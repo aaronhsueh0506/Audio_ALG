@@ -7,6 +7,7 @@
 #include <string.h>
 
 #include "dfn_rate_bridge.h"
+#include "utility/mem_align.h"
 #include "audio_resampler.h"
 #include "fft_wrapper.h"
 #include "audio_stft.h"
@@ -191,7 +192,7 @@ static void fill_descriptor(const DfnRateBridgeConfig *cfg, const Resolved *r,
     out->descriptor_version = DFN_RATE_BRIDGE_DESCRIPTOR_VERSION;
     out->layout_version = DFN_RATE_BRIDGE_LAYOUT_VERSION;
     out->backend_id = r->stage_req.backend_id;
-    out->build_flags_hash = h;
+    out->build_flags_hash = ac_memreq_abi_hash(h);
     out->alignment = BRIDGE_ALIGN;
     out->bytes = (uint64_t)r->bytes;
 }
@@ -529,10 +530,6 @@ int dfn_rate_bridge_n_freqs(const DfnRateBridge *b) {
 
 int dfn_rate_bridge_added_delay_samples(const DfnRateBridge *b) {
     return b ? b->added_delay : -1;
-}
-
-int dfn_rate_bridge_set_atten_lim(DfnRateBridge *b, float atten_lim_db) {
-    return b ? dfn_res_stage_set_atten_lim(b->stage, atten_lim_db) : -1;
 }
 
 DfnResStage *dfn_rate_bridge_stage(const DfnRateBridge *b) {

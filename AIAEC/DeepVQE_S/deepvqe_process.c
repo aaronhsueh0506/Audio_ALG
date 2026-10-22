@@ -1,6 +1,6 @@
 #include "deepvqe_process.h"
 
-#include "simd_kernel_nn.h"
+#include "utility/simd_kernel_nn.h"
 
 #include <string.h>
 

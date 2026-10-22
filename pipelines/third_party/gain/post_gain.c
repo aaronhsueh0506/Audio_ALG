@@ -4,9 +4,9 @@
 #include <string.h>
 
 #include "post_gain.h"
-#include "fast_math.h"
-#include "mem_align.h"
-#include "simd_kernels.h"
+#include "utility/fast_math.h"
+#include "utility/mem_align.h"
+#include "utility/simd_kernels.h"
 
 #ifndef M_PI
 #define M_PI 3.14159265358979323846
@@ -90,8 +90,8 @@ static int post_gain_angle_to_index(float doa_rad, int num_angles)
  *
  * Bump allocator carving this module's flat pool into typed sub-blocks.
  * File-private because that is this directory's convention -- masker.c,
- * vad_api.c, gsc.c and srp.c each carry their own copy; the sizing half of
- * the same lockstep pair is shared as ck_field_size() in audio_common's
+ * vad_api.c, bf.c and srp.c each carry their own copy; the sizing half of
+ * the same lockstep pair is shared as ck_field_size() in audiolib's
  * mem_align.h.
  */
 typedef struct PoolCursor {
@@ -138,7 +138,7 @@ size_t post_gain_get_mem_size(const PostGainConfig* cfg)
  * exhausted-exactly check at the end is what enforces it in both directions:
  * carving more than was sized runs the cursor out and returns NULL, and
  * sizing more than is carved leaves a remainder. (masker.c and vad_api.c
- * check only the first direction; gsc.c and srp.c check both, as here.) */
+ * check only the first direction; bf.c and srp.c check both, as here.) */
 static struct PostGainState* post_gain_carve(const PostGainConfig* cfg,
                                              void* mem, size_t need)
 {

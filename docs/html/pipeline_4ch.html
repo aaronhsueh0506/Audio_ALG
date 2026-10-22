@@ -28,19 +28,19 @@ th{background:#eef0f5}
 <a href="pipeline_dfn_mono.html">pipeline_dfn_mono</a>
 <a href="pipeline_dfn_4ch.html">pipeline_dfn_4ch</a>
 </nav>
-<h1>audio_pipeline_4ch — 4 mic 共用 delay + SRP/GSC + fused post</h1>
+<h1>audio_pipeline_4ch — 4 mic 共用 delay + SRP/BF + fused post</h1>
 
 <h2>概要</h2>
 <p>兩層結構(<code>pipelines/4ch_aec_bf_nr_res/</code>):</p>
 <ul>
-<li><b>前端 <code>4aec_nr_res</code>(<code>FourAecNrRes</code>)</b>:1 個共用 far aligner(<code>delay_mode=MATCHED</code> 時是 1 個 <code>DelayAec3</code> matcher + 1 條共用 aligned render delay line;<code>FIXED</code>/<code>EXTERNAL_ALIGNED</code> 時 matcher count = 0,兩者都不 carve)→ <b>4 條獨立線性 AEC lane</b> → 外部 beamformer 權重投影。每 hop 兩個呼叫:<code>four_aec_front_process()</code>(delay + 四條 lane,交出借用的 <code>FourAecFront</code>)與 <code>four_aec_fuse()</code>(用外部權重投影,填 <code>SeSpecFrame</code>)。RES、NR、CNG 與 iFFT <b>不在前端內</b>:由應用 carve(<code>four_aec_nr_res_stage_configs()</code> 給出 <code>AecConfig</code>／<code>AnrConfig</code>)並明寫串接 <code>se_res_stage_gain → se_anr_stage_gain → sk_min_f32 → sk_capply_gain_f32 → aec_cng_fill → ac_istft_push</code>,不複製 NR/RES 到每條 lane,也沒有函式指標表。</li>
-<li><b>完整 wrapper <code>audio_pipeline_4ch</code></b>:把 SRP-PHAT DOA + GSC(<code>third_party/doa</code>、<code>third_party/GSC</code>)接進 <code>four_aec_front_process()</code> 與 <code>four_aec_fuse()</code> 之間,擁有後級 stage 並串接(<code>run_post_stages()</code>),並提供保守 energy-VAD fallback。</li>
+<li><b>前端 <code>4aec_nr_res</code>(<code>FourAecNrRes</code>)</b>:1 個共用 far aligner(<code>delay_mode=MATCHED</code> 時是 1 個 <code>DelayAec</code> matcher + 1 條共用 aligned render delay line;<code>FIXED</code>/<code>EXTERNAL_ALIGNED</code> 時 matcher count = 0,兩者都不 carve)→ <b>4 條獨立線性 AEC lane</b> → 外部 beamformer 權重投影。每 hop 兩個呼叫:<code>four_aec_front_process()</code>(delay + 四條 lane,交出借用的 <code>FourAecFront</code>)與 <code>four_aec_fuse()</code>(用外部權重投影,填 <code>SeSpecFrame</code>)。RES、NR、CNG 與 iFFT <b>不在前端內</b>:由應用 carve(<code>four_aec_nr_res_stage_configs()</code> 給出 <code>AecConfig</code>／<code>AnrConfig</code>)並明寫串接 <code>se_res_stage_gain → se_anr_stage_gain → sk_min_f32 → sk_capply_gain_f32 → aec_cng_fill → ac_istft_push</code>,不複製 NR/RES 到每條 lane,也沒有函式指標表。</li>
+<li><b>完整 wrapper <code>audio_pipeline_4ch</code></b>:把 SRP-PHAT DOA + BF(<code>audiolib/doa</code>、<code>audiolib/bf</code>)接進 <code>four_aec_front_process()</code> 與 <code>four_aec_fuse()</code> 之間,擁有後級 stage 並串接(<code>run_post_stages()</code>),並提供保守 energy-VAD fallback。</li>
 </ul>
 <p>結構稽核值(<code>*_count()</code>):<code>matched_filter</code> 依 <code>cfg.delay_mode</code> 而定——<code>MATCHED</code> 時 1,<code>FIXED</code>/<code>EXTERNAL_ALIGNED</code> 時 0(無 estimator 可數);<code>linear_aec</code> 恆 4;前端提供 <code>four_aec_nr_res_matched_filter_count()</code>／<code>_linear_aec_count()</code>;<code>post_res</code> 與 <code>nr</code> 由 wrapper 擁有,所以 <code>audio_pipeline_4ch_post_res_count()</code>／<code>_nr_count()</code> 在 wrapper 上:<code>post_res</code> 為 1 需 <code>enable_post &amp;&amp; enable_res</code>,<code>nr</code> 為 1 需 <code>enable_post &amp;&amp; enable_nr</code>(RES-only 組態下 <code>nr</code> 為 0)。Lane 0 每 hop 跑真 far-FFT,lane 1–3 經 <code>aec_process_context_shared_far()</code> 借用 lane 0 的 far 頻譜(4 次 far-FFT → 1 次,測試以 <code>four_aec_nr_res_far_fft_real_compute_count()</code> 證明)。支援 16 kHz(fft 256 預設 / 512 明示)與 48 kHz(fft 1024)。</p>
 <p><b>共用 estimator 的 duty-cycle(<code>MATCHED</code>)</b>:與 mono lib 同一套機器,兩個視窗直接讀自本層已經建好的 lane <code>AecConfig</code>(<code>delay_est_init_s</code>/<code>delay_est_period_s</code>,預設 0.3 s/0.5 s)——估計 solid 且 <code>delay_est_init_s</code> 不變後,matched-filter 分析降為 1-in-K(K=<code>delay_est_period_s</code>/hop÷5:16k/128 為 12、16k/256 為 6、48k/512 為 9,三個格點的 duty 週期都是 ~96 ms);estimator 每 hop 照餵(decimation 只作用於分析,不作用於音訊)。<b>回全速的時機不是「立刻」</b>:被略過的 hop 不會發佈新估計,所以 delay 改變/信心流失只能在<b>下一個排定的分析</b>被看見,全速從看見的那個 hop 起恢復——最壞多等一個 duty 週期(~96 ms)。windowed-ERLE 自洩漏峰值崩 6 dB 的看門狗可以提早喚醒它,但它必須先讓峰值超過同一個 6 dB 才會武裝。實測 shared delay 段 17.0→4.3µs/hop,delay 軌跡與全速版逐 hop 相同。census:<code>four_aec_nr_res_duty_hops_run()</code>(實跑分析的 hop)對 <code>four_aec_nr_res_duty_hops_total()</code>(=<code>estimator_calls</code> 的別名,分母)。已知邊界(已由 <code>test_4aec_nr_res.c</code> 的低 ERLE A/B 場景釘住):lane ERLE 壓在 6 dB 之下時看門狗永遠不會武裝,delay change 的 re-lock 完全由 1-in-K 取樣承擔——16k/256 實測全速 319 hops(5.10 s)、duty 805 hops(12.88 s),2.52 倍,峰值 lane ERLE 3.3 dB(mono 同款行為)。</p>
 
 <h2>API 用法</h2>
-<pre>/* 完整 wrapper(含 SRP/GSC) */
+<pre>/* 完整 wrapper(含 SRP/BF) */
 AudioPipeline4ChConfig cfg = audio_pipeline_4ch_default_config(16000);
 AudioPipeline4ChMemReq req;
 audio_pipeline_4ch_get_mem_requirements(&amp;cfg, &amp;req);
@@ -67,7 +67,7 @@ aec_cng_fill(&amp;rng, spec, frame.cn, res_gain, nr_gain, SE_CNG_NR_GAIN_FLOOR, 
 ac_istft_push(istft, spec, out);
 /* 外部 NN 後級(如 ULCNet)只用前端:不呼叫 four_aec_fuse(),下一個 front_process 直接接手。 */</pre>
 <p><b>換用別的後級(例如 DFN2)。</b>前端只交出 <code>SeSpecFrame</code>;<code>frame.e</code> 是 RES 與降噪據以估計的 pre-RES beamformed 誤差頻譜,<code>frame.cn</code>／<code>frame.r2</code> 是同一次投影的舒適噪音與殘餘回音 PSD。想插入神經後濾波的應用,在 <code>se_res_stage_gain()</code> 之後自己組 <code>P = E · G_res (+ comfort noise)</code>,處理完交給自己的 <code>ac_istft_push()</code>——整條鏈沒有函式指標表,每個應用把自己的幾行寫出來。目前的消費者是 <a href="pipeline_dfn_4ch.html">pipeline_dfn_4ch</a>(<code>enable_post=1、enable_res=1、enable_nr=0</code>)。前端 <code>FOUR_AEC_NR_RES_LAYOUT_VERSION</code> 仍為 18。</p>
-<p>Descriptor 慣例與 mono 相同(32-byte 固定 ABI、init_ex 8 點閘)。核心 <code>FOUR_AEC_NR_RES_LAYOUT_VERSION=19</code>、wrapper <code>AUDIO_PIPELINE_4CH_LAYOUT_VERSION=14</code>,兩者 descriptor_version 皆 1;wrapper 的 build_flags_hash 摺入核心的 hash(核心 layout bump 會連帶作廢外層 descriptor)。核心 config:<code>delay_mode</code>(<code>AEC_DELAY_MATCHED</code>|<code>FIXED</code>|<code>EXTERNAL_ALIGNED</code>,四條 lane 共用同一個決策)、<code>delay_num_filters</code>(僅 <code>MATCHED</code>,[1,5])、<code>fixed_delay_samples</code>(僅 <code>FIXED</code>,原生取樣點數;其餘須 −1)、<code>capture_proxy_channel</code>(matcher 輸入,[0,3])、<code>max_delay_ms</code>(僅 <code>MATCHED</code> 用於 sizing delay ring,預設 1024,delay ring = ceil(ms×sr/1000)+2×hop+1)、<code>filter_length</code>(0=rate default)、<code>delay_backward_quarantine_enabled</code>(bool,預設 0;開啟後只隔離比現行 delay <b>更早</b>的新估計,且僅在 <code>capture_proxy_channel</code> 那一條 lane 仍在消除回音時;往後跳與首次取得對齊都不受影響)、<code>delay_backward_quarantine_s</code>(float,預設 1.0;隔離窗長,init 時換算成 hop 數,到期即採用——延後一個窗,不是治癒;<b>不是 pre-echo 誤鎖的解藥</b>,該誤鎖已在估計器端根治,aggregator 改為回報 dominant matched-filter peak)。Quarantine 目前<b>只驗過合成場景與 C／Python 逐 hop 對照,真實錄音抽測待做</b>,產品組態維持預設 OFF。<code>enable_res</code>／<code>enable_nr</code>／<code>enable_cng</code>／<code>legacy_amin</code> 前端本身不讀,它們配置應用的後級(經 <code>four_aec_nr_res_stage_configs()</code> 導出 <code>AecConfig</code>／<code>AnrConfig</code>);<code>enable_post</code> 決定 lane 是否保留頻域 post context 並 carve fuse 緩衝。</p>
+<p>Descriptor 慣例與 mono 相同(32-byte 固定 ABI、init_ex 8 點閘)。核心 <code>FOUR_AEC_NR_RES_LAYOUT_VERSION=21</code>、wrapper <code>AUDIO_PIPELINE_4CH_LAYOUT_VERSION=16</code>,兩者 descriptor_version 皆 1;wrapper 的 build_flags_hash 摺入核心的 hash(核心 layout bump 會連帶作廢外層 descriptor)。核心 config:<code>delay_mode</code>(<code>AEC_DELAY_MATCHED</code>|<code>FIXED</code>|<code>EXTERNAL_ALIGNED</code>,四條 lane 共用同一個決策)、<code>delay_num_filters</code>(僅 <code>MATCHED</code>,[1,5])、<code>fixed_delay_samples</code>(僅 <code>FIXED</code>,原生取樣點數;其餘須 −1)、<code>capture_proxy_channel</code>(matcher 輸入,[0,3])、<code>max_delay_ms</code>(僅 <code>MATCHED</code> 用於 sizing delay ring,預設 1024,delay ring = ceil(ms×sr/1000)+2×hop+1)、<code>filter_length</code>(0=rate default)、<code>delay_backward_quarantine_enabled</code>(bool,預設 0;開啟後只隔離比現行 delay <b>更早</b>的新估計,且僅在 <code>capture_proxy_channel</code> 那一條 lane 仍在消除回音時;往後跳與首次取得對齊都不受影響)、<code>delay_backward_quarantine_s</code>(float,預設 1.0;隔離窗長,init 時換算成 hop 數,到期即採用——延後一個窗,不是治癒;<b>不是 pre-echo 誤鎖的解藥</b>,該誤鎖已在估計器端根治,aggregator 改為回報 dominant matched-filter peak)。Quarantine 目前<b>只驗過合成場景與 C／Python 逐 hop 對照,真實錄音抽測待做</b>,產品組態維持預設 OFF。<code>enable_res</code>／<code>enable_nr</code>／<code>enable_cng</code>／<code>legacy_amin</code> 前端本身不讀,它們配置應用的後級(經 <code>four_aec_nr_res_stage_configs()</code> 導出 <code>AecConfig</code>／<code>AnrConfig</code>);<code>enable_post</code> 決定 lane 是否保留頻域 post context 並 carve fuse 緩衝。</p>
 
 <h3>執行期強度控制與逐階段耗時</h3>
 <p><code>audio_pipeline_4ch_set_aec_preset()</code>(<code>ramp_ms</code> 以 dB 線性走到新地板)、<code>audio_pipeline_4ch_set_nr_mode()</code>、唯讀的 <code>audio_pipeline_4ch_post_split_floor()</code>(<code>live</code>／<code>target</code>,線性功率)三個 setter 只作用在 wrapper 自己 carve 的那<b>一個</b>共用 post 級抑制器與降噪器;對四條 lane 重新指定 preset 是無效操作(lane 以 <code>spatial_linear_context</code> 建立,不走自己的殘留抑制器)。診斷用的 <code>four_aec_nr_res_get_last_timing()</code>(<code>FourAecNrResLastTiming</code>)回報前端各階段的 wall-clock 微秒。兩者的呼叫表、回 −1 條件、ramp 與 A/B 量測注意事項、時鐘替換方式收在 <a href="pipeline_4ch_detail.html">pipeline_4ch_detail</a>。</p>
@@ -90,7 +90,7 @@ ac_istft_push(istft, spec, out);
  │
  ├─ four_aec_front_process(core, mics, ref, &amp;front)
  │    ├─ inputs_finite() 拒非有限輸入
- │    ├─ update_shared_delay(): delay_aec3_accumulate_ex(proxy_ch, ref, run)
+ │    ├─ update_shared_delay(): delay_aec_accumulate_ex(proxy_ch, ref, run)
  │    │     eligible = est&gt;=0 &amp;&amp; solid &amp;&amp; n_updates&gt;=3 → accepted_delay
  │    ├─ align_render(): 共用 delay ring → aligned_ref[hop]
  │    ├─ delay.changed → aec_apply_external_realign(lane 0..3, Δdelay)
@@ -98,9 +98,9 @@ ac_istft_push(istft, spec, out);
  │                lane1-3 aec_process_context_shared_far(..., far_spec@lane0)
  │                bind_lane_view() → front.linear_spectra / formed_hop(借用 lane buffer)
  ├─ doa_step(srp, front.linear_spectra, mask, vad_raw, vad_out)    SRP-PHAT
- ├─ gsc_process_with_weights(gsc, front.linear_spectra, doa_get_smooth(srp),
- │        vad_out?0:1, mask, gsc_spectrum, gsc_weights)            GSC(RLS)
- ├─ four_aec_fuse(core, gsc_weights, gsc_spectrum, &amp;frame)         → SeSpecFrame
+ ├─ bf_process_with_weights(bf, front.linear_spectra, doa_get_smooth(srp),
+ │        vad_out?0:1, mask, bf_spectrum, bf_weights)              BF(RLS)
+ ├─ four_aec_fuse(core, bf_weights, bf_spectrum, &amp;frame)         → SeSpecFrame
  │      ├─ validate_weights()(全零/非有限權重拒收,front frame 仍可重試)
  │      └─ fuse_contexts(): 用同一組 weights 投影 near/residual/comfort
  │            residual_vec[k] = sqrt(r2[k])·echo[k]/|echo[k]| (取 echo 相位)
@@ -123,11 +123,11 @@ caller            mics0[128][4]     mics1,ref1        mics_p, ref_p
                   ref0[128]
 front (C)         delay+align;      同左;             front: spectra frame_p
                   4×lane ctx        4×lane ctx        aligned_ref hop_p
-SRP/GSC (C)       doa/weights #0    doa/weights #1    weights frame_p(同 hop)
+SRP/BF (C)        doa/weights #0    doa/weights #1    weights frame_p(同 hop)
 fuse + 後級 (C)   out=半窗 ramp≈0   out=hop#0 重建    out = hop p-1 的重建
                                                       ── 同一呼叫內完成, 輸出
                                                          落後輸入 1 hop(WOLA)</pre>
-<p>front → SRP/GSC → fuse → 後級全部發生在同一次呼叫、同一個 hop;唯一 hop-lag 是 ISTFT 端 WOLA。實測(4 mic 同號白噪 cross-correlation,16 kHz 預設 hop=128):lag argmax = 127 samples ≈ 1.0 hop。</p>
+<p>front → SRP/BF → fuse → 後級全部發生在同一次呼叫、同一個 hop;唯一 hop-lag 是 ISTFT 端 WOLA。實測(4 mic 同號白噪 cross-correlation,16 kHz 預設 hop=128):lag argmax = 127 samples ≈ 1.0 hop。</p>
 
 <h2>I/O 表</h2>
 <table>
@@ -139,50 +139,50 @@ fuse + 後級 (C)   out=半窗 ramp≈0   out=hop#0 重建    out = hop p-1 的�
 <tr><td><code>front.linear_spectra</code></td><td>4×[n_freqs]</td><td>Complex</td><td>1 frame</td><td>分析窗=2 hop</td></tr>
 <tr><td><code>front.formed_hop</code></td><td>4×[hop]</td><td>float32</td><td>1 hop</td><td>128(各 lane 一份,借用)</td></tr>
 <tr><td><code>front.aligned_ref</code></td><td>[hop]</td><td>float32</td><td>1 hop</td><td>128</td></tr>
-<tr><td><code>gsc_spectrum</code>(wrapper 內部)</td><td>[n_freqs]</td><td>Complex</td><td>1 frame</td><td>beamformed 誤差頻譜</td></tr>
+<tr><td><code>bf_spectrum</code>(wrapper 內部)</td><td>[n_freqs]</td><td>Complex</td><td>1 frame</td><td>beamformed 誤差頻譜</td></tr>
 <tr><td><code>SeSpecFrame</code>(<code>four_aec_fuse</code> out)</td><td><code>e,y,x,r2,cn</code> 各 [n_freqs];<code>far_hop</code> [hop](<code>formed_hop</code> 為 NULL:各 lane 的時域 hop 在 <code>FourAecFront.formed_hop</code>)</td><td>Complex／float32</td><td>1 frame</td><td>借用視圖,有效至下一次 <code>four_aec_front_process()</code>／reset;不可寫入</td></tr>
-<tr><td><code>frequency_mask</code>(可選 in)</td><td>[n_freqs]</td><td>int</td><td>—</td><td>1=選給 SRP 且凍結該 bin 的 GSC 適應</td></tr>
+<tr><td><code>frequency_mask</code>(可選 in)</td><td>[n_freqs]</td><td>int</td><td>—</td><td>1=選給 SRP 且凍結該 bin 的 BF 適應</td></tr>
 </table>
 <p>n_freqs = 129(16k/256)/ 257(16k/512)/ 513(48k/1024)。</p>
 
 <h2>State 表</h2>
-<p>單一 caller pool。wrapper carve 順序 <code>self, core, srp, gsc, gsc_spectrum, gsc_weights</code>,接著是它自己的後級:<code>AecRes</code>、<code>AnrDenoiser</code>、<code>AcIstft</code>,以及 <code>total_gain / extra_noise / spec / unity</code> 四個暫存(<code>audio_pipeline_4ch.c</code> 的 <code>pool_carve()</code> 序列)。前端(<code>FourAecNrRes</code>)自己只 carve 4 條 lane、共用 aligner、delay ring 與 fuse 緩衝,<b>不含</b> RES／NR／iFFT。FFT backend 預設為 ne10(<code>audio_common</code> 對 NEON 目標自動偵測);下表數字為 ne10 實測,kiss 一律現查(換 backend／編譯選項／submodule 即失效)。</p>
+<p>單一 caller pool。wrapper carve 順序 <code>self, core, srp, bf, bf_spectrum, bf_weights</code>,接著是它自己的後級:<code>AecRes</code>、<code>AnrDenoiser</code>、<code>AcIstft</code>,以及 <code>total_gain / extra_noise / spec / unity</code> 四個暫存(<code>audio_pipeline_4ch.c</code> 的 <code>pool_carve()</code> 序列)。前端(<code>FourAecNrRes</code>)自己只 carve 4 條 lane、共用 aligner、delay ring 與 fuse 緩衝,<b>不含</b> RES／NR／iFFT。FFT backend 預設為 ne10(<code>audiolib</code> 對 NEON 目標自動偵測);下表數字為 ne10 實測(換 backend／編譯選項／submodule 即失效,一律現查)。</p>
 <table>
 <tr><th>state</th><th>shape / size</th><th>存放者</th><th>備註</th></tr>
-<tr><td>4× <code>Aec</code> lanes</td><td>1,390,336 B(@16k/512;@16k/256 879,296 B;@48k 3,016,384 B)</td><td>pool(前端)</td><td>lane 各自 PBFDKF/shadow/context;<code>enable_delay_est=0</code>(delay 共用)。取自 <code>4aec_nr_res_static --print-mem-size</code> 的 <code>AEC x4</code></td></tr>
-<tr><td><code>DelayAec3 shared_delay</code></td><td>struct 內嵌</td><td>C struct(前端)</td><td>48k 時內建 anti-alias 降頻 sidechain</td></tr>
+<tr><td>4× <code>Aec</code> lanes</td><td>1,449,920 B(@16k/512;@16k/256 935,040 B;@48k 3,198,976 B)</td><td>pool(前端)</td><td>lane 各自 PBFDKF/shadow/context;<code>enable_delay_est=0</code>(delay 共用)。取自 <code>4aec_nr_res_static --print-mem-size</code> 的 <code>AEC x4</code></td></tr>
+<tr><td><code>DelayAec shared_delay</code></td><td>struct 內嵌</td><td>C struct(前端)</td><td>48k 時內建 anti-alias 降頻 sidechain</td></tr>
 <tr><td><code>delay_ring</code></td><td>[ring] f32;ring=ceil(max_delay_ms×sr/1000)+2·hop+1</td><td>pool(前端)</td><td>預設 1024 ms → 16,641 samples @16k/128</td></tr>
 <tr><td><code>AnrDenoiser</code>(×1)</td><td>133,552 B(@16k/512;@16k/256 122,240 B;@48k 374,416 B)</td><td>pool(應用:wrapper 或 <code>4aec_nr_res_static.c</code>)</td><td>mono NR;大小由 <code>se_anr_stage_mem_size()</code> 取自 <code>four_aec_nr_res_stage_configs()</code> 的 <code>nr_cfg</code></td></tr>
 <tr><td><code>AecRes</code>(×1)</td><td>由 <code>aec_res_get_mem_size(res_cfg)</code> 決定;抑制器狀態與近端功率／render 暫存都在其內</td><td>pool(應用)</td><td>post-beam RES(<code>aec_res.h</code>;<code>res_cfg</code> 與 lane 內抑制器出自同一個建構函式)</td></tr>
 <tr><td><code>AcIstft</code>(含 <code>FftHandle</code>)</td><td>FFT 15,600 B(ne10 @16k/512;@16k/256 8,176 B;@48k 30,448 B)+ 其餘 [fft]×3 f32 + 結構</td><td>pool(應用)</td><td>最終合成(<code>ac_istft_push()</code>:fft_inverse + sqrt-Hann OLA)</td></tr>
 <tr><td><code>rng</code></td><td>uint32 純量</td><td>C struct(應用)</td><td>CNG seed <code>SE_CNG_RNG_SEED</code>=0x9e3779b9(<code>se_stage.h</code>)</td></tr>
 <tr><td><code>total_gain / extra_noise / spec / unity</code></td><td>各 [n_freqs](<code>spec</code> 為 Complex)</td><td>pool(應用)</td><td><code>unity</code> 是停用的增益來源讀到的全 1 向量</td></tr>
-<tr><td><code>SRP</code>(含 steering table)</td><td>num_angles=72 預設</td><td>pool(wrapper)</td><td>GSC 借用 <code>srp-&gt;a_array</code></td></tr>
-<tr><td><code>GSC</code>(RLS P/weights)</td><td>P:16×n_freqs Complex;wa:4×n_freqs Complex</td><td>pool(wrapper)</td><td>內部排列 <code>P[M][M][F]</code>;AArch64 每次更新 4 bins，逐 hop 對 scalar oracle 做 P/wa/output byte-exact 測試。lambda 0.995 經 <code>anr_retime_alpha</code> 依 hop×adapt_interval retime;mu 0.1</td></tr>
+<tr><td><code>SRP</code>(含 steering table)</td><td>num_angles=72 預設</td><td>pool(wrapper)</td><td>BF 借用 <code>srp-&gt;a_array</code></td></tr>
+<tr><td><code>BF</code>(RLS P/weights)</td><td>P:16×n_freqs Complex;wa:4×n_freqs Complex</td><td>pool(wrapper)</td><td>內部排列 <code>P[M][M][F]</code>;AArch64 每次更新 4 bins，逐 hop 對 scalar oracle 做 P/wa/output byte-exact 測試。lambda 0.995 經 <code>anr_retime_alpha</code> 依 hop×adapt_interval retime;mu 0.1</td></tr>
 <tr><td>auto-VAD(<code>noise_power/vad_hangover</code>)</td><td>純量</td><td>C struct(wrapper)</td><td>-55 dBFS / SNR 3.0 / hangover 8(retimed);EMA 0.999/0.95(retimed)</td></tr>
-<tr><td>前端＋後級合計 @16k/512</td><td>1,682,048 B(ne10)</td><td>—</td><td>實測 <code>4aec_nr_res_static --print-mem-size --sample-rate 16000 --fft-size 512</code>(前端 <code>four_aec_nr_res_get_mem_requirements()</code>(<code>enable_post=1</code>)加上範例自己 carve 的 RES／NR／iFFT／暫存;<code>Pipeline bufs</code> 為其餘)。ULCNet wrapper 走 <code>enable_post=0</code> 的 front-only 前端,見 <code>pipeline_ulcnet_4ch.html</code></td></tr>
-<tr><td>完整 wrapper 合計</td><td>1,925,184 B @16k/256(預設)/ 6,863,792 B @48k/1024</td><td>—</td><td>實測 <code>audio_pipeline_4ch_get_mem_requirements()</code>(ne10,layout_version=14),由 static smoke 的 <code>Total:</code> 行印出</td></tr>
+<tr><td>前端＋後級合計 @16k/512</td><td>1,741,680 B(ne10)</td><td>—</td><td>實測 <code>4aec_nr_res_static --print-mem-size --sample-rate 16000 --fft-size 512</code>(前端 <code>four_aec_nr_res_get_mem_requirements()</code>(<code>enable_post=1</code>)加上範例自己 carve 的 RES／NR／iFFT／暫存;<code>Pipeline bufs</code> 為其餘)。ULCNet wrapper 走 <code>enable_post=0</code> 的 front-only 前端,見 <code>pipeline_ulcnet_4ch.html</code></td></tr>
+<tr><td>完整 wrapper 合計</td><td>1,980,992 B @16k/256(預設)/ 7,046,448 B @48k/1024</td><td>—</td><td>實測 <code>audio_pipeline_4ch_get_mem_requirements()</code>(ne10,layout_version=16),由 static smoke 的 <code>Total:</code> 行印出</td></tr>
 </table>
 
 <h2>延遲與 warm-up</h2>
 <ul>
 <li>演算法延遲:<b>1 hop</b>(WOLA;實測 argmax 127 samples @hop=128 → 8 ms @16k 預設)。</li>
 <li>delay acquisition:估計值要 <code>solid</code> 且 <code>n_updates≥3</code> 才被接受;<b>開始新的可用 alignment generation 的那個 hop</b> 回報 <code>delay.changed=1</code>——首次 acquisition、unlock 後<b>同值重鎖</b>、鎖定中值改變皆屬之(不只值改變;見 <code>4aec_nr_res.h</code> 的 <code>FourAecNrResDelayState</code> 契約),核心對四條 lane 做 <code>aec_apply_external_realign()</code>(濾波器依 delay 差位移,不重置、不清合成 OLA);外部 beamformer 若自帶 STFT/OLA 狀態,應照 <code>changed</code> 清除。ring 未累積到 delay 樣本前 <code>aligned_ref</code> 前導為 0。</li>
-<li>SRP/GSC warm-up:DOA smoother 需 <code>doa_switch_consecutive=3</code> 次一致觀測才切換;GSC RLS 由 vad_out 凍結(vad_out=1 → 凍結適應)。</li>
+<li>SRP/BF warm-up:DOA smoother 需 <code>doa_switch_consecutive=3</code> 次一致觀測才切換;BF RLS 由 vad_out 凍結(vad_out=1 → 凍結適應)。</li>
 <li>NR 噪聲底 ~1.5 s wall-clock(retimed L)。</li>
 </ul>
 
 <h2>相關檔案與測試路徑</h2>
 <table>
 <tr><th>路徑(repo-relative)</th><th>內容</th></tr>
-<tr><td><code>pipelines/4ch_aec_bf_nr_res/4aec_nr_res.h / .c</code></td><td>前端(<code>four_aec_front_process</code> / <code>four_aec_fuse</code> / <code>four_aec_nr_res_stage_configs</code>;layout v18)</td></tr>
-<tr><td><code>pipelines/4ch_aec_bf_nr_res/audio_pipeline_4ch.h / .c</code></td><td>完整 wrapper(SRP/GSC/auto-VAD、後級 stage 串接 <code>run_post_stages()</code>;layout v14)</td></tr>
+<tr><td><code>pipelines/4ch_aec_bf_nr_res/4aec_nr_res.h / .c</code></td><td>前端(<code>four_aec_front_process</code> / <code>four_aec_fuse</code> / <code>four_aec_nr_res_stage_configs</code>;layout v21)</td></tr>
+<tr><td><code>pipelines/4ch_aec_bf_nr_res/audio_pipeline_4ch.h / .c</code></td><td>完整 wrapper(SRP/BF/auto-VAD、後級 stage 串接 <code>run_post_stages()</code>;layout v16)</td></tr>
 <tr><td><code>pipelines/common/se_stage.h</code>、<code>se_anr_stage.h</code></td><td><code>SeSpecFrame</code> 與 <code>se_res_stage_gain()</code>／<code>se_anr_stage_gain()</code></td></tr>
 <tr><td><code>pipelines/4ch_aec_bf_nr_res/4aec_projection_kernels.h</code></td><td>投影 kernels(cmac/residual/comfort/mag2)與權重矩陣檢查</td></tr>
-<tr><td><code>pipelines/third_party/{doa,GSC,utility}</code></td><td>SRP-PHAT / GSC / spatial SIMD</td></tr>
+<tr><td><code>../../../audiolib/{doa,bf,common/utility}</code></td><td>SRP-PHAT / BF / spatial SIMD</td></tr>
 <tr><td><code>pipelines/4ch_aec_bf_nr_res/audio_pipeline_4ch_raw.c</code> / <code>audio_pipeline_4ch_static.c</code>；<code>pipelines/4ch_aec_bf_nr_res/4aec_nr_res_static.c</code></td><td>應用 CLI 與靜態記憶體範例(<code>4aec_nr_res_static.c</code> 是「前端＋明寫串接」的最小範例)</td></tr>
 <tr><td><code>pipelines/4ch_aec_bf_nr_res/tests/test_4aec_nr_res.c</code>、<code>tests/conv_chain_4ch.h</code></td><td>前端的 sequence 規則、heap-vs-static byte parity、WOLA identity、far-FFT sharing、descriptor 閘、known-delay profile(acquisition/coverage/mislock/cost, n=1..5,幾何以 <code>DA_*</code> 常數推導、對 ground-truth 斷言)、per-filter RAM/CPU 實測;<code>conv_chain_4ch.h</code> 把後級串接寫成參考鏈</td></tr>
-<tr><td><code>pipelines/4ch_aec_bf_nr_res/tests/test_audio_pipeline_4ch.c</code> / <code>pipelines/third_party/tests/test_spatial_third_party.c</code></td><td>wrapper(含 wrapper 與參考鏈逐位元相等)與空間庫驗收</td></tr>
+<tr><td><code>pipelines/4ch_aec_bf_nr_res/tests/test_audio_pipeline_4ch.c</code> / <code>../../../audiolib/tests/test_spatial_third_party.c</code></td><td>wrapper(含 wrapper 與參考鏈逐位元相等)與空間庫驗收</td></tr>
 <tr><td><code>pipelines/4ch_aec_bf_nr_res/pipeline.py</code>、<code>pipelines/se_stage.py</code> + <code>tests/test_pipeline.py</code></td><td>Python reference(<code>front_process</code> → <code>fuse</code> → stage functions;copy 語意,允許多個 front frame 在飛)</td></tr>
 <tr><td><code>pipelines/4ch_aec_bf_nr_res/Makefile</code></td><td>建置 <code>libaudio_pipeline_4ch.a</code>(含 <code>4aec_nr_res.o</code>,以及 <code>pipelines/common</code> 的共用 <code>se_config.o</code>、<code>se_anr_stage.o</code>;<code>audio_pipeline_4ch.o</code>/ULCNet 變體物件皆各自 link,不進這個 archive)、<code>test</code>、<code>audit-no-stdio</code>;也是 <code>4ch_alignulcnet/</code> 應用轉發建置的目標目錄</td></tr>
 </table>

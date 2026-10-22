@@ -30,6 +30,7 @@ from train import (  # noqa: E402
     erb_bandborder,
     extract_model_features,
     read_feature_config,
+    istft,
 )
 from inference import apply_atten_lim  # noqa: E402
 
@@ -43,33 +44,47 @@ WRAPPER = r"""
 #include "process.h"
 #include <stddef.h>
 #include <string.h>
+#include "test/rnnoise_test_framing.h"
 
-size_t test_state_size(void) { return sizeof(RNNoiseState); }
+typedef struct { RNNoiseState state; RNNoiseTestFraming framing; } ParityState;
+size_t test_state_size(void) { return sizeof(ParityState); }
 
-void test_state_init(void *memory) {
-    rnnoise_state_init((RNNoiseState *)memory);
+int test_state_init(void *memory) {
+    ParityState *p = (ParityState *)memory;
+    return rnnoise_test_framing_init(&p->framing, &p->state);
+}
+int test_state_reset(void *memory) {
+    ParityState *p = (ParityState *)memory;
+    return rnnoise_state_init(&p->state, p->framing.analysis, p->framing.synthesis);
+}
+void test_state_free(void *memory) {
+    rnnoise_test_framing_free(&((ParityState *)memory)->framing);
 }
 
 void test_analysis(void *memory, const float *frame, float *re, float *im) {
-    rnnoise_analysis((RNNoiseState *)memory, frame, re, im);
+    rnnoise_analysis(&((ParityState *)memory)->state, frame, re, im);
 }
 
 int test_step(void *memory, const float *re, const float *im,
               float *out_erb, float *out_spec) {
     return rnnoise_compute_features(
-        (RNNoiseState *)memory, re, im,
+        &((ParityState *)memory)->state, re, im,
         (float (*)[RNNOISE_N_BANDS])out_erb,
         (float (*)[2][RNNOISE_SPEC_BINS])out_spec);
 }
 
 void test_copy_erb_state(void *memory, float *out) {
-    RNNoiseState *state = (RNNoiseState *)memory;
+    RNNoiseState *state = &((ParityState *)memory)->state;
     memcpy(out, state->erb_norm_state, sizeof(state->erb_norm_state));
 }
 
 void test_copy_spec_state(void *memory, float *out) {
-    RNNoiseState *state = (RNNoiseState *)memory;
+    RNNoiseState *state = &((ParityState *)memory)->state;
     memcpy(out, state->spec_norm_state, sizeof(state->spec_norm_state));
+}
+
+int test_synthesis(void *memory, float *re, float *im, const float *gains, float *out) {
+    return rnnoise_synthesis(&((ParityState *)memory)->state, re, im, gains, out);
 }
 
 void test_apply_atten_lim(float *band_gains, float atten_lim_db) {
@@ -105,9 +120,18 @@ def _compile_bridge(tmpdir):
     suffix = '.dylib' if sys.platform == 'darwin' else '.so'
     library = pathlib.Path(tmpdir) / f'feature_bridge{suffix}'
     shared_flag = '-dynamiclib' if sys.platform == 'darwin' else '-shared'
+    common = pathlib.Path(os.environ.get('COMMON_DIR', ROOT.parents[2] / 'audiolib' / 'common')).resolve()
+    simd = os.environ.get('RNNOISE_TEST_SIMD', '1')
+    if simd not in ('0', '1'):
+        raise ValueError('RNNOISE_TEST_SIMD must be 0 or 1')
+    common_make = ['make', '-s', '--no-print-directory', '-C', str(common), f'SIMD={simd}', f'CC={cc}']
+    subprocess.run(common_make + ['lib'], check=True, stdout=subprocess.DEVNULL)
+    archive = subprocess.check_output(common_make + ['print-lib-path'], text=True).strip()
+    simd_flags = ['-DSIMD_KERNELS_FORCE_SCALAR'] if simd == '0' else []
     subprocess.run([
         cc, shared_flag, '-fPIC', '-O2', '-ffp-contract=off',
-        '-I', str(ROOT), str(wrapper), str(ROOT / 'process.c'),
+        *simd_flags, '-I', str(ROOT), '-I', str(common / 'include'), '-I', str(common),
+        str(wrapper), str(ROOT / 'process.c'), archive,
         '-o', str(library), '-lm',
     ], check=True)
     return ctypes.CDLL(str(library))
@@ -152,6 +176,12 @@ def main():
     float_p = ctypes.POINTER(ctypes.c_float)
     lib.test_state_size.restype = ctypes.c_size_t
     lib.test_state_init.argtypes = [ctypes.c_void_p]
+    lib.test_state_init.restype = ctypes.c_int
+    lib.test_state_free.argtypes = [ctypes.c_void_p]
+    lib.test_state_reset.argtypes = [ctypes.c_void_p]
+    lib.test_state_reset.restype = ctypes.c_int
+    lib.test_synthesis.argtypes = [ctypes.c_void_p, float_p, float_p, float_p, float_p]
+    lib.test_synthesis.restype = ctypes.c_int
     lib.test_analysis.argtypes = [ctypes.c_void_p, float_p, float_p, float_p]
     lib.test_step.argtypes = [ctypes.c_void_p, float_p, float_p, float_p, float_p]
     lib.test_step.restype = ctypes.c_int
@@ -160,70 +190,120 @@ def main():
     lib.test_apply_atten_lim.argtypes = [float_p, ctypes.c_float]
 
     memory = ctypes.create_string_buffer(lib.test_state_size())
-    lib.test_state_init(memory)
+    assert lib.test_state_init(memory) == 0
 
-    # One center=False analysis frame: C root-Hann + normalized FFT must
-    # match the exact tensor entering Python feature extraction.
-    n = np.arange(512, dtype=np.float32)
-    frame = (0.03 * np.sin(2 * np.pi * 17 * n / 512) +
-             0.01 * np.cos(2 * np.pi * 53 * n / 512)).astype(np.float32)
-    c_re = np.empty(N_BINS, dtype=np.float32)
-    c_im = np.empty(N_BINS, dtype=np.float32)
-    lib.test_analysis(
-        memory, frame.ctypes.data_as(float_p),
-        c_re.ctypes.data_as(float_p), c_im.ctypes.data_as(float_p))
-    window = torch.sqrt(torch.hann_window(512))
-    py_fft = torch.fft.rfft(torch.from_numpy(frame) * window, norm='ortho')
-    np.testing.assert_allclose(c_re, py_fft.real.numpy(), rtol=3e-5, atol=3e-6)
-    np.testing.assert_allclose(c_im, py_fft.imag.numpy(), rtol=3e-5, atol=3e-6)
+    try:
+        # One center=False analysis frame: C root-Hann + normalized FFT must
+        # match the exact tensor entering Python feature extraction.
+        n = np.arange(512, dtype=np.float32)
+        frame = (0.03 * np.sin(2 * np.pi * 17 * n / 512) +
+                 0.01 * np.cos(2 * np.pi * 53 * n / 512)).astype(np.float32)
+        c_re = np.empty(N_BINS, dtype=np.float32)
+        c_im = np.empty(N_BINS, dtype=np.float32)
+        lib.test_analysis(
+            memory, frame.ctypes.data_as(float_p),
+            c_re.ctypes.data_as(float_p), c_im.ctypes.data_as(float_p))
+        window = torch.sqrt(torch.hann_window(512))
+        py_fft = torch.fft.rfft(torch.from_numpy(frame) * window, norm='ortho')
+        np.testing.assert_allclose(c_re, py_fft.real.numpy(), rtol=3e-5, atol=3e-6)
+        np.testing.assert_allclose(c_im, py_fft.imag.numpy(), rtol=3e-5, atol=3e-6)
+    
+        c_erb = np.empty((3, N_BANDS), dtype=np.float32)
+        c_spec = np.empty((3, 2, SPEC_BINS), dtype=np.float32)
+        for t, frame in enumerate(spectra):
+            re = np.ascontiguousarray(frame.real, dtype=np.float32)
+            im = np.ascontiguousarray(frame.imag, dtype=np.float32)
+            ready = lib.test_step(
+                memory,
+                re.ctypes.data_as(float_p),
+                im.ctypes.data_as(float_p),
+                c_erb.ctypes.data_as(float_p),
+                c_spec.ctypes.data_as(float_p),
+            )
+            assert ready == int(t >= 2), (t, ready)
+            if ready:
+                np.testing.assert_allclose(
+                    c_erb, py_erb[0, t - 2:t + 1].numpy(), rtol=3e-5, atol=3e-5)
+                np.testing.assert_allclose(
+                    c_spec, py_spec[0, t - 2:t + 1].numpy(), rtol=3e-5, atol=3e-5)
+    
+        c_erb_state = np.empty(N_BANDS, dtype=np.float32)
+        c_spec_state = np.empty(SPEC_BINS, dtype=np.float32)
+        lib.test_copy_erb_state(memory, c_erb_state.ctypes.data_as(float_p))
+        lib.test_copy_spec_state(memory, c_spec_state.ctypes.data_as(float_p))
+        np.testing.assert_allclose(
+            c_erb_state, py_state['erb'][0, 0].numpy(), rtol=3e-5, atol=3e-5)
+        np.testing.assert_allclose(
+            c_spec_state, py_state['spec'][0, 0].numpy(), rtol=3e-5, atol=3e-5)
+    
+        # rnnoise_apply_atten_lim must agree with inference.py's apply_atten_lim
+        # (attenuation-limit gain mix, ported from Rikorose/DeepFilterNet
+        # enhance.py) bit-for-bit-equivalent within float32 tolerance, both
+        # for the disabled (<=0) no-op path and the active-mixing path.
+        # MUST be N_BANDS long: rnnoise_apply_atten_lim writes
+        # RNNOISE_N_BANDS entries unconditionally; a shorter array would overflow
+        # the heap on every call with atten_lim_db > 0, and under pytest the
+        # corruption would surface later as a malloc abort inside an unrelated
+        # torch op.
+        py_gains = torch.linspace(0.0, 1.0, N_BANDS, dtype=torch.float32)
+        for atten_lim_db in (0.0, -3.0, 6.0, 12.0, 40.0):
+            c_gains = py_gains.numpy().copy().astype(np.float32)
+            lib.test_apply_atten_lim(c_gains.ctypes.data_as(float_p),
+                                     ctypes.c_float(atten_lim_db))
+            py_out = apply_atten_lim(py_gains.clone(), atten_lim_db).numpy()
+            np.testing.assert_allclose(c_gains, py_out, rtol=1e-6, atol=1e-6)
+    
+        # One full caller frame per analysis call, and one hop from the first
+        # synthesis call. Independent torch transforms catch scale, window,
+        # imaginary-sign, full-frame/hop and overlap-reset mistakes.
+        rng = np.random.default_rng(20261021)
+        waveform = rng.uniform(-0.2, 0.2, 512 + 8 * 256).astype(np.float32)
+        c_frames = []
+        for offset in range(0, len(waveform) - 511, 256):
+            frame = np.ascontiguousarray(waveform[offset:offset + 512])
+            lib.test_analysis(memory, frame.ctypes.data_as(float_p),
+                              c_re.ctypes.data_as(float_p), c_im.ctypes.data_as(float_p))
+            reference = torch.fft.rfft(torch.from_numpy(frame) * window, norm='ortho')
+            np.testing.assert_allclose(c_re, reference.real.numpy(), rtol=3e-5, atol=3e-6)
+            np.testing.assert_allclose(c_im, reference.imag.numpy(), rtol=3e-5, atol=3e-6)
+            c_frames.append(c_re.copy() + 1j * c_im.copy())
 
-    c_erb = np.empty((3, N_BANDS), dtype=np.float32)
-    c_spec = np.empty((3, 2, SPEC_BINS), dtype=np.float32)
-    for t, frame in enumerate(spectra):
-        re = np.ascontiguousarray(frame.real, dtype=np.float32)
-        im = np.ascontiguousarray(frame.imag, dtype=np.float32)
-        ready = lib.test_step(
-            memory,
-            re.ctypes.data_as(float_p),
-            im.ctypes.data_as(float_p),
-            c_erb.ctypes.data_as(float_p),
-            c_spec.ctypes.data_as(float_p),
-        )
-        assert ready == int(t >= 2), (t, ready)
-        if ready:
-            np.testing.assert_allclose(
-                c_erb, py_erb[0, t - 2:t + 1].numpy(), rtol=3e-5, atol=3e-5)
-            np.testing.assert_allclose(
-                c_spec, py_spec[0, t - 2:t + 1].numpy(), rtol=3e-5, atol=3e-5)
+        def synthesize(spectra, gains):
+            assert lib.test_state_reset(memory) == 0
+            emitted = []
+            scale = np.float32(22.62741699796952)
+            for spectrum, gain in zip(spectra, gains):
+                re = np.ascontiguousarray(spectrum.real)
+                im = np.ascontiguousarray(spectrum.imag)
+                expected_re, expected_im = re * (gain * scale), im * (gain * scale)
+                out = np.empty(256, dtype=np.float32)
+                assert lib.test_synthesis(
+                    memory, re.ctypes.data_as(float_p), im.ctypes.data_as(float_p),
+                    gain.ctypes.data_as(float_p), out.ctypes.data_as(float_p)) == 0
+                np.testing.assert_array_equal(re.view(np.uint32), expected_re.view(np.uint32))
+                np.testing.assert_array_equal(im.view(np.uint32), expected_im.view(np.uint32))
+                emitted.append(out)
+            return np.concatenate(emitted)
 
-    c_erb_state = np.empty(N_BANDS, dtype=np.float32)
-    c_spec_state = np.empty(SPEC_BINS, dtype=np.float32)
-    lib.test_copy_erb_state(memory, c_erb_state.ctypes.data_as(float_p))
-    lib.test_copy_spec_state(memory, c_spec_state.ctypes.data_as(float_p))
-    np.testing.assert_allclose(
-        c_erb_state, py_state['erb'][0, 0].numpy(), rtol=3e-5, atol=3e-5)
-    np.testing.assert_allclose(
-        c_spec_state, py_state['spec'][0, 0].numpy(), rtol=3e-5, atol=3e-5)
+        spectra = np.stack(c_frames)
+        gains = rng.uniform(0.05, 1.0, spectra.shape).astype(np.float32)
+        c_wave = synthesize(spectra, gains)
+        reference = istft(torch.from_numpy(spectra * gains).T, 512, 256, 512, window).numpy()
+        assert len(c_wave) == len(spectra) * 256
+        np.testing.assert_allclose(c_wave, reference[:len(c_wave)], rtol=3e-5, atol=3e-6)
+        np.testing.assert_array_equal(synthesize(spectra, gains), c_wave)
+        identity = synthesize(spectra, np.ones_like(gains))
+        np.testing.assert_allclose(identity[256:], waveform[256:len(identity)], rtol=3e-5, atol=3e-6)
+        # A wrong whole-frame shift or extra analysis delay cannot hide behind
+        # a periodic test tone: compare the untrimmed first hop separately.
+        first_hop = waveform[:256] * window[:256].numpy() ** 2
+        np.testing.assert_allclose(identity[:256], first_hop, rtol=3e-5, atol=3e-6)
 
-    # rnnoise_apply_atten_lim must agree with inference.py's apply_atten_lim
-    # (attenuation-limit gain mix, ported from Rikorose/DeepFilterNet
-    # enhance.py) bit-for-bit-equivalent within float32 tolerance, both
-    # for the disabled (<=0) no-op path and the active-mixing path.
-    # MUST be N_BANDS long: rnnoise_apply_atten_lim writes
-    # RNNOISE_N_BANDS entries unconditionally; a shorter array would overflow
-    # the heap on every call with atten_lim_db > 0, and under pytest the
-    # corruption would surface later as a malloc abort inside an unrelated
-    # torch op.
-    py_gains = torch.linspace(0.0, 1.0, N_BANDS, dtype=torch.float32)
-    for atten_lim_db in (0.0, -3.0, 6.0, 12.0, 40.0):
-        c_gains = py_gains.numpy().copy().astype(np.float32)
-        lib.test_apply_atten_lim(c_gains.ctypes.data_as(float_p),
-                                 ctypes.c_float(atten_lim_db))
-        py_out = apply_atten_lim(py_gains.clone(), atten_lim_db).numpy()
-        np.testing.assert_allclose(c_gains, py_out, rtol=1e-6, atol=1e-6)
-
-    print('PASS: train.py and process.c STFT/features/states agree')
-    print('PASS: rnnoise_apply_atten_lim matches inference.py apply_atten_lim')
+        print('PASS: train.py and process.c STFT/features/states agree')
+        print('PASS: rnnoise_apply_atten_lim matches inference.py apply_atten_lim')
+        print('PASS: full-frame analysis, mutable spectrum, synthesis hop, reset and latency')
+    finally:
+        lib.test_state_free(memory)
 
 
 def test_main():

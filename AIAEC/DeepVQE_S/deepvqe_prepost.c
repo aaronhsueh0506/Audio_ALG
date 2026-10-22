@@ -3,7 +3,7 @@
  * This file OWNS no signal processing of its own. It composes the two
  * parity-tested translation units -- aiaec_process.c (the complex-mask
  * helpers; the sqrt-Hann STFT/WOLA it shares with Align-ULCNet is
- * audio_common's AcStft / AcIstft) and deepvqe_process.c (the CCM
+ * audiolib's AcStft / AcIstft) and deepvqe_process.c (the CCM
  * kernel) -- and adds only the object lifecycle, the pool carve, the
  * accelerator tensor views and the per-hop frame state machine. Neither
  * file's existing entry points change, so both of their standalone parity
@@ -19,8 +19,8 @@
 
 #include "deepvqe_prepost.h"
 
-#include "mem_align.h"
-#include "simd_kernel_nn.h"
+#include "utility/mem_align.h"
+#include "utility/simd_kernel_nn.h"
 
 #include <math.h>
 #include <stdlib.h>
@@ -232,7 +232,7 @@ const char *deepvqe_prepost_skip_policy_name(void) {
 }
 
 /* ---- pool arithmetic ---------------------------------------------------
- * audio_common's saturating helpers (mem_align.h): an overflow anywhere in
+ * audiolib's saturating helpers (mem_align.h): an overflow anywhere in
  * the walk pins the cursor to SIZE_MAX, which MEM_SIZE_INVALID catches. */
 
 #ifdef __STDC_VERSION__
@@ -272,7 +272,7 @@ static uint32_t pp_build_hash(int io_mode, int delay_depth) {
     h = pp_fnv1a(h, (uint32_t)DEEPVQE_PREPOST_CARVE_VERSION);
     h = pp_fnv1a(h, (uint32_t)io_mode);
     h = pp_fnv1a(h, (uint32_t)delay_depth);
-    return h;
+    return ac_memreq_abi_hash(h);
 }
 
 /* The framing objects of the TIME configuration: rolling analyses and the
@@ -710,61 +710,6 @@ static void pp_close_frame(DeepVqePrepost *p) {
     }
 }
 
-/* 1 when every element of `rows` rows of `width` floats, `stride` floats
- * apart, is finite: skn_all_finite_f32 applied to each row. */
-static inline __attribute__((unused)) int rows_all_finite_scalar(const float *base, size_t rows,
-                                     size_t stride, size_t width) {
-    size_t row;
-    for (row = 0; row < rows; ++row)
-        if (!skn_all_finite_f32_scalar(base + row * stride, width)) return 0;
-    return 1;
-}
-
-#if SK_HAVE_NEON
-/* The same predicate for all rows at once: the largest masked exponent field
- * seen reaches 0x7f800000 only for Inf or NaN. A row's last quad is read again
- * from its end when the width is no multiple of four, which a maximum does not
- * mind. */
-static inline int rows_all_finite_neon(const float *base, size_t rows,
-                                       size_t stride, size_t width) {
-    const uint32x4_t exponent = vdupq_n_u32(0x7f800000u);
-    uint32x4_t a0 = vdupq_n_u32(0u), a1 = a0, a2 = a0, a3 = a0;
-    size_t row, i;
-
-    if (width < 4) return rows_all_finite_scalar(base, rows, stride, width);
-    for (row = 0; row < rows; ++row) {
-        const float *p = base + row * stride;
-        for (i = 0; i + 16 <= width; i += 16) {
-            a0 = vmaxq_u32(a0, vandq_u32(vreinterpretq_u32_f32(
-                vld1q_f32(p + i)), exponent));
-            a1 = vmaxq_u32(a1, vandq_u32(vreinterpretq_u32_f32(
-                vld1q_f32(p + i + 4)), exponent));
-            a2 = vmaxq_u32(a2, vandq_u32(vreinterpretq_u32_f32(
-                vld1q_f32(p + i + 8)), exponent));
-            a3 = vmaxq_u32(a3, vandq_u32(vreinterpretq_u32_f32(
-                vld1q_f32(p + i + 12)), exponent));
-        }
-        for (; i + 4 <= width; i += 4)
-            a0 = vmaxq_u32(a0, vandq_u32(vreinterpretq_u32_f32(
-                vld1q_f32(p + i)), exponent));
-        if (i < width)
-            a1 = vmaxq_u32(a1, vandq_u32(vreinterpretq_u32_f32(
-                vld1q_f32(p + width - 4)), exponent));
-    }
-    return vmaxvq_u32(vmaxq_u32(vmaxq_u32(a0, a1), vmaxq_u32(a2, a3))) <
-           0x7f800000u;
-}
-#endif
-
-static inline int rows_all_finite(const float *base, size_t rows,
-                                  size_t stride, size_t width) {
-#if SK_HAVE_NEON
-    return rows_all_finite_neon(base, rows, stride, width);
-#else
-    return rows_all_finite_scalar(base, rows, stride, width);
-#endif
-}
-
 /* The finite predicate over what the graph just wrote into one state tensor.
  * Every window is written back whole, but only its newest frame is new: slot
  * 0 of an attention ring (newest first), the last frame of a conv or score
@@ -787,7 +732,7 @@ static int newest_frame_finite(const DeepVqePrepost *p, int id) {
     width = (size_t)dims[3];
     newest = (id == DEEPVQE_STATE_ALIGN_KEY_RING ||
               id == DEEPVQE_STATE_ALIGN_VALUE_RING) ? 0u : frames - 1u;
-    return rows_all_finite(p->state[id] + newest * width, channels,
+    return skn_all_finite_rows_f32(p->state[id] + newest * width, channels,
                            frames * width, width);
 }
 

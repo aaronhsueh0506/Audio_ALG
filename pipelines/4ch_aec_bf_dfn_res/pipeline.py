@@ -16,7 +16,7 @@ reference, unchanged.  This module adds the post half that has no Python twin
   ``4ch_aec_bf_dfn_res`` C wrapper.
 
 Both consume the same fused ``AecResContext`` stream, so the two tails differ
-only in the stage under test.  The C wrapper hands the stage the GSC output
+only in the stage under test.  The C wrapper hands the stage the beamformer's output
 directly (``trusted_beamformed_error``); here ``E`` is the coherent projection
 ``sum_ch w_ch * error_spec_ch`` the Python reference builds from the adapter's
 weights, which is the same signal when the adapter's weights are the ones the

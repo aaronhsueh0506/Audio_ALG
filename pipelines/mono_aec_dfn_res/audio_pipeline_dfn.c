@@ -4,7 +4,8 @@
 #include <string.h>
 
 #include "audio_pipeline_dfn.h"
-#include "simd_kernels.h"   /* sk_min_f32 / sk_capply_gain_f32 */
+#include "utility/mem_align.h"
+#include "utility/simd_kernels.h"   /* sk_min_f32 / sk_capply_gain_f32 */
 
 #define MONO_ALIGN 16u
 
@@ -129,7 +130,7 @@ static void fill_descriptor(const Resolved *r, MonoAecDfnResMemReq *out) {
     out->descriptor_version = MONO_AEC_DFN_RES_DESCRIPTOR_VERSION;
     out->layout_version = MONO_AEC_DFN_RES_LAYOUT_VERSION;
     out->backend_id = r->backend_id;
-    out->build_flags_hash = h;
+    out->build_flags_hash = ac_memreq_abi_hash(h);
     out->alignment = MONO_ALIGN;
     out->bytes = (uint64_t)r->bytes;
 }

@@ -43,8 +43,7 @@
  * stack (same rationale as lib/aec's stack-safety rule). The
  * chain's FFT is ONE pool-carved compiled-grid fft_wrapper handle shared by
  * err-analysis + far-analysis + synthesis (strictly sequential use within
- * a hop, per ulcnet_process.h's sharing contract), so BACKEND=kiss/ne10
- * genuinely selects the ULCNet FFT backend too.
+ * a hop, per ulcnet_process.h's sharing contract).
  */
 
 #include <math.h>
@@ -53,19 +52,19 @@
 #include <stdint.h>
 
 #include "audio_pipeline_ulcnet.h"
-#include "mem_align.h"       /* ALIGN16 / MEM_IS_ALIGNED16 */
+#include "utility/mem_align.h"       /* ALIGN16 / MEM_IS_ALIGNED16 */
 #include "common/se_config.h"  /* se_derive(): grid + AecConfig, shared by every application */
-#include "simd_kernel_nn.h"    /* skn_fill_f32 */
+#include "utility/simd_kernel_nn.h"    /* skn_fill_f32 */
 
 /* This wrapper's own carve-layout version (see AudioPipelineUlcnetMemReq's
  * doc). Any change of pool size, carve order or descriptor content bumps it,
  * including a change of the self-resident Ulcnet state block or of a composed
  * pool; the token string in audio_pipeline_ulcnet_build_flags_hash() moves
  * with a changed carve. */
-#define AUDIO_PIPELINE_ULCNET_LAYOUT_VERSION 13u
+#define AUDIO_PIPELINE_ULCNET_LAYOUT_VERSION 14u
 
 /* Compile-time FFT backend identity -- same mechanism as audio_pipeline.c:
- * pipelines/Makefile passes -DAUDIO_PIPELINE_BACKEND_STR=\"kiss\"/\"ne10\"
+ * pipelines/Makefile passes -DAUDIO_PIPELINE_BACKEND_STR=\"ne10\"
  * to every TU it compiles; the fallback only fires outside that Makefile
  * and is rejected by get_mem_requirements (backend_id 0 is reserved). */
 #ifndef AUDIO_PIPELINE_BACKEND_STR
@@ -73,8 +72,6 @@
 #endif
 
 static uint32_t audio_pipeline_ulcnet_backend_id(void) {
-    if (strcmp(AUDIO_PIPELINE_BACKEND_STR, "kiss") == 0)
-        return AUDIO_PIPELINE_ULCNET_BACKEND_KISS;
     if (strcmp(AUDIO_PIPELINE_BACKEND_STR, "ne10") == 0)
         return AUDIO_PIPELINE_ULCNET_BACKEND_NE10;
     return 0u;
@@ -305,7 +302,7 @@ static uint32_t audio_pipeline_ulcnet_build_flags_hash(void) {
                          "frame_scratch[1],ulcnet_window),aec,fft,"
                          "ana_err,ana_far,synth", h);
     h = ulcnet_fnv1a_str("|align|ulcnet" ULCNET_GRID_TOKEN, h);
-    return h;
+    return ac_memreq_abi_hash(h);
 }
 
 /* NaN/Inf guard: a model frame with ANY non-finite value must never reach

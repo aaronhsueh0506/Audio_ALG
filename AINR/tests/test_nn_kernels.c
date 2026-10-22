@@ -144,15 +144,17 @@ static int test_gtcrn_kernels(void)
                 if (rng() % 8 != 0) inv[i] = 0.0f;
         }
 
-        gtcrn_model_input(spectrum, fwd, m_a, r_a, i_a);
-        ref_input(spectrum, fwd, want);
+        gtcrn_model_input((const float (*)[2])spectrum, fwd, m_a, r_a, i_a);
+        ref_input((const float (*)[2])spectrum, fwd, want);
         CHECK(same_bits(m_a, m_b, GTCRN_MODEL_ERB_BANDS) &&
               same_bits(r_a, r_b, GTCRN_MODEL_ERB_BANDS) &&
               same_bits(i_a, i_b, GTCRN_MODEL_ERB_BANDS),
               "GTCRN model_input equals the plain contract");
 
-        gtcrn_model_output(mask, inv, spectrum, en_a);
-        ref_output(mask, inv, spectrum, en_b);
+        gtcrn_model_output((const float (*)[2])mask, inv,
+                           (const float (*)[2])spectrum, en_a);
+        ref_output((const float (*)[2])mask, inv,
+                   (const float (*)[2])spectrum, en_b);
         CHECK(same_bits(&en_a[0][0], &en_b[0][0], 2 * GTCRN_N_BINS),
               "GTCRN model_output equals the plain contract");
 
@@ -180,7 +182,7 @@ static int test_gtcrn_kernels(void)
                 mr[k] = mask[k][0];
                 mi[k] = mask[k][1];
             }
-            mask_expand_scalar(mask, inv, mr, mi);
+            mask_expand_scalar((const float (*)[2])mask, inv, mr, mi);
             for (int k = 0; k < GTCRN_N_BINS; ++k) {
                 float sr = spectrum[k][0], si = spectrum[k][1];
                 float a = sr * mr[k], b = si * mi[k], cc = si * mr[k],
@@ -217,7 +219,7 @@ static int test_gtcrn_kernels(void)
                   same_bits(t2, s2, GTCRN_MODEL_ERB_BANDS),
                   "GTCRN NEON band kernel equals its scalar twin");
             mask_expand_neon(mask, inv, mr0, mi0);
-            mask_expand_scalar(mask, inv, mr1, mi1);
+            mask_expand_scalar((const float (*)[2])mask, inv, mr1, mi1);
             CHECK(same_bits(mr0 + GTCRN_MODEL_ERB_KEPT, mr1 + GTCRN_MODEL_ERB_KEPT,
                             GTCRN_MODEL_ERB_HIGH_BINS) &&
                   same_bits(mi0 + GTCRN_MODEL_ERB_KEPT, mi1 + GTCRN_MODEL_ERB_KEPT,

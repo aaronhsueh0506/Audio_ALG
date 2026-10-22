@@ -12,6 +12,7 @@
 #include "dfn_rate_bridge.h"
 #include "audio_stft.h"
 #include "fft_wrapper.h"
+#include "utility/mem_align.h"   /* ALIGN16 -- was transitively reached via fft_wrapper.h */
 #include "tests/dfn_test_fixture.h"
 
 #define MAX_FFT 512
@@ -246,7 +247,7 @@ static int run_rejections(void) {
 
 /* The bridge and both ULCNet pipelines size their STFT/ISTFT objects before
  * any FFT handle exists, as the object that carves its own handle and window
- * less those two regions. Pin that accounting against the size audio_common
+ * less those two regions. Pin that accounting against the size audiolib
  * reports for an object that really borrows them, for AcStft and AcIstft in
  * both synthesis modes, and show that a block one alignment unit short is
  * refused. */

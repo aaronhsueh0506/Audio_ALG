@@ -9,7 +9,7 @@ extern "C" {
 
 /* Per-channel input gain with an optional clip.
  *
- * audio_common's AudioPreGain (audio_pre_gain.h) is the canonical single-gain
+ * audiolib's AudioPreGain (audio_pre_gain.h) is the canonical single-gain
  * input stage for this stack; this module is the multi-channel variant the
  * integrator's capture path needs -- one gain per microphone plus the clip --
  * and it shapes the signal with the same shared kernels. Prefer AudioPreGain
@@ -67,8 +67,8 @@ void     fix_gain_process(FixGain* fg, float* x, int n, int ch);
 void     fix_gain_destroy(FixGain* fg);
 
 /* 10^(db/20). Pure conversion with NO validation: a non-finite `db` gives a
- * non-finite gain, which fix_gain_get_mem_size() then refuses. audio_common's
- * audio_pre_gain_set_gain_db() is the validating entry point for the same
+ * non-finite gain, which fix_gain_get_mem_size() then refuses. audiolib's
+ * audio_pre_gain_set_db() is the validating entry point for the same
  * convention. */
 float    fix_gain_db_to_linear(float db);
 

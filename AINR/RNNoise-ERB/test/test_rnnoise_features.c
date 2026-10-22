@@ -1,6 +1,8 @@
+#define _POSIX_C_SOURCE 200809L
 /* Independent C reference test for the RNNOISE_FEATURE_VERSION feature contract. */
 
 #include "process.h"
+#include "rnnoise_test_framing.h"
 #include "rnnoise_tables_gen.h"
 
 #include <math.h>
@@ -107,7 +109,8 @@ int main(void) {
     float want_spec[3][2][RNNOISE_SPEC_BINS];
     int ok = 1;
 
-    rnnoise_state_init(&actual);
+    RNNoiseTestFraming framing;
+    if (rnnoise_test_framing_init(&framing, &actual) != 0) return 1;
     rnnoise_model_state_init(&model_state);
     /* The state struct is the buffer the graph's h*_out outputs write into,
      * so a healthy state validates in place and is left byte-identical. */
@@ -300,5 +303,6 @@ int main(void) {
                "converges to zero while complex features remain observable after %d frames\n",
                RNNOISE_FEATURE_VERSION, TEST_FRAMES);
     }
+    rnnoise_test_framing_free(&framing);
     return ok ? 0 : 1;
 }

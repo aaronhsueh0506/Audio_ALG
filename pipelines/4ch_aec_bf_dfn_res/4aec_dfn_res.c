@@ -4,8 +4,9 @@
 #include <string.h>
 
 #include "4aec_dfn_res.h"
+#include "utility/mem_align.h"
 #include "audio_stft.h"
-#include "simd_kernels.h"
+#include "utility/simd_kernels.h"
 
 #define WRAP_ALIGN 16u
 
@@ -73,7 +74,7 @@ static int add_region(size_t *total, size_t bytes) {
 
 static int resolve(const FourAecDfnResConfig *cfg, Resolved *r) {
     FourAecNrResMemBreakdown bd;
-    AnrConfig nr_cfg;
+    AnrConfig nr_cfg;           /* zeroed by stage_configs (enable_nr = 0); unused */
     size_t total;
     if (!cfg || !r ||
         (cfg->front_end.sample_rate != 16000 &&
@@ -154,7 +155,7 @@ static void fill_descriptor(const Resolved *r, FourAecDfnResMemReq *out) {
     out->descriptor_version = FOUR_AEC_DFN_RES_DESCRIPTOR_VERSION;
     out->layout_version = FOUR_AEC_DFN_RES_LAYOUT_VERSION;
     out->backend_id = r->front_req.backend_id;
-    out->build_flags_hash = h;
+    out->build_flags_hash = ac_memreq_abi_hash(h);
     out->alignment = WRAP_ALIGN;
     out->bytes = (uint64_t)r->bytes;
 }

@@ -133,8 +133,8 @@ enum { AUDIO_PIPELINE_ULCNET_REPRIME_FRAMES = 1 };
 
 /** Stable FFT backend identifiers (same values as audio_pipeline.h's, so a
  * board-side descriptor store can share the id space; redefined here so this
- * header stays self-contained). Zero is reserved and never returned. */
-#define AUDIO_PIPELINE_ULCNET_BACKEND_KISS 1u
+ * header stays self-contained). Zero is reserved and never returned; 1 is
+ * retired and never returned. */
 #define AUDIO_PIPELINE_ULCNET_BACKEND_NE10 2u
 
 /**
@@ -152,7 +152,7 @@ enum { AUDIO_PIPELINE_ULCNET_REPRIME_FRAMES = 1 };
 typedef struct {
     uint32_t descriptor_version;  /* = AUDIO_PIPELINE_ULCNET_DESCRIPTOR_VERSION (1) */
     uint32_t layout_version;      /* carve-layout version, starts at 1        */
-    uint32_t backend_id;          /* _BACKEND_KISS=1 / _BACKEND_NE10=2        */
+    uint32_t backend_id;          /* _BACKEND_NE10 = 2                         */
     uint32_t build_flags_hash;    /* FNV-1a-32 over backend + carve tokens    */
     uint32_t alignment;           /* 16                                       */
     uint32_t reserved;            /* 0; keeps 8-byte alignment for bytes      */

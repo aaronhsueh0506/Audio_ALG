@@ -1,5 +1,20 @@
 # AIAEC models
 
+## ARM target selection
+
+C deployment supports both ARM EABI32 and AArch64 builds. The target compiler's
+predefined macros select the path: AArch64 uses the guarded NEON model kernels;
+ARM32 uses their existing scalar implementations. `SIMD=0` still forces scalar.
+The shared FFT independently selects its available target implementation; select
+the board compiler and ABI flags rather than editing source guards. Signal grids,
+model state tensors and latency do not change with pointer width.
+
+Public memory descriptors remain 32 bytes. Their build hashes add an ILP32 token
+on 32-bit targets and preserve the existing hashes on 64-bit targets. Re-query
+requirements for the target build; `_init_ex` rejects a descriptor from the other
+ABI before touching the supplied pool.
+
+
 AIAEC has four candidates. There are no GTCRN- or DeepFilterNet2-derived AENR
 variants: Align-ULCNet covers the linear-AEC + RES/NR route.
 

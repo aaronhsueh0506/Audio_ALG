@@ -2,39 +2,39 @@
 # audit_fp_contract.sh -- disassembly check for pipeline objects whose
 # multiply/add ordering is part of the numerical contract.
 #
-# Why this exists here and not in audio_common: the KERNEL those objects call
-# (sk_wola_accumulate_f32) is audited by audio_common's own script, against a
+# Why this exists here and not in audiolib: the KERNEL those objects call
+# (sk_wola_accumulate_f32) is audited by audiolib's own script, against a
 # non-inline instantiation in that repo. The CALL SITES are a separate
 # question -- these translation units carry WOLA or DFN per-bin floating-point
 # work, and none of them was ever disassembled. Being compiled
 # under -ffp-contract=off is a Makefile property; being fma-free is a property
-# of the emitted code, and only a disassembly says so. audio_common must not
+# of the emitted code, and only a disassembly says so. audiolib must not
 # reach up into Audio_ALG, so the audit for these objects lives with them.
 #
 # The object under test is BUILT BY THIS SCRIPT and its directory is then
 # queried from the very same make configuration. Picking "the newest object
 # lying around" would not survive scrutiny: the obj/ tree accumulates many
-# config signatures (backend, SIMD, and the producer signatures of
-# audio_common/AEC/NR, which move whenever those repos are edited), so an
+# config signatures (SIMD, and the producer signatures of
+# audiolib/common/AEC/NR, which move whenever those repos are edited), so an
 # audit of an unrelated stale object would pass while saying nothing.
 #
-# Usage:  scripts/audit_fp_contract.sh [BACKEND ...]      (default: ne10 kiss)
+# Usage:  scripts/audit_fp_contract.sh [BACKEND ...]      (default: ne10, the only backend)
 #         SIMD=0|1 (default 1) and WERROR are honoured and forwarded.
 # Exit 0 if every audited object disassembles free of fma-class instructions.
 
 set -eu
 
 cd "$(dirname "$0")/.."
-BACKENDS="${*:-ne10 kiss}"
+BACKENDS="${*:-ne10}"
 SIMD="${SIMD:-1}"
 WERROR="${WERROR:-1}"
 
 # The forbidden mnemonic set and the disassembler wrapper come from
-# audio_common, so extending the set is one edit rather than two copies that
-# can silently disagree. Depending on audio_common is the allowed direction;
+# audiolib, so extending the set is one edit rather than two copies that
+# can silently disagree. Depending on audiolib is the allowed direction;
 # the reverse is not, which is why the audit LIST below stays here.
-AC_DIR="${AC_DIR:-../../audio_common}"
-. "$AC_DIR/scripts/fp_contract_lib.sh"
+COMMON_DIR="${COMMON_DIR:-../../audiolib/common}"
+. "$COMMON_DIR/scripts/fp_contract_lib.sh"
 FMA_RE="$FP_CONTRACT_FMA_RE"
 disas() { fp_contract_disas "$1"; }
 

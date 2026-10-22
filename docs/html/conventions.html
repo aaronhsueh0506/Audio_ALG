@@ -31,7 +31,7 @@ code{font-family:ui-monospace,Menlo,monospace;font-size:.92em}
 <a href="onnx_prepost.html">ONNX 邊界</a> ·
 <a href="../../../AEC/docs/html/aec.html">AEC</a> ·
 <a href="../../../NR/docs/html/nr.html">NR</a> ·
-<a href="../../../audio_common/docs/html/audio_common.html">audio_common</a> ·
+<a href="../../../audiolib/common/docs/html/audio_common.html">audiolib</a> ·
 <a href="../../../AEC/docs/html/aec_res.html">AEC RES 級</a> ·
 <a href="pipeline_mono.html">mono</a> ·
 <a href="pipeline_ulcnet_mono.html">mono-ULCNet</a> ·
@@ -40,6 +40,7 @@ code{font-family:ui-monospace,Menlo,monospace;font-size:.92em}
 <a href="pipeline_dfn_mono.html">mono-DFN2</a> ·
 <a href="pipeline_dfn_4ch.html">4ch-DFN2</a> ·
 <a href="ainr_dfn2.html">DFN2</a> ·
+<a href="ainr_dfn3.html">DFN3</a> ·
 <a href="ainr_gtcrn.html">GTCRN</a> ·
 <a href="ainr_rnnoise_erb.html">RNNoise-ERB</a> ·
 <a href="aiaec_align_ulcnet.html">Align-ULCNet</a> ·
@@ -111,6 +112,7 @@ HOP/BINS/TA_BINS 由 N_FFT 導出）、<code>ulcnet_process.h</code>（四個別
 <td>1024 / 512（513）；<b>非上游 960/480</b>（2 的次方限制；DF 截止 4500 Hz
 vs 上游 4800 Hz）</td><td>編譯期固定</td>
 <td><code>dfn2_process.h</code></td></tr>
+<tr><td><a href="ainr_dfn3.html">AINR DFN3</a></td><td>48 k</td><td>1024 / 512（513）；32 ERB bands、96 DF bins</td><td>編譯期固定，模型 lookahead 1 hop</td><td><code>dfn3_process.h</code></td></tr>
 <tr><td>AINR GTCRN</td><td>16 k</td><td>512 / 256（257）</td><td>編譯期固定</td>
 <td><code>gtcrn_process.h</code></td></tr>
 <tr><td>AINR RNNoise-ERB</td><td>16 k</td>
@@ -135,16 +137,16 @@ vs 上游 4800 Hz）</td><td>編譯期固定</td>
 <table>
 <tr><th>使用點</th><th>程式碼</th></tr>
 <tr><td>AEC RES 分析窗（error_spec_windowed 用）</td>
-<td><code>pbfdkf.c</code> <code>pbfdaf_fill_windows()</code>（denom = block_size）</td></tr>
+<td><code>pbfdkf.c</code> <code>pbfdaf_fill_windows()</code>（<code>ac_window_build()</code>,denom = block_size）</td></tr>
 <tr><td>AEC3 post 合成窗（16k/512 grid 表格化 = sin(πk/512)）</td>
-<td><code>aec3_balanced_config.h</code> <code>AEC3B_SYNTH_WINDOW[512]</code>（per-rate 表）</td></tr>
-<tr><td>mono / 4ch pipeline 合成窗</td><td><code>pipelines/mono_aec_nr_res/audio_pipeline.c</code>、<code>pipelines/4ch_aec_bf_nr_res/4aec_nr_res.c</code>：<code>AcIstft</code> 自帶的窗表（<code>ac_window_build()</code>，<code>audio_common/src/audio_stft.c</code>）</td></tr>
+<td><code>aec_balanced_config.h</code> <code>AECB_SYNTH_WINDOW[512]</code>（per-rate 表）</td></tr>
+<tr><td>mono / 4ch pipeline 合成窗</td><td><code>pipelines/mono_aec_nr_res/audio_pipeline.c</code>、<code>pipelines/4ch_aec_bf_nr_res/4aec_nr_res.c</code>：<code>AcIstft</code> 自帶的窗表（<code>ac_window_build()</code>，<code>audiolib/common/src/audio_window.c</code>）</td></tr>
 <tr><td>DFN rate bridge（原生格點合成 + 48 kHz 分析／合成）</td><td><code>pipelines/dfn_rate_bridge.c</code>：bridge 自建的兩張表（<code>win_n</code>、<code>win48</code>，<code>ac_window_build()</code>），借給五個 <code>AcStft</code>／<code>AcIstft</code></td></tr>
 <tr><td>ULCNet 兩條 pipeline</td><td><code>audio_pipeline_ulcnet.c</code>、<code>audio_pipeline_4ch_ulcnet.c</code>：pipeline 自有的 <code>ulcnet_window</code>（<code>ac_window_build()</code>），借給分析與合成物件</td></tr>
 <tr><td>Align-ULCNet／DeepVQE-S 前後處理 class</td><td>呼叫端在 config 給的表（<code>ac_window_build()</code>），分析與合成共用</td></tr>
 <tr><td>DFN2/GTCRN 分析+合成</td><td>呼叫端的 <code>dfn2_framing_config()</code>／<code>gtcrn_framing_config()</code>；窗表由呼叫端借入，或由分析物件自帶、合成物件借用（<code>ac_stft_window()</code>）</td></tr>
 <tr><td>RNNoise-ERB 分析+合成</td>
-<td><code>rnnoise_tables_gen.h</code>（編譯期表；<code>gen_rnnoise_tables.c</code> 產生，
+<td><code>rnnoise_tables_gen.h</code>（編譯期表；<code>gen_rnnoise_tables.c</code> 呼叫 <code>ac_window_build()</code> 產生，
 <code>test_rnnoise_tables.c</code> 逐 byte drift-guard）</td></tr>
 <tr><td>AIAEC Python streaming 參考</td>
 <td><code>AIAEC/aiaec_streaming.py</code> StreamSTFT/StreamISTFT（對 torch center=True bit-exact）</td></tr>
@@ -157,15 +159,15 @@ vs 上游 4800 Hz）</td><td>編譯期固定</td>
 （<code>AC_OLA_ENV_NORM</code> 的 <code>env</code> 累加器），結果相同、簿記不同。</p>
 
 <h3>STFT／ISTFT 組幀家族（<code>audio_stft.h</code>）</h3>
-<p>上表所有呼叫點都經 audio_common 的 <code>AcStft</code>／<code>AcIstft</code>；差別只在兩個旋鈕：
+<p>上表所有呼叫點都經 audiolib 的 <code>AcStft</code>／<code>AcIstft</code>；差別只在兩個旋鈕：
 分析的 <code>center</code>（0 = 每次 push 恰一幀、零歷史起算；1 = torch <code>center=True</code>、reflect 前綴）與合成的
 <code>ola</code> 模式（<code>AC_OLA_ACCUMULATE</code> = acc += ifft×w、每幀吐一個 hop；<code>AC_OLA_ENV_NORM</code> =
-另累加 w×w、除以包絡、第一幀不吐）。頻譜縮放只有 DFN2 用（<code>spec_scale</code> = 1/32、<code>ispec_scale</code> = 32，皆 2 的冪，
+另累加 w×w、除以包絡、第一幀不吐）。頻譜縮放由 DFN2/DFN3 用（<code>spec_scale</code> = 1/32、<code>ispec_scale</code> = 32，皆 2 的冪，
 乘法不進位）；縮放恰為 1.0f 時略過乘法。</p>
 <div class="tbl">
 <table>
 <tr><th>家族</th><th>呼叫點</th><th>分析</th><th>合成</th><th>FFT／窗</th></tr>
-<tr><td>A</td><td>mono <code>synthesize_hop</code>、4ch <code>finish_hop</code></td><td>（在 AEC 內，非本物件）</td><td>ACCUMULATE</td><td>物件自帶 FFT 與窗</td></tr>
+<tr><td>A</td><td>mono <code>synthesize_hop</code></td><td>（在 AEC 內，非本物件）</td><td>ACCUMULATE</td><td>物件自帶 FFT 與窗</td></tr>
 <tr><td>B → A</td><td><code>dfn_rate_bridge.c</code>、<code>dfn2_process.c</code>、<code>gtcrn_process.c</code></td><td><code>center</code> 0（bridge 48 kHz 兩路、DFN2、GTCRN）</td><td>ACCUMULATE（bridge 三路、DFN2、GTCRN）</td><td>借用呼叫端／bridge 的 FFT handle 與窗</td></tr>
 <tr><td>C</td><td><code>ulcnet_prepost</code>、<code>deepvqe_prepost</code>、兩條 ULCNet pipeline</td><td><code>center</code> 0（出貨路徑）；<code>center</code> 1 只剩 Python parity 測試</td><td>ENV_NORM</td><td>借用 pipeline／呼叫端的 FFT handle 與窗</td></tr>
 </table>
@@ -254,10 +256,10 @@ exactly ONE hop」；輸出 hop p ≙ 輸入 hop p−1</td></tr>
 <table>
 <tr><th>階段</th><th>新增延遲</th><th>說明</th></tr>
 <tr><td>4×AEC lanes + 共享 delay matcher + SRP-PHAT DOA + GSC 權重
-（<code>four_aec_front_process</code> → <code>gsc_process_with_weights</code>）</td>
+（<code>four_aec_front_process</code> → <code>bf_process_with_weights</code>）</td>
 <td>+0 hop</td><td>同 hop 產生 beamformed 線性誤差<b>頻譜</b></td></tr>
 <tr><td>GSC 頻譜<b>直送</b>模型（不重建、不再分析）</td><td>+0 hop</td>
-<td><code>gsc_spectrum</code> 已是當前 hop 的 sqrt-Hann、50% overlap、一 hop 一幀
+<td><code>bf_spectrum</code> 已是當前 hop 的 sqrt-Hann、50% overlap、一 hop 一幀
 分析幀（各 lane 在 AEC 內分析，beamformer 只逐 bin 加權），拆成
 <code>err_re/err_im</code> 直接餵 model</td></tr>
 <tr><td>far 分支 <code>AcStft</code>（<code>center</code> 0）</td><td>+0（平行）</td>
@@ -317,7 +319,7 @@ sqrt-Hann 1024/512 分析。AEC delay 改變<b>不</b>重置 stage 或 bridge：
 <h2>Wall-clock authoring grid 註記</h2>
 <ul>
 <li>AEC 的時間常數多以 legacy 10 ms hop（hop=160@16k）撰寫，於
-<code>aec_carve()</code>/<code>aec3_growth_rehop()</code> 對實際 grid 即時 retime
+<code>aec_carve()</code>/<code>aec_growth_rehop()</code> 對實際 grid 即時 retime
 （<code>aec.h</code> 各欄位註解）；<b>不要</b>在程式碼裡寫入已 retime 的字面值。</li>
 <li>NR 有兩個 authoring 基準並存：10 ms 參考（<code>anr_retime_alpha</code>）
 與 16 ms 撰寫（<code>anr_retime_alpha_ref(..., 0.016)</code>，如
@@ -336,9 +338,9 @@ alpha_xi=0.92、L=32、strength overlay 的 alpha_d/g/attack/decay）。
 <tr><td>Grid 定義</td><td><code>lib/aec/c_impl/src/aec.c</code>（defaults/validate/676-678）、
 <code>lib/nr/c_impl/include/anr_types.h</code>、<code>pipelines/common/se_config.c</code></td></tr>
 <tr><td>視窗</td><td><code>lib/aec/c_impl/src/pbfdkf.c</code>、
-<code>lib/aec/c_impl/include/aec3_balanced_config.h</code>、
+<code>lib/aec/c_impl/include/aec_balanced_config.h</code>、
 <code>pipelines/mono_aec_nr_res/audio_pipeline.c</code>、<code>pipelines/4ch_aec_bf_nr_res/4aec_nr_res.c</code>、
-<code>AIAEC/Align_ULCNet/ulcnet_process.c</code>、<code>AINR/dfn_process_common.h</code></td></tr>
+<code>AIAEC/Align_ULCNet/ulcnet_process.c</code></td></tr>
 <tr><td>Framing 決策</td><td><code>docs/align_ulcnet_embedded_streaming_design_zh_TW.md</code> §7、
 <code>AINR/DeepFilterNet2/dfn2_process.h</code> parity 限制 (1)</td></tr>
 <tr><td>測試</td><td><code>pipelines/tests/test_signal_grids.py</code>、
@@ -346,7 +348,7 @@ alpha_xi=0.92、L=32、strength overlay 的 alpha_d/g/attack/decay）。
 <code>pipelines/4ch_alignulcnet/tests/test_audio_pipeline_4ch_ulcnet.c</code>（timing contract）、
 <code>AIAEC/tests/test_ulcnet_process_c.py</code>（C↔Python 逐幀 parity）、
 <code>lib/aec/c_impl/test/test_rate_structural.c</code>（retime 結構檢查）、
-<code>lib/aec/c_impl/test/test_aec_res.c</code>（<code>aec_res</code>：設定、增益、舒適噪音的位元一致檢查）、
+<code>lib/aec/c_impl/test/test_aec_res.c</code>（<code>aec_res</code>：設定與 lane 一致、API 契約、render 縮放與初始狀態細節）、
 <code>lib/nr/c_impl/test/test_config_parity.c</code></td></tr>
 </table>
 

@@ -14,26 +14,26 @@
 # wrapper/pre-post objects directly rather than adding another wrapper archive.
 #
 # All three link against the submodule libs (lib/aec, lib/nr) + the shared
-# audio_common FFT/fast_math layer (../../audio_common relative to this dir).
+# audiolib FFT/fast_math layer (../../audiolib/common relative to this dir).
 #
 # =============================================================================
 # Build isolation
 # =============================================================================
-# This repo is a CONSUMER of THREE producer archives (audio_common's
+# This repo is a CONSUMER of THREE producer archives (audiolib's
 # libaudio_common.a, lib/aec's libaec.a, lib/nr's libanr.a), each of
 # which is itself CFG_SIG-keyed (see those repos' own Makefiles). The design
 # here is the same two-phase recursive-make dispatch AEC/NR already use for
-# their ONE producer (audio_common), extended to resolve THREE:
+# their ONE producer (audiolib), extended to resolve THREE:
 #
-#   Phase 1 (AC_LIB unset — the normal case for any top-level `make ...`):
+#   Phase 1 (COMMON_LIB unset — the normal case for any top-level `make ...`):
 #   a goal that needs any producer archive gets a recipe that queries, IN
-#   ORDER, audio_common's, then lib/aec's, then lib/nr's own `print-lib-path`
+#   ORDER, audiolib's, then lib/aec's, then lib/nr's own `print-lib-path`
 #   (forwarding this invocation's exact BACKEND/WERROR/CC/CXX/EXTRA_CFLAGS/
 #   NO_STDIO — and, for the lib/aec and lib/nr queries, ALSO the just-resolved
-#   AC_DIR/AC_LIB, so THEIR OWN two-phase dispatch resolves directly instead
-#   of re-deriving it) and re-invokes itself with AC_LIB/AEC_LIB/NR_LIB set.
+#   COMMON_DIR/COMMON_LIB, so THEIR OWN two-phase dispatch resolves directly instead
+#   of re-deriving it) and re-invokes itself with COMMON_LIB/AEC_LIB/NR_LIB set.
 #
-#   Phase 2 (AC_LIB known): the REAL rules are defined. Each producer archive
+#   Phase 2 (COMMON_LIB known): the REAL rules are defined. Each producer archive
 #   is a FORCE-recipe target (always re-invokes that producer's own build,
 #   which is a no-op if already up to date, then asserts the archive exists)
 #   and a NORMAL (not order-only) prerequisite of every rule that links
@@ -44,30 +44,27 @@
 # (obj|bin/<backend>-<cfg_sig>/) — CFG_SIG folds in this Makefile's own full
 # flag coverage (CC/CXX/AR/RANLIB/CFLAGS/CXXFLAGS/CPPFLAGS/LDFLAGS/
 # EXTRA_CFLAGS/EXTRA_LDFLAGS/BACKEND/WERROR/NO_STDIO/DEBUG) PLUS the three
-# resolved producers' own config identities (AC_PRODUCER_SIG/AEC_PRODUCER_SIG/
+# resolved producers' own config identities (COMMON_PRODUCER_SIG/AEC_PRODUCER_SIG/
 # NR_PRODUCER_SIG — each just the last path component of that producer's
-# resolved archive dir, e.g. "kiss-1234567890", never the full path) — so a
+# resolved archive dir, e.g. "ne10-1234567890", never the full path) — so a
 # pipeline build against a differently-configured producer keys to its own
 # separate directory too, instead of risking silent config skew.
 #
 # Usage:
 #   make                       # resolves+builds all three producer archives
-#                              # (BACKEND=ne10, the default everywhere) + both
-#                              # pipeline binaries
-#   make BACKEND=kiss          # portable, bit-reproducible KISS reference
-#                              # backend, pass explicitly -- every axis this
-#                              # file and the three producers' own Makefiles
-#                              # key on (BACKEND, EXTRA_CFLAGS, WERROR,
-#                              # NO_STDIO, ...) lands in a fresh, separate
-#                              # obj|bin directory automatically; no manual
-#                              # clean needed, ever
+#                              # (the NE10 FFT backend, the only one) + both
+#                              # pipeline binaries. Every axis this file and
+#                              # the three producers' own Makefiles key on
+#                              # (SIMD, EXTRA_CFLAGS, WERROR, NO_STDIO, ...)
+#                              # lands in a fresh, separate obj|bin directory
+#                              # automatically; no manual clean needed, ever
 #   make EXTRA_CFLAGS="..."    # forwarded to all three producers AND this
 #                              # pipeline's own compile
 #   make WERROR=1              # opt-in: -Werror for this file's own TUs
 #   make test                  # build + run mono API and board-adapter tests
 #
 # The four-channel pipeline has an intentionally independent producer at
-# 4ch_aec_bf_nr_res/Makefile.  Keeping it there prevents its DOA/GSC dependencies and
+# 4ch_aec_bf_nr_res/Makefile.  Keeping it there prevents its DOA/BF dependencies and
 # source set from changing this mono pipeline's build identity.
 #   make NO_STDIO=1 libaudio_pipeline.a   # board-firmware stdio-less build of
 #                              # JUST the library object (see the NO_STDIO
@@ -91,21 +88,21 @@
 #   make clean                 # remove this dir's own obj/bin trees + any
 #                              # flat binaries/archive of a pre-keyed
 #                              # directory layout
-#   make clean-all             # also clean lib/aec, lib/nr, audio_common build
+#   make clean-all             # also clean lib/aec, lib/nr, audiolib build
 #                              # dirs (clean-libs is a compatibility alias)
 
 # =============================================================================
 # Whitespace build-root fail-fast guard
 # =============================================================================
-# This Makefile forwards several resolved directory paths (AC_DIR, and
+# This Makefile forwards several resolved directory paths (COMMON_DIR, and
 # transitively AEC_DIR/NR_DIR) to sub-`make` invocations as BARE, UNQUOTED
-# shell words on a recipe line -- e.g. `AC_DIR=$(abspath $(AC_DIR))` in the
+# shell words on a recipe line -- e.g. `COMMON_DIR=$(abspath $(COMMON_DIR))` in the
 # two-phase dispatch / FORCE rules / query targets / audit-no-stdio-stack
 # recipes further down this file. GNU Make has no concept of shell quoting for
 # text like this: it is substituted verbatim into the recipe's command line and
 # handed to $(SHELL) as-is. If the resolved path contains a space, the shell
 # word-splits that unquoted argument, silently breaking
-# `AC_DIR=/that/whole/path` into several separate words -- which the sub-`make`
+# `COMMON_DIR=/that/whole/path` into several separate words -- which the sub-`make`
 # on that same line then parses as EXTRA COMMAND-LINE ARGUMENTS (stray target
 # names, or a lone "-"), producing a cryptic, deep "No such file or directory"
 # / "No rule to make target ..." failure inside some unrelated sub-invocation,
@@ -115,13 +112,13 @@
 # consistently, end to end, across all four repos in this stack is out of
 # scope). This guard only makes the FAILURE immediate and legible: it is
 # checked as close to the top of this file as possible -- before
-# AC_DIR/BACKEND/CC/CXX/... are given their defaults, and long before any of
+# COMMON_DIR/BACKEND/CC/CXX/... are given their defaults, and long before any of
 # the recipes described above can run -- so a whitespace-containing invocation
 # is rejected here with a clear, one-line explanation.
 #
 # $(CURDIR) is GNU Make's own notion of "the directory this invocation is
 # running in" (post any `-C` processing) -- exactly the invocation's own
-# working/build-root path: AC_DIR/AEC_DIR/NR_DIR are always resolved RELATIVE
+# working/build-root path: COMMON_DIR/AEC_DIR/NR_DIR are always resolved RELATIVE
 # to this same directory (see their defaults just below), so they share
 # whatever space-or-not-space ancestor path this invocation is running under. A
 # literal space has no direct token form in GNU Make function syntax (a bare
@@ -130,7 +127,7 @@
 AUDIO_PIPELINE_EMPTY :=
 AUDIO_PIPELINE_SPACE := $(AUDIO_PIPELINE_EMPTY) $(AUDIO_PIPELINE_EMPTY)
 ifneq ($(findstring $(AUDIO_PIPELINE_SPACE),$(CURDIR)),)
-$(error this build root path contains whitespace ('$(CURDIR)'), which is not supported -- re-run from a path with no spaces. (Whitespace build-root paths are a known, pre-existing limitation shared by all four repos in this stack -- audio_common, lib/aec, lib/nr, and this repo -- not something this pass fixes; this check only fails fast and clearly, here, instead of a cryptic "No such file or directory" deep inside an unrelated sub-invocation.))
+$(error this build root path contains whitespace ('$(CURDIR)'), which is not supported -- re-run from a path with no spaces. (Whitespace build-root paths are a known, pre-existing limitation shared by all four repos in this stack -- audiolib, lib/aec, lib/nr, and this repo -- not something this pass fixes; this check only fails fast and clearly, here, instead of a cryptic "No such file or directory" deep inside an unrelated sub-invocation.))
 endif
 
 AEC_DIR = ../lib/aec/c_impl
@@ -150,7 +147,7 @@ DFN2_DIR = $(AINR_DIR)/DeepFilterNet2
 # embed the STFT/WOLA tables and scratch, so the grid is a build parameter,
 # not a runtime field. Selected by name here rather than by hand-writing the
 # two -D flags into EXTRA_CFLAGS, because EXTRA_CFLAGS is forwarded verbatim
-# to the AEC/NR/audio_common producer sub-makes -- none of which contain any
+# to the AEC/NR/audiolib/common producer sub-makes -- none of which contain any
 # ULCNet code -- and would split their object caches for no reason.
 # Applied ONLY to the ULCNet TUs below, and folded into CFG_SIG_PAYLOAD so
 # the two grids never share an object directory.
@@ -163,22 +160,30 @@ else
 $(error ULCNET_GRID must be 16k or 48k, got '$(ULCNET_GRID)')
 endif
 
-# audio_common sits two levels up from pipelines/ (SE/Audio_ALG/pipelines -> SE/audio_common).
+# audiolib sits two levels up from pipelines/ (SE/Audio_ALG/pipelines -> SE/audiolib/common).
 # lib/aec/c_impl and lib/nr/c_impl each resolve it themselves from their own
-# location (../../../../audio_common from c_impl/, verified to exist as a
-# submodule checkout); AC_DIR here is for OUR OWN CFLAGS/-I path and is passed
-# through explicitly (as AC_DIR=$(abspath $(AC_DIR))) to the lib/aec and
-# lib/nr sub-makes so all three always agree on the exact same audio_common
+# location (../../../../audiolib/common from c_impl/, verified to exist as a
+# submodule checkout); COMMON_DIR here is for OUR OWN CFLAGS/-I path and is passed
+# through explicitly (as COMMON_DIR=$(abspath $(COMMON_DIR))) to the lib/aec and
+# lib/nr sub-makes so all three always agree on the exact same audiolib
 # checkout.
-AC_DIR ?= ../../audio_common
+COMMON_DIR ?= ../../audiolib/common
+# audiolib repo root (COMMON_DIR's parent): check-pins reports the whole
+# audiolib repo's HEAD, not just the common/ subdirectory's.
+AUDIOLIB_DIR ?= ../../audiolib
+# ne10 is the only FFT backend. BACKEND stays a variable because it names the
+# keyed obj/bin directories and is forwarded to the producers.
 BACKEND ?= ne10
+ifneq ($(BACKEND),ne10)
+$(error BACKEND must be ne10 (got '$(BACKEND)'): ne10 is the only FFT backend)
+endif
 
 # Announce the resolved backend on every build (same MAKECMDGOALS guard as
-# audio_common's own banner: print-bin-dir/print-obj-dir/print-lib-path are
+# audiolib's own banner: print-bin-dir/print-obj-dir/print-lib-path are
 # consumed via `$$(make -s ... print-lib-path)` command substitution
 # elsewhere, and this must not add stray stdout to that captured value).
 ifeq ($(filter print-%,$(MAKECMDGOALS)),)
-$(info Audio_ALG/pipelines: FFT backend = $(BACKEND) -- switch with `make BACKEND=kiss` or `make BACKEND=ne10`)
+$(info Audio_ALG/pipelines: FFT backend = $(BACKEND))
 endif
 
 CC  ?= gcc
@@ -189,7 +194,7 @@ RANLIB  ?= ranlib
 # CFG_SIG payload-coverage placeholders: CXXFLAGS/CPPFLAGS are not consumed by
 # this Makefile (no C++ TU of its own), but the CFG_SIG payload below
 # unconditionally includes them so the payload string has the same stable shape
-# as audio_common's/AEC's/NR's, and so a future use of any of them here keys
+# as audiolib's/AEC's/NR's, and so a future use of any of them here keys
 # builds correctly instead of silently aliasing with a build that didn't set
 # it. EXTRA_LDFLAGS/NO_STDIO are real here (see LDFLAGS/LIB_CFLAGS below).
 #
@@ -204,7 +209,7 @@ RANLIB  ?= ranlib
 # foreach rejects, while appending an empty string leaves the VALUE unchanged
 # (a plain-environment CXXFLAGS/CPPFLAGS still folds in normally -- origin
 # becomes "file" -- and still participates in CFG_SIG_PAYLOAD). See
-# audio_common's/AEC's/NR's Makefile for the identical treatment and full
+# audiolib's/AEC's/NR's Makefile for the identical treatment and full
 # writeup.
 CXXFLAGS      +=
 CPPFLAGS      +=
@@ -214,7 +219,7 @@ DEBUG         ?= 0
 
 # DEBUG is real here too: this Makefile has no
 # DEBUG-gated code path of its OWN, but DEBUG is forwarded via $(FWD) (below)
-# to every producer sub-make (audio_common, lib/aec, lib/nr) -- most directly
+# to every producer sub-make (audiolib, lib/aec, lib/nr) -- most directly
 # lib/nr's, whose Makefile rejects any non-0/1 DEBUG outright. Without this
 # Makefile resolving/validating its OWN DEBUG explicitly, a sub-make would
 # fall through to inheriting whatever the calling shell's environment
@@ -246,12 +251,12 @@ TOOLCHAIN_CHECK ?= 1
 # (test scripts point this at a throwaway mktemp dir so they never touch the
 # real dist/), and the HOST compiler for the publish-time atomic
 # symlink-swap helper (never $(CC): that may be a cross compiler). Neither
-# is in CFG_SIG -- neither affects what is built. See audio_common's
+# is in CFG_SIG -- neither affects what is built. See audiolib's
 # Makefile for the full writeups.
 #
 # ALLOW_DIRTY_PUBLISH: `make
 # publish` REFUSES by default when THIS repo (Audio_ALG) or any of the three
-# producers (audio_common, lib/aec, lib/nr) has uncommitted TRACKED changes
+# producers (audiolib, lib/aec, lib/nr) has uncommitted TRACKED changes
 # (this repo: `git status --porcelain -uno`; each producer: `git -C <dir>
 # status --porcelain -uno`, same -uno scope -- see _publish_impl) or is not
 # a git checkout at all (commit unknown) -- a release whose ATTEST
@@ -328,17 +333,17 @@ ALLOW_DIRTY_PUBLISH ?= 0
 ALLOW_UNTRACKED_PUBLISH ?= 0
 ATTEST_STAMP ?=
 
-# EXTRA_CFLAGS — pass-through to the AEC/NR/audio_common producer builds AND
+# EXTRA_CFLAGS — pass-through to the AEC/NR/audiolib/common producer builds AND
 # this pipeline's own compile (all three producers' own Makefiles already do
 # `CFLAGS += $(EXTRA_CFLAGS)`, so one EXTRA_CFLAGS on this top-level `make`
 # reaches every .o for the whole build). The fast matched-filter arithmetic
 # and delay-estimator duty-cycling are built in unconditionally (no flag) —
-# see lib/aec/c_impl/src/delay_aec3.c.
+# see lib/aec/c_impl/src/delay_aec.c.
 #
-# Switching EXTRA_CFLAGS (or BACKEND, or WERROR, or NO_STDIO) never needs a
+# Switching EXTRA_CFLAGS (or SIMD, or WERROR, or NO_STDIO) never needs a
 # manual `make clean-libs` first: this Makefile's own objects/binaries are
 # hash-keyed by config (see the OBJ_DIR/BIN_DIR/CFG_SIG section below), and
-# lib/aec's, lib/nr's, and audio_common's own Makefiles independently key
+# lib/aec's, lib/nr's, and audiolib's own Makefiles independently key
 # their objects/archives off the same axes -- a stale, differently-flagged
 # .o/.a simply can't exist under the new path a config produces.
 # `make clean-libs`/`clean-all` are available but not required for correctness.
@@ -416,9 +421,9 @@ CFLAGS = -Wall -Wextra -O2 -std=gnu99 \
          -Imono_aec_nr_res -Imono_alignulcnet -I$(ULCNET_DIR) -I$(DFN2_DIR) \
          -I$(AEC_DIR)/include -I$(AEC_DIR)/example \
          -I$(NR_DIR)/include \
-         -I$(AC_DIR)/include -I$(AC_DIR)/lib/kiss_fft
+         -I$(COMMON_DIR)/include -I$(COMMON_DIR)
 # AUDIO_PIPELINE_BACKEND_STR: compile-time FFT backend identity baked into
-# audio_pipeline.c's AudioPipelineMemReq.backend field (F20) -- matches
+# audio_pipeline.c's AudioPipelineMemReq.backend field -- matches
 # whichever libaudio_common.a variant this build links (BACKEND= above), so
 # the descriptor never has to be told separately which backend produced it.
 CFLAGS += -DAUDIO_PIPELINE_BACKEND_STR=\"$(BACKEND)\"
@@ -427,8 +432,8 @@ CFLAGS += $(SIMD_CFLAGS)
 CFLAGS += $(PROFILE_CFLAGS)
 
 # -Werror opt-in for this Makefile's OWN TUs (default off; CI can flip it
-# on with `make WERROR=1`). Vendor code (audio_common's NE10/KISS) is built by
-# audio_common's own Makefile, not by rules in this file, so no separate
+# on with `make WERROR=1`). Vendor code (audiolib's NE10) is built by
+# audiolib's own Makefile, not by rules in this file, so no separate
 # warning isolation is needed on this side.
 WERROR ?= 0
 ifeq ($(WERROR),1)
@@ -464,8 +469,8 @@ endif
 # every time LIB_CFLAGS is used in a recipe -- so appending FP_POLICY to CFLAGS
 # alone (below) already reaches LIB_CFLAGS; appending it to LIB_CFLAGS a second
 # time would duplicate the flag on every libaudio_pipeline.a compile line. See
-# audio_common's Makefile for the full cross-repo design writeup and
-# scripts/audit_fp_contract.sh (in audio_common) for the disassembly-level
+# audiolib's Makefile for the full cross-repo design writeup and
+# scripts/audit_fp_contract.sh (in audiolib) for the disassembly-level
 # verification.
 #
 # --- Bare-literal policy flag, defined early (`make -e` environment override) ---
@@ -475,22 +480,22 @@ endif
 # `$(origin FP_POLICY)` only flips from plain "environment" to "environment
 # override" once a makefile assignment to FP_POLICY has actually been PARSED:
 # with the bare `:=` further down the file, `env FP_POLICY=-ffp-contract=fast
-# make -e -n BACKEND=kiss lib` would sail straight through with no error
+# make -e -n lib` would sail straight through with no error
 # (rc=0), silently dropping -ffp-contract=off from the compile line for
 # audio_pipeline.o (see the foreach's own comment for the full mechanism).
 # FP_POLICY's OTHER job -- appending it to CFLAGS, LAST, exactly as the
 # "FP-contraction policy" comment above describes -- stays at its late position
 # (`CFLAGS += $(FP_POLICY)`), and FP_POLICY must stay appended AFTER every
 # other CFLAGS append and BEFORE CFG_SIG_PAYLOAD is computed. There is exactly
-# one `:=` definition of FP_POLICY in this file. audio_common/AEC/NR apply the
+# one `:=` definition of FP_POLICY in this file. audiolib/common/AEC/NR apply the
 # same treatment to their own Makefiles.
 # already applied to their own Makefiles.
-# Keep scalar/NEON operation ordering stable and let audio_common's guarded
+# Keep scalar/NEON operation ordering stable and let audiolib's guarded
 # AArch64 sqrtf calls lower to FSQRT without an errno-checking libm fallback.
 FP_POLICY := -ffp-contract=off -fno-math-errno
 
 # FP_ALLOWED_CHARS_RE (the FP-policy allow-list's character set -- same as
-# audio_common's/AEC's/NR's) is a SECOND bare, dependency-free `:=` literal
+# audiolib's/AEC's/NR's) is a SECOND bare, dependency-free `:=` literal
 # with the exact same `make -e` exposure as FP_POLICY above -- it lives here,
 # fully relocated (this is its ONLY definition in this file), so its origin is
 # already final by the time the foreach below queries it. The regex it holds is
@@ -521,7 +526,7 @@ LDFLAGS = -lm
 LDFLAGS += $(EXTRA_LDFLAGS)
 
 # --- Command-line override rejection ------------------------------------
-# See audio_common's Makefile for the full writeup: a command-line
+# See audiolib's Makefile for the full writeup: a command-line
 # CFLAGS=/CXXFLAGS=/CPPFLAGS=/LDFLAGS=/FP_POLICY=/FP_ALLOWED_CHARS_RE= silently
 # disables every one of this file's own assignments/appends to that variable
 # (here that would strip -ffp-contract=off, -DAUDIO_PIPELINE_BACKEND_STR, the
@@ -534,7 +539,7 @@ $(foreach v,CFLAGS CXXFLAGS CPPFLAGS LDFLAGS FP_POLICY FP_ALLOWED_CHARS_RE,\
     $(error $(v) cannot be overridden (origin: $(origin $(v))) -- it would silently drop this Makefile's own flag appends (FP policy, backend define, include paths); use EXTRA_CFLAGS / EXTRA_LDFLAGS instead)))
 
 # Conflict detection and the quote/escape/response-file rejection gate (same as
-# audio_common's/AEC's/NR's): reject outright rather than let a caller silently
+# audiolib's/AEC's/NR's): reject outright rather than let a caller silently
 # re-enable contraction. Checked against the fully-assembled $(CFLAGS)
 # $(CXXFLAGS) $(CPPFLAGS) (each already includes EXTRA_CFLAGS folded in above,
 # AND any CFLAGS=/CXXFLAGS=/CPPFLAGS= command-line override, since a
@@ -548,7 +553,7 @@ $(foreach v,CFLAGS CXXFLAGS CPPFLAGS LDFLAGS FP_POLICY FP_ALLOWED_CHARS_RE,\
 # CFG_SIG_PAYLOAD above -- a PLAIN ENVIRONMENT CXXFLAGS or CPPFLAGS is
 # deliberately allowed to fold in normally via that same foreach's origin
 # logic, never going through EXTRA_CFLAGS at all, so `env CXXFLAGS=-Ofast make
-# BACKEND=kiss lib` would sail through a CFLAGS-only check; the day either
+# lib` would sail through a CFLAGS-only check; the day either
 # variable starts feeding a real compile recipe in this file, a live
 # -Ofast/-ffast-math/-ffp-contract=<x> could ride in completely unchecked. The
 # check below inspects all three together so no combination of
@@ -573,13 +578,13 @@ $(foreach v,CFLAGS CXXFLAGS CPPFLAGS LDFLAGS FP_POLICY FP_ALLOWED_CHARS_RE,\
 # -ffp-contract=<anything>), so it only ever matches a complete flag token,
 # never a substring buried inside an unrelated token.
 #
-# EXCLUSION, specific to this repo: unlike audio_common's/AEC's/NR's CFLAGS,
+# EXCLUSION, specific to this repo: unlike audiolib's/AEC's/NR's CFLAGS,
 # THIS file's own CFLAGS append (above) unconditionally includes one
 # Makefile-INTERNAL token that legitimately contains a backslash AND a
 # double-quote character: `-DAUDIO_PIPELINE_BACKEND_STR=\"$(BACKEND)\"`. That
 # backslash-escaped quoting is the entire POINT of the flag (audio_pipeline.c
 # reads AUDIO_PIPELINE_BACKEND_STR as a real C string literal and compares it
-# against "kiss"/"ne10" via strcmp() -- see that flag's own comment above); the
+# against "ne10" via strcmp() -- see that flag's own comment above); the
 # shell that runs this Makefile's compile recipes unescapes `\"` to a literal
 # `"` so the compiler receives a genuinely quoted string token, the same
 # well-known idiom countless Makefiles use to inject a stringified #define.
@@ -609,8 +614,8 @@ $(foreach v,CFLAGS CXXFLAGS CPPFLAGS LDFLAGS FP_POLICY FP_ALLOWED_CHARS_RE,\
 # used to smuggle a real conflicting/unsafe flag past the gate.
 FP_INPUT_FLAGS := $(filter-out -DAUDIO_PIPELINE_BACKEND_STR=%,$(CFLAGS) $(CXXFLAGS) $(CPPFLAGS))
 
-# --- link-flags character-safety coverage (same as audio_common's -- see
-# audio_common's Makefile for the full writeup this comment summarizes): the
+# --- link-flags character-safety coverage (same as audiolib's -- see
+# audiolib's Makefile for the full writeup this comment summarizes): the
 # allow-list below validates FP_INPUT_FLAGS (CFLAGS/CXXFLAGS/CPPFLAGS) AND
 # LDFLAGS (a plain `-lm` literal plus whatever EXTRA_LDFLAGS folds in, see the
 # `LDFLAGS += $(EXTRA_LDFLAGS)` line above), because LDFLAGS is embedded in
@@ -618,9 +623,9 @@ FP_INPUT_FLAGS := $(filter-out -DAUDIO_PIPELINE_BACKEND_STR=%,$(CFLAGS) $(CXXFLA
 # aec_nr_pipeline*/test_audio_pipeline/example_board_adapter link recipes
 # further down) exactly the same way CFLAGS/CXXFLAGS are embedded in every
 # compile recipe: `make aec_nr_pipeline EXTRA_LDFLAGS=';id'` (with
-# AC_LIB/AEC_LIB/NR_LIB pre-resolved so the two-phase producer dispatch lands
+# COMMON_LIB/AEC_LIB/NR_LIB pre-resolved so the two-phase producer dispatch lands
 # directly on this repo's OWN link recipe instead of recursing into
-# audio_common's sub-make) would otherwise reach a real `cc -o ... $(LDFLAGS)`
+# audiolib's sub-make) would otherwise reach a real `cc -o ... $(LDFLAGS)`
 # recipe line with the `;id` payload sitting live and unfiltered after the
 # `-lm`. The two checks that only care about CHARACTER safety (the single-quote
 # pre-check and the allow-list itself, immediately below) therefore run against
@@ -654,7 +659,7 @@ SHELL_SAFE_INPUT_FLAGS := $(FP_INPUT_FLAGS) $(LDFLAGS)
 # inject anything at all with zero text ever appearing in CFLAGS/
 # EXTRA_CFLAGS itself.
 #
-# Character allow-list (same as audio_common's/AEC's/NR's -- see audio_common's
+# Character allow-list (same as audiolib's/AEC's/NR's -- see audiolib's
 # Makefile for the full writeup this comment summarizes). A
 # character-by-character DENY-list (single quote, double quote, backslash,
 # backtick, a literal "$(" sequence, semicolon, pipe, ampersand, and an
@@ -707,10 +712,10 @@ endif
 # SHELL_SAFE_INPUT_FLAGS is always multiple whitespace-joined tokens, never a
 # single one, so space must be permitted even though it is not part of any
 # individual flag's own character set). Chosen (same audit
-# audio_common's/AEC's/NR's Makefile performed for its own identical
+# audiolib's/AEC's/NR's Makefile performed for its own identical
 # allow-list) by checking every legitimate flag THIS Makefile's own invocations
 # actually use: -O2/-Wall/-Wextra/-std=gnu99,
-# -I$(AEC_DIR)/include/-I$(AEC_DIR)/example/-I$(NR_DIR)/include/-I$(AC_DIR)/include
+# -I$(AEC_DIR)/include/-I$(AEC_DIR)/example/-I$(NR_DIR)/include/-I$(COMMON_DIR)/include/-I$(COMMON_DIR)
 # (letters/digits/underscore, and slash/dot for the paths), and (once the
 # `-DAUDIO_PIPELINE_BACKEND_STR=%` exclusion above has removed the one known
 # internal token that would otherwise trip it) every other flag this file
@@ -756,7 +761,7 @@ $(error FP policy conflict: CFLAGS/CXXFLAGS/CPPFLAGS/EXTRA_CFLAGS contains $(FP_
 endif
 
 # Command-line/`-e` override rejection for the FP-policy/shell-safety checks'
-# remaining FOUR internal variables (same as audio_common's/AEC's/NR's):
+# remaining FOUR internal variables (same as audiolib's/AEC's/NR's):
 # FP_INPUT_FLAGS/SHELL_SAFE_INPUT_FLAGS/SHELL_SAFE_ALLOWLIST_RC/FP_CONFLICT_FLAGS
 # are each computed from the fully-assembled CFLAGS/CXXFLAGS/CPPFLAGS
 # (SHELL_SAFE_INPUT_FLAGS/SHELL_SAFE_ALLOWLIST_RC also fold in the
@@ -803,10 +808,7 @@ CFLAGS     += $(FP_POLICY)
 # on GNU/Linux gcc). A hardcoded `-lc++` alongside it would be a macOS-ism
 # (duplicate there, a link error on GNU/Linux). LINK
 # participates in CFG_SIG below.
-LINK = $(CC)
-ifeq ($(BACKEND),ne10)
-  LINK = $(CXX)
-endif
+LINK = $(CXX)
 
 .DEFAULT_GOAL := all
 
@@ -820,15 +822,15 @@ endif
 # repo's own build identity (config skew).
 #
 # The same two-phase recursive-make dispatch AEC/NR use for their
-# ONE producer, extended to THREE, is driven by whether AC_LIB is already known:
+# ONE producer, extended to THREE, is driven by whether COMMON_LIB is already known:
 #
-#   Phase 1 (AC_LIB unset): a goal that needs any producer archive gets a
-#   recipe that resolves audio_common's archive path first (needed by both
-#   lib/aec's and lib/nr's OWN two-phase dispatch -- see the AC_DIR=/AC_LIB=
+#   Phase 1 (COMMON_LIB unset): a goal that needs any producer archive gets a
+#   recipe that resolves audiolib's archive path first (needed by both
+#   lib/aec's and lib/nr's OWN two-phase dispatch -- see the COMMON_DIR=/COMMON_LIB=
 #   forwarding below), then lib/aec's, then lib/nr's, and re-invokes itself
 #   with all three set.
 #
-#   Phase 2 (AC_LIB known): the REAL rules are defined, with $(AC_LIB)/
+#   Phase 2 (COMMON_LIB known): the REAL rules are defined, with $(COMMON_LIB)/
 #   $(AEC_LIB)/$(NR_LIB) as NORMAL (not order-only) prerequisites of the
 #   binaries that link against them -- so relinking happens iff a producer's
 #   archive mtime actually advanced.
@@ -849,54 +851,54 @@ endif
 # propagates to every child `make` via MAKEFLAGS regardless of how it was
 # invoked, so each child's own recipes are themselves just printed.
 #
-# lib/aec's and lib/nr's own Makefiles fold AC_LIB into THEIR OWN CFG_SIG
-# (as AC_PRODUCER_SIG) REGARDLESS of which of their targets is being built --
-# even their `lib` target, which itself never links audio_common's archive
-# (see those Makefiles: AC_PRODUCER_SIG is computed unconditionally whenever
-# AC_LIB is non-empty, before their own CFG_SIG_PAYLOAD is assembled). So
-# AC_DIR=$(abspath $(AC_DIR)) AC_LIB=<resolved path> MUST be forwarded to
+# lib/aec's and lib/nr's own Makefiles fold COMMON_LIB into THEIR OWN CFG_SIG
+# (as COMMON_PRODUCER_SIG) REGARDLESS of which of their targets is being built --
+# even their `lib` target, which itself never links audiolib's archive
+# (see those Makefiles: COMMON_PRODUCER_SIG is computed unconditionally whenever
+# COMMON_LIB is non-empty, before their own CFG_SIG_PAYLOAD is assembled). So
+# COMMON_DIR=$(abspath $(COMMON_DIR)) COMMON_LIB=<resolved path> MUST be forwarded to
 # every lib/aec / lib/nr sub-make below (both the query calls and the real
 # `lib` build calls in the FORCE rules further down) -- otherwise a `lib`
-# build invoked without AC_LIB would land in a DIFFERENT (AC_PRODUCER_SIG-less)
+# build invoked without COMMON_LIB would land in a DIFFERENT (COMMON_PRODUCER_SIG-less)
 # keyed directory than the one this Makefile's query call resolved, and the
 # "does $(AEC_LIB) exist" assertion in that FORCE rule would fail.
 FWD = BACKEND=$(BACKEND) SIMD=$(SIMD) PROFILE=$(PROFILE) WERROR=$(WERROR) CC='$(CC)' CXX='$(CXX)' EXTRA_CFLAGS='$(EXTRA_CFLAGS)' NO_STDIO=$(NO_STDIO) TOOLCHAIN_CHECK=$(TOOLCHAIN_CHECK) DEBUG=$(DEBUG)
 
-ifeq ($(AC_LIB),)
-.PHONY: all test libs _publish_impl aec_nr_pipeline aec_nr_pipeline_static mono_alignulcnet mono_aec_dfn_res test_audio_pipeline test_audio_pipeline_ulcnet test_ulcnet_accelerator_adapter test_dfn_res_stage test_dfn_rate_bridge test_audio_pipeline_dfn test_se_common test_readme_flow example-adapter libaudio_pipeline.a libaudio_pipeline_dfn.a
-all test libs _publish_impl aec_nr_pipeline aec_nr_pipeline_static mono_alignulcnet mono_aec_dfn_res test_audio_pipeline test_audio_pipeline_ulcnet test_ulcnet_accelerator_adapter test_dfn_res_stage test_dfn_rate_bridge test_audio_pipeline_dfn test_se_common test_readme_flow example-adapter libaudio_pipeline.a libaudio_pipeline_dfn.a:
-	+@ac="$$($(MAKE) -s --no-print-directory -C $(AC_DIR) $(FWD) print-lib-path)"; \
-	 test -n "$$ac" || { echo "FATAL: could not resolve audio_common archive path (AC_DIR=$(AC_DIR) -- is audio_common present as a sibling of Audio_ALG?)" >&2; exit 1; }; \
-	 aec="$$($(MAKE) -s --no-print-directory -C $(AEC_DIR) $(FWD) AC_DIR=$(abspath $(AC_DIR)) AC_LIB="$$ac" print-lib-path)"; \
+ifeq ($(COMMON_LIB),)
+.PHONY: all test test_target_abi target-abi-test libs _publish_impl aec_nr_pipeline aec_nr_pipeline_static mono_alignulcnet mono_aec_dfn_res test_audio_pipeline test_audio_pipeline_ulcnet test_ulcnet_accelerator_adapter test_dfn_res_stage test_dfn_rate_bridge test_audio_pipeline_dfn test_se_common test_readme_flow example-adapter libaudio_pipeline.a libaudio_pipeline_dfn.a
+all test test_target_abi target-abi-test libs _publish_impl aec_nr_pipeline aec_nr_pipeline_static mono_alignulcnet mono_aec_dfn_res test_audio_pipeline test_audio_pipeline_ulcnet test_ulcnet_accelerator_adapter test_dfn_res_stage test_dfn_rate_bridge test_audio_pipeline_dfn test_se_common test_readme_flow example-adapter libaudio_pipeline.a libaudio_pipeline_dfn.a:
+	+@ac="$$($(MAKE) -s --no-print-directory -C $(COMMON_DIR) $(FWD) print-lib-path)"; \
+	 test -n "$$ac" || { echo "FATAL: could not resolve audiolib archive path (COMMON_DIR=$(COMMON_DIR) -- is audiolib present as a sibling of Audio_ALG?)" >&2; exit 1; }; \
+	 aec="$$($(MAKE) -s --no-print-directory -C $(AEC_DIR) $(FWD) COMMON_DIR=$(abspath $(COMMON_DIR)) COMMON_LIB="$$ac" print-lib-path)"; \
 	 test -n "$$aec" || { echo "FATAL: could not resolve lib/aec archive path (AEC_DIR=$(AEC_DIR))" >&2; exit 1; }; \
-	 nr="$$($(MAKE) -s --no-print-directory -C $(NR_DIR) $(FWD) AC_DIR=$(abspath $(AC_DIR)) AC_LIB="$$ac" print-lib-path)"; \
+	 nr="$$($(MAKE) -s --no-print-directory -C $(NR_DIR) $(FWD) COMMON_DIR=$(abspath $(COMMON_DIR)) COMMON_LIB="$$ac" print-lib-path)"; \
 	 test -n "$$nr" || { echo "FATAL: could not resolve lib/nr archive path (NR_DIR=$(NR_DIR))" >&2; exit 1; }; \
-	 $(MAKE) --no-print-directory $@ AC_LIB="$$ac" AEC_LIB="$$aec" NR_LIB="$$nr"
+	 $(MAKE) --no-print-directory $@ COMMON_LIB="$$ac" AEC_LIB="$$aec" NR_LIB="$$nr"
 else
 # Producer-identity components of this consumer's own CFG_SIG (see AEC's/
 # NR's Makefiles for the full rationale): the LAST path component of each
-# resolved archive's directory (e.g. "kiss-2139547423"), NEVER the full
+# resolved archive's directory (e.g. "ne10-2139547423"), NEVER the full
 # (absolute) path -- so a pipeline build against a DIFFERENTLY-configured
 # producer keys to its own separate obj/bin directory here too, instead of
-# risking silent config skew. AC_DIR/AEC_DIR/NR_DIR themselves (abspaths,
+# risking silent config skew. COMMON_DIR/AEC_DIR/NR_DIR themselves (abspaths,
 # used only as -C arguments to the sub-makes) never appear in any payload or
 # manifest -- only these short backend-sig components do.
-AC_PRODUCER_SIG  := $(notdir $(patsubst %/,%,$(dir $(AC_LIB))))
+COMMON_PRODUCER_SIG  := $(notdir $(patsubst %/,%,$(dir $(COMMON_LIB))))
 AEC_PRODUCER_SIG := $(notdir $(patsubst %/,%,$(dir $(AEC_LIB))))
 NR_PRODUCER_SIG  := $(notdir $(patsubst %/,%,$(dir $(NR_LIB))))
 endif
 
 # --- Hash-keyed object/binary directory + full-coverage CFG_SIG ------------
-# obj/<backend>-<sig> AND bin/<backend>-<sig> -- see audio_common's Makefile
+# obj/<backend>-<sig> AND bin/<backend>-<sig> -- see audiolib's Makefile
 # for the full design rationale (identical mechanism, applied here). Payload
 # coverage (USER-MANDATED): CC CXX AR RANLIB CFLAGS CXXFLAGS CPPFLAGS LDFLAGS
 # EXTRA_CFLAGS EXTRA_LDFLAGS BACKEND WERROR NO_STDIO DEBUG, PLUS (consumer-
-# specific, THREE producers) AC_PRODUCER_SIG/AEC_PRODUCER_SIG/NR_PRODUCER_SIG
+# specific, THREE producers) COMMON_PRODUCER_SIG/AEC_PRODUCER_SIG/NR_PRODUCER_SIG
 # -- each empty when its _LIB var isn't resolved yet (e.g. for goals like
 # `libaudio_pipeline.a`/`audit-no-stdio` that never touch any producer).
 #
 # This MUST be defined after CFLAGS/LDFLAGS are fully assembled and after the
-# AC_LIB ifeq/else above resolves the three PRODUCER_SIGs, but before the
+# COMMON_LIB ifeq/else above resolves the three PRODUCER_SIGs, but before the
 # first rule below that mentions $(OBJ_DIR)/$(BIN_DIR)/anything derived from
 # them -- GNU Make expands a rule's target/prerequisite list immediately
 # when parsed, not deferred like a recipe body, so a forward reference here
@@ -904,14 +906,39 @@ endif
 # landing objects in a hash-less directory instead of the real one.
 #
 # Deliberately NOT $(strip)'d (false-miss OK, false-hit never -- see
-# audio_common's Makefile for the full rationale). cksum (POSIX) computes
+# audiolib's Makefile for the full rationale). cksum (POSIX) computes
 # the hash; `cut -d' ' -f1` isolates the checksum from cksum's
 # "<checksum> <byte-count>" stdout.
 # Payload additions beyond the base set: LINK, TOOLCHAIN_CHECK (the
 # guard-skip knob must not alias a guarded build), SRCS (this
 # Makefile's own compiled sources -- the archive's one member TU plus the
 # CLI/test TUs -- so a source-set change keys to a fresh directory).
-CFG_SIG_PAYLOAD := ULCNET_GRID=$(ULCNET_GRID) CC=$(CC) CXX=$(CXX) AR=$(AR) RANLIB=$(RANLIB) LINK=$(LINK) CFLAGS=$(CFLAGS) CXXFLAGS=$(CXXFLAGS) CPPFLAGS=$(CPPFLAGS) LDFLAGS=$(LDFLAGS) EXTRA_CFLAGS=$(EXTRA_CFLAGS) EXTRA_LDFLAGS=$(EXTRA_LDFLAGS) BACKEND=$(BACKEND) SIMD=$(SIMD) PROFILE=$(PROFILE) WERROR=$(WERROR) NO_STDIO=$(NO_STDIO) DEBUG=$(DEBUG) TOOLCHAIN_CHECK=$(TOOLCHAIN_CHECK) AC_PRODUCER_SIG=$(AC_PRODUCER_SIG) AEC_PRODUCER_SIG=$(AEC_PRODUCER_SIG) NR_PRODUCER_SIG=$(NR_PRODUCER_SIG) SRCS=$(sort common/se_anr_stage.c common/se_config.c mono_aec_nr_res/audio_pipeline.c mono_aec_nr_res/main.c mono_aec_nr_res/static_main.c mono_aec_nr_res/tests/test_audio_pipeline.c mono_aec_nr_res/example_board_adapter.c mono_alignulcnet/audio_pipeline_ulcnet.c mono_alignulcnet/tests/test_audio_pipeline_ulcnet.c $(ULCNET_DIR)/ulcnet_accelerator_adapter.c $(ULCNET_DIR)/ulcnet_prepost.c $(ULCNET_DIR)/ulcnet_process.c $(ULCNET_DIR)/ulcnet_model_io.c $(AIAEC_DIR)/tests/test_ulcnet_accelerator_adapter.c mono_alignulcnet/main.c dfn_res_stage.c dfn_rate_bridge.c tests/test_dfn_res_stage.c tests/test_dfn_rate_bridge.c tests/test_se_common.c tests/test_readme_flow.c mono_aec_dfn_res/audio_pipeline_dfn.c mono_aec_dfn_res/tests/test_audio_pipeline_dfn.c mono_aec_dfn_res/main.c $(DFN2_DIR)/dfn2_process.c $(DFN2_DIR)/dfn2_model_io.c $(DFN2_DIR)/dfn2_prepost.c)
+# One optional descriptor test spans all public pipeline/prepost APIs.
+TARGET_ABI_SRCS := tests/test_target_abi.c \
+ mono_aec_nr_res/audio_pipeline.c common/se_config.c common/se_anr_stage.c \
+ mono_alignulcnet/audio_pipeline_ulcnet.c mono_aec_dfn_res/audio_pipeline_dfn.c \
+ 4ch_aec_bf_nr_res/4aec_nr_res.c 4ch_aec_bf_nr_res/audio_pipeline_4ch.c \
+ 4ch_alignulcnet/audio_pipeline_4ch_ulcnet.c 4ch_aec_bf_dfn_res/4aec_dfn_res.c \
+ dfn_res_stage.c dfn_rate_bridge.c \
+ $(DFN2_DIR)/dfn2_process.c $(DFN2_DIR)/dfn2_model_io.c $(DFN2_DIR)/dfn2_prepost.c \
+ ../AINR/DeepFilterNet3/dfn3_process.c ../AINR/DeepFilterNet3/dfn3_model_io.c \
+ ../AINR/DeepFilterNet3/dfn3_prepost.c \
+ $(ULCNET_DIR)/ulcnet_process.c $(ULCNET_DIR)/ulcnet_model_io.c $(ULCNET_DIR)/ulcnet_prepost.c \
+ $(AIAEC_DIR)/aiaec_process.c $(AIAEC_DIR)/DeepVQE_S/deepvqe_process.c \
+ $(AIAEC_DIR)/DeepVQE_S/deepvqe_prepost.c \
+ $(COMMON_DIR)/../bf/bf.c $(COMMON_DIR)/../doa/srp.c \
+ $(COMMON_DIR)/../doa/doa_smoother.c $(COMMON_DIR)/../doa/steering.c \
+ $(COMMON_DIR)/utility/spatial_complex.c $(COMMON_DIR)/utility/spatial_simd.c
+TARGET_ABI_INCLUDES := -Imono_aec_nr_res -Imono_alignulcnet -Imono_aec_dfn_res \
+ -I4ch_aec_bf_nr_res -I4ch_alignulcnet -I4ch_aec_bf_dfn_res \
+ -I$(DFN2_DIR) -I../AINR/DeepFilterNet3 -I$(ULCNET_DIR) \
+ -I$(AIAEC_DIR) -I$(AIAEC_DIR)/DeepVQE_S -I$(COMMON_DIR)/utility \
+ -I$(COMMON_DIR)/../bf -I$(COMMON_DIR)/../doa
+
+# The same CC command can select a different SDK through PATH.
+# Include effective pointer/FP/ISA predefines to avoid cross-ABI cache reuse.
+override CC_TARGET_SIG := $(shell sh $(COMMON_DIR)/scripts/target_abi_signature.sh $(CC) $(CPPFLAGS) $(CFLAGS))
+CFG_SIG_PAYLOAD := CC_TARGET_SIG=$(CC_TARGET_SIG) ULCNET_GRID=$(ULCNET_GRID) CC=$(CC) CXX=$(CXX) AR=$(AR) RANLIB=$(RANLIB) LINK=$(LINK) CFLAGS=$(CFLAGS) CXXFLAGS=$(CXXFLAGS) CPPFLAGS=$(CPPFLAGS) LDFLAGS=$(LDFLAGS) EXTRA_CFLAGS=$(EXTRA_CFLAGS) EXTRA_LDFLAGS=$(EXTRA_LDFLAGS) BACKEND=$(BACKEND) SIMD=$(SIMD) PROFILE=$(PROFILE) WERROR=$(WERROR) NO_STDIO=$(NO_STDIO) DEBUG=$(DEBUG) TOOLCHAIN_CHECK=$(TOOLCHAIN_CHECK) COMMON_PRODUCER_SIG=$(COMMON_PRODUCER_SIG) AEC_PRODUCER_SIG=$(AEC_PRODUCER_SIG) NR_PRODUCER_SIG=$(NR_PRODUCER_SIG) SRCS=$(sort common/se_anr_stage.c common/se_config.c mono_aec_nr_res/audio_pipeline.c mono_aec_nr_res/main.c mono_aec_nr_res/static_main.c mono_aec_nr_res/tests/test_audio_pipeline.c mono_aec_nr_res/example_board_adapter.c mono_alignulcnet/audio_pipeline_ulcnet.c mono_alignulcnet/tests/test_audio_pipeline_ulcnet.c $(ULCNET_DIR)/ulcnet_accelerator_adapter.c $(ULCNET_DIR)/ulcnet_prepost.c $(ULCNET_DIR)/ulcnet_process.c $(ULCNET_DIR)/ulcnet_model_io.c $(AIAEC_DIR)/tests/test_ulcnet_accelerator_adapter.c mono_alignulcnet/main.c dfn_res_stage.c dfn_rate_bridge.c tests/test_dfn_res_stage.c tests/test_dfn_rate_bridge.c tests/test_se_common.c tests/test_readme_flow.c mono_aec_dfn_res/audio_pipeline_dfn.c mono_aec_dfn_res/tests/test_audio_pipeline_dfn.c mono_aec_dfn_res/main.c $(DFN2_DIR)/dfn2_process.c $(DFN2_DIR)/dfn2_model_io.c $(DFN2_DIR)/dfn2_prepost.c $(TARGET_ABI_SRCS))
 CFG_SIG := $(shell printf '%s' "$(CFG_SIG_PAYLOAD)" | cksum | cut -d' ' -f1)
 
 # OBJ_ROOT / BIN_ROOT: where THIS repo's own keyed
@@ -922,7 +949,7 @@ CFG_SIG := $(shell printf '%s' "$(CFG_SIG_PAYLOAD)" | cksum | cut -d' ' -f1)
 # to run tamper/injection scenarios against a scratch-directory build of the
 # real worktree, so the REAL obj/ and bin/ artifacts here are never
 # modified -- not even transiently. (Each of the three producers --
-# audio_common, lib/aec, lib/nr -- keys its OWN obj/bin trees independently;
+# audiolib, lib/aec, lib/nr -- keys its OWN obj/bin trees independently;
 # this pair only covers this Makefile's own objects/binaries.)
 OBJ_ROOT ?= obj
 BIN_ROOT ?= bin
@@ -931,18 +958,21 @@ BIN_DIR  = $(BIN_ROOT)/$(BACKEND)-$(CFG_SIG)
 
 # --- CFG_SIG collision guard + directory creation ---------------------------
 # Single order-only prerequisite for every compile/link/archive rule below.
-# See audio_common's Makefile for the full design writeup (identical
+# See audiolib's Makefile for the full design writeup (identical
 # mechanism, applied here) -- write config.manifest first time, verify (hard
 # error on mismatch = CFG_SIG collision or payload coverage gap) every time
 # after, atomically (temp file + mv).
 .PHONY: _cfg_guard
 _cfg_guard:
-	@if [ "$(BACKEND)" = "ne10" ] && [ "$(TOOLCHAIN_CHECK)" = "1" ]; then \
+	@test -n "$(CC_TARGET_SIG)" && test "$(CC_TARGET_SIG)" != unavailable || { \
+	  echo "FATAL: cannot determine compiler target; CC preprocessing with the configured flags must succeed." >&2; \
+	  exit 1; }
+	@if [ "$(TOOLCHAIN_CHECK)" = "1" ]; then \
 	  cc_m="$$($(CC) -dumpmachine 2>/dev/null)"; cxx_m="$$($(CXX) -dumpmachine 2>/dev/null)"; \
 	  if [ -z "$$cc_m" ] || [ "$$cc_m" != "$$cxx_m" ]; then \
 	    echo "FATAL: CC/CXX compile for different targets (CC='$(CC)' -> '$$cc_m', CXX='$(CXX)' -> '$$cxx_m')." >&2; \
-	    echo "  BACKEND=ne10 links a C++ TU (audio_common's NE10 archive); pass the FULL toolchain:" >&2; \
-	    echo "    make BACKEND=ne10 CC=aarch64-linux-gnu-gcc CXX=aarch64-linux-gnu-g++ AR=aarch64-linux-gnu-ar RANLIB=aarch64-linux-gnu-ranlib" >&2; \
+	    echo "  The build links a C++ TU (audiolib's NE10 archive); pass the FULL toolchain:" >&2; \
+	    echo "    make CC=aarch64-linux-gnu-gcc CXX=aarch64-linux-gnu-g++ AR=aarch64-linux-gnu-ar RANLIB=aarch64-linux-gnu-ranlib" >&2; \
 	    echo "  (TOOLCHAIN_CHECK=0 skips this check; it participates in CFG_SIG.)" >&2; \
 	    exit 1; \
 	  fi; \
@@ -1004,8 +1034,7 @@ $(OBJ_DIR)/test_audio_pipeline.o: mono_aec_nr_res/tests/test_audio_pipeline.c mo
 # Align-ULCNet pipeline variant objects. ulcnet_process.o compiles the
 # AIAEC-owned C pre/post TU (centered sqrt-Hann STFT / WOLA / model
 # boundary) -- read-only from this Makefile's perspective, never edited
-# here. It transforms through audio_common's fft_wrapper (so BACKEND=
-# kiss/ne10 genuinely selects the ULCNet FFT backend); the -I$(AC_DIR)/
+# here. It transforms through audiolib's fft_wrapper; the -I$(COMMON_DIR)/
 # include already in $(CFLAGS) resolves that header, and -I$(ULCNET_DIR)
 # resolves its own. The pipeline TU and its test also need the ULCNET
 # include path for ulcnet_process.h (via audio_pipeline_ulcnet.h).
@@ -1099,7 +1128,7 @@ DFN_PIPELINE_OBJS = $(OBJ_DIR)/audio_pipeline_dfn.o $(OBJ_DIR)/dfn_rate_bridge.o
 
 # `libaudio_pipeline.a` needs only THIS repo's own object (audio_pipeline.o)
 # -- no producer archive is linked into it -- so, per the dispatch design
-# above, it's a real rule living entirely outside the AC_LIB dispatch (never
+# above, it's a real rule living entirely outside the COMMON_LIB dispatch (never
 # shells out to any of the three producers, works even if none of them are
 # buildable). The phony alias keeps the pre-B01 flat-filename invocation
 # (`make libaudio_pipeline.a`) working.
@@ -1109,20 +1138,38 @@ libaudio_pipeline.a: $(LIB_TARGET)
 # Fresh-archive discipline: always built from scratch
 # into a temp file and renamed into place -- never `ar` onto an existing
 # archive (which only adds/replaces members and would keep a removed source's
-# stale member forever). See audio_common's Makefile for the full writeup.
+# stale member forever). See audiolib's Makefile for the full writeup.
 # One chained shell line with a PID-suffixed temp: two
 # same-config processes racing this rule each write their OWN temp, final mv
-# is atomic last-writer-wins. See audio_common's Makefile.
+# is atomic last-writer-wins. See audiolib's Makefile.
 $(LIB_TARGET): $(OBJ_DIR)/audio_pipeline.o $(OBJ_DIR)/se_config.o $(OBJ_DIR)/se_anr_stage.o | _cfg_guard
 	t="$@.tmp.$$$$" && rm -f "$$t" && $(AR) rcs "$$t" $^ && $(RANLIB) "$$t" && mv -f "$$t" $@
 	@echo "libaudio_pipeline.a [$(BACKEND)] -> $@"
 
 # =============================================================================
-# Phase 2 real rules: only defined once AC_LIB (and, transitively, AEC_LIB/
+# Phase 2 real rules: only defined once COMMON_LIB (and, transitively, AEC_LIB/
 # NR_LIB, always set together by phase 1's re-invoke) is known.
 # =============================================================================
-ifneq ($(AC_LIB),)
+ifneq ($(COMMON_LIB),)
 .PHONY: all test libs aec_nr_pipeline aec_nr_pipeline_static mono_alignulcnet mono_aec_dfn_res test_audio_pipeline test_audio_pipeline_ulcnet test_ulcnet_accelerator_adapter test_dfn_res_stage test_dfn_rate_bridge test_audio_pipeline_dfn test_se_common test_readme_flow example-adapter example_board_adapter libaudio_pipeline_dfn.a FORCE
+# This Phase 2 branch is entered via a recursive `$(MAKE) ... COMMON_LIB=...
+# AEC_LIB=... NR_LIB=...` re-invoke (see the Phase 1 rule above). GNU Make
+# tracks every variable given this way in MAKEOVERRIDES and folds it into
+# MAKEFLAGS for every further `$(MAKE)` recipe run by this same instance --
+# including the unrelated `samples/` recursive test call below, where it
+# collides with THAT Makefile's own, differently-shaped set of producer
+# variables (`unexport`ing COMMON_LIB/AEC_LIB/NR_LIB individually does NOT
+# stop this: MAKEOVERRIDES, not the plain environment, is what MAKEFLAGS is
+# built from). Clearing MAKEOVERRIDES here removes them from that
+# propagation without touching any variable this Makefile forwards to a
+# sub-make through its own explicit, visible `VAR=value` recipe text.
+# Command-line-origin variables are ALSO auto-exported straight into every
+# recipe's own process environment (a second, independent propagation path
+# from the MAKEFLAGS one above) -- `unexport` blocks that path for these
+# three names specifically; both lines together are what actually isolates
+# the `samples/` recursive call below.
+unexport COMMON_LIB AEC_LIB NR_LIB
+MAKEOVERRIDES :=
 all: $(BIN_DIR)/aec_nr_pipeline $(BIN_DIR)/aec_nr_pipeline_static $(BIN_DIR)/mono_alignulcnet $(DFN_LIB_TARGET) $(BIN_DIR)/mono_aec_dfn_res
 
 libaudio_pipeline_dfn.a: $(DFN_LIB_TARGET)
@@ -1159,6 +1206,14 @@ test: $(BIN_DIR)/test_audio_pipeline $(BIN_DIR)/example_board_adapter $(BIN_DIR)
 	"$(abspath $(BIN_DIR))/mono_aec_dfn_res" --sample-rate 16000Hz >/dev/null 2>&1; test $$? -eq 2
 	"$(abspath $(BIN_DIR))/mono_aec_dfn_res" --delay-mode fixed --fixed-delay 12x >/dev/null 2>&1; test $$? -eq 2
 	"$(abspath $(BIN_DIR))/mono_aec_dfn_res" --atten-lim 12dB >/dev/null 2>&1; test $$? -eq 2
+# samples/ (e.g. mcab_demo) is an intentionally independent producer, the
+# same way 4ch_aec_bf_nr_res is (see that Makefile's own header comment):
+# kept out of this target's own prerequisite list so its DOA/BF dependencies
+# never become part of THIS mono pipeline's build identity, but still run
+# here as a recipe line so `make test` at this level is the one aggregate
+# that exercises every reference example under pipelines/, not only the
+# mono binaries built directly in this directory.
+	+$(MAKE) --no-print-directory -C samples test
 
 # example-adapter: build + RUN the REFERENCE ONLY
 # board-adapter host simulation (example_board_adapter.c) standalone -- same
@@ -1177,7 +1232,23 @@ example_board_adapter: $(BIN_DIR)/example_board_adapter
 # libs: compat alias that builds the three producer archives (an automatic side
 # effect of the FORCE rules below) and asserts the local DFN pipeline archive
 # exists, for tooling that invokes `make libs`.
-libs: $(AC_LIB) $(AEC_LIB) $(NR_LIB) $(DFN_LIB_TARGET)
+libs: $(COMMON_LIB) $(AEC_LIB) $(NR_LIB) $(DFN_LIB_TARGET)
+
+.PHONY: test_target_abi target-abi-test
+test_target_abi: $(BIN_DIR)/test_target_abi
+target-abi-test: $(BIN_DIR)/test_target_abi
+	"$(abspath $(BIN_DIR))/test_target_abi"
+
+$(BIN_DIR)/test_target_abi: $(TARGET_ABI_SRCS) $(COMMON_LIB) $(AEC_LIB) $(NR_LIB) | _cfg_guard
+	@mkdir -p "$(OBJ_DIR)/target_abi"
+	@rm -f "$(OBJ_DIR)/target_abi/"*.o
+	@for source in $(TARGET_ABI_SRCS); do \
+	  object="$(OBJ_DIR)/target_abi/$$(basename "$$source" .c).o"; \
+	  $(CC) $(CFLAGS) $(ULCNET_GRID_CFLAGS) $(TARGET_ABI_INCLUDES) -MD -MP \
+	    -c "$$source" -o "$$object" || exit $$?; \
+	done
+	$(LINK) -o $@ $(OBJ_DIR)/target_abi/*.o $(AEC_LIB) $(NR_LIB) $(COMMON_LIB) $(LDFLAGS)
+
 
 # Root-name phony aliases: `make aec_nr_pipeline`, etc. build the artifact at
 # $(BIN_DIR)/<name>, not flat in this directory.
@@ -1200,37 +1271,37 @@ FORCE:
 # producer's own build (a no-op if it's already up to date -- that
 # producer's own Makefile decides that), but only actually touches the
 # archive's mtime if it really rebuilt something, so the binaries below
-# only relink when it did. AC_DIR=$(abspath $(AC_DIR)) AC_LIB=$(AC_LIB) is
+# only relink when it did. COMMON_DIR=$(abspath $(COMMON_DIR)) COMMON_LIB=$(COMMON_LIB) is
 # forwarded to the lib/aec/lib/nr sub-makes even though `lib` itself never
-# links audio_common's archive -- see the two-phase dispatch comment above
+# links audiolib's archive -- see the two-phase dispatch comment above
 # for why this is required for their CFG_SIG (hence output path) to match
 # what the query call above already resolved.
-$(AC_LIB): FORCE
-	+$(MAKE) -C $(AC_DIR) $(FWD) lib
-	@test -f '$@' || { echo "ERROR: audio_common did not produce $@ (query/build divergence -- supported forwarded controls are BACKEND/SIMD/WERROR/CC/CXX/EXTRA_CFLAGS/NO_STDIO/TOOLCHAIN_CHECK)"; exit 1; }
+$(COMMON_LIB): FORCE
+	+$(MAKE) -C $(COMMON_DIR) $(FWD) lib
+	@test -f '$@' || { echo "ERROR: audiolib did not produce $@ (query/build divergence -- supported forwarded controls are BACKEND/SIMD/WERROR/CC/CXX/EXTRA_CFLAGS/NO_STDIO/TOOLCHAIN_CHECK)"; exit 1; }
 
 $(AEC_LIB): FORCE
-	+$(MAKE) -C $(AEC_DIR) $(FWD) AC_DIR=$(abspath $(AC_DIR)) AC_LIB=$(AC_LIB) lib
+	+$(MAKE) -C $(AEC_DIR) $(FWD) COMMON_DIR=$(abspath $(COMMON_DIR)) COMMON_LIB=$(COMMON_LIB) lib
 	@test -f '$@' || { echo "ERROR: lib/aec did not produce $@ (query/build divergence)"; exit 1; }
 
 $(NR_LIB): FORCE
-	+$(MAKE) -C $(NR_DIR) $(FWD) AC_DIR=$(abspath $(AC_DIR)) AC_LIB=$(AC_LIB) lib
+	+$(MAKE) -C $(NR_DIR) $(FWD) COMMON_DIR=$(abspath $(COMMON_DIR)) COMMON_LIB=$(COMMON_LIB) lib
 	@test -f '$@' || { echo "ERROR: lib/nr did not produce $@ (query/build divergence)"; exit 1; }
 
 # Compile with $(CC) (always a plain-C driver, -std=gnu99 valid) then link
-# with $(LINK) (c++ for BACKEND=ne10 -- the NE10 archive's one C++ TU needs
-# it). Link order matters (see the LDFLAGS comment above): pipeline.o,
+# with $(LINK) (c++ -- the NE10 archive's one C++ TU needs it). Link order
+# matters (see the LDFLAGS comment above): pipeline.o,
 # libaudio_pipeline.a, libaec.a, libanr.a, libaudio_common.a, -lm.
-$(BIN_DIR)/aec_nr_pipeline: $(OBJ_DIR)/aec_nr_pipeline.o $(LIB_TARGET) $(AEC_LIB) $(NR_LIB) $(AC_LIB) | _cfg_guard
-	$(LINK) -o $@ $(OBJ_DIR)/aec_nr_pipeline.o $(LIB_TARGET) $(AEC_LIB) $(NR_LIB) $(AC_LIB) $(LDFLAGS)
+$(BIN_DIR)/aec_nr_pipeline: $(OBJ_DIR)/aec_nr_pipeline.o $(LIB_TARGET) $(AEC_LIB) $(NR_LIB) $(COMMON_LIB) | _cfg_guard
+	$(LINK) -o $@ $(OBJ_DIR)/aec_nr_pipeline.o $(LIB_TARGET) $(AEC_LIB) $(NR_LIB) $(COMMON_LIB) $(LDFLAGS)
 	@echo "aec_nr_pipeline [$(BACKEND)] -> $@"
 
-$(BIN_DIR)/aec_nr_pipeline_static: $(OBJ_DIR)/aec_nr_pipeline_static.o $(LIB_TARGET) $(AEC_LIB) $(NR_LIB) $(AC_LIB) | _cfg_guard
-	$(LINK) -o $@ $(OBJ_DIR)/aec_nr_pipeline_static.o $(LIB_TARGET) $(AEC_LIB) $(NR_LIB) $(AC_LIB) $(LDFLAGS)
+$(BIN_DIR)/aec_nr_pipeline_static: $(OBJ_DIR)/aec_nr_pipeline_static.o $(LIB_TARGET) $(AEC_LIB) $(NR_LIB) $(COMMON_LIB) | _cfg_guard
+	$(LINK) -o $@ $(OBJ_DIR)/aec_nr_pipeline_static.o $(LIB_TARGET) $(AEC_LIB) $(NR_LIB) $(COMMON_LIB) $(LDFLAGS)
 	@echo "aec_nr_pipeline_static [$(BACKEND)] -> $@"
 
-$(BIN_DIR)/test_audio_pipeline: $(OBJ_DIR)/test_audio_pipeline.o $(LIB_TARGET) $(AEC_LIB) $(NR_LIB) $(AC_LIB) | _cfg_guard
-	$(LINK) -o $@ $(OBJ_DIR)/test_audio_pipeline.o $(LIB_TARGET) $(AEC_LIB) $(NR_LIB) $(AC_LIB) $(LDFLAGS)
+$(BIN_DIR)/test_audio_pipeline: $(OBJ_DIR)/test_audio_pipeline.o $(LIB_TARGET) $(AEC_LIB) $(NR_LIB) $(COMMON_LIB) | _cfg_guard
+	$(LINK) -o $@ $(OBJ_DIR)/test_audio_pipeline.o $(LIB_TARGET) $(AEC_LIB) $(NR_LIB) $(COMMON_LIB) $(LDFLAGS)
 	@echo "test_audio_pipeline [$(BACKEND)] -> $@"
 
 # ULCNet applications link their wrapper/pre-post objects directly. They are
@@ -1241,8 +1312,8 @@ ULCNET_PIPELINE_OBJS = $(OBJ_DIR)/audio_pipeline_ulcnet.o $(OBJ_DIR)/se_config.o
 # descriptor a runtime published, so a board integrating the wrapper alone
 # gains no new link dependency); the test links it to BUILD descriptors for
 # the far-input contract gate.
-$(BIN_DIR)/test_audio_pipeline_ulcnet: $(OBJ_DIR)/test_audio_pipeline_ulcnet.o $(ULCNET_PIPELINE_OBJS) $(OBJ_DIR)/ulcnet_model_io.o $(AEC_LIB) $(AC_LIB) | _cfg_guard
-	$(LINK) -o $@ $(OBJ_DIR)/test_audio_pipeline_ulcnet.o $(ULCNET_PIPELINE_OBJS) $(OBJ_DIR)/ulcnet_model_io.o $(AEC_LIB) $(AC_LIB) $(LDFLAGS)
+$(BIN_DIR)/test_audio_pipeline_ulcnet: $(OBJ_DIR)/test_audio_pipeline_ulcnet.o $(ULCNET_PIPELINE_OBJS) $(OBJ_DIR)/ulcnet_model_io.o $(AEC_LIB) $(COMMON_LIB) | _cfg_guard
+	$(LINK) -o $@ $(OBJ_DIR)/test_audio_pipeline_ulcnet.o $(ULCNET_PIPELINE_OBJS) $(OBJ_DIR)/ulcnet_model_io.o $(AEC_LIB) $(COMMON_LIB) $(LDFLAGS)
 	@echo "test_audio_pipeline_ulcnet [$(BACKEND)] -> $@"
 
 # The adapter drives the pre/post class, so anything linking the adapter
@@ -1250,54 +1321,54 @@ $(BIN_DIR)/test_audio_pipeline_ulcnet: $(OBJ_DIR)/test_audio_pipeline_ulcnet.o $
 # ulcnet_process.c's analysis/synthesis entry points unconditionally -- the
 # ULCNET_IO_FREQ instances the adapter builds never CALL them, but the symbols
 # still have to resolve -- which is why the adapter test links ulcnet_process.o
-# and, through it, audio_common's FFT wrapper.
+# and, through it, audiolib's FFT wrapper.
 ULCNET_ADAPTER_OBJS = $(OBJ_DIR)/ulcnet_accelerator_adapter.o \
                       $(OBJ_DIR)/ulcnet_prepost.o \
                       $(OBJ_DIR)/ulcnet_model_io.o
 
-$(BIN_DIR)/mono_alignulcnet: $(OBJ_DIR)/mono_alignulcnet_main.o $(ULCNET_ADAPTER_OBJS) $(ULCNET_PIPELINE_OBJS) $(AEC_LIB) $(AC_LIB) | _cfg_guard
-	$(LINK) -o $@ $(OBJ_DIR)/mono_alignulcnet_main.o $(ULCNET_ADAPTER_OBJS) $(ULCNET_PIPELINE_OBJS) $(AEC_LIB) $(AC_LIB) $(LDFLAGS)
+$(BIN_DIR)/mono_alignulcnet: $(OBJ_DIR)/mono_alignulcnet_main.o $(ULCNET_ADAPTER_OBJS) $(ULCNET_PIPELINE_OBJS) $(AEC_LIB) $(COMMON_LIB) | _cfg_guard
+	$(LINK) -o $@ $(OBJ_DIR)/mono_alignulcnet_main.o $(ULCNET_ADAPTER_OBJS) $(ULCNET_PIPELINE_OBJS) $(AEC_LIB) $(COMMON_LIB) $(LDFLAGS)
 	@echo "mono_alignulcnet [$(BACKEND)] -> $@"
 
-$(BIN_DIR)/test_ulcnet_accelerator_adapter: $(OBJ_DIR)/test_ulcnet_accelerator_adapter.o $(ULCNET_ADAPTER_OBJS) $(OBJ_DIR)/ulcnet_process.o $(AC_LIB) | _cfg_guard
-	$(LINK) -o $@ $(OBJ_DIR)/test_ulcnet_accelerator_adapter.o $(ULCNET_ADAPTER_OBJS) $(OBJ_DIR)/ulcnet_process.o $(AC_LIB) $(LDFLAGS)
+$(BIN_DIR)/test_ulcnet_accelerator_adapter: $(OBJ_DIR)/test_ulcnet_accelerator_adapter.o $(ULCNET_ADAPTER_OBJS) $(OBJ_DIR)/ulcnet_process.o $(COMMON_LIB) | _cfg_guard
+	$(LINK) -o $@ $(OBJ_DIR)/test_ulcnet_accelerator_adapter.o $(ULCNET_ADAPTER_OBJS) $(OBJ_DIR)/ulcnet_process.o $(COMMON_LIB) $(LDFLAGS)
 
 # The mono DFN2 application hosts the conventional pipeline, so it links
 # libaudio_pipeline.a (and through it the NR archive) next to the DFN
 # archive; a board integrating the wrapper needs the same set.
-$(BIN_DIR)/mono_aec_dfn_res: $(OBJ_DIR)/mono_aec_dfn_res_main.o $(DFN_LIB_TARGET) $(LIB_TARGET) $(AEC_LIB) $(NR_LIB) $(AC_LIB) | _cfg_guard
-	$(LINK) -o $@ $(OBJ_DIR)/mono_aec_dfn_res_main.o $(DFN_LIB_TARGET) $(LIB_TARGET) $(AEC_LIB) $(NR_LIB) $(AC_LIB) $(LDFLAGS)
+$(BIN_DIR)/mono_aec_dfn_res: $(OBJ_DIR)/mono_aec_dfn_res_main.o $(DFN_LIB_TARGET) $(LIB_TARGET) $(AEC_LIB) $(NR_LIB) $(COMMON_LIB) | _cfg_guard
+	$(LINK) -o $@ $(OBJ_DIR)/mono_aec_dfn_res_main.o $(DFN_LIB_TARGET) $(LIB_TARGET) $(AEC_LIB) $(NR_LIB) $(COMMON_LIB) $(LDFLAGS)
 	@echo "mono_aec_dfn_res [$(BACKEND)] -> $@"
 
-$(BIN_DIR)/test_se_common: $(OBJ_DIR)/test_se_common.o $(OBJ_DIR)/se_config.o $(OBJ_DIR)/se_anr_stage.o $(AEC_LIB) $(NR_LIB) $(AC_LIB) | _cfg_guard
-	$(LINK) -o $@ $(OBJ_DIR)/test_se_common.o $(OBJ_DIR)/se_config.o $(OBJ_DIR)/se_anr_stage.o $(AEC_LIB) $(NR_LIB) $(AC_LIB) $(LDFLAGS)
+$(BIN_DIR)/test_se_common: $(OBJ_DIR)/test_se_common.o $(OBJ_DIR)/se_config.o $(OBJ_DIR)/se_anr_stage.o $(AEC_LIB) $(NR_LIB) $(COMMON_LIB) | _cfg_guard
+	$(LINK) -o $@ $(OBJ_DIR)/test_se_common.o $(OBJ_DIR)/se_config.o $(OBJ_DIR)/se_anr_stage.o $(AEC_LIB) $(NR_LIB) $(COMMON_LIB) $(LDFLAGS)
 	@echo "test_se_common [$(BACKEND)] -> $@"
 
 # test_readme_flow: the call-flow examples of README.md, compiled and run (chain a stage, DFN and ULCNet phased hops).
-$(BIN_DIR)/test_readme_flow: $(OBJ_DIR)/test_readme_flow.o $(ULCNET_PIPELINE_OBJS) $(OBJ_DIR)/ulcnet_model_io.o $(DFN_LIB_TARGET) $(LIB_TARGET) $(AEC_LIB) $(NR_LIB) $(AC_LIB) | _cfg_guard
-	$(LINK) -o $@ $(OBJ_DIR)/test_readme_flow.o $(ULCNET_PIPELINE_OBJS) $(OBJ_DIR)/ulcnet_model_io.o $(DFN_LIB_TARGET) $(LIB_TARGET) $(AEC_LIB) $(NR_LIB) $(AC_LIB) $(LDFLAGS)
+$(BIN_DIR)/test_readme_flow: $(OBJ_DIR)/test_readme_flow.o $(ULCNET_PIPELINE_OBJS) $(OBJ_DIR)/ulcnet_model_io.o $(DFN_LIB_TARGET) $(LIB_TARGET) $(AEC_LIB) $(NR_LIB) $(COMMON_LIB) | _cfg_guard
+	$(LINK) -o $@ $(OBJ_DIR)/test_readme_flow.o $(ULCNET_PIPELINE_OBJS) $(OBJ_DIR)/ulcnet_model_io.o $(DFN_LIB_TARGET) $(LIB_TARGET) $(AEC_LIB) $(NR_LIB) $(COMMON_LIB) $(LDFLAGS)
 	@echo "test_readme_flow [$(BACKEND)] -> $@"
 
-$(BIN_DIR)/test_dfn_res_stage: $(OBJ_DIR)/test_dfn_res_stage.o $(DFN_STAGE_OBJS) $(AC_LIB) | _cfg_guard
-	$(LINK) -o $@ $(OBJ_DIR)/test_dfn_res_stage.o $(DFN_STAGE_OBJS) $(AC_LIB) $(LDFLAGS)
+$(BIN_DIR)/test_dfn_res_stage: $(OBJ_DIR)/test_dfn_res_stage.o $(DFN_STAGE_OBJS) $(COMMON_LIB) | _cfg_guard
+	$(LINK) -o $@ $(OBJ_DIR)/test_dfn_res_stage.o $(DFN_STAGE_OBJS) $(COMMON_LIB) $(LDFLAGS)
 	@echo "test_dfn_res_stage [$(BACKEND)] -> $@"
 
-$(BIN_DIR)/test_dfn_rate_bridge: $(OBJ_DIR)/test_dfn_rate_bridge.o $(OBJ_DIR)/dfn_rate_bridge.o $(DFN_STAGE_OBJS) $(AC_LIB) | _cfg_guard
-	$(LINK) -o $@ $(OBJ_DIR)/test_dfn_rate_bridge.o $(OBJ_DIR)/dfn_rate_bridge.o $(DFN_STAGE_OBJS) $(AC_LIB) $(LDFLAGS)
+$(BIN_DIR)/test_dfn_rate_bridge: $(OBJ_DIR)/test_dfn_rate_bridge.o $(OBJ_DIR)/dfn_rate_bridge.o $(DFN_STAGE_OBJS) $(COMMON_LIB) | _cfg_guard
+	$(LINK) -o $@ $(OBJ_DIR)/test_dfn_rate_bridge.o $(OBJ_DIR)/dfn_rate_bridge.o $(DFN_STAGE_OBJS) $(COMMON_LIB) $(LDFLAGS)
 	@echo "test_dfn_rate_bridge [$(BACKEND)] -> $@"
 
-$(BIN_DIR)/test_audio_pipeline_dfn: $(OBJ_DIR)/test_audio_pipeline_dfn.o $(DFN_LIB_TARGET) $(LIB_TARGET) $(AEC_LIB) $(NR_LIB) $(AC_LIB) | _cfg_guard
-	$(LINK) -o $@ $(OBJ_DIR)/test_audio_pipeline_dfn.o $(DFN_LIB_TARGET) $(LIB_TARGET) $(AEC_LIB) $(NR_LIB) $(AC_LIB) $(LDFLAGS)
+$(BIN_DIR)/test_audio_pipeline_dfn: $(OBJ_DIR)/test_audio_pipeline_dfn.o $(DFN_LIB_TARGET) $(LIB_TARGET) $(AEC_LIB) $(NR_LIB) $(COMMON_LIB) | _cfg_guard
+	$(LINK) -o $@ $(OBJ_DIR)/test_audio_pipeline_dfn.o $(DFN_LIB_TARGET) $(LIB_TARGET) $(AEC_LIB) $(NR_LIB) $(COMMON_LIB) $(LDFLAGS)
 	@echo "test_audio_pipeline_dfn [$(BACKEND)] -> $@"
 
-$(BIN_DIR)/example_board_adapter: $(OBJ_DIR)/example_board_adapter.o $(LIB_TARGET) $(AEC_LIB) $(NR_LIB) $(AC_LIB) | _cfg_guard
-	$(LINK) -o $@ $(OBJ_DIR)/example_board_adapter.o $(LIB_TARGET) $(AEC_LIB) $(NR_LIB) $(AC_LIB) $(LDFLAGS)
+$(BIN_DIR)/example_board_adapter: $(OBJ_DIR)/example_board_adapter.o $(LIB_TARGET) $(AEC_LIB) $(NR_LIB) $(COMMON_LIB) | _cfg_guard
+	$(LINK) -o $@ $(OBJ_DIR)/example_board_adapter.o $(LIB_TARGET) $(AEC_LIB) $(NR_LIB) $(COMMON_LIB) $(LDFLAGS)
 	@echo "example_board_adapter [$(BACKEND)] -> $@"
 endif
 
 # --- Query targets -----------------------------------------------------
-# Report THIS invocation's own build identity (empty AC_PRODUCER_SIG/
-# AEC_PRODUCER_SIG/NR_PRODUCER_SIG unless AC_LIB/AEC_LIB/NR_LIB were
+# Report THIS invocation's own build identity (empty COMMON_PRODUCER_SIG/
+# AEC_PRODUCER_SIG/NR_PRODUCER_SIG unless COMMON_LIB/AEC_LIB/NR_LIB were
 # explicitly passed in). Parse-time stdout purity: nothing above this point
 # ever unconditionally $(info)/$(warning)s, so these targets' stdout is
 # exactly their one recipe-time @echo line -- safe to capture with
@@ -1305,7 +1376,7 @@ endif
 # lib/aec's/lib/nr's own Makefiles, and this file's audit-no-stdio/publish
 # recipes) all do. To get the exact path `make all` itself would produce
 # (which DOES fold in the three resolved producers' identities), resolve
-# AC_LIB/AEC_LIB/NR_LIB the same way phase 1 does and pass them explicitly.
+# COMMON_LIB/AEC_LIB/NR_LIB the same way phase 1 does and pass them explicitly.
 .PHONY: print-bin-dir print-obj-dir print-lib-path
 # print-bin-dir / print-lib-path / print-obj-dir all dispatch through the same
 # three-producer phase-1 resolution as the build goals, so a bare
@@ -1314,14 +1385,14 @@ endif
 # resolved-producer directory). print-obj-dir did NOT dispatch before, so it
 # answered for a different config signature than the one the build used --
 # which made it useless for anything that has to find a just-built object.
-# Passing AC_LIB/AEC_LIB/NR_LIB explicitly skips the query sub-makes.
-ifeq ($(AC_LIB),)
+# Passing COMMON_LIB/AEC_LIB/NR_LIB explicitly skips the query sub-makes.
+ifeq ($(COMMON_LIB),)
 print-bin-dir print-lib-path print-obj-dir:
-	+@ac="$$($(MAKE) -s --no-print-directory -C $(AC_DIR) $(FWD) print-lib-path)"; \
-	 test -n "$$ac" || { echo "FATAL: could not resolve audio_common archive path (AC_DIR=$(AC_DIR))" >&2; exit 1; }; \
-	 aec="$$($(MAKE) -s --no-print-directory -C $(AEC_DIR) $(FWD) AC_DIR=$(abspath $(AC_DIR)) AC_LIB="$$ac" print-lib-path)"; \
-	 nr="$$($(MAKE) -s --no-print-directory -C $(NR_DIR) $(FWD) AC_DIR=$(abspath $(AC_DIR)) AC_LIB="$$ac" print-lib-path)"; \
-	 $(MAKE) -s --no-print-directory $@ AC_LIB="$$ac" AEC_LIB="$$aec" NR_LIB="$$nr"
+	+@ac="$$($(MAKE) -s --no-print-directory -C $(COMMON_DIR) $(FWD) print-lib-path)"; \
+	 test -n "$$ac" || { echo "FATAL: could not resolve audiolib archive path (COMMON_DIR=$(COMMON_DIR))" >&2; exit 1; }; \
+	 aec="$$($(MAKE) -s --no-print-directory -C $(AEC_DIR) $(FWD) COMMON_DIR=$(abspath $(COMMON_DIR)) COMMON_LIB="$$ac" print-lib-path)"; \
+	 nr="$$($(MAKE) -s --no-print-directory -C $(NR_DIR) $(FWD) COMMON_DIR=$(abspath $(COMMON_DIR)) COMMON_LIB="$$ac" print-lib-path)"; \
+	 $(MAKE) -s --no-print-directory $@ COMMON_LIB="$$ac" AEC_LIB="$$aec" NR_LIB="$$nr"
 else
 print-bin-dir:
 	@echo $(abspath $(BIN_DIR))
@@ -1350,7 +1421,7 @@ test-fp-contract:
 # config's path, i.e. the two configs cannot silently collide/alias. `ar -t`
 # confirms the archive holds its three members (audio_pipeline.o, se_config.o,
 # se_anr_stage.o) nm's hits are attributed to. Pattern/style mirrors
-# ../../audio_common/scripts/audit_alloc_symbols.sh (leading-underscore-
+# ../../audiolib/common/scripts/audit_alloc_symbols.sh (leading-underscore-
 # tolerant regex, last-whitespace-field match against nm's NAME column, so
 # it works the same under macOS/BSD nm and GNU nm). This IS a pass/fail gate
 # (prints PASS/FAIL, non-zero exit on FAIL).
@@ -1382,20 +1453,14 @@ audit-no-stdio:
 
 # audit-no-stdio-stack (full-image gate): builds ALL FIVE
 # delivered archives with NO_STDIO=1 (the dispatch forwards NO_STDIO to
-# audio_common / lib/aec / lib/nr -- lib/aec compiles its trace/debug TU out
+# audiolib / lib/aec / lib/nr -- lib/aec compiles its trace/debug TU out
 # entirely under this knob), nm-gates EACH delivered archive, then links
 # test_no_stdio_stack.c (a minimal main that runs the whole
 # query->init_ex->process->reset->destroy flow and uses no stdio itself --
 # exit code is its only output) and nm-gates the EXECUTABLE, so a stdio
 # symbol contributed by any archive fails the audit at the image level.
-# Strictness tiers (calibrated, same as lib/aec's audit): the S1 set
-# (fprintf/vfprintf/printf/puts/fputs) must be absent on BOTH backends at
-# every level; the extended S2 set (+stderr/__stderrp/fputc/fwrite) is
-# additionally enforced for BACKEND=ne10 -- the board deliverable -- end to
-# end. BACKEND=kiss retains __stderrp/fputc/fwrite refs from the VENDORED
-# KISS FFT's malloc-failure error macro (kiss_fft_log.h); that path is
-# unreachable on the pool path (allocator-hook-proven zero-heap) and kiss is
-# the host/reference backend, so it is a documented calibration, not a pass.
+# Every archive and the executable must be free of the stdio set
+# (fprintf/vfprintf/printf/puts/fputs/stderr/__stderrp/fputc/fwrite).
 .PHONY: audit-no-stdio-stack
 audit-no-stdio-stack:
 	@echo "audit-no-stdio-stack: building the full stack (BACKEND=$(BACKEND), NO_STDIO=1)"
@@ -1403,15 +1468,13 @@ audit-no-stdio-stack:
 	@pl="$$($(MAKE) -s --no-print-directory BACKEND=$(BACKEND) NO_STDIO=1 print-lib-path)"; \
 	 bd="$$($(MAKE) -s --no-print-directory BACKEND=$(BACKEND) NO_STDIO=1 print-bin-dir)"; \
 	 dfnpl="$$bd/libaudio_pipeline_dfn.a"; \
-	 ac="$$($(MAKE) -s --no-print-directory -C $(AC_DIR) BACKEND=$(BACKEND) SIMD=$(SIMD) WERROR=$(WERROR) CC='$(CC)' CXX='$(CXX)' EXTRA_CFLAGS='$(EXTRA_CFLAGS)' NO_STDIO=1 print-lib-path)"; \
-	 aec="$$($(MAKE) -s --no-print-directory -C $(AEC_DIR) BACKEND=$(BACKEND) SIMD=$(SIMD) WERROR=$(WERROR) CC='$(CC)' CXX='$(CXX)' EXTRA_CFLAGS='$(EXTRA_CFLAGS)' NO_STDIO=1 AC_DIR=$(abspath $(AC_DIR)) AC_LIB="$$ac" print-lib-path)"; \
-	 nr="$$($(MAKE) -s --no-print-directory -C $(NR_DIR) BACKEND=$(BACKEND) SIMD=$(SIMD) WERROR=$(WERROR) CC='$(CC)' CXX='$(CXX)' EXTRA_CFLAGS='$(EXTRA_CFLAGS)' NO_STDIO=1 AC_DIR=$(abspath $(AC_DIR)) AC_LIB="$$ac" print-lib-path)"; \
-	 $(MAKE) --no-print-directory -C $(AC_DIR) BACKEND=$(BACKEND) SIMD=$(SIMD) WERROR=$(WERROR) CC='$(CC)' CXX='$(CXX)' EXTRA_CFLAGS='$(EXTRA_CFLAGS)' NO_STDIO=1 lib >/dev/null; \
-	 $(MAKE) --no-print-directory -C $(AEC_DIR) BACKEND=$(BACKEND) SIMD=$(SIMD) WERROR=$(WERROR) CC='$(CC)' CXX='$(CXX)' EXTRA_CFLAGS='$(EXTRA_CFLAGS)' NO_STDIO=1 AC_DIR=$(abspath $(AC_DIR)) AC_LIB="$$ac" lib >/dev/null; \
-	 $(MAKE) --no-print-directory -C $(NR_DIR) BACKEND=$(BACKEND) SIMD=$(SIMD) WERROR=$(WERROR) CC='$(CC)' CXX='$(CXX)' EXTRA_CFLAGS='$(EXTRA_CFLAGS)' NO_STDIO=1 AC_DIR=$(abspath $(AC_DIR)) AC_LIB="$$ac" lib >/dev/null; \
-	 s1='^_?(fprintf|vfprintf|printf|puts|fputs)$$'; \
-	 s2='^_?(fprintf|vfprintf|printf|puts|fputs|stderr|__stderrp|fputc|fwrite)$$'; \
-	 pat="$$s1"; [ "$(BACKEND)" = ne10 ] && pat="$$s2"; \
+	 ac="$$($(MAKE) -s --no-print-directory -C $(COMMON_DIR) BACKEND=$(BACKEND) SIMD=$(SIMD) WERROR=$(WERROR) CC='$(CC)' CXX='$(CXX)' EXTRA_CFLAGS='$(EXTRA_CFLAGS)' NO_STDIO=1 print-lib-path)"; \
+	 aec="$$($(MAKE) -s --no-print-directory -C $(AEC_DIR) BACKEND=$(BACKEND) SIMD=$(SIMD) WERROR=$(WERROR) CC='$(CC)' CXX='$(CXX)' EXTRA_CFLAGS='$(EXTRA_CFLAGS)' NO_STDIO=1 COMMON_DIR=$(abspath $(COMMON_DIR)) COMMON_LIB="$$ac" print-lib-path)"; \
+	 nr="$$($(MAKE) -s --no-print-directory -C $(NR_DIR) BACKEND=$(BACKEND) SIMD=$(SIMD) WERROR=$(WERROR) CC='$(CC)' CXX='$(CXX)' EXTRA_CFLAGS='$(EXTRA_CFLAGS)' NO_STDIO=1 COMMON_DIR=$(abspath $(COMMON_DIR)) COMMON_LIB="$$ac" print-lib-path)"; \
+	 $(MAKE) --no-print-directory -C $(COMMON_DIR) BACKEND=$(BACKEND) SIMD=$(SIMD) WERROR=$(WERROR) CC='$(CC)' CXX='$(CXX)' EXTRA_CFLAGS='$(EXTRA_CFLAGS)' NO_STDIO=1 lib >/dev/null; \
+	 $(MAKE) --no-print-directory -C $(AEC_DIR) BACKEND=$(BACKEND) SIMD=$(SIMD) WERROR=$(WERROR) CC='$(CC)' CXX='$(CXX)' EXTRA_CFLAGS='$(EXTRA_CFLAGS)' NO_STDIO=1 COMMON_DIR=$(abspath $(COMMON_DIR)) COMMON_LIB="$$ac" lib >/dev/null; \
+	 $(MAKE) --no-print-directory -C $(NR_DIR) BACKEND=$(BACKEND) SIMD=$(SIMD) WERROR=$(WERROR) CC='$(CC)' CXX='$(CXX)' EXTRA_CFLAGS='$(EXTRA_CFLAGS)' NO_STDIO=1 COMMON_DIR=$(abspath $(COMMON_DIR)) COMMON_LIB="$$ac" lib >/dev/null; \
+	 pat='^_?(fprintf|vfprintf|printf|puts|fputs|stderr|__stderrp|fputc|fwrite)$$'; \
 	 for lib in "$$pl" "$$dfnpl" "$$aec" "$$nr" "$$ac"; do \
 	   test -f "$$lib" || { echo "FAIL: archive not found: $$lib"; exit 1; }; \
 	   hits=$$(nm -A "$$lib" | awk -v re="$$pat" '{ n=$$NF; if (n ~ re) print }'); \
@@ -1428,22 +1491,22 @@ audit-no-stdio-stack:
 
 # =============================================================================
 # publish v2: immutable per-config release under dist/
-# -- same design as audio_common's/AEC's/NR's publish (see audio_common's
+# -- same design as audiolib's/AEC's/NR's publish (see audiolib's
 # Makefile for the full writeup): dist/<backend>/<cfg_sig>/ + atomic
 # dist/<backend>/current symlink, a per-backend mkdir-lock serialising
 # concurrent publishes, MANIFEST.txt with relative paths + per-file sha256 +
-# this build's three resolved producer identities (AC_PRODUCER_SIG/
+# this build's three resolved producer identities (COMMON_PRODUCER_SIG/
 # AEC_PRODUCER_SIG/NR_PRODUCER_SIG) + the git commit of each of the three
-# sibling/submodule repos (audio_common, lib/aec, lib/nr) via `git -C`, on
+# sibling/submodule repos (audiolib, lib/aec, lib/nr) via `git -C`, on
 # top of this repo's (Audio_ALG's) own commit. PUBLISH_ARTIFACTS needs
-# $(AC_LIB)/$(AEC_LIB)/$(NR_LIB) to exist, so `publish` goes through the same
+# $(COMMON_LIB)/$(AEC_LIB)/$(NR_LIB) to exist, so `publish` goes through the same
 # two-phase, three-producer dispatch as `all`/`test`/`libs` above when they
-# aren't already known (see the ifeq($(AC_LIB),) block near the top of this
+# aren't already known (see the ifeq($(COMMON_LIB),) block near the top of this
 # file, which lists `publish` alongside all/test/libs).
 # =============================================================================
 # publish v4: immutable, content-addressed release under $(DIST_ROOT) --
-# same design as audio_common's publish; see that Makefile for the full
-# layout/semantics writeup. Additions here (mirroring audio_common's,
+# same design as audiolib's publish; see that Makefile for the full
+# layout/semantics writeup. Additions here (mirroring audiolib's,
 # extended to FOUR repos):
 #   - ATTEST is one-event-one-file: EXACTLY one new
 #     attest-<utc>-<commit>[-dirty]-<seq>.txt per publish EVENT (incl.
@@ -1456,7 +1519,7 @@ audit-no-stdio-stack:
 #     clobber the prior record).
 #   - Every commit recorded is the FULL 40-hex git OID (never abbreviated),
 #     for this repo (pipelines/Audio_ALG) AND all three producers
-#     (audio_common, lib/aec, lib/nr) -- "which exact checkout of the whole
+#     (audiolib, lib/aec, lib/nr) -- "which exact checkout of the whole
 #     stack published this" lives in ATTEST/, not in MANIFEST (which stays
 #     deterministic: config + tool identities + per-file SHA-256 only, so
 #     the same release id always has the same MANIFEST bytes and republish
@@ -1554,7 +1617,7 @@ DIST_LOCK         = $(DIST_ROOT)/.lock.$(BACKEND)
 #   -n  exec a recursion-only path (the child make inherits -n and merely
 #       PRINTS the pin check and _publish_impl commands).
 # All three are ZERO-WRITE: no DIST_ROOT, no lock, no stage/helper/
-# MANIFEST/ATTEST writes, and no artifact mtime changes. See audio_common's
+# MANIFEST/ATTEST writes, and no artifact mtime changes. See audiolib's
 # Makefile for the full MAKEFLAGS word-scan writeup (verified against GNU
 # make 3.81: 17 flag combinations incl. long forms: bundled no-dash short
 # flags may appear as the first word ("n", "sn") OR as separate dashed
@@ -1592,12 +1655,12 @@ _publish_checked:
 
 # _publish_impl phase-2: attest v2 records FOUR repos'
 # provenance -- this repo (Audio_ALG/pipelines) AND all three producers
-# (audio_common, lib/aec, lib/nr) -- each as a FULL 40-hex git commit OID
+# (audiolib, lib/aec, lib/nr) -- each as a FULL 40-hex git commit OID
 # plus a dirty flag, so a release's ATTEST/ directory names the exact
 # source state of the entire stack, not just this repo.
 #
 # hash_untracked() (defined at the very top of the recipe below, VERBATIM
-# the same helper audio_common's Makefile defines): takes a path PREFIX as
+# the same helper audiolib's Makefile defines): takes a path PREFIX as
 # $1, reads a newline-separated untracked-path list on stdin, sorts it
 # (`LC_ALL=C sort`), and emits one FIXED-FIELD record per path -- "L
 # <sha256(path)> <sha256(readlink output)>" for a symlink, "F <mode>
@@ -1609,7 +1672,7 @@ _publish_checked:
 # collision-prone: "a b"->"c" vs "a"->"b c" would otherwise encode
 # identically). Called FOUR times below, once per repo, each into its OWN
 # record file: this repo as `hash_untracked "./"` over the
-# WHITELIST-FILTERED list, each producer as `hash_untracked "$(AC_DIR)/"` /
+# WHITELIST-FILTERED list, each producer as `hash_untracked "$(COMMON_DIR)/"` /
 # `"$(AEC_DIR)/"` / `"$(NR_DIR)/"` over its raw (unfiltered) list -- the
 # prefix is how the SAME helper resolves a path relative to a DIFFERENT
 # repo root without duplicating the L/F/X logic four times. Each repo's
@@ -1656,7 +1719,7 @@ _publish_checked:
 # deterministically ... and so cannot enter the provenance record" -- a
 # publish must never proceed as though it could account for a source it
 # can't.
-ifneq ($(AC_LIB),)
+ifneq ($(COMMON_LIB),)
 .PHONY: _publish_impl
 _publish_impl: $(PUBLISH_ARTIFACTS)
 	@set -e; \
@@ -1692,17 +1755,17 @@ _publish_impl: $(PUBLISH_ARTIFACTS)
 	dirty=0; [ -n "$$(git status --porcelain -uno 2>/dev/null)" ] && dirty=1; \
 	unt_list="$$(git ls-files --others --exclude-standard 2>/dev/null | grep -vE '^AINR/(GTCRN|gtcrn_github)/' || true)"; \
 	untracked=0; [ -n "$$unt_list" ] && untracked=1; \
-	if [ -z "$(AC_DIR)" ] || [ ! -d "$(AC_DIR)" ]; then \
-	  echo "FATAL: publish refused -- audio_common has no git identity (not a git checkout, or AC_DIR=$(AC_DIR) not present); no escape hatch admits this." >&2; \
+	if [ -z "$(COMMON_DIR)" ] || [ ! -d "$(COMMON_DIR)" ]; then \
+	  echo "FATAL: publish refused -- audiolib has no git identity (not a git checkout, or COMMON_DIR=$(COMMON_DIR) not present); no escape hatch admits this." >&2; \
 	  exit 1; \
 	fi; \
-	ac_commit="$$(git -C "$(AC_DIR)" rev-parse HEAD 2>/dev/null || echo unknown)"; \
+	ac_commit="$$(git -C "$(COMMON_DIR)" rev-parse HEAD 2>/dev/null || echo unknown)"; \
 	if [ "$$ac_commit" = "unknown" ]; then \
-	  echo "FATAL: publish refused -- audio_common has no git identity (not a git checkout, or AC_DIR=$(AC_DIR) not present); no escape hatch admits this." >&2; \
+	  echo "FATAL: publish refused -- audiolib has no git identity (not a git checkout, or COMMON_DIR=$(COMMON_DIR) not present); no escape hatch admits this." >&2; \
 	  exit 1; \
 	fi; \
-	ac_dirty=0; [ -n "$$(git -C "$(AC_DIR)" status --porcelain -uno 2>/dev/null)" ] && ac_dirty=1; \
-	ac_unt_list="$$(git -C "$(AC_DIR)" ls-files --others --exclude-standard 2>/dev/null)"; \
+	ac_dirty=0; [ -n "$$(git -C "$(COMMON_DIR)" status --porcelain -uno 2>/dev/null)" ] && ac_dirty=1; \
+	ac_unt_list="$$(git -C "$(COMMON_DIR)" ls-files --others --exclude-standard 2>/dev/null)"; \
 	ac_untracked=0; [ -n "$$ac_unt_list" ] && ac_untracked=1; \
 	if [ -z "$(AEC_DIR)" ] || [ ! -d "$(AEC_DIR)" ]; then \
 	  echo "FATAL: publish refused -- lib/aec has no git identity (not a git checkout, or AEC_DIR=$(AEC_DIR) not present); no escape hatch admits this." >&2; \
@@ -1733,7 +1796,7 @@ _publish_impl: $(PUBLISH_ARTIFACTS)
 	if [ "$$adp" != "1" ]; then \
 	  bad=0; \
 	  if [ "$$dirty" = "1" ]; then echo "FATAL: publish refused -- pipelines (this repo) working tree has uncommitted TRACKED changes." >&2; bad=1; fi; \
-	  if [ "$$ac_dirty" = "1" ]; then echo "FATAL: publish refused -- audio_common working tree has uncommitted TRACKED changes." >&2; bad=1; fi; \
+	  if [ "$$ac_dirty" = "1" ]; then echo "FATAL: publish refused -- audiolib working tree has uncommitted TRACKED changes." >&2; bad=1; fi; \
 	  if [ "$$aec_dirty" = "1" ]; then echo "FATAL: publish refused -- lib/aec working tree has uncommitted TRACKED changes." >&2; bad=1; fi; \
 	  if [ "$$nr_dirty" = "1" ]; then echo "FATAL: publish refused -- lib/nr working tree has uncommitted TRACKED changes." >&2; bad=1; fi; \
 	  if [ "$$bad" = "1" ]; then \
@@ -1750,7 +1813,7 @@ _publish_impl: $(PUBLISH_ARTIFACTS)
 	    bad=1; \
 	  fi; \
 	  if [ "$$ac_untracked" = "1" ]; then \
-	    echo "FATAL: publish refused -- audio_common contains UNTRACKED files:" >&2; \
+	    echo "FATAL: publish refused -- audiolib contains UNTRACKED files:" >&2; \
 	    printf '%s\n' "$$ac_unt_list" | head -5 | sed 's/^/    /' >&2; \
 	    bad=1; \
 	  fi; \
@@ -1771,7 +1834,7 @@ _publish_impl: $(PUBLISH_ARTIFACTS)
 	  fi; \
 	fi; \
 	ddiff=""; [ "$$dirty" = "1" ] && ddiff="$$(git diff --binary HEAD 2>/dev/null | shasum -a 256 | cut -d' ' -f1)"; \
-	ac_ddiff=""; [ "$$ac_dirty" = "1" ] && ac_ddiff="$$(git -C "$(AC_DIR)" diff --binary HEAD 2>/dev/null | shasum -a 256 | cut -d' ' -f1)"; \
+	ac_ddiff=""; [ "$$ac_dirty" = "1" ] && ac_ddiff="$$(git -C "$(COMMON_DIR)" diff --binary HEAD 2>/dev/null | shasum -a 256 | cut -d' ' -f1)"; \
 	aec_ddiff=""; [ "$$aec_dirty" = "1" ] && aec_ddiff="$$(git -C "$(AEC_DIR)" diff --binary HEAD 2>/dev/null | shasum -a 256 | cut -d' ' -f1)"; \
 	nr_ddiff=""; [ "$$nr_dirty" = "1" ] && nr_ddiff="$$(git -C "$(NR_DIR)" diff --binary HEAD 2>/dev/null | shasum -a 256 | cut -d' ' -f1)"; \
 	uhash=""; \
@@ -1786,9 +1849,9 @@ _publish_impl: $(PUBLISH_ARTIFACTS)
 	fi; \
 	ac_uhash=""; \
 	if [ "$$ac_untracked" = "1" ]; then \
-	  printf '%s\n' "$$ac_unt_list" | hash_untracked "$(AC_DIR)/" > "$$work/ac_untracked.records"; \
+	  printf '%s\n' "$$ac_unt_list" | hash_untracked "$(COMMON_DIR)/" > "$$work/ac_untracked.records"; \
 	  if grep -q '^X ' "$$work/ac_untracked.records"; then \
-	    echo "FATAL: publish refused -- an untracked path in audio_common cannot be hashed deterministically (embedded git checkout / special file / I/O failure) and so cannot enter the provenance record:" >&2; \
+	    echo "FATAL: publish refused -- an untracked path in audiolib cannot be hashed deterministically (embedded git checkout / special file / I/O failure) and so cannot enter the provenance record:" >&2; \
 	    grep '^X ' "$$work/ac_untracked.records" | sed 's/^X /    /' >&2; \
 	    exit 1; \
 	  fi; \
@@ -1816,7 +1879,7 @@ _publish_impl: $(PUBLISH_ARTIFACTS)
 	fi; \
 	dateutc="$$(date -u +%Y-%m-%dT%H:%M:%SZ)"; \
 	stamp='$(ATTEST_STAMP)'; [ -n "$$stamp" ] || stamp="$$(date -u +%Y%m%dT%H%M%SZ)"; \
-	$(HOSTCC) -O2 -o "$$work/swapln" $(AC_DIR)/tools/atomic_symlink_swap.c || { echo "FATAL: could not build the atomic symlink-swap helper with HOSTCC=$(HOSTCC) (pass HOSTCC=<host compiler>)" >&2; exit 1; }; \
+	$(HOSTCC) -O2 -o "$$work/swapln" $(COMMON_DIR)/tools/atomic_symlink_swap.c || { echo "FATAL: could not build the atomic symlink-swap helper with HOSTCC=$(HOSTCC) (pass HOSTCC=<host compiler>)" >&2; exit 1; }; \
 	mkdir -p "$(DIST_BACKEND_DIR)"; \
 	rm -rf "$$tmp"; mkdir -p "$$tmp"; \
 	cp $(PUBLISH_ARTIFACTS) "$$tmp/"; \
@@ -1828,7 +1891,7 @@ _publish_impl: $(PUBLISH_ARTIFACTS)
 	  echo "release_id=$$rel_id"; \
 	  echo "backend=$(BACKEND)"; \
 	  echo "cfg_sig=$(CFG_SIG)"; \
-	  echo "ac_producer_cfg_sig=$(AC_PRODUCER_SIG)"; \
+	  echo "ac_producer_cfg_sig=$(COMMON_PRODUCER_SIG)"; \
 	  echo "aec_producer_cfg_sig=$(AEC_PRODUCER_SIG)"; \
 	  echo "nr_producer_cfg_sig=$(NR_PRODUCER_SIG)"; \
 	  echo "cc=$(CC)"; echo "cxx=$(CXX)"; echo "ar=$(AR)"; echo "ranlib=$(RANLIB)"; echo "link=$(LINK)"; \
@@ -1862,10 +1925,10 @@ _publish_impl: $(PUBLISH_ARTIFACTS)
 	    [ -n "$$ddiff" ] && echo "dirty_diff_sha256=$$ddiff"; \
 	    echo "git_untracked=$$untracked"; \
 	    [ -n "$$uhash" ] && echo "untracked_tree_sha256=$$uhash"; \
-	    echo "audio_common_git_commit=$$ac_commit"; echo "audio_common_git_dirty=$$ac_dirty"; \
-	    [ -n "$$ac_ddiff" ] && echo "audio_common_dirty_diff_sha256=$$ac_ddiff"; \
-	    echo "audio_common_git_untracked=$$ac_untracked"; \
-	    [ -n "$$ac_uhash" ] && echo "audio_common_untracked_tree_sha256=$$ac_uhash"; \
+	    echo "audiolib_git_commit=$$ac_commit"; echo "audiolib_git_dirty=$$ac_dirty"; \
+	    [ -n "$$ac_ddiff" ] && echo "audiolib_dirty_diff_sha256=$$ac_ddiff"; \
+	    echo "audiolib_git_untracked=$$ac_untracked"; \
+	    [ -n "$$ac_uhash" ] && echo "audiolib_untracked_tree_sha256=$$ac_uhash"; \
 	    echo "aec_git_commit=$$aec_commit"; echo "aec_git_dirty=$$aec_dirty"; \
 	    [ -n "$$aec_ddiff" ] && echo "aec_dirty_diff_sha256=$$aec_ddiff"; \
 	    echo "aec_git_untracked=$$aec_untracked"; \
@@ -1900,20 +1963,20 @@ clean:
 	rm -f aec_nr_pipeline aec_nr_pipeline_static libaudio_pipeline.a test_audio_pipeline
 
 # clean-all: full nuke -- this dir's own artifacts plus all three
-# submodule/shared build trees (lib/aec, lib/nr, audio_common). clean-libs is
+# submodule/shared build trees (lib/aec, lib/nr, audiolib). clean-libs is
 # kept as a backward-compatible alias (same effect) since existing
 # tooling/docs call it by that name.
 clean-all: clean
 	$(MAKE) -C $(AEC_DIR) clean
 	$(MAKE) -C $(NR_DIR) clean
-	$(MAKE) -C $(AC_DIR) clean
+	$(MAKE) -C $(COMMON_DIR) clean
 
 clean-libs: clean-all
 
 .PHONY: clean clean-all clean-libs
 
 # --- Header dependency tracking ----------------------------------------------
-# See audio_common's Makefile for the full rationale (-MD not -MMD, -MP
+# See audiolib's Makefile for the full rationale (-MD not -MMD, -MP
 # guards against deleted-header stale-.d errors). $(wildcard ...) makes this
 # evaluate to nothing (not an error) before any objects exist yet for this
 # CFG_SIG.
@@ -1927,7 +1990,7 @@ clean-libs: clean-all
 # grid gets its own object/bin directory (ULCNET_GRID is in CFG_SIG), so the
 # two runs cannot contaminate each other.
 #
-# Defined outside the AC_LIB bootstrap conditionals on purpose: it needs no
+# Defined outside the COMMON_LIB bootstrap conditionals on purpose: it needs no
 # resolved producer archives of its own, and each recursive `test` bootstraps
 # itself. Adding it to the bootstrap target list instead would resolve the
 # producers once and then hand both grids the same resolved set, which is
@@ -1939,10 +2002,27 @@ test-grids:
 	$(MAKE) ULCNET_GRID=48k test
 
 # ---------------------------------------------------------------------------
+# pyc-parity: Python <-> C parity of the pipelines glue (mono and 4-channel NR
+# gain, post-beam RES gain, shared-delay realign, min/apply/comfort noise/OLA),
+# Layer 1 against std-math C and Layer 2 shipped against std-math C. Needs a
+# python3 with numpy, scipy, soundfile and pyyaml (PYTHON=... to choose it);
+# scratch and results go to PYC_WORK (default under $TMPDIR), never into this
+# tree. Options and the exit-status contract are documented at the top of
+# tests/pyc_parity_pipelines.sh; pass them through PYC_PARITY_ARGS, e.g.
+#   make pyc-parity PYC_PARITY_ARGS="--layers 1 --only a.nr4."
+# Defined outside the COMMON_LIB bootstrap conditionals, like test-grids: it has no
+# producer-archive prerequisite (the script builds its own copies under the
+# scratch directory).
+# ---------------------------------------------------------------------------
+.PHONY: pyc-parity
+pyc-parity:
+	bash tests/pyc_parity_pipelines.sh $(PYC_PARITY_ARGS)
+
+# ---------------------------------------------------------------------------
 # check-pins: verify the producer revisions this checkout expects. lib/aec
-# and lib/nr are submodules, so their gitlinks ARE the pin; audio_common is a
-# sibling checkout resolved through AC_DIR, so its expected commit is recorded
-# in audio_common.pin (bump it in the same commit that bumps the gitlinks).
+# and lib/nr are submodules, so their gitlinks ARE the pin; audiolib is a
+# sibling checkout resolved through COMMON_DIR, so its expected commit is recorded
+# in audiolib.pin (bump it in the same commit that bumps the gitlinks).
 # A commit mismatch fails; tracked changes in a producer are reported but
 # allowed here (dev builds) -- `make publish` separately applies its dirty
 # policy. Publish runs this check after taking its lock and before building.
@@ -1953,14 +2033,14 @@ test-grids:
 check-pins: _check_pins_impl
 
 _check_pins_impl:
-	@pin="$$(sed -n 's/^AUDIO_COMMON_COMMIT=//p' audio_common.pin)"; \
-	 [ -n "$$pin" ] || { echo "check-pins: audio_common.pin has no AUDIO_COMMON_COMMIT" >&2; exit 1; }; \
-	 have="$$(git -C "$(AC_DIR)" rev-parse HEAD 2>/dev/null || echo unknown)"; \
+	@pin="$$(sed -n 's/^AUDIOLIB_COMMIT=//p' audiolib.pin)"; \
+	 [ -n "$$pin" ] || { echo "check-pins: audiolib.pin has no AUDIOLIB_COMMIT" >&2; exit 1; }; \
+	 have="$$(git -C "$(AUDIOLIB_DIR)" rev-parse HEAD 2>/dev/null || echo unknown)"; \
 	 if [ "$$have" != "$$pin" ]; then \
-	   echo "check-pins: FAIL audio_common at $(AC_DIR) is $$have, audio_common.pin expects $$pin" >&2; exit 1; \
+	   echo "check-pins: FAIL audiolib at $(AUDIOLIB_DIR) is $$have, audiolib.pin expects $$pin" >&2; exit 1; \
 	 fi; \
-	 note=""; [ -n "$$(git -C "$(AC_DIR)" status --porcelain -uno 2>/dev/null)" ] && note=" (tracked changes present)"; \
-	 echo "check-pins: audio_common $$have matches audio_common.pin$$note"; \
+	 note=""; [ -n "$$(git -C "$(AUDIOLIB_DIR)" status --porcelain -uno 2>/dev/null)" ] && note=" (tracked changes present)"; \
+	 echo "check-pins: audiolib $$have matches audiolib.pin$$note"; \
 	 for sub in lib/aec lib/nr; do \
 	   rec="$$(git -C .. ls-files -s -- $$sub 2>/dev/null | awk '$$3 == 0 {print $$2}')"; \
 	   have="$$(git -C ../$$sub rev-parse HEAD 2>/dev/null || echo unknown)"; \
@@ -1970,3 +2050,5 @@ _check_pins_impl:
 	   note=""; [ -n "$$(git -C ../$$sub status --porcelain -uno 2>/dev/null)" ] && note=" (tracked changes present)"; \
 	   echo "check-pins: $$sub $$have matches gitlink$$note"; \
 	 done
+
+-include $(wildcard $(OBJ_DIR)/target_abi/*.d)

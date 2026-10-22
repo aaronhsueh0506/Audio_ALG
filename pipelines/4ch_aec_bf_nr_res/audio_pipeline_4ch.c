@@ -3,12 +3,12 @@
  *
  * This is the deployable orchestrator around 4aec_nr_res.c:
  *
- *   four_aec_front_process -> SRP-PHAT DOA -> GSC effective weights
+ *   four_aec_front_process -> SRP-PHAT DOA -> BF effective weights
  *   -> four_aec_fuse -> RES/NR gains -> CNG -> ISTFT
  *
  * It follows the same pool-first layout and lifecycle as 4aec_nr_res.c
  * (descriptor-tier: get_mem_requirements()/init_ex() compose the core's own
- * descriptor-tier API with SRP/GSC's simple size_t tier plus this wrapper's
+ * descriptor-tier API with SRP/BF's simple size_t tier plus this wrapper's
  * own scratch), with create() as a heap convenience wrapper over that same
  * pool-first implementation. See audio_pipeline_4ch.h's own doc comment for
  * the caller-pool vs. heap usage patterns.
@@ -24,12 +24,12 @@
 #include <stdint.h>
 
 #include "audio_pipeline_4ch.h"
-#include "gsc.h"
+#include "bf.h"
 #include "srp.h"
 #include "spatial_simd.h"
-#include "mem_align.h"
+#include "utility/mem_align.h"
 #include "audio_stft.h"         /* AcIstft: inverse FFT + sqrt-Hann OLA */
-#include "simd_kernels.h"       /* sk_min_f32 / sk_capply_gain_f32 */
+#include "utility/simd_kernels.h"       /* sk_min_f32 / sk_capply_gain_f32 */
 #include "common/se_stage.h"    /* SeSpecFrame, se_res_stage_gain, comfort-noise constants */
 #include "common/se_anr_stage.h"/* NR stage */
 
@@ -50,14 +50,14 @@ struct AudioPipeline4Ch {
     AudioPipeline4ChConfig cfg;
     FourAecNrRes* core;
     SRP* srp;
-    Complex*** gsc_steering;
-    GSC* gsc;
+    Complex*** bf_steering;
+    BF* bf;
 
     int hop_size;
     int fft_size;
     int n_freqs;
-    Complex* gsc_spectrum;
-    Complex* gsc_weights;
+    Complex* bf_spectrum;
+    Complex* bf_weights;
 
     /* Post-beam stages, chained in audio_pipeline_4ch_process_with_activity(). */
     AecRes* res;                /* iff cfg.core.enable_res */
@@ -83,11 +83,11 @@ struct AudioPipeline4Ch {
 
     /* Non-NULL only on the audio_pipeline_4ch_create() heap path: the single
      * posix_memalign()'d block backing this whole struct plus every carved
-     * sub-region below it (core/srp/gsc/scratch), freed by
+     * sub-region below it (core/srp/bf/scratch), freed by
      * audio_pipeline_4ch_destroy(). NULL on the audio_pipeline_4ch_init()
      * caller-pool path, where the caller owns the memory and destroy() must
      * not free it. Same convention as FourAecNrRes::owned_heap/SRP::
-     * owned_heap/GSC::owned_heap one layer down. */
+     * owned_heap/BF::owned_heap one layer down. */
     void* owned_heap;
     int destroyed;
 };
@@ -128,14 +128,14 @@ static int validate_config(const AudioPipeline4ChConfig* cfg) {
         !isfinite(cfg->doa_angle_tolerance_rad) ||
         cfg->doa_angle_tolerance_rad < 0.0f ||
         cfg->doa_update_interval <= 0) return 0;
-    if (!is_bool(cfg->gsc_enable) ||
-        !isfinite(cfg->gsc_lambda) || cfg->gsc_lambda <= 0.0f ||
-        cfg->gsc_lambda > 1.0f ||
-        !isfinite(cfg->gsc_mu) || cfg->gsc_mu < 0.0f ||
-        !is_bool(cfg->gsc_fixed_mode) ||
-        !isfinite(cfg->gsc_fixed_doa_rad) ||
-        !is_bool(cfg->gsc_fixed_align_notebook) ||
-        cfg->gsc_adapt_interval <= 0) return 0;
+    if (!is_bool(cfg->bf_enable) ||
+        !isfinite(cfg->bf_lambda) || cfg->bf_lambda <= 0.0f ||
+        cfg->bf_lambda > 1.0f ||
+        !isfinite(cfg->bf_mu) || cfg->bf_mu < 0.0f ||
+        !is_bool(cfg->bf_fixed_mode) ||
+        !isfinite(cfg->bf_fixed_doa_rad) ||
+        !is_bool(cfg->bf_fixed_align_notebook) ||
+        cfg->bf_adapt_interval <= 0) return 0;
     if (!isfinite(cfg->auto_vad_threshold_dbfs) ||
         !isfinite(cfg->auto_vad_snr_ratio) ||
         cfg->auto_vad_snr_ratio < 1.0f ||
@@ -181,13 +181,13 @@ AudioPipeline4ChConfig audio_pipeline_4ch_default_config(int sample_rate) {
     cfg.doa_switch_consecutive = 3;
     cfg.doa_angle_tolerance_rad = 10.0f * M_PI_F / 180.0f;
     cfg.doa_update_interval = 2;
-    cfg.gsc_enable = 1;
-    cfg.gsc_lambda = 0.995f;
-    cfg.gsc_mu = 0.1f;
-    cfg.gsc_fixed_mode = 0;
-    cfg.gsc_fixed_doa_rad = 0.0f;
-    cfg.gsc_fixed_align_notebook = 0;
-    cfg.gsc_adapt_interval = 1;
+    cfg.bf_enable = 1;
+    cfg.bf_lambda = 0.995f;
+    cfg.bf_mu = 0.1f;
+    cfg.bf_fixed_mode = 0;
+    cfg.bf_fixed_doa_rad = 0.0f;
+    cfg.bf_fixed_align_notebook = 0;
+    cfg.bf_adapt_interval = 1;
     cfg.auto_vad_threshold_dbfs = -55.0f;
     cfg.auto_vad_snr_ratio = 3.0f;
     cfg.auto_vad_hangover_frames = 8;
@@ -196,7 +196,7 @@ AudioPipeline4ChConfig audio_pipeline_4ch_default_config(int sample_rate) {
 
 /* ============================================================================
  * Pool-first construction: file-private PoolCursor/pool_carve(), same
- * bump-allocator shape kept file-private by 4aec_nr_res.c/srp.c/gsc.c (each
+ * bump-allocator shape kept file-private by 4aec_nr_res.c/srp.c/bf.c (each
  * keeps its own copy per those files' own precedent, not shared).
  * ========================================================================== */
 
@@ -246,18 +246,18 @@ static uint32_t audio_pipeline_4ch_build_flags_hash(
     uint32_t core_build_flags_hash) {
     uint32_t hash = 2166136261u;
     hash = fnv1a_str(
-        "|carve:self(corecfg-delay-v2),core,srp,gsc,gsc_spectrum,gsc_weights",
+        "|carve:self(corecfg-delay-v2),core,srp,bf,bf_spectrum,bf_weights",
         hash);
     hash = fnv1a_str("|align16", hash);
     hash ^= core_build_flags_hash;
     hash *= 16777619u;
-    return hash;
+    return ac_memreq_abi_hash(hash);
 }
 
 /* ============================================================================
  * Stack-only array geometry (no malloc)
  *
- * Fill formulas copied verbatim from third_party/doa/steering.c's
+ * Fill formulas copied verbatim from audiolib/doa/steering.c's
  * array_geometry_create_uca/_ula/_custom() so a stack-local ArrayGeometry
  * here produces bit-identical x/y coordinates to what the malloc-based
  * geometry helper produces -- calling that helper (even though its result
@@ -325,11 +325,11 @@ static int fill_stack_geometry(
 }
 
 /* ============================================================================
- * Config -> SRP/GSC module configs (shared by get_mem_requirements/init_ex)
+ * Config -> SRP/BF module configs (shared by get_mem_requirements/init_ex)
  * ========================================================================== */
 
 /*
- * Builds srp_cfg/gsc_cfg from cfg plus the core's own already-derived
+ * Builds srp_cfg/bf_cfg from cfg plus the core's own already-derived
  * hop/fft/n_freqs -- mirrors 4aec_nr_res.c's derive_dims_and_configs()'s role
  * of "compute once, reuse in both sizing and init", so
  * audio_pipeline_4ch_get_mem_requirements() and audio_pipeline_4ch_init_ex()
@@ -338,9 +338,9 @@ static int fill_stack_geometry(
 static int derive_spatial_configs(
     const AudioPipeline4ChConfig* cfg,
     int hop, int fft, int n_freqs,
-    SRP_Config* srp_cfg, GSC_Config* gsc_cfg) {
-    int gsc_effective_interval;
-    if (!cfg || !srp_cfg || !gsc_cfg) return 0;
+    SRP_Config* srp_cfg, BF_Config* bf_cfg) {
+    int bf_effective_interval;
+    if (!cfg || !srp_cfg || !bf_cfg) return 0;
 
     memset(srp_cfg, 0, sizeof(*srp_cfg));
     srp_cfg->M = FOUR_AEC_NR_RES_CHANNELS;
@@ -359,23 +359,23 @@ static int derive_spatial_configs(
     srp_cfg->angle_tol = cfg->doa_angle_tolerance_rad;
     srp_cfg->update_interval = cfg->doa_update_interval;
 
-    /* gsc_create()/gsc_init() force the RLS update cadence to 1 (every hop)
-     * whenever fixed-notebook mode is requested (gsc_fixed_mode &&
-     * gsc_fixed_align_notebook), regardless of the caller's configured
-     * gsc_adapt_interval -- see gsc.c's gsc_effective_adapt_interval().
+    /* bf_create()/bf_init() force the RLS update cadence to 1 (every hop)
+     * whenever fixed-notebook mode is requested (bf_fixed_mode &&
+     * bf_fixed_align_notebook), regardless of the caller's configured
+     * bf_adapt_interval -- see bf.c's bf_effective_adapt_interval().
      * Derive that SAME effective value here, once, and feed it into both the
-     * lambda retime scaling below and gsc_cfg->adapt_interval, so the
-     * cadence lambda is calibrated for and the cadence GSC actually runs at
+     * lambda retime scaling below and bf_cfg->adapt_interval, so the
+     * cadence lambda is calibrated for and the cadence BF actually runs at
      * can never silently diverge (scaling lambda by the raw pre-forced
-     * gsc_adapt_interval while gsc_create() forces the real cadence to 1
+     * bf_adapt_interval while bf_create() forces the real cadence to 1
      * would mis-calibrate it). */
-    gsc_effective_interval = gsc_effective_adapt_interval(
-        cfg->gsc_fixed_mode, cfg->gsc_fixed_align_notebook,
-        cfg->gsc_adapt_interval);
+    bf_effective_interval = bf_effective_adapt_interval(
+        cfg->bf_fixed_mode, cfg->bf_fixed_align_notebook,
+        cfg->bf_adapt_interval);
 
-    memset(gsc_cfg, 0, sizeof(*gsc_cfg));
-    gsc_cfg->enable = cfg->gsc_enable;
-    /* gsc_lambda is an RLS forgetting/retention factor tuned at a 10-ms
+    memset(bf_cfg, 0, sizeof(*bf_cfg));
+    bf_cfg->enable = cfg->bf_enable;
+    /* bf_lambda is an RLS forgetting/retention factor tuned at a 10-ms
      * reference update (like NR's alpha_d/alpha_attack in the mono/4ch NR
      * config derivation) -- its real wall-clock forgetting time varies with
      * hop_size/sample_rate, so it is retimed via the same helper NR uses for
@@ -383,7 +383,7 @@ static int derive_spatial_configs(
      * time-constant, so it is left as-is.
      *
      * The RLS update itself only actually applies once every
-     * gsc_effective_interval hops (gsc.c gates the whole P/gain/weight-update
+     * bf_effective_interval hops (bf.c gates the whole P/gain/weight-update
      * block on frame_idx % adapt_interval == 0; default adapt_interval=1,
      * i.e. every hop). Unlike AEC's ERLE 6-point cadence, the ORIGINAL
      * "10ms reference" tuning assumed one update per hop (interval=1) --
@@ -391,14 +391,14 @@ static int derive_spatial_configs(
      * -- so when the effective interval > 1 the real wall-clock update
      * period is that many hops, and the retime call must scale hop by it
      * (no-op at the shipped default of 1). */
-    gsc_cfg->lambda = anr_retime_alpha(
-        cfg->gsc_lambda, cfg->core.sample_rate,
-        hop * gsc_effective_interval);
-    gsc_cfg->mu = cfg->gsc_mu;
-    gsc_cfg->enable_fix_mode = cfg->gsc_fixed_mode;
-    gsc_cfg->fixed_doa_rad = cfg->gsc_fixed_doa_rad;
-    gsc_cfg->fixed_align_notebook = cfg->gsc_fixed_align_notebook;
-    gsc_cfg->adapt_interval = gsc_effective_interval;
+    bf_cfg->lambda = anr_retime_alpha(
+        cfg->bf_lambda, cfg->core.sample_rate,
+        hop * bf_effective_interval);
+    bf_cfg->mu = cfg->bf_mu;
+    bf_cfg->enable_fix_mode = cfg->bf_fixed_mode;
+    bf_cfg->fixed_doa_rad = cfg->bf_fixed_doa_rad;
+    bf_cfg->fixed_align_notebook = cfg->bf_fixed_align_notebook;
+    bf_cfg->adapt_interval = bf_effective_interval;
     return 1;
 }
 
@@ -438,13 +438,13 @@ static int derive_post_stages(const AudioPipeline4ChConfig* cfg, PostStages* ps)
 static int derive_pipeline_layout(
     const AudioPipeline4ChConfig* cfg,
     FourAecNrResMemReq* core_req,
-    SRP_Config* srp_cfg, GSC_Config* gsc_cfg,
+    SRP_Config* srp_cfg, BF_Config* bf_cfg,
     PostStages* ps,
     int* hop, int* fft, int* n_freqs,
-    size_t* srp_bytes, size_t* gsc_bytes) {
+    size_t* srp_bytes, size_t* bf_bytes) {
     FourAecNrResMemBreakdown breakdown;
-    if (!cfg || !core_req || !srp_cfg || !gsc_cfg || !ps || !hop || !fft ||
-        !n_freqs || !srp_bytes || !gsc_bytes) return 0;
+    if (!cfg || !core_req || !srp_cfg || !bf_cfg || !ps || !hop || !fft ||
+        !n_freqs || !srp_bytes || !bf_bytes) return 0;
     if (!validate_config(cfg)) return 0;
     if (four_aec_nr_res_get_mem_requirements(&cfg->core, core_req) != 0)
         return 0;
@@ -456,11 +456,11 @@ static int derive_pipeline_layout(
     *fft = breakdown.fft_size;
     *n_freqs = breakdown.n_freqs;
     if (!derive_post_stages(cfg, ps)) return 0;
-    if (!derive_spatial_configs(cfg, *hop, *fft, *n_freqs, srp_cfg, gsc_cfg))
+    if (!derive_spatial_configs(cfg, *hop, *fft, *n_freqs, srp_cfg, bf_cfg))
         return 0;
     *srp_bytes = srp_get_mem_size(srp_cfg);
-    *gsc_bytes = gsc_get_mem_size(FOUR_AEC_NR_RES_CHANNELS, *n_freqs);
-    if (*srp_bytes == 0 || *gsc_bytes == 0) return 0;
+    *bf_bytes = bf_get_mem_size(FOUR_AEC_NR_RES_CHANNELS, *n_freqs);
+    if (*srp_bytes == 0 || *bf_bytes == 0) return 0;
     return 1;
 }
 
@@ -469,28 +469,28 @@ int audio_pipeline_4ch_get_mem_requirements(
     AudioPipeline4ChMemReq* out) {
     FourAecNrResMemReq core_req;
     SRP_Config srp_cfg;
-    GSC_Config gsc_cfg;
+    BF_Config bf_cfg;
     PostStages ps;
     int hop, fft, n_freqs;
-    size_t srp_bytes, gsc_bytes;
+    size_t srp_bytes, bf_bytes;
     size_t spectral_count;
     size_t total;
 
     if (!out || !derive_pipeline_layout(
-            cfg, &core_req, &srp_cfg, &gsc_cfg, &ps,
-            &hop, &fft, &n_freqs, &srp_bytes, &gsc_bytes)) return -1;
+            cfg, &core_req, &srp_cfg, &bf_cfg, &ps,
+            &hop, &fft, &n_freqs, &srp_bytes, &bf_bytes)) return -1;
     if (core_req.bytes > (uint64_t)SIZE_MAX) return -1;
 
     total = ck_align16_size(sizeof(AudioPipeline4Ch));
     total = ck_add_size(total, ck_align16_size((size_t)core_req.bytes));
     total = ck_add_size(total, ck_align16_size(srp_bytes));
-    total = ck_add_size(total, ck_align16_size(gsc_bytes));
+    total = ck_add_size(total, ck_align16_size(bf_bytes));
 
     spectral_count = (size_t)FOUR_AEC_NR_RES_CHANNELS * (size_t)n_freqs;
     total = ck_field_size(
-        total, (size_t)n_freqs, sizeof(Complex));       /* gsc_spectrum */
+        total, (size_t)n_freqs, sizeof(Complex));       /* bf_spectrum */
     total = ck_field_size(
-        total, spectral_count, sizeof(Complex));        /* gsc_weights */
+        total, spectral_count, sizeof(Complex));        /* bf_weights */
 
     /* Post-beam stages, in carve order. */
     if (ps.res_bytes) total = ck_add_size(total, ck_align16_size(ps.res_bytes));
@@ -528,10 +528,10 @@ AudioPipeline4Ch* audio_pipeline_4ch_init_ex(
     AudioPipeline4ChMemReq current;
     FourAecNrResMemReq core_req;
     SRP_Config srp_cfg;
-    GSC_Config gsc_cfg;
+    BF_Config bf_cfg;
     PostStages ps;
     int hop, fft, n_freqs;
-    size_t srp_bytes, gsc_bytes;
+    size_t srp_bytes, bf_bytes;
     float geom_x[FOUR_AEC_NR_RES_CHANNELS];
     float geom_y[FOUR_AEC_NR_RES_CHANNELS];
     ArrayGeometry geom;
@@ -539,7 +539,7 @@ AudioPipeline4Ch* audio_pipeline_4ch_init_ex(
     PoolCursor cursor;
     void* core_region;
     void* srp_region;
-    void* gsc_region;
+    void* bf_region;
     size_t spectral_count;
 
     if (!mem || !cfg) return NULL;
@@ -562,8 +562,8 @@ AudioPipeline4Ch* audio_pipeline_4ch_init_ex(
         (uint64_t)bytes < current.bytes) return NULL;
 
     if (!derive_pipeline_layout(
-            &cfg_copy, &core_req, &srp_cfg, &gsc_cfg, &ps,
-            &hop, &fft, &n_freqs, &srp_bytes, &gsc_bytes)) return NULL;
+            &cfg_copy, &core_req, &srp_cfg, &bf_cfg, &ps,
+            &hop, &fft, &n_freqs, &srp_bytes, &bf_bytes)) return NULL;
     if (core_req.bytes > (uint64_t)SIZE_MAX) return NULL;
     if (!fill_stack_geometry(&cfg_copy, geom_x, geom_y, &geom)) return NULL;
 
@@ -590,25 +590,25 @@ AudioPipeline4Ch* audio_pipeline_4ch_init_ex(
     if (!srp_region) return NULL;
     p->srp = srp_init(srp_region, srp_bytes, &srp_cfg, &geom);
     if (!p->srp) return NULL;
-    /* Same borrow relationship as the heap path: GSC never owns/frees
+    /* Same borrow relationship as the heap path: BF never owns/frees
      * a_array. It points into pool memory with a lifetime tied to p
      * itself, rather than to a separately heap-managed SRP. */
-    p->gsc_steering = p->srp->a_array;
-    if (!p->gsc_steering) return NULL;
+    p->bf_steering = p->srp->a_array;
+    if (!p->bf_steering) return NULL;
 
-    gsc_region = pool_carve(&cursor, 1, gsc_bytes);
-    if (!gsc_region) return NULL;
-    p->gsc = gsc_init(
-        gsc_region, gsc_bytes, FOUR_AEC_NR_RES_CHANNELS, n_freqs,
-        cfg_copy.num_angles, p->gsc_steering, &gsc_cfg);
-    if (!p->gsc) return NULL;
+    bf_region = pool_carve(&cursor, 1, bf_bytes);
+    if (!bf_region) return NULL;
+    p->bf = bf_init(
+        bf_region, bf_bytes, FOUR_AEC_NR_RES_CHANNELS, n_freqs,
+        cfg_copy.num_angles, p->bf_steering, &bf_cfg);
+    if (!p->bf) return NULL;
 
     spectral_count = (size_t)FOUR_AEC_NR_RES_CHANNELS * (size_t)n_freqs;
-    p->gsc_spectrum =
+    p->bf_spectrum =
         (Complex*)pool_carve(&cursor, (size_t)n_freqs, sizeof(Complex));
-    p->gsc_weights =
+    p->bf_weights =
         (Complex*)pool_carve(&cursor, spectral_count, sizeof(Complex));
-    if (!p->gsc_spectrum || !p->gsc_weights) return NULL;
+    if (!p->bf_spectrum || !p->bf_weights) return NULL;
 
     /* Post-beam stages. */
     if (cfg_copy.core.enable_res) {
@@ -651,7 +651,7 @@ AudioPipeline4Ch* audio_pipeline_4ch_init_ex(
 
     /* auto_vad_hangover_frames + the speech/silence noise-EMA pairs are
      * authored literals (8 frames; 0.999/0.001; 0.95/0.05) and are retimed to
-     * the actual grid, as gsc_lambda is in derive_spatial_configs(). The EMA pairs
+     * the actual grid, as bf_lambda is in derive_spatial_configs(). The EMA pairs
      * are retention/new-weight complements (old_weight + new_weight == 1 by
      * construction); retime the retention factor and derive new_weight from
      * it so that invariant still holds post-retime. */
@@ -722,10 +722,10 @@ static void fill_frame_info(
     info->delay = front->delay;
     info->doa_raw_rad = doa_get_raw(p->srp);
     info->doa_smooth_rad = doa_get_smooth(p->srp);
-    info->doa_used_rad = gsc_get_doa_used(p->gsc);
+    info->doa_used_rad = bf_get_doa_used(p->bf);
     info->vad_raw = vad_raw;
     info->vad_out = vad_out;
-    info->gsc_adaptive = gsc_get_adaptive(p->gsc);
+    info->bf_adaptive = bf_get_adaptive(p->bf);
     info->doa_analysis_frames = doa_analysis_frames;
 }
 
@@ -800,20 +800,20 @@ int audio_pipeline_4ch_process_with_activity(
     }
 
     /* front.linear_spectra[ch] borrows each lane's own live spectrum
-     * (const Complex*) -- SRP/GSC only ever read through X, never write, so
+     * (const Complex*) -- SRP/BF only ever read through X, never write, so
      * feeding them this array directly needs no per-hop copy into a
      * wrapper-owned scratch buffer. */
     doa_step(
         p->srp, front.linear_spectra, frequency_mask,
         vad_raw, vad_out);
     doa_analysis_frames = 1;
-    gsc_process_with_weights(
-        p->gsc, front.linear_spectra, doa_get_smooth(p->srp),
-        vad_out ? 0 : 1, frequency_mask, p->gsc_spectrum,
-        p->gsc_weights);
+    bf_process_with_weights(
+        p->bf, front.linear_spectra, doa_get_smooth(p->srp),
+        vad_out ? 0 : 1, frequency_mask, p->bf_spectrum,
+        p->bf_weights);
 
-    /* gsc_spectrum and gsc_weights were produced atomically by the same
-     * gsc_process_with_weights() call above. Hand the mono error over as it
+    /* bf_spectrum and bf_weights were produced atomically by the same
+     * bf_process_with_weights() call above. Hand the mono error over as it
      * is instead of reconstructing one weighted sum a second time; the fuse
      * still projects near/R2/comfort with those exact weights.
      *
@@ -822,7 +822,7 @@ int audio_pipeline_4ch_process_with_activity(
      * projection) before either is read, and the status check below resets
      * on any failure -- a duplicate scan here can only ever agree with that
      * authoritative check, never catch something it would miss. */
-    status = four_aec_fuse(p->core, p->gsc_weights, p->gsc_spectrum, &frame);
+    status = four_aec_fuse(p->core, p->bf_weights, p->bf_spectrum, &frame);
     if (status == FOUR_AEC_NR_RES_OK)
         status = run_post_stages(p, &frame, output);
     if (status != FOUR_AEC_NR_RES_OK) {
@@ -951,7 +951,7 @@ void audio_pipeline_4ch_reset(AudioPipeline4Ch* p) {
     if (!p || p->destroyed) return;
     four_aec_nr_res_reset(p->core);
     srp_reset(p->srp);
-    gsc_reset(p->gsc);
+    bf_reset(p->bf);
     if (p->nr) se_anr_stage_reset(p->nr);
     if (p->res) aec_res_reset(p->res);
     ac_istft_reset(p->istft);
@@ -966,13 +966,13 @@ void audio_pipeline_4ch_reset(AudioPipeline4Ch* p) {
 void audio_pipeline_4ch_destroy(AudioPipeline4Ch* p) {
     void* owned_heap;
     if (!p || p->destroyed) return;
-    /* GSC borrows the steering table; destroy it before its owner. Each of
+    /* BF borrows the steering table; destroy it before its owner. Each of
      * these three is a no-op free on the pool-carved sub-objects this
      * wrapper builds inside its own pool/heap block (their own owned_heap
      * fields stay NULL -- see audio_pipeline_4ch_init_ex()); only this
      * wrapper's OWN owned_heap (set only by audio_pipeline_4ch_create()) is
      * ever actually freed below, exactly once. */
-    gsc_destroy(p->gsc);
+    bf_destroy(p->bf);
     srp_destroy(p->srp);
     if (p->nr) se_anr_stage_destroy(p->nr);
     four_aec_nr_res_destroy(p->core);
@@ -1021,29 +1021,29 @@ int audio_pipeline_4ch_doa_fft_size(const AudioPipeline4Ch* p) {
     return audio_pipeline_4ch_fft_size(p);
 }
 
-int audio_pipeline_4ch_gsc_sample_rate(const AudioPipeline4Ch* p) {
+int audio_pipeline_4ch_bf_sample_rate(const AudioPipeline4Ch* p) {
     return (p && !p->destroyed) ? p->cfg.core.sample_rate : -1;
 }
 
-int audio_pipeline_4ch_gsc_frame_size(const AudioPipeline4Ch* p) {
+int audio_pipeline_4ch_bf_frame_size(const AudioPipeline4Ch* p) {
     return (p && !p->destroyed) ? p->fft_size : -1;
 }
 
-int audio_pipeline_4ch_gsc_hop_size(const AudioPipeline4Ch* p) {
+int audio_pipeline_4ch_bf_hop_size(const AudioPipeline4Ch* p) {
     return (p && !p->destroyed) ? p->hop_size : -1;
 }
 
-int audio_pipeline_4ch_gsc_fft_size(const AudioPipeline4Ch* p) {
+int audio_pipeline_4ch_bf_fft_size(const AudioPipeline4Ch* p) {
     return (p && !p->destroyed) ? p->fft_size : -1;
 }
 
-int audio_pipeline_4ch_gsc_effective_adapt_interval(
+int audio_pipeline_4ch_bf_effective_adapt_interval(
     const AudioPipeline4Ch* p) {
-    return (p && !p->destroyed && p->gsc) ? p->gsc->adapt_interval : -1;
+    return (p && !p->destroyed && p->bf) ? p->bf->adapt_interval : -1;
 }
 
-float audio_pipeline_4ch_gsc_lambda(const AudioPipeline4Ch* p) {
-    return (p && !p->destroyed && p->gsc) ? p->gsc->lambda : NAN;
+float audio_pipeline_4ch_bf_lambda(const AudioPipeline4Ch* p) {
+    return (p && !p->destroyed && p->bf) ? p->bf->lambda : NAN;
 }
 
 int audio_pipeline_4ch_matched_filter_count(const AudioPipeline4Ch* p) {

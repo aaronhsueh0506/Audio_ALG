@@ -1,171 +1,56 @@
-/* ============================================================
- * RNNoise-ERB 前後處理 C 實現 — 對齊 train.py / inference.py
- *
- * 包含:
- *   - Radix-2 FFT/IFFT (N=N_FFT)
- *   - Root Hann window (sqrt(hann), analysis+synthesis 各乘一次 → COLA)
- *   - normalized STFT/ISTFT (× N^∓0.5, = torch.stft/istft normalized=True)
- *   - Glasberg-Moore ERB band borders + 三角 filterbank (forward/inverse)
- *   - DF-style mean-normalised log-ERB + per-bin-normalised complex features
- *   - Band gain → bin gain (mode=1 inverse matrix, partition of unity)
- *   - Overlap-add synthesis
- * ============================================================ */
+/* RNNoise-ERB feature/gain kernels; caller-owned audiolib framing. */
 
 #include "process.h"
 #include <math.h>
 #include <string.h>
 
-#if defined(__aarch64__) && defined(__ARM_NEON) && \
-    !defined(SIMD_KERNELS_FORCE_SCALAR)
+#include "utility/simd_kernels.h"
+
+#if SK_HAVE_NEON
 #include <arm_neon.h>
-#define RNNOISE_HAVE_NEON 1
-#else
-#define RNNOISE_HAVE_NEON 0
 #endif
 
-#ifndef M_PI
-#define M_PI 3.14159265358979323846
-#endif
+_Static_assert(RNNOISE_N_FFT == 512 && RNNOISE_WIN_LEN == 512 &&
+               RNNOISE_HOP_LEN == 256 && RNNOISE_N_BINS == 257,
+               "RNNoise C framing is fixed at 512/512/256");
 
 #define LOG_FLOOR 1e-10f
 
-/* ============================================================
- * Glasberg-Moore ERB band borders + 三角 filterbank + root-Hann window
- * 忠實移植 train.py erb_bandborder() / compute_erb_matrix()
- * (DeepFilterNet(-Keras) 常數: 24.7 * 9.265)
- *
- * 這四張表格 (rnn_nfftborder/rnn_erb_fwd/rnn_erb_inv/rnn_hann_win) 的
- * 輸入 (RNNOISE_SR/N_BANDS/N_BINS/N_FFT/WIN_LEN) 全部是編譯期常數, 所以
- * 是編譯期 `static const` 表格: 由 gen_rnnoise_tables.c (host-only 工具)
- * 產生 rnnoise_tables_gen.h 並直接 #include。表格沒有共享可變狀態, 執行
- * 期沒有 race, 也不需要 once-guard。
- * test_rnnoise_tables.c 用獨立複製的演算法在執行期重算並逐 byte
- * 比對這份表格, 當作 drift-guard。
- *
- * nfftborder: N_BANDS 個邊界 → N_BANDS-1 個 block, N_BANDS 個矩陣欄
- *   border[0]=0 (DC), border[N-1]=N_BINS (Nyquist+1)
- * forward (mode=0, 特徵用): 兩端單邊欄 ×2
- * inverse (mode=1, gain 展開用): 無 ×2, partition of unity
- *
- * root-Hann window (長度 WIN_LEN): sqrt(hann) — analysis 與 synthesis
- * 各乘一次，合計 = hann → COLA (torch.hann_window 預設 periodic=True,
- * 與此處分母 WIN_LEN 一致)
- * ============================================================ */
+/* Immutable model tables, checked independently by test_rnnoise_tables.c.
+ * Forward ERB doubles the two edge bands; inverse ERB sums to one per bin.
+ * The periodic root-Hann is shared by analysis and synthesis. */
 #include "rnnoise_tables_gen.h"
 
 /* normalized=True 的縮放常數 */
 #define STFT_NORM_FWD (1.0f / 22.62741699796952f)   /* N_FFT^-0.5, N=512 */
 #define STFT_NORM_INV (22.62741699796952f)          /* N_FFT^+0.5 */
 
-/* ============================================================
- * Radix-2 FFT/IFFT (in-place, N=N_FFT)
- * re[], im[] 長度皆為 N
- * ============================================================ */
-static void fft_radix2(float *re, float *im, int n, int inverse) {
-    /* bit-reversal */
-    int j = 0;
-    for (int i = 0; i < n; i++) {
-        if (i < j) {
-            float tr = re[i]; re[i] = re[j]; re[j] = tr;
-            float ti = im[i]; im[i] = im[j]; im[j] = ti;
-        }
-        int m = n >> 1;
-        while (m >= 1 && j >= m) { j -= m; m >>= 1; }
-        j += m;
-    }
-    /* butterfly
-     * Within a stage the twiddle recurrence starts from (1, 0) for every
-     * block, so the k-th twiddle does not depend on the block: it is walked
-     * once per stage (k outer) and applied across all blocks (i inner). The
-     * butterflies of one stage touch disjoint (u, v) pairs, so their order
-     * does not change any result. */
-    float sign = inverse ? 1.0f : -1.0f;
-    for (int len = 2; len <= n; len <<= 1) {
-        const int half = len / 2;
-        float ang = sign * 2.0f * (float)M_PI / len;
-        float wre = cosf(ang);
-        float wim = sinf(ang);
-        float cur_re = 1.0f, cur_im = 0.0f;
-        int k = 0;
-#if RNNOISE_HAVE_NEON
-        for (; k + 4 <= half; k += 4) {
-            float tw_re[4], tw_im[4];
-            for (int lane = 0; lane < 4; ++lane) {
-                float new_re, new_im;
-                tw_re[lane] = cur_re;
-                tw_im[lane] = cur_im;
-                new_re = cur_re * wre - cur_im * wim;
-                new_im = cur_re * wim + cur_im * wre;
-                cur_re = new_re;
-                cur_im = new_im;
-            }
-            float32x4_t wr = vld1q_f32(tw_re);
-            float32x4_t wi = vld1q_f32(tw_im);
-            for (int i = 0; i < n; i += len) {
-                int u = i + k;
-                int v = u + half;
-                float32x4_t ur = vld1q_f32(re + u);
-                float32x4_t ui = vld1q_f32(im + u);
-                float32x4_t vr = vld1q_f32(re + v);
-                float32x4_t vi = vld1q_f32(im + v);
-                float32x4_t tre = vsubq_f32(
-                    vmulq_f32(vr, wr), vmulq_f32(vi, wi));
-                float32x4_t tim = vaddq_f32(
-                    vmulq_f32(vr, wi), vmulq_f32(vi, wr));
-                vst1q_f32(re + v, vsubq_f32(ur, tre));
-                vst1q_f32(im + v, vsubq_f32(ui, tim));
-                vst1q_f32(re + u, vaddq_f32(ur, tre));
-                vst1q_f32(im + u, vaddq_f32(ui, tim));
-            }
-        }
-#endif
-        for (; k < half; k++) {
-            for (int i = 0; i < n; i += len) {
-                int u = i + k;
-                int v = u + half;
-                float tre = re[v] * cur_re - im[v] * cur_im;
-                float tim = re[v] * cur_im + im[v] * cur_re;
-                re[v] = re[u] - tre;
-                im[v] = im[u] - tim;
-                re[u] += tre;
-                im[u] += tim;
-            }
-            float new_re = cur_re * wre - cur_im * wim;
-            float new_im = cur_re * wim + cur_im * wre;
-            cur_re = new_re;
-            cur_im = new_im;
-        }
-    }
-    if (inverse) {
-        /* n is a power of two, so 1/n is exact and x * (1/n) rounds to the
-         * same float as x / n for every x (subnormals and Inf/NaN included);
-         * a multiply is several times cheaper than a divide. */
-        const float inv_n = 1.0f / (float)n;
-        int i = 0;
-#if RNNOISE_HAVE_NEON
-        const float32x4_t vinv = vdupq_n_f32(inv_n);
-        for (; i + 4 <= n; i += 4) {
-            vst1q_f32(re + i, vmulq_f32(vld1q_f32(re + i), vinv));
-            vst1q_f32(im + i, vmulq_f32(vld1q_f32(im + i), vinv));
-        }
-#endif
-        for (; i < n; i++) { re[i] *= inv_n; im[i] *= inv_n; }
-    }
+void rnnoise_framing_config(AcStftConfig *cfg, FftHandle *fft) {
+    if (!cfg) return;
+    ac_stft_config_default(cfg, RNNOISE_N_FFT);
+    cfg->spec_scale = STFT_NORM_FWD;
+    cfg->ispec_scale = 1.0f;
+    cfg->fft = fft;
+    cfg->window = rnn_hann_win;
 }
 
-/* ============================================================
- * 公開 API
- * ============================================================ */
-
-/* ERB filterbank + root-Hann window 是編譯期 `static const` 表格
- * (rnnoise_tables_gen.h), 沒有執行期初始化可做。這個函式純粹是為了
- * API 相容, 本體是刻意留空的 no-op。見 process.h。 */
-void rnnoise_tables_init(void) {
-    /* no-op: 表格在編譯期已就緒, 見上方 #include "rnnoise_tables_gen.h" */
-}
-
-void rnnoise_state_init(RNNoiseState *st) {
-    memset(st, 0, sizeof(RNNoiseState));
+int rnnoise_state_init(RNNoiseState *st, AcStft *stft, AcIstft *istft) {
+    if (!st) return -1;
+    memset(st, 0, sizeof(*st));
+    AcStftConfig analysis, synthesis;
+    if (ac_stft_get_config(stft, &analysis) != 0 ||
+        ac_istft_get_config(istft, &synthesis) != 0 ||
+        analysis.fft_size != RNNOISE_N_FFT ||
+        synthesis.fft_size != RNNOISE_N_FFT || analysis.center != 0 ||
+        synthesis.ola != AC_OLA_ACCUMULATE ||
+        analysis.spec_scale != STFT_NORM_FWD || synthesis.ispec_scale != 1.0f ||
+        memcmp(analysis.window, rnn_hann_win, sizeof(rnn_hann_win)) != 0 ||
+        memcmp(synthesis.window, rnn_hann_win, sizeof(rnn_hann_win)) != 0)
+        return -1;
+    st->stft = stft;
+    st->istft = istft;
+    ac_stft_reset(stft);
+    ac_istft_reset(istft);
     for (int b = 0; b < RNNOISE_N_BANDS; b++) {
         float pos = RNNOISE_N_BANDS > 1
             ? (float)b / (float)(RNNOISE_N_BANDS - 1) : 0.0f;
@@ -178,7 +63,7 @@ void rnnoise_state_init(RNNoiseState *st) {
         st->spec_norm_state[k] = RNNOISE_SPEC_NORM_INIT_LO +
             pos * (RNNOISE_SPEC_NORM_INIT_HI - RNNOISE_SPEC_NORM_INIT_LO);
     }
-    rnnoise_tables_init();  /* no-op (表格編譯期已就緒); 保留呼叫只為相容 */
+    return 0;
 }
 
 void rnnoise_model_state_init(RNNoiseModelState *state) {
@@ -220,49 +105,11 @@ int rnnoise_model_state_inherit(
 
 /* --- 前處理: analysis --- */
 
-void rnnoise_analysis(RNNoiseState *st, const float *frame, float *out_re, float *out_im) {
-    /* Root Hann windowed frame + zero-pad to N_FFT
-     * (暫存區在 st->scratch_buf_re/im, 不佔用呼叫端 stack) */
-    float *buf_re = st->scratch_buf_re;
-    float *buf_im = st->scratch_buf_im;
-    memset(buf_im, 0, sizeof(float) * RNNOISE_N_FFT);
-
-    int i = 0;
-#if RNNOISE_HAVE_NEON
-    for (; i + 4 <= RNNOISE_WIN_LEN; i += 4) {
-        vst1q_f32(buf_re + i,
-                  vmulq_f32(vld1q_f32(frame + i),
-                            vld1q_f32(rnn_hann_win + i)));
-    }
-#endif
-    for (; i < RNNOISE_WIN_LEN; i++) {
-        buf_re[i] = frame[i] * rnn_hann_win[i];
-    }
-    /* zero-pad (當 WIN_LEN == N_FFT 時此 loop 不執行) */
-    for (int i = RNNOISE_WIN_LEN; i < RNNOISE_N_FFT; i++) {
-        buf_re[i] = 0.0f;
-    }
-
-    fft_radix2(buf_re, buf_im, RNNOISE_N_FFT, 0);
-
-    /* 只取正頻率 (0 ~ N/2) 共 N_BINS 個, 並乘 N^-0.5
-     * (= torch.stft normalized=True; 特徵的絕對 dB 尺度依賴此縮放) */
-    i = 0;
-#if RNNOISE_HAVE_NEON
-    {
-        const float32x4_t norm = vdupq_n_f32(STFT_NORM_FWD);
-        for (; i + 4 <= RNNOISE_N_BINS; i += 4) {
-            vst1q_f32(out_re + i,
-                      vmulq_f32(vld1q_f32(buf_re + i), norm));
-            vst1q_f32(out_im + i,
-                      vmulq_f32(vld1q_f32(buf_im + i), norm));
-        }
-    }
-#endif
-    for (; i < RNNOISE_N_BINS; i++) {
-        out_re[i] = buf_re[i] * STFT_NORM_FWD;
-        out_im[i] = buf_im[i] * STFT_NORM_FWD;
-    }
+int rnnoise_analysis(RNNoiseState *st, const float *frame,
+                     float *out_re, float *out_im) {
+    if (!st || !st->stft || !frame || !out_re || !out_im) return -1;
+    ac_stft_frame_planar(st->stft, frame, out_re, out_im);
+    return 0;
 }
 
 /* --- 前處理: compute features --- */
@@ -275,7 +122,7 @@ int rnnoise_compute_features(RNNoiseState *st,
      * (暫存區在 st->scratch_power, 不佔用呼叫端 stack) */
     float *power = st->scratch_power;
     int i = 0;
-#if RNNOISE_HAVE_NEON
+#if SK_HAVE_NEON
     for (; i + 4 <= RNNOISE_N_BINS; i += 4) {
         float32x4_t re = vld1q_f32(spec_re + i);
         float32x4_t im = vld1q_f32(spec_im + i);
@@ -292,7 +139,7 @@ int rnnoise_compute_features(RNNoiseState *st,
      * (暫存區在 st->scratch_erb_db) */
     float *erb_db = st->scratch_erb_db;
     int b = 0;
-#if RNNOISE_HAVE_NEON
+#if SK_HAVE_NEON
     for (; b + 4 <= RNNOISE_N_BANDS; b += 4) {
         float32x4_t sum = vdupq_n_f32(0.0f);
         for (int k = 0; k < RNNOISE_N_BINS; ++k) {
@@ -322,7 +169,7 @@ int rnnoise_compute_features(RNNoiseState *st,
     int idx = st->feat_idx;
     const float erb_a = RNNOISE_ERB_NORM_ALPHA;
     b = 0;
-#if RNNOISE_HAVE_NEON
+#if SK_HAVE_NEON
     {
         const float32x4_t va = vdupq_n_f32(erb_a);
         const float32x4_t vb = vdupq_n_f32(1.0f - erb_a);
@@ -349,7 +196,7 @@ int rnnoise_compute_features(RNNoiseState *st,
      * updates its own magnitude EMA before real/imag are normalised. */
     const float norm_a = RNNOISE_SPEC_NORM_ALPHA;
     int k = 0;
-#if RNNOISE_HAVE_NEON
+#if SK_HAVE_NEON
     {
         const float32x4_t va = vdupq_n_f32(norm_a);
         const float32x4_t vb = vdupq_n_f32(1.0f - norm_a);
@@ -379,9 +226,7 @@ int rnnoise_compute_features(RNNoiseState *st,
         st->spec_feat_buf[idx][1][k] = im;
     }
     st->feat_idx = (idx + 1) % 3;
-    /* 飽和計數，不無限累加: feat_count 唯一用途是與 3 比較 (< 3 vs >= 3)，
-     * 無限遞增在長時間連續運行後會 overflow (signed int UB)，飽和在 3
-     * 對這個用途完全等價且消除該風險 */
+    /* Only readiness matters; saturation avoids signed overflow on long streams. */
     if (st->feat_count < 3) ++st->feat_count;
 
     /* 需要至少 3 frame 才能送入 conv1 */
@@ -406,7 +251,7 @@ void rnnoise_apply_atten_lim(float band_gains[RNNOISE_N_BANDS],
     if (atten_lim_db <= 0.0f) return;
     float lim = powf(10.0f, -atten_lim_db / 20.0f);
     int b = 0;
-#if RNNOISE_HAVE_NEON
+#if SK_HAVE_NEON
     {
         float32x4_t vlim = vdupq_n_f32(lim);
         float32x4_t mix = vdupq_n_f32(1.0f - lim);
@@ -428,7 +273,7 @@ void rnnoise_expand_gains(const float *band_gains, float *bin_gains) {
     /* bin_gains = gains @ erb_inv^T (inference.py apply gains; mode=1 為
      * partition of unity → gains=1 對應 bin_gains=1, 無需列正規化) */
     int k = 0;
-#if RNNOISE_HAVE_NEON
+#if SK_HAVE_NEON
     for (; k + 4 <= RNNOISE_N_BINS; k += 4) {
         float32x4_t g = vdupq_n_f32(0.0f);
         for (int b = 0; b < RNNOISE_N_BANDS; ++b) {
@@ -452,13 +297,15 @@ void rnnoise_expand_gains(const float *band_gains, float *bin_gains) {
 
 /* --- 後處理: synthesis (apply gain + IFFT + overlap-add) --- */
 
-void rnnoise_synthesis(RNNoiseState *st,
+int rnnoise_synthesis(RNNoiseState *st,
                        float *spec_re, float *spec_im,
                        const float *bin_gains,
                        float *out_samples) {
+    if (!st || !st->istft || !spec_re || !spec_im || !bin_gains ||
+        !out_samples) return -1;
     /* 套用 gain, 並乘 N^+0.5 反正規化 (= torch.istft normalized=True) */
     int i = 0;
-#if RNNOISE_HAVE_NEON
+#if SK_HAVE_NEON
     for (; i + 4 <= RNNOISE_N_BINS; i += 4) {
         float32x4_t gain = vmulq_n_f32(
             vld1q_f32(bin_gains + i), STFT_NORM_INV);
@@ -473,60 +320,12 @@ void rnnoise_synthesis(RNNoiseState *st,
         spec_im[i] *= bin_gains[i] * STFT_NORM_INV;
     }
 
-    /* 還原負頻率 (共軛對稱)
-     * (暫存區在 st->scratch_full_re/im, 不佔用呼叫端 stack) */
-    float *full_re = st->scratch_full_re;
-    float *full_im = st->scratch_full_im;
-    memcpy(full_re, spec_re, sizeof(float) * RNNOISE_N_BINS);
-    memcpy(full_im, spec_im, sizeof(float) * RNNOISE_N_BINS);
-    for (int i = 1; i < RNNOISE_N_FFT / 2; i++) {
-        full_re[RNNOISE_N_FFT - i] =  spec_re[i];
-        full_im[RNNOISE_N_FFT - i] = -spec_im[i];
-    }
-
-    /* IFFT */
-    fft_radix2(full_re, full_im, RNNOISE_N_FFT, 1);
-
-    /* Root Hann window (synthesis side) — 只取 WIN_LEN 點，丟棄 zero-pad 部分
-     * (sqrt-hann × sqrt-hann = hann, 50% overlap COLA 和 = 1 → 免除 torch.istft
-     * 的 window-envelope 除法, 穩態等價) */
-    i = 0;
-#if RNNOISE_HAVE_NEON
-    for (; i + 4 <= RNNOISE_WIN_LEN; i += 4) {
-        vst1q_f32(full_re + i,
-                  vmulq_f32(vld1q_f32(full_re + i),
-                            vld1q_f32(rnn_hann_win + i)));
-    }
-#endif
-    for (; i < RNNOISE_WIN_LEN; i++) {
-        full_re[i] *= rnn_hann_win[i];
-    }
-    /* full_re[WIN_LEN..N_FFT-1] 為 zero-pad 產生的殘留，不使用 */
-
-    /* Overlap-add: 輸出 HOP_LEN 個 sample */
-    i = 0;
-#if RNNOISE_HAVE_NEON
-    for (; i + 4 <= RNNOISE_HOP_LEN; i += 4) {
-        vst1q_f32(out_samples + i,
-                  vaddq_f32(vld1q_f32(st->synthesis_buf + i),
-                            vld1q_f32(full_re + i)));
-    }
-#endif
-    for (; i < RNNOISE_HOP_LEN; i++) {
-        out_samples[i] = st->synthesis_buf[i] + full_re[i];
-    }
-
-    /* 更新 synthesis_buf: 存 overlap 部分 (OVL_LEN = WIN_LEN - HOP_LEN) */
-    memcpy(st->synthesis_buf, full_re + RNNOISE_HOP_LEN,
-           sizeof(float) * RNNOISE_OVL_LEN);
-    /* 清除剩餘 */
-    for (int i = RNNOISE_OVL_LEN; i < RNNOISE_WIN_LEN; i++) {
-        st->synthesis_buf[i] = 0.0f;
-    }
+    return ac_istft_push_planar(st->istft, spec_re, spec_im, out_samples)
+        == RNNOISE_HOP_LEN ? 0 : -1;
 }
 
 const char *rnnoise_simd_backend(void) {
-#if RNNOISE_HAVE_NEON
+#if SK_HAVE_NEON
     return "aarch64-neon";
 #else
     return "scalar";

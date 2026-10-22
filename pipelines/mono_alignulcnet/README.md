@@ -2,7 +2,7 @@
 
 This directory is an application integration example, not another DSP
 library. The executable directly links the pipeline wrapper object, the
-Align-ULCNet C pre/post-processing object, and the existing AEC/audio_common
+Align-ULCNet C pre/post-processing object, and the existing AEC/audiolib/common
 libraries.
 
 `main.c` shows the board boundary. CPU memory owns the K/V windows, logit
@@ -77,6 +77,6 @@ distinguishes it from a correct lock — see the known-delay tests in
 `tests/`.
 
 ```sh
-make BACKEND=kiss SIMD=0 test
-make BACKEND=ne10 SIMD=1 test
+make SIMD=0 test
+make SIMD=1 test
 ```

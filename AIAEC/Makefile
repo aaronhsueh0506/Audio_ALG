@@ -25,7 +25,7 @@ ifeq ($(WERROR),1)
 override CFLAGS += -Werror
 endif
 
-CPPFLAGS := -I. -IAlign_ULCNet -IDeepVQE_S -I../../audio_common/include
+CPPFLAGS := -I. -IAlign_ULCNet -IDeepVQE_S -I../../audiolib/common/include -I../../audiolib/common
 ifeq ($(SIMD),0)
 CPPFLAGS += -DSIMD_KERNELS_FORCE_SCALAR
 endif
@@ -40,7 +40,10 @@ endif
 # each directory records its payload so a signature collision is refused
 # rather than reinterpreted.
 BUILD_DIR := build
-CFG_SIG_PAYLOAD := CC=$(CC) AR=$(AR) CFLAGS=$(CFLAGS) CPPFLAGS=$(CPPFLAGS) SIMD=$(SIMD) WERROR=$(WERROR)
+# The same CC command can select a different SDK through PATH.
+# Include effective pointer/FP/ISA predefines to avoid cross-ABI cache reuse.
+override CC_TARGET_SIG := $(shell sh ../../audiolib/common/scripts/target_abi_signature.sh $(CC) $(CPPFLAGS) $(CFLAGS))
+CFG_SIG_PAYLOAD := CC_TARGET_SIG=$(CC_TARGET_SIG) CC=$(CC) AR=$(AR) CFLAGS=$(CFLAGS) CPPFLAGS=$(CPPFLAGS) SIMD=$(SIMD) WERROR=$(WERROR)
 CFG_SIG := $(shell printf '%s' "$(CFG_SIG_PAYLOAD)" | cksum | cut -d' ' -f1)
 OBJ_DIR := $(BUILD_DIR)/simd$(SIMD)-$(CFG_SIG)
 LIB := $(OBJ_DIR)/libaiaec_prepost.a
@@ -74,6 +77,9 @@ $(LIB): $(OBJECTS)
 	rm -f "$@" && $(AR) rcs "$@" $(OBJECTS)
 
 _cfg_guard:
+	@test -n "$(CC_TARGET_SIG)" && test "$(CC_TARGET_SIG)" != unavailable || { \
+	  echo "FATAL: cannot determine compiler target; CC preprocessing with the configured flags must succeed." >&2; \
+	  exit 1; }
 	@mkdir -p "$(OBJ_DIR)"
 	@m="$(OBJ_DIR)/config.manifest"; \
 	if [ -f "$$m" ] && [ "$$(cat "$$m")" != "$(CFG_SIG_PAYLOAD)" ]; then \

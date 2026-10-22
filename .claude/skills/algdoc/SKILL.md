@@ -15,8 +15,8 @@ description: 演算法改動後同步文件與使用者說明 — 更新 Audio_A
 - **元件頁在各自 repo 的 `docs/html/`**：
   - `AEC/docs/html/aec.html`
   - `NR/docs/html/nr.html`
-  - `audio_common/docs/html/audio_common.html`
-  - 新元件（新的 AEC/NR/audio_common 子模組或子系統）比照辦理：建在該
+  - `audiolib/common/docs/html/audio_common.html`
+  - 新元件（新的 AEC/NR/audiolib/common 子模組或子系統）比照辦理：建在該
     元件自己的 repo `docs/html/` 下，不要放進 Audio_ALG。
 - **`Audio_ALG/docs/html/` 只留自身內容**：`index.html`（總覽+導覽）、
   `conventions.html`、`onnx_prepost.html`、四個 `pipeline_*.html`、四個
@@ -24,11 +24,11 @@ description: 演算法改動後同步文件與使用者說明 — 更新 Audio_A
   才留在這裡；新的 pipeline/AINR/AIAEC 頁面也建在這裡）。
 
 **連結規約（SE 樹 sibling 相對路徑，四個 repo 同層 `SE/{AEC,NR,
-audio_common,Audio_ALG}`）**：
+audiolib,Audio_ALG}`）**：
 
 - 從 `Audio_ALG/docs/html/*.html` 連到元件頁：
   `../../../AEC/docs/html/aec.html`、`../../../NR/docs/html/nr.html`、
-  `../../../audio_common/docs/html/audio_common.html`。
+  `../../../audiolib/common/docs/html/audio_common.html`。
 - 從元件頁（`aec.html`/`nr.html`/`audio_common.html`）連回 Audio_ALG index：
   `../../../Audio_ALG/docs/html/index.html`；元件頁彼此互連同理用
   `../../../<repo>/docs/html/<page>.html`；連到自己則用檔名(`aec.html`
@@ -38,7 +38,7 @@ audio_common,Audio_ALG}`）**：
 ## 步驟
 
 1. **找出受影響元件**：`git diff` 未提交改動 + 最近的 commits（AEC、NR、
-   audio_common、Audio_ALG 四個 repo 都要看）。對應到下方頁面清單。
+   audiolib、Audio_ALG 四個 repo 都要看）。對應到下方頁面清單。
 2. **逐頁更新**受影響的頁面（規格見下）；元件頁去對應 repo 的
    `docs/html/` 找，Audio_ALG 自身頁面去 `Audio_ALG/docs/html/` 找。新元件
    （新 pipeline、新 model、新 seam API）→ 新頁面 + 更新 `index.html` 與
@@ -81,7 +81,7 @@ audio_common,Audio_ALG}`）**：
 **元件頁（各自 repo 的 `docs/html/`，見上面存放結構一節）**：
 `AEC/docs/html/aec.html`、`AEC/docs/html/aec_detail.html`（aec 的 API 細節）、
 `NR/docs/html/nr.html`、
-`audio_common/docs/html/audio_common.html`
+`audiolib/common/docs/html/audio_common.html`
 
 **`Audio_ALG/docs/html/`（本站；index/conventions/onnx_prepost +
 Audio_ALG 自有 pipelines/AINR/AIAEC）**：

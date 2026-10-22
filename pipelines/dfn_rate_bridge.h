@@ -2,7 +2,7 @@
  * Rate bridge: run the DFN2 stage on its 48 kHz grid inside a pipeline whose
  * own grid is 8 or 16 kHz.
  *
- * Everything conventional (AEC, RES, BF/GSC, comfort noise) stays on the
+ * Everything conventional (AEC, RES, BF, comfort noise) stays on the
  * product's native grid. Only this bridge crosses to 48 kHz and back, per
  * native hop:
  *
@@ -149,8 +149,6 @@ int dfn_rate_bridge_hop_size(const DfnRateBridge *b);      /* -1 on NULL */
 int dfn_rate_bridge_n_freqs(const DfnRateBridge *b);       /* -1 on NULL */
 /* Native samples the bridge adds to the hosting pipeline's own latency. */
 int dfn_rate_bridge_added_delay_samples(const DfnRateBridge *b);
-/* Between hops only; -1 on NULL or a refused value. */
-int dfn_rate_bridge_set_atten_lim(DfnRateBridge *b, float atten_lim_db);
 DfnResStage *dfn_rate_bridge_stage(const DfnRateBridge *b);
 /* Frame counters, for tests and diagnostics: 48 kHz frames run in total
  * and during the last hop (the schedule). */

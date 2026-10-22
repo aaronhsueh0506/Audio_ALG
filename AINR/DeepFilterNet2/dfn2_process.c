@@ -5,70 +5,22 @@
 
 
 /* Model-local DSP kernels (features / mask expansion / attenuation limit /
- * post-filter). The STFT and ISTFT framing is audio_common's AcStft and
+ * post-filter). The STFT and ISTFT framing is audiolib's AcStft and
  * AcIstft, owned by the caller and bound with dfn2_state_init(). */
 
 #include <math.h>
 #include <stddef.h>
 #include <string.h>
 
-#include "simd_kernel_nn.h"
+#include "utility/simd_kernel_nn.h"
 
-#if defined(__aarch64__) && defined(__ARM_NEON) && \
-    !defined(SIMD_KERNELS_FORCE_SCALAR)
+#if SK_HAVE_NEON
 #include <arm_neon.h>
-#define DF_COMMON_HAVE_NEON 1
-#else
-#define DF_COMMON_HAVE_NEON 0
 #endif
-
-#ifndef M_PI
-#define M_PI 3.14159265358979323846
-#endif
+#define DF_COMMON_HAVE_NEON SK_HAVE_NEON
 
 /* The deep filter's taps before the stream start read this row. */
 static const float df_zero_row[DFN2_DF_BINS];
-
-/* erb_work[b] = sum over bins k in [k0[b], k1[b]) ascending of
- * power[k] * erb_fwd[k * n_bands + b]; erb_work is zeroed on entry and
- * n_bands is a multiple of 4. Four adjacent bands (their ranges are about the
- * same length) advance together, each with its own register accumulator: the
- * bin-major walk updates the accumulators in memory and every update waits for
- * the previous one's store. Every power must be finite (a zero weight outside
- * a range then adds nothing). */
-static inline void erb_forward_banded(const float *power, const float *erb_fwd,
-                                      const uint16_t *k0, const uint16_t *k1,
-                                      int n_bands, float *erb_work) {
-    for (int b = 0; b < n_bands; b += 4) {
-        const int a0 = k0[b], a1 = k0[b + 1], a2 = k0[b + 2], a3 = k0[b + 3];
-        const int n0 = k1[b] - a0, n1 = k1[b + 1] - a1;
-        const int n2 = k1[b + 2] - a2, n3 = k1[b + 3] - a3;
-        int common = n0 < n1 ? n0 : n1;
-        const float *w0 = erb_fwd + (size_t)a0 * n_bands + b;
-        const float *w1 = erb_fwd + (size_t)a1 * n_bands + b + 1;
-        const float *w2 = erb_fwd + (size_t)a2 * n_bands + b + 2;
-        const float *w3 = erb_fwd + (size_t)a3 * n_bands + b + 3;
-        float s0 = erb_work[b], s1 = erb_work[b + 1];
-        float s2 = erb_work[b + 2], s3 = erb_work[b + 3];
-        if (n2 < common) common = n2;
-        if (n3 < common) common = n3;
-        int j;
-        for (j = 0; j < common; ++j) {
-            s0 += power[a0 + j] * w0[(size_t)j * n_bands];
-            s1 += power[a1 + j] * w1[(size_t)j * n_bands];
-            s2 += power[a2 + j] * w2[(size_t)j * n_bands];
-            s3 += power[a3 + j] * w3[(size_t)j * n_bands];
-        }
-        for (j = common; j < n0; ++j) s0 += power[a0 + j] * w0[(size_t)j * n_bands];
-        for (j = common; j < n1; ++j) s1 += power[a1 + j] * w1[(size_t)j * n_bands];
-        for (j = common; j < n2; ++j) s2 += power[a2 + j] * w2[(size_t)j * n_bands];
-        for (j = common; j < n3; ++j) s3 += power[a3 + j] * w3[(size_t)j * n_bands];
-        erb_work[b] = s0;
-        erb_work[b + 1] = s1;
-        erb_work[b + 2] = s2;
-        erb_work[b + 3] = s3;
-    }
-}
 
 /* erb_fwd: caller-loaded exported matrix, raw float32, bin-major
  * [n_bins][n_bands] -- the exact buffer the model trained with (see
@@ -92,9 +44,9 @@ static inline void df_common_features(
      * band by band with the accumulators in registers. Both add each band's
      * nonzero products in the same order. */
     if (skn_all_finite_f32(power, (size_t)n_bins)) {
-        _Static_assert(DFN2_N_ERB % 4 == 0, "erb_forward_banded runs bands in fours");
-        erb_forward_banded(power, erb_fwd, band_k0, band_k1, n_bands,
-                           erb_work);
+        _Static_assert(DFN2_N_ERB % 4 == 0, "skn_erb_forward_banded_f32 runs bands in fours");
+        skn_erb_forward_banded_f32(power, erb_fwd, band_k0, band_k1, n_bands,
+                                   erb_work);
     } else {
         for (int k = 0; k < n_bins; ++k) {
             float p = power[k];
@@ -157,15 +109,8 @@ DFN2_TWIN void df_common_expand_mask_scalar(const float *band_gain,
                                             const uint16_t *inv_hi,
                                             int n_bins, int n_bands,
                                             float *bin_gain) {
-    memset(bin_gain, 0, (size_t)n_bins * sizeof(float));
-    for (int b = 0; b < n_bands; ++b) {
-        float gain = band_gain[b];
-        const float *row = erb_inv + (size_t)b * n_bins;
-        int finite = isfinite(gain);
-        int hi = finite ? inv_hi[b] : n_bins;
-        for (int k = finite ? inv_lo[b] : 0; k < hi; ++k)
-            bin_gain[k] += row[k] * gain;
-    }
+    skn_erb_expand_mask_f32_scalar(band_gain, erb_inv, inv_lo, inv_hi, n_bins,
+                                   n_bands, bin_gain);
 }
 
 #if DF_COMMON_HAVE_NEON
@@ -179,21 +124,8 @@ static inline void df_common_expand_mask_neon(const float *band_gain,
                                               const uint16_t *inv_hi,
                                               int n_bins, int n_bands,
                                               float *bin_gain) {
-    memset(bin_gain, 0, (size_t)n_bins * sizeof(float));
-    for (int b = 0; b < n_bands; ++b) {
-        float gain = band_gain[b];
-        const float *row = erb_inv + (size_t)b * n_bins;
-        int finite = isfinite(gain);
-        int hi = finite ? inv_hi[b] : n_bins;
-        int k = finite ? inv_lo[b] : 0;
-        float32x4_t g = vdupq_n_f32(gain);
-        for (; k < hi && k + 4 <= n_bins; k += 4)
-            vst1q_f32(bin_gain + k,
-                      vaddq_f32(vld1q_f32(bin_gain + k),
-                                vmulq_f32(vld1q_f32(row + k), g)));
-        for (; k < hi; ++k)
-            bin_gain[k] += row[k] * gain;
-    }
+    skn_erb_expand_mask_f32_neon(band_gain, erb_inv, inv_lo, inv_hi, n_bins,
+                                 n_bands, bin_gain);
 }
 #endif
 
@@ -212,56 +144,20 @@ static inline void df_common_expand_mask(const float *band_gain,
 #endif
 }
 
+/* enh_re[k] = noisy_re[k]*lim + enh_re[k]*mix (and the imag twin) is
+ * sk_ema_f32's state[i] = alpha*state[i] + beta*x[i] with state=enh,
+ * x=noisy, alpha=mix, beta=lim -- float addition is exactly commutative for
+ * finite operands, so the swapped argument order changes no bit. */
 static inline void df_common_atten_lim(const float *noisy_re,
                                        const float *noisy_im,
                                        float *enh_re, float *enh_im, int bins,
                                        float atten_lim_db) {
     float lim, mix;
-    int k = 0;
     if (atten_lim_db == 0.0f) return;
     lim = powf(10.0f, -fabsf(atten_lim_db) / 20.0f);
     mix = 1.0f - lim;
-#if DF_COMMON_HAVE_NEON
-    {
-        float32x4_t vl = vdupq_n_f32(lim), vm = vdupq_n_f32(mix);
-        for (; k + 4 <= bins; k += 4) {
-            vst1q_f32(enh_re + k, vaddq_f32(
-                vmulq_f32(vld1q_f32(noisy_re + k), vl),
-                vmulq_f32(vld1q_f32(enh_re + k), vm)));
-            vst1q_f32(enh_im + k, vaddq_f32(
-                vmulq_f32(vld1q_f32(noisy_im + k), vl),
-                vmulq_f32(vld1q_f32(enh_im + k), vm)));
-        }
-    }
-#endif
-    for (; k < bins; ++k) {
-        enh_re[k] = noisy_re[k] * lim + enh_re[k] * mix;
-        enh_im[k] = noisy_im[k] * lim + enh_im[k] * mix;
-    }
-}
-
-static inline void df_common_post_filter(const float *spec_re,
-                                         const float *spec_im,
-                                         float *enh_re, float *enh_im,
-                                         int bins, float beta) {
-    const float eps = 1e-12f;
-    if (!(beta > 0.0f)) return;
-    for (int k = 0; k < bins; ++k) {
-        float noisy_mag = sqrtf(spec_re[k] * spec_re[k] +
-                                spec_im[k] * spec_im[k]);
-        float enh_mag = sqrtf(enh_re[k] * enh_re[k] +
-                              enh_im[k] * enh_im[k]);
-        float mask = enh_mag / (noisy_mag + eps);
-        float mask_sin, ratio, pf;
-        if (mask < eps) mask = eps;
-        if (mask > 1.0f) mask = 1.0f;
-        mask_sin = mask * sinf((float)M_PI * mask * 0.5f);
-        if (mask_sin < eps) mask_sin = eps;
-        ratio = mask / mask_sin;
-        pf = (1.0f + beta) / (1.0f + beta * ratio * ratio);
-        enh_re[k] *= pf;
-        enh_im[k] *= pf;
-    }
+    sk_ema_f32(enh_re, noisy_re, mix, lim, bins);
+    sk_ema_f32(enh_im, noisy_im, mix, lim, bins);
 }
 
 /* One frame of the deep filter on bins [0, DFN2_DF_BINS): each bin sums
@@ -442,10 +338,6 @@ int dfn2_compose(DFN2State* st,
         out_re[k] = st->hi_delay_re[target][high];
         out_im[k] = st->hi_delay_im[target][high];
     }
-#if DFN2_MASK_PF
-    dfn2_post_filter(st->noisy_ring_re[target], st->noisy_ring_im[target],
-                     out_re, out_im, DFN2_PF_BETA);
-#endif
     return 1;
 }
 
@@ -544,24 +436,11 @@ int dfn2_compose_stream(DFN2State* st,
         out_re[k] = st->hi_delay_re[target_slot][high];
         out_im[k] = st->hi_delay_im[target_slot][high];
     }
-#if DFN2_MASK_PF
-    dfn2_post_filter(st->noisy_ring_re[target_slot],
-                     st->noisy_ring_im[target_slot],
-                     out_re, out_im, DFN2_PF_BETA);
-#endif
     dfn2_apply_atten_lim(st->noisy_ring_re[target_slot],
                          st->noisy_ring_im[target_slot],
                          out_re, out_im, atten_lim_db);
     if (output_frame_index) *output_frame_index = target_frame;
     return 1;
-}
-
-void dfn2_post_filter(const float* spec_re, const float* spec_im,
-                      float* enh_re, float* enh_im, float beta)
-{
-    if (!spec_re || !spec_im || !enh_re || !enh_im) return;
-    df_common_post_filter(
-        spec_re, spec_im, enh_re, enh_im, DFN2_N_BINS, beta);
 }
 
 void dfn2_synthesis(DFN2State* st,

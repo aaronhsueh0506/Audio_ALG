@@ -8,7 +8,7 @@
  * #include。表格在編譯期就固定, 沒有共享可變狀態, 執行期沒有 race。
  *
  * 重新產生 rnnoise_tables_gen.h:
- *   cc -O2 -ffp-contract=off gen_rnnoise_tables.c -lm -o gen_rnnoise_tables && ./gen_rnnoise_tables > rnnoise_tables_gen.h
+ *   cc -O2 -ffp-contract=off -I../../../audiolib/common/include gen_rnnoise_tables.c ../../../audiolib/common/src/audio_window.c -lm -o gen_rnnoise_tables && ./gen_rnnoise_tables > rnnoise_tables_gen.h
  *
  * rnnoise_tables_gen.h 是「產生出來的檔案」— 不要手動編輯, 要改請改這裡
  * 再重新產生。test_rnnoise_tables.c 另外用一份獨立複製的原始演算法
@@ -16,13 +16,10 @@
  * ============================================================ */
 
 #include "process.h"
+#include "audio_window.h"
 #include <math.h>
 #include <stdio.h>
 #include <string.h>
-
-#ifndef M_PI
-#define M_PI 3.14159265358979323846
-#endif
 
 static double freq2erb(double f) {
     return 9.265 * log(1.0 + f / (24.7 * 9.265));
@@ -102,9 +99,7 @@ static void compute_erb_tables(void) {
 
 /* root-Hann window 的計算本體; test_rnnoise_tables.c 有獨立複本。 */
 static void compute_window_table(void) {
-    for (int i = 0; i < RNNOISE_WIN_LEN; i++) {
-        hann_win[i] = sqrtf(0.5f * (1.0f - cosf(2.0f * (float)M_PI * i / RNNOISE_WIN_LEN)));
-    }
+    ac_window_build(hann_win, RNNOISE_WIN_LEN);
 }
 
 /* %a hexfloat 往返精確; 印出時手動補 'f' 後綴, 讓讀回來的常數是 float
@@ -121,7 +116,7 @@ static void print_header(void) {
     printf(" * AUTO-GENERATED FILE - DO NOT EDIT.\n");
     printf(" *\n");
     printf(" * Regenerate with:\n");
-    printf(" *   cc -O2 -ffp-contract=off gen_rnnoise_tables.c -lm -o gen_rnnoise_tables && ./gen_rnnoise_tables > rnnoise_tables_gen.h\n");
+    printf(" *   cc -O2 -ffp-contract=off -I../../../audiolib/common/include gen_rnnoise_tables.c ../../../audiolib/common/src/audio_window.c -lm -o gen_rnnoise_tables && ./gen_rnnoise_tables > rnnoise_tables_gen.h\n");
     printf(" *\n");
     printf(" * 編譯期常數版 ERB filterbank (forward/inverse) + root-Hann window,\n");
     printf(" * 由 gen_rnnoise_tables.c 算出; test_rnnoise_tables.c 另外用獨立\n");

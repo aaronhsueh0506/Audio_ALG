@@ -38,8 +38,8 @@ extern "C" {
 /** AudioPipelineMemReq ABI version; independent of the pool layout version. */
 #define AUDIO_PIPELINE_DESCRIPTOR_VERSION 2u
 
-/** Stable FFT backend identifiers. Zero is reserved and never returned. */
-#define AUDIO_PIPELINE_BACKEND_KISS 1u
+/** Stable FFT backend identifier. Zero is reserved and never returned; 1 is retired
+ *  and never returned. */
 #define AUDIO_PIPELINE_BACKEND_NE10 2u
 
 /**
@@ -52,7 +52,7 @@ extern "C" {
 typedef struct {
     uint32_t descriptor_version;  /* = AUDIO_PIPELINE_DESCRIPTOR_VERSION (2) */
     uint32_t layout_version;      /* carve-layout version                    */
-    uint32_t backend_id;          /* AUDIO_PIPELINE_BACKEND_KISS=1 / _NE10=2 */
+    uint32_t backend_id;          /* AUDIO_PIPELINE_BACKEND_NE10 = 2         */
     uint32_t build_flags_hash;    /* FNV-1a-32 */
     uint32_t alignment;           /* 16 */
     uint32_t reserved;            /* 0; keeps 8-byte alignment for bytes */
@@ -99,7 +99,7 @@ typedef struct {
                                    * post path and both are inert                      */
     int           enable_nr;     /* 1 = run MMSE-LSA (default); 0 = no denoiser state, *
                                    * g_total is G_res alone                            */
-    int           enable_res;    /* 1 = apply the AEC3 residual gain G_res (default);  *
+    int           enable_res;    /* 1 = apply the AEC residual gain G_res (default);   *
                                    * 0 = G_res is unity: g_total is G_nr alone, CNG    *
                                    * (which fills only RES-cut bins) is skipped; both  *
                                    * 0 = the linear residual, synthesised              */

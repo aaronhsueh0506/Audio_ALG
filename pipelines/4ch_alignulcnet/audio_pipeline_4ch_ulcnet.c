@@ -4,8 +4,8 @@
  *
  * Per-hop flow (see the header's timing contract):
  *
- *   four_aec_front_process -> SRP-PHAT DOA -> GSC effective weights
- *     -> gsc_spectrum, taken DIRECTLY as the model's error frame: it is
+ *   four_aec_front_process -> SRP-PHAT DOA -> BF effective weights
+ *     -> bf_spectrum, taken DIRECTLY as the model's error frame: it is
  *        already the sqrt-Hann, 50%-overlap, one-frame-per-hop analysis
  *        frame of the current hop that the Align-ULCNet chain would
  *        compute, so there is no reconstruction and no re-analysis between
@@ -33,10 +33,10 @@
 #include <stdint.h>
 
 #include "audio_pipeline_4ch_ulcnet.h"
-#include "gsc.h"
+#include "bf.h"
 #include "srp.h"
-#include "mem_align.h"
-#include "simd_kernel_nn.h"    /* skn_fill_f32 */
+#include "utility/mem_align.h"
+#include "utility/simd_kernel_nn.h"    /* skn_fill_f32 */
 
 #ifndef M_PI
 #define M_PI 3.14159265358979323846
@@ -59,14 +59,14 @@ struct AudioPipeline4ChUlcnet {
     AudioPipeline4ChConfig cfg;
     FourAecNrRes* core;
     SRP* srp;
-    Complex*** gsc_steering;
-    GSC* gsc;
+    Complex*** bf_steering;
+    BF* bf;
 
     int hop_size;
     int fft_size;
     int n_freqs;
-    Complex* gsc_spectrum;
-    Complex* gsc_weights;
+    Complex* bf_spectrum;
+    Complex* bf_weights;
 
     /* The one carved FFT handle serves the ULCNet chain (far analysis and
      * synthesis; same compiled size, strictly sequential use within a hop,
@@ -77,7 +77,7 @@ struct AudioPipeline4ChUlcnet {
      * with its own per-call FFT scratch, borrowing the shared handle above
      * and the window table below) plus the per-hop frame scratch, which is
      * part of `self` in the carve. There is no error-branch analysis: the
-     * GSC spectrum IS the error frame, de-interleaved into err_re/err_im for
+     * BF spectrum IS the error frame, de-interleaved into err_re/err_im for
      * the model callback. */
     AcStft  *far_analysis;
     AcIstft *synthesis;
@@ -175,14 +175,14 @@ static int validate_config(const AudioPipeline4ChConfig* cfg) {
         !isfinite(cfg->doa_angle_tolerance_rad) ||
         cfg->doa_angle_tolerance_rad < 0.0f ||
         cfg->doa_update_interval <= 0) return 0;
-    if (!is_bool(cfg->gsc_enable) ||
-        !isfinite(cfg->gsc_lambda) || cfg->gsc_lambda <= 0.0f ||
-        cfg->gsc_lambda > 1.0f ||
-        !isfinite(cfg->gsc_mu) || cfg->gsc_mu < 0.0f ||
-        !is_bool(cfg->gsc_fixed_mode) ||
-        !isfinite(cfg->gsc_fixed_doa_rad) ||
-        !is_bool(cfg->gsc_fixed_align_notebook) ||
-        cfg->gsc_adapt_interval <= 0) return 0;
+    if (!is_bool(cfg->bf_enable) ||
+        !isfinite(cfg->bf_lambda) || cfg->bf_lambda <= 0.0f ||
+        cfg->bf_lambda > 1.0f ||
+        !isfinite(cfg->bf_mu) || cfg->bf_mu < 0.0f ||
+        !is_bool(cfg->bf_fixed_mode) ||
+        !isfinite(cfg->bf_fixed_doa_rad) ||
+        !is_bool(cfg->bf_fixed_align_notebook) ||
+        cfg->bf_adapt_interval <= 0) return 0;
     /* auto_vad_* fields are unused here (external VAD only) but validated
      * for uniformity with the standard wrapper's config surface. */
     if (!isfinite(cfg->auto_vad_threshold_dbfs) ||
@@ -290,7 +290,7 @@ static uint32_t audio_pipeline_4ch_ulcnet_build_flags_hash(
     hash = fnv1a_str(
         "|carve:self(corecfg-delay-v2,ulcnet-direct,model(io_descriptor),"
         "reprime,ulcnet_window,frame),"
-        "core,srp,gsc,gsc_spectrum,gsc_weights,fft,far_analysis,synthesis",
+        "core,srp,bf,bf_spectrum,bf_weights,fft,far_analysis,synthesis",
         hash);
     /* The grid is a build parameter, so it cannot be spelled into the token
      * as a literal: stringify the macros instead, or two builds on different
@@ -298,7 +298,7 @@ static uint32_t audio_pipeline_4ch_ulcnet_build_flags_hash(
     hash = fnv1a_str("|align|ulcnet" ULCNET_GRID_TOKEN "|sharedfft", hash);
     hash ^= core_build_flags_hash;
     hash *= 16777619u;
-    return hash;
+    return ac_memreq_abi_hash(hash);
 }
 
 /* ============================================================================
@@ -358,7 +358,7 @@ static int fill_stack_geometry(
 }
 
 /* ============================================================================
- * Config -> SRP/GSC module configs (file-private copy of
+ * Config -> SRP/BF module configs (file-private copy of
  * audio_pipeline_4ch.c's derive_spatial_configs — see that file for the
  * lambda-retime/effective-cadence rationale)
  * ========================================================================== */
@@ -366,9 +366,9 @@ static int fill_stack_geometry(
 static int derive_spatial_configs(
     const AudioPipeline4ChConfig* cfg,
     int hop, int fft, int n_freqs,
-    SRP_Config* srp_cfg, GSC_Config* gsc_cfg) {
-    int gsc_effective_interval;
-    if (!cfg || !srp_cfg || !gsc_cfg) return 0;
+    SRP_Config* srp_cfg, BF_Config* bf_cfg) {
+    int bf_effective_interval;
+    if (!cfg || !srp_cfg || !bf_cfg) return 0;
 
     memset(srp_cfg, 0, sizeof(*srp_cfg));
     srp_cfg->M = FOUR_AEC_NR_RES_CHANNELS;
@@ -387,20 +387,20 @@ static int derive_spatial_configs(
     srp_cfg->angle_tol = cfg->doa_angle_tolerance_rad;
     srp_cfg->update_interval = cfg->doa_update_interval;
 
-    gsc_effective_interval = gsc_effective_adapt_interval(
-        cfg->gsc_fixed_mode, cfg->gsc_fixed_align_notebook,
-        cfg->gsc_adapt_interval);
+    bf_effective_interval = bf_effective_adapt_interval(
+        cfg->bf_fixed_mode, cfg->bf_fixed_align_notebook,
+        cfg->bf_adapt_interval);
 
-    memset(gsc_cfg, 0, sizeof(*gsc_cfg));
-    gsc_cfg->enable = cfg->gsc_enable;
-    gsc_cfg->lambda = anr_retime_alpha(
-        cfg->gsc_lambda, cfg->core.sample_rate,
-        hop * gsc_effective_interval);
-    gsc_cfg->mu = cfg->gsc_mu;
-    gsc_cfg->enable_fix_mode = cfg->gsc_fixed_mode;
-    gsc_cfg->fixed_doa_rad = cfg->gsc_fixed_doa_rad;
-    gsc_cfg->fixed_align_notebook = cfg->gsc_fixed_align_notebook;
-    gsc_cfg->adapt_interval = gsc_effective_interval;
+    memset(bf_cfg, 0, sizeof(*bf_cfg));
+    bf_cfg->enable = cfg->bf_enable;
+    bf_cfg->lambda = anr_retime_alpha(
+        cfg->bf_lambda, cfg->core.sample_rate,
+        hop * bf_effective_interval);
+    bf_cfg->mu = cfg->bf_mu;
+    bf_cfg->enable_fix_mode = cfg->bf_fixed_mode;
+    bf_cfg->fixed_doa_rad = cfg->bf_fixed_doa_rad;
+    bf_cfg->fixed_align_notebook = cfg->bf_fixed_align_notebook;
+    bf_cfg->adapt_interval = bf_effective_interval;
     return 1;
 }
 
@@ -426,12 +426,12 @@ static int derive_pipeline_layout(
     const AudioPipeline4ChConfig* cfg,
     AudioPipeline4ChConfig* cfg_forced,
     FourAecNrResMemReq* core_req,
-    SRP_Config* srp_cfg, GSC_Config* gsc_cfg,
+    SRP_Config* srp_cfg, BF_Config* bf_cfg,
     int* hop, int* fft, int* n_freqs,
-    size_t* srp_bytes, size_t* gsc_bytes, size_t* fft_bytes) {
+    size_t* srp_bytes, size_t* bf_bytes, size_t* fft_bytes) {
     FourAecNrResMemBreakdown breakdown;
-    if (!cfg || !cfg_forced || !core_req || !srp_cfg || !gsc_cfg || !hop ||
-        !fft || !n_freqs || !srp_bytes || !gsc_bytes || !fft_bytes) return 0;
+    if (!cfg || !cfg_forced || !core_req || !srp_cfg || !bf_cfg || !hop ||
+        !fft || !n_freqs || !srp_bytes || !bf_bytes || !fft_bytes) return 0;
     if (!validate_config(cfg)) return 0;
     /* Force the compiled grid before ANY core sizing so the descriptor and
      * the carve always describe the same layout. */
@@ -452,12 +452,12 @@ static int derive_pipeline_layout(
     if (*hop != ULCNET_HOP || *fft != ULCNET_N_FFT ||
         *n_freqs != ULCNET_BINS) return 0;
     if (!derive_spatial_configs(
-            cfg_forced, *hop, *fft, *n_freqs, srp_cfg, gsc_cfg))
+            cfg_forced, *hop, *fft, *n_freqs, srp_cfg, bf_cfg))
         return 0;
     *srp_bytes = srp_get_mem_size(srp_cfg);
-    *gsc_bytes = gsc_get_mem_size(FOUR_AEC_NR_RES_CHANNELS, *n_freqs);
+    *bf_bytes = bf_get_mem_size(FOUR_AEC_NR_RES_CHANNELS, *n_freqs);
     *fft_bytes = fft_get_mem_size(*fft);
-    if (*srp_bytes == 0 || *gsc_bytes == 0 || *fft_bytes == 0) return 0;
+    if (*srp_bytes == 0 || *bf_bytes == 0 || *fft_bytes == 0) return 0;
     return 1;
 }
 
@@ -467,28 +467,28 @@ int audio_pipeline_4ch_ulcnet_get_mem_requirements(
     AudioPipeline4ChConfig cfg_forced;
     FourAecNrResMemReq core_req;
     SRP_Config srp_cfg;
-    GSC_Config gsc_cfg;
+    BF_Config bf_cfg;
     int hop, fft, n_freqs;
-    size_t srp_bytes, gsc_bytes, fft_bytes;
+    size_t srp_bytes, bf_bytes, fft_bytes;
     size_t spectral_count;
     size_t total;
 
     if (!out || !derive_pipeline_layout(
-            cfg, &cfg_forced, &core_req, &srp_cfg, &gsc_cfg,
-            &hop, &fft, &n_freqs, &srp_bytes, &gsc_bytes, &fft_bytes))
+            cfg, &cfg_forced, &core_req, &srp_cfg, &bf_cfg,
+            &hop, &fft, &n_freqs, &srp_bytes, &bf_bytes, &fft_bytes))
         return -1;
     if (core_req.bytes > (uint64_t)SIZE_MAX) return -1;
 
     total = ck_align16_size(sizeof(AudioPipeline4ChUlcnet));      /* self */
     total = ck_add_size(total, ck_align16_size((size_t)core_req.bytes));
     total = ck_add_size(total, ck_align16_size(srp_bytes));
-    total = ck_add_size(total, ck_align16_size(gsc_bytes));
+    total = ck_add_size(total, ck_align16_size(bf_bytes));
 
     spectral_count = (size_t)FOUR_AEC_NR_RES_CHANNELS * (size_t)n_freqs;
     total = ck_field_size(
-        total, (size_t)n_freqs, sizeof(Complex));       /* gsc_spectrum */
+        total, (size_t)n_freqs, sizeof(Complex));       /* bf_spectrum */
     total = ck_field_size(
-        total, spectral_count, sizeof(Complex));        /* gsc_weights */
+        total, spectral_count, sizeof(Complex));        /* bf_weights */
     total = ck_add_size(total, ck_align16_size(fft_bytes));  /* fft */
     if (framing_bytes(0) == 0 || framing_bytes(1) == 0) return -1;
     total = ck_add_size(total, ck_align16_size(framing_bytes(0)));  /* far_analysis */
@@ -520,9 +520,9 @@ AudioPipeline4ChUlcnet* audio_pipeline_4ch_ulcnet_init_ex(
     AudioPipeline4ChUlcnetMemReq current;
     FourAecNrResMemReq core_req;
     SRP_Config srp_cfg;
-    GSC_Config gsc_cfg;
+    BF_Config bf_cfg;
     int hop, fft, n_freqs;
-    size_t srp_bytes, gsc_bytes, fft_bytes;
+    size_t srp_bytes, bf_bytes, fft_bytes;
     float geom_x[FOUR_AEC_NR_RES_CHANNELS];
     float geom_y[FOUR_AEC_NR_RES_CHANNELS];
     ArrayGeometry geom;
@@ -530,7 +530,7 @@ AudioPipeline4ChUlcnet* audio_pipeline_4ch_ulcnet_init_ex(
     PoolCursor cursor;
     void* core_region;
     void* srp_region;
-    void* gsc_region;
+    void* bf_region;
     void* fft_region;
     void* region;
     AcStftConfig sc;
@@ -556,8 +556,8 @@ AudioPipeline4ChUlcnet* audio_pipeline_4ch_ulcnet_init_ex(
         (uint64_t)bytes < current.bytes) return NULL;
 
     if (!derive_pipeline_layout(
-            cfg, &cfg_forced, &core_req, &srp_cfg, &gsc_cfg,
-            &hop, &fft, &n_freqs, &srp_bytes, &gsc_bytes, &fft_bytes))
+            cfg, &cfg_forced, &core_req, &srp_cfg, &bf_cfg,
+            &hop, &fft, &n_freqs, &srp_bytes, &bf_bytes, &fft_bytes))
         return NULL;
     if (core_req.bytes > (uint64_t)SIZE_MAX) return NULL;
     if (!fill_stack_geometry(&cfg_forced, geom_x, geom_y, &geom)) return NULL;
@@ -579,22 +579,22 @@ AudioPipeline4ChUlcnet* audio_pipeline_4ch_ulcnet_init_ex(
     if (!srp_region) return NULL;
     p->srp = srp_init(srp_region, srp_bytes, &srp_cfg, &geom);
     if (!p->srp) return NULL;
-    p->gsc_steering = p->srp->a_array;
-    if (!p->gsc_steering) return NULL;
+    p->bf_steering = p->srp->a_array;
+    if (!p->bf_steering) return NULL;
 
-    gsc_region = pool_carve(&cursor, 1, gsc_bytes);
-    if (!gsc_region) return NULL;
-    p->gsc = gsc_init(
-        gsc_region, gsc_bytes, FOUR_AEC_NR_RES_CHANNELS, n_freqs,
-        cfg_forced.num_angles, p->gsc_steering, &gsc_cfg);
-    if (!p->gsc) return NULL;
+    bf_region = pool_carve(&cursor, 1, bf_bytes);
+    if (!bf_region) return NULL;
+    p->bf = bf_init(
+        bf_region, bf_bytes, FOUR_AEC_NR_RES_CHANNELS, n_freqs,
+        cfg_forced.num_angles, p->bf_steering, &bf_cfg);
+    if (!p->bf) return NULL;
 
     spectral_count = (size_t)FOUR_AEC_NR_RES_CHANNELS * (size_t)n_freqs;
-    p->gsc_spectrum =
+    p->bf_spectrum =
         (Complex*)pool_carve(&cursor, (size_t)n_freqs, sizeof(Complex));
-    p->gsc_weights =
+    p->bf_weights =
         (Complex*)pool_carve(&cursor, spectral_count, sizeof(Complex));
-    if (!p->gsc_spectrum || !p->gsc_weights) return NULL;
+    if (!p->bf_spectrum || !p->bf_weights) return NULL;
 
     fft_region = pool_carve(&cursor, 1, fft_bytes);
     if (!fft_region) return NULL;
@@ -720,7 +720,7 @@ int audio_pipeline_4ch_ulcnet_process_front(
         (p->frame_index != 0 && !p->last_delay.solid && pre.delay.solid)) {
         /* Tell the runtime to flush its far attention ring + logit history.
          * The C-side framing states keep running across the boundary -- the
-         * core's lane analysis behind the GSC spectrum, and this wrapper's
+         * core's lane analysis behind the BF spectrum, and this wrapper's
          * far analysis -- so the frame whose window still covers a
          * pre-switch hop is covered by the identity reprime armed here
          * rather than by a crossfade. The counter is armed whether or not a
@@ -732,7 +732,7 @@ int audio_pipeline_4ch_ulcnet_process_front(
     p->last_delay = pre.delay;
 
     /* Far branch: the same hop's raw far source through the one-frame-per-hop
-     * framing. The error branch is the GSC spectrum (process_beam), which is
+     * framing. The error branch is the BF spectrum (process_beam), which is
      * already the model's analysis frame -- the core's lanes analyse with the
      * same sqrt-Hann window at the same 50% overlap, one frame per hop from
      * hop #0, and the beamformer only weights bins -- so it is handed over
@@ -775,13 +775,13 @@ int audio_pipeline_4ch_ulcnet_process_beam(
     if (p->phase != 3) return FOUR_AEC_NR_RES_SEQUENCE_ERROR;
 
     doa_step(p->srp, front->lane_spectra, mask, vad_raw, vad_out);
-    gsc_process_with_weights(
-        p->gsc, front->lane_spectra, doa_get_smooth(p->srp),
-        vad_out ? 0 : 1, mask, p->gsc_spectrum, p->gsc_weights);
+    bf_process_with_weights(
+        p->bf, front->lane_spectra, doa_get_smooth(p->srp),
+        vad_out ? 0 : 1, mask, p->bf_spectrum, p->bf_weights);
 
     for (k = 0; k < ULCNET_BINS; ++k) {
-        p->err_re[k] = p->gsc_spectrum[k].r;
-        p->err_im[k] = p->gsc_spectrum[k].i;
+        p->err_re[k] = p->bf_spectrum[k].r;
+        p->err_im[k] = p->bf_spectrum[k].i;
     }
     p->phase = 1;
     return FOUR_AEC_NR_RES_OK;
@@ -885,7 +885,7 @@ void audio_pipeline_4ch_ulcnet_reset(AudioPipeline4ChUlcnet* p) {
     if (!p || p->destroyed) return;
     four_aec_nr_res_reset(p->core);
     srp_reset(p->srp);
-    gsc_reset(p->gsc);
+    bf_reset(p->bf);
     /* The objects keep the shared handle and window (pool/instance resident,
      * untouched by reset); reset clears their history. */
     ac_stft_reset(p->far_analysis);
@@ -905,11 +905,11 @@ void audio_pipeline_4ch_ulcnet_reset(AudioPipeline4ChUlcnet* p) {
 void audio_pipeline_4ch_ulcnet_destroy(AudioPipeline4ChUlcnet* p) {
     void* owned_heap;
     if (!p || p->destroyed) return;
-    /* GSC borrows the steering table; destroy it before its owner. All four
+    /* BF borrows the steering table; destroy it before its owner. All four
      * sub-destroys are no-op frees for pool-carved sub-objects (their own
      * owned_heap fields stay NULL); only this wrapper's OWN owned_heap (set
      * only by create()) is ever actually freed below, exactly once. */
-    gsc_destroy(p->gsc);
+    bf_destroy(p->bf);
     srp_destroy(p->srp);
     four_aec_nr_res_destroy(p->core);
     fft_destroy(p->fft);
@@ -945,8 +945,8 @@ int audio_pipeline_4ch_ulcnet_beam_state(
     if (!p || p->destroyed || !out) return -1;
     out->doa_raw_rad = doa_get_raw(p->srp);
     out->doa_smooth_rad = doa_get_smooth(p->srp);
-    out->doa_used_rad = gsc_get_doa_used(p->gsc);
-    out->gsc_adaptive = gsc_get_adaptive(p->gsc);
+    out->doa_used_rad = bf_get_doa_used(p->bf);
+    out->bf_adaptive = bf_get_adaptive(p->bf);
     return 0;
 }
 

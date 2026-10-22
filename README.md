@@ -14,7 +14,7 @@ contracts.
 | `AIAEC/` | Four neural AEC candidate architectures | [`AIAEC/README.md`](AIAEC/README.md) |
 | `pipelines/4ch_aec_bf_nr_res/` | Python reference and C API for four linear AEC lanes around an externally owned SRP-PHAT/GSC | [`pipelines/4ch_aec_bf_nr_res/README.md`](pipelines/4ch_aec_bf_nr_res/README.md) |
 | `lib/aec/`, `lib/nr/` | Conventional algorithm libraries | Git submodules |
-| `../audio_common/` | Shared FFT / fast-math / SIMD kernel layer used by AEC, NR and the pipelines | Sibling checkout, expected revision in [`pipelines/audio_common.pin`](pipelines/audio_common.pin) (`make -C pipelines check-pins`) |
+| `../audiolib/common/` | Shared FFT / fast-math / SIMD kernel layer used by AEC, NR and the pipelines | Sibling checkout, expected revision in [`pipelines/audiolib.pin`](pipelines/audiolib.pin) (`make -C pipelines check-pins`) |
 
 The conventional pipeline is the deployable reference path. `AINR/` and
 `AIAEC/` are model-training workspaces and are not silently inserted into that
@@ -73,11 +73,11 @@ cd Audio_ALG
 # If the repository was cloned without submodules:
 git submodule update --init --recursive
 
-# audio_common is a sibling checkout, not a submodule: clone it next to this
-# repository at the revision recorded in pipelines/audio_common.pin, then
+# audiolib is a sibling checkout, not a submodule: clone it next to this
+# repository at the revision recorded in pipelines/audiolib.pin, then
 # verify all three producer revisions.
-git clone https://github.com/aaronhsueh0506/audio_common.git ../audio_common
-git -C ../audio_common checkout "$(sed -n 's/^AUDIO_COMMON_COMMIT=//p' pipelines/audio_common.pin)"
+git clone https://github.com/aaronhsueh0506/audiolib/common.git ../audiolib
+git -C ../audiolib checkout "$(sed -n 's/^AUDIOLIB_COMMIT=//p' pipelines/audiolib.pin)"
 make -C pipelines check-pins
 
 # Build the conventional mono binaries and libaudio_pipeline.a.
@@ -108,7 +108,7 @@ README inside the corresponding model directory.
 
 - [Documentation index](docs/README.md)
 - [C integration manual](docs/c_user_manual_zh_TW.md)
-- [AEC / NR / audio_common C API quick reference](docs/audio_libraries_c_api_zh_TW.md)
+- [AEC / NR / audiolib C API quick reference](docs/audio_libraries_c_api_zh_TW.md)
 - [Frequency-domain pipeline design](docs/freq_domain_pipeline_design.md)
 - [AIAEC current candidate matrix](docs/ai_aec_candidate_matrix.md)
 - [Development and submodule workflow](docs/development.md)
@@ -134,8 +134,8 @@ Audio_ALG/
 Submodule working trees are independent repositories. Commit their changes
 inside `lib/aec` or `lib/nr` first, then update the gitlink in this repository
 only when that submodule revision is intentionally part of an integration
-release. `audio_common` follows the same rule without a gitlink: commit and
-push it first, then update `AUDIO_COMMON_COMMIT` in `pipelines/audio_common.pin`
+release. `audiolib` follows the same rule without a gitlink: commit and
+push it first, then update `AUDIOLIB_COMMIT` in `pipelines/audiolib.pin`
 in the same integration commit that bumps the gitlinks.
 `make -C pipelines publish` enforces the same pin check inside the publish
 lock before it builds any release artifact; `check-pins` remains the quick

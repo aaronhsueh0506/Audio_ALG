@@ -5,8 +5,8 @@
 本文只講「什麼時候呼叫哪個 function」「每個參數怎麼設」。演算法內部推導不在本文範圍。
 
 > **路徑慣例**：本文所有路徑都相對於 Audio_ALG repository 根目錄。
-> `audio_common` 是與 Audio_ALG 平行的另一個 checkout，本文寫成 `<audio_common>/`；
-> 從 `pipelines/` 出發的相對路徑是 `../../audio_common`。
+> `audiolib` 是與 Audio_ALG 平行的另一個 checkout，本文寫成 `<audiolib>/`；
+> 從 `pipelines/` 出發的相對路徑是 `../../audiolib/common`。
 >
 > **數值來源**：本文所有數字都是從當前 source 讀出，或以當前 checkout 實際建置後量測。
 > 記憶體數字**必須**用 API 重新查詢，不要抄本文（見 §4.5）。
@@ -40,7 +40,7 @@ mic hop + ref hop  ──►  linear AEC  ──►  echo-aware NR  ──►  R
 
 ### 1.3 `Complex` type 從哪來
 
-`Complex` 定義在 `<audio_common>/include/fft_wrapper.h`。
+`Complex` 定義在 `<audiolib>/common/include/fft_wrapper.h`。
 單聲道 public API **不需要**你直接使用 `Complex`（`AudioPipelineConfig`、`AudioPipelineMemReq`、
 `AudioPipelineMemBreakdown`、`audio_pipeline_process()` 都沒有 `Complex` 參數）。
 只有當你想自己讀 `audio_pipeline_get_aec()` 回傳的 AEC 診斷資料時才會碰到它，
@@ -49,15 +49,16 @@ mic hop + ref hop  ──►  linear AEC  ──►  echo-aware NR  ──►  R
 ### 1.4 編譯需要的 `-I` 清單（consumer 端最小集合）
 
 ```
+-I pipelines/mono_aec_nr_res
 -I pipelines
 -I lib/aec/c_impl/include
 -I lib/nr/c_impl/include
--I <audio_common>/include
+-I <audiolib>/common/include
 ```
 
-四個就夠（已實測：只用這四個即可編過只含 `#include "audio_pipeline.h"` 的 TU）。
-`pipelines/Makefile` 自己建置 library 時的 `-I` 清單比這個長（多了 `lib/aec/c_impl/example`
-與 `<audio_common>/lib/kiss_fft`），那是給 CLI 的 WAV I/O 與後端內部用的，consumer 不需要。
+五個 include roots 涵蓋 `audio_pipeline.h` 與其 `common/se_stage.h` 相依。
+`pipelines/Makefile` 自己建置 library 時的 `-I` 清單比這個長（多了 `lib/aec/c_impl/example`），
+那是給 CLI 的 WAV I/O 用的，consumer 不需要。
 
 語言標準：library 以 `-std=gnu99` 建置；NE10 後端的 header 需要 GNU 擴充，
 所以你的 TU 也請用 `gnu99`（或以上的 GNU 方言）。
@@ -76,12 +77,12 @@ libaudio_common.a
 ```
 
 * `libaudio_pipeline.a` 只含三個 object（`audio_pipeline.o`、`se_config.o`、`se_anr_stage.o`；後兩者是
-  `pipelines/common/` 的共用組態與 NR 級），不是把 AEC/NR/audio_common
+  `pipelines/common/` 的共用組態與 NR 級），不是把 AEC/NR/audiolib/common
   打包進去的 fat archive。上面四個 archive 你都要自己連。
 * 四個 archive 的實際路徑是 config-keyed 的（`bin/<backend>-<hash>/`），不是固定名稱。
   用各自 Makefile 的 `make -s print-lib-path` 取得，不要硬寫路徑。
-* `BACKEND=ne10` 時 audio_common 內含一個 C++ TU，最終 link 要用 C++ driver（`c++`），
-  不是 `cc`。`BACKEND=kiss` 用 `cc` 即可。
+* `BACKEND=ne10` 時 audiolib 內含一個 C++ TU，最終 link 要用 C++ driver（`c++`），
+  不是 `cc`。
 * 四個 archive 必須用**同一組** backend / 編譯選項建置。混用會在
   `audio_pipeline_init_ex()` 的 descriptor 檢查被擋下（見 §5.3）。
 
@@ -126,15 +127,17 @@ int main(void) {
 編譯（`<...>` 換成你 `print-lib-path` 查到的路徑）：
 
 ```sh
-cc -std=gnu99 -O2 -Wall -Wextra -o app app.c \
+cc -std=gnu99 -O2 -Wall -Wextra -c app.c -o app.o \
+  -I pipelines/mono_aec_nr_res \
   -I pipelines \
   -I lib/aec/c_impl/include \
   -I lib/nr/c_impl/include \
-  -I <audio_common>/include \
+  -I <audiolib>/common/include
+c++ -o app app.o \
   <pipelines-bin>/libaudio_pipeline.a \
   <aec-bin>/libaec.a \
   <nr-bin>/libanr.a \
-  <audio_common-bin>/libaudio_common.a \
+  <audiolib-bin>/libaudio_common.a \
   -lm
 ```
 
@@ -150,7 +153,7 @@ cc -std=gnu99 -O2 -Wall -Wextra -o app app.c \
 
 | # | 步驟 | 呼叫 | 什麼時候呼叫 | 這一步可能怎麼失敗 |
 |---|---|---|---|---|
-| 1 | query | `audio_pipeline_get_mem_requirements(&cfg, &req)` | **每次 init 之前**都要重查，不可跨 build / backend / config 快取 | 回傳 `-1`：`cfg` 或 `out` 為 NULL；config 未通過驗證（§4）；此 TU 編譯時沒帶 `-DAUDIO_PIPELINE_BACKEND_STR="kiss"` 或 `"ne10"`（`backend_id` 會是 0，直接拒絕） |
+| 1 | query | `audio_pipeline_get_mem_requirements(&cfg, &req)` | **每次 init 之前**都要重查，不可跨 build / backend / config 快取 | 回傳 `-1`：`cfg` 或 `out` 為 NULL；config 未通過驗證（§4）；此 TU 編譯時沒帶 `-DAUDIO_PIPELINE_BACKEND_STR="ne10"`（`backend_id` 會是 0，直接拒絕） |
 | 2 | allocate | 你自己的配置器，取得 `req.bytes` 且對齊 `req.alignment` 的記憶體 | 拿到 `req` 之後 | 配置失敗由你自己處理。pool **不需要**預先清零（poison pattern 也可以，已實測）；但必須是 16-byte 對齊、且在 handle 生命週期內獨佔、不被其他人寫入 |
 | 3 | init | `audio_pipeline_init_ex(pool, req.bytes, &cfg, &req)` | 拿到 pool 之後，處理第一個 hop 之前 | 回傳 `NULL`：8 項 descriptor 檢查任一不符（§5.3）；pool 未 16-byte 對齊；pool 太小；config 無效；子模組 init 失敗；grid 不一致 |
 | 4 | process | `audio_pipeline_process(p, mic, ref, out)` | 每收到一個 hop 呼叫一次。三個 buffer 都必須剛好 `audio_pipeline_hop_size(p)` 個 float | 回傳 `-1`：`p`/`mic`/`ref`/`out` 任一為 NULL。**不會**檢查 buffer 長度 —— 長度錯是你的責任 |
@@ -368,9 +371,9 @@ if (audio_pipeline_get_mem_breakdown(&cfg, &b) == 0) { /* b.aec_bytes, ... */ }
 
 ### 4.5 實測記憶體（僅供量級參考，務必自己重查）
 
-以下是**本次 checkout（layout_version=13）、`BACKEND=kiss`、`pipelines/Makefile`
-預設選項**下，直接以 `--print-mem-size` 量到的值。換 backend、換編譯選項、更新
-submodule 都會變。
+以下是**本次 checkout（layout_version=14）、`BACKEND=kiss`、`pipelines/Makefile`
+預設選項**在 kiss 後端移除前的量測，直接以 `--print-mem-size` 量到的值。現行建置
+只有 ne10，數字會不同，請自己重查；換編譯選項、更新 submodule 也都會變。
 
 控制區塊為 160 B（`ALIGN16(sizeof(AudioPipeline))`）。
 
@@ -563,8 +566,8 @@ FFT/NR/pipeline 分項），數字與 `lib/aec` 自己的 `aec_get_mem_size()` �
 | Offset | 欄位 | 型別 | 目前值 |
 |---:|---|---|---|
 | 0 | `descriptor_version` | `uint32_t` | `2` |
-| 4 | `layout_version` | `uint32_t` | `13` |
-| 8 | `backend_id` | `uint32_t` | `1` = KISS，`2` = NE10（永遠不會是 0） |
+| 4 | `layout_version` | `uint32_t` | `14` |
+| 8 | `backend_id` | `uint32_t` | `2` = NE10（目前唯一的 FFT 後端）；`1` 已退役、不會再回傳；永遠不會是 0 |
 | 12 | `build_flags_hash` | `uint32_t` | FNV-1a-32，隨 build 變動 |
 | 16 | `alignment` | `uint32_t` | `16` |
 | 20 | `reserved` | `uint32_t` | `0`（必須為 0，`init_ex()` 會驗證） |
@@ -589,7 +592,7 @@ FFT/NR/pipeline 分項），數字與 `lib/aec` 自己的 `aec_get_mem_size()` �
 ### 8.4 相容性規則（給整合者的三條）
 
 1. **descriptor 永遠現查現用**。不要存進 NVRAM、不要跨 firmware rebuild 沿用。
-2. **兩個 backend 之間永不互通**。即使 `bytes` 剛好相同，KISS 與 NE10 也不是
-   byte-identical 的，descriptor 不能互相代用。
+2. **舊 `backend_id=1`（已移除的 KISS 後端）的 descriptor 一律不相容**。即使 `bytes` 剛好相同，
+   它也不是 NE10 build 的 descriptor，不能代用。
 3. **升級 library 之後一定要重跑一次 `get_mem_requirements()`**，
    並確認你的 pool 預算仍然足夠。

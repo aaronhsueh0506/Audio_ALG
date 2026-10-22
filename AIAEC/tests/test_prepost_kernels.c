@@ -90,14 +90,10 @@ static int test_rows_all_finite(void)
         for (size_t r = 0; r < rows; ++r)
             for (size_t i = 0; i < width; ++i)
                 if (!isfinite(buf[r * stride + i])) want = 0;
-        CHECK(rows_all_finite(buf, rows, stride, width) == want,
-              "rows_all_finite equals the plain predicate");
-        CHECK(rows_all_finite_scalar(buf, rows, stride, width) == want,
-              "rows_all_finite scalar twin equals the plain predicate");
-#if SK_HAVE_NEON
-        CHECK(rows_all_finite_neon(buf, rows, stride, width) == want,
-              "rows_all_finite NEON kernel equals the plain predicate");
-#endif
+        CHECK(skn_all_finite_rows_f32(buf, rows, stride, width) == want,
+              "skn_all_finite_rows_f32 equals the plain predicate");
+        CHECK(skn_all_finite_rows_f32_scalar(buf, rows, stride, width) == want,
+              "skn_all_finite_rows_f32 scalar twin equals the plain predicate");
     }
     return 1;
 }

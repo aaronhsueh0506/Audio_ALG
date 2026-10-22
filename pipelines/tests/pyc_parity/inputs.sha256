@@ -1,0 +1,11 @@
+# sha256 manifest of the inputs of pyc_parity_pipelines.sh (see gen_inputs.py).
+# src/*  : lib/aec/wav/aec_record/ recordings (tracked data of the lib/aec submodule)
+# *.f32  : the files gen_inputs.py derives from them (float32, little endian; mic4 is interleaved [N][4])
+a8c3f3da787fee2ad9f9c9e7c195ee39c4a569c7942ef10a49cba5d309ad74c2  mic1_16k.f32
+c0d24f5a78463a6217de3715f28c5b2973416e0c40490ac0b8470b7f84216026  mic1_48k.f32
+2d96af26b4b76158d2abc043d309710701bb6b91ac8afda728d6a0e55c1d87c7  mic4_16k.f32
+f632fb7c2b586387cba770801450510a70fdbe4a458f9eaff66b39c5abb63d40  mic4_48k.f32
+a674ab47d422391745741c99986022f61b5b85ce43779c7af7ca49d5407c1fa8  ref_16k.f32
+edc336c12b45e594d311af5064f1f83835a29a8168c0064cbabf0c972ba319c4  ref_48k.f32
+7a41b546d0acee5109a6110b1a9906e1553d34038655ce7d9090c7d7729aafe4  src/aec_record_mic_10s.wav
+c9fd010b5bfad819c8c951c2da8a621705a6e8f5712fb945ee2c179f2d71b3d6  src/aec_record_ref_10s.wav

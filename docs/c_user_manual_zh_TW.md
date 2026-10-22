@@ -15,7 +15,7 @@
 
 - AEC static library：`lib/aec/c_impl/bin/libaec.a`
 - NR static library：`lib/nr/c_impl/bin/libanr.a`
-- 共用層 library（FFT/fast_math/hpf）：`../audio_common/bin/<backend>/libaudio_common.a`
+- 共用層 library（FFT/fast_math/hpf）：`../audiolib/common/bin/<backend>/libaudio_common.a`
 - malloc reference executable：config-keyed `pipelines/bin/.../aec_nr_pipeline`
   （source：`pipelines/mono_aec_nr_res/main.c`）
 - static-memory reference executable：config-keyed `pipelines/bin/.../aec_nr_pipeline_static`
@@ -126,7 +126,6 @@ git submodule update --init --recursive
 # 從 Audio_ALG 根目錄執行；mono 與 4ch 的 producer 完全分離
 make -C pipelines            # mono heap/static + libaudio_pipeline.a
 make -C pipelines BACKEND=ne10   # NE10 FFT 後端（obj/ 依 backend+參數雜湊分開目錄，免手動 clean-libs）
-make -C pipelines/4ch_aec_bf_nr_res BACKEND=kiss SIMD=1
 make -C pipelines/4ch_aec_bf_nr_res BACKEND=ne10 SIMD=1
 make -C pipelines/4ch_aec_bf_nr_res 4aec_nr_res_static
 make -C pipelines/4ch_aec_bf_nr_res audio_pipeline_4ch_raw
@@ -140,11 +139,13 @@ make -C pipelines/4ch_aec_bf_nr_res test
 cc -std=gnu99 -O2 -Wall -Wextra \
   -Ilib/aec/c_impl/include -Ilib/aec/c_impl/example \
   -Ilib/nr/c_impl/include \
-  -I../audio_common/include \
-  app.c \
+  -I../audiolib/common/include \
+  -c app.c -o app.o
+# libaudio_common.a 內含一個 C++ TU，最終 link 用 c++ driver；路徑由 audiolib 的 Makefile 回報
+c++ app.o \
   -Llib/aec/c_impl/bin -laec \
   -Llib/nr/c_impl/bin -lanr \
-  ../audio_common/bin/kiss/libaudio_common.a -lm -o app
+  "$(make -s -C ../audiolib/common print-lib-path)" -lm -o app
 ```
 
 AEC library 本身使用 `-ffp-contract=off -fno-math-errno` 建置；若 application 內重做同類遞迴 DSP 運算，也應保留這兩個選項，以維持數值一致性並確保 AArch64 `sqrtf` 直接降成 `FSQRT`。

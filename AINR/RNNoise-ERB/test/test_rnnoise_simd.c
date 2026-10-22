@@ -1,5 +1,7 @@
+#define _POSIX_C_SOURCE 200809L
 /* Scalar/SIMD equivalence test. */
 #include "process.h"
+#include "rnnoise_test_framing.h"
 
 #include <stdint.h>
 #include <stdio.h>
@@ -34,7 +36,8 @@ int main(void) {
     float output[RNNOISE_HOP_LEN];
     uint64_t hash = UINT64_C(1469598103934665603);
 
-    rnnoise_state_init(&state);
+    RNNoiseTestFraming framing;
+    if (rnnoise_test_framing_init(&framing, &state) != 0) return 1;
     for (int frame_index = 0; frame_index < 24; ++frame_index) {
         for (int i = 0; i < RNNOISE_WIN_LEN; ++i) frame[i] = next_sample();
         for (int b = 0; b < RNNOISE_N_BANDS; ++b) {
@@ -61,5 +64,6 @@ int main(void) {
     fprintf(stderr, "rnnoise preprocessing backend=%s\n",
             rnnoise_simd_backend());
     printf("%016llx\n", (unsigned long long)hash);
+    rnnoise_test_framing_free(&framing);
     return 0;
 }

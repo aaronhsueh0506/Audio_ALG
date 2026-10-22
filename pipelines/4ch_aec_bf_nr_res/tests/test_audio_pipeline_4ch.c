@@ -2,7 +2,7 @@
  * tests/test_audio_pipeline_4ch.c — complete four-channel pipeline tests.
  *
  * Mirrors test_audio_pipeline.c's public-API acceptance style while exercising
- * the additional SRP-PHAT/GSC stage at all three production signal grids.
+ * the additional SRP-PHAT/BF stage at all three production signal grids.
  */
 
 #include "audio_pipeline_4ch.h"
@@ -35,9 +35,9 @@ static int run_grid(int sample_rate, int fft_size) {
     int doa_analysis_total = 0;
 
     cfg.core.fft_size = fft_size;
-    cfg.gsc_fixed_mode = 1;
-    cfg.gsc_fixed_doa_rad = 0.4f;
-    cfg.gsc_mu = 0.02f;
+    cfg.bf_fixed_mode = 1;
+    cfg.bf_fixed_doa_rad = 0.4f;
+    cfg.bf_mu = 0.02f;
     p = audio_pipeline_4ch_create(&cfg);
     CHECK(p != NULL, "create complete 4ch spatial pipeline");
     hop = audio_pipeline_4ch_hop_size(p);
@@ -56,11 +56,11 @@ static int run_grid(int sample_rate, int fft_size) {
         audio_pipeline_4ch_doa_fft_size(p) == fft_size,
         "DOA grid follows selected main AEC/NR/RES grid");
     CHECK(
-        audio_pipeline_4ch_gsc_sample_rate(p) == sample_rate &&
-        audio_pipeline_4ch_gsc_frame_size(p) == fft_size &&
-        audio_pipeline_4ch_gsc_hop_size(p) == fft_size / 2 &&
-        audio_pipeline_4ch_gsc_fft_size(p) == fft_size,
-        "GSC grid follows selected main AEC/NR/RES grid");
+        audio_pipeline_4ch_bf_sample_rate(p) == sample_rate &&
+        audio_pipeline_4ch_bf_frame_size(p) == fft_size &&
+        audio_pipeline_4ch_bf_hop_size(p) == fft_size / 2 &&
+        audio_pipeline_4ch_bf_fft_size(p) == fft_size,
+        "BF grid follows selected main AEC/NR/RES grid");
     CHECK(audio_pipeline_4ch_matched_filter_count(p) == 1,
           "one shared matcher");
     CHECK(audio_pipeline_4ch_linear_aec_count(p) ==
@@ -101,7 +101,7 @@ static int run_grid(int sample_rate, int fft_size) {
               info.doa_analysis_frames <= 1,
               "bounded DOA analyses per main hop");
         doa_analysis_total += info.doa_analysis_frames;
-        CHECK(isfinite(info.doa_used_rad), "fixed GSC DOA must be finite");
+        CHECK(isfinite(info.doa_used_rad), "fixed BF DOA must be finite");
         for (int i = 0; i < hop; ++i) {
             CHECK(isfinite(output[i]), "complete pipeline output finite");
         }
@@ -126,15 +126,15 @@ static int run_grid(int sample_rate, int fft_size) {
 }
 
 /* Contract test: in fixed-notebook mode
- * (gsc_fixed_mode && gsc_fixed_align_notebook), gsc_create() forces the
- * actual GSC RLS update cadence to 1 hop regardless of the configured
- * gsc_adapt_interval -- kept for baseline-matching against the reference
+ * (bf_fixed_mode && bf_fixed_align_notebook), bf_create() forces the
+ * actual BF RLS update cadence to 1 hop regardless of the configured
+ * bf_adapt_interval -- kept for baseline-matching against the reference
  * notebook. The lambda retime scaling computed in
  * audio_pipeline_4ch_create() MUST use that same forced cadence, not the
- * raw pre-forced gsc_adapt_interval, or lambda ends up calibrated for a
+ * raw pre-forced bf_adapt_interval, or lambda ends up calibrated for a
  * slower wall-clock update period than what is actually running (too
  * aggressive/timid RLS forgetting relative to the intended design). */
-static int test_gsc_fixed_notebook_lambda_matches_forced_cadence(void) {
+static int test_bf_fixed_notebook_lambda_matches_forced_cadence(void) {
     AudioPipeline4ChConfig cfg =
         audio_pipeline_4ch_default_config(16000);
     AudioPipeline4Ch* p;
@@ -144,36 +144,36 @@ static int test_gsc_fixed_notebook_lambda_matches_forced_cadence(void) {
     float expected_lambda;
     float buggy_lambda;
 
-    cfg.gsc_fixed_mode = 1;
-    cfg.gsc_fixed_align_notebook = 1;
-    cfg.gsc_adapt_interval = 4; /* caller asks for a slower cadence... */
-    cfg.gsc_lambda = 0.98f;
+    cfg.bf_fixed_mode = 1;
+    cfg.bf_fixed_align_notebook = 1;
+    cfg.bf_adapt_interval = 4; /* caller asks for a slower cadence... */
+    cfg.bf_lambda = 0.98f;
 
     p = audio_pipeline_4ch_create(&cfg);
     CHECK(p != NULL, "fixed-notebook cadence test: create pipeline");
 
-    hop_size = audio_pipeline_4ch_gsc_hop_size(p);
-    actual_interval = audio_pipeline_4ch_gsc_effective_adapt_interval(p);
-    actual_lambda = audio_pipeline_4ch_gsc_lambda(p);
+    hop_size = audio_pipeline_4ch_bf_hop_size(p);
+    actual_interval = audio_pipeline_4ch_bf_effective_adapt_interval(p);
+    actual_lambda = audio_pipeline_4ch_bf_lambda(p);
 
-    /* ...but fixed_align_notebook forces the real GSC cadence to every hop
+    /* ...but fixed_align_notebook forces the real BF cadence to every hop
      * (1), regardless of the requested 4. */
     CHECK(actual_interval == 1,
-          "fixed-notebook mode forces the actual GSC cadence to 1");
+          "fixed-notebook mode forces the actual BF cadence to 1");
 
     /* Lambda must be retimed assuming that SAME forced interval (1), i.e.
-     * exactly anr_retime_alpha(gsc_lambda, sr, hop_size*1) -- not
-     * hop_size*4, which scaling with the raw pre-forced gsc_adapt_interval
+     * exactly anr_retime_alpha(bf_lambda, sr, hop_size*1) -- not
+     * hop_size*4, which scaling with the raw pre-forced bf_adapt_interval
      * would give. */
     expected_lambda = anr_retime_alpha(
-        cfg.gsc_lambda, cfg.core.sample_rate, hop_size * 1);
+        cfg.bf_lambda, cfg.core.sample_rate, hop_size * 1);
     CHECK(fabsf(actual_lambda - expected_lambda) < 1e-9f,
           "lambda retime uses the forced (not the requested) adapt_interval");
 
     /* Sanity check that this test can fail: the lambda scaled against the
      * pre-forced interval of 4 must visibly differ from the correct one. */
     buggy_lambda = anr_retime_alpha(
-        cfg.gsc_lambda, cfg.core.sample_rate, hop_size * 4);
+        cfg.bf_lambda, cfg.core.sample_rate, hop_size * 4);
     CHECK(fabsf(actual_lambda - buggy_lambda) > 1e-4f,
           "forced-cadence lambda differs from the old mis-scaled lambda");
 
@@ -182,30 +182,30 @@ static int test_gsc_fixed_notebook_lambda_matches_forced_cadence(void) {
 }
 
 /* Companion check: outside fixed-notebook mode, a configured
- * gsc_adapt_interval > 1 is NOT forced down, so the effective interval used
- * for both the actual GSC cadence and the lambda retime must equal the
+ * bf_adapt_interval > 1 is NOT forced down, so the effective interval used
+ * for both the actual BF cadence and the lambda retime must equal the
  * requested value itself (guards the other branch of
- * gsc_effective_adapt_interval() from regressing). */
-static int test_gsc_auto_mode_respects_configured_interval(void) {
+ * bf_effective_adapt_interval() from regressing). */
+static int test_bf_auto_mode_respects_configured_interval(void) {
     AudioPipeline4ChConfig cfg =
         audio_pipeline_4ch_default_config(16000);
     AudioPipeline4Ch* p;
     int hop_size;
     float expected_lambda;
 
-    cfg.gsc_adapt_interval = 4;
-    cfg.gsc_lambda = 0.98f;
+    cfg.bf_adapt_interval = 4;
+    cfg.bf_lambda = 0.98f;
 
     p = audio_pipeline_4ch_create(&cfg);
     CHECK(p != NULL, "auto-mode cadence test: create pipeline");
 
-    hop_size = audio_pipeline_4ch_gsc_hop_size(p);
-    CHECK(audio_pipeline_4ch_gsc_effective_adapt_interval(p) == 4,
+    hop_size = audio_pipeline_4ch_bf_hop_size(p);
+    CHECK(audio_pipeline_4ch_bf_effective_adapt_interval(p) == 4,
           "auto mode keeps the requested adapt_interval unforced");
 
     expected_lambda = anr_retime_alpha(
-        cfg.gsc_lambda, cfg.core.sample_rate, hop_size * 4);
-    CHECK(fabsf(audio_pipeline_4ch_gsc_lambda(p) - expected_lambda) < 1e-9f,
+        cfg.bf_lambda, cfg.core.sample_rate, hop_size * 4);
+    CHECK(fabsf(audio_pipeline_4ch_bf_lambda(p) - expected_lambda) < 1e-9f,
           "lambda retime uses the requested adapt_interval in auto mode");
 
     audio_pipeline_4ch_destroy(p);
@@ -420,7 +420,7 @@ static int test_rejected_calls_preserve_vad_state(void) {
  * the mono output hop and every scalar field of AudioPipeline4ChFrameInfo.
  *
  * Deliberately does NOT scan the whole poisoned pool for "rejected calls
- * never touch it" (test_spatial_third_party.c's smaller SRP/GSC pools do;
+ * never touch it" (test_spatial_third_party.c's smaller SRP/BF pools do;
  * this composite pool can be several MB at 48 kHz/1024, and
  * test_4aec_nr_res.c's own run_static_parity() -- the direct precedent for
  * this descriptor tier -- likewise only checks the EXTRA trailing bytes
@@ -446,14 +446,14 @@ static int run_static_parity(int sample_rate, int fft_size) {
     int frame;
 
     cfg.core.fft_size = fft_size;
-    cfg.gsc_fixed_mode = 1;
-    cfg.gsc_fixed_doa_rad = 0.35f;
-    cfg.gsc_mu = 0.02f;
+    cfg.bf_fixed_mode = 1;
+    cfg.bf_fixed_doa_rad = 0.35f;
+    cfg.bf_mu = 0.02f;
 
     CHECK(audio_pipeline_4ch_get_mem_requirements(&cfg, &req) == 0,
           "static memory requirement query succeeds");
     CHECK(req.layout_version == AUDIO_PIPELINE_4CH_LAYOUT_VERSION &&
-              AUDIO_PIPELINE_4CH_LAYOUT_VERSION == 15u,
+              AUDIO_PIPELINE_4CH_LAYOUT_VERSION == 16u,
           "the queried descriptor publishes the current carve layout");
     CHECK(req.bytes <= (uint64_t)SIZE_MAX,
           "static memory requirement fits size_t");
@@ -595,7 +595,7 @@ static int run_static_parity(int sample_rate, int fft_size) {
               "heap/pool doa_used_rad matches");
         CHECK(heap_info.vad_raw == stat_info.vad_raw &&
                   heap_info.vad_out == stat_info.vad_out &&
-                  heap_info.gsc_adaptive == stat_info.gsc_adaptive &&
+                  heap_info.bf_adaptive == stat_info.bf_adaptive &&
                   heap_info.doa_analysis_frames ==
                       stat_info.doa_analysis_frames,
               "heap/pool remaining frame info fields match");
@@ -629,7 +629,7 @@ static int run_static_parity(int sample_rate, int fft_size) {
 /* ---------------------------------------------------------------------------
  * Post-beam stages carved by this wrapper: strength setters, sizing, and the
  * equivalence of the wrapper's chain with the reference chain written over the
- * front end (conv_chain_4ch.h), on a bypassed GSC so both see the same error
+ * front end (conv_chain_4ch.h), on a bypassed BF so both see the same error
  * spectrum (lane 0) and the identity weights.
  * ------------------------------------------------------------------------ */
 
@@ -739,6 +739,20 @@ static int test_stage_sizing_and_switches(void) {
         neither = both; neither.core.enable_nr = 0; neither.core.enable_res = 0;
         CHECK(four_aec_nr_res_stage_configs(&both.core, &res_cfg, &nr_cfg) == 0,
               "sizing: the stage configurations derive");
+        {
+            /* NR off: the denoiser configuration is not composed, only zeroed, and the
+             * RES configuration is the one NR-on derives. */
+            AecConfig res_off;
+            AnrConfig nr_off, nr_zero;
+            memset(&nr_off, 0xA5, sizeof(nr_off));
+            memset(&nr_zero, 0, sizeof(nr_zero));
+            CHECK(four_aec_nr_res_stage_configs(&no_nr.core, &res_off, &nr_off) == 0 &&
+                  memcmp(&nr_off, &nr_zero, sizeof(nr_off)) == 0 &&
+                  se_anr_stage_mem_size(&nr_off) == 0 &&
+                  res_off.fft_size == res_cfg.fft_size &&
+                  aec_res_get_mem_size(&res_off) == aec_res_get_mem_size(&res_cfg),
+                  "sizing: NR off zeroes nr_cfg and leaves the RES configuration unchanged");
+        }
         res_b = (aec_res_get_mem_size(&res_cfg) + 15u) & ~(size_t)15u;
         nr_b = (se_anr_stage_mem_size(&nr_cfg) + 15u) & ~(size_t)15u;
         n_freqs = grids[g][1] / 2 + 1;
@@ -766,7 +780,7 @@ static int test_stage_sizing_and_switches(void) {
     return 1;
 }
 
-/* With the GSC bypassed the beamformed error is lane 0's error spectrum and
+/* With the BF bypassed the beamformed error is lane 0's error spectrum and
  * the effective weights are [1,0,0,0]; the reference chain fed the same two
  * must reproduce the wrapper bit for bit, for every combination of the three
  * switches the post stages offer. */
@@ -787,7 +801,7 @@ static int test_wrapper_equals_reference_chain(void) {
             cfg.core.enable_nr = mode & 1;
             cfg.core.enable_res = (mode >> 1) & 1;
             cfg.core.enable_cng = (mode >> 2) & 1;
-            cfg.gsc_enable = 0;
+            cfg.bf_enable = 0;
             wrap = audio_pipeline_4ch_create(&cfg);
             ref = conv_create(&cfg.core);
             snprintf(label, sizeof(label), "reference chain: %d Hz/%d nr=%d res=%d cng=%d build",
@@ -864,14 +878,14 @@ static int run_all_tests(void) {
         audio_pipeline_4ch_destroy(nr_only);
     }
     invalid = audio_pipeline_4ch_default_config(16000);
-    invalid.gsc_lambda = 1.0f + 1e-6f;
+    invalid.bf_lambda = 1.0f + 1e-6f;
     CHECK(audio_pipeline_4ch_create(&invalid) == NULL,
-          "GSC forgetting factor above 1.0 is rejected");
-    invalid.gsc_lambda = 1.0f;
+          "BF forgetting factor above 1.0 is rejected");
+    invalid.bf_lambda = 1.0f;
     {
         AudioPipeline4Ch* boundary = audio_pipeline_4ch_create(&invalid);
         CHECK(boundary != NULL,
-              "GSC forgetting factor of exactly 1.0 is still accepted");
+              "BF forgetting factor of exactly 1.0 is still accepted");
         audio_pipeline_4ch_destroy(boundary);
     }
     CHECK(run_grid(16000, 256),
@@ -880,10 +894,10 @@ static int run_all_tests(void) {
           "16 kHz 512/256 complete spatial pipeline");
     CHECK(run_grid(48000, 1024),
           "48 kHz 1024/512 complete spatial pipeline");
-    CHECK(test_gsc_fixed_notebook_lambda_matches_forced_cadence(),
-          "GSC fixed-notebook lambda/forced-cadence match test");
-    CHECK(test_gsc_auto_mode_respects_configured_interval(),
-          "GSC auto-mode configured-interval test");
+    CHECK(test_bf_fixed_notebook_lambda_matches_forced_cadence(),
+          "BF fixed-notebook lambda/forced-cadence match test");
+    CHECK(test_bf_auto_mode_respects_configured_interval(),
+          "BF auto-mode configured-interval test");
     CHECK(test_rejected_calls_preserve_vad_state(),
           "rejected calls (NULL args, NaN input) must not contaminate VAD state");
     CHECK(run_static_parity(16000, 256),

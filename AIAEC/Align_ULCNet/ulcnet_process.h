@@ -29,12 +29,12 @@
  *   與 Python reference 的 StreamSTFT/StreamISTFT 相同。
  *
  * Parity expectations: the Python reference (AIAEC/aiaec_streaming.py) is
- * bit-exact vs torch. This C side runs its transforms through audio_common's
- * fft_wrapper.h on a caller-owned FftHandle, so BACKEND=kiss/ne10 genuinely
- * selects the FFT backend, real signals pay an ULCNET_N_FFT-point RFFT/IRFFT (not a
- * full complex FFT), and twiddles are precomputed once inside the handle,
- * never per call. Agreement vs Python is float-ULP class (~1e-5 absolute at
- * ULCNET_N_FFT points), not bit-exact. Regression gate:
+ * bit-exact vs torch. This C side runs its transforms through audiolib's
+ * fft_wrapper.h on a caller-owned FftHandle, so real signals pay an
+ * ULCNET_N_FFT-point RFFT/IRFFT (not a full complex FFT), and twiddles are
+ * precomputed once inside the handle, never per call. Agreement vs Python is
+ * float-ULP class (~1e-5 absolute at ULCNET_N_FFT points), not bit-exact.
+ * Regression gate:
  * AIAEC/tests/test_ulcnet_process_c.py (drives AcStft / AcIstft in the
  * ulcnet configuration, links libaudio_common.a, compares frame by frame vs
  * Python).
@@ -60,7 +60,7 @@
 #ifndef ULCNET_PROCESS_H
 #define ULCNET_PROCESS_H
 
-#include "audio_stft.h"      /* AcStft, AcIstft, FftHandle, Complex (audio_common) */
+#include "audio_stft.h"      /* AcStft, AcIstft, FftHandle, Complex (audiolib) */
 #include "ulcnet_model_io.h" /* UlcnetModelIoDescriptor + UlcnetFarInputMode
                               * -- a stddef/stdint-only leaf header; the
                               * UlcnetModel boundary below publishes the
@@ -98,11 +98,11 @@ extern "C" {
  * ulcnet_model_io.h 的部署契約常數;此名稱保留給既有呼叫端。 */
 #define ULCNET_COMPRESSION_EXP ULCNET_MODEL_IO_COMPRESSION_EXP
 
-/* ---- Framing: audio_common's AcStft / AcIstft ----
+/* ---- Framing: audiolib's AcStft / AcIstft ----
  * Analysis is a sqrt-Hann STFT with `center` 1 (centered, reflect-padded:
  * push#0 yields no frame, push#1 yields two, later pushes one; ac_stft_flush
  * adds the trailing frame) or 0 (rolling: exactly one frame per push from the
- * first push, the framing of the AEC/GSC seam's own spectra). Synthesis is
+ * first push, the framing of the AEC/BF seam's own spectra). Synthesis is
  * AC_OLA_ENV_NORM: overlap-add with the squared-window envelope divided out
  * (torch.istft semantics); the first frame lies in the trimmed half window
  * and emits nothing.
@@ -180,22 +180,6 @@ typedef struct UlcnetNnJob {
 
 /* 1 when every bin of (re, im) is finite. */
 int ulcnet_frame_is_finite(const float re[ULCNET_BINS], const float im[ULCNET_BINS]);
-
-/**
- * Run the model callback once on one (err, far) frame pair under the
- * FULL-WRITE CONTRACT: out_re/out_im are pre-filled with NaN, infer() is
- * called, and the output is accepted only if infer() returned 0 AND every
- * bin came back finite -- so a partial write (rc == 0 without writing all
- * ULCNET_BINS) is rejected instead of silently applying stale values from a
- * previous frame. Returns 1 when the output was accepted (the caller
- * synthesises out_*), 0 when the caller must fall back to the identity
- * (err_*) path. model->infer must be non-NULL. Shared by every wrapper that
- * drives a UlcnetModel so the fail-open policy is defined in one place.
- */
-int ulcnet_model_run_frame(const UlcnetModel *model,
-                           const float err_re[ULCNET_BINS], const float err_im[ULCNET_BINS],
-                           const float far_re[ULCNET_BINS], const float far_im[ULCNET_BINS],
-                           float out_re[ULCNET_BINS], float out_im[ULCNET_BINS]);
 
 #ifdef __cplusplus
 }

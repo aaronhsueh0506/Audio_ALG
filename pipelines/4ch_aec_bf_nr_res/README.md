@@ -1,10 +1,10 @@
 # 4-channel PBFDKF + beamforming + NR/RES application
 
 This is the conventional four-channel product application directory. It owns
-the reusable four-lane linear-AEC front end, the SRP-PHAT/GSC integration, host
+the reusable four-lane linear-AEC front end, the SRP-PHAT/BF integration, host
 evaluation tools and their tests. The sibling `../4ch_alignulcnet/`
 application reuses the public front-only core API; it does not duplicate AEC,
-DOA, GSC or NR implementations.
+DOA, BF or NR implementations.
 
 This shares the mono pipeline's zero-padding-free grid convention (frame ==
 FFT, hop == frame/2 -- see the supported-grids table below), not an AIAEC
@@ -19,11 +19,11 @@ raw/aligned far ──> one shared aligner (MATCHED, FIXED or EXTERNAL)
                               |
                               v (one aligned reference, identical to every lane)
 mic 0 ──> linear AEC 0 ─┐ (computes the far-end FFT: aec_process_context())
-mic 1 ──> linear AEC 1 ─┤ (borrows lane 0's far_spec: aec_process_context_shared_far())
-mic 2 ──> linear AEC 2 ─┤ (borrows lane 0's far_spec: aec_process_context_shared_far())
-mic 3 ──> linear AEC 3 ─┘ (borrows lane 0's far_spec: aec_process_context_shared_far())
+mic 1 ──> linear AEC 1 ─┤ (normally borrows lane 0's far_spec: aec_process_context_shared_far();
+mic 2 ──> linear AEC 2 ─┤  own FFT instead on a mixed warm/soft-realign hop -- see "Far-end FFT
+mic 3 ──> linear AEC 3 ─┘  sharing" below)
                         │    four_aec_front_process()
-                        └─>[external SRP-PHAT/GSC: weights + beamformed error]
+                        └─>[external SRP-PHAT/BF: weights + beamformed error]
                               │    four_aec_fuse()   → SeSpecFrame
                               v
         se_res_stage_gain ─ se_anr_stage_gain ─ sk_min_f32 ─ sk_capply_gain_f32
@@ -40,21 +40,48 @@ internally by this pipeline, not caller-configurable) skips straight to the
 gain (`se_res_stage_gain()` over the fused frame) is the only place a
 suppression gain is calculated.
 
-**Far-end FFT sharing** (one far-end rfft/hop instead of four): all four
-lanes see the byte-identical `p->aligned_ref` every hop and realign together on
-any delay change (see the hard invariants below) -- the precondition for
-safely sharing one lane's far-end spectrum across the other three was already
-true before this existed. Lane 0 runs `aec_process_context()` (computes its
-own far-end FFT, as always); `aec_get_res_context()`'s always-populated
+**Far-end FFT sharing** (one far-end rfft/hop instead of four, except on a
+mixed-realign hop -- see below): all four lanes see the byte-identical
+`p->aligned_ref` every hop and realign on the same hop, by the same delta, on
+any delay change (see the hard invariants below). That is necessary but not
+sufficient for safely sharing one lane's far-end spectrum across the other
+three: `aec_apply_external_realign()`'s warm-vs-soft OUTCOME is also per-lane
+(each lane's own filter-convergence evidence gates it independently), and a
+soft outcome zeros that lane's far_buffer OLA history while a warm outcome
+leaves it alone. On a hop where every lane's outcome agrees (all warm, all
+soft, or no realign at all), every lane's far_buffer stays in lockstep and
+lane 0's FFT really is what any other lane would compute; on a MIXED
+warm/soft hop it is not, and this is not a corner case reserved for
+adversarial tests -- real 4-mic recordings produce it (one hop in the
+`aec_together`/`aec_take_turn` fixtures realigns 3 lanes warm and 1 soft
+together). Lane 0 always runs `aec_process_context()` (computes its own
+far-end FFT, as always); `aec_get_res_context()`'s always-populated
 `far_spec` field is then handed to lanes 1-3 via
 `aec_process_context_shared_far()`, which borrows it instead of computing a
-redundant, byte-identical transform. `four_aec_nr_res_far_fft_real_compute_count()`
-exposes a running per-hop count for tests to confirm the 4x→1x drop directly,
-rather than trusting the wiring by inspection alone. `ref` is still passed to
-every lane even when its far-end spectrum is borrowed -- the OLA far-buffer
+redundant, byte-identical transform -- except on a mixed hop
+(`FourAecNrRes.far_spec_mixed_hop`), where lanes 1-3 fall through to their
+own `aec_process_context()` call instead, the same per-lane far-FFT
+computation every lane already has for the non-shared case, so each lane's
+far_spec reflects its own realign outcome rather than borrowing lane 0's.
+`four_aec_nr_res_far_fft_real_compute_count()` exposes a running per-hop
+count for tests to confirm the 4x→1x drop directly, rather than trusting the
+wiring by inspection alone; on a mixed hop the count is 4, not 1, for that one
+hop. `ref` is still passed to every lane regardless -- the OLA far-buffer
 time-domain history and every non-FFT use of the raw far signal (saturation
 detection, delay estimation, mu_scale) are per-lane state, untouched by this
-sharing.
+sharing -- which is exactly why a per-lane realign outcome that diverges
+shows up there first.
+
+`fuse_contexts()`'s cross-lane far-spec agreement gate
+(`four_aec_nr_res_far_spec_agrees()`, in `4aec_nr_res_internal.h`) is bypassed
+for exactly this one hop (`far_spec_mixed_hop` again) rather than asked to
+approve a disagreement it is not designed to approve; the fused `X` handed
+downstream still takes lane 0's far_spec either way
+(`frame->x = p->snapshots[0].far_spec` in `four_aec_fuse()`), matching
+`pipeline.py`'s `_fuse_contexts()`, which carries the same exception (it no
+longer raises on a cross-lane far_spec mismatch; it accepts it and fuses lane
+0's far_spec as `X`, same semantics on both sides of the C/Python seam -- see
+the comments at both sites for the full reasoning).
 
 Hard invariants:
 
@@ -72,10 +99,10 @@ Hard invariants:
   own suppression gain (`spatial_linear_context=1`; see above).
 - `delay_num_filters`, each PBFDKF lane's `filter_length`, and an
   Align-ULCNet checkpoint's TA depth `D` are independent budgets.
-- The Python reference and the C front end leave SRP-PHAT/GSC at an explicit
+- The Python reference and the C front end leave SRP-PHAT/BF at an explicit
   ownership seam. The complete C wrapper in `audio_pipeline_4ch.*` connects
-  that seam to the reusable implementations under `pipelines/third_party/`
-  (a sibling of this directory, shared by every pipeline).
+  that seam to the reusable implementations under `../../../audiolib/{doa,bf}`
+  (a sibling checkout of this repo, shared by every pipeline).
 - `EqualWeightBeamformer` exists only as a deterministic offline/test adapter;
   it is never selected by default.
 
@@ -97,7 +124,7 @@ come from different beamformer states. A beamformer that atomically returns both
 its mono spectrum and effective weights passes the spectrum and skips that
 duplicate weighted sum; both arrays are validated for finiteness, while their
 coherence remains an explicit caller contract. The bundled complete wrapper uses
-this form with `gsc_process_with_weights()`. The far-end spectrum remains the one
+this form with `bf_process_with_weights()`. The far-end spectrum remains the one
 shared digital render reference -- it is verified equal across lanes and is not
 spatially weighted. The result passes through one mono NR+RES path without a
 fifth AEC or replicated post-filters. When `front.delay.changed` is non-zero, an
@@ -112,7 +139,7 @@ The deployable C seam is:
 - [`4aec_nr_res.h`](4aec_nr_res.h): public config, lifecycle, the two per-hop
   calls (`four_aec_front_process()`, `four_aec_fuse()`), the stage-config helper
   and structural audit accessors;
-- [`4aec_nr_res.c`](4aec_nr_res.c): one shared `DelayAec3`, four linear `Aec`
+- [`4aec_nr_res.c`](4aec_nr_res.c): one shared `DelayAec`, four linear `Aec`
   instances and the coherent context projection. The residual suppressor (`AecRes`,
   `aec_res.h`), the MMSE-LSA instance and the inverse transform are carved and
   chained by the applications below;
@@ -129,13 +156,13 @@ The deployable C seam is:
   [`audio_pipeline_4ch.c`](audio_pipeline_4ch.c): complete wrapper (pool-first
   `get_mem_requirements`/`init_ex`/`init`, plus a `create` heap convenience
   wrapper — same two-tier convention as `4aec_nr_res.h` above) that inserts
-  third-party SRP-PHAT/DOA smoothing and GSC between `four_aec_front_process()`
+  third-party SRP-PHAT/DOA smoothing and BF between `four_aec_front_process()`
   and `four_aec_fuse()` and chains the post-beam stages (`run_post_stages()`);
 - [`audio_pipeline_4ch_raw.c`](audio_pipeline_4ch_raw.c): raw-float host CLI for running
   the complete wrapper on recorded four-channel fixtures (heap `create()` —
   a one-shot host tool, not a board-deployment demo);
 - [`audio_pipeline_4ch_static.c`](audio_pipeline_4ch_static.c): caller-owned-pool
-  example for the COMPLETE wrapper (front end + real SRP-PHAT + real GSC, not an
+  example for the COMPLETE wrapper (front end + real SRP-PHAT + real BF, not an
   externally-supplied fixed-weight stand-in), following the same query →
   allocate → `init_ex` → process → destroy → release sequence as
   `4aec_nr_res_static.c` above;
@@ -147,10 +174,12 @@ The deployable C seam is:
 - [`tests/test_audio_pipeline_4ch.c`](tests/test_audio_pipeline_4ch.c): complete-wrapper lifecycle,
   topology, reset, strength setters, stage sizing, finite-output tests, and the
   bit-exact equality of the wrapper's chain with the reference chain;
-- [`../third_party/tests/test_spatial_third_party.c`](../third_party/tests/test_spatial_third_party.c):
-  scalar/SIMD PHAT, cached SRP, exported-GSC-weight and VAD pool equivalence
-  tests. These live with the modules they cover; `make test` here delegates to
-  `make -C ../third_party test`.
+- [`../../../audiolib/tests/test_spatial_third_party.c`](../../../audiolib/tests/test_spatial_third_party.c):
+  scalar/SIMD PHAT, cached SRP, exported-BF-weight and VAD pool equivalence
+  tests (moved here, alongside `doa/`, `bf/` and `VAD/`, in the
+  audio_common -> audiolib rename); `make test` here delegates to
+  `make -C ../../../audiolib test`. The gain stages' own tests stayed
+  behind at [`../third_party/gain/tests/test_gain.c`](../third_party/gain/tests/test_gain.c).
 
 For side-by-side reading, the files and public calls map directly:
 
@@ -187,10 +216,10 @@ SeSpecFrame f;
 /* microphones is interleaved [hop][4], reference is [hop]. */
 four_aec_front_process(pipeline, microphones, reference, &front);
 
-/* External SRP-PHAT/GSC consumes front.linear_spectra and produces
+/* External SRP-PHAT/BF consumes front.linear_spectra and produces
  * channel-major Complex[4][n_freqs] weights (and, optionally, the mono error).
  * Convention: out[k] = sum(weights[ch,k] * in[ch,k]); no conjugation. */
-external_srp_gsc_update(front.linear_spectra, weights);
+external_srp_bf_update(front.linear_spectra, weights);
 
 four_aec_fuse(pipeline, weights, NULL, &f);       /* NULL: rebuild E from the weights */
 
@@ -212,7 +241,8 @@ querying memory or constructing the wrapper. The wrapper's static-memory
 requirement then excludes the NR state. The front end itself reads none of
 `enable_res` / `enable_nr` / `enable_cng` / `legacy_amin`: they configure the
 application's stages (`four_aec_nr_res_stage_configs()` derives the `AecConfig`
-and `AnrConfig`). `enable_post` selects whether the lanes keep the
+and `AnrConfig`; with `enable_nr = 0` the `AnrConfig` is returned all-zero and
+no denoiser is sized). `enable_post` selects whether the lanes keep the
 frequency-domain post context and the front end carves the fuse buffers
 (`enable_post = 0` is the front-only seam the Align-ULCNet application uses).
 
@@ -246,10 +276,10 @@ four_aec_nr_res_destroy(pipeline); /* does not release caller-owned memory */
 platform_free(pool);
 ```
 
-The COMPLETE wrapper (front end + SRP-PHAT + GSC + the post-beam stages in one
+The COMPLETE wrapper (front end + SRP-PHAT + BF + the post-beam stages in one
 instance) uses the same pattern one level up --
 `audio_pipeline_4ch_get_mem_requirements()` composes the front end's own
-requirement with the SRP/GSC sub-modules' `*_get_mem_size()`, the `AecRes`, the
+requirement with the SRP/BF sub-modules' `*_get_mem_size()`, the `AecRes`, the
 denoiser, the synthesis object and this wrapper's own scratch, and
 `audio_pipeline_4ch_init_ex()` places all of it, zero-heap, in one
 caller-owned pool:
@@ -302,7 +332,7 @@ make NO_STDIO=1 audit-no-stdio
 `se_config.o` / `se_anr_stage.o` of `pipelines/common`. Standard and ULCNet
 wrapper objects are linked directly into their application binaries; no
 per-application archive is produced. A standard consumer links the front end with
-`audio_pipeline_4ch.o`, `libdoa.a`, `libgsc.a`,
+`audio_pipeline_4ch.o`, `libdoa.a`, `libbf.a`,
 `libspatial_common.a`, `libaec.a`, `libanr.a`, `libaudio_common.a`, and
 `-lm`, in the order demonstrated by this directory's Makefile.
 
@@ -320,9 +350,9 @@ pipeline = FourChannelAecPipeline()      # no beamformer is created
 # 1. Our code: one shared aligner + four linear AEC lanes.
 pre = pipeline.front_process(microphones_hop, far_hop)
 
-# 2. External Python owner: SRP-PHAT + GSC. The complete C wrapper supplies
+# 2. External Python owner: SRP-PHAT + BF. The complete C wrapper supplies
 #    this stage, but the Python reference intentionally keeps the seam open.
-mono_hop, effective_weights = external_srp_gsc.process(pre.linear_channels)
+mono_hop, effective_weights = external_srp_bf.process(pre.linear_channels)
 
 # 3. Our code again: project AEC context with those exact weights and calculate
 #    one mono residual-suppression gain. The existing mono NR+RES seam consumes
@@ -347,7 +377,7 @@ Python shapes and ordering are contractual:
   resume on another instance;
 - `reset()` invalidates every frame still in flight.
 
-If the external GSC is a multi-frame/time-domain filter, `weights` must mean
+If the external BF is a multi-frame/time-domain filter, `weights` must mean
 its exact current effective frequency response. Returning only a mono waveform
 is insufficient for the traditional RES path.
 
@@ -359,11 +389,11 @@ vector with the same spatial weights, then runs exactly one stateful
 not calculate unused beamformed echo/far spectra. Residual normalization uses
 one square root and one divide per channel/bin; the public weights-only path
 performs 12 complex MACs per bin (error + near + residual across four lanes),
-while the complete GSC wrapper reuses its atomic mono spectrum and performs 8
+while the complete BF wrapper reuses its atomic mono spectrum and performs 8
 (near + residual). Comfort-noise power projection is a separate real SIMD
 accumulation.
 
-For the fixed four-channel GSC, the internal RLS covariance is laid out as
+For the fixed four-channel BF, the internal RLS covariance is laid out as
 `P[M][M][F]`. This makes frequency contiguous and lets AArch64 NEON update four
 bins at once without changing the public API or recurrence order. Automated
 tests compare the SIMD and scalar output, effective weights, `P` and `wa`
@@ -383,7 +413,7 @@ This is structurally correct but **not bit-exact** to a future fully extracted
 AEC3 post-beam RES API; it must be cohort-tuned before production sign-off.
 
 The core C API does not expose an async multi-frame queue. The complete C
-wrapper does execute SRP-PHAT/GSC and remains synchronous; it supports both
+wrapper does execute SRP-PHAT/BF and remains synchronous; it supports both
 the heap convenience constructor and the caller-owned, zero-heap static-pool
 constructor shown above. Automated tests prove caller-pool and heap lifecycle,
 byte-identical core construction paths, topology, supported grids, spatial
@@ -391,7 +421,7 @@ arithmetic equivalence,
 sequencing, and finite DSP output; they do not replace objective speech
 metrics or subjective quality sign-off on real array recordings.
 
-DOA and GSC now follow the same selected no-padding grid as AEC/NR/RES:
+DOA and BF now follow the same selected no-padding grid as AEC/NR/RES:
 
 | sample rate | frame | FFT | hop | bins | selection |
 |---:|---:|---:|---:|---:|---|
@@ -401,12 +431,12 @@ DOA and GSC now follow the same selected no-padding grid as AEC/NR/RES:
 
 Frame and hop are derived from the selected FFT rather than independently
 configured: `frame == FFT`, `hop == frame/2`. SRP receives the matching
-sample rate, FFT and bin count for steering; GSC operates on the exact
+sample rate, FFT and bin count for steering; BF operates on the exact
 `FFT/2+1` spectra exported by the four linear AEC lanes. The raw runner
 selects the same tuple with `--fft-size 256|512|1024` and rejects cross-rate
 combinations.
 
-There is no legacy/downsample grid entry: DOA, GSC and AEC/NR/RES always use
+There is no legacy/downsample grid entry: DOA, BF and AEC/NR/RES always use
 the same selected tuple. Changing the grid therefore changes the complete
 pipeline atomically rather than creating a second spatial timing domain.
 
@@ -415,7 +445,7 @@ Reproduce the two checked-in recording tests from the `Audio_ALG` directory:
 ```bash
 ../.venv/bin/python -m pipelines.4ch_aec_bf_nr_res.evaluate_recordings
 
-# Complete C SRP-PHAT/GSC path:
+# Complete C SRP-PHAT/BF path:
 make -C pipelines/4ch_aec_bf_nr_res audio_pipeline_4ch_raw
 ../.venv/bin/python -m pipelines.4ch_aec_bf_nr_res.evaluate_external_recordings
 
@@ -433,8 +463,8 @@ finish within the declared delay tolerance of the independent file-level
 measurement (the C low-latency evaluator uses `max(half hop, 5 ms)`).
 Use `--no-contract-check` only when inspecting a deliberately changed fixture.
 `evaluate_external_recordings` runs the complete C wrapper—shared matcher,
-four linear AEC lanes, SRP-PHAT, GSC, one NR and one post-beam RES—and verifies
-the reported DOA/GSC grids. The separate Python `evaluate_recordings` command
+four linear AEC lanes, SRP-PHAT, BF, one NR and one post-beam RES—and verifies
+the reported DOA/BF grids. The separate Python `evaluate_recordings` command
 uses `EqualWeightBeamformer` only to test the open Python pre/post seam.
 
 The wrapper default is a four-microphone UCA with 35 mm radius only so the API
@@ -451,5 +481,5 @@ both. It deliberately does **not** align the far stem directly to its echo in
 the mic, because doing so would erase the acoustic/system delay that the one
 live shared matched filter is supposed to estimate. The C evaluator uses the
 same alignment rule, writes raw float hops for `audio_pipeline_4ch_raw`, and checks
-the complete `1 matcher / 4 linear AEC / SRP-PHAT / GSC / 1 NR / 1 post-RES`
+the complete `1 matcher / 4 linear AEC / SRP-PHAT / BF / 1 NR / 1 post-RES`
 resource and delay contract.

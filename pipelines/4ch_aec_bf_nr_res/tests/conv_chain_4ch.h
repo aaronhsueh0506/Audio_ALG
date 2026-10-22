@@ -18,8 +18,8 @@
 
 #include "4aec_nr_res.h"
 #include "audio_stft.h"
-#include "mem_align.h"
-#include "simd_kernels.h"
+#include "utility/mem_align.h"
+#include "utility/simd_kernels.h"
 #include "common/se_anr_stage.h"
 #include "common/se_stage.h"
 
@@ -75,7 +75,7 @@ static inline ConvChain* conv_attach(FourAecNrRes* core, const FourAecNrResConfi
     c->hop = four_aec_nr_res_hop_size(c->core);
     ac_stft_config_default(&scfg, four_aec_nr_res_fft_size(c->core));
     res_b = ALIGN16(aec_res_get_mem_size(&res_cfg));
-    nr_b = ALIGN16(se_anr_stage_mem_size(&nr_cfg));
+    nr_b = cfg->enable_nr ? ALIGN16(se_anr_stage_mem_size(&nr_cfg)) : 0;
     synth_b = ALIGN16(ac_istft_get_mem_size(&scfg));
     vec = ALIGN16((size_t)c->n_freqs * sizeof(float));
     cvec = ALIGN16((size_t)c->n_freqs * sizeof(Complex));

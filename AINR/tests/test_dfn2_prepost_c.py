@@ -11,7 +11,7 @@ class reproduces the hand-composed path SAMPLE FOR SAMPLE.  Every comparison
 here is therefore ``memcmp`` on fp32, never a tolerance: the class is only
 allowed to reorder nothing.
 
-Cases, all in ONE driver selected by argv[1] so audio_common and the three
+Cases, all in ONE driver selected by argv[1] so audiolib and the three
 model TUs are compiled once for the module:
 
   equiv     DFN2_IO_TIME vs analysis + features + model-I/O + compose +
@@ -55,7 +55,7 @@ import pytest
 _THIS_DIR = os.path.dirname(os.path.abspath(__file__))
 _DFN_DIR = os.path.join(os.path.dirname(_THIS_DIR), 'DeepFilterNet2')
 _AC_DIR = os.path.abspath(
-    os.path.join(_THIS_DIR, '..', '..', '..', 'audio_common'))
+    os.path.join(_THIS_DIR, '..', '..', '..', 'audiolib', 'common'))
 _AC_INCLUDE = os.path.join(_AC_DIR, 'include')
 
 _SOURCES = ('dfn2_prepost.c', 'dfn2_process.c', 'dfn2_model_io.c')
@@ -67,7 +67,7 @@ _DRIVER = r'''
 #include <string.h>
 
 #include "dfn2_prepost.h"
-#include "mem_align.h"
+#include "utility/mem_align.h"
 
 #define CHECK(x) do { if (!(x)) { \
     fprintf(stderr, "CHECK failed at line %d: %s\n", __LINE__, #x); \
@@ -587,7 +587,7 @@ static int case_freqpool(FftHandle *fft) {
      * output hop staging and the two framing objects (the analysis object
      * with its own window table, the synthesis object borrowing it; both
      * share the caller's FFT handle), IO_FREQ carves the dual entry point's
-     * second staging pair instead.  The framing sizes come from audio_common
+     * second staging pair instead.  The framing sizes come from audiolib
      * with a real window table for the borrowing object, independent of the
      * sizing path under test.  Pin the difference to the byte so a region
      * silently added to one mode fails here. */
@@ -1974,7 +1974,7 @@ int main(int argc, char **argv) {
 
 @pytest.fixture(scope='module')
 def audio_common_lib():
-    """audio_common's NE10 static lib (the default backend), built and located the way the other AINR C tests do it."""
+    """audiolib's NE10 static lib (the default backend), built and located the way the other AINR C tests do it."""
     if shutil.which('make') is None:
         pytest.skip('no make available')
     subprocess.run(
@@ -2004,7 +2004,7 @@ def driver(tmp_path_factory, audio_common_lib):
     subprocess.run(
         [cc, '-O2', '-std=c11',
          '-Wall', '-Wextra', '-Wpedantic', '-Werror', '-ffp-contract=off',
-         '-I', _DFN_DIR, '-I', _AC_INCLUDE, str(source),
+         '-I', _DFN_DIR, '-I', _AC_INCLUDE, '-I', _AC_DIR, str(source),
          *[os.path.join(_DFN_DIR, name) for name in _SOURCES],
          audio_common_lib, '-lm', '-o', str(executable)],
         check=True, capture_output=True,

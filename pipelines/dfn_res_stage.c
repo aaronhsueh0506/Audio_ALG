@@ -8,7 +8,8 @@
 #include <string.h>
 
 #include "dfn_res_stage.h"
-#include "simd_kernel_nn.h"
+#include "utility/mem_align.h"
+#include "utility/simd_kernel_nn.h"
 
 #ifndef AUDIO_PIPELINE_BACKEND_STR
 #define AUDIO_PIPELINE_BACKEND_STR "unknown"
@@ -70,8 +71,6 @@ static uint32_t fnv1a_u32(uint32_t h, uint32_t value) {
 }
 
 static uint32_t backend_id(void) {
-    if (strcmp(AUDIO_PIPELINE_BACKEND_STR, "kiss") == 0)
-        return DFN_RES_STAGE_BACKEND_KISS;
     if (strcmp(AUDIO_PIPELINE_BACKEND_STR, "ne10") == 0)
         return DFN_RES_STAGE_BACKEND_NE10;
     return 0u;
@@ -152,7 +151,7 @@ static void fill_descriptor(const Resolved *r, DfnResStageMemReq *out) {
     out->descriptor_version = DFN_RES_STAGE_DESCRIPTOR_VERSION;
     out->layout_version = DFN_RES_STAGE_LAYOUT_VERSION;
     out->backend_id = backend_id();
-    out->build_flags_hash = h;
+    out->build_flags_hash = ac_memreq_abi_hash(h);
     out->alignment = STAGE_ALIGN;
     out->bytes = (uint64_t)r->bytes;
 }

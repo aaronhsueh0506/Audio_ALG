@@ -7,6 +7,20 @@
 #define FOUR_AEC_NR_RES_INTERNAL_H
 
 #include "4aec_nr_res.h"
+#include <limits.h>
+
+/* Diagnostic counts never wrap. A saturated/rewound counter cannot prove
+ * this hop's borrow provenance; the caller then uses its full comparison. */
+static inline long four_aec_count_add_sat(long total, long add) {
+    if (total < 0 || add < 0 || add > LONG_MAX - total) return LONG_MAX;
+    return total + add;
+}
+
+static inline int four_aec_far_fft_delta_matches(long before, long after,
+                                                 long expected) {
+    if (before < 0 || after < before || after == LONG_MAX) return 0;
+    return after - before == expected;
+}
 
 /* ============================================================================
  * Shared-delay change admission (lib/aec Path-B mirror)
@@ -19,7 +33,7 @@
  * 16`, `pending_delay_ttl = 3`), in native samples and hops.
  *
  * Exposed here rather than kept static because the TTL is not reachable from
- * a stream: DelayAec3 re-offers a movement on every hop once it has one, so
+ * a stream: DelayAec re-offers a movement on every hop once it has one, so
  * a candidate is always resolved on the very next eligible hop and never
  * ages. Driving this state machine directly is the only way to test expiry
  * without pretending a synthetic scene produced it.
@@ -52,12 +66,25 @@ int four_aec_nr_res_admission_offer(
 /* ============================================================================
  * Cross-lane far-end agreement (fuse-stage precondition)
  *
- * Exposed for the same reason the admission machine is: the rejecting half
- * is unreachable from a stream. This file's own lanes always share one far
- * spectrum by construction, so a test driving four_aec_front_process()/four_aec_fuse()
- * can only ever exercise the accepting branch -- the divergent case, which
- * is what the rejection exists for, has to be handed to the predicate
- * directly.
+ * Exposed for the same reason the admission machine is: most of the
+ * rejecting half is still unreachable from a stream through THIS predicate
+ * specifically, but not because the lanes always agree. A mixed warm/soft-
+ * realign hop (some lanes' aec_apply_external_realign() this hop returned
+ * warm, others soft) DOES make the lanes' far_spec disagree in practice --
+ * confirmed against real recordings, not just in theory (one 48 kHz 4-mic
+ * fixture realigns a mix of warm and soft lanes on the same hop). What stays
+ * unreachable through this predicate is that case specifically:
+ * four_aec_front_process() now gives every lane its own real far FFT on such
+ * a hop (so the disagreement this predicate exists to reject is real, not
+ * silently papered over), but fuse_contexts() answers that hop by skipping
+ * this predicate entirely (p->far_spec_mixed_hop) rather than asking it to
+ * approve a mismatch it is not designed to approve -- see the comment above
+ * four_aec_nr_res_far_spec_agrees() in 4aec_nr_res.c. So a test driving
+ * four_aec_front_process()/four_aec_fuse() can still only exercise this
+ * predicate's accepting branch; the divergent case still has to be handed to
+ * it directly, same as before -- but that is this core's own design choice
+ * about which hops ask the predicate at all, not evidence that the lanes
+ * themselves cannot diverge.
  * ========================================================================== */
 
 /* 1 = this lane may be folded into the beam, 0 = it carries a different
@@ -82,7 +109,7 @@ int four_aec_nr_res_far_spec_provenance(const FourAecNrRes* p);
  * The duty machine in update_shared_delay() is a C-only SCHEDULE: it decides
  * on which hops the matched-filter analysis runs, and pipeline.py -- the
  * reference for the shared alignment's MATH -- has no counterpart for it
- * (delay_aec3.h says so of the underlying delay_aec3_accumulate_ex()). A
+ * (delay_aec.h says so of the underlying delay_aec_accumulate_ex()). A
  * per-hop C/Python comparison therefore has to neutralise the schedule
  * first, or it measures the divergence the schedule IS instead of the
  * arithmetic it is supposed to gate.

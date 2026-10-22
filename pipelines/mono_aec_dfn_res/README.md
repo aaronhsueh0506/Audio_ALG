@@ -48,7 +48,7 @@ the DFN2 stage runs at 48 kHz. At 48 kHz the host's spectra are DFN2's grid
 and the stage is applied directly (algorithmic latency three hops: two model
 lookahead hops plus one synthesis-WOLA hop, 32 ms). Below 48 kHz the rate
 bridge (`pipelines/dfn_rate_bridge.h`) synthesises E and P on the native
-grid, resamples them up with `audio_common`'s polyphase FIR, runs the stage
+grid, resamples them up with `audiolib`'s polyphase FIR, runs the stage
 on the 48 kHz 1024/512 grid every 512 new samples, and resamples the result
 down; the AEC, RES and comfort noise never leave the product rate. The
 bridge adds a fixed delay to the host's own output: 672 samples at 16 kHz
@@ -63,9 +63,9 @@ hosts).
 Build and test from `pipelines/` (the directory `Makefile` forwards):
 
 ```sh
-make BACKEND=kiss WERROR=1 libaudio_pipeline_dfn.a mono_aec_dfn_res
-make BACKEND=kiss WERROR=1 test        # includes test_dfn_res_stage,
-                                       # test_audio_pipeline_dfn and the skeleton
+make WERROR=1 libaudio_pipeline_dfn.a mono_aec_dfn_res
+make WERROR=1 test        # includes test_dfn_res_stage,
+                          # test_audio_pipeline_dfn and the skeleton
 ```
 
 `libaudio_pipeline_dfn.a` holds the wrapper, the shared stage and the DFN2
@@ -98,9 +98,9 @@ moves the AEC itself to 48 kHz; that extra AEC cost is separate from this
 resampler count and must be included in the board measurement.
 
 Host DSP pool (`mono_aec_dfn_res_get_mem_requirements`, matched delay,
-five-filter bank, NE10): 725,840 bytes at the 16 kHz default (host plus the
+five-filter bank, NE10): 771,264 bytes at the 16 kHz default (host plus the
 rate bridge, whose own pool is 326,896 bytes including the stage) and
-1,467,904 bytes at 48 kHz (the conventional MMSE-LSA pipeline on the 48 kHz
-grid needs 1,608,128 bytes). Model weights and accelerator activation/
+1,530,240 bytes at 48 kHz (the conventional MMSE-LSA pipeline on the 48 kHz
+grid needs 1,658,016 bytes). Model weights and accelerator activation/
 workspace memory are external to this descriptor; adding int8 weights alone
 brings the known minimum to about 2.8 MiB at 16 kHz.

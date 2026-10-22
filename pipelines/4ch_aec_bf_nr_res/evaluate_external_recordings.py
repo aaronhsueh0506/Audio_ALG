@@ -1,4 +1,4 @@
-"""Run the complete C SRP-PHAT/GSC pipeline on both checked-in recordings."""
+"""Run the complete C SRP-PHAT/BF pipeline on both checked-in recordings."""
 
 from __future__ import annotations
 
@@ -111,7 +111,7 @@ def evaluate_case(
     near = np.ascontiguousarray(near[:n_samples], dtype=np.float32)
     near_activity = _activity(_frame_power(near, hop, n_frames)).astype(np.uint8)
 
-    with tempfile.TemporaryDirectory(prefix="four-aec-gsc-") as directory:
+    with tempfile.TemporaryDirectory(prefix="four-aec-bf-") as directory:
         temporary = Path(directory)
         mic_raw = temporary / "mic.f32"
         ref_raw = temporary / "ref.f32"
@@ -206,7 +206,7 @@ def evaluate_case(
     if output_dir is not None:
         output_dir.mkdir(parents=True, exist_ok=True)
         sf.write(
-            output_dir / f"{case_dir.name}_c_srp_gsc_nr_res.wav",
+            output_dir / f"{case_dir.name}_c_srp_bf_nr_res.wav",
             output,
             sample_rate,
         )
@@ -237,10 +237,10 @@ def validate(result: dict) -> None:
         "doa_frame_size": result["frame_size"],
         "doa_hop_size": result["hop_size"],
         "doa_fft_size": result["fft_size"],
-        "gsc_sample_rate": result["sample_rate"],
-        "gsc_frame_size": result["frame_size"],
-        "gsc_hop_size": result["hop_size"],
-        "gsc_fft_size": result["fft_size"],
+        "bf_sample_rate": result["sample_rate"],
+        "bf_frame_size": result["frame_size"],
+        "bf_hop_size": result["hop_size"],
+        "bf_fft_size": result["fft_size"],
     }
     for key, value in expected_grid.items():
         if summary.get(key) != value:
@@ -251,8 +251,8 @@ def validate(result: dict) -> None:
         failures.append("DOA analysis never consumed a frame")
     if summary.get("doa_update_frames", 0) <= 0:
         failures.append("SRP-PHAT never updated")
-    if summary.get("gsc_adaptive_frames", 0) <= 0:
-        failures.append("GSC never adapted")
+    if summary.get("bf_adaptive_frames", 0) <= 0:
+        failures.append("BF never adapted")
     if abs(result["final_delay_error_samples"]) > result[
         "delay_tolerance_samples"
     ]:

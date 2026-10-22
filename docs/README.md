@@ -11,7 +11,7 @@ README.
 | Repository scope and signal-grid boundary | [`../README.md`](../README.md) |
 | Conventional mono AEC + NR/RES | [`../pipelines/README.md`](../pipelines/README.md) |
 | C and caller-owned-pool integration | [`c_user_manual_zh_TW.md`](c_user_manual_zh_TW.md) |
-| AEC / NR / audio_common public API quick reference | [`audio_libraries_c_api_zh_TW.md`](audio_libraries_c_api_zh_TW.md) |
+| AEC / NR / audiolib public API quick reference | [`audio_libraries_c_api_zh_TW.md`](audio_libraries_c_api_zh_TW.md) |
 | DEBUG observability: current inventory and proposals | [`debug_observability_zh_TW.md`](debug_observability_zh_TW.md) |
 | Board integration of `libaudio_pipeline.a` | [`pipeline_board_integration.md`](pipeline_board_integration.md) |
 | Frequency-domain gain fusion | [`freq_domain_pipeline_design.md`](freq_domain_pipeline_design.md) |
@@ -21,6 +21,7 @@ README.
 | Four-channel AEC + BF + RES + DeepFilterNet2 application | [`../pipelines/4ch_aec_bf_dfn_res/README.md`](../pipelines/4ch_aec_bf_dfn_res/README.md) |
 | Standalone AINR models | [`../AINR/README.md`](../AINR/README.md) |
 | DFN2 cascade/alpha contract | [`../AINR/DeepFilterNet2/README.md`](../AINR/DeepFilterNet2/README.md) |
+| DFN3 raw-low / masked-high comparison contract | [`../AINR/DeepFilterNet3/README.md`](../AINR/DeepFilterNet3/README.md) |
 | Neural AEC candidates | [`../AIAEC/README.md`](../AIAEC/README.md) |
 | AIAEC candidate decision matrix | [`ai_aec_candidate_matrix.md`](ai_aec_candidate_matrix.md) |
 | PBFDKF + Align-ULCNet embedded streaming proposal | [`align_ulcnet_embedded_streaming_design_zh_TW.md`](align_ulcnet_embedded_streaming_design_zh_TW.md) |
@@ -36,7 +37,7 @@ page per module (overview / API / block diagram / signal swimlane / I-O table /
 state table / latency / file paths), plus `conventions.html` for the chain-wide
 grid and framing table and `onnx_prepost.html` for the ONNX-boundary,
 state-layout-version and PTQ-calibration status. Component pages for AEC, NR
-and audio_common live in those repositories' own `docs/html/` and are reached
+and audiolib live in those repositories' own `docs/html/` and are reached
 through sibling relative links. The AEC component page
 has a companion detail page, `aec_detail.html`, in the AEC repository.
 
@@ -50,7 +51,7 @@ variants (shared entry-point, rate-bridge and test detail in
 reached through `pipelines/dfn_rate_bridge.{h,c}`; the shared post-RES stage
 `pipelines/dfn_res_stage.{h,c}` estimates the model from the pre-RES spectrum
 and applies it to the post-RES one). Model pages: `ainr_dfn2.html` (pool, callback and build detail in
-`ainr_dfn2_detail.html`), `ainr_gtcrn.html`, `ainr_rnnoise_erb.html`, and the four
+`ainr_dfn2_detail.html`), `ainr_dfn3.html`, `ainr_gtcrn.html`, `ainr_rnnoise_erb.html`, and the four
 `aiaec_*.html` pages (Align-ULCNet far-branch, PTQ and layout detail in
 `aiaec_align_ulcnet_detail.html`).
 

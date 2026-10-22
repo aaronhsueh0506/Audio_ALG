@@ -1,6 +1,6 @@
-# AEC、NR、audio_common C API 整合速查
+# AEC、NR、audiolib C API 整合速查
 
-本文件是給 application／board integration 使用者的**短版入口**，涵蓋 AEC、NR、audio_common
+本文件是給 application／board integration 使用者的**短版入口**，涵蓋 AEC、NR、audiolib
 三個 library，以及三個 AI 模型的 pre/post 類別（§6），回答三件事：
 
 1. 應該 include 哪些 public header；
@@ -11,7 +11,7 @@
 
 - [AEC C 使用手冊](../lib/aec/docs/c_user_manual_zh_TW.md)
 - [NR C 使用手冊](../lib/nr/docs/c_user_manual_zh_TW.md)
-- [audio_common C 使用手冊](../../audio_common/docs/c_user_manual_zh_TW.md)
+- [audiolib C 使用手冊](../../audiolib/common/docs/c_user_manual_zh_TW.md)
 - [Audio_ALG mono／4ch pipeline 使用手冊](c_user_manual_zh_TW.md)
 - 模型側的圖邊界、I/O 表與延遲：`docs/html/` 的各模型頁（`ainr_dfn2.html` 等）
 
@@ -28,10 +28,11 @@
 | 4ch linear AEC 與外部 beamformer seam | `pipelines/4ch_aec_bf_nr_res/4aec_nr_res.h` |
 | 只做單路 AEC，或自行組合 NN／其他 post-filter | `aec.h` |
 | 已有 STFT/WOLA，只需要頻域 NR | `anr.h` |
-| 只需要 FFT、resample、HPF、pre-gain | `audio_common/include/*.h` |
+| 只需要 FFT、resample、HPF、pre-gain | `audiolib/common/include/*.h` |
 | Align-ULCNet 加速器 handoff（hop 或頻譜） | `AIAEC/Align_ULCNet/ulcnet_prepost.h` |
 | DeepVQE-S 加速器 handoff | `AIAEC/DeepVQE_S/deepvqe_prepost.h` |
 | DeepFilterNet2 加速器 handoff | `AINR/DeepFilterNet2/dfn2_prepost.h` |
+| DeepFilterNet3 加速器 handoff | `AINR/DeepFilterNet3/dfn3_prepost.h` |
 
 產品 application 若要的是既有完整 flow，優先呼叫 pipeline API；不要在 application
 重新複製 AEC/NR gain fusion、window、OLA 或 CNG 邏輯。只有要做不同演算法組合時，才直接組
@@ -82,7 +83,7 @@ AEC 與 NR 另保留 8 kHz legacy grid，但 4ch product pipeline 不接受它�
 #include "aec_res.h"   /* AecRes、aec_cng_fill */
 ```
 
-`pbfdkf.h`、`delay_aec3.h`、`aec3_post.h`、`suppression_gain.h` 等是內部 header，不是 application API。
+`pbfdkf.h`、`delay_aec.h`、`aec_post.h`、`suppression_gain.h` 等是內部 header，不是 application API。
 
 ### 3.2 Config 與建立
 
@@ -358,7 +359,7 @@ if (anr_reconfigure(nr, &target) != 0) { /* grid 不符或 target 無效 */ }
 
 ---
 
-## 5. audio_common library
+## 5. audiolib library
 
 ### 5.1 Header 與主要 API
 
@@ -369,10 +370,11 @@ if (anr_reconfigure(nr, &target) != 0) { /* grid 不符或 target 無效 */ }
 | `hpf.h` | stateful 2nd-order HPF | `hpf_create/init/process/reset/destroy` |
 | `audio_pre_gain.h` | dB pre-gain，不 clipping | `audio_pre_gain_create/init/set_db/process/destroy` |
 | `wav_io.h` | host WAV I/O helper | `wav_open_*`、`wav_read_float`、`wav_write_float` |
-| `mem_align.h` | pool alignment/size helper | `ALIGN16` 等 |
 
-`simd_kernels.h` 與 `fast_math.h` 是 header-only DSP kernels，不是一般 application
-control API。若 application TU 直接 include，必須和 library 使用相同 SIMD/FP flags。
+以上皆在 `include/`（對外 API）。`utility/mem_align.h`（pool alignment/size helper，
+`ALIGN16` 等）、`utility/simd_kernels.h` 與 `utility/fast_math.h` 是內部 header-only
+DSP kernels，不是一般 application control API。若 application TU 直接 include，
+必須和 library 使用相同 SIMD/FP flags。
 
 ### 5.2 FFT
 
@@ -429,7 +431,7 @@ hpf_process(hpf, buf, n);                  /* in-place */
 
 ## 6. AI 模型 pre/post 類別
 
-三個模型各有一個 pre/post 類別，把「呼叫端音訊 ↔ 加速器張量」之間的所有東西
+四個模型各有一個 pre/post 類別，把「呼叫端音訊 ↔ 加速器張量」之間的所有東西
 （framing、window、FFT/IFFT/OLA、特徵前端、遞迴 ring 與狀態交易）收成一個物件：
 
 | 模型 | Public header | 訊號輸入 |
@@ -437,14 +439,17 @@ hpf_process(hpf, buf, n);                  /* in-place */
 | Align-ULCNet | `AIAEC/Align_ULCNet/ulcnet_prepost.h` | linear-AEC error + aligned far |
 | DeepVQE-S | `AIAEC/DeepVQE_S/deepvqe_prepost.h` | **raw microphone** + far reference |
 | DeepFilterNet2 | `AINR/DeepFilterNet2/dfn2_prepost.h` | 單路 noisy |
+| DeepFilterNet3 | `AINR/DeepFilterNet3/dfn3_prepost.h` | 單路 noisy；raw 低頻 DF / 高頻 ERB |
 
-每個類別都是**第三個 TU**：它組合的兩個檔案（`ulcnet_process.c` + `ulcnet_model_io.c`；
+每個類別都是**第三個 TU**：它組合的兩個檔案（`dfn3_process.c` + `dfn3_model_io.c`；`ulcnet_process.c` + `ulcnet_model_io.c`；
 `aiaec_process.c` + `deepvqe_process.c`；`dfn2_process.c` + `dfn2_model_io.c`）必須維持各自
-可獨立連結給自己的 parity 測試用，所以類別不能放進其中任何一個，而且**兩個被組合的檔案都沒有改動**。
+可獨立連結給自己的 parity 測試用，所以類別不能放進其中任何一個。
 
 ### 6.1 共通生命週期
 
-三個類別的形狀相同，只有前綴不同（`ulcnet_` / `deepvqe_` / `dfn2_`）：
+四個類別的生命週期形狀相同，前綴為 `ulcnet_` / `deepvqe_` / `dfn2_` / `dfn3_`。
+DFN3 的兩個 heads、layout 9、state 綁定、單 hop lookahead 與 API 範例見
+[DFN3 模型頁](html/ainr_dfn3.html)；下面原有的 DFN2 專節仍描述其 cascade/alpha。
 
 ```text
 _config_defaults(&cfg, io_mode[, delay_depth])
@@ -505,7 +510,7 @@ ulcnet_prepost_post_process(p, out_hop, &written);
   所以**所有遞迴 state 歸零**（冷啟動）、state generation 加一，framing／CCM ring 不前進、frame 維持開啟、回 `-1`（Align-ULCNet：key／value／logit 三個
   window 與 h_gru 共四個 state 全歸零；DeepFilterNet2：`h_gru` 與 pathway window 兩個遞迴張量；DeepVQE-S：16 個 state）。
   接著只有兩條路：`_frame_skip()`，或重新 `_frame_inputs()` 再從冷 state 跑一次加速器。
-- **commit 後面一定要有一次 `_frame_inputs()`**（`prepared` 閂鎖，三個類別皆然）：
+- **commit 前面一定要有一次 `_frame_inputs()`**（`prepared` 閂鎖，四個類別皆然）：
   沒跑過的加速器不能把沒被碰過的 buffer 當成結果送出。
 - **遞迴 state 的綁定。** 每個 state 張量在 pool 裡只有一個 buffer，位址在實例壽命內固定（沒有交替的 bank、沒有指標交換）。
   - **Align-ULCNet、DeepVQE-S、DFN2、GTCRN：就地綁定，沒有複製路徑。** runtime 把每個 `*_out`（C 端欄位名 `*_next`）綁到
@@ -696,12 +701,12 @@ int  dfn2_prepost_output_frame_index(const DFN2Prepost *p, long long *frame);
 | DeepFilterNet2 48 kHz | — | 246,320 | 219,536 |
 
 DeepVQE-S 的量體由 16 個 state 張量（每個一份 buffer）主宰。DeepFilterNet2 的 FREQ 比 TIME 小 26,784 bytes：
-`DFN2State` 不內嵌 analysis/window/synthesis 緩衝，TIME 另 carve 分析與合成兩個 audio_common 物件
+`DFN2State` 不內嵌 analysis/window/synthesis 緩衝，TIME 另 carve 分析與合成兩個 audiolib 物件
 （16,480 B 與 12,384 B），FREQ 只多 carve 雙輸入入口的第二組 staging（`apply_re`/`apply_im`）。
 
 ### 6.8 Framing：一 hop 一框的 analysis
 
-兩個 AIAEC 類別在 TIME 模式下的 analysis 是 audio_common `audio_stft.h` 的 `AcStft`，`center` = 0：
+兩個 AIAEC 類別在 TIME 模式下的 analysis 是 audiolib `audio_stft.h` 的 `AcStft`，`center` = 0：
 
 ```c
 void ulcnet_framing_config(AcStftConfig *cfg, FftHandle *fft, const float *window, int center);
@@ -774,15 +779,15 @@ config
 從 `SE/` 根目錄做參考建置：
 
 ```bash
-make -C audio_common lib BACKEND=kiss SIMD=0
-make -C AEC/c_impl  lib BACKEND=kiss SIMD=0
-make -C NR/c_impl   lib BACKEND=kiss SIMD=0
+make -C audiolib lib BACKEND=ne10 SIMD=0
+make -C AEC/c_impl  lib BACKEND=ne10 SIMD=0
+make -C NR/c_impl   lib BACKEND=ne10 SIMD=0
 ```
 
 ARM NEON 產品建置使用相同旗標：
 
 ```bash
-make -C audio_common lib BACKEND=ne10 SIMD=1
+make -C audiolib lib BACKEND=ne10 SIMD=1
 make -C AEC/c_impl  lib BACKEND=ne10 SIMD=1
 make -C NR/c_impl   lib BACKEND=ne10 SIMD=1
 ```
@@ -799,11 +804,11 @@ make -C AINR  lib ; make -C AINR  -s print-lib-path   # libainr_prepost.a
 
 兩者都落在自己 repo 的 `build/simd<N>-<sig>/` 下（`<sig>` 是各自 Makefile 的組態簽章 cksum：
 AIAEC 蓋 `CC`/`AR`/`CFLAGS`/`CPPFLAGS`/`SIMD`/`WERROR`，AINR 蓋 `CC`/`AR`/`CFLAGS`/`LDFLAGS`/
-`SIMD`/`SIMD_CPPFLAGS`/`BACKEND`/`WERROR`/`AC_LIB`；每個目錄另存 `config.manifest` 擋簽章碰撞），
+`SIMD`/`SIMD_CPPFLAGS`/`BACKEND`/`WERROR`/`COMMON_LIB`；每個目錄另存 `config.manifest` 擋簽章碰撞），
 所以路徑一律用 `print-lib-path` 取得。成員：`libaiaec_prepost.a` = `ulcnet_process`、
 `ulcnet_model_io`、`ulcnet_prepost`、`ulcnet_accelerator_adapter`、`aiaec_process`、
 `deepvqe_process`、`deepvqe_prepost`；`libainr_prepost.a` = `dfn2_process`、`dfn2_model_io`、
-`dfn2_prepost`、`gtcrn_process`。RNNoise-ERB **不在**任何 archive 裡（自己的 Makefile，
+`dfn2_prepost`、`dfn3_process`、`dfn3_model_io`、`dfn3_prepost`、`gtcrn_process`。RNNoise-ERB **不在**任何 archive 裡（自己的 Makefile，
 要用的板子把它的來源檔直接加進自己的 build）。`WERROR=1` 是 opt-in，且已納入組態簽章。
 
 消費端至少要帶：
@@ -814,7 +819,7 @@ AIAEC 蓋 `CC`/`AR`/`CFLAGS`/`CPPFLAGS`/`SIMD`/`WERROR`，AINR 蓋 `CC`/`AR`/`CF
 -fno-math-errno
 -I<AEC>/c_impl/include
 -I<NR>/c_impl/include
--I<audio_common>/include
+-I<audiolib>/common/include
 <libaec.a> <libanr.a> <libaudio_common.a> -lm
 ```
 

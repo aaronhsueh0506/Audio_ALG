@@ -102,7 +102,7 @@ buffer，一個 binary 固定一組 grid。`export_onnx.py` 的 `SUPPORTED_GRIDS
 C 端用 `make ULCNET_GRID=16k|48k` 選 grid（底層就是那兩個 `-D`），其餘
 （`HOP`/`BINS`/`TA_BINS`）全部由 `n_fft` 導出，沒有第二處需要改。`ULCNET_GRID`
 只套到 ULCNet 的 TU，並折進 pipeline 的 `CFG_SIG`，所以兩個 grid 不共用 object
-目錄，AEC/NR/audio_common 這些不含 ULCNet 程式碼的 producer 也不會跟著重建。
+目錄，AEC/NR/audiolib/common 這些不含 ULCNet 程式碼的 producer 也不會跟著重建。
 `make test-grids` 一次建置並測試兩個 grid。
 
 三件跨 grid 時會咬人的事：
@@ -160,7 +160,7 @@ C 端用 `make ULCNET_GRID=16k|48k` 選 grid（底層就是那兩個 `-D`），�
    AEC hop 與 NN hop 不同拍。
 2. **duty-cycle 數字已驗證**：0.3 s（16k/hop256 = 19 hops ≈ 304 ms）進
    duty、之後每 6 hops（96 ms）分析一次（`aec.c:1711-1741`）；
-   ring/decimator 每 hop 連續餵（`delay_aec3.c:1043-1046`）。
+   ring/decimator 每 hop 連續餵（`delay_aec.c:1256-1260`）。
 3. **ERLE 相關保護在本案組態下全部有效**（C/Python 一致，見下）。`enable_res=0 && return_res_context=1`（NN seam
    與 4ch pipeline 的實際組態）時：
    - windowed-ERLE duty watchdog 與 `delay_acquire_protect_converged`
@@ -305,7 +305,7 @@ flowchart TD
 - 超出支援範圍就不解，不把錯位 far 強制交給 NN。
 
 殘差預算（由 C 實作推得，Phase 0 實測確認）：delay 估計輸出的量化格是
-64 raw samples = 4 ms（histogram bin，`delay_aec3.c:831/839/1062`；ring
+64 raw samples = 4 ms（histogram bin，`delay_aec.c:989-1004/1068/1275`；ring
 讀取本身是 sample 級精確，`aec.c:1869`），加上恆正向的 headroom 32--92
 samples（見 4.1 節），LOCKED 穩態殘差上界約 < 10 ms，小於 1 個 frame。
 D=8（112 ms）對穩態約 10 倍裕度，D=4（48 ms）理論上也足夠——D 買的主要
@@ -322,11 +322,11 @@ fail-open 範圍（偵測現況見 5.1/8 節）。
 查證結果：保守 causal margin 不是待評估選項，而是現有 C 實作的既定行
 為，且方向一致地偏向「少補償」：
 
-- headroom：candidate lag 一律先減 32 raw samples（`delay_aec3.c:873-878`）；
-- floor 量化：histogram bin 用右移取整，恆不進位（`delay_aec3.c:772-773`
-  與 `:831/:839`）；
+- headroom：candidate lag 一律先減 32 raw samples（`delay_aec.c:1068`、`delay_aec.h:152`）；
+- floor 量化：histogram bin 用右移取整，恆不進位（`delay_aec.h:187-188`
+  與 `delay_aec.c:1013-1020`）；
 - pre-echo onset 偵測把 lag 拉往「最早能解釋回音」的 tap group，回傳值
-  恆不大於峰值 lag（`delay_aec3.c:469-481`）。
+  恆不大於峰值 lag（`delay_aec.c:1006-1037`）。
 
 合成效果：aligned far 恆比 matched filter 認定的回音路徑提早 32--92 raw
 samples（16 kHz 約 2--5.75 ms），殘差恆為正，causal attention（`d >= 0`）
@@ -335,7 +335,7 @@ samples（16 kHz 約 2--5.75 ms），殘差恆為正，causal attention（`d >= 
 
 僅存的負殘差風險是 matched filter 本身把 lag 估過大：直達路徑極弱、晚期
 反射主導、且 pre-echo 偵測尚未啟動（需要 >= 50 次更新，
-`delay_aec3.c:591-599`）時，2--5.75 ms 的 margin 可能被吃掉。這屬於
+`delay_aec.h:192`、`delay_aec.c:855-870`）時，2--5.75 ms 的 margin 可能被吃掉。這屬於
 Phase 0 量測要確認的邊角案例（負 offset 比例），不是主路徑設計問題。
 
 ## 5. AEC 對外介面提案
@@ -774,7 +774,7 @@ class 的 TIME 模式全走這個）從第一次推入起就固定一幀一次 i
 priming 例外。centered 分析（`center` 1，0/2/1 幀發射，priming 期間的
 第二次 push 會連續產生兩幀）不再有出貨 pipeline 呼叫，只剩
 Python parity gate 使用。（組幀實作已由 `ulcnet_process.c` 內的 `UlcnetAnalysis`／`UlcnetSynthesis`
-換成 audio_common 的 `AcStft`／`AcIstft`，函式名稱見 `ulcnet_framing_config()`；本節其餘敘述是當時的紀錄。）model graph 不收 PCM、不包 STFT/WOLA、不包 PBFDKF
+換成 audiolib 的 `AcStft`／`AcIstft`，函式名稱見 `ulcnet_framing_config()`；本節其餘敘述是當時的紀錄。）model graph 不收 PCM、不包 STFT/WOLA、不包 PBFDKF
 或 delay state machine。
 
 ### 10.2 ONNX input/output contract（方案 B）
@@ -884,7 +884,7 @@ identity reprime。
 
 本專案交付：
 
-- `ulcnet_process.c/.h`：`ulcnet_framing_config()` 描述 audio_common 的 sqrt-Hann `AcStft`／`AcIstft`
+- `ulcnet_process.c/.h`：`ulcnet_framing_config()` 描述 audiolib 的 sqrt-Hann `AcStft`／`AcIstft`
   （RI frame）。兩種 analysis 排程：`center` 1（centered、0/2/1 出幀排程，
   不再有出貨 pipeline 呼叫，只剩 Python parity gate 使用）與
   `center` 0（rolling、每次推入固定出一幀，與同一 hop 的 centered
@@ -1001,7 +1001,7 @@ v5 起由 `ulcnet_model_io_prepare()`/`ulcnet_model_io_commit()` 以 host fp32
 
 - AEC exposed aligned far 與 PBFDKF consumed far 同 hop、同 samples。
 - reset/delay change後不讀 stale context/state。
-- scalar/NEON 與 KISS/NE10 適用路徑全部測試。
+- scalar/NEON 適用路徑全部測試。
 - full-utterance vs streaming comparison 明確說明 bit-exact 或 tolerance；
   不可只看 finite。
 - PyTorch/export/board tensor逐層 max/RMS error。

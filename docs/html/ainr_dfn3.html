@@ -1,0 +1,50 @@
+<!doctype html>
+<html lang="zh-Hant"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>AINR DeepFilterNet3</title>
+<style>body{font:15px/1.55 system-ui,sans-serif;max-width:1000px;margin:2rem auto;padding:0 1rem;color:#222}nav a{margin-right:.7rem}table{border-collapse:collapse;width:100%;margin:1rem 0}th,td{border:1px solid #bbb;padding:.45rem;text-align:left;vertical-align:top}code,pre{background:#f3f3f3}pre{padding:.8rem;overflow:auto}</style></head><body>
+<nav><a href="index.html">索引</a><a href="conventions.html">慣例</a><a href="onnx_prepost.html">ONNX 邊界</a><a href="ainr_dfn2.html">DFN2</a><a href="../../../audiolib/common/docs/html/audio_common.html">audiolib</a></nav>
+<h1>DeepFilterNet3：raw 低頻 DF / 高頻 ERB split</h1>
+<h2>概要</h2>
+<p>本機 DFN3 是 48 kHz 單路降噪模型，FFT/window/hop = 1024/1024/512，32 ERB bands、96 個低頻 DF bins、5 個複數 taps。低頻直接濾原始 noisy 頻譜，高頻乘 ERB gain；沒有 alpha 混合輸出。DFN2 的產品 pipeline 仍使用 DFN2，切換模型須另外整合與使用相容權重。</p>
+<h2>API 用法</h2>
+<pre>DFN3PrepostConfig cfg;
+dfn3_prepost_config_defaults(&amp;cfg, DFN3_IO_FREQ);
+cfg.erb_fwd = fwd;  /* bin-major [513][32] */
+cfg.erb_inv = inv;  /* band-major [32][513] */
+/* get_mem_size -> caller block aligned to req.alignment -> init_ex */
+int n = dfn3_prepost_pre_process_freq(p, re, im);
+if (n == 1) {
+    dfn3_prepost_frame_inputs(p, &amp;inputs, &amp;outputs);
+    /* runtime: read state inputs before writing same-address state outputs */
+    if (accelerator_run(&amp;inputs, &amp;outputs) != 0 ||
+        dfn3_prepost_frame_commit(p) != 0)
+        dfn3_prepost_frame_skip(p);
+}
+dfn3_prepost_post_process_freq(p, out_re, out_im, &amp;valid);</pre>
+<p>FREQ 入口不做 transform，頻譜為 sqrt-Hann STFT 的 normalized=True 尺度（1/32）。TIME 入口使用相同生命週期，改呼叫 <code>pre_process</code>/<code>post_process</code>，並借入可用的 FFT handle。ERB 矩陣由 <code>export_erb_matrix.py --runtime-bins</code> 產生。每個 init/create 皆先查 fresh memory descriptor；process 不配置 heap。</p>
+<h2>Block diagram</h2>
+<pre>caller hop / normalized spectrum
+  -> dfn3_prepost_pre_process[_freq] -> features + [t-1,t,t+1] host window
+  -> stateless graph: erb_mask, df_coefs, next states
+  -> dfn3_compose_stream
+       low bins 0..95: DF(raw spectra)
+       high bins 96..512: raw target * ERB gain
+  -> attenuation limit -> output spectrum
+  -> TIME only: audiolib AcIstft -> one hop</pre>
+<h2>訊號泳道圖</h2>
+<pre>current input frame     0             1                2
+host feature window     [0,0,F0]       [0,F0,F1]        [F0,F1,F2]
+graph invocation        none          heads[0]          heads[1]
+compose output          invalid       spectrum[0]       spectrum[1]
+TIME synthesis          silence       first WOLA hop    next WOLA hop</pre>
+<h2>I/O 表</h2>
+<p>所有 graph tensors 為 float32，以下是單路 batch-1 部署 shape。每次 invocation 產生一個目標 frame（512 samples / 10.67 ms 的 hop）；三幀 feature window 由 host 保存。</p>
+<table><tr><th>方向</th><th>名稱</th><th>Shape</th></tr><tr><td>input</td><td>erb</td><td>[1,1,3,32]</td></tr><tr><td>input</td><td>spec</td><td>[1,2,3,96]</td></tr><tr><td>input / output</td><td>h_gru / h_gru_out</td><td>[1,5,1,256]</td></tr><tr><td>input / output</td><td>df_convp_history / df_convp_history_out</td><td>[1,64,5,96]</td></tr><tr><td>output</td><td>erb_mask</td><td>[1,1,1,32]</td></tr><tr><td>output</td><td>df_coefs</td><td>[1,1,96,10]；bin/tap/re-im</td></tr></table>
+<h2>State 表</h2>
+<table><tr><th>跨 hop 狀態</th><th>Shape / 大小</th><th>保存者</th></tr><tr><td>GRU hidden</td><td>1280 floats = 5120 bytes</td><td>host pool；graph input/output 同位址</td></tr><tr><td>DF pathway window</td><td>30720 floats = 122880 bytes</td><td>host pool；graph 內 Slice/Concat 更新</td></tr><tr><td>feature windows</td><td>ERB 96 floats、complex 576 floats</td><td>C host 滑動，runtime 唯讀</td></tr><tr><td>normalizers、raw spectrum rings、framing/OLA</td><td>依 dfn3_process.h / fresh pool query</td><td>C host；不進 graph</td></tr></table>
+<p><code>DFN3_MODEL_IO_LAYOUT_VERSION = 9</code>；DFN2 layout 8 不相容。單路 C descriptor 不能拿 batch-N graph 代替。init generation 為 1，reset 與被拒的 commit 會清零兩個 recurrent state 並增加 generation；runtime 必須同步重填自己的量化 state。</p>
+<h2>延遲與 warm-up</h2>
+<p>mask/DF lookahead = 1/1，兩條路平行，模型需等 1 hop。TIME identity 路徑再加 WOLA，位移為 1024 samples = 2 hops = 21.33 ms（不含推論時間或外部排隊）。第一 hop pre_process 回 0，其後每 hop 回 1；skip 使用 unit 高頻 gain 和 unit current DF tap，維持相同時序。有限 clip 的精確尾端應補模型 feature 的零 padding；持續餵零音訊只是在延續 live stream。</p>
+<h2>相關檔案與測試</h2>
+<ul><li>AINR/DeepFilterNet3/model.py、train.py、export_onnx.py、inference.py、export_erb_matrix.py</li><li>AINR/DeepFilterNet3/dfn3_process.c/.h、dfn3_model_io.c/.h、dfn3_prepost.c/.h</li><li>AINR/DeepFilterNet3/tests/test_dfn3_contract.py</li><li>AINR/tests/test_dfn_comparison.py、test_dfn3_stream.c、test_dfn3_stream_c.py、test_dfn3_prepost_c.py</li></ul>
+<p><a href="../../AINR/DeepFilterNet3/README.md">模型指令與 checkpoint 合約</a>；<a href="../../AINR/CHANGELOG.md">還原驗證紀錄</a>。來源與 parity 驗證支持介面與算術一致性；降噪品質需用相容訓練權重另行量測。</p>
+</body></html>

@@ -96,6 +96,17 @@ static void test_derive_fields(void) {
           a.enable_delay_est == 0, "fixed passthrough");
     CHECK(a.min_gain_floor_far_active_db == preset.min_gain_floor_far_active_db, "aggressive preset applied");
 
+    r.aec_preset = AEC_PRESET_NO_FLOOR;
+    CHECK(se_derive(&r, &mono, &g, &a) == 0, "mono derive no_floor");
+    aec_config_from_preset(&preset, AEC_PRESET_NO_FLOOR, 16000);
+    CHECK(a.min_gain_floor_far_active_db == preset.min_gain_floor_far_active_db &&
+          a.min_gain_floor_dt_db == preset.min_gain_floor_dt_db &&
+          a.min_gain_split_floor_enabled == preset.min_gain_split_floor_enabled &&
+          a.min_gain_split_floor_enabled == 0,
+          "no_floor preset applied, gate disabled, matches aec_config_from_preset() byte-for-byte "
+          "(the same values the old BALANCED-construct + aec_res_set_preset(NO_FLOOR) runtime "
+          "retarget workaround converged to)");
+
     {   /* lane aligned: the request's delay settings do not reach the AEC */
         SeRules four = four_channel_rules(1);
         SeRequest q = base_request(48000);
@@ -137,8 +148,11 @@ static void test_derive_rejects(void) {
           "NULL arguments");
 
     r = base_request(16000);
-    r.aec_preset = (AecPreset)3;
-    CHECK(se_derive(&r, &mono, &g, &a) == -1, "preset 3");
+    r.aec_preset = AEC_PRESET_NO_FLOOR;   /* value 3: in range now, must be accepted */
+    CHECK(se_derive(&r, &mono, &g, &a) == 0, "preset NO_FLOOR accepted at construction");
+    CHECK(a.min_gain_split_floor_enabled == 0, "NO_FLOOR construction disables the split floor gate");
+    r.aec_preset = (AecPreset)4;
+    CHECK(se_derive(&r, &mono, &g, &a) == -1, "preset 4 (past NO_FLOOR, still out of range)");
     r.aec_preset = (AecPreset)-1;
     CHECK(se_derive(&r, &mono, &g, &a) == -1, "preset -1");
     r = base_request(16000);

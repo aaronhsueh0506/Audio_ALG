@@ -4,11 +4,11 @@
 > each component README and header; resolved findings in this snapshot are not
 > current setup instructions.
 
-Scope: `audio_common`, `AEC`, `NR`, `Audio_ALG/pipelines` under `SE/`. Written from the code as it stands as of 2026-08-03 (dated comments below are the *files'* own dates, not claims about when this doc was written).
+Scope: `audiolib`, `AEC`, `NR`, `Audio_ALG/pipelines` under `SE/`. Written from the code as it stands as of 2026-08-03 (dated comments below are the *files'* own dates, not claims about when this doc was written).
 
 ---
 
-## 1. `audio_common` — shared DSP infrastructure
+## 1. `audiolib` — shared DSP infrastructure
 
 ### Purpose
 
@@ -46,7 +46,7 @@ fft_inverse(fft, spec, time_out);
 fft_destroy(fft);
 ```
 
-`fft_phase()` / `fft_from_mag_phase()` are declared and implemented in both backends but have **no caller anywhere in AEC/NR/Audio_ALG/audio_common** today.
+`fft_phase()` / `fft_from_mag_phase()` are declared and implemented in both backends but have **no caller anywhere in AEC/NR/Audio_ALG/audiolib/common** today.
 
 **Resampler** (`include/audio_resampler.h`):
 
@@ -181,7 +181,6 @@ CLI: `bin/aec_wav mic.wav ref.wav out.wav --preset {mild|balanced|aggressive} [-
 
 ### Known limitations / gaps
 
-- `reverb_decay_estimator.c` is the sole remaining `double`-typed C file post-float32-campaign, and it is dead code with no production caller.
 - The NE10 embedded backend and the KISS host/reference backend are byte-equal to *themselves* (static pool == heap path) but not bit-identical to *each other* — documented as pre-existing/expected.
 - **Resolved 2026-08-03** (kept here for context, not an open item): the Python delay estimator (`modules/delay/echo_path_delay_estimator.py`) previously lacked a 48kHz anti-alias sidechain, causing Python and C to lock onto different delay estimates at 48kHz and fail `parity_aec_e2e` (max diff 0.46 vs 0.1 tolerance). Ported C's `DaResample48` filter to Python as `_Resample48` (same coefficients, verified sample-for-sample against C to float32 precision); `ClockdriftDetector`/`MatchedFilterLagAggregator` now use the effective post-sidechain rate rather than the raw native rate. `parity_aec_e2e` now passes at all three rates (48kHz max diff 3.9e-2, within the 1.0e-1 tolerance and back in the class of the originally-calibrated 6.4e-2 baseline).
 - **Resolved 2026-08-03** (kept here for context, not an open item): the 4-channel pipeline's own `SharedMatchedDelayEstimator` (`Audio_ALG/pipelines/4ch_pipelines/pipeline.py`) used to do its own separate, naive stride-pick 48kHz decimation ahead of this estimator, hardcoding the inner estimator to `sample_rate=16000` and manually rescaling the returned delay — the fix above did not automatically extend to it. Refactored to match the same fix applied to `delay_aec3.c`'s `DaResample48` (2026-08-02) and this estimator's `_Resample48` (above): the inner `LegacyDelayShim` is now constructed at the wrapper's TRUE native `sample_rate` and fed raw, un-decimated hops; `EchoPathDelayEstimator` anti-alias-filters + decimates + rescales internally. See `pipelines/4ch_pipelines/test_pipeline.py`'s standalone-script verification for before/after accuracy.

@@ -80,12 +80,11 @@
  *      infer frozen for exactly those frames and resuming right after, one
  *      model->reset per generation.
  *
- * Build (from pipelines/): `make test` (ne10 default; BACKEND=kiss for the
- * portable reference). Standalone (kiss reference variant shown):
+ * Build (from pipelines/): `make test`. Standalone:
  *   cc -O2 -std=gnu99 -ffp-contract=off -I. -I../lib/aec/c_impl/include \
- *      -I../lib/aec/c_impl/example -I../../audio_common/include \
- *      -I../../audio_common/lib/kiss_fft -I../AIAEC/Align_ULCNet \
- *      -DAUDIO_PIPELINE_BACKEND_STR=\"kiss\" \
+ *      -I../lib/aec/c_impl/example -I../../audiolib/common/include \
+ *      -I../AIAEC/Align_ULCNet \
+ *      -DAUDIO_PIPELINE_BACKEND_STR=\"ne10\" \
  *      tests/test_audio_pipeline_ulcnet.c audio_pipeline_ulcnet.c \
  *      ../AIAEC/Align_ULCNet/ulcnet_process.c \
  *      <libaec.a> <libaudio_common.a> -lm -o /tmp/tapu && /tmp/tapu
@@ -135,7 +134,7 @@ static const char* fmt_msg(const char* fmt, ...) {
     return g_msgbuf;
 }
 
-/* DelayAec3 searches a 16 kHz-equivalent sidechain and scales the selected
+/* DelayAec searches a 16 kHz-equivalent sidechain and scales the selected
  * delay back to native samples. Test stimuli and bounds therefore scale by
  * exactly three on the 48 kHz product grid. */
 #define DELAY_RATE_FACTOR (ULCNET_SR / 16000)

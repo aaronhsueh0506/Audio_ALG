@@ -3,15 +3,12 @@
 #include <math.h>
 #include <string.h>
 
-#include "simd_kernel_nn.h"
+#include "utility/simd_kernel_nn.h"
 
-#if defined(__aarch64__) && defined(__ARM_NEON) && \
-    !defined(SIMD_KERNELS_FORCE_SCALAR)
+#if SK_HAVE_NEON
 #include <arm_neon.h>
-#define DF_COMMON_HAVE_NEON 1
-#else
-#define DF_COMMON_HAVE_NEON 0
 #endif
+#define DF_COMMON_HAVE_NEON SK_HAVE_NEON
 
 void gtcrn_framing_config(AcStftConfig* cfg, FftHandle* fft,
                           const float* window)
@@ -36,62 +33,40 @@ void gtcrn_process_init(GTCRNProcessState* state, AcStft* stft,
  * SIMD=0 build; a NEON build keeps it only for the differential test. */
 #define GTCRN_TWIN static inline __attribute__((unused))
 
-/* Band one already-computed full-band channel: low bins pass through, the
- * high 192 bins accumulate into 64 bands via the committed forward table
- * (bin-major, so the inner loop runs contiguously over bands). */
+/* Keep low bins unchanged; band the high bins with the shared scalar
+ * kernel. Each band accumulates bins in ascending order with unfused
+ * multiply/add, matching the model's committed forward table. */
 GTCRN_TWIN void erb_band_channel_scalar(const float* full,
                                         const float* erb_fwd, float* banded)
 {
     for (int k = 0; k < GTCRN_MODEL_ERB_KEPT; ++k) banded[k] = full[k];
-    for (int b = 0; b < GTCRN_MODEL_ERB_HIGH_BANDS; ++b)
-        banded[GTCRN_MODEL_ERB_KEPT + b] = 0.0f;
-    for (int k = 0; k < GTCRN_MODEL_ERB_HIGH_BINS; ++k) {
-        float value = full[GTCRN_MODEL_ERB_KEPT + k];
-        const float* row = erb_fwd + (size_t)k * GTCRN_MODEL_ERB_HIGH_BANDS;
-        float* out = banded + GTCRN_MODEL_ERB_KEPT;
-        for (int b = 0; b < GTCRN_MODEL_ERB_HIGH_BANDS; ++b)
-            out[b] += row[b] * value;
-    }
+    skn_erb_band_accumulate_f32_scalar(full + GTCRN_MODEL_ERB_KEPT, erb_fwd,
+                                       GTCRN_MODEL_ERB_HIGH_BINS,
+                                       GTCRN_MODEL_ERB_HIGH_BANDS,
+                                       banded + GTCRN_MODEL_ERB_KEPT);
 }
 
 #if DF_COMMON_HAVE_NEON
-/* Quads of bands (resp. bins) whose sums stay in registers across one pass. */
-#define ERB_BAND_QUADS 4
+/* Quads of bins the mask-expansion kernel below keeps in registers. */
 #define MASK_BIN_QUADS 8
-_Static_assert(GTCRN_MODEL_ERB_HIGH_BANDS % (4 * ERB_BAND_QUADS) == 0,
-               "the band blocks tile the high bands");
 _Static_assert(GTCRN_MODEL_ERB_HIGH_BINS % (4 * MASK_BIN_QUADS) == 0,
                "the bin blocks tile the high bins");
 
-/* The three channels in one pass over the forward table. Each band's sum
- * stays in a register while the bins run in ascending order, the scalar
- * twin's addition order per band. */
+/* Fuse the three channels into one table pass for throughput. Each
+ * channel/band keeps its own accumulator in ascending-bin, unfused order;
+ * the shared kernel documents the register-block performance constraint. */
 static inline void erb_band3_neon(const float* const full[3],
                                   const float* erb_fwd, float* const banded[3])
 {
-    for (int c = 0; c < 3; ++c)
+    const float* x3[3];
+    float* b3[3];
+    for (int c = 0; c < 3; ++c) {
         memcpy(banded[c], full[c], GTCRN_MODEL_ERB_KEPT * sizeof(float));
-    for (int b0 = 0; b0 < GTCRN_MODEL_ERB_HIGH_BANDS; b0 += 4 * ERB_BAND_QUADS) {
-        float32x4_t acc[3][ERB_BAND_QUADS];
-        for (int c = 0; c < 3; ++c)
-            for (int q = 0; q < ERB_BAND_QUADS; ++q)
-                acc[c][q] = vdupq_n_f32(0.0f);
-        for (int k = 0; k < GTCRN_MODEL_ERB_HIGH_BINS; ++k) {
-            const float* row =
-                erb_fwd + (size_t)k * GTCRN_MODEL_ERB_HIGH_BANDS + b0;
-            for (int c = 0; c < 3; ++c) {
-                const float32x4_t v =
-                    vdupq_n_f32(full[c][GTCRN_MODEL_ERB_KEPT + k]);
-                for (int q = 0; q < ERB_BAND_QUADS; ++q)
-                    acc[c][q] = vaddq_f32(
-                        acc[c][q], vmulq_f32(vld1q_f32(row + 4 * q), v));
-            }
-        }
-        for (int c = 0; c < 3; ++c)
-            for (int q = 0; q < ERB_BAND_QUADS; ++q)
-                vst1q_f32(banded[c] + GTCRN_MODEL_ERB_KEPT + b0 + 4 * q,
-                          acc[c][q]);
+        x3[c] = full[c] + GTCRN_MODEL_ERB_KEPT;
+        b3[c] = banded[c] + GTCRN_MODEL_ERB_KEPT;
     }
+    skn_erb_band_accumulate_nch_f32(x3, 3, erb_fwd, GTCRN_MODEL_ERB_HIGH_BINS,
+                                    GTCRN_MODEL_ERB_HIGH_BANDS, b3);
 }
 #endif
 

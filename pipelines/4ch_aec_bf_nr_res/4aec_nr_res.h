@@ -3,9 +3,9 @@
  *
  * Four-microphone linear-AEC front end with one shared far aligner.
  *
- * The external owner supplies SRP-PHAT/GSC. This module owns:
+ * The external owner supplies SRP-PHAT/BF. This module owns:
  *
- *   1 shared DelayAec3 matcher
+ *   1 shared DelayAec matcher
  *   4 independent linear AEC adaptive filters
  *   the coherent projection of the four lane contexts onto one mono frame
  *
@@ -16,8 +16,8 @@
  * (pipelines/common/se_stage.h). Per hop:
  *
  *   four_aec_front_process()   shared delay + four linear AEC lanes; the lane
- *                              spectra go to the external SRP-PHAT/GSC
- *   (SRP-PHAT, GSC)            effective weights and the beamformed error
+ *                              spectra go to the external SRP-PHAT/BF
+ *   (SRP-PHAT, BF)            effective weights and the beamformed error
  *   four_aec_fuse()            project near / R^2 / comfort noise with those
  *                              weights -> SeSpecFrame
  *   stages                     se_res_stage_gain(), se_anr_stage_gain(), ...
@@ -78,9 +78,8 @@ extern "C" {
  * stages are carved by the application, not here. Any change of pool size,
  * carve order or descriptor content bumps it. Query a fresh descriptor for
  * every build; do not persist or synthesize one from this version number. */
-#define FOUR_AEC_NR_RES_LAYOUT_VERSION 20u
-#define FOUR_AEC_NR_RES_BACKEND_KISS 1u
-#define FOUR_AEC_NR_RES_BACKEND_NE10 2u
+#define FOUR_AEC_NR_RES_LAYOUT_VERSION 21u
+#define FOUR_AEC_NR_RES_BACKEND_NE10 2u   /* backend_id 1 is retired, never returned */
 
 /**
  * Fixed-width descriptor for a caller-owned static-memory pool.
@@ -203,14 +202,14 @@ typedef struct FourAecNrResConfig {
      * caller who never asked for that.
      *
      * 0.0 (the default) = full rate, no decimation -- matching lib/aec's own
-     * default since AMEND_35 (2026-10-18; delay_est_period_s defaulting to
-     * 0.5 could make the matched filter settle on a different lag than
-     * Python's always-full-rate reference, not merely settle on it slower).
+     * default (a throttled default can make the matched filter settle on a
+     * different lag than Python's always-full-rate reference, not merely
+     * settle on it slower).
      * A positive value opts back into the throttle for an embedded
      * deployment that wants the compute saving (measured 17.0->4.3 us/hop
-     * for the shared delay stage, see commit 07a51b1) and accepts that
-     * parity cost. Range-checked like delay_backward_quarantine_s (finite,
-     * [0, 3600]), mirroring lib/aec's own AEC_CK_RANGE_F bound. */
+     * for the shared delay stage) and accepts that parity cost.
+     * Range-checked like delay_backward_quarantine_s (finite, [0, 3600]),
+     * mirroring lib/aec's own AEC_CK_RANGE_F bound. */
     float delay_est_period_s;
     float max_delay_ms;           /* MATCHED reference delay-line capacity   */
     AecPreset aec_preset;
@@ -302,7 +301,7 @@ typedef struct FourAecFront {
 
     /**
      * The exact linear-AEC error spectra of this hop, one per channel
-     * (n_freqs bins, audio scale). An external SRP-PHAT/GSC consumes these
+     * (n_freqs bins, audio scale). An external SRP-PHAT/BF consumes these
      * instead of performing a duplicate STFT.
      */
     const Complex* linear_spectra[FOUR_AEC_NR_RES_CHANNELS];
@@ -429,7 +428,7 @@ int four_aec_front_process(
  * g_res_ctx is NULL (the lanes compute no gain of their own).
  *
  * beamformed_error is the mono error spectrum produced by the SAME external
- * beamformer invocation as `weights` (the bundled gsc_process_with_weights()
+ * beamformer invocation as `weights` (the bundled bf_process_with_weights()
  * returns both atomically). Both arrays are checked for finite values, but
  * their semantic equality cannot be inferred from samples alone and is a
  * caller contract. Pass NULL to have the error reconstructed from `weights`;
@@ -459,8 +458,11 @@ int four_aec_fuse(
  * The configurations the application's own post-beam stages need, derived on
  * the core's grid exactly as the core derived its lane configuration: res_cfg
  * sizes and initialises the AecRes (aec_res_get_mem_size / aec_res_init) and
- * nr_cfg the denoiser (se_anr_stage_mem_size / se_anr_stage_init). Returns 0,
- * or -1 for a NULL argument or a config the core would reject.
+ * nr_cfg the denoiser (se_anr_stage_mem_size / se_anr_stage_init). With
+ * cfg->enable_nr = 0 no denoiser is configured: *nr_cfg is zeroed (the
+ * all-zero AnrConfig, which se_anr_stage_mem_size() sizes as 0) and must not
+ * be used. Returns 0, or -1 for a NULL argument or a config the core would
+ * reject.
  */
 int four_aec_nr_res_stage_configs(
     const FourAecNrResConfig* cfg,
@@ -519,12 +521,15 @@ int four_aec_nr_res_linear_aec_count(const FourAecNrRes* p);
  * recomputing it (aec_process_context_shared_far()) -- so this total
  * increments by exactly 1 per four_aec_front_process() call, not 4.
  * Intended for tests/instrumentation proving the cross-lane far-FFT
- * sharing is genuinely active; has no effect on any processing. */
+ * sharing is active. The total saturates at LONG_MAX. Once a lane's counter
+ * is saturated, internal provenance checks use the full spectrum comparison
+ * instead of inferring a per-hop delta; borrow/history calls are unchanged. */
 long four_aec_nr_res_far_fft_real_compute_count(const FourAecNrRes* p);
 
 /* Realign instrumentation, read-only and cumulative since construction or the
  * last four_aec_nr_res_reset(): how the four lanes'
  * aec_apply_external_realign() calls landed.
+ * The cumulative counters saturate at LONG_MAX.
  * Every hop that publishes `changed` sweeps all four lanes, so
  * the pair grows by exactly 4 on such a hop and not at all otherwise -- warm
  * (returned 1) means the learned IR was shifted and cancellation survived the
@@ -603,7 +608,7 @@ int four_aec_nr_res_get_mem_breakdown(
  *   linear_us    summed over the four lanes: each lane's main adaptive
  *                filter, including the far-end FFT on the lane that computes
  *                it (lanes 1-3 borrow it and pay less here).
- *   lane_res_us  summed over the four lanes: each lane's AEC3 post/RES block,
+ *   lane_res_us  summed over the four lanes: each lane's AEC post/RES block,
  *                which runs because the lanes set return_res_context even
  *                though no lane applies a gain.
  *   fuse_us      four_aec_fuse(): the beamformer-weighted projection of the

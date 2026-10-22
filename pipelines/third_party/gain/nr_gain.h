@@ -47,8 +47,6 @@ NrGain* nr_gain_create(void);
 size_t  nr_gain_get_mem_size(void);
 NrGain* nr_gain_init(void* mem, size_t mem_size);
 
-void    nr_gain_reset(NrGain* ng);
-
 /* Advances the smoothed gain one hop and scales `x` in place by it. Returns
  * the gain that was applied. `x` may be NULL (or `n` <= 0) to advance the
  * smoother without touching a signal. */

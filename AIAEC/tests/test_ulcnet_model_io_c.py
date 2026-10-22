@@ -9,8 +9,9 @@ import pytest
 
 _THIS_DIR = os.path.dirname(os.path.abspath(__file__))
 _ULCNET_DIR = os.path.join(os.path.dirname(_THIS_DIR), 'Align_ULCNet')
-_AC_INCLUDE = os.path.abspath(os.path.join(
-    _THIS_DIR, '..', '..', '..', 'audio_common', 'include'))
+_AC_DIR = os.path.abspath(os.path.join(
+    _THIS_DIR, '..', '..', '..', 'audiolib', 'common'))
+_AC_INCLUDE = os.path.join(_AC_DIR, 'include')
 
 _DRIVER = r'''
 #include <math.h>
@@ -472,7 +473,7 @@ def test_ulcnet_model_io_external_state_contract(
         '-Wall', '-Wextra', '-Wpedantic', '-Werror',
         '-DULCNET_MODEL_IO_SR=%d' % sample_rate,
         '-DULCNET_MODEL_IO_N_FFT=%d' % n_fft,
-        '-I', _ULCNET_DIR, '-I', _AC_INCLUDE,
+        '-I', _ULCNET_DIR, '-I', _AC_INCLUDE, '-I', _AC_DIR,
         str(driver), os.path.join(_ULCNET_DIR, 'ulcnet_model_io.c'),
         '-lm', '-o', str(executable),
     ], check=True, capture_output=True)

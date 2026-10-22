@@ -5,8 +5,8 @@
 #include <stdlib.h>
 #include <string.h>
 
-#include "mem_align.h"
-#include "simd_kernels.h"
+#include "utility/mem_align.h"
+#include "utility/simd_kernels.h"
 
 struct FixGain {
     int channels;

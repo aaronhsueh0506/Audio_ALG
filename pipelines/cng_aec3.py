@@ -4,7 +4,7 @@ Both C pipelines (``mono_aec_nr_res/audio_pipeline.c`` and
 ``4ch_aec_bf_nr_res/4aec_nr_res.c``) fill the residual-suppressed bins through
 ``aec_cng_fill`` (``lib/aec/c_impl/include/aec_res.h``) with comfort noise drawn
 from one multiplicative-congruential step per bin whose top five bits index
-``AEC3B_SQRT2_SIN_LUT`` (``lib/aec/c_impl/include/aec3_balanced_config.h``), the
+``AECB_SQRT2_SIN_LUT`` (``lib/aec/c_impl/include/aec_balanced_config.h``), the
 imaginary part reading a quarter turn (+8 of 32) ahead of the real one.  This
 module reproduces that generator exactly so a Python reference can be compared
 with the C output with comfort noise ON.
@@ -21,7 +21,7 @@ import numpy as np
 #: ``AUDIO_PIPELINE_RNG_SEED`` in both C pipelines.
 SEED = 0x9E3779B9
 
-#: The 32 float32 literals of ``AEC3B_SQRT2_SIN_LUT``: sqrt(2) * sin(2*pi*i/32).
+#: The 32 float32 literals of ``AECB_SQRT2_SIN_LUT``: sqrt(2) * sin(2*pi*i/32).
 #: Copied as literals (index 16 is 1.73191212e-16, not 0) so the table is the
 #: same bits the C reads.
 LUT = np.array(

@@ -18,8 +18,8 @@
 #include "dfn_unit_partition.h"
 #include "tests/dfn_test_fixture.h"
 #include "common/se_anr_stage.h"
-#include "mem_align.h"
-#include "simd_kernels.h"
+#include "utility/mem_align.h"
+#include "utility/simd_kernels.h"
 
 static int g_fail = 0;
 #define CHECK(cond, msg) do { \

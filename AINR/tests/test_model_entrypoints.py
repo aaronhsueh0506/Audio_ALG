@@ -23,22 +23,22 @@ def _help(model, script, *arguments):
     assert 'usage:' in result.stdout.lower()
 
 
-@pytest.mark.parametrize('model', ('RNNoise-ERB', 'DeepFilterNet2', 'GTCRN'))
+@pytest.mark.parametrize('model', ('RNNoise-ERB', 'DeepFilterNet2', 'DeepFilterNet3', 'GTCRN'))
 def test_inference_help_runs_from_model_directory(model):
     _help(model, 'inference.py')
 
 
-@pytest.mark.parametrize('model', ('DeepFilterNet2', 'GTCRN'))
+@pytest.mark.parametrize('model', ('DeepFilterNet2', 'DeepFilterNet3', 'GTCRN'))
 def test_calibration_help_runs_from_model_directory(model):
     _help(model, 'inference.py', 'calib')
 
 
-@pytest.mark.parametrize('model', ('RNNoise-ERB', 'DeepFilterNet2', 'GTCRN'))
+@pytest.mark.parametrize('model', ('RNNoise-ERB', 'DeepFilterNet2', 'DeepFilterNet3', 'GTCRN'))
 def test_export_help_runs_from_model_directory(model):
     _help(model, 'export_onnx.py')
 
 
-@pytest.mark.parametrize('model', ('RNNoise-ERB', 'DeepFilterNet2', 'GTCRN'))
+@pytest.mark.parametrize('model', ('RNNoise-ERB', 'DeepFilterNet2', 'DeepFilterNet3', 'GTCRN'))
 def test_exporter_does_not_import_from_audio_alg_parent(model):
     """AINR exporters must remain usable when AINR is released alone."""
     source = (AINR_ROOT / model / 'export_onnx.py').read_text()

@@ -14,9 +14,9 @@ from pipelines.cng_aec3 import LUT, SEED, Aec3ComfortNoise, lcg_step  # noqa: E4
 
 def _c_lut_literals():
     header = (ROOT / 'lib' / 'aec' / 'c_impl' / 'include'
-              / 'aec3_balanced_config.h').read_text(encoding='utf-8')
-    match = re.search(r'AEC3B_SQRT2_SIN_LUT\[32\]\s*=\s*\{([^}]*)\}', header)
-    assert match, 'AEC3B_SQRT2_SIN_LUT not found in the AEC header'
+              / 'aec_balanced_config.h').read_text(encoding='utf-8')
+    match = re.search(r'AECB_SQRT2_SIN_LUT\[32\]\s*=\s*\{([^}]*)\}', header)
+    assert match, 'AECB_SQRT2_SIN_LUT not found in the AEC header'
     values = [float(v.strip().rstrip('f')) for v in match.group(1).split(',')]
     return np.array(values, dtype=np.float32)
 

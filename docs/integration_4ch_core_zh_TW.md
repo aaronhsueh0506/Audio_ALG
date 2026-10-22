@@ -10,8 +10,8 @@ pipeline，請看 `docs/integration_4ch_spatial_zh_TW.md`。
 頻域 stage 串接的總覽（任何 pipeline 都適用）見 `pipelines/README.md` 的 Call flow。
 
 > **路徑慣例**：本文所有路徑都相對於 Audio_ALG repository 根目錄。
-> `audio_common` 是與 Audio_ALG 平行的另一個 checkout，本文寫成 `<audio_common>/`；
-> 從 `pipelines/4ch_aec_bf_nr_res/` 出發的相對路徑是 `../../../audio_common`。
+> `audiolib` 是與 Audio_ALG 平行的另一個 checkout，本文寫成 `<audiolib>/`；
+> 從 `pipelines/4ch_aec_bf_nr_res/` 出發的相對路徑是 `../../../audiolib/common`。
 >
 > **數值來源**：本文所有數字都是從當前 source 讀出，或以當前 checkout 實際建置後量測。
 > 記憶體數字**必須**用 API 重新查詢，不要抄本文（見 §4.6）。
@@ -56,11 +56,11 @@ denoiser（`AnrDenoiser`）與最終 iFFT/OLA（`AcIstft`）**不在**前端內�
 ```
 
 一行就夠前端本身用。它自己會拉進 `aec.h`、`anr.h` 與 `common/se_stage.h`（`SeSpecFrame`）。
-要串後級 stage 時另外 include `common/se_anr_stage.h`、`audio_stft.h`、`simd_kernels.h`。
+要串後級 stage 時另外 include `common/se_anr_stage.h`、`audio_stft.h`、`utility/simd_kernels.h`。
 
 ### 1.3 `Complex` type 從哪來
 
-`Complex` 定義在 `<audio_common>/include/fft_wrapper.h`，
+`Complex` 定義在 `<audiolib>/common/include/fft_wrapper.h`，
 透過 `4aec_nr_res.h` → `aec.h` → `fft_wrapper.h` 傳遞進來。
 **你會直接用到它**：
 
@@ -76,11 +76,12 @@ denoiser（`AnrDenoiser`）與最終 iFFT/OLA（`AcIstft`）**不在**前端內�
 -I pipelines
 -I lib/aec/c_impl/include
 -I lib/nr/c_impl/include
--I <audio_common>/include
+-I <audiolib>/common/include
 ```
 
-五個就夠（已實測）。`-I pipelines` 讓 `common/se_stage.h`、`common/se_anr_stage.h` 找得到。
-**注意：不需要 `third_party/doa`、`third_party/GSC`、`third_party/utility`**
+這五個 include roots 足以使用前端；下方串接範例另加 `-I <audiolib>/common`，
+讓 `utility/mem_align.h` 與 `utility/simd_kernels.h` 找得到。`-I pipelines` 讓 `common/se_stage.h`、`common/se_anr_stage.h` 找得到。
+**注意：不需要 `audiolib/doa`、`audiolib/bf`、`audiolib/common/utility`**
 —— 那三個是完整 spatial wrapper 才需要的（見另一份手冊）。
 
 語言標準：`-std=gnu99`（或以上的 GNU 方言）。
@@ -101,7 +102,7 @@ libaudio_common.a
   wrapper）**不在這個 archive 裡**——需要它的每個執行檔（`audio_pipeline_4ch_raw`
   等）各自把 `audio_pipeline_4ch.o` 當獨立 object 加進自己的 link 命令，不是
   從 archive 帶出來的。只用本手冊這套 API 時，你的 link 命令根本不提
-  `audio_pipeline_4ch.o`，所以你**不需要**連 `libdoa.a` / `libgsc.a` /
+  `audio_pipeline_4ch.o`，所以你**不需要**連 `libdoa.a` / `libbf.a` /
   `libspatial_common.a`。
   （已實測：上面五項就能把只用 `4aec_nr_res.h` 的程式連成執行檔。）
 * archive 路徑是 config-keyed 的（`bin/<backend>-<hash>/`）。用各 Makefile 的
@@ -121,8 +122,8 @@ libaudio_common.a
 #include <stdlib.h>
 #include "4aec_nr_res.h"
 #include "audio_stft.h"
-#include "mem_align.h"
-#include "simd_kernels.h"
+#include "utility/mem_align.h"
+#include "utility/simd_kernels.h"
 #include "common/se_anr_stage.h"
 #include "common/se_stage.h"
 
@@ -194,16 +195,18 @@ int main(void) {
 編譯：
 
 ```sh
-cc -std=gnu99 -O2 -Wall -Wextra -o app app.c \
+cc -std=gnu99 -O2 -Wall -Wextra -c app.c -o app.o \
   -I pipelines/4ch_aec_bf_nr_res \
   -I pipelines \
   -I lib/aec/c_impl/include \
   -I lib/nr/c_impl/include \
-  -I <audio_common>/include \
+  -I <audiolib>/common/include \
+  -I <audiolib>/common
+c++ -o app app.o \
   <4ch-bin>/libaudio_pipeline_4ch.a \
   <aec-bin>/libaec.a \
   <nr-bin>/libanr.a \
-  <audio_common-bin>/libaudio_common.a \
+  <audiolib-bin>/libaudio_common.a \
   -lm
 ```
 
@@ -215,7 +218,7 @@ cc -std=gnu99 -O2 -Wall -Wextra -o app app.c \
 
 | # | 步驟 | 呼叫 | 什麼時候呼叫 | 這一步可能怎麼失敗 |
 |---|---|---|---|---|
-| 1 | query | `four_aec_nr_res_get_mem_requirements(&cfg, &req)` | **每次 init 之前**都要重查，不可跨 build / backend / config 快取 | 回傳 `-1`：`out` 為 NULL；`cfg` 未通過驗證（§4）；此 TU 編譯時沒帶 `-DAUDIO_PIPELINE_BACKEND_STR="kiss"` 或 `"ne10"` |
+| 1 | query | `four_aec_nr_res_get_mem_requirements(&cfg, &req)` | **每次 init 之前**都要重查，不可跨 build / backend / config 快取 | 回傳 `-1`：`out` 為 NULL；`cfg` 未通過驗證（§4）；此 TU 編譯時沒帶 `-DAUDIO_PIPELINE_BACKEND_STR="ne10"` |
 | 2 | allocate | 你自己的配置器，取得 `req.bytes` 且對齊 `req.alignment`（16）的記憶體 | 拿到 `req` 之後 | pool **不需要**預先清零（poison pattern 可接受，已實測）。`init_ex()` 自己會把整塊 memset 成 0 |
 | 3 | init | `four_aec_nr_res_init_ex(pool, req.bytes, &cfg, &req)` | 拿到 pool 之後，處理第一個 hop 之前 | 回傳 `NULL`：8 項 descriptor 檢查任一不符；pool 未 16-byte 對齊；pool 太小；config 無效；子模組 init 失敗。**沒有任何診斷輸出**（見 §5.5） |
 | 3b | stage 配置 | `four_aec_nr_res_stage_configs(&cfg, &res_cfg, &nr_cfg)`，再 `aec_res_init()`／`se_anr_stage_init()`／`ac_istft_init()` | 你的後級 stage 要用時 | `-1`：NULL 引數或前端會拒絕的 config。stage 的記憶體由你自己查大小、自己 carve（§2 的範例） |
@@ -489,22 +492,22 @@ lane 的 `filter_converged` / `dt_indicator` / `saturation_level` 縮成三個�
 
 ### 4.6 實測記憶體（僅供量級參考，務必自己重查）
 
-以下是本次 checkout（`layout_version=19`）、`BACKEND=ne10`、`SIMD=1`、
+以下是本次 checkout（`layout_version=21`）、`BACKEND=ne10`、`SIMD=1`、
 `delay_mode=MATCHED`（預設,n=5）、`enable_post=1`（預設）下直接呼叫 API
 量到的前端值。換 backend、換編譯選項、更新 submodule 都會變。前端不含 RES／NR／iFFT，
 所以 `FourAecNrResMemBreakdown` 只有 `aec_bytes`、`wrapper_bytes`（控制區塊、共用 aligner 與 fuse 緩衝）與 `total_bytes`。
 
 | Config | `req.bytes` | `aec_bytes`（四路合計） | `wrapper_bytes` |
 |---|---:|---:|---:|
-| 16000，預設（256/128，`max_delay_ms=1024`） | 988,208 | 879,296 | 108,912 |
-| 16000，`fft_size=512` | 1,506,416 | 1,390,336 | 116,080 |
-| 16000，`max_delay_ms=100` | 929,072 | 879,296 | 49,776 |
-| 16000，`filter_length=512` | 889,200 | 780,288 | 108,912 |
-| 48000，預設（1024/512） | 3,279,248 | 3,016,384 | 262,864 |
+| 16000，預設（256/128，`max_delay_ms=1024`） | 1,044,000 | 935,040 | 108,960 |
+| 16000，`fft_size=512` | 1,566,048 | 1,449,920 | 116,128 |
+| 16000，`max_delay_ms=100` | 984,864 | 935,040 | 49,824 |
+| 16000，`filter_length=512` | 920,160 | 811,200 | 108,960 |
+| 48000，預設（1024/512） | 3,461,888 | 3,198,976 | 262,912 |
 
 `four_aec_nr_res_get_mem_breakdown()` 的 `total_bytes` 與 `get_mem_requirements()` 的
 `req.bytes` 在上述每一組都相等；`wrapper_bytes` 已包含控制區塊。四路合計的
-`aec_bytes` 除以 4 得單路 219,824 B（@16k/256）——與 `lib/aec` 的
+`aec_bytes` 除以 4 得單路 233,760 B（@16k/256）——與 `lib/aec` 的
 `AEC_DELAY_EXTERNAL_ALIGNED` 單體大小完全相同,因為每路內部本來就是
 `EXTERNAL_ALIGNED`（delay 由本層共用估計器提供,不建自己的 estimator/ring）。
 
@@ -512,9 +515,9 @@ lane 的 `filter_converged` / `dt_indicator` / `saturation_level` 縮成三個�
 
 | `delay_mode` | `req.bytes` | 相對 `MATCHED n=5` |
 |---|---:|---:|
-| `MATCHED` n=5（預設） | 988,208 | — |
-| `FIXED`，`fixed_delay_samples=1600`（100 ms） | 894,608 | −93,600 |
-| `EXTERNAL_ALIGNED` | 887,696 | −100,512 |
+| `MATCHED` n=5（預設） | 1,044,000 | — |
+| `FIXED`，`fixed_delay_samples=1600`（100 ms） | 950,400 | −93,600 |
+| `EXTERNAL_ALIGNED` | 943,488 | −100,512 |
 
 省下的量比單聲道版本小，因為這裡只省**一份共用**的 estimator/ring（四路
 共用一個 aligner），不是四份各自的——與本頁「單一共用 aligner」的結構
@@ -649,7 +652,8 @@ destroy 之後不要再呼叫任何 accessor。
 ### 6.3 其他（不出貨）
 
 * `pipelines/4ch_aec_bf_nr_res/tests/` —— 測試；`tests/conv_chain_4ch.h` 是把後級串接寫在前端之上的參考鏈。
-* `pipelines/third_party/` —— DOA / GSC / spatial kernel 函式庫。
+* `audiolib/{doa,bf,common/utility}`(原 `pipelines/third_party/{doa,GSC,utility}`，2026-10-20
+  併入 `audiolib`) —— DOA / BF / spatial kernel 函式庫。
   **只用本手冊這套 API 的話完全不需要它們。**
 * `.py` 檔 —— 主機端評估與參考實作，不是 C 產品的一部分。
 
@@ -661,7 +665,7 @@ destroy 之後不要再呼叫任何 accessor。
 
 - [ ] 四個 archive（`libaudio_pipeline_4ch.a` / `libaec.a` / `libanr.a` /
       `libaudio_common.a`）是用**同一組** backend 與編譯選項建出來的
-- [ ] link 順序照 §1.5；沒有多連 `libdoa.a` / `libgsc.a` / `libspatial_common.a`
+- [ ] link 順序照 §1.5；沒有多連 `libdoa.a` / `libbf.a` / `libspatial_common.a`
 - [ ] `BACKEND=ne10` 時最終 link 用 C++ driver
 - [ ] archive 路徑是用 `print-lib-path` 查的
 - [ ] 沒有 include `4aec_nr_res_internal.h` 或 `4aec_projection_kernels.h`
@@ -712,8 +716,8 @@ front / fuse 協定：
 | Offset | 欄位 | 型別 | 目前值 |
 |---:|---|---|---|
 | 0 | `descriptor_version` | `uint32_t` | `1` |
-| 4 | `layout_version` | `uint32_t` | `19` |
-| 8 | `backend_id` | `uint32_t` | `1` = KISS，`2` = NE10（永遠不會是 0） |
+| 4 | `layout_version` | `uint32_t` | `21` |
+| 8 | `backend_id` | `uint32_t` | `2` = NE10（目前唯一的 FFT 後端）；`1` 已退役、不會再回傳；永遠不會是 0 |
 | 12 | `build_flags_hash` | `uint32_t` | FNV-1a-32，隨 build 變動 |
 | 16 | `alignment` | `uint32_t` | `16` |
 | 20 | `reserved` | `uint32_t` | `0`（必須為 0，`init_ex()` 會驗證） |
@@ -742,5 +746,5 @@ front / fuse 協定：
 ### 8.4 相容性規則（給整合者的三條）
 
 1. **descriptor 永遠現查現用**。不要存進 NVRAM、不要跨 firmware rebuild 沿用。
-2. **兩個 backend 之間永不互通**，即使 `bytes` 相同。
+2. **舊 `backend_id=1`（已移除的 KISS 後端）的 descriptor 一律不相容**，即使 `bytes` 相同。
 3. **升級 library 之後一定要重跑一次 `get_mem_requirements()`**，並確認 pool 預算仍足夠。

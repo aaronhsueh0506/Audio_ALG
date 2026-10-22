@@ -1,36 +1,35 @@
-# External spatial DSP and gain-staging integration
+# Gain-staging integration
 
-`doa/` and `GSC/` contain the supplied SRP-PHAT/DOA smoother and GSC
-implementations vendored with this repository and used by
-`pipelines/4ch_aec_bf_nr_res/audio_pipeline_4ch.c`.
-`utility/complex.*` is their shared complex arithmetic. `gain/` holds the
-input, directional and post-NR gain stages from the same supplier.
+`gain/` holds the input, directional and post-NR gain stages from the
+supplier that also provided the SRP-PHAT/DOA smoother, BF and VAD sources
+this directory used to vendor. Those moved to the sibling `audiolib` checkout
+(`../../../audiolib/{doa,bf,VAD,common/utility}`) in the audio_common ->
+audiolib rename (2026-10-20) -- they build and test there now
+(`make -C ../../../audiolib SIMD=1 test`), alongside `audiolib/common`'s own
+FFT/fast_math/SIMD-kernel layer, whose backend-neutral `Complex` type
+(`{float r; float i;}`) `post_gain_apply()` still takes. `gain/` itself
+stayed behind: `make -C pipelines` does not link it into any shipped binary
+(see `gain/` interfaces below), so it was out of scope for that merge.
 
-`third_party/Makefile` builds five config-keyed reusable archives:
+`gain/`'s tests moved too, split out of the combined
+`tests/test_spatial_third_party.c` (now `audiolib/tests/test_spatial_third_party.c`,
+PHAT/BF/SRP/VAD only) into `gain/tests/test_gain.c` alongside a duplicate
+copy of the shared `check_pool_contract` helper the two files used to share.
+`gain/` currently has no Makefile of its own -- `gain/tests/test_gain.c`
+builds and passes (verified manually against `gain/{fix_gain,nr_gain,
+post_gain}.c` and `audiolib/common`'s headers/archive), but lost its
+automated `make test` runner when `third_party/Makefile` was retired with
+the rest of this directory's spatial DSP. Flagging this for a follow-up
+decision rather than silently restoring a build target: whether `gain/`
+needs a small Makefile of its own, or whether its test coverage is meant to
+move somewhere else, was not decided as part of the rename.
 
-- `libspatial_common.a`: namespaced complex helpers and scalar/NEON kernels;
-- `libdoa.a`: geometry, steering, SRP-PHAT, and DOA smoothing;
-- `libgsc.a`: the GSC state and processing API;
-- `libvad.a`: single-channel spectral mask estimation and the mask VAD;
-- `libgain.a`: the input fix-gain, directional post-gain and post-NR gain
-  compensation stages in `gain/`.
+`gain/` interfaces:
 
-Every archive offers the caller-pool constructor pair the rest of this stack
-uses -- `X_get_mem_size()` sizes, `X_init()` carves a caller-owned block, and
-`X_destroy()` frees nothing on that path.
-
-Their public spectra use `audio_common`'s backend-neutral `Complex` type.
-They do not expose KISS types, so the same headers and source-level API work
-with `BACKEND=kiss` and `BACKEND=ne10`; `SIMD=0` selects the scalar kernels.
-
-`gain/` arrived using KISS types and an application-wide runtime-config header
-directly, neither of which exists on the `BACKEND=ne10` include path, so two
-interfaces changed on the way in. Integrators updating to this copy need:
-
-- `post_gain_apply()` now takes `Complex*` instead of `kiss_fft_cpx*`. The two
-  are byte-compatible -- both are `{float r; float i;}` -- so a caller still
-  holding a KISS spectrum spells the conversion as a cast at the call site.
-- `nr_gain_create()`/`nr_gain_process()` now take an `NrGainConfig` this module
+- `post_gain_apply()` takes `Complex*`; a caller holding an FFT library's own
+  complex type of the same layout spells the conversion as a cast at the call
+  site.
+- `nr_gain_create()`/`nr_gain_process()` take an `NrGainConfig` this module
   owns instead of the application's own runtime-config struct, matching
   `FixGainConfig` and `PostGainConfig` beside them. `nr_gain.h` carries the
   field-by-field mapping. `nr_gain_create()` takes no argument: it never read
@@ -41,7 +40,7 @@ integrator was already calling.
 
 Two things about `fix_gain` are worth knowing before picking it:
 
-- audio_common's `AudioPreGain` is this stack's canonical input-gain stage and
+- audiolib's `AudioPreGain` is this stack's canonical input-gain stage and
   does the same job for a single gain, with validated dB conversion. `fix_gain`
   is the multi-channel variant -- one gain per microphone plus a clip -- and is
   the right choice only when that per-channel table is what you need. The two
@@ -59,69 +58,13 @@ config goes stale); `post_gain` takes its config per call but also reads `F`
 and `gain_match` at construction to size the pool and seed the smoother, so
 `F` is fixed for the instance's life while everything else is per-hop.
 
-The integration adds two algorithm-preserving facilities:
-
-- `utility/spatial_simd.*` computes each microphone-pair PHAT spectrum once per
-  frame and provides an AArch64 NEON path (via audio_common's sanctioned
-  `sk__cquad_load`/`sk__cquad_store` complex-quad primitives, not a raw
-  pointer-cast load/store). Its test requires sample-for-sample bit identity
-  with the scalar implementation.
-- GSC routes both the distortionless beamformer and adaptive-canceller
-  beamformer through the same scalar/NEON complex kernel. The covariance is
-  stored internally as `P[M][M][F]`, so the four-channel RLS recursion can
-  update four adjacent frequency bins without gather/scatter. The AArch64
-  path preserves the scalar channel/matrix accumulation order and avoids FMA,
-  reciprocal estimates and horizontal reductions; the test-only scalar
-  oracle compares output, effective weights, `P` and `wa` byte-for-byte after
-  every hop. Non-four-channel shapes and exceptional bins use the scalar path.
-- GSC can export the exact effective complex channel weights used to produce
-  its mono spectrum. This lets the downstream post-beam RES project all AEC
-  contexts with the same spatial state; the original `gsc_process()` API and
-  output remain available and are checked against the exporting path.
-
-`GSC/gsc.c`'s per-hop RLS update additionally carries two numerical-hardening
-additions that are **not** algorithm-preserving/bit-exact against the
-originally supplied recursion (both are plain constants, not exposed as
-config): the covariance matrix `P` is re-Hermitianized after each per-bin
-update (guards against float32 rounding asymmetry accumulating over long
-continuous runtime), and the adaptive weight state `wa` carries a slow leak
-(`GSC_WA_LEAK`, queried via `gsc_wa_leak_factor()`; time constant far slower
-than the RLS forgetting factor's own adaptation timescale, and only applied
-when this bin's RLS update actually runs -- i.e. counted in updates, not raw
-hops, since VAD/mask gating means not every hop updates) so it cannot grow
-unbounded under sustained non-target conditions with no forgetting mechanism
-otherwise. Neither has been
-perceptually validated against real recordings; the `lambda` forgetting
-factor itself is separately bounded to `(0, 1]` at both `gsc_create()` and
-the wrapper's config validation.
-
-Steering tables are precomputed at construction for whichever single grid the
-pipeline is running (`srp_cfg.sr`/FFT/hop are the pipeline's own native
-values -- see `audio_pipeline_4ch.c`'s `..._doa_sample_rate()`/`..._doa_fft_size()`
-getters, which are pure pass-throughs). No allocation occurs in SRP/GSC
-per-frame processing.
-
-There is no separate/optional 16 kHz DOA mode: no corresponding config field,
-flag, or second steering table exists anywhere in this directory or
-`audio_pipeline_4ch.c` -- the two paragraphs below describe a design that is
-not implemented. `4ch_aec_bf_nr_res/README.md`'s
-"There is no legacy/downsample grid entry" is the accurate statement of the
-current design. If a real 16 kHz-DOA-at-48-kHz-pipeline requirement ever
-lands, prefer first restricting SRP-PHAT's per-bin PHAT/pair-steering/scratch
-work to the frequency band it actually searches (`f_start..f_end`, `srp.c`'s
-`pair_steering`/`prealign` loops currently walk the full bin range even
-though the search band is much narrower) before adding a second STFT/
-downsample domain -- reusing the AEC lanes' existing 48 kHz spectra and
-narrowing the band SRP scores is cheaper than a second FFT pipeline, and a
-naive stride-pick 48->16 kHz decimation would alias exactly like the
-mono/4ch AEC delay-estimator gap documented elsewhere in this repo.
-
-The gain stages are shaped by the same shared kernels as everything else here:
-`fix_gain` scales through `sk_scale_f32` and clips through `sk_clip_f32`,
-`nr_gain` scales through `sk_scale_f32`, and `post_gain` clamps and applies its
-per-bin gain through `sk_clip_f32`/`sk_capply_gain_f32`. `sk_scale_f32` is the
-shared broadcast-multiply kernel; the gain stages call it instead of carrying
-their own loops.
+The gain stages are shaped by the same shared kernels as the rest of the
+stack (now in `audiolib`): `fix_gain` scales through `sk_scale_f32` and clips
+through `sk_clip_f32`, `nr_gain` scales through `sk_scale_f32`, and
+`post_gain` clamps and applies its per-bin gain through
+`sk_clip_f32`/`sk_capply_gain_f32`. `sk_scale_f32` is the shared
+broadcast-multiply kernel; the gain stages call it instead of carrying their
+own loops.
 
 Two loops stay open-coded, each for a stated reason rather than by omission:
 `post_gain`'s box-average frequency smoother (a running accumulator would
@@ -132,23 +75,21 @@ this module selects attack on `target > prev`, so the two disagree at
 `target == prev` -- exactly the steady state a constant-target gain sits in,
 and the branches genuinely differ there for 17.0% of values, measured).
 
-These modules own their own tests: `make -C pipelines/third_party test` builds
-the GSC_TESTING object, runs the equivalence suite and runs
-`audit-no-gsc-test-symbols`, which proves no test-only symbol reached a
-deployable archive. The 4ch pipeline's `make test` delegates to it. The gain
-tests carry a transcription of each module's pre-kernel formulation and require
-byte-identical output against it, so the kernel routing above is a refactor and
-not a retune; the suite runs under `SIMD=0` and `SIMD=1` alike, which makes the
-same comparison the scalar-versus-NEON gate.
+The gain tests (`gain/tests/test_gain.c`) carry a transcription of each
+module's pre-kernel formulation and require byte-identical output against
+it, so the kernel routing above is a refactor and not a retune.
 
-Run the spatial arithmetic and full wrapper gates through:
+The doa/BF/VAD arithmetic and the 4ch pipeline's full wrapper gate run
+through:
 
 ```bash
-make -C Audio_ALG/pipelines/third_party BACKEND=kiss SIMD=1 test
+make -C audiolib SIMD=1 test
 make -C Audio_ALG/pipelines/4ch_aec_bf_nr_res test
 ```
 
-The complete pipeline supports `16k/256/128`, `16k/512/256`, and
-`48k/1024/512` (`sample-rate/frame/hop`, with frame equal to FFT), one grid
-at a time -- DOA, GSC and AEC/NR/RES all run at the same selected tuple
-(see `4ch_aec_bf_nr_res/README.md`). There is no DOA-downsample flag.
+(the second delegates to the first for its spatial dependencies; see
+`audiolib`'s own README and `4ch_aec_bf_nr_res/README.md`). The complete
+pipeline supports `16k/256/128`, `16k/512/256`, and `48k/1024/512`
+(`sample-rate/frame/hop`, with frame equal to FFT), one grid at a time --
+DOA, BF and AEC/NR/RES all run at the same selected tuple (see
+`4ch_aec_bf_nr_res/README.md`). There is no DOA-downsample flag.

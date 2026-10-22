@@ -32,11 +32,11 @@ pre code{background:none;padding:0}
 <a href="index.html">index</a>
 <a href="../../../AEC/docs/html/aec.html">aec</a>
 <a href="../../../NR/docs/html/nr.html">nr</a>
-<a href="../../../audio_common/docs/html/audio_common.html">audio_common</a>
+<a href="../../../audiolib/common/docs/html/audio_common.html">audiolib</a>
 <span class="sep">|</span>
 <a href="../../../AEC/docs/html/aec_c_api.html">AEC API</a>
 <a href="../../../NR/docs/html/nr_c_api.html">NR API</a>
-<a href="../../../audio_common/docs/html/audio_common_c_api.html">audio_common API</a>
+<a href="../../../audiolib/common/docs/html/audio_common_c_api.html">audiolib API</a>
 <a href="integration_example.html">串接範例</a>
 <a href="integration_example_detail.html"><b>串接範例細節</b></a>
 </nav>
@@ -52,7 +52,7 @@ pre code{background:none;padding:0}
 <tr><th>類別</th><th class="ok">存活</th><th class="dead">消失</th></tr>
 <tr><td><b>狀態快照(pull)</b></td><td><code>aec_debug_status</code>、<code>aec_get_res_context</code>、<code>aec_get_linear_context</code>、<code>aec_linear_is_cancelling</code>、<code>aec_far_fft_real_compute_count</code>、<code>aec_get_mem_breakdown</code>、<code>anr_debug_status</code>、<code>anr_get_gain/_spp/_noise_psd</code>、4ch 的全部 census/counter accessor</td><td>—</td></tr>
 <tr><td><b>耗時</b></td><td>函式在(<b>回 0</b>)</td><td><b>全部數值</b>(<code>AecStageTiming</code>／<code>AudioPipelineLastTiming</code>／<code>FourAecNrResLastTiming</code>)</td></tr>
-<tr><td><b>Log / trace(push)</b></td><td>—</td><td><b>全部</b>:<code>aec_debug_logf</code>、<code>aec_debug_set_level/_log/_frame</code>、<code>aec_debug_set_trace</code>、<code>AecDebugTraceRow</code> 的 14 欄;mono 的 init 期 stderr 診斷</td></tr>
+<tr><td><b>Log / trace(push)</b></td><td>—</td><td><b>全部</b>:<code>aec_debug_set_level/_log/_frame</code>、<code>aec_debug_set_trace</code>、<code>AecDebugTraceRow</code> 的 14 欄;mono 的 init 期 stderr 診斷</td></tr>
 <tr><td><b>錯誤碼</b></td><td>全部</td><td>—</td></tr>
 <tr><td><b>Finite guards</b></td><td>全部(不受任何開關影響)</td><td>—</td></tr>
 </table></div>
@@ -90,7 +90,7 @@ log("delay=%d conf=%.1f upd=%d erle=%.1fdB usable=%d conv=%d "
 <div class="tblwrap"><table>
 <tr><th>盲點</th><th>實情</th></tr>
 <tr><td class="dead">per-hop CSV trace <b>四條 pipeline 全部不可達</b></td><td><code>AecDebugTraceRow</code> 的唯一填寫點要求 <code>cfg.enable_res == 1</code> <b>且</b>走 <code>aec_process()</code>。四條 pipeline <b>全部</b>設 <code>enable_res = 0</code> → <code>dominant_nearend</code>／<code>saturated_echo</code>／<code>usable_linear</code>／<code>fullband_erle</code>／<code>gain_mean</code> 這些沒有第二個出口的量,在產品組態下<b>永遠取不到</b>。只有 CLI <code>aec_wav --debug-trace</code> 拿得到</td></tr>
-<tr><td class="dead">層級式 log 是<b>死碼</b></td><td><code>AEC_DEBUG_LOG</code> 在整個 library 的 <code>src/</code> 有 <b>0 個呼叫點</b>(唯一命中是一句註解)。level 1/2/3、<code>aec_debug_logf</code>、時間/frame 前綴——整套四層基礎設施沒有任何 emit 端</td></tr>
+<tr><td class="dead">沒有層級式 log</td><td><code>aec_debug_set_level()</code>／<code>aec_debug_set_log()</code> 只把值存進 <code>aec_debug.c</code> 的靜態變數,library 內沒有任何讀取端,也沒有 emit 函式 → CLI 的 <code>--debug-level</code>／<code>--debug-log</code> 不會產生輸出</td></tr>
 <tr><td class="dead"><code>assert()</code> 在出貨板上是<b>活的</b></td><td>四個 Makefile <b>沒有任何一個</b>設 <code>-DNDEBUG</code>。<code>suppression_gain.c</code> 的 table-length assert <b>沒有 release-path fallback</b>,失敗即 <code>abort()</code>——沒有回傳碼、沒有 log、沒有 hook 可攔</td></tr>
 <tr><td class="dead">self-reset 不計數</td><td><code>DSP_ERROR</code> 路徑會內部呼叫 <code>reset()</code>,而 <code>reset()</code> 本身<b>清掉所有 instrumentation</b>(realign counters／duty census 全歸零)→ 一次 self-reset 之後「之前發生過什麼」在計數器上完全消失</td></tr>
 <tr><td class="dead">delay lock 遺失不計數</td><td><code>AecLinearContext.delay_state</code> 與 <code>generation</code> 每 hop 可讀,但 <code>AecDebugStatus</code> <b>兩者都沒有</b> → 只 poll <code>aec_debug_status()</code> 的整合者<b>看不到 lock 的丟失與重獲</b></td></tr>

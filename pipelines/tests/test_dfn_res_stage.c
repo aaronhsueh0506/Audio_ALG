@@ -10,6 +10,7 @@
 #include <string.h>
 
 #include "dfn_res_stage.h"
+#include "audio_window.h"
 #include "tests/dfn_test_fixture.h"
 
 #define FRAMES 6
@@ -56,10 +57,8 @@ static void fill_frame(Complex *estimate, Complex *apply, int frame) {
  * actually receives: the ERB and complex feature windows. It therefore pins
  * three things at once -- the scale factor, the analysis window, and the
  * frame assembly ([previous hop | this hop], 50% overlap, no centring).
- * The window here is deliberately spelled as the HOSTS spell it
- * (pipelines/mono_aec_nr_res/audio_pipeline.c, 4ch_aec_bf_nr_res/4aec_nr_res.c,
- * lib/aec's analysis), not as DFN2 spells it, so the row also proves the two
- * spellings agree bit for bit. */
+ * Both paths use the shared periodic sqrt-Hann; audiolib/test_stft compares
+ * the table's bits with independent formulas. */
 typedef struct ScaleCapture {
     float erb[SCALE_FRAMES][CAP_ERB];
     float spec[SCALE_FRAMES][CAP_SPEC];
@@ -84,11 +83,9 @@ static void make_pcm(void) {
     }
 }
 
-/* The hosts' own spelling of the periodic sqrt-Hann. */
+/* The shared periodic sqrt-Hann used by the host front ends. */
 static void host_root_hann(float *window, int n) {
-    int i;
-    for (i = 0; i < n; ++i)
-        window[i] = sqrtf(0.5f * (1.0f - cosf(2.0f * (float)M_PI * (float)i / (float)n)));
+    ac_window_build(window, n);
 }
 
 static int capturing_infer(void *user, const DFN2PrepostInputs *in,

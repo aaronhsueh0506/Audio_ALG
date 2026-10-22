@@ -15,7 +15,7 @@
  *   front_process -> (weights) -> fuse -> se_res_stage_gain, se_anr_stage_gain
  *     -> sk_min_f32 -> sk_capply_gain_f32 -> aec_cng_fill -> ac_istft_push
  *
- * The beamformer is externally owned in a real product (SRP-PHAT/GSC); this
+ * The beamformer is externally owned in a real product (SRP-PHAT/BF); this
  * executable supplies fixed equal weights between the two front calls. Equal
  * weights are a deterministic smoke adapter, not a production beamformer.
  *
@@ -23,6 +23,7 @@
  *   make -C pipelines/4ch_aec_bf_nr_res 4aec_nr_res_static
  *
  * Usage:
+ *   AEC preset: 0=mild, 1=balanced, 2=aggressive, 3=no_floor; names also accepted.
  *   ./4aec_nr_res_static [aec-preset]
  *       [--nr-preset mild|moderate|balanced|aggressive]
  *       [--sample-rate 16000|48000] [--fft-size 256|512|1024]
@@ -38,16 +39,23 @@
 
 #include "4aec_nr_res.h"
 #include "audio_stft.h"
-#include "mem_align.h"
-#include "simd_kernels.h"
+#include "utility/mem_align.h"
+#include "utility/simd_kernels.h"
 #include "common/se_anr_stage.h"
 #include "common/se_stage.h"
 
 /* ------------------------------------------------------------------ */
 
+/* CLI aliases only; unknown names retain the historical balanced fallback. */
 static AecPreset parse_preset(const char* s) {
-    if (strcmp(s, "mild") == 0) return AEC_PRESET_MILD;
-    if (strcmp(s, "aggressive") == 0) return AEC_PRESET_AGGRESSIVE;
+    if (strcmp(s, "mild") == 0 || strcmp(s, "0") == 0)
+        return AEC_PRESET_MILD;
+    if (strcmp(s, "balanced") == 0 || strcmp(s, "1") == 0)
+        return AEC_PRESET_BALANCED;
+    if (strcmp(s, "aggressive") == 0 || strcmp(s, "2") == 0)
+        return AEC_PRESET_AGGRESSIVE;
+    if (strcmp(s, "no_floor") == 0 || strcmp(s, "3") == 0)
+        return AEC_PRESET_NO_FLOOR;
     return AEC_PRESET_BALANCED;
 }
 
@@ -55,6 +63,7 @@ static const char* preset_name(AecPreset p) {
     switch (p) {
         case AEC_PRESET_MILD:       return "mild";
         case AEC_PRESET_AGGRESSIVE: return "aggressive";
+        case AEC_PRESET_NO_FLOOR:   return "no_floor";
         default:                    return "balanced";
     }
 }
@@ -72,7 +81,6 @@ static const char* nr_mode_name(AnrMode mode) {
 
 static const char* backend_id_name(uint32_t backend_id) {
     switch (backend_id) {
-        case FOUR_AEC_NR_RES_BACKEND_KISS: return "kiss";
         case FOUR_AEC_NR_RES_BACKEND_NE10: return "ne10";
         default:                           return "unknown";
     }
@@ -93,13 +101,13 @@ static int plan_stages(const FourAecNrResConfig* cfg, const FourAecNrResMemReq* 
     AcStftConfig scfg;
     if (four_aec_nr_res_stage_configs(cfg, &s->res_cfg, &s->nr_cfg) != 0) return -1;
     s->res_bytes = aec_res_get_mem_size(&s->res_cfg);
-    s->nr_bytes = se_anr_stage_mem_size(&s->nr_cfg);
+    s->nr_bytes = cfg->enable_nr ? se_anr_stage_mem_size(&s->nr_cfg) : 0;
     ac_stft_config_default(&scfg, b->fft_size);
     s->synth_bytes = ac_istft_get_mem_size(&scfg);
     s->fft_bytes = fft_get_mem_size(b->fft_size);
     s->vec_bytes = ALIGN16((size_t)b->n_freqs * sizeof(float));
     s->cvec_bytes = ALIGN16((size_t)b->n_freqs * sizeof(Complex));
-    if (!s->res_bytes || !s->nr_bytes || !s->synth_bytes) return -1;
+    if (!s->res_bytes || !s->synth_bytes || (cfg->enable_nr && !s->nr_bytes)) return -1;
     s->total = (size_t)req->bytes + ALIGN16(s->res_bytes) + ALIGN16(s->nr_bytes) +
                ALIGN16(s->synth_bytes) + 2 * s->vec_bytes + s->cvec_bytes;
     return 0;
@@ -201,7 +209,8 @@ int main(int argc, char* argv[]) {
                 "Usage: %s [aec-preset] [--nr-preset ...] "
                 "[--sample-rate 16000|48000] "
                 "[--fft-size 256|512|1024] [--capture-proxy 0|1|2|3] "
-                "[--legacy-amin] [--no-cng] [--print-mem-size]\n",
+                "[--legacy-amin] [--no-cng] [--print-mem-size]\n"
+                "AEC preset: 0=mild, 1=balanced, 2=aggressive, 3=no_floor; names also accepted.\n",
                 argv[0]);
             return 1;
         }
@@ -227,7 +236,7 @@ int main(int argc, char* argv[]) {
     if (print_mem_budget(&cfg) != 0) return 1;
 
     /* Query -> allocate -> init: same caller-pool sequence as the mono
-     * static_main.c. malloc is a host stand-in for the board
+     * static_main.c. Aligned allocation is a host stand-in for the board
      * memory manager; the pipeline owns none of this memory. */
     FourAecNrResMemReq req;
     FourAecNrResMemBreakdown bd;
@@ -239,9 +248,10 @@ int main(int argc, char* argv[]) {
         return 1;
     }
 
-    void* pool = malloc(st.total);
+    void* pool = NULL;
+    if (posix_memalign(&pool, req.alignment, st.total) != 0) pool = NULL;
     if (!pool) {
-        fprintf(stderr, "Error: malloc failed (%zu bytes)\n", st.total);
+        fprintf(stderr, "Error: aligned allocation failed (%zu bytes)\n", st.total);
         return 1;
     }
     if (((uintptr_t)pool) % req.alignment != 0) {

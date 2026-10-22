@@ -13,7 +13,7 @@
 
 #include "ulcnet_prepost.h"
 
-#include "mem_align.h"
+#include "utility/mem_align.h"
 
 #include <stdlib.h>
 #include <string.h>
@@ -60,7 +60,7 @@ struct UlcnetPrepost {
 
 /* ---- pool arithmetic ---------------------------------------------------
  * Alignment through ulcnet_model_io's exported helper (its region carries
- * its own alignment), addition through audio_common's saturating
+ * its own alignment), addition through audiolib's saturating
  * ck_add_size: an overflow pins the cursor to SIZE_MAX, which
  * MEM_SIZE_INVALID catches. */
 
@@ -96,7 +96,7 @@ static uint32_t pp_build_hash(int io_mode, int delay_depth, uint32_t layout) {
     h = pp_fnv1a(h, (uint32_t)ULCNET_PREPOST_CARVE_VERSION);
     h = pp_fnv1a(h, (uint32_t)io_mode);
     h = pp_fnv1a(h, (uint32_t)delay_depth);
-    return h;
+    return ac_memreq_abi_hash(h);
 }
 
 /* TIME requires the caller's handle and window in the config, so the

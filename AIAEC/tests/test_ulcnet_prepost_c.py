@@ -10,7 +10,7 @@ reproduces the hand-composed path SAMPLE FOR SAMPLE. Every comparison
 here is therefore ``memcmp`` on fp32, never a tolerance: the class is only
 allowed to reorder nothing.
 
-Cases, all in ONE driver selected by argv[1] so audio_common and the three
+Cases, all in ONE driver selected by argv[1] so audiolib and the three
 model TUs are compiled once for the module:
 
   equiv     ULCNET_IO_TIME vs analysis + model-I/O transaction + synthesis,
@@ -45,7 +45,7 @@ import pytest
 _THIS_DIR = os.path.dirname(os.path.abspath(__file__))
 _ULCNET_DIR = os.path.join(os.path.dirname(_THIS_DIR), 'Align_ULCNet')
 _AC_DIR = os.path.abspath(
-    os.path.join(_THIS_DIR, '..', '..', '..', 'audio_common'))
+    os.path.join(_THIS_DIR, '..', '..', '..', 'audiolib', 'common'))
 _AC_INCLUDE = os.path.join(_AC_DIR, 'include')
 
 _SOURCES = ('ulcnet_prepost.c', 'ulcnet_process.c', 'ulcnet_model_io.c')
@@ -223,8 +223,9 @@ static AcIstft *make_synthesis(FftHandle *fft) {
 
 /* center=False rolling analysis: one frame per hop, over the last N_FFT
  * samples. Deliberately expression-for-expression the same as
- * ulcnet_process.c's ulcnet_rfft, so this reference is independent of the
- * class yet bit-comparable with it. */
+ * the center=False analysis of audiolib's AcStft that ulcnet_process.c
+ * configures, so this reference is independent of the class yet
+ * bit-comparable with it. */
 static void ref_roll(FftHandle *fft, float *history, const float *hop_in,
                      float *out_re, float *out_im) {
     static float seg[ULCNET_N_FFT];
@@ -449,7 +450,7 @@ static int case_freqpool(FftHandle *fft) {
 
     /* IO_FREQ must not pay for the framing machinery it never runs: the
      * difference is exactly the output hop staging and the three framing
-     * objects, sized here by audio_common with the caller's handle and
+     * objects, sized here by audiolib with the caller's handle and
      * window. */
     CHECK(req_freq.bytes < req_time.bytes);
     {
@@ -1066,7 +1067,11 @@ static int case_hash(void) {
     UlcnetPrepostMemReq req;
     CHECK(ulcnet_prepost_config_defaults(&cfg, ULCNET_IO_FREQ, D) == 0);
     CHECK(ulcnet_prepost_get_mem_size(&cfg, &req) == 0);
-    printf("hash=%u layout=%u\n", req.build_flags_hash, req.layout_version);
+    /* The ABI token folded into the hash follows the C target, which a
+     * cross-built driver run under an emulator does not share with the
+     * Python host. */
+    printf("hash=%u layout=%u ptr_bytes=%zu\n", req.build_flags_hash,
+           req.layout_version, sizeof(void *));
     return 0;
 }
 
@@ -1106,7 +1111,7 @@ int main(int argc, char **argv) {
 
 @pytest.fixture(scope='module')
 def audio_common_lib():
-    """audio_common's NE10 static lib (the default backend),
+    """audiolib's NE10 static lib (the default backend),
     built and located the way the other C tests document it."""
     if shutil.which('make') is None:
         pytest.skip('no make available')
@@ -1137,7 +1142,7 @@ def driver(tmp_path_factory, audio_common_lib):
     subprocess.run(
         [cc, '-O2', '-std=c11',
          '-Wall', '-Wextra', '-Wpedantic', '-Werror', '-ffp-contract=off',
-         '-I', _ULCNET_DIR, '-I', _AC_INCLUDE, str(source),
+         '-I', _ULCNET_DIR, '-I', _AC_INCLUDE, '-I', _AC_DIR, str(source),
          *[os.path.join(_ULCNET_DIR, name) for name in _SOURCES],
          audio_common_lib, '-lm', '-o', str(executable)],
         check=True, capture_output=True,
@@ -1252,6 +1257,10 @@ def test_pool_identity_moved_with_the_full_window_carve(driver):
     assert carve == 6
     # io_mode FREQ == 0, D == 8, grid 16000 / 512 (this driver's build).
     expected = _fnv1a([16000, 512, layout, carve, 0, 8])
+    ptr_bytes = int(re.search(r'ptr_bytes=(\d+)', out).group(1))
+    if ptr_bytes == 4:
+        for byte in b'|abi:ilp32':
+            expected = ((expected ^ byte) * 16777619) & 0xffffffff
     previous = _fnv1a([16000, 512, 16, 4, 0, 8])
     assert c_hash == expected
     assert c_hash != previous

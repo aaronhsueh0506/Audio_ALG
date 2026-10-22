@@ -1,9 +1,9 @@
-# 4-channel AEC + BF/GSC + RES + DeepFilterNet2
+# 4-channel AEC + beamformer (bf) + RES + DeepFilterNet2
 
 This wrapper replaces the post-beam MMSE-LSA denoiser of the four-channel
 core (`4ch_aec_bf_nr_res/4aec_nr_res.h`) with DeepFilterNet2 while keeping
-the shared delay estimator, the four linear AEC lanes, the external BF/GSC
-seam, the post-beam AEC3 residual suppressor, the comfort-noise recipe and
+the shared delay estimator, the four linear AEC lanes, the external
+beamformer (bf) seam, the post-beam AEC3 residual suppressor, the comfort-noise recipe and
 the synthesis WOLA. The front end is configured with `enable_post=1`,
 `enable_res=1`, `enable_nr=0`; this application chains its own RES and
 synthesis and inserts the network between the post-RES spectrum and the
@@ -11,7 +11,7 @@ synthesis:
 
 ```text
 mics/ref -> four_aec_dfn_res_front_process()         four lanes, front view
-            (external BF/GSC -> effective weights, optional trusted spectrum)
+            (external beamformer (bf) -> effective weights, optional trusted spectrum)
          -> four_aec_dfn_res_process_begin(weights, error)
               E = beamformed error spectrum         -> DFN2 feature input
               P = E * G_res + comfort noise         -> DFN2 applied here
@@ -21,7 +21,7 @@ mics/ref -> four_aec_dfn_res_front_process()         four lanes, front view
 ```
 
 The external beamformer seam is the same as `FourAecNrRes`'s: `process_begin()`
-reconstructs the beamformed error from the weights, or takes the GSC's own
+reconstructs the beamformed error from the weights, or takes the BF's own
 spectrum when one is passed (`four_aec_fuse()`). `four_aec_dfn_res_process()`
 is the sequence of the four calls with `dfn_res_stage_infer()` as the model
 runner. This application owns its RES, gain scratch, comfort-noise state and
@@ -49,7 +49,7 @@ at 48 kHz: directly on the core's spectra at 48 kHz (algorithmic latency
 three hops, 32 ms), or through the rate bridge (`pipelines/dfn_rate_bridge.h`)
 at 16 kHz, which synthesises E and P on the native grid, resamples them up,
 runs the stage on the 48 kHz 1024/512 grid and resamples the result down.
-The four lanes, the BF/GSC seam, the RES and the comfort noise never leave
+The four lanes, the beamformer (bf) seam, the RES and the comfort noise never leave
 the product rate. The bridge adds 672 samples (42 ms) at 16 kHz with hop
 128 and 629 (39 ms) with hop 256 to the core's own output; total algorithmic
 latency is that plus the core's WOLA hop (16 kHz, hop 128: 800 samples,
@@ -60,8 +60,8 @@ Build and test from `pipelines/4ch_aec_bf_nr_res/` (the directory `Makefile`
 forwards):
 
 ```sh
-make BACKEND=kiss WERROR=1 lib4aec_dfn_res.a 4ch_aec_bf_dfn_res
-make BACKEND=kiss WERROR=1 test        # includes test_4aec_dfn_res and the skeleton
+make WERROR=1 lib4aec_dfn_res.a 4ch_aec_bf_dfn_res
+make WERROR=1 test        # includes test_4aec_dfn_res and the skeleton
 ```
 
 `lib4aec_dfn_res.a` holds the wrapper, the shared stage and the DFN2 host
@@ -109,9 +109,9 @@ model dominates this arithmetic budget; A53/A73 CPU-only admission still
 requires the final int8/fp runtime and board cycle measurement.
 
 Host DSP pool (`four_aec_dfn_res_get_mem_requirements`, matched delay,
-five-filter bank, NE10): 1,440,288 bytes at the 16 kHz default (core plus
-the rate bridge) and 3,703,360 bytes at 48 kHz (the conventional
-four-channel MMSE-LSA pipeline on the 48 kHz grid needs 3,740,224 bytes).
+five-filter bank, NE10): 1,409,264 bytes at the 16 kHz default (core plus
+the rate bridge) and 3,782,816 bytes at 48 kHz (the conventional
+four-channel MMSE-LSA pipeline on the 48 kHz grid needs 3,920,880 bytes).
 Model weights and accelerator activation/workspace memory are external;
 adding int8 weights alone brings the known minimum to about 3.4 MiB at
 16 kHz.

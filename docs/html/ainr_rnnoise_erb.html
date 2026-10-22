@@ -57,13 +57,18 @@ ERB band gain(sigmoid ∈ [0,1]),由 C 端經 partition-of-unity 反向三角矩
 且 lookahead=1 之下,呼叫端必須把 spectrum 延遲一框再套 gain。</p>
 <pre>#include "RNNoise-ERB/process.h"
 
-RNNoiseState st;                    /* 15,328 bytes, 呼叫端配置 */
-rnnoise_state_init(&amp;st);            /* 表格為編譯期常數, 無執行期初始化 */
+RNNoiseState st;                    /* 5,104 bytes on this AArch64 host */
+AcStftConfig cfg;
+rnnoise_framing_config(&amp;cfg, fft);  /* caller-owned 512-point handle */
+/* aligned pools sized by ac_stft_get_mem_size / ac_istft_get_mem_size */
+AcStft *analysis = ac_stft_init(analysis_mem, analysis_bytes, &amp;cfg);
+AcIstft *synthesis = ac_istft_init(synthesis_mem, synthesis_bytes, &amp;cfg);
+if (rnnoise_state_init(&amp;st, analysis, synthesis) != 0) return -1;
 
 float win[512];                     /* 呼叫端滑動窗 (每 hop 移入 256 新樣本) */
 float prev_re[257], prev_im[257];   /* 呼叫端: 延遲一框的 spectrum */
 for (each hop of 256 new samples) {
-    rnnoise_analysis(&amp;st, win, spec_re, spec_im);
+    if (rnnoise_analysis(&amp;st, win, spec_re, spec_im) != 0) return -1;
     int ready = rnnoise_compute_features(&amp;st, spec_re, spec_im,
                                          erb3 /*[3][22]*/,
                                          spec3 /*[3][2][129]*/);
@@ -73,7 +78,7 @@ for (each hop of 256 new samples) {
         rnnoise_apply_atten_lim(band_gains, atten_lim_db); /* 可選, &lt;=0 = no-op */
         rnnoise_expand_gains(band_gains, bin_gains /*[257]*/);
         /* gain 屬於 t-1: 套在延遲一框的 prev_re/prev_im 上 */
-        rnnoise_synthesis(&amp;st, prev_re, prev_im, bin_gains, out256);
+        if (rnnoise_synthesis(&amp;st, prev_re, prev_im, bin_gains, out256) != 0) return -1;
     }
     save prev_re/prev_im = spec_re/spec_im;   /* 1-hop spectrum 延遲 */
 }</pre>
@@ -161,24 +166,24 @@ feature ring、gain 展開、atten-lim、頻譜延遲、ISTFT/OLA。<b>runtime �
 h1/h2/h3</b>——3 框 conv 窗由 C 端 ring 重送,圖內無 conv cache。</p>
 <div class="tbl"><table>
 <tr><th>狀態</th><th>shape</th><th>bytes</th><th>儲存者</th><th>說明</th></tr>
-<tr><td><code>synthesis_buf</code></td><td>[512]</td><td>2,048</td><td>C struct <code>RNNoiseState</code></td><td>OLA(有效 256)</td></tr>
+<tr><td><code>stft / istft</code></td><td>pointer ×2</td><td>16 (AArch64)</td><td>C struct <code>RNNoiseState</code></td><td>借用呼叫端 framing；init 檢查 grid、scale、窗與 OLA mode</td></tr>
+<tr><td>FFT / STFT / ISTFT objects</td><td>由 size-query 配置</td><td>15,600 + 6,240 + 6,240</td><td>host aligned pools</td><td>FFT、IFFT、frame scratch 與 OLA 均由 audiolib 管理；可依序共用 FFT handle</td></tr>
 <tr><td><code>erb_feat_buf</code></td><td>[3][22]</td><td>264</td><td>C struct</td><td>3-frame ERB 特徵 ring</td></tr>
 <tr><td><code>spec_feat_buf</code></td><td>[3][2][129]</td><td>3,096</td><td>C struct</td><td>3-frame complex 特徵 ring</td></tr>
 <tr><td><code>feat_idx</code> / <code>feat_count</code></td><td>int ×2</td><td>8</td><td>C struct</td><td>ring 指標 / 暖機計數</td></tr>
 <tr><td><code>erb_norm_state</code></td><td>[22]</td><td>88</td><td>C struct</td><td>dB mean EMA,α=0.984,init linspace −20→−45 dB(v8 校準)</td></tr>
 <tr><td><code>spec_norm_state</code></td><td>[129]</td><td>516</td><td>C struct</td><td>magnitude EMA,init 0.04→0.008;<code>sqrtf(state+1e-12)</code></td></tr>
-<tr><td>scratch 區</td><td>—</td><td>~9.3 KB</td><td>C struct</td><td>非跨呼叫(F13:由 stack 移入 state)</td></tr>
+<tr><td>scratch 區</td><td>—</td><td>1,116</td><td>C struct</td><td>power / ERB dB scratch，每次完整覆寫</td></tr>
 <tr><td><code>h1,h2,h3</code></td><td>(1,1,128) ×3</td><td>1,536</td><td>host <code>RNNoiseModelState</code></td><td>3 層 GRU hidden；不同 stream 間歸零；一般路徑由 <code>rnnoise_model_state_inherit()</code> 檢查後複製(非有限則不複製、回 -1、state 不變);<code>h1_in/h1_out</code> 等綁同一欄位時就地寫入,<code>rnnoise_model_state_validate()</code> 遇 NaN/Inf 整組歸零並回 -1</td></tr>
 <tr><td>1-hop spectrum 延遲</td><td>[257] ×2</td><td>2,056</td><td>host(呼叫端)</td><td>lookahead=1:gain 屬 t−1,呼叫端自存上一框頻譜</td></tr>
 <tr><td>輸入滑動窗</td><td>[512]</td><td>2,048</td><td>host(呼叫端)</td><td><code>rnnoise_analysis</code> 吃整窗,C 不代管</td></tr>
 <tr><td>ERB/Hann 表格</td><td><code>nfftborder[22]</code>、<code>erb_fwd/erb_inv[257][22]</code>、<code>hann_win[512]</code></td><td>—(.rodata)</td><td>編譯期常數</td><td><code>gen_rnnoise_tables.c</code> 產生 <code>rnnoise_tables_gen.h</code>,無執行期可變表格</td></tr>
 </table></div>
-<p class="note"><code>sizeof(RNNoiseState)</code> = 15,328 bytes(本機量測)。同一 stream 分 chunk
-處理必須傳遞 EMA + GRU state;README 對此有明確要求。</p>
+<p class="note"><code>sizeof(RNNoiseState)</code> = 5,104 bytes；獨立配置一個 FFT 與兩個 framing 的總 static memory 為 33,184 bytes，舊版為 15,328 bytes（本機量測，實際依 size-query 配置）。只有 host 已有可共用 FFT 時，RNNoise/framing 部分才是 17,584 bytes。<code>RNNOISE_PREPOST_LAYOUT_VERSION=2</code>，GRU/ONNX layout 仍為 1。同一 stream 分 chunk 必須保留 EMA、GRU、framing/OLA 與對應的 spectrum 延遲。</p>
 
 <h2>延遲與 warm-up</h2>
 <ul>
-<li><b>演算法延遲 = 1 hop = 256 samples = 16 ms</b>(<code>lookahead_frames=1</code>:
+<li><b>額外模型 lookahead = 1 hop = 256 samples = 16 ms</b>(<code>lookahead_frames=1</code>:
 3-tap conv 窗置中,gain 對應中間框 t−1;<code>RNNOISE_CONV_DELAY = 2 − LOOKAHEAD = 1</code>)。</li>
 <li>WOLA 重疊結構延遲:win−hop = 256 samples = 16 ms。</li>
 <li>Warm-up:<code>rnnoise_compute_features()</code> 前 2 框回 0(3-frame conv 窗未滿),
@@ -197,7 +202,8 @@ h1/h2/h3</b>——3 框 conv 窗由 C 端 ring 重送,圖內無 conv cache。</p
 <li>文件:<a href="../../AINR/RNNoise-ERB/README.md">README.md</a>(歷史版本紀錄在 <code>docs/archive/</code>)</li>
 <li>C 測試:<code>AINR/RNNoise-ERB/test/</code> — <code>make test</code> 實測全 PASS:
 tables byte-exact(canonical)、portable 數學合約(recompute max ULP 0)、
-config/Python/C feature 合約、feature-state 行為、SIMD/scalar digest <code>0506b5ee3d18afb8</code></li>
+config/Python/C feature 合約、feature-state 行為、framing 拒絕錯誤設定，以及固定 shared FFT 下 local DSP 的 SIMD/scalar digest。NE10 SIMD=0/1 本身允許有捨入差；不能跨 FFT 模式要求 digest 相同。</li>
+<li>FFT 數值驗證包含完整 frame、原有 Python 容差、合成 hop/首幀/重置、gain 乘法順序與固定係數網路。本機無已訓練 RNNoise 權重，真實模型感知品質尚未量測。</li>
 <li>Python 測試:<code>AINR/RNNoise-ERB/tests/</code>(pytest);
 共用測試位於 <code>AINR/tests/</code>；全樹請執行 <code>python3 -m pytest AINR</code>，目前基準數集中記錄於 <code>docs/release_checklist.md</code>。</li>
 </ul>

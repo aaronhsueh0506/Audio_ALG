@@ -1,4 +1,4 @@
-"""Build a small C shim against audio_common (and extra sources) and load it
+"""Build a small C shim against audiolib (and extra sources) and load it
 through ctypes.  Shared by the C-parity tests, which differ only in the shim
 text, the sources it needs and the argtypes they bind."""
 import ctypes
@@ -10,7 +10,7 @@ import sys
 import pytest
 
 ROOT = pathlib.Path(__file__).resolve().parents[2]
-AC = ROOT.parent / 'audio_common'
+AC = ROOT.parent / 'audiolib' / 'common'
 
 
 def build_shim(work, name, shim_source, extra_sources=(), extra_includes=(),
@@ -34,7 +34,7 @@ def build_shim(work, name, shim_source, extra_sources=(), extra_includes=(),
                '-fno-math-errno']
     for define in defines:
         command.append('-D' + define)
-    for include in (AC / 'include', *extra_includes):
+    for include in (AC / 'include', AC, *extra_includes):
         command += ['-I', str(include)]
     command += [str(shim), *[str(s) for s in extra_sources], archive, '-lm',
                 '-o', str(library)]

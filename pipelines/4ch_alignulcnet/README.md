@@ -1,7 +1,7 @@
 # 4-channel PBFDKF + BF + Align-ULCNet application
 
 This is an application skeleton, not a new library. It directly composes the
-shared 4-lane linear-AEC core, SRP-PHAT/GSC, Align-ULCNet C pre/post code and
+shared 4-lane linear-AEC core, SRP-PHAT/BF, Align-ULCNet C pre/post code and
 their existing component libraries. The core is initialized in front-only
 mode, so the unused conventional NR/RES post path is not allocated.
 
@@ -32,7 +32,7 @@ through those frames) is deferred pending an audio A/B.
 
 ## Signal path and timing (direct path)
 
-The GSC's beamformed linear-error SPECTRUM is handed to the model directly:
+The BF's beamformed linear-error SPECTRUM is handed to the model directly:
 it is already the sqrt-Hann, 50%-overlap, one-frame-per-hop analysis frame
 the Align-ULCNet chain would otherwise compute, so nothing is reconstructed
 or re-analysed in between. The far branch pushes the SAME hop's
@@ -53,11 +53,11 @@ IFFT plus one RFFT and one extra hop of latency per hop). The pipeline has none 
 one-hop far compensation buffer, and the C API entry point
 `audio_pipeline_4ch_ulcnet_last_beamformed_error()` — there is no
 reconstructed beam hop to hand out. The layout version
-(`AUDIO_PIPELINE_4CH_ULCNET_LAYOUT_VERSION`) is **20**; a persisted
+(`AUDIO_PIPELINE_4CH_ULCNET_LAYOUT_VERSION`) is **22**; a persisted
 descriptor from any earlier version is refused by
 `audio_pipeline_4ch_ulcnet_init_ex()`.
 
-Spectrogram-consistency note: `gsc_spectrum` is per-bin weighted, i.e. an
+Spectrogram-consistency note: `bf_spectrum` is per-bin weighted, i.e. an
 inconsistent spectrogram, and a WOLA round trip would project it onto a
 consistent one. Measured on real 4-channel recordings, that
 projection moves about -30 dB complex (-33 dB magnitude), -36..-43 dB over
@@ -77,7 +77,7 @@ callback. A board that runs the network itself (the NPU between `nn_begin` and
 
 ```c
 UlcnetNnJob job;
-audio_pipeline_4ch_ulcnet_process_begin(p, mics, far, vad);        /* lanes, DOA, GSC, far analysis */
+audio_pipeline_4ch_ulcnet_process_begin(p, mics, far, vad);        /* lanes, DOA, BF, far analysis */
 if (audio_pipeline_4ch_ulcnet_nn_begin(p, &job) > 0) {       /* 1 = a frame to run */
     int rc = run_network(&job);                          /* write every bin of job.out_re/out_im */
     audio_pipeline_4ch_ulcnet_nn_end(p, rc);                 /* accepted only if rc == 0 and finite */
@@ -100,15 +100,15 @@ the same hop (a masker over lane 0, for example) cannot hand them to
 AudioPipeline4ChUlcnetFront front;
 audio_pipeline_4ch_ulcnet_process_front(p, mics, far, &front);   /* lanes, alignment bookkeeping, far analysis */
 /* mask (n_freqs ints), vad_raw, vad_out from front.lane_spectra[0] */
-audio_pipeline_4ch_ulcnet_process_beam(p, &front, vad_raw, vad_out, mask);   /* SRP-PHAT, GSC */
+audio_pipeline_4ch_ulcnet_process_beam(p, &front, vad_raw, vad_out, mask);   /* SRP-PHAT, BF */
 AudioPipeline4ChUlcnetBeamState st;
-audio_pipeline_4ch_ulcnet_beam_state(p, &st);   /* doa_raw/smooth/used in radians (NaN = none), gsc_adaptive */
+audio_pipeline_4ch_ulcnet_beam_state(p, &st);   /* doa_raw/smooth/used in radians (NaN = none), bf_adaptive */
 /* then nn_begin / nn_end / process_end as above */
 ```
 
-`mask[f]` nonzero: SRP uses bin `f`, GSC freezes its adaptation on bin `f`;
+`mask[f]` nonzero: SRP uses bin `f`, BF freezes its adaptation on bin `f`;
 NULL means all bins used and none frozen. `vad_raw` gates SRP, `vad_out` feeds the
-DOA smoother and freezes GSC adaptation. `front.lane_spectra` are read-only views
+DOA smoother and freezes BF adaptation. `front.lane_spectra` are read-only views
 valid until the next `process_front()`, `process_begin()`, `reset()` or
 `destroy()`. Between the two calls only `process_beam()` is valid. The split adds
 no state to the instance: the pool size and the layout version are unchanged.
@@ -118,10 +118,9 @@ no state to the instance: the pool size and the layout version are unchanged.
 The matched-filter bank size `n` is a product deployment decision, so it is a
 command-line argument rather than a literal in `main.c`; the resolved profile
 and the pool it costs are printed at start-up — at the default matched/n=5
-profile, `BACKEND=ne10`, that banner reads 3,109,248 B at 16 kHz and
-6,468,768 B at 48 kHz. Read it from your own build rather than copying it:
-the FFT backend moves the total (the same 16 kHz profile costs 3,116,128 B
-under `BACKEND=kiss`). `n` is an init parameter, not a runtime setter —
+profile, that banner reads 3,164,176 B at 16 kHz and 6,642,608 B at 48 kHz
+(`ULCNET_GRID=48k`). Read it from your own build rather than copying it.
+`n` is an init parameter, not a runtime setter —
 changing it means re-querying the pool and re-initializing.
 
 ```sh
@@ -146,6 +145,6 @@ confidence, and nothing in the delay seam distinguishes it from a correct
 lock — see the known-delay tests.
 
 ```sh
-make BACKEND=kiss SIMD=0 test
-make BACKEND=ne10 SIMD=1 test
+make SIMD=0 test
+make SIMD=1 test
 ```

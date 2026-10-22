@@ -11,8 +11,8 @@
 - **Complex 輸入（可選、預設關閉）**: 0–4 kHz 的 129 個 real/imag bins，做每-bin magnitude EMA unit norm
 - **模型**: ERB temporal conv → 3 層 GRU(128)；開啟 complex 分支時才加入 frequency encoder/temporal conv 與 fusion
 - **輸出**: 22 個 gain masks [0, 1]
-- **參數量**: 329,302（預設純 ERB、無 VAD head）；開啟 complex 分支為 376,254
-- **Latency**: 16ms lookahead（`lookahead_frames=1`，gain 對應 3-frame window 中間幀）
+- **參數量**: 321,110（預設純 ERB、無 VAD head）；開啟 complex 分支為 376,254
+- **額外 lookahead**: 16ms（`lookahead_frames=1`，gain 對應 3-frame window 中間幀）
 
 ### Feature preprocessing
 
@@ -42,6 +42,57 @@ complex feature 約放大 `sqrt(a)` 倍。只有啟用 complex 分支時，模�
 
 Feature 常數在 `config.ini [feature]`，C 部署常數固定於 `process.h`。
 修改後需同步兩邊並重訓。
+
+## C 串流整合
+
+`process.c` 只維護模型特徵與 gain 處理；FFT、IFFT、窗與 overlap-add 由
+`audiolib/common` 的 `AcStft`／`AcIstft` 執行。呼叫端持有 FFT handle、兩個 framing
+物件及其 16-byte aligned 記憶體，並負責生命週期；處理途中沒有配置記憶體。
+分析與合成依序執行時，可以共用一個 FFT handle。傳入 `fft=NULL` 時，common 會在
+各物件的 caller pool 內各自建立 plan；記憶體需求須重新查詢。`cfg=NULL` 時設定
+helper 不做任何操作。
+
+```c
+AcStftConfig cfg;
+rnnoise_framing_config(&cfg, fft);  /* fft: caller-owned 512-point FFT */
+AcStft *analysis = ac_stft_init(analysis_mem, analysis_bytes, &cfg);
+AcIstft *synthesis = ac_istft_init(synthesis_mem, synthesis_bytes, &cfg);
+if (rnnoise_state_init(&state, analysis, synthesis) != 0) return -1;
+```
+
+記憶體大小分別以 `fft_get_mem_size(512)`、`ac_stft_get_mem_size(&cfg)`、
+`ac_istft_get_mem_size(&cfg)` 查詢。`rnnoise_state_init` 檢查實際物件的 FFT 大小、
+center、縮放、窗與合成模式；錯誤組合回傳 `-1`，不綁定物件。保留 helper 借用的
+immutable model window：512 個窗值必須與模型表逐位元相同。若另把 `cfg.window` 設為
+`NULL`，common 會自行建窗；只有產生的位元完全相同時才接受綁定，不能把這當作跨
+工具鏈保證的替代方式。重新初始化同時重置
+特徵 EMA 與 framing 狀態。呼叫端不可在綁定後重用或覆寫這些物件的記憶體。
+
+- C 部署固定為 16 kHz、FFT/window 512、hop 256、periodic root-Hann、center=0。
+  Python 設定允許 `win_len < n_fft`，但此 C 部署並不支援該模式；不能只改巨集。
+- `rnnoise_analysis` 每次讀取完整 **512 samples**，不把它當作 256-sample hop。
+  呼叫端以 256 samples 步進準備相鄰 frame，正向輸出乘 `512^-0.5`。
+- 合成保留 `spec *= gain * sqrt(512)` 的運算順序與輸入頻譜修改契約；共用 ISTFT
+  的 `ispec_scale=1`，不可再縮放一次。`AC_OLA_ACCUMULATE` 自第一幀輸出 256 samples，
+  不除窗包絡，與 Python `train.istft` 相同。
+- 最新特徵 window `[t-2,t-1,t]` 的 gain 套到 spectrum `t-1`；呼叫端仍須延遲對應頻譜。
+- `RNNOISE_PREPOST_LAYOUT_VERSION=2`：state 改為借用 framing；`rnnoise_state_init`
+  新增 analysis／synthesis 參數，並與 analysis／synthesis 一樣回傳 `0` 或 `-1`。
+  GRU 張量未改，`RNNOISE_MODEL_IO_LAYOUT_VERSION` 與 ONNX state layout 仍為 **1**。
+
+建置時加入 `audiolib/common/include`、`audiolib/common` include paths，連結同一組
+`SIMD=0/1` 的 common archive；此目錄的 Makefile 已處理這些依賴。
+
+更換 FFT 實作保留數學定義，但 butterfly 的浮點捨入會改變結果，不能宣稱逐位元
+相同。共用 FFT 在本次固定訊號與錄音對照中更接近 torch 參考；低能量 band 的 log
+會放大微小頻譜誤差。驗證涵蓋原有 Python/C 容差、完整 frame、頻譜修改、合成長度、
+首 hop、重置與固定係數網路輸出；本機沒有已訓練 RNNoise 權重，**尚未量測真實模型的
+感知品質**，固定係數測試不能替代這項評估。
+
+在目前 AArch64 host，獨立配置的總 static memory 為 **33,184 bytes**，舊版為
+15,328 bytes；其中 RNNoiseState 5,104、FFT 15,600、analysis 6,240、synthesis 6,240。
+只有呼叫端原本就持有可共用 FFT 時，新增的 RNNoise/framing 部分才是 17,584 bytes。
+這些是目前實作的量測，整合端仍應依 size-query 配置。
 
 ## 環境安裝
 
@@ -337,7 +388,7 @@ make test-tables   # 兩層都建置+執行,任一 FAIL 即非零退出
 ## Feature tests
 
 ```bash
-make test                 # tables + config/Python/C constants + C feature-state contract
+make test                 # tables + constants + feature state + local SIMD + framing rejection
 make test-feature-python  # 需 torch training environment
 ```
 

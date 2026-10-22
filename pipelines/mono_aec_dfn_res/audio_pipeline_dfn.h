@@ -41,7 +41,7 @@ extern "C" {
 /* Carve layout version. Any change of pool size, carve order or descriptor
  * content bumps it, including a change of the composed host, bridge or stage
  * pool. */
-#define MONO_AEC_DFN_RES_LAYOUT_VERSION 3u
+#define MONO_AEC_DFN_RES_LAYOUT_VERSION 4u
 
 /* `host` is the conventional pipeline's own config, validated by it. This
  * wrapper only pins the invariants the seam needs: sample_rate 8000, 16000

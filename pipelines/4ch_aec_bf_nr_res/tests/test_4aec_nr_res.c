@@ -11,6 +11,7 @@
 #include "aec_res.h"
 #include "conv_chain_4ch.h"
 #include "fft_wrapper.h"
+#include "audio_window.h"
 
 #include <float.h>
 #include <math.h>
@@ -870,13 +871,13 @@ static void run_static_parity(int sample_rate, int fft_size) {
      * build_flags_hash still matches and this counter is the whole signal.
      * Bump this literal with FOUR_AEC_NR_RES_LAYOUT_VERSION. */
     stale = req;
-    stale.layout_version = 19u;
+    stale.layout_version = 20u;
     CHECK(four_aec_nr_res_init_ex(
               pool, (size_t)req.bytes, &cfg, &stale) == NULL,
           "static init_ex rejects a descriptor from the superseded layout "
           "even when its byte count exactly covers the current pool");
     CHECK(req.layout_version == FOUR_AEC_NR_RES_LAYOUT_VERSION &&
-          FOUR_AEC_NR_RES_LAYOUT_VERSION == 20u,
+          FOUR_AEC_NR_RES_LAYOUT_VERSION == 21u,
           "the queried descriptor publishes the current carve layout");
 
     stat = four_aec_nr_res_init_ex(
@@ -1062,11 +1063,7 @@ static void test_pre_frame_wola_identity(int sample_rate, int fft_size) {
         history[i] = 0.1f * (((float)(rng >> 8) *
                               (1.0f / 16777216.0f)) - 0.5f);
     }
-    for (int i = 0; i < fft_size; ++i) {
-        window[i] = sqrtf(0.5f * (1.0f - cosf(
-            2.0f * 3.14159265358979323846f * (float)i /
-            (float)fft_size)));
-    }
+    ac_window_build(window, fft_size);
     for (int ch = 0; ch < FOUR_AEC_NR_RES_CHANNELS; ++ch) {
         for (int k = 0; k < n_freqs; ++k)
             weights[(size_t)ch * n_freqs + k].r = 0.25f;
@@ -1363,8 +1360,8 @@ cleanup:
     (((n) - 1) * DA_FILTER_INTRA_SHIFT * DA_DOWN_SAMPLING_FACTOR + \
      (DA_FILTER_SIZE - 11) * DA_DOWN_SAMPLING_FACTOR)
 
-/* The applied alignment must never land LATER than the true echo: the AEC3
- * design deliberately reports early so PBFDKF sees a POSITIVE residual it can
+/* The applied alignment must never land LATER than the true echo: the AEC
+ * delay estimator deliberately reports early so PBFDKF sees a POSITIVE residual it can
  * model (a negative residual is non-causal for the filter and cannot be).
  * Measured across n=1..5 and true delays 4..509 ms, the shortfall is 64 or 80
  * samples -- one estimator headroom (32) plus pre-echo block quantisation.
@@ -1441,15 +1438,15 @@ static void known_delay_run(int num_filters, int hops,
         /* The published `solid` must be exactly "a usable accepted alignment
          * generation exists", recomputed here from the OTHER published
          * estimator fields rather than read back from `solid` itself:
-         * confidence >= 1.0 IS delay_aec3_is_solid(), estimator_updates IS
-         * delay_aec3_n_updates(), and the remaining acceptance term
+         * confidence >= 1.0 IS delay_aec_is_solid(), estimator_updates IS
+         * delay_aec_n_updates(), and the remaining acceptance term
          * (estimated >= 0) is implied by confidence >= 1.0 -- a confidence
          * above 0 requires a produced estimate, and a produced estimate is
          * never negative. Sticky, because a confidence dip must not retract
          * an alignment the audio path is still applying.
          *
          * MUTATIONS: publishing `solid` on COARSE confidence (`state.solid =
-         * now_usable || delay_aec3_confidence(...) >= 0.5f`) makes it lead
+         * now_usable || delay_aec_confidence(...) >= 0.5f`) makes it lead
          * the accepted delay and BOTH counters below go non-zero; widening
          * the wrapper's own `n_updates >= 3` acceptance term (e.g. to 30)
          * makes it lag instead, and solid_disagreements alone goes
@@ -1715,7 +1712,7 @@ static void test_known_delay_memory_and_cost(void) {
  *
  * Two things absorb movement before the lanes ever see it, and they sit at
  * different scales:
- *   - DelayAec3 publishes on a 16-downsampled-sample grid (64 native samples
+ *   - DelayAec publishes on a 16-downsampled-sample grid (64 native samples
  *     at 16 kHz), so a bulk-delay wander finer than that never reaches the
  *     wrapper at all -- the WANDER row measures that end of the seam;
  *   - the wrapper's own admission (> 32 samples AND repeated within 16 on the
@@ -1857,7 +1854,7 @@ static void test_shared_delay_change_admission(void) {
     char label[224];
 
     /* WANDER: the bulk delay itself moves by 24 samples (1.5 ms) back and
-     * forth, below both the wrapper's 32-sample admission and DelayAec3's own
+     * forth, below both the wrapper's 32-sample admission and DelayAec's own
      * 64-sample output grid. Nothing may reach the lanes: one acquisition
      * sweep for the whole run and an alignment that never moves again. */
     realign_run(240, 512, 536, 0.0f, -1, 30, &wander);
@@ -1958,7 +1955,7 @@ static void test_shared_delay_change_admission(void) {
  * Held-candidate lifetime
  *
  * The admission state machine is driven directly here. Through a stream it
- * cannot be: DelayAec3 re-offers a movement on every hop once it has one, so
+ * cannot be: DelayAec re-offers a movement on every hop once it has one, so
  * the candidate is always resolved on the very next eligible hop and its TTL
  * never runs out -- the same reason the expiry rule exists at all is the
  * reason a synthetic scene cannot exercise it. What a scene DOES cover (a
@@ -2233,11 +2230,9 @@ static void duty_run(int hops, int delay_a, int delay_b, int shift_at,
 
     cfg.fft_size = 512;             /* the ULCNet grid: hop 256 */
     cfg.enable_cng = 0;
-    /* The throttle is opt-in since AMEND_35 (2026-10-18; default is full
-     * rate) -- this scene exists specifically to characterize the throttle,
-     * so it asks for the regime explicitly rather than relying on a default
-     * that no longer produces it. 0.5 s is the pre-AMEND_35 default this
-     * scene's numbers were always measured against. */
+    /* The throttle is opt-in (the default is full rate) -- this scene exists
+     * specifically to characterize the throttle, so it asks for the regime
+     * explicitly. 0.5 s is the period this scene's numbers were measured at. */
     cfg.delay_est_period_s = 0.5f;
     p = four_aec_nr_res_create(&cfg);
     if (!p) return;
@@ -2663,7 +2658,7 @@ static void test_duty_watchdog_leak_is_a_rate(void) {
  * the WHOLE re-lock mechanism. The same scene is driven twice, once with the
  * schedule pinned at full rate through four_aec_nr_res_pin_duty_full_rate()
  * and once with the throttle opted into via cfg.delay_est_period_s (the
- * default since AMEND_35, 2026-10-18, is already full rate -- an embedded
+ * default is already full rate -- an embedded
  * deployment that wants this scene's compute saving back has to ask for the
  * throttle explicitly, the same way the C port's own cfg.delay_est_period_s
  * works), and the two re-lock latencies are printed side by side.
@@ -2743,10 +2738,10 @@ static void low_erle_run(int pin_full_rate, LowErleRun* out) {
 
     cfg.fft_size = 512;             /* the ULCNet grid: hop 256 */
     cfg.enable_cng = 0;
-    /* The throttle is opt-in since AMEND_35 (2026-10-18; default is full
-     * rate) -- this scene exists to compare the throttled duty arm against
-     * a full-rate one, so it asks for the throttled regime explicitly. 0.5 s
-     * is the pre-AMEND_35 default LE_DUTY_K was always measured against. */
+    /* The throttle is opt-in (the default is full rate) -- this scene exists
+     * to compare the throttled duty arm against a full-rate one, so it asks
+     * for the throttled regime explicitly. 0.5 s is the period LE_DUTY_K was
+     * measured against. */
     cfg.delay_est_period_s = 0.5f;
     p = four_aec_nr_res_create(&cfg);
     if (!p) return;
@@ -3020,6 +3015,267 @@ static void test_far_spec_provenance_guard(void) {
         free(weights);
         four_aec_nr_res_destroy(p);
     }
+}
+
+
+/* A hop on which some lanes realign warm and others soft must give EVERY lane
+ * its own far spectrum. A soft realign zeroes that lane's far-analysis
+ * history (far_buffer) while a warm one keeps it, so the lanes' analysis
+ * frames differ on that hop and the spectrum lane 0 computes is wrong for the
+ * lanes whose history was reset. Borrowing it anyway leaves no trace on the
+ * hop itself (a freshly reset filter has zero taps, so its error equals its
+ * near input whatever far spectrum it was handed); the wrong spectrum is
+ * pushed into the lane's partition history and corrupts the echo estimate and
+ * the adaptation of the hops that follow. So the reference here is four
+ * stand-alone lanes built from the core's own lane configuration, fed the
+ * same microphones, the same aligned far and the same realign deltas, and
+ * always processed through the ordinary local-far path (aec_process_context);
+ * the core's lanes must match them bit for bit on every hop, and the far-FFT
+ * counter must read 4 on the mixed hop and 1 on every other hop.
+ *
+ * The scene makes the mix happen on its own: lanes 0 and 1 carry a
+ * two-path echo of the render, so they are still cancelling when the shared
+ * alignment swings from the weaker path to the stronger one (warm tap
+ * transfer), while lanes 2 and 3 carry unrelated noise that no filter can
+ * cancel (filter-only reset). Both echo paths sit inside the filters' tap
+ * span, which is what keeps the echo lanes cancelling through the swing. */
+typedef struct MixedHopRun {
+    int hops_run;
+    int mixed_hops;              /* hops with both warm and soft lane realigns */
+    int mixed_hop_first;         /* -1 when none                              */
+    int mixed_fft_not_four;      /* mixed hops whose far-FFT delta was not 4   */
+    int other_fft_not_one;       /* other hops whose far-FFT delta was not 1   */
+    int outcome_count_mismatch;  /* realign hops where reference warm/soft
+                                  * counts differ from the core's              */
+    int lane_hops_mismatched;    /* lane-hops where error spectrum or formed
+                                  * hop differs from the reference             */
+    int first_mismatch_hop;      /* -1 when none                              */
+    int far_spec_diverges;       /* mixed hops where the reference lanes' own
+                                  * far spectra differ between lanes           */
+    int fuse_failures;           /* hops whose fuse did not return OK          */
+    int valid;
+} MixedHopRun;
+
+static int mixed_hop_far_specs_differ(const Complex* a, const Complex* b,
+                                      int n) {
+    return memcmp(a, b, (size_t)n * sizeof(Complex)) != 0;
+}
+
+static void mixed_hop_run(int sample_rate, int fft_size, int strong_delay,
+                          int weak_delay, int swing_hop, int hops,
+                          MixedHopRun* out) {
+    enum { MH_PAD = 4096 };
+    FourAecNrResConfig cfg = four_aec_nr_res_default_config(sample_rate);
+    AecConfig lane_cfg;
+    AnrConfig nr_cfg;
+    FourAecNrRes* p = NULL;
+    Aec* ref_lane[FOUR_AEC_NR_RES_CHANNELS] = {NULL, NULL, NULL, NULL};
+    void* ref_pool[FOUR_AEC_NR_RES_CHANNELS] = {NULL, NULL, NULL, NULL};
+    uint32_t noise_rng[FOUR_AEC_NR_RES_CHANNELS] = {
+        0u, 0u, 0x9e3779b9u, 0x85ebca6bu};
+    uint32_t rng = 0x1234567u;
+    float* history = NULL;
+    float* microphones = NULL;
+    float* lane_mic = NULL;
+    float* ref = NULL;
+    Complex* weights = NULL;
+    long warm_before = 0, soft_before = 0, fft_before = 0;
+    int previous_solid = 0;
+    int previous_delay = 0;
+    int hop = 0, n_freqs = 0;
+    int h, ch, i;
+
+    memset(out, 0, sizeof(*out));
+    out->mixed_hop_first = -1;
+    out->first_mismatch_hop = -1;
+
+    cfg.fft_size = fft_size;
+    cfg.enable_cng = 0;
+    p = four_aec_nr_res_create(&cfg);
+    if (!p || four_aec_nr_res_stage_configs(&cfg, &lane_cfg, &nr_cfg) != 0)
+        goto cleanup;
+    hop = four_aec_nr_res_hop_size(p);
+    n_freqs = four_aec_nr_res_n_freqs(p);
+    {
+        size_t bytes = aec_get_mem_size(&lane_cfg);
+        for (ch = 0; ch < FOUR_AEC_NR_RES_CHANNELS; ++ch) {
+            if (bytes == 0 ||
+                posix_memalign(&ref_pool[ch], 16, bytes) != 0) goto cleanup;
+            ref_lane[ch] = aec_init(ref_pool[ch], bytes, &lane_cfg);
+            if (!ref_lane[ch]) goto cleanup;
+        }
+    }
+    history = (float*)calloc((size_t)(hops * hop + MH_PAD), sizeof(float));
+    microphones = (float*)calloc(
+        (size_t)hop * FOUR_AEC_NR_RES_CHANNELS, sizeof(float));
+    lane_mic = (float*)calloc((size_t)hop, sizeof(float));
+    ref = (float*)calloc((size_t)hop, sizeof(float));
+    weights = (Complex*)calloc(
+        (size_t)FOUR_AEC_NR_RES_CHANNELS * n_freqs, sizeof(Complex));
+    if (!history || !microphones || !lane_mic || !ref || !weights)
+        goto cleanup;
+    for (i = 0; i < hops * hop + MH_PAD; ++i) {
+        rng ^= rng << 13; rng ^= rng >> 17; rng ^= rng << 5;
+        history[i] = 0.1f * (((float)(rng >> 8) *
+                              (1.0f / 16777216.0f)) - 0.5f);
+    }
+    for (i = 0; i < FOUR_AEC_NR_RES_CHANNELS * n_freqs; ++i)
+        weights[i].r = 0.25f;
+
+    for (h = 0; h < hops; ++h) {
+        FourAecFront pre;
+        SeSpecFrame fused;
+        int base = h * hop + MH_PAD;
+        float strong_gain = h >= swing_hop ? 0.25f : 0.6f;
+        float weak_gain = h >= swing_hop ? 0.6f : 0.25f;
+        int old_align = previous_solid ? previous_delay : 0;
+        long warm_after, soft_after, fft_after;
+        int warm_delta, soft_delta, fft_delta, mixed;
+        int ref_warm = 0, ref_soft = 0;
+        const Complex* first_far = NULL;
+        const Complex* soft_far = NULL;
+
+        for (i = 0; i < hop; ++i) {
+            float echo = strong_gain * history[base + i - strong_delay] +
+                         weak_gain * history[base + i - weak_delay];
+            ref[i] = history[base + i];
+            for (ch = 0; ch < FOUR_AEC_NR_RES_CHANNELS; ++ch) {
+                float v = echo;
+                if (ch >= 2) {
+                    noise_rng[ch] ^= noise_rng[ch] << 13;
+                    noise_rng[ch] ^= noise_rng[ch] >> 17;
+                    noise_rng[ch] ^= noise_rng[ch] << 5;
+                    v = 0.06f * (((float)(noise_rng[ch] >> 8) *
+                                  (1.0f / 16777216.0f)) - 0.5f);
+                }
+                microphones[i * FOUR_AEC_NR_RES_CHANNELS + ch] = v;
+            }
+        }
+        if (four_aec_front_process(p, microphones, ref, &pre) !=
+                FOUR_AEC_NR_RES_OK) goto cleanup;
+        out->hops_run += 1;
+
+        warm_after = four_aec_nr_res_realign_warm_lane_count(p);
+        soft_after = four_aec_nr_res_realign_soft_lane_count(p);
+        fft_after = four_aec_nr_res_far_fft_real_compute_count(p);
+        warm_delta = (int)(warm_after - warm_before);
+        soft_delta = (int)(soft_after - soft_before);
+        fft_delta = (int)(fft_after - fft_before);
+        mixed = pre.delay.changed && warm_delta > 0 && soft_delta > 0;
+        if (mixed) {
+            out->mixed_hops += 1;
+            if (out->mixed_hop_first < 0) out->mixed_hop_first = h;
+        }
+
+        if (pre.delay.changed) {
+            for (ch = 0; ch < FOUR_AEC_NR_RES_CHANNELS; ++ch) {
+                int outcome = aec_apply_external_realign(
+                    ref_lane[ch], pre.delay.delay_samples - old_align);
+                if (outcome == 1) ref_warm += 1;
+                if (outcome == 0) ref_soft += 1;
+            }
+            if (ref_warm != warm_delta || ref_soft != soft_delta)
+                out->outcome_count_mismatch += 1;
+        }
+        for (ch = 0; ch < FOUR_AEC_NR_RES_CHANNELS; ++ch) {
+            AecResContext context;
+            int lane_bad;
+            for (i = 0; i < hop; ++i)
+                lane_mic[i] = microphones[i * FOUR_AEC_NR_RES_CHANNELS + ch];
+            aec_process_context(ref_lane[ch], lane_mic, pre.aligned_ref);
+            aec_get_res_context(ref_lane[ch], &context);
+            lane_bad =
+                memcmp(context.error_spec, pre.linear_spectra[ch],
+                       (size_t)n_freqs * sizeof(Complex)) != 0 ||
+                memcmp(context.formed_hop, pre.formed_hop[ch],
+                       (size_t)hop * sizeof(float)) != 0;
+            if (lane_bad) {
+                out->lane_hops_mismatched += 1;
+                if (out->first_mismatch_hop < 0) out->first_mismatch_hop = h;
+            }
+            if (ch == 0) first_far = context.far_spec;
+            else if (!soft_far && first_far && mixed &&
+                     mixed_hop_far_specs_differ(
+                         context.far_spec, first_far, n_freqs))
+                soft_far = context.far_spec;
+        }
+        if (mixed && soft_far) out->far_spec_diverges += 1;
+
+        if (mixed) {
+            if (fft_delta != FOUR_AEC_NR_RES_CHANNELS)
+                out->mixed_fft_not_four += 1;
+        } else if (fft_delta != 1) {
+            out->other_fft_not_one += 1;
+        }
+        if (four_aec_fuse(p, weights, NULL, &fused) != FOUR_AEC_NR_RES_OK)
+            out->fuse_failures += 1;
+
+        previous_solid = pre.delay.solid;
+        previous_delay = pre.delay.delay_samples;
+        warm_before = warm_after;
+        soft_before = soft_after;
+        fft_before = fft_after;
+    }
+    out->valid = 1;
+
+cleanup:
+    free(weights);
+    free(ref);
+    free(lane_mic);
+    free(microphones);
+    free(history);
+    for (ch = 0; ch < FOUR_AEC_NR_RES_CHANNELS; ++ch) free(ref_pool[ch]);
+    four_aec_nr_res_destroy(p);
+}
+
+static void test_mixed_realign_hop_far_spectrum(
+        int sample_rate, int fft_size, int strong_delay, int weak_delay,
+        int swing_hop, int hops) {
+    MixedHopRun run;
+    char label[256];
+
+    mixed_hop_run(sample_rate, fft_size, strong_delay, weak_delay,
+                  swing_hop, hops, &run);
+    snprintf(label, sizeof(label),
+             "mixed realign sr=%d/fft=%d: the scene runs to completion and "
+             "really produces a hop with warm AND soft lane realigns (%d "
+             "mixed hop(s), first at hop %d of %d)",
+             sample_rate, fft_size, run.mixed_hops, run.mixed_hop_first,
+             run.hops_run);
+    CHECK(run.valid && run.hops_run == hops && run.mixed_hops >= 1, label);
+    snprintf(label, sizeof(label),
+             "mixed realign sr=%d/fft=%d: the independent reference lanes "
+             "realign with the same warm/soft split as the core's lanes (%d "
+             "hops differ)",
+             sample_rate, fft_size, run.outcome_count_mismatch);
+    CHECK(run.valid && run.outcome_count_mismatch == 0, label);
+    snprintf(label, sizeof(label),
+             "mixed realign sr=%d/fft=%d: on the mixed hop the lanes' own "
+             "far spectra really differ (%d of %d mixed hops)",
+             sample_rate, fft_size, run.far_spec_diverges, run.mixed_hops);
+    CHECK(run.valid && run.mixed_hops >= 1 &&
+          run.far_spec_diverges == run.mixed_hops, label);
+    snprintf(label, sizeof(label),
+             "mixed realign sr=%d/fft=%d: every mixed hop runs four local "
+             "far FFTs (%d mixed hops did not) and every other hop exactly "
+             "one (%d hops did not)",
+             sample_rate, fft_size, run.mixed_fft_not_four,
+             run.other_fft_not_one);
+    CHECK(run.valid && run.mixed_fft_not_four == 0 &&
+          run.other_fft_not_one == 0, label);
+    snprintf(label, sizeof(label),
+             "mixed realign sr=%d/fft=%d: every lane's error spectrum and "
+             "formed hop equals an ordinary local-far reference lane bit for "
+             "bit across the mixed hop and the hops after it (%d lane-hops "
+             "differ, first at hop %d)",
+             sample_rate, fft_size, run.lane_hops_mismatched,
+             run.first_mismatch_hop);
+    CHECK(run.valid && run.lane_hops_mismatched == 0, label);
+    snprintf(label, sizeof(label),
+             "mixed realign sr=%d/fft=%d: the fuse accepts the mixed hop "
+             "and every other (%d refusals)",
+             sample_rate, fft_size, run.fuse_failures);
+    CHECK(run.valid && run.fuse_failures == 0, label);
 }
 
 /* One hop of the echo stimulus the bypass tests share: a far-end tone, its
@@ -3820,6 +4076,7 @@ static void test_fuse_frame_contract(void) {
     SeSpecFrame fr;
     uint32_t rng = 7u;
     int h, i, hop, n, ok = 1, flags_match = 1, finite = 1;
+    int usable_linear_valid = 1, usable_linear_seen = 0;
 
     cfg.fft_size = 1024;
     p = four_aec_nr_res_create(&cfg);
@@ -3843,11 +4100,22 @@ static void test_fuse_frame_contract(void) {
         if (!(fr.max_dt >= 0.0f) || !(fr.max_sat >= 0.0f) ||
             !all_finite(fr.r2, n) || !all_finite(fr.cn, n))
             finite = 0;
+        if (fr.usable_linear != 0 && fr.usable_linear != 1)
+            usable_linear_valid = 0;
+        if (fr.usable_linear)
+            usable_linear_seen = 1;
     }
     CHECK(ok, "fuse frame: shape, pointers and no lane-level gain on every hop");
     CHECK(flags_match,
           "fuse frame: delay flags follow the shared aligner");
     CHECK(finite, "fuse frame: R^2, comfort noise and the worst-lane scalars are valid");
+    CHECK(usable_linear_valid,
+          "fuse frame: usable_linear is a 0/1 verdict on every hop");
+    CHECK(usable_linear_seen,
+          "fuse frame: usable_linear becomes true once four equally-weighted, "
+          "equally-converging lanes clear startup (regression guard for the "
+          "af914d4 lost-update: frame->usable_linear was memset to 0 and "
+          "never written)");
     CHECK(four_aec_fuse(p, weights, NULL, &fr) == FOUR_AEC_NR_RES_OK,
           "fuse frame: a second fuse on the same front frame is allowed");
 
@@ -3868,8 +4136,206 @@ static void test_fuse_frame_contract(void) {
     four_aec_nr_res_destroy(p);
 }
 
+/* Like synth_echo_hop(), but lane decorrelated_ch gets capture content with
+ * zero correlation to the far-end reference (independent noise, no echo
+ * term at all) instead of the shared echo. That lane's adaptive filter has
+ * nothing stable to lock onto, so its own filter_converged never fires,
+ * convergence_seen never latches, and usable_linear (gated on
+ * convergence_seen -- see fq_update()/fq_linear_filter_usable() in
+ * lib/aec/c_impl/src/filter_quality.c) stays false for the whole run. */
+static void synth_echo_hop_decorrelated_lane(int h, int hop, float* mics,
+                                             float* far, int decorrelated_ch,
+                                             uint32_t* rng) {
+    int i, ch;
+    for (i = 0; i < hop; ++i) {
+        float t = (float)(h * hop + i);
+        float r = 0.6f * sinf(0.06f * t);
+        float noise;
+        *rng = *rng * 1664525u + 1013904223u;
+        noise = 0.02f * ((float)((*rng >> 8) & 0xFFFFu) / 32768.0f - 1.0f);
+        far[i] = r;
+        for (ch = 0; ch < 4; ++ch) {
+            if (ch == decorrelated_ch) {
+                uint32_t draw = (*rng = *rng * 1664525u + 1013904223u);
+                mics[(size_t)i * 4u + (size_t)ch] =
+                    0.3f * ((float)((draw >> 8) & 0xFFFFu) / 32768.0f - 1.0f);
+            } else {
+                mics[(size_t)i * 4u + (size_t)ch] =
+                    0.5f * r + 0.02f * sinf(0.017f * t) + noise;
+            }
+        }
+    }
+}
+
+/* Complement to test_fuse_frame_contract(): the usable_linear AND-fold in
+ * fuse_contexts() must run over CONTRIBUTING lanes only (the same
+ * lane_contributes gate the all_converged fold right above it already
+ * uses), matching Python's `all(... for c in contributors)` -- not an AND
+ * over all four lanes unconditionally, and not a constant.
+ *
+ * Lane 3 is fed capture content with zero correlation to the far-end
+ * reference for the whole run, so its own usable_linear stays false (see
+ * synth_echo_hop_decorrelated_lane()) while lanes 0-2 see the ordinary
+ * correlated echo and become usable within the window, exactly as in
+ * test_fuse_frame_contract(). The same front frame is then fused twice each
+ * hop (four_aec_fuse() on the same front frame twice is already exercised
+ * and allowed by test_fuse_frame_contract()):
+ *   - with lane 3 at zero weight (non-contributing) -> usable_linear must
+ *     eventually read true, driven by lanes 0-2 alone. A buggy AND over all
+ *     four lanes unconditionally would instead latch this false forever.
+ *   - with lane 3 given real weight (contributing) -> usable_linear must
+ *     then read false, because a lane that is actually voting is not
+ *     usable. A naive "always force usable_linear=1" mutation, or one that
+ *     drops the AND-fold entirely, gets exactly this wrong -- and is NOT
+ *     caught by test_fuse_frame_contract()'s equal-weight-only setup, where
+ *     the correct fold and "always 1" are indistinguishable. */
+static void test_fuse_usable_linear_and_over_contributors(void) {
+    FourAecNrResConfig cfg = four_aec_nr_res_default_config(48000);
+    FourAecNrRes* p;
+    static Complex noncontrib_w[4 * 513];
+    static Complex contrib_w[4 * 513];
+    static float mics[512 * 4];
+    float far[512];
+    FourAecFront front;
+    SeSpecFrame fr;
+    uint32_t rng = 31u;
+    int h, i, hop, n, k, ok = 1;
+    int noncontrib_usable_seen = 0;
+    int contrib_usable_wrongly_true = 0;
+
+    cfg.fft_size = 1024;
+    p = four_aec_nr_res_create(&cfg);
+    CHECK(p != NULL, "fuse usable_linear AND-fold: core creates");
+    if (!p) return;
+    hop = four_aec_nr_res_hop_size(p);
+    n = four_aec_nr_res_n_freqs(p);
+    for (k = 0; k < n; ++k) {
+        for (i = 0; i < 3; ++i) {
+            noncontrib_w[(size_t)i * n + k].r = 1.0f / 3.0f;
+            noncontrib_w[(size_t)i * n + k].i = 0.0f;
+        }
+        noncontrib_w[3 * n + k].r = 0.0f;
+        noncontrib_w[3 * n + k].i = 0.0f;
+        for (i = 0; i < 4; ++i) {
+            contrib_w[(size_t)i * n + k].r = 0.25f;
+            contrib_w[(size_t)i * n + k].i = 0.0f;
+        }
+    }
+
+    for (h = 0; h < 60; ++h) {
+        synth_echo_hop_decorrelated_lane(h, hop, mics, far, 3, &rng);
+        ok = ok && four_aec_front_process(p, mics, far, &front) ==
+                       FOUR_AEC_NR_RES_OK;
+        if (!ok) break;
+        ok = ok && four_aec_fuse(p, noncontrib_w, NULL, &fr) ==
+                       FOUR_AEC_NR_RES_OK;
+        if (!ok) break;
+        if (fr.usable_linear) noncontrib_usable_seen = 1;
+
+        ok = ok &&
+             four_aec_fuse(p, contrib_w, NULL, &fr) == FOUR_AEC_NR_RES_OK;
+        if (!ok) break;
+        if (noncontrib_usable_seen && fr.usable_linear)
+            contrib_usable_wrongly_true = 1;
+    }
+    CHECK(ok, "fuse usable_linear AND-fold: front/fuse succeed on every hop");
+    CHECK(noncontrib_usable_seen,
+          "fuse usable_linear AND-fold: zero-weight non-usable lane does not "
+          "block the other three (equally-weighted, equally-converging) "
+          "lanes from driving usable_linear true");
+    CHECK(!contrib_usable_wrongly_true,
+          "fuse usable_linear AND-fold: once the same never-converging lane "
+          "is given real weight, usable_linear must read false (AND over "
+          "contributing lanes, not 'always true')");
+
+    four_aec_nr_res_destroy(p);
+}
+
+static void test_proxy_lane_inputs(int sample_rate, int fft_size,
+                                   AecDelayMode mode) {
+    FourAecNrResConfig cfg = four_aec_nr_res_default_config(sample_rate);
+    FourAecNrRes* pipelines[4] = {NULL, NULL, NULL, NULL};
+    FourAecFront views[4];
+    float* microphones = NULL;
+    float* ref = NULL;
+    int hop = 0, bins = 0, ok = 1, distinct = 0;
+    cfg.fft_size = fft_size;
+    cfg.delay_mode = mode;
+    cfg.fixed_delay_samples = mode == AEC_DELAY_FIXED ? 0 : -1;
+    for (int proxy = 0; proxy < 4; ++proxy) {
+        cfg.capture_proxy_channel = proxy;
+        pipelines[proxy] = four_aec_nr_res_create(&cfg);
+        if (!pipelines[proxy]) { ok = 0; break; }
+    }
+    if (ok) {
+        hop = four_aec_nr_res_hop_size(pipelines[0]);
+        bins = four_aec_nr_res_n_freqs(pipelines[0]);
+        microphones = (float*)calloc((size_t)hop * 4, sizeof(float));
+        ref = (float*)calloc((size_t)hop, sizeof(float));
+        ok = microphones != NULL && ref != NULL;
+    }
+    /* With alignment fixed, the matcher proxy must not change any lane's
+     * capture input. Distinct channels expose a reused deinterleave buffer. */
+    for (int h = 0; h < 12 && ok; ++h) {
+        if (h == 6)
+            for (int proxy = 0; proxy < 4; ++proxy)
+                four_aec_nr_res_reset(pipelines[proxy]);
+        for (int i = 0; i < hop; ++i)
+            for (int ch = 0; ch < 4; ++ch)
+                microphones[4 * i + ch] = 0.05f * (float)(ch + 1) *
+                    sinf((float)(h * hop + i) * (0.03f + 0.011f * ch));
+        for (int proxy = 0; proxy < 4; ++proxy)
+            if (four_aec_front_process(pipelines[proxy], microphones, ref,
+                                      &views[proxy]) != FOUR_AEC_NR_RES_OK)
+                ok = 0;
+        if (!ok) break;
+        distinct |= memcmp(views[0].linear_spectra[0],
+                           views[0].linear_spectra[1],
+                           (size_t)bins * sizeof(Complex)) != 0;
+        for (int proxy = 1; proxy < 4; ++proxy)
+            for (int ch = 0; ch < 4; ++ch)
+                if (memcmp(views[0].linear_spectra[ch],
+                           views[proxy].linear_spectra[ch],
+                           (size_t)bins * sizeof(Complex)) != 0 ||
+                    memcmp(views[0].formed_hop[ch],
+                           views[proxy].formed_hop[ch],
+                           (size_t)hop * sizeof(float)) != 0)
+                    ok = 0;
+    }
+    CHECK(ok && distinct,
+          "every legal proxy preserves distinct per-lane capture across reset");
+    for (int proxy = 0; proxy < 4; ++proxy)
+        if (pipelines[proxy]) four_aec_nr_res_destroy(pipelines[proxy]);
+    free(microphones);
+    free(ref);
+}
+
+static void test_counter_boundaries(void) {
+    CHECK(four_aec_count_add_sat(3, 7) == 10 &&
+          four_aec_count_add_sat(LONG_MAX - 1, 1) == LONG_MAX &&
+          four_aec_count_add_sat(LONG_MAX - 1, 2) == LONG_MAX &&
+          four_aec_count_add_sat(LONG_MAX, LONG_MAX) == LONG_MAX,
+          "diagnostic counts saturate without signed overflow");
+    CHECK(four_aec_far_fft_delta_matches(0, 1, 1) &&
+          four_aec_far_fft_delta_matches(7, 7, 0) &&
+          !four_aec_far_fft_delta_matches(LONG_MAX - 1, LONG_MAX, 1) &&
+          !four_aec_far_fft_delta_matches(LONG_MAX, LONG_MAX, 0) &&
+          !four_aec_far_fft_delta_matches(LONG_MAX, LONG_MAX, 1) &&
+          !four_aec_far_fft_delta_matches(10, 0, 1) &&
+          !four_aec_far_fft_delta_matches(-1, LONG_MAX, 1),
+          "ambiguous counter deltas never establish borrow provenance");
+}
+
 int main(void) {
+    test_counter_boundaries();
+    test_proxy_lane_inputs(16000, 256, AEC_DELAY_FIXED);
+    test_proxy_lane_inputs(16000, 512, AEC_DELAY_FIXED);
+    test_proxy_lane_inputs(48000, 1024, AEC_DELAY_FIXED);
+    test_proxy_lane_inputs(16000, 256, AEC_DELAY_EXTERNAL_ALIGNED);
+    test_proxy_lane_inputs(16000, 512, AEC_DELAY_EXTERNAL_ALIGNED);
+    test_proxy_lane_inputs(48000, 1024, AEC_DELAY_EXTERNAL_ALIGNED);
     test_projection_kernels();
+    test_fuse_usable_linear_and_over_contributors();
     test_weights_gate();
     test_trusted_spectrum_finite_gate();
     test_trusted_spectrum_path();
@@ -3899,6 +4365,9 @@ int main(void) {
     test_duty_watchdog_leak_is_a_rate();
     test_duty_low_erle_delay_change();
     test_far_spec_provenance_guard();
+    test_mixed_realign_hop_far_spectrum(16000, 256, 256, 512, 150, 360);
+    test_mixed_realign_hop_far_spectrum(16000, 512, 512, 1024, 150, 360);
+    test_mixed_realign_hop_far_spectrum(48000, 1024, 1536, 3072, 150, 480);
     test_nr_bypass_output_identity();
     test_res_bypass_passthrough();
     test_stage_timing();

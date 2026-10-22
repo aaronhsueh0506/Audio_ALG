@@ -17,7 +17,7 @@
 | | 結果 |
 |---|---|
 | **pull 型結構化快照** | **全部存活**（`aec_debug_status`、`aec_get_res_context`、`aec_get_linear_context`、`aec_get_mem_breakdown`、`aec_linear_is_cancelling`、`aec_far_fft_real_compute_count`、`anr_debug_status`、4ch 的全部 counter accessor） |
-| **push 型 log / trace** | **全部消失**（沒有 `aec_debug_logf`、沒有 `aec_debug_set_trace`、archive 內連 `fprintf`/`vfprintf` 的引用都沒有） |
+| **push 型 log / trace** | **全部消失**（沒有 `aec_debug_set_trace`、沒有每 hop CSV trace，`aec_debug.o` 不進 archive，archive 內連 `fprintf`/`vfprintf` 的引用都沒有） |
 | **stage timing** | 函式存活但**數值全為 0**（`AEC_STAGE_TIMING` 預設 0） |
 | **finite guards / 錯誤碼** | 全部存活，不受任何開關影響 |
 
@@ -45,7 +45,7 @@
 | # | 盲點 | 證據 |
 |---|---|---|
 | **G1** | **`assert()` 在出貨板上是活的**。四個 Makefile 沒有任何一個設 `-DNDEBUG`；`suppression_gain.c` 的 table-length assert **沒有 release-path fallback**，失敗即 `abort()`——沒有回傳碼、沒有 log、沒有 hook 可攔 | 全樹 grep `-DNDEBUG` = 0 命中 |
-| **G2** | **層級式 log 是死碼**。`AEC_DEBUG_LOG` 在整個 `src/` 有 **0 個呼叫點**（唯一命中是一句註解） | grep `AEC_DEBUG_LOG src/` |
+| **G2** | **沒有層級式 log**。`aec_debug_set_level()`／`aec_debug_set_log()` 只把值存進 `aec_debug.c` 的靜態變數，library 內沒有任何讀取端，也沒有 emit 函式；CLI 的 `--debug-level`／`--debug-log` 因此不會產生輸出 | `src/aec_debug.c` 的 `g_level`／`g_fp` 只被賦值 |
 | **G3** | **per-hop CSV trace 在四條 pipeline 全部不可達**。唯一填寫點要求 `cfg.enable_res == 1` 且走 `aec_process()`；四條 pipeline **全部**無條件設 `enable_res = 0` | `audio_pipeline.c`、`audio_pipeline_ulcnet.c`、`4aec_nr_res.c` 的 `derive_dims_and_configs()` |
 | **G4** | **self-reset 不計數，而且會抹掉證據**。`DSP_ERROR` 路徑內部呼叫 `reset()`，而 `reset()` 把 realign counters / duty census 全部歸零 → 事後完全看不出發生過 | `4aec_nr_res.c` 的 reset 實作 |
 | **G5** | **delay lock 遺失不可見**。`delay_state` 與 `generation` 每 hop 可讀，但 `AecDebugStatus` **兩者都沒有** → 只 poll 快照的整合者看不到 lock 的丟失與重獲 | `aec.h` 的 `AecDebugStatus` 欄位表 |
@@ -68,7 +68,7 @@
 | 項目 | 動作 | 成本 |
 |---|---|---|
 | **T0.1（最高優先，屬安全性不只 debug）** | 為 release build 設 `-DNDEBUG`，**並且**替 `suppression_gain.c` 那個沒有 fallback 的 assert 補上 release-path guard（其餘兩處已有）。或者反過來，把該 assert 改成建構期拒絕（回 NULL）——它檢查的是 init 期的一致性，本來就不該用 abort 表達 | 零 per-hop |
-| **T0.2** | `AEC_DEBUG_LOG` 整套死碼：**刪掉**。留著只會讓人以為 library 有 log 能力 | 負值（減碼） |
+| **T0.2** | `aec_debug_set_level()`／`aec_debug_set_log()` 與 CLI 的 `--debug-level`／`--debug-log`（沒有 emit 端）：**刪掉**。留著只會讓人以為 library 有 log 能力 | 負值（減碼） |
 | **T0.3（回收最大）** | 把 trace 的 gate 從 `cfg.enable_res` 改成 `cfg.enable_res \|\| cfg.return_res_context`（與 `last_erle_windowed` 的更新條件一致），並讓 `aec_process_context()` 也能觸發 | 一個 NULL 測試 |
 
 T0.3 之所以關鍵：`dominant_nearend`、`saturated_echo`、`usable_linear`、

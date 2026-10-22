@@ -118,7 +118,7 @@ def test_unreconciled_schedule_divergences_are_visible():
     assert clips == {'GTCRN': 5.0, 'RNNoise-ERB': 1.0}, clips
 
 
-NR_TRAINERS = ('RNNoise-ERB', 'GTCRN', 'DeepFilterNet2')
+NR_TRAINERS = ('RNNoise-ERB', 'GTCRN', 'DeepFilterNet2', 'DeepFilterNet3')
 
 
 def test_split_comes_from_one_shared_implementation():

@@ -1,5 +1,6 @@
 #include "audio_pipeline_4ch_ulcnet.h"
 #include "ulcnet_accelerator_adapter.h"
+#include "mcab_sample_driver.h"
 
 #include <math.h>
 #include <stdio.h>
@@ -66,12 +67,6 @@ _Static_assert(ULCNET_EXAMPLE_DELAY_NUM_FILTERS >= 1 &&
                ULCNET_EXAMPLE_DELAY_NUM_FILTERS <= DA_NUM_FILTERS,
                "ULCNET_EXAMPLE_DELAY_NUM_FILTERS outside lib/aec's bank range");
 
-typedef struct DelayProfile {
-    AecDelayMode mode;
-    int num_filters;      /* MATCHED only; 1..DA_NUM_FILTERS                 */
-    int fixed_samples;    /* FIXED only; -1 otherwise                        */
-} DelayProfile;
-
 static void usage(const char* prog) {
     fprintf(stderr,
         "Usage: %s [options]\n"
@@ -88,104 +83,6 @@ static void usage(const char* prog) {
         prog, ULCNET_EXAMPLE_DELAY_NUM_FILTERS);
 }
 
-static int parse_delay_mode(const char* s, AecDelayMode* out) {
-    if (!strcmp(s, "matched"))  { *out = AEC_DELAY_MATCHED;          return 0; }
-    if (!strcmp(s, "fixed"))    { *out = AEC_DELAY_FIXED;            return 0; }
-    if (!strcmp(s, "external")) { *out = AEC_DELAY_EXTERNAL_ALIGNED; return 0; }
-    return -1;
-}
-
-static const char* delay_mode_name(AecDelayMode m) {
-    switch (m) {
-        case AEC_DELAY_MATCHED:          return "matched";
-        case AEC_DELAY_FIXED:            return "fixed";
-        case AEC_DELAY_EXTERNAL_ALIGNED: return "external";
-        default:                         return "?";
-    }
-}
-
-/* Returns 0 on success, 1 on --help, 2 on a rejected profile. Every rejection
- * names BOTH the requested value and what this build accepts, because the
- * pipeline TU itself is stdio-free and can only answer with a NULL handle. */
-static int parse_delay_profile(int argc, char** argv, DelayProfile* out) {
-    int have_num_filters = 0;
-    int have_fixed = 0;
-    int i;
-
-    out->mode = AEC_DELAY_MATCHED;
-    out->num_filters = ULCNET_EXAMPLE_DELAY_NUM_FILTERS;
-    out->fixed_samples = -1;
-
-    for (i = 1; i < argc; ++i) {
-        const char* arg = argv[i];
-        if ((!strcmp(arg, "-h") || !strcmp(arg, "--help"))) {
-            usage(argv[0]);
-            return 1;
-        } else if (!strcmp(arg, "--delay-mode") && i + 1 < argc) {
-            if (parse_delay_mode(argv[++i], &out->mode) != 0) {
-                fprintf(stderr,
-                        "4ch_alignulcnet: --delay-mode '%s' is not a mode "
-                        "(accepted: matched|fixed|external)\n", argv[i]);
-                return 2;
-            }
-        } else if (!strcmp(arg, "--delay-num-filters") && i + 1 < argc) {
-            out->num_filters = atoi(argv[++i]);
-            have_num_filters = 1;
-        } else if (!strcmp(arg, "--fixed-delay") && i + 1 < argc) {
-            out->fixed_samples = atoi(argv[++i]);
-            have_fixed = 1;
-        } else {
-            fprintf(stderr, "4ch_alignulcnet: unknown argument '%s'\n", arg);
-            usage(argv[0]);
-            return 2;
-        }
-    }
-
-    /* n is meaningful only where a matched bank exists. 0 is NOT "disabled" --
-     * FIXED and EXTERNAL_ALIGNED are separate modes, and both require
-     * n == DA_NUM_FILTERS because they build no bank at all. */
-    if (have_fixed && out->mode != AEC_DELAY_FIXED) {
-        fprintf(stderr,
-                "4ch_alignulcnet: --fixed-delay %d is only valid with "
-                "--delay-mode fixed (requested mode: %s)\n",
-                out->fixed_samples, delay_mode_name(out->mode));
-        return 2;
-    }
-    if (out->mode == AEC_DELAY_FIXED &&
-        (!have_fixed || out->fixed_samples < 0)) {
-        fprintf(stderr,
-                "4ch_alignulcnet: --delay-mode fixed needs "
-                "--fixed-delay <samples> >= 0 (requested: %d)\n",
-                have_fixed ? out->fixed_samples : -1);
-        return 2;
-    }
-    if (out->mode == AEC_DELAY_MATCHED) {
-        if (out->num_filters < 1 || out->num_filters > DA_NUM_FILTERS) {
-            fprintf(stderr,
-                    "4ch_alignulcnet: --delay-num-filters %d is out of range "
-                    "(accepted: 1..%d; 0 does not mean 'off' -- use "
-                    "--delay-mode fixed or external instead)\n",
-                    out->num_filters, DA_NUM_FILTERS);
-            return 2;
-        }
-    } else {
-        if (have_num_filters && out->num_filters != DA_NUM_FILTERS) {
-            fprintf(stderr,
-                    "4ch_alignulcnet: --delay-num-filters %d is only valid "
-                    "with --delay-mode matched (requested mode: %s, which "
-                    "builds no matched bank and requires n == %d)\n",
-                    out->num_filters, delay_mode_name(out->mode),
-                    DA_NUM_FILTERS);
-            return 2;
-        }
-        /* The build-time default is a matched-bank knob, so it does not carry
-         * into a mode that has no bank: the caller asked for the mode, not for
-         * n, and lib/aec would reject the pair. */
-        out->num_filters = DA_NUM_FILTERS;
-    }
-    return 0;
-}
-
 /* Replace with the product's stateless accelerator invocation: bind each
  * *_out of the graph to the address of the state input of the same name (the
  * pointers in `outputs`), write `outputs->output`, read every state input
@@ -200,95 +97,120 @@ static int run_accelerator(void *user,
     return -1; /* TODO(board): write every output tensor, then return 0. */
 }
 
-int main(int argc, char** argv) {
+typedef struct UlcSample {
     AudioPipeline4ChConfig cfg;
-    DelayProfile profile;
+    McabDelayOptions profile;
     UlcnetAcceleratorAdapter *adapter;
     UlcnetModelIoDescriptor model_descriptor;
     AudioPipeline4ChUlcnet *pipeline;
     UlcnetModel model;
-    void *adapter_pool = NULL;
-    size_t adapter_bytes;
-    size_t adapter_alignment;
+    void *adapter_pool;
+    size_t adapter_bytes,adapter_alignment;
     AudioPipeline4ChUlcnetMemReq req;
-    float microphones[ULCNET_HOP * 4] = {0};
-    float far[ULCNET_HOP] = {0};
-    float output[ULCNET_HOP];
-    int hop;
-    int index;
-    int rc;
-    rc = parse_delay_profile(argc, argv, &profile);
-    if (rc != 0) return rc == 1 ? 0 : rc;
-
-    cfg = audio_pipeline_4ch_ulcnet_default_config();
-    cfg.core.delay_mode = profile.mode;
-    cfg.core.delay_num_filters = profile.num_filters;
-    cfg.core.fixed_delay_samples = profile.fixed_samples;
+    float microphones[ULCNET_HOP*4],far[ULCNET_HOP],output[ULCNET_HOP];
+    const char *program;
+} UlcSample;
+static int ulc_unknown(void *user, const char *arg) {
+    UlcSample *s=user;
+    fprintf(stderr,"4ch_alignulcnet: unknown argument '%s'\n",arg);
+    usage(s->program); return 2;
+}
+static int ulc_set(void *user, const char *arg, const char *value) {
+    UlcSample *s=user;
+    if (!strcmp(arg,"-h") || !strcmp(arg,"--help")) {
+        usage(s->program); return 1;
+    }
+    return mcab_set_delay_option(&s->profile,arg,value,0,"4ch_alignulcnet");
+}
+static int ulc_parse(void *user, int argc, char **argv) {
+    UlcSample *s=user;
+    static const McabCliOption options[]={
+        {"-h",0},{"--help",0},{"--delay-mode",1},
+        {"--delay-num-filters",1},{"--fixed-delay",1}
+    };
+    s->program=argv[0]; s->profile.mode=AEC_DELAY_MATCHED;
+    s->profile.num_filters=ULCNET_EXAMPLE_DELAY_NUM_FILTERS;
+    s->profile.fixed_samples=-1;
+    int rc=mcab_scan_cli(argc,argv,options,sizeof(options)/sizeof(options[0]),
+                          s,ulc_set,ulc_unknown);
+    return rc != 0 ? rc : mcab_validate_delay_options(&s->profile,"4ch_alignulcnet");
+}
+static int ulc_setup(void *user, McabHopView *view) {
+    UlcSample *s=user;
+    s->cfg = audio_pipeline_4ch_ulcnet_default_config();
+    s->cfg.core.delay_mode = s->profile.mode;
+    s->cfg.core.delay_num_filters = s->profile.num_filters;
+    s->cfg.core.fixed_delay_samples = s->profile.fixed_samples;
 
     /* Print the RESOLVED profile with the pool the SAME config actually
      * costs -- query and init must agree on one (sample_rate, hop, n). */
-    if (audio_pipeline_4ch_ulcnet_get_mem_requirements(&cfg, &req) != 0) {
+    if (audio_pipeline_4ch_ulcnet_get_mem_requirements(&s->cfg, &s->req) != 0) {
         fprintf(stderr,
                 "4ch_alignulcnet: pool query rejected the delay profile "
                 "(mode=%s n=%d fixed_delay=%d)\n",
-                delay_mode_name(profile.mode), profile.num_filters,
-                profile.fixed_samples);
+                mcab_delay_mode_name(s->profile.mode), s->profile.num_filters,
+                s->profile.fixed_samples);
         return 1;
     }
     printf("4ch_alignulcnet: delay profile mode=%s n=%d fixed_delay=%d "
            "(one shared estimator) -> pool %llu bytes (align %lu)\n",
-           delay_mode_name(profile.mode), profile.num_filters,
-           profile.fixed_samples, (unsigned long long)req.bytes,
-           (unsigned long)req.alignment);
+           mcab_delay_mode_name(s->profile.mode), s->profile.num_filters,
+           s->profile.fixed_samples, (unsigned long long)s->req.bytes,
+           (unsigned long)s->req.alignment);
 
     /* The board loads this descriptor from the exported model metadata;
      * see ULCNET_EXAMPLE_DELAY_FRAMES at the top of this file. */
     if (ulcnet_model_io_descriptor_default(
-            ULCNET_EXAMPLE_DELAY_FRAMES, &model_descriptor) != 0 ||
+            ULCNET_EXAMPLE_DELAY_FRAMES, &s->model_descriptor) != 0 ||
         ulcnet_accelerator_adapter_get_mem_size(
-            &model_descriptor, &adapter_bytes, &adapter_alignment) != 0 ||
-        posix_memalign(&adapter_pool, adapter_alignment, adapter_bytes) != 0) {
+            &s->model_descriptor, &s->adapter_bytes, &s->adapter_alignment) != 0 ||
+        posix_memalign(&s->adapter_pool, s->adapter_alignment, s->adapter_bytes) != 0) {
         return 1;
     }
     printf("%s: model I/O D=%d -> accelerator adapter pool %zu bytes (align %zu)\n",
-           argv[0], ULCNET_EXAMPLE_DELAY_FRAMES, adapter_bytes,
-           adapter_alignment);
-    adapter = ulcnet_accelerator_adapter_init(
-        adapter_pool, adapter_bytes, &model_descriptor,
+           view->program, ULCNET_EXAMPLE_DELAY_FRAMES, s->adapter_bytes,
+           s->adapter_alignment);
+    s->adapter = ulcnet_accelerator_adapter_init(
+        s->adapter_pool, s->adapter_bytes, &s->model_descriptor,
         run_accelerator, NULL);
-    pipeline = audio_pipeline_4ch_ulcnet_create(&cfg);
-    if (!adapter || !pipeline) {
-        audio_pipeline_4ch_ulcnet_destroy(pipeline);
-        free(adapter_pool);
+    s->pipeline = audio_pipeline_4ch_ulcnet_create(&s->cfg);
+    if (!s->adapter || !s->pipeline) {
         return 1;
     }
 
-    model = ulcnet_accelerator_adapter_model(adapter);
-    if (audio_pipeline_4ch_ulcnet_set_model(pipeline, &model) != 0) {
+    s->model = ulcnet_accelerator_adapter_model(s->adapter);
+    if (audio_pipeline_4ch_ulcnet_set_model(s->pipeline, &s->model) != 0) {
         fprintf(stderr, "4ch_alignulcnet: model install failed\n");
-        audio_pipeline_4ch_ulcnet_destroy(pipeline);
-        free(adapter_pool);
         return 1;
     }
 
-    for (hop = 0; hop < 4; ++hop) {
-        if (audio_pipeline_4ch_ulcnet_process_with_activity(
-                pipeline, microphones, far, 0, output) != 0) {
-            audio_pipeline_4ch_ulcnet_destroy(pipeline);
-            free(adapter_pool);
-            return 1;
-        }
-        for (index = 0; index < ULCNET_HOP; ++index) {
-            if (!isfinite(output[index])) {
-                audio_pipeline_4ch_ulcnet_destroy(pipeline);
-                free(adapter_pool);
-                return 1;
-            }
-        }
-    }
-
-    audio_pipeline_4ch_ulcnet_destroy(pipeline);
-    free(adapter_pool);
-    puts("4ch_alignulcnet: fail-open board skeleton PASS");
+    view->hop=ULCNET_HOP; view->microphones=s->microphones;
+    view->reference=s->far; view->output=s->output; view->check_finite=1;
     return 0;
+}
+static int ulc_read(void *user, McabHopView *view, int frame) {
+    (void)user; (void)view; return frame < 4;
+}
+static int ulc_process(void *user, McabHopView *view, int frame) {
+    UlcSample *s=user; (void)view; (void)frame;
+    return audio_pipeline_4ch_ulcnet_process_with_activity(s->pipeline,
+        s->microphones,s->far,0,s->output) != 0;
+}
+static int ulc_finish(void *user, McabHopView *view, int frames) {
+    (void)user; (void)view; (void)frames;
+    return 0;
+}
+static void ulc_complete(void *user) {
+    (void)user;
+    puts("4ch_alignulcnet: fail-open board skeleton PASS");
+}
+static void ulc_cleanup(void *user) {
+    UlcSample *s=user;
+    audio_pipeline_4ch_ulcnet_destroy(s->pipeline); free(s->adapter_pool);
+}
+int main(int argc, char **argv) {
+    UlcSample sample={0};
+    static const McabSampleOps ops={ulc_parse,2,ulc_setup,ulc_read,ulc_process,
+                                  NULL,NULL,ulc_finish,ulc_cleanup,ulc_complete};
+    return mcab_sample_main(argc,argv,&ops,&sample);
 }

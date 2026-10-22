@@ -38,7 +38,7 @@
 #
 # 4. -Ofast/-ffast-math/-ffp-contract= exact-token matching: the conflict check
 #    is $(filter -Ofast -ffast-math -ffp-contract=%,$(CFLAGS)) (same design as
-#    audio_common's Makefile's FP_CONFLICT_FLAGS), which splits on whitespace
+#    audiolib's Makefile's FP_CONFLICT_FLAGS), which splits on whitespace
 #    and matches each pattern against a WHOLE word only. A SUBSTRING match
 #    ($(findstring)) would reject a legitimate flag whose VALUE merely CONTAINS
 #    one of these substrings without BEING the flag -- e.g.
@@ -76,6 +76,9 @@
 
 set -u
 REPO_ROOT="$(cd "$(dirname "$0")/.." && pwd)"
+# The isolated component copy still links the explicitly selected shared DSP tree.
+COMMON_DIR="${COMMON_DIR:-$(cd "$REPO_ROOT/../../../audiolib/common" && pwd)}"
+export COMMON_DIR
 
 # test-features prints "PASS: <RNNOISE_FEATURE_VERSION> matches ..." where the
 # version tag comes from process.h; read it from there so the expected line

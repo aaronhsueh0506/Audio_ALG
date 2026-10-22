@@ -5,7 +5,7 @@
  *   1. identity E2E: the 1-hop timing contract (hop 0 zero; every hop is
  *      exactly one inference from hop 0; out[hop p] is bit-identical to a
  *      reference the test synthesises ITSELF from the spectra the pipeline
- *      hands the model) through the direct GSC -> model -> synthesis chain
+ *      hands the model) through the direct BF -> model -> synthesis chain
  *      in identity mode.
  *   2. counting model: infer STEPPED and applied on every emitted frame
  *      except the identity-reprime frames after an alignment generation;
@@ -65,12 +65,12 @@
  *      aligned-far descriptor is rejected; no runtime mode setter exists.
  *  12. split beam half: process_front + process_beam(v, v, NULL) equals
  *      process_begin byte for byte; a non-NULL mask and a separate
- *      vad_raw/vad_out reach SRP and GSC; beam_state equals the lower-level
- *      SRP/GSC getters on the same spectra; sequence and argument guards.
+ *      vad_raw/vad_out reach SRP and BF; beam_state equals the lower-level
+ *      SRP/BF getters on the same spectra; sequence and argument guards.
  */
 
 #include "audio_pipeline_4ch_ulcnet.h"
-#include "gsc.h"
+#include "bf.h"
 #include "srp.h"
 
 #include <math.h>
@@ -95,7 +95,7 @@ static const UlcnetModelIoDescriptor* test_io_descriptor(void) {
 }
 
 
-/* DelayAec3 searches a 16 kHz-equivalent sidechain and scales the selected
+/* DelayAec searches a 16 kHz-equivalent sidechain and scales the selected
  * delay back to native samples. Echo-delay stimuli therefore scale by
  * exactly three on the 48 kHz product grid. */
 #define DELAY_RATE_FACTOR (ULCNET_SR / 16000)
@@ -150,7 +150,7 @@ static int reprime_take(int* armed, int frames) {
 }
 
 /* ============================================================================
- * 1. Identity E2E: direct GSC -> model -> synthesis chain + 1-hop latency
+ * 1. Identity E2E: direct BF -> model -> synthesis chain + 1-hop latency
  *    contract. The reference is synthesised by the TEST from the spectra the
  *    pipeline hands the model (a capture model that also returns the
  *    identity), through the test's own AcIstft: a bit-identical
@@ -205,9 +205,9 @@ static int test_identity_e2e(void) {
     CHECK(cfg.core.sample_rate == ULCNET_SR &&
           cfg.core.fft_size == ULCNET_N_FFT,
           "default config matches the compiled ULCNet deployment grid");
-    cfg.gsc_fixed_mode = 1;
-    cfg.gsc_fixed_doa_rad = 0.4f;
-    cfg.gsc_mu = 0.02f;
+    cfg.bf_fixed_mode = 1;
+    cfg.bf_fixed_doa_rad = 0.4f;
+    cfg.bf_mu = 0.02f;
     cfg.core.enable_cng = 0;
     cfg.core.delay_mode = AEC_DELAY_FIXED;
     cfg.core.fixed_delay_samples = 0;
@@ -406,9 +406,9 @@ static int test_counting_model_policy(void) {
     int hop;
     int total_frames = FRAMES + FAIL_FRAMES;
 
-    cfg.gsc_fixed_mode = 1;
-    cfg.gsc_fixed_doa_rad = 0.3f;
-    cfg.gsc_mu = 0.02f;
+    cfg.bf_fixed_mode = 1;
+    cfg.bf_fixed_doa_rad = 0.3f;
+    cfg.bf_mu = 0.02f;
     cfg.core.enable_cng = 0;
 
     p = audio_pipeline_4ch_ulcnet_create(&cfg);
@@ -801,9 +801,9 @@ static int test_relock_same_delay_resets_model(void) {
     long reset_before_hop = 0;
     int resets_without_acceptance = 0;
 
-    cfg.gsc_fixed_mode = 1;
-    cfg.gsc_fixed_doa_rad = 0.3f;
-    cfg.gsc_mu = 0.02f;
+    cfg.bf_fixed_mode = 1;
+    cfg.bf_fixed_doa_rad = 0.3f;
+    cfg.bf_mu = 0.02f;
     cfg.core.enable_cng = 0;
 
     p = audio_pipeline_4ch_ulcnet_create(&cfg);
@@ -831,7 +831,7 @@ static int test_relock_same_delay_resets_model(void) {
         if (frame == WARM_FRAMES) {
             /* The forced unlock. This is the only lever the core exposes:
              * four_aec_nr_res_reset() (which audio_pipeline_4ch_ulcnet_reset
-             * calls) is the sole caller of delay_aec3_reset(), and the
+             * calls) is the sole caller of delay_aec_reset(), and the
              * estimator's REFINED-confidence latch cannot otherwise drop
              * once set. It also puts accepted_delay back to 0 -- which is
              * precisely why a same-value relock at 0 is invisible to a
@@ -851,7 +851,7 @@ static int test_relock_same_delay_resets_model(void) {
         /* A model reset flushes recurrent state against the applied delay,
          * so it may only fire on a hop where an alignment generation was
          * actually ACCEPTED -- never on a hop where the estimator is merely
-         * confident (confidence >= 1.0 is delay_aec3_is_solid()) but the
+         * confident (confidence >= 1.0 is delay_aec_is_solid()) but the
          * wrapper's acceptance conditions are not all met yet. Recomputed
          * from the seam's own estimator fields, so it is independent of the
          * `solid`/`changed` flags being tested.
@@ -1056,9 +1056,9 @@ static int test_pool_and_descriptor_gate(void) {
     size_t k;
     int hop;
 
-    cfg.gsc_fixed_mode = 1;
-    cfg.gsc_fixed_doa_rad = 0.35f;
-    cfg.gsc_mu = 0.02f;
+    cfg.bf_fixed_mode = 1;
+    cfg.bf_fixed_doa_rad = 0.35f;
+    cfg.bf_mu = 0.02f;
     cfg.core.enable_cng = 0;
 
     CHECK(audio_pipeline_4ch_ulcnet_get_mem_requirements(&cfg, &req) == 0,
@@ -1124,13 +1124,13 @@ static int test_pool_and_descriptor_gate(void) {
      * layout this wrapper descriptor carries. Bump this literal with
      * AUDIO_PIPELINE_4CH_ULCNET_LAYOUT_VERSION. */
     stale = req;
-    stale.layout_version = 20u;
+    stale.layout_version = 21u;
     CHECK(audio_pipeline_4ch_ulcnet_init_ex(
               pool, (size_t)req.bytes, &cfg, &stale) == NULL,
           "init_ex rejects a descriptor from the superseded layout even "
           "when its byte count exactly covers the current pool");
     CHECK(req.layout_version == AUDIO_PIPELINE_4CH_ULCNET_LAYOUT_VERSION &&
-          AUDIO_PIPELINE_4CH_ULCNET_LAYOUT_VERSION == 21u,
+          AUDIO_PIPELINE_4CH_ULCNET_LAYOUT_VERSION == 22u,
           "the queried descriptor publishes the current carve layout");
 
     stat = audio_pipeline_4ch_ulcnet_init_ex(
@@ -1319,9 +1319,9 @@ static int test_raw_far_timestamp_after_fixed_delay_lock(void) {
     UlcnetModel model;
     ImpulseRun r;
 
-    cfg.gsc_fixed_mode = 1;
-    cfg.gsc_fixed_doa_rad = 0.4f;
-    cfg.gsc_mu = 0.02f;
+    cfg.bf_fixed_mode = 1;
+    cfg.bf_fixed_doa_rad = 0.4f;
+    cfg.bf_mu = 0.02f;
     cfg.core.enable_cng = 0;
     cfg.core.delay_mode = AEC_DELAY_FIXED;
     cfg.core.fixed_delay_samples = 2 * ULCNET_HOP;
@@ -1346,7 +1346,7 @@ static int test_raw_far_timestamp_after_fixed_delay_lock(void) {
  *    branch, against the INPUT rather than the model's output. Silence on
  *    far, one unit impulse on all four mics, a frozen fixed beamformer
  *    (mu 0, vad 1), FIXED delay 0 (boundary-free), NULL model (identity).
- *    The impulse must come out at EXACTLY impulse + 1 hop -- the GSC
+ *    The impulse must come out at EXACTLY impulse + 1 hop -- the BF
  *    spectrum of hop p is the model's frame at hop p and the synthesis adds
  *    the one hop -- and it must come out AS an impulse: a spectrum handed
  *    over with its imaginary part dropped, or an error branch delayed by a
@@ -1361,9 +1361,9 @@ static int test_error_timestamp_and_content(void) {
     AudioPipeline4ChConfig cfg = audio_pipeline_4ch_ulcnet_default_config();
     ImpulseRun r;
 
-    cfg.gsc_fixed_mode = 1;
-    cfg.gsc_fixed_doa_rad = 0.3f;
-    cfg.gsc_mu = 0.0f;
+    cfg.bf_fixed_mode = 1;
+    cfg.bf_fixed_doa_rad = 0.3f;
+    cfg.bf_mu = 0.0f;
     cfg.core.enable_cng = 0;
     cfg.core.delay_mode = AEC_DELAY_FIXED;
     cfg.core.fixed_delay_samples = 0;
@@ -1383,7 +1383,7 @@ static int test_error_timestamp_and_content(void) {
     CHECK(r.found_index >= r.expect_index - 2 &&
           r.found_index <= r.expect_index + 2,
           "mic impulse lands at impulse + 1 hop (within the beamformer's "
-          "steering spread) through the direct GSC -> synthesis path");
+          "steering spread) through the direct BF -> synthesis path");
     CHECK(r.peak > 0.1f,
           "mic impulse comes through the frozen beamformer (spread, not "
           "attenuated away)");
@@ -1420,9 +1420,9 @@ static int test_model_applies_unlocked(void) {
     float max_err = 0.0f;
     int hop;
 
-    cfg.gsc_fixed_mode = 1;
-    cfg.gsc_fixed_doa_rad = 0.3f;
-    cfg.gsc_mu = 0.02f;
+    cfg.bf_fixed_mode = 1;
+    cfg.bf_fixed_doa_rad = 0.3f;
+    cfg.bf_mu = 0.02f;
     cfg.core.enable_cng = 0;
 
     p = audio_pipeline_4ch_ulcnet_create(&cfg);
@@ -1558,9 +1558,9 @@ static int test_nan_guard(void) {
     int n_differ = 0;
     int hop;
 
-    cfg.gsc_fixed_mode = 1;
-    cfg.gsc_fixed_doa_rad = 0.3f;
-    cfg.gsc_mu = 0.02f;
+    cfg.bf_fixed_mode = 1;
+    cfg.bf_fixed_doa_rad = 0.3f;
+    cfg.bf_mu = 0.02f;
     cfg.core.enable_cng = 0;
 
     pa = audio_pipeline_4ch_ulcnet_create(&cfg);
@@ -1712,9 +1712,9 @@ static int test_partial_write_guard(void) {
     int n_differ = 0;
     int hop;
 
-    cfg.gsc_fixed_mode = 1;
-    cfg.gsc_fixed_doa_rad = 0.3f;
-    cfg.gsc_mu = 0.02f;
+    cfg.bf_fixed_mode = 1;
+    cfg.bf_fixed_doa_rad = 0.3f;
+    cfg.bf_mu = 0.02f;
     cfg.core.enable_cng = 0;
 
     pa = audio_pipeline_4ch_ulcnet_create(&cfg);
@@ -1915,12 +1915,12 @@ static int reprime_probe_run(int fixed_delay, int mark_far, ProbeModel* st) {
     float out[ULCNET_HOP];
 
     memset(st, 0, sizeof(*st));
-    /* Frozen fixed beamformer (mu 0 and vad_external 1 both freeze GSC
+    /* Frozen fixed beamformer (mu 0 and vad_external 1 both freeze BF
      * adaptation) so the beam path is time-invariant and the marker cannot
      * be smeared by an adapting filter. */
-    cfg.gsc_fixed_mode = 1;
-    cfg.gsc_fixed_doa_rad = 0.3f;
-    cfg.gsc_mu = 0.0f;
+    cfg.bf_fixed_mode = 1;
+    cfg.bf_fixed_doa_rad = 0.3f;
+    cfg.bf_mu = 0.0f;
     cfg.core.enable_cng = 0;
     cfg.core.delay_mode = AEC_DELAY_FIXED;
     cfg.core.fixed_delay_samples = fixed_delay;
@@ -2130,9 +2130,9 @@ static int test_reprime_behavior(void) {
     int resumed_frame = -1;
     int hop;
 
-    cfg.gsc_fixed_mode = 1;
-    cfg.gsc_fixed_doa_rad = 0.3f;
-    cfg.gsc_mu = 0.02f;
+    cfg.bf_fixed_mode = 1;
+    cfg.bf_fixed_doa_rad = 0.3f;
+    cfg.bf_mu = 0.02f;
     cfg.core.enable_cng = 0;
 
     p = audio_pipeline_4ch_ulcnet_create(&cfg);
@@ -2327,9 +2327,9 @@ static int test_raw_descriptor_gate(void) {
     aligned_model = undescribed_model;
     aligned_model.io_descriptor = &aligned_desc;
 
-    cfg.gsc_fixed_mode = 1;
-    cfg.gsc_fixed_doa_rad = 0.3f;
-    cfg.gsc_mu = 0.02f;
+    cfg.bf_fixed_mode = 1;
+    cfg.bf_fixed_doa_rad = 0.3f;
+    cfg.bf_mu = 0.02f;
     cfg.core.enable_cng = 0;
     p = audio_pipeline_4ch_ulcnet_create(&cfg);
     CHECK(p != NULL, "create aligned-descriptor gate pipeline");
@@ -2395,9 +2395,9 @@ static int phased_twin_matches(int mode, int frames) {
     int hop, ran = 0, nonzero = 0, ok = 1;
     int poison_tag = 1;
 
-    cfg.gsc_fixed_mode = 1;
-    cfg.gsc_fixed_doa_rad = 0.3f;
-    cfg.gsc_mu = 0.02f;
+    cfg.bf_fixed_mode = 1;
+    cfg.bf_fixed_doa_rad = 0.3f;
+    cfg.bf_mu = 0.02f;
     cfg.core.enable_cng = 0;
     ph = audio_pipeline_4ch_ulcnet_create(&cfg);
     cb = audio_pipeline_4ch_ulcnet_create(&cfg);
@@ -2547,7 +2547,7 @@ static int same_state(const AudioPipeline4ChUlcnetBeamState* a,
 
 static AudioPipeline4ChConfig split_config(void) {
     AudioPipeline4ChConfig cfg = audio_pipeline_4ch_ulcnet_default_config();
-    cfg.gsc_mu = 0.02f;
+    cfg.bf_mu = 0.02f;
     cfg.doa_update_interval = 1;
     return cfg;
 }
@@ -2612,8 +2612,8 @@ static int test_split_null_mask_equals_begin(void) {
     return 1;
 }
 
-/* A mask and a separate vad_raw / vad_out change what SRP and GSC see. */
-static int test_split_mask_and_vad_reach_srp_gsc(void) {
+/* A mask and a separate vad_raw / vad_out change what SRP and BF see. */
+static int test_split_mask_and_vad_reach_srp_bf(void) {
     AudioPipeline4ChConfig cfg = split_config();
     enum { NP = 5 };   /* NULL, all-zero, all-one, even bins, NULL with vad_raw 0 */
     AudioPipeline4ChUlcnet* p[NP];
@@ -2642,14 +2642,14 @@ static int test_split_mask_and_vad_reach_srp_gsc(void) {
         fill_split_hop(f, hop, s.far_hist, s.near_hist, s.far, s.mics);
         for (int i = 0; i < NP; ++i) {
             /* Speech (vad_out 1) lets the DOA smoother settle; the quiet
-             * stretches (vad_out 0) are where GSC adapts. */
+             * stretches (vad_out 0) are where BF adapts. */
             int vad_raw = i == 4 ? 0 : 1;
             int vad_out = (f % 20) < 10;
             CHECK(split_hop(p[i], s.mics, s.far, vad_raw, vad_out, mask[i], out[i]),
                   "split mask: hop runs");
             CHECK(audio_pipeline_4ch_ulcnet_beam_state(p[i], &st[i]) == 0, "split mask: state reads");
             if (isfinite(st[i].doa_raw_rad)) raw_finite[i] = 1;
-            if (st[i].gsc_adaptive) adaptive_seen[i] = 1;
+            if (st[i].bf_adaptive) adaptive_seen[i] = 1;
         }
         for (int i = 1; i < NP; ++i) {
             if (!same_state(&st[0], &st[i])) differs_doa[i] = 1;
@@ -2657,10 +2657,10 @@ static int test_split_mask_and_vad_reach_srp_gsc(void) {
         }
     }
     CHECK(raw_finite[0], "split mask: with vad_raw 1 SRP produces a finite raw DOA");
-    CHECK(adaptive_seen[0], "split mask: GSC adapts on some quiet hop once a DOA exists");
+    CHECK(adaptive_seen[0], "split mask: BF adapts on some quiet hop once a DOA exists");
     CHECK(differs_doa[1], "split mask: an all-zero mask changes the SRP result (bins are read)");
     CHECK(differs_doa[3], "split mask: a half-bin mask changes the SRP result");
-    CHECK(differs_out[2], "split mask: an all-one mask freezes GSC adaptation, the output changes");
+    CHECK(differs_out[2], "split mask: an all-one mask freezes BF adaptation, the output changes");
     CHECK(differs_out[3], "split mask: a half-bin mask changes the beamformed output");
     CHECK(!raw_finite[4], "split vad: vad_raw 0 never runs SRP");
     CHECK(differs_doa[4], "split vad: vad_raw reaches SRP independently of vad_out");
@@ -2677,20 +2677,20 @@ static int bits_equal_f(float a, float b) {
     return memcmp(&a, &b, sizeof(float)) == 0;
 }
 
-/* beam_state against SRP and GSC objects built here from the same derivation
+/* beam_state against SRP and BF objects built here from the same derivation
  * and fed the same lane spectra: every field, and the model's error frame. */
-static int split_state_case(int fixed_gsc) {
+static int split_state_case(int fixed_bf) {
     AudioPipeline4ChConfig cfg = split_config();
     AudioPipeline4ChUlcnet* p;
-    cfg.gsc_fixed_mode = fixed_gsc;
-    cfg.gsc_fixed_doa_rad = 0.3f;
+    cfg.bf_fixed_mode = fixed_bf;
+    cfg.bf_fixed_doa_rad = 0.3f;
     p = audio_pipeline_4ch_ulcnet_create(&cfg);
     SRP_Config sc;
-    GSC_Config gc;
+    BF_Config gc;
     float gx[FOUR_AEC_NR_RES_CHANNELS], gy[FOUR_AEC_NR_RES_CHANNELS];
     ArrayGeometry geom = { FOUR_AEC_NR_RES_CHANNELS, gx, gy };
     SRP* srp;
-    GSC* gsc;
+    BF* bf;
     Complex *spec, *weights;
     SplitScene s;
     int *mask;
@@ -2722,19 +2722,19 @@ static int split_state_case(int fixed_gsc) {
     sc.update_interval = cfg.doa_update_interval;
     srp = srp_create_from_geometry(&sc, &geom);
     CHECK(srp != NULL, "split state: lower-level SRP creates");
-    interval = gsc_effective_adapt_interval(cfg.gsc_fixed_mode,
-                                            cfg.gsc_fixed_align_notebook,
-                                            cfg.gsc_adapt_interval);
+    interval = bf_effective_adapt_interval(cfg.bf_fixed_mode,
+                                            cfg.bf_fixed_align_notebook,
+                                            cfg.bf_adapt_interval);
     memset(&gc, 0, sizeof(gc));
-    gc.enable = cfg.gsc_enable;
-    gc.lambda = anr_retime_alpha(cfg.gsc_lambda, cfg.core.sample_rate, hop * interval);
-    gc.mu = cfg.gsc_mu;
-    gc.enable_fix_mode = cfg.gsc_fixed_mode;
-    gc.fixed_doa_rad = cfg.gsc_fixed_doa_rad;
-    gc.fixed_align_notebook = cfg.gsc_fixed_align_notebook;
+    gc.enable = cfg.bf_enable;
+    gc.lambda = anr_retime_alpha(cfg.bf_lambda, cfg.core.sample_rate, hop * interval);
+    gc.mu = cfg.bf_mu;
+    gc.enable_fix_mode = cfg.bf_fixed_mode;
+    gc.fixed_doa_rad = cfg.bf_fixed_doa_rad;
+    gc.fixed_align_notebook = cfg.bf_fixed_align_notebook;
     gc.adapt_interval = interval;
-    gsc = gsc_create(FOUR_AEC_NR_RES_CHANNELS, nf, srp->num_angles, srp->a_array, &gc);
-    CHECK(gsc != NULL, "split state: lower-level GSC creates");
+    bf = bf_create(FOUR_AEC_NR_RES_CHANNELS, nf, srp->num_angles, srp->a_array, &gc);
+    CHECK(bf != NULL, "split state: lower-level BF creates");
     spec = (Complex*)calloc((size_t)nf, sizeof(Complex));
     weights = (Complex*)calloc((size_t)nf * FOUR_AEC_NR_RES_CHANNELS, sizeof(Complex));
     mask = (int*)malloc((size_t)nf * sizeof(int));
@@ -2754,21 +2754,21 @@ static int split_state_case(int fixed_gsc) {
         CHECK(front.n_freqs == nf && front.lane_spectra[0] && front.lane_spectra[3],
               "split state: front publishes the four lane spectra");
         doa_step(srp, front.lane_spectra, m, vad_raw, vad_out);
-        gsc_process_with_weights(gsc, front.lane_spectra, doa_get_smooth(srp),
+        bf_process_with_weights(bf, front.lane_spectra, doa_get_smooth(srp),
                                  vad_out ? 0 : 1, m, spec, weights);
         CHECK(audio_pipeline_4ch_ulcnet_process_beam(p, &front, vad_raw, vad_out, m) == FOUR_AEC_NR_RES_OK,
               "split state: beam runs");
         CHECK(audio_pipeline_4ch_ulcnet_beam_state(p, &st) == 0, "split state: state reads");
         CHECK(bits_equal_f(st.doa_raw_rad, doa_get_raw(srp)) &&
               bits_equal_f(st.doa_smooth_rad, doa_get_smooth(srp)) &&
-              bits_equal_f(st.doa_used_rad, gsc_get_doa_used(gsc)) &&
-              st.gsc_adaptive == gsc_get_adaptive(gsc),
-              "split state: getters equal the lower-level SRP/GSC getters");
+              bits_equal_f(st.doa_used_rad, bf_get_doa_used(bf)) &&
+              st.bf_adaptive == bf_get_adaptive(bf),
+              "split state: getters equal the lower-level SRP/BF getters");
         CHECK(!isinf(st.doa_raw_rad) && !isinf(st.doa_smooth_rad) && !isinf(st.doa_used_rad),
               "split state: no infinite angle");
         if (isfinite(st.doa_smooth_rad)) finite_smooth = 1;
         if (isfinite(st.doa_used_rad)) finite_used = 1;
-        if (fixed_gsc && st.doa_used_rad == 0.3f && !bits_equal_f(st.doa_used_rad, st.doa_smooth_rad))
+        if (fixed_bf && st.doa_used_rad == 0.3f && !bits_equal_f(st.doa_used_rad, st.doa_smooth_rad))
             fixed_used_seen = 1;
         r = audio_pipeline_4ch_ulcnet_nn_begin(p, &job);
         CHECK(r >= 0, "split state: nn_begin succeeds");
@@ -2777,21 +2777,21 @@ static int split_state_case(int fixed_gsc) {
             for (int k = 0; k < nf; ++k)
                 same = same && bits_equal_f(job.err_re[k], spec[k].r) &&
                        bits_equal_f(job.err_im[k], spec[k].i);
-            CHECK(same, "split state: the error frame is the lower-level GSC spectrum");
+            CHECK(same, "split state: the error frame is the lower-level BF spectrum");
             frames_compared++;
         }
         CHECK(audio_pipeline_4ch_ulcnet_process_end(p, out) == FOUR_AEC_NR_RES_OK, "split state: end runs");
     }
     CHECK(frames_compared > frames / 2, "split state: most hops carried a model frame");
     CHECK(finite_smooth && finite_used, "split state: the smoothed and used DOA become finite");
-    CHECK(!fixed_gsc || fixed_used_seen, "split state: a fixed beamformer reports its fixed angle as the used DOA");
+    CHECK(!fixed_bf || fixed_used_seen, "split state: a fixed beamformer reports its fixed angle as the used DOA");
     {
         AudioPipeline4ChUlcnetBeamState dummy;
         CHECK(audio_pipeline_4ch_ulcnet_beam_state(NULL, &dummy) != 0 &&
               audio_pipeline_4ch_ulcnet_beam_state(p, NULL) != 0,
               "split state: NULL arguments are refused");
     }
-    gsc_destroy(gsc);
+    bf_destroy(bf);
     srp_destroy(srp);
     free(spec); free(weights); free(mask); free(out);
     scene_close(&s);
@@ -2969,10 +2969,10 @@ static int run_all_tests(void) {
     CHECK(test_phased_hop(), "phased hop (process_begin / nn / process_end)");
     CHECK(test_split_null_mask_equals_begin(),
           "split: front + beam(v, v, NULL) equals process_begin");
-    CHECK(test_split_mask_and_vad_reach_srp_gsc(),
-          "split: mask and vad_raw/vad_out reach SRP and GSC");
+    CHECK(test_split_mask_and_vad_reach_srp_bf(),
+          "split: mask and vad_raw/vad_out reach SRP and BF");
     CHECK(test_split_beam_state_matches_lower_level(),
-          "split: beam_state equals the lower-level SRP/GSC values");
+          "split: beam_state equals the lower-level SRP/BF values");
     CHECK(test_split_sequence_guards(), "split: sequence and argument guards");
     printf("All audio_pipeline_4ch_ulcnet tests passed\n");
     return 1;

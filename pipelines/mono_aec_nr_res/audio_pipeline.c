@@ -28,9 +28,10 @@
 #include "common/se_config.h"     /* se_derive(): grid + AecConfig, shared by every application */
 #include "common/se_stage.h"      /* SeSpecFrame                                                  */
 #include "common/se_anr_stage.h"  /* NR configuration, init, per-hop gain, strength setter       */
-#include "fft_wrapper.h"       /* fft_get_mem_size, Complex, ALIGN16 */
+#include "fft_wrapper.h"       /* fft_get_mem_size, Complex */
+#include "utility/mem_align.h"       /* ALIGN16 -- was transitively reached via fft_wrapper.h */
 #include "audio_stft.h"        /* AcIstft: inverse FFT + sqrt-Hann OLA                */
-#include "simd_kernels.h"      /* sk_min_f32 / sk_capply_gain_f32                                     */
+#include "utility/simd_kernels.h"      /* sk_min_f32 / sk_capply_gain_f32                                     */
 #include "aec_res.h"          /* aec_cng_fill                                                        */
 
 /* Deliberately NO "wav_io.h" here: this TU takes raw float* mic/ref/out
@@ -65,20 +66,17 @@
 #define AP_LOG_ERR(...) ((void)0)
 #endif
 
-#define PSD_SCALE                 SE_PSD_SCALE  /* int16^2 (Python _PSD_SCALE) */
-
 /* This file's own carve-layout version (see audio_pipeline.h's
  * AudioPipelineMemReq doc). Any change of pool size, carve order or descriptor
  * content bumps it, including a change of the composed AEC, NR or FFT pool;
  * the carve token string in audio_pipeline_build_flags_hash() moves with a
  * changed buffer set or order. */
-#define AUDIO_PIPELINE_LAYOUT_VERSION 13u
+#define AUDIO_PIPELINE_LAYOUT_VERSION 14u
 
 /* Compile-time FFT backend identity. pipelines/Makefile passes
- * -DAUDIO_PIPELINE_BACKEND_STR=\"kiss\" or \"ne10\" to match its own
- * BACKEND= selection (the same backend libaudio_common.a this TU links
- * against); the fallback below only fires if someone compiles this file
- * outside that Makefile. */
+ * -DAUDIO_PIPELINE_BACKEND_STR=\"ne10\" to match its own BACKEND= selection
+ * (the same backend libaudio_common.a this TU links against); the fallback
+ * below only fires if someone compiles this file outside that Makefile. */
 #ifndef AUDIO_PIPELINE_BACKEND_STR
 #define AUDIO_PIPELINE_BACKEND_STR "unknown"
 #endif
@@ -142,7 +140,6 @@ static uint32_t audio_pipeline_now_us(void) { return AUDIO_PIPELINE_NOW_US(); }
 #endif
 
 static uint32_t audio_pipeline_backend_id(void) {
-    if (strcmp(AUDIO_PIPELINE_BACKEND_STR, "kiss") == 0) return AUDIO_PIPELINE_BACKEND_KISS;
     if (strcmp(AUDIO_PIPELINE_BACKEND_STR, "ne10") == 0) return AUDIO_PIPELINE_BACKEND_NE10;
     return 0u;
 }
@@ -386,7 +383,7 @@ static uint32_t audio_pipeline_build_flags_hash(void) {
     h = fnv1a_str("|carve:self(config-delay-v2),aec,istft(fft,window,acc,time,spec),nr?,"
                   "g_total,extra,spec,unity?", h);
     h = fnv1a_str("|align16", h);
-    return h;
+    return ac_memreq_abi_hash(h);
 }
 
 /* ============================================================================
@@ -573,7 +570,7 @@ AudioPipeline* audio_pipeline_init_ex(void* mem, size_t bytes, const AudioPipeli
     p->aec_only             = cfg->aec_only;
     p->legacy_amin          = cfg->legacy_amin;
     p->enable_res           = cfg->enable_res;
-    /* Comfort noise fills only the bins the AEC3 residual gain cut, so it has
+    /* Comfort noise fills only the bins the AEC residual gain cut, so it has
      * nothing to fill without that gain. */
     p->enable_cng_effective = aec_cfg.enable_cng && cfg->enable_cng && cfg->enable_res;
     p->sample_rate          = cfg->sample_rate;

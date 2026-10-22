@@ -5,8 +5,8 @@
  * Architecture per hop (compile-time ULCNET_HOP samples):
  *
  *   4x linear AEC lanes + one shared far aligner (FourAecNrRes four_aec_front_process)
- *     -> SRP-PHAT DOA -> GSC effective weights (existing spatial libraries)
- *     -> beamformed linear-error SPECTRUM (gsc_process_with_weights output),
+ *     -> SRP-PHAT DOA -> BF effective weights (existing spatial libraries)
+ *     -> beamformed linear-error SPECTRUM (bf_process_with_weights output),
  *        handed to the model DIRECTLY as its error frame -- it is already
  *        the sqrt-Hann, 50%-overlap, one-frame-per-hop analysis frame the
  *        Align-ULCNet chain would compute, so nothing is reconstructed or
@@ -27,7 +27,7 @@
  *            trimmed half window, so hop#p's output is the beamformed error
  *            of input hop p-1 (see ulcnet_process.h).
  *
- *   Nothing else adds latency. The GSC spectrum of hop p is the model's
+ *   Nothing else adds latency. The BF spectrum of hop p is the model's
  *   error frame at hop p, and the far branch is analysed from the same
  *   hop's far source (a rolling AcStft, one frame per hop from
  *   hop #0), so the model always sees error/far frame pairs of the SAME
@@ -60,7 +60,7 @@
  *     to a usable aligned AEC error: model->reset (if set) is
  *     called so the runtime flushes its far attention ring + logit history.
  *     The C-side framing states keep running (the core's lane analysis
- *     behind the GSC spectrum, this wrapper's far analysis and its
+ *     behind the BF spectrum, this wrapper's far analysis and its
  *     synthesis); the frame that still straddles the boundary is covered by
  *     the identity reprime below. Nothing is cleared: there is no
  *     reconstruction stage to wipe, and the boundary hop is emitted whole.
@@ -86,7 +86,7 @@
  *
  *   Derivation of the constant (MEASURED by the straddle-derivation test in
  *   tests/test_audio_pipeline_4ch_ulcnet.c, never assumed here): both
- *   branches are framed from the CURRENT input hop -- the GSC spectrum of
+ *   branches are framed from the CURRENT input hop -- the BF spectrum of
  *   hop T, and the far analysis pushed with hop T -- and each 50%-overlap
  *   frame spans two hops, so the frame at the boundary hop T still covers
  *   the pre-switch hop T-1 and straddles; the frame at T+1 covers the two
@@ -153,7 +153,7 @@ enum { AUDIO_PIPELINE_4CH_ULCNET_REPRIME_FRAMES = 1 };
  * ========================================================================== */
 
 #define AUDIO_PIPELINE_4CH_ULCNET_DESCRIPTOR_VERSION 1u
-/* Carve order: self, core, srp, gsc, gsc_spectrum, gsc_weights, fft (the
+/* Carve order: self, core, srp, bf, bf_spectrum, bf_weights, fft (the
  * ULCNet far-analysis/synthesis states, the one-frame err/far staging and
  * the chain's shared sqrt-Hann window table live inside `self`). The one
  * carved `fft` handle serves the ULCNet chain (same compiled size; strictly
@@ -162,7 +162,7 @@ enum { AUDIO_PIPELINE_4CH_ULCNET_REPRIME_FRAMES = 1 };
  * content bumps it, including a change of the composed core's pool or layout
  * version, which build_flags_hash does not see. The token string in the
  * build-flags hash moves with a changed carve. */
-#define AUDIO_PIPELINE_4CH_ULCNET_LAYOUT_VERSION 21u
+#define AUDIO_PIPELINE_4CH_ULCNET_LAYOUT_VERSION 22u
 
 /**
  * Fixed-width descriptor for a caller-owned static-memory pool. Same 32-byte
@@ -267,7 +267,7 @@ int audio_pipeline_4ch_ulcnet_get_mem_requirements(
     AudioPipeline4ChUlcnetMemReq* out);
 
 /**
- * Place the complete pipeline (core + SRP-PHAT + GSC + the ULCNet chain
+ * Place the complete pipeline (core + SRP-PHAT + BF + the ULCNet chain
  * state) in caller-owned memory. mem must satisfy the freshly
  * queried alignment and byte requirement. No heap allocation is performed by
  * this path. A dirty/poisoned pool is accepted. The model callback starts
@@ -325,7 +325,7 @@ int audio_pipeline_4ch_ulcnet_set_model(
  * Complete one hop with activity supplied by the product VAD (external VAD
  * only -- see the header comment). microphones_interleaved is [hop][4],
  * far_reference and out are [hop]. vad_external gates SRP observation and
- * freezes GSC adaptation exactly like the standard wrapper's vad_raw/vad_out
+ * freezes BF adaptation exactly like the standard wrapper's vad_raw/vad_out
  * pair (a single flag feeds both here).
  *
  * out receives zeros for hop#0; from hop#1 on it carries the enhanced (or
@@ -350,14 +350,14 @@ int audio_pipeline_4ch_ulcnet_process_with_activity(
  * no infer callback -- a reset callback, if set, is still called on an
  * alignment boundary and by audio_pipeline_4ch_ulcnet_reset()):
  *
- *     audio_pipeline_4ch_ulcnet_process_begin(p, mics, far, vad);  // lanes, DOA, GSC, far analysis
+ *     audio_pipeline_4ch_ulcnet_process_begin(p, mics, far, vad);  // lanes, DOA, BF, far analysis
  *     if (audio_pipeline_4ch_ulcnet_nn_begin(p, &job) > 0) {       // a frame to run
  *         rc = run_network(&job);                                  // 0 = all bins written
  *         audio_pipeline_4ch_ulcnet_nn_end(p, rc);                 // accept, or the identity
  *     }
  *     audio_pipeline_4ch_ulcnet_process_end(p, out);               // WOLA, one hop
  *
- * nn_begin returns 1 with the frame in *job (the GSC spectrum as the error
+ * nn_begin returns 1 with the frame in *job (the BF spectrum as the error
  * frame, the same hop's raw far), 0 when this hop has no model frame (the
  * identity reprime after an alignment boundary), or a negative
  * FOUR_AEC_NR_RES_* status. nn_end accepts the output only when rc == 0 and
@@ -389,7 +389,7 @@ int audio_pipeline_4ch_ulcnet_process_end(AudioPipeline4ChUlcnet* p, float* out)
  *
  *     audio_pipeline_4ch_ulcnet_process_front(p, mics, far, &front);   // lanes, far analysis
  *     ... mask, vad_raw, vad_out from front.lane_spectra[0] ...
- *     audio_pipeline_4ch_ulcnet_process_beam(p, &front, vad_raw, vad_out, mask);  // DOA, GSC
+ *     audio_pipeline_4ch_ulcnet_process_beam(p, &front, vad_raw, vad_out, mask);  // DOA, BF
  *     audio_pipeline_4ch_ulcnet_nn_begin / nn_end / process_end        // unchanged
  *
  * process_begin(p, mics, far, v) is process_front followed by
@@ -421,15 +421,15 @@ int audio_pipeline_4ch_ulcnet_process_front(
     AudioPipeline4ChUlcnetFront* front);
 
 /**
- * Second half of the hop: SRP-PHAT DOA and the GSC beamformer on the lane
- * spectra of `front`, whose GSC output becomes the model's error frame.
+ * Second half of the hop: SRP-PHAT DOA and the beamformer (bf) on the lane
+ * spectra of `front`, whose output becomes the model's error frame.
  *
  *   vad_raw  0/1  SRP analyses this hop only when it is 1 (and the update
  *                 interval allows it).
- *   vad_out  0/1  the DOA smoother's activity input; 1 freezes GSC adaptation.
+ *   vad_out  0/1  the DOA smoother's activity input; 1 freezes BF adaptation.
  *   mask     NULL, or n_freqs ints indexed by bin (the pipeline's n_freqs;
  *                 read during this call only): SRP uses the bins where mask[f]
- *                 is nonzero, GSC freezes its adaptation on those bins.
+ *                 is nonzero, BF freezes its adaptation on those bins.
  *                 NULL = every bin is used by SRP and none is frozen.
  *
  * @return FOUR_AEC_NR_RES_OK, FOUR_AEC_NR_RES_INVALID_ARGUMENT (nothing
@@ -443,14 +443,14 @@ int audio_pipeline_4ch_ulcnet_process_beam(
     const int* mask);
 
 /**
- * DOA and GSC state of the most recent process_beam()/process_begin(). Valid
- * until the next hop's beam half; read from the live SRP and GSC objects.
+ * DOA and BF state of the most recent process_beam()/process_begin(). Valid
+ * until the next hop's beam half; read from the live SRP and BF objects.
  */
 typedef struct AudioPipeline4ChUlcnetBeamState {
     float doa_raw_rad;      /* fresh SRP result of that hop; NaN when SRP did not run  */
-    float doa_smooth_rad;   /* smoothed, held DOA given to GSC; NaN until the first valid one */
-    float doa_used_rad;     /* DOA the GSC steered to; NaN when it used none          */
-    int   gsc_adaptive;     /* 1 when GSC adapted its weights on that hop, else 0      */
+    float doa_smooth_rad;   /* smoothed, held DOA given to BF; NaN until the first valid one */
+    float doa_used_rad;     /* DOA the BF steered to; NaN when it used none          */
+    int   bf_adaptive;     /* 1 when BF adapted its weights on that hop, else 0      */
 } AudioPipeline4ChUlcnetBeamState;
 
 /** Returns 0 on success, nonzero on a NULL out or NULL/destroyed handle. */
@@ -467,7 +467,7 @@ void audio_pipeline_4ch_ulcnet_last_core_timing(
     FourAecNrResLastTiming* out);
 
 /**
- * Reset all core/SRP/GSC/ULCNet-chain state, restart the 1-hop timing
+ * Reset all core/SRP/BF/ULCNet-chain state, restart the 1-hop timing
  * preamble, and call model->reset (if set). Any pending identity reprime is
  * dropped: the analysis history is zeroed here, so the frames emitted after
  * a reset straddle nothing. Never touches the model callback installation

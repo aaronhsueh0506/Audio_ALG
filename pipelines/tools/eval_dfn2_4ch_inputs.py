@@ -1,14 +1,14 @@
 #!/usr/bin/env python3
 """Compare DFN2 feature inputs on the checked-in four-microphone recordings.
 
-All arms share one AEC/BF/RES context stream on the recordings' own rate
+All arms share one AEC/beamformer/RES context stream on the recordings' own rate
 (16 kHz); only the DFN2 stage runs at 48 kHz, through the rate bridge that
 the C product path uses. The report also carries
 the original MMSE-LSA+RES tail and an AEC/BF/RES-only identity baseline. Only
 the spectrum used to estimate the DFN2 heads changes between DFN arms:
 
   raw_capture     raw/near spectrum from the capture-proxy microphone
-  linear_capture  linear-AEC spectrum from that microphone, before BF/GSC
+  linear_capture  linear-AEC spectrum from that microphone, before the beamformer
   beamformed      the actual post-beam linear spectrum
 
 Every arm applies the resulting heads to the same post-beam, post-RES

@@ -1,7 +1,7 @@
 /* Shared 16 kHz AIAEC boundary.
  *
  * Align-CRUSE, Align-ULCNet, DeepVQE-S and CAGCRN all use the same
- * 16 kHz / 512 / 256 centered sqrt-Hann framing, which is audio_common's
+ * 16 kHz / 512 / 256 centered sqrt-Hann framing, which is audiolib's
  * AcStft / AcIstft (audio_stft.h) in the AC_OLA_ENV_NORM configuration; each
  * model's pre/post class builds its own objects. This header holds the
  * constants of that boundary and the complex-mask helpers. Model-specific

@@ -22,7 +22,7 @@ import torch
 
 AINR = Path(__file__).resolve().parents[1]
 ROOT = AINR.parent.parent
-AC = ROOT / 'audio_common'
+AC = ROOT / 'audiolib' / 'common'
 DFN = AINR / 'DeepFilterNet2'
 GT = AINR / 'GTCRN'
 
@@ -110,7 +110,7 @@ def c_prepost(tmp_path_factory):
     shared_flag = '-dynamiclib' if sys.platform == 'darwin' else '-shared'
     subprocess.run(
         [cc, shared_flag, '-fPIC', '-O2', '-std=c11', '-ffp-contract=off',
-         '-I', str(DFN), '-I', str(GT), '-I', str(AC / 'include'),
+         '-I', str(DFN), '-I', str(GT), '-I', str(AC / 'include'), '-I', str(AC),
          str(wrapper), str(DFN / 'dfn2_process.c'),
          str(GT / 'gtcrn_process.c'), archive, '-lm', '-o', str(library)],
         check=True, capture_output=True,
@@ -248,7 +248,7 @@ def test_dfn2_process_compiles_alone_without_the_class_symbols(tmp_path):
     obj = tmp_path / 'dfn2_process.o'
     subprocess.run(
         [cc, '-c', '-O2', '-std=c11', '-ffp-contract=off', '-fno-math-errno',
-         '-I', str(DFN), '-I', str(AC / 'include'), str(DFN / 'dfn2_process.c'),
+         '-I', str(DFN), '-I', str(AC / 'include'), '-I', str(AC), str(DFN / 'dfn2_process.c'),
          '-o', str(obj)],
         check=True, capture_output=True)
     undefined = subprocess.run(['nm', '-u', str(obj)], check=True,

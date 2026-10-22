@@ -2,7 +2,7 @@
  * AUTO-GENERATED FILE - DO NOT EDIT.
  *
  * Regenerate with:
- *   cc -O2 -ffp-contract=off gen_rnnoise_tables.c -lm -o gen_rnnoise_tables && ./gen_rnnoise_tables > rnnoise_tables_gen.h
+ *   cc -O2 -ffp-contract=off -I../../../audiolib/common/include gen_rnnoise_tables.c ../../../audiolib/common/src/audio_window.c -lm -o gen_rnnoise_tables && ./gen_rnnoise_tables > rnnoise_tables_gen.h
  *
  * 編譯期常數版 ERB filterbank (forward/inverse) + root-Hann window,
  * 由 gen_rnnoise_tables.c 算出; test_rnnoise_tables.c 另外用獨立

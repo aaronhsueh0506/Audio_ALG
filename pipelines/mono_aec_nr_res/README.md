@@ -1,6 +1,6 @@
 # Mono AEC + NR/RES application
 
-The application uses the existing AEC, NR and audio_common libraries through
+The application uses the existing AEC, NR and audiolib libraries through
 `audio_pipeline.h`. The heap and caller-pool WAV runners are `main.c` and
 `static_main.c`; `example_board_adapter.c` demonstrates board integration.
 This directory is the stable application entry point and does not introduce
@@ -11,8 +11,8 @@ The top-level `pipelines/Makefile` owns the actual build so all four
 applications share one backend/SIMD configuration contract:
 
 ```sh
-make BACKEND=kiss SIMD=0 test
-make BACKEND=ne10 SIMD=1 test
+make SIMD=0 test
+make SIMD=1 test
 ```
 
 The configuration selects sample rate and FFT independently. Supported

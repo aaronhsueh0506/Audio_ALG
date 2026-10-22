@@ -13,12 +13,11 @@ extern "C" {
  * steered angle and suppresses the rest, then smooths the result over
  * frequency and time before applying it to the spectrum.
  *
- * The spectrum is audio_common's backend-neutral `Complex`, not a KISS type,
- * so the same header and archive serve BACKEND=kiss and BACKEND=ne10 and the
- * shared complex kernels apply to it directly. Integrators still holding a
- * `kiss_fft_cpx*` are byte-compatible -- both are {float r; float i;} -- but
- * must spell the conversion as a cast at the call site rather than relying on
- * the two names being interchangeable. */
+ * The spectrum is audiolib's backend-neutral `Complex` ({float r; float i;}),
+ * so the shared complex kernels apply to it directly. An integrator holding an
+ * FFT library's own complex type of the same layout must spell the conversion
+ * as a cast at the call site rather than relying on the two names being
+ * interchangeable. */
 
 typedef struct {
     int F;

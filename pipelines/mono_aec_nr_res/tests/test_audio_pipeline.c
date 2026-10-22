@@ -38,17 +38,14 @@
  * test_config_validation_rejects().
  *
  * Build (from pipelines/, after `make libs` for the selected BACKEND):
- *   make test                     # ne10 backend (default everywhere)
- *   make BACKEND=kiss test        # portable/bit-reproducible reference backend
+ *   make test
  *
- * Standalone (no Makefile; kiss reference variant shown -- swap kiss->ne10
- * in the define and the audio_common archive path for the default backend):
+ * Standalone (no Makefile; <libs> are the ne10 archives the Makefile builds):
  *   cc -O2 -std=gnu99 -I../lib/aec/c_impl/include -I../lib/aec/c_impl/example \
- *      -I../lib/nr/c_impl/include -I../../audio_common/include \
- *      -DAUDIO_PIPELINE_BACKEND_STR=\"kiss\" \
+ *      -I../lib/nr/c_impl/include -I../../audiolib/common/include \
+ *      -DAUDIO_PIPELINE_BACKEND_STR=\"ne10\" \
  *      tests/test_audio_pipeline.c audio_pipeline.c \
- *      ../lib/aec/c_impl/bin/libaec.a ../lib/nr/c_impl/bin/libanr.a \
- *      ../../audio_common/bin/kiss/libaudio_common.a -lm -o /tmp/tap && /tmp/tap
+ *      <libaec.a> <libanr.a> <libaudio_common.a> -lm -o /tmp/tap && /tmp/tap
  *
  * Cases (each run once per rate in RATES[] below, unless noted "once"):
  *   1. audio_pipeline_get_mem_requirements: NULL cfg/out rejected,
@@ -75,9 +72,10 @@
  */
 #include "audio_pipeline.h"
 #include "common/se_anr_stage.h"   /* se_anr_stage_gain */
-#include "simd_kernels.h"          /* sk_min_f32 / sk_capply_gain_f32 */
+#include "utility/simd_kernels.h"          /* sk_min_f32 / sk_capply_gain_f32 */
 #include "aec_res.h"               /* aec_cng_fill */
 #include "fft_wrapper.h"           /* test-side WOLA reference for the RES/NR bypass */
+#include "audio_window.h"
 
 #include <math.h>
 #include <stdio.h>
@@ -589,7 +587,8 @@ static void test_nr_res_switches(void) {
     frame = 2 * hop;                     /* 50% overlap: FFT == frame == 2 hops */
     init_hops = anr_retime_frames(20, 16000, hop);
     total_hops = init_hops + 120;
-    fft_mem = malloc(fft_get_mem_size(frame));
+    /* fft_init requires a 16-byte aligned pool; a 32-bit malloc only guarantees 8. */
+    if (posix_memalign(&fft_mem, 16, fft_get_mem_size(frame)) != 0) fft_mem = NULL;
     fft = fft_mem ? fft_init(fft_mem, fft_get_mem_size(frame), frame) : NULL;
     CHECK(fft != NULL, "test-side synthesis FFT builds");
     if (fft) {
@@ -601,8 +600,7 @@ static void test_nr_res_switches(void) {
         float* win = (float*)malloc((size_t)frame * sizeof(float));
         float* ola = (float*)calloc((size_t)frame, sizeof(float));
         float* ibuf = (float*)malloc((size_t)frame * sizeof(float));
-        for (i = 0; i < frame; i++)
-            win[i] = sqrtf(0.5f * (1.0f - cosf(2.0f * (float)M_PI * (float)i / (float)frame)));
+        ac_window_build(win, frame);
         for (h = 0; h < total_hops; h++) {
             AecResContext ctx;
             for (i = 0; i < hop; i++) {
@@ -706,13 +704,13 @@ static void test_init_ex_descriptor(void) {
     if (p_lv) audio_pipeline_destroy(p_lv);
 
     /* The literal, not a relative tamper: a carve or ABI change that forgets
-     * the bump must fail here. A persisted layout-12 descriptor is refused on
+     * the bump must fail here. A persisted layout-13 descriptor is refused on
      * the counter alone. */
-    CHECK(req.layout_version == 13u, "AudioPipelineMemReq reports layout_version 13");
+    CHECK(req.layout_version == 14u, "AudioPipelineMemReq reports layout_version 14");
     AudioPipelineMemReq stale_lv = req;
-    stale_lv.layout_version = 12u;
+    stale_lv.layout_version = 13u;
     AudioPipeline* p_stale = audio_pipeline_init_ex(pool, (size_t)req.bytes, &cfg, &stale_lv);
-    CHECK(p_stale == NULL, "audio_pipeline_init_ex refuses a persisted layout-12 descriptor");
+    CHECK(p_stale == NULL, "audio_pipeline_init_ex refuses a persisted layout-13 descriptor");
     if (p_stale) audio_pipeline_destroy(p_stale);
 
     /* Tampered backend_id: a plain wrong integer (99), never a string --

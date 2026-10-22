@@ -29,10 +29,10 @@ def _valid_result():
             "doa_frame_size": 256,
             "doa_hop_size": 128,
             "doa_fft_size": 256,
-            "gsc_sample_rate": 16000,
-            "gsc_frame_size": 256,
-            "gsc_hop_size": 128,
-            "gsc_fft_size": 256,
+            "bf_sample_rate": 16000,
+            "bf_frame_size": 256,
+            "bf_hop_size": 128,
+            "bf_fft_size": 256,
             "matched_filters": 1,
             "linear_aecs": 4,
             "nr": 1,
@@ -40,7 +40,7 @@ def _valid_result():
             "final_delay_solid": 1,
             "doa_analysis_frames": 1,
             "doa_update_frames": 1,
-            "gsc_adaptive_frames": 1,
+            "bf_adaptive_frames": 1,
         },
     }
 
@@ -51,7 +51,7 @@ def test_external_recording_contract_accepts_shared_spatial_grid():
 
 @pytest.mark.parametrize(
     "field",
-    ["doa_hop_size", "gsc_fft_size", "n_freqs"],
+    ["doa_hop_size", "bf_fft_size", "n_freqs"],
 )
 def test_external_recording_contract_rejects_spatial_grid_skew(field):
     result = _valid_result()

@@ -26,7 +26,7 @@ for AEC; MCRA + SPP for NR) inside its single pool segment:
 ```c
 size_t aec_sz = aec_get_mem_size(&aec_cfg);          /* lib/aec           */
 size_t nr_sz  = anr_get_mem_size(&nr_cfg);      /* lib/nr            */
-size_t fft_sz = fft_get_mem_size(fft_size);          /* audio_common (OLA) */
+size_t fft_sz = fft_get_mem_size(fft_size);          /* audiolib (OLA) */
 /* + pipeline buffers; every segment 16-byte aligned (ALIGN16)            */
 
 Aec*             aec = aec_init(mem_aec, aec_sz, &aec_cfg);
@@ -34,7 +34,7 @@ AnrDenoiser* nr  = anr_init(mem_nr, nr_sz, &nr_cfg);
 FftHandle*       fft = fft_init(mem_fft, fft_sz, fft_size);
 /* destroy() on static instances frees no pool memory (runtime is_static)
  * and, since P0001, releases no backend-owned handle OUTSIDE the pool
- * either: on BOTH backends every one of aec_destroy/anr_destroy/
+ * either: with the NE10 backend every one of aec_destroy/anr_destroy/
  * fft_destroy above is a genuine no-op for a pool-resident instance --
  * nothing lives outside mem_aec/mem_nr/mem_fft to leak or double-free, so
  * each is safe to call any number of times (including never, if the caller
@@ -102,7 +102,7 @@ aligned (both libraries assert this).
             // NR -> pipeline FFT -> AEC, reverse of the init carve order.
             // NULL-safe; idempotent for THIS pool-resident instance (every
             // sub-destroy is already a genuine no-op on the pool path, on
-            // BOTH backends — see "Two Versions" in
+            // the NE10 backend — see "Two Versions" in
             // ../pipelines/README.md). Call it exactly once if `p` came
             // from audio_pipeline_create() instead
             // (ordinary free() semantics — see "Warnings" below).
@@ -156,7 +156,7 @@ caller-owned block; the stage chain adds no heap use in the hop path.
   thing here" below; do not look for one to set, there is nothing to
   accidentally leave unset either.
 - **Re-query the descriptor after ANY build, backend, or config change** —
-  a firmware rebuild, a `BACKEND=kiss` ↔ `BACKEND=ne10` switch, or a change
+  a firmware rebuild, or a change
   to any `AudioPipelineConfig` field that affects sizing. Never cache a
   bare byte count (or a whole `AudioPipelineMemReq`) across one of those
   changes and replay it into a later build's `audio_pipeline_init_ex()` —
@@ -198,9 +198,9 @@ updated, there is no compatibility shim.
 |-------|---------|
 | `descriptor_version` | This STRUCT's own ABI version — `AUDIO_PIPELINE_DESCRIPTOR_VERSION` (currently `2`). Bumped only when `AudioPipelineMemReq`'s field set/order/width changes, independent of `layout_version` below (which tracks THIS FILE's carve layout, not the descriptor struct's own shape). `audio_pipeline_init_ex()` checks this FIRST, before interpreting any other field. |
 | `layout_version` | Bumped whenever the pool size, carve order or descriptor content of `../pipelines/mono_aec_nr_res/audio_pipeline.c` changes — including a change of the composed AEC, NR or FFT pool size, which moves `bytes`. A cached `bytes` alone is only a lower bound, so this counter is what refuses a descriptor persisted by another build. |
-| `backend_id` | Compile-time FFT backend identity this `audio_pipeline.o` was built with, as a small integer — `AUDIO_PIPELINE_BACKEND_KISS` (1) or `AUDIO_PIPELINE_BACKEND_NE10` (2) (matches `../pipelines/Makefile`'s `BACKEND=`). A process-local rodata pointer cannot be serialized safely, so `backend_id` is compared with a plain integer `==`. The two backends are not byte-identical to each other; a descriptor from one is never valid for the other even at matching `bytes`. `0` is reserved for "unknown backend" and is never present in a descriptor this library actually returns — `audio_pipeline_get_mem_requirements()` rejects an unrecognized backend string outright. |
+| `backend_id` | Compile-time FFT backend identity this `audio_pipeline.o` was built with, as a small integer — `AUDIO_PIPELINE_BACKEND_NE10` (2), the only FFT backend (matches `../pipelines/Makefile`'s `BACKEND=`; value 1 belonged to the removed KISS backend, is retired, and is never returned). A process-local rodata pointer cannot be serialized safely, so `backend_id` is compared with a plain integer `==`. A descriptor carrying any other value (for example `1`, from a build made before the KISS backend was removed) is never valid, even at matching `bytes`. `0` is reserved for "unknown backend" and is never present in a descriptor this library actually returns — `audio_pipeline_get_mem_requirements()` rejects an unrecognized backend string outright. |
 | `build_flags_hash` | FNV-1a-32 of a small fixed set of compile-time strings that affect the pipeline's own carve STRUCTURE: the backend identity above, a literal token list naming the 8 scratch buffers in carve order, and the alignment granularity — see `audio_pipeline_build_flags_hash()` in `../pipelines/mono_aec_nr_res/audio_pipeline.c`. **Covers:** a change to this file's own carve order/buffer set/alignment. **Does NOT cover:** `AudioPipelineConfig` preset/tunable VALUES (`aec_preset`, `nr_mode`, `sample_rate`, `aec_only`, ...) — those change `bytes` but are config, not layout, so a caller re-querying `get_mem_requirements()` for its actual config already gets the right `bytes` regardless of this hash; AEC's/NR's/an FFT backend's internal struct layouts (opaque blobs, as above); the compiler/ABI/toolchain. |
-| `alignment` | Required base alignment of the pool pointer, bytes. Always 16 today (the one alignment every module in this stack — AEC, NR, both FFT backends, `mem_align.h`'s `ALIGN16` — carves to). `uint32_t`, not `size_t`. |
+| `alignment` | Required base alignment of the pool pointer, bytes. Always 16 today (the one alignment every module in this stack — AEC, NR, the NE10 FFT backend, `mem_align.h`'s `ALIGN16` — carves to). `uint32_t`, not `size_t`. |
 | `reserved` | Always 0. Exists only so `bytes` (a `uint64_t`) lands on an 8-byte-aligned offset within the struct with no compiler-inserted padding — part of the fixed 32-byte layout, not a field to read or write. |
 | `bytes` | Total pool size to allocate (includes the opaque `AudioPipeline` control block itself, carved at the front — a few hundred bytes — plus AEC + FFT(OLA) + NR + the 8 pipeline scratch buffers, same carve `aec_nr_pipeline_static.c`'s old file-local `pipeline_pool_size()` produced). `uint64_t`, not `size_t` — cast to `size_t` before passing to `malloc`/`posix_memalign`/`audio_pipeline_init*()` on a target where the two widths differ. |
 
@@ -291,7 +291,7 @@ make BACKEND=ne10 audit-no-stdio   # PASS/FAIL, non-zero exit on FAIL
 ```
 
 builds exactly that and asserts it with `nm` over the delivered archive (members `audio_pipeline.o`, `se_config.o`, `se_anr_stage.o`)
-(pattern/style follows `audio_common/scripts/audit_alloc_symbols.sh`) — run
+(pattern/style follows `audiolib/common/scripts/audit_alloc_symbols.sh`) — run
 it after touching any diagnostic in `../pipelines/mono_aec_nr_res/audio_pipeline.c` to
 confirm the gate still holds.
 
@@ -322,7 +322,7 @@ they will be there.
 `audio_pipeline_destroy()` tears down NR → pipeline FFT (the OLA irfft
 instance) → AEC — the reverse of `audio_pipeline_init()`'s carve order (AEC →
 FFT → NR → scratch). Every one of those three calls is a genuine no-op for a
-pool-resident instance today, on **both** backends (matches the "Two
+pool-resident instance today, with the NE10 backend (matches the "Two
 Versions" section in [`../pipelines/README.md`](../pipelines/README.md) —
 NE10's twiddle configs moved fully into the pool under vendored patch
 P0001, closing the one case that used to need a real
@@ -382,12 +382,12 @@ platform allocator, DMA engine, or power state behind that pointer.
   power state itself; confirm the pool's contents survive whatever the
   platform does across suspend, or re-`init_ex()` from scratch on resume
   if they don't).
-- **Allocator-hook trace of init→destroy (zero-heap, both backends)**:
+- **Allocator-hook trace of init→destroy (zero-heap)**:
   with a runtime allocator-hook/interposer (the style `lib/aec`'s and
-  `audio_common`'s own zero-heap tests use), confirm NO `malloc`/`calloc`/
+  `audiolib`'s own zero-heap tests use), confirm NO `malloc`/`calloc`/
   `realloc`/`free` call happens between `audio_pipeline_init_ex()`
   returning and the matching `audio_pipeline_destroy()` returning, ON YOUR
-  ACTUAL TARGET BUILD — KISS and NE10 are both zero-heap end-to-end since
+  ACTUAL TARGET BUILD — NE10 is zero-heap end-to-end since
   P0001 (see "Two Versions" in
   [`../pipelines/README.md`](../pipelines/README.md)), but that is a
   property of THIS repo's reference builds, not a substitute for verifying
@@ -420,7 +420,7 @@ kernel-level equivalent of `O_CREAT|O_EXCL`) — a same-second name collision
 `<seq>` and retries, so an existing attestation is **never** overwritten.
 Each attestation's `event_id` is embedded inside the file, and it records a
 **full 40-hex git commit OID** plus a dirty flag for **this repo AND all
-three producers** (audio_common, lib/aec, lib/nr) — "which exact checkout
+three producers** (audiolib, lib/aec, lib/nr) — "which exact checkout
 of the whole stack published this" lives here, not in MANIFEST.
 
 `publish` **refuses by default**, checking tracked and untracked state as
@@ -489,7 +489,7 @@ are isolation-test knobs for running scratch-directory builds, not part of
 the build's config identity (CFG_SIG).
 
 The `current` symlink is swapped via a rename(2)-atomic helper
-(`audio_common/tools/atomic_symlink_swap.c`, built at publish time with the
+(`audiolib/common/tools/atomic_symlink_swap.c`, built at publish time with the
 host compiler `HOSTCC`), and `publish` takes its per-backend lock BEFORE
 building anything, so concurrent publishes serialize fully. When
 cross-compiling, pass
@@ -544,8 +544,8 @@ concurrently in the same worktree without stomping each other's objects.
 ## Unified FP-contraction policy
 
 `-ffp-contract=off -fno-math-errno` is a **unified policy spanning all four repos**
-(`audio_common`, `lib/nr`, `lib/aec`, the `../pipelines/` Makefile): every TU
-each Makefile compiles — own sources and vendored KISS/NE10 alike — builds
+(`audiolib`, `lib/nr`, `lib/aec`, the `../pipelines/` Makefile): every TU
+each Makefile compiles — own sources and vendored NE10 alike — builds
 with both flags. The second flag guarantees that guarded AArch64 `sqrtf`
 lowers to `FSQRT` without a cold errno fallback; production code does not
 read math `errno`.
@@ -560,9 +560,9 @@ $ make EXTRA_CFLAGS=-ffast-math
 Makefile:217: *** FP policy conflict: CFLAGS/EXTRA_CFLAGS contains -ffast-math; this repo pins -ffp-contract=off; remove -ffast-math from EXTRA_CFLAGS.  Stop.
 ```
 
-`../../audio_common/scripts/audit_fp_contract.sh` is the disassembly-level
-proof the flag actually bites (audio_common's and NR's TUs —
+`../../audiolib/common/scripts/audit_fp_contract.sh` is the disassembly-level
+proof the flag actually bites (audiolib's and NR's TUs —
 `../pipelines/`'s own three TUs, being pure CLI/glue code with no
 per-sample math loops of their own, are outside that script's audit list). See
-`audio_common/README.md`'s "FP-contraction policy" section for the full
+`audiolib/common/README.md`'s "FP-contraction policy" section for the full
 cross-repo writeup.

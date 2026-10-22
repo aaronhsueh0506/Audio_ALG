@@ -8,14 +8,19 @@ override CFLAGS += -ffp-contract=off -fno-math-errno -I.
 LDFLAGS ?=
 SIMD ?= 1
 override SIMD := $(strip $(SIMD))
+# ne10 is the only FFT backend; the variable remains because audiolib's
+# archive path is keyed on it.
 BACKEND ?= ne10
+ifneq ($(BACKEND),ne10)
+$(error BACKEND must be ne10 (got '$(BACKEND)'): ne10 is the only FFT backend)
+endif
 
-# The FFT (and Complex type) come from audio_common -- the cross-product
+# The FFT (and Complex type) come from audiolib -- the cross-product
 # base library every port already carries; the models keep only their own
 # DSP on top of it.
-AC_DIR ?= $(abspath ../../audio_common)
-AC_LIB = $(shell $(MAKE) -s -C $(AC_DIR) BACKEND=$(BACKEND) SIMD=$(SIMD) 	lib print-lib-path | tail -1)
-override CFLAGS += -I$(AC_DIR)/include
+COMMON_DIR ?= $(abspath ../../audiolib/common)
+COMMON_LIB = $(shell $(MAKE) -s -C $(COMMON_DIR) BACKEND=$(BACKEND) SIMD=$(SIMD) 	lib print-lib-path | tail -1)
+override CFLAGS += -I$(COMMON_DIR)/include -I$(COMMON_DIR)
 
 # -Werror opt-in, the same control name and shape as AIAEC/Makefile and
 # pipelines/Makefile. `override` because CFLAGS may be a command-line
@@ -45,7 +50,10 @@ endif
 # run reuses a binary that was never compiled with -Werror. `make
 # print-lib-path` prints the archive for the current configuration.
 BUILD_DIR := build
-CFG_SIG_PAYLOAD := CC=$(CC) AR=$(AR) CFLAGS=$(CFLAGS) LDFLAGS=$(LDFLAGS) SIMD=$(SIMD) SIMD_CPPFLAGS=$(SIMD_CPPFLAGS) BACKEND=$(BACKEND) WERROR=$(WERROR) AC_LIB=$(AC_LIB)
+# The same CC command can select a different SDK through PATH.
+# Include effective pointer/FP/ISA predefines to avoid cross-ABI cache reuse.
+override CC_TARGET_SIG := $(shell sh $(COMMON_DIR)/scripts/target_abi_signature.sh $(CC) $(CPPFLAGS) $(CFLAGS))
+CFG_SIG_PAYLOAD := CC_TARGET_SIG=$(CC_TARGET_SIG) CC=$(CC) AR=$(AR) CFLAGS=$(CFLAGS) LDFLAGS=$(LDFLAGS) SIMD=$(SIMD) SIMD_CPPFLAGS=$(SIMD_CPPFLAGS) BACKEND=$(BACKEND) WERROR=$(WERROR) COMMON_LIB=$(COMMON_LIB)
 CFG_SIG := $(shell printf '%s' "$(CFG_SIG_PAYLOAD)" | cksum | cut -d' ' -f1)
 OBJ_DIR := $(BUILD_DIR)/simd$(SIMD)-$(CFG_SIG)
 # dfn2_prepost.c is not referenced by tests/test_c_prepost.c. It is in
@@ -56,26 +64,37 @@ SOURCES := tests/test_c_prepost.c \
 	DeepFilterNet2/dfn2_process.c \
 	DeepFilterNet2/dfn2_model_io.c \
 	DeepFilterNet2/dfn2_prepost.c \
+	DeepFilterNet3/dfn3_process.c \
+	DeepFilterNet3/dfn3_model_io.c \
+	DeepFilterNet3/dfn3_prepost.c \
 	GTCRN/gtcrn_process.c
 HEADERS := \
 	DeepFilterNet2/dfn2_process.h \
 	DeepFilterNet2/dfn2_model_io.h \
 	DeepFilterNet2/dfn2_prepost.h \
+	DeepFilterNet3/dfn3_process.h \
+	DeepFilterNet3/dfn3_model_io.h \
+	DeepFilterNet3/dfn3_prepost.h \
 	GTCRN/gtcrn_process.h
 TEST_BIN := $(OBJ_DIR)/test_c_prepost
 SCALAR_BIN := $(OBJ_DIR)/test_c_prepost_scalar
 # Bit-exactness of the model-local kernels against their scalar twins; the
-# test includes the kernel sources, so it links only audio_common.
+# test includes the kernel sources, so it links only audiolib.
 KERNEL_TEST_BIN := $(OBJ_DIR)/test_nn_kernels
 KERNEL_TEST_SCALAR_BIN := $(OBJ_DIR)/test_nn_kernels_scalar
-# Recorded digests of the DFN2 and GTCRN chains driven through their public
-# API; the same constants must hold for the NEON and the scalar build.
-GOLDEN_SOURCES := $(SOURCES:tests/test_c_prepost.c=tests/test_nn_golden.c)
-GOLDEN_BIN := $(OBJ_DIR)/test_nn_golden
-GOLDEN_SCALAR_BIN := $(OBJ_DIR)/test_nn_golden_scalar
+# Whole-chain digests of the DFN2 and GTCRN chains driven through their public
+# API; the NEON and the scalar build must print the same digests.
+CHAINS_SOURCES := $(SOURCES:tests/test_c_prepost.c=tests/test_nn_chains.c)
+CHAINS_BIN := $(OBJ_DIR)/test_nn_chains
+CHAINS_SCALAR_BIN := $(OBJ_DIR)/test_nn_chains_scalar
+DFN3_STREAM_SOURCES := tests/test_dfn3_stream.c \
+	DeepFilterNet3/dfn3_process.c DeepFilterNet3/dfn3_model_io.c \
+	DeepFilterNet3/dfn3_prepost.c
+DFN3_STREAM_BIN := $(OBJ_DIR)/test_dfn3_stream
+DFN3_STREAM_SCALAR_BIN := $(OBJ_DIR)/test_dfn3_stream_scalar
 
 # The AINR release archive, the counterpart of AIAEC's libaiaec_prepost.a:
-# DeepFilterNet2 (including its pre/post class) and GTCRN. RNNoise-ERB is
+# DeepFilterNet2, DeepFilterNet3 (including their pre/post classes) and GTCRN. RNNoise-ERB is
 # NOT in it -- it has its own Makefile under RNNoise-ERB/ and no archive of
 # its own (its process.c is compiled directly), so a board using it adds that
 # source to its build. The contract binaries above compile the same sources
@@ -84,8 +103,11 @@ LIB := $(OBJ_DIR)/libainr_prepost.a
 LIB_OBJECTS := $(OBJ_DIR)/dfn2_process.o \
 	$(OBJ_DIR)/dfn2_model_io.o \
 	$(OBJ_DIR)/dfn2_prepost.o \
+	$(OBJ_DIR)/dfn3_process.o \
+	$(OBJ_DIR)/dfn3_model_io.o \
+	$(OBJ_DIR)/dfn3_prepost.o \
 	$(OBJ_DIR)/gtcrn_process.o
-VPATH := DeepFilterNet2:GTCRN
+VPATH := DeepFilterNet2:DeepFilterNet3:GTCRN
 
 .PHONY: all lib print-lib-path test test-simd clean _cfg_guard
 
@@ -102,6 +124,9 @@ $(LIB): $(LIB_OBJECTS)
 	rm -f "$@" && $(AR) rcs "$@" $(LIB_OBJECTS)
 
 _cfg_guard:
+	@test -n "$(CC_TARGET_SIG)" && test "$(CC_TARGET_SIG)" != unavailable || { \
+	  echo "FATAL: cannot determine compiler target; CC preprocessing with the configured flags must succeed." >&2; \
+	  exit 1; }
 	@mkdir -p "$(OBJ_DIR)"
 	@m="$(OBJ_DIR)/config.manifest"; \
 	if [ -f "$$m" ] && [ "$$(cat "$$m")" != "$(CFG_SIG_PAYLOAD)" ]; then \
@@ -118,45 +143,67 @@ $(OBJ_DIR)/%.o: %.c | _cfg_guard
 -include $(LIB_OBJECTS:.o=.d)
 
 # The contract binaries are whole-program builds, so they list what they
-# read: the model sources and headers, audio_common's archive and headers.
-AC_HEADERS := $(wildcard $(AC_DIR)/include/*.h)
+# read: the model sources and headers, audiolib's archive and headers.
+COMMON_HEADERS := $(wildcard $(COMMON_DIR)/include/*.h $(COMMON_DIR)/utility/*.h)
 
-$(TEST_BIN): $(SOURCES) $(HEADERS) $(AC_LIB) $(AC_HEADERS) | _cfg_guard
-	$(CC) $(CFLAGS) $(SIMD_CPPFLAGS) $(SOURCES) "$(AC_LIB)" $(LDFLAGS) -lm -o "$@"
+$(TEST_BIN): $(SOURCES) $(HEADERS) $(COMMON_LIB) $(COMMON_HEADERS) | _cfg_guard
+	$(CC) $(CFLAGS) $(SIMD_CPPFLAGS) $(SOURCES) "$(COMMON_LIB)" $(LDFLAGS) -lm -o "$@"
 
-$(SCALAR_BIN): $(SOURCES) $(HEADERS) $(AC_LIB) $(AC_HEADERS) | _cfg_guard
-	$(CC) $(CFLAGS) -DSIMD_KERNELS_FORCE_SCALAR $(SOURCES) "$(AC_LIB)" \
+$(SCALAR_BIN): $(SOURCES) $(HEADERS) $(COMMON_LIB) $(COMMON_HEADERS) | _cfg_guard
+	$(CC) $(CFLAGS) -DSIMD_KERNELS_FORCE_SCALAR $(SOURCES) "$(COMMON_LIB)" \
 		$(LDFLAGS) -lm -o "$@"
 
 KERNEL_SOURCES := DeepFilterNet2/dfn2_process.c GTCRN/gtcrn_process.c
 
-$(KERNEL_TEST_BIN): tests/test_nn_kernels.c $(KERNEL_SOURCES) $(HEADERS) $(AC_LIB) $(AC_HEADERS) | _cfg_guard
-	$(CC) $(CFLAGS) $(SIMD_CPPFLAGS) tests/test_nn_kernels.c "$(AC_LIB)" \
+$(KERNEL_TEST_BIN): tests/test_nn_kernels.c $(KERNEL_SOURCES) $(HEADERS) $(COMMON_LIB) $(COMMON_HEADERS) | _cfg_guard
+	$(CC) $(CFLAGS) $(SIMD_CPPFLAGS) tests/test_nn_kernels.c "$(COMMON_LIB)" \
 		$(LDFLAGS) -lm -o "$@"
 
-$(KERNEL_TEST_SCALAR_BIN): tests/test_nn_kernels.c $(KERNEL_SOURCES) $(HEADERS) $(AC_LIB) $(AC_HEADERS) | _cfg_guard
+$(KERNEL_TEST_SCALAR_BIN): tests/test_nn_kernels.c $(KERNEL_SOURCES) $(HEADERS) $(COMMON_LIB) $(COMMON_HEADERS) | _cfg_guard
 	$(CC) $(CFLAGS) -DSIMD_KERNELS_FORCE_SCALAR tests/test_nn_kernels.c \
-		"$(AC_LIB)" $(LDFLAGS) -lm -o "$@"
+		"$(COMMON_LIB)" $(LDFLAGS) -lm -o "$@"
 
-$(GOLDEN_BIN): $(GOLDEN_SOURCES) $(HEADERS) $(AC_LIB) $(AC_HEADERS) | _cfg_guard
-	$(CC) $(CFLAGS) $(SIMD_CPPFLAGS) $(GOLDEN_SOURCES) "$(AC_LIB)" \
+$(CHAINS_BIN): $(CHAINS_SOURCES) $(HEADERS) $(COMMON_LIB) $(COMMON_HEADERS) | _cfg_guard
+	$(CC) $(CFLAGS) $(SIMD_CPPFLAGS) $(CHAINS_SOURCES) "$(COMMON_LIB)" \
 		$(LDFLAGS) -lm -o "$@"
 
-$(GOLDEN_SCALAR_BIN): $(GOLDEN_SOURCES) $(HEADERS) $(AC_LIB) $(AC_HEADERS) | _cfg_guard
-	$(CC) $(CFLAGS) -DSIMD_KERNELS_FORCE_SCALAR $(GOLDEN_SOURCES) \
-		"$(AC_LIB)" $(LDFLAGS) -lm -o "$@"
+$(CHAINS_SCALAR_BIN): $(CHAINS_SOURCES) $(HEADERS) $(COMMON_LIB) $(COMMON_HEADERS) | _cfg_guard
+	$(CC) $(CFLAGS) -DSIMD_KERNELS_FORCE_SCALAR $(CHAINS_SOURCES) \
+		"$(COMMON_LIB)" $(LDFLAGS) -lm -o "$@"
 
-test: $(TEST_BIN) $(KERNEL_TEST_BIN) $(GOLDEN_BIN)
+$(DFN3_STREAM_BIN): $(DFN3_STREAM_SOURCES) $(HEADERS) $(COMMON_LIB) $(COMMON_HEADERS) | _cfg_guard
+	$(CC) $(CFLAGS) $(SIMD_CPPFLAGS) $(DFN3_STREAM_SOURCES) "$(COMMON_LIB)" $(LDFLAGS) -lm -o "$@"
+
+$(DFN3_STREAM_SCALAR_BIN): $(DFN3_STREAM_SOURCES) $(HEADERS) $(COMMON_LIB) $(COMMON_HEADERS) | _cfg_guard
+	$(CC) $(CFLAGS) -DSIMD_KERNELS_FORCE_SCALAR $(DFN3_STREAM_SOURCES) \
+		"$(COMMON_LIB)" $(LDFLAGS) -lm -o "$@"
+
+test: $(TEST_BIN) $(KERNEL_TEST_BIN) $(CHAINS_BIN) $(DFN3_STREAM_BIN)
 	"$(TEST_BIN)"
 	"$(KERNEL_TEST_BIN)"
-	"$(GOLDEN_BIN)"
+	"$(CHAINS_BIN)"
+	"$(DFN3_STREAM_BIN)"
 
 test-simd: $(TEST_BIN) $(SCALAR_BIN) $(KERNEL_TEST_BIN) $(KERNEL_TEST_SCALAR_BIN) \
-		$(GOLDEN_BIN) $(GOLDEN_SCALAR_BIN)
+		$(CHAINS_BIN) $(CHAINS_SCALAR_BIN) $(DFN3_STREAM_BIN) $(DFN3_STREAM_SCALAR_BIN)
 	@"$(KERNEL_TEST_BIN)" && "$(KERNEL_TEST_SCALAR_BIN)" || { \
 		echo "FAIL: kernel test" >&2; exit 1; }
-	@"$(GOLDEN_BIN)" && "$(GOLDEN_SCALAR_BIN)" || { \
-		echo "FAIL: golden digest test" >&2; exit 1; }
+	@auto_output="$$($(CHAINS_BIN))" && \
+	scalar_output="$$($(CHAINS_SCALAR_BIN))" && \
+	printf '%s\n%s\n' "$$auto_output" "$$scalar_output" && \
+	auto_digest="$${auto_output##*digest=}" && \
+	scalar_digest="$${scalar_output##*digest=}" && \
+	test "$$auto_digest" != "$$auto_output" && \
+	test -n "$$auto_digest" && test "$$auto_digest" = "$$scalar_digest" || { \
+		echo "FAIL: DFN2/GTCRN chain SIMD/scalar digest mismatch" >&2; exit 1; }
+	@auto_output="$$($(DFN3_STREAM_BIN))" && \
+	scalar_output="$$($(DFN3_STREAM_SCALAR_BIN))" && \
+	printf '%s\n%s\n' "$$auto_output" "$$scalar_output" && \
+	auto_digest="$${auto_output##*digest=}" && \
+	scalar_digest="$${scalar_output##*digest=}" && \
+	test "$$auto_digest" != "$$auto_output" && \
+	test -n "$$auto_digest" && test "$$auto_digest" = "$$scalar_digest" || { \
+		echo "FAIL: DFN3 SIMD/scalar output mismatch" >&2; exit 1; }
 	@auto_output="$$($(TEST_BIN))" || { \
 		echo "FAIL: $(TEST_BIN) failed" >&2; exit 1; }; \
 	scalar_output="$$($(SCALAR_BIN))" || { \

@@ -1,18 +1,17 @@
 """Parity gate for the Align-ULCNet C pre/post-processing.
 
 Compiles AIAEC/Align_ULCNet/ulcnet_process.c with a tiny file-driven test
-main (written to a temp dir, never to the repo) that drives audio_common's
+main (written to a temp dir, never to the repo) that drives audiolib's
 AcStft / AcIstft in the ulcnet configuration (ulcnet_framing_config: centered
 analysis, envelope-normalised synthesis), runs it on random audio and
 compares, frame by frame and sample by sample, against the Python reference
 (aiaec_streaming.StreamSTFT/StreamISTFT), which is itself the bit-exact twin
 of torch.stft/istft(center=True).
 
-The C side transforms through audio_common's fft_wrapper (caller-owned
-FftHandle, real RFFT/IRFFT, backend-switched by BACKEND=kiss/ne10), so the
-fixture first builds audio_common's NE10 static lib (the default backend)
-the way the AEC C tests document it
-(make -s -C ../audio_common BACKEND=ne10 lib + print-lib-path) and links it
+The C side transforms through audiolib's fft_wrapper (caller-owned
+FftHandle, real RFFT/IRFFT), so the fixture first builds audiolib's NE10
+static lib the way the AEC C tests document it
+(make -s -C ../audiolib/common BACKEND=ne10 lib + print-lib-path) and links it
 into the driver. The driver deliberately shares ONE FftHandle across the
 analysis and the synthesis (strictly sequential use), exercising the same
 sharing contract the pipeline variants rely on.
@@ -39,7 +38,7 @@ _THIS_DIR = os.path.dirname(os.path.abspath(__file__))
 _ULCNET_DIR = os.path.join(os.path.dirname(_THIS_DIR), 'Align_ULCNet')
 _AIAEC_DIR = os.path.dirname(_THIS_DIR)
 _AC_DIR = os.path.abspath(
-    os.path.join(_THIS_DIR, '..', '..', '..', 'audio_common'))
+    os.path.join(_THIS_DIR, '..', '..', '..', 'audiolib', 'common'))
 _AC_INCLUDE = os.path.join(_AC_DIR, 'include')
 
 N_FFT, HOP, BINS = 512, 256, 257
@@ -116,8 +115,8 @@ int main(int argc, char **argv) {
 
 @pytest.fixture(scope='module')
 def audio_common_lib():
-    """audio_common's NE10 static lib (default backend), built + located the
-    way the AEC C tests document it (make -s -C ../audio_common BACKEND=ne10
+    """audiolib's NE10 static lib (default backend), built + located the
+    way the AEC C tests document it (make -s -C ../audiolib/common BACKEND=ne10
     lib, then print-lib-path for this invocation's exact archive path)."""
     if shutil.which('make') is None:
         pytest.skip('no make available')
@@ -145,7 +144,7 @@ def _build_driver(tmp_path_factory, audio_common_lib, name, defines=()):
     exe = work / 'driver'
     subprocess.run(
         [cc, '-O2', '-std=c99', '-ffp-contract=off', *defines,
-         '-I', _ULCNET_DIR, '-I', _AC_INCLUDE,
+         '-I', _ULCNET_DIR, '-I', _AC_INCLUDE, '-I', _AC_DIR,
          str(main_c), os.path.join(_ULCNET_DIR, 'ulcnet_process.c'),
          audio_common_lib, '-lm', '-o', str(exe)],
         check=True, capture_output=True,
@@ -293,7 +292,7 @@ int main(int argc, char **argv) {
     executable = work / 'ulc_mask'
     subprocess.run(
         [cc, '-O2', '-std=c99', '-ffp-contract=off',
-         '-I', _AIAEC_DIR, '-I', _ULCNET_DIR, '-I', _AC_INCLUDE,
+         '-I', _AIAEC_DIR, '-I', _ULCNET_DIR, '-I', _AC_INCLUDE, '-I', _AC_DIR,
          str(source), os.path.join(_AIAEC_DIR, 'aiaec_process.c'),
          os.path.join(_ULCNET_DIR, 'ulcnet_process.c'),
          audio_common_lib, '-lm', '-o', str(executable)],
@@ -341,7 +340,7 @@ int main(int argc, char **argv) {
     executable = work / 'shared_masks'
     subprocess.run(
         [cc, '-O2', '-std=c99', '-ffp-contract=off',
-         '-I', _AIAEC_DIR, '-I', _ULCNET_DIR, '-I', _AC_INCLUDE,
+         '-I', _AIAEC_DIR, '-I', _ULCNET_DIR, '-I', _AC_INCLUDE, '-I', _AC_DIR,
          str(source), os.path.join(_AIAEC_DIR, 'aiaec_process.c'),
          os.path.join(_ULCNET_DIR, 'ulcnet_process.c'),
          audio_common_lib, '-lm', '-o', str(executable)],
@@ -403,7 +402,7 @@ int main(int argc, char **argv) {
     subprocess.run(
         [cc, '-O2', '-std=c99', '-ffp-contract=off',
          '-I', _AIAEC_DIR, '-I', _ULCNET_DIR,
-         '-I', os.path.join(_AIAEC_DIR, 'DeepVQE_S'), '-I', _AC_INCLUDE,
+         '-I', os.path.join(_AIAEC_DIR, 'DeepVQE_S'), '-I', _AC_INCLUDE, '-I', _AC_DIR,
          str(source), os.path.join(_AIAEC_DIR, 'DeepVQE_S', 'deepvqe_process.c'),
          '-o', str(executable)], check=True, capture_output=True)
     torch.manual_seed(22)

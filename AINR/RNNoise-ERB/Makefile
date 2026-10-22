@@ -36,6 +36,11 @@
 #     is relative or absolute (see the BUILD_DIR comment below).
 
 CC ?= cc
+COMMON_DIR ?= $(abspath ../../../audiolib/common)
+COMMON_FWD = SIMD=$(SIMD) CC='$(CC)' EXTRA_CFLAGS='$(EXTRA_CFLAGS)'
+COMMON_LIB ?= $(shell $(MAKE) -s --no-print-directory -C $(COMMON_DIR) $(COMMON_FWD) print-lib-path)
+COMMON_INCLUDES = -I"$(COMMON_DIR)/include" -I"$(COMMON_DIR)"
+
 SIMD ?= 1
 ifneq ($(words $(SIMD)),1)
 $(error SIMD must be exactly 0 or 1, got '$(SIMD)')
@@ -54,7 +59,7 @@ CFLAGS += $(EXTRA_CFLAGS)
 CFLAGS += $(SIMD_CFLAGS)
 
 # --- Bare-literal policy flags, defined early (`make -e` environment-override
-# gap; same treatment as the sibling C-library Makefiles -- see audio_common's
+# gap; same treatment as the sibling C-library Makefiles -- see audiolib's
 # Makefile "Bare-literal policy flags" comment for the general mechanism).
 # FP_POLICY and
 # FP_ALLOWED_CHARS_RE are both plain, dependency-free `:=` literals (no
@@ -77,7 +82,7 @@ FP_POLICY := -ffp-contract=off -fno-math-errno
 FP_ALLOWED_CHARS_RE := ^[A-Za-z0-9_./=,+ -]*$$
 
 # --- Command-line override rejection (same design as the four main
-# Makefiles' analogous gate -- see audio_common's Makefile). A
+# Makefiles' analogous gate -- see audiolib's Makefile). A
 # command-line CFLAGS=/FP_POLICY= would silently drop the FP policy below;
 # a command-line/`-e` FP_ALLOWED_CHARS_RE= could silently widen the
 # allow-list below (e.g. to `.*`) and neuter it.
@@ -85,7 +90,7 @@ $(foreach v,CFLAGS FP_POLICY FP_ALLOWED_CHARS_RE,\
   $(if $(findstring command,$(origin $(v)))$(findstring override,$(origin $(v))),\
     $(error $(v) cannot be overridden (origin: $(origin $(v))) -- it would silently drop this Makefile's own flag appends (FP policy) or neuter the FP-policy allow-list; use EXTRA_CFLAGS instead)))
 
-# --- FP-policy allow-list (character-based; same as audio_common's Makefile --
+# --- FP-policy allow-list (character-based; same as audiolib's Makefile --
 # see its allow-list comment for the full writeup of the
 # quote/glob/tilde/redirect/process-substitution bypass class a
 # character-by-character deny-list structurally cannot keep up with). It
@@ -107,7 +112,7 @@ ifneq ($(findstring ',$(CFLAGS)),)
 $(error FP policy conflict: CFLAGS/EXTRA_CFLAGS contains a single-quote character; this repo requires plain, unquoted, whitespace-separated compiler argv tokens built only from the allowed character set (see the allow-list below) -- a single quote specifically must be rejected by this Make-native check BEFORE the allow-list's own $(shell) call can safely single-quote-embed the rest of the text)
 endif
 
-# The allow-list itself (same character set as audio_common's Makefile):
+# The allow-list itself (same character set as audiolib's Makefile):
 # letters, digits, underscore, dot, slash, equals, comma, plus, minus, plus
 # space as the token separator between flags. Closes the redirection/glob/
 # tilde/process-substitution bypass class (>, <, <(...), *, ?, [, ], ~) that
@@ -127,7 +132,7 @@ $(error FP policy conflict: CFLAGS/EXTRA_CFLAGS contains a character outside the
 endif
 
 # Command-line/`-e` override rejection for the allow-list's own internal
-# variable (same gap class as audio_common's Makefile's second foreach):
+# variable (same gap class as audiolib's Makefile's second foreach):
 # FP_ALLOWLIST_RC is computed from the fully-assembled CFLAGS via a
 # $(shell) call, so (unlike FP_POLICY/FP_ALLOWED_CHARS_RE above) it cannot be
 # relocated to the early bare-literal foreach -- its own override-rejection
@@ -139,7 +144,7 @@ $(foreach v,FP_ALLOWLIST_RC,\
     $(error $(v) cannot be overridden (origin: $(origin $(v))) -- it would silently defeat the FP-policy allow-list check above, leaving the real CFLAGS content unvalidated; this variable is internal to that check and has no supported external use)))
 
 # FP-policy conflict detection + last-position append, with EXACT-TOKEN
-# matching -- same as audio_common's Makefile's FP_CONFLICT_FLAGS, see its
+# matching -- same as audiolib's Makefile's FP_CONFLICT_FLAGS, see its
 # comment for the full writeup. A SUBSTRING match ($(findstring -Ofast,...)
 # etc.) would reject a legitimate flag value that merely CONTAINS one of these
 # substrings without BEING the flag -- e.g. -DROUND9_NOTE=-Ofastness, a
@@ -157,7 +162,7 @@ $(error FP policy conflict: CFLAGS/EXTRA_CFLAGS contains $(FP_CONFLICT_FLAGS); t
 endif
 
 # Command-line/`-e` override rejection for FP_CONFLICT_FLAGS itself (same gap
-# class as FP_ALLOWLIST_RC above, and the same one audio_common's Makefile
+# class as FP_ALLOWLIST_RC above, and the same one audiolib's Makefile
 # closes for its own FP_CONFLICT_FLAGS): without this guard, `make
 # FP_CONFLICT_FLAGS= EXTRA_CFLAGS=-Ofast -n test-features` sails straight
 # through with no error, and the printed compile line genuinely carries -Ofast
@@ -189,13 +194,19 @@ CFLAGS    += $(FP_POLICY)
 # without running it). $(abspath ...) is correct for BOTH a relative and an
 # already-absolute BUILD_DIR, and the result is kept double-quoted in the
 # recipe since the checkout's path may contain spaces.
-CFG_SIG_PAYLOAD := CC=$(CC) CFLAGS=$(CFLAGS) EXTRA_CFLAGS=$(EXTRA_CFLAGS) SIMD=$(SIMD)
+# The same CC command can select a different SDK through PATH.
+# Include effective pointer/FP/ISA predefines to avoid cross-ABI cache reuse.
+override CC_TARGET_SIG := $(shell sh $(COMMON_DIR)/scripts/target_abi_signature.sh $(CC) $(CPPFLAGS) $(CFLAGS))
+CFG_SIG_PAYLOAD := CC_TARGET_SIG=$(CC_TARGET_SIG) CC=$(CC) CFLAGS=$(CFLAGS) EXTRA_CFLAGS=$(EXTRA_CFLAGS) SIMD=$(SIMD) COMMON_DIR=$(abspath $(COMMON_DIR)) COMMON_LIB=$(COMMON_LIB)
 CFG_SIG := $(shell printf '%s' "$(CFG_SIG_PAYLOAD)" | cksum | cut -d' ' -f1)
 BUILD_DIR = build/$(CFG_SIG)
 PY_TEST_DIR = tests
 
-.PHONY: test test-tables test-features test-simd test-feature-contract test-feature-python test-loss-python clean _cfg_guard
+.PHONY: test test-tables test-features test-simd test-feature-contract test-feature-python test-loss-python test-framing clean _cfg_guard FORCE
 _cfg_guard:
+	@test -n "$(CC_TARGET_SIG)" && test "$(CC_TARGET_SIG)" != unavailable || { \
+	  echo "FATAL: cannot determine compiler target; CC preprocessing with the configured flags must succeed." >&2; \
+	  exit 1; }
 	@mkdir -p $(BUILD_DIR)
 	@m="$(BUILD_DIR)/config.manifest"; \
 	if [ -f "$$m" ]; then \
@@ -216,7 +227,7 @@ test-tables: $(BUILD_DIR)/test_rnnoise_tables $(BUILD_DIR)/test_rnnoise_tables_p
 	@echo "== rnnoise tables drift-guard: layer 2 (portable, math contracts) =="
 	"$(abspath $(BUILD_DIR))/test_rnnoise_tables_portable"
 
-test: test-tables test-feature-contract test-features test-simd
+test: test-tables test-feature-contract test-features test-simd test-framing
 
 test-feature-contract:
 	@echo "== rnnoise config/Python/C feature contract =="
@@ -226,6 +237,9 @@ test-features: $(BUILD_DIR)/test_rnnoise_features
 	@echo "== rnnoise feature-state contract =="
 	"$(abspath $(BUILD_DIR))/test_rnnoise_features"
 
+test-framing: $(BUILD_DIR)/test_rnnoise_framing
+	"$(abspath $(BUILD_DIR))/test_rnnoise_framing"
+
 test-simd: $(BUILD_DIR)/test_rnnoise_simd_auto $(BUILD_DIR)/test_rnnoise_simd_scalar
 	@auto="$$( "$(abspath $(BUILD_DIR))/test_rnnoise_simd_auto" )"; \
 	 scalar="$$( "$(abspath $(BUILD_DIR))/test_rnnoise_simd_scalar" )"; \
@@ -233,7 +247,7 @@ test-simd: $(BUILD_DIR)/test_rnnoise_simd_auto $(BUILD_DIR)/test_rnnoise_simd_sc
 	   echo "FAIL: RNNoise SIMD/scalar digest mismatch: $$auto != $$scalar" >&2; \
 	   exit 1; \
 	 }; \
-	 echo "PASS: RNNoise SIMD/scalar full preprocessing digest $$auto"
+	 echo "PASS: RNNoise SIMD/scalar local DSP (shared FFT fixed) digest $$auto"
 
 # Requires the training Python environment (torch + numpy).  Kept separate from
 # `make test` so the dependency-free embedded C checks remain runnable on hosts
@@ -250,7 +264,7 @@ test-python: test-feature-python test-loss-python test-calibration
 
 test-feature-python:
 	$(PYTHON) $(PY_TEST_DIR)/test_feature_norm.py
-	$(PYTHON) $(PY_TEST_DIR)/test_python_c_features.py
+	COMMON_DIR="$(abspath $(COMMON_DIR))" RNNOISE_TEST_SIMD=$(SIMD) $(PYTHON) $(PY_TEST_DIR)/test_python_c_features.py
 
 test-loss-python:
 	$(PYTHON) $(PY_TEST_DIR)/test_loss.py
@@ -262,19 +276,28 @@ test-calibration:
 	$(PYTHON) ../tests/test_norm_init_calibration.py
 
 $(BUILD_DIR)/test_rnnoise_tables: test/test_rnnoise_tables.c rnnoise_tables_gen.h process.h | _cfg_guard
-	$(CC) $(CFLAGS) -o $@ test/test_rnnoise_tables.c -lm
+	$(CC) $(CFLAGS) $(COMMON_INCLUDES) -o $@ test/test_rnnoise_tables.c -lm
 
 $(BUILD_DIR)/test_rnnoise_tables_portable: test/test_rnnoise_tables.c rnnoise_tables_gen.h process.h | _cfg_guard
-	$(CC) $(CFLAGS) -DRNN_TABLES_PORTABLE -o $@ test/test_rnnoise_tables.c -lm
+	$(CC) $(CFLAGS) $(COMMON_INCLUDES) -DRNN_TABLES_PORTABLE -o $@ test/test_rnnoise_tables.c -lm
 
-$(BUILD_DIR)/test_rnnoise_features: test/test_rnnoise_features.c process.c process.h rnnoise_tables_gen.h | _cfg_guard
-	$(CC) $(CFLAGS) -o $@ test/test_rnnoise_features.c process.c -lm
+$(BUILD_DIR)/test_rnnoise_features: test/test_rnnoise_features.c process.c process.h rnnoise_tables_gen.h test/rnnoise_test_framing.h $(COMMON_LIB) | _cfg_guard
+	$(CC) $(CFLAGS) $(COMMON_INCLUDES) -o $@ test/test_rnnoise_features.c process.c $(COMMON_LIB) -lm
 
-$(BUILD_DIR)/test_rnnoise_simd_auto: test/test_rnnoise_simd.c process.c process.h rnnoise_tables_gen.h | _cfg_guard
-	$(CC) $(CFLAGS) -o $@ test/test_rnnoise_simd.c process.c -lm
+$(BUILD_DIR)/test_rnnoise_simd_auto: test/test_rnnoise_simd.c process.c process.h rnnoise_tables_gen.h test/rnnoise_test_framing.h $(COMMON_LIB) | _cfg_guard
+	$(CC) $(CFLAGS) $(COMMON_INCLUDES) -o $@ test/test_rnnoise_simd.c process.c $(COMMON_LIB) -lm
 
-$(BUILD_DIR)/test_rnnoise_simd_scalar: test/test_rnnoise_simd.c process.c process.h rnnoise_tables_gen.h | _cfg_guard
-	$(CC) $(CFLAGS) -DSIMD_KERNELS_FORCE_SCALAR -o $@ test/test_rnnoise_simd.c process.c -lm
+$(BUILD_DIR)/test_rnnoise_simd_scalar: test/test_rnnoise_simd.c process.c process.h rnnoise_tables_gen.h test/rnnoise_test_framing.h $(COMMON_LIB) | _cfg_guard
+	$(CC) $(CFLAGS) $(COMMON_INCLUDES) -DSIMD_KERNELS_FORCE_SCALAR -o $@ test/test_rnnoise_simd.c process.c $(COMMON_LIB) -lm
+
+$(BUILD_DIR)/test_rnnoise_framing: test/test_rnnoise_framing.c process.c process.h rnnoise_tables_gen.h test/rnnoise_test_framing.h $(COMMON_LIB) | _cfg_guard
+	$(CC) $(CFLAGS) $(COMMON_INCLUDES) -o $@ test/test_rnnoise_framing.c process.c $(COMMON_LIB) -lm
+
+$(COMMON_LIB): FORCE
+	$(MAKE) -s --no-print-directory -C $(COMMON_DIR) $(COMMON_FWD) lib
+	@test -f '$@' || { echo "FATAL: common archive missing: $@" >&2; exit 1; }
+
+FORCE:
 
 clean:
 	rm -rf build

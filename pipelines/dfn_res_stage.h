@@ -83,8 +83,7 @@ extern "C" {
 /* Carve layout version. Any change of pool size, carve order or descriptor
  * content bumps it, including a change of the composed DFN2 pre/post pool. */
 #define DFN_RES_STAGE_LAYOUT_VERSION     3u
-#define DFN_RES_STAGE_BACKEND_KISS       1u
-#define DFN_RES_STAGE_BACKEND_NE10       2u
+#define DFN_RES_STAGE_BACKEND_NE10       2u   /* 1 is retired, never returned */
 
 /* Pipeline audio-scale spectra <-> DFN2 normalized=True spectra. Hex-float
  * literals: no division, no decimal round trip, exact powers of two. */
@@ -106,7 +105,7 @@ typedef struct DfnResStageConfig {
 typedef struct {
     uint32_t descriptor_version;  /* DFN_RES_STAGE_DESCRIPTOR_VERSION         */
     uint32_t layout_version;      /* DFN_RES_STAGE_LAYOUT_VERSION             */
-    uint32_t backend_id;          /* DFN_RES_STAGE_BACKEND_KISS / _NE10       */
+    uint32_t backend_id;          /* DFN_RES_STAGE_BACKEND_NE10               */
     uint32_t build_flags_hash;    /* FNV-1a-32, folds the DFN2 class hash     */
     uint32_t alignment;           /* 16                                       */
     uint32_t reserved;            /* 0                                        */

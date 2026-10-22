@@ -1,11 +1,11 @@
 #!/usr/bin/env bash
 # pipelines/scripts/test_build_isolation.sh -- build-isolation suite for
 # Audio_ALG/pipelines (the CFG_SIG-keyed obj/bin directory design).
-# audio_common, AEC and NR have their own scripts/test_build_isolation.sh for
+# audiolib, AEC and NR have their own scripts/test_build_isolation.sh for
 # the single-producer scenarios (S1-S5/S7p/S8), which this script does not
 # repeat.
 #
-# pipelines/Makefile is a THREE-producer consumer (audio_common's
+# pipelines/Makefile is a THREE-producer consumer (audiolib's
 # libaudio_common.a, lib/aec's libaec.a, lib/nr's libanr.a), each resolved via
 # the two-phase recursive-make dispatch described in that Makefile's own header
 # comment. This script exercises the scenarios specific to that design, plus
@@ -32,11 +32,11 @@
 #     ALLOW_DIRTY_PUBLISH=1 on every publish call in this script, EXCEPT
 #     SP-S17's own deliberate policy-negative calls (which test a knob's
 #     absence on purpose). SP-S11 asserts the four *_git_untracked fields
-#     (git_untracked/audio_common_git_untracked/aec_git_untracked/nr_git_untracked)
+#     (git_untracked/audiolib_git_untracked/aec_git_untracked/nr_git_untracked)
 #     + allow_untracked_publish=.
 #   - Cross-suite mutex: a SUITE_LOCK under
 #     `${TMPDIR:-/tmp}/audio_dsp_isolation_suite.lock` -- the EXACT SAME lock
-#     path/name audio_common's own script uses -- refuses to let two instances
+#     path/name audiolib's own script uses -- refuses to let two instances
 #     of EITHER suite run concurrently (both assert real-tree invariants a
 #     second concurrent run would trample). mkdir-based, holder-pid file,
 #     single TOCTOU-safe stale-reclaim retry (a losing reclaimer never steals
@@ -58,9 +58,9 @@
 # Scenario index:
 #   S6:      audit-no-stdio false-pass check
 #   S7:      publish v4 -- lock-FIRST driver + concurrent-publish semantics
-#   SP1:     pipeline-level A->B->A (kiss -> ne10 -> kiss)
-#   SP2:     producer-change propagation (audio_common hpf.c / fast_math.h),
-#             against disposable clones of audio_common/AEC/NR, never the real
+#   SP1:     pipeline-level A->B->A (SIMD=1 -> SIMD=0 -> SIMD=1)
+#   SP2:     producer-change propagation (audiolib hpf.c / fast_math.h),
+#             against disposable clones of audiolib/common/AEC/NR, never the real
 #             trees
 #   SP-S9:   command-line override rejection, all three Makefiles
 #             (pipelines/lib-aec/lib-nr, submodule paths)
@@ -104,11 +104,11 @@
 #   SP-S16:  interruption-safety probe -- EXIT/INT/TERM all clean up the whole
 #             scratch tree
 #   SP-S17:  dirty-producer provenance -- publish against three DIRTY producer
-#             clones (audio_common/AEC/NR; the SAME clone set SP2 built while
+#             clones (audiolib/common/AEC/NR; the SAME clone set SP2 built while
 #             clean): the ALLOW_DIRTY_PUBLISH=1 path succeeds with correct
 #             per-producer attest fields, the default (no override) path FAILS
 #             "publish refused"; SP-S17a/b: the untracked-file dimension
-#             (untracked producer probe naming audio_common; unknown-producer
+#             (untracked producer probe naming audiolib; unknown-producer
 #             AEC_DIR refused unconditionally naming lib/aec)
 #   SP-S18:  `make -e` environment-override rejection -- the SP-S9 complement:
 #             SP-S9 covers COMMAND-LINE overrides (`make VAR=...`, origin flips
@@ -129,14 +129,14 @@
 #             own CPPFLAGS/CXXFLAGS are placeholder-only). See
 #             assert_make_e_rejected()'s own comment. The pipelines-specific
 #             cases target `libaudio_pipeline.a` (not `all`) with
-#             AC_LIB=/AEC_LIB=/NR_LIB= forced -- a producer-dispatch-free
+#             COMMON_LIB=/AEC_LIB=/NR_LIB= forced -- a producer-dispatch-free
 #             target, so a PASS can only come from pipelines/Makefile's OWN
-#             gate, never from audio_common's or the lib/aec|lib/nr gates
+#             gate, never from audiolib's or the lib/aec|lib/nr gates
 #             reached through `all`'s three-producer dispatch (a real child
 #             `make` process even under `-n`, inheriting this scenario's `env
 #             VAR=...`).
 #
-# Design rules (same as audio_common's script -- do not violate when editing):
+# Design rules (same as audiolib's script -- do not violate when editing):
 #   - No `make clean` inside any scenario body (except SP-S13's own trailing
 #     `make -C RNNoise-ERB clean`, which only ever removes THAT repo's own
 #     gitignored build/ -- never this repo's bin/obj): distinct configs must
@@ -150,7 +150,7 @@
 #   - "Is this the SAME delivered artifact as its own keyed object?" IS a sha
 #     comparison, via file_sha() below.
 #
-# Safety contract (mirrors audio_common's script; see that script for the full
+# Safety contract (mirrors audiolib's script; see that script for the full
 # rationale on each point):
 #   - ONE scratch root for the entire run: SCRATCH_ROOT="$(mktemp -d)", removed
 #     by a single EXIT trap; every temp file/dir this script uses is a FIXED
@@ -162,26 +162,26 @@
 #     given an explicit -p/template) -- so a child `make`'s own `work="$(mktemp
 #     -d)"` (the publish recipe) lands under scratch too.
 #   - Real obj/ and bin/ (this repo's own, AND the submodule
-#     lib/aec's/lib/nr's, AND audio_common's) only ever see the NORMAL
-#     kiss/ne10 configs S6/S7/SP1/SP-S9's real-tree assertions depend on. Every
+#     lib/aec's/lib/nr's, AND audiolib's) only ever see the NORMAL
+#     SIMD=1/SIMD=0 ne10 configs S6/S7/SP1/SP-S9's real-tree assertions depend on. Every
 #     throwaway/tamper scenario that needs a scratch OBJ_ROOT/BIN_ROOT uses one
 #     (SP-S10 against $AEC_R6_DIR; SP-S12's toolchain-shim probes -- the CXX
 #     shim's scratch-fresh path participates in CFG_SIG, so a real-tree build
 #     would mint a new orphan keyed directory on every run; SP-S14's dry runs;
 #     SP2/SP-S17's producer clones, whose own obj/bin land under SCRATCH_ROOT
 #     by construction). A final-guard snapshot (path + sha256 + `stat -f %Fm`
-#     per file, taken once SP1's kiss+ne10 builds finish, of every keyed
+#     per file, taken once SP1's SIMD=1 and SIMD=0 builds finish, of every keyed
 #     directory already under the real obj/+bin/ of the four trees this suite
-#     builds in -- pipelines, lib/aec, lib/nr, audio_common) is re-verified
+#     builds in -- pipelines, lib/aec, lib/nr, audiolib) is re-verified
 #     byte-for-byte identical at the very end; a later-created directory is
 #     allowed (INFO/WARN), there should be none.
-#   - The real dist/ (pipelines' own, lib/aec's, lib/nr's, audio_common's, and
+#   - The real dist/ (pipelines' own, lib/aec's, lib/nr's, audiolib's, and
 #     -- belt-and-braces -- the two PRIMARY AEC/NR repos' own) is never read,
 #     written, or removed: every `make ... publish` passes an explicit
 #     DIST_ROOT= under $SCRATCH_ROOT. A sentinel digest of each real dist/
 #     (absent, or a full manifest of paths + sha256 + mtime) is captured at the
 #     very start and re-checked at the very end.
-#   - No git-tracked file, in $AC_DIR, the submodule lib/aec/lib/nr, the
+#   - No git-tracked file, in $COMMON_DIR, the submodule lib/aec/lib/nr, the
 #     Audio_ALG toplevel, OR the two PRIMARY AEC/NR repos, is EVER touched --
 #     not its content, not even its mtime. Every mtime bump this script
 #     performs to force a recompile probe (hpf.c, fast_math.h) happens against
@@ -189,7 +189,7 @@
 #     SP-S17), or an already clone-local file (SP-S17's
 #     untracked/unknown-producer probes). `tree_state_hash()` (status
 #     --porcelain + diff --binary HEAD, not status alone) is captured for the
-#     Audio_ALG toplevel, lib/aec, lib/nr, and $AC_DIR -- plus,
+#     Audio_ALG toplevel, lib/aec, lib/nr, and $COMMON_DIR -- plus,
 #     belt-and-braces, the two PRIMARY AEC/NR repos this script also builds
 #     directly against -- at the start and re-checked at the end, asserting
 #     exact equality (not just "still dirty"): a script bug that touched a real
@@ -221,7 +221,8 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 SCRIPT_PATH="$SCRIPT_DIR/$(basename "${BASH_SOURCE[0]}")"
 PIPE_DIR="$(cd "$SCRIPT_DIR/.." && pwd)"
 AUDIO_ALG_ROOT="$(cd "$PIPE_DIR/.." && pwd)"
-AC_DIR="$(cd "$PIPE_DIR/../../audio_common" && pwd)"
+COMMON_DIR="$(cd "$PIPE_DIR/../../audiolib/common" && pwd)"
+AUDIOLIB_DIR="$(cd "$PIPE_DIR/../../audiolib" && pwd)"
 AEC_DIR="$(cd "$PIPE_DIR/../lib/aec/c_impl" && pwd)"
 NR_DIR="$(cd "$PIPE_DIR/../lib/nr/c_impl" && pwd)"
 AEC_SUB_ROOT="$(cd "$AEC_DIR/.." && pwd)"
@@ -312,9 +313,9 @@ fi
 # PARENT already holds) and BEFORE `export TMPDIR=...` below (so
 # `${TMPDIR:-/tmp}` here still resolves to the INVOKING environment's TMPDIR,
 # not the scratch-local one this script is about to export over it). Two
-# instances of this suite -- or of the audio_common counterpart, which uses
+# instances of this suite -- or of the audiolib counterpart, which uses
 # this EXACT SAME lock path/name -- must never run concurrently: both assert
-# real-tree invariants (S6/S7/SP1's real kiss/ne10 archives, the final-guard
+# real-tree invariants (S6/S7/SP1's real SIMD=1/SIMD=0 archives, the final-guard
 # snapshot below, the dist/ sentinels, tree_state_hash()) that a second
 # concurrent run's own real-tree activity would trample.
 SUITE_LOCK="${TMPDIR:-/tmp}/audio_dsp_isolation_suite.lock"
@@ -394,18 +395,29 @@ tree_state_hash() {
 }
 
 # adopt_worktree_clone <src-repo-dir> <clone-dir> -- shared by SP2 and SP-S17,
-# aligned with audio_common's own version of this helper. Clone <src-repo-dir>
+# aligned with audiolib's own version of this helper. Clone <src-repo-dir>
 # (fully read-only on the source -- the explicitly allowed exception to "no
 # mutating git commands against real repos"), then overlay every
-# currently-MODIFIED TRACKED file on top and adopt them as ONE throwaway commit
-# INSIDE THE SCRATCH CLONE ONLY, so the clone gets a genuinely CLEAN git
-# identity that still reflects the current (possibly uncommitted) worktree
-# content. A plain `git clone` alone only reproduces the source's last COMMIT
-# -- it transfers committed objects, never uncommitted working-tree bytes -- so
-# a bare clone would not carry the Makefile under test. The clone is a
-# disposable git repository living entirely under $SCRATCH_ROOT, destroyed by
-# the EXIT trap; its own history never touches the source repo's .git in any
-# way (a distinct clone, never pushed/fetched back).
+# currently-MODIFIED TRACKED file AND every untracked-but-not-ignored file on
+# top, and adopt them as ONE throwaway commit INSIDE THE SCRATCH CLONE ONLY,
+# so the clone gets a genuinely CLEAN git identity that still reflects the
+# current (possibly uncommitted) worktree content. A plain `git clone` alone
+# only reproduces the source's last COMMIT -- it transfers committed objects,
+# never uncommitted working-tree bytes -- so a bare clone would not carry the
+# Makefile under test. The clone is a disposable git repository living
+# entirely under $SCRATCH_ROOT, destroyed by the EXIT trap; its own history
+# never touches the source repo's .git in any way (a distinct clone, never
+# pushed/fetched back).
+#
+# Regression fix: the untracked-file overlay (`git ls-files --others
+# --exclude-standard`) was missing here (audiolib's copy of this helper
+# already had it). Without it, a rename-in-progress whose new file was never
+# `git add`ed -- e.g. AEC's own `include/delay_aec.c`/`.h`, currently
+# untracked while the old `delay_aec3.c`/`.h` show as tracked-deleted, a
+# leftover from this campaign's own in-progress aec3->aec rename -- lands in
+# the clone as a straight deletion with no replacement, and any build
+# depending on the new file fails with a confusing "file not found" instead
+# of reflecting today's actual worktree.
 #
 # The commit is CONDITIONAL -- `git add -A`, then commit only if
 # `git diff --cached --quiet --exit-code` says something is actually staged
@@ -416,26 +428,46 @@ adopt_worktree_clone() {
   git clone --no-hardlinks --quiet "$src" "$dst"
   while IFS= read -r relf; do
     [ -n "$relf" ] || continue
-    mkdir -p "$(dirname "$dst/$relf")"
-    cp "$src/$relf" "$dst/$relf"
-  done < <(git -C "$src" diff --name-only HEAD)
+    if [ -e "$src/$relf" ]; then
+      mkdir -p "$(dirname "$dst/$relf")"
+      cp "$src/$relf" "$dst/$relf"
+    else
+      # A path git reports as changed vs HEAD but absent on disk is a
+      # worktree deletion (e.g. a vendored-dependency removal) -- mirror it
+      # rather than failing to cp a file that no longer exists; `git add -A`
+      # below stages the removal the same way it stages the copies above.
+      rm -f "$dst/$relf"
+    fi
+  # --no-renames: with git's default rename detection a staged rename lists only the NEW
+  # path, so the old file would survive in the clone next to the new one. Untracked (not
+  # ignored) files are adopted too: an in-progress rename leaves the new sources untracked.
+  done < <(git -C "$src" diff --name-only --no-renames HEAD; git -C "$src" ls-files --others --exclude-standard)
   git -C "$dst" add -A
   if ! git -C "$dst" diff --cached --quiet --exit-code; then
     git -C "$dst" -c user.email=scratch@example.invalid -c user.name="scratch clone" \
       commit -q -m "scratch: adopt current worktree (disposable clone only, never touches the real repo)"
   fi
+  # Loud "can this actually fail" guard: the clone must be fully clean at
+  # this HEAD, or downstream dirty/untracked scenarios would be silently
+  # polluted by leftover adoption state instead of seeing only what the
+  # scenario itself injects afterward.
+  if [ -n "$(git -C "$dst" status --porcelain)" ]; then
+    echo "FATAL: adopt_worktree_clone: $dst is NOT clean immediately after adoption (bug in the overlay/commit step above)" >&2
+    git -C "$dst" status --porcelain >&2
+    exit 1
+  fi
 }
 
 # Real-tree final guard: per-file "path sha256 mtime" snapshot of everything
 # under the REAL obj/ and bin/ of the four trees this suite builds in
-# (pipelines itself, lib/aec, lib/nr, audio_common), plus a separate top-level
+# (pipelines itself, lib/aec, lib/nr, audiolib), plus a separate top-level
 # keyed-directory listing -- captured once SP1's own intentional real-tree
-# builds (kiss + ne10) are done, and re-verified at the very end: every
+# builds (SIMD=1 + SIMD=0) are done, and re-verified at the very end: every
 # snapshotted file must still be sha+mtime identical; a genuinely NEW directory
 # is allowed (INFO/WARN, not FAIL -- there should be none), while a new file
 # inside an ALREADY-snapshotted directory is a FAIL. Each line is tagged with a
-# short repo prefix (pipelines/lib_aec/lib_nr/audio_common) joined onto the
-# relative path -- the four trees' relative paths (obj/kiss-<sig>/...) would
+# short repo prefix (pipelines/lib_aec/lib_nr/audiolib/common) joined onto the
+# relative path -- the four trees' relative paths (obj/ne10-<sig>/...) would
 # otherwise collide across repos once combined into one snapshot set.
 _fg_snapshot_repo() {  # <tag> <repo-root>
   local tag="$1" dir="$2"
@@ -459,19 +491,19 @@ final_guard_snapshot() {
   _fg_snapshot_repo pipelines "$PIPE_DIR"
   _fg_snapshot_repo lib_aec "$AEC_DIR"
   _fg_snapshot_repo lib_nr "$NR_DIR"
-  _fg_snapshot_repo audio_common "$AC_DIR"
+  _fg_snapshot_repo audiolib "$COMMON_DIR"
 }
 final_guard_dirs() {
   _fg_dirs_repo pipelines "$PIPE_DIR"
   _fg_dirs_repo lib_aec "$AEC_DIR"
   _fg_dirs_repo lib_nr "$NR_DIR"
-  _fg_dirs_repo audio_common "$AC_DIR"
+  _fg_dirs_repo audiolib "$COMMON_DIR"
 }
 
 # Real dist/ sentinel (standing guard): absent stays absent; otherwise a full
 # path list + per-file sha256 + per-file (name, mtime). <root>/dist is the
 # argument (not a bare repo root), so this works for pipelines' own dist,
-# lib/aec/c_impl's, lib/nr/c_impl's, $AC_DIR's, and (belt-and-braces) the two
+# lib/aec/c_impl's, lib/nr/c_impl's, $COMMON_DIR's, and (belt-and-braces) the two
 # PRIMARY AEC/NR repos' c_impl dist/ too.
 real_dist_sentinel() {
   local root="$1"
@@ -524,16 +556,16 @@ assert_cmd_fails_with() {
   rm -f "$log"
 }
 
-# resolve_producers <backend> -- resolves audio_common's/lib-aec's/lib-nr's
-# archive paths for <backend> (default flags otherwise), exactly the way
-# pipelines/Makefile's own phase-1 dispatch recipe does. Uses the submodule
-# AEC_DIR/NR_DIR paths (no OBJ_ROOT=/BIN_ROOT= feature needed). Sets globals
-# AC_LIB_/AEC_LIB_/NR_LIB_.
+# resolve_producers <backend> [simd] -- resolves audiolib's/lib-aec's/lib-nr's
+# archive paths for <backend> and SIMD=<simd> (default 1; default flags
+# otherwise), exactly the way pipelines/Makefile's own phase-1 dispatch recipe
+# does. Uses the submodule AEC_DIR/NR_DIR paths (no OBJ_ROOT=/BIN_ROOT= feature
+# needed). Sets globals AC_LIB_/AEC_LIB_/NR_LIB_.
 resolve_producers() {
-  local backend="$1"
-  AC_LIB_="$(make -s -C "$AC_DIR" BACKEND="$backend" WERROR=0 CC='cc' CXX='c++' EXTRA_CFLAGS='' NO_STDIO=0 print-lib-path)"
-  AEC_LIB_="$(make -s -C "$AEC_DIR" BACKEND="$backend" WERROR=0 CC='cc' CXX='c++' EXTRA_CFLAGS='' NO_STDIO=0 AC_DIR="$AC_DIR" AC_LIB="$AC_LIB_" print-lib-path)"
-  NR_LIB_="$(make -s -C "$NR_DIR" BACKEND="$backend" WERROR=0 CC='cc' CXX='c++' EXTRA_CFLAGS='' NO_STDIO=0 AC_DIR="$AC_DIR" AC_LIB="$AC_LIB_" print-lib-path)"
+  local backend="$1" simd="${2:-1}"
+  AC_LIB_="$(make -s -C "$COMMON_DIR" BACKEND="$backend" SIMD="$simd" WERROR=0 CC='cc' CXX='c++' EXTRA_CFLAGS='' NO_STDIO=0 print-lib-path)"
+  AEC_LIB_="$(make -s -C "$AEC_DIR" BACKEND="$backend" SIMD="$simd" WERROR=0 CC='cc' CXX='c++' EXTRA_CFLAGS='' NO_STDIO=0 COMMON_DIR="$COMMON_DIR" COMMON_LIB="$AC_LIB_" print-lib-path)"
+  NR_LIB_="$(make -s -C "$NR_DIR" BACKEND="$backend" SIMD="$simd" WERROR=0 CC='cc' CXX='c++' EXTRA_CFLAGS='' NO_STDIO=0 COMMON_DIR="$COMMON_DIR" COMMON_LIB="$AC_LIB_" print-lib-path)"
 }
 
 cd "$PIPE_DIR"
@@ -543,14 +575,14 @@ cd "$PIPE_DIR"
 AUDIO_ALG_STATE_BEFORE="$(tree_state_hash "$AUDIO_ALG_ROOT")"
 AEC_SUB_STATE_BEFORE="$(tree_state_hash "$AEC_SUB_ROOT")"
 NR_SUB_STATE_BEFORE="$(tree_state_hash "$NR_SUB_ROOT")"
-AC_STATE_BEFORE="$(tree_state_hash "$AC_DIR")"
+AC_STATE_BEFORE="$(tree_state_hash "$COMMON_DIR")"
 AEC_R6_STATE_BEFORE="$(tree_state_hash "$AEC_REPO_DIR")"
 NR_R6_STATE_BEFORE="$(tree_state_hash "$NR_REPO_DIR")"
 
 REAL_DIST_PIPE_BEFORE="$(real_dist_sentinel "$PIPE_DIR")"
 REAL_DIST_AEC_BEFORE="$(real_dist_sentinel "$AEC_DIR")"
 REAL_DIST_NR_BEFORE="$(real_dist_sentinel "$NR_DIR")"
-REAL_DIST_AC_BEFORE="$(real_dist_sentinel "$AC_DIR")"
+REAL_DIST_AC_BEFORE="$(real_dist_sentinel "$COMMON_DIR")"
 REAL_DIST_AECR6_BEFORE="$(real_dist_sentinel "$AEC_R6_DIR")"
 REAL_DIST_NRR6_BEFORE="$(real_dist_sentinel "$NR_R6_DIR")"
 
@@ -565,12 +597,12 @@ echo "############################################################"
 echo "# S6: audit-no-stdio false-pass regression"
 echo "############################################################"
 mkscratch s6
-make -s BACKEND=kiss libaudio_pipeline.a >/dev/null
-default_lib="$(make -s BACKEND=kiss NO_STDIO=0 print-lib-path)"
+make -s BACKEND=ne10 libaudio_pipeline.a >/dev/null
+default_lib="$(make -s BACKEND=ne10 NO_STDIO=0 print-lib-path)"
 sha_default_before="$(file_sha "$default_lib")"
 
 S6_LOG="$SCRATCH_ROOT/s6/log"
-if make BACKEND=kiss audit-no-stdio >"$S6_LOG" 2>&1; then
+if make BACKEND=ne10 audit-no-stdio >"$S6_LOG" 2>&1; then
   pass "S6: audit-no-stdio exits green"
 else
   fail "S6: audit-no-stdio FAILED"
@@ -579,7 +611,7 @@ fi
 grep -q '^PASS:' "$S6_LOG" && pass "S6: audit-no-stdio printed a PASS line" \
   || fail "S6: audit-no-stdio did not print a PASS line"
 
-nostdio_lib="$(make -s BACKEND=kiss NO_STDIO=1 print-lib-path)"
+nostdio_lib="$(make -s BACKEND=ne10 NO_STDIO=1 print-lib-path)"
 [ "$nostdio_lib" != "$default_lib" ] && pass "S6: NO_STDIO=1 archive path differs from the default (NO_STDIO=0) path" \
   || fail "S6: NO_STDIO=1 archive path COLLIDES with the default path ($default_lib)"
 [ -f "$nostdio_lib" ] && pass "S6: NO_STDIO=1 archive exists on disk" || fail "S6: NO_STDIO=1 archive missing"
@@ -596,7 +628,7 @@ echo "# S7: publish (v4 -- lock-first driver + concurrent semantics)"
 echo "############################################################"
 mkscratch s7
 S7_DIST_ROOT="$SCRATCH_ROOT/s7/dist"
-resolve_producers kiss
+resolve_producers ne10
 # ALLOW_DIRTY_PUBLISH=1 on every publish call in this script from here on --
 # these dev trees may legitimately be dirty; the dirty-publish POLICY itself is
 # exercised on purpose in SP-S17. ALLOW_UNTRACKED_PUBLISH=1 rides along on
@@ -607,33 +639,33 @@ resolve_producers kiss
 # legitimately carry untracked files that have nothing to do with what each of
 # these scenarios actually tests. DIST_ROOT stays a throwaway scratch path: the
 # real dist/ is never read, written, or removed.
-make -s BACKEND=kiss DIST_ROOT="$S7_DIST_ROOT" ALLOW_DIRTY_PUBLISH=1 ALLOW_UNTRACKED_PUBLISH=1 publish AC_LIB="$AC_LIB_" AEC_LIB="$AEC_LIB_" NR_LIB="$NR_LIB_" >/dev/null
+make -s BACKEND=ne10 DIST_ROOT="$S7_DIST_ROOT" ALLOW_DIRTY_PUBLISH=1 ALLOW_UNTRACKED_PUBLISH=1 publish COMMON_LIB="$AC_LIB_" AEC_LIB="$AEC_LIB_" NR_LIB="$NR_LIB_" >/dev/null
 
-kiss_current_target="$(readlink "$S7_DIST_ROOT/kiss/current" || true)"
-[ -n "$kiss_current_target" ] && [ -d "$S7_DIST_ROOT/kiss/$kiss_current_target" ] && \
+ne10_current_target="$(readlink "$S7_DIST_ROOT/ne10/current" || true)"
+[ -n "$ne10_current_target" ] && [ -d "$S7_DIST_ROOT/ne10/$ne10_current_target" ] && \
   pass "S7: publish -- current symlink resolves to a real release dir" \
   || fail "S7: publish -- current symlink broken or missing"
 
 manifest_ok=1
 while read -r sha fname; do
   [ "$fname" = "MANIFEST.txt" ] && continue
-  actual="$(file_sha "$S7_DIST_ROOT/kiss/current/$fname")"
+  actual="$(file_sha "$S7_DIST_ROOT/ne10/current/$fname")"
   [ "$actual" = "$sha" ] || manifest_ok=0
-done < <(grep -E '^[0-9a-f]{64}  ' "$S7_DIST_ROOT/kiss/current/MANIFEST.txt")
+done < <(grep -E '^[0-9a-f]{64}  ' "$S7_DIST_ROOT/ne10/current/MANIFEST.txt")
 [ "$manifest_ok" -eq 1 ] && pass "S7: MANIFEST sha self-consistency" \
   || fail "S7: MANIFEST sha mismatch against files on disk"
 
-grep -q '^ac_producer_cfg_sig=kiss-' "$S7_DIST_ROOT/kiss/current/MANIFEST.txt" && \
-  grep -q '^aec_producer_cfg_sig=kiss-' "$S7_DIST_ROOT/kiss/current/MANIFEST.txt" && \
-  grep -q '^nr_producer_cfg_sig=kiss-' "$S7_DIST_ROOT/kiss/current/MANIFEST.txt" && \
+grep -q '^ac_producer_cfg_sig=ne10-' "$S7_DIST_ROOT/ne10/current/MANIFEST.txt" && \
+  grep -q '^aec_producer_cfg_sig=ne10-' "$S7_DIST_ROOT/ne10/current/MANIFEST.txt" && \
+  grep -q '^nr_producer_cfg_sig=ne10-' "$S7_DIST_ROOT/ne10/current/MANIFEST.txt" && \
   pass "S7: MANIFEST records all three producer cfg_sig identities" \
   || fail "S7: MANIFEST missing one or more producer cfg_sig identities"
 
-grep -q '^git_commit=' "$S7_DIST_ROOT/kiss/current/MANIFEST.txt" && \
+grep -q '^git_commit=' "$S7_DIST_ROOT/ne10/current/MANIFEST.txt" && \
   fail "S7: MANIFEST.txt unexpectedly contains a git_commit= line (v4 keeps provenance in ATTEST/ only)" \
   || pass "S7: MANIFEST.txt has no git_commit= line (deterministic MANIFEST)"
 
-s7_attest="$(find "$S7_DIST_ROOT/kiss/current/ATTEST" -type f -name 'attest-*.txt' 2>/dev/null | head -n1)"
+s7_attest="$(find "$S7_DIST_ROOT/ne10/current/ATTEST" -type f -name 'attest-*.txt' 2>/dev/null | head -n1)"
 [ -n "$s7_attest" ] && grep -q '^git_commit=' "$s7_attest" && grep -q '^aec_git_commit=' "$s7_attest" && \
   pass "S7: ATTEST file carries git_commit=/aec_git_commit= provenance" \
   || fail "S7: ATTEST file missing, or missing git_commit=/aec_git_commit="
@@ -644,8 +676,8 @@ s7_attest="$(find "$S7_DIST_ROOT/kiss/current/ATTEST" -type f -name 'attest-*.tx
 # lock windows and both succeed. Either outcome is fine as long as `current`
 # ends up pointing at a COMPLETE, self-consistent release.
 S7_LOG_A="$SCRATCH_ROOT/s7/log_a"; S7_LOG_B="$SCRATCH_ROOT/s7/log_b"
-( make -s BACKEND=kiss DIST_ROOT="$S7_DIST_ROOT" ALLOW_DIRTY_PUBLISH=1 ALLOW_UNTRACKED_PUBLISH=1 publish AC_LIB="$AC_LIB_" AEC_LIB="$AEC_LIB_" NR_LIB="$NR_LIB_" >"$S7_LOG_A" 2>&1 ) & cp1=$!
-( make -s BACKEND=kiss DIST_ROOT="$S7_DIST_ROOT" ALLOW_DIRTY_PUBLISH=1 ALLOW_UNTRACKED_PUBLISH=1 publish AC_LIB="$AC_LIB_" AEC_LIB="$AEC_LIB_" NR_LIB="$NR_LIB_" >"$S7_LOG_B" 2>&1 ) & cp2=$!
+( make -s BACKEND=ne10 DIST_ROOT="$S7_DIST_ROOT" ALLOW_DIRTY_PUBLISH=1 ALLOW_UNTRACKED_PUBLISH=1 publish COMMON_LIB="$AC_LIB_" AEC_LIB="$AEC_LIB_" NR_LIB="$NR_LIB_" >"$S7_LOG_A" 2>&1 ) & cp1=$!
+( make -s BACKEND=ne10 DIST_ROOT="$S7_DIST_ROOT" ALLOW_DIRTY_PUBLISH=1 ALLOW_UNTRACKED_PUBLISH=1 publish COMMON_LIB="$AC_LIB_" AEC_LIB="$AEC_LIB_" NR_LIB="$NR_LIB_" >"$S7_LOG_B" 2>&1 ) & cp2=$!
 cr1=0; cr2=0
 wait "$cp1" || cr1=$?
 wait "$cp2" || cr2=$?
@@ -661,29 +693,29 @@ else
   fail "S7: concurrent same-backend publish -- no evidence of lock enforcement"
 fi
 
-final_target="$(readlink "$S7_DIST_ROOT/kiss/current" || true)"
-[ -n "$final_target" ] && [ -f "$S7_DIST_ROOT/kiss/$final_target/MANIFEST.txt" ] && [ -f "$S7_DIST_ROOT/kiss/$final_target/aec_nr_pipeline" ] && \
+final_target="$(readlink "$S7_DIST_ROOT/ne10/current" || true)"
+[ -n "$final_target" ] && [ -f "$S7_DIST_ROOT/ne10/$final_target/MANIFEST.txt" ] && [ -f "$S7_DIST_ROOT/ne10/$final_target/aec_nr_pipeline" ] && \
   pass "S7: after concurrent publish, current points at a complete release dir" \
   || fail "S7: after concurrent publish, current points at an incomplete/missing release dir"
 
 echo "############################################################"
-echo "# SP1: pipeline-level A->B->A (kiss -> ne10 -> kiss)"
+echo "# SP1: pipeline-level A->B->A (SIMD=1 -> SIMD=0 -> SIMD=1)"
 echo "############################################################"
-resolve_producers kiss
-ac_k="$AC_LIB_"; aec_k="$AEC_LIB_"; nr_k="$NR_LIB_"
-make -s BACKEND=kiss WERROR=0 all AC_LIB="$ac_k" AEC_LIB="$aec_k" NR_LIB="$nr_k" >/dev/null
-bd_k1="$(make -s BACKEND=kiss WERROR=0 print-bin-dir AC_LIB="$ac_k" AEC_LIB="$aec_k" NR_LIB="$nr_k")"
-m_k1="$(mtime "$bd_k1/aec_nr_pipeline")"
+resolve_producers ne10 1
+ac_a="$AC_LIB_"; aec_a="$AEC_LIB_"; nr_a="$NR_LIB_"
+make -s BACKEND=ne10 SIMD=1 WERROR=0 all COMMON_LIB="$ac_a" AEC_LIB="$aec_a" NR_LIB="$nr_a" >/dev/null
+bd_a1="$(make -s BACKEND=ne10 SIMD=1 WERROR=0 print-bin-dir COMMON_LIB="$ac_a" AEC_LIB="$aec_a" NR_LIB="$nr_a")"
+m_a1="$(mtime "$bd_a1/aec_nr_pipeline")"
 
-resolve_producers ne10
-ac_n="$AC_LIB_"; aec_n="$AEC_LIB_"; nr_n="$NR_LIB_"
-make -s BACKEND=ne10 WERROR=0 all AC_LIB="$ac_n" AEC_LIB="$aec_n" NR_LIB="$nr_n" >/dev/null
-bd_n="$(make -s BACKEND=ne10 WERROR=0 print-bin-dir AC_LIB="$ac_n" AEC_LIB="$aec_n" NR_LIB="$nr_n")"
+resolve_producers ne10 0
+ac_b="$AC_LIB_"; aec_b="$AEC_LIB_"; nr_b="$NR_LIB_"
+make -s BACKEND=ne10 SIMD=0 WERROR=0 all COMMON_LIB="$ac_b" AEC_LIB="$aec_b" NR_LIB="$nr_b" >/dev/null
+bd_b="$(make -s BACKEND=ne10 SIMD=0 WERROR=0 print-bin-dir COMMON_LIB="$ac_b" AEC_LIB="$aec_b" NR_LIB="$nr_b")"
 
 # Final-guard snapshot, taken NOW -- both of the real-tree normal-config builds
-# this suite intends (kiss above, via S6/S7 and this scenario; ne10 just now)
-# are done for all four trees (pipelines itself, lib/aec, lib/nr,
-# audio_common). Every later real-tree `make ... lib`/`all` in this suite
+# this suite intends (SIMD=1 above, via S6/S7 and this scenario; SIMD=0 just
+# now) are done for all four trees (pipelines itself, lib/aec, lib/nr,
+# audiolib). Every later real-tree `make ... lib`/`all` in this suite
 # re-targets one of these same two already-built configs and must be a pure
 # no-op against them. Re-verified at the very end (see "Final integrity
 # guards").
@@ -692,65 +724,71 @@ FINAL_GUARD_SNAPSHOT_BEFORE="$(final_guard_snapshot)"
 
 # No sleep -- this is a "should NOT relink" check, so mtime()'s BSD
 # fractional-second read (stat -f '%Fm') is what makes a genuine relink here
-# distinguishable from m_k1, regardless of how close in wall-clock time the two
-# kiss builds land (a whole-second mtime comparison could otherwise false-PASS
+# distinguishable from m_a1, regardless of how close in wall-clock time the two
+# SIMD=1 builds land (a whole-second mtime comparison could otherwise false-PASS
 # a real, same-second relink).
-make -s BACKEND=kiss WERROR=0 all AC_LIB="$ac_k" AEC_LIB="$aec_k" NR_LIB="$nr_k" >/dev/null
-bd_k2="$(make -s BACKEND=kiss WERROR=0 print-bin-dir AC_LIB="$ac_k" AEC_LIB="$aec_k" NR_LIB="$nr_k")"
-m_k2="$(mtime "$bd_k2/aec_nr_pipeline")"
+make -s BACKEND=ne10 SIMD=1 WERROR=0 all COMMON_LIB="$ac_a" AEC_LIB="$aec_a" NR_LIB="$nr_a" >/dev/null
+bd_a2="$(make -s BACKEND=ne10 SIMD=1 WERROR=0 print-bin-dir COMMON_LIB="$ac_a" AEC_LIB="$aec_a" NR_LIB="$nr_a")"
+m_a2="$(mtime "$bd_a2/aec_nr_pipeline")"
 
-[ "$bd_k1" = "$bd_k2" ] && pass "SP1: kiss bin dir stable across A->B->A" \
-  || fail "SP1: kiss bin dir CHANGED across A->B->A ($bd_k1 vs $bd_k2)"
-[ "$m_k1" = "$m_k2" ] && pass "SP1: kiss aec_nr_pipeline NOT relinked on the third (A->B->A) run" \
-  || fail "SP1: kiss aec_nr_pipeline relinked with nothing changed"
+[ "$bd_a1" != "$bd_b" ] && pass "SP1: SIMD=1 and SIMD=0 builds land in different bin dirs" \
+  || fail "SP1: SIMD=1 and SIMD=0 builds share one bin dir ($bd_a1)"
+[ "$bd_a1" = "$bd_a2" ] && pass "SP1: SIMD=1 bin dir stable across A->B->A" \
+  || fail "SP1: SIMD=1 bin dir CHANGED across A->B->A ($bd_a1 vs $bd_a2)"
+[ "$m_a1" = "$m_a2" ] && pass "SP1: SIMD=1 aec_nr_pipeline NOT relinked on the third (A->B->A) run" \
+  || fail "SP1: SIMD=1 aec_nr_pipeline relinked with nothing changed"
 
-nm "$bd_k2/aec_nr_pipeline" 2>/dev/null | grep -q 'ne10_fft_r2c_1d_float32_neon' && \
-  fail "SP1: kiss aec_nr_pipeline unexpectedly links ne10 FFT symbols" \
-  || pass "SP1: kiss aec_nr_pipeline links backend-correct (no ne10) FFT symbols"
-nm "$bd_n/aec_nr_pipeline" 2>/dev/null | grep -q 'ne10_fft_r2c_1d_float32_neon' && \
-  pass "SP1: ne10 aec_nr_pipeline links backend-correct (ne10) FFT symbols" \
-  || fail "SP1: ne10 aec_nr_pipeline missing ne10 FFT symbols"
+nm "$bd_a2/aec_nr_pipeline" 2>/dev/null | grep -q 'ne10_fft_r2c_1d_float32_neon' && \
+  pass "SP1: SIMD=1 aec_nr_pipeline links the ne10 FFT symbols" \
+  || fail "SP1: SIMD=1 aec_nr_pipeline missing ne10 FFT symbols"
+nm "$bd_b/aec_nr_pipeline" 2>/dev/null | grep -q 'ne10_fft_r2c_1d_float32_c$' && \
+  ! nm "$bd_b/aec_nr_pipeline" 2>/dev/null | grep -q 'ne10_fft_r2c_1d_float32_neon' && \
+  pass "SP1: SIMD=0 aec_nr_pipeline links the scalar ne10 FFT (no NEON FFT symbol)" \
+  || fail "SP1: SIMD=0 aec_nr_pipeline does not link exactly the scalar ne10 FFT"
 
 echo "############################################################"
 echo "# SP2: producer-change propagation (regression: scratch clones)"
 echo "############################################################"
-# This scenario runs against a disposable clone of audio_common + the PRIMARY
+# This scenario runs against a disposable clone of audiolib + the PRIMARY
 # AEC repo + the PRIMARY NR repo; no real tracked file is touched, not even its
 # mtime. This SAME clone set is created fresh HERE (on the still-clean tip) and
 # REUSED (then further dirtied) by SP-S17 further down. The producer objs build
 # INSIDE the clones (their own default, clone-relative obj/bin, which live
 # under scratch by construction); the pipeline binary itself builds from the
-# REAL pipelines directory (never cloned) with AC_DIR/AEC_DIR/NR_DIR pointed at
+# REAL pipelines directory (never cloned) with COMMON_DIR/AEC_DIR/NR_DIR pointed at
 # the clones plus an explicit scratch OBJ_ROOT/BIN_ROOT.
 mkscratch pshared
 mkscratch sp2
-PSHARED_AC_CLONE="$SCRATCH_ROOT/pshared/ac_clone"
+# audiolib's common/ subdirectory has no .git of its own any more (it is a
+# subdirectory of the audiolib repo, not a standalone checkout the way
+# audio_common used to be), so the clone is of the WHOLE audiolib repo,
+# named "audiolib" so it sits where AEC's/NR's own c_impl/example/wav_io.h
+# shim's HARDCODED relative __has_include path
+# ("../../../audiolib/common/include/wav_io.h" from c_impl/example/)
+# expects to find it -- a sibling of the AEC/NR clones, both under
+# $SCRATCH_ROOT/pshared/ -- without a symlink or editing any tracked source.
+# PSHARED_AC_CLONE is then just this clone's common/ subdirectory, the same
+# role the standalone audio_common clone used to play everywhere below.
+PSHARED_AUDIOLIB_CLONE="$SCRATCH_ROOT/pshared/audiolib"
 PSHARED_AEC_CLONE="$SCRATCH_ROOT/pshared/aec_clone"
 PSHARED_NR_CLONE="$SCRATCH_ROOT/pshared/nr_clone"
-adopt_worktree_clone "$AC_DIR" "$PSHARED_AC_CLONE"
+adopt_worktree_clone "$AUDIOLIB_DIR" "$PSHARED_AUDIOLIB_CLONE"
 adopt_worktree_clone "$AEC_REPO_DIR" "$PSHARED_AEC_CLONE"
 adopt_worktree_clone "$NR_REPO_DIR" "$PSHARED_NR_CLONE"
-# AEC's/NR's own c_impl/example/wav_io.h shim locates audio_common's
-# include/wav_io.h via a HARDCODED relative __has_include path
-# ("../../../audio_common/include/wav_io.h" from c_impl/example/) -- it
-# expects audio_common as a SIBLING of the repo root. Neither clone lives
-# next to a real "audio_common" (both under $SCRATCH_ROOT/pshared/), so a
-# symlink named "audio_common", sibling to both, pointing at the audio_common
-# clone, satisfies that lookup for both without editing any tracked source.
-ln -s "$PSHARED_AC_CLONE" "$SCRATCH_ROOT/pshared/audio_common"
+PSHARED_AC_CLONE="$PSHARED_AUDIOLIB_CLONE/common"
 
 SP2_OBJ_ROOT="$SCRATCH_ROOT/sp2/obj"
 SP2_BIN_ROOT="$SCRATCH_ROOT/sp2/bin"
 
 # Resolve + build each producer INSIDE its own clone. CRITICAL: every make into
-# the AEC/NR clones passes AC_DIR=<ac clone abs path> explicitly -- their own
-# `$(AC_LIB): FORCE` rule re-invokes `$(MAKE) -C $(AC_DIR) ... lib` using THAT
-# invocation's own AC_DIR, and leaving it to a wildcard/relative default would
+# the AEC/NR clones passes COMMON_DIR=<ac clone abs path> explicitly -- their own
+# `$(COMMON_LIB): FORCE` rule re-invokes `$(MAKE) -C $(COMMON_DIR) ... lib` using THAT
+# invocation's own COMMON_DIR, and leaving it to a wildcard/relative default would
 # resolve the real tree and write into it.
 #
 # CC/CXX are pinned EXPLICITLY here (CC='cc' CXX='c++', the SAME literal values
 # resolve_producers() uses throughout this script) rather than left to each
-# Makefile's own bare `?=` default: audio_common's own bare default is `CC ?=
+# Makefile's own bare `?=` default: audiolib's own bare default is `CC ?=
 # cc`, but pipelines' own bare default is `CC ?= gcc`; forwarding the wrong one
 # anywhere would key a producer to a different CFG_SIG than the rest of this
 # scenario expects.
@@ -763,35 +801,35 @@ SP2_BIN_ROOT="$SCRATCH_ROOT/sp2/bin"
 # every recursive $(MAKE) sub-invocation via MAKEFLAGS ("Communicating
 # Variables to a Sub-make" in the GNU Make manual) -- so the PIPELINE's own
 # OBJ_ROOT/BIN_ROOT override (needed so ITS artifacts never land in the real
-# pipelines/obj,bin) is UNAVOIDABLY inherited by the nested `$(AC_LIB):
+# pipelines/obj,bin) is UNAVOIDABLY inherited by the nested `$(COMMON_LIB):
 # FORCE`/`$(AEC_LIB): FORCE`/`$(NR_LIB): FORCE` sub-makes too, regardless of
 # what $(FWD) lists -- so each producer's OWN build ends up under THIS SAME
 # root either way, never its own clone-relative default. Resolving `ac_k`
 # WITHOUT the override while the pipeline build uses one would leave `ac_k`
 # pointing at a stale copy under the clone's own default path while the nested
-# sub-make's ACTUAL audio_common archive lands under the inherited scratch root
+# sub-make's ACTUAL audiolib archive lands under the inherited scratch root
 # (the FORCE rule's own `test -f '$@'` assertion would still pass on a stale
 # file), and every "touch source -> relink" assertion below would false-fail.
 # Passing the identical OBJ_ROOT=/BIN_ROOT= explicitly everywhere removes the
 # mismatch outright instead of fighting MAKEFLAGS propagation.
 CCX=(CC='cc' CXX='c++' WERROR=0 EXTRA_CFLAGS='' NO_STDIO=0)
 ORX=(OBJ_ROOT="$SP2_OBJ_ROOT" BIN_ROOT="$SP2_BIN_ROOT")
-ac_k="$(make -s -C "$PSHARED_AC_CLONE" BACKEND=kiss "${CCX[@]}" "${ORX[@]}" print-lib-path)"
-make -s -C "$PSHARED_AC_CLONE" BACKEND=kiss "${CCX[@]}" "${ORX[@]}" lib >/dev/null
-aec_k="$(make -s -C "$PSHARED_AEC_CLONE/c_impl" BACKEND=kiss "${CCX[@]}" "${ORX[@]}" AC_DIR="$PSHARED_AC_CLONE" AC_LIB="$ac_k" print-lib-path)"
-make -s -C "$PSHARED_AEC_CLONE/c_impl" BACKEND=kiss "${CCX[@]}" "${ORX[@]}" AC_DIR="$PSHARED_AC_CLONE" AC_LIB="$ac_k" lib >/dev/null
-nr_k="$(make -s -C "$PSHARED_NR_CLONE/c_impl" BACKEND=kiss "${CCX[@]}" "${ORX[@]}" AC_DIR="$PSHARED_AC_CLONE" AC_LIB="$ac_k" print-lib-path)"
-make -s -C "$PSHARED_NR_CLONE/c_impl" BACKEND=kiss "${CCX[@]}" "${ORX[@]}" AC_DIR="$PSHARED_AC_CLONE" AC_LIB="$ac_k" lib >/dev/null
+ac_k="$(make -s -C "$PSHARED_AC_CLONE" BACKEND=ne10 "${CCX[@]}" "${ORX[@]}" print-lib-path)"
+make -s -C "$PSHARED_AC_CLONE" BACKEND=ne10 "${CCX[@]}" "${ORX[@]}" lib >/dev/null
+aec_k="$(make -s -C "$PSHARED_AEC_CLONE/c_impl" BACKEND=ne10 "${CCX[@]}" "${ORX[@]}" COMMON_DIR="$PSHARED_AC_CLONE" COMMON_LIB="$ac_k" print-lib-path)"
+make -s -C "$PSHARED_AEC_CLONE/c_impl" BACKEND=ne10 "${CCX[@]}" "${ORX[@]}" COMMON_DIR="$PSHARED_AC_CLONE" COMMON_LIB="$ac_k" lib >/dev/null
+nr_k="$(make -s -C "$PSHARED_NR_CLONE/c_impl" BACKEND=ne10 "${CCX[@]}" "${ORX[@]}" COMMON_DIR="$PSHARED_AC_CLONE" COMMON_LIB="$ac_k" print-lib-path)"
+make -s -C "$PSHARED_NR_CLONE/c_impl" BACKEND=ne10 "${CCX[@]}" "${ORX[@]}" COMMON_DIR="$PSHARED_AC_CLONE" COMMON_LIB="$ac_k" lib >/dev/null
 
-sp2_makeargs=(BACKEND=kiss "${CCX[@]}" "${ORX[@]}" \
-  AC_DIR="$PSHARED_AC_CLONE" AEC_DIR="$PSHARED_AEC_CLONE/c_impl" NR_DIR="$PSHARED_NR_CLONE/c_impl" \
-  AC_LIB="$ac_k" AEC_LIB="$aec_k" NR_LIB="$nr_k")
+sp2_makeargs=(BACKEND=ne10 "${CCX[@]}" "${ORX[@]}" \
+  COMMON_DIR="$PSHARED_AC_CLONE" AEC_DIR="$PSHARED_AEC_CLONE/c_impl" NR_DIR="$PSHARED_NR_CLONE/c_impl" \
+  COMMON_LIB="$ac_k" AEC_LIB="$aec_k" NR_LIB="$nr_k")
 
 make -s "${sp2_makeargs[@]}" all >/dev/null
 bd_k="$(make -s "${sp2_makeargs[@]}" print-bin-dir)"
 
 # "Did it rebuild?" is verified from make's own build LOG (grep for that rule's
-# `@echo` line), never an mtime diff -- exactly audio_common's own S5 technique
+# `@echo` line), never an mtime diff -- exactly audiolib's own S5 technique
 # (see that scenario's comment for the full rationale). Comparing two mtime
 # snapshots of the SAME output file, taken moments apart by THIS SCRIPT, can
 # land in the very same whole second when the whole touch-rebuild-relink chain
@@ -806,11 +844,11 @@ bd_k="$(make -s "${sp2_makeargs[@]}" print-bin-dir)"
 # immediately before the rebuild that must supersede it, so that rebuild's
 # fresh "now" timestamp is unambiguously newer regardless of which whole
 # second it lands in -- removing the collision instead of hoping to avoid
-# it. Mirrors audio_common's S5 `backdate_aecwav()` helper.
+# it. Mirrors audiolib's S5 `backdate_aecwav()` helper.
 backdate_sp2() { touch -A -0500 "$1"; }
 
-# touch the audio_common CLONE's src/hpf.c -> hpf.o recompiles AND
-# aec_nr_pipeline relinks (audio_common's own CFG_SIG is a hash of its
+# touch the audiolib CLONE's src/hpf.c -> hpf.o recompiles AND
+# aec_nr_pipeline relinks (audiolib's own CFG_SIG is a hash of its
 # COMPILER INVOCATION, not file content, so its archive path is unaffected --
 # only its mtime advances). Deterministic strictly-newer bump (not `sleep`):
 # hpf.c's mtime is set to hpf.o's CURRENT mtime + 1s (BSD touch -r/-A),
@@ -820,69 +858,69 @@ backdate_sp2() { touch -A -0500 "$1"; }
 # supersede both, so the archive-rebuild and relink echoes are guaranteed to
 # fire regardless of whole-second collisions. mtime-only touch of hpf.c: no
 # real tree, tracked or otherwise, is ever touched.
-ac_objdir="$(make -s -C "$PSHARED_AC_CLONE" BACKEND=kiss "${CCX[@]}" "${ORX[@]}" print-obj-dir)"
+ac_objdir="$(make -s -C "$PSHARED_AC_CLONE" BACKEND=ne10 "${CCX[@]}" "${ORX[@]}" print-obj-dir)"
 backdate_sp2 "$ac_k"
 backdate_sp2 "$bd_k/aec_nr_pipeline"
 touch -r "$ac_objdir/hpf.o" -A 01 "$PSHARED_AC_CLONE/src/hpf.c"
 SP2_LOG_HPF="$SCRATCH_ROOT/sp2/log_hpf"
 make -s "${sp2_makeargs[@]}" all >"$SP2_LOG_HPF" 2>&1
-grep -q "^audio_common \[kiss\] ->" "$SP2_LOG_HPF" && pass "SP2: touching the audio_common clone's src/hpf.c rebuilt its archive" \
-  || { fail "SP2: audio_common's archive did NOT rebuild after the clone's hpf.o changed"; cat "$SP2_LOG_HPF" >&2; }
-grep -q "^aec_nr_pipeline \[kiss\] ->" "$SP2_LOG_HPF" && pass "SP2: touching the audio_common clone's src/hpf.c relinked aec_nr_pipeline" \
-  || { fail "SP2: aec_nr_pipeline NOT relinked after the audio_common clone's hpf.o changed"; cat "$SP2_LOG_HPF" >&2; }
+grep -q "^common \[ne10\] ->" "$SP2_LOG_HPF" && pass "SP2: touching the audiolib clone's src/hpf.c rebuilt its archive" \
+  || { fail "SP2: audiolib's archive did NOT rebuild after the clone's hpf.o changed"; cat "$SP2_LOG_HPF" >&2; }
+grep -q "^aec_nr_pipeline \[ne10\] ->" "$SP2_LOG_HPF" && pass "SP2: touching the audiolib clone's src/hpf.c relinked aec_nr_pipeline" \
+  || { fail "SP2: aec_nr_pipeline NOT relinked after the audiolib clone's hpf.o changed"; cat "$SP2_LOG_HPF" >&2; }
 
-# touch include/fast_math.h -> NR/AEC objects that include it
-# (aec3_post.c/suppression_gain.c in lib/aec, mcra_noise_estimator.c/
+# touch utility/fast_math.h -> NR/AEC objects that include it
+# (aec_post.c/suppression_gain.c in lib/aec, noise_estimator.c/
 # spp_estimator.c/anr.c in lib/nr) recompile, AND the pipeline
 # binary relinks -- the full transitive header chain. Again mtime-only, and
 # again against the CLONE's copy: no tracked file's content OR mtime changes
 # in any real repo. Same log-based verification + backdating as above --
 # this time backdating BOTH producer archives (lib/aec's, lib/nr's) plus the
 # pipeline binary.
-aec_objdir="$(make -s -C "$PSHARED_AEC_CLONE/c_impl" BACKEND=kiss "${CCX[@]}" "${ORX[@]}" AC_DIR="$PSHARED_AC_CLONE" AC_LIB="$ac_k" print-obj-dir)"
-nr_objdir="$(make -s -C "$PSHARED_NR_CLONE/c_impl" BACKEND=kiss "${CCX[@]}" "${ORX[@]}" AC_DIR="$PSHARED_AC_CLONE" AC_LIB="$ac_k" print-obj-dir)"
+aec_objdir="$(make -s -C "$PSHARED_AEC_CLONE/c_impl" BACKEND=ne10 "${CCX[@]}" "${ORX[@]}" COMMON_DIR="$PSHARED_AC_CLONE" COMMON_LIB="$ac_k" print-obj-dir)"
+nr_objdir="$(make -s -C "$PSHARED_NR_CLONE/c_impl" BACKEND=ne10 "${CCX[@]}" "${ORX[@]}" COMMON_DIR="$PSHARED_AC_CLONE" COMMON_LIB="$ac_k" print-obj-dir)"
 
-# touch fast_math.h strictly newer than BOTH aec3_post.o AND
-# mcra_noise_estimator.o -- the two were compiled moments apart in the
+# touch fast_math.h strictly newer than BOTH aec_post.o AND
+# noise_estimator.o -- the two were compiled moments apart in the
 # original build above, in no guaranteed order, so pick whichever of the
 # two has the LATER current mtime as the touch -r reference before bumping
 # +1s, guaranteeing fast_math.h ends up newer than both regardless of which
 # one happened to compile later (immune to whichever way it rounds).
-sp2_ref="$aec_objdir/aec3_post.o"
-if awk -v a="$(mtime "$nr_objdir/mcra_noise_estimator.o")" -v b="$(mtime "$sp2_ref")" 'BEGIN{exit !(a>b)}'; then
-  sp2_ref="$nr_objdir/mcra_noise_estimator.o"
+sp2_ref="$aec_objdir/aec_post.o"
+if awk -v a="$(mtime "$nr_objdir/noise_estimator.o")" -v b="$(mtime "$sp2_ref")" 'BEGIN{exit !(a>b)}'; then
+  sp2_ref="$nr_objdir/noise_estimator.o"
 fi
 backdate_sp2 "$aec_k"
 backdate_sp2 "$nr_k"
 backdate_sp2 "$bd_k/aec_nr_pipeline"
-touch -r "$sp2_ref" -A 01 "$PSHARED_AC_CLONE/include/fast_math.h"
+touch -r "$sp2_ref" -A 01 "$PSHARED_AC_CLONE/utility/fast_math.h"
 SP2_LOG_FASTMATH="$SCRATCH_ROOT/sp2/log_fastmath"
 make -s "${sp2_makeargs[@]}" all >"$SP2_LOG_FASTMATH" 2>&1
 
-grep -q "^aec \[kiss\] ->" "$SP2_LOG_FASTMATH" && pass "SP2: touching the audio_common clone's include/fast_math.h recompiled lib/aec's aec3_post.o (archive rebuilt)" \
-  || { fail "SP2: lib/aec's archive did NOT rebuild after touching the clone's fast_math.h (aec3_post.o likely did not recompile)"; cat "$SP2_LOG_FASTMATH" >&2; }
-grep -q "^Static library built: " "$SP2_LOG_FASTMATH" && pass "SP2: touching the audio_common clone's include/fast_math.h recompiled lib/nr's mcra_noise_estimator.o (archive rebuilt)" \
-  || { fail "SP2: lib/nr's archive did NOT rebuild after touching the clone's fast_math.h (mcra_noise_estimator.o likely did not recompile)"; cat "$SP2_LOG_FASTMATH" >&2; }
-grep -q "^aec_nr_pipeline \[kiss\] ->" "$SP2_LOG_FASTMATH" && pass "SP2: touching the audio_common clone's include/fast_math.h relinked aec_nr_pipeline (full transitive chain)" \
+grep -q "^aec \[ne10\] ->" "$SP2_LOG_FASTMATH" && pass "SP2: touching the audiolib clone's utility/fast_math.h recompiled lib/aec's aec_post.o (archive rebuilt)" \
+  || { fail "SP2: lib/aec's archive did NOT rebuild after touching the clone's fast_math.h (aec_post.o likely did not recompile)"; cat "$SP2_LOG_FASTMATH" >&2; }
+grep -q "^Static library built: " "$SP2_LOG_FASTMATH" && pass "SP2: touching the audiolib clone's utility/fast_math.h recompiled lib/nr's noise_estimator.o (archive rebuilt)" \
+  || { fail "SP2: lib/nr's archive did NOT rebuild after touching the clone's fast_math.h (noise_estimator.o likely did not recompile)"; cat "$SP2_LOG_FASTMATH" >&2; }
+grep -q "^aec_nr_pipeline \[ne10\] ->" "$SP2_LOG_FASTMATH" && pass "SP2: touching the audiolib clone's utility/fast_math.h relinked aec_nr_pipeline (full transitive chain)" \
   || { fail "SP2: aec_nr_pipeline NOT relinked after the clone's fast_math.h touch"; cat "$SP2_LOG_FASTMATH" >&2; }
 
 echo "############################################################"
 echo "# SP-S9: command-line override rejection across the stack"
 echo "############################################################"
 assert_cmd_fails_with "SP-S9: pipelines 'make CFLAGS=-O3' rejected at parse time" "cannot be overridden" \
-  make BACKEND=kiss CFLAGS=-O3 print-obj-dir
+  make BACKEND=ne10 CFLAGS=-O3 print-obj-dir
 
 assert_cmd_fails_with "SP-S9: pipelines 'make FP_POLICY=-ffp-contract=fast' rejected at parse time" "cannot be overridden" \
-  make BACKEND=kiss FP_POLICY=-ffp-contract=fast print-obj-dir
+  make BACKEND=ne10 FP_POLICY=-ffp-contract=fast print-obj-dir
 
 assert_cmd_fails_with "SP-S9: lib/aec 'make CFLAGS=-O3' rejected at parse time" "cannot be overridden" \
-  make -C "$AEC_DIR" BACKEND=kiss CFLAGS=-O3 print-obj-dir
+  make -C "$AEC_DIR" BACKEND=ne10 CFLAGS=-O3 print-obj-dir
 
 assert_cmd_fails_with "SP-S9: lib/nr 'make LDFLAGS=-lfoo' rejected at parse time" "cannot be overridden" \
-  make -C "$NR_DIR" BACKEND=kiss LDFLAGS=-lfoo print-obj-dir
+  make -C "$NR_DIR" BACKEND=ne10 LDFLAGS=-lfoo print-obj-dir
 
-sp9_plain_objdir="$(make -s BACKEND=kiss print-obj-dir)"
-sp9_probe_objdir="$(make -s BACKEND=kiss EXTRA_CFLAGS=-DSP9_PROBE print-obj-dir)"
+sp9_plain_objdir="$(make -s BACKEND=ne10 print-obj-dir)"
+sp9_probe_objdir="$(make -s BACKEND=ne10 EXTRA_CFLAGS=-DSP9_PROBE print-obj-dir)"
 [ -n "$sp9_probe_objdir" ] && pass "SP-S9: pipelines EXTRA_CFLAGS=-DSP9_PROBE print-obj-dir SUCCEEDED" \
   || fail "SP-S9: pipelines EXTRA_CFLAGS=-DSP9_PROBE print-obj-dir produced no output"
 [ "$sp9_probe_objdir" != "$sp9_plain_objdir" ] && pass "SP-S9: EXTRA_CFLAGS=-DSP9_PROBE obj dir differs from the plain-query obj dir" \
@@ -895,7 +933,7 @@ echo "# distinct code path, the FP-policy check's OWN internal variables,"
 echo "# and the legitimate positive control"
 echo "############################################################"
 # See the header comment (search "SP-S9b") and pipelines/Makefile's own
-# "REDESIGN" comment for the full writeup -- same as audio_common's/AEC's,
+# "REDESIGN" comment for the full writeup -- same as audiolib's/AEC's,
 # scoped to this repo's own print-obj-dir gate. Every negative case below is a
 # real, live bypass of a character deny-list (single quote, double quote,
 # backslash, backtick, a literal "$(" sequence, semicolon, pipe, ampersand,
@@ -908,7 +946,7 @@ echo "############################################################"
 sp9b_check_rejected() {
   local label="$1" flag_value="$2" expect_chars="$3" log
   log="$SCRATCH_ROOT/tmp/sp9b_$(printf '%s' "$label" | tr -c 'A-Za-z0-9' '_').log"
-  if env EXTRA_CFLAGS="$flag_value" make BACKEND=kiss print-obj-dir >"$log" 2>&1; then
+  if env EXTRA_CFLAGS="$flag_value" make BACKEND=ne10 print-obj-dir >"$log" 2>&1; then
     fail "SP-S9b: EXTRA_CFLAGS='$flag_value' ($label) print-obj-dir unexpectedly SUCCEEDED (must be rejected)"
   elif grep -q "FP policy conflict" "$log" && grep -q "outside the allowed set" "$log" && grep -qF "found: \"$expect_chars\"" "$log"; then
     pass "SP-S9b: EXTRA_CFLAGS='$flag_value' ($label) print-obj-dir correctly FAILS, identifying \"$expect_chars\""
@@ -931,7 +969,7 @@ sp9b_check_rejected "process-subst" '<(echo hi)'      '()<'
 # single-quote-embed the rest of the text), so this message says "single-quote
 # character" verbatim, unlike the allow-list cases above.
 SP9B_LOG_SQ="$SCRATCH_ROOT/tmp/sp9b_single_quote.log"
-if env EXTRA_CFLAGS="-O'f'ast" make BACKEND=kiss print-obj-dir >"$SP9B_LOG_SQ" 2>&1; then
+if env EXTRA_CFLAGS="-O'f'ast" make BACKEND=ne10 print-obj-dir >"$SP9B_LOG_SQ" 2>&1; then
   fail "SP-S9b: EXTRA_CFLAGS=\"-O'f'ast\" (quote-split) print-obj-dir unexpectedly SUCCEEDED (must be rejected)"
 elif grep -q "FP policy conflict" "$SP9B_LOG_SQ" && grep -q "single-quote" "$SP9B_LOG_SQ"; then
   pass "SP-S9b: EXTRA_CFLAGS=\"-O'f'ast\" (quote-split) print-obj-dir correctly FAILS, identifying the single-quote character"
@@ -948,7 +986,7 @@ fi
 # unchanged FP_CONFLICT_FLAGS $(filter) check can still reject.
 export SP9B_R11_FLAG=-Ofast
 SP9B_LOG_R11="$SCRATCH_ROOT/tmp/sp9b_r11_dollar_brace.log"
-if make -n BACKEND=kiss 'EXTRA_CFLAGS=${SP9B_R11_FLAG}' lib >"$SP9B_LOG_R11" 2>&1; then
+if make -n BACKEND=ne10 'EXTRA_CFLAGS=${SP9B_R11_FLAG}' lib >"$SP9B_LOG_R11" 2>&1; then
   fail "SP-S9b: SP9B_R11_FLAG=-Ofast (exported) make -n EXTRA_CFLAGS=\${SP9B_R11_FLAG} lib unexpectedly SUCCEEDED (must be rejected via the exact-token filter)"
 elif grep -q "FP policy conflict" "$SP9B_LOG_R11" && grep -q -- "-Ofast" "$SP9B_LOG_R11" && ! grep -q "outside the allowed set" "$SP9B_LOG_R11"; then
   pass "SP-S9b: SP9B_R11_FLAG=-Ofast (exported) make -n EXTRA_CFLAGS=\${SP9B_R11_FLAG} lib correctly FAILS via the exact-token \$(filter) check (not the character allow-list)"
@@ -973,7 +1011,7 @@ sp9b_check_override_rejected() {
   local varname="$1" varvalue="$2" payload="$3" use_dash_e="$4" log
   log="$SCRATCH_ROOT/tmp/sp9b_override_$(printf '%s' "$varname" | tr -c 'A-Za-z0-9' '_')_$use_dash_e.log"
   if [ "$use_dash_e" = "dashe" ]; then
-    if env "$varname=$varvalue" make -e BACKEND=kiss EXTRA_CFLAGS="$payload" print-obj-dir >"$log" 2>&1; then
+    if env "$varname=$varvalue" make -e BACKEND=ne10 EXTRA_CFLAGS="$payload" print-obj-dir >"$log" 2>&1; then
       fail "SP-S9b: env $varname=$varvalue make -e print-obj-dir unexpectedly SUCCEEDED (must be rejected: overriding $varname must not defeat the FP-policy checks)"
     elif grep -q "cannot be overridden" "$log" && grep -q "$varname" "$log"; then
       pass "SP-S9b: env $varname=$varvalue make -e print-obj-dir correctly FAILS, mentioning '$varname cannot be overridden'"
@@ -982,7 +1020,7 @@ sp9b_check_override_rejected() {
       cat "$log" >&2
     fi
   else
-    if make BACKEND=kiss EXTRA_CFLAGS="$payload" "$varname=$varvalue" print-obj-dir >"$log" 2>&1; then
+    if make BACKEND=ne10 EXTRA_CFLAGS="$payload" "$varname=$varvalue" print-obj-dir >"$log" 2>&1; then
       fail "SP-S9b: make $varname=$varvalue print-obj-dir unexpectedly SUCCEEDED (must be rejected: overriding $varname must not defeat the FP-policy checks)"
     elif grep -q "cannot be overridden" "$log" && grep -q "$varname" "$log"; then
       pass "SP-S9b: make $varname=$varvalue print-obj-dir correctly FAILS, mentioning '$varname cannot be overridden'"
@@ -1002,7 +1040,7 @@ sp9b_check_override_rejected "FP_ALLOWED_CHARS_RE"    ".*"    '-O2;rm' dashe
 sp9b_check_override_rejected "FP_CONFLICT_FLAGS"      ""      '-Ofast' dashe
 
 # Positive control: a plain, override-free build must still succeed, AND
-# the internal -DAUDIO_PIPELINE_BACKEND_STR=\"kiss\" define (this repo's own
+# the internal -DAUDIO_PIPELINE_BACKEND_STR=\"ne10\" define (this repo's own
 # wrinkle -- a legitimate Makefile-generated token containing a backslash
 # and a double quote, neither of which is in the allow-list's character
 # set) must still reach the actual compile line, protected by the
@@ -1012,14 +1050,14 @@ mkscratch sp9b_pos
 SP9B_POS_OBJ_ROOT="$SCRATCH_ROOT/sp9b_pos/obj"
 SP9B_POS_BIN_ROOT="$SCRATCH_ROOT/sp9b_pos/bin"
 SP9B_POS_LOG="$SCRATCH_ROOT/tmp/sp9b_positive_build.log"
-if make BACKEND=kiss OBJ_ROOT="$SP9B_POS_OBJ_ROOT" BIN_ROOT="$SP9B_POS_BIN_ROOT" libaudio_pipeline.a >"$SP9B_POS_LOG" 2>&1; then
+if make BACKEND=ne10 OBJ_ROOT="$SP9B_POS_OBJ_ROOT" BIN_ROOT="$SP9B_POS_BIN_ROOT" libaudio_pipeline.a >"$SP9B_POS_LOG" 2>&1; then
   pass "SP-S9b: plain override-free 'make libaudio_pipeline.a' SUCCEEDS under the new allow-list"
 else
   fail "SP-S9b: plain override-free 'make libaudio_pipeline.a' unexpectedly FAILED under the new allow-list"
   cat "$SP9B_POS_LOG" >&2
 fi
-if grep -qF -- '-DAUDIO_PIPELINE_BACKEND_STR=\"kiss\"' "$SP9B_POS_LOG"; then
-  pass "SP-S9b: -DAUDIO_PIPELINE_BACKEND_STR=\\\"kiss\\\" still reaches the audio_pipeline.c compile line"
+if grep -qF -- '-DAUDIO_PIPELINE_BACKEND_STR=\"ne10\"' "$SP9B_POS_LOG"; then
+  pass "SP-S9b: -DAUDIO_PIPELINE_BACKEND_STR=\\\"ne10\\\" still reaches the audio_pipeline.c compile line"
 else
   fail "SP-S9b: -DAUDIO_PIPELINE_BACKEND_STR define did NOT appear on the compile line"
   cat "$SP9B_POS_LOG" >&2
@@ -1030,7 +1068,7 @@ echo "# SP-S9c: link-flags (LDFLAGS/EXTRA_LDFLAGS) character-safety coverage"
 echo "############################################################"
 # See the header comment (search "SP-S9c") and pipelines/Makefile's own
 # "link-flags character-safety coverage" comment for the full writeup -- same
-# as audio_common's. SP-S9b's allow-list validates FP_INPUT_FLAGS
+# as audiolib's. SP-S9b's allow-list validates FP_INPUT_FLAGS
 # (CFLAGS/CXXFLAGS/CPPFLAGS); LDFLAGS/EXTRA_LDFLAGS need the same check, since
 # LDFLAGS is embedded in every real link recipe ($(LINK) ... $(LDFLAGS)) the
 # exact same way CFLAGS is embedded in every compile recipe. Same discipline as
@@ -1041,7 +1079,7 @@ echo "############################################################"
 sp9c_check_rejected() {
   local label="$1" flag_value="$2" expect_chars="$3" log
   log="$SCRATCH_ROOT/tmp/sp9c_$(printf '%s' "$label" | tr -c 'A-Za-z0-9' '_').log"
-  if env EXTRA_LDFLAGS="$flag_value" make BACKEND=kiss print-obj-dir >"$log" 2>&1; then
+  if env EXTRA_LDFLAGS="$flag_value" make BACKEND=ne10 print-obj-dir >"$log" 2>&1; then
     fail "SP-S9c: EXTRA_LDFLAGS='$flag_value' ($label) print-obj-dir unexpectedly SUCCEEDED (must be rejected)"
   elif grep -q "FP policy conflict" "$log" && grep -q "outside the allowed set" "$log" && grep -qF "found: \"$expect_chars\"" "$log"; then
     pass "SP-S9c: EXTRA_LDFLAGS='$flag_value' ($label) print-obj-dir correctly FAILS, identifying \"$expect_chars\""
@@ -1052,9 +1090,9 @@ sp9c_check_rejected() {
 }
 
 # The reported repro: a semicolon payload via EXTRA_LDFLAGS -- `make
-# aec_nr_pipeline EXTRA_LDFLAGS=';id'` (with AC_LIB/AEC_LIB/NR_LIB pre-resolved
+# aec_nr_pipeline EXTRA_LDFLAGS=';id'` (with COMMON_LIB/AEC_LIB/NR_LIB pre-resolved
 # so the dispatch lands directly on this repo's OWN link recipe instead of
-# recursing into audio_common's sub-make first) -- must be rejected, not land
+# recursing into audiolib's sub-make first) -- must be rejected, not land
 # live and unfiltered after the `-lm` of a real `cc -o ... $(LDFLAGS)` recipe
 # line (checked via `make -n`, zero files touched).
 sp9c_check_rejected "injection-semicolon" ';id' ';'
@@ -1072,7 +1110,7 @@ sp9c_check_rejected "process-subst" '<(echo hi)'      '()<'
 # Single-quote -- caught by the ONE pure-Make $(findstring) check, same as
 # SP-S9b's own single-quote case.
 SP9C_LOG_SQ="$SCRATCH_ROOT/tmp/sp9c_single_quote.log"
-if env EXTRA_LDFLAGS="-l'p'thread" make BACKEND=kiss print-obj-dir >"$SP9C_LOG_SQ" 2>&1; then
+if env EXTRA_LDFLAGS="-l'p'thread" make BACKEND=ne10 print-obj-dir >"$SP9C_LOG_SQ" 2>&1; then
   fail "SP-S9c: EXTRA_LDFLAGS=\"-l'p'thread\" (quote-split) print-obj-dir unexpectedly SUCCEEDED (must be rejected)"
 elif grep -q "FP policy conflict" "$SP9C_LOG_SQ" && grep -q "single-quote" "$SP9C_LOG_SQ"; then
   pass "SP-S9c: EXTRA_LDFLAGS=\"-l'p'thread\" (quote-split) print-obj-dir correctly FAILS, identifying the single-quote character"
@@ -1096,7 +1134,7 @@ mkscratch sp9c_pos
 SP9C_POS_OBJ_ROOT="$SCRATCH_ROOT/sp9c_pos/obj"
 SP9C_POS_BIN_ROOT="$SCRATCH_ROOT/sp9c_pos/bin"
 SP9C_POS_BUILD_LOG="$SCRATCH_ROOT/tmp/sp9c_positive_build.log"
-if env EXTRA_LDFLAGS='-Wl,-rpath,/usr/lib -L/usr/lib' make BACKEND=kiss OBJ_ROOT="$SP9C_POS_OBJ_ROOT" BIN_ROOT="$SP9C_POS_BIN_ROOT" test_audio_pipeline >"$SP9C_POS_BUILD_LOG" 2>&1; then
+if env EXTRA_LDFLAGS='-Wl,-rpath,/usr/lib -L/usr/lib' make BACKEND=ne10 OBJ_ROOT="$SP9C_POS_OBJ_ROOT" BIN_ROOT="$SP9C_POS_BIN_ROOT" test_audio_pipeline >"$SP9C_POS_BUILD_LOG" 2>&1; then
   pass "SP-S9c: EXTRA_LDFLAGS='-Wl,-rpath,/usr/lib -L/usr/lib' (positive control, real rpath/library-path link flag) builds test_audio_pipeline"
   if grep -qF -- '-Wl,-rpath,/usr/lib -L/usr/lib' "$SP9C_POS_BUILD_LOG"; then
     pass "SP-S9c: the real link flag reaches the actual \$(LINK) recipe line for test_audio_pipeline"
@@ -1104,7 +1142,7 @@ if env EXTRA_LDFLAGS='-Wl,-rpath,/usr/lib -L/usr/lib' make BACKEND=kiss OBJ_ROOT
     fail "SP-S9c: the real link flag did NOT appear on the test_audio_pipeline link recipe line"
     cat "$SP9C_POS_BUILD_LOG" >&2
   fi
-  SP9C_POS_BINDIR="$(env EXTRA_LDFLAGS='-Wl,-rpath,/usr/lib -L/usr/lib' make -s BACKEND=kiss OBJ_ROOT="$SP9C_POS_OBJ_ROOT" BIN_ROOT="$SP9C_POS_BIN_ROOT" print-bin-dir)"
+  SP9C_POS_BINDIR="$(env EXTRA_LDFLAGS='-Wl,-rpath,/usr/lib -L/usr/lib' make -s BACKEND=ne10 OBJ_ROOT="$SP9C_POS_OBJ_ROOT" BIN_ROOT="$SP9C_POS_BIN_ROOT" print-bin-dir)"
   SP9C_POS_RUN_LOG="$SCRATCH_ROOT/tmp/sp9c_positive_run.log"
   if "$SP9C_POS_BINDIR/test_audio_pipeline" >"$SP9C_POS_RUN_LOG" 2>&1 && grep -q "^ALL PASS$" "$SP9C_POS_RUN_LOG"; then
     pass "SP-S9c: test_audio_pipeline (built with the real rpath/library-path link flag) RUNS to ALL PASS"
@@ -1126,7 +1164,7 @@ sp9c_check_override_rejected() {
   local varname="$1" varvalue="$2" payload="$3" use_dash_e="$4" log
   log="$SCRATCH_ROOT/tmp/sp9c_override_$(printf '%s' "$varname" | tr -c 'A-Za-z0-9' '_')_$use_dash_e.log"
   if [ "$use_dash_e" = "dashe" ]; then
-    if env "$varname=$varvalue" make -e BACKEND=kiss EXTRA_LDFLAGS="$payload" print-obj-dir >"$log" 2>&1; then
+    if env "$varname=$varvalue" make -e BACKEND=ne10 EXTRA_LDFLAGS="$payload" print-obj-dir >"$log" 2>&1; then
       fail "SP-S9c: env $varname=$varvalue make -e print-obj-dir (EXTRA_LDFLAGS payload) unexpectedly SUCCEEDED (must be rejected: overriding $varname must not defeat the link-flags character-safety check)"
     elif grep -q "cannot be overridden" "$log" && grep -q "$varname" "$log"; then
       pass "SP-S9c: env $varname=$varvalue make -e print-obj-dir (EXTRA_LDFLAGS payload) correctly FAILS, mentioning '$varname cannot be overridden'"
@@ -1135,7 +1173,7 @@ sp9c_check_override_rejected() {
       cat "$log" >&2
     fi
   else
-    if make BACKEND=kiss EXTRA_LDFLAGS="$payload" "$varname=$varvalue" print-obj-dir >"$log" 2>&1; then
+    if make BACKEND=ne10 EXTRA_LDFLAGS="$payload" "$varname=$varvalue" print-obj-dir >"$log" 2>&1; then
       fail "SP-S9c: make $varname=$varvalue print-obj-dir (EXTRA_LDFLAGS payload) unexpectedly SUCCEEDED (must be rejected: overriding $varname must not defeat the link-flags character-safety check)"
     elif grep -q "cannot be overridden" "$log" && grep -q "$varname" "$log"; then
       pass "SP-S9c: make $varname=$varvalue print-obj-dir (EXTRA_LDFLAGS payload) correctly FAILS, mentioning '$varname cannot be overridden'"
@@ -1158,15 +1196,15 @@ mkscratch sp10
 SP10_OBJ_ROOT="$SCRATCH_ROOT/sp10/obj"
 SP10_BIN_ROOT="$SCRATCH_ROOT/sp10/bin"
 
-# Resolve the real audio_common lib once (plain query target -- no
+# Resolve the real audiolib lib once (plain query target -- no
 # ALLOW_DIRTY_PUBLISH needed; print-lib-path never touches DIST_ROOT/dirty
 # state at all).
-sp10_ac_lib="$(make -s -C "$AC_DIR" BACKEND=kiss print-lib-path)"
+sp10_ac_lib="$(make -s -C "$COMMON_DIR" BACKEND=ne10 print-lib-path)"
 
 # Snapshot the REAL submodule libaec.a -- must stay byte/mtime-untouched across
 # this whole scenario (the foreign member is injected into a scratch archive
 # instead).
-sp10_submodule_lib="$(make -s -C "$AEC_DIR" BACKEND=kiss print-lib-path)"
+sp10_submodule_lib="$(make -s -C "$AEC_DIR" BACKEND=ne10 print-lib-path)"
 sp10_submodule_existed_before=0
 if [ -f "$sp10_submodule_lib" ]; then
   sp10_submodule_existed_before=1
@@ -1178,7 +1216,7 @@ fi
 # OBJ_ROOT/BIN_ROOT) libaec.a, if a prior run happened to leave one there --
 # this scenario builds ONLY under scratch OBJ_ROOT/BIN_ROOT, so that path
 # must never be touched either.
-sp10_primary_real_lib="$(make -s -C "$AEC_R6_DIR" BACKEND=kiss print-lib-path)"
+sp10_primary_real_lib="$(make -s -C "$AEC_R6_DIR" BACKEND=ne10 print-lib-path)"
 sp10_primary_existed_before=0
 if [ -f "$sp10_primary_real_lib" ]; then
   sp10_primary_existed_before=1
@@ -1186,8 +1224,8 @@ if [ -f "$sp10_primary_real_lib" ]; then
   sp10_primary_mtime_before="$(mtime "$sp10_primary_real_lib")"
 fi
 
-make -s -C "$AEC_R6_DIR" BACKEND=kiss OBJ_ROOT="$SP10_OBJ_ROOT" BIN_ROOT="$SP10_BIN_ROOT" AC_DIR="$AC_DIR" AC_LIB="$sp10_ac_lib" lib >/dev/null
-sp10_lib="$(make -s -C "$AEC_R6_DIR" BACKEND=kiss OBJ_ROOT="$SP10_OBJ_ROOT" BIN_ROOT="$SP10_BIN_ROOT" AC_DIR="$AC_DIR" AC_LIB="$sp10_ac_lib" print-lib-path)"
+make -s -C "$AEC_R6_DIR" BACKEND=ne10 OBJ_ROOT="$SP10_OBJ_ROOT" BIN_ROOT="$SP10_BIN_ROOT" COMMON_DIR="$COMMON_DIR" COMMON_LIB="$sp10_ac_lib" lib >/dev/null
+sp10_lib="$(make -s -C "$AEC_R6_DIR" BACKEND=ne10 OBJ_ROOT="$SP10_OBJ_ROOT" BIN_ROOT="$SP10_BIN_ROOT" COMMON_DIR="$COMMON_DIR" COMMON_LIB="$sp10_ac_lib" print-lib-path)"
 [ -f "$sp10_lib" ] && pass "SP-S10: PRIMARY AEC repo's SCRATCH archive built ($sp10_lib)" \
   || fail "SP-S10: PRIMARY AEC repo's SCRATCH archive missing after 'make lib'"
 
@@ -1205,7 +1243,7 @@ ar -t "$sp10_lib" | grep -qx 'sp10_foreign.o' && pass "SP-S10: foreign member in
 # mtimes, so make's own dependency check ($(LIB): $(OBJS)) sees it as stale
 # and re-archives from scratch on the very next build.
 touch -t 202001010000 "$sp10_lib"
-make -s -C "$AEC_R6_DIR" BACKEND=kiss OBJ_ROOT="$SP10_OBJ_ROOT" BIN_ROOT="$SP10_BIN_ROOT" AC_DIR="$AC_DIR" AC_LIB="$sp10_ac_lib" lib >/dev/null
+make -s -C "$AEC_R6_DIR" BACKEND=ne10 OBJ_ROOT="$SP10_OBJ_ROOT" BIN_ROOT="$SP10_BIN_ROOT" COMMON_DIR="$COMMON_DIR" COMMON_LIB="$sp10_ac_lib" lib >/dev/null
 
 if ar -t "$sp10_lib" | grep -qx 'sp10_foreign.o'; then
   fail "SP-S10: foreign member SURVIVED a rebuild (archive was NOT rebuilt fresh -- looks like 'ar r' onto the existing .a rather than \$@.tmp + mv -f)"
@@ -1215,7 +1253,7 @@ fi
 ar -t "$sp10_lib" | grep -qx 'aec_debug.o' && pass "SP-S10: aec_debug.o present in the freshly-rebuilt archive" \
   || fail "SP-S10: aec_debug.o missing from the freshly-rebuilt archive"
 
-sp10_objdir="$(make -s -C "$AEC_R6_DIR" BACKEND=kiss OBJ_ROOT="$SP10_OBJ_ROOT" BIN_ROOT="$SP10_BIN_ROOT" AC_DIR="$AC_DIR" AC_LIB="$sp10_ac_lib" print-obj-dir)"
+sp10_objdir="$(make -s -C "$AEC_R6_DIR" BACKEND=ne10 OBJ_ROOT="$SP10_OBJ_ROOT" BIN_ROOT="$SP10_BIN_ROOT" COMMON_DIR="$COMMON_DIR" COMMON_LIB="$sp10_ac_lib" print-obj-dir)"
 grep -q 'SRCS=' "$sp10_objdir/config.manifest" && pass "SP-S10: the SCRATCH obj dir's config.manifest records a SRCS= entry" \
   || fail "SP-S10: SCRATCH obj dir's config.manifest missing a SRCS= entry"
 
@@ -1245,17 +1283,35 @@ fi
 
 echo "############################################################"
 echo "# SP-S11: pipelines publish v4 (content-addressed release + ATTEST v2)"
+own_untracked_flag() {
+  local dir="$1" paths
+  paths="$(git -C "$dir" ls-files --others --exclude-standard | grep -vE '^AINR/(GTCRN|gtcrn_github)/' || true)"
+  if [ -n "$paths" ]; then printf '1\n'; else printf '0\n'; fi
+}
+sp11_expected_self_untracked="$(own_untracked_flag "$PIPE_DIR")"
+# Exercise both expectations without staging anything in the real checkout.
+mkdir -p "$SCRATCH_ROOT/sp11-untracked-policy/AINR/GTCRN"
+git -C "$SCRATCH_ROOT/sp11-untracked-policy" init -q
+printf 'manual content\n' > "$SCRATCH_ROOT/sp11-untracked-policy/AINR/GTCRN/probe.txt"
+[ "$(own_untracked_flag "$SCRATCH_ROOT/sp11-untracked-policy")" = 0 ] \
+  && pass "SP-S11: whitelist-only fixture has expected own untracked=0" \
+  || fail "SP-S11: whitelist-only fixture wrongly reports own untracked files"
+printf 'int probe;\n' > "$SCRATCH_ROOT/sp11-untracked-policy/probe.c"
+[ "$(own_untracked_flag "$SCRATCH_ROOT/sp11-untracked-policy")" = 1 ] \
+  && pass "SP-S11: new source fixture has expected own untracked=1" \
+  || fail "SP-S11: new source fixture hides own untracked files"
+
 echo "############################################################"
 mkscratch sp11
 SP11_DIST_ROOT="$SCRATCH_ROOT/sp11/dist"
-resolve_producers kiss
-make -s BACKEND=kiss DIST_ROOT="$SP11_DIST_ROOT" ALLOW_DIRTY_PUBLISH=1 ALLOW_UNTRACKED_PUBLISH=1 publish AC_LIB="$AC_LIB_" AEC_LIB="$AEC_LIB_" NR_LIB="$NR_LIB_" >/dev/null
+resolve_producers ne10
+make -s BACKEND=ne10 DIST_ROOT="$SP11_DIST_ROOT" ALLOW_DIRTY_PUBLISH=1 ALLOW_UNTRACKED_PUBLISH=1 publish COMMON_LIB="$AC_LIB_" AEC_LIB="$AEC_LIB_" NR_LIB="$NR_LIB_" >/dev/null
 
-id1="$(readlink "$SP11_DIST_ROOT/kiss/current" || true)"
-[ -n "$id1" ] && [ -d "$SP11_DIST_ROOT/kiss/$id1" ] && pass "SP-S11: publish v4 -- current symlink resolves to release dir '$id1'" \
+id1="$(readlink "$SP11_DIST_ROOT/ne10/current" || true)"
+[ -n "$id1" ] && [ -d "$SP11_DIST_ROOT/ne10/$id1" ] && pass "SP-S11: publish v4 -- current symlink resolves to release dir '$id1'" \
   || fail "SP-S11: publish v4 -- current symlink broken or missing after the first publish"
 
-rel_dir="$SP11_DIST_ROOT/kiss/$id1"
+rel_dir="$SP11_DIST_ROOT/ne10/$id1"
 
 grep -q "^release_id=$id1\$" "$rel_dir/MANIFEST.txt" && pass "SP-S11: MANIFEST.txt release_id= matches the release dir name" \
   || fail "SP-S11: MANIFEST.txt release_id= missing or does not match '$id1'"
@@ -1284,12 +1340,12 @@ fi
 # attest v2: git_commit= (self) AND all three producer *_git_commit= fields are
 # full 40-hex OIDs (not `git rev-parse --short`).
 sp11_hex_ok=1
-for field in git_commit audio_common_git_commit aec_git_commit nr_git_commit; do
+for field in git_commit audiolib_git_commit aec_git_commit nr_git_commit; do
   val="$(grep "^${field}=" "$first_attest" | head -1 | cut -d= -f2)"
   echo "$val" | grep -Eq '^[0-9a-f]{40}$' || sp11_hex_ok=0
 done
 [ "$sp11_hex_ok" -eq 1 ] && pass "SP-S11: git_commit= and all three producer *_git_commit= fields are full 40-hex OIDs" \
-  || fail "SP-S11: one or more of git_commit=/audio_common_git_commit=/aec_git_commit=/nr_git_commit= is not 40 hex characters"
+  || fail "SP-S11: one or more of git_commit=/audiolib_git_commit=/aec_git_commit=/nr_git_commit= is not 40 hex characters"
 
 # The *_git_untracked dimension is a SEPARATE default refusal from *_git_dirty
 # (see the Makefile's ALLOW_UNTRACKED_PUBLISH comment) -- assert all four
@@ -1297,14 +1353,15 @@ done
 # attest (SP-S17a/b exercise the refusal path itself; this is the
 # field-presence check for the ordinary path).
 sp11_untracked_fields_ok=1
-for field in git_untracked audio_common_git_untracked aec_git_untracked nr_git_untracked allow_untracked_publish; do
+for field in git_untracked audiolib_git_untracked aec_git_untracked nr_git_untracked allow_untracked_publish; do
   grep -q "^${field}=" "$first_attest" || sp11_untracked_fields_ok=0
 done
 [ "$sp11_untracked_fields_ok" -eq 1 ] && pass "SP-S11: attest carries all four *_git_untracked fields + allow_untracked_publish=" \
-  || fail "SP-S11: attest is missing one or more of git_untracked=/audio_common_git_untracked=/aec_git_untracked=/nr_git_untracked=/allow_untracked_publish="
+  || fail "SP-S11: attest is missing one or more of git_untracked=/audiolib_git_untracked=/aec_git_untracked=/nr_git_untracked=/allow_untracked_publish="
 
-grep -q "^git_untracked=0\$" "$first_attest" && pass "SP-S11: pipelines' own git_untracked=0 (AINR/GTCRN|gtcrn_github whitelist holds)" \
-  || fail "SP-S11: pipelines' own git_untracked= is not 0 (whitelist not filtering, or a genuine untracked file is present)"
+grep -q "^git_untracked=$sp11_expected_self_untracked\$" "$first_attest" \
+  && pass "SP-S11: pipelines' own git_untracked=$sp11_expected_self_untracked matches the independently enumerated worktree" \
+  || fail "SP-S11: pipelines' own git_untracked does not match the actual worktree"
 
 release_dir_mtime_before="$(mtime "$rel_dir")"
 snap_before="$(release_mtime_snapshot "$rel_dir")"
@@ -1314,7 +1371,7 @@ snap_before="$(release_mtime_snapshot "$rel_dir")"
 # same-second case directly, forcing 20 publishes into one literal second via
 # ATTEST_STAMP=).
 S11_LOG="$SCRATCH_ROOT/sp11/republish.log"
-make -s BACKEND=kiss DIST_ROOT="$SP11_DIST_ROOT" ALLOW_DIRTY_PUBLISH=1 ALLOW_UNTRACKED_PUBLISH=1 publish AC_LIB="$AC_LIB_" AEC_LIB="$AEC_LIB_" NR_LIB="$NR_LIB_" >"$S11_LOG" 2>&1
+make -s BACKEND=ne10 DIST_ROOT="$SP11_DIST_ROOT" ALLOW_DIRTY_PUBLISH=1 ALLOW_UNTRACKED_PUBLISH=1 publish COMMON_LIB="$AC_LIB_" AEC_LIB="$AEC_LIB_" NR_LIB="$NR_LIB_" >"$S11_LOG" 2>&1
 if grep -q "already published (byte-verified" "$S11_LOG"; then
   pass "SP-S11: idempotent republish printed 'already published (byte-verified, incl. MANIFEST)'"
 else
@@ -1324,7 +1381,7 @@ fi
 grep -Eq '\(attested: attest-[^)]+\)[[:space:]]*$' "$S11_LOG" && pass "SP-S11: republish success line ends '(attested: <name>)'" \
   || fail "SP-S11: republish success line missing the '(attested: <name>)' suffix"
 
-id2="$(readlink "$SP11_DIST_ROOT/kiss/current" || true)"
+id2="$(readlink "$SP11_DIST_ROOT/ne10/current" || true)"
 [ "$id2" = "$id1" ] && pass "SP-S11: current still points at the same release id after idempotent republish" \
   || fail "SP-S11: current MOVED after idempotent republish ('$id1' -> '$id2')"
 
@@ -1377,10 +1434,10 @@ assert_cmd_fails_with "SP-S12: BACKEND=ne10 with a CXX whose -dumpmachine disagr
   make BACKEND=ne10 CXX="$SP12_SHIM" OBJ_ROOT="$SP12_OBJ_ROOT" BIN_ROOT="$SP12_BIN_ROOT" libaudio_pipeline.a
 
 S12_LOG="$SCRATCH_ROOT/sp12/log"
-if make BACKEND=kiss CXX="$SP12_SHIM" OBJ_ROOT="$SP12_OBJ_ROOT" BIN_ROOT="$SP12_BIN_ROOT" libaudio_pipeline.a >"$S12_LOG" 2>&1; then
-  pass "SP-S12: BACKEND=kiss with the same mismatched-triple CXX shim still SUCCEEDS (guard is ne10-only)"
+if make TOOLCHAIN_CHECK=0 CXX="$SP12_SHIM" OBJ_ROOT="$SP12_OBJ_ROOT" BIN_ROOT="$SP12_BIN_ROOT" libaudio_pipeline.a >"$S12_LOG" 2>&1; then
+  pass "SP-S12: TOOLCHAIN_CHECK=0 with the same mismatched-triple CXX shim SUCCEEDS (the guard is the only thing that rejected it)"
 else
-  fail "SP-S12: BACKEND=kiss build unexpectedly FAILED with the CXX shim in place"
+  fail "SP-S12: TOOLCHAIN_CHECK=0 build unexpectedly FAILED with the CXX shim in place"
   cat "$S12_LOG" >&2
 fi
 
@@ -1422,8 +1479,8 @@ snap_dirs() { { find "$1" -maxdepth 1 -type d 2>/dev/null | sort; } || true; }
 
 SP14_BEFORE_PIPE_OBJ="$(snap_dirs "$PIPE_DIR/obj")"
 SP14_BEFORE_PIPE_BIN="$(snap_dirs "$PIPE_DIR/bin")"
-SP14_BEFORE_AC_OBJ="$(snap_dirs "$AC_DIR/obj")"
-SP14_BEFORE_AC_BIN="$(snap_dirs "$AC_DIR/bin")"
+SP14_BEFORE_AC_OBJ="$(snap_dirs "$COMMON_DIR/obj")"
+SP14_BEFORE_AC_BIN="$(snap_dirs "$COMMON_DIR/bin")"
 SP14_BEFORE_AECR6_OBJ="$(snap_dirs "$AEC_R6_DIR/obj")"
 SP14_BEFORE_AECR6_BIN="$(snap_dirs "$AEC_R6_DIR/bin")"
 SP14_BEFORE_NRR6_OBJ="$(snap_dirs "$NR_R6_DIR/obj")"
@@ -1440,20 +1497,20 @@ for x in pipe aec nr; do
   SP14_BIN="$SCRATCH_ROOT/sp14/$x/nb"
 
   rc=0
-  "${MAKE_ARGS[@]}" -n BACKEND=kiss DIST_ROOT="$SP14_DIST" OBJ_ROOT="$SP14_OBJ" BIN_ROOT="$SP14_BIN" publish >"$SCRATCH_ROOT/sp14/$x.n.log" 2>&1 || rc=$?
+  "${MAKE_ARGS[@]}" -n BACKEND=ne10 DIST_ROOT="$SP14_DIST" OBJ_ROOT="$SP14_OBJ" BIN_ROOT="$SP14_BIN" publish >"$SCRATCH_ROOT/sp14/$x.n.log" 2>&1 || rc=$?
   if [ "$x" = "pipe" ]; then
-    # pipelines' own THREE-producer FORCE rules forward $(AC_LIB) into a
-    # FURTHER nested `$(MAKE) ... AC_LIB=$(AC_LIB) lib` sub-make call for
+    # pipelines' own THREE-producer FORCE rules forward $(COMMON_LIB) into a
+    # FURTHER nested `$(MAKE) ... COMMON_LIB=$(COMMON_LIB) lib` sub-make call for
     # lib/aec and lib/nr. Under `-n`, GNU Make PRINTS (rather than executes)
-    # audio_common's own `print-lib-path` recipe line VERBATIM -- including its
-    # `echo` text -- instead of running it (`make -n -s -C audio_common
+    # audiolib's own `print-lib-path` recipe line VERBATIM -- including its
+    # `echo` text -- instead of running it (`make -n -s -C audiolib
     # print-lib-path` prints "echo /abs/path" instead of just "/abs/path"), so
     # the captured "$$ac" becomes the literal STRING "echo /abs/path/to/lib.a"
     # (containing a space) instead of just the path. Forwarding THAT corrupted
-    # value on as AC_LIB=$(AC_LIB) into the nested lib/aec or lib/nr sub-make
+    # value on as COMMON_LIB=$(COMMON_LIB) into the nested lib/aec or lib/nr sub-make
     # then splits it into extra bogus command-line words/goals, and that nested
     # make exits nonzero ("No rule to make target ..."). AEC's and NR's own
-    # single-producer dispatch never re-forwards AC_LIB into a THIRD level of
+    # single-producer dispatch never re-forwards COMMON_LIB into a THIRD level of
     # nesting this way, so they don't hit it (see SP-S14[aec]/SP-S14[nr]
     # immediately below, both rc=0) -- this is specific to pipelines'
     # three-producer design. The safety property this scenario exists to verify
@@ -1471,7 +1528,7 @@ for x in pipe aec nr; do
   fi
 
   rc=0
-  "${MAKE_ARGS[@]}" -q BACKEND=kiss DIST_ROOT="$SP14_DIST" OBJ_ROOT="$SP14_OBJ" BIN_ROOT="$SP14_BIN" publish >"$SCRATCH_ROOT/sp14/$x.q.log" 2>&1 || rc=$?
+  "${MAKE_ARGS[@]}" -q BACKEND=ne10 DIST_ROOT="$SP14_DIST" OBJ_ROOT="$SP14_OBJ" BIN_ROOT="$SP14_BIN" publish >"$SCRATCH_ROOT/sp14/$x.q.log" 2>&1 || rc=$?
   [ "$rc" -ne 0 ] && pass "SP-S14[$x]: make -q publish exits NONZERO (rc=$rc)" || fail "SP-S14[$x]: make -q publish exited 0 (expected nonzero)"
   if [ ! -e "$SP14_DIST" ] && [ ! -e "$SP14_OBJ" ] && [ ! -e "$SP14_BIN" ]; then
     pass "SP-S14[$x]: make -q publish is zero-write (created NONE of DIST_ROOT/OBJ_ROOT/BIN_ROOT)"
@@ -1479,7 +1536,7 @@ for x in pipe aec nr; do
     fail "SP-S14[$x]: make -q publish left behind a path (dist=$([ -e "$SP14_DIST" ] && echo yes || echo no) obj=$([ -e "$SP14_OBJ" ] && echo yes || echo no) bin=$([ -e "$SP14_BIN" ] && echo yes || echo no))"
   fi
 
-  "${MAKE_ARGS[@]}" -t BACKEND=kiss DIST_ROOT="$SP14_DIST" OBJ_ROOT="$SP14_OBJ" BIN_ROOT="$SP14_BIN" publish >"$SCRATCH_ROOT/sp14/$x.t.log" 2>&1 || true
+  "${MAKE_ARGS[@]}" -t BACKEND=ne10 DIST_ROOT="$SP14_DIST" OBJ_ROOT="$SP14_OBJ" BIN_ROOT="$SP14_BIN" publish >"$SCRATCH_ROOT/sp14/$x.t.log" 2>&1 || true
   if [ ! -e "$SP14_DIST" ] && [ ! -e "$SP14_OBJ" ] && [ ! -e "$SP14_BIN" ]; then
     pass "SP-S14[$x]: make -t publish is zero-write (created NONE of DIST_ROOT/OBJ_ROOT/BIN_ROOT)"
   else
@@ -1489,8 +1546,8 @@ done
 
 SP14_AFTER_PIPE_OBJ="$(snap_dirs "$PIPE_DIR/obj")"
 SP14_AFTER_PIPE_BIN="$(snap_dirs "$PIPE_DIR/bin")"
-SP14_AFTER_AC_OBJ="$(snap_dirs "$AC_DIR/obj")"
-SP14_AFTER_AC_BIN="$(snap_dirs "$AC_DIR/bin")"
+SP14_AFTER_AC_OBJ="$(snap_dirs "$COMMON_DIR/obj")"
+SP14_AFTER_AC_BIN="$(snap_dirs "$COMMON_DIR/bin")"
 SP14_AFTER_AECR6_OBJ="$(snap_dirs "$AEC_R6_DIR/obj")"
 SP14_AFTER_AECR6_BIN="$(snap_dirs "$AEC_R6_DIR/bin")"
 SP14_AFTER_NRR6_OBJ="$(snap_dirs "$NR_R6_DIR/obj")"
@@ -1500,8 +1557,8 @@ SP14_AFTER_NRR6_BIN="$(snap_dirs "$NR_R6_DIR/bin")"
   pass "SP-S14: no NEW keyed dirs appeared in pipelines' own real obj/bin" \
   || fail "SP-S14: a NEW keyed dir appeared in pipelines' own real obj/bin"
 [ "$SP14_BEFORE_AC_OBJ" = "$SP14_AFTER_AC_OBJ" ] && [ "$SP14_BEFORE_AC_BIN" = "$SP14_AFTER_AC_BIN" ] && \
-  pass "SP-S14: no NEW keyed dirs appeared in audio_common's real obj/bin" \
-  || fail "SP-S14: a NEW keyed dir appeared in audio_common's real obj/bin"
+  pass "SP-S14: no NEW keyed dirs appeared in audiolib's real obj/bin" \
+  || fail "SP-S14: a NEW keyed dir appeared in audiolib's real obj/bin"
 [ "$SP14_BEFORE_AECR6_OBJ" = "$SP14_AFTER_AECR6_OBJ" ] && [ "$SP14_BEFORE_AECR6_BIN" = "$SP14_AFTER_AECR6_BIN" ] && \
   pass "SP-S14: no NEW keyed dirs appeared in the PRIMARY AEC repo's real obj/bin" \
   || fail "SP-S14: a NEW keyed dir appeared in the PRIMARY AEC repo's real obj/bin"
@@ -1510,7 +1567,7 @@ SP14_AFTER_NRR6_BIN="$(snap_dirs "$NR_R6_DIR/bin")"
   || fail "SP-S14: a NEW keyed dir appeared in the PRIMARY NR repo's real obj/bin"
 
 echo "--- SP-S14b: COMBINED dry-run flags stay zero-write (PIPELINES Makefile) --"
-# Combined dry-run flags (the S15b pattern from audio_common's script): a combined
+# Combined dry-run flags (the S15b pattern from audiolib's script): a combined
 # `make -nt publish` could take the -n branch and recurse; the recursed
 # child then sees BOTH flags and GNU make applies REAL touch semantics down
 # the _publish_impl prerequisite chain -- the pipelines Makefile's own
@@ -1520,16 +1577,16 @@ echo "--- SP-S14b: COMBINED dry-run flags stay zero-write (PIPELINES Makefile) -
 # a leaked -t would "fix" by touching. Scratch-side only -- the real tree's
 # artifacts are covered by the SP1 final-guard snapshot and must never be
 # backdated. libaudio_pipeline.a needs no producer archive at all, so no
-# AC_LIB/AEC_LIB/NR_LIB resolution is needed for this check.
+# COMMON_LIB/AEC_LIB/NR_LIB resolution is needed for this check.
 mkscratch sp14b
 SP14B_OBJ="$SCRATCH_ROOT/sp14b/obj"; SP14B_BIN="$SCRATCH_ROOT/sp14b/bin"; SP14B_DIST="$SCRATCH_ROOT/sp14b/nx"
-make -s BACKEND=kiss OBJ_ROOT="$SP14B_OBJ" BIN_ROOT="$SP14B_BIN" libaudio_pipeline.a >/dev/null
-sp14b_lib="$(make -s BACKEND=kiss OBJ_ROOT="$SP14B_OBJ" BIN_ROOT="$SP14B_BIN" print-lib-path)"
+make -s BACKEND=ne10 OBJ_ROOT="$SP14B_OBJ" BIN_ROOT="$SP14B_BIN" libaudio_pipeline.a >/dev/null
+sp14b_lib="$(make -s BACKEND=ne10 OBJ_ROOT="$SP14B_OBJ" BIN_ROOT="$SP14B_BIN" print-lib-path)"
 touch -t 202001010000 "$sp14b_lib"
 sp14b_ref="$(stat -f '%m %z' "$sp14b_lib")"
 for combo in "-nt" "-n -t" "-tq" "-nq" "-nqt"; do
   rm -rf "$SP14B_DIST"
-  rc=0; make $combo BACKEND=kiss OBJ_ROOT="$SP14B_OBJ" BIN_ROOT="$SP14B_BIN" DIST_ROOT="$SP14B_DIST" publish >/dev/null 2>&1 || rc=$?
+  rc=0; make $combo BACKEND=ne10 OBJ_ROOT="$SP14B_OBJ" BIN_ROOT="$SP14B_BIN" DIST_ROOT="$SP14B_DIST" publish >/dev/null 2>&1 || rc=$?
   if [ ! -e "$SP14B_DIST" ] && [ "$(stat -f '%m %z' "$sp14b_lib")" = "$sp14b_ref" ]; then
     pass "SP-S14b[$combo]: zero-write (no DIST_ROOT; stale scratch archive untouched; rc=$rc informational)"
   else
@@ -1543,10 +1600,10 @@ echo "#         (regression P2-2)"
 echo "############################################################"
 mkscratch sp15
 SP15_DIST="$SCRATCH_ROOT/sp15/dist"
-resolve_producers kiss
-make -s BACKEND=kiss DIST_ROOT="$SP15_DIST" ALLOW_DIRTY_PUBLISH=1 ALLOW_UNTRACKED_PUBLISH=1 publish AC_LIB="$AC_LIB_" AEC_LIB="$AEC_LIB_" NR_LIB="$NR_LIB_" >/dev/null
-sp15_id="$(readlink "$SP15_DIST/kiss/current" || true)"
-sp15_attest_dir="$SP15_DIST/kiss/$sp15_id/ATTEST"
+resolve_producers ne10
+make -s BACKEND=ne10 DIST_ROOT="$SP15_DIST" ALLOW_DIRTY_PUBLISH=1 ALLOW_UNTRACKED_PUBLISH=1 publish COMMON_LIB="$AC_LIB_" AEC_LIB="$AEC_LIB_" NR_LIB="$NR_LIB_" >/dev/null
+sp15_id="$(readlink "$SP15_DIST/ne10/current" || true)"
+sp15_attest_dir="$SP15_DIST/ne10/$sp15_id/ATTEST"
 
 sp15_before_list="$(find "$sp15_attest_dir" -name 'attest-*.txt' | sort)"
 sp15_before_snap="$SCRATCH_ROOT/sp15/before_snap.txt"
@@ -1557,7 +1614,7 @@ for f in $sp15_before_list; do
 done
 
 for i in $(seq 1 20); do
-  make -s BACKEND=kiss DIST_ROOT="$SP15_DIST" ALLOW_DIRTY_PUBLISH=1 ALLOW_UNTRACKED_PUBLISH=1 ATTEST_STAMP=20260715T999999Z publish AC_LIB="$AC_LIB_" AEC_LIB="$AEC_LIB_" NR_LIB="$NR_LIB_" >/dev/null
+  make -s BACKEND=ne10 DIST_ROOT="$SP15_DIST" ALLOW_DIRTY_PUBLISH=1 ALLOW_UNTRACKED_PUBLISH=1 ATTEST_STAMP=20260715T999999Z publish COMMON_LIB="$AC_LIB_" AEC_LIB="$AEC_LIB_" NR_LIB="$NR_LIB_" >/dev/null
 done
 
 sp15_after_list="$(find "$sp15_attest_dir" -name 'attest-*.txt' | sort)"
@@ -1705,8 +1762,8 @@ SP17_LOG_OK="$SCRATCH_ROOT/sp17/log_ok"
 # practice, since these clones carry no untracked files yet (only tracked-dirty
 # edits above), but uniform with every other publish call in this script from
 # S7 onward.
-if make -s BACKEND=kiss DIST_ROOT="$SP17_DIST" OBJ_ROOT="$SP17_OBJ_ROOT" BIN_ROOT="$SP17_BIN_ROOT" \
-     AC_DIR="$SP17_AC_CLONE" AEC_DIR="$SP17_AEC_CLONE/c_impl" NR_DIR="$SP17_NR_CLONE/c_impl" \
+if make -s BACKEND=ne10 DIST_ROOT="$SP17_DIST" OBJ_ROOT="$SP17_OBJ_ROOT" BIN_ROOT="$SP17_BIN_ROOT" \
+     COMMON_DIR="$SP17_AC_CLONE" AEC_DIR="$SP17_AEC_CLONE/c_impl" NR_DIR="$SP17_NR_CLONE/c_impl" \
      ALLOW_DIRTY_PUBLISH=1 ALLOW_UNTRACKED_PUBLISH=1 publish >"$SP17_LOG_OK" 2>&1; then
   pass "SP-S17: publish against three dirty producer clones + ALLOW_DIRTY_PUBLISH=1 succeeds"
 else
@@ -1714,9 +1771,9 @@ else
   cat "$SP17_LOG_OK" >&2
 fi
 
-sp17_id="$(readlink "$SP17_DIST/kiss/current" || true)"
+sp17_id="$(readlink "$SP17_DIST/ne10/current" || true)"
 sp17_attest_name="$(sp17_attest_name_from_log "$SP17_LOG_OK" || true)"
-sp17_attest="$SP17_DIST/kiss/$sp17_id/ATTEST/$sp17_attest_name"
+sp17_attest="$SP17_DIST/ne10/$sp17_id/ATTEST/$sp17_attest_name"
 
 sp17_ac_commit="$(git -C "$SP17_AC_CLONE" rev-parse HEAD)"
 sp17_aec_commit="$(git -C "$SP17_AEC_CLONE" rev-parse HEAD)"
@@ -1726,9 +1783,9 @@ sp17_aec_ddiff="$(git -C "$SP17_AEC_CLONE" diff --binary HEAD | shasum -a 256 | 
 sp17_nr_ddiff="$(git -C "$SP17_NR_CLONE" diff --binary HEAD | shasum -a 256 | cut -d' ' -f1)"
 
 if [ -n "$sp17_attest_name" ] && [ -f "$sp17_attest" ] \
-   && grep -q "^audio_common_git_dirty=1\$" "$sp17_attest" \
-   && grep -q "^audio_common_git_commit=$sp17_ac_commit\$" "$sp17_attest" \
-   && grep -q "^audio_common_dirty_diff_sha256=$sp17_ac_ddiff\$" "$sp17_attest" \
+   && grep -q "^audiolib_git_dirty=1\$" "$sp17_attest" \
+   && grep -q "^audiolib_git_commit=$sp17_ac_commit\$" "$sp17_attest" \
+   && grep -q "^audiolib_dirty_diff_sha256=$sp17_ac_ddiff\$" "$sp17_attest" \
    && grep -q "^aec_git_dirty=1\$" "$sp17_attest" \
    && grep -q "^aec_git_commit=$sp17_aec_commit\$" "$sp17_attest" \
    && grep -q "^aec_dirty_diff_sha256=$sp17_aec_ddiff\$" "$sp17_attest" \
@@ -1741,67 +1798,67 @@ else
 fi
 
 SP17_LOG_FAIL="$SCRATCH_ROOT/sp17/log_fail"
-if make -s BACKEND=kiss DIST_ROOT="$SP17_DIST" OBJ_ROOT="$SP17_OBJ_ROOT" BIN_ROOT="$SP17_BIN_ROOT" \
-     AC_DIR="$SP17_AC_CLONE" AEC_DIR="$SP17_AEC_CLONE/c_impl" NR_DIR="$SP17_NR_CLONE/c_impl" \
+if make -s BACKEND=ne10 DIST_ROOT="$SP17_DIST" OBJ_ROOT="$SP17_OBJ_ROOT" BIN_ROOT="$SP17_BIN_ROOT" \
+     COMMON_DIR="$SP17_AC_CLONE" AEC_DIR="$SP17_AEC_CLONE/c_impl" NR_DIR="$SP17_NR_CLONE/c_impl" \
      publish >"$SP17_LOG_FAIL" 2>&1; then
   fail "SP-S17: publish against the same dirty producer clones WITHOUT ALLOW_DIRTY_PUBLISH unexpectedly SUCCEEDED"
 else
   if grep -q "publish refused" "$SP17_LOG_FAIL" \
-     && grep -q "audio_common working tree has uncommitted TRACKED changes" "$SP17_LOG_FAIL" \
+     && grep -q "audiolib working tree has uncommitted TRACKED changes" "$SP17_LOG_FAIL" \
      && grep -q "lib/aec working tree has uncommitted TRACKED changes" "$SP17_LOG_FAIL" \
      && grep -q "lib/nr working tree has uncommitted TRACKED changes" "$SP17_LOG_FAIL"; then
-    pass "SP-S17: publish without ALLOW_DIRTY_PUBLISH correctly FAILS, naming audio_common/lib/aec/lib/nr as the dirty repos"
+    pass "SP-S17: publish without ALLOW_DIRTY_PUBLISH correctly FAILS, naming audiolib/common/lib/aec/lib/nr as the dirty repos"
   else
     fail "SP-S17: publish failed but without the expected 'publish refused' / per-producer dirty wording"
     cat "$SP17_LOG_FAIL" >&2
   fi
 fi
 
-echo "--- SP-S17a: untracked producer probe (audio_common) -------------------"
+echo "--- SP-S17a: untracked producer probe (audiolib) -------------------"
 # The untracked dimension is SEPARATE from the tracked-dirty one already
-# exercised above. An untracked file in the SHARED audio_common clone (already
+# exercised above. An untracked file in the SHARED audiolib clone (already
 # tracked-dirty from the edit above, so ALLOW_DIRTY_PUBLISH=1 alone already
 # admits THAT dimension) must still be refused on the UNTRACKED dimension
 # unless ALLOW_UNTRACKED_PUBLISH=1 is ALSO given -- and once given, the
-# attestation records audio_common_git_untracked=1 + a 64-hex
-# audio_common_untracked_tree_sha256, while pipelines' OWN git_untracked stays
-# 0 (the AINR/GTCRN|gtcrn_github whitelist holding, since this repo's own tree
-# never gained an untracked file from this scenario).
+# attestation records audiolib_git_untracked=1 + a 64-hex
+# audiolib_untracked_tree_sha256, while pipelines' own untracked flag stays
+# at its independently measured pre-probe value. The scenario adds no
+# untracked file to the real pipelines checkout.
 echo "int sp17a_untracked_probe;" > "$SP17_AC_CLONE/probe.c"
 
 SP17_LOG_A1="$SCRATCH_ROOT/sp17/log_untracked_a1"
-if make -s BACKEND=kiss DIST_ROOT="$SP17_DIST" OBJ_ROOT="$SP17_OBJ_ROOT" BIN_ROOT="$SP17_BIN_ROOT" \
-     AC_DIR="$SP17_AC_CLONE" AEC_DIR="$SP17_AEC_CLONE/c_impl" NR_DIR="$SP17_NR_CLONE/c_impl" \
+if make -s BACKEND=ne10 DIST_ROOT="$SP17_DIST" OBJ_ROOT="$SP17_OBJ_ROOT" BIN_ROOT="$SP17_BIN_ROOT" \
+     COMMON_DIR="$SP17_AC_CLONE" AEC_DIR="$SP17_AEC_CLONE/c_impl" NR_DIR="$SP17_NR_CLONE/c_impl" \
      ALLOW_DIRTY_PUBLISH=1 publish >"$SP17_LOG_A1" 2>&1; then
-  fail "SP-S17a: ALLOW_DIRTY_PUBLISH=1 ALONE unexpectedly admitted an untracked file in audio_common"
+  fail "SP-S17a: ALLOW_DIRTY_PUBLISH=1 ALONE unexpectedly admitted an untracked file in audiolib"
 else
-  if grep -qi "publish refused" "$SP17_LOG_A1" && grep -q "audio_common" "$SP17_LOG_A1" && grep -q "UNTRACKED" "$SP17_LOG_A1"; then
-    pass "SP-S17a: ALLOW_DIRTY_PUBLISH=1 alone is refused, naming audio_common on the untracked dimension"
+  if grep -qi "publish refused" "$SP17_LOG_A1" && grep -q "audiolib" "$SP17_LOG_A1" && grep -q "UNTRACKED" "$SP17_LOG_A1"; then
+    pass "SP-S17a: ALLOW_DIRTY_PUBLISH=1 alone is refused, naming audiolib on the untracked dimension"
   else
-    fail "SP-S17a: refusal did not name audio_common's UNTRACKED files"
+    fail "SP-S17a: refusal did not name audiolib's UNTRACKED files"
     cat "$SP17_LOG_A1" >&2
   fi
 fi
 
 SP17_LOG_A2="$SCRATCH_ROOT/sp17/log_untracked_a2"
-if make -s BACKEND=kiss DIST_ROOT="$SP17_DIST" OBJ_ROOT="$SP17_OBJ_ROOT" BIN_ROOT="$SP17_BIN_ROOT" \
-     AC_DIR="$SP17_AC_CLONE" AEC_DIR="$SP17_AEC_CLONE/c_impl" NR_DIR="$SP17_NR_CLONE/c_impl" \
+if make -s BACKEND=ne10 DIST_ROOT="$SP17_DIST" OBJ_ROOT="$SP17_OBJ_ROOT" BIN_ROOT="$SP17_BIN_ROOT" \
+     COMMON_DIR="$SP17_AC_CLONE" AEC_DIR="$SP17_AEC_CLONE/c_impl" NR_DIR="$SP17_NR_CLONE/c_impl" \
      ALLOW_DIRTY_PUBLISH=1 ALLOW_UNTRACKED_PUBLISH=1 publish >"$SP17_LOG_A2" 2>&1; then
-  pass "SP-S17a: ALLOW_DIRTY_PUBLISH=1 + ALLOW_UNTRACKED_PUBLISH=1 together succeed with an untracked audio_common file present"
+  pass "SP-S17a: ALLOW_DIRTY_PUBLISH=1 + ALLOW_UNTRACKED_PUBLISH=1 together succeed with an untracked audiolib file present"
 else
   fail "SP-S17a: both knobs together FAILED"
   cat "$SP17_LOG_A2" >&2
 fi
 
-sp17a_id="$(readlink "$SP17_DIST/kiss/current" || true)"
+sp17a_id="$(readlink "$SP17_DIST/ne10/current" || true)"
 sp17a_attest_name="$(sp17_attest_name_from_log "$SP17_LOG_A2" || true)"
-sp17a_attest="$SP17_DIST/kiss/$sp17a_id/ATTEST/$sp17a_attest_name"
-sp17a_ac_uhash="$(grep '^audio_common_untracked_tree_sha256=' "$sp17a_attest" 2>/dev/null | head -1 | cut -d= -f2)"
+sp17a_attest="$SP17_DIST/ne10/$sp17a_id/ATTEST/$sp17a_attest_name"
+sp17a_ac_uhash="$(grep '^audiolib_untracked_tree_sha256=' "$sp17a_attest" 2>/dev/null | head -1 | cut -d= -f2)"
 if [ -n "$sp17a_attest_name" ] && [ -f "$sp17a_attest" ] \
-   && grep -q "^audio_common_git_untracked=1\$" "$sp17a_attest" \
+   && grep -q "^audiolib_git_untracked=1\$" "$sp17a_attest" \
    && [ -n "$sp17a_ac_uhash" ] && [ "${#sp17a_ac_uhash}" -eq 64 ] \
-   && grep -q "^git_untracked=0\$" "$sp17a_attest"; then
-  pass "SP-S17a: attestation shows audio_common_git_untracked=1 + 64-hex audio_common_untracked_tree_sha256, pipelines' own git_untracked=0"
+   && grep -q "^git_untracked=$sp11_expected_self_untracked\$" "$sp17a_attest"; then
+  pass "SP-S17a: attestation records the untracked producer and preserves pipelines' own measured untracked flag"
 else
   fail "SP-S17a: attestation ($sp17a_attest) does not match the expected untracked-producer shape"
 fi
@@ -1817,8 +1874,8 @@ mkdir -p "$SP17B_NOGIT_AEC"
 tar -c -C "$AEC_REPO_DIR" --exclude obj --exclude bin --exclude dist --exclude .git . | tar -x -C "$SP17B_NOGIT_AEC"
 
 SP17_LOG_B="$SCRATCH_ROOT/sp17/log_unknown_aec"
-if make -s BACKEND=kiss DIST_ROOT="$SP17_DIST" OBJ_ROOT="$SP17_OBJ_ROOT" BIN_ROOT="$SP17_BIN_ROOT" \
-     AC_DIR="$SP17_AC_CLONE" AEC_DIR="$SP17B_NOGIT_AEC/c_impl" NR_DIR="$SP17_NR_CLONE/c_impl" \
+if make -s BACKEND=ne10 DIST_ROOT="$SP17_DIST" OBJ_ROOT="$SP17_OBJ_ROOT" BIN_ROOT="$SP17_BIN_ROOT" \
+     COMMON_DIR="$SP17_AC_CLONE" AEC_DIR="$SP17B_NOGIT_AEC/c_impl" NR_DIR="$SP17_NR_CLONE/c_impl" \
      ALLOW_DIRTY_PUBLISH=1 ALLOW_UNTRACKED_PUBLISH=1 publish >"$SP17_LOG_B" 2>&1; then
   fail "SP-S17b: publish with AEC_DIR pointed at a no-git copy unexpectedly SUCCEEDED (unknown identity slipped past both hatches)"
 else
@@ -1844,7 +1901,7 @@ echo "############################################################"
 # VAR has actually been PARSED -- so under `-e`, a bare env var whose
 # file-side assignment sits AFTER the foreach (in file order) would sail
 # straight through unrejected, silently dropping that Makefile's own flag
-# appends (e.g. `env FP_POLICY=-ffp-contract=fast make -e -n BACKEND=kiss
+# appends (e.g. `env FP_POLICY=-ffp-contract=fast make -e -n BACKEND=ne10
 # lib` succeeding with -ffp-contract=fast on the dry-run compile line instead
 # of the pinned -ffp-contract=off). Each Makefile therefore places its bare
 # FP_POLICY/LDFLAGS literal/composition ahead of the foreach and uses `+=`
@@ -1866,7 +1923,7 @@ SP18_BIN_ROOT="$SCRATCH_ROOT/sp18/bin"
 mkscratch sp18
 
 # assert_make_e_rejected <description> <dir> <target> <mode> <needle> <VAR=value>...
-# Runs `env <VAR=value>... make -C <dir> -e -n BACKEND=kiss OBJ_ROOT=/
+# Runs `env <VAR=value>... make -C <dir> -e -n BACKEND=ne10 OBJ_ROOT=/
 # BIN_ROOT= (fresh scratch dirs, one pair per case) <target>`.
 #
 # The ONLY passing condition is make exiting NONZERO with the captured log
@@ -1906,21 +1963,21 @@ mkscratch sp18
 # a non-rejection into a PASS.
 #
 # Dispatch isolation: pipelines' own three-producer dispatch means `target=all`
-# genuinely SHELLS OUT to audio_common + the lib/aec/lib/nr SUBMODULES via a
+# genuinely SHELLS OUT to audiolib + the lib/aec/lib/nr SUBMODULES via a
 # "+@...$(MAKE)..." recipe line that runs for real even under `-n` (by design
 # -- see pipelines/Makefile's own dispatch comment). `env VAR=...` is inherited
 # by every one of those child `make` processes, so if ONLY pipelines' own
-# origin-rejection gate were disabled (audio_common's/the submodules' own gates
+# origin-rejection gate were disabled (audiolib's/the submodules' own gates
 # left intact), a pipelines case run with `target=all` would still print
 # "cannot be overridden" -- from a DIFFERENT Makefile's still-working gate
 # reached via that dispatch, not from pipelines' own -- and this helper would
 # report a PASS that is not attributable to pipelines/Makefile at all.
-# AC_LIB=/AEC_LIB=/NR_LIB= below, forced to dummy non-empty values on every
+# COMMON_LIB=/AEC_LIB=/NR_LIB= below, forced to dummy non-empty values on every
 # call (harmless for the lib/aec (primary)/lib/nr (primary) cases too -- those
 # Makefiles have no AEC_LIB/NR_LIB variables of their own, and their own `lib`
 # target already needs no producer archive), make every SP-S18 case here skip
 # the two-phase producer-resolution dispatch entirely (see pipelines/Makefile's
-# own query-target comment: passing AC_LIB/AEC_LIB/NR_LIB "skips the query
+# own query-target comment: passing COMMON_LIB/AEC_LIB/NR_LIB "skips the query
 # sub-makes") -- so no case below ever shells out to a DIFFERENT Makefile, and
 # a PASS can only ever come from the ONE Makefile named by `<dir>`'s own
 # origin-rejection gate. This is also why the pipelines-specific cases further
@@ -1933,7 +1990,7 @@ assert_make_e_rejected() {
   shift 5
   SP18_COUNTER=$((SP18_COUNTER + 1))
   log="$SCRATCH_ROOT/sp18/case-$SP18_COUNTER.log"
-  if env "$@" make -C "$dir" -e -n BACKEND=kiss AC_LIB=x AEC_LIB=y NR_LIB=z \
+  if env "$@" make -C "$dir" -e -n BACKEND=ne10 COMMON_LIB=x AEC_LIB=y NR_LIB=z \
        OBJ_ROOT="$SP18_OBJ_ROOT/$SP18_COUNTER" BIN_ROOT="$SP18_BIN_ROOT/$SP18_COUNTER" \
        "$target" >"$log" 2>&1; then
     fail "$desc -- make exited 0 (NOT rejected): the origin-override gate did not fire"
@@ -2014,9 +2071,9 @@ NR_SUB_STATE_AFTER="$(tree_state_hash "$NR_SUB_ROOT")"
 [ "$NR_SUB_STATE_BEFORE" = "$NR_SUB_STATE_AFTER" ] && pass "integrity: lib/nr (submodule) tree-state (status+diff) unchanged across the whole run" \
   || fail "integrity: lib/nr (submodule) tree-state CHANGED during this run"
 
-AC_STATE_AFTER="$(tree_state_hash "$AC_DIR")"
-[ "$AC_STATE_BEFORE" = "$AC_STATE_AFTER" ] && pass "integrity: \$AC_DIR (audio_common) tree-state (status+diff) unchanged across the whole run" \
-  || fail "integrity: \$AC_DIR (audio_common) tree-state CHANGED during this run"
+AC_STATE_AFTER="$(tree_state_hash "$COMMON_DIR")"
+[ "$AC_STATE_BEFORE" = "$AC_STATE_AFTER" ] && pass "integrity: \$COMMON_DIR (audiolib) tree-state (status+diff) unchanged across the whole run" \
+  || fail "integrity: \$COMMON_DIR (audiolib) tree-state CHANGED during this run"
 
 # Bonus (beyond the four repos the safety contract mandates): the PRIMARY
 # AEC/NR repos are exercised directly (SP-S10/SP-S14) -- guard their
@@ -2041,9 +2098,9 @@ REAL_DIST_NR_AFTER="$(real_dist_sentinel "$NR_DIR")"
 [ "$REAL_DIST_NR_BEFORE" = "$REAL_DIST_NR_AFTER" ] && pass "integrity: real lib/nr/c_impl/dist sentinel unchanged" \
   || fail "integrity: real lib/nr/c_impl/dist sentinel CHANGED during this run"
 
-REAL_DIST_AC_AFTER="$(real_dist_sentinel "$AC_DIR")"
-[ "$REAL_DIST_AC_BEFORE" = "$REAL_DIST_AC_AFTER" ] && pass "integrity: real \$AC_DIR/dist sentinel unchanged" \
-  || fail "integrity: real \$AC_DIR/dist sentinel CHANGED during this run"
+REAL_DIST_AC_AFTER="$(real_dist_sentinel "$COMMON_DIR")"
+[ "$REAL_DIST_AC_BEFORE" = "$REAL_DIST_AC_AFTER" ] && pass "integrity: real \$COMMON_DIR/dist sentinel unchanged" \
+  || fail "integrity: real \$COMMON_DIR/dist sentinel CHANGED during this run"
 
 # Bonus: the PRIMARY AEC/NR repos' own real dist/ too.
 REAL_DIST_AECR6_AFTER="$(real_dist_sentinel "$AEC_R6_DIR")"
@@ -2056,7 +2113,7 @@ REAL_DIST_NRR6_AFTER="$(real_dist_sentinel "$NR_R6_DIR")"
 
 # Final-guard re-check against the snapshot taken in SP1 (right after this
 # suite's LAST intentional real-tree build). Every file that existed then,
-# across all FOUR trees (pipelines, lib/aec, lib/nr, audio_common), must still
+# across all FOUR trees (pipelines, lib/aec, lib/nr, audiolib), must still
 # be sha+mtime identical now; a directory created after the snapshot is allowed
 # but reported (WARN/INFO -- there should be none), while a NEW file inside an
 # already-snapshotted directory is a HARD FAIL.
@@ -2065,7 +2122,7 @@ FINAL_GUARD_SNAPSHOT_AFTER="$(final_guard_snapshot)"
 
 fg_lost="$(comm -23 <(printf '%s\n' "$FINAL_GUARD_SNAPSHOT_BEFORE" | LC_ALL=C sort) <(printf '%s\n' "$FINAL_GUARD_SNAPSHOT_AFTER" | LC_ALL=C sort))"
 if [ -z "$fg_lost" ]; then
-  pass "final-guard: every real obj/+bin/ file (pipelines, lib/aec, lib/nr, audio_common) snapshotted after SP1's builds is still sha+mtime identical"
+  pass "final-guard: every real obj/+bin/ file (pipelines, lib/aec, lib/nr, audiolib) snapshotted after SP1's builds is still sha+mtime identical"
 else
   fail "final-guard: real obj/+bin/ files changed or vanished since SP1's builds"
   printf '%s\n' "$fg_lost" | sed 's/^/    changed\/lost: /' >&2

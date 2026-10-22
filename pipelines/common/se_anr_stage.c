@@ -1,33 +1,16 @@
 /* pipelines/common/se_anr_stage.c -- see se_anr_stage.h. */
 #include "se_anr_stage.h"
 
-#include "simd_kernels.h"
+#include "utility/simd_kernels.h"
 
-/* out[k] = r2[k] / SE_PSD_SCALE, as the exact reciprocal multiply. */
-static inline void se_psd_scale_scalar(float* out, const float* r2, int n) {
-    int k;
-    for (k = 0; k < n; ++k) out[k] = r2[k] * SE_PSD_SCALE_INV;
-}
-
-#if SK_HAVE_NEON
+/* out[k] = r2[k] / SE_PSD_SCALE, as the exact reciprocal multiply:
+ * sk_scale_f32 of utility/simd_kernels.h is the identical single
+ * broadcast-multiply with no fused op (out[i] = x[i] * g), so its 4-wide
+ * NEON unroll versus this file's former 16-wide one does not change the
+ * per-lane rounding -- there is no cross-lane reduction to reorder. */
 static inline void se_psd_scale(float* out, const float* r2, int n) {
-    const float32x4_t inv = vdupq_n_f32(SE_PSD_SCALE_INV);
-    int k = 0;
-    for (; k + 16 <= n; k += 16) {
-        vst1q_f32(out + k, vmulq_f32(vld1q_f32(r2 + k), inv));
-        vst1q_f32(out + k + 4, vmulq_f32(vld1q_f32(r2 + k + 4), inv));
-        vst1q_f32(out + k + 8, vmulq_f32(vld1q_f32(r2 + k + 8), inv));
-        vst1q_f32(out + k + 12, vmulq_f32(vld1q_f32(r2 + k + 12), inv));
-    }
-    for (; k + 4 <= n; k += 4)
-        vst1q_f32(out + k, vmulq_f32(vld1q_f32(r2 + k), inv));
-    se_psd_scale_scalar(out + k, r2 + k, n - k);
+    sk_scale_f32(out, r2, SE_PSD_SCALE_INV, n);
 }
-#else
-static inline void se_psd_scale(float* out, const float* r2, int n) {
-    se_psd_scale_scalar(out, r2, n);
-}
-#endif
 
 AnrConfig se_anr_compose_config(int sample_rate, int fft_size, int hop_size, AnrMode mode) {
     AnrConfig cfg = anr_config_for_mode_grid(sample_rate, fft_size, mode);

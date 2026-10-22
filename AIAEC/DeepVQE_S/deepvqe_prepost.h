@@ -25,7 +25,7 @@
  * same window, so they are bit-identical -- measured, not assumed. The only
  * difference is the head: the centered schedule additionally emits one
  * reflect-prefix frame, which this class does not. That also makes the class
- * agree with the AEC/GSC seam, whose spectra are center=False and arrive one
+ * agree with the AEC/BF seam, whose spectra are center=False and arrive one
  * per hop from hop 0.
  *
  * The one-hop algorithmic latency is unchanged: it comes from the synthesis
@@ -55,7 +55,7 @@
  * would put an undefined symbol in the other's parity build. This file
  * composes them and neither of them changes.
  *
- * Memory: both house lifecycles (audio_common/include/fft_wrapper.h,
+ * Memory: both house lifecycles (audiolib/common/include/fft_wrapper.h,
  * "Static memory support").
  *   size_t/req  deepvqe_prepost_get_mem_size(&cfg, &req);
  *   DeepVqePrepost *p = deepvqe_prepost_init(pool, req.bytes, &cfg); // board

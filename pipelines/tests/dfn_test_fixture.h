@@ -10,12 +10,11 @@
 
 #include "dfn2_prepost.h"
 #include "dfn_unit_partition.h"
+#include "audio_window.h"
 
 /* The periodic sqrt-Hann window the pipelines analyse and synthesise with. */
 static inline void dfn_fixture_root_hann(float *window, int n) {
-    int i;
-    for (i = 0; i < n; ++i)
-        window[i] = sqrtf(0.5f - 0.5f * cosf(2.0f * (float)M_PI * (float)i / (float)n));
+    ac_window_build(window, n);
 }
 
 /* Uniform noise in [-0.25, 0.25) from the LCG the sibling tests use. */

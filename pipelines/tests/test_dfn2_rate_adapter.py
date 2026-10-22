@@ -14,7 +14,7 @@ if str(ROOT) not in sys.path:
 
 from pipelines.dfn2_rate_adapter import AudioResampler, CResampler, round_trip  # noqa: E402
 
-AC = ROOT.parent / 'audio_common'
+AC = ROOT.parent / 'audiolib' / 'common'
 
 
 @pytest.fixture(scope='module')

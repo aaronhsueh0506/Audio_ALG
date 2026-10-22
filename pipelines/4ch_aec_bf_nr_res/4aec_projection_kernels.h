@@ -2,93 +2,47 @@
  * 4aec_projection_kernels.h — scalar/NEON kernels used by post-beam context
  * projection.
  *
- * Keep these kernels local to the four-channel integration layer: unlike the
- * AEC filter's fmaf-based complex MAC, projection uses separate
- * multiply/subtract/add operations under -ffp-contract=off.  The NEON path
- * deliberately preserves that operation sequence so SIMD=1 and SIMD=0 stay
- * byte-identical for finite inputs.
+ * four_aec_projection_cmac/_scalar below are thin aliases over
+ * utility/simd_kernels.h's sk_cmac_f32/sk_cmac_f32_scalar (pure move, same
+ * bodies, same unfused multiply/subtract/add operation sequence under
+ * -ffp-contract=off -- unlike the AEC filter's fmaf-based complex MAC,
+ * sk_cmac_fma_f32_scalar). Kept under these local names, same pattern as
+ * four_aec_complex_mag2 below, because 4aec_nr_res.c and
+ * tests/test_4aec_nr_res.c call them directly by name.
  */
 #ifndef FOUR_AEC_PROJECTION_KERNELS_H
 #define FOUR_AEC_PROJECTION_KERNELS_H
 
-#include "simd_kernels.h"
+#include "utility/simd_kernels.h"
 
 #include <float.h>
 #include <math.h>
 
 static inline void four_aec_projection_cmac_scalar(
     Complex* acc, const Complex* weights, const Complex* input, int n) {
-    int i;
-    for (i = 0; i < n; ++i) {
-        float wr = weights[i].r;
-        float wi = weights[i].i;
-        float xr = input[i].r;
-        float xi = input[i].i;
-        float real = wr * xr - wi * xi;
-        float imag = wr * xi + wi * xr;
-        acc[i].r += real;
-        acc[i].i += imag;
-    }
+    sk_cmac_f32_scalar(acc, weights, input, n);
 }
 
-#if SK_HAVE_NEON
 static inline void four_aec_projection_cmac(
     Complex* acc, const Complex* weights, const Complex* input, int n) {
-    int i = 0;
-    for (; i + 4 <= n; i += 4) {
-        float32x4x2_t w = sk__cquad_load(weights + i);
-        float32x4x2_t x = sk__cquad_load(input + i);
-        float32x4x2_t a = sk__cquad_load(acc + i);
-        float32x4x2_t out;
-        float32x4_t real = vsubq_f32(
-            vmulq_f32(w.val[0], x.val[0]),
-            vmulq_f32(w.val[1], x.val[1]));
-        float32x4_t imag = vaddq_f32(
-            vmulq_f32(w.val[0], x.val[1]),
-            vmulq_f32(w.val[1], x.val[0]));
-        out.val[0] = vaddq_f32(a.val[0], real);
-        out.val[1] = vaddq_f32(a.val[1], imag);
-        sk__cquad_store(acc + i, out);
-    }
-    four_aec_projection_cmac_scalar(
-        acc + i, weights + i, input + i, n - i);
+    sk_cmac_f32(acc, weights, input, n);
 }
-#else
-static inline void four_aec_projection_cmac(
-    Complex* acc, const Complex* weights, const Complex* input, int n) {
-    four_aec_projection_cmac_scalar(acc, weights, input, n);
-}
-#endif
 
+/* out[i] = input[i].r^2 + input[i].i^2, no epsilon: sk_cmag_f32/_scalar of
+ * utility/simd_kernels.h is the same squared magnitude with an eps term
+ * added last; eps=0.0f is bit-exact here because the sum of two squares is
+ * always >= +0.0 (never -0.0), and IEEE754 addition of +0.0 to a value
+ * >= +0.0 does not change its bit pattern (inf/NaN propagate unchanged
+ * too). */
 static inline void four_aec_complex_mag2_scalar(
     float* out, const Complex* input, int n) {
-    int i;
-    for (i = 0; i < n; ++i) {
-        float real = input[i].r;
-        float imag = input[i].i;
-        out[i] = real * real + imag * imag;
-    }
+    sk_cmag_f32_scalar(out, input, n, 0.0f);
 }
 
-#if SK_HAVE_NEON
 static inline void four_aec_complex_mag2(
     float* out, const Complex* input, int n) {
-    int i = 0;
-    for (; i + 4 <= n; i += 4) {
-        float32x4x2_t value = sk__cquad_load(input + i);
-        float32x4_t mag2 = vaddq_f32(
-            vmulq_f32(value.val[0], value.val[0]),
-            vmulq_f32(value.val[1], value.val[1]));
-        vst1q_f32(out + i, mag2);
-    }
-    four_aec_complex_mag2_scalar(out + i, input + i, n - i);
+    sk_cmag_f32(out, input, n, 0.0f);
 }
-#else
-static inline void four_aec_complex_mag2(
-    float* out, const Complex* input, int n) {
-    four_aec_complex_mag2_scalar(out, input, n);
-}
-#endif
 
 /* Rebuild the residual-echo PSD as a complex vector carrying the echo
  * estimate's PHASE and the residual's MAGNITUDE:

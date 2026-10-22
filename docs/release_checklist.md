@@ -2,7 +2,7 @@
 
 This document is the release gate for the repositories below:
 
-- `audio_common`
+- `audiolib`
 - `AEC`
 - `NR`
 - `Audio_ALG`
@@ -52,7 +52,7 @@ numbered gates below, not by stale source-audit notes.
       | constant | site | validated anchor | 16k/256 | 16k/512 | 48k/1024 |
       |---|---|---:|---:|---:|---:|
       | `simple_mu_holdoff = 20` | `aec.c:448`, `orchestrator.py:1332` | 200 ms | 160 ms | 320 ms | 213 ms |
-      | coherence `alpha = 0.05` TC | `aec3_post.c:56`, `config.py:63` | 195 ms | 156 ms | 312 ms | 208 ms |
+      | coherence `alpha = 0.05` TC | `aec_post.c:53`, `config.py:63` | 195 ms | 156 ms | 312 ms | 208 ms |
       | misadjustment `n_hops_target = 2` | `aec.c:1518`, `orchestrator.py:130` | ~16 ms | 16 ms | 32 ms | 21 ms |
       | ERLE window `decay = 0.999` TC | `aec.c:2213`, `orchestrator.py:2137` | ~10 s | 8 s | 16 s | 10.7 s |
       | recent ERLE peak `last 15 hops` | — | 150 ms | 120 ms | 240 ms | 160 ms |
@@ -105,11 +105,11 @@ numbered gates below, not by stale source-audit notes.
       public docstring now requires all three dimensions together, or all
       omitted for the project default.
 
-- [x] **The `hop <= 0` guards in `pbfdkf_init` / `pbfdkf_init_static` lacked
+- [x] **The `hop <= 0` guards in `pbfdkf_init_static` lacked
       regression coverage.** Deleting both left the old suite green,
       because the added CHECKs assert only the return value, which the nested
       `pbfdaf_*` guard supplies independently. The guards are load-bearing:
-      without them `p->is_static = 0` and `memset(p, 0, sizeof(*p))` run before
+      without them `memset(p, 0, sizeof(*p))` runs before
       rejection, breaking the no-write-on-reject contract that the same commit
       published in `pbfdkf.h`. Add a sentinel + memcmp assertion on the
       instance, matching the one that already covers the `sample_rate` case.
@@ -171,8 +171,7 @@ The traditional signal contract is:
 - no transform zero-padding;
 - periodic sqrt-Hann and 50% overlap at downstream STFT/WOLA boundaries;
 - SIMD enabled by default and disabled everywhere through `SIMD=0`;
-- KISS is the reference backend and NE10 is the embedded backend;
-- KISS and NE10 are not required to be bit-exact to each other;
+- NE10 is the only FFT backend (any other `BACKEND` value is rejected at parse time);
 - heap/static and SIMD/scalar paths must satisfy their documented parity
   contract within one backend;
 - static APIs use caller-owned pools and allocate no heap after init;
@@ -231,30 +230,22 @@ the handover documentation, and check them off here.
 - [ ] Public headers compile from a clean external C99 consumer.
 - [ ] Every public API/ABI/layout break has a version bump, migration note,
       and negative compatibility test.
-- [ ] Third-party KISS, NE10, SRP, GSC, and other redistributed code has
+- [ ] Third-party NE10, SRP, GSC, and other redistributed code has
       correct license/source attribution.
 
-## 3. `audio_common` gate
+## 3. `audiolib` gate
 
-Run from `audio_common/`:
+Run from `audiolib/common/`:
 
 ```bash
 make clean
-make BACKEND=kiss SIMD=0 WERROR=1
-make BACKEND=kiss SIMD=0 selftest test_audio_utils test_pool \
-  test_wav test_wav_nr_style test-wav-ubsan test_zero_heap
-
-make BACKEND=kiss SIMD=1 WERROR=1
-make BACKEND=kiss SIMD=1 selftest test_audio_utils test_pool \
-  test_wav test_wav_nr_style test-wav-ubsan test_zero_heap
-
 make BACKEND=ne10 SIMD=0 WERROR=1
 make BACKEND=ne10 SIMD=0 selftest test_audio_utils test_pool \
-  test_wav test_wav_nr_style test_zero_heap
+  test_wav test_wav_nr_style test-wav-ubsan test_zero_heap
 
 make BACKEND=ne10 SIMD=1 WERROR=1
 make BACKEND=ne10 SIMD=1 selftest test_audio_utils test_pool \
-  test_wav test_wav_nr_style test_zero_heap
+  test_wav test_wav_nr_style test-wav-ubsan test_zero_heap
 
 make test_ne10_force_c
 ```
@@ -271,10 +262,8 @@ Pass conditions:
 
 ## 4. AEC automated gate
 
-Run each target with all four build combinations:
+Run each target with both SIMD settings:
 
-- `BACKEND=kiss SIMD=0`
-- `BACKEND=kiss SIMD=1`
 - `BACKEND=ne10 SIMD=0`
 - `BACKEND=ne10 SIMD=1`
 
@@ -282,18 +271,18 @@ Use `WERROR=1` throughout. From `AEC/c_impl/`:
 
 ```bash
 make clean
-make BACKEND=<backend> SIMD=<0-or-1> WERROR=1
-make BACKEND=<backend> SIMD=<0-or-1> WERROR=1 selftest
-make BACKEND=<backend> SIMD=<0-or-1> WERROR=1 test-rate-structural
-make BACKEND=<backend> SIMD=<0-or-1> WERROR=1 test-counter-saturation
-make BACKEND=<backend> SIMD=<0-or-1> WERROR=1 test-delay-reset
-make BACKEND=<backend> SIMD=<0-or-1> WERROR=1 test-config-validation
-make BACKEND=<backend> SIMD=<0-or-1> WERROR=1 test-process-context
-make BACKEND=<backend> SIMD=<0-or-1> WERROR=1 test-shared-far-spec
-make BACKEND=<backend> SIMD=<0-or-1> WERROR=1 test-shared-fft-handle
-make BACKEND=<backend> SIMD=<0-or-1> WERROR=1 test-static-aec
-make BACKEND=<backend> SIMD=<0-or-1> WERROR=1 test-zero-heap
-make BACKEND=<backend> SIMD=<0-or-1> WERROR=1 test-detectors-parity-all
+make BACKEND=ne10 SIMD=<0-or-1> WERROR=1
+make BACKEND=ne10 SIMD=<0-or-1> WERROR=1 selftest
+make BACKEND=ne10 SIMD=<0-or-1> WERROR=1 test-rate-structural
+make BACKEND=ne10 SIMD=<0-or-1> WERROR=1 test-counter-saturation
+make BACKEND=ne10 SIMD=<0-or-1> WERROR=1 test-delay-reset
+make BACKEND=ne10 SIMD=<0-or-1> WERROR=1 test-config-validation
+make BACKEND=ne10 SIMD=<0-or-1> WERROR=1 test-process-context
+make BACKEND=ne10 SIMD=<0-or-1> WERROR=1 test-shared-far-spec
+make BACKEND=ne10 SIMD=<0-or-1> WERROR=1 test-shared-fft-handle
+make BACKEND=ne10 SIMD=<0-or-1> WERROR=1 test-static-aec
+make BACKEND=ne10 SIMD=<0-or-1> WERROR=1 test-zero-heap
+make BACKEND=ne10 SIMD=<0-or-1> WERROR=1 test-detectors-parity-all
 ```
 
 Run the supported Python test suites from `AEC/` using the release Python
@@ -311,7 +300,7 @@ Pass conditions:
       un-retimed constants were never in the inventory. Build the list
       mechanically: grep `c_impl/src/*.c` and `python/modules/*.py` for bare
       float EMA retentions and integer frame counts, subtract everything
-      routed through `aec3_growth_rehop` / `aec3_ms_to_hops` /
+      routed through `aec_growth_rehop` / `aec_ms_to_hops` /
       `growth_rehop` / `ms_to_hops`, and adjudicate the remainder one by one.
 - [ ] Effective-value tests are mutation-tested: reverting any single constant
       to its authored literal, and retiming any constant off the wrong
@@ -385,7 +374,7 @@ with real energy above 8 kHz and cover:
 - [ ] representative device paths.
 
 Report full-band ERLE, AECMOS, SI-SDR/STOI, 8--24 kHz artifact/energy analysis,
-clipping/non-finite counts, KISS/NE10 behavior, and human listening. Do not
+clipping/non-finite counts, NE10 behavior, and human listening. Do not
 remove the AEC RC marker without this verdict.
 
 ## 6. NR automated gate
@@ -396,11 +385,11 @@ From `NR/`:
 python3 -m pytest -q tests
 ```
 
-From `NR/c_impl/`, run all four KISS/NE10 and SIMD 0/1 combinations:
+From `NR/c_impl/`, run both SIMD 0/1 combinations:
 
 ```bash
 make clean
-make BACKEND=<backend> SIMD=<0-or-1> WERROR=1 \
+make BACKEND=ne10 SIMD=<0-or-1> WERROR=1 \
   test test-config test-config-parity parity
 ```
 
@@ -451,11 +440,11 @@ non-stationary noise, music, and competing speech cases.
 
 ## 8. Mono pipeline gate
 
-From `Audio_ALG/pipelines/`, run all KISS/NE10 and SIMD 0/1 combinations:
+From `Audio_ALG/pipelines/`, run both SIMD 0/1 combinations:
 
 ```bash
 make clean-all
-make BACKEND=<backend> SIMD=<0-or-1> WERROR=1 test
+make BACKEND=ne10 SIMD=<0-or-1> WERROR=1 test
 ```
 
 From `Audio_ALG/`:
@@ -483,7 +472,7 @@ product-rate host, and the mono wrapper that hosts the conventional pipeline
 with `enable_nr=0` / `enable_res=1`:
 
 ```bash
-make -C pipelines BACKEND=<backend> SIMD=<0-or-1> WERROR=1 test
+make -C pipelines BACKEND=ne10 SIMD=<0-or-1> WERROR=1 test
 # adds: test_dfn_res_stage, test_dfn_rate_bridge, test_audio_pipeline_dfn,
 #       mono_aec_dfn_res (board skeleton at its 16 kHz default, also run with
 #       --delay-num-filters 1 --cng --atten-lim 12, and with
@@ -525,12 +514,12 @@ Pass conditions:
 
 ## 9. Four-channel pipeline gate
 
-From `Audio_ALG/pipelines/4ch_aec_bf_nr_res/`, run all KISS/NE10 and SIMD 0/1
+From `Audio_ALG/pipelines/4ch_aec_bf_nr_res/`, run both SIMD 0/1
 combinations:
 
 ```bash
 make clean-all
-make BACKEND=<backend> SIMD=<0-or-1> WERROR=1 test
+make BACKEND=ne10 SIMD=<0-or-1> WERROR=1 test
 ```
 
 From `Audio_ALG/`:
@@ -559,7 +548,7 @@ Pass conditions:
 wrapper over the core (`enable_post=1` / `enable_res=1` / `enable_nr=0`):
 
 ```bash
-make -C pipelines/4ch_aec_bf_nr_res BACKEND=<backend> SIMD=<0-or-1> WERROR=1 test
+make -C pipelines/4ch_aec_bf_nr_res BACKEND=ne10 SIMD=<0-or-1> WERROR=1 test
 # adds: test_4aec_dfn_res, 4ch_aec_bf_dfn_res (board skeleton at its 16 kHz
 #       default, also run with --delay-num-filters 1 --cng --atten-lim 12,
 #       and with --sample-rate 48000)
@@ -852,10 +841,10 @@ After all required gates pass:
 6. Publish in dependency order:
 
    ```text
-   audio_common -> AEC -> NR -> Audio_ALG
+   audiolib -> AEC -> NR -> Audio_ALG
    ```
 
-7. Run `make publish` for the applicable KISS and NE10 deliverables.
+7. Run `make publish` for the applicable NE10 deliverables.
 8. Verify immutable artifacts, manifest, attestation, backend symbols,
    republish byte verification, and the `current` symlink.
 9. Confirm Audio_ALG pins the exact published AEC and NR commits.
@@ -883,7 +872,7 @@ quality scores are explicitly outside this source/framework release gate.
 ## Appendix A. Known-good automated counts
 
 Reference values measured from the four-repo working
-tree, KISS backend, SIMD=1, macOS, `SE/.venv` Python. Re-measure and re-record these
+tree, KISS backend (measured before that backend was removed; not yet re-recorded on NE10), SIMD=1, macOS, `SE/.venv` Python. Re-measure and re-record these
 whenever the tree moves — a stale reference count silently converts a real
 regression into a "matches the doc" pass. A count that **drops** is a
 regression; a count that
@@ -898,7 +887,7 @@ is routinely misattributed to a real bug.
 | `AEC` `make test-config-validation` | 404 |
 | `AEC` `make test-delay-reset` | 16 |
 | `AEC` `make test-delay-backward-quarantine` | 22 |
-| `AEC` `make test-aec-res` | 264 |
+| `AEC` `make test-aec-res` | 225 |
 | `AEC` `make test-linear-context` | 201 |
 | `AEC` `python3 -m pytest python/tests` | 308 |
 | `NR` / `Audio_ALG/lib/nr` `python3 -m pytest python/tests` | 76 |
@@ -937,7 +926,7 @@ their own directory before importing, as the projects' tests do, and
 combined row, not just the per-package rows, before using these as a gate.
 
 C-side `make test` targets that print `PASS:` markers rather than a count
-(KISS backend, `make clean` first, `^PASS:` lines counted):
+(KISS backend, measured before it was removed and not yet re-recorded on NE10; `make clean` first, `^PASS:` lines counted):
 `pipelines` (all applications) 306, `pipelines/mono_aec_nr_res` 136,
 `pipelines/mono_alignulcnet` 162 (the same count on the 16 kHz and the
 `ULCNET_GRID=48k` build), `pipelines/4ch_aec_bf_nr_res` 543 (one-stop gate; also
@@ -952,7 +941,7 @@ Pass/fail-only targets (no count): `AEC` `selftest`, `test-counter-saturation`,
 `test-process-context`, `test-shared-far-spec`, `test-shared-fft-handle`,
 `test-static-aec` (needs the doubletalk blind-test wav pair, overridable with
 `TEST_STATIC_MIC` / `TEST_STATIC_REF`), `test-zero-heap`,
-`test-detectors-parity-all`; `audio_common` `selftest` (includes `test_stft` and
+`test-detectors-parity-all`; `audiolib` `selftest` (includes `test_stft` and
 `test_stft_guard`), `test_audio_utils`, `test_pool`, `test_wav`,
 `test_wav_nr_style`, `test_zero_heap`, `test_ne10_force_c`; `NR/c_impl`
 `test-config`, `test-reconfigure`, `test-noise-restart`, `test-scene-change`,
@@ -988,7 +977,7 @@ already produced a wrong verdict in this project at least once.
 
 - Submodule pins are updated by committing the standalone repo first, then
   fetching that commit into `Audio_ALG/lib/<name>` and committing the new
-  gitlink. Publish order is `audio_common -> AEC -> NR -> Audio_ALG` (§14).
+  gitlink. Publish order is `audiolib -> AEC -> NR -> Audio_ALG` (§14).
 - After any file moves, stage with `git add -A` and then **review the
   rename detection** (`git diff --cached --name-status -M`). Before committing,
   confirm every deletion either has a counterpart at a new path or is

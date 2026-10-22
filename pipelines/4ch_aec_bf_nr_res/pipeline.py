@@ -1,11 +1,12 @@
 """Shared-delay, four-linear-filter AEC front end for microphone arrays.
 
-This Python reference deliberately does not implement SRP-PHAT or GSC.  Its
+This Python reference deliberately does not implement SRP-PHAT or the
+beamformer (bf).  Its
 production API is split at that ownership boundary, with the stage names of the
 C core (four_aec_front_process / four_aec_fuse)::
 
     front = pipeline.front_process(mics, render)
-    bf = external_srp_gsc(front.linear_channels)
+    bf = external_srp_bf(front.linear_channels)
     post = pipeline.fuse(front, bf)     # projection + post-beam RES gain
     spec = post.spec_frame()            # the SeSpecFrame the later stages read
 
@@ -51,7 +52,7 @@ _N_CHANNELS = 4
 # estimate within 16 of the held candidate, and ``pending_delay_ttl = 3`` hops
 # of life for that candidate).  Same values and same spelling as the C core's
 # FOUR_DELAY_CHANGE_MIN_SAMPLES / _CONFIRM_SAMPLES / _CANDIDATE_TTL
-# (4aec_nr_res_internal.h), against an estimate from the same DelayAec3 on the
+# (4aec_nr_res_internal.h), against an estimate from the same DelayAec on the
 # same grid.
 _DELAY_CHANGE_MIN_SAMPLES = 32
 _DELAY_CHANGE_CONFIRM_SAMPLES = 16
@@ -90,7 +91,7 @@ class SharedMatchedDelayEstimator:
 
     Anti-alias status: this wrapper does no decimation of its own. The inner
     estimator owns the 48 kHz anti-alias + decimate-by-3 sidechain, the same
-    way the mono AEC's C port does (``delay_aec3.c``'s ``DaResample48``
+    way the mono AEC's C port does (``delay_aec.c``'s ``DaResample48``
     sidechain) and Python's own ``EchoPathDelayEstimator`` (its
     ``_Resample48`` sidechain).
 
@@ -351,7 +352,7 @@ class BeamformerFrame:
 
 @dataclass(frozen=True)
 class FrontFrame:
-    """Owned handoff from four linear AEC lanes to external SRP-PHAT/GSC.
+    """Owned handoff from four linear AEC lanes to external SRP-PHAT/BF.
 
     ``linear_channels`` is ``[hop, 4]``.  ``contexts`` and ``aligned_render``
     are snapshots: the caller may queue frames while the four adaptive filters
@@ -408,6 +409,16 @@ class FourChannelAecConfig:
     capture_proxy_channel: int = 0
     max_delay_ms: float = 1024.0
     aec_mode: AecMode = AecMode.PBFDKF
+    # Strength preset the shared post-beam suppressor is BUILT with (mirrors
+    # FourAecNrResConfig's own aec_preset field, right after this dataclass's
+    # own filter-algorithm mode). Seeds PostBeamResidualSuppressor's far-
+    # active floor, DT floor, AND split-floor-enabled gate at __init__/
+    # reset() time -- the same three fields set_aec_preset() retargets at
+    # runtime, so a fresh/reset()-rebuilt instance matches one built
+    # balanced and then immediately retargeted. set_aec_preset("no_floor")
+    # on an already-running pipeline flips min_gain_split_floor_enabled
+    # live, via SuppressionGain.set_split_floor_enabled().
+    aec_preset: AecPreset = AecPreset.BALANCED
     # Backward-jump quarantine on a shared-delay CHANGE. DEFAULT OFF, so the
     # reference path is unchanged. Mirrors
     # FourAecNrResConfig::delay_backward_quarantine_enabled / _s: a shared
@@ -552,8 +563,18 @@ def _fuse_contexts(
     far_specs = np.stack(
         [np.asarray(c.far_spec, dtype=np.complex64) for c in contexts]
     )
-    if not np.allclose(far_specs, far_specs[0:1], rtol=1e-6, atol=1e-7):
-        raise ValueError("linear AEC lanes do not share one far-end spectrum")
+    # The lanes normally agree bit-for-bit (same aligned_ref, same FFT), but a
+    # mixed warm/soft-realign hop is a legitimate exception, not a caller
+    # error: aec_reset_filter_for_realign() zeros a soft-reset lane's
+    # far_buffer OLA history (lib/aec's own soft-path design intent -- see
+    # aec.c's aec_reset_filter_for_realign / aec_apply_external_realign),
+    # while a lane that went warm on the same hop keeps its real history, so
+    # the two lanes' far-end FFTs of the identical aligned_ref genuinely
+    # differ for that one hop. There is still exactly one fused context to
+    # return downstream (the single post-beam RES stage needs one X), so it
+    # carries lane 0's own far_spec; the other three lanes are untouched by
+    # this function and keep their own, individually-correct, unfused
+    # far_spec for whatever they still do with it upstream of this fuse.
     far_spec = far_specs[0]
 
     r2 = np.stack([np.asarray(c.r2, dtype=np.float32) for c in contexts])
@@ -639,19 +660,45 @@ class PostBeamResidualSuppressor:
     explicit parity limitation, not a reason to reuse one microphone's gain.
     """
 
-    def __init__(self, sample_rate: int, hop_size: int, n_freqs: int) -> None:
+    def __init__(
+        self,
+        sample_rate: int,
+        hop_size: int,
+        n_freqs: int,
+        preset: Optional[AecPreset] = None,
+    ) -> None:
         self.sample_rate = int(sample_rate)
         self.hop_size = int(hop_size)
         self.n_freqs = int(n_freqs)
         self.instance_count = 1
         self._state = _PostBeamAecState()
         self._initial_state = True
-        # Chosen far-active floor, or None to take AecConfig's default. Stored
-        # because _build_gain() -- which reset() re-runs -- constructs a fresh
-        # AecConfig every time; without this a runtime strength change would be
-        # silently reverted by the next reset. Mirrors the C core keeping its
-        # own post_sg_cfg copy in step with post_sg.cfg for the same reason.
-        self._split_floor_far_active_db = None
+        # Three sentinels -- None means "take AecConfig's own dataclass
+        # default". When a preset is given, all three (far-active floor, DT
+        # floor, split-floor gate) are seeded together from one
+        # AecConfig.from_preset(preset) call, mirroring the C core's
+        # construction path (derive_dims_and_configs() -> se_derive() ->
+        # aec_config_from_preset(), which applies both floor fields from the
+        # preset before aec_res_init() runs).
+        #
+        # Stored, not just applied once: _build_gain() (which reset()
+        # re-runs) constructs a fresh AecConfig every time, so the seed must
+        # be re-applied on every rebuild, same as set_preset()'s far-active/
+        # DT/gate overrides below.
+        #
+        # split_floor_enabled is retargetable at runtime too: set_preset()
+        # below also calls SuppressionGain.set_split_floor_enabled(), so an
+        # already-running instance can switch into/out of NO_FLOOR, not just
+        # a fresh/reset()-rebuilt one.
+        if preset is not None:
+            preset_cfg = AecConfig.from_preset(preset)
+            self._split_floor_far_active_db = preset_cfg.min_gain_floor_far_active_db
+            self._split_floor_dt_db = preset_cfg.min_gain_floor_dt_db
+            self._split_floor_enabled = preset_cfg.min_gain_split_floor_enabled
+        else:
+            self._split_floor_far_active_db = None
+            self._split_floor_dt_db = None
+            self._split_floor_enabled = None
         self._build_gain()
 
     def _build_gain(self) -> None:
@@ -664,6 +711,16 @@ class PostBeamResidualSuppressor:
             config = replace(
                 config,
                 min_gain_floor_far_active_db=self._split_floor_far_active_db,
+            )
+        if self._split_floor_dt_db is not None:
+            config = replace(
+                config,
+                min_gain_floor_dt_db=self._split_floor_dt_db,
+            )
+        if self._split_floor_enabled is not None:
+            config = replace(
+                config,
+                min_gain_split_floor_enabled=self._split_floor_enabled,
             )
         default_audibility = EchoAudibilityConfig()
         suppressor_config = SuppressorConfig()
@@ -708,7 +765,10 @@ class PostBeamResidualSuppressor:
         This -- not the four lanes -- is what shapes the four-channel output:
         the lanes run with spatial_linear_context and never compute a gain of
         their own, so a preset pushed at them does nothing. Mirrors the C
-        wrapper's audio_pipeline_4ch_set_aec_preset().
+        wrapper's audio_pipeline_4ch_set_aec_preset(), which itself calls
+        aec_res_set_preset(): a three-field retarget (far-active floor, DT
+        floor, split-floor-enabled gate). All four presets, including
+        NO_FLOOR, are switchable at runtime via this path.
 
         The stored value is what a later reset() rebuilds from, so the change
         survives one.
@@ -720,12 +780,22 @@ class PostBeamResidualSuppressor:
             preset = AecPreset(preset)
         except (TypeError, ValueError):
             raise ValueError(f"unknown AEC preset: {preset!r}")
-        db = AecConfig.from_preset(preset).min_gain_floor_far_active_db
-        # Validate through the suppressor first: it raises without writing, so
-        # a rejected call cannot leave the stored value and the live floor
-        # disagreeing.
+        preset_cfg = AecConfig.from_preset(preset)
+        db = preset_cfg.min_gain_floor_far_active_db
+        dt_db = preset_cfg.min_gain_floor_dt_db
+        enabled = preset_cfg.min_gain_split_floor_enabled
+        # Validate through the suppressor first: the two dB setters raise
+        # without writing, so a rejected call cannot leave the stored value
+        # and the live floor disagreeing. The gate setter has nothing to
+        # validate (any bool coerces, mirroring set_initial_state's own
+        # contract), so it runs last, after both dB setters have had a
+        # chance to raise -- same ordering as orchestrator.py's set_preset().
         self._gain.set_split_floor_far_active_db(db, ramp_ms)
         self._split_floor_far_active_db = db
+        self._gain.set_split_floor_dt_db(dt_db)
+        self._split_floor_dt_db = dt_db
+        self._gain.set_split_floor_enabled(enabled)
+        self._split_floor_enabled = enabled
 
     def reset(self) -> None:
         self._state = _PostBeamAecState()
@@ -777,7 +847,7 @@ class PostBeamResidualSuppressor:
 # ---------------------------------------------------------------------------
 
 class FourChannelAecPipeline:
-    """Pre/post shell around an externally owned SRP-PHAT/GSC stage."""
+    """Pre/post shell around an externally owned SRP-PHAT/BF stage."""
 
     def __init__(
         self,
@@ -823,7 +893,7 @@ class FourChannelAecPipeline:
         # process/process_signal helpers used by tests and offline fixtures.
         self._beamformer = beamformer
         self._post_beam_res = PostBeamResidualSuppressor(
-            self.config.sample_rate, hop, self.n_freqs
+            self.config.sample_rate, hop, self.n_freqs, self.config.aec_preset
         )
         self._last_delay = 0
         self._generation = 0
@@ -995,7 +1065,8 @@ class FourChannelAecPipeline:
     ) -> FourChannelFrame:
         """Resume with one external mono/weight result and calculate mono RES.
 
-        This method does not run SRP-PHAT or update GSC coefficients.  It only
+        This method does not run SRP-PHAT or update the beamformer's
+        coefficients.  It only
         reuses the supplied effective weights to project AEC context, then runs
         the one stateful post-beam residual-gain calculator.  Results must be
         returned in order because that RES state is temporal.
@@ -1035,7 +1106,7 @@ class FourChannelAecPipeline:
         if self._beamformer is None:
             raise RuntimeError(
                 "no beamformer is configured: call front_process(), "
-                "run the external SRP-PHAT/GSC, then call "
+                "run the external SRP-PHAT/BF, then call "
                 "fuse()"
             )
         pre = self.front_process(microphones, render)

@@ -1,11 +1,11 @@
-/* Four-channel AEC -> external BF/GSC -> RES -> DFN2 pipeline.
+/* Four-channel AEC -> external beamformer (bf) -> RES -> DFN2 pipeline.
  *
  * The conventional four-channel core on the product's own grid (16 or
  * 48 kHz, the core's rates; 16 kHz by default) with its post-beam MMSE-LSA
  * replaced by DFN2.
  * The external beamformer seam is the FourAecNrRes front end's: front_process()
  * exposes the four linear lanes, then process() accepts the effective weights
- * and the optional trusted GSC spectrum, fuses the lanes into the beamformed
+ * and the optional trusted BF spectrum, fuses the lanes into the beamformed
  * error E, and forms the post-RES spectrum P = E * G_res (+ comfort noise when
  * enabled) from this pipeline's own post-beam RES. At 48 kHz the shared
  * dfn_res_stage is applied to P directly and this pipeline's own synthesis
@@ -34,7 +34,7 @@ extern "C" {
 #define FOUR_AEC_DFN_RES_DESCRIPTOR_VERSION 1u
 /* Carve layout version. Any change of pool size, carve order or descriptor
  * content bumps it, including a change of the composed core or stage pool. */
-#define FOUR_AEC_DFN_RES_LAYOUT_VERSION 4u
+#define FOUR_AEC_DFN_RES_LAYOUT_VERSION 5u
 
 /* front_end must carry enable_post=1, enable_res=1, enable_nr=0; its
  * enable_cng is the core's own comfort-noise fill, which lands in the
@@ -75,7 +75,7 @@ FourAecDfnRes *four_aec_dfn_res_create(const FourAecDfnResConfig *cfg);
 void four_aec_dfn_res_destroy(FourAecDfnRes *p);
 void four_aec_dfn_res_reset(FourAecDfnRes *p);
 
-/* One hop around the external SRP-PHAT/GSC. front_process() is
+/* One hop around the external SRP-PHAT/BF. front_process() is
  * four_aec_front_process() on the front end: it exposes the four linear lanes
  * (FourAecFront.linear_spectra). The beamformer then supplies the effective
  * weights and, optionally, the beamformed error from the same call (NULL

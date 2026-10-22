@@ -1,4 +1,4 @@
-"""Python twin of ``audio_common/src/audio_resampler.c``.
+"""Python twin of ``audiolib/common/src/audio_resampler.c``.
 
 The house resampler is a stateful rational polyphase FIR: Blackman-windowed
 sinc, ``AUDIO_RESAMPLER_HALF_TAPS_PER_RATIO = 16`` taps per unit of ratio,
@@ -173,7 +173,7 @@ class CResampler:
             import sys
             import tempfile
             here = os.path.dirname(os.path.abspath(__file__))
-            ac = os.path.join(os.path.dirname(os.path.dirname(here)), 'audio_common')
+            ac = os.path.join(os.path.dirname(os.path.dirname(here)), 'audiolib', 'common')
             source = os.path.join(ac, 'src', 'audio_resampler.c')
             tag = hashlib.sha1(open(source, 'rb').read()).hexdigest()[:12]
             work = os.path.join(tempfile.gettempdir(), 'audio_alg_resampler_' + tag)
@@ -185,7 +185,7 @@ class CResampler:
                 subprocess.run(
                     [cc, shared, '-fPIC', '-O2', '-std=c11', '-ffp-contract=off',
                      '-fno-math-errno', '-DSIMD_KERNELS_FORCE_SCALAR',
-                     '-I', os.path.join(ac, 'include'), source, '-lm', '-o', library],
+                     '-I', os.path.join(ac, 'include'), '-I', ac, source, '-lm', '-o', library],
                     check=True, capture_output=True)
             lib = ctypes.CDLL(library)
             fp = ctypes.POINTER(ctypes.c_float)

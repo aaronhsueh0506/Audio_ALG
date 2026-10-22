@@ -1,3 +1,4 @@
+#define _POSIX_C_SOURCE 200809L
 /* C pre/post-processing contract test. */
 #include <math.h>
 #include <stddef.h>
@@ -9,6 +10,10 @@
 #include "DeepFilterNet2/dfn2_process.h"
 #include "DeepFilterNet2/dfn2_model_io.h"
 #include "GTCRN/gtcrn_process.h"
+
+#ifndef M_PI
+#define M_PI 3.14159265358979323846
+#endif
 
 #define CHECK(condition, message) do {                                      \
     if (!(condition)) {                                                     \
@@ -253,7 +258,7 @@ static int test_dfn2_model_io(void)
             for (int bin = 0; bin < DFN2_DF_BINS; ++bin)
                 spec[channel][bin] =
                     (float)(1000 * frame + 100 * channel + bin);
-        CHECK(dfn2_model_io_push_features(&state, erb, spec) == (frame != 0),
+        CHECK(dfn2_model_io_push_features(&state, erb, (const float (*)[DFN2_DF_BINS])spec) == (frame != 0),
               "DFN2 model window warms up for one lookahead frame");
     }
     CHECK(state.erb_window[0][7] == 7.0f &&
@@ -446,7 +451,7 @@ static int test_gtcrn(uint64_t* digest)
             input[i] = signal_sample((int64_t)frame * GTCRN_HOP_LEN + i,
                                      GTCRN_SR);
         gtcrn_analysis(&state, input, spectrum);
-        gtcrn_synthesis(&state, spectrum, output);
+        gtcrn_synthesis(&state, (const float (*)[2])spectrum, output);
         CHECK(all_finite(&spectrum[0][0], 2 * GTCRN_N_BINS),
               "GTCRN finite spectrum");
         CHECK(all_finite(output, GTCRN_HOP_LEN), "GTCRN finite WOLA output");
@@ -527,7 +532,7 @@ static int test_gtcrn_model_state(void)
         memset(spec_in, 0, sizeof(spec_in));
         spec_in[10][0] = 3.0f; spec_in[10][1] = 4.0f;   /* low: passthrough */
         spec_in[GTCRN_MODEL_ERB_KEPT + 35][0] = 2.0f;   /* one high bin     */
-        gtcrn_model_input(spec_in, &fwd[0][0], mag, re_b, im_b);
+        gtcrn_model_input((const float (*)[2])spec_in, &fwd[0][0], mag, re_b, im_b);
         CHECK(fabsf(mag[10] - 5.0f) < 1e-6f &&
               re_b[10] == 3.0f && im_b[10] == 4.0f &&
               mag[0] == sqrtf(1e-12f),
@@ -545,7 +550,8 @@ static int test_gtcrn_model_state(void)
         memset(mask_erb, 0, sizeof(mask_erb));
         mask_erb[10][0] = 1.0f;                          /* unity low mask  */
         mask_erb[GTCRN_MODEL_ERB_KEPT + 7][0] = 0.5f;    /* one high band   */
-        gtcrn_model_output(mask_erb, &inv[0][0], spec_in, enhanced);
+        gtcrn_model_output((const float (*)[2])mask_erb, &inv[0][0],
+                           (const float (*)[2])spec_in, enhanced);
         CHECK(enhanced[10][0] == 3.0f && enhanced[10][1] == 4.0f,
               "GTCRN host output: unity low-band CRM reproduces the "
               "spectrum bin");

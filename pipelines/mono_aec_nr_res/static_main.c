@@ -6,8 +6,8 @@
  * which is linkable on its own (see pipelines/README.md "Board
  * Integration"). This file keeps exactly what a CLI is actually
  * responsible for: argv parsing, WAV I/O,
- * the explicit caller-owned-pool dance (`malloc` here standing in for a
- * platform allocator — see audio_pipeline.h's audio_pipeline_init doc), and
+ * the aligned caller-owned-pool allocation (see audio_pipeline.h's
+ * audio_pipeline_init doc), and
  * the `--debug` / `DUMP_CTX` / `--print-mem-size` diagnostics.
  *
  * `aec_nr_pipeline_static out.wav` must be BYTE-IDENTICAL to
@@ -18,6 +18,7 @@
  *
  * Build:  make -C pipelines            (builds both binaries)
  * Usage:
+ *   AEC preset: 0=mild, 1=balanced, 2=aggressive, 3=no_floor; names also accepted.
  *   ./aec_nr_pipeline_static <mic.wav> <ref.wav> <out.wav> [aec-preset]
  *                     [--nr-preset mild|moderate|balanced|aggressive] [--aec-only] [--no-nr] [--no-res] [--legacy-amin]
  *                     [--debug]
@@ -40,9 +41,16 @@
 
 /* ------------------------------------------------------------------ */
 
+/* CLI aliases only; unknown names retain the historical balanced fallback. */
 static AecPreset parse_preset(const char* s) {
-    if (strcmp(s, "mild") == 0)     return AEC_PRESET_MILD;
-    if (strcmp(s, "aggressive") == 0) return AEC_PRESET_AGGRESSIVE;
+    if (strcmp(s, "mild") == 0 || strcmp(s, "0") == 0)
+        return AEC_PRESET_MILD;
+    if (strcmp(s, "balanced") == 0 || strcmp(s, "1") == 0)
+        return AEC_PRESET_BALANCED;
+    if (strcmp(s, "aggressive") == 0 || strcmp(s, "2") == 0)
+        return AEC_PRESET_AGGRESSIVE;
+    if (strcmp(s, "no_floor") == 0 || strcmp(s, "3") == 0)
+        return AEC_PRESET_NO_FLOOR;
     return AEC_PRESET_BALANCED;
 }
 
@@ -50,6 +58,7 @@ static const char* preset_name(AecPreset p) {
     switch (p) {
         case AEC_PRESET_MILD:     return "mild";
         case AEC_PRESET_AGGRESSIVE: return "aggressive";
+        case AEC_PRESET_NO_FLOOR:   return "no_floor";
         default:                     return "balanced";
     }
 }
@@ -107,7 +116,6 @@ static void print_debug_status(const AudioPipeline* pipe, int aec_only, float se
  * backend_id doc). */
 static const char* backend_id_name(uint32_t backend_id) {
     switch (backend_id) {
-        case AUDIO_PIPELINE_BACKEND_KISS: return "kiss";
         case AUDIO_PIPELINE_BACKEND_NE10: return "ne10";
         default:                          return "unknown";
     }
@@ -258,8 +266,9 @@ int main(int argc, char* argv[]) {
             fprintf(stderr, "Error: invalid config (sample_rate=%d?)\n", sample_rate);
             return 1;
         }
-        void* pool = malloc((size_t)req.bytes);   /* host stand-in for a platform memory block */
-        if (!pool) { fprintf(stderr, "Error: malloc failed (%llu bytes)\n", (unsigned long long)req.bytes); return 1; }
+        void* pool = NULL;   /* host stand-in for a platform memory block */
+        if (posix_memalign(&pool, req.alignment, (size_t)req.bytes) != 0) pool = NULL;
+        if (!pool) { fprintf(stderr, "Error: aligned allocation failed (%llu bytes)\n", (unsigned long long)req.bytes); return 1; }
         if (((uintptr_t)pool) % req.alignment != 0) {
             fprintf(stderr, "Error: pool not %u-byte aligned (%p)\n", req.alignment, pool);
             free(pool); return 1;
@@ -277,7 +286,8 @@ int main(int argc, char* argv[]) {
     if (argc < 4) {
         printf("Usage: %s <mic.wav> <ref.wav> <out.wav> [aec-preset] "
                "[--nr-preset mild|moderate|balanced|aggressive] [--aec-only] [--no-nr] [--no-res] [--legacy-amin] "
-               "[--fft-size 256|512|1024] [--debug] [--timing]\n",
+               "[--fft-size 256|512|1024] [--debug] [--timing]\n"
+               "AEC preset: 0=mild, 1=balanced, 2=aggressive, 3=no_floor; names also accepted.\n",
                argv[0]);
         printf("       %s --print-mem-size [preset] [--nr-preset ...] [--aec-only] [--no-nr] [--no-res] "
                "[--sample-rate <hz>] [--fft-size <n>]\n", argv[0]);
@@ -368,8 +378,9 @@ int main(int argc, char* argv[]) {
         wav_close_read(mic_r); wav_close_read(ref_r); return 1;
     }
 
-    void* pool = malloc((size_t)req.bytes);
-    if (!pool) { fprintf(stderr, "Error: malloc failed (%llu bytes)\n", (unsigned long long)req.bytes); return 1; }
+    void* pool = NULL;
+    if (posix_memalign(&pool, req.alignment, (size_t)req.bytes) != 0) pool = NULL;
+    if (!pool) { fprintf(stderr, "Error: aligned allocation failed (%llu bytes)\n", (unsigned long long)req.bytes); return 1; }
     if (((uintptr_t)pool) % req.alignment != 0) {
         /* ALIGN16 contract (mem_align.h): don't rely on allocator luck. */
         fprintf(stderr, "Error: pool not %u-byte aligned (%p)\n", req.alignment, pool);

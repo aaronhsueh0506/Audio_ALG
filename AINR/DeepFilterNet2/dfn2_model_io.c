@@ -3,7 +3,7 @@
 #include <math.h>
 #include <string.h>
 
-#include "simd_kernel_nn.h"
+#include "utility/simd_kernel_nn.h"
 
 void dfn2_model_io_init(DFN2ModelIOState *state)
 {

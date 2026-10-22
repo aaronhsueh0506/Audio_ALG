@@ -4,9 +4,9 @@
 #include <stdlib.h>
 #include <string.h>
 
-#include "fast_math.h"
-#include "mem_align.h"
-#include "simd_kernels.h"
+#include "utility/fast_math.h"
+#include "utility/mem_align.h"
+#include "utility/simd_kernels.h"
 
 struct NrGain {
     float gain;
@@ -50,12 +50,6 @@ NrGain* nr_gain_init(void* mem, size_t mem_size)
     ng->gain = 1.0f;
     ng->owned_heap = NULL;   /* caller owns it */
     return ng;
-}
-
-void nr_gain_reset(NrGain* ng)
-{
-    if (!ng) return;
-    ng->gain = 1.0f;
 }
 
 float nr_gain_process(NrGain* ng,

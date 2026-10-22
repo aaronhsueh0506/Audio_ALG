@@ -1,5 +1,20 @@
 # AINR
 
+## ARM target selection
+
+C deployment supports both ARM EABI32 and AArch64 builds. The target compiler's
+predefined macros select the path: AArch64 uses the guarded NEON model kernels;
+ARM32 uses their existing scalar implementations. `SIMD=0` still forces scalar.
+The shared FFT independently selects its available target implementation; select
+the board compiler and ABI flags rather than editing source guards. Signal grids,
+model state tensors and latency do not change with pointer width.
+
+Public memory descriptors remain 32 bytes. Their build hashes add an ILP32 token
+on 32-bit targets and preserve the existing hashes on 64-bit targets. Re-query
+requirements for the target build; `_init_ex` rejects a descriptor from the other
+ABI before touching the supplied pool.
+
+
 Standalone neural speech-enhancement models. AINR datasets contain noisy/clean
 pairs and do not include the AIAEC echo-stem contract.
 
@@ -7,14 +22,16 @@ pairs and do not include the AIAEC echo-stem contract.
 
 | Directory | Rate / grid | Role | Checkpoint contract |
 |---|---|---|---|
-| `RNNoise-ERB` | 16 kHz, 512/512/256 | compact ERB recurrent suppressor | model-specific |
+| `RNNoise-ERB` | 16 kHz, 512/512/256 | compact ERB recurrent suppressor | audiolib AcStft/AcIstft |
 | `GTCRN` | 16 kHz, 512/512/256 | GTCRN baseline | model-specific |
 | `DeepFilterNet2` | 48 kHz, 1024/1024/512 | DFN2 cascade + learned alpha | `MODEL_VERSION` v6 |
+| `DeepFilterNet3` | 48 kHz, 1024/1024/512 | DFN3 raw-low DF / high ERB split | `MODEL_VERSION` v5, feature v5 |
 
 `DeepFilterNet2`'s final composition is a cascade:
 
 ```text
 DFN2: full-band ERB mask → masked low-band DF → alpha blend
+DFN3: raw low-band DF + high-band ERB mask → concatenate
 ```
 
 Do not force-load a checkpoint from another composition into DFN2. The
@@ -32,7 +49,7 @@ a freshly trained compatible checkpoint.
 `dataset_gen/` is the single noisy/clean augmentation implementation:
 
 - run at 16 kHz for RNNoise-ERB and GTCRN;
-- run at 48 kHz for DeepFilterNet2;
+- run at 48 kHz for DeepFilterNet2 and DeepFilterNet3;
 - keep separate output directories for separate sample-rate runs.
 
 The generator applies the same waveform transformation to noisy and target
@@ -47,10 +64,19 @@ experiment. If it suppresses steady low-frequency speech, compare the output
 composition, target/loss behavior, normalization state, and low-frequency
 training coverage before attributing the result to the shared dataset.
 
+`DeepFilterNet3` restores the independent band-split comparison branch. Both
+DFN configs share the signal grid, feature arithmetic, training recipe and
+dataset seed/split. With mask/DF lookahead 1/1, DFN2 waits two hops and DFN3
+one hop; including identity-path WOLA the measured shifts are 1536 and 1024
+samples respectively. See `tests/test_dfn_comparison.py` and the DFN3 README.
+Historical model-v5 / feature-v3 weights are incompatible with both current
+feature-v5 implementations. Keep outputs in each model's own directory.
+
 Detailed contracts:
 
 - [`DeepFilterNet2/README.md`](DeepFilterNet2/README.md)
 - [`DeepFilterNet2/UPSTREAM_ALIGNMENT.md`](DeepFilterNet2/UPSTREAM_ALIGNMENT.md)
+- [`DeepFilterNet3/README.md`](DeepFilterNet3/README.md)
 
 ## Typical commands
 
@@ -132,21 +158,22 @@ smallest `max|w|` any healthy tensor starts at (3.8e-02).
 
 ## C pre/post-processing
 
-RNNoise-ERB, GTCRN, and DeepFilterNet2 provide streaming C analysis/synthesis
+RNNoise-ERB, GTCRN, DeepFilterNet2 and DeepFilterNet3 provide streaming C analysis/synthesis
 code; the neural inference between those two boundaries is left to the target
 accelerator. The production default enables AArch64 NEON.
 Use the same switch as the conventional stack to build the scalar reference:
 
 ```bash
-make lib                # libainr_prepost.a: DeepFilterNet2 + GTCRN C pre/post code
+make lib                # libainr_prepost.a: DeepFilterNet2 + DeepFilterNet3 + GTCRN
                         # (RNNoise-ERB is built from RNNoise-ERB/ directly, no
                         # archive); outputs are keyed by configuration --
                         # `make print-lib-path` prints the absolute path
 make test-simd          # NEON and forced-scalar digest must match, the
                         # model-local NEON kernels equal their scalar twins,
-                        # and the DFN2/GTCRN chains reproduce their recorded
-                        # digests in both builds (tests/test_nn_golden.c)
-make SIMD=0 test        # scalar-only build
+                        # and the DFN2/GTCRN chains print identical digests in
+                        # both builds (tests/test_nn_chains.c)
+make SIMD=0 test        # scalar-only build, including DFN3 streaming
+python3 -m pytest DeepFilterNet2/tests DeepFilterNet3/tests tests -q
 make -C RNNoise-ERB SIMD=0 test
 ```
 
@@ -157,24 +184,30 @@ integrations must use `dfn2_compose_stream()`: it explicitly pairs a delayed
 network head with the spectrum frame it describes and returns the output frame
 index. DFN2's cascade costs two hops because the future DF source first needs
 its own lookahead mask. The API returns zero during warm-up; callers must not
-send an invalid warm-up frame to synthesis. GTCRN uses the configured
-unnormalised complex `[F,2]` network boundary. All three C implementations
-use zero-padded streaming warm-up (`center=False` semantics), while the offline
-PyTorch `inference.py` entry points (the whole-utterance path) use centered
-STFT framing at clip boundaries.
+send an invalid warm-up frame to synthesis. DFN3 uses its independent
+`dfn3_compose_stream()`/`dfn3_prepost` APIs; its raw-low branch and high-band
+mask need one hop of lookahead, and are aligned to the same output frame. GTCRN uses the configured
+unnormalised complex `[F,2]` network boundary. DeepFilterNet2, DeepFilterNet3
+and GTCRN use zero-padded streaming warm-up (`center=False` semantics), while
+their offline PyTorch whole-utterance inference uses centered STFT framing at
+clip boundaries. RNNoise-ERB uses `center=False` in both Python and C; its C
+analysis reads a full caller-supplied 512-sample frame rather than a hop.
+Its FFT/IFFT/overlap state belongs to caller-owned audiolib `AcStft`/`AcIstft`
+objects, bound with pre/post API layout 2; its GRU/ONNX state layout stays 1.
+See the model README for initialization and memory requirements.
 
-DeepFilterNet2 and GTCRN also provide `export_onnx.py`,
+DeepFilterNet2, DeepFilterNet3 and GTCRN also provide `export_onnx.py`,
 `inference.py calib`, and `export_erb_matrix.py`. Install the optional
 packages in `requirements-export.txt`; the model-specific READMEs define
 whether recurrent state is explicit at the ONNX boundary and whether ERB is
 inside or outside the graph.
 
-RNNoise-ERB, DeepFilterNet2 and GTCRN calibration can emit `bin` or `npz`.
+RNNoise-ERB, DeepFilterNet2, DeepFilterNet3 and GTCRN calibration can emit `bin` or `npz`.
 Every calibration run also exports and parity-checks the ONNX graph the
 tensors bind to (default `<output>.onnx`, override with `--onnx`), from the
 same model instance in the same process, so the two deployment artifacts
 cannot drift apart; `export_onnx.py` remains available for a graph-only
-export. The deployment BIN layout is identical for all three: one subdirectory per
+export. The deployment BIN layout is identical for all four: one subdirectory per
 ONNX input, one zero-padded `<tensor>_0000.bin`, `<tensor>_0001.bin`, ... per invocation, and a
 `manifest.json`. Each file contains one complete graph input tensor, including
 its batch dimension; only the filename index is the calibration-frame axis.
@@ -188,12 +221,13 @@ The active deployment exports are stateless accelerator graphs:
 |---|---:|---|
 | RNNoise-ERB | 3 feature frames -> 1 gain frame | 3 GRU hidden tensors |
 | DeepFilterNet2 | 3 feature frames -> 1 head frame | `h_gru` (1,5,1,256) + 5-frame DF pathway window (1,64,5,96) |
+| DeepFilterNet3 | 3 feature frames -> 1 two-head frame | same state tensor geometry as DFN2, independent layout 9, no alpha output |
 | GTCRN | 1 complex STFT frame | 6 conv windows (1,16,3\|5\|11,33) + `h_tra` (1,6,1,16) + `h_dpgrnn` (1,4,33,8) |
 
 “Stateless” describes the accelerator, not the algorithm. Each state tensor has
 one host buffer owned by the caller.
 
-DeepFilterNet2 and GTCRN state is rank 4 and has the same shape at the graph
+DeepFilterNet2, DeepFilterNet3 and GTCRN state is rank 4 and has the same shape at the graph
 input and at its `*_out` output; the runtime binds both to the same address, so
 the updated state is the next call's input and nothing is copied. A sliding
 window (DFN2 `df_convp_history`, the six GTCRN conv windows) is the full window:

@@ -51,7 +51,7 @@ make test-grids            # build and test BOTH, in separate object dirs
 
 `ULCNET_GRID` reaches only the ULCNet translation units and is folded into the
 pipeline `CFG_SIG`, so the two grids never share an object directory and the
-AEC/NR/audio_common producer archives -- which contain no ULCNet code -- are
+AEC/NR/audiolib/common producer archives -- which contain no ULCNet code -- are
 not rebuilt when the grid changes. Passing the two `-D` flags through
 `EXTRA_CFLAGS` also works but does forward them to those producers, splitting
 their caches for nothing.

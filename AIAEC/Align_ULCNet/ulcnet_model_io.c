@@ -1,6 +1,6 @@
 #include "ulcnet_model_io.h"
 
-#include "simd_kernel_nn.h"
+#include "utility/simd_kernel_nn.h"
 
 #include <math.h>
 #include <stdint.h>
@@ -447,61 +447,6 @@ int ulcnet_model_io_prepare(UlcnetModelIoState *state,
     return 0;
 }
 
-/* 1 when every element of `rows` rows of `width` floats, `stride` floats
- * apart, is finite: skn_all_finite_f32 applied to each row. */
-ULCNET_TWIN int rows_all_finite_scalar(const float *base, size_t rows,
-                                     size_t stride, size_t width) {
-    size_t row;
-    for (row = 0; row < rows; ++row)
-        if (!skn_all_finite_f32_scalar(base + row * stride, width)) return 0;
-    return 1;
-}
-
-#if SK_HAVE_NEON
-/* The same predicate for all rows at once: the largest masked exponent field
- * seen reaches 0x7f800000 only for Inf or NaN. A row's last quad is read again
- * from its end when the width is no multiple of four, which a maximum does not
- * mind. */
-static inline int rows_all_finite_neon(const float *base, size_t rows,
-                                       size_t stride, size_t width) {
-    const uint32x4_t exponent = vdupq_n_u32(0x7f800000u);
-    uint32x4_t a0 = vdupq_n_u32(0u), a1 = a0, a2 = a0, a3 = a0;
-    size_t row, i;
-
-    if (width < 4) return rows_all_finite_scalar(base, rows, stride, width);
-    for (row = 0; row < rows; ++row) {
-        const float *p = base + row * stride;
-        for (i = 0; i + 16 <= width; i += 16) {
-            a0 = vmaxq_u32(a0, vandq_u32(vreinterpretq_u32_f32(
-                vld1q_f32(p + i)), exponent));
-            a1 = vmaxq_u32(a1, vandq_u32(vreinterpretq_u32_f32(
-                vld1q_f32(p + i + 4)), exponent));
-            a2 = vmaxq_u32(a2, vandq_u32(vreinterpretq_u32_f32(
-                vld1q_f32(p + i + 8)), exponent));
-            a3 = vmaxq_u32(a3, vandq_u32(vreinterpretq_u32_f32(
-                vld1q_f32(p + i + 12)), exponent));
-        }
-        for (; i + 4 <= width; i += 4)
-            a0 = vmaxq_u32(a0, vandq_u32(vreinterpretq_u32_f32(
-                vld1q_f32(p + i)), exponent));
-        if (i < width)
-            a1 = vmaxq_u32(a1, vandq_u32(vreinterpretq_u32_f32(
-                vld1q_f32(p + width - 4)), exponent));
-    }
-    return vmaxvq_u32(vmaxq_u32(vmaxq_u32(a0, a1), vmaxq_u32(a2, a3))) <
-           0x7f800000u;
-}
-#endif
-
-static inline int rows_all_finite(const float *base, size_t rows,
-                                  size_t stride, size_t width) {
-#if SK_HAVE_NEON
-    return rows_all_finite_neon(base, rows, stride, width);
-#else
-    return rows_all_finite_scalar(base, rows, stride, width);
-#endif
-}
-
 /* The finite predicate over the tensors one frame wrote.  The graph writes a
  * whole window back, but only the frame it just produced is new -- key/value
  * slot 0 of every channel (newest first) and the last logit frame (oldest
@@ -518,11 +463,11 @@ static int frame_is_finite(const UlcnetModelIoState *state) {
 
     return skn_all_finite_f32(state->output, state->spectrum_ri_elements) &&
            skn_all_finite_f32(state->h_gru, state->gru_hidden_elements) &&
-           rows_all_finite(state->key_history, channels, key_stride,
+           skn_all_finite_rows_f32(state->key_history, channels, key_stride,
                            ULCNET_MODEL_IO_TA_BINS) &&
-           rows_all_finite(state->value_history, channels, key_stride,
+           skn_all_finite_rows_f32(state->value_history, channels, key_stride,
                            ULCNET_MODEL_IO_TA_BINS) &&
-           rows_all_finite(state->logit_history + newest_logit, channels,
+           skn_all_finite_rows_f32(state->logit_history + newest_logit, channels,
                            logit_stride, depth);
 }
 

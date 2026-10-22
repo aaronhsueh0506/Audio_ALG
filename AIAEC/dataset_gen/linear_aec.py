@@ -515,6 +515,19 @@ ACCEPTED_BEHAVIOR_HASH_MIGRATIONS: Dict[str, str] = {
     # C's hard restart clears coarse/leakage evidence, and both move
     # `linear_error`, so no byte-identity evidence can describe a frontend
     # after them. A retired pair may never be retargeted.
+    #
+    # 2026-10-20: the combined NO_FLOOR runtime-setter + S-05 hop
+    # (428aa9b796c2...562d -> 419f473e609e...ff8fa) also admits nothing here.
+    # Both changes are inert on this materialization path (measured
+    # byte-identical `formed_output`/`error` on real AEC 2021/2023/self-
+    # recorded doubletalk clips at 16 kHz and 48 kHz -- see
+    # AIAEC/tests/test_linear_aec_behavior_migration.py's note and the
+    # harness-can-fail BALANCED-vs-NO_FLOOR control that accompanies it), but
+    # a grep of every corpus/checkpoint ledger under this tree found nothing
+    # recorded at the pre-hop hash and in progress -- nothing is STRANDED, so
+    # there is no rescue for this table to grant. The unconditional
+    # RELEASED_INFERENCE_BEHAVIOR_HASH_COMPATIBILITY pointer below is bumped
+    # regardless, since that one is not a migration admission.
 }
 
 # One released 16-kHz Align-ULCNet checkpoint was trained with this frontend
@@ -525,9 +538,79 @@ ACCEPTED_BEHAVIOR_HASH_MIGRATIONS: Dict[str, str] = {
 # below accepts this exact one-way pair only in LinearAecEngine, emits a warning
 # that output can differ, and is never called by materialization or packing.
 RELEASED_INFERENCE_BEHAVIOR_HASH_COMPATIBILITY: Dict[str, str] = {
+    # Bumped 2026-10-21. This pointer had actually drifted to 5fe64e4648...3f4
+    # (set 2026-09-22, Audio_ALG commit 29916a4) before this bump, not to
+    # 428aa9b7...562d as the ACCEPTED_BEHAVIOR_HASH_MIGRATIONS comment above
+    # frames it -- lib/aec picked up 21 unrelated commits touching
+    # python/aec.py/modules between those two hashes (full-rate delay
+    # estimator, bad-relock revert, live-observer R2 path, round-robin TD
+    # constraint and mechanism removals, among others), none individually
+    # measured for inertness against this exception. This bump covers the
+    # FULL hop 5fe64e46...3f4 -> 9fa7a2de...245e5, not just the NO_FLOOR+S-05
+    # slice. The NO_FLOOR+S-05 slice (428aa9b7...562d -> 419f473e...ff8fa) is
+    # measured inert (see test_linear_aec_behavior_migration.py); the
+    # 5fe64e46->428aa9b7 slice is NOT separately measured -- this exception
+    # already only emits a warning and is never called by materialization or
+    # packing (see the comment above this table), and the decision was made
+    # to keep moving rather than spend a round re-validating a month of
+    # unrelated frontend history against one inference-only compatibility
+    # warning. If this checkpoint's inference output is ever found to have
+    # degraded, re-check this unmeasured slice first.
+    # The additional 419f473e...ff8fa -> 9fa7a2de...245e5 slice only splits
+    # orchestrator stages and enables numeric/name CLI presets. Its frozen
+    # formed_output/error/echo samples and RES context/state traces were
+    # measured byte-identical on full real AEC 2021/2023/self-recorded clips
+    # at 16/48 kHz (8,636 hops across frozen/full/observer profiles). A one-bit
+    # perturbation at the actual formed_output getter is rejected by that
+    # same comparator. This new evidence does not validate the historical
+    # unmeasured slice above. No local corpus/checkpoint ledger is stranded
+    # at 419f473e, so ACCEPTED_BEHAVIOR_HASH_MIGRATIONS stays empty.
     "c1b1f5433fa244a2f7369938992bff95f00d1bdc394c4f21a5862f2dc547f786":
-        "5fe64e46480c7e2a75c90718f1b64c09ca29f611d09713ea4ec2a9ef61c813f4",
+        "9fa7a2dec85cef8f123cc4dd02e7eb3c5dc0c1b45d7ec0f32b766cf9cda245e5",
 }
+
+# --- Staleness guard for the pointer above ----------------------------------
+# The bug this guards against (opus review item C2, 2026-10-20): an agent
+# bumping the single entry above ASSUMED its prior value was the hash
+# immediately before their own change, bumped it to their new hash, and in
+# doing so silently re-admitted roughly a month and 21 unrelated lib/aec
+# commits of un-vetted drift that had piled up on the pointer in between (see
+# the comment on the entry above for that incident's own account). The
+# pre-existing test only checked that the pointer equals the LIVE hash right
+# now; it had no way to notice that the gap between two bumps was never
+# individually vetted.
+#
+# Fix: every time the entry above is bumped, append one row here --
+# (date, old_value, new_value) -- where `old_value` is copied from this
+# table's own immediately preceding row's `new_value` (or, for the very
+# first row, read directly from `git show HEAD:...`) -- never assumed or
+# independently recomputed. Both values are LITERAL 64-hex-char hashes, not
+# the abbreviated "prefix...suffix" form used in prose comments elsewhere in
+# this file -- elided values can't be compared against git's byte-for-byte.
+#
+# `AIAEC/tests/test_released_pointer_bump_guard.py` (backed by
+# `AIAEC/dataset_gen/released_pointer_bump_guard.py`, also runnable standalone
+# as `python3 -m AIAEC.dataset_gen.released_pointer_bump_guard`; both covered
+# by `make test`) enforces this mechanically, not by convention:
+#   1. stateless, runs in any checkout forever: the rows must chain --
+#      row[i].old == row[i-1].new -- and the LAST row's `new` must equal the
+#      live value of the entry above. A wrong `old`, or a bump with no new
+#      row, fails this the moment it is checked, in this commit or any later
+#      one.
+#   2. bump-time: whenever `git show HEAD:<this file>`'s entry value differs
+#      from the working tree's, the working tree must carry a row whose
+#      `old` is literally HEAD's value and whose `new` is literally the
+#      working tree's value -- making "I assumed the old value was X"
+#      structurally visible, since X is checked against git, not the
+#      author's claim.
+# Run `python3 -m pytest AIAEC/tests/test_released_pointer_bump_guard.py`
+# before committing a bump to the entry above.
+RELEASED_INFERENCE_POINTER_BUMPS: Tuple[Tuple[str, str, str], ...] = (
+    ("2026-10-21",
+     "5fe64e46480c7e2a75c90718f1b64c09ca29f611d09713ea4ec2a9ef61c813f4",
+     "9fa7a2dec85cef8f123cc4dd02e7eb3c5dc0c1b45d7ec0f32b766cf9cda245e5"),
+)
+
 _RELEASED_INFERENCE_SAMPLE_RATES: Dict[str, frozenset] = {
     "c1b1f5433fa244a2f7369938992bff95f00d1bdc394c4f21a5862f2dc547f786":
         frozenset({16000}),
@@ -898,6 +981,7 @@ def materialize_linear_error(
 __all__ = [
     "ACCEPTED_BEHAVIOR_HASH_MIGRATIONS",
     "RELEASED_INFERENCE_BEHAVIOR_HASH_COMPATIBILITY",
+    "RELEASED_INFERENCE_POINTER_BUMPS",
     "MIGRATED_SOURCE_PROVENANCE",
     "RETIRED_BEHAVIOR_HASHES",
     "BEHAVIOR_HASH_SCHEMA",

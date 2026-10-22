@@ -51,7 +51,7 @@ th{background:#eef1f5}
 <tr><td>Lookahead</td><td><code>mask_lookahead=1</code>、<code>df_lookahead=1</code>;cascade 串聯 ⇒ 總延遲 2 hops(非 max)</td></tr>
 <tr><td>參數量</td><td>2,134,971(以出貨 config 實際建構 <code>DeepFilterNet2(...)</code> 量測)</td></tr>
 <tr><td>model / feature version</td><td><code>dfn2_fmajor_pathway_cascade_alpha_no_lsnr_v6</code> / <code>dfn2_libdf_wnorm_upstream_init_no_eps_v5</code></td></tr>
-<tr><td>post-filter</td><td>Valin PF 存在但出貨關閉(<code>DFN2_MASK_PF=0</code>、<code>mask_pf=false</code>)</td></tr>
+<tr><td>post-filter</td><td>Valin PF 只在 Python 參考(<code>mask_pf=false</code> 出貨關閉);C 端沒有實作</td></tr>
 </table></div>
 <p class="note">深入數學與上游對齊紀錄見 <a href="../../AINR/DeepFilterNet2/README.md">README</a> 與
 <a href="../../AINR/DeepFilterNet2/UPSTREAM_ALIGNMENT.md">UPSTREAM_ALIGNMENT</a>。</p>
@@ -59,7 +59,7 @@ th{background:#eef1f5}
 <h2>API 用法</h2>
 <p>整合者直接用下一節的 <code>dfn2_prepost</code> 類別即可;以下是它底下的低階 API:部署端用
 <code>dfn2_compose_stream()</code>,<code>dfn2_compose()</code> 是 frame-aligned 的 parity 參考,
-兩者不可混用(切換須重新 <code>dfn2_state_init()</code>)。分析與合成的組幀是 audio_common 的 <code>AcStft</code>／<code>AcIstft</code>,由呼叫端建立並交給 state(<code>dfn2_framing_config()</code> 給出 1024 點、hop 512、<code>spec_scale</code> = 1/32、<code>ispec_scale</code> = 32 的組態)。</p>
+兩者不可混用(切換須重新 <code>dfn2_state_init()</code>)。分析與合成的組幀是 audiolib 的 <code>AcStft</code>／<code>AcIstft</code>,由呼叫端建立並交給 state(<code>dfn2_framing_config()</code> 給出 1024 點、hop 512、<code>spec_scale</code> = 1/32、<code>ispec_scale</code> = 32 的組態)。</p>
 <pre>#include "DeepFilterNet2/dfn2_process.h"
 
 DFN2State st;                       /* 67,368 bytes, 呼叫端配置 */
@@ -200,7 +200,7 @@ dfn2_compose_stream(spec, heads(current-1))   noisy_ring (延遲的原譜)
    |  df_common_expand_mask: 32 band -> 513 bin gain
    |  cascade: masked spec 入 df_ring / hi_delay
    |  DF FIR 5-tap @ target=current-2, alpha blend (低 96 bins)
-   |  (dfn2_post_filter 編譯關閉) -> dfn2_apply_atten_lim(0=no-op)
+   |  -> dfn2_apply_atten_lim(0=no-op)
    v
 out_re/out_im [513] (frame current-2)
    |

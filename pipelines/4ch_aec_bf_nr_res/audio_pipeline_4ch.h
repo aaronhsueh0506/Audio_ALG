@@ -4,14 +4,14 @@
  * Complete four-channel traditional speech-enhancement pipeline:
  *
  *   one shared far aligner -> four linear AEC lanes
- *   -> SRP-PHAT DOA -> GSC -> one NR + one post-beam RES
+ *   -> SRP-PHAT DOA -> BF -> one NR + one post-beam RES
  *
- * SRP-PHAT/GSC come from the reusable libraries under this project's
- * third_party directory. This wrapper owns their lifetime and preserves the
+ * SRP-PHAT/BF come from the sibling audiolib/doa and audiolib/bf
+ * libraries. This wrapper owns their lifetime and preserves the
  * resource boundary of 4aec_nr_res.h. Naming and lifecycle mirror
  * audio_pipeline.h/4aec_nr_res.h's own descriptor-tier pool-first pattern
- * (this layer composes core + SRP + GSC + its own scratch, the same tier as
- * 4aec_nr_res.c, not the simple size_t tier SRP/GSC each expose on their
+ * (this layer composes core + SRP + BF + its own scratch, the same tier as
+ * 4aec_nr_res.c, not the simple size_t tier SRP/BF each expose on their
  * own):
  *
  *   Caller-owned pool (board/static path):
@@ -70,13 +70,13 @@ typedef struct AudioPipeline4ChConfig {
     int doa_switch_consecutive;
     float doa_angle_tolerance_rad;
     int doa_update_interval;
-    int gsc_enable;
-    float gsc_lambda;
-    float gsc_mu;
-    int gsc_fixed_mode;
-    float gsc_fixed_doa_rad;
-    int gsc_fixed_align_notebook;
-    int gsc_adapt_interval;
+    int bf_enable;
+    float bf_lambda;
+    float bf_mu;
+    int bf_fixed_mode;
+    float bf_fixed_doa_rad;
+    int bf_fixed_align_notebook;
+    int bf_adapt_interval;
 
     /*
      * Fallback activity detector used only by audio_pipeline_4ch_process().
@@ -96,7 +96,7 @@ typedef struct AudioPipeline4ChFrameInfo {
     float doa_used_rad;
     int vad_raw;
     int vad_out;
-    int gsc_adaptive;
+    int bf_adaptive;
     int doa_analysis_frames;
 } AudioPipeline4ChFrameInfo;
 
@@ -114,7 +114,7 @@ typedef struct AudioPipeline4Ch AudioPipeline4Ch;
  * this counter is the signal. Query a fresh descriptor for every build; do not
  * persist or synthesize one from this number. The exact totals come from
  * `make print-mem-size`. */
-#define AUDIO_PIPELINE_4CH_LAYOUT_VERSION 15u
+#define AUDIO_PIPELINE_4CH_LAYOUT_VERSION 16u
 
 /**
  * Fixed-width descriptor for a caller-owned static-memory pool. Same 32-byte
@@ -123,7 +123,7 @@ typedef struct AudioPipeline4Ch AudioPipeline4Ch;
  * build_flags_hash/alignment/reserved/bytes) -- see that header's own doc
  * comment for the full rationale rather than repeating it here.
  *
- * This layer composes the core (4aec_nr_res), SRP-PHAT, and GSC sub-modules
+ * This layer composes the core (4aec_nr_res), SRP-PHAT, and BF sub-modules
  * one level up, so its own build_flags_hash folds in the core's
  * build_flags_hash (see audio_pipeline_4ch_get_mem_requirements()'s
  * implementation): a core-layer layout bump must also invalidate every
@@ -175,20 +175,20 @@ AudioPipeline4ChConfig audio_pipeline_4ch_default_config(int sample_rate);
  * Query the complete 16-byte-aligned caller pool required by cfg. Performs
  * no allocation and returns 0 on success. Composes the core's own
  * four_aec_nr_res_get_mem_requirements()/get_mem_breakdown() with
- * srp_get_mem_size()/gsc_get_mem_size() and this wrapper's own two scratch
- * buffers (gsc_spectrum/gsc_weights).
+ * srp_get_mem_size()/bf_get_mem_size() and this wrapper's own two scratch
+ * buffers (bf_spectrum/bf_weights).
  */
 int audio_pipeline_4ch_get_mem_requirements(
     const AudioPipeline4ChConfig* cfg,
     AudioPipeline4ChMemReq* out);
 
 /**
- * Place the complete four-channel spatial pipeline (core + SRP-PHAT + GSC +
+ * Place the complete four-channel spatial pipeline (core + SRP-PHAT + BF +
  * this wrapper's own scratch) in caller-owned memory.
  *
  * mem must satisfy the freshly queried alignment and byte requirement. No
  * heap allocation is performed by this path, including inside the core, SRP,
- * or GSC. A dirty/poisoned pool is accepted.
+ * or BF. A dirty/poisoned pool is accepted.
  */
 AudioPipeline4Ch* audio_pipeline_4ch_init(
     void* mem,
@@ -236,9 +236,9 @@ int audio_pipeline_4ch_process(
  * Complete one hop with activity supplied by the product VAD.
  *
  * vad_raw controls whether SRP-PHAT gets a fresh observation. vad_out is
- * the held target-speech state used by the DOA smoother and freezes the GSC
+ * the held target-speech state used by the DOA smoother and freezes the BF
  * RLS update when nonzero.  frequency_mask may be NULL or n_freqs integers;
- * 1 selects a bin for SRP and freezes GSC adaptation in that bin.
+ * 1 selects a bin for SRP and freezes BF adaptation in that bin.
  */
 int audio_pipeline_4ch_process_with_activity(
     AudioPipeline4Ch* p,
@@ -260,13 +260,21 @@ void audio_pipeline_4ch_reset(AudioPipeline4Ch* p);
  * is one denoiser, not one per lane. Both setters target those, which is why
  * they exist rather than leaving the caller to loop over lanes.
  *
- * set_aec_preset retargets the far-active gain floor on the post-beam
- * suppressor: ramp_ms 0 applies on the next hop and lands on exactly the floor
- * a fresh instance would hold, a positive value walks there linearly in dB.
- * The floor only binds on far-active, non-double-talk hops (during double-talk
- * the DT floor, identical across presets, applies), and the same gain also
- * scales the comfort noise, so an average over a whole recording moves less
- * than the dB step implies. Requires core.enable_res.
+ * set_aec_preset retargets all three strength fields on the post-beam
+ * suppressor: the two gain floors, and the split-floor-enabled gate itself.
+ * The far-active floor ramps (ramp_ms 0 applies on the next hop and lands on
+ * exactly the floor a fresh instance would hold, a positive value walks there
+ * linearly in dB), while the DT floor and the gate both jump immediately to
+ * the new preset's value (DT floor: -20 dB for mild/balanced, -30 dB for
+ * aggressive; see AEC_PRESET_FLOORS in aec.c) -- ramp_ms only governs the
+ * far-active step. The far-active floor only binds on far-active,
+ * non-double-talk hops (during double-talk the DT floor applies instead),
+ * and the same gain also scales the comfort noise, so an average over a
+ * whole recording moves less than the dB step implies. Switching to/from
+ * AEC_PRESET_NO_FLOOR (gate OFF) is allowed at runtime, not just at
+ * construction: the gate steps on the same call that retargets the two dB
+ * fields, so the instance never has a hop where the preset label and the
+ * gate disagree. Requires core.enable_res.
  *
  * set_nr_mode recomposes this pipeline's own NR configuration -- the canonical
  * strength preset plus the overrides it always applies -- and hands it to
@@ -301,21 +309,21 @@ int audio_pipeline_4ch_doa_sample_rate(const AudioPipeline4Ch* p);
 int audio_pipeline_4ch_doa_frame_size(const AudioPipeline4Ch* p);
 int audio_pipeline_4ch_doa_hop_size(const AudioPipeline4Ch* p);
 int audio_pipeline_4ch_doa_fft_size(const AudioPipeline4Ch* p);
-int audio_pipeline_4ch_gsc_sample_rate(const AudioPipeline4Ch* p);
-int audio_pipeline_4ch_gsc_frame_size(const AudioPipeline4Ch* p);
-int audio_pipeline_4ch_gsc_hop_size(const AudioPipeline4Ch* p);
-int audio_pipeline_4ch_gsc_fft_size(const AudioPipeline4Ch* p);
+int audio_pipeline_4ch_bf_sample_rate(const AudioPipeline4Ch* p);
+int audio_pipeline_4ch_bf_frame_size(const AudioPipeline4Ch* p);
+int audio_pipeline_4ch_bf_hop_size(const AudioPipeline4Ch* p);
+int audio_pipeline_4ch_bf_fft_size(const AudioPipeline4Ch* p);
 
 /*
- * The adapt_interval GSC actually configured (post fixed-notebook-mode
+ * The adapt_interval BF actually configured (post fixed-notebook-mode
  * forcing) and the RLS forgetting factor (lambda) it was retimed for, given
  * that same interval. Exposed read-only so tests can confirm the two were
  * derived from one shared effective-interval value instead of silently
- * diverging (see gsc.h's gsc_effective_adapt_interval()).
+ * diverging (see bf.h's bf_effective_adapt_interval()).
  */
-int audio_pipeline_4ch_gsc_effective_adapt_interval(
+int audio_pipeline_4ch_bf_effective_adapt_interval(
     const AudioPipeline4Ch* p);
-float audio_pipeline_4ch_gsc_lambda(const AudioPipeline4Ch* p);
+float audio_pipeline_4ch_bf_lambda(const AudioPipeline4Ch* p);
 
 int audio_pipeline_4ch_matched_filter_count(const AudioPipeline4Ch* p);
 int audio_pipeline_4ch_linear_aec_count(const AudioPipeline4Ch* p);

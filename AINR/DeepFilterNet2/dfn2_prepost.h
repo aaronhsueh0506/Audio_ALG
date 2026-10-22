@@ -25,7 +25,7 @@
  * symbol in the other's parity build. This file composes them and neither of
  * them changes.
  *
- * Memory: both house lifecycles (audio_common/include/fft_wrapper.h,
+ * Memory: both house lifecycles (audiolib/common/include/fft_wrapper.h,
  * "Static memory support").
  *   dfn2_prepost_get_mem_size(&cfg, &req);
  *   DFN2Prepost *p = dfn2_prepost_init(pool, req.bytes, &cfg);   // board
@@ -117,7 +117,7 @@ extern "C" {
  * entry point. */
 #define DFN2_PREPOST_CARVE_VERSION      7u
 
-/* One shared alignment for every module (audio_common mem_align.h). */
+/* One shared alignment for every module (audiolib mem_align.h). */
 #define DFN2_PREPOST_ALIGNMENT 16u
 
 /* Flat element counts at the accelerator boundary. Stated as macros because

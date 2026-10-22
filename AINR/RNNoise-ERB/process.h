@@ -1,6 +1,8 @@
 #ifndef RNNOISE_PROCESS_H
 #define RNNOISE_PROCESS_H
 
+#include "audio_stft.h"
+
 #ifdef __cplusplus
 extern "C" {
 #endif
@@ -30,8 +32,8 @@ extern "C" {
 #define RNNOISE_SR          16000
 #define RNNOISE_N_FFT       512
 #define RNNOISE_N_BINS      257   /* N_FFT/2 + 1 */
-#define RNNOISE_WIN_LEN     512   /* 分析窗長度 (≤ N_FFT, 預設 = N_FFT) */
-#define RNNOISE_HOP_LEN     256   /* 幀移長度 (≤ WIN_LEN/2 for COLA) */
+#define RNNOISE_WIN_LEN     512   /* fixed deployed analysis window */
+#define RNNOISE_HOP_LEN     256   /* fixed 50% overlap */
 #define RNNOISE_OVL_LEN     (RNNOISE_WIN_LEN - RNNOISE_HOP_LEN)  /* overlap 長度 */
 #define RNNOISE_N_BANDS     22    /* = config.ini [signal] n_bands (純 ERB 模式) */
 #define RNNOISE_MIN_BINS_PER_BAND 2  /* = config.ini [signal] min_bins_per_band */
@@ -52,6 +54,7 @@ extern "C" {
  *   h3_in / h3_out -> &state->hidden[2]
  * Aliasing precondition (optimized path): the runtime must read every state
  * input before it writes any state output at the same address. */
+#define RNNOISE_PREPOST_LAYOUT_VERSION 2
 #define RNNOISE_MODEL_IO_LAYOUT_VERSION 1
 #define RNNOISE_MODEL_GRU_COUNT          3
 #define RNNOISE_MODEL_GRU_SIZE         128
@@ -100,8 +103,9 @@ typedef struct {
 
 /* 處理狀態 (呼叫端分配，跨 frame 保持) */
 typedef struct {
-    /* overlap-add 緩衝 (長度 = WIN_LEN, 只用前 OVL_LEN) */
-    float synthesis_buf[RNNOISE_WIN_LEN];
+    /* Caller-owned framing objects; reset together with feature state. */
+    AcStft *stft;
+    AcIstft *istft;
 
     /* 特徵歷史 (conv1 需要 3 frame) */
     float erb_feat_buf[3][RNNOISE_N_BANDS];  /* ring buffer for 3 frames */
@@ -115,20 +119,27 @@ typedef struct {
     /* Original DeepFilterNet per-bin complex-magnitude EMA. */
     float spec_norm_state[RNNOISE_SPEC_BINS];
 
-    /* --- 以下為每次呼叫用的暫存區 (scratch), 非跨 frame 狀態 ---
-     * 放在 state 內, 呼叫端 stack 不佔用這些暫存區。呼叫間不需要清零,
-     * 每次使用前都會被完整覆寫。 */
-    float scratch_buf_re[RNNOISE_N_FFT];   /* rnnoise_analysis 用 */
-    float scratch_buf_im[RNNOISE_N_FFT];
+    /* Per-call feature scratch, fully overwritten before use. */
     float scratch_power[RNNOISE_N_BINS];   /* rnnoise_compute_features 用 */
     float scratch_erb_db[RNNOISE_N_BANDS];
-    float scratch_full_re[RNNOISE_N_FFT];  /* rnnoise_synthesis 用 */
-    float scratch_full_im[RNNOISE_N_FFT];
 } RNNoiseState;
 
-/* 初始化狀態 (歸零 + ERB/complex norm 初值; 內部亦會呼叫
- * rnnoise_tables_init() — 見下方說明, 為 no-op) */
-void rnnoise_state_init(RNNoiseState *st);
+/* Fixed deployed grid: 512-point periodic root-Hann, hop 256, center=0,
+ * forward N^-0.5, plain overlap-add. Synthesis itself mutates the spectra by
+ * gain*N^0.5, so ispec_scale MUST stay 1. Borrowing one FFT handle is safe
+ * when analysis and synthesis run sequentially; objects and their buffers
+ * must outlive RNNoiseState. fft=NULL lets common carve its own FFT plan;
+ * cfg=NULL is a no-op. Keep the helper's borrowed immutable model window:
+ * all 512 window values must be byte-identical to the model table. Replacing
+ * cfg.window with NULL makes common build a window; binding accepts it only
+ * if its bytes match, which is not a portable substitute for the model table. */
+void rnnoise_framing_config(AcStftConfig *cfg, FftHandle *fft);
+
+/* Bind objects constructed from rnnoise_framing_config, clear feature state
+ * and reset both framing objects. Returns 0, or -1 for a NULL state or
+ * mismatched framing config.
+ * The pre/post layout changed in version 2; GRU tensor layout stays version 1. */
+int rnnoise_state_init(RNNoiseState *st, AcStft *stft, AcIstft *istft);
 
 void rnnoise_model_state_init(RNNoiseModelState *state);
 
@@ -155,24 +166,13 @@ int rnnoise_model_state_inherit(
     RNNoiseModelState *state,
     const float hidden_out[RNNOISE_MODEL_GRU_COUNT][RNNOISE_MODEL_GRU_SIZE]);
 
-/* ERB filterbank + root-Hann window 表格是編譯期 `static const`
- * (由 gen_rnnoise_tables.c 產生 rnnoise_tables_gen.h, process.c 直接
- * #include), 沒有任何執行期查表初始化。表格沒有共享可變狀態, 執行緒
- * 安全是「設計上就沒有可競爭的寫入」, 不是靠同步保證。
- *
- * 這個函式本體是刻意留空的 no-op, 純粹保留 API 相容, 呼叫與否都不影響
- * 任何 rnnoise_* API 的行為或正確性。 */
-void rnnoise_tables_init(void);
-
 /* --- 前處理 (每 frame 呼叫) --- */
 
-/* 對 WIN_LEN 個 sample 做 analysis:
- *   1. 加 root Hann window (WIN_LEN samples)
- *   2. Zero-pad 到 N_FFT (當 WIN_LEN < N_FFT)
- *   3. FFT → N_BINS 個 complex bin, 乘 N_FFT^-0.5 (= torch normalized=True)
- *   st: 提供 scratch 空間 (scratch_buf_re/im), 不讀寫任何跨 frame 狀態
- *   frame: 長度 WIN_LEN, out_re/out_im: 長度 N_BINS */
-void rnnoise_analysis(RNNoiseState *st, const float *frame, float *out_re, float *out_im);
+/* Windowed, N^-0.5-normalized rFFT of one full 512-sample caller frame.
+ * Does not advance the borrowed object's streaming history. Outputs have
+ * RNNOISE_N_BINS floats each. Returns 0, or -1 for a NULL argument/binding
+ * without writing outputs. */
+int rnnoise_analysis(RNNoiseState *st, const float *frame, float *out_re, float *out_im);
 
 /* 從 normalized FFT spectrum 計算雙路 features:
  *   1. power = |X|^2 → 三角 ERB filterbank (mode=0) → 10*log10(·+1e-10)
@@ -192,20 +192,10 @@ int rnnoise_compute_features(RNNoiseState *st,
 
 /* --- 後處理 --- */
 
-/* Attenuation limit: 對齊 Rikorose/DeepFilterNet enhance.py 的 atten_lim_db
- * 機制 (df/enhance.py `enhanced = noisy*lim + enhanced*(1-lim)`,
- * lim = 10^(-|atten_lim_db|/20))。不是 mask clamp/floor (df/modules.py 的
- * Mask.forward 另一種、數學上不同的機制) ——這裡是線性內插:
- *   band_gains[b] = lim + band_gains[b] * (1 - lim)
- * 在 band 層級套用即可 (不需另外在 bin 層級重做一次)：因為 erb_inv 是
- * partition of unity (每一列元素和為 1)，這個仿射變換跟 rnnoise_expand_gains
- * 的矩陣乘法可交換 —— band 層級套用後再展開, 等價於展開後在 bin 層級套用,
- * 也等價於直接對 spectrum 做同樣的線性混合, 但成本只需 N_BANDS(22) 次而非
- * N_BINS(257) 次。
- * atten_lim_db <= 0 (或呼叫端選擇不呼叫這個函式) 為 no-op/停用, 行為與
- * 未呼叫本函式時完全相同。
- * band_gains: 長度 RNNOISE_N_BANDS, 就地修改。 */
-/* band_gains 必須有 RNNOISE_N_BANDS 個元素：本函式無條件寫滿整段。 */
+/* band_gains[b] = lim + gain[b]*(1-lim), lim=10^(-atten_lim_db/20).
+ * Matches inference.py's attenuation-limit mixture. The inverse ERB matrix
+ * sums to one per bin, so applying this affine mix to the RNNOISE_N_BANDS
+ * gains before expansion gives the same mixture. <=0 disables it. */
 void rnnoise_apply_atten_lim(float band_gains[RNNOISE_N_BANDS],
                              float atten_lim_db);
 
@@ -216,8 +206,10 @@ void rnnoise_expand_gains(const float *band_gains, float *bin_gains);
 /* 套用 gain 並 ISTFT + overlap-add:
  *   spec_re, spec_im: 長度 N_BINS (會被修改; 內含 × N_FFT^+0.5 反正規化)
  *   bin_gains: 長度 N_BINS
- *   out_samples: 長度 HOP_LEN (256), 輸出的時域 sample */
-void rnnoise_synthesis(RNNoiseState *st,
+ *   out_samples: 長度 HOP_LEN (256), 輸出的時域 sample
+ * Returns 0, or -1 for a NULL argument/binding without modifying spectra or output.
+ */
+int rnnoise_synthesis(RNNoiseState *st,
                        float *spec_re, float *spec_im,
                        const float *bin_gains,
                        float *out_samples);

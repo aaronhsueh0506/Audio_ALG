@@ -100,5 +100,5 @@ AIAEC/build/libaiaec_prepost.a 提供：
 3. BIN calibration 每個 input 的檔案數、dtype 與 per-frame shape 和 ONNX
    descriptor 一致。
 4. reset 後所有 host state 回到初始值；失敗時不提交部分更新。
-5. C scalar/SIMD 與 KISS/NE10 測試全綠。
+5. C scalar/SIMD 測試全綠。
 6. 使用真實 checkpoint 做短音檔 spot check 後才開啟產品路徑。

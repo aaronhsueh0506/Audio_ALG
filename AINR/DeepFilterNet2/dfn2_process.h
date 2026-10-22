@@ -126,10 +126,6 @@
  *   否則 round trip 不是 unity。 */
 #define DFN2_ANALYSIS_SCALE   0.03125f       /* = 2*512/1024^2 * sqrt(1024) */
 
-/* ---- 推論後處理: = config.ini [model] ---- */
-#define DFN2_MASK_PF        0        /* Valin post-filter, 出貨 false */
-#define DFN2_PF_BETA        0.02f    /* = 上游 PF_BETA */
-
 /* ============================================================
  * 狀態 (呼叫端分配，跨 frame 保持)
  * ============================================================ */
@@ -286,13 +282,6 @@ int dfn2_compose_stream(DFN2State *st,
                         float *out_re,
                         float *out_im,
                         long long *output_frame_index);
-
-/* Valin post-filter (上游 deepfilternet3.py:388-394 的形式)。
- * ⚠ 作用在最終複數頻譜，mask 是從 |spec_e|/|spec| 推導出來的實際增益，不是
- *   網路輸出的那個 mask。分子沒有 mask 因子。上游不用 training 閘門。
- *   不要在 ERB mask 上套這個式子 — 兩者不可互換。 */
-void dfn2_post_filter(const float *spec_re, const float *spec_im,
-                      float *enh_re, float *enh_im, float beta);
 
 /* 增強頻譜 -> HOP_LEN 個輸出樣本 (sqrt-Hann 合成 + OLA)。
  * ⚠ 合成端不做 window-envelope 除法: sqrt-Hann 分析 x sqrt-Hann 合成 = Hann，

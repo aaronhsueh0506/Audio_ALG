@@ -19,7 +19,7 @@ _AIAEC_DIR = os.path.dirname(_THIS_DIR)
 _ULCNET_DIR = os.path.join(_AIAEC_DIR, 'Align_ULCNet')
 _DEEPVQE_DIR = os.path.join(_AIAEC_DIR, 'DeepVQE_S')
 _AC_DIR = os.path.abspath(
-    os.path.join(_THIS_DIR, '..', '..', '..', 'audio_common'))
+    os.path.join(_THIS_DIR, '..', '..', '..', 'audiolib', 'common'))
 _AC_INCLUDE = os.path.join(_AC_DIR, 'include')
 _TEST_SOURCE = os.path.join(_THIS_DIR, 'test_prepost_kernels.c')
 
@@ -69,7 +69,7 @@ def test_kernels_match_their_twins_and_the_contract(
         [cc, '-O2', '-std=c11', '-Wall', '-Wextra', '-Wpedantic', '-Werror',
          '-ffp-contract=off', '-fno-math-errno', *defines,
          '-I', _AIAEC_DIR, '-I', _ULCNET_DIR, '-I', _DEEPVQE_DIR,
-         '-I', _AC_INCLUDE, _TEST_SOURCE, *extra_sources,
+         '-I', _AC_INCLUDE, '-I', _AC_DIR, _TEST_SOURCE, *extra_sources,
          audio_common_lib, '-lm', '-o', str(executable)],
         check=True, capture_output=True)
     done = subprocess.run([str(executable)], capture_output=True, text=True)

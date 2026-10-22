@@ -29,6 +29,7 @@ AINR = pathlib.Path(__file__).resolve().parents[1]
 CASES = [
     (16000, 'RNNoise-ERB', 1.0),
     (48000, 'DeepFilterNet2', 1.0),
+    (48000, 'DeepFilterNet3', 1.0),
 ]
 
 EXPECTED_LINES = (
@@ -78,6 +79,10 @@ def test_rnnoise_erb_calibrator_runs():
 
 def test_deepfilternet2_calibrator_runs():
     _run_one(*CASES[1])
+
+
+def test_deepfilternet3_calibrator_runs():
+    _run_one(*CASES[2])
 
 
 def test_calibrators_do_not_share_endpoints():

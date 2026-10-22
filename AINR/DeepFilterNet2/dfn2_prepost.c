@@ -3,7 +3,7 @@
  * This file OWNS no signal processing of its own. It composes the two
  * parity-tested translation units -- dfn2_process.c (ERB and complex
  * features, mask expansion, deep filter, attenuation limit; the streaming
- * center=False sqrt-Hann framing is audio_common's AcStft / AcIstft) and
+ * center=False sqrt-Hann framing is audiolib's AcStft / AcIstft) and
  * dfn2_model_io.c (graph feature windows and recurrent
  * caches) -- and adds only the object lifecycle, the pool carve and the
  * per-hop frame state machine. Neither of those files changes, so both of
@@ -14,8 +14,8 @@
 
 #include "dfn2_prepost.h"
 
-#include "mem_align.h"
-#include "simd_kernel_nn.h"
+#include "utility/mem_align.h"
+#include "utility/simd_kernel_nn.h"
 
 #include <math.h>
 #include <stdlib.h>
@@ -85,7 +85,7 @@ struct DFN2Prepost {
 };
 
 /* ---- pool arithmetic ---------------------------------------------------
- * audio_common's saturating helpers (mem_align.h): an overflow anywhere in
+ * audiolib's saturating helpers (mem_align.h): an overflow anywhere in
  * the walk pins the cursor to SIZE_MAX, which MEM_SIZE_INVALID catches. */
 
 #ifdef __STDC_VERSION__
@@ -145,7 +145,7 @@ static uint32_t pp_build_hash(int io_mode) {
     h = pp_fnv1a_u32(h, (uint32_t)DFN2_MODEL_DF_PATHWAY_WINDOW);
     h = pp_fnv1a_str(h, DFN2_FEATURE_VERSION);
     h = pp_fnv1a_u32(h, (uint32_t)io_mode);
-    return h;
+    return ac_memreq_abi_hash(h);
 }
 
 /* Sizing a borrowed table needs a table pointer, but only whether it is NULL:
@@ -191,7 +191,7 @@ static int pp_layout(DFN2Prepost *p, unsigned char *base,
         sizeof(float_counts) / sizeof(float_counts[0]);
     size_t cursor = 0;
     size_t i;
-    void *ptr;
+    void *ptr = NULL;
     float **slots[sizeof(float_counts) / sizeof(float_counts[0])];
 
     if (pp_carve(base, &cursor, sizeof(DFN2Prepost), &ptr) != 0) return -1;

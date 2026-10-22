@@ -30,7 +30,8 @@ int se_grid_fixed(int sample_rate, int requested_fft, int rate, int fft, SeGrid*
 }
 
 static int preset_valid(AecPreset p) {
-    return p == AEC_PRESET_MILD || p == AEC_PRESET_BALANCED || p == AEC_PRESET_AGGRESSIVE;
+    return p == AEC_PRESET_MILD || p == AEC_PRESET_BALANCED || p == AEC_PRESET_AGGRESSIVE ||
+           p == AEC_PRESET_NO_FLOOR;
 }
 
 /* MATCHED sizes its bank, FIXED pins a bounded sample count (two minutes at the

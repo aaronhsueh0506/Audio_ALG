@@ -22,8 +22,7 @@
  * `// BOARD:` comment.
  *
  * Build/run (from pipelines/):
- *   make example-adapter                 # ne10 backend (default everywhere)
- *   make BACKEND=kiss example-adapter    # portable/bit-reproducible reference backend
+ *   make example-adapter
  *
  * Flow demonstrated (mirrors README.md "Board Integration" -> "Sequence"):
  *   1. query    audio_pipeline_get_mem_requirements() — EVERY time, never
@@ -75,13 +74,12 @@
  * audio_pipeline.h) actually depends on.
  *
  * The arena is sized from the LARGEST configuration this repo
- * supports — 48 kHz, either FFT backend — plus headroom, per
- * pipelines/README.md's "Memory Budget" table (measured: 1,597,536 B KISS
- * / 1,591,712 B NE10 @ 48 kHz, balanced presets). 2 MiB leaves a comfortable
- * ~480+ KB margin over the larger (KISS) figure. This is a REFERENCE
+ * supports — 48 kHz, balanced presets: 1,658,016 B measured with
+ * `aec_nr_pipeline_static --print-mem-size --sample-rate 48000` — plus
+ * headroom; 2 MiB leaves ~425 KiB of margin. This is a REFERENCE
  * sizing choice for the host simulation, not a platform requirement —
  * BOARD: size the platform's real common pool from whatever set of
- * configs (sample rates, presets, aec_only, backend) the product actually
+ * configs (sample rates, presets, aec_only) the product actually
  * ships, using audio_pipeline_get_mem_requirements() (or
  * audio_pipeline_get_mem_breakdown() for a per-module view) for each one,
  * not this file's guess.

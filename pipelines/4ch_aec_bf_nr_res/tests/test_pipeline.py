@@ -14,6 +14,7 @@ EqualWeightBeamformer = _pipeline.EqualWeightBeamformer
 FourChannelAecConfig = _pipeline.FourChannelAecConfig
 FourChannelAecPipeline = _pipeline.FourChannelAecPipeline
 SharedMatchedDelayEstimator = _pipeline.SharedMatchedDelayEstimator
+AecPreset = _pipeline.AecPreset
 
 
 def _external_equal_weight(pre):
@@ -246,7 +247,7 @@ def test_48k_wrapper_feeds_inner_estimator_raw_native_rate_hops(monkeypatch):
     (it would have no anti-alias filter and alias).
     The inner estimator is constructed at the TRUE native sample_rate
     and fed every raw sample; EchoPathDelayEstimator owns the anti-alias +
-    decimate-by-3 sidechain internally (mirrors delay_aec3.c's
+    decimate-by-3 sidechain internally (mirrors delay_aec.c's
     DaResample48)."""
     estimator = SharedMatchedDelayEstimator(sample_rate=48000, hop_size=512)
     assert estimator._estimator._sample_rate == 48000
@@ -463,6 +464,10 @@ def _live_floor(pipeline):
     return pipeline._post_beam_res._gain._split_floor_far_active_live
 
 
+def _dt_floor(pipeline):
+    return pipeline._post_beam_res._gain._split_floor_dt
+
+
 def _lane_floors(pipeline):
     return [lane._aec3_sg._split_floor_far_active_live for lane in pipeline._lanes]
 
@@ -509,6 +514,236 @@ def test_preset_retarget_survives_reset():
     pipeline._post_beam_res._split_floor_far_active_db = None
     pipeline.reset()
     assert _live_floor(pipeline) != after_set
+
+
+def test_preset_retarget_moves_the_dt_floor_too():
+    """set_aec_preset must also move the DT-protect floor, not just far-active.
+
+    aggressive deepens min_gain_floor_dt_db to -30 dB (mild/balanced share the
+    dataclass default -20 dB), so switching to aggressive must change the
+    live DT floor the suppressor actually applies during double-talk.
+    """
+    pipeline = _new_pipeline()
+    before_dt = _dt_floor(pipeline)
+
+    pipeline.set_aec_preset("aggressive")
+    assert _dt_floor(pipeline) != before_dt
+
+
+def test_preset_retarget_dt_floor_survives_reset():
+    """Mirrors test_preset_retarget_survives_reset for the DT floor.
+
+    Without the pipeline storing the chosen DT floor alongside far-active,
+    reset()'s fresh AecConfig would silently put balanced's -20 dB back.
+    """
+    pipeline = _new_pipeline()
+    pipeline.set_aec_preset("aggressive")
+    after_set = _dt_floor(pipeline)
+
+    pipeline.reset()
+    assert _dt_floor(pipeline) == after_set
+
+    # The mutation that would break it: clearing the stored value makes the
+    # rebuild revert, so the assertion above is not vacuous.
+    pipeline._post_beam_res._split_floor_dt_db = None
+    pipeline.reset()
+    assert _dt_floor(pipeline) != after_set
+
+
+def test_construction_default_preset_leaves_split_floor_enabled():
+    """Default aec_preset=BALANCED must not perturb default behavior.
+
+    BALANCED's from_preset() override dict is empty, so this is a no-op
+    value-wise: the point is that it stays True (the dataclass default),
+    not that construction changed it.
+    """
+    pipeline = _new_pipeline()
+    assert pipeline._post_beam_res._gain._split_floor_enabled is True
+
+
+def test_construction_time_no_floor_disables_split_floor():
+    """FourChannelAecConfig(aec_preset=NO_FLOOR) must build a suppressor with
+    the split-floor mechanism OFF from the start, and keep it off across a
+    reset() rebuild.
+
+    Construction-time only here: this does NOT exercise
+    set_aec_preset("no_floor") on an already-running instance -- that runtime
+    retarget path is covered separately, by
+    test_preset_retarget_moves_split_floor_enabled_too and
+    test_construction_time_no_floor_matches_runtime_retarget below.
+    """
+    pipeline = FourChannelAecPipeline(
+        FourChannelAecConfig(
+            sample_rate=16000, frame_size=256, hop_size=128,
+            aec_preset=AecPreset.NO_FLOOR,
+        )
+    )
+    assert pipeline._post_beam_res._gain._split_floor_enabled is False
+    pipeline.reset()
+    assert pipeline._post_beam_res._gain._split_floor_enabled is False
+
+
+def test_construction_time_preset_matches_runtime_retarget():
+    """Building with aec_preset=AGGRESSIVE must match balanced-then-retarget.
+
+    C's own construction path (derive_dims_and_configs -> se_derive ->
+    aec_config_from_preset) applies BOTH floor fields from the preset before
+    aec_res_init() ever runs -- the same two fields set_aec_preset() retargets
+    at runtime. A construction-time seed that only moved the split-floor gate
+    and left the two floors at balanced's values would silently make
+    aec_preset=AGGRESSIVE behave like balanced until something called
+    set_aec_preset() -- a real divergence from the C side this pins against.
+    """
+    built_aggressive = FourChannelAecPipeline(
+        FourChannelAecConfig(
+            sample_rate=16000, frame_size=256, hop_size=128,
+            aec_preset=AecPreset.AGGRESSIVE,
+        )
+    )
+    retargeted = _new_pipeline()
+    retargeted.set_aec_preset("aggressive")
+
+    assert _live_floor(built_aggressive) == _live_floor(retargeted)
+    assert _dt_floor(built_aggressive) == _dt_floor(retargeted)
+    # And it must actually differ from balanced's own values, so the
+    # assertions above are not vacuously comparing two balanced instances.
+    assert _live_floor(built_aggressive) != _live_floor(_new_pipeline())
+    assert _dt_floor(built_aggressive) != _dt_floor(_new_pipeline())
+
+
+def _gate(pipeline):
+    return pipeline._post_beam_res._gain._split_floor_enabled
+
+
+def test_preset_retarget_moves_split_floor_enabled_too():
+    """set_aec_preset must also retarget the split-floor gate, not just the
+    two floor dB values.
+
+    This is the runtime half of NO_FLOOR: before this, switching an
+    already-running pipeline to NO_FLOOR left _split_floor_enabled wherever
+    construction put it (True, since BALANCED is the default) -- silently
+    behaving like BALANCED. Mirrors the C twin's aec_res_set_preset(), which
+    mirrors the gate into r->sg_cfg.split_floor_enabled on every call.
+    """
+    pipeline = _new_pipeline()
+    assert _gate(pipeline) is True
+
+    pipeline.set_aec_preset("no_floor")
+    assert _gate(pipeline) is False
+
+    # And it must switch back on too -- this is a retarget, not a one-way latch.
+    pipeline.set_aec_preset("aggressive")
+    assert _gate(pipeline) is True
+
+
+def test_preset_retarget_split_floor_enabled_survives_reset():
+    """Mirrors test_preset_retarget_survives_reset for the split-floor gate.
+
+    Without the pipeline storing the chosen gate value, reset()'s fresh
+    AecConfig would silently put BALANCED's True back.
+    """
+    pipeline = _new_pipeline()
+    pipeline.set_aec_preset("no_floor")
+    after_set = _gate(pipeline)
+    assert after_set is False
+
+    pipeline.reset()
+    assert _gate(pipeline) == after_set
+
+    # The mutation that would break it: clearing the stored value makes the
+    # rebuild revert, so the assertion above is not vacuous.
+    pipeline._post_beam_res._split_floor_enabled = None
+    pipeline.reset()
+    assert _gate(pipeline) != after_set
+
+
+def test_construction_time_no_floor_matches_runtime_retarget():
+    """Building with aec_preset=NO_FLOOR must match balanced-then-retarget.
+
+    Same property as test_construction_time_preset_matches_runtime_retarget,
+    for the boolean gate instead of the two dB floors: now that the gate has
+    its own runtime setter, a fresh instance and a retargeted one must agree
+    on all three fields NO_FLOOR touches.
+    """
+    built_no_floor = FourChannelAecPipeline(
+        FourChannelAecConfig(
+            sample_rate=16000, frame_size=256, hop_size=128,
+            aec_preset=AecPreset.NO_FLOOR,
+        )
+    )
+    retargeted = _new_pipeline()
+    retargeted.set_aec_preset("no_floor")
+
+    assert _gate(built_no_floor) == _gate(retargeted) is False
+    assert _live_floor(built_no_floor) == _live_floor(retargeted)
+    assert _dt_floor(built_no_floor) == _dt_floor(retargeted)
+
+
+def _no_floor_scene_context(nf, hop):
+    """A hop where the split floor actually binds: converged, far-active
+    (enough render energy to fire the latch on this very hop), no
+    double-talk, and residual echo (r2) that dwarfs the near-end spectrum --
+    so the AEC3-native min_gain this hop would clamp suppression far below
+    the far-active floor if nothing lifted it back up.
+    """
+    from lib.aec.python.modules.dataclasses import AecResContext
+
+    rng = np.random.default_rng(11)
+    # render std 0.1 -> after the *32768 int16 scaling inside process(), mean
+    # square ~= (0.1*32768)**2 ~= 1.07e7, comfortably over the 1e6 latch
+    # threshold (min_gain_far_latch_power) on the very first hop.
+    render = (rng.standard_normal(hop) * 0.1).astype(np.float32)
+    tiny = (1e-4 * (rng.standard_normal(nf) + 1j * rng.standard_normal(nf))).astype(
+        np.complex64
+    )
+    strong_r2 = np.full(nf, 1.0e9, dtype=np.float32)
+    zc = np.zeros(nf, dtype=np.complex64)
+    z = np.zeros(hop, dtype=np.float32)
+    ctx = AecResContext(
+        raw_output=z, formed_output=z, echo_spec=zc, far_power=1.0e6, far_spec=zc,
+        near_spec=tiny, filter_converged=True, erle_factor=1.0, dt_indicator=0.0,
+        divergence=0.0, over_sub=1.0, saturation_level=0.0, error_spec=tiny,
+        res_gain=np.ones(nf, np.float32), comfort_noise=np.zeros(nf, np.float32),
+        r2=strong_r2, usable_linear=True,
+    )
+    return ctx, render
+
+
+def test_runtime_no_floor_switch_changes_suppressor_gain_output():
+    """The whole point of this retarget: it must move what PostBeamResidual-
+    Suppressor.process() actually outputs on a scene where the split floor
+    matters, not just an internal flag.
+
+    BALANCED (floor ON) must clamp the gain up to at least the far-active
+    floor once the far-active latch fires; NO_FLOOR (switched at runtime on
+    a second, otherwise-identical pipeline -- no rebuild) must NOT, so its
+    gain is strictly lower on this deep-suppression scene.
+    """
+    pipeline = _new_pipeline()
+    nf, hop = pipeline.n_freqs, pipeline.hop_size
+    ctx, render = _no_floor_scene_context(nf, hop)
+
+    gain_balanced = pipeline._post_beam_res.process(ctx, render).res_gain.copy()
+    far_active_floor_power = pipeline._post_beam_res._gain._split_floor_far_active_live
+
+    # Sanity: the floor actually bound on at least one bin this hop (not a
+    # vacuous scene where AEC3's own gain was already above the floor).
+    assert np.any(gain_balanced >= far_active_floor_power), (
+        "scene did not exercise the floor at all -- strengthen r2/near_spec"
+    )
+
+    pipeline2 = _new_pipeline()
+    pipeline2.set_aec_preset("no_floor")
+    assert _gate(pipeline2) is False
+    gain_no_floor = pipeline2._post_beam_res.process(ctx, render).res_gain
+
+    # Every bin the floor touched above must now be free to go lower.
+    assert np.all(gain_no_floor <= gain_balanced)
+    assert np.any(gain_no_floor < gain_balanced), (
+        "NO_FLOOR produced an identical gain to BALANCED on a scene built "
+        "to exercise the floor -- the runtime gate is not actually reaching "
+        "the suppressor's gain computation"
+    )
 
 
 def test_preset_retarget_rejects_bad_arguments_without_writing():

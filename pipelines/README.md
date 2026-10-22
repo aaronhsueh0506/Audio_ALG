@@ -1,5 +1,35 @@
 # C Pipeline: linear AEC + echo-aware NR/RES gain fusion
 
+## ARM target selection
+
+C deployment supports both ARM EABI32 and AArch64 builds. The target compiler's
+predefined macros select the path: AArch64 uses the guarded NEON model kernels;
+ARM32 uses their existing scalar implementations. `SIMD=0` still forces scalar.
+The shared FFT independently selects its available target implementation; select
+the board compiler and ABI flags rather than editing source guards. Signal grids,
+model state tensors and latency do not change with pointer width.
+
+For ARM32 NEON use `EXTRA_CFLAGS=-mfpu=neon-vfpv4` (`-mfpu=neon-fp-armv8` on
+AArch32 ARMv8 cores), not plain `-mfpu=neon`: without hardware FMA each explicit
+`fmaf()` in the AEC, NR and shared kernels becomes a libm call (same bits, much
+slower). ARMv7 Advanced SIMD flushes subnormals to zero and returns the default
+NaN, so `SIMD=1` and `SIMD=0` can differ on ARM32 for subnormal or NaN-payload
+values; only the NE10 NEON FFT and, on cores with fused FMA
+(`-mfpu=neon-vfpv4`), the AEC delay matched-filter kernels are affected.
+
+Public memory descriptors remain 32 bytes. Their build hashes add an ILP32 token
+on 32-bit targets and preserve the existing hashes on 64-bit targets. Re-query
+requirements for the target build; `_init_ex` rejects a descriptor from the other
+ABI before touching the supplied pool.
+
+`make target-abi-test` builds and runs the 13-interface descriptor test with the
+same target compiler/producer settings; `make test_target_abi` builds it without
+running. The keyed `test_target_abi` binary accepts `--write descriptor.bin` and
+`--reject descriptor.bin`. Exchange files between 32/64-bit builds with the same
+model/grid settings: rejection must leave caller memory unchanged even after the
+foreign byte budget is normalized to the current requirement.
+
+
 ## Architecture
 
 ```
@@ -34,28 +64,30 @@ instance.
 |--------|---------|--------|----------|
 | AEC | libaec.a | aec.h | PBFDKF adaptive filter + shadow filter |
 | NR | libanr.a | anr.h | MMSE-LSA + MCRA noise est + SPP |
-| RES | libaec.a (included) | aec.h (`AecResContext`) | Residual echo suppression, folded into AEC's freq-domain seam |
+| RES | libaec.a | aec_res.h (`AecRes`) / aec.h (`AecResContext`) | Independent post-beam frequency gain API; mono also exposes the AEC-owned gain through its context |
 | Mono integration | libaudio_pipeline.a | mono_aec_nr_res/audio_pipeline.h | One-mic AEC + NR/RES, heap or caller-owned pool |
 | 4-ch front end | libaudio_pipeline_4ch.a | 4ch_aec_bf_nr_res/4aec_nr_res.h | One shared aligner + four linear AECs + the fuse (`four_aec_front_process()`, `four_aec_fuse()`); the post-beam stages are the application's; the archive contains only this core |
-| Complete 4-ch spatial | application object | 4ch_aec_bf_nr_res/audio_pipeline_4ch.h | Front end + reusable SRP-PHAT/GSC libraries + the post-beam RES, NR, comfort noise and synthesis chained in `audio_pipeline_4ch.c`; linked into the application, not another archive |
+| Complete 4-ch spatial | application object | 4ch_aec_bf_nr_res/audio_pipeline_4ch.h | Front end + reusable SRP-PHAT/BF libraries + the post-beam RES, NR, comfort noise and synthesis chained in `audio_pipeline_4ch.c`; linked into the application, not another archive |
 | Mono/4-ch Align-ULCNet | application objects | mono_alignulcnet/audio_pipeline_ulcnet.h and 4ch_alignulcnet/audio_pipeline_4ch_ulcnet.h | Existing component libraries + C pre/post + external accelerator callback |
 | Mono DFN2 replacement | libaudio_pipeline_dfn.a (+ libaudio_pipeline.a host) | mono_aec_dfn_res/audio_pipeline_dfn.h | The conventional mono pipeline (16 kHz default, 8/16/48 kHz) as the host (`audio_pipeline_process_spec()`); the application forms P = E.G_res (+ comfort noise); DFN2 estimates from the linear-AEC error and is applied to P, at 48 kHz directly, below 48 kHz through the rate bridge; phased hop `process_begin` / `nn_begin` / `nn_end` / `process_end` |
 | 4-ch DFN2 replacement | lib4aec_dfn_res.a (+ libaudio_pipeline_4ch.a core) | 4ch_aec_bf_dfn_res/4aec_dfn_res.h | The four-lane front end (16 kHz default, 16/48 kHz); the application carves the post-beam RES, forms P = E.G_res (+ comfort noise) from `four_aec_fuse()`, and runs DFN2 on (E, P), at 48 kHz directly, at 16 kHz through the rate bridge; phased hop as above |
 
-RES is not a standalone module/library — it is exposed as the `AecResContext` seam on
-the AEC object. With `AecConfig.return_res_context=1` and `enable_res=0`, `aec_process_context()`
-(or the streaming `aec_analyze_render()` / `aec_process_capture()` pair, if the offline/streaming
-split matters more than shedding the emit copy) still computes the
-AEC3 post-filter's residual-echo suppression internals but does not apply them to the time
-output; `aec_get_res_context(a, &ctx)` then exposes `AecResContext` — the
-reconstructing 50%-overlap WOLA `error_spec`, its matching `echo_spec` /
-`near_spec`, `formed_hop`, `res_gain` (G_res(f)), `r2` (residual-echo PSD),
-`comfort_noise`, etc. — so an external caller
-can run AEC(linear) → NR → RES itself. `aec_process_context()` is this mono
-pipeline's own choice for exactly this pattern (this file's Architecture
-diagram above) — it never emits an `out` buffer, pure waste when nothing
-downstream reads it. See `lib/aec/c_impl/include/aec.h` (`AecResContext`,
-`aec_get_res_context()`, `aec_process_context()`) for the full field list.
+RES is available as an independent frequency-domain `AecRes` object in
+`aec_res.h`, shipped in `libaec.a`. The four-channel application owns one such
+object after `four_aec_fuse()`; `se_res_stage_gain()` calls `aec_res_process()`
+without another transform. NR independently calls `anr_process_gain()` on the
+same fused `frame.e`; the application merges the two gains, applies them once,
+and performs one final inverse transform/OLA. This is gain fusion, not a
+RES-applied spectrum feeding NR.
+
+The conventional mono application instead takes the AEC-owned `res_gain` from
+`AecResContext` (`g_res_ctx` in `SeSpecFrame`). With `return_res_context=1` and
+`enable_res=0`, `aec_process_context()` advances the linear filter and context
+calculation without copying returned time audio. The legacy `aec_process()`
+convenience API also emits time audio; with RES enabled it applies its own
+suppression/synthesis internally. That full convenience path is distinct from
+the four-channel linear front → external SRP/BF → fuse → gain stages flow.
+See `lib/aec/c_impl/include/aec.h` and `aec_res.h` for ownership and inputs.
 
 **`error_spec` does not always mean "error."** That configuration —
 `enable_res=0` with `return_res_context=1` — is the one mode where `lib/aec`'s
@@ -84,12 +116,12 @@ are delivered as separate archives where noted:
 
 | Application | Entry directory | Composition |
 |---|---|---|
-| Mono AEC + NR/RES | `mono_aec_nr_res/` | `audio_pipeline` + AEC + NR + audio_common |
-| 4-ch AEC + BF + NR/RES | `4ch_aec_bf_nr_res/` | 4-lane front end + DOA/GSC + post-beam RES/NR stages + audio_common |
+| Mono AEC + NR/RES | `mono_aec_nr_res/` | `audio_pipeline` + AEC + NR + audiolib |
+| 4-ch AEC + BF + NR/RES | `4ch_aec_bf_nr_res/` | 4-lane front end + DOA/BF + post-beam RES/NR stages + audiolib |
 | Mono Align-ULCNet | `mono_alignulcnet/` | mono ULCNet wrapper + AEC + AIAEC pre/post |
-| 4-ch Align-ULCNet | `4ch_alignulcnet/` | front-only 4-lane core + DOA/GSC + AIAEC pre/post |
+| 4-ch Align-ULCNet | `4ch_alignulcnet/` | front-only 4-lane core + DOA/BF + AIAEC pre/post |
 | Mono DFN2 | `mono_aec_dfn_res/` | mono host (`process_spec`) + the application's post-RES spectrum + dual-input DFN2 stage |
-| 4-ch DFN2 | `4ch_aec_bf_dfn_res/` | 4-lane front end + external BF/GSC + post-beam RES + dual-input DFN2 stage |
+| 4-ch DFN2 | `4ch_aec_bf_dfn_res/` | 4-lane front end + external beamformer (bf) + post-beam RES + dual-input DFN2 stage |
 
 The mono, 4-channel and mono ULCNet applications take their signal grid, AEC
 configuration and delay-request rules from `common/se_config.{h,c}`
@@ -125,6 +157,29 @@ selectable grids; the others have exactly one:
 
 (Verified against a live `aec_create()` at each grid, not hand-derived.)
 
+## Four-channel sample driver
+
+The four 4-channel sample mains use `4ch_aec_bf_nr_res/mcab_sample_driver.{c,h}`
+for option scanning and the setup → read → process → finite check → consume →
+finish → cleanup sequence. Each main supplies typed pipeline/model adapters;
+the driver is linked into these executables and is excluded from delivered
+algorithm archives.
+
+| Executable | Input and lifecycle |
+|---|---|
+| `audio_pipeline_4ch_raw` | Complete interleaved float32 raw hops, optional per-hop VAD, heap pipeline; trailing incomplete hops are ignored. |
+| `audio_pipeline_4ch_static` | 48 generated tone hops and an explicit VAD schedule; query/allocate/init_ex with caller-owned pool. |
+| `4ch_aec_bf_dfn_res` | Eight silent fail-open model hops; DFN2 matrix, delay-profile and descriptor setup stays local. |
+| `4ch_alignulcnet` | Four silent fail-open model hops; descriptor/accelerator pool and model installation stay local. |
+
+CLI defaults, help/error exits and diagnostics retain each sample's existing
+policy. In particular, static spatial and ULCNet numeric options retain their
+legacy `atoi/atof` conversion; raw and DFN2 retain their prior numeric checks.
+Model samples report success after resource destruction. The shared hop loop
+performs no allocation. Run `make -C 4ch_aec_bf_nr_res test-mcab-sample-driver`
+for CLI boundary, short-circuit, finite-output and cleanup-order regressions;
+this gate also runs through that directory's `make test`.
+
 ## Latency & Performance
 
 | 項目 | 數值 | 說明 |
@@ -137,52 +192,33 @@ selectable grids; the others have exactly one:
 
 上表是 conventional mono pipeline 的數字。兩條 Align-ULCNet application 的
 加總額外延遲同樣是 **1 hop**（唯一來源是 ULCNet synthesis WOLA）：mono 與
-4ch 變體都是——4ch 把 GSC 的 beamformed error 頻譜直接當成模型的分析幀，
+4ch 變體都是——4ch 把 BF 的 beamformed error 頻譜直接當成模型的分析幀，
 沒有中間的 beam WOLA→再 analysis 來回，也沒有 one-hop far 補償。細節見
 [`4ch_alignulcnet/README.md`](4ch_alignulcnet/README.md)。
 
 ### Memory Budget
 
-Measured figures from `"$(make -s print-bin-dir)"/aec_nr_pipeline_static --print-mem-size --sample-rate 16000`
-(balanced presets). The AEC row is the composite `aec_get_mem_size()` pool — it
-already contains HPF, PBFDKF ×2 (main+shadow), delay estimator, the RES/post
-context and the AEC-internal FFTs. Since NE10 vendored patch P0001 the NE10
-twiddle configs are carved from these pools too, so both columns are the
-complete memory requirement (strict init→destroy zero-heap on both backends):
+Measured with `"$(make -s print-bin-dir)"/aec_nr_pipeline_static --print-mem-size
+--sample-rate <sr> [--fft-size <alt>]` (balanced presets). The AEC column is the
+composite `aec_get_mem_size()` pool — it already contains HPF, PBFDKF ×2
+(main+shadow), delay estimator, the RES/post context and the AEC-internal FFTs.
+The NE10 twiddle configs are carved from these pools too, so the columns are the
+complete memory requirement (strict init→destroy zero-heap). 16 kHz's default
+grid is 256/128 (see "Parameter Alignment" above); the alternate 512/256 grid
+stays explicitly selectable.
 
-Re-measured against the current `lib/aec` pin (descriptor now reports
-layout_version=10). Both the AEC column and the control block moved this
-round: `sizeof(Aec)` grew 5832 -> 5848 B and the AEC pool grew by a per-grid
-constant (+2,560 B @8 kHz, +5,664 B @16 kHz/256, +5,120 B @16 kHz/512,
-+18,464 B @48 kHz), while `AudioPipelineLastTiming` embeds `AecStageTiming`
-verbatim, which went 16 -> 20 B and pushed the control block 176 -> 192 B --
-see the note under the table. Measured via
-`"$(make -s print-bin-dir)"/aec_nr_pipeline_static --print-mem-size balanced
---sample-rate <sr> [--fft-size <alt>]` on both backends, against the current
-grid (16 kHz default is 256/128 — see "Parameter Alignment" above). 16 kHz's
-alternate 512/256 grid is included since it remains explicitly selectable.
-
-| Rate / Backend | AEC | FFT (OLA) | NR | Pipeline bufs | **Total** |
-|--------|-----|-----------|-----|---------------|-----------|
-| **8 kHz KISS** | 278,256 B | 8,784 B | 67,424 B | 5,168 B | **359,824 B (351.4 KB)** |
-| **8 kHz NE10** | 277,648 B | 8,176 B | 67,424 B | 5,168 B | **358,608 B (350.2 KB)** |
-| **16 kHz KISS (default, 256/128)** | 385,440 B | 8,784 B | 122,160 B | 5,168 B | **521,744 B (509.5 KB)** |
-| **16 kHz NE10 (default, 256/128)** | 384,832 B | 8,176 B | 122,160 B | 5,168 B | **520,528 B (508.3 KB)** |
-| **16 kHz KISS (alt, 512/256)** | 513,968 B | 16,976 B | 133,472 B | 10,288 B | **674,896 B (659.1 KB)** |
-| **16 kHz NE10 (alt, 512/256)** | 512,592 B | 15,600 B | 133,472 B | 10,288 B | **672,144 B (656.4 KB)** |
-| **48 kHz KISS** | 1,185,536 B | 33,360 B | 374,336 B | 20,528 B | **1,613,952 B (1,576.1 KB)** |
-| **48 kHz NE10** | 1,182,624 B | 30,448 B | 374,336 B | 20,528 B | **1,608,128 B (1,570.4 KB)** |
+| Rate | AEC | FFT (OLA) | NR | Pipeline bufs | **Total** |
+|------|-----|-----------|-----|---------------|-----------|
+| **8 kHz** | 285,376 B | 8,176 B | 67,504 B | 6,288 B | **367,504 B (358.9 KB)** |
+| **16 kHz (default, 256/128)** | 398,768 B | 8,176 B | 122,240 B | 6,288 B | **535,632 B (523.1 KB)** |
+| **16 kHz (alt, 512/256)** | 527,488 B | 15,600 B | 133,552 B | 12,432 B | **689,232 B (673.1 KB)** |
+| **48 kHz** | 1,228,272 B | 30,448 B | 374,416 B | 24,720 B | **1,658,016 B (1,619.2 KB)** |
 
 The AEC column is owned by `lib/aec/docs/c_user_manual_zh_TW.md` §4 — re-measure from
 there rather than editing it here, and always prefer the value
 `audio_pipeline_get_mem_requirements()` returns at runtime.
 
-(Totals include the 192 B `AudioPipeline` control block, not broken out as
-its own column above. It grew 176 -> 192 B with the `AecStageTiming` growth
-described above: the record itself gained 4 B, but `ALIGN16(sizeof(
-AudioPipeline))` had no slack left to absorb it, so the whole 16 B lands in
-every Total. That is measured from `--print-mem-size`, which reports the
-control block directly, not derived from the struct.)
+(Totals include the 160 B `AudioPipeline` control block, not broken out as its own column.)
 
 > filter_length 是 ms-derived（52 ms；≥44.1 kHz 用 64 ms → 48 kHz 為 3072
 > taps、6 partitions at hop=512），加長會等比增加 AEC 記憶體；記憶體吃緊時先縮
@@ -218,7 +254,7 @@ read straight from each application's `process` function
 | Application | Analysis call | Stages written out | Synthesis |
 |---|---|---|---|
 | Mono AEC + NR/RES | `audio_pipeline_process_spec()` | `se_anr_stage_gain`, `g_res_ctx`, min, apply, `aec_cng_fill` | `audio_pipeline_synthesize()` |
-| 4-ch AEC + BF + NR/RES | `four_aec_front_process()` → SRP/GSC → `four_aec_fuse()` | `se_res_stage_gain`, `se_anr_stage_gain`, min, apply, `aec_cng_fill` | `ac_istft_push()` |
+| 4-ch AEC + BF + NR/RES | `four_aec_front_process()` → SRP/BF → `four_aec_fuse()` | `se_res_stage_gain`, `se_anr_stage_gain`, min, apply, `aec_cng_fill` | `ac_istft_push()` |
 | Mono / 4-ch Align-ULCNet | `*_process_begin()` (4-ch: or `process_front()` + `process_beam()`) | the network (`nn_begin` / `nn_end`) | `*_process_end()` |
 | Mono / 4-ch DFN2 | `mono_aec_dfn_res_process_begin()`, `four_aec_dfn_res_front_process()` + `_process_begin()` | RES gain, min with the unity gain, apply, `aec_cng_fill`, then the DFN2 stage | `*_process_end()` |
 
@@ -262,7 +298,7 @@ Rules the chain relies on:
   per generator, reset to `SE_CNG_RNG_SEED`.
 - A spectrum-type stage (the 4-channel beamformer) is a function that takes the
   lane spectra and returns a spectrum; it replaces `f.e` in the chain. The
-  4-channel applications feed the GSC spectrum straight into `four_aec_fuse()`.
+  4-channel applications feed the BF spectrum straight into `four_aec_fuse()`.
 - Every pointer in the frame is borrowed from the producer. It is valid until the
   producer runs again (the next `process_spec` / `four_aec_front_process`, a
   reset) and is never written through.
@@ -270,7 +306,7 @@ Rules the chain relies on:
 ### Where do I call the inverse transform?
 
 Once per hop, last: `audio_pipeline_synthesize()` (mono) or `ac_istft_push()`
-(audio_common) on the spectrum that has all gains applied and comfort noise added.
+(audiolib) on the spectrum that has all gains applied and comfort noise added.
 It performs the inverse FFT, the sqrt-Hann window and the overlap-add, and emits
 exactly one hop; the half-window it holds back is the pipeline's one hop of
 algorithmic latency. The spectrum must sit on the analysis frame of the same hop
@@ -299,7 +335,8 @@ HfTilt* tilt = hf_tilt_init((uint8_t*)pool + ALIGN16(req.bytes), n_freqs, 8, 0.0
 - The 4-channel core (`FourAecNrRes`) now owns only the shared aligner, the four
   lanes and the fuse buffers. The wrappers carve the post-beam stages behind it
   from their own pool: `four_aec_nr_res_stage_configs()` returns the `AecConfig`
-  for `aec_res_init()` and the `AnrConfig` for `se_anr_stage_init()`.
+  for `aec_res_init()` and the `AnrConfig` for `se_anr_stage_init()` (all-zero
+  when `enable_nr = 0`: no denoiser is configured or sized).
 - Re-query the descriptor after any library, backend, build-option or config
   change; `init_ex()` refuses a stale one (8-point gate).
 
@@ -329,8 +366,8 @@ The 4-ch Align-ULCNet application can also be split before the beamformer, for a
 caller whose mask and VAD come from the lane spectra of the same hop (the masker
 reads lane 0): `audio_pipeline_4ch_ulcnet_process_front()` returns the read-only lane
 spectra, the caller computes mask, `vad_raw` and `vad_out`,
-`audio_pipeline_4ch_ulcnet_process_beam()` runs SRP and GSC with them, and
-`audio_pipeline_4ch_ulcnet_beam_state()` reads the DOA and GSC adaptation state.
+`audio_pipeline_4ch_ulcnet_process_beam()` runs SRP and BF with them, and
+`audio_pipeline_4ch_ulcnet_beam_state()` reads the DOA and BF adaptation state.
 `process_begin()` is `process_front()` + `process_beam(front, v, v, NULL)`; see
 [`4ch_alignulcnet/README.md`](4ch_alignulcnet/README.md).
 
@@ -348,9 +385,9 @@ by the pipeline's `reset()`, so the board keeps its recurrent state in step.
 ```c
 FourAecFront front;
 four_aec_front_process(core, mics_interleaved, ref, &front);   /* shared aligner + 4 lanes; front.linear_spectra[4] */
-gsc_process_with_weights(gsc, front.linear_spectra, doa, adapt, mask, gsc_spectrum, gsc_weights);   /* external SRP/GSC */
+bf_process_with_weights(bf, front.linear_spectra, doa, adapt, mask, bf_spectrum, bf_weights);   /* external SRP/BF */
 SeSpecFrame f;
-four_aec_fuse(core, gsc_weights, gsc_spectrum, &f);            /* project near, R^2, comfort noise with those weights */
+four_aec_fuse(core, bf_weights, bf_spectrum, &f);            /* project near, R^2, comfort noise with those weights */
 /* then the same chain: se_res_stage_gain(res, &f), se_anr_stage_gain(nr, &f, ...), sk_min_f32, ... */
 ```
 
@@ -358,7 +395,7 @@ four_aec_fuse(core, gsc_weights, gsc_spectrum, &f);            /* project near, 
 `FOUR_AEC_NR_RES_SEQUENCE_ERROR`), refuses an all-zero or non-finite weight set
 and resets the core on a lane disagreement. The front view lives until the next
 `four_aec_front_process()` or `four_aec_nr_res_reset()`; there is no token to
-return. The Align-ULCNet application never fuses: it takes the GSC spectrum as
+return. The Align-ULCNet application never fuses: it takes the BF spectrum as
 its error frame directly.
 
 ### What is in the frame?
@@ -387,12 +424,12 @@ latency.
 ```bash
 # From Audio_ALG/pipelines/ — builds component libs and mono applications
 make                # aec_nr_pipeline, static variant and mono_alignulcnet
-make SIMD=0         # one switch: mono pipeline + AEC + NR + audio_common all scalar
+make SIMD=0         # one switch: mono pipeline + AEC + NR + audiolib all scalar
 
 > **SIMD=0 and SIMD=1 are not bit-identical end to end, by design.** Each
 > shared kernel is byte-exact against its scalar twin (proved per kernel by
-> `audio_common/test/simd_selftest.c`), but the AEC matched filter diverges
-> deliberately: `delay_aec3.c`'s dot product uses four accumulators plus
+> `audiolib/common/test/simd_selftest.c`), but the AEC matched filter diverges
+> deliberately: `delay_aec.c`'s dot product uses four accumulators plus
 > `vfmaq_f32` — reordered summation *and* fused rounding — and its NLMS update
 > fuses where the scalar spells a separate multiply and add. Measured on the
 > mono pipeline, the two builds differ in 75 bytes at fft=256 and 67 at
@@ -568,7 +605,7 @@ Built by default alongside Version A (both `lib/aec` and `lib/nr` track
 selected at runtime). One
 caller-owned pool, no malloc after init, byte-identical output to Version A
 (see Verification below). Since NE10 vendored patch P0001
-(`audio_common/lib/ne10/VENDORED.md`), the NE10 backend's three R2C/C2R
+(`audiolib/common/lib/ne10/VENDORED.md`), the NE10 backend's three R2C/C2R
 twiddle configs are carved FROM the caller pool too
 (`ne10_fft_init_r2c_float32_ext`: carve + twiddle-generate directly over
 caller-supplied memory, no `malloc()` involved) and are already counted in
@@ -602,7 +639,7 @@ publish flow, and the on-target verification checklist — is in
 
 ### AEC (`AecConfig`, see `aec.h`)
 
-**Presets**: `AEC_PRESET_MILD` / `AEC_PRESET_BALANCED`（default）/ `AEC_PRESET_AGGRESSIVE`
+**Presets**: `AEC_PRESET_MILD` / `AEC_PRESET_BALANCED`（default）/ `AEC_PRESET_AGGRESSIVE` / `AEC_PRESET_NO_FLOOR`
 
 | Parameter | Default | Description |
 |-----------|---------|-------------|
@@ -613,12 +650,14 @@ publish flow, and the on-target verification checklist — is in
 
 **RES / preset strength axis**：RES has no standalone `ResConfig` — it lives inside `AecConfig`
 and the AEC3 post-filter chain (`SuppressionGain`, `ResidualEchoEstimator`, etc.), surfaced
-externally through the `AecResContext` seam (see `## Modules` above). The three AEC presets
-differ in exactly one field:
+externally through the `AecResContext` seam (see `## Modules` above). The four AEC presets
+differ in exactly three fields:
 
-| Parameter | Mild | Balanced | Aggressive | Description |
-|-----------|------|----------|------------|-------------|
-| `min_gain_floor_far_active_db` | -20 | -28 | -38 | AEC3 `SuppressionGain` 遠端活躍時的最低增益下限 dB（最大抑制量）；其餘欄位（filter length、Kalman Q、delay buffer、CNG…）三個 preset 皆相同 |
+| Parameter | Mild | Balanced | Aggressive | No-floor | Description |
+|-----------|------|----------|------------|----------|-------------|
+| `min_gain_floor_far_active_db` | -20 | -28 | -38 | -28（inert） | AEC3 `SuppressionGain` 遠端活躍時的最低增益下限 dB（最大抑制量） |
+| `min_gain_floor_dt_db` | -20 | -20 | -30 | -20（inert） | double-talk 期間套用的地板 dB；mild/balanced 停在 dataclass 共用預設 -20，只有 aggressive 額外下探到 -30（其餘欄位：filter length、Kalman Q、delay buffer、CNG…四個 preset 皆相同） |
+| `min_gain_split_floor_enabled` | true | true | true | **false** | 地板機制本身的開關；`AEC_PRESET_NO_FLOOR` 把它關掉，此時上面兩個 dB 欄位不生效（AEC3 原生 min_gain 不被任何東西往上拉），抑制可以深到 AEC3 自己算出的極限 |
 
 ### Runtime strength control（不重建、不動 pool）
 
@@ -640,6 +679,13 @@ differ in exactly one field:
 live 值重新起走。兩者都**不是重啟**：濾波器、延遲鎖定、噪聲底與增益平滑歷史全部繼續
 跑；要重啟請用對應的 `_reset()`。
 
+`AEC_PRESET_NO_FLOOR` 也可以在**已經在跑的** instance 上用同一個 `set_aec_preset()`
+切換，不必重建：`min_gain_split_floor_enabled` 這個 gate 會跟兩個 dB 欄位同一次呼叫一起
+retarget（沒有 ramp，立即生效，跟 DT 地板一樣是硬切），所以不會有一個 hop 是「preset
+標籤已經是 NO_FLOOR，但 gate 還沒跟上」的中間狀態。mono（`AEC.set_preset()` /
+`audio_pipeline_set_aec_preset()`）與 4ch（`FourChannelAecPipeline.set_aec_preset()` /
+`audio_pipeline_4ch_set_aec_preset()`）兩邊 Python/C 都支援。
+
 > **4ch：對四條 lane 重新指定 preset 是無效操作。** 四條 lane 都以
 > `spatial_linear_context` 建立，從不走到自己的殘留抑制器，它們的地板
 > 什麼都不塑形。真正乘上輸出的 gain 來自**唯一一個**共用的 post 級抑制器，這就是
@@ -652,8 +698,8 @@ live 值重新起走。兩者都**不是重啟**：濾波器、延遲鎖定、�
 > setter 做的事是重組完整組態再交給 `anr_reconfigure()`。
 
 > **A/B 量測時該預期什麼。** far-active 地板只在 **far-active 且非 double-talk** 的
-> hop 生效：double-talk 期間套的是 DT 地板，而 DT 地板三個 preset **完全相同**；
-> far-active latch 觸發前套的是 far-silent 地板。同一個 `G_res` 還決定注入的 comfort
+> hop 生效：double-talk 期間套的是 DT 地板（mild/balanced 共用 -20 dB，aggressive 是
+> -30 dB，見上表 `min_gain_floor_dt_db`）；far-active latch 觸發前套的是 far-silent 地板。同一個 `G_res` 還決定注入的 comfort
 > noise 量（振幅正比於 `sqrt(1 - G_res^2)`，再乘該 bin 的 `G_nr`（下限 −10 dB），見兩處實作的 CNG
 > 步驟——地板越深、CNG 反而越多）。所以**整段錄音的平均值移動幅度會小於 dB 落差所暗示的量**，而且只量
 > echo／degradation 的 A/B 會把 CNG 的變化錯記到別的機制。請在 echo 對齊或
@@ -751,7 +797,8 @@ older power-dB (`/10`) convention.
 | **Filter 發散（輸出爆音）** | Kalman Q 太激進或 echo path 劇變 | 降低 `kalman_q_high`（如 1e-3→5e-4） |
 | **Echo path 變化後適應慢** | Shadow filter 太保守 | 提高 `shadow_mu_nlms`（如 0.5→0.7），降低 `shadow_err_alpha`（如 0.8→0.6） |
 
-> `min_gain_floor_far_active_db` 是唯一在 mild/balanced/aggressive 三個 preset 間變動的欄位；
+> `min_gain_floor_far_active_db` 與 `min_gain_floor_dt_db` 是在 mild/balanced/aggressive
+> 三個 preset 間變動的兩個欄位（aggressive 的 DT 地板是 -30 dB，其餘兩個 preset 共用 -20 dB）；
 > 沒有獨立的 `res_*` tunable struct（見上方 `AEC (AecConfig, see aec.h)`）。
 
 ### NR 相關

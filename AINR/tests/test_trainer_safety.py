@@ -22,6 +22,7 @@ _COSINE_TRAINERS = (
     "RNNoise-ERB/train.py",
     "GTCRN/train.py",
     "DeepFilterNet2/train.py",
+    "DeepFilterNet3/train.py",
 )
 
 

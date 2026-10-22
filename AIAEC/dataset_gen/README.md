@@ -899,22 +899,29 @@ channel with the command below, which avoids repeating acoustic mixing:
 
 #### The one exception: verified frontend-equivalent migrations
 
-> **⚠ The table is empty.** The current frontend (per-grid shadow-copy
-> error-baseline retention, C hard restart clearing coarse/leakage evidence)
-> **moves `linear_error`** relative to every earlier build, so no
-> byte-identity evidence can describe a corpus rendered by an earlier
-> frontend. Every identity a corpus on disk may carry is in
-> `RETIRED_BEHAVIOR_HASHES` and is refused with an instruction to
-> rematerialize (`rematerialize_linear_aec.py`, WITHOUT `--resume`, then
-> repack, then retrain), not with a bare hash mismatch. A corpus that also
-> needs the `[acoustic_tails]` mixture must be generated afresh instead —
-> see "Migrating an existing corpus" above.
+> **⚠ The table is empty.** Historical corpus identities affected by the
+> per-grid shadow-copy baseline retime and C restart evidence clearing
+> remain retired: those changes move `linear_error`, so an inert refactor
+> cannot make the earlier waveforms compatible. They are refused with an
+> instruction to rematerialize (`rematerialize_linear_aec.py`, WITHOUT
+> `--resume`, then repack and retrain). A corpus that also needs the
+> `[acoustic_tails]` mixture must be generated afresh instead — see
+> "Migrating an existing corpus" above.
 >
-> Retired identities are **never retargeted**: pointing one at a live hash
-> would declare an old waveform compatible with a build that does not produce
-> it. `behavior_hash_schema` stays `canon-ast-1`: these are behaviour changes,
-> not canonicalizer changes. Pinned by
+> Retired identities are **never retargeted**. `behavior_hash_schema` stays
+> `canon-ast-1`; the canonicalizer is unchanged. The refusals are pinned by
 > `tests/test_linear_aec_behavior_migration.py`.
+
+The 2026-10-21 orchestrator-stage refactor and numeric CLI preset support move
+identity `419f473e...ff8fa` to `9fa7a2de...245e5` while leaving the frozen
+materialized signal unchanged. Before/after full real AEC 2021/2023 and
+self-recorded clips at 16/48 kHz have byte-identical formed output, error,
+echo and context/state traces (8,636 hops across nine profiles); the same
+comparator rejects a one-bit change at the actual formed-output getter.
+No local corpus or checkpoint ledger is stranded at the previous identity,
+so this measured equivalence adds no exception to the empty table. Existing
+recorded data still needs an explicitly admitted pair to cross an identity
+boundary; measurement alone does not change admission policy.
 
 `ACCEPTED_BEHAVIOR_HASH_MIGRATIONS` in `linear_aec.py` is an explicit table of
 `recorded → current` behaviour-hash pairs that are known to produce the *same*
