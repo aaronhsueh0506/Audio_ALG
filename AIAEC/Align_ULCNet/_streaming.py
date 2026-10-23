@@ -1,29 +1,18 @@
 #!/usr/bin/env python3
 """Internal Align-ULCNet frame-by-frame deployment reference.
 
-用法:
-    python3 inference.py checkpoint.pth mic.wav far.wav out.wav
-    python3 inference.py checkpoint.pth mic.wav far.wav out.wav --verify
-    python3 inference.py checkpoint.pth kf_error.wav far.wav out.wav \\
-        --input-is-linear-error
+Everything after the linear AEC is strictly incremental: hop-sized sample chunks
+feed StreamSTFT, every finished frame goes through forward_stream (one complex
+[B,1,F] frame in, one out), and StreamISTFT reconstructs samples as they become
+final. PBFDKF also advances one hop at a time on raw mic/far; the Python PBFDKF
+is a reference for the production C seam with the same state lifetime and hop
+cadence. ``--far-input-mode`` changes only the model's far branch, not PBFDKF or
+its linear_error.
 
-Checkpoint loading and the audio frontend are identical to inference.py.  The
-``--far-input-mode`` switch changes only the model's far branch: PBFDKF still
-advances on raw mic/far and produces the same linear_error.  PBFDKF, STFT,
-network, and ISTFT all advance one input hop at a time.  The Python PBFDKF is
-only a reference for the production C seam, but its state lifetime and hop
-cadence are the same here.
-
-Everything after the linear AEC is strictly incremental: hop-sized sample
-chunks feed StreamSTFT, every finished frame goes through forward_stream (one
-complex [B,1,F] frame in, one out), and StreamISTFT reconstructs samples as
-they become final.  On startup the per-invocation I/O table and the state
-inventory (the deployment RAM contract) are printed.  ``--verify`` also runs
-the offline whole-utterance forward and reports the waveform difference.  That
-print is DIAGNOSTICS ONLY: no tolerance is applied and the exit code never
-changes.  The streaming equivalence gate is
-tests/test_streaming_align_ulcnet.py::test_stream_matches_offline, not this
-flag.
+On startup the per-invocation I/O table and the state inventory (the deployment
+RAM contract) are printed. ``--verify`` also runs the offline whole-utterance
+forward and prints the waveform difference as diagnostics only (no tolerance;
+the exit code never changes).
 """
 
 import os
@@ -117,9 +106,8 @@ def main(args, load_model_fn=None):
                     "istft": istft_out,
                 }))
 
-    # Hop-sized sample chunks: PBFDKF and the neural frontend advance with the
-    # same cadence.  Calling LinearAecEngine on each hop preserves its engine
-    # state; it does not reconstruct a fresh AEC per call.
+    # Hop-sized chunks: PBFDKF and the neural frontend advance with the same
+    # cadence; LinearAecEngine keeps its state across calls.
     for start in range(0, length, grid.hop_len):
         stop = min(start + grid.hop_len, length)
         primary_hop = primary[:, start:stop]
@@ -131,12 +119,12 @@ def main(args, load_model_fn=None):
             error_hop, _ = linear_aec(primary_hop, input_far_hop, grid.sr)
             if far_input_mode == 'raw_far':
                 # Keep the NN input on the checkpoint's training provenance;
-                # this does not bypass PBFDKF or alter its linear_error.
+                # PBFDKF and its linear_error are unaffected.
                 model_far_hop = input_far_hop
             else:
-                # Exact far hop PBFDKF consumed: raw until acquisition/ring
-                # fill, aligned afterward. This branch is retained only for
-                # explicit diagnostic comparison with the raw-far contract.
+                # Far hop PBFDKF consumed: raw until acquisition/ring fill,
+                # aligned afterward. Retained for diagnostic comparison with the
+                # raw-far contract.
                 model_far_hop = linear_aec.get_aligned_far()
         reference_error.append(error_hop)
         reference_far.append(model_far_hop)

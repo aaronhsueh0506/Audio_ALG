@@ -287,17 +287,10 @@ def validate_recording_contract(result: dict) -> None:
     if result.get("first_nonzero_delay_frame") is None:
         failures.append("shared matched-filter never accepted a nonzero delay")
     delay_error = abs(int(result.get("final_delay_error_samples", 1 << 30)))
-    # Same tolerance as evaluate_external_recordings.py: max(half-hop, 5ms).
-    # This script's own "expected" delay (estimate_file_offset()'s full-file
-    # broadband correlation, same function both scripts use) is not a
-    # half-hop (4-8ms) precision reference: on both checked-in recordings that
-    # correlation's own confidence (|corr| / sqrt(autocorr_cap * autocorr_src))
-    # is 0.05-0.24 -- close to noise-floor -- while the online matched-filter
-    # delay this checks against reports its own high-confidence "solid" state
-    # via a well-established, independently-validated AEC3-style criterion. A
-    # ~73-75 sample (4.5-4.7ms) gap between a converged online estimator and a
-    # weak-confidence offline correlation is not evidence the online estimate
-    # is wrong.
+    # Same tolerance as evaluate_external_recordings.py: max(half-hop, 5 ms).
+    # The expected delay is estimate_file_offset()'s full-file broadband
+    # correlation, a weaker reference than the online matcher's "solid"
+    # estimate, so a gap of a few ms is not evidence against the online estimate.
     tolerance = max(int(result["hop_size"]) // 2, int(result["sample_rate"]) // 200)
     if delay_error > tolerance:
         failures.append(

@@ -24,14 +24,12 @@ preserved by the network and left to RES, and non-speech is suppressed by
 both. The host's comfort-noise fill is kept as a switch but is OFF by
 default in this variant: with it on, the additive fill perturbs P's phase in
 the RES-cut bins where it is largest, which breaks the estimate/apply phase
-consistency the complex deep filter relies on, and no true-model result yet
-supports enabling it. Turn it on only for a subjective far-end-only / silence
-A/B; when on it travels through the network like every other component of P
+consistency the complex deep filter relies on. Turn it on only for a
+subjective far-end-only / silence A/B; when on it travels through the network like every other component of P
 and `atten_lim_db` bounds how far any bin can be attenuated. The dual-input
-topology with the full deep filter is itself the product hypothesis: the C
-gates prove it structurally, and its quality against a mask-only compose is
-settled by `pipelines/tools/eval_dfn2_variants.py` once a checkpoint of the
-current model contract exists.
+topology with the full deep filter is checked structurally by the C gates;
+its quality against a mask-only compose is evaluated by
+`pipelines/tools/eval_dfn2_variants.py`.
 
 With no model callback (or a failing one) the output is the conventional
 pipeline with `enable_nr=0` delayed: bit for bit by two hops at 48 kHz

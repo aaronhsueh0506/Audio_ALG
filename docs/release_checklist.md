@@ -19,137 +19,6 @@ The release owner must record every command, commit, result, failure, and accept
 exception in a dated release report. Do not convert an unexecuted item into a
 PASS based only on source inspection.
 
-## 0. Closed audit findings and live release gates
-
-This section preserves the failure modes found during the release audit. Every
-item below is now fixed, regression-tested, or explicitly classified as a
-documented historical limitation. Remaining GO/NO-GO work is tracked in the
-numbered gates below, not by stale source-audit notes.
-
-- [x] **F2.4's mu-holdoff no-reset guard was silently reverted and shipped
-      broken for ten weeks.** FIXED (Python + C + regression tests at
-      all four grids, mutation-verified). Recorded here because the failure mode
-      is the reusable lesson, not the line: commit `2f3699f` ("remove dead flag
-      branches") collapsed
-      `if not cfg.mu_holdoff_no_reset or holdoff == 0:` to an **unconditional**
-      arm — keeping the arm the flag had *disabled*, because
-      `mu_holdoff_no_reset` was in `AecConfig._LEGACY_HARDCODE_TRUE`. The
-      explanatory comment above the line survived intact and went on describing
-      the guard, so the source read correctly; only the executed branch was
-      wrong, and the C port mirrored it. Nothing caught it for ten weeks.
-      **When retiring a feature flag, evaluate which arm was live — a
-      hardcoded-TRUE flag means the `if not flag` branch is the dead one.**
-
-- [x] **The wall-clock timing audit was incomplete while shipped documentation
-      said it was complete.** `AEC/README.md` presented a closed three-item blocker list
-      (800-case, native 48 kHz, tuning-not-timing) and `AEC/CHANGELOG.md:965`
-      states "Every constant now covers the same wall-clock span at every
-      grid". Both are false. Known un-retimed constants on the default-ON path,
-      all of which mistime on this release's own new 16 kHz default grid
-      (hop 128 = 8 ms) — **this list is not yet closed; a full inventory is the
-      first task**, see §4:
-
-      | constant | site | validated anchor | 16k/256 | 16k/512 | 48k/1024 |
-      |---|---|---:|---:|---:|---:|
-      | `simple_mu_holdoff = 20` | `aec.c:448`, `orchestrator.py:1332` | 200 ms | 160 ms | 320 ms | 213 ms |
-      | coherence `alpha = 0.05` TC | `aec_post.c:53`, `config.py:63` | 195 ms | 156 ms | 312 ms | 208 ms |
-      | misadjustment `n_hops_target = 2` | `aec.c:1518`, `orchestrator.py:130` | ~16 ms | 16 ms | 32 ms | 21 ms |
-      | ERLE window `decay = 0.999` TC | `aec.c:2213`, `orchestrator.py:2137` | ~10 s | 8 s | 16 s | 10.7 s |
-      | recent ERLE peak `last 15 hops` | — | 150 ms | 120 ms | 240 ms | 160 ms |
-      | stationary-DT baseline `0.999/0.95/0.995` | `aec.c:2286`, `orchestrator.py:2229` | tbd | | | |
-      | instant-ERLE `0.7` | `aec.c:2300`, `orchestrator.py:2249` | tbd | | | |
-      | `simple_mu` alphas `0.3/0.99/0.95` | `aec.c:448-450` | tbd | | | |
-
-      **The anchor is the last commit that empirically VALIDATED the constant,
-      not the commit that introduced it, and not the in-code comment.** Worked
-      example: `simple_mu_holdoff = 20` was introduced at `d774771`
-      when the default was frame 512 / hop 256 = 16 ms, so its
-      comment says "~320ms" and was correct *then*. It was validated at
-      `7b2cf04` (the F2.4 800-case ablation) when `AecConfig` had
-      flipped to `frame_size = -1  # Auto: sample_rate * 20ms` = hop 160 =
-      10 ms. The validated span is therefore **200 ms**, and the comment has
-      been stale since then. Anchoring on the introduction commit instead
-      gives a 1.6x error.
-
-      Each constant needs a verdict: retime (and extend `test_rate_structural`
-      check (d2) + the Python effective-value suite), or classify as a genuine
-      event count with a recorded rationale (as `CONV_FRAMES` and
-      `ne_recent_sustain` were). Then restore an accurate disclosure. Do not
-      close §5 or §15 while the README asserts a completeness the tree lacks.
-      **Resolved:** the full inventory now lives in
-      `AEC/docs/timing_constant_inventory.md`; every candidate has an authored
-      grid and a retime/event-count/dead verdict. Effective-value and mutation
-      tests cover the retimed values. The `simple_mu` batch is deliberately
-      not retimed because the measured full-batch change was not Pareto-safe.
-
-- [x] **AIAEC was the most-deviated consumer of the timing gap.** AIAEC pins
-      16 kHz **512/256**, the
-      grid furthest from every anchor in the table: holdoff 320 ms vs 200 ms,
-      ERLE decay ~16 s vs ~10 s, coherence TC 312 ms vs 195 ms, misadjustment
-      window 32 ms vs ~16 ms. Retiming will change `aec_behavior_hash`, so any
-      dataset generated first must be rematerialized or its contract bumped,
-      and any checkpoint trained on it retrained. Do not start bulk AIAEC
-      dataset generation before the retime lands. AINR is unaffected.
-      **Resolved:** the accepted timing changes are mirrored into `lib/aec`;
-      existing `8e5d05708`-era data is admitted only through an explicit
-      behavior-hash migration whose old/new linear-error and echo-estimate
-      WAVs were byte-identical. Unknown hashes still fail closed.
-
-- [x] **`FrameProcessor`'s docstring contradicted the code shipped with it.**
-      `NR/core/frame_processor.py:19` documents per-parameter defaults
-      (`frame_shift` "omitted -> frame_size / 2"), but the constructor raises
-      `ValueError` unless all three dimensions are omitted or all three given.
-      A caller following the docstring to reach the legacy 16 kHz 512/256 grid
-      gets a hard construction failure. The CHANGELOG is correct; the API
-      documentation an integrator actually reads is not. **Resolved:** the
-      public docstring now requires all three dimensions together, or all
-      omitted for the project default.
-
-- [x] **The `hop <= 0` guards in `pbfdkf_init_static` lacked
-      regression coverage.** Deleting both left the old suite green,
-      because the added CHECKs assert only the return value, which the nested
-      `pbfdaf_*` guard supplies independently. The guards are load-bearing:
-      without them `memset(p, 0, sizeof(*p))` runs before
-      rejection, breaking the no-write-on-reject contract that the same commit
-      published in `pbfdkf.h`. Add a sentinel + memcmp assertion on the
-      instance, matching the one that already covers the `sample_rate` case.
-      (The pool half of the contract is genuinely protected; only the instance
-      half is exposed.) **Resolved:** sentinel/no-write assertions now cover
-      both instance and pool entry points and are mutation-tested.
-
-- [x] **`AEC/python/modules/aec3_scale.py` claimed "default 160 samples
-      @ 16 kHz".** The C twin's identical sentence was corrected; the Python
-      source-of-truth it is a port of was not, so the two now contradict each
-      other. hop=160 is not merely non-default — `config.py`'s grid whitelist
-      makes it unreachable. This is the exact misreading that produced the 1.6x
-      mistiming class. **Resolved:** Python and C documentation now identify
-      16 kHz/256/128 as product default and 16 kHz/512/256 as the alternate.
-
-- [x] **`AEC/CHANGELOG.md` contains retired historical documentation paths.**
-      Of the original 73
-      prose `docs/*.md` / `docs/*.html` mentions, 71 point at verdict and
-      design documents deleted during the release cleanup
-      (`docs/f2_4_verdict.md`, `docs/v3_14_plan.md`, ...). Verify with:
-      `grep -oE '\bdocs/[a-zA-Z0-9_/-]+\.(md|html)' CHANGELOG.md | while read p; do [ -f "$p" ] || echo "$p"; done`
-      An integrator following any of them hits nothing. Either restore the
-      archive, rewrite them as pinned-commit history links, or drop the
-      reference and inline the one-line conclusion. Do not leave them as-is —
-      the CHANGELOG is a release surface, and §13 requires that every
-      documented file exist and work from a clean clone. **Accepted historical
-      limitation:** the CHANGELOG now labels those paths as retired evidence
-      and gives `git show <commit>:<path>` recovery instructions; current
-      README/manual pages do not link them as live specifications.
-
-- [x] **Five orchestrator state fields were written but never read.**
-      `_shadow_error_psd`, `_shadow_R`, `_shadow_mu_holdoff` (init + two reset
-      sites each), `_prev_filter_state` (init, reset, one write at
-      `orchestrator.py:2614`), and `_hb_mic_pwr_ring` (a 32-float array
-      allocated at `orchestrator.py:718` and never touched again). Confirmed
-      by grep across `python/` — every reference is an assignment. Dead state
-      in a 4500-line file with tightly coupled state is an active hazard: it
-      reads as live invariant maintenance and invites "fixes" to code paths
-      that do not exist. **Resolved:** the dead assignments were removed.
-
 ## 1. Product contract
 
 The traditional mono and four-channel product grids are:
@@ -160,9 +29,9 @@ The traditional mono and four-channel product grids are:
 | 16 kHz | 512 | 256 | Supported alternate |
 | 48 kHz | 1024 | 512 | Supported |
 
-The 8 kHz standalone grid is legacy support and is not a main product grid for
-this release. Either retain that label or give it an independent quality
-verdict before promoting it to a product grid.
+The 8 kHz standalone grid is supported by AEC and NR but is not a main product
+grid for this release. Either keep it classified that way or give it an
+independent quality verdict before promoting it to a product grid.
 
 The traditional signal contract is:
 
@@ -224,9 +93,9 @@ the handover documentation, and check them off here.
 - [ ] No untracked checkpoints, datasets, ZIP files, temporary WAV files, or
       build products are present.
 - [ ] No absolute local paths or credentials are present.
-- [ ] No `review_*.md`, Claude/Codex/simplify/round-N wording, or other
-      development-process messages remain in release source, CLI output, or
-      current user documentation.
+- [ ] No `review_*.md`, review-round wording, or other development-process
+      messages remain in release source, CLI output, or current user
+      documentation.
 - [ ] Public headers compile from a clean external C99 consumer.
 - [ ] Every public API/ABI/layout break has a version bump, migration note,
       and negative compatibility test.
@@ -295,10 +164,8 @@ Pass conditions:
 - [ ] **An inventory of every hop-authored constant exists, and each one has a
       verdict: retimed (with an effective-value test at all four grids) or
       deliberately not retimed (with a recorded reason).** "The retimed ones
-      are tested" is not the same claim and does not satisfy this — the gap
-      recorded in §0 passed every effective-value test precisely because the
-      un-retimed constants were never in the inventory. Build the list
-      mechanically: grep `c_impl/src/*.c` and `python/modules/*.py` for bare
+      are tested" is not the same claim and does not satisfy this. Build the
+      list mechanically: grep `c_impl/src/*.c` and `python/modules/*.py` for bare
       float EMA retentions and integer frame counts, subtract everything
       routed through `aec_growth_rehop` / `aec_ms_to_hops` /
       `growth_rehop` / `ms_to_hops`, and adjudicate the remainder one by one.
@@ -466,7 +333,7 @@ Pass conditions:
 
 ### 8.1 Mono DeepFilterNet2 variant (`mono_aec_dfn_res`)
 
-`make -C pipelines test` now also builds and runs the shared post-RES DFN2
+`make -C pipelines test` also builds and runs the shared post-RES DFN2
 stage, the rate bridge that takes that stage to its 48 kHz grid from a
 product-rate host, and the mono wrapper that hosts the conventional pipeline
 with `enable_nr=0` / `enable_res=1`:
@@ -508,9 +375,9 @@ Pass conditions:
 - [ ] The board skeleton runs at `--sample-rate 16000` (default),
       `8000` and `48000`, and prints a pool size, hop and algorithmic latency
       for each.
-- [ ] Publish artifacts include `libaudio_pipeline_dfn.a` (now also carrying
+- [ ] Publish artifacts include `libaudio_pipeline_dfn.a` (carrying
       `dfn_rate_bridge.o`) and the `mono_aec_dfn_res` board skeleton alongside
-      the existing ones.
+      the other artifacts.
 
 ## 9. Four-channel pipeline gate
 
@@ -544,7 +411,7 @@ Pass conditions:
 
 ### 9.0 Four-channel DeepFilterNet2 variant (`4ch_aec_bf_dfn_res`)
 
-`make -C pipelines/4ch_aec_bf_nr_res test` now also builds and runs the DFN2
+`make -C pipelines/4ch_aec_bf_nr_res test` also builds and runs the DFN2
 wrapper over the core (`enable_post=1` / `enable_res=1` / `enable_nr=0`):
 
 ```bash
@@ -575,9 +442,8 @@ Pass conditions:
       cumulative frame count, the impulse-pinned added delay (672 / 629 native
       samples) and a pass-band tolerance against the conventional NR-off
       output. The native path is a tolerance, NOT a memcmp.
-- [ ] The build produces `lib4aec_dfn_res.a` (now also carrying
-      `dfn_rate_bridge.o`); `FOUR_AEC_NR_RES_LAYOUT_VERSION` is 19 (the `four_aec_front_process`/`four_aec_fuse` split moved the post-beam
-      stages into the applications, which changed the core's carve).
+- [ ] The build produces `lib4aec_dfn_res.a` (carrying
+      `dfn_rate_bridge.o`); `FOUR_AEC_NR_RES_LAYOUT_VERSION` is 22.
 
 ### 9.1 Real four-microphone validation
 
@@ -625,7 +491,7 @@ budget is not an efficiency verdict.
 
 ## 11. AINR framework gate
 
-Public AINR models are RNNoise-ERB, GTCRN, and DeepFilterNet2. Full training
+Public AINR models are RNNoise-ERB, GTCRN, DeepFilterNet2, and DeepFilterNet3. Full training
 and trained-model quality are out of scope.
 
 ### 11.1 Dataset generator
@@ -638,7 +504,7 @@ Run small real end-to-end jobs separately at 16 kHz and 48 kHz:
 - [ ] index-gap rejection and temporary-WAV cleanup;
 - [ ] pack;
 - [ ] mmap load;
-- [ ] WAV-only layout (`NNNNNN.wav`, legacy JSON ignored);
+- [ ] WAV-only layout (`NNNNNN.wav`, leftover JSON ignored);
 - [ ] post-resample `effective_rms_dbfs` validation;
 - [ ] train/validation clipping contract;
 - [ ] rejection of mixed sample-rate directories;
@@ -738,7 +604,7 @@ Pass conditions:
 - [ ] Complete stateful PBFDKF scenarios are rendered before chunking.
 - [ ] Behavior hash is stable across supported Python versions.
 - [ ] Source hash and behavior hash retain their separate meanings.
-- [ ] Final WAV writes are atomic; legacy JSON is neither required nor read.
+- [ ] Final WAV writes are atomic; leftover JSON is neither required nor read.
 - [ ] Plain re-run, index gaps, and conflicting resume start indices fail
       closed.
 - [ ] Temporary-WAV cleanup, pack, and mmap load pass.
@@ -795,7 +661,7 @@ make -C AIAEC SIMD=1 WERROR=1 print-lib-path   # absolute path of THIS config
 make -C AIAEC SIMD=0 WERROR=1 test             # lib + pytest
 ```
 
-- [ ] The archive is configuration-keyed (`build/simd<N>-<cksum>/`, keyed on
+- [ ] The archive is configuration-keyed (`build/simd<N>-<sig>/`, keyed on
       `CC`/`AR`/`CFLAGS`/`CPPFLAGS`/`SIMD`/`WERROR`) and a signature collision
       is refused rather than reinterpreted; resolve it with `print-lib-path`.
 - [ ] No AIAEC translation unit includes `simd_kernels.h`, so the SIMD knob
@@ -869,73 +735,50 @@ Release is GO only when all of the following are true:
 Full AI dataset generation, long training, final checkpoints, and AI model
 quality scores are explicitly outside this source/framework release gate.
 
-## Appendix A. Known-good automated counts
+## Appendix A. Reference test targets
 
-Reference values measured from the four-repo working
-tree, KISS backend (measured before that backend was removed; not yet re-recorded on NE10), SIMD=1, macOS, `SE/.venv` Python. Re-measure and re-record these
-whenever the tree moves — a stale reference count silently converts a real
-regression into a "matches the doc" pass. A count that **drops** is a
-regression; a count that
-**rises** without a corresponding new test in the diff means someone
-parameterized an existing test rather than adding coverage. Always `make clean`
-first — this tree has a stale-`.o` hazard that produces spurious segfaults and
-is routinely misattributed to a real bug.
+Re-measure counts on the release tree and record them in the dated release
+report. A count that **drops** is a regression; a count that **rises** without
+a corresponding new test in the diff means someone parameterized an existing
+test rather than adding coverage. Always `make clean` first — the tree has a
+stale-`.o` hazard that produces spurious segfaults and is routinely
+misattributed to a real bug.
 
-| Suite | Count |
-|---|---:|
-| `AEC` `make test-rate-structural` | 382 |
-| `AEC` `make test-config-validation` | 404 |
-| `AEC` `make test-delay-reset` | 16 |
-| `AEC` `make test-delay-backward-quarantine` | 22 |
-| `AEC` `make test-aec-res` | 225 |
-| `AEC` `make test-linear-context` | 201 |
-| `AEC` `python3 -m pytest python/tests` | 308 |
-| `NR` / `Audio_ALG/lib/nr` `python3 -m pytest python/tests` | 76 |
-| `Audio_ALG` `python3 -m pytest pipelines` | 157 |
-| `Audio_ALG` `python3 -m pytest AIAEC` | 702 |
-| `Audio_ALG` `python3 -m pytest AINR` | 301 |
-| `Audio_ALG` `python3 -m pytest AIAEC AINR pipelines` | 1160 |
+Count-bearing suites: `AEC` `make test-rate-structural`,
+`test-config-validation`, `test-delay-reset`, `test-aec-res`,
+`test-linear-context` and `python3 -m pytest python/tests`; `NR` /
+`Audio_ALG/lib/nr` `python3 -m pytest python/tests`; `Audio_ALG`
+`python3 -m pytest pipelines`, `AIAEC`, `AINR`, and the combined
+`python3 -m pytest AIAEC AINR pipelines`. Per-package collection counts
+(`--collect-only`) must sum exactly to the combined row, which checks that the
+combined invocation collects everything.
 
-The `AEC` rows were measured on the AEC repository tip and the `NR` row on the
-revision pinned in `Audio_ALG/lib/nr`; the NR repository tip carries the same
-`python/` tree. The three per-package `Audio_ALG` rows are collection counts
-(`--collect-only`) and sum exactly to the combined row, which is the check that
-the combined invocation collects everything. The combined invocation itself ran
-to completion: 1158 passed, 1 skipped, 1 failed, in 13 min 59 s. The failure is
-`AIAEC/tests/test_training_common.py::test_the_mps_stft_backward_bound_is_where_the_backend_actually_breaks`,
-which probes the host's MPS backend and expects it to still diverge from the CPU
-past a recorded sample bound; on this macOS version the backend agrees with the
-CPU, so the probe reports that the guard constant may be raised. It depends on
-the host's backend, not on this tree, and it is the only red test in the
-combined run.
+The combined row is the one that matters: pytest gives every `conftest.py` the
+same top-level module name, so a test doing `from conftest import ...` picks up
+whichever package was imported first and the whole run dies at collection while
+each package on its own stays green.
+`AIAEC/tests/test_cross_package_collection.py` drives the combined invocation
+in a subprocess, in both argument orders. Collection is not the only place this
+bites: every AINR project also defines a top-level `train`, `model` and
+`export_onnx`, and a bare import made after a sibling's is cached in
+`sys.modules` is handed the sibling's module at RUN time. Consumers of those
+modules drop the cached names and front their own directory before importing,
+as the projects' tests do; `pipelines/tests/test_dfn2_stage.py` pins that for
+the DFN2 stage. Re-run the combined row, not just the per-package rows.
 
-The combined row is the one that matters, and it is the one that used to be
-impossible: pytest gives every `conftest.py` the same top-level module name, so
-a test doing `from conftest import ...` picks up whichever package was imported
-first and the whole run dies at collection while each package on its own stays
-green. `AIAEC/tests/test_cross_package_collection.py` now drives the combined
-invocation in a subprocess, in both argument orders, so the per-package rows
-can no longer be green over a suite that cannot start. Collection is not the
-only place this bites: every AINR project also defines a top-level `train`,
-`model` and `export_onnx`, and a bare import made after a sibling's is cached
-in `sys.modules` is handed the sibling's module at RUN time, so the per-package
-rows stay green while the combined run errors at fixture setup (this is how
-`pipelines/dfn2_stage.py` was found loading the wrong `train`). Consumers of those modules drop the cached names and front
-their own directory before importing, as the projects' tests do, and
-`pipelines/tests/test_dfn2_stage.py` pins that for the DFN2 stage. Re-run the
-combined row, not just the per-package rows, before using these as a gate.
+One combined-run test depends on the host rather than the tree:
+`AIAEC/tests/test_training_common.py::test_the_mps_stft_backward_bound_is_where_the_backend_actually_breaks`
+probes the host's MPS backend and fails where the backend agrees with the CPU.
 
 C-side `make test` targets that print `PASS:` markers rather than a count
-(KISS backend, measured before it was removed and not yet re-recorded on NE10; `make clean` first, `^PASS:` lines counted):
-`pipelines` (all applications) 306, `pipelines/mono_aec_nr_res` 136,
-`pipelines/mono_alignulcnet` 162 (the same count on the 16 kHz and the
-`ULCNET_GRID=48k` build), `pipelines/4ch_aec_bf_nr_res` 543 (one-stop gate; also
-builds and runs the `4ch_alignulcnet` binaries, whose test prints a single
-`All audio_pipeline_4ch_ulcnet tests passed` line and no `PASS:` markers, and the
-`4ch_aec_bf_dfn_res` command-line runs; the same count on the `ULCNET_GRID=48k`
-build). Each
-additionally prints a small number of non-`PASS:` pass lines (static smokes,
-board-skeleton profiles, adapter).
+(`make clean` first, `^PASS:` lines counted): `pipelines` (all applications),
+`pipelines/mono_aec_nr_res`, `pipelines/mono_alignulcnet` (the same count on the
+16 kHz and the `ULCNET_GRID=48k` build) and `pipelines/4ch_aec_bf_nr_res`
+(one-stop gate; also builds and runs the `4ch_alignulcnet` binaries, whose test
+prints a single `All audio_pipeline_4ch_ulcnet tests passed` line and no `PASS:`
+markers, and the `4ch_aec_bf_dfn_res` command-line runs; the same count on the
+`ULCNET_GRID=48k` build). Each additionally prints a small number of non-`PASS:`
+pass lines (static smokes, board-skeleton profiles, adapter).
 
 Pass/fail-only targets (no count): `AEC` `selftest`, `test-counter-saturation`,
 `test-process-context`, `test-shared-far-spec`, `test-shared-fft-handle`,
@@ -950,8 +793,7 @@ denoiser when a `test.wav` sits next to it, so it is not a gate).
 
 ## Appendix B. Benchmark protocol
 
-Rules that invalidate a benchmark result if broken. They exist because each has
-already produced a wrong verdict in this project at least once.
+Rules that invalidate a benchmark result if broken.
 
 - **`NO_PREALIGN=1` is mandatory for every AEC benchmark.** The eval driver's
   *default* is an offline GCC-PHAT pre-align crutch that hides exactly the

@@ -1,29 +1,19 @@
-"""Tests for the Phase-0 alignment-residual meter.
+"""Tests for the alignment-residual meter.
 
-Three layers, mirroring the tool's own self-proof requirement:
+Three layers:
 
 * Pure-meter tests drive :func:`measure_residual_windows` with synthetic
-  numpy signals whose ground-truth lag is known by construction -- they prove
-  the correlation core recovers magnitude AND sign, that the silence /
-  low-correlation gates actually drop windows, that a peak on the +-max_lag
-  search boundary is flagged, and that the locked-window gate (stable delay +
-  solid confidence + settle time) admits and rejects exactly what it claims
-  (a meter that cannot fail measures nothing).
+  signals of known lag: sign and magnitude are recovered, the silence and
+  low-correlation gates drop windows, a peak on the +-max_lag boundary is
+  flagged, and the locked-window gate admits and rejects exactly what it claims.
 * Engine-backed tests run the real frozen PBFDKF frontend (read-only, from
-  ``lib/aec``) through :func:`run_self_test` on short white-noise scenes with
-  known bulk delays, asserting the post-lock residual vs the D_hat PROXY is
-  positive and bounded, that an injected +N shift of the tool's own
-  aligned-far tap moves the measurement by ~N, and that an injected negative
-  lag is reported negative.
-* Generator-backed tests render short clean sequences fully in memory with
-  the repo's own ``AecSequenceRenderer`` and assert the residual against the
-  TRUE echo (``RenderedSequence.audit['echo']``) obeys the same bounds, and
-  that the D_hat proxy agrees with the true echo within one histogram
-  quantum.
+  ``lib/aec``) through :func:`run_self_test` on short white-noise scenes.
+* Generator-backed tests render short clean sequences in memory with
+  ``AecSequenceRenderer`` and check the residual against the TRUE echo
+  (``RenderedSequence.audit['echo']``) and the D_hat proxy against it.
 
-No corpus, no fixtures on disk (the generator-backed layer writes only
-throwaway source WAVs to an ephemeral temp dir): everything is synthesized
-in-process.
+No corpus on disk; the generator layer writes only throwaway source WAVs to a
+temp dir.
 """
 
 import numpy as np

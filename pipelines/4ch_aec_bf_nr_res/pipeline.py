@@ -1,9 +1,8 @@
 """Shared-delay, four-linear-filter AEC front end for microphone arrays.
 
 This Python reference deliberately does not implement SRP-PHAT or the
-beamformer (bf).  Its
-production API is split at that ownership boundary, with the stage names of the
-C core (four_aec_front_process / four_aec_fuse)::
+beamformer (bf).  Its production API is split at that ownership boundary, with
+the stage names of the C core (four_aec_front_process / four_aec_fuse)::
 
     front = pipeline.front_process(mics, render)
     bf = external_srp_bf(front.linear_channels)
@@ -16,7 +15,7 @@ the functions of pipelines/aec_nr_pipeline.py over that frame.
 The optional ``Beamformer`` object and ``EqualWeightBeamformer`` exist only for
 integration tests and offline fixtures.  Requiring the external stage to return
 its complex per-bin effective weights lets the AEC error/echo spectra cross the
-boundary coherently before the existing mono NR + RES stages, without a second
+boundary coherently before the mono NR + RES stages, without a second
 beamformer or a fifth AEC.
 """
 
@@ -47,13 +46,10 @@ from lib.aec.python.modules.aec3_scale import fft_density_scale
 _SUPPORTED_SAMPLE_RATES = (16000, 48000)
 _N_CHANNELS = 4
 
-# Admission band for a shared-delay CHANGE, in native samples and hops:
-# lib/aec's own Path-B trio (``abs(new_delay - current_delay) > 32``, a second
-# estimate within 16 of the held candidate, and ``pending_delay_ttl = 3`` hops
-# of life for that candidate).  Same values and same spelling as the C core's
-# FOUR_DELAY_CHANGE_MIN_SAMPLES / _CONFIRM_SAMPLES / _CANDIDATE_TTL
-# (4aec_nr_res_internal.h), against an estimate from the same DelayAec on the
-# same grid.
+# Admission of a shared-delay CHANGE (lib/aec's Path B; same values as the C
+# core's FOUR_DELAY_CHANGE_MIN_SAMPLES / _CONFIRM_SAMPLES / _CANDIDATE_TTL in
+# 4aec_nr_res_internal.h): the movement must exceed MIN samples and be offered
+# again within CONFIRM samples before the held candidate's TTL hops run out.
 _DELAY_CHANGE_MIN_SAMPLES = 32
 _DELAY_CHANGE_CONFIRM_SAMPLES = 16
 _DELAY_CHANGE_CANDIDATE_TTL = 3
@@ -67,15 +63,12 @@ _DELAY_CHANGE_CANDIDATE_TTL = 3
 class SharedDelayState:
     """Observable state of the one shared matched-filter instance.
 
-    ``solid`` is "a usable accepted alignment generation exists" -- it never
-    leads ``delay_samples`` and, once raised, only ``reset()`` clears it.
-    ``changed`` marks the hop on which a NEW usable generation begins (first
-    acquisition included, even at applied delay 0), and is the signal for a
-    consumer to flush any history derived from the aligned reference before
-    the frame it produces for this hop.  A change while locked is admitted
-    only when it exceeds 32 samples and is offered again, within 16, before
-    the held candidate's 3 hops of life run out.  Same contract as the C
-    core's ``FourAecNrResDelayState`` (4aec_nr_res.h).
+    ``solid``: a usable accepted alignment generation exists; it never leads
+    ``delay_samples`` and only ``reset()`` clears it.  ``changed``: a NEW usable
+    generation begins on this hop (first acquisition included, even at applied
+    delay 0); consumers flush history derived from the aligned reference.  A
+    change while locked must pass the admission rule above.  Same contract as
+    the C core's ``FourAecNrResDelayState`` (4aec_nr_res.h).
     """
 
     delay_samples: int
@@ -89,23 +82,11 @@ class SharedDelayState:
 class SharedMatchedDelayEstimator:
     """One matched filter driven by one configurable array capture proxy.
 
-    Anti-alias status: this wrapper does no decimation of its own. The inner
-    estimator owns the 48 kHz anti-alias + decimate-by-3 sidechain, the same
-    way the mono AEC's C port does (``delay_aec.c``'s ``DaResample48``
-    sidechain) and Python's own ``EchoPathDelayEstimator`` (its
-    ``_Resample48`` sidechain).
-
-    This wrapper constructs its inner ``LegacyDelayShim`` with this
-    wrapper's TRUE native ``sample_rate`` (8000/16000/48000) and feeds it
-    every hop RAW and un-decimated. At 48 kHz, ``EchoPathDelayEstimator``
-    internally anti-alias-filters (order-7 elliptic, 4 SOS sections) and
-    decimates by 3 ahead of its inner AEC3-rate matched-filter chain, and it
-    already rescales the delay it returns back to the true native sample
-    domain (see its ``_process_inner_block``'s
-    ``* _DOWN_SAMPLING_FACTOR * self._rate_factor`` line) -- so this wrapper
-    must NOT decimate or rescale a second time: no external decimation, no
-    decimation-phase bookkeeping, and no manual rate-factor rescale live
-    here.
+    No decimation here: the inner ``LegacyDelayShim`` is built with the true
+    native ``sample_rate`` and fed raw hops.  ``EchoPathDelayEstimator`` owns
+    the 48 kHz anti-alias + decimate-by-3 sidechain (as ``delay_aec.c`` does)
+    and returns the delay already in native samples, so decimating or
+    rescaling again here would apply it twice.
     """
 
     def __init__(self, sample_rate: int, hop_size: int,
@@ -118,17 +99,11 @@ class SharedMatchedDelayEstimator:
         self.sample_rate = int(sample_rate)
         self.hop_size = int(hop_size)
         self.quarantine_enabled = bool(quarantine_enabled)
-        # Seconds -> hops once, here, with the same floor of 1 the C core and
-        # lib/aec use, so all three cannot disagree about how long a window
-        # is.
+        # Seconds -> hops once, with the same floor of 1 as the C core and lib/aec.
         self.quarantine_hops = max(
             1, int(round(float(quarantine_s) / (self.hop_size / self.sample_rate))))
         self._quarantine_left = -1   # -1 = disarmed, the only re-armable state
-        # LegacyDelayShim -> EchoPathDelayEstimator owns 48kHz anti-alias
-        # + decimation internally (and rescales its returned delay back to
-        # native samples), so it is constructed with the TRUE native rate --
-        # never a hardcoded 16000 -- and fed raw hops directly (see
-        # accumulate() below).
+        # True native rate, never a hardcoded 16000; fed raw hops (class docstring).
         self._estimator = LegacyDelayShim(
             sample_rate=self.sample_rate,
             hop_size=self.hop_size,
@@ -136,11 +111,8 @@ class SharedMatchedDelayEstimator:
         self._calls = 0
         self._accepted_delay = 0
         self._usable = False
-        # Two-step admission for a CHANGE (see accumulate()): the movement
-        # seen once and held for confirmation, plus the hops of life left on
-        # it.  ``_pending_ttl > 0`` IS "a candidate is held" -- lib/aec spells
-        # that as pending_delay_ttl plus has_pending, but sets and clears the
-        # two together everywhere, so one counter cannot disagree with itself.
+        # Two-step admission for a CHANGE (see accumulate()): the held candidate
+        # and the hops of life left on it; ``_pending_ttl > 0`` means held.
         self._pending_delay = 0
         self._pending_ttl = 0
 
@@ -165,14 +137,11 @@ class SharedMatchedDelayEstimator:
         proxy_lane_cancelling: bool = False,
     ) -> SharedDelayState:
         """``proxy_lane_cancelling`` mirrors the C core's read of
-        ``p->lanes[cfg.capture_proxy_channel]`` inside
-        ``update_shared_delay()``: True when the lane the shared estimator is
-        FED FROM is still demonstrably cancelling at the alignment currently
-        applied. That one lane, not any of the four: it is the only one whose
-        cancellation is evidence about the estimate being judged. It is
-        passed in rather than read here because this object owns only the
-        estimator, not the lanes -- the C core reaches them through ``p``.
-        Ignored unless ``delay_backward_quarantine_enabled`` is on."""
+        ``p->lanes[cfg.capture_proxy_channel]`` in ``update_shared_delay()``:
+        True when the lane the estimator is fed from still cancels at the
+        applied alignment (that lane only: its cancellation is the evidence
+        about the estimate).  Passed in because this object does not own the
+        lanes.  Ignored unless ``delay_backward_quarantine_enabled`` is on."""
         capture_proxy = np.asarray(capture_proxy, dtype=np.float32)
         render = np.asarray(render, dtype=np.float32)
         if (
@@ -182,9 +151,7 @@ class SharedMatchedDelayEstimator:
         ):
             raise ValueError("capture proxy and render must be equal-length 1-D hops")
         self._calls += 1
-        # Raw, un-decimated native-rate hop straight into the estimator --
-        # it anti-alias filters + decimates internally at 48kHz and returns
-        # the delay already rescaled back to native samples.
+        # Raw native-rate hop; the estimator decimates internally.
         self._estimator.accumulate(capture_proxy, render)
 
         estimated = int(self._estimator.estimated_delay)
@@ -196,25 +163,19 @@ class SharedMatchedDelayEstimator:
             and self._estimator.is_solid
             and self._estimator._n_updates >= 3
         )
-        # One hop of the held candidate's life, spent here -- ahead of both the
-        # quarantine and the admission below, exactly where lib/aec ages its
-        # own pending delay, so a candidate expires on hops the quarantine
-        # takes away as readily as on hops the estimate moves elsewhere.
+        # One hop of the held candidate's life is spent here, ahead of the
+        # quarantine and admission, where lib/aec ages its pending delay.
         if self._pending_ttl > 0:
             self._pending_ttl -= 1
             if self._pending_ttl <= 0:
                 self._pending_ttl = 0
                 self._pending_delay = 0
-        # Backward-jump quarantine (see delay_backward_quarantine_enabled on
-        # FourChannelAecConfig). Engages only once a usable generation exists
-        # and only for an estimate strictly EARLIER than the one in force: a
-        # first acquisition has no alignment to protect, re-confirming the
-        # accepted value is not a change, and a LARGER estimate is not the
-        # pre-echo direction. Armed once per continuously qualifying backward
-        # episode, then one tick per hop; candidate values may jitter within
-        # that class without re-arming. A forward/ineligible estimate or lost
-        # cancellation evidence disarms the episode. Mirrors the C core's arm
-        # in 4aec_nr_res.c's update_shared_delay().
+        # Backward-jump quarantine (FourChannelAecConfig
+        # .delay_backward_quarantine_enabled): only once a usable generation
+        # exists and only for an estimate strictly EARLIER than the accepted
+        # one.  Armed once per continuous backward episode, then one tick per
+        # hop; a forward/ineligible estimate or lost cancellation disarms it.
+        # Mirrors the C core's update_shared_delay().
         if (
             eligible
             and self.quarantine_enabled
@@ -229,37 +190,13 @@ class SharedMatchedDelayEstimator:
                 eligible = False
         else:
             self._quarantine_left = -1
-        # ``solid`` = "a usable accepted alignment generation exists", so it is
-        # derived from the SAME acceptance test that writes the accepted delay
-        # rather than from the estimator's raw confidence -- a raw-confidence
-        # ``solid`` is free to LEAD the applied delay on any hop the two
-        # disagree, and a consumer that flushes recurrent state on the
-        # not-usable -> usable edge would then flush against the previous
-        # generation's alignment.  Usability is sticky: once a generation
-        # exists, a short confidence dip must not retract an alignment the
-        # audio path is still applying (lib/aec spells that state
-        # ``current_delay == -1``, which never un-spells itself without a
-        # reset).  ``changed`` = "this hop starts a NEW USABLE generation", so
-        # it also fires on an acquisition or relock that lands on applied
-        # delay 0, which a value-only comparison misses.
-        #
-        # A CHANGE to a usable alignment must additionally clear lib/aec's own
-        # Path-B trio, mirrored by the C core's update_shared_delay() and its
-        # four_aec_nr_res_admission_offer(): the movement has to exceed
-        # _DELAY_CHANGE_MIN_SAMPLES and still be offered, within
-        # _DELAY_CHANGE_CONFIRM_SAMPLES, before the candidate's
-        # _DELAY_CHANGE_CANDIDATE_TTL hops of life run out.  Each accepted
-        # generation shifts four converged filters and, on a retard, clears
-        # their far history, so a movement seen once and gone must not buy
-        # one.  A SUSTAINED movement still passes, right or wrong -- this is a
-        # repeated-evidence rule, not a correctness test.  A movement too
-        # small to admit is absorbed WITHOUT clearing the candidate (lib/aec's
-        # Path B has no such clear): one hop of the estimator agreeing with
-        # the alignment being moved away from must not cancel a movement, the
-        # TTL is what ends it.  First acquisition is exempt: nothing is
-        # applied yet to protect.  The accepted delay moves only on
-        # acceptance, so the served alignment and the realign that shifts the
-        # filters are always the same hop.
+        # ``solid`` comes from the same acceptance test that writes the accepted
+        # delay (not the estimator's raw confidence, which could lead the
+        # applied delay) and is sticky once a generation exists; ``changed``
+        # also fires on an acquisition that lands on delay 0.  A CHANGE must
+        # additionally pass the admission rule above (a movement seen once and
+        # gone must not shift four converged filters); first acquisition is
+        # exempt, and a too-small movement does not clear the candidate.
         was_usable = self._usable
         now_usable = was_usable or eligible
         changed = False
@@ -317,18 +254,10 @@ class _SharedReferenceDelayLine:
         start = self._samples_seen
         absolute = start + np.arange(render.size, dtype=np.int64)
         self._ring[absolute % self._capacity] = render
-        # Whole-hop decision on the same predicate the C core's align_render()
-        # uses: the ring can serve this hop's requested offset only once the
-        # samples already seen cover ``delay_samples``.  Until then the far
-        # content IS the raw render hop (lib/aec's rule: while the seam is not
-        # aligned, the content is the raw far), never silence -- a consumer
-        # stepping a recurrent model over the far branch would otherwise see a
-        # stretch of zeros, and the leading ``delay_samples`` of the stream
-        # would be unmodellable for the linear filters.  Per hop and not per
-        # sample: ``start`` is the smallest absolute index in this hop, so a
-        # partly-servable hop would splice raw and shifted audio inside one
-        # frame.  With a constant delay this makes the first
-        # ``ceil(delay_samples / hop)`` hops raw and every later hop aligned.
+        # Whole-hop decision, as the C core's align_render(): the ring serves the
+        # offset only once the samples seen cover ``delay_samples``; before that
+        # the far content is the raw render hop (never silence).  Per hop, not
+        # per sample, so raw and shifted audio are never spliced in one frame.
         if start >= int(delay_samples):
             source = absolute - int(delay_samples)
             out = self._ring[source % self._capacity]
@@ -409,24 +338,17 @@ class FourChannelAecConfig:
     capture_proxy_channel: int = 0
     max_delay_ms: float = 1024.0
     aec_mode: AecMode = AecMode.PBFDKF
-    # Strength preset the shared post-beam suppressor is BUILT with (mirrors
-    # FourAecNrResConfig's own aec_preset field, right after this dataclass's
-    # own filter-algorithm mode). Seeds PostBeamResidualSuppressor's far-
-    # active floor, DT floor, AND split-floor-enabled gate at __init__/
-    # reset() time -- the same three fields set_aec_preset() retargets at
-    # runtime, so a fresh/reset()-rebuilt instance matches one built
-    # balanced and then immediately retargeted. set_aec_preset("no_floor")
-    # on an already-running pipeline flips min_gain_split_floor_enabled
-    # live, via SuppressionGain.set_split_floor_enabled().
+    # Strength preset the shared post-beam suppressor is built with (mirrors
+    # FourAecNrResConfig.aec_preset).  Seeds the far-active floor, DT floor and
+    # split-floor gate at __init__/reset(); set_aec_preset() retargets the same
+    # three fields at runtime.
     aec_preset: AecPreset = AecPreset.BALANCED
-    # Backward-jump quarantine on a shared-delay CHANGE. DEFAULT OFF, so the
-    # reference path is unchanged. Mirrors
-    # FourAecNrResConfig::delay_backward_quarantine_enabled / _s: a shared
-    # estimate strictly EARLIER than the accepted delay is held while the
-    # estimator's OWN capture lane (capture_proxy_channel — not any lane)
-    # still cancels at the applied alignment, and is adopted at the window's
-    # expiry, or sooner if cancellation collapses. A larger estimate is never
-    # held, and first acquisition is not guarded.
+    # Backward-jump quarantine on a shared-delay CHANGE (default off; mirrors
+    # FourAecNrResConfig::delay_backward_quarantine_enabled / _s): an estimate
+    # strictly EARLIER than the accepted delay is held while the estimator's own
+    # capture lane (capture_proxy_channel) still cancels at the applied
+    # alignment, and is adopted at the window's expiry or when cancellation
+    # collapses.  A larger estimate and first acquisition are never held.
     delay_backward_quarantine_enabled: bool = False
     # Window in SECONDS, converted to hops once at construction (minimum 1).
     # Inert while delay_backward_quarantine_enabled is False.
@@ -437,17 +359,13 @@ class FourChannelAecConfig:
             raise ValueError(
                 f"four-channel path supports {_SUPPORTED_SAMPLE_RATES}, got {self.sample_rate}"
             )
-        # 16 kHz default is 256/128 (8ms hop), matching the C core's own
-        # derive_dims_and_configs default (4aec_nr_res.c).
-        # 512/256 remains a supported, explicit alternate (see whitelist below).
+        # 16 kHz default is 256/128 (8 ms hop), as the C core's
+        # derive_dims_and_configs (4aec_nr_res.c); 512/256 is an explicit alternate.
         default_frame = 256 if self.sample_rate == 16000 else 1024
         frame = default_frame if self.frame_size is None else int(self.frame_size)
         hop = frame // 2 if self.hop_size is None else int(self.hop_size)
-        # Mirrors the C core's exact whitelist (4aec_nr_res.c derive_dims_and_configs):
-        # 16 kHz supports frame/FFT in {256, 512}; 48 kHz supports only 1024. A
-        # frame value the C side would reject must be rejected here too, so an
-        # explicit override can't silently diverge between the Python reference
-        # and the C acceptance gate.
+        # Same whitelist as the C core (4aec_nr_res.c derive_dims_and_configs):
+        # 16 kHz frame/FFT in {256, 512}, 48 kHz only 1024.
         if self.sample_rate == 16000:
             if frame not in (256, 512):
                 raise ValueError(
@@ -563,18 +481,10 @@ def _fuse_contexts(
     far_specs = np.stack(
         [np.asarray(c.far_spec, dtype=np.complex64) for c in contexts]
     )
-    # The lanes normally agree bit-for-bit (same aligned_ref, same FFT), but a
-    # mixed warm/soft-realign hop is a legitimate exception, not a caller
-    # error: aec_reset_filter_for_realign() zeros a soft-reset lane's
-    # far_buffer OLA history (lib/aec's own soft-path design intent -- see
-    # aec.c's aec_reset_filter_for_realign / aec_apply_external_realign),
-    # while a lane that went warm on the same hop keeps its real history, so
-    # the two lanes' far-end FFTs of the identical aligned_ref genuinely
-    # differ for that one hop. There is still exactly one fused context to
-    # return downstream (the single post-beam RES stage needs one X), so it
-    # carries lane 0's own far_spec; the other three lanes are untouched by
-    # this function and keep their own, individually-correct, unfused
-    # far_spec for whatever they still do with it upstream of this fuse.
+    # The lanes normally agree bit for bit, but on a mixed warm/soft-realign
+    # hop a soft-reset lane has zeroed its far_buffer OLA history
+    # (aec_reset_filter_for_realign) while a warm lane keeps it, so their far
+    # FFTs differ for that hop.  The single post-beam RES needs one X: lane 0's.
     far_spec = far_specs[0]
 
     r2 = np.stack([np.asarray(c.r2, dtype=np.float32) for c in contexts])
@@ -613,12 +523,8 @@ def _fuse_contexts(
         far_spec=far_spec.astype(np.complex64),
         near_spec=near_spec.astype(np.complex64),
         filter_converged=all(c.filter_converged for c in contributors),
-        # Same contributors-only rule as filter_converged just above: a lane
-        # that doesn't steer the beam shouldn't veto readiness either. Left
-        # unset (None, the AecResContext default) this silently reads as
-        # "not usable" wherever a consumer treats None as not-safe (see
-        # aec_nr_pipeline.run_nr_spectrum's usable_linear gate) -- a fused
-        # context must carry a real verdict, not fall back to that default.
+        # Contributors only, as filter_converged: a fused context must carry a
+        # real verdict (None reads as "not usable" in run_nr_spectrum's gate).
         usable_linear=all(bool(c.usable_linear) for c in contributors),
         erle_factor=float(min(c.erle_factor for c in contexts)),
         dt_indicator=float(max(c.dt_indicator for c in contributors)),
@@ -654,10 +560,9 @@ class PostBeamResidualSuppressor:
     object then owns the one temporal SuppressionGain state consumed by the
     mono NR -> RES output path.
 
-    AecResContext currently does not export unbounded R2 or the full
-    stationarity/AecState surface. Until that seam is extended, bounded R2 is
-    used for both gain inputs and no stationary mask is supplied. This is an
-    explicit parity limitation, not a reason to reuse one microphone's gain.
+    AecResContext exports no unbounded R2 or full stationarity/AecState
+    surface, so bounded R2 feeds both gain inputs and no stationary mask is
+    supplied (an explicit parity limitation).
     """
 
     def __init__(
@@ -673,23 +578,11 @@ class PostBeamResidualSuppressor:
         self.instance_count = 1
         self._state = _PostBeamAecState()
         self._initial_state = True
-        # Three sentinels -- None means "take AecConfig's own dataclass
-        # default". When a preset is given, all three (far-active floor, DT
-        # floor, split-floor gate) are seeded together from one
-        # AecConfig.from_preset(preset) call, mirroring the C core's
-        # construction path (derive_dims_and_configs() -> se_derive() ->
-        # aec_config_from_preset(), which applies both floor fields from the
-        # preset before aec_res_init() runs).
-        #
-        # Stored, not just applied once: _build_gain() (which reset()
-        # re-runs) constructs a fresh AecConfig every time, so the seed must
-        # be re-applied on every rebuild, same as set_preset()'s far-active/
-        # DT/gate overrides below.
-        #
-        # split_floor_enabled is retargetable at runtime too: set_preset()
-        # below also calls SuppressionGain.set_split_floor_enabled(), so an
-        # already-running instance can switch into/out of NO_FLOOR, not just
-        # a fresh/reset()-rebuilt one.
+        # None means "take AecConfig's own dataclass default".  With a preset,
+        # all three (far-active floor, DT floor, split-floor gate) are seeded
+        # from one AecConfig.from_preset(preset), as the C core's construction
+        # path does.  They are stored because _build_gain() (re-run by reset())
+        # builds a fresh AecConfig each time; set_preset() retargets them live.
         if preset is not None:
             preset_cfg = AecConfig.from_preset(preset)
             self._split_floor_far_active_db = preset_cfg.min_gain_floor_far_active_db
@@ -762,20 +655,15 @@ class PostBeamResidualSuppressor:
     def set_preset(self, preset, ramp_ms: float = 0.0) -> None:
         """Retarget the strength this stage applies, on a running instance.
 
-        This -- not the four lanes -- is what shapes the four-channel output:
-        the lanes run with spatial_linear_context and never compute a gain of
-        their own, so a preset pushed at them does nothing. Mirrors the C
-        wrapper's audio_pipeline_4ch_set_aec_preset(), which itself calls
-        aec_res_set_preset(): a three-field retarget (far-active floor, DT
-        floor, split-floor-enabled gate). All four presets, including
-        NO_FLOOR, are switchable at runtime via this path.
-
-        The stored value is what a later reset() rebuilds from, so the change
-        survives one.
+        This, not the four lanes, shapes the output (the lanes compute no gain
+        of their own).  Mirrors the C wrapper's
+        audio_pipeline_4ch_set_aec_preset() / aec_res_set_preset(): a
+        three-field retarget (far-active floor, DT floor, split-floor gate);
+        all four presets, NO_FLOOR included, are switchable.  The stored value
+        is what a later reset() rebuilds from.
         """
-        # Coerce FIRST: AecConfig.from_preset() falls back to balanced for
-        # anything it does not recognise -- correct for a config factory,
-        # wrong for a setter, which has a caller to tell.
+        # Coerce first: from_preset() falls back to balanced for unknown values;
+        # a setter must reject them.
         try:
             preset = AecPreset(preset)
         except (TypeError, ValueError):
@@ -784,12 +672,9 @@ class PostBeamResidualSuppressor:
         db = preset_cfg.min_gain_floor_far_active_db
         dt_db = preset_cfg.min_gain_floor_dt_db
         enabled = preset_cfg.min_gain_split_floor_enabled
-        # Validate through the suppressor first: the two dB setters raise
-        # without writing, so a rejected call cannot leave the stored value
-        # and the live floor disagreeing. The gate setter has nothing to
-        # validate (any bool coerces, mirroring set_initial_state's own
-        # contract), so it runs last, after both dB setters have had a
-        # chance to raise -- same ordering as orchestrator.py's set_preset().
+        # The dB setters validate and raise without writing, so they run first;
+        # the gate setter cannot fail and runs last (as orchestrator.py's
+        # set_preset()), keeping the stored values and the live floors in step.
         self._gain.set_split_floor_far_active_db(db, ramp_ms)
         self._split_floor_far_active_db = db
         self._gain.set_split_floor_dt_db(dt_db)
@@ -831,8 +716,7 @@ class PostBeamResidualSuppressor:
             aec_state=self._state,
             nearend_spectrum=suppressor_input,
             residual_echo_spectrum=r2,
-            # Not exported by AecResContext yet; bounded R2 is the explicit
-            # conservative placeholder for the DNE-only unbounded input.
+            # AecResContext has no unbounded R2; bounded R2 stands in.
             residual_echo_spectrum_unbounded=r2,
             comfort_noise_spectrum=comfort,
             render_block=np.asarray(render, dtype=np.float32) * 32768.0,
@@ -878,8 +762,7 @@ class FourChannelAecPipeline:
             enable_res=False,
             return_res_context=True,
         )
-        # Four independent adaptive-filter states.  ``replace`` prevents one
-        # AEC instance from mutating config state observed by another lane.
+        # ``replace`` gives each lane its own config object.
         self._lanes = [AEC(replace(lane_config)) for _ in range(_N_CHANNELS)]
         self._shared_delay = SharedMatchedDelayEstimator(
             sample_rate=self.config.sample_rate, hop_size=hop,
@@ -888,9 +771,9 @@ class FourChannelAecPipeline:
         )
         max_delay = int(self.config.max_delay_ms * self.config.sample_rate / 1000.0)
         self._delay_line = _SharedReferenceDelayLine(max_delay, hop)
-        # Production leaves this unset and calls the explicit pre/post methods.
-        # A configured object enables only the backwards-compatible one-call
-        # process/process_signal helpers used by tests and offline fixtures.
+        # Production leaves this unset and calls the explicit pre/post methods;
+        # a configured object enables only the one-call process/process_signal
+        # helpers used by tests and offline fixtures.
         self._beamformer = beamformer
         self._post_beam_res = PostBeamResidualSuppressor(
             self.config.sample_rate, hop, self.n_freqs, self.config.aec_preset
@@ -923,24 +806,14 @@ class FourChannelAecPipeline:
     def realign_warm_lane_count(self) -> int:
         """How many lane realigns took the warm tap-transfer path.
 
-        Read-only and cumulative since construction or the last ``reset()``.
-        Every hop that publishes ``changed`` sweeps all four lanes, so this and
-        ``realign_soft_lane_count`` grow by exactly 4 between them on such a
-        hop and not at all otherwise. Warm means the learned IR was shifted and
-        the cancellation survived the move.
-
-        Soft is the engine's "not warm" and covers two cases, because
-        ``apply_external_realign`` returns 0 for both: the lane's filter was
-        restarted (taps and far history only — see the method), OR the delta
-        was 0 and nothing happened at all. The second is not hypothetical: a
-        first acquisition that lands on applied delay 0 publishes ``changed``
-        with a zero delta, so a fresh stream's first sweep is four soft counts
-        for four no-ops. Read the pair against the delay trajectory, not on its
-        own. Nothing branches on either count.
-
-        The rejection outcome (-1) is not counted because it cannot occur here:
-        this pipeline builds its own lanes, and their config resolves to
-        EXTERNAL_ALIGNED, the one mode the call accepts. Mirrors the C core's
+        Cumulative since construction or the last ``reset()``.  Every hop that
+        publishes ``changed`` sweeps all four lanes, so this and
+        ``realign_soft_lane_count`` grow by 4 between them on such a hop.  Warm:
+        the learned IR was shifted and the cancellation survived.  Soft: the
+        lane's filter was restarted, or the delta was 0 and nothing happened
+        (``apply_external_realign`` returns 0 for both), so read the pair
+        against the delay trajectory.  The rejection outcome (-1) cannot occur
+        here (the lanes resolve to EXTERNAL_ALIGNED).  Mirrors the C core's
         ``four_aec_nr_res_realign_warm_lane_count()`` pair.
         """
         return self._realign_warm_lanes
@@ -952,11 +825,9 @@ class FourChannelAecPipeline:
     def set_aec_preset(self, preset, ramp_ms: float = 0.0) -> None:
         """Retarget residual-echo strength on a RUNNING pipeline.
 
-        Targets the SHARED post-beam suppressor, which is what actually shapes
-        this pipeline's output. The four lanes are deliberately left alone:
-        they run with spatial_linear_context and never reach their own gain
-        path, so retargeting them would be a provable no-op. Mirrors the C
-        core's setter exactly.
+        Targets the shared post-beam suppressor; the four lanes compute no gain
+        of their own, so retargeting them would be a no-op.  Mirrors the C
+        core's setter.
         """
         self._post_beam_res.set_preset(preset, ramp_ms)
 
@@ -967,8 +838,7 @@ class FourChannelAecPipeline:
             lane.reset()
         self._post_beam_res.reset()
         self._last_delay = 0
-        # Zeroed with the lanes' own state, so every instrumentation total
-        # shares one epoch (matches four_aec_nr_res_reset()).
+        # Zeroed with the lanes' state (as four_aec_nr_res_reset()).
         self._realign_warm_lanes = 0
         self._realign_soft_lanes = 0
         self._generation += 1
@@ -993,15 +863,10 @@ class FourChannelAecPipeline:
             raise ValueError("input contains non-finite samples")
 
         proxy = microphones[:, self.config.capture_proxy_channel]
-        # Read BEFORE the lanes process this hop, so what it answers with is
-        # last hop's cancellation — the same one-hop-behind reading lib/aec's
-        # own Path-B guard judges on, and the ordering the C core gets for
-        # free by calling update_shared_delay() ahead of its lane loop.
-        # ONE lane, the capture proxy: it is the microphone this shared
-        # estimator is fed from, so the only lane whose cancellation is
-        # evidence about the estimate being judged. Evaluated only when the
-        # quarantine is on, so the default path pays nothing for a disabled
-        # feature.
+        # Read before the lanes process this hop, so it reports last hop's
+        # cancellation (as lib/aec's Path-B guard and the C core, which calls
+        # update_shared_delay() ahead of its lane loop).  Capture-proxy lane
+        # only, and only when the quarantine is on.
         proxy_lane_cancelling = bool(
             self.config.delay_backward_quarantine_enabled
             and self._lanes[
@@ -1011,20 +876,13 @@ class FourChannelAecPipeline:
                                               proxy_lane_cancelling)
         aligned_render = self._delay_line.process(render, delay.delay_samples)
         if delay.changed:
-            # All four filters learned against the former shared alignment, so
-            # all four move together on the SAME hop the reference does; never
-            # let lanes drift to different delays.
-            #
-            # Realign instead of reset: ``apply_external_realign`` shifts each
-            # converged filter by the alignment delta (warm tap-transfer when
-            # the evidence gate holds, a filter-only restart otherwise), so the
-            # cancellation survives the move and the WOLA sequences continue.
-            # A ``reset()`` per lane would cost one near-zero output hop plus
-            # dozens of hops of re-exposed echo: the spectrogram vertical line.  ``_last_delay`` is the alignment the
-            # lanes were served BEFORE this hop's decision (0 until the
-            # estimate first turns solid), so the delta is exactly the movement
-            # they have to absorb.  Same call, same delta and same per-lane
-            # sweep as the C core's four_aec_front_process (4aec_nr_res.c).
+            # All four filters move together on the same hop as the reference.
+            # Realign, not reset: ``apply_external_realign`` shifts each filter
+            # by the delta (warm tap-transfer, else a filter-only restart), so
+            # cancellation survives and the WOLA sequences continue.
+            # ``_last_delay`` is the alignment served before this hop's decision
+            # (0 until the estimate first turns solid).  Same sweep as the C
+            # core's four_aec_front_process (4aec_nr_res.c).
             delta = int(delay.delay_samples) - int(self._last_delay)
             for lane in self._lanes:
                 outcome = lane.apply_external_realign(delta)
@@ -1041,8 +899,7 @@ class FourChannelAecPipeline:
             if not isinstance(result, tuple) or len(result) != 2:
                 raise RuntimeError("linear AEC lane did not return its RES context")
             _lane_output, context = result
-            # Match context.error_spec, including refined/coarse selection,
-            # crossfade and WOLA formation.
+            # Same signal as context.error_spec (selection, crossfade, WOLA).
             lane_outputs[channel] = np.asarray(
                 context.formed_output, dtype=np.float32
             )

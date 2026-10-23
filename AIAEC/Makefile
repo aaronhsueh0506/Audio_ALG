@@ -19,7 +19,7 @@ endif
 # `override` is required, not stylistic: CFLAGS above is a `?=` default, so a
 # caller passing CFLAGS= on the command line makes CFLAGS a command-line
 # variable, and a plain `CFLAGS +=` here would then be discarded -- WERROR=1
-# would silently compile without -Werror (verified).
+# would silently compile without -Werror.
 WERROR ?= 0
 ifeq ($(WERROR),1)
 override CFLAGS += -Werror
@@ -48,9 +48,9 @@ CFG_SIG := $(shell printf '%s' "$(CFG_SIG_PAYLOAD)" | cksum | cut -d' ' -f1)
 OBJ_DIR := $(BUILD_DIR)/simd$(SIMD)-$(CFG_SIG)
 LIB := $(OBJ_DIR)/libaiaec_prepost.a
 # ulcnet_prepost.o and deepvqe_prepost.o are the pre/post classes, each a
-# THIRD TU on purpose: the two files a class composes (ulcnet_process.c +
-# ulcnet_model_io.c; aiaec_process.c + deepvqe_process.c) stay independently
-# linkable for their own parity tests. The accelerator adapter drives the
+# THIRD TU on purpose: the files a class composes (ulcnet_process.c +
+# ulcnet_model_io.c; deepvqe_process.c) stay independently linkable for their
+# own parity tests. The accelerator adapter drives the
 # Align-ULCNet class.
 OBJECTS := $(OBJ_DIR)/ulcnet_process.o \
 	$(OBJ_DIR)/ulcnet_model_io.o \

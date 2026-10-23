@@ -13,9 +13,8 @@ from AIAEC.aiaec_common import SignalGrid
 
 GRID = SignalGrid(16000, 512, 512, 256)
 
-# Measured on random weights (seeds 0/1, B=2, T=96): the largest offline vs
-# streamed deviation over enhanced/mask/delay/erb_mask was 5.3e-7 -- pure
-# float32 accumulation-order noise.  Pinned with ~10x headroom.
+# Tolerances are pinned with ~10x headroom over the largest offline vs streamed
+# deviation on random weights (pure float32 accumulation-order noise).
 TOL = 5e-6
 
 

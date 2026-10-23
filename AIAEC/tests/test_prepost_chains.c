@@ -1,26 +1,18 @@
 /* Whole-chain digests of the Align-ULCNet and DeepVQE-S pre/post chains.
  *
- * Each chain is driven through its public frequency-domain class for HOPS
- * hops with a seeded generator: the analysed spectra going in, and stand-in
- * model outputs coming back (plausible mask or tap values, and on a fixed
- * schedule tiny values, huge values, non-finite heads, non-finite recurrent
- * state in the newest and in an older slot, a skipped frame and an unwritten
- * frame). Everything handed to the model, the recurrent state after each
- * frame and every post-processed spectrum is hashed bit by bit; a NaN counts
- * as one value whatever its payload. Align-ULCNet runs at two delay depths,
- * the grid is the one the translation unit is built for (16 kHz / 512 by
- * default, 48 kHz / 1024 with -DULCNET_MODEL_IO_SR=48000
- * -DULCNET_MODEL_IO_N_FFT=1024).
+ * Each chain runs HOPS hops through its public frequency-domain class with a
+ * seeded generator: spectra in, stand-in model outputs back (plausible, tiny,
+ * huge and non-finite values, bad state in the newest and an older slot, a
+ * skipped and an unwritten frame). Model inputs, the recurrent state after each
+ * frame and every output spectrum are hashed bit by bit (a NaN is one value).
+ * Align-ULCNet runs at two delay depths on the compiled grid (16 kHz / 512;
+ * 48 kHz / 1024 with -DULCNET_MODEL_IO_SR=48000 -DULCNET_MODEL_IO_N_FFT=1024).
  *
- * The program prints one line with the digest of each delay depth. The NEON
- * and the forced-scalar build must print the same digests (the pytest module
- * compares them), so a difference of one bit of any tensor between the two
- * builds fails there. Each depth is also run twice in the process and must
- * reproduce its own digest, which catches state that is read before it is
- * written.
- *
- * CHAIN_ULCNET selects Align-ULCNet, CHAIN_DEEPVQE selects DeepVQE-S;
- * RNG_SEED overrides the generator seed. */
+ * One line per delay depth is printed. The NEON and forced-scalar builds must
+ * print the same digests (test_prepost_chains.py compares them), and a second
+ * run in the process must reproduce its own, which catches state read before it
+ * is written. CHAIN_ULCNET or CHAIN_DEEPVQE selects the chain; RNG_SEED the
+ * seed. */
 #include <math.h>
 #include <stddef.h>
 #include <stdint.h>

@@ -1,11 +1,6 @@
 /* CPU-owned state adapter for a stateless Align-ULCNet accelerator graph.
- *
- * The per-frame transaction (prepare -> run -> commit-or-discard) lives in
- * exactly ONE place, ulcnet_prepost.c, and this file drives it. The adapter
- * is the spectrum-in/spectrum-out face of that class: it carves no framing
- * state, so it runs the class in ULCNET_IO_FREQ, where the caller owns the
- * framing clock and no FftHandle or window is involved at all.
- */
+ * Drives the ulcnet_prepost frame transaction (prepare, run, commit or discard)
+ * in ULCNET_IO_FREQ: spectrum in, spectrum out, caller owns the framing clock. */
 #include "ulcnet_accelerator_adapter.h"
 
 #include <stdint.h>
@@ -19,13 +14,8 @@ struct UlcnetAcceleratorAdapter {
     void *run_user;
 };
 
-/* The class config this descriptor deploys as.
- *
- * descriptor_validate() pins geometry and the layout version to this build;
- * the class then takes both from the descriptor.
- * Validating here also keeps the reject-first contract the header states:
- * an aligned-far or out-of-range descriptor never reaches sizing.
- */
+/* Class config for this descriptor. Geometry and layout version must match this
+ * build; aligned-far and out-of-range descriptors are rejected before sizing. */
 static int adapter_config(const UlcnetModelIoDescriptor *descriptor,
                           UlcnetPrepostConfig *cfg) {
     if (ulcnet_model_io_descriptor_validate(descriptor) != 0) {
@@ -37,8 +27,7 @@ static int adapter_config(const UlcnetModelIoDescriptor *descriptor,
     return 0;
 }
 
-/* One pool: this header, then the class -- which itself contains the model
- * I/O state and the frequency-domain frame staging. */
+/* One pool: header, then the class (model I/O state and frequency-domain staging). */
 static int adapter_layout(const UlcnetModelIoDescriptor *descriptor,
                           UlcnetPrepostConfig *cfg,
                           UlcnetPrepostMemReq *req,
@@ -48,10 +37,8 @@ static int adapter_layout(const UlcnetModelIoDescriptor *descriptor,
         ulcnet_prepost_get_mem_size(cfg, req) != 0) {
         return -1;
     }
-    /* The class reports bytes as uint64_t; on a 32-bit target that is wider
-     * than size_t. Written as a round-trip rather than a compare against
-     * SIZE_MAX so it stays a real test instead of a tautology a 64-bit
-     * -Wtype-limits build would (rightly) flag. */
+    /* The class reports uint64_t bytes; the round-trip keeps the check
+     * meaningful where size_t is 32-bit. */
     if ((uint64_t)(size_t)req->bytes != req->bytes) {
         return -1;
     }
@@ -105,10 +92,8 @@ UlcnetAcceleratorAdapter *ulcnet_accelerator_adapter_init(
 
     memset(memory, 0, required);
     adapter = (UlcnetAcceleratorAdapter *)memory;
-    /* _init_ex, not _init: `req` is what THIS build just sized, so the
-     * class's stale-pool gate re-proves the carve it is handed matches the
-     * mode, depth and build the header above was sized for. The class pool
-     * starts at a multiple of req.alignment past an equally aligned base. */
+    /* req is this build's own sizing, so the class re-validates the carve
+     * against mode, depth and build. */
     adapter->prepost = ulcnet_prepost_init_ex(
         (unsigned char *)memory + header_bytes, (size_t)req.bytes, &cfg, &req);
     if (!adapter->prepost) {
@@ -130,9 +115,7 @@ static int infer(void *user,
     if (!adapter || !adapter->prepost || !adapter->run) {
         return -1;
     }
-    /* In ULCNET_IO_FREQ one spectrum is one accelerator invocation, so this
-     * returns 1 or it failed; there is no centered double emission to loop
-     * over (that is the ULCNET_IO_TIME caller's job). */
+    /* ULCNET_IO_FREQ: one spectrum is one invocation; returns 1 or fails. */
     if (ulcnet_prepost_pre_process_freq(adapter->prepost, error_re, error_im,
                                         far_re, far_im) != 1 ||
         ulcnet_prepost_frame_inputs(adapter->prepost, &inputs,
@@ -141,23 +124,12 @@ static int infer(void *user,
     }
 
     if (adapter->run(adapter->run_user, &inputs, &outputs) != 0) {
-        /* A failed run must not commit: a runtime that filled every output and
-         * THEN reported failure would otherwise pass commit()'s finite check
-         * and take the frame. frame_skip() closes the transaction WITHOUT
-         * committing, and the in-place state stays as the runtime left it
-         * (a run that reported failure is taken not to have written). The
-         * next prepare() re-arms the transaction and re-fills the
-         * NaN-checked mask, so the NaN-prefill plus commit()'s finite
-         * gate remain as the second line of defence against an unwritten
-         * frame. The caller's enhanced spectra stay untouched, because -1
-         * here means this frame produced nothing. */
+        /* A failed run is discarded without commit; the caller's spectra stay untouched. */
         (void)ulcnet_prepost_frame_skip(adapter->prepost);
         return -1;
     }
     if (ulcnet_prepost_frame_commit(adapter->prepost) != 0) {
-        /* Same rule from the other direction: commit refused the frame (an
-         * unwritten or non-finite one), restarted the recurrent state from
-         * zero, and wrote nothing to the caller. */
+        /* Commit refused the frame: state restarted from zero, nothing written to the caller. */
         (void)ulcnet_prepost_frame_skip(adapter->prepost);
         return -1;
     }
@@ -179,8 +151,7 @@ uint32_t ulcnet_accelerator_adapter_state_generation(
 
 const UlcnetModelIoDescriptor *ulcnet_accelerator_adapter_descriptor(
     const UlcnetAcceleratorAdapter *adapter) {
-    /* Lives in the model I/O state inside the caller's pool, so it outlives
-     * the adapter exactly as the header promises. */
+    /* Lives in the model I/O state inside the caller's pool. */
     return adapter ? ulcnet_prepost_descriptor(adapter->prepost) : NULL;
 }
 

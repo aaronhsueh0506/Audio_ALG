@@ -1,9 +1,7 @@
-/* Command-line handling shared by the two DFN2 board skeletons
- * (mono_aec_dfn_res/main.c, 4ch_aec_bf_dfn_res/main.c; this header lives in
- * pipelines/ so both include it by name): the delay profile
- * in lib/aec's aec_wav spelling, the exported ERB matrices, the DFN2
- * attenuation limit and the comfort-noise switch (off by default). Header-only so each
- * skeleton stays a single translation unit; nothing here is linked into the
+/* Command-line handling shared by the DFN2 board skeletons
+ * (mono_aec_dfn_res/main.c, 4ch_aec_bf_dfn_res/main.c): delay profile in
+ * lib/aec's aec_wav spelling, exported ERB matrices, DFN2 attenuation limit and
+ * the comfort-noise switch (off by default). Header-only; not linked into the
  * delivered archives. */
 #ifndef DFN_EXAMPLE_ARGS_H
 #define DFN_EXAMPLE_ARGS_H
@@ -19,15 +17,11 @@
 #include "dfn2_process.h"
 #include "dfn_unit_partition.h"
 
-/* The delay profile is a product deployment decision, not a property of the
- * source: `n` (matched-filter bank size) sets how far the estimator can
- * search for the bulk far-to-mic delay, and it has to be chosen from the
- * measured delay distribution of the SKU/route the binary is deployed on.
- * Reliable bulk-delay search range per bank (lib/aec's contract value):
- * n=1 ~125 ms, 2 ~221 ms, 3 ~317 ms, 4 ~413 ms, 5 ~509 ms. Changing n means
- * re-querying the pool and re-init; there is no runtime setter. lib/aec's
- * DA_NUM_FILTERS is both the bank-size cap and the exact value the
- * non-MATCHED modes require. */
+/* Delay profile: `n` (matched-filter bank size) sets the bulk-delay search range
+ * and is chosen from the delay distribution of the deployment route. Range per
+ * bank: n=1 ~125 ms, 2 ~221 ms, 3 ~317 ms, 4 ~413 ms, 5 ~509 ms. No runtime
+ * setter. DA_NUM_FILTERS is the bank-size cap and the value the non-MATCHED modes
+ * require. */
 #ifndef DFN_EXAMPLE_DELAY_NUM_FILTERS
 #define DFN_EXAMPLE_DELAY_NUM_FILTERS DA_NUM_FILTERS
 #endif
@@ -46,8 +40,7 @@ typedef struct DfnExampleArgs {
     int enable_cng;
 } DfnExampleArgs;
 
-/* `rates` is the 0-terminated list of host grids THIS skeleton's host offers
- * (the 4-channel core has no 8 kHz); "8000|16000|48000" for the texts. */
+/* `rates` is the 0-terminated list of host grids the skeleton offers. */
 static int dfn_example_rate_known(const int *rates, int value) {
     for (; *rates; ++rates)
         if (*rates == value) return 1;
@@ -104,8 +97,7 @@ static const char *dfn_example_delay_mode_name(AecDelayMode m) {
     }
 }
 
-/* Whole-string decimal integer / finite float, or -1: "16000Hz", "12dB"
- * and "" are rejections, not 16000, 12 and 0. */
+/* Whole-string decimal integer / finite float, or -1 ("16000Hz" and "" are rejected). */
 static int dfn_example_parse_int(const char *text, int *value) {
     char *end = NULL;
     long parsed;
@@ -128,11 +120,9 @@ static int dfn_example_parse_float(const char *text, float *value) {
     return 0;
 }
 
-/* Returns 0 on success, 1 on --help, 2 on a rejected argument. `rates` is
- * the 0-terminated list of host grids this skeleton's host offers. Every
- * rejection names BOTH the requested value and what this build accepts,
- * because the pipeline TUs are stdio-free and can only answer with a NULL
- * handle. */
+/* Returns 0 on success, 1 on --help, 2 on a rejected argument. `rates` is the
+ * 0-terminated list of host grids the skeleton offers. A rejection names the
+ * requested value and what the build accepts. */
 static int dfn_example_parse_args(int argc, char **argv, const char *name,
                                   const int *rates, DfnExampleArgs *out) {
     char rates_text[64];
@@ -208,9 +198,8 @@ static int dfn_example_parse_args(int argc, char **argv, const char *name,
         fprintf(stderr, "%s: --erb-fwd and --erb-inv go together\n", name);
         return 2;
     }
-    /* n is meaningful only where a matched bank exists. 0 is NOT "disabled":
-     * FIXED and EXTERNAL_ALIGNED are separate modes, and both require
-     * n == DA_NUM_FILTERS because they build no bank at all. */
+    /* n applies only to MATCHED; FIXED and EXTERNAL_ALIGNED require n == DA_NUM_FILTERS
+     * (no bank is built). */
     if (have_fixed && out->delay_mode != AEC_DELAY_FIXED) {
         fprintf(stderr, "%s: --fixed-delay %d is only valid with "
                 "--delay-mode fixed (requested mode: %s)\n", name,
@@ -249,8 +238,7 @@ static int dfn_example_parse_args(int argc, char **argv, const char *name,
     return 0;
 }
 
-/* Exactly `count` little-endian float32 values, or failure: a short or long
- * file is a matrix from another model geometry, not a partial success. */
+/* Exactly `count` little-endian float32 values, or failure. */
 static int dfn_example_read_matrix(const char *path, float *dst,
                                    size_t count, const char *name) {
     FILE *f = fopen(path, "rb");
@@ -272,8 +260,8 @@ static int dfn_example_read_matrix(const char *path, float *dst,
     return 0;
 }
 
-/* Fills the two matrices from the exported files, or with the unit
- * partition when none were named. */
+/* Fills the two matrices from the exported files, or with the unit partition when
+ * none were named. */
 static int dfn_example_load_matrices(const DfnExampleArgs *args,
                                      float *erb_fwd, float *erb_inv,
                                      const char *name) {

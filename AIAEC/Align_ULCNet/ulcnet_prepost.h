@@ -1,9 +1,5 @@
-/* ============================================================
- * Align-ULCNet pre/post-processing class.
- *
- * ONE object owning everything between the caller's audio and the
- * accelerator's tensors, so an integrator never touches the framing
- * states, the feature front end or the recurrent windows directly:
+/* Align-ULCNet pre/post-processing class: one object owning everything between
+ * the caller's audio and the accelerator's tensors.
  *
  *     ulcnet_prepost_pre_process(p, err_hop, far_hop);
  *     ulcnet_prepost_frame_inputs(p, &in, &out);   // views into the pool
@@ -11,45 +7,12 @@
  *     ulcnet_prepost_frame_commit(p);              // or _frame_skip()
  *     ulcnet_prepost_post_process(p, out_hop, &written);
  *
- * ONE HOP IN, ONE INFERENCE, ONE HOP OUT -- always, from the very first hop,
- * in both I/O modes. There is no variable emission count to loop over.
+ * One hop in, one inference, one hop out, from the first hop, in both I/O modes.
+ * Analysis is a rolling window over the last ULCNET_N_FFT samples (AcStft with
+ * center 0), one frame per hop, the same convention as the AEC spectra.
  *
- * FRAMING: this class analyses at center=False -- a plain rolling window over
- * the last ULCNET_N_FFT samples, one frame per hop (AcStft with center 0). It
- * is NOT the centered (center 1) schedule, which emits 0 frames on the first
- * hop and TWO on the second to carry a reflect prefix.
- *
- * That is a re-labelling, not a change of signal. At this geometry
- * (win == n_fft, hop == n_fft/2, one shared sqrt-Hann table) centered frame k
- * and non-centered frame k-1 cover exactly the same samples with exactly the
- * same window, so they are bit-identical -- measured, not assumed. The only
- * difference is the head: the centered schedule additionally emits one
- * reflect-prefix frame, which this class does not. That also makes the class
- * agree with the AEC/BF seam, whose spectra are center=False and arrive one
- * per hop from hop 0.
- *
- * The one-hop algorithmic latency is unchanged: it comes from the synthesis
- * half-window trim, not from the analysis schedule.
- *
- * WHY A THIRD TRANSLATION UNIT, not an addition to one of the two it uses:
- * ulcnet_process.c and ulcnet_model_io.c are deliberately independently
- * linkable -- AIAEC/tests/test_ulcnet_process_c.py compiles the first
- * WITHOUT the second, and test_ulcnet_model_io_c.py the second without the
- * first. A class in either would put an undefined symbol in the other's
- * parity build. This file composes them and neither of them changes.
- *
- * Memory: both house lifecycles (audiolib/common/include/fft_wrapper.h,
- * "Static memory support").
- *   size_t/req  ulcnet_prepost_get_mem_size(&cfg, &req);
- *   UlcnetPrepost *p = ulcnet_prepost_init(pool, req.bytes, &cfg);   // board
- *   UlcnetPrepost *p = ulcnet_prepost_create(&cfg);                  // host
- *   ulcnet_prepost_destroy(p);   // frees only what create() allocated
- *
- * The FftHandle and the sqrt-Hann window table are CALLER-OWNED and may be
- * shared with anything else on the same grid -- this class never creates or
- * destroys either. They are required in ULCNET_IO_TIME and unused in
- * ULCNET_IO_FREQ.
- * ============================================================ */
+ * Memory: init() on a caller pool (board) or create() (host). The FftHandle and
+ * sqrt-Hann window are caller-owned, required in ULCNET_IO_TIME only. */
 
 #ifndef ULCNET_PREPOST_H
 #define ULCNET_PREPOST_H
@@ -57,51 +20,38 @@
 #include <stddef.h>
 #include <stdint.h>
 
-#include "ulcnet_process.h"   /* grid, AcStft/AcIstft, FftHandle, ulcnet_framing_config
-                               * and (transitively) ulcnet_model_io.h       */
+#include "ulcnet_process.h"   /* grid, AcStft/AcIstft, FftHandle, ulcnet_framing_config, ulcnet_model_io.h */
 
 #ifdef __cplusplus
 extern "C" {
 #endif
 
 #define ULCNET_PREPOST_DESCRIPTOR_VERSION 1u
-/* Folded into build_flags_hash. Any change of pool size, carve order or
- * descriptor content (a region added, removed, resized or reordered) bumps it,
- * so a pool recorded by another carve is refused by _init_ex on the hash, not
- * only on `bytes`. */
+/* Folded into build_flags_hash. Bumped on any change of pool size, carve order
+ * or descriptor content, so a pool carved differently is refused by _init_ex. */
 #define ULCNET_PREPOST_CARVE_VERSION 6u
 
-/* Which side of the transform the caller works on. FIXED AT INIT because it
- * decides the pool size: ULCNET_IO_TIME additionally carves two analysis
- * states (each with its own transform scratch), one synthesis state and the
- * output hop staging. At D=4 that is larger than the recurrent state itself,
- * so a runtime switch would make every frequency-domain instance pay for
- * machinery it never runs. */
+/* Which side of the transform the caller works on. Fixed at init because it
+ * decides the pool size: ULCNET_IO_TIME also carves the analysis and synthesis
+ * states and the output hop staging. */
 typedef enum UlcnetIoMode {
-    /* Spectrum in, spectrum out. NO framing, windowing, FFT, iFFT or
-     * overlap-add -- the caller owns the transform. This is the mode for
-     * chaining, and the mode in which `fft`/`window` may be NULL. */
+    /* Spectrum in, spectrum out; the caller owns the transform. fft/window may be NULL. */
     ULCNET_IO_FREQ = 0,
-    /* Hop in, hop out. The class owns framing, windowing, overlap-add and
-     * calls the CALLER'S FftHandle for the transforms. */
+    /* Hop in, hop out; the class owns framing, windowing and overlap-add and
+     * calls the caller's FftHandle. */
     ULCNET_IO_TIME = 1
 } UlcnetIoMode;
 
 typedef struct UlcnetPrepostConfig {
     int          io_mode;      /* a UlcnetIoMode                            */
     int          delay_depth;  /* D, as exported; ULCNET_MODEL_IO_MIN/MAX_D */
-    FftHandle   *fft;          /* ULCNET_IO_TIME: required, borrowed        */
-    const float *window;       /* ULCNET_IO_TIME: required, borrowed,
-                                * ULCNET_N_FFT entries from
-                                * ac_window_build()                         */
-    uint32_t model_layout_version; /* 0 = ULCNET_MODEL_IO_LAYOUT_VERSION; any
-                                    * other value must equal it. Must match
-                                    * the exported graph metadata.           */
+    FftHandle   *fft;          /* ULCNET_IO_TIME: required, borrowed */
+    const float *window;       /* ULCNET_IO_TIME: required, borrowed; ULCNET_N_FFT entries from ac_window_build() */
+    uint32_t model_layout_version; /* 0 = ULCNET_MODEL_IO_LAYOUT_VERSION; otherwise must equal it and the exported graph metadata */
 } UlcnetPrepostConfig;
 
-/* Fixed 32-byte shape, same staleness-gate discipline as the pipelines'
- * memory descriptors: a pool sized for another io_mode, delay depth or build
- * is refused by _init_ex rather than reinterpreted. */
+/* Fixed 32-byte descriptor; a pool sized for another io_mode, delay depth or
+ * build is refused by _init_ex. */
 typedef struct UlcnetPrepostMemReq {
     uint32_t descriptor_version;  /* ULCNET_PREPOST_DESCRIPTOR_VERSION      */
     uint32_t layout_version;      /* ULCNET_MODEL_IO_LAYOUT_VERSION         */
@@ -138,32 +88,26 @@ int ulcnet_prepost_get_mem_size(const UlcnetPrepostConfig *cfg,
 UlcnetPrepost *ulcnet_prepost_init(void *pool, size_t bytes,
                                    const UlcnetPrepostConfig *cfg);
 
-/* As _init, plus refusing a pool whose recorded requirements differ from
- * this build's -- the stale-pool gate. `expected` NULL behaves as _init. */
+/* As _init, plus the stale-pool gate: refuses a pool whose recorded
+ * requirements differ from this build's. `expected` NULL behaves as _init. */
 UlcnetPrepost *ulcnet_prepost_init_ex(void *pool, size_t bytes,
                                       const UlcnetPrepostConfig *cfg,
                                       const UlcnetPrepostMemReq *expected);
 
-/* get_mem_size + aligned allocation + init. Host tools and tests; the board
- * path is _init on a caller pool. */
+/* get_mem_size + aligned allocation + init (host path). */
 UlcnetPrepost *ulcnet_prepost_create(const UlcnetPrepostConfig *cfg);
 
-/* Frees only what _create allocated. NULL-safe. For an _init instance it is
- * a genuine no-op that may be called repeatedly -- the caller's pool stays
- * the caller's; a _create instance is gone after the first call, so calling
- * it twice on one is a use-after-free like any other double free. Never
- * touches the caller's fft or window. */
+/* Frees only what _create allocated; NULL-safe, a no-op on an _init instance.
+ * Never touches the caller's fft or window. */
 void ulcnet_prepost_destroy(UlcnetPrepost *p);
 
 /* Zero every recurrent window/hidden tensor, drop any open frame, and reset
  * the framing states. Config and pool are untouched. */
 void ulcnet_prepost_reset(UlcnetPrepost *p);
 
-/* Counter of state restarts (ulcnet_model_io_state_generation): it advances
- * whenever the C side zeroed the state tensors, in ulcnet_prepost_reset() and
- * when frame_commit() refused a frame; 0 for a fresh instance. A board with a
- * fixed-point accelerator state refills it with quantized zeros when the
- * value differs from the one it last saw. 0 for NULL. */
+/* Counter of state restarts: advances on ulcnet_prepost_reset() and when
+ * frame_commit() refused a frame; 0 for a fresh instance or NULL. A fixed-point
+ * accelerator refills its state with quantized zeros when it changes. */
 uint32_t ulcnet_prepost_state_generation(const UlcnetPrepost *p);
 
 int ulcnet_prepost_hop_size(const UlcnetPrepost *p);   /* or -1 */
@@ -173,70 +117,46 @@ const UlcnetModelIoDescriptor *ulcnet_prepost_descriptor(const UlcnetPrepost *p)
 
 /* ---- per-hop stages -------------------------------------------------- */
 
-/* ULCNET_IO_TIME. One hop of the linear-AEC error and one of the aligned
- * far, BOTH FOR THE SAME INPUT HOP -- this class applies no internal skew.
- * A caller whose error source lags its far source (an upstream WOLA, say)
- * aligns them before calling.
- *
- * Transforms both streams (center=False rolling window). ALWAYS returns 1 --
- * one hop is one accelerator invocation, from the first hop onward. Returns
- * -1 on NULL args, in ULCNET_IO_FREQ, or while the previous frame is still
- * open (neither committed nor skipped): a hop is refused rather than
- * silently stacked on top of an unfinished one. */
+/* ULCNET_IO_TIME. One hop of the linear-AEC error and one of the aligned far,
+ * both for the same input hop (no internal skew). Returns 1 (one hop is one
+ * accelerator invocation), or -1 on NULL args, in ULCNET_IO_FREQ, or while the
+ * previous frame is still open (neither committed nor skipped). */
 int ulcnet_prepost_pre_process(UlcnetPrepost *p,
                                const float err_hop[ULCNET_HOP],
                                const float far_hop[ULCNET_HOP]);
 
-/* ULCNET_IO_FREQ. One already-analysed frame per stream, in the model's own
- * framing (unnormalised rfft of a sqrt-Hann-windowed ULCNET_N_FFT block on
- * the hop grid, center=False -- see FRAMING above; the AEC's
- * AecResContext.error_spec is already in exactly this convention). Does NO
- * transform. Always returns 1; -1 on NULL args, in ULCNET_IO_TIME, or while
- * the previous frame is still open. */
+/* ULCNET_IO_FREQ. One analysed frame per stream: unnormalised rfft of a
+ * sqrt-Hann-windowed ULCNET_N_FFT block on the hop grid (center=False). No transform is done. Returns 1; -1 on NULL args,
+ * in ULCNET_IO_TIME, or while the previous frame is open. */
 int ulcnet_prepost_pre_process_freq(UlcnetPrepost *p,
                                     const float err_re[ULCNET_BINS],
                                     const float err_im[ULCNET_BINS],
                                     const float far_re[ULCNET_BINS],
                                     const float far_im[ULCNET_BINS]);
 
-/* Publish the current frame's accelerator boundary. The `output` mask is
- * NaN-prefilled, so an unwritten frame is caught by frame_commit rather than
- * leaking the previous frame's values. Each state output (key/value/logit
- * window, GRU hidden) is the same address as its state input: the runtime
- * binds the pointers returned here, reads every state input before it writes
- * any state output, and the state advances with no copy. Pointers are into
- * this instance's pool and are stable for its life.
- * Returns 0, or -1 if no frame is open. */
+/* Publish the current frame's accelerator boundary. `output` is NaN-prefilled so
+ * an unwritten frame is caught by frame_commit. Each state output has the same
+ * address as its state input: bind the returned pointers and read every state
+ * input before writing any state output. Pointers are into the pool and stable
+ * for its life. Returns 0, or -1 if no frame is open. */
 int ulcnet_prepost_frame_inputs(UlcnetPrepost *p,
                                 UlcnetModelIoInputs *inputs,
                                 UlcnetModelIoOutputs *outputs);
 
-/* Validates that the accelerator wrote a finite mask and finite state,
- * applies it to the compressed error and the inverse compression, then feeds
- * the enhanced spectrum to the synthesis (ULCNET_IO_TIME) or stages it for
- * post_process_freq. The state
- * tensors need no step: the accelerator already wrote them where the next
- * frame reads them.
+/* Validate that the accelerator wrote a finite mask and state, apply the mask
+ * and inverse compression, and feed the enhanced spectrum to the synthesis
+ * (ULCNET_IO_TIME) or stage it for post_process_freq. Requires a frame opened by
+ * pre_process and published by frame_inputs(); otherwise it is refused.
  *
- * Requires a frame opened by pre_process AND published by frame_inputs():
- * a commit with no frame_inputs() behind it is refused, so an accelerator
- * that never ran cannot pass untouched buffers off as a result.
- *
- * On failure the state has already been overwritten and cannot be rolled
- * back, so the K/V/logit windows and the hidden restart from zero and
- * ulcnet_prepost_state_generation() advances;
- * the framing state does not move, the frame stays open, and -1 is
- * returned. The caller then either calls ulcnet_prepost_frame_skip() to
- * keep the framing schedule intact, or re-runs the accelerator through a
+ * On failure the K/V/logit windows and hidden restart from zero,
+ * ulcnet_prepost_state_generation() advances, the frame stays open and -1 is
+ * returned; the caller then calls ulcnet_prepost_frame_skip() or re-runs via a
  * fresh frame_inputs(). */
 int ulcnet_prepost_frame_commit(UlcnetPrepost *p);
 
-/* Take the identity for the current frame: the error spectrum passes
- * through unenhanced, the state tensors stay as the accelerator left them (a
- * run that reported failure is taken not to have written), and the framing
- * schedule still advances. This is
- * what a failed accelerator run and an alignment-boundary reprime both
- * need. Returns 0, or -1. */
+/* Take the identity for the current frame: the error spectrum passes through
+ * unenhanced and the framing schedule still advances. Used after a failed
+ * accelerator run or an alignment-boundary reprime. Returns 0, or -1. */
 int ulcnet_prepost_frame_skip(UlcnetPrepost *p);
 
 /* ULCNET_IO_TIME. Emit this hop's output. `out_hop` is always fully

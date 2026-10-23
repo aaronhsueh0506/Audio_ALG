@@ -1,26 +1,19 @@
 """Parity gate for the Align-ULCNet C pre/post-processing.
 
-Compiles AIAEC/Align_ULCNet/ulcnet_process.c with a tiny file-driven test
-main (written to a temp dir, never to the repo) that drives audiolib's
-AcStft / AcIstft in the ulcnet configuration (ulcnet_framing_config: centered
-analysis, envelope-normalised synthesis), runs it on random audio and
-compares, frame by frame and sample by sample, against the Python reference
-(aiaec_streaming.StreamSTFT/StreamISTFT), which is itself the bit-exact twin
-of torch.stft/istft(center=True).
+Compiles AIAEC/Align_ULCNet/ulcnet_process.c with a tiny file-driven test main
+(written to a temp dir, never to the repo) that drives audiolib's AcStft /
+AcIstft in the ulcnet configuration (centered analysis, envelope-normalised
+synthesis) on random audio and compares, frame by frame, against the Python
+reference (aiaec_streaming.StreamSTFT/StreamISTFT, the bit-exact twin of
+torch.stft/istft(center=True)). The fixture first builds audiolib's NE10 static
+lib the way the AEC C tests document it. The driver shares ONE FftHandle across
+analysis and synthesis (strictly sequential), the sharing contract the pipeline
+variants rely on.
 
-The C side transforms through audiolib's fft_wrapper (caller-owned
-FftHandle, real RFFT/IRFFT), so the fixture first builds audiolib's NE10
-static lib the way the AEC C tests document it
-(make -s -C ../audiolib/common BACKEND=ne10 lib + print-lib-path) and links it
-into the driver. The driver deliberately shares ONE FftHandle across the
-analysis and the synthesis (strictly sequential use), exercising the same
-sharing contract the pipeline variants rely on.
-
-Expected agreement is float-ULP class, not bit-exact: the C side uses the
-f32 NE10 FFT while torch computes with double twiddles. Measured ~2e-5
-absolute on unit-scale audio; tolerances are pinned at ~10x that. A
-one-frame misalignment shows up as O(1) error, so the comparison has teeth
-by construction (asserted below).
+Agreement is float-ULP class, not bit-exact (the C side uses the f32 NE10 FFT,
+torch double twiddles): tolerances sit at ~10x the ~2e-5 absolute error on
+unit-scale audio, and a one-frame misalignment shows up as O(1) error, so the
+comparison has teeth by construction.
 """
 
 import os

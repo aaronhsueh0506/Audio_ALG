@@ -101,7 +101,7 @@ calibration manifest 與 CPU descriptor 必須使用相同 D。</p>
 <h2>C pre/post 類別（四個模型共用的形狀）</h2>
 
 <p>四個模型各有一個 pre/post 類別，把「caller 音訊 ↔ 加速器張量」之間的一切收進<b>一個物件</b>：
-framing、特徵前後端、recurrent ring／state buffer。整合者不再自己把兩個 TU 接起來。
+framing、特徵前後端、recurrent ring／state buffer。整合者不需自己把兩個 TU 接起來。
 四個類別的 API 形狀相同，只是前綴 <code>&lt;pfx&gt;</code> 不同（<code>ulcnet</code> /
 <code>deepvqe</code> / <code>dfn2</code> / <code>dfn3</code>）：</p>
 
@@ -253,7 +253,7 @@ Makefile、沒有封存檔，板端要用就把它的 <code>process.c</code> 直
 mic + far。Align-ULCNet 使用已產生的 error + raw far（或
 <code>--primary-is-mic</code> 餵 raw mic，由凍結 PBFDKF 現算 linear error 並
 把衍生檔存於 artifact 旁）；
-manifest 會另外記錄產品部署輸入是 aligned far，避免把校正資料來源與
+manifest 會另外記錄產品部署輸入(raw far)，避免把校正資料來源與
 board wiring 混為一談。</p>
 
 <h2>Batch-1 圖整理（onnx_batch1_optimizer.py）</h2>

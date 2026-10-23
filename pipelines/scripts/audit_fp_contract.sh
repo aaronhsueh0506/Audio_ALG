@@ -1,22 +1,14 @@
 #!/bin/sh
-# audit_fp_contract.sh -- disassembly check for pipeline objects whose
-# multiply/add ordering is part of the numerical contract.
+# audit_fp_contract.sh -- disassembly check for pipeline objects whose multiply/add ordering is part of
+# the numerical contract. The kernel they call (sk_wola_accumulate_f32) is audited by audiolib's own
+# script; this audits the call sites, which carry WOLA or DFN per-bin floating-point work. Compiling
+# under -ffp-contract=off is a Makefile property, but being fma-free is a property of the emitted code
+# that only a disassembly shows. audiolib must not reach up into Audio_ALG, so the audit for these
+# objects lives here.
 #
-# Why this exists here and not in audiolib: the KERNEL those objects call
-# (sk_wola_accumulate_f32) is audited by audiolib's own script, against a
-# non-inline instantiation in that repo. The CALL SITES are a separate
-# question -- these translation units carry WOLA or DFN per-bin floating-point
-# work, and none of them was ever disassembled. Being compiled
-# under -ffp-contract=off is a Makefile property; being fma-free is a property
-# of the emitted code, and only a disassembly says so. audiolib must not
-# reach up into Audio_ALG, so the audit for these objects lives with them.
-#
-# The object under test is BUILT BY THIS SCRIPT and its directory is then
-# queried from the very same make configuration. Picking "the newest object
-# lying around" would not survive scrutiny: the obj/ tree accumulates many
-# config signatures (SIMD, and the producer signatures of
-# audiolib/common/AEC/NR, which move whenever those repos are edited), so an
-# audit of an unrelated stale object would pass while saying nothing.
+# The object under test is built by this script and its directory is queried from the same make
+# configuration: the obj/ tree accumulates many config signatures, so auditing the newest object lying
+# around could pass on an unrelated stale one while saying nothing.
 #
 # Usage:  scripts/audit_fp_contract.sh [BACKEND ...]      (default: ne10, the only backend)
 #         SIMD=0|1 (default 1) and WERROR are honoured and forwarded.

@@ -1,31 +1,10 @@
-/**
- * audio_pipeline_4ch_ulcnet.c — four-channel spatial pipeline with the
- * Align-ULCNet neural post-filter as its post stage.
- *
- * Per-hop flow (see the header's timing contract):
- *
- *   four_aec_front_process -> SRP-PHAT DOA -> BF effective weights
- *     -> bf_spectrum, taken DIRECTLY as the model's error frame: it is
- *        already the sqrt-Hann, 50%-overlap, one-frame-per-hop analysis
- *        frame of the current hop that the Align-ULCNet chain would
- *        compute, so there is no reconstruction and no re-analysis between
- *     -> far branch: the caller's raw far from the same hop through a
- *        rolling AcStft -- the same one-frame-per-hop framing -- so both branches carry the SAME
- *        input hop with no delay buffer
- *     -> UlcnetModel callback, exactly once per hop from hop #0 (skipped
- *        only during the post-boundary identity reprime; fail-open identity
- *        when unset/error/non-finite)
- *     -> AcIstft synthesis -> out
- *
- * The core runs front-only (cfg.core.enable_post = 0): no fuse, RES, NR or
- * core synthesis exists; the ULCNet chain replaces that post stage.
- *
- * The file follows audio_pipeline_4ch.c's order: instance, config
- * validation, default config, pool-first construction, heap convenience,
- * processing, reset/destroy, and accessors. The spatial-config derivation
- * helpers are file-private copies of audio_pipeline_4ch.c's own (that file
- * keeps them static, per the local one-copy-per-file precedent).
- */
+/** Four-channel spatial pipeline with the Align-ULCNet post-filter (see the header
+ * for the timing and model-callback contract). Per hop: four_aec_front_process ->
+ * SRP-PHAT DOA -> BF weights -> bf_spectrum used directly as the model's error
+ * frame; the caller's raw far through a rolling AcStft; one UlcnetModel call per
+ * hop (identity during the post-boundary reprime or on failure); AcIstft
+ * synthesis. The core runs front-only (cfg.core.enable_post = 0). The
+ * spatial-config helpers are file-private copies of audio_pipeline_4ch.c's. */
 
 #include <stdlib.h>
 #include <string.h>
@@ -42,18 +21,10 @@
 #define M_PI 3.14159265358979323846
 #endif
 
-/* This wrapper's one supported grid IS whichever grid the ULCNet layer was
- * built for -- a build parameter of ulcnet_model_io.h, taken from there
- * rather than restated. The core is then forced onto the same grid.
- * Asserting hop == fft/2 or bins == fft/2+1 here would assert nothing:
- * ULCNET_HOP and ULCNET_BINS ARE those expressions. The FFT size is what
- * can actually differ, so that is what is pinned. */
+/* The supported grid is the one the ULCNet layer was built for (ulcnet_model_io.h);
+ * only the FFT size is checked since hop and bins derive from it. */
 _Static_assert(ULCNET_N_FFT == 512 || ULCNET_N_FFT == 1024,
                "ULCNet wrapper supports FFT 512 (16 kHz) or 1024 (48 kHz)");
-
-/* ============================================================================
- * Instance
- * ========================================================================== */
 
 struct AudioPipeline4ChUlcnet {
     AudioPipeline4ChConfig cfg;
@@ -68,21 +39,17 @@ struct AudioPipeline4ChUlcnet {
     Complex* bf_spectrum;
     Complex* bf_weights;
 
-    /* The one carved FFT handle serves the ULCNet chain (far analysis and
-     * synthesis; same compiled size, strictly sequential use within a hop,
-     * per ulcnet_process.h's sharing contract). */
+    /* The carved FFT handle serves the far analysis and the synthesis (sequential
+     * within a hop). */
     FftHandle* fft;
 
-    /* Align-ULCNet chain: two framing objects carved from the pool (each
-     * with its own per-call FFT scratch, borrowing the shared handle above
-     * and the window table below) plus the per-hop frame scratch, which is
-     * part of `self` in the carve. There is no error-branch analysis: the
-     * BF spectrum IS the error frame, de-interleaved into err_re/err_im for
-     * the model callback. */
+    /* Align-ULCNet chain: two framing objects carved from the pool (borrowing the
+     * shared handle above and the window table below) plus the per-hop frame scratch.
+     * There is no error-branch analysis: the BF spectrum is the error frame,
+     * de-interleaved into err_re/err_im. */
     AcStft  *far_analysis;
     AcIstft *synthesis;
-    float ulcnet_window[ULCNET_N_FFT];  /* shared sqrt-Hann table for both
-                                         * framing objects (self-owned) */
+    float ulcnet_window[ULCNET_N_FFT];  /* shared sqrt-Hann table for both framing objects */
     float err_re[ULCNET_BINS];
     float err_im[ULCNET_BINS];
     float far_re[ULCNET_BINS];
@@ -94,11 +61,8 @@ struct AudioPipeline4ChUlcnet {
     FourAecNrResDelayState last_delay;
     uint64_t frame_index;
 
-    /* Frames still straddling the last alignment boundary: armed to
-     * AUDIO_PIPELINE_4CH_ULCNET_REPRIME_FRAMES at the boundary hop,
-     * decremented once per hop (one frame per hop). While nonzero the frame
-     * takes the identity path and the model is not stepped. Re-armed, never
-     * accumulated, by a boundary that lands inside a reprime. */
+    /* Frames still straddling the last alignment boundary; while nonzero the frame is
+     * the identity and the model is not stepped. Re-armed, never accumulated. */
     int reprime_frames;
 
     /* The hop in flight (process_begin .. process_end). */
@@ -106,16 +70,12 @@ struct AudioPipeline4ChUlcnet {
     int nn_wanted;                /* the frame has not been fetched and is not reprime */
     int nn_accepted;              /* the model output replaces the error frame */
 
-    /* Non-NULL only on the create() heap path (same convention as
-     * audio_pipeline_4ch.c's owned_heap). */
+    /* Non-NULL only on the create() heap path. */
     void* owned_heap;
     int destroyed;
 };
 
-/* ============================================================================
- * Config validation (file-private copy of audio_pipeline_4ch.c's checks,
- * narrowed to this wrapper's one supported grid)
- * ========================================================================== */
+/* Config validation (narrowed to this wrapper's one supported grid). */
 
 static int is_bool(int value) {
     return value == 0 || value == 1;
@@ -124,30 +84,21 @@ static int is_bool(int value) {
 static int validate_config(const AudioPipeline4ChConfig* cfg) {
     float nyquist;
     if (!cfg) return 0;
-    /* Accept only the grid compiled into this ULCNet build. */
+    /* Only the compiled ULCNet grid is accepted. */
     if (cfg->core.sample_rate != ULCNET_SR) return 0;
     if (cfg->core.fft_size != 0 &&
         cfg->core.fft_size != ULCNET_N_FFT) return 0;
-    /* Post-only fields are REJECTED, not ignored. AudioPipeline4ChConfig is
-     * shared with the standard 4-channel wrapper, so this application's
-     * accepted set is deliberately narrower than that struct's: with
-     * enable_post = 0 there is no NR instance, no suppressor, no comfort
-     * noise and no post iFFT, and a value set in any of these fields could
-     * not have done anything. Silently accepting them is what would make one
-     * struct mean two things; refusing says so at init. */
+    /* Post-only fields are rejected, not ignored: the config struct is shared with the
+     * standard 4-channel wrapper, and with enable_post = 0 they cannot take effect. */
     if (cfg->core.enable_post != 0) return 0;
     if (cfg->core.enable_nr != 0) return 0;
     if (cfg->core.enable_res != 0) return 0;
     if (cfg->core.enable_cng != 0) return 0;
     if (cfg->core.legacy_amin != 0) return 0;
-    /* AnrMode has no "disabled" value and no denoiser is created here,
-     * so the default is a required sentinel rather than a strength choice. */
+    /* AnrMode has no "disabled" value, so the default is a required sentinel. */
     if (cfg->core.nr_mode != ANR_MODE_BALANCED) return 0;
-    /* The built-in energy VAD is unreachable too: this wrapper exposes only
-     * _process_with_activity(), which takes the caller's VAD. Compared against
-     * a freshly built default rather than transcribed literals, so a change to
-     * the defaults cannot leave this rejecting the default config. Exact float
-     * comparison is right here: these values are copied, never computed. */
+    /* The built-in VAD is unreachable (only process_with_activity() exists); compared
+     * against a freshly built default so changes to the defaults stay consistent. */
     {
         AudioPipeline4ChConfig base =
             audio_pipeline_4ch_default_config(ULCNET_SR);
@@ -183,8 +134,7 @@ static int validate_config(const AudioPipeline4ChConfig* cfg) {
         !isfinite(cfg->bf_fixed_doa_rad) ||
         !is_bool(cfg->bf_fixed_align_notebook) ||
         cfg->bf_adapt_interval <= 0) return 0;
-    /* auto_vad_* fields are unused here (external VAD only) but validated
-     * for uniformity with the standard wrapper's config surface. */
+    /* auto_vad_* fields are unused here but validated like the standard wrapper's. */
     if (!isfinite(cfg->auto_vad_threshold_dbfs) ||
         !isfinite(cfg->auto_vad_snr_ratio) ||
         cfg->auto_vad_snr_ratio < 1.0f ||
@@ -204,38 +154,21 @@ static int validate_config(const AudioPipeline4ChConfig* cfg) {
     return 1;
 }
 
-/* ============================================================================
- * Public config
- * ========================================================================== */
-
 AudioPipeline4ChConfig audio_pipeline_4ch_ulcnet_default_config(void) {
     AudioPipeline4ChConfig cfg =
         audio_pipeline_4ch_default_config(ULCNET_SR);
     cfg.core.fft_size = ULCNET_N_FFT;
-    /* Align-ULCNet REPLACES the post-beam RES/NR/CNG stage, so the front-only
-     * profile is what this function returns rather than something the wrapper
-     * quietly rewrites afterwards. Every post-only core field must keep the
-     * value set here; validate_config() rejects any other, so a caller who
-     * believes it configured NR or comfort noise finds out at init instead of
-     * on a board. */
+    /* The front-only profile is returned here; validate_config() rejects any other
+     * post-only value so a wrong expectation fails at init. */
     cfg.core.enable_post = 0;
     cfg.core.enable_nr = 0;
     cfg.core.enable_res = 0;
     cfg.core.enable_cng = 0;
-    /* core.delay_backward_quarantine_enabled stays at the core default
-     * (OFF). The guard holds backward candidates only, for a bounded window
-     * after which it accepts, and judges cancellation on the estimator's
-     * proxy lane -- so a mis-lock is DELAYED by the window, not cured.
-     * Enabling it here is therefore a policy decision, and it waits on a
-     * real-audio spot check with the deployed checkpoint. */
+    /* core.delay_backward_quarantine_enabled stays at the core default (off). */
     return cfg;
 }
 
-/* ============================================================================
- * Pool-first construction: file-private PoolCursor/pool_carve(), same
- * bump-allocator shape kept file-private by audio_pipeline_4ch.c per that
- * file's own precedent.
- * ========================================================================== */
+/* Pool-first construction: file-private bump allocator. */
 
 typedef struct PoolCursor {
     uint8_t* ptr;
@@ -258,10 +191,6 @@ static void* pool_carve(PoolCursor* cursor, size_t count,
     return out;
 }
 
-/* ============================================================================
- * Build-flags hash
- * ========================================================================== */
-
 static uint32_t fnv1a_str(const char* text, uint32_t hash) {
     while (*text) {
         hash ^= (uint32_t)(unsigned char)*text++;
@@ -270,41 +199,29 @@ static uint32_t fnv1a_str(const char* text, uint32_t hash) {
     return hash;
 }
 
-/* Folds in the core's own build_flags_hash exactly like
- * audio_pipeline_4ch.c's hash does, so a change to the core's CARVE TOKEN
- * propagates here. A core LAYOUT VERSION bump does not -- the core's hash
- * never sees it -- so invalidating a persisted composite descriptor still
- * requires bumping AUDIO_PIPELINE_4CH_ULCNET_LAYOUT_VERSION by hand.
- * NO_STDIO-safe (no snprintf). */
+/* Folds in the core's build_flags_hash; a core layout-version bump is not seen by
+ * it, so bump AUDIO_PIPELINE_4CH_ULCNET_LAYOUT_VERSION by hand. No snprintf. */
 static uint32_t audio_pipeline_4ch_ulcnet_build_flags_hash(
     uint32_t core_build_flags_hash) {
     uint32_t hash = 2166136261u;
-    /* The token names the regions of the pool: `self` (the state embedded in
-     * the control block -- core-config delay fields, the direct ULCNet chain,
-     * the UlcnetModel copy with its io_descriptor, the identity-reprime
-     * counter, the shared window table and the one-frame err/far staging) and
-     * the carved objects, in carve order. The one carved FFT handle serves
-     * the far analysis and the synthesis. Any change to this layout bumps
-     * AUDIO_PIPELINE_4CH_ULCNET_LAYOUT_VERSION together with this string,
-     * always both. */
+    /* Tokens name the `self` state (core-config delay fields, ULCNet chain, model copy
+     * with io_descriptor, reprime counter, window table, err/far staging) and the
+     * carved objects in carve order. Bump AUDIO_PIPELINE_4CH_ULCNET_LAYOUT_VERSION
+     * together with this string. */
     hash = fnv1a_str(
         "|carve:self(corecfg-delay-v2,ulcnet-direct,model(io_descriptor),"
         "reprime,ulcnet_window,frame),"
         "core,srp,bf,bf_spectrum,bf_weights,fft,far_analysis,synthesis",
         hash);
-    /* The grid is a build parameter, so it cannot be spelled into the token
-     * as a literal: stringify the macros instead, or two builds on different
-     * grids would share one descriptor hash. */
+    /* The grid is stringified from the macros so builds on different grids get
+     * different hashes. */
     hash = fnv1a_str("|align|ulcnet" ULCNET_GRID_TOKEN "|sharedfft", hash);
     hash ^= core_build_flags_hash;
     hash *= 16777619u;
     return ac_memreq_abi_hash(hash);
 }
 
-/* ============================================================================
- * Stack-only array geometry (no malloc) — verbatim copies of
- * audio_pipeline_4ch.c's own fill helpers (see that file's rationale).
- * ========================================================================== */
+/* Stack-only array geometry (copies of audio_pipeline_4ch.c's helpers). */
 
 static void fill_uca_geometry(float radius, float* x, float* y) {
     int M = FOUR_AEC_NR_RES_CHANNELS;
@@ -357,11 +274,8 @@ static int fill_stack_geometry(
     return 1;
 }
 
-/* ============================================================================
- * Config -> SRP/BF module configs (file-private copy of
- * audio_pipeline_4ch.c's derive_spatial_configs — see that file for the
- * lambda-retime/effective-cadence rationale)
- * ========================================================================== */
+/* Config -> SRP/BF module configs (copy of audio_pipeline_4ch.c's
+ * derive_spatial_configs). */
 
 static int derive_spatial_configs(
     const AudioPipeline4ChConfig* cfg,
@@ -404,14 +318,10 @@ static int derive_spatial_configs(
     return 1;
 }
 
-/* ============================================================================
- * Memory sizing -- compute once, reuse in get_mem_requirements()/init_ex()
- * ========================================================================== */
+/* Memory sizing, computed once for get_mem_requirements()/init_ex(). */
 
-/* Bytes of the far analysis (is_synthesis 0) or the synthesis (1) object on
- * the shared handle and window table: the size of the object that carves its
- * own, less those two regions. The shared handle exists only after the pool
- * does, so the size cannot be asked for it directly. */
+/* Bytes of the far analysis (is_synthesis 0) or synthesis (1) object that borrows
+ * the shared handle and window table. */
 static size_t framing_bytes(int is_synthesis) {
     AcStftConfig sc;
     size_t own, shared;
@@ -433,13 +343,10 @@ static int derive_pipeline_layout(
     if (!cfg || !cfg_forced || !core_req || !srp_cfg || !bf_cfg || !hop ||
         !fft || !n_freqs || !srp_bytes || !bf_bytes || !fft_bytes) return 0;
     if (!validate_config(cfg)) return 0;
-    /* Force the compiled grid before ANY core sizing so the descriptor and
-     * the carve always describe the same layout. */
+    /* Force the compiled grid before core sizing so descriptor and carve agree. */
     *cfg_forced = *cfg;
     cfg_forced->core.fft_size = ULCNET_N_FFT;
-    /* enable_post is already 0: validate_config() refuses anything else, so
-     * the caller has declared the front-only profile rather than had it
-     * rewritten underneath. Nothing to force here. */
+    /* enable_post is already 0 (validate_config() refuses anything else). */
     if (four_aec_nr_res_get_mem_requirements(
             &cfg_forced->core, core_req) != 0)
         return 0;
@@ -507,9 +414,7 @@ int audio_pipeline_4ch_ulcnet_get_mem_requirements(
     return 0;
 }
 
-/* ============================================================================
- * Caller-pool init and heap convenience construction
- * ========================================================================== */
+/* Caller-pool init and heap convenience construction. */
 
 AudioPipeline4ChUlcnet* audio_pipeline_4ch_ulcnet_init_ex(
     void* mem,
@@ -540,7 +445,7 @@ AudioPipeline4ChUlcnet* audio_pipeline_4ch_ulcnet_init_ex(
     if (audio_pipeline_4ch_ulcnet_get_mem_requirements(cfg, &current) != 0)
         return NULL;
 
-    /* 8-point descriptor gate (contract documented in the header). */
+    /* 8-point descriptor gate (see the header). */
     if (expected) {
         if (expected->descriptor_version != current.descriptor_version ||
             expected->layout_version != current.layout_version ||
@@ -605,9 +510,8 @@ AudioPipeline4ChUlcnet* audio_pipeline_4ch_ulcnet_init_ex(
     p->fft_size = fft;
     p->n_freqs = n_freqs;
 
-    /* The chain uses the handle carved above (same compiled grid; strictly
-     * sequential use per hop). Reject-first: the inits re-check the
-     * handle's bin count against the compiled ULCNet grid. */
+    /* The chain uses the carved handle; the inits re-check its bin count against the
+     * compiled grid. */
     ac_window_build(p->ulcnet_window, ULCNET_N_FFT);
     ulcnet_framing_config(&sc, p->fft, p->ulcnet_window, 0);
     region = pool_carve(&cursor, 1, framing_bytes(0));
@@ -625,8 +529,7 @@ AudioPipeline4ChUlcnet* audio_pipeline_4ch_ulcnet_init_ex(
     p->owned_heap = NULL;
     p->destroyed = 0;
 
-    /* Lockstep proof: the sizing walk and the carves above must consume
-     * exactly current.bytes. */
+    /* The sizing walk and the carves must consume exactly current.bytes. */
     if (cursor.remaining != 0) return NULL;
     return p;
 }
@@ -664,14 +567,9 @@ int audio_pipeline_4ch_ulcnet_set_model(
     const UlcnetModel* model) {
     if (!p || p->destroyed) return -1;
     if (model) {
-        /* Reject-first: a refused model leaves the installed one in place. */
-        /* A model that actually infers MUST publish a descriptor. Its delay depth,
-         * attention geometry and history shapes are what the host-side rings are
-         * carved from, and nothing downstream can detect a mismatch: the finite
-         * guard catches an UNWRITTEN output, never a WRONG-SHAPED one, so a graph
-         * whose D differs from the descriptor reads and writes past the pool
-         * silently. An identity model (no infer callback) has no shapes to agree
-         * about and may leave it NULL. */
+        /* A refused model leaves the installed one in place. A model that infers must
+         * publish a descriptor (host-side rings are carved from it); an identity model may
+         * leave it NULL. */
         if (model->infer && !model->io_descriptor) return -1;
         if (model->io_descriptor &&
             ulcnet_model_io_descriptor_validate(model->io_descriptor) != 0)
@@ -683,9 +581,7 @@ int audio_pipeline_4ch_ulcnet_set_model(
     return 0;
 }
 
-/* ============================================================================
- * Per-hop processing
- * ========================================================================== */
+/* Per-hop processing. */
 
 int audio_pipeline_4ch_ulcnet_process_front(
     AudioPipeline4ChUlcnet* p,
@@ -712,41 +608,26 @@ int audio_pipeline_4ch_ulcnet_process_front(
         return FOUR_AEC_NR_RES_DSP_ERROR;
     }
 
-    /* MATCHED exposes generation changes directly. FIXED has no estimator
-     * generation, so detect the first raw-to-aligned ring transition from
-     * the existing solid/frame history. In both cases, flush every state
-     * whose time basis crosses the boundary before this hop's inference. */
+    /* MATCHED exposes generation changes directly; FIXED has none, so the first
+     * raw-to-aligned ring transition is detected from the solid/frame history. States
+     * whose time basis crosses the boundary are flushed before this hop's inference. */
     if (pre.delay.changed ||
         (p->frame_index != 0 && !p->last_delay.solid && pre.delay.solid)) {
-        /* Tell the runtime to flush its far attention ring + logit history.
-         * The C-side framing states keep running across the boundary -- the
-         * core's lane analysis behind the BF spectrum, and this wrapper's
-         * far analysis -- so the frame whose window still covers a
-         * pre-switch hop is covered by the identity reprime armed here
-         * rather than by a crossfade. The counter is armed whether or not a
-         * runtime is attached, so the frame policy does not depend on the
-         * model's presence. */
+        /* Flush the runtime's far attention ring and logit history. The C framing states
+         * keep running; the straddling frame is covered by the identity reprime armed here.
+         * The counter is armed whether or not a runtime is attached. */
         if (p->model.reset) p->model.reset(p->model.user);
         p->reprime_frames = AUDIO_PIPELINE_4CH_ULCNET_REPRIME_FRAMES;
     }
     p->last_delay = pre.delay;
 
-    /* Far branch: the same hop's raw far source through the one-frame-per-hop
-     * framing. The error branch is the BF spectrum (process_beam), which is
-     * already the model's analysis frame -- the core's lanes analyse with the
-     * same sqrt-Hann window at the same 50% overlap, one frame per hop from
-     * hop #0, and the beamformer only weights bins -- so it is handed over
-     * as-is. Both branches therefore carry input hop t at pipeline hop t, with
-     * no reconstruction, no re-analysis and no delay buffer in between. */
+    /* Far branch: the same hop's raw far through the one-frame-per-hop framing. The
+     * error branch (BF spectrum) is already the model's analysis frame, so both
+     * branches carry input hop t at pipeline hop t. */
     (void)ac_stft_push_planar(
         p->far_analysis, far_reference, p->far_re, p->far_im);
 
-    /* One frame, one inference: the model steps and its output is applied,
-     * EXCEPT while the identity reprime armed at the last boundary is still
-     * running -- that frame's window still covers the pre-switch hop, and
-     * stepping it would rebuild the just-flushed recurrent state from
-     * half-stale input. Skipping inference lowers the cost of that frame; it
-     * never doubles it. */
+    /* One inference per frame, except during the identity reprime. */
     p->nn_wanted = 0;
     p->nn_accepted = 0;
     if (p->reprime_frames > 0) p->reprime_frames -= 1;   /* identity; model idle */
@@ -808,8 +689,7 @@ int audio_pipeline_4ch_ulcnet_nn_begin(AudioPipeline4ChUlcnet* p,
     if (p->phase != 1) return FOUR_AEC_NR_RES_SEQUENCE_ERROR;
     if (!p->nn_wanted) return 0;
     p->nn_wanted = 0;
-    /* FULL-WRITE CONTRACT: the staging is NaN, so a model that reports
-     * success without writing every bin is caught by nn_end's finite guard. */
+    /* Full-write contract: NaN staging lets nn_end's finite guard catch an unwritten bin. */
     skn_fill_f32(p->enh_re, ULCNET_BINS, NAN);
     skn_fill_f32(p->enh_im, ULCNET_BINS, NAN);
     job->err_re = p->err_re; job->err_im = p->err_im;
@@ -822,7 +702,7 @@ int audio_pipeline_4ch_ulcnet_nn_begin(AudioPipeline4ChUlcnet* p,
 int audio_pipeline_4ch_ulcnet_nn_end(AudioPipeline4ChUlcnet* p, int model_rc) {
     if (!p || p->destroyed) return FOUR_AEC_NR_RES_INVALID_ARGUMENT;
     if (p->phase != 2) return FOUR_AEC_NR_RES_SEQUENCE_ERROR;
-    /* Fail-open: a failed run, or any non-finite bin, leaves the identity. */
+    /* Fail-open: a failed run or any non-finite bin leaves the identity. */
     p->nn_accepted = model_rc == 0 && ulcnet_frame_is_finite(p->enh_re, p->enh_im);
     p->phase = 1;
     return FOUR_AEC_NR_RES_OK;
@@ -843,12 +723,10 @@ int audio_pipeline_4ch_ulcnet_process_end(AudioPipeline4ChUlcnet* p, float* out)
     p->phase = 0;
     written = ac_istft_push_planar(p->synthesis, spec_re, spec_im, out);
     if (written == 0) {
-        /* hop#0: frame #0's block lies inside the synthesis's trimmed half
-         * window; the caller-facing contract is zeros. */
+        /* hop#0: the synthesis emits nothing; the caller-facing output is zeros. */
         memset(out, 0, (size_t)hop * sizeof(float));
     } else if (written != hop) {
-        /* Structurally impossible (the synthesis emits 0 or one full hop);
-         * treat as an internal DSP error rather than emitting a short hop. */
+        /* Cannot happen (the synthesis emits 0 or one full hop); treated as a DSP error. */
         audio_pipeline_4ch_ulcnet_reset(p);
         return FOUR_AEC_NR_RES_DSP_ERROR;
     }
@@ -877,17 +755,14 @@ int audio_pipeline_4ch_ulcnet_process_with_activity(
     return audio_pipeline_4ch_ulcnet_process_end(p, out);
 }
 
-/* ============================================================================
- * Reset and teardown
- * ========================================================================== */
+/* Reset and teardown. */
 
 void audio_pipeline_4ch_ulcnet_reset(AudioPipeline4ChUlcnet* p) {
     if (!p || p->destroyed) return;
     four_aec_nr_res_reset(p->core);
     srp_reset(p->srp);
     bf_reset(p->bf);
-    /* The objects keep the shared handle and window (pool/instance resident,
-     * untouched by reset); reset clears their history. */
+    /* The objects keep the shared handle and window; reset clears their history. */
     ac_stft_reset(p->far_analysis);
     ac_istft_reset(p->synthesis);
     memset(&p->last_delay, 0, sizeof(p->last_delay));
@@ -895,20 +770,17 @@ void audio_pipeline_4ch_ulcnet_reset(AudioPipeline4ChUlcnet* p) {
     p->phase = 0;
     p->nn_wanted = 0;
     p->nn_accepted = 0;
-    /* The analysis history is zeroed above, so nothing emitted after this
-     * point straddles anything: drop any pending reprime. */
+    /* The analysis history is zeroed above: drop any pending reprime. */
     p->reprime_frames = 0;
-    /* Documented contract: a pipeline reset also resets the runtime. */
+    /* A pipeline reset also resets the runtime. */
     if (p->model.reset) p->model.reset(p->model.user);
 }
 
 void audio_pipeline_4ch_ulcnet_destroy(AudioPipeline4ChUlcnet* p) {
     void* owned_heap;
     if (!p || p->destroyed) return;
-    /* BF borrows the steering table; destroy it before its owner. All four
-     * sub-destroys are no-op frees for pool-carved sub-objects (their own
-     * owned_heap fields stay NULL); only this wrapper's OWN owned_heap (set
-     * only by create()) is ever actually freed below, exactly once. */
+    /* BF borrows the steering table, so destroy it first. The sub-destroys are no-ops
+     * for pool-carved objects; only this wrapper's own owned_heap (create()) is freed. */
     bf_destroy(p->bf);
     srp_destroy(p->srp);
     four_aec_nr_res_destroy(p->core);
@@ -917,10 +789,6 @@ void audio_pipeline_4ch_ulcnet_destroy(AudioPipeline4ChUlcnet* p) {
     p->destroyed = 1;
     if (owned_heap) free(owned_heap);
 }
-
-/* ============================================================================
- * Read-only accessors
- * ========================================================================== */
 
 int audio_pipeline_4ch_ulcnet_hop_size(const AudioPipeline4ChUlcnet* p) {
     return (p && !p->destroyed) ? p->hop_size : -1;

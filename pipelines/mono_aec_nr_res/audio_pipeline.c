@@ -1,23 +1,7 @@
-/**
- * audio_pipeline.c — implementation of audio_pipeline.h.
- *
- * Pool sizing/carving and the per-hop processing as one linkable TU shared
- * by both CLIs (main.c, static_main.c) — see
- * audio_pipeline.h for the API contract and pipelines/README.md ("Board
- * Integration") for the consumer sequence.
- *
- * Instance state:
- *   - The synthesis state is per-INSTANCE (an AudioPipeline field): multiple
- *     instances (or one instance across an audio_pipeline_reset()) never
- *     share state.
- *   - The comfort-noise generator is a per-instance field too, so no noise
- *     sequence is shared. It is lib/aec's own comfort-noise recipe
- *     (aec_cng_fill() in aec_res.h); with `enable_cng = 0` it is not used.
- *   - Every pipeline-owned scratch buffer is explicitly zeroed at carve time
- *     (audio_pipeline_init), so a caller handing in a poisoned pool (e.g.
- *     `memset(pool, 0xA5, bytes)`, the pattern lib/aec's own zero-heap test
- *     uses) inits identically to a zeroed one.
- */
+/** Implementation of audio_pipeline.h: pool sizing/carving and per-hop processing in
+ * one linkable TU shared by both CLIs. The synthesis state and the comfort-noise
+ * generator (lib/aec's aec_cng_fill()) are per instance; every pipeline-owned
+ * scratch buffer is zeroed at carve time, so a dirty pool inits like a zeroed one. */
 
 #include <stdlib.h>
 #include <string.h>
@@ -29,36 +13,12 @@
 #include "common/se_stage.h"      /* SeSpecFrame                                                  */
 #include "common/se_anr_stage.h"  /* NR configuration, init, per-hop gain, strength setter       */
 #include "fft_wrapper.h"       /* fft_get_mem_size, Complex */
-#include "utility/mem_align.h"       /* ALIGN16 -- was transitively reached via fft_wrapper.h */
+#include "utility/mem_align.h"       /* ALIGN16 */
 #include "audio_stft.h"        /* AcIstft: inverse FFT + sqrt-Hann OLA                */
 #include "utility/simd_kernels.h"      /* sk_min_f32 / sk_capply_gain_f32                                     */
 #include "aec_res.h"          /* aec_cng_fill                                                        */
 
-/* Deliberately NO "wav_io.h" here: this TU takes raw float* mic/ref/out
- * buffers only (audio_pipeline_process) -- no WAV path, no stdio-based I/O.
- * WAV reading/writing stays entirely in the CLIs (main.c /
- * static_main.c), which are thin shells over this API. */
-
-/* ============================================================================
- * No-stdio build gate
- * ========================================================================== */
-
-/**
- * This TU's diagnostics (init/build-time reject reasons only -- nothing on
- * the per-hop audio_pipeline_process() path ever logs) are advisory: every
- * failure this file can hit is ALSO signalled through its return value
- * (NULL / -1), so a caller that cannot or will not link libc's stdio (a
- * board/firmware image with no console, or one that forbids the stdio
- * symbol set outright) must still get a fully-functional library -- it
- * simply loses the human-readable "why" that would otherwise go to stderr.
- *
- * -DAUDIO_PIPELINE_NO_STDIO (pipelines/Makefile's `NO_STDIO=1`) compiles
- * every AP_LOG_ERR() call below to a no-op and drops the <stdio.h> include
- * entirely, so a NO_STDIO build of audio_pipeline.o pulls in none of
- * fprintf/printf/puts/fputs/stderr (see `make audit-no-stdio`, which
- * verifies exactly this with `nm` over the archive). Default (unset)
- * behaviour: AP_LOG_ERR() is fprintf(stderr, ...).
- */
+/** Diagnostics (init/build-time reject reasons only) are advisory; every failure also returns NULL/-1. -DAUDIO_PIPELINE_NO_STDIO (Makefile NO_STDIO=1) compiles AP_LOG_ERR() to a no-op and drops <stdio.h>. */
 #ifndef AUDIO_PIPELINE_NO_STDIO
 #include <stdio.h>
 #define AP_LOG_ERR(...) fprintf(stderr, __VA_ARGS__)
@@ -66,62 +26,25 @@
 #define AP_LOG_ERR(...) ((void)0)
 #endif
 
-/* This file's own carve-layout version (see audio_pipeline.h's
- * AudioPipelineMemReq doc). Any change of pool size, carve order or descriptor
- * content bumps it, including a change of the composed AEC, NR or FFT pool;
- * the carve token string in audio_pipeline_build_flags_hash() moves with a
- * changed buffer set or order. */
+/* Carve-layout version; bumped on any change of pool size, carve order or descriptor
+ * content, including a change of the composed AEC, NR or FFT pool. The token string
+ * in audio_pipeline_build_flags_hash() changes with it. */
 #define AUDIO_PIPELINE_LAYOUT_VERSION 15u
 
-/* Compile-time FFT backend identity. pipelines/Makefile passes
- * -DAUDIO_PIPELINE_BACKEND_STR=\"ne10\" to match its own BACKEND= selection
- * (the same backend libaudio_common.a this TU links against); the fallback
- * below only fires if someone compiles this file outside that Makefile. */
+/* Compile-time FFT backend identity passed by pipelines/Makefile; the fallback below
+ * applies only outside that Makefile. */
 #ifndef AUDIO_PIPELINE_BACKEND_STR
 #define AUDIO_PIPELINE_BACKEND_STR "unknown"
 #endif
 
-/* Maps AUDIO_PIPELINE_BACKEND_STR -- THIS TU's OWN compile-time literal,
- * never caller-supplied data -- to the small stable integer a serializable
- * descriptor can carry (see audio_pipeline.h's
- * AudioPipelineMemReq.backend_id doc). One strcmp per
- * audio_pipeline_get_mem_requirements() call against a compiled-in literal
- * is not the caller-facing string hazard the header doc warns about (that
- * hazard is `strcmp` against a CALLER-supplied `expected->backend`, which
- * this file never does -- audio_pipeline_init_ex() below compares
- * backend_id with plain integer `==`). Returns 0 ("unknown") for anything
- * else; get_mem_requirements() rejects that -- see its own comment. */
-/* Per-stage timing is diagnostic and costs four clock_gettime() calls per hop
- * here, on top of whatever the AEC makes inside its own call (aec.h carries
- * that count). DEFAULT OFF for
- * the same reason lib/aec's is: a diagnostic that has to be switched off is
- * one that ships on by accident.
- *
- * The two flags are separate because the two builds are: this one governs the
- * stages measured here, AEC_STAGE_TIMING governs what aec_get_last_timing()
- * reports back. Setting only this one leaves frontend/linear/res reading 0
- * while nr/post/synth measure, which is a legible state, not a broken one.
- * `make PROFILE=1` sets both, and is what a profile build should use. */
+/* Maps the compile-time AUDIO_PIPELINE_BACKEND_STR to the integer a serializable descriptor carries; 0 (unknown) is rejected by get_mem_requirements().
+ * Stage timing is diagnostic and off by default; this flag governs the stages measured here, AEC_STAGE_TIMING what aec_get_last_timing() reports (`make PROFILE=1` sets both). */
 #ifndef AUDIO_PIPELINE_STAGE_TIMING
 #define AUDIO_PIPELINE_STAGE_TIMING 0
 #endif
 
 #if AUDIO_PIPELINE_STAGE_TIMING
-/* Microsecond monotonic stamp for the per-stage diagnostic timing. Truncated
- * to 32 bits: every consumer subtracts two stamps in UNSIGNED arithmetic, so
- * the difference is exact for any interval shorter than the ~71.6 minute wrap
- * -- which no hop approaches. *
- * CLOCK_MONOTONIC is POSIX, not C99. A target with a reduced libc enables the
- * timing with -DAUDIO_PIPELINE_STAGE_TIMING=1 -DAUDIO_PIPELINE_NOW_US=board_timer_us, naming a function that takes
- * no argument and returns uint32_t microseconds -- a plain identifier, because
- * these Makefiles reject parentheses in EXTRA_CFLAGS, and its declaration is
- * the integrator's to supply. The default below is then neither compiled nor
- * linked and <time.h> is not included.
- *
- * Each component carries its own override rather than sharing one: lib/aec has
- * AEC_NOW_US and the other pipeline has its own, so a chain built for such a
- * target names a timer per component it actually builds.
- */
+/* Microsecond monotonic stamp truncated to 32 bits (consumers subtract in unsigned arithmetic). A target without POSIX CLOCK_MONOTONIC names a no-argument uint32_t-microsecond function with -DAUDIO_PIPELINE_NOW_US=<fn> (and lib/aec's -DAEC_NOW_US=<fn>). */
 #ifndef AUDIO_PIPELINE_NOW_US
 #include <time.h>
 static uint32_t audio_pipeline_now_us(void) {
@@ -134,8 +57,6 @@ static uint32_t audio_pipeline_now_us(void) {
 static uint32_t audio_pipeline_now_us(void) { return AUDIO_PIPELINE_NOW_US(); }
 #endif
 #else
-/* Every stamp folds to a constant, so the subtractions fold to zero and no
- * clock is read. */
 #define audio_pipeline_now_us() 0u
 #endif
 
@@ -144,75 +65,41 @@ static uint32_t audio_pipeline_backend_id(void) {
     return 0u;
 }
 
-/* ============================================================================
- * Instance
- * ========================================================================== */
-
 struct AudioPipeline {
-    /* effective per-instance config (already resolved from AudioPipelineConfig
-     * + preset -- see derive_dims_and_configs) */
     int aec_only;
     int enable_res;
     int legacy_amin;
-    int enable_cng_effective;   /* aec_cfg.enable_cng (preset, always 1 today) && cfg.enable_cng */
+    int enable_cng_effective;   /* aec_cfg.enable_cng && cfg.enable_cng */
     int sample_rate, hop, frame_sz, fft_sz, n_freqs;
 
-    /* sub-modules (point into `pool` below; nr is NULL iff aec_only or NR disabled) */
     Aec*             aec;
     AnrDenoiser* nr;
 
-    /* the pipeline's scratch buffers (point into `pool` below; all NULL
-     * when aec_only). There is no g_aec
-     * buffer: AecResContext's own doc guarantees ctx.res_gain aliases AEC's
-     * internal buffer for the whole hop (until the next AEC processing call),
-     * so sk_min_f32() and the CNG loop read ctx.res_gain directly.
-     * There is likewise no g_nr buffer: anr_get_gain() exposes the
-     * denoiser's own gain buffer directly, no copy needed.
-     * There is likewise no mic_buf/ref_buf/out_buf: aec_process() already
-     * copies mic/ref into its own near_hop/far_hop at the top of the call,
-     * so the caller's mic/ref pointers are passed straight through, and the
-     * OLA write lands directly in the caller's `out`. There is likewise no
-     * aec_out: the aec_only branch of audio_pipeline_process() passes the
-     * caller's own `out` buffer straight to aec_process(). */
+    /* Scratch buffers (point into `pool`; all NULL when aec_only). There is no gain
+     * copy: ctx.res_gain and anr_get_gain() alias the producers' buffers for the hop,
+     * and mic/ref/out go straight to the AEC and the OLA. */
     AcIstft* istft;        /* iff !aec_only: inverse FFT, sqrt-Hann window, overlap-add */
     float*   g_total;      /* iff !aec_only */
     float*   extra;        /* iff !aec_only */
     Complex* spec;         /* iff !aec_only */
-    float*   unity_gain;   /* iff !aec_only && unity_gain_needed(): the all-ones
-                            * gain read in place of a disabled source */
+    float*   unity_gain;   /* iff !aec_only && unity_gain_needed(): the all-ones gain vector */
 
-    /* per-instance comfort-noise RNG */
     uint32_t rng_state;
 
-    /* Per-hop wall-clock stage timing -- see AudioPipelineLastTiming's doc
-     * comment (audio_pipeline.h) for the stage-boundary reference. Present
-     * unconditionally so the pool carve does not depend on the build flag;
-     * only the stamping compiles out. */
+    /* Per-hop stage timing (see AudioPipelineLastTiming); always present so the carve
+     * does not depend on the build flag. */
     AudioPipelineLastTiming last_timing;
 
-    /* pool bookkeeping */
     void*  pool;          /* sub-pool AFTER this struct: AEC+FFT+NR+scratch */
     size_t pool_size;
     void*  owned_heap;     /* non-NULL iff obtained via audio_pipeline_create(); freed by destroy() */
 };
 
-/* ============================================================================
- * Config -> module configs + frame dims (shared by every entry point that
- * needs to know the carve/process shape for a given AudioPipelineConfig)
- * ========================================================================== */
-
-/* Returns 0 and fills every out-param, or -1 (NULL cfg; sample_rate outside
- * {8000,16000,48000}; fft_size outside the rate's grids; aec_preset/nr_mode
- * outside their enum values; filter_length outside [0, SE_FILTER_LENGTH_MAX];
- * or aec_only/enable_nr/enable_res/enable_cng/legacy_amin holding anything but
- * 0/1).
- *
- * This is the one reject-first gate every entry point funnels through
- * (get_mem_requirements, init, get_mem_breakdown, and create() via the
- * first two): an out-of-enum preset or mode would otherwise fall into the
- * modules' documented balanced fallback, and a stray non-0/1 flag would be
- * read as true downstream, so neither would ever fail loudly. The delay
- * settings are passed through; lib/aec validates them when it sizes the AEC. */
+/* Returns 0 and fills the out-params, or -1 (NULL cfg; sample_rate outside
+ * {8000,16000,48000}; fft_size outside the rate's grids; aec_preset/nr_mode outside
+ * their enums; filter_length outside [0, SE_FILTER_LENGTH_MAX]; or a 0/1 flag
+ * holding another value). This is the reject-first gate every entry point uses.
+ * Delay settings are validated by lib/aec when it sizes the AEC. */
 static int derive_dims_and_configs(const AudioPipelineConfig* cfg,
                                     AecConfig* aec_cfg, AnrConfig* nr_cfg,
                                     int* hop, int* frame_sz, int* fft_sz, int* n_freqs) {
@@ -247,18 +134,14 @@ static int derive_dims_and_configs(const AudioPipelineConfig* cfg,
     return 0;
 }
 
-/* ============================================================================
- * Pool sizing (field order and ALIGN16 bumps match the carve below)
- * ========================================================================== */
-
-/* "a disabled gain source is read as the unity vector" -- named once so the
- * sizing and the carve below cannot disagree about when that vector exists. */
+/* A disabled gain source is read as the unity vector; named once so sizing and carve
+ * agree on when it exists. */
 static int unity_gain_needed(int enable_nr, int enable_res) {
     return !enable_nr || !enable_res;
 }
 
-/* The synthesis object: inverse FFT, sqrt-Hann window and overlap-add state
- * of this pipeline. It carves its own FFT handle. */
+/* The synthesis object: inverse FFT, sqrt-Hann window and overlap-add state (it
+ * carves its own FFT handle). */
 static size_t synthesis_mem_size(int fft_sz) {
     AcStftConfig scfg;
     ac_stft_config_default(&scfg, fft_sz);
@@ -268,7 +151,7 @@ static size_t synthesis_mem_size(int fft_sz) {
 static size_t pipeline_pool_size(const AecConfig* aec_cfg, const AnrConfig* nr_cfg,
                                   int hop, int frame_sz, int fft_sz, int n_freqs,
                                   int aec_only, int enable_nr, int enable_res) {
-    (void)hop;       /* kept for signature symmetry with pipeline_build() below */
+    (void)hop;       /* kept for signature symmetry with pipeline_build() */
     (void)frame_sz;
     size_t aec_sz     = aec_get_mem_size(aec_cfg);
     size_t synth_sz   = aec_only ? 0 : synthesis_mem_size(fft_sz);
@@ -286,12 +169,6 @@ static size_t pipeline_pool_size(const AecConfig* aec_cfg, const AnrConfig* nr_c
     return ALIGN16(aec_sz) + ALIGN16(synth_sz) + ALIGN16(nr_sz) + pipe;
 }
 
-/* ============================================================================
- * Carve (same field order as the pool sizing above, PLUS an explicit zero
- * of each pipeline buffer -- see audio_pipeline.h's audio_pipeline_init doc
- * for why)
- * ========================================================================== */
-
 static int pipeline_build(AudioPipeline* p, void* pool, size_t pool_size,
                            const AecConfig* aec_cfg, const AnrConfig* nr_cfg,
                            int hop, int frame_sz, int fft_sz, int n_freqs,
@@ -304,8 +181,7 @@ static int pipeline_build(AudioPipeline* p, void* pool, size_t pool_size,
     }
     uint8_t* ptr = (uint8_t*)pool;
 
-    /* AEC (its own internal post_fft is sized/placed inside aec_get_mem_size /
-     * aec_init -- a separate FFT instance from the synthesis object below). */
+    /* AEC (its internal FFT is separate from the synthesis object's). */
     size_t aec_sz = aec_get_mem_size(aec_cfg);
     p->aec = aec_init(ptr, aec_sz, aec_cfg);
     ptr += ALIGN16(aec_sz);
@@ -336,18 +212,13 @@ static int pipeline_build(AudioPipeline* p, void* pool, size_t pool_size,
             for (int k = 0; k < n_freqs; k++) p->unity_gain[k] = 1.0f;
         }
 
-        /* Explicit zero of every pipeline-owned STATE buffer (a dirty
-         * pool must be safe without the caller's blanket memset); the
-         * synthesis object zeroes its own state in ac_istft_init. */
+        /* Zero every pipeline-owned state buffer; the synthesis object zeroes its own. */
         memset(p->g_total,   0, (size_t)n_freqs  * sizeof(float));
         memset(p->extra,     0, (size_t)n_freqs  * sizeof(float));
         memset(p->spec,      0, (size_t)n_freqs  * sizeof(Complex));
     }
 
-    /* --- n_freqs/hop agreement guard ---
-     * aec_get_res_context() is readable right after aec_init (a->n_freqs /
-     * a->hop_size are set at init time, before any frame is processed), so
-     * this check runs at INIT, before a single sample is read. */
+    /* n_freqs/hop agreement guard, checked at init before any sample is read. */
     AecResContext ctx0;
     aec_get_res_context(p->aec, &ctx0);
     if (ctx0.n_freqs != n_freqs || ctx0.hop_size != hop) {
@@ -366,10 +237,6 @@ static int pipeline_build(AudioPipeline* p, void* pool, size_t pool_size,
     return 0;
 }
 
-/* ============================================================================
- * Build-flags hash (FNV-1a-32)
- * ========================================================================== */
-
 static uint32_t fnv1a_str(const char* s, uint32_t h) {
     while (*s) { h ^= (uint32_t)(unsigned char)(*s++); h *= 16777619u; }
     return h;
@@ -378,17 +245,13 @@ static uint32_t fnv1a_str(const char* s, uint32_t h) {
 static uint32_t audio_pipeline_build_flags_hash(void) {
     uint32_t h = 2166136261u;   /* FNV-1a 32-bit offset basis */
     h = fnv1a_str(AUDIO_PIPELINE_BACKEND_STR, h);
-    /* Literal carve-order token list -- bump AUDIO_PIPELINE_LAYOUT_VERSION
-     * (and update this string) whenever the buffer set/order changes. */
+    /* Carve-order token list; bump AUDIO_PIPELINE_LAYOUT_VERSION whenever the buffer
+     * set or order changes. */
     h = fnv1a_str("|carve:self(config-delay-v2),aec,istft(fft,window,acc,time,spec),nr?,"
                   "g_total,extra,spec,unity?", h);
     h = fnv1a_str("|align16", h);
     return ac_memreq_abi_hash(h);
 }
-
-/* ============================================================================
- * Public API
- * ========================================================================== */
 
 AudioPipelineConfig audio_pipeline_default_config(int sample_rate) {
     AudioPipelineConfig cfg;
@@ -418,10 +281,8 @@ int audio_pipeline_get_mem_requirements(const AudioPipelineConfig* cfg,
     if (derive_dims_and_configs(cfg, &aec_cfg, &nr_cfg, &hop, &frame_sz, &fft_sz, &n_freqs) != 0)
         return -1;
 
-    /* Module validators: aec_get_mem_size/anr_get_mem_size
-     * both return 0 for a config their own aec_validate_config/
-     * anr_validate_config rejects -- catch that explicitly here (rather
-     * than let it silently fold into a too-small `pipe`-only total below). */
+    /* The module validators return 0 for a rejected config; catch that here instead of
+     * folding it into a too-small total. */
     size_t aec_sz = aec_get_mem_size(&aec_cfg);
     if (aec_sz == 0) return -1;
     if (!cfg->aec_only) {
@@ -429,23 +290,16 @@ int audio_pipeline_get_mem_requirements(const AudioPipelineConfig* cfg,
             (cfg->enable_nr && se_anr_stage_mem_size(&nr_cfg) == 0)) return -1;
     }
 
-    /* backend_id: reject up front (same reject-first shape as
-     * the module validators above) if this TU's own AUDIO_PIPELINE_BACKEND_STR
-     * doesn't map to a known backend -- e.g. a build outside pipelines/
-     * Makefile that never set -DAUDIO_PIPELINE_BACKEND_STR at all (falls
-     * back to "unknown" above). A descriptor with backend_id==0 would be
-     * meaningless to a board's `expected` comparison (0 means "no backend"),
-     * so this library never actually returns one. */
+    /* Reject up front a build whose backend maps to no known id (outside
+     * pipelines/Makefile); a descriptor with backend_id 0 is never returned. */
     uint32_t backend_id = audio_pipeline_backend_id();
     if (backend_id == 0u) return -1;
 
     size_t sub_total = pipeline_pool_size(&aec_cfg, &nr_cfg, hop, frame_sz, fft_sz, n_freqs,
                                            cfg->aec_only, cfg->enable_nr, cfg->enable_res);
     size_t self_sz   = ALIGN16(sizeof(AudioPipeline));
-    /* self_sz + sub_total: both operands are bounded well under SIZE_MAX in
-     * any realistic config (sub_total already went through mem_align.h's
-     * saturating ck_* helpers inside each _get_mem_size call), so a plain
-     * add is safe here. */
+    /* Operands are bounded well under SIZE_MAX (sub_total uses saturating ck_* helpers),
+     * so a plain add is safe. */
     out->descriptor_version = AUDIO_PIPELINE_DESCRIPTOR_VERSION;
     out->layout_version     = AUDIO_PIPELINE_LAYOUT_VERSION;
     out->backend_id         = backend_id;
@@ -455,18 +309,6 @@ int audio_pipeline_get_mem_requirements(const AudioPipelineConfig* cfg,
     out->bytes              = (uint64_t)(self_sz + sub_total);
     return 0;
 }
-
-/* ============================================================================
- * audio_pipeline_init_ex descriptor validation —
- * audio_pipeline_init() PLUS an optional `expected` descriptor gate. See
- * audio_pipeline.h for the full contract; the eight-condition check below
- * (run only when `expected` is non-NULL) is the literal implementation of
- * that doc's numbered list, in the SAME order, each on its own named
- * diagnostic. Every comparison below is a plain integer `==`/`<` over
- * fixed-width fields — no strings, no %s of caller data (see
- * AudioPipelineMemReq.backend_id's doc for why that matters: `expected` may
- * originate from persisted/transmitted bytes this library never validated).
- * ========================================================================== */
 
 AudioPipeline* audio_pipeline_init_ex(void* mem, size_t bytes, const AudioPipelineConfig* cfg,
                                        const AudioPipelineMemReq* expected) {
@@ -510,10 +352,8 @@ AudioPipeline* audio_pipeline_init_ex(void* mem, size_t bytes, const AudioPipeli
             return NULL;
         }
         if (expected->reserved != 0u) {
-            /* The header contract requires reserved to be zero in
-             * any descriptor this library produced -- validated here, not
-             * assumed, because `expected` may arrive from persisted/
-             * transmitted bytes this library never wrote. */
+            /* `expected` may arrive from persisted bytes: reserved == 0 is validated, not
+             * assumed. */
             AP_LOG_ERR("audio_pipeline_init_ex: corrupt descriptor -- reserved must be 0 "
                        "(got %u)\n", expected->reserved);
             return NULL;
@@ -570,8 +410,7 @@ AudioPipeline* audio_pipeline_init_ex(void* mem, size_t bytes, const AudioPipeli
     p->aec_only             = cfg->aec_only;
     p->legacy_amin          = cfg->legacy_amin;
     p->enable_res           = cfg->enable_res;
-    /* Comfort noise fills only the bins the AEC residual gain cut, so it has
-     * nothing to fill without that gain. */
+    /* Comfort noise fills only bins the AEC residual gain cut. */
     p->enable_cng_effective = aec_cfg.enable_cng && cfg->enable_cng && cfg->enable_res;
     p->sample_rate          = cfg->sample_rate;
     p->hop = hop; p->frame_sz = frame_sz; p->fft_sz = fft_sz; p->n_freqs = n_freqs;
@@ -604,28 +443,20 @@ AudioPipeline* audio_pipeline_create(const AudioPipelineConfig* cfg) {
     return p;
 }
 
-/* The AEC block is not measured here -- the AEC measures them
- * itself and this copies them through. They are governed by AEC_STAGE_TIMING,
- * not by AUDIO_PIPELINE_STAGE_TIMING, which is why this is not inside the
- * #if above: with only the AEC half built, that block still carries real
- * numbers while nr/post/synth read 0. */
+/* The AEC block is copied through from the AEC; it is governed by AEC_STAGE_TIMING,
+ * not by AUDIO_PIPELINE_STAGE_TIMING. */
 #if AEC_STAGE_TIMING
 static void audio_pipeline_copy_aec_timing(AudioPipeline* p) {
     aec_get_last_timing(p->aec, &p->last_timing.aec);
 }
 #else
-/* Guarded, not just cheap: aec_get_last_timing() is a cross-TU call, so
- * leaving it unguarded made a fully-release build pay one per hop on both
- * paths to copy four zeros. With the AEC half off, the embedded record keeps
- * the zero it got at init, which is exactly what it should report. The macro
- * is defined by aec.h, so this reads the same value the AEC itself was
- * built with. */
+/* Guarded because aec_get_last_timing() is a cross-TU call; with the AEC half off
+ * the record keeps its init-time zero. */
 #define audio_pipeline_copy_aec_timing(p) ((void)(p))
 #endif
 
-/* The analysis stage of a hop: the context-only linear AEC, then the borrowed
- * view of its spectra. The frame aliases the AEC's per-hop buffers and is
- * valid until the next AEC processing call on this instance. */
+/* Analysis stage of a hop: context-only linear AEC, then the borrowed view of its
+ * spectra (valid until the next AEC processing call). */
 static void analyse_hop(AudioPipeline* p, const float* mic, const float* ref,
                         SeSpecFrame* f) {
     AecResContext ctx;
@@ -634,9 +465,8 @@ static void analyse_hop(AudioPipeline* p, const float* mic, const float* ref,
     audio_pipeline_copy_aec_timing(p);
     aec_get_res_context(p->aec, &ctx);
     aec_get_linear_context(p->aec, &lin);
-    /* enable_res=0/return_res_context=1 is set unconditionally for every
-     * !aec_only instance (derive_dims_and_configs() above), so the seam
-     * pointers are always non-NULL here. */
+    /* enable_res=0/return_res_context=1 is set for every !aec_only instance, so the
+     * seam pointers are non-NULL. */
     f->n_freqs = p->n_freqs;
     f->hop = p->hop;
     f->e = ctx.error_spec;
@@ -657,10 +487,8 @@ static void analyse_hop(AudioPipeline* p, const float* mic, const float* ref,
     f->delay_locked = lin.delay_state != AEC_LINEAR_DELAY_UNLOCKED;
 }
 
-/* One IFFT + sqrt-Hann synthesis + OLA, then the hop emit/shift, with the
- * synth timing stamp. Shared by audio_pipeline_process() and
- * audio_pipeline_synthesize() so both finish a hop through the one OLA with
- * the identical operation order. */
+/* One IFFT + sqrt-Hann synthesis + OLA, then hop emit/shift, with the synth timing
+ * stamp; shared by audio_pipeline_process() and audio_pipeline_synthesize(). */
 static void synthesize_hop(AudioPipeline* p, const Complex* spectrum,
                            float* out) {
     uint32_t t2 = audio_pipeline_now_us();
@@ -675,16 +503,11 @@ int audio_pipeline_process(AudioPipeline* p, const float* mic, const float* ref,
 
     if (!p || !mic || !ref || !out) return -1;
 
-    /* No per-hop clear of p->last_timing: every field a mode owns is
-     * rewritten below before this function returns, and the fields a mode
-     * does not own are written by no path at all, so they keep the zero the
-     * control block got at init. */
+    /* Every field of last_timing a mode owns is rewritten each hop; the others keep
+     * their init-time zero. */
 
-    /* aec_only means the AEC's own output IS the pipeline's output: it needs
-     * aec_process(), writing directly into the caller's `out`. Otherwise the
-     * downstream stages read only the frame and never the emitted hop, so
-     * aec_process_context() skips that copy. The caller's mic/ref go straight
-     * into the AEC, which copies them into its own buffers. */
+    /* aec_only: the AEC's output is the pipeline output, written directly into `out`.
+     * Otherwise aec_process_context() skips that copy. */
     if (p->aec_only) {
         aec_process(p->aec, mic, ref, out);
         audio_pipeline_copy_aec_timing(p);
@@ -693,9 +516,8 @@ int audio_pipeline_process(AudioPipeline* p, const float* mic, const float* ref,
     analyse_hop(p, mic, ref, &f);
     t0 = audio_pipeline_now_us();
 
-    /* Noise-reduction gain. The residual-echo power r2 folds into the noise
-     * floor (xi = S^2/(N^2+R^2)) through p->extra; legacy_amin hands the
-     * denoiser no prior. */
+    /* Noise-reduction gain: r2 folds into the noise floor (xi = S^2/(N^2+R^2)) through
+     * p->extra; legacy_amin gives the denoiser no prior. */
     nr_gain = p->unity_gain;
     if (p->nr) {
         nr_gain = se_anr_stage_gain(p->nr, &f, p->extra, !p->legacy_amin);
@@ -703,32 +525,23 @@ int audio_pipeline_process(AudioPipeline* p, const float* mic, const float* ref,
     }
     t1 = audio_pipeline_now_us();
     p->last_timing.nr_us = p->nr ? t1 - t0 : 0;
-    /* A disabled gain source reads as the unity vector, so the fusion below
-     * needs no second code path. */
     res_gain = p->enable_res ? f.g_res_ctx : p->unity_gain;
 
-    /* g_total = min(G_nr, G_res). G_res (pre-min) also sets the comfort-noise
-     * level so the fill reflects AEC suppression only. Both gain vectors stay
-     * valid until their producer runs again, which does not happen before
-     * this hop finishes. */
+    /* g_total = min(G_nr, G_res). Pre-min G_res sets the comfort-noise level so the fill
+     * reflects AEC suppression only. */
     sk_min_f32(p->g_total, nr_gain, res_gain, p->n_freqs);
 
-    /* S(f) = E(f) . g_total */
     sk_capply_gain_f32(p->spec, f.e, p->g_total, p->n_freqs);
 
-    /* Comfort noise on the cut bins: level = sqrt(N^2/PSD_SCALE), scaled by
-     * sqrt(1 - G_res^2) so it fills only what the AEC suppressed (bins
-     * 1..N-2), and by G_nr (bounded below by SE_CNG_NR_GAIN_FLOOR) so the fill
-     * follows the denoised floor: the denoiser never sees the comfort noise,
-     * so its gain is applied to it here. */
+    /* Comfort noise on the cut bins: level sqrt(N^2/PSD_SCALE) scaled by
+     * sqrt(1 - G_res^2) (bins 1..N-2) and by G_nr (floored at SE_CNG_NR_GAIN_FLOOR), as
+     * the denoiser never sees the fill. */
     if (p->enable_cng_effective && f.cn)
         aec_cng_fill(&p->rng_state, p->spec, f.cn, f.g_res_ctx,
                      nr_gain, SE_CNG_NR_GAIN_FLOOR, p->n_freqs);
 
     p->last_timing.post_us = audio_pipeline_now_us() - t1;
 
-    /* p->spec sits on the matching sqrt-Hann analysis frame; complete the
-     * 50%-overlap WOLA with one IFFT + synthesis + OLA. */
     synthesize_hop(p, p->spec, out);
     return 0;
 }
@@ -750,16 +563,13 @@ int audio_pipeline_synthesize(AudioPipeline* p, const Complex* spectrum,
 int audio_pipeline_set_aec_preset(AudioPipeline* p, AecPreset preset,
                                   float ramp_ms) {
     if (!p || !p->aec) return -1;
-    /* No pipeline-level mirror: this instance stores resolved dimensions, not
-     * the caller's config, and aec_set_preset already updates the AEC's own
-     * AecConfig -- the single authoritative copy. */
+    /* aec_set_preset updates the AEC's own AecConfig, the single authoritative copy. */
     return aec_set_preset(p->aec, preset, ramp_ms);
 }
 
 int audio_pipeline_set_nr_mode(AudioPipeline* p, AnrMode mode) {
     if (!p || !p->nr) return -1;   /* aec_only builds have no denoiser */
-    /* The denoiser's own AnrConfig is the authoritative copy; this instance
-     * keeps none. */
+    /* The denoiser's AnrConfig is the authoritative copy. */
     return se_anr_stage_set_mode(p->nr, p->sample_rate, p->fft_sz, p->hop, mode);
 }
 
@@ -770,8 +580,6 @@ void audio_pipeline_reset(AudioPipeline* p) {
     if (!p->aec_only) {
         if (p->nr) se_anr_stage_reset(p->nr);
 
-        /* Re-zero pipeline-owned accumulator/scratch state (mirrors the
-         * explicit zero at carve time). */
         ac_istft_reset(p->istft);
         memset(p->g_total,  0, (size_t)p->n_freqs  * sizeof(float));
         memset(p->extra,    0, (size_t)p->n_freqs  * sizeof(float));
@@ -783,9 +591,7 @@ void audio_pipeline_reset(AudioPipeline* p) {
 
 void audio_pipeline_destroy(AudioPipeline* p) {
     if (!p) return;
-    /* Reverse carve order: NR -> synthesis -> AEC. Each call is a genuine
-     * no-op for a pool-resident (audio_pipeline_init'd) instance; kept
-     * for the heap path and forward-compat -- see audio_pipeline.h's doc. */
+    /* Reverse carve order: NR -> synthesis -> AEC (no-ops for a pool-resident instance). */
     if (p->nr)  se_anr_stage_destroy(p->nr);
     if (p->aec) aec_destroy(p->aec);
 
@@ -832,12 +638,6 @@ int audio_pipeline_get_mem_breakdown(const AudioPipelineConfig* cfg,
     return 0;
 }
 
-/* ============================================================================
- * Diagnostic per-stage timing
- * ========================================================================== */
-
-/* See AudioPipelineLastTiming's doc comment (audio_pipeline.h) for the full
- * stage-boundary reference. */
 void audio_pipeline_get_last_timing(const AudioPipeline* p,
                                     AudioPipelineLastTiming* out) {
     if (!out) return;

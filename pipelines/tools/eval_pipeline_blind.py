@@ -34,7 +34,7 @@ def process_case(mic_path, lpb_path, out_path, preset, fl, nr_preset):
     # Stage 2: NR
     nr_out, nr_gains = run_nr(aec_out, sr, nr_preset=nr_preset, return_gain=True)
 
-    # Stage 3: RES (A_min_pl: g_total = min(G_nr, G_res))
+    # Stage 3: RES (g_total = min(G_nr, G_res))
     config_res = AecConfig.from_preset(preset,
         sample_rate=sr, mode=AecMode.PBFDKF,
         filter_length=fl, enable_res=True, enable_cng=True)

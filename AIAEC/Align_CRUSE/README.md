@@ -6,8 +6,7 @@ output is a real magnitude mask applied to the microphone spectrum, preserving
 microphone phase. This project runs it as an **end-to-end AEC+RES+NR**
 candidate: the training target is `near_target` (denoised, dereverberated,
 echo-cancelled near speech), the same joint task and target DeepVQE-S uses.
-This project has no AEC-only candidate (a target of `near_speech + local_noise`,
-with noise deliberately preserved, is not trained here).
+This project has no AEC-only candidate.
 
 Paper-aligned details:
 
@@ -36,9 +35,9 @@ padding and projection width remain documented reconstruction choices.
 
 The shipped `config.ini` uses the paper's Adam settings (`lr=1.5e-4`, coupled
 L2 `weight_decay=5e-6`) and STFT-consistent PLCPA (`c=0.3`, `beta=0.7` on the
-phase-aware complex term). The local campaign adds three epochs of warmup from
-`1e-5`, then per-step cosine decay to `1e-6`. Batch 16 is the project memory-fit setting and this campaign runs
-50 epochs instead of the paper's batch 400 / 150 epochs. The paper does not
+phase-aware complex term). The shipped config adds three epochs of warmup from
+`1e-5`, then per-step cosine decay to `1e-6`. Batch 16 is the project memory-fit
+setting and it runs 50 epochs instead of the paper's batch 400 / 150 epochs. The paper does not
 publish example duration or steps per epoch, so the peak LR is not rescaled
 from an unknown exposure ratio. Early stopping is disabled; validation still selects
 the best checkpoint.

@@ -2,13 +2,10 @@
 
 `ACCEPTED_BEHAVIOR_HASH_MIGRATIONS` is empty: the shadow-copy baseline retime
 and the C restart evidence clearing move `linear_error`, so every earlier
-identity pair (including 37ed5ad9 -> 19dd4f90) is retired.
-
-What must NOT happen is a retired entry coming back. Byte-identity evidence
-describes no frontend after a change that moves the stem; retargeting one at
-a live build would declare an old waveform compatible with a build that does
+identity pair is retired. A retired entry must not come back: retargeting one
+at a live build would declare an old waveform compatible with a build that does
 not produce it. Retired identities are refused with an instruction to
-rematerialize rather than with a bare hash mismatch.
+rematerialize rather than a bare hash mismatch.
 
 Run:
     python3 -m pytest AIAEC/tests/test_linear_aec_behavior_migration.py
@@ -31,19 +28,19 @@ from AIAEC.dataset_gen.linear_aec import (
 )
 
 
-# Two identities that must stay refused: the frontend the shipped corpus and
-# the Align-ULCNet checkpoints were built on, and one of the identities that
-# had been verified equivalent to it. Both are spelled out rather than read
-# from RETIRED_BEHAVIOR_HASHES: a test that takes its inputs from the table it
-# is checking would still pass if the table were emptied.
+# Two retired identities that must stay refused: the frontend the shipped
+# corpus and the Align-ULCNet checkpoints were built on, and one verified
+# equivalent to it. Spelled out rather than read from RETIRED_BEHAVIOR_HASHES:
+# a test that takes its inputs from the table it checks would pass if the table
+# were emptied.
 DEPLOYED_OLD_HASH = (
     "abd8aa04272d8f833e948999fb54c5a9b2348d0f57f38efb21f43a15bbe6a239")
 EARLIER_MIGRATED_HASH = (
     "eda3c3be25b4bb69762572b22447db7e004f870a395d7cf84ad1ce02ddd28cfe")
 
-# The pair retired most recently: the frontend the shipped corpus was
-# materialized under and the identity it had been carried forward to. Spelled
-# out for the same reason as the two above.
+# The most recently retired pair: the frontend the shipped corpus was
+# materialized under and the identity it was carried forward to. Spelled out
+# for the same reason.
 CORPUS_HASH = (
     "37ed5ad9b75ce42902361d8195fcf04a650b940744ec036a16c8736dec9d5061")
 LAST_MIGRATED_TO_HASH = (

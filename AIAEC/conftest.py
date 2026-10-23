@@ -1,12 +1,10 @@
 """Expose package-qualified AIAEC and pure-AINR imports during tests.
 
-AEC data generation reuses generic augmentation DSP from ``AINR``.
-
-The ``Audio_ALG`` root serves the package-qualified imports; the ``AINR``
-directory is added as well because ``calibration_io`` lives there (so a
-deployment that copies only the model folders still carries it). ``AIAEC``
-itself is deliberately NOT added -- that would shadow AINR's bare
-``dataset_gen`` with a second top-level package of the same name.
+AEC data generation reuses generic augmentation DSP from ``AINR``. The
+``Audio_ALG`` root serves the package-qualified imports; ``AINR`` is added too
+because ``calibration_io`` lives there. ``AIAEC`` itself is deliberately NOT
+added: that would shadow AINR's bare ``dataset_gen`` with a second top-level
+package of the same name.
 """
 
 import os

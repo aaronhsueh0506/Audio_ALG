@@ -16,12 +16,12 @@ _Static_assert(RNNOISE_N_FFT == 512 && RNNOISE_WIN_LEN == 512 &&
 
 #define LOG_FLOOR 1e-10f
 
-/* Immutable model tables, checked independently by test_rnnoise_tables.c.
- * Forward ERB doubles the two edge bands; inverse ERB sums to one per bin.
- * The periodic root-Hann is shared by analysis and synthesis. */
+/* Immutable model tables: forward ERB doubles the two edge bands, inverse ERB
+ * sums to one per bin; the periodic root-Hann is shared by analysis and
+ * synthesis. */
 #include "rnnoise_tables_gen.h"
 
-/* normalized=True 的縮放常數 */
+/* normalized=True scale constants */
 #define STFT_NORM_FWD (1.0f / 22.62741699796952f)   /* N_FFT^-0.5, N=512 */
 #define STFT_NORM_INV (22.62741699796952f)          /* N_FFT^+0.5 */
 
@@ -95,15 +95,14 @@ int rnnoise_model_state_inherit(
     RNNoiseModelState *state,
     const float hidden_out[RNNOISE_MODEL_GRU_COUNT][RNNOISE_MODEL_GRU_SIZE]) {
     if (state == NULL || hidden_out == NULL) return -1;
-    /* The runtime wrote the whole block in place: nothing to check or copy
-     * (copying a range onto itself is undefined). */
+    /* The runtime wrote the whole block in place: nothing to check or copy. */
     if (&hidden_out[0][0] == &state->hidden[0][0]) return 0;
     if (!hidden_finite(hidden_out)) return -1;
     memcpy(state->hidden, hidden_out, sizeof(state->hidden));
     return 0;
 }
 
-/* --- 前處理: analysis --- */
+/* --- analysis --- */
 
 int rnnoise_analysis(RNNoiseState *st, const float *frame,
                      float *out_re, float *out_im) {
@@ -112,14 +111,13 @@ int rnnoise_analysis(RNNoiseState *st, const float *frame,
     return 0;
 }
 
-/* --- 前處理: compute features --- */
+/* --- compute features --- */
 
 int rnnoise_compute_features(RNNoiseState *st,
                              const float *spec_re, const float *spec_im,
                              float out_erb[3][RNNOISE_N_BANDS],
                              float out_spec[3][2][RNNOISE_SPEC_BINS]) {
-    /* power spectrum (normalized 域)
-     * (暫存區在 st->scratch_power, 不佔用呼叫端 stack) */
+    /* power spectrum (normalized domain), in st->scratch_power */
     float *power = st->scratch_power;
     int i = 0;
 #if SK_HAVE_NEON
@@ -134,9 +132,8 @@ int rnnoise_compute_features(RNNoiseState *st,
         power[i] = spec_re[i] * spec_re[i] + spec_im[i] * spec_im[i];
     }
 
-    /* 三角 ERB band energy → dB
-     * energy = power @ erb_fwd; erb_db = 10*log10(energy + 1e-10)
-     * (暫存區在 st->scratch_erb_db) */
+    /* triangular ERB band energy -> dB: 10*log10(power @ erb_fwd + 1e-10), in
+     * st->scratch_erb_db */
     float *erb_db = st->scratch_erb_db;
     int b = 0;
 #if SK_HAVE_NEON
@@ -164,8 +161,8 @@ int rnnoise_compute_features(RNNoiseState *st,
         erb_db[b] = 10.0f * log10f(sum + LOG_FLOOR);
     }
 
-    /* ERB branch: update the causal per-band dB mean with this frame first,
-     * then subtract and scale, matching original DeepFilterNet band_mean_norm_erb. */
+    /* ERB branch: update the causal per-band dB mean with this frame, then
+     * subtract and scale (band_mean_norm_erb). */
     int idx = st->feat_idx;
     const float erb_a = RNNOISE_ERB_NORM_ALPHA;
     b = 0;
@@ -192,8 +189,8 @@ int rnnoise_compute_features(RNNoiseState *st,
         st->erb_feat_buf[idx][b] = feat;
     }
 
-    /* Complex branch: original DeepFilterNet libDF band_unit_norm.  Each bin
-     * updates its own magnitude EMA before real/imag are normalised. */
+    /* Complex branch (libDF band_unit_norm): each bin updates its magnitude EMA
+     * before real/imag are normalised. */
     const float norm_a = RNNOISE_SPEC_NORM_ALPHA;
     int k = 0;
 #if SK_HAVE_NEON
@@ -229,11 +226,11 @@ int rnnoise_compute_features(RNNoiseState *st,
     /* Only readiness matters; saturation avoids signed overflow on long streams. */
     if (st->feat_count < 3) ++st->feat_count;
 
-    /* 需要至少 3 frame 才能送入 conv1 */
+    /* conv1 needs at least 3 frames */
     if (st->feat_count < 3) return 0;
 
-    /* 按時序排列 3 frame: oldest, middle, newest */
-    int oldest = st->feat_idx;  /* feat_idx 指向下一個寫入位置 = 最舊的那格 */
+    /* order the 3 frames oldest, middle, newest */
+    int oldest = st->feat_idx;  /* feat_idx is the next write slot, i.e. the oldest */
     for (int f = 0; f < 3; f++) {
         int src = (oldest + f) % 3;
         memcpy(out_erb[f], st->erb_feat_buf[src],
@@ -244,7 +241,7 @@ int rnnoise_compute_features(RNNoiseState *st,
     return 1;
 }
 
-/* --- 後處理: attenuation limit --- */
+/* --- attenuation limit --- */
 
 void rnnoise_apply_atten_lim(float band_gains[RNNOISE_N_BANDS],
                              float atten_lim_db) {
@@ -267,11 +264,10 @@ void rnnoise_apply_atten_lim(float band_gains[RNNOISE_N_BANDS],
     }
 }
 
-/* --- 後處理: expand gains --- */
+/* --- expand gains --- */
 
 void rnnoise_expand_gains(const float *band_gains, float *bin_gains) {
-    /* bin_gains = gains @ erb_inv^T (inference.py apply gains; mode=1 為
-     * partition of unity → gains=1 對應 bin_gains=1, 無需列正規化) */
+    /* bin_gains = gains @ erb_inv^T (mode=1, partition of unity) */
     int k = 0;
 #if SK_HAVE_NEON
     for (; k + 4 <= RNNOISE_N_BINS; k += 4) {
@@ -295,7 +291,7 @@ void rnnoise_expand_gains(const float *band_gains, float *bin_gains) {
     }
 }
 
-/* --- 後處理: synthesis (apply gain + IFFT + overlap-add) --- */
+/* --- synthesis (apply gain + IFFT + overlap-add) --- */
 
 int rnnoise_synthesis(RNNoiseState *st,
                        float *spec_re, float *spec_im,
@@ -303,7 +299,7 @@ int rnnoise_synthesis(RNNoiseState *st,
                        float *out_samples) {
     if (!st || !st->istft || !spec_re || !spec_im || !bin_gains ||
         !out_samples) return -1;
-    /* 套用 gain, 並乘 N^+0.5 反正規化 (= torch.istft normalized=True) */
+    /* apply gain and multiply by N^+0.5 (torch.istft normalized=True) */
     int i = 0;
 #if SK_HAVE_NEON
     for (; i + 4 <= RNNOISE_N_BINS; i += 4) {

@@ -1,48 +1,41 @@
 """Equivalence and contract gates for the DeepFilterNet2 pre/post class.
 
-``dfn2_prepost.c`` owns no signal processing: it composes the two already
-parity-tested translation units (``dfn2_process.c`` for the center=False
-sqrt-Hann STFT/WOLA, the ERB/complex feature front end and the compose stage,
-``dfn2_model_io.c`` for the graph feature windows and the recurrent caches)
-behind one object.  So the gate that matters is not a tolerance against a
-Python reference -- the parity of the parts is covered by
-test_python_c_prepost_parity.py and tests/test_c_prepost.c -- but that the
-class reproduces the hand-composed path SAMPLE FOR SAMPLE.  Every comparison
-here is therefore ``memcmp`` on fp32, never a tolerance: the class is only
-allowed to reorder nothing.
+``dfn2_prepost.c`` owns no signal processing: it composes two parity-tested
+translation units (``dfn2_process.c`` for the center=False sqrt-Hann STFT/WOLA,
+the ERB/complex feature front end and the compose stage, ``dfn2_model_io.c``
+for the graph feature windows and the recurrent caches) behind one object. So
+the gate is that the class reproduces the hand-composed path SAMPLE FOR SAMPLE:
+every comparison is ``memcmp`` on fp32, never a tolerance.
 
-Cases, all in ONE driver selected by argv[1] so audiolib and the three
-model TUs are compiled once for the module:
+Cases, all in ONE driver selected by argv[1] (audiolib and the three model TUs
+are compiled once for the module):
 
   equiv     DFN2_IO_TIME vs analysis + features + model-I/O + compose +
-            synthesis, hand-composed.  The reference deliberately uses ONLY
-            the two composed TUs, never dfn2_prepost.c, so the comparison is
-            not circular.  Run twice: attenuation limit off and at -20 dB.
-  freq      DFN2_IO_FREQ driven by the caller's own dfn2_analysis on a
-            separate DFN2State and re-synthesised by the caller, vs IO_TIME
-  freqpool  the FREQ pool is smaller, and the stale-pool gate both accepts
-            the matching MemReq and refuses a perturbed one
+            synthesis, hand-composed from ONLY the two composed TUs (never
+            dfn2_prepost.c). Run twice: attenuation limit off and at -20 dB.
+  freq      DFN2_IO_FREQ driven by the caller's own dfn2_analysis on a separate
+            DFN2State and re-synthesised by the caller, vs IO_TIME
+  freqpool  the FREQ pool is smaller; the stale-pool gate accepts the matching
+            MemReq and refuses a perturbed one
   lifecycle _create/_destroy against _init on a caller pool
   reject    _get_mem_size / _init / stage-call reject-first validation
   reset     _reset really clears state (a re-run reproduces the first run)
-  skip      _frame_skip is the exact identity, never steps the state itself
-            and leaves it exactly as the accelerator wrote it
+  skip      _frame_skip is the exact identity, never steps the state itself and
+            leaves it as the accelerator wrote it
   guard     the four frame-state-machine gates the contract block promises
-  txn       a refused commit zeroes the two recurrent tensors (the state is
-            written in place, so there is nothing to roll back to), keeps the
-            frame open and leaves windows and clocks alone, proved for every
-            one of the five accelerator output tensors
+  txn       a refused commit zeroes the two recurrent tensors (written in place,
+            so there is nothing to roll back to), keeps the frame open and leaves
+            windows and clocks alone, proved for each of the five accelerator
+            output tensors
   state_inplace  one buffer per recurrent tensor: input and `*_next` views are
             the same address on every frame
-  inplace_nan    mutation gate: a NaN injected through the in-place pointer
-            makes commit refuse and leaves both tensors zero
-  generation     the state generation is 1 after init and advances once per
-            reset and once per refused commit, never on commit or skip
+  inplace_nan    a NaN injected through the in-place pointer makes commit refuse
+            and leaves both tensors zero
+  generation     the state generation is 1 after init and advances once per reset
+            and once per refused commit, never on commit or skip
 
-The accelerator stand-in is deterministic and input-dependent, so the two
-feature windows, the h_gru tensor and the deep-filter pathway window
-genuinely influence later frames -- a class that dropped a state
-advance would diverge rather than agree.
+The accelerator stand-in is deterministic and input-dependent, so a class that
+dropped a state advance would diverge rather than agree.
 """
 
 import os
@@ -2087,14 +2080,12 @@ def test_frame_skip_is_exact_identity_and_freezes_the_state(driver):
 
 def test_frame_state_machine_guards(driver):
     """The contract gates: a second pre_process with a frame open is refused
-    without eating the frame; the ERB and attenuation setters are refused
-    while a frame is open (a swap can never land inside a transaction) and
-    accepted again after it closes; a commit with no frame_inputs behind it
-    is refused; a
-    commit that failed on a non-finite output disarms the transaction until
-    a fresh frame_inputs NaN-refills the three heads (the state is the
-    accelerator's input and is not prefilled); and frame_skip needs no
-    frame_inputs behind it."""
+    without eating the frame; the ERB and attenuation setters are refused while
+    a frame is open and accepted again after it closes; a commit with no
+    frame_inputs behind it is refused; a commit that failed on a non-finite
+    output disarms the transaction until a fresh frame_inputs NaN-refills the
+    three heads (the state is the accelerator's input and is not prefilled);
+    and frame_skip needs no frame_inputs behind it."""
     _run(driver, 'guard')
 
 

@@ -62,9 +62,9 @@ def reference_df3_mrsl(enhanced, clean, fft_sizes, gamma, factor, factor_complex
 def test_config_is_irm_only():
     """The objective is the ERB-IRM term alone; MRSL is configured off.
 
-    Measured on a 3 s sample, d(MRSL)/d(gains) had ~1106x the RMS of
-    d(IRM)/d(gains), so running both meant IRM contributed nothing to the
-    optimisation.  Turning MRSL off is what makes "train with IRM loss" true.
+    MRSL's gradient with respect to the gains dwarfs the IRM term's (~1000x RMS
+    on a 3 s sample), so running both left IRM contributing nothing to the
+    optimisation. Turning MRSL off is what makes "train with IRM loss" true.
     """
     cfg = configparser.ConfigParser()
     assert cfg.read(ROOT / 'config.ini')
@@ -205,7 +205,7 @@ def test_checkpoint_gate_rejects_legacy_objective():
 def test_checkpoint_gate_covers_the_irm_settings():
     """The IRM term is the entire objective, so its knobs must be contracted.
 
-    They were absent: a run trained at gamma=0.25 resumed without complaint
+    Without them a run trained at gamma=0.25 would resume without complaint
     against a config asking for 0.5.
     """
     cfg = configparser.ConfigParser()
@@ -235,11 +235,11 @@ def test_checkpoint_gate_covers_the_irm_settings():
 def test_irm_loss_has_no_speech_activity_weighting():
     """A noise-only example must not be up-weighted as speech.
 
-    The removed ``(1 + 5*vad)`` term computed vad from the CLEAN energy against
-    its own peak; for an all-zero clean signal that was 10*log10(0/1e-12) = 0
-    dB, i.e. above threshold, so every pure-noise frame scored as speech and
-    got 6x weight -- the exact opposite of the intent.  The model has no VAD
-    output head, so there is nothing for such a weight to correspond to.
+    A ``(1 + 5*vad)`` term computing vad from the CLEAN energy against its own
+    peak would score an all-zero clean signal as 10*log10(0/1e-12) = 0 dB,
+    above threshold, giving every pure-noise frame 6x weight, the opposite of
+    the intent; the model has no VAD output head for such a weight to
+    correspond to.
     """
     cfg = configparser.ConfigParser()
     assert cfg.read(ROOT / 'config.ini')

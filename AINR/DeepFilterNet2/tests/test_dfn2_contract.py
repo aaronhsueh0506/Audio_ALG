@@ -96,11 +96,9 @@ def build_shipped_model(cfg, **overrides):
     """Construct the model exactly as config.ini specifies, with overrides.
 
     Goes through the trainer's own ``read_model_config`` rather than re-reading
-    the keys: a local copy is a third restatement of the constructor's defaults
-    (train.py and inference.py were the first two, which is why that function
-    exists), and it silently omitted ``df_hidden``, ``mask_pf`` and ``pf_beta`` --
-    so tests built those three from constructor defaults while the trainer built
-    them from config.  It also inherits the unknown-key rejection.
+    the keys, so tests cannot build ``df_hidden``, ``mask_pf`` or ``pf_beta``
+    from constructor defaults while the trainer builds them from config; it
+    also inherits the unknown-key rejection.
     """
     return DeepFilterNet2(**{**read_model_config(cfg), **overrides})
 
@@ -244,9 +242,9 @@ def test_phase_aware_loss_matches_reference_and_accepts_pure_noise():
 
 
 def test_erb_fb_matches_banderb_notebook_construction():
-    # erb_bandborder(): every band >= 2 bins (the v3 fix -- the original
-    # notebook's "every-OTHER-band-pair >= 2" rule did not actually
-    # guarantee this), endpoints pinned, right band count.
+    # erb_bandborder(): every band >= 2 bins (the original notebook's
+    # "every-OTHER-band-pair >= 2" rule does not guarantee it), endpoints
+    # pinned, right band count.
     for n_bands, sr, n_fft in [(32, 48000, 1024), (22, 16000, 512),
                                (10, 8000, 256)]:
         border = erb_bandborder(n_bands, sr, n_fft)
@@ -415,12 +413,9 @@ def test_calibration_frame_shapes_equal_the_exported_graph_inputs(tmp_path):
     """One recorded calibration frame must BE one graph invocation.
 
     ``capture_calibration_inputs`` keeps the graph's batch dimension and
-    ``np.stack`` adds the calibration-frame axis on top of it.  Dropping the
-    batch axis would leave every ``.bin`` one rank short of the input the
-    accelerator binds it to, and nothing downstream re-derives the shape --
-    the manifest is what a quantizer reads.  So the per-frame shapes are
-    compared against the ONNX graph this exporter really produces rather than
-    against a literal that could be edited to match a regression.
+    ``np.stack`` adds the calibration-frame axis on top; dropping the batch
+    axis would leave every ``.bin`` one rank short of the input the accelerator
+    binds it to, with nothing downstream re-deriving the shape.
     """
     onnx = pytest.importorskip('onnx')
     from calibration_io import (
@@ -668,11 +663,10 @@ def test_enc_concat_true_still_emits_a_single_width_bus():
     """⚠ Dormant path, so nothing else covers it.
 
     Upstream keeps emb_in_dim and emb_out_dim separate: concatenating the two
-    encoder branches doubles what the embedding GRU CONSUMES while what it EMITS
-    stays one bus wide, because the decoders downstream are built for one bus.
-    A single shared width attribute would make enc_concat=True emit a
-    double-width bus the ERB decoder cannot accept.  Since enc_concat is an
-    exposed config knob, that failure is reachable.
+    encoder branches doubles what the embedding GRU CONSUMES while what it
+    EMITS stays one bus wide for the decoders. One shared width attribute would
+    make enc_concat=True emit a double-width bus the ERB decoder cannot accept,
+    and enc_concat is an exposed config knob.
     """
     cfg = load_config()
     model = build_shipped_model(cfg, enc_concat=True)
@@ -811,12 +805,10 @@ def test_erb_power_uses_the_direct_form_through_the_real_feature_path():
 def test_squeezed_gru_skip_closes_over_the_raw_input():
     """⚠ Dormant at every call site, so only a direct construction reaches it.
 
-    Upstream's SqueezedGRU_S adds `gru_skip(input)` -- the raw argument -- after
-    linear_out (df/modules.py:732-738).  The port had `gru_skip(x)` where `x` had
-    already been rebound by linear_in, i.e. the squeezed activation.  All three
-    in-repo sites pass gru_skip_op=None, so no end-to-end test can see the
-    difference; mutation-proven that the whole suite stayed green with the wrong
-    wiring.
+    Upstream's SqueezedGRU_S adds `gru_skip(input)` -- the raw argument --
+    after linear_out (df/modules.py:732-738), not `gru_skip(x)` with `x`
+    already rebound by linear_in. All three in-repo sites pass
+    gru_skip_op=None, so no end-to-end test can see the difference.
     """
     torch.manual_seed(17)
     block = SqueezedGRU_S(
@@ -906,8 +898,7 @@ def test_gru_state_rows_are_routed_to_their_own_gru():
     decoder), and the DF and ERB decoders read only the encoder's embedding,
     never each other's hidden state. So perturbing one decoder's rows may move
     only that decoder's rows of ``h_gru_out``; perturbing the encoder row moves
-    the embedding and therefore both decoders. A slice that landed on the wrong
-    GRU, or a reversed row order, breaks the first property.
+    the embedding and therefore both decoders.
     """
     torch.manual_seed(73)
     model = _small_dfn2()

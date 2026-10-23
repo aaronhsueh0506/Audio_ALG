@@ -1,4 +1,4 @@
-/* DeepVQE-S CCM post-processing.  STFT/WOLA is AIAEC/aiaec_process.h. */
+/* DeepVQE-S CCM post-processing on the AIAEC grid (aiaec_process.h). */
 #ifndef DEEPVQE_PROCESS_H
 #define DEEPVQE_PROCESS_H
 

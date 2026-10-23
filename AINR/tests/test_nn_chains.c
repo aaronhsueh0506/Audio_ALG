@@ -1,18 +1,13 @@
 /* Whole-chain digests of the DeepFilterNet2 and GTCRN pre/post chains.
  *
- * Each chain is driven through its public frequency-domain API for HOPS hops
- * with a seeded generator: the analysed spectra going in, and stand-in model
- * outputs coming back (plausible head values, and on a fixed schedule tiny
- * values, huge values, non-finite heads, non-finite recurrent state, a
- * skipped frame and an unwritten frame). Everything handed to the model, the
- * recurrent state after each frame and every post-processed spectrum is
- * hashed bit by bit; a NaN counts as one value whatever its payload.
- *
- * The program prints one digest per chain. The NEON and the forced-scalar
- * build must print the same line (`make test-simd` compares them), so a
- * difference of one bit of any tensor between the two builds fails there. Each
- * chain is also run twice in the process and must reproduce its own digest,
- * which catches state that is read before it is written. */
+ * Each chain runs HOPS hops through its public frequency-domain API with a
+ * seeded generator: spectra in, stand-in model outputs back (plausible values
+ * plus tiny, huge and non-finite heads, non-finite state, a skipped and an
+ * unwritten frame). Model inputs, the recurrent state after each frame and
+ * every output spectrum are hashed bit by bit (a NaN is one value). The
+ * program prints one digest per chain; the NEON and forced-scalar builds must
+ * match (`make test-simd`), and a second run in the process must reproduce its
+ * own digest, which catches state read before it is written. */
 #include <math.h>
 #include <stdint.h>
 #include <stdio.h>

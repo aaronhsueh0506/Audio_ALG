@@ -1,15 +1,11 @@
 """Checkpoint helpers shared by train.py / inference.py.
 
-Kept out of model.py on purpose: model.py is a bit-exact port of upstream
-gtcrn_github/gtcrn.py (verified max|diff| = 0.0, 48,245 total / 23,669
-trainable on both) and must stay that way so it can be diffed against
-upstream and so the vendored published checkpoints keep loading.
+Kept out of model.py so that file stays identical to upstream
+gtcrn_github/gtcrn.py and the vendored published checkpoints keep loading.
 """
 
-# Top-level key holding the weights, in priority order.
-#   'state_dict' — written by this repo's train.py
-#   'model'      — written by upstream gtcrn (see gtcrn_github/infer.py:11);
-#                  all four vendored tars have keys ['epoch','optimizer','model']
+# Top-level weights key, in priority order: 'state_dict' (this repo's train.py) or
+# 'model' (upstream gtcrn).
 _STATE_DICT_KEYS = ('state_dict', 'model')
 
 

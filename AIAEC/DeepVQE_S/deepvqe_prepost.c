@@ -1,21 +1,9 @@
-/* DeepVQE-S pre/post class. Contract: see deepvqe_prepost.h.
- *
- * This file OWNS no signal processing of its own. It composes the two
- * parity-tested translation units -- aiaec_process.c (the complex-mask
- * helpers; the sqrt-Hann STFT/WOLA it shares with Align-ULCNet is
- * audiolib's AcStft / AcIstft) and deepvqe_process.c (the CCM
- * kernel) -- and adds only the object lifecycle, the pool carve, the
- * accelerator tensor views and the per-hop frame state machine. Neither
- * file's existing entry points change, so both of their standalone parity
- * builds keep linking.
- *
- * It deliberately does NOT use ulcnet_model_io.c: DeepVQE-S's boundary is a
- * different one (compressed planar spectra in, full next state out) and
- * pulling that TU in would bind this model to Align-ULCNet's layout version. The small amount of pool
- * arithmetic it would have shared is duplicated below instead.
- *
- * Constraint inherited from both: -ffp-contract=off. No heap in _init, no
- * globals, no stdio. */
+/* DeepVQE-S pre/post class (contract: deepvqe_prepost.h). Composes
+ * deepvqe_process.c (CCM kernel) and audiolib's AcStft/AcIstft on the AIAEC
+ * grid, and adds the object lifecycle, pool carve, accelerator tensor views and
+ * per-hop frame state machine. It does not use ulcnet_model_io.c (different
+ * boundary), so the small pool arithmetic is repeated here. Requires
+ * -ffp-contract=off. No heap in _init, no globals, no stdio. */
 
 #include "deepvqe_prepost.h"
 
@@ -28,10 +16,8 @@
 
 #define PP_ALIGN ((size_t)DEEPVQE_PREPOST_ALIGNMENT)
 
-/* Graph tensor names, in DeepVqeStateId order == the exporter's
- * input_names[2:]. Two tables rather than one plus a runtime "_out" suffix
- * concatenation: this file has no scratch string storage and must return
- * literals with static lifetime. */
+/* Graph tensor names in DeepVqeStateId order (the exporter's input_names[2:]);
+ * two tables of static literals. */
 static const char *const dv_state_names[] = {
     "state_align_key_ring",
     "state_align_value_ring",
@@ -70,8 +56,7 @@ static const char *const dv_state_names_out[] = {
     "state_up3_history_out"
 };
 
-/* Sized by the initialiser, not by the enum, so a missing entry is a
- * compile error here rather than a NULL name at runtime. */
+/* Sized by the initialiser, so a missing entry is a compile error. */
 #ifdef __STDC_VERSION__
 #if __STDC_VERSION__ >= 201112L
 _Static_assert(sizeof(dv_state_names) / sizeof(dv_state_names[0]) ==
@@ -88,9 +73,7 @@ struct DeepVqePrepost {
 
     int io_mode;
 
-    /* One buffer per state tensor, bound as BOTH the accelerator's input and
-     * its `_out` output for the life of the instance: the frame-t output is
-     * already the frame-t+1 input, so nothing is copied or swapped. */
+    /* One buffer per state tensor, bound as both the accelerator input and its _out output. */
     float *state[DEEPVQE_STATE_COUNT];
     size_t state_elements[DEEPVQE_STATE_COUNT];
 
@@ -99,23 +82,17 @@ struct DeepVqePrepost {
     float *mic_ri;      /* [2 * AIAEC_N_BINS] real plane, imaginary plane   */
     float *far_ri;      /* [2 * AIAEC_N_BINS] real plane, imaginary plane   */
 
-    /* Host-owned raw-microphone spectrum ring the CCM taps convolve over.
-     * The exporter pops it out of the graph's state on purpose
-     * (_streaming_export.py: stream_state.pop('spec_ring')). */
+    /* Host-owned raw-microphone spectrum ring the CCM taps convolve over (popped
+     * out of the graph state by the exporter). */
     DeepVqeCcmState *ccm;
 
-    /* DEEPVQE_IO_TIME only; NULL in DEEPVQE_IO_FREQ.
-     *
-     * Both analyses are rolling (center 0) -- the plain one-frame-per-hop
-     * window, NOT the centered schedule -- see the header's FRAMING note.
-     * The three objects borrow the caller's FftHandle and window table and
-     * carry their own transform scratch (object-owned, never stack). */
+    /* DEEPVQE_IO_TIME only; NULL in DEEPVQE_IO_FREQ. Rolling (center 0) analyses
+     * and the synthesis state borrow the caller's FftHandle and window and carry
+     * their own transform scratch. */
     AcStft         *ana_mic;
     AcStft         *ana_far;
     AcIstft        *synth;
-    float          *out_hop;    /* [AIAEC_HOP] the synthesis output. Zero
-                                 * from init/reset, then only ever written
-                                 * wholesale by the synthesis. */
+    float          *out_hop;    /* [AIAEC_HOP] synthesis output; zero from init/reset, written wholesale */
 
     /* Per-hop frame staging: one frame, in both I/O modes. */
     float *mic_re;      /* [AIAEC_N_BINS] */
@@ -150,11 +127,9 @@ int deepvqe_prepost_state_shape(int state_id, int delay_depth,
     int f = 0;
 
     if (!dims || !dv_valid_depth(delay_depth)) return -1;
-    /* One switch is the single source of truth for the boundary: the pool
-     * carve, the published element counts and any schema check a tool runs
-     * all read it, so a shape can never be right in one and wrong in
-     * another. Channel counts mirror DeepVQE_S/model.py's schedule; the
-     * frequency ladder is the encoder's stride-2 halving. */
+    /* Single source of truth for the boundary shapes (pool carve, element counts,
+     * schema checks). Channel counts follow DeepVQE_S/model.py; the frequency
+     * ladder is the encoder's stride-2 halving. */
     switch (state_id) {
     case DEEPVQE_STATE_ALIGN_KEY_RING:
         c = DEEPVQE_SIM_CHANNELS;   t = delay_depth; f = DEEPVQE_F2; break;
@@ -231,9 +206,9 @@ const char *deepvqe_prepost_skip_policy_name(void) {
     return "mute_fail_closed";
 }
 
-/* ---- pool arithmetic ---------------------------------------------------
- * audiolib's saturating helpers (mem_align.h): an overflow anywhere in
- * the walk pins the cursor to SIZE_MAX, which MEM_SIZE_INVALID catches. */
+/* ---- pool arithmetic ----
+ * audiolib's saturating helpers (mem_align.h): overflow pins the cursor to
+ * SIZE_MAX, which MEM_SIZE_INVALID catches. */
 
 #ifdef __STDC_VERSION__
 #if __STDC_VERSION__ >= 201112L
@@ -262,8 +237,8 @@ static uint32_t pp_fnv1a(uint32_t h, uint32_t v) {
     return h;
 }
 
-/* The build identity a pool is only valid for. io_mode is IN here because
- * the two modes carve different regions at the same total-size class. */
+/* Build identity a pool is valid for; io_mode is included because the two modes
+ * carve different regions. */
 static uint32_t pp_build_hash(int io_mode, int delay_depth) {
     uint32_t h = 2166136261u;
     h = pp_fnv1a(h, (uint32_t)AIAEC_SR);
@@ -275,8 +250,8 @@ static uint32_t pp_build_hash(int io_mode, int delay_depth) {
     return ac_memreq_abi_hash(h);
 }
 
-/* The framing objects of the TIME configuration: rolling analyses and the
- * envelope-normalised synthesis, on the AIAEC grid. */
+/* Framing objects of the TIME configuration: rolling analyses and the
+ * envelope-normalised synthesis on the AIAEC grid. */
 static void pp_framing_config(AcStftConfig *sc,
                               const DeepVqePrepostConfig *cfg) {
     ac_stft_config_default(sc, AIAEC_N_FFT);
@@ -285,9 +260,8 @@ static void pp_framing_config(AcStftConfig *sc,
     sc->window = cfg->window;
 }
 
-/* Walk the layout once. base==NULL sizes it; base!=NULL also carves it.
- * get_mem_size and init MUST walk in this same order -- that is the whole
- * reason it is one function. */
+/* Walk the layout once: base==NULL sizes it, otherwise it also carves.
+ * get_mem_size and init share this walk so their order agrees. */
 static int pp_layout(DeepVqePrepost *p, unsigned char *base,
                      const DeepVqePrepostConfig *cfg, size_t *total) {
     size_t cursor = 0;
@@ -297,8 +271,7 @@ static int pp_layout(DeepVqePrepost *p, unsigned char *base,
 
     if (pp_carve(base, &cursor, sizeof(DeepVqePrepost), &ptr) != 0) return -1;
 
-    /* One buffer per state tensor: the accelerator reads it and writes its
-     * next value back to the same address. */
+    /* One buffer per state tensor: read by the accelerator, next value written back to the same address. */
     for (id = 0; id < DEEPVQE_STATE_COUNT; ++id) {
         size_t elements =
             deepvqe_prepost_state_elements(id, cfg->delay_depth);
@@ -405,16 +378,9 @@ int deepvqe_prepost_descriptor_default(int delay_depth,
 int deepvqe_prepost_descriptor_validate(
     const DeepVqePrepostDescriptor *descriptor) {
     if (!descriptor) return -1;
-    /* Field by field, not memcmp: a descriptor deserialized from ONNX/JSON
-     * metadata may carry whatever the writer left in the struct padding, and
-     * that must not decide the verdict.
-     *
-     * delay_depth is checked for RANGE only, deliberately: it is the one
-     * genuine deployment parameter here, chosen at export time, so a
-     * descriptor is not wrong for carrying a D this build was not compiled
-     * with -- the pool is sized from it. Everything else below is a compiled
-     * constant, and a graph disagreeing on any of them is a different
-     * boundary. */
+    /* Field by field, not memcmp, so struct padding cannot decide the verdict.
+     * delay_depth is only range-checked: it is an export-time parameter and the
+     * pool is sized from it. */
     if (!dv_valid_depth(descriptor->delay_depth)) return -1;
     if (descriptor->layout_version != DEEPVQE_PREPOST_LAYOUT_VERSION ||
         descriptor->sample_rate != AIAEC_SR ||
@@ -439,8 +405,7 @@ static int pp_check_config(const DeepVqePrepostConfig *cfg) {
         return -1;
     if (!dv_valid_depth(cfg->delay_depth)) return -1;
     if (cfg->io_mode == DEEPVQE_IO_TIME) {
-        /* Reject-first: a handle of the wrong size would silently break the
-         * feature-time contract. */
+        /* Reject-first: a wrong-size handle would break the feature-time contract. */
         if (!cfg->fft || !cfg->window) return -1;
         if (fft_get_n_freqs(cfg->fft) != AIAEC_N_BINS) return -1;
     }
@@ -489,9 +454,8 @@ DeepVqePrepost *deepvqe_prepost_init_ex(void *pool, size_t bytes,
         }
     }
 
-    /* Whole control region zeroed first, so a poisoned pool initialises
-     * identically to a zeroed one -- and so every state tensor starts at the
-     * model's reset value without a second pass. */
+    /* Zero the whole control region first so a poisoned pool initialises like a
+     * zeroed one and every state tensor starts at the reset value. */
     memset(pool, 0, (size_t)req.bytes);
     p = (DeepVqePrepost *)pool;
     if (deepvqe_prepost_descriptor_default(cfg->delay_depth,
@@ -538,8 +502,7 @@ void deepvqe_prepost_destroy(DeepVqePrepost *p) {
     void *base;
     if (!p) return;
     base = p->heap_base;
-    p->heap_base = NULL;   /* a pool instance owns nothing to free and
-                            * stays usable: repeat calls on it are no-ops */
+    p->heap_base = NULL;   /* nothing to free for a pool instance; repeat calls are no-ops */
     if (base) free(base);
 }
 
@@ -610,10 +573,8 @@ int deepvqe_prepost_pre_process(DeepVqePrepost *p,
     if (p->io_mode != DEEPVQE_IO_TIME) return -1;
     if (p->frame_open) return -1;   /* previous frame neither committed nor skipped */
 
-    /* center=False rolling analysis, one frame per hop from the very first
-     * hop (see deepvqe_prepost.h). Both streams are transformed from the SAME
-     * hop index -- this class applies no internal skew -- so they cannot
-     * desynchronise. */
+    /* center=False rolling analysis, one frame per hop from the first hop; both
+     * streams use the same hop index (no internal skew). */
     (void)ac_stft_push_planar(p->ana_mic, mic_hop, p->mic_re, p->mic_im);
     (void)ac_stft_push_planar(p->ana_far, far_hop, p->far_re, p->far_im);
 
@@ -641,11 +602,10 @@ int deepvqe_prepost_pre_process_freq(DeepVqePrepost *p,
     return 1;
 }
 
-/* x * |x|^(e-1) with |x| = sqrt(re^2 + im^2 + 1e-12), the model's
- * compressed_ri_feature (aiaec_common.py), as passes over the planes so the
- * sqrt and the scaling are vector loops; only the powf is per element. The
- * imaginary output plane is the scratch for |x| and then the scale.
- * Products stay unfused (-ffp-contract=off). */
+/* x * |x|^(e-1) with |x| = sqrt(re^2 + im^2 + 1e-12), as passes over the planes
+ * (vector sqrt and scaling, powf per element); the imaginary output plane is
+ * scratch for |x| and then the scale. Unfused products (-ffp-contract=off).
+ * Python reference: aiaec_common.compressed_ri_feature. */
 static void compress_planar(const float *re, const float *im, float *out) {
     float *out_re = out;
     float *out_im = out + AIAEC_N_BINS;
@@ -666,16 +626,14 @@ int deepvqe_prepost_frame_inputs(DeepVqePrepost *p,
 
     if (!p || !inputs || !outputs || !p->frame_open) return -1;
 
-    /* The graph's fixed front end, run on the host: the power-law
-     * compression of both spectra into [1,2,1,BINS] planar tensors. The raw
-     * mic spectrum stays in mic_re/mic_im for the CCM ring. */
+    /* Host-side front end: power-law compression of both spectra into
+     * [1,2,1,BINS] planar tensors. The raw mic spectrum stays in mic_re/mic_im
+     * for the CCM ring. */
     compress_planar(p->mic_re, p->mic_im, p->mic_ri);
     compress_planar(p->far_re, p->far_im, p->far_ri);
 
-    /* Arms the transaction and NaN-fills the head output, so a caller that
-     * asks twice still gets a clean one rather than a half-written one. The
-     * state tensors are NOT filled: each is the accelerator's input as well
-     * as its output. */
+    /* Arms the transaction and NaN-fills the head output; state tensors are not
+     * filled (they are the accelerator's input too). */
     fill_nan(p->taps, DEEPVQE_TAPS_ELEMENTS);
 
     memset(inputs, 0, sizeof(*inputs));
@@ -695,12 +653,9 @@ int deepvqe_prepost_frame_inputs(DeepVqePrepost *p,
     return 0;
 }
 
-/* Push the finished frame through the synthesis (TIME) or stage it (FREQ)
- * and close it. Cannot fail: the synthesis only ever reports 0 samples (the
- * very first frame, whose block lies inside the trimmed half window) or a
- * full AIAEC_HOP, and never reads `out`. So the only fallible step of a
- * commit is the validation that precedes the CCM ring advance, so a failed
- * commit leaves the ring untouched structurally rather than by argument. */
+/* Push the finished frame through the synthesis (TIME) or stage it (FREQ) and
+ * close it. Cannot fail: the synthesis reports 0 samples (first frame) or a full
+ * AIAEC_HOP, so a failed commit leaves the CCM ring untouched. */
 static void pp_close_frame(DeepVqePrepost *p) {
     p->frame_open = 0;
     p->prepared = 0;
@@ -710,12 +665,10 @@ static void pp_close_frame(DeepVqePrepost *p) {
     }
 }
 
-/* The finite predicate over what the graph just wrote into one state tensor.
- * Every window is written back whole, but only its newest frame is new: slot
- * 0 of an attention ring (newest first), the last frame of a conv or score
- * window (oldest first); h_gru is checked whole. The older frames were
- * checked when they were new, and a non-finite value left in any of them
- * reaches `taps` on a later frame, where it is refused. */
+/* Finite check over what the graph wrote into one state tensor: only the newest
+ * frame of a window (slot 0 of an attention ring, last frame of a conv or score
+ * window) and h_gru whole. Older frames were checked when new, and a non-finite
+ * value left in them reaches `taps` on a later frame. */
 static int newest_frame_finite(const DeepVqePrepost *p, int id) {
     int dims[DEEPVQE_STATE_MAX_RANK];
     size_t channels;
@@ -746,19 +699,16 @@ int deepvqe_prepost_frame_commit(DeepVqePrepost *p) {
     for (id = 0; ok && id < DEEPVQE_STATE_COUNT; ++id)
         ok = newest_frame_finite(p, id);
     if (!ok) {
-        /* The accelerator already overwrote the state in place, so there is
-         * nothing to roll back to: restart the recurrence from the cold
-         * state. The CCM ring has not been pushed, and the frame stays open
-         * so the caller can take the fail-closed identity with frame_skip(). */
+        /* State was overwritten in place: restart the recurrence cold. The CCM
+         * ring is not pushed and the frame stays open for frame_skip(). */
         zero_state(p);
         p->prepared = 0;
         return -1;
     }
 
-    /* The CCM ring is host state (the exporter pops spec_ring out of the
-     * graph): deepvqe_ccm_process pushes THIS frame's raw microphone
-     * spectrum and convolves the taps over the resulting (t, t-1, t-2)
-     * history. It advances only here, on a frame whose outputs validated. */
+    /* The CCM ring is host state: deepvqe_ccm_process pushes this frame's raw
+     * microphone spectrum and convolves the taps over (t, t-1, t-2). It advances
+     * only on a validated frame. */
     deepvqe_ccm_process(
         p->ccm, p->mic_re, p->mic_im,
         (const float (*)[DEEPVQE_TIME_ORDER][DEEPVQE_FREQ_TAPS][2])p->taps,
@@ -770,16 +720,9 @@ int deepvqe_prepost_frame_commit(DeepVqePrepost *p) {
 int deepvqe_prepost_frame_skip(DeepVqePrepost *p) {
     const size_t bins = (size_t)AIAEC_N_BINS * sizeof(float);
     if (!p || !p->frame_open) return -1;
-    /* FAIL CLOSED. DeepVQE-S's stream 0 is the RAW MICROPHONE, so the
-     * pass-through identity a post-filter can take would emit the full
-     * uncancelled echo -- see deepvqe_prepost.h. Silence instead: bounded,
-     * audible as a one-frame notch, and never echo.
-     *
-     * The CCM ring is not pushed, and the state tensors are left exactly as
-     * the accelerator wrote them: a runtime that reports failure did not
-     * write, so there is nothing to undo. The armed transaction is simply not
-     * committed; the next frame_inputs() re-arms it and re-fills the head
-     * output with NaN. */
+    /* Fail closed: stream 0 is the raw microphone, so pass-through would emit the
+     * uncancelled echo (see deepvqe_prepost.h). Emit silence; the CCM ring is not
+     * pushed and the state stays as the accelerator left it. */
     memset(p->enh_re, 0, bins);
     memset(p->enh_im, 0, bins);
     pp_close_frame(p);
@@ -791,9 +734,8 @@ int deepvqe_prepost_post_process(DeepVqePrepost *p,
     if (!p || !out_hop) return -1;
     if (p->io_mode != DEEPVQE_IO_TIME) return -1;
     if (p->frame_open) return -1;   /* a frame is still awaiting the model */
-    /* Always a full, defined hop: out_hop is zero from init/reset and the
-     * synthesis only ever writes it wholesale, so the one warm-up frame that
-     * emits nothing hands over silence, never stale samples. */
+    /* Always a full defined hop: out_hop is zero from init/reset and written
+     * wholesale, so the warm-up frame yields silence. */
     memcpy(out_hop, p->out_hop, (size_t)AIAEC_HOP * sizeof(float));
     if (written) *written = p->written;
     return 0;

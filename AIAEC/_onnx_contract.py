@@ -1,14 +1,12 @@
 """ONNX contract checks for AIAEC's stateless streaming graphs.
 
-The validators are implemented once, in ``AINR/onnx_streaming_contract.py``,
-which is the module every exporter uses. ``AINR/`` is a sibling of ``AIAEC/``
-in a full checkout and in a standalone AIAEC copy alike.
-
-``validate_inplace_state_contract`` takes AIAEC's name lists instead of the
-shared module's ``state_handoff`` mapping. A window state is a history cut by
-one Slice over the time axis. Each window declares the end it drops: a
-time-ordered window drops ``'first'``, a newest-first K/V or attention ring
-drops ``'last'``; the other end is refused.
+The validators live in ``AINR/onnx_streaming_contract.py``, which every
+exporter uses (``AINR/`` is a sibling of ``AIAEC/`` in a full checkout and in a
+standalone AIAEC copy alike). ``validate_inplace_state_contract`` takes AIAEC's
+name lists instead of the shared ``state_handoff`` mapping: a window state is a
+history cut by one Slice over the time axis and declares the end it drops
+(``'first'`` for a time-ordered window, ``'last'`` for a newest-first K/V or
+attention ring); the other end is refused.
 """
 
 import os

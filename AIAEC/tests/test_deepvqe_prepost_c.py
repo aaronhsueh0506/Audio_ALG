@@ -1,59 +1,48 @@
 """Equivalence and contract gates for the DeepVQE-S pre/post class.
 
 ``DeepVQE_S/deepvqe_prepost.c`` owns no signal processing: it composes two
-already parity-tested translation units (``aiaec_process.c`` for the 16 kHz
-sqrt-Hann STFT/WOLA -- itself a thin wrapper over ``ulcnet_process.c`` -- and
-``DeepVQE_S/deepvqe_process.c`` for the CCM kernel) behind one object. So the
-gate that matters is not a tolerance against a Python reference -- the parity
-of the parts is covered elsewhere -- but that the class reproduces the
-hand-composed path SAMPLE FOR SAMPLE. Every numeric comparison here is
-therefore ``memcmp`` on fp32, never a tolerance: the class is allowed to
-reorder nothing. Every "identical" claim is paired with a "not trivially
-identical" one, so no gate can pass by both sides being silence.
+parity-tested translation units (``aiaec_process.c`` for the 16 kHz sqrt-Hann
+STFT/WOLA, a thin wrapper over ``ulcnet_process.c``, and
+``DeepVQE_S/deepvqe_process.c`` for the CCM kernel) behind one object, so the
+gate is that the class reproduces the hand-composed path SAMPLE FOR SAMPLE:
+every numeric comparison is ``memcmp`` on fp32, and every "identical" claim is
+paired with a "not trivially identical" one so no gate passes on silence.
 
-Cases, all in ONE driver selected by argv[1] so audiolib and the four
-model TUs are compiled once for the module:
+Cases, all in ONE driver selected by argv[1] (audiolib and the four model TUs
+are compiled once for the module):
 
   equiv      DEEPVQE_IO_TIME vs a rolling analysis + one hand-held in-place
-             state buffer set + deepvqe_ccm_process + a hand-built AcIstft,
-             wired up by hand from ONLY the composed TUs
+             state buffer set + deepvqe_ccm_process + a hand-built AcIstft
   freq       DEEPVQE_IO_FREQ driven by the caller's own transform vs IO_TIME
-  freqpool   the FREQ pool is smaller, and the stale-pool gate both accepts
-             the matching MemReq and refuses every mismatched one
+  freqpool   the FREQ pool is smaller; the stale-pool gate accepts the matching
+             MemReq and refuses every mismatched one
   lifecycle  _create/_destroy against _init on a caller pool
   reject     _get_mem_size / _init / the stage calls, reject-first
   reset      _reset really clears state (a re-run reproduces the first run)
-  skip       _frame_skip MUTES (fail-closed), leaves the state exactly as the
-             accelerator wrote it, and does not advance the CCM ring
-  inplace    one buffer per state tensor (input and output are the same
-             pointer, stable for the instance's life), only the head is
-             NaN-prefilled, and a non-finite write to the newest frame of
-             any state tensor zeroes all sixteen (mutation test) and leaves
-             the next frame healthy
-  guard      the three contract gates: no double pre_process, no commit
-             without frame_inputs, no re-commit after a refused one
-  newest     commit checks the newest frame of every window (slot 0 of a
-             ring, the last frame of a conv or score window) and h_gru whole;
-             a non-finite value in an older frame or in the frame a window
-             drops is not seen
+  skip       _frame_skip MUTES (fail-closed), leaves the state as the
+             accelerator wrote it and does not advance the CCM ring
+  inplace    one buffer per state tensor (input and output are the same pointer,
+             stable for the instance's life), only the head NaN-prefilled, and a
+             non-finite write to the newest frame of any state tensor zeroes all
+             sixteen and leaves the next frame healthy
+  guard      no double pre_process, no commit without frame_inputs, no re-commit
+             after a refused one
+  newest     commit checks the newest frame of every window and h_gru whole; a
+             non-finite value in an older or dropped frame is not seen
   generation state_generation starts at 0 and advances on reset and on a
              refused commit, and on nothing else
-  boundary   the explicit state boundary -- names, shapes (all rank 4),
-             element counts, and the descriptor validator's 12 refusable
-             fields
-  descriptor a shape/validate dump driven from argv, so the Python side can
-             feed it a descriptor MEASURED from the built graph
+  boundary   state names, shapes (all rank 4), element counts and the descriptor
+             validator's 12 refusable fields
+  descriptor a shape/validate dump driven from argv, so the Python side can feed
+             it a descriptor MEASURED from the built graph
 
-The accelerator stand-in is deterministic and input-dependent -- it sums both
-signal inputs and all sixteen state tensors, and writes its next state back in
-place -- so a state handoff that failed to happen, or happened when it should
-not have, diverges rather than agrees. The class never shifts a window: the
-graph does, so the stand-in only has to write every element.
+The accelerator stand-in is deterministic and input-dependent (it sums both
+signal inputs and all sixteen state tensors and writes its next state back in
+place), so a state handoff that failed to happen diverges rather than agrees.
 
-THE SKIP POLICY IS DELIBERATE. DeepVQE-S's stream 0 is the RAW microphone,
-not a residual, so the pass-through identity a post-filter takes would emit
-the full uncancelled echo. ``deepvqe_prepost_frame_skip`` therefore emits
-SILENCE, and this suite asserts the mute rather than a pass-through.
+THE SKIP POLICY IS DELIBERATE: stream 0 is the RAW microphone, not a residual,
+so a pass-through would emit the full uncancelled echo; ``frame_skip`` emits
+SILENCE and this suite asserts the mute.
 """
 
 import json
@@ -1945,9 +1934,7 @@ def test_time_mode_matches_the_hand_composed_path(driver):
     in-place state buffer set, deepvqe_ccm_process and a hand-built AcIstft
     wired up from ONLY the composed TUs -- byte-identical over 400 hops, with
     `written` following the synthesis half-window schedule (0, then one full
-    hop).
-    This is the gate that folding the composition into an object changed
-    nothing at all."""
+    hop)."""
     assert 'io_mode=TIME' in _run(driver, 'equiv')
 
 

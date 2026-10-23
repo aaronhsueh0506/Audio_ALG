@@ -6,19 +6,11 @@
 #include <stdlib.h>
 #include <string.h>
 
-/* Delay depth D for THIS standalone smoke example only.
- *
- * D is a runtime descriptor field, not a library constant: the C chain serves
- * whatever depth the attached model publishes. This macro is only the example
- * binary's compile-time default, overridable with
- * -DULCNET_EXAMPLE_DELAY_FRAMES=N at build time. It is NOT a switch the built
- * binary can flip -- changing D means rebuilding.
- *
- * It MUST equal the D the model in use was exported with. Nothing checks that
- * for you: the descriptor validator only bounds-checks the range, so a
- * mismatch between this value and the graph is silent and corrupting (see
- * ulcnet_process.h's I/O contract). The shipped checkpoints are not all D=8;
- * set this to match the model you are actually running. */
+/* Delay depth D for this smoke example only. D is a runtime descriptor field; this
+ * macro is the example's compile-time default (override with
+ * -DULCNET_EXAMPLE_DELAY_FRAMES=N). It must equal the D the model was exported
+ * with: the descriptor validator only bounds-checks the range, so a mismatch is
+ * silent. The shipped checkpoints are not all D=8. */
 #ifndef ULCNET_EXAMPLE_DELAY_FRAMES
 #define ULCNET_EXAMPLE_DELAY_FRAMES 8
 #endif
@@ -26,34 +18,9 @@ _Static_assert(ULCNET_EXAMPLE_DELAY_FRAMES >= ULCNET_MODEL_IO_MIN_D &&
                ULCNET_EXAMPLE_DELAY_FRAMES <= ULCNET_MODEL_IO_MAX_D,
                "ULCNET_EXAMPLE_DELAY_FRAMES outside the descriptor's range");
 
-/* The delay profile is a product deployment decision, not a property of this
- * source file: `n` (matched-filter bank size) sets how far the estimator can
- * search for the bulk far-to-mic delay, and it has to be chosen from the
- * measured delay distribution of the SKU/route this binary is deployed on.
- * It is therefore read from the command line here -- the same
- * --delay-mode / --delay-num-filters / --fixed-delay spelling lib/aec's
- * aec_wav example uses -- and the resolved profile is printed, so a board
- * bring-up run states which profile it actually ran instead of leaving it
- * buried in a literal. Changing n means re-querying the pool and re-init;
- * there is no runtime setter.
- *
- * Reliable bulk-delay search range per bank (lib/aec's contract value, not a
- * geometric span): n=1 ~125 ms, 2 ~221 ms, 3 ~317 ms, 4 ~413 ms, 5 ~509 ms.
- *
- * lib/aec's DA_NUM_FILTERS is both the bank-size cap and the exact value the
- * non-MATCHED modes require -- aec_validate_config() rejects any other n once
- * the mode is not MATCHED -- so it is used for both roles below. The MATCHED
- * default is a separate decision; see ULCNET_EXAMPLE_DELAY_NUM_FILTERS. */
+/* Delay profile is a deployment decision: `n` (matched-filter bank size) sets the bulk-delay search range and comes from the command line (--delay-mode / --delay-num-filters / --fixed-delay, as lib/aec's aec_wav); the resolved profile is printed. Reliable range per bank: n=1 ~125 ms, 2 ~221 ms, 3 ~317 ms, 4 ~413 ms, 5 ~509 ms. DA_NUM_FILTERS is the bank-size cap and the value non-MATCHED modes require. */
 
-/* MATCHED bank size n for THIS standalone smoke example only, overridable with
- * -DULCNET_EXAMPLE_DELAY_NUM_FILTERS=N so a per-SKU build can bake in its
- * measured delay profile instead of passing the flag on every run.
- *
- * It is only the DEFAULT: --delay-num-filters still wins. It applies to
- * MATCHED alone, because the other two modes build no bank and lib/aec
- * requires DA_NUM_FILTERS there. Like D, it is NOT a switch the built binary
- * can flip -- n sizes the matched bank, so changing it means a rebuild, a
- * fresh pool query and a re-init. */
+/* MATCHED bank size n for this example, overridable with -DULCNET_EXAMPLE_DELAY_NUM_FILTERS=N; --delay-num-filters wins. MATCHED only; changing it needs a rebuild and a fresh pool query. */
 #ifndef ULCNET_EXAMPLE_DELAY_NUM_FILTERS
 #define ULCNET_EXAMPLE_DELAY_NUM_FILTERS DA_NUM_FILTERS
 #endif
@@ -98,9 +65,8 @@ static const char* delay_mode_name(AecDelayMode m) {
     }
 }
 
-/* Returns 0 on success, 1 on --help, 2 on a rejected profile. Every rejection
- * names BOTH the requested value and what this build accepts, because the
- * pipeline TU itself is stdio-free and can only answer with a NULL handle. */
+/* Returns 0 on success, 1 on --help, 2 on a rejected profile. A rejection names the
+ * requested value and what this build accepts. */
 static int parse_delay_profile(int argc, char** argv, DelayProfile* out) {
     int have_num_filters = 0;
     int have_fixed = 0;
@@ -135,9 +101,8 @@ static int parse_delay_profile(int argc, char** argv, DelayProfile* out) {
         }
     }
 
-    /* n is meaningful only where a matched bank exists. 0 is NOT "disabled" --
-     * FIXED and EXTERNAL_ALIGNED are separate modes, and both require
-     * n == DA_NUM_FILTERS because they build no bank at all. */
+    /* n applies only to MATCHED; FIXED and EXTERNAL_ALIGNED require n == DA_NUM_FILTERS
+     * (no bank is built). */
     if (have_fixed && out->mode != AEC_DELAY_FIXED) {
         fprintf(stderr,
                 "mono_alignulcnet: --fixed-delay %d is only valid with "
@@ -172,29 +137,25 @@ static int parse_delay_profile(int argc, char** argv, DelayProfile* out) {
                     DA_NUM_FILTERS);
             return 2;
         }
-        /* The build-time default is a matched-bank knob, so it does not carry
-         * into a mode that has no bank: the caller asked for the mode, not for
-         * n, and lib/aec would reject the pair. */
         out->num_filters = DA_NUM_FILTERS;
     }
     return 0;
 }
 
-/* Replace this body with the board runtime call. `inputs` holds the spectra
- * and the four state tensors (key_history, value_history, logit_history,
- * h_gru). Bind each *_out of the graph to the address of the input of the
- * same name (the pointers in `outputs`), write `outputs->output`, and return
- * 0, or -1 when the run failed. The graph shifts every window itself; the
- * runtime must read every state input before writing any state output. When
- * the accelerator keeps fixed-point state, refill it with quantized zeros
- * whenever ulcnet_accelerator_adapter_state_generation() changes. */
+/* Replace with the board runtime call. `inputs` holds the spectra and the four state
+ * tensors (key_history, value_history, logit_history, h_gru). Bind each *_out of
+ * the graph to the address of the input of the same name (the pointers in
+ * `outputs`), write `outputs->output`, and return 0, or -1 when the run failed.
+ * The graph shifts every window itself; read every state input before writing any
+ * state output. When the accelerator keeps fixed-point state, refill it with
+ * quantized zeros whenever ulcnet_accelerator_adapter_state_generation() changes. */
 static int run_accelerator(void *user,
                            const UlcnetModelIoInputs *inputs,
                            UlcnetModelIoOutputs *outputs) {
     (void)user;
     (void)inputs;
     (void)outputs;
-    return -1; /* TODO(board): invoke the stateless ONNX accelerator. */
+    return -1; /* BOARD: invoke the stateless ONNX accelerator. */
 }
 
 int main(int argc, char** argv) {
@@ -222,10 +183,8 @@ int main(int argc, char** argv) {
     cfg.delay_num_filters = profile.num_filters;
     cfg.fixed_delay_samples = profile.fixed_samples;
 
-    /* Print the RESOLVED profile with the pool the SAME config actually
-     * costs -- query and init must agree on one (sample_rate, hop, n). The
-     * query reads only the grid and delay fields, so it runs before anything
-     * is allocated and the reject path has nothing to clean up. */
+    /* Print the resolved profile with the pool the same config costs; query and init
+     * must agree on one (sample_rate, hop, n). */
     if (audio_pipeline_ulcnet_get_mem_requirements(&cfg, &req) != 0) {
         fprintf(stderr,
                 "mono_alignulcnet: pool query rejected the delay profile "
@@ -240,8 +199,7 @@ int main(int argc, char** argv) {
            profile.fixed_samples, (unsigned long long)req.bytes,
            (unsigned long)req.alignment);
 
-    /* The board loads this descriptor from the exported model metadata;
-     * see ULCNET_EXAMPLE_DELAY_FRAMES at the top of this file. */
+    /* The board loads this descriptor from the exported model metadata. */
     if (ulcnet_model_io_descriptor_default(
             ULCNET_EXAMPLE_DELAY_FRAMES, &model_descriptor) != 0 ||
         ulcnet_accelerator_adapter_get_mem_size(
@@ -270,7 +228,7 @@ int main(int argc, char** argv) {
         return 1;
     }
 
-    /* Host smoke path. A product calls process() once per ULCNET_HOP-sample hop. */
+    /* Host smoke path: a product calls process() once per ULCNET_HOP-sample hop. */
     for (hop = 0; hop < 4; ++hop) {
         if (audio_pipeline_ulcnet_process(pipeline, mic, far, output) != 0) {
             audio_pipeline_ulcnet_destroy(pipeline);

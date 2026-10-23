@@ -47,7 +47,7 @@ th{background:#f5efe8}
 <h2>API 用法</h2>
 <pre>AudioPipelineUlcnetConfig cfg = audio_pipeline_ulcnet_default_config(ULCNET_SR);
 /* fft_size=0→ULCNET_N_FFT, aec_preset=BALANCED, model=all-zero(identity);
- * production far branch 固定讀 AEC aligned-far seam */
+ * production far branch 固定讀 caller 的 raw far */
 
 /* 推薦路徑:用 accelerator adapter 包一個無狀態 run() callback(main.c 範例) */
 UlcnetModelIoDescriptor descriptor;
@@ -58,7 +58,7 @@ void* adapter_pool = platform_alloc(adapter_bytes, adapter_align);
 UlcnetAcceleratorAdapter* adapter = ulcnet_accelerator_adapter_init(
     adapter_pool, adapter_bytes, &amp;descriptor,
     board_run_stateless_tensor_invocation, NULL);
-cfg.model = ulcnet_accelerator_adapter_model(adapter);   /* 帶 aligned-far descriptor */
+cfg.model = ulcnet_accelerator_adapter_model(adapter);   /* 帶 raw-far descriptor */
 
 AudioPipelineUlcnetMemReq req;
 audio_pipeline_ulcnet_get_mem_requirements(&amp;cfg, &amp;req);  /* raw descriptor 會 reject */
@@ -78,16 +78,16 @@ if (audio_pipeline_ulcnet_nn_begin(p, &amp;job) &gt; 0) {         /* 1 = 有一�
 }
 audio_pipeline_ulcnet_process_end(p, out);                 /* WOLA,剛好一個 hop */</pre>
 <p><code>process()</code> 就是這個序列加上 <code>cfg.model</code> 的回呼;<code>nn_begin</code> 回 1、0 或 -1(序列錯誤),開著沒取走或沒關閉的幀走 identity(fail-open)。mono 變體每 hop 仍以 <code>aec_get_res_context()</code> 的 <code>formed_hop</code> 重新做 error 分析(不重用 AEC 的頻譜),所以兩路分析都在 <code>process_begin</code> 內。</p>
-<p class="note"><b>沒有執行期強度 setter,而且是刻意的。</b><code>pipeline_mono</code> 與 <code>pipeline_4ch</code> 都有 <code>set_aec_preset()</code> / <code>set_nr_mode()</code>,本 pipeline <b>兩個都不提供</b>——因為它沒有可以重新指定的強度面。這條 pipeline 完全沒有 NR 實例(<code>anr_*</code> 在本 TU 一次都沒出現);AEC 側以 <code>enable_res=0</code> / <code>return_res_context=1</code> / <code>spatial_linear_context=AEC_CONTEXT_LINEAR_ONLY</code> 建立:post 區塊在 AecState 更新後停止,<code>G_res</code>、R²、comfort noise 都不計算(<code>res_gain</code>/<code>r2</code>/<code>comfort_noise</code> 為 NULL),本 pipeline 只讀 <code>formed_hop</code> 與線性 context 的 aligned far、<code>delay_state</code>——塑形輸出的是 ULCNet 的 mask。所以「回音壓多深」在這裡是模型的性質,不是一個 runtime 旋鈕。<code>cfg.aec_preset</code> 仍是 init 時要填的欄位(須為定義內的 enum 值),但它只決定那個不執行的抑制器的地板。要改強度,請重新訓練/更換模型,或改用有 DSP 後級的 <code>pipeline_mono</code>。</p>
+<p class="note"><b>沒有執行期強度 setter,而且是刻意的。</b><code>pipeline_mono</code> 與 <code>pipeline_4ch</code> 都有 <code>set_aec_preset()</code> / <code>set_nr_mode()</code>,本 pipeline <b>兩個都不提供</b>——因為它沒有可以重新指定的強度面。這條 pipeline 完全沒有 NR 實例(<code>anr_*</code> 在本 TU 一次都沒出現);AEC 側以 <code>enable_res=0</code> / <code>return_res_context=1</code> / <code>spatial_linear_context=AEC_CONTEXT_LINEAR_ONLY</code> 建立:post 區塊在 AecState 更新後停止,<code>G_res</code>、R²、comfort noise 都不計算(<code>res_gain</code>/<code>r2</code>/<code>comfort_noise</code> 為 NULL),本 pipeline 只讀 <code>formed_hop</code> 與線性 context 的 <code>delay_state</code>(模型的 far 取 caller 的 raw <code>ref</code>)——塑形輸出的是 ULCNet 的 mask。所以「回音壓多深」在這裡是模型的性質,不是一個 runtime 旋鈕。<code>cfg.aec_preset</code> 仍是 init 時要填的欄位(須為定義內的 enum 值),但它只決定那個不執行的抑制器的地板。要改強度,請重新訓練/更換模型,或改用有 DSP 後級的 <code>pipeline_mono</code>。</p>
 <p class="note"><b>模型 error 分支不保證每個 hop 都是誤差。</b>context-only(<code>enable_res=0</code> / <code>return_res_context=1</code>)是 <code>lib/aec</code> 唯一開放 formed capture 候選的模式:上一個 hop 的濾波品質判定尚未認可線性估計、且被選中的殘差在這個 hop 的能量大於同一 hop 的 mic capture 時,<code>formed_hop</code> 與 <code>error_spec</code> 一起改送 capture 本身(時域與頻譜同步切換,既有 30-sample crossfade 承接邊界)。所以「濾波器在加訊號」的 hop 上模型看到的是 mic 原樣;<code>AIAEC/dataset_gen/linear_aec.py</code> 產生訓練用 linear error 時走的是同一組設定。</p>
 
-<h3>固定 aligned-far 部署契約</h3>
-<p>production 沒有 raw/aligned runtime switch。模型固定讀 <code>AecLinearContext.aligned_far_hop</code>：MATCHED/FIXED 尚未能提供對齊資料時，這個 seam 暫時承載 raw far，模型仍 infer 並套用成功且 finite 的輸出；取得對齊後，同一 seam 改承載 PBFDKF 實際消費的 aligned far。切換 hop 會先 reset 外部 K/V、logit 與 GRU state。raw/aligned 比較只保留在 <code>sweep_delay_depth.py</code>。export 的 <code>training_far_input_mode</code> 是 checkpoint provenance；<code>far_input_mode=aligned_far</code> 才是部署 ABI。C descriptor 只接受 ALIGNED，raw descriptor 在 init/set_model 被拒；<code>io_descriptor==NULL</code> 僅供 identity 或尚未發布 descriptor 的 callback。</p>
+<h3>固定 raw-far 部署契約</h3>
+<p>production 沒有 raw/aligned runtime switch。模型固定讀 caller 傳入的 raw <code>ref</code>；PBFDKF 的 aligned 副本只用來形成 linear error，對齊由模型的 TA block 負責。取得對齊(或 delay 變動)的 hop 會先 reset 外部 K/V、logit 與 GRU state。raw/aligned 比較只保留在 <code>sweep_delay_depth.py</code>。export 的 <code>training_far_input_mode</code> 是 checkpoint provenance，<code>far_input_mode=raw_far</code> 是部署 ABI，兩者必須相同。C descriptor 只接受 <code>ULCNET_FAR_RAW</code>，其他值的 descriptor 在 init/set_model 被拒；<code>io_descriptor==NULL</code> 只允許 all-zero 的 identity model。</p>
 <h3>UlcnetModel callback 契約(step-always,唯一例外 = reprime)</h3>
 <ul>
 <li><b>Fail-open identity</b>:<code>infer==NULL</code>(all-zero model)、<code>infer()</code> 回非 0、或輸出幀含任何非有限值(<code>ulcnet_frame_is_finite()</code> 逐 bin isfinite)→ 該幀改走誤差頻譜原樣;NaN/Inf 永不進 WOLA。STFT/WOLA 時序不因模型存在與否改變。</li>
 <li><b>Step-always</b>:只要裝了 infer callback,每個發射幀都呼叫 infer；delay lock 不閘控模型。唯一例外是下面的 identity reprime(每個 alignment generation 少 1 幀推論——compute 只會少,不會加倍)。</li>
-<li><b>Delay 事件</b>:MATCHED 的 <code>AEC_LINEAR_DELAY_CHANGED</code>，以及 FIXED 首次 <code>UNLOCKED→LOCKED</code>，都先呼叫 <code>model-&gt;reset</code> 清除 raw-far 時期的 recurrent state，並武裝 identity reprime。</li>
+<li><b>Delay 事件</b>:MATCHED 的 <code>AEC_LINEAR_DELAY_CHANGED</code>，以及 FIXED 首次 <code>UNLOCKED→LOCKED</code>，都先呼叫 <code>model-&gt;reset</code> 清除 recurrent state，並武裝 identity reprime。</li>
 </ul>
 
 <h3>Identity reprime(alignment 邊界,option A)</h3>
@@ -135,7 +135,7 @@ out             全零 256          hop#0 內容            hop p-1 內容
 <table>
 <tr><th>張量</th><th>shape</th><th>dtype</th><th>每次呼叫幀數</th><th>時域樣本</th></tr>
 <tr><td><code>mic</code>(in)</td><td>[ULCNET_HOP]</td><td>float32</td><td>1 hop</td><td>256(16 kHz)或512(48 kHz)</td></tr>
-<tr><td><code>ref</code>(in)</td><td>[ULCNET_HOP]</td><td>float32</td><td>1 hop</td><td>AEC seam 在未取得 alignment 前傳遞 raw far</td></tr>
+<tr><td><code>ref</code>(in)</td><td>[ULCNET_HOP]</td><td>float32</td><td>1 hop</td><td>caller 的 raw far,模型 far 分支直接使用</td></tr>
 <tr><td><code>out</code>(out)</td><td>[ULCNET_HOP]</td><td>float32</td><td>1 hop(全覆寫)</td><td>同 input hop</td></tr>
 <tr><td><code>err_re/err_im</code>(infer in)</td><td>各 [ULCNET_BINS]</td><td>float32</td><td>1 幀/hop(自 hop#0 起)</td><td>分析窗 ULCNET_N_FFT(rolling,對最近 N_FFT 樣本 transform)</td></tr>
 <tr><td><code>far_re/far_im</code>(infer in)</td><td>各 [ULCNET_BINS]</td><td>float32</td><td>與 err 同步</td><td>同上</td></tr>
@@ -144,7 +144,7 @@ out             全零 256          hop#0 內容            hop p-1 內容
 <p>infer 介面以 <code>ULCNET_BINS</code> 為每個 RI array 的長度；回 0=成功。不要把 16 kHz 的 257 寫死在板端 callback。</p>
 
 <h2>State 表</h2>
-<p>Carve 順序(layout v15;pool 大小、carve 順序或 descriptor 內容任一改變,該模組的版本加一):self 控制塊(delay-transition bookkeeping、reprime 計數器、共用視窗表與幀 scratch)→ AEC pool → 共用 compiled-grid <code>FftHandle</code> → 兩個分析 <code>AcStft</code> → 合成 <code>AcIstft</code>(三者借用該 handle 與視窗表)。build hash 含 sample rate 與 FFT size，16/48 kHz descriptor 不可互用。幀 scratch 為 1 幀;kiss 後端移除前的 n=5 build 現查:16 kHz 為 560,080 B,48 kHz 為 1,276,704 B(<code>mono_alignulcnet</code> 執行檔的 banner;現行只有 ne10,總量不同,以自己 build 的 banner 為準)。控制塊另有 phased API 的相位與 job 狀態(<code>phase</code>、<code>nn_wanted</code>、<code>nn_accepted</code>)。<b>換 grid/backend/編譯選項/submodule 都必須以 <code>audio_pipeline_ulcnet_get_mem_requirements()</code> 現查並重新 init。</b></p>
+<p>Carve 順序(layout v15;pool 大小、carve 順序或 descriptor 內容任一改變,該模組的版本加一):self 控制塊(delay-transition bookkeeping、reprime 計數器、共用視窗表與幀 scratch)→ AEC pool → 共用 compiled-grid <code>FftHandle</code> → 兩個分析 <code>AcStft</code> → 合成 <code>AcIstft</code>(三者借用該 handle 與視窗表)。build hash 含 sample rate 與 FFT size，16/48 kHz descriptor 不可互用。幀 scratch 為 1 幀;n=5 build:16 kHz 為 568,128 B,48 kHz 為 1,308,336 B(<code>mono_alignulcnet</code> 執行檔的 banner;以自己 build 的 banner 為準)。控制塊另有 phased API 的相位與 job 狀態(<code>phase</code>、<code>nn_wanted</code>、<code>nn_accepted</code>)。<b>換 grid/backend/編譯選項/submodule 都必須以 <code>audio_pipeline_ulcnet_get_mem_requirements()</code> 現查並重新 init。</b></p>
 <table>
 <tr><th>state</th><th>shape / size</th><th>存放者</th><th>備註</th></tr>
 <tr><td><code>Aec</code> 全狀態</td><td>compiled-grid pool 內</td><td>pool(C struct)</td><td><code>enable_res=0 / return_res_context=1 / spatial_linear_context=AEC_CONTEXT_LINEAR_ONLY</code>(只留線性半邊,線性輸出與完整 context 逐位元相同,省約 11–14 % 的 AEC 時間);delay estimation 開</td></tr>
@@ -155,14 +155,14 @@ out             全零 256          hop#0 內容            hop p-1 內容
 <tr><td>幀 scratch</td><td>約6 KB(16 kHz)或12 KB(48 kHz)</td><td>C struct(self)</td><td>err/far 各 1 幀 + model 輸出 1 幀,每 hop 用量</td></tr>
 <tr><td><code>model</code>(by value)+delay transition+<code>reprime_frames</code></td><td>純量級</td><td>C struct(self)</td><td>model 指標指向物由 caller 保活;<code>reprime_frames</code> 在 alignment 邊界武裝為 <code>AUDIO_PIPELINE_ULCNET_REPRIME_FRAMES</code>=1,每發射一幀遞減</td></tr>
 <tr><td>NN 顯式 states(far K/V history、logit history、GRU h)</td><td>依 export D 與 grid;D=8 參考值 75,280 B(16 kHz)/142,864 B(48 kHz)</td><td><b>host/CPU 端獨立 pool</b>(參考實作 <code>ulcnet_model_io.c</code>;真正的矩陣運算在 NPU,但 state 本身活在 CPU RAM,經 <code>UlcnetModelIoInputs/Outputs</code> 每幀交給加速器)</td><td>不在 audio pipeline pool 內;pipeline 只透過 <code>model.reset</code> 要求 flush(對應 <code>ulcnet_model_io_reset()</code>)</td></tr>
-<tr><td>合計 pool</td><td>runtime sizing；kiss 後端移除前 n=5 現查:16 kHz 560,080 B、48 kHz 1,276,704 B(n=1 的 16 kHz 為 537,168 B)；現行只有 ne10,總量不同</td><td>host 擁有 pool 記憶體</td><td>init→destroy 零 heap(create() 除外)</td></tr>
+<tr><td>合計 pool</td><td>runtime sizing；n=5 現查:16 kHz 568,128 B、48 kHz 1,308,336 B(n=1 的 16 kHz 為 545,216 B)；以自己 build 的 banner 為準</td><td>host 擁有 pool 記憶體</td><td>init→destroy 零 heap(create() 除外)</td></tr>
 </table>
 
 <h2>延遲與 warm-up</h2>
 <ul>
 <li>端到端演算法延遲 = <b>1 compiled-grid hop</b>:16 kHz 為256 samples/16 ms，48 kHz 為512 samples/10.67 ms。延遲來源是 <b>synthesis 的半窗 trim</b>,不是 analysis 排程(rolling push 從 hop#0 起就吐幀)。</li>
 <li>warm-up:hop#0 就推入 1 幀並跑 1 次推論(history 全零),但 synthesis 的第一幀吃在半窗 trim 內,輸出仍全零;hop#1 起每 hop 正常輸出 256(16 kHz)/512(48 kHz)樣本。identity E2E 測試:out[hop p] ≈ formed_history[p-1](2e-4 內),hop 0 精確為零。</li>
-<li>AEC delay acquisition 前 seam 傳 raw far；模型從第一個發射幀就執行並套用。取得 alignment 時 reset recurrent state，之後 seam 傳 aligned far;邊界後 1 幀走 identity reprime(不 step 模型),第 2 幀起恢復 step+apply。</li>
+<li>模型從第一個發射幀就執行並套用(far 恆為 caller 的 raw far)。取得 alignment(或 delay 變動)時 reset recurrent state;邊界後 1 幀走 identity reprime(不 step 模型),第 2 幀起恢復 step+apply。</li>
 <li>reset:<code>audio_pipeline_ulcnet_reset()</code> 重置 AEC/兩路 analysis/synthesis 並呼叫 <code>model-&gt;reset</code>;timing 前導(hop#0 零輸出)重新開始。</li>
 </ul>
 <p class="note"><b>短延遲注意</b>:echo path 落在線性濾波器涵蓋範圍內時，matched estimator 可能因 already-cancelling 保護而維持 UNLOCKED。這不會停用模型；模型繼續看到 raw far，能否解掉偏移取決於 export-time D。</p>
@@ -175,13 +175,13 @@ out             全零 256          hop#0 內容            hop p-1 內容
 <tr><td><code>AIAEC/Align_ULCNet/ulcnet_accelerator_adapter.h / .c</code></td><td>accelerator adapter(無狀態 run() callback 包裝,見上方專節);內部驅動 <code>ulcnet_prepost</code> 的 <code>ULCNET_IO_FREQ</code> 實例</td></tr>
 <tr><td><code>AIAEC/Align_ULCNet/ulcnet_prepost.h / .c</code></td><td>ULCNet 前後處理 class:<code>_config_defaults</code>/<code>_get_mem_size</code>/<code>_init_ex</code>(32-byte MemReq stale-pool gate)/<code>_reset</code> + 每幀 <code>_pre_process[_freq]</code> → <code>_frame_inputs</code> → accelerator → <code>_frame_commit</code>|<code>_frame_skip</code> → <code>_post_process[_freq]</code>;<code>ULCNET_IO_TIME</code> 由 class 跑 framing(用呼叫端的 <code>FftHandle</code> 與窗表),<code>ULCNET_IO_FREQ</code> 頻譜進出、不做轉換</td></tr>
 <tr><td><code>AIAEC/Align_ULCNet/ulcnet_model_io.h / .c</code></td><td>CPU 端 K/V / logit window / GRU hidden 四個 state(就地綁定;commit 驗證後做 mask 乘法與逆冪、不更新 state),內建固定前後端(signed-pow 特徵/mask 乘法/逆冪);Python parity:<code>AIAEC/tests/test_ulcnet_model_io_c.py</code></td></tr>
-<tr><td><code>AIAEC/Align_ULCNet/export_onnx.py</code></td><td>stateless one-frame ONNX 匯出(<code>STATE_LAYOUT_VERSION=18</code>);分別寫入 training provenance 與固定 aligned-far deployment metadata</td></tr>
-<tr><td><code>pipelines/mono_alignulcnet/tests/test_audio_pipeline_ulcnet.c</code></td><td>identity E2E、continuous stepping(除 reprime)、phased 序列(begin／nn／end 對 process 逐位元相同,含失敗模型、未取走的 job、序列錯誤)、MATCHED 同值重鎖 reset、FIXED raw→aligned 首次切換 reset、identity-reprime straddle 推導(脈衝標記/無邊界對照跑;<b>far 路是推導、error 路只是上界</b>——error 標記先過 AEC 濾波器,量到的含因果尾音)與 reprime 行為(MATCHED + FIXED)、config/pool/descriptor、create-vs-init parity、pre-acquisition far timestamp、UNLOCKED 仍套用、NaN/Inf、partial-write 與 known-delay n=1..5 coverage/mislock/cost</td></tr>
-<tr><td><code>AIAEC/tests/test_ulcnet_accelerator_adapter.c</code></td><td>accelerator adapter 獨立測試:raw/未定義 descriptor reject、aligned descriptor 發布、partial-write/失敗 run 不推進 state、成功 run 才推進</td></tr>
+<tr><td><code>AIAEC/Align_ULCNet/export_onnx.py</code></td><td>stateless one-frame ONNX 匯出(<code>STATE_LAYOUT_VERSION=18</code>);分別寫入 training provenance 與 deployment metadata(皆為 raw_far)</td></tr>
+<tr><td><code>pipelines/mono_alignulcnet/tests/test_audio_pipeline_ulcnet.c</code></td><td>identity E2E、continuous stepping(除 reprime)、phased 序列(begin／nn／end 對 process 逐位元相同,含失敗模型、未取走的 job、序列錯誤)、MATCHED 同值重鎖 reset、FIXED 首次 UNLOCKED→LOCKED reset、identity-reprime straddle 推導(脈衝標記/無邊界對照跑;<b>far 路是推導、error 路只是上界</b>——error 標記先過 AEC 濾波器,量到的含因果尾音)與 reprime 行為(MATCHED + FIXED)、config/pool/descriptor、create-vs-init parity、pre-acquisition far timestamp、UNLOCKED 仍套用、NaN/Inf、partial-write 與 known-delay n=1..5 coverage/mislock/cost</td></tr>
+<tr><td><code>AIAEC/tests/test_ulcnet_accelerator_adapter.c</code></td><td>accelerator adapter 獨立測試:aligned／未定義 descriptor reject、raw descriptor 發布、partial-write/失敗 run 不推進 state、成功 run 才推進</td></tr>
 <tr><td><code>AIAEC/tests/test_ulcnet_prepost_c.py</code></td><td>class 的 10 個測試函式:對「手工組合 <code>ulcnet_process</code> + <code>ulcnet_model_io</code>」的路徑逐 byte(memcmp)同一,兩種 io_mode 皆驗</td></tr>
 <tr><td><code>pipelines/mono_alignulcnet/main.c</code></td><td>板端 adapter 參考骨架(fail-open,accelerator run() 回 -1 佔位);收 <code>--delay-mode/--delay-num-filters/--fixed-delay</code> 並打印 resolved profile 與該 config 的 pool bytes</td></tr>
-<tr><td><code>pipelines/Makefile</code></td><td>ULCNet 應用直接連結 <code>audio_pipeline_ulcnet.o</code>、模型前後處理與共用 AEC/FFT libraries，不再額外包裝一層應用專用 archive；targets:<code>mono_alignulcnet</code>、<code>test_audio_pipeline_ulcnet</code>、<code>test_ulcnet_accelerator_adapter</code>;grid 用 <code>make ULCNET_GRID=16k|48k</code> 選(只套到 ULCNet TU 並進 <code>CFG_SIG</code>),<code>make test-grids</code> 一次測兩個 grid</td></tr>
+<tr><td><code>pipelines/Makefile</code></td><td>ULCNet 應用直接連結 <code>audio_pipeline_ulcnet.o</code>、模型前後處理與共用 AEC/FFT libraries，不另外包裝應用專用 archive；targets:<code>mono_alignulcnet</code>、<code>test_audio_pipeline_ulcnet</code>、<code>test_ulcnet_accelerator_adapter</code>;grid 用 <code>make ULCNET_GRID=16k|48k</code> 選(只套到 ULCNet TU 並進 <code>CFG_SIG</code>),<code>make test-grids</code> 一次測兩個 grid</td></tr>
 </table>
-<p>測試：<code>mono_alignulcnet/ make test</code> 執行完整 C suite、accelerator adapter 與 n=5/n=1 兩個板端 profile；包含 MATCHED acquisition/relock、FIXED 首次可用 reset、UNLOCKED model application 與 known-delay n=1..5。kiss 後端移除前的現查(16 kHz 與 48 kHz build 各跑一次):<b>各 162 個 <code>PASS:</code> 標記 / 0 FAIL</b>(含 <code>test_phased_hop</code>),結尾印 <code>ALL PASS</code>,另有 <code>ulcnet_accelerator_adapter: PASS</code> 與 <code>fail-open board skeleton PASS</code>。far[2085]→out[2341](16 kHz,+1 hop, offset +0, peak 1.0000);far[4133]→out[4645](48 kHz,同 offset)。reprime 推導實測(16 kHz):ERROR/FAR 兩路各 1 個跨界幀(marked peak 0.7072/0.7071 vs unmarked 1.257e-02/0.000e+00),邊界後第一個模型可見幀在 hop 9 且兩路皆無切換前樣本。48 kHz:FAR 路 1、ERROR 路 2(AEC 濾波器尾音,不是 straddle)。</p>
+<p>測試：<code>mono_alignulcnet/ make test</code> 執行完整 C suite、accelerator adapter 與 n=5/n=1 兩個板端 profile；包含 MATCHED acquisition/relock、FIXED 首次可用 reset、UNLOCKED model application 與 known-delay n=1..5。結尾印 <code>ALL PASS</code>,另有 <code>ulcnet_accelerator_adapter: PASS</code> 與 <code>fail-open board skeleton PASS</code>。reprime 推導:16 kHz 的 ERROR/FAR 兩路各 1 個跨界幀;48 kHz:FAR 路 1、ERROR 路 2(AEC 濾波器尾音,不是 straddle)。</p>
 </body>
 </html>

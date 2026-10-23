@@ -1,78 +1,21 @@
 #!/bin/sh
-# run_makefile_build_safety_test.sh - Makefile build-safety test for
-# ../Makefile (this component has no build dependency on sibling projects --
-# these are RNNoise-ERB's OWN Makefile mechanics, matching the pattern of the
-# sibling C-library Makefiles). It checks:
-#
-# 1. `make -e` FP_POLICY origin-check ordering: the bare `FP_POLICY :=
-#    -ffp-contract=off` literal is defined BEFORE the "Command-line override
-#    rejection" $(foreach) that checks $(origin FP_POLICY) -- GNU Make only
-#    flips a variable's origin from plain "environment" to "environment
-#    override" at the point THAT SAME-NAME assignment is actually parsed (and,
-#    under `-e`, silently voids it in the environment's favor), so a check
-#    placed before the assignment can never observe the flipped state. `env
-#    FP_POLICY=-ffp-contract=fast make -e -n test-features` must be rejected,
-#    rather than printing a compile line carrying -ffp-contract=fast. The later
-#    `CFLAGS += $(FP_POLICY)` append (after conflict detection) is a separate
-#    step.
-#
-# 2. BUILD_DIR=/absolute/path execution path: the test-tables/test-features
-#    recipes invoke the built binary as `$(abspath $(BUILD_DIR))/binary_name`,
-#    correct whether BUILD_DIR is relative or already absolute. A
-#    `./$(BUILD_DIR)/binary` form would turn BUILD_DIR=/tmp/abs_test_dir into
-#    `.//tmp/abs_test_dir/binary` -- the leading component is `.`, not `/`, so
-#    the doubled slash collapses to a path RELATIVE to cwd
-#    (`./tmp/abs_test_dir/...`), not the absolute path the binary was actually
-#    built at, giving "No such file or directory" at real (non-dry-run)
-#    execution (`make -n` alone never surfaces this, since it only prints the
-#    recipe text without running it).
-#
-# 3. FP-policy allow-list: a quote/glob/tilde/redirect/process-substitution
-#    bypass of the plain -Ofast/-ffast-math/-ffp-contract= conflict checks must
-#    not reach a real shell. The Makefile has the same character-class
-#    ALLOW-list mechanism as the sibling C-library Makefiles (adapted for this
-#    file's simpler CFLAGS-only variable set): a Make-native single-quote
-#    rejection (protects the allow-list's own single-quote-embedded $(shell)
-#    call), then a `grep -E` allow-list over [A-Za-z0-9_./=,+ -], with the
-#    specific disallowed character(s) named in the error.
-#
-# 4. -Ofast/-ffast-math/-ffp-contract= exact-token matching: the conflict check
-#    is $(filter -Ofast -ffast-math -ffp-contract=%,$(CFLAGS)) (same design as
-#    audiolib's Makefile's FP_CONFLICT_FLAGS), which splits on whitespace
-#    and matches each pattern against a WHOLE word only. A SUBSTRING match
-#    ($(findstring)) would reject a legitimate flag whose VALUE merely CONTAINS
-#    one of these substrings without BEING the flag -- e.g.
-#    EXTRA_CFLAGS=-DROUND9_NOTE=-Ofastness, a harmless macro definition --
-#    while a real bare -Ofast/-ffast-math/-ffp-contract=<x> token must still be
-#    caught. FP_CONFLICT_FLAGS has the same command-line/`-e`
-#    override-rejection guard as FP_ALLOWLIST_RC (without it, `make
-#    FP_CONFLICT_FLAGS= EXTRA_CFLAGS=-Ofast` would silently defeat the whole
-#    conflict check).
-#
-# Style/convention follows the repository's other C-library policy tests.
-#
-# Scratch-isolated throughout: this script rsync's the ENTIRE RNNoise-ERB
-# directory tree (Makefile + all .c/.h sources this Makefile depends on) into a
-# fresh mktemp scratch working copy at startup, cd's into THAT copy, and runs
-# every test case below -- default BUILD_DIR, relative BUILD_DIR, absolute
-# BUILD_DIR, and all the character-bypass cases -- only inside the scratch
-# copy. The real checkout this script was invoked from is never cd'd into for
-# any recipe invocation and has no file created, modified, or deleted by any
-# scenario below. `build/` is excluded from the copy on purpose: excluding it
-# forces every scratch run to genuinely (re)compile from source rather than
-# silently reusing a config.manifest/binary that happened to get copied over,
-# and it means there is no real build/<sig> directory in the checkout for this
-# script to land in even by accident. A single `rm -rf "$SCRATCH"` cleanup
-# covers the whole scratch tree (working copy included).
+# run_makefile_build_safety_test.sh - build-safety test for ../Makefile.
+# Checks:
+#   1. `make -e` origin check: FP_POLICY is assigned before the override check,
+#      so `env FP_POLICY=-ffp-contract=fast make -e -n test-features` is rejected.
+#   2. BUILD_DIR=/absolute/path: recipes run the binary via $(abspath $(BUILD_DIR)),
+#      so relative and absolute BUILD_DIR both work (a `./$(BUILD_DIR)/binary`
+#      form would resolve wrongly for an absolute path).
+#   3. FP-policy allow-list: quote/glob/tilde/redirect/process-substitution
+#      characters in EXTRA_CFLAGS are rejected, naming the offending character.
+#   4. Exact-token conflict check: a bare -Ofast / -ffast-math / -ffp-contract=<x>
+#      is rejected, a value that merely contains "-Ofast" is accepted, and the
+#      check variables cannot be overridden from the command line or by `-e`.
+# Every case runs in a scratch copy of the component (without build/); the
+# checkout is never modified.
 #
 # Usage: ./test/run_makefile_build_safety_test.sh
-#   (from anywhere; locates this component's root via the script's own
-#   location, no assumption about caller cwd -- but only to know what to
-#   rsync FROM; every actual test runs from the scratch copy)
-#
-# Exit code 0 + "run_makefile_build_safety_test: ALL PASS" means every case
-# behaved as expected. Nonzero + at least one "FAIL" line means a
-# regression.
+# Exit 0 with "run_makefile_build_safety_test: ALL PASS" means every case passed.
 
 set -u
 REPO_ROOT="$(cd "$(dirname "$0")/.." && pwd)"
@@ -90,12 +33,7 @@ FEATURE_VERSION="$(sed -n 's/^#define RNNOISE_FEATURE_VERSION[[:space:]]*"\([^"]
 }
 FEATURES_PASS_RE="^PASS: $FEATURE_VERSION matches independent reference"
 
-# Explicit template (same fix applied throughout the sibling repos' other
-# test/run_*.sh scripts): a bare `mktemp -d` with no template argument
-# ignores $TMPDIR on some hosts, silently defeating any caller that sets
-# TMPDIR to observe this script's scratch-dir lifecycle. Also deliberately
-# space-free (macOS default $TMPDIR is under /var/folders/..., no spaces)
-# even though this component's own real checkout path is not.
+# Explicit template: a bare `mktemp -d` ignores $TMPDIR on some hosts.
 SCRATCH="$(mktemp -d "${TMPDIR:-/tmp}/rnnoise-erb-makefile-safety.XXXXXX")" || {
     echo "FATAL: mktemp failed to create a scratch directory" >&2
     exit 1
@@ -113,10 +51,7 @@ trap 'exit 130' INT
 trap 'exit 143' TERM
 
 mkdir -p "$WORKDIR"
-# --exclude='/build': never copy the real checkout's build artifacts into
-# the scratch copy (see comment above -- forces a genuine fresh compile
-# every run and keeps the real build/ directory wholly irrelevant to this
-# script from this point on).
+# --exclude='/build': the scratch copy always compiles from source.
 if ! rsync -a --exclude='/build' "$REPO_ROOT/" "$WORKDIR/"; then
     echo "FATAL: rsync of $REPO_ROOT into scratch workdir $WORKDIR failed -- aborting before any test runs (real checkout untouched)" >&2
     exit 1
@@ -133,7 +68,7 @@ fail() { FAIL_COUNT=$((FAIL_COUNT + 1)); echo "  FAIL: $1"; }
 
 echo "=== Section 1: make -e FP_POLICY origin-check-ordering bug ==="
 
-# The repro for item 1. `-n` (dry run) is sufficient and side-effect-free: the
+# Case 1. `-n` (dry run) is sufficient and side-effect-free: the
 # origin-check foreach is parse-time Makefile text ($(error ...)), evaluated
 # before any recipe (even a dry-run-printed one) would run.
 LOG1="$SCRATCH/log_e_fp_policy"
@@ -174,8 +109,8 @@ fi
 
 echo "=== Section 2: BUILD_DIR=/absolute/path real (non-dry-run) execution ==="
 
-# The dry-run form of the item 2 repro, to confirm the recipe TEXT is
-# unambiguous (no bare `./$(BUILD_DIR)` anywhere).
+# Case 2, dry run: the recipe TEXT is unambiguous (no bare
+# `./$(BUILD_DIR)` anywhere).
 ABS_BUILD_DIR="$SCRATCH/abs_test_dir"
 LOG4="$SCRATCH/log_dryrun_absdir"
 "$MAKE_BIN" -n BUILD_DIR="$ABS_BUILD_DIR" test-tables >"$LOG4" 2>&1
@@ -189,8 +124,7 @@ else
     cat "$LOG4" >&2
 fi
 
-# The real thing: actually build AND run (not a dry run) with an absolute
-# BUILD_DIR, since the problem only manifests at real execution.
+# Case 2, real run: build AND run (not a dry run) with an absolute BUILD_DIR.
 LOG5="$SCRATCH/log_real_absdir"
 if "$MAKE_BIN" BUILD_DIR="$ABS_BUILD_DIR" test-tables >"$LOG5" 2>&1; then
     if grep -q "PASS: rnnoise_tables_gen.h byte-identical" "$LOG5" && grep -q "PASS (portable)" "$LOG5"; then
@@ -204,9 +138,8 @@ else
     cat "$LOG5" >&2
 fi
 
-# Confirm the binary that ran really lives at the absolute path (not a
-# cwd-relative collapse of it), and that no bogus relative directory
-# mirroring the collapsed pattern was created under this component's cwd.
+# The binary lives at the absolute path, and no cwd-relative mirror directory
+# was created.
 if [ -x "$ABS_BUILD_DIR/test_rnnoise_tables" ] && [ -x "$ABS_BUILD_DIR/test_rnnoise_tables_portable" ]; then
     pass "2c: both built binaries actually exist, executable, at the absolute BUILD_DIR path"
 else

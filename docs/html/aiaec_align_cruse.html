@@ -27,8 +27,7 @@ th{background:#eef0f2}
 （<code>dataset_gen/model_views.py</code>）= <code>end_to_end_aec_res_nr_dereverb</code>：
 輸入是<b>未對齊的 microphone 與 far-end 複數頻譜</b>（<code>mic_postclip</code> /
 <code>far_render</code>，前面<b>沒有</b>任何 matched filter 或 linear AEC）；target 是
-<code>near_target</code>。輸出為 real magnitude mask 乘在 mic 頻譜上（保留 mic 相位）。
-本候選早期的 AEC-only 路線已裁撤併入此共同 task。</p>
+<code>near_target</code>。輸出為 real magnitude mask 乘在 mic 頻譜上（保留 mic 相位）。</p>
 <p>16k grid 下 <code>max_delay_frames = 63</code>（<code>delay_frames(1.0)</code>=ceil(62.5)）。
 參數量實測 <b>710,513</b> trainable（論文 ~0.75 M class）。<code>stream_output_delay = 0</code>。
 alignment 有兩個 mode：部署預設 <code>causal_running</code>（逐幀 <code>D[B,T,63]</code>，
@@ -118,7 +117,7 @@ hop-lag：端到端 256 samples（16 ms）＝ centered 半窗 lookahead；NN 本
 <code>[B,63]</code>（test：<code>test_align_cruse_paper_global_mode_is_explicitly_available</code>）。</p>
 
 <h2>State 表</h2>
-<p><code>state_report</code> 實測（B=1 fp32，total <b>559.2 KB</b>；conv window 各比先前的 history 多一幀）。graph boundary 上每個 state 都是 rank 4：<code>score_sum</code> 為 <code>(1,1,1,63)</code>、<code>frame_index</code> 為 <code>(1,1,1,1)</code> int64、<code>h_gru</code> 為 <code>(1,1,1,192)</code>。部署契約：顯式
+<p><code>state_report</code> 實測（B=1 fp32，total <b>559.2 KB</b>；conv window 是完整 window,含新的一幀）。graph boundary 上每個 state 都是 rank 4：<code>score_sum</code> 為 <code>(1,1,1,63)</code>、<code>frame_index</code> 為 <code>(1,1,1,1)</code> int64、<code>h_gru</code> 為 <code>(1,1,1,192)</code>。部署契約：顯式
 state I/O，由 host caller 保存；STFT/ISTFT 狀態屬 C struct 層：</p>
 <table>
 <tr><th>state</th><th>shape</th><th>size</th><th>保存者（部署契約）</th></tr>
@@ -155,7 +154,7 @@ T=90 全幀 stream-vs-offline enhanced 4.9e-7 / mask 1.8e-7 / delay 3.3e-7（ATO
 <ul>
 <li><code>AIAEC/Align_CRUSE/model.py</code>（<code>AlignCRUSE</code>）；<code>AIAEC/aiaec_common.py</code>（<code>GlobalDelayAttention</code>）；<code>AIAEC/aiaec_streaming.py</code>（<code>GlobalDelayAttentionCell</code>）</li>
 <li><code>AIAEC/Align_CRUSE/inference.py</code>、<code>export_onnx.py</code>、<code>train.py</code>、<code>config.ini</code></li>
-<li>tests：<code>AIAEC/tests/test_streaming_align_cruse.py</code>（等價/can-fail/短檔 caveat/paper_global 拒絕/fresh-state）、<code>test_candidate_models.py</code>；全樹基準數見 <code>docs/release_checklist.md</code>。</li>
+<li>tests：<code>AIAEC/tests/test_streaming_align_cruse.py</code>（等價/can-fail/短檔 caveat/paper_global 拒絕/fresh-state）、<code>test_candidate_models.py</code>；全樹請執行 <code>python3 -m pytest AIAEC</code>。</li>
 <li>匯出／calibration：<code>AIAEC/Align_CRUSE/export_onnx.py</code>、<code>AIAEC/Align_CRUSE/inference.py calib</code>（BIN/NPZ calibration 放在 <code>AIAEC/Align_CRUSE/calib/</code>；calib 會同 process 一併匯出並 parity-check 對應 graph（預設 <code>&lt;output&gt;.onnx</code>，<code>--onnx</code> 可改））。<code>state_align_score_sum</code>=<code>float32_no_ptq</code>、<code>state_align_frame_index</code>=<code>int64_no_ptq</code>；calibration 必須取自單一不中斷錄音。</li>
 <li>docs：<code>docs/aiaec_streaming_readiness_zh_TW.md</code> §3.2</li>
 </ul>

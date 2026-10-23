@@ -40,48 +40,26 @@ internally by this pipeline, not caller-configurable) skips straight to the
 gain (`se_res_stage_gain()` over the fused frame) is the only place a
 suppression gain is calculated.
 
-**Far-end FFT sharing** (one far-end rfft/hop instead of four, except on a
-mixed-realign hop -- see below): all four lanes see the byte-identical
-`p->aligned_ref` every hop and realign on the same hop, by the same delta, on
-any delay change (see the hard invariants below). That is necessary but not
-sufficient for safely sharing one lane's far-end spectrum across the other
-three: `aec_apply_external_realign()`'s warm-vs-soft OUTCOME is also per-lane
-(each lane's own filter-convergence evidence gates it independently), and a
-soft outcome zeros that lane's far_buffer OLA history while a warm outcome
-leaves it alone. On a hop where every lane's outcome agrees (all warm, all
-soft, or no realign at all), every lane's far_buffer stays in lockstep and
-lane 0's FFT really is what any other lane would compute; on a MIXED
-warm/soft hop it is not, and this is not a corner case reserved for
-adversarial tests -- real 4-mic recordings produce it (one hop in the
-`aec_together`/`aec_take_turn` fixtures realigns 3 lanes warm and 1 soft
-together). Lane 0 always runs `aec_process_context()` (computes its own
-far-end FFT, as always); `aec_get_res_context()`'s always-populated
-`far_spec` field is then handed to lanes 1-3 via
-`aec_process_context_shared_far()`, which borrows it instead of computing a
-redundant, byte-identical transform -- except on a mixed hop
-(`FourAecNrRes.far_spec_mixed_hop`), where lanes 1-3 fall through to their
-own `aec_process_context()` call instead, the same per-lane far-FFT
-computation every lane already has for the non-shared case, so each lane's
-far_spec reflects its own realign outcome rather than borrowing lane 0's.
-`four_aec_nr_res_far_fft_real_compute_count()` exposes a running per-hop
-count for tests to confirm the 4x→1x drop directly, rather than trusting the
-wiring by inspection alone; on a mixed hop the count is 4, not 1, for that one
-hop. `ref` is still passed to every lane regardless -- the OLA far-buffer
-time-domain history and every non-FFT use of the raw far signal (saturation
-detection, delay estimation, mu_scale) are per-lane state, untouched by this
-sharing -- which is exactly why a per-lane realign outcome that diverges
-shows up there first.
+**Far-end FFT sharing** (one far-end rfft per hop instead of four): all four
+lanes see the byte-identical `p->aligned_ref` and realign on the same hop by the
+same delta (see the hard invariants below), but
+`aec_apply_external_realign()`'s warm-vs-soft outcome is per lane, and a soft
+outcome zeros that lane's far_buffer OLA history. When every lane agrees (all
+warm, all soft, or no realign), lane 0's far-end FFT is what any lane would
+compute: lane 0 runs `aec_process_context()` and lanes 1-3 borrow its `far_spec`
+through `aec_process_context_shared_far()`. On a mixed warm/soft hop
+(`FourAecNrRes.far_spec_mixed_hop`) lanes 1-3 run their own
+`aec_process_context()`, so each far_spec reflects the lane's own outcome.
+`four_aec_nr_res_far_fft_real_compute_count()` exposes the per-hop FFT count
+(1, or 4 on a mixed hop). `ref` is passed to every lane either way: the OLA
+far-buffer history and the non-FFT uses of the raw far signal (saturation
+detection, delay estimation, mu_scale) are per-lane state.
 
 `fuse_contexts()`'s cross-lane far-spec agreement gate
-(`four_aec_nr_res_far_spec_agrees()`, in `4aec_nr_res_internal.h`) is bypassed
-for exactly this one hop (`far_spec_mixed_hop` again) rather than asked to
-approve a disagreement it is not designed to approve; the fused `X` handed
-downstream still takes lane 0's far_spec either way
-(`frame->x = p->snapshots[0].far_spec` in `four_aec_fuse()`), matching
-`pipeline.py`'s `_fuse_contexts()`, which carries the same exception (it no
-longer raises on a cross-lane far_spec mismatch; it accepts it and fuses lane
-0's far_spec as `X`, same semantics on both sides of the C/Python seam -- see
-the comments at both sites for the full reasoning).
+(`four_aec_nr_res_far_spec_agrees()`, in `4aec_nr_res_internal.h`) is bypassed on
+a mixed hop; the fused `X` takes lane 0's far_spec either way
+(`frame->x = p->snapshots[0].far_spec` in `four_aec_fuse()`), as in `pipeline.py`'s
+`_fuse_contexts()`.
 
 Hard invariants:
 
@@ -176,10 +154,7 @@ The deployable C seam is:
   bit-exact equality of the wrapper's chain with the reference chain;
 - [`../../../audiolib/tests/test_spatial_third_party.c`](../../../audiolib/tests/test_spatial_third_party.c):
   scalar/SIMD PHAT, cached SRP, exported-BF-weight and VAD pool equivalence
-  tests (moved here, alongside `doa/`, `bf/` and `VAD/`, in the
-  audio_common -> audiolib rename); `make test` here delegates to
-  `make -C ../../../audiolib test`. The gain stages' own tests stayed
-  behind at [`../third_party/gain/tests/test_gain.c`](../third_party/gain/tests/test_gain.c).
+  tests; `make test` here delegates to `make -C ../../../audiolib test`.
 
 For side-by-side reading, the files and public calls map directly:
 
@@ -400,17 +375,14 @@ tests compare the SIMD and scalar output, effective weights, `P` and `wa`
 byte-for-byte after every hop, including reset, masked, tail-bin and non-finite
 recovery cases.
 
-One parity limitation remains explicit: `AecResContext` does not yet export
-the complete stationarity/AecState surface, so the post-beam RES omits the
-stationary mask. R2 itself is **not** bounded. The phase-bearing residual
+`AecResContext` does not export the complete stationarity/AecState surface, so
+the post-beam RES omits the stationary mask. R2 itself is **not** bounded. The phase-bearing residual
 vector's intermediate is not clamped: a clamp would break the projection's
 `|out|^2 == r2` contract — `r2` arrives int16^2-scaled while `echo_spec` is
 audio-scaled, so the honest scale routinely exceeds any fixed bound and a
 clamp would simply understate residual echo. Only the overflow
 fallback guards the intermediates, and it preserves the same magnitude
 contract for every finite float32 input.
-This is structurally correct but **not bit-exact** to a future fully extracted
-AEC3 post-beam RES API; it must be cohort-tuned before production sign-off.
 
 The core C API does not expose an async multi-frame queue. The complete C
 wrapper does execute SRP-PHAT/BF and remains synchronous; it supports both
@@ -421,7 +393,7 @@ arithmetic equivalence,
 sequencing, and finite DSP output; they do not replace objective speech
 metrics or subjective quality sign-off on real array recordings.
 
-DOA and BF now follow the same selected no-padding grid as AEC/NR/RES:
+DOA and BF follow the same selected no-padding grid as AEC/NR/RES:
 
 | sample rate | frame | FFT | hop | bins | selection |
 |---:|---:|---:|---:|---:|---|
@@ -436,9 +408,9 @@ sample rate, FFT and bin count for steering; BF operates on the exact
 selects the same tuple with `--fft-size 256|512|1024` and rejects cross-rate
 combinations.
 
-There is no legacy/downsample grid entry: DOA, BF and AEC/NR/RES always use
-the same selected tuple. Changing the grid therefore changes the complete
-pipeline atomically rather than creating a second spatial timing domain.
+DOA, BF and AEC/NR/RES always use the same selected tuple, so changing the grid
+changes the complete pipeline atomically; there is no second spatial timing
+domain.
 
 Reproduce the two checked-in recording tests from the `Audio_ALG` directory:
 

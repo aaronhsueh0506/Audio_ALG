@@ -1,7 +1,6 @@
 """AEC scenario simulator: renders parent sequences of 5 aligned stems.
 
-THE SIGNAL MODEL THIS FILE EXISTS TO PRODUCE
---------------------------------------------
+Signal model:
     Y = S + N + D        microphone   (S near speech, N local noise, D echo)
     X                    far-end reference
     D_hat                frozen-linear echo estimate
@@ -10,31 +9,20 @@ THE SIGNAL MODEL THIS FILE EXISTS TO PRODUCE
 
 The four acoustic stems stay separated and the fifth persisted channel is the
 real Python-PBFDKF linear error. The filter runs once over the complete parent
-sequence before it is split into chunks, so its adaptation state remains
-continuous while every trainer can still randomize chunks freely.
+sequence before it is split into chunks, so its adaptation state stays
+continuous while trainers randomize chunks freely.
 
-Everything a model may need is derivable from the persisted stems:
-    Y = mic_postclip     X = far_render
-    S = near_speech
-    S_early = near_target (DeepVQE-S and Align-CRUSE's dereverb target)
+Persisted stems give Y = mic_postclip, X = far_render, S = near_speech and
+S_early = near_target (the DeepVQE-S / Align-CRUSE dereverb target). D, N and
+``mic_preclip`` are not persisted; they are computed on every render and
+returned as ``RenderedSequence.audit`` so the invariants
+(``mic_preclip == S+N+D``, echo is a delayed copy of X) are checked directly
+against the renderer in ``tests/test_aec_dataset.py``.
 
-``D`` (echo), ``N`` (local noise) and the pre-clip/AGC ``mic_preclip`` are NOT
-persisted -- no model task targets echo cancellation without denoising any
-more, so none of the three needs to reach a trainer as its own channel, and no
-candidate is meant to see an oracle residual. All three are
-still COMPUTED on every render and returned as ``RenderedSequence.audit``, so
-the corpus's central invariants (``mic_preclip == S+N+D``, "echo really is a
-delayed copy of X") stay checked at generation time -- see
-``tests/test_aec_dataset.py``, which verifies them directly against the
-renderer rather than from a packed shard.
-
-REUSE
------
-The DSP primitives come from ``AINR/dataset_gen/dataset.py`` -- the NR generator and
-this one share one ``prepare_rir``, one ``fftconvolve``, one ``active_rms``, and
-the same discrete SNR convention.  Only genuinely new behaviour lives here:
-loudspeaker nonlinearity, echo-path switching, sample-rate offset, reference
-dropout and the mic AGC.
+The DSP primitives are shared with ``AINR/dataset_gen/dataset.py`` (one
+``prepare_rir``, ``fftconvolve``, ``active_rms`` and the same discrete SNR
+convention). Defined here: loudspeaker nonlinearity, echo-path switching,
+sample-rate offset, reference dropout and the mic AGC.
 """
 
 import configparser
@@ -214,16 +202,13 @@ class _OptionSpec:
     retired: Optional[str] = None
 
 
-# Per-drift-mode [path_motion] keys, and the ones shared by both modes.  ONE
-# table per section, because three checks read the same list and a key added to
-# two of them is a hole nobody sees: the PRESENCE contract the planner enforces
-# (a key listed here cannot reach a render worker missing from a config), the
-# refusal of a retired name, and the range validator all derive from it.
-#   'positive_range'  the floor of a finite min <= max pair, itself > 0
-#   'paired'          the ceiling of such a pair, checked with its floor
-#   'whole_range'     a min <= max pair of counts, floor >= 0
-#   'waypoints'       the trajectory length, bounded by _waypoint_range
-#   the rest name what the value may be on its own
+# Per-drift-mode [path_motion] keys, and the ones shared by both modes. One
+# table per section because three checks read the same list: the PRESENCE
+# contract the planner enforces, the refusal of a retired name, and the range
+# validator. 'positive_range' = floor of a min <= max pair, itself > 0;
+# 'paired' = its ceiling, checked with its floor; 'whole_range' = a count pair,
+# floor >= 0; 'waypoints' = trajectory length, bounded by _waypoint_range; the
+# rest name what the value may be on its own.
 DRIFT_MODE_OPTION_SPECS = {
     'segment_sec_min': _OptionSpec('positive_range', pair='segment_sec_max'),
     'segment_sec_max': _OptionSpec('paired'),
@@ -326,22 +311,19 @@ ECHO_PATH_IMPAIRMENTS = frozenset({
     'delay_jitter', 'delay_step', 'sro', 'codec_mismatch',
 })
 
-# The impairments [complex_cases] p_dt_stress_combo forces together.  Named
-# because three places must agree on it: the planner that sets it, the
-# renderer's forced-edge-overlap gate that detects it, and the CLI census that
-# counts it.  Two of those three fail SILENTLY when the definition moves.
-# ⚠ Path motion is deliberately NOT in this bundle. It is drawn on its own
-# axis for 67% of compatible echo paths at the shipped defaults, so bundling
-# it here would make
-# "DT while the path moves" indistinguishable from "DT while the loudspeaker
-# distorts and the capture clips": the two would only ever appear together and
-# neither could be attributed.
+# The impairments [complex_cases] p_dt_stress_combo forces together. Named
+# because the planner that sets it, the renderer's forced-edge-overlap gate and
+# the CLI census must agree, and two of those fail SILENTLY when it moves.
+# ⚠ Path motion is deliberately NOT in this bundle: it is drawn on its own axis
+# for 67% of compatible echo paths at the shipped defaults, and bundling it
+# would make "DT while the path moves" indistinguishable from "DT while the
+# loudspeaker distorts and the capture clips".
 DT_STRESS_IMPAIRMENTS = frozenset({
     'nonlinear_spk', 'clipping_agc',
 })
 
-# The hard acoustic DT intersection.  In addition to independently sampled
-# tails, [complex_cases] can force this set so a finite campaign contains
+# The hard acoustic DT intersection. In addition to independently sampled
+# tails, [complex_cases] can force this set so a finite corpus contains
 # examples at both the cold-start and mature-PBFDKF DT boundaries. Trainers
 # currently reset neural state per chunk, so this does not claim to exercise a
 # 20--30 s continuously carried GRU state.
@@ -480,19 +462,11 @@ def nonlinearity_by_id(cfg: configparser.ConfigParser,
                        corpus_seed: int) -> Dict[str, str]:
     """Which loudspeaker model each configured id gets, STRATIFIED.
 
-    An independent draw per id makes the realised loudspeaker population a
-    lottery: with 8 ids over 7 models a third of the corpus seeds contain no
-    linear device at all and the rarer models are missing from most of them,
-    which moves what the corpus is -- the calibration of the movement axis is
-    measured THROUGH this population, so a seed that drew no linear device
-    renders a different curve from one that drew three.
-
-    A seeded permutation of the model list therefore fills the ids first, and
-    only the remainder is drawn uniformly: every configured model appears at
-    least once whenever there are at least as many ids as models, at every
-    corpus seed. The per-id determinism is unchanged -- the same (seed, id
-    list) always yields the same map -- and every other characteristic still
-    comes from the id's own stream.
+    An independent draw per id is a lottery: with 8 ids over 7 models a third
+    of the seeds contain no linear device, which shifts the movement-axis
+    calibration. A seeded permutation of the model list fills the ids first and
+    only the remainder is drawn uniformly, so every model appears whenever ids
+    >= models; the same (seed, id list) always yields the same map.
     """
     models = configured_nonlinear_models(cfg)
     ids = configured_device_ids(cfg)
@@ -596,12 +570,10 @@ def _biquad_chain(sr: int, seed: int, n_filters: int, gain_db: float,
                   ) -> List[Tuple[torch.Tensor, torch.Tensor]]:
     """A fixed, level-preserving biquad cascade.
 
-    ``rand_biquad_filter`` is reused for the loudspeaker path, but it cannot be
-    used here: it RMS-normalises its own output, so applying it to S, N and D
-    separately would give each stem a different gain and break the
-    ``mic_preclip == S + N + D`` identity the whole corpus rests on.  This
-    builds coefficients once, from the same ``_biquad_coeffs`` cookbook, so one
-    identical filter can be applied to every stem.
+    ``rand_biquad_filter`` RMS-normalises its own output, so applying it to S,
+    N and D separately would give each stem a different gain and break the
+    ``mic_preclip == S + N + D`` identity. This builds the coefficients once
+    from the same ``_biquad_coeffs`` cookbook so one filter serves every stem.
     """
     rng = random.Random(seed)
     chain = []
@@ -632,12 +604,11 @@ def resample_by_ratio(x: torch.Tensor, ratio: float,
                       n_out: Optional[int] = None) -> torch.Tensor:
     """Read ``x`` at a slightly wrong clock: ``y[n] = x[n * ratio]``.
 
-    ⚠ Catmull-Rom fractional interpolation, NOT a bandlimited resampler, and
-    that is deliberate.  A few ppm of drift is a slowly accumulating fractional
-    delay -- 5 ppm over 60 s at 16 kHz is 4.8 samples -- and no integer-rate
-    resampler can express it: ``resample(16000, 16001)`` is 62.5 ppm, an order
-    of magnitude too coarse.  The interpolation error sits far below the
-    misalignment being modelled, which is the thing under test.
+    ⚠ Catmull-Rom fractional interpolation, deliberately NOT a bandlimited
+    resampler: a few ppm of drift is a slowly accumulating fractional delay (5
+    ppm over 60 s at 16 kHz is 4.8 samples), and ``resample(16000, 16001)`` is
+    62.5 ppm, an order of magnitude too coarse. The interpolation error sits
+    far below the misalignment being modelled.
     """
     if not math.isfinite(ratio) or ratio <= 0:
         raise ValueError(f"ratio must be positive and finite, got {ratio}")
@@ -666,12 +637,11 @@ def resample_by_ratio(x: torch.Tensor, ratio: float,
 def simulate_codec(x: torch.Tensor, sr: int, source_sr: int, bits: int) -> torch.Tensor:
     """Band limiting plus mu-law requantisation.
 
-    ⚠ An approximation, on purpose.  A real Opus/AAC round trip would add a
-    dependency this package does not have, and the property that matters for
-    AEC is that the played signal carries a nonlinear, non-invertible difference
-    from the reference the canceller was handed.  Coarse companded quantisation
-    produces exactly that.  It does not reproduce any particular codec's
-    artefacts, so no result may be reported as "robust to <codec>".
+    ⚠ An approximation on purpose: a real Opus/AAC round trip would add a
+    dependency, and what matters for AEC is a nonlinear, non-invertible
+    difference between the played signal and the reference. It reproduces no
+    particular codec's artefacts, so no result may be reported as "robust to
+    <codec>".
     """
     y = simulate_upsampled_source(x, sr, source_sr)
     peak = y.abs().max()
@@ -774,11 +744,10 @@ def _contiguous_runs(n_samples: int, sr: int, talk_sec: float,
     """Back-to-back talk runs covering the whole span, with no silent gap.
 
     The degenerate case of ``activity_runs`` where the talker never stops.
-    Split into utterance-sized runs rather than returned as ONE long run so
-    that ``_render_talker`` draws a fresh pool file per run: one whole-sequence
-    run would be a single speaker repeating for 20-30 s.  Keeping the far end
-    ACTIVE across a run that outlasts its file is the other half of the job and
-    belongs to that caller's ``loop=True``.
+    Split into utterance-sized runs so ``_render_talker`` draws a fresh pool
+    file per run (one whole-sequence run would be a single speaker repeating
+    for 20-30 s); keeping the far end ACTIVE past the end of a file is the
+    caller's ``loop=True``.
     """
     if talk_sec <= 0:
         raise ValueError("talk_sec must be positive")
@@ -953,13 +922,12 @@ def plan_sequences(cfg: configparser.ConfigParser, hours: float, seed: int,
         )
     _validate_far_then_near_curriculum(cfg, chunk_sec)
 
-    # A worker renders every sequence out of [echo_path] and [path_motion],
-    # and a config written against an older trajectory model carries neither
-    # section. Their PRESENCE is therefore established before the planner
-    # options below: a config missing [path_motion] outright would otherwise
-    # be told about three missing [impairments] probabilities and only learn
-    # what it really lacks on the next run. Their RANGES are checked further
-    # down, where the planner branch is known.
+    # A worker renders every sequence out of [echo_path] and [path_motion], so
+    # their PRESENCE is established before the planner options below: a config
+    # missing [path_motion] outright would otherwise be told about three
+    # missing [impairments] probabilities and only learn what it really lacks
+    # on the next run. Their RANGES are checked further down, where the planner
+    # branch is known.
     _refuse_retired_path_motion_options(cfg)
     _validate_renderer_sections(cfg)
 
@@ -1040,13 +1008,11 @@ def plan_sequences(cfg: configparser.ConfigParser, hours: float, seed: int,
         probabilities = [weights[name] for name in names]
 
     # Both branches plan sequences a worker renders out of [echo_path] and
-    # [path_motion], so both branches check those ranges here. Validating only
-    # the layered branch leaves the compatibility path with the failure mode
-    # the checks exist to remove -- a whole corpus planned, then a worker dying
-    # on the first sequence that draws motion or a delay step -- and that path
-    # is exactly where an older copied config lands. The tail ranges are the
-    # exception: they live in a layer section, so a compatibility config has no
-    # tails to check and cannot draw one.
+    # [path_motion], so both branches check those ranges here: validating only
+    # the layered branch leaves a whole corpus planned and then a worker dying
+    # on the first sequence that draws motion or a delay step. The tail ranges
+    # are the exception: they live in a layer section, so a compatibility
+    # config has no tails to check and cannot draw one.
     _validate_echo_path_ranges(cfg)
     if layered:
         _validate_acoustic_tail_ranges(cfg)
@@ -1067,9 +1033,9 @@ def plan_sequences(cfg: configparser.ConfigParser, hours: float, seed: int,
         n_chunks = rng.randint(chunks_min, chunks_max)
         sequence_seed = stable_seed(seed, 'sequence', split, sequence_id)
         if layered:
-            # Each field owns a seed. Changing one impairment probability no
-            # longer silently reshuffles talk modes or every impairment after
-            # it, and worker/render order remains irrelevant.
+            # Each field owns a seed, so changing one impairment probability
+            # does not reshuffle talk modes or the impairments after it, and
+            # worker/render order stays irrelevant.
             talk_mode = random.Random(stable_seed(
                 sequence_seed, 'talk_mode')).choices(
                     talk_names, weights=talk_probabilities, k=1)[0]
@@ -1111,7 +1077,7 @@ def plan_sequences(cfg: configparser.ConfigParser, hours: float, seed: int,
                 impairments.difference_update(ECHO_PATH_IMPAIRMENTS)
 
             # Pure independent draws make the exact DT + nonlinear/clipped
-            # intersection too rare to teach in a 200 h campaign.
+            # intersection too rare to teach in a 200 h corpus.
             # This conditional draw creates a measurable tail without turning
             # every ordinary DT example into an adversarial one.
             if (talk_mode == 'double_talk'
@@ -1364,8 +1330,8 @@ def _require_options(cfg: configparser.ConfigParser,
                      required: Dict[str, Sequence[str]], prefix: str) -> None:
     """Refuse a config missing any of ``required``, naming every one of them.
 
-    All of them, not the first: a config written against an older tree is
-    usually missing several, and one name per run is one run per name.
+    All of them, not the first: a config is usually missing several, and one
+    name per run is one run per name.
     """
     missing = [f'[{section}] {option}'
                for section, options in required.items()
@@ -1378,13 +1344,11 @@ def _require_options(cfg: configparser.ConfigParser,
 def _validate_renderer_sections(cfg: configparser.ConfigParser) -> None:
     """Refuse a config missing anything the RENDER workers read.
 
-    [echo_path] and [path_motion] carry no planner probability, so nothing
-    else in the plan would notice: a missing key survives the plan and the
-    manifest and kills the first worker that draws the impairment reading it,
-    hours into a run. Every key each section is read for is listed, and the
-    SECTION itself is named first -- an older copied config that has neither is
-    the likeliest way to arrive here, and configparser's own NoSectionError
-    says nothing about what to add.
+    [echo_path] and [path_motion] carry no planner probability, so a missing
+    key would survive the plan and the manifest and kill the first worker that
+    draws the impairment reading it, hours into a run. The SECTION itself is
+    named first: configparser's own NoSectionError says nothing about what to
+    add.
     """
     required = {'echo_path': ECHO_PATH_OPTIONS,
                 'path_motion': PATH_MOTION_OPTIONS}
@@ -1407,10 +1371,11 @@ def _validate_far_then_near_curriculum(
         cfg: configparser.ConfigParser, chunk_sec: float) -> None:
     """Validate the optional first-chunk far-pre-roll curriculum.
 
-    Configs that contain none of these keys keep the feature off. An explicit zero disables the feature completely, so its
-    otherwise-unused geometry must not invalidate a shorter diagnostic/test
-    chunk. Once the probability is positive, every shape-defining bound is
-    required so two workers cannot silently render different curricula.
+    Configs that contain none of these keys keep the feature off. An explicit
+    zero disables the feature completely, so its otherwise-unused geometry must
+    not invalidate a shorter diagnostic/test chunk. Once the probability is
+    positive, every shape-defining bound is required so two workers cannot
+    silently render different curricula.
     """
     section = 'activity'
     probability_key = 'p_far_then_near'
@@ -1463,11 +1428,10 @@ def _validate_far_then_near_curriculum(
 def _refuse_retired_path_motion_options(cfg: configparser.ConfigParser) -> None:
     """Name a retired trajectory knob before anything else is checked.
 
-    A config carrying one is a config written against an older trajectory
-    model, and it is missing the key that replaced it -- so the presence check
-    would refuse it first, for the missing key, and never mention the knob the
-    author actually has to change. Refusing by name first is what makes the
-    message the one that fixes the file.
+    A config carrying one is missing the key that replaced it, so the presence
+    check would refuse it first for the missing key and never mention the knob
+    the author has to change. Refusing by name first makes the message the one
+    that fixes the file.
     """
     for mode in sorted(DRIFT_MODES):
         for replacement, spec in DRIFT_MODE_OPTION_SPECS.items():
@@ -1585,18 +1549,12 @@ def resolve_acoustic_tails(plan: SequencePlan) -> Tuple[str, ...]:
 # ============================================================
 
 # Keys that are correct at one product rate and wrong at the other, but whose
-# right value is editorial -- the generator cannot pick a device population or
-# a codec ladder for you. What it CAN see is that a key was never revisited:
-# "still exactly the OTHER rate's shipped default" is not a choice anyone
-# makes on purpose. Everything else is accepted silently, so deliberate tuning
-# is never blocked.
-#
-# This exists because both of these degrade SILENTLY. A 48 kHz run that kept
-# the 16 kHz loudspeaker fractions band-limits at 13-23 kHz, i.e. not at all
-# (the device population's spread at 6 kHz collapses from -6.5..-1.4 dB to
-# -0.18..-0.02 dB, and device-disjoint validation loses an axis); one that
-# kept the 16 kHz codec ladder turns a 1.3-2x resample into a 4-6x one. Both
-# produce a full, finite, plausible corpus.
+# right value is editorial: the generator cannot pick a device population or a
+# codec ladder. What it can see is a key left at exactly the OTHER rate's
+# shipped default, which is not a choice anyone makes on purpose; everything
+# else is accepted silently. Both degrade SILENTLY: a 48 kHz run keeping the
+# 16 kHz loudspeaker fractions band-limits at 13-23 kHz (i.e. not at all), and
+# one keeping the 16 kHz codec ladder turns a 1.3-2x resample into a 4-6x one.
 RATE_DEPENDENT_KEYS = {
     ('devices', 'speaker_lp_nyquist_frac_min'): {16000: '0.55', 48000: '0.1833'},
     ('devices', 'speaker_lp_nyquist_frac_max'): {16000: '0.95', 48000: '0.3167'},
@@ -1648,17 +1606,10 @@ def chunk_samples_from_config(cfg: configparser.ConfigParser,
                               hop_size: int) -> int:
     """`[sequence] chunk_sec` in samples, or raise naming what has to change.
 
-    The linear-AEC frontend consumes whole hops, so a chunk that is not an
-    integer number of them cannot be materialized. The hop is frozen per
-    sample rate (linear_aec.FROZEN_FRAME_HOP_BY_SR), which makes `chunk_sec`
-    the only adjustable side of
-
-        round(chunk_sec * sr) % hop == 0
-
-    and makes the constraint rate-dependent: the same `chunk_sec` that is
-    exact at one rate need not be at another. Called both by the renderer
-    (below) and by gen_aec_dataset.py's config preflight, so a CLI run and an
-    in-process one fail identically.
+    The linear-AEC frontend consumes whole hops and the hop is frozen per
+    sample rate (linear_aec.FROZEN_FRAME_HOP_BY_SR), so ``round(chunk_sec * sr)
+    % hop == 0`` must hold; a value exact at one rate need not be at another.
+    Shared by the renderer and gen_aec_dataset.py's config preflight.
     """
     sample_rate = cfg.getint('signal', 'sr')
     chunk_sec = cfg.getfloat('sequence', 'chunk_sec')
@@ -1690,32 +1641,15 @@ def chunk_samples_from_config(cfg: configparser.ConfigParser,
 # ============================================================
 # Continuous echo-path motion
 # ============================================================
-#
-# WHAT THIS MODELS AND WHY IT IS NOT A CROSSFADE
-# ----------------------------------------------
-# A device's echo path is never frozen.  Measured on paired static/movement
-# far-end captures, its correlation with itself seconds earlier falls away even
-# on a device nobody touches, and a moving one has largely forgotten its own
-# path after 8 s.  The numbers live in ONE place --
-# ``path_drift_metrics.CALIBRATION_TARGETS``, which is also what the
-# calibration test asserts against -- so that a re-calibration cannot leave a
-# stale copy behind here.  A single 20 ms crossfade between two positions
-# reproduces none of that curve: it leaves the path EXACTLY constant on both
-# sides of one instant, which is what makes a filter that only converges once
-# look adequate.
-#
-# The trajectory is a weight schedule over K positions in ONE room,
-#
-#     H(t) = sum_k w_k(t) * h_k,      sum_k w_k(t) = 1,
-#
-# whose corners (`keyframes`) walk between per-position target mixtures and
-# whose transitions are raised cosines, so neither the weights nor their first
-# derivative step.  Two knobs set the correlation curve: how far a keyframe
-# pulls the mixture toward a single position
-# (`*_position_correlation`, solved into a per-room mixture depth by
-# `solve_mixture_depth`) and how long a transition takes
-# (`*_segment_sec_*`).  Level is a separate dB-domain random walk, because a
-# real path's gain and its shape do not change together.
+
+# A device's echo path is never frozen: its correlation with itself seconds
+# earlier falls away even on an untouched device (targets live only in
+# ``path_drift_metrics.CALIBRATION_TARGETS``), and a single 20 ms crossfade
+# reproduces none of that curve. The trajectory is a weight schedule over K
+# positions in ONE room, H(t) = sum_k w_k(t) * h_k with sum_k w_k = 1, whose
+# `keyframes` walk between per-position mixtures on raised-cosine transitions;
+# `*_position_correlation` (solved into a per-room depth by
+# `solve_mixture_depth`) and `*_segment_sec_*` set the correlation curve.
 DriftKeyframes = Tuple[Tuple[int, int], ...]
 
 
@@ -1725,15 +1659,11 @@ def drift_keyframes(n_samples: int, sr: int, n_waypoints: int,
                     ) -> DriftKeyframes:
     """Corner times and waypoint indices of one trajectory.
 
-    A dwell is expressed as a keyframe repeating the previous waypoint, so the
-    interpolator below needs no separate "holding" state: interpolating
-    between two identical mixtures is a constant.
-
-    ⚠ Both durations are drawn LOG-uniformly over their range.  Movement
-    durations are naturally log-distributed -- a gesture lasts a fraction of a
-    second, crossing a room takes several -- and a uniform draw concentrates
-    the trajectory on one timescale, which shows up directly as a
-    correlation-vs-lag curve with a sharp knee where the measured one has none.
+    A dwell is a keyframe repeating the previous waypoint, so the interpolator
+    needs no "holding" state. ⚠ Both durations are drawn LOG-uniformly:
+    movement durations are naturally log-distributed, and a uniform draw
+    concentrates on one timescale, giving a correlation-vs-lag curve with a
+    sharp knee.
     """
     if n_waypoints < 2:
         raise ValueError(f"a trajectory needs >= 2 waypoints, got {n_waypoints}")
@@ -1763,13 +1693,10 @@ def _log_uniform_samples(rng: random.Random, seconds: Tuple[float, float],
 def drift_corners(n_waypoints: int, depth: float) -> torch.Tensor:
     """The (K, K) mixtures the keyframes walk between; row k is corner k.
 
-    ``depth`` is how far one keyframe pulls the mixture toward its own
-    position: 1.0 makes each corner a pure single-position path (and a lag long
-    enough to reach a different corner decorrelates as far as the two positions
-    themselves differ), 0.0 makes every corner the same uniform blend (nothing
-    ever changes).  Every corner is therefore ``(1 - depth) * anchor + depth *
-    e_k`` around the uniform ANCHOR mixture, which is what
-    ``solve_mixture_depth`` measures the corners against.
+    ``depth`` is how far one keyframe pulls the mixture toward its own position:
+    1.0 makes each corner a pure single-position path, 0.0 makes every corner the
+    same uniform blend. Corner k is ``(1 - depth) * anchor + depth * e_k`` around
+    the uniform ANCHOR mixture that ``solve_mixture_depth`` measures against.
     """
     if not 0.0 <= depth <= 1.0:
         raise ValueError(f"drift depth must be in [0, 1], got {depth}")
@@ -1781,9 +1708,8 @@ def drift_corners(n_waypoints: int, depth: float) -> torch.Tensor:
 
 # How far a rendered reach may sit above the configured target before the
 # renderer calls the room unreachable. The bisection below stops at a depth
-# resolution of `tolerance`, so the correlation it lands on is that resolution
-# times the local slope away from the target -- measured over the calibration
-# pools at 1.8e-05 worst, i.e. two orders of magnitude inside this.
+# resolution of `tolerance`, so the correlation it lands on is only that
+# resolution times the local slope away from the target.
 POSITION_REACH_TOLERANCE = 1e-3
 
 
@@ -1834,12 +1760,11 @@ def mixture_reach(gram: np.ndarray, n_waypoints: int, depth: float) -> float:
 def positions_reach(gram: np.ndarray, positions: Sequence[int]) -> float:
     """How far a trajectory over ``positions`` can decorrelate the path.
 
-    A trajectory can only decorrelate as far as the positions it mixes differ,
-    and its deepest mixture -- pure single-position corners -- is that limit.
-    A set whose limit sits ABOVE the configured target cannot render the
-    corpus's movement axis: the solve saturates at depth 1.0 and the audio
-    carries a shallower path than the corpus asked for. The renderer therefore
-    asks this of the set it has DRAWN, and draws again when the answer is no.
+    The limit is the deepest mixture (pure single-position corners). A set
+    whose limit sits ABOVE the configured target cannot render the movement
+    axis: the solve saturates at depth 1.0 and the audio carries a shallower
+    path than asked for, so the renderer asks this of the set it has DRAWN and
+    draws again when the answer is no.
     """
     index = np.asarray(positions, dtype=np.intp)
     return mixture_reach(gram[index[:, None], index[None, :]], len(index), 1.0)
@@ -1851,10 +1776,9 @@ def most_distinct_positions(gram: np.ndarray,
 
     Greedy from the least alike PAIR, then repeatedly the position whose
     strongest band-limited correlation with the set so far is weakest.
-    Saturation is a property of positions that share their energy, so this is
-    the room's best candidate for a set that reaches -- and it is available to
-    the renderer as a fallback, which is what lets a set that reaches CERTIFY
-    the room without enumerating every other set.
+    Positions that share energy saturate, so this is the room's best candidate
+    for a reaching set; as the renderer's fallback it lets a reaching set
+    CERTIFY the room without enumerating every other set.
     """
     count = gram.shape[0]
     if n_waypoints >= count or n_waypoints < 2:
@@ -1875,21 +1799,13 @@ def most_distinct_positions(gram: np.ndarray,
 def certified_positions(gram: np.ndarray, n_waypoints: int,
                         subset_limit: int = REACH_SUBSET_LIMIT
                         ) -> Tuple[Tuple[int, ...], float]:
-    """A set of ``n_waypoints`` positions that reaches as far as the room can,
-    and how far that is.
+    """A set of ``n_waypoints`` positions that reaches as far as the room can.
 
-    This is what room ELIGIBILITY is decided on, and eligibility is an
-    EXISTENCE statement: a room can host a drift mode when at least one
-    drawable set of positions reaches the configured path correlation
-    (``AecSequenceRenderer.rooms_that_can_host``). Exact by enumeration while
-    the room offers few enough sets; beyond that the most distinct positions,
-    which certifies the room CONSTRUCTIVELY -- the renderer can always fall
-    back to this very set, so a set that reaches proves the claim whatever the
-    sets nobody enumerated would have shown.
-
-    ⚠ Ranking sets by their most alike PAIR is not a substitute. Pairwise
-    similarity does not order set reach, so a room can be certified over a set
-    it would never draw, or refused over one that does not exist.
+    Room ELIGIBILITY is an EXISTENCE statement: some drawable set reaches the
+    configured path correlation. Exact by enumeration for few sets; beyond that
+    the most distinct positions certify the room CONSTRUCTIVELY, since the
+    renderer can always fall back to this very set. ⚠ Ranking by the most alike
+    PAIR is not a substitute.
     """
     count = gram.shape[0]
     if n_waypoints < 1 or count < n_waypoints:
@@ -1927,32 +1843,13 @@ def certified_positions(gram: np.ndarray, n_waypoints: int,
 def solve_mixture_depth(gram: np.ndarray, n_waypoints: int,
                         target_correlation: float,
                         tolerance: float = 1e-4) -> Tuple[float, float]:
-    """The mixture depth that puts the corners ``target_correlation`` from the
-    anchor, and the correlation actually reached.
+    """The mixture depth putting the corners ``target_correlation`` from the
+    anchor, and the correlation reached.
 
-    ⚠ Depth is NOT the quantity a corpus can be calibrated in.  What the path
-    estimator sees is the correlation between mixture STATES, and that depends
-    on how much the room's positions share: the same depth measures a corner
-    correlation of 0.79 on a pool of 60 ms paths and 0.65 on one of 350 ms
-    paths, because longer, more different tails decorrelate further per unit of
-    weight change.  A depth fitted on one pool therefore over- or under-drives
-    the movement axis on every other one, INCLUDING the same pool at another
-    sample rate.  Solving per room from the room's own Gram matrix makes the
-    configured number a property of the corpus instead: the target correlation
-    is what the calibration is expressed in, and the depth is whatever that
-    room needs to reach it.
-
-    ⚠ The reached correlation is returned rather than assumed.  A set of
-    positions that share most of their energy cannot decorrelate to an
-    arbitrary target even at depth 1.0 (pure single-position corners).
-    Rendering that silently is the failure this solve exists to remove, and it
-    is removed UPSTREAM: the room is certified to offer a set that reaches
-    (``certified_positions``) and the set actually drawn is checked before any
-    audio is touched (``AecSequenceRenderer._draw_positions``), so a saturated
-    return here means the caller passed a set neither of those two approved --
-    which the renderer refuses.  Both numbers are recorded per chunk as
-    diagnostics, and the CLI reports the reached median against the configured
-    target.
+    ⚠ Depth is not a quantity a corpus can be calibrated in (one depth gives
+    0.79 on 60 ms paths, 0.65 on 350 ms), so it is solved per room from its
+    Gram matrix. Sets sharing most energy cannot reach every target even at
+    depth 1.0; ``certified_positions`` keeps them out.
     """
     def reached(depth: float) -> float:
         return mixture_reach(gram, n_waypoints, depth)
@@ -1997,17 +1894,11 @@ def gain_walk_db(n_samples: int, sr: int, rng: random.Random,
                  recentre_sec: float) -> torch.Tensor:
     """A bounded dB-domain random walk, linearly interpolated to per sample.
 
-    Per-sample rather than per-block because a block-constant gain is a step,
-    and a step in the echo's level is a broadband click the model can use as a
-    free movement detector.
-
-    ⚠ ``recentre_sec`` (a pull back toward the sequence's own mean level) is
-    not decoration.  A free walk that is merely clipped at +-clamp spends most
-    of a 30 s sequence pinned to one rail: at the sigma needed for a realistic
-    per-second step its level spread comes out 10 dB wide against a measured
-    ~6 dB, and the level distribution turns bimodal.  Reverting instead bounds
-    the spread by the process itself, so sigma and clamp keep meaning what
-    they say.
+    Per-sample, not per-block: a block-constant gain is a step, a broadband
+    click the model could use as a free movement detector. ⚠ ``recentre_sec``
+    (a pull back toward the sequence's mean level) is not decoration: a merely
+    clipped free walk sits pinned to one rail for most of a 30 s sequence (~10
+    dB spread against a measured ~6 dB).
     """
     if update_sec <= 0:
         raise ValueError(f"gain update_sec must be positive, got {update_sec}")
@@ -2045,32 +1936,12 @@ def moving_chunks(weights: Optional[torch.Tensor], chunk_samples: int,
                   n_chunks: int, weight_delta: float) -> frozenset:
     """Which chunks the path actually travels during.
 
-    "Moving" is the chunk's own weight EXCURSION -- the largest within-chunk
-    swing of any single weight -- not the difference between its endpoints.  A
-    chunk in which the path leaves a position and comes back is moving, and
-    endpoint differencing would call it still.
-
-    ⚠ The level walk is deliberately NOT part of this.  A device whose level
-    drifts while it stays where it is has not moved, and the walk never stops:
-    its per-chunk swing clears any useful threshold on every chunk of every
-    drifting sequence, so folding it in either labels everything (as a
-    disjunction) or makes the label silently depend on a knob that has nothing
-    to do with the trajectory (as a conjunction).  The weight excursion is the
-    whole discriminating quantity: a dwell keyframe repeats its predecessor, so
-    the weights are EXACTLY constant across a dwell.
-
-    ⚠ How much this discriminates depends on the CHUNK LENGTH.  A chunk longer
-    than the longest dwell the mode can draw always contains part of a
-    transition, so at ``[sequence] chunk_sec`` above ``*_dwell_sec_max`` every
-    far-active chunk of a drifting sequence is labelled and the label coincides
-    with ``path_motion in DRIFT_MODES and far_active``.  It separates
-    travelling chunks from dwelling ones only when chunks are shorter than a
-    dwell.
-
-    ⚠ This answers "did the SCHEDULE move", which is not the whole label the
-    corpus records: ``_build_meta`` also requires the chunk's own measured far
-    activity, because a moving path over a silent reference puts no moving echo
-    in the microphone. A caller reproducing the label has to apply that too.
+    "Moving" is the chunk's own weight EXCURSION (largest within-chunk swing of
+    any weight), not the difference of its endpoints, and excludes the level
+    walk. A chunk longer than the longest dwell always contains part of a
+    transition, so above ``*_dwell_sec_max`` the label equals ``path_motion in
+    DRIFT_MODES and far_active``; ``_build_meta`` also requires the chunk's
+    measured far activity.
     """
     if weights is None:
         return frozenset()
@@ -2109,14 +1980,10 @@ class PathMotion:
                fade: int = 1) -> torch.Tensor:
         """Travel this trajectory through the responses it was planned over.
 
-        ``convolved`` is the signal already convolved with each of the
-        trajectory's positions, in waypoint order.  One implementation for the
-        echo path and for the near talker's own path, so a change to how a
-        trajectory sounds cannot reach one of them and not the other.
-
-        The level walk is applied here too: it is part of the trajectory, and
-        applying it at some call sites and not others is what would make the
-        movement axis and the level axis drift apart.
+        ``convolved`` is the signal already convolved with each trajectory
+        position, in waypoint order. One implementation serves the echo path
+        and the near talker's own path, and the level walk is applied here too,
+        so the movement and level axes cannot drift apart.
         """
         if self.mode == 'echo_path_change':
             out = _crossfade(convolved[0], convolved[1],
@@ -2134,12 +2001,10 @@ class PathMotion:
 class _EchoPathRender:
     """What one render's echo path actually did.
 
-    Everything in here exists only AFTER the draws: the trajectory, the near
+    Everything here exists only AFTER the draws: the trajectory, the near
     talker's own trajectory, which chunks moved, which RIR files the positions
-    came from, and the one-shot events.  ``_build_meta`` re-derives whatever it
-    can from the plan and takes the rest through this one record, so adding a
-    field to the motion model does not add a positional argument to a call site
-    nobody can read.
+    came from, and the one-shot events. ``_build_meta`` re-derives what it can
+    from the plan and takes the rest through this one record.
     """
 
     motion: PathMotion
@@ -2237,23 +2102,11 @@ class AecSequenceRenderer:
                       ) -> List[Tuple[torch.Tensor, torch.Tensor]]:
         """Prepared (early, full) RIR pairs sharing ONE normalisation factor.
 
-        ``prepare_rir`` L2-normalises whatever it is handed, which is right for
-        a single path and wrong for a trajectory: it erases precisely the level
-        difference between two loudspeaker positions that a moving path exists
-        to carry (measured p5--p95 path level spread: ~6 dB).  Every pair is
-        therefore rescaled to the first path's normalisation, which leaves a
-        one-element set -- every static sequence -- bit-identical to the plain
-        ``prepare_rir`` result.
-
-        The factor is recovered without re-implementing the pre-delay trim:
-        that trim always keeps the direct-path peak, so ``max|raw| /
-        max|prepared|`` IS the L2 norm ``prepare_rir`` divided out.  The trim
-        itself stays in force, so the paths differ in level and shape but not
-        in position-dependent propagation delay. This is intentional: the RIR
-        files do not share a guaranteed recording time origin, so their raw
-        peak offsets cannot safely be interpreted as distance. Timing changes
-        remain separate, countable ``delay_jitter`` / ``delay_step`` / ``sro``
-        axes rather than an untraceable property of the chosen RIR file.
+        ``prepare_rir`` L2-normalises each response, erasing the ~6 dB level
+        spread between positions that a moving path exists to carry. Every pair
+        is rescaled to the first path's factor (``max|raw| / max|prepared|``);
+        the pre-delay trim stays, so timing changes belong only to
+        ``delay_jitter`` / ``delay_step`` / ``sro``.
         """
         prepared: List[Tuple[torch.Tensor, torch.Tensor]] = []
         norms: List[float] = []
@@ -2279,18 +2132,13 @@ class AecSequenceRenderer:
                        ) -> Tuple[torch.Tensor, List[str]]:
         """Place whole utterances inside the active runs, drawn from ``pool``.
 
-        Gating a continuous stream with a mask would cut words in half and leave
-        a step discontinuity at every boundary; the model would then learn to
-        treat that click as the cue for talk onset.
-
-        ``pool`` is which speech corpus to draw from -- ``self.pools.far_speech_files``
-        for the far-end talker, ``self.pools.speech_files`` for the near-end one.
-        They are the same list unless ``[paths] far_speech_dir`` is configured.
-
-        ``loop`` repeats a drawn file that is shorter than its run instead of
-        zero-padding it.  Off for conversational talkers, where a run that
-        outlasts its utterance SHOULD fall silent; on only where the run's
-        whole purpose is that the signal never stops (far_active_no_echo).
+        Gating a continuous stream with a mask would cut words and leave onset
+        clicks the model could learn as a cue. ``pool`` is
+        ``self.pools.far_speech_files`` (far end) or
+        ``self.pools.speech_files`` (near end; same list unless ``[paths]
+        far_speech_dir`` is set). ``loop`` repeats a file shorter than its run
+        instead of zero-padding; on only where the signal must never stop
+        (far_active_no_echo).
         """
         out = torch.zeros(n_samples)
         used: List[str] = []
@@ -2382,17 +2230,10 @@ class AecSequenceRenderer:
         """When the one-shot crossfade happens, or -1 if it cannot happen.
 
         Away from the very edges, so the chunk labelled 'echo_path_change'
-        really does contain audio from both paths -- and far enough from the
-        end that the guaranteed far-active window behind the switch fits
-        inside the sequence, the same preference the drift modes apply to
-        their last transition.  Without it the switch lands in the final chunk
-        whenever the sequence has two of them, and the guarantee is truncated
-        to whatever is left: a window of a few milliseconds is an echo-path
-        event nothing can be measured against.
-
-        A sequence too short to hold both gets no switch at all: the caller
-        renders it with a still path rather than labelling an event whose
-        window it cannot supply.
+        holds audio from both paths, and far enough from the end that the
+        guaranteed far-active window behind the switch fits (as the drift modes
+        do for their last transition). A sequence too short for both gets no
+        switch rather than an event it cannot supply.
         """
         n_samples = n_chunks * self.chunk_samples
         _horizon, _min_run, latest = self._event_window(n_samples)
@@ -2408,12 +2249,11 @@ class AecSequenceRenderer:
     def _room_gram(self, room: str) -> np.ndarray:
         """The band-limited Gram of every position in ``room``.
 
-        Over the WHOLE room rather than one trajectory's positions: which
-        positions a sequence draws is a per-sequence draw, and the question
-        here is whether the room can host the mode at all.  A trajectory's own
-        Gram is the sub-matrix of this one -- ``_load_rir_set`` normalises a
+        Over the WHOLE room rather than one trajectory's positions, since the
+        question is whether the room can host the mode at all. A trajectory's
+        own Gram is a sub-matrix of this one (``_load_rir_set`` normalises a
         set to its first response, and a common scalar cancels in every
-        correlation -- so the two are the same statement.
+        correlation).
         """
         gram = self._room_grams.get(room)
         if gram is None:
@@ -2435,16 +2275,11 @@ class AecSequenceRenderer:
                      ) -> Tuple[Tuple[int, ...], float]:
         """The set of ``room``'s positions that reaches furthest, cached.
 
-        Both an eligibility certificate and the set a render falls back to
-        when its own draws saturate, which is why the two read the same call.
-
-        ``avoid`` restricts it to the positions outside that set, which is what
-        lets a fallback keep the preference the draws it replaces were
-        expressing.  The restricted answer is a certificate of the same kind --
-        a drawable set with its reach computed the same way -- so the caller
-        holds it to the same target and asks again without ``avoid`` only when
-        it does not reach.  Cached per restriction, because a room drawn
-        hundreds of times is drawn against the same few restrictions.
+        Both the eligibility certificate and the set a render falls back to
+        when its own draws saturate. ``avoid`` restricts it to positions
+        outside that set, so a fallback keeps the draws' preference; the caller
+        holds the restricted answer to the same target and asks again without
+        ``avoid`` only if it does not reach. Cached per restriction.
         """
         key = (room, n_waypoints, avoid)
         if key not in self._room_certificates:
@@ -2463,27 +2298,11 @@ class AecSequenceRenderer:
     def can_host(self, room: str, mode: str) -> Optional[str]:
         """Why ``room`` cannot carry ``mode``'s trajectory, or ``None``.
 
-        The reason rather than a boolean because the census reports it and the
-        renderer only asks whether there is one.
-
-        Two requirements, and the second is why this is decided before a room
-        is drawn rather than after: the room needs enough positions, and it has
-        to OFFER a set of them whose responses differ enough that the
-        configured path correlation is reachable at a mixture depth of at most
-        1.0.  A trajectory over positions that share most of their energy
-        renders a shallower movement axis than the corpus asked for and nothing
-        in the audio says so, so a room offering no such set does not host the
-        mode -- for every waypoint count the mode could draw here, because the
-        count is drawn per sequence.
-
-        ⚠ EXISTENCE, not universality: which of the room's positions a
-        sequence draws is a draw of its own, so the render checks its own set
-        and draws again (``_draw_positions``) rather than the room being
-        refused for the sets that saturate.  A room where most sets saturate
-        stays usable and says so in the census.
-
-        The one-shot switch has no mixture to solve: it renders its two
-        positions pure, and how far apart they are is what it is.
+        The reason rather than a boolean because the census reports it. The
+        room needs enough positions and must OFFER a set whose responses differ
+        enough to reach the configured path correlation at depth <= 1.0, for
+        every waypoint count the mode could draw (EXISTENCE, not universality:
+        a render draws again on its own saturated set).
         """
         key = (room, mode)
         if key not in self._room_hosts:
@@ -2503,25 +2322,13 @@ class AecSequenceRenderer:
     def _draw_positions(self, room: str, mode: str, count: int,
                         rng: random.Random,
                         avoid=frozenset()) -> Tuple[List[str], int, bool]:
-        """``count`` of ``room``'s positions whose trajectory REACHES ``mode``'s
-        configured path correlation, how many draws were rejected first, and
-        whether the set is a certified one rather than a drawn one.
+        """Positions of ``room`` whose trajectory REACHES ``mode``'s path
+        correlation: ``count``, draws rejected first, and whether the set is
+        certified.
 
-        ``can_host`` says a reaching set exists; this is where the set the
-        sequence actually renders is held to it.  A rejected draw costs one
-        Gram lookup and no audio.  After ``POSITION_DRAW_ATTEMPTS`` the room's
-        certified set is rendered instead -- that set is the certificate, so
-        the fallback cannot fail -- and both counts are recorded per sequence,
-        because they say different things: re-draws mean the room holds
-        near-duplicate positions next to distinctive ones, while a fallback
-        means this sequence renders the room's ONE certified trajectory, which
-        every other saturating draw in that room renders too.
-
-        ⚠ The fallback keeps ``avoid``.  Certifying over the room's positions
-        minus that set answers the same existence question on a smaller room,
-        so a near talker whose draws saturate still leaves the loudspeaker's
-        positions where a reaching set exists beside them; only a restriction
-        that leaves nothing reaching gives the shared certificate back.
+        ``can_host`` says a reaching set exists; this holds the rendered set to
+        it. After ``POSITION_DRAW_ATTEMPTS`` rejected draws the room's
+        certified set is rendered, keeping ``avoid`` where it still reaches.
         """
         room_rirs = self.pools.rirs_by_room[room]
         if not motion_policy(mode).solves_mixture or count < 2:
@@ -2554,17 +2361,11 @@ class AecSequenceRenderer:
         """Which rooms can host ``mode``, and why the others cannot.
 
         Keyed 'eligible' / 'too_few_positions' / 'positions_too_alike', the
-        last meaning the room's CERTIFICATE does not reach the configured path
-        correlation at some waypoint count. On the constructive branch that is
-        sufficient and not necessary: the certificate is one set the renderer
-        can always draw, so a room it clears is renderable, while a room it
-        does not clear may still hold a reaching set nobody enumerated. The
-        refusal is that way round on purpose -- what a render needs is a set it
-        can be given, not a proof that one exists somewhere.
-
-        The preflight prints it and refuses on it; it costs one load of every
-        RIR in the split's rooms, which is why the CLI does it once up front
-        instead of every worker discovering it.
+        last meaning the room's CERTIFICATE misses the configured path
+        correlation at some waypoint count (sufficient, not necessary: an
+        unenumerated reaching set may exist, but a render needs a set it can be
+        given). Costs one load of every RIR in the split's rooms, so the CLI
+        preflight does it once up front.
         """
         census: Dict[str, List[str]] = {
             'eligible': [], 'too_few_positions': [], 'positions_too_alike': []}
@@ -2581,11 +2382,10 @@ class AecSequenceRenderer:
         """How many positions this sequence's trajectory visits.
 
         Capped by the largest room in the split rather than failing: the count
-        is a modelling preference, the RIR inventory is a fact.  The drawn
-        room caps it again (see ``_render_impl``), and a pool too sparse for
-        even the minimum is refused there, because silently rendering a
-        two-position "trajectory" would put the corpus's movement share where
-        the metadata says continuous drift is.
+        is a modelling preference, the RIR inventory a fact. The drawn room
+        caps it again (see ``_render_impl``), and a pool too sparse for the
+        minimum is refused there, since a two-position "trajectory" would put
+        the movement share where the metadata says continuous drift is.
         """
         needed = self.waypoints_needed(mode)
         if not motion_policy(mode).solves_mixture:
@@ -2600,23 +2400,11 @@ class AecSequenceRenderer:
                           gain_scale: float = 1.0) -> PathMotion:
         """Draw the trajectory before any audio is touched.
 
-        ``responses`` are the prepared impulse responses of the positions this
-        trajectory mixes, in waypoint order: the configured knob is a target
-        path correlation and the mixture depth that reaches it is a property of
-        those responses, so a drift mode cannot be planned without them.
-
-        ⚠ Reaching the configured correlation is an INVARIANT here, not an
-        outcome: ``can_host`` certified before the room was drawn that a
-        reaching set exists for every trajectory length this mode can draw in
-        it, and ``_draw_positions`` handed over a set that reaches -- its own
-        draw or, failing that, the certified one. A solve that saturates means
-        those two disagree, which is worth a stopped run: the alternative is a
-        corpus whose movement axis is quietly shallower than its own metadata
-        claims.
-
-        ``slowdown`` / ``gain_scale`` are how the near talker's own path is
-        derived from the same draw: a person shifting in a chair moves the same
-        way a loudspeaker does, only slower and with less level change.
+        ``responses`` are the prepared RIRs of the mixed positions, in waypoint
+        order; the depth reaching the configured path correlation depends on
+        them. ⚠ Reaching it is an INVARIANT here (``can_host`` and
+        ``_draw_positions`` guarantee a reaching set): a saturated solve stops
+        the run. ``slowdown`` / ``gain_scale`` derive the near talker's path.
         """
         cfg = self.cfg
         policy = motion_policy(mode)
@@ -2739,15 +2527,11 @@ class AecSequenceRenderer:
         n_waypoints = self._waypoint_count(motion_mode, rng)
         # The room is drawn from the WHOLE pool; a moving sequence that draws a
         # room which cannot host its trajectory draws again from the rooms that
-        # can, so the planned motion share is the rendered one.
-        # ⚠ That leaves an INHERENT cue: a trajectory needs >= waypoints_min
-        # positions in one room (a waypoint in another room would leave the
-        # near talker behind) whose responses differ enough to reach the
-        # configured path correlation, so moving sequences can only ever come
-        # from rooms that qualify, and a single-position room only ever renders
-        # still. Drawing every sequence from the whole pool does not remove it
-        # -- it only adds still sequences to the rich rooms while downgrading
-        # most of the motion axis. gen_aec_dataset.py prints the eligible-room
+        # can, so the planned motion share is the rendered one. ⚠ That leaves
+        # an INHERENT cue: moving sequences only come from rooms with >=
+        # waypoints_min positions whose responses differ enough, and a
+        # single-position room only ever renders still. Drawing from the whole
+        # pool does not remove it. gen_aec_dataset.py prints the eligible-room
         # share per mode and refuses a split with fewer than two.
         room = self.pools.rooms[rng.randrange(len(self.pools.rooms))]
         if (motion_mode != STATIC_PATH
@@ -2763,7 +2547,7 @@ class AecSequenceRenderer:
         room_rirs = self.pools.rirs_by_room[room]
         # The count is a modelling preference and the inventory is a fact, so a
         # room holding fewer files than the drawn count shortens the trajectory
-        # -- it can no longer be below the minimum the mode needs.
+        # -- it is never below the minimum the mode needs.
         n_waypoints = min(n_waypoints, len(room_rirs))
         # ⚠ The loudspeaker and the near talker are ALWAYS in the SAME room --
         # RIRs from different rooms would hand the model an acoustic "this is
@@ -3049,19 +2833,15 @@ class AecSequenceRenderer:
 
         if echo_mode == 'far_active_no_echo':
             # A reference at full level and no acoustic path back to this
-            # microphone; near-end speech may independently be present. Every
-            # normal-echo plan ties echo to far_render through erl_db, whose
-            # range stops at 30 dB, so the quietest echo the corpus could
-            # otherwise produce still sits only ser_db_max below the near
-            # speech -- around 25 dB short of what a real headset or a muted
-            # loudspeaker looks like.  Without this case nothing teaches that a
-            # loud reference can be irrelevant, and a linear filter is free to
-            # fit reference-shaped noise onto near speech and subtract
-            # something that was never there.
-            #
-            # Distinct from near_only (far_render itself is silent, so there is
-            # no reference to be misled by) and from ref_dropout (which zeros
-            # the reference and the echo together, teaching the converse).
+            # microphone; near-end speech may independently be present. A
+            # normal echo plan ties echo to far_render through erl_db (range
+            # stops at 30 dB), so the quietest echo the corpus could otherwise
+            # produce sits ~25 dB short of a real headset or a muted
+            # loudspeaker. Without this case nothing teaches that a loud
+            # reference can be irrelevant, and a linear filter may subtract
+            # something that was never there. Distinct from near_only
+            # (far_render itself is silent) and from ref_dropout (reference and
+            # echo zeroed together).
             echo = torch.zeros_like(echo)
             erl_db = float('inf')
 
@@ -3130,9 +2910,9 @@ class AecSequenceRenderer:
         mic_postclip = mic_preclip.clone()
         if ('clipping_agc' in impairments
                 or rng.random() < cfg.getfloat('mic', 'p_clipping')):
-            # apply_clipping() also returns the sampled clip_snr (added for
-            # AINR's own per-sample metadata) -- this caller already tracks
-            # a separate `clipped` boolean, not the exact sampled value.
+            # apply_clipping() also returns the sampled clip_snr; this caller
+            # already tracks a separate `clipped` boolean, not the exact
+            # sampled value.
             mic_postclip, _clip_snr = apply_clipping(
                 mic_postclip,
                 cfg.getfloat('mic', 'clip_snr_min'),
@@ -3294,17 +3074,15 @@ class AecSequenceRenderer:
             'erl_db': float(erl_db),
             'bulk_delay_samples': int(bulk_delay),
             'delay_jitter': bool(delay_jitter),
-            # Signed: a dropped playout buffer moves the echo earlier just
-            # as readily as a duplicated one moves it later. The instant is
-            # given in the MIC timeline, i.e. the reference-side step time
-            # plus the bulk delay it travels through.
-            # ⚠ That conversion uses the sequence's NOMINAL bulk delay, so
-            # on a sequence that also carries delay_jitter the true instant
-            # moves with the jitter state (up to jitter_steps_max *
-            # jitter_ms_max), and under sro by the drift accumulated at
-            # that point. Both are bounded and small next to a chunk; a
-            # consumer aligning an evaluation window tightly around the
-            # step should widen it by that much.
+            # Signed: a dropped playout buffer moves the echo earlier just as
+            # readily as a duplicated one moves it later. The instant is in the
+            # MIC timeline (reference-side step time plus the bulk delay). ⚠
+            # The conversion uses the sequence's NOMINAL bulk delay, so with
+            # delay_jitter the true instant moves with the jitter state (up to
+            # jitter_steps_max * jitter_ms_max) and under sro by the
+            # accumulated drift. Both are small next to a chunk; a consumer
+            # aligning an evaluation window tightly around the step should
+            # widen it.
             'delay_step_samples': int(delay_step),
             'delay_step_at': int(delay_step_at + bulk_delay
                                  if delay_step else -1),
@@ -3335,28 +3113,24 @@ class AecSequenceRenderer:
             # `impairments` to count those.
             'echo_path_change': motion.mode == 'echo_path_change',
             'codec_mismatch': 'codec_mismatch' in impairments,
-            # The motion axis. `path_motion` is the sequence's rendered
-            # mode; `echo_path_moving` is per chunk and MEASURED -- from
-            # the trajectory's own within-chunk weight excursion and from
-            # the chunk's reference activity -- so a chunk sitting inside a
-            # dwell is not labelled, and neither is one whose reference is
-            # silent: with no echo in the microphone there is no moving
-            # path to hear, and the label would be indistinguishable from
-            # a near-only chunk.
-            # ⚠ How much the label DISCRIMINATES depends on the chunk
-            # length; moving_chunks owns that rule.
+            # The motion axis. `path_motion` is the sequence's rendered mode;
+            # `echo_path_moving` is per chunk and MEASURED from the
+            # trajectory's within-chunk weight excursion and the chunk's
+            # reference activity, so a chunk inside a dwell is not labelled,
+            # and neither is one with a silent reference (no echo in the
+            # microphone, indistinguishable from near-only). ⚠ How much the
+            # label DISCRIMINATES depends on the chunk length; moving_chunks
+            # owns that rule.
             'path_motion': motion.mode,
             'echo_path_waypoints': list(echo_path.waypoint_ids),
             'echo_path_keyframes': keyframes,
             # The switch instant, or the start of the trajectory's last
-            # transition that still has room behind it: the renderer
-            # guarantees far-end activity inside the
-            # far_active_after_event_sec window that follows this sample,
-            # and steers a reference dropout away from it. -1 when the
-            # path never moves -- including a sequence whose drawn motion
-            # could not be given that window, which renders still and says
-            # so in `path_motion` rather than recording an event with
-            # nothing behind it.
+            # transition that still has room behind it: the renderer guarantees
+            # far-end activity inside the far_active_after_event_sec window
+            # after this sample and steers a reference dropout away from it. -1
+            # when the path never moves, including a sequence whose drawn
+            # motion could not be given that window (it renders still and says
+            # so in `path_motion`).
             'echo_path_event_at': int(motion.event_sample),
             # What the mixture solve made of this room: the depth the
             # configured path correlation needed here, and the correlation
@@ -3425,20 +3199,11 @@ def _chunk_scenario(echo_mode: str,
                     near_active: bool, moving: bool = False) -> str:
     """Per-chunk label, which is not always the sequence's label.
 
-    ⚠ A 'ref_dropout' parent sequence is mostly NOT a dropout, and an
-    'echo_path_change' sequence contains exactly one chunk where the path
-    changes.  Labelling every chunk with the sequence's intent would make the
-    honest test "every ref_dropout clip has a silent reference" fail, and would
-    let a dropout-conditioned loss term train on chunks whose reference is fully
-    active.  So the label marks the chunks that really are the event, and the
-    rest are labelled by what they actually contain.  ``sequence_scenario``
-    keeps the sequence-level intent for anyone who needs it.
-
-    ⚠ An event label DISPLACES the activity label, and a drifting sequence's
-    event covers most of its chunks.  The chunk's own ``far_active`` /
-    ``near_active`` are recorded separately for that reason -- filtering a
-    double-talk curriculum on this string alone would silently drop the moving
-    share of the corpus.
+    ⚠ A 'ref_dropout' sequence is mostly NOT a dropout and an
+    'echo_path_change' sequence has one chunk where the path changes, so the
+    label marks the chunks that really are the event and labels the rest by
+    what they contain (``sequence_scenario`` keeps the intent). An event label
+    DISPLACES the activity label: see ``far_active`` / ``near_active``.
     """
     if chunk_index in dropout_chunks:
         return 'ref_dropout'
@@ -3453,7 +3218,7 @@ def _chunk_scenario(echo_mode: str,
         return 'echo_path_moving'
     # Measured, not asserted: this label claims the reference IS playing, so a
     # chunk whose far end is actually silent must fall through and be labelled
-    # by what it contains.  Otherwise a scheduling regression upstream would
+    # by what it contains.  Otherwise a scheduling fault upstream would
     # keep emitting the label over a silent reference -- signal-identical to a
     # 'ref_dropout' chunk, and contradicting it.
     if echo_mode == 'far_active_no_echo' and far_active:
@@ -3497,9 +3262,8 @@ def _force_overlap(far_runs, near_runs, rng, sr, cfg, *, force_edges=False,
         if edge:
             # A forced edge is a guarantee, so a short draw is widened rather
             # than dropped, and a burst too short to reach the floor is covered
-            # whole instead of skipped. Applying the floor here as a `continue`
-            # silently cost ~21% of stress-combo sequences at least one of
-            # their two edges, while the config and README promised both.
+            # whole instead of skipped (a `continue` here would silently lose
+            # edges the config and README promise).
             window = max(window, min(length, edge_floor))
         elif window < floor:
             continue
@@ -3539,32 +3303,11 @@ def _apply_jittered_delay(x, base_delay, sr, rng, cfg, applied_step: int = 0,
                           step_at: int = -1):
     """Piecewise bulk delay with crossfades, i.e. playout buffer glitches.
 
-    Discrete steps rather than a slow ramp: a dropped or duplicated playout
-    buffer moves the echo by a whole block at once, which is a completely
-    different disturbance from an SRO's continuous drift.  Conflating the two
-    would let one scenario stand in for the other, and it cannot.
-
-    ⚠ The walk is floored at ``bulk_delay_ms_min``, not at zero, and a
-    NEGATIVE ``applied_step`` (a ``delay_step`` already baked into ``x`` at
-    ``step_at``) raises that floor by its own size.  Both halves are the same
-    rule -- the rendered echo is never closer to its reference than the
-    configured floor -- and both are reachable: the walk alone can take a 10 ms
-    bulk delay to 0 in two downward steps, and after a negative step the NET
-    delay is the walk minus the step, which goes negative outright, an echo
-    arriving before the reference that caused it. Inside the frozen matched
-    filter's first bin the delay estimate simply stops moving, so either one
-    costs the rest of the sequence.
-
-    ⚠ The raised floor applies only where the step is actually in the signal.
-    A walk value holds until the next boundary, so it is raised exactly when
-    the stretch it governs reaches the step; before that the net delay is the
-    walk alone and flooring it at ``bulk_delay_ms_min - step`` would make the
-    whole first part of the walk one-sided, by up to the largest step the
-    config admits.  ``step_at`` indexes the INPUT and the boundaries index the
-    delayed output, so the instant compared against them is
-    ``step_at + current``: the stretch's own delay is how much later the step
-    reaches the output, and comparing without it raises the floor up to one
-    bulk delay early.
+    Discrete steps, not a ramp: a dropped or duplicated buffer moves the echo
+    by a whole block at once, unlike SRO's drift. ⚠ The walk is floored at
+    ``bulk_delay_ms_min`` and a NEGATIVE ``applied_step`` (already baked into
+    ``x`` at ``step_at``) raises the floor by its own size, so the echo is
+    never closer to its reference than the floor.
     """
     steps = rng.randint(cfg.getint('echo_path', 'jitter_steps_min'),
                         cfg.getint('echo_path', 'jitter_steps_max'))
@@ -3593,12 +3336,11 @@ def _apply_jittered_delay(x, base_delay, sr, rng, cfg, applied_step: int = 0,
 def _convolver(signal: torch.Tensor):
     """``fftconvolve(signal, kernel)``, with the signal transformed once.
 
-    A trajectory convolves ONE signal with K responses, and the shared operand
-    is the long one: re-transforming it per position is most of the work.  The
-    arithmetic is ``fftconvolve``'s, term for term -- the same power-of-two
-    length, the same product, the same inverse and the same trim -- so the
-    result is bit-identical; only the transform of ``signal`` is remembered,
-    per length, because two responses of different lengths do not share one.
+    A trajectory convolves ONE signal with K responses and the shared operand
+    is the long one, so re-transforming it per position is most of the work.
+    The arithmetic is ``fftconvolve``'s term for term (same power-of-two
+    length, product, inverse and trim), so the result is bit-identical; only
+    the transform of ``signal`` is remembered, per length.
     """
     spectra: Dict[int, torch.Tensor] = {}
 
@@ -3655,26 +3397,10 @@ def _ensure_far_activity_after(far_runs, at: int, n_samples: int,
     """Guarantee far-end activity INSIDE ``[at, at + horizon)``.
 
     Returns the (possibly extended) run list and the window that must stay
-    active, or ``None`` when the sequence has too little left after ``at`` to
-    carry an utterance at all.
-
-    ⚠ The window is returned WHETHER OR NOT a run had to be added.  The caller
-    steers a reference dropout away from it, and a dropout zeroes the reference
-    just as thoroughly over a naturally scheduled run as over a repaired one --
-    "the schedule already covered it" is not protection, it is the thing that
-    needs protecting.
-
-    ⚠ Coverage is counted inside the window, not anywhere after ``at``.  A
-    schedule that falls silent at the event and resumes ten seconds later
-    satisfies "some far activity later in the sequence" while leaving the event
-    itself invisible, which is the case this exists to remove.
-
-    ⚠ The demand is capped at what is left of the sequence, and abandoned when
-    that remainder is shorter than ``min_run`` -- the shortest run
-    ``_render_talker`` can place an utterance into.  Buying the full amount at
-    the very end would mean starting the run BEFORE the event, and a run below
-    that floor is dropped by the talker renderer while the caller would still
-    be treating it as guaranteed.
+    active, or ``None`` when too little of the sequence is left to carry an
+    utterance. The window is returned WHETHER OR NOT a run was added (a dropout
+    zeroes a scheduled run just as thoroughly). The demand is abandoned below
+    ``min_run``, the shortest run ``_render_talker`` can place an utterance in.
     """
     at = max(0, at)
     need = min(horizon, n_samples - at)
@@ -3692,20 +3418,12 @@ def _dropout_placement(n_chunks: int, count: int, chunk_samples: int,
                        protect=None):
     """Where a ``count``-chunk reference dropout may start.
 
-    ``protect`` is the ``(start, stop)`` sample window that must keep its
-    reference (the stretch behind an echo-path event), or ``None``.  A dropout
-    zeroes WHOLE chunks, so the window is protected by the chunks it touches;
-    the dropout SHRINKS to fit beside them rather than being placed on top of
-    them, because a shorter idle stretch is still an idle stretch while an
-    event with its echo zeroed is a label describing audio that is not there.
-
-    ⚠ Only a sequence with no room at all for both -- the protected chunks are
-    every chunk -- keeps its drawn length, and there it is placed where it
-    zeroes the FEWEST protected samples.  A window that straddles the only
-    interior chunk boundary of a two-chunk sequence protects both chunks while
-    lying almost entirely in one of them, so this is the difference between
-    losing a few milliseconds of the window and losing all of it.  The measured
-    per-chunk ``far_active`` records the outcome either way.
+    ``protect`` is the ``(start, stop)`` window that must keep its reference
+    (the stretch behind an echo-path event), or ``None``. A dropout zeroes
+    WHOLE chunks, so it SHRINKS to fit beside the chunks the window touches;
+    only a sequence with no room for both keeps its drawn length, placed where
+    it zeroes the FEWEST protected samples. Per-chunk ``far_active`` records
+    the outcome.
     """
     count = max(1, count)
     keep_out = None
@@ -3732,32 +3450,10 @@ def _draw_delay_step(n_samples: int, bulk_delay: int, sr: int,
     """One signed playout-buffer step: its size in samples and when it lands.
 
     ⚠ A negative step must leave the echo at least ``bulk_delay_ms_min`` behind
-    the reference, and the magnitude is redrawn inside that headroom rather
-    than clipped to it.  Both halves matter:
-
-    * clipping to the bulk delay puts the post-step echo at 0 ms, where the
-      frozen matched filter has no bin to lock onto -- the delay estimate then
-      stays at the pre-step value and the persisted linear error is the
-      uncancelled capture for the whole rest of the sequence;
-    * clipping also produces steps smaller than ``delay_step_ms_min`` while the
-      metadata still says ``delay_step``, which makes the impairment
-      indistinguishable from ``delay_jitter``.
-
-    When the sequence's own bulk delay leaves less headroom than
-    ``delay_step_ms_min``, the step is positive instead: the echo can always be
-    pushed later, and a sequence that keeps the impairment label has to carry a
-    step inside the configured range.
-
-    ⚠ The floor holds END TO END, not just here: ``delay_jitter`` is drawn
-    independently and walks the same delay afterwards, so it takes this step
-    and raises its own lower clamp by it, so the rendered echo is at least
-    ``bulk_delay_ms_min`` behind the reference.
-
-    ⚠ With ONE exception, and it is a physical one: ``sro`` resamples the
-    played path before the delay is applied, so a positive offset advances the
-    echo by ppm x elapsed time -- 1.8 ms at the largest configured offset over
-    a 30 s sequence. Two clocks running apart do move the echo, which is what
-    that impairment is; the floor bounds everything the delay draws do.
+    the reference, so the magnitude is redrawn inside that headroom, not
+    clipped: a clip would put the echo at 0 ms (no matched-filter bin) or yield
+    steps below ``delay_step_ms_min`` that look like ``delay_jitter``. With
+    less headroom the step is positive; only ``sro`` can move the echo closer.
     """
     low = int(sr * cfg.getfloat('echo_path', 'delay_step_ms_min') / 1000)
     high = max(low, int(sr * cfg.getfloat('echo_path', 'delay_step_ms_max') / 1000))

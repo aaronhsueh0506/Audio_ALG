@@ -11,8 +11,7 @@
 struct NrGain {
     float gain;
 
-    /* Non-NULL only on the nr_gain_create() heap path. NULL on the
-     * nr_gain_init() caller-pool path. */
+    /* Non-NULL only on the nr_gain_create() heap path. */
     void* owned_heap;
 };
 
@@ -48,7 +47,7 @@ NrGain* nr_gain_init(void* mem, size_t mem_size)
     memset(mem, 0, need);
     ng = (NrGain*)mem;
     ng->gain = 1.0f;
-    ng->owned_heap = NULL;   /* caller owns it */
+    ng->owned_heap = NULL;
     return ng;
 }
 
@@ -64,8 +63,7 @@ float nr_gain_process(NrGain* ng,
         return 1.0f;
     }
 
-    /* No config, switched off, or NR itself is off while the compensation is
-     * tied to it: pin at unity. */
+    /* No config, switched off, or NR off while the compensation is tied to it: unity. */
     if (!cfg || !cfg->enable ||
         (cfg->only_when_nr_enable && !cfg->nr_enable)) {
         ng->gain = 1.0f;
@@ -105,7 +103,6 @@ float nr_gain_get_gain(const NrGain* ng)
 void nr_gain_destroy(NrGain* ng)
 {
     if (!ng) return;
-    /* Pool path (owned_heap == NULL, nr_gain_init()): caller-owned memory,
-     * nothing to free. */
+    /* Pool path: the caller owns the memory. */
     if (ng->owned_heap) free(ng->owned_heap);
 }

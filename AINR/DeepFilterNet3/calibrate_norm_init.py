@@ -3,53 +3,42 @@
 WHY THIS EXISTS
 ---------------
 ``erb_norm_init_lo_db`` / ``erb_norm_init_hi_db`` / ``spec_norm_init_lo`` /
-``spec_norm_init_hi`` in ``config.ini`` were imported verbatim from
-DeepFilterNet's libDF.  libDF aggregates each ERB band as an energy MEAN over a
-rectangular, non-overlapping filterbank (``k = 1/band_size``).  This port uses
-the triangular, overlapping, partition-of-unity bank built by ``_build_erb_fb``
--- 482 of its 513 bins are shared between bands, and the per-band weights sum to
-2..72 rather than to 1 -- so band energy grows with band width and the imported
-constants start the EMA between +3.0 dB and +18.6 dB away from where this
-model's features actually sit.
+``spec_norm_init_hi`` in ``config.ini`` are libDF's, calibrated for an energy-MEAN
+over a rectangular, non-overlapping filterbank (``k = 1/band_size``). This port
+uses the triangular, overlapping, partition-of-unity bank built by
+``_build_erb_fb`` (482 of its 513 bins are shared between bands, per-band weights
+sum to 2..72 rather than 1), so band energy grows with band width and the imported
+constants start the EMA between +3.0 dB and +18.6 dB away from where this model's
+features sit.
 
-⚠ These numbers are NOT transferable from RNNoise-ERB.  That project runs
-16 kHz with a 512-point FFT and 22 bands; this one runs
-48 kHz, 1024-point FFT, 32 bands.  Different band widths give a different
-offset per band, and the corpora differ too.  Fitting them separately is the
-whole point -- run this script here, and run RNNoise-ERB's in that directory.
+⚠ These numbers are NOT transferable from RNNoise-ERB (16 kHz, 512-point FFT,
+22 bands vs 48 kHz, 1024-point FFT, 32 bands); run this script here and
+RNNoise-ERB's in that directory.
 
-Why it matters at all: a constant offset would normally wash out, because
-``band_mean_norm`` keeps a per-band running mean that converges away from its
-initial value.  It does not wash out here.  At tau = 1 s, hop 512, 48 kHz,
-3*tau is 281 frames and a 3-second training segment is 281 frames, so the
-normaliser is still converging when the example ends and every frame the model
-sees lies in the init-dominated transient.  (Measured against the *realised*
-alpha of 0.989 rather than nominal tau, 3*tau is 273 frames -- 3-decimal
-rounding makes the effective tau 0.9644 s, see config.ini [feature].  The
-conclusion holds under either figure.)
+A constant offset would normally wash out as ``band_mean_norm``'s running mean
+converges, but at tau = 1 s, hop 512, 48 kHz, 3*tau is 281 frames, the length
+of a 3-second training segment, so every frame lies in the init-dominated
+transient. (Against the realised alpha of 0.989, 3*tau is 273 frames: 3-decimal
+rounding makes the effective tau 0.9644 s, see config.ini [feature]; the
+conclusion holds either way.)
 
-⚠ EXPECT A LARGE DELTA AGAINST config.ini, AND DO NOT "CORRECT" IT.
-config.ini ships libDF's literal ``-60/-90`` and ``0.001/0.0001``. This script
-will recommend something ~39 dB away, because those literals are calibrated for
-libDF's rectangular/energy-mean bank and 1/N analysis scale, not for this port's
-triangular/energy-sum bank and ``normalized=True``. That gap is the known scale
-shift, not a corpus problem.
-
-The corpus-fitted pair (-17.35/-57.81, rounded to -15/-60) is not used:
-training diverged under it and converges under the literals, on an identical
-corpus, both runs from scratch. So this script's output is a measurement, not
-a recommendation to paste. Read UPSTREAM_ALIGNMENT.md do-not-touch item 4
-before acting on it. Seven candidate mechanisms for that divergence were
-measured and none survived, so the reason the better-fitting init trains worse
-is open.
+⚠ EXPECT A LARGE DELTA AGAINST config.ini, AND DO NOT "CORRECT" IT. config.ini
+ships libDF's literal ``-60/-90`` and ``0.001/0.0001``; this script will
+recommend something ~39 dB away, because those literals are calibrated for
+libDF's rectangular/energy-mean bank and 1/N analysis scale, not for this
+port's triangular/energy-sum bank and ``normalized=True``. The corpus-fitted
+pair (-17.35/-57.81, rounded to -15/-60) is not used: training diverged under
+it and converges under the literals, on an identical corpus. So this script's
+output is a measurement, not a recommendation to paste; read
+UPSTREAM_ALIGNMENT.md do-not-touch item 4 before acting on it.
 
 USAGE
 -----
     python calibrate_norm_init.py --config config.ini --packed-dir /path/to/48k
 
 Run it on the machine holding the packed corpus, against the SAME corpus the
-model will train on.  It prints the measured distribution and the config lines
-to paste back.  It modifies nothing.
+model will train on. It prints the measured distribution and the config lines
+to paste back, and modifies nothing.
 """
 
 import argparse

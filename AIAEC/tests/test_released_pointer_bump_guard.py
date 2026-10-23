@@ -1,29 +1,21 @@
 """Staleness guard for RELEASED_INFERENCE_BEHAVIOR_HASH_COMPATIBILITY.
 
-Opus review item C2 (2026-10-20): an agent bumping that dict's single entry
-ASSUMED the pointer's prior value was the hash immediately before their own
-change, bumped it to their new hash, and in doing so silently re-admitted
-roughly a month and 21 unrelated lib/aec commits of un-vetted drift that had
-accumulated on the pointer in between. The pre-existing test
-(``test_released_checkpoint_exception_is_separate_and_targets_this_build`` in
-``test_linear_aec_behavior_migration.py``) only asserts the pointer equals
-the LIVE hash right now; it cannot notice that the gap between two bumps was
-never individually vetted.
+A bump of that dict's single entry must not assume the pointer's prior value
+was the hash immediately before the author's own change, or unvetted drift
+accumulated on the pointer is silently re-admitted;
+``test_released_checkpoint_exception_is_separate_and_targets_this_build``
+(``test_linear_aec_behavior_migration.py``) only asserts the pointer equals the
+LIVE hash.
 
-This module tests ``released_pointer_bump_guard.py``'s two layers (see that
-module's docstring for the full design), and -- the point of this file --
-proves each layer can actually fail:
+This module tests the two layers of ``released_pointer_bump_guard.py`` and
+proves each can fail:
 
   * ``test_chain_checker_rejects_*`` / ``test_head_check_rejects_*`` feed the
-    pure checker functions the EXACT bad input the opus bug produced (a row
-    naming the wrong "old" value, or no row at all) and assert it is
-    rejected, before asserting the correct form passes.
+    pure checkers the EXACT bad input (a row naming the wrong "old" value, or no
+    row at all) and assert it is rejected before the correct form passes.
   * ``test_bump_table_chains_to_the_live_pointer_value`` and
-    ``test_live_worktree_bump_is_documented_against_head`` run the real
-    checkers against this repo's real ``linear_aec.py`` (the latter via
-    ``git show HEAD:...``), so a future bump that skips updating
-    ``RELEASED_INFERENCE_POINTER_BUMPS`` fails `make test` / this file here,
-    not just a convention someone has to remember.
+    ``test_live_worktree_bump_is_documented_against_head`` run the real checkers
+    against this repo's ``linear_aec.py`` (the latter via ``git show HEAD:...``).
 
 Run:
     python3 -m pytest AIAEC/tests/test_released_pointer_bump_guard.py
@@ -48,10 +40,9 @@ _A = "a" * 64
 _B = "b" * 64
 _C = "c" * 64
 _D = "d" * 64
-# A real-looking but WRONG value: close to the real pre-bump value in
-# spelling (it is the prefix/suffix the opus-bug comment actually names
-# elsewhere in linear_aec.py: "428aa9b7...562d") but not literally the hash
-# HEAD has. 64 hex chars, deliberately not any real hash here.
+# A real-looking but WRONG value: close to the real pre-bump value in spelling
+# but not literally the hash HEAD has. 64 hex chars, deliberately not any real
+# hash here.
 _PLAUSIBLE_WRONG = "428aa9b796c2" + ("0" * (64 - len("428aa9b796c2") - 4)) + "562d"
 assert len(_PLAUSIBLE_WRONG) == 64
 
@@ -67,9 +58,8 @@ def _live_pointer_value():
 # --- Layer 1: check_chain -- stateless, survives any future commit ---------
 
 def test_chain_checker_rejects_a_row_whose_old_does_not_match_the_priors_new():
-    """Can-fail proof. Reproduces the opus bug shape: row 1's `old` is a
-    plausible-looking value that is NOT row 0's `new` (the author assumed/
-    recomputed it instead of reading it off the chain)."""
+    """Can-fail proof. Row 1's `old` is a plausible-looking value that is NOT
+    row 0's `new` (assumed or recomputed instead of read off the chain)."""
     bad = (
         ("2026-09-22", _A, _B),
         ("2026-10-20", _C, _D),  # WRONG: should chain from _B, not _C
@@ -117,10 +107,9 @@ def test_bump_table_chains_to_the_live_pointer_value():
 # --- Layer 2: check_bump_against_head -- the bump-time catch ---------------
 
 def test_head_check_rejects_a_bump_with_the_wrong_assumed_old_value():
-    """Can-fail proof. THE exact failure mode from the opus review: the
-    pointer is bumped, and a row IS added, but that row's `old` is not what
-    HEAD actually had -- it is a value the author assumed or independently
-    recomputed, not one copied from `git show HEAD:...`."""
+    """Can-fail proof. The pointer is bumped and a row IS added, but that row's
+    `old` is not what HEAD had: a value the author assumed or recomputed, not
+    one copied from `git show HEAD:...`."""
     head_value = "5fe64e46480c7e2a75c90718f1b64c09ca29f611d09713ea4ec2a9ef61c813f4"
     work_value = "419f473e609ec0c3fd645a9dcb7ccd53a742fb8c22d17a45578e6cc6df2ff8fa"
     bumps = (("2026-10-20", _PLAUSIBLE_WRONG, work_value),)
@@ -130,8 +119,7 @@ def test_head_check_rejects_a_bump_with_the_wrong_assumed_old_value():
 
 
 def test_head_check_rejects_a_bump_with_no_row_at_all():
-    """Can-fail proof. The value moved, and the table has no row for it --
-    the original bug before any table existed."""
+    """Can-fail proof. The value moved and the table has no row for it."""
     violations = check_bump_against_head(_A, _B, ())
     assert violations != []
 

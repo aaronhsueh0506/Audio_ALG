@@ -44,9 +44,9 @@ class SignalGrid:
         return self.sample_rate / self.hop_len
 
     def delay_frames(self, seconds: float) -> int:
-        # This is a maximum supported delay, not a nearest-duration estimate.
-        # Rounding 62.5 frames down to 62 silently loses the last 8 ms of a
-        # requested one-second search range on the 16 kHz/256-hop grid.
+        # Maximum supported delay, not a nearest-duration estimate: rounding 62.5
+        # frames down to 62 would lose the last 8 ms of a one-second range on the
+        # 16 kHz/256-hop grid.
         return max(1, int(math.ceil(seconds * self.frame_rate)))
 
 
@@ -205,9 +205,8 @@ def causal_delay_stack(x: Tensor, delays: int) -> Tensor:
 class FrameDelayAttention(nn.Module):
     """Per-frame causal cross-attention used by DeepVQE/Align-ULCNet."""
 
-    # Bound the broadcast temporary without changing the original reduction
-    # order.  This matters for long offline evaluation files: materializing all
-    # [B,C,T,D,F] products at once can require gigabytes.
+    # Bound the broadcast temporary (keeping the reduction order) so long files do
+    # not materialize every [B,C,T,D,F] product at once.
     _TIME_CHUNK_FRAMES = 64
 
     def __init__(self, mic_channels: int, far_channels: int,
@@ -227,9 +226,8 @@ class FrameDelayAttention(nn.Module):
             raise ValueError("attention feature grids must match")
         q = self.query(mic)
         k_delayed = causal_delay_stack(self.key(far), self.max_delay_frames)
-        # [B,H,T,D], dot product over frequency.  Preserve the original
-        # multiply-then-sum arithmetic exactly, but limit its temporary to one
-        # time chunk instead of the whole utterance.
+        # [B,H,T,D], dot product over frequency: multiply-then-sum, limited to one
+        # time chunk.
         logits = torch.cat([
             (q[:, :, start:end].unsqueeze(3)
              * k_delayed[:, :, start:end]).sum(dim=-1)

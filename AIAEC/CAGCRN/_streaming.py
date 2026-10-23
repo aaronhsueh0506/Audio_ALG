@@ -6,20 +6,13 @@
     python3 inference.py checkpoint.pth mic.wav far.wav out.wav --verify
 
 This module binds inference.py's complete STFT -> model -> ISTFT chain (the
-shared hop loop in AIAEC/_cli_common.py) to this candidate, one hop at a
-time through StreamSTFT / forward_stream / StreamISTFT. On startup it prints
-the per-invocation I/O table and, after the first frame, the state inventory --
-together these are the deployment contract an NPU/C port must reproduce.
-
-CAGCRN is an end-to-end candidate: inference.py feeds the microphone and
-far-end reference straight into the network, so there is no linear-AEC
-(PBFDKF) frontend to run here.  For candidates that do consume a PBFDKF
-error signal, streaming that frontend is a separate C-side seam -- this CLI
-verifies the NN streaming.
-
-``--verify`` additionally runs the offline whole-wav forward and prints the
-max-abs / RMS difference between the two output waveforms.  It is DIAGNOSTICS
-ONLY: no tolerance is applied and the exit code never changes.  The streaming
+shared hop loop in AIAEC/_cli_common.py) to this candidate, one hop at a time
+through StreamSTFT / forward_stream / StreamISTFT. On startup it prints the
+per-invocation I/O table and, after the first frame, the state inventory: the
+deployment contract an NPU/C port must reproduce. CAGCRN is end-to-end, so
+there is no linear-AEC (PBFDKF) frontend to run here. ``--verify`` also runs
+the offline whole-wav forward and prints the max-abs / RMS difference as
+DIAGNOSTICS ONLY (no tolerance; the exit code never changes). The streaming
 equivalence gate is
 tests/test_streaming_cagcrn.py::test_stream_matches_offline, not this flag.
 """

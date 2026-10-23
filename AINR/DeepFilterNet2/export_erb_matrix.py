@@ -58,8 +58,7 @@ def write_runtime_bins(config_path, out_dir):
     erb_fwd.bin bin-major [n_bins][n_erb], erb_inv.bin band-major
     [n_erb][n_bins], plus erb_matrices.json. The library takes pointers only
     (dfn2_set_erb_matrices), so the deployment loader owns the files and can
-    swap them at any time. The contract test pins the model's own buffers
-    against these files.
+    swap them at any time.
     """
     import configparser as _configparser
 

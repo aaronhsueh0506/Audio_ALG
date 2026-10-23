@@ -1,11 +1,7 @@
-/**
- * Host-only raw-float runner for recording validation.
- *
- * Input mic: interleaved float32 [frames][4]
- * Input ref: mono float32 [frames]
- * Optional VAD: uint8 [complete_hops], nonzero = target speech
- * Output: mono float32 [complete_hops * hop]
- */
+/** Host-only raw-float runner for recording validation.
+ * Input mic: interleaved float32 [frames][4]; input ref: mono float32 [frames];
+ * optional VAD: uint8 [complete_hops], nonzero = target speech; output: mono float32
+ * [complete_hops * hop]. */
 
 #include <errno.h>
 #include <math.h>
@@ -131,14 +127,14 @@ static int raw_process(void *user, McabHopView *view, int frame) {
 }
 static int raw_consume(void *user, McabHopView *view, int frame) {
     RawSample *s=user; (void)view; (void)frame;
-        if (fwrite(s->output, sizeof(float), (size_t)s->hop, s->output_file) !=
-            (size_t)s->hop) {
-            fprintf(stderr, "failed to write output frame\n");
-            return 1;
-        }
-        s->adaptive_frames += s->info.bf_adaptive != 0;
-        s->doa_frames += isfinite(s->info.doa_raw_rad);
-        s->doa_analysis_frames += s->info.doa_analysis_frames;
+    if (fwrite(s->output, sizeof(float), (size_t)s->hop, s->output_file) !=
+        (size_t)s->hop) {
+        fprintf(stderr, "failed to write output frame\n");
+        return 1;
+    }
+    s->adaptive_frames += s->info.bf_adaptive != 0;
+    s->doa_frames += isfinite(s->info.doa_raw_rad);
+    s->doa_analysis_frames += s->info.doa_analysis_frames;
     return 0;
 }
 static int raw_finish(void *user, McabHopView *view, int processed) {
@@ -194,7 +190,6 @@ static int raw_finish(void *user, McabHopView *view, int processed) {
            processed > 0 ? s->info.delay.solid : 0,
            final_raw, final_smooth, final_used);
     return processed > 0 ? 0 : 1;
-
 }
 static void raw_cleanup(void *user) {
     RawSample *s=user;

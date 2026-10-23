@@ -1,22 +1,15 @@
 """The synthetic corpus the ledger/rematerialization tests share.
 
-Lives in a module of its own, rather than in ``conftest.py``, because two test
-files import these three names directly and pytest gives every ``conftest.py``
-the same top-level module name ``conftest``. Collecting AIAEC together with any
-sibling package that also has one -- ``AINR/conftest.py`` does -- makes
-``from conftest import ...`` resolve to whichever was imported first, and the
-whole run dies at collection. A uniquely named module cannot be shadowed that
-way. ``tests/test_cross_package_collection.py`` holds the gate.
-
-Both suites need the SAME corpus shape: change the stem set or the echo and
-both must move together, which is only true while there is one definition to
-move.
-
-Deliberately not reusing dataset_gen/tests/test_aec_dataset.py's `corpus`
-fixture: that one is module-scoped and renders a full speech/noise/RIR library
-through the real pipeline. These tests need per-test, mutable roots -- they
-delete a chunk mid-sequence, truncate a channel, and build two side-by-side
-corpora to compare -- so a shared immutable fixture would leak between them.
+A module of its own, not ``conftest.py``: pytest gives every ``conftest.py``
+the same top-level module name, so collecting AIAEC together with a sibling
+package that has one (``AINR/conftest.py``) makes ``from conftest import ...``
+resolve to whichever was imported first and the run dies at collection; a
+uniquely named module cannot be shadowed
+(``tests/test_cross_package_collection.py`` holds the gate). Both suites need
+the SAME corpus shape, so there is one definition. It does not reuse
+dataset_gen/tests/test_aec_dataset.py's module-scoped `corpus` fixture: these
+tests need per-test mutable roots (they delete a chunk mid-sequence, truncate a
+channel and build two corpora side by side).
 """
 import configparser
 import os

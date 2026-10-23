@@ -210,9 +210,8 @@ audio_pipeline_get_last_timing(p, &t);
 | `synth_us` | 逆轉換、加窗 overlap-add、hop 送出與位移 |
 
 **實測：`delay_us` 通常是整個 hop 最大的一塊。** 16 kHz/256 ne10 上量到
-60.9%，而拆出去之後 `frontend_us` 只剩 6.8%——也就是說舊版把 matched filter
-和 mic HPF/RSA/shadow filter 混在同一欄時，那一欄的絕大部分其實都是 matched
-filter。這條線直接對應 `delay_num_filters`（1..5）這個可調旋鈕。
+60.9%，`frontend_us`（mic HPF/RSA/shadow filter）只有 6.8%。這條線直接對應
+`delay_num_filters`（1..5）這個可調旋鈕。
 
 **與四聲道版本的差異**：那邊把 estimator **外提**到 wrapper、四條 lane 共用，
 所以 `delay_us` 是 wrapper 自己的階段；這裡 estimator 留在單一 AEC 內部，經
@@ -297,7 +296,7 @@ hop 上生效：double-talk 期間套用的是 DT 地板，而 DT 地板在三�
 
 ## 4. Config 完整參考
 
-`AudioPipelineConfig` 共 7 個欄位。取得預設值的唯一正確方式：
+`AudioPipelineConfig` 共 13 個欄位。取得預設值的唯一正確方式：
 
 ```c
 AudioPipelineConfig cfg = audio_pipeline_default_config(16000);
@@ -314,13 +313,17 @@ AudioPipelineConfig cfg = audio_pipeline_default_config(16000);
 |---|---|---|---|---|
 | `sample_rate` | `int` | 你傳給 `default_config()` 的值 | `8000` / `16000` / `48000`。其他一律拒絕（例如 `44100` 會在任何 size 運算之前就被擋掉） | 設成你音訊實際的取樣率。這個值同時決定預設 grid |
 | `fft_size` | `int` | `0` | `0` = 依 rate 取預設。明確指定時：8 kHz 只接受 `256`；16 kHz 接受 `256` 或 `512`；48 kHz 只接受 `1024`。其他組合拒絕 | 除非你有明確理由要 16 kHz 的 512 grid，否則留 `0` |
-| `aec_preset` | `AecPreset` | `AEC_PRESET_BALANCED`（= 1） | `AEC_PRESET_MILD`(0) / `AEC_PRESET_BALANCED`(1) / `AEC_PRESET_AGGRESSIVE`(2)。列舉以外的整數會被拒絕（**不會**默默 fallback 成 balanced） | 近端保留優先 → `MILD`；回聲抑制優先 → `AGGRESSIVE`；不確定就留預設 |
-| `nr_mode` | `AnrMode` | `ANR_MODE_BALANCED`（= 2） | `ANR_MODE_MILD`(0) / `ANR_MODE_MODERATE`(1) / `ANR_MODE_BALANCED`(2) / `ANR_MODE_AGGRESSIVE`(3)。列舉以外拒絕 | 降噪強度。四級都可用（CLI 只認得其中三個，library API 四個都能設） |
+| `filter_length` | `int` | `0` | `0` = 依 rate 取預設；明確指定時由 AEC 的驗證器檢查 | PBFDKF taps，init 後不可變；沒有明確需求就留 `0` |
+| `delay_mode` | `AecDelayMode` | `AEC_DELAY_MATCHED` | `AEC_DELAY_MATCHED` / `AEC_DELAY_FIXED` / `AEC_DELAY_EXTERNAL_ALIGNED` | 語意同 `lib/aec`；記憶體差異見 §4.5a |
+| `delay_num_filters` | `int` | `5` | 僅 `MATCHED` 有效：`[1, 5]`；其他模式要求維持預設的 `5` | matched-filter bank 大小，決定 bulk delay 搜尋範圍；init 參數，不是 runtime setter |
+| `fixed_delay_samples` | `int` | `-1` | 僅 `FIXED` 有效（原生取樣點數，上限為該取樣率下的兩分鐘）；其他模式須為 `-1` | 已知固定 delay 時使用 |
+| `aec_preset` | `AecPreset` | `AEC_PRESET_BALANCED`（= 1） | `AEC_PRESET_MILD`(0) / `AEC_PRESET_BALANCED`(1) / `AEC_PRESET_AGGRESSIVE`(2) / `AEC_PRESET_NO_FLOOR`(3)。列舉以外的整數會被拒絕（**不會**默默 fallback 成 balanced） | 近端保留優先 → `MILD`；回聲抑制優先 → `AGGRESSIVE`；不確定就留預設 |
+| `nr_mode` | `AnrMode` | `ANR_MODE_BALANCED`（= 2） | `ANR_MODE_MILD`(0) / `ANR_MODE_MODERATE`(1) / `ANR_MODE_BALANCED`(2) / `ANR_MODE_AGGRESSIVE`(3)。列舉以外拒絕 | 降噪強度。四級都可用（CLI 的 `--nr-preset` 與 library API 都接受四個） |
 | `enable_nr` | `int`（bool） | `1` | 只接受 `0` 或 `1` | `0` = 不建 MMSE-LSA（state 不進 pool、`get_nr()` 回 `NULL`），`g_total` 只剩 `G_res`。`aec_only=1` 時無作用 |
 | `enable_res` | `int`（bool） | `1` | 只接受 `0` 或 `1` | `0` = 不套 AEC3 殘留 gain（`G_res` 視為 1），`g_total` 只剩 `G_nr`，CNG 因為沒有被 RES 挖掉的 bin 而不填。兩者都 `0` 就是線性殘差經合成直通。`aec_only=1` 時無作用 |
 | `aec_only` | `int`（bool） | `0` | 只接受 `0` 或 `1`。`2` 之類的「truthy」值會被拒絕 | `1` = 只跑 linear AEC，完全跳過 NR/RES/最終 OLA。用來隔離問題，或你自己接後級。此時 `get_nr()` 回 `NULL`，且 FFT/NR/pipeline buffer 都不配置 |
 | `enable_cng` | `int`（bool） | `1` | 只接受 `0` 或 `1` | `1` = 在 AEC 抑制掉的 bin 填舒適噪音，位準再乘該 bin 的 NR gain、下限 −10 dB（NR 看不到 comfort noise，在此補套）。實際生效值是「AEC preset 自己的 `enable_cng`」與這個欄位的 AND |
-| `legacy_amin` | `int`（bool） | `0` | 只接受 `0` 或 `1` | `1` = 回到舊的 noise-only NR：noise floor 不摺入 R²。只用於比對舊行為，新整合請保持 `0` |
+| `legacy_amin` | `int`（bool） | `0` | 只接受 `0` 或 `1` | `1` = noise-only NR：noise floor 不摺入 R²。只用於比對，新整合請保持 `0` |
 
 ### 4.2 Grid（由 `sample_rate` + `fft_size` 唯一決定）
 
@@ -568,7 +571,7 @@ FFT/NR/pipeline 分項），數字與 `lib/aec` 自己的 `aec_get_mem_size()` �
 |---:|---|---|---|
 | 0 | `descriptor_version` | `uint32_t` | `2` |
 | 4 | `layout_version` | `uint32_t` | `15` |
-| 8 | `backend_id` | `uint32_t` | `2` = NE10（目前唯一的 FFT 後端）；`1` 已退役、不會再回傳；永遠不會是 0 |
+| 8 | `backend_id` | `uint32_t` | `2` = NE10（目前唯一的 FFT 後端）；永遠不會是 0 |
 | 12 | `build_flags_hash` | `uint32_t` | FNV-1a-32，隨 build 變動 |
 | 16 | `alignment` | `uint32_t` | `16` |
 | 20 | `reserved` | `uint32_t` | `0`（必須為 0，`init_ex()` 會驗證） |
@@ -593,7 +596,7 @@ FFT/NR/pipeline 分項），數字與 `lib/aec` 自己的 `aec_get_mem_size()` �
 ### 8.4 相容性規則（給整合者的三條）
 
 1. **descriptor 永遠現查現用**。不要存進 NVRAM、不要跨 firmware rebuild 沿用。
-2. **舊 `backend_id=1`（已移除的 KISS 後端）的 descriptor 一律不相容**。即使 `bytes` 剛好相同，
+2. **`backend_id` 不是 2 的 descriptor 一律不相容**。即使 `bytes` 剛好相同，
    它也不是 NE10 build 的 descriptor，不能代用。
 3. **升級 library 之後一定要重跑一次 `get_mem_requirements()`**，
    並確認你的 pool 預算仍然足夠。

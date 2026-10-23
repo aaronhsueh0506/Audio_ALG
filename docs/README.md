@@ -1,8 +1,7 @@
 # Documentation index
 
-Use this page to distinguish current integration contracts from dated audit
-records. Source code and tests win if a dated report disagrees with a current
-README.
+Index of the current integration contracts. Source code and tests win if a
+document disagrees with them.
 
 ## Current sources of truth
 
@@ -29,7 +28,7 @@ README.
 | Mono pipeline integration (config/pool/errors) | [`integration_mono_zh_TW.md`](integration_mono_zh_TW.md) |
 | 4ch core integration (`4aec_nr_res`) | [`integration_4ch_core_zh_TW.md`](integration_4ch_core_zh_TW.md) |
 | 4ch spatial wrapper integration (SRP/GSC) | [`integration_4ch_spatial_zh_TW.md`](integration_4ch_spatial_zh_TW.md) |
-| Release gate and reference test counts | [`release_checklist.md`](release_checklist.md) |
+| Release gate and reference test targets | [`release_checklist.md`](release_checklist.md) |
 | Development / submodules | [`development.md`](development.md) |
 
 The offline HTML documentation site lives in [`html/`](html/index.html): one
@@ -67,6 +66,5 @@ When code changes:
 
 1. update the nearest component README and its checkpoint/signal-grid contract;
 2. update the root summary only if repository boundaries changed;
-3. keep dated audits immutable except for a short superseded notice;
-4. move obsolete design narratives to `docs/archive/` instead of leaving them
+3. move obsolete design narratives to `docs/archive/` instead of leaving them
    mixed with current setup instructions.

@@ -97,11 +97,10 @@ def input_range_report(arrays, policy):
     """Per-tensor calibration ranges, minus the tensors PTQ must not touch.
 
     A tensor named in ``state_precision_policy`` carries its policy marker
-    instead of a range. Emitting both would be worse than useless: the range
-    of an undecayed accumulator is a function of how long this capture
-    happened to run, and float percentiles over the int64 frame counter
-    describe nothing at all -- yet a quantizer reading the ``inputs`` block has
-    no way to know it was meant to skip those entries.
+    instead of a range: the range of an undecayed accumulator depends on how
+    long the capture ran, and percentiles over the int64 frame counter describe
+    nothing, yet a quantizer reading the ``inputs`` block could not know to
+    skip them.
     """
     report = {}
     for name, value in arrays.items():

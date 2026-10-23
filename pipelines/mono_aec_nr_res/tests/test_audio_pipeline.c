@@ -1,74 +1,15 @@
 /**
- * tests/test_audio_pipeline.c — acceptance tests for
- * mono_aec_nr_res/audio_pipeline.h.
- *
- * Not a DSP-quality test (no AECMOS, no reference WAVs) — a contract test
- * for the library API surface itself: does the pool-first path behave
- * exactly like the heap-convenience path, does it reject what it must
- * reject, and is teardown safe to call more than once. Style mirrors
- * lib/aec/c_impl/test/test_zero_heap_aec.c (LCG synthetic input, a
- * 0xA5-poisoned pool to prove the "no blanket memset needed" claim,
- * PASS/FAIL prints, nonzero exit on any failure).
- *
- * Per-rate coverage: every case below (validation, pool rejection,
- * create-vs-init byte-equal parity, destroy idempotence) runs once per
- * supported sample rate — 8000 / 16000 / 48000 — not just 16000. The
- * create-vs-init byte-equality (heap vs. an 0xA5-poisoned pool) at every
- * rate, on whichever BACKEND this binary was built with, is the load-bearing
- * closure: it is the only place that proves the pool-carve arithmetic
- * (pipeline_pool_size/pipeline_build in audio_pipeline.c) agrees with itself
- * across the full 8k/16k/48k FFT-grid range.
- *
- * 48 kHz runs a REDUCED hop count (HOP_COUNT_48K, see below) — AEC's
- * filter_length (and therefore n_partitions/convolution cost) and the
- * pipeline's own hop/n_freqs all scale up substantially above 16 kHz
- * (the 48 kHz grid), so 1000 hops there is materially slower for no added
- * coverage value versus 8k/16k's 1000; the byte-equal parity check is
- * exactly as conclusive at 300 hops (same LCG-seeded stream, same
- * poisoned-pool-vs-heap comparison, just fewer of them).
- *
- * The sample_rate=44100 rate-whitelist rejection is checked exactly ONCE
- * (independent of the per-rate loop below) — it is a property of the
- * validator, not of any one supported rate.
- *
- * Also covers reject-first AudioPipelineConfig validation in
- * derive_dims_and_configs() (audio_pipeline.c): an out-of-enum aec_preset/
- * nr_mode and an out-of-{0,1} bool-typed field must all be rejected by both
- * audio_pipeline_get_mem_requirements() and audio_pipeline_init() — see
- * test_config_validation_rejects().
- *
- * Build (from pipelines/, after `make libs` for the selected BACKEND):
- *   make test
- *
- * Standalone (no Makefile; <libs> are the ne10 archives the Makefile builds):
- *   cc -O2 -std=gnu99 -I../lib/aec/c_impl/include -I../lib/aec/c_impl/example \
- *      -I../lib/nr/c_impl/include -I../../audiolib/common/include \
- *      -DAUDIO_PIPELINE_BACKEND_STR=\"ne10\" \
- *      tests/test_audio_pipeline.c audio_pipeline.c \
- *      <libaec.a> <libanr.a> <libaudio_common.a> -lm -o /tmp/tap && /tmp/tap
- *
- * Cases (each run once per rate in RATES[] below, unless noted "once"):
- *   1. audio_pipeline_get_mem_requirements: NULL cfg/out rejected,
- *      sample_rate=44100 rejected (once), sample_rate=<rate> accepted.
- *   2. audio_pipeline_init: a misaligned pool rejected, an undersized pool
- *      rejected.
- *   3. audio_pipeline_create() (heap) vs audio_pipeline_init() (caller pool,
- *      deliberately poisoned with 0xA5 before init) produce BYTE-IDENTICAL
- *      output over HOP_COUNT (or HOP_COUNT_48K) hops of LCG synthetic
- *      mic/ref input — the direct proof of audio_pipeline_init's "a dirty
- *      pool is safe without the caller's blanket memset" claim.
- *   4. audio_pipeline_destroy() idempotence + NULL-safety on a pool-resident
- *      instance, and that the pool itself is untouched/reusable afterward.
- *   5. (once) reject-first AudioPipelineConfig validation: an
- *      out-of-enum aec_preset/nr_mode and a bool field holding 2 (or -1)
- *      are all rejected by get_mem_requirements() AND init().
- *   6. (once) audio_pipeline_init_ex()'s `expected` descriptor gate: a
- *      correct/current descriptor is accepted;
- *      a NULL descriptor behaves exactly like audio_pipeline_init(); a
- *      descriptor with a tampered descriptor_version, layout_version,
- *      backend_id, build_flags_hash, alignment, or bytes (or an undersized
- *      `bytes` pool argument alongside an otherwise-correct descriptor) is
- *      each independently rejected; the pool remains usable afterward.
+ * tests/test_audio_pipeline.c -- acceptance tests for mono_aec_nr_res/audio_pipeline.h.
+ * A contract test of the API surface, not DSP quality: the pool-first path behaves exactly
+ * like the heap path, rejects what it must reject, and teardown is safe more than once.
+ * LCG synthetic input, a 0xA5-poisoned pool, PASS/FAIL prints, nonzero exit on any failure.
+ * Per-rate cases (validation, pool rejection, create-vs-init byte-equal parity, destroy
+ * idempotence) run at 8000 / 16000 / 48000 Hz; 48 kHz runs HOP_COUNT_48K hops because its
+ * filter length and grid are much larger. The heap-vs-poisoned-pool byte-equal parity is
+ * the only proof that the pool-carve arithmetic agrees with itself on every grid.
+ * Run once: the 44100 whitelist rejection, reject-first config validation (out-of-enum
+ * aec_preset/nr_mode, bool fields outside {0,1}) and the init_ex `expected` descriptor gate.
+ * Build and run: `make test` in pipelines/.
  */
 #include "audio_pipeline.h"
 #include "common/se_anr_stage.h"   /* se_anr_stage_gain */
@@ -96,10 +37,7 @@ static const float kCngTable[32] = {
     -0.27589938f};
 
 #define HOP_COUNT      1000   /* 8 kHz / 16 kHz */
-#define HOP_COUNT_48K   300   /* 48 kHz: filter_length/hop/n_freqs all scale up
-                                * substantially (48 kHz grid) -- 300 hops
-                                * keeps runtime sane without weakening the
-                                * byte-equal parity proof (see file header). */
+#define HOP_COUNT_48K   300   /* 48 kHz: larger filter_length/hop/n_freqs, so fewer hops (see file header) */
 
 typedef struct { int sample_rate; int fft_size; } GridCase;
 static const GridCase GRIDS[] = {
@@ -310,13 +248,9 @@ static void reset_scene_hop(unsigned int* rng, float* mic, float* ref, int hop,
     for (int i = 0; i < hop; i++) hist[hop - 1 - i] = ref[i];
 }
 
-/* audio_pipeline_reset()'s documented contract (audio_pipeline.h): equivalent
- * to a fresh audio_pipeline_init() on the same pool/cfg. That was prose until
- * the AEC's own reset was made to deliver it -- state survived aec_reset()
- * that a fresh instance never has, so the first post-reset hop of this
- * pipeline already differed from a never-warmed twin. Run with CNG both ON
- * and OFF: reset re-seeds the comfort-noise RNG to the same construction-time
- * seed, so the CNG path is compared for real rather than excused. */
+/* audio_pipeline_reset()'s documented contract (audio_pipeline.h): equivalent to a fresh
+ * audio_pipeline_init() on the same pool/cfg. Run with CNG both ON and OFF: reset re-seeds
+ * the comfort-noise RNG to its construction-time seed, so the CNG path is compared for real. */
 static void test_reset_equals_fresh_instance(int sr, int fft_size,
                                              int enable_cng, int enable_nr) {
     enum { HIST = 8192, WARM = 600, COMPARE = 300 };
@@ -540,18 +474,14 @@ static void test_config_validation_rejects(void) {
     free(pool);
 }
 
-/* NR and RES are the post path's two gain sources. Two witnesses hold from
- * outside: (1) MMSE-LSA passes through (gain 1.0) for its first
- * num_init_frames hops, so an enable_nr=0 instance must match an enable_nr=1
- * instance bit for bit over that window and diverge afterwards -- a RES-only
- * branch with any scaling of its own breaks the equality; (2) with NR, RES
- * and CNG all off the post path applies gain 1.0 to the seam spectrum, so
- * resynthesising that same spectrum here (read back through the AEC seam,
- * one sqrt-Hann WOLA) must reproduce the output to float precision, while the
- * default instance on the same stimulus must not. aec_only's time output is
- * deliberately NOT the reference: it is the AEC's own emitted hop, not the
- * seam spectrum, and the two differ by design. The NR-disabled build also
- * drops the denoiser from the pool and reports no denoiser handle. */
+/* NR and RES are the post path's two gain sources. Two witnesses hold from outside:
+ * (1) MMSE-LSA passes through (gain 1.0) for its first num_init_frames hops, so an
+ * enable_nr=0 instance must match an enable_nr=1 instance bit for bit over that window and
+ * diverge afterwards; (2) with NR, RES and CNG all off the post path applies gain 1.0 to the
+ * seam spectrum, so resynthesising that spectrum here (read back through the AEC seam, one
+ * sqrt-Hann WOLA) must reproduce the output to float precision, while the default instance
+ * must not. aec_only's time output is not the reference (it is the AEC's own emitted hop).
+ * The NR-disabled build also drops the denoiser from the pool. */
 static void test_nr_res_switches(void) {
     AudioPipelineConfig on_cfg = audio_pipeline_default_config(16000);
     AudioPipelineConfig nr_off_cfg, thru_cfg;
@@ -660,12 +590,9 @@ static void test_nr_res_switches(void) {
     audio_pipeline_destroy(thru);
 }
 
-/* audio_pipeline_init_ex()'s `expected` descriptor gate. Run once (16000 Hz,
- * an arbitrary representative rate) -- like the config validation above,
- * this exercises a comparison the function does against a freshly-recomputed
- * AudioPipelineMemReq, not a per-rate carve property; see audio_pipeline.h's
- * audio_pipeline_init_ex() doc for the exact seven-condition contract this
- * drills. */
+/* audio_pipeline_init_ex()'s `expected` descriptor gate. Run once (16000 Hz, a representative
+ * rate): it exercises a comparison against a freshly recomputed AudioPipelineMemReq, not a
+ * per-rate carve property; see the audio_pipeline_init_ex() doc in audio_pipeline.h. */
 static void test_init_ex_descriptor(void) {
     AudioPipelineConfig cfg = audio_pipeline_default_config(16000);
     AudioPipelineMemReq req;
@@ -762,28 +689,13 @@ static void test_init_ex_descriptor(void) {
     free(pool);
 }
 
-/* ---------------------------------------------------------------------------
- * Per-stage timing
- *
- * The numbers must be REAL measurements, not merely present. Two properties
- * carry that: every stage is bounded by the wall time of the call it sits
- * inside (a stray or uninitialised value would almost certainly exceed it),
- * and each half is asserted against its OWN build flag, so a compiled-out
- * build is required to report zeros rather than stale values.
- *
- * This pipeline has no accepted-then-bail path -- audio_pipeline_process()
- * validates its arguments and then runs to completion -- so the 4ch suite's
- * non-finite-hop case has no counterpart here and is deliberately absent
- * rather than written as an assertion that cannot fail. What replaces it is
- * the aec_only case on a POISONED pool: that instance never writes nr/post/
- * synth, so those three read whatever the caller's memory held unless the
- * control block was zeroed at init.
- *
- * These are a real gate on the control block's init-time
- * memset(p, 0, sizeof(*p)): remove it and they go red. That is the only
- * thing keeping an aec_only instance's nr/post/synth at zero, since no
- * path ever writes them.
- * ------------------------------------------------------------------------- */
+/* Per-stage timing: the numbers must be REAL measurements. Every stage is bounded by the
+ * wall time of the call it sits inside, and each half is asserted against its OWN build
+ * flag, so a compiled-out build must report zeros rather than stale values.
+ * This pipeline has no accepted-then-bail path, so the 4ch suite's non-finite-hop case has
+ * no counterpart. Instead the aec_only case runs on a POISONED pool: that instance never
+ * writes nr/post/synth, so they read zero only if the control block was zeroed at init (a
+ * gate on its memset(p, 0, sizeof(*p))). */
 static uint32_t wall_us_now(void) {
     struct timespec ts;
     clock_gettime(CLOCK_MONOTONIC, &ts);
@@ -839,21 +751,14 @@ static void test_stage_timing(void) {
     }
     audio_pipeline_get_last_timing(p, &t);
 
-    /* ⚠ Written so it can FAIL: over a full hop the AEC runs a main filter,
-     * a pre-filter stage and a post/RES block, and this layer runs an NR
-     * gain, the gain arithmetic and a synthesis -- on this grid the delay
-     * bank, the main filter and the post/RES block cannot cost under a
-     * microsecond, so a zero there means that window never ran. post_us and
-     * synth_us are NOT asserted nonzero: they
-     * sit at the 1 us clock floor on the development host, and an assertion
-     * that depends on the host being slow is a flake, not a test.
-     *
-     * Each half is asserted against its own flag because the two are
-     * separate builds: AUDIO_PIPELINE_STAGE_TIMING governs the stages
-     * measured here, AEC_STAGE_TIMING governs the three copied out of
-     * aec_get_last_timing(). The zero branches are not filler -- they are
-     * what proves a flag removes the measurement rather than merely hiding
-     * it. */
+    /* Written so it can fail: over a full hop the AEC runs a main filter, a pre-filter stage
+     * and a post/RES block, and this layer runs an NR gain, the gain arithmetic and a
+     * synthesis; on this grid the delay bank, the main filter and the post/RES block cannot
+     * cost under a microsecond, so a zero there means that window never ran. post_us and
+     * synth_us are not asserted nonzero (they sit at the 1 us clock floor on a fast host).
+     * Each half is asserted against its own flag: AUDIO_PIPELINE_STAGE_TIMING governs the
+     * stages measured here, AEC_STAGE_TIMING the three copied from aec_get_last_timing().
+     * The zero branches prove a flag removes the measurement rather than hiding it. */
 #if AUDIO_PIPELINE_STAGE_TIMING
     CHECK(t.nr_us > 0, "timing: the NR gain reports a real cost");
 #else
@@ -960,22 +865,13 @@ static void test_stage_timing(void) {
 }
 
 /* ---- comfort-noise contract ----------------------------------------------
- *
- * The pipeline fills AEC-suppressed bins from lib/aec's own comfort-noise
- * recipe: an LCG step per bin whose top five bits index kCngTable,
- * the imaginary part reading a quarter turn (+8 of 32) ahead of the real one.
- * The three properties the injected noise is required to have -- bounded
- * samples, the same expected power as the unit-variance Gaussian pair the
- * recipe replaced, and a sequence that actually advances -- are what this
- * pins. The exact output samples deliberately are NOT pinned: the recipe is
- * specified statistically, so a byte assertion here would only re-state the
- * arithmetic.
- *
- * Part 1 checks the shared table itself (a table edit moves every
- * CNG-enabled render's noise power). Part 2 checks the pipeline actually
- * draws from it and advances its state, by differencing a CNG-on run against
- * a byte-identical CNG-off one -- comfort noise is added after every gain,
- * so that difference IS the injected noise and nothing else. */
+ * The pipeline fills AEC-suppressed bins from lib/aec's comfort-noise recipe: an LCG step
+ * per bin whose top five bits index kCngTable, the imaginary part a quarter turn (+8 of 32)
+ * ahead of the real one. The injected noise must have bounded samples, the same expected
+ * power as the unit-variance Gaussian pair and an advancing sequence; exact samples are not
+ * pinned (the recipe is statistical). Part 1 checks the shared table; part 2 checks the
+ * pipeline draws from it and advances its state, by differencing a CNG-on run against a
+ * byte-identical CNG-off one (comfort noise is added after every gain). */
 static void test_comfort_noise_contract(void) {
     const int sr = 16000, fft_size = 256, hops = 400;
     double sum = 0.0, sq = 0.0, worst_pair = 0.0;
@@ -1104,19 +1000,13 @@ static void test_comfort_noise_contract(void) {
     }
 }
 
-/* The comfort noise is scaled by the denoiser gain of its bin, bounded below
- * by CNG_NR_GAIN_FLOOR: the denoiser never sees the comfort noise, so its
- * gain is applied at injection. Witness on an echo-plus-stationary-noise
- * stimulus, where the denoiser settles far below the floor in every bin that
- * carries comfort noise: the injected noise is the exact difference between
- * a CNG-on and a CNG-off render (added after every gain, same draw
- * sequence), so with the denoiser off (G_nr the unity vector) that difference
- * is the unscaled reference d_ref and with it on the difference d_nr must be
- * CNG_NR_GAIN_FLOOR * d_ref sample for sample. Two assertions pin the
- * contract from outside: the residual d_nr - floor * d_ref carries almost no
- * energy (an unbounded scaling or a different floor both leave a residual of
- * (scale - floor)^2 of the reference), and the energy ratio sits at floor^2
- * (no scaling at all would leave it at 1). */
+/* The comfort noise is scaled by the denoiser gain of its bin, bounded below by
+ * CNG_NR_GAIN_FLOOR (the denoiser never sees the fill). Witness on an echo-plus-stationary-
+ * noise stimulus where the denoiser settles far below the floor: the injected noise is the
+ * exact difference between a CNG-on and a CNG-off render (same draw sequence). With the
+ * denoiser off that difference is the unscaled reference d_ref; with it on, d_nr must be
+ * CNG_NR_GAIN_FLOOR * d_ref sample for sample. The residual d_nr - floor * d_ref must carry
+ * almost no energy, and the energy ratio must sit at floor^2 (no scaling would leave 1). */
 static void test_comfort_noise_follows_nr_gain(void) {
     const int sr = 16000, fft_size = 256;
     const double floor_amp = 0.31622777, floor_sq = floor_amp * floor_amp;

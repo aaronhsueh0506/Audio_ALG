@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Experiment 1: render the DFN2 pipeline variants over the 90-case AEC manifest.
+"""Render the DFN2 pipeline variants over the 90-case AEC manifest.
 
 Every variant shares one linear-AEC pass per case (the contexts are computed
 once), so the only thing that differs between the rendered files is the

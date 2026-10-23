@@ -4,16 +4,15 @@ The hard resource boundary is part of the public contract:
 
 * exactly one shared matched-filter delay estimator;
 * exactly four linear adaptive filters;
-* beamform to mono before the existing NR + RES post path.
+* beamform to mono before the NR + RES post path.
 """
 
 from importlib import import_module
 
-# ``4ch_aec_bf_nr_res`` is the project directory name requested for the C/Python
-# integration surface.  A leading digit is accepted by importlib and
-# ``python -m`` but cannot appear in a normal Python ``from`` statement.
-# Resolve the implementation by string so this file also remains importable
-# when pytest collects it as a path-level ``__init__`` module.
+# ``4ch_aec_bf_nr_res`` starts with a digit: importlib and ``python -m`` accept
+# it but a ``from`` statement cannot, so the implementation is resolved by
+# string (which also keeps this file importable when pytest collects it as a
+# path-level ``__init__`` module).
 _pipeline = import_module("pipelines.4ch_aec_bf_nr_res.pipeline")
 Beamformer = _pipeline.Beamformer
 BeamformerFrame = _pipeline.BeamformerFrame

@@ -10,27 +10,23 @@
 
 config.ini sections (see the shipped config.ini for every knob, documented):
     [signal]   sample rate + FFT grid. The paper used 16 kHz/512/512/256,
-               exactly matching this project's 16 kHz grid; MUST equal the
-               grid AIAEC/dataset_gen/config.ini rendered with.
+               matching this project's 16 kHz grid; MUST equal the grid
+               AIAEC/dataset_gen/config.ini rendered with.
     [data]     one packed corpus path + DataLoader batch size / workers +
                val_fraction (held out at LOAD time, see below)
     [model]    every CAGCRN constructor keyword (see model.py's __init__);
-               an unknown key raises rather than being silently ignored, so a
-               typo cannot build a differently-shaped model
+               an unknown key raises rather than being silently ignored
     [training] optimizer, seed, epoch budget, checkpoint/log locations
     [loss]     paper MSE + SI-SNR + L1 objective weights
 
 dataset:
-    Data is rendered and packed by AIAEC/dataset_gen/ only -- see
-    AIAEC/dataset_gen/README.md and ../Align_CRUSE/train.py's docstring for
-    the full generation walkthrough (identical for every candidate) --
-    including why this generates one unified pool (``--split all``) and
-    performs a deterministic random split over individual 10-second chunks.
-    CAGCRN is end-to-end -- mic + unaligned far-end go straight to one
-    network, no linear AEC in front -- so like Align_CRUSE (and unlike
-    the other candidate trainers) there is no persistent external state to
-    preserve across chunks, and training draws chunks with a plain SHUFFLED
-    DataLoader over each split.
+    Data is rendered and packed by AIAEC/dataset_gen/ only (see its README.md
+    and ../Align_CRUSE/train.py's docstring for the walkthrough, identical for
+    every candidate): one unified pool (``--split all``) and a deterministic
+    random split over individual 10-second chunks. CAGCRN is end-to-end (mic +
+    unaligned far-end go straight to one network, no linear AEC in front), so
+    like Align_CRUSE there is no persistent external state to preserve across
+    chunks and training draws chunks with a plain SHUFFLED DataLoader.
 
 task (see ../README.md's decision matrix and
 ../dataset_gen/model_views.py MODEL_TASKS['CAGCRN']):

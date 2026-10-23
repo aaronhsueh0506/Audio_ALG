@@ -45,10 +45,9 @@ import pytest
 HERE = pathlib.Path(__file__).resolve()
 ROOT = pathlib.Path(os.environ.get('C_PY_MAP_ROOT') or HERE.parents[2])
 COMMON_DIR = pathlib.Path(os.environ.get('C_PY_MAP_AC') or (ROOT.parent / 'audiolib' / 'common'))
-# AUDIOLIB_DIR covers the rest of the sibling audiolib checkout (doa/bf/VAD),
-# not just its common/ subtree; COMMON_DIR keeps its own override for
-# backward compatibility with C_PY_MAP_AC callers that already point it at
-# a common/ directory directly.
+# AUDIOLIB_DIR covers the sibling audiolib checkout (doa/bf/VAD) beyond its
+# common/ subtree; COMMON_DIR can be pointed at a common/ directory directly
+# via C_PY_MAP_AC.
 AUDIOLIB_DIR = pathlib.Path(os.environ.get('C_PY_MAP_AUDIOLIB') or (ROOT.parent / 'audiolib'))
 DOC = pathlib.Path(os.environ.get('C_PY_MAP_MD') or (ROOT / 'docs' / 'c_python_function_map.md'))
 

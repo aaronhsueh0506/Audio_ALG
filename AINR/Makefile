@@ -8,8 +8,8 @@ override CFLAGS += -ffp-contract=off -fno-math-errno -I.
 LDFLAGS ?=
 SIMD ?= 1
 override SIMD := $(strip $(SIMD))
-# ne10 is the only FFT backend; the variable remains because audiolib's
-# archive path is keyed on it.
+# ne10 is the only FFT backend; BACKEND is forwarded to audiolib, whose
+# archive path it keys.
 BACKEND ?= ne10
 ifneq ($(BACKEND),ne10)
 $(error BACKEND must be ne10 (got '$(BACKEND)'): ne10 is the only FFT backend)

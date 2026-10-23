@@ -89,8 +89,8 @@ def write_runtime_bins(config_path, out_dir, checkpoint_path=None):
     [n_erb][n_bins], plus erb_matrices.json. The library takes pointers only
     (dfn3_set_erb_matrices), so the deployment loader owns the files and can
     swap them at any time. With checkpoint_path, validate the checkpoint's
-    model/feature/config contract and export its loaded buffers. Without one,
-    construct the matrices from config. No checkpoint is silently ignored.
+    contract and export its loaded buffers; without one, construct the
+    matrices from config.
     """
     model, cfg = _load_export_model(config_path, checkpoint_path)
     with torch.no_grad():

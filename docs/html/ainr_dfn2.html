@@ -315,5 +315,5 @@ Slice 沿 axis 2 起於第 1 列,對齊由量化工具鏈決定,尚未在板上�
 實測 NEON/scalar digest 皆 <code>de7e511600d05a10</code>(bit 相同);deep filter 的 96 bin×5 tap 複數乘加走共用 NEON 核心 <code>skn_ctaps_mac_f32</code>(不依賴編譯器自動向量化)</li>
 <li>Python 合約測試:<code>AINR/DeepFilterNet2/tests/test_dfn2_contract.py</code>(layout version 互鎖、
 <code>h_gru</code> 各列抵達自己的 GRU、匯出圖的 state 邊界)、<code>AINR/tests/test_onnx_state_contract.py</code>(邊界驗證器與量化後檢查);<code>AINR/tests/</code> 另有
-<code>test_python_c_prepost_parity.py</code>;全樹基準數見 <code>docs/release_checklist.md</code>。</li>
+<code>test_python_c_prepost_parity.py</code>;全樹請執行 <code>python3 -m pytest AINR</code>。</li>
 </ul>

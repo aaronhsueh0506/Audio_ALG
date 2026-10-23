@@ -43,8 +43,8 @@ read `E + X`; end-to-end candidates read `Y + X`; all target `S_early`
 `mic_postclip - linear_error` when required and is never stored separately.
 
 **⚠ `echo` (D), `local_noise` (N) and `mic_preclip` (S+N+D, pre-clip/AGC) are
-NOT stored.** No model task targets echo cancellation without denoising any
-more, and no candidate sees oracle residual `R`. All three are still
+NOT stored.** No model task targets echo cancellation without denoising, and no
+candidate sees oracle residual `R`. All three are still
 **computed on every render** — `aec_dataset.AecSequenceRenderer.render()`
 returns them under `RenderedSequence.audit` — so the corpus's central
 invariants (`mic_preclip == S+N+D`, "echo really is a delayed copy of X") stay
@@ -54,23 +54,19 @@ directly against the renderer rather than a packed shard. If you need `echo`/
 `AecSequenceRenderer.render()` yourself — do not add them back to
 `STEM_ORDER` for that.
 
-Old six-channel WAVs/shards (with a separate `local_noise` stem) are rejected.
-To upgrade an existing four-channel render without repeating speech/noise/RIR
-mixing, run `rematerialize_linear_aec.py`; it reconstructs complete sequences
-in `(sequence_id, chunk_index)` order from the filenames and rewrites the last
-channel (`linear_error`) in place.
+Old six-channel WAVs/shards (with a separate `local_noise` stem) and old
+five-channel `.pt` shards are rejected. An existing five-channel WAV corpus needs
+no regeneration for the four-channel contract: run `pack_aec_dataset.py` again
+(it drops only `near_speech`). `rematerialize_linear_aec.py` rebuilds the last
+channel (`linear_error`) of an existing render without repeating
+speech/noise/RIR mixing; it reconstructs complete sequences in
+`(sequence_id, chunk_index)` order from the filenames and rewrites that channel
+in place.
 
-Existing five-channel WAV corpora need no regeneration for the four-channel
-training contract: run `pack_aec_dataset.py` again. Old five-channel `.pt`
-shards are intentionally rejected because their target semantics differ;
-repacking reads the existing WAVs and drops only `near_speech`.
-
-**⚠ That covers the channel layout, not the fifth channel's contents.** A corpus
-rendered before the frozen frontend moved onto the context seam carries a
-`linear_error` produced without the over-output capture guard, and the packer
-stamps whatever contract `--config` builds today onto whatever audio it finds.
-Rematerialize that channel first — see "Recomputing `linear_error` after a
-frontend change".
+**⚠ That covers the channel layout, not the fifth channel's contents.** The
+packer stamps whatever contract `--config` builds today onto whatever audio it
+finds, so recompute `linear_error` after any frontend change (see "Recomputing
+`linear_error` after a frontend change").
 
 `AecStems` gives these names; nothing indexes the channel axis by number.
 
@@ -114,7 +110,7 @@ description — `speaker_id`, `far_speaker_id`, `noise_id`, `rir_id`, `room_id`,
 `path_position_fallbacks`, `near_path_shared_positions`, `far_active`,
 `near_active`, `scenario`,
 `sequence_scenario`, `sequence_seed`,
-`split` — but it is now visible only
+`split` — but it is visible only
 in-process, on the `RenderedSequence` a worker hands back
 (`tests/test_aec_dataset.py` reads it there). None of it reaches disk, so:
 
@@ -221,26 +217,18 @@ trains hallucination.
 
 ### The echo path moves
 
-**The path is never frozen, and that is the point.** Measured on paired
-static/movement far-end clips from the AEC-challenge blind set — 64 ms
+**The path is never frozen.** The movement axis is calibrated against paired
+static/movement far-end clips from the AEC-challenge blind set (64 ms
 frequency-domain Wiener path estimates over 300–4000 Hz in 2 s windows, after
-delay compensation — the path's correlation with itself 1/2/4/8 s earlier, its
+delay compensation): the path's correlation with itself 1/2/4/8 s earlier, its
 per-second relative change and its per-second level step are
 `path_drift_metrics.CALIBRATION_TARGETS`. **That dict is the only copy of those
-numbers**: it is what the calibration test asserts against, and restating it
-here (or in a config comment) is how a re-calibration leaves five stale tables
-behind. It holds two curves, `movement` for a device being moved and
-`static_device` for one nobody touched; `CALIBRATION_TARGET_OF_MODE` says which
-rendered mode is calibrated against which. The same module measures a rendered
-pair, so the corpus and the captures are compared through one implementation —
-including the delay search, which has to be wide enough for the whole delay a
-pair can carry: outside its true delay the phase-transform peak is noise, and a
-mislocked clip reads as violent movement rather than failing.
-
-A device nobody touches still drifts — its correlation with its own path 8 s
-earlier is well below 1.0 — and a moving one has largely forgotten its path by
-then. A path that is exactly constant except at one instant is a path a filter
-has to find once and then never again.
+numbers**: the calibration test asserts against it. It holds two curves,
+`movement` and `static_device`; `CALIBRATION_TARGET_OF_MODE` says which rendered
+mode is calibrated against which. The same module measures a rendered pair, so
+the corpus and the captures are compared through one implementation, including
+a delay search wide enough for the whole delay a pair can carry (a mislocked
+clip reads as violent movement).
 
 Motion is one **mutually exclusive** draw per far-capable sequence —
 `p_slow_drift` (0.5), `p_movement` (0.15), `p_echo_path_change` (0.02), the
@@ -268,33 +256,25 @@ keep between the trajectory's anchor mixture and a corner, in the same
 300–4000 Hz band **and through the same 64 ms analysis frame** the estimator
 reads, and the renderer solves the depth that reaches it from the drawn room's
 responses — per sequence. Why a depth is not a quantity a corpus can be
-calibrated in is on `aec_dataset.solve_mixture_depth`. `movement`'s 0.87 solves
-to a median depth of 0.50 on a 60 ms pool, 0.38 on a 200 ms one, 0.40 at
-350 ms, 0.39 at 600 ms and 0.36 at 1 s (`slow_drift`'s 0.965 to
-0.24/0.18/0.19/0.19/0.18); all of them render the same axis to within the
-residual `RT60_POOL_TOLERANCE` records. Both numbers land in the chunk
-metadata (`echo_path_mixture_depth`, `echo_path_position_correlation`, and
-`near_path_*` for the near talker's own trajectory).
+calibrated in is on `aec_dataset.solve_mixture_depth`. The solved depth and the
+reached correlation land in the chunk metadata (`echo_path_mixture_depth`,
+`echo_path_position_correlation`, and `near_path_*` for the near talker's own
+trajectory).
 
 **⚠ A room whose positions cannot reach the target does not host the mode.**
-Eligibility is decided before the room is drawn rather than discovered during a
-render, and `AecSequenceRenderer.can_host` owns what it asks of a room. Rooms
-that cannot host are excluded, printed as such in the preflight, and counted
-against the two-room rule below; the renderer then asserts what the draw
-guarantees, so a corpus whose movement axis is shallower than it asked for is
-impossible rather than merely visible in the metadata.
+Eligibility is decided before the room is drawn (`AecSequenceRenderer.can_host`),
+rooms that cannot host are excluded and printed as such in the preflight, and the
+renderer asserts what the draw guarantees.
 
 **⚠ Two things bound how far a synthetic corpus can decorrelate**, and both are
 worth knowing before reading a measurement:
 
 - **the RIR pool.** Positions in one room share their direct path and early
   reflections, so a pool whose rooms are near-anechoic has a correlation floor
-  no weight schedule can go below. The solve above is what keeps that a floor
-  rather than a silent re-calibration — it reports the correlation each room
-  actually reached — but no depth can pass it. Measure your own pool rather
-  than assuming: `path_drift_metrics.py` takes `(far, echo)` and returns the
-  table above, and `position_gram` takes the room's RIRs and returns the matrix
-  the depth is solved from.
+  no weight schedule can go below. Measure your own pool rather than assuming:
+  `path_drift_metrics.py` takes `(far, echo)` and returns the table above, and
+  `position_gram` takes the room's RIRs and returns the matrix the depth is
+  solved from.
 - **position-dependent propagation delay is not inferred from RIR file
   offsets.** `prepare_rir` peak-aligns every waypoint, so this trajectory
   changes path shape and level but not time of flight. The RIR files do not
@@ -304,135 +284,66 @@ worth knowing before reading a measurement:
   `delay_step`, and `sro` axes, while `bulk_delay_samples` keeps describing the
   audio.
 
-Measured back out of the rendered 30 s corpus the calibration test builds,
-through the **shipped loudspeaker population** and a RIR pool drawn from the
-shipped `[rir]` RT60 range — the models, drives and rooms the corpus actually
-generates with, because that is what the trajectory has to reproduce the
-measured curve through. What THIS build measures, per mode and per lag, the
-calibration tests print themselves — the `_report` rows of
+What a build measures, per mode and per lag, is printed by the `_report` rows of
 `tests/test_aec_dataset.py` under `pytest -s`, over `MOTION_SEQUENCES`
-sequences, a count the suite sizes from the bootstrapped spread of its own
-medians. A table here would be a copy that goes stale at the next
-re-calibration.
+sequences; the band each lag is held to is `CALIBRATION_BAND`. Capture clipping
+and the AGC are not part of it: the estimator reads the echo before the
+microphone stage.
 
-Capture clipping and the AGC are *not* part of that: the estimator reads the
-echo before the microphone stage, so `p_clipping` and `p_agc` cannot move any
-of those numbers. The band each lag is held to is in the test
-(`CALIBRATION_BAND`), sized from the bootstrapped spread of the median at those
-sequence counts — one sequence reads ~0.998 at every lag with a linear
-loudspeaker and 0.4–0.9 with a hard-clipping one, and the pool's rooms differ
-in RT60 on top of that, so the median needs a hundred-odd sequences before it
-is stable to the band. The 2 s and 8 s lags are banded wider than the rest
-because their spread stops shrinking with the count: the short lags are the
-loudspeaker's rather than the trajectory's and inherit the whole device draw.
+**⚠ The loudspeaker axis supplies decorrelation of its own.** Through the
+shipped loudspeaker population the one-shot crossfade and a stopped drift mode
+land inside the band, so the statements about the trajectory are made with the
+loudspeaker removed (`nonlinear_models = linear`): there a frozen path and the
+crossfade fail the band, and the two drift modes must clear a long-lag ceiling
+(`ISOLATED_TRAJECTORY_MAX`) that a frozen trajectory and a path-correlation
+target halfway to 1.0 both miss.
 
-**⚠ What the band can and cannot separate on that population.** The one-shot
-crossfade is NOT rejected by it: with a distorting loudspeaker it lands inside
-the band at every lag, because the device supplies decorrelation of its own. A
-drift mode whose trajectory has stopped is not rejected either — the level walk
-through the same distortion supplies most of the curve, and the mode ORDERING
-(asserted at 4 s and 8 s) puts a frozen drift mode exactly where a moving one
-belongs. So the statements about the trajectory are made with the loudspeaker
-axis removed (`nonlinear_models = linear`): still 0.991/0.980/0.979/0.979,
-one-shot 0.989/0.975/0.972/0.954, `slow_drift` 0.988/0.970/0.950/0.937,
-`movement` 0.979/0.937/0.871/0.822. There a frozen path fails the band at two
-lags against both curves and the crossfade at three against the `movement`
-curve, and the two drift modes have to clear a long-lag ceiling
-(`ISOLATED_TRAJECTORY_MAX`) that both mutations miss at both lags: a frozen
-trajectory, and a path correlation target halfway to 1.0 — a corpus whose
-positions barely differ. That is what makes "the trajectory moved" a tested
-claim rather than an inference from a curve the loudspeaker could have produced
-on its own. Every ceiling is held above the bootstrapped spread of its own
-green median by an assertion, not by a comment.
+**⚠ The still-path shortfall is the loudspeaker population.** Through the
+shipped drives a path that never moves already reads under the estimator's floor
+(a near-linear device reads on the floor, a hard-clipping one far under it), and
+no `*_position_correlation` can close that gap.
+`test_a_still_path_stays_correlated_with_itself` reports the still-path median
+with its bootstrap interval rather than gating it; re-fitting the drive
+population against the untouched-device curve is a separate calibration.
 
-**⚠ The still-path shortfall is the loudspeaker population, and the device
-axis is calibrated separately from this one.** Read the still-path row those
-tests print against `static_device` in
-`path_drift_metrics.CALIBRATION_TARGETS`, which is the curve
-`slow_drift` is held to: through the shipped drives a path that never moves
-already reads far under the estimator's own floor on the calibration pool
-itself, and at the short lags down to that curve, before the trajectory does
-anything — which is where `slow_drift`'s own remaining deviation is. With
-`nonlinear_models = linear` the same pool puts the still path back on the
-estimator floor, so the gap is the drive population and not the rooms, the
-estimator or the trajectory — and no `*_position_correlation` can close it at
-any RT60, because a trajectory can only move the path further from itself,
-never back toward the curve. The suite renders the still path both ways and
-reports the two readings side by side, the mixture one with its bootstrap
-interval (`test_a_still_path_stays_correlated_with_itself`): that population is
-bimodal — a near-linear device reads on the floor and a hard-clipping one far
-under it — so its median swings with the count and is reported rather than
-gated. Re-fitting the drive population against the untouched-device curve is a
-separate calibration and is not what the trajectory knobs are for.
-
-**⚠ The pool the axis is fitted on stops short of `[rir] rt60_max`,** because
-that floor deepens with RT60 — a tail several times the estimator's 64 ms
-analysis frame is not one frequency response — while the room-to-room spread
-out there is as large as the RT60 trend itself. Fitting there would calibrate
-the trajectory against the device floor and the room draw instead of against
-the path. A separate check (`RT60_POOLS`, 60 ms to 1 s) holds the *same* config
-to the same axis across the whole range, isolated, to within the residual
-`RT60_POOL_TOLERANCE` records,
-and reports the shipped population on one pool above the span so what it does
-there stays visible.
+**⚠ The pool the axis is fitted on stops short of `[rir] rt60_max`,** because the
+estimator floor deepens with RT60 (a tail several times the 64 ms analysis frame
+is not one frequency response). `RT60_POOLS` (60 ms to 1 s) holds the same config
+to the same axis across the whole range to within `RT60_POOL_TOLERANCE`.
 
 **⚠ The loudspeaker population is stratified, not drawn per device.** A seeded
-permutation of `[devices] nonlinear_models` fills `device_ids` before the
-remainder is drawn, so every configured model reaches every corpus seed
-whenever there are at least as many ids as models. Drawing each id's model
-independently leaves a third of the seeds with no linear device at all and the
-rarer models missing from most of them, and since this axis is calibrated
-*through* that population, which models it contains is part of what the corpus
-is. What still moves between seeds is each id's **drive**: at the seeds the
-test checks, `movement`'s 4 s median spans 0.024–0.139 from its target, which
-is what the seed check's own allowance covers. The **split** is model-aware for
-the same reason: `device_split = disjoint` renders one split's ids, so a
-held-out id drawn without regard to its model takes that model out of training
-whenever it is the only id carrying it (148 of 200 seeds at the shipped 8 ids
-over 7 models, for a draw made on its own; through `build_manifest` the device
-split follows three source splits on the same generator and the count moves
-with them). Train is therefore filled with one id per model first and val
-drawn from the rest; a split too small to hold every model falls back to a
-plain permutation and is stated in the preflight instead.
+permutation of `[devices] nonlinear_models` fills `device_ids` first, so every
+configured model reaches every corpus seed when there are at least as many ids
+as models; the movement axis is calibrated *through* that population. The
+**split** is model-aware too: `device_split = disjoint` fills train with one id
+per model first and draws val from the rest (a split too small to hold every
+model falls back to a plain permutation and says so in the preflight).
 
-**⚠ What `device_split = disjoint` holds out is therefore a device IDENTITY,
-not a loudspeaker MODEL.** While train keeps every model, val's id carries its
-own EQ, drive and level draw of a nonlinearity family train also has: at the
-shipped 8 ids over 7 models the val id's model is one train holds at every
-seed. Validation still answers "an unseen loudspeaker", but not "an unseen
-distortion family" — say which one you mean when you report the score. Changing
-which id is held out changes the corpus, so `MANIFEST_VERSION` moves with it
-and an existing `manifest.json` is refused rather than reused; rebuild it with
-`--rebuild-manifest`.
+**⚠ What `device_split = disjoint` holds out is a device IDENTITY, not a
+loudspeaker MODEL.** Val's id carries its own EQ, drive and level draw of a
+nonlinearity family train also has, so validation answers "an unseen
+loudspeaker" but not "an unseen distortion family" — say which one you mean when
+you report the score. Changing which id is held out changes the corpus, so
+`MANIFEST_VERSION` moves with it and an existing `manifest.json` is refused;
+rebuild it with `--rebuild-manifest`.
 
 **⚠ The near-plateau between 2 s and 4 s in the reference curve is not
-reachable from a trajectory, and trying is a trap.** It is the signature of an
-incoherent component that fully decorrelates within 2 s and then stops
-contributing. Anything faster than the estimator's own 2 s window is *averaged*,
-not resolved, so adding a fast weight component RAISES this correlation instead
-of lowering it. That part of the real number is the device, not the path —
-which is why the calibration is run through the shipped device population
-rather than around it.
+reachable from a trajectory.** It is the signature of an incoherent component
+that fully decorrelates within 2 s. Anything faster than the estimator's own 2 s
+window is *averaged*, not resolved, so adding a fast weight component RAISES
+this correlation. That part of the real number is the device, not the path,
+which is why the calibration is run through the shipped device population.
 
-**⚠ The measured per-second level step is not a pure level measurement**, so
-it is not what the level walk is tuned against — `path_drift_metrics`'s own
-`gain_step_db` says what the statistic is and what tuning against it would
-cost. `[path_motion]`'s `*_gain_sigma_db_per_sec` and `*_gain_clamp_db` are set
-by the measured level **spread** for a moving device instead, and the walk is
-mean-reverting (`gain_recentre_sec`; `aec_dataset.gain_walk_db` says why a
-merely-clipped walk is not enough). As rendered it spreads what
-`LEVEL_SPREAD_DB` records per mode, and both the step and that spread are
-banded there.
-The spread is banded separately because the step cannot stand in for it: with
-`slow_drift`'s walk turned off entirely the step barely moves against its
-`static_device` target in `path_drift_metrics.CALIBRATION_TARGETS` — it stays
-inside its own sampling spread — while the walk's p5–p95 goes to zero. (On
-`movement` the step does notice.)
-The estimator's `relative_change` is reported but deliberately not banded: no
-level or trajectory setting the axis admits moves it more than 0.13 from the
-measured 0.29, so a band loose enough to pass a green generator rejects only a
-completely frozen path, which the correlation curve already rejects on more
-evidence.
+**⚠ The measured per-second level step is not a pure level measurement**, so the
+level walk is not tuned against it (`path_drift_metrics`'s `gain_step_db` says
+what the statistic is). `[path_motion]`'s `*_gain_sigma_db_per_sec` and
+`*_gain_clamp_db` are set by the measured level **spread** for a moving device,
+and the walk is mean-reverting (`gain_recentre_sec`; `aec_dataset.gain_walk_db`
+says why a merely-clipped walk is not enough). The step and the spread
+(`LEVEL_SPREAD_DB`) are banded separately because the step cannot stand in for
+the spread. The estimator's `relative_change` is reported but not banded: no
+admissible level or trajectory setting moves it enough to reject anything the
+correlation curve does not already reject.
 
 **DT movement.** A sequence with a near talker moves that talker's path too,
 with the same trajectory shape at `near_slowdown` × the timescale and
@@ -443,67 +354,37 @@ compatible echo paths at the shipped defaults, so bundling it there would make
 inseparable from "DT while the loudspeaker distorts", and the CLI census counts
 `dt+movement` and `dt+slow_drift` separately.
 
-The CLI also prints the path correlation the rendered mixtures reached against
-the one the config asks for, per mode: they can only differ by the solver's own
-tolerance, since a trajectory only ever renders positions that reach the
-target, so that row is the audit of the eligibility rule. Like the `Path
-motion` row below it, it covers **the sequences this run rendered** — the reach
-of a sequence an earlier run wrote is not on disk — and a fully resumed run
-prints a line saying the audit is unavailable rather than nothing. A run that
-had to draw a position set more than once to find one that reaches says so on
-its own line; frequent re-draws mean the eligible rooms hold mostly
-near-duplicate positions.
-
-A second line counts the trajectories that **ran out of draws** and rendered
-their room's certified set, and the two are separate because they cost
-different things. A re-draw costs a Gram lookup and no audio. A fallback costs
-variety: a room has one certified set per waypoint count, so every sequence
-counted there renders one of a handful of trajectories however many sequences
-the corpus holds — a pool whose eligible rooms are mostly near-duplicate
-positions can therefore be correct on every reach and still repeat itself. The
-near talker keeps its preference through that fallback (the certificate is
-taken over the room minus the loudspeaker's positions), so a fallback does not
-put the two paths on the same room response unless nothing else in the room
-reaches — and when that happens a third line counts the sequences whose near
-talker shares a position with the loudspeaker. All three position rows cover
-the sequences this run rendered, like the reach row: a fully resumed run
-prints that the position draws were not audited rather than nothing.
+The CLI prints, per mode, the path correlation the rendered mixtures reached
+against the one the config asks for (they can differ only by the solver's own
+tolerance, so the row audits the eligibility rule), the number of position
+re-draws, the trajectories that **ran out of draws** and rendered their room's
+certified set (a fallback costs variety: a room has one certified set per
+waypoint count), and the sequences whose near talker shares a position with the
+loudspeaker. These rows, like the `Path motion` census, cover **the sequences
+this run rendered**: nothing about a finished sequence is persisted beyond its
+chunk WAVs, so a fully resumed run prints that the audit is unavailable.
 
 `Loudspeakers` is the population row: how many device ids this split holds, how
 many of `[devices] nonlinear_models` they realise, and how many ids carry each
-model. It is printed because the movement axis is calibrated *through* that
-population and a source-disjoint split renders a subset of the id list, so
-which models the split realises is a property of the split rather than of
-`[devices]`. A split holding fewer ids than there are models cannot carry the
-whole population however it is drawn, and the row is followed by a warning
-naming the missing models.
+model. A split holding fewer ids than there are models cannot carry the whole
+population however it is drawn, and the row is followed by a warning naming the
+missing models.
 
-**⚠ The `Path motion` census counts the mode each sequence was RENDERED with —
-for the sequences this run rendered.** A sequence whose drawn motion did not
-fit renders still, so counting the plan would report an axis the audio does not
-carry; but nothing about a finished sequence is persisted beyond its chunk WAVs
-(that is the on-disk contract, see below), so a `--resume` run cannot recover
-the rendered mode of a sequence an earlier run wrote and falls back to the
-planned one for those. The printed row says which part is which, and the
-downgrade counter therefore covers this run's slice only. On the shipped values
-nothing downgrades at all (the one-shot switch always finds room for its 1 s
-window in a ≥ 20 s sequence), so the gap is zero there; a config with a large
-`far_active_after_event_sec` is where it would matter, and a single-pass run
-counts it exactly.
+**⚠ The `Path motion` census counts the mode each sequence was RENDERED with**
+(a sequence whose drawn motion did not fit renders still). A `--resume` run falls
+back to the planned mode for the sequences an earlier run wrote, and the printed
+row says which part is which. On the shipped values nothing downgrades.
 
-**Delay steps are NOT movement.** Delay jumps > 20 ms were measured in 53 % of
-moving *and* 63 % of static clips: they are device/buffer events. `delay_step`
-is therefore an independent impairment — one signed re-timing of the whole
-echo at a random instant, `[echo_path] delay_step_ms_*` — so nothing in the
-corpus lets "the path moved" be inferred from "the delay jumped". Its range
-stacks on the long-delay tail and the jitter, and the sum has to stay inside
-the frozen n=5 matched-filter reach (`linear_aec.MATCHED_REACH_MS`);
-`plan_sequences()` refuses a config that breaks it. How the sign and the
-magnitude are drawn, and what floors the rendered delay end to end through
-`delay_jitter`, is on `aec_dataset._draw_delay_step`. The one thing that moves
-the rendered delay past that floor is `sro`, which pulls the two clocks apart
-by ppm × elapsed time (1.8 ms at 60 ppm over 30 s): two clocks running apart
-genuinely do move the echo.
+**Delay steps are NOT movement.** Delay jumps > 20 ms occur in static clips as
+often as in moving ones: they are device/buffer events. `delay_step` is therefore
+an independent impairment — one signed re-timing of the whole echo at a random
+instant, `[echo_path] delay_step_ms_*` — so nothing in the corpus lets "the path
+moved" be inferred from "the delay jumped". Its range stacks on the long-delay
+tail and the jitter, and the sum has to stay inside the frozen n=5 matched-filter
+reach (`linear_aec.MATCHED_REACH_MS`); `plan_sequences()` refuses a config that
+breaks it. How the sign and the magnitude are drawn is on
+`aec_dataset._draw_delay_step`. The one thing that moves the rendered delay past
+the jitter floor is `sro`, which pulls the two clocks apart by ppm × elapsed time.
 The instant is uniform except for a 0.5 s margin at each end
 (`aec_dataset.DELAY_STEP_EDGE_MARGIN_SEC`), so both sides of the step can be
 measured.
@@ -512,14 +393,11 @@ measured.
 when the largest within-chunk swing of any single weight reaches
 `moving_label_weight_delta` **and** the chunk's own reference is measurably
 active; `aec_dataset.moving_chunks` owns what that excursion is and why the
-level walk is deliberately not part of it.
-
-**⚠ How much that label carries depends on `chunk_sec`.** A dwell lasts at most
-`*_dwell_sec_max` (1.5 s for `movement`, 4 s for `slow_drift`), so at the
-shipped 10 s chunk the label says exactly what `path_motion` and `far_active`
-already say, and it separates travelling chunks from dwelling ones only below
-that. The label test asserts both regimes so neither claim drifts, and
-`echo_path_change` still marks the one switch chunk.
+level walk is not part of it. A dwell lasts at most `*_dwell_sec_max` (1.5 s for
+`movement`, 4 s for `slow_drift`), so at the shipped 10 s chunk the label says
+what `path_motion` and `far_active` already say; it separates travelling chunks
+from dwelling ones only for shorter chunks. `echo_path_change` still marks the
+one switch chunk.
 
 **⚠ An event label displaces the activity label.** A drifting sequence's event
 covers most of its chunks, so `scenario` alone would no longer show that a
@@ -527,50 +405,33 @@ moving chunk is double talk. Every chunk therefore also records measured
 `far_active` / `near_active` booleans; filter a DT curriculum on those, not on
 the string.
 
-**⚠ A trajectory needs a room with at least `waypoints_min` RIR files, and
-that is an inherent cue.** Every waypoint stays in the same room (a cross-room
-waypoint would leave the near talker behind in the old room — the acoustic
-"this is echo" leak the same-room invariant exists to prevent), so a moving
-sequence can only ever come from a room that holds enough positions **whose
-responses differ enough to reach `*_position_correlation`**, and a single-RIR
-room only ever renders still. No draw rule removes that: drawing
-every sequence from the whole pool and downgrading the ones that land in a
-sparse room leaves `P(moving | sparse room) = 0` exactly as before, and pays
-for it by losing most of the motion axis. So a sequence that draws a room too
-sparse for its trajectory **draws again among the rooms that can hold it**, and
-the rendered motion share is the planned one. What is done about the cue is to
-make it countable: every chunk records `room_rir_count` beside `room_id`,
-`path_motion` is the **rendered** mode, and `gen_aec_dataset.py` prints the
-eligible-room share per mode before any worker starts — with the rooms it
-excluded for too few positions and for positions too alike counted
-separately, the second measured on the set the renderer would be handed if its
-draws ran out (so it is the room's renderability, not a proof that no reaching
-set exists in it) — and **refuses** a split where fewer than two rooms can host
-a mode it *can* draw — with one, the trajectory would identify the room. A
-split holding a single room altogether is exempt: the room is then constant
-and identifies nothing. The refusal reads
-every motion probability in the config rather than only the modes a plan
-happened to draw, so a short `--hours` trial cannot pass a manifest the full
-run refuses. What the re-draw costs is the other side of the cue: on a sparse
-pool (3 of 40 rooms eligible) every moving sequence comes from those three
-while still ones stay uniform over all 40, i.e. `P(moving | eligible room)` is
-~93 %. That is the trade this design accepts — a strong forward cue on rich
-pools in exchange for the rendered motion share equalling the planned one.
+**⚠ A trajectory needs a room with at least `waypoints_min` RIR files, and that
+is an inherent cue.** Every waypoint stays in the same room (a cross-room
+waypoint would leave the near talker behind in the old room, an acoustic "this
+is echo" leak), so a moving sequence can only come from a room that holds enough
+positions **whose responses differ enough to reach `*_position_correlation`**;
+a single-RIR room only ever renders still. A sequence that draws a room too
+sparse for its trajectory therefore **draws again among the rooms that can hold
+it**, so the rendered motion share equals the planned one, at the price of a
+forward cue on sparse pools (every moving sequence comes from the eligible rooms
+while still ones stay uniform over all rooms). The cue is made countable: every
+chunk records `room_rir_count` beside `room_id`, `path_motion` is the
+**rendered** mode, and `gen_aec_dataset.py` prints the eligible-room share per
+mode before any worker starts (rooms excluded for too few positions and for
+positions too alike counted separately) and **refuses** a split where fewer than
+two rooms can host a mode it *can* draw — with one, the trajectory would
+identify the room. A split holding a single room altogether is exempt. The
+refusal reads every motion probability in the config, so a short `--hours` trial
+cannot pass a manifest the full run refuses.
 
 **⚠ The renderer** — not the planner — guarantees `far_active_after_event_sec`
-of far-end activity **inside the window** that follows the event, and both
-event kinds are placed where that window fits (`_switch_point`,
-`_ensure_far_activity_after`). What they do when nothing fits differs, and that
-is the trade: a one-shot switch that cannot be placed renders **still** and
-records no event, rather than labelling an event the audio cannot support
-(`gen_aec_dataset.py` counts those), while a trajectory reports its last
-transition anyway and the window shrinks to what is left — the sequence keeps
-its motion, which is real, and the guarantee is the part that gives. With the
-shipped values that case cannot arise (a drift sequence's first transition
-starts at most `*_dwell_sec_max` into a ≥ 20 s sequence, against a 1 s window);
-a `far_active_after_event_sec` near the sequence length reaches it. A reference
-dropout is steered away from the same window and shrinks to fit beside it
-(`_dropout_placement`), with the chunk's measured `far_active` recording what
+of far-end activity **inside the window** that follows the event, and both event
+kinds are placed where that window fits (`_switch_point`,
+`_ensure_far_activity_after`). A one-shot switch that cannot be placed renders
+**still** and records no event (`gen_aec_dataset.py` counts those); a trajectory
+reports its last transition anyway and the window shrinks to what is left. A
+reference dropout is steered away from the same window and shrinks to fit beside
+it (`_dropout_placement`), with the chunk's measured `far_active` recording what
 happened either way.
 
 Note that `p_ref_dropout` is conditional per far-capable *sequence*; the
@@ -615,7 +476,7 @@ not used by any trainer.
 
 ### Migrating an existing corpus
 
-Changing only `linear_error` cannot create the newly composed acoustic scenes:
+Changing only `linear_error` cannot create new acoustic scenes:
 the four source stems already encode talk activity, path movement,
 nonlinearity, capture clipping, bulk delay, far level and ERL. In particular,
 `rematerialize_linear_aec.py` cannot add the `[acoustic_tails]` mixture or the
@@ -635,6 +496,9 @@ were rendered by the previous planner.
 | `gen_aec_dataset.py` | CLI — renders complete sequences to 5-channel WAV chunks |
 | `linear_aec.py` | frozen PBFDKF contract and full-sequence materializer |
 | `rematerialize_linear_aec.py` | rebuilds the last channel from existing four/five-channel WAVs |
+| `linear_error_ledger.py` | the `linear_error.done.json` ledger: which sequences the current contract has rewritten |
+| `model_views.py` | `build_model_view` / `build_spectral_model_view`: the single stem-to-model mapping |
+| `measure_align_residual.py` | meter for the residual lag between the far-end the filter consumed and the echo path |
 | `materialize_pair.py` | **diagnostic**: one loose mic/far pair to a `linear_error` WAV, contract taken from the runtime |
 | `pack_aec_dataset.py` | projects the five-channel WAVs into four-channel `.pt` shards (`--dtype float16` halves shard size and is safe to train on: every trainer widens to float32 at the device move, so only the stored dtype changes) |
 | `packed_aec_dataset.py` | `PackedAecDataset`, returning `(stems, meta)` |
@@ -746,39 +610,36 @@ different things:
 `aec_behavior_hash` hashes the parsed AST with docstrings stripped, so a comment
 reflow, docstring reword or reindent under `lib/aec/python` does **not**
 invalidate existing shards or checkpoints, while any change to an expression,
-constant or control-flow path does — and fails closed.
-
-**It must not depend on the interpreter, and getting that right needed a custom
-serializer.** The first implementation used `ast.dump()`. Python 3.13 changed
-`ast.dump` to omit fields equal to their default, so the same 48 files digest to
-`89b866cd` under 3.9 and `402acc1a` under 3.14 with no code difference at all —
-a dataset generated under one interpreter would be refused by training under
-another, and a checkpoint would become unloadable on a Python upgrade alone.
-`aec_behavior_hash.py` therefore canonicalizes the tree itself (`_canon_ast`),
-applying that same "drop empty fields" rule uniformly on every version. The rule
-also absorbs fields that simply do not exist on older versions — `type_params`
-(PEP 695) is absent on 3.9 and `[]` on 3.14, so both emit nothing — while a
-field that is genuinely *used* is non-empty, is emitted, and does change the
-hash. Nothing is dropped silently.
-
-That module is deliberately free of third-party imports, so the parity test can
-run it under every CPython on the machine.
-`tests/test_linear_aec_behavior_hash.py` asserts they all agree, and runs a
-control that reproduces the old `ast.dump` path and asserts it *disagrees* — the
-stability claim would otherwise pass vacuously on a single-interpreter machine.
+constant or control-flow path does — and fails closed. It must not depend on the
+interpreter, so `aec_behavior_hash.py` canonicalizes the tree itself
+(`_canon_ast`: empty fields are dropped uniformly on every Python version)
+instead of using `ast.dump()`, whose output changed in Python 3.13. A field that
+is genuinely *used* is non-empty, is emitted, and does change the hash. The
+module is free of third-party imports so `tests/test_linear_aec_behavior_hash.py`
+can run it under every CPython on the machine and assert they agree; a control
+that reproduces the `ast.dump` path asserts that it *disagrees*.
 
 It is a hash rather than a hand-maintained `behavior_version` on purpose: every
 other compared field is either a `__post_init__` literal or echoed out of the
 recorded contract by both call sites, so a version integer would be the same
-constant on both sides and could never differ. `test_contract_comparison_is_not_vacuous` guards against that tautology.
+constant on both sides and could never differ.
 
-Scope: `aec_behavior_hash` covers `aec.py` plus everything under `modules/` —
-the code `LinearAecProcessor` can actually reach. `diag/`, `tests/` and the
-bench/eval tooling are excluded, and the module-level `__version__` assignment
-is stripped before hashing, so editing a test, a golden generator or the release
-version cannot strand a checkpoint. `aec_source_hash` still covers every
-Python file under `lib/aec/python`; unlike the 48-file signal-path scope, that
-provenance count intentionally grows when tests or diagnostics are added.
+Scope: `aec_behavior_hash` covers `aec.py` plus everything under `modules/` — the
+code `LinearAecProcessor` can actually reach. `diag/`, `tests/` and the
+bench/eval tooling are excluded, and the module-level `__version__` assignment is
+stripped before hashing, so editing a test or the release version cannot strand
+a checkpoint. `aec_source_hash` covers every Python file under `lib/aec/python`,
+so it grows when tests or diagnostics are added.
+
+`behavior_hash_schema` is folded into the digest as well as compared. Bump it
+(`canon-ast-1` → `canon-ast-2`) whenever `_canon_ast` changes what it emits for
+unchanged input; a mismatch then names the serializer instead of looking like an
+AEC code change. A v2 contract (no `aec_behavior_hash`) is refused: re-run
+`rematerialize_linear_aec.py` for the dataset; a v2 checkpoint must be retrained.
+
+The check is conservative: a pure refactor (renaming a local, reordering
+independent statements) also changes the behaviour hash. Refusing to load is the
+safe direction — rematerialize rather than loosening the check.
 
 **Recomputing `linear_error` after a frontend change.** The source WAVs do not
 need re-rendering — only the fifth channel does, then the packed shards:
@@ -820,23 +681,15 @@ consumes it.
 ⚠ Both halves are evaluation-only. `materialize_pair.py` pads one waveform to a
 hop boundary and trims the result back, so its tail is not what the corpus path
 produces; its output must never be written into a corpus, and no contract
-comparison can tell the two apart. Run the same pair through the old library
-too if you want the comparison to have a baseline.
+comparison can tell the two apart.
 
-**`--jobs` is the only lever that matters.** Measured on a 16 kHz corpus, the
-Python PBFDKF is **99.8%** of the run and file I/O is 0.1%, so nothing about
-the WAV handling is worth optimizing. One process sustains roughly 3.3x
-realtime, which puts a 200-hour corpus near 62 hours; sequences are
-independent, so `--jobs N` scales approximately with N until CPU or memory
-bandwidth saturates. Do not expect exactly N×: process startup, memory
-bandwidth and storage all take a cut, and the useful ceiling is usually below
-the logical-core count.
-
-`--jobs` cannot change the corpus. Each sequence gets a fresh PBFDKF, writes
-only its own chunks, and has no random source, so the only thing N changes is
-the order sequences finish in. Pinned by
+**`--jobs` is the only throughput lever.** The Python PBFDKF dominates the run
+(file I/O is negligible) and sequences are independent, so `--jobs N` scales
+roughly with N until CPU or memory bandwidth saturates. It cannot change the
+corpus: each sequence gets a fresh PBFDKF and writes only its own chunks, so N
+only changes the order sequences finish in (pinned by
 `tests/test_rematerialize_linear_aec.py`, which compares every sample of
-`--jobs 1` against `--jobs 3`.
+`--jobs 1` against `--jobs 3`).
 
 > ⚠ Compare AUDIO, not file bytes, if you check this yourself. libsndfile
 > stamps a `PEAK` chunk with the wall-clock time when it writes a float WAV,
@@ -844,95 +697,42 @@ the order sequences finish in. Pinned by
 > `--jobs`.
 
 **`--resume` is safe for this.** It skips a sequence only when THIS contract
-already wrote it AND that sequence's chunks still match on disk — the ledger
-records what was written, not what survived, so every claim is re-checked
-before it is honoured. A ledger written by a different contract is discarded
-whole rather than partially trusted. The ledger records a sequence only after
-all of its chunks are on disk, so an interrupted run redoes at most the ones
-that were in flight (up to `--jobs` of them). A run WITHOUT `--resume` starts
-by emptying the ledger, so it can never inherit a claim it did not make.
+already wrote it AND that sequence's chunks still match on disk; a ledger
+written by a different contract is discarded whole. The ledger records a
+sequence only after all of its chunks are on disk, so an interrupted run redoes
+at most the ones in flight, and a run WITHOUT `--resume` starts by emptying the
+ledger.
 
-**Between the two commands.** The packer is the only thing that checks the
-corpus is whole, so the order matters and there is no step to skip:
+**Order matters.** The packer is the only thing that checks the corpus is whole:
 
 1. `rematerialize_linear_aec` must exit **0**. A non-zero exit means some
-   sequences still carry the old fifth channel; the ledger will say so and the
-   packer will refuse, but do not go looking for a way around that.
-2. Do not run a second rematerializer against the same split concurrently.
-   Both would write the same ledger and each would overwrite the other's
-   claims.
-3. Then pack. If it refuses, finish the rematerialization -- re-run it, this
-   time WITH `--resume`, which now re-checks each claim against the chunks on
-   disk before honouring it.
+   sequences still carry the old fifth channel, and the packer will refuse.
+2. Do not run a second rematerializer against the same split concurrently; both
+   would write the same ledger and overwrite each other's claims.
+3. Then pack. If it refuses, finish the rematerialization (re-run it, with
+   `--resume` for the cheap path).
 
-If the run was interrupted, re-running with `--resume` is the cheap path and
-is safe: it redoes only what is not already recorded and verified. Re-running
-without `--resume` is also correct, just slower -- it empties the ledger and
-starts over.
-
-**The packer refuses a half-rematerialized corpus.** If
-`linear_error.done.json` exists but does not name every sequence, the split is
-part new frontend and part old, and `pack_aec_dataset.py` stops instead of
-labelling the shards with one contract while they hold two — the one failure
-here with no downstream detector, since the fifth channel is just samples once
-packed. A corpus with no ledger at all is fine: a one-pass generation never
-had one, and the guard is against a PARTIAL claim, not an absent one.
-
-**v2 → v3 has no automatic migration, deliberately.** A v2 contract records only
-a raw-text source hash, so once `lib/aec` has moved on there is no way to
-recover what the producing build's *behaviour* hash was — stamping the current
-one would assert a compatibility nobody verified. Re-stamp a dataset by
-re-running `rematerialize_linear_aec.py` (it re-runs PBFDKF and rewrites the
-`linear_error` channel, which is the honest thing to do). A v2 **checkpoint**
-cannot be repaired and must be retrained against a v3 corpus.
-
-`behavior_hash_schema` is folded into the digest as well as compared, so the two
-can never disagree. Bump it (`canon-ast-1` → `canon-ast-2`) whenever `_canon_ast`
-changes what it emits for unchanged input; a mismatch then names the serializer
-instead of looking like an AEC code change. No stamped artifact has ever carried
-a v3 contract without this field, so there is no migration path for one.
-
-The check is conservative: a pure refactor (renaming a local, reordering
-independent statements) also changes the behaviour hash. Refusing to load is the
-safe direction — rematerialize rather than loosening the check. Refresh the
-channel with the command below, which avoids repeating acoustic mixing:
+**The packer refuses a half-rematerialized corpus.** If `linear_error.done.json`
+exists but does not name every sequence, the split is part new frontend and part
+old, and `pack_aec_dataset.py` stops instead of labelling the shards with one
+contract while they hold two. A corpus with no ledger at all is fine: a one-pass
+generation never had one.
 
 #### The one exception: verified frontend-equivalent migrations
 
-> **⚠ The table is empty.** Historical corpus identities affected by the
-> per-grid shadow-copy baseline retime and C restart evidence clearing
-> remain retired: those changes move `linear_error`, so an inert refactor
-> cannot make the earlier waveforms compatible. They are refused with an
-> instruction to rematerialize (`rematerialize_linear_aec.py`, WITHOUT
-> `--resume`, then repack and retrain). A corpus that also needs the
-> `[acoustic_tails]` mixture must be generated afresh instead — see
-> "Migrating an existing corpus" above.
->
-> Retired identities are **never retargeted**. `behavior_hash_schema` stays
-> `canon-ast-1`; the canonicalizer is unchanged. The refusals are pinned by
-> `tests/test_linear_aec_behavior_migration.py`.
-
-The 2026-10-21 orchestrator-stage refactor and numeric CLI preset support move
-identity `419f473e...ff8fa` to `9fa7a2de...245e5` while leaving the frozen
-materialized signal unchanged. Before/after full real AEC 2021/2023 and
-self-recorded clips at 16/48 kHz have byte-identical formed output, error,
-echo and context/state traces (8,636 hops across nine profiles); the same
-comparator rejects a one-bit change at the actual formed-output getter.
-No local corpus or checkpoint ledger is stranded at the previous identity,
-so this measured equivalence adds no exception to the empty table. Existing
-recorded data still needs an explicitly admitted pair to cross an identity
-boundary; measurement alone does not change admission policy.
+> **⚠ The table is empty.** A corpus identity that predates a change which moves
+> `linear_error` is refused with an instruction to rematerialize
+> (`rematerialize_linear_aec.py`, WITHOUT `--resume`, then repack and retrain),
+> pinned by `tests/test_linear_aec_behavior_migration.py`. A corpus that also
+> needs the `[acoustic_tails]` mixture must be generated afresh instead — see
+> "Migrating an existing corpus" above. `behavior_hash_schema` stays
+> `canon-ast-1`.
 
 `ACCEPTED_BEHAVIOR_HASH_MIGRATIONS` in `linear_aec.py` is an explicit table of
 `recorded → current` behaviour-hash pairs that are known to produce the *same*
-`linear_error`. `require_linear_aec_contract` accepts exactly those pairs, with
-a `RuntimeWarning` naming the migration; the existing shards and the trained
-checkpoint stay valid, so **no regeneration, no re-stamping, no retraining**.
-`behavior_hash_schema` is *not* bumped — the canonicalizer is unchanged, only
-the sources it is applied to.
-
-This is not a loosening of the guard, and specifically is not a way to accept
-"old hashes" in general:
+`linear_error`. `require_linear_aec_contract` accepts exactly those pairs, with a
+`RuntimeWarning` naming the migration, so existing shards and trained
+checkpoints stay valid. This is not a way to accept "old hashes" in general:
 
 - an entry is a **single explicit pair**, never a wildcard or a version floor;
 - it applies **only when `aec_behavior_hash` is the sole differing field**, so a
@@ -941,70 +741,40 @@ This is not a loosening of the guard, and specifically is not a way to accept
   older build is a downgrade and stays refused;
 - it is **single-hop**: the table is not applied transitively, so two stacked
   migrations need the composed pair, re-verified end to end;
-- an unlisted hash is refused exactly as before.
+- an unlisted hash is refused.
 
 Admission requires *measured* evidence, not an argument that the change looks
 inert: render the frozen frontend (`LinearAecProcessor`, formed_output seam)
 before and after over a scene that actually reaches the changed code, and show
 the bytes are identical — plus a control proving the same harness *can* fail
 (render with the new mechanism enabled and confirm the bytes move). The
-byte-equality of a dead harness is worth nothing. The rationale and the numbers
-for each admitted entry live in the comment on the entry itself.
+rationale and the numbers for each admitted entry live in the comment on the
+entry itself. Anything that retunes a *live* mechanism does not qualify:
+rematerialize instead, with the commands above.
 
 #### Released-checkpoint inference exception
 
-The 16-kHz Align-ULCNet checkpoint released immediately before the PBFDKF
-causal-half TD-constraint correction remains loadable through
-`require_inference_linear_aec_contract`. This is deliberately a different
-allowlist from `ACCEPTED_BEHAVIOR_HASH_MIGRATIONS`: the correction changes
-`linear_error`, so inference emits a warning that model output may differ.
-Only that exact recorded/current hash pair, at 16 kHz and in the live
+One released 16-kHz Align-ULCNet checkpoint hash pair
+(`RELEASED_INFERENCE_BEHAVIOR_HASH_COMPATIBILITY`) remains loadable through
+`require_inference_linear_aec_contract`. This is a different allowlist from
+`ACCEPTED_BEHAVIOR_HASH_MIGRATIONS`: that checkpoint's `linear_error` differs
+from the current frontend's, so inference emits a warning that model output may
+differ. Only that exact recorded/current hash pair, at 16 kHz and in the live
 `LinearAecEngine`, is accepted. Dataset packing, rematerialization, training,
-48-kHz use, reverse use and every unlisted hash still fail closed; regenerate
-the corpus before training the next checkpoint.
-
-Anything that retunes a *live* mechanism does not qualify for the
-frontend-equivalent table — rematerialize instead:
-
-```bash
-python3 -m AIAEC.dataset_gen.rematerialize_linear_aec \
-    --input data_aec/all \
-    --config AIAEC/dataset_gen/config.ini
-python3 -m AIAEC.dataset_gen.pack_aec_dataset \
-    --config AIAEC/dataset_gen/config.ini \
-    --input data_aec/all --output data_aec/packed/all --overwrite
-```
+48-kHz use, reverse use and every unlisted hash still fail closed.
 
 `rematerialize_linear_aec.py --resume` skips a sequence only when the CURRENT
 contract already wrote it, per the `linear_error.done.json` ledger beside the
-corpus; a ledger from another contract is ignored whole. Re-running after a
-`[linear_aec]` config edit therefore redoes every sequence on its own, with or
-without `--resume`. That holds across an accepted migration too: the ledger is
-keyed on `fingerprint()`, which folds in the raw-text `aec_source_hash` and
-`aec_commit`, so an INTERRUPTED rematerialization restarts even where the
-migration applies. A COMPLETED one does not — the packer honours that ledger
-with a `RuntimeWarning`, because refusing there would strand a finished corpus
-behind advice that cannot be followed: the config is identical, and what moved
-is `lib/aec`.
-
-**The ledger records the frontend that wrote it,** not only the fingerprint.
-The fingerprint is one-way, so a ledger carrying nothing else can say a corpus
-was written by a different contract but never *which* — which leaves an
-operator comparing two opaque hashes. `linear_error.done.json` therefore also
-carries the producing contract under `linear_aec`, and the packer bridges on
-that: an exact, config-independent comparison through
-`require_linear_aec_contract`, which reports the field that disagrees and
-names both builds. A ledger written before that field existed (only `contract`
-and `sequences`) still reads normally everywhere; for those the packer
-reconstructs the migrated-from build's fingerprint from its recorded
-provenance instead (`MIGRATED_SOURCE_PROVENANCE`, one candidate per `lib/aec`
-revision that carried the migrated-from behaviour hash — a behaviour hash is
-comment-insensitive, so a RANGE of revisions carries it and each one wrote a
-different fingerprint). If that refuses, the message says the ledger records
-no identity and asks for `git -C lib/aec rev-parse HEAD` plus the `[signal]`
-and `[linear_aec]` config sections from the machine that ran the
-rematerialization — the two things needed to identify the build. Add `--jobs N` to spread independent sequences across
-cores — it does not change a single sample.
+corpus. The ledger is keyed on `fingerprint()` (raw-text `aec_source_hash` and
+`aec_commit`), so an INTERRUPTED rematerialization restarts even where an
+accepted migration applies, while the packer honours a COMPLETED one with a
+`RuntimeWarning`. The ledger also records the producing contract under
+`linear_aec`, so the packer compares it exactly through
+`require_linear_aec_contract`, names the field that disagrees and reports both
+builds; for a ledger without that field it reconstructs the migrated-from
+fingerprint from `MIGRATED_SOURCE_PROVENANCE`. If that refuses, the message asks
+for `git -C lib/aec rev-parse HEAD` plus the `[signal]` and `[linear_aec]`
+config sections from the machine that ran the rematerialization.
 
 Generation is deterministic given `--seed`: each sequence is seeded from
 `(seed, split, sequence_id)`, so it renders identically regardless of worker
@@ -1043,8 +813,7 @@ The movement axis is checked by measuring it back out of rendered audio with
 `path_drift_metrics.py` and comparing against the blind-set targets, so the
 test cannot pass by reading the schedule the renderer wrote down. Its RIRs are
 deliberately short enough to fit the estimator's 64 ms frame (a longer path
-cannot be written as one frequency response and would put an estimator floor of
-0.98 under every number) and deliberately reverberant enough that two positions
+cannot be written as one frequency response) and deliberately reverberant enough that two positions
 in a room are not near-identical. The `echo_path_moving` label test freezes the
 weight schedule and requires the label to disappear.
 

@@ -1,7 +1,7 @@
 """AEC3 comfort-noise generator, ported bit-for-bit from the C pipelines.
 
 Both C pipelines (``mono_aec_nr_res/audio_pipeline.c`` and
-``4ch_aec_bf_nr_res/4aec_nr_res.c``) fill the residual-suppressed bins through
+``4ch_aec_bf_nr_res/audio_pipeline_4ch.c``) fill the residual-suppressed bins through
 ``aec_cng_fill`` (``lib/aec/c_impl/include/aec_res.h``) with comfort noise drawn
 from one multiplicative-congruential step per bin whose top five bits index
 ``AECB_SQRT2_SIN_LUT`` (``lib/aec/c_impl/include/aec_balanced_config.h``), the
@@ -18,7 +18,7 @@ from __future__ import annotations
 
 import numpy as np
 
-#: ``AUDIO_PIPELINE_RNG_SEED`` in both C pipelines.
+#: ``SE_CNG_RNG_SEED`` (pipelines/common/se_stage.h).
 SEED = 0x9E3779B9
 
 #: The 32 float32 literals of ``AECB_SQRT2_SIN_LUT``: sqrt(2) * sin(2*pi*i/32).

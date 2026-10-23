@@ -1,7 +1,6 @@
 # AIAEC current candidate matrix
 
-This is the current implementation map. Superseded research notes are retained
-in Git history rather than treated as implementation documentation.
+This is the current implementation map.
 
 ## Decision matrix
 
@@ -12,31 +11,21 @@ in Git history rather than treated as implementation documentation.
 | end-to-end AEC+RES+NR | `DeepVQE_S` | mic + unaligned far | early near target | primary |
 | end-to-end AEC+RES+NR | `CAGCRN` | mic + unaligned far | early near target | backup |
 
-⚠ **Every candidate now targets the same early/dereverberated `near_target`**
+⚠ **Every candidate targets the same early/dereverberated `near_target`**
 (`MODEL_TASKS` values all end in `_dereverb`). For `Align_ULCNet` and
-`CAGCRN` that is a project extension of the published
-task, not the published task itself — they previously targeted the reverberant
-`near_speech`. Checkpoints trained under the old targets are refused at
-inference by `require_checkpoint_model_identity`, so they must be retrained.
+`CAGCRN` that is a project extension of the published task, not the published
+task itself. A checkpoint trained for another target is refused at inference by
+`require_checkpoint_model_identity`.
 
-`Align_CRUSE` previously ran its own "direct AEC/RES, preserve local noise"
-route (target: near speech + local noise, untouched). That route was retired
-and folded into the end-to-end AEC+RES+NR task above -- there is no more
-standalone AEC-only candidate in this project.
-
-No current model lives under `AINR/AECNet`, `AINR/PostFilter`, or
-`AINR/JointAECNR`. Those prototype names occur only in the archived design
-record.
+There is no standalone AEC-only candidate in this project.
 
 ## Selection rules
 
 - Use a RES+NR candidate only after the same production linear AEC that will be
   frozen at deployment. An oracle residual is rejected by the dataset view.
-- `DeepVQE_S` is the primary E2E route and `CAGCRN` the smaller backup. ⚠ This
-  rule used to read "use `DeepVQE_S` when dereverberation is part of the
-  target"; that no longer separates the two, since every candidate now targets
-  `near_target`. Whatever replaces it as the selection criterion is still an
-  open decision.
+- `DeepVQE_S` is the primary E2E route and `CAGCRN` the smaller backup.
+  Dereverberation does not separate them, since every candidate targets
+  `near_target`.
 
 ## Common contracts
 

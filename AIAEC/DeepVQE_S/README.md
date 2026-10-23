@@ -32,13 +32,12 @@ or bit exact.
 ## Training recipe
 
 The shipped `config.ini` uses the paper's AdamW settings (`lr=1.2e-3`,
-`weight_decay=5e-7`). The local campaign adds the shared three-epoch warmup from
+`weight_decay=5e-7`). The shipped config adds the shared three-epoch warmup from
 `1e-4`, followed by per-step cosine decay to `1e-6`. This is an explicit project
 choice; the paper does not publish its LR schedule.
 
-The paper trains batch 400 for 250 epochs. This campaign deliberately uses
-batch 8 (GPU limit) for 50 epochs (requested budget); those are substantial
-reproduction gaps and are recorded as such. Gradient accumulation is not
+The paper trains batch 400 for 250 epochs. The shipped config uses batch 8
+(GPU limit) for 50 epochs; those are substantial reproduction gaps. Gradient accumulation is not
 presented as an exact substitute because the BatchNorm layers would still see
 micro-batches of eight. The paper does not publish its training-example
 duration, dataset hours, or steps per epoch, so there is no defensible
@@ -50,15 +49,13 @@ so this implementation
   explicitly inherits Align-CRUSE's STFT-consistent PLCPA objective (`c=0.3`,
   `beta=0.7` on the phase-aware complex term).
 
-Early stopping is disabled for the 50-epoch campaign; validation continues to
-select `*_best.pth`.
+Early stopping is disabled; validation continues to select `*_best.pth`.
 
 ## C deployment boundary
 
 `deepvqe_prepost.h/.c` is the integrator's entry point: one opaque
 `DeepVqePrepost` composing the shared `aiaec_process.c` STFT/WOLA and the
-`deepvqe_process.c` CCM kernel (neither changes, so their standalone parity
-tests keep linking). The lifecycle and per-hop sequence shared by every
+`deepvqe_process.c` CCM kernel. The lifecycle and per-hop sequence shared by every
 class are described once, in `../README.md` ("C pre/post-processing").
 Specific to this one: the accelerator boundary is the exporter's exactly --
 power-law compressed `mic`/`far` in (planar `[1,2,1,F]`, real plane then
@@ -90,19 +87,12 @@ microphone, so the pass-through identity a post-filter can take would emit the
 uncancelled echo here.
 
 The exporter writes `state_layout_version` (`DEEPVQE_PREPOST_LAYOUT_VERSION`,
-currently 4; the exporter's `DEEPVQE_C_LAYOUT_VERSION` is the same number; 1-3 are retired) and
+currently 4; the exporter's `DEEPVQE_C_LAYOUT_VERSION` is the same number) and
 a `c_descriptor` block measured from the built graph into the ONNX
 metadata and the sidecar JSON; a board feeds that block to
 `deepvqe_prepost_descriptor_validate()` before binding. The class gate is
 `../tests/test_deepvqe_prepost_c.py`, which also pins the header, the exporter
 table and the graph's state shapes to each other.
-
-Removed with layout 4: the exporter option `--gru-state-layout`,
-`deepvqe_prepost_outputs_inherit()` (the runtime binds each `*_out` to its input
-address), `DEEPVQE_CONV_HISTORY`/`DEEPVQE_SCORE_HISTORY` (replaced by
-`DEEPVQE_CONV_WINDOW`/`DEEPVQE_SCORE_WINDOW`) and the descriptor fields
-`conv_history_frames`/`score_history_frames` (replaced by `conv_window_frames`/
-`score_window_frames`).
 
 ## ONNX and calibration
 
@@ -117,6 +107,4 @@ python3 inference.py calib --checkpoint checkpoint.pth \
 Use `--format npz --output calib/deepvqe_s.npz` for a NumPy archive. BIN
 output contains one directory per graph input and one numbered file per
 streaming invocation. The `mic`/`far` tensors it records are the host-compressed
-planar spectra the graph binds (layout version 4); an ONNX file, JSON sidecar
-or calibration set from an earlier layout must be regenerated and the
-accelerator program recompiled.
+planar spectra the graph binds (layout version 4).

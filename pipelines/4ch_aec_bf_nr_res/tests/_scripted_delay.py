@@ -1,12 +1,11 @@
 """Scripted shared-delay shim used by test_delay_parity.py and test_pipeline.py.
 
 Publishes a scripted ``(delay, solid)`` per hop in place of a live DelayAec.
-Scripted rather than provoked, for the same reason the C side drives its
-admission state machine directly (tests/test_4aec_nr_res.c): a live estimator
-re-offers a movement on every hop once it has one, so a held candidate is
-always resolved on the very next eligible hop and its TTL never runs out;
-and the hop a lock is PUBLISHED on must be chosen by the scene, not by the
-estimator, when the test is about what the pipeline does on that hop.
+Scripted rather than provoked, as the C side drives its admission state
+machine directly (tests/test_4aec_nr_res.c): a live estimator re-offers a
+movement on every hop, so a held candidate is resolved on the next eligible hop
+and its TTL never runs out, and the scene, not the estimator, must choose the
+hop a lock is published on.
 """
 
 

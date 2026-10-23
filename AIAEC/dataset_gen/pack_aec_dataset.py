@@ -2,8 +2,8 @@
 """Pack rendered stem WAVs into .pt shards.
 
 Same motivation as ``AINR/dataset_gen/pack_dataset.py``: per-file I/O dominates
-training on a corpus of this size.  The shard layout is the packed format every
-AEC model project consumes:
+training on a corpus of this size. The shard layout every AEC model project
+consumes:
 
     {
       'stems': ['far_render','mic_postclip','linear_error','near_target'],
@@ -14,23 +14,19 @@ AEC model project consumes:
       'linear_aec_contract_hash': its fingerprint,
     }
 
-Input is rendered audio only: ``<split>/seqs/SSSSSS_CCC.wav``. No meta.json, no
-per-sequence sidecar, no index.json on the way out either -- the packer
-discovers sequences and chunk order from the filenames, and takes T, sr and the
-channel count from the WAVs themselves.  A corpus therefore stays packable
-after being copied, rsynced or trimmed by hand.
+Input is rendered audio only (``<split>/seqs/SSSSSS_CCC.wav``): sequences and
+chunk order come from the filenames, T, sr and channel count from the WAVs, so
+a corpus stays packable after being copied or trimmed by hand.
 
-⚠ ``--config`` is the one non-audio input, and it is required: the frozen
-linear-AEC contract that produced the ``linear_error`` stem cannot be recovered
-from a WAV, and inference has to construct the SAME one to reproduce ``D_hat``
-(see ``AIAEC.training_common.LinearAecEngine``). Pass the config the corpus was
-generated with. Nothing cross-checks that claim, so passing a
-different one silently mislabels the corpus.
+⚠ ``--config`` is required: the frozen linear-AEC contract that produced the
+``linear_error`` stem cannot be recovered from a WAV, and inference has to
+construct the SAME one to reproduce ``D_hat`` (see
+``AIAEC.training_common.LinearAecEngine``). Pass the config the corpus was
+generated with; nothing cross-checks it.
 
 ⚠ Chunks are packed in ``(sequence_id, chunk_index)`` order and a sequence is
-never split across shards. Training later randomizes global chunk indices, but
-the physical order is retained for full-sequence reconstruction and streaming
-evaluation.
+never split across shards; the physical order is kept for full-sequence
+reconstruction and streaming evaluation.
 
 Usage:
     python3 pack_aec_dataset.py --config config.ini --input data_aec/all \\
@@ -153,14 +149,11 @@ def _frontend_line(contract) -> str:
 def _honour_recorded_identity(path, contract, recorded, identity):
     """Decide a ledger that NAMES the frontend that wrote it. Raise to refuse.
 
-    Preferred over reconstructing candidate fingerprints: the ledger states
-    the producing contract, so the comparison is exact, independent of which
-    --config this run passed, and needs no table of revisions to enumerate.
+    Preferred over reconstructing candidate fingerprints: the ledger states the
+    producing contract, so the comparison is exact and independent of --config.
     ``require_linear_aec_contract`` is the one authority on whether two
-    frontends may share data -- it compares every compatibility field, admits
-    only a migration the evidence table already holds, and reports a retired
-    identity with what to do about it -- so the decision is delegated rather
-    than re-derived here.
+    frontends may share data (every compatibility field, only evidenced
+    migrations, retired identities named), so the decision is delegated.
     """
     try:
         source = LinearAecContract.from_dict(identity)
@@ -188,40 +181,11 @@ def _honour_recorded_identity(path, contract, recorded, identity):
 def _require_complete_rematerialization(seqs_dir, sequences, contract):
     """Stop if the fifth channel was only partly rebuilt.
 
-    rematerialize_linear_aec writes a ledger keyed to the contract it ran, and
-    records a sequence only once all of that sequence's chunks are on disk. So
-    a ledger that exists but does not name every sequence means a run was
-    interrupted: some sequences carry the new frontend and the rest still
-    carry the old one. Packing that produces a shard set labelled with ONE
-    contract while holding two, which nothing downstream can detect -- the
-    fifth channel is just samples once it is packed.
-
-    No ledger at all is not an error. A corpus generated in one pass by
-    gen_aec_dataset.py never had one, and there is nothing to contradict.
-    The failure this guards is a PARTIAL claim, not an absent one.
-
-    A ledger written by an equivalent frontend is honoured. It keys on
-    ``fingerprint()``, which folds in `aec_commit` and `aec_source_hash`, so
-    it moves on any lib/aec edit -- including a comment reflow, and including
-    one whose `linear_error` is byte-identical by the evidence
-    ACCEPTED_BEHAVIOR_HASH_MIGRATIONS required to admit it. Refusing there
-    would strand a COMPLETED corpus behind advice that cannot be followed: the
-    config is identical, and what moved is lib/aec, which --config cannot
-    address.
-
-    Two routes to that, in order of preference:
-
-      * the ledger RECORDS the producing contract, so the comparison is exact
-        and config-independent -- ``require_linear_aec_contract`` decides it
-        on the same terms every other gate uses;
-      * a LEGACY ledger records only the fingerprint, which is one-way. The
-        source build's fingerprint is then reconstructed from its recorded
-        provenance (MIGRATED_SOURCE_PROVENANCE, one candidate per lib/aec
-        revision that carried the migrated-from behaviour) and compared whole,
-        so an unrelated build still fails.
-
-    Neither weakens the completeness check below, which runs against the
-    ledger either way.
+    rematerialize_linear_aec records a sequence in its ledger only once all of
+    its chunks are on disk, so a ledger that does not name every sequence means
+    an interrupted run and a shard set labelled with ONE contract would hold
+    two frontends. No ledger at all is fine: the guard is against a PARTIAL
+    claim. A ledger from an equivalent frontend is honoured.
     """
     path = ledger_path(seqs_dir)
     if not os.path.exists(path):

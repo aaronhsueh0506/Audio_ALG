@@ -18,17 +18,12 @@ At an AEC delay-regime boundary — including FIXED mode's first usable error �
 wrapper does two things and nothing else: it calls `model->reset` (so the
 runtime flushes its far attention ring and logit history) and it arms the
 identity reprime. No buffer is cleared; every C-side framing state keeps
-running across the switch. (The layout-16 wrapper wiped its beam-WOLA
-accumulator at every boundary and emitted one half-window-tapered hop there;
-with no reconstruction stage left there is nothing to wipe, so the boundary
-hop now comes out whole — see the header's MODEL CALLBACK POLICY note.)
-The frame whose analysis window still covers a pre-switch hop therefore
+running across the switch. The frame whose analysis window still covers a pre-switch hop therefore
 emits the identity WITHOUT stepping the model:
 `AUDIO_PIPELINE_4CH_ULCNET_REPRIME_FRAMES` = 1 frame, the same count as the
 mono wrapper, because both branches are framed from the CURRENT input hop and
 each 50%-overlap frame spans two hops. The constant is derived and asserted
-by the straddle-derivation test, not estimated; option B (keep stepping
-through those frames) is deferred pending an audio A/B.
+by the straddle-derivation test, not estimated.
 
 ## Signal path and timing (direct path)
 
@@ -44,14 +39,10 @@ side, and every hop from hop #0 is exactly one inference.
 Total added algorithmic latency is **1 hop** — 256 samples / 16 ms at 16 kHz,
 512 samples / 10.67 ms at 48 kHz — the Align-ULCNet synthesis WOLA and
 nothing else. `process()` emits zeros for hop #0 only; the output of hop p
-(p >= 1) is the beamformed error of input hop p-1. Measured with a unit
-impulse: far at sample 2085 comes out at 2341, i.e. impulse + 256 exactly.
+(p >= 1) is the beamformed error of input hop p-1.
 
 The beam hop is not reconstructed by WOLA and re-analysed (that would cost one
-IFFT plus one RFFT and one extra hop of latency per hop). The pipeline has none of: the beam WOLA carves
-(`ifft`, `ola`, `synth_win`, `beam_hop`), the error-branch analysis state, the two-frame staging, the
-one-hop far compensation buffer, and the C API entry point
-`audio_pipeline_4ch_ulcnet_last_beamformed_error()` — there is no
+IFFT plus one RFFT and one extra hop of latency per hop), so the pipeline has no
 reconstructed beam hop to hand out. The layout version
 (`AUDIO_PIPELINE_4CH_ULCNET_LAYOUT_VERSION`) is **23**; a persisted
 descriptor from any earlier version is refused by
@@ -59,11 +50,9 @@ descriptor from any earlier version is refused by
 
 Spectrogram-consistency note: `bf_spectrum` is per-bin weighted, i.e. an
 inconsistent spectrogram, and a WOLA round trip would project it onto a
-consistent one. Measured on real 4-channel recordings, that
-projection moves about -30 dB complex (-33 dB magnitude), -36..-43 dB over
-the 750-4000 Hz speech band and -22 dB at DC in the worst case. The direct
-path feeds the model the un-projected spectrum; no listening A/B has been
-done.
+consistent one (on real 4-channel recordings that projection moves the
+spectrum by about -30 dB complex). The direct path feeds the model the
+un-projected spectrum.
 
 Raw/aligned selection exists only in `sweep_delay_depth.py`, not in this
 runtime API. Export metadata requires the checkpoint and deployment contracts

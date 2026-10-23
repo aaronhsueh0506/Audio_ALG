@@ -343,9 +343,9 @@ def export_graph(stream, grid, checkpoint_path, output_path, opset=17,
                     for a, b in zip(actual, expected))
         # fp32 GRU kernels differ in accumulation order between torch and
         # onnxruntime, and the difference scales with the trained weight
-        # magnitude: a real checkpoint measured 2.14e-4 where random-weight
-        # fixtures sit at 1e-6. The bound guards against structural breakage
-        # (wrong wiring explodes far past this), not kernel rounding.
+        # magnitude, so a trained checkpoint lands orders of magnitude above
+        # random-weight fixtures (~1e-6). The bound guards against structural
+        # breakage (wrong wiring explodes far past this), not kernel rounding.
         if worst > 1e-3:
             raise RuntimeError('ONNX parity failed: max abs error %.6g' % worst)
         print('ONNX parity max_abs=%.6g' % worst)

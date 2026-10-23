@@ -76,21 +76,19 @@ immutable model window：512 個窗值必須與模型表逐位元相同。若另
   的 `ispec_scale=1`，不可再縮放一次。`AC_OLA_ACCUMULATE` 自第一幀輸出 256 samples，
   不除窗包絡，與 Python `train.istft` 相同。
 - 最新特徵 window `[t-2,t-1,t]` 的 gain 套到 spectrum `t-1`；呼叫端仍須延遲對應頻譜。
-- `RNNOISE_PREPOST_LAYOUT_VERSION=2`：state 改為借用 framing；`rnnoise_state_init`
-  新增 analysis／synthesis 參數，並與 analysis／synthesis 一樣回傳 `0` 或 `-1`。
-  GRU 張量未改，`RNNOISE_MODEL_IO_LAYOUT_VERSION` 與 ONNX state layout 仍為 **1**。
+- `RNNOISE_PREPOST_LAYOUT_VERSION=2`：state 借用 framing，`rnnoise_state_init`
+  取 analysis／synthesis 參數並回傳 `0` 或 `-1`。GRU 張量的
+  `RNNOISE_MODEL_IO_LAYOUT_VERSION` 與 ONNX state layout 為 **1**。
 
 建置時加入 `audiolib/common/include`、`audiolib/common` include paths，連結同一組
 `SIMD=0/1` 的 common archive；此目錄的 Makefile 已處理這些依賴。
 
 更換 FFT 實作保留數學定義，但 butterfly 的浮點捨入會改變結果，不能宣稱逐位元
-相同。共用 FFT 在本次固定訊號與錄音對照中更接近 torch 參考；低能量 band 的 log
-會放大微小頻譜誤差。驗證涵蓋原有 Python/C 容差、完整 frame、頻譜修改、合成長度、
-首 hop、重置與固定係數網路輸出；本機沒有已訓練 RNNoise 權重，**尚未量測真實模型的
-感知品質**，固定係數測試不能替代這項評估。
+相同；低能量 band 的 log 會放大微小頻譜誤差。測試涵蓋 Python/C 容差、完整 frame、
+頻譜修改、合成長度、首 hop、重置與固定係數網路輸出；本機沒有已訓練 RNNoise 權重，
+**尚未量測真實模型的感知品質**，固定係數測試不能替代這項評估。
 
-在目前 AArch64 host，獨立配置的總 static memory 為 **31,136 bytes**，舊版為
-15,328 bytes；其中 RNNoiseState 5,104、FFT 13,552、analysis 6,240、synthesis 6,240。
+在目前 AArch64 host，獨立配置的總 static memory 為 **31,136 bytes**；其中 RNNoiseState 5,104、FFT 13,552、analysis 6,240、synthesis 6,240。
 只有呼叫端原本就持有可共用 FFT 時，新增的 RNNoise/framing 部分才是 17,584 bytes。
 這些是目前實作的量測，整合端仍應依 size-query 配置。
 
@@ -144,7 +142,7 @@ datasets_fullband/
 - 所有音檔必須是 **`.wav` 格式**（程式只掃描 `*.wav`）
 - 音檔可以是任意 sample rate，程式會自動 resample 到 16kHz
 - **RIR 為 optional**：若不使用，可將 `rir_dir` 設為空字串或刪除該行。建議使用以提升 dereverberation 效果
-- RIR 會自動用 Schroeder 積分法估算 RT60，只保留 `rt60_min` ~ `rt60_max` (預設 0.1s ~ 1.3s) 範圍內的 RIR
+- RIR 會自動用 Schroeder 積分法估算 RT60，只保留 `rt60_min` ~ `rt60_max` (`dataset_gen/config.example.ini` 預設 0.2s ~ 1.0s) 範圍內的 RIR
 - **RIR RT60 快取**：首次掃描後會自動存成 `.rir_cache_*.json`，後續相同設定直接讀取，大幅加速初始化
 - 不一定要用 DNS4，**任何符合上述結構的語音/噪音資料集都可以**（只要是 wav 檔放在對應目錄下）
 
@@ -184,8 +182,8 @@ output_dir = ./output
 匯出的 ONNX model metadata 也會帶上相同 feature contract，供部署端檢查。
 
 > 只有 `feature_version` 等於上述 `..._v8` 的 checkpoint/ONNX 可用；其他版本
-> (含早期 ERB-only 與 absolute-ERB 版本) 即使 input shape 相同，normalization
-> semantics 或 erb_fwd/erb_inv 矩陣也不同，必須重訓後重新匯出。
+> 即使 input shape 相同，normalization semantics 或 erb_fwd/erb_inv 矩陣也不同，
+> 必須重訓後重新匯出。
 
 ## 訓練
 
@@ -196,10 +194,8 @@ packing 全部由 `../dataset_gen/` 維護，RNNoise-ERB 不保存重複版本�
 
 訓練 objective 是直接 ERB IRM：對 22 個 band gain 與 ideal ratio
 mask 在 `gamma=0.5` 的壓縮域做 MSE，對齊原始 RNNoise 論文採用的 perceptual
-compromise。目前 MRSL 的兩個 factor 都是 0；
-沒有假 VAD/activity 加權。低於 `energy_floor` 的 mixture band 無法定義
-ratio，會被 mask 掉而不產生梯度。若要重開 MRSL，必須先依實測 gradient
-norm 重新縮放 IRM；直接恢復 factor 500 會讓 MRSL 壓過 IRM。
+compromise。MRSL 的兩個 factor 為 0，沒有 VAD/activity 加權。低於
+`energy_floor` 的 mixture band 無法定義 ratio，會被 mask 掉而不產生梯度。
 
 ```bash
 # Step 0: 建立 dataset_gen 專用設定並填入 speech/noise/RIR paths
@@ -250,12 +246,11 @@ python3 train.py --config config.ini --packed-data data_16k/packed.pt \
 ```
 
 續訓會恢復：model weights、optimizer 狀態、global_step、epoch 計數、best_val_loss。
-⚠ **scheduler 狀態刻意不恢復**：checkpoint 裡沒有存它。restore 會把寫入當時那一輪的
-`T_max` 帶回來蓋掉為現在這輪重建的值——實測從 100-epoch 的 checkpoint 續訓到 120
-epochs，終端 lr 是 1.02e-04 而非 min_lr 1e-06（102 倍）。正確做法是照新的 epochs
-重建，再用 `global_step` 快轉，這也是 `training_common.fast_forward_scheduler()` 做的事。
-Checkpoint 同時檢查 loss contract；以 MRSL+IRM 為 loss 的 checkpoint 不能 resume，
-必須從新初始化的訓練開始。
+⚠ **scheduler 狀態刻意不恢復**：checkpoint 裡沒有存它，因為 restore 會把寫入當時
+那一輪的 `T_max` 帶回來蓋掉為現在這輪重建的值，續訓到較長的 epochs 時 lr 無法降到
+min_lr。做法是照新的 epochs 重建，再用 `global_step` 快轉，這也是
+`training_common.fast_forward_scheduler()` 做的事。Checkpoint 同時檢查 loss
+contract，不一致的 checkpoint 不能 resume。
 
 ### 訓練輸出
 

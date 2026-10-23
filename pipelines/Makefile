@@ -1,129 +1,56 @@
 # Audio_ALG/pipelines/Makefile
 #
-# AEC(linear) -> echo-aware NR -> RES pipeline — two versions of the SAME
-# algorithm (see mono_aec_nr_res/main.c's header for the DSP chain):
+# AEC(linear) -> echo-aware NR -> RES pipeline in two builds of the same algorithm (DSP
+# chain: see mono_aec_nr_res/main.c):
+#   aec_nr_pipeline         heap-allocated modules
+#   aec_nr_pipeline_static  one caller pool, no malloc after init
+# Both are thin CLI shells (arg parsing, WAV I/O, diagnostics) over
+# mono_aec_nr_res/audio_pipeline.h/.c, linked from libaudio_pipeline.a; the ULCNet
+# application links its wrapper/pre-post objects directly. All link against the submodule
+# libs (lib/aec, lib/nr) and audiolib's FFT/fast_math layer (../../audiolib/common).
 #
-#   aec_nr_pipeline         (Version A: malloc)         — heap-allocated modules
-#   aec_nr_pipeline_static  (Version B: static memory)  — one caller pool, no
-#                                                          malloc after init
-#
-# Both are thin CLI shells (arg parsing + WAV I/O + diagnostics) over
-# mono_aec_nr_res/audio_pipeline.h/.c — the pool-sizing/carving/per-hop-
-# processing logic itself is reusable through audio_pipeline.h. The two host
-# runners link it from libaudio_pipeline.a; the ULCNet application links its
-# wrapper/pre-post objects directly rather than adding another wrapper archive.
-#
-# All three link against the submodule libs (lib/aec, lib/nr) + the shared
-# audiolib FFT/fast_math layer (../../audiolib/common relative to this dir).
-#
-# =============================================================================
-# Build isolation
-# =============================================================================
-# This repo is a CONSUMER of THREE producer archives (audiolib's
-# libaudio_common.a, lib/aec's libaec.a, lib/nr's libanr.a), each of
-# which is itself CFG_SIG-keyed (see those repos' own Makefiles). The design
-# here is the same two-phase recursive-make dispatch AEC/NR already use for
-# their ONE producer (audiolib), extended to resolve THREE:
-#
-#   Phase 1 (COMMON_LIB unset — the normal case for any top-level `make ...`):
-#   a goal that needs any producer archive gets a recipe that queries, IN
-#   ORDER, audiolib's, then lib/aec's, then lib/nr's own `print-lib-path`
-#   (forwarding this invocation's exact BACKEND/WERROR/CC/CXX/EXTRA_CFLAGS/
-#   NO_STDIO — and, for the lib/aec and lib/nr queries, ALSO the just-resolved
-#   COMMON_DIR/COMMON_LIB, so THEIR OWN two-phase dispatch resolves directly instead
-#   of re-deriving it) and re-invokes itself with COMMON_LIB/AEC_LIB/NR_LIB set.
-#
-#   Phase 2 (COMMON_LIB known): the REAL rules are defined. Each producer archive
-#   is a FORCE-recipe target (always re-invokes that producer's own build,
-#   which is a no-op if already up to date, then asserts the archive exists)
-#   and a NORMAL (not order-only) prerequisite of every rule that links
-#   against it — so relinking happens iff a producer's archive mtime actually
-#   advanced.
-#
-# This repo's own objects/binaries are ALSO hash-keyed the same way
-# (obj|bin/<backend>-<cfg_sig>/) — CFG_SIG folds in this Makefile's own full
-# flag coverage (CC/CXX/AR/RANLIB/CFLAGS/CXXFLAGS/CPPFLAGS/LDFLAGS/
-# EXTRA_CFLAGS/EXTRA_LDFLAGS/BACKEND/WERROR/NO_STDIO/DEBUG) PLUS the three
-# resolved producers' own config identities (COMMON_PRODUCER_SIG/AEC_PRODUCER_SIG/
-# NR_PRODUCER_SIG — each just the last path component of that producer's
-# resolved archive dir, e.g. "ne10-1234567890", never the full path) — so a
-# pipeline build against a differently-configured producer keys to its own
-# separate directory too, instead of risking silent config skew.
+# Build isolation: this repo consumes three producer archives (audiolib's libaudio_common.a,
+# lib/aec's libaec.a, lib/nr's libanr.a), each CFG_SIG-keyed.
+#   Phase 1 (COMMON_LIB unset): a goal that needs a producer archive queries, in order,
+#     audiolib's, lib/aec's and lib/nr's own `print-lib-path` (forwarding BACKEND/WERROR/CC/
+#     CXX/EXTRA_CFLAGS/NO_STDIO and, for lib/aec and lib/nr, the resolved COMMON_DIR/
+#     COMMON_LIB) and re-invokes itself with COMMON_LIB/AEC_LIB/NR_LIB set.
+#   Phase 2 (COMMON_LIB known): the real rules. Each producer archive is a FORCE-recipe
+#     target and a normal prerequisite of every rule that links it, so relinking happens iff
+#     a producer archive's mtime advanced.
+# Objects and binaries are keyed obj|bin/<backend>-<cfg_sig>/. CFG_SIG folds in this
+# Makefile's flag coverage (CC/CXX/AR/RANLIB/CFLAGS/CXXFLAGS/CPPFLAGS/LDFLAGS/EXTRA_CFLAGS/
+# EXTRA_LDFLAGS/BACKEND/WERROR/NO_STDIO/DEBUG) plus the three producers' config identities
+# (COMMON_PRODUCER_SIG/AEC_PRODUCER_SIG/NR_PRODUCER_SIG, the last path component of each
+# resolved archive dir), so a differently configured producer gets its own directory.
 #
 # Usage:
-#   make                       # resolves+builds all three producer archives
-#                              # (the NE10 FFT backend, the only one) + both
-#                              # pipeline binaries. Every axis this file and
-#                              # the three producers' own Makefiles key on
-#                              # (SIMD, EXTRA_CFLAGS, WERROR, NO_STDIO, ...)
-#                              # lands in a fresh, separate obj|bin directory
-#                              # automatically; no manual clean needed, ever
-#   make EXTRA_CFLAGS="..."    # forwarded to all three producers AND this
-#                              # pipeline's own compile
-#   make WERROR=1              # opt-in: -Werror for this file's own TUs
-#   make test                  # build + run mono API and board-adapter tests
-#
-# The four-channel pipeline has an intentionally independent producer at
-# 4ch_aec_bf_nr_res/Makefile.  Keeping it there prevents its DOA/BF dependencies and
-# source set from changing this mono pipeline's build identity.
-#   make NO_STDIO=1 libaudio_pipeline.a   # board-firmware stdio-less build of
-#                              # JUST the library object (see the NO_STDIO
-#                              # comment further down) -- does not link, so it
-#                              # needs none of the three producer archives
-#   make audit-no-stdio        # PASS/FAIL gate: proves the delivered
-#                              # NO_STDIO=1 libaudio_pipeline.a really has no
-#                              # fprintf/printf/puts/fputs/stderr refs, and
-#                              # that its keyed path differs from the default
-#                              # (stdio) config's path
+#   make                       # all three producer archives + both pipeline binaries
+#   make EXTRA_CFLAGS="..."    # forwarded to the producers and this compile
+#   make WERROR=1              # -Werror for this file's own TUs
+#   make test                  # build + run the mono API and board-adapter tests
+#   make NO_STDIO=1 libaudio_pipeline.a   # stdio-less library object only (no link, so no
+#                              # producer archive is needed)
+#   make audit-no-stdio        # PASS/FAIL: the NO_STDIO=1 libaudio_pipeline.a has no
+#                              # fprintf/printf/puts/fputs/stderr refs and a keyed path that
+#                              # differs from the default (stdio) config's
 #   make print-bin-dir | print-obj-dir | print-lib-path
-#                              # report THIS invocation's own keyed paths (see
-#                              # the query-targets comment further down for
-#                              # how to get the exact path `make all` itself
-#                              # would produce)
-#   make publish               # copy this build's artifacts to
-#                              # dist/<backend>/<cfg_sig>/ + update
-#                              # dist/<backend>/current (see that section)
-#   make libs                  # compat alias: builds just the three producer
-#                              # archives (no pipeline objects/binaries)
-#   make clean                 # remove this dir's own obj/bin trees + any
-#                              # flat binaries/archive of a pre-keyed
-#                              # directory layout
-#   make clean-all             # also clean lib/aec, lib/nr, audiolib build
-#                              # dirs (clean-libs is a compatibility alias)
+#                              # this invocation's own keyed paths
+#   make publish               # copy this build's artifacts to dist/<backend>/<cfg_sig>/ and
+#                              # update dist/<backend>/current
+#   make libs                  # just the three producer archives
+#   make clean                 # remove this dir's obj/bin trees
+#   make clean-all             # also clean lib/aec, lib/nr and audiolib (clean-libs: alias)
+#
+# The four-channel pipeline has an independent producer set in 4ch_aec_bf_nr_res/Makefile, so
+# its DOA/BF dependencies never change this mono pipeline's build identity.
 
-# =============================================================================
-# Whitespace build-root fail-fast guard
-# =============================================================================
-# This Makefile forwards several resolved directory paths (COMMON_DIR, and
-# transitively AEC_DIR/NR_DIR) to sub-`make` invocations as BARE, UNQUOTED
-# shell words on a recipe line -- e.g. `COMMON_DIR=$(abspath $(COMMON_DIR))` in the
-# two-phase dispatch / FORCE rules / query targets / audit-no-stdio-stack
-# recipes further down this file. GNU Make has no concept of shell quoting for
-# text like this: it is substituted verbatim into the recipe's command line and
-# handed to $(SHELL) as-is. If the resolved path contains a space, the shell
-# word-splits that unquoted argument, silently breaking
-# `COMMON_DIR=/that/whole/path` into several separate words -- which the sub-`make`
-# on that same line then parses as EXTRA COMMAND-LINE ARGUMENTS (stray target
-# names, or a lone "-"), producing a cryptic, deep "No such file or directory"
-# / "No rule to make target ..." failure inside some unrelated sub-invocation,
-# nowhere near the actual cause.
-#
-# Whitespace build-root paths are not supported (quoting every such forward
-# consistently, end to end, across all four repos in this stack is out of
-# scope). This guard only makes the FAILURE immediate and legible: it is
-# checked as close to the top of this file as possible -- before
-# COMMON_DIR/BACKEND/CC/CXX/... are given their defaults, and long before any of
-# the recipes described above can run -- so a whitespace-containing invocation
-# is rejected here with a clear, one-line explanation.
-#
-# $(CURDIR) is GNU Make's own notion of "the directory this invocation is
-# running in" (post any `-C` processing) -- exactly the invocation's own
-# working/build-root path: COMMON_DIR/AEC_DIR/NR_DIR are always resolved RELATIVE
-# to this same directory (see their defaults just below), so they share
-# whatever space-or-not-space ancestor path this invocation is running under. A
-# literal space has no direct token form in GNU Make function syntax (a bare
-# space in a function argument list is a separator, not data), so it is built
-# the standard way: an empty variable, doubled with itself around one space.
+# Whitespace build-root fail-fast guard: resolved directory paths (COMMON_DIR, transitively AEC_DIR/
+# NR_DIR) are forwarded to sub-makes as bare, unquoted words on recipe lines. A space in the path
+# would split them into stray arguments and fail deep inside an unrelated sub-invocation, so this
+# check, placed before COMMON_DIR/BACKEND/CC/CXX get defaults and before any recipe runs, fails at
+# once. $(CURDIR) is the build root they resolve against. A literal space has no token form in Make
+# function syntax, so it is built from an empty variable doubled around one.
 AUDIO_PIPELINE_EMPTY :=
 AUDIO_PIPELINE_SPACE := $(AUDIO_PIPELINE_EMPTY) $(AUDIO_PIPELINE_EMPTY)
 ifneq ($(findstring $(AUDIO_PIPELINE_SPACE),$(CURDIR)),)
@@ -161,12 +88,9 @@ $(error ULCNET_GRID must be 16k or 48k, got '$(ULCNET_GRID)')
 endif
 
 # audiolib sits two levels up from pipelines/ (SE/Audio_ALG/pipelines -> SE/audiolib/common).
-# lib/aec/c_impl and lib/nr/c_impl each resolve it themselves from their own
-# location (../../../../audiolib/common from c_impl/, verified to exist as a
-# submodule checkout); COMMON_DIR here is for OUR OWN CFLAGS/-I path and is passed
-# through explicitly (as COMMON_DIR=$(abspath $(COMMON_DIR))) to the lib/aec and
-# lib/nr sub-makes so all three always agree on the exact same audiolib
-# checkout.
+# lib/aec/c_impl and lib/nr/c_impl resolve it themselves from their own location; COMMON_DIR here
+# feeds this Makefile's CFLAGS/-I path and is passed to the lib/aec and lib/nr sub-makes as
+# COMMON_DIR=$(abspath $(COMMON_DIR)) so all three use the same audiolib checkout.
 COMMON_DIR ?= ../../audiolib/common
 # audiolib repo root (COMMON_DIR's parent): check-pins reports the whole
 # audiolib repo's HEAD, not just the common/ subdirectory's.
@@ -191,46 +115,25 @@ CXX ?= c++
 AR      ?= ar
 RANLIB  ?= ranlib
 
-# CFG_SIG payload-coverage placeholders: CXXFLAGS/CPPFLAGS are not consumed by
-# this Makefile (no C++ TU of its own), but the CFG_SIG payload below
-# unconditionally includes them so the payload string has the same stable shape
-# as audiolib's/AEC's/NR's, and so a future use of any of them here keys
-# builds correctly instead of silently aliasing with a build that didn't set
-# it. EXTRA_LDFLAGS/NO_STDIO are real here (see LDFLAGS/LIB_CFLAGS below).
-#
-# CXXFLAGS and CPPFLAGS are also two of the five names the "Command-line
-# override rejection" foreach further below rejects a command-line/`-e`
-# override of. `?=` only ever assigns when the variable's origin is still
-# "undefined" -- if either already has a value from the environment, `?=` is a
-# complete no-op (GNU Make never attempts the assignment at all), so the origin
-# never flips to "environment override" under `make -e` no matter how early the
-# line sits. `+=` is an unconditional assignment ATTEMPT, so under `-e` GNU
-# Make's origin bookkeeping flips it to "environment override", which the
-# foreach rejects, while appending an empty string leaves the VALUE unchanged
-# (a plain-environment CXXFLAGS/CPPFLAGS still folds in normally -- origin
-# becomes "file" -- and still participates in CFG_SIG_PAYLOAD). See
-# audiolib's/AEC's/NR's Makefile for the identical treatment and full
-# writeup.
+# CXXFLAGS/CPPFLAGS are not consumed by this Makefile (no C++ TU of its own), but the CFG_SIG
+# payload includes them so its shape matches audiolib's/AEC's/NR's and a later use keys builds
+# correctly. They are also guarded by the command-line override rejection below. `?=` is a no-op
+# when the environment already defines the variable, so its origin would never become
+# "environment override" under `make -e`; `+=` is an unconditional assignment attempt that does
+# flip it (so the foreach rejects it) while appending an empty string leaves the value unchanged,
+# so a plain environment value still folds in. EXTRA_LDFLAGS/NO_STDIO are real here (see
+# LDFLAGS/LIB_CFLAGS below).
 CXXFLAGS      +=
 CPPFLAGS      +=
 EXTRA_LDFLAGS ?=
 NO_STDIO      ?= 0
 DEBUG         ?= 0
 
-# DEBUG is real here too: this Makefile has no
-# DEBUG-gated code path of its OWN, but DEBUG is forwarded via $(FWD) (below)
-# to every producer sub-make (audiolib, lib/aec, lib/nr) -- most directly
-# lib/nr's, whose Makefile rejects any non-0/1 DEBUG outright. Without this
-# Makefile resolving/validating its OWN DEBUG explicitly, a sub-make would
-# fall through to inheriting whatever the calling shell's environment
-# happens to have exported for DEBUG (e.g. a stray `DEBUG=release` left over
-# from an unrelated tool), silently building the wrong config downstream --
-# or, since lib/nr's guard landed, hard-failing deep inside a producer
-# sub-build instead of erroring here with proper locality. Same exact-match
-# guard shape as lib/nr's: `ifneq` twice (not a
-# single $(filter DEBUG,0 1) check) so a multi-word value like `DEBUG='0 1'`
-# or one containing `%` can't slip through -- see lib/nr's Makefile for the
-# full rationale.
+# DEBUG has no DEBUG-gated code path in this Makefile, but it is forwarded through $(FWD) to every
+# producer sub-make, and lib/nr's rejects any non-0/1 value. Validating it here, with an exact
+# match (`ifneq` twice, not a single $(filter DEBUG,0 1), so `DEBUG='0 1'` or a value containing
+# `%` cannot slip through), stops a stray exported DEBUG from silently building the wrong config
+# downstream or failing deep inside a producer sub-build.
 ifneq ($(DEBUG),0)
 ifneq ($(DEBUG),1)
 $(error DEBUG must be exactly 0 or 1 (got DEBUG='$(DEBUG)') -- pass DEBUG=0 \
@@ -247,116 +150,54 @@ endif
 # sub-makes via $(FWD); participates in CFG_SIG.
 TOOLCHAIN_CHECK ?= 1
 
-# DIST_ROOT / HOSTCC: where `make publish` writes releases
-# (test scripts point this at a throwaway mktemp dir so they never touch the
-# real dist/), and the HOST compiler for the publish-time atomic
-# symlink-swap helper (never $(CC): that may be a cross compiler). Neither
-# is in CFG_SIG -- neither affects what is built. See audiolib's
-# Makefile for the full writeups.
-#
-# ALLOW_DIRTY_PUBLISH: `make
-# publish` REFUSES by default when THIS repo (Audio_ALG) or any of the three
-# producers (audiolib, lib/aec, lib/nr) has uncommitted TRACKED changes
-# (this repo: `git status --porcelain -uno`; each producer: `git -C <dir>
-# status --porcelain -uno`, same -uno scope -- see _publish_impl) or is not
-# a git checkout at all (commit unknown) -- a release whose ATTEST
-# provenance cannot name the exact source state of the whole stack is not a
-# board deliverable. A checkout with NO git identity at all is refused
-# UNCONDITIONALLY, for every one of the four repos -- neither knob below
-# admits it (provenance is impossible without a commit OID to name), and
-# this is checked before any dirty/untracked flag is even computed for that
-# repo. ALLOW_DIRTY_PUBLISH=1 is the explicit escape hatch for dev
-# publishes on an otherwise-identified checkout; it is recorded in the
-# attestation together with a sha256 of each dirty repo's `git diff
-# --binary HEAD`. It covers TRACKED changes ONLY -- untracked files have
-# their own dimension below (the tracked diff hash says
-# nothing about untracked bytes, so lumping the two under one flag let two
-# different untracked source states publish with identical provenance).
-# Not in CFG_SIG: it never changes what is built, only whether publish
-# proceeds.
-#
-# ALLOW_UNTRACKED_PUBLISH: publish also REFUSES by default
-# when this repo (outside the whitelist below) or any of the three
-# producers contains ANY untracked, non-ignored file (this repo: `git
-# ls-files --others --exclude-standard` minus the whitelist; each producer,
-# NO whitelist: `git -C <dir> ls-files --others --exclude-standard`;
-# gitignored build output is excluded by design and never part of this
-# provenance) -- an untracked source a (possibly clean-tracked) Makefile
-# references can change the artifact without leaving a trace in the
-# tracked diff. ALLOW_UNTRACKED_PUBLISH=1 is the separate escape hatch; it
-# records untracked_tree_sha256 per repo that had untracked=1: sha256 over
-# sorted FIXED-FIELD per-file records emitted by the `hash_untracked()`
-# helper at the top of _publish_impl -- "L <sha256(path)> <sha256(readlink
-# output)>" for a symlink, "F <mode> <sha256(path)> <sha256(content)>" for
-# a regular file -- every variable-length value is itself hashed, so
-# records concatenate unambiguously (raw space-joined path/target strings
-# were collision-prone: "a b"->"c" vs "a"->"b c" encoded identically) and
-# any stat/readlink/shasum failure downgrades the entry to an X record =>
-# FATAL, never an empty hash (fail-closed). A path that is neither a
-# regular file nor a symlink (an embedded git checkout, a fifo) cannot be
-# hashed deterministically and is always refused, with a diagnostic naming
-# both the path and the repo it came from.
-#
-# THIS repo's untracked check is WHITELISTED BY PREFIX (the three producers
-# get NO such whitelist -- an untracked file there is always a violation):
-# `git ls-files --others --exclude-standard` output with any path matching
-# `^AINR/(GTCRN|gtcrn_github)/` removed (one `grep -vE`, `|| true` guards
-# the empty-list case). This working tree permanently carries those two
-# directories as user-owned, never-staged content;
-# without the whitelist, an otherwise byte-identical publish would refuse
-# (or, under ALLOW_UNTRACKED_PUBLISH=1, would have its provenance hash
-# perturbed by) files that have nothing to do with the released artifact.
-# Both prefixes stay whitelisted for the SAME two reasons, one per
-# directory: `GTCRN/` is a plain directory that may gain further untracked
-# files over time (still must never count against a publish);
-# `gtcrn_github/` is an EMBEDDED git checkout (its own `.git/`, not a
-# registered submodule) and so currently collapses to a single opaque
-# `AINR/gtcrn_github/` line in `git ls-files --others` output rather than
-# one line per contained file -- which is ALSO exactly the "neither a
-# regular file nor a symlink" case the X-record type-guard in
-# `hash_untracked()` would otherwise FATAL on as unhashable. If that inner
-# `.git` ever disappears, the same prefix will instead match a whole tree
-# of ordinary per-file untracked entries -- covered either way by matching
-# on the prefix rather than the single current line. Neither knob is in
-# CFG_SIG: they never change what is built, only whether publish proceeds.
-#
-# ATTEST_STAMP (TEST-ONLY): overrides the UTC timestamp
-# embedded in the attestation FILENAME so the isolation tests can
-# deterministically force same-second publish collisions and prove the
-# no-clobber retry path. Never use it on a real publish -- though note a
-# forged stamp is within the already-accepted threat model: attestations
-# are unsigned and provide traceability, NOT authenticity against an
-# attacker with filesystem access. Not in CFG_SIG or MANIFEST.
+# DIST_ROOT / HOSTCC: where `make publish` writes releases (test scripts point DIST_ROOT at a
+# throwaway directory) and the HOST compiler for the publish-time atomic symlink-swap helper
+# (never $(CC): that may be a cross compiler). Neither affects what is built, so neither is in
+# CFG_SIG. See audiolib's Makefile.
+
+# ALLOW_DIRTY_PUBLISH: `make publish` refuses by default when this repo or any producer
+# (audiolib, lib/aec, lib/nr) has uncommitted TRACKED changes (`git status --porcelain -uno`,
+# `git -C <dir>` for producers) or is not a git checkout. A checkout with no git identity is
+# refused unconditionally, as provenance needs a commit OID. =1 is the escape hatch for dev
+# publishes: the attestation records it with a sha256 of each dirty repo's `git diff --binary HEAD`.
+# It covers tracked changes only.
+
+# ALLOW_UNTRACKED_PUBLISH: publish also refuses by default when this repo (outside the whitelist
+# below) or any producer has an untracked, non-ignored file (`git ls-files --others
+# --exclude-standard`), since such a source can change the artifact without a trace in the tracked
+# diff. =1 is the separate escape hatch: it records untracked_tree_sha256 per repo with untracked=1,
+# computed by hash_untracked() at the top of _publish_impl over sorted fixed-field records ("L
+# <sha256(path)> <sha256(readlink)>" for a symlink, "F <mode> <sha256(path)> <sha256(content)>" for
+# a regular file; every variable-length value is hashed so records concatenate unambiguously). A
+# path that is neither, or whose stat/readlink/shasum fails, is always refused, naming path and repo.
+
+# This repo's untracked list is whitelisted by the prefix `^AINR/(GTCRN|gtcrn_github)/`: those
+# directories are user-owned and never staged, and would otherwise refuse (or, under
+# ALLOW_UNTRACKED_PUBLISH=1, perturb the provenance hash of) an otherwise identical publish.
+# `gtcrn_github/` is an embedded git checkout that shows as one opaque line in
+# `git ls-files --others`, which is also the unhashable case above. The producers get no
+# whitelist. Neither knob is in CFG_SIG: they only decide whether publish proceeds.
+
+# ATTEST_STAMP (test only): overrides the UTC timestamp in the attestation filename so the
+# isolation tests can force same-second collisions and exercise the no-clobber retry. Attestations
+# are unsigned (traceability, not authenticity). Not in CFG_SIG or MANIFEST.
 DIST_ROOT ?= dist
 HOSTCC    ?= cc
 ALLOW_DIRTY_PUBLISH ?= 0
 ALLOW_UNTRACKED_PUBLISH ?= 0
 ATTEST_STAMP ?=
 
-# EXTRA_CFLAGS — pass-through to the AEC/NR/audiolib/common producer builds AND
-# this pipeline's own compile (all three producers' own Makefiles already do
-# `CFLAGS += $(EXTRA_CFLAGS)`, so one EXTRA_CFLAGS on this top-level `make`
-# reaches every .o for the whole build). The fast matched-filter arithmetic
-# and delay-estimator duty-cycling are built in unconditionally (no flag) —
-# see lib/aec/c_impl/src/delay_aec.c.
-#
-# Switching EXTRA_CFLAGS (or SIMD, or WERROR, or NO_STDIO) never needs a
-# manual `make clean-libs` first: this Makefile's own objects/binaries are
-# hash-keyed by config (see the OBJ_DIR/BIN_DIR/CFG_SIG section below), and
-# lib/aec's, lib/nr's, and audiolib's own Makefiles independently key
-# their objects/archives off the same axes -- a stale, differently-flagged
-# .o/.a simply can't exist under the new path a config produces.
-# `make clean-libs`/`clean-all` are available but not required for correctness.
+# EXTRA_CFLAGS is forwarded to the producer builds and to this pipeline's own compile (the
+# producers' Makefiles already do `CFLAGS += $(EXTRA_CFLAGS)`). The matched-filter and
+# delay-estimator duty-cycle arithmetic is built in unconditionally (lib/aec/c_impl/src/delay_aec.c).
+# Changing EXTRA_CFLAGS, SIMD, WERROR or NO_STDIO needs no `make clean-libs`: every Makefile in the
+# stack keys its objects/archives on the same axes.
 EXTRA_CFLAGS ?=
-# PROFILE=1 turns on the per-hop stage timing across everything this Makefile
-# builds: the mono pipeline's own nr/post/synth here, and lib/aec's own stages
-# through the same knob forwarded by name. Off by default so a release build
-# takes none of the clock reads; each component's own header carries its
-# count, and this file deliberately does not restate it. Folded into CFG_SIG
-# both by name and through CFLAGS, so a profile build and a release build
-# occupy different obj/bin directories and cannot hand each other a stale
-# object. Setting only one component's -D by hand is legible rather than
-# broken -- the other half simply reads 0.
+# PROFILE=1 turns on per-hop stage timing for everything built here: the mono pipeline's own
+# nr/post/synth, and lib/aec's stages through the same knob forwarded by name. Off by default so a
+# release build takes no clock reads. Folded into CFG_SIG by name and through CFLAGS, so profile and
+# release builds occupy different obj/bin directories. Setting only one component's -D by hand is
+# legible rather than broken: the other half reads 0.
 PROFILE ?= 0
 ifneq ($(words $(PROFILE)),1)
 $(error PROFILE must be exactly 0 or 1, got '$(PROFILE)')
@@ -364,31 +205,17 @@ endif
 ifneq ($(filter-out 0 1,$(PROFILE)),)
 $(error PROFILE must be exactly 0 or 1, got '$(PROFILE)')
 endif
-# Set through PROFILE_CFLAGS -> CFLAGS rather than EXTRA_CFLAGS, mirroring
-# SIMD right below. EXTRA_CFLAGS is forwarded verbatim to the producer
-# sub-makes and folded into CFG_SIG, so smuggling the -D through it made the
-# flag arrive twice whenever a consumer that also has PROFILE drove this
-# build, splitting byte-identical objects across two keys, and re-keyed
-# producers that never reference the macro at all. CFLAGS is already
-# protected from a command-line assignment (see the FP policy guard below),
-# so the knob cannot be silently dropped either.
-# Both -D land in THIS Makefile's CFLAGS, which is not forwarded: lib/aec gets
-# its own AEC_STAGE_TIMING from the PROFILE knob forwarded by name in FWD
-# below, so the flag reaches its compile once rather than twice.
-#
-# AEC_STAGE_TIMING is repeated here on purpose. It is not only the library's
-# switch -- this layer's own translation units test it, to decide whether to
-# copy the lanes' record out and what the tests may assert about it. Leaving
-# it out built a consumer that believed the library had not measured while it
-# had: every AEC stage reported zero with the cost showing up as
-# unattributed, and the test that should have caught it agreed with the
-# broken behaviour instead. Both sides deriving from PROFILE is what keeps
-# the two views from disagreeing.
-#
-# A lib/aec pin older than the PROFILE knob has nothing to receive and
-# degrades to the documented one-half state -- the wrapper's stages measure,
-# the AEC block reads zero -- which the --timing report shows as real numbers
-# beside a row of zeros rather than hiding.
+# PROFILE_CFLAGS goes into CFLAGS rather than EXTRA_CFLAGS, as SIMD does below: EXTRA_CFLAGS is
+# forwarded to the producer sub-makes and folded into CFG_SIG, so a -D smuggled through it arrived
+# twice when a consumer with its own PROFILE drove this build, splitting identical objects across
+# two keys and re-keying producers that never use the macro. CFLAGS is protected from command-line
+# assignment (FP policy guard below). These -D land in this Makefile's CFLAGS only: lib/aec gets
+# AEC_STAGE_TIMING from the PROFILE knob forwarded in FWD.
+
+# AEC_STAGE_TIMING is repeated on purpose: this layer's own TUs test it, to decide whether to copy
+# the lanes' record out and what the tests may assert about it, and deriving both flags from
+# PROFILE keeps the two views consistent. A lib/aec pin without the PROFILE knob degrades to the
+# one-half state: the wrapper's stages measure and the AEC block reads zero.
 ifeq ($(PROFILE),1)
 PROFILE_CFLAGS := -DAUDIO_PIPELINE_STAGE_TIMING=1 -DAEC_STAGE_TIMING=1
 else
@@ -408,349 +235,131 @@ else
 SIMD_CFLAGS :=
 endif
 
-# -ffp-contract=off is applied uniformly to every pipeline TU: contraction of
-# mul+add pairs (clang contracts a handful in the pipeline glue, e.g. the |E|^2
-# hoist) would change bytes, and a uniform flag means SIMD/EMA-style code added
-# to pipeline TUs inherits the repo-wide bit-exactness discipline instead of
-# silently depending on the compiler's contraction mood. The flag itself is
-# appended at the true end of the CFLAGS assembly (see the "FP-contraction
-# policy" section below, after EXTRA_CFLAGS/WERROR are folded in), so a
-# caller's EXTRA_CFLAGS can never land after it and override it.
+# -ffp-contract=off applies to every pipeline TU: contraction of mul+add pairs would change bytes,
+# and one uniform flag keeps new SIMD/EMA code under the repo-wide bit-exactness discipline. It is
+# appended at the true end of the CFLAGS assembly (see "FP-contraction policy" below), so a caller's
+# EXTRA_CFLAGS can never land after it and override it.
 CFLAGS = -Wall -Wextra -O2 -std=gnu99 \
          -I. \
          -Imono_aec_nr_res -Imono_alignulcnet -I$(ULCNET_DIR) -I$(DFN2_DIR) \
          -I$(AEC_DIR)/include -I$(AEC_DIR)/example \
          -I$(NR_DIR)/include \
          -I$(COMMON_DIR)/include -I$(COMMON_DIR)
-# AUDIO_PIPELINE_BACKEND_STR: compile-time FFT backend identity baked into
-# audio_pipeline.c's AudioPipelineMemReq.backend field -- matches
-# whichever libaudio_common.a variant this build links (BACKEND= above), so
-# the descriptor never has to be told separately which backend produced it.
+# AUDIO_PIPELINE_BACKEND_STR: compile-time FFT backend identity baked into audio_pipeline.c's
+# AudioPipelineMemReq.backend_id; it matches the libaudio_common.a variant this build links
+# (BACKEND= above), so the descriptor never needs the backend told separately.
 CFLAGS += -DAUDIO_PIPELINE_BACKEND_STR=\"$(BACKEND)\"
 CFLAGS += $(EXTRA_CFLAGS)
 CFLAGS += $(SIMD_CFLAGS)
 CFLAGS += $(PROFILE_CFLAGS)
 
-# -Werror opt-in for this Makefile's OWN TUs (default off; CI can flip it
-# on with `make WERROR=1`). Vendor code (audiolib's NE10) is built by
-# audiolib's own Makefile, not by rules in this file, so no separate
-# warning isolation is needed on this side.
+# -Werror opt-in for this Makefile's own TUs (default off; CI can set WERROR=1). Vendor code
+# (audiolib's NE10) is built by audiolib's own Makefile, so no separate warning isolation is needed.
 WERROR ?= 0
 ifeq ($(WERROR),1)
   CFLAGS += -Werror
 endif
 
-# NO_STDIO=1: compiles audio_pipeline.o with
-# -DAUDIO_PIPELINE_NO_STDIO, which turns every AP_LOG_ERR() diagnostic in
-# audio_pipeline.c into a no-op and drops its <stdio.h> include entirely --
-# see that file's "No-stdio build gate" section. This is a board-firmware
-# concern (a stdio-less image, or one that forbids the stdio symbol set
-# outright), so it is scoped to LIB_CFLAGS (used ONLY by the
-# libaudio_pipeline.a object below) rather than the shared CFLAGS: the two
-# CLIs (aec_nr_pipeline / aec_nr_pipeline_static) are host tools that always
-# do their own WAV-I/O stdio regardless, and test_audio_pipeline.c prints
-# its own PASS/FAIL via stdio unconditionally -- neither references
-# AUDIO_PIPELINE_NO_STDIO, so there is nothing to gain (and a real loss of
-# CLI diagnostics) from adding the define to their compiles.
+# NO_STDIO=1 compiles audio_pipeline.o with -DAUDIO_PIPELINE_NO_STDIO, which turns every
+# AP_LOG_ERR() into a no-op and drops <stdio.h> (see audio_pipeline.c). It is a board-firmware
+# concern, so it is scoped to LIB_CFLAGS (used only by the libaudio_pipeline.a objects) rather than
+# the shared CFLAGS: the host CLIs and the tests use stdio unconditionally.
 LIB_CFLAGS = $(CFLAGS)
 ifeq ($(NO_STDIO),1)
   LIB_CFLAGS += -DAUDIO_PIPELINE_NO_STDIO
 endif
 
-# --- FP-contraction policy: unified across all four repos. The flag is
-# appended LAST, after every other CFLAGS append in this file (the base -I
-# flags, -DAUDIO_PIPELINE_BACKEND_STR, EXTRA_CFLAGS, WERROR), and BEFORE
-# CFG_SIG_PAYLOAD is computed below, so nothing can override it: a caller
-# passing EXTRA_CFLAGS=-ffp-contract=fast (or -Ofast/-ffast-math, which imply
-# contraction) would otherwise land LATER on the compile line and silently win.
-# LIB_CFLAGS = $(CFLAGS) above is a recursive (lazily-expanded) variable: its
-# own definition is the literal text "$(CFLAGS)" (plus the conditional
-# -DAUDIO_PIPELINE_NO_STDIO token), re-expanded against CFLAGS's CURRENT value
-# every time LIB_CFLAGS is used in a recipe -- so appending FP_POLICY to CFLAGS
-# alone (below) already reaches LIB_CFLAGS; appending it to LIB_CFLAGS a second
-# time would duplicate the flag on every libaudio_pipeline.a compile line. See
-# audiolib's Makefile for the full cross-repo design writeup and
-# scripts/audit_fp_contract.sh (in audiolib) for the disassembly-level
-# verification.
-#
-# --- Bare-literal policy flag, defined early (`make -e` environment override) ---
-# FP_POLICY is a plain, dependency-free `:=` literal (no reference to CFLAGS or
-# anything else computed above). It is defined here, ahead of the "Command-line
-# override rejection" foreach, because FP_POLICY is listed in that foreach and
-# `$(origin FP_POLICY)` only flips from plain "environment" to "environment
-# override" once a makefile assignment to FP_POLICY has actually been PARSED:
-# with the bare `:=` further down the file, `env FP_POLICY=-ffp-contract=fast
-# make -e -n lib` would sail straight through with no error
-# (rc=0), silently dropping -ffp-contract=off from the compile line for
-# audio_pipeline.o (see the foreach's own comment for the full mechanism).
-# FP_POLICY's OTHER job -- appending it to CFLAGS, LAST, exactly as the
-# "FP-contraction policy" comment above describes -- stays at its late position
-# (`CFLAGS += $(FP_POLICY)`), and FP_POLICY must stay appended AFTER every
-# other CFLAGS append and BEFORE CFG_SIG_PAYLOAD is computed. There is exactly
-# one `:=` definition of FP_POLICY in this file. audiolib/common/AEC/NR apply the
-# same treatment to their own Makefiles.
-# already applied to their own Makefiles.
-# Keep scalar/NEON operation ordering stable and let audiolib's guarded
-# AArch64 sqrtf calls lower to FSQRT without an errno-checking libm fallback.
+# --- FP-contraction policy (unified across the four repos) -------------------
+# -ffp-contract=off is appended LAST to CFLAGS (`CFLAGS += $(FP_POLICY)` below), after
+# EXTRA_CFLAGS/WERROR and before CFG_SIG_PAYLOAD, so a caller's EXTRA_CFLAGS=-ffp-contract=fast
+# (or -Ofast/-ffast-math) cannot land later and win. LIB_CFLAGS = $(CFLAGS) is recursively
+# expanded, so the append reaches it too; appending to LIB_CFLAGS as well would duplicate the flag.
+# See audiolib's Makefile and its scripts/audit_fp_contract.sh for the design and the
+# disassembly-level check.
+
+# FP_POLICY is a bare `:=` literal defined here, ahead of the override-rejection foreach below,
+# because `$(origin FP_POLICY)` only becomes "environment override" once an assignment has been
+# parsed: defined lower, `env FP_POLICY=-ffp-contract=fast make -e` would pass unchecked and drop
+# -ffp-contract=off. -fno-math-errno lets audiolib's AArch64 sqrtf lower to FSQRT without an
+# errno-checking libm fallback; scalar and NEON operation ordering stays stable.
 FP_POLICY := -ffp-contract=off -fno-math-errno
 
-# FP_ALLOWED_CHARS_RE (the FP-policy allow-list's character set -- same as
-# audiolib's/AEC's/NR's) is a SECOND bare, dependency-free `:=` literal
-# with the exact same `make -e` exposure as FP_POLICY above -- it lives here,
-# fully relocated (this is its ONLY definition in this file), so its origin is
-# already final by the time the foreach below queries it. The regex it holds is
-# documented in full where it is actually used (the FP-policy allow-list block,
-# further below).
+# FP_ALLOWED_CHARS_RE (the allow-list's character set, as in audiolib/AEC/NR) is a second bare `:=`
+# literal with the same `make -e` exposure as FP_POLICY, so it is defined early. Its regex is
+# documented where it is used (the allow-list block below).
 FP_ALLOWED_CHARS_RE := ^[A-Za-z0-9_./=,+ -]*$$
 
-# LDFLAGS is just link FLAGS (-lm plus whatever EXTRA_LDFLAGS adds) -- NOT the
-# three producer archive paths. Those are resolved dynamically (see the
-# two-phase dispatch below) and appended directly to each link recipe's own
-# prerequisite list / command line, in the fixed order: pipeline.o,
-# libaudio_pipeline.a, libaec.a, libanr.a, libaudio_common.a, -lm.
-# libaudio_pipeline.a holds only this repo's own TUs (audio_pipeline.o plus the
-# shared se_config.o and se_anr_stage.o) -- it is not a bundled/fat archive, so
-# it still needs libaec.a/libanr.a/libaudio_common.a linked after it.
-#
-# The LDFLAGS composition sits ahead of the "Command-line override rejection"
-# foreach below for the same reason as FP_POLICY's bare literal above:
-# `$(origin LDFLAGS)` only flips to "environment override" once a makefile
-# assignment to LDFLAGS has actually been PARSED, so `env LDFLAGS=<poison> make
-# -e -n ... lib` would otherwise sail through the foreach while LDFLAGS's own
-# defining lines sat below it, unparsed at foreach-time. Nothing between here
-# and the foreach reads $(LDFLAGS) (the two-phase archive-path dispatch below
-# forwards BACKEND/WERROR/CC/CXX/EXTRA_CFLAGS/NO_STDIO/TOOLCHAIN_CHECK/DEBUG
-# via $(FWD), never LDFLAGS; the only other readers are CFG_SIG_PAYLOAD and the
-# four link recipes, both further down).
+# LDFLAGS is link flags only (-lm plus EXTRA_LDFLAGS), not the producer archive paths: those are
+# resolved by the two-phase dispatch below and appended to each link recipe in the fixed order
+# pipeline.o, libaudio_pipeline.a, libaec.a, libanr.a, libaudio_common.a, -lm. libaudio_pipeline.a
+# holds only this repo's TUs (audio_pipeline.o, se_config.o, se_anr_stage.o), so the producer
+# archives follow it. Defined ahead of the override-rejection foreach for the same `make -e`
+# origin reason as FP_POLICY.
 LDFLAGS = -lm
 LDFLAGS += $(EXTRA_LDFLAGS)
 
 # --- Command-line override rejection ------------------------------------
-# See audiolib's Makefile for the full writeup: a command-line
-# CFLAGS=/CXXFLAGS=/CPPFLAGS=/LDFLAGS=/FP_POLICY=/FP_ALLOWED_CHARS_RE= silently
-# disables every one of this file's own assignments/appends to that variable
-# (here that would strip -ffp-contract=off, -DAUDIO_PIPELINE_BACKEND_STR, the
-# -I paths, and -lm) while still producing artifacts -- and a command-line/
-# `-e` override of FP_ALLOWED_CHARS_RE specifically could widen the allowed
-# character set (e.g. to `.*`, matching anything) and silently neuter the
-# allow-list below. EXTRA_CFLAGS / EXTRA_LDFLAGS are the supported hooks.
+# A command-line CFLAGS=/CXXFLAGS=/CPPFLAGS=/LDFLAGS=/FP_POLICY=/FP_ALLOWED_CHARS_RE= silently
+# disables this file's own appends to it (the FP policy, the backend define, the -I paths, -lm), and
+# an override of FP_ALLOWED_CHARS_RE could widen the allow-list below to match anything.
+# EXTRA_CFLAGS / EXTRA_LDFLAGS are the supported hooks. See audiolib's Makefile.
 $(foreach v,CFLAGS CXXFLAGS CPPFLAGS LDFLAGS FP_POLICY FP_ALLOWED_CHARS_RE,\
   $(if $(findstring command,$(origin $(v)))$(findstring override,$(origin $(v))),\
     $(error $(v) cannot be overridden (origin: $(origin $(v))) -- it would silently drop this Makefile's own flag appends (FP policy, backend define, include paths); use EXTRA_CFLAGS / EXTRA_LDFLAGS instead)))
 
-# Conflict detection and the quote/escape/response-file rejection gate (same as
-# audiolib's/AEC's/NR's): reject outright rather than let a caller silently
-# re-enable contraction. Checked against the fully-assembled $(CFLAGS)
-# $(CXXFLAGS) $(CPPFLAGS) (each already includes EXTRA_CFLAGS folded in above,
-# AND any CFLAGS=/CXXFLAGS=/CPPFLAGS= command-line override, since a
-# command-line-set value is what every prior `+=`/`=` in this file appended to)
-# -- BEFORE FP_POLICY is appended below and BEFORE CFG_SIG is computed, so a
-# rejected build never creates an obj/bin directory.
-#
-# All three variables are inspected, not CFLAGS alone: CXXFLAGS and CPPFLAGS
-# are two of the five names the "Command-line override rejection" foreach above
-# rejects a command-line/`-e` override of, and both participate in
-# CFG_SIG_PAYLOAD above -- a PLAIN ENVIRONMENT CXXFLAGS or CPPFLAGS is
-# deliberately allowed to fold in normally via that same foreach's origin
-# logic, never going through EXTRA_CFLAGS at all, so `env CXXFLAGS=-Ofast make
-# lib` would sail through a CFLAGS-only check; the day either
-# variable starts feeding a real compile recipe in this file, a live
-# -Ofast/-ffast-math/-ffp-contract=<x> could ride in completely unchecked. The
-# check below inspects all three together so no combination of
-# CFLAGS/CXXFLAGS/CPPFLAGS -- command-line-folded, EXTRA_CFLAGS-folded, or a
-# plain environment value -- can carry any of these three patterns past this
-# gate. This position (after every CFLAGS/CXXFLAGS/CPPFLAGS append earlier in
-# this file and before FP_POLICY's own append just below) sees CFLAGS's
-# fully-composed value, and is equally late enough for CXXFLAGS and CPPFLAGS:
-# neither is appended to anywhere else in this file (each is a single bare `+=`
-# at the top -- see that line's own comment), both fully resolved well before
-# this point.
-#
-# Exact-token matching, not substring matching: $(findstring ...) does a plain
-# SUBSTRING search over the whole concatenated text, so it false-positives on
-# any token that merely CONTAINS one of these patterns as part of a larger
-# identifier -- e.g. a harmless `-DROUND9_NOTE=-Ofastness` macro definition is
-# not the compiler flag -Ofast at all, yet a naive $(findstring -Ofast,...)
-# check would reject it anyway (as -DTEXT=ffast-math would equally
-# false-positive on $(findstring -ffast-math,...)). $(filter PATTERN...,TEXT)
-# instead splits TEXT on whitespace into WORDS and matches each whole word
-# against PATTERN (a trailing %% is a single wildcard, used here for
-# -ffp-contract=<anything>), so it only ever matches a complete flag token,
-# never a substring buried inside an unrelated token.
-#
-# EXCLUSION, specific to this repo: unlike audiolib's/AEC's/NR's CFLAGS,
-# THIS file's own CFLAGS append (above) unconditionally includes one
-# Makefile-INTERNAL token that legitimately contains a backslash AND a
-# double-quote character: `-DAUDIO_PIPELINE_BACKEND_STR=\"$(BACKEND)\"`. That
-# backslash-escaped quoting is the entire POINT of the flag (audio_pipeline.c
-# reads AUDIO_PIPELINE_BACKEND_STR as a real C string literal and compares it
-# against "ne10" via strcmp() -- see that flag's own comment above); the
-# shell that runs this Makefile's compile recipes unescapes `\"` to a literal
-# `"` so the compiler receives a genuinely quoted string token, the same
-# well-known idiom countless Makefiles use to inject a stringified #define.
-# Without this exclusion, a plain, override-free `make all` trips the
-# double-quote/backslash rejection checks below on this file's OWN default
-# CFLAGS, before any caller-supplied EXTRA_CFLAGS/CXXFLAGS/CPPFLAGS enters the
-# picture. The token can never carry a caller-supplied conflicting flag past
-# the gate: it is Makefile-generated text with a fixed, known shape
-# (`-DAUDIO_PIPELINE_BACKEND_STR=` followed by whatever $(BACKEND) is), never
-# itself one of -Ofast/-ffast-math/-ffp-contract=%. $(filter-out PATTERN,TEXT)
-# removes every whole WORD in TEXT that matches PATTERN (same whole-word
-# semantics as the $(filter) conflict check further below), so only this one
-# exact-prefix token is ever removed -- every other word in
-# CFLAGS/CXXFLAGS/CPPFLAGS (base flags, EXTRA_CFLAGS, and any
-# command-line/environment override of any of the three) is still scanned in
-# full below.
-#
-# The exclusion has to run first and has to feed the SAME FP_INPUT_FLAGS into
-# every check below (the single-quote gate, the allow-list's own $(shell) call,
-# and the FP_CONFLICT_FLAGS filter): the allow-list ([A-Za-z0-9_./=,+ -], see
-# FP_ALLOWED_CHARS_RE) rejects backslash and double-quote, so a plain
-# override-free `make all` would otherwise trip the allow-list's generic
-# "outside the allowed set" $(error) on this file's own default CFLAGS (naming
-# `\` and `"` as the disallowed characters). The exclusion is scoped to the one
-# exact-prefix token `-DAUDIO_PIPELINE_BACKEND_STR=%`, Makefile-generated with
-# a fixed, known shape and never something a caller controls, so it cannot be
-# used to smuggle a real conflicting/unsafe flag past the gate.
+# Conflict detection and the quote/escape/response-file rejection gate (as in audiolib/AEC/NR):
+# reject outright rather than let a caller re-enable contraction. It checks the fully assembled
+# CFLAGS/CXXFLAGS/CPPFLAGS (EXTRA_CFLAGS and any command-line or environment value already folded
+# in) before FP_POLICY is appended and before CFG_SIG is computed, so a rejected build never
+# creates an obj/bin directory. All three variables are inspected: a plain-environment
+# CXXFLAGS=-Ofast would pass a CFLAGS-only check.
+
+# Matching is by whole word ($(filter), with `%` for -ffp-contract=<x>), not substring
+# ($(findstring)): a harmless `-DNOTE=-Ofastness` is not the flag -Ofast.
+
+# FP_INPUT_FLAGS excludes the one Makefile-generated token `-DAUDIO_PIPELINE_BACKEND_STR=%`, which
+# legitimately contains a backslash and double quotes (audio_pipeline.c reads it as a C string
+# literal). Without the exclusion an override-free `make all` would trip the quote/allow-list checks
+# on this file's own CFLAGS. The token has a fixed shape and is never caller-controlled, so it
+# cannot carry a conflicting flag past the gate. The same FP_INPUT_FLAGS feeds the single-quote
+# check, the allow-list $(shell) call and FP_CONFLICT_FLAGS.
 FP_INPUT_FLAGS := $(filter-out -DAUDIO_PIPELINE_BACKEND_STR=%,$(CFLAGS) $(CXXFLAGS) $(CPPFLAGS))
 
-# --- link-flags character-safety coverage (same as audiolib's -- see
-# audiolib's Makefile for the full writeup this comment summarizes): the
-# allow-list below validates FP_INPUT_FLAGS (CFLAGS/CXXFLAGS/CPPFLAGS) AND
-# LDFLAGS (a plain `-lm` literal plus whatever EXTRA_LDFLAGS folds in, see the
-# `LDFLAGS += $(EXTRA_LDFLAGS)` line above), because LDFLAGS is embedded in
-# every real link recipe below ($(LINK) ... $(LDFLAGS), see the four
-# aec_nr_pipeline*/test_audio_pipeline/example_board_adapter link recipes
-# further down) exactly the same way CFLAGS/CXXFLAGS are embedded in every
-# compile recipe: `make aec_nr_pipeline EXTRA_LDFLAGS=';id'` (with
-# COMMON_LIB/AEC_LIB/NR_LIB pre-resolved so the two-phase producer dispatch lands
-# directly on this repo's OWN link recipe instead of recursing into
-# audiolib's sub-make) would otherwise reach a real `cc -o ... $(LDFLAGS)`
-# recipe line with the `;id` payload sitting live and unfiltered after the
-# `-lm`. The two checks that only care about CHARACTER safety (the single-quote
-# pre-check and the allow-list itself, immediately below) therefore run against
-# SHELL_SAFE_INPUT_FLAGS instead of FP_INPUT_FLAGS directly, so
-# LDFLAGS/EXTRA_LDFLAGS content goes through the exact same grep-based gate
-# with no separate/duplicated $(shell) invocation. The FP-semantic conflict
-# check (FP_CONFLICT_FLAGS, further below -- -Ofast/-ffast-math/-ffp-contract=%
-# are meaningless as LINK flags, not just unnecessary to check there) stays
-# scoped to FP_INPUT_FLAGS alone. The `-DAUDIO_PIPELINE_BACKEND_STR=%`
-# exclusion above is already applied to FP_INPUT_FLAGS before this union folds
-# LDFLAGS in, and LDFLAGS itself never carries that internal token, so the
-# exclusion applies to exactly the one token it always applies to, on the
-# CFLAGS/CXXFLAGS/CPPFLAGS side only.
+# --- link-flags character-safety coverage (as in audiolib's) ------------------
+# The allow-list also validates LDFLAGS (-lm plus EXTRA_LDFLAGS), because LDFLAGS is embedded in
+# every link recipe just as CFLAGS is in every compile recipe: `EXTRA_LDFLAGS=';id'` would otherwise
+# reach a real `cc -o ... $(LDFLAGS)` line live. The two character-safety checks therefore run on
+# SHELL_SAFE_INPUT_FLAGS (FP_INPUT_FLAGS plus LDFLAGS), sharing one $(shell) call. The FP-semantic
+# check (FP_CONFLICT_FLAGS) stays on FP_INPUT_FLAGS only: -Ofast/-ffast-math/-ffp-contract are
+# meaningless as link flags.
 SHELL_SAFE_INPUT_FLAGS := $(FP_INPUT_FLAGS) $(LDFLAGS)
 
-# $(filter) directly above does whole-WORD matching against
-# GNU Make's OWN text representation of CFLAGS/CXXFLAGS/CPPFLAGS -- but Make
-# has zero concept of shell quoting. A value like EXTRA_CFLAGS="'-Ofast'" is
-# stored by Make as the literal 9-character text '-Ofast', quote characters
-# included, which is not equal to the bare word -Ofast, so $(filter) can
-# never match it -- yet when this same text later appears on an actual
-# compile recipe line and that line is handed to $(SHELL), the shell strips
-# the quote characters and the compiler genuinely receives -Ofast as a real
-# argv token. Three confirmed-live bypass shapes: EXTRA_CFLAGS="'-Ofast'"
-# (single-quoted), EXTRA_CFLAGS='"-ffast-math"' (double-quoted), and
-# EXTRA_CFLAGS="-O'f'ast" (quote-split mid-token -- the shell concatenates
-# the pieces back into -Ofast once it strips the quotes). A fourth family,
-# @response-file syntax (EXTRA_CFLAGS=@flags.rsp), is unrelated to quoting
-# but equally invisible to a plain whole-word check: many compilers treat a
-# bare @file argv token as "read more arguments from this file", which could
-# inject anything at all with zero text ever appearing in CFLAGS/
-# EXTRA_CFLAGS itself.
-#
-# Character allow-list (same as audiolib's/AEC's/NR's -- see audiolib's
-# Makefile for the full writeup this comment summarizes). A
-# character-by-character DENY-list (single quote, double quote, backslash,
-# backtick, a literal "$(" sequence, semicolon, pipe, ampersand, and an
-# @-prefixed response-file token) cannot keep up: it does NOT catch bare glob
-# characters (*, ?, [, ]), tilde (~), or -- most seriously -- real shell
-# REDIRECTION (>, <) or process substitution (<(...)): none of these are Make's
-# own syntax, so Make cannot pre-resolve or reject them the way it catches
-# ${VAR}-style expansions (GNU Make treats ${...} identically to $(...) and
-# resolves it itself before any check runs -- a different, unrelated
-# mechanism). If a recipe line containing an unbanned '>' or '<' is ever
-# actually executed by a real shell (not a dry run), it silently redirects the
-# compiler invocation's own stdout/stdin to an arbitrary path -- a real,
-# unconditional risk, independent of any -Ofast/-ffast-math/-ffp-contract
-# semantics. A "$(" entry would also be DEAD CODE for well-formed input: `make
-# ... 'CFLAGS=-O2 $(shell echo INJECTED)'` lets GNU Make's OWN parser resolve
-# the well-formed $(...) reference at command-line-parsing time -- "INJECTED"
-# lands in CFLAGS as plain text, no literal "$(" substring ever reaches the
-# check -- while an UNBALANCED `$(unbalanced` (no closing paren) makes Make
-# itself abort with its own "unterminated variable reference. Stop." before any
-# makefile-level check runs at all.
-#
-# So the input is checked as a whole against a single ALLOW-list. GNU Make has
-# no native regex/character-class function, so this necessarily shells out to
-# `grep -E` -- a $(shell ...) call, the same technique this file already uses
-# for CFG_SIG's cksum computation below. Embedding untrusted, Make-supplied
-# text inside a constructed shell command is exactly the kind of thing that can
-# reintroduce the problem if done carelessly, so the embedding strategy is
-# deliberately narrow: SHELL_SAFE_INPUT_FLAGS
-# (CFLAGS/CXXFLAGS/CPPFLAGS/LDFLAGS, fully-assembled -- see the "link-flags
-# character-safety coverage" comment above for why LDFLAGS is folded in here
-# too) is embedded SINGLE-QUOTED in the shell command text below (`printf '%s'
-# '$(SHELL_SAFE_INPUT_FLAGS)' | ...`). Inside a single-quoted POSIX shell
-# string, EVERY character is literal except a single quote itself -- double
-# quote, backslash, backtick, "$(", semicolon, pipe, and ampersand are all
-# completely inert there. So the ONLY character that can break this embedding
-# is a literal single quote in SHELL_SAFE_INPUT_FLAGS itself (which would close
-# the quoted string early and hand whatever follows to the shell as live
-# syntax) -- which is why the single-quote check below is a separate pre-check,
-# kept for this structural reason (safe shell-embedding), not merely because it
-# is also a disallowed character (the allow-list below would reject it either
-# way). It MUST run first, and MUST stay a pure $(findstring) check with zero
-# shell involvement, so it can gate the shell-embedding step that follows it.
-# shell-embedding step that follows it.
+# Make compares words of its own text and has no notion of shell quoting: EXTRA_CFLAGS="'-Ofast'",
+# '"-ffast-math"' and "-O'f'ast" are stored with their quote characters, so $(filter) cannot match
+# them, yet the shell strips the quotes and the compiler receives -Ofast. An @response-file token is
+# equally invisible to a whole-word check.
+
+# A character deny-list cannot keep up: globs, `~` and above all the redirections `>` `<` and
+# process substitution are not Make syntax, so Make neither resolves nor rejects them. The input is
+# therefore checked as a whole against one ALLOW-list with `grep -E`, a $(shell) call like CFG_SIG's
+# cksum below. SHELL_SAFE_INPUT_FLAGS is embedded single-quoted in that command, where every
+# character but a single quote is inert; so the single-quote check below stays a separate
+# pure-$(findstring) pre-check (no shell involved) that must run first.
 ifneq ($(findstring ',$(SHELL_SAFE_INPUT_FLAGS)),)
 $(error FP policy conflict: CFLAGS/CXXFLAGS/CPPFLAGS/LDFLAGS/EXTRA_CFLAGS/EXTRA_LDFLAGS contains a single-quote character; this repo requires plain, unquoted, whitespace-separated compiler/linker argv tokens built only from the allowed character set (see the allow-list below) -- a single quote specifically must be rejected by this Make-native check BEFORE the allow-list's own $(shell) call can safely single-quote-embed the rest of the text)
 endif
 
-# The allow-list itself. Allowed set: letters, digits, underscore, dot, slash,
-# equals, comma, plus, minus -- plus space (the token SEPARATOR between flags;
-# SHELL_SAFE_INPUT_FLAGS is always multiple whitespace-joined tokens, never a
-# single one, so space must be permitted even though it is not part of any
-# individual flag's own character set). Chosen (same audit
-# audiolib's/AEC's/NR's Makefile performed for its own identical
-# allow-list) by checking every legitimate flag THIS Makefile's own invocations
-# actually use: -O2/-Wall/-Wextra/-std=gnu99,
-# -I$(AEC_DIR)/include/-I$(AEC_DIR)/example/-I$(NR_DIR)/include/-I$(COMMON_DIR)/include/-I$(COMMON_DIR)
-# (letters/digits/underscore, and slash/dot for the paths), and (once the
-# `-DAUDIO_PIPELINE_BACKEND_STR=%` exclusion above has removed the one known
-# internal token that would otherwise trip it) every other flag this file
-# appends by default -- every one of these tokens is built ONLY from this set.
-# Comma and plus are included for headroom (e.g. -Wl,-rpath,dir / -Wa,--option
-# pass-through flags a consumer might legitimately need): neither character
-# appears anywhere in this Makefile's own flags, and both are inert to the
-# shell (unlike the characters actually excluded below).
-#
-# LC_ALL=C avoids any locale-dependent surprises in the [A-Za-z0-9...] ranges:
-# POSIX bracket-expression ranges are locale-defined by design, and the C
-# locale pins them to the unambiguous ASCII ordering on both BSD and GNU
-# grep/tr.
-#
-# Every character of the deny-list targets above (single quote, double quote,
-# backslash, backtick, a literal "$(", semicolon, pipe, ampersand,
-# @-response-file) is NOT in this allowed set, so all of them are rejected by
-# construction. scripts/test_build_isolation.sh (SP-S9b/SP-S9c) covers this
-# check. Only the single-quote check above is kept as a separate pre-check, for
-# the shell-embedding reason given there, not because the allow-list fails to
-# cover it (a lone single quote is ALSO rejected by the allow-list on its own).
-#
-# FP_ALLOWED_CHARS_RE itself is NOT defined here -- it is a bare, early
-# `:=` literal (see the "Bare-literal policy flag" / "Command-line override
-# rejection" comments near the top of this file, where it is protected
-# against a command-line/`-e` override the exact same way FP_POLICY is).
-# Only referenced here.
+# The allow-list: letters, digits, underscore, dot, slash, equals, comma, plus and minus, plus
+# space as the token separator. Every flag this Makefile uses is built from this set; comma and plus
+# stay for -Wl,-rpath,dir / -Wa,--option style pass-through and are inert to the shell. LC_ALL=C pins
+# the bracket ranges to ASCII ordering on BSD and GNU grep/tr. Every deny-list character (quotes,
+# backslash, backtick, "$(", `;`, `|`, `&`, @-response-file) is outside the set and so rejected by
+# construction; scripts/test_build_isolation.sh covers it. FP_ALLOWED_CHARS_RE is defined near the top.
 SHELL_SAFE_ALLOWLIST_RC := $(shell printf '%s' '$(SHELL_SAFE_INPUT_FLAGS)' | LC_ALL=C grep -Eq '$(FP_ALLOWED_CHARS_RE)'; echo $$?)
 ifneq ($(SHELL_SAFE_ALLOWLIST_RC),0)
-# Diagnostic-only second $(shell) call (only ever runs on the already-doomed
-# error path above, never on a passing build): deletes every ALLOWED
-# character from the same single-quote-embedded text, leaving only the
-# disallowed ones, then dedupes/sorts them into a short, stable string --
-# so the $(error ...) below names the SPECIFIC offending character(s)
-# (e.g. ">" or "~" or "*") instead of a generic "invalid format" message.
+# Diagnostic-only second $(shell) call (runs only on the error path): it deletes every allowed
+# character from the same text and dedupes the rest, so the $(error ...) below names the specific
+# offending characters (e.g. ">" or "~").
 SHELL_SAFE_DISALLOWED_CHARS := $(shell printf '%s' '$(SHELL_SAFE_INPUT_FLAGS)' | LC_ALL=C tr -d 'A-Za-z0-9_./=,+ -' | fold -w1 | LC_ALL=C sort -u | tr -d '\n')
 $(error FP policy conflict: CFLAGS/CXXFLAGS/CPPFLAGS/LDFLAGS/EXTRA_CFLAGS/EXTRA_LDFLAGS contains a character outside the allowed set [A-Za-z0-9_./=,+- ] (letters/digits/underscore/dot/slash/equals/comma/plus/minus, plus space as the token separator) -- disallowed character(s) found: "$(SHELL_SAFE_DISALLOWED_CHARS)"; this repo requires plain, unquoted, whitespace-separated compiler/linker argv tokens built only from that set -- remove/replace the disallowed character(s) shown above in CFLAGS/CXXFLAGS/CPPFLAGS/LDFLAGS/EXTRA_CFLAGS/EXTRA_LDFLAGS)
 endif
@@ -760,108 +369,46 @@ ifneq ($(FP_CONFLICT_FLAGS),)
 $(error FP policy conflict: CFLAGS/CXXFLAGS/CPPFLAGS/EXTRA_CFLAGS contains $(FP_CONFLICT_FLAGS); this repo pins -ffp-contract=off; remove $(FP_CONFLICT_FLAGS) from CFLAGS/CXXFLAGS/CPPFLAGS/EXTRA_CFLAGS)
 endif
 
-# Command-line/`-e` override rejection for the FP-policy/shell-safety checks'
-# remaining FOUR internal variables (same as audiolib's/AEC's/NR's):
-# FP_INPUT_FLAGS/SHELL_SAFE_INPUT_FLAGS/SHELL_SAFE_ALLOWLIST_RC/FP_CONFLICT_FLAGS
-# are each computed from the fully-assembled CFLAGS/CXXFLAGS/CPPFLAGS
-# (SHELL_SAFE_INPUT_FLAGS/SHELL_SAFE_ALLOWLIST_RC also fold in the
-# fully-assembled LDFLAGS; SHELL_SAFE_ALLOWLIST_RC via a $(shell) call keyed
-# off SHELL_SAFE_INPUT_FLAGS) -- unlike FP_POLICY/FP_ALLOWED_CHARS_RE above,
-# none of the four is a bare, dependency-free literal, so none can be relocated
-# earlier to ride in the "Command-line override rejection" foreach near the top
-# of this file (that foreach's own comment explains why bare-literal-and-early
-# is required for the `-e` case). But each has the EXACT SAME
-# command-line-override exposure as every name in that foreach: e.g. `make ...
-# EXTRA_LDFLAGS=';echo INJECTED' SHELL_SAFE_ALLOWLIST_RC=0` (or the equivalent
-# with SHELL_SAFE_INPUT_FLAGS=<anything clean>, FP_INPUT_FLAGS=<anything
-# clean>, or FP_CONFLICT_FLAGS=) would silently win over this file's own
-# computed value and turn every ifneq/$(error) gate above into a complete no-op
-# -- while the REAL $(CFLAGS)/$(CXXFLAGS)/$(CPPFLAGS)/$(LDFLAGS) used in every
-# actual compile/link recipe still carry the dangerous, unvalidated content
-# unmodified. So the override-rejection check for these variables must itself
-# run AFTER the variable's own real assignment (never before), so the
-# origin-flip -- for both plain "command line" and, under `-e`, "environment
-# override" -- has already happened by the time $(origin ...) is queried. This
-# is why this second foreach sits HERE, immediately after FP_CONFLICT_FLAGS
-# (the last of the four to be assigned), rather than folded into the earlier
-# foreach (which runs too early in the file for any of these four to have been
-# assigned yet). SHELL_SAFE_DISALLOWED_CHARS is deliberately NOT included: it
-# is pure diagnostic text folded into the $(error ...) message on the failure
-# path only, never a condition any ifneq tests, so overriding it cannot bypass
-# anything -- at worst it would garble the reported character list on a build
-# that was going to fail anyway.
+# Override rejection for the four internal variables of the checks above (FP_INPUT_FLAGS,
+# SHELL_SAFE_INPUT_FLAGS, SHELL_SAFE_ALLOWLIST_RC, FP_CONFLICT_FLAGS): a command-line value would win
+# over the computed one and turn every gate above into a no-op while the real CFLAGS/LDFLAGS stay
+# unvalidated. They are computed, not bare literals, so this foreach must run after their last
+# assignment (so $(origin) has already flipped) instead of joining the early foreach.
+# SHELL_SAFE_DISALLOWED_CHARS is excluded: it is only diagnostic text on the failure path.
 $(foreach v,FP_INPUT_FLAGS SHELL_SAFE_INPUT_FLAGS SHELL_SAFE_ALLOWLIST_RC FP_CONFLICT_FLAGS,\
   $(if $(findstring command,$(origin $(v)))$(findstring override,$(origin $(v))),\
     $(error $(v) cannot be overridden (origin: $(origin $(v))) -- it would silently defeat the FP-policy/shell-safety allow-list/conflict checks above, leaving the real CFLAGS/CXXFLAGS/CPPFLAGS/LDFLAGS content unvalidated; this variable is internal to those checks and has no supported external use)))
 
-# FP_POLICY's own bare `:=` literal lives earlier in this file, directly above
-# the LDFLAGS composition and the "Command-line override rejection" foreach --
-# see that literal's "Bare-literal policy flag" comment for why. Only
-# FP_POLICY's OTHER job -- appending it to CFLAGS, LAST, exactly as the
-# "FP-contraction policy" comment above describes -- lives at this position;
-# there is exactly one `:=` definition of FP_POLICY in this file.
+# FP_POLICY's `:=` literal is defined earlier (see "FP-contraction policy"); only its CFLAGS append,
+# which must come last, lives here.
 CFLAGS     += $(FP_POLICY)
 
-# The NE10 archive carries one C++ TU (NE10's generic-radix FFT kernel); a
-# plain-C pipeline binary linking against it uses the C++ DRIVER, which
-# supplies the correct C++ runtime itself (libc++ on macOS/clang, libstdc++
-# on GNU/Linux gcc). A hardcoded `-lc++` alongside it would be a macOS-ism
-# (duplicate there, a link error on GNU/Linux). LINK
-# participates in CFG_SIG below.
+# The NE10 archive carries one C++ TU, so plain-C binaries link with the C++ driver, which supplies
+# the right C++ runtime itself (libc++ on macOS/clang, libstdc++ on GNU/Linux gcc); a hardcoded
+# `-lc++` would be a link error on GNU/Linux. LINK participates in CFG_SIG below.
 LINK = $(CXX)
 
 .DEFAULT_GOAL := all
 
-# =============================================================================
-# Consumer two-phase, THREE-producer resolution
-# =============================================================================
-# Why a dispatch: all three producers' own bin/ dirs are CFG_SIG-keyed, so
-# there is no fixed path to hardcode for libaudio_common.a/libaec.a/libanr.a;
-# and a producer built with a different CC/CXX/NO_STDIO than THIS invocation's
-# own could otherwise be silently linked in without that showing up in this
-# repo's own build identity (config skew).
-#
-# The same two-phase recursive-make dispatch AEC/NR use for their
-# ONE producer, extended to THREE, is driven by whether COMMON_LIB is already known:
-#
-#   Phase 1 (COMMON_LIB unset): a goal that needs any producer archive gets a
-#   recipe that resolves audiolib's archive path first (needed by both
-#   lib/aec's and lib/nr's OWN two-phase dispatch -- see the COMMON_DIR=/COMMON_LIB=
-#   forwarding below), then lib/aec's, then lib/nr's, and re-invokes itself
-#   with all three set.
-#
-#   Phase 2 (COMMON_LIB known): the REAL rules are defined, with $(COMMON_LIB)/
-#   $(AEC_LIB)/$(NR_LIB) as NORMAL (not order-only) prerequisites of the
-#   binaries that link against them -- so relinking happens iff a producer's
-#   archive mtime actually advanced.
-#
-# Goals that never need any producer archive (`libaudio_pipeline.a` -- this
-# `clean`/`clean-all` and the help target get their real rules OUTSIDE this
-# dispatch entirely, further down this file. `libaudio_pipeline.a` (and the
-# audit targets that build+inspect it) DO go through the dispatch: the
-# delivered archive is the one a consumer links, and consumers always
-# resolve the producer identities -- so the archive's keyed path must fold
-# them in too (a bare no-producer build would land in a different directory
-# than every query reports).
-#
-# `make -n`: see AEC's/NR's Makefile comments for why the dispatch recipe's
-# sub-`make` calls are genuinely spawned even under `make -n` (GNU Make
-# always executes, never merely prints, a recipe line that textually
-# mentions $(MAKE)) yet still create zero files (verified empirically): -n
-# propagates to every child `make` via MAKEFLAGS regardless of how it was
-# invoked, so each child's own recipes are themselves just printed.
-#
-# lib/aec's and lib/nr's own Makefiles fold COMMON_LIB into THEIR OWN CFG_SIG
-# (as COMMON_PRODUCER_SIG) REGARDLESS of which of their targets is being built --
-# even their `lib` target, which itself never links audiolib's archive
-# (see those Makefiles: COMMON_PRODUCER_SIG is computed unconditionally whenever
-# COMMON_LIB is non-empty, before their own CFG_SIG_PAYLOAD is assembled). So
-# COMMON_DIR=$(abspath $(COMMON_DIR)) COMMON_LIB=<resolved path> MUST be forwarded to
-# every lib/aec / lib/nr sub-make below (both the query calls and the real
-# `lib` build calls in the FORCE rules further down) -- otherwise a `lib`
-# build invoked without COMMON_LIB would land in a DIFFERENT (COMMON_PRODUCER_SIG-less)
-# keyed directory than the one this Makefile's query call resolved, and the
-# "does $(AEC_LIB) exist" assertion in that FORCE rule would fail.
+# Consumer two-phase, THREE-producer resolution: all three producers' bin/ directories are
+# CFG_SIG-keyed, so there is no fixed archive path to hardcode, and a producer built with a different
+# CC/CXX/NO_STDIO must show in this repo's build identity.
+#   Phase 1 (COMMON_LIB unset): resolve audiolib's archive path first (lib/aec's and lib/nr's own
+#     dispatch need it), then lib/aec's, then lib/nr's, and re-invoke with all three set.
+#   Phase 2 (COMMON_LIB known): the real rules, with $(COMMON_LIB)/$(AEC_LIB)/$(NR_LIB) as normal
+#     prerequisites of the binaries that link them, so relinking happens iff an archive's mtime advanced.
+
+# clean/clean-all have real rules outside the dispatch; libaudio_pipeline.a and the audit targets go
+# through it so the archive's keyed path folds in the producer identities.
+
+# `make -n`: the dispatch recipe mentions $(MAKE), so GNU Make runs it even under -n; -n reaches each
+# child make through MAKEFLAGS, so the children only print their recipes and create no files.
+
+# lib/aec's and lib/nr's CFG_SIG include COMMON_LIB (as COMMON_PRODUCER_SIG) for every target, even
+# their `lib` target, which never links audiolib. COMMON_DIR=$(abspath $(COMMON_DIR)) COMMON_LIB=<path>
+# must therefore reach every lib/aec and lib/nr sub-make (queries and real builds): otherwise a `lib`
+# build would land in a different keyed directory than the query resolved and the archive-exists
+# assertion in the FORCE rule would fail.
 FWD = BACKEND=$(BACKEND) SIMD=$(SIMD) PROFILE=$(PROFILE) WERROR=$(WERROR) CC='$(CC)' CXX='$(CXX)' EXTRA_CFLAGS='$(EXTRA_CFLAGS)' NO_STDIO=$(NO_STDIO) TOOLCHAIN_CHECK=$(TOOLCHAIN_CHECK) DEBUG=$(DEBUG)
 
 ifeq ($(COMMON_LIB),)
@@ -875,45 +422,25 @@ all test test_target_abi target-abi-test libs _publish_impl aec_nr_pipeline aec_
 	 test -n "$$nr" || { echo "FATAL: could not resolve lib/nr archive path (NR_DIR=$(NR_DIR))" >&2; exit 1; }; \
 	 $(MAKE) --no-print-directory $@ COMMON_LIB="$$ac" AEC_LIB="$$aec" NR_LIB="$$nr"
 else
-# Producer-identity components of this consumer's own CFG_SIG (see AEC's/
-# NR's Makefiles for the full rationale): the LAST path component of each
-# resolved archive's directory (e.g. "ne10-2139547423"), NEVER the full
-# (absolute) path -- so a pipeline build against a DIFFERENTLY-configured
-# producer keys to its own separate obj/bin directory here too, instead of
-# risking silent config skew. COMMON_DIR/AEC_DIR/NR_DIR themselves (abspaths,
-# used only as -C arguments to the sub-makes) never appear in any payload or
-# manifest -- only these short backend-sig components do.
+# Producer-identity components of this consumer's CFG_SIG: the last path component of each
+# resolved archive's directory (e.g. "ne10-2139547423"), never the full absolute path, so a pipeline
+# build against a differently configured producer keys to its own obj/bin directory. COMMON_DIR/
+# AEC_DIR/NR_DIR (abspaths, used only as -C arguments) never appear in a payload or manifest.
 COMMON_PRODUCER_SIG  := $(notdir $(patsubst %/,%,$(dir $(COMMON_LIB))))
 AEC_PRODUCER_SIG := $(notdir $(patsubst %/,%,$(dir $(AEC_LIB))))
 NR_PRODUCER_SIG  := $(notdir $(patsubst %/,%,$(dir $(NR_LIB))))
 endif
 
 # --- Hash-keyed object/binary directory + full-coverage CFG_SIG ------------
-# obj/<backend>-<sig> AND bin/<backend>-<sig> -- see audiolib's Makefile
-# for the full design rationale (identical mechanism, applied here). Payload
-# coverage (USER-MANDATED): CC CXX AR RANLIB CFLAGS CXXFLAGS CPPFLAGS LDFLAGS
-# EXTRA_CFLAGS EXTRA_LDFLAGS BACKEND WERROR NO_STDIO DEBUG, PLUS (consumer-
-# specific, THREE producers) COMMON_PRODUCER_SIG/AEC_PRODUCER_SIG/NR_PRODUCER_SIG
-# -- each empty when its _LIB var isn't resolved yet (e.g. for goals like
-# `libaudio_pipeline.a`/`audit-no-stdio` that never touch any producer).
-#
-# This MUST be defined after CFLAGS/LDFLAGS are fully assembled and after the
-# COMMON_LIB ifeq/else above resolves the three PRODUCER_SIGs, but before the
-# first rule below that mentions $(OBJ_DIR)/$(BIN_DIR)/anything derived from
-# them -- GNU Make expands a rule's target/prerequisite list immediately
-# when parsed, not deferred like a recipe body, so a forward reference here
-# would silently resolve using CFG_SIG's value at parse time (empty),
-# landing objects in a hash-less directory instead of the real one.
-#
-# Deliberately NOT $(strip)'d (false-miss OK, false-hit never -- see
-# audiolib's Makefile for the full rationale). cksum (POSIX) computes
-# the hash; `cut -d' ' -f1` isolates the checksum from cksum's
-# "<checksum> <byte-count>" stdout.
-# Payload additions beyond the base set: LINK, TOOLCHAIN_CHECK (the
-# guard-skip knob must not alias a guarded build), SRCS (this
-# Makefile's own compiled sources -- the archive's one member TU plus the
-# CLI/test TUs -- so a source-set change keys to a fresh directory).
-# One optional descriptor test spans all public pipeline/prepost APIs.
+# obj|bin/<backend>-<sig>, as in audiolib's Makefile. The payload covers CC CXX AR RANLIB CFLAGS
+# CXXFLAGS CPPFLAGS LDFLAGS EXTRA_CFLAGS EXTRA_LDFLAGS BACKEND WERROR NO_STDIO DEBUG, the three
+# producer identities (empty while a _LIB is unresolved), LINK, TOOLCHAIN_CHECK (a guard-skip knob
+# must not alias a guarded build) and SRCS. It is defined after CFLAGS/LDFLAGS are final and the
+# PRODUCER_SIGs are resolved, but before the first rule that mentions $(OBJ_DIR)/$(BIN_DIR): Make
+# expands target lists when parsed, so a forward reference would see an empty CFG_SIG. Not $(strip)'d
+# (a false miss is fine, a false hit never); cksum (POSIX) hashes it.
+
+# One optional descriptor test (test_target_abi) spans all public pipeline/prepost APIs.
 TARGET_ABI_SRCS := tests/test_target_abi.c \
  mono_aec_nr_res/audio_pipeline.c common/se_config.c common/se_anr_stage.c \
  mono_alignulcnet/audio_pipeline_ulcnet.c mono_aec_dfn_res/audio_pipeline_dfn.c \
@@ -941,16 +468,9 @@ override CC_TARGET_SIG := $(shell sh $(COMMON_DIR)/scripts/target_abi_signature.
 CFG_SIG_PAYLOAD := CC_TARGET_SIG=$(CC_TARGET_SIG) ULCNET_GRID=$(ULCNET_GRID) CC=$(CC) CXX=$(CXX) AR=$(AR) RANLIB=$(RANLIB) LINK=$(LINK) CFLAGS=$(CFLAGS) CXXFLAGS=$(CXXFLAGS) CPPFLAGS=$(CPPFLAGS) LDFLAGS=$(LDFLAGS) EXTRA_CFLAGS=$(EXTRA_CFLAGS) EXTRA_LDFLAGS=$(EXTRA_LDFLAGS) BACKEND=$(BACKEND) SIMD=$(SIMD) PROFILE=$(PROFILE) WERROR=$(WERROR) NO_STDIO=$(NO_STDIO) DEBUG=$(DEBUG) TOOLCHAIN_CHECK=$(TOOLCHAIN_CHECK) COMMON_PRODUCER_SIG=$(COMMON_PRODUCER_SIG) AEC_PRODUCER_SIG=$(AEC_PRODUCER_SIG) NR_PRODUCER_SIG=$(NR_PRODUCER_SIG) SRCS=$(sort common/se_anr_stage.c common/se_config.c mono_aec_nr_res/audio_pipeline.c mono_aec_nr_res/main.c mono_aec_nr_res/static_main.c mono_aec_nr_res/tests/test_audio_pipeline.c mono_aec_nr_res/example_board_adapter.c mono_alignulcnet/audio_pipeline_ulcnet.c mono_alignulcnet/tests/test_audio_pipeline_ulcnet.c $(ULCNET_DIR)/ulcnet_accelerator_adapter.c $(ULCNET_DIR)/ulcnet_prepost.c $(ULCNET_DIR)/ulcnet_process.c $(ULCNET_DIR)/ulcnet_model_io.c $(AIAEC_DIR)/tests/test_ulcnet_accelerator_adapter.c mono_alignulcnet/main.c dfn_res_stage.c dfn_rate_bridge.c tests/test_dfn_res_stage.c tests/test_dfn_rate_bridge.c tests/test_se_common.c tests/test_readme_flow.c mono_aec_dfn_res/audio_pipeline_dfn.c mono_aec_dfn_res/tests/test_audio_pipeline_dfn.c mono_aec_dfn_res/main.c $(DFN2_DIR)/dfn2_process.c $(DFN2_DIR)/dfn2_model_io.c $(DFN2_DIR)/dfn2_prepost.c $(TARGET_ABI_SRCS))
 CFG_SIG := $(shell printf '%s' "$(CFG_SIG_PAYLOAD)" | cksum | cut -d' ' -f1)
 
-# OBJ_ROOT / BIN_ROOT: where THIS repo's own keyed
-# obj/bin trees live (defaults: obj/ and bin/ in this directory -- the
-# default expansion is byte-identical to the previous hardcoded paths).
-# Same rationale as DIST_ROOT above: a placement knob, never a build-content
-# knob, so deliberately NOT in CFG_SIG. The isolation test scripts use these
-# to run tamper/injection scenarios against a scratch-directory build of the
-# real worktree, so the REAL obj/ and bin/ artifacts here are never
-# modified -- not even transiently. (Each of the three producers --
-# audiolib, lib/aec, lib/nr -- keys its OWN obj/bin trees independently;
-# this pair only covers this Makefile's own objects/binaries.)
+# OBJ_ROOT / BIN_ROOT: where this repo's keyed obj/bin trees live (default obj/ and bin/ here). A
+# placement knob like DIST_ROOT, so not in CFG_SIG; the isolation tests point them at a scratch
+# directory so the real obj/ and bin/ are never touched. Each producer keys its own trees.
 OBJ_ROOT ?= obj
 BIN_ROOT ?= bin
 OBJ_DIR  = $(OBJ_ROOT)/$(BACKEND)-$(CFG_SIG)
@@ -1126,12 +646,9 @@ DFN_STAGE_OBJS = $(OBJ_DIR)/dfn_res_stage.o $(OBJ_DIR)/dfn2_prepost.o \
                  $(OBJ_DIR)/dfn2_model_io.o $(OBJ_DIR)/dfn2_process.o
 DFN_PIPELINE_OBJS = $(OBJ_DIR)/audio_pipeline_dfn.o $(OBJ_DIR)/dfn_rate_bridge.o $(DFN_STAGE_OBJS)
 
-# `libaudio_pipeline.a` needs only THIS repo's own object (audio_pipeline.o)
-# -- no producer archive is linked into it -- so, per the dispatch design
-# above, it's a real rule living entirely outside the COMMON_LIB dispatch (never
-# shells out to any of the three producers, works even if none of them are
-# buildable). The phony alias keeps the pre-B01 flat-filename invocation
-# (`make libaudio_pipeline.a`) working.
+# libaudio_pipeline.a is built from this repo's own objects only (audio_pipeline.o, se_config.o,
+# se_anr_stage.o); no producer archive is linked into it. The phony alias keeps
+# `make libaudio_pipeline.a` working; the keyed archive is $(LIB_TARGET).
 .PHONY: libaudio_pipeline.a
 libaudio_pipeline.a: $(LIB_TARGET)
 
@@ -1152,22 +669,12 @@ $(LIB_TARGET): $(OBJ_DIR)/audio_pipeline.o $(OBJ_DIR)/se_config.o $(OBJ_DIR)/se_
 # =============================================================================
 ifneq ($(COMMON_LIB),)
 .PHONY: all test libs aec_nr_pipeline aec_nr_pipeline_static mono_alignulcnet mono_aec_dfn_res test_audio_pipeline test_audio_pipeline_ulcnet test_ulcnet_accelerator_adapter test_dfn_res_stage test_dfn_rate_bridge test_audio_pipeline_dfn test_se_common test_readme_flow example-adapter example_board_adapter libaudio_pipeline_dfn.a FORCE
-# This Phase 2 branch is entered via a recursive `$(MAKE) ... COMMON_LIB=...
-# AEC_LIB=... NR_LIB=...` re-invoke (see the Phase 1 rule above). GNU Make
-# tracks every variable given this way in MAKEOVERRIDES and folds it into
-# MAKEFLAGS for every further `$(MAKE)` recipe run by this same instance --
-# including the unrelated `samples/` recursive test call below, where it
-# collides with THAT Makefile's own, differently-shaped set of producer
-# variables (`unexport`ing COMMON_LIB/AEC_LIB/NR_LIB individually does NOT
-# stop this: MAKEOVERRIDES, not the plain environment, is what MAKEFLAGS is
-# built from). Clearing MAKEOVERRIDES here removes them from that
-# propagation without touching any variable this Makefile forwards to a
-# sub-make through its own explicit, visible `VAR=value` recipe text.
-# Command-line-origin variables are ALSO auto-exported straight into every
-# recipe's own process environment (a second, independent propagation path
-# from the MAKEFLAGS one above) -- `unexport` blocks that path for these
-# three names specifically; both lines together are what actually isolates
-# the `samples/` recursive call below.
+# This branch is entered through the recursive `$(MAKE) ... COMMON_LIB=... AEC_LIB=... NR_LIB=...`
+# re-invoke. Make folds command-line variables into MAKEOVERRIDES/MAKEFLAGS for every further
+# $(MAKE) recipe, including the `samples/` test call below, whose own producer variables would
+# collide with them. Clearing MAKEOVERRIDES stops that without affecting variables forwarded as
+# explicit VAR=value recipe text; `unexport` also blocks the separate auto-export of command-line
+# variables into recipe environments.
 unexport COMMON_LIB AEC_LIB NR_LIB
 MAKEOVERRIDES :=
 all: $(BIN_DIR)/aec_nr_pipeline $(BIN_DIR)/aec_nr_pipeline_static $(BIN_DIR)/mono_alignulcnet $(DFN_LIB_TARGET) $(BIN_DIR)/mono_aec_dfn_res
@@ -1178,12 +685,8 @@ $(DFN_LIB_TARGET): $(DFN_PIPELINE_OBJS) | _cfg_guard
 	t="$@.tmp.$$$$" && rm -f "$$t" && $(AR) rcs "$$t" $^ && $(RANLIB) "$$t" && mv -f "$$t" $@
 	@echo "libaudio_pipeline_dfn.a [$(BACKEND)] -> $@"
 
-# test: also builds + runs example_board_adapter -- wired into the SAME gate as
-# test_audio_pipeline (not left standalone-only) because it is clean: green on
-# both backends, exits 0 on full success, and its own failure modes (a
-# positive-flow step or negative-demonstration check failing) are exactly the
-# kind of regression this gate exists to catch. `make example-adapter` (below)
-# is available standalone too.
+# test: also builds and runs example_board_adapter, whose exit code signals any failed positive-flow
+# step or negative demonstration. `make example-adapter` (below) runs it standalone.
 test: $(BIN_DIR)/test_audio_pipeline $(BIN_DIR)/example_board_adapter $(BIN_DIR)/test_audio_pipeline_ulcnet $(BIN_DIR)/test_ulcnet_accelerator_adapter $(BIN_DIR)/test_dfn_res_stage $(BIN_DIR)/test_dfn_rate_bridge $(BIN_DIR)/test_audio_pipeline_dfn $(BIN_DIR)/test_se_common $(BIN_DIR)/test_readme_flow $(BIN_DIR)/mono_alignulcnet $(BIN_DIR)/mono_aec_dfn_res
 	"$(abspath $(BIN_DIR))/test_audio_pipeline"
 	"$(abspath $(BIN_DIR))/example_board_adapter"
@@ -1229,7 +732,7 @@ example-adapter: $(BIN_DIR)/example_board_adapter
 # "build the binary" for whoever wants that split.
 example_board_adapter: $(BIN_DIR)/example_board_adapter
 
-# libs: compat alias that builds the three producer archives (an automatic side
+# libs: alias that builds the three producer archives (an automatic side
 # effect of the FORCE rules below) and asserts the local DFN pipeline archive
 # exists, for tooling that invokes `make libs`.
 libs: $(COMMON_LIB) $(AEC_LIB) $(NR_LIB) $(DFN_LIB_TARGET)
@@ -1267,15 +770,11 @@ test_readme_flow: $(BIN_DIR)/test_readme_flow
 
 FORCE:
 
-# Each producer archive is a FORCE-recipe target: always re-invokes that
-# producer's own build (a no-op if it's already up to date -- that
-# producer's own Makefile decides that), but only actually touches the
-# archive's mtime if it really rebuilt something, so the binaries below
-# only relink when it did. COMMON_DIR=$(abspath $(COMMON_DIR)) COMMON_LIB=$(COMMON_LIB) is
-# forwarded to the lib/aec/lib/nr sub-makes even though `lib` itself never
-# links audiolib's archive -- see the two-phase dispatch comment above
-# for why this is required for their CFG_SIG (hence output path) to match
-# what the query call above already resolved.
+# Each producer archive is a FORCE-recipe target: it always re-invokes the producer's own build (a
+# no-op when up to date) and only touches the archive's mtime if something was rebuilt, so the
+# binaries below relink only then. COMMON_DIR/COMMON_LIB are forwarded to the lib/aec and lib/nr
+# sub-makes even though `lib` never links audiolib, so their CFG_SIG (hence output path) matches
+# what the dispatch query resolved.
 $(COMMON_LIB): FORCE
 	+$(MAKE) -C $(COMMON_DIR) $(FWD) lib
 	@test -f '$@' || { echo "ERROR: audiolib did not produce $@ (query/build divergence -- supported forwarded controls are BACKEND/SIMD/WERROR/CC/CXX/EXTRA_CFLAGS/NO_STDIO/TOOLCHAIN_CHECK)"; exit 1; }
@@ -1367,25 +866,14 @@ $(BIN_DIR)/example_board_adapter: $(OBJ_DIR)/example_board_adapter.o $(LIB_TARGE
 endif
 
 # --- Query targets -----------------------------------------------------
-# Report THIS invocation's own build identity (empty COMMON_PRODUCER_SIG/
-# AEC_PRODUCER_SIG/NR_PRODUCER_SIG unless COMMON_LIB/AEC_LIB/NR_LIB were
-# explicitly passed in). Parse-time stdout purity: nothing above this point
-# ever unconditionally $(info)/$(warning)s, so these targets' stdout is
-# exactly their one recipe-time @echo line -- safe to capture with
-# `$(MAKE) -s ... print-lib-path` the way the dispatch recipe above (and
-# lib/aec's/lib/nr's own Makefiles, and this file's audit-no-stdio/publish
-# recipes) all do. To get the exact path `make all` itself would produce
-# (which DOES fold in the three resolved producers' identities), resolve
-# COMMON_LIB/AEC_LIB/NR_LIB the same way phase 1 does and pass them explicitly.
+# Report this invocation's own build identity (the producer SIGs are empty unless COMMON_LIB/AEC_LIB/
+# NR_LIB were passed). Nothing above ever $(info)s or $(warning)s unconditionally, so stdout is
+# exactly the one recipe-time @echo line, safe to capture with `$(MAKE) -s ... print-lib-path` as the
+# dispatch recipe and the audit/publish recipes do.
 .PHONY: print-bin-dir print-obj-dir print-lib-path
-# print-bin-dir / print-lib-path / print-obj-dir all dispatch through the same
-# three-producer phase-1 resolution as the build goals, so a bare
-# `make -s print-<x>` prints the location that configuration actually uses
-# (this repo's archive, binaries AND objects only exist in the
-# resolved-producer directory). print-obj-dir did NOT dispatch before, so it
-# answered for a different config signature than the one the build used --
-# which made it useless for anything that has to find a just-built object.
-# Passing COMMON_LIB/AEC_LIB/NR_LIB explicitly skips the query sub-makes.
+# print-bin-dir / print-lib-path / print-obj-dir dispatch through the same three-producer phase-1
+# resolution as the build goals, so a bare `make -s print-<x>` prints the location this configuration
+# actually uses. Passing COMMON_LIB/AEC_LIB/NR_LIB explicitly skips the queries.
 ifeq ($(COMMON_LIB),)
 print-bin-dir print-lib-path print-obj-dir:
 	+@ac="$$($(MAKE) -s --no-print-directory -C $(COMMON_DIR) $(FWD) print-lib-path)"; \
@@ -1412,19 +900,13 @@ endif
 test-fp-contract:
 	@scripts/audit_fp_contract.sh $(BACKEND)
 
-# audit-no-stdio (adapted to the keyed-directory layout):
-# builds libaudio_pipeline.a with NO_STDIO=1 (current BACKEND=$(BACKEND))
-# and asserts, via `nm` over the DELIVERED keyed archive itself (not an
-# intermediate object file), that none of fprintf/printf/puts/fputs/stderr/
-# __stderrp made it into it -- plus that the NO_STDIO=1
-# archive's resolved path actually differs from the default (NO_STDIO=0)
-# config's path, i.e. the two configs cannot silently collide/alias. `ar -t`
-# confirms the archive holds its three members (audio_pipeline.o, se_config.o,
-# se_anr_stage.o) nm's hits are attributed to. Pattern/style mirrors
-# ../../audiolib/common/scripts/audit_alloc_symbols.sh (leading-underscore-
-# tolerant regex, last-whitespace-field match against nm's NAME column, so
-# it works the same under macOS/BSD nm and GNU nm). This IS a pass/fail gate
-# (prints PASS/FAIL, non-zero exit on FAIL).
+# audit-no-stdio: builds libaudio_pipeline.a with NO_STDIO=1 and asserts, with `nm` over the delivered
+# keyed archive itself, that none of fprintf/printf/puts/fputs/stderr/__stderrp is in it, and that its
+# resolved path differs from the default (NO_STDIO=0) config's path so the two cannot alias. `ar -t`
+# confirms the three members (audio_pipeline.o, se_config.o, se_anr_stage.o). The regex tolerates a
+# leading underscore and matches the last field of nm's NAME column, as
+# ../../audiolib/common/scripts/audit_alloc_symbols.sh does, so it works with macOS/BSD and GNU nm.
+# Prints PASS/FAIL; non-zero exit on FAIL.
 .PHONY: audit-no-stdio
 audit-no-stdio:
 	@echo "audit-no-stdio: building libaudio_pipeline.a (BACKEND=$(BACKEND), NO_STDIO=1)"
@@ -1451,16 +933,12 @@ audit-no-stdio:
 	 fi; \
 	 echo "PASS: no fprintf/printf/puts/fputs/stderr/__stderrp symbols in $$lib_nostdio (NO_STDIO=1); path differs from default-config path $$lib_default"
 
-# audit-no-stdio-stack (full-image gate): builds ALL FIVE
-# delivered archives with NO_STDIO=1 (the dispatch forwards NO_STDIO to
-# audiolib / lib/aec / lib/nr -- lib/aec compiles its trace/debug TU out
-# entirely under this knob), nm-gates EACH delivered archive, then links
-# test_no_stdio_stack.c (a minimal main that runs the whole
-# query->init_ex->process->reset->destroy flow and uses no stdio itself --
-# exit code is its only output) and nm-gates the EXECUTABLE, so a stdio
-# symbol contributed by any archive fails the audit at the image level.
-# Every archive and the executable must be free of the stdio set
-# (fprintf/vfprintf/printf/puts/fputs/stderr/__stderrp/fputc/fwrite).
+# audit-no-stdio-stack (full-image gate): builds all five delivered archives with NO_STDIO=1 (the
+# dispatch forwards it to audiolib / lib/aec / lib/nr; lib/aec compiles its trace/debug TU out under
+# it), nm-gates each archive, then links test_no_stdio_stack.c (a minimal main that runs
+# query->init_ex->process->reset->destroy using no stdio) and nm-gates the executable, so a stdio
+# symbol from any archive fails at the image level. The stdio set is
+# fprintf/vfprintf/printf/puts/fputs/stderr/__stderrp/fputc/fwrite.
 .PHONY: audit-no-stdio-stack
 audit-no-stdio-stack:
 	@echo "audit-no-stdio-stack: building the full stack (BACKEND=$(BACKEND), NO_STDIO=1)"
@@ -1489,87 +967,37 @@ audit-no-stdio-stack:
 	 "$$bd/test_no_stdio_stack" || { rc=$$?; echo "FAIL: test_no_stdio_stack exit $$rc"; exit 1; }; \
 	 echo "PASS: full NO_STDIO=1 stack -- 5 delivered archives scanned + conventional-stack executable clean ($$pat tier), runtime exit 0"
 
-# =============================================================================
-# publish v2: immutable per-config release under dist/
-# -- same design as audiolib's/AEC's/NR's publish (see audiolib's
-# Makefile for the full writeup): dist/<backend>/<cfg_sig>/ + atomic
-# dist/<backend>/current symlink, a per-backend mkdir-lock serialising
-# concurrent publishes, MANIFEST.txt with relative paths + per-file sha256 +
-# this build's three resolved producer identities (COMMON_PRODUCER_SIG/
-# AEC_PRODUCER_SIG/NR_PRODUCER_SIG) + the git commit of each of the three
-# sibling/submodule repos (audiolib, lib/aec, lib/nr) via `git -C`, on
-# top of this repo's (Audio_ALG's) own commit. PUBLISH_ARTIFACTS needs
-# $(COMMON_LIB)/$(AEC_LIB)/$(NR_LIB) to exist, so `publish` goes through the same
-# two-phase, three-producer dispatch as `all`/`test`/`libs` above when they
-# aren't already known (see the ifeq($(COMMON_LIB),) block near the top of this
-# file, which lists `publish` alongside all/test/libs).
-# =============================================================================
-# publish v4: immutable, content-addressed release under $(DIST_ROOT) --
-# same design as audiolib's publish; see that Makefile for the full
-# layout/semantics writeup. Additions here (mirroring audiolib's,
-# extended to FOUR repos):
-#   - ATTEST is one-event-one-file: EXACTLY one new
-#     attest-<utc>-<commit>[-dirty]-<seq>.txt per publish EVENT (incl.
-#     idempotent republishes), installed via the atomic_symlink_swap
-#     helper's `--excl-install` mode (write-temp + link(2), the atomic
-#     no-clobber equivalent of O_CREAT|O_EXCL) -- a same-second name
-#     collision regenerates the event id with the next <seq> (capped at
-#     999) and retries; an existing attestation is NEVER overwritten
-#     (a prior cp+mv -f approach let same-second republishes silently
-#     clobber the prior record).
-#   - Every commit recorded is the FULL 40-hex git OID (never abbreviated),
-#     for this repo (pipelines/Audio_ALG) AND all three producers
-#     (audiolib, lib/aec, lib/nr) -- "which exact checkout of the whole
-#     stack published this" lives in ATTEST/, not in MANIFEST (which stays
-#     deterministic: config + tool identities + per-file SHA-256 only, so
-#     the same release id always has the same MANIFEST bytes and republish
-#     verifies it byte-for-byte).
-#   - Unknown identity (c) is checked FIRST, per repo, and is refused
-#     UNCONDITIONALLY -- no ALLOW_DIRTY_PUBLISH/ALLOW_UNTRACKED_PUBLISH
-#     combination admits it, because without a commit OID neither the
-#     tracked diff nor the untracked enumeration can be named for that
-#     repo. Only once every one of the four repos (this repo AND all
-#     three producers) has resolved to a real commit does this recipe
-#     compute (a) TRACKED-dirty (`git status --porcelain -uno`, identical
-#     -uno scope for all four) and (b) UNTRACKED (`git ls-files --others
-#     --exclude-standard`; THIS repo's list has `AINR/GTCRN/` and
-#     `AINR/gtcrn_github/` whitelisted BY PREFIX -- permanent user-owned
-#     content never staged for a publish -- the three producers get no
-#     such whitelist, so any untracked file there is always a violation).
-#     Ordering is gate-then-hash: the dirty gate runs for all
-#     four repos, then the untracked gate for all four, and ONLY AFTER
-#     BOTH PASS does this recipe hash anything -- no hash work happens on
-#     a repo that is about to FATAL anyway. The two escape hatches remain
-#     separate and orthogonal: ALLOW_DIRTY_PUBLISH=1 admits tracked
-#     changes and records a dirty_diff_sha256 (sha256 of `git diff
-#     --binary HEAD`) per dirty repo; ALLOW_UNTRACKED_PUBLISH=1 admits
-#     untracked files and records an untracked_tree_sha256 per repo with
-#     untracked=1, computed by the shared `hash_untracked()` helper
-#     (defined once, at the top of _publish_impl) over sorted FIXED-FIELD
-#     records -- "L <sha256(path)> <sha256(readlink output)>" for a
-#     symlink, "F <mode> <sha256(path)> <sha256(content)>" for a regular
-#     file -- every variable-length value is itself hashed so records
-#     concatenate unambiguously (raw space-joined path/target strings were
-#     collision-prone) -- the tracked diff hash says nothing
-#     about untracked bytes, so two different untracked source states must
-#     not share a provenance record. An untracked path that is neither a
-#     regular file nor a symlink (an embedded git checkout, a fifo), or
-#     that a stat/readlink/shasum call fails on, cannot be hashed
-#     deterministically and is always refused (fail-closed), with a
-#     diagnostic naming both the path and the repo it came from.
-#   - Attestations are UNSIGNED: they provide traceability, not
-#     authenticity -- anyone with filesystem access could forge one, so do
-#     not present ATTEST/ as tamper-proof under an attacker model
-#     (MANIFEST byte-verification is the integrity check; ATTEST is the
-#     provenance log).
-# `publish` is the locked driver (a MAKEFLAGS word-scan makes
-# `-n`/`-q`/`-t` fully ZERO-WRITE -- no DIST_ROOT, no lock, no
-# stage/helper/MANIFEST/ATTEST writes, and no artifact mtime changes; `-t`
-# is checked FIRST so a COMBINED invocation like `make -nt publish` takes
-# the touch no-op path instead of recursing for `-n` -- see that target's
-# own comment for the full word-scan detail); _publish_impl is INTERNAL
-# (direct invocation skips the lock) and goes through the same
-# three-producer phase-1 dispatch as `all`/`test`.
+# publish: immutable, content-addressed release under $(DIST_ROOT), same design as audiolib's publish
+# (see its Makefile): dist/<backend>/<cfg_sig>/ plus an atomic dist/<backend>/current symlink, a
+# per-backend mkdir-lock serialising concurrent publishes, and MANIFEST.txt with relative paths,
+# per-file sha256, the three resolved producer identities and the git commit of each of the four
+# repos (audiolib, lib/aec, lib/nr via `git -C`, and this repo). PUBLISH_ARTIFACTS needs
+# $(COMMON_LIB)/$(AEC_LIB)/$(NR_LIB), so `publish` goes through the same two-phase dispatch as
+# all/test/libs.
+
+# - ATTEST is one event, one file: exactly one new attest-<utc>-<commit>[-dirty]-<seq>.txt per publish
+#   event (idempotent republishes included), installed with the atomic_symlink_swap helper's
+#   `--excl-install` mode (write-temp + link(2), an atomic no-clobber). A same-second name collision
+#   regenerates the event id with the next <seq> (capped at 999); an existing attestation is never
+#   overwritten.
+# - Every commit recorded is the full 40-hex OID, for this repo and the three producers. ATTEST/ names
+#   the exact checkout of the whole stack, while MANIFEST stays deterministic (config, tool
+#   identities, per-file SHA-256), so the same release id always has the same MANIFEST bytes.
+
+# - Per repo, an unknown identity is checked first and refused unconditionally (no commit OID, no
+#   provenance). Only when all four repos have a commit are TRACKED-dirty (`git status --porcelain
+#   -uno`) and UNTRACKED (`git ls-files --others --exclude-standard`; this repo's list has the
+#   AINR/GTCRN/ and AINR/gtcrn_github/ prefixes whitelisted) computed. Gate-then-hash: the dirty gate
+#   runs for all four repos, then the untracked gate, and only then is anything hashed. The escape
+#   hatches ALLOW_DIRTY_PUBLISH / ALLOW_UNTRACKED_PUBLISH stay separate and record dirty_diff_sha256 /
+#   untracked_tree_sha256 (via hash_untracked(), see _publish_impl).
+
+# - Attestations are unsigned: traceability, not authenticity. MANIFEST byte-verification is the
+#   integrity check; ATTEST is the provenance log.
+
+# `publish` is the locked driver (a MAKEFLAGS word-scan makes -n/-q/-t write nothing; see its own
+# comment); _publish_impl is internal (direct invocation skips the lock) and uses the same
+# three-producer dispatch as `all`/`test`.
 # =============================================================================
 PUBLISH_ARTIFACTS = $(LIB_TARGET) $(DFN_LIB_TARGET) $(BIN_DIR)/aec_nr_pipeline $(BIN_DIR)/aec_nr_pipeline_static $(BIN_DIR)/mono_alignulcnet $(BIN_DIR)/mono_aec_dfn_res
 
@@ -1597,35 +1025,17 @@ DIST_BACKEND_DIR  = $(DIST_ROOT)/$(BACKEND)
 DIST_LOCK         = $(DIST_ROOT)/.lock.$(BACKEND)
 
 .PHONY: publish
-# Dry-run guard: this
-# recipe mentions $(MAKE), so GNU make executes it for real under -n/-q/-t
-# (all three share that rule) -- which would otherwise mkdir $(DIST_ROOT)
-# persistently and take/release the real publish lock on every dry run.
-# The word-scan below detects those flags in MAKEFLAGS and branches:
-#   -t  prints a one-line note and exits 0 WITHOUT recursing (recursing
-#       lets standard touch semantics bump the mtimes of this
-#       repo's own artifact prerequisites (the pipeline objects/archive/
-#       binaries) -- real writes. publish is a phony ACTION, not a build
-#       product; touching its artifact prerequisites without attesting
-#       would fabricate state, so touch mode is an explicit no-op here).
-#       Checked FIRST: in a COMBINED invocation like `make -nt publish`,
-#       recursing for -n would hand the child make both flags and GNU make
-#       then really applies touch semantics (reproduced) -- so any t wins
-#       over n, conservatively;
-#   -q  exits 1 directly (question mode's documented "needs updating"
-#       answer -- publish is phony, so it always would run -- no output);
-#   -n  exec a recursion-only path (the child make inherits -n and merely
-#       PRINTS the pin check and _publish_impl commands).
-# All three are ZERO-WRITE: no DIST_ROOT, no lock, no stage/helper/
-# MANIFEST/ATTEST writes, and no artifact mtime changes. See audiolib's
-# Makefile for the full MAKEFLAGS word-scan writeup (verified against GNU
-# make 3.81: 17 flag combinations incl. long forms: bundled no-dash short
-# flags may appear as the first word ("n", "sn") OR as separate dashed
-# words ("-n" after a long option); long options start with "--"; a
-# literal "--" separates flags from command-line variable overrides, which
-# can themselves contain n/q/t -- BACKEND=ne10 -- hence the explicit
-# skips). Normal invocations keep the original lock-FIRST discipline
-# unchanged.
+# Dry-run guard: this recipe mentions $(MAKE), so GNU make runs it for real under -n/-q/-t, which would
+# create $(DIST_ROOT) and take the publish lock on every dry run. A MAKEFLAGS word-scan branches:
+#   -t  print a note and exit 0 without recursing (recursing would let touch semantics bump the mtimes
+#       of the artifact prerequisites; publish is a phony action, not a build product). Checked first:
+#       for `make -nt publish`, recursing for -n would hand the child both flags and make would touch.
+#   -q  exit 1 with no output (the documented "needs updating" answer; publish is phony).
+#   -n  recurse; the child inherits -n and only prints the pin check and _publish_impl commands.
+
+# All three write nothing. The scan handles bundled short flags as the first word ("n", "sn") or as
+# separate dashed words, long options ("--"), and a literal "--" before command-line variables (which
+# can contain n/q/t, e.g. BACKEND=ne10), hence the explicit skips. Normal invocations lock first.
 publish:
 	+@has_n=0; has_q=0; has_t=0; \
 	for w in $(MAKEFLAGS); do \
@@ -1653,72 +1063,29 @@ publish:
 _publish_checked:
 	+$(MAKE) --no-print-directory _check_pins_impl && $(MAKE) --no-print-directory _publish_impl
 
-# _publish_impl phase-2: attest v2 records FOUR repos'
-# provenance -- this repo (Audio_ALG/pipelines) AND all three producers
-# (audiolib, lib/aec, lib/nr) -- each as a FULL 40-hex git commit OID
-# plus a dirty flag, so a release's ATTEST/ directory names the exact
-# source state of the entire stack, not just this repo.
-#
-# hash_untracked() (defined at the very top of the recipe below, VERBATIM
-# the same helper audiolib's Makefile defines): takes a path PREFIX as
-# $1, reads a newline-separated untracked-path list on stdin, sorts it
-# (`LC_ALL=C sort`), and emits one FIXED-FIELD record per path -- "L
-# <sha256(path)> <sha256(readlink output)>" for a symlink, "F <mode>
-# <sha256(path)> <sha256(content)>" for a regular file, "X <path>" for
-# anything else (neither file nor symlink, or any stat/readlink/shasum
-# failure -- fail-closed, never an empty hash). Every variable-length
-# value is itself hashed before being placed in the record, so records
-# concatenate unambiguously (a raw space-joined "path target" string is
-# collision-prone: "a b"->"c" vs "a"->"b c" would otherwise encode
-# identically). Called FOUR times below, once per repo, each into its OWN
-# record file: this repo as `hash_untracked "./"` over the
-# WHITELIST-FILTERED list, each producer as `hash_untracked "$(COMMON_DIR)/"` /
-# `"$(AEC_DIR)/"` / `"$(NR_DIR)/"` over its raw (unfiltered) list -- the
-# prefix is how the SAME helper resolves a path relative to a DIFFERENT
-# repo root without duplicating the L/F/X logic four times. Each repo's
-# untracked_tree_sha256 (`uhash`/`ac_uhash`/`aec_uhash`/`nr_uhash`) is then
-# `shasum -a 256` of that ONE record file.
-#
-# Unknown identity is checked FIRST, per repo, and is an UNCONDITIONAL
-# FATAL -- no ALLOW_DIRTY_PUBLISH/ALLOW_UNTRACKED_PUBLISH combination
-# admits it, because without a commit OID neither the tracked diff nor the
-# untracked enumeration can be named for that repo. Each producer dir is
-# still guarded with `[ -z "$(X_DIR)" ] || [ ! -d "$(X_DIR)" ]` before any
-# `git -C` call (an EMPTY or missing dir variable would otherwise make
-# `git -C ''`/`git -C <missing>` fail in a way that doesn't clearly name
-# the producer, or silently misattribute this repo's own state to it) --
-# a missing/non-existent producer directory FATALs by name exactly like a
-# present-but-non-git one does. Only once every one of the four repos has
-# resolved to a real commit does this recipe compute that repo's
-# dirty/untracked flags -- both are then plain 0/1, never a third
-# "unknown" state, since "unknown" already exited above.
-#
-# Ordering (gate-then-hash): the dirty gate (all four
-# repos) runs FIRST, then the untracked gate (all four repos) -- each a
-# hard FATAL, by name, per offending repo, unless its escape hatch is set
-# -- and ONLY AFTER BOTH GATES PASS does this recipe do any hashing: the
-# four `git diff`-based dirty_diff_sha256 hashes (each only for a repo
-# with dirty=1), then the four hash_untracked() record files (each only
-# for a repo with untracked=1). No hash work happens on a repo that is
-# about to FATAL anyway.
-#
-# Dirty policy: publish REFUSES by default when this
-# repo OR any producer has uncommitted TRACKED changes. ALLOW_DIRTY_
-# PUBLISH=1 is the escape hatch; the attestation then records
-# allow_dirty_publish=1 plus, for each repo that was dirty, a
-# dirty_diff_sha256 (sha256 of `git diff --binary HEAD`) so the deviation
-# itself is traceable.
-#
-# Untracked policy: publish separately REFUSES by default
-# when this repo (outside its whitelist) OR any producer contains any
-# untracked file. ALLOW_UNTRACKED_PUBLISH=1 is the separate escape hatch;
-# the attestation then records allow_untracked_publish=1 plus, for each
-# repo with untracked=1, an untracked_tree_sha256 from hash_untracked()
-# above. Any X record in that repo's record file is always a hard FATAL
-# naming the repo -- "an untracked path in <repo> cannot be hashed
-# deterministically ... and so cannot enter the provenance record" -- a
-# publish must never proceed as though it could account for a source it
-# can't.
+# _publish_impl records the provenance of four repos (this repo and the three producers), each as a
+# full 40-hex commit OID plus a dirty flag, so ATTEST/ names the source state of the whole stack.
+
+# hash_untracked() (defined at the top of the recipe, the same helper as audiolib's): $1 is a path
+# prefix; it reads an untracked-path list on stdin, sorts it (`LC_ALL=C sort`) and emits one
+# fixed-field record per path: "L <sha256(path)> <sha256(readlink)>" for a symlink, "F <mode>
+# <sha256(path)> <sha256(content)>" for a regular file, "X <path>" for anything else or any
+# stat/readlink/shasum failure (fail-closed, never an empty hash). Variable-length values are hashed
+# first so records concatenate unambiguously. It runs once per repo ("./" over the whitelist-filtered
+# list; "$(COMMON_DIR)/", "$(AEC_DIR)/", "$(NR_DIR)/" over the raw lists) into its own record file,
+# and each untracked_tree_sha256 is `shasum -a 256` of that file.
+
+# Per repo, an unknown identity is checked first and is an unconditional FATAL. Each producer dir is
+# guarded with `[ -z "$(X_DIR)" ] || [ ! -d "$(X_DIR)" ]` before any `git -C`, so an empty or missing
+# dir fails naming the producer. Once all four have a commit, the dirty gate (all four) runs, then the
+# untracked gate (all four), each a FATAL naming the repo unless its escape hatch is set; only then
+# are the dirty_diff_sha256 hashes (repos with dirty=1) and the record files (repos with untracked=1)
+# computed.
+
+# ALLOW_DIRTY_PUBLISH=1 / ALLOW_UNTRACKED_PUBLISH=1 record allow_dirty_publish=1 /
+# allow_untracked_publish=1 plus the per-repo dirty_diff_sha256 / untracked_tree_sha256. An X record is
+# always a FATAL naming the repo: a publish must not proceed as though it could account for a source
+# it cannot hash.
 ifneq ($(COMMON_LIB),)
 .PHONY: _publish_impl
 _publish_impl: $(PUBLISH_ARTIFACTS)
@@ -1951,21 +1318,15 @@ _publish_impl: $(PUBLISH_ARTIFACTS)
 	echo "pipelines: published $(BACKEND)/$$rel_id -> $(DIST_BACKEND_DIR)/current (attested: $$attest_name)"
 endif
 
-# clean: this dir's own hash-keyed obj/bin trees (every config, not just the
-# one BACKEND/flags this invocation resolves to) PLUS any flat
-# binaries/archive from a pre-keyed directory layout (an
-# older checkout, or a manual build from an older revision of this file).
-# Uses the OBJ_ROOT/BIN_ROOT knobs so `clean` with an override
-# scrubs THAT tree, never the real obj/ and bin/. dist/ is NOT removed
-# (publish is a deliberate release, not a build cache).
+# clean: this dir's hash-keyed obj/bin trees (every config, not just the one this invocation
+# resolves to). OBJ_ROOT/BIN_ROOT overrides scrub that tree instead of the real obj/ and bin/. dist/
+# is not removed (publish is a deliberate release, not a build cache).
 clean:
 	rm -rf $(OBJ_ROOT) $(BIN_ROOT)
 	rm -f aec_nr_pipeline aec_nr_pipeline_static libaudio_pipeline.a test_audio_pipeline
 
-# clean-all: full nuke -- this dir's own artifacts plus all three
-# submodule/shared build trees (lib/aec, lib/nr, audiolib). clean-libs is
-# kept as a backward-compatible alias (same effect) since existing
-# tooling/docs call it by that name.
+# clean-all: this dir's artifacts plus all three submodule/shared build trees (lib/aec, lib/nr,
+# audiolib). clean-libs is an alias with the same effect.
 clean-all: clean
 	$(MAKE) -C $(AEC_DIR) clean
 	$(MAKE) -C $(NR_DIR) clean
@@ -1983,51 +1344,34 @@ clean-libs: clean-all
 -include $(wildcard $(OBJ_DIR)/*.d)
 
 # ---------------------------------------------------------------------------
-# test-grids: prove BOTH Align-ULCNet deployment grids in one command.
-#
-# `test` only ever exercises whichever grid ULCNET_GRID selects, so a
-# 16 kHz-only CI would never compile or run the 48 kHz build at all. Each
-# grid gets its own object/bin directory (ULCNET_GRID is in CFG_SIG), so the
-# two runs cannot contaminate each other.
-#
-# Defined outside the COMMON_LIB bootstrap conditionals on purpose: it needs no
-# resolved producer archives of its own, and each recursive `test` bootstraps
-# itself. Adding it to the bootstrap target list instead would resolve the
-# producers once and then hand both grids the same resolved set, which is
-# harmless but pointless work.
+# test-grids: runs both Align-ULCNet deployment grids in one command (`test` only exercises the grid
+# ULCNET_GRID selects). ULCNET_GRID is in CFG_SIG, so each grid has its own obj/bin directory. Defined
+# outside the COMMON_LIB conditionals: it needs no producer archive itself and each recursive `test`
+# bootstraps its own.
 # ---------------------------------------------------------------------------
 .PHONY: test-grids
 test-grids:
 	$(MAKE) ULCNET_GRID=16k test
 	$(MAKE) ULCNET_GRID=48k test
 
-# ---------------------------------------------------------------------------
-# pyc-parity: Python <-> C parity of the pipelines glue (mono and 4-channel NR
-# gain, post-beam RES gain, shared-delay realign, min/apply/comfort noise/OLA),
-# Layer 1 against std-math C and Layer 2 shipped against std-math C. Needs a
-# python3 with numpy, scipy, soundfile and pyyaml (PYTHON=... to choose it);
-# scratch and results go to PYC_WORK (default under $TMPDIR), never into this
-# tree. Options and the exit-status contract are documented at the top of
-# tests/pyc_parity_pipelines.sh; pass them through PYC_PARITY_ARGS, e.g.
+# pyc-parity: Python <-> C parity of the pipelines glue (mono and 4-channel NR gain, post-beam RES
+# gain, shared-delay realign, min/apply/comfort noise/OLA): Layer 1 against std-math C and Layer 2
+# shipped against std-math C. Needs python3 with numpy, scipy, soundfile and pyyaml (PYTHON=... to
+# choose it); scratch and results go to PYC_WORK (default under $TMPDIR). Options and the exit
+# contract are at the top of tests/pyc_parity_pipelines.sh; pass them via PYC_PARITY_ARGS, e.g.
 #   make pyc-parity PYC_PARITY_ARGS="--layers 1 --only a.nr4."
-# Defined outside the COMMON_LIB bootstrap conditionals, like test-grids: it has no
-# producer-archive prerequisite (the script builds its own copies under the
-# scratch directory).
-# ---------------------------------------------------------------------------
+# Defined outside the COMMON_LIB conditionals: the script builds its own copies in the scratch dir.
 .PHONY: pyc-parity
 pyc-parity:
 	bash tests/pyc_parity_pipelines.sh $(PYC_PARITY_ARGS)
 
 # ---------------------------------------------------------------------------
-# check-pins: verify the producer revisions this checkout expects. lib/aec
-# and lib/nr are submodules, so their gitlinks ARE the pin; audiolib is a
-# sibling checkout resolved through COMMON_DIR, so its expected commit is recorded
-# in audiolib.pin (bump it in the same commit that bumps the gitlinks).
-# A commit mismatch fails; tracked changes in a producer are reported but
-# allowed here (dev builds) -- `make publish` separately applies its dirty
-# policy. Publish runs this check after taking its lock and before building.
-# Submodule pins are read from the index, so a staged gitlink bump can be
-# validated before its commit; clean committed trees have index == HEAD.
+# check-pins: verify the producer revisions this checkout expects. lib/aec and lib/nr are submodules
+# whose gitlinks are the pin (read from the index, so a staged bump validates before its commit);
+# audiolib is a sibling checkout resolved through COMMON_DIR, with its expected commit in audiolib.pin
+# (bump it with the gitlinks). A commit mismatch fails; tracked changes in a producer are reported but
+# allowed (`make publish` applies its own dirty policy). Publish runs this after taking its lock and
+# before building.
 # ---------------------------------------------------------------------------
 .PHONY: check-pins _check_pins_impl
 check-pins: _check_pins_impl

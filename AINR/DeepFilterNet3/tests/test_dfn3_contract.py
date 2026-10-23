@@ -57,11 +57,9 @@ def build_shipped_model(cfg, **overrides):
     """Construct the model exactly as config.ini specifies, with overrides.
 
     Goes through the trainer's own ``read_model_config`` rather than re-reading
-    the keys: a local copy is a third restatement of the constructor's defaults
-    (train.py and inference.py were the first two, which is why that function
-    exists), and it silently omitted ``df_hidden``, ``mask_pf`` and ``pf_beta`` --
-    so tests built those three from constructor defaults while the trainer built
-    them from config.  It also inherits the unknown-key rejection.
+    the keys, so tests cannot build ``df_hidden``, ``mask_pf`` or ``pf_beta``
+    from constructor defaults while the trainer builds them from config; it
+    also inherits the unknown-key rejection.
     """
     return DeepFilterNet3(**{**read_model_config(cfg), **overrides})
 
@@ -179,9 +177,9 @@ def test_phase_aware_loss_matches_reference_and_accepts_pure_noise():
 
 
 def test_erb_fb_matches_banderb_notebook_construction():
-    # erb_bandborder(): every band >= 2 bins (the v3 fix -- the original
-    # notebook's "every-OTHER-band-pair >= 2" rule did not actually
-    # guarantee this), endpoints pinned, right band count.
+    # erb_bandborder(): every band >= 2 bins (the original notebook's
+    # "every-OTHER-band-pair >= 2" rule does not guarantee it), endpoints
+    # pinned, right band count.
     for n_bands, sr, n_fft in [(32, 48000, 1024), (22, 16000, 512),
                                (10, 8000, 256)]:
         border = erb_bandborder(n_bands, sr, n_fft)
@@ -192,9 +190,8 @@ def test_erb_fb_matches_banderb_notebook_construction():
         assert len(border) == n_bands
 
     # _build_erb_fb(): erb_inv is an exact partition of unity (no row
-    # normalisation needed, unlike the old construction); erb_fb's two edge
-    # columns are exactly 2x erb_inv's (mode=0 vs mode=1), interior columns
-    # match exactly.
+    # normalisation needed); erb_fb's two edge columns are exactly 2x erb_inv's
+    # (mode=0 vs mode=1), interior columns match exactly.
     fb, inv = _build_erb_fb(1024, 48000, 32)
     assert fb.shape == (32, 513)
     assert inv.shape == (32, 513)
@@ -395,12 +392,12 @@ def test_non_finite_gradient_is_refused_before_it_touches_the_model():
 def test_scan_non_finite_excludes_buffers_by_default():
     """⚠ Buffers must be OFF by default, and that default is load-bearing.
 
-    BatchNorm writes running_mean/running_var during forward() in train mode, so a
-    forward-side fault poisons every BN buffer before the loss exists.  Including
-    them made the halt report claim "an earlier step already wrote NaN into the
-    weights" at global step 0 -- the opposite of the truth -- and put non-finite
-    buffers into the checkpoint it told the operator to resume from, which the
-    resume guard then rejected.
+    BatchNorm writes running_mean/running_var during forward() in train mode,
+    so a forward-side fault poisons every BN buffer before the loss exists.
+    Including them would make the halt report claim "an earlier step already
+    wrote NaN into the weights" at global step 0 and put non-finite buffers
+    into the checkpoint it tells the operator to resume from, which the resume
+    guard rejects.
     """
     model = torch.nn.Sequential(torch.nn.Linear(3, 2), torch.nn.BatchNorm1d(2))
     assert scan_non_finite(model) == []
@@ -423,8 +420,7 @@ def test_scan_non_finite_excludes_buffers_by_default():
 def test_lookahead_relation_is_enforced_in_the_model_constructor():
     """df_lookahead > mask_lookahead must be rejected at the single source.
 
-    Guards against the invariant drifting back out into per-entry-point copies:
-    train.py and inference.py deliberately no longer check it, so if the
+    train.py and inference.py deliberately do not check it, so if the
     constructor stops enforcing it nothing does.
     """
     cfg = load_config()
@@ -438,11 +434,10 @@ def test_enc_concat_true_still_emits_a_single_width_bus():
     """⚠ Dormant path, so nothing else covers it.
 
     Upstream keeps emb_in_dim and emb_out_dim separate: concatenating the two
-    encoder branches doubles what the embedding GRU CONSUMES while what it EMITS
-    stays one bus wide, because the decoders downstream are built for one bus.
-    The port previously used a single attribute, so enc_concat=True emitted a
-    double-width bus the ERB decoder could not accept.  Since enc_concat is an
-    exposed config knob, that failure was reachable.
+    encoder branches doubles what the embedding GRU CONSUMES while what it
+    EMITS stays one bus wide for the decoders. One shared width attribute would
+    make enc_concat=True emit a double-width bus the ERB decoder cannot accept,
+    and enc_concat is an exposed config knob.
     """
     cfg = load_config()
     model = build_shipped_model(cfg, enc_concat=True)
@@ -466,9 +461,8 @@ def test_enc_concat_true_still_emits_a_single_width_bus():
 def test_n_erb_divisibility_follows_upstreams_stricter_rule():
     """Upstream asserts nb_erb % 8; the two stride-2 stages only need % 4.
 
-    ⚠ Calls the real validator.  The previous version asserted `32 % 8 == 0`
-    locally and never reached train.py -- mutation-proven: reverting the guard to
-    % 4 left it green.
+    ⚠ Calls the real validator: a local `32 % 8 == 0` assertion would never
+    reach train.py and would stay green if the guard reverted to % 4.
     """
     shipped = dict(n_fft=1024, win_len=1024, hop_len=512, n_erb=32, df_bins=96,
                    df_order=5, mask_lookahead=1, df_lookahead=1)
@@ -510,10 +504,10 @@ def test_analysis_scale_fold_is_bit_exact():
 
 
 def test_calibrator_calls_the_trainers_band_db_step():
-    """⚠ The calibrator fits init values FOR the trainer, so it must measure what
-    the trainer produces.  It used to transcribe the four lines and drifted twice
-    -- on the log floor and on the power expression.  It now calls the same
-    function, so this asserts the call rather than the text.
+    """⚠ The calibrator fits init values FOR the trainer, so it must measure
+    what the trainer produces.  It calls the same function, so a transcribed
+    copy cannot drift on the log floor or the power expression; this asserts
+    the call rather than the text.
     """
     source = (ROOT_PATH / 'calibrate_norm_init.py').read_text()
     assert 'erb_band_db(' in source, (
@@ -534,10 +528,10 @@ def test_calibrator_calls_the_trainers_band_db_step():
 def test_erb_power_uses_the_direct_form_through_the_real_feature_path():
     """Upstream computes re*re + im*im (lib.rs:291), not abs()**2.
 
-    ⚠ Asserts through extract_dfn3_features, not against a local re-implementation.
-    The previous version of this test built both expressions itself and compared
-    them, so it passed whichever form the trainer actually used -- mutation-proven:
-    reverting the trainer to abs().pow(2) left it green.
+    ⚠ Asserts through extract_dfn3_features, not against a local
+    re-implementation: a test that built both expressions itself would pass
+    whichever form the trainer used, while reverting the trainer to
+    abs().pow(2) fails this one.
     """
     torch.manual_seed(5)
     cfg = load_config()
@@ -581,12 +575,10 @@ def test_erb_power_uses_the_direct_form_through_the_real_feature_path():
 def test_squeezed_gru_skip_closes_over_the_raw_input():
     """⚠ Dormant at every call site, so only a direct construction reaches it.
 
-    Upstream's SqueezedGRU_S adds `gru_skip(input)` -- the raw argument -- after
-    linear_out (df/modules.py:732-738).  The port had `gru_skip(x)` where `x` had
-    already been rebound by linear_in, i.e. the squeezed activation.  All three
-    in-repo sites pass gru_skip_op=None, so no end-to-end test can see the
-    difference; mutation-proven that the whole suite stayed green with the wrong
-    wiring.
+    Upstream's SqueezedGRU_S adds `gru_skip(input)` -- the raw argument --
+    after linear_out (df/modules.py:732-738), not `gru_skip(x)` with `x`
+    already rebound by linear_in. All three in-repo sites pass
+    gru_skip_op=None, so no end-to-end test can see the difference.
     """
     torch.manual_seed(17)
     block = SqueezedGRU_S(
@@ -622,11 +614,11 @@ def test_squeezed_gru_skip_closes_over_the_raw_input():
 
 
 def test_emb_num_layers_one_fails_loudly_instead_of_building_two():
-    """The max(1, emb_num_layers - 1) clamp was removed to match upstream.
+    """Upstream's bare ``emb_num_layers - 1`` is kept (no max(1, ...) clamp).
 
-    ⚠ With the clamp, emb_num_layers=1 silently built 1 + 1 = 2 GRU layers while
-    the config said 1, breaking the total-depth invariant config.ini documents.
-    Upstream is a bare subtraction and nn.GRU rejects num_layers=0.
+    ⚠ A clamp would silently build 1 + 1 = 2 GRU layers for emb_num_layers=1
+    while the config says 1, breaking the total-depth invariant config.ini
+    documents; nn.GRU rejects num_layers=0.
     """
     cfg = load_config()
     with pytest.raises(ValueError, match='num_layers'):
@@ -692,7 +684,8 @@ def test_restored_checkpoint_loads_historical_v5_but_rejects_dfn2(tmp_path):
         'state_dict': model.state_dict(),
     }
     path = tmp_path / 'dfn3.pth'
-    # Historical v5 did not store the composition field. No arithmetic changed.
+    # A v5 checkpoint does not store the composition field; no arithmetic
+    # differs.
     historical = {**checkpoint, 'contract': {
         key: value for key, value in contract.items() if key != 'composition'}}
     torch.save(historical, path)

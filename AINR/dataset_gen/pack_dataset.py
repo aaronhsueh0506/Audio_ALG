@@ -189,17 +189,14 @@ def pack(args):
                 f"pack refused: cannot read WAV header {path}: {e}"
             ) from e
 
-    # Measured AFTER any --target-sr resample + clip-guard AND after the
-    # cast to the packed dtype -- not on the pre-cast float32
-    # tensor: a downsample does not exactly preserve the requested level/SNR
-    # (narrowband content is the worst case -- e.g. a 1 kHz-speech/12 kHz-
-    # noise pair generated at ~0 dB SNR measures ~48 dB after a 48k->16k
-    # downsample, since the noise energy above the new Nyquist is simply
-    # gone). This is the packed payload's own record of what a consumer
-    # ACTUALLY trains on, byte-for-byte, including any float16 rounding --
-    # see README.md's "48 kHz source, 16 kHz pack" section for the full
-    # caveat and when to prefer native generation instead
-    # (gen_dataset.py --sample-rate 16000) for exact fidelity.
+    # Measured AFTER any --target-sr resample + clip-guard AND after the cast
+    # to the packed dtype, not on the pre-cast float32 tensor: a downsample
+    # does not preserve the requested level/SNR exactly (narrowband content is
+    # the worst case: noise energy above the new Nyquist is simply gone). This
+    # is the packed payload's own record of what a consumer ACTUALLY trains on,
+    # including any float16 rounding; see README.md's "48 kHz source, 16 kHz
+    # pack" section, and prefer native generation (gen_dataset.py --sample-rate
+    # 16000) for exact fidelity.
     n_clip_guarded = 0
     header = {
         'sr': out_sr,

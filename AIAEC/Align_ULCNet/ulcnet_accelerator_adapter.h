@@ -19,22 +19,16 @@ typedef int (*UlcnetAcceleratorRun)(
 
 typedef struct UlcnetAcceleratorAdapter UlcnetAcceleratorAdapter;
 
-/* Includes the adapter and every CPU-owned K/V, logit and GRU state tensor.
- * The descriptor is the exported graph contract, including export-time D. */
+/* Adapter plus every CPU-owned K/V, logit and GRU state tensor. The descriptor
+ * is the exported graph contract, including the export-time delay depth D. */
 int ulcnet_accelerator_adapter_get_mem_size(
     const UlcnetModelIoDescriptor *descriptor,
     size_t *bytes,
     size_t *alignment);
 
-/* Initialize from the same descriptor published beside the ONNX graph.
- * Production validation requires the fixed raw-far contract. */
-/* Board integrators: the descriptor's delay_depth MUST equal the delay depth
- * the ONNX graph was exported with. Nothing verifies that -- the validator
- * only bounds-checks the range, and no C code here reads the model's metadata
- * -- and a mismatch is silent: the host windows are carved from the descriptor
- * while the runtime reads and writes the graph's shapes. There is no
- * exporter-generated descriptor header yet; populate it from the exported
- * model's own recorded depth. */
+/* Initialize from the descriptor published beside the ONNX graph (fixed raw-far
+ * contract). descriptor.delay_depth MUST equal the depth the graph was exported
+ * with; it is only range-checked. */
 UlcnetAcceleratorAdapter *ulcnet_accelerator_adapter_init(
     void *memory,
     size_t bytes,
@@ -42,22 +36,19 @@ UlcnetAcceleratorAdapter *ulcnet_accelerator_adapter_init(
     UlcnetAcceleratorRun run,
     void *run_user);
 
-/* Restart counter of the adapter's state tensors: it advances when the state
- * is reset or a refused frame zeroed it (ulcnet_prepost_state_generation).
- * A board with a fixed-point accelerator state refills it with quantized
- * zeros whenever the value changed. 0 for a NULL adapter. */
+/* Restart counter of the state tensors: advances on reset or when a refused
+ * frame zeroed the state. A fixed-point accelerator refills its state with
+ * quantized zeros whenever it changes. 0 for a NULL adapter. */
 uint32_t ulcnet_accelerator_adapter_state_generation(
     const UlcnetAcceleratorAdapter *adapter);
 
-/* The compiled model-I/O contract of this adapter's state, for a board
- * comparing it against the ONNX metadata it loaded. Valid for the adapter's
- * lifetime; NULL for a NULL adapter. */
+/* Compiled model-I/O contract, for comparison with the loaded ONNX metadata.
+ * Valid for the adapter's lifetime; NULL for a NULL adapter. */
 const UlcnetModelIoDescriptor *ulcnet_accelerator_adapter_descriptor(
     const UlcnetAcceleratorAdapter *adapter);
 
-/* UlcnetModel is copied into the mono/4ch pipeline, WITH a pointer to the
- * descriptor above. The adapter and its caller-owned pool must therefore
- * outlive that pipeline instance. */
+/* UlcnetModel is copied into the pipeline together with a pointer to the
+ * descriptor; the adapter and its pool must outlive that pipeline. */
 UlcnetModel ulcnet_accelerator_adapter_model(UlcnetAcceleratorAdapter *adapter);
 
 #ifdef __cplusplus

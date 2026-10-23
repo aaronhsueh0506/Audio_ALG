@@ -130,14 +130,11 @@ static void test_projection_kernels(void) {
               sizeof(residual_scalar)) == 0,
           "residual projection SIMD matches scalar bytes");
 
-    /* The kernel's actual contract: |out|^2 == max(r2, 0), with echo
-     * supplying phase only. The byte-equality check above cannot see this --
-     * scalar and SIMD agree just as happily on a wrong magnitude -- and the
-     * magnitudes seeded at the top of this function (r2 ~ 1e-5, echo ~ 1e-3)
-     * are nowhere near production, where r2 arrives int16^2-scaled (~1e11)
-     * against an audio-scaled echo (~1e-2). A bound on the intermediate
-     * sqrt(r2/|echo|^2) is invisible at test magnitudes and clamps most bins
-     * at real ones, so this asserts the identity at the levels that matter. */
+    /* The kernel's contract: |out|^2 == max(r2, 0), with echo supplying phase only. The
+     * byte-equality check above cannot see a wrong magnitude (scalar and SIMD agree on it),
+     * and the seed magnitudes (r2 ~ 1e-5, echo ~ 1e-3) are far from production, where r2 is
+     * int16^2-scaled (~1e11) against an audio-scaled echo (~1e-2); so the identity is
+     * asserted at the production levels. */
     {
         Complex prod_echo[N];
         float prod_r2[N];
@@ -864,12 +861,10 @@ static void run_static_parity(int sample_rate, int fft_size) {
           "static init_ex rejects a stale layout even when its cached "
           "bytes are larger than current (byte count fitting must never "
           "substitute for layout/hash agreement)");
-    /* The immediately superseded version spelled out, not `current - 1`: a
-     * descriptor persisted by that build carries exactly this number, and its
-     * byte count is left at the CURRENT figure so the only thing wrong with
-     * it is the layout. A control-block-only growth moves no carve token, so
-     * build_flags_hash still matches and this counter is the whole signal.
-     * Bump this literal with FOUR_AEC_NR_RES_LAYOUT_VERSION. */
+    /* A descriptor from an older layout, with the current byte count so the layout is the only
+     * mismatch. A control-block-only growth moves no carve token, so build_flags_hash still
+     * matches and the layout counter is the whole signal. Keep the literals in step with
+     * FOUR_AEC_NR_RES_LAYOUT_VERSION. */
     stale = req;
     stale.layout_version = 20u;
     CHECK(four_aec_nr_res_init_ex(
@@ -970,19 +965,12 @@ cleanup:
     free(pool);
 }
 
-/* The WOLA identity below has to be measured ACROSS a realign boundary, so
- * its scene is a delayed echo that MOVES rather than the zero-delay tone the
- * rest of the file uses: `changed` on a zero-delay scene realigns by a delta
- * of 0, which aec_apply_external_realign() answers as a no-op, and nothing
- * about seam continuity would have been exercised. `history` holds
- * WOLA_SCENE_PAD samples of pre-roll so the echo is valid from the first
- * streamed sample.
- *
- * The run is long because the second boundary is a RE-lock: the shared
- * matched filter is duty-cycled, so the estimator answers a movement after a
- * number of ANALYSED hops, and the coarsest grid here (48 kHz, hop 512)
- * decimates hardest. The scene has to outlast that, or the identity would
- * only ever be measured across the acquisition. */
+/* The WOLA identity below is measured across a realign boundary, so the scene is a delayed
+ * echo that MOVES: on a zero-delay scene `changed` realigns by a delta of 0, which
+ * aec_apply_external_realign() treats as a no-op. `history` holds WOLA_SCENE_PAD samples of
+ * pre-roll so the echo is valid from the first sample. The run is long because the second
+ * boundary is a re-lock and the shared matched filter is duty-cycled (coarsest grid:
+ * 48 kHz, hop 512), so the scene has to outlast the decimated analysis. */
 #define WOLA_SCENE_PAD   16384
 #define WOLA_SHIFT_HOP   150
 #define WOLA_SCENE_HOPS  3000
@@ -1144,24 +1132,12 @@ cleanup:
     four_aec_nr_res_destroy(pipeline);
 }
 
-/* Group 6: lane 0 runs its own far-end FFT every hop; lanes 1-3 borrow it
- * via aec_process_context_shared_far() instead of each recomputing an
- * identical transform. Proves the total (four_aec_nr_res_far_fft_real_
- * compute_count(), summed across all four lanes) increases by AT MOST 1
- * per four_aec_front_process() call, never 4 -- the actual, measured
- * consequence of the sharing, not just "the code compiles and still
- * produces plausible output" (already covered by run_grid()'s finite-
- * output checks and the byte-equal WAV/raw-f32 gates run outside this
- * suite).
- *
- * "At most 1", not "exactly 1": four_aec_front_process() resets all four lanes
- * (aec_reset(), which also zeroes this counter) whenever the shared delay
- * estimator's estimate changes -- expected behavior during the synthetic
- * signal's initial delay-acquisition hops (the total visibly drops back down
- * before climbing again). A drop is fine; the one invariant
- * that must never break is the total never jumping by MORE than 1 in a
- * single call, which is exactly what "lanes 1-3 silently stopped sharing
- * and went back to computing their own FFT" would look like. */
+/* Group 6: lane 0 runs its own far-end FFT every hop; lanes 1-3 borrow it via
+ * aec_process_context_shared_far(). The total (four_aec_nr_res_far_fft_real_compute_count(),
+ * summed over the four lanes) must rise by at most 1 per four_aec_front_process() call,
+ * never 4. "At most", not "exactly": the call resets all four lanes (zeroing the counter)
+ * whenever the shared delay estimate changes, e.g. during initial acquisition. A drop is
+ * fine; a jump by more than 1 would mean lanes 1-3 stopped sharing. */
 static void test_far_fft_sharing_reduces_four_to_one(
         int sample_rate, int fft_size) {
     FourAecNrResConfig cfg;
@@ -1333,29 +1309,18 @@ cleanup:
 }
 
 /* ============================================================================
- * Known-delay profile verification (product delay gate, NOT an audio-quality
- * run).
- *
- * Everything here is driven by a SYNTHESISED echo whose bulk delay is known
- * exactly, so every claim is checked against ground truth instead of against
- * a score. Four questions:
- *
- *   acquisition  Does each bank size acquire the delays it is supposed to
- *                cover, how fast, and how accurately?
- *   coverage     Does the reliable-range contract per n actually hold at the
- *                boundary -- locks just inside, does NOT lock just outside?
- *   mislock      When the true bulk delay is beyond the bank's reach, is the
- *                failure DETECTABLE? (It is not detectable from the seam.)
- *   cost         Pool bytes vs n, and a rough per-hop CPU figure.
+ * Known-delay profile check (product delay gate, not an audio-quality run): a synthesised
+ * echo with an exactly known bulk delay, checked against ground truth for acquisition
+ * (each bank size acquires the delays it should, how fast and how accurately), coverage
+ * (the reliable range per n holds at its boundary), mislock (a delay beyond the bank's
+ * reach is detectable only against ground truth, not from the seam) and cost.
  * ========================================================================== */
 
-/* Reliable bulk-delay search ceiling for a bank of n matched filters, in
- * native 16 kHz samples, spelled with lib/aec's own constants: the ring
- * holds (n-1)*DA_FILTER_INTRA_SHIFT + (DA_FILTER_SIZE - 11) DOWNSAMPLED
- * samples of reach (the -11 is the `lag < filter_size - 10` reliability
- * cut), and one downsampled sample is DA_DOWN_SAMPLING_FACTOR native
- * samples (0.25 ms at 16 kHz). That is the 125/221/317/413/509 ms table in
- * the plan, derived rather than copied as five literals. */
+/* Reliable bulk-delay search ceiling for a bank of n matched filters, in native 16 kHz
+ * samples, from lib/aec's own constants: the ring reaches (n-1)*DA_FILTER_INTRA_SHIFT +
+ * (DA_FILTER_SIZE - 11) downsampled samples (the -11 is the `lag < filter_size - 10`
+ * reliability cut), and one downsampled sample is DA_DOWN_SAMPLING_FACTOR native samples
+ * (0.25 ms at 16 kHz). For n = 1..5 that is 125/221/317/413/509 ms. */
 #define KD_RELIABLE_SAMPLES(n) \
     (((n) - 1) * DA_FILTER_INTRA_SHIFT * DA_DOWN_SAMPLING_FACTOR + \
      (DA_FILTER_SIZE - 11) * DA_DOWN_SAMPLING_FACTOR)
@@ -1435,22 +1400,14 @@ static void known_delay_run(int num_filters, int hops,
         }
         if (four_aec_front_process(p, mic, far, &pre) !=
             FOUR_AEC_NR_RES_OK) break;
-        /* The published `solid` must be exactly "a usable accepted alignment
-         * generation exists", recomputed here from the OTHER published
-         * estimator fields rather than read back from `solid` itself:
-         * confidence >= 1.0 IS delay_aec_is_solid(), estimator_updates IS
-         * delay_aec_n_updates(), and the remaining acceptance term
-         * (estimated >= 0) is implied by confidence >= 1.0 -- a confidence
-         * above 0 requires a produced estimate, and a produced estimate is
-         * never negative. Sticky, because a confidence dip must not retract
-         * an alignment the audio path is still applying.
-         *
-         * MUTATIONS: publishing `solid` on COARSE confidence (`state.solid =
-         * now_usable || delay_aec_confidence(...) >= 0.5f`) makes it lead
-         * the accepted delay and BOTH counters below go non-zero; widening
-         * the wrapper's own `n_updates >= 3` acceptance term (e.g. to 30)
-         * makes it lag instead, and solid_disagreements alone goes
-         * non-zero. */
+        /* The published `solid` must be exactly "a usable accepted alignment generation exists",
+         * recomputed from the other published estimator fields (confidence >= 1.0 is
+         * delay_aec_is_solid(), estimator_updates is delay_aec_n_updates(); the remaining term,
+         * estimated >= 0, is implied by confidence >= 1.0). Sticky: a confidence dip must not
+         * retract an alignment still applied.
+         * MUTATIONS: publishing `solid` on COARSE confidence makes it lead the accepted delay and
+         * both counters go non-zero; widening the wrapper's `n_updates >= 3` term makes it lag and
+         * solid_disagreements alone goes non-zero. */
         if (pre.delay.changed) {
             out->changed_events += 1;
             if (out->first_changed_hop < 0) out->first_changed_hop = hop;
@@ -1559,18 +1516,12 @@ static void test_known_delay_acquisition_and_coverage(void) {
     }
 }
 
-/* An out-of-range bulk delay is NOT always a clean "never locks". Add any
- * in-range echo component -- an early reflection, a second speaker path, a
- * codec artefact -- and the estimator locks onto THAT with full confidence
- * while the dominant path stays unmodelled far outside the filter's reach.
- * This reproduces, synthetically, the recording that exposed the n=5 ceiling:
- * a dominant path at 579.44 ms and a confident lock at ~32 ms.
- *
- * This test does NOT bless that behaviour. It pins the property a product
- * delay gate has to be built around: the seam cannot see the error (solid=1,
- * confidence=1.0, exactly as for a correct lock), so the ONLY thing that
- * catches it is comparing the applied delay against an independently known
- * ground-truth delay. That comparison is the check being asserted here. */
+/* An out-of-range bulk delay is not always a clean "never locks": with any in-range echo
+ * component (early reflection, second speaker path) the estimator locks onto THAT with full
+ * confidence while the dominant path stays unmodelled. This reproduces a dominant path at
+ * 579.44 ms with a confident lock at ~32 ms. The seam cannot see the error (solid=1,
+ * confidence=1.0, as for a correct lock), so what is asserted is the applied delay against
+ * an independently known ground-truth delay. */
 static void test_known_delay_mislock_is_detectable(void) {
     KnownDelayRun mislock, control;
     const int dominant = 9271;      /* 579.44 ms -- beyond every bank */
@@ -1617,10 +1568,9 @@ static void test_known_delay_mislock_is_detectable(void) {
           3536 - control.applied_delay <= KD_MAX_UNDERSHOOT, label);
 }
 
-/* Plan §8.6: report the 4ch numbers by CALLING the 4ch queries. n drives the
- * ONE shared estimator in the wrapper; the four lanes are EXTERNAL_ALIGNED
- * and must not move with it, so the mono "5,728 B per filter per AEC
- * instance" contract must NOT be multiplied by four here. */
+/* Report the 4ch numbers by calling the 4ch queries. n drives the one shared estimator; the
+ * four lanes are EXTERNAL_ALIGNED and must not move with it, so the mono "5,728 B per
+ * filter per AEC instance" contract is not multiplied by four here. */
 static void test_known_delay_memory_and_cost(void) {
     FourAecNrResMemBreakdown b[6];
     FourAecNrResMemReq req[6];
@@ -1699,26 +1649,13 @@ static void test_known_delay_memory_and_cost(void) {
     CHECK(cost.us_per_hop > 0.0 && cost.us_per_hop < 16000.0, label);
 }
 
-/* ============================================================================
- * Shared-delay change admission and the four-lane realign sweep
- *
- * A published `changed` sweeps aec_apply_external_realign() over all four
- * lanes: an IR shift, plus (when the alignment retards) a far-history clear,
- * on every one of them. What the rows below pin is that the sweep happens on
- * exactly the hops it should, sized exactly four, and that the applied
- * alignment and the sweep are one event -- the delay may never move on a hop
- * that publishes no `changed`, or the lanes would be handed a reference
- * shifted out from under filters nothing had realigned.
- *
- * Two things absorb movement before the lanes ever see it, and they sit at
- * different scales:
- *   - DelayAec publishes on a 16-downsampled-sample grid (64 native samples
- *     at 16 kHz), so a bulk-delay wander finer than that never reaches the
- *     wrapper at all -- the WANDER row measures that end of the seam;
- *   - the wrapper's own admission (> 32 samples AND repeated within 16 on the
- *     next eligible hop) then holds every movement for one hop before it can
- *     spend a sweep -- the MOVING and SHIFT rows measure that end.
- * ========================================================================== */
+/* Shared-delay change admission and the four-lane realign sweep. A published `changed`
+ * sweeps aec_apply_external_realign() over all four lanes; the rows pin that the sweep
+ * happens on exactly the hops it should, sized four, and that the applied alignment and
+ * the sweep are one event (the delay never moves on a hop without `changed`). Movement is
+ * absorbed at two scales: DelayAec publishes on a 16-downsampled-sample grid (64 native
+ * samples at 16 kHz), measured by the WANDER row; the wrapper's admission (> 32 samples,
+ * repeated within 16) holds every movement for one hop, measured by MOVING and SHIFT. */
 
 typedef struct RealignRun {
     int acquisition_hop;        /* first `changed` (the acquisition)         */
@@ -1761,15 +1698,11 @@ static void realign_scene_hop(const float* far_hist, int base, int hop_len,
     }
 }
 
-/* Drives one 16 kHz/hop-256 MATCHED scene and reports what the shared
- * alignment did. The echo is a single path at `delay_a`, except:
- *   second_gain > 0  adds a SIMULTANEOUS second path at delay_b (an
- *                    ambiguous scene: the estimator's peak moves between the
- *                    two on its own, which is what real jitter looks like at
- *                    this seam);
- *   shift_at >= 0    moves the single path to delay_b from that hop on;
- *   wander_hops > 0  alternates the single path between delay_a and delay_b
- *                    every wander_hops hops. */
+/* Drives one 16 kHz/hop-256 MATCHED scene and reports what the shared alignment did: a
+ * single echo path at `delay_a`, except that second_gain > 0 adds a simultaneous second
+ * path at delay_b (an ambiguous scene whose peak moves on its own, like real jitter),
+ * shift_at >= 0 moves the path to delay_b from that hop on, and wander_hops > 0 alternates
+ * it between delay_a and delay_b every wander_hops hops. */
 static void realign_run(int hops, int delay_a, int delay_b, float second_gain,
                         int shift_at, int wander_hops, RealignRun* out) {
     enum { RA_HOP = 256, RA_PAD = 16384 };
@@ -1823,7 +1756,7 @@ static void realign_run(int hops, int delay_a, int delay_b, float second_gain,
                 /* The candidate must have been HELD on the previous hop and
                  * must be the value applied: that pair is the whole
                  * two-step rule, and it is what disappears if acceptance
-                 * moves back to the first sighting. */
+                 * happens on the first sighting. */
                 if (previous_pending < 0 ||
                     abs(previous_pending - pre.delay.delay_samples) >= 16)
                     out->unconfirmed_changes += 1;
@@ -1873,15 +1806,11 @@ static void test_shared_delay_change_admission(void) {
              wander.warm, wander.soft, wander.warm + wander.soft);
     CHECK(wander.warm + wander.soft == FOUR_AEC_NR_RES_CHANNELS, label);
 
-    /* MOVING: the echo path really does travel, 512 <-> 1024 samples in
-     * 400-hop blocks, so the shared estimate moves several times over the run
-     * -- and every move is far larger than the admission band, which is what
-     * a movement the lanes SHOULD follow looks like. This is the row that
-     * makes the two-step rule falsifiable: a single-generation scene would
-     * pass the hold assertions for free. The blocks are long and so is the
-     * run: the shared matched filter is duty-cycled, so each re-lock costs a
-     * number of ANALYSED hops, and a scene that switched faster than that
-     * would simply never move the estimate. */
+    /* MOVING: the echo path travels 512 <-> 1024 samples in 400-hop blocks, so the shared
+     * estimate moves several times, each move far larger than the admission band. This row
+     * makes the two-step rule falsifiable (a single-generation scene would pass the hold
+     * assertions for free). Blocks and run are long because the matched filter is
+     * duty-cycled: each re-lock costs a number of analysed hops. */
     realign_run(2400, 512, 1024, 0.0f, -1, 400, &moving);
     printf("shared-delay admission: 512<->1024 in 400-hop blocks -> acquired "
            "hop %d, %d later generations, %d holds, applied %d, %ld warm + "
@@ -1952,16 +1881,12 @@ static void test_shared_delay_change_admission(void) {
 }
 
 /* ============================================================================
- * Held-candidate lifetime
- *
- * The admission state machine is driven directly here. Through a stream it
- * cannot be: DelayAec re-offers a movement on every hop once it has one, so
- * the candidate is always resolved on the very next eligible hop and its TTL
- * never runs out -- the same reason the expiry rule exists at all is the
- * reason a synthetic scene cannot exercise it. What a scene DOES cover (a
- * candidate is really held, and really spends a realign when confirmed) is
- * asserted in test_shared_delay_change_admission() above; the reset row below
- * closes the loop by clearing a candidate that a real stream produced.
+ * Held-candidate lifetime. The admission state machine is driven directly: through a
+ * stream DelayAec re-offers a movement every hop, so the candidate is resolved on the next
+ * eligible hop and its TTL never runs out. What a scene does cover (a candidate is really
+ * held and spends a realign when confirmed) is asserted in
+ * test_shared_delay_change_admission(); the reset row below clears a candidate that a real
+ * stream produced.
  * ========================================================================== */
 
 /* One hop, spent the way update_shared_delay() spends it: the held candidate
@@ -2095,15 +2020,10 @@ static void test_delay_change_candidate_ttl(void) {
 
 
 /* ============================================================================
- * Runtime strength control
- *
- * The load-bearing property: the four lanes run with spatial_linear_context
- * and therefore never reach their own residual suppressor. A preset change
- * pushed at them is a provable no-op, so this core's setter has to move the
- * SHARED post-stage suppressor (the AecRes), and the retargeted floor has to
- * survive a reset. A setter that updated only the live floor would work until
- * the first reset and then silently revert, which is exactly what test 3
- * below pins.
+ * Runtime strength control. The lanes run with spatial_linear_context and never reach their
+ * own residual suppressor, so a preset change pushed at them is a no-op: the setter must
+ * move the shared post-stage suppressor (the AecRes), and the retargeted floor must survive
+ * a reset (test 3 below).
  * ========================================================================== */
 
 /* Drives `hops` hops of the shared strength/timing stimulus. When
@@ -2254,15 +2174,12 @@ static void duty_run(int hops, int delay_a, int delay_b, int shift_at,
             FOUR_AEC_NR_RES_OK) break;
         out->hops_seen += 1;
 
-        /* The watchdog's steady decay branch, reconstructed. A DECREASE is
-         * the branch's signature -- arming jumps the peak to the current lane
-         * ERLE and a rise re-seeds it from the same -- with one other way
-         * down: a trip zeroes it outright, which is excluded by its own
-         * value rather than by a threshold (measured on the moved scene:
-         * 15.50 -> 0 at hop 312, the one hop this scene's watchdog fires).
-         * Compared with == because it is the identical float subtraction, so
-         * anything else means the branch subtracted a different number than
-         * the core converted. */
+        /* The watchdog's steady decay branch, reconstructed. A decrease is its signature (arming
+         * jumps the peak to the current lane ERLE and a rise re-seeds it); the other way down,
+         * a trip, zeroes the peak outright and is excluded by its value (15.50 -> 0 at hop 312
+         * on the moved scene). Compared with == because it is the identical float subtraction:
+         * anything else means the branch subtracted a different number than the core
+         * converted. */
         {
             float peak_after = four_aec_nr_res_duty_erle_peak(p);
             if (peak_after < peak_before && peak_after != 0.0f) {
@@ -2413,17 +2330,11 @@ static void test_duty_cycle_machine(void) {
           moved.census_total_mismatch == 0 &&
           moved.updates_on_skipped_hop == 0, label);
 
-    /* The watchdog subtracts the CONVERTED leak, not the authored per-hop
-     * literal. test_duty_watchdog_leak_is_a_rate pins the value the core
-     * STORES; this is the other half -- that the branch READS it -- and it is
-     * the only assertion in the file that a use site reverted to
-     * DUTY_ERLE_LEAK_DB turns red.
-     *
-     * The MOVED scene is where the decay lives. The static one never reaches
-     * the branch at all: its lanes converge monotonically, so the peak is
-     * re-seeded from a rising ERLE on every armed hop and never decays --
-     * which is why coverage is asserted on the moved scene only, and stated
-     * rather than left to look like an oversight. */
+    /* The watchdog subtracts the CONVERTED leak, not the authored per-hop literal.
+     * test_duty_watchdog_leak_is_a_rate pins the value the core stores; this pins that the
+     * branch reads it (the only assertion that goes red if a use site reverts to
+     * DUTY_ERLE_LEAK_DB). The decay lives on the MOVED scene; on the static one the lanes
+     * converge monotonically, so the peak is re-seeded from a rising ERLE and never decays. */
     snprintf(label, sizeof(label),
              "the watchdog subtracts the converted leak on every decay hop "
              "(%d decay hops, %d subtracted something else; static scene "
@@ -2523,26 +2434,12 @@ static void test_duty_cycle_machine(void) {
 }
 
 /* ============================================================================
- * The watchdog leak is a RATE, not a per-hop amount
- *
- * The duty machine's two windows are converted from seconds at init. Its
- * collapse depth needs no conversion -- it is dB. Its LEAK does: 0.001 dB per
- * hop is 0.1 dB per SECOND only on the 10 ms hop lib/aec calibrated it on,
- * and this pipeline builds no such grid. Used as a literal it would be
- * 0.125 dB/s at 16 kHz/256 and 0.0625 dB/s at 16 kHz/512 -- the watchdog
- * disengaging the schedule on a quiet stretch at one grid and sitting on a
- * stale peak at the other.
- *
- * Asserted as the rate, at all three grids the pipeline ships, so the target
- * is one number rather than three. None of the three IS the calibration grid
- * (8 / 16 / 10.667 ms hops), so there is no row where "converted" and "left
- * as the literal" agree: reverting the conversion turns all three red.
- *
- * The calibration grid itself cannot be built here -- hop 160 at 16 kHz is a
- * 320-sample frame this pipeline does not accept -- so the identity that
- * makes this a retime rather than a retune is asserted against the pure
- * conversion, bit-for-bit, and the per-grid rows tie what the core actually
- * stored back to that same conversion.
+ * The watchdog leak is a RATE, not a per-hop amount: the duty machine's windows convert
+ * from seconds at init, and so must its leak (0.001 dB/hop is 0.1 dB/s only on the 10 ms
+ * hop lib/aec calibrated it on). Asserted as the rate at all three shipped grids, none of
+ * which is the calibration grid, so reverting the conversion turns all rows red. The
+ * calibration grid cannot be built here (hop 160 at 16 kHz), so the retime identity is
+ * asserted against the pure conversion bit for bit.
  * ========================================================================== */
 /* The authored per-hop amount, restated here because the core keeps it
  * file-local -- same reason LE_ERLE_COLLAPSE_DB is restated further down. A
@@ -2644,40 +2541,14 @@ static void test_duty_watchdog_leak_is_a_rate(void) {
  * Duty cycle vs a delay change the watchdog cannot see
  * ========================================================================== */
 
-/* test_duty_cycle_machine's MOVED scene cancels well, so its ERLE watchdog
- * arms and then fires, and the machine is back at full rate within a few tens
- * of hops. This is the other half of the contract -- the boundary the core's
- * own doc comment names, measured instead of asserted in prose.
- *
- * Here cancellation is deliberately poor: the echo is the same single path,
- * but an independent near-end noise of comparable power sits on every
- * microphone, so the best a lane can do is remove the echo and leave the
- * noise. That caps lane ERLE near 3 dB, and the watchdog is armed only once
- * its running peak EXCEEDS DUTY_ERLE_COLLAPSE_DB (6 dB) -- so in this scene
- * it provably never arms, cannot fire, and the 1-in-K analysis schedule is
- * the WHOLE re-lock mechanism. The same scene is driven twice, once with the
- * schedule pinned at full rate through four_aec_nr_res_pin_duty_full_rate()
- * and once with the throttle opted into via cfg.delay_est_period_s (the
- * default is already full rate -- an embedded
- * deployment that wants this scene's compute saving back has to ask for the
- * throttle explicitly, the same way the C port's own cfg.delay_est_period_s
- * works), and the two re-lock latencies are printed side by side.
- *
- * This is a CHARACTERIZATION: the numbers below are measured, not derived,
- * and they exist so a change that makes the gap WORSE fails here instead of
- * being discovered on a board. K is 6 on this grid because
- * cfg.delay_est_period_s is set to 0.5 s and the hop is 16 ms
- * (round(0.5/0.016)/5 = 6); a retune of that field, or of low_erle_run()'s
- * own opt-in value, moves K and is SUPPOSED to land here as a red test that
- * has to be re-measured.
- *
- * One non-obvious property, spelled out because the assertions below are
- * shaped around it: removing the estimate-moved disengage entirely does NOT
- * move either re-lock latency here -- both arms still re-lock on the same
- * hop. That rule fires only once the matched filter has ALREADY found the
- * new peak, so it shortens nothing in this scene, and the census check
- * further down is what holds it, not the latency bound. Widening K, by
- * contrast, stops the duty arm re-locking inside the scene at all. */
+/* The counterpart of test_duty_cycle_machine's MOVED scene (good cancellation, watchdog
+ * fires): here near-end noise of comparable power on every microphone caps lane ERLE near
+ * 3 dB, below DUTY_ERLE_COLLAPSE_DB (6 dB), so the watchdog never arms and the 1-in-K
+ * schedule is the whole re-lock mechanism. The scene runs with the schedule pinned at full
+ * rate (four_aec_nr_res_pin_duty_full_rate()) and with the throttle opted into via
+ * cfg.delay_est_period_s (K = 6 here: round(0.5/0.016)/5). The numbers are measured, so a
+ * change that widens the gap fails here. The estimate-moved disengage shortens neither
+ * latency (it fires after the matched filter found the new peak); the census check holds it. */
 
 #define LE_HOP              256
 #define LE_PAD              32768
@@ -3018,27 +2889,14 @@ static void test_far_spec_provenance_guard(void) {
 }
 
 
-/* A hop on which some lanes realign warm and others soft must give EVERY lane
- * its own far spectrum. A soft realign zeroes that lane's far-analysis
- * history (far_buffer) while a warm one keeps it, so the lanes' analysis
- * frames differ on that hop and the spectrum lane 0 computes is wrong for the
- * lanes whose history was reset. Borrowing it anyway leaves no trace on the
- * hop itself (a freshly reset filter has zero taps, so its error equals its
- * near input whatever far spectrum it was handed); the wrong spectrum is
- * pushed into the lane's partition history and corrupts the echo estimate and
- * the adaptation of the hops that follow. So the reference here is four
- * stand-alone lanes built from the core's own lane configuration, fed the
- * same microphones, the same aligned far and the same realign deltas, and
- * always processed through the ordinary local-far path (aec_process_context);
- * the core's lanes must match them bit for bit on every hop, and the far-FFT
- * counter must read 4 on the mixed hop and 1 on every other hop.
- *
- * The scene makes the mix happen on its own: lanes 0 and 1 carry a
- * two-path echo of the render, so they are still cancelling when the shared
- * alignment swings from the weaker path to the stronger one (warm tap
- * transfer), while lanes 2 and 3 carry unrelated noise that no filter can
- * cancel (filter-only reset). Both echo paths sit inside the filters' tap
- * span, which is what keeps the echo lanes cancelling through the swing. */
+/* A hop on which some lanes realign warm and others soft must give every lane its own far
+ * spectrum: a soft realign zeroes that lane's far_buffer history, a warm one keeps it, so
+ * lane 0's spectrum is wrong for the reset lanes. Borrowing it leaves no trace on the hop
+ * itself (a fresh filter has zero taps) but corrupts later adaptation. The reference is four
+ * stand-alone lanes through the ordinary local-far path (aec_process_context) with the same
+ * inputs and realign deltas; the core's lanes must match bit for bit, and the far-FFT counter
+ * must read 4 on the mixed hop and 1 otherwise. Lanes 0-1 carry a two-path echo (warm
+ * transfer on the swing), lanes 2-3 unrelated noise (filter-only reset). */
 typedef struct MixedHopRun {
     int hops_run;
     int mixed_hops;              /* hops with both warm and soft lane realigns */
@@ -3299,19 +3157,12 @@ static void synth_echo_hop(int h, int hop, float* mics, float* far,
     }
 }
 
-/* The NR-disabled post path must apply EXACTLY the RES gain, with no scaling
- * of its own. total_gain is not readable from outside, but the identity still
- * has an external witness: MMSE-LSA PASSES THROUGH -- gain == 1.0 in every
- * bin -- for its first num_init_frames hops, and min(1.0, res_gain) IS
- * res_gain. So over that window an NR-enabled and an NR-disabled instance fed
- * the same stimulus must emit the same samples, bit for bit.
- *
- * All three assertions are load-bearing. Without the equality, a wrong
- * constant on the RES-only branch passes every structural row in
- * test_nr_bypass(). Without the non-zero check the equality would hold
- * trivially on a silent output. Without the later divergence it would also
- * hold for a denoiser that never shapes anything, which would make the first
- * assertion prove nothing about the bypass. */
+/* The NR-disabled post path must apply exactly the RES gain with no scaling of its own.
+ * MMSE-LSA passes through (gain == 1.0 in every bin) for its first num_init_frames hops,
+ * and min(1.0, res_gain) is res_gain, so over that window an NR-enabled and an NR-disabled
+ * instance fed the same stimulus must emit the same samples bit for bit. Also asserted: a
+ * non-zero output (the equality would hold trivially on silence) and a later divergence (a
+ * denoiser that never shapes anything would make the equality prove nothing). */
 static void test_nr_bypass_output_identity(void) {
     FourAecNrResConfig on_cfg = four_aec_nr_res_default_config(16000);
     FourAecNrResConfig off_cfg = on_cfg;
@@ -3395,16 +3246,12 @@ static void test_nr_bypass_output_identity(void) {
     conv_destroy(off);
 }
 
-/* With RES, NR and CNG all disabled the post path has no gain source left,
- * so the core must be a transparent synthesis of the beamformed linear
- * error. That is checkable from outside: with identity weights on lane 0
- * the fused error is lane 0's analysis spectrum, whose underlying time-domain
- * hop the front end hands out as formed_hop[0], and a sqrt-Hann WOLA round
- * trip reconstructs the previous hop of that stream to float precision. A
- * RES-only branch that applied anything of its own would break the identity;
- * the default core on the same stimulus must NOT satisfy it, or the identity
- * would be proving nothing about the switch. Structural rows: no suppressor
- * is built. */
+/* With RES, NR and CNG all disabled the post path has no gain source, so the core must be
+ * a transparent synthesis of the beamformed linear error: with identity weights on lane 0
+ * the fused error is lane 0's analysis spectrum, and a sqrt-Hann WOLA round trip
+ * reconstructs the previous hop of formed_hop[0] to float precision. The default core on
+ * the same stimulus must not satisfy it, or the identity proves nothing about the switch.
+ * Structural rows: no suppressor is built. */
 static void test_res_bypass_passthrough(void) {
     FourAecNrResConfig def_cfg = four_aec_nr_res_default_config(16000);
     FourAecNrResConfig off_cfg = def_cfg;
@@ -3511,7 +3358,7 @@ static void test_stage_timing(void) {
     feed_strength_hops(p, 34, &pre_wall_us, &post_wall_us);
     four_aec_nr_res_get_last_timing(p, &t);
 
-    /* ⚠ Written so it can FAIL: four AEC lanes each run a main filter, a
+    /* Written so it can fail: four AEC lanes each run a main filter, a
      * pre-filter stage and a post/RES block over a full hop, and the shared
      * five-filter matched estimator runs once -- none of those can cost under
      * a microsecond, so a zero anywhere here means that window never ran.
@@ -3585,14 +3432,12 @@ static void test_stage_timing(void) {
            t.fuse_us, post_wall_us);
 }
 
-/* Comfort noise fills the AEC-suppressed bins from lib/aec's own recipe: an
- * LCG step per bin whose top five bits index kCngTable, the
- * imaginary part reading a quarter turn (+8 of 32) ahead of the real one.
- * What the injected noise owes the caller is bounded samples, the same
- * expected per-bin power as the unit-variance Gaussian pair, and a sequence that advances -- not one fixed sample stream, so
- * nothing here pins output bytes. The pipeline half differences a CNG-on run
- * against a byte-identical CNG-off one; comfort noise is added after every
- * gain, so that difference is the injected noise and nothing else. */
+/* Comfort noise fills the AEC-suppressed bins from lib/aec's recipe: an LCG step per bin
+ * whose top five bits index kCngTable, the imaginary part a quarter turn (+8 of 32) ahead
+ * of the real one. The injected noise owes the caller bounded samples, the same expected
+ * per-bin power as the unit-variance Gaussian pair and an advancing sequence; no output
+ * bytes are pinned. The pipeline half differences a CNG-on run against a byte-identical
+ * CNG-off one: comfort noise is added after every gain, so the difference is the noise. */
 static void test_comfort_noise_contract(void) {
     FourAecNrResConfig on = four_aec_nr_res_default_config(16000);
     FourAecNrResConfig off = four_aec_nr_res_default_config(16000);
@@ -3744,25 +3589,11 @@ static void test_comfort_noise_contract(void) {
 }
 
 /* ---------------------------------------------------------------------------
- * Pool placement invariance
- *
- * Everything this module owns is carved out of one caller-supplied block, so
- * where that block sits, and what surrounds it, must not reach the audio. Two
- * independent ways it could:
- *
- *   - a consumer reading past the end of its own carve, or past the end of
- *     the pool, picks up whatever the neighbouring bytes happen to hold;
- *   - a decision taken on a pointer VALUE rather than on the samples behind
- *     it turns the carve base into an input.
- *
- * A uniform shift of every carve -- a control block that grows, a board
- * moving the pool -- looks identical to correct behaviour when a build is
- * only ever compared against itself, so this drives ONE build four times with
- * the pool at four different 16-aligned bases inside a larger block, and with
- * the bytes on both sides of it set to a different filler each time.
- * Byte-equal output across all four is the whole assertion; the filler check
- * afterwards is the write-side half of the same property, measured over the
- * processing run rather than over init alone.
+ * Pool placement invariance: everything this module owns is carved from one caller block,
+ * so where it sits and what surrounds it must not reach the audio (a consumer reading past
+ * its carve, or a decision on a pointer value). One build runs four times with the pool at
+ * four different 16-aligned bases and a different filler on both sides; byte-equal output
+ * is the main assertion, and the filler check afterwards is the write-side half.
  * ------------------------------------------------------------------------ */
 
 #define POOL_PLACEMENT_GUARD  4096u
@@ -3893,17 +3724,11 @@ static void test_pool_placement_invariance(int sample_rate, int fft_size) {
     free(reference);
 }
 
-/* four_aec_nr_res_reset() has the same contract the mono wrapper's header
- * spells out: the instance it leaves behind must be the one a fresh
- * four_aec_nr_res_init() on the same pool/cfg would have produced. It could
- * not be, until the AEC's own aec_reset() stopped carrying a converged
- * filter's startup gates and Kalman H_error across the call -- the first
- * post-reset hop of all four lanes differed from a never-warmed twin.
- *
- * Warmed on a different stretch of the scene than the one compared, so what
- * the subject remembers is wrong for what follows. Run with CNG both ON and
- * OFF: reset re-seeds the comfort-noise generator, so the CNG path is
- * compared for real rather than excused. */
+/* four_aec_nr_res_reset() has the contract of the mono wrapper's reset: the instance it
+ * leaves behind is the one a fresh four_aec_nr_res_init() on the same pool/cfg would
+ * produce. The subject is warmed on a different stretch of the scene than the one compared,
+ * so what it remembers is wrong for what follows. Run with CNG both ON and OFF: reset
+ * re-seeds the comfort-noise generator, so the CNG path is compared for real. */
 static void test_reset_equals_fresh_instance(int sample_rate, int fft_size,
                                              int enable_cng) {
     enum { WARM = 400, WARM_OFFSET = 100000, COMPARE = 200 };
@@ -3976,19 +3801,14 @@ static void test_reset_equals_fresh_instance(int sample_rate, int fft_size,
     conv_destroy(warmed);
 }
 
-/* The comfort noise is scaled by the denoiser gain of its bin, bounded below
- * by CNG_NR_GAIN_FLOOR: the denoiser never sees the comfort noise, so its
- * gain is applied at injection. Witness on a broadband echo-plus-noise
- * stimulus (a tone would leave only a few bins carrying comfort noise), where
- * the denoiser settles far below the floor in every such bin: the injected
- * noise is the exact difference between a CNG-on and a CNG-off core (added
- * after every gain, same draw sequence), so with the denoiser off (G_nr the
- * unity vector) that difference is the unscaled reference d_ref and with it
- * on the difference d_nr must be CNG_NR_GAIN_FLOOR * d_ref sample for
- * sample. Two assertions pin the contract from outside: the residual
- * d_nr - floor * d_ref carries almost no energy (an unbounded scaling or a
- * different floor both leave (scale - floor)^2 of the reference), and the
- * energy ratio sits at floor^2 (no scaling at all would leave it at 1). */
+/* The comfort noise is scaled by the denoiser gain of its bin, bounded below by
+ * CNG_NR_GAIN_FLOOR (the denoiser never sees the fill). Witness on a broadband
+ * echo-plus-noise stimulus where the denoiser settles far below the floor: the injected
+ * noise is the exact difference between a CNG-on and a CNG-off core (added after every gain,
+ * same draw sequence). With the denoiser off that difference is the unscaled reference
+ * d_ref; with it on, d_nr must equal CNG_NR_GAIN_FLOOR * d_ref sample for sample. The
+ * residual d_nr - floor * d_ref must carry almost no energy, and the energy ratio must sit
+ * at floor^2 (no scaling at all would leave it at 1). */
 static void test_comfort_noise_follows_nr_gain(void) {
     const double floor_amp = 0.31622777, floor_sq = floor_amp * floor_amp;
     FourAecNrResConfig cfg[4];
@@ -4167,28 +3987,15 @@ static void synth_echo_hop_decorrelated_lane(int h, int hop, float* mics,
     }
 }
 
-/* Complement to test_fuse_frame_contract(): the usable_linear AND-fold in
- * fuse_contexts() must run over CONTRIBUTING lanes only (the same
- * lane_contributes gate the all_converged fold right above it already
- * uses), matching Python's `all(... for c in contributors)` -- not an AND
- * over all four lanes unconditionally, and not a constant.
- *
- * Lane 3 is fed capture content with zero correlation to the far-end
- * reference for the whole run, so its own usable_linear stays false (see
- * synth_echo_hop_decorrelated_lane()) while lanes 0-2 see the ordinary
- * correlated echo and become usable within the window, exactly as in
- * test_fuse_frame_contract(). The same front frame is then fused twice each
- * hop (four_aec_fuse() on the same front frame twice is already exercised
- * and allowed by test_fuse_frame_contract()):
- *   - with lane 3 at zero weight (non-contributing) -> usable_linear must
- *     eventually read true, driven by lanes 0-2 alone. A buggy AND over all
- *     four lanes unconditionally would instead latch this false forever.
- *   - with lane 3 given real weight (contributing) -> usable_linear must
- *     then read false, because a lane that is actually voting is not
- *     usable. A naive "always force usable_linear=1" mutation, or one that
- *     drops the AND-fold entirely, gets exactly this wrong -- and is NOT
- *     caught by test_fuse_frame_contract()'s equal-weight-only setup, where
- *     the correct fold and "always 1" are indistinguishable. */
+/* Complement to test_fuse_frame_contract(): the usable_linear AND-fold in fuse_contexts()
+ * runs over contributing lanes only (the lane_contributes gate of the all_converged fold),
+ * matching Python's `all(... for c in contributors)`. Lane 3 gets capture content
+ * uncorrelated with the far end, so its usable_linear stays false while lanes 0-2 become
+ * usable. The same front frame is fused twice per hop: with lane 3 at zero weight
+ * usable_linear must eventually read true (an AND over all four lanes would latch it
+ * false); with lane 3 given real weight it must read false (an "always 1" mutation or a
+ * dropped AND-fold fails this, and the equal-weight setup of test_fuse_frame_contract()
+ * cannot tell it from the correct fold). */
 static void test_fuse_usable_linear_and_over_contributors(void) {
     FourAecNrResConfig cfg = four_aec_nr_res_default_config(48000);
     FourAecNrRes* p;

@@ -232,10 +232,8 @@ def test_default_grids_are_no_padding_power_of_two():
     )
     with pytest.raises(ValueError, match="256, 512"):
         FourChannelAecConfig(sample_rate=16000, frame_size=320).resolved_grid()
-    # frame_size=128 is a power of two but outside the C core's exact
-    # whitelist (16 kHz only supports 256/512) -- must be rejected here too,
-    # so the Python reference can't silently diverge from the C acceptance
-    # gate (see 4aec_nr_res.c's derive_dims_and_configs).
+    # 128 is a power of two but outside the C core's whitelist (16 kHz: 256/512,
+    # 4aec_nr_res.c derive_dims_and_configs); it must be rejected here too.
     with pytest.raises(ValueError, match="256, 512"):
         FourChannelAecConfig(sample_rate=16000, frame_size=128).resolved_grid()
     with pytest.raises(ValueError, match="1024"):
@@ -243,12 +241,10 @@ def test_default_grids_are_no_padding_power_of_two():
 
 
 def test_48k_wrapper_feeds_inner_estimator_raw_native_rate_hops(monkeypatch):
-    """The wrapper does no external 48kHz stride-pick decimation of its own
-    (it would have no anti-alias filter and alias).
-    The inner estimator is constructed at the TRUE native sample_rate
-    and fed every raw sample; EchoPathDelayEstimator owns the anti-alias +
-    decimate-by-3 sidechain internally (mirrors delay_aec.c's
-    DaResample48)."""
+    """The wrapper does no decimation of its own (a stride pick would alias):
+    the inner estimator is built at the true native sample_rate and fed every
+    raw sample; EchoPathDelayEstimator owns the anti-alias + decimate-by-3
+    sidechain (as delay_aec.c's DaResample48)."""
     estimator = SharedMatchedDelayEstimator(sample_rate=48000, hop_size=512)
     assert estimator._estimator._sample_rate == 48000
     seen = []
@@ -354,10 +350,9 @@ def test_pre_frame_cannot_resume_on_a_different_pipeline_instance():
 
 # ---------------------------------------------------------------------------
 # An admitted shared-delay change REALIGNS the four lanes; it does not reset
-# them.  A reset per lane would wipe four converged
-# filters and restarts four WOLA sequences on one hop: the echo comes back for
-# dozens of hops and the output drops a near-silent one.  See
-# lib/aec ``AEC.apply_external_realign`` and its test_external_realign.py.
+# them (a reset would wipe four converged filters and restart four WOLA
+# sequences).  See lib/aec ``AEC.apply_external_realign`` and its
+# test_external_realign.py.
 # ---------------------------------------------------------------------------
 
 _REALIGN_HOP = 128
@@ -415,9 +410,7 @@ def test_admitted_delay_change_realigns_four_lanes_instead_of_resetting_them():
     relock = changed[1]
     assert rows[relock]["delay"] == _REALIGN_DELAY
 
-    # The acquisition sweep is four zero-delta no-ops reported as soft, which
-    # is what `realign_soft_lane_count` documents and the only reason the
-    # counter is not read as "four filters were restarted".
+    # The acquisition sweep is four zero-delta no-ops, counted as soft.
     assert (rows[0]["warm"], rows[0]["soft"]) == (0, 4)
 
     before = rows[relock - 1]
@@ -586,13 +579,10 @@ def test_construction_time_no_floor_disables_split_floor():
 def test_construction_time_preset_matches_runtime_retarget():
     """Building with aec_preset=AGGRESSIVE must match balanced-then-retarget.
 
-    C's own construction path (derive_dims_and_configs -> se_derive ->
-    aec_config_from_preset) applies BOTH floor fields from the preset before
-    aec_res_init() ever runs -- the same two fields set_aec_preset() retargets
-    at runtime. A construction-time seed that only moved the split-floor gate
-    and left the two floors at balanced's values would silently make
-    aec_preset=AGGRESSIVE behave like balanced until something called
-    set_aec_preset() -- a real divergence from the C side this pins against.
+    The C construction path (derive_dims_and_configs -> se_derive ->
+    aec_config_from_preset) applies both floor fields from the preset before
+    aec_res_init(), the same two fields set_aec_preset() retargets; a seed
+    that left them at balanced's values would diverge from the C side.
     """
     built_aggressive = FourChannelAecPipeline(
         FourChannelAecConfig(
@@ -617,13 +607,10 @@ def _gate(pipeline):
 
 def test_preset_retarget_moves_split_floor_enabled_too():
     """set_aec_preset must also retarget the split-floor gate, not just the
-    two floor dB values.
+    two floor dB values (the runtime half of NO_FLOOR).
 
-    This is the runtime half of NO_FLOOR: before this, switching an
-    already-running pipeline to NO_FLOOR left _split_floor_enabled wherever
-    construction put it (True, since BALANCED is the default) -- silently
-    behaving like BALANCED. Mirrors the C twin's aec_res_set_preset(), which
-    mirrors the gate into r->sg_cfg.split_floor_enabled on every call.
+    Mirrors the C twin's aec_res_set_preset(), which mirrors the gate into
+    r->sg_cfg.split_floor_enabled on every call.
     """
     pipeline = _new_pipeline()
     assert _gate(pipeline) is True
@@ -661,9 +648,8 @@ def test_construction_time_no_floor_matches_runtime_retarget():
     """Building with aec_preset=NO_FLOOR must match balanced-then-retarget.
 
     Same property as test_construction_time_preset_matches_runtime_retarget,
-    for the boolean gate instead of the two dB floors: now that the gate has
-    its own runtime setter, a fresh instance and a retargeted one must agree
-    on all three fields NO_FLOOR touches.
+    for the boolean gate: a fresh instance and a retargeted one must agree on
+    all three fields NO_FLOOR touches.
     """
     built_no_floor = FourChannelAecPipeline(
         FourChannelAecConfig(

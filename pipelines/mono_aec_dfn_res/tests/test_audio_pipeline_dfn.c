@@ -1,21 +1,11 @@
 /* mono_aec_dfn_res acceptance test.
- *
- * 48 kHz backbone gate: with the identity model (no callback) the wrapper
- * must be the conventional pipeline with enable_nr=0, delayed by exactly two
- * hops, byte for byte, with comfort noise OFF and ON. The stimulus is an
- * echo delayed by 384 samples under the matched delay estimator, and the
- * test asserts that (a) the estimator reported a delay change during the run
- * and (b) the residual suppressor actually cut (min G_res < 0.9): without
- * (a) the "no reset on a delay change" contract would be unexercised,
- * without (b) the post-RES spectrum would equal the pre-RES one and an
- * estimate/apply swap would be invisible.
- *
- * 16 kHz (the default) and 8 kHz gates: the host runs on its own grid and
- * the bridge takes the stage to 48 kHz and back, so the output is the
- * conventional NR-off output delayed by the bridge's added delay within the
- * resamplers' pass-band error (a tolerance, not a memcmp), the delay itself
- * is pinned by a near-end impulse, and the stage's per-hop schedule is the
- * documented one. */
+ * 48 kHz: with the identity model the wrapper equals the conventional pipeline with
+ * enable_nr=0, delayed by exactly two hops, byte for byte, comfort noise OFF and ON.
+ * The echo (384-sample delay, matched estimator) must make the estimator report a delay
+ * change (the "no reset on a delay change" contract) and the RES cut (min G_res < 0.9).
+ * 8/16 kHz: the stage runs through the bridge; the output equals the NR-off output
+ * delayed by the bridge's added delay within the resamplers' pass-band error, a
+ * near-end impulse pins the delay, and the per-hop stage schedule is the documented one. */
 #include <math.h>
 #include <stdio.h>
 #include <stdlib.h>

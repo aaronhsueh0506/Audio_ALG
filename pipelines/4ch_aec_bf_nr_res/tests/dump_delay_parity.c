@@ -1,25 +1,16 @@
 /**
- * dump_delay_parity.c — per-hop shared-alignment CSV for the C/Python
- * reference parity test (tests/test_delay_parity.py).
+ * dump_delay_parity.c -- per-hop shared-alignment CSV for the C/Python parity test
+ * (tests/test_delay_parity.py).
  *
- * Drives one deterministic synthetic scene (xorshift32 far noise plus a
- * half-amplitude echo at a known bulk delay) through the real 4ch core and
- * prints, for every hop, the published shared-delay state and a hash of the
- * aligned far the four lanes actually consumed. pipeline.py generates the
- * SAME scene and must reproduce every column, so any divergence between the
- * C core's acquisition/ring-fill rules and the Python reference's shows up
- * as a per-hop mismatch instead of as an audio-quality drift nobody bisects.
+ * Drives one deterministic synthetic scene (xorshift32 far noise plus a half-amplitude
+ * echo at a known bulk delay) through the real 4ch core and prints, per hop, the
+ * published shared-delay state and a hash of the aligned far the four lanes consumed.
+ * pipeline.py generates the same scene and must reproduce every column.
+ * The matched-filter duty cycle is pinned at full rate
+ * (four_aec_nr_res_pin_duty_full_rate(), 4aec_nr_res_internal.h) because it is a C-only
+ * schedule. printf lives in this test binary only; the core stays stdio-free.
  *
- * The core's matched-filter duty cycle is pinned at full rate for the whole
- * run (four_aec_nr_res_pin_duty_full_rate(), 4aec_nr_res_internal.h): it is
- * a C-only schedule, so it belongs to neither side of a math comparison.
- *
- * printf lives in THIS test binary only -- 4aec_nr_res.c and everything it
- * links stay stdio-free (see the Makefile's audit-no-stdio target).
- *
- * Build:
- *   make -C pipelines/4ch_aec_bf_nr_res dump_delay_parity
- *
+ * Build:  make -C pipelines/4ch_aec_bf_nr_res dump_delay_parity
  * Usage:
  *   ./dump_delay_parity [--mode matched|fixed] [--delay SAMPLES]
  *                       [--shift-at HOP --shift-delay SAMPLES]
@@ -27,25 +18,11 @@
  *                       [--fft-size 256|512|1024] [--seed HEX]
  *                       [--backward-quarantine] [--quarantine-s SECONDS]
  *                       [--proxy-noise GAIN]
- *
- * --seed reseeds the far/echo stream ONLY; the --proxy-noise stream keeps its
- * own fixed seed, so a reseeded run still gets the same proxy interference.
- *
- * --backward-quarantine turns on
- * FourAecNrResConfig::delay_backward_quarantine_enabled (default off, as in
- * production) so the parity test can drive the quarantined acceptance rule as
- * well as the unquarantined one -- the quarantine reads live lane state and
- * carries its own countdown, so a mirror that only agreed with it OFF would
- * leave the whole rule uncompared. --quarantine-s overrides the window
- * (default 1.0 s), which is what makes the countdown itself comparable rather
- * than only its enabled/disabled ends.
- *
- * --proxy-noise adds an independent noise stream to the capture-proxy channel
- * ONLY, leaving the other three microphones on the clean echo. That asymmetry
- * is the only way to tell "judge the estimator's own lane" apart from "judge
- * any lane": with it, the proxy lane cannot cancel while the other three can,
- * so the two rules disagree about whether to quarantine. Without it every
- * channel carries identical audio and the two rules are indistinguishable.
+ * --seed reseeds the far/echo stream only. --backward-quarantine sets
+ * FourAecNrResConfig::delay_backward_quarantine_enabled (default off) and
+ * --quarantine-s its window (default 1.0 s). --proxy-noise adds independent noise to the
+ * capture-proxy channel only, so the proxy lane cannot cancel while the other three can
+ * and the proxy-lane rule is told apart from a judge-any-lane rule.
  */
 
 #include <stdint.h>
@@ -167,13 +144,9 @@ int main(int argc, char** argv) {
         fprintf(stderr, "four_aec_nr_res_create failed\n");
         return 3;
     }
-    /* Analyse every hop. The core's matched-filter duty cycle is a C-only
-     * SCHEDULE with no counterpart on the Python side, so leaving it in
-     * would make every row below a comparison of when the two implementations
-     * looked rather than of what they computed. Everything else -- the
-     * estimator, the admission machine, the quarantine, the ring -- runs
-     * exactly as production runs it. The schedule itself is covered where it
-     * is the subject, in tests/test_4aec_nr_res.c. */
+    /* Analyse every hop: the duty-cycle schedule is C-only with no Python counterpart;
+     * everything else runs as in production. The schedule is covered in
+     * tests/test_4aec_nr_res.c. */
     four_aec_nr_res_pin_duty_full_rate(p);
     hop = four_aec_nr_res_hop_size(p);
 

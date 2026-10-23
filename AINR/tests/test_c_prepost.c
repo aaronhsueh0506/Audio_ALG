@@ -826,17 +826,13 @@ static int test_dfn_erb_spans_exact(void)
     return 1;
 }
 
-/* State evolution through the in-place boundary.
- *
- * A deterministic stand-in for the accelerator advances the caller-owned state
- * the way the graph does: recurrent rows are rewritten from their own previous
- * values (all state inputs are read before any is written), conv windows drop
- * their oldest frame and append the new one. The stand-in addresses the arrays
- * through the struct's typed fields; the reference below addresses plain float
- * vectors with explicit strides, so a field whose extents or order differ from
- * the graph tensors makes the two disagree. After every hop (commit, a refused
- * commit, a reset) the arrays are compared byte for byte with the reference
- * and hashed into the digest that test-simd compares across builds. */
+/* State evolution through the in-place boundary. A deterministic stand-in for
+ * the accelerator rewrites the caller-owned state the way the graph does
+ * (recurrent rows from their own previous values, conv windows shifted by one
+ * frame, all inputs read before any output is written) through the struct's
+ * typed fields; a reference on plain strided vectors must agree byte for byte
+ * after every hop (commit, refused commit, reset). The arrays are hashed into
+ * the digest that test-simd compares across builds. */
 
 static float standin_row(float previous, int hop, int row, int column)
 {

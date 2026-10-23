@@ -2,6 +2,49 @@
 
 ## Unreleased
 
+### Known gap (AIAEC)
+- `AIAEC/dataset_gen/linear_aec.py` registers the AEC Python behaviour-hash step 5fe64e46 -> 428aa9b7 as a
+  compatible migration without a measurement that the frozen front end is unchanged over that step; a mismatch only
+  warns. Re-materialised corpora use the current hash.
+
+### Source comments condensed
+
+- Comments and docstrings in the AINR/AIAEC model C/H files (dfn2, dfn3, gtcrn,
+  RNNoise-ERB `process.*`, ulcnet, deepvqe, aiaec) and their Python model and
+  streaming modules were reduced to contract text (C/H comment lines 2,998 ->
+  1,700; Python 1,283 -> 963). Code, identifiers, literals and generated object
+  code are unchanged. The records below were removed from the sources.
+- DFN2/DFN3 `model.py` upstream alignment: `df_dec.df_gru` takes the module
+  default `linear_groups=8` (checkpoint weight `(8, 64, 32)`; 16 breaks loading);
+  the `lsnr` head is omitted (513 parameters, loss term not trained), so a
+  streaming port cannot skip the ERB/DF stages on clean frames; DFN3's 257-parameter
+  `df_fc_a` is kept for the 2,135,484 reconciliation; the released DFN3
+  `convt_depthwise` key is never read upstream; the DF decoder guard
+  (`emb_in_dim == df_hidden`) intentionally differs from upstream's.
+- DFN2/DFN3 `process.h`: the grid is 1024/512 (DF cutoff 4500 Hz instead of
+  4800 Hz at 960/480); `ERB_NORM_ALPHA` is rounded to 3 decimals (effective tau
+  0.9644 s); `ERB_NORM_SCALE_DB = |log floor - init_lo|`; `ANALYSIS_SCALE`
+  is the libDF `wnorm` residual 1/32 and acts only on the feature branch;
+  `SPEC_NORM_EPS` stays in C although the trainer dropped it (denormal flush);
+  `torch.istft` rejects `center=False` at 1024/512, and the causal EMA carries a
+  first-frame difference through a whole 3 s segment (3 tau = 273 of 281 frames).
+- Latency figures: DFN2 identity path 3 hops (1536 samples, 32 ms at 48 kHz);
+  DFN3 2 hops (1024 samples, 21.33 ms).
+- RNNoise-ERB normaliser init values come from this project's 16 kHz corpus
+  (libDF's -60/-90 dB would start the EMA 35..48 dB off for the triangular bank;
+  0.001 against the measured 0.008161 would put the top bin 2.86x out).
+- ULCNet/DeepVQE-S `prepost`: analysis is the rolling `center=False` schedule;
+  centered frame k and rolling frame k-1 cover the same samples and window (bit
+  identical when measured), and algorithmic latency stays one hop (synthesis
+  half-window trim). Each `prepost.c` is a separate translation unit so that the
+  process and model-io files stay independently linkable.
+- DeepVQE-S `frame_skip()` fails closed (silence): its stream 0 is the raw
+  microphone, so pass-through would emit the full echo; the cost is a one-frame
+  notch. The ULCNet adapter cannot verify that the descriptor `delay_depth`
+  equals the exported depth; there is no exporter-generated descriptor header yet.
+- ULCNet model-io layout versions 3-17 and DeepVQE-S 1-3 are retired; numbers
+  are never reused.
+
 ### Removed (2026-10-23)
 
 - Dead C code with no caller in any supported configuration: `dfn2_post_filter`
@@ -43,8 +86,9 @@
   `python -m pytest AINR/DeepFilterNet2/tests AINR/DeepFilterNet3/tests AINR/tests -q`
   from the repository root.
 - `make -C AINR WERROR=1 lib test-simd` and
-  `make -C AINR SIMD=0 WERROR=1 test` passed. Existing DFN2/GTCRN golden
-  digests stayed unchanged; DFN3 scalar/NEON stream digest was `5b831894`.
+  `make -C AINR SIMD=0 WERROR=1 test` passed. The DFN2/GTCRN output
+  digests of that date were unchanged; DFN3 scalar/NEON stream digest was `5b831894`. The frozen-digest
+  checks were removed on 2026-10-23: the current tests check reproducibility and NEON/scalar agreement only.
 - A tiny synthetic 48 kHz corpus exercised train, resume, checkpoint load,
   WAV inference, normalizer calibration, graph/calibration export and ERB
   export. Batch-1 / batch-3 ONNXRuntime replay errors were at most

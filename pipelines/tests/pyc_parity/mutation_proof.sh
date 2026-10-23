@@ -19,12 +19,10 @@
 #   cng_seed_1bit          pipelines/common/se_stage.h       SE_CNG_RNG_SEED 0x9e3779b9u -> 0x9e3779b8u
 #   usable_gate_dropped    pipelines/common/se_anr_stage.c   "&& frame->usable_linear" removed from the r2 fold condition
 #
-# Flip tests (name flip_*): the opposite direction. A plausible fix of a known gap is planted in the copy; the row
-# tagged EXPECTED_RED for that gap must turn UNEXPECTED_GREEN and the script must fail, which is the mechanism that
-# forces the tag to be removed together with the fix:
-#   flip_s25_c_flag_forced  4aec_nr_res.c        four_aec_fuse sets frame->usable_linear = 1   (a.nr4.*.verdict_flag)
-#   flip_s26_python_dt_floor 4ch pipeline.py     PostBeamResidualSuppressor.set_preset also retargets the DT floor (b.res4.*.aggressive)
-#   flip_s27_python_borrow  4ch pipeline.py      _fuse_contexts no longer raises on lane far-spectrum disagreement (c.realign4.48k1024)
+# Flip tests (name flip_*): a known past defect is planted back into the copy; the row(s) guarding it must turn FAIL:
+#   flip_s25_c_flag_forced  4aec_nr_res.c        four_aec_fuse forces frame->usable_linear = 1   (a.nr4.*.verdict_flag)
+#   flip_s26_python_dt_floor 4ch pipeline.py     PostBeamResidualSuppressor.set_preset stops retargeting the DT floor (b.res4.*.aggressive)
+#   flip_s27_python_borrow  4ch pipeline.py      _fuse_contexts raises on lane far-spectrum disagreement (c.realign4.48k1024)
 
 MP_DEFAULT="fold_coef_ulp:1,16,256,4096,65536 xi_min_db_div10_5 aec_floor_balanced_ulp:1,64,4096,65536 cng_seed_1bit usable_gate_dropped flip_s25_c_flag_forced flip_s26_python_dt_floor flip_s27_python_borrow"
 
@@ -65,24 +63,16 @@ mp_def() {
       M_MUST="a.nr4.16k256.verdict_flag" ;;
     flip_s26_python_dt_floor)
       M_FILE="Audio_ALG/pipelines/4ch_aec_bf_nr_res/pipeline.py"
-      # The real S-26 fix IS set_preset() calling self._gain.set_split_floor_dt_db(dt_db) --
-      # inserting another call of the exact same setter with the exact same value (the old
-      # M_PERL, right after the far_active_db setter two lines above) is a no-op duplicate,
-      # not a regression of the fix, so this mutation was never detectable by any row. Undo
-      # the actual fix instead: delete the dt_db retarget call, which is the pre-S-26 bug
-      # (set_preset only ever moved the far-active floor; the DT floor stayed at whatever the
-      # instance was constructed with).
+      # Delete the dt_db retarget call in set_preset(): without it only the far-active floor moves and the
+      # DT floor stays at the construction value. Inserting a duplicate of the call would be a no-op that
+      # no row can detect.
       M_PERL='s|        self\._gain\.set_split_floor_dt_db\(dt_db\)\n||'
       M_ONLY="b.res4.16k256.balanced,b.res4.16k256.aggressive"
       M_MUST="b.res4.16k256.aggressive" ;;
     flip_s27_python_borrow)
       M_FILE="Audio_ALG/pipelines/4ch_aec_bf_nr_res/pipeline.py"
-      # S-27's real fix DELETED the old raise (it used to sit right before this same
-      # assignment) rather than just reword it, so there is no longer any "raise ...far-end
-      # spectrum" text left to find-and-replace -- the old M_PERL silently matched nothing
-      # and the harness's own "pattern drifted?" self-check caught that and returned exit 2.
-      # Reinstate the pre-S-27 guard instead (same shape as the still-live far_power check a
-      # few lines down) so the flip plants the actual old bug again.
+      # Insert a guard that raises on lane far-spectrum disagreement, in the shape of the far_power check a
+      # few lines down, before `far_spec = far_specs[0]`.
       M_PERL='s|(    far_spec = far_specs\[0\]\n)|    if not np.allclose(far_specs, far_specs[0], rtol=1e-6, atol=1e-9):\n        raise ValueError("linear AEC lanes do not share one far-end spectrum")\n$1|'
       M_ONLY="c.realign4.48k1024"
       M_MUST="c.realign4.48k1024" ;;
@@ -92,15 +82,12 @@ mp_def() {
 }
 
 mp_failed_rows() { # json -> space separated ids with status FAIL / UNEXPECTED_GREEN / a crashed NOT_RUN
-  # A planted regression can also surface as NOT_RUN rather than FAIL: pyc_parity.py's main()
-  # wraps each scenario-group function (sec_a/b/c/d) in one try/except (an uncaught exception
-  # anywhere in that group, e.g. from a shared helper the group calls unconditionally, turns the
-  # WHOLE group's rows into a single "scenario group could not run" NOT_RUN row instead of a
-  # per-row FAIL) -- flip_s27_python_borrow's reinstated raise is exactly this case. Counted only
-  # when the note names a raised exception (always "<ExceptionType>: <message>" for a real crash,
-  # per main()'s own `note='%s: %s' % (type(exc).__name__, exc)`), never for a legitimately
-  # vacuous row (e.g. "no mixed warm/soft realign hop occurred"/"no double-talk hop"), so a benign
-  # skip elsewhere is never mistaken for detection.
+  # A planted regression can also surface as NOT_RUN rather than FAIL: pyc_parity.py's main() wraps each
+  # scenario-group function (sec_a/b/c/d) in one try/except, so an uncaught exception in a group turns the
+  # whole group's rows into a single "scenario group could not run" NOT_RUN row (flip_s27_python_borrow's
+  # raise is such a case). Counted only when the note names a raised exception ("<ExceptionType>: <message>"),
+  # never for a legitimately vacuous row (e.g. "no mixed warm/soft realign hop occurred"), so a benign skip
+  # is never mistaken for detection.
   "${PYRUN[@]}" -c '
 import json, sys
 d = json.load(open(sys.argv[1]))
@@ -149,11 +136,9 @@ mutation_proof_main() {
       rows="$(mp_failed_rows "$mpw/run_$tag/results.json")"
       cp -p "$backup" "$copy/$M_FILE"
       det="no"
-      # Detection is "did the row(s) we're watching actually turn up", not "was the sub-run's own
-      # exit code exactly 1": pyc_parity_pipelines.sh also exits 3 for INCOMPLETE (its own
-      # NOT_RUN-only outcome, e.g. flip_s27_python_borrow's reinstated raise crashing a whole
-      # scenario group instead of failing one row numerically -- see mp_failed_rows above), which
-      # is just as real a detection as exit 1's per-row FAIL and must not be read as "no".
+      # Detection is "did the row(s) we're watching turn up", not "was the sub-run's exit code exactly 1": the
+      # sub-run also exits 3 for INCOMPLETE (its NOT_RUN-only outcome, e.g. a whole scenario group crashing, see
+      # mp_failed_rows above), which is just as real a detection.
       [ -n "$rows" ] && det="YES" && detected_any=1
       [ "$rc" = 2 ] && [ -z "$rows" ] && det="build error"
       printf '%-26s %-8s %-6s %-9s %s\n' "$name" "$k" "$rc" "$det" "$rows"

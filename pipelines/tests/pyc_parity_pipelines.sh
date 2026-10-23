@@ -3,13 +3,13 @@
 #
 # What it measures (nothing here modifies an algorithm, a C numeric behaviour or a tolerance):
 #   (a) 4-channel NR gain: the C chain's fused frame fed to Python run_nr_spectrum, against the C G_nr,
-#       with usable_linear taken from the C frame flag (glue sync, four_aec_fuse AND-folds it over
-#       contributing lanes -- S-25, fixed 2026-10-20) and, as an independent cross-check, from the
-#       Python verdict of the same hop, plus "legacy_amin 0 and 1 must differ" inside C.
+#       with usable_linear taken from the C frame flag (four_aec_fuse AND-folds it over contributing
+#       lanes) and, as an independent cross-check, from the Python verdict of the same hop, plus
+#       "legacy_amin 0 and 1 must differ" inside C.
 #   (b) 4-channel post-beam RES gain: PostBeamResidualSuppressor (+ set_preset) fed with the C fused
-#       frame, against the C G_res, for balanced / mild / aggressive (aggressive: S-26) / no_floor.
-#   (c) 4-channel shared-delay realign: the hop on which the lanes take a mixed warm/soft path at 48 kHz
-#       (S-27): stock Python 4ch against the C core on the same input.
+#       frame, against the C G_res, for balanced / mild / aggressive / no_floor.
+#   (c) 4-channel shared-delay realign: the hop on which the lanes take a mixed warm/soft path at 48 kHz:
+#       stock Python 4ch against the C core on the same input.
 #   (d) mono pipeline glue (NR gain, min, apply, comfort noise, OLA): Python functions of
 #       aec_nr_pipeline.py fed with the C AEC seam, against the C output.
 #
@@ -26,19 +26,16 @@
 #
 # Scenario ids (see --list): a.nr4.<grid>.*  4ch NR gain      b.res4.<grid>.<preset>  4ch post-beam RES
 #   c.realign4.<grid>  shared-delay realign   d.mono.*  mono glue     l2.*  Layer 2      <grid> = 16k256 | 16k512 | 48k1024
-#   Rows a.nr4.*.glue_cflag and a.nr4.*.glue_fold both compare the Python NR stage with C over the same frame; the
-#   first takes usable_linear from the C frame flag (set by four_aec_fuse's AND-over-contributing-lanes fold,
-#   S-25 fixed 2026-10-20), the second forces the Python verdict into the C stage as an independent check that
-#   the fold itself is exercised correctly.
+#   Rows a.nr4.*.glue_cflag and a.nr4.*.glue_fold both compare the Python NR stage with C over the same
+#   frame; the first takes usable_linear from the C frame flag (four_aec_fuse's AND-over-contributing-lanes
+#   fold), the second forces the Python verdict into the C stage as an independent check of the fold.
 #
-# Every tolerance below is FROZEN (2026-10-20, after S-25/S-26/S-27 landed and EXPECTED_RED emptied: see
-# pyc_parity.py's TOL1/TOL2 and the pipelines CHANGELOG's "S-28" entry for the measured max error each
-# constant was set from and the margin reasoning). A frozen tolerance still prints next to the number it
-# judged; it changes only through the same measure-then-sign-off process, not silently. Scenarios of a known
-# gap are tagged EXPECTED_RED(S-xx): they may exceed their tolerance without failing the script; if one turns
-# green the script FAILS (UNEXPECTED_GREEN) so the tag gets removed together with the fix. A scenario that
-# cannot be exercised on its input (for example no mixed warm/soft realign hop, no double-talk hop) is
-# NOT_RUN, never a vacuous pass.
+# Tolerances are frozen (pyc_parity.py's TOL1/TOL2 carry the measured max error each constant was set
+# from); a frozen tolerance still prints next to the number it judged and changes only through
+# measure-then-sign-off. A row for a known gap is tagged EXPECTED_RED(<audit id>): it may exceed its
+# tolerance without failing the script, and if it turns green the script FAILS (UNEXPECTED_GREEN) so the
+# tag is removed with the fix. A scenario that cannot be exercised on its input (for example no mixed
+# warm/soft realign hop, no double-talk hop) is NOT_RUN, never a vacuous pass.
 #
 # Exit status: 0 = every scenario PASS / EXPECTED_RED / SKIP / INFO;  1 = a FAIL or an UNEXPECTED_GREEN;
 #              2 = infrastructure error (build, input checksum, usage);  3 = some scenario NOT_RUN.

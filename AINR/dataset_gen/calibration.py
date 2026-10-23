@@ -1,20 +1,14 @@
 """Fitting helpers shared by the per-model normaliser-init calibrators.
 
-WHY THESE ARE SHARED
---------------------
 RNNoise-ERB and DeepFilterNet2 both initialise their per-band EMA normalisers
-from a two-point ``torch.linspace`` ramp across frequency, and both inherited
-those two points from DeepFilterNet's libDF.  libDF aggregates each ERB band as
-an energy MEAN over a rectangular, non-overlapping filterbank; both of these
-ports use a triangular, overlapping, partition-of-unity bank whose band value
-is a weighted SUM, so band energy grows with band width and the imported
-constants start the EMA in the wrong place by a band-dependent amount.
-
-The two models need SEPARATE numbers -- different sample rate, FFT size and
-band count give different band widths, hence a different offset per band -- but
-they need the SAME fitting procedure.  Keeping that procedure in one place is
-the same reasoning that put the train/val split in ``loader.py``: the previous
-per-project copies of shared logic drifted.
+from a two-point ``torch.linspace`` ramp across frequency inherited from libDF,
+which aggregates each ERB band as an energy MEAN over a rectangular,
+non-overlapping filterbank; both ports use a triangular, overlapping,
+partition-of-unity bank whose band value is a weighted SUM, so the imported
+constants start the EMA in the wrong place by a band-dependent amount. The two
+models need SEPARATE numbers (different sample rate, FFT size and band count)
+but the SAME fitting procedure, kept here for the reason the train/val split
+lives in ``loader.py``: per-project copies drift.
 """
 
 import torch
@@ -40,35 +34,26 @@ def robust_quantile(x, q):
 def fit_ramp(x, axis_name='band', unit='', verbose=True, require_positive=False):
     """Endpoints of the least-squares line through the per-column MEAN.
 
-    ``init_lo``/``init_hi`` are the two ends of a ramp ACROSS FREQUENCY, so they
-    have to be fitted along that axis.  Pooling every column and every frame
-    into one distribution and reporting its median and 5th percentile -- the
-    naive approach -- measures how levels vary over
-    TIME and LOUDNESS instead, and yields two numbers that describe no ramp at
-    all.  On a synthetic case with a known 16 dB frequency ramp and 12 dB of
-    frequency-flat level jitter, the pooled version reports a 20.8 dB span and
-    misses both endpoints by 8-13 dB; this recovers them to about 0.1 dB.
-
-    The statistic is the MEAN because that is what the EMA converges to:
-    ``mean = alpha*mean + (1-alpha)*x`` has expectation E[x], not its median.
+    ``init_lo``/``init_hi`` are the two ends of a ramp ACROSS FREQUENCY, so
+    they are fitted along that axis; pooling every column and frame and
+    reporting a median and 5th percentile measures level variation over TIME
+    and LOUDNESS instead (on a synthetic 16 dB ramp with 12 dB of flat level
+    jitter that reports a 20.8 dB span, while this recovers the endpoints to
+    about 0.1 dB). The statistic is the MEAN because that is what the EMA
+    converges to.
 
     ``require_positive`` is for the unit-norm path, whose state is a MAGNITUDE
-    that the model divides by as ``x / sqrt(state)``.  A least-squares line
-    through a convex, non-monotonic magnitude profile extrapolates below zero
-    at the high-frequency edge -- measured on real corpora it produced -0.0074 (16 kHz) and
-    -0.0146 (48 kHz) -- and a negative state makes that sqrt NaN on the first
-    frames.  When the fit would return a non-positive endpoint the measured
-    first/last column means are returned instead: real, positive numbers, and
-    no worse than a line that does not describe the data anyway.
+    the model divides by as ``x / sqrt(state)``: a line through a convex
+    magnitude profile can extrapolate below zero at the high-frequency edge and
+    make that sqrt NaN, so a non-positive endpoint falls back to the measured
+    first/last column means.
 
     Args:
         x: (frames, columns) real tensor -- per-band dB, or per-bin magnitude.
 
     Returns:
-        (value_at_first_column, value_at_last_column, rms_residual).  The
-        residual is the part of the frequency profile a two-parameter ramp
-        cannot represent; report it so the reader can judge whether the ramp is
-        expressive enough before trusting the two numbers.
+        (value_at_first_column, value_at_last_column, rms_residual); the residual
+        is the part of the profile a two-parameter ramp cannot represent.
     """
     if x.ndim != 2:
         raise ValueError(f'expected (frames, columns), got {tuple(x.shape)}')
@@ -121,19 +106,12 @@ def describe_bands(erb_db, band_weight_sums, scale_db):
 
     The measured level of a band is the signal's level in that frequency range
     PLUS 10*log10(sum of the band's filter weights), because this filterbank
-    sums where libDF averages.  That second term is deterministic -- it depends
-    only on the band borders -- so printing it lets you subtract it and check
-    whether what remains looks like the corpus you actually fed in.  If the
-    corrected column does not resemble a plausible spectrum (for speech+noise,
-    falling with frequency), the measurement is wrong somewhere upstream of the
-    fit and the endpoints should not be trusted.
-
-    ``spread`` is p95-p5 WITHIN each band across time.  That is the quantity
-    ``scale_db`` (the /40 divisor) has to cover: after mean subtraction the
-    feature is (level - running_mean)/scale_db, so a band whose spread is far
-    below scale_db reaches the network compressed into a narrow range.  The
-    across-band span is irrelevant to that divisor -- the mean subtraction
-    removes it.
+    sums where libDF averages. That second term depends only on the band
+    borders, so printing it lets you subtract it and check the remainder looks
+    like a plausible spectrum (falling with frequency for speech+noise);
+    otherwise the measurement is wrong upstream of the fit. ``spread`` is
+    p95-p5 WITHIN each band across time, the quantity ``scale_db`` (the /40
+    divisor) has to cover.
     """
     import torch
 

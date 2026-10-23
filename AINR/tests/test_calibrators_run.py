@@ -1,17 +1,12 @@
 #!/usr/bin/env python3
 """Both calibrators must actually execute, not merely import.
 
-These are standalone scripts with no other caller, so nothing exercised them:
-the DeepFilterNet2 one shipped reading ``feat['erb_norm_init_lo_db']`` when its
-own ``read_feature_config`` returns that value under ``erb_init_lo_db`` (the
-two projects spell the key differently -- config.ini has the ``norm_`` infix,
-the parsed dict does not).  ``--help`` passed, so the KeyError only appeared on
-a real run.
-
-This drives each script end to end over a tiny synthetic corpus and checks it
-reaches its output.  The numbers are meaningless -- white noise, a handful of
-clips -- so nothing here asserts values; it asserts that the pipeline runs and
-emits the four config lines.
+They are standalone scripts with no other caller, so nothing else exercises
+them, and the two projects spell the key differently (config.ini has the
+``norm_`` infix, the parsed dict does not), a KeyError ``--help`` cannot
+reveal. This drives each end to end over a tiny synthetic corpus of white
+noise: it asserts the pipeline runs and emits the four config lines, not
+values.
 """
 
 import pathlib

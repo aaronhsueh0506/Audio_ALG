@@ -88,11 +88,10 @@ def write_calibration_artifact(output_path, arrays, report, artifact_format):
     """Write NPZ or per-frame/per-tensor little-endian BIN calibration.
 
     ``arrays`` maps graph input names to arrays whose leading dimension is the
-    captured invocation index. NPZ keeps those arrays intact. BIN creates one
-    directory per input and writes zero-padded 0-based
-    ``<name>_0000.bin``, ``<name>_0001.bin``, ... beneath it (width grows
-    past 10000 frames so a lexicographic listing always equals frame
-    order).
+    captured invocation index. BIN creates one directory per input and writes
+    zero-padded 0-based ``<name>_0000.bin``, ``<name>_0001.bin``, ... beneath
+    it (width grows past 10000 frames so a lexicographic listing always equals
+    frame order).
     """
     artifact_format = resolve_calibration_format(output_path, artifact_format)
     frame_count = _validate_arrays(arrays)

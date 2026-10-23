@@ -6,10 +6,9 @@ A rendered split is a directory of chunk WAVs and nothing else:
     <split>/seqs/SSSSSS_CCC.wav      5-channel, channels = STEM_ORDER
 
 ``SSSSSS`` is the parent sequence id and ``CCC`` its chunk index. That filename
-is the entire contract -- there is no sidecar and no run manifest -- so the
-generator, the packer and the re-materializer all have to agree on exactly what
-counts as a chunk file and how a killed run is made invisible. They agree by
-importing from here.
+is the entire contract (no sidecar, no run manifest), so the generator, packer
+and re-materializer import from here what counts as a chunk file and how a
+killed run is made invisible.
 """
 
 from __future__ import annotations

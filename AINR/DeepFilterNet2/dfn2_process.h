@@ -1,55 +1,28 @@
-/* ============================================================
- * DeepFilterNet2 前後處理 (C 實現) — 對齊 train.py / model.py / inference.py
+/* DeepFilterNet2 signal path outside the network (C twin of model.py
+ * heads()/compose(); Python reference: inference.py).
  *
- * 這個檔案是「網路以外的全部」。邊界與 model.py 的 heads()/compose() 完全一致:
+ *   C  : frame -> STFT -> ERB features + complex features
+ *   NN : (feat_erb, feat_spec) -> (erb_mask, coefs, alpha)   <- the learned part
+ *   C  : erb_mask/coefs/alpha -> full-band mask -> low-band deep filter ->
+ *        alpha blend -> atten_lim -> ISTFT + OLA -> frame
  *
- *     C   : frame -> STFT -> ERB 特徵 + complex 特徵
- *     網路: (feat_erb, feat_spec) -> (erb_mask, coefs, alpha) <-- 只有這一段是學來的
- *     C   : erb_mask/coefs/alpha -> 全頻 mask · 低頻 deep filter · alpha blend
- *           · post-filter · atten_lim · ISTFT + OLA -> frame
+ * - STFT: sqrt-Hann, normalized=True (x N_FFT^-0.5); the feature branch also
+ *   scales by DFN2_ANALYSIS_SCALE before the normalisers.
+ * - ERB matrices are caller-loaded (erb_fwd.bin / erb_inv.bin): forward doubles
+ *   the edge columns, inverse is a partition of unity.
+ * - ERB feature: band energy in dB, causal EMA mean norm per band, divided by 40.
+ * - Complex feature: real/imag of bins 0..df_bins with per-bin magnitude EMA
+ *   unit norm.
+ * - Cascade: ERB mask over the full band, then a DF_ORDER-tap complex FIR on the
+ *   lowest DF_BINS bins; low band = alpha*DF(masked) + (1-alpha)*masked, high
+ *   band keeps masked.
+ * - ISTFT: normalized=True (x N_FFT^+0.5), sqrt-Hann, 50% OLA.
  *
- * ⚠ 網路只出 mask、coefficient 與 alpha，合成全部在這裡。compose() 是 parameter-free
- *   的，正是為了讓這個檔案可以逐項對上它；任何學來的東西都該在 heads() 裡。
- *   上游把線畫在同一個位置: 它的 Python forward 會合成 (那是訓練圖)，而部署的
- *   runtime 只跑網路取這兩個張量，合成自己做。
- *
- * 與 Python 參考的對應 (inference.py 為準):
- *   - STFT: sqrt-Hann window, normalized=True (x N_FFT^-0.5)
- *   - 分析尺度: 額外乘 DFN2_ANALYSIS_SCALE 才進正規化器 (libDF wnorm, 見下)
- *   - ERB: caller-loaded exported matrices (erb_fwd.bin/erb_inv.bin)
- *          (mode=0 forward 邊緣欄加倍 / mode=1 inverse partition of unity)
- *   - ERB 特徵: band 能量取 dB 後，逐 band causal EMA mean norm，再 /40
- *   - Complex 特徵: 0..df_bins 的 real/imag，逐 bin magnitude EMA unit norm
- *   - band gain -> 全頻 bin gain: erb_mask @ ERB_inv^T (mode=1)
- *   - cascade: 全頻先套 mask，再對最低 DF_BINS 做 DF_ORDER-tap 複數 FIR
- *   - alpha blend: 低頻 = alpha*DF(masked) + (1-alpha)*masked；高頻保留 masked
- *   - ISTFT: normalized=True (x N_FFT^+0.5) + sqrt-Hann + 50% OLA (COLA)
- *
- * ============================================================
- * ⚠ 已知的 parity 限制 — 這兩項無法在 C 端修掉，不要當成 bug 追
- * ============================================================
- *
- * 1) 框對齊。train.py 用 torch.stft 的預設 center=True，也就是首框被置中且
- *    邊界用 reflect padding。這個 C 是串流實現 (等價 center=False，零填暖機)。
- *    後果只在 clip 起點: Python 的 frame 0 含有訊號的時間反轉拷貝，這裡是靜音。
- *    穩態下 center=True 只是固定的半窗時序偏移，串流可精確重現。
- *    ⚠ torch.istft 在 win=1024/hop=512 下直接拒絕 center=False
- *    ("window overlap add min: 1")，因為首尾框 OLA 覆蓋不足。所以要對齊得照
- *    libDF 做「零填暖機 + 丟掉暖機框」的 framing，不是翻一個 flag。
- *    ⚠ 這件事對 causal EMA 尤其要緊: 它的狀態從 frame 0 起累積，而 3 秒
- *    segment 全程都在暖機期 (3*tau = 273 frames vs 281 frames/segment)，所以
- *    frame 0 的差異會一路傳播。
- *
- * 2) spec_norm_eps。trainer 沒有它，以對齊 libDF 的裸 sqrt，但這裡
- *    保留 (DFN2_SPEC_NORM_EPS)。這不是不一致，是刻意的:
- *    fp32 + 次正規數下 mu 永不為 0，所以 trainer 不需要它；但在 FTZ /
- *    denormals-are-zero 的目標上 mu 可以真的到 0，x/sqrt(0) = NaN。
- *    ⚠ 這正是「trainer 拿掉、C 保留」的理由，同樣做法見 RNNoise-ERB 的
- *    process.c: sqrtf(state + RNNOISE_SPEC_NORM_EPS)。
- *    代價是與 Python 差 ~1e-9 相對，遠小於 float32 ULP 級的其他差異。
- *
- * → 與 torch 為 float32 ULP 級近似, 非 bit-exact。
- * ============================================================ */
+ * Known differences from the training graph:
+ * 1) Framing is streaming (center=False, zero-filled warm-up) instead of
+ *    center=True reflect padding; only the first frame of a clip differs.
+ * 2) DFN2_SPEC_NORM_EPS is kept inside the unit-norm sqrt: where denormals flush
+ *    to zero the EMA can reach 0 and x/sqrt(0) would be NaN. */
 
 #ifndef DFN2_PROCESS_H
 #define DFN2_PROCESS_H
@@ -59,138 +32,115 @@
 #include <stddef.h>
 #include <stdint.h>
 
-/* ---- 訊號格點: = config.ini [signal] ---- */
+/* ---- Signal grid (= config.ini [signal]) ---- */
 #define DFN2_SR             48000
 #define DFN2_N_FFT          1024
 #define DFN2_N_BINS         513   /* N_FFT/2 + 1 */
-#define DFN2_WIN_LEN        1024  /* 分析窗長度 (= N_FFT) */
-#define DFN2_HOP_LEN        512   /* 幀移 (= WIN_LEN/2, COLA) */
+#define DFN2_WIN_LEN        1024  /* analysis window length (= N_FFT) */
+#define DFN2_HOP_LEN        512   /* hop (= WIN_LEN/2, COLA) */
 #define DFN2_OVL_LEN        (DFN2_WIN_LEN - DFN2_HOP_LEN)
 
-/* ⚠ 不是上游的 960/480。960 不是 2 的次方，嵌入式 FFT 用不了。代價是 DF 的
- * 截止落在 4500 Hz 而非上游的 4800 Hz — 見 config.ini [model] df_bins。 */
+/* The grid is 1024/512, not 960/480: 960 is not a power of two. The DF cutoff is
+ * therefore 4500 Hz instead of 4800 Hz (config.ini [model] df_bins). */
 
-/* ---- 模型幾何: = config.ini [model] ---- */
+/* ---- Model geometry (= config.ini [model]) ---- */
 #define DFN2_N_ERB          32
-#define DFN2_DF_BINS        96    /* deep filter 擁有的 bin 數 (0..95) */
-#define DFN2_DF_ORDER       5     /* FIR tap 數 */
-#define DFN2_DF_LOOKAHEAD   1     /* 未來 tap 數 */
+#define DFN2_DF_BINS        96    /* bins owned by the deep filter (0..95) */
+#define DFN2_DF_ORDER       5     /* FIR taps */
+#define DFN2_DF_LOOKAHEAD   1     /* future taps */
 #define DFN2_MASK_LOOKAHEAD 1
 
-/* deep filter 的時間窗是 [t-(ORDER-LOOKAHEAD-1) .. t+LOOKAHEAD]。
- * 在出貨的 5/1 下是 [t-3 .. t+1]:
- *   - 需要 3 個歷史框 + 當前框 + 1 個未來框 = ring buffer 深度 5
- *   - 單看 DF FIR 需要 1 框輸出延 (要等 masked t+1 才能發 t)
- * ⚠ 上游出貨 2/2 (對稱 [t-2..t+2])。本 port 用 1/1 換延遲: hop 512 @ 48k
- *   一框 10.67 ms。但 DFN2 是 cascade: masked(t+1) 自己還要等
- *   mask head(t+1)，而 head 的 conv lookahead 又是 1。所以真正的
- *   streaming head-to-audio 總延遲是 MASK_LOOKAHEAD + DF_LOOKAHEAD = 2 框，
- *   不是 max(1,1)=1。見 dfn2_compose_stream()。 */
+/* The deep-filter window is [t-(ORDER-LOOKAHEAD-1) .. t+LOOKAHEAD], i.e.
+ * [t-3 .. t+1] for the shipped 5/1: ring depth 5, one frame of output delay.
+ * DFN2 is a cascade (masked(t+1) waits for mask head(t+1), whose conv lookahead
+ * is 1), so the streaming head-to-audio latency is MASK_LOOKAHEAD + DF_LOOKAHEAD
+ * = 2 frames. See dfn2_compose_stream(). */
 #define DFN2_DF_HISTORY     (DFN2_DF_ORDER - DFN2_DF_LOOKAHEAD - 1)  /* 3 */
 #define DFN2_DF_RING        DFN2_DF_ORDER                            /* 5 */
 
-/* ---- 特徵正規化: = config.ini [feature] ----
- * ⚠ FEATURE_VERSION 必須與 train.py 逐字相同，否則 checkpoint 與這個前處理
- * 不是同一個合約。 */
+/* ---- Feature normalisation (= config.ini [feature]) ----
+ * FEATURE_VERSION must equal train.py's, otherwise the checkpoint and this front
+ * end are different contracts. */
 #define DFN2_FEATURE_VERSION  "dfn2_libdf_wnorm_upstream_init_no_eps_v5"
 
-/* alpha 是導出值不是設定值: exp(-(hop/sr)/tau) 再取 3 位小數 (train.py 的
- * make_norm_alpha 重現上游 df/utils.py 的取整迴圈)。tau = 1.0 s，
- * hop 512 @ 48k -> 0.989。⚠ 這個數字在上游任何 config 都不存在，因為上游的
- * hop 480 會得到不同值。改 sr/hop 就要重新導出，不要照抄。
- * ⚠ 副作用: 3 位小數的取整讓有效 tau 是 0.9644 s 而非 1.0 s。 */
+/* alpha is derived, not configured: exp(-(hop/sr)/tau) rounded to 3 decimals
+ * (train.py make_norm_alpha), tau = 1.0 s, hop 512 @ 48 kHz -> 0.989 (effective
+ * tau 0.9644 s). Re-derive it if sr or hop change. */
 #define DFN2_ERB_NORM_ALPHA         0.989f
 #define DFN2_ERB_NORM_INIT_LO_DB  (-60.0f)   /* = libDF MEAN_NORM_INIT */
 #define DFN2_ERB_NORM_INIT_HI_DB  (-90.0f)
 #define DFN2_ERB_NORM_SCALE_DB      40.0f
-#define DFN2_ERB_LOG_FLOOR          1e-10f   /* = libDF lib.rs:209 的字面值 */
+#define DFN2_ERB_LOG_FLOOR          1e-10f   /* = libDF lib.rs literal */
 
-/* ⚠ scale_db 不是任意值: 它是 |log floor - init_lo|。
- *   10*log10(1e-10) = -100 dB，|-100 - (-60)| = 40，所以數值靜音的 band 會被
- *   硬界在精確的 -1.00，也就是上游自己的特徵範圍。上游這三個常數互相一致，
- *   動一個就破壞關係 (init_lo 移到 -15 就需要除數 85)。 */
+/* scale_db = |log floor - init_lo| (10*log10(1e-10) = -100 dB, |-100 - (-60)| =
+ * 40), so numerically silent bands are bounded at exactly -1.00. The three
+ * constants are mutually consistent; change them together. */
 
 #define DFN2_SPEC_NORM_ALPHA        0.989f
 #define DFN2_SPEC_NORM_INIT_LO      0.001f   /* = libDF UNIT_NORM_INIT */
 #define DFN2_SPEC_NORM_INIT_HI      0.0001f
-#define DFN2_SPEC_NORM_EPS          1e-12f   /* ⚠ 見檔頭 parity 限制 (2) */
+#define DFN2_SPEC_NORM_EPS          1e-12f   /* guards x/sqrt(0) where denormals flush to zero */
 
-/* libDF 的分析尺度。上游對頻譜乘 wnorm = 2*hop/win^2 (= 1/1024)，而
- * torch.stft(normalized=True) 只乘 1/sqrt(n_fft) (= 1/32)，所以殘差因子是
- * wnorm * sqrt(n_fft) = 1/32。
- * ⚠ 這在 DF 路徑上不是裝飾: band_unit_norm 是 x/sqrt(EMA|x|)，輸入乘 c 則
- *   輸出乘 sqrt(c)，是永久因子不是暫態。漏掉它 feat_spec 會永遠以
- *   sqrt(32) = 5.66x 上游的量級進 DF 分支，而 feat_erb 是上游量級，兩個
- *   encoder 分支相對彼此錯配。
- * ⚠ 只作用在餵進正規化器的那一份。要送去 masking/ISTFT 的頻譜保持原尺度，
- *   否則 round trip 不是 unity。 */
+/* libDF analysis scale: the reference multiplies the spectrum by
+ * wnorm = 2*hop/win^2 (1/1024) while torch.stft(normalized=True) applies
+ * 1/sqrt(n_fft) (1/32), leaving a residual of 1/32. It matters on the DF path
+ * (band_unit_norm is x/sqrt(EMA|x|), so an input scale persists as sqrt(c)).
+ * Applied only to the copy feeding the normalisers; the spectrum used for
+ * masking and ISTFT keeps its scale. */
 #define DFN2_ANALYSIS_SCALE   0.03125f       /* = 2*512/1024^2 * sqrt(1024) */
 
-/* ============================================================
- * 狀態 (呼叫端分配，跨 frame 保持)
- * ============================================================ */
+/* ---- State (caller-allocated, persists across frames) ---- */
 typedef struct {
-    /* Framing objects, caller-owned and borrowed (see dfn2_framing_config).
-     * NULL where the caller works on spectra and never calls
-     * dfn2_analysis / dfn2_synthesis. */
+    /* Framing objects, caller-owned and borrowed (see dfn2_framing_config); NULL
+     * where the caller works on spectra only. */
     AcStft  *stft;
     AcIstft *istft;
-    /* Caller-loaded exported ERB matrices (never derived here):
-     * erb_fwd bin-major [DFN2_N_BINS][DFN2_N_ERB], erb_inv band-major
-     * [DFN2_N_ERB][DFN2_N_BINS]; raw float32 from erb_fwd.bin/erb_inv.bin.
-     * The loader owns the memory and may swap it between hops. */
+    /* Caller-loaded ERB matrices: erb_fwd bin-major [DFN2_N_BINS][DFN2_N_ERB],
+     * erb_inv band-major [DFN2_N_ERB][DFN2_N_BINS]; raw float32. The loader owns
+     * the memory and may swap it between hops. */
     const float *erb_fwd;
     const float *erb_inv;
 
-    /* 逐 band 的 causal log-ERB mean EMA */
+    /* per-band causal log-ERB mean EMA */
     float erb_norm_state[DFN2_N_ERB];
 
-    /* 逐 bin 的 complex-magnitude EMA (只有 DF 那段 bin) */
+    /* per-bin complex-magnitude EMA (DF bins only) */
     float spec_norm_state[DFN2_DF_BINS];
 
-    /* deep filter 的複數 ring buffer: 已套 ERB mask 的最低 DF_BINS 個 bin。
-     * ⚠ DFN2 是串聯 cascade，不能把原始未遮罩頻譜直接推進此 buffer。 */
+    /* Deep-filter rings hold the lowest DF_BINS bins after the ERB mask; the
+     * unmasked spectrum must not be pushed here (cascade). */
     float df_ring_re[DFN2_DF_RING][DFN2_DF_BINS];
     float df_ring_im[DFN2_DF_RING][DFN2_DF_BINS];
     float coef_ring[DFN2_DF_RING][DFN2_DF_BINS][DFN2_DF_ORDER][2];
     float alpha_ring[DFN2_DF_RING];
     float noisy_ring_re[DFN2_DF_RING][DFN2_N_BINS];
     float noisy_ring_im[DFN2_DF_RING][DFN2_N_BINS];
-    int   df_ring_idx;     /* 下一個寫入位置 */
-    int   df_ring_count;   /* 已累積框數，用來判斷暖機是否結束 */
+    int   df_ring_idx;     /* next write position */
+    int   df_ring_count;   /* frames accumulated; warm-up ends when full */
 
-    /* Streaming accelerator handoff.  dfn2_compose_stream() numbers each
-     * pushed spectrum monotonically; returned heads are expected to describe
-     * current_frame-MASK_LOOKAHEAD.  Do not mix the aligned and streaming
-     * compose APIs without dfn2_state_init(). */
+    /* Streaming accelerator handoff: dfn2_compose_stream() numbers each pushed
+     * spectrum and the returned heads must describe current_frame-MASK_LOOKAHEAD.
+     * Do not mix the aligned and streaming compose APIs without dfn2_state_init(). */
     long long stream_frame_index;
 
-    /* 高頻段 (bin >= DF_BINS) 也要延遲同樣的框數，否則 band split 會把
-     * 不同時刻的兩半拼在一起。⚠ 這是最容易漏的一步。 */
+    /* The high band (bin >= DF_BINS) is delayed by the same number of frames so
+     * both halves of the band split come from the same instant. */
     float hi_delay_re[DFN2_DF_RING][DFN2_N_BINS - DFN2_DF_BINS];
     float hi_delay_im[DFN2_DF_RING][DFN2_N_BINS - DFN2_DF_BINS];
 
-    /* --- scratch: 非跨 frame 狀態，每次使用前完整覆寫 --- */
+    /* scratch: not state, fully overwritten before each use */
     float scratch_power[DFN2_N_BINS];
     float scratch_erb_db[DFN2_N_ERB];
     float scratch_bin_gain[DFN2_N_BINS];
 
-    /* Where the two ERB matrices are nonzero, derived from their CONTENTS
-     * by dfn2_set_erb_matrices(): bin k's forward row is nonzero only in
-     * bands [erb_fwd_lo[k], erb_fwd_hi[k]), band b's inverse row only in
-     * bins [erb_inv_lo[b], erb_inv_hi[b]). An ERB filterbank is banded (a
-     * bin feeds one or two bands), so the feature and mask sums visit only
-     * those spans. That is exact, not approximate: a skipped term is a
-     * finite value times +-0, and adding +-0 leaves any accumulator that
-     * starts at +0 unchanged (Inf and NaN included); the kept terms keep
-     * their order. A non-finite power or band gain (x * 0 would be NaN)
-     * takes its whole row. A caller that rewrites a matrix's contents in
-     * place must re-publish it through dfn2_set_erb_matrices().
-     * The forward matrix's columns have the same structure the other way
-     * round: band b is fed only by bins [erb_fwd_k0[b], erb_fwd_k1[b]). The
-     * feature sum runs band by band over that range (four bands at a time,
-     * each in ascending bin order, so every band's sum is formed exactly as
-     * the bin-major walk forms it). */
+    /* Nonzero spans of the ERB matrices, derived from their contents by
+     * dfn2_set_erb_matrices(): bin k's forward row is nonzero only in bands
+     * [erb_fwd_lo[k], erb_fwd_hi[k]), band b's inverse row only in bins
+     * [erb_inv_lo[b], erb_inv_hi[b]), and band b is fed only by bins
+     * [erb_fwd_k0[b], erb_fwd_k1[b]). The sums visit only these spans; skipped
+     * terms are finite values times +-0, so the result is unchanged. A non-finite
+     * power or band gain takes its whole row. A caller that rewrites a matrix in
+     * place must re-publish it through dfn2_set_erb_matrices(). */
     uint16_t erb_fwd_lo[DFN2_N_BINS];
     uint16_t erb_fwd_hi[DFN2_N_BINS];
     uint16_t erb_fwd_k0[DFN2_N_ERB];
@@ -199,78 +149,73 @@ typedef struct {
     uint16_t erb_inv_hi[DFN2_N_ERB];
 } DFN2State;
 
-/* Configuration of the two framing objects, for ac_stft_get_mem_size /
- * ac_istft_get_mem_size and the matching init calls: 1024-point sqrt-Hann,
- * hop 512, no centering, torch normalized=True scaling (analysis x
- * DFN2_N_FFT^-0.5, synthesis x DFN2_N_FFT^+0.5). `fft` is a DFN2_N_FFT
- * handle shared by both objects; `window` is a shared DFN2_WIN_LEN table, or
- * NULL for the analysis object to carve one that the synthesis object then
- * borrows from ac_stft_window(). Borrowed tables stay unchanged and alive as
- * long as the objects. */
+/* Config of the two framing objects, for ac_stft/ac_istft get_mem_size and init:
+ * 1024-point sqrt-Hann, hop 512, no centering, torch normalized=True scaling
+ * (analysis x N_FFT^-0.5, synthesis x N_FFT^+0.5). `fft` is a DFN2_N_FFT handle
+ * shared by both objects; `window` is a shared DFN2_WIN_LEN table, or NULL for the
+ * analysis object to carve one that the synthesis object borrows. Borrowed tables
+ * stay alive and unchanged as long as the objects. */
 void dfn2_framing_config(AcStftConfig *cfg, FftHandle *fft,
                          const float *window);
 
-/* 初始化 (歸零 + 兩個正規化器的 linspace 初值)。stft / istft 是依
- * dfn2_framing_config 建立的物件(可為 NULL: 只走頻譜入口時);本函式把兩者
- * 一併 reset,所以對已在使用的 state 再呼叫即是 reset。 */
+/* Zero the state and set the two normalisers' linspace initial values. stft/istft
+ * are the objects built per dfn2_framing_config (may be NULL when only spectra
+ * are used) and are reset too, so calling this on a state in use resets it. */
 void dfn2_state_init(DFN2State *st, AcStft *stft, AcIstft *istft);
 
-/* Point the state at the caller-loaded ERB matrices (see the struct field
- * comment for layout) and record their nonzero spans. Must be called before
- * feature extraction or mask expansion, and again after any change to a
- * matrix's contents; the library never reads files itself. */
+/* Point the state at the caller-loaded ERB matrices and record their nonzero
+ * spans. Call before feature extraction or mask expansion, and again after any
+ * change to a matrix's contents. The library never reads files. */
 void dfn2_set_erb_matrices(DFN2State *st, const float *erb_fwd,
                              const float *erb_inv);
 
-/* frame (HOP_LEN 個新樣本，內部自己維護分析 overlap) -> 複數頻譜。
- * out_re/out_im 長度 N_BINS。⚠ 這是「原尺度」的頻譜，masking 與 ISTFT 用它；
- * 分析尺度只在特徵計算裡套。 */
+/* frame (HOP_LEN new samples; the analysis overlap is kept internally) ->
+ * complex spectrum of N_BINS bins, at the original scale used for masking and
+ * ISTFT. */
 void dfn2_analysis(DFN2State *st, const float *frame,
                    float *out_re, float *out_im);
 
-/* 頻譜 -> 網路的兩組輸入。
- *   feat_erb : 長度 N_ERB
- *   feat_spec: 長度 2*DF_BINS，interleave 為 [re..., im...] 兩段 (非交錯)
- * ⚠ 內部會套 DFN2_ANALYSIS_SCALE，呼叫端不要自己先乘。 */
+/* Spectrum -> the network's two inputs: feat_erb [N_ERB] and feat_spec
+ * [2*DF_BINS] laid out as [re..., im...] (two segments). DFN2_ANALYSIS_SCALE is
+ * applied internally; callers must not pre-scale. */
 void dfn2_compute_features(DFN2State *st,
                            const float *spec_re, const float *spec_im,
                            float *feat_erb, float *feat_spec);
 
-/* DeepFilterNet atten_lim 必須對最終複數頻譜混合：DF 輸出不是 noisy
- * spectrum 乘上實數 mask，因此不能像 RNNoise 那樣在 band gain 域做。 */
+/* atten_lim mixes into the final complex spectrum (the DF output is not a real
+ * mask times noisy, so it cannot be applied in the band-gain domain). */
 void dfn2_apply_atten_lim(const float *noisy_re, const float *noisy_im,
                           float *enh_re, float *enh_im,
                           float atten_lim_db);
 
-/* 網路輸出 -> 增強頻譜。這是 model.py compose() 的 C 對應。
- *   erb_mask: 長度 N_ERB，sigmoid 後在 [0,1]
- *   coefs   : 長度 DF_BINS * DF_ORDER * 2，layout 與 model.py 的
- *             (df_bins, df_order, 2) 相同 (bin 最外、tap 次之、re/im 最內)
- *   alpha   : 單一 sigmoid blend weight；0 走 masked residual，1 走 DF
- *   spec_re/spec_im: 當前框的原尺度頻譜，會被推進 ring buffer
- *   out_re/out_im  : 延遲 DF_LOOKAHEAD 框後的增強頻譜
- * 回傳 1 表示 out 有效，0 表示還在暖機 (前 DF_LOOKAHEAD 框沒有輸出)。
- * ⚠ 呼叫端必須處理回傳 0: 那幾框不要送去 ISTFT。 */
+/* Network outputs -> enhanced spectrum (C twin of model.py compose()).
+ *   erb_mask: [N_ERB], sigmoid output in [0,1]
+ *   coefs   : [DF_BINS * DF_ORDER * 2], model.py's (df_bins, df_order, 2) layout
+ *   alpha   : one sigmoid blend weight; 0 = masked residual, 1 = deep filter
+ *   spec_re/spec_im: current frame, original scale; pushed into the ring
+ *   out_re/out_im  : enhanced spectrum delayed by DF_LOOKAHEAD frames
+ * Returns 1 when out is valid, 0 during warm-up (those frames must not go to the
+ * ISTFT). */
 int dfn2_compose(DFN2State *st,
                  const float *spec_re, const float *spec_im,
                  const float *erb_mask, const float *coefs, float alpha,
                  float *out_re, float *out_im);
 
-/* 真正的串流/硬體 handoff。每次呼叫推進一框 CURRENT spectrum；
- * 當 heads_valid=1 時，erb_mask/coefs/alpha 必須是硬體在這一拍
- * 回傳的 current_frame-MASK_LOOKAHEAD 那框 head。heads_valid=0 只用於
- * 左邊暖機，此時三個 head pointer 可以是 NULL。
+/* Streaming/hardware handoff: each call pushes one CURRENT spectrum. With
+ * heads_valid=1, erb_mask/coefs/alpha must be the heads the accelerator returned
+ * for current_frame-MASK_LOOKAHEAD; heads_valid=0 is for the left warm-up only
+ * and the three head pointers may be NULL.
  *
- * DFN2 cascade 要先有每個 source frame 自己的 mask，所以有效輸出
- * 對應 current_frame-MASK_LOOKAHEAD-DF_LOOKAHEAD。出貨 1/1 因此是
- * 2 hops = 21.33 ms @48 kHz，再加 STFT framing 本身的算法時間。
- * output_frame_index 可為 NULL；非 NULL 時回報 out 所屬的 frame id。
+ * Because of the cascade, a valid output corresponds to
+ * current_frame - MASK_LOOKAHEAD - DF_LOOKAHEAD (2 hops = 21.33 ms at 48 kHz for
+ * the shipped 1/1, plus the STFT framing). output_frame_index may be NULL;
+ * otherwise it reports the frame id of out.
  *
- * 右邊 flush 必須由中間硬體用與訓練相同的 zero padding 產生剩餘
- * heads，再以零 spectrum 繼續呼叫；C 不會臆測加速器的 flush。
- * atten_lim_db=0 停用 attenuation limit；非零時會對正確的延遲
- * noisy target 做 complex mix，呼叫端不需要另存一份 spectrum ring。
- * 回傳 1 = 有效 out，0 = 還在暖機，-1 = pointer/時序合約錯誤。 */
+ * To flush on the right, the accelerator produces the remaining heads with the
+ * training zero padding and the caller keeps calling with zero spectra; C does
+ * not invent a flush. atten_lim_db=0 disables the limit; otherwise it mixes
+ * against the correctly delayed noisy target internally.
+ * Returns 1 = valid out, 0 = warm-up, -1 = pointer or timing contract error. */
 int dfn2_compose_stream(DFN2State *st,
                         const float *current_spec_re,
                         const float *current_spec_im,
@@ -283,9 +228,9 @@ int dfn2_compose_stream(DFN2State *st,
                         float *out_im,
                         long long *output_frame_index);
 
-/* 增強頻譜 -> HOP_LEN 個輸出樣本 (sqrt-Hann 合成 + OLA)。
- * ⚠ 合成端不做 window-envelope 除法: sqrt-Hann 分析 x sqrt-Hann 合成 = Hann，
- *   在 50% overlap 下滿足 COLA。 */
+/* Enhanced spectrum -> HOP_LEN output samples (sqrt-Hann synthesis + OLA). No
+ * window-envelope division: sqrt-Hann analysis x sqrt-Hann synthesis = Hann,
+ * which is COLA at 50% overlap. */
 void dfn2_synthesis(DFN2State *st,
                     const float *spec_re, const float *spec_im,
                     float *out_frame);

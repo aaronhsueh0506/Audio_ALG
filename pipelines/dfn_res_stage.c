@@ -1,6 +1,6 @@
 /* Post-RES DeepFilterNet2 stage; see dfn_res_stage.h for the signal/timing
- * contract. This TU owns no FFT: both inputs are spectra on DFN2's native
- * 48 kHz / 1024 / 512 grid and the hosting pipeline owns synthesis. */
+ * contract. Both inputs are spectra on DFN2's 48 kHz / 1024 / 512 grid; the
+ * hosting pipeline owns synthesis. */
 
 #include <math.h>
 #include <stdint.h>
@@ -84,13 +84,9 @@ static int model_valid(const DFN2Model *model) {
            dfn2_model_io_descriptor_validate(model->io_descriptor) == 0;
 }
 
-/* The identity contract of the fail-open path (dfn2_prepost_frame_skip: unit
- * band mask, zero taps, alpha 0) is exact only when the unit mask expands to
- * exactly 1.0f in every bin. Walk the band-major matrix in the same order as
- * the DFN2 expansion (df_common_expand_mask: bands outer, bins inner, one
- * multiply-add per band), so the check sees the same float sums the model
- * path will form. A unit gain makes each product exact, so this is the
- * expansion itself, not an approximation of it. */
+/* The fail-open identity is exact only when the unit band mask expands to exactly
+ * 1.0f in every bin; walk the band-major matrix in the DFN2 expansion order
+ * (bands outer, bins inner) so the sums match the model path. */
 static int erb_inv_is_partition_of_unity(const float *erb_inv) {
     float bin_gain[DFN2_N_BINS];
     int b, k;
@@ -105,9 +101,8 @@ static int erb_inv_is_partition_of_unity(const float *erb_inv) {
     return 1;
 }
 
-/* Everything init needs, derived from the config exactly once: the DFN2
- * class config and pool size, and this pool's total. Reject-first, in the
- * order the header documents. */
+/* Everything init needs, derived from the config once: the DFN2 class config and
+ * pool size, and this pool's total. */
 typedef struct Resolved {
     DFN2PrepostConfig pcfg;
     DFN2PrepostMemReq pp_req;
@@ -210,10 +205,7 @@ DfnResStage *dfn_res_stage_init_ex(void *mem, size_t bytes,
                                       &r.pcfg, &r.pp_req);
     if (!s->prepost) return NULL;
 
-    /* One aligned slab: an individual 513-float row is not a multiple of
-     * 16 bytes, so aligning every row would add hidden padding and make the
-     * sizing walk disagree with the carve. SIMD kernels accept unaligned
-     * rows; only the slab base is part of the pool ABI. */
+    /* One aligned slab for the six spectra; only the slab base is part of the pool ABI. */
     if (carve(&cur, one * 6u, &region) != 0) return NULL;
     s->est_re = (float *)region;
     s->est_im = s->est_re + DFN2_N_BINS;
@@ -277,10 +269,7 @@ void dfn_res_stage_get_counters(const DfnResStage *s, long long *frames_in,
     if (skips) *skips = s ? s->skips : 0;
 }
 
-/* Both spectra are scanned for finite values before any of them reaches
- * the recurrent state: a NaN that enters the feature EMA or the GRU hidden
- * state would poison every later frame, and the class's own commit-time
- * check only covers the model outputs. */
+/* Scans both spectra for finite values before they reach the recurrent state. */
 static int inputs_valid(const Complex *estimate, const Complex *apply) {
     if (!estimate || !apply) return 0;
     return skn_all_finite_cf32(estimate, DFN2_N_BINS) &&
@@ -314,9 +303,8 @@ int dfn_res_stage_end(DfnResStage *s, int model_rc, Complex *out_spec) {
     int valid = 0;
     if (!s || !out_spec || s->phase == 0) return -1;
     if (s->phase == 2) {
-        /* A failed run, an unwritten or non-finite output (the commit refuses
-         * it) all take the frame as the identity: the clocks advance exactly
-         * once. */
+        /* A failed run or an unwritten/non-finite output takes the frame as the identity;
+         * the clocks advance once. */
         int committed = model_rc == 0 &&
                         dfn2_prepost_frame_commit(s->prepost) == 0;
         if (!committed && dfn2_prepost_frame_skip(s->prepost) != 0) {

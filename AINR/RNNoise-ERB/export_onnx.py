@@ -358,12 +358,11 @@ def verify_output(streaming, n_bands, spec_bins, gru_size, onnx_path):
             pt_out = streaming(erb_input, spec_input, h, h, h)
 
         sess = ort.InferenceSession(onnx_path)
-        # Feed whatever the graph actually declares, not a fixed name list.
-        # In a pure-ERB export `spec_input` is dead in the graph, and exporters
-        # are free to prune a dead input -- passing a name the session does not
+        # Feed whatever the graph actually declares, not a fixed name list. In
+        # a pure-ERB export `spec_input` is dead in the graph, and exporters
+        # are free to prune a dead input; passing a name the session does not
         # have is a hard error, so the verification would fail on a perfectly
-        # good model.  (Not reproducible here: `onnx` is not installed, so the
-        # export path itself cannot run in this environment.)
+        # good model.
         available = {i.name for i in sess.get_inputs()}
         feed = {'erb_input': erb_input.numpy(), 'spec_input': spec_input.numpy(),
                 'h1_in': h.numpy(), 'h2_in': h.numpy(), 'h3_in': h.numpy()}

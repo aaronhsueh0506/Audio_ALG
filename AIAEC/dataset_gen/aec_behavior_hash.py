@@ -115,30 +115,11 @@ def _canon_constant(value) -> str:
 def _canon_ast(node) -> str:
     """Serialize an AST deterministically and IDENTICALLY on every CPython.
 
-    ``ast.dump()`` cannot be used here. Python 3.13 changed it to omit fields
-    that equal their default, so the same source hashes differently before and
-    after: the 48 signal-path files digest to 89b866cd on 3.9 and 402acc1a on
-    3.14 with no code difference at all. A dataset built
-    under one interpreter would then be refused by training under another.
-
-    The rule here is that same omission -- drop a field whose value is ``None``
-    or an empty list -- applied uniformly on EVERY version, by this function
-    rather than by the stdlib. That also absorbs fields which simply do not
-    exist on older versions: ``type_params`` (PEP 695, added to FunctionDef/
-    AsyncFunctionDef/ClassDef in 3.12) is absent on 3.9 and ``[]`` on 3.14, so
-    both sides emit nothing. Those three are the ONLY fields 3.14 adds to a
-    node type that 3.9 already has; everything else new (match statements, PEP
-    695 declarations, t-strings) is a wholly new node type whose class name
-    appears in the output the moment it is used.
-
-    Fail-closed by construction: fields are read from the live ``_fields``, so
-    a genuinely-used new field (``type_params`` on ``class Foo[T]:``) is
-    non-empty, is emitted, and DOES change the hash. Nothing is silently
-    dropped -- only provably-empty values are, and an empty value carries no
-    behaviour.
-
-    Fields are emitted in sorted-name order rather than ``_fields`` order,
-    which is not guaranteed stable across versions when a field is appended.
+    ``ast.dump()`` cannot be used: Python 3.13 omits fields equal to their
+    default, so one source would hash differently across interpreters. This
+    applies that omission (drop a field that is ``None`` or an empty list)
+    uniformly on EVERY version. Fail-closed: a genuinely used new field is
+    non-empty and DOES change the hash. Fields are emitted sorted by name.
     """
     if isinstance(node, ast.Constant):
         # `value` bypasses the empty-field rule: the literal `None` is a real
@@ -188,39 +169,11 @@ def _strip_docstrings(tree):
 def aec_python_behavior_hash() -> str:
     """Hash the AEC sources' CODE, insensitive to comments and formatting.
 
-    This is the COMPATIBILITY condition. It hashes the normalized AST rather
-    than raw text, so reflowing a comment, rewording a docstring or reindenting
-    a block does NOT invalidate existing shards or checkpoints, while any change
-    to an actual expression, constant or control-flow path does -- and fails
-    closed.
-
-    Why a hash and not a hand-maintained ``behavior_version`` integer: every
-    other field of ``LinearAecContract`` is either a literal pinned by
-    ``__post_init__`` or echoed out of the recorded contract by both call sites,
-    so a version integer would be the same constant on both sides of every
-    comparison and could never differ. That is exactly the tautology that made
-    this check vacuous once already. A mechanical hash cannot be
-    forgotten the way a manual bump can.
-
-    Conservative by construction: a pure refactor (renaming a local, reordering
-    independent statements) also changes this hash. Refusing to load is the safe
-    direction; the fix is to rematerialize, not to loosen the check.
-
-    The single exception is ``ACCEPTED_BEHAVIOR_HASH_MIGRATIONS`` in
-    ``linear_aec``: an explicit table of recorded/current hash PAIRS shown by
-    measurement to render byte-identical ``linear_error``, so an unchanged
-    corpus and an already-trained checkpoint stay usable across a provably inert
-    lib/aec change. It is a per-pair, one-way, single-hop exemption that applies
-    only when this hash is the sole differing contract field -- not a way to
-    accept old hashes generally, and no reason to weaken what is hashed here.
-    Adding an entry does NOT bump ``BEHAVIOR_HASH_SCHEMA``: the canonicalizer is
-    unchanged, only the sources it runs over.
-
-    Stable across CPython versions -- see `_canon_ast()`. It must be: a dataset
-    generated under one interpreter is routinely trained against under another,
-    and an interpreter-dependent hash would refuse that pairing even though the
-    AEC sources are byte-identical. `test_linear_aec_behavior_hash.py` pins this
-    against every interpreter it can find on the machine.
+    The COMPATIBILITY condition: it hashes the normalized AST, so a comment
+    reflow keeps shards and checkpoints valid while any change to an
+    expression, constant or control flow does not (the fix is to
+    rematerialize). A mechanical hash rather than a hand-kept version integer,
+    which could never differ between the two sides of a comparison.
     """
     digest = hashlib.sha256()
     digest.update(BEHAVIOR_HASH_SCHEMA.encode("utf-8"))
@@ -248,15 +201,9 @@ def aec_python_behavior_hash() -> str:
 def aec_python_source_hash() -> str:
     """Raw-text hash of the Python AEC sources, including uncommitted edits.
 
-    PROVENANCE ONLY. It records exactly which bytes produced a dataset, which is
-    what resume/integrity wants, but it is deliberately NOT a compatibility
-    condition: it changes when a comment is reflowed, which would invalidate
-    byte-identical data and -- worse -- refuse an already-trained checkpoint
-    that no rematerialization can repair. Compatibility uses
-    ``aec_python_behavior_hash()``.
-
-    Computed once per process. A long-lived process that edits the AEC sources
-    after the first call keeps reporting the original hash.
+    PROVENANCE ONLY: it records which bytes produced a dataset but is NOT a
+    compatibility condition, since a comment reflow changes it. Compatibility
+    uses ``aec_python_behavior_hash()``. Computed once per process.
     """
     digest = hashlib.sha256()
     for path in _aec_python_files():

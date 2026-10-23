@@ -1,35 +1,20 @@
-/**
- * 4aec_nr_res_static.c — 4x AEC(linear) -> beamformer -> NR/RES
- *                        (static memory, stages chained by the caller)
- *
- * Minimal example of the frequency-domain stage chain over 4aec_nr_res.h.
- * It follows pipelines/mono_aec_nr_res/static_main.c:
- *
- *   default config -> get_mem_requirements -> caller allocation
- *                  -> init -> process -> destroy -> caller release
- *
- * The front end (four_aec_front_process / four_aec_fuse) owns the shared
- * aligner and the four lanes; this file carves the post-beam stages from the
- * same caller pool and chains them itself:
- *
+/** 4x AEC(linear) -> beamformer -> NR/RES with static memory and the stages chained
+ * by the caller. Minimal example of the frequency-domain stage chain over
+ * 4aec_nr_res.h, following mono_aec_nr_res/static_main.c: default config ->
+ * get_mem_requirements -> caller allocation -> init -> process -> destroy -> release.
+ * The front end owns the shared aligner and the four lanes; this file carves the
+ * post-beam stages from the same pool and chains them:
  *   front_process -> (weights) -> fuse -> se_res_stage_gain, se_anr_stage_gain
  *     -> sk_min_f32 -> sk_capply_gain_f32 -> aec_cng_fill -> ac_istft_push
- *
- * The beamformer is externally owned in a real product (SRP-PHAT/BF); this
- * executable supplies fixed equal weights between the two front calls. Equal
- * weights are a deterministic smoke adapter, not a production beamformer.
- *
- * Build:
- *   make -C pipelines/4ch_aec_bf_nr_res 4aec_nr_res_static
- *
+ * The beamformer is externally owned in a product; this executable supplies fixed
+ * equal weights, a deterministic smoke adapter and not a production beamformer.
+ * Build:  make -C pipelines/4ch_aec_bf_nr_res 4aec_nr_res_static
  * Usage:
  *   AEC preset: 0=mild, 1=balanced, 2=aggressive, 3=no_floor; names also accepted.
- *   ./4aec_nr_res_static [aec-preset]
- *       [--nr-preset mild|moderate|balanced|aggressive]
+ *   ./4aec_nr_res_static [aec-preset] [--nr-preset mild|moderate|balanced|aggressive]
  *       [--sample-rate 16000|48000] [--fft-size 256|512|1024]
  *       [--capture-proxy 0|1|2|3] [--legacy-amin] [--no-cng]
- *   ./4aec_nr_res_static --print-mem-size [same options]
- */
+ *   ./4aec_nr_res_static --print-mem-size [same options] */
 
 #include <stdio.h>
 #include <stdlib.h>
@@ -44,9 +29,7 @@
 #include "common/se_anr_stage.h"
 #include "common/se_stage.h"
 
-/* ------------------------------------------------------------------ */
-
-/* CLI aliases only; unknown names retain the historical balanced fallback. */
+/* CLI aliases only; unknown names fall back to balanced. */
 static AecPreset parse_preset(const char* s) {
     if (strcmp(s, "mild") == 0 || strcmp(s, "0") == 0)
         return AEC_PRESET_MILD;
@@ -68,8 +51,7 @@ static const char* preset_name(AecPreset p) {
     }
 }
 
-/* Name table lives beside the enum (lib/nr anr_types.h); an unknown
- * name keeps this tool's long-standing fallback to balanced. */
+/* Name table lives beside the enum (anr_types.h); unknown names fall back to balanced. */
 static AnrMode parse_nr_mode(const char* s) {
     int m = anr_nr_mode_from_name(s);
     return m < 0 ? ANR_MODE_BALANCED : (AnrMode)m;
@@ -93,7 +75,7 @@ typedef struct Stages {
     size_t res_bytes, nr_bytes, synth_bytes, fft_bytes;
     size_t vec_bytes;                     /* one float[n_freqs], 16-byte padded */
     size_t cvec_bytes;                    /* one Complex[n_freqs], padded       */
-    size_t total;                         /* pool: front end + every stage       */
+    size_t total;                         /* pool: front end + every stage */
 } Stages;
 
 static int plan_stages(const FourAecNrResConfig* cfg, const FourAecNrResMemReq* req,
@@ -169,8 +151,6 @@ static void fill_hop(float* microphones, float* reference,
     }
 }
 
-/* ------------------------------------------------------------------ */
-
 int main(int argc, char* argv[]) {
     AecPreset preset = AEC_PRESET_BALANCED;
     AnrMode nr_mode = ANR_MODE_BALANCED;
@@ -235,9 +215,8 @@ int main(int argc, char* argv[]) {
 
     if (print_mem_budget(&cfg) != 0) return 1;
 
-    /* Query -> allocate -> init: same caller-pool sequence as the mono
-     * static_main.c. Aligned allocation is a host stand-in for the board
-     * memory manager; the pipeline owns none of this memory. */
+    /* Query -> allocate -> init, as in the mono static_main.c. The aligned allocation is a
+     * host stand-in for the board memory manager. */
     FourAecNrResMemReq req;
     FourAecNrResMemBreakdown bd;
     Stages st;
@@ -322,7 +301,7 @@ int main(int argc, char* argv[]) {
     }
     uint32_t rng = SE_CNG_RNG_SEED;
 
-    /* === Processing loop === */
+    /* Processing loop */
     int frame;
     for (frame = 0; frame < 6; ++frame) {
         FourAecFront front;
@@ -367,7 +346,7 @@ int main(int argc, char* argv[]) {
     printf("Processed: %d frames (%d samples)\n", frame, frame * hop);
     printf("4aec_nr_res_static: smoke PASS\n");
 
-    /* === Cleanup === */
+    /* Cleanup */
     four_aec_nr_res_destroy(pipe);
     free(pool);
     free(mic_buf);

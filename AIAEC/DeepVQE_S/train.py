@@ -10,26 +10,23 @@
 
 config.ini sections (see the shipped config.ini for every knob, documented):
     [signal]   sample rate + FFT grid. MUST equal the grid the packed corpus
-               below was rendered with (AIAEC/dataset_gen/config.ini's
-               [signal]); AecGrid/SignalGrid do not re-derive it from the data.
+               was rendered with (AIAEC/dataset_gen/config.ini's [signal]);
+               AecGrid/SignalGrid do not re-derive it from the data.
     [data]     one packed corpus path + DataLoader batch size / workers +
                val_fraction (held out at LOAD time, see below)
     [model]    every DeepVQES constructor keyword (see model.py's __init__);
-               an unknown key raises rather than being silently ignored, so a
-               typo cannot build a differently-shaped model
+               an unknown key raises rather than being silently ignored
     [training] optimizer, seed, epoch budget, checkpoint/log locations
     [loss]     inherited Align-CRUSE PLCPA/STFT-consistency recipe
 
 dataset:
-    Data is rendered and packed by AIAEC/dataset_gen/ only -- see
-    AIAEC/dataset_gen/README.md and its config.example.ini for the full
-    generation walkthrough. This project generates ONE unified pool (no
-    source-disjoint split at generation time) and splits
-    train/val at LOAD time instead:
+    Data is rendered and packed by AIAEC/dataset_gen/ only (see its README.md
+    and config.example.ini). One unified pool is generated (no source-disjoint
+    split at generation time) and split train/val at LOAD time:
         cp AIAEC/dataset_gen/config.example.ini AIAEC/dataset_gen/config.ini
         python3 -m AIAEC.dataset_gen.gen_aec_dataset --config ... --split all --hours 100 --output data_aec_16k
         python3 -m AIAEC.dataset_gen.pack_aec_dataset --input data_aec_16k/all --output data_aec_16k/packed/all
-    ``[data] val_fraction`` then holds out individual 10-second chunks via
+    ``[data] val_fraction`` holds out individual 10-second chunks via
     ``training_common.split_dataset_by_sample``, deterministically from
     ``--seed``. Chunks from the same sequence/speaker/RIR may intentionally
     straddle the split, so generalisation requires a separate held-out set.
@@ -38,10 +35,9 @@ dataset:
 task (see ../README.md's decision matrix and
 ../dataset_gen/model_views.py MODEL_TASKS['DeepVQE_S']):
     mic + unaligned far-end in; the EARLY/DEREVERBERATED near-speech target
-    (``near_target``, not ``near_speech``) out -- DeepVQE's published task
-    includes dereverberation. ``build_model_view`` selects this same
-    product target for every candidate, so this file has no private target
-    branch.
+    (``near_target``, not ``near_speech``) out, since DeepVQE's published task
+    includes dereverberation. ``build_model_view`` selects this same product
+    target for every candidate, so this file has no private target branch.
 
 inference: see inference.py's own top-of-file usage comment.
 """

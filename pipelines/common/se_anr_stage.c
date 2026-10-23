@@ -1,13 +1,8 @@
-/* pipelines/common/se_anr_stage.c -- see se_anr_stage.h. */
 #include "se_anr_stage.h"
 
 #include "utility/simd_kernels.h"
 
-/* out[k] = r2[k] / SE_PSD_SCALE, as the exact reciprocal multiply:
- * sk_scale_f32 of utility/simd_kernels.h is the identical single
- * broadcast-multiply with no fused op (out[i] = x[i] * g), so its 4-wide
- * NEON unroll versus this file's former 16-wide one does not change the
- * per-lane rounding -- there is no cross-lane reduction to reorder. */
+/* out[k] = r2[k] / SE_PSD_SCALE as an exact reciprocal multiply. */
 static inline void se_psd_scale(float* out, const float* r2, int n) {
     sk_scale_f32(out, r2, SE_PSD_SCALE_INV, n);
 }

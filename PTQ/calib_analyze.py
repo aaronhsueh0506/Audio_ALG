@@ -97,12 +97,9 @@ def load_artifact(path):
         width = max(4, len(str(frames - 1)))
         arrays = {}
         for name, spec in report['binary_tensors'].items():
-            # Same guard AINR/calibration_io.py's writer already applies to
-            # tensor names before using them as path components -- this
-            # reader had no equivalent check on the name it loads FROM a
-            # manifest.json that is itself untrusted input (a shared/vendor
-            # calibration artifact), so an absolute or ".."-containing name
-            # could otherwise make os.path.join() escape this directory.
+            # The manifest is untrusted input and the name becomes a path
+            # component: reject absolute or ".."-containing names, as the
+            # AINR/calibration_io.py writer does.
             if name != os.path.basename(name) or name in ('.', '..'):
                 raise ValueError('invalid calibration tensor name in '
                                  'manifest.json: %r' % name)
@@ -302,7 +299,7 @@ def _mse_range(values, lo, hi, scheme):
 def kl_threshold(absvalues, bins=2048, target=128):
     """Symmetric clip threshold minimising KL(reference || 128-level quantised).
 
-    The entropy calibration used by TensorRT-style tools; ``absvalues`` is |x|.
+    The entropy (KL) calibration; ``absvalues`` is |x|.
     """
     top = float(absvalues.max())
     if top <= 0:

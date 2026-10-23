@@ -26,19 +26,11 @@ __all__ = ['PackedAecDataset', 'aec_collate']
 class PackedAecDataset(Dataset):
     """Open one ``.pt`` shard, or every shard in a directory, in order.
 
-    ``__getitem__`` returns ``(stems, meta)`` where ``stems`` is the raw
-    ``(4, T)`` tensor in ``PACKED_STEM_ORDER``.  Wrap it in
-    :class:`~AIAEC.dataset_gen.aec_features.AecStems` to read channels by name --
-    :meth:`stems_of` does that for you.
-
-    ⚠ ``stems`` comes out in the dtype the shard was PACKED with, which
-    ``--dtype float16`` makes half.  Widening is the consumer's job, and is
-    deliberately left there so the smaller dtype survives the loader: the
-    trainers do it on the same ``.to()`` as the device move.  A half tensor
-    handed straight to ``torch.stft`` raises ``expected scalar type Double
-    but found Half`` -- there is no half kernel on CPU -- so anything that
-    measures the stems needs ``.float()`` first.  ``self.dtype`` reports what
-    is on disk.
+    ``__getitem__`` returns ``(stems, meta)`` with ``stems`` the raw ``(4, T)``
+    tensor in ``PACKED_STEM_ORDER`` (:meth:`stems_of` wraps it in
+    ``AecStems``). ⚠ ``stems`` keeps the dtype the shard was PACKED with
+    (``--dtype float16`` makes it half), so anything measuring the stems needs
+    ``.float()``; ``self.dtype`` reports what is on disk.
     """
 
     def __init__(self, path: str, expected_sr: Optional[int] = None,
@@ -216,11 +208,9 @@ class PackedAecDataset(Dataset):
         """Dataset indices whose metadata matches every keyword.
 
         Only ``sequence_id``/``chunk_index`` are recorded, so this answers
-        "which chunks belong to sequence N", not "which chunks are dropouts" --
-        the renderer's per-chunk labels are not persisted (see
-        pack_aec_dataset.py). A subset that needs an acoustic property has to
-        measure the stems, which is possible precisely because they are stored
-        separately.
+        "which chunks belong to sequence N", not "which chunks are dropouts"
+        (per-chunk labels are not persisted, see pack_aec_dataset.py); an
+        acoustic subset has to measure the stems.
         """
         return [
             i for i, m in enumerate(self._meta)
@@ -240,13 +230,10 @@ class PackedAecDataset(Dataset):
     def fingerprint(self) -> str:
         """Stable corpus identity used by checkpoint/data-resume contracts.
 
-        ⚠ This identifies the packed corpus's SHAPE and inventory -- rate,
-        geometry, dtype, linear-AEC contract, and every (sequence, chunk) it
-        contains -- not the audio itself. Two corpora rendered from different
-        configs or seeds into the same shape fingerprint identically,
-        because nothing on disk records which config rendered a chunk. A
-        checkpoint resumed against the wrong corpus of the same shape will not
-        be caught here.
+        ⚠ Identifies the packed corpus's SHAPE and inventory (rate, geometry,
+        dtype, linear-AEC contract, every (sequence, chunk)), not the audio:
+        two corpora rendered from different configs into the same shape
+        fingerprint identically.
         """
         digest = hashlib.sha256()
         header = {

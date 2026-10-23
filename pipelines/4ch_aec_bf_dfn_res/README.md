@@ -30,9 +30,8 @@ network estimates from the beamformed error and is applied to the post-RES
 spectrum. The core's comfort-noise fill is kept as a switch but is OFF by
 default in this variant: with it on, the additive fill perturbs P's phase in
 the RES-cut bins, which breaks the estimate/apply phase consistency the
-complex deep filter relies on, and no true-model result yet supports enabling
-it (when on it travels through the network with the rest of P and
-`atten_lim_db` bounds the attenuation of every bin). With no model callback
+complex deep filter relies on (when on it travels through the network with the
+rest of P and `atten_lim_db` bounds the attenuation of every bin). With no model callback
 (or a failing one) the output is the
 conventional core with `enable_nr=0` delayed: bit for bit by two hops at
 48 kHz (the acceptance gate in `tests/test_4aec_dfn_res.c` asserts it for
@@ -88,10 +87,8 @@ python pipelines/tools/eval_dfn2_4ch_inputs.py \
 
 `--identity-model` is a pipeline/resampler smoke gate only. It requires every
 DFN arm to equal RES-only exactly and makes no speech-quality claim. The
-checked-in `dfn2_best.pth` and `dfn2_last.pth` are v5/feature-v3
-checkpoints, while current code requires model-v6/feature-v5. The contract
-gate intentionally refuses them; a fresh compatible training run is required
-before PESQ/STOI or echo-cohort conclusions are valid.
+contract gate refuses a checkpoint whose model/feature versions differ from the
+current model-v6/feature-v5.
 
 ## Compute admission
 

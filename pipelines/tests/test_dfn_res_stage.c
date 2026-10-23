@@ -43,22 +43,12 @@ static void fill_frame(Complex *estimate, Complex *apply, int frame) {
 }
 
 /* ---- absolute scale at the model boundary --------------------------------
- *
- * The stage hands DFN2 the host's audio-scale spectrum multiplied by 2^-5.
- * The reference here is DFN2's own C TIME-mode analysis of the same audio.
- * This checks the integration contract, not an independent PyTorch reference
- * or the perceptual quality of a trained model.
- * Every other gate on this seam is blind to it: IN_SCALE * OUT_SCALE == 1, so
- * the fail-open and identity paths reproduce their input at ANY scale, and a
- * consistent 2^-4 or 2^-20 would pass them all while the model saw features
- * 6 dB out or clamped at the log floor.
- *
- * This row drives one signal down both paths and compares what the model
- * actually receives: the ERB and complex feature windows. It therefore pins
- * three things at once -- the scale factor, the analysis window, and the
- * frame assembly ([previous hop | this hop], 50% overlap, no centring).
- * Both paths use the shared periodic sqrt-Hann; audiolib/test_stft compares
- * the table's bits with independent formulas. */
+ * The stage hands DFN2 the host's audio-scale spectrum times 2^-5. The fail-open and
+ * identity paths reproduce their input at any scale (IN_SCALE * OUT_SCALE == 1), so only
+ * this row sees a wrong factor: it drives one signal down the product path and DFN2's own
+ * C TIME-mode analysis and compares the ERB and complex feature windows the model
+ * receives. That pins the scale factor, the analysis window and the frame assembly
+ * ([previous hop | this hop], 50% overlap, no centring). */
 typedef struct ScaleCapture {
     float erb[SCALE_FRAMES][CAP_ERB];
     float spec[SCALE_FRAMES][CAP_SPEC];

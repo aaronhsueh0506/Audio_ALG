@@ -376,13 +376,16 @@ FourAecNrResConfig cfg = four_aec_nr_res_default_config(16000);
 | `fixed_delay_samples` | `int` | `-1` | 僅 `FIXED`：原生取樣點數；其餘模式須為 `-1` | 決定共用 delay ring 大小 |
 | `capture_proxy_channel` | `int` | `0` | `[0, 3]`。其他值拒絕 | 共用 delay matcher 要用哪一支麥克風當輸入。挑訊噪比最穩定、離喇叭關係最典型的那一支 |
 | `max_delay_ms` | `float` | `1024.0f` | 必須是有限值，且落在 `[0.0, 4096.0]` | 共用 reference delay line 的容量上限（毫秒）。實際的 ring 大小 = `ceil(max_delay_ms * sample_rate / 1000) + 2 * hop + 1` 個 sample。設得比你系統真實最大 mic↔ref 延遲**略大**即可；設太大只是白白吃記憶體 |
-| `aec_preset` | `AecPreset` | `AEC_PRESET_BALANCED`（= 1） | `MILD`(0) / `BALANCED`(1) / `AGGRESSIVE`(2)。列舉以外拒絕（**不會**默默 fallback） | 近端保留優先 → `MILD`；回聲抑制優先 → `AGGRESSIVE` |
+| `delay_backward_quarantine_enabled` | `int`（bool） | `0` | `0` 或 `1` | 僅 `MATCHED`。開啟後，比現行 accepted delay **更早**的共用估計會先被隔離（`capture_proxy_channel` 那條 lane 在目前對齊上仍明顯在消除回音時），到期才採用；往後跳與首次取得對齊不受影響。產品組態維持 `0`；機制說明見 `integration_4ch_spatial_zh_TW.md` 的 `core.delay_backward_quarantine_enabled` 列 |
+| `delay_backward_quarantine_s` | `float` | `1.0` | 有限值，`[0.0, 3600.0]` | 隔離窗長（秒），`init` 時換算成 hop 數（最小 1）；enable 為 0 時無作用但仍被驗證 |
+| `delay_est_period_s` | `float` | `0.0` | 有限值，`[0.0, 3600.0]` | 共用 matched-filter 的 duty-cycle 週期：`0.0` = 每 hop 全速分析；正值時估計 solid 且不變 `delay_est_init_s`（0.3 s，固定）後，改為每 round(`delay_est_period_s`/hop)÷5 個 hop（最小 1）分析一次，省算力但可能鎖到不同的 lag |
+| `aec_preset` | `AecPreset` | `AEC_PRESET_BALANCED`（= 1） | `MILD`(0) / `BALANCED`(1) / `AGGRESSIVE`(2) / `NO_FLOOR`(3)。列舉以外拒絕（**不會**默默 fallback） | 近端保留優先 → `MILD`；回聲抑制優先 → `AGGRESSIVE` |
 | `nr_mode` | `AnrMode` | `ANR_MODE_BALANCED`（= 2） | `MILD`(0) / `MODERATE`(1) / `BALANCED`(2) / `AGGRESSIVE`(3)。列舉以外拒絕 | 降噪強度，四級都可用；前端不讀它，`four_aec_nr_res_stage_configs()` 用它推導 `AnrConfig` |
 | `enable_nr` | `int`（bool） | `1` | 只接受 `0` 或 `1` | 前端自己不讀；它與 `enable_res`／`enable_cng`／`legacy_amin` 配置的是**你的後級**（`four_aec_nr_res_stage_configs()` 據此導出 `AecConfig`／`AnrConfig`；完整 wrapper 用它們決定 carve 哪些 stage）。`0` = 不建 MMSE-LSA，`total_gain` 只由 RES 決定。給「要回聲抑制但不要降噪」的產品 |
 | `enable_res` | `int`（bool） | `1` | 只接受 `0` 或 `1` | 同上，後級的設定。`0` = 不建 post-beam RES，`total_gain` 只由 NR 決定，CNG 沒有被 RES 挖掉的 bin 可填故略過；缺席的增益來源讀 unity 全 1 向量。`enable_post` 優先：`enable_post=0` 時前端不 carve fuse 緩衝（見 4.6b）；`enable_post=1` 時兩者獨立組合，都 `0` 即 beamform 後線性誤差經合成直通 |
 | `enable_post` | `int`（bool） | `1` | 只接受 `0` 或 `1` | `1` = 前端 carve fuse 緩衝，可呼叫 `four_aec_fuse()`；`0` = front-only 前端（只有 `four_aec_front_process()`，`four_aec_fuse()` 回 `INVALID_ARGUMENT`），給從不 fuse 的應用（例如 ULCNet）。見 4.6b |
 | `enable_cng` | `int`（bool） | `1` | 只接受 `0` 或 `1` | `1` = 在 RES 抑制掉的 bin 填舒適噪音，位準再乘該 bin 的 NR gain、下限 −10 dB |
-| `legacy_amin` | `int`（bool） | `0` | 只接受 `0` 或 `1` | `1` = NR 的 noise prior 不摺入 R²。只用於比對舊行為，新整合請保持 `0` |
+| `legacy_amin` | `int`（bool） | `0` | 只接受 `0` 或 `1` | `1` = NR 的 noise prior 不摺入 R²。只用於比對，新整合請保持 `0` |
 
 ### 4.2 Grid（由 `sample_rate` + `fft_size` 唯一決定）
 
@@ -433,7 +436,7 @@ lane 的 `filter_converged` / `dt_indicator` / `saturation_level` 縮成三個�
 | `n_channels` | `int` | 恆為 `FOUR_AEC_NR_RES_CHANNELS`（4） |
 | `n_freqs` | `int` | 這一幀的 bin 數 |
 | `linear_spectra[ch]` | `const Complex*` | 四路 linear AEC 的**頻譜**，就是 `four_aec_fuse()` 稍後會用的同一份。讓外部 beamformer 直接沿用既有的分析轉換，不必重做一次 STFT。**這是別名**，直接指向各 lane 自己的 buffer |
-| `formed_hop[ch]` | `const float*` | 各 lane 與 `linear_spectra[ch]` 同一次選擇的**時域** hop（`hop_size` 個 sample）。做自己的 sqrt-Hann 分析的時域 beamformer 要吃這個。**這也是借用的**，不再有 interleaved 拷貝 |
+| `formed_hop[ch]` | `const float*` | 各 lane 與 `linear_spectra[ch]` 同一次選擇的**時域** hop（`hop_size` 個 sample）。做自己的 sqrt-Hann 分析的時域 beamformer 要吃這個。**這也是借用的**，沒有 interleaved 拷貝 |
 | `aligned_ref` | `const float*` | 這一 hop 實際餵給四條 lane 的對齊後 far（`hop_size` 個 sample）；給需要「與線性濾波器吃到同一份 far」的外部 NN 後級用 |
 
 `SeSpecFrame`（`four_aec_fuse()` 填，定義在 `pipelines/common/se_stage.h`）：
@@ -652,8 +655,7 @@ destroy 之後不要再呼叫任何 accessor。
 ### 6.3 其他（不出貨）
 
 * `pipelines/4ch_aec_bf_nr_res/tests/` —— 測試；`tests/conv_chain_4ch.h` 是把後級串接寫在前端之上的參考鏈。
-* `audiolib/{doa,bf,common/utility}`(原 `pipelines/third_party/{doa,GSC,utility}`，2026-10-20
-  併入 `audiolib`) —— DOA / BF / spatial kernel 函式庫。
+* `audiolib/{doa,bf,common/utility}` —— DOA / BF / spatial kernel 函式庫。
   **只用本手冊這套 API 的話完全不需要它們。**
 * `.py` 檔 —— 主機端評估與參考實作，不是 C 產品的一部分。
 
@@ -717,7 +719,7 @@ front / fuse 協定：
 |---:|---|---|---|
 | 0 | `descriptor_version` | `uint32_t` | `1` |
 | 4 | `layout_version` | `uint32_t` | `22` |
-| 8 | `backend_id` | `uint32_t` | `2` = NE10（目前唯一的 FFT 後端）；`1` 已退役、不會再回傳；永遠不會是 0 |
+| 8 | `backend_id` | `uint32_t` | `2` = NE10（目前唯一的 FFT 後端）；永遠不會是 0 |
 | 12 | `build_flags_hash` | `uint32_t` | FNV-1a-32，隨 build 變動 |
 | 16 | `alignment` | `uint32_t` | `16` |
 | 20 | `reserved` | `uint32_t` | `0`（必須為 0，`init_ex()` 會驗證） |
@@ -746,5 +748,5 @@ front / fuse 協定：
 ### 8.4 相容性規則（給整合者的三條）
 
 1. **descriptor 永遠現查現用**。不要存進 NVRAM、不要跨 firmware rebuild 沿用。
-2. **舊 `backend_id=1`（已移除的 KISS 後端）的 descriptor 一律不相容**，即使 `bytes` 相同。
+2. **`backend_id` 不是 2 的 descriptor 一律不相容**，即使 `bytes` 相同。
 3. **升級 library 之後一定要重跑一次 `get_mem_requirements()`**，並確認 pool 預算仍足夠。

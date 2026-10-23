@@ -1,13 +1,10 @@
 """--jobs must not change the corpus, and --resume must not mix contracts.
 
-Both properties are structural -- a fresh PBFDKF per sequence, no shared
-mutable state, no random source -- but structural arguments are what these
-tests exist to stop anyone from having to trust.
-
-⚠ Compare AUDIO, never file bytes. libsndfile stamps a PEAK chunk with the
-wall-clock time when it writes a float WAV, so two runs of ANY configuration
-seconds apart differ in one byte at offset 61. Byte-comparing the files would
-make this test fail for a reason that has nothing to do with what it checks.
+Both properties are structural (a fresh PBFDKF per sequence, no shared mutable
+state, no random source), but these tests exist so nobody has to trust that. ⚠
+Compare AUDIO, never file bytes: libsndfile stamps a PEAK chunk with the
+wall-clock time, so two runs of ANY configuration differ in one byte at offset
+61.
 """
 import argparse
 import json
@@ -102,12 +99,11 @@ def test_a_ledger_from_another_contract_is_ignored_whole(tmp_path):
 def test_resume_does_not_bridge_an_accepted_behaviour_migration(tmp_path):
     """The asymmetry the migration entry documents, pinned.
 
-    A COMPLETED corpus travels forward on ACCEPTED_BEHAVIOR_HASH_MIGRATIONS --
-    the packer's gate reconstructs the migrated-from fingerprint and honours
-    that ledger. Resume must NOT: it decides which sequences to SKIP, and the
-    only safe answer for a run that is still partly unwritten is to redo it.
-    ``load_ledger`` is the resume path's whole view of the ledger, and it stays
-    an exact-match on fingerprint().
+    A COMPLETED corpus travels forward on ACCEPTED_BEHAVIOR_HASH_MIGRATIONS
+    (the packer's gate reconstructs the migrated-from fingerprint). Resume must
+    NOT: it decides which sequences to SKIP, and for a partly unwritten run the
+    only safe answer is to redo it, so ``load_ledger`` stays an exact
+    fingerprint() match.
     """
     import dataclasses
 

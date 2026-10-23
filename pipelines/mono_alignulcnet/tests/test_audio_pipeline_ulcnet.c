@@ -1,93 +1,10 @@
 /**
- * tests/test_audio_pipeline_ulcnet.c — acceptance tests for
- * pipelines/mono_alignulcnet/audio_pipeline_ulcnet.h (mono AEC(linear) -> Align-ULCNet
- * neural post-filter pipeline).
- *
- * Style mirrors tests/test_audio_pipeline.c (CHECK macro, LCG synthetic
- * input, 0xA5-poisoned pool, PASS/FAIL prints, nonzero exit on failure).
- * Not a DSP-quality test — a contract test for the API surface, the
- * one-hop-latency STFT/WOLA integration, and the model-callback policy.
- *
- * Two synthetic signal shapes drive everything:
- *   - "zero-delay echo" (mic = 0.3*ref + noise): the AEC's linear filter
- *     converges before the matched filter acquires, so the Path-A
- *     already-cancelling protection keeps delay_state UNLOCKED for the
- *     whole run — used where a stable identity path is wanted (test 1).
- *   - "bulk-delay echo" (echo delayed ECHO_DELAY=2000 samples, beyond the
- *     832-tap filter reach): the filter cannot converge unaligned, so the
- *     matched filter acquires deterministically (~hop 15 with this seed):
- *     one CHANGED hop, then LOCKED for the rest of the run — used wherever
- *     the model must actually be APPLIED (tests 2/3/5).
- *
- * Cases:
- *   1. identity E2E (NULL model): out[hop p] ~= formed_history[p-1] within
- *      2e-4 (hop 0 exactly zeros) — proves the AecResContext.formed_hop tap
- *      choice, the one-hop algorithmic latency, and the STFT/WOLA closure.
- *   2. counting model: infer is stepped for every emitted frame (constant
- *      compute path) EXCEPT the identity-reprime frames after an alignment
- *      generation: cumulative calls after hop #p == p+1 minus the reprime
- *      frames consumed so far (one frame per hop from hop #0, rolling
- *      analysis); model->reset fires exactly once per CHANGED hop during the
- *      run, plus exactly once more on audio_pipeline_ulcnet_reset(); a
- *      post-reset hop #0 is one inference again with an all-zero output.
- *   3. fail-open callback handling: a model whose output
- *      halves the spectrum (rc=0) but doubles it on scheduled failing hops
- *      (rc!=0) — output is bit-identical to the NULL-model pipeline's
- *      exactly where the policy says identity must hold (every failing
- *      frame) and differs on successful model frames, including while the
- *      AEC alignment state is UNLOCKED.
- *   4. pool rejection / reject-first config validation / init_ex 8-point
- *      descriptor gate / destroy idempotence / create-vs-init byte parity
- *      on a 0xA5-poisoned pool (patterns copied from test_audio_pipeline.c).
- *   5. NULL model == identity (copy err->out, rc=0) model: bit-identical
- *      output across UNLOCKED, CHANGED and LOCKED phases.
- *   6. far-timestamp before matched-delay acquisition: far-passthrough model,
- *      silence on mic, one unit impulse in far at a known sample index —
- *      the impulse must land in the output at EXACTLY impulse_index + HOP:
- *      the mono far tap is SAME-HOP with the error tap (no wrapper-side far
- *      compensation exists or is needed), and the centered ULCNet chain
- *      lags the input by exactly one hop. Documents the mono timing.
- *   7. Production never gates on the delay lock: a 0.5x model
- *      diverges from the NULL-model pipeline from the FIRST emitted frame
- *      (hop #1), long before the delay acquires.
- *   8. NaN guard: a model returning rc==0 but a NaN-poisoned spectrum on
- *      scheduled hops — those frames take the identity path BITWISE (equal
- *      to the NULL-model pipeline under the same 50%-overlap mixing rule
- *      as test 3), the next clean frame is applied again, and no NaN ever
- *      reaches the output.
- *   9. full-write contract: a model returning rc==0 after writing only the
- *      FIRST 100 bins on scheduled hops — the pipeline's NaN pre-fill of
- *      the staging buffers leaves the unwritten bins non-finite, so those
- *      frames take the identity path BITWISE (same mixing rule as test 8)
- *      and the next fully-written frame recovers. MUTATION: removing the
- *      pre-fill in audio_pipeline_ulcnet.c leaks stale finite values into
- *      the unwritten bins, the partial frames get applied, and this test
- *      goes red.
- *  10. fixed deployment contract: a model publishing a raw-far descriptor
- *      is accepted; an aligned-far descriptor is rejected by
- *      get_mem_requirements/init/init_ex/create. A NULL descriptor remains
- *      supported for identity and board bring-up callbacks.
- *  11. identity-reprime straddle DERIVATION: a unit impulse in the middle of
- *      the last pre-boundary hop measures, branch by branch, how many
- *      emitted frames still have a pre-switch hop inside their analysis
- *      window. Measured in a boundary-FREE control run (so the reprime never
- *      measures itself) and asserted equal to
- *      AUDIO_PIPELINE_ULCNET_REPRIME_FRAMES; the boundary run then proves
- *      the first model-visible frame after the reprime is marker-free on
- *      BOTH branches. MUTATION: no reprime, or one frame too few, goes red.
- *  12. identity-reprime BEHAVIOUR: exactly that many identity frames after a
- *      mid-stream MATCHED CHANGED hop and after the FIXED fill completion,
- *      infer frozen for exactly those frames and resuming right after, one
- *      model->reset per generation.
- *
- * Build (from pipelines/): `make test`. Standalone:
- *   cc -O2 -std=gnu99 -ffp-contract=off -I. -I../lib/aec/c_impl/include \
- *      -I../lib/aec/c_impl/example -I../../audiolib/common/include \
- *      -I../AIAEC/Align_ULCNet \
- *      -DAUDIO_PIPELINE_BACKEND_STR=\"ne10\" \
- *      tests/test_audio_pipeline_ulcnet.c audio_pipeline_ulcnet.c \
- *      ../AIAEC/Align_ULCNet/ulcnet_process.c \
- *      <libaec.a> <libaudio_common.a> -lm -o /tmp/tapu && /tmp/tapu
+ * Acceptance tests for audio_pipeline_ulcnet.h (mono linear AEC -> Align-ULCNet
+ * post-filter): API surface, one-hop STFT/WOLA latency, delay-event identity reprime
+ * and the model-callback policy. A contract test, not a DSP-quality test.
+ * Stimuli: a zero-delay echo (the delay state stays UNLOCKED) and a bulk-delay echo
+ * (ECHO_DELAY is beyond the filter reach, so the matched filter locks and a model is
+ * applied). Each test banner states its case. Build and run: `make test` in pipelines/.
  */
 #include "audio_pipeline_ulcnet.h"
 
@@ -249,20 +166,11 @@ static void test_identity_e2e(void) {
 }
 
 /* =========================================================================
- * 2. counting model. Bulk-delay echo so the run crosses UNLOCKED ->
- *    CHANGED -> LOCKED. infer is stepped for EVERY emitted frame EXCEPT the
- *    AUDIO_PIPELINE_ULCNET_REPRIME_FRAMES straddling frames after each
- *    CHANGED hop (the identity reprime), so cumulative calls after hop #p ==
- *    p+1 minus the reprime frames consumed so far (one frame per hop);
- *    model->reset fires once per CHANGED hop + once per pipeline reset.
- *
- *    Original intent kept: the per-hop compute is CONSTANT everywhere else
- *    -- one infer per emitted frame, never two, and never a hidden
- *    delay-gated skip. The reprime is the one documented exception and it
- *    only ever REMOVES work (those frames emit the identity without any
- *    inference); nothing anywhere doubles the per-hop model cost. The
- *    expectation below is built from the policy hop by hop, so both a
- *    missing and an over-long reprime fail here.
+ * 2. counting model, bulk-delay echo (UNLOCKED -> CHANGED -> LOCKED). infer is stepped
+ *    for every emitted frame except the AUDIO_PIPELINE_ULCNET_REPRIME_FRAMES identity
+ *    frames after each CHANGED hop; model->reset fires once per CHANGED hop plus once
+ *    per pipeline reset. The expectation is built hop by hop from that policy, so a
+ *    missing or an over-long reprime fails.
  * ========================================================================= */
 typedef struct {
     int infer_calls;
@@ -364,16 +272,11 @@ static void test_counting_model(void) {
     audio_pipeline_ulcnet_destroy(p);
 }
 
-/* FIXED has no estimator generation event: its seam is raw while the
- * alignment ring fills, then becomes aligned. The wrapper must still reset
- * external recurrent state exactly at that input-distribution boundary.
- *
- * The far branch is driven with real noise (not silence) so the seam's
- * content claim is checkable rather than vacuous: "UNLOCKED means the
- * content is the RAW far" is asserted byte-exactly on every fill hop
- * against the caller's own far history, and the shifted content is asserted
- * the same way from the first LOCKED hop on. The ref path applies no HPF and
- * no soft-clip, so equality is exact rather than approximate. */
+/* FIXED has no estimator generation event: its seam is raw while the alignment ring
+ * fills, then aligned. The wrapper must still reset the model at that boundary.
+ * The far branch carries real noise, so "UNLOCKED means the RAW far" is asserted
+ * byte-exactly against the caller's far history on every fill hop, and the shifted
+ * content the same way from the first LOCKED hop on. */
 static void test_fixed_first_alignment_resets_model(void) {
     enum { FIXED_DELAY = 2 * HOP, N = 8 };
     AudioPipelineUlcnetConfig cfg =
@@ -462,30 +365,12 @@ static void test_fixed_first_alignment_resets_model(void) {
 }
 
 /* =========================================================================
- * 2b. relock on the SAME delay still resets the model (ALIGNED).
- *
- * The mono twin of test_relock_same_delay_resets_model() in
- * 4ch_alignulcnet/tests/. Same scenario, same contract:
- *
- *   LOCKED(V) -> forced UNLOCKED for several hops -> LOCKED(V), same V
- *
- * must issue exactly one model->reset, on the relock hop, because ALIGNED
- * mode keeps STEPPING infer() while unlocked (constant per-hop compute) and
- * therefore carries recurrent state built over a reference the estimator had
- * not vouched for.
- *
- * The two families reach this from opposite directions and the test records
- * which. lib/aec spells "nothing accepted yet" as current_delay == -1, so its
- * first acquisition after a reset always crosses that sentinel and bumps
- * delay_generation -> AEC_LINEAR_DELAY_CHANGED, whatever value it relocks on;
- * mono was already correct. The 4ch core keeps a plain non-negative
- * accepted_delay with no sentinel, so its same-value relock had to be fixed
- * by tracking the not-usable -> usable transition explicitly. This test
- * pins the mono half of that shared contract so the two cannot drift apart.
- *
- * MUTATION: deleting the `delay_state == AEC_LINEAR_DELAY_CHANGED` model
- * reset in audio_pipeline_ulcnet.c turns both the acquisition and the relock
- * reset off and this test goes red.
+ * 2b. A relock on the SAME delay still resets the model (ALIGNED mode keeps stepping
+ *     infer() while unlocked, so its recurrent state spans an unvouched reference):
+ *     LOCKED(V) -> forced UNLOCKED for several hops -> LOCKED(V) issues exactly one
+ *     model->reset, on the relock hop. Same contract as the 4ch twin test.
+ *     MUTATION: removing the `delay_state == AEC_LINEAR_DELAY_CHANGED` model reset in
+ *     audio_pipeline_ulcnet.c turns this test red.
  * ========================================================================= */
 static int pipeline_delay_samples(const AudioPipelineUlcnet* p) {
     AecLinearContext lctx;
@@ -585,13 +470,10 @@ static void test_relock_same_delay_resets_model(void) {
 }
 
 /* =========================================================================
- * 3. fail-open model callback. Model A halves
- *    the spectrum on success (rc=0) and doubles it on scheduled failing
- *    hops (rc!=0); pipeline B has a NULL model. Output hop p mixes the
- *    frames pushed at hops p-1 and p (50% WOLA overlap), so A == B bitwise
- *    exactly when BOTH contributing frames took the identity path (rc!=0),
- *    and A != B when any successful
- *    frame contributed.
+ * 3. fail-open model callback. Model A halves the spectrum on success (rc=0) and
+ *    doubles it on scheduled failing hops (rc!=0); pipeline B has a NULL model.
+ *    Output hop p mixes the frames pushed at hops p-1 and p (50% WOLA overlap), so
+ *    A == B bitwise exactly when both contributing frames took the identity path.
  * ========================================================================= */
 typedef struct {
     int fail_now;   /* set by the test before each process call */
@@ -764,7 +646,7 @@ static void test_config_validation_rejects(void) {
     AudioPipelineUlcnetMemReq req0, req_explicit;
     AudioPipelineUlcnetConfig c0 = audio_pipeline_ulcnet_default_config(ULCNET_SR);
     AudioPipelineUlcnetConfig c_explicit = audio_pipeline_ulcnet_default_config(ULCNET_SR);
-    c0.fft_size = 0;  /* compatibility spelling for the same fixed grid */
+    c0.fft_size = 0;  /* 0 resolves to the compiled grid */
     c_explicit.fft_size = ULCNET_N_FFT;
     CHECK(audio_pipeline_ulcnet_get_mem_requirements(&c0, &req0) == 0 &&
           audio_pipeline_ulcnet_get_mem_requirements(&c_explicit, &req_explicit) == 0 &&
@@ -1133,16 +1015,11 @@ static void test_null_model_equals_identity_model(void) {
 }
 
 /* =========================================================================
- * 6. far-timestamp after fixed-delay acquisition. Far-passthrough model
- *    (copies far_ri -> out_ri, ignores err), silence on mic, one unit
- *    impulse in far at sample index T. The mono far tap is SAME-HOP with
- *    the error tap (this hop's raw ref feeds the far analysis beside this
- *    hop's formed error -- no wrapper-side far compensation exists or is
- *    needed), and the centered ULCNet chain output lags its input by
- *    exactly one hop (hop #p carries input hop p-1). So the reconstructed
- *    impulse must land at EXACTLY T + HOP. FIXED delay becomes solid several
- *    hops before the impulse, so an implementation that feeds AEC's aligned
- *    far moves it by FIXED_DELAY and this test fails.
+ * 6. far-timestamp after fixed-delay acquisition. A far-passthrough model, silence on
+ *    the mic and one unit impulse in far at sample T: the mono far tap is same-hop
+ *    with the error tap and the chain lags the input by one hop, so the impulse must
+ *    land at exactly T + HOP. A wrapper feeding AEC's aligned far would move it by
+ *    FIXED_DELAY.
  * ========================================================================= */
 static int passthrough_far_infer(void* user,
                                  const float err_re[ULCNET_BINS], const float err_im[ULCNET_BINS],
@@ -1265,15 +1142,11 @@ static void test_model_applies_unlocked(void) {
 }
 
 /* =========================================================================
- * 8. NaN guard. Model returns rc==0 but poisons one bin with NaN (and
- *    another with +Inf) on scheduled hops; otherwise it halves the
- *    spectrum. The model is applied from frame 1. Pipeline B has a NULL
- *    model. Same 50%-overlap mixing rule as test 3: output hop p is
- *    bit-identical to B exactly when BOTH contributing frames took the
- *    identity path (here: were NaN-poisoned and discarded), and differs
- *    when any clean (applied, 0.5x) frame contributed -- which also proves
- *    the next clean frame after a NaN window recovers. No NaN may ever
- *    appear in the output.
+ * 8. NaN guard. On scheduled hops the model returns rc==0 but poisons one bin with
+ *    NaN and another with +Inf; otherwise it halves the spectrum. As in test 3,
+ *    output hop p is bit-identical to a NULL-model pipeline exactly when both
+ *    contributing frames were poisoned and discarded, and differs once a clean frame
+ *    contributes (so recovery is proven). No NaN may reach the output.
  * ========================================================================= */
 typedef struct {
     int poison_now;   /* set by the test before each process call */
@@ -1378,18 +1251,12 @@ static void test_nan_guard(void) {
 }
 
 /* =========================================================================
- * 9. full-write contract. Model writes only the FIRST 100 bins (0.5x) on
- *    scheduled hops but still returns rc==0; otherwise it writes all bins
- *    (0.5x). The pipeline pre-fills the mdl_re/mdl_im staging with NaN
- *    before every infer call (ulcnet_process.h's FULL-WRITE CONTRACT), so
- *    the 157 unwritten bins stay NaN and the finite guard discards the
- *    frame: output is bit-identical to the NULL-model pipeline exactly
- *    when BOTH contributing frames were partial (same 50%-overlap mixing
- *    rule as test 8), and the next fully-written frame is applied again.
- *    MUTATION PROOF: removing the pre-fill loop in audio_pipeline_ulcnet.c
- *    leaves the previous frame's stale FINITE values in bins 100..256 --
- *    the guard cannot catch them, the partial frames get applied, and the
- *    bit-identical check below goes red.
+ * 9. full-write contract. On scheduled hops the model writes only the first 100 bins
+ *    but returns rc==0. The pipeline pre-fills its staging with NaN before every
+ *    infer call, so the unwritten bins stay non-finite and the frame takes the
+ *    identity path (same mixing rule as test 8); the next fully-written frame is
+ *    applied again. MUTATION: removing the pre-fill leaves stale finite values in
+ *    the unwritten bins and this test goes red.
  * ========================================================================= */
 typedef struct {
     int partial_now;   /* set by the test before each process call */
@@ -1489,44 +1356,14 @@ static void test_partial_write_guard(void) {
     audio_pipeline_ulcnet_destroy(pb);
 }
 
-/* =========================================================================
- * 11. Identity-reprime straddle DERIVATION (marker/timestamp test).
- *
- * Measures the quantity the reprime constant is supposed to be: how many
- * frames emitted at or after an alignment boundary at hop T still have a
- * PRE-boundary hop inside their two-hop analysis window, on the error
- * branch and on the far branch separately.
- *
- * Instrument: total silence except ONE unit impulse at the MIDDLE of input
- * hop T-1 -- the last hop pushed before the boundary. The middle is the
- * position the sqrt-Hann window weights at 0.707 in BOTH frames that cover
- * that hop (a marker at a hop edge would be multiplied by the window's zero
- * and hide itself). A frame's window therefore contains a pre-boundary hop
- * exactly when the model sees a spectrum whose peak is ~0.707 instead of the
- * silence floor. The two branches are marked in SEPARATE runs: the error
- * branch through the mic (far kept silent so the linear filter has no far
- * history to leak, leaving only the mic HPF's own short ring), the far
- * branch through the reference (which the seam carries byte-exactly).
- *
- * The count is derived from a CONTROL run that has NO boundary at all
- * (FIXED delay 0: the ring can serve from hop #0, so the wrapper never sees
- * a raw->aligned transition and never arms a reprime -- asserted, not
- * assumed). The reprime logic therefore takes no part in measuring its own
- * length, and the measurement is pure framing/latency: which emitted frames
- * still reach back across hop T. A boundary would only replace the content
- * of those straddling slots (mono clears nothing at all), never move them.
- *
- * The boundary run (FIXED delay = T hops, so the raw->aligned switch lands
- * exactly on hop T) then checks the implementation against that number:
- * exactly REPRIME frames are skipped, they are the frames at hops
- * T..T+REPRIME-1, and the first frame the model DOES see afterwards carries
- * no pre-switch sample on either branch.
- *
- * MUTATION: dropping the reprime counter (stepping always) makes the first
- * model-visible frame after the boundary the straddling one and the
- * marker-free assertion goes red; arming it one frame too short does the
- * same.
- * ========================================================================= */
+/* 11. Identity-reprime straddle derivation: per branch, how many frames emitted at or after
+ *     an alignment boundary at hop T still hold a pre-boundary hop in their two-hop window.
+ *     One unit impulse at the middle of hop T-1 (window weight 0.707 in both covering
+ *     frames) is marked on the error or the far branch in separate runs. The count comes
+ *     from a boundary-free control (FIXED delay 0, no reprime armed). The boundary run
+ *     (FIXED delay = T hops) must skip exactly AUDIO_PIPELINE_ULCNET_REPRIME_FRAMES frames,
+ *     at hops T.., and the first frame the model then sees must be marker-free on both
+ *     branches. MUTATION: no reprime, or one frame too few, turns that red. */
 enum {
     RP_T        = 8,            /* boundary hop under test                 */
     RP_MARK_HOP = RP_T - 1,     /* last hop pushed before the boundary     */
@@ -1614,24 +1451,12 @@ static int reprime_probe_run(int fixed_delay, int mark_far, ProbeModelState* st)
     return 0;
 }
 
-/* Frames emitted at hops [RP_T, RP_T+RP_WINDOW) that still carry the marker,
- * plus the classification margin (smallest marked peak / largest unmarked
- * peak inside that window).
- *
- * Measured on the boundary-free control, so this is the chain's MEMORY of
- * content injected before hop RP_T, not a straddle count. The distinction
- * matters per branch:
- *   far   -- the marker reaches the analysis untouched, so the memory is
- *            exactly the centered 50%-overlap window straddle. This is the
- *            derivation of REPRIME_FRAMES.
- *   error -- the marker passes the AEC linear filter first, so the memory is
- *            the straddle PLUS the filter's causal tail. That tail is not
- *            something the reprime is meant to hide (waiting it out has no
- *            principled bound -- every IIR tail would extend the reprime),
- *            so this branch can only bound the straddle from above.
- * The tail is why the two branches agree at 16 kHz and differ at 48 kHz:
- * filter_length is 52 ms (3.25 hops) at 16 kHz but 64 ms (6.00 hops) at
- * 48 kHz, while the straddle stays at one hop on both. */
+/* Frames emitted at hops [RP_T, RP_T+RP_WINDOW) that still carry the marker, plus the
+ * classification margin (smallest marked peak / largest unmarked peak). On the far
+ * branch the memory is exactly the window straddle, which derives REPRIME_FRAMES. On
+ * the error branch the marker passes the AEC filter first, so its memory is the
+ * straddle plus the filter's causal tail; that branch only bounds the straddle from
+ * above. */
 static int reprime_straddle_count(const ProbeModelState* st, int far_branch,
                                   float* dirty_min, float* clean_max) {
     int n = 0;
@@ -1770,13 +1595,10 @@ static void test_reprime_straddle_derivation(void) {
 }
 
 /* =========================================================================
- * 12. Identity-reprime BEHAVIOUR: exactly REPRIME identity frames per
- *     alignment generation, on both event shapes the wrapper recognises --
- *     a mid-stream MATCHED CHANGED hop and the FIXED ring-fill completion.
- *     Per hop the test predicts the infer delta from its OWN copy of the
- *     policy (arm REPRIME at the boundary hop, consume one per emitted
- *     frame) and compares against the counting model, so both a missing and
- *     an over-long reprime fail. reset stays exactly one per generation.
+ * 12. Identity-reprime behaviour: exactly REPRIME_FRAMES identity frames per alignment
+ *     generation, for a mid-stream MATCHED CHANGED hop and for FIXED ring-fill
+ *     completion. The test predicts the infer delta per hop from its own copy of the
+ *     policy and compares with the counting model; reset stays once per generation.
  * ========================================================================= */
 static void test_reprime_behavior(void) {
     enum { N = 60, FIXED_HOPS = 8 };
@@ -1915,32 +1737,22 @@ static void test_reprime_behavior(void) {
 }
 
 /* =========================================================================
- * Known-delay profile verification (product delay gate, NOT an audio-quality
- * run).
- *
- * The mono twin of test_4aec_nr_res.c's known-delay block: same synthetic
- * two-path echo with an exactly known bulk delay, same four questions
- * (acquisition, coverage boundary, mislock detectability, cost), checked
- * against ground truth rather than against a score. The one structural
- * difference is where n lives -- mono has ONE AEC instance and the whole
- * "5,728 B per matched filter" contract lands in its pool, whereas 4ch pays
- * it once in a shared estimator that the four lanes do not multiply.
+ * Known-delay profile check (product delay gate, not an audio-quality run): a
+ * two-path echo with an exactly known bulk delay, checked against ground truth for
+ * acquisition, coverage boundary, mislock detectability and cost. Mono has one AEC,
+ * so the whole per-filter pool cost lands in its pool.
  * ========================================================================= */
 
-/* Same geometry as the 4ch twin, spelled with lib/aec's own constants: a
- * bank of n filters reaches (n-1)*DA_FILTER_INTRA_SHIFT +
- * (DA_FILTER_SIZE - 11) downsampled samples (the -11 is the
- * `lag < filter_size - 10` reliability cut), decimation
- * DA_DOWN_SAMPLING_FACTOR. */
+/* A bank of n filters reaches (n-1)*DA_FILTER_INTRA_SHIFT + (DA_FILTER_SIZE - 11)
+ * downsampled samples (the -11 is the `lag < filter_size - 10` reliability cut),
+ * decimation DA_DOWN_SAMPLING_FACTOR. */
 #define KD_RELIABLE_SAMPLES(n) \
     ((((n) - 1) * DA_FILTER_INTRA_SHIFT * DA_DOWN_SAMPLING_FACTOR + \
       (DA_FILTER_SIZE - 11) * DA_DOWN_SAMPLING_FACTOR) * DELAY_RATE_FACTOR)
 /* Applied alignment may be EARLY of the true echo (PBFDKF then models a
  * positive residual) but never LATE; measured shortfall is 64-80 samples. */
 #define KD_MAX_UNDERSHOOT (128 * DELAY_RATE_FACTOR)
-/* Preserve the original 16 kHz test's 60-hop (960 ms) acquisition budget
- * in wall-clock time. The 48 kHz product hop is 10.67 ms, so it gets 90
- * hops rather than an accidentally tighter 640 ms budget. */
+/* 960 ms acquisition budget in wall-clock time on any grid. */
 #define KD_MAX_LOCK_HOPS \
     ((960 * ULCNET_SR + 1000 * HOP - 1) / (1000 * HOP))
 
@@ -2059,12 +1871,9 @@ static void test_known_delay_profile(void) {
                       KD_RELIABLE_SAMPLES(n) * 1000.0 / ULCNET_SR));
     }
 
-    /* Mislock detectability. Identical construction to the 4ch twin: an
-     * out-of-range dominant path plus an in-range early reflection makes the
-     * estimator lock, with a LOCKED seam state, onto the wrong path. Nothing
-     * in AecLinearContext distinguishes this from a correct lock, so only a
-     * comparison against an independently known delay catches it -- that
-     * comparison is what is asserted. This does not bless the behaviour. */
+    /* Mislock detectability: an out-of-range dominant path plus an in-range early
+     * reflection makes the estimator lock onto the wrong path with a LOCKED seam state.
+     * Only a comparison against the independently known delay catches it. */
     mono_known_delay_run(5, 200, 9271 * DELAY_RATE_FACTOR, 0.6f,
                          512 * DELAY_RATE_FACTOR, 0.5f, &mislock);
     mono_known_delay_run(5, 200, 3536 * DELAY_RATE_FACTOR, 0.6f,
@@ -2094,8 +1903,7 @@ static void test_known_delay_profile(void) {
                   control.locked
                       ? 3536 * DELAY_RATE_FACTOR - control.applied_delay : -1));
 
-    /* RAM. Mono has ONE AEC, so the whole per-filter cost lands in its pool
-     * -- this is where the 5,728 B/filter contract is spent per instance. */
+    /* RAM: the per-filter pool cost lands in this single AEC instance. */
     for (n = 1; n <= 5; n++) {
         AudioPipelineUlcnetConfig cfg = audio_pipeline_ulcnet_default_config(ULCNET_SR);
         cfg.delay_num_filters = n;
@@ -2270,10 +2078,8 @@ int main(void) {
     printf("\n=== audio_pipeline_ulcnet: FIXED first alignment resets the model ===\n");
     test_fixed_first_alignment_resets_model();
 
-    /* Runs on every grid. The far branch derives REPRIME_FRAMES exactly; the
-     * error branch only bounds it, because its marker arrives through the AEC
-     * filter and carries a causal tail that no reprime length can remove.
-     * See reprime_straddle_count's comment. */
+    /* The far branch derives REPRIME_FRAMES exactly; the error branch only bounds it
+     * (its marker carries the AEC filter's causal tail). */
     printf("\n=== audio_pipeline_ulcnet: identity-reprime straddle derivation ===\n");
     test_reprime_straddle_derivation();
 

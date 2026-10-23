@@ -1,28 +1,10 @@
 """Shared signal-grid and stem primitives for every AEC model project.
 
-WHY THIS LIVES HERE
--------------------
-Three model projects will consume the same packed AEC corpus and be compared
-against each other.  Anything that decides *what the model sees* -- the STFT
-grid, the window convention, the channel order of the stem tensor, and how
-consecutive chunks of one sequence reach a batch -- is therefore part of the
-comparison protocol, not an implementation detail of any one trainer.
-
-``AINR/dataset_gen/loader.py`` records what happens when such things are
-copied into each ``train.py``: a held-out fraction that drifts (5% vs 10%)
-trains the two models being compared on different corpora.  The same failure
-mode is available here and is worse, because a
-channel-order or window mismatch does not look like a bug -- it looks like a
-model that is merely worse.
-
-So: one ``AecGrid``, one ``stft``/``istft``, and one declared order for each
-storage boundary. A project that needs something different is opting out of
-the comparison and should say so in its own README.
-
-⚠ Nothing in this module derives a time constant from a fixed hop count.  Time
-constants arrive in SECONDS and go through ``alpha_from_tau``; a 48 kHz grid
-with hop 512 then produces the same physical smoothing as 16 kHz with hop 256
-without a single edit.
+What the model sees (STFT grid, window, stem channel order, chunk batching) is
+part of the comparison protocol between model projects; a mismatch looks like a
+model that is merely worse. So: one ``AecGrid``, one ``stft``/``istft``, one
+declared order per storage boundary. ⚠ Time constants arrive in SECONDS
+(``alpha_from_tau``), so 48 kHz/hop 512 smooths like 16 kHz/hop 256.
 """
 
 import configparser
@@ -53,19 +35,14 @@ __all__ = [
 # ============================================================
 # Stem channel order
 # ============================================================
-#
-# Fixed, and duplicated nowhere else.  The packed shards record this same tuple
-# under 'stems' so a shard that disagrees can be rejected instead of silently
-# feeding a stem into the wrong slot.
-#
-# ``echo`` (D), ``local_noise`` (N) and ``mic_preclip`` (S+N+D before
-# clipping/AGC) remain audit signals only -- no model task targets echo
-# cancellation without denoising, so N never needs to reach a
-# trainer as its own channel (see ``RenderedSequence.audit`` in
-# aec_dataset.py). ``linear_error`` is different: it is the real frozen
-# PBFDKF output E=Y-D_hat consumed by the three RES+NR candidates. It is
-# materialized over the COMPLETE parent sequence before chunking, never
-# manufactured from oracle D and never recomputed inside a training epoch.
+
+# Fixed, and duplicated nowhere else. The packed shards record this tuple under
+# 'stems' so a disagreeing shard is rejected instead of feeding a stem into the
+# wrong slot. ``echo`` (D), ``local_noise`` (N) and ``mic_preclip`` (S+N+D
+# before clipping/AGC) are audit signals only (see ``RenderedSequence.audit``).
+# ``linear_error`` is the real frozen PBFDKF output E=Y-D_hat consumed by the
+# RES+NR candidates, materialized over the COMPLETE parent sequence before
+# chunking, never from oracle D.
 BASE_STEM_ORDER = (
     'far_render',
     'near_speech',
@@ -95,12 +72,10 @@ PACKED_STEM_ORDER = (
 class AecGrid:
     """The time-frequency grid, derived once from config.
 
-    Frozen because a grid that can be mutated after a model is built is a grid
-    that will disagree with the weights it trained.  ``n_freqs`` and
-    ``frame_rate`` are real fields rather than properties so that
-    ``dataclasses.asdict(grid)`` produces a complete record for a checkpoint
-    contract -- a contract that stored only ``n_fft`` would happily accept a
-    checkpoint trained at a different hop.
+    Frozen because a grid mutable after a model is built disagrees with the
+    weights it trained. ``n_freqs`` and ``frame_rate`` are real fields, not
+    properties, so ``dataclasses.asdict(grid)`` is a complete checkpoint
+    contract record.
     """
 
     sr: int
@@ -230,12 +205,9 @@ def alpha_from_tau(tau_sec: float, hop_len: int, sr: int) -> float:
 
     ``alpha = exp(-hop_len / (sr * tau_sec))``
 
-    ⚠ This is the only place an EMA coefficient may be produced.  A literal
-    ``0.92`` in a model or a config is a frame-rate-dependent constant in
-    disguise: it means 220 ms at 16 kHz/hop 256 and 73 ms at 48 kHz/hop 512,
-    so the 48 kHz variant would quietly become a different algorithm.
-
-    Pass ``hop_len=1`` for a per-sample smoother (mic AGC, envelope followers).
+    ⚠ The only place an EMA coefficient may be produced: a literal ``0.92`` is
+    a frame-rate-dependent constant in disguise (220 ms at 16 kHz/hop 256, 73
+    ms at 48 kHz/hop 512). Pass ``hop_len=1`` for a per-sample smoother.
     """
     if sr <= 0 or hop_len <= 0:
         raise ValueError(f"sr and hop_len must be positive, got sr={sr}, hop={hop_len}")
@@ -250,17 +222,11 @@ def frames_from_seconds(seconds: float, frame_rate: float,
                         minimum: int = 0) -> int:
     """Duration in SECONDS -> whole frames on this grid.
 
-    ⚠ The counterpart of :func:`alpha_from_tau` for durations that are counted
-    in frames rather than smoothed: lookahead, filter spans, gate memories.
-    Same reasoning, same hazard.  A config that says ``taps = 16`` has baked in
-    a frame rate: 16 frames is 256 ms at 16 kHz/hop 256 but only 171 ms at
-    48 kHz/hop 512, so the 48 kHz variant silently covers a shorter echo tail
-    than the one it was tuned for.  Every duration in a config.ini is therefore
-    written in seconds and converted here.
-
-    ``minimum`` is for spans where zero is structurally meaningless -- a filter
-    with 0 taps or a gate with 0 frames of memory is not a degenerate setting,
-    it is an invalid one -- so the caller asks for at least 1.
+    ⚠ The counterpart of :func:`alpha_from_tau` for durations counted in frames
+    (lookahead, filter spans, gate memories): ``taps = 16`` bakes in a frame
+    rate (256 ms at 16 kHz/hop 256, 171 ms at 48 kHz/hop 512), so config.ini
+    durations are written in seconds. ``minimum`` is for spans where zero is
+    invalid (a filter with 0 taps).
     """
     if not math.isfinite(seconds) or seconds < 0.0:
         raise ValueError(f"duration must be finite and non-negative, got {seconds}")
@@ -343,13 +309,11 @@ class AecStems:
     #   D_hat                a linear/model echo estimate when available
     #   E = Y - D_hat        by subtraction, never a mask on Y
     #   R = D - D_hat        residual echo; emerges, never a target
-    #
-    # ``D`` (true echo), ``N`` (local noise) and ``R`` (oracle residual echo)
-    # deliberately have no accessor: no model task targets echo cancellation
-    # without denoising, so N is audit-only (see
-    # ``RenderedSequence.audit`` in aec_dataset.py) like D and R always were.
-    # E is the materialized *linear error*, not R. D_hat is derived exactly
-    # from the two persisted waveforms rather than stored twice.
+
+    # ``D``, ``N`` and ``R`` deliberately have no accessor (audit-only, see
+    # ``RenderedSequence.audit`` in aec_dataset.py). E is the materialized
+    # *linear error*, not R; D_hat is derived from the two persisted waveforms
+    # rather than stored twice.
     @property
     def Y(self) -> torch.Tensor:
         return self.mic_postclip
@@ -402,20 +366,11 @@ def lane_reset_mask(chunk_indices) -> torch.Tensor:
 class SequenceChunkSampler(Sampler):
     """Batch sampler whose lanes carry consecutive chunks of one sequence.
 
-    Batch *b* holds one chunk per lane; batch *b+1* holds the NEXT chunk of the
-    same sequence in each lane.  A trainer that keeps a per-lane recurrent state
-    across batches therefore sees one whole configured parent sequence unbroken.
-
-    ⚠ Resetting recurrent state every chunk is the default a naive DataLoader
-    gives you, and it hides precisely the behaviours this corpus was built to
-    expose: convergence from cold, recovery after an echo-path change, and
-    long-term drift.  A model that is never asked to remember anything past one
-    chunk cannot be shown to fail at any of them.
-
-    Lane boundaries: when a lane finishes a sequence it starts the next one, and
-    the first chunk of that sequence has ``chunk_index == 0``.  Use
-    :func:`lane_reset_mask` on the batch's ``chunk_index`` metadata to zero the
-    state for those lanes.
+    Batch *b+1* holds the NEXT chunk of the sequence batch *b* held in each
+    lane, so a per-lane recurrent state sees a whole parent sequence unbroken
+    (resetting every chunk hides cold-start convergence, echo-path recovery and
+    drift). A lane starting a new sequence has ``chunk_index == 0`` (see
+    :func:`lane_reset_mask`).
     """
 
     def __init__(self, sequence_ids: Sequence[int], chunk_indices: Sequence[int],

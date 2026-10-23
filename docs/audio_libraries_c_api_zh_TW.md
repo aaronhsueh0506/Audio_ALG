@@ -50,7 +50,7 @@
 | 16 kHz | 512 | 256 | 257 | 可選 |
 | 48 kHz | 1024 | 512 | 513 | 48 kHz 產品 grid |
 
-AEC 與 NR 另保留 8 kHz legacy grid，但 4ch product pipeline 不接受它。不要只傳
+AEC 與 NR 另支援 8 kHz grid（非產品主 grid），4ch product pipeline 不接受它。不要只傳
 `sample_rate` 後讓底層猜 FFT；16 kHz 有兩個合法值，建立實例前必須 resolve 成明確的
 `fft_size`。
 
@@ -639,7 +639,7 @@ const DeepVqePrepostDescriptor *deepvqe_prepost_descriptor(const DeepVqePrepost 
   commit 的有限性檢查只走每個 tap、`h_gru` 與各 window 的最新一幀，遇非有限值時整組 state 歸零、
   `deepvqe_prepost_state_generation()` 加一（`uint32_t deepvqe_prepost_state_generation(const DeepVqePrepost *p)`）。
 - `descriptor_validate()` 拿 ONNX/JSON metadata 裡的 13 欄 `c_descriptor` 對本 build 的 ABI 逐欄比對，
-  只有 `delay_depth` 是 export-time 部署參數、僅做範圍檢查；`DEEPVQE_PREPOST_LAYOUT_VERSION` = 4（1–3 退役；舊 layout 產生的 ONNX／JSON 與 calibration 資料須重新匯出，加速器程式須重編）。
+  只有 `delay_depth` 是 export-time 部署參數、僅做範圍檢查；`DEEPVQE_PREPOST_LAYOUT_VERSION` = 4。
 - D 範圍 `DEEPVQE_PREPOST_MIN_D`=1 到 `DEEPVQE_PREPOST_MAX_D`=256，出貨值
   `DEEPVQE_PREPOST_DEFAULT_D`=32（16 kHz 上的半秒搜尋範圍；D 是 export 期參數，圖 shape 與 C 傳入的 `delay_depth` 必須相同，descriptor 只檢查範圍，抓不到不一致）。
 - grid 只有 16 kHz/512/256：`aiaec_process.h` 帶 `#error` 守衛，grid 換掉是編譯失敗而不是默默重新解讀張量。

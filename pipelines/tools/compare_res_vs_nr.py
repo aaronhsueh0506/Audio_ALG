@@ -55,7 +55,7 @@ from pipelines.aec_nr_pipeline import (                       # noqa: E402
 )
 from lib.aec.python.aec import AecConfig, AecMode, AecPreset  # noqa: E402
 
-_N_FREQS = 257   # fft=512 → 512//2 + 1 (the AEC/NR/RES shared grid)
+_N_FREQS = 257   # fft=512 → 512//2 + 1
 
 
 def _build_cfg(sample_rate, preset, enable_res, enable_cng):

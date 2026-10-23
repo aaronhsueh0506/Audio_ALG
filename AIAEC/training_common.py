@@ -1,53 +1,39 @@
 """Shared training infrastructure for every AIAEC candidate trainer.
 
-Four model directories -- Align_CRUSE, Align_ULCNet, DeepVQE_S and CAGCRN --
-each own a ``train.py`` / ``config.ini`` / ``inference.py`` (see any
-of their top-of-file docstrings for the exact usage). What they do NOT each
-keep a private copy of lives here, for the same reason
-``AIAEC/dataset_gen/aec_features.py`` holds the signal grid and
-``AINR/dataset_gen`` holds the seeder: a knob that drifts between four
-near-identical copies is a checkpoint- or corpus-comparability bug that
-surfaces only as "one model is mysteriously worse."
+Four model directories (Align_CRUSE, Align_ULCNet, DeepVQE_S, CAGCRN) each own
+a ``train.py`` / ``config.ini`` / ``inference.py``. What they must not keep
+private copies of lives here: a knob that drifts between near-identical copies
+is a comparability bug that surfaces only as "one model is mysteriously worse."
 
 Provided here:
 
 * ``set_seed``                                -- re-exported from AINR.dataset_gen
-* ``read_model_kwargs``                       -- ``[model]`` config -> constructor
-  kwargs, generalising AINR/DeepFilterNet2's ``read_model_config`` (there:
-  one model class; here: four)
+* ``read_model_kwargs``                       -- ``[model]`` config -> constructor kwargs
 * ``make_checkpoint_contract`` /
   ``require_checkpoint_contract``             -- reject a checkpoint whose grid,
   task, model kwargs or loss version differ from the running config
 * ``scan_non_finite`` / ``NonFiniteTraining`` / ``GradNormLog`` /
   ``halt_on_non_finite`` / ``WeightScaleGuard`` / ``VanishedWeights``
-                                              -- the halt machinery is
-  re-exported from ``AINR.training_common``, not reimplemented a second time.
-  ``WeightScaleGuard`` covers the failure ``scan_non_finite`` structurally
-  cannot: weights that decay to denormal magnitudes stay FINITE
-* ``make_optimizer``                          -- fallback optimizer selector for
-  candidates whose paper does not prescribe a different recipe
-* ``make_scheduler`` / ``fast_forward_scheduler`` -- the common project
-  warmup/cosine recipe used by all shipped AIAEC training configs
-* ``compressed_spectral_loss``                -- project fallback for candidates
-  whose paper does not publish a training objective
-* ``component_compressed_mse_loss``           -- Align-ULCNet/ULCNet paper
-  objective: component-wise signed power compression followed by complex MSE
+                                              -- re-exported from
+  ``AINR.training_common``; ``WeightScaleGuard`` covers weights that decay to
+  denormal magnitudes and stay FINITE, which ``scan_non_finite`` cannot see
+* ``make_optimizer``                          -- fallback optimizer selector
+* ``make_scheduler`` / ``fast_forward_scheduler`` -- the common warmup/cosine recipe
+* ``compressed_spectral_loss``                -- fallback objective
+* ``component_compressed_mse_loss``           -- Align-ULCNet/ULCNet objective
 * ``power_compressed_complex_mse_loss``       -- Align-CRUSE PLCPA objective
-* ``si_snr_loss``                             -- waveform SI-SNR term used by
-  CAGCRN
+* ``si_snr_loss``                             -- waveform SI-SNR term used by CAGCRN
 * ``stft_consistent_spectrum`` / ``spectrum_to_waveform`` -- differentiable
   shared synthesis boundaries for objectives defined after iSTFT
 * ``LinearAecEngine``                         -- inference-only continuous-file
-  wrapper around the same frozen Python PBFDKF whose output is materialized as
-  dataset stem five (`linear_error`). Trainers never execute it.
+  wrapper around the frozen Python PBFDKF whose output is dataset stem five
+  (`linear_error`); trainers never execute it
 * ``split_dataset_by_sample`` / ``build_plain_loaders`` -- deterministic
-  per-chunk train/val split plus epoch-level shuffle for the unified corpus.
+  per-chunk train/val split plus epoch-level shuffle for the unified corpus
 
-Do not add a fifth copy of generic infrastructure into a candidate's
-``train.py``. A paper-specific optimizer remains in that candidate and is
-recorded in its checkpoint contract; the shared project schedule must not be
-presented as paper-published when a paper omits it. The same reasoning
-``AIAEC/dataset_gen/README.md`` gives for ``aec_features.py``.
+A paper-specific optimizer stays in its candidate and is recorded in its
+checkpoint contract; the shared schedule must not be presented as
+paper-published when a paper omits it.
 """
 
 from __future__ import annotations
@@ -231,10 +217,8 @@ def read_grids(cfg, section: str = 'signal') -> Tuple[AecGrid, 'SignalGrid']:
     ``AecGrid`` (``dataset_gen/aec_features.py``, field ``sr``) drives the
     dataset/STFT boundary; ``SignalGrid`` (``aiaec_common.py``, field
     ``sample_rate``) is what every model constructor takes. They describe the
-    identical grid under two names because they were written for two
-    different layers; building both from one config read here means they
-    cannot drift apart the way two independent ``cfg.getint`` call sites
-    could.
+    same grid under two names; building both from one config read keeps them
+    from drifting apart.
     """
     aec_grid = AecGrid.from_config(cfg, section=section)
     model_grid = SignalGrid(aec_grid.sr, aec_grid.n_fft, aec_grid.win_len, aec_grid.hop_len)
@@ -249,16 +233,11 @@ def split_dataset_by_sample(dataset, val_fraction: float,
                             seed: int = 42) -> Tuple[List[int], List[int]]:
     """Deterministically random-split individual materialized chunks.
 
-    The frozen PBFDKF has already run over each complete parent sequence before
-    the `linear_error` stem was cut into chunks. Consequently each stored item is a fixed
-    model sample: the trainer may place any chunk on either side and shuffle
-    train order without changing adaptive-filter state. Sharing a sequence,
-    speaker or RIR across train/validation is an explicit in-distribution
-    validation choice, matching the standalone NR loaders.
-
-    Returned indices are sorted only for shard/mmap locality. The assignment is
-    drawn from a dedicated RNG and depends exclusively on dataset length and
-    ``seed``.
+    The frozen PBFDKF already ran over each complete parent sequence before the
+    `linear_error` stem was cut into chunks, so any chunk may go on either side
+    and train order may be shuffled without changing adaptive-filter state.
+    Sharing a sequence, speaker or RIR across train/validation is an explicit
+    in-distribution choice. Indices are sorted for shard/mmap locality.
     """
     if not 0.0 <= val_fraction < 1.0:
         raise ValueError(f"val_fraction must be in [0, 1), got {val_fraction}")
@@ -334,15 +313,13 @@ def build_plain_loaders(cfg, aec_grid, seed: int = 42,
 
 def read_model_kwargs(cfg, model_cls, section: str = 'model',
                       aliases: Optional[Dict[str, str]] = None) -> Dict:
-    """Every ``model_cls.__init__`` keyword argument, overlaid with ``[model]``.
+    """Every ``model_cls.__init__`` keyword argument, overlaid with
+    ``[model]``.
 
     ``grid`` (and ``self``) are excluded: the signal grid comes from
-    ``[signal]`` via ``AecGrid.from_config``, not from a second copy in
-    ``[model]``. Unknown ``[model]`` keys raise, and the parsed type follows
-    the constructor's own default -- exactly
-    ``AINR/DeepFilterNet2/train.py``'s ``read_model_config``, generalised from
-    one model class to whichever ``model_cls`` a candidate's train.py passes.
-
+    ``[signal]`` via ``AecGrid.from_config``, not a second copy in ``[model]``.
+    Unknown ``[model]`` keys raise, and the parsed type follows the
+    constructor's own default.
     """
     aliases = aliases or {}
     sig = inspect.signature(model_cls.__init__)
@@ -426,11 +403,9 @@ def far_input_mode_c_value(mode: str) -> int:
 def checkpoint_far_input_mode(contract: Dict) -> str:
     """Return the contract's far-input mode; the ONE place the default lives.
 
-    Checkpoints written before ``far_input_mode`` existed all trained on raw
-    far by construction (see ``FAR_INPUT_MODES``), so a missing field reads as
-    ``'raw_far'`` and legacy checkpoints stay loadable. A recorded mode this
-    code does not know is rejected: it means the checkpoint's far
-    preprocessing has no implementation at this seam.
+    A missing field reads as ``'raw_far'`` (every checkpoint without it trained
+    on raw far, see ``FAR_INPUT_MODES``). A recorded mode this code does not
+    know is rejected: its far preprocessing has no implementation at this seam.
     """
     if not isinstance(contract, dict):
         raise ValueError("checkpoint has no valid contract")
@@ -447,32 +422,15 @@ def make_checkpoint_contract(*, model_name: str, task: str, grid, model_kwargs: 
                              loss_version: str, feature_version: Optional[str] = None,
                              data_contract: Optional[Dict] = None,
                              optimizer: Optional[Dict] = None) -> Dict:
-    """The fields a checkpoint must match to be resumed or loaded for inference.
+    """The fields a checkpoint must match to be resumed or loaded for
+    inference.
 
-    ``model_kwargs`` should be exactly what ``read_model_kwargs`` returned
-    (or what was passed to the model constructor), so a config edit that
-    changes the model's shape is caught before ``load_state_dict`` turns it
-    into a cryptic size-mismatch error.
-
-    ``optimizer`` is the resolved training recipe -- the optimizer name, its
-    numeric arguments and the schedule.  Since the four candidates diverged
-    onto their own papers' recipes these differ per model AND per run, and
-    without them two runs of one model at different learning rates produce
-    identical contracts and resume into each other in silence.  Recording the
-    recipe here rather than encoding it in ``loss_version`` keeps the loss
-    string about the loss.  Optional so a caller with no optimizer (an export
-    or an evaluation) can still build a contract.
-
-    ``grid`` accepts either ``AIAEC.aiaec_common.SignalGrid`` (``.sample_rate``,
-    the model-boundary type) or ``AIAEC.dataset_gen.AecGrid`` (``.sr``, the
-    dataset-boundary type) -- two dataclasses for the same grid, named
-    differently at the two layers; duck-typing here means a trainer never has
-    to convert between them just to record a checkpoint contract.
-
-    Model constructor kwargs are recorded under a ``ctor_`` prefix (not
-    ``model_``) so they cannot collide with the fixed ``model_name`` field --
-    a candidate could otherwise legitimately have a constructor keyword
-    literally named ``name``.
+    ``model_kwargs`` should be exactly what ``read_model_kwargs`` returned, so
+    a shape-changing config edit is caught before ``load_state_dict``.
+    ``optimizer`` is the resolved recipe: without it two runs at different
+    learning rates would resume into each other silently. ``grid`` accepts
+    ``SignalGrid`` or ``AecGrid``. Constructor kwargs use a ``ctor_`` prefix so
+    they cannot collide with ``model_name``.
     """
     sr = getattr(grid, 'sr', None)
     if sr is None:
@@ -505,9 +463,9 @@ def require_checkpoint_contract(ckpt: Dict, expected: Dict, context: str = 'chec
     """Reject a checkpoint whose recorded contract disagrees with ``expected``."""
     saved = ckpt.get('contract', {})
     if isinstance(saved, dict):
-        # Legacy checkpoints predate 'far_input_mode'; the single defaulting
-        # authority is checkpoint_far_input_mode (which also rejects an
-        # unknown recorded mode), so resume does not fail on the added field.
+        # checkpoint_far_input_mode is the single defaulting authority (it also
+        # rejects an unknown recorded mode), so a contract without the field
+        # still resumes.
         saved = dict(saved, far_input_mode=checkpoint_far_input_mode(saved))
     def compare(got, want, path):
         if isinstance(want, dict):
@@ -718,14 +676,11 @@ def spectrum_to_waveform(spectrum: Tensor, grid: AecGrid) -> Tensor:
 
 
 #: Longest waveform whose ``torch.stft`` BACKWARD is trustworthy on the MPS
-#: backend. Measured on torch 2.8.0: an iSTFT->STFT round trip differentiated
-#: on MPS agrees with CPU to 1.0000 up to 65,536 samples and then breaks
-#: discontinuously -- 65,792 samples gives a gradient-norm ratio of 0.063, and
-#: the shipped 10 s chunk at 16 kHz (160,256 samples) gives 0.424. The FORWARD
-#: is exact and the loss value is bit-identical, so a run on MPS descends
-#: normally on a gradient that is wrong by ~2.4x, with no symptom to catch it.
-#: ``torch.istft`` alone is exact at every length tested, which is why only the
-#: consistency projection is affected and not the SI-SNR path.
+#: backend: an iSTFT->STFT round trip differentiated on MPS matches CPU up to
+#: 65,536 samples and breaks beyond it (gradient-norm ratio 0.063 at 65,792
+#: samples, 0.424 at the 10 s / 16 kHz chunk). The FORWARD stays exact, so a run
+#: would descend on a wrong gradient with no symptom. ``torch.istft`` alone is
+#: exact at every length, so only the consistency projection is affected.
 _MPS_STFT_BACKWARD_SAFE_SAMPLES = 65536
 
 
@@ -758,16 +713,13 @@ def stft_consistent_spectrum(spectrum: Tensor, grid: AecGrid) -> Tensor:
 # Optimizer
 # ============================================================
 
-#: ``[training] optimizer`` -> class.  AdamW is the default because plain Adam's
+#: ``[training] optimizer`` -> class. AdamW is the default because plain Adam's
 #: COUPLED L2 term is a weight-killer on a branch whose gradient has gone quiet:
-#: ``weight_decay * w`` is then the only consistently signed contribution left in
-#: that tensor's gradient, and Adam divides it by ``sqrt(v_hat)`` of that same
-#: contribution, so the normalised step is ~1 and the weight moves a full ~lr
-#: per step -- through zero and on down into denormal magnitudes.  AdamW applies
-#: the identical ``weight_decay`` OUTSIDE the moment normaliser, a bounded
-#: ``(1 - lr * weight_decay)`` shrink per step that no vanishing gradient can
-#: amplify.  ``adam`` stays selectable so a run that predates the switch can be
-#: reproduced exactly.
+#: ``weight_decay * w`` is then the only signed contribution, Adam normalises it
+#: to a ~lr step per iteration and the weight is driven through zero into
+#: denormal magnitudes. AdamW applies ``weight_decay`` OUTSIDE the moment
+#: normaliser, a bounded ``(1 - lr * weight_decay)`` shrink per step. ``adam``
+#: stays selectable.
 OPTIMIZERS = {
     'adamw': torch.optim.AdamW,
     'adam': torch.optim.Adam,
@@ -778,14 +730,10 @@ DEFAULT_OPTIMIZER = 'adamw'
 def make_optimizer(cfg, params, *, lr: float) -> torch.optim.Optimizer:
     """Build the configurable optimizer named by the config.
 
-    New paper-reference trainers construct the optimizer named by their own
-    recipe directly.  This selector serves candidates without a published
-    optimizer; an unknown name is refused.
-
-    ``weight_decay`` keeps its nominal 1e-4 across the switch.  Decoupled, that
-    number is a much gentler regulariser than the same number was coupled, and
-    that is the intent: bounded shrink instead of an unbounded push once a
-    tensor's gradient vanishes.
+    Serves candidates without a published optimizer (paper-reference trainers
+    construct their own); an unknown name is refused. ``weight_decay`` keeps
+    its nominal 1e-4: decoupled, that is a much gentler regulariser than when
+    coupled, which is the intent.
     """
     name = cfg.get('training', 'optimizer', fallback=DEFAULT_OPTIMIZER)
     name = name.strip().lower()
@@ -811,16 +759,10 @@ def halt_on_non_finite(reason: str, *, model, mic: Tensor, target: Tensor,
                        sr: int, checkpoint: Dict, enhanced: Optional[Tensor] = None) -> None:
     """Dump evidence and raise, delegating to ``AINR.training_common``.
 
-    ``mic``/``target`` are whatever the caller's loss operates on -- for every
-    AIAEC trainer that is a COMPLEX SPECTRUM, not a waveform, because the
-    model-specific spectral objectives run in that domain. The delegate's
-    WAV dump therefore raises inside its own try/except and is skipped (it
-    tries ``torchaudio.save`` on a complex tensor); the ``batch.pt`` tensor
-    dump and ``lanes.txt`` per-lane summary, which do not assume a waveform
-    dtype, still capture full evidence. Threading the pre-STFT waveform
-    through for a real audio dump would add a per-trainer plumbing path and is
-    not provided.
-
+    ``mic``/``target`` are what the caller's loss operates on; for every AIAEC
+    trainer that is a COMPLEX SPECTRUM, so the delegate's WAV dump raises
+    inside its own try/except and is skipped, while the ``batch.pt`` tensor
+    dump and ``lanes.txt`` per-lane summary still capture full evidence.
     """
     _halt_on_non_finite(
         reason, model=model,
@@ -837,13 +779,11 @@ def halt_on_non_finite(reason: str, *, model, mic: Tensor, target: Tensor,
 class LinearAecEngine:
     """Continuous Python-PBFDKF wrapper for RES+NR file inference.
 
-    Training reads the already-materialized `linear_error` stem and never calls
-    this class. Inference constructs it from the checkpoint's exact
-    ``linear_aec`` contract, processes the whole file as one stateful stream,
-    and recovers ``D_hat`` by subtraction.
-
-    The multi-lane/reset surface is retained for diagnostics and parity tests,
-    not for trainer batching.
+    Training reads the materialized `linear_error` stem and never calls this
+    class. Inference constructs it from the checkpoint's exact ``linear_aec``
+    contract, processes the whole file as one stateful stream and recovers
+    ``D_hat`` by subtraction. The multi-lane/reset surface is for diagnostics
+    and parity tests, not trainer batching.
     """
 
     def __init__(self, n_lanes: int, sample_rate: int, preset: str = 'balanced',
@@ -922,13 +862,9 @@ class LinearAecEngine:
     ) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
         """Returns ``(error, echo_estimate, aligned_far)`` at ``mic.shape``.
 
-        The returned signal must stay the same shape as the microphone, so
-        this cannot truncate to a whole number of hops. A file may end with
-        a sub-hop remainder. That remainder is too short to feed
-        ``AEC.process()`` at all, so it
-        passes through with no cancellation applied (``error = mic``,
-        ``echo_estimate = 0`` there) -- the honest answer for a fragment the
-        engine never got to see, not an invented one.
+        The output keeps the microphone's shape, so it cannot truncate to whole
+        hops: a sub-hop remainder is too short for ``AEC.process()`` and passes
+        through uncancelled (``error = mic``, ``echo_estimate = 0``).
         """
         if mic.shape != far.shape or mic.ndim != 2 or mic.shape[0] != self.n_lanes:
             raise ValueError(
@@ -972,7 +908,8 @@ class LinearAecEngine:
         return self._last_aligned_far
 
     def __call__(self, mic: Tensor, far: Tensor, sample_rate: int) -> Tuple[Tensor, Tensor]:
-        """``LinearAecFrontend`` signature: ``(mic, far, sample_rate) -> (error, echo_estimate)``."""
+        """Frontend call signature: ``(mic, far, sample_rate) -> (error,
+        echo_estimate)``."""
         if sample_rate != self.sample_rate:
             raise ValueError(
                 f"engine was built for sample_rate={self.sample_rate}, got "

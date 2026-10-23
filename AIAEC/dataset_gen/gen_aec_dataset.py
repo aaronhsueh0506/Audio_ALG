@@ -1,25 +1,23 @@
 # -*- coding: utf-8 -*-
 """Offline rendering of AEC scenario sequences into 5-channel WAV chunks.
 
-Mirrors ``AINR/dataset_gen/gen_dataset.py``'s flags so the two generators are
-driven the same way, with two additions that the NR generator has no need for
-(and one omission, noted below):
+Mirrors ``AINR/dataset_gen/gen_dataset.py``'s flags, plus:
 
     --split       'all' (the selected protocol) or a SOURCE-DISJOINT side
                   ('train'/'val'), for a separate held-out generalisation corpus
     --manifest    optional persisted source-split decision
 
-⚠ There is no ``--sample-rate``. The generation rate is one member of a grid
+⚠ There is no ``--sample-rate``: the generation rate is one member of a grid
 that also fixes ``[signal] n_fft/win_len/hop_len``, ``[sequence] chunk_sec``
 and ``[codec] source_sr_values``, and pack_aec_dataset.py rebuilds the frozen
-linear-AEC contract from the same config file; only config.ini can move all of
-them together. See config.example.ini's header for the complete 48 kHz recipe.
+linear-AEC contract from the same config file. See config.example.ini's header
+for the complete 48 kHz recipe.
 
-⚠ The split is decided BEFORE generation, over the source lists. With the same
-config, source inventory and seed, it is rebuilt deterministically in memory;
-pass the SAME explicit ``--manifest`` to both source-disjoint runs if the
-source directories may change between them. See manifest.py for why splitting
-after generation (as the NR loader does) is wrong here.
+⚠ The split is decided BEFORE generation, over the source lists, and is rebuilt
+deterministically in memory from the same config, inventory and seed; pass the
+SAME explicit ``--manifest`` to both source-disjoint runs if the source
+directories may change between them. See manifest.py for why splitting after
+generation (as the NR loader does) is wrong here.
 
 Usage (selected training protocol -- one unified pool, then a deterministic
 random chunk split with AIAEC.training_common.split_dataset_by_sample at load
@@ -41,27 +39,16 @@ Output layout -- rendered audio and nothing else:
       train/..., val/...            source-disjoint mode instead of all/,
                                      shared by both runs
 
-By default there is no JSON output at all: `SSSSSS_CCC.wav` is the whole
-on-disk contract, and pack_aec_dataset.py rebuilds everything it needs from
-those filenames, the WAV headers and config.ini. ``--manifest PATH`` is an
-explicit opt-in for persisting a source-disjoint split; the packer never reads
-that control file.
-
-What that costs, stated plainly:
-  * --resume does not detect a config.ini/--seed edit between runs. It
-    checks that each planned sequence's chunks exist with the right rate,
-    length and channel count -- not that they were rendered by the config now
-    in effect. Resume into a directory only with the config that started it.
+`SSSSSS_CCC.wav` is the whole on-disk contract: pack_aec_dataset.py rebuilds
+everything else from the filenames, the WAV headers and config.ini. Limits:
+  * --resume does not detect a config.ini/--seed edit between runs; it only
+    checks each planned sequence's chunk count, rate, length and channels.
   * The renderer's per-chunk labels (scenario, ser_db, snr_db, rir_id, ...) are
-    not persisted. No trainer reads them; a curriculum that needs them
-    must measure the stems, which is possible precisely because they are
-    stored separately.
-What survives without any JSON, because it never depended on one:
-  * A visible chunk WAV is complete -- every chunk is written to a `tmp.` name
-    and renamed into place (see _save_chunk_atomic), so a killed run can never
-    leave a truncated chunk that looks finished.
-  * pack_aec_dataset.py re-checks channel count, length, rate and finiteness
-    on every chunk it packs.
+    not persisted; a curriculum that needs them measures the stems.
+  * Every chunk is written to a `tmp.` name and renamed into place
+    (seq_layout.save_chunk_atomic), so a killed run cannot leave a truncated
+    chunk, and pack_aec_dataset.py re-checks channel count, length, rate and
+    finiteness.
 
 Then pack with pack_aec_dataset.py.
 """
@@ -246,19 +233,13 @@ def _identity_collate(batch):
 def _sequence_is_complete(plan: SequencePlan, seqs_dir: str, *,
                           sample_rate: int, chunk_samples: int,
                           wav_encoding: str = 'float32') -> bool:
-    """Does this sequence's audio already exist, in full and in the right shape?
+    """Does this sequence's audio already exist, in full and in the right
+    shape?
 
     Every chunk 0..n_chunks-1 must be present with the expected rate, length,
-    channel count and encoding, and there must be no chunk BEYOND that range
-    (a leftover from a longer earlier render, which the packer would otherwise
-    pack as a real chunk).
-
-    ⚠ What this cannot check, since nothing records how a chunk was made:
-    whether the audio on disk was rendered by the config and --seed now in
-    effect. A config.ini edit, or a --seed change that reshuffles which
-    scenario each sequence_id draws, leaves same-shaped chunks that resume
-    happily accepts. Resume into a directory only with the run that started
-    it; use a new --output otherwise.
+    channel count and encoding, with no chunk BEYOND that range. ⚠ Not checked:
+    whether it was rendered by the config and --seed now in effect (nothing
+    records that), so resume only with the run that started the directory.
     """
     present = chunk_indices(seqs_dir, plan.sequence_id)
     if present != list(range(plan.n_chunks)):
@@ -298,12 +279,11 @@ def _validate_existing_output(plans: List[SequencePlan], seqs_dir: str,
                               resume: bool) -> None:
     """Prevent a rerun from silently mixing two WAV inventories.
 
-    Without a persisted run record, the filenames are the complete inventory.
-    A plain rerun would overwrite the planned prefix but leave any higher
-    sequence ids from an earlier run in place, and the packer would then
-    include both.
-    Resume may extend a corpus, but every existing sequence id must be part of
-    the current plan so lowering ``--hours`` cannot leave an invisible tail.
+    The filenames are the complete inventory, so a plain rerun would leave
+    higher sequence ids from an earlier run in place and the packer would
+    include both. Resume may extend a corpus, but every existing sequence id
+    must be part of the current plan so lowering ``--hours`` cannot leave an
+    invisible tail.
     """
     existing = scan_chunks(seqs_dir)
     if not existing:
@@ -329,18 +309,11 @@ def _validate_existing_output(plans: List[SequencePlan], seqs_dir: str,
 def _motion_modes_this_config_can_draw(cfg, plans) -> set:
     """Every path-motion mode the run could render, drawn or not.
 
-    The room requirement below is a property of the CONFIG and the source
-    inventory, not of one plan: checking only the modes a small ``--hours``
-    happened to draw lets a five-sequence trial run pass a manifest that the
-    full run refuses hours later, which is the opposite of a preflight. Any
-    mode the config gives a probability above zero is therefore checked, and
-    the drawn modes are added because a legacy plan carries its mode without a
-    probability section to read it from.
-
-    ⚠ The probabilities are read from the ONE section the planner will read
-    them from -- [impairments] for a layered config, [scenarios] otherwise.
-    Taking both would refuse a split over a probability the active branch
-    ignores, e.g. a stale [scenarios] left in a layered file.
+    The room requirement is a property of the CONFIG and source inventory, not
+    of one plan: checking only the drawn modes lets a trial run pass a manifest
+    the full run refuses. So every mode with a probability above zero is
+    checked too. ⚠ The probabilities come from the ONE section the planner
+    reads: [impairments] for a layered config, else [scenarios].
     """
     modes = {path_motion_mode(resolve_sequence_plan(plan)[2])
              for plan in plans}
@@ -373,13 +346,12 @@ def gen_aec_dataset(args):
 
     # --- config-only preflight ---------------------------------------------
     # The frozen PBFDKF grid and the chunk geometry depend on nothing but cfg,
-    # so they are checked here -- before the sequence plan, the manifest and
-    # the RIR RT60 scan. An unsupported grid or a chunk_sec that is not a whole
-    # number of linear-AEC hops must not cost a full source inventory pass
-    # first, and must not surface as a worker traceback partway into a render.
-    # (The echo_path_change preflight further down cannot join them: it needs
-    # the manifest's rooms_to_rirs.) pack_aec_dataset.py rebuilds the same
-    # contract from the same config.
+    # so they are checked before the sequence plan, the manifest and the RIR
+    # RT60 scan: an unsupported grid or a chunk_sec that is not a whole number
+    # of linear-AEC hops must not cost a full source inventory pass or surface
+    # as a worker traceback. (The echo_path_change preflight below needs the
+    # manifest's rooms_to_rirs.) pack_aec_dataset.py rebuilds the same
+    # contract.
     linear_aec_contract = linear_aec_contract_from_config(cfg)
     chunk_sec = cfg.getfloat('sequence', 'chunk_sec')
     chunk_samples = chunk_samples_from_config(cfg, linear_aec_contract.hop_size)
@@ -480,18 +452,13 @@ def gen_aec_dataset(args):
     motion_room_notes = []
     if motion_modes:
         # Fail before any worker starts rendering, not partway through a
-        # multi-hour run whenever one happens to draw the first moving
-        # sequence (AecSequenceRenderer checks this too, but only once a
-        # worker actually reaches that sequence). Every position of a
-        # trajectory lives in the same room, so the requirement is per room --
-        # and PER MODE, because a one-shot switch needs two positions where a
-        # continuous trajectory needs waypoints_min of them AND needs those
-        # positions to differ enough to reach the configured path correlation.
-        # ⚠ Deciding the second half costs one load of every RIR in the
-        # split's rooms plus a Gram per room, and then a closed form per set of
-        # positions the mode could draw there: 0.2 s over a 200-room manifest
-        # of four 0.5 s RIRs each, and 1 ms for the 2380 sets of a 16-position
-        # room, against hours of rendering.
+        # multi-hour run (AecSequenceRenderer checks this too, but only once a
+        # worker reaches such a sequence). Every position of a trajectory lives
+        # in the same room, so the requirement is per room and PER MODE: a
+        # one-shot switch needs two positions, a continuous trajectory needs
+        # waypoints_min of them that differ enough to reach the configured path
+        # correlation. ⚠ Deciding that costs one load of every RIR in the
+        # split's rooms plus a Gram per room, against hours of rendering.
         rooms_to_rirs = manifest['splits'][args.split]['rooms_to_rirs']
         prober = AecSequenceRenderer(
             cfg, pools_for_split(manifest, args.split),
@@ -517,15 +484,12 @@ def gen_aec_dataset(args):
                     f"[impairments] path-motion probabilities to 0"
                 )
             # Every position of a trajectory lives in one room, so a moving
-            # sequence can only come from a room that can host it -- the one
-            # motion cue the same-room invariant cannot remove. When the split
-            # has several rooms and only ONE of them can host the mode, that
-            # cue IS the room: every moving sequence carries one RT60 and one
-            # early-reflection signature and the mode is readable off the
-            # reverberation alone. Refused rather than warned about, because it
-            # cannot be repaired after the corpus exists. A split with a single
-            # room altogether is not that case -- there the room is constant
-            # and says nothing about any sequence.
+            # sequence can only come from a room that can host it. When the
+            # split has several rooms and only ONE can host the mode, that cue
+            # IS the room: the mode is readable off the reverberation alone.
+            # Refused rather than warned about, because it cannot be repaired
+            # after the corpus exists. A split with a single room altogether is
+            # not that case: the room is constant and says nothing.
             if eligible < 2 and len(rooms_to_rirs) > 1:
                 raise ValueError(
                     f"the configuration enables {mode} sequences but only 1 of "
@@ -670,14 +634,11 @@ def gen_aec_dataset(args):
         print(f"  ⚠ {motion_downgrades} sequence(s) drew a motion mode that "
               f"did not fit the sequence and rendered still")
     # The path correlation the rendered mixtures actually reached against the
-    # one the config asks for. They can only differ by the solver's own
-    # tolerance -- a trajectory renders positions that reach the target -- so
-    # this is the audit of that rule.
-    # ⚠ Scoped to the sequences THIS RUN rendered, like the Path motion row
-    # above and for the same reason: nothing about a finished sequence is
-    # persisted beyond its chunk WAVs, so a resumed run cannot read the reach
-    # of a sequence an earlier run wrote. A run that rendered none says so
-    # rather than printing nothing.
+    # configured one; they can only differ by the solver's own tolerance, so
+    # this is the audit of that rule. ⚠ Scoped to the sequences THIS RUN
+    # rendered, like the Path motion row above: nothing about a finished
+    # sequence is persisted beyond its chunk WAVs. A run that rendered none
+    # says so rather than printing nothing.
     if rendered_reach:
         for mode in sorted(rendered_reach):
             reached = sorted(rendered_reach[mode])

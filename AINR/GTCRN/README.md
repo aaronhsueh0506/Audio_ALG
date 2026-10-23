@@ -18,7 +18,7 @@ make test-simd
 make SIMD=0 test
 ```
 
-Architecture/paper notes are retained in `docs/architecture_notes.md`.
+Architecture/paper notes are in `docs/architecture_notes.md`.
 
 ## ONNX, ERB tables and calibration
 
@@ -36,6 +36,9 @@ python3 inference.py calib --model output/gtcrn_best.pth \
 python3 export_erb_matrix.py --model output/gtcrn_best.pth \
   --output-dir output/erb --format all
 ```
+
+The C runtime loads the files written by `export_erb_matrix.py --runtime-bins DIR`;
+the `--output-dir` formats are for toolchain validation.
 
 The graph takes eleven inputs: `mag`, `real`, `imag`, six `conv_*` windows,
 `h_tra` and `h_dpgrnn`. It returns
@@ -61,9 +64,8 @@ every state input before it writes any state output at the same address.
 After each invocation `gtcrn_model_state_validate()` finite-checks the whole
 state in place and returns `int`: `0` when every element is finite, `-1` on a
 null argument or on any NaN/Inf, in which case the whole state is zeroed (it
-restarts from zero) because the previous value no longer exists.
-
-A partial or mixed write that stays finite is not detectable.
+restarts from zero) because the previous value no longer exists. A partial or mixed write that
+stays finite is not detectable.
 
 The library zeroes the state on `gtcrn_model_state_reset()` and on a refused
 `gtcrn_model_state_validate()`, but the accelerator keeps its own fixed-point

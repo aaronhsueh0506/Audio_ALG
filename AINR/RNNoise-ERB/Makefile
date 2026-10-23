@@ -1,39 +1,20 @@
-# RNNoise-ERB table drift-guard wiring: the original flat build/ had no
-# compiler/flags identity, so `make CC=false CFLAGS=... test-tables` silently
-# re-ran a STALE binary from an earlier config -- reported PASS without ever
-# invoking CC=false -- and a command-line CFLAGS= could replace
-# -ffp-contract=off outright.
+# RNNoise-ERB test wiring.
 #
 #   make test-tables    build + run BOTH layers and fail on any FAIL:
 #                         1. canonical (default mode): byte-exact memcmp of
 #                            rnnoise_tables_gen.h against an independent
-#                            recompute -- the pinned-toolchain contract.
+#                            recompute.
 #                         2. portable (-DRNN_TABLES_PORTABLE): mathematical-
-#                            contract checks + measured-then-margined ULP
-#                            bounds (256 ULP recompute-vs-table garbage
-#                            detector; 4096 ULP Hann mirror-pair symmetry --
-#                            two DIFFERENT bounds for two different checks,
-#                            see the test source).
+#                            contract checks plus ULP bounds (256 ULP
+#                            recompute-vs-table, 4096 ULP Hann mirror pair).
 #
-# Same discipline as the four big Makefiles (lightweight version):
-#   - CFLAGS/FP_POLICY cannot be overridden on the command line OR via
-#     `make -e` + an environment variable of the same name (origin gate,
-#     with FP_POLICY's own bare-literal `:=` defined early enough for the
-#     origin check to see an `-e` override -- see its own comment below);
-#     EXTRA_CFLAGS is the supported hook, folded in BEFORE the repo-pinned
-#     -ffp-contract=off (appended last, conflict-rejected).
-#   - CFLAGS/EXTRA_CFLAGS text is validated against a character allow-list
-#     (letters/digits/underscore/dot/slash/equals/comma/plus/minus/space)
-#     before any conflict check runs, closing the quote/glob/tilde/redirect/
-#     process-substitution bypass class a substring-based flag check alone
-#     cannot see (see the "FP-policy allow-list" block below).
-#   - Binaries live in build/<cfg-sig>/ keyed by CC+CFLAGS+EXTRA_CFLAGS, with
-#     a config.manifest collision guard -- a config change always lands in a
-#     fresh directory and must genuinely compile there; a stale binary from
-#     another config can never satisfy this target again. BUILD_DIR may be
-#     overridden to an absolute path; the recipes that run a built binary
-#     resolve it via $(abspath $(BUILD_DIR)) so this works whether BUILD_DIR
-#     is relative or absolute (see the BUILD_DIR comment below).
+# Build policy:
+#   - CFLAGS/FP_POLICY cannot be overridden from the command line or by
+#     `make -e`; EXTRA_CFLAGS is the supported hook.
+#   - CFLAGS/EXTRA_CFLAGS must use a restricted character set and may not carry
+#     -Ofast, -ffast-math or -ffp-contract=; -ffp-contract=off is appended last.
+#   - Binaries live in build/<cfg-sig>/, keyed by the build configuration, with
+#     a config.manifest collision guard. BUILD_DIR may be absolute.
 
 CC ?= cc
 COMMON_DIR ?= $(abspath ../../../audiolib/common)
@@ -58,142 +39,61 @@ CFLAGS += -I.
 CFLAGS += $(EXTRA_CFLAGS)
 CFLAGS += $(SIMD_CFLAGS)
 
-# --- Bare-literal policy flags, defined early (`make -e` environment-override
-# gap; same treatment as the sibling C-library Makefiles -- see audiolib's
-# Makefile "Bare-literal policy flags" comment for the general mechanism).
-# FP_POLICY and
-# FP_ALLOWED_CHARS_RE are both plain, dependency-free `:=` literals (no
-# reference to CFLAGS or anything computed above) that MUST be assigned
-# before the "Command-line override rejection" foreach below queries
-# $(origin ...) on them: GNU Make only flips a variable's origin from plain
-# "environment" to "environment override" at the point THIS SAME-NAME
-# assignment is actually parsed (and, under `-e`, silently voided in the
-# environment's favor) -- checking before that assignment ever runs means the
-# check can never observe the flipped state. With FP_POLICY's bare literal
-# AFTER the foreach, `env FP_POLICY=-ffp-contract=fast make -e -n
-# test-features` would pass with no error and the printed compile line would
-# carry -ffp-contract=fast (the pinned policy silently overridden). There is
-# exactly one `:=` definition of FP_POLICY in this file; its CFLAGS append
-# (folded in LAST, after conflict detection) stays below.
+# --- Policy literals, assigned before the override check below: under `make -e`
+# the check only sees an environment override of a variable once its own
+# assignment has been parsed.
 FP_POLICY := -ffp-contract=off -fno-math-errno
-# FP_ALLOWED_CHARS_RE (the FP-policy allow-list's character class) has the
-# exact same `make -e` exposure and is a bare literal for the same reason -- see the
-# allow-list block below for what it's used for.
+# The allow-list character class is a bare literal for the same reason.
 FP_ALLOWED_CHARS_RE := ^[A-Za-z0-9_./=,+ -]*$$
 
-# --- Command-line override rejection (same design as the four main
-# Makefiles' analogous gate -- see audiolib's Makefile). A
-# command-line CFLAGS=/FP_POLICY= would silently drop the FP policy below;
-# a command-line/`-e` FP_ALLOWED_CHARS_RE= could silently widen the
-# allow-list below (e.g. to `.*`) and neuter it.
+# --- Override rejection: a command-line or `-e` value for these would drop the
+# FP policy or widen the allow-list.
 $(foreach v,CFLAGS FP_POLICY FP_ALLOWED_CHARS_RE,\
   $(if $(findstring command,$(origin $(v)))$(findstring override,$(origin $(v))),\
     $(error $(v) cannot be overridden (origin: $(origin $(v))) -- it would silently drop this Makefile's own flag appends (FP policy) or neuter the FP-policy allow-list; use EXTRA_CFLAGS instead)))
 
-# --- FP-policy allow-list (character-based; same as audiolib's Makefile --
-# see its allow-list comment for the full writeup of the
-# quote/glob/tilde/redirect/process-substitution bypass class a
-# character-by-character deny-list structurally cannot keep up with). It
-# complements the -Ofast/-ffast-math/-ffp-contract= conflict check further
-# below.
-#
-# Single-quote rejection MUST run first, as a pure $(findstring) Make-native
-# check with zero shell involvement: the allow-list below embeds $(CFLAGS)
-# SINGLE-QUOTED inside a $(shell ...) call, and a literal single quote in
-# CFLAGS would close that quoted string early and hand whatever follows to
-# the shell as live syntax. Inside a single-quoted POSIX shell string every
-# OTHER character is literal (double quote, backslash, backtick, "$(",
-# semicolon, pipe, ampersand all inert there), so a lone single quote is the
-# only character that can break this embedding -- kept as a separate pre-check
-# for that structural reason, not merely
-# because it's also outside the allow-list below (it is rejected by the
-# allow-list too).
+# --- FP-policy allow-list. A single quote is rejected first by a Make-native
+# check: the allow-list below embeds $(CFLAGS) single-quoted in a $(shell) call,
+# and a stray quote would end that string early.
 ifneq ($(findstring ',$(CFLAGS)),)
 $(error FP policy conflict: CFLAGS/EXTRA_CFLAGS contains a single-quote character; this repo requires plain, unquoted, whitespace-separated compiler argv tokens built only from the allowed character set (see the allow-list below) -- a single quote specifically must be rejected by this Make-native check BEFORE the allow-list's own $(shell) call can safely single-quote-embed the rest of the text)
 endif
 
-# The allow-list itself (same character set as audiolib's Makefile):
-# letters, digits, underscore, dot, slash, equals, comma, plus, minus, plus
-# space as the token separator between flags. Closes the redirection/glob/
-# tilde/process-substitution bypass class (>, <, <(...), *, ?, [, ], ~) that
-# a character-by-character deny-list cannot keep up with -- this file had no
-# character check of any kind before this. LC_ALL=C avoids locale-dependent
-# bracket-expression surprises in the [A-Za-z0-9...] ranges.
+# Allow-list: letters, digits, underscore, dot, slash, equals, comma, plus, minus
+# and space. LC_ALL=C keeps the bracket ranges locale-independent.
 FP_ALLOWLIST_RC := $(shell printf '%s' '$(CFLAGS)' | LC_ALL=C grep -Eq '$(FP_ALLOWED_CHARS_RE)'; echo $$?)
 ifneq ($(FP_ALLOWLIST_RC),0)
-# Diagnostic-only second $(shell) call (only ever runs on the already-doomed
-# error path above, never on a passing build): deletes every ALLOWED
-# character from the same single-quote-embedded text, leaving only the
-# disallowed ones, then dedupes/sorts them into a short, stable string -- so
-# the $(error ...) below names the SPECIFIC offending character(s) instead of
-# a generic "invalid format" message.
+# Error path only: name the offending characters.
 FP_DISALLOWED_CHARS := $(shell printf '%s' '$(CFLAGS)' | LC_ALL=C tr -d 'A-Za-z0-9_./=,+ -' | fold -w1 | LC_ALL=C sort -u | tr -d '\n')
 $(error FP policy conflict: CFLAGS/EXTRA_CFLAGS contains a character outside the allowed set [A-Za-z0-9_./=,+- ] (letters/digits/underscore/dot/slash/equals/comma/plus/minus, plus space as the token separator) -- disallowed character(s) found: "$(FP_DISALLOWED_CHARS)"; this repo requires plain, unquoted, whitespace-separated compiler argv tokens built only from that set -- remove/replace the disallowed character(s) shown above in CFLAGS/EXTRA_CFLAGS)
 endif
 
-# Command-line/`-e` override rejection for the allow-list's own internal
-# variable (same gap class as audiolib's Makefile's second foreach):
-# FP_ALLOWLIST_RC is computed from the fully-assembled CFLAGS via a
-# $(shell) call, so (unlike FP_POLICY/FP_ALLOWED_CHARS_RE above) it cannot be
-# relocated to the early bare-literal foreach -- its own override-rejection
-# check must run AFTER its real assignment so the origin-flip (plain
-# "command line", or under `-e` "environment override") has already happened
-# by the time $(origin ...) is queried here.
+# FP_ALLOWLIST_RC is computed from the final CFLAGS, so its override check runs
+# after the assignment.
 $(foreach v,FP_ALLOWLIST_RC,\
   $(if $(findstring command,$(origin $(v)))$(findstring override,$(origin $(v))),\
     $(error $(v) cannot be overridden (origin: $(origin $(v))) -- it would silently defeat the FP-policy allow-list check above, leaving the real CFLAGS content unvalidated; this variable is internal to that check and has no supported external use)))
 
-# FP-policy conflict detection + last-position append, with EXACT-TOKEN
-# matching -- same as audiolib's Makefile's FP_CONFLICT_FLAGS, see its
-# comment for the full writeup. A SUBSTRING match ($(findstring -Ofast,...)
-# etc.) would reject a legitimate flag value that merely CONTAINS one of these
-# substrings without BEING the flag -- e.g. -DROUND9_NOTE=-Ofastness, a
-# harmless macro definition (`env EXTRA_CFLAGS='-DROUND9_NOTE=-Ofastness' make
-# -n test-features` must not fail with "FP policy conflict").
-#
-# $(filter PATTERN...,TEXT) instead splits CFLAGS on whitespace and matches
-# each PATTERN against a WHOLE word only (% is $(filter)'s own single wildcard,
-# used here for -ffp-contract=<anything>) -- it can never match a flag value
-# that merely embeds one of these substrings inside a longer token, while a
-# real bare -Ofast / -ffast-math / -ffp-contract=<x> token is still caught.
+# FP-policy conflict check with exact-token matching: $(filter) compares whole
+# words, so a value that merely contains "-Ofast" as a substring is accepted
+# while a bare -Ofast / -ffast-math / -ffp-contract=<x> is rejected.
 FP_CONFLICT_FLAGS := $(filter -Ofast -ffast-math -ffp-contract=%,$(CFLAGS))
 ifneq ($(FP_CONFLICT_FLAGS),)
 $(error FP policy conflict: CFLAGS/EXTRA_CFLAGS contains $(FP_CONFLICT_FLAGS); this repo pins -ffp-contract=off; remove $(FP_CONFLICT_FLAGS) from CFLAGS/EXTRA_CFLAGS)
 endif
 
-# Command-line/`-e` override rejection for FP_CONFLICT_FLAGS itself (same gap
-# class as FP_ALLOWLIST_RC above, and the same one audiolib's Makefile
-# closes for its own FP_CONFLICT_FLAGS): without this guard, `make
-# FP_CONFLICT_FLAGS= EXTRA_CFLAGS=-Ofast -n test-features` sails straight
-# through with no error, and the printed compile line genuinely carries -Ofast
-# -- this file's own pinned FP policy silently defeated by overriding the
-# check's OWN internal variable rather than CFLAGS/EXTRA_CFLAGS directly.
-# FP_CONFLICT_FLAGS is computed from the fully-assembled CFLAGS via $(filter),
-# so (like FP_ALLOWLIST_RC) it cannot be relocated to the early bare-literal
-# foreach; this check must run AFTER its real assignment so the origin-flip has
-# already happened by the time $(origin ...) is queried here.
+# FP_CONFLICT_FLAGS is derived from the final CFLAGS, so its override check
+# runs after the assignment.
 $(foreach v,FP_CONFLICT_FLAGS,\
   $(if $(findstring command,$(origin $(v)))$(findstring override,$(origin $(v))),\
     $(error $(v) cannot be overridden (origin: $(origin $(v))) -- it would silently defeat the FP-policy conflict check above, leaving the real CFLAGS content unvalidated; this variable is internal to that check and has no supported external use)))
 
 CFLAGS    += $(FP_POLICY)
 
-# Config-keyed build dir + collision guard (lightweight _cfg_guard).
-#
-# BUILD_DIR is intentionally a caller-overridable knob (`make
-# BUILD_DIR=/some/path ...`), so it may be either relative (the default,
-# `build/<cfg-sig>`) or an absolute path. The recipes below that actually
-# EXECUTE a built binary (test-tables/test-features) must resolve it via
-# $(abspath $(BUILD_DIR)) rather than a hardcoded `./$(BUILD_DIR)/<binary>`
-# prefix: when BUILD_DIR is already absolute, `./$(BUILD_DIR)/binary` becomes
-# `.//tmp/abs_test_dir/binary` -- since the leading path component is `.`, not
-# `/`, that doubled slash collapses to a path RELATIVE to cwd
-# (`./tmp/abs_test_dir/...`), not the absolute path the binary was actually
-# built at, causing "No such file or directory" at real (non-dry-run) execution
-# (`make -n` alone never surfaces this -- it only prints the recipe text
-# without running it). $(abspath ...) is correct for BOTH a relative and an
-# already-absolute BUILD_DIR, and the result is kept double-quoted in the
-# recipe since the checkout's path may contain spaces.
+# Config-keyed build dir and collision guard.
+# BUILD_DIR may be relative or absolute; recipes that run a built binary use
+# $(abspath $(BUILD_DIR)) so both forms resolve, and quote it because the
+# checkout path may contain spaces.
 # The same CC command can select a different SDK through PATH.
 # Include effective pointer/FP/ISA predefines to avoid cross-ABI cache reuse.
 override CC_TARGET_SIG := $(shell sh $(COMMON_DIR)/scripts/target_abi_signature.sh $(CC) $(CPPFLAGS) $(CFLAGS))
@@ -249,15 +149,11 @@ test-simd: $(BUILD_DIR)/test_rnnoise_simd_auto $(BUILD_DIR)/test_rnnoise_simd_sc
 	 }; \
 	 echo "PASS: RNNoise SIMD/scalar local DSP (shared FFT fixed) digest $$auto"
 
-# Requires the training Python environment (torch + numpy).  Kept separate from
-# `make test` so the dependency-free embedded C checks remain runnable on hosts
-# that intentionally do not install PyTorch.  `test-calibration` belongs here
-# for the same reason -- it was briefly wired into `test`, which silently gave
-# the default target a torch dependency it is specifically designed not to have.
+# Requires the training Python environment (torch + numpy); kept out of
+# `make test` so the C checks run on hosts without PyTorch.
 #
-# PYTHON is overridable because a bare `python3` resolves to whatever is on
-# PATH (often /usr/bin/python3, which has no torch) rather than the project's
-# virtualenv:  make test-python PYTHON=../../.venv/bin/python3
+# PYTHON is overridable so the project's virtualenv can be used:
+#   make test-python PYTHON=../../.venv/bin/python3
 PYTHON ?= python3
 
 test-python: test-feature-python test-loss-python test-calibration

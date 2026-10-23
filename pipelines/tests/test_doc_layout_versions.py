@@ -1,15 +1,15 @@
 """每個 pipeline 的 ``layout_version`` 在文件站只能有一個值：header 裡的那個。
 
-這五個計數器是整合者判斷「持久化的 descriptor 還能不能用」的**唯一**訊號——
+這些計數器是整合者判斷「持久化的 descriptor 還能不能用」的**唯一**訊號——
 descriptor 的 ``bytes`` 只是下界，擋得住成長、擋不住等量的語意變更，而
 ``build_flags_hash`` 是 carve token 字串的 FNV-1a，對結構單純長大是盲的。
 所以文件把版號寫錯，整合者會沿用一份 ``init_ex()`` 其實會拒絕的 descriptor。
 
-C 測試把字面值釘死在 header 上（``test_4aec_nr_res.c`` 的
-``FOUR_AEC_NR_RES_LAYOUT_VERSION == 16u`` 那一列），這裡是文件端對稱的閘。
+C 測試把字面值釘死在 header 上（例如 ``test_4aec_nr_res.c`` 的
+``FOUR_AEC_NR_RES_LAYOUT_VERSION == Nu`` 那一列），這裡是文件端對稱的閘。
 
-只檢查**具名巨集**的宣稱（``FOUR_AEC_NR_RES_LAYOUT_VERSION = 16``）。文件裡另有
-「layout v6 起新增四個 delay 欄位」這類**沿革**敘述不是在陳述目前值，刻意不納入；
+只檢查**具名巨集**的宣稱（``FOUR_AEC_NR_RES_LAYOUT_VERSION = N``）。文件裡另有
+「layout vN 起新增…」這類**沿革**敘述不是在陳述目前值，刻意不納入；
 AIAEC 兩個 C 類別的版號（``ULCNET_MODEL_IO_LAYOUT_VERSION``、
 ``DEEPVQE_PREPOST_LAYOUT_VERSION``）以具名巨集形式納入，AINR 各模型自有的版號則不在此表。
 """
@@ -104,8 +104,8 @@ def _doc_files():
 
 
 # 巨集名之後允許夾一個 </code> 與空白，再吃 `=` 與數字。像
-# ``<code>FOUR_AEC_NR_RES_LAYOUT_VERSION</code> = 16`` 與
-# ``FOUR_AEC_NR_RES_LAYOUT_VERSION=15`` 兩種寫法都要抓到。
+# ``<code>FOUR_AEC_NR_RES_LAYOUT_VERSION</code> = N`` 與
+# ``FOUR_AEC_NR_RES_LAYOUT_VERSION=N`` 兩種寫法都要抓到。
 def _claim_pattern(macro: str) -> re.Pattern:
     return re.compile(
         r'%s(?:</code>)?\s*=\s*(\d+)' % re.escape(macro))
@@ -143,10 +143,7 @@ def test_unqualified_current_layout_claims(relative_path, macro, pattern):
 
 
 def test_the_scan_actually_reaches_the_pages_that_publish_versions():
-    """沒有這一列，上面五個測試在「掃不到任何檔案」時也會綠。
-
-    正好是這種空掃無聲通過，讓版號可以漂移一整個 release。
-    """
+    """沒有這一列，上面的測試在「掃不到任何檔案」時也會綠。"""
     files = _doc_files()
     assert files, '沒有掃到任何文件檔，%s 的路徑假設壞了' % _DOC_ROOT
     hits = sum(

@@ -1,34 +1,16 @@
-/**
- * static_main.c (binary aec_nr_pipeline_static) — AEC(linear) -> echo-aware NR -> RES  (Version B: static memory)
- *
- * Thin CLI shell over mono_aec_nr_res/audio_pipeline.h. All
- * pool-sizing/carving/per-hop-processing logic lives in audio_pipeline.c,
- * which is linkable on its own (see pipelines/README.md "Board
- * Integration"). This file keeps exactly what a CLI is actually
- * responsible for: argv parsing, WAV I/O,
- * the aligned caller-owned-pool allocation (see audio_pipeline.h's
- * audio_pipeline_init doc), and
- * the `--debug` / `DUMP_CTX` / `--print-mem-size` diagnostics.
- *
- * `aec_nr_pipeline_static out.wav` must be BYTE-IDENTICAL to
- * `aec_nr_pipeline out.wav` for the same inputs/options/backend (both are
- * the SAME audio_pipeline_process() call underneath — one reached via
- * an explicit caller pool, the other via audio_pipeline_create()'s heap
- * convenience wrapper).
- *
+/** Binary aec_nr_pipeline_static (caller-pool flavor): AEC(linear) -> echo-aware NR
+ * -> RES. Thin CLI over audio_pipeline.h: argument parsing, WAV I/O, the aligned
+ * caller-owned pool allocation and the `--debug` / `DUMP_CTX` / `--print-mem-size`
+ * diagnostics. Processing is the same audio_pipeline_process() call as aec_nr_pipeline.
  * Build:  make -C pipelines            (builds both binaries)
  * Usage:
  *   AEC preset: 0=mild, 1=balanced, 2=aggressive, 3=no_floor; names also accepted.
  *   ./aec_nr_pipeline_static <mic.wav> <ref.wav> <out.wav> [aec-preset]
- *                     [--nr-preset mild|moderate|balanced|aggressive] [--aec-only] [--no-nr] [--no-res] [--legacy-amin]
- *                     [--debug]
- *   ./aec_nr_pipeline_static --print-mem-size [preset] [--nr-preset ...] [--aec-only] [--no-nr] [--no-res]
- *                     [--sample-rate <hz>]
- *
- * --debug: identical semantics to the malloc pipeline (see
- *   main.c's header) — prints one combined AEC+NR status
- *   line/sec to stderr.
- */
+ *                     [--nr-preset mild|moderate|balanced|aggressive] [--aec-only]
+ *                     [--no-nr] [--no-res] [--legacy-amin] [--debug]
+ *   ./aec_nr_pipeline_static --print-mem-size [preset] [--nr-preset ...] [--aec-only]
+ *                     [--no-nr] [--no-res] [--sample-rate <hz>]
+ * --debug: one combined AEC+NR status line/sec to stderr (as in main.c). */
 
 #include <stdio.h>
 #include <stdlib.h>
@@ -39,9 +21,7 @@
 #include "audio_pipeline.h"
 #include "wav_io.h"
 
-/* ------------------------------------------------------------------ */
-
-/* CLI aliases only; unknown names retain the historical balanced fallback. */
+/* CLI aliases only; unknown names fall back to balanced. */
 static AecPreset parse_preset(const char* s) {
     if (strcmp(s, "mild") == 0 || strcmp(s, "0") == 0)
         return AEC_PRESET_MILD;
@@ -63,8 +43,7 @@ static const char* preset_name(AecPreset p) {
     }
 }
 
-/* Name table lives beside the enum (lib/nr anr_types.h); an unknown
- * name keeps this tool's long-standing fallback to balanced. */
+/* Name table lives beside the enum (anr_types.h); unknown names fall back to balanced. */
 static AnrMode parse_nr_mode(const char* s) {
     int m = anr_nr_mode_from_name(s);
     return m < 0 ? ANR_MODE_BALANCED : (AnrMode)m;
@@ -74,17 +53,9 @@ static const char* nr_mode_name(AnrMode m) {
     return anr_nr_mode_name(m);
 }
 
-/* --debug: one compact status line/sec to stderr, combining both libraries'
- * read-only diagnostic queries (aec_debug_status() / anr_debug_status())
- * via the handles audio_pipeline_get_aec()/audio_pipeline_get_nr() expose —
- * byte-identical helper to the malloc pipeline's copy.
- *
- * CAVEAT: this pipeline always runs AEC in linear mode (enable_res=0,
- * return_res_context=1 — the external NR/RES seam above), and aec.c only
- * caches last_erle_windowed when cfg.enable_res is true. So the "erle="
- * field below always reads 0.0dB here — expected given this pipeline's
- * config, not a broken query (see pipelines/README.md "Debugging &
- * Performance Flags"). */
+/* --debug: one status line/sec to stderr from the read-only aec_debug_status() /
+ * anr_debug_status() queries. The pipeline runs AEC in linear mode (enable_res=0),
+ * so "erle=" reads 0.0 dB here. */
 static void print_debug_status(const AudioPipeline* pipe, int aec_only, float seconds) {
     AecDebugStatus a;
     aec_debug_status(audio_pipeline_get_aec(pipe), &a);
@@ -109,11 +80,7 @@ static void print_debug_status(const AudioPipeline* pipe, int aec_only, float se
         n.initialized, n.mean_gain_db, n.min_gain_db, n.mean_spp, n.noise_floor_db);
 }
 
-/* Human-readable name for a descriptor backend_id -- CLI-side convenience
- * only (this is trusted local code turning OUR OWN integer back into a
- * string for a diagnostic table; not the caller-data %s/strcmp hazard the
- * library itself avoids -- see audio_pipeline.h's AudioPipelineMemReq.
- * backend_id doc). */
+/* Human-readable name of a descriptor backend_id, for the diagnostic table. */
 static const char* backend_id_name(uint32_t backend_id) {
     switch (backend_id) {
         case AUDIO_PIPELINE_BACKEND_NE10: return "ne10";
@@ -121,11 +88,8 @@ static const char* backend_id_name(uint32_t backend_id) {
     }
 }
 
-/* --print-mem-size diagnostic table. Backed by audio_pipeline_get_mem_breakdown
- * (per-module AEC/FFT/NR/pipeline-buffer split) + audio_pipeline_get_mem_requirements
- * (the descriptor struct: total bytes incl. the AudioPipeline
- * control block itself, descriptor_version, layout_version, backend_id,
- * build_flags_hash, alignment). */
+/* --print-mem-size table: per-module split (audio_pipeline_get_mem_breakdown) plus
+ * the descriptor (audio_pipeline_get_mem_requirements). */
 static void print_mem_budget(const AudioPipelineConfig* cfg) {
     AudioPipelineMemBreakdown b;
     AudioPipelineMemReq req;
@@ -156,17 +120,8 @@ static void print_mem_budget(const AudioPipelineConfig* cfg) {
     printf("\n");
 }
 
-/* ------------------------------------------------------------------ */
-
-/* ------------------------------------------------------------------ *
- * --timing: per-stage cost accumulation.
- *
- * Summed over the run and reported as a mean per hop, because a per-hop
- * print at 100 hops/s is noise and a single hop is not a measurement. The
- * UNATTRIBUTED line is not decoration: the stages deliberately do not sum to
- * the call (audio_pipeline.h documents what sits in the gap), so a table
- * that printed only the parts would imply a whole it never measured.
- * ------------------------------------------------------------------ */
+/* --timing: per-stage cost summed over the run and reported as a mean per hop. The
+ * UNATTRIBUTED line is the part of the call outside the listed stages. */
 typedef struct {
     uint64_t delay, frontend, linear, res, nr, post, synth, wall;
     uint64_t hops;
@@ -231,9 +186,8 @@ static uint32_t timing_now_us(void) {
 
 
 int main(int argc, char* argv[]) {
-    /* --print-mem-size diagnostic mode: report the pool byte budget (and
-     * exercise a real audio_pipeline_init(), so the init guards are covered)
-     * without any WAV I/O. */
+    /* --print-mem-size: report the pool byte budget and run a real
+     * audio_pipeline_init(), without WAV I/O. */
     if (argc >= 2 && strcmp(argv[1], "--print-mem-size") == 0) {
         AecPreset     preset      = AEC_PRESET_BALANCED;
         AnrMode nr_mode     = ANR_MODE_BALANCED;
@@ -304,7 +258,7 @@ int main(int argc, char* argv[]) {
     int           legacy   = 0;   /* --legacy-amin → min-only A_min_pl */
     int           no_nr    = 0;   /* --no-nr → no denoiser, g_total is G_res */
     int           no_res   = 0;   /* --no-res → no residual gain, g_total is G_nr */
-    int           no_cng   = 0;   /* --no-cng → disable comfort noise (parity) */
+    int           no_cng   = 0;   /* --no-cng -> disable comfort noise */
     int           debug_status = 0; /* --debug → periodic aec+nr status line   */
     int           show_timing  = 0; /* --timing → per-stage cost summary at exit */
     StageAccum    acc; memset(&acc, 0, sizeof(acc));
@@ -334,10 +288,7 @@ int main(int argc, char* argv[]) {
         fprintf(stderr, "Error: sample-rate mismatch\n");
         wav_close_read(mic_r); wav_close_read(ref_r); return 1;
     }
-    /* CLI rate whitelist: audio_pipeline_get_mem_requirements() would reject
-     * an unsupported rate anyway (aec_is_valid_sample_rate() under the hood)
-     * — fail earlier and with a clearer message here, before any buffers/pool
-     * are sized off it. */
+    /* CLI rate whitelist, checked before any buffers or pool are sized. */
     if (!aec_is_valid_sample_rate(mic_r->info.sample_rate)) {
         fprintf(stderr, "Error: unsupported sample rate %d Hz (supported: 8000, 16000, 48000)\n",
                 mic_r->info.sample_rate);
@@ -365,11 +316,8 @@ int main(int argc, char* argv[]) {
            preset_name(preset), nr_mode_name(nr_mode), !no_nr ? "on" : "off",
            !no_res ? "on" : "off", !no_cng ? "on" : "off");
 
-    /* === Query the descriptor, then allocate + hand in the single static
-     * pool (the ONE allocation — host stand-in for a platform memory
-     * block). This is the board story: a real integrator's memory manager
-     * replaces this malloc with its own allocator, keeping everything else
-     * identical. === */
+    /* Query the descriptor, then allocate the single static pool (a host stand-in for a
+     * platform memory block; a board replaces this malloc with its own allocator). */
     print_mem_budget(&cfg);
 
     AudioPipelineMemReq req;
@@ -382,7 +330,7 @@ int main(int argc, char* argv[]) {
     if (posix_memalign(&pool, req.alignment, (size_t)req.bytes) != 0) pool = NULL;
     if (!pool) { fprintf(stderr, "Error: aligned allocation failed (%llu bytes)\n", (unsigned long long)req.bytes); return 1; }
     if (((uintptr_t)pool) % req.alignment != 0) {
-        /* ALIGN16 contract (mem_align.h): don't rely on allocator luck. */
+        /* ALIGN16 contract (mem_align.h): do not rely on allocator luck. */
         fprintf(stderr, "Error: pool not %u-byte aligned (%p)\n", req.alignment, pool);
         free(pool); wav_close_read(mic_r); wav_close_read(ref_r); return 1;
     }
@@ -412,13 +360,9 @@ int main(int argc, char* argv[]) {
         wav_close_read(mic_r); wav_close_read(ref_r); return 1;
     }
 
-    /* Optional per-frame context dump (DUMP_CTX=<path>) for port parity tests —
-     * identical layout/semantics to the malloc pipeline: header [n_freqs, hop];
-     * then per frame error_spec(2·nf) res_gain(nf) r2(nf) comfort_noise(nf)
-     * far_power(1) g_nr(nf) out_hop(hop), all float32. Read via the
-     * audio_pipeline_get_aec()/audio_pipeline_get_nr() handles — a dump record
-     * is only ever written for a hop whose freq seam was actually available,
-     * mirroring audio_pipeline_process()'s own internal fallback check. */
+    /* Optional per-frame context dump (DUMP_CTX=<path>): header [n_freqs, hop]; then per
+     * frame error_spec(2*nf) res_gain(nf) r2(nf) comfort_noise(nf) far_power(1) g_nr(nf)
+     * out_hop(hop), all float32. Written only for hops whose freq seam was available. */
     FILE* dctx = NULL;
     const char* dpath = getenv("DUMP_CTX");
     if (dpath && !aec_only) {
@@ -429,7 +373,7 @@ int main(int argc, char* argv[]) {
     Aec* aec_handle = audio_pipeline_get_aec(pipe);
     AnrDenoiser* nr_handle = audio_pipeline_get_nr(pipe);
 
-    /* === Processing loop === */
+    /* Processing loop */
     int processed = 0;
     while (processed + hop <= n_samples) {
         wav_read_float(mic_r, mic_buf, hop);
@@ -476,11 +420,8 @@ int main(int argc, char* argv[]) {
     if (show_timing) print_stage_timing(&acc);
     printf("Output: %s\n", out_path);
 
-    /* === Cleanup ===
-     * All modules and pipeline scratch live in `pool` — a single free()
-     * releases everything after audio_pipeline_destroy() (teardown order
-     * NR -> pipeline FFT -> AEC, all no-ops on this pool-resident instance —
-     * see audio_pipeline.h). */
+    /* Cleanup: all modules and scratch live in `pool`; one free() releases everything
+     * after audio_pipeline_destroy(). */
     wav_close_read(mic_r);
     wav_close_read(ref_r);
     wav_close_write(writer);

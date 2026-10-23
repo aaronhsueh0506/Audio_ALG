@@ -1,19 +1,13 @@
 """Trainer-side loading primitives shared by every model in ``AINR/``.
 
-WHY THESE LIVE HERE
--------------------
-RNNoise-ERB and GTCRN are trained on the same packed 16 kHz corpus and then
-compared against each other, so *which samples each one gets* is part of the
-comparison protocol, not an implementation detail of either trainer.  When
-these functions are copied into each ``train.py`` they drift: GTCRN holding
-out ``max(2, 5%)`` while RNNoise-ERB holds out ``max(1, 10%)`` puts the two
-models on different corpora and different validation sets, which no amount of
-seed agreement can fix.  ``PackedDataset`` lives here for that reason; the
-split belongs with it.
-
-``DEFAULT_VAL_FRACTION`` is therefore the single definition of the held-out
-fraction.  A trainer may override it, but then it is opting out of the bake-off
-and should say so.
+RNNoise-ERB and GTCRN train on the same packed 16 kHz corpus and are compared
+against each other, so *which samples each one gets* is part of the comparison
+protocol: copied into each ``train.py`` these drift (one holding out ``max(2,
+5%)``, the other ``max(1, 10%)``) and no seed agreement fixes it.
+``PackedDataset`` and the split live here for that reason, and
+``DEFAULT_VAL_FRACTION`` is the single definition of the held-out fraction (a
+trainer may override it, but then it opts out of the bake-off and should say
+so).
 """
 
 import glob

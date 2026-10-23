@@ -1,11 +1,10 @@
 """End-to-end tests for the AEC generator.
 
-These render a tiny synthetic corpus through the REAL pipeline -- manifest,
-generator CLI, packer, packed dataset -- rather than unit-testing the pieces in
-isolation.  Every invariant checked here is one that a consumer cannot detect
-being broken: a swapped stem channel trains a model that cancels the talker and
-converges beautifully, a leaked speaker produces a validation curve that looks
-excellent, and a sequence packed out of order looks like slow convergence.
+These render a tiny synthetic corpus through the REAL pipeline (manifest,
+generator CLI, packer, packed dataset). Every invariant here is one a consumer
+cannot see broken: a swapped stem channel trains a model that cancels the
+talker, a leaked speaker gives an excellent validation curve, and a mis-ordered
+sequence looks like slow convergence.
 """
 
 import argparse
@@ -126,17 +125,11 @@ def _speechlike(n_samples, generator):
 def _rir(n_samples, rt60, generator, gain=1.0, tail=1.0, sr=SR):
     """One synthetic room position: a direct path plus a decaying tail.
 
-    ⚠ ``tail`` is the reverberant level relative to the direct path, and it is
-    load-bearing wherever a path is measured through
-    ``path_drift_metrics``. Two positions in one room share their direct
-    impulse and differ in their tails, so the tail is BOTH what lets a
-    trajectory decorrelate the path at all and what the estimator's 64 ms
-    analysis frame cannot see: a response whose energy is almost all
-    reverberant has a frequency response the estimator reads as noise, and a
-    STILL path then measures less correlated than a moving one. ``tail = 0.23``
-    puts two positions' shared fraction near 0.25 with the direct path still
-    dominant, which is what the motion fixtures below are built from; the
-    default leaves the plain sources unchanged.
+    ⚠ ``tail`` is the reverberant level relative to the direct path. Positions
+    in one room share their direct impulse and differ in their tails; an almost
+    purely reverberant response reads as noise to the estimator's 64 ms frame.
+    ``tail = 0.23`` puts two positions' shared fraction near 0.25; the default
+    leaves plain sources unchanged.
     """
     t = torch.arange(n_samples, dtype=torch.float32) / sr
     decay = torch.exp(-6.9078 * t / rt60)
@@ -170,8 +163,8 @@ def _base_cfg(root):
     cfg.set('sequence', 'seq_sec_max', '3.072')
     cfg.set('sequence', 'chunk_sec', '1.024')
     # The fast fixture's chunk is much shorter than the shipped 8/10 s grids.
-    # Keep the new curriculum disabled for unrelated tests and give its bounds
-    # a valid miniature geometry; focused tests below exercise it explicitly.
+    # Keep the curriculum disabled for unrelated tests and give its bounds a
+    # valid miniature geometry; focused tests below exercise it explicitly.
     cfg.set('activity', 'p_far_then_near', '0')
     cfg.set('activity', 'far_pre_roll_sec_min', '0.2')
     cfg.set('activity', 'far_pre_roll_sec_max', '0.6')
@@ -480,13 +473,11 @@ def test_rematerialize_upgrades_legacy_and_resumes_mixed_channel_sequence(
         packed, corpus, tmp_path):
     """A four-channel corpus is upgraded from the audio alone.
 
-    Nothing declares the channel count, the rate or the chunk count,
-    so this also covers the re-materializer discovering all three from the
-    files themselves -- including a half-finished directory where one chunk is
-    already five-channel and the rest are still legacy four. That mixture is
-    recovered from the first four stems regardless of --resume: a
-    half-rewritten sequence is never a resumable one, because the ledger only
-    ever records sequences whose chunks all landed.
+    Nothing declares the channel count, the rate or the chunk count, so the
+    re-materializer discovers all three from the files, including a
+    half-finished directory (one chunk already five-channel, the rest still
+    four). That mixture is recovered from the first four stems regardless of
+    --resume: the ledger only records sequences whose chunks all landed.
     """
     source_seqs = packed['output'] / 'train' / 'seqs'
     destination = tmp_path / 'legacy_train'
@@ -501,8 +492,8 @@ def test_rematerialize_upgrades_legacy_and_resumes_mixed_channel_sequence(
     for chunk_index, source_wav in enumerate(source_chunks):
         audio, sr = torchaudio.load(str(source_wav))
         expected_errors.append(audio[STEM_ORDER.index('linear_error')].clone())
-        # Simulate interruption: the first file was already rewritten to five
-        # channels, while the remaining files are still legacy four-channel.
+        # Simulate interruption: the first file is already five-channel, the
+        # remaining files are still four-channel.
         write_audio = audio if chunk_index == 0 else audio[:len(BASE_STEM_ORDER)]
         torchaudio.save(
             str(seqs / source_wav.name), write_audio, sr,
@@ -551,14 +542,10 @@ def test_rematerialize_upgrades_legacy_and_resumes_mixed_channel_sequence(
 def test_stems_recombine(corpus):
     """mic_preclip == near_speech + local_noise + echo, for every clip.
 
-    This is the corpus's central invariant.  If it fails, the stems have been
-    scaled independently somewhere and no consumer can trust that the echo
-    generation is what actually reached the microphone.
-
-    ``mic_preclip``, ``echo`` and ``local_noise`` are NOT persisted (see
-    STEM_ORDER's docstring in aec_features.py) -- they are computed on every
-    render regardless, so this checks the invariant against the renderer's
-    ``RenderedSequence.audit`` output directly rather than a packed shard.
+    The corpus's central invariant: if it fails, the stems were scaled
+    independently somewhere. ``mic_preclip``, ``echo`` and ``local_noise`` are
+    not persisted (see STEM_ORDER's docstring in aec_features.py), so this
+    checks ``RenderedSequence.audit`` directly rather than a packed shard.
     """
     renderer = AecSequenceRenderer(
         corpus['cfg'], pools_for_split(corpus['manifest'], 'train'),
@@ -581,12 +568,11 @@ def test_stems_recombine(corpus):
 def test_postclip_differs_exactly_where_the_metadata_says(corpus):
     """`clipped` / `agc` must describe the data, not sit alongside it.
 
-    Both directions matter.  A flag that is set when nothing happened would
-    poison an ablation; a flag that is clear when the mic path WAS altered
-    would make mic_postclip silently untrustworthy.
-
-    ``mic_preclip`` is audit-only (not persisted, see STEM_ORDER's
-    docstring), so this renders directly rather than reading a packed shard.
+    A flag set when nothing happened would poison an ablation; a flag clear
+    when the mic path WAS altered would make mic_postclip silently
+    untrustworthy. ``mic_preclip`` is audit-only (not persisted, see
+    STEM_ORDER's docstring), so this renders directly rather than reading a
+    packed shard.
     """
     renderer = AecSequenceRenderer(
         corpus['cfg'], pools_for_split(corpus['manifest'], 'train'),
@@ -621,12 +607,10 @@ def test_postclip_differs_exactly_where_the_metadata_says(corpus):
 def test_ref_dropout_clips_have_a_silent_reference(corpus):
     """Every chunk LABELLED ref_dropout really has X == 0.
 
-    ⚠ This is what the idle-loss term and the "ref == 0 implies output ~= mic"
-    gate are trained on.  If a dropout-labelled chunk still carried far-end
-    audio, the gate would be supervised by contradictory examples.
-
-    ``echo`` is audit-only (not persisted, see STEM_ORDER's docstring), so
-    this renders directly rather than reading a packed shard.
+    ⚠ The idle-loss term and the "ref == 0 implies output ~= mic" gate are
+    trained on this; a dropout-labelled chunk with far-end audio would make the
+    gate's supervision contradictory. ``echo`` is audit-only (not persisted,
+    see STEM_ORDER's docstring), so this renders directly.
     """
     renderer = AecSequenceRenderer(
         corpus['cfg'], pools_for_split(corpus['manifest'], 'train'),
@@ -653,14 +637,11 @@ def test_ref_dropout_clips_have_a_silent_reference(corpus):
 def test_far_active_no_echo_has_a_loud_reference_and_no_echo(corpus):
     """The converse of ref_dropout: X is loud end to end and D is exactly 0.
 
-    ⚠ This is the only scenario that can express it. Everywhere else the echo
-    is tied to the reference through erl_db, whose range stops at 30 dB, so
-    the quietest echo the corpus could otherwise produce still sits only
-    ser_db_max below the near speech. A model trained without this case has
-    never seen a reference that is loud and irrelevant.
-
-    ``echo`` is audit-only (not persisted, see STEM_ORDER's docstring), so
-    this renders directly rather than reading a packed shard.
+    ⚠ The only scenario that can express it: elsewhere the echo is tied to the
+    reference through erl_db (range stops at 30 dB), so a model trained without
+    this case never sees a reference that is loud and irrelevant. ``echo`` is
+    audit-only (not persisted, see STEM_ORDER's docstring), so this renders
+    directly.
     """
     renderer = AecSequenceRenderer(
         corpus['cfg'], pools_for_split(corpus['manifest'], 'train'),
@@ -937,13 +918,9 @@ def test_layered_plan_rejects_invalid_probabilities(corpus):
 def test_layered_plan_composes_dt_nonlinearity_and_capture(corpus):
     """The difficult intersection must be constructible, not three labels.
 
-    A categorical planner draws exactly one of double_talk, nonlinear_spk and
-    clipping_agc.  Forcing only the conditional combo here pins the layered
-    contract and its metadata together.
-
-    ⚠ Path motion is deliberately NOT part of the bundle: it is its own axis
-    on 67% of compatible echo paths at the shipped defaults, so bundling it
-    here would make
+    Forcing only the conditional combo pins the layered contract and its
+    metadata together. ⚠ Path motion is deliberately NOT in the bundle: it is
+    its own axis on 67% of compatible echo paths, and bundling it would make
     "DT while the path moves" inseparable from "DT while the loudspeaker
     distorts".
     """
@@ -1061,13 +1038,10 @@ def test_no_echo_far_reference_never_runs_out_on_a_long_sequence(corpus):
     """The hard negative must stay far-ACTIVE in every chunk it labels.
 
     ⚠ The module fixture writes speech files LONGER than its tiny sequences,
-    so no other test here can see this: `_render_talker` draws ONE pool file
-    per run and `_load_audio(loop=False)` zero-pads a file shorter than its
-    run, so a single whole-sequence far run goes silent after one utterance.
-    Those chunks are X == 0 and D == 0 -- signal-identical to `ref_dropout` --
-    and would still carry the `far_active_no_echo` label. This test makes the
-    sequence LONGER than any source file, which is the production shape
-    (20-30 s sequences, single-digit-second utterances).
+    which hides this: `_render_talker` draws ONE pool file per run and
+    `_load_audio(loop=False)` zero-pads a short one, so a whole-sequence far
+    run goes silent after one utterance. This test makes the sequence LONGER
+    than any source file.
     """
     cfg = copy.deepcopy(corpus['cfg'])
     for name in ('far_only', 'near_only', 'duplex_random'):
@@ -1140,11 +1114,11 @@ def test_layered_plan_requires_every_layer_section_and_option(corpus):
                     f'[{section}] {option}')):
                 plan_sequences(cfg, 0.001, SEED, 'train')
 
-    # ⚠ A config that predates the trajectory model has no [path_motion]
-    # section AND no planner probability for the modes that section drives, and
-    # the first message has to name the section. Sent to add three
-    # probabilities to [impairments] instead, the author fixes those, re-runs,
-    # and only then learns what the config really lacks.
+    # ⚠ A config without the trajectory sections has no [path_motion] section
+    # AND no planner probability for the modes it drives, and the first message
+    # has to name the section. Sent to add three probabilities to [impairments]
+    # instead, the author fixes those, re-runs, and only then learns what the
+    # config really lacks.
     cfg = copy.deepcopy(corpus['cfg'])
     cfg.remove_section('path_motion')
     for mode in ('slow_drift', 'movement', 'delay_step'):
@@ -1461,7 +1435,7 @@ def test_the_documented_48k_recipe_is_complete_and_hop_exact():
     """Every claim the header makes about the recipe, checked against the file.
 
     ⚠ Nothing here restates a key or a duration: they all come from
-    config.example.ini, which is the artefact that was wrong.
+    config.example.ini.
     """
     recipe = _documented_48k_recipe()
     assert [(section, key) for section, key, _ in recipe] == [
@@ -1543,16 +1517,11 @@ def test_the_shipped_config_is_a_copy_of_the_example():
 def test_the_48k_example_config_is_the_recipe_already_applied():
     """`config.example.48k.ini` must BE `config.example.ini` + the recipe.
 
-    Shipping two configs means two places to forget, and every key the recipe
-    covers degrades SILENTLY when it is missed. So the 48 kHz file is not
-    trusted to have been edited correctly by hand: it is compared against the
-    16 kHz file with that file's OWN documented recipe applied, key by key.
-    A value changed in one file and not the other fails here, and so does a
-    recipe key left at the 16 kHz default.
-
-    ⚠ Comments are deliberately not compared. They are prose, and the
-    rate-specific ones (worked hop arithmetic, the loudspeaker band table)
-    legitimately differ; the VALUES are the contract.
+    Every key the recipe covers degrades SILENTLY when missed, so the 48 kHz
+    file is compared key by key against the 16 kHz file with that file's OWN
+    documented recipe applied: a value changed in one file only fails, and so
+    does a recipe key left at the 16 kHz default. ⚠ Comments are not compared
+    (rate-specific prose legitimately differs); the VALUES are the contract.
     """
     directory = pathlib.Path(__file__).parents[1]
     rate_48k = configparser.ConfigParser()
@@ -1703,10 +1672,10 @@ def test_gen_refuses_an_inexact_chunk_sec_before_touching_the_sources(
 def test_gen_has_no_sample_rate_override():
     """The rate belongs to the config file the packer is later handed.
 
-    --sample-rate moved [signal] sr alone, which could never produce a valid
-    run at the other rate (the grid, chunk_sec and the codec rates stay put)
-    and left pack_aec_dataset.py rebuilding the contract at whatever rate the
-    file still claimed.
+    There is no --sample-rate: moving [signal] sr alone can never produce a
+    valid run at the other rate (the grid, chunk_sec and the codec rates stay
+    put) and would leave pack_aec_dataset.py rebuilding the contract at
+    whatever rate the file still claims.
     """
     flags = {action.dest for action in build_parser()._actions}
     assert 'sample_rate' not in flags
@@ -2482,11 +2451,9 @@ def test_a_room_of_identical_positions_is_still_certified_over_a_real_set():
     """The certificate is a SET, including where no set beats another.
 
     A room whose responses are identical reaches exactly 1.0 over every set of
-    them -- the case a search that keeps the best "so far" has to be
-    initialised for, because 1.0 is the top of the statistic's range rather
-    than a value anything can come in under. An empty answer there would report
-    a reach with no positions behind it, which nothing downstream can render or
-    fall back to.
+    them, the case a "best so far" search has to be initialised for (1.0 is the
+    top of the statistic's range). An empty answer there would report a reach
+    with no positions behind it, which nothing can render or fall back to.
     """
     generator = torch.Generator().manual_seed(11)
     position = _rir(SR // 4, 0.2, generator, tail=1.0)
@@ -2504,21 +2471,11 @@ def test_a_room_of_identical_positions_is_still_certified_over_a_real_set():
 def test_a_room_of_near_duplicates_hosts_the_sets_of_it_that_reach(tmp_path):
     """Eligibility is an EXISTENCE statement, and the DRAW is what enforces it.
 
-    A room can hold near-duplicate positions next to distinctive ones. Refusing
-    it because SOME set of its positions saturates would throw away every set
-    that does not; certifying it and then rendering whatever the draw returned
-    would put a shallower trajectory in the corpus than the metadata claims. So
-    the room is eligible when a reaching set exists in it, and the set a
-    sequence renders is checked against the same target and drawn again when it
-    fails.
-
-    ⚠ The certificate has to be CONSTRUCTIVE for that to be sound. This room
-    offers more sets than REACH_SUBSET_LIMIT enumerates, so the room is
-    certified over the most distinct positions it holds -- a set the renderer
-    can always fall back to, which is why "this set reaches" proves "the room
-    can host" without saying anything about the sets nobody enumerated. Ranking
-    sets by their most alike pair instead would certify a room over a set it
-    might never draw, and rooms this shape are where that comes apart.
+    A room is eligible when a reaching set exists in it; each rendered set is
+    checked and redrawn on failure. ⚠ The certificate must be CONSTRUCTIVE:
+    this room has more sets than REACH_SUBSET_LIMIT enumerates, so it is
+    certified over its most distinct positions, which the renderer can always
+    fall back to.
     """
     cfg, manifest = _mixed_rir_manifest(tmp_path)
     renderer = AecSequenceRenderer(
@@ -2585,19 +2542,11 @@ def test_the_certified_fallback_keeps_the_near_talker_off_the_loudspeaker(
         tmp_path):
     """The fallback is a DRAW's replacement, so it keeps the draw's preference.
 
-    A near talker is drawn away from the loudspeaker's positions because a room
-    that can keep them apart should: sharing them hands the model a near path
-    and an echo path with the same room response. In a room where most sets
-    saturate, the draws run out -- and a fallback that answered "which set of
-    this room reaches furthest" without the restriction would put the near
-    talker on the loudspeaker's own positions in exactly the rooms where the
-    preference is hardest to satisfy, which is where it matters most.
-
-    So the certificate is asked on the room MINUS those positions, and only a
-    restriction that leaves nothing reaching gives the shared set back. Both
-    halves are checked: that such a disjoint reaching set exists here, and that
-    every render finds it -- with the draws forced to zero, so the fallback is
-    the only thing under test.
+    A near talker is drawn away from the loudspeaker's positions so the two
+    paths do not share a room response; a fallback that ignored that would put
+    them together exactly where the draws ran out. So the certificate is asked
+    on the room MINUS those positions, and only a restriction leaving nothing
+    reaching gives the shared set back. Checked with the draws forced to zero.
     """
     cfg, manifest = _mixed_rir_manifest(tmp_path, distinct=4)
     renderer = AecSequenceRenderer(
@@ -2647,17 +2596,11 @@ def test_a_room_whose_positions_are_too_alike_cannot_host_a_trajectory(
         tmp_path):
     """Reaching the configured path correlation is an ELIGIBILITY rule.
 
-    A trajectory can only decorrelate as far as the positions it mixes differ.
-    Where they barely differ the solve saturates at depth 1.0, the render is
-    quietly shallower than the corpus asked for, and nothing in the audio says
-    so -- the failure the solved depth exists to expose. It is therefore
-    decided BEFORE the room is drawn: such a room does not host the mode, the
-    moving sequence draws from the rooms that can, and the renderer asserts
-    what the draw guarantees.
-
-    ⚠ Certified per waypoint count, because the count is drawn per sequence,
-    and over the least distinctive set of positions the room offers, because
-    which of them a sequence draws is a draw too.
+    Where positions barely differ the solve saturates at depth 1.0 and the
+    render is quietly shallower than asked for, so it is decided BEFORE the
+    room is drawn: such a room does not host the mode and the moving sequence
+    draws from the rooms that can. ⚠ Certified per waypoint count (drawn per
+    sequence), over the least distinctive set the room offers.
     """
     cfg, manifest = _sparse_rir_manifest(
         tmp_path, {'room_00': 4, 'room_01': 4, 'room_02': 4},
@@ -2788,14 +2731,11 @@ def test_the_near_talkers_trajectory_solves_from_its_own_positions(tmp_path):
 def test_echo_path_change_never_leaves_a_room_with_only_one_rir(tmp_path):
     """The post-change RIR must stay in the SAME room as the near talker's.
 
-    room_00 has only 1 RIR file, so a path change is not renderable there --
-    the post-change waypoint would have to cross into a different room,
-    reintroducing the acoustic "this is echo" leak the same-room invariant
-    exists to prevent. A sequence that draws it therefore draws again among the
-    rooms that can hold the switch, and every rendered switch comes from one of
-    those. (A pool with only one such room is refused by the CLI preflight, for
-    the reason tested there; the renderer still has to place the sequences it
-    is given.)
+    room_00 has only 1 RIR file, so a path change is not renderable there: the
+    post-change waypoint would have to cross into a different room and
+    reintroduce the acoustic "this is echo" leak. A sequence that draws it
+    draws again among the rooms that can hold the switch. (A pool with only one
+    such room is refused by the CLI preflight.)
     """
     cfg, manifest = _sparse_rir_manifest(tmp_path, {'room_00': 1, 'room_01': 2})
     renderer = AecSequenceRenderer(
@@ -2854,32 +2794,14 @@ def test_render_fails_loudly_when_every_noise_file_is_unreadable(corpus):
 # Echo-path motion
 # ============================================================
 
-# The RIR pool the movement axis is fitted and gated on.
-#
-# ⚠ Its RT60s come from the SHIPPED [rir] range -- the same reason the fixture
-# renders the shipped loudspeaker population -- so the fitted
-# `*_position_correlation` describes rooms the corpus can actually draw. They
-# are the midpoints of CALIBRATION_ROOMS equal parts of the span, so both ends
-# are present in every build rather than in the lucky ones.
-#
-# ⚠ Most of slow_drift's remaining distance from its own curve is the
-# LOUDSPEAKER POPULATION rather than the rooms or the trajectory. Through the
-# shipped drives a path that never moves already measures far under the
-# estimator floor on THIS pool, inside the span, and at the short lags down to
-# the static-device curve itself -- while with linear devices the same pool
-# puts it on the floor. No *_position_correlation can give that back at any
-# RT60: a trajectory moves the path further from itself, never back toward the
-# curve. Both still-path readings are measured and reported by
-# ``test_a_still_path_stays_correlated_with_itself``; re-fitting the drive
-# population against the untouched-device curve is a separate calibration, and
-# this span is where the trajectory can be fitted without one.
-# RT60 adds to that floor rather than causing it: a tail several times the
-# estimator's own 64 ms analysis frame is not one frequency response, so the
-# floor falls further out. Fitting further out would calibrate the trajectory
-# against the device floor and the room draw instead of against the path. What
-# happens beyond the span is measured separately, in RT60_POOLS, whose
-# tolerance is that measurement and which reports the shipped population on
-# one long pool.
+# The RIR pool the movement axis is fitted and gated on. Its RT60s are the
+# midpoints of CALIBRATION_ROOMS equal parts of the SHIPPED [rir] span, so the
+# fitted `*_position_correlation` describes rooms the corpus can draw and both
+# ends are present in every build. ⚠ Most of slow_drift's remaining distance
+# from its own curve is the LOUDSPEAKER POPULATION, not the rooms: through the
+# shipped drives a path that never moves already sits far under the estimator
+# floor, and no `*_position_correlation` can give that back. Beyond the span is
+# measured in RT60_POOLS; see `test_a_still_path_stays_correlated_with_itself`.
 CALIBRATION_RT60_SPAN = (0.1, 0.35)
 CALIBRATION_ROOMS = 4
 CALIBRATION_RIRS_PER_ROOM = 4
@@ -2952,14 +2874,10 @@ def _without_linear_aec():
     """Replace the frozen linear AEC with zeros for the duration of a block.
 
     It is by far the slowest part of a render and channel 5 is irrelevant to
-    every path-motion assertion; a 30 s sequence is what the 8 s correlation
-    lag needs, and paying for PBFDKF on each one costs minutes.
-
-    A context manager rather than a save/restore pair at five call sites: a
-    module-scoped fixture that raises between the two would leave the renderer
-    patched for the whole session, and every consumer of it here is a block.
-    ``pytest.MonkeyPatch.context`` does the undoing, since the function-scoped
-    ``monkeypatch`` fixture cannot be injected into a module-scoped one.
+    every path-motion assertion. A context manager rather than a save/restore
+    pair, so a module-scoped fixture that raises between the two cannot leave
+    the renderer patched for the session (``pytest.MonkeyPatch.context`` does
+    the undoing).
     """
     with pytest.MonkeyPatch.context() as patch:
         patch.setattr(
@@ -2996,25 +2914,11 @@ def _frozen_trajectory():
 def motion_corpus(tmp_path_factory):
     """A corpus that renders the path-motion axis the way the corpus ships.
 
-    The LOUDSPEAKER POPULATION is the shipped one, because it is what the
-    calibrated trajectory has to reproduce the measured curve THROUGH:
-    memoryless distortion decorrelates the Wiener path estimate by itself, and
-    a path correlation calibrated without it is not the one the corpus needs.
-    Its cost is the per-sequence spread -- with a linear loudspeaker a sequence
-    reads ~0.998 at every lag and with a distorting one 0.4-0.98, so the
-    population median needs tens of sequences (see CALIBRATION_BAND).
-    ``motion_corpus_isolated`` is the same corpus with that axis removed, for
-    the statements that are about the trajectory alone.
-
-    The RIR POOL is the shipped [rir] RT60 range for the same reason -- see
-    CALIBRATION_RT60_SPAN, which also says why it stops where it does. One room
-    per RT60, so a sequence's room draw is a draw over the range.
-
-    ⚠ The capture axis is NOT part of what the gate measures, whatever
-    ``[mic]`` says here: the estimator reads the pre-clip echo, so clipping and
-    the AGC cannot move any number below.  They are left at their shipped
-    probabilities because this fixture also serves the tests that DO read the
-    microphone.
+    Uses the shipped LOUDSPEAKER POPULATION (memoryless distortion decorrelates
+    the path estimate by itself, at the cost of a wide per-sequence spread; see
+    CALIBRATION_BAND) and the shipped [rir] RT60 range (CALIBRATION_RT60_SPAN).
+    ⚠ The capture axis is not measured by the gate: the estimator reads the
+    pre-clip echo.
     """
     root = tmp_path_factory.mktemp('aec_motion')
     generator = torch.Generator().manual_seed(17)
@@ -3037,23 +2941,10 @@ def motion_corpus_isolated(motion_corpus):
     """``motion_corpus`` with the loudspeaker axis taken out.
 
     Every device linear, so the trajectory is the only thing that can move the
-    path estimate.  Two things are asserted here that the shipped mixture
-    cannot carry: what the band MEANS -- that a path found once fails it -- and
-    that the long-lag decorrelation comes from the TRAJECTORY rather than from
-    the loudspeaker (``test_the_trajectory_alone_carries_the_long_lag_...``).
-    On the mixture a distorting loudspeaker supplies much of the same
-    decorrelation a real device's own curve carries, so a path that never moves
-    is not separated from one that does and neither statement can be made
-    there. How close the still and slow_drift medians sit on the shipped
-    population is reported by
-    ``test_the_two_drift_modes_are_ordered_on_the_shipped_population``.
-    The manifest is shared: it selects sources and RIRs, neither of which the
-    device population touches.
-
-    ⚠ Only the loudspeaker is reset. Clipping and the AGC are left where the
-    shipped fixture has them because they are NOT what isolates this corpus:
-    the estimator reads the pre-clip echo, so resetting them would change no
-    number here.
+    path estimate. That lets it state what the band MEANS (a path found once
+    fails it) and that long-lag decorrelation comes from the TRAJECTORY rather
+    than the loudspeaker. Clipping and the AGC stay as shipped: the estimator
+    reads the pre-clip echo.
     """
     return _linear_devices(motion_corpus)
 
@@ -3062,15 +2953,11 @@ def motion_corpus_isolated(motion_corpus):
 def motion_corpus_half_reach(motion_corpus_isolated):
     """``motion_corpus_isolated`` with both drift targets halfway to 1.0.
 
-    A corpus whose trajectory still runs and whose mixture only decorrelates
-    half as far -- what a pool of near-alike positions would render if nothing
-    checked the reach. It is one of the two mutations ISOLATED_TRAJECTORY_MAX
-    exists to reject, and rendering it here is what holds those ceilings from
-    ABOVE: a ceiling nothing sits above is not a control.
-
-    Isolated for the same reason the green side is: through the shipped
-    loudspeaker population the device's own decorrelation would supply most of
-    the distance between the two, and the statement is about the trajectory.
+    Its trajectory still runs but its mixture decorrelates only half as far, as
+    a pool of near-alike positions would render if nothing checked the reach.
+    It is one of the two mutations ISOLATED_TRAJECTORY_MAX rejects and holds
+    those ceilings from ABOVE; isolated because loudspeaker distortion would
+    otherwise supply most of the distance.
     """
     cfg = copy.deepcopy(motion_corpus_isolated['cfg'])
     for mode in ('slow_drift', 'movement'):
@@ -3084,19 +2971,11 @@ def motion_corpus_half_reach(motion_corpus_isolated):
 def delay_corpus(tmp_path_factory):
     """A corpus with a SHORT echo path, for the delay measurements.
 
-    What those tests measure is where the echo's alignment against its
-    reference changes, and a reverberant path smears exactly that: the echo at
-    any instant is a mixture of the reference's recent past over the room's
-    whole tail, so a delay step shorter than the tail moves the correlation
-    very little. Measured on the calibration pool, the two smallest steps of
-    that fixture leave the pre-step alignment winning by 0.03 anywhere and put
-    the located instant 0.9-1.4 s from the recorded one. That is a fact about
-    measuring a reverberant room rather than about the impairment -- the same
-    step is rendered either way -- so the pool here is 60 ms, short enough that
-    the alignment is a delay and nothing else. Nothing is calibrated on it.
-
-    Every device linear for the same reason: the measurement is a
-    cross-correlation, and loudspeaker distortion only lowers it.
+    Those tests locate where the echo's alignment against its reference
+    changes, which a reverberant path smears (a step shorter than the tail
+    barely moves the correlation). The 60 ms pool makes the alignment a delay
+    and nothing else; nothing is calibrated on it. Devices are linear because
+    loudspeaker distortion only lowers the cross-correlation.
     """
     root = tmp_path_factory.mktemp('aec_delay')
     generator = torch.Generator().manual_seed(17)
@@ -3242,22 +3121,12 @@ def _report(line):
     print(line)
 
 
-# How many sequences each mode's median is taken over.
-#
-# ⚠ Set by the SPREAD OF THE MEDIAN, not by taste. One 30 s clip yields ~20
-# window pairs at an 8 s lag and a single clip's median swings between 0.38 and
-# 0.98; on top of that the shipped device population spreads a whole sequence's
-# reading -- one that draws a linear loudspeaker reads ~0.998 at every lag and
-# one that draws a hard-clipping one 0.4-0.9 -- and the pool's rooms differ in
-# RT60, which moves it again. Each count is a step of MOTION_SEQUENCE_STEP at
-# which the bands below clear that mode's own sampling spread; the rule is
-# measured on these very renders by
-# `test_the_calibration_bands_clear_their_own_sampling_spread`, so no number
-# here can go stale without a test failing -- and that test reports the head
-# one step down as well, so a count that stops being the smallest says so on
-# the run instead of here. They differ per mode because the spreads do --
-# slow_drift is calibrated against a curve its own device floor already sits
-# near, which is what the 2 s and 8 s lags cost it.
+# How many sequences each mode's median is taken over. ⚠ Set by the SPREAD OF
+# THE MEDIAN, not by taste: one 30 s clip gives ~20 window pairs at an 8 s lag,
+# and the shipped device population and the pool's RT60s add per-sequence
+# spread. Each count is a step of MOTION_SEQUENCE_STEP at which the bands below
+# clear that mode's sampling spread, checked on these renders by
+# `test_the_calibration_bands_clear_their_own_sampling_spread`.
 MOTION_SEQUENCES = {STATIC_PATH: 40, 'slow_drift': 160, 'movement': 100}
 MOTION_SEQUENCE_STEP = 20
 # The same statement for the isolated corpus, where the per-sequence spread is
@@ -3272,28 +3141,21 @@ ISOLATED_SEQUENCES = {STATIC_PATH: 40, 'echo_path_change': 40,
                       'slow_drift': 160, 'movement': 160}
 
 # How far each lag's median may sit from its calibration target, and how much
-# room every band keeps above the sampling spread it has to survive. The rule
-# is `band >= p99(|median - target|) + CALIBRATION_MARGIN` at that mode's
-# count, asserted rather than described.
-# ⚠ 2 s and 8 s are wider than the rest, and that is a statement about what the
-# corpus can be held to rather than a concession. The short lags are the
-# LOUDSPEAKER population's: the trajectory cannot buy them (anything faster
-# than the estimator's own 2 s window is averaged, which RAISES the
-# correlation), so their median inherits the whole spread of the device draw
-# and their p99 stops shrinking with the count. The 4 s band is the tightest of
-# the four and is what the trajectory is held to.
+# room every band keeps above the sampling spread: `band >= p99(|median -
+# target|) + CALIBRATION_MARGIN` at that mode's count, asserted rather than
+# described. ⚠ 2 s and 8 s are wider than the rest as a statement about what
+# the corpus can be held to: the short lags are the LOUDSPEAKER population's
+# (anything faster than the estimator's 2 s window is averaged, which RAISES
+# the correlation), so their p99 stops shrinking with the count. The 4 s band
+# is the tightest and is what the trajectory is held to.
 CALIBRATION_BAND = {1.0: 0.10, 2.0: 0.17, 4.0: 0.12, 8.0: 0.13}
 CALIBRATION_MARGIN = 0.01
 # The same rule for the level step, per mode, against the curve each mode is
 # calibrated against. The spread is the device population's again, because the
 # statistic counts shape change at a constant level, and it is wider for
-# movement -- which is why that band is.
-# ⚠ Neither band is what rejects a corpus shipped without a level walk. At
-# sigma = 0 the movement median falls far enough for its own band to catch it,
-# but slow_drift's does not leave its band at all: most of what the statistic
-# counts is path SHAPE change at a constant level, which the trajectory
-# supplies either way. What rejects such a corpus for BOTH modes is the walk's
-# own spread, asserted below.
+# movement. ⚠ Neither band rejects a corpus shipped without a level walk (most
+# of what the statistic counts is path SHAPE change, which the trajectory
+# supplies either way); the walk's own spread, asserted below, does.
 LEVEL_STEP_BAND_DB = {'movement': 0.45, 'slow_drift': 0.35}
 # The level WALK's own spread, p5-p95 of the recorded track, and how far the
 # median of it may sit from that. This is the quantity
@@ -3394,29 +3256,10 @@ def _calibration_deviation(renders, mode):
 def test_drift_reproduces_the_measured_path_correlation(motion_renders, mode):
     """The corpus's movement axis is calibrated, not merely present.
 
-    The targets come from paired static/movement far-end captures on the
-    AEC-challenge blind set -- path_drift_metrics.CALIBRATION_TARGETS, the one
-    place they live -- measured with the SAME estimator used here, and
-    reproduced from the rendered audio alone rather than from the weight
-    schedule the renderer wrote down. ``slow_drift`` is calibrated against the
-    UNTOUCHED real device, which is what CALIBRATION_TARGET_OF_MODE says.
-
-    ⚠ This renders the SHIPPED device population, because that is the corpus
-    the targets have to be reproduced by. The trajectory only has to supply
-    what the loudspeaker does not: the same ``*_position_correlation`` lands
-    well above this on the isolated corpus, so a value calibrated without the
-    device axis is not the one this corpus needs. Both readings are reported --
-    these ones here, the isolated long-lag ones by the ceiling test below.
-
-    ⚠ Anything faster than the estimator's own 2 s window is AVERAGED, not
-    resolved: adding a fast weight component RAISES this correlation instead of
-    lowering it, so the short lags cannot be bought with a faster trajectory.
-
-    ⚠ What is calibrated is a target PATH CORRELATION, not a mixture depth.
-    The depth that reaches it is solved per room from the room's own responses
-    (``solve_mixture_depth``), which is what makes this number a property of
-    the corpus rather than of the fixture's RIR pool -- see
-    ``test_the_axis_survives_the_whole_shipped_rt60_range``.
+    The targets (path_drift_metrics.CALIBRATION_TARGETS) come from paired
+    static/movement far-end captures and are reproduced from the rendered audio
+    alone with the SAME estimator. ⚠ Rendered with the SHIPPED device
+    population; the target is a PATH CORRELATION, not a mixture depth.
     """
     deviation = _calibration_deviation(motion_renders[mode], mode)
     target = CALIBRATION_TARGETS[CALIBRATION_TARGET_OF_MODE[mode]]['correlation']
@@ -3435,26 +3278,11 @@ def test_drift_reproduces_the_measured_path_correlation(motion_renders, mode):
 def test_the_level_walk_reproduces_the_measured_one(motion_renders, mode):
     """The level scalar of the same calibration, on the same renders.
 
-    Both drift modes, and both halves of each: the per-second step against its
-    calibration target, and the walk's own SPREAD against what
-    ``*_gain_sigma_db_per_sec`` / ``*_gain_clamp_db`` were set by. A walk that
-    is never gated is a walk that can be shipped at sigma = 0, and the step
-    alone cannot notice for either mode -- see LEVEL_SPREAD_DB.
-
-    ⚠ ``gain_step_db`` is NOT a pure level measurement -- it is the
-    least-squares complex scalar between consecutive windows, so a shape change
-    contributes to it at a constant level. That is exactly why it is banded
-    here rather than tuned away: the level walk supplies a minority of it, and
-    a generator that closed the gap on this number with sigma alone would be
-    over-driving the level axis by everything the trajectory contributes.
-
-    ⚠ ``relative_change`` is reported by the estimator and deliberately NOT
-    banded. At this count its own bootstrap interval spans most of the range
-    the statistic takes over the whole level-walk axis, so any ceiling it could
-    carry would be wider than the effect it would have to catch; the interval
-    is printed with the median so the instability is visible instead of being
-    asserted away. What rejects a frozen path is the correlation band and the
-    ordering, on more evidence than one scalar.
+    Both drift modes, both halves: the per-second step against its target, and
+    the walk's own SPREAD against what ``*_gain_sigma_db_per_sec`` /
+    ``*_gain_clamp_db`` were set by (see LEVEL_SPREAD_DB). ⚠ ``gain_step_db``
+    also counts shape change, so it is banded, not tuned; ``relative_change``
+    is reported but NOT banded.
     """
     target = CALIBRATION_TARGETS[CALIBRATION_TARGET_OF_MODE[mode]]
     measured = _drift_median(motion_renders[mode], 'gain_step_db')
@@ -3489,21 +3317,10 @@ def test_the_calibration_bands_clear_their_own_sampling_spread(motion_renders,
     """A band and a count are one decision, and it is measured here.
 
     A band is a gate only if it is wider than the spread of the statistic it
-    gates: a green generator has to pass it at the count the fixture renders,
-    at every lag and for the level step too, or the suite is red on the corpus
-    it was calibrated from. The rule is therefore
-    ``band >= p99(|median - target|) + margin``, bootstrapped from THESE
-    renders rather than read off a comment, and MOTION_SEQUENCES is a count
-    that satisfies it. What the count buys is reported as well as asserted: a
-    prefix of these renders IS the smaller fixture, since each one is seeded
-    from its own index, so the head one MOTION_SEQUENCE_STEP down is printed
-    beside the head at the shipped count.
-
-    ⚠ The other direction is not free, which is why the counts are not simply
-    raised: the 2 s and 8 s spreads belong to the LOUDSPEAKER population -- the
-    trajectory cannot buy them, since anything faster than the estimator's own
-    2 s window is averaged -- so they stop shrinking with the count and set the
-    two widest bands however many sequences are rendered.
+    gates: ``band >= p99(|median - target|) + margin``, bootstrapped from THESE
+    renders, at every lag and for the level step. A prefix of these renders IS
+    the smaller fixture (each is seeded from its own index), so the head one
+    MOTION_SEQUENCE_STEP down is printed beside the shipped count.
     """
     renders = motion_renders[mode]
     assert len(renders) == MOTION_SEQUENCES[mode]
@@ -3530,24 +3347,11 @@ def test_the_isolated_ceilings_clear_their_own_sampling_spread(
         isolated_renders, half_reach_renders, mode):
     """The same rule for the ceilings, and from BOTH sides.
 
-    A ceiling below the sampling spread of a green isolated median fails the
-    corpus it was fitted on; one above what it has to reject is not a control
-    at all. So the corridor is asserted at both ends and at the same margin:
-
-        p99(green median) + ISOLATED_MARGIN <= ceiling
-        ceiling + ISOLATED_MARGIN <= each mutation's median
-
-    The mutations are the two the ceilings exist for -- a path that never moves
-    (the isolated still renders this fixture already holds) and a target path
-    correlation halfway to 1.0 (``motion_corpus_half_reach``).
-
-    ⚠ slow_drift's 4 s corridor is the narrow one, and that is a property of
-    the mode rather than of the count: it is calibrated against a device nobody
-    touched, so its green median and a trajectory reaching half as far sit a
-    couple of hundredths apart and two margins are most of that. The only end
-    that renders can move is the lower one, which is why
-    ISOLATED_SEQUENCES holds more sequences than the lower side alone needs.
-    Both ends are printed on every run, so a corridor that closes says so.
+    A ceiling below the spread of a green isolated median fails the corpus it
+    was fitted on; one above what it has to reject is no control. So the
+    corridor is asserted at both ends with the same margin: ``p99(green median)
+    + ISOLATED_MARGIN <= ceiling <= each mutation's median - ISOLATED_MARGIN``
+    (a path that never moves; a target correlation halfway to 1.0).
     """
     assert len(isolated_renders[mode]) == ISOLATED_SEQUENCES[mode]
     assert len(half_reach_renders[mode]) == ISOLATED_SEQUENCES[mode]
@@ -3581,14 +3385,12 @@ def test_the_isolated_ceilings_clear_their_own_sampling_spread(
 
 
 # How many of the four lags an unmoving path has to sit OUTSIDE the band, per
-# target curve, on the isolated corpus. The counts are the statement and the
-# assertion below is what holds them; the per-lag deviations they come from are
-# in that assertion's own message when it fails.
-# ⚠ The one-shot switch against the static-device curve is the odd one, and
-# not by accident: it DOES move, once, so it lands where a slowly drifting
-# device does at every lag but the longest. That is the whole reason the
-# trajectory witness below exists -- the band cannot separate a single
-# crossfade from a continuous drift, and nothing about widening it would.
+# target curve, on the isolated corpus; the per-lag deviations are in the
+# assertion's message when it fails. ⚠ The one-shot switch against the
+# static-device curve is the odd one: it DOES move, once, so it lands where a
+# slowly drifting device does at every lag but the longest. That is why the
+# trajectory witness below exists: the band cannot separate a single crossfade
+# from continuous drift.
 UNMOVING_LAGS_OUTSIDE = {
     (STATIC_PATH, 'movement'): 3,
     (STATIC_PATH, 'slow_drift'): 2,
@@ -3600,21 +3402,13 @@ UNMOVING_LAGS_OUTSIDE = {
 @pytest.mark.parametrize('unmoving', [STATIC_PATH, 'echo_path_change'])
 def test_a_path_that_holds_still_fails_the_drift_calibration(isolated_renders,
                                                              unmoving):
-    """The band has to REJECT what the drift modes replaced.
+    """The band has to REJECT a frozen path and a one-shot crossfade.
 
-    A calibration test that a still path also passes measures nothing. Both
-    the frozen path and the one-shot crossfade -- the only motion the generator
-    had before continuous trajectories -- must land outside the band, at the
-    lags UNMOVING_LAGS_OUTSIDE says they do.
-
-    ⚠ Measured on the ISOLATED corpus, and that is a finding rather than a
-    convenience. On the shipped device population the one-shot crossfade sits
-    inside the band at every lag against the untouched-device curve, because a
-    distorting loudspeaker decorrelates the path estimate by itself, and a
-    frozen path's own deviation there moves with the device draw. So the band
-    cannot separate "the trajectory moved" from "the loudspeaker distorts" on
-    the shipped mixture; what separates the modes there is their ORDERING,
-    asserted below.
+    Both must land outside the band at the lags UNMOVING_LAGS_OUTSIDE says. ⚠
+    Measured on the ISOLATED corpus: on the shipped population the crossfade
+    sits inside the band against the untouched-device curve, because a
+    distorting loudspeaker decorrelates the estimate by itself; there the modes
+    are separated by their ORDERING, asserted below.
     """
     for mode in ('slow_drift', 'movement'):
         deviation = _calibration_deviation(isolated_renders[unmoving], mode)
@@ -3628,16 +3422,12 @@ def test_a_path_that_holds_still_fails_the_drift_calibration(isolated_renders,
 
 # The long-lag correlation each drift mode's TRAJECTORY has to produce with the
 # loudspeaker axis removed. Every ceiling is held from both sides by
-# `test_the_isolated_ceilings_clear_their_own_sampling_spread`: ISOLATED_MARGIN
-# or more above the bootstrap p99 of its own median at ISOLATED_SEQUENCES, and
-# ISOLATED_MARGIN or more below each mutation it has to reject -- a path that
-# never moves and a target path correlation halfway to 1.0 -- at BOTH lags for
-# BOTH modes. The values are therefore a consequence of that corridor rather
-# than a choice, which is why slow_drift's carry a fourth decimal.
-# ⚠ The margin is a fifth of the calibration band's, and slow_drift is why:
-# that mode is calibrated against a device nobody touched, so the whole
-# distance between "drifts as a still device does" and "moves half as far" is
-# a few hundredths, and a margin sized for the mixture would not fit inside it.
+# `test_the_isolated_ceilings_clear_their_own_sampling_spread`, so the values
+# are a consequence of that corridor rather than a choice (hence slow_drift's
+# fourth decimal). ⚠ The margin is a fifth of the calibration band's:
+# slow_drift is calibrated against an untouched device, so the whole distance
+# between "drifts as a still device does" and "moves half as far" is a few
+# hundredths.
 ISOLATED_TRAJECTORY_MAX = {'movement': {4.0: 0.90, 8.0: 0.87},
                            'slow_drift': {4.0: 0.9590, 8.0: 0.952}}
 ISOLATED_MARGIN = 0.005
@@ -3654,18 +3444,10 @@ def test_the_trajectory_alone_carries_the_long_lag_decorrelation(
     """The control the shipped mixture cannot supply: is the path MOVING?
 
     On the device mixture a drift mode whose trajectory has stopped still
-    renders most of the calibration curve -- the loudspeaker's own distortion
-    and the level walk through it supply the decorrelation -- so the
-    correlation band accepts it and the mode ordering, which puts a frozen
-    drift mode between movement and still, never rejects it either. Neither
-    control is evidence that the trajectory does anything.
-
-    With the loudspeaker linear there is nothing else left: the long-lag
-    correlation here IS the weight schedule. That the ceilings sit below both
-    mutations they exist for -- a path that never moves, and a path
-    correlation target halfway to 1.0, i.e. a corpus whose positions barely
-    differ -- is asserted next to them, at both lags for both modes, rather
-    than left to this docstring.
+    renders most of the calibration curve (loudspeaker distortion and the level
+    walk supply the decorrelation), so neither the band nor the ordering
+    rejects it. With a linear loudspeaker the long-lag correlation IS the
+    weight schedule.
     """
     for lag, ceiling in ISOLATED_TRAJECTORY_MAX[mode].items():
         measured = _drift_median(isolated_renders[mode], 'correlation', lag)
@@ -3679,31 +3461,11 @@ def test_the_two_drift_modes_are_ordered_on_the_shipped_population(
         motion_renders, isolated_renders):
     """A band alone cannot tell slow_drift from movement; this can.
 
-    This is the discrimination that holds on the SHIPPED device population: the
-    loudspeaker's own distortion moves both modes together, so it cannot
-    reorder them, while the trajectory separates them. The gap and the
-    bootstrap probability that a green run reads it the other way round are
-    reported per lag.
-
-    ⚠ Asserted at 8 s only. At 1 s and 2 s the two modes' medians overlap on
-    this population, because the sequences that drew a distorting loudspeaker
-    decorrelate inside the estimator's own window whatever the path does; at
-    4 s they are ordered but the bootstrap of that ordering is a few per cent
-    from a coin toss at MOTION_SEQUENCES, which is not a separation an
-    assertion can be built on. The 4 s gap is reported instead, with its own
-    probability, so the evidence stays visible without gating the suite on a
-    statistic that can turn over.
-
-    ⚠ A STILL path is not part of the ordering ON THE MIXTURE, and that is a
-    limit of the gate rather than a property of the corpus. Through the shipped
-    loudspeaker population the device floor has already spent most of the
-    static-device budget before the trajectory moves, so the still and
-    slow_drift medians land inside each other's sampling spread at the still
-    count this fixture renders -- the bootstrap probability that still reads
-    the higher of the two is reported below, and it is nowhere near a
-    separation either way. Rendering enough still sequences to separate them
-    costs more than the statement is worth. Where the three-way ordering IS a
-    statement is with the loudspeaker axis removed, which is asserted here.
+    On the SHIPPED device population loudspeaker distortion moves both modes
+    together, the trajectory separates them. ⚠ Asserted at 8 s only: at 1 s and
+    2 s the medians overlap and at 4 s the ordering's bootstrap is a coin toss.
+    A STILL path is not ordered on the mixture; the three-way ordering is
+    asserted with the loudspeaker removed.
     """
     for lag in (4.0, 8.0):
         drift = _drift_median(motion_renders['slow_drift'], 'correlation', lag)
@@ -3742,27 +3504,11 @@ def test_the_two_drift_modes_are_ordered_on_the_shipped_population(
 def test_the_position_gram_reads_a_path_the_way_the_estimator_does():
     """The solve's statistic has to BE the measured one, not a relative of it.
 
-    The estimator reads a path through a 64 ms frame: what it reports is the
-    response of the first frame of the path, plus the tail beyond it acting as
-    state-dependent noise on every window's estimate. A Gram taken over the
-    whole response therefore predicts a correlation nobody measures on a
-    reverberant pool, and a depth solved from it under-drives the movement axis
-    in exactly the rooms the corpus is aimed at.
-
-    Two constant mixture states rendered through the real convolution path and
-    read back with the real estimator, against both predictions.
-
-    ⚠ What WITNESSES the frame is the identity below -- nothing past the frame
-    may move the Gram, so a whole-response Gram is a different matrix and the
-    mutation that computes one fails there.
-
-    ⚠ Which of the two predictions is CLOSER is reported, not asserted. On a
-    single pool the two swap places often, and over eight of them the median
-    swaps with the seed block as well -- so an assertion on it would be a
-    statement about the pools drawn rather than about the frame. What is
-    asserted is the bound that does survive a fresh seed block: the framed Gram
-    is never worse than the whole-response one by more than the spread of the
-    statistic itself, on any pool.
+    The estimator reads a path through a 64 ms frame, so a Gram over the whole
+    response predicts a correlation nobody measures on a reverberant pool. Two
+    constant mixture states are rendered through the real convolution and read
+    back with the real estimator. ⚠ The frame is witnessed by the identity
+    below; which prediction is closer is reported, not asserted.
     """
     frame = int(round(ANALYSIS_FRAME_SEC * SR))
 
@@ -3821,17 +3567,10 @@ def test_the_jitter_floor_rises_when_the_step_reaches_the_output(corpus):
     """``delay_step_at`` indexes the input; the walk's boundaries index the
     output.
 
-    A negative step raises the walk's lower clamp by its own size, but only
-    where the step is in the signal -- and the step reaches the OUTPUT one bulk
-    delay after the input index it is recorded at. Comparing the recorded index
-    against the output boundaries raises the floor that much early, which is
-    one-sided in the safe direction and still wrong: the walk is then clamped
-    over a stretch that carries no step, by up to one bulk delay's worth of the
-    sequence.
-
-    Driven directly, with each stretch's own delay and boundary recorded,
-    because the quantity is a decision inside the walk rather than anything the
-    audio shows once the walk has been clipped.
+    A negative step raises the walk's lower clamp only where the step is in the
+    signal, and it reaches the OUTPUT one bulk delay after its recorded input
+    index; comparing the input index with output boundaries raises the floor
+    that much early. Driven directly: the audio no longer shows this.
     """
     cfg = copy.deepcopy(corpus['cfg'])
     # Many short stretches and a bulk delay close to the raised floor: the two
@@ -3900,21 +3639,11 @@ RT60_POOLS = {'rt60_60ms': 0.06, 'rt60_200ms': 0.2, 'rt60_350ms': 0.35,
               'rt60_600ms': 0.6, 'rt60_1000ms': 1.0}
 POOL_SEQUENCES = 40
 # How far a pool's median may sit from the CALIBRATION POOL's own median, per
-# lag. Measured over 80 isolated renders per pool and mode, as
-# (pool - calibration) at 1/2/4/8 s:
-#     60 ms    movement +0.010/+0.026/+0.032/+0.024  slow_drift +0.009/+0.021/+0.023/+0.021
-#     200 ms            +0.002/+0.007/+0.002/-0.004             +0.002/+0.004/+0.006/-0.000
-#     350 ms            -0.006/-0.009/+0.002/-0.008             -0.004/-0.011/-0.006/-0.010
-#     600 ms            -0.020/-0.041/-0.036/-0.032             -0.016/-0.035/-0.034/-0.033
-#     1000 ms           -0.032/-0.073/-0.054/-0.044             -0.030/-0.064/-0.061/-0.063
-# i.e. a residual that grows with RT60 and reaches 0.073, on top of which the
-# bootstrap (B=20000) of this test's own counts -- POOL_SEQUENCES against the
-# 80-render reference -- puts the 99th percentile of |pool - calibration| at
-# 0.090 for the worst pool. What is left after the Gram is the estimator's own
-# view of a path it cannot resolve: it reads a response through a 64 ms frame,
-# and the tail beyond that frame acts as state-dependent noise on every
-# window's estimate, which no weight schedule can compensate because it is not
-# in the weights. Real rooms carry it too.
+# lag. The residual grows with RT60: the tail beyond the estimator's 64 ms
+# frame acts as state-dependent noise on every window's estimate, which no
+# weight schedule can compensate. The tolerance covers the worst pool plus the
+# bootstrap (B=20000) spread of this test's own counts, POOL_SEQUENCES against
+# the 80-render reference.
 RT60_POOL_TOLERANCE = 0.12
 # How much deeper a mixture the shortest pool needs than the longest, for the
 # same configured correlation. Sized from the bootstrap of the two medians at
@@ -3925,17 +3654,12 @@ RT60_POOL_TOLERANCE = 0.12
 POOL_DEPTH_SPREAD = 0.03
 # The pool the SHIPPED loudspeaker population is reported on, one room length
 # above the span the axis is fitted over. Reported and never gated: what that
-# population costs is the device calibration's number, not the trajectory's
-# (see CALIBRATION_RT60_SPAN), and a gate here would be a gate on a calibration
-# this file does not perform. Rendered at POOL_SEQUENCES and read PAIRED
-# against the linear renders of the same sequences, so the room and the speech
-# drop out of the difference and the DEVICE DRAW is what is left in it.
-# ⚠ That difference is bimodal: a near-linear draw costs the correlation
-# almost nothing and a hard-clipping one costs it a lot, so its median is a
-# step function of how many of the pairs fall in the near-zero mode and moves
-# in jumps between index blocks. Both the mean and the median are reported,
-# each with its own bootstrap interval, and so is the count in that mode --
-# the mean is the summary that behaves at this count.
+# population costs is the device calibration's number, not the trajectory's.
+# Rendered at POOL_SEQUENCES and read PAIRED against the linear renders of the
+# same sequences, so the device draw is what is left in the difference. ⚠ That
+# difference is bimodal (a near-linear draw costs almost nothing, a
+# hard-clipping one a lot), so the median moves in jumps; the mean, the median
+# and the near-zero count are reported, each with its own bootstrap interval.
 MIXTURE_POOL = 'rt60_600ms'
 # What counts as the near-zero mode of that paired difference, for the count
 # printed beside the two summaries.
@@ -3978,40 +3702,11 @@ def test_the_axis_survives_the_whole_shipped_rt60_range(
         rt60_pool_renders, isolated_renders, mode):
     """The calibrated number has to describe the CORPUS, not one pool.
 
-    A mixture depth cannot: what the estimator sees is the correlation between
-    mixture STATES, and that depends on how much the room's positions share.
-    Rendering one fixed depth on these pools moves the same mode 0.15-0.23
-    from the pool it was fitted on, because a longer tail decorrelates further
-    per unit of weight change -- so a corpus rendered in real rooms would carry
-    a different movement axis from the one calibrated here, silently.
-    Configuring a target path CORRELATION and solving the depth per room from
-    the room's own responses removes that, and every render says which depth it
-    needed and what it reached. Median solved depth per pool, movement /
-    slow_drift, with the spread the 3-4 waypoint draw adds in brackets:
-    60 ms 0.50 (0.47-0.60) / 0.24 (0.22-0.29), 200 ms 0.38 (0.35-0.47) / 0.18
-    (0.17-0.23), 350 ms 0.40 (0.38-0.49) / 0.19 (0.19-0.24), 600 ms 0.39
-    (0.35-0.47) / 0.19 (0.17-0.23), 1 s 0.36 (0.36-0.45) / 0.18 (0.17-0.22),
-    against 0.42 (0.35-0.51) / 0.20 (0.17-0.25) on the calibration pool -- all
-    of them rendering the same axis.
-
-    ⚠ Measured on the ISOLATED corpus and against the CALIBRATION POOL's own
-    median rather than against the target curve. Both follow from what is being
-    asked: this is a statement about the RIR pool, and on the shipped device
-    population a per-pool median carries a sampling spread of 0.12-0.20 (see
-    MOTION_SEQUENCES) -- ten times the residual it would have to resolve -- so
-    a per-pool gate there would either need hundreds of renders per pool or
-    measure nothing. The device population is gated on the calibration pool,
-    where the count is sized for it.
-
-    ⚠ The rendered axis alone cannot show that the depth is SOLVED here, and
-    the depths are therefore asserted too. On a pool whose positions share a
-    dominant direct path the Gram correction is a second-order effect: pinning
-    every room to the depth the calibration pool solves (0.42 / 0.20) renders
-    within 0.079 of the same axis where solving renders within 0.073, which no
-    tolerance can separate. What the solve does show is in the depths it picks
-    -- the shortest pool needs a markedly deeper mixture than the longest to
-    reach the same correlation, by POOL_DEPTH_SPREAD at least -- and that is
-    the quantity a configured depth cannot have.
+    A mixture depth cannot: it depends on how much a room's positions share, so
+    one fixed depth moves the same mode 0.15-0.23 across these pools; solving
+    the depth per room from a configured target CORRELATION removes that. ⚠
+    Measured on the ISOLATED corpus, and the depths are asserted too (shortest
+    pool deeper than the longest by POOL_DEPTH_SPREAD).
     """
     reference = {lag: _drift_median(isolated_renders[mode], 'correlation', lag)
                  for lag in DEFAULT_LAGS_SEC}
@@ -4053,16 +3748,13 @@ def test_the_axis_survives_the_whole_shipped_rt60_range(
         f"the same correlation through a 60 ms path and through a 1 s one is "
         f"not being solved from the room's own responses")
 
-    # The shipped loudspeaker population on the same long pool, reported.
-    # Everything above ran linear because the device spread is ten times the
-    # residual a per-pool gate would have to resolve; this row is what that
-    # decision costs in visibility, put back as evidence rather than as a gate.
-    # ⚠ PAIRED: the two sets of renders share their sequence seeds and differ
-    # only in [devices] nonlinear_models, so the room and the speech drop out
-    # of the difference and what is left in it is the device draw -- which is
-    # the quantity being reported, and a bimodal one (see MIXTURE_POOL). The
-    # mean, the median and the size of the near-zero mode are all printed,
-    # because the median of a bimodal sample moves in steps with that size.
+    # The shipped loudspeaker population on the same long pool, reported: the
+    # rows above are linear because the device spread is ten times the residual
+    # a per-pool gate would have to resolve, and this row puts that visibility
+    # back as evidence, not a gate. ⚠ PAIRED: the two sets of renders share
+    # sequence seeds and differ only in [devices] nonlinear_models, so what is
+    # left in the difference is the (bimodal) device draw; the mean, the median
+    # and the near-zero mode size are all printed.
     curve = CALIBRATION_TARGETS[CALIBRATION_TARGET_OF_MODE[mode]]['correlation']
     linear = rt60_pool_renders[MIXTURE_POOL][mode]
     shipped = rt60_pool_renders[MIXTURE_POOL][f'mixture/{mode}']
@@ -4090,11 +3782,8 @@ def test_the_axis_survives_the_whole_shipped_rt60_range(
                 f"{curve[lag]:.2f}")
 
 
-# How far the 48 kHz axis may sit from the 16 kHz one, per lag. Measured
-# isolated, 60 renders per mode: movement +0.000/-0.008/-0.010/-0.018 and
-# slow_drift -0.001/-0.003/-0.001/-0.010 at 1/2/4/8 s, with the bootstrap
-# (B=20000) of this test's counts putting the 99th percentile of the
-# difference at 0.048.
+# How far the 48 kHz axis may sit from the 16 kHz one, per lag, isolated: the
+# tolerance covers the bootstrap (B=20000) spread of this test's counts.
 RATE_TOLERANCE = 0.08
 RATE_SEQUENCES = 40
 
@@ -4104,23 +3793,11 @@ def test_the_axis_is_the_same_at_the_other_sample_rate(isolated_renders, mode,
                                                        tmp_path):
     """The same statement across the rate grid, on the shipped 48 kHz config.
 
-    A mixture depth does not carry across rates -- the same value renders 0.14
-    from the axis it was fitted on here -- while a band-limited path
-    correlation does: the Gram is taken over 300-4000 Hz through the
-    estimator's own analysis frame, so it means the same thing at every rate
-    the corpus is generated at. What is being checked is therefore the CONFIG:
-    everything in config.example.48k.ini that the rate touches -- the grid, the
-    chunk geometry and the rescaled loudspeaker band limits -- has to leave the
-    axis where the 16 kHz one is.
-
-    ⚠ Isolated, and against the 16 kHz ISOLATED axis rather than against the
-    calibration curve. The loudspeaker population is where the per-sequence
-    spread comes from, and at 48 kHz a render costs three times as much, so a
-    gate on the mixture here would need hundreds of renders to resolve a
-    difference this small (measured p99 of the difference between the two
-    rates' medians: 0.048 against a band of 0.10-0.17). The nonlinearity is
-    what the isolated corpus drops; the rescaled band limits, which are the
-    rate-dependent part of [devices], are still in force.
+    A mixture depth does not carry across rates, while a band-limited path
+    correlation does (the Gram is taken over 300-4000 Hz). What is checked is
+    the CONFIG: everything in config.example.48k.ini the rate touches has to
+    leave the axis where the 16 kHz one is. ⚠ Isolated, to keep the loudspeaker
+    spread out of it.
     """
     cfg = configparser.ConfigParser()
     assert cfg.read(pathlib.Path(__file__).parents[1] / 'config.example.48k.ini',
@@ -4175,12 +3852,10 @@ def test_the_axis_is_the_same_at_the_other_sample_rate(isolated_renders, mode,
 CALIBRATION_SEEDS = (SEED, 7, 2024)
 CALIBRATION_SEED_SEQUENCES = 40
 # How much wider than CALIBRATION_BAND the per-seed deviation may be. Two
-# things live in it: the bootstrap allowance of the smaller count (movement
-# n=40 p99 0.083/0.148/0.111/0.102 against n=80's 0.079/0.137/0.090/0.075), and
-# the part of the loudspeaker population that is STILL a draw -- the models are
-# stratified but each id's drive is not, so a seed whose severe models drew
-# high drives renders a lower curve (measured worst: movement at seed 2024 is
-# 0.139 from its 4 s target where the gate's own seed is 0.024).
+# things live in it: the bootstrap allowance of the smaller count, and the part
+# of the loudspeaker population that is still a draw (the models are stratified
+# but each id's drive is not, so a seed whose severe models drew high drives
+# renders a lower curve).
 CALIBRATION_SEED_ALLOWANCE = 0.04
 
 
@@ -4188,17 +3863,10 @@ def test_every_configured_loudspeaker_model_reaches_every_corpus_seed():
     """The realised loudspeaker population is not a lottery.
 
     Each device id's nonlinearity is derived from the corpus seed, so an
-    independent draw per id leaves whole models out of most corpora: over 200
-    seeds of the shipped config, a third have no linear device at all and the
-    asymmetric one is missing from more than a quarter. The movement axis is
-    calibrated THROUGH this population, so which models it contains is part of
-    what the corpus IS, not a detail of --seed.
-
-    Stratifying makes the containment a guarantee whenever there are at least
-    as many ids as models, which is also asserted here: with fewer ids the
-    permutation still runs but the guarantee it provides is vacuous, and a
-    config that quietly slipped under that line would leave this test green
-    while saying nothing.
+    independent draw per id leaves whole models out of most corpora, and the
+    movement axis is calibrated THROUGH this population. Stratifying guarantees
+    containment whenever ids >= models, which is asserted too: with fewer ids
+    the guarantee is vacuous and the test would stay green saying nothing.
     """
     cfg = _example_config()
     models = [name.strip()
@@ -4226,19 +3894,11 @@ def test_every_configured_loudspeaker_model_reaches_every_corpus_seed():
 def test_the_train_split_realises_every_loudspeaker_model(corpus):
     """Stratifying the ids is not enough: the corpus renders ONE split.
 
-    ``device_split = disjoint`` holds ids out for validation, so the population
-    a --split train corpus renders is a subset of the configured one. Drawn
-    without regard to the model, the val id takes its model out of training
-    whenever it is the only id carrying it. The movement axis is calibrated
-    through the population the corpus actually renders, so the split is where
-    the guarantee has to hold; how often the plain permutation misses is
-    measured below rather than quoted.
-
-    ⚠ What that means for val FOLLOWS from the assertion rather than needing
-    one of its own: val is a subset of the configured ids and train realises
-    every configured model, so a val id's model is one train carries. That is
-    the whole content of "held-out identity, not held-out model", and a second
-    assertion of it could not fail while the first one holds.
+    ``device_split = disjoint`` holds ids out for validation, so a --split
+    train corpus renders a subset of the configured population: drawn without
+    regard to the model, the val id takes its model out of training whenever it
+    is the only id carrying it. Val ids are a subset of the configured ids, so
+    what is held out is the identity, not the model.
     """
     cfg = _example_config()
     models = {name.strip()
@@ -4300,15 +3960,11 @@ def test_the_calibration_holds_at_other_corpus_seeds(motion_corpus,
                                                      motion_renders, mode):
     """And it is not a property of ONE seed's device realisation either.
 
-    The gate above renders one corpus seed. The loudspeaker population is
-    derived from that seed, so a calibration that only holds there is a
-    calibration of the seed: this renders the same config at two more and
-    checks that every configured model actually reaches the renders and that
-    the curve stays inside the band the smaller count admits.
-
-    ⚠ The residual spread is the DRIVE, not the model list: with the models
-    stratified, what still moves between seeds is how hard each id happens to
-    be driven, and that is what CALIBRATION_SEED_ALLOWANCE covers.
+    The population is derived from the corpus seed, so a calibration that holds
+    only at the gate's seed is a calibration of that seed: this renders two
+    more seeds and checks that every configured model reaches the renders and
+    the curve stays inside the band the smaller count admits. ⚠ The residual
+    spread is the DRIVE, not the model list (CALIBRATION_SEED_ALLOWANCE).
     """
     cfg = motion_corpus['cfg']
     models = {name.strip()
@@ -4340,11 +3996,10 @@ def test_the_calibration_holds_at_other_corpus_seeds(motion_corpus,
                 # ⚠ NOT held to _assert_band_clears_spread. That rule compares
                 # a band with p99(|median - target|), which is the sampling
                 # spread only where the median sits ON the target. Here the
-                # deviation the allowance exists to cover IS a systematic one
-                # -- a seed whose severe models drew high drives renders a
-                # lower curve -- so the same statistic would be comparing the
-                # allowance against the bias it was sized for (measured:
-                # movement at 8 s reads 0.1673 against a 0.17 band).
+                # deviation the allowance covers IS systematic (a seed whose
+                # severe models drew high drives renders a lower curve), so the
+                # rule would compare the allowance against the bias it was
+                # sized for.
                 _report(f"{mode} at corpus seed {seed} at {lag:g} s over "
                         f"{len(values)} renders: {deviation:.4f} from the "
                         f"target, allowed {allowed:.2f}")
@@ -4361,36 +4016,11 @@ def test_a_still_path_stays_correlated_with_itself(isolated_renders,
                                                    motion_renders):
     """The property the whole axis exists to break: a path found once.
 
-    Rendered BOTH ways on the same pool, because the two answers say different
-    things and only one of them is a gate.
-
-    ⚠ With the device axis removed what is left is the ESTIMATOR's own floor,
-    which is what the ceiling below holds. It is the estimator meeting paths
-    several times longer than its own 64 ms analysis frame -- such a path is
-    not one frequency response, so its Wiener estimate keeps a
-    signal-dependent bias that varies from window to window, and the floor
-    falls further the more reverberant the pool is. It is not the Wiener
-    regularisation: measured on the sequence that reads lowest, the number does
-    not move between an absolute ridge of 1e-9 and one of 1e-5, nor between a
-    25 dB and a 15 dB activity gate, nor across +-128 samples of alignment.
-
-    ⚠ Through the SHIPPED loudspeaker population the same motionless path reads
-    far below that floor -- on the calibration pool itself, inside
-    CALIBRATION_RT60_SPAN, and at the short lags down to the static-device
-    curve slow_drift is calibrated against, which is where that mode's own
-    remaining deviation is. That is the drive population, not the rooms and not
-    the trajectory: no `*_position_correlation` can recover it at any RT60,
-    because a trajectory moves the path further from itself and never back
-    toward the curve.
-
-    ⚠ The mixture reading is REPORTED with its own bootstrap interval, and the
-    interval is why. The drive population is bimodal -- a near-linear device
-    reads on the estimator floor and a hard-clipping one far under it -- so the
-    median of it swings with the count and cannot carry a threshold at any
-    count this fixture can afford. What the test pins is the half that is
-    stable: the estimator contributes none of the shortfall. Re-fitting the
-    drive population against the untouched-device curve is a separate
-    calibration.
+    Rendered BOTH ways on the same pool, because only one answer is a gate.
+    With the device axis removed what is left is the ESTIMATOR's own floor
+    (paths several times longer than its 64 ms frame are not one frequency
+    response), which the ceiling below holds. Through the SHIPPED loudspeakers
+    the reading is bimodal, so it is only REPORTED.
     """
     for lag in DEFAULT_LAGS_SEC:
         assert _drift_median(isolated_renders[STATIC_PATH],
@@ -4487,22 +4117,11 @@ def test_the_moving_label_separates_travelling_chunks_from_dwelling_ones(
         motion_corpus, chunk_sec):
     """What the label carries, at both geometries the corpus is cut into.
 
-    ⚠ It is the CHUNK LENGTH that decides how much the label says, so both are
-    asserted here rather than only the one a fixture happens to pin. A dwell
-    lasts at most `*_dwell_sec_max` (4 s for slow_drift), so at the shipped
-    `chunk_sec` no chunk can lie inside one: every far-active chunk of a
-    drifting sequence contains part of a transition and is labelled, and the
-    label says exactly what `path_motion` and `far_active` already say. At a
-    chunk shorter than a dwell it separates travelling chunks from dwelling
-    ones, which is the only regime where the label is worth reading -- and the
-    regime that pins the definition, because a label that fired on the level
-    walk as well would be emitted on the dwelling chunks too.
-
-    ⚠ The shipped geometry is READ from config.ini rather than restated, and a
-    reference dropout is rendered at it. Every chunk of an ordinary drifting
-    sequence is far-active there, so without a dropout the "no far-silent chunk
-    is labelled" half of the definition is vacuous at exactly the length the
-    corpus is cut into.
+    ⚠ The CHUNK LENGTH decides how much the label says, so both are asserted.
+    At the shipped `chunk_sec` (longer than a dwell, at most `*_dwell_sec_max`)
+    every far-active chunk of a drifting sequence is labelled; at a shorter
+    chunk it separates travelling from dwelling, which pins the definition. The
+    shipped geometry is READ from config.ini.
     """
     shipped = configparser.ConfigParser()
     assert shipped.read(pathlib.Path(__file__).parents[1] / 'config.ini',
@@ -4608,21 +4227,11 @@ def test_the_keyframes_describe_the_trajectory_to_the_end_of_the_render(
         motion_renders, motion_corpus):
     """The metadata has to cover the tail the renderer actually ramps.
 
-    The keyframe walk stops one corner PAST the end of the sequence, and the
-    renderer interpolates the final partial span toward that corner. Dropping
-    it because its time lies outside the audio leaves the last seconds of every
-    sequence with no recorded span at all -- a consumer reading the corners
-    back sees the path stop where the audio does not, and `echo_path_event_at`
-    can point at a transition whose destination is missing.
-
-    ⚠ What the tail is checked for is its KIND, not a size. How much of the
-    final ramp is rendered depends on where the last corner falls: a transition
-    starting a fraction of a second before the end renders a sliver of its
-    raised cosine (measured excursions down to 0.00003 over these renders), so
-    a threshold on the swing would describe the draw rather than the metadata.
-    A hold is EXACTLY constant and a ramp moves toward its recorded
-    destination -- monotonically, because it is one raised cosine -- and that
-    is true of every render.
+    The keyframe walk stops one corner PAST the end of the sequence and the
+    renderer interpolates the final partial span toward it; dropping it leaves
+    the last seconds without a recorded span. ⚠ The tail is checked for its
+    KIND, not a size: a hold is EXACTLY constant and a ramp moves monotonically
+    toward its recorded destination.
     """
     holds = ramps = 0
     for mode in ('slow_drift', 'movement'):
@@ -4727,11 +4336,9 @@ def test_a_moving_sequence_carries_far_activity_after_its_last_transition(
     """An echo-path event with no echo behind it teaches nothing.
 
     ⚠ Measured INSIDE the window, not summed over the whole remainder of the
-    sequence. A schedule that falls silent at the event and resumes ten
-    seconds later has far activity "after the event" by the loose reading and
-    leaves the event itself invisible; that is precisely the case the
-    guarantee exists to remove, so the loose reading cannot be what is
-    asserted here.
+    sequence: a schedule that falls silent at the event and resumes ten seconds
+    later has far activity "after the event" by the loose reading and leaves
+    the event itself invisible.
     """
     with _without_linear_aec():
         renders = [_render_motion(motion_corpus, mode, index=index)
@@ -4757,18 +4364,11 @@ def test_a_reference_dropout_never_zeroes_the_stretch_behind_an_event(
         motion_corpus):
     """The dropout yields to the guarantee, not the other way round.
 
-    ⚠ Whether or not the far schedule had to be repaired. A dropout zeroes a
-    naturally scheduled run exactly as thoroughly as a repaired one, so
-    steering it only around repairs leaves the majority case -- the schedule
-    already covered the window -- unprotected.
-
-    ⚠ The sequence indices are CHOSEN, not the first few. Most draws miss the
-    protected window on their own, so a test that renders whichever sequences
-    come first passes with the keep-out deleted and with the caller passing no
-    keep-out at all. Rendering the same fixture with the keep-out ignored, 5
-    puts a four-chunk dropout on [11, 12, 13, 14] over a protected [11, 12] and
-    14 puts a one-chunk dropout on [8] over [8, 9]; 0 is an ordinary draw that
-    misses either way.
+    ⚠ Whether or not the far schedule had to be repaired: a dropout zeroes a
+    naturally scheduled run as thoroughly as a repaired one. ⚠ The sequence
+    indices are CHOSEN, not the first few, because most draws miss the
+    protected window on their own; with the keep-out ignored, 5 and 14 collide
+    with it and 0 is an ordinary draw that misses either way.
     """
     need = motion_corpus['cfg'].getfloat('path_motion',
                                          'far_active_after_event_sec')
@@ -4827,16 +4427,12 @@ def test_far_activity_is_guaranteed_inside_the_window_not_merely_after_it():
 
 def test_the_one_shot_switch_leaves_room_for_the_window_it_promises(
         motion_corpus):
-    """The switch is an event with a guarantee behind it, so it is placed
-    where the guarantee fits.
+    """The switch is placed where its far-active guarantee fits.
 
-    ⚠ At the SHIPPED chunk geometry, which is where this bites: a 20-30 s
-    sequence is 2 or 3 chunks of 10 s, and a switch drawn uniformly inside the
-    last of them lands in the final second often enough to matter. The drift
-    modes already prefer the last transition that still has the window behind
-    it; drawing the one-shot switch without the same limit leaves an event
-    whose window is a few milliseconds long -- and the field comment, the
-    config and the README all state the guarantee unconditionally.
+    ⚠ At the SHIPPED chunk geometry (20-30 s sequences of 10 s chunks) a switch
+    drawn uniformly inside the last chunk lands in the final second often
+    enough to matter, leaving a window of a few milliseconds. The drift modes
+    already prefer the last transition that still has the window behind it.
     """
     cfg = copy.deepcopy(motion_corpus['cfg'])
     cfg.set('sequence', 'chunk_sec', '10.0')
@@ -4933,13 +4529,11 @@ def test_double_talk_movement_also_moves_the_near_talkers_path(motion_corpus,
                                                                monkeypatch):
     """DT movement is a person shifting AND a loudspeaker moving.
 
-    ⚠ Measured on the near-end AUDIO, not on the metadata flag. The regression
-    this exists to catch is the renderer taking its static `near_rirs[0]`
-    branch while the plan still says the near path moves, and every flag in
-    the chunk metadata survives that. The comparison render forces exactly
-    that branch -- the near trajectory is replaced by a still path AFTER it has
-    been drawn, so both renders consume the same rng and differ in the near
-    path alone.
+    ⚠ Measured on the near-end AUDIO, not the metadata flag: the failure to
+    catch is the renderer taking its static `near_rirs[0]` branch while the
+    plan still says the near path moves. The comparison render forces that
+    branch after the near trajectory has been drawn, so both renders consume
+    the same rng and differ in the near path alone.
     """
     def _static_near_path():
         original = AecSequenceRenderer._plan_path_motion
@@ -5093,20 +4687,11 @@ def _two_segment_split(lags):
 def _reference_is_continuous(far, centres):
     """Is the reference loud enough AROUND these window centres?
 
-    Asked at lag 0, i.e. over the window itself, while the alignment score
-    reads the reference one bulk delay earlier -- so this is the reference's
-    own continuity at the located instant, not a check of every sample the
-    score touched.
-
-    Separated from the locator itself so that "the reference has a gap here"
-    and "the two alignments never cross" are different outcomes: the first is
-    a render this measurement cannot be made on, the second is a failure.
-
-    ⚠ Asked about the LOCATED instant, never about a recorded one. A reference
-    gap at the step drags the crossing to the edge of the gap (measured: up to
-    0.37 s), which is a measurement this render cannot carry; asking the
-    question at the recorded instant instead would let a regression that moved
-    that instant into a gap remove itself from the check.
+    Asked at lag 0 (over the window itself) while the alignment score reads the
+    reference one bulk delay earlier: this is the reference's continuity at the
+    located instant. ⚠ Asked about the LOCATED instant, never a recorded one,
+    so a regression cannot remove itself from the check by moving the instant
+    into a gap.
     """
     quiet = 1e-3 * float(far.pow(2).mean().sqrt())
     return bool(centres) and all(
@@ -5117,22 +4702,12 @@ def _reference_is_continuous(far, centres):
 
 def _alignment_switch(far, echo, before_lag, after_lag, centres):
     """Where the echo stops matching ``before_lag`` and starts matching
-    ``after_lag``.
+    ``after_lag``, or ``None`` when the span holds no boundary.
 
-    A sliding window's two scores cross when the window straddles the step
-    equally, i.e. at the step itself, whatever the window length -- so this
-    locates the instant more tightly than the window it uses.
-
-    ⚠ The sign is decided with hysteresis, from a fraction of the difference's
-    own range rather than from zero: one window sitting on the step can wobble
-    across zero and turn a single boundary into three crossings.
-
-    ⚠ Returns ``None`` when the span holds no boundary to locate, which
-    happens two ways: the difference never changes sign at all -- one alignment
-    matching everywhere -- or its strong excursions run the wrong way round, no
-    window past the last strongly negative one being strongly positive. Either
-    means no instant explains the two lags better than its neighbours, which is
-    what an instant reported far from where it happened looks like.
+    A sliding window's two scores cross when it straddles the step equally,
+    i.e. at the step itself whatever the window length. ⚠ The sign is decided
+    with hysteresis from a fraction of the difference's range, so one window on
+    the step cannot turn a boundary into three crossings.
     """
     difference = []
     for centre in centres:
@@ -5160,16 +4735,10 @@ def _locate_delay_step(far, echo):
     """What the AUDIO says the step was and when it happened.
 
     Returns a ``_StepReading``: ``before``/``after`` are the lags on either
-    side (``None`` when the render carries no measurable step at all),
-    ``instant`` is the located crossing (``None`` when it cannot be located)
-    and ``why`` names the path taken, so a test can pin WHICH renders are
-    analysable and for what reason rather than counting them.
-
-    ⚠ Nothing here is told where the step was recorded. The coarse pass finds
-    it in the alignment track over the WHOLE render and the fine pass refines
-    it inside that bracket, so a render whose recorded instant is wrong is
-    still measured and still compared -- rather than dropping out of the check
-    because a filter evaluated at the wrong instant found no reference there.
+    side (``None`` without a measurable step), ``instant`` the located crossing
+    (``None`` when it cannot be located) and ``why`` the path taken, so a test
+    can pin WHICH renders are analysable. ⚠ Nothing here is told where the step
+    was recorded: a render whose recorded instant is wrong is still measured.
     """
     centres, lags = _lag_track(far, echo)
     if len(lags) < 4:
@@ -5198,21 +4767,12 @@ def _locate_delay_step(far, echo):
             else _StepReading(before, after, None, 'reference-gap'))
 
 
-# What each render of the fixture below does, by index, taken from the
-# locator's own reason for each of the 16. The fixture is deterministic, so
-# this is the complete inventory rather than a sample.
-#   'located'             the crossing was found in the audio and compared
-#   'reference-gap'       the reference is silent around the crossing, so the
-#                         crossing is only defined to the edge of the gap
-#   'no-crossing'         no instant explains the two lags better than its
-#                         neighbours. On this fixture the one render in this
-#                         state has the strong excursions the wrong way round
-#                         -- 45 windows strongly favour the pre-step alignment
-#                         and none after the last of them favours the post-step
-#                         one -- rather than two alignments that never separate
-#   'no-step-in-the-track' the step lands too close to an edge for a 2 s window
-#                         to sit on one side of it, so the lag track carries
-#                         one segment
+# What each render of the fixture below does, by index, from the locator's own
+# reason for each of the 16 (the fixture is deterministic, so this is the
+# complete inventory): 'located' = crossing found and compared; 'reference-gap'
+# = reference silent around the crossing; 'no-crossing' = no instant explains
+# the two lags better than its neighbours; 'no-step-in-the-track' = the step is
+# too close to an edge for a 2 s window to sit on one side of it.
 INSTANT_RENDERS = {
     0: 'located', 1: 'located', 2: 'no-step-in-the-track',
     3: 'located', 4: 'located', 5: 'no-crossing', 6: 'located',
@@ -5225,43 +4785,11 @@ INSTANT_RENDERS = {
 def test_delay_step_shifts_the_echo_by_the_recorded_amount(delay_corpus):
     """The impairment's own metadata has to describe the audio.
 
-    ⚠ Both halves of it. Comparing the lag long before the step with the lag
-    long after verifies the SIZE and would pass unchanged with the recorded
-    instant off by a second, so the instant is located independently -- from
-    the audio alone, over the whole render -- and only then compared with
-    `delay_step_at`.
-
-    ⚠ Nothing about which renders are checked may depend on the value under
-    test. Deciding analysability from the RECORDED instant (is it far enough
-    from an edge, does the reference carry it) turns a regression that moves
-    one instant into a silent skip: the render leaves the check instead of
-    failing it, and a floor on the count cannot see the difference between "two
-    renders were unanalysable" and "two renders were wrong". Here the coarse
-    pass finds the step in the alignment track over the whole render, the fine
-    pass refines it, and the reference is asked about the LOCATED instant.
-
-    ⚠ The bulk delay is pinned LARGE (0.4-0.5 s) on purpose. The error this
-    bound has to reject is an instant reported on the reference timeline
-    instead of the microphone's, which is exactly one bulk delay -- 6400-8000
-    samples here -- so INSTANT_BOUND_SEC sits at 0.16 s: twice the worst
-    measurement error on an unmutated render (peak 1261 samples over the
-    located renders) and a third of the error it discriminates. The range is a
-    RANGE because a negative step is drawn from the headroom above
-    `bulk_delay_ms_min`: with both ends pinned there is no headroom and every
-    drawn step is positive, so half the impairment would go unexercised
-    (measured here: 8 positive, 8 negative).
-
-    ⚠ Which renders are analysable is a fixed, deterministic set, and it is
-    asserted as one rather than as a floor: with a floor, a regression that
-    takes exactly one render out of the check is silent. INSTANT_RENDERS says
-    what the 16 renders of this fixture do, and any change to that fails here
-    with the reason attached.
-
-    ⚠ The recorded instant of a render that is not located is checked by
-    nothing, here or anywhere: locating it from the audio is the only
-    independent evidence there is, and where the audio cannot answer, the
-    metadata cannot be contradicted. That is why the set is pinned -- the
-    number of renders in that position must not grow quietly.
+    ⚠ Comparing the lag long before the step with the lag long after verifies
+    only the SIZE, so the instant is located independently from the audio.
+    Judging analysability from the RECORDED instant would turn a regression
+    into a silent skip, so the reference is asked about the LOCATED instant and
+    the analysable set is pinned (INSTANT_RENDERS).
     """
     cfg = copy.deepcopy(delay_corpus['cfg'])
     cfg.set('echo_path', 'bulk_delay_ms_min', '400')
@@ -5303,26 +4831,11 @@ def test_delay_step_shifts_the_echo_by_the_recorded_amount(delay_corpus):
 def test_a_jittered_delay_keeps_the_echo_behind_its_reference(delay_corpus):
     """The floor is on the delay the microphone actually receives.
 
-    Two independent impairments move the same bulk delay: ``delay_step`` is
-    baked into the played signal first and ``delay_jitter`` then walks it, from
-    the PRE-step value. A walk clamped at zero therefore renders below the
-    configured floor in two different ways -- on its own, by walking a short
-    bulk delay down to nothing, and after a NEGATIVE step, where the net delay
-    is the walk minus the step and goes negative outright, an echo arriving
-    before the reference that caused it. Inside the frozen matched filter's
-    first bin the delay estimate stops moving, so either one costs the rest of
-    the sequence.
-
-    ⚠ Measured from the audio, over 4 s windows. The composition is what the
-    microphone hears and neither impairment's own draw shows it; the windows
-    are long because the far end is conversational and the same speech files
-    recur, so a 1 s window's cross-correlation can lock onto a repeat instead
-    of the alignment.
-
-    ⚠ The seeds are CHOSEN, and they cover both routes: 13, 22 and 23 draw a
-    negative step, 30 draws a positive one and reaches the floor through the
-    walk alone. With the walk clamped at zero instead, 13/23/30 render the echo
-    137/104/81 samples behind a reference it should be at least 160 behind.
+    ``delay_step`` is baked into the played signal first and ``delay_jitter``
+    then walks the PRE-step delay, so a walk clamped at zero renders below the
+    configured floor on its own and after a NEGATIVE step (net delay = walk
+    minus step). ⚠ Measured from the audio over 4 s windows. ⚠ Seeds 13, 22, 23
+    draw a negative step, 30 a positive one.
     """
     cfg = copy.deepcopy(delay_corpus['cfg'])
     cfg.set('echo_path', 'bulk_delay_ms_min', '10')
@@ -5373,17 +4886,10 @@ def test_the_jitter_floor_is_raised_only_where_the_step_is(delay_corpus):
     """The floor follows the step into the signal, it does not precede it.
 
     A negative ``delay_step`` raises the walk's lower clamp by its own size,
-    because after the step the net delay is the walk minus the step. Before the
-    step instant there is no step in the signal: clamping there too would push
-    the whole first part of every walk up by as much as 150 ms and make it
-    one-sided -- a walk that can only go up is not a playout buffer glitch,
-    and it would put a floor in the delay distribution that the config does not
-    describe.
-
-    Measured on the delayed audio rather than on the draw, because what has to
-    hold is a property of the rendered signal: the walk stays above the plain
-    floor everywhere, above the RAISED floor from the step onward, and reaches
-    below the raised floor before it.
+    since after the step the net delay is the walk minus the step; before it,
+    clamping would make the first part of every walk one-sided. Measured on the
+    delayed audio: the walk stays above the plain floor everywhere, above the
+    RAISED floor from the step onward, and reaches below it before.
     """
     cfg = delay_corpus['cfg']
     generator = torch.Generator().manual_seed(11)
@@ -5423,14 +4929,13 @@ def test_the_jitter_floor_is_raised_only_where_the_step_is(delay_corpus):
 
 def test_a_negative_delay_step_keeps_the_echo_inside_the_filter_reach(
         motion_corpus):
-    """A step that lands the echo at 0 ms is not a shorter delay, it is a
-    sequence whose linear error is the uncancelled capture.
+    """A step that lands the echo at 0 ms leaves a linear error equal to the
+    uncancelled capture.
 
-    The frozen matched filter cannot resolve a delay inside its first bin, so
-    it holds the pre-step estimate for the rest of the sequence. Clipping a
-    negative step to the bulk delay does exactly that -- and, on the way,
-    records steps below delay_step_ms_min while the metadata still says
-    delay_step, which is indistinguishable from delay_jitter.
+    The frozen matched filter cannot resolve a delay inside its first bin and
+    holds the pre-step estimate. Clipping a negative step to the bulk delay
+    does that and also records steps below delay_step_ms_min under the
+    delay_step label, indistinguishable from delay_jitter.
     """
     cfg = copy.deepcopy(motion_corpus['cfg'])
     cfg.set('echo_path', 'bulk_delay_ms_min', '10')
@@ -5458,11 +4963,11 @@ def test_a_negative_delay_step_keeps_the_echo_inside_the_filter_reach(
 
 
 def test_a_moving_double_talk_render_is_reproducible(motion_corpus):
-    """Every new draw -- trajectory, level walk, near path -- is seeded.
+    """Every draw of the motion model -- trajectory, level walk, near path --
+    is seeded.
 
-    A drifting sequence adds three rng consumers to a render that a corpus's
-    --resume, its re-materialisation and every A/B against it all assume is a
-    pure function of the sequence seed.
+    --resume, re-materialisation and every A/B assume a render is a pure
+    function of the sequence seed.
     """
     with _without_linear_aec():
         first = _render_motion(motion_corpus, 'movement',
@@ -5767,12 +5272,11 @@ def test_the_planner_refuses_an_unrenderable_motion_model(corpus):
 def test_the_planner_refuses_a_config_missing_any_echo_path_key(corpus):
     """[echo_path] carries no planner probability, so nothing else looks at it.
 
-    Every key in it is read inside a render WORKER -- the bulk delay for every
-    far-capable sequence, the crossfade for a one-shot switch, the step and the
-    jitter walk for their impairments -- and a key omitted from the section
-    survives the plan and the manifest and kills the first worker that draws
-    the impairment reading it, which for the shipped probabilities is a few per
-    cent of the way into a multi-hour run.
+    Every key in it is read inside a render WORKER (the bulk delay for every
+    far-capable sequence, the crossfade, the step and the jitter walk for their
+    impairments), so a key omitted from the section survives the plan and the
+    manifest and kills the first worker that draws the impairment reading it,
+    hours into a run.
     """
     for option in aec_dataset_module.ECHO_PATH_OPTIONS:
         cfg = copy.deepcopy(corpus['cfg'])
@@ -5813,13 +5317,11 @@ class _ReadLoggingConfig(configparser.ConfigParser):
 def test_the_presence_contract_names_every_key_a_worker_reads(motion_corpus):
     """The contract has to come from the RENDERER, not from itself.
 
-    The two tests above delete each key the contract lists and check the
-    planner refuses -- which is a statement about the keys already in it. The
-    defect they cannot see is the opposite one: a key the renderer reads that
-    nobody added to the list, which is precisely how a worker comes to die
-    hours into a run. So this drives the renderer through every impairment with
-    a config that records what it was asked for, and requires the contract to
-    cover it.
+    The tests above delete each key the contract lists and check the planner
+    refuses, which cannot see the opposite defect: a key the renderer reads
+    that nobody listed, which is how a worker dies hours into a run. So this
+    drives the renderer through every impairment with a config that records
+    what it was asked for and requires the contract to cover it.
     """
     cfg = _ReadLoggingConfig()
     cfg.read_dict(motion_corpus['cfg'])
@@ -5857,12 +5359,11 @@ def test_the_presence_contract_names_every_key_a_worker_reads(motion_corpus):
 
 
 def test_the_compatibility_planner_checks_the_same_ranges(corpus):
-    """The legacy [scenarios] branch plans sequences a worker renders too.
+    """The [scenarios] compatibility branch plans sequences a worker renders
+    too.
 
-    It is the branch a config copied from an older tree lands on, so it is
-    exactly where an unrenderable trajectory model is most likely to arrive --
-    and it reads the same [path_motion] and [echo_path] values in the same
-    worker.
+    It reads the same [path_motion] and [echo_path] values in the same worker,
+    so an unrenderable trajectory model must be refused here as well.
     """
     cfg = copy.deepcopy(corpus['cfg'])
     for section in ('talk_modes', 'echo_modes', 'impairments',
@@ -5886,8 +5387,8 @@ def test_the_compatibility_planner_checks_the_same_ranges(corpus):
             plan_sequences(broken, 0.001, SEED, 'train')
 
     # The PRESENCE half, on this branch too. Two of these keys are read by no
-    # validator -- only by a worker, at the moment it renders a crossfade -- so
-    # a legacy config missing one plans a whole corpus and dies hours later,
+    # validator, only by a worker at the moment it renders a crossfade, so a
+    # [scenarios] config missing one plans a whole corpus and dies hours later,
     # which is exactly the failure the contract exists to remove.
     for section, options in (('echo_path', aec_dataset_module.ECHO_PATH_OPTIONS),
                              ('path_motion',
@@ -5899,9 +5400,9 @@ def test_the_compatibility_planner_checks_the_same_ranges(corpus):
                                match=re.escape(f'[{section}] {option}')):
                 plan_sequences(broken, 0.001, SEED, 'train')
 
-    # And the section itself: an older config predating either of them must be
-    # told which section to copy, not handed configparser's NoSectionError from
-    # somewhere inside the validator.
+    # And the section itself: a config without either must be told which
+    # section to copy, not handed configparser's NoSectionError from somewhere
+    # inside the validator.
     for section in ('echo_path', 'path_motion'):
         broken = copy.deepcopy(cfg)
         assert broken.remove_section(section)
@@ -5913,20 +5414,11 @@ def test_the_compatibility_planner_checks_the_same_ranges(corpus):
 def test_a_moving_sequence_is_drawn_from_the_rooms_that_can_hold_it(tmp_path):
     """The room draw pays for the trajectory, not the other way round.
 
-    Every waypoint of a trajectory is in the SAME room (a waypoint elsewhere
-    would leave the near talker behind in the old room -- the acoustic "this is
-    echo" leak the same-room invariant exists to prevent), so a room with fewer
-    than `waypoints_min` positions cannot host one. A sequence that draws such
-    a room draws again among the rooms that can, which is what keeps the
-    rendered motion share equal to the planned one.
-
-    ⚠ The cue that leaves is one-sided and inherent: moving sequences come only
-    from rooms rich enough to hold a trajectory, and no draw rule can change
-    that while every waypoint stays in one room. What CAN be changed is
-    hiding it -- `room_rir_count` is recorded per chunk so the cue is
-    countable, and the CLI refuses a split where fewer than two rooms qualify.
-    Still sequences keep drawing from the whole pool, so a sparse room is not
-    evidence of the sequence's own mode, only of what it could not have been.
+    Every waypoint of a trajectory is in the SAME room (another room would
+    reintroduce the acoustic "this is echo" leak), so a room with fewer than
+    `waypoints_min` positions cannot host one and a sequence that draws it
+    draws again, keeping the rendered motion share equal to the planned one. ⚠
+    The remaining cue is countable via the per-chunk `room_rir_count`.
     """
     cfg, manifest = _sparse_rir_manifest(
         tmp_path, {'room_00': 1, 'room_01': 4, 'room_02': 4})
@@ -6079,18 +5571,11 @@ def test_the_reach_audit_is_scoped_to_this_run_and_counts_the_re_draws(
         tmp_path, capsys):
     """Two rows about the trajectory's positions, both scoped to this run.
 
-    Nothing about a finished sequence is persisted beyond its chunk WAVs, so a
-    resumed run cannot read back what an earlier one reached. The audit
-    therefore covers the sequences THIS run rendered -- and a fully resumed run
-    has to say the audit is missing rather than print nothing, which reads
-    exactly like a corpus whose reach was never in question.
-
-    The position counters are the other half, and there are two of them
-    because a re-draw and a fallback cost different things: a pool whose
-    eligible rooms are mostly near-duplicate positions renders correctly and
-    slowly, while the sequences that run out of draws render their room's ONE
-    certified trajectory and are correct without being varied. A single sum
-    cannot tell an operator which of the two a corpus has.
+    Nothing about a finished sequence is persisted beyond its chunk WAVs, so
+    the audit covers the sequences THIS run rendered, and a fully resumed run
+    says the audit is missing rather than print nothing. A re-draw is slow but
+    correct while running out of draws renders the room's ONE certified
+    trajectory, so the two counters are kept apart.
     """
     cfg, _manifest = _mixed_rir_manifest(tmp_path)
     _only_impairments(cfg, movement='1')

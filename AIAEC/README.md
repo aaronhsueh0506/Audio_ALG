@@ -15,8 +15,7 @@ requirements for the target build; `_init_ex` rejects a descriptor from the othe
 ABI before touching the supplied pool.
 
 
-AIAEC has four candidates. There are no GTCRN- or DeepFilterNet2-derived AENR
-variants: Align-ULCNet covers the linear-AEC + RES/NR route.
+AIAEC has four candidates; Align-ULCNet covers the linear-AEC + RES/NR route.
 
 | Route | Model | Model inputs | Training target | Status |
 |---|---|---|---|---|
@@ -43,11 +42,9 @@ generation stores five stems:
 
 Packing stores only the four tensors used by training: far_render,
 mic_postclip, linear_error, and near_target. Existing generated WAV data does
-not need to be regenerated when repacking, but a corpus rendered before the
-frozen frontend moved onto the context seam carries a `linear_error` produced
-without the over-output capture guard; rematerialize that channel before
-repacking (`dataset_gen/README.md`, "Recomputing `linear_error` after a
-frontend change").
+not need to be regenerated when repacking; to recompute `linear_error` after a
+frontend change see `dataset_gen/README.md`, "Recomputing `linear_error` after a
+frontend change".
 
 model_views.build_model_view() is the only waveform-to-model mapping:
 Align-ULCNet receives linear_error + far_render; the other three receive
@@ -120,7 +117,7 @@ the schedule does not equalise update count or audio exposure, so a win by one
 model is not attributable to architecture alone.
 
 This is a deliberate trade: per-paper fidelity is chosen over a shared
-protocol, and the two cannot both hold in one campaign. Whichever is
+protocol, and the two cannot both hold. Whichever is
 wanted, it should be an explicit decision rather than an artefact:
 
 - **To rank architectures**, put all four on one optimiser, one schedule and
@@ -128,8 +125,7 @@ wanted, it should be an explicit decision rather than an artefact:
 - **To reproduce each paper**, keep these recipes and judge each model against
   its own published numbers, not against its siblings here.
 
-The epoch budget is the project decision requested for this training campaign.
-Align-ULCNet batch 16 and DeepVQE-S batch 8 are GPU-memory overrides. The
+The epoch budget is a project decision. Align-ULCNet batch 16 and DeepVQE-S batch 8 are GPU-memory overrides. The
 Align-ULCNet paper uses 64; DeepVQE-S and Align-CRUSE both publish batch 400
 (for 250 and 150 epochs respectively). CAGCRN explicitly publishes batch 32.
 Early stopping is disabled for all four shipped 50-epoch runs; validation still
@@ -137,22 +133,17 @@ selects the best checkpoint. The common cosine schedule is a project decision,
 not a claim that all four papers published that schedule.
 Changing a loss recipe changes `loss_version`, so a checkpoint trained under a different
 recipe is rejected instead of silently resuming under a new objective.
-The checkpoint contract also records the resolved training recipe -- optimizer
-name, learning rate, weight decay, amsgrad, schedule and the schedule's own
-scalars -- read once and used both to build the optimizer and to write the
-contract. Without it two runs of one model that differ only in learning rate
-produce identical contracts and resume into each other in silence, which is
-exactly the drift `require_checkpoint_contract` exists to catch and which
-became reachable the moment the four candidates stopped sharing one recipe.
-All four shipped configs use `warmup_cosine`. It is rebuilt from the global
-optimizer-step count on resume instead of restoring a stale scheduler horizon.
-The contract records batch size, epoch budget, warmup and LR floor, so a changed
-trajectory is rejected instead of silently resumed.
+The checkpoint contract records the resolved training recipe -- optimizer
+name, learning rate, weight decay, amsgrad, schedule and its scalars, batch
+size, epoch budget, warmup and LR floor -- read once and used both to build the
+optimizer and to write the contract, so `require_checkpoint_contract` rejects a
+changed trajectory instead of silently resuming it. All four shipped configs use
+`warmup_cosine`, rebuilt from the global optimizer-step count on resume instead
+of restoring a stale scheduler horizon.
 
-The stored project examples remain 10-second chunks and one epoch remains one
-complete DataLoader pass. Align-ULCNet's paper used random 3-second examples
-and 20,000 steps per epoch; this campaign intentionally does not rewrite the
-already generated dataset or silently redefine an epoch.
+The stored project examples are 10-second chunks and one epoch is one complete
+DataLoader pass. Align-ULCNet's paper used random 3-second examples and 20,000
+steps per epoch.
 
 ## ONNX export and calibration
 

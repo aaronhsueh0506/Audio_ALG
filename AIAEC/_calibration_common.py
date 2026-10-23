@@ -67,12 +67,11 @@ def wav_inventory(root):
 def discover_pairs(primary_dir, far_dir, pair_replace=None):
     """Pair primary/far WAVs by relative path.
 
-    Default: IDENTICAL relative names in both trees. With ``pair_replace``
-    = (primary_token, far_token) a primary name may also match the far tree
-    after replacing the token (mic_001.wav -> lpb_001.wav) -- an EXPLICIT,
-    deterministic rule the caller states, never a guessed similarity: a
-    wrong silent pairing would poison the whole calibration capture, so
-    anything unmatched still fails loudly.
+    Default: IDENTICAL relative names in both trees. With ``pair_replace`` =
+    (primary_token, far_token) a primary name may also match after replacing
+    the token (mic_001.wav -> lpb_001.wav): an EXPLICIT, deterministic rule,
+    never a guessed similarity, since a silent mis-pairing would poison the
+    capture; anything unmatched fails loudly.
     """
     primary = wav_inventory(primary_dir)
     far = wav_inventory(far_dir)

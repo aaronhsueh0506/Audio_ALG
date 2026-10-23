@@ -5,17 +5,16 @@
 
 #include "utility/simd_kernel_nn.h"
 
-/* The exported graph consumes the fixed [t-1,t,t+1] window. Changing the
- * heads' delay requires a different graph window/readiness contract, not
- * only different DSP ring constants. */
+/* The exported graph consumes the fixed [t-1,t,t+1] window; a different head
+ * delay needs a different graph window and readiness contract, not only
+ * different ring constants. */
 _Static_assert(DFN3_MASK_LOOKAHEAD == 1 && DFN3_MODEL_INPUT_FRAMES == 3,
                "DFN3 layout9 requires a three-frame window and mask lookahead1");
 
 #define DFN3_MODEL_IO_STATE_TENSORS 2
 
-/* One list of (field, contract value) drives both the default and the
- * validator, so validate(default()) == 0 holds by construction and a new
- * geometry constant cannot be added to one without the other. */
+/* One list of (field, contract value) drives both the default and the validator,
+ * so they cannot diverge. */
 #define DFN3_MODEL_IO_DESCRIPTOR_FIELDS(X)                            \
     X(layout_version, (unsigned int)DFN3_MODEL_IO_LAYOUT_VERSION)     \
     X(sample_rate, DFN3_SR)                                           \
@@ -99,8 +98,7 @@ int dfn3_model_io_validate_arrays(
     if (gru_hidden == NULL || df_convp_window == NULL) return -1;
     if (all_finite(&gru_hidden[0][0], gru_count) &&
         all_finite(&df_convp_window[0][0][0], convp_count)) return 0;
-    /* The accelerator wrote these arrays in place, so the previous values are
-     * gone: zero is the only state a stream can restart from. */
+    /* Zero is the only state a stream can restart from after an in-place overwrite. */
     memset(gru_hidden, 0, gru_count * sizeof(float));
     memset(df_convp_window, 0, convp_count * sizeof(float));
     return -1;

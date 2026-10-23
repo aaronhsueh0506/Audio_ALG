@@ -14,10 +14,7 @@
  *     fuse with equal 0.25 weights -> RES stage -> NR stage -> min -> apply -> comfort noise ->
  *     synthesis), every hop dumped in the seam format below. Stops at the first non-zero status of
  *     the core, recording it in the header; the Python side treats that as a result.
- *     aec=no_floor is a construction-time preset like any other: se_derive()'s preset_valid()
- *     (pipelines/common/se_config.c) whitelists mild/balanced/aggressive/no_floor, matching the
- *     Python 4ch pipeline's construction path (FourChannelAecConfig(aec_preset=NO_FLOOR)) and the
- *     AEC C lib's own AecPreset enum. run_chain() passes it straight through in cfg.aec_preset.
+ *     aec=no_floor is accepted like the other presets (se_derive()'s preset_valid()).
  *   mono   mic=F ref=F sr=N fft=N out=F [aec=..] [nr=..] [legacy_amin=0|1] [enable_cng=0|1]
  *     audio_pipeline_process() as the applications call it, with the AEC seam read back after each hop.
  *   replay seam=F out=F [aec=..] [nr=..] [legacy_amin=0|1] [enable_cng=0|1] [usable=F]
@@ -152,7 +149,7 @@ static int run_chain(const Args* a) {
     float *mics, *ref, *out;
     Complex* w;
     cfg.fft_size = a->fft;
-    cfg.aec_preset = a->aec;   /* se_derive()'s preset_valid() now accepts NO_FLOOR directly */
+    cfg.aec_preset = a->aec;
     cfg.nr_mode = a->nr;
     cfg.legacy_amin = a->legacy_amin;
     cfg.enable_nr = a->enable_nr;

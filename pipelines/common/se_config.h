@@ -1,15 +1,8 @@
-/* pipelines/common/se_config.h -- configuration shared by the AEC pipeline
- * applications.
+/* se_config.h -- configuration shared by the AEC pipeline applications.
  *
- * One place derives, from the fields every application carries, the signal
- * grid and the AecConfig of the linear stage. Each application keeps the
- * rules that belong to it (the rate set, the delay-request checks, how its
- * AEC lanes are aligned, which seam context the lanes keep) as an SeRules
- * value, so an edit to a shared bound lands once instead of in three files.
- *
- * Pure functions of their arguments: no allocation, no I/O, no state. The
- * NR configuration is composed in se_anr_stage.h.
- */
+ * Derives the signal grid and the linear-stage AecConfig from the fields every
+ * application carries; each application states its own rules as an SeRules value.
+ * Pure functions: no allocation, no I/O, no state. */
 #ifndef PIPELINES_SE_CONFIG_H
 #define PIPELINES_SE_CONFIG_H
 
@@ -48,11 +41,10 @@ typedef struct SeRequest {
 /* What an application accepts and how its AEC stage is wired. */
 typedef struct SeRules {
     int allow_8k;          /* admit the 8 kHz grid (fft 256)                          */
-    int fixed_rate;        /* > 0: the only rate; then fft must be 0 or fixed_fft and  */
-    int fixed_fft;         /*      allow_8k is ignored (compiled-grid applications)    */
+    int fixed_rate;        /* > 0: the only rate; then fft must be 0 or fixed_fft, allow_8k is ignored */
+    int fixed_fft;         /* compiled-grid fft size */
     int check_delay;       /* reject delay settings that contradict delay_mode          */
-    int lane_aligned;      /* the AEC consumes an already aligned reference: the AEC    */
-                           /* config carries EXTERNAL_ALIGNED whatever the request says */
+    int lane_aligned;      /* the AEC consumes an already aligned reference (EXTERNAL_ALIGNED) */
     int spatial_context;   /* AecConfig.spatial_linear_context, or SE_CONTEXT_PRESET    */
     int with_nr;           /* validate nr_mode                                          */
 } SeRules;
@@ -66,10 +58,9 @@ int se_grid_resolve(int sample_rate, int requested_fft, int allow_8k, SeGrid* ou
 /* The compiled-grid variant: only (rate, fft) with fft requested as 0 or fft. */
 int se_grid_fixed(int sample_rate, int requested_fft, int rate, int fft, SeGrid* out);
 
-/* Validates `req` against `rules`, then fills the grid and the AecConfig of
- * the linear stage (enable_res 0, return_res_context 1: the RES and NR gains
- * are applied by the caller). Returns 0, or -1 for the first violated rule;
- * on -1 the outputs are unspecified. */
+/* Validates `req` against `rules`, then fills the grid and the linear-stage
+ * AecConfig (enable_res 0, return_res_context 1: the caller applies the RES and NR
+ * gains). Returns 0, or -1 for the first violated rule (outputs unspecified). */
 int se_derive(const SeRequest* req, const SeRules* rules,
               SeGrid* grid, AecConfig* aec);
 

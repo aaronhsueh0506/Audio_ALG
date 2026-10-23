@@ -2,8 +2,8 @@
 
 DFN3 band-split implementation alongside DFN2 cascade/alpha for controlled
 comparison. This custom port uses the current AINR training, calibration, ONNX
-and audiolib C interfaces. Restoration provenance and validation are recorded
-in [`../CHANGELOG.md`](../CHANGELOG.md).
+and audiolib C interfaces. Release history is in
+[`../CHANGELOG.md`](../CHANGELOG.md).
 
 ## Architecture and comparison contract
 
@@ -13,8 +13,8 @@ DFN3: raw low bins -> DF; high bins -> ERB mask; concatenate low/high
 ```
 
 DFN3 does not consume the ERB gain in its low-frequency path and has no alpha
-output. Historical unused alpha parameters remain in `state_dict` so existing
-compatible DFN3 v5 weights can still load strictly; they do not affect inference.
+output. Unused alpha parameters remain in `state_dict` so compatible
+DFN3 v5 weights can still load strictly; they do not affect inference.
 Both models deliberately omit the upstream local-SNR head.
 
 The shipped configs agree on signal grid, feature calculation, network sizes,
@@ -50,13 +50,10 @@ the streaming C timing reference.
 - Loss: `dfn_mrsl_mag_complex_gamma_v2`.
 - Composition: `dfn3_parallel_split` in newly written contracts.
 
-A historical checkpoint with the exact model/feature versions above may omit
-the composition field, since the model version already identifies that graph.
-An explicitly different composition is rejected. DFN2 v6 weights, feature-v3
-historical weights and old accelerator layouts must not be relabeled or
-force-loaded. The old files under `../DeepFilterNet2/output/` are model-v5 /
-feature-v3 artifacts and are not ready-to-use weights for this restoration.
-No new trained production checkpoint is supplied by restoring source code.
+A checkpoint with the exact model/feature versions above may omit the
+composition field, since the model version already identifies that graph. An
+explicitly different composition is rejected. A checkpoint from another model,
+feature or accelerator-layout version must not be relabeled or force-loaded.
 
 ## Train, infer and export
 
@@ -64,7 +61,7 @@ Run each model from its own directory so its relative `output/` and `calib/`
 paths remain separate. Use the same packed corpus and seed for the comparison:
 
 ```bash
-# This checkout was verified with SE/.venv (or use an equivalent environment).
+# Use SE/.venv or an equivalent environment.
 source ../../../.venv/bin/activate
 python3 train.py --config config.ini --packed-dir /path/to/data_48k --seed 42
 python3 inference.py --config config.ini --model output/dfn3_best.pth \
@@ -120,10 +117,10 @@ python3 -m pytest DeepFilterNet2/tests DeepFilterNet3/tests \
     tests/test_dfn3_prepost_c.py -q
 ```
 
-`libainr_prepost.a` contains independent DFN2, DFN3 and GTCRN symbols. The new
+`libainr_prepost.a` contains independent DFN2, DFN3 and GTCRN symbols. The
 DFN3 C tests cover changing masks, nonzero future taps, Python/C parity,
 identity audio latency, reset/rejected-head behavior and scalar/SIMD agreement.
 `tests/test_dfn3_prepost_c.py` pins the grid accessors and the between-hops
 ERB-matrix swap contract (including its refusals) through ctypes.
-The detailed historical numerical audit remains in
+The upstream numerical alignment is in
 [`UPSTREAM_ALIGNMENT.md`](UPSTREAM_ALIGNMENT.md).

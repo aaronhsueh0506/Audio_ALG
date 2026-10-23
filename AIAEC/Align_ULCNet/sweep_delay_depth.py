@@ -5,33 +5,27 @@ A delay profile has two independent halves and this tool drives both:
 
 * the AEC half, ``--delay-num-filters`` (n): how far the PBFDKF frontend's
   matched-filter bank searches for the bulk far-to-mic delay, and how much AEC
-  pool that costs. Reliable reach is 125/221/317/413/509 ms for n=1..5.
-* the model half, ``--depths`` (D): how many past frames the temporal
-  alignment attention keeps, and how much model state that costs. One hop is
-  16 ms on the fixed 16 kHz / 512 / 256 grid.
+  pool that costs (reliable reach 125/221/317/413/509 ms for n=1..5).
+* the model half, ``--depths`` (D): how many past frames the temporal alignment
+  attention keeps, and how much model state that costs (one hop is 16 ms on the
+  fixed 16 kHz / 512 / 256 grid).
 
-They do not add up into one delay budget. Each layer must satisfy the input
-condition the previous one delivers, which is why n and D are reported side by
-side in every summary row rather than summed.
+They do not add up into one delay budget: each layer must satisfy the input
+condition the previous one delivers, so n and D are reported side by side. Both
+are DEPLOYMENT knobs, not checkpoint-compatibility or retraining requirements:
+n is a runtime AEC init override applied to the instance this tool builds (the
+tool records the departure from the frozen ``DATASET_DELAY_NUM_FILTERS`` bank);
+D is an export-time model shape.
 
-Both are DEPLOYMENT knobs and neither is a checkpoint-compatibility or
-retraining requirement. n is a runtime AEC init override applied to the
-instance this tool builds; D is an export-time model shape. Corpora remain
-materialized at the frozen ``DATASET_DELAY_NUM_FILTERS`` bank. A product may
-deploy another n after its measured bulk-delay range and acquisition margin
-fit that bank; this tool records the departure so results remain auditable.
-
-The microphone/far frontend is evaluated once, with a tapped hop loop that
-records the delay the PBFDKF actually applied and the far it actually
-consumed. Every requested depth then loads the same checkpoint weights into an
-otherwise identical model and runs ``forward_stream()`` one STFT frame at a
-time. The tool writes one float WAV per depth, a summary CSV, a per-frame
-delay trace, and the AEC alignment trace.
-
-Every clip is also QA'd against an estimator-INDEPENDENT offline measurement
-of the bulk delay (see :func:`alignment_qa`). A clip whose applied delay
-disagrees with that measurement is marked invalid so a mis-lock cannot be
-averaged into a delay-profile statistic.
+The microphone/far frontend is evaluated once with a tapped hop loop that
+records the delay the PBFDKF applied and the far it consumed. Every requested
+depth then loads the same checkpoint weights into an otherwise identical model
+and runs ``forward_stream()`` one STFT frame at a time. The tool writes one
+float WAV per depth, a summary CSV, a per-frame delay trace and the AEC
+alignment trace. Every clip is also QA'd against an estimator-INDEPENDENT
+offline measurement of the bulk delay (see :func:`alignment_qa`); a clip whose
+applied delay disagrees is marked invalid so a mis-lock cannot be averaged into
+a delay-profile statistic.
 
 Examples::
 
@@ -46,7 +40,7 @@ Examples::
         --target-wav clean_target.wav
 
 The Python real-time factor is useful only for relative comparisons between
-depths on the same machine.  It is not an estimate of NPU performance.
+depths on the same machine; it is not an estimate of NPU performance.
 """
 
 from __future__ import annotations
@@ -154,12 +148,11 @@ QA_MIN_WINDOWS = 2
 def resolve_delay_num_filters(requested: Optional[int]) -> int:
     """The bank size this run deploys.
 
-    ``None`` -- the flag omitted -- resolves to the size every corpus is
-    materialized at, so an unflagged run reproduces exactly the frontend the
-    checkpoint was trained against. Resolved here rather than as an argparse
-    default so the tool can still tell "asked for the corpus size" apart from
-    "did not ask", which is what the ``--input-is-linear-error`` conflict check
-    needs.
+    ``None`` (flag omitted) resolves to the size every corpus is materialized
+    at, so an unflagged run reproduces the frontend the checkpoint was trained
+    against. Resolved here rather than as an argparse default so "asked for the
+    corpus size" stays distinguishable from "did not ask" for the
+    ``--input-is-linear-error`` conflict check.
     """
     if requested is None:
         return DATASET_DELAY_NUM_FILTERS
@@ -372,16 +365,10 @@ def measure_offline_bulk_delay(
     """Bulk far-to-mic delay from RAW signals, independent of the estimator.
 
     Reuses the residual meter's windowed, energy-gated, normalized
-    cross-correlation with the RAW far as the reference and the microphone as
-    the target, so ``lag > 0`` means the far leads the mic by that many
-    samples -- the bulk delay. Windows with no far excitation or no
-    explanatory peak are skipped rather than contributing a noise lag, and a
-    peak sitting on the search boundary is reported instead of being read as a
-    measurement: that combination is what separates a real delay from the
-    corpus tail-length artefact that once read as 3744 ms.
-
-    The lock gate is deliberately not applied here. This measurement must stay
-    independent of the very estimator decision it is used to audit.
+    cross-correlation with the RAW far as reference and the microphone as
+    target, so ``lag > 0`` means the far leads the mic. The lock gate is
+    deliberately not applied: this must stay independent of the estimator
+    decision it audits.
     """
     windows, _skipped = measure_residual_windows(
         far_end, microphone, sample_rate,
@@ -408,25 +395,14 @@ def alignment_qa(
 ) -> Dict[str, object]:
     """Per-clip QA of the estimator's decision against offline ground truth.
 
-    Two independent verdicts, both reported:
-
-    * ``applied vs offline bulk delay`` -- the estimator's applied delay must
-      land at, or just before, the delay an estimator-independent correlation
-      of the raw signals measures. Anything else is a mis-lock and the clip is
-      marked INVALID so it cannot be averaged into a delay-profile statistic.
-    * ``aligned-far residual`` -- over settled, locked windows the far the
-      PBFDKF actually consumed must lead the echo (positive lag) by a bounded
-      amount. This is the seam the NN sees in ``aligned_far`` mode.
-
-    ``status`` is one of ``ok`` / ``mislock`` / ``not_acquired`` /
-    ``not_acquired_in_range`` / ``undecidable``. ``not_acquired`` is an honest
-    out-of-range observation: a bank too small to reach the clip's delay stays
-    unlocked and lets the pipeline fail open. Failure to acquire a decidable
-    delay that is inside this bank's reliable range is instead invalid and
-    reported as ``not_acquired_in_range``.
-
-    ``offline`` accepts a precomputed measurement: it depends only on the raw
-    signals, so callers that QA several runs of one clip measure once.
+    Two verdicts: ``applied vs offline bulk delay`` (the applied delay must
+    land at, or just before, what an estimator-independent correlation of the
+    raw signals measures; otherwise a mis-lock and the clip is INVALID) and
+    ``aligned-far residual`` (over settled, locked windows the consumed far
+    must lead the echo by a bounded positive amount). ``status`` is ``ok`` /
+    ``mislock`` / ``not_acquired`` (an honest out-of-range observation) /
+    ``not_acquired_in_range`` (invalid) / ``undecidable``. ``offline`` accepts
+    a precomputed measurement.
     """
     if offline is None:
         offline = measure_offline_bulk_delay(

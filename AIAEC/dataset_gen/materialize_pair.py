@@ -1,24 +1,17 @@
 #!/usr/bin/env python3
 """Materialize one mic/far pair's ``linear_error`` with the current frontend.
 
-DIAGNOSTIC ONLY. This exists to feed
-``inference.py --input-is-linear-error``, whose point is to answer "what does
-this checkpoint do on a signal the CURRENT frontend produces" without
-retraining first. rematerialize_linear_aec.py is the corpus tool: it walks a
-generated split directory and rewrites dataset chunks. Neither substitutes for
-the other, and neither of them served a loose pair of WAVs.
+DIAGNOSTIC ONLY: it feeds ``inference.py --input-is-linear-error``, to answer
+"what does this checkpoint do on a signal the CURRENT frontend produces"
+without retraining. rematerialize_linear_aec.py is the corpus tool.
 
-The contract here is built from the runtime, not read from a checkpoint, which
-is what makes this runnable when a checkpoint-carrying path is not: after a
-frontend change a recorded ``aec_behavior_hash`` no longer describes the
-installed engine, and every path that carries one is supposed to refuse. This
-tool carries no checkpoint, so it has nothing to refuse.
+The contract is built from the runtime, not read from a checkpoint, so this
+runs where a checkpoint-carrying path would refuse; it carries no checkpoint.
 
-⚠ The output must never be written back into a corpus. A corpus is materialized
-as complete sequences and chunked afterwards; this pads one waveform to a hop
-boundary and trims the result back, so its tail is not what the corpus path
-would produce there. No contract comparison can tell the two apart -- the
-contract is identical -- which is why this is a warning and not a check.
+⚠ The output must never be written back into a corpus: a corpus is
+materialized as complete sequences and chunked afterwards, while this pads one
+waveform to a hop boundary and trims it back, so its tail differs and no
+contract comparison can tell.
 
     python3 -m AIAEC.dataset_gen.materialize_pair mic.wav far.wav error.wav
 """

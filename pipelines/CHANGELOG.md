@@ -3,6 +3,16 @@
 `Audio_ALG/pipelines`（含它建置的 `AINR`、`AIAEC` C 程式）的重要改動記錄在此，格式依
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/)。README 只寫現況，改動經過寫在這裡。
 
+## [Unreleased] — 2026-10-23 — Sample driver tidy-up; sources and docs condensed
+
+### Changed
+- `mcab_sample_driver`: a NULL `finish` hook counts as success; the raw and static drivers and the 4-channel
+  DFN / ULCNet `main.c` use it, with a test for the NULL case.
+- `dfn3_process.c` drops duplicate includes. Docs: the quick-start clone URL, archive paths (`print-lib-path`),
+  layout-version numbers and the Align-ULCNet far-input description (raw far) match the code; the long design and
+  upstream-alignment notes are cut to present-state tables, with history left in git.
+
+
 ## [Unreleased] — 2026-10-23 — Smaller AEC pool; DFN3 pre/post accessor and ERB-swap tests
 
 ### Changed
@@ -27,6 +37,46 @@
 ### Removed
 - `dfn_rate_bridge_set_atten_lim()`, a pure forwarder; call `dfn_res_stage_set_atten_lim()` on
   `dfn_rate_bridge_stage()`, or set `atten_lim_db` at creation.
+
+### Source comments condensed
+- Release comments in the pipeline sources are cut to contracts and one-line rationale; the design
+  decisions that lived only in comments are recorded here.
+- Shared-delay duty cycle (`4aec_nr_res.c`): the period floor is 1 hop (a floor of 2 capped the
+  `delay_est_period_s = 0.0` default at 50 % engagement); the watchdog leak is lib/aec's 0.1 dB per
+  second and scales linearly with the hop period (0.001 dB per 10 ms hop), not as a retention
+  power law. The opt-in throttle saved about 4x of the shared delay stage (17.0 -> 4.3 us/hop
+  measured) at the price of a possibly different settled lag; with no lane clearing the ERLE arming
+  threshold, re-acquisition costs up to about 2.5x on 16 kHz/256 (bounded at K).
+- Shared-delay change admission uses lib/aec's Path-B numbers (movement above 32 native samples,
+  offered again within 16, candidate life 3 hops). DelayAec publishes on a 16-downsampled grid
+  (64 native samples at 16 kHz, 192 at 48 kHz), so the 32-sample term is a floor under a finer
+  source. The TTL is not reachable from a stream (DelayAec re-offers every hop), hence the
+  non-static state machine.
+- An alignment change realigns the four lanes (`aec_apply_external_realign()`: warm tap transfer or
+  a filter-only reset) instead of resetting them; a full reset costs one near-zero hop plus dozens
+  of hops of re-exposed echo. A mixed warm/soft sweep makes the lanes' far spectra diverge (seen on a
+  real 48 kHz 4-microphone fixture), so that hop skips lane-0 far-FFT sharing and the agreement
+  predicate; on all other hops four far-FFT counter reads replace 4*n_freqs compares.
+- Identity reprime after an alignment boundary is 1 frame in both ULCNet pipelines: both branches are
+  framed from the current hop and each 50 %-overlap frame spans two hops, so only the boundary hop's
+  frame straddles. The count was derived from a marker run containing no boundary.
+- `delay_backward_quarantine_enabled` stays off in the 4-channel ULCNet defaults: the guard only
+  delays a mis-lock by its window, so enabling it is a policy decision pending a spot check with the
+  deployed checkpoint.
+- DFN stage: the comfort-noise fill stays off by default because additive noise perturbs P's phase in
+  the RES-cut bins, where the deep filter's estimate/apply consistency (fitted on E, applied on P)
+  no longer holds; quality of the dual-input topology against a mask-only compose is to be settled
+  with the Python evaluators once a checkpoint of the current contract exists.
+- `post_gain`: the angle-to-bin mapping rounds in radians (SRP's rounds through degrees and differs
+  on 208 of 2.4M sampled angles); the frequency smoother splits edge/interior loops (247.2 -> 34.6
+  ns/frame at F=257; a running accumulator is rejected because it reassociates the sum, hand NEON
+  38.0 ns); the target loop uses `&` instead of `&&` (103.0 -> 18.7 ns/frame); hoisting the time
+  smoother's coefficients took 96.1 -> 26.7 ns/frame; a two-pass dilation was slower (132.5 -> 201.1);
+  `sk_asym_ema_f32` is not used because it breaks ties on the other side (17.0 % of values differ).
+- `fix_gain`/`nr_gain`: a `global_gain` of exactly 0 means unset (1.0) so existing tuning files keep
+  their meaning; `fix_gain` clips in a separate pass through the shared kernels.
+- Stage timing stays off by default: nine clock reads per 4-channel hop plus five per lane (29 in
+  all), four per mono hop; the profile build sets both halves with `PROFILE=1`.
 
 ## [Unreleased] — 2026-10-23 — Frozen-digest regression checks are no longer shipped
 

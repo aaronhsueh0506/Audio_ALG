@@ -4,7 +4,7 @@
 All arms share one AEC/beamformer/RES context stream on the recordings' own rate
 (16 kHz); only the DFN2 stage runs at 48 kHz, through the rate bridge that
 the C product path uses. The report also carries
-the original MMSE-LSA+RES tail and an AEC/BF/RES-only identity baseline. Only
+the MMSE-LSA+RES tail and an AEC/BF/RES-only identity baseline. Only
 the spectrum used to estimate the DFN2 heads changes between DFN arms:
 
   raw_capture     raw/near spectrum from the capture-proxy microphone
@@ -154,8 +154,7 @@ def evaluate(case_dir: Path, checkpoint: Path, seconds: float,
     output_dir.mkdir(parents=True, exist_ok=True)
     outputs = {}
 
-    # These two anchors make the experiment answer both questions: whether
-    # DFN beats the pipeline it replaces, and what it adds beyond RES alone.
+    # Two anchors: the pipeline DFN replaces, and RES alone.
     outputs['original_nr_res'] = dfn_post.post_conventional(
         contexts, native_rate, nr_preset='balanced', enable_cng=False)[:limit]
     post_config = AecConfig(sample_rate=native_rate, frame_size=2 * hop,
@@ -174,8 +173,8 @@ def evaluate(case_dir: Path, checkpoint: Path, seconds: float,
                 contexts, post_config, stage,
                 estimate_spectra=candidates[name],
                 enable_cng=False, output_length=count)[:limit]
-            # Preserve the original full-head name for compatibility and add
-            # an explicit suffix only to the diagnostic mask-only arm.
+            # The full-head arm keeps the plain name; the diagnostic mask-only
+            # arm gets a suffix.
             output_name = (f'dfn_{name}' if compose == 'full'
                            else f'dfn_{name}_{compose}')
             outputs[output_name] = out

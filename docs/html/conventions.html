@@ -63,7 +63,7 @@ centered 與串流（center=False）framing 在穩態逐 bit 等價。</p>
 <table>
 <tr><th>元件</th><th>SR</th><th>FFT=frame / hop（bins）</th><th>預設？</th><th>出處</th></tr>
 <tr><td rowspan="4">AEC（<code>lib/aec/c_impl</code>）<br>
-<span class="note">hop=fft/2、block=fft、K=fft/2+1（<code>aec.c:199-204</code>）</span></td>
+<span class="note">hop=fft/2、block=fft、K=fft/2+1（<code>aec_derive_dims()</code>，<code>aec.c</code>）</span></td>
 <td>8 k</td><td>256 / 128（129）</td><td>預設（唯一）</td>
 <td rowspan="4"><code>aec.c</code> <code>aec_config_defaults()</code>
 （48k→1024、16k→256、8k→256）與 <code>aec_validate_config()</code> 白名單；
@@ -83,7 +83,7 @@ centered 與串流（center=False）framing 在穩態逐 bit 等價。</p>
 <td><code>pipelines/common/se_config.c</code> <code>se_grid_resolve()</code>（<code>allow_8k</code> 由應用的規則給）</td></tr>
 <tr><td>4ch core（<code>4ch_aec_bf_nr_res/</code>）</td><td>16/48 k</td>
 <td>只有三個 grid：16k/256、16k/512、48k/1024（<b>無 8 k</b>）</td><td>16k 預設 256</td>
-<td><code>pipelines/common/se_config.c</code> <code>se_grid_resolve()</code>（<code>allow_8k = 0</code>）；<code>aec.c:196-198</code> 註解</td></tr>
+<td><code>pipelines/common/se_config.c</code> <code>se_grid_resolve()</code>（<code>allow_8k = 0</code>）；<code>aec_derive_dims()</code> 註解</td></tr>
 <tr><td rowspan="2">ULCNet 變體（mono + 4ch）</td><td>16 k</td>
 <td><b>512 / 256（257）</b>；ta_bins 26</td>
 <td rowspan="2">編譯期固定：<code>make ULCNET_GRID=16k|48k</code>
@@ -179,19 +179,18 @@ vs 上游 4800 Hz）</td><td>編譯期固定</td>
 <h3>PBFDKF far_spec 矩形窗例外</h3>
 <p><b>線性濾波路徑沒有分析窗。</b>PBFDAF/PBFDKF 是 overlap-save 結構：
 far/near 的 block（= 2×hop 原始樣本）直接進 RFFT——
-<code>pbfdkf.c:444</code> <code>rfft_padded(p, p->far_buffer, blk, p->far_spec)</code>、
-<code>:436</code> 同樣的 near_spec——等效矩形窗。輸出取
-<code>echo_time[hop:block]</code> 有效半段、error_spec 由 zero-pad 的有效 hop 重建
-（<code>:542-545</code>），全程無窗。sqrt-Hann 只出現在<b>供 RES/後級分析用</b>的
-<code>error_spec_windowed</code>（<code>:552-553</code>：sqrt-Hann×near − echo_spec）。
+<code>pbfdkf.c</code> 的 <code>rfft_padded(p, p->far_buffer, blk, p->far_spec)</code>
+與同樣的 near_spec——等效矩形窗。輸出取
+<code>echo_time[hop:block]</code> 有效半段、error_spec 由 zero-pad 的有效 hop 重建，全程無窗。sqrt-Hann 只出現在<b>供 RES/後級分析用</b>的
+<code>error_spec_windowed</code>（sqrt-Hann×near − echo_spec）。
 另有 <code>td_window</code>（IR 時域約束窗：causal taps 全 1 + hop/4 非因果
 fade），作用在濾波器係數不是訊號。</p>
 
-<h2>ULCNet centered framing vs AEC/DFN 串流（center=False）framing</h2>
-<p>兩種 framing 並存是刻意的：AINR DFN2 的 C 是 center=False 串流
-（<code>dfn2_process.h</code> parity 限制 (1)），Align-ULCNet 的 C 重現
-torch <code>center=True</code> timing（<code>ulcnet_process.h</code> 檔頭 +
-<code>docs/align_ulcnet_embedded_streaming_design_zh_TW.md</code> 第 7 節決策）。</p>
+<h2>centered framing 與串流（center=False）framing</h2>
+<p>AINR DFN2 的 C 是 center=False 串流（<code>dfn2_process.h</code> parity 限制 (1)），
+Align-ULCNet 的 C 出貨路徑也是 center=False rolling 分析，與 torch <code>center=True</code>
+的穩態幀逐 bit 重合（<code>ulcnet_process.h</code> 檔頭 +
+<code>docs/align_ulcnet_embedded_streaming_design_zh_TW.md</code> §7）。</p>
 <p><b>穩態幀為何重合（逐 bit）：</b>本 grid 下 win = n_fft、hop = win/2、同一
 sqrt-Hann 窗。centered 第 k 幀以樣本 k·hop 為中心，覆蓋
 [k·hop − win/2, k·hop + win/2) = [(k−1)·hop, (k+1)·hop)；
@@ -318,7 +317,7 @@ sqrt-Hann 1024/512 分析。AEC delay 改變<b>不</b>重置 stage 或 bridge：
 
 <h2>Wall-clock authoring grid 註記</h2>
 <ul>
-<li>AEC 的時間常數多以 legacy 10 ms hop（hop=160@16k）撰寫，於
+<li>AEC 的時間常數多以 10 ms hop（hop=160@16k）為基準撰寫，於
 <code>aec_carve()</code>/<code>aec_growth_rehop()</code> 對實際 grid 即時 retime
 （<code>aec.h</code> 各欄位註解）；<b>不要</b>在程式碼裡寫入已 retime 的字面值。</li>
 <li>NR 有兩個 authoring 基準並存：10 ms 參考（<code>anr_retime_alpha</code>）

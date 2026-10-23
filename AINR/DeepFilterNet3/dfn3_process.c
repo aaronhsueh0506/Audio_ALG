@@ -5,13 +5,11 @@
 #include <string.h>
 
 
-/* Model-local DSP kernels (features / mask expansion / attenuation limit /
- * post-filter). The STFT and ISTFT framing is audiolib's AcStft and
- * AcIstft, owned by the caller and bound with dfn3_state_init(). */
+/* Model-local DSP kernels (features / mask expansion / attenuation limit).
+ * The STFT and ISTFT framing is audiolib's AcStft and AcIstft, owned by the
+ * caller and bound with dfn3_state_init(). */
 
-#include <math.h>
 #include <stddef.h>
-#include <string.h>
 
 #include "utility/simd_kernel_nn.h"
 
@@ -20,10 +18,9 @@
 #endif
 #define DF_COMMON_HAVE_NEON SK_HAVE_NEON
 
-/* This fixed graph consumes heads[current-MASK_LOOKAHEAD]. A larger DF
- * lookahead needs an additional coefficient queue and a changed graph/runtime
- * contract; refuse that configuration at compile time instead of reading a
- * future ring slot before it has arrived. */
+/* This graph consumes heads[current-MASK_LOOKAHEAD]; a larger DF lookahead needs
+ * a coefficient queue and a changed graph/runtime contract, so it is refused at
+ * compile time. */
 _Static_assert(DFN3_DF_LOOKAHEAD <= DFN3_MASK_LOOKAHEAD,
                "DFN3 stream requires DF lookahead <= mask lookahead");
 _Static_assert(DFN3_DF_LOOKAHEAD >= 0 && DFN3_DF_HISTORY >= 0,
@@ -32,10 +29,8 @@ _Static_assert(DFN3_DF_LOOKAHEAD >= 0 && DFN3_DF_HISTORY >= 0,
 /* The deep filter's taps before the stream start read this row. */
 static const float df_zero_row[DFN3_DF_BINS];
 
-/* erb_fwd: caller-loaded exported matrix, raw float32, bin-major
- * [n_bins][n_bands] -- the exact buffer the model trained with (see
- * export_erb_matrix.py --runtime-bins). The library never derives a
- * filterbank; the loader owns the file and can swap it at runtime. */
+/* erb_fwd: caller-loaded matrix, raw float32, bin-major [n_bins][n_bands]
+ * (export_erb_matrix.py --runtime-bins). The library never derives a filterbank. */
 static inline void df_common_features(
     const float *spec_re, const float *spec_im,
     const float *erb_fwd, const uint16_t *fwd_lo, const uint16_t *fwd_hi,
@@ -48,11 +43,9 @@ static inline void df_common_features(
     float scale2 = analysis_scale * analysis_scale;
     memset(erb_work, 0, (size_t)n_bands * sizeof(float));
     skn_power_scale_f32(power, spec_re, spec_im, (size_t)n_bins, scale2);
-    /* Each band accumulates its bins in ascending k over its nonzero range
-     * (see DFN3State). A non-finite power takes its whole row, since Inf/NaN
-     * times 0 is NaN; that case walks bin by bin, every other frame runs
-     * band by band with the accumulators in registers. Both add each band's
-     * nonzero products in the same order. */
+    /* Each band accumulates its bins in ascending k over its nonzero range. A
+     * non-finite power takes its whole row (Inf/NaN times 0 is NaN), walked bin by
+     * bin; other frames run band by band with accumulators in registers. */
     if (skn_all_finite_f32(power, (size_t)n_bins)) {
         _Static_assert(DFN3_N_ERB % 4 == 0, "skn_erb_forward_banded_f32 runs bands in fours");
         skn_erb_forward_banded_f32(power, erb_fwd, band_k0, band_k1, n_bands,
@@ -106,14 +99,9 @@ static inline void df_common_features(
     }
 }
 
-/* erb_inv: caller-loaded exported matrix, band-major [n_bands][n_bins]
- * (the model's mask-expansion buffer); the inner loop runs contiguously
- * over the band's nonzero bins, or the whole row for a non-finite gain.
- * Identical to DeepFilterNet2's df_common_expand_mask; both call the one
- * shared kernel in utility/simd_kernel_nn.h. No test or exported symbol
- * table in this tree calls DFN3's scalar/NEON twins by their own local
- * names (unlike DFN2's, which tests/test_nn_kernels.c calls directly), so
- * only the dispatcher name stays here. */
+/* erb_inv: caller-loaded matrix, band-major [n_bands][n_bins]; the inner loop
+ * runs over the band's nonzero bins, or the whole row for a non-finite gain.
+ * Calls the shared kernel in utility/simd_kernel_nn.h. */
 static inline void df_common_expand_mask(const float *band_gain,
                                          const float *erb_inv,
                                          const uint16_t *inv_lo,
@@ -124,10 +112,8 @@ static inline void df_common_expand_mask(const float *band_gain,
                             n_bands, bin_gain);
 }
 
-/* enh_re[k] = noisy_re[k]*lim + enh_re[k]*mix (and the imag twin) is
- * sk_ema_f32's state[i] = alpha*state[i] + beta*x[i] with state=enh,
- * x=noisy, alpha=mix, beta=lim -- float addition is exactly commutative for
- * finite operands, so the swapped argument order changes no bit. */
+/* enh = noisy*lim + enh*mix, expressed as sk_ema_f32 (state=enh, x=noisy,
+ * alpha=mix, beta=lim). */
 static inline void df_common_atten_lim(const float *noisy_re,
                                        const float *noisy_im,
                                        float *enh_re, float *enh_im, int bins,
@@ -140,11 +126,10 @@ static inline void df_common_atten_lim(const float *noisy_re,
     sk_ema_f32(enh_im, noisy_im, mix, lim, bins);
 }
 
-/* Where each of `lines` lines of a matrix is nonzero: line i holds
- * m[i * line_step + j * elem_step] for j < len, and its span is the first nonzero j
- * and one past the last (an all-zero line is the empty range [0, 0); without
- * a matrix every line is full). Rows of a [rows][cols] matrix: (rows, cols,
- * cols, 1); columns: (cols, rows, 1, cols). */
+/* Nonzero span of each of `lines` matrix lines: line i holds
+ * m[i*line_step + j*elem_step] for j < len; the span is the first nonzero j to one
+ * past the last (all-zero line: [0, 0); no matrix: full). Rows of [rows][cols]:
+ * (rows, cols, cols, 1); columns: (cols, rows, 1, cols). */
 static void erb_spans(const float *m, int lines, int len, int line_step,
                       int elem_step, uint16_t *lo, uint16_t *hi)
 {
@@ -197,9 +182,8 @@ void dfn3_state_init(DFN3State* st, AcStft* stft, AcIstft* istft)
     st->istft = istft;
     ac_stft_reset(stft);
     ac_istft_reset(istft);
-    /* ERB matrices arrive via dfn3_set_erb_matrices(): caller-loaded
-     * erb_fwd.bin / erb_inv.bin from export_erb_matrix.py --runtime-bins.
-     * Until then the matrices are NULL and their spans full. */
+    /* ERB matrices arrive via dfn3_set_erb_matrices(); until then they are NULL
+     * and their spans full. */
     dfn3_set_erb_matrices(st, NULL, NULL);
     for (int b = 0; b < DFN3_N_ERB; ++b) {
         float position = (float)b / (float)(DFN3_N_ERB - 1);
@@ -320,8 +304,8 @@ int dfn3_compose_stream(DFN3State* st,
     const float *src_re[DFN3_DF_ORDER];
     const float *src_im[DFN3_DF_ORDER];
 
-    /* Reject before changing any ring, clock or output. A malformed head
-     * must be retryable on this same frame. */
+    /* Reject before changing any ring, clock or output, so a malformed head can
+     * be retried on the same frame. */
     if (!st || !current_spec_re || !current_spec_im || !out_re || !out_im ||
         !st->erb_inv || (heads_valid != 0 && heads_valid != 1) ||
         !isfinite(atten_lim_db) ||

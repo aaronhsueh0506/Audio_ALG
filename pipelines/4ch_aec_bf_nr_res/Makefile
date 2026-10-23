@@ -1,10 +1,9 @@
 # Four-channel traditional AEC -> spatial -> mono NR/RES pipeline.
 #
-# This Makefile intentionally lives beside the 4-channel implementation.  The
-# parent pipelines/Makefile remains the mono AEC -> NR producer/runner. The
-# archive below contains only the reusable four-lane linear core.
-# Standard and ULCNet wrappers are linked directly into application binaries;
-# AEC, NR, common, DOA, BF, and spatial kernels remain component libs.
+# This Makefile lives beside the 4-channel implementation; the parent pipelines/Makefile is the mono
+# AEC -> NR producer/runner. The archive built here holds only the reusable four-lane linear core.
+# The standard and ULCNet wrappers are linked directly into application binaries; AEC, NR, common,
+# DOA, BF and spatial kernels remain component libs.
 #
 # Common invocations:
 #   make SIMD=1
@@ -48,37 +47,22 @@ NO_STDIO = 0
 DEBUG = 0
 TOOLCHAIN_CHECK = 1
 EXTRA_CFLAGS =
-# PROFILE=1 turns on the per-hop stage timing across the WHOLE chain: this
-# wrapper's own stages and, through EXTRA_CFLAGS reaching the lib/aec producer
-# build, the four summed off the four lanes. Both are off otherwise, so a
-# release build takes none of the clock reads; FourAecNrResLastTiming's doc
-# comment (4aec_nr_res.h) carries the count, and is the only place that does.
-#
-# Set through PROFILE_CFLAGS -> CFLAGS rather than EXTRA_CFLAGS, mirroring
-# SIMD. EXTRA_CFLAGS is forwarded verbatim to every producer sub-make and
-# folded into CFG_SIG, so smuggling the -D through it made the flag arrive
-# twice at lib/aec once that gained its own PROFILE, splitting byte-identical
-# objects across two keys, and re-keyed producers that never reference the
-# macro. CFLAGS here is `override CFLAGS :=`, so a command-line assignment
-# cannot silently drop the knob either.
-#
-# Both -D land in THIS Makefile's CFLAGS, which is not forwarded: lib/aec gets
-# its own AEC_STAGE_TIMING from the PROFILE knob forwarded by name in FWD
-# below, so the flag reaches its compile once rather than twice.
-#
-# AEC_STAGE_TIMING is repeated here on purpose. It is not only the library's
-# switch -- this layer's own translation units test it, to decide whether to
-# copy the lanes' record out and what the tests may assert about it. Leaving
-# it out built a consumer that believed the library had not measured while it
-# had: every AEC stage reported zero with the cost showing up as
-# unattributed, and the test that should have caught it agreed with the
-# broken behaviour instead. Both sides deriving from PROFILE is what keeps
-# the two views from disagreeing.
-#
-# A lib/aec pin older than the PROFILE knob has nothing to receive and
-# degrades to the documented one-half state -- the wrapper's stages measure,
-# the AEC block reads zero -- which the --timing report shows as real numbers
-# beside a row of zeros rather than hiding.
+# PROFILE=1 turns on per-hop stage timing across the whole chain: this wrapper's own stages and,
+# through the PROFILE knob forwarded to the lib/aec build, the four summed off the lanes. Off
+# otherwise, so a release build takes no clock reads; FourAecNrResLastTiming's doc comment
+# (4aec_nr_res.h) carries the field list.
+
+# PROFILE_CFLAGS goes into CFLAGS rather than EXTRA_CFLAGS, as SIMD does: EXTRA_CFLAGS is forwarded
+# to every producer sub-make and folded into CFG_SIG, so a -D smuggled through it reached lib/aec
+# twice, splitting identical objects across two keys and re-keying producers that never use the
+# macro. CFLAGS here is `override CFLAGS :=`, so a command-line assignment cannot drop the knob.
+# Both -D land in this Makefile's CFLAGS only; lib/aec gets AEC_STAGE_TIMING from the PROFILE knob
+# forwarded by name in FWD.
+
+# AEC_STAGE_TIMING is repeated on purpose: this layer's own TUs test it, to decide whether to copy
+# the lanes' record out and what the tests may assert about it; deriving both flags from PROFILE
+# keeps the two views consistent. A lib/aec pin without the PROFILE knob degrades to the one-half
+# state: the wrapper's stages measure and the AEC block reads zero.
 PROFILE ?= 0
 ifeq ($(PROFILE),1)
 PROFILE_CFLAGS := -DFOUR_AEC_NR_RES_STAGE_TIMING=1 -DAEC_STAGE_TIMING=1
@@ -474,9 +458,8 @@ $(BIN_DIR)/test_4aec_dfn_res: $(OBJ_DIR)/test_4aec_dfn_res.o $(DFN_PIPELINE_LIB)
 $(BIN_DIR)/dump_delay_parity: $(OBJ_DIR)/dump_delay_parity.o $(PIPELINE_LIB) $(AEC_LIB) $(NR_LIB) $(COMMON_LIB) | _cfg_guard
 	$(LINK) -o $@ $(OBJ_DIR)/dump_delay_parity.o $(PIPELINE_LIB) $(AEC_LIB) $(NR_LIB) $(COMMON_LIB) $(LDLIBS)
 
-# The spatial dependencies test themselves: their sources, their BF_TESTING
-# build and their deployable-archive audit all live in third_party/, so this
-# directory only has to invoke them.
+# The spatial dependencies (SRP-PHAT, BF, VAD) live in audiolib and test themselves there; this
+# target only invokes audiolib's tests.
 test-third-party: FORCE
 	+$(MAKE) -C $(AUDIOLIB_DIR) $(FWD) test
 
@@ -541,20 +524,10 @@ clean-all: clean
 
 -include $(wildcard $(OBJ_DIR)/*.d)
 
-# ---------------------------------------------------------------------------
-# test-grids: prove BOTH Align-ULCNet deployment grids in one command.
-#
-# `test` only ever exercises whichever grid ULCNET_GRID selects, so a
-# 16 kHz-only CI would never compile or run the 48 kHz build at all. Each
-# grid gets its own object/bin directory (ULCNET_GRID is in CFG_SIG), so the
-# two runs cannot contaminate each other.
-#
-# Defined outside the COMMON_LIB bootstrap conditionals on purpose: it needs no
-# resolved producer archives of its own, and each recursive `test` bootstraps
-# itself. Adding it to the bootstrap target list instead would resolve the
-# producers once and then hand both grids the same resolved set, which is
-# harmless but pointless work.
-# ---------------------------------------------------------------------------
+# test-grids: runs both Align-ULCNet deployment grids in one command (`test` only exercises the grid
+# ULCNET_GRID selects). ULCNET_GRID is in CFG_SIG, so each grid has its own obj/bin directory.
+# Defined outside the COMMON_LIB bootstrap conditionals: it needs no producer archive itself and each
+# recursive `test` bootstraps its own.
 .PHONY: test-grids
 test-grids:
 	$(MAKE) ULCNET_GRID=16k test

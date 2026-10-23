@@ -1,22 +1,11 @@
-/* pipelines/common/se_stage.h -- the view exchanged by the frequency-domain
- * stages of the AEC pipelines.
+/* se_stage.h -- the view exchanged by the frequency-domain stages of the AEC
+ * pipelines.
  *
- * Each application analyses once per hop: the AEC takes time-domain mic/ref
- * and returns its context spectra. Every later stage is a plain function over
- * the borrowed SeSpecFrame below; the application writes the combination of
- * their results itself:
- *
- *     gain stages       const float* <stage>_gain(stage, frame)
- *     min of the gains  sk_min_f32
- *     apply             sk_capply_gain_f32
- *     comfort noise     aec_cng_fill
- *     synthesis         ac_istft_push
- *
- * A frame borrows the producer's per-hop buffers: it is valid until the
- * producer runs again (the next process/front call or reset) and is never
- * written through. Scales: e, y, x in audio scale; r2 and cn in int16^2 power
- * scale; gains are amplitudes.
- */
+ * The AEC returns its context spectra once per hop; later stages are plain
+ * functions over the borrowed SeSpecFrame. A frame is valid until the producer
+ * runs again (next process/front call or reset) and is never written through.
+ * Scales: e, y, x in audio scale; r2 and cn in int16^2 power scale; gains are
+ * amplitudes. */
 #ifndef PIPELINES_SE_STAGE_H
 #define PIPELINES_SE_STAGE_H
 
@@ -27,9 +16,8 @@
 extern "C" {
 #endif
 
-/* Comfort noise is scaled by the denoiser gain of its bin, but never below this
- * amplitude (-10 dB): the fill follows the denoised floor while enough of it
- * remains to keep the residual echo it masks from surfacing. */
+/* Comfort noise follows the denoiser gain of its bin but never below this
+ * amplitude (-10 dB), so the residual echo it masks does not surface. */
 #define SE_CNG_NR_GAIN_FLOOR 0.31622777f
 
 /* Start state of every application's comfort-noise generator (aec_cng_fill). */
@@ -50,17 +38,15 @@ typedef struct SeSpecFrame {
     float max_dt;             /* worst double-talk indicator                      */
     float max_sat;            /* worst saturation level                           */
     int all_converged;        /* every contributing linear filter has converged   */
-    int usable_linear;        /* r2 derives from a usable linear estimate, not the
-                                * conservative nonlinear fallback; 0 fails closed  */
+    int usable_linear;        /* r2 derives from a usable linear estimate */
     int clock_drift;
     int delay_changed;        /* this hop starts a new alignment generation       */
     int delay_locked;         /* a usable alignment is in force                   */
 } SeSpecFrame;
 
-/* Residual-echo gain of the post-beam suppressor over `frame` (needs e, y, r2,
- * cn and far_hop). The gain is n_freqs floats owned by `res`, valid until the
- * next call on it; NULL for a NULL argument or a frame lacking one of those
- * inputs (aec_res_process refuses it). */
+/* Residual-echo gain over `frame` (needs e, y, r2, cn and far_hop): n_freqs floats
+ * owned by `res`, valid until its next call; NULL for a NULL argument or a frame
+ * lacking one of those inputs. */
 static inline const float* se_res_stage_gain(AecRes* res, const SeSpecFrame* frame) {
     AecResInput in;
     if (!res || !frame) return NULL;

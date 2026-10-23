@@ -1,9 +1,7 @@
-/* Align-ULCNet C pre/post-processing. Contract and parity notes: see the
- * header. The STFT / ISTFT framing is audiolib's AcStft / AcIstft in the
- * configuration ulcnet_framing_config() describes; this file adds that
- * configuration and the model-callback step the pipeline wrappers share.
- *
- * Constraint: -ffp-contract=off (all owning Makefiles append it). */
+/* Align-ULCNet C pre/post-processing (contract: ulcnet_process.h). Framing is
+ * audiolib's AcStft/AcIstft as configured by ulcnet_framing_config(); this file
+ * adds that configuration and the model-callback output check.
+ * Requires -ffp-contract=off. */
 
 #include "ulcnet_process.h"
 

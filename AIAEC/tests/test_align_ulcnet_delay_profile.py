@@ -1,67 +1,44 @@
 """Joint delay-profile validation: small n + aligned far + small D.
 
-Two knobs decide how much delay an Align-ULCNet deployment can absorb, and
-they are sized at different times by different owners:
+Two knobs decide how much delay an Align-ULCNet deployment can absorb:
 
-* ``n`` (``delay_num_filters``) sizes the AEC's matched-filter bank at AEC
-  init. It decides how far the bulk far-to-mic delay search reaches
-  (125/221/317/413/509 ms for n=1..5) and how much AEC pool it costs.
+* ``n`` (``delay_num_filters``) sizes the AEC's matched-filter bank at AEC init:
+  how far the bulk far-to-mic delay search reaches (125/221/317/413/509 ms for
+  n=1..5) and how much AEC pool it costs.
 * ``D`` (``max_delay_frames``) sizes the model's temporal-alignment history at
-  ONNX export. It decides how many past 16 ms frames the attention can reach
-  and how much model state it costs.
+  ONNX export: how many past 16 ms frames the attention can reach and how much
+  model state it costs.
 
-They are NOT one delay budget in two halves. Each layer only has to satisfy
-the input condition the previous one delivers, so this file drives the two
-together and checks each layer's own contract:
+They are not one delay budget in two halves: each layer only has to satisfy the
+input condition the previous one delivers, so this file drives the two together
+(n in {1, 2, 5} x far in {raw_far, aligned_far} x D in {4, 8, 64}) and checks
+each layer's own contract. ``n`` is a RUNTIME override, deliberately not part
+of the ``linear_aec`` data contract (dataset generation is frozen at
+``DATASET_DELAY_NUM_FILTERS``).
 
-  n in {1, 2, 5}  x  far in {raw_far, aligned_far}  x  D in {4, 8, 64}
+1. REACH IS REAL: a delay inside the bank's reliable reach locks at every n and
+   one outside it must NOT lock. 200 ms is inside n=2's reach and outside n=1's,
+   so a dropped argument (degrading to the default of 5) turns it red;
+   ``test_mutation_pinned_bank_size_*`` re-runs n=1 with the harness knob removed.
+2. NOT LOCKING OUT OF REACH is an honest outcome for the single-path fixture;
+   mis-locking on an in-range early reflection is pinned by the C known-delay
+   fixtures. In-range failure to acquire is invalid (``not_acquired_in_range``).
+3. THE ALIGNED-FAR SEAM IS EXACT: the far the PBFDKF consumed is the raw far
+   delayed by exactly the applied delay (byte-for-byte) and LEADS the echo by a
+   bounded positive margin over settled locked windows.
+4. FAR MODE CHANGES ONLY THE FAR: raw_far and aligned_far share one frontend
+   and one bit-identical ``linear_error``.
+5. MEMORY SCALES: model stream state grows strictly with D; the AEC's search
+   ring and aggregator histogram grow strictly with n.
+6. THE QA GATE CAN FAIL: ``alignment_qa`` goes red on an INJECTED wrong applied
+   delay (a confident lock 100 ms early).
+7. THE OVERRIDE DOES NOT TOUCH THE CONTRACT: same object, dict and fingerprint
+   at every n.
+8. GENERATION STAYS AT THE FROZEN BANK: the materialization entry point takes
+   no bank size and the config-driven builder refuses a delay-profile key.
 
-``n`` is a RUNTIME override and deliberately not part of the ``linear_aec``
-data contract: dataset generation is frozen at
-``DATASET_DELAY_NUM_FILTERS`` and the recorded contract carries no delay
-profile at all. That decision is itself guarded here (assertions 7-8): the
-override must change the engine and leave the contract, its dict and its
-fingerprint untouched, and the generation entry points must have no way to
-reach another bank size.
-
-What is asserted, and why each assertion can fail:
-
-1. REACH IS REAL. A delay inside the bank's reliable reach locks at every n;
-   a delay outside it must NOT be locked at all. The 200 ms case is inside
-   n=2's 221 ms reach and outside n=1's 125 ms reach, so the pair of
-   assertions goes red the moment n stops reaching lib/aec -- a dropped
-   argument anywhere along the way degrades to the default of 5, which would
-   let n=1 lock. ``test_mutation_pinned_bank_size_*`` proves exactly that by
-   re-running the n=1 case with the harness knob removed.
-2. NOT LOCKING OUT OF REACH IS AN HONEST OUTCOME for the single-path fixture.
-   That out-of-range input may instead mis-lock confidently when an in-range
-   early reflection exists is pinned by the C known-delay fixtures
-   (test_known_delay_mislock_is_detectable in both pipeline test families);
-   the Python QA side has no such fixture yet. In-range failure to acquire
-   is invalid (``not_acquired_in_range``).
-3. THE ALIGNED-FAR SEAM IS EXACT. The far the PBFDKF consumed is the raw far
-   delayed by exactly the applied delay -- checked byte-for-byte, so a
-   one-sample slip fails -- and it LEADS the echo by a bounded positive
-   margin over settled locked windows.
-4. FAR MODE CHANGES ONLY THE FAR. raw_far and aligned_far runs share one
-   frontend and therefore one bit-identical ``linear_error``.
-5. MEMORY SCALES. Model stream state grows linearly and strictly with D; the
-   AEC's search ring and aggregator histogram grow strictly with n.
-6. THE QA GATE CAN FAIL. ``alignment_qa`` is proved by making it go red on an
-   INJECTED wrong applied delay (a confident lock 100 ms early), not only
-   against healthy clips; injecting the signature tests the gate itself and
-   survives estimator changes.
-7. THE OVERRIDE DOES NOT TOUCH THE CONTRACT. Same contract object, same dict,
-   same fingerprint at every n -- so no shard or checkpoint stamp can shift
-   because a diagnostic ran at a different bank size.
-8. GENERATION STAYS AT THE FROZEN BANK. The materialization entry point takes
-   no bank size, resolves to the frozen one, and the config-driven builder
-   refuses a delay-profile key rather than honouring it.
-
-No checkpoint is needed: the frontend is the real lib/aec PBFDKF and the
-model runs at random weights, because every property here is about the
-timeline, the state and the pool -- never about audio quality. Quality is the
-training machine's gate.
+No checkpoint is needed: the frontend is the real lib/aec PBFDKF and the model
+runs at random weights, since every property is about timeline, state and pool.
 
 Run:
     python3 -m pytest AIAEC/tests/test_align_ulcnet_delay_profile.py
@@ -221,8 +198,8 @@ def test_out_of_reach_delay_is_refused_rather_than_guessed(bank_size):
             f"({headroom_ms:+.2f} ms)"
         )
     else:
-        # The can-fail core of the whole file. A bank that no longer honours
-        # n silently becomes the 509 ms default one and locks here.
+        # The can-fail core of the whole file. A bank that ignores n becomes
+        # the 509 ms default one and locks here.
         assert applied < 0, (
             f"n={bank_size} reaches only "
             f"{MATCHED_REACH_MS[bank_size]:.0f} ms, so a "
@@ -460,13 +437,11 @@ def test_qa_gate_goes_red_on_a_wrong_applied_delay():
 def test_mutation_pinned_bank_size_makes_the_out_of_reach_case_lock():
     """Mutation control for the harness's own n knob.
 
-    ``run_linear_aec_with_taps(..., delay_num_filters=n)`` is the one place
-    the requested bank size turns into the engine the frontend runs. Drop it
-    -- the behaviour of a harness that accepts the flag and forwards nothing
-    -- and the bank silently reverts to the frozen 509 ms one. The 200 ms delay then comes back into
-    reach, so ``test_out_of_reach_delay_is_refused_rather_than_guessed``
-    would go green for the wrong reason. If THIS test fails, that assertion is
-    passing on something other than the wiring.
+    ``run_linear_aec_with_taps(..., delay_num_filters=n)`` is where the
+    requested bank size becomes the engine. Without it the bank reverts to the
+    frozen 509 ms one, the 200 ms delay comes back into reach and the
+    out-of-reach test goes green for the wrong reason; if THIS test fails, that
+    assertion passes on something other than the wiring.
     """
     microphone, far_end = _scene(OUT_OF_REACH_MS)
 
@@ -493,11 +468,10 @@ def test_mutation_dropping_the_config_forwarding_cannot_pass_silently():
     """The second half of the wiring, and it cannot lean on the contract.
 
     ``make_linear_aec_config`` is where the requested bank size reaches
-    ``AecConfig``. Drop it there and the engine would run a 5-filter bank
-    while the caller believes it deployed n=1 -- and, because the bank size is
-    deliberately absent from the contract, no contract comparison anywhere can
-    notice. The guard therefore has to be a direct read of the ESTIMATOR the
-    engine built, which is what ``LinearAecProcessor`` asserts at construction.
+    ``AecConfig``. Dropped there, the engine would run a 5-filter bank while
+    the caller believes n=1, and no contract comparison could notice (the bank
+    size is deliberately absent from it), so the guard reads the ESTIMATOR the
+    engine built.
     """
     from AIAEC.dataset_gen import linear_aec as module
 
@@ -562,12 +536,9 @@ def test_bank_size_override_leaves_the_contract_and_its_stamp_untouched(
 def test_the_contract_factory_has_no_bank_size_knob():
     """The complement, one level up: the profile cannot reach a contract.
 
-    ``make_linear_aec_contract`` is what stamps a shard and a checkpoint. It
-    must reject a bank size outright rather than accept and ignore one --
-    accepting it is how a caller comes to believe a differently-searched
-    corpus is distinguishable by its stamp. (That an ACCEPTED override leaves
-    the stamp untouched is the previous test's job, asserted there against a
-    fresh dict rather than the cached object.)
+    ``make_linear_aec_contract`` stamps a shard and a checkpoint; it must
+    reject a bank size outright rather than accept and ignore one (an accepted
+    override leaving the stamp untouched is the previous test's job).
     """
     with pytest.raises(TypeError):
         make_linear_aec_contract(SAMPLE_RATE, delay_num_filters=1)
@@ -576,13 +547,10 @@ def test_the_contract_factory_has_no_bank_size_knob():
 def test_dataset_generation_stays_at_the_frozen_bank_size():
     """The corpus path must have no way to reach another bank size.
 
-    Two independent halves: the materialization entry point takes no bank-size
-    argument at all (so a caller cannot pass one), and the config-driven
-    contract builder REFUSES a delay-profile key instead of honouring it (so a
-    config file cannot smuggle one in). Both matter, because a corpus
-    materialized at a smaller bank has a different linear_error and an
-    identical recorded contract -- nothing downstream could tell the shards
-    apart afterwards.
+    The materialization entry point takes no bank-size argument, and the
+    config-driven contract builder REFUSES a delay-profile key instead of
+    honouring it. Both matter: a corpus materialized at a smaller bank has a
+    different linear_error and an identical recorded contract.
     """
     import inspect
 

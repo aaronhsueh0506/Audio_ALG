@@ -1,11 +1,9 @@
 """How much a rendered echo path moves, measured back out of the audio.
 
 The corpus's movement axis is calibrated against real captures, so the
-calibration has to be checkable from the rendered pair alone -- not from the
-weight schedule the renderer happens to have written down.  Everything here
-takes only ``(far, echo)``, and it is also the estimator ``CALIBRATION_TARGETS``
-below was measured with, so a render and a real capture are compared through
-one implementation:
+calibration has to be checkable from the rendered pair alone, not from the
+weight schedule the renderer wrote down. Everything here takes only
+``(far, echo)`` and is the estimator ``CALIBRATION_TARGETS`` was measured with:
 
     1. compensate the bulk delay (GCC-PHAT over the whole clip);
     2. per 64 ms frame, take the frequency-domain Wiener path estimate
@@ -13,31 +11,19 @@ one implementation:
        over a 2 s window, restricted to 300 <= f < 4000 Hz, stepped by 1 s;
     3. report how that per-second path track changes.
 
-The same band and the same 64 ms frame are where a room's positions are
-compared with each other: ``position_gram`` / ``mixture_correlation`` answer
-"how correlated would two mixtures of these positions measure", which is what
-the generator solves its trajectory's mixture depth from. One band, one frame
-and one statistic for both, so the number a corpus is tuned to is the number it
-is measured by.
+``position_gram`` / ``mixture_correlation`` use the same band, frame and
+statistic to compare a room's positions, so the number a corpus is tuned to is
+the number it is measured by.
 
-⚠ The correlation is ``|<H1,H2>| / (||H1|| ||H2||)`` -- invariant to a complex
-scalar, so it measures the path's SHAPE and nothing else.  Level change is
-reported separately as the least-squares complex scalar that maps one window's
-path onto the next, in dB, because a real path's gain and its shape do not move
-together and a single number that mixed them could not say which one a corpus
-was missing.
+⚠ The correlation ``|<H1,H2>| / (||H1|| ||H2||)`` is invariant to a complex
+scalar, so it measures path SHAPE only; level change is reported separately as
+the least-squares complex scalar mapping one window's path onto the next (dB),
+because a real path's gain and shape do not move together.
 
-⚠ A window whose far end is nearly silent has no path to estimate.  Those
-windows are dropped rather than contributing a near-zero H that would read as a
-large, fictional path change.
-
-⚠ ONE bulk delay is assumed for the whole clip: the estimator aligns the pair
-once and then treats every window as a shape/level comparison at that
-alignment.  A clip carrying the ``delay_step`` impairment breaks that
-assumption -- a mid-clip re-timing reads here as violent movement (measured:
-0.81/0.57/0.21/0.15 for a 150 ms step on an otherwise frozen path) -- so such
-sequences are outside this helper's scope and must be excluded from any
-aggregate rather than explained.
+⚠ Windows with a nearly silent far end are dropped (no path to estimate).
+⚠ ONE bulk delay is assumed for the whole clip, so a clip carrying the
+``delay_step`` impairment reads as violent movement and must be excluded from
+any aggregate.
 """
 
 import math
@@ -84,24 +70,13 @@ ANALYSIS_FRAME_SEC = 0.064
 ACTIVITY_GATE_DB = 25.0
 
 # What 46 paired static and 46 paired movement far-end captures from the
-# AEC-challenge blind set measure THROUGH THE HELPER BELOW, at its own
-# defaults: bulk-delay search over 0..2 s, 64 ms frames, a hop that divides the
-# sample rate into whole-second steps, 2 s windows stepped 1 s, band
-# 300 <= f < 4000 Hz, 25 dB per-window activity gate, 1e-9 ridge, and the
-# least-squares complex scalar as the level step. Every paired id is kept: no
-# quality gate, because gating on measurable echo moves 4 s and 8 s by up to
-# 0.12 and would calibrate the corpus against the clips that happen to have a
-# strong linear path. `correlation` is keyed by lag in seconds; `gain_step_db`
-# and `relative_change` are per-second medians.
-# ⚠ Two decimals is all that is real: the bootstrap 95% interval of the 8 s
-# movement median at n = 46 is [0.35, 0.79].
-# ⚠ THIS DICT IS THE SINGLE SOURCE OF THESE NUMBERS. The configs, the
-# generator and the README point at it instead of restating them, because a
-# re-calibration that updates one prose copy and not the other five is
-# invisible until someone re-derives the axis from a stale table.
-# ⚠ 'static_device' is a real device nobody touched, NOT a synthetic frozen
-# path: its correlation is well below 1.0 at 8 s. A generator whose ordinary
-# sequences sit at 1.0 is the thing these numbers exist to detect.
+# AEC-challenge blind set measure THROUGH THE HELPER BELOW at its own defaults
+# (bulk-delay search 0..2 s, 64 ms frames, 2 s windows stepped 1 s, 300 <= f <
+# 4000 Hz, 25 dB activity gate, 1e-9 ridge); every paired id is kept, with no
+# quality gate. `correlation` is keyed by lag in seconds; `gain_step_db` and
+# `relative_change` are per-second medians. ⚠ Two decimals is all that is real.
+# ⚠ THIS DICT IS THE SINGLE SOURCE of these numbers; others point at it. ⚠
+# 'static_device' is a real untouched device, NOT a synthetic frozen path.
 CALIBRATION_TARGETS = {
     'movement': {
         'correlation': {1.0: 0.90, 2.0: 0.78, 4.0: 0.75, 8.0: 0.67},
@@ -137,15 +112,10 @@ def _as_float_array(signal) -> np.ndarray:
 def _bulk_delay(far: np.ndarray, echo: np.ndarray, max_lag: int) -> int:
     """GCC-PHAT lag of ``echo`` behind ``far``, in samples.
 
-    Phase transform rather than a plain cross-correlation: the broadband peak
-    of a reverberant echo sits on the path's own spectral tilt and can land a
-    frame away from the direct path, which then shows up as a fixed shape
-    error in every window's estimate.
-
-    ⚠ Non-negative lags only. An echo cannot precede the reference that caused
-    it, and this corpus always delays the played signal by a positive bulk
-    delay; a captured pair whose reference is stored BEHIND the microphone
-    would need the search widened.
+    Phase transform rather than plain cross-correlation: the broadband peak of
+    a reverberant echo sits on the path's spectral tilt and can land a frame
+    from the direct path. ⚠ Non-negative lags only: an echo cannot precede its
+    reference and this corpus always delays the played signal.
     """
     size = 1
     while size < far.size + echo.size:
@@ -192,34 +162,11 @@ def position_gram(responses: Sequence, sr: int,
                   frame_sec: float = ANALYSIS_FRAME_SEC) -> np.ndarray:
     """Band-limited Gram matrix ``G_jk = <H_j, H_k>`` of a room's paths.
 
-    ``responses`` are the impulse responses of the positions AS RENDERED --
-    prepared, and carrying their relative levels, because a mixture weights
-    the positions and a position twice as loud contributes four times the
-    energy to the mixture's own response.
-
-    ⚠ Each response is taken over the estimator's own analysis frame, which is
-    what makes this the same statistic rather than a related one: the estimator
-    reads a path through a ``frame_sec`` frame, so a longer response is not the
-    ``H`` it reports.  Taking the whole response instead over-predicts the
-    correlation the estimator will read by up to 0.08 on a 1 s pool, and the
-    depth solved from it then under-drives the movement axis in exactly the
-    reverberant rooms the corpus is aimed at.  What is left after this is the
-    tail acting as state-dependent noise on the estimate, which pushes the
-    reading the other way and which real rooms carry too.
-
-    This is the ONE thing that decides how far a mixture of those positions
-    can move: the correlation of the estimator above is a statement about the
-    mixture's frequency response, and every such response is a fixed linear
-    combination of these ``H_k``.  A pool whose positions share more of their
-    energy has a correlation floor no weight schedule can reach below, and a
-    pool whose tails differ decorrelates further per unit of weight change --
-    which is why the trajectory's mixture depth is SOLVED from this matrix per
-    room rather than configured as a constant (see
-    ``aec_dataset.solve_mixture_depth``).
-
-    ⚠ Hermitian, not symmetric, and ``w^T G v`` is complex for real mixtures.
-    Only ``|w^T G v|`` and the real diagonal forms ``w^T G w`` are used, which
-    is the same magnitude statistic ``path_drift_metrics`` reports.
+    ``responses`` are the impulse responses AS RENDERED, with their relative
+    levels. ⚠ Each is taken over the estimator's own ``frame_sec`` frame; the
+    whole response would over-predict the correlation it reads. The mixture
+    depth is SOLVED from this Hermitian matrix per room
+    (``aec_dataset.solve_mixture_depth``).
     """
     if not len(responses):
         raise ValueError("a Gram matrix needs at least one response")
@@ -260,29 +207,13 @@ def estimate_path_track(far, echo, sr: int = 16000, *,
                         max_delay_sec: float = 2.0,
                         ridge: float = 1e-9
                         ) -> Tuple[np.ndarray, np.ndarray, float]:
-    """Per-window echo-path estimate.
+    """Per-window echo-path estimate ``(H, valid, step_sec)``.
 
-    Returns ``(H, valid, step_sec)``: ``H`` is (n_windows, n_bins) complex over
-    the requested band, ``valid`` marks the windows whose far end carried
-    enough energy to define a path, and ``step_sec`` is the ACTUAL spacing
-    between windows -- exact whole seconds whenever the hop divides the sample
-    rate, which ``_exact_hop`` arranges for every rate this corpus uses.
-
-    ⚠ ``ridge`` is an ABSOLUTE floor on the Wiener denominator, matching the
-    reference measurement.  A floor proportional to the window's own mean band
-    power looks safer and is not: it shrinks each window's weak bins by an
-    amount that depends on that window's spectrum, which is a shape change the
-    correlation then reports as path movement.
-
-    ⚠ ``max_delay_sec`` has to cover the WHOLE delay the pair can carry, with
-    headroom.  Outside its true delay the PHAT peak is noise, and locking onto
-    noise does not fail loudly: the path track becomes garbage that explains
-    ~0.05 dB of the capture instead of ~10 dB, and its correlation collapses
-    toward 0 -- which reads as violent movement and drags any population median
-    down with it.  The default covers a captured delay of up to 2 s, i.e. every
-    delay this corpus can render (bulk delay plus the long-delay tail, the
-    jitter and a delay step) and every capture the targets above were measured
-    on, whose largest genuine delay is 0.93 s.
+    ``H`` is (n_windows, n_bins) complex over the band, ``valid`` marks windows
+    whose far end defines a path, ``step_sec`` is the ACTUAL window spacing. ⚠
+    ``ridge`` is an ABSOLUTE floor on the Wiener denominator (a
+    band-power-proportional one would be read as movement). ⚠ ``max_delay_sec``
+    must cover the WHOLE delay the pair can carry, else the PHAT peak is noise.
     """
     far = _as_float_array(far)
     echo = _as_float_array(echo)
@@ -340,16 +271,11 @@ def path_drift_metrics(far, echo, sr: int = 16000, *,
                        **track_kwargs) -> Dict[str, object]:
     """Correlation vs lag, per-second relative change, per-second level step.
 
-    ``correlation`` is keyed by the requested lag in seconds; a lag longer than
-    the clip -- or one whose window pairs are all far-silent -- reports
-    ``None`` rather than a number computed from nothing.
-
-    ⚠ ``gain_step_db`` is the least-squares complex scalar ``a`` that maps one
-    window's path onto the next, ``a = <H1, H2> / <H1, H1>``, in dB.  A ratio
-    of norms would be a different statistic: two paths of equal norm and
-    different shape have a norm ratio of exactly 1 while ``|a|`` falls with
-    their correlation, so a corpus tuned to close the gap on the norm ratio
-    would over-drive its level walk by whatever the shape change contributes.
+    ``correlation`` is keyed by the requested lag in seconds; ``None`` when the
+    clip is shorter or all window pairs are far-silent. ⚠ ``gain_step_db`` is
+    the least-squares complex scalar ``a = <H1, H2> / <H1, H1>`` in dB, not a
+    norm ratio (equal norms give 1 whatever the shape, while ``|a|`` falls with
+    correlation).
     """
     track, valid, step_sec = estimate_path_track(far, echo, sr, **track_kwargs)
     norms = np.linalg.norm(track, axis=1) if track.size else np.zeros(0)

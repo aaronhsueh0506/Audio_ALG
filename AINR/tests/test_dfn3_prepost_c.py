@@ -1,23 +1,20 @@
 """DFN3 pre/post class: accessor and ERB-matrix swap contract through ctypes.
 
-``dfn3_prepost.c`` is built as a shared library together with the two
-translation units it composes and the audiolib archive, then driven through its
-public C API only.  Two groups of contract:
+``dfn3_prepost.c`` is built as a shared library with the two translation units
+it composes and the audiolib archive, then driven through its public C API
+only. Two groups of contract:
 
-* the three accessors (``_hop_size``, ``_num_bins``, ``_io_mode``) report the
-  fixed 48 kHz / 1024 / 512 grid and the mode fixed at init, and answer -1 for
-  a NULL instance;
-* ``_set_erb_matrices`` (header: "BETWEEN HOPS ONLY") is atomic per hop.  A swap
-  made before the first hop is indistinguishable from constructing with the
-  new pair, a mid-stream swap leaves the rows already in the graph window
-  untouched, and a refused call (NULL argument, or a frame still open) changes
-  nothing.
+* the accessors (``_hop_size``, ``_num_bins``, ``_io_mode``) report the fixed
+  48 kHz / 1024 / 512 grid and the mode fixed at init, and answer -1 for a NULL
+  instance;
+* ``_set_erb_matrices`` ("BETWEEN HOPS ONLY") is atomic per hop: a swap before
+  the first hop is indistinguishable from constructing with the new pair, a
+  mid-stream swap leaves the rows already in the graph window untouched, and a
+  refused call (NULL argument, or a frame still open) changes nothing.
 
-Every comparison between instances is ``tobytes()`` equality, never a
-tolerance: the swap may not reorder or approximate anything.  The observable is
-both halves of the matrix pair: the forward matrix through the ERB feature
-window handed to the accelerator, the inverse matrix through the enhanced
-spectrum that mask expansion produces.
+Comparisons between instances are ``tobytes()`` equality, never a tolerance, on
+both halves of the pair: the forward matrix through the ERB feature window and
+the inverse matrix through the enhanced spectrum.
 """
 import ctypes
 from pathlib import Path

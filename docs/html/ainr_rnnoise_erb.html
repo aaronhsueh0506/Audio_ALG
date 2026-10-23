@@ -179,7 +179,7 @@ h1/h2/h3</b>——3 框 conv 窗由 C 端 ring 重送,圖內無 conv cache。</p
 <tr><td>輸入滑動窗</td><td>[512]</td><td>2,048</td><td>host(呼叫端)</td><td><code>rnnoise_analysis</code> 吃整窗,C 不代管</td></tr>
 <tr><td>ERB/Hann 表格</td><td><code>nfftborder[22]</code>、<code>erb_fwd/erb_inv[257][22]</code>、<code>hann_win[512]</code></td><td>—(.rodata)</td><td>編譯期常數</td><td><code>gen_rnnoise_tables.c</code> 產生 <code>rnnoise_tables_gen.h</code>,無執行期可變表格</td></tr>
 </table></div>
-<p class="note"><code>sizeof(RNNoiseState)</code> = 5,104 bytes；獨立配置一個 FFT 與兩個 framing 的總 static memory 為 31,136 bytes，舊版為 15,328 bytes（本機量測，實際依 size-query 配置）。只有 host 已有可共用 FFT 時，RNNoise/framing 部分才是 17,584 bytes。<code>RNNOISE_PREPOST_LAYOUT_VERSION=2</code>，GRU/ONNX layout 仍為 1。同一 stream 分 chunk 必須保留 EMA、GRU、framing/OLA 與對應的 spectrum 延遲。</p>
+<p class="note"><code>sizeof(RNNoiseState)</code> = 5,104 bytes；獨立配置一個 FFT 與兩個 framing 的總 static memory 為 31,136 bytes（本機量測，實際依 size-query 配置）。只有 host 已有可共用 FFT 時，RNNoise/framing 部分才是 17,584 bytes。<code>RNNOISE_PREPOST_LAYOUT_VERSION=2</code>，GRU/ONNX layout 仍為 1。同一 stream 分 chunk 必須保留 EMA、GRU、framing/OLA 與對應的 spectrum 延遲。</p>
 
 <h2>延遲與 warm-up</h2>
 <ul>
@@ -199,11 +199,11 @@ h1/h2/h3</b>——3 框 conv 窗由 C 端 ring 重送,圖內無 conv cache。</p
 <ul>
 <li>C 前後處理:<code>AINR/RNNoise-ERB/process.c</code> / <code>process.h</code>;表格產生器:<code>gen_rnnoise_tables.c</code> → <code>rnnoise_tables_gen.h</code></li>
 <li>模型 / 訓練 / 推論 / 匯出:<code>train.py</code>(<code>RNNoiseModel</code>)、<code>inference.py</code>、<code>export_onnx.py</code>、<code>config.ini</code>、<code>calibrate_norm_init.py</code></li>
-<li>文件:<a href="../../AINR/RNNoise-ERB/README.md">README.md</a>(歷史版本紀錄在 <code>docs/archive/</code>)</li>
+<li>文件:<a href="../../AINR/RNNoise-ERB/README.md">README.md</a></li>
 <li>C 測試:<code>AINR/RNNoise-ERB/test/</code> — <code>make test</code> 實測全 PASS:
 tables byte-exact(canonical)、portable 數學合約(recompute max ULP 0)、
 config/Python/C feature 合約、feature-state 行為、framing 拒絕錯誤設定，以及固定 shared FFT 下 local DSP 的 SIMD/scalar digest。NE10 SIMD=0/1 本身允許有捨入差；不能跨 FFT 模式要求 digest 相同。</li>
 <li>FFT 數值驗證包含完整 frame、原有 Python 容差、合成 hop/首幀/重置、gain 乘法順序與固定係數網路。本機無已訓練 RNNoise 權重，真實模型感知品質尚未量測。</li>
 <li>Python 測試:<code>AINR/RNNoise-ERB/tests/</code>(pytest);
-共用測試位於 <code>AINR/tests/</code>；全樹請執行 <code>python3 -m pytest AINR</code>，目前基準數集中記錄於 <code>docs/release_checklist.md</code>。</li>
+共用測試位於 <code>AINR/tests/</code>；全樹請執行 <code>python3 -m pytest AINR</code>。</li>
 </ul>

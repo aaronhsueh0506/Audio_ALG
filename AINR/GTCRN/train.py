@@ -57,9 +57,9 @@ from training_common import (  # noqa: E402
 # ============================================================
 # Checkpoint contract
 # ============================================================
-#
-# Bump whenever a change makes previously-trained weights invalid or
-# meaningless to resume.  Mirrors the gates in RNNoise-ERB/train.py and
+
+# Bump whenever a change makes trained weights invalid or meaningless to
+# resume. Mirrors the gates in RNNoise-ERB/train.py and
 # DeepFilterNet2/train.py.
 MODEL_VERSION = 'gtcrn_upstream_bitexact_v1'
 LOSS_VERSION = 'gtcrn_hybrid_30spec_70mag_sisnr_istft_both_v1'
@@ -89,14 +89,11 @@ def require_checkpoint_contract(ckpt, contract, context='checkpoint',
                                 allow_missing=False):
     """Refuse to resume across a semantic change.
 
-    Upstream ships no trainer, so this is our own hygiene — but without it a
-    resume across an n_fft or erb_subband change silently succeeds and trains
-    garbage.
-
-    ``allow_missing=True`` skips the version gate for checkpoints that predate
-    it -- the vendored upstream tars carry no contract at all, so inference
-    must still accept them while enforcing the contract on anything that does
-    record one.
+    Upstream ships no trainer, so this is our own hygiene: without it a resume
+    across an n_fft or erb_subband change silently succeeds and trains garbage.
+    ``allow_missing=True`` skips the version gate for checkpoints without a
+    contract (the vendored upstream tars carry none), so inference still
+    accepts them while enforcing the contract on anything that records one.
     """
     if allow_missing and not any(key in ckpt for key in _VERSION_FIELDS):
         return
@@ -158,14 +155,13 @@ HAZARD_MAG = SPEC_EPS ** 0.5
 
 class HybridLoss(nn.Module):
     """
-    Paper-faithful GTCRN loss (paper Eq. 1 with alpha=0.01, beta=0.3, scaled
-    x100 exactly as gtcrn_github/loss.py does):
+    Paper-faithful GTCRN loss (paper Eq. 1 with alpha=0.01, beta=0.3, scaled x100
+    exactly as gtcrn_github/loss.py does):
         30 * (mag_norm_re_mse + mag_norm_im_mse) + 70 * mag^0.3_mse + SI-SNR
 
-    Both waveforms are obtained by ISTFT of the two spectra, matching upstream
-    gtcrn_github/loss.py:24-25.  Comparing an ISTFT'd prediction against the
-    RAW clean waveform would put a floor on the SI-SNR term that the model
-    could never reach, because sqrt-Hann WOLA does not reconstruct the
+    Both waveforms are ISTFT of the two spectra, as gtcrn_github/loss.py:24-25:
+    comparing an ISTFT'd prediction against the RAW clean waveform would put a
+    floor on the SI-SNR term, since sqrt-Hann WOLA does not reconstruct the
     first/last half-frame exactly.
     """
 
@@ -322,15 +318,14 @@ def train(args):
         print(f"  mmap: block={mmap_block_size}, workers={train_workers}, "
               f"prefetch={prefetch_factor}, packed_dtype_preserved=True")
 
-    # The OPTIMIZER is the paper's (§3.2: Adam, initial lr 1e-3).  The SCHEDULE
-    # is deliberately not.  The paper halves the LR after 5 consecutive epochs
-    # without a decrease, and ReduceLROnPlateau implements that against the best
-    # epoch ever seen -- so one improved epoch resets the counter and the LR can
-    # sit at its initial value indefinitely.  Measured on a real run: 32 epochs,
-    # still 1e-3, never halved once.  Per-step warmup→cosine decays
-    # unconditionally.  It is also what the other AINR trainers use, and the LR
-    # trajectory is part of the bake-off protocol: two models compared over "the
-    # same 100 epochs" must not be on different schedules.
+    # The OPTIMIZER is the paper's (§3.2: Adam, initial lr 1e-3). The SCHEDULE
+    # is deliberately not: the paper halves the LR after 5 consecutive epochs
+    # without a decrease, and ReduceLROnPlateau implements that against the
+    # best epoch ever seen, so one improved epoch resets the counter and the LR
+    # can sit at its initial value indefinitely. Per-step warmup→cosine decays
+    # unconditionally and is what the other AINR trainers use; the LR
+    # trajectory is part of the bake-off protocol (two models compared over
+    # "the same 100 epochs" must not be on different schedules).
     optimizer = torch.optim.Adam(model.parameters(), lr=lr, betas=(0.9, 0.999))
     total_steps = epochs * len(train_loader)
     warmup_steps = min(warmup_ep * len(train_loader), total_steps - 1)
@@ -520,8 +515,7 @@ def train(args):
 
         val_loss /= len(val_loader)
         # Read AFTER the epoch's steps, so the number printed is the LR the run
-        # is actually on.  Read before the step, every change showed up one
-        # epoch late in the log.
+        # is actually on.
         lr_now = optimizer.param_groups[0]['lr']
         print(f"Epoch {epoch}: train={train_loss:.4f}  val={val_loss:.4f}  lr={lr_now:.2e}")
 

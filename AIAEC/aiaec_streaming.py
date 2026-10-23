@@ -1,16 +1,12 @@
 """Shared stateful cells for frame-by-frame AIAEC inference.
 
-Every cell reuses the weights of an existing offline module and replays its
-exact arithmetic on one (or a few) new time frames, carrying the time context
-in explicit state tensors.  Zero-initialised history equals the offline
-left-only zero padding, so a stream started from reset produces bit-for-bit
-the same causal computation as one whole-utterance ``forward`` -- the only
-intended exceptions are documented on the model's own ``forward_stream``
-(Align-CRUSE warm-up, DeepFilterNet's two-hop output delay).
-
-These cells are a Python deployment *reference*: they define the state
-inventory and per-invocation I/O contract that an NPU/C port must reproduce.
-They are not optimised.
+Every cell reuses the weights of an offline module and replays its arithmetic
+on one (or a few) new time frames, carrying the time context in explicit state
+tensors. Zero-initialised history equals the offline left-only zero padding, so
+a stream started from reset matches one whole-utterance ``forward`` (exceptions
+are documented on each model's ``forward_stream``). The cells are a Python
+deployment reference defining the state inventory and per-invocation I/O
+contract an NPU/C port must reproduce.
 """
 
 from __future__ import annotations
@@ -24,9 +20,7 @@ import torch.nn.functional as F
 from AIAEC.aiaec_common import CausalConv2d, FrameDelayAttention, GlobalDelayAttention
 
 
-# ---------------------------------------------------------------------------
-# guards
-# ---------------------------------------------------------------------------
+# ---- guards ----
 
 def assert_streaming_ready(model: nn.Module) -> None:
     """Refuse to stream a model whose normalisation would be utterance-level.
@@ -48,23 +42,16 @@ def assert_streaming_ready(model: nn.Module) -> None:
                 )
 
 
-# ---------------------------------------------------------------------------
-# convolution cells
-# ---------------------------------------------------------------------------
+# ---- convolution cells ----
 
 class StreamConv2dCell:
     """Streaming context for one time-extended Conv2d.
 
     Wraps a conv whose offline call pads ``(kt - 1) * dt`` zeros on the left.
-    The cell state is the FULL input window of ``retain + 1`` frames, oldest
-    first, with ``retain = (kt - 1) * dt``.  ``step`` takes ``[B, C, T_new, F]``
-    and returns exactly ``T_new`` output frames: the conv input is the state
-    without its oldest frame followed by the new frames, and the next state is
-    the last ``retain + 1`` frames of that input.  For ``T_new == 1`` the next
-    state is therefore the conv input itself, so a graph built from this cell
-    has a Slice on the state input and a Concat producing the state output.
-    The oldest state frame only keeps the in and out shapes identical; it is
-    never read by the conv.
+    The state is the full input window of ``retain + 1`` frames, oldest first,
+    ``retain = (kt - 1) * dt``. ``step`` takes ``[B, C, T_new, F]`` and returns
+    ``T_new`` frames; the next state is the last ``retain + 1`` frames of the
+    conv input, so an exported graph is a Slice plus a Concat.
     """
 
     def __init__(self, conv: nn.Conv2d, kt: int, dt: int,
@@ -141,9 +128,7 @@ class StreamModuleCell:
         return self.conv_cell.state_tensors()
 
 
-# ---------------------------------------------------------------------------
-# recurrence / ring cells
-# ---------------------------------------------------------------------------
+# ---- recurrence / ring cells ----
 
 class StreamGRUCell:
     """Hidden-state carrier for an ``nn.GRU`` running along the time axis."""
@@ -248,14 +233,10 @@ class GlobalDelayAttentionCell:
     """Streaming twin of Align-CRUSE's ``causal_running`` delay attention.
 
     State: projected-key ring, far-feature value ring, the *undecayed* score
-    accumulator (``cumsum`` integrator) and an absolute frame counter.
-
-    Equivalence caveat, by construction: the offline forward masks delays with
-    ``observable = arange(D) < T`` using the FINAL utterance length ``T``.  A
-    stream cannot know ``T``, so this cell assumes ``T >= D`` (any utterance of
-    at least ``D`` hops).  For such inputs the stream matches offline exactly;
-    for shorter utterances the offline mask differs and so does the output.
-    ``paper_global`` mode reduces over the whole utterance and is rejected.
+    accumulator and an absolute frame counter. The offline forward masks delays
+    with ``arange(D) < T`` using the final utterance length ``T``; a stream
+    cannot know ``T`` and assumes ``T >= D``. ``paper_global`` mode is
+    rejected.
     """
 
     def __init__(self, attention: GlobalDelayAttention):
@@ -311,19 +292,16 @@ class GlobalDelayAttentionCell:
         return out
 
 
-# ---------------------------------------------------------------------------
-# stateful STFT / WOLA replicating the offline center=True contract
-# ---------------------------------------------------------------------------
+# ---- stateful STFT / WOLA (offline center=True contract) ----
 
 class StreamSTFT:
     """Incremental ``torch.stft(center=True, pad_mode='reflect')``.
 
-    Deployment decision (design doc section 7): the first version reproduces
-    the offline centered timing, paying ``n_fft/2`` samples of lookahead, so a
-    frame is emitted only once its trailing half-window has arrived.  Feed
+    Reproduces the offline centered timing at the cost of ``n_fft/2`` samples of
+    lookahead: a frame is emitted once its trailing half-window has arrived. Feed
     arbitrary-sized sample chunks; ``push`` returns zero or more complex
-    ``[B, n_freqs]`` frames; ``flush`` applies the trailing reflect pad and
-    emits the remaining frames (total ``L // hop + 1``).
+    ``[B, n_freqs]`` frames; ``flush`` applies the trailing reflect pad and emits
+    the remaining frames (total ``L // hop + 1``).
     """
 
     def __init__(self, n_fft: int, hop: int, window: Tensor):
@@ -394,9 +372,8 @@ class StreamSTFT:
                 f"stream shorter than half a window ({self.half + 1} samples); "
                 "the centered contract needs at least that much audio"
             )
-        # Trailing reflect pad mirrors the half samples before the last one.
-        # Total frames come out to L // hop + 1 exactly, because the emit
-        # loop slides while a full window exists over L + 2*half samples.
+        # Trailing reflect pad mirrors the half samples before the last one; total
+        # frames are L // hop + 1.
         suffix = self._tail[:, :-1].flip(-1)
         self._buf = torch.cat((self._buf, suffix), dim=-1)
         return self._emit()
@@ -492,9 +469,7 @@ class StreamISTFT:
         return out
 
 
-# ---------------------------------------------------------------------------
-# reporting
-# ---------------------------------------------------------------------------
+# ---- reporting ----
 
 def state_report(cells: Dict[str, object]) -> str:
     """Human-readable inventory of every persistent tensor in a state dict.

@@ -6,8 +6,7 @@ cutoff ``0.47 / max(up, down)`` on the up-sampled grid, unity DC pinned per
 phase, and the ``next_output_tick`` machine that decides how many outputs each
 input frame produces.  This port keeps the same design, the same float32
 arithmetic and the same tap order, so it is the reference the non-48 kHz DFN2
-path (and Experiment 0's resampler round trip) is measured against; it is not
-a generic resampler.  It is bit-exact against the C code built with ``SIMD=0``;
+path is measured against; it is not a generic resampler.  It is bit-exact against the C code built with ``SIMD=0``;
 the NEON build sums each output in a different (four-lane) order, so it agrees
 with this twin to float rounding, not bit for bit.
 
@@ -157,8 +156,8 @@ class AudioResampler:
 class CResampler:
     """The C ``audio_resampler`` itself, through ctypes: same result as
     :class:`AudioResampler` on the scalar kernel, orders of magnitude faster.
-    Used by the experiment drivers; the pure-Python twin stays the readable
-    reference the tests compare against."""
+    Used by the tools/ drivers; the pure-Python twin is the readable reference
+    the tests compare against."""
 
     _lib = None
 

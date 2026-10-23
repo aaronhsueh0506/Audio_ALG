@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Experiment 0: is DFN2 usable on 16 kHz material upsampled to 48 kHz?
+"""Is DFN2 usable on 16 kHz material upsampled to 48 kHz?
 
 DFN2 is trained full band at 48 kHz.  A 16 kHz product path would feed it
 signals whose top two thirds of the ERB bands are empty (the house
@@ -19,8 +19,7 @@ Everything is scored at 16 kHz against the clean reference decimated to
 16 kHz: PESQ (wide band), STOI, and DNSMOS P.835 (non-intrusive).  The corpus
 decimation 48 k -> 16 k is torchaudio's sinc resampler (corpus preparation);
 the up/down legs inside dfn2_16k_rt and rt_only are the house resampler, the
-thing under test.  The H4 gate: dfn2_16k_rt must beat mmse_16k on DNSMOS
-OVRL/BAK and not lose PESQ.
+thing under test.
 
 Outputs <out>/<arm>/<stem>.wav (16 kHz) and <out>/scores.json + <out>/summary.md.
 """

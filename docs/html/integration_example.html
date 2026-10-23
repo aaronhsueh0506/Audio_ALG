@@ -201,7 +201,7 @@ aec_get_linear_context(p->aec, &lctx);   /* lctx.aligned_far_hop ← 對齊後�
     if (p->model.reset) p->model.reset(user);   /* 通知 NN 丟棄跨 frame 狀態 */
     p->reprime_frames = REPRIME;                /* mono=1, 4ch=1 */
 }</pre>
-<div class="note"><b>reprime frame 數是量測出來的,不是猜的</b>:兩條都是 <b>1</b>——兩條的兩個 branch 都從<b>當前</b> input hop 取幀,50%-overlap 幀橫跨兩個 hop,只有邊界 hop 那一幀還蓋到切換前的 hop(4ch 早先是 2,肇因於已移除的 WOLA)。常數<b>綁定 hop 結構</b>,改 framing 必須重新量(<code>test_reprime_straddle_derivation()</code>)。</div>
+<div class="note"><b>reprime frame 數是量測出來的,不是猜的</b>:兩條都是 <b>1</b>——兩條的兩個 branch 都從<b>當前</b> input hop 取幀,50%-overlap 幀橫跨兩個 hop,只有邊界 hop 那一幀還蓋到切換前的 hop。常數<b>綁定 hop 結構</b>,改 framing 必須重新量(<code>test_reprime_straddle_derivation()</code>)。</div>
 <h3>Fail-open 三層 + FULL-WRITE CONTRACT</h3>
 <pre>if (reprime_frames > 0) {
     /* identity,不 step model */
@@ -235,7 +235,7 @@ audio_pipeline_ulcnet_process_end(p, out);                     /* 合成剛好�
 <pre>if (cfg->model.infer &amp;&amp; !cfg->model.io_descriptor) return -1;
 if (cfg->model.io_descriptor &amp;&amp;
     ulcnet_model_io_descriptor_validate(cfg->model.io_descriptor) != 0) return -1;</pre>
-<div class="warn"><b>掛了真的 runtime 就必須提供 descriptor</b>(identity model 才可以留 NULL)。理由:finite guard 只抓得到「沒寫」,永遠抓不到「寫錯形狀」——graph 的 <code>D</code> 與 descriptor 不符時會<b>靜默地</b>越界讀寫 pool。descriptor 內容包含 <code>layout_version</code>(必須等於 <code>ULCNET_MODEL_IO_LAYOUT_VERSION</code>)、<code>delay_depth</code> D ∈ [2,64]、grid 幾何、以及 <code>far_input_mode</code> 必須是 <code>ULCNET_FAR_ALIGNED</code>。</div>
+<div class="warn"><b>掛了真的 runtime 就必須提供 descriptor</b>(identity model 才可以留 NULL)。理由:finite guard 只抓得到「沒寫」,永遠抓不到「寫錯形狀」——graph 的 <code>D</code> 與 descriptor 不符時會<b>靜默地</b>越界讀寫 pool。descriptor 內容包含 <code>layout_version</code>(必須等於 <code>ULCNET_MODEL_IO_LAYOUT_VERSION</code>)、<code>delay_depth</code> D ∈ [2,64]、grid 幾何、以及 <code>far_input_mode</code> 必須是 <code>ULCNET_FAR_RAW</code>。</div>
 
 <h3>4ch ULCNet 的 front-only 契約:<b>拒絕而非忽略</b></h3>
 <p><code>core.enable_post = 0</code> 時前端<b>不 carve</b> fuse 緩衝,wrapper 也不 carve 任何 denoiser／suppressor／comfort noise／post iFFT。因此以下欄位<b>必須</b>維持 <code>_default_config()</code> 的值,否則<b>在 init 被拒</b>:</p>

@@ -1,23 +1,21 @@
-"""Explicit-state one-frame wrapper around the tracked offline GTCRN model.
+"""Explicit-state one-frame wrapper around the offline GTCRN model.
 
-The learned modules remain the exact objects from :mod:`model`; this file only
-replays causal temporal convolutions and recurrent layers with tensor windows
-and stacked recurrent rows, so a clean checkout can export a deployable graph.
+The learned modules are the objects from :mod:`model`; this file replays the
+causal temporal convolutions and recurrent layers with tensor windows and stacked
+recurrent rows so the graph can be exported.
 
-State boundary. Every state tensor is rank 4 and has the same shape at the
-graph input and at its ``*_out`` output, so a runtime binds both to one
-address:
+State boundary: every state tensor is rank 4 with the same shape at the graph
+input and at its ``*_out`` output, so a runtime binds both to one address.
 
 * ``conv_enc0..2`` / ``conv_dec0..2`` ``(1, C, window, F)``: the full causal
-  window of one depthwise convolution. The graph drops the oldest frame with a
-  Slice on the input, appends the new frame, convolves, and returns the whole
-  concatenation as the next window.
+  window of one depthwise convolution (the graph drops the oldest frame with a
+  Slice, appends the new one, convolves, and returns the whole concatenation).
 * ``h_tra`` ``(1, 6 * layers, 1, hidden)``: the six TRA attention GRUs.
-* ``h_dpgrnn`` ``(1, 4 * layers, width, hidden)``: the four grouped DPGRNN
-  inter GRUs, whose hidden batch is the frequency axis.
+* ``h_dpgrnn`` ``(1, 4 * layers, width, hidden)``: the four grouped DPGRNN inter
+  GRUs, whose hidden batch is the frequency axis.
 
-The GRU stacks are cut with Slices on dim 1 of the input and joined with one
-Concat on dim 1 on the way out.
+GRU stacks are cut with Slices on dim 1 of the input and joined with one Concat
+on dim 1 on the way out.
 """
 
 import torch
@@ -26,14 +24,13 @@ import torch.nn.functional as F
 
 
 class _FrequencyNeighborhood(nn.Module):
-    """Exact kernel-3 SFE lowering as one grouped convolution.
+    """Kernel-3 SFE lowered to one grouped convolution.
 
     ``nn.Unfold`` exports a frequency-only neighbourhood as Pad/Gather/Gather/
-    Transpose/Reshape.  Seven copies of that pattern dominate the otherwise
-    small GTCRN graph on accelerators with per-operator launch or DMA costs.
-    A grouped one-hot convolution produces the same channel-interleaved
-    ``[left, centre, right]`` values while lowering to one supported Conv.
-    The weights are fixed buffers, not checkpoint parameters.
+    Transpose/Reshape, and seven copies of that pattern dominate the small GTCRN
+    graph on accelerators with per-operator launch or DMA costs. A grouped one-hot
+    convolution yields the same channel-interleaved ``[left, centre, right]``
+    values as one Conv. The weights are fixed buffers, not checkpoint parameters.
     """
 
     def __init__(self, channels, kernel_size=3):
@@ -59,12 +56,9 @@ def _encoder_pad_sizes(model):
 
 
 def _encoder_window_sizes(model):
-    """Per-GT-block window: the history plus the frame being computed.
-
-    The single source for the window depth; both the allocation
-    (`initial_inputs`) and the slice bounds that read it (`StreamGTCRN`)
-    derive from this, so they cannot drift apart.
-    """
+    """Per-GT-block window: the history plus the frame being computed. It is the
+    single source of the window depth, used by the allocation and the slice
+    bounds."""
     return [pad + 1 for pad in _encoder_pad_sizes(model)]
 
 
@@ -82,13 +76,10 @@ def _gru_row_counts(model):
 def initial_inputs(model):
     """One random spectrum frame plus zero states, shaped for ``model``.
 
-    Ordered exactly like the graph I/O: three feature inputs, six block-local
-    convolution windows, then the stacked ``h_tra`` and ``h_dpgrnn`` tensors.
-    Every extent is read off the module tree rather than written down, so the
-    graph follows whatever grid the checkpoint was trained on: the spectrum
-    width tracks n_fft through the ERB split, the window depth tracks the GT
-    blocks' temporal kernels/dilations, and the frequency width tracks the
-    encoder strides through ``dpgrnn1.width``.
+    Ordered like the graph I/O: three feature inputs, six block-local convolution
+    windows, then the stacked ``h_tra`` and ``h_dpgrnn`` tensors. Every extent is
+    read off the module tree, so the graph follows the grid the checkpoint was
+    trained on.
     """
     erb = model.erb
     gt_blocks = list(model.encoder.en_convs[2:])
@@ -113,10 +104,9 @@ def initial_inputs(model):
     bands = erb.erb_subband_1 + erb.erb_fc.out_features
     return (
         # Three separate ERB-domain feature frames (mag, real, imag), each
-        # (1, E, 1): the magnitude AND the frozen ERB forward matmul run on
-        # the HOST in fp32 (C: gtcrn_model_input), the graph concatenates
-        # and holds learned compute only, and each channel keeps its own
-        # quantization scale.
+        # (1, E, 1). The magnitude and the frozen ERB forward matmul run on the
+        # host in fp32 (C: gtcrn_model_input); the graph holds learned compute only
+        # and each channel keeps its own quantization scale.
         torch.randn(1, bands, 1).abs(),
         torch.randn(1, bands, 1),
         torch.randn(1, bands, 1),
@@ -130,11 +120,10 @@ def initial_inputs(model):
 def stream_features(model, spectrum_ri):
     """Host-side model input from RI spectra: (1, F, T, 2) -> 3x (1, E, T).
 
-    The complete fixed front end, computed in fp32 OUTSIDE the graph
-    (C: gtcrn_model_input): [sqrt(re^2 + im^2 + 1e-12), re, im] followed by
-    the frozen ERB forward matmul (model.erb.bm), so neither the sqrt nor
-    the filterbank ever enters the quantized domain. E = erb_subband_1 +
-    erb_subband_2 (129 on every grid).
+    The complete fixed front end, computed in fp32 outside the graph (C:
+    gtcrn_model_input): [sqrt(re^2 + im^2 + 1e-12), re, im] followed by the frozen
+    ERB forward matmul (model.erb.bm). E = erb_subband_1 + erb_subband_2 (129 on
+    every grid).
     """
     real = spectrum_ri[..., 0]
     imag = spectrum_ri[..., 1]
@@ -150,11 +139,10 @@ def stream_features(model, spectrum_ri):
 
 
 def host_synthesis(model, mask_erb, spectrum_ri):
-    """Host-side fixed back end: ERB inverse + complex ratio mask, in fp32.
+    """Host-side fixed back end: ERB inverse + complex ratio mask in fp32.
 
-    mask_erb (1, E, T, 2) is the graph output; spectrum_ri (1, F, T, 2) is
-    the same frame the features came from. Mirrors model.erb.bs + Mask
-    exactly (C: gtcrn_model_output).
+    mask_erb (1, E, T, 2) is the graph output; spectrum_ri (1, F, T, 2) is the
+    frame the features came from (C: gtcrn_model_output).
     """
     mask = model.erb.bs(mask_erb.permute(0, 3, 2, 1))     # (1, 2, T, F)
     spec = spectrum_ri.permute(0, 3, 2, 1)                # (1, 2, T, F)
@@ -183,10 +171,8 @@ def _conv_depth_step(conv, x, window, size):
 def _deconv_depth_step(deconv, x, window, size, flipped_weight):
     """Causal stride-one depthwise ConvTranspose2d as an ordinary Conv2d.
 
-    ``flipped_weight`` is ``deconv.weight.flip(-2, -1)`` precomputed at wrap
-    time: flipping inside the traced forward would put a step=-1 Slice pair
-    into the graph on every invocation (and defeat constant folding) for a
-    tensor that never changes after load.
+    ``flipped_weight`` is ``deconv.weight.flip(-2, -1)`` precomputed at wrap time,
+    so the traced forward carries no step=-1 Slice pair.
     """
     combined = torch.cat((window[:, :, 1:size], x), dim=2)
     next_window = combined
@@ -262,8 +248,8 @@ class StreamGTCRN(nn.Module):
         self.block_sfe = _FrequencyNeighborhood(
             block_channels, gt_blocks[0].sfe.kernel_size
         )
-        # Each GT block receives its own graph window tensor, so no state is
-        # ever packed or unpacked inside the graph.
+        # Each GT block receives its own window tensor, so no state is packed or
+        # unpacked in the graph.
         encoder_pads = _encoder_pad_sizes(model)
         decoder_pads = [block.pad_size
                         for block in model.decoder.de_convs[:len(encoder_pads)]]
@@ -282,9 +268,9 @@ class StreamGTCRN(nn.Module):
                 conv_enc0, conv_enc1, conv_enc2,
                 conv_dec0, conv_dec1, conv_dec2,
                 h_tra, h_dpgrnn):
-        # Each GRU reads its rows through a Slice on dim 1 of the stacked
-        # input and drops the singleton batch for nn.GRU's (layers, batch,
-        # hidden). Slices are written with Python integer bounds.
+        # Each GRU reads its rows through a Slice on dim 1 of the stacked input and
+        # drops the singleton batch for nn.GRU's (layers, batch, hidden); slices use
+        # Python integer bounds.
         tra_rows, dpgrnn_rows = self.tra_rows, self.dpgrnn_rows
         tra_in = [h_tra[:, i * tra_rows:(i + 1) * tra_rows].squeeze(0)
                   for i in range(6)]
@@ -294,9 +280,8 @@ class StreamGTCRN(nn.Module):
          h_tra_dec0, h_tra_dec1, h_tra_dec2) = tra_in
         h_dpgrnn1_0, h_dpgrnn1_1, h_dpgrnn2_0, h_dpgrnn2_1 = dp_in
         model = self.model
-        # mag/real/imag are the HOST-banded feature frames (1, E, 1): the
-        # fixed front end already ran outside; the graph concatenates them
-        # into (B, 3, T, E) and holds learned compute only.
+        # mag/real/imag are the host-banded feature frames (1, E, 1); the graph
+        # concatenates them into (B, 3, T, E).
         x = torch.stack((mag, real, imag), dim=1).permute(0, 1, 3, 2)
         x = self.input_sfe(x)
 
@@ -338,8 +323,8 @@ class StreamGTCRN(nn.Module):
         for index, block in enumerate(model.decoder.de_convs[3:], start=3):
             x = block(x + skips[4 - index])
 
-        # x is the ERB-domain complex mask (B, 2, T, E); the fixed back end
-        # (ERB inverse + CRM) runs on the host -- see host_synthesis.
+        # x is the ERB-domain complex mask (B, 2, T, E); the fixed back end (ERB
+        # inverse + CRM) runs on the host (host_synthesis).
         enhanced = x.permute(0, 3, 2, 1)
         # The stacks leave in the order they were sliced.
         h_tra_next = torch.cat(

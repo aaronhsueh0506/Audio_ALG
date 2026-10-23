@@ -1,23 +1,13 @@
 """The Audio_ALG test roots must collect together, in either argument order.
 
-Every package here may carry its own ``conftest.py``, and pytest imports each
-of them under the same top-level module name ``conftest``. So a test module
-that does ``from conftest import ...`` gets whichever package's conftest was
-imported first. On its own the suite passes; collected next to a sibling that
-also has one, the import resolves to the wrong module and the WHOLE run dies
-at collection -- including the tests that were fine.
-
-That is a failure the per-package runs cannot see, which is exactly why it
-survived: `pytest AIAEC` was green the entire time `pytest AIAEC AINR
-pipelines` could not start. The gate therefore drives a real pytest in a
-subprocess rather than pattern-matching import lines: any future shadowing, by
-whatever mechanism, fails here.
-
-Both orders are checked because argument order decides which ``conftest`` wins
-the module name -- a fix that only works one way round is not a fix.
-
-``--collect-only`` because the question is whether the modules IMPORT together;
-running them is what the ordinary suites already do.
+Every package may carry its own ``conftest.py`` and pytest imports each under
+the same top-level module name, so ``from conftest import ...`` gets whichever
+package's conftest was imported first. Collected next to a sibling that also
+has one, the import resolves to the wrong module and the WHOLE run dies at
+collection, which per-package runs cannot see. The gate drives a real pytest
+(``--collect-only``: the question is whether the modules IMPORT together) in a
+subprocess in both argument orders, since order decides which ``conftest``
+wins.
 """
 import os
 import subprocess

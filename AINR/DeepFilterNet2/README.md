@@ -39,9 +39,6 @@ Current model version:
 dfn2_fmajor_pathway_cascade_alpha_no_lsnr_v6
 ```
 
-v5 band-split checkpoints share this feature version but not the model
-version; they must not be renamed or force-loaded here.
-
 `train.py --resume` and `inference.py --model` validate the serialized signal,
 feature, and model contract before loading.
 
@@ -66,8 +63,7 @@ accelerator only needs to emit `(erb_mask, coefs, alpha)`. Run
 reference; `make -C .. SIMD=0 test` forces the latter.
 
 `dfn2_prepost.h/.c` is the integrator's entry point: one opaque object that
-composes `dfn2_process.c` and `dfn2_model_io.c` (neither changes, so their
-standalone parity builds keep linking) behind the same lifecycle and per-hop
+composes `dfn2_process.c` and `dfn2_model_io.c` behind the same lifecycle and per-hop
 shape as the AIAEC classes, described once in `../../AIAEC/README.md`
 ("C pre/post-processing"). Specific to this one: `pre_process` returns 0 on
 the first hop (the graph needs its right-hand neighbour) and 1 after; the
@@ -115,6 +111,10 @@ python3 inference.py calib --model output/dfn2_best.pth \
   --wav-dir /path/to/noisy_wavs --frames 8192 --format bin \
   --output calib/dfn2
 ```
+
+The C runtime loads the files written by `export_erb_matrix.py --runtime-bins DIR`
+(`erb_fwd.bin` bin-major, `erb_inv.bin` band-major); the `--output-dir` formats
+are for toolchain validation.
 
 The graph is stateless from the accelerator's perspective. Each invocation
 receives exactly three feature frames `[t-1,t,t+1]`, emits the heads for frame
@@ -179,8 +179,7 @@ State layout version 8. Both state tensors are rank 4 with the same shape at
 the input and at the `*_out` output, bound to one address; the metadata records
 `state_binding = in_place_same_address`, `state_handoff` and `state_slicing`.
 Versions 4, 5, 6 and 7 are retired (`RETIRED_LAYOUT_VERSIONS`); the contract
-test asserts `DFN2_MODEL_IO_LAYOUT_VERSION` against them, so a C-side bump onto
-one fails a test rather than a review.
+test asserts `DFN2_MODEL_IO_LAYOUT_VERSION` is not one of them.
 
 | tensor | shape | meaning |
 | --- | --- | --- |
@@ -216,5 +215,5 @@ the issue is in the DF/alpha path rather than the shared dataset. If the
 ERB-masked low band is already collapsed, audit low-frequency corpus coverage,
 speech-only sampling, SNR distribution, and target contamination.
 
-The full upstream-alignment and training-stability record is in
+The upstream-alignment record is in
 [`UPSTREAM_ALIGNMENT.md`](UPSTREAM_ALIGNMENT.md).

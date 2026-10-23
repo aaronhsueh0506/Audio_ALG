@@ -19,7 +19,8 @@ different graph and state layout)::
         --output output/align_ulcnet_d8_stream.onnx \
         --verify
 
-Capture PTQ calibration inputs through this model's inference entry::
+Capture PTQ calibration inputs through this model's inference entry (add
+``--format bin`` for one raw binary per input tensor per streaming frame)::
 
     python3 AIAEC/Align_ULCNet/inference.py calib \
         --checkpoint output/align_ulcnet_best.pth \
@@ -29,48 +30,28 @@ Capture PTQ calibration inputs through this model's inference entry::
         --max-delay-frames 8 \
         --output AIAEC/Align_ULCNet/calib/align_ulcnet_d8.npz
 
-To write one raw binary per input tensor per streaming frame instead::
+For RAW microphone recordings pass ``--primary-dir calibration/raw_mic
+--primary-is-mic``: the checkpoint-matched frozen PBFDKF derives the
+linear-error stems in-process and persists them beside the artifact.
+``--primary-dir`` and ``--far-dir`` must contain matching relative WAV paths;
+differently-tokened names (mic_001.wav vs lpb_001.wav) pair via an explicit
+``--pair-replace mic:lpb`` rule.
 
-    python3 AIAEC/Align_ULCNet/inference.py calib \
-        --checkpoint output/align_ulcnet_best.pth \
-        --primary-dir calibration/linear_error \
-        --far-dir calibration/raw_far \
-        --frames 8192 \
-        --max-delay-frames 8 \
-        --format bin \
-        --output AIAEC/Align_ULCNet/calib/align_ulcnet_d8
-
-Calibration straight from RAW microphone recordings (the checkpoint-matched
-frozen PBFDKF derives the linear-error stems in-process and persists them
-beside the artifact)::
-
-    python3 AIAEC/Align_ULCNet/inference.py calib \\
-        --checkpoint output/align_ulcnet_best.pth \\
-        --primary-dir calibration/raw_mic \\
-        --far-dir calibration/raw_far \\
-        --primary-is-mic \\
-        --frames 8192 \\
-        --max-delay-frames 8 \\
-        --output AIAEC/Align_ULCNet/calib/align_ulcnet_d8.npz
-
-``--primary-dir`` and ``--far-dir`` must contain matching relative WAV
-paths; differently-tokened names (mic_001.wav vs lpb_001.wav) pair via an
-explicit ``--pair-replace mic:lpb`` rule.
-Calibration and deployment both use raw far-end audio. The linear AEC aligns
-its private copy only to form ``linear_error``; the graph's TA block aligns
+Calibration and deployment both use raw far-end audio: the linear AEC aligns
+its private copy only to form ``linear_error`` and the graph's TA block aligns
 raw far against that error. The calibration and ONNX commands must use the same
-``--max-delay-frames`` value.  NPZ output writes a sibling JSON contract;
-binary output writes ``manifest.json`` inside its output directory.
+``--max-delay-frames``. NPZ output writes a sibling JSON contract; binary
+output writes ``manifest.json`` inside its output directory.
 
-STFT/WOLA and PBFDKF stay outside the graph in ``ulcnet_process.c`` and the AEC
-library respectively.  The exported graph boundary follows the checkpoint and
-supports 16 kHz / FFT-window 512 / hop 256 or 48 kHz / 1024 / 512.  The C
-pre/post must be compiled for the same grid; one binary serves one grid.
+STFT/WOLA and PBFDKF stay outside the graph (``ulcnet_process.c`` and the AEC
+library). The graph boundary follows the checkpoint and supports 16 kHz / FFT
+window 512 / hop 256 or 48 kHz / 1024 / 512; the C pre/post must be compiled
+for the same grid (one binary serves one grid).
 
 Graph boundary (state layout version ``LAYOUT_VERSION``)
 --------------------------------------------------------
 
-The accelerator retains no state.  Four host-computed signal inputs
+The accelerator retains no state. Four host-computed signal inputs
 (``error_mag``, ``far_mag``, ``error_cos``, ``error_sin``, each ``[1,1,F]``;
 signed-power compression, magnitudes and the compressed-domain phase run on
 the host, see ``stream_features``) are followed by four rank-4 state inputs,
@@ -81,18 +62,16 @@ and every state input has an ``*_out`` output of exactly the same shape:
     logit_history  [1, 32, 5, D]    oldest frame first (slot 4 is the newest)
     h_gru          [1, 4, 1, 128]   subband GRU 0 layers, then subband GRU 1
 
-Each ``*_out`` is the FULL next window.  The shift runs in the graph, on the
-tensors attention already builds: the history is cut by a Slice on the graph
-input (K/V keep slots ``0..D-2``, the logit window keeps frames ``1..4``) and
-the new frame is concatenated behind or in front of it, so the Concat result
-is the output and no output is produced by a Slice.  The dropped slot only
-keeps the input and output shapes identical.  A runtime can therefore bind
-each ``*_out`` to the address of its input; it must finish reading every
-state input before it writes any state output.  The graph ends at the
-``complex_mask`` 1x1 Conv and returns the learned mask itself,
+Each ``*_out`` is the FULL next window. The shift runs in the graph: the
+history is cut by a Slice on the graph input (K/V keep slots ``0..D-2``, the
+logit window keeps frames ``1..4``) and the new frame is concatenated behind or
+in front of it, so the Concat result is the output and no output is produced by
+a Slice. A runtime can bind each ``*_out`` to the address of its input; it must
+finish reading every state input before it writes any state output. The graph
+ends at the ``complex_mask`` 1x1 Conv and returns the learned mask itself,
 ``output`` = ``[1, 2, 1, n_freqs]`` (plane 0 real, plane 1 imaginary); the
-fixed back end -- complex multiply of the compressed error by that mask, then
-the inverse power -- runs on the host (``host_back_end``; C:
+fixed back end (complex multiply of the compressed error by that mask, then
+the inverse power) runs on the host (``host_back_end``; C:
 ``ulcnet_model_io_commit``).
 
 ``export_graph`` validates the written file with
@@ -133,23 +112,20 @@ from AIAEC.training_common import (
 )
 
 
-# The state boundary's version.  ULCNET_MODEL_IO_LAYOUT_VERSION in
-# ulcnet_model_io.h carries the same number; test_export_streaming_ulcnet.py
-# pins the two together.  Versions 3-17 are RETIRED: each denoted a boundary
-# this exporter and ulcnet_model_io.c do not implement, and a number that
-# once denoted one boundary must never denote another.
+# The state boundary's version. ULCNET_MODEL_IO_LAYOUT_VERSION in
+# ulcnet_model_io.h carries the same number (test_export_streaming_ulcnet.py
+# pins the two). Versions 3-17 are never reused: a number must not denote two
+# boundaries.
 LAYOUT_VERSION = 18
 RETIRED_LAYOUT_VERSIONS = frozenset(range(3, 18))
 STATE_LAYOUT_VERSION = LAYOUT_VERSION
 # The deployed C front/back end hardcodes this exponent
-# (ULCNET_MODEL_IO_COMPRESSION_EXP); export_graph refuses any checkpoint
-# whose model carries a different value, because nothing downstream of the
-# graph could detect the mismatch.
-# The two product grids. SignalGrid admits more than these -- 16 kHz / 256 is
-# constructible and the model runs on it -- but the deployed boundary is
-# defined only for the pair the corpus is materialized on, so anything else is
-# refused here rather than left to fail deep in a matmul or, worse, to export a
-# graph no C build can bind.
+# (ULCNET_MODEL_IO_COMPRESSION_EXP); export_graph refuses a checkpoint whose
+# model carries a different value, since nothing downstream could detect it.
+# The two product grids: SignalGrid admits more (16 kHz / 256 is constructible)
+# but the deployed boundary is defined only for the pair the corpus is
+# materialized on, so anything else is refused here rather than failing deep in
+# a matmul or exporting a graph no C build can bind.
 SUPPORTED_GRIDS = ((16000, 512), (48000, 1024))
 COMPRESSION_EXPONENT = 0.3
 MIN_DELAY_DEPTH = 2
@@ -451,17 +427,11 @@ class AlignUlcnetStreamingExport(nn.Module):
 def ta_bins_for(model) -> int:
     """The K/V feature width the encoder emits.
 
-    NOT a constant -- it follows n_freqs, so it is 26 on the 16 kHz grid and
-    52 on the 48 kHz one. Read off the encoder rather than re-derived, so
-    there is nothing here to drift from model.py. The C side derives the
-    same number from its compiled grid as (BINS + 9) / 10, which is equal to
-    this for the (gamma, subband_bins) pair the export guard enforces;
-    test_c_ta_bins_matches_the_python_derivation evaluates both and compares
-    them at each supported grid.
-
-    ⚠ Not model.reorient.width. That is 52 at 16 kHz -- the same number this
-    returns at 48 kHz -- so the wrong derivation looks right in a 48 kHz
-    trace and is off by 2x on the shipped grid.
+    NOT a constant: it follows n_freqs (26 on the 16 kHz grid, 52 on the 48 kHz
+    one), so it is read off the encoder. The C side derives it from its
+    compiled grid as (BINS + 9) / 10 (pinned by
+    test_c_ta_bins_matches_the_python_derivation). ⚠ Not model.reorient.width,
+    which is 52 at 16 kHz.
     """
     return model.encoded_width
 
@@ -485,12 +455,11 @@ def state_shapes(delay_depth: int, ta_bins: int) -> Dict[str, Tuple[int, ...]]:
 def stream_features(model, error_ri: Tensor, far_ri: Tensor):
     """Host-side fixed front end from RAW RI spectra ((1, 1, n_freqs, 2) each).
 
-    Signed-power compression, magnitudes, and the compressed-domain phase as
-    cos/sin -- everything unlearned, in fp32 (C: ulcnet_model_io_prepare).
-    Returns ``(error_mag, far_mag, error_cos, error_sin, error_ri)``: the
-    first four are the graph's signal inputs in INPUT_NAMES order, and
-    ``error_ri`` is the compressed error spectrum the host keeps for
-    host_back_end (``graph_signals`` slices it off).
+    Signed-power compression, magnitudes and the compressed-domain phase as
+    cos/sin, all unlearned and in fp32 (C: ulcnet_model_io_prepare). Returns
+    ``(error_mag, far_mag, error_cos, error_sin, error_ri)``: the first four
+    are the graph's signal inputs in INPUT_NAMES order, ``error_ri`` is the
+    compressed error spectrum the host keeps for host_back_end.
     """
     exponent = model.compression_exponent
     e_re = _signed_power(error_ri[..., 0], exponent)

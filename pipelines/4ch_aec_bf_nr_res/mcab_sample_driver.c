@@ -1,4 +1,3 @@
-/* See mcab_sample_driver.h. */
 #include "mcab_sample_driver.h"
 
 #include <stdio.h>
@@ -28,8 +27,7 @@ int mcab_print_mem_budget(const char* title, const AudioPipeline4ChConfig* cfg,
     }
     printf("Memory Budget (%s)\n", title);
     printf("=============================================================\n");
-    /* cfg->core.fft_size may be the unresolved 0 sentinel (caller didn't
-     * override --fft-size); print the grid that will actually be used. */
+    /* cfg->core.fft_size may be the unresolved 0 sentinel; print the grid actually used. */
     printf("  sample_rate=%d fft=%d geometry=%d num_angles=%d\n",
            cfg->core.sample_rate,
            cfg->core.fft_size ? cfg->core.fft_size
@@ -232,7 +230,7 @@ int mcab_sample_main(int argc, char **argv, const McabSampleOps *ops, void *user
         if (ops->consume && ops->consume(user, &hop, frames) != 0) goto cleanup;
         ++frames;
     }
-    result = ops->finish(user, &hop, frames);
+    result = ops->finish ? ops->finish(user, &hop, frames) : 0;
 cleanup:
     ops->cleanup(user);
     if (result == 0 && ops->complete) ops->complete(user);

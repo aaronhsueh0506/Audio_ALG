@@ -1,11 +1,10 @@
 """materialize_pair is the loose-WAV diagnostic frontend.
 
-The property that earns it a place beside rematerialize_linear_aec.py is that
-it runs when a checkpoint-carrying path refuses: it builds its contract from
-the runtime, so an installed engine whose behavior hash has moved is not a
-disagreement it can have. ``test_runs_when_a_recorded_contract_would_refuse``
-is that property, written so it fails if the tool ever starts carrying someone
-else's contract.
+It earns its place beside rematerialize_linear_aec.py by running when a
+checkpoint-carrying path refuses: it builds its contract from the runtime, so a
+moved behavior hash is not a disagreement it can have.
+``test_runs_when_a_recorded_contract_would_refuse`` fails if the tool ever
+starts carrying someone else's contract.
 """
 
 import dataclasses

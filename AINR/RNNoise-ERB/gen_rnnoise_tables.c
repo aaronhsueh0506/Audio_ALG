@@ -1,18 +1,14 @@
 /* ============================================================
  * RNNoise-ERB 編譯期查表產生器 (host-only 工具, 不進 production build)
  *
- * 這些表格的輸入 (RNNOISE_SR/N_BANDS/N_BINS/N_FFT/WIN_LEN) 全部是編譯期
- * 常數, 所以表格不在執行期計算。本檔算出四張表格 (ERB forward/inverse
- * filterbank、nfftborder、root-Hann window) 後印成一份 C header
- * (rnnoise_tables_gen.h), 內含 `static const` 陣列, 讓 process.c 直接
- * #include。表格在編譯期就固定, 沒有共享可變狀態, 執行期沒有 race。
+ * 輸入 (RNNOISE_SR/N_BANDS/N_BINS/N_FFT/WIN_LEN) 皆為編譯期常數。本檔算出四張表
+ * (ERB forward/inverse filterbank、nfftborder、root-Hann window), 印成
+ * rnnoise_tables_gen.h 供 process.c 直接 #include; 該檔是產生出來的, 不要手動編輯。
  *
  * 重新產生 rnnoise_tables_gen.h:
  *   cc -O2 -ffp-contract=off -I../../../audiolib/common/include gen_rnnoise_tables.c ../../../audiolib/common/src/audio_window.c -lm -o gen_rnnoise_tables && ./gen_rnnoise_tables > rnnoise_tables_gen.h
  *
- * rnnoise_tables_gen.h 是「產生出來的檔案」— 不要手動編輯, 要改請改這裡
- * 再重新產生。test_rnnoise_tables.c 另外用一份獨立複製的原始演算法
- * 在執行期重算、逐 byte 比對這個 header 的內容, 當作 drift-guard。
+ * test_rnnoise_tables.c 以獨立複本重算並逐 byte 比對這個 header, 當作 drift-guard。
  * ============================================================ */
 
 #include "process.h"

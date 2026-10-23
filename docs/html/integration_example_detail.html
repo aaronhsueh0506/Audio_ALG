@@ -74,7 +74,7 @@ log("delay=%d conf=%.1f upd=%d erle=%.1fdB usable=%d conv=%d "
 <tr><th>讀到這樣</th><th>通常代表</th></tr>
 <tr><td><code>delay=-1</code> 一直不變</td><td>從未鎖定。檢查 ref 是否真的是送往喇叭的訊號、電平是否過低</td></tr>
 <tr><td><code>erle</code> 低但 <code>conv=1</code></td><td>濾波器收斂了但 echo 仍在 → 懷疑鎖到錯的 delay(早期反射),或非線性失真超出線性模型</td></tr>
-<tr><td><code>duty_run/duty_total</code> 接近 1.0 且長時間不降</td><td>duty-cycle 從未進入省電抽樣 → delay 一直不穩定</td></tr>
+<tr><td><code>duty_run/duty_total</code> 接近 1.0 且長時間不降</td><td>duty-cycle 未啟用(<code>delay_est_period_s</code> = 0,預設),或已啟用但 delay 一直不穩定而從未進入抽樣</td></tr>
 <tr><td><code>nr_init=0</code> 持續</td><td>還在啟動 pass-through(前 <code>num_init_frames</code> 個 frame),此時完全不降噪是正常的</td></tr>
 <tr><td><code>mean_spp</code> 長期接近 0</td><td>判定沒有語音 → 檢查電平或噪聲底是否估過高</td></tr>
 <tr><td><code>noise_floor_db</code> 隨語音一起爬升</td><td>噪聲估計正在吸收語音 → 檢查 <code>delta_db</code>／<code>alpha_d</code></td></tr>
@@ -98,7 +98,7 @@ log("delay=%d conf=%.1f upd=%d erle=%.1fdB usable=%d conv=%d "
 <tr><td class="dead">4ch init 失敗<b>一個字都不說</b></td><td><code>init_ex()</code> 的 8 項檢查任一失敗都<b>靜默回 NULL</b>。mono 有逐欄位 stderr,但 <code>NO_STDIO=1</code>(正是板端組態)一開就沒了</td></tr>
 <tr><td class="dead">沒有 frame counter</td><td>四條 pipeline <b>都沒有</b> frame counter 的 public accessor → 「這條 stream 到目前為止處理了幾個 hop」都答不出來,遑論 xrun</td></tr>
 <tr><td class="dead">mono pipeline 沒有 finite 守衛</td><td><code>audio_pipeline_process()</code> 輸入不檢、輸出不檢。<b>只有 4ch 有</b>(輸入與輸出各一道)</td></tr>
-<tr><td class="dead">兩條 ULCNet pipeline 幾乎沒有觀測面</td><td>mono ULCNet 只有 <code>_get_aec()</code>;4ch ULCNet <b>只剩</b> <code>_last_delay()</code> 與尺寸查詢(沒有 <code>_last_beamformed_error()</code>)。兩條都<b>沒有暴露 core handle</b> → core 的 duty census、realign counters、timing、post floor 對整合者全部不可達</td></tr>
+<tr><td class="dead">兩條 ULCNet pipeline 幾乎沒有觀測面</td><td>mono ULCNet 只有 <code>_get_aec()</code>;4ch ULCNet <b>只有</b> <code>_last_delay()</code>、<code>_beam_state()</code>、<code>_last_core_timing()</code> 與尺寸查詢。兩條都<b>沒有暴露 core handle</b> → core 的 duty census、realign counters、timing、post floor 對整合者全部不可達</td></tr>
 </table></div>
 
 <h2>相關檔案與測試路徑</h2>

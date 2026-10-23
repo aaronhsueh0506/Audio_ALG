@@ -38,12 +38,6 @@ Do not force-load a checkpoint from another composition into DFN2. The
 contract gate should reject it; bypassing the gate creates an invalid
 comparison even when many parameter names happen to match.
 
-The two files currently under `DeepFilterNet2/output/` predate this contract:
-`dfn2_best.pth` and `dfn2_last.pth` identify model v5 / feature v3, while the
-source above requires model v6 / feature v5. They remain historical artifacts,
-not deployable weights; the AEC/BF/RES input-placement evaluation must wait for
-a freshly trained compatible checkpoint.
-
 ## Dataset
 
 `dataset_gen/` is the single noisy/clean augmentation implementation:
@@ -69,8 +63,7 @@ DFN configs share the signal grid, feature arithmetic, training recipe and
 dataset seed/split. With mask/DF lookahead 1/1, DFN2 waits two hops and DFN3
 one hop; including identity-path WOLA the measured shifts are 1536 and 1024
 samples respectively. See `tests/test_dfn_comparison.py` and the DFN3 README.
-Historical model-v5 / feature-v3 weights are incompatible with both current
-feature-v5 implementations. Keep outputs in each model's own directory.
+Keep outputs in each model's own directory.
 
 Detailed contracts:
 
@@ -106,11 +99,10 @@ warmup from `lr_warmup` to `lr` over `warmup_epochs`, then cosine annealing to
 loss. Do not infer an AIAEC model's schedule from this section.
 
 **Resume for reconstructible schedules** — warmup/cosine scheduler state is
-deliberately not restored from the checkpoint. Restoring it brings back the
-`T_max` of the run that wrote it: measured, a checkpoint from a 100-epoch run
-resumed at 120 epochs ends on lr 1.02e-04 against a `min_lr` of 1e-06, 102x.
-`global_step` is stored instead, and `fast_forward_scheduler()` rebuilds for
-the current run and indexes the fresh schedule by step. Stateful schedules,
+deliberately not restored from the checkpoint: it would bring back the
+`T_max` of the run that wrote it, so a longer resumed run would never reach
+`min_lr`. `global_step` is stored instead, and `fast_forward_scheduler()`
+rebuilds for the current run and indexes the fresh schedule by step. Stateful schedules,
 such as Align-ULCNet's validation plateau scheduler, have their own checkpoint
 contract described in `AIAEC/README.md`.
 
@@ -138,23 +130,15 @@ way (an optimizer-state problem); the trace can.
 **Vanished weights** — a PER-TENSOR guard (`WeightScaleGuard`) runs once per
 epoch, immediately before the checkpoint write, and halts when a parameter
 tensor's `max|w|` has fallen below both 1e-06 of its own running peak and an
-absolute 1e-12. Nothing else above can see that failure. A real run lost one of
-two parallel subband GRU blocks to weights of 6.5e-25 while its twin stayed at
-6e-01, and every value stayed FINITE the whole way down, so the loss curve,
-`scan_non_finite()` and an ONNX `--verify` parity check all reported agreement —
-PyTorch and ONNX produce the same garbage. `grad_norm.csv` could not see it
-either: that is the GLOBAL norm, which the surviving branch and the rest of the
-network held above 0.2 for the entire run.
+absolute 1e-12. Nothing else above can see that failure: the weights stay
+FINITE, so the loss curve, `scan_non_finite()`, an ONNX `--verify` parity check
+and the GLOBAL norm in `grad_norm.csv` all look healthy while one branch dies.
 
 The baseline is the running maximum of each tensor's own `max|w|`, not its
 initial value, so a bias that initializes at exactly zero is skipped until it
 has grown and is still caught if it later collapses; under `--resume` the
-baseline starts from the loaded weights. Both thresholds have orders of
-magnitude on either side: float32's smallest normal is 1.18e-38, so the 1e-12
-floor sits 26 decades above the denormal boundary, 19x above even the least
-collapsed tensor of that run (5.3e-14), and eight and a half decades below the
-smallest `max|w|` any healthy tensor starts at (3.8e-02).
-`WeightScaleGuard`'s docstring carries the rest of the arithmetic.
+baseline starts from the loaded weights.
+`WeightScaleGuard`'s docstring carries the threshold arithmetic.
 
 ## C pre/post-processing
 
@@ -248,7 +232,7 @@ a reset or by that zeroing, so `dfn2_prepost_state_generation()`,
 them (1 after init, plus one per event): a runtime that sees a new value refills
 its state tensors with quantized zeros.
 
-RNNoise-ERB still takes the ordinary runtime's own output tensors with
+RNNoise-ERB takes the ordinary runtime's own output tensors with
 `rnnoise_model_state_inherit()` (finite-check, then copy), or is bound in place
 and validated with `rnnoise_model_state_validate()`.
 

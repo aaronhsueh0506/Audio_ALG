@@ -12,12 +12,10 @@ DNS4 Dataset + DeepFilterNet v2 風格 augmentation
     cfg = load_config('config.ini')
     dataset = DNS4Dataset(cfg)
 
-Standalone note (AINR extraction):
-    This module is self-contained on purpose — dataset generation is model-
-    independent. The ERB-band helpers below serve only the
-    DNS4Dataset(..., return_raw=False) feature path. gen_dataset.py always uses
-    return_raw=True, so its config needs no FFT, ERB, model, training, or loss
-    parameters.
+This module is self-contained on purpose: dataset generation is
+model-independent. The ERB-band helpers serve only the DNS4Dataset(...,
+return_raw=False) feature path; gen_dataset.py always uses return_raw=True, so
+its config needs no FFT, ERB, model, training or loss parameters.
 """
 
 import configparser
@@ -470,7 +468,6 @@ def prepare_rir(rir: torch.Tensor, sr: int,
     2. target_rir = peak + late_offset_ms 之內保留, 之後依 RT60 指數衰減
        (amplitude -60dB at t=RT60 ⇒ tau = RT60 / 3)
     3. full_rir = 去 pre-delay 後的完整 RIR (給 noisy 混合用)
-
     回傳: (target_rir, full_rir)
     """
     # 移除 pre-delay
@@ -660,22 +657,16 @@ class DNS4Dataset(Dataset):
     Pipeline:
     1. Select mixed / noise-only / speech-only sample mode
     2. Load and augment speech when required (RemoveDC, LFilt, optional biquad,
-       and optional within-segment silence -> speech onset)
+       optional within-segment silence -> speech onset)
     3. RIR convolution (early for target, full for noisy)
-    4. Load 2--5 real/generated full-band noise lanes and augment each real
-       lane with LFilt when required; combine lanes, then apply optional
-       biquad and pre-mix clipping distortion
+    4. Load 2--5 noise lanes, LFilt on real lanes, combine, then optional biquad
+       and pre-mix clipping distortion
     5. Discrete-SNR mixing for mixed samples
     6. Optional lower-rate source simulation (noisy + target)
-    7. DNS-style target-level normalization (noisy + target scaled together
-       by one factor so a sampled requested_level_dbfs is hit on the
-       post-resample-simulation mixture — see level_mode below; run AFTER
-       step 6, not before, so the level a downstream consumer actually
-       measures matches what was requested instead of drifting through the
-       lower-rate-source simulation)
+    7. DNS-style target-level normalization: noisy + target scaled by one factor
+       so the sampled requested_level_dbfs is hit on the post-step-6 mixture
     8. Mixture clipping distortion (mixed/noise-only input only,
-       p_mixture_clipping — post-mix, post-level-normalization; independent
-       knob from step 4's pre-mix p_noise_clipping)
+       p_mixture_clipping; independent of step 4's p_noise_clipping)
     9. Clipping prevention (final peak guard)
     10. STFT → features + target gains  (return_raw=False)
         OR return (noisy, clean) raw audio tensors (return_raw=True),
@@ -878,22 +869,12 @@ class DNS4Dataset(Dataset):
                 f"{self.clip_snr_min} > {self.clip_snr_max}"
             )
 
-        # This project has no train/val split concept at generation time by
-        # DEFAULT (splitting normally happens downstream, in each model's own
-        # train.py) -- but DFN3's own clipping augmentation is train-only
-        # (validation data is never clipped), and this generator's
-        # p_noise_clipping/p_mixture_clipping applied unconditionally to
-        # every sample otherwise diverges from that. [gen] generation_split
-        # is an OPTIONAL opt-in: omitted (None), both knobs apply exactly as
-        # configured above, unconditionally, to every sample (unchanged
-        # default behavior, and the right choice for a generator whose
-        # output IS the val set too, or that leaves clipping-as-augmentation
-        # as a deliberate distribution choice regardless of split). Set to
-        # 'validation' for a run whose entire output is a held-out
-        # validation batch -- both clipping knobs are force-zeroed for that
-        # whole run, matching DFN3. 'train' is accepted as a no-op alias
-        # (documents intent at the call site; behaves identically to
-        # omitting the key).
+        # No train/val split exists at generation time by default, but DFN3's
+        # clipping augmentation is train-only. [gen] generation_split is an
+        # OPTIONAL opt-in: omitted (None), both clipping knobs apply as
+        # configured to every sample; 'validation' force-zeroes both for the
+        # whole run (a held-out validation batch, matching DFN3); 'train' is a
+        # no-op alias documenting intent.
         self.generation_split = cfg.get(
             'gen', 'generation_split', fallback=None
         )
@@ -1347,18 +1328,14 @@ class DNS4Dataset(Dataset):
             metadata['resample_simulated'] = True
             metadata['source_sr'] = source_sr
 
-        # 7. DNS-style target-level normalization (level_mode=dns_target_
-        # level). Sampled and applied AFTER step 6's resample simulation,
-        # not before: this measures mixture_rms against whatever the
-        # pipeline's last resample left behind, so requested_level_dbfs is
-        # what a consumer reading `noisy` right after this call actually
-        # gets -- not a level that then silently drifts through a later
-        # resample (see this module's level_mode config doc). One scalar
-        # scale, derived from the noisy mixture's RMS, applied identically
-        # to noisy and target so the requested SNR (step 5) is preserved;
-        # noise_only's exact-zero target and speech_only's identity pair
-        # (noisy is literally target.clone() two branches up) both stay
-        # exactly correct under a single uniform scale.
+        # 7. DNS-style target-level normalization
+        # (level_mode=dns_target_level), applied AFTER step 6's resample
+        # simulation so requested_level_dbfs is what a consumer reading `noisy`
+        # right after this call gets, not a level that drifts through a later
+        # resample. One scalar derived from the noisy mixture's RMS is applied
+        # identically to noisy and target, so the requested SNR (step 5) is
+        # preserved and the noise_only zero target and speech_only identity
+        # pair stay exact.
         requested_level_dbfs = random.uniform(
             self.target_level_min_db, self.target_level_max_db
         )

@@ -21,17 +21,16 @@ config.ini sections (see the shipped config.ini for every knob, documented):
 
 dataset:
     AIAEC/dataset_gen renders each complete parent sequence, runs one stateful
-    frozen Python PBFDKF over it, stores the resulting ``linear_error`` as
-    the last channel, then cuts 10-second chunks. This trainer never executes
-    PBFDKF. It uses the common deterministic per-chunk random split and an
+    frozen Python PBFDKF over it, stores the resulting ``linear_error`` as the
+    last channel, then cuts 10-second chunks. This trainer never executes
+    PBFDKF; it uses the common deterministic per-chunk random split and an
     ordinary shuffled training DataLoader.
 
 task (see ../README.md's decision matrix and
 ../dataset_gen/model_views.py MODEL_TASKS['Align_ULCNet']):
     frozen-linear-AEC error + far-end reference in; denoised, echo-free,
-    early/dereverberated near-end speech out.
-    Requires the stored real linear-AEC error; an oracle residual is rejected
-    by ``build_model_view``.
+    early/dereverberated near-end speech out. Requires the stored real
+    linear-AEC error; an oracle residual is rejected by ``build_model_view``.
 
 inference: see inference.py's own top-of-file usage comment.
 """

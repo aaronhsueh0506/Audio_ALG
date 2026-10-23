@@ -56,29 +56,22 @@ from training_common import (
 
 # Feature semantics are versioned: FEATURE_VERSION names the contract below,
 # and a checkpoint trained under another version is incompatible even when its
-# input/output dimensions match.
-# The causal normalisation follows the original DeepFilterNet: per-band EMA
-# mean-normalised log-ERB and per-bin EMA-normalised complex bins, with no
-# erb_norm_clip/spec_clip clamp (neither upstream Rikorose/DeepFilterNet
-# libDF/src/lib.rs band_mean_norm_erb/band_unit_norm nor this repo's
-# AINR/DeepFilterNet2 port clips).
-# erb_bandborder() enforces a strict greedy-forward minimum band width, same
-# style as this file's own compute_erb_bands().  (The "every-OTHER-band-pair
-# >= 2 bins" rule of aaronhsueh0506/DeepFilterNet-Keras's ERBBand() notebook
-# does not guarantee every individual band is >= 2 bins wide: a genuine 1-bin
-# band occurs at this file's own sr/n_fft/n_bands.)  The rule fixes the ERB
-# filterbank matrices (erb_fwd/erb_inv / nfftborder), hence the features.
+# input/output dimensions match. The causal normalisation follows the original
+# DeepFilterNet: per-band EMA mean-normalised log-ERB and per-bin
+# EMA-normalised complex bins, with no erb_norm_clip/spec_clip clamp (neither
+# upstream libDF nor AINR/DeepFilterNet2 clips). erb_bandborder() enforces a
+# strict greedy-forward minimum band width, as compute_erb_bands() does; an
+# every-OTHER-band-pair rule leaves genuine 1-bin bands at this file's
+# sr/n_fft/n_bands.
 FEATURE_VERSION = 'log_erb_dfn_mean_cplx_unit_0_4k_v8'
 LOSS_VERSION = 'erb_irm_only_v4'
 # Signal/framing contract (checkpoints trained under another contract are not
 # compatible):
 #   * fft_sizes 128,256,512,1024, i.e. {n_fft/4, n_fft/2, n_fft, n_fft*2} for
-#     THIS model's 512-point FFT.  Upstream's integers (256,512,1024,2048) were
-#     chosen against its own 960-point FFT; applying them here would shift
-#     every resolution one octave up (16/32/64/128 ms).
-#   * direct ERB IRM supervision.  MRSL and the pseudo-VAD weighting are
-#     disabled; see config.ini for the measured gradient-scale reason and the
-#     pure-noise classification problem.
+#     THIS model's 512-point FFT (upstream's integers are tied to its 960-point
+#     FFT and would shift every resolution one octave up).
+#   * direct ERB IRM supervision; MRSL and the pseudo-VAD weighting are
+#     disabled (see config.ini).
 #   * training STFT uses center=False so framing matches deployment.
 
 
@@ -137,17 +130,12 @@ def require_checkpoint_feature_config(ckpt, feature_cfg, context='checkpoint'):
 def model_capacity_from_checkpoint(ckpt):
     """RNNoiseModel shape kwargs, taken from the checkpoint rather than config.
 
-    Capacity is a property of the weights.  A config.ini that disagrees would
-    build a model that either fails to load or -- worse -- loads and means
-    something else, so both inference.py and export_onnx.py construct from here.
-    (Feature/signal constants are the opposite case: those must match the
-    runtime config exactly, which is require_checkpoint_feature_config's job.)
-
-    ``use_complex_input`` is read from the recorded config, falling back to
-    probing the weights for checkpoints written before the flag existed.  The
-    spec_* shapes are only read once that is known to be true -- they do not
-    exist in a pure-ERB checkpoint, and reading them unconditionally is a
-    KeyError, not a graceful degradation.
+    Capacity is a property of the weights: a config.ini that disagrees would
+    build a model that fails to load or loads and means something else, so
+    inference.py and export_onnx.py construct from here (feature/signal
+    constants must instead match the runtime config, see
+    require_checkpoint_feature_config). ``use_complex_input`` falls back to
+    probing the weights when the recorded config lacks the flag.
     """
     sd = ckpt['state_dict']
     saved = ckpt.get('config', {})
@@ -281,19 +269,12 @@ def read_feature_config(cfg, sr, hop_len, n_fft, win_len=None):
         raise ValueError('invalid DeepFilterNet-style ERB/complex feature configuration')
     spec_bins = spec_max_hz * n_fft // sr + 1
     # An explicit alpha, when given, wins over the tau-derived one.
-    #
+
     # alpha is the per-FRAME decay, so pinning it keeps the normaliser's memory
-    # fixed at 1/(1-alpha) frames no matter what sr/hop become.  That is the
-    # invariant the GRU actually cares about: its learned time constants are in
-    # frames, so a fixed alpha keeps "normaliser adaptation speed vs state
-    # update rate" constant across grid changes and the learned dynamics stay
-    # valid.  Deriving alpha from tau instead pins the memory in SECONDS, which
-    # is the signal-processing invariant but lets the frame-domain relationship
-    # drift (63 frames at hop 256 vs 126 at hop 128).
-    #
-    # The cost of a longer alpha is a longer warm-up, and that only hurts while
-    # the init values are wrong; once they are calibrated to the steady state
-    # (calibrate_norm_init.py) there is no transient to sit through.
+    # fixed at 1/(1-alpha) frames whatever sr/hop become, which is what the
+    # GRU's frame-domain time constants care about; deriving it from tau pins
+    # the memory in SECONDS and lets that relationship drift (63 frames at hop
+    # 256 vs 126 at hop 128).
     erb_alpha = cfg.getfloat('feature', 'erb_norm_alpha', fallback=0.0)
     spec_alpha = cfg.getfloat('feature', 'spec_norm_alpha', fallback=0.0)
     if not 0.0 <= erb_alpha < 1.0 or not 0.0 <= spec_alpha < 1.0:
@@ -382,17 +363,10 @@ def erb_bandborder(n_bands, sr, n_fft, min_bins_per_band):
         border  = round((cutoff + bw/2) / bw),   bw = (sr/2)/(n_fft/2) = sr/n_fft
 
     Band-width enforcement: strict greedy-forward minimum -- every consecutive
-    border pair is nudged to be at least `min_bins_per_band` bins apart (never
-    below the ideal position, so we only ever borrow forward, never move a
-    border backward). This replaces the original aaronhsueh0506/
-    DeepFilterNet-Keras `ERBBand()` notebook's "every-OTHER-band-pair >= 2"
-    rule (`nb[i+2]-nb[i] >= 2`, checked only for i, i+2 -- not i, i+1), which
-    does NOT actually guarantee every individual band is >= 2 bins wide:
-    verified empirically to produce a genuine 1-bin-wide band at
-    sr=16000/n_fft=512/n_bands=22. The greedy-forward style itself mirrors
-    this file's own compute_erb_bands() (used by the disabled hybrid-band
-    path), just applied to this function's N-border/edge-doubled convention
-    instead of that function's N+1-border one.
+    border pair is at least `min_bins_per_band` bins apart (only ever borrowed
+    forward, never moved backward). The upstream "every-OTHER-band-pair >= 2"
+    rule does not guarantee every individual band is >= 2 bins wide (it yields
+    a 1-bin band at sr=16000/n_fft=512/n_bands=22).
     """
     n_bins = n_fft // 2 + 1
     high_lim = sr / 2.0
@@ -443,17 +417,13 @@ def compute_erb_matrix(nfftborder, n_fft, mode=0):
 # ============================================================
 
 class RNNoiseModel(nn.Module):
-    """
-    RNNoise/DeepFilterNet-inspired ERB-gain model.
+    """RNNoise/DeepFilterNet-inspired ERB-gain model.
 
-    The ERB path observes short-term deviations from a causal per-band mean.
     An optional complex path (``use_complex_input``, OFF by default) preserves
-    fine low-frequency magnitude/phase structure; see __init__ for why it is
-    off.  Both paths are causal apart from caller-controlled lookahead padding.
-
-    ``forward`` always accepts ``spec_features`` so the ONNX signature, the C
-    feature contract and every call site stay stable; with the complex path
-    disabled the argument is simply unused.
+    fine low-frequency magnitude/phase structure. Both are causal apart from
+    caller-controlled lookahead padding. ``forward`` always accepts
+    ``spec_features`` so the ONNX signature and C feature contract stay stable;
+    with the complex path disabled it is unused.
     """
     def __init__(self, n_bands, spec_bins, cond_size=64, gru_size=128,
                  spec_conv_channels=8, spec_embed_size=64, dropout=0.0,
@@ -468,17 +438,13 @@ class RNNoiseModel(nn.Module):
         # Three-frame mean-normalised log-ERB path.
         self.erb_conv = nn.Conv1d(n_bands, cond_size, kernel_size=3, padding=0)
 
-        # Per-frame complex spectrum encoder.  Frequency is reduced by 4x;
-        # temporal context is applied only after each frame has been embedded.
-        #
-        # Disabled by default: the model's OUTPUT is 22 real ERB band gains, so
-        # everything this branch learns about within-band structure is discarded
-        # at the output anyway.  It cost 46,952 params (12.5% of the model) to
-        # extract fine-grained 0-4 kHz detail that the coarse output cannot
-        # express.  Turning it off makes the model pure-ERB on both ends, which
-        # is what the RNNoise-ERB vs GTCRN comparison is meant to isolate:
-        # GTCRN has hybrid-resolution input AND a complex mask, so the two
-        # models become clean opposite ends rather than a muddled middle.
+        # Per-frame complex spectrum encoder (frequency reduced 4x; temporal
+        # context applied after each frame is embedded). Disabled by default:
+        # the output is 22 real ERB band gains, so within-band structure
+        # learned here is discarded anyway, and it costs 46,952 params (12.5%
+        # of the model). Off, the model is pure-ERB on both ends, the clean
+        # opposite of GTCRN's hybrid-resolution input and complex mask for the
+        # comparison.
         self.use_complex_input = use_complex_input
         if use_complex_input:
             self.spec_conv1 = nn.Conv1d(2, spec_conv_channels, kernel_size=5,
@@ -520,9 +486,8 @@ class RNNoiseModel(nn.Module):
         """
         erb_features:  (batch, seq_len, n_bands)
         spec_features: (batch, seq_len, 2, spec_bins), or None when the complex
-              branch is disabled.  The argument stays in the signature either
-              way so the ONNX graph and the C contract do not change shape with
-              a training-time flag; when unused it is simply not read.
+              branch is disabled (the argument stays in the signature so the ONNX
+              graph and the C contract do not change with a training-time flag)
         states: [h1, h2, h3] 或 None
         回傳: gains, new_states
               seq_len' = seq_len - 2 (conv1 kernel=3 valid 減 2 frame)
@@ -603,13 +568,12 @@ def stft(wav, n_fft, hop_len, win_len, window):
     """STFT with normalized=True (= fft_size^-0.5, matching DeepFilterNet-Keras
     stft(normalize=True)). Pairs with istft() for perfect reconstruction.
 
-    center=False so that training framing equals the deployed framing.  The C
-    streaming path is center=False-equivalent by construction (process.h:20-23),
-    and with center=True every frame differed from deployment by n_fft/2 = 256
-    samples.  That header calls it a boundary-only effect, which holds for the
-    spectrum but NOT for the causal EMA normaliser: its state starts fresh at
-    frame 0 and, because tau=1 s against 3 s segments means the whole segment is
-    still warming up, a frame-0 difference propagates through the entire example.
+    center=False so that training framing equals the deployed framing (the C
+    streaming path is center=False-equivalent by construction,
+    process.h:20-23). The offset is not boundary-only: the causal EMA
+    normaliser starts fresh at frame 0 and with tau=1 s against 3 s segments is
+    still warming up, so a frame-0 difference propagates through the whole
+    example.
     """
     return torch.stft(wav, n_fft, hop_len, win_len, window=window,
                       return_complex=True, center=False, normalized=True)
@@ -618,15 +582,12 @@ def stft(wav, n_fft, hop_len, win_len, window):
 def istft(spec, n_fft, hop_len, win_len, window, length=None):
     """Weighted overlap-add synthesis, matching the C streaming path.
 
-    Deliberately NOT torch.istft: that divides by the window envelope, which is
-    exactly zero at the first and last sample once center=False (sqrt-Hann
-    starts at 0 and only one frame covers the edge), so it refuses to run.  The
-    deployed path has no such division -- sqrt-Hann analysis times sqrt-Hann
+    Deliberately NOT torch.istft, which divides by the window envelope, exactly
+    zero at the first and last sample once center=False, so it refuses to run.
+    The deployed path has no such division: sqrt-Hann analysis times sqrt-Hann
     synthesis is Hann, which sums to 1 at 50% overlap (COLA), so plain
-    overlap-add reconstructs exactly in the interior.  The edges are genuinely
-    attenuated in deployment too; ``valid_region`` below reports the span where
-    that is not the case, and the loss trims to it.
-
+    overlap-add reconstructs the interior exactly and the edges are attenuated
+    in deployment too (``valid_region`` reports the span the loss trims to).
     normalized=True in the analysis scales by n_fft^-0.5, so undo it here.
     """
     n_frames = spec.shape[-1]
@@ -662,11 +623,10 @@ def normalize_log_erb(erb_db, norm_state=None, norm_alpha: float = 0.984,
     """Original DeepFilterNet causal per-band mean normalisation.
 
     The EMA is updated with the current frame before subtraction, matching
-    Rikorose/DeepFilterNet ``libDF::band_mean_norm_erb`` exactly (verified
-    against libDF/src/lib.rs and this repo's own AINR/DeepFilterNet2 port,
-    neither of which clips the output). No variance or absolute-level
-    side channel is used; the complex branch remains observable for stationary
-    inputs and retains partial level information.
+    Rikorose/DeepFilterNet ``libDF::band_mean_norm_erb`` exactly (neither it
+    nor AINR/DeepFilterNet2 clips the output). No variance or absolute-level
+    side channel is used; the complex branch stays observable for stationary
+    inputs.
     """
     if erb_db.ndim != 3:
         raise ValueError('erb_db must have shape [B,T,E]')
@@ -692,12 +652,10 @@ def normalize_complex_spectrum(spec_low, norm_state=None, norm_alpha: float = 0.
                                eps: float = 1e-12):
     """Original DeepFilterNet per-bin magnitude EMA norm.
 
-    This matches ``libDF::band_unit_norm`` exactly (verified against
-    libDF/src/lib.rs and this repo's own AINR/DeepFilterNet2 port, neither of
-    which clips the output): each bin updates its own state from
-    ``abs(X[k])`` and divides the complex value by ``sqrt(state[k])``.  It is
-    deliberately not fully gain-invariant: at steady state, scaling X by ``a``
-    scales this feature by approximately ``sqrt(a)``.
+    This matches ``libDF::band_unit_norm`` exactly (no output clipping): each
+    bin updates its own state from ``abs(X[k])`` and divides the complex value
+    by ``sqrt(state[k])``. It is deliberately not fully gain-invariant: scaling
+    X by ``a`` scales this feature by approximately ``sqrt(a)``.
     """
     if spec_low.ndim != 3:
         raise ValueError('spec_low must have shape [B,T,F]')
@@ -723,17 +681,14 @@ def normalize_complex_spectrum(spec_low, norm_state=None, norm_alpha: float = 0.
 def extract_model_features(spec, erb_matrix, feature_cfg, norm_state=None,
                            return_debug=False, need_spec=True):
     """
-    spec: (B, n_bins, T) complex, from normalized=True STFT.
-    erb_matrix: (n_bins, n_bands) triangular forward ERB filterbank.
-    Returns mean-normalised ERB features, complex low-bin features and both
-    updated causal normalisation states.
+    spec: (B, n_bins, T) complex, from normalized=True STFT. erb_matrix:
+    (n_bins, n_bands) triangular forward ERB filterbank. Returns
+    mean-normalised ERB features, complex low-bin features and both updated
+    causal normalisation states.
 
-    ``need_spec=False`` skips the complex branch entirely and returns ``None``
-    in its place.  A pure-ERB model discards that tensor, but producing it
-    costs a Python loop over every frame (the EMA is causal), so the training
-    loop must not pay for it.  The C path and the ONNX signature are unaffected
-    -- they are separate code, and the default stays True so every other caller
-    (parity tests, denoise) is unchanged.
+    ``need_spec=False`` skips the complex branch and returns ``None`` in its
+    place: a pure-ERB model discards that tensor but producing it costs a
+    Python loop over every frame (the EMA is causal).
     """
     spec_btf = spec.permute(0, 2, 1)
     energy = spec_btf.abs().pow(2) @ erb_matrix
@@ -768,8 +723,8 @@ def apply_erb_gains_batch(noisy_spec, gains, erb_inv, lookahead=0):
     noisy_spec : (B, n_bins, n_frames) complex
     gains      : (B, n_frames_out, n_bands)
     erb_inv    : (n_bins, n_bands) mode=1 inverse ERB FB (no edge x2, partition of unity)
-    Keras mask expansion: bin_gains = gains @ erb_inv.T (= mask @ iERB_Matrix). Because
-    mode=1 is a partition of unity, gains=1 → bin_gains=1 with NO row normalisation.
+    Keras mask expansion: bin_gains = gains @ erb_inv.T. Because mode=1 is a
+    partition of unity, gains=1 → bin_gains=1 with NO row normalisation.
 
     Mode 自動判定:
     - n_frames_out == n_frames : padded 模式 (training), gains 與 spec frame 1:1 對齊
@@ -818,28 +773,17 @@ class _LossStft(nn.Module):
 
 
 class ErbIrmLoss(nn.Module):
-    """Direct supervision of the 22 ERB band gains against the ideal ratio mask.
-
-    Why this exists: with MultiResSpecLoss alone the gains are only supervised
-    *through* the synthesis, so nothing pushes a specific gain value in a band
-    the waveform loss barely notices.  This trains them directly.
+    """Direct supervision of the 22 ERB band gains against the ideal ratio
+    mask.
 
     target  g* = sqrt(clamp(E_clean / E_noisy, 0, 1))   per band, amplitude domain
     loss    mean( (g^gamma - g*^gamma)^2 )  over DEFINED bands only
 
-    NO speech-activity weighting.  A ``(1 + 5*vad)`` term (as in xiph/rnnoise)
-    would weight a loss by a quantity the network never predicts: xiph
-    computes it from a real VAD *output head* trained against a VAD target,
-    while this model has no such head and emits nothing but 22 band gains.  It
-    would also be inverted in the case that matters most: for a noise-only
-    example ``clean_frame_e`` is 0 and the peak reference clamps to 1e-12, so
-    ``10*log10(0/1e-12)`` evaluates to 0 dB -- above any sane threshold -- and
-    every pure-noise frame would be scored as speech-active and up-weighted
-    6x.
-
-    The undefined-band mask is kept: a band with essentially no energy in the
-    MIXTURE has no defined ratio at all, so its gradient is pure noise rather
-    than a weighting choice.
+    NO speech-activity weighting: a ``(1 + 5*vad)`` term (xiph/rnnoise) needs a
+    real VAD output head, which this model lacks, and for a noise-only example
+    ``clean_frame_e`` is 0 so every frame would count as speech-active. The
+    undefined-band mask is kept: a band with essentially no mixture energy has
+    no defined ratio, so its gradient is pure noise.
     """
 
     def __init__(self, factor=1.0, gamma=0.5, energy_floor=1e-9):
@@ -888,12 +832,10 @@ class ErbIrmLoss(nn.Module):
 class MultiResSpecLoss(nn.Module):
     """
     DeepFilterNet 3 MultiResSpecLoss port. Each resolution uses a plain Hann
-    window, hop=n_fft//4 and normalized STFT. Both magnitude and complex spectra
-    are gamma-compressed before MSE, and resolution losses are summed (not
-    averaged), exactly like the upstream implementation.
-
-    There is no division by clean energy, activity weighting, or IRM target, so
-    clean=0 (pure-noise samples) is a normal finite target.
+    window, hop=n_fft//4 and normalized STFT; magnitude and complex spectra are
+    gamma-compressed before MSE and resolution losses are summed (not
+    averaged), as upstream. There is no division by clean energy, so clean=0
+    (pure-noise samples) is a normal finite target.
     """
 
     def __init__(self, fft_sizes=(256, 512, 1024, 2048), gamma=0.3,
@@ -1217,18 +1159,11 @@ def train(args):
     def make_halt_context(epoch):
         """Assemble halt_on_non_finite's arguments -- called ONLY when halting.
 
-        Built once per epoch, never per batch: the state_dict copies below are
-        far too expensive to take on every step, and the halt path runs at most
-        once per process.  Model/optimizer state is still pre-step at every call
-        site, so the checkpoint it captures is uncontaminated.
-
-        raw_model, not model: halt_on_non_finite indexes state_dict() by the
-        names it gets from named_buffers(), and under torch.compile those two
-        namespaces disagree.
-
-        enhanced is None because with the MRSL factors at zero this objective
-        never synthesises a waveform -- the model emits band gains and the loss
-        consumes them directly, so there is no enhanced signal to dump.
+        Built once per epoch, never per batch: the state_dict copies are far
+        too expensive per step, and the halt path runs at most once per
+        process. Model/optimizer state is still pre-step at every call site.
+        raw_model, not model: under torch.compile ``named_buffers()`` and
+        ``state_dict()`` namespaces disagree.
         """
         def context(batch_idx, noisy, clean):
             return {
@@ -1257,11 +1192,8 @@ def train(args):
     mrsl_enabled = mrsl_is_enabled(loss_cfg)
 
     def batch_loss(noisy_wav, clean_wav):
-        """One forward pass and its objective, shared by the train and val loops.
-
-        These were two verbatim copies sixty lines apart, so every change to the
-        objective had to be made twice.
-        """
+        """One forward pass and its objective, shared by the train and val
+        loops."""
         noisy_spec = stft(noisy_wav, N_FFT, HOP_LEN, WIN_LEN, stft_window)
 
         # Zero-pad time so both k=3 branches emit one gain per spectrum frame:

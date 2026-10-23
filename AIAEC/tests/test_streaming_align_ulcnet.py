@@ -1,10 +1,9 @@
 """Frame-by-frame streaming equivalence for Align-ULCNet.
 
 The offline forward is the reference; ``forward_stream`` must replay it one
-STFT frame at a time.  Tolerances below were MEASURED on this fixture (worst
-over three input pairs: enhanced 4.1e-8, mask 1.2e-7, magnitude_mask 6.0e-8,
-delay 4.0e-7 -- pure GEMM-batching noise from running the GRUs stepwise) and
-pinned with ~10x headroom.
+STFT frame at a time. Tolerances are pinned with ~10x headroom over the worst
+noise measured on this fixture (pure GEMM-batching noise from running the GRUs
+stepwise).
 """
 
 import pytest
@@ -226,11 +225,11 @@ def test_load_model_far_input_mode_default_present_and_rejected(
     path = str(tmp_path / 'ckpt.pth')
     _write_synthetic_checkpoint(path, model)
 
-    # _write_synthetic_checkpoint records no far_input_mode -- exactly a
-    # legacy checkpoint. It must load, defaulted to raw_far, and the loader
-    # must name BOTH sides: the mode the checkpoint trained on and the
-    # deployment default. _streaming.py separately prints the selected
-    # runtime seam, which may override that default.
+    # _write_synthetic_checkpoint records no far_input_mode. It must load,
+    # defaulted to raw_far, and the loader must name BOTH sides: the mode the
+    # checkpoint trained on and the deployment default. _streaming.py
+    # separately prints the selected runtime seam, which may override that
+    # default.
     load_model(path, 'cpu')
     assert ('checkpoint training far_input_mode: raw_far; '
             'deployment default: raw_far'

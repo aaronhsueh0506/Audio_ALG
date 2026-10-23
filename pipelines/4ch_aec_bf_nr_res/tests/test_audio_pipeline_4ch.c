@@ -1,8 +1,7 @@
 /**
- * tests/test_audio_pipeline_4ch.c — complete four-channel pipeline tests.
- *
- * Mirrors test_audio_pipeline.c's public-API acceptance style while exercising
- * the additional SRP-PHAT/BF stage at all three production signal grids.
+ * tests/test_audio_pipeline_4ch.c -- complete four-channel pipeline tests: the public-API
+ * acceptance style of test_audio_pipeline.c plus the SRP-PHAT/BF stage, on all three
+ * production signal grids.
  */
 
 #include "audio_pipeline_4ch.h"
@@ -125,15 +124,10 @@ static int run_grid(int sample_rate, int fft_size) {
     return 1;
 }
 
-/* Contract test: in fixed-notebook mode
- * (bf_fixed_mode && bf_fixed_align_notebook), bf_create() forces the
- * actual BF RLS update cadence to 1 hop regardless of the configured
- * bf_adapt_interval -- kept for baseline-matching against the reference
- * notebook. The lambda retime scaling computed in
- * audio_pipeline_4ch_create() MUST use that same forced cadence, not the
- * raw pre-forced bf_adapt_interval, or lambda ends up calibrated for a
- * slower wall-clock update period than what is actually running (too
- * aggressive/timid RLS forgetting relative to the intended design). */
+/* Contract test: in fixed-notebook mode (bf_fixed_mode && bf_fixed_align_notebook),
+ * bf_create() forces the BF RLS update cadence to 1 hop whatever bf_adapt_interval is.
+ * The lambda retime in audio_pipeline_4ch_create() must use that forced cadence, or
+ * lambda is calibrated for a slower update period than the one that runs. */
 static int test_bf_fixed_notebook_lambda_matches_forced_cadence(void) {
     AudioPipeline4ChConfig cfg =
         audio_pipeline_4ch_default_config(16000);
@@ -212,18 +206,11 @@ static int test_bf_auto_mode_respects_configured_interval(void) {
     return 1;
 }
 
-/*
- * audio_pipeline_4ch_process() must reject a bad call before auto_vad() --
- * which unconditionally folds its input into the noise_power EMA -- can see
- * it: NULL far_reference/output and non-finite input must not reach the VAD
- * state. A NaN noise_power would make `power >= noise_power * ratio` false
- * for every future frame (any comparison against NaN is false), silently
- * disabling VAD forever. Checked here by running two identically-fed
- * pipeline instances side by side: only one ("attacked") also receives a
- * batch of calls that must be rejected (NULL far_reference, NULL output, a
- * NaN mic buffer); if any of those leaks into VAD state, "attacked" diverges
- * from "clean" on every frame afterward despite otherwise-identical input.
- */
+/* audio_pipeline_4ch_process() must reject a bad call (NULL far_reference/output,
+ * non-finite input) before auto_vad() can fold it into the noise_power EMA; a NaN
+ * noise_power would make every later comparison false and disable VAD for good. Two
+ * identically-fed pipelines run side by side and only "attacked" also receives the calls
+ * that must be rejected; any leak into VAD state makes it diverge from "clean". */
 static int test_rejected_calls_preserve_vad_state(void) {
     const int sample_rate = 16000;
     const int fft_size = 256;
@@ -319,23 +306,13 @@ static int test_rejected_calls_preserve_vad_state(void) {
               attacked, nan_mic, far, out_attacked, &throwaway) !=
               FOUR_AEC_NR_RES_OK,
           "NaN mic input is rejected, not silently processed");
-    /* far_reference is never read by auto_vad() itself (only
-     * microphones_interleaved is), so on perfectly finite mic data a
-     * non-finite far passes auto_vad()'s own guard entirely and would only
-     * be caught by the deeper finite check inside four_aec_front_process()
-     * -- by which point auto_vad() would already have mutated
-     * noise_power/vad_hangover from real, finite mic energy. Both NaN and
-     * Inf are exercised since they're rejected by different mechanisms
-     * downstream (isfinite() catches both, but this pins the check at the
-     * source rather than relying on that).
-     *
-     * Deliberately QUIET mic content for these two calls, NOT the loud
-     * arming signal still sitting in `mic`: auto_vad() on the loud signal
-     * would just re-arm vad_hangover to the exact value it already has
-     * (indistinguishable from not running at all), so a missing
-     * far_reference check would go unnoticed. Quiet
-     * content instead takes the EMA's "silence" branch, a real, different
-     * noise_power update if auto_vad() incorrectly runs. */
+    /* auto_vad() reads only the microphones, so on finite mic data a non-finite far would
+     * pass its own guard and only be caught by the finite check inside
+     * four_aec_front_process(), after auto_vad() has already moved
+     * noise_power/vad_hangover. NaN and Inf are both exercised. The mic content is quiet
+     * on purpose: a loud frame would re-arm vad_hangover to the value it already has and
+     * hide a missing far_reference check, while quiet content takes the EMA's silence
+     * branch and changes noise_power if auto_vad() wrongly runs. */
     for (int i = 0; i < hop; ++i) {
         float v = 0.003f * sinf(phase + 1.7f);
         for (int ch = 0; ch < FOUR_AEC_NR_RES_CHANNELS; ++ch)
@@ -350,14 +327,9 @@ static int test_rejected_calls_preserve_vad_state(void) {
               FOUR_AEC_NR_RES_INVALID_ARGUMENT,
           "Inf far_reference is rejected before touching VAD state");
 
-    /* Resume byte-identical valid input on both -- QUIET this time, so the
-     * hangover counter actually counts down to 0 across the run instead of
-     * being re-armed to the same fixed value on every hop (a loud frame
-     * here would mask a 1-frame hangover discrepancy the moment it hits,
-     * since `speech` re-arms hangover unconditionally on the speech
-     * branch). A leak in any of the three rejected calls above -- including
-     * a hangover off-by-one -- desyncs "attacked" from "clean" somewhere in
-     * this walk-down, even though both see exactly the same frames. */
+    /* Resume identical valid input on both, QUIET so the hangover counter walks down to 0
+     * instead of being re-armed every hop (a loud frame would mask a 1-frame hangover
+     * discrepancy). A leak in any rejected call above desyncs "attacked" from "clean". */
     for (int frame = 0; frame < 40; ++frame) {
         for (int i = 0; i < hop; ++i) {
             float v = 0.002f * sinf(phase);
@@ -408,24 +380,13 @@ static int test_rejected_calls_preserve_vad_state(void) {
     return 1;
 }
 
-/*
- * Static-memory pool coverage for the descriptor-tier composition layer
- * (Phase A.3): poison/bounds, descriptor-staleness rejection, and a
- * heap-vs-pool byte-equal run. Mirrors 4ch_aec_bf_nr_res/test_4aec_nr_res.c's
- * run_static_parity() -- same 0xa5 poison + EXTRA trailing-byte bounds check,
- * same 8-point descriptor mutation block (descriptor_version/layout_version/
- * backend_id/build_flags_hash/alignment/reserved/bytes/"stale layout despite
- * larger cached bytes"), same destroy-then-reinit pool-reuse check -- plus a
- * heap vs. pool side-by-side run across many synthetic hops comparing both
- * the mono output hop and every scalar field of AudioPipeline4ChFrameInfo.
- *
- * Deliberately does NOT scan the whole poisoned pool for "rejected calls
- * never touch it" (test_spatial_third_party.c's smaller SRP/BF pools do;
- * this composite pool can be several MB at 48 kHz/1024, and
- * test_4aec_nr_res.c's own run_static_parity() -- the direct precedent for
- * this descriptor tier -- likewise only checks the EXTRA trailing bytes
- * after the ACCEPTING init, not a full-pool scan around every rejection).
- */
+/* Static-memory pool coverage for the descriptor-tier composition layer: poison/bounds,
+ * descriptor-staleness rejection and a heap-vs-pool byte-equal run. Follows
+ * run_static_parity() in test_4aec_nr_res.c (0xa5 poison with a trailing-byte bounds
+ * check, the 8-point descriptor mutation block, destroy-then-reinit pool reuse) plus a
+ * heap vs. pool run over many hops comparing the mono output and every scalar field of
+ * AudioPipeline4ChFrameInfo. The composite pool can be several MB at 48 kHz/1024, so
+ * there is no full-pool scan around every rejection. */
 static int run_static_parity(int sample_rate, int fft_size) {
     enum { EXTRA = 32, FRAMES = 40 };
     AudioPipeline4ChConfig cfg =
@@ -620,12 +581,9 @@ static int run_static_parity(int sample_rate, int fft_size) {
     return 1;
 }
 
-/* CHECK() early-returns 0 from whichever function it is lexically inside.
- * All top-level assertions therefore run inside this helper (not directly in
- * main()) so a failure returns 0 here -- a value main() explicitly turns
- * into a nonzero process exit -- instead of returning 0 from main() itself,
- * which the C runtime reports to the shell as a SUCCESSFUL exit despite the
- * "FAIL: ..." line already printed to stderr. */
+/* CHECK() early-returns 0 from the function it is lexically inside, so all top-level
+ * assertions run in this helper; main() turns its 0 into a nonzero exit instead of
+ * reporting success. */
 /* ---------------------------------------------------------------------------
  * Post-beam stages carved by this wrapper: strength setters, sizing, and the
  * equivalence of the wrapper's chain with the reference chain written over the

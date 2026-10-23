@@ -1,15 +1,8 @@
-/* Align-ULCNet pre/post class. Contract: see ulcnet_prepost.h.
- *
- * This file OWNS no signal processing of its own. It composes the two
- * parity-tested translation units -- ulcnet_process.c (sqrt-Hann STFT/WOLA,
- * driven here in its one-frame-per-hop rolling form) and ulcnet_model_io.c
- * (feature front end, accelerator tensor
- * views, recurrent windows) -- and adds only the object lifecycle, the pool
- * carve and the per-hop frame state machine. Neither file's existing entry
- * points change, so both of their standalone parity builds keep linking.
- *
- * Constraint inherited from both: -ffp-contract=off. No heap in _init, no
- * globals, no stdio. */
+/* Align-ULCNet pre/post class (contract: ulcnet_prepost.h). Composes
+ * ulcnet_process.c (sqrt-Hann STFT/WOLA, one rolling frame per hop) and
+ * ulcnet_model_io.c (feature front end, tensor views, recurrent windows), and
+ * adds the object lifecycle, pool carve and per-hop frame state machine.
+ * Requires -ffp-contract=off. No heap in _init, no globals, no stdio. */
 
 #include "ulcnet_prepost.h"
 
@@ -27,12 +20,9 @@ struct UlcnetPrepost {
 
     int io_mode;
 
-    /* ULCNET_IO_TIME only; NULL in ULCNET_IO_FREQ.
-     *
-     * Both analyses are rolling (center 0) -- the plain one-frame-per-hop
-     * window, NOT the centered schedule -- see the header's FRAMING note.
-     * The three objects borrow the caller's FftHandle and window table and
-     * carry their own transform scratch (object-owned, never stack). */
+    /* ULCNET_IO_TIME only; NULL in ULCNET_IO_FREQ. Rolling (center 0) analyses
+     * and the synthesis state borrow the caller's FftHandle and window and carry
+     * their own transform scratch. */
     AcStft  *ana_err;
     AcStft  *ana_far;
     AcIstft *synth;
@@ -44,9 +34,7 @@ struct UlcnetPrepost {
     float *far_im;
     float *enh_re;      /* [ULCNET_BINS] commit staging */
     float *enh_im;
-    float *out_hop;     /* [ULCNET_HOP] the synthesis output; TIME only.
-                         * Zero from init/reset, then only ever written
-                         * wholesale by the synthesis. */
+    float *out_hop;     /* [ULCNET_HOP] synthesis output, TIME only; zero from init/reset, written wholesale */
 
     int frame_open;     /* a frame is pending the accelerator */
     int prepared;       /* frame_inputs() armed the accelerator transaction
@@ -58,11 +46,10 @@ struct UlcnetPrepost {
     void *heap_base;
 };
 
-/* ---- pool arithmetic ---------------------------------------------------
- * Alignment through ulcnet_model_io's exported helper (its region carries
- * its own alignment), addition through audiolib's saturating
- * ck_add_size: an overflow pins the cursor to SIZE_MAX, which
- * MEM_SIZE_INVALID catches. */
+/* ---- pool arithmetic ----
+ * Alignment via ulcnet_model_io's helper, addition via audiolib's saturating
+ * ck_add_size: overflow pins the cursor to SIZE_MAX, which MEM_SIZE_INVALID
+ * catches. */
 
 /* Reserve `bytes` at *cursor, aligned. Pass base==NULL to size only. */
 static int pp_carve(unsigned char *base, size_t *cursor, size_t bytes,
@@ -86,8 +73,8 @@ static uint32_t pp_fnv1a(uint32_t h, uint32_t v) {
     return h;
 }
 
-/* The build identity a pool is only valid for. io_mode is IN here because
- * the two modes carve different regions at the same total-size class. */
+/* Build identity a pool is valid for; io_mode is included because the two modes
+ * carve different regions. */
 static uint32_t pp_build_hash(int io_mode, int delay_depth, uint32_t layout) {
     uint32_t h = 2166136261u;
     h = pp_fnv1a(h, (uint32_t)ULCNET_SR);
@@ -99,8 +86,8 @@ static uint32_t pp_build_hash(int io_mode, int delay_depth, uint32_t layout) {
     return ac_memreq_abi_hash(h);
 }
 
-/* TIME requires the caller's handle and window in the config, so the
- * framing objects are sized exactly. */
+/* TIME needs the caller's handle and window in the config so the framing
+ * objects are sized exactly. */
 static int pp_framing_sizes(const UlcnetPrepostConfig *cfg, size_t *stft_bytes,
                             size_t *istft_bytes) {
     AcStftConfig sc;
@@ -110,9 +97,8 @@ static int pp_framing_sizes(const UlcnetPrepostConfig *cfg, size_t *stft_bytes,
     return (*stft_bytes != 0 && *istft_bytes != 0) ? 0 : -1;
 }
 
-/* Walk the layout once. base==NULL sizes it; base!=NULL also carves it.
- * get_mem_size and init MUST walk in this same order -- that is the whole
- * reason it is one function. */
+/* Walk the layout once: base==NULL sizes it, otherwise it also carves.
+ * get_mem_size and init share this walk so their order agrees. */
 static int pp_layout(UlcnetPrepost *p, unsigned char *base,
                      const UlcnetPrepostConfig *cfg,
                      const UlcnetModelIoDescriptor *descriptor,
@@ -201,8 +187,7 @@ static int pp_check_config(const UlcnetPrepostConfig *cfg) {
     if (cfg->delay_depth < ULCNET_MODEL_IO_MIN_D ||
         cfg->delay_depth > ULCNET_MODEL_IO_MAX_D) return -1;
     if (cfg->io_mode == ULCNET_IO_TIME) {
-        /* Reject-first: a handle of the wrong size would silently break the
-         * feature-time contract. */
+        /* Reject-first: a wrong-size handle would break the feature-time contract. */
         if (!cfg->fft || !cfg->window) return -1;
         if (fft_get_n_freqs(cfg->fft) != ULCNET_BINS) return -1;
     }
@@ -273,8 +258,7 @@ UlcnetPrepost *ulcnet_prepost_init_ex(void *pool, size_t bytes,
     if (ulcnet_model_io_get_mem_requirements(&descriptor, &io_req) != 0)
         return NULL;
 
-    /* Whole control region zeroed first, so a poisoned pool initialises
-     * identically to a zeroed one. */
+    /* Zero the whole control region first so a poisoned pool initialises like a zeroed one. */
     memset(pool, 0, (size_t)req.bytes);
     p = (UlcnetPrepost *)pool;
     p->io_mode = cfg->io_mode;
@@ -318,8 +302,7 @@ void ulcnet_prepost_destroy(UlcnetPrepost *p) {
     void *base;
     if (!p) return;
     base = p->heap_base;
-    p->heap_base = NULL;   /* a pool instance owns nothing to free and
-                            * stays usable: repeat calls on it are no-ops */
+    p->heap_base = NULL;   /* nothing to free for a pool instance; repeat calls are no-ops */
     if (base) free(base);
 }
 
@@ -372,10 +355,8 @@ int ulcnet_prepost_pre_process(UlcnetPrepost *p,
     if (p->io_mode != ULCNET_IO_TIME) return -1;
     if (p->frame_open) return -1;   /* previous frame neither committed nor skipped */
 
-    /* center=False rolling analysis, one frame per hop from the very first
-     * hop (see ulcnet_process.h). Both streams are transformed from the
-     * SAME hop index -- this class applies no internal skew -- so they
-     * cannot desynchronise. */
+    /* center=False rolling analysis, one frame per hop from the first hop; both
+     * streams use the same hop index (no internal skew). */
     (void)ac_stft_push_planar(p->ana_err, err_hop, p->err_re, p->err_im);
     (void)ac_stft_push_planar(p->ana_far, far_hop, p->far_re, p->far_im);
 
@@ -407,9 +388,7 @@ int ulcnet_prepost_frame_inputs(UlcnetPrepost *p,
                                 UlcnetModelIoInputs *inputs,
                                 UlcnetModelIoOutputs *outputs) {
     if (!p || !inputs || !outputs || !p->frame_open) return -1;
-    /* Arms the transaction and NaN-fills the `output` mask, so a caller
-     * that asks twice still gets a clean one rather than a half-written
-     * one. */
+    /* Arms the transaction and NaN-fills the `output` mask, so a repeated request still gets a clean one. */
     if (ulcnet_model_io_prepare(p->io, p->err_re, p->err_im,
                                 p->far_re, p->far_im, inputs, outputs) != 0)
         return -1;
@@ -417,13 +396,9 @@ int ulcnet_prepost_frame_inputs(UlcnetPrepost *p,
     return 0;
 }
 
-/* Push the finished frame through the synthesis (TIME) or stage it (FREQ)
- * and close it. Cannot fail: the synthesis only ever reports 0 samples (the
- * very first frame, whose block lies inside the trimmed half window) or a
- * full ULCNET_HOP, and never reads `out`. So the only fallible step of a
- * commit is the validation that precedes this, so a failed commit leaves the
- * framing and synthesis state untouched structurally rather than by
- * argument. */
+/* Push the finished frame through the synthesis (TIME) or stage it (FREQ) and
+ * close it. Cannot fail: the synthesis reports 0 samples (first frame) or a full
+ * ULCNET_HOP, so a failed commit leaves framing and synthesis state untouched. */
 static void pp_close_frame(UlcnetPrepost *p) {
     p->frame_open = 0;
     p->prepared = 0;
@@ -434,15 +409,13 @@ static void pp_close_frame(UlcnetPrepost *p) {
 }
 
 int ulcnet_prepost_frame_commit(UlcnetPrepost *p) {
-    /* `prepared` implies frame_open. It is the class's OWN latch, not
-     * model_io's: a frame_skip() leaves model_io's transaction armed with
-     * stale outputs, and on model_io's flag alone the next frame's commit
-     * would accept them with no frame_inputs() behind it. */
+    /* `prepared` is this class's own latch: after frame_skip() model_io's
+     * transaction stays armed with stale outputs, so its flag alone would let the
+     * next commit accept them without frame_inputs(). */
     if (!p || !p->prepared) return -1;
     if (ulcnet_model_io_commit(p->io, p->enh_re, p->enh_im) != 0) {
-        /* model_io already discarded the transaction and restarted its
-         * recurrent state. The frame stays open so the caller can take the
-         * identity with frame_skip(), or re-arm with frame_inputs(). */
+        /* model_io discarded the transaction and restarted the recurrent state;
+         * the frame stays open for frame_skip() or a fresh frame_inputs(). */
         p->prepared = 0;
         return -1;
     }
@@ -453,9 +426,7 @@ int ulcnet_prepost_frame_commit(UlcnetPrepost *p) {
 int ulcnet_prepost_frame_skip(UlcnetPrepost *p) {
     const size_t bins = (size_t)ULCNET_BINS * sizeof(float);
     if (!p || !p->frame_open) return -1;
-    /* Identity: the error spectrum passes through. The armed transaction is
-     * simply not committed; the next prepare() re-arms it and re-fills the
-     * NaN-checked mask. */
+    /* Identity: the error spectrum passes through; the armed transaction is not committed. */
     memcpy(p->enh_re, p->err_re, bins);
     memcpy(p->enh_im, p->err_im, bins);
     pp_close_frame(p);
@@ -467,9 +438,8 @@ int ulcnet_prepost_post_process(UlcnetPrepost *p,
     if (!p || !out_hop) return -1;
     if (p->io_mode != ULCNET_IO_TIME) return -1;
     if (p->frame_open) return -1;   /* a frame is still awaiting the model */
-    /* Always a full, defined hop: out_hop is zero from init/reset and the
-     * synthesis only ever writes it wholesale, so the one warm-up frame that
-     * emits nothing hands over silence, never stale samples. */
+    /* Always a full defined hop: out_hop is zero from init/reset and written
+     * wholesale, so the warm-up frame yields silence. */
     memcpy(out_hop, p->out_hop, (size_t)ULCNET_HOP * sizeof(float));
     if (written) *written = p->written;
     return 0;

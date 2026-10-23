@@ -1,51 +1,41 @@
-"""Measure the steady-state feature distribution and emit calibrated init values.
+"""Measure the steady-state feature distribution and emit calibrated init
+values.
 
 WHY THIS EXISTS
 ---------------
-The four normaliser init constants in ``config.ini`` --
-``erb_norm_init_lo_db`` / ``erb_norm_init_hi_db`` / ``spec_norm_init_lo`` /
-``spec_norm_init_hi`` -- were imported verbatim from DeepFilterNet's libDF.
-They are calibrated for libDF's analysis chain, which aggregates each ERB band
-as an energy MEAN (``k = 1/band_size``, rectangular and non-overlapping).  This
-port instead uses a triangular, overlapping, partition-of-unity filterbank whose
-band value is a weighted SUM, so its band energy grows with band width -- by
-0 dB at the narrowest bands and over 13 dB at the widest.  The imported
-constants therefore start the EMA in the wrong place, by a band-dependent
-amount.
-
-Normally that would wash out: ``band_mean_norm_erb`` keeps a per-band running
-mean, so a constant offset is absorbed once the EMA converges.  It does not wash
-out here.  With ``tau = 1 s`` against 3-second training segments, 3*tau equals
-the whole segment: the normaliser is still converging when the example ends, so
-every frame the model ever sees is in the init-dominated transient.
-
-Since the filterbank is fixed (it is correct as designed) and the segment length
-is fixed (the corpus is already generated), calibrating the init values is the
-only remaining lever -- and if ``init`` equals the steady state, there is no
-transient at all regardless of tau.
+The four normaliser init constants in ``config.ini`` (``erb_norm_init_lo_db`` /
+``erb_norm_init_hi_db`` / ``spec_norm_init_lo`` / ``spec_norm_init_hi``) are
+libDF's, calibrated for an energy-MEAN, rectangular, non-overlapping ERB
+aggregation. This port uses a triangular, overlapping, partition-of-unity
+filterbank whose band value is a weighted SUM, so band energy grows with band
+width (0 dB at the narrowest bands, over 13 dB at the widest) and the imported
+constants start the EMA in the wrong place by a band-dependent amount. That
+would normally wash out as the EMA converges, but with ``tau = 1 s`` against
+3-second training segments 3*tau equals the whole segment, so every frame the
+model sees is in the init-dominated transient. Calibrating the init values is the
+remaining lever: if ``init`` equals the steady state there is no transient at all
+regardless of tau.
 
 METHOD
 ------
 ``init_lo``/``init_hi`` are the two ends of a ``linspace`` across FREQUENCY, so
-they are fitted along that axis: take the per-band (per-bin) MEAN -- the
-quantity the EMA actually converges to -- then least-squares a line through it
-against the band index and read off both ends.  The RMS residual is printed so
-you can see how much of the profile a 2-parameter ramp simply cannot express.
+they are fitted along that axis: take the per-band (per-bin) MEAN (what the EMA
+converges to), least-squares a line through it against the band index and read
+off both ends; the RMS residual shows how much a 2-parameter ramp cannot express.
+Measured on the training split only (calibrating on held-out clips would bake the
+validation set into the init).
 
-Measured on the training split only; calibrating on held-out clips would bake
-the validation set into a constant the model starts from.
-
-⚠ These values are specific to THIS project's grid and filterbank.  The
-DeepFilterNet2 directory runs a different sample rate, FFT size, band count and
-ERB matrix, so it needs its own calibration -- do not copy numbers between them.
+⚠ These values are specific to THIS project's grid and filterbank; the
+DeepFilterNet2 directory has its own sample rate, FFT size, band count and ERB
+matrix, so do not copy numbers between them.
 
 USAGE
 -----
     python calibrate_norm_init.py --config config.ini --packed-dir /path/to/packed.pt
 
 Run it on the machine that holds the packed corpus, against the SAME corpus the
-models will train on.  It prints the measured distribution and the config lines
-to paste back.  It does not modify anything.
+models will train on. It prints the measured distribution and the config lines
+to paste back, and modifies nothing.
 """
 
 import argparse

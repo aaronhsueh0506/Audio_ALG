@@ -1,15 +1,7 @@
-/**
- * 4aec_projection_kernels.h — scalar/NEON kernels used by post-beam context
- * projection.
- *
- * four_aec_projection_cmac/_scalar below are thin aliases over
- * utility/simd_kernels.h's sk_cmac_f32/sk_cmac_f32_scalar (pure move, same
- * bodies, same unfused multiply/subtract/add operation sequence under
- * -ffp-contract=off -- unlike the AEC filter's fmaf-based complex MAC,
- * sk_cmac_fma_f32_scalar). Kept under these local names, same pattern as
- * four_aec_complex_mag2 below, because 4aec_nr_res.c and
- * tests/test_4aec_nr_res.c call them directly by name.
- */
+/** Scalar/NEON kernels used by post-beam context projection.
+ * four_aec_projection_cmac/_scalar are aliases of utility/simd_kernels.h's
+ * sk_cmac_f32/sk_cmac_f32_scalar: the same unfused multiply/subtract/add sequence under
+ * -ffp-contract=off (unlike the AEC filter's fmaf-based sk_cmac_fma_f32_scalar). */
 #ifndef FOUR_AEC_PROJECTION_KERNELS_H
 #define FOUR_AEC_PROJECTION_KERNELS_H
 
@@ -28,12 +20,8 @@ static inline void four_aec_projection_cmac(
     sk_cmac_f32(acc, weights, input, n);
 }
 
-/* out[i] = input[i].r^2 + input[i].i^2, no epsilon: sk_cmag_f32/_scalar of
- * utility/simd_kernels.h is the same squared magnitude with an eps term
- * added last; eps=0.0f is bit-exact here because the sum of two squares is
- * always >= +0.0 (never -0.0), and IEEE754 addition of +0.0 to a value
- * >= +0.0 does not change its bit pattern (inf/NaN propagate unchanged
- * too). */
+/* out[i] = input[i].r^2 + input[i].i^2 with no epsilon (the sum of two squares is
+ * never -0.0, so adding eps = 0 leaves sk_cmag_f32's result unchanged). */
 static inline void four_aec_complex_mag2_scalar(
     float* out, const Complex* input, int n) {
     sk_cmag_f32_scalar(out, input, n, 0.0f);
@@ -44,34 +32,8 @@ static inline void four_aec_complex_mag2(
     sk_cmag_f32(out, input, n, 0.0f);
 }
 
-/* Rebuild the residual-echo PSD as a complex vector carrying the echo
- * estimate's PHASE and the residual's MAGNITUDE:
- *
- *     |out[i]|^2 == max(r2[i], 0)
- *
- * That identity is the kernel's whole contract -- echo supplies direction
- * only, and its magnitude divides out. The Python reference spells it as
- * sqrt(r2) * exp(1j * angle(echo)); the ratio form here is the same thing
- * without atan2/sincos EXCEPT on the phase floor, which only this side has:
- * for 0 < |echo|^2 <= phase_floor2 (the mic-path HPF routinely puts the DC
- * bin there) C pins the result to the +real axis while Python follows
- * np.angle. That divergence is independent of the range handling below.
- *
- * There is deliberately no fixed upper bound on `scale`. r2 arrives
- * int16^2-scaled (aec.h) while echo_spec is audio-scaled, so
- * sqrt(r2/|echo|^2) carries a factor of 32768 unrelated to residual gain. A
- * bound would make |out| smaller than sqrt(r2) and understate residual echo.
- * The phase floor handles estimates without useful phase; the overflow
- * fallback below preserves the same magnitude contract for every finite
- * float32 input.
- *
- * Neither overflow mode announces itself. power/|echo|^2 saturating yields
- * inf and poisons every downstream stage; |echo|^2 saturating yields
- * sqrt(power/inf) == 0, reporting NO residual echo on that bin and quietly
- * stopping the suppressor -- the same class of failure as bounding `scale`,
- * just further out. The exceptional path below normalizes the phase vector
- * before applying the magnitude, which is the reference formulation and
- * cannot form the overflowing intermediate at all. */
+/* Rebuilds the residual-echo PSD as a complex vector with the echo estimate's phase and the residual's magnitude: |out[i]|^2 == max(r2[i], 0). Python reference: 4ch_aec_bf_nr_res/pipeline.py:_fuse_contexts (sqrt(r2) * exp(1j * echo_phase)); the ratio form avoids atan2/sincos, and for 0 < |echo|^2 <= phase_floor2 (e.g. the DC bin after the mic HPF) the result is pinned to the +real axis.
+ * `scale` has no upper bound: r2 is int16^2-scaled while echo_spec is audio-scaled, so sqrt(r2/|echo|^2) legitimately carries a factor of 32768. Overflow modes: power/|echo|^2 saturating gives inf, and |echo|^2 saturating gives 0 (no residual echo reported). The exceptional path normalises the phase vector first, so no intermediate leaves float32 range. */
 static inline Complex four_aec_residual_sample(
     float er, float ei, float raw_r2) {
     const float phase_floor2 = 1.0e-12f; /* (1e-6)^2 */
@@ -86,8 +48,7 @@ static inline Complex four_aec_residual_sample(
         return out;
     }
 
-    /* mag2 > phase_floor2 > 0, so the ratio is never 0/0 and can be formed
-     * unconditionally; only its range is in question. */
+    /* mag2 > phase_floor2 > 0, so the ratio is never 0/0; only its range is in question. */
     ratio = power / mag2;
     if (isfinite(mag2) && isfinite(ratio)) {
         scale = sqrtf(ratio);
@@ -96,10 +57,8 @@ static inline Complex four_aec_residual_sample(
         return out;
     }
 
-    /* Exceptional path: scale the phase vector down before combining, so no
-     * intermediate ever leaves float32 range. Dividing by the larger
-     * component puts the sum of squares in [1, 2], which is why a plain
-     * sqrt suffices here where the direct form overflowed. */
+    /* Exceptional path: divide by the larger component first (sum of squares in [1, 2]),
+     * so a plain sqrt suffices. */
     axis = fmaxf(fabsf(er), fabsf(ei));
     unit_r = er / axis;
     unit_i = ei / axis;
@@ -121,10 +80,8 @@ static inline void four_aec_residual_vector_scalar(
 #if SK_HAVE_NEON
 static inline void four_aec_residual_vector(
     Complex* out, const Complex* echo, const float* r2, int n) {
-    /* Must match four_aec_residual_sample's phase_floor2 exactly -- see that
-     * function's comment for why -- so SIMD=1 and SIMD=0 stay byte-identical
-     * for finite inputs, per this header's own documented invariant. Neither
-     * form bounds `scale`; that comment says why. */
+    /* Must match four_aec_residual_sample's phase_floor2 so the SIMD and scalar forms
+     * agree for finite inputs. */
     const float phase_floor2 = 1.0e-12f;
     int i = 0;
     for (; i + 4 <= n; i += 4) {
@@ -148,20 +105,11 @@ static inline void four_aec_residual_vector(
             has_phase, vmulq_f32(e.val[1], scale), zero);
         sk__cquad_store(out + i, residual);
 
-        /* Both overflow modes are visible in values this block already holds,
-         * so detecting them costs no arithmetic: |echo|^2 saturating shows up
-         * in mag2, and power/|echo|^2 saturating shows up as an infinite
-         * scale. Both terms are needed -- the first mode degrades scale to a
-         * perfectly finite zero. Recomputing the test in scalar instead would
-         * make the repair decision depend on the vector and scalar forms
-         * agreeing bit-for-bit, and would have to re-read echo after the
-         * store just above, which is what would forbid an in-place call.
-         *
-         * The reduction is false on every hop of real audio, leaving the
-         * vectorized path exactly as it was. When it does trip, all four
-         * lanes go back through the scalar form: for a lane that did not
-         * overflow it reproduces the stored bytes, which is the same
-         * SIMD/scalar identity the tests already assert. */
+        /* Both overflow modes are visible in values already held (mag2 saturating, scale
+         * infinite or degraded to zero), so detection costs no arithmetic and keeps an
+         * in-place call legal. The test is false on real audio; when it trips, all four lanes
+         * go back through the scalar form, which reproduces the stored bytes for lanes that did
+         * not overflow. */
         {
             const float32x4_t huge = vdupq_n_f32(FLT_MAX);
             uint32x4_t overflowed = vandq_u32(
@@ -229,16 +177,10 @@ static inline void four_aec_comfort_accumulate(
 }
 #endif
 
-/* Weight-matrix gate: 1 when every component is finite and the sequential sum
- * of |re| + |im| is finite and above 1e-12, else 0.
- *
- * The vector screen answers the common case without forming the sum: with
- * every term finite and at most 2^100 and fewer than 2^24 of them, the
- * sequential sum cannot overflow, and it is at least its largest term (a sum
- * of non-negative floats never falls below an addend), so one term above 1e-12
- * decides the gate. Any other input -- a non-finite component, a larger
- * term, only small terms -- runs the sequential loop, so the result equals
- * the scalar twin's for every input. */
+/* Weight-matrix gate: 1 when every component is finite and the sequential sum of
+ * |re| + |im| is finite and above 1e-12, else 0. The vector screen decides the common
+ * case without the sum (terms <= 2^100 and fewer than 2^24 of them cannot overflow,
+ * and one term above 1e-12 decides); any other input runs the sequential loop. */
 static inline int four_aec_weights_valid_scalar(
     const Complex* weights, size_t count) {
     size_t i;

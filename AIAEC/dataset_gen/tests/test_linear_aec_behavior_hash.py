@@ -1,26 +1,15 @@
 """The AEC behaviour hash must be stable across CPython versions.
 
-Why this file exists: the first implementation used ``ast.dump()``. Python 3.13
-changed ``ast.dump`` to omit fields equal to their default, so the SAME 48
-signal-path source files digested to ``89b866cd`` under 3.9 and ``402acc1a``
-under 3.14 with no code difference whatsoever. That is not a cosmetic problem.
-The behaviour hash is the compatibility gate: a dataset generated under one
-interpreter would have been refused by training under another, and a trained
-checkpoint would have been unloadable by an interpreter upgrade alone -- a
-failure no rematerialization can repair.
+``ast.dump()`` omits fields equal to their default from Python 3.13, so the
+same sources would digest differently under 3.9 and 3.14 and a dataset or
+checkpoint would be refused by an interpreter upgrade alone. Two properties are
+pinned, and both are needed:
 
-Two independent properties are pinned here, and both are needed:
-
-  * STABILITY -- the same sources hash the same under every interpreter on the
-    machine. Tested against the real corpus, in subprocesses.
-  * SENSITIVITY -- a real code change still changes the hash. A canonicalizer
-    that returned a constant would be perfectly stable and completely useless,
-    so stability is only meaningful next to a mutation test.
-
-The stability test also runs a CONTROL that reproduces plain ``ast.dump``
-behaviour under the same interpreters and asserts it DISAGREES. Without that,
-the test would pass vacuously on a machine with only one Python installed, and
-would keep passing if the canonicalizer were quietly reverted.
+  * STABILITY: the same sources hash the same under every interpreter on the
+    machine (real sources, in subprocesses), with a CONTROL reproducing plain
+    ``ast.dump`` that must DISAGREE so the test cannot pass vacuously.
+  * SENSITIVITY: a real code change still changes the hash (a constant would be
+    perfectly stable and useless).
 """
 
 import ast

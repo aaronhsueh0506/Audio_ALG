@@ -1,9 +1,8 @@
 # AINR dataset_gen
 
 Model-independent generator for (noisy, clean) speech-enhancement training
-pairs, living at `AINR/dataset_gen/`. Extracted from the RNNoise-ERB
-dataset-generation chain so one generator can serve multiple models:
-RNNoise-ERB/GTCRN at 16 kHz and DeepFilterNet2 at 48 kHz.
+pairs, living at `AINR/dataset_gen/`. One generator serves multiple models:
+RNNoise-ERB/GTCRN at 16 kHz and DeepFilterNet2/DeepFilterNet3 at 48 kHz.
 
 ## Purpose
 
@@ -46,26 +45,16 @@ python3 gen_dataset.py --config config.ini --output data_48k --hours 25 \
     --sample-rate 48000
 ```
 
-⚠ **`pack_dataset.py --target-sr` does NOT exactly preserve level/SNR** —
-do not treat a 48 kHz→16 kHz downsample-at-pack-time as a standard way to
-produce a second rate's training data when SNR/level fidelity matters. The
-level normalization (and the requested SNR mix) happens at generation time,
-against the SOURCE rate's spectrum; a later resample only re-shapes the
-already-mixed signal, it does not re-mix to the new rate's requested SNR.
-For narrowband content this can drift by tens of dB — an extreme but legal
-config (1 kHz speech mixed against 12 kHz noise at a requested ~0 dB SNR)
-measures ~48.6 dB after a 48 k→16 k downsample, because the noise energy
-above the new 8 kHz Nyquist is simply gone. Real corpus content typically
-drifts far less (most speech/noise energy sits well below either Nyquist),
-but "typically less" is not a contract `pack_dataset.py --target-sr` can
-promise — only re-mixing speech/noise stems natively at the target rate can
-guarantee the requested SNR exactly. `pack_dataset.py`'s packed payload now
-records `effective_rms_dbfs` (measured AFTER any `--target-sr` resample AND
-after casting to the packed `dtype` — i.e. on the exact bytes stored in
-`data`, not the higher-precision tensor before either step — per sample,
-per channel) precisely so a consumer can audit this drift on its own
-packed data rather than trusting generation-time metadata that describes a
-different rate.
+⚠ **`pack_dataset.py --target-sr` does NOT exactly preserve level/SNR.** The
+level normalization and the requested SNR mix happen at generation time, against
+the SOURCE rate's spectrum; a later resample only re-shapes the already-mixed
+signal, so for narrowband content (for example noise energy above the new
+Nyquist) the SNR can drift by tens of dB. Real corpus content typically drifts
+far less, but only re-mixing speech/noise stems natively at the target rate
+guarantees the requested SNR. `pack_dataset.py`'s packed payload records
+`effective_rms_dbfs` (measured after any `--target-sr` resample and after casting
+to the packed `dtype`, per sample, per channel) so a consumer can audit this
+drift on its own packed data.
 
 Downsampling at pack time remains a supported, useful SHORTCUT when you
 specifically do not need exact fidelity — e.g. a quick 16 kHz smoke-test
@@ -193,9 +182,7 @@ p_speech_onset = 0.15
 `RemoveDC` subtracts the segment mean on speech only. `LFilt` is independently
 sampled for speech and every real noise lane; generated colored-noise lanes
 already have a sampled spectral slope and, like upstream, return before LFilt.
-The previous 50% biquad setting (up to three ±15 dB sections) is disabled: it
-was substantially stronger than the actual DeepFilterNet production setting
-and unnecessarily broadened the feature-normalizer distribution.
+Biquad EQ is off by default (`p_biquad = 0.0`).
 
 Independently, 15% of samples containing speech delay that speech by 0.5--2.0
 seconds inside the fixed-length segment. Mixed-sample noise continues from
@@ -238,9 +225,8 @@ also touched the signal after the level scale was applied.
 
 ### Clipping distortion: two independent knobs
 
-The single `p_clipping` knob was split into a pre-mix and a post-mix
-probability, aligned with how DeepFilterNet3 actually behaves (not just its
-config surface — see the comment in `config.example.ini`):
+Clipping has a pre-mix and a post-mix probability, aligned with how
+DeepFilterNet3 actually behaves (see the comment in `config.example.ini`):
 
 ```ini
 [augmentation]
@@ -309,36 +295,18 @@ audio a consumer actually trains on is `pack_dataset.py`'s own
 
 ### Where the working rate comes from
 
-There is **no separate "generate at X Hz" setting**
-— the working rate is `config.ini`'s
-`[signal] sr` key, read once in `DNS4Dataset.__init__` (`dataset.py`):
-
-```python
-self.sr = cfg.getint('signal', 'sr')
-```
-
-`self.sr` then drives *everything*: segment length in samples
-(`segment_samples = segment_sec * sr`), the target rate every speech / noise
-/ RIR file is resampled to on load (`_load_and_crop`, `_load_noise`,
-`_load_rir` all call `torchaudio.functional.resample(audio, orig_sr, self.sr)`
-whenever a source file's native rate differs), STFT parameters, and ERB band
-edges. The **source corpus itself has no fixed rate** — DNS4 speech/noise/RIR
-files are typically 48 kHz already but are not required to be; whatever rate
-they're at gets resampled to `self.sr` on load, so `self.sr` is the *sole*
-place the working rate is pinned. `config.ini` ships `sr = 16000`;
-nothing about the augmentation logic requires that rate. The command line
-can set it explicitly:
-
-- `gen_dataset.py --sample-rate` overrides config.ini's `[signal] sr`.
-- Omitting the CLI flag genuinely uses the config value.
-- `config.example.ini` uses 48000 as its example; change it to 16000 or pass
-  `--sample-rate 16000` for RNNoise-ERB/GTCRN.
+There is **no separate "generate at X Hz" setting**: the working rate is
+`config.ini`'s `[signal] sr` key, read once in `DNS4Dataset.__init__`
+(`self.sr = cfg.getint('signal', 'sr')`). It drives the segment length in
+samples, the rate every speech / noise / RIR file is resampled to on load
+(whatever its native rate), the STFT parameters and the ERB band edges.
+`gen_dataset.py --sample-rate` overrides it; omitting the flag uses the config
+value. `config.example.ini` uses 48000 as its example; change it to 16000 or
+pass `--sample-rate 16000` for RNNoise-ERB/GTCRN.
 
 `DNS4Dataset._compute_erb_bands` has no dependency on a model repo's
 `train.py`: `compute_hybrid_bands`, `compute_erb_bands` and their
-`erb_rate`/`erb_inv` helpers are pure NumPy math kept in `dataset.py`. Everything
-else in `dataset.py` is sample-rate-parameterized as well (no hardcoded
-16000/48000 anywhere in the augmentation logic itself).
+`erb_rate`/`erb_inv` helpers are pure NumPy math kept in `dataset.py`.
 
 ## Files
 
@@ -383,9 +351,8 @@ data_16k/ or data_48k/
 Each WAV is 2-channel: ch0=noisy, ch1=clean, written atomically (temp-file +
 rename). **That is the whole on-disk format** — no `meta.json`, no per-sample
 JSON sidecar, no contract version. A directory of `NNNNNN.wav` is the corpus,
-so one stays packable after being copied, resampled or trimmed by hand, and a
-corpus generated by the older sidecar-writing version packs unchanged (its
-leftover JSON is simply ignored, not read and not an error).
+so one stays packable after being copied, resampled or trimmed by hand (a
+leftover `NNNNNN.json` sidecar is ignored, not read and not an error).
 
 Run BOTH commands above — one native generation per target rate is the
 recommended path (see the design section above for why downsampling at
@@ -418,7 +385,7 @@ duration by less than one segment. It is not rounded to a complete
 `--resume` continues from the highest `NNNNNN.wav` in `pairs/`. Every WAV is
 written to `tmp.NNNNNN.wav` and renamed into place, so **a visible file is a
 finished file** — a process killed mid-write leaves a `tmp.` file that no scan
-here or in `pack_dataset.py` ever matches. That rename is now the only
+here or in `pack_dataset.py` ever matches. That rename is the only
 completion marker a sample has, which is why nothing may ever write directly
 to the final path.
 
@@ -480,7 +447,7 @@ default; pass `--overwrite` to replace its `shard_*.pt` only after the new set
 has serialized successfully. Because the shared loader reads every `.pt` in a
 directory, shard output also refuses unrelated `.pt` files in that directory.
 
-Omit `--shard-clips` to retain the previous single-file form, for example
+Omit `--shard-clips` for a single-file output, for example
 `--output data_48k/packed.pt`. Omitting `--target-sr` packs at
 the source WAVs' own rate and requires every input file to already share one
 native rate. `--target-sr` resamples everything to one output rate, so mixed
@@ -490,8 +457,7 @@ native rates are accepted in that mode.
 required, and nothing else is read. A stray `tmp.NNNNNN.wav` (an
 in-progress/crashed write, see "Resuming" above) and any WAV whose name is not
 all digits are both ignored, not errors. Leftover `NNNNNN.json` sidecars or a
-`meta.json` from an older corpus are ignored too, which is what lets existing
-data be packed without regenerating it.
+`meta.json` are ignored too.
 
 What still stops a pack, because it is checkable from the audio itself:
 

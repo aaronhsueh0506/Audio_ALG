@@ -3,10 +3,10 @@
 Offline pre-generation of training data (WAV pair mode).
 Saves augmented (noisy, clean) WAV pairs for flexible downstream use.
 
-This is the standalone, model-independent dataset generator (AINR).
-Choose one generation sample rate per run through config.ini's `[signal] sr`
-or `--sample-rate`. Use 16 kHz for RNNoise-ERB/GTCRN and 48 kHz for
-DeepFilterNet2. See README.md.
+This is the standalone, model-independent dataset generator (AINR). Choose one
+generation sample rate per run through config.ini's `[signal] sr` or
+`--sample-rate`: 16 kHz for RNNoise-ERB/GTCRN, 48 kHz for DeepFilterNet2. See
+README.md.
 
 Output is WAV and nothing else:
 
@@ -14,10 +14,9 @@ Output is WAV and nothing else:
     <output>/pairs/000001.wav
     ...
 
-No meta.json, no per-sample JSON sidecar. pack_dataset.py packs whatever
+There is no meta.json or per-sample sidecar: pack_dataset.py packs whatever
 `NNNNNN.wav` files it finds, so a directory stays packable after being copied,
-resampled or trimmed by hand. See the note above DatasetContractError for what
-that costs and what it does not.
+resampled or trimmed by hand (see the note above DatasetContractError).
 
 Usage:
     python3 gen_dataset.py --config config.ini --output data/ --hours 25
@@ -27,10 +26,8 @@ Usage:
     python3 gen_dataset.py --config config.ini --output data_48k/ --hours 25 \
         --sample-rate 48000
 
-Training:
-    Training scripts (e.g. RNNoise-ERB's train.py) live in their model
-    directories and consume packed copies of the WAV pairs produced here.
-    They are NOT part of this package.
+Training scripts (e.g. RNNoise-ERB's train.py) live in their model directories
+and consume packed copies of the WAV pairs produced here.
 """
 
 import argparse
@@ -56,26 +53,13 @@ except ImportError:
 
 
 # The batch is exactly what is in pairs/: `NNNNNN.wav`, one 2-channel file per
-# sample, and nothing else. There is no meta.json, no per-sample JSON sidecar
-# and no contract version -- a directory of WAVs is the whole contract, so a
-# batch stays packable after being copied, resampled, filtered by hand, or
-# produced by something other than this script.
-#
-# What that costs, stated plainly:
-#   * A config.ini/--sample-rate edit between two --resume runs is not
-#     detected -- nothing records which config produced which sample, so two
-#     distributions can be mixed into one directory with no error. Resume into
-#     a directory only with the config that started it.
-#   * The generation seed is printed, not persisted, so a batch is not
-#     self-describing enough to reproduce.
-# What survives without any JSON, because it never depended on one:
-#   * A visible `NNNNNN.wav` is always complete -- every write goes to
-#     `tmp.NNNNNN.wav` first and is renamed into place (see _save_pair_atomic),
-#     and a `tmp.` file is invisible to every scan here. The sidecar's real
-#     structural job was to mark a sample finished; the atomic rename already
-#     does that.
-#   * pack_dataset.py still re-checks channel count, length, sample rate and
-#     finiteness on every file it packs.
+# sample, and nothing else (no sidecar, no contract version), so a batch stays
+# packable after being copied, resampled, filtered by hand or produced by
+# something other than this script. What still holds: a visible `NNNNNN.wav` is
+# always complete (every write goes to `tmp.NNNNNN.wav` and is renamed into
+# place, see _save_pair_atomic; a `tmp.` file is invisible to every scan), and
+# pack_dataset.py re-checks channel count, length, sample rate and finiteness
+# on every file it packs.
 
 
 class DatasetContractError(RuntimeError):
@@ -89,16 +73,12 @@ def _sample_wav_path(pairs_dir, index):
 
 def _tmp_path(final_path):
     """Same-directory temp path for `final_path`, named `tmp.<basename>`
-    (prefix, not suffix). Two things need this exact shape:
-      1. torchaudio's soundfile backend infers the save format from the
-         LAST '.'-separated segment of a string path and ignores its own
-         `format=` kwarg in that case (a soundfile-backend quirk) -- so the
-         temp path must still literally END in '.wav' for _save_pair_atomic
-         to work at all; a '.wav.tmp' suffix breaks that.
-      2. _list_sample_indices()'s glob-based scan must never mistake a
-         temp/in-progress file for a real sample: `tmp.NNNNNN.wav`'s
-         os.path.splitext() stem is `tmp.NNNNNN` (not all-digit), so it is
-         correctly excluded, same as a '*.wav.tmp' suffix would have been.
+    (prefix, not suffix).
+
+    torchaudio's soundfile backend infers the save format from the LAST
+    '.'-separated segment of a string path, so the temp path must still END in
+    '.wav'; and `tmp.NNNNNN.wav`'s stem `tmp.NNNNNN` is not all-digit, so
+    _list_sample_indices() never mistakes it for a real sample.
     """
     d = os.path.dirname(final_path)
     b = os.path.basename(final_path)
@@ -284,15 +264,11 @@ def gen_dataset(args):
         done = sample_count - base_idx
     else:
         # A non-empty pairs_dir without --resume must never be silently
-        # extended or partially overwritten: forgetting --resume and
-        # generating a smaller batch with a DIFFERENT config into an
-        # existing directory would overwrite only the low indices and leave
-        # a stale tail from the other config behind, and nothing downstream
-        # can detect that. --start-idx remains available, but only for a
-        # genuinely fresh/empty --output directory (e.g. numbering a new
-        # shard so it cannot collide with a DIFFERENT, unrelated batch
-        # elsewhere) -- extending THIS directory's own batch must go
-        # through --resume --hours <new TOTAL, not an increment>.
+        # extended or partially overwritten: a smaller batch with a DIFFERENT
+        # config would overwrite only the low indices and leave a stale tail
+        # nothing can detect. --start-idx stays available only for a
+        # fresh/empty --output directory; extending THIS directory's own batch
+        # goes through --resume --hours <new TOTAL, not an increment>.
         if _list_sample_indices(pairs_dir):
             raise DatasetContractError(
                 f"refused: {pairs_dir} already contains sample file(s) but "

@@ -34,9 +34,8 @@ def assets():
 def test_dfn2_modules_are_dfn2s_even_after_a_sibling_project_imported_first(monkeypatch):
     """AIAEC and the other AINR projects each define a top-level ``train``,
     ``model`` and ``export_onnx``; once a sibling's is in ``sys.modules`` a
-    bare import hands it back, and the whole stage then fails at setup. The
-    per-package run never sees that (the DFN2 modules are imported first),
-    the combined run does."""
+    bare import hands it back and the stage fails at setup (seen only in a
+    combined run)."""
     for name in stage_mod._AINR_BARE_NAMES:
         monkeypatch.setitem(sys.modules, name, types.ModuleType(name))   # a sibling's, attribute-free
     monkeypatch.setattr(stage_mod, '_DFN2_MODULES', None)

@@ -1,13 +1,13 @@
 """Align-CRUSE reproduction for direct neural AEC (including RES).
 
-Paper: Indenbom et al., "Deep model with built-in cross-attention alignment
-for acoustic echo cancellation", arXiv:2208.11308.
+Paper: Indenbom et al., "Deep model with built-in cross-attention alignment for
+acoustic echo cancellation", arXiv:2208.11308.
 
-The model consumes unaligned microphone/reference complex spectra.  It emits a
-real magnitude mask and preserves microphone phase, exactly as the paper's
-prediction contract specifies.  The project target is the joint
-end-to-end AEC+RES+NR task (early/dereverberated near speech, denoised and
-echo-cancelled); see ../dataset_gen/model_views.py's MODEL_TASKS.
+The model consumes unaligned microphone/reference complex spectra and emits a
+real magnitude mask, preserving microphone phase as the paper's prediction
+contract specifies. The project target is the joint end-to-end AEC+RES+NR task
+(early/dereverberated near speech); see ../dataset_gen/model_views.py's
+MODEL_TASKS.
 """
 
 from __future__ import annotations
@@ -161,17 +161,10 @@ class AlignCRUSE(nn.Module):
                        state: Dict[str, object]) -> AecOutput:
         """Streaming twin of :meth:`forward` for one new STFT frame.
 
-        Inputs are complex ``[B, 1, F]`` (a T=1 slice of the offline input);
-        the returned fields are the matching T=1 slices.  The decoder's
-        transposed convolutions have time kernel 1, so they run per frame
-        unchanged; only the encoder convs, the alignment integrator and the
-        GRU carry state.
-
         Equivalence caveat (inherited from GlobalDelayAttentionCell): offline
         masks delays with ``arange(D) < T`` using the FINAL utterance length,
-        which a stream cannot know.  For utterances of at least
-        ``max_delay_frames`` hops the stream matches offline exactly; shorter
-        utterances differ by design.
+        so the stream matches offline exactly only for utterances of at least
+        ``max_delay_frames`` hops.
         """
         require_complex_btf(microphone, "microphone")
         require_complex_btf(far_end, "far_end")

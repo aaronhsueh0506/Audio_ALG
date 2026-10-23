@@ -1,37 +1,31 @@
 """Equivalence and contract gates for the Align-ULCNet pre/post class.
 
-``ulcnet_prepost.c`` owns no signal processing: it composes the two already
+``ulcnet_prepost.c`` owns no signal processing: it composes the two
 parity-tested translation units (``ulcnet_process.c`` for the centered
 sqrt-Hann STFT/WOLA, ``ulcnet_model_io.c`` for the feature front end and the
-recurrent rings) behind one object. So the gate that matters is not a
-tolerance against a Python reference -- the parity of the parts is covered by
-test_ulcnet_process_c.py and test_ulcnet_model_io_c.py -- but that the class
-reproduces the hand-composed path SAMPLE FOR SAMPLE. Every comparison
-here is therefore ``memcmp`` on fp32, never a tolerance: the class is only
-allowed to reorder nothing.
+recurrent rings) behind one object, so the gate is that the class reproduces
+the hand-composed path SAMPLE FOR SAMPLE: every comparison is ``memcmp`` on
+fp32, never a tolerance.
 
-Cases, all in ONE driver selected by argv[1] so audiolib and the three
-model TUs are compiled once for the module:
+Cases, all in ONE driver selected by argv[1] (audiolib and the model TUs are
+compiled once for the module):
 
   equiv     ULCNET_IO_TIME vs analysis + model-I/O transaction + synthesis,
-            hand-composed. The reference deliberately uses ONLY the two
-            composed TUs and not ulcnet_accelerator_adapter.c, which is
-            itself implemented on top of the class -- comparing against it
-            would be circular.
+            hand-composed from ONLY the two composed TUs (not
+            ulcnet_accelerator_adapter.c, which is built on the class)
   freq      ULCNET_IO_FREQ driven by the caller's own analysis vs IO_TIME
-  freqpool  the FREQ pool is smaller, and the stale-pool gate both accepts
-            the matching MemReq and refuses a mismatched one
+  freqpool  the FREQ pool is smaller; the stale-pool gate accepts the matching
+            MemReq and refuses a mismatched one
   lifecycle _create/_destroy against _init on a caller pool
   reject    _get_mem_size / _init reject-first validation
   reset     _reset really clears state (re-run reproduces the first run)
   skip      _frame_skip is the identity and leaves the state as written
-  guard     the frame state machine: a hop on top of an unfinished frame,
-            a commit with no frame_inputs behind it, and a retry after a
-            refused commit are all refused; skip needs no frame_inputs
+  guard     the frame state machine: a hop on top of an unfinished frame, a
+            commit with no frame_inputs and a retry after a refused commit are
+            refused; skip needs no frame_inputs
 
-The accelerator stand-in is deterministic and input-dependent, so the K/V/
-logit rings and the in-place GRU hiddens genuinely influence later frames -- a
-class that dropped a ring advance would diverge rather than agree.
+The accelerator stand-in is deterministic and input-dependent, so a class that
+dropped a ring advance would diverge rather than agree.
 """
 
 import os
@@ -1158,11 +1152,10 @@ def _run(driver, case):
 
 
 def test_time_mode_matches_the_hand_composed_path(driver):
-    """The class vs analysis + the model-I/O transaction + synthesis wired
-    up by hand, byte-identical over 400 hops. This is the gate that folding
-    the composition into an object changed nothing at all. The same case
-    pins the framing claim: the centered analysis's last frame per hop is
-    bit-identical to the class's rolling frame."""
+    """The class vs analysis + the model-I/O transaction + synthesis wired up
+    by hand, byte-identical over 400 hops. The same case pins the framing
+    claim: the centered analysis's last frame per hop is bit-identical to the
+    class's rolling frame."""
     assert 'io_mode=TIME' in _run(driver, 'equiv')
 
 

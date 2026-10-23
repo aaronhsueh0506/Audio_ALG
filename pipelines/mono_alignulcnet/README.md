@@ -24,10 +24,9 @@ to form the linear error; the model's TA block aligns raw far to that error.
 The model state is reset when the AEC delay regime changes, including FIXED
 mode's first usable error. The C-side STFT keeps running across it, so the
 frames still straddling the error change emit identity WITHOUT stepping the model:
-`AUDIO_PIPELINE_ULCNET_REPRIME_FRAMES` = 1 frame here (both branches are
-pushed from the current hop), the same as the 4ch wrapper, which also frames both branches from the current hop. The constant is
-derived and asserted by the straddle-derivation test, not estimated; option B
-(keep stepping through those frames) is deferred pending an audio A/B.
+`AUDIO_PIPELINE_ULCNET_REPRIME_FRAMES` = 1 frame (both branches are framed
+from the current hop, as in the 4ch wrapper). The constant is derived and
+asserted by the straddle-derivation test, not estimated.
 
 Raw/aligned selection exists only in `sweep_delay_depth.py`, not in this
 runtime API. Export metadata requires the checkpoint and deployment contracts

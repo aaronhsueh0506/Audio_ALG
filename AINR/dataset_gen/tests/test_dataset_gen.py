@@ -876,7 +876,8 @@ class SampleScanTest(unittest.TestCase):
             self.assertEqual(_list_stale_temp_files(tmp), [temp])
 
     def test_leftover_sidecars_and_meta_are_not_samples(self):
-        """An older corpus's JSON must be inert, not an error, not a sample."""
+        """Leftover JSON beside the WAVs must be inert, not an error, not a
+        sample."""
         with tempfile.TemporaryDirectory() as tmp:
             _save_pair_atomic(tmp, 0, torch.zeros(160), torch.zeros(160), 16000)
             Path(tmp, '000000.json').write_text('{"index": 0}')

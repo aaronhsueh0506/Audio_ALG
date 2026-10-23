@@ -101,20 +101,13 @@ def load_mic_far(
 ) -> Tuple[Tensor, Tensor, Tuple[int, int]]:
     """Load an aligned mono pair and convert both signals to the model rate.
 
-    Resampling happens before every AEC/model operation.  This is load-bearing
-    for RES+NR candidates: running PBFDKF at the capture rate and resampling
-    only its residual would not reproduce the linear-AEC frontend used during
-    training.
-
-    ``far_path`` may be None, meaning there is no far-end recording: the
-    reference becomes digital silence matching the microphone's output length.
-    The reported far rate is then the microphone's, because no second file was
-    read.
-
-    Returns two ``[1, samples]`` CPU tensors plus the original mic/far rates.
-    The synchronized source files must use the same rate and represent the
-    same start time. The microphone owns the output timeline: a short far-end
-    tail is zero-padded and a long one is cropped before resampling.
+    Resampling happens before every AEC/model operation (running PBFDKF at the
+    capture rate and resampling only its residual would not reproduce the
+    training frontend). ``far_path`` may be None: the reference becomes digital
+    silence matching the microphone's output length and the reported far rate
+    is the microphone's. The microphone owns the timeline (a short far-end tail
+    is zero-padded, a long one cropped before resampling). Returns two
+    ``[1, samples]`` CPU tensors plus the original mic/far rates.
     """
     if model_sample_rate <= 0:
         raise ValueError(
@@ -153,13 +146,11 @@ def load_linear_error_far(
 ) -> Tuple[Tensor, Tensor, Tuple[int, int]]:
     """Load a precomputed KF/AEC error and far reference for NN-only tests.
 
-    Unlike :func:`load_mic_far`, the source rates may differ: published AEC
-    demos commonly provide a 16 kHz KF residual beside a 48 kHz loopback. The
+    Unlike :func:`load_mic_far`, the source rates may differ (published AEC
+    demos commonly provide a 16 kHz KF residual beside a 48 kHz loopback). The
     error signal owns the output timeline and both tensors leave at the model
-    rate. This helper deliberately does not claim that the external KF matches
-    the frozen PBFDKF used to train this repository's checkpoints.
-
-    ``far_path`` may be None, with the same meaning as in :func:`load_mic_far`.
+    rate. The external KF is not claimed to match the frozen PBFDKF used to
+    train this repository's checkpoints. ``far_path`` may be None.
     """
     if model_sample_rate <= 0:
         raise ValueError(

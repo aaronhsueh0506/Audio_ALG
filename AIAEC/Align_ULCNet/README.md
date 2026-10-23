@@ -91,7 +91,7 @@ trainable parameters, matching the published 0.69 M class without inventing a
 U-Net decoder.
 
 For training, `[model] max_delay_frames` in `config.ini` directly selects D;
-the shipped campaign config uses D=32.  The delay-stack activation and
+the shipped config uses D=32.  The delay-stack activation and
 streaming state grow linearly with D, so this is also the first memory knob to
 reduce when a D=64 run exhausts CUDA memory.  This is a real forward-path
 choice, not only an allocation hint: changing D changes the attention candidate
@@ -106,17 +106,17 @@ warmup from `1e-4`, followed by per-optimizer-step cosine decay to `1e-6` over
 the remaining 50-epoch budget. This gives every run a deterministic LR curve
 rather than one driven by validation noise.
 
-Early stopping is disabled (`early_stop_patience=0`) for the requested
-50-epoch campaign. Validation still selects `*_best.pth`.
+Early stopping is disabled (`early_stop_patience=0`). Validation still selects
+`*_best.pth`.
 
-The loss is unchanged: ULCNet's component-wise signed power compression
-followed by frequency-domain MSE (`c=0.3`).
+The loss is ULCNet's component-wise signed power compression followed by
+frequency-domain MSE (`c=0.3`).
 
 The primary source is arXiv:2410.13620. It explicitly publishes Adam, `4e-3`,
 D=64, batch 64, 3-second examples, a 20,000-step epoch, and the `0.1` plateau
 reduction. It does not state weight decay, AMSGrad, an LR floor, or an early-stop
-rule. This campaign deliberately changes D to 32, batch to 16, the schedule to
-warmup/cosine, and the budget to 50 local epochs.
+rule. The shipped config uses D=32, batch 16, the warmup/cosine schedule and a
+50-epoch budget instead.
 
 For the listening examples on the paper's project page, the track labelled
 ``KF`` is the 16 kHz **error/residual Z**, not the KF echo estimate. To test
@@ -450,34 +450,18 @@ process. The version is `LAYOUT_VERSION` in `export_onnx.py` and
 them together). Versions 3-17 are retired (`RETIRED_LAYOUT_VERSIONS`): a number
 that once meant one boundary must never also mean another, because state
 element counts can coincide across boundaries and nothing but the version can
-tell them apart. The next real bump goes to 19.
-
-Removed with layout 18: the exporter options `--feature-layout` (Align-ULCNet
-exporter and calibration CLI) and `--gru-state-layout` (the same two and the
-shared streaming exporter), the C function
-`ulcnet_model_io_inherit()` (the runtime binds each `*_out` to its input
-address instead), the macro `ULCNET_MODEL_IO_SCORE_HISTORY` (replaced by
-`ULCNET_MODEL_IO_SCORE_WINDOW`), the descriptor field `score_history_frames`
-(replaced by `score_window_frames`), and the `h_gru0`/`h_gru1` pairs of
-`UlcnetModelIoInputs`/`UlcnetModelIoOutputs` (replaced by `h_gru`/`h_gru_out`).
+tell them apart.
 
 The fixed front end never enters the quantized domain: each of the four feature
 inputs keeps its own quantization scale, and `sqrt`/`atan2`/`pow` stay out of
 the graph.
 
-**Every graph exported under another layout must be re-exported.** A descriptor written
-for any other layout fails `ulcnet_model_io_descriptor_validate()` on
+A descriptor written for any other layout fails `ulcnet_model_io_descriptor_validate()` on
 `layout_version != ULCNET_MODEL_IO_LAYOUT_VERSION`, and
 `ulcnet_accelerator_adapter_init()` therefore returns NULL. The K/V and logit
-windows are full windows (D and 5 frames) and the two GRU hiddens are one tensor; the tensor names keep their
-meaning. The mask is a quantization target of its own: the `complex_mask` 1x1
-Conv has no activation, so its range comes from calibration. Existing
-calibration data and quantization results must be regenerated, the accelerator
-program recompiled, and the ONNX/JSON re-exported; the checkpoint and the
-dataset do not change. Checked on seeded random weights (no checkpoint exists
-for this model here): the new graph's mask equals the retired
-graph's mask bit for bit, each new `*_out` equals the retired window extended by
-the new frame, and each retired `*_out` equals the new one without the dropped slot.
+windows are full windows (D and 5 frames) and the two GRU hiddens are one
+tensor. The mask is a quantization target of its own: the `complex_mask` 1x1
+Conv has no activation, so its range comes from calibration.
 
 CPU state storage is implemented by `ulcnet_model_io.c/.h`.  They use one
 caller-owned pool and allocate RAM according to D.  `prepare()` NaN-fills only
@@ -499,9 +483,8 @@ the inverse signed power before unpacking `enhanced_re/im`.  The queried pool
 size is the four state tensors plus the feature-input and output staging; the
 state figure alone is not a sufficient allocation.
 `ulcnet_process.c/.h`
-continues to own only STFT/WOLA and the high-level model callback.  Vendor NPU
-drivers and mono/4ch pipeline wiring are intentionally outside this model-side
-deliverable.
+owns only STFT/WOLA and the high-level model callback.  Board NPU drivers
+and mono/4ch pipeline wiring are outside this model-side deliverable.
 
 `ulcnet_prepost.c/.h` is the pre/post *class* over those two files: one
 opaque `UlcnetPrepost` owning the framing states, the feature front end and

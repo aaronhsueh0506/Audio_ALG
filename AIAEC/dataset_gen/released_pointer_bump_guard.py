@@ -1,58 +1,37 @@
 """Staleness guard for the released-checkpoint hash-compatibility pointer.
 
-See the comment block directly above ``RELEASED_INFERENCE_POINTER_BUMPS`` in
-``linear_aec.py`` for the invariant this exists to enforce and the bug that
-motivated it (2026-10-20 opus review item C2): an agent bumping
-``RELEASED_INFERENCE_BEHAVIOR_HASH_COMPATIBILITY``'s single entry ASSUMED the
-pointer's prior value was the hash immediately before their own change,
-bumped it to their new hash, and in doing so silently re-admitted roughly a
-month and 21 unrelated commits of un-vetted drift that had accumulated on the
-pointer in between. The old test
-(``test_released_checkpoint_exception_is_separate_and_targets_this_build``)
-only asserted the pointer equals the LIVE hash right now; it had no way to
-notice that the gap between two consecutive bumps was never individually
-vetted.
+See the comment block above ``RELEASED_INFERENCE_POINTER_BUMPS`` in
+``linear_aec.py``. A bump of ``RELEASED_INFERENCE_BEHAVIOR_HASH_COMPATIBILITY``
+must not assume the pointer's prior value was the hash immediately before the
+author's own change, or unvetted drift accumulated on the pointer is silently
+re-admitted; asserting that the pointer equals the live hash cannot see that.
 
-Two independent layers, both pure functions (no git, no filesystem) plus one
-thin git-backed wrapper:
+Two pure layers (no git, no filesystem) plus one git-backed wrapper:
 
 ``check_chain(bumps, live_value)``
-    Stateless; runs in any checkout, forever, including long after the bump
-    that introduced a row has been committed. Verifies the rows in
-    ``RELEASED_INFERENCE_POINTER_BUMPS`` form one unbroken chain -- row i's
-    ``old`` equals row (i-1)'s ``new`` -- and the last row's ``new`` equals
-    the dict entry's current live value. A row whose ``old`` does not match
-    the previous row's ``new`` is exactly "the author assumed/recomputed the
-    old value instead of reading it off the previous row."
+    Stateless. The rows of ``RELEASED_INFERENCE_POINTER_BUMPS`` form one
+    unbroken chain (row i's ``old`` equals row i-1's ``new``) and the last
+    row's ``new`` equals the entry's live value.
 
 ``check_bump_against_head(head_value, work_value, bumps)``
-    Needs the file's value at git HEAD and in the working tree (or index).
-    If they differ, the working tree's ``bumps`` must contain a row whose
-    ``old`` is LITERALLY ``head_value`` and whose ``new`` is literally
-    ``work_value``. This is what makes "I assumed the old value was X"
-    structurally visible: X is checked against what git actually has at
-    HEAD, not against the author's claim. If the two values are equal
-    (nothing changed), this layer is silent.
+    If the entry differs between git HEAD and the working tree, ``bumps`` must
+    hold a row whose ``old`` is literally HEAD's value and whose ``new`` is
+    literally the working tree's. Silent when nothing changed.
 
 ``check_file_against_head(repo_root, rel_path, rev="HEAD")``
-    Wires both layers to a real git checkout: reads ``rev:rel_path`` with
-    ``git show``, reads the working-tree file off disk, extracts the dict
-    and the bump table from both with ``ast.literal_eval`` (never ``eval``
-    or ``ast.dump`` -- see ``reference_ast_dump_not_version_stable``), and
-    returns the combined violation list.
+    Wires both layers to a git checkout: reads ``rev:rel_path`` with ``git
+    show``, extracts the dict and the bump table from both copies with
+    ``ast.literal_eval`` (never ``eval``/``ast.dump``) and returns the combined
+    violations.
 
-Only single-hop bumps are modelled, matching this file's existing
-"single hop by construction" convention for ``ACCEPTED_BEHAVIOR_HASH_MIGRATIONS``:
-one commit is expected to add exactly one row connecting the value it found
-at HEAD to the value it leaves in the working tree. A diff that jumps through
-an intermediate value never recorded at any HEAD is out of scope.
+Only single-hop bumps are modelled: one commit adds exactly one row connecting
+HEAD's value to the working tree's.
 
-Run standalone (also usable as a pre-commit-style check, exit 1 on failure):
+Run standalone (exit 1 on failure):
 
     python3 -m AIAEC.dataset_gen.released_pointer_bump_guard [repo_root] [rel_path]
 
-``make test`` / ``pytest AIAEC/tests`` also runs this guard, via
-``AIAEC/tests/test_released_pointer_bump_guard.py``.
+It also runs via ``AIAEC/tests/test_released_pointer_bump_guard.py``.
 """
 from __future__ import annotations
 

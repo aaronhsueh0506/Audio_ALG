@@ -69,7 +69,7 @@
 |---|---|---|
 | **T0.1（最高優先，屬安全性不只 debug）** | 為 release build 設 `-DNDEBUG`，**並且**替 `suppression_gain.c` 那個沒有 fallback 的 assert 補上 release-path guard（其餘兩處已有）。或者反過來，把該 assert 改成建構期拒絕（回 NULL）——它檢查的是 init 期的一致性，本來就不該用 abort 表達 | 零 per-hop |
 | **T0.2** | `aec_debug_set_level()`／`aec_debug_set_log()` 與 CLI 的 `--debug-level`／`--debug-log`（沒有 emit 端）：**刪掉**。留著只會讓人以為 library 有 log 能力 | 負值（減碼） |
-| **T0.3（回收最大）** | 把 trace 的 gate 從 `cfg.enable_res` 改成 `cfg.enable_res \|\| cfg.return_res_context`（與 `last_erle_windowed` 的更新條件一致），並讓 `aec_process_context()` 也能觸發 | 一個 NULL 測試 |
+| **T0.3（回收最大）** | 把 trace 的 gate 從 `cfg.enable_res` 改成 `cfg.enable_res \|\| cfg.return_res_context`，並讓 `aec_process_context()` 也能觸發 | 一個 NULL 測試 |
 
 T0.3 之所以關鍵：`dominant_nearend`、`saturated_echo`、`usable_linear`、
 `fullband_erle`、`gain_mean` 這五個量**沒有第二個出口**，改完 gate 之後

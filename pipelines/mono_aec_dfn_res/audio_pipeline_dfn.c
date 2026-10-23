@@ -42,9 +42,8 @@ static uint32_t fnv_u32(uint32_t h, uint32_t v) {
     return h;
 }
 
-/* Everything init needs, derived from the config exactly once: the stage
- * config, both sub-descriptors and this pool's total. The host validates
- * its own config; only the seam invariants are checked here. */
+/* Everything init needs, derived from the config once: the stage config, both
+ * sub-descriptors and this pool's total. The host validates its own config. */
 typedef struct Resolved {
     int use_bridge;                 /* host below 48 kHz */
     DfnResStageConfig scfg;
@@ -194,11 +193,10 @@ MonoAecDfnRes *mono_aec_dfn_res_init_ex(void *mem, size_t bytes,
         for (k = 0; k < r.n_freqs; ++k) p->unity[k] = 1.0f;
     }
     p->rng = SE_CNG_RNG_SEED;
-    /* The comfort-noise fill is the host config's switch (the AEC preset keeps it on). */
+    /* The comfort-noise fill is the host config's switch. */
     p->cng = cfg->host.enable_cng;
-    /* The host resolves fft_size 0 to its rate default; the stage's grid
-     * (48 kHz) or the bridge's native grid must be the host's, checked once
-     * here. */
+    /* The host resolves fft_size 0 to its rate default; the stage's grid (48 kHz) or
+     * the bridge's native grid must be the host's. */
     if (r.use_bridge) {
         p->bridge = dfn_rate_bridge_init_ex(cursor, (size_t)r.bridge_req.bytes,
                                             &r.bcfg, &r.bridge_req);
@@ -262,7 +260,7 @@ void mono_aec_dfn_res_destroy(MonoAecDfnRes *p) {
     if (owned) free(owned);
 }
 
-/* A contract error anywhere in a hop resets the pipeline, as for process(). */
+/* A contract error anywhere in a hop resets the pipeline. */
 static int fail(MonoAecDfnRes *p) {
     mono_aec_dfn_res_reset(p);
     return -1;
@@ -274,9 +272,8 @@ int mono_aec_dfn_res_process_begin(MonoAecDfnRes *p, const float *mic,
     int r;
     if (!p || !mic || !ref || p->phase != 0) return -1;
     if (audio_pipeline_process_spec(p->host, mic, ref, &f) != 0) return fail(p);
-    /* P = E * min(1, G_res), plus comfort noise on the cut bins. The absent
-     * denoiser reads as the unity vector, so the same four calls as the NR
-     * pipeline serve. */
+    /* P = E * min(1, G_res), plus comfort noise on the cut bins; the absent denoiser
+     * reads as the unity vector. */
     sk_min_f32(p->g_total, p->unity, f.g_res_ctx, p->n_freqs);
     sk_capply_gain_f32(p->post, f.e, p->g_total, p->n_freqs);
     if (p->cng && f.cn)
@@ -333,7 +330,7 @@ int mono_aec_dfn_res_process_end(MonoAecDfnRes *p, float *out) {
         if (dfn_rate_bridge_finish(p->bridge, out) != 0) return fail(p);
         return 0;
     }
-    /* A frame left open or unfetched takes the identity (fail-open). */
+    /* A frame left open or unfetched takes the identity. */
     if (!p->stage_ended) {
         int open = p->job_pending || p->phase == 2;
         if (dfn_res_stage_end(p->stage, open ? -1 : 0, p->stage_output) < 0) {
@@ -376,8 +373,8 @@ int mono_aec_dfn_res_hop_size(const MonoAecDfnRes *p) {
 
 int mono_aec_dfn_res_lookahead_samples(const MonoAecDfnRes *p) {
     if (!p) return -1;
-    /* The host's synthesis WOLA hop, plus the model's two lookahead hops at
-     * 48 kHz or the bridge's added delay on a native grid. */
+    /* Host WOLA hop plus the model's two lookahead hops at 48 kHz, or the bridge's
+     * added delay on a native grid. */
     if (p->bridge)
         return audio_pipeline_hop_size(p->host) +
                dfn_rate_bridge_added_delay_samples(p->bridge);

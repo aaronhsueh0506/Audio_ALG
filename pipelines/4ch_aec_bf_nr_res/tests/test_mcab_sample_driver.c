@@ -60,6 +60,13 @@ int main(void) {
     p=fresh();p.consume_rc=1;assert(run(&p)==1 && p.consumed==1 && p.cleaned==1 && p.finished==0);
     p=fresh();p.output[1]=NAN;assert(run(&p)==1 && p.nonfinite==1 && p.cleaned==1 && p.consumed==0);
     p=fresh();p.output[1]=NAN;p.finite=0;assert(run(&p)==0 && p.nonfinite==0 && p.consumed==3);
+    {   /* finish is optional: NULL means success after the hop loop. */
+        static const McabSampleOps no_finish={parse,2,setup,read_hop,process,
+                                              NULL,NULL,NULL,cleanup,complete};
+        char *args[]={"probe",NULL};
+        p=fresh();assert(mcab_sample_main(1,args,&no_finish,&p)==0);
+        assert(p.processed==3 && p.cleaned==1 && p.completed==1);
+    }
     const McabCliOption opts[]={{"--value",1},{"--help",0}};
     int seen=0;char *ok[]={"probe","--value","12"};
     assert(mcab_scan_cli(3,ok,opts,2,&seen,set,unknown)==0 && seen==1);

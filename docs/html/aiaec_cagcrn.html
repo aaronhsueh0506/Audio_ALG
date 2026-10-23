@@ -130,7 +130,7 @@ hop-lag：端到端 256 samples（16 ms）＝ centered 半窗 lookahead；NN 本
 <p>Offline <code>forward(microphone, far_end)</code>：同名 tensor、T 軸為整段幀數。</p>
 
 <h2>State 表</h2>
-<p><code>state_report</code> 實測（B=1 fp32，total <b>469.9 KB</b>；conv 與 CATA 時間卷積的 window 各比先前的 history 多一幀）。部署契約：顯式
+<p><code>state_report</code> 實測（B=1 fp32，total <b>469.9 KB</b>；conv 與 CATA 時間卷積的 window 是完整 window,含新的一幀）。部署契約：顯式
 state I/O，由 host caller 保存；STFT/ISTFT 屬 C struct 層：</p>
 <table>
 <tr><th>state</th><th>shape</th><th>size</th><th>保存者（部署契約）</th></tr>
@@ -166,7 +166,7 @@ samples。</li>
 <ul>
 <li><code>AIAEC/CAGCRN/model.py</code>（<code>CAGCRN</code>、<code>CrossAttentionTemporalAlignment</code>、<code>TFGRU</code>、<code>TFAG</code>、<code>ErbBandCodec</code>、<code>_stream_*</code> helpers）</li>
 <li><code>AIAEC/CAGCRN/inference.py</code>、<code>export_onnx.py</code>、<code>train.py</code>、<code>config.ini</code></li>
-<li>tests：<code>AIAEC/tests/test_streaming_cagcrn.py</code>、<code>test_candidate_models.py</code>（含 <code>test_cagcrn_soft_window_has_gradient</code>）、<code>test_export_stateless.py</code>（外部 state 往返對 <code>forward_stream</code> 的 <code>rtol=1e-5, atol=2e-6</code>；<code>test_every_state_is_rank_four_and_returns_in_full</code>：每個 state rank 4、<code>*_out</code> 與輸入同 shape／dtype；<code>test_exported_graph_satisfies_the_in_place_state_contract</code>：寫出的檔案通過 <code>validate_inplace_state_contract</code>、window 的輸出由 Concat 產生；<code>test_cagcrn_hiddens_stack_on_dim_one_in_slot_order</code>：<code>h_gru</code> 兩個 slot 逐元素等於 <code>forward_stream</code> 的兩顆 hidden）、<code>test_onnx_state_contract_names.py</code>（validator 的違規案例）；全樹基準數見 <code>docs/release_checklist.md</code>。</li>
+<li>tests：<code>AIAEC/tests/test_streaming_cagcrn.py</code>、<code>test_candidate_models.py</code>（含 <code>test_cagcrn_soft_window_has_gradient</code>）、<code>test_export_stateless.py</code>（外部 state 往返對 <code>forward_stream</code> 的 <code>rtol=1e-5, atol=2e-6</code>；<code>test_every_state_is_rank_four_and_returns_in_full</code>：每個 state rank 4、<code>*_out</code> 與輸入同 shape／dtype；<code>test_exported_graph_satisfies_the_in_place_state_contract</code>：寫出的檔案通過 <code>validate_inplace_state_contract</code>、window 的輸出由 Concat 產生；<code>test_cagcrn_hiddens_stack_on_dim_one_in_slot_order</code>：<code>h_gru</code> 兩個 slot 逐元素等於 <code>forward_stream</code> 的兩顆 hidden）、<code>test_onnx_state_contract_names.py</code>（validator 的違規案例）；全樹請執行 <code>python3 -m pytest AIAEC</code>。</li>
 <li>匯出／calibration：<code>AIAEC/CAGCRN/export_onnx.py</code>、<code>AIAEC/CAGCRN/inference.py calib</code>（BIN/NPZ calibration 放在 <code>AIAEC/CAGCRN/calib/</code>；calib 會同 process 一併匯出並 parity-check 對應 graph（預設 <code>&lt;output&gt;.onnx</code>，<code>--onnx</code> 可改））。</li>
 <li>docs：<code>docs/aiaec_streaming_readiness_zh_TW.md</code> §3.4</li>
 </ul>

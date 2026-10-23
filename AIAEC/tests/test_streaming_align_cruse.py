@@ -14,8 +14,8 @@ from AIAEC.aiaec_common import SignalGrid
 
 G16 = SignalGrid(16000, 512, 512, 256)
 
-# Measured max-abs stream-vs-offline difference on the reference run was
-# 4.9e-7 (enhanced), 1.8e-7 (mask), 3.3e-7 (delay); pinned with ~10x headroom.
+# Tolerances are pinned with ~10x headroom over the stream-vs-offline
+# difference (float32 accumulation-order noise).
 ATOL = 5e-6
 
 

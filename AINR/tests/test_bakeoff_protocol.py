@@ -1,23 +1,13 @@
 #!/usr/bin/env python3
 """Drift guard for the RNNoise-ERB vs GTCRN comparison protocol.
 
-WHY THIS EXISTS
----------------
-The two models are trained on the same packed 16 kHz corpus so that the
-difference between their scores is attributable to the models.  Everything that
-has to be equal for that to hold is pinned here rather than left to two config
-files that happen to agree: a drifted held-out fraction (5% on one side, 10% on
-the other) would mean the two models are trained on different corpora and
-validated on different data.
-
-This is the same guard ``RNNoise-ERB/tests/test_feature_contract.py`` applies to
-the config/C constants, pointed at the pair of config files instead.
-
-Deliberate divergences are asserted as divergences, not ignored -- ``center``
-and ``batch_size`` differ on purpose, and pinning them here records that the
-difference is a decision rather than an oversight.
-
-Dependency-free: parses the .ini files directly, no torch import.
+Both models train on the same packed 16 kHz corpus so score differences are
+attributable to the models. Everything that has to be equal for that is pinned
+here rather than left to two config files that happen to agree (a held-out
+fraction of 5% on one side and 10% on the other would train and validate on
+different data). Deliberate divergences (``center``, ``batch_size``) are
+asserted as divergences, recording that they are decisions. Dependency-free:
+parses the .ini files directly, no torch import.
 """
 
 import configparser
@@ -44,10 +34,9 @@ def _load(name):
 SHARED_SIGNAL = ('sr', 'n_fft')
 SHARED_TRAINING = ('epoch_size',)
 
-# Schedule SHAPE keys, compared as floats.  These are not cosmetic: two models
-# compared over "the same 100 epochs" are only comparable if the learning rate
-# followed the same trajectory, which is the whole reason the schedule was
-# unified.  ``lr`` itself is deliberately NOT here -- the base rate is a
+# Schedule SHAPE keys, compared as floats: two models compared over "the same
+# 100 epochs" are only comparable if the learning rate followed the same
+# trajectory. ``lr`` itself is deliberately NOT here -- the base rate is a
 # per-model tuning choice; the shape around it is not.
 SHARED_SCHEDULE = ('min_lr', 'warmup_epochs')
 
@@ -93,16 +82,13 @@ def test_schedule_shape_matches():
 def test_unreconciled_schedule_divergences_are_visible():
     """⚠ Two schedule knobs still disagree and NOBODY has decided they should.
 
-    Unlike test_intentional_divergences_are_still_intentional, this test does
-    not claim these are deliberate -- it pins the current values so the pair
-    cannot drift further while the question is open, and so that whoever
-    reconciles them has to come here and say which way it went.
+    Unlike test_intentional_divergences_are_still_intentional, this does not
+    claim they are deliberate: it pins the current values so the pair cannot
+    drift further while the question is open.
 
     - warmup start factor (``lr_warmup / lr``): GTCRN warms up from 10% of its
-      base rate, RNNoise-ERB from 1%.  GTCRN takes DeepFilterNet2's value;
-      RNNoise-ERB's 0.01 is the explicit form of its start_factor.  Neither
-      number was chosen against the other.
-    - ``grad_clip``: 5.0 vs 1.0.  GradNormLog's own docstring argues the clip
+      base rate (DeepFilterNet2's value), RNNoise-ERB from 1%.
+    - ``grad_clip``: 5.0 vs 1.0. GradNormLog's docstring argues the clip
       threshold decides what the gradient trace can distinguish, so it belongs
       to the comparison protocol on the same footing as the LR.
     """
@@ -124,9 +110,9 @@ NR_TRAINERS = ('RNNoise-ERB', 'GTCRN', 'DeepFilterNet2', 'DeepFilterNet3')
 def test_split_comes_from_one_shared_implementation():
     """No trainer may define its own split, sampler or seeder.
 
-    The 5%-vs-10% drift happened because each train.py carried its own copy.
-    Importing from dataset_gen is what makes the split a single definition;
-    a re-declaration here would silently reintroduce the divergence.
+    A train.py carrying its own copy lets the held-out fraction drift (5% vs
+    10%); importing from dataset_gen keeps the split a single definition, and a
+    re-declaration here would silently reintroduce the divergence.
     """
     banned = ('def locality_preserving_random_split',
               'def set_seed',

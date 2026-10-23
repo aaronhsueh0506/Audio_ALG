@@ -33,9 +33,10 @@ Aec*             aec = aec_init(mem_aec, aec_sz, &aec_cfg);
 AnrDenoiser* nr  = anr_init(mem_nr, nr_sz, &nr_cfg);
 FftHandle*       fft = fft_init(mem_fft, fft_sz, fft_size);
 /* destroy() on static instances frees no pool memory (runtime is_static)
- * and, since P0001, releases no backend-owned handle OUTSIDE the pool
- * either: with the NE10 backend every one of aec_destroy/anr_destroy/
- * fft_destroy above is a genuine no-op for a pool-resident instance --
+ * and, with the NE10 backend (vendored patch P0001), releases no
+ * backend-owned handle OUTSIDE the pool either: every one of aec_destroy/
+ * anr_destroy/fft_destroy above is a genuine no-op for a pool-resident
+ * instance --
  * nothing lives outside mem_aec/mem_nr/mem_fft to leak or double-free, so
  * each is safe to call any number of times (including never, if the caller
  * is about to free/reuse the whole pool anyway). */
@@ -74,8 +75,7 @@ aligned (both libraries assert this).
             // Passing `req` back in as `expected` is what makes this call
             // reject a STALE pool/descriptor instead of silently carving
             // into one sized/shaped for a different build — see
-            // "Descriptor semantics" below for the seven-condition check
-            // this performs. NULL on: any expected-descriptor mismatch
+            // "Descriptor semantics" below for the check this performs. NULL on: any expected-descriptor mismatch
             // (descriptor_version / layout_version / backend_id /
             // build_flags_hash / alignment / bytes), a misaligned/undersized
             // pool, an invalid cfg, or a sub-module init/grid-agreement
@@ -149,21 +149,17 @@ caller-owned block; the stage chain adds no heap use in the hop path.
   sequence above
   (`audio_pipeline_get_mem_requirements` + `audio_pipeline_init_ex` +
   `audio_pipeline_destroy`) is the only sequence that touches zero heap.
-- **There is no `USE_EXT_MEM` macro.** Both the heap path and the pool
-  path are always compiled into `libaudio_pipeline.a` — the *entry point
-  you call* is the only switch, decided at runtime by which functions your
-  code calls, not by any compile-time flag. See "`USE_EXT_MEM` — not a
-  thing here" below; do not look for one to set, there is nothing to
-  accidentally leave unset either.
+- **Both the heap path and the pool path are always compiled into
+  `libaudio_pipeline.a`.** The entry point you call is the only switch,
+  decided at runtime; there is no compile-time flag to set.
 - **Re-query the descriptor after ANY build, backend, or config change** —
   a firmware rebuild, or a change
   to any `AudioPipelineConfig` field that affects sizing. Never cache a
   bare byte count (or a whole `AudioPipelineMemReq`) across one of those
   changes and replay it into a later build's `audio_pipeline_init_ex()` —
   that mismatch is exactly what the `expected` argument exists to catch
-  (see "Descriptor semantics" below). This still holds even though V2's
-  fixed 32-byte layout (below) makes the struct meaningfully
-  serializable now — "can be persisted byte-for-byte" is not the same
+  (see "Descriptor semantics" below). This still holds with the fixed
+  32-byte layout (below): "can be persisted byte-for-byte" is not the same
   claim as "is still valid after a rebuild/backend/config change": a
   persisted descriptor from a PREVIOUS build is exactly the stale-cache
   case `audio_pipeline_init_ex()` exists to catch. If a descriptor must be
@@ -178,39 +174,36 @@ caller-owned block; the stage chain adds no heap use in the hop path.
   yourself while letting `audio_pipeline_create()` heap-allocate another,
   and don't call `aec_create()`/`anr_create()`/`fft_create()` directly
   alongside this library's own carve. `audio_pipeline_init()`/`_init_ex()`
-  own the ENTIRE pool layout (control block + AEC + FFT + NR + the 8
+  own the ENTIRE pool layout (control block + AEC + FFT + NR + the
   pipeline scratch buffers) as one unit — there is no supported way to substitute
   a heap-obtained sub-module handle into a pool-resident `AudioPipeline`,
   or vice versa.
 
 ## Descriptor semantics (`AudioPipelineMemReq`)
 
-Descriptor V2: every field is a fixed-width integer
+Every field is a fixed-width integer
 (`uint32_t`/`uint64_t`, never `size_t` or a pointer), and the struct is
 pinned to a stable, `_Static_assert`-enforced **32-byte** layout — see
 "Serializing the descriptor" below for what that does (and does not) buy
-you. This is a **BREAKING** change from the original descriptor shape
-(`{size_t bytes; size_t alignment; uint32_t layout_version; const char*
-backend; uint32_t build_flags_hash;}`); every caller in this repo has been
-updated, there is no compatibility shim.
+you.
 
 | Field | Meaning |
 |-------|---------|
 | `descriptor_version` | This STRUCT's own ABI version — `AUDIO_PIPELINE_DESCRIPTOR_VERSION` (currently `2`). Bumped only when `AudioPipelineMemReq`'s field set/order/width changes, independent of `layout_version` below (which tracks THIS FILE's carve layout, not the descriptor struct's own shape). `audio_pipeline_init_ex()` checks this FIRST, before interpreting any other field. |
 | `layout_version` | Bumped whenever the pool size, carve order or descriptor content of `../pipelines/mono_aec_nr_res/audio_pipeline.c` changes — including a change of the composed AEC, NR or FFT pool size, which moves `bytes`. A cached `bytes` alone is only a lower bound, so this counter is what refuses a descriptor persisted by another build. |
-| `backend_id` | Compile-time FFT backend identity this `audio_pipeline.o` was built with, as a small integer — `AUDIO_PIPELINE_BACKEND_NE10` (2), the only FFT backend (matches `../pipelines/Makefile`'s `BACKEND=`; value 1 belonged to the removed KISS backend, is retired, and is never returned). A process-local rodata pointer cannot be serialized safely, so `backend_id` is compared with a plain integer `==`. A descriptor carrying any other value (for example `1`, from a build made before the KISS backend was removed) is never valid, even at matching `bytes`. `0` is reserved for "unknown backend" and is never present in a descriptor this library actually returns — `audio_pipeline_get_mem_requirements()` rejects an unrecognized backend string outright. |
-| `build_flags_hash` | FNV-1a-32 of a small fixed set of compile-time strings that affect the pipeline's own carve STRUCTURE: the backend identity above, a literal token list naming the 8 scratch buffers in carve order, and the alignment granularity — see `audio_pipeline_build_flags_hash()` in `../pipelines/mono_aec_nr_res/audio_pipeline.c`. **Covers:** a change to this file's own carve order/buffer set/alignment. **Does NOT cover:** `AudioPipelineConfig` preset/tunable VALUES (`aec_preset`, `nr_mode`, `sample_rate`, `aec_only`, ...) — those change `bytes` but are config, not layout, so a caller re-querying `get_mem_requirements()` for its actual config already gets the right `bytes` regardless of this hash; AEC's/NR's/an FFT backend's internal struct layouts (opaque blobs, as above); the compiler/ABI/toolchain. |
+| `backend_id` | Compile-time FFT backend identity this `audio_pipeline.o` was built with, as a small integer — `AUDIO_PIPELINE_BACKEND_NE10` (2), the only FFT backend (matches `../pipelines/Makefile`'s `BACKEND=`). A process-local rodata pointer cannot be serialized safely, so `backend_id` is compared with a plain integer `==`. A descriptor carrying any other value is never valid, even at matching `bytes`. `0` is reserved for "unknown backend" and is never present in a descriptor this library actually returns — `audio_pipeline_get_mem_requirements()` rejects an unrecognized backend string outright. |
+| `build_flags_hash` | FNV-1a-32 of a small fixed set of compile-time strings that affect the pipeline's own carve STRUCTURE: the backend identity above, a literal carve-order token list, and the alignment granularity — see `audio_pipeline_build_flags_hash()` in `../pipelines/mono_aec_nr_res/audio_pipeline.c`. **Covers:** a change to this file's own carve order/buffer set/alignment. **Does NOT cover:** `AudioPipelineConfig` preset/tunable VALUES (`aec_preset`, `nr_mode`, `sample_rate`, `aec_only`, ...) — those change `bytes` but are config, not layout, so a caller re-querying `get_mem_requirements()` for its actual config already gets the right `bytes` regardless of this hash; AEC's/NR's/an FFT backend's internal struct layouts (opaque blobs, as above); the compiler/ABI/toolchain. |
 | `alignment` | Required base alignment of the pool pointer, bytes. Always 16 today (the one alignment every module in this stack — AEC, NR, the NE10 FFT backend, `mem_align.h`'s `ALIGN16` — carves to). `uint32_t`, not `size_t`. |
 | `reserved` | Always 0. Exists only so `bytes` (a `uint64_t`) lands on an 8-byte-aligned offset within the struct with no compiler-inserted padding — part of the fixed 32-byte layout, not a field to read or write. |
-| `bytes` | Total pool size to allocate (includes the opaque `AudioPipeline` control block itself, carved at the front — a few hundred bytes — plus AEC + FFT(OLA) + NR + the 8 pipeline scratch buffers, same carve `aec_nr_pipeline_static.c`'s old file-local `pipeline_pool_size()` produced). `uint64_t`, not `size_t` — cast to `size_t` before passing to `malloc`/`posix_memalign`/`audio_pipeline_init*()` on a target where the two widths differ. |
+| `bytes` | Total pool size to allocate (includes the opaque `AudioPipeline` control block itself, carved at the front — a few hundred bytes — plus AEC + FFT(OLA) + NR + the pipeline scratch buffers). `uint64_t`, not `size_t` — cast to `size_t` before passing to `malloc`/`posix_memalign`/`audio_pipeline_init*()` on a target where the two widths differ. |
 
 `audio_pipeline_init_ex(mem, bytes, cfg, expected)` (see "Sequence" above)
 automates exactly this comparison: passing the descriptor straight back in
 as `expected` makes the library itself recompute the CURRENT
 `descriptor_version`/`layout_version`/`backend_id`/`build_flags_hash`/
 `alignment`/`bytes` and reject (`NULL`, with a diagnostic naming the
-mismatched field) unless every one still agrees with `expected` — a board
-integrator no longer has to hand-write this comparison. The one discipline
+mismatched field) unless every one still agrees with `expected`, so a board
+integrator does not hand-write this comparison. The one discipline
 this does NOT relieve you of: `expected` must itself have been queried
 freshly (see "Warnings" above) — `audio_pipeline_init_ex()` can only compare
 what it's given against what the CURRENT build computes; it has no way to
@@ -243,8 +236,8 @@ serialization":
 ## Dirty-pool contract
 
 `audio_pipeline_init()` does **not** require a zero-filled pool. Every
-pipeline-owned scratch buffer (the OLA accumulator, per-bin gain/spectrum
-scratch, the aec_out hop copy) is explicitly zeroed at carve time,
+pipeline-owned scratch buffer (the OLA accumulator and the per-bin
+gain/spectrum scratch) is explicitly zeroed at carve time,
 and AEC/NR/the FFT backend each zero their own sub-region during their own
 `_init()` — so a pool filled with poison bytes inits and processes
 identically to a freshly-zeroed one.
@@ -254,18 +247,6 @@ bytes)`-poisoned pool run through `audio_pipeline_init()` produces
 byte-for-byte the same 1000-hop output as `audio_pipeline_create()`'s
 (unpoisoned) heap path. There is no need for a caller-side blanket
 `memset(pool, 0, bytes)` before `audio_pipeline_init()`.
-
-## `USE_EXT_MEM` — not a thing here
-
-Both the heap path (`audio_pipeline_create`/`audio_pipeline_destroy`) and the
-pool path (`audio_pipeline_get_mem_requirements`/`audio_pipeline_init`/
-`audio_pipeline_destroy`) are always compiled into `libaudio_pipeline.a` —
-which one you use is selected purely by which entry point you call, at
-runtime, same as `lib/aec`'s and `lib/nr`'s own `_create` vs. `_get_mem_size`/
-`_init` pairs. There is no `-DUSE_EXT_MEM`-style compile-time switch (that
-pattern existed historically in `lib/nr` and was removed — see
-`lib/nr/c_impl/CHANGELOG.md` `[v1.11.0]`/later entries); do not look for one,
-and do not add one.
 
 ## `NO_STDIO=1` — building without libc stdio
 
@@ -324,12 +305,11 @@ instance) → AEC — the reverse of `audio_pipeline_init()`'s carve order (AEC 
 FFT → NR → scratch). Every one of those three calls is a genuine no-op for a
 pool-resident instance today, with the NE10 backend (matches the "Two
 Versions" section in [`../pipelines/README.md`](../pipelines/README.md) —
-NE10's twiddle configs moved fully into the pool under vendored patch
-P0001, closing the one case that used to need a real
-release); the order is kept anyway as forward-compat insurance — a future
-backend/module MAY hold something outside the pool that a destroy call
-needs to release, and it is exactly what the heap-convenience path needs
-for real (`free()` on the pool `audio_pipeline_create()` allocated).
+NE10's twiddle configs live in the pool under vendored patch
+P0001); the order is kept anyway — a future backend/module may hold
+something outside the pool that a destroy call needs to release, and it is
+exactly what the heap-convenience path needs for real (`free()` on the pool
+`audio_pipeline_create()` allocated).
 
 ## Board-side verification checklist
 
@@ -387,8 +367,8 @@ platform allocator, DMA engine, or power state behind that pointer.
   `audiolib`'s own zero-heap tests use), confirm NO `malloc`/`calloc`/
   `realloc`/`free` call happens between `audio_pipeline_init_ex()`
   returning and the matching `audio_pipeline_destroy()` returning, ON YOUR
-  ACTUAL TARGET BUILD — NE10 is zero-heap end-to-end since
-  P0001 (see "Two Versions" in
+  ACTUAL TARGET BUILD — NE10 is zero-heap end-to-end
+  (vendored patch P0001; see "Two Versions" in
   [`../pipelines/README.md`](../pipelines/README.md)), but that is a
   property of THIS repo's reference builds, not a substitute for verifying
   your own board's build.
@@ -456,9 +436,7 @@ either, both, or neither may be needed for a given publish.
 
 This repo's own untracked check is **whitelisted by prefix**: any path
 starting `AINR/GTCRN/` or `AINR/gtcrn_github/` never counts against a
-publish here (neither the refusal nor the provenance hash) — this working
-tree permanently carries those two directories as user-owned content that
-is never staged for a release. The three producers get **no such
+publish here (neither the refusal nor the provenance hash). The three producers get **no such
 whitelist**: an untracked file there is always a violation.
 
 **Attestations are UNSIGNED**: they provide traceability, not authenticity
@@ -484,7 +462,7 @@ phony, so it always would run — with no output and no recursion); `-t`
 (alone or combined) is an **explicit no-op**: one note printed to stdout
 and exit 0, with no recursion. `OBJ_ROOT=`/`BIN_ROOT=` relocate this
 repo's own keyed obj/bin build trees (default: `obj/`/`bin/` under
-`../pipelines/`, byte-identical to the previous hardcoded paths) — like `DIST_ROOT=`, these
+`../pipelines/`) — like `DIST_ROOT=`, these
 are isolation-test knobs for running scratch-directory builds, not part of
 the build's config identity (CFG_SIG).
 
@@ -520,19 +498,17 @@ Guard rails (all four repos):
   supported hooks. `EXTRA_CFLAGS` containing `-Ofast`/`-ffast-math`/
   `-ffp-contract=` is likewise rejected by the FP-policy conflict gate.
 - **C++ runtime comes from the C++ driver** (`libstdc++` on GNU/Linux gcc,
-  `libc++` on macOS/clang) — there is no hardcoded `-lc++` anywhere any
-  more, so GNU toolchains link cleanly.
+  `libc++` on macOS/clang) — there is no hardcoded `-lc++`, so GNU
+  toolchains link cleanly.
 
 ## Compile flags (`EXTRA_CFLAGS`)
 
 `../pipelines/Makefile` passes `EXTRA_CFLAGS` through to the `lib/aec` and
 `lib/nr` sub-builds *and* this pipeline's own compile, so one invocation
-reaches every `.o`. The fast matched-filter arithmetic and delay-estimator
-duty-cycling are built in unconditionally — there are no optional
-performance flags at present.
+reaches every `.o`. There are no optional performance flags.
 
 No manual `make clean-libs` is needed when switching `EXTRA_CFLAGS` (or
-`BACKEND`/`WERROR`): objects are now flag-keyed — each distinct combination
+`BACKEND`/`WERROR`): objects are flag-keyed — each distinct combination
 of `BACKEND`/`CFLAGS`/`EXTRA_CFLAGS`/`WERROR` lands in its own hash-named
 object directory (`obj/<backend>-<config-hash>/`, both under
 `../pipelines/` and independently in `lib/aec`'s and `lib/nr`'s own

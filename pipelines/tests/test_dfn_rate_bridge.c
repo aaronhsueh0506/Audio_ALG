@@ -12,7 +12,7 @@
 #include "dfn_rate_bridge.h"
 #include "audio_stft.h"
 #include "fft_wrapper.h"
-#include "utility/mem_align.h"   /* ALIGN16 -- was transitively reached via fft_wrapper.h */
+#include "utility/mem_align.h"   /* ALIGN16 */
 #include "tests/dfn_test_fixture.h"
 
 #define MAX_FFT 512
@@ -76,7 +76,7 @@ static int expected_added_delay(int sr, int hop) {
     return prefill + 16 + 1536 * sr / 48000 + 16;
 }
 
-/* Run `hops` hops of estimate=est_signal, apply=app_signal (either may be
+/* Run `hops` hops of estimate=est, apply=app (either may be
  * NULL for silence) through a fresh bridge; output into out. */
 static int run_bridge(DfnRateBridge *b, Analyzer *ae, Analyzer *ap,
                       const float *est, const float *app, int hops,

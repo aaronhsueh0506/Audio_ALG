@@ -1,14 +1,13 @@
-"""
-DeepFilterNet3 adaptation with config-driven sample rate and FFT size.
+"""DeepFilterNet3 with config-driven sample rate and FFT size.
 
-Architecture overview (aligned with released DeepFilterNet3 topology):
-  - Encoder: ERB path (4 levels, freq stride-2 ×2) + DF path (2 levels)
-             → joint embedding GRU
-  - ERBDecoder: U-Net transposed conv × 4 → sigmoid ERB mask
-  - DFDecoder: GRU → per-bin FIR coefficients
-  - deep_filter_apply: causal real/imag FIR filtering on low-freq bins
+Architecture (released DeepFilterNet3 topology):
+  - Encoder: ERB path (4 levels, freq stride-2 x2) + DF path (2 levels)
+             -> joint embedding GRU
+  - ERBDecoder: U-Net transposed conv x 4 -> sigmoid ERB mask
+  - DFDecoder: GRU -> per-bin FIR coefficients
+  - deep_filter_apply: causal real/imag FIR filtering on low-frequency bins
 
-Convention: (B, C, T, F) throughout (time = H dim 2, freq = W dim 3).
+Convention: (B, C, T, F) throughout (time = dim 2, freq = dim 3).
 """
 
 import math
@@ -20,15 +19,11 @@ import torch.nn as nn
 import torch.nn.functional as F
 
 
-# ============================================================
-# ERB filterbank helpers
-# ============================================================
+# ---- ERB filterbank helpers ----
 
 def freq2erb(freq_hz):
-    """Hz -> ERB-number (Glasberg-Moore). Verified bit-for-bit against
-    upstream Rikorose/DeepFilterNet's libDF/src/lib.rs freq2erb (9.265/24.7
-    constants) and this project's own aaronhsueh0506/DeepFilterNet-Keras
-    bandERB.ipynb -- also the exact formula RNNoise-ERB's train.py uses."""
+    """Hz -> ERB-number (Glasberg-Moore; 9.265/24.7 constants as in libDF freq2erb
+    and RNNoise-ERB train.py)."""
     return 9.265 * np.log(1.0 + freq_hz / (24.7 * 9.265))
 
 
@@ -38,20 +33,15 @@ def erb2freq(n_erb):
 
 
 def erb_bandborder(n_bands, sr, n_fft, min_bins_per_band=2):
-    """Port of aaronhsueh0506/DeepFilterNet-Keras bandERB.ipynb's ERBBand():
-    returns nfftborder, a length-N (N = n_bands) int array of FFT-bin band
-    borders on the Glasberg-Moore ERB scale. nfftborder[0]=0 (DC),
-    nfftborder[-1]=n_fft//2+1 (Nyquist+1). N borders -> N ERB bands (one
-    matrix column each, see compute_erb_matrix):
+    """ERB band borders as FFT-bin indices on the Glasberg-Moore scale (after
+    bandERB.ipynb ERBBand()).
+
+    Returns a length-N (N = n_bands) int array with nfftborder[0] = 0 (DC) and
+    nfftborder[-1] = n_fft//2 + 1; N borders give N ERB bands.
         cutoffs = erb2freq(linspace(freq2erb(0), freq2erb(sr/2), N))
         ideal border = round((cutoff + bw/2) / bw), bw = sr/n_fft
-
-    Band-width enforcement: strict greedy-forward minimum (every consecutive
-    border pair is >= min_bins_per_band bins apart, only ever borrowing
-    forward). This is RNNoise-ERB train.py's own v5 fix, applied here from
-    the start: the original notebook's "every-OTHER-band-pair >= 2" rule
-    (checked only i, i+2) does not actually guarantee every individual band
-    is >= 2 bins wide.
+    Band width is enforced greedily forward, so every consecutive border pair is
+    at least min_bins_per_band bins apart (as in RNNoise-ERB train.py).
     """
     n_bins = n_fft // 2 + 1
     high_lim = sr / 2.0
@@ -70,16 +60,15 @@ def erb_bandborder(n_bands, sr, n_fft, min_bins_per_band=2):
 
 
 def compute_erb_matrix(nfftborder, n_fft, mode=0):
-    """Port of bandERB.ipynb's ERB_pro_matrix(nfftborder, NFFT, mode) --
-    identical to RNNoise-ERB train.py's compute_erb_matrix(). Triangular ERB
-    filterbank, shape (n_bins, N) with N = len(nfftborder) bands. The
-    range(N-1) blocks lie BETWEEN consecutive borders, so column 0 (falling
-    ramp only) and column N-1 (rising ramp only) are ONE-SIDED; interior
-    columns are full triangles.
-        mode=0 (forward / feature ERBB): x2 on the two one-sided edge
-               columns so their band energy is comparable to interior bands.
-        mode=1 (inverse / mask expansion): no x2 -- a clean partition of
-               unity, so gain=1 maps to bin_gain=1 with NO row normalisation.
+    """Triangular ERB filterbank (after bandERB.ipynb ERB_pro_matrix), shape
+    (n_bins, N) with N = len(nfftborder) bands.
+
+    The range(N-1) blocks lie between consecutive borders, so column 0 and column
+    N-1 are one-sided and interior columns are full triangles.
+        mode=0 (forward / feature): x2 on the two edge columns so their band
+               energy is comparable to interior bands.
+        mode=1 (inverse / mask expansion): no x2; a partition of unity, so gain=1
+               maps to bin_gain=1 without row normalisation.
     """
     n_bins = n_fft // 2 + 1
     N = len(nfftborder)
@@ -97,19 +86,12 @@ def compute_erb_matrix(nfftborder, n_fft, mode=0):
 
 
 def _build_erb_fb(n_fft: int, sr: int, n_erb: int):
-    """
-    Build ERB band-assignment matrices for the configured sample rate and FFT.
-    Ported from this project's own aaronhsueh0506/DeepFilterNet-Keras
-    bandERB.ipynb (ERBBand()/ERB_pro_matrix()) -- the same triangular
-    construction RNNoise-ERB's train.py uses (erb_bandborder()/
-    compute_erb_matrix()), including the v5 strict-minimum-band-width fix.
+    """Build ERB band-assignment matrices for the configured sample rate and FFT.
 
     Returns:
-        erb_fb   : (n_erb, n_bins) — forward transform (mode=0: edge columns
-                   doubled so their band energy is comparable to interior
-                   bands, matching bandERB.ipynb -- NOT normalised to sum 1)
-        erb_inv  : (n_erb, n_bins) — inverse transform (mode=1: clean
-                   partition-of-unity by construction, no row normalisation)
+        erb_fb   : (n_erb, n_bins) forward transform (mode=0, edge columns
+                   doubled; not normalised to sum 1)
+        erb_inv  : (n_erb, n_bins) inverse transform (mode=1, partition of unity)
     """
     borders = erb_bandborder(n_erb, sr, n_fft)
     fb = compute_erb_matrix(borders, n_fft, mode=0).T.copy()   # (n_erb, n_bins)
@@ -117,24 +99,16 @@ def _build_erb_fb(n_fft: int, sr: int, n_erb: int):
     return torch.from_numpy(fb), torch.from_numpy(inv)
 
 
-# ============================================================
-# Building blocks
-# ============================================================
+# ---- Building blocks ----
 
 class SeparableConv2d(nn.Module):
     """Separable Conv2d + BN + ReLU, causal on the time axis.
 
-    Matches upstream ``Conv2dNormAct`` (df/modules.py):
-      * grouping is ``gcd(in_ch, out_ch)`` and the *first* conv already changes
-        the channel count, followed by a 1x1 pointwise.  When in_ch == out_ch
-        this is the usual depthwise+pointwise pair; when they differ (the input
-        convs) it is NOT, which is why this used to diverge.
-      * activation is ReLU, not PReLU.
-      * the time axis is padded ``kernel[0] - 1`` on the LEFT ONLY, so the conv
-        is strictly causal.  The previous version always passed
-        ``padding=(0, kf//2)``, i.e. zero time padding — correct only for
-        kt == 1, and silently wrong (output shrinks in time, no causal pad) for
-        any larger temporal kernel such as DeepFilterNet3-ll's (2, 3).
+    Matches upstream ``Conv2dNormAct``: grouping is ``gcd(in_ch, out_ch)`` and the
+    first conv already changes the channel count, followed by a 1x1 pointwise (the
+    usual depthwise+pointwise pair only when in_ch == out_ch); activation is ReLU;
+    the time axis is padded ``kernel[0] - 1`` on the left only, so the conv is
+    strictly causal for any temporal kernel.
     """
 
     def __init__(self, in_ch, out_ch, kernel=(1, 3), stride=(1, 1), padding=None,
@@ -160,9 +134,8 @@ class SeparableConv2d(nn.Module):
 class SeparableConvTranspose2d(nn.Module):
     """Separable ConvTranspose2d + BN + ReLU, causal on the time axis.
 
-    Matches upstream ``ConvTranspose2dNormAct``: the *transpose* runs first
-    (with ``groups = gcd``), then the 1x1 pointwise.  The previous version had
-    the order reversed (pointwise first, then a depthwise transpose).
+    Matches upstream ``ConvTranspose2dNormAct``: the *transpose* runs first (with
+    ``groups = gcd``), then the 1x1 pointwise.
     """
 
     def __init__(self, in_ch, out_ch, kernel=(1, 3), stride=(1, 1), padding=None,
@@ -170,9 +143,8 @@ class SeparableConvTranspose2d(nn.Module):
         super().__init__()
         kt, kf = kernel
         fpad = kf // 2 if padding is None else padding[1]
-        # Upstream ConvTranspose2dNormAct hardcodes output_padding=(0, kf//2);
-        # with padding=(kt-1, kf//2) that makes F_out exactly stride*F_in, so
-        # the shape-matching heuristic the decoder used to carry is unnecessary.
+        # Upstream hardcodes output_padding=(0, kf//2); with padding=(kt-1, kf//2)
+        # this makes F_out exactly stride*F_in.
         if output_padding is None:
             output_padding = (0, fpad)
         groups = math.gcd(in_ch, out_ch) if separable else 1
@@ -196,18 +168,14 @@ class LookaheadConv2d(nn.Sequential):
     """Conv2d with an explicit, streaming-compatible temporal lookahead.
 
     For a temporal kernel of size ``K`` and lookahead ``L``, output frame ``t``
-    consumes input frames ``[t-(K-L-1), ..., t+L]``.  Frequency padding remains
-    symmetric.  This makes the frame alignment explicit instead of relying on
-    Conv2d's symmetric time padding.
-
-    Equivalent to upstream's scheme (strictly causal convs plus a whole-stream
-    feature shift ``ConstantPad2d((0, 0, -L, L))``): at L = 1 both give the
-    receptive field ``[t-1, t, t+1]``.  Doing it inside the conv keeps the
-    alignment explicit for the streaming port.
+    consumes input frames ``[t-(K-L-1), ..., t+L]``; frequency padding stays
+    symmetric. This equals upstream's strictly causal convs plus a whole-stream
+    feature shift (at L = 1 both give ``[t-1, t, t+1]``) but keeps the alignment
+    explicit for the streaming port.
 
     Separability follows upstream: ``groups = gcd(in_ch, out_ch)``, so the ERB
-    input conv (1 -> C, gcd = 1) is dense while the DF input conv (2 -> C,
-    gcd = 2) is grouped + pointwise.
+    input conv (1 -> C) is dense while the DF input conv (2 -> C) is grouped +
+    pointwise.
     """
 
     def __init__(self, in_ch, out_ch, kernel=(3, 3), lookahead=0, separable=True):
@@ -234,25 +202,15 @@ class LookaheadConv2d(nn.Sequential):
 
 
 class GroupedLinearEinsum(nn.Module):
-    """Grouped linear projection, no bias — upstream df/modules.py.
+    """Grouped linear projection, no bias (upstream df/modules.py).
 
     Weight is (G, I/G, H/G) and the input is reshaped to (B, T, G, I/G) before
-    an einsum, so each group only sees its own slice of the feature axis.  With
-    G groups this is G x fewer parameters than a dense Linear of the same
-    shape.
-
-    ⚠ There are THREE group counts in play, not two.  Upstream's shipped config
-    sets linear_groups=16 and enc_linear_groups=32, but df_dec.df_gru gets
-    NEITHER: deepfilternet3.py:297-304 simply never passes linear_groups at that
-    one site, so SqueezedGRU_S's own module default of 8 applies.  The released
-    checkpoint proves it -- df_dec.df_gru.linear_in.0.weight is (8, 64, 32) --
-    and deepfilternet2.py:328-334 has the identical omission, so it is a
-    long-standing upstream pattern, not a DFN3 typo.  "Fixing" df_gru to 16
-    leaves the model 8,192 params short of the checkpoint.  See the matching
-    warning in DFN2DfDecoder and UPSTREAM_ALIGNMENT.md do-not-touch item 9.
-
-    Note there is deliberately NO bias (upstream registers only 'weight'), and
-    kaiming init on the 3-D weight makes torch use fan_in = (I/G)*(H/G).
+    an einsum, so each group sees only its slice of the feature axis. There is
+    deliberately no bias (upstream registers only 'weight'). Group counts:
+    upstream's linear_groups=16 and enc_linear_groups=32, while df_dec.df_gru
+    never receives linear_groups and uses SqueezedGRU_S's default of 8 (the
+    released checkpoint's df_dec.df_gru.linear_in.0.weight is (8, 64, 32));
+    changing it to 16 breaks checkpoint compatibility.
     """
 
     def __init__(self, input_size, hidden_size, groups=1):
@@ -269,10 +227,9 @@ class GroupedLinearEinsum(nn.Module):
     def forward(self, x):
         b, t, _ = x.shape
         x = x.view(b, t, self.groups, self.ws)
-        # Grouped matmul written as broadcast matmul rather than einsum: the
-        # ONNX Einsum op is widely unsupported by accelerator toolchains,
-        # while this form exports as a plain MatMul. (b,t,g,1,i)@(g,i,h) ->
-        # (b,t,g,1,h); identical contraction order, identical numerics.
+        # Grouped matmul as a broadcast matmul instead of einsum: the ONNX Einsum
+        # op is unsupported by many accelerator toolchains, and this form exports
+        # as a plain MatMul with the same contraction order.
         x = (x.unsqueeze(-2) @ self.weight).squeeze(-2)
         return x.flatten(2, 3)
 
@@ -282,13 +239,12 @@ class GroupedLinearEinsum(nn.Module):
 
 
 class SqueezedGRU_S(nn.Module):
-    """Grouped-linear squeeze -> GRU -> optional grouped-linear expand.
+    """Grouped-linear squeeze -> GRU -> optional grouped-linear expand (upstream
+    df/modules.py).
 
-    Upstream df/modules.py.  The GRU itself is always hidden->hidden; the
-    512<->256 width change is done by the bias-free GroupedLinearEinsum pair,
-    which is why upstream's GRUs are all 256->256 while its embedding bus is
-    512 wide.  ``_S`` places the optional skip on the raw input AFTER
-    linear_out (DFN2's plain SqueezedGRU added it before).
+    The GRU is always hidden->hidden; the 512<->256 width change is done by the
+    bias-free GroupedLinearEinsum pair. ``_S`` places the optional skip on the raw
+    input after linear_out.
     """
 
     def __init__(self, input_size, hidden_size, output_size=None, num_layers=1,
@@ -311,13 +267,8 @@ class SqueezedGRU_S(nn.Module):
             self.linear_out = nn.Identity()
 
     def forward(self, x, h=None):
-        # ⚠ The skip is fed the RAW input, not linear_in's output -- upstream
-        # df/modules.py:732-738 closes over its `input` argument.  Dormant here
-        # (all three call sites pass gru_skip_op=None and the released checkpoint
-        # has no gru_skip keys), and enabling it with the squeezed activation
-        # would fail loudly on the width rather than silently, which is how the
-        # mis-wiring survived.  Fixed anyway: this is a reusable block and its
-        # docstring above describes the upstream behaviour.
+        # The skip is fed the raw input, not linear_in's output (as upstream). It
+        # is dormant here: every call site passes gru_skip_op=None.
         skip_in = x
         x = self.linear_in(x)
         y, h = self.gru(x, h)
@@ -327,9 +278,7 @@ class SqueezedGRU_S(nn.Module):
         return y, h
 
 
-# ============================================================
-# Encoder
-# ============================================================
+# ---- Encoder ----
 
 class DFN3Encoder(nn.Module):
     def __init__(self, n_erb, df_bins, enc_ch=64, emb_size=256,
@@ -351,50 +300,32 @@ class DFN3Encoder(nn.Module):
         )
         self.df_conv1 = SeparableConv2d(enc_ch, enc_ch, conv_kernel, stride=(1, 2))
 
-        # Embedding bus is enc_ch * n_erb//4 (n_erb//4 because erb_conv1 and
-        # erb_conv2 each halve the frequency axis).  At the upstream conv_ch=64
-        # this is 512, NOT emb_size.
+        # Embedding bus is enc_ch * n_erb//4 (erb_conv1 and erb_conv2 each halve
+        # the frequency axis): 512 at conv_ch=64, not emb_size.
         self.emb_dim = enc_ch * (n_erb // 4)          # the bus, in and out
         df_feat_dim = enc_ch * (df_bins // 2)
 
-        # Upstream has NO projection on the ERB branch: e3 is flattened and fed
-        # straight into `combine`.  Only the DF branch is projected, and with
-        # enc_lin_groups (32) rather than lin_groups.
+        # As upstream, the ERB branch is flattened straight into `combine`; only
+        # the DF branch is projected, with enc_lin_groups (32).
         self.df_fc_emb = nn.Sequential(
             GroupedLinearEinsum(df_feat_dim, self.emb_dim, groups=enc_lin_groups),
             nn.ReLU(inplace=True),
         )
-        # enc_concat=False upstream -> the branches are ADDED and the bus stays one
-        # width.  ⚠ Concatenating doubles only what the GRU CONSUMES; what it
-        # EMITS stays one bus wide, because both decoders are built for that
-        # (deepfilternet3.py:125-136,152-155).
+        # enc_concat=False (upstream): the branches are added, so the bus stays
+        # one width.
         self.enc_concat = enc_concat
         gru_in_dim = self.emb_dim * 2 if enc_concat else self.emb_dim
 
-        # One GRU layer here; the remaining emb_num_layers-1 live in the ERB
-        # decoder.  Upstream hardcodes num_layers=1 at this site even though
-        # emb_num_layers defaults to 2 -- reading that config value as the
-        # encoder's depth is the trap this port previously fell into.
+        # One GRU layer here; the other emb_num_layers-1 live in the ERB decoder
+        # (upstream hardcodes 1 at this site).
         self.emb_gru = SqueezedGRU_S(
             gru_in_dim, emb_size, output_size=self.emb_dim,
             num_layers=1, linear_groups=lin_groups, gru_skip_op=None,
             linear_act_layer=partial(nn.ReLU, inplace=True),
         )
-        # No lsnr head: upstream trains one with [localsnrloss] factor = 1e-3,
-        # but this port deliberately omits that loss term, so the head would be
-        # untrained dead weight.  (Verified upstream: enc.lsnr_fc weights span
-        # -3.72..+1.35, far outside their +-0.0442 init bound, i.e. trained.)
-        # Its measured contribution to upstream's total loss is 0.2-4%
-        # (0.001-0.228 vs MRSL 2.5-33), most of it landing on the head's own 513
-        # params, and the 2,135,484 - 513 reconciliation depends on its absence.
-        #
-        # ⚠ THE COST IS AT INFERENCE, NOT IN TRAINING.  Upstream's runtime
-        # (tract.rs:658-672) uses lsnr to SKIP the ERB stage on clean speech and
-        # the whole DF stage on lightly-noisy frames.  Without the head, a
-        # C/streaming port of this model cannot reproduce either the per-frame
-        # compute saving or the "don't touch clean speech" behaviour, and must
-        # run both stages on every frame.  Budget for that, not for the 513
-        # params.
+        # No lsnr head: its loss term is not trained here. Upstream's runtime uses
+        # lsnr to skip the ERB/DF stages on clean or lightly noisy frames, so a
+        # streaming port of this model runs both stages on every frame.
 
     def forward(self, feat_erb, feat_spec):
         """
@@ -411,16 +342,11 @@ class DFN3Encoder(nn.Module):
         c0 = self.df_conv0(feat_spec)    # (B, enc_ch, T, df_bins)
         c1 = self.df_conv1(c0)           # (B, enc_ch, T, df_bins//2)
 
-        # Flatten.  The ERB branch goes into `combine` UNPROJECTED (upstream
-        # has no counterpart to the old erb_fc); only the DF branch is
-        # projected, down to the same width.
-        # Frequency-major: (B, C, T, F) -> (B, T, F, C) -> flatten.  Upstream
-        # does exactly this (`e3.permute(0, 2, 3, 1).flatten(2)`), and the ERB
-        # decoder's `emb.view(b, t, f8, -1)` only reconstitutes the spatial map
-        # correctly under this layout.  Channel-major flattening has the same
-        # parameter count but hands GroupedLinearEinsum a different partition:
-        # F-major makes each group a contiguous frequency span, C-major makes
-        # it a set of channels spanning all frequencies.
+        # Flatten frequency-major, (B, C, T, F) -> (B, T, F, C) -> flatten, as
+        # upstream: the ERB decoder's emb.view(b, t, f8, -1) only reconstitutes the
+        # spatial map under this layout, and each GroupedLinear group is then a
+        # contiguous frequency span. The ERB branch enters `combine` unprojected;
+        # only the DF branch is projected.
         B, _, T, _ = e3.shape
         e3_flat = e3.permute(0, 2, 3, 1).reshape(B, T, -1)   # (B, T, n_erb//4 * enc_ch)
         c1_flat = c1.permute(0, 2, 3, 1).reshape(B, T, -1)   # (B, T, df_bins//2 * enc_ch)
@@ -436,22 +362,15 @@ class DFN3Encoder(nn.Module):
         return e0, e1, e2, e3, emb, c0
 
 
-# ============================================================
-# ERB Decoder
-# ============================================================
+# ---- ERB Decoder ----
 
 class ERBDecoder(nn.Module):
     """4-level U-Net decoder: emb -> (B, 1, T, n_erb) sigmoid mask.
 
-    Encoder features enter through 1x1 *pathway* convolutions and are ADDED to
-    the running decoder state, which is upstream's structure (``conv3p`` ..
-    ``conv0p`` in ErbDecoder).  This port previously concatenated the skips and
-    fed 2*enc_ch into each transposed conv.  Concat and pathway+add can be made
-    to agree on parameter count, so nothing about the totals reveals which one
-    is in use -- but they are different functions.
-
-    Note ``convt3`` and ``conv0_out`` are ordinary convolutions, not transposed
-    ones: only the two stride-2 stages upsample the frequency axis.
+    Encoder features enter through 1x1 pathway convolutions and are added to the
+    running decoder state (upstream conv3p .. conv0p); concatenating the skips
+    would be a different function. ``convt3`` and ``conv0_out`` are ordinary
+    convolutions: only the two stride-2 stages upsample the frequency axis.
     """
 
     def __init__(self, n_erb, enc_ch=64, emb_size=256, conv_kernel=(1, 3),
@@ -459,17 +378,10 @@ class ERBDecoder(nn.Module):
         super().__init__()
         emb_dim = enc_ch * (n_erb // 4)
 
-        # THE decoder recurrence.  Upstream splits emb_num_layers between the
-        # encoder (a hardcoded 1) and here (emb_num_layers - 1); this port
-        # previously put both layers in the encoder and left the ERB decoder
-        # with no recurrence at all.
-        #
-        # No max(1, ...) clamp: upstream is a bare subtraction
-        # (deepfilternet3.py:216) and nn.GRU rejects num_layers=0 loudly.  The
-        # clamp silently built 1 + 1 = 2 layers at emb_num_layers = 1 while the
-        # config said 1, quietly breaking the total-depth invariant documented in
-        # config.ini.  Failing is the correct response to a config that cannot be
-        # honoured.
+        # Decoder recurrence: upstream splits emb_num_layers between the encoder
+        # (1) and here (emb_num_layers - 1). There is no max(1, ...) clamp: a
+        # config that cannot be honoured must fail (nn.GRU rejects num_layers=0)
+        # instead of silently changing the total depth.
         self.emb_gru = SqueezedGRU_S(
             emb_dim, emb_size, output_size=emb_dim,
             num_layers=emb_num_layers - 1, linear_groups=lin_groups,
@@ -478,9 +390,9 @@ class ERBDecoder(nn.Module):
         # DFN3 uses a separate convt_kernel; DFN2 reused conv_kernel.
         convt_kernel = convt_kernel or conv_kernel
 
-        # Pathway convs are 1x1, so `max(kernel) == 1` disables the pointwise
-        # stage while groups stays gcd(C, C) = C: a depthwise per-channel
-        # scale, exactly as upstream builds it.
+        # Pathway convs are 1x1, so max(kernel) == 1 disables the pointwise stage
+        # while groups stays gcd(C, C) = C: a depthwise per-channel scale, as
+        # upstream.
         self.conv3p = SeparableConv2d(enc_ch, enc_ch, (1, 1))
         self.convt3 = SeparableConv2d(enc_ch, enc_ch, conv_kernel)
         self.conv2p = SeparableConv2d(enc_ch, enc_ch, (1, 1))
@@ -501,7 +413,7 @@ class ERBDecoder(nn.Module):
         B, T, _ = emb.shape
         x, _ = self.emb_gru(emb)                       # (B, T, n_erb//4 * enc_ch)
         # Frequency-major, matching the encoder's flatten and upstream's
-        # `emb.view(b, t, f8, -1).permute(0, 3, 1, 2)`.
+        # emb.view(b, t, f8, -1).permute(0, 3, 1, 2).
         x = x.reshape(B, T, self.n_erb_4, self.enc_ch)
         x = x.permute(0, 3, 1, 2)                      # (B, enc_ch, T, n_erb//4)
 
@@ -511,16 +423,11 @@ class ERBDecoder(nn.Module):
         return self.conv0_out(self.conv0p(e0) + x)     # (B, 1, T, n_erb)
 
 
-# ============================================================
-# DF Decoder
-# ============================================================
+# ---- DF Decoder ----
 
 class DFDecoder(nn.Module):
-    """
-    Per-frame, per-bin FIR filter coefficients.  DFN2's alpha blend weight is
-    gone: DFN3 splits the spectrum by band instead of blending, so there is
-    nothing for an alpha to weigh.
-    """
+    """Per-frame, per-bin FIR filter coefficients. DFN3 splits the spectrum by
+    band instead of blending, so there is no alpha head."""
     def __init__(self, df_bins, df_order, df_hidden=256, emb_in_dim=512,
                  enc_ch=64, conv_kernel=(1, 3), num_layers=2, lin_groups=16,
                  df_gru_skip='groupedlinear', pathway_kernel_size_t=5):
@@ -529,11 +436,9 @@ class DFDecoder(nn.Module):
         self.df_order = df_order
         df_out_ch = df_order * 2   # real + imag
 
-        # ⚠ linear_groups is NOT passed here: upstream relies on
-        # SqueezedGRU_S's own default of 8 at this one site, while the encoder
-        # and ERB decoder use 16.  Checkpoint-confirmed
-        # (df_dec.df_gru.linear_in.0.weight has shape (8, 64, 32)).
-        # Do NOT "fix" this to lin_groups.
+        # linear_groups is not passed: upstream relies on SqueezedGRU_S's default
+        # of 8 at this site (checkpoint df_dec.df_gru.linear_in.0.weight is
+        # (8, 64, 32)). Do not change it to lin_groups.
         self.df_gru = SqueezedGRU_S(
             emb_in_dim, df_hidden, num_layers=num_layers, gru_skip_op=None,
             linear_act_layer=partial(nn.ReLU, inplace=True),
@@ -544,11 +449,10 @@ class DFDecoder(nn.Module):
         if df_gru_skip == 'none':
             self.df_skip = None
         elif df_gru_skip == 'identity':
-            # ⚠ DELIBERATELY NOT upstream's guard.  Upstream asserts
-            # emb_hidden_dim == df_hidden_dim (256 == 256, which passes and then
-            # fails to broadcast); the tensor actually being added here is the
-            # emb_in_dim-wide bus, so emb_in_dim == df_hidden is the condition
-            # that matters.  This is a fix, not a slip -- do not "align" it.
+            # Intentionally not upstream's guard (emb_hidden_dim == df_hidden_dim,
+            # which passes and then fails to broadcast): the tensor added here is
+            # the emb_in_dim-wide bus, so emb_in_dim == df_hidden is the condition
+            # that matters.
             assert emb_in_dim == df_hidden, "identity skip needs matching dims"
             self.df_skip = nn.Identity()
         else:
@@ -561,18 +465,13 @@ class DFDecoder(nn.Module):
             GroupedLinearEinsum(df_hidden, df_bins * df_out_ch, groups=lin_groups),
             nn.Tanh(),
         )
-        # Not used by forward -- but released DeepFilterNet3 still carries it,
-        # and its 257 parameters are inside the 2,135,484 this port reconciles
-        # against (ours = 2,135,484 - 513 for the removed lsnr head).  Deleting
-        # it would silently break that reconciliation, which is the only check
-        # that the architecture realignment is complete.
+        # Unused by forward, but released DeepFilterNet3 carries it and its 257
+        # parameters are part of the parameter count this model is reconciled
+        # against (2,135,484 minus the 513 of the omitted lsnr head).
         self.df_fc_a = nn.Sequential(nn.Linear(df_hidden, 1), nn.Sigmoid())
-        # ⚠ Related do-not-restore: released DeepFilterNet3's config declares
-        # convt_depthwise = False, but that key is never READ (deepfilternet3.py
-        # :34-39) -- DFN3 hardcodes separable=True and the checkpoint's transposed
-        # convs are depthwise.  Obeying the shipped key would build dense
-        # transposed convs (12,288 params each vs 192 + 4,096) and break the
-        # reconciliation above.  This port deliberately has no such key.
+        # Released DFN3's convt_depthwise key is never read upstream (separable
+        # is hardcoded and the transposed convs are depthwise), so this port has
+        # no such key.
 
     def forward(self, emb, c0):
         """
@@ -594,37 +493,25 @@ class DFDecoder(nn.Module):
         return coefs
 
 
-# ============================================================
-# Deep Filter Apply
-# ============================================================
+# ---- Deep Filter Apply ----
 
 def deep_filter_apply(spec, coefs, df_bins, df_order, df_lookahead):
-    """
-    Apply a per-bin FIR filter to the lowest df_bins of spec.
+    """Apply a per-bin FIR filter to the lowest df_bins of spec.
 
-    ⚠ Operates on the UNMASKED spectrum.  DFN3 composes DF and the ERB mask as a
-    parallel band split -- DF owns bins < df_bins outright -- so nothing masked
-    reaches this function.  (DFN2 did cascade DF onto the masked spectrum; that
-    is the older design.)  See the comment at the call site.
-
-    ⚠ ``df_lookahead`` is deliberately NOT defaulted: it is a latency decision,
-    it must agree with ``[model] df_lookahead`` in config.ini, and a silent
-    default here previously contradicted the shipped value.
-
-    Streaming ring buffer at the shipped ``df_order=5, df_lookahead=1``:
-    ``history = df_order - df_lookahead - 1 = 3``, so the window is
-    ``[t-3, ..., t+1]`` -- three history frames, the current frame, one future
-    frame, and therefore a one-frame output delay.  Mask lookahead is an
-    independent model delay and must not be folded into this FIR window.
+    Operates on the unmasked spectrum: DFN3 composes the DF and the ERB mask as
+    a parallel band split (DF owns bins < df_bins). ``df_lookahead`` has no
+    default on purpose: it is a latency decision that must agree with ``[model]
+    df_lookahead`` in config.ini. Streaming ring at the shipped ``df_order=5,
+    df_lookahead=1``: history = 3, window ``[t-3, ..., t+1]``, one frame of
+    output delay; mask lookahead is an independent model delay.
 
     Args:
         spec   : (B, n_bins, T) complex
         coefs  : (B, T, df_bins, df_order*2)
-        df_bins: int
-        df_order: int
+        df_bins, df_order: int
         df_lookahead: number of future raw-spectrum frames used by the FIR
     Returns:
-        out    : (B, n_bins, T) complex (only first df_bins modified)
+        out    : (B, n_bins, T) complex (only the first df_bins modified)
     """
     if not 0 <= df_lookahead < df_order:
         raise ValueError(
@@ -660,9 +547,7 @@ def deep_filter_apply(spec, coefs, df_bins, df_order, df_lookahead):
     return out
 
 
-# ============================================================
-# Main model
-# ============================================================
+# ---- Main model ----
 
 class DeepFilterNet3(nn.Module):
     """
@@ -680,10 +565,9 @@ class DeepFilterNet3(nn.Module):
     def __init__(self, n_fft=512, sr=16000, n_erb=32, df_bins=64, df_order=5,
                  enc_ch=64, emb_size=256, df_hidden=256, df_num_layers=2,
                  mask_lookahead=1, df_lookahead=1,
-                 # ⚠ 1, not 0.  read_model_config sources its defaults from this
-                 # signature, so an omitted [model] df_lookahead built the exact
-                 # 1/0 pairing config.ini documents as buying nothing -- silently,
-                 # and it passes the lookahead invariant.
+                 # 1, not 0: read_model_config takes its defaults from this
+                 # signature, and an omitted [model] df_lookahead would otherwise
+                 # build the 1/0 pairing config.ini documents as buying nothing.
 
                  emb_num_layers=3, lin_groups=16, enc_lin_groups=32,
                  enc_concat=False, df_gru_skip='groupedlinear',
@@ -709,12 +593,8 @@ class DeepFilterNet3(nn.Module):
                 f"df_lookahead must be in [0, {df_order - 1}], "
                 f"got {df_lookahead}"
             )
-        # ⚠ THE single source of truth for the lookahead relation.  Upstream
-        # relates the two (deepfilternet3.py:357-358); the port validated them
-        # independently here, in train.py and in inference.py, and stated the
-        # relation only in config.ini prose -- so a config upstream refuses to
-        # build was accepted by all three.  It belongs in the constructor,
-        # because every entry point goes through it.
+        # Single source of truth for the lookahead relation (as upstream);
+        # checking it here covers training, inference and export.
         if df_lookahead > mask_lookahead:
             raise ValueError(
                 "df_lookahead must not exceed mask_lookahead: the DF window "
@@ -734,10 +614,9 @@ class DeepFilterNet3(nn.Module):
             mask_lookahead=mask_lookahead, lin_groups=lin_groups,
             enc_lin_groups=enc_lin_groups, enc_concat=enc_concat,
         )
-        # The embedding bus is enc_ch * n_erb//4 wide (512 at the upstream
-        # conv_ch=64), NOT emb_size -- emb_size is only the GRU hidden width.
-        # The DF decoder consumes what the encoder EMITS; ERBDecoder recomputes the
-        # same width from enc_ch and n_erb.
+        # The embedding bus is enc_ch * n_erb//4 wide (512 at conv_ch=64), not
+        # emb_size (the GRU hidden width); the DF decoder consumes what the encoder
+        # emits and ERBDecoder recomputes the same width.
         emb_out_dim = self.encoder.emb_dim
         self.erb_dec = ERBDecoder(n_erb, enc_ch, emb_size, conv_kernel,
                                   emb_num_layers=emb_num_layers,
@@ -750,9 +629,8 @@ class DeepFilterNet3(nn.Module):
                                  df_gru_skip=df_gru_skip,
                                  pathway_kernel_size_t=df_pathway_kernel_size_t)
 
-        # Valin post-filter, DFN3 form -- see self.post_filter.  Upstream ships
-        # mask_pf false and PF_BETA 0.02 (deepfilternet3.py:69), exposing beta via
-        # --pf, so BOTH are config-driven here.
+        # Valin post-filter, DFN3 form (see self.post_filter). Both mask_pf and
+        # PF_BETA (upstream default 0.02, exposed as --pf) are config-driven.
         self.mask_pf = mask_pf
         self.pf_beta = pf_beta
 
@@ -760,24 +638,17 @@ class DeepFilterNet3(nn.Module):
         print(f"DeepFilterNet3: {n_params:,} trainable parameters")
 
     def heads(self, feat_erb, feat_spec):
-        """Everything the NETWORK predicts, and nothing it composes.
+        """The network's predictions only, with no composition.
 
         Returns:
             erb_mask : (B, 1, T, n_erb)              real, sigmoid, in [0, 1]
             coefs    : (B, T, df_bins, df_order*2)   deep-filter taps, re/im
 
-        ⚠ THIS IS THE EXPORT BOUNDARY, and it is the whole reason this method
-        exists separately from ``forward``.  Everything after it -- expanding the
-        ERB mask through ``erb_inv``, the deep-filter FIR, the band split, the
-        post-filter, the ISTFT -- is fixed arithmetic with no learned parameters,
-        so it belongs in the C/accelerator host rather than inside the exported
-        graph.  Upstream draws the line in the same place: its Python ``forward``
-        composes (it is the training graph) while its deployed runtime runs the
-        network for these two tensors and does the composition itself.
-
-        ``forward`` below calls this and then composes, so there is exactly one
-        definition of each half and the exported half cannot drift from the
-        trained one.
+        This is the export boundary: everything after it (ERB mask expansion
+        through ``erb_inv``, the deep-filter FIR, band split, post-filter, ISTFT)
+        is fixed arithmetic with no learned parameters and runs in the C or
+        accelerator host. ``forward`` calls this and then composes, so the exported
+        half cannot drift from the trained one.
         """
         e0, e1, e2, e3, emb, c0 = self.encoder(feat_erb, feat_spec)
         return self.erb_dec(emb, e3, e2, e1, e0), self.df_dec(emb, c0)
@@ -785,23 +656,18 @@ class DeepFilterNet3(nn.Module):
     def compose(self, spec, erb_mask, coefs):
         """Turn the two predicted heads into an enhanced spectrum.
 
-        ⚠ Parameter-free by construction -- this is the arithmetic the C port has
-        to reproduce, so keep it that way.  Anything learned belongs in ``heads``.
+        Parameter-free by construction: this is the arithmetic the C port
+        reproduces. Anything learned belongs in ``heads``.
         """
-        # ERB mask → per-bin.  Only bins at or above df_bins survive the band
-        # split below, so the mask is expanded over that slice alone; the lower
-        # bins would be computed and then overwritten.
+        # ERB mask -> per-bin, over bins >= df_bins only: the lower bins are
+        # replaced by the deep filter in the band split.
         bin_mask = erb_mask.squeeze(1).matmul(self.erb_inv[:, self.df_bins:])
         bin_mask = bin_mask.permute(0, 2, 1)           # (B, n_bins-df_bins, T) — NOT .T
         spec_m = spec[:, self.df_bins:] * bin_mask
 
-        # DFN3 composes the two stages as a PARALLEL BAND SPLIT, not a cascade:
-        # the deep filter runs on the *unmasked* spectrum and owns the lowest
-        # df_bins outright, while everything above comes from the ERB mask.
-        # DFN2 instead ran DF on the already-masked spectrum and blended with a
-        # learned alpha.  This costs zero parameters, so no parameter count can
-        # tell you which one you have -- and it is the most behaviourally
-        # significant DFN2->DFN3 change.
+        # Parallel band split, not a cascade: the deep filter runs on the unmasked
+        # spectrum and owns the lowest df_bins, while everything above comes from
+        # the ERB mask.
         spec_e = deep_filter_apply(
             spec, coefs, self.df_bins, self.df_order, self.df_lookahead,
         )
@@ -818,19 +684,13 @@ class DeepFilterNet3(nn.Module):
         return self.compose(spec, erb_mask, coefs), erb_mask
 
     def post_filter(self, spec, spec_e):
-        """Valin post-filter, DeepFilterNet3 form (deepfilternet3.py:388-394).
+        """Valin post-filter, DeepFilterNet3 form (deepfilternet3.py).
 
-        ⚠ This is NOT DFN2's ``Mask.pf`` (df/modules.py:235-246), and the two are
-        not interchangeable:
-          * DFN3 works on the FINAL COMPLEX SPECTRUM, after both the ERB mask and
-            the deep filter; DFN2 worked on the real ERB mask before erb_inv.
-          * DFN3 DERIVES its mask as ``|spec_e| / |spec|`` -- the effective gain
-            actually realised -- rather than post-filtering the network's mask.
-          * DFN3's numerator has no ``mask`` factor: ``pf`` is a multiplicative
-            correction, because the gain is already present in ``spec_e``.
-          * DFN3 does NOT gate on ``self.training``.
-          * ``beta`` is config-driven upstream (``PF_BETA``, default 0.02, exposed
-            as ``--pf``), not a hardcoded constant.
+        Differs from DFN3's ``Mask.pf``: it works on the final complex spectrum
+        (after the ERB mask and the deep filter), derives its mask as
+        ``|spec_e| / |spec|`` (the realised gain), has no ``mask`` factor in the
+        numerator (a multiplicative correction), does not gate on ``self.training``,
+        and takes ``beta`` from config (upstream ``PF_BETA`` default 0.02, ``--pf``).
         """
         if not self.mask_pf:
             return spec_e

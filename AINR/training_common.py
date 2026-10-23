@@ -20,32 +20,23 @@ import torch
 class NonFiniteTraining(RuntimeError):
     """Raised to HALT training the first time a NaN/inf reaches the optimizer.
 
-    ⚠ Deliberately stricter than upstream, which SKIPS the batch and tolerates up
-    to MAX_NANS = 50 before re-raising (df/train.py:43,380-419).  Upstream's
-    choice is a throughput choice -- it runs 120 epochs over a large corpus and
-    does not want one bad file to kill a multi-day run.  Halting on the first hit
-    is the diagnostic choice, and it buys the one thing skipping cannot: the
-    model and optimizer state at the moment of the hit are still UNCONTAMINATED,
-    because nothing has stepped.  That is the state worth resuming from once the
-    cause is fixed, and skipping past it destroys the evidence of when the
-    degradation actually began.
+    ⚠ Deliberately stricter than upstream, which SKIPS the batch and tolerates
+    up to MAX_NANS = 50 (df/train.py:43,380-419). Halting on the first hit buys
+    what skipping cannot: model and optimizer state at that moment are still
+    UNCONTAMINATED because nothing has stepped, and that is the state worth
+    resuming from.
     """
 
 
 def scan_non_finite(module, include_buffers=False):
     """Non-finite (name, n_nan, n_inf, numel) rows, worst first.
 
-    Upstream's ``check_finite_module`` equivalent, which answers the question a
-    batch dump alone cannot: is this the FIRST hit, or were the weights already
-    poisoned by an earlier step whose clip turned an inf into a NaN?
-
-    ⚠ Buffers are EXCLUDED by default, and that default is load-bearing.
-    ``BatchNorm2d`` updates ``running_mean``/``running_var`` inside ``forward()``
-    in train mode, so a forward-side fault poisons all 30 BN buffers before the
-    loss is even evaluated.  Scanning them would make every forward-side halt report
-    "an earlier step already wrote NaN into the weights" at global step 0, which
-    is the opposite of the truth.  Only PARAMETERS carry the optimizer's history,
-    so only parameters answer the first-hit question.
+    Answers what a batch dump alone cannot: is this the FIRST hit, or were the
+    weights already poisoned by an earlier step? ⚠ Buffers are EXCLUDED by
+    default, and that is load-bearing: ``BatchNorm2d`` updates its running
+    stats inside ``forward()`` in train mode, so a forward-side fault poisons
+    every BN buffer before the loss exists and scanning them would report "an
+    earlier step already wrote NaN" at step 0.
     """
     tensors = list(module.named_parameters())
     if include_buffers:
@@ -71,13 +62,10 @@ def scan_non_finite(module, include_buffers=False):
 class VanishedWeights(RuntimeError):
     """Raised to HALT training when a parameter tensor's scale has collapsed.
 
-    Deliberately NOT a ``NonFiniteTraining``: the values that trigger this are
-    FINITE.  A GRU block whose weights have decayed to 1e-25 passes
-    ``scan_non_finite``, passes every ``torch.isfinite`` assertion, and exports
-    to an ONNX graph that agrees with PyTorch to the last bit -- both reproduce
-    the same dead branch.  Folding it into the non-finite exception would make
-    that name false for whatever catches it, and this halt has no offending
-    batch to dump, so it cannot travel through ``halt_on_non_finite`` either.
+    Deliberately NOT a ``NonFiniteTraining``: the values are FINITE. A GRU
+    block decayed to 1e-25 passes ``scan_non_finite`` and every
+    ``torch.isfinite`` assertion, exports to an ONNX graph that agrees with
+    PyTorch bit for bit, and has no offending batch to dump.
     """
 
 
@@ -88,56 +76,23 @@ VANISHED_FLOOR = 1e-12
 
 
 class WeightScaleGuard:
-    """Per-tensor ``max|w|`` watch that halts when one tensor's scale collapses.
+    """Per-tensor ``max|w|`` watch that halts when one tensor's scale
+    collapses.
 
-    ⚠ PER-TENSOR is the whole point.  A real run lost one of two parallel
-    subband GRU blocks to weights of 6.5e-25 while its twin stayed at 6e-01, and
-    ``grad_norm.csv`` never dropped below 0.2 for the entire run: that trace
-    records the GLOBAL norm, which the surviving branch and the rest of the
-    network sustain on their own.  No global scalar can see one branch die, and
-    nothing else in this module can either -- the weights stay finite, so the
-    loss curve, ``scan_non_finite`` and an ONNX parity check all agree that
-    everything is fine.
+    ⚠ PER-TENSOR is the whole point: one of two parallel subband GRU blocks can
+    collapse to ~1e-25 while its twin stays at 0.6, and the global gradient
+    norm, the loss, ``scan_non_finite`` and an ONNX parity check all stay
+    healthy. Each tensor is judged against ITS OWN scale, since many biases
+    initialize to exactly zero and a bare ``max|w| < eps`` would fire at step
+    0. The baseline is the RUNNING maximum of ``max|w|`` (so a zero-initialized
+    bias that grows and then collapses is caught); under ``--resume`` it starts
+    from the loaded weights.
 
-    Each tensor is judged against ITS OWN scale, never an absolute one.  Many
-    biases initialize to exactly zero (8 of Align-ULCNet's 67 parameter tensors
-    do) and some norm/gate parameters are legitimately small, so a bare
-    ``max|w| < eps`` test fires at step 0.  The baseline is the RUNNING maximum
-    of ``max|w|`` seen so far rather than the initial value, which costs nothing
-    extra and is strictly more sensitive: a zero-initialized bias that grows and
-    only then collapses is still caught, where a fixed initial snapshot would
-    have written it off forever.  Under ``--resume`` the baseline starts from
-    the loaded weights, because what a resumed run departs from is what it
-    resumed from.
-
-    A tensor whose running peak has never risen above ``floor`` is SKIPPED: it
-    has no scale to fall from, and the ratio against it is meaningless.  That
-    exclusion cannot hide a collapse, because a collapse is by definition a fall
-    from a healthy scale and a healthy scale pins the peak above ``floor``
-    permanently.
-
-    Both constants carry orders of magnitude on both sides (Align-ULCNet at
-    init, and the five tensors of the run described above):
-
-    * ``floor`` 1e-12 -- float32's smallest normal is 1.18e-38.  The collapsed
-      tensors sat at 6.5e-25 .. 5.3e-14, so the floor is 19x above even the
-      least collapsed of them, while the smallest non-zero ``max|w|`` any
-      healthy tensor starts at is 3.8e-02, eight and a half decades clear.
-    * ``ratio`` 1e-6 -- those same tensors were at 7.4e-24 .. 6.0e-13 of their
-      initial peak, so the least collapsed one still clears the threshold by six
-      decades.  Decay shrinks a healthy tensor's peak by a fraction of a decade
-      over a whole run, not by six.
-
-    The two are ANDed, so a false positive needs a tensor that both fell by a
-    factor of a million AND ended below 1e-12.
-
-    Cost: one ``max|abs|`` per parameter tensor, 0.78 ms for Align-ULCNet's 67
-    tensors / 672k parameters.  Callers run it ONCE PER EPOCH, immediately
-    before the checkpoint write, where it is 5% of the 15 ms that write itself
-    costs and 0.6% of one training step (batch 8 x 1 s of audio; the shipped
-    10 s chunk makes it ten times smaller again).  Per step it would be that
-    0.78 ms on every step of the run to catch something that takes epochs to
-    develop.
+    ``floor`` (1e-12) and ``ratio`` (1e-6) are ANDed: a false positive needs a
+    tensor that both fell by a factor of a million AND ended below 1e-12, while
+    healthy decay shrinks a peak by a fraction of a decade over a whole run. A
+    tensor whose running peak never exceeded ``floor`` is skipped. Callers run
+    it ONCE PER EPOCH, before the checkpoint write.
     """
 
     def __init__(self, model, ratio=VANISHED_RATIO, floor=VANISHED_FLOOR):
@@ -221,29 +176,15 @@ class WeightScaleGuard:
 def dump_batch(dump_dir, noisy, clean, sr, enhanced=None, hazard_mag=None):
     """Write the batch as a .pt plus one wav pair per lane, and describe it.
 
-    The audio IS the evidence -- a spike's cause (near-silent target, heavy
-    spectral tilt, silent top bands) is audible and visible in a spectrogram but
-    invisible in any scalar the trainer logs.  The .pt is written first so a
-    torchaudio failure never costs the data.
-
-    ``enhanced`` is the model output for the same batch.  It matters because the
-    gradient hazard lives on the PREDICTION side: a compressed-magnitude
-    objective amplifies most where the ENHANCED spectrum's magnitude is smallest,
-    so the prediction is what needs inspecting, not only the inputs.
-
-    ``hazard_mag`` is the prediction magnitude at which THIS model's objective
-    has its worst gradient gain.  A model that has such a magnitude passes it and
-    gets a near_hazard%% column; one that does not passes None and the column
-    reads '-'.  It is a per-objective property, so it cannot live here.
-
-    ⚠ READ THE COLUMN AS A HINT, NOT A MEASUREMENT.  Both current suppliers
-    derive their threshold from an STFT magnitude, while the column below
-    measures |x| on the WAVEFORM, and the two scales differ by roughly the
-    window's gain.  A near-zero percentage therefore does not establish that the
-    batch was clear of the hazard -- it may only mean the comparison was made in
-    the wrong domain.  Fixing it properly means letting each trainer measure its
-    own hazard in its own domain (a callable rather than a scalar), which needs
-    a test on this function first; there is none.
+    The audio IS the evidence: a spike's cause (near-silent target, heavy
+    spectral tilt, silent top bands) is audible in a spectrogram but invisible
+    in any logged scalar. ``enhanced`` is the model output for the same batch
+    (the gradient hazard lives on the PREDICTION side). ``hazard_mag`` is the
+    prediction magnitude at which THIS model's objective has its worst gradient
+    gain (None if it has none; the near_hazard%% column then reads '-'). ⚠ Read
+    the column as a HINT: the supplied thresholds come from an STFT magnitude
+    while the column measures |x| on the waveform, so a near-zero percentage
+    does not establish the batch was clear of the hazard.
     """
     os.makedirs(dump_dir, exist_ok=True)
     payload = {'noisy': noisy.detach().cpu(), 'clean': clean.detach().cpu()}
@@ -392,21 +333,12 @@ def halt_on_non_finite(reason, *, model, noisy, clean,
 class GradNormLog:
     """Per-step pre-clip gradient-norm trace, plus finite-spike batch dumps.
 
-    ⚠ Why this is not optional for the diagnosis: once grad_clip = 1.0 is in
-    effect, every gradient above 1.0 is scaled to exactly 1.0, so the loss curve
-    cannot distinguish "a handful of enormous isolated spikes" (a pathological
-    batch) from "bounded gradients, wrong step direction" (an optimizer-state
-    problem).  Those two have opposite fixes.  clip_grad_norm_ already computes
-    and RETURNS the pre-clip norm, so recording it costs nothing extra.
-
-    The spike threshold is relative to a rolling median rather than an absolute
-    value because the norm's scale is objective-dependent (this port's MRSL runs
-    7.85x upstream's nominal scale) and drifts over training.  Window = 1000
-    steps so the median tracks the current regime instead of epoch 0.
-
-    A finite spike is DUMPED but does NOT halt: a large-but-finite gradient is
-    still a legal step, and the run reaching inf later is precisely the sequence
-    worth observing.  Only NaN/inf halts.
+    ⚠ Needed for the diagnosis: with grad_clip = 1.0 every gradient above 1.0
+    is scaled to exactly 1.0, so the loss curve cannot distinguish a few
+    enormous isolated spikes (a pathological batch) from bounded gradients with
+    a wrong step direction (an optimizer-state problem), which have opposite
+    fixes. A finite spike is DUMPED but does not halt (still a legal step);
+    only NaN/inf halts.
     """
 
     def __init__(self, path, sr, spike_ratio=100.0, window=1000,
@@ -429,9 +361,8 @@ class GradNormLog:
                noisy, clean, output_dir, enhanced=None):
         """Log one step; dump the batch if the norm is a finite outlier.
 
-        ``norm`` and ``loss_value`` arrive as PYTHON FLOATS, already synced by the
-        caller.  Taking device tensors here cost a second device->host copy of two
-        scalars the training loop had already fetched.
+        ``norm`` and ``loss_value`` arrive as PYTHON FLOATS already synced by
+        the caller, avoiding a second device->host copy of two scalars.
         """
         self.handle.write(
             f'{global_step},{epoch},{batch_idx},{norm:.6e},{loss_value:.6e}\n'
@@ -509,18 +440,12 @@ def make_scheduler(
 def fast_forward_scheduler(scheduler, global_step):
     """Advance a freshly built scheduler to ``global_step`` and return the lr.
 
-    ⚠ A resumed run must NOT restore the scheduler from its checkpoint.
+    ⚠ A resumed run must NOT restore the scheduler from its checkpoint:
     ``load_state_dict`` brings back ``CosineAnnealingLR``'s ``T_max`` from the
-    run that wrote it, overwriting the freshly built
-    ``max(1, total_steps - warmup_steps)``.  Measured on a real checkpoint: a
-    100-epoch run stores T_max 4850; resuming it at epochs=120 builds 5850 and
-    then restores 4850, giving a terminal lr of 1.02e-04 against min_lr 1e-06 --
-    102x.  Neither ``epochs`` nor ``batch_size`` is in the checkpoint contract,
-    so nothing catches the mismatch.
-
-    Upstream is stateless here: it indexes a precomputed schedule array by step.
-    Rebuilding and fast-forwarding reproduces that, and stays correct across a
-    change of epochs, batch size or corpus size.
+    run that wrote it, overwriting the freshly built ``max(1, total_steps -
+    warmup_steps)``, and neither ``epochs`` nor ``batch_size`` is in the
+    checkpoint contract, so a resume at a different epoch count ends at the
+    wrong terminal lr.
     """
     for _ in range(global_step):
         scheduler.step()

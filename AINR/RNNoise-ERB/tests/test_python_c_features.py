@@ -1,4 +1,5 @@
-"""Golden-vector parity test between train.py and process.c feature extraction."""
+"""Parity test between train.py and process.c feature extraction on fixed
+vectors."""
 
 import atexit
 import configparser

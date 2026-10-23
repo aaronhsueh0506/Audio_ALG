@@ -5,19 +5,16 @@ gen_dataset.py down/up to a specific model's target sample rate, so per-epoch
 training dataloaders never pay a resample cost. See README.md for the overall
 generation-rate design.
 
-Anti-aliasing: uses torchaudio.functional.resample with the Kaiser-windowed
-sinc-interpolation kernel ("sinc_interp_kaiser") — the "kaiser_best" preset
-from torchaudio's own resampling tutorial/benchmark:
+Anti-aliasing: torchaudio.functional.resample with the Kaiser-windowed
+sinc-interpolation kernel ("sinc_interp_kaiser"), the "kaiser_best" preset from
+torchaudio's resampling tutorial:
     lowpass_filter_width = 64
     rolloff              = 0.9475937167399596
     beta                 = 14.769656459379492
-This is deliberately the highest-quality preset torchaudio ships (vs. the
-faster/cheaper "kaiser_fast" or the plain sinc_interp_hann default): a wide,
-steep, well-behaved lowpass is applied before decimation so this step is
-explicitly anti-aliased. Since it runs once offline (not per epoch), the
-extra compute cost relative to a cheaper kernel is irrelevant — quality was
-prioritized over speed. --quality fast (kaiser_fast) is offered only for
-quick smoke tests.
+This is the highest-quality preset torchaudio ships (vs the cheaper "kaiser_fast"
+or the plain sinc_interp_hann default); it runs once offline, so quality is
+prioritized over speed. --quality fast (kaiser_fast) is offered only for quick
+smoke tests.
 
 Usage:
     python3 resample_dataset.py --input data_48k/ --output data_16k/ \
@@ -27,8 +24,8 @@ Preserves:
     - directory structure (relative to --input) and filenames
     - 2-channel (noisy, clean) pair layout produced by gen_dataset.py
 
-The output is WAV only, same as the input: a resampled directory is packable
-by pack_dataset.py exactly like the original.
+The output is WAV only, same as the input: a resampled directory is packable by
+pack_dataset.py exactly like the original.
 """
 
 import argparse
@@ -65,14 +62,13 @@ def resampled_num_frames(num_frames: int, source_sr: int, target_sr: int) -> int
 
 
 class _ResampleJob(data.Dataset):
-    """One item = one input WAV file → resample → write to mirrored output path.
+    """One item = one input WAV file → resample → write to mirrored output
+    path.
 
-    Loading, resampling, clip-guarding, and writing all happen inside
-    __getitem__ so the heavy lifting is spread across DataLoader workers
-    (mirrors gen_dataset.py's worker-does-the-work / main-process-aggregates
-    pattern, except here the write itself also happens in the worker since
-    output path is a pure function of input path — no shared file-name
-    counter to serialize on).
+    Loading, resampling, clip-guarding and writing all happen inside
+    __getitem__ so the work is spread across DataLoader workers; the output
+    path is a pure function of the input path, so there is no shared counter to
+    serialize on.
     """
 
     def __init__(self, in_paths, out_paths, target_sr, resample_kwargs,

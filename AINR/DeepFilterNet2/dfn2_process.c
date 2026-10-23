@@ -4,8 +4,8 @@
 #include <string.h>
 
 
-/* Model-local DSP kernels (features / mask expansion / attenuation limit /
- * post-filter). The STFT and ISTFT framing is audiolib's AcStft and
+/* Model-local DSP kernels (features / mask expansion / attenuation limit).
+ * The STFT and ISTFT framing is audiolib's AcStft and
  * AcIstft, owned by the caller and bound with dfn2_state_init(). */
 
 #include <math.h>
@@ -22,10 +22,8 @@
 /* The deep filter's taps before the stream start read this row. */
 static const float df_zero_row[DFN2_DF_BINS];
 
-/* erb_fwd: caller-loaded exported matrix, raw float32, bin-major
- * [n_bins][n_bands] -- the exact buffer the model trained with (see
- * export_erb_matrix.py --runtime-bins). The library never derives a
- * filterbank; the loader owns the file and can swap it at runtime. */
+/* erb_fwd: caller-loaded matrix, raw float32, bin-major [n_bins][n_bands]
+ * (export_erb_matrix.py --runtime-bins). The library never derives a filterbank. */
 static inline void df_common_features(
     const float *spec_re, const float *spec_im,
     const float *erb_fwd, const uint16_t *fwd_lo, const uint16_t *fwd_hi,
@@ -38,11 +36,9 @@ static inline void df_common_features(
     float scale2 = analysis_scale * analysis_scale;
     memset(erb_work, 0, (size_t)n_bands * sizeof(float));
     skn_power_scale_f32(power, spec_re, spec_im, (size_t)n_bins, scale2);
-    /* Each band accumulates its bins in ascending k over its nonzero range
-     * (see DFN2State). A non-finite power takes its whole row, since Inf/NaN
-     * times 0 is NaN; that case walks bin by bin, every other frame runs
-     * band by band with the accumulators in registers. Both add each band's
-     * nonzero products in the same order. */
+    /* Each band accumulates its bins in ascending k over its nonzero range. A
+     * non-finite power takes its whole row (Inf/NaN times 0 is NaN), walked bin by
+     * bin; other frames run band by band with accumulators in registers. */
     if (skn_all_finite_f32(power, (size_t)n_bins)) {
         _Static_assert(DFN2_N_ERB % 4 == 0, "skn_erb_forward_banded_f32 runs bands in fours");
         skn_erb_forward_banded_f32(power, erb_fwd, band_k0, band_k1, n_bands,
@@ -96,13 +92,11 @@ static inline void df_common_features(
     }
 }
 
-/* A scalar twin is the reference of its NEON kernel and the whole kernel in a
- * SIMD=0 build; a NEON build keeps it only for the differential test. */
+/* Scalar twin of a NEON kernel; it is the whole kernel in a SIMD=0 build. */
 #define DFN2_TWIN static inline __attribute__((unused))
 
-/* erb_inv: caller-loaded exported matrix, band-major [n_bands][n_bins]
- * (the model's mask-expansion buffer); the inner loop runs contiguously
- * over the band's nonzero bins, or the whole row for a non-finite gain. */
+/* erb_inv: caller-loaded matrix, band-major [n_bands][n_bins]; the inner loop
+ * runs over the band's nonzero bins, or the whole row for a non-finite gain. */
 DFN2_TWIN void df_common_expand_mask_scalar(const float *band_gain,
                                             const float *erb_inv,
                                             const uint16_t *inv_lo,
@@ -114,10 +108,9 @@ DFN2_TWIN void df_common_expand_mask_scalar(const float *band_gain,
 }
 
 #if DF_COMMON_HAVE_NEON
-/* The same sums with four bins per step. A band's last step may run up to
- * three bins past its span: the weights there are zero, and adding a zero
- * product to a bin that is never -0 changes nothing for a finite gain (a
- * non-finite gain takes the whole row, as in the twin). */
+/* The same sums four bins per step. A band's last step may run up to three bins
+ * past its span, where the weights are zero (a non-finite gain takes the whole
+ * row, as in the twin). */
 static inline void df_common_expand_mask_neon(const float *band_gain,
                                               const float *erb_inv,
                                               const uint16_t *inv_lo,
@@ -144,10 +137,8 @@ static inline void df_common_expand_mask(const float *band_gain,
 #endif
 }
 
-/* enh_re[k] = noisy_re[k]*lim + enh_re[k]*mix (and the imag twin) is
- * sk_ema_f32's state[i] = alpha*state[i] + beta*x[i] with state=enh,
- * x=noisy, alpha=mix, beta=lim -- float addition is exactly commutative for
- * finite operands, so the swapped argument order changes no bit. */
+/* enh = noisy*lim + enh*mix, expressed as sk_ema_f32 (state=enh, x=noisy,
+ * alpha=mix, beta=lim). */
 static inline void df_common_atten_lim(const float *noisy_re,
                                        const float *noisy_im,
                                        float *enh_re, float *enh_im, int bins,
@@ -176,11 +167,10 @@ static inline void df_common_deep_filter(
     sk_ema_f32(out_im, mix_im, alpha, beta, DFN2_DF_BINS);
 }
 
-/* Where each of `lines` lines of a matrix is nonzero: line i holds
- * m[i * line_step + j * elem_step] for j < len, and its span is the first nonzero j
- * and one past the last (an all-zero line is the empty range [0, 0); without
- * a matrix every line is full). Rows of a [rows][cols] matrix: (rows, cols,
- * cols, 1); columns: (cols, rows, 1, cols). */
+/* Nonzero span of each of `lines` matrix lines: line i holds
+ * m[i*line_step + j*elem_step] for j < len; the span is the first nonzero j to one
+ * past the last (all-zero line: [0, 0); no matrix: full). Rows of [rows][cols]:
+ * (rows, cols, cols, 1); columns: (cols, rows, 1, cols). */
 static void erb_spans(const float *m, int lines, int len, int line_step,
                       int elem_step, uint16_t *lo, uint16_t *hi)
 {
@@ -233,9 +223,8 @@ void dfn2_state_init(DFN2State* st, AcStft* stft, AcIstft* istft)
     st->istft = istft;
     ac_stft_reset(stft);
     ac_istft_reset(istft);
-    /* ERB matrices arrive via dfn2_set_erb_matrices(): caller-loaded
-     * erb_fwd.bin / erb_inv.bin from export_erb_matrix.py --runtime-bins.
-     * Until then the matrices are NULL and their spans full. */
+    /* ERB matrices arrive via dfn2_set_erb_matrices(); until then they are NULL
+     * and their spans full. */
     dfn2_set_erb_matrices(st, NULL, NULL);
     for (int b = 0; b < DFN2_N_ERB; ++b) {
         float position = (float)b / (float)(DFN2_N_ERB - 1);
@@ -378,10 +367,9 @@ int dfn2_compose_stream(DFN2State* st,
     memcpy(st->noisy_ring_im[current_slot], current_spec_im,
            sizeof(st->noisy_ring_im[current_slot]));
 
-    /* A lookahead network cannot return frame 0's heads until input frame
-     * MASK_LOOKAHEAD has arrived.  Enforce this alignment here: silently
-     * treating a returned frame-(n-L) mask as frame n is audible but finite,
-     * so ordinary NaN/output-smoke tests cannot catch the mistake. */
+    /* A lookahead network cannot return frame 0's heads before input frame
+     * MASK_LOOKAHEAD has arrived. This alignment is enforced because a misaligned
+     * mask is audible but finite and passes NaN/smoke checks. */
     if (current < DFN2_MASK_LOOKAHEAD) {
         return 0;
     }
@@ -408,8 +396,8 @@ int dfn2_compose_stream(DFN2State* st,
            sizeof(st->coef_ring[head_slot]));
     st->alpha_ring[head_slot] = alpha;
 
-    /* In a cascade the newest usable masked source is head_frame, hence the
-     * output target is one DF lookahead behind that head. */
+    /* In a cascade the newest usable masked source is head_frame, so the output
+     * target is one DF lookahead behind it. */
     target_frame = head_frame - DFN2_DF_LOOKAHEAD;
     if (target_frame < 0) return 0;
     target_slot = (int)(target_frame % DFN2_DF_RING);
@@ -417,9 +405,8 @@ int dfn2_compose_stream(DFN2State* st,
     if (alpha < 0.0f) alpha = 0.0f;
     if (alpha > 1.0f) alpha = 1.0f;
 
-    /* The taps' source rows are per frame, not per bin: resolve them once.
-     * A source frame before the stream start is a row of 0.0f, multiplied
-     * through like any other. */
+    /* The taps' source rows are per frame, not per bin: resolve them once. A
+     * source frame before the stream start is a row of 0.0f. */
     for (int tap = 0; tap < DFN2_DF_ORDER; ++tap) {
         long long source_frame = target_frame - DFN2_DF_HISTORY + tap;
         int slot = source_frame >= 0 ? (int)(source_frame % DFN2_DF_RING)

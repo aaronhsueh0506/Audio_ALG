@@ -211,9 +211,8 @@ def test_far_input_mode_recorded_legacy_default_and_unknown_rejected():
     assert contract['far_input_mode'] == 'raw_far'
     assert checkpoint_far_input_mode(contract) == 'raw_far'
 
-    # Legacy checkpoint (written before the field existed): the ONE defaulting
-    # helper reads it as raw_far, and resuming it against a new expected
-    # contract still passes.
+    # A checkpoint without the field: the ONE defaulting helper reads it as
+    # raw_far, so resuming it against the expected contract still passes.
     legacy = {k: v for k, v in contract.items() if k != 'far_input_mode'}
     assert checkpoint_far_input_mode(legacy) == 'raw_far'
     require_checkpoint_contract({'contract': legacy}, contract)  # must not raise
@@ -422,12 +421,10 @@ def test_linear_aec_engine_honours_deployment_filter_bank_override():
 def test_linear_aec_engine_aligned_far_is_the_shifted_far():
     """The aligned-far tap must BE the shifted far, not merely self-consistent.
 
-    Diagnostic aligned-far evaluation consumes this tap, so what it contains
-    is a contract, not an internal detail. The scene has a known
-    bulk delay; the applied alignment is read from the engine's public stats
-    seam and the expected content is then built INDEPENDENTLY here by shifting
-    the caller's own far by that many samples -- nothing is compared against
-    the buffer the implementation copied from.
+    Diagnostic aligned-far evaluation consumes this tap, so its content is a
+    contract. The expected content is built INDEPENDENTLY by shifting the
+    caller's far by the delay read from the engine's public stats seam, not
+    compared against the buffer the implementation copied from.
     """
     samples, true_delay = 32768, 1024
     generator = torch.Generator().manual_seed(23)
@@ -541,12 +538,11 @@ def test_contract_comparison_rejects_behavioral_linear_aec_drift():
 def test_contract_comparison_is_not_vacuous():
     """Guard against the comparison silently losing its only real condition.
 
-    Both call sites build the ``runtime`` contract by echoing the recorded
-    contract's sample_rate/preset/frame_size/filter_length, and every remaining
-    non-provenance field is pinned to a literal by ``__post_init__``. So if the
-    provenance fields are ever excluded from the comparison again, no field can
-    differ on any real path and the check becomes a tautology -- which is
-    exactly what this asserts is not the case.
+    Both call sites echo the recorded contract's
+    sample_rate/preset/frame_size/filter_length into ``runtime`` and every
+    other non-provenance field is pinned by ``__post_init__``; if the
+    provenance fields were excluded, no field could differ on any real path and
+    the check would be a tautology.
     """
     recorded = make_linear_aec_contract(16000, frame_size=512)
     runtime = make_linear_aec_contract(
@@ -569,17 +565,12 @@ def test_contract_comparison_is_not_vacuous():
 
 
 # ---- verified frontend-equivalent behaviour-hash migrations ----------------
-#
-# The rows here are the STRUCTURAL invariants the lookup relies on whatever
-# the table contains, and they are what a new entry is admitted against. They
-# hold for an empty table too, which is why they stayed when it was emptied.
-#
-# The per-pair rows -- accepted-with-a-warning, refused-in-reverse, the pair
-# actually targeting the live build -- live in
-# AIAEC/tests/test_linear_aec_behavior_migration.py, together with the
-# retired identities that must never come back. That file is the one to read
-# for what the table currently claims; this one only checks the shape of the
-# claim.
+
+# These rows are the STRUCTURAL invariants the lookup relies on whatever the
+# table contains (they hold for an empty table too). The per-pair rows
+# (accepted-with-a-warning, refused-in-reverse, the pair targeting the live
+# build, the retired identities) live in
+# AIAEC/tests/test_linear_aec_behavior_migration.py.
 
 def _contract_pair(pair):
     """(current, recorded) contract dicts, identical except the hash field."""
@@ -834,21 +825,12 @@ def test_all_trainers_keep_the_weight_guard_around_checkpoint_writes(source_path
 def test_stft_consistency_refuses_a_device_whose_stft_backward_is_wrong():
     """A silently wrong gradient must stop the run, not merely warn.
 
-    Measured on torch 2.8.0's MPS backend, an iSTFT->STFT round trip
-    differentiated on MPS matches CPU to 1.0000 up to 65,536 samples and then
-    breaks discontinuously: 65,792 samples gives a gradient-norm ratio of
-    0.063, and the shipped 10 s chunk at 16 kHz (160,256 samples) gives 0.424.
-    The forward is exact and the loss value is bit-identical, so a 50-epoch run
-    would descend normally on a gradient wrong by roughly 2.4x with nothing to
-    catch it -- which is why the projection refuses instead of warning.
-
-    ``train.py`` defaults ``--device`` to None and ``auto_device`` returns
-    'mps' on a machine with no CUDA, so this is the default launch on such a
-    machine, not an exotic one.
-
-    Pinned here rather than left to the comment because the bound is the whole
-    guard: forward-only use at any length, and any length at or below the
-    bound, must still be allowed.
+    On torch 2.8's MPS backend an iSTFT->STFT round trip differentiated on MPS
+    matches CPU up to 65,536 samples and then breaks (gradient-norm ratio 0.063
+    at 65,792 samples, 0.424 at the shipped 10 s / 16 kHz chunk) while forward
+    and loss stay exact, so the projection refuses. The bound is the whole
+    guard: forward-only use at any length and any length at or below the bound
+    must still be allowed.
     """
     grid = AecGrid(sr=16000, n_fft=512, win_len=512, hop_len=256)
 
@@ -907,13 +889,10 @@ def _mps_over_cpu_stft_grad_ratio(samples):
 def _check_mps_stft_backward_bound(ratio_at, bound):
     """Judge a bound against a measurement ``ratio_at(samples) -> MPS/CPU``.
 
-    * The bound must be SAFE: MPS and CPU agree at ``bound``. Always asserted,
-      on every torch, so a backend that starts breaking at a shorter length
-      fails here instead of being waved through.
-    * The bound is only TIGHT while the backend still breaks past it. When MPS
-      agrees with CPU at every probe past the bound the defect is not present
-      on this torch/OS: the second half has nothing to exercise, so skip with
-      the measured ratios rather than fail on a backend that got better.
+    * The bound must be SAFE: MPS and CPU agree at ``bound`` (always asserted).
+    * It is only TIGHT while the backend still breaks past it; when MPS agrees
+      with CPU at every probe past the bound the defect is absent on this
+      torch/OS, so skip with the measured ratios instead of failing.
     """
     at = ratio_at(bound)
     assert abs(at - 1.0) < 0.01, (
@@ -934,9 +913,9 @@ def test_the_mps_stft_backward_bound_is_where_the_backend_actually_breaks():
     """The bound has to track the defect, not a remembered number.
 
     Differentiates an iSTFT->STFT round trip on both devices. MPS and CPU must
-    agree at the bound (always), and, while the backend still has the defect,
-    disagree past it. A backend that no longer breaks skips this half with the
-    measured ratios -- see ``_check_mps_stft_backward_bound``.
+    agree at the bound (always) and, while the backend has the defect, disagree
+    past it. A backend without the defect skips this half with the measured
+    ratios; see ``_check_mps_stft_backward_bound``.
     """
     if not torch.backends.mps.is_available():
         pytest.skip('the defect being guarded is an MPS backend one')
@@ -971,15 +950,12 @@ def test_the_mps_bound_check_skips_with_the_ratios_when_the_backend_is_fixed():
 def test_a_configured_weight_decay_is_not_silently_rounded_away():
     """Document coupled Adam and decoupled AdamW decay truthfully.
 
-    Decoupled decay multiplies each weight by ``1 - lr*wd`` per step. Three of
-    the shipped configs use AdamW with a decay whose ``lr*wd`` is below
-    float32 eps, so the factor is exactly 1.0f and those runs have no effective
-    optimizer-side regularisation.
-
-    Align-CRUSE is different: torch.optim.Adam applies weight_decay as a
-    coupled L2 gradient penalty before updating its moments. Applying the
-    AdamW rounding test to that config is a category error, so its config must
-    explicitly state the coupled semantics instead of calling it inert.
+    Decoupled decay multiplies each weight by ``1 - lr*wd`` per step; three
+    shipped configs use AdamW with ``lr*wd`` below float32 eps, so the factor
+    is exactly 1.0f and they have no effective optimizer-side regularisation.
+    Align-CRUSE's torch.optim.Adam applies weight_decay as a coupled L2
+    gradient penalty, so its config must state the coupled semantics instead of
+    calling it inert.
     """
     import numpy as np
     for path in AIAEC_TRAINER_CONFIGS:
@@ -1194,11 +1170,9 @@ def test_the_checkpoint_contract_records_the_training_recipe(
     each other.
 
     ``require_checkpoint_contract`` compares the contract and nothing else, so
-    if the recipe is absent those two runs are indistinguishable -- same model,
-    same grid, same ``loss_version`` -- and a checkpoint trained at one LR
-    silently continues under another.  The four candidates carry different
-    optimizers and different numbers, which is exactly when this stops being
-    hypothetical.
+    without the recipe those runs are indistinguishable (same model, grid and
+    ``loss_version``) and a checkpoint trained at one LR silently continues
+    under another.
     """
     shipped = (pathlib.Path(training_common.__file__).parent
                / model_name / 'config.ini')
@@ -1305,20 +1279,10 @@ def test_a_resume_cannot_silently_rebuild_a_different_lr_curve(
     """Changing the schedule's denominator must change the contract.
 
     ``warmup_cosine`` is rebuilt from ``max_epochs * len(train_loader)`` and
-    fast-forwarded by ``global_step`` -- deliberately, so a saved ``T_max``
-    cannot come back on a run with a different horizon.  That makes the rebuild
-    only as trustworthy as its two inputs, and ``len(train_loader)`` follows
-    ``batch_size``.  Neither was recorded, so either one produced a DIFFERENT
-    curve under an IDENTICAL contract, and the resume was accepted.
-
-    Measured on Align-ULCNet's grid, resuming at epoch 20 after batch_size
-    16 -> 64 reads 160% progress; and past the horizon the chainable cosine
-    walks BACKWARDS, reaching 0.97 x peak LR at 1.75x rather than resting at
-    min_lr.  The config names the GPU as the batch-size constraint, which makes
-    a hardware change the likeliest reason anyone resumes -- exactly the edit
-    this has to refuse.
-
-    Compares real contracts built by the real ``main``, not the source text.
+    fast-forwarded by ``global_step``, and ``len(train_loader)`` follows
+    ``batch_size``; if neither is recorded, a different curve resumes under an
+    IDENTICAL contract. Compares real contracts built by the real ``main``, not
+    the source text.
     """
     shipped = (pathlib.Path(training_common.__file__).parent
                / model_name / 'config.ini')
@@ -1351,16 +1315,11 @@ def test_align_ulcnet_step_schedule_advances_per_batch(
         monkeypatch, tmp_path):
     """The shipped schedule advances once per optimizer step.
 
-    Selecting ``warmup_cosine`` is not enough. Moving ``scheduler.step()`` out
-    of the batch loop and into the epoch loop leaves every string in the file
-    unchanged, and leaves ``run_epoch`` still RECEIVING the scheduler, while
-    compressing the whole trajectory into ``max_epochs`` steps -- an
-    epoch-counted schedule wearing a step-counted name, which is the exact
-    defect this model was just moved off.
-
-    So no stubbed ``run_epoch``: this runs one real epoch over a small corpus
-    and counts the scheduler's own advances.  Anything other than one per
-    training batch fails.
+    Selecting ``warmup_cosine`` is not enough: moving ``scheduler.step()`` out
+    of the batch loop leaves every string in the file unchanged yet compresses
+    the trajectory into ``max_epochs`` steps. So this runs one real epoch over
+    a small corpus (no stubbed ``run_epoch``) and counts the scheduler's
+    advances; anything other than one per training batch fails.
     """
     trainer = importlib.import_module('AIAEC.Align_ULCNet.train')
     shipped = (pathlib.Path(training_common.__file__).parent
@@ -1445,16 +1404,11 @@ def test_other_step_schedules_advance_per_batch(
         model_name, monkeypatch, tmp_path):
     """The cosine horizon has to be advanced once per optimizer step.
 
-    Asserting ``'scheduler.step()' in inspect.getsource(run_epoch)`` plus a
-    bound on the LR after ``max_epochs`` advances is not enough: a mutant that
-    keeps ``scheduler.step()`` inside ``run_epoch`` but moves it OUT of the
-    batch loop -- so the schedule advances once per epoch, a 4050x re-timing --
-    passes both assertions (the string is still there, and ``main()`` still
-    builds a step-sized horizon so the numeric bound still holds).
-
-    So this counts the scheduler's own advances over one real epoch, exactly
-    as the Align-ULCNet twin does. Anything but one advance per training batch
-    fails.
+    A string check for ``scheduler.step()`` in ``run_epoch`` plus a bound on
+    the LR after ``max_epochs`` advances is not enough: a mutant that moves the
+    call out of the batch loop passes both. So this counts the scheduler's own
+    advances over one real epoch, as the Align-ULCNet twin does; anything but
+    one per training batch fails.
     """
     trainer = importlib.import_module(f'AIAEC.{model_name}.train')
     shipped = (pathlib.Path(training_common.__file__).parent
@@ -1742,18 +1696,13 @@ def test_optimizer_selector_refuses_an_unknown_name():
 def test_coupled_decay_is_what_walks_a_quiet_weight_into_denormals():
     """The mechanism behind the default, demonstrated both ways.
 
-    One parameter whose true gradient is exactly zero -- a branch that has
-    stopped receiving signal -- decayed at the shipped lr 1e-3 /
-    weight_decay 1e-4 / amsgrad for 5000 steps, about one epoch's worth.
-    Coupled, ``weight_decay * w`` is the whole gradient, so
-    ``m_hat / sqrt(v_hat)`` normalises it back to ~1 and the weight moves a full
-    lr per step: it crosses zero and keeps shrinking, ending nine decades below
-    where it started and still falling.  Decoupled, the same number is a
-    ``(1 - lr * weight_decay)`` shrink and costs the weight 0.06%.
-
-    ⚠ Written so it can FAIL: if AdamW's decay became coupled, the
-    second branch would land on the first branch's value and the final
-    assertion would say so instead of this test passing vacuously.
+    A parameter whose true gradient is exactly zero is decayed at the shipped
+    lr 1e-3 / weight_decay 1e-4 / amsgrad for 5000 steps. Coupled,
+    ``weight_decay * w`` is the whole gradient, ``m_hat / sqrt(v_hat)``
+    normalises it to ~1 and the weight moves a full lr per step, crossing zero;
+    decoupled, it is a ``(1 - lr * weight_decay)`` shrink costing 0.06%. ⚠
+    Written so it can FAIL: if AdamW's decay became coupled, the final
+    assertion says so.
     """
     def decay_a_quiet_weight(cls, steps=5000):
         param = torch.nn.Parameter(torch.tensor([0.5]))

@@ -29,6 +29,7 @@ pipeline.
 | `RNNoise-ERB` | 16 kHz / 512 / 512 / 256 | ERB-band recurrent mask |
 | `GTCRN` | 16 kHz / 512 / 512 / 256 | GTCRN complex enhancement |
 | `DeepFilterNet2` | 48 kHz / 1024 / 1024 / 512 | full-band ERB mask → low-band DF → learned-alpha residual mix |
+| `DeepFilterNet3` | 48 kHz / 1024 / 1024 / 512 | raw low-band DF + high-band ERB mask → concatenate |
 
 Each model carries its own feature contract and `MODEL_VERSION`; checkpoints
 are not interchangeable between them.
@@ -76,7 +77,7 @@ git submodule update --init --recursive
 # audiolib is a sibling checkout, not a submodule: clone it next to this
 # repository at the revision recorded in pipelines/audiolib.pin, then
 # verify all three producer revisions.
-git clone https://github.com/aaronhsueh0506/audiolib/common.git ../audiolib
+git clone https://github.com/aaronhsueh0506/audio_common.git ../audiolib
 git -C ../audiolib checkout "$(sed -n 's/^AUDIOLIB_COMMIT=//p' pipelines/audiolib.pin)"
 make -C pipelines check-pins
 
@@ -112,8 +113,6 @@ README inside the corresponding model directory.
 - [Frequency-domain pipeline design](docs/freq_domain_pipeline_design.md)
 - [AIAEC current candidate matrix](docs/ai_aec_candidate_matrix.md)
 - [Development and submodule workflow](docs/development.md)
-- Dated audits are structural sign-offs for the revision they name, not current
-  references. See [docs/README.md](docs/README.md#dated-audits).
 
 ## Repository structure
 

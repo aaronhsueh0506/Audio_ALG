@@ -80,7 +80,7 @@ def test_dfn_backbones_produce_identical_heads_before_composition():
     """Controlled weights isolate the output graph from encoder differences.
 
     This explicit test-only copy is not a supported cross-model checkpoint load.
-    Historical DFN3 retains the unused alpha parameters, so even a strict
+    A DFN3 checkpoint retains the unused alpha parameters, so even a strict
     state_dict load alone cannot distinguish these differently trained graphs.
     """
     cfg2, trainer2, module2 = _project(2)

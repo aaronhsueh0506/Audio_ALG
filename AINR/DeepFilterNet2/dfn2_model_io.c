@@ -14,9 +14,8 @@ void dfn2_model_io_init(DFN2ModelIOState *state)
 
 #define DFN2_MODEL_IO_STATE_TENSORS 2
 
-/* One list of (field, contract value) drives both the default and the
- * validator, so validate(default()) == 0 holds by construction and a new
- * geometry constant cannot be added to one without the other. */
+/* One list of (field, contract value) drives both the default and the validator,
+ * so they cannot diverge. */
 #define DFN2_MODEL_IO_DESCRIPTOR_FIELDS(X)                            \
     X(layout_version, (unsigned int)DFN2_MODEL_IO_LAYOUT_VERSION)     \
     X(sample_rate, DFN2_SR)                                           \
@@ -100,8 +99,7 @@ int dfn2_model_io_validate_arrays(
     if (gru_hidden == NULL || df_convp_window == NULL) return -1;
     if (all_finite(&gru_hidden[0][0], gru_count) &&
         all_finite(&df_convp_window[0][0][0], convp_count)) return 0;
-    /* The accelerator wrote these arrays in place, so the previous values are
-     * gone: zero is the only state a stream can restart from. */
+    /* Zero is the only state a stream can restart from after an in-place overwrite. */
     memset(gru_hidden, 0, gru_count * sizeof(float));
     memset(df_convp_window, 0, convp_count * sizeof(float));
     return -1;

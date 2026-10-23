@@ -1,26 +1,13 @@
-/**
- * audio_pipeline_4ch_static.c — complete four-channel spatial pipeline
- *                                (core + SRP-PHAT + BF), static memory.
- *
- * Thin host reference over audio_pipeline_4ch.h. Follows the same
- * query -> allocate -> init_ex -> process -> destroy -> release sequence as
- * 4aec_nr_res_static.c (the core-only demo) and pipelines/
- * mono_aec_nr_res/static_main.c (the mono demo), but drives the COMPLETE wrapper
- * -- the real SRP-PHAT DOA + beamformer (bf) run inside this process, not an
- * externally-supplied fixed-weight stand-in. This is the full end-to-end
- * static-memory smoke reference; audio_pipeline_4ch_raw.c (the
- * recording-validation CLI) intentionally stays on the heap `create()` path
- * since it is a one-shot host tool, not a board-deployment demo.
- *
- * Build:
- *   make -C pipelines/4ch_aec_bf_nr_res audio_pipeline_4ch_static
- *
+/** Complete four-channel spatial pipeline (core + SRP-PHAT + BF), static memory. Thin
+ * host reference over audio_pipeline_4ch.h: query -> allocate -> init_ex -> process ->
+ * destroy -> release, with the real SRP-PHAT DOA and beamformer running in this
+ * process. audio_pipeline_4ch_raw.c (the recording-validation CLI) uses the heap
+ * create() path.
+ * Build:  make -C pipelines/4ch_aec_bf_nr_res audio_pipeline_4ch_static
  * Usage:
- *   ./audio_pipeline_4ch_static [--sample-rate 16000|48000]
- *       [--fft-size 256|512|1024] [--uca-radius-m 0.035]
- *       [--fixed-doa-deg DEG]
- *   ./audio_pipeline_4ch_static --print-mem-size [same options]
- */
+ *   ./audio_pipeline_4ch_static [--sample-rate 16000|48000] [--fft-size 256|512|1024]
+ *       [--uca-radius-m 0.035] [--fixed-doa-deg DEG]
+ *   ./audio_pipeline_4ch_static --print-mem-size [same options] */
 
 #include <math.h>
 #include <stdint.h>
@@ -35,8 +22,6 @@
 #define M_PI 3.14159265358979323846
 #endif
 
-/* ------------------------------------------------------------------ */
-
 static void fill_hop(float* microphones, float* reference, int hop,
                      int sample_rate, int frame_index) {
     int i;
@@ -48,18 +33,14 @@ static void fill_hop(float* microphones, float* reference, int hop,
             (float)absolute / (float)sample_rate;
         reference[i] = 0.08f * sinf(phase);
         for (ch = 0; ch < FOUR_AEC_NR_RES_CHANNELS; ++ch) {
-            /* Slightly different per-channel scale + a tiny per-channel
-             * delay stand-in (phase offset) so SRP-PHAT/BF see a
-             * non-degenerate four-channel signal, not four identical
-             * copies. */
+            /* Per-channel scale and a small phase offset give SRP-PHAT/BF a non-degenerate
+             * four-channel signal. */
             float ch_phase = phase - 0.05f * (float)ch;
             microphones[i * FOUR_AEC_NR_RES_CHANNELS + ch] =
                 (0.35f + 0.05f * (float)ch) * sinf(ch_phase);
         }
     }
 }
-
-/* ------------------------------------------------------------------ */
 
 typedef struct StaticSample {
     McabSpatialOptions options;
@@ -101,10 +82,8 @@ static int static_setup(void *user, McabHopView *view) {
             "complete 4ch pipeline: core + SRP-PHAT + BF", &s->cfg, audio_pipeline_4ch_get_mem_requirements) != 0)
         return 1;
 
-    /* Query -> allocate -> init_ex: same caller-pool sequence as
-     * 4aec_nr_res_static.c / pipelines/mono_aec_nr_res/static_main.c. Aligned
-     * allocation stands in for the board memory manager; the pipeline owns
-     * none of this memory. */
+    /* Query -> allocate -> init_ex; the aligned allocation stands in for the board memory
+     * manager. */
     if (audio_pipeline_4ch_get_mem_requirements(&s->cfg, &s->req) != 0) {
         fprintf(stderr, "Error: invalid config\n");
         return 1;
@@ -173,14 +152,14 @@ static void static_nonfinite(void *user) {
 }
 static int static_consume(void *user, McabHopView *view, int frame) {
     StaticSample *s=user; (void)view;
-        if (isfinite(s->info.doa_raw_rad)) s->saw_finite_doa_raw = 1;
-        if (s->info.bf_adaptive) s->saw_bf_adaptive = 1;
-        if (frame == 48 - 1) {
-            printf("final frame: doa_raw=%.4f doa_smooth=%.4f doa_used=%.4f "
-                   "vad_out=%d bf_adaptive=%d\n",
-                   s->info.doa_raw_rad, s->info.doa_smooth_rad, s->info.doa_used_rad,
-                   s->info.vad_out, s->info.bf_adaptive);
-        }
+    if (isfinite(s->info.doa_raw_rad)) s->saw_finite_doa_raw = 1;
+    if (s->info.bf_adaptive) s->saw_bf_adaptive = 1;
+    if (frame == 48 - 1) {
+        printf("final frame: doa_raw=%.4f doa_smooth=%.4f doa_used=%.4f "
+               "vad_out=%d bf_adaptive=%d\n",
+               s->info.doa_raw_rad, s->info.doa_smooth_rad, s->info.doa_used_rad,
+               s->info.vad_out, s->info.bf_adaptive);
+    }
     return 0;
 }
 static int static_finish(void *user, McabHopView *view, int frame) {
@@ -200,7 +179,6 @@ static int static_finish(void *user, McabHopView *view, int frame) {
         return 1;
     }
     printf("audio_pipeline_4ch_static: smoke PASS\n");
-
     return 0;
 }
 static void static_cleanup(void *user) {

@@ -303,7 +303,8 @@ def test_metadata_separates_training_provenance_from_deployment(tmp_path):
     assert metadata['state_binding'] == 'in_place_same_address'
     assert metadata['score_window_frames'] == SCORE_WINDOW_FRAMES
 
-    # Legacy checkpoints retain the same raw-far training/deployment contract.
+    # Checkpoints without the field keep the same raw-far training/deployment
+    # contract.
     legacy = _write_metadata(
         str(tmp_path / 'legacy.onnx'), str(checkpoint), model, {},
         inputs, outputs,

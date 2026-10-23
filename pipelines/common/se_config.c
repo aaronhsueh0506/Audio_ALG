@@ -1,4 +1,3 @@
-/* pipelines/common/se_config.c -- see se_config.h. */
 #include <stddef.h>
 
 #include "se_config.h"

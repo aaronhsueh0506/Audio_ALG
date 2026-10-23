@@ -1,6 +1,5 @@
-/* Rate bridge between a pipeline's 8/16 kHz grid and the DFN2 stage's
- * 48 kHz grid; see dfn_rate_bridge.h for the signal, clock and delay
- * contract. */
+/* Rate bridge between a pipeline's 8/16 kHz grid and the DFN2 stage's 48 kHz grid;
+ * see dfn_rate_bridge.h for the signal, clock and delay contract. */
 
 #include <stdint.h>
 #include <stdlib.h>
@@ -16,14 +15,12 @@
 #define B48_FFT  DFN2_N_FFT
 #define B48_HOP  DFN2_HOP_LEN
 #define B48_BINS DFN2_N_BINS
-/* Each 48 kHz FIFO holds at most 511 leftover samples plus one native hop
- * upsampled (<= 768); the native output FIFO holds the prefill (<= one hop)
- * plus one hop of surplus plus two downsampled 48 kHz frames (<= 2 * 171). */
+/* FIFO capacities: 511 leftover samples plus one upsampled native hop (<= 768);
+ * the output FIFO holds the prefill, one hop of surplus and two downsampled frames. */
 #define FIFO48_CAP   1536
 #define OUT_FIFO_CAP 1024
-/* Hops simulated at init to find the schedule's largest emitted-minus-
- * produced deficit; every supported grid repeats within four hops, so eight
- * cover two periods. */
+/* Hops simulated at init to find the schedule's largest emitted-minus-produced
+ * deficit (every supported grid repeats within four hops). */
 #define PREFILL_SIM_HOPS 8
 
 struct DfnRateBridge {
@@ -75,9 +72,8 @@ static uint32_t fnv_u32(uint32_t h, uint32_t v) {
     return h;
 }
 
-/* The bridge's capability gate (see GRID CONTRACT in the header): the three
- * native grids its resamplers, FIFO capacities and calibration window are
- * proven for, hop = fft / 2 always. */
+/* Capability gate: the three native grids the resamplers, FIFO capacities and
+ * prefill calibration are sized for; hop = fft / 2. */
 static int grid_dims(int sample_rate, int fft_size, int *fft, int *hop) {
     int f = fft_size == 0 ? 256 : fft_size;
     if (sample_rate == 8000) {
@@ -92,7 +88,7 @@ static int grid_dims(int sample_rate, int fft_size, int *fft, int *hop) {
     return 0;
 }
 
-/* Everything init needs, derived from the config exactly once. */
+/* Everything init needs, derived from the config once. */
 typedef struct Resolved {
     int fft_n;
     int hop_n;
@@ -107,10 +103,8 @@ typedef struct Resolved {
     size_t bytes;
 } Resolved;
 
-/* Bytes of an STFT or ISTFT object that borrows the bridge's FFT handle and
- * window table: the size of the object that carves its own, less those two
- * regions. A borrowed handle exists only after the pool does, so the size
- * cannot be asked for it directly. */
+/* Bytes of an STFT/ISTFT object that borrows the bridge's FFT handle and window
+ * table (the object that carves its own, less those two regions). */
 static size_t borrowed_bytes(size_t own_bytes, int fft_size) {
     size_t shared = align_up(fft_get_mem_size(fft_size)) +
                     align_up((size_t)fft_size * sizeof(float));
@@ -184,8 +178,8 @@ static void fill_descriptor(const DfnRateBridgeConfig *cfg, const Resolved *r,
     h = fnv_u32(h, r->stage_req.build_flags_hash);
     h = fnv_u32(h, (uint32_t)FIFO48_CAP);
     h = fnv_u32(h, (uint32_t)OUT_FIFO_CAP);
-    /* The resamplers' own pool sizes: a pool recorded against another
-     * resampler layout is refused on the hash, not only on `bytes`. */
+    /* The resamplers' pool sizes: a pool recorded against another resampler layout
+     * is refused on the hash. */
     h = fnv_u32(h, (uint32_t)r->up_bytes);
     h = fnv_u32(h, (uint32_t)r->down_bytes);
     memset(out, 0, sizeof(*out));
@@ -241,11 +235,9 @@ static void clear_streams(DfnRateBridge *b) {
     b->phase = 0;
 }
 
-/* Walk the count schedule with the real resamplers on silence: how many
- * native samples the output FIFO must hold before the first hop so that
- * emitting one hop per hop never outruns what the 48 kHz frames produce.
- * Only the counts are used; every buffer written here is cleared again by
- * clear_streams() before the first hop. Leaves the resamplers reset. */
+/* Walks the count schedule with the real resamplers on silence to find how many
+ * native samples the output FIFO must hold before the first hop. Only counts are
+ * used; buffers are cleared again by clear_streams(). Leaves the resamplers reset. */
 static int calibrate_prefill(DfnRateBridge *b) {
     int fill = 0, produced_total = 0, emitted = 0, max_deficit = 0;
     int t, consumed, produced;
@@ -363,7 +355,7 @@ DfnRateBridge *dfn_rate_bridge_init_ex(void *mem, size_t bytes,
     if (b->prefill < 0 || b->prefill > OUT_FIFO_CAP / 2 || lat_up < 0 ||
         lat_down < 0)
         return NULL;
-    /* down latency is in its own (48 kHz) input frames; the grids divide. */
+    /* Down latency is in 48 kHz input frames; the grids divide. */
     b->added_delay = b->prefill + lat_up +
                      (DFN_RES_STAGE_LOOKAHEAD_FRAMES + 1) * B48_HOP *
                          cfg->sample_rate / DFN2_SR +
@@ -409,7 +401,7 @@ void dfn_rate_bridge_reset(DfnRateBridge *b) {
     clear_streams(b);
 }
 
-/* Upsample one native hop into the FIFO's pending region; the count
+/* Upsamples one native hop into the FIFO's pending region; returns the count
  * produced, or -1. */
 static int push_up(DfnRateBridge *b, AudioResampler *up, const float *hop,
                    float *fifo) {
@@ -438,8 +430,8 @@ int dfn_rate_bridge_begin(DfnRateBridge *b,
     return 0;
 }
 
-/* Closes the open (or warm-up) stage frame: stage output -> 48 kHz WOLA ->
- * resample down into the native FIFO. */
+/* Closes the open (or warm-up) stage frame: stage output -> 48 kHz WOLA -> resample
+ * down into the native FIFO. */
 static int finish_frame(DfnRateBridge *b, int model_rc) {
     int consumed, produced;
     if (dfn_res_stage_end(b->stage, model_rc, b->out48) < 0) return -1;
@@ -460,9 +452,7 @@ int dfn_rate_bridge_nn_begin(DfnRateBridge *b, DfnResStageJob *job) {
     if (!b || !job || b->phase != 1) return -1;
     while (b->fill >= B48_HOP) {
         int r;
-        /* The 48 kHz sqrt-Hann 1024/512 analysis the 48 kHz pipelines' AEC
-         * performs on its own hop: each STFT object keeps its lane's
-         * 512-sample history. */
+        /* 48 kHz sqrt-Hann 1024/512 analysis; each STFT object keeps its lane's history. */
         ac_stft_push(b->stft_e, b->fifo_e, b->spec_e48);
         ac_stft_push(b->stft_p, b->fifo_p, b->spec_p48);
         b->fill -= B48_HOP;
@@ -491,7 +481,7 @@ int dfn_rate_bridge_finish(DfnRateBridge *b, float *out_hop) {
     DfnResStageJob job;
     int r;
     if (!b || !out_hop || b->phase == 0) return -1;
-    /* Frames the caller left open or never fetched take the identity. */
+    /* Frames left open or never fetched take the identity. */
     if (b->phase == 2 && dfn_rate_bridge_nn_end(b, -1) != 0) return -1;
     while ((r = dfn_rate_bridge_nn_begin(b, &job)) == 1)
         if (dfn_rate_bridge_nn_end(b, -1) != 0) return -1;

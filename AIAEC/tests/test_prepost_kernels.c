@@ -289,7 +289,7 @@ static int test_deepvqe_kernels(void)
     return 1;
 }
 
-/* newest_frame_finite against the per-channel loop it replaced. */
+/* newest_frame_finite against a plain per-channel loop. */
 static int test_deepvqe_newest_frame(void)
 {
     DeepVqePrepostConfig cfg;

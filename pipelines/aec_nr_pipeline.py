@@ -2,7 +2,7 @@
 AEC + NR + RES Processing Pipeline
 聲學回聲消除 + 降噪 + 殘留回聲抑制串接管線
 
-Pipeline: AEC(linear) → echo-aware NR(E) → RES  (freq A_min_pl, production).
+Pipeline: AEC(linear) → echo-aware NR(E) → RES  (frequency domain).
 The NR folds the AEC residual-echo PSD R²(f) into its noise floor (ξ=S²/(N²+R²))
 and g_total = min(G_nr, G_res) is applied as computed; pass --legacy-amin for
 the noise-only NR. AEC and NR are each selected by their own preset; the
@@ -42,17 +42,17 @@ try:                                    # imported as pipelines.aec_nr_pipeline
 except ImportError:                     # run from the pipelines directory
     from se_stage import SeSpecFrame, frame_from_context
 
-# The separated `--pipeline-mode linear` (AEC-linear -> NR -> RES) is built on
-# the AEC3 freq-domain seam (AecConfig.return_res_context exposes the linear
-# error spectrum + the per-frame AEC3 SuppressionGain), so the post-NR RES is
-# a pure freq multiply — see run_res() + docs/freq_domain_pipeline_design.md.
+# The post-NR RES is a pure frequency multiply on the AEC3 seam
+# (AecConfig.return_res_context exposes the linear error spectrum and the
+# per-frame AEC3 SuppressionGain); see run_res() and
+# docs/freq_domain_pipeline_design.md.
 
 
 def parse_aec_mode(mode_str: str) -> AecMode:
     modes = {
         'fdaf': AecMode.FDAF, 'pbfdaf': AecMode.PBFDAF,
         'pbfdkf': AecMode.PBFDKF,
-        'subband': AecMode.SUBBAND,  # backward compat alias (= PBFDKF)
+        'subband': AecMode.SUBBAND,  # alias of pbfdkf
     }
     return modes.get(mode_str, AecMode.PBFDKF)
 
@@ -110,33 +110,29 @@ def run_aec_linear(mic_signal: np.ndarray, ref_signal: np.ndarray,
 
 
 # NR parameters come from NR's single source of truth
-# (NR/python/config/v3_2_config.yaml with NR/python/core/nr_strength.py's
+# (lib/nr/python/config/v3_2_config.yaml with core/nr_strength.py's
 # apply_strength() overlaid); this module keeps no preset table of its own.
-# See _build_denoiser().
 _NR_YAML_CONFIG = os.path.join(_ROOT, 'lib', 'nr', 'python', 'config', 'v3_2_config.yaml')
 
-# MCRA minima-tracking window (MmseLsaDenoiser's `L`): this pipeline's own ~1.5s
-# wall-clock design, independent of NR's own L=32 (512ms, tuned for standalone
-# noise) -- see _build_denoiser()'s docstring for the full derivation of 94.
+# MCRA minima-tracking window (MmseLsaDenoiser's `L`, authored on the 16 ms
+# grid): 94 frames = 1.5 s, independent of NR's own L=32.
 _NR_L_MINIMA_WINDOW = 94
 
-# Production recipe on top of A_min_pl's min(G_nr, G_res): the AEC residual-echo
-# PSD R²(f) is folded into the OM-LSA noise floor (ξ = S²/(N²+R²), the
-# Speex/Habets canonical) so the NR also suppresses residual echo, while
-# g_res stays in the min. Set LEGACY_AMIN=1 (env / arg) to select the
-# noise-only NR. There is no near-end floor: g_total is applied as computed.
+# Production recipe: the AEC residual-echo PSD R²(f) is folded into the OM-LSA
+# noise floor (ξ = S²/(N²+R²)) so the NR also suppresses residual echo, while
+# g_res stays in the min (--legacy-amin selects the noise-only NR). There is no
+# near-end floor: g_total is applied as computed.
 PROD_INJECT_ECHO_PSD = True
 # Comfort noise is scaled by the denoiser gain of its bin, never below this
-# amplitude (-10 dB); mirrors CNG_NR_GAIN_FLOOR in both C pipelines.
+# amplitude (-10 dB); mirrors SE_CNG_NR_GAIN_FLOOR (pipelines/common/se_stage.h).
 CNG_NR_GAIN_FLOOR = 0.31622777
 
 
 def _project_grid(sample_rate: int, fft_size: int = None) -> Tuple[int, int, int]:
     """Resolve an integrated-pipeline no-padding ``(frame, hop, fft)`` grid."""
     allowed = {16000: (256, 512), 48000: (1024,)}
-    # 16 kHz default is 256/128 (8ms hop), matching
-    # AEC/NR/the 4-channel pipeline's own defaults; 512 remains a
-    # supported, explicit alternate.
+    # 16 kHz default is 256/128 (8 ms hop), as AEC, NR and the 4-channel
+    # pipeline; 512 is an explicit alternate.
     defaults = {16000: 256, 48000: 1024}
     if sample_rate not in allowed:
         raise ValueError(f"supported sample rates are 16000 and 48000, got {sample_rate}")
@@ -156,43 +152,14 @@ def _build_denoiser(sample_rate: int,
                     fft_size: int = None) -> MmseLsaDenoiser:
     """MMSE-LSA denoiser on a power-of-two, no-padding 50%-overlap grid.
 
-    Routed through NR's own single source of truth: NR/python/config/v3_2_config.yaml's
-    base params (via NR/python/process_audio.py's build_v3_2_base_params(), the same
-    helper create_denoiser_from_config() uses) with NR/python/core/nr_strength.py's
-    apply_strength(nr_preset) overlaid -- i.e. exactly the base-YAML -> strength
-    composition create_denoiser_from_config() does, minus the mode overlay (this
-    pipeline has no content-mode selection, so `mode='full'`, itself an empty
-    overlay). ``strength`` is also recorded on the params dict so the
-    MmseLsaDenoiser constructor can correctly disambiguate the pre-/post-16ms-grid
-    provenance of alpha_noise/alpha_g/alpha_attack/alpha_decay when retiming them
-    (see v3_2_mmse_lsa.py's __init__ docstring) -- omitting it would silently
-    retime mild/aggressive's post-16ms-grid overlay values as if they were
-    pre-16ms-grid, corrupting them at any non-16ms-hop grid.
-
-    One genuinely pipeline-specific structural overlay remains on top of the
-    canonical params, applied after apply_strength() so it wins regardless of
-    preset (it is not part of NR's own strength/mode axes, so there is nothing
-    in the standalone system for it to diverge from):
-      - L=94 (see _NR_L_MINIMA_WINDOW): the MCRA minima-tracking window,
-        94 frames x 16ms = 1.504s. This pipeline's window is authored as
-        1.5s of wall clock, independent of NR's own L=32 (512ms); NR's L
-        retiming is an unconditional 16ms-authored one, and 94 reproduces the
-        retimed frame counts of a 1.5s window (188 / 94 / 141 at the
-        16k-8ms-hop, 16k-16ms-hop and 48k-10.67ms-hop grids respectively).
-        L only affects noise_psd when `mcra_accept_external_spp=False`; this
-        pipeline never sets that flag (it stays at the MmseLsaDenoiser
-        default `True`), so today L's value has no effect on this pipeline's
-        output.
-
-    broadband_threshold stays at the canonical 1.0 (scene-reset gate off), the
-    same value the C overlay inherits: with the denoiser's SPP gating the noise
-    update, the gate read the first speech after a silent stretch as a new
-    noise scene, and on the AEC blind corpus that cost near-end speech far more
-    than faster post-burst adaptation returned.
+    Parameters come from NR's single source of truth: the base params of
+    lib/nr/python/config/v3_2_config.yaml (``build_v3_2_base_params``) with
+    ``apply_strength(nr_preset)`` overlaid, as ``create_denoiser_from_config()``
+    does (no content-mode overlay).  The one pipeline-specific overlay is the
+    MCRA minima window ``L`` (``_NR_L_MINIMA_WINDOW``), applied last.
+    ``broadband_threshold`` stays at the canonical 1.0 (scene-reset gate off).
     """
-    # When fft_size is explicitly selected (notably 512 at 16 kHz), infer the
-    # matching frame/hop defaults from that grid instead of first resolving the
-    # sample-rate default (256 at 16 kHz).
+    # An explicit fft_size selects the matching frame/hop defaults.
     default_frame, default_hop, default_fft = _project_grid(sample_rate, fft_size)
     frame_size = default_frame if frame_size is None else int(frame_size)
     frame_shift = default_hop if frame_shift is None else int(frame_shift)
@@ -223,10 +190,10 @@ def _build_denoiser(sample_rate: int,
         )
     params = build_v3_2_base_params(config, sample_rate, frame_size, frame_shift, fft_size)
     params = apply_strength(params, nr_preset)
-    params['strength'] = nr_preset  # retiming-provenance disambiguator; see docstring
+    params['strength'] = nr_preset  # recorded on the denoiser
     params['mode'] = 'full'         # no content-mode selection in this pipeline (empty overlay)
 
-    # The only genuinely pipeline-specific overlay -- see docstring.
+    # The one pipeline-specific overlay.
     params['L'] = _NR_L_MINIMA_WINDOW
 
     return MmseLsaDenoiser(**params)
@@ -248,30 +215,15 @@ def run_nr(signal: np.ndarray, sample_rate: int,
 def run_nr_spectrum(aec_contexts: List[AecResContext], sample_rate: int,
                     nr_preset: str = 'balanced',
                     inject_echo_psd: bool = False) -> np.ndarray:
-    """NR directly on the AEC linear error spectra E(f) — no re-FFT.
+    """NR directly on the AEC linear error spectra E(f), with no re-FFT.
 
-    Consumes ``ctx.error_spec`` (the AEC's sqrt-Hann-windowed linear error
-    spectrum) for every hop, runs MMSE-LSA in the frequency domain via
-    ``denoise_spectrum``, and returns the per-frame gain G_nr(f)
-    (``n_frames, n_freqs``)
-    for the freq-domain RES. This is the FFT-deduplicated path: the spectra the
-    time-domain run_nr would re-derive are already in the context.
-
-    ``inject_echo_psd`` (default False = unchanged): fold the AEC residual-echo
-    PSD R²(f) into the OM-LSA noise floor (a priori SNR ξ = S²/(N²+R²), the
-    canonical Speex/Habets "echo-as-extra-noise" unified gain), so the single
-    NR gain ALSO suppresses residual echo. R²=ctx.r2/psd_scale is already on the
-    |E|² scale the denoiser's noise floor uses (β_r=1). Combine downstream with
-    ``min(g_nr, g_res)`` — g_res stays load-bearing (dropping it kills echo).
-
-    Injection is additionally gated per hop on ``ctx.usable_linear`` (AEC's own
-    ``AecState.usable_linear_estimate()`` verdict for that hop, already carried
-    on the context): before the linear filter is usable, R² comes from AEC's
-    nonlinear-path fallback, which is a deliberately conservative
-    "assume-unmitigated-echo" estimate, not a trustworthy per-bin noise-floor
-    term. A hop with ``usable_linear`` False or None (no verdict, e.g. a
-    fused multi-lane context) contributes zero extra noise PSD, same as a
-    missing ``r2``.
+    Consumes ``ctx.error_spec`` per hop and returns the per-frame gain G_nr(f)
+    (``n_frames, n_freqs``) for the frequency-domain RES.  ``inject_echo_psd``
+    (default False) folds the residual-echo PSD R²(f) into the OM-LSA noise
+    floor (ξ = S²/(N²+R²)) so the gain also suppresses residual echo (combine
+    with ``min(g_nr, g_res)``); it is gated per hop on ``ctx.usable_linear``,
+    and a hop with it False or None (e.g. a fused multi-lane context) adds no
+    extra noise PSD, as a missing ``r2`` does.
     """
     if not aec_contexts:
         raise ValueError("aec_contexts must not be empty")
@@ -310,10 +262,9 @@ def total_gain(g_nr, g_res, use_nr: bool, use_res: bool, combine: str,
                n_freqs: int) -> np.ndarray:
     """Per-bin gain applied to E(f): the Python twin of ``sk_min_f32``.
 
-    A_min_pl (``combine='min'``, both gains on): the per-bin min recovers the
-    AEC3 echo gain that v0 discarded -- near-end bins (g_res~1) keep g_nr; echo
-    bins (g_res<g_nr) cut the leak -- WITHOUT the product's double-cut on
-    double-talk near-end.  A disabled source reads as the unity gain.
+    ``combine='min'`` with both gains on: near-end bins (g_res~1) keep g_nr,
+    echo bins (g_res<g_nr) cut the leak, without the double-cut of the product
+    on double-talk near-end.  A disabled source reads as the unity gain.
     """
     if use_nr and use_res and combine == 'min':
         return np.minimum(g_nr, g_res).astype(np.float32)
@@ -366,28 +317,13 @@ def run_res(nr_output: np.ndarray, nr_gains: np.ndarray,
             combine: str = 'product') -> np.ndarray:
     """Residual-echo suppression AFTER NR, in the frequency domain.
 
-    Reuses the linear AEC's own per-frame AEC3 SuppressionGain (``ctx.res_gain``)
-    and its windowed error spectrum (``ctx.error_spec``), exposed via
-    ``AecConfig.return_res_context``. The post-NR residual is a single freq
-    multiply per hop::
-
-        S(f) = E(f) · G_nr(f) · G_res(f)   (+ comfort noise on the cut bins)
-
-    then one sqrt-Hann OLA — no standalone ResFilter, no extra FFT round-trip.
-    The sqrt-Hann synthesis window matches the AEC's ``_aec3_synth_window`` exactly
-    (periodic Hann, denom = block_size) for perfect reconstruction.  Per hop
-    the steps are those of the C applications, in the same order:
-    ``total_gain`` (min) -> ``apply_gain`` -> ``comfort_noise_fill`` ->
-    ``synthesize_hop``.
-
-    Frame alignment: ``ctx[i].error_spec`` spans [(i-1)*hop, (i+1)*hop) (AEC
-    analysis window ends at the current hop). In ``--pipeline-mode freq`` NR
-    is also computed from ``ctx.error_spec`` so frame i = frame i. In
-    ``--pipeline-mode linear`` NR is computed from the AEC time-domain output
-    whose frame i covers [i*hop, (i+2)*hop), so ``nr_gains[i]`` is one hop
-    AHEAD of ``ctx[i].error_spec`` — callers should pass ``nr_gains`` with a
-    one-frame shift (``np.concatenate([[nr_gains[0]], nr_gains[:-1]])``) or
-    use ``--pipeline-mode freq`` (the default).
+    Per hop, in the order of the C applications, ``total_gain`` ->
+    ``apply_gain`` -> ``comfort_noise_fill`` -> ``synthesize_hop`` (sqrt-Hann
+    OLA, as the AEC's ``_aec3_synth_window``): S(f) = E(f) · G_nr(f) · G_res(f)
+    plus comfort noise on the cut bins, from ``ctx.res_gain`` and
+    ``ctx.error_spec`` (``AecConfig.return_res_context``).  ``nr_gains`` must
+    come from the same spectra (``run_nr_spectrum``); gains from a time-domain
+    NR run are one hop ahead and need a one-frame shift.
     """
     bs = int(config.frame_size)
     hop = int(config.hop_size)
@@ -423,12 +359,9 @@ def run_res(nr_output: np.ndarray, nr_gains: np.ndarray,
         frame = frame_from_context(ctx, hop)
         g_nr = nr_gains[i].astype(np.float32) if use_nr else 1.0
         g_res = frame.g_res_ctx.astype(np.float32) if use_res else 1.0
-        # Save AEC-only gain before combining with G_nr: which bins the comfort
-        # noise fills is decided by AEC suppression alone (sqrt(1 - G_res^2)),
-        # never by g_total. Its LEVEL is then scaled by G_nr, bounded below by
-        # CNG_NR_GAIN_FLOOR, so the fill follows the denoised floor rather than
-        # the ambient level: the denoiser never sees the comfort noise, so its
-        # gain is applied to it here.
+        # Which bins the comfort noise fills is decided by AEC suppression alone
+        # (sqrt(1 - G_res^2)), never by g_total; its level is scaled by G_nr
+        # (floored at CNG_NR_GAIN_FLOOR) because the denoiser never sees it.
         g_aec = g_res if isinstance(g_res, np.ndarray) else np.full(n_freqs, g_res, dtype=np.float32)
         cn_scale = np.maximum(g_nr, CNG_NR_GAIN_FLOOR) if isinstance(g_nr, np.ndarray) else 1.0
         g_total = total_gain(g_nr, g_res, use_nr, use_res, combine, n_freqs)
@@ -518,8 +451,7 @@ Switches:
         print("NR/RES:   disabled (--aec-only)")
     print()
 
-    # AEC config: production filter (PBFDKF); the preset sets the echo-vs-near
-    # min-gain floor (the only inter-preset difference).
+    # Production filter (PBFDKF); the preset sets the echo-vs-near min-gain floor.
     aec_config = AecConfig.from_preset(
         preset,
         sample_rate=sample_rate,
@@ -530,10 +462,9 @@ Switches:
         enable_res=True,
     )
 
-    # freq A_min_pl pipeline (production): AEC(linear) -> noise-only NR(E) ->
-    # g_total = min(G_nr, G_res). NR handles
-    # noise; the AEC's own near-end-aware AEC3 echo gain G_res handles echo; the
-    # per-bin min keeps both without the product's double-talk double-cut.
+    # AEC(linear) -> NR(E) -> g_total = min(G_nr, G_res): NR handles noise, the
+    # AEC's near-end-aware echo gain G_res handles echo, and the per-bin min
+    # avoids the double-cut of the product on double-talk.
     print("Stage 1: AEC (linear, no RES)...")
     aec_output, contexts = run_aec_linear(
         mic_signal, ref_signal, aec_config,

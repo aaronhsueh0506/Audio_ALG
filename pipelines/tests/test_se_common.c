@@ -289,22 +289,18 @@ static void test_stage(void) {
         CHECK(ga && gb && memcmp(ga, gb, (size_t)n * sizeof(float)) == 0, "stage gain equals the direct call");
         CHECK(memcmp(scratch, extra, (size_t)n * sizeof(float)) == 0, "scratch holds r2 / SE_PSD_SCALE");
     }
-    /* usable_linear = 0 fails closed: r2 and scratch are both non-NULL, but the
-     * cold-start-unusable estimate must not fold into the noise floor -- the
-     * gain must equal the plain (use_r2 = 0) call, never the r2-folded one.
-     * r2 here is sized like the real cold-start fault this gate exists for
-     * (on the order of 1e12, matching a field trace of the AEC's conservative
-     * nonlinear estimate during cold start). The mutation guard below (denoiser
-     * c) proves that comparison isn't vacuous. */
+    /* usable_linear = 0 fails closed: with r2 and scratch both non-NULL, a cold-start
+     * unusable estimate must not fold into the noise floor, so the gain equals the plain
+     * (use_r2 = 0) call. r2 is sized like the cold-start fault this gate exists for
+     * (order 1e12). The mutation guard below (denoiser c) shows the comparison is not
+     * vacuous. */
     se_anr_stage_reset(a);
     anr_reset(b);
     anr_reset(c);
     f.usable_linear = 0;
-    /* The denoiser bypasses NR for its first num_init_frames (here it takes
-     * ~25 hops for gb's own gain to move off unity), so the mutation guard
-     * below -- folding this r2 must visibly differ from not folding it --
-     * is only checked once that warm-up has passed; the primary ga == gb
-     * gate check runs every hop regardless. */
+    /* The denoiser bypasses NR for its first num_init_frames, so the mutation guard below
+     * (folding this r2 must visibly differ from not folding it) is checked only after that
+     * warm-up; the ga == gb gate check runs every hop. */
     for (frame = 0; frame < 35; ++frame) {
         for (k = 0; k < n; ++k) {
             spec[k].r = (float)((frame * 7 + k * 13) % 101) * 31.0f - 1500.0f;

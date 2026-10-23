@@ -3,16 +3,11 @@
 
 Three of the four candidates take the same microphone/far-end WAV pair, load
 their weights the same way and run the same hop-by-hop STFT -> forward_stream
--> ISTFT schedule; only the model class and the prose differ.  Both halves of
-that CLI live here once: ``make_inference_cli`` builds the public entry point
-and ``make_streaming_main`` builds the deployment-reference schedule behind it.
-
-Align-ULCNet keeps its own pair of files because a PBFDKF frontend runs inside
-its hop loop; it reuses the pieces below that do not depend on that seam.
-
-This is the CLI factory.  ``AIAEC/inference_common.py`` -- no leading
-underscore -- is the separate module holding the WAV loading/resampling
-helpers both hop loops call.
+-> ISTFT schedule. ``make_inference_cli`` builds the public entry point and
+``make_streaming_main`` the deployment-reference schedule behind it.
+Align-ULCNet keeps its own files because a PBFDKF frontend runs inside its hop
+loop, and reuses the pieces that do not depend on that seam. (WAV loading and
+resampling live in ``AIAEC/inference_common.py``.)
 """
 
 from __future__ import annotations
@@ -313,11 +308,9 @@ def make_inference_cli(model_name, model_class, description):
 
     ``load_model`` is the single checkpoint-construction site shared by the
     streaming CLI, the exporters and the calibration recorder, so a contract
-    check added here reaches all of them.  config.ini is deliberately not read:
+    check added here reaches all of them. config.ini is deliberately not read:
     every shape-relevant setting comes from the checkpoint's own contract.
-
-    Returns ``(build_parser, load_model, main, cli)``; each model's
-    ``inference.py`` binds them as its module-level entry points.
+    Returns ``(build_parser, load_model, main, cli)``.
     """
 
     def build_parser() -> argparse.ArgumentParser:

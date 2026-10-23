@@ -1,25 +1,13 @@
 """A corpus packed with ``--dtype float16`` must reach every model.
 
 ``pack_aec_dataset.py --dtype float16`` halves what the corpus costs on disk,
-and nothing between the shard and the model widened it: ``__getitem__`` hands
-back the stored tensor, ``aec_collate`` stacks it, and each ``forward_batch``
-moved it to the device without naming a dtype. Training then stopped in
-``torch.stft`` (``aec_features.py``), which has no half kernel on CPU and
-falls back to a float64 path: ``expected scalar type Double but found Half``.
-Reports of ``expected scalar type Half but found Float`` are the same cause
-reaching a different op first. Half is not a precision problem here -- the
-transform carries fp16's eleven mantissa bits faithfully -- it is a dtype one.
-
-The fix belongs on the device move, which is where AINR's trainers already put
-it: half survives the loader and is widened once, on the way in. So this
-asserts the property at ``forward_batch`` rather than at the dataset --
-widening earlier would work too, and would carry the wider dtype across the
-loader for no gain. (AINR also pins memory and passes ``non_blocking``; AIAEC's
-loaders do not, so only the dtype half of that pattern applies here.)
-
-No corpus is rendered here. The batch is fabricated at the packed layout,
-because what broke was the dtype of the tensor handed to ``forward_batch``,
-not anything about how the samples were produced.
+and nothing between the shard and the model widens it: ``__getitem__`` hands
+back the stored tensor, ``aec_collate`` stacks it and ``forward_batch`` moves
+it to the device without naming a dtype. ``torch.stft`` (``aec_features.py``)
+has no half kernel on CPU, so training would stop with ``expected scalar type
+Double but found Half``. The widening belongs on the device move, as in AINR's
+trainers, so this asserts it at ``forward_batch`` on a batch fabricated at the
+packed layout.
 """
 import importlib
 import math

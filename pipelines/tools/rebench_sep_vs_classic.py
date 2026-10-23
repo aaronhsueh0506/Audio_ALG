@@ -7,7 +7,7 @@ alignment, matching production), writing <stem>_ours.wav into two dirs so the
 AEC repo's bench_aecmos.py can score each:
 
   classic   : AEC(enable_res=True) -> NR(time)              (RES inside AEC)
-  separated : AEC(linear) -> NR(E(f)) -> RES (freq-domain)  (item-12 topology)
+  separated : AEC(linear) -> NR(E(f)) -> RES (freq-domain)
 
 Usage:
   python3 pipelines/tools/rebench_sep_vs_classic.py <classic_dir> <separated_dir> [limit_per_scenario]

@@ -1,39 +1,11 @@
-/**
- * main.c (binary aec_nr_pipeline) — AEC(linear) → echo-aware NR → RES  (Version A: malloc)
- *
- * Thin CLI shell over mono_aec_nr_res/audio_pipeline.h. Freq-domain
- * A_min_pl pipeline, a C port of pipelines/aec_nr_pipeline.py. Per hop:
- *   Stage 1: AEC in LINEAR mode (enable_res=0, return_res_context=1) — the AEC
- *            post block still runs and exposes, via AecResContext, the windowed
- *            linear error spectrum E(f), the AEC suppression gain G_res(f), the
- *            residual-echo PSD R²(f) and the comfort-noise PSD N²(f); the AEC
- *            time output stays the linear residual (no suppression applied).
- *   Stage 2: echo-aware NR on E(f). MMSE-LSA gain G_nr(f) with R² folded into the
- *            noise floor (ξ = S²/(N²+R²), the unified Speex/Habets gain).
- *   Stage 3: external RES — g_total = min(G_nr, G_res), then S(f) = E(f)·g_total
- *            (+ comfort noise on the cut bins) and one sqrt-Hann OLA.
- *
- * All of the above lives in audio_pipeline.c (audio_pipeline_process()) —
- * this file is arg parsing + WAV I/O + the `--debug` / `DUMP_CTX` diagnostics
- * around a single audio_pipeline_create()/destroy() pair (the heap
- * convenience path; see mono_aec_nr_res/static_main.c for the explicit
- * caller-pool flavor of the same API).
- *
- * This mirrors run_aec_linear → run_nr_spectrum(inject_echo_psd) → run_res
- * (combine='min'). --legacy-amin selects the noise-only NR (no R²
- * injection).
- *
+/** Binary aec_nr_pipeline (heap flavor): AEC(linear) -> echo-aware NR -> RES. Thin CLI over audio_pipeline.h (argument parsing, WAV I/O, `--debug` / `DUMP_CTX` diagnostics around one audio_pipeline_create()/destroy() pair); the processing is audio_pipeline_process(). See static_main.c for the caller-pool flavor.
  * Build:  make libs && make aec_nr_pipeline
  * Usage:
  *   AEC preset: 0=mild, 1=balanced, 2=aggressive, 3=no_floor; names also accepted.
  *   ./aec_nr_pipeline <mic.wav> <ref.wav> <out.wav> [aec-preset]
- *                     [--nr-preset mild|moderate|balanced|aggressive] [--aec-only] [--no-nr] [--no-res] [--legacy-amin]
- *                     [--debug]
- *
- * --debug: once per second of processed audio, print one compact status line
- *   to stderr combining aec_debug_status() (lib/aec) + anr_debug_status()
- *   (lib/nr) — read-only snapshots, no DSP-state or output changes.
- */
+ *                     [--nr-preset mild|moderate|balanced|aggressive] [--aec-only]
+ *                     [--no-nr] [--no-res] [--legacy-amin] [--debug]
+ * --debug: once per second of processed audio, one status line to stderr from aec_debug_status() + anr_debug_status() (read-only). */
 
 #include <stdio.h>
 #include <stdlib.h>
@@ -44,9 +16,7 @@
 #include "audio_pipeline.h"
 #include "wav_io.h"
 
-/* ------------------------------------------------------------------ */
-
-/* CLI aliases only; unknown names retain the historical balanced fallback. */
+/* CLI aliases only; unknown names fall back to balanced. */
 static AecPreset parse_preset(const char* s) {
     if (strcmp(s, "mild") == 0 || strcmp(s, "0") == 0)
         return AEC_PRESET_MILD;
@@ -68,8 +38,7 @@ static const char* preset_name(AecPreset p) {
     }
 }
 
-/* Name table lives beside the enum (lib/nr anr_types.h); an unknown
- * name keeps this tool's long-standing fallback to balanced. */
+/* Name table lives beside the enum (anr_types.h); unknown names fall back to balanced. */
 static AnrMode parse_nr_mode(const char* s) {
     int m = anr_nr_mode_from_name(s);
     return m < 0 ? ANR_MODE_BALANCED : (AnrMode)m;
@@ -79,20 +48,8 @@ static const char* nr_mode_name(AnrMode m) {
     return anr_nr_mode_name(m);
 }
 
-/* --debug: one compact status line/sec to stderr, combining both libraries'
- * read-only diagnostic queries (aec_debug_status() / anr_debug_status())
- * via the handles audio_pipeline_get_aec()/audio_pipeline_get_nr() expose.
- * Neither call mutates DSP state or fast_math-approximates anything (both
- * use standard logf/log10f), so this is safe to call every second regardless
- * of preset/backend. aec_only (or nr==NULL) omits the NR half — no denoiser
- * exists in that mode.
- *
- * CAVEAT: this pipeline always runs AEC in linear mode (enable_res=0,
- * return_res_context=1 — the external NR/RES seam above), and aec.c only
- * caches last_erle_windowed when cfg.enable_res is true. So the "erle="
- * field below always reads 0.0dB here — expected given this pipeline's
- * config, not a broken query (see pipelines/README.md "Debugging &
- * Performance Flags"). */
+/* --debug: one status line/sec to stderr from the read-only aec_debug_status() /
+ * anr_debug_status() queries; the NR half is omitted when no denoiser exists. */
 static void print_debug_status(const AudioPipeline* pipe, int aec_only, float seconds) {
     AecDebugStatus a;
     aec_debug_status(audio_pipeline_get_aec(pipe), &a);
@@ -117,17 +74,8 @@ static void print_debug_status(const AudioPipeline* pipe, int aec_only, float se
         n.initialized, n.mean_gain_db, n.min_gain_db, n.mean_spp, n.noise_floor_db);
 }
 
-/* ------------------------------------------------------------------ */
-
-/* ------------------------------------------------------------------ *
- * --timing: per-stage cost accumulation.
- *
- * Summed over the run and reported as a mean per hop, because a per-hop
- * print at 100 hops/s is noise and a single hop is not a measurement. The
- * UNATTRIBUTED line is not decoration: the stages deliberately do not sum to
- * the call (audio_pipeline.h documents what sits in the gap), so a table
- * that printed only the parts would imply a whole it never measured.
- * ------------------------------------------------------------------ */
+/* --timing: per-stage cost summed over the run and reported as a mean per hop. The
+ * UNATTRIBUTED line is the part of the call outside the listed stages. */
 typedef struct {
     uint64_t delay, frontend, linear, res, nr, post, synth, wall;
     uint64_t hops;
@@ -211,7 +159,7 @@ int main(int argc, char* argv[]) {
     int           legacy   = 0;   /* --legacy-amin → min-only A_min_pl */
     int           no_nr    = 0;   /* --no-nr → no denoiser, g_total is G_res */
     int           no_res   = 0;   /* --no-res → no residual gain, g_total is G_nr */
-    int           no_cng   = 0;   /* --no-cng → disable comfort noise (parity) */
+    int           no_cng   = 0;   /* --no-cng -> disable comfort noise */
     int           debug_status = 0; /* --debug → periodic aec+nr status line   */
     int           show_timing  = 0; /* --timing → per-stage cost summary at exit */
     StageAccum    acc; memset(&acc, 0, sizeof(acc));
@@ -241,9 +189,7 @@ int main(int argc, char* argv[]) {
         fprintf(stderr, "Error: sample-rate mismatch\n");
         wav_close_read(mic_r); wav_close_read(ref_r); return 1;
     }
-    /* CLI rate whitelist: audio_pipeline_create() would reject an unsupported
-     * rate anyway (aec_is_valid_sample_rate() under the hood) — fail earlier
-     * and with a clearer message here, before any buffers are sized off it. */
+    /* CLI rate whitelist, checked before any buffers are sized. */
     if (!aec_is_valid_sample_rate(mic_r->info.sample_rate)) {
         fprintf(stderr, "Error: unsupported sample rate %d Hz (supported: 8000, 16000, 48000)\n",
                 mic_r->info.sample_rate);
@@ -271,8 +217,7 @@ int main(int argc, char* argv[]) {
            preset_name(preset), nr_mode_name(nr_mode), !no_nr ? "on" : "off",
            !no_res ? "on" : "off", !no_cng ? "on" : "off");
 
-    /* Create the pipeline (heap convenience: get_mem_requirements +
-     * posix_memalign + init, all inside audio_pipeline_create()). */
+    /* Create the pipeline (heap path: get_mem_requirements + posix_memalign + init). */
     AudioPipeline* pipe = audio_pipeline_create(&cfg);
     if (!pipe) {
         fprintf(stderr, "Error: pipeline create failed\n");
@@ -299,13 +244,9 @@ int main(int argc, char* argv[]) {
         wav_close_read(mic_r); wav_close_read(ref_r); return 1;
     }
 
-    /* Optional per-frame context dump (DUMP_CTX=<path>) for port parity tests:
-     * header [n_freqs, hop]; then per frame error_spec(2·nf) res_gain(nf) r2(nf)
-     * comfort_noise(nf) far_power(1) g_nr(nf) out_hop(hop), all float32. Read
-     * via the audio_pipeline_get_aec()/audio_pipeline_get_nr() handles — a
-     * dump record is only ever written for a hop whose freq seam was
-     * actually available, mirroring audio_pipeline_process()'s own internal
-     * fallback check. */
+    /* Optional per-frame context dump (DUMP_CTX=<path>): header [n_freqs, hop]; then per
+     * frame error_spec(2*nf) res_gain(nf) r2(nf) comfort_noise(nf) far_power(1) g_nr(nf)
+     * out_hop(hop), all float32. Written only for hops whose freq seam was available. */
     FILE* dctx = NULL;
     const char* dpath = getenv("DUMP_CTX");
     if (dpath && !aec_only) {
@@ -316,7 +257,7 @@ int main(int argc, char* argv[]) {
     Aec* aec_handle = audio_pipeline_get_aec(pipe);
     AnrDenoiser* nr_handle = audio_pipeline_get_nr(pipe);
 
-    /* === Processing loop === */
+    /* Processing loop */
     int processed = 0;
     while (processed + hop <= n_samples) {
         wav_read_float(mic_r, mic_buf, hop);

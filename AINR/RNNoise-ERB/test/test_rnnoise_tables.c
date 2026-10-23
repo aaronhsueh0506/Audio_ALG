@@ -1,35 +1,16 @@
 /* ============================================================
- * Drift-guard (兩層 contract):
+ * rnnoise_tables_gen.h 的 drift-guard, 兩層:
  *
- * 第一層 (預設, 未定義 RNN_TABLES_PORTABLE 時): 確保 rnnoise_tables_gen.h
- * 裡的編譯期常數表格，跟下面獨立寫出的 ERB/window 演算法逐 byte 相同 --
- * 這是「本機 + pinned CI 工具鏈」的 canonical/bit-exact 檢查, 預設啟用
- * (即: canonical/bit-exact 是預設值, portable mode 才是 opt-out)。
+ * 第一層 (預設): 用獨立寫出的 ERB/window 算法 (不呼叫 gen_rnnoise_tables.c) 在
+ * 執行期重算四張表, 與 header 內的 `static const` 表格逐 byte memcmp。
  *
- * 這個測試「獨立複製」一份演算法迴圈 (不是呼叫 gen_rnnoise_tables.c 裡的
- * 函式, 而是自己再寫一次), 執行期重新算出四張表格, 跟 header 裡的
- * `static const` 表格 memcmp。這樣就算日後有人手動改壞了
- * rnnoise_tables_gen.h、或者 gen 工具本身的算式跟這裡「本來該有」的
- * 演算法不小心分岔了, 這個測試都能抓到 (只要這份獨立複製沒有跟著錯)。
+ * 第二層 (-DRNN_TABLES_PORTABLE): 不同 libm/工具鏈不保證逐 byte 相同, 改檢查數學
+ * 性質: 值皆有限; nfftborder 嚴格遞增且端點為 0 與 257; erb_inv 每列總和為 1;
+ * erb_fwd 除頭尾兩個 band 為 erb_inv 的兩倍外與之相同; hann window 落在 [0,1]、
+ * w[0]==0 且 w[i] 與 w[WIN_LEN-i] 的 ULP 差在界內; 另有 recompute-vs-table 的
+ * max-ULP 門檻 (256 ULP), 只抓整體算式錯誤, 不是位元契約。
  *
- * 第二層 (`-DRNN_TABLES_PORTABLE`, opt-out): 逐 byte memcmp 在不同 libm/
- * 工具鏈/交叉編譯目標下不保證成立 (跨工具鏈不規定 1 ULP)，
- * 所以這個 mode 檢查表格的「數學性質」而非精確位元:
- *   - 四張表都是有限值 (finite)
- *   - nfftborder 嚴格遞增, 兩端點釘死在 0 與 257
- *   - erb_inv 每一列 (每個 frequency bin) 對 band 求和是
- *     partition-of-unity (= 1.0, within a measured tolerance)
- *   - erb_fwd 除了頭尾兩個 band 欄位是 erb_inv 的兩倍以外, 其餘逐一相同
- *   - hann window 落在 [0,1], 且滿足公式本身要求的對稱關係
- *     (w[i]==w[WIN_LEN-i]), 端點 w[0]==0
- * 外加一個 recompute-vs-table 的 max-ULP 量測報告, 用一個留了大量餘裕的
- * 門檻 (256 ULP) 當作 garbage-detector -- 這不是位元契約, 只是抓「整個
- * 算式錯掉/表格對調/regen 損毀」這種明顯錯誤 (pinned 工具鏈上的量測值
- * 是 0, 跟 Layer 1 的逐 byte memcmp 一致)。
- *
- * 建置 (兩個 mode 都要在這台機器上跑過, 都要 PASS):
- *   cc -O2 -ffp-contract=off -Wall -Wextra -I. test/test_rnnoise_tables.c -lm -o test_rnnoise_tables && ./test_rnnoise_tables
- *   cc -O2 -ffp-contract=off -Wall -Wextra -I. -DRNN_TABLES_PORTABLE test/test_rnnoise_tables.c -lm -o test_rnnoise_tables_portable && ./test_rnnoise_tables_portable
+ * 建置並執行 (兩個模式都須 PASS): 在 RNNoise-ERB/ 下 `make test-tables`。
  * ============================================================ */
 
 #include "process.h"
@@ -231,21 +212,10 @@ static int check_erb_fwd_matches_inv_except_ends(void) {
     return ok;
 }
 
-/* [0,1] range, w[0]==0 endpoint, and the symmetry the formula's
- * periodicity guarantees MATHEMATICALLY:
- * cos(2*pi*(WIN_LEN-i)/WIN_LEN) == cos(2*pi - 2*pi*i/WIN_LEN) == cos(2*pi*i/WIN_LEN)
- * by 2*pi-periodicity of cosine, so w[i] and w[WIN_LEN-i] should be the same
- * real number. But `2.0f*(float)M_PI*i/WIN_LEN` and
- * `2.0f*(float)M_PI*(WIN_LEN-i)/WIN_LEN` are DIFFERENT float expressions
- * (different multiply, different rounding) that only happen to evaluate to
- * the same real angle mod 2*pi -- so this is NOT bit-exact in practice
- * (measured on the pinned toolchain: up to 434 ULP / ~8.1e-7 absolute between a pair,
- * from cosf/sqrtf rounding a several-ULP-different argument). This checks
- * the formula-derived relationship (mirror index WIN_LEN-i, not e.g. the
- * wrong-but-plausible WIN_LEN-1-i) with a generous, measured-then-margined
- * ULP bound -- same "garbage-detector, not a bit contract" spirit as the
- * recompute-vs-table check below, just applied to this table's internal
- * self-consistency instead of table-vs-recompute. */
+/* [0,1] 範圍、w[0]==0, 以及週期性隱含的對稱 w[i]~w[WIN_LEN-i]。兩側角度
+ * `2.0f*(float)M_PI*i/WIN_LEN` 與 `2.0f*(float)M_PI*(WIN_LEN-i)/WIN_LEN` 是不同的
+ * float 運算式 (各自捨入), 所以只用寬鬆的 ULP 上界檢查; 鏡像 index 是 WIN_LEN-i
+ * (不是 WIN_LEN-1-i)。 */
 #define RNN_HANN_SYMMETRY_MAX_ULP 4096u
 static int check_hann_window_contract(void) {
     int ok = 1;
@@ -296,16 +266,8 @@ static uint32_t max_ulp_over_tables(void) {
     return worst;
 }
 
-/* Generous margin around what's actually MEASURED on the pinned toolchain
- * (0, per the PASS below -- matching Layer 1's exact memcmp). This is
- * deliberately NOT tightened to a small bound like 1 ULP: a 1-ULP
- * cross-toolchain contract is not required, since a
- * different libm/compiler/target is free to round transcendental functions
- * (log/exp/cos/sqrt, all used by ref_compute_*) differently while still
- * being a perfectly correct implementation. 256 ULP is loose enough to
- * absorb that legitimate variation while still catching a genuinely wrong
- * table (wrong formula, swapped/transposed table, corrupted regen) by many
- * orders of magnitude. */
+/* recompute-vs-table 的門檻刻意寬鬆: 不同 libm/編譯器/目標對 log/exp/cos/sqrt 的
+ * 捨入可以不同而仍然正確。256 ULP 仍能抓出整個算式錯誤、表格對調或 regen 損毀。 */
 #define RNN_TABLES_PORTABLE_MAX_ULP 256u
 
 #endif /* RNN_TABLES_PORTABLE */

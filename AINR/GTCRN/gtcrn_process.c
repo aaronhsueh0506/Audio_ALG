@@ -29,13 +29,11 @@ void gtcrn_process_init(GTCRNProcessState* state, AcStft* stft,
     ac_istft_reset(istft);
 }
 
-/* A scalar twin is the reference of its NEON kernel and the whole kernel in a
- * SIMD=0 build; a NEON build keeps it only for the differential test. */
+/* Scalar twin of a NEON kernel; it is the whole kernel in a SIMD=0 build. */
 #define GTCRN_TWIN static inline __attribute__((unused))
 
-/* Keep low bins unchanged; band the high bins with the shared scalar
- * kernel. Each band accumulates bins in ascending order with unfused
- * multiply/add, matching the model's committed forward table. */
+/* Low bins pass through; the high bins are banded with the shared scalar kernel
+ * (ascending-bin, unfused accumulation). */
 GTCRN_TWIN void erb_band_channel_scalar(const float* full,
                                         const float* erb_fwd, float* banded)
 {
@@ -47,14 +45,13 @@ GTCRN_TWIN void erb_band_channel_scalar(const float* full,
 }
 
 #if DF_COMMON_HAVE_NEON
-/* Quads of bins the mask-expansion kernel below keeps in registers. */
+/* Quads of bins the mask-expansion kernel keeps in registers. */
 #define MASK_BIN_QUADS 8
 _Static_assert(GTCRN_MODEL_ERB_HIGH_BINS % (4 * MASK_BIN_QUADS) == 0,
                "the bin blocks tile the high bins");
 
-/* Fuse the three channels into one table pass for throughput. Each
- * channel/band keeps its own accumulator in ascending-bin, unfused order;
- * the shared kernel documents the register-block performance constraint. */
+/* The three channels fuse into one table pass; each channel/band keeps its own
+ * accumulator in ascending-bin, unfused order. */
 static inline void erb_band3_neon(const float* const full[3],
                                   const float* erb_fwd, float* const banded[3])
 {
@@ -179,7 +176,7 @@ void gtcrn_model_output(const float mask_erb[GTCRN_MODEL_ERB_BANDS][2],
         mask_im[k] = mask_erb[k][1];
     }
     mask_expand(mask_erb, erb_inv, mask_re, mask_im);
-    /* Complex ratio mask, mirroring model.py's Mask exactly. */
+    /* Complex ratio mask (model.py Mask). */
     for (int k = 0; k < GTCRN_N_BINS; ++k) {
         float sr = spectrum[k][0], si = spectrum[k][1];
         float mr = mask_re[k], mi = mask_im[k];

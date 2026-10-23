@@ -1,72 +1,13 @@
 /**
- * tests/test_audio_pipeline_4ch_ulcnet.c — Align-ULCNet 4ch pipeline tests.
- *
- * Mirrors test_audio_pipeline_4ch.c's public-API acceptance style. Covers:
- *   1. identity E2E: the 1-hop timing contract (hop 0 zero; every hop is
- *      exactly one inference from hop 0; out[hop p] is bit-identical to a
- *      reference the test synthesises ITSELF from the spectra the pipeline
- *      hands the model) through the direct BF -> model -> synthesis chain
- *      in identity mode.
- *   2. counting model: infer STEPPED and applied on every emitted frame
- *      except the identity-reprime frames after an alignment generation;
- *      model->reset fired on
- *      every delay change AND on pipeline reset; fail-open on infer()
- *      error (output stays identity, calls continue).
- *  2b. relock on the SAME delay: LOCKED(0) -> forced UNLOCKED ->
- *      LOCKED(0) must still fire model->reset exactly once, on the relock
- *      hop. Applied delay 0 is the one value a value-only `changed` test
- *      cannot tell apart from "nothing accepted yet"; see the test's own
- *      header for the mutation that turns it red.
- *   3. core front view: front.aligned_ref non-NULL, byte-exact against
- *      an independently maintained delayed-far reference, and the delay lock
- *      on a delayed far.
- *   4. pool rejection / 8-point descriptor gate / destroy idempotence /
- *      pool reuse, plus a short heap-vs-pool byte-equal run.
- *   5. far-timestamp before acquisition: far-passthrough model,
- *      silence on all mics, one unit impulse in far at a known index -- it
- *      must land in the output at EXACTLY impulse + 1 hop: the far branch
- *      is framed from the current hop (err/far frame pairs are same-hop)
- *      and the only latency is the ULCNet synthesis. Applied delay
- *      contributes 0 here (the shared delay never acquires on silent mics).
- *      Goes red by exactly one hop if either branch is delayed.
- *  5b. error-branch timestamp and content: the same impulse on the four
- *      mics (frozen beamformer, silent far, NULL model) lands at impulse +
- *      1 hop AND comes out as an impulse -- the one check that reads the
- *      error branch against the INPUT, so a dropped imaginary part or a
- *      hop of delay on that branch cannot hide behind a self-consistent
- *      model-output comparison.
- *   6. Production never gates on the delay lock: the 0.5x model's output is
- *      applied from the FIRST emitted frame, before the delay is solid.
- *   7. NaN guard: rc==0 frames poisoned with NaN/Inf are discarded
- *      (bit-identical to the NULL-model pipeline under the 50%-overlap
- *      mixing rule), the next clean frame recovers, no NaN in the output.
- *   8. full-write contract: rc==0 frames that wrote only the FIRST 100
- *      bins are discarded bitwise (the pipeline's NaN pre-fill of the
- *      staging buffers leaves the unwritten bins non-finite, so the
- *      finite guard catches the partial write), and the next fully
- *      written frame recovers. MUTATION: removing the pre-fill in
- *      audio_pipeline_4ch_ulcnet.c leaks stale finite values into the
- *      unwritten bins and this test goes red.
- *   9. identity-reprime straddle DERIVATION: a unit impulse in the middle of
- *      the last pre-boundary input hop measures, branch by branch, how many
- *      emitted frames still have a pre-switch hop inside their analysis
- *      window. Measured in a boundary-FREE control run (so the reprime never
- *      measures itself, and the boundary's own buffer clearing cannot hide
- *      the straddling slot) and asserted equal to
- *      AUDIO_PIPELINE_4CH_ULCNET_REPRIME_FRAMES; the boundary run then
- *      proves the first model-visible frame after the reprime is marker-free
- *      on BOTH branches. MUTATION: no reprime, or one frame too few, goes
- *      red.
- *  10. identity-reprime BEHAVIOUR: exactly that many identity frames after a
- *      mid-stream delay change and after the FIXED fill completion, infer
- *      frozen for exactly those frames and resuming right after, one
- *      model->reset per generation.
- *  11. fixed deployment contract: a raw-far descriptor is accepted and an
- *      aligned-far descriptor is rejected; no runtime mode setter exists.
- *  12. split beam half: process_front + process_beam(v, v, NULL) equals
- *      process_begin byte for byte; a non-NULL mask and a separate
- *      vad_raw/vad_out reach SRP and BF; beam_state equals the lower-level
- *      SRP/BF getters on the same spectra; sequence and argument guards.
+ * tests/test_audio_pipeline_4ch_ulcnet.c -- Align-ULCNet 4ch pipeline tests, in the
+ * public-API acceptance style of test_audio_pipeline_4ch.c. Each test banner states its case:
+ *   1. identity E2E and the 1-hop timing contract
+ *   2. counting model (stepping, reset, fail-open)    2b. same-delay relock resets the model
+ *   2c. FIXED pre-lock seam is the RAW far            3. core front view (aligned_ref, lock)
+ *   4. pool rejection, descriptor gate, pool reuse    5/5b. far / error-branch impulse timestamps
+ *   6. production never gates on the delay lock       7. NaN guard   8. full-write contract
+ *   9. identity-reprime straddle derivation           10. identity-reprime behaviour
+ *   11. fixed deployment contract                     12. split beam half
  */
 
 #include "audio_pipeline_4ch_ulcnet.h"
@@ -150,14 +91,12 @@ static int reprime_take(int* armed, int frames) {
 }
 
 /* ============================================================================
- * 1. Identity E2E: direct BF -> model -> synthesis chain + 1-hop latency
- *    contract. The reference is synthesised by the TEST from the spectra the
- *    pipeline hands the model (a capture model that also returns the
- *    identity), through the test's own AcIstft: a bit-identical
- *    output proves the chain adds nothing between the model's frame and the
- *    WOLA, and the call count proves every hop from hop #0 is exactly one
- *    inference. FIXED delay 0 keeps the run boundary-free (asserted), so no
- *    reprime frame can bypass the model and leave the capture stale.
+ * 1. Identity E2E: direct BF -> model -> synthesis chain and the 1-hop latency contract.
+ *    The reference is synthesised by the TEST from the spectra the pipeline hands the model
+ *    (a capture model that also returns the identity) through its own AcIstft: bit-identical
+ *    output proves the chain adds nothing between the model's frame and the WOLA, and the
+ *    call count proves one inference per hop from hop #0. FIXED delay 0 keeps the run
+ *    boundary-free (asserted), so no reprime frame bypasses the model.
  * ========================================================================== */
 
 typedef struct CaptureModel {
@@ -609,23 +548,12 @@ static int test_fixed_first_alignment_resets_model(void) {
 }
 
 /* ============================================================================
- * 2c. FIXED pre-lock seam content: RAW far, byte for byte
- *
- * "UNLOCKED means the content is the RAW far" is the seam's central promise,
- * and under FIXED the unlocked stretch is the whole ring fill -- up to half a
- * second of audio at a realistic loudspeaker delay. Zero-filling it would
- * hand the linear filters and any external far branch a silent reference for
- * that entire window while the microphone already carries the echo.
- *
- * Checked byte-exactly on both sides of the switch and against
- * INDEPENDENTLY maintained references (the caller's own far history), not
- * against anything the pipeline produced:
- *   - every pre-solid hop equals the RAW far hop of the SAME hop,
- *   - the first solid hop onward equals the far hop delayed by exactly
- *     fixed_delay_samples,
- *   - the switch happens on hop ceil(fixed / hop) and nowhere else, and it
- *     is whole-hop: the 320-sample case would splice raw and shifted audio
- *     inside hop 1 under a per-sample rule and go red here.
+ * 2c. FIXED pre-lock seam content: RAW far, byte for byte. Under FIXED the unlocked
+ * stretch is the whole ring fill (up to half a second at a realistic loudspeaker delay), and
+ * zero-filling it would give the linear filters a silent reference while the mic carries the
+ * echo. Checked against the caller's own far history: every pre-solid hop equals the raw far
+ * of the same hop, the first solid hop onward equals the far delayed by fixed_delay_samples,
+ * and the switch happens on hop ceil(fixed / hop) only, as a whole-hop decision.
  * ========================================================================== */
 
 /* This case exercises the 4ch CORE's FIXED seam, so it pins the core's own
@@ -743,35 +671,14 @@ static int test_fixed_prelock_seam_is_raw_far(void) {
     return 1;
 }
 
-/* ============================================================================
- * 2b. Relock on the SAME delay must still reset the model
- *
- * The scenario the shared-delay `changed` flag exists for, in the one variant
- * a value-only comparison cannot see:
- *
- *   LOCKED(applied delay 0) -> UNLOCKED for several hops -> LOCKED(applied
- *   delay 0 again, the very same value)
- *
- * The model keeps running across the unlocked stretch on the seam's raw far,
- * so its recurrent state advances over a different delay regime. Unless the
- * relock hop reports `changed`, the wrapper never resets that history before
- * consuming the newly aligned far.
- *
- * The applied delay is deliberately pinned to 0 here. 0 is a legal applied
- * delay AND the value the core's accepted_delay holds when nothing has been
- * accepted yet (init, and every four_aec_nr_res_reset()), so "no alignment
- * yet" and "aligned at 0" are the one pair a value-only `changed` test cannot
- * distinguish -- every other value relocks through a visible 0 -> V step and
- * would pass even with the bug present. TRUE_DELAY 64 minus the estimator's
- * 32-sample headroom lands exactly there; the test asserts delay_samples == 0
- * rather than assuming it, so a headroom change fails loudly instead of
- * quietly turning this into a vacuous pass.
- *
- * MUTATION: restoring the old `state.changed = eligible && estimated !=
- * p->accepted_delay;` in 4aec_nr_res.c's update_shared_delay() drops BOTH the
- * first acquisition and the relock, and this test goes red on the acquisition
- * assertion.
- * ========================================================================== */
+/* 2b. Relock on the SAME delay must still reset the model: LOCKED(applied delay 0) ->
+ * UNLOCKED for several hops -> LOCKED(0 again). The model keeps running across the unlocked
+ * stretch on the seam's raw far, so its recurrent state spans a different delay regime and
+ * the relock hop must report `changed`. Delay 0 is pinned because it is also the core's
+ * accepted_delay when nothing is accepted, the one pair a value-only `changed` test cannot
+ * tell apart (TRUE_DELAY 64 minus the estimator's 32-sample headroom lands there; the test
+ * asserts delay_samples == 0). MUTATION: a value-only `state.changed = eligible &&
+ * estimated != p->accepted_delay;` in update_shared_delay() turns the acquisition red. */
 
 static int test_relock_same_delay_resets_model(void) {
     enum { WARM_FRAMES = 60, RELOCK_FRAMES = 60 };
@@ -848,20 +755,14 @@ static int test_relock_same_delay_resets_model(void) {
               "relock frame processes");
         CHECK(audio_pipeline_4ch_ulcnet_last_delay(p, &delay) == 0,
               "delay-state accessor works");
-        /* A model reset flushes recurrent state against the applied delay,
-         * so it may only fire on a hop where an alignment generation was
-         * actually ACCEPTED -- never on a hop where the estimator is merely
-         * confident (confidence >= 1.0 is delay_aec_is_solid()) but the
-         * wrapper's acceptance conditions are not all met yet. Recomputed
-         * from the seam's own estimator fields, so it is independent of the
-         * `solid`/`changed` flags being tested.
-         *
-         * MUTATION: adding a raw-confidence arm to this file's own
-         * raw->aligned reset gate in audio_pipeline_4ch_ulcnet.c -- e.g.
-         * `|| (p->frame_index != 0 && p->last_delay.confidence < 0.5f &&
-         * pre.delay.confidence >= 0.5f)` -- fires a reset on the first
-         * COARSE hop, long before anything is accepted, and this counter
-         * goes non-zero. */
+        /* A model reset flushes recurrent state against the applied delay, so it may only fire on
+         * a hop where an alignment generation was ACCEPTED, never where the estimator is merely
+         * confident (confidence >= 1.0 is delay_aec_is_solid()). Recomputed from the seam's own
+         * estimator fields, independent of the `solid`/`changed` flags under test.
+         * MUTATION: a raw-confidence arm in the raw->aligned reset gate of
+         * audio_pipeline_4ch_ulcnet.c (e.g. `|| (p->frame_index != 0 && p->last_delay.confidence
+         * < 0.5f && pre.delay.confidence >= 0.5f)`) fires a reset on the first COARSE hop and
+         * this counter goes non-zero. */
         if (m.reset_calls != reset_before_hop &&
             !(delay.confidence >= 1.0f && delay.estimator_updates >= 3))
             resets_without_acceptance += 1;
@@ -1119,10 +1020,9 @@ static int test_pool_and_descriptor_gate(void) {
     CHECK(audio_pipeline_4ch_ulcnet_init_ex(
               pool, (size_t)req.bytes, &cfg, &stale) == NULL,
           "init_ex rejects a stale layout even with larger cached bytes");
-    /* The immediately superseded version is spelled out rather than derived.
-     * Its byte count is left at the CURRENT figure so the only mismatch is the
-     * layout this wrapper descriptor carries. Bump this literal with
-     * AUDIO_PIPELINE_4CH_ULCNET_LAYOUT_VERSION. */
+    /* An older layout version, spelled out rather than derived. Its byte count is left at the
+     * CURRENT figure so the only mismatch is the layout this wrapper descriptor carries. Keep
+     * the literal in step with AUDIO_PIPELINE_4CH_ULCNET_LAYOUT_VERSION. */
     stale = req;
     stale.layout_version = 21u;
     CHECK(audio_pipeline_4ch_ulcnet_init_ex(
@@ -1202,21 +1102,13 @@ static int test_pool_and_descriptor_gate(void) {
     return 1;
 }
 
-/* ============================================================================
- * 5. Far-timestamp after fixed-delay acquisition: the model's far branch must
- *    carry the SAME input hop as its error branch. Far-passthrough model,
- *    silence on all mics, a single unit impulse in far at sample T. The
- *    expected output position is derived, not measured:
- *      + 0    model far delay: production feeds caller raw far even after
- *             the AEC's FIXED delay has become solid
- *      + 0    the far branch is framed from the CURRENT hop, like the
- *             error branch (no compensation buffer on either side)
- *      + hop  the ULCNet synthesis (hop #p output = chain input hop p-1)
- *      = T + one hop.
- *    MUTATION PROOF: delaying the far branch by a hop moves the
- *    reconstructed impulse to T + 2 hops -- this check then fails with
- *    offset +hop.
- * ========================================================================== */
+/* 5. Far-timestamp after fixed-delay acquisition: the model's far branch must carry the
+ *    SAME input hop as its error branch. Far-passthrough model, silence on all mics, one
+ *    unit impulse in far at sample T. Expected output position T + one hop: production feeds
+ *    the caller's raw far even after the FIXED delay is solid (+0), the far branch is framed
+ *    from the current hop like the error branch (+0), and the ULCNet synthesis adds one hop
+ *    (output hop #p = chain input hop p-1).
+ *    MUTATION: delaying the far branch by a hop moves the impulse to T + 2 hops. */
 
 static int passthrough_far_infer(
     void* user,
@@ -1341,21 +1233,13 @@ static int test_raw_far_timestamp_after_fixed_delay_lock(void) {
     return 1;
 }
 
-/* ============================================================================
- * 5b. Error-branch timestamp and content: the mirror of test 5 on the OTHER
- *    branch, against the INPUT rather than the model's output. Silence on
- *    far, one unit impulse on all four mics, a frozen fixed beamformer
- *    (mu 0, vad 1), FIXED delay 0 (boundary-free), NULL model (identity).
- *    The impulse must come out at EXACTLY impulse + 1 hop -- the BF
- *    spectrum of hop p is the model's frame at hop p and the synthesis adds
- *    the one hop -- and it must come out AS an impulse: a spectrum handed
- *    over with its imaginary part dropped, or an error branch delayed by a
- *    hop, both pass every model-output test (they are self-consistent) and
- *    are caught only here.
- *    MUTATION: delaying the error branch by a hop moves the peak by +hop;
- *    zeroing err_im mirrors the impulse inside the frame and the energy
- *    outside the peak neighbourhood rises to about half.
- * ========================================================================== */
+/* 5b. Error-branch timestamp and content: the mirror of test 5 on the other branch, read
+ *    against the INPUT. Silence on far, one unit impulse on all four mics, a frozen fixed
+ *    beamformer (mu 0, vad 1), FIXED delay 0, NULL model. The impulse must come out at
+ *    exactly impulse + 1 hop and AS an impulse: a dropped imaginary part or an error branch
+ *    delayed by a hop is self-consistent in every model-output test and is caught only here.
+ *    MUTATION: a hop of delay moves the peak by +hop; zeroing err_im mirrors the impulse and
+ *    raises the energy outside the peak neighbourhood to about half. */
 
 static int test_error_timestamp_and_content(void) {
     AudioPipeline4ChConfig cfg = audio_pipeline_4ch_ulcnet_default_config();
@@ -1657,19 +1541,13 @@ static int test_nan_guard(void) {
     return 1;
 }
 
-/* ============================================================================
- * 8. Full-write contract: infer() writes only the FIRST 100 bins (0.5x)
- *    on scheduled hops but still returns rc==0. The pipeline pre-fills the
- *    enh_re/enh_im staging with NaN before every infer call
- *    (ulcnet_process.h's FULL-WRITE CONTRACT), so the 157 unwritten bins
- *    stay NaN and the finite guard discards the frame: bit-identical to
- *    the NULL-model pipeline under the same 50%-overlap mixing rule as
- *    test 7, and the next fully-written frame is applied again.
- *    MUTATION PROOF: removing the pre-fill loop in
- *    audio_pipeline_4ch_ulcnet.c leaves the previous frame's stale FINITE
- *    values in bins 100..256 -- the guard cannot catch them, the partial
- *    frames get applied, and the bit-identical check goes red.
- * ========================================================================== */
+/* 8. Full-write contract: infer() writes only the FIRST 100 bins (0.5x) on scheduled hops
+ *    but returns rc==0. The pipeline pre-fills the enh_re/enh_im staging with NaN before
+ *    every infer call (ulcnet_process.h's FULL-WRITE CONTRACT), so the unwritten bins stay
+ *    NaN and the finite guard discards the frame: bit-identical to the NULL-model pipeline
+ *    under the mixing rule of test 7, and the next fully-written frame is applied again.
+ *    MUTATION: removing the pre-fill loop in audio_pipeline_4ch_ulcnet.c leaves stale finite
+ *    values in bins 100..256 and the bit-identical check goes red. */
 
 typedef struct PartialModel {
     int partial;   /* set by the test before each process call */
@@ -1804,47 +1682,14 @@ static int test_partial_write_guard(void) {
     return 1;
 }
 
-/* ============================================================================
- * 9. Identity-reprime straddle DERIVATION (marker/timestamp test).
- *
- * Measures the quantity the reprime constant is supposed to be: how many
- * frames emitted at or after an alignment boundary at hop T still have a
- * PRE-boundary hop inside their two-hop analysis window, on the error
- * branch and on the far branch separately.
- *
- * Instrument: total silence except ONE unit impulse at the MIDDLE of input
- * hop T-1 -- the last input hop that reaches the chain from the pre-boundary
- * side. The middle is the position the sqrt-Hann window weights at 0.707 in
- * BOTH frames covering the hop it lands in (a marker at a hop edge would be
- * multiplied by the window's zero and hide itself). The branches are marked
- * in SEPARATE runs: the error branch through the four mics (far kept silent,
- * so the AEC lanes have no far history to leak and the fixed beamformer is
- * time-invariant), the far branch through the reference.
- *
- * The count is derived from a CONTROL run with NO boundary at all (FIXED
- * delay 0: the shared ring can serve from hop #0, so the wrapper never sees
- * a raw->aligned transition and never arms a reprime -- asserted, not
- * assumed). The reprime logic therefore takes no part in measuring its own
- * length, and the measurement is pure framing/latency: which emitted frames
- * still reach back across hop T. Measuring at a real boundary would also
- * entangle the model reset and the arming of the reprime with the framing
- * question; the control run keeps them apart (nothing is cleared at a
- * boundary any more, so there is no other difference to account for).
- *
- * Both branches come out at 1, as in the mono wrapper, and for a measured
- * reason: both are framed from the current input hop, so only the frame at
- * hop T still reaches back to input hop T-1.
- *
- * The boundary run (FIXED delay = T hops, so the raw->aligned switch lands
- * exactly on hop T) then checks the implementation: exactly REPRIME frames
- * skipped, at hops T..T+REPRIME-1, and the first frame the model DOES see
- * afterwards carries no pre-switch sample on either branch.
- *
- * MUTATION: dropping the reprime counter (stepping always) makes the first
- * model-visible frame after the boundary a straddling one and the
- * marker-free assertion goes red; arming it one frame too short does the
- * same.
- * ========================================================================== */
+/* 9. Identity-reprime straddle derivation: per branch, how many frames emitted at or after
+ *    an alignment boundary at hop T still have a pre-boundary hop in their two-hop window.
+ *    One unit impulse at the middle of input hop T-1 (window weight 0.707 in both covering
+ *    frames) is marked through the mics (error branch) or the reference (far branch) in
+ *    separate runs. The count comes from a boundary-free control (FIXED delay 0, no reprime
+ *    armed, asserted) and is 1 on both branches. The boundary run (FIXED delay = T hops)
+ *    must skip exactly REPRIME frames, at hops T.., and the first frame the model then sees
+ *    must be marker-free on both. MUTATION: no reprime, or one frame too few, turns that red. */
 
 enum {
     RP_T        = 8,             /* boundary hop under test                */
@@ -1960,22 +1805,13 @@ static int reprime_probe_run(int fixed_delay, int mark_far, ProbeModel* st) {
     return 1;
 }
 
-/* Frames emitted at hops [RP_T, RP_T+RP_WINDOW) that still carry the marker,
- * plus the classification margin (smallest marked peak / largest unmarked
- * peak inside that window).
- *
- * Measured on the boundary-free control, so this is the chain's MEMORY of
- * content injected before hop RP_T, not a straddle count. Per branch:
- *   far   -- the marker reaches the analysis untouched, so the memory is
- *            exactly the 50%-overlap window straddle. This is the
- *            derivation of REPRIME_FRAMES.
- *   error -- the marker passes the AEC linear filter first, so the memory is
- *            the straddle PLUS the filter's causal tail. Waiting that tail
- *            out is not what the reprime is for and has no principled bound,
- *            so this branch can only bound the straddle from above.
- * The tail is why the branches agree at 16 kHz and differ at 48 kHz:
- * filter_length is 52 ms (3.25 hops) at 16 kHz but 64 ms (6.00 hops) at
- * 48 kHz, while the straddle stays at one hop on both. */
+/* Frames emitted at hops [RP_T, RP_T+RP_WINDOW) that still carry the marker, plus the
+ * classification margin (smallest marked peak / largest unmarked peak). Per branch: far, the
+ * marker reaches the analysis untouched, so the memory is exactly the window straddle (the
+ * derivation of REPRIME_FRAMES); error, the marker passes the AEC linear filter first, so
+ * the memory is the straddle plus the filter's causal tail and can only bound the straddle
+ * from above. The tail is why the branches agree at 16 kHz and differ at 48 kHz:
+ * filter_length is 52 ms (3.25 hops) at 16 kHz but 64 ms (6.00 hops) at 48 kHz. */
 static int reprime_straddle_count(const ProbeModel* st, int far_branch,
                                   float* dirty_min, float* clean_max) {
     int n = 0;
@@ -2103,13 +1939,10 @@ static int test_reprime_straddle_derivation(void) {
 }
 
 /* ============================================================================
- * 10. Identity-reprime BEHAVIOUR: exactly REPRIME identity frames per
- *     alignment generation, on both event shapes the wrapper recognises -- a
- *     mid-stream delay change and the FIXED ring-fill completion. Per hop the
- *     test predicts the infer delta from its OWN copy of the policy (arm
- *     REPRIME at the boundary hop, consume one per emitted frame) and
- *     compares against the counting model, so both a missing and an over-long
- *     reprime fail. reset stays exactly one per generation.
+ * 10. Identity-reprime behaviour: exactly REPRIME identity frames per alignment generation,
+ *     for a mid-stream delay change and for the FIXED ring-fill completion. The test
+ *     predicts the infer delta per hop from its own copy of the policy and compares with the
+ *     counting model; reset stays once per generation.
  * ========================================================================== */
 
 static int test_reprime_behavior(void) {
@@ -2288,9 +2121,9 @@ static int test_reprime_behavior(void) {
 }
 
 /* ============================================================================
- * 11. Fixed deployment contract: production accepts only the raw-far
- * descriptor. The aligned enumerator remains useful for negative ABI tests and
- * the offline sweep, but there is no runtime far-mode setter.
+ * 11. Fixed deployment contract: production accepts only the raw-far descriptor. The
+ * aligned enumerator is used only for negative ABI tests; there is no runtime far-mode
+ * setter.
  * ========================================================================== */
 static int gate_infer_identity(
     void* user,
@@ -2571,8 +2404,8 @@ static int split_hop(AudioPipeline4ChUlcnet* p, const float* mics, const float* 
     return audio_pipeline_4ch_ulcnet_process_end(p, out) == FOUR_AEC_NR_RES_OK;
 }
 
-/* process_with_activity (the old call sequence) against front + beam(v, v,
- * NULL): the null mask and the single flag are exactly today's behaviour. */
+/* process_with_activity() against front + beam(v, v, NULL): a null mask and a single flag
+ * reproduce it. */
 static int test_split_null_mask_equals_begin(void) {
     AudioPipeline4ChConfig cfg = split_config();
     AudioPipeline4ChUlcnet *a, *b;

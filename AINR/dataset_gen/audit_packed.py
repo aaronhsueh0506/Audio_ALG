@@ -1,39 +1,28 @@
 """Pre-flight audit of a packed dataset: is the corpus itself a suspect?
 
-WHY THIS EXISTS
----------------
 ``PackedDataset`` validates shape and sample rate and nothing else, and
-``pack_dataset.py`` never checked for non-finite samples. So "the corpus is
-clean" was an assumption, not a measurement -- and a single non-finite sample, or
-a clip whose target is numerically silent, is enough to produce a gradient spike
-that looks like a model or optimizer problem.
+``pack_dataset.py`` does not check for non-finite samples, so "the corpus is
+clean" is an assumption until measured: a single non-finite sample, or a clip
+whose target is numerically silent, is enough to produce a gradient spike that
+looks like a model or optimizer problem.
 
-⚠ This is a READ-ONLY audit and it modifies nothing. Run it before a long
-training run; the cost is one pass over the shards.
-
-⚠ It reports the corpus AS PACKED. Editing generator config comments after the
-fact changes nothing here -- a generated dataset carries whatever
-augmentation was in force when it was written, so the numbers below are the only
-statement about what the model will actually see.
+⚠ READ-ONLY: it modifies nothing; run it before a long training run (one pass
+over the shards). It reports the corpus AS PACKED, which carries whatever
+augmentation was in force when it was generated.
 
 WHAT IT LOOKS FOR
 -----------------
-non-finite      any NaN or inf. Any hit at all is disqualifying: it will reach
-                the loss and, with gradient clipping active, turn into a NaN
-                that poisons the optimizer moments irrecoverably.
-silent target   clean RMS below --silent-rms. These are the full-suppression
-                examples; their fraction should match the generator's
-                ``noise_only_p``, and a large mismatch means the corpus is not
-                what the config claims.
-near-silent     clean RMS in a band just above silence. These are the ones that
-                drive a prediction magnitude down through the region where
-                DeepFilterNet's complex-angle gradient is most amplified, so
-                they are more interesting than the exactly-silent ones.
+non-finite      any NaN or inf. Any hit is disqualifying: it reaches the loss and
+                poisons the optimizer moments irrecoverably.
+silent target   clean RMS below --silent-rms (the full-suppression examples);
+                their fraction should match the generator's ``noise_only_p``.
+near-silent     clean RMS in a band just above silence: these drive a prediction
+                magnitude down through the region where DeepFilterNet's
+                complex-angle gradient is most amplified.
 dc offset       mean/RMS ratio above --max-dc. Upstream applies a random DC
-                remover during training; this port does not, so a corpus with a
-                real DC component is a genuine distribution difference.
-clipped         fraction of samples at |x| >= --clip-thresh, i.e. already at
-                full scale before the model sees them.
+                remover during training; this port does not, so a real DC
+                component is a distribution difference.
+clipped         fraction of samples at |x| >= --clip-thresh (already full scale).
 
 USAGE
 -----

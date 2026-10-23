@@ -140,7 +140,7 @@
     <p>單通道全雙工語音增強 Pipeline — linear AEC + echo-aware NR/RES gain fusion</p>
     <p style="font-size: 13px; opacity: 0.75; margin-top: 12px;">
       AEC (PBFDKF + Shadow + RES)
-      &nbsp;·&nbsp; NR V3-2 (MMSE-LSA + MCRA + SPP)
+      &nbsp;·&nbsp; NR (MMSE-LSA + MCRA + SPP)
       &nbsp;·&nbsp; 16/48 kHz power-of-two grids / float32
     </p>
   </div>
@@ -204,7 +204,7 @@
   <text x="375" y="115" font-size="15" fill="white" text-anchor="middle" font-weight="700">Linear AEC</text>
   <text x="375" y="135" font-size="11" fill="white" text-anchor="middle">PBFDKF + Shadow</text>
   <text x="375" y="152" font-size="11" fill="white" text-anchor="middle">EPC detector</text>
-  <text x="375" y="169" font-size="11" fill="white" text-anchor="middle">Stationary DT v13</text>
+  <text x="375" y="169" font-size="11" fill="white" text-anchor="middle">Stationary DT</text>
 
   <!-- arrow to NR -->
   <line x1="455" y1="130" x2="520" y2="130" stroke="#64748b" stroke-width="2" marker-end="url(#arrow)"/>
@@ -236,7 +236,7 @@
 
   <!-- annotations -->
   <text x="40" y="280" font-size="11" fill="#64748b">時域訊號</text>
-  <text x="540" y="280" font-size="11" fill="#64748b">頻域處理 (STFT, n_freq=257)</text>
+  <text x="540" y="280" font-size="11" fill="#64748b">頻域處理 (STFT, n_freq = FFT/2+1)</text>
 </svg>
 <div class="caption">圖 1：整體 pipeline 概觀</div>
 </div>
@@ -302,11 +302,11 @@
   <tr><td>類型</td><td>2nd-order Butterworth (IIR)</td></tr>
   <tr><td>截止頻率</td><td>80 Hz (−3 dB)</td></tr>
   <tr><td>實作</td><td>Direct Form II Transposed</td></tr>
-  <tr><td>位置</td><td>mic-path HPF 在 AEC module（<code>lib/aec</code> config 預設 ON）；另有獨立 C 元件 <code>lib/hpf</code> 供嵌入式應用層使用</td></tr>
+  <tr><td>位置</td><td>mic-path HPF 在 AEC module（<code>lib/aec</code> config 預設 ON）；另有獨立 C 元件 <code>audiolib/common/src/hpf.c</code> 供應用層使用</td></tr>
 </table>
 
 <div class="note">
-<strong>注意：</strong>HPF <strong>只對 mic path</strong> 做一次；<strong>ref（far-end）不經 HPF</strong>（ref-path HPF 在 v3.19 retired，<code>lib/aec</code> config 預設 mic-path HPF=ON / ref HPF=OFF）。downstream Saturation / DelayEst 吃原始 ref。
+<strong>注意：</strong>HPF <strong>只對 mic path</strong> 做一次；<strong>ref（far-end）不經 HPF</strong>（<code>lib/aec</code> config 預設 mic-path HPF=ON / ref HPF=OFF）。downstream Saturation / DelayEst 吃原始 ref。
 </div>
 </div>
 
@@ -412,9 +412,9 @@
 
 <table>
   <tr><th>項目</th><th>值</th></tr>
-  <tr><td>block_size</td><td>320 samples (= 2 × hop)</td></tr>
-  <tr><td>fft_size</td><td>512 (next pow2)</td></tr>
-  <tr><td>n_partitions</td><td>ceil(filter_length ÷ hop) = 6（16 kHz 預設 FL=832）</td></tr>
+  <tr><td>block_size</td><td>256 samples (= 2 × hop，16 kHz 預設 256/128)</td></tr>
+  <tr><td>fft_size</td><td>256 (= frame size)</td></tr>
+  <tr><td>n_partitions</td><td>ceil(filter_length ÷ hop) = 7（16 kHz 預設 FL=832）</td></tr>
   <tr><td>Kalman Q (process noise)</td><td>1e−3 (high), 1e−5 (low)</td></tr>
   <tr><td>P_MAX</td><td>0.5 (state covariance ceiling)</td></tr>
 </table>
@@ -493,84 +493,11 @@ delta_ratio &lt; 0.3
   <li>20 frame hangover 期間 RES 進入保守模式</li>
 </ul>
 
-<h3>3.4 Stationary far-end DT 保護 (v13)</h3>
+<h3>3.4 Stationary far-end DT 保護</h3>
 
 <p><strong>問題場景</strong>：白噪音、風扇、冷氣等穩態 far-end + 近端有人講話 → 傳統 DT 偵測全部失效（dt_indicator → 0, coh² → 1），RES 把語音當 echo 壓掉。</p>
 
-<div class="figure">
-<svg viewBox="0 0 800 320" xmlns="http://www.w3.org/2000/svg">
-  <defs>
-    <marker id="arr4" markerWidth="10" markerHeight="10" refX="9" refY="3" orient="auto">
-      <path d="M0,0 L0,6 L9,3 z" fill="#64748b"/>
-    </marker>
-  </defs>
-
-  <!-- Stage 1: CV² gate -->
-  <rect x="40" y="30" width="240" height="100" rx="8" fill="#dbeafe" stroke="#2563eb" stroke-width="2"/>
-  <text x="160" y="55" font-size="14" fill="#1e40af" text-anchor="middle" font-weight="700">Stage 1: 穩態偵測</text>
-  <text x="160" y="78" font-size="11" fill="#1e40af" text-anchor="middle">far_pwr EMA (α=0.99, TC≈1s)</text>
-  <text x="160" y="95" font-size="11" fill="#1e40af" text-anchor="middle">CV² = var / mean²</text>
-  <text x="160" y="115" font-size="12" fill="#dc2626" text-anchor="middle" font-weight="600">CV² &lt; 0.02 → _is_stationary_far ✓</text>
-
-  <!-- arrow -->
-  <line x1="280" y1="80" x2="340" y2="80" stroke="#64748b" stroke-width="2" marker-end="url(#arr4)"/>
-
-  <!-- Stage 2: jump_ratio -->
-  <rect x="345" y="30" width="240" height="100" rx="8" fill="#fef3c7" stroke="#f59e0b" stroke-width="2"/>
-  <text x="465" y="55" font-size="14" fill="#92400e" text-anchor="middle" font-weight="700">Stage 2: 語音突波偵測</text>
-  <text x="465" y="78" font-size="11" fill="#92400e" text-anchor="middle">voice-band (100-3kHz) error</text>
-  <text x="465" y="95" font-size="11" fill="#92400e" text-anchor="middle">jump_ratio = err / baseline</text>
-  <text x="465" y="115" font-size="12" fill="#dc2626" text-anchor="middle" font-weight="600">jump &gt; 1.5 → 800ms hangover</text>
-
-  <!-- arrow -->
-  <line x1="585" y1="80" x2="645" y2="80" stroke="#64748b" stroke-width="2" marker-end="url(#arr4)"/>
-  <text x="615" y="70" font-size="11" fill="#64748b" text-anchor="middle">is_stationary_dt</text>
-
-  <!-- output flag -->
-  <rect x="650" y="55" width="120" height="50" rx="8" fill="#dcfce7" stroke="#16a34a" stroke-width="2"/>
-  <text x="710" y="78" font-size="13" fill="#166534" text-anchor="middle" font-weight="700">啟用保護</text>
-  <text x="710" y="95" font-size="10" fill="#166534" text-anchor="middle">v3 mask + skip reverb</text>
-
-  <!-- protection mechanisms -->
-  <text x="40" y="170" font-size="13" font-weight="700" fill="#1e40af">保護機制 (僅 is_stationary_dt = True 時觸發)：</text>
-
-  <!-- v3 mask -->
-  <rect x="40" y="185" width="350" height="120" rx="6" fill="#f0fdf4" stroke="#16a34a"/>
-  <text x="50" y="205" font-size="12" font-weight="700" fill="#166534">① v3 頻帶成型遮罩</text>
-
-  <!-- mask shape mini-plot -->
-  <line x1="60" y1="280" x2="380" y2="280" stroke="#475569" stroke-width="1.5"/>
-  <line x1="60" y1="280" x2="60" y2="220" stroke="#475569" stroke-width="1.5"/>
-  <text x="55" y="225" font-size="9" fill="#475569" text-anchor="end">0.8</text>
-  <text x="55" y="285" font-size="9" fill="#475569" text-anchor="end">0</text>
-
-  <!-- mask trapezoid -->
-  <polygon points="60,280 100,280 130,225 250,225 280,280 380,280" fill="#bbf7d0" stroke="#16a34a" stroke-width="2"/>
-
-  <text x="100" y="298" font-size="9" fill="#475569" text-anchor="middle">100Hz</text>
-  <text x="135" y="298" font-size="9" fill="#475569" text-anchor="middle">300</text>
-  <text x="245" y="298" font-size="9" fill="#475569" text-anchor="middle">3kHz</text>
-  <text x="285" y="298" font-size="9" fill="#475569" text-anchor="middle">4kHz</text>
-  <text x="195" y="220" font-size="10" fill="#166534" text-anchor="middle">語音黃金頻段 dt=0.8</text>
-
-  <!-- other mechanisms -->
-  <rect x="410" y="185" width="360" height="120" rx="6" fill="#fef3c7" stroke="#f59e0b"/>
-  <text x="425" y="207" font-size="12" font-weight="700" fill="#92400e">② Reverb tail 跳過</text>
-  <text x="430" y="223" font-size="11" fill="#78350f">穩態 far-end 下 reverb_psd 會累積巨量噪音能量</text>
-
-  <text x="425" y="245" font-size="12" font-weight="700" fill="#92400e">③ Mu_scale freeze</text>
-  <text x="430" y="261" font-size="11" fill="#78350f">凍結 filter 學習，避免吸收近端語音</text>
-
-  <text x="425" y="283" font-size="12" font-weight="700" fill="#92400e">④ Temporal gating</text>
-  <text x="430" y="299" font-size="11" fill="#78350f">HF cap / release / rise boost 用虛擬 dt_for_fs</text>
-</svg>
-<div class="caption">圖 5：Stationary DT 兩階段偵測 + 四重保護</div>
-</div>
-
-<div class="key-point">
-<strong>效果</strong>：合成 WN DT 測試，語音保留率從 5% → 48%（接近 NoRES baseline 50%）。<br>
-800-case blind test 一般語音場景<strong>零退步</strong>（所有改動被 <code>is_stationary_dt</code> 守門）。
-</div>
+<p>AEC3 post chain 以 StationarityEstimator 與 <code>is_stationary_dt</code> 旗標處理這個場景，演算法見 <a href="../lib/aec/docs/aec_methods.md">lib/aec/docs/aec_methods.md</a> §3.1。</p>
 
 </div>
 
@@ -675,166 +602,15 @@ G[k] = G<sub>LSA</sub><sup>p[k]</sup> · g<sub>min</sub><sup>1−p[k]</sup>
 <h2 id="res">5. Post-filter — RES + CNG</h2>
 
 <div class="panel">
-<p>RES 處理 NR 後的訊號，把 linear AEC 漏的 residual echo 進一步壓掉。CNG 在純 FS 段補上舒適噪音避免突然安靜。</p>
+<p>RES 是 AEC3-aligned 的抑制鏈（<code>AecState</code> → <code>ResidualEchoEstimator</code> → <code>SuppressionGain</code>），在 AEC 內部以頻域計算 <code>G_res(f)</code> 與 <code>R²(f)</code>，經 <code>AecResContext</code> 交給 pipeline；它不是 NR 之後的第二個時域濾波器。演算法本體見 <a href="../lib/aec/docs/aec_methods.md">lib/aec/docs/aec_methods.md</a> §3。</p>
 
-<h3>5.1 ENR (Echo-to-Nearend Ratio) 計算</h3>
+<h3>5.1 Gain fusion</h3>
 
-<div class="figure">
-<svg viewBox="0 0 880 400" xmlns="http://www.w3.org/2000/svg">
-  <defs>
-    <marker id="arr6" markerWidth="10" markerHeight="10" refX="9" refY="3" orient="auto">
-      <path d="M0,0 L0,6 L9,3 z" fill="#64748b"/>
-    </marker>
-  </defs>
+<p><code>g_total = min(G_nr, G_res)</code>，每個 bin 取兩個 gain 的較小者並對 <code>E(f)</code> 套用一次；沒有 near-end floor。NR 把 <code>R²</code> 折進先驗 SNR，因此兩個 gain 不是重複計算同一件事。</p>
 
-  <!-- ============ Row 1: residual_echo_psd 計算 ============ -->
-  <!-- echo_psd input -->
-  <rect x="20" y="40" width="120" height="40" rx="6" fill="#dbeafe" stroke="#2563eb" stroke-width="2"/>
-  <text x="80" y="65" font-size="12" fill="#1e40af" text-anchor="middle" font-weight="700">echo_psd[k]</text>
+<h3>5.2 CNG (Comfort Noise Generation)</h3>
 
-  <!-- G_NR² input -->
-  <rect x="20" y="100" width="120" height="40" rx="6" fill="#dcfce7" stroke="#16a34a" stroke-width="2"/>
-  <text x="80" y="120" font-size="12" fill="#166534" text-anchor="middle" font-weight="700">G_NR²[k]</text>
-  <text x="80" y="134" font-size="9" fill="#166534" text-anchor="middle">(來自 NR)</text>
-
-  <!-- arrows to multiply -->
-  <line x1="140" y1="60" x2="200" y2="82" stroke="#64748b" stroke-width="2" marker-end="url(#arr6)"/>
-  <line x1="140" y1="120" x2="200" y2="98" stroke="#64748b" stroke-width="2" marker-end="url(#arr6)"/>
-
-  <!-- multiply circle -->
-  <circle cx="220" cy="90" r="18" fill="#fef3c7" stroke="#f59e0b" stroke-width="2"/>
-  <text x="220" y="96" font-size="18" font-weight="700" text-anchor="middle" fill="#92400e">×</text>
-
-  <!-- arrow to residual -->
-  <line x1="238" y1="90" x2="290" y2="90" stroke="#64748b" stroke-width="2" marker-end="url(#arr6)"/>
-
-  <!-- residual_echo_psd box -->
-  <rect x="295" y="65" width="200" height="50" rx="6" fill="#fee2e2" stroke="#dc2626" stroke-width="2"/>
-  <text x="395" y="87" font-size="13" fill="#991b1b" text-anchor="middle" font-weight="700">residual_echo_psd[k]</text>
-  <text x="395" y="105" font-size="10" fill="#991b1b" text-anchor="middle">echo · G_NR² · over_sub</text>
-
-  <!-- ============ Row 2: nearend_est 計算 ============ -->
-  <!-- error_psd input -->
-  <rect x="20" y="220" width="120" height="40" rx="6" fill="#dbeafe" stroke="#2563eb" stroke-width="2"/>
-  <text x="80" y="245" font-size="12" fill="#1e40af" text-anchor="middle" font-weight="700">error_psd[k]</text>
-
-  <!-- arrow to subtract -->
-  <line x1="140" y1="240" x2="200" y2="240" stroke="#64748b" stroke-width="2" marker-end="url(#arr6)"/>
-
-  <!-- subtract circle -->
-  <circle cx="220" cy="240" r="18" fill="#dcfce7" stroke="#16a34a" stroke-width="2"/>
-  <text x="220" y="246" font-size="18" font-weight="700" text-anchor="middle" fill="#166534">−</text>
-
-  <!-- residual feeds into subtract (vertical line) -->
-  <line x1="395" y1="115" x2="395" y2="170" stroke="#64748b" stroke-width="2"/>
-  <line x1="395" y1="170" x2="220" y2="170" stroke="#64748b" stroke-width="2"/>
-  <line x1="220" y1="170" x2="220" y2="220" stroke="#64748b" stroke-width="2" marker-end="url(#arr6)"/>
-  <text x="305" y="165" font-size="10" fill="#64748b">residual_echo</text>
-
-  <!-- arrow to nearend_est box -->
-  <line x1="238" y1="240" x2="290" y2="240" stroke="#64748b" stroke-width="2" marker-end="url(#arr6)"/>
-
-  <!-- nearend_est box -->
-  <rect x="295" y="215" width="200" height="50" rx="6" fill="#dcfce7" stroke="#16a34a" stroke-width="2"/>
-  <text x="395" y="237" font-size="13" fill="#166534" text-anchor="middle" font-weight="700">nearend_est[k]</text>
-  <text x="395" y="255" font-size="10" fill="#166534" text-anchor="middle">error − residual</text>
-
-  <!-- ============ Row 3: ENR ratio (right side) ============ -->
-  <!-- residual → divide -->
-  <line x1="495" y1="90" x2="555" y2="90" stroke="#64748b" stroke-width="2"/>
-  <line x1="555" y1="90" x2="555" y2="145" stroke="#64748b" stroke-width="2" marker-end="url(#arr6)"/>
-
-  <!-- nearend → divide -->
-  <line x1="495" y1="240" x2="555" y2="240" stroke="#64748b" stroke-width="2"/>
-  <line x1="555" y1="240" x2="555" y2="195" stroke="#64748b" stroke-width="2" marker-end="url(#arr6)"/>
-
-  <!-- divide box -->
-  <rect x="525" y="150" width="60" height="40" rx="6" fill="#f3e8ff" stroke="#8b5cf6" stroke-width="2"/>
-  <text x="555" y="178" font-size="18" font-weight="700" text-anchor="middle" fill="#6b21a8">÷</text>
-
-  <!-- arrow to ENR -->
-  <line x1="585" y1="170" x2="650" y2="170" stroke="#64748b" stroke-width="2" marker-end="url(#arr6)"/>
-
-  <!-- ENR box -->
-  <rect x="655" y="145" width="170" height="50" rx="6" fill="#f3e8ff" stroke="#8b5cf6" stroke-width="2"/>
-  <text x="740" y="167" font-size="13" fill="#6b21a8" text-anchor="middle" font-weight="700">ENR[k]</text>
-  <text x="740" y="185" font-size="10" fill="#6b21a8" text-anchor="middle">residual / nearend</text>
-
-  <!-- arrow to soft gate -->
-  <line x1="740" y1="195" x2="740" y2="305" stroke="#64748b" stroke-width="2" marker-end="url(#arr6)"/>
-
-  <!-- soft gate box -->
-  <rect x="190" y="310" width="660" height="60" rx="6" fill="#f3e8ff" stroke="#8b5cf6" stroke-width="2"/>
-  <text x="520" y="333" font-size="13" fill="#6b21a8" text-anchor="middle" font-weight="700">Soft gate</text>
-  <text x="520" y="353" font-size="11" fill="#6b21a8" text-anchor="middle">G_RES[k] = clamp((enr_s − ENR) / (enr_s − enr_t), g_min, 1.0)</text>
-
-  <!-- arrow to G_RES output -->
-  <line x1="190" y1="340" x2="130" y2="340" stroke="#64748b" stroke-width="2" marker-end="url(#arr6)"/>
-  <text x="115" y="345" font-size="13" font-weight="700" fill="#16a34a" text-anchor="end">G_RES</text>
-</svg>
-<div class="caption">圖 7：RES 內 ENR 計算流程 — 用 NR 的 G_NR² 修正 echo PSD，再除以 nearend_est 得 ENR</div>
-</div>
-
-<div class="formula">
-G<sub>RES</sub>[k] = clamp((enr<sub>s</sub> − ENR) / (enr<sub>s</sub> − enr<sub>t</sub>), &nbsp; g<sub>min</sub>, &nbsp; 1.0)
-</div>
-
-<p>FS 段（dt 低）用較嚴格的 enr_t，DT 段（dt 高）用較寬鬆的 enr_t（two-tuning）。</p>
-
-<h3>5.2 多重保護機制</h3>
-
-<table>
-  <tr><th>機制</th><th>用途</th></tr>
-  <tr><td>Spectral floor</td><td>頻譜形狀保留，避免 musical noise</td></tr>
-  <tr><td>NE protection</td><td>per-bin near-end gate (1−coh²)</td></tr>
-  <tr><td>EMR (Echo-to-Masker Ratio)</td><td>echo 低於噪音底時不壓抑（聽不見）</td></tr>
-  <tr><td>HF cap</td><td>500 Hz 以上的 gain 不超過 500 Hz 的（避免高頻彈跳）</td></tr>
-  <tr><td>Cross-frequency smoothing</td><td>3-bin 卷積平滑，去掉孤立 peak/valley</td></tr>
-  <tr><td>Temporal smoothing</td><td>release α 與 attack α，DT-aware</td></tr>
-  <tr><td>Rate limiting</td><td>每 frame 最多 6 dB drop / 6 dB rise</td></tr>
-  <tr><td>Stationary DT bypass (v13)</td><td>穩態 far-end 下啟動 v3 頻帶遮罩</td></tr>
-</table>
-
-<h3>5.3 CNG (Comfort Noise Generation)</h3>
-
-<p>純 FS 段把 mic 訊號完全壓掉會聽起來不自然（突然安靜）。CNG 在這些段補上低位舒適噪音：</p>
-
-<div class="figure">
-<svg viewBox="0 0 700 200" xmlns="http://www.w3.org/2000/svg">
-  <!-- timeline base -->
-  <line x1="40" y1="160" x2="660" y2="160" stroke="#475569" stroke-width="1.5"/>
-
-  <!-- segments -->
-  <rect x="40" y="100" width="180" height="60" fill="#fef3c7" stroke="#f59e0b"/>
-  <text x="130" y="125" font-size="11" font-weight="600" fill="#92400e" text-anchor="middle">FS (純遠端)</text>
-  <text x="130" y="142" font-size="10" fill="#92400e" text-anchor="middle">RES 全壓 → CNG fill</text>
-
-  <rect x="220" y="60" width="200" height="100" fill="#dcfce7" stroke="#16a34a"/>
-  <text x="320" y="100" font-size="11" font-weight="600" fill="#166534" text-anchor="middle">DT (雙講)</text>
-  <text x="320" y="118" font-size="10" fill="#166534" text-anchor="middle">RES 保護語音</text>
-  <text x="320" y="135" font-size="10" fill="#166534" text-anchor="middle">CNG off</text>
-
-  <rect x="420" y="100" width="240" height="60" fill="#fef3c7" stroke="#f59e0b"/>
-  <text x="540" y="125" font-size="11" font-weight="600" fill="#92400e" text-anchor="middle">FS (純遠端)</text>
-  <text x="540" y="142" font-size="10" fill="#92400e" text-anchor="middle">RES 全壓 → CNG fill</text>
-
-  <text x="350" y="50" font-size="13" font-weight="700" fill="#1e40af" text-anchor="middle">CNG 觸發時機</text>
-
-  <text x="40" y="180" font-size="10" fill="#64748b">time →</text>
-</svg>
-<div class="caption">圖 8：CNG 在 FS 段補舒適噪音，DT 段不啟動</div>
-</div>
-
-<table>
-  <tr><th>機制</th><th>說明</th></tr>
-  <tr><td>Frozen noise tracking</td><td>NR 安全段（純噪音）凍結 noise PSD 模板</td></tr>
-  <tr><td>0.3 × attenuation</td><td>補回時降 −10 dB 避免太明顯</td></tr>
-  <tr><td>啟用條件</td><td>filter converged + far_active + dt_low + gain &lt; threshold</td></tr>
-</table>
-
-<div class="note">
-<strong>預設關閉</strong>：CNG 預設 <code>enable_cng=False</code>。需要的場景手動開啟。
-</div>
+<p>Comfort noise 由 AEC 的 <code>comfort_noise</code> PSD 產生，只填 <code>G_res</code> 切掉的 bin；位準再乘該 bin 的 <code>G_nr</code>（下限 −10 dB，<code>SE_CNG_NR_GAIN_FLOOR</code>），讓補進去的噪聲落在降噪後的底噪。pipeline 預設 <code>enable_cng=1</code>。</p>
 
 </div>
 
@@ -850,7 +626,7 @@ G<sub>RES</sub>[k] = clamp((enr<sub>s</sub> − ENR) / (enr<sub>s</sub> − enr<
   <tr><td>取樣率</td><td>8 / 16 / 48 kHz</td><td>8 / 16 / 48 kHz</td><td>單通道</td></tr>
   <tr><td>Frame / Hop</td><td colspan="2">8k 256/128；16k 256/128（預設）或 512/256；48k 1024/512</td><td>frame=FFT、50% overlap、無補零</td></tr>
   <tr><td>FFT size</td><td>256 / 512 / 1024</td><td>256 / 512 / 1024</td><td>NE10，float32</td></tr>
-  <tr><td>Algorithmic delay</td><td>1 grid hop</td><td>final OLA 再 1 grid hop</td><td>完整 mono pipeline 為 2 hops；不含裝置 I/O／resampler／OS scheduling</td></tr>
+  <tr><td>Algorithmic delay</td><td>0 samples（linear 路徑）</td><td>—</td><td>完整 mono pipeline 為 1 grid hop（final sqrt-Hann OLA）；不含裝置 I/O／resampler／OS scheduling</td></tr>
   <tr><td>靜態記憶體</td><td><code>aec_get_mem_size()</code></td><td><code>anr_get_mem_size()</code></td><td>完整整合以 <code>audio_pipeline_get_mem_requirements()</code> 為準</td></tr>
   <tr><td>計算量</td><td>依 grid、partition、shadow 與 backend</td><td>依 n_freqs、MCRA 視窗與 backend</td><td>release 前在目標 SoC profile，不使用本頁固定估算</td></tr>
 </table>
@@ -903,12 +679,13 @@ ONNX，<strong>無 harness pre-align</strong>（讓 AEC 線上 <code>EchoPathDel
 
 <h3>6.4 AEC Preset — 單一 Pareto 旋鈕</h3>
 
-<p style="margin: 8px 0 4px;">v3.22.5 三個 preset <strong>只差</strong>一個參數
-<code>min_gain_floor_far_active_db</code>（far-active 殘響 gain 地板，權衡回音消除 ↔ 近端保留）。
+<p style="margin: 8px 0 4px;">三個 preset <strong>只差</strong>兩個地板參數：
+<code>min_gain_floor_far_active_db</code>（far-active 殘響 gain 地板，權衡回音消除 ↔ 近端保留）與
+<code>min_gain_floor_dt_db</code>（double-talk 地板：mild／balanced −20 dB，aggressive −30 dB）。
 數據為 AEC 模組單獨的 800-case bench（AECMOS ONNX，FL=832/52 ms）：</p>
 
 <table>
-  <tr><th>Preset</th><th>floor</th><th>FS_mv echo↑</th><th>NE deg↑</th><th>DT echo↑</th><th>DT deg↑</th><th>特性 / 場景</th></tr>
+  <tr><th>Preset</th><th>far-active floor</th><th>FS_mv echo↑</th><th>NE deg↑</th><th>DT echo↑</th><th>DT deg↑</th><th>特性 / 場景</th></tr>
   <tr><td><strong>mild</strong></td><td>−20 dB</td><td colspan="4" style="text-align:center">近端優先 — 保留更多近端、回音漏更多（FS 刻意低於 3.5）</td><td>近端品質優先</td></tr>
   <tr><td><strong>balanced ★</strong></td><td>−28 dB</td><td>3.512</td><td>4.047</td><td>4.20</td><td>2.16</td><td><strong>預設、通用，四項 ship bar 全過</strong></td></tr>
   <tr><td><strong>aggressive</strong></td><td>−38 dB</td><td colspan="4" style="text-align:center">回音優先 — 壓更深、近端略損（deg 仍 &gt;2.0，高於 AEC3）</td><td>高 echo 環境</td></tr>
@@ -921,37 +698,20 @@ ONNX，<strong>無 harness pre-align</strong>（讓 AEC 線上 <code>EchoPathDel
 
 <h3>6.5 NR 降噪等級</h3>
 
-<p>NR 透過 <code>g_min_db</code> 控制最大抑制量（語音/噪音比值的下限），搭配 <code>alpha_g</code> 控制時域平滑：</p>
+<p>NR 的強度 preset 只改 <code>g_min_db</code>（最大抑制量，amplitude dB）、<code>q</code>（語音先驗機率）、<code>xi_min_db</code> 與 <code>noise_over_subtraction</code>；時域平滑 <code>alpha_g</code> 各等級相同（0.88，10 ms 基準）：</p>
 
 <table>
-  <tr><th>等級</th><th>g_min_db</th><th>最大抑制量</th><th>alpha_g</th><th>推薦場景</th></tr>
-  <tr>
-    <td><strong>Light</strong></td>
-    <td>−15 dB</td>
-    <td>15 dB</td>
-    <td>0.70</td>
-    <td>高 SNR (&gt;10 dB)、近端品質優先、保留細節</td>
-  </tr>
-  <tr>
-    <td><strong>Balanced</strong></td>
-    <td>−20 dB</td>
-    <td>20 dB</td>
-    <td>0.85</td>
-    <td><strong>預設</strong>、一般場景</td>
-  </tr>
-  <tr>
-    <td><strong>Aggressive</strong></td>
-    <td>−25 dB</td>
-    <td>25 dB</td>
-    <td>0.90</td>
-    <td>低 SNR (&lt;5 dB)、需要安靜背景</td>
-  </tr>
+  <tr><th>等級</th><th>g_min_db</th><th>q</th><th>推薦場景</th></tr>
+  <tr><td><strong>Mild</strong></td><td>−20 dB</td><td>0.58</td><td>高 SNR (&gt;10 dB)、近端品質優先、保留細節</td></tr>
+  <tr><td><strong>Moderate</strong></td><td>−23 dB</td><td>0.54</td><td>介於 mild 與 balanced</td></tr>
+  <tr><td><strong>Balanced</strong></td><td>−25 dB</td><td>0.52</td><td><strong>預設</strong>、一般場景</td></tr>
+  <tr><td><strong>Aggressive</strong></td><td>−28 dB</td><td>0.45</td><td>低 SNR (&lt;5 dB)、需要安靜背景</td></tr>
 </table>
 
 <div class="key-point">
 <strong>等級選擇 trade-off：</strong>
 <ul style="margin: 6px 0 0 20px;">
-  <li><strong>Light</strong>：語音失真最小，但靜音段仍聽得到底噪</li>
+  <li><strong>Mild</strong>：語音失真最小，但靜音段仍聽得到底噪</li>
   <li><strong>Balanced</strong>：echo/quality 平衡，適合通用語音場景</li>
   <li><strong>Aggressive</strong>：背景幾乎靜音，但低 SNR 下語音可能有 musical noise / 鈍化</li>
 </ul>
@@ -983,7 +743,7 @@ ONNX，<strong>無 harness pre-align</strong>（讓 AEC 線上 <code>EchoPathDel
   </tr>
   <tr>
     <td><strong>AEC delay estimation</strong></td>
-    <td>GCC-PHAT 在低 SNR 或強非線性場景可能不準</td>
+    <td>matched-filter delay estimator 在低 SNR 或強非線性場景可能鎖到錯的 delay</td>
   </tr>
   <tr>
     <td><strong>NR 突發噪音</strong></td>

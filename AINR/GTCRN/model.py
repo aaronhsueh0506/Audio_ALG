@@ -289,10 +289,9 @@ class GTCRN(nn.Module):
 
         self.encoder = Encoder()
 
-        # Derive DPGRNN width from encoder conv strides
-        # Input F = erb_subband_1 + erb_subband_2
-        # Conv1: kernel=(1,5), stride=(1,2), padding=(0,2) → F_out = (F+4-5)//2+1 = (F-1)//2+1
-        # Conv2: same params → F_out = (F_prev-1)//2+1
+        # DPGRNN width from the encoder conv strides: input F = erb_subband_1 +
+        # erb_subband_2; each conv (kernel (1,5), stride (1,2), padding (0,2)) gives
+        # F_out = (F-1)//2 + 1.
         f = erb_subband_1 + erb_subband_2
         f = (f - 1) // 2 + 1   # after Conv1 stride=2
         f = (f - 1) // 2 + 1   # after Conv2 stride=2

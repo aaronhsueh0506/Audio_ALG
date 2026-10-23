@@ -1,10 +1,8 @@
-/* 4ch_aec_bf_dfn_res board skeleton: builds the wrapper from the
- * command-line delay profile and ERB matrices, installs a fail-open model
- * callback, and runs a few silent hops through the pre/post seam with
- * uniform beamformer weights standing in for the product's beamformer (bf).
- * Replace
- * run_accelerator() with the board runtime call and the weights with the
- * beamformer's effective response. */
+/* 4ch_aec_bf_dfn_res board skeleton: builds the wrapper from the command-line delay
+ * profile and ERB matrices, installs a fail-open model callback and runs a few
+ * silent hops with uniform beamformer weights standing in for the product's
+ * beamformer. Replace run_accelerator() with the board runtime call and the weights
+ * with the beamformer's effective response. */
 #include "4aec_dfn_res.h"
 #include "dfn_example_args.h"
 #include "mcab_sample_driver.h"
@@ -17,16 +15,16 @@ static float g_erb_fwd[DFN2_N_BINS * DFN2_N_ERB];
 static float g_erb_inv[DFN2_N_ERB * DFN2_N_BINS];
 static Complex g_weights[FOUR_AEC_NR_RES_CHANNELS * DFN2_N_BINS];
 
-/* Replace this body with the board runtime call (see mono_aec_dfn_res). */
+/* Replace with the board runtime call (see mono_aec_dfn_res). */
 static int run_accelerator(void *user, const DFN2PrepostInputs *inputs,
                            DFN2PrepostOutputs *outputs) {
     (void)user;
     (void)inputs;
     (void)outputs;
-    return -1; /* TODO(board): invoke the stateless DFN2 graph. */
+    return -1; /* BOARD: invoke the stateless DFN2 graph. */
 }
 
-/* Host grids this skeleton accepts at parse time (0-terminated): the core's own grids (no 8 kHz). */
+/* Host grids accepted at parse time (0-terminated; no 8 kHz). */
 static const int HOST_RATES[] = { 16000, 48000, 0 };
 
 static const char *name="4ch_aec_bf_dfn_res";
@@ -79,7 +77,7 @@ static int dfn_parse(void *user, int argc, char **argv) {
     };
     s->program=argv[0];
     dfn_example_rates_text(HOST_RATES,s->rates_text,sizeof(s->rates_text));
-    /* Seed the established DFN defaults without consuming user arguments. */
+    /* Seed the DFN defaults without consuming user arguments. */
     if (dfn_example_parse_args(1,argv,name,HOST_RATES,&s->args) != 0) return 2;
     s->delay.mode=s->args.delay_mode;
     s->delay.num_filters=s->args.delay_num_filters;
@@ -115,7 +113,7 @@ static int dfn_setup(void *user, McabHopView *view) {
     s->cfg.atten_lim_db = s->args.atten_lim_db;
     s->cfg.erb_fwd = g_erb_fwd;
     s->cfg.erb_inv = g_erb_inv;
-    /* Compiled-in geometry, not the model's metadata: see mono_aec_dfn_res. */
+    /* Compiled-in geometry, not the model's metadata (see mono_aec_dfn_res). */
     if (dfn2_model_io_descriptor_default(&s->descriptor) != 0) return 1;
     s->cfg.model.user = NULL;
     s->cfg.model.infer = run_accelerator;
@@ -159,10 +157,6 @@ static int dfn_process(void *user, McabHopView *view, int frame) {
     return four_aec_dfn_res_front_process(s->pipeline,microphones,far,&front) != 0 ||
            four_aec_dfn_res_process(s->pipeline,g_weights,NULL,output) != 0;
 }
-static int dfn_finish(void *user, McabHopView *view, int frames) {
-    (void)user; (void)view; (void)frames;
-    return 0;
-}
 static void dfn_complete(void *user) {
     (void)user;
     printf("%s: fail-open board skeleton PASS\n",name);
@@ -173,6 +167,6 @@ static void dfn_cleanup(void *user) {
 int main(int argc, char **argv) {
     DfnSample sample={0};
     static const McabSampleOps ops={dfn_parse,2,dfn_setup,dfn_read,dfn_process,
-                                  NULL,NULL,dfn_finish,dfn_cleanup,dfn_complete};
+                                  NULL,NULL,NULL,dfn_cleanup,dfn_complete};
     return mcab_sample_main(argc,argv,&ops,&sample);
 }

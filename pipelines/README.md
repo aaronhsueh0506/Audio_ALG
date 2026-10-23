@@ -53,10 +53,9 @@ The non-`aec_only` path never reads `aec_process()`'s own returned audio —
 only `AecResContext`'s linear residual matters downstream — so it drives AEC
 via `aec_process_context()` instead: same linear filter and AEC3
 post/RES-context computation, minus the copy into an `out` buffer neither this
-pipeline nor the caller ever reads on that path. This pipeline still picks one
-entry point at init from `aec_only`, but that is now only a cost choice: the
-two entry points advance identical state and may be mixed freely on one
-instance.
+pipeline nor the caller ever reads on that path. The pipeline picks one entry
+point at init from `aec_only`; the two entry points advance identical state and
+may be mixed freely on one instance.
 
 ## Modules
 
@@ -83,7 +82,7 @@ RES-applied spectrum feeding NR.
 The conventional mono application instead takes the AEC-owned `res_gain` from
 `AecResContext` (`g_res_ctx` in `SeSpecFrame`). With `return_res_context=1` and
 `enable_res=0`, `aec_process_context()` advances the linear filter and context
-calculation without copying returned time audio. The legacy `aec_process()`
+calculation without copying returned time audio. The `aec_process()`
 convenience API also emits time audio; with RES enabled it applies its own
 suppression/synthesis internally. That full convenience path is distinct from
 the four-channel linear front → external SRP/BF → fuse → gain stages flow.
@@ -155,8 +154,6 @@ selectable grids; the others have exactly one:
 | filter_length | 416 | 832 | 832 | 3072 | ms-derived: sr × 52ms (64ms ≥44.1 kHz) |
 | n_partitions | 4 | 7 | 4 | 6 | ceil(filter_length / hop) |
 
-(Verified against a live `aec_create()` at each grid, not hand-derived.)
-
 ## Four-channel sample driver
 
 The four 4-channel sample mains use `4ch_aec_bf_nr_res/mcab_sample_driver.{c,h}`
@@ -172,9 +169,6 @@ algorithm archives.
 | `4ch_aec_bf_dfn_res` | Eight silent fail-open model hops; DFN2 matrix, delay-profile and descriptor setup stays local. |
 | `4ch_alignulcnet` | Four silent fail-open model hops; descriptor/accelerator pool and model installation stay local. |
 
-CLI defaults, help/error exits and diagnostics retain each sample's existing
-policy. In particular, static spatial and ULCNet numeric options retain their
-legacy `atoi/atof` conversion; raw and DFN2 retain their prior numeric checks.
 Model samples report success after resource destruction. The shared hop loop
 performs no allocation. Run `make -C 4ch_aec_bf_nr_res test-mcab-sample-driver`
 for CLI boundary, short-circuit, finite-output and cleanup-order regressions;
@@ -332,7 +326,7 @@ HfTilt* tilt = hf_tilt_init((uint8_t*)pool + ALIGN16(req.bytes), n_freqs, 8, 0.0
   application carved (`se_anr_stage_*` take the `AnrDenoiser`, `se_res_stage_gain`
   the `AecRes`). Gain vectors the chain needs (`g_total`, the NR prior scratch, the
   spectrum buffer) are `n_freqs` floats / bins each, also from the caller's block.
-- The 4-channel core (`FourAecNrRes`) now owns only the shared aligner, the four
+- The 4-channel core (`FourAecNrRes`) owns only the shared aligner, the four
   lanes and the fuse buffers. The wrappers carve the post-beam stages behind it
   from their own pool: `four_aec_nr_res_stage_configs()` returns the `AecConfig`
   for `aec_res_init()` and the `AnrConfig` for `se_anr_stage_init()` (all-zero
@@ -426,17 +420,7 @@ latency.
 make                # aec_nr_pipeline, static variant and mono_alignulcnet
 make SIMD=0         # one switch: mono pipeline + AEC + NR + audiolib all scalar
 
-> **SIMD=0 and SIMD=1 are not bit-identical end to end, by design.** Each
-> shared kernel is byte-exact against its scalar twin (proved per kernel by
-> `audiolib/common/test/simd_selftest.c`), but the AEC matched filter diverges
-> deliberately: `delay_aec.c`'s dot product uses four accumulators plus
-> `vfmaq_f32` — reordered summation *and* fused rounding — and its NLMS update
-> fuses where the scalar spells a separate multiply and add. Measured on the
-> mono pipeline, the two builds differ in 75 bytes at fft=256 and 67 at
-> fft=512 over a 6 s stimulus. The contract is **per configuration**: a change
-> must be byte-exact against the same configuration before it. Across
-> configurations only finite output, the same delay winner/state and a quality
-> tolerance are guaranteed — do not gate a release on cross-SIMD WAV equality.
+# SIMD=0 and SIMD=1 outputs are not bit-identical end to end (see the note below).
 
 # Binaries land in a config-keyed directory:
 #   bin/<backend>-<config-hash>/  — resolve it with `make print-bin-dir`
@@ -453,18 +437,10 @@ BIN="$(make -s print-bin-dir)"
 "$BIN"/aec_nr_pipeline_static mic.wav ref.wav output.wav balanced
 "$BIN"/aec_nr_pipeline_static --print-mem-size --sample-rate 16000
 
-# Run the audio_pipeline.h library's own acceptance tests —
-# create-vs-init byte equality (incl. a poisoned pool), destroy idempotence,
-# misaligned/undersized pool rejection, sample-rate whitelist rejection,
-# AudioPipelineConfig reject-first validation (bad enum/bool fields),
-# audio_pipeline_init_ex()'s `expected` descriptor gate (tampered
-# descriptor_version/layout_version/backend_id/build_flags_hash/alignment/
-# bytes each rejected) — each per-rate case runs once per supported rate
-# (8000/16000/48000; 48 kHz uses a reduced hop count, see
-# mono_aec_nr_res/tests/test_audio_pipeline.c)
-# — AND builds + runs the example_board_adapter smoke test (see "Board
-# Integration" below). Four-channel tests are intentionally isolated in
-# 4ch_aec_bf_nr_res/Makefile.
+# audio_pipeline.h acceptance tests (pool, config and descriptor validation at
+# each supported rate; mono_aec_nr_res/tests/test_audio_pipeline.c) plus the
+# example_board_adapter smoke test (see "Board Integration" below).
+# Four-channel tests live in 4ch_aec_bf_nr_res/Makefile.
 make test
 
 # Build/test the four application packages.
@@ -484,6 +460,14 @@ make example-adapter
 make NO_STDIO=1 libaudio_pipeline.a
 make audit-no-stdio
 ```
+
+> **SIMD=0 and SIMD=1 are not bit-identical end to end, by design.** Each shared
+> kernel is byte-exact against its scalar twin (`audiolib/common/test/simd_selftest.c`),
+> but the AEC matched filter (`delay_aec.c`) uses four accumulators with
+> `vfmaq_f32` and a fused NLMS update. The contract is per configuration: a
+> change must be byte-exact against the same configuration before it. Across
+> configurations only finite output, the same delay winner/state and a quality
+> tolerance hold; do not gate a release on cross-SIMD WAV equality.
 
 `make` builds the mono executables and the existing `libaudio_pipeline.a`.
 `libaudio_pipeline.a` is the pool-sizing/carving/processing library that both
@@ -532,9 +516,7 @@ distinguish from a build without them. See `AudioPipelineLastTiming` in
 `mono_aec_nr_res/audio_pipeline.h` for what each stage covers and for why the
 stages deliberately do not sum to the call.
 
-There are no other optional performance compile flags — the fast
-matched-filter arithmetic and delay-estimator duty-cycling are built into
-`lib/aec` unconditionally.
+There are no other optional performance compile flags.
 
 ### `--debug`
 
@@ -546,8 +528,8 @@ no per-frame cost when the flag is off and doesn't perturb the DSP output when o
 
 ```
 ./aec_nr_pipeline mic.wav ref.wav out.wav --debug
-[dbg   1.0s] aec: delay=-1 conf=0.5 upd=6 erle=0.0dB lin=0 conv=0 near=8.74e-04 out=8.08e-04 | nr: init=1 gain=-18.2/-23.4dB spp=0.50 noise=-1.2dB
-[dbg   2.0s] aec: delay=320 conf=1.0 upd=18 erle=0.0dB lin=1 conv=0 near=4.79e-03 out=3.47e-03 | nr: init=1 gain=-18.8/-23.9dB spp=0.51 noise=-4.8dB
+[dbg   1.0s] aec: delay=288 conf=1.0 upd=68 erle=6.0dB lin=1 conv=0 near=1.48e-03 out=1.63e-05 | nr: init=1 gain=-13.3/-15.0dB spp=0.50 noise=-22.1dB
+[dbg   2.0s] aec: delay=288 conf=1.0 upd=169 erle=9.4dB lin=1 conv=1 near=1.86e-03 out=2.98e-05 | nr: init=1 gain=-14.9/-17.2dB spp=0.51 noise=-27.5dB
 ...
 ```
 
@@ -559,38 +541,16 @@ power). `nr:` fields are `AnrDebugStatus` (`init` = noise-floor initialized;
 `noise` = mean noise-floor dB). With `--aec-only` the `nr:` half prints `n/a`
 (no denoiser exists in that mode).
 
-> **Caveat**: this pipeline always runs AEC in **linear mode**
-> (`enable_res=0`, `return_res_context=1` — the external NR/RES seam), and
-> `lib/aec/c_impl/src/aec.c` only caches `last_erle_windowed` when
-> `cfg.enable_res` is true. So `erle=` in this pipeline's `--debug` output
-> always reads `0.0dB` — that's expected here, not a broken query. (The field
-> does move if you drive `aec_debug_status()` from a caller running with
-> `enable_res=1`, e.g. `lib/aec/c_impl/example/aec_wav.c --debug`.)
+### Delay-estimator duty-cycling (opt-in)
 
-### Delay-estimator duty-cycling (built in, always on)
-
-The AEC3 matched-filter delay estimator duty-cycles itself — no flag or
-config field: once the delay estimate is solid (confidence 1.0) and unchanged
-for `delay_est_init_s` (default 0.3s), analysis drops to 1 hop in every
-K = round(`delay_est_period_s`/hop)/5 instead of every hop — K = 12 at
-8 ms hops, 6 at 16 ms, 9 at 10.67 ms, i.e. a duty period of ~96 ms on all
-three of this pipeline's grids. Full-rate analysis resumes when the estimate
-changes, loses solidity, or ERLE drops >6dB off its running peak.
-**Sampled-quality-verified ~zero cost** (60-case AECMOS: ≤+0.014 / worst
-−0.006). On a stable-delay clip the decimated schedule never actually skips a
-*different* outcome; verified here on
-`wav/aec_challenge_blind/doubletalk/0I0XMl3M0ECO0U1N0cJvpg_*`.
-
-Two things that read as "immediately" but are not. First, a decimated hop
-publishes no new estimate, so "the estimate changed" can only be observed on
-an ANALYSED hop: a delay movement mid-stream is seen at the next scheduled
-analysis, and full rate resumes from the hop that sees it — up to one duty
-period (~96 ms) later than the movement itself. Second, in THIS pipeline the
-ERLE-watchdog resume leg is inert — the AEC runs linear-mode
-(`enable_res=0`) so `last_erle_windowed` is never updated (same root cause as
-the `--debug` `erle=0.0` caveat above). Together that leaves the
-1-in-K-sampled estimate change as the only resume path here, which is exactly
-the bound above and not a shorter one.
+`AecConfig.delay_est_period_s` (default `0` = analyse every hop) duty-cycles the
+AEC3 matched-filter delay estimator: once the estimate is solid (confidence 1.0)
+and unchanged for `delay_est_init_s` (default 0.3 s), analysis drops to 1 hop in
+every K = round(`delay_est_period_s`/hop)/5 (minimum 1). Full-rate analysis
+resumes when the estimate changes, loses solidity, or ERLE drops more than 6 dB
+below its running peak. A decimated hop publishes no new estimate, so a delay
+movement is seen at the next scheduled analysis, up to one duty period later.
+The pipelines in this directory leave it at `0`.
 
 ## Two Versions
 
@@ -600,18 +560,14 @@ Suitable for desktop testing and Linux servers.
 
 ### Version B: static memory (`mono_aec_nr_res/static_main.c`)
 
-Built by default alongside Version A (both `lib/aec` and `lib/nr` track
-`main` — each library ships the heap and static APIs side by side,
-selected at runtime). One
-caller-owned pool, no malloc after init, byte-identical output to Version A
-(see Verification below). Since NE10 vendored patch P0001
-(`audiolib/common/lib/ne10/VENDORED.md`), the NE10 backend's three R2C/C2R
+Built by default alongside Version A. One caller-owned pool, no malloc after
+init, byte-identical output to Version A (see Verification below). With NE10
+vendored patch P0001 (`audiolib/common/lib/ne10/VENDORED.md`), the NE10 backend's three R2C/C2R
 twiddle configs are carved FROM the caller pool too
 (`ne10_fft_init_r2c_float32_ext`: carve + twiddle-generate directly over
 caller-supplied memory, no `malloc()` involved) and are already counted in
 the `*_get_mem_size` figures — so "no malloc after init" is zero heap
-allocation ever, end to end, on **both** backends, not just on the per-hop
-audio path.
+allocation ever, end to end, not just on the per-hop audio path.
 
 ## Board Integration
 
@@ -718,68 +674,46 @@ post-beam 抑制器）。
 
 **Modes**: `ANR_MODE_MILD` / `ANR_MODE_MODERATE` / `ANR_MODE_BALANCED`（default）/ `ANR_MODE_AGGRESSIVE`
 
-> These are the library's mode enum. Both C pipeline CLIs' `parse_nr_mode()` —
-> `mono_aec_nr_res/main.c` and `4ch_aec_bf_nr_res/4aec_nr_res_static.c` — also recognize
-> `"moderate"` (`--nr-preset mild|moderate|balanced|aggressive`); anything else
-> still silently falls back to `ANR_MODE_BALANCED` — no error. The Python `aec_nr_pipeline.py`
-> CLI has not been updated and still restricts `--nr-preset` to `choices=['mild', 'balanced',
-> 'aggressive']`; `MODERATE` there is only reachable by calling `anr_config_for_mode()`
-> directly.
+> Both C pipeline CLIs' `parse_nr_mode()` — `mono_aec_nr_res/main.c` and
+> `4ch_aec_bf_nr_res/4aec_nr_res_static.c` — accept
+> `--nr-preset mild|moderate|balanced|aggressive`; anything else falls back to
+> `ANR_MODE_BALANCED` with no error. The Python `aec_nr_pipeline.py` CLI accepts
+> `mild|balanced|aggressive` only.
 
-`g_min_db` is in the amplitude-dB convention (`/20`, i.e. `g_min = 10^(g_min_db/20)`), not the
-older power-dB (`/10`) convention.
+`g_min_db` is amplitude dB (`g_min = 10^(g_min_db/20)`).
 
-> **Retime basis — read before hand-editing any `alpha_*`/`L`/`num_init_frames` below.**
-> Every `alpha_*` (except `q`/`g_min_db`/`xi_min_db`, which are plain dB/probability
-> constants) and `L`/`num_init_frames`/`scene_change_min_frames` is **not** used as-authored —
-> `anr_types.h`'s `anr_config_for_mode_grid()` retimes each one from its authored
-> reference duration to the actual `hop_size` of the grid you construct it for
-> (`anr_retime_alpha()`/`anr_retime_alpha_ref()`/`anr_retime_frames[_ref]()`).
-> The tables below list the **authored constants exactly as they appear as literals in
-> source** (what you'd override via `AnrConfig` before construction, or diff against in
-> code) — **not** the realized runtime value at any particular grid; `L`/`num_init_frames`
-> are the one exception, called out per-row below, since a plain frame count without a
-> stated grid is meaningless.
->
-> The reference duration is **not the same for every field** — mixing them up when
-> hand-deriving a value for a different grid silently reintroduces the musical-noise and strength-mode
-> regressions:
-> - **16 ms-authored** (retimed off a 16 ms/hop reference): `alpha_xi`, `L`, `alpha_attack`
->   (all modes), and `alpha_d`/`alpha_g`/`alpha_decay` **in MILD/MODERATE/AGGRESSIVE only**.
-> - **10 ms-authored** (retimed off a 10 ms/hop reference): `alpha_s`, `alpha_p`,
->   `num_init_frames`, `scene_change_min_frames`, and `alpha_d`/`alpha_g`/`alpha_decay`
->   **in BALANCED only** (BALANCED inherits these three straight from
->   `anr_default_config_for_grid()`, which predates the 16 ms-hop grid switch).
->
-> Don't hand-scale one of these numbers by a grid's sample-rate/hop ratio and expect it to
-> match the library's own value — call `anr_default_config()`/`anr_config_for_mode()`
-> (or the Python `core/nr_strength.py` equivalent) and read the field back instead.
+> **Retime basis.** `anr_config_for_mode_grid()` retimes every `alpha_*`, `L`,
+> `num_init_frames` and `scene_change_min_frames` from its authored reference
+> duration to the actual hop of the grid (`anr_retime_alpha()`,
+> `anr_retime_alpha_ref()`, `anr_retime_frames()`, `anr_retime_frames_ms()`);
+> `q`, `g_min_db` and `xi_min_db` are plain constants. The reference is 16 ms/hop
+> for `alpha_xi`, `alpha_attack`, `alpha_d_speech` and `L`, and 10 ms/hop for the
+> other `alpha_*` and the frame counts. The tables list the authored constants,
+> not the realized value at a grid; read that back from `anr_default_config()` /
+> `anr_config_for_mode()` (or Python `core/nr_strength.py`) instead of scaling by hand.
+
+The strength presets change only these four fields:
 
 | Parameter | Mild | Moderate | Balanced | Aggressive | Description |
 |-----------|------|----------|----------|------------|-------------|
-| `g_min_db` | -20 | -25 | -30 | -40 | 最小增益 dB（最大抑制量，amplitude dB, /20） |
-| `q` | 0.60 | 0.55 | 0.50 | 0.35 | 語音先驗機率（低→積極抑噪） |
-| `xi_min_db` | -15 | -18 | -20 | -25 | 先驗 SNR 下限 dB |
-| `alpha_d` | 0.85 | 0.85 | 0.903414 (10 ms 基準 = 0.85 @16 ms) | 0.50 | 噪聲追蹤 IIR 係數（authored 常數，見上方 retime 說明；BALANCED 取較慢的值） |
-| `alpha_g` | 0.92 | 0.92 | 0.88 | 0.85 | 增益時間平滑（高→平滑；authored 常數） |
-| `alpha_attack` | 0.40 | 0.40 | 0.30 | 0.15 | Attack 平滑（語音起始追蹤；authored 常數，四個 preset 皆 16ms 基準） |
-| `alpha_decay` | 0.92 | 0.92 | 0.88 | 0.88 | Decay 平滑（噪聲釋放；authored 常數） |
+| `g_min_db` | -20 | -23 | -25 | -28 | 最小增益 dB（最大抑制量，amplitude dB, /20） |
+| `q` | 0.58 | 0.54 | 0.52 | 0.45 | 語音先驗機率（低→積極抑噪） |
+| `xi_min_db` | -10 | -10 | -10 | -12 | 先驗 SNR 下限 dB |
+| `noise_over_subtraction` | 1.2 | 1.3 | 1.4 | 1.3 | 噪聲過減係數 |
 
-**MCRA 噪聲估計**：
+All modes share these tracker and gain-smoothing constants:
 
-| Parameter | Default | Description |
-|-----------|---------|-------------|
-| `alpha_s` | 0.95 | 功率譜時間平滑（authored 常數，10ms 基準） |
-| `alpha_d` | 0.903414 | 噪聲更新速率（authored 常數，10ms 基準 = 0.85 @16 ms；BALANCED 值，見上方 retime 說明） |
-| `L` | 64 | 最小值追蹤視窗（幀數；**已 retime**；authored 值為 32 hops @ 16 ms，16 kHz 預設 256/128 grid 的實際 hop 為 8 ms，因此 effective 值為 64；其他 grid 請由設定 API 讀回） |
-| `num_init_frames` | 25 | 初始化靜默幀數（**已 retime**；常數以 10 ms 為 authored basis，16 kHz 預設 256/128 的實際 hop 是 8 ms，因此 25 hops ≈200 ms） |
-| `scene_change_threshold_db` | 10.0 | 場景轉換偵測閾值（純 dB 常數，不 retime） |
-
-**SPP**：
-
-| Parameter | Default | Description |
-|-----------|---------|-------------|
-| `alpha_xi` | 0.92 | Decision Directed 先驗 SNR 平滑（authored 常數，16ms 基準；所有 preset 共用） |
+| Parameter | Authored value | Basis | Description |
+|-----------|----------------|-------|-------------|
+| `alpha_xi` | 0.92 | 16 ms | Decision Directed 先驗 SNR 平滑（SPP） |
+| `alpha_attack` | 0.15 | 16 ms | Attack 平滑（語音起始追蹤） |
+| `alpha_g` | 0.88 | 10 ms | 增益時間平滑（高→平滑） |
+| `alpha_decay` | 0.88 | 10 ms | Decay 平滑（噪聲釋放） |
+| `alpha_s` | 0.95 | 10 ms | 功率譜時間平滑（MCRA） |
+| `alpha_d` | 0.903414 | 10 ms | 噪聲更新速率（= 0.85 @ 16 ms） |
+| `L` | 32 frames | 16 ms | 最小值追蹤視窗；16 kHz 預設 256/128 grid（hop 8 ms）的實際值為 64 |
+| `num_init_frames` | 20 frames | 10 ms | 初始化靜默幀數；同一 grid 的實際值為 25（約 200 ms） |
+| `scene_change_threshold_db` | 10.0 | 純 dB 常數 | 場景轉換偵測閾值，不 retime |
 
 ---
 
@@ -805,14 +739,14 @@ older power-dB (`/10`) convention.
 
 | 症狀 | 原因 | 調整方式 |
 |------|------|----------|
-| **噪聲殘留太多** | 抑制量不夠 | 降低 `g_min_db`（如 -30→-40），降低 `q`（如 0.5→0.35） |
-| **語音被吃掉** | 抑制太激進 | 提高 `g_min_db`（如 -30→-20），提高 `q`（如 0.5→0.6），提高 `alpha_g`（如 0.88→0.92） |
+| **噪聲殘留太多** | 抑制量不夠 | 降低 `g_min_db` 與 `q`（朝 aggressive preset 的 -28 dB／0.45） |
+| **語音被吃掉** | 抑制太激進 | 提高 `g_min_db` 與 `q`（朝 mild preset 的 -20 dB／0.58），提高 `alpha_g`（如 0.88→0.92） |
 | **Musical noise（隨機顆粒噪聲）** | 增益抖動 | 提高 `alpha_g`（增益更平滑），提高 `alpha_decay`（釋放更慢） |
-| **語音起始被截斷** | Attack 太慢 | 降低 `alpha_attack`（如 0.3→0.15），讓增益快速回升 |
+| **語音起始被截斷** | Attack 太慢 | 降低 `alpha_attack`（預設 0.15；如 0.15→0.10），讓增益快速回升 |
 | **噪聲環境切換後適應慢** | MCRA 追蹤窗太長 | 減小 `L`（如 32→16），但會增加噪聲底噪估計抖動 |
 | **初始化期語音被壓** | 噪聲底噪估計偏高 | 減少 `num_init_frames`（如 20→10），但需確保前段有足夠噪聲 |
-| **穩態噪聲殘留（風扇聲）** | 噪聲更新太慢 | 降低 `alpha_d`（如 0.7→0.5），讓噪聲估計更快跟上 |
-| **語音段噪聲估計上升** | SPP 平滑不足 | 提高 `alpha_xi`（如 0.88→0.95），讓 SPP 更穩定判別語音 |
+| **穩態噪聲殘留（風扇聲）** | 噪聲更新太慢 | 降低 `alpha_d`（預設 0.903；如 0.90→0.80），讓噪聲估計更快跟上 |
+| **語音段噪聲估計上升** | SPP 平滑不足 | 提高 `alpha_xi`（預設 0.92；如 0.92→0.95），讓 SPP 更穩定判別語音 |
 
 ### Pipeline 整體
 
@@ -825,8 +759,7 @@ older power-dB (`/10`) convention.
 
 ### Verification
 
-Both versions build from the default `make` and have been verified
-**byte-identical** to each other (`cmp` on the full rendered WAV) at 16 kHz on
-real doubletalk material (`aec_challenge_blind` case `0I0XMl3M`, balanced
-presets, CNG on), and the static build's init asserts the 8 kHz / 16 kHz FFT
-grids agree across AEC/NR/OLA (`n_freqs` cross-check at init).
+Both versions build from the default `make` and produce byte-identical output
+(`cmp` on the full rendered WAV) for the same arguments, and the static build's
+init asserts the FFT grids agree across AEC/NR/OLA (`n_freqs` cross-check at
+init).

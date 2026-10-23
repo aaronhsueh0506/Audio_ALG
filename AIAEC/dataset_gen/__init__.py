@@ -7,10 +7,8 @@ The four AEC model projects import from here and nowhere else:
         PACKED_STEM_ORDER, alpha_from_tau, stft, istft,
     )
 
-⚠ A project that re-declares any of these is opting out of the comparison.
-``AINR/tests/test_bakeoff_protocol.py`` already guards the NR side of that rule
-for split/sampler/seed; the same reasoning applies to the STFT grid and the
-stem channel order, which are equally silent when they drift.
+⚠ A project that re-declares any of these opts out of the comparison
+(``AINR/tests/test_bakeoff_protocol.py`` guards the NR side).
 """
 
 from .aec_dataset import (

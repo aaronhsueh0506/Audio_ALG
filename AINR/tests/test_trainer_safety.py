@@ -140,12 +140,11 @@ def test_non_finite_gradient_is_refused_before_it_touches_the_model():
 def test_scan_non_finite_excludes_buffers_by_default():
     """⚠ Buffers must be OFF by default, and that default is load-bearing.
 
-    BatchNorm writes running_mean/running_var during forward() in train mode, so a
-    forward-side fault poisons every BN buffer before the loss exists.  Including
-    them made the halt report claim "an earlier step already wrote NaN into the
-    weights" at global step 0 -- the opposite of the truth -- and put non-finite
-    buffers into the checkpoint it told the operator to resume from, which the
-    resume guard then rejected.
+    BatchNorm writes running_mean/running_var during forward() in train mode,
+    so a forward-side fault poisons every BN buffer before the loss exists.
+    Including them would make the halt report claim "an earlier step already
+    wrote NaN into the weights" at global step 0 and put non-finite buffers
+    into the checkpoint it tells the operator to resume from.
     """
     model = torch.nn.Sequential(torch.nn.Linear(3, 2), torch.nn.BatchNorm1d(2))
     assert scan_non_finite(model) == []
@@ -216,14 +215,11 @@ def test_a_zero_initialized_bias_does_not_halt_at_step_zero():
 def test_a_tensor_that_never_had_a_scale_is_skipped_not_reported():
     """What the ``peak > floor`` skip is actually load-bearing for.
 
-    A bias sitting at exactly 0.0 is already protected by the ratio test alone
-    (0.0 is not less than 1e-06 x 0.0).  A tensor that has only ever been SMALL
-    is not: a peak of 1e-14 falling to 1e-25 clears the absolute floor and the
-    ratio both, and without the skip it would be reported as a collapse it never
-    had the scale to suffer.
-
-    ⚠ Written so it can FAIL: remove ``peak > floor`` from the test and the
-    second check below halts.
+    A bias at exactly 0.0 is already protected by the ratio test alone. A
+    tensor that has only ever been SMALL is not: a peak of 1e-14 falling to
+    1e-25 clears the absolute floor and the ratio both, and without the skip
+    would be reported as a collapse it never had the scale to suffer. ⚠ Written
+    so it can FAIL: remove ``peak > floor`` and the second check below halts.
     """
     model = torch.nn.Linear(4, 3)
     with torch.no_grad():

@@ -1,15 +1,10 @@
 """The packer must refuse a corpus whose fifth channel was only partly rebuilt.
 
-This is the one failure with no downstream detector: once packed, the fifth
-channel is just samples, and a shard set labelled with one contract while
-holding two looks exactly like a correct one.
-
-⚠ The cases below that call the guard DIRECTLY are testing the guard's own
-logic and nothing else. They will pass whether or not pack() actually calls
-it -- a call site pointing at a stale guard name would leave every one of
-these green while any real pack raised NameError.
-test_pack_itself_runs_the_guard is the one that closes that gap, and it is the reason to reach for pack() rather than the helper
-whenever a test can afford to.
+The one failure with no downstream detector: once packed, the fifth channel is
+just samples, and a shard set labelled with one contract while holding two
+looks correct. ⚠ The cases that call the guard DIRECTLY test its logic only and
+pass whether or not pack() calls it; test_pack_itself_runs_the_guard closes
+that gap, so reach for pack() whenever a test can afford to.
 """
 import argparse
 import dataclasses
@@ -46,16 +41,13 @@ def _gate(root):
         seqs, P._collect(seqs), shipped_contract())
 
 
-# The identity of the builds the shipped corpus was materialized under. It is
-# RETIRED, so a ledger from any of these revisions must be refused whether
-# it is legacy-shaped or records its contract. Spelled out rather than read
-# from the tables on purpose: a test fed its inputs from the table it checks
-# would still pass if the table were emptied.
-#
-# A behaviour hash is insensitive to comments and formatting, so it survives
-# every docs-only lib/aec commit while `aec_commit` moves under it -- four
-# revisions carried this one, measured, and each wrote a DIFFERENT ledger
-# fingerprint because `fingerprint()` folds in the commit.
+# The identity of the builds the shipped corpus was materialized under,
+# RETIRED: a ledger from any of these revisions must be refused whether it is
+# legacy-shaped or records its contract. Spelled out rather than read from the
+# tables, which would pass if the table were emptied. A behaviour hash survives
+# docs-only lib/aec commits while `aec_commit` moves, and `fingerprint()` folds
+# in the commit, so each of the four revisions that carried this one wrote a
+# DIFFERENT ledger fingerprint.
 MIGRATED_FROM_HASH = (
     "37ed5ad9b75ce42902361d8195fcf04a650b940744ec036a16c8736dec9d5061")
 _SOURCE_HASH_EARLY = (
@@ -353,15 +345,11 @@ def test_pack_itself_runs_the_guard(tmp_path):
 def test_rematerialize_then_pack_produces_loadable_shards(tmp_path):
     """The whole path a real run takes, in order, through both entry points.
 
-    Two things this closes that nothing else did. First, the negative case
-    above has to be able to pass, or it proves nothing. Second, "pack did not
-    raise" is not "pack produced something usable" -- the shards are opened
-    and checked, because a corpus that packs into unusable shards fails at
-    training time, hours later, with nothing pointing back here.
-
-    Runs the rematerializer at --jobs 2 deliberately: the parallel path is the
-    one a real run uses, and it is the one that writes the ledger the packer
-    then reads.
+    The negative case above has to be able to pass, or it proves nothing, and
+    "pack did not raise" is not "pack produced something usable", so the shards
+    are opened and checked. Runs the rematerializer at --jobs 2 deliberately:
+    the parallel path is the one a real run uses and the one that writes the
+    ledger the packer reads.
     """
     from AIAEC.dataset_gen.pack_aec_dataset import PACKED_STEM_ORDER
 
@@ -394,12 +382,11 @@ def test_rematerialize_then_pack_produces_loadable_shards(tmp_path):
 def test_a_corpus_from_the_retired_frontend_does_not_pack(tmp_path):
     """The remote flow end to end after the frontend moved.
 
-    A corpus is rematerialized, lib/aec then moves to a revision that renders
-    a different `linear_error` (simulated by re-keying the ledger to the
-    retired corpus build, which is exactly what that machine's ledger holds),
-    and the operator packs. The first gate has to refuse: shards stamped with
-    THIS build's contract over that audio would train a checkpoint on a stem
-    this build does not produce.
+    A corpus is rematerialized, then lib/aec moves to a revision that renders a
+    different `linear_error` (simulated by re-keying the ledger to the retired
+    corpus build) and the operator packs. The first gate has to refuse: shards
+    stamped with THIS build's contract over that audio would train a checkpoint
+    on a stem this build does not produce.
     """
     root = _corpus(str(tmp_path / "c"))
     seqs = os.path.join(root, "seqs")

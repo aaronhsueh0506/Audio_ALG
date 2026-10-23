@@ -2,22 +2,15 @@
 """The shared normaliser-init ramp fit must recover a ramp it was given.
 
 Lives here rather than under a model directory because both RNNoise-ERB and
-DeepFilterNet2 calibrate through ``dataset_gen.calibration``.  The two models
-need SEPARATE constants -- different sample rate, FFT size, band count and
-corpus -- but the same fitting procedure, and a per-project copy of that
-procedure is exactly the kind of duplicate that drifts.
-
-``erb_norm_init_lo_db``/``hi_db`` are the two ends of a ``torch.linspace``
-across FREQUENCY (train.py ``normalize_log_erb``), so calibrating them means
-fitting the frequency profile.  The original script pooled every band and
-every frame into one distribution and reported its median and 5th percentile.
-That measures how levels vary over time and loudness, not over frequency: on
-the synthetic case below it reports a 20.8 dB span for a signal whose true
-frequency ramp is 16.0 dB, with the difference coming entirely from per-frame
-level jitter.
-
-This test pins the property that actually matters -- given data built from a
-known ramp, the calibration returns that ramp.
+DeepFilterNet2 calibrate through ``dataset_gen.calibration``: they need
+SEPARATE constants (different sample rate, FFT size, band count and corpus) but
+the same fitting procedure. ``erb_norm_init_lo_db``/``hi_db`` are the two ends
+of a ``torch.linspace`` across FREQUENCY (train.py ``normalize_log_erb``), so
+calibrating them means fitting the frequency profile; pooling every band and
+frame into one distribution measures level variation over time and loudness
+instead (a 20.8 dB span reported for a true 16.0 dB ramp on the synthetic case
+below). This pins the property that matters: data built from a known ramp
+returns that ramp.
 """
 
 import contextlib

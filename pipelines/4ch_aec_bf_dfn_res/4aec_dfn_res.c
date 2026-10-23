@@ -44,9 +44,8 @@ static uint32_t fnv_u32(uint32_t h, uint32_t v) {
     return h;
 }
 
-/* Everything init needs, derived from the config exactly once: the stage
- * config, the sub-descriptors and this pool's total. The core validates its
- * own config; only the seam invariants are checked here. */
+/* Everything init needs, derived from the config once: the stage config, the
+ * sub-descriptors and this pool's total. The core validates its own config. */
 typedef struct Resolved {
     int use_bridge;                 /* core below 48 kHz */
     DfnResStageConfig scfg;
@@ -224,11 +223,10 @@ FourAecDfnRes *four_aec_dfn_res_init_ex(void *mem, size_t bytes,
     cursor += align_up((size_t)r.n_freqs * sizeof(Complex));
     for (k = 0; k < r.n_freqs; ++k) p->unity[k] = 1.0f;
     p->rng = SE_CNG_RNG_SEED;
-    /* The comfort-noise fill is the front end's own switch. */
+    /* The comfort-noise fill is the front end's switch. */
     p->cng = cfg->front_end.enable_cng;
-    /* The core resolves fft_size 0 to its rate default; the stage's grid
-     * (48 kHz) or the bridge's native grid must be the core's, checked once
-     * here. */
+    /* The core resolves fft_size 0 to its rate default; the stage's grid (48 kHz) or
+     * the bridge's native grid must be the core's. */
     if (r.use_bridge) {
         p->bridge = dfn_rate_bridge_init_ex(cursor, (size_t)r.bridge_req.bytes,
                                             &r.bcfg, &r.bridge_req);
@@ -301,8 +299,8 @@ void four_aec_dfn_res_destroy(FourAecDfnRes *p) {
     if (owned) free(owned);
 }
 
-/* out->delay.changed is reported for external STFT/OLA consumers of the
- * far-end; the stage consumes no far-end and is left running. */
+/* out->delay.changed is reported for external STFT/OLA consumers of the far-end;
+ * the stage consumes no far-end and keeps running. */
 int four_aec_dfn_res_front_process(FourAecDfnRes *p,
                                    const float *microphones_interleaved,
                                    const float *ref,
@@ -338,9 +336,8 @@ int four_aec_dfn_res_process_begin(FourAecDfnRes *p, const Complex *weights,
     }
     res_gain = se_res_stage_gain(p->res, &f);
     if (!res_gain) return fail(p);
-    /* P = E * min(1, G_res), plus comfort noise on the cut bins. The absent
-     * denoiser reads as the unity vector, so the same four calls as the NR
-     * pipeline serve. */
+    /* P = E * min(1, G_res), plus comfort noise on the cut bins; the absent denoiser
+     * reads as the unity vector. */
     sk_min_f32(p->g_total, p->unity, res_gain, p->n_freqs);
     sk_capply_gain_f32(p->post, f.e, p->g_total, p->n_freqs);
     if (p->cng)
@@ -400,7 +397,7 @@ int four_aec_dfn_res_process_end(FourAecDfnRes *p, float *out) {
         if (dfn_rate_bridge_finish(p->bridge, out) != 0) return fail(p);
         return FOUR_AEC_NR_RES_OK;
     }
-    /* A frame left open or unfetched takes the identity (fail-open). */
+    /* A frame left open or unfetched takes the identity. */
     if (!p->stage_ended) {
         int open = p->job_pending || p->phase == 2;
         if (dfn_res_stage_end(p->stage, open ? -1 : 0, p->stage_output) < 0)
@@ -446,8 +443,8 @@ int four_aec_dfn_res_hop_size(const FourAecDfnRes *p) {
 int four_aec_dfn_res_lookahead_samples(const FourAecDfnRes *p) {
     int hop = four_aec_dfn_res_hop_size(p);
     if (hop <= 0) return -1;
-    /* The core's synthesis WOLA hop, plus the model's two lookahead hops at
-     * 48 kHz or the bridge's added delay on a native grid. */
+    /* Core WOLA hop plus the model's two lookahead hops at 48 kHz, or the bridge's
+     * added delay on a native grid. */
     if (p->bridge) return hop + dfn_rate_bridge_added_delay_samples(p->bridge);
     return hop * (DFN_RES_STAGE_LOOKAHEAD_FRAMES + 1);
 }

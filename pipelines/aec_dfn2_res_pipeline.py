@@ -24,7 +24,7 @@ Usage:
     python -m pipelines.aec_dfn2_res_pipeline --mic mic.wav --ref ref.wav --output out.wav \
         --checkpoint AINR/DeepFilterNet2/output/dfn2_best.pth
 
-Experiment switches (Python only; the C pipeline ships pre_res / full):
+Diagnostic switches (Python only; the C pipeline uses pre_res / full):
     --dfn-estimate-source {pre_res,post_res,mic}
     --dfn-compose {full,mask_only}
 """
@@ -61,7 +61,7 @@ COMPOSE_MODES = ('full', 'mask_only')
 
 
 class MaskOnlyHeads:
-    """Variant (c'): the network's ERB mask with the deep filter disabled."""
+    """The network's ERB mask with the deep filter disabled."""
 
     def __init__(self, inner):
         self.inner = inner
@@ -116,26 +116,16 @@ def run_dfn2_res(aec_contexts: Sequence[AecResContext], config: AecConfig,
                  output_length: Optional[int] = None) -> np.ndarray:
     """Post-RES spectrum, DFN2 cascade and WOLA, frame by frame.
 
-    Per frame the conventional post spectrum with the denoiser off is formed
-    first: ``P = E * G_res`` plus the comfort-noise fill (``cng_aec3``, the
-    bit-exact twin of the C recipe with the denoiser factor at unity).  The
-    DFN2 heads are then applied to P.
-
-    ``estimate_source`` picks the spectrum the DFN2 features are computed
-    from: ``pre_res`` = E (the shipped design), ``post_res`` = P (the naive
-    cascade, A == B), ``mic`` = the windowed capture spectrum
-    ``near_spec = error_spec + echo_spec``.
-
-    ``estimate_spectra`` overrides that selection with one spectrum per AEC
-    context.  The 4-channel evaluator uses this for a raw capture lane or a
-    pre-beam linear lane while retaining the fused post-beam context as the
-    application path.  It never changes S1.
-
-    ``realtime_timing=False`` (offline reference) writes source frame f at
-    sample f*hop, compensating the two-frame model lookahead so the output
-    lines up with the conventional pipeline's.  ``True`` reproduces the C
-    real-time timing: frame f lands at (f + 2)*hop and the first two hops are
-    zero.
+    Per frame: ``P = E * G_res`` plus the comfort-noise fill (``cng_aec3``, the
+    bit-exact twin of the C recipe with the denoiser factor at unity), then the
+    DFN2 heads on P.  ``estimate_source`` selects the spectrum the features come
+    from: ``pre_res`` = E (shipped), ``post_res`` = P, ``mic`` = ``near_spec``
+    (= error_spec + echo_spec).  ``estimate_spectra`` overrides it with one
+    spectrum per AEC context (e.g. a raw capture lane of the 4-channel
+    evaluator) and never changes S1.  ``realtime_timing=False`` (offline)
+    writes source frame f at sample f*hop, compensating the two-frame
+    lookahead; ``True`` reproduces the C timing: frame f lands at (f + 2)*hop
+    and the first two hops are zero.
     """
     if estimate_source not in ESTIMATE_SOURCES:
         raise ValueError(f'estimate_source must be one of {ESTIMATE_SOURCES}')

@@ -6,8 +6,7 @@
 #include <stdint.h>
 #include <string.h>
 
-/* A scalar twin is the reference of its NEON kernel and the whole kernel in a
- * SIMD=0 build; a NEON build keeps it only for the differential test. */
+/* Scalar twin of a NEON kernel; it is the whole kernel in a SIMD=0 build. */
 #define ULCNET_TWIN static inline __attribute__((unused))
 
 struct UlcnetModelIoState {
@@ -20,8 +19,7 @@ struct UlcnetModelIoState {
     float *logit_history;
     float *h_gru;
 
-    /* The four graph feature tensors prepare() computes, and the compressed
-     * error spectrum it keeps for commit(). */
+    /* Feature tensors computed by prepare(), and the compressed error spectrum kept for commit(). */
     float *error_mag;
     float *far_mag;
     float *error_cos;
@@ -301,12 +299,9 @@ uint32_t ulcnet_model_io_state_generation(const UlcnetModelIoState *state) {
     return state ? state->state_generation : 0u;
 }
 
-/* The fixed front end: signed-power compression, magnitudes and the
- * compressed-domain phase direction, all in fp32 on the host. cos/sin of
- * atan2(c_im, c_re) are the normalized direction: hypotf avoids underflow for
- * tiny components, and the zero-vector case follows atan2(0,0) == 0 (cos 1,
- * sin 0), matching the torch reference in export_onnx.stream_features to fp32
- * rounding. */
+/* Front end: signed-power compression, magnitudes and compressed-domain phase
+ * direction (cos/sin of atan2). hypotf avoids underflow; a zero vector gives
+ * cos 1, sin 0. Python reference: export_onnx.stream_features. */
 ULCNET_TWIN void front_end_scalar(UlcnetModelIoState *state,
                                   const float *error_re, const float *error_im,
                                   const float *far_re, const float *far_im) {
@@ -332,12 +327,8 @@ ULCNET_TWIN void front_end_scalar(UlcnetModelIoState *state,
 }
 
 #if SK_HAVE_NEON
-/* The same front end in two passes. The libm calls run per bin and leave
- * their results in planes that the frame owns anyway (the compressed error in
- * error_ri, the compressed far spectrum in the not yet filled output planes,
- * the norm in error_cos); the square roots, divides and the direction are
- * then taken four bins at a time. Each lane performs the scalar twin's
- * operations in its order, with the correctly rounded vsqrtq/vdivq. */
+/* Two-pass front end: libm calls run per bin into planes the frame owns, then
+ * sqrt, divide and direction run four bins at a time. */
 static inline void front_end_tail_one(UlcnetModelIoState *state, int bin) {
     const float c_re = state->error_ri[2 * bin];
     const float c_im = state->error_ri[2 * bin + 1];
@@ -447,13 +438,9 @@ int ulcnet_model_io_prepare(UlcnetModelIoState *state,
     return 0;
 }
 
-/* The finite predicate over the tensors one frame wrote.  The graph writes a
- * whole window back, but only the frame it just produced is new -- key/value
- * slot 0 of every channel (newest first) and the last logit frame (oldest
- * first); the older frames were checked when they were new, and a non-finite
- * value left in any of them reaches `output` on the next frame, where this
- * same check refuses it.  The window geometry follows from the element counts
- * and the compiled grid. */
+/* Finite check over the tensors one frame wrote: key/value slot 0 of every
+ * channel and the last logit frame. Older frames were checked when new, and a
+ * non-finite value in them reaches `output` on the next frame. */
 static int frame_is_finite(const UlcnetModelIoState *state) {
     const size_t channels = ULCNET_MODEL_IO_TA_CHANNELS;
     const size_t key_stride = state->key_history_elements / channels;
@@ -471,10 +458,9 @@ static int frame_is_finite(const UlcnetModelIoState *state) {
                            logit_stride, depth);
 }
 
-/* The fixed back end: the compressed error prepare() kept times the graph's
- * planar complex mask (plane 0 real, plane 1 imaginary), then the inverse
- * signed power. Products stay unfused (the build keeps -ffp-contract=off),
- * matching export_onnx.apply_mask_ri. */
+/* Back end: compressed error times the planar complex mask, then inverse
+ * signed power. Products stay unfused (-ffp-contract=off).
+ * Python reference: export_onnx.apply_mask_ri. */
 ULCNET_TWIN void back_end_scalar(const UlcnetModelIoState *state,
                                  float *enhanced_re, float *enhanced_im) {
     const float inverse_exponent = 1.0f / ULCNET_MODEL_IO_COMPRESSION_EXP;
@@ -493,8 +479,7 @@ ULCNET_TWIN void back_end_scalar(const UlcnetModelIoState *state,
 }
 
 #if SK_HAVE_NEON
-/* The complex products four bins at a time into the caller's planes, then the
- * libm pass over them in place; the same operations as the scalar twin. */
+/* Complex products four bins at a time, then the libm pass in place. */
 static inline void back_end_neon(const UlcnetModelIoState *state,
                                  float *enhanced_re, float *enhanced_im) {
     const float inverse_exponent = 1.0f / ULCNET_MODEL_IO_COMPRESSION_EXP;
@@ -544,8 +529,7 @@ int ulcnet_model_io_commit(UlcnetModelIoState *state,
     if (!state || !state->prepared || !enhanced_re || !enhanced_im) {
         return -1;
     }
-    /* Every state tensor was written in place, so a bad frame cannot leave
-     * them as they were: refuse it and restart the recurrent state cold. */
+    /* State was written in place, so a bad frame cannot be rolled back: restart the recurrent state. */
     if (!frame_is_finite(state)) {
         clear_recurrent_state(state);
         state->prepared = 0;

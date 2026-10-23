@@ -54,40 +54,36 @@ from training_common import (  # noqa: E402
 
 
 # MODEL_VERSION names the trained graph. It is the only check that rejects a
-# checkpoint trained for a different one: several of the differences listed
-# here change no parameter count, so neither load_state_dict nor a parameter
-# count can see them.
-#   - ERB filterbank: the exact triangular construction from this project's
-#     own aaronhsueh0506/DeepFilterNet-Keras bandERB.ipynb (ERBBand()/
-#     ERB_pro_matrix()), same as RNNoise-ERB's train.py (ERB rate constants
+# checkpoint trained for a different one: several differences below change no
+# parameter count, so neither load_state_dict nor a parameter count can see them.
+#   - ERB filterbank: the exact triangular construction from
+#     aaronhsueh0506/DeepFilterNet-Keras bandERB.ipynb (ERBBand()/
+#     ERB_pro_matrix()), as in RNNoise-ERB's train.py (ERB rate constants
 #     9.265/24.7, strict minimum band width, doubled forward edge columns).
-#     erb_fb/erb_inv are registered buffers (part of state_dict), so a
-#     checkpoint carries the filterbank values and load_state_dict would
-#     restore them silently.
+#     erb_fb/erb_inv are registered buffers, so a checkpoint carries (and
+#     load_state_dict silently restores) the filterbank values.
 #   - Architecture as released DeepFilterNet3 (minus lsnr): ReLU,
-#     GroupedLinearEinsum, the GRU layers in the ERB decoder, the encoder
-#     flattening frequency-major (B,T,F,C) as upstream does (which changes
-#     which elements GroupedLinearEinsum groups together), and the ERB decoder
-#     taking encoder skips through 1x1 pathway convs that are ADDED.
-#     Concatenating instead totals the same 14,210 conv parameters: identical
-#     numbers, different functions.
-#   - Output composition of DFN2: ERB mask over every bin, DF on the masked
-#     low-frequency spectrum, then the learned sigmoid alpha blend against
-#     that masked residual.
+#     GroupedLinearEinsum, GRU layers in the ERB decoder, an encoder flattening
+#     frequency-major (B,T,F,C) as upstream does (which changes which elements
+#     GroupedLinearEinsum groups), and the ERB decoder taking encoder skips
+#     through 1x1 pathway convs that are ADDED (concatenating would total the
+#     same 14,210 conv parameters with a different function).
+#   - Output composition: ERB mask over every bin, DF on the masked
+#     low-frequency spectrum, then the learned sigmoid alpha blend against that
+#     masked residual.
 #
-# ⚠ lookahead is 1/1 and the ERB filterbank is triangular/overlapping/sum.
-# Both are operator decisions, NOT oversights -- see config.ini [model] and
-# UPSTREAM_ALIGNMENT.md.  Everything else in the port is aligned to upstream.
+# ⚠ lookahead is 1/1 and the ERB filterbank is triangular/overlapping/sum: both
+# are operator decisions, NOT oversights (see config.ini [model] and
+# UPSTREAM_ALIGNMENT.md); everything else is aligned to upstream.
 #
 # FEATURE_VERSION names the feature path:
-#   1. The normaliser inits are libDF's literal MEAN_NORM_INIT (-60/-90 dB)
-#      and UNIT_NORM_INIT (0.001/0.0001).  A corpus-fitted pair diverged in
-#      training; see calibrate_norm_init.py and config.ini [feature].
-#   2. There is no spec_norm_eps.  libDF divides by a bare sqrt(state); see
-#      config.ini [feature] for the measurement showing removal is safe in
-#      fp32 and for the one case where it is not.
-#   3. The analysis spectrum carries libDF's wnorm (see analysis_scale), so
-#      the normalisers see the scale their constants were calibrated against.
+#   1. The normaliser inits are libDF's literal MEAN_NORM_INIT (-60/-90 dB) and
+#      UNIT_NORM_INIT (0.001/0.0001); a corpus-fitted pair diverged in training
+#      (see calibrate_norm_init.py and config.ini [feature]).
+#   2. There is no spec_norm_eps: libDF divides by a bare sqrt(state) (see
+#      config.ini [feature] for when that is safe in fp32).
+#   3. The analysis spectrum carries libDF's wnorm (see analysis_scale), so the
+#      normalisers see the scale their constants were calibrated against.
 MODEL_VERSION = 'dfn2_fmajor_pathway_cascade_alpha_no_lsnr_v6'
 FEATURE_VERSION = 'dfn2_libdf_wnorm_upstream_init_no_eps_v5'
 LOSS_VERSION = 'dfn_mrsl_mag_complex_gamma_v2'
@@ -99,16 +95,13 @@ LOSS_VERSION = 'dfn_mrsl_mag_complex_gamma_v2'
 
 #: The clamp inside _SafeAngle.backward.  Same value upstream (df/utils.py:74).
 SAFE_ANGLE_CLAMP = 1e-10
-#: Gradient gain of _SafeAngle is |x| / max(|x|^2, SAFE_ANGLE_CLAMP).  It peaks
-#: at |x| = sqrt(clamp) with value 1/sqrt(clamp) -- so the worst case is 1e5, NOT
-#: 1/clamp = 1e10, and at x = 0 exactly the gain falls to ZERO.  Measured against
-#: autograd at 12 magnitudes; see tests/test_dfn2_contract.py.
-#:
-#: ⚠ The consequence for diagnosis: an exactly-silent target is NOT itself the
-#: hazard.  The hazard is a PREDICTION whose STFT magnitude sits near 1e-5, and a
-#: silent target matters only because it drives |y| down THROUGH that band.  With
-#: gamma=0.3 a zero target compresses to clamp_min(1e-12)**0.3 = 2.51e-4, so the
-#: prediction is pulled toward 2.51e-4, not toward zero.
+#: Gradient gain of _SafeAngle is |x| / max(|x|^2, SAFE_ANGLE_CLAMP). It peaks at
+#: |x| = sqrt(clamp) with value 1/sqrt(clamp), so the worst case is 1e5, NOT
+#: 1/clamp = 1e10, and at x = 0 exactly the gain is ZERO (see
+#: tests/test_dfn2_contract.py). ⚠ An exactly-silent target is not itself the
+#: hazard; a PREDICTION whose STFT magnitude sits near 1e-5 is, and a silent
+#: target matters only because it drives |y| down through that band (with
+#: gamma=0.3 it pulls the prediction toward clamp_min(1e-12)**0.3 = 2.51e-4).
 SAFE_ANGLE_WORST_MAG = SAFE_ANGLE_CLAMP ** 0.5          # 1e-5; peak gain is 1/this
 
 
@@ -237,17 +230,14 @@ _MODEL_KWARG_ALIASES = {'enc_channels': 'enc_ch'}
 
 
 def read_model_config(cfg):
-    """Every DeepFilterNet2 constructor argument, defaults overlaid with [model].
+    """Every DeepFilterNet2 constructor argument, defaults overlaid with
+    [model].
 
     Defaults come from ``DeepFilterNet2.__init__``'s own signature rather than
-    from a ``fallback=`` on each read, so train.py and inference.py cannot
-    disagree on a default.  A disagreement builds a differently-shaped model,
-    which surfaces only as a load_state_dict failure at inference time, long
-    after the training run.
-
-    Unknown ``[model]`` keys raise rather than being silently ignored, and the
-    parsed type follows the signature default, so a new constructor argument
-    becomes configurable without touching this function.
+    a ``fallback=`` per read, so train.py and inference.py cannot build
+    differently-shaped models. Unknown ``[model]`` keys raise, and the parsed
+    type follows the signature default, so a new constructor argument becomes
+    configurable without touching this function.
     """
     kwargs = {
         name: param.default
@@ -306,21 +296,16 @@ def validate_signal_config(n_fft, win_len, hop_len, n_erb, df_bins, df_order,
 
 
 def analysis_scale(n_fft, win_len, hop_len):
-    """Factor that turns a ``normalized=True`` STFT into libDF's analysis scale.
+    """Factor that turns a ``normalized=True`` STFT into libDF's analysis
+    scale.
 
-    libDF multiplies its analysis spectrum by
-    ``wnorm = 1 / (window_size^2 / (2 * frame_size))`` = ``2*hop / win^2``
-    (lib.rs:133, applied at :390-392), and EVERYTHING calibrated against that
-    spectrum -- compute_band_corr, the +1e-10 floor, MEAN_NORM_INIT,
-    UNIT_NORM_INIT -- assumes it.  ``torch.stft(normalized=True)`` instead applies
-    ``1/sqrt(n_fft)``, so this returns the residual ``wnorm * sqrt(n_fft)``
-    (= 1/32 at 1024/1024/512, i.e. libDF's own 1/1024 in total).
-
-    ⚠ It is not cosmetic on the DF path.  ``band_unit_norm`` is
-    ``x / sqrt(EMA|x|)``, so scaling x by c scales its OUTPUT by sqrt(c) -- a
-    permanent factor, not a transient.  Left unapplied, feat_spec entered the DF
-    branch at sqrt(32) = 5.66x upstream's regime forever while feat_erb entered at
-    upstream's, mis-scaling the two encoder branches relative to each other.
+    libDF multiplies its analysis spectrum by ``wnorm = 2*hop / win^2``
+    (lib.rs:133, applied at :390-392) and everything calibrated against it
+    (compute_band_corr, the +1e-10 floor, MEAN_NORM_INIT, UNIT_NORM_INIT)
+    assumes it; ``torch.stft(normalized=True)`` applies ``1/sqrt(n_fft)``, so
+    this returns the residual ``wnorm * sqrt(n_fft)`` (= 1/32 at
+    1024/1024/512). ⚠ Not cosmetic on the DF path: ``band_unit_norm`` is ``x /
+    sqrt(EMA|x|)``, so scaling x by c scales its output by sqrt(c) permanently.
     """
     return (2.0 * hop_len / (win_len ** 2)) * math.sqrt(n_fft)
 
@@ -328,19 +313,11 @@ def analysis_scale(n_fft, win_len, hop_len):
 def erb_band_db(spec_BTC, erb_fb, analysis_scale):
     """Band energies in dB, exactly as the model is fed them.
 
-    ⚠ SHARED with calibrate_norm_init.py on purpose.  A hand-copied version can
+    ⚠ SHARED with calibrate_norm_init.py on purpose: a hand-copied version can
     drift (the log floor, the power expression) and silently bias the init
-    values the calibrator recommends.  One definition makes that
-    unrepresentable rather than merely tested.
-
-    ``analysis_scale`` is applied to the POWER as s**2 rather than to the spectrum
-    as s: identical result (s is an exact power of two at every supported grid, so
-    the exponent shift is lossless -- verified bit-equal by torch.equal), but it
-    touches (B, T, n_erb) floats instead of (B, T, n_bins) complex.
-
-    The +1e-10 floor is upstream's literal (lib.rs:209).  ⚠ It is not
-    re-derived for this port's band scale; see config.ini [feature] for the
-    measurement and for why raising it is the wrong repair.
+    values the calibrator recommends. The +1e-10 floor is upstream's literal
+    (lib.rs:209), not re-derived for this port's band scale (see config.ini
+    [feature]).
     """
     power = spec_BTC.real.square() + spec_BTC.imag.square()
     band = power.matmul(erb_fb.T) * (analysis_scale * analysis_scale)
@@ -453,14 +430,12 @@ def make_checkpoint_contract(
 
 
 #: Contract keys that record how the weights were TRAINED but must not constrain
-#: how a trained checkpoint may be RENDERED.  The loss configuration cannot affect
-#: inference at all.  The post-filter is an output-shaping choice the operator is
-#: entitled to change on an existing checkpoint -- ⚠ it IS recorded, because DFN3's
-#: form is ungated and therefore does change the training objective, and it IS
-#: still enforced when resuming training; it is only waived on the inference path.
-#: Without this, flipping `mask_pf = true` to try the post-filter would make
-#: inference.py refuse to load the checkpoint, i.e. the knob could not be
-#: exercised at all.
+#: how a trained checkpoint may be RENDERED. The loss configuration cannot
+#: affect inference. The post-filter is an output-shaping choice the operator
+#: may change on an existing checkpoint: ⚠ it IS recorded (DFN3's form is
+#: ungated and does change the training objective) and IS enforced when resuming
+#: training, but is waived on the inference path, else flipping `mask_pf = true`
+#: would make inference.py refuse the checkpoint.
 RENDER_ONLY_CONTRACT_KEYS = ('mask_pf', 'pf_beta')
 
 
@@ -517,17 +492,15 @@ def causal_ema_db_norm(
     scale_db=40.0,
 ):
     """
-    DeepFilterNet band_mean_norm_erb: per-band causal EMA of dB, subtract running mean, /40.
-    State init = linspace(mean_norm_init) across bands (NOT first-frame).
+    DeepFilterNet band_mean_norm_erb: per-band causal EMA of dB, subtract
+    running mean, /40. State init = linspace(mean_norm_init) across bands (NOT
+    first-frame).
 
-    ⚠ The init IS libDF's MEAN_NORM_INIT = -60..-90 dB, used deliberately.
-    It is NOT calibrated for this port: the triangular / overlapping / energy-SUM
-    bank plus normalized=True puts measured band levels ~+39 dB higher than
-    libDF's (composite +32.8..+48.4 dB per band), and the fitted values for this
-    corpus are -17.35/-57.81, but training diverged under them and converges
-    under libDF's.  config.ini [feature]
-    carries the full reasoning and the suspected mechanism (the +1e-10 log floor,
-    which these values keep at upstream's -1.00 bound by coincidence).
+    ⚠ The init IS libDF's MEAN_NORM_INIT = -60..-90 dB, used deliberately and NOT
+    calibrated for this port: the triangular / overlapping / energy-SUM bank plus
+    normalized=True puts band levels ~+39 dB above libDF's, and the corpus-fitted
+    values (-17.35/-57.81) diverged in training where libDF's converge (reasoning
+    in config.ini [feature]).
     erb_db    : (B, T, n_erb)
     Returns:
         normed   : (B, T, n_erb)
@@ -865,15 +838,11 @@ def train(args):
             ckpt_amsgrad = ckpt['optimizer']['param_groups'][0].get('amsgrad')
             optimizer.load_state_dict(ckpt['optimizer'])
             # ⚠ load_state_dict restores param_group HYPERPARAMETERS too, so a
-            # checkpoint written before amsgrad was turned on silently reverts it
-            # to False -- verified on torch 2.8: the flag flips back, no
-            # max_exp_avg_sq is ever allocated, and nothing warns.
-            #
-            # ⚠ Do NOT paper over that by force-enabling amsgrad here.  Flipping
-            # the optimizer mid-run destroys the one thing a diagnostic resume is
-            # for: it removes the very variable under test, so a run that then
-            # survives tells you nothing about whether the batch or the optimizer
-            # was to blame.  Make the fork explicit instead.
+            # checkpoint written before amsgrad was turned on silently reverts
+            # it to False (no max_exp_avg_sq is ever allocated, nothing warns).
+            # ⚠ Do NOT force-enable amsgrad here: flipping the optimizer
+            # mid-run removes the very variable a diagnostic resume tests. Make
+            # the fork explicit instead.
             if ckpt_amsgrad is False and amsgrad:
                 print()
                 print('  ' + '-' * 64)
@@ -961,25 +930,19 @@ def train(args):
                                  non_blocking=pin_memory)
                 T = noisy.shape[-1]
 
-                # ⚠ center / pad_mode are left at torch's defaults (center=True,
-                # pad_mode='reflect'), which is NOT libDF's analysis.  libDF
-                # zero-primes analysis_mem (lib.rs:118-119) and its offline
-                # front-end DROPS the primed frames (transforms.rs:162,187), so
-                # its frame 0 begins in silence where ours begins in a
-                # time-reversed copy of the clip -- and that lands inside the
-                # init-dominated EMA transient the norm-init was calibrated for
-                # (3*tau = 273 frames vs 281 frames per 3 s segment).  In steady
-                # state center=True is only a fixed half-window frame-timing
-                # offset that a streaming implementation reproduces exactly, and
-                # train/inference here are mutually consistent (inference.py uses
-                # the same defaults), so this is a documented offset, not a
-                # latency bug.
-                # ⚠ MEASURED: center=False is NOT a one-line alignment.  At
-                # win=1024 / hop=512 torch.istft REFUSES it outright --
-                # "window overlap add min: 1" -- because the first and last
-                # frames lack OLA coverage.  Aligning means replicating libDF's
-                # framing (zero-prime analysis_mem, then DROP the primed frames),
-                # not flipping a flag.
+                # ⚠ center / pad_mode are left at torch's defaults
+                # (center=True, pad_mode='reflect'), which is NOT libDF's
+                # analysis: libDF zero-primes analysis_mem (lib.rs:118-119) and
+                # its offline front-end DROPS the primed frames
+                # (transforms.rs:162,187), so its frame 0 begins in silence
+                # where ours begins in a reversed copy of the clip, inside the
+                # init-dominated EMA transient the norm-init was calibrated
+                # for. In steady state it is a fixed half-window offset that
+                # streaming reproduces exactly, and train/inference share the
+                # defaults. center=False is not a one-line alignment:
+                # torch.istft REFUSES it at win=1024 / hop=512 (first/last
+                # frames lack OLA coverage); aligning means replicating libDF's
+                # framing.
                 spec_c = torch.stft(
                     noisy, N_FFT, HOP_LEN, WIN_LEN,
                     window=stft_window, return_complex=True, normalized=True,

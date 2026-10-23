@@ -51,12 +51,11 @@ def validate_nctf_no_temporal_padding(graph, require_static=False):
 
     Seeing an 8-element ``pads`` tensor therefore does not mean "pad by 8".
     This check requires ``T_begin == T_end == 0`` while allowing frequency
-    padding.  It also checks padding fused into Conv/ConvTranspose attributes.
-    The exporters call it after their normal constant-folding pass.  With
-    ``require_static=True`` a Pad whose values are still dynamic is rejected;
-    ordinary non-``--verify`` exports keep working without onnxruntime's
-    optional folding pass, while every statically visible pad is still
-    checked.
+    padding. It also checks padding fused into Conv/ConvTranspose attributes.
+    With ``require_static=True`` a Pad whose values are still dynamic is
+    rejected; ordinary non-``--verify`` exports keep working without
+    onnxruntime's optional folding pass, while every statically visible pad is
+    still checked.
     """
     constants = _constant_arrays(graph)
     checked = 0

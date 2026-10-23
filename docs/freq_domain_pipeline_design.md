@@ -74,8 +74,7 @@ It supports both a heap convenience constructor and a caller-owned,
 CLI executables are reference wrappers around this implementation.
 
 Low-level details, backend/release rules, memory sizing, presets, and tests are
-maintained in [`../pipelines/README.md`](../pipelines/README.md). Superseded
-pre-implementation proposals are retained in Git history.
+maintained in [`../pipelines/README.md`](../pipelines/README.md).
 
 ## Stage chain
 

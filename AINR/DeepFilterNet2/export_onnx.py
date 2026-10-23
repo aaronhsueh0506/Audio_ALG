@@ -492,21 +492,14 @@ def initial_inputs(model, batch_size=1):
 def gru_state_slice_report(combined, stats, slices):
     """What the single shared PTQ scale of ``h_gru`` costs each GRU.
 
-    ``combined`` is the captured
-    ``(frames, graph_batch, layers, gru_batch, hidden)`` array,
-    ``stats`` produces one per-tensor range dict and ``slices`` comes from
-    ``gru_state_slices``, so the per-slice entries have the same shape as
-    those the calibration report publishes for every other input.
-
-    The bits figure is named for the policy it assumes. A symmetric max-abs
-    int8 scale is set by the widest slice, so a narrower one keeps only
-    127 * own/shared levels and gives up log2(shared/own) of resolution. Under
-    a percentile-clipped policy -- which the same report anticipates by
-    publishing p001/p999 -- the number does not apply, hence the name rather
-    than a bare `bits_lost`.
-
-    Lives here beside the layout it describes so a test can reach it without a
-    checkpoint and a wav directory.
+    ``combined`` is the captured ``(frames, graph_batch, layers, gru_batch,
+    hidden)`` array, ``stats`` produces one per-tensor range dict and
+    ``slices`` comes from ``gru_state_slices``, so the per-slice entries match
+    those the calibration report publishes for every other input. The bits
+    figure assumes a symmetric max-abs int8 scale: the widest slice sets it, so
+    a narrower one keeps 127 * own/shared levels and gives up log2(shared/own)
+    of resolution (it does not apply to a percentile-clipped policy, hence the
+    name rather than a bare `bits_lost`).
     """
     per_layer = {}
     for name, start, stop in slices:

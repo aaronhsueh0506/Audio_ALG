@@ -1,25 +1,4 @@
-/**
- * 4aec_nr_res.c — implementation of 4aec_nr_res.h.
- *
- * Four-channel front end of pipelines/mono_aec_nr_res/audio_pipeline.c:
- *
- *   one shared DelayAec -> one aligned render
- *   -> four independent linear AEC filters (four_aec_front_process)
- *   -> externally supplied effective beamformer weights
- *   -> the coherent projection of the four lane contexts (four_aec_fuse)
- *
- * The residual-echo, noise-reduction, comfort-noise and synthesis stages are
- * not here: the application carves them and chains them over the frame the
- * fuse returns (pipelines/common/se_stage.h).
- *
- * Same pool-first layout and lifecycle as AudioPipeline:
- *
- *   four_aec_nr_res_get_mem_requirements() + four_aec_nr_res_init_ex()
- *       caller-owned pool; zero heap from init through destroy
- *
- *   four_aec_nr_res_create()
- *       heap convenience wrapper over that same pool-first implementation
- */
+/** Implementation of 4aec_nr_res.h: one shared DelayAec -> one aligned render -> four independent linear AEC filters -> externally supplied beamformer weights -> coherent projection of the four lane contexts (four_aec_fuse). The application chains the RES, NR, comfort-noise and synthesis stages over the fused frame. Pool-first layout as AudioPipeline; create() is the heap convenience. */
 
 #include <stdlib.h>
 #include <string.h>
@@ -36,48 +15,12 @@
 #include "common/se_config.h"     /* se_derive(): grid + AecConfig, shared by every application */
 #include "common/se_anr_stage.h"  /* se_anr_compose_config()                                     */
 
-/* Matched-filter duty cycle. The hold WINDOW is not a literal here: it is
- * read from the lane AecConfig this file already builds at init --
- * delay_est_init_s, the same field lib/aec reads for its own machine -- so
- * the shared estimator holds for exactly as long as a lane's own estimator
- * would. The period window, delay_est_period_s, is NOT read through from
- * that same AecConfig (see derive_dims_and_configs()): it is this core's
- * cfg.delay_est_period_s instead, this wrapper's own opt-in contract rather
- * than a silent mirror of whatever lib/aec currently defaults to -- the two
- * used to be the same field by construction, and that is exactly what broke
- * once lib/aec's own default moved out from under this file's unrelated
- * floor. Hold the analysis
- * at full rate until the estimate has been solid and unchanged for
- * delay_est_init_s, then analyse one hop in
- * K = round(delay_est_period_s/hop_s)/DUTY_PERIOD_DIVISOR.
- *
- * The divisor and the hold floor of one hop stay literals for the same
- * reason they are literals in lib/aec: they are the SHAPE of the schedule,
- * not a tuning surface, and neither library exposes them. The period floor
- * is 1, not 2 -- a floor of 2 ("decimated always means something") would
- * silently re-cap this core's own delay_est_period_s=0.0 default at 50%
- * engagement, the bug lib/aec has already fixed in its own floor. The
- * watchdog's collapse figure stays a literal too: it is a depth in dB and
- * carries no clock.
- *
- * The watchdog's LEAK does carry one, and is the only number here that is not
- * used as written. It is lib/aec's literal, and lib/aec calibrated it on the
- * 10 ms hop its config defaults to: 0.001 dB
- * per hop there means 0.1 dB per SECOND, i.e. 60 s to leak the whole
- * DUTY_ERLE_COLLAPSE_DB threshold. Applied as a per-hop literal it would be
- * 0.125 dB/s on this pipeline's 8 ms grid and 0.0625 dB/s on its 16 ms one --
- * the watchdog would disengage the schedule on a merely quiet stretch at one
- * grid and sit on a stale peak at the other. duty_leak_db_for_grid() converts
- * it once at init, beside the two windows and for the same reason, by the
- * rule an ADDITIVE per-hop amount takes: it scales LINEARLY with the hop
- * period, where a retention would take a power law -- N hops of a leak sum to
- * N*leak, they do not compound. */
+/* Matched-filter duty cycle: full-rate analysis until the estimate has been solid and unchanged for delay_est_init_s (lane AecConfig), then one hop in K = round(delay_est_period_s / hop_s) / DUTY_PERIOD_DIVISOR (cfg.delay_est_period_s). Divisor and hold floor are the schedule's shape; the period floor is 1, so 0.0 means true full rate. The watchdog leak is lib/aec's 0.1 dB per second, converted to this grid's hop by duty_leak_db_for_grid(). */
 #define DUTY_PERIOD_DIVISOR       5
-#define DUTY_ERLE_LEAK_DB         0.001f   /* per hop AT DUTY_LEAK_REF_HOP_S */
+#define DUTY_ERLE_LEAK_DB         0.001f   /* per hop at DUTY_LEAK_REF_HOP_S */
 #define DUTY_LEAK_REF_HOP_S       0.010f
 #define DUTY_ERLE_COLLAPSE_DB     6.0f
 
-/* Same compile-time backend identity used by audio_pipeline.c. */
 #ifndef AUDIO_PIPELINE_BACKEND_STR
 #define AUDIO_PIPELINE_BACKEND_STR "unknown"
 #endif
@@ -88,36 +31,18 @@ static uint32_t four_aec_nr_res_backend_id(void) {
     return 0u;
 }
 
-/* Per-stage timing is diagnostic and costs nine clock_gettime() calls per hop
- * here, on top of the five each of the four lanes makes inside lib/aec -- 29
- * in all. DEFAULT OFF for the same reason lib/aec's is: a diagnostic that has
- * to be switched off is one that ships on by accident.
- *
- * The two flags are separate because the two builds are: this one governs the
- * wrapper's own stages, AEC_STAGE_TIMING governs what the lanes report back.
- * Setting only this one leaves frontend/linear/lane_res reading 0 while the
- * wrapper's own stages measure, which is a legible state, not a broken one.
- * `make PROFILE=1` sets both, and is what a profile build should use. */
+/* Per-stage timing is diagnostic and off by default. This flag governs the wrapper's
+ * own stages; AEC_STAGE_TIMING governs what the lanes report. `make PROFILE=1` sets
+ * both. */
 #ifndef FOUR_AEC_NR_RES_STAGE_TIMING
 #define FOUR_AEC_NR_RES_STAGE_TIMING 0
 #endif
 
 #if FOUR_AEC_NR_RES_STAGE_TIMING
-/* Microsecond monotonic stamp for the per-stage diagnostic timing. Truncated
- * to 32 bits: every consumer subtracts two stamps in UNSIGNED arithmetic, so
- * the difference is exact for any interval shorter than the ~71.6 minute wrap
- * -- which no hop approaches. *
- * CLOCK_MONOTONIC is POSIX, not C99. A target with a reduced libc enables the
- * timing with -DFOUR_AEC_NR_RES_STAGE_TIMING=1 -DFOUR_AEC_NR_RES_NOW_US=board_timer_us, naming a function that takes
- * no argument and returns uint32_t microseconds -- a plain identifier, because
- * these Makefiles reject parentheses in EXTRA_CFLAGS, and its declaration is
- * the integrator's to supply. The default below is then neither compiled nor
- * linked and <time.h> is not included.
- *
- * Each component carries its own override rather than sharing one: lib/aec has
- * AEC_NOW_US and the other pipeline has its own, so a chain built for such a
- * target names a timer per component it actually builds.
- */
+/* Microsecond monotonic stamp, truncated to 32 bits (consumers subtract in unsigned
+ * arithmetic). A target without POSIX CLOCK_MONOTONIC names a no-argument function
+ * returning uint32_t microseconds with -DFOUR_AEC_NR_RES_NOW_US=<fn> (a plain
+ * identifier); lib/aec has its own AEC_NOW_US. */
 #ifndef FOUR_AEC_NR_RES_NOW_US
 #include <time.h>
 static uint32_t four_aec_nr_res_now_us(void) {
@@ -130,21 +55,12 @@ static uint32_t four_aec_nr_res_now_us(void) {
 static uint32_t four_aec_nr_res_now_us(void) { return FOUR_AEC_NR_RES_NOW_US(); }
 #endif
 #else
-/* Every stamp folds to a constant, so the subtractions fold to zero and no
- * clock is read. */
 #define four_aec_nr_res_now_us() 0u
 #endif
 
-/* ============================================================================
- * Instance
- * ========================================================================== */
-
 typedef struct FourAecLaneSnapshot {
-    /* Borrowed (not owned) views into a lane's own AecResContext buffers --
-     * see bind_lane_view()'s doc comment for the lifetime contract. Kept
-     * const to match AecResContext's own field types and because nothing in
-     * this file ever writes through these pointers, only through the
-     * pointer fields themselves (i.e. re-binding to a new hop's buffers). */
+    /* Borrowed views into a lane's AecResContext buffers (lifetime: see
+     * bind_lane_view()); const, as nothing here writes through them. */
     const Complex* error_spec;
     const Complex* echo_spec;
     const Complex* far_spec;
@@ -180,19 +96,17 @@ struct FourAecNrRes {
     int delay_ring_size;
     uint64_t delay_samples_seen;
     int accepted_delay;
-    /* Backward-jump quarantine (cfg.delay_backward_quarantine_*), mirroring
-     * lib/aec's own pair: _left is the hops still to spend before a held
-     * EARLIER estimate is adopted anyway (-1 = DISARMED, the only state that
-     * may re-arm; 0 = armed and EXPIRED, i.e. this hop adopts), _hops is the
-     * window converted once at init. */
+    /* Backward-jump quarantine (cfg.delay_backward_quarantine_*): _left is the hops
+     * remaining before a held earlier estimate is adopted anyway (-1 = disarmed, the only
+     * state that may re-arm; 0 = armed and expired), _hops is the window converted once at
+     * init. */
     int delay_quarantine_left;
     int delay_quarantine_hops;
-    /* Two-step admission for a shared-delay CHANGE: the movement seen once
-     * and held for confirmation, plus its remaining life in hops (see
-     * 4aec_nr_res_internal.h). Cleared by acceptance, by expiry, by reset(). */
+    /* Two-step admission for a shared-delay change: the movement held for confirmation and
+     * its remaining life in hops (4aec_nr_res_internal.h). Cleared by acceptance, expiry
+     * and reset(). */
     FourAecDelayAdmission delay_admission;
-    /* Cumulative aec_apply_external_realign() outcomes across the four lanes,
-     * split warm (returned 1, learned IR shifted) vs soft (returned 0). */
+    /* Cumulative realign outcomes across the lanes: warm (returned 1, IR shifted) vs soft (returned 0, filter-only reset). */
     long realign_warm_lanes;
     long realign_soft_lanes;
     uint64_t delay_calls;
@@ -211,60 +125,21 @@ struct FourAecNrRes {
     size_t pool_size;
     int destroyed;
 
-    /* Per-stage wall-clock timing -- see FourAecNrResLastTiming's doc comment
-     * (4aec_nr_res.h) for what each field measures. Stored as the published
-     * record itself rather than eight private twins, so the accessor is one
-     * assignment and a new stage cannot be added to one side only. Appended
-     * at the end, the same precedent as aec.h's Aec additions: every field
-     * above keeps its offset. */
     FourAecNrResLastTiming last_timing;
 
-    /* This hop's answer to "did all four lanes consume ONE far spectrum",
-     * established from the lanes' own far-FFT counters in
-     * four_aec_front_process() and consumed by fuse_contexts() through
-     * four_aec_nr_res_far_spec_agrees(). 0 (the value every bail-out path
-     * leaves behind) means "not established", which costs the full per-bin
-     * comparison rather than skipping it. */
+    /* This hop's answer to "did all four lanes consume one far spectrum", established from
+     * the lanes' far-FFT counters in four_aec_front_process() and used by fuse_contexts()
+     * via four_aec_nr_res_far_spec_agrees(). 0 (also after any bail-out) means not
+     * established, which costs the full per-bin comparison. */
     int far_spec_shared_hop;
 
-    /* This hop's answer to "did the lane loop just route a MIXED warm/soft
-     * realign outcome", established in four_aec_front_process() from the
-     * per-hop realign outcome counts (not the cumulative realign_warm_lanes/
-     * realign_soft_lanes totals above, which never reset) and consumed by
-     * fuse_contexts() to bypass four_aec_nr_res_far_spec_agrees() on exactly
-     * this hop. A mixed hop legitimately makes the lanes' far_spec diverge
-     * (see four_aec_front_process()'s per-lane loop comment), so the normal
-     * agreement gate would otherwise reject the frame and force a full
-     * four_aec_nr_res_reset() over something routine. 0 (every bail-out
-     * path's value, same precedent as far_spec_shared_hop above) means "not
-     * a mixed hop", i.e. the normal gate still applies. */
+    /* This hop's answer to "did the lane loop route a mixed warm/soft realign outcome",
+     * set in four_aec_front_process() from the per-hop outcome counts. fuse_contexts()
+     * bypasses four_aec_nr_res_far_spec_agrees() on that hop, since the lanes' far_spec
+     * legitimately diverge. 0 means the normal gate applies. */
     int far_spec_mixed_hop;
 
-    /* Matched-filter duty cycle, the shared estimator's counterpart of
-     * lib/aec's own always-on machine (the duty_* fields in aec.h): the
-     * estimator is FED every hop and ANALYSED at full rate until the
-     * published estimate has been solid and unchanged for duty_hold_hops,
-     * then 1-in-duty_period_hops until the estimate is seen to move, seen to
-     * lose confidence, or the watchdog below sees cancellation collapse. Seen
-     * is the operative word for the first two: only an ANALYSED hop can
-     * republish, so those two triggers land at the next scheduled analysis
-     * and not before (update_shared_delay() carries the bound).
-     *
-     * duty_erle_peak is a leaky running peak of the LANES' windowed ERLE
-     * (the wrapper's stand-in for the single instance's own reading lib/aec
-     * watches -- see update_shared_delay()); the two window figures are
-     * converted from seconds once at init, where lib/aec converts them per
-     * hop from its config, and hold the same values on the same grid.
-     * duty_erle_leak_db is that peak's per-hop decay, converted at init from
-     * the same 0.1 dB/s the lib calibrated (see DUTY_ERLE_LEAK_DB); it sits
-     * here rather than beside the windows above because the tail padding
-     * ahead of the counter absorbs it and the control block does not grow.
-     *
-     * duty_hops_run is the engagement half of the census, counted at the one
-     * site that consumes the decision so it cannot drift from what ran;
-     * cumulative since init or the last reset(), like lib/aec's. The census
-     * DENOMINATOR is delay_calls -- every analysed hop reaches this block, so
-     * a separate total would count the same thing twice. */
+    /* Matched-filter duty cycle: the estimator is fed every hop and analysed at full rate until the estimate has been solid and unchanged for duty_hold_hops, then once per duty_period_hops until it is seen to move or lose confidence, or the watchdog sees cancellation collapse. duty_erle_peak is a leaky peak of the lanes' windowed ERLE decaying by duty_erle_leak_db per hop. duty_hops_run is counted where the decision is consumed; the census denominator is delay_calls. */
     int duty_active;
     int duty_stable_hops;
     int duty_pos;
@@ -281,17 +156,7 @@ typedef struct PoolCursor {
     size_t remaining;
 } PoolCursor;
 
-/* The watchdog leak in this grid's own per-hop units -- see the
- * DUTY_ERLE_LEAK_DB banner for why it is the one duty constant that is
- * converted rather than used as written.
- *
- * Exact at the calibration grid, by construction rather than by rounding:
- * hop 160 at 16 kHz makes hop_s the same float DUTY_LEAK_REF_HOP_S is, so
- * the ratio is exactly 1.0f and the authored 0.001f comes back bit-for-bit.
- * That grid is not one this pipeline builds (its three are 8 / 16 / 10.667 ms),
- * which is why four_aec_nr_res_duty_leak_db_for_grid() exposes this for a
- * test to call at the reference directly. Both stacks pin -ffp-contract=off
- * and reject -ffast-math, so x/x == 1.0f holds. */
+/* Watchdog leak in this grid's per-hop units; exactly 1.0f at the calibration grid (hop 160 at 16 kHz), which is not built here, hence the exposed four_aec_nr_res_duty_leak_db_for_grid(). */
 static float duty_leak_db_for_grid(int hop_size, int sample_rate) {
     float hop_s;
     if (hop_size <= 0 || sample_rate <= 0) return DUTY_ERLE_LEAK_DB;
@@ -299,19 +164,13 @@ static float duty_leak_db_for_grid(int hop_size, int sample_rate) {
     return DUTY_ERLE_LEAK_DB * (hop_s / DUTY_LEAK_REF_HOP_S);
 }
 
-/* ============================================================================
- * Config -> module configs + frame dimensions
- * ========================================================================== */
-
-/* Returns 1 and fills every out-param, or 0 (NULL argument; a rate outside
- * {16000, 48000}; a grid, preset, mode, flag, filter length or delay setting
- * outside its range; or a MATCHED/FIXED request whose delay ring or estimator
- * cannot be sized). Grid, AecConfig and the delay-request rules come from
- * se_derive(); what only this core has -- the capture proxy, the quarantine
- * and delay-line ranges, the shared ring and estimator sizes -- is checked
- * here. The wrapper owns alignment once for all four lanes, so each lane's
- * AEC consumes an already-aligned reference and carries neither a private
- * estimator nor a ring. */
+/* Returns 1 and fills the out-params, or 0 (NULL argument; rate outside {16000,
+ * 48000}; grid, preset, mode, flag, filter length or delay setting outside its range;
+ * or a MATCHED/FIXED request whose delay ring or estimator cannot be sized). Grid,
+ * AecConfig and the delay-request rules come from se_derive(); what only this core has
+ * (capture proxy, quarantine and delay-line ranges, shared ring and estimator sizes) is
+ * checked here. The wrapper owns alignment once for all four lanes, so each lane's AEC
+ * consumes an already-aligned reference. */
 static int derive_dims_and_configs(
     const FourAecNrResConfig* cfg,
     AecConfig* aec_cfg,
@@ -337,10 +196,8 @@ static int derive_dims_and_configs(
     rules.fixed_fft = 0;
     rules.check_delay = 1;
     rules.lane_aligned = 1;
-    /* A front-only core has no post stage, so nothing reads a lane's R^2 or
-     * comfort noise: its lanes keep only the linear half of the context. With
-     * a post stage the lanes' own G_res is still never read (the gain is
-     * computed once from fused multi-lane data), so it is skipped too. */
+    /* A front-only core has no post stage, so lanes keep only the linear half of the
+     * context; with a post stage the lanes' own G_res is still never read. */
     rules.spatial_context =
         cfg->enable_post ? AEC_CONTEXT_NO_GAIN : AEC_CONTEXT_LINEAR_ONLY;
     rules.with_nr = 1;
@@ -357,15 +214,7 @@ static int derive_dims_and_configs(
 
     if (cfg->capture_proxy_channel < 0 ||
         cfg->capture_proxy_channel >= FOUR_AEC_NR_RES_CHANNELS) return 0;
-    /* Range only. Unlike delay_num_filters, these are pure policy knobs with
-     * no effect on the pool carve, and lib/aec accepts its own
-     * delay_backward_quarantine_* in every mode for the same reason -- so a
-     * caller that sets them once for a whole product and switches modes at
-     * bring-up does not have to unset them. Outside MATCHED nothing
-     * re-decides an alignment, so they are simply inert. The window is
-     * range-checked (and NaN-rejected) even while the enable is 0: a config
-     * that would misbehave the moment someone flips one field must not pass
-     * validation. */
+    /* Range only: these knobs do not affect the carve and are inert outside MATCHED; the window is range-checked and NaN-rejected even while the enable is 0. */
     if (cfg->delay_backward_quarantine_enabled != 0 &&
         cfg->delay_backward_quarantine_enabled != 1) return 0;
     if (!isfinite(cfg->delay_backward_quarantine_s) ||
@@ -374,13 +223,8 @@ static int derive_dims_and_configs(
     if (!isfinite(cfg->delay_est_period_s) ||
         cfg->delay_est_period_s < 0.0f ||
         cfg->delay_est_period_s > 3600.0f) return 0;
-    /* The wrapper's own duty-cycle contract, not lib/aec's: se_derive() ->
-     * aec_config_from_preset() -> aec_config_defaults() already set
-     * aec_cfg->delay_est_period_s to whatever lib/aec defaults to, but that
-     * value is an implementation detail of a library the lanes here run
-     * with enable_delay_est=0 (they never read it) -- the shared estimator
-     * is the only consumer, and it is this struct's field, authoritatively,
-     * so it overwrites rather than defers to lib/aec's default. */
+    /* This core's duty-cycle period overwrites whatever lib/aec's preset defaulted
+     * (the lanes run with enable_delay_est=0 and never read it). */
     aec_cfg->delay_est_period_s = cfg->delay_est_period_s;
     if (!isfinite(cfg->max_delay_ms) ||
         cfg->max_delay_ms < 0.0f || cfg->max_delay_ms > 4096.0f) return 0;
@@ -405,10 +249,6 @@ static int derive_dims_and_configs(
 
     return 1;
 }
-
-/* ============================================================================
- * Pool sizing and carving
- * ========================================================================== */
 
 static void* pool_carve(PoolCursor* cursor, size_t count,
                         size_t element_size) {
@@ -453,12 +293,6 @@ static int carve_working_buffers(FourAecNrRes* p,
     p->fused_comfort =
         (float*)pool_carve(cursor, (size_t)n, sizeof(float));
 
-    /* p->snapshots[ch]'s Complex- and float-pointer fields are not
-     * pool-carved -- bind_lane_view() points them directly at each lane's own
-     * AecResContext buffers every hop instead of owning a private copy. See
-     * bind_lane_view()'s doc comment for the lifetime contract this depends
-     * on. */
-
     return p->mic_lane && p->aligned_ref &&
            p->fused_error && p->fused_near &&
            p->residual_work && p->residual_proj &&
@@ -471,8 +305,6 @@ static size_t pipeline_buffer_size(
     size_t total = 0;
     int i;
 
-    /* mic_lane + aligned_ref are always required; the frequency-domain
-     * buffers exist only for a core that fuses. */
     for (i = 0; i < 2; ++i)
         total = ck_field_size(total, (size_t)hop, sizeof(float));
 
@@ -481,9 +313,6 @@ static size_t pipeline_buffer_size(
             total = ck_field_size(total, (size_t)n, sizeof(Complex));
         for (i = 0; i < 2; ++i)
             total = ck_field_size(total, (size_t)n, sizeof(float));
-        /* No per-lane snapshot buffers here: FourAecLaneSnapshot's
-         * spectrum/PSD fields are borrowed pointers into each lane's own
-         * AecResContext, not pool-carved copies. See bind_lane_view(). */
     }
     if (delay_estimator_bytes > 0)
         total = ck_add_size(total, ck_align16_size(delay_estimator_bytes));
@@ -513,10 +342,6 @@ static size_t pipeline_pool_size(
     total = ck_add_size(total, buffer_bytes);
     return MEM_SIZE_INVALID(total) ? 0 : total;
 }
-
-/* ============================================================================
- * Carve/build — counterpart of audio_pipeline.c's pipeline_build()
- * ========================================================================== */
 
 static int pipeline_build(
     FourAecNrRes* p,
@@ -551,10 +376,6 @@ static int pipeline_build(
     return 1;
 }
 
-/* ============================================================================
- * Build-flags hash
- * ========================================================================== */
-
 static uint32_t fnv1a_str(const char* text, uint32_t hash) {
     while (*text) {
         hash ^= (uint32_t)(unsigned char)*text++;
@@ -563,7 +384,7 @@ static uint32_t fnv1a_str(const char* text, uint32_t hash) {
     return hash;
 }
 
-/* ",aec<i>": lane i's tag in the hashed carve text; keep byte-identical (build_flags_hash). */
+/* lane i's tag in the hashed carve text; do not alter (feeds build_flags_hash). */
 #define LANE_TAG(i) ",aec" #i
 
 static uint32_t four_aec_nr_res_build_flags_hash(void) {
@@ -578,10 +399,6 @@ static uint32_t four_aec_nr_res_build_flags_hash(void) {
     return ac_memreq_abi_hash(hash);
 }
 
-/* ============================================================================
- * Public config and memory query
- * ========================================================================== */
-
 FourAecNrResConfig four_aec_nr_res_default_config(int sample_rate) {
     FourAecNrResConfig cfg;
     memset(&cfg, 0, sizeof(cfg));
@@ -594,7 +411,7 @@ FourAecNrResConfig four_aec_nr_res_default_config(int sample_rate) {
     cfg.capture_proxy_channel = 0;
     cfg.delay_backward_quarantine_enabled = 0;
     cfg.delay_backward_quarantine_s = 1.0f;
-    cfg.delay_est_period_s = 0.0f;   /* full rate; see 4aec_nr_res.h doc */
+    cfg.delay_est_period_s = 0.0f;   /* full rate; see 4aec_nr_res.h */
     cfg.max_delay_ms = 1024.0f;
     cfg.aec_preset = AEC_PRESET_BALANCED;
     cfg.nr_mode = ANR_MODE_BALANCED;
@@ -642,10 +459,6 @@ int four_aec_nr_res_get_mem_requirements(
     out->bytes = (uint64_t)total_bytes;
     return 0;
 }
-
-/* ============================================================================
- * Caller-pool init and heap convenience construction
- * ========================================================================== */
 
 FourAecNrRes* four_aec_nr_res_init_ex(
     void* mem,
@@ -696,29 +509,17 @@ FourAecNrRes* four_aec_nr_res_init_ex(
     p->hop_size = hop;
     p->n_freqs = n;
     p->delay_ring_size = delay_ring_size;
-    /* Quarantine window: seconds -> hops ONCE, here, against the resolved
-     * grid -- the same conversion (and the same floor of 1) lib/aec does in
-     * aec_carve(), so the core and its lanes cannot disagree about how long
-     * a window is. */
+    /* Quarantine window: seconds -> hops once, against the resolved grid, with the same
+     * floor of 1 as lib/aec's aec_carve(). */
     {
         float q_hop_s = (float)hop / (float)cfg_copy.sample_rate;
         int q_hops = (int)lrintf(cfg_copy.delay_backward_quarantine_s / q_hop_s);
         p->delay_quarantine_hops = q_hops < 1 ? 1 : q_hops;
         p->delay_quarantine_left = -1;   /* disarmed */
-        /* Duty-cycle windows, taken from the lane config built just above --
-         * the same two fields lib/aec converts for its own machine -- on the
-         * same resolved grid and with the same floors. Converted once here
-         * rather than per hop because this grid cannot change after init; the
-         * values are the ones lib/aec's per-hop conversion would produce from
-         * the same seconds.
-         *
-         * Floor of 1, not 2: a floor of 2 silently caps delay_est_period_s=0.0
-         * at 50% engagement instead of true full-rate, changing WHICH delay
-         * the matched filter could ever settle on, not just when -- see aec.c's
-         * duty_period_hops init. This core's cfg.delay_est_period_s is its
-         * own field (derive_dims_and_configs() overwrites whatever lib/aec's
-         * preset defaulted aec_cfg.delay_est_period_s to), defaulting to 0.0
-         * for the same reason, so it must floor the same way as lib/aec. */
+        /* Duty-cycle windows from the lane config built above (the same two fields lib/aec
+         * converts), converted once because the grid is fixed after init. Floor of 1, not 2: a
+         * floor of 2 would cap delay_est_period_s = 0.0 at 50 % engagement instead of full
+         * rate. */
         {
             int hold = (int)lrintf(aec_cfg.delay_est_init_s / q_hop_s);
             int period = (int)lrintf(aec_cfg.delay_est_period_s / q_hop_s) /
@@ -793,33 +594,7 @@ static int complex_close(Complex a, Complex b) {
     return dr <= 1e-5f * scale && di <= 1e-5f * scale;
 }
 
-/* Cross-lane far-end agreement, the fuse stage's precondition: X is ONE
- * shared digital render reference, not four spatial observations, so a lane
- * carrying a DIFFERENT far spectrum must not be folded into the beam as if
- * it were sharing lane 0's borrowed copy (the "linear AEC lanes do not share
- * one far-end spectrum" rejection, mirrored from pipeline.py).
- *
- * This predicate's own meaning is unchanged: it answers whether the lanes'
- * far_spec genuinely agree, nothing more. fuse_contexts() below has a
- * SEPARATE, caller-side bypass of the call for a mixed warm/soft-realign hop
- * (p->far_spec_mixed_hop, set in four_aec_front_process() -- see its
- * per-lane loop comment) -- that hop's lanes are known to legitimately
- * disagree, so fuse_contexts() does not ask this predicate at all rather
- * than asking it to approve a mismatch it is not designed to approve.
- *
- * Two ways to establish agreement when the predicate IS asked. When the
- * borrow chain this file drives has been shown to have run this hop -- lane
- * 0 computes the one real far FFT, lanes 1-3 take it through
- * aec_process_context_shared_far() and provably ran no transform of their
- * own -- the lanes hold a memcpy of one buffer and a per-bin value
- * comparison can only restate that. Provenance answers it in four counter
- * reads for the whole hop instead of 4*n_freqs float compares.
- *
- * Without that evidence -- a caller wiring per-lane contexts from somewhere
- * else, or any hop whose counters do not move the way the borrow requires --
- * nothing is known about where a lane's spectrum came from, and the full
- * comparison is the only answer available. Not knowing therefore costs the
- * comparison; it never skips it. */
+/* Cross-lane far-end agreement, the fuse stage's precondition: a lane with a different far spectrum must not be folded into the beam. Python reference: 4ch_aec_bf_nr_res/pipeline.py:_fuse_contexts. When the borrow chain is shown to have run this hop (lane 0 computes the one far FFT, lanes 1-3 borrow it), four counter reads replace 4*n_freqs compares; without that evidence the full comparison runs. fuse_contexts() skips the predicate on a mixed warm/soft-realign hop. */
 int four_aec_nr_res_far_spec_agrees(int shared_far_provenance,
                                     const Complex* lane_far_spec,
                                     const Complex* reference_far_spec,
@@ -833,14 +608,6 @@ int four_aec_nr_res_far_spec_agrees(int shared_far_provenance,
     return 1;
 }
 
-/* ============================================================================
- * Per-hop processing — Stage 1: shared delay + four linear AEC lanes
- * ========================================================================== */
-
-/* The admission band, its confirmation window and the candidate's life are
- * lib/aec's own Path-B numbers; they and the state they act on are declared
- * in 4aec_nr_res_internal.h, where the tests can reach them. */
-
 void four_aec_nr_res_admission_age(FourAecDelayAdmission* admission) {
     if (!admission || admission->ttl <= 0) return;
     admission->ttl -= 1;
@@ -853,10 +620,7 @@ void four_aec_nr_res_admission_age(FourAecDelayAdmission* admission) {
 int four_aec_nr_res_admission_offer(
     FourAecDelayAdmission* admission, int accepted_delay, int estimated) {
     if (!admission) return 0;
-    /* Too small to be worth four IR shifts: absorbed, and deliberately left
-     * to age rather than clearing the candidate, so a movement is not
-     * cancelled by one hop of the estimator agreeing with the alignment it is
-     * moving away from. lib/aec's Path B has no such clear either. */
+    /* Too small to be worth four IR shifts: absorbed and left to age (as lib/aec's Path B). */
     if (abs(estimated - accepted_delay) <= FOUR_DELAY_CHANGE_MIN_SAMPLES)
         return 0;
     if (admission->ttl > 0 &&
@@ -866,26 +630,15 @@ int four_aec_nr_res_admission_offer(
         admission->ttl = 0;
         return 1;
     }
-    /* First sighting, or a movement somewhere else entirely: this becomes the
-     * candidate with a full life, replacing whatever was held. */
     admission->candidate = estimated;
     admission->ttl = FOUR_DELAY_CHANGE_CANDIDATE_TTL;
     return 0;
 }
 
-/* The duty machine's watchdog signal. lib/aec watches the one linear filter
- * it owns; the shared estimator here drives FOUR, so the reading that
- * corresponds to "the alignment this estimate produced is still working" is
- * the BEST of them -- one lane going quiet (a microphone with no echo path
- * of its own to cancel) is not evidence that the shared alignment collapsed,
- * whereas no lane cancelling anywhere is.
- *
- * aec_debug_status() is documented read-only with no hot-path cost: it copies
- * figures the engine already maintains. Both readings are last hop's, which
- * is also what lib/aec's cached last_erle_windowed is at the point its own
- * duty block runs. Lanes report 0 until their ERLE machinery has run, so an
- * unavailable metric leaves the watchdog inert (peak stays below the arming
- * threshold) rather than firing. */
+/* Duty-machine watchdog signal: the best windowed ERLE of the four lanes (one quiet
+ * lane is not evidence that the shared alignment collapsed). Both readings are last
+ * hop's; lanes report 0 until their ERLE machinery has run, which leaves the watchdog
+ * inert. */
 static float max_lane_erle_windowed(const FourAecNrRes* p) {
     float best = 0.0f;
     int ch;
@@ -923,12 +676,9 @@ static FourAecNrResDelayState update_shared_delay(
     if (p->cfg.delay_mode == AEC_DELAY_FIXED) {
         state.delay_samples = p->cfg.fixed_delay_samples;
         state.confidence = 1.0f;
-        /* update_shared_delay() runs immediately before align_render().
-         * The current hop will therefore be completely readable when the
-         * samples already stored cover the requested delay. This matches
-         * lib/aec, which checks `filled >= delay + hop` after writing the
-         * current hop; checking delay+hop here would report LOCKED one hop
-         * later than the audio actually switches to aligned far. */
+        /* update_shared_delay() runs immediately before align_render(): the current hop is
+         * readable when the samples already stored cover the requested delay (as lib/aec's
+         * `filled >= delay + hop`), so LOCKED is reported on the hop the audio switches. */
         state.solid = p->delay_samples_seen >=
             (uint64_t)p->cfg.fixed_delay_samples;
         p->accepted_delay = p->cfg.fixed_delay_samples;
@@ -936,43 +686,7 @@ static FourAecNrResDelayState update_shared_delay(
         return state;
     }
 
-    /* Raw, un-decimated hops: delay_aec_init() constructed p->shared_delay
-     * at this pipeline's real native sample_rate, so DelayAec itself
-     * anti-alias-filters + decimates internally at 48kHz (see delay_aec.c's
-     * DaResample48) and delay_aec_estimated_delay() below returns the
-     * result already rescaled back to this pipeline's native domain. */
-    /* Duty-cycled analysis, the same machine lib/aec runs on its own
-     * estimator (aec.c's delay block): the estimator is FED on every hop
-     * regardless -- delay_aec_accumulate_ex() keeps the decimators and the
-     * render ring gapless, so the matched filter never sees spliced audio --
-     * and only the matched-filter ANALYSIS is decimated, and only once the
-     * published estimate has held still long enough to make analysing it
-     * again redundant.
-     *
-     * What re-arms full rate, stated as the contract it actually is: the
-     * estimate is compared against the previous hop's below, and a decimated
-     * hop cannot publish a new one -- so a movement mid-stream is SEEN at the
-     * next SCHEDULED analysis, not on the hop it happens. Full rate then
-     * resumes from the hop that sees it, and the whole exposure is bounded by
-     * one duty period: at most duty_period_hops of extra wait. At the
-     * default cfg.delay_est_period_s=0.0 that period is 1 (full rate, no
-     * wait at all). The K=12/6/9 figures below (~96 ms on every grid this
-     * pipeline ships: 16 kHz/128, 16 kHz/256, 48 kHz/512 -- the /5 divisor
-     * and the rounding land all three on the same wall clock) are what
-     * opting into the throttle at cfg.delay_est_period_s=0.5 reproduces
-     * (the default is full rate). The ERLE watchdog
-     * below can shorten that by
-     * disengaging on a cancellation collapse the skipped hops still measure,
-     * but it is armed only once a lane's windowed ERLE clears
-     * DUTY_ERLE_COLLAPSE_DB: on a path where no lane ever cancels that well,
-     * the 1-in-K sampling is the whole re-lock mechanism and re-acquisition
-     * costs a multiple of what full rate would -- measured 2.5x on the
-     * 16 kHz/256 grid, bounded at K, with both arms pinned in
-     * test_4aec_nr_res.c. So the machine costs latency where the answer was
-     * already static, plus one duty period wherever it stops being static.
-     *
-     * The census is counted HERE, at the one site that consumes the
-     * decision, so it can never claim a schedule the estimator did not run. */
+    /* Raw hops: DelayAec runs at the native sample_rate and decimates internally, returning the delay in the native domain. Duty-cycled analysis as in lib/aec: the estimator is fed every hop (decimators and render ring stay gapless) and only the matched-filter analysis is decimated once the estimate has held still. A mid-stream movement is seen at the next scheduled analysis, so exposure is bounded by duty_period_hops (1 at the default 0.0 period; ~96 ms on all shipped grids at delay_est_period_s = 0.5). The ERLE watchdog can shorten it once a lane's windowed ERLE has cleared DUTY_ERLE_COLLAPSE_DB. */
     run_filter = 1;
     if (p->duty_active) {
         p->duty_pos += 1;
@@ -988,8 +702,7 @@ static FourAecNrResDelayState update_shared_delay(
         int cur = delay_aec_estimated_delay(&p->shared_delay);
         int solid = delay_aec_is_solid(&p->shared_delay);
         if (!solid || cur < 0 || cur != p->duty_last_delay) {
-            /* Estimate moved or lost confidence: full rate, and the hold
-             * starts over. */
+            /* Estimate moved or lost confidence: full rate, hold restarts. */
             p->duty_active = 0;
             p->duty_stable_hops = 0;
         } else if (!p->duty_active) {
@@ -1003,12 +716,9 @@ static FourAecNrResDelayState update_shared_delay(
         p->duty_last_delay = cur;
     }
     if (p->duty_active) {
-        /* Cancellation watchdog: a leaky peak of the lanes' windowed ERLE,
-         * with full-rate analysis resumed on a DUTY_ERLE_COLLAPSE_DB drop
-         * from it. Armed only once the peak clears that same figure, so it
-         * cannot fire before any lane ever converged. Same shape and same
-         * collapse depth as lib/aec's; the leak is the same 0.1 dB/s, carried
-         * in this grid's per-hop units by duty_erle_leak_db. */
+        /* Cancellation watchdog: a leaky peak of the lanes' windowed ERLE; a drop of
+         * DUTY_ERLE_COLLAPSE_DB from it resumes full-rate analysis. Armed only once the peak
+         * clears that figure. */
         float erle = max_lane_erle_windowed(p);
         if (erle > p->duty_erle_peak) p->duty_erle_peak = erle;
         else p->duty_erle_peak -= p->duty_erle_leak_db;
@@ -1025,29 +735,11 @@ static FourAecNrResDelayState update_shared_delay(
                delay_aec_is_solid(&p->shared_delay) &&
                delay_aec_n_updates(&p->shared_delay) >= 3;
 
-    /* One hop of the held candidate's life, spent here -- ahead of both the
-     * quarantine and the admission below, exactly where lib/aec ages its own
-     * pending delay. Held candidates therefore expire on hops the quarantine
-     * takes away as readily as on hops the estimate moves elsewhere. */
+    /* Age the held candidate here, ahead of the quarantine and admission (as lib/aec ages its
+     * pending delay). */
     four_aec_nr_res_admission_age(&p->delay_admission);
 
-    /* Backward-jump quarantine (see delay_backward_quarantine_enabled in the
-     * header). Engages only once a usable generation exists and only for an
-     * estimate strictly EARLIER than the one in force: a first acquisition
-     * has no alignment to protect, re-confirming the accepted value is not a
-     * change, and a LARGER estimate is not the pre-echo direction. The lane
-     * is read here, BEFORE this hop's aec_process_context() calls, so what it
-     * answers with is last hop's cancellation -- the same one-hop-behind
-     * reading lib/aec's own Path-B guard judges on.
-     *
-     * ONE lane: cfg.capture_proxy_channel, the microphone the shared
-     * estimator is actually fed from, so the only lane whose cancellation is
-     * evidence about the estimate being judged.
-     *
-     * Armed once per continuously qualifying backward episode, then one tick
-     * per hop; at 0 the estimate is adopted. Candidate values may jitter
-     * within that qualifying class without re-arming. A forward/ineligible
-     * estimate or lost cancellation evidence disarms the episode. */
+    /* Backward-jump quarantine (see delay_backward_quarantine_enabled): only for an estimate strictly earlier than the one in force and only once a usable generation exists. It judges cfg.capture_proxy_channel, read before this hop's aec_process_context() (last hop's cancellation). Armed once per qualifying backward episode, one tick per hop, adopted at 0; a forward/ineligible estimate or lost cancellation disarms it. */
     if (eligible && p->cfg.delay_backward_quarantine_enabled &&
         p->last_delay.solid && estimated < p->accepted_delay &&
         p->lanes[p->cfg.capture_proxy_channel] &&
@@ -1062,56 +754,8 @@ static FourAecNrResDelayState update_shared_delay(
         p->delay_quarantine_left = -1;
     }
 
-    /* Published `solid` = "a usable accepted alignment generation exists",
-     * which is why it is derived from the SAME acceptance test that writes
-     * accepted_delay rather than mirroring the estimator's raw confidence.
-     * Nothing in DelayAec's contract ties its confidence latch to the
-     * acceptance conditions above, so a raw-confidence `solid` would be free
-     * to LEAD accepted_delay on any hop the two disagree -- and a consumer
-     * that flushes recurrent state on the not-usable -> usable edge would
-     * then flush against the previous generation's applied delay.
-     *
-     * Usability is also sticky: once a generation exists, a short
-     * is_solid/confidence dip keeps the accepted delay in force instead of
-     * briefly retracting an alignment the audio path is still applying.
-     * That is exactly lib/aec's semantics, where "nothing accepted yet" is
-     * spelled current_delay == -1 and never un-spells itself without a
-     * reset. p->last_delay is zeroed by init's pool memset and by reset(),
-     * so was_usable is 0 at every genuine stream start.
-     *
-     * `changed` = "this hop starts a NEW USABLE alignment generation" (see
-     * FourAecNrResDelayState's doc for why a value-only comparison misses
-     * every acquisition or relock that lands on applied delay 0). The
-     * previous hop's usability is exactly its published `solid`: this
-     * wrapper's delay_samples is never negative (accepted_delay starts at 0
-     * and only ever takes an `estimated >= 0`), so there is no -1 sentinel
-     * half to test.
-     *
-     * A CHANGE to a usable alignment additionally has to clear the admission
-     * in 4aec_nr_res_internal.h, because every one of them costs an IR shift
-     * plus (on a retard) a far-history clear on all FOUR lanes:
-     *
-     *   - FOUR_DELAY_CHANGE_MIN_SAMPLES bounds how small a movement may
-     *     disturb four converged filters at all. DelayAec publishes on a
-     *     16-downsampled-sample grid -- 64 native samples at 16 kHz, 192 at
-     *     48 kHz, since its answer is a block index shifted left -- so
-     *     with this estimator this term is the floor under a finer
-     *     source rather than an active filter.
-     *   - the held candidate is the operative half: a value that is not
-     *     offered again before it ages out never reaches the lanes.
-     *
-     * What this deliberately does NOT reject is a SUSTAINED wrong estimate:
-     * it is re-offered every hop and confirms itself. Holding that one is the
-     * backward quarantine's job above, on its own evidence and its own bound.
-     *
-     * First acquisition keeps its immediate path: with nothing accepted yet
-     * there is no alignment to protect, the same split lib/aec makes between
-     * its Path A and Path B.
-     *
-     * accepted_delay moves only on acceptance, so the alignment served to the
-     * lanes and the realign that shifts their filters always land on the same
-     * hop; a value written on the pending hop would feed them a reference
-     * shifted out from under filters nothing had realigned. */
+    /* Published `solid` = a usable accepted alignment generation exists, derived from the acceptance test that writes accepted_delay; it is sticky (a short confidence dip keeps the delay, as in lib/aec) and p->last_delay is zeroed at init and reset().
+     * `changed` = this hop starts a new usable generation (a value-only comparison would miss an acquisition or relock at delay 0). A change to a usable alignment must also clear the admission in 4aec_nr_res_internal.h, since each costs an IR shift on all four lanes; a sustained wrong estimate confirms itself and is left to the backward quarantine. First acquisition is immediate (lib/aec's Path A). accepted_delay moves only on acceptance, so the served alignment and the lanes' realign land on the same hop. */
     was_usable = p->last_delay.solid;
     now_usable = was_usable || eligible;
     accepted = 0;
@@ -1156,15 +800,7 @@ static int align_render(FourAecNrRes* p, const float* render,
     hop = p->hop_size;
     ring = p->delay_ring_size;
     start = p->delay_samples_seen;
-    /* The hop occupies ring slots start%ring .. (start+hop-1)%ring, which are
-     * contiguous and wrap at most once (the guard above leaves hop <= ring),
-     * so the whole write is one or two bounded runs: the same samples land in
-     * the same slots as a per-sample `absolute % ring` walk would put them,
-     * without dividing 64-bit values `hop` times per hop. The divisor is a
-     * runtime value, so a compiler cannot strength-reduce it away, and a
-     * 目標平台 core has no fast 64-bit divide to fall back on. `start` is
-     * reduced ONCE and every other index below is derived from that with
-     * 32-bit adds. */
+    /* Ring write of one hop: slots start%ring .. (start+hop-1)%ring wrap at most once, so it is one or two bounded runs with `start` reduced once (no per-sample 64-bit divide). */
     write_at = (int)(start % (uint64_t)ring);
     first = ring - write_at;
     if (first > hop) first = hop;
@@ -1173,24 +809,10 @@ static int align_render(FourAecNrRes* p, const float* render,
         memcpy(p->delay_ring, render + first,
                (size_t)(hop - first) * sizeof(float));
     }
-    /* Whole-hop decision, taken on the SAME predicate the published `solid`
-     * uses under FIXED: the ring can serve this hop's requested offset only
-     * once the samples already seen cover delay_samples. Until then the far
-     * content IS the raw render hop -- lib/aec's rule ("UNLOCKED means the
-     * content is the raw far") rather than silence, so a consumer stepping a
-     * recurrent model over the far branch sees real reference audio from the
-     * first hop instead of a stretch of zeros. Serving zeros would also make
-     * the leading delay_samples of every FIXED stream unmodellable for the
-     * linear filters. Per-hop and not per-sample: `start` is the smallest
-     * absolute index in this hop, so a partly-servable hop would otherwise
-     * splice raw and aligned audio while the seam still reports UNLOCKED. */
+    /* Whole-hop decision on the same predicate as `solid` under FIXED: the ring serves this offset only once the samples seen cover delay_samples; until then the far content is the raw render hop (lib/aec's rule), not silence. Per hop, so raw and aligned audio are never spliced under UNLOCKED. */
     if (start >= (uint64_t)delay_samples) {
-        /* (start - delay_samples) mod ring, without a second 64-bit divide:
-         * start is congruent to write_at, and delay_samples is bounded by
-         * ring above, so write_at - delay_samples + ring lands in (0, 2*ring)
-         * and one conditional subtract reduces it. Same first-sample slot,
-         * and the read run wraps at most once for the same reason the write
-         * run does. */
+        /* (start - delay_samples) mod ring without a second 64-bit divide: write_at -
+         * delay_samples + ring lies in (0, 2*ring), so one conditional subtract reduces it. */
         read_at = write_at - delay_samples;
         if (read_at < 0) read_at += ring;
         first = ring - read_at;
@@ -1209,20 +831,7 @@ static int align_render(FourAecNrRes* p, const float* render,
     return 1;
 }
 
-/* Points dst's spectrum/PSD fields (error_spec, echo_spec, far_spec,
- * near_spec, r2, comfort_noise, formed_hop -- these back the front view and
- * the fuse inputs) directly at src's own buffers instead of copying them.
- *
- * Safe because AecResContext's pointers are documented to "alias the AEC's
- * internal per-hop buffers -- read before the next aec_process() call"
- * (aec.h): a lane runs again only inside four_aec_front_process() or after a
- * reset, and the front view is documented valid until exactly then.
- * four_aec_nr_res_reset() does not clear or overwrite this memory -- aec_reset()
- * makes no such promise for a lane's spectrum buffers -- so a caller that
- * keeps reading a view past a reset reads undefined content, and fuse refuses
- * to run on one (front_valid). pipeline.py's FourChannelAecPipeline keeps
- * several frames in flight and copies; this borrow design is deliberately
- * not mirrored there. */
+/* Points dst's spectrum/PSD fields directly at src's buffers instead of copying. AecResContext's pointers alias the AEC's per-hop buffers (aec.h), a lane runs again only inside four_aec_front_process() or after a reset, and the front view is valid until then. reset does not clear this memory; fuse refuses to run on a stale view (front_valid). */
 static int bind_lane_view(FourAecLaneSnapshot* dst,
                           const AecResContext* src,
                           int n_freqs, int residual_half) {
@@ -1266,18 +875,11 @@ int four_aec_front_process(
     if (!p || p->destroyed ||
         !microphones_interleaved || !ref || !out)
         return FOUR_AEC_NR_RES_INVALID_ARGUMENT;
-    /* Cleared once the call is accepted: a hop that then bails out part-way
-     * reports zero for the stages it never reached rather than the previous
-     * hop's numbers. The three AEC-side fields are ACCUMULATED over the four
-     * lanes below, so this is also what makes each hop start from zero. The
-     * post half is cleared the same way in four_aec_fuse(). */
+    /* Cleared once the call is accepted, so a hop that bails out reports zero for stages it never reached; lane-side fields accumulate over the four lanes. The post half is cleared in four_aec_fuse(). */
     p->last_timing.delay_us = 0;
     p->last_timing.frontend_us = 0;
     p->last_timing.linear_us = 0;
     p->last_timing.lane_res_us = 0;
-    /* Same rule for the fuse stage's far-end provenance: a hop that bails out
-     * before the lane loop has established nothing, and "nothing established"
-     * is what makes fuse_contexts() fall back to the full comparison. */
     p->far_spec_shared_hop = 0;
     p->far_spec_mixed_hop = 0;
     p->front_valid = 0;
@@ -1289,50 +891,33 @@ int four_aec_front_process(
         !inputs_finite(ref, (size_t)hop))
         return FOUR_AEC_NR_RES_INVALID_ARGUMENT;
 
-    /* Only lane 0 with proxy 0 can reuse this extraction: earlier lanes
-     * overwrite mic_lane before a later proxy lane is processed. */
+    /* Only lane 0 with proxy 0 can reuse this extraction: earlier lanes overwrite
+     * mic_lane before a later proxy lane runs. */
     for (i = 0; i < hop; ++i) {
         p->mic_lane[i] =
             microphones_interleaved[
                 i * FOUR_AEC_NR_RES_CHANNELS +
                 p->cfg.capture_proxy_channel];
     }
-    /* The alignment the lanes were served BEFORE this hop's decision: raw
-     * (0) until the estimate first turns solid. Captured ahead of
-     * update_shared_delay(), which overwrites both fields. */
+    /* The alignment the lanes were served before this hop's decision (raw 0 until the
+     * estimate first turns solid), captured before update_shared_delay() overwrites it. */
     old_align = p->last_delay.solid ? p->accepted_delay : 0;
     t0 = four_aec_nr_res_now_us();
     delay = update_shared_delay(p, p->mic_lane, ref);
     p->last_timing.delay_us = four_aec_nr_res_now_us() - t0;
-    /* align_render() below is deliberately OUTSIDE the window: it is a
-     * ring-buffer copy, not delay estimation, and the caller's reconciliation
-     * identity accounts for it in the pre-stage remainder. */
     if (!align_render(p, ref, delay.delay_samples)) {
         four_aec_nr_res_reset(p);
         return FOUR_AEC_NR_RES_DSP_ERROR;
     }
     if (delay.changed) {
-        /* Realign instead of reset: aec_apply_external_realign() shifts each
-         * converged filter by the alignment delta (warm tap-transfer when the
-         * evidence gate holds, a filter-only reset otherwise), so the
-         * cancellation survives and the WOLA sequences continue. A full
-         * aec_reset() + OLA wipe would produce one near-zero output hop plus
-         * dozens of hops of re-exposed echo (covered by lib/aec
-         * test_external_realign.c and tests/test_4aec_nr_res.c's realign
-         * continuity rows). */
+        /* Realign instead of reset: aec_apply_external_realign() shifts each converged filter by
+         * the alignment delta (warm tap transfer when the evidence gate holds, a filter-only
+         * reset otherwise), so cancellation survives and the WOLA sequences continue. */
         int hop_warm = 0;
         int hop_soft = 0;
         for (ch = 0; ch < FOUR_AEC_NR_RES_CHANNELS; ++ch) {
             int outcome = aec_apply_external_realign(
                 p->lanes[ch], delay.delay_samples - old_align);
-            /* Which path each lane took is otherwise invisible from here --
-             * the call reports it and nothing kept the answer. Counted, not
-             * branched on: a lane that goes soft is still correct, just cold
-             * for a while, so this is what makes "the sweep ran, and how it
-             * landed" measurable. A sweep that does not add exactly 4 means a
-             * lane rejected the call (-1: no instance, or a lane not in
-             * EXTERNAL_ALIGNED), which is a wiring fault rather than a soft
-             * realign and must not be counted as one. */
             if (outcome == 1) {
                 p->realign_warm_lanes = four_aec_count_add_sat(
                     p->realign_warm_lanes, 1);
@@ -1343,21 +928,10 @@ int four_aec_front_process(
                 hop_soft += 1;
             }
         }
-        /* Some lanes warm, some soft, on the SAME hop. A soft outcome
-         * zeroed that lane's far_buffer OLA history while a warm outcome left
-         * it alone, so the lanes are no longer in far_buffer lockstep this
-         * hop -- see the per-lane loop below, which stops borrowing lane 0's
-         * far FFT for exactly this hop, and fuse_contexts(), which stops
-         * requiring the lanes' (now legitimately different) far_spec to
-         * agree for exactly this hop. */
+        /* Some lanes warm and some soft on the same hop: a soft outcome zeroes that lane's far_buffer OLA history, so the lanes are out of lockstep. The loop stops borrowing lane 0's far FFT for this hop and fuse_contexts() stops requiring the far spectra to agree. */
         p->far_spec_mixed_hop = (hop_warm > 0 && hop_soft > 0);
     }
 
-    /* Read BEFORE the loop so the verdict below rests on what the lanes
-     * themselves counted this hop, not on the fact that this function
-     * intended to share a spectrum -- a flag set by the code that does the
-     * borrowing would be an identity, true whether or not the borrow landed.
-     * Two loads and an add per lane, off the transform path entirely. */
     for (ch = 0; ch < FOUR_AEC_NR_RES_CHANNELS; ++ch)
         far_fft_before[ch] = aec_far_fft_real_compute_count(p->lanes[ch]);
     lanes_borrowed = 1;
@@ -1371,11 +945,8 @@ int four_aec_front_process(
                         i * FOUR_AEC_NR_RES_CHANNELS + ch];
             }
         }
-        /* Lane 0 produces this hop's far spectrum and magnitude; lanes
-         * 1-3 copy them into their own state after their prior-hop RSA read.
-         * Mixed warm/soft realignment breaks OLA-history agreement, so all
-         * lanes compute locally on that hop. Context-only calls retain the
-         * same AEC state without copying an unused time-domain output. */
+        /* Lane 0 produces this hop's far spectrum and magnitude; lanes 1-3 copy them after their
+         * prior-hop RSA read. On a mixed warm/soft hop all lanes compute locally. */
         if (ch == 0 || p->far_spec_mixed_hop) {
             aec_process_context(p->lanes[ch], p->mic_lane, p->aligned_ref);
         } else {
@@ -1390,30 +961,16 @@ int four_aec_front_process(
             four_aec_nr_res_reset(p);
             return FOUR_AEC_NR_RES_DSP_ERROR;
         }
-        /* Sum this lane's own stage split into the hop's record. The four
-         * lanes run sequentially, so summing gives the wall-clock cost of
-         * each stage across the whole loop -- see FourAecNrResLastTiming. */
         {
             AecStageTiming lane_time;
             aec_get_last_timing(p->lanes[ch], &lane_time);
-            /* Lane-internal delay work folds into the same delay_us the
-             * shared estimator reports, because it is the same quantity:
-             * time spent aligning the far end. It is structurally ZERO
-             * -- every lane is built AEC_DELAY_EXTERNAL_ALIGNED, so no lane
-             * owns a ring or an estimator -- and is summed anyway so that a
-             * future lane-mode change cannot silently drop its cost out of
-             * the breakdown. */
+            /* Lane-internal delay work is structurally zero (every lane is EXTERNAL_ALIGNED) and is summed into delay_us anyway. */
             p->last_timing.delay_us    += lane_time.delay_us;
             p->last_timing.frontend_us += lane_time.frontend_us;
             p->last_timing.linear_us   += lane_time.linear_us;
             p->last_timing.lane_res_us += lane_time.res_us;
         }
-        /* The borrow chain's own signature, one lane at a time: the lane that
-         * computes the shared spectrum runs exactly ONE real far transform
-         * this hop, and a lane that borrowed it runs NONE. Anything else --
-         * a lane that recomputed its own, or a lane that never reached its
-         * front end at all -- leaves this 0 and sends fuse_contexts() back to
-         * the per-bin comparison. */
+        /* Borrow-chain signature: the lane that computes the shared spectrum runs one far transform this hop, a borrowing lane none; anything else leaves 0 and sends fuse_contexts() to the per-bin comparison. */
         {
             long after = aec_far_fft_real_compute_count(p->lanes[ch]);
             if (!four_aec_far_fft_delta_matches(
@@ -1421,9 +978,6 @@ int four_aec_front_process(
                 lanes_borrowed = 0;
         }
     }
-    /* shared_far_spec is lane 0's live spectrum, so a NULL here means lanes
-     * 1-3 were handed nothing to borrow and the counter evidence above is
-     * about some other arrangement. */
     p->far_spec_shared_hop = lanes_borrowed && shared_far_spec != NULL;
 
     p->front_valid = 1;
@@ -1436,15 +990,9 @@ int four_aec_front_process(
         out->linear_spectra[ch] = p->snapshots[ch].error_spec;
         out->formed_hop[ch] = p->snapshots[ch].formed_hop;
     }
-    /* The exact delay-aligned far every lane consumed this hop. */
     out->aligned_ref = p->aligned_ref;
     return FOUR_AEC_NR_RES_OK;
 }
-
-/* ============================================================================
- * Per-hop processing — Stages 2/3: external beamformer -> NR/RES -> OLA
- * ========================================================================== */
-
 
 static int validate_weights(const FourAecNrRes* p,
                                  const Complex* weights) {
@@ -1473,43 +1021,23 @@ static int fuse_contexts(FourAecNrRes* p,
 
     *all_converged = 1;
     *usable_linear = 1;
-    /* Seeded neutral rather than from lane 0, so lane 0 is subject to the
-     * same contributes-to-the-output test as every other lane below. Both
-     * quantities are non-negative, so 0 is the identity for the max. At
-     * least one lane always survives that test: four_aec_fuse() rejects
-     * all-zero weights before reaching here. */
     *max_dt = 0.0f;
     *max_saturation = 0.0f;
 
     if (trusted_beamformed_error) {
         if (!complex_vector_finite(trusted_beamformed_error, n)) return 0;
-        /* No copy into p->fused_error: its lifetime (owned by the caller,
-         * e.g. audio_pipeline_4ch.c's p->bf_spectrum) already covers every
-         * read the post-beam stages make this call -- they read
-         * trusted_beamformed_error directly instead. */
+        /* No copy into p->fused_error: the caller owns it for the whole call. */
     } else {
         memset(p->fused_error, 0, (size_t)n * sizeof(Complex));
     }
     memset(p->fused_near, 0, (size_t)n * sizeof(Complex));
-    /* residual_proj accumulates the coherent residual vector below;
-     * fused_r2 takes its power. */
     memset(p->residual_proj, 0, (size_t)n * sizeof(Complex));
     memset(p->fused_comfort, 0, (size_t)n * sizeof(float));
 
     for (ch = 0; ch < FOUR_AEC_NR_RES_CHANNELS; ++ch) {
         const Complex* lane_weights =
             weights + (size_t)ch * (size_t)n;
-        /* A lane the beamformer has zeroed in every bin contributes exactly
-         * nothing to fused_error/fused_near/residual_proj/fused_comfort below,
-         * so it must not vote on the three scalars that steer the post stage
-         * either -- those govern a spectrum this lane is absent from. The
-         * degenerate case is real: with the external beamformer disabled the
-         * bypass emits identity weights [1,0,0,0], and lanes 1-3 would still
-         * drive max_dt, which selects the residual suppressor's floor.
-         *
-         * With a beamformer that actually beamforms, every lane carries
-         * weight somewhere and this skips nothing: the reductions see the
-         * same four lanes they always did, bit for bit. */
+        /* A lane the beamformer zeroed in every bin contributes nothing, so it must not vote on the scalars that steer the post stage (with the beamformer bypassed the weights are [1,0,0,0] and lanes 1-3 would still drive max_dt). */
         int lane_contributes = 0;
         for (k = 0; k < n; ++k) {
             if (lane_weights[k].r != 0.0f || lane_weights[k].i != 0.0f) {
@@ -1532,13 +1060,7 @@ static int fuse_contexts(FourAecNrRes* p,
                 *max_saturation = p->snapshots[ch].saturation_level;
         }
 
-        /* A mixed warm/soft-realign hop is skipped past this predicate
-         * entirely rather than asked to approve the lanes' now-legitimately-
-         * different far_spec (see four_aec_nr_res_far_spec_agrees()'s own
-         * comment above for why this is a separate bypass, not a change to
-         * what that predicate answers). The fused X still takes lane 0's
-         * far_spec either way (frame->x = snapshots[0].far_spec in
-         * four_aec_fuse()), matching pipeline.py's _fuse_contexts(). */
+        /* A mixed warm/soft-realign hop skips this predicate. The fused X takes lane 0's far_spec either way. Python reference: 4ch_aec_bf_nr_res/pipeline.py:_fuse_contexts. */
         if (!p->far_spec_mixed_hop && !four_aec_nr_res_far_spec_agrees(
                 p->far_spec_shared_hop,
                 p->snapshots[ch].far_spec,
@@ -1565,10 +1087,6 @@ static int fuse_contexts(FourAecNrRes* p,
     four_aec_complex_mag2(p->fused_r2, p->residual_proj, n);
     return 1;
 }
-
-/* ============================================================================
- * Per-hop processing — Stage 2: the beamformer-weighted projection
- * ========================================================================== */
 
 int four_aec_fuse(
     FourAecNrRes* p,
@@ -1636,15 +1154,9 @@ int four_aec_nr_res_stage_configs(
     return 0;
 }
 
-/* ============================================================================
- * Reset and teardown
- * ========================================================================== */
-
-/* Legal at any time. A caller still holding a FourAecFront must stop reading
- * its pointers the instant this is called: they alias per-lane AecResContext
- * buffers that aec_reset() does not clear, so a violation shows as stale
- * content, not as a fault. four_aec_fuse() refuses to run until a new front
- * frame has been processed. */
+/* Legal at any time. A caller holding a FourAecFront must stop reading its pointers: they
+ * alias lane buffers that aec_reset() does not clear (stale content, not a fault).
+ * four_aec_fuse() refuses to run until a new front frame is processed. */
 void four_aec_nr_res_reset(FourAecNrRes* p) {
     int ch;
     if (!p || p->destroyed) return;
@@ -1667,26 +1179,17 @@ void four_aec_nr_res_reset(FourAecNrRes* p) {
     p->accepted_delay =
         p->cfg.delay_mode == AEC_DELAY_FIXED
             ? p->cfg.fixed_delay_samples : 0;
-    /* A reset abandons the alignment the quarantine was protecting, so a
-     * countdown armed against it must not survive. The WINDOW
-     * (delay_quarantine_hops) is config-derived and stays. Same for a held
-     * change candidate and the life left on it: it describes a movement away
-     * from an alignment the reset abandoned, and the next acquisition is
-     * immediate anyway. */
+    /* A reset abandons the alignment the quarantine was protecting, so the countdown and any
+     * held change candidate (with its life) are cleared; the config-derived window stays. */
     p->delay_quarantine_left = -1;
     p->delay_admission.candidate = 0;
     p->delay_admission.ttl = 0;
-    /* Zeroed with the lanes' own counters (aec_reset() clears the per-lane
-     * far-FFT count), so every instrumentation total shares one epoch. */
     p->realign_warm_lanes = 0;
     p->realign_soft_lanes = 0;
     p->delay_calls = 0;
     p->far_spec_shared_hop = 0;
     p->far_spec_mixed_hop = 0;
-    /* The duty machine measured the alignment this reset just abandoned, so
-     * it re-arms with it: full-rate analysis, no hold, no peak, and a census
-     * that starts over rather than blending two regimes into one ratio.
-     * The two window figures are grid-derived and stay. */
+    /* The duty machine measured the alignment this reset abandoned: full-rate analysis, no hold, no peak, fresh census; the grid-derived windows stay. */
     p->duty_active = 0;
     p->duty_stable_hops = 0;
     p->duty_pos = 0;
@@ -1709,10 +1212,6 @@ void four_aec_nr_res_destroy(FourAecNrRes* p) {
     p->destroyed = 1;
     if (owned_heap) free(owned_heap);
 }
-
-/* ============================================================================
- * Read-only shape/topology accessors
- * ========================================================================== */
 
 int four_aec_nr_res_hop_size(const FourAecNrRes* p) {
     return p && !p->destroyed ? p->hop_size : -1;
@@ -1758,8 +1257,6 @@ long four_aec_nr_res_realign_soft_lane_count(const FourAecNrRes* p) {
 }
 
 unsigned long long four_aec_nr_res_duty_hops_total(const FourAecNrRes* p) {
-    /* Alias of delay_calls: the estimator is fed on every analysed hop, so
-     * the census denominator IS the call count -- no second field to drift. */
     return p && !p->destroyed ? p->delay_calls : 0ull;
 }
 
@@ -1771,17 +1268,7 @@ int four_aec_nr_res_far_spec_provenance(const FourAecNrRes* p) {
     return p && !p->destroyed ? p->far_spec_shared_hop : 0;
 }
 
-/* Declared in 4aec_nr_res_internal.h; see there for why a harness needs it.
- * A period of ONE hop is what "analyse every hop" is spelled as at the
- * decision site: duty_pos advances into the period and immediately wraps, so
- * run_filter is true whether or not the machine ever arms, and the arming,
- * the hold and the watchdog keep running and keep being measurable through
- * the census. init's own floor is 1 too (see the
- * carve-site comment), so at the default cfg.delay_est_period_s=0.0 this
- * call is already a no-op -- this setter earns its keep only for a core
- * built with a non-zero delay_est_period_s (the opt-in throttle), where it
- * forces the schedule back to full rate for a parity harness without
- * disturbing anything else the duty machine tracks. */
+/* Declared in 4aec_nr_res_internal.h. A period of one hop is "analyse every hop" at the decision site, while arming, hold and watchdog keep running and stay measurable through the census. A no-op at the default 0.0 period. */
 void four_aec_nr_res_pin_duty_full_rate(FourAecNrRes* p) {
     if (!p || p->destroyed) return;
     p->duty_period_hops = 1;
@@ -1805,10 +1292,6 @@ int four_aec_nr_res_pending_delay_candidate(const FourAecNrRes* p) {
     if (!p || p->destroyed || p->delay_admission.ttl <= 0) return -1;
     return p->delay_admission.candidate;
 }
-
-/* ============================================================================
- * Diagnostic memory breakdown
- * ========================================================================== */
 
 int four_aec_nr_res_get_mem_breakdown(
     const FourAecNrResConfig* cfg,
@@ -1853,12 +1336,7 @@ int four_aec_nr_res_get_mem_breakdown(
     return 0;
 }
 
-/* ============================================================================
- * Diagnostic per-stage timing
- * ========================================================================== */
-
-/* See FourAecNrResLastTiming's doc comment (4aec_nr_res.h) for the full
- * stage-boundary reference. */
+/* See FourAecNrResLastTiming (4aec_nr_res.h). */
 void four_aec_nr_res_get_last_timing(
     const FourAecNrRes* p,
     FourAecNrResLastTiming* out) {

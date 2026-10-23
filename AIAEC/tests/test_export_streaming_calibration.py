@@ -228,12 +228,11 @@ def test_policy_tensors_carry_a_marker_instead_of_numeric_ranges(tmp_path):
 def test_primary_is_mic_derives_and_persists_linear_error(tmp_path):
     """--primary-is-mic runs the frozen PBFDKF on RAW mic pairs.
 
-    The derived linear-error stems must be written beside the artifact (the
-    recorded tensors stay auditable and reusable) and the manifest must say
-    where its primary came from -- a consumer pairing calibration with
-    training data has to be able to tell derived stems from materialized
-    ones. The derived stem must actually BE the engine's error: on this
-    echo-only scene it carries less energy than the raw microphone.
+    The derived linear-error stems must be written beside the artifact
+    (recorded tensors stay auditable and reusable) and the manifest must say
+    where its primary came from, so a consumer can tell derived stems from
+    materialized ones. The derived stem must actually BE the engine's error: on
+    this echo-only scene it carries less energy than the raw microphone.
     """
     from AIAEC import _streaming_calibration as calibration
     from AIAEC.Align_ULCNet import export_onnx as ulcnet_export  # noqa: F401

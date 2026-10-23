@@ -8,7 +8,7 @@ about the arithmetic, not about a network.
 
 * compose: bit-exact (``np.array_equal``) on every emitted frame -- the stage
   performs each multiply and add as its own float32 operation, in the C order;
-* features: the existing AINR parity band (rtol 2e-5 / atol 3e-6), because the
+* features: the AINR parity band (rtol 2e-5 / atol 3e-6), because the
   torch reference the stage reuses is not the C's op order.
 """
 import ctypes

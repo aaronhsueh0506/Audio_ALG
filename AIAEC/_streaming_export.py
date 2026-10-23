@@ -1,28 +1,24 @@
 #!/usr/bin/env python3
 """Internal stateless ONNX backend for model-local AIAEC exporters.
 
-One new STFT frame is supplied per invocation for causal models. Every
-temporal convolution history, attention ring and recurrent hidden tensor is
-an ordinary graph input/output.
-
-Align-ULCNet keeps its specialised exporter because its full-state ABI is
-already paired with ``ulcnet_model_io.c``.
+One new STFT frame is supplied per invocation for causal models; every temporal
+convolution history, attention ring and recurrent hidden tensor is an ordinary
+graph input/output. Align-ULCNet keeps its specialised exporter because its
+full-state ABI is already paired with ``ulcnet_model_io.c``.
 
 State boundary
 --------------
 
-Every state tensor is rank 4 and comes back from the graph in full with its
-input's shape, so each ``*_out`` can be bound to the address of its input.
+Every state tensor is rank 4 and comes back in full with its input's shape, so
+each ``*_out`` can be bound to the address of its input.
 
-* Time-extended convolutions keep their whole input window (oldest first).
-  The graph cuts the history off the window input with a Slice and
-  concatenates the new frame behind it; the Concat result is the output.
+* Time-extended convolutions keep their whole input window (oldest first): the
+  graph cuts the history off with a Slice and concatenates the new frame.
 * Delay rings (newest first) keep slots ``0..D-2`` through a Slice and
   concatenate the new frame in front.
-* A GRU hidden ``[layers, N, H]`` crosses the boundary as ``[1, layers, N, H]``.
-  A model with several GRU hiddens stacks them on dim 1 into one ``h_gru``
-  tensor placed after the other states (they must share one shape); a model
-  with a single hidden already has one tensor called ``h_gru``.
+* A GRU hidden ``[layers, N, H]`` crosses as ``[1, layers, N, H]``. Several GRU
+  hiddens (one shape) are stacked on dim 1 into one ``h_gru`` placed after the
+  other states; a single hidden is already called ``h_gru``.
 * Vector and scalar accumulators are lifted to ``[1, 1, N, D]`` / ``[1, 1, 1, 1]``.
 
 ``export_graph`` validates the written file with
@@ -319,13 +315,10 @@ def state_precision_policy(model_name: str) -> Dict[str, str]:
 def requires_contiguous_calibration(model_name: str) -> bool:
     """Whether calibration must come from ONE uninterrupted source stream.
 
-    The same cumulative Align-CRUSE state that ``state_precision_policy``
-    keeps out of integer PTQ also makes stitched calibration meaningless:
-    joining short files resets ``score_sum`` at every boundary, so the
-    recorded range describes a session length no deployment will ever see.
-    Every calibration decision that depends on that -- skipping short
-    sources, the failure message, the recorded frame count -- reads this one
-    predicate rather than re-testing the model name.
+    The cumulative Align-CRUSE state that ``state_precision_policy`` keeps out
+    of integer PTQ also makes stitched calibration meaningless: joining short
+    files resets ``score_sum`` at every boundary. Skipping short sources, the
+    failure message and the recorded frame count all read this one predicate.
     """
     return model_name == 'Align_CRUSE'
 
@@ -459,14 +452,11 @@ def _hidden_name(path: str) -> str:
 def _fold_three_vector_conv(conv: nn.Conv2d, pairs: int) -> nn.Conv2d:
     """Fold DeepVQE's three-vector -> complex map into the last conv.
 
-    ``conv`` is the bias-free conv under ``ccm_up`` whose output channel
-    ``(p * 3 + v) * 2 + s`` carries tap ``p``, vector component ``v`` and
-    sub-pixel phase ``s``. Everything between that conv and the CCM taps
-    (sub-pixel shuffle, frequency fit, ``re = w0 - w1/2 - w2/2``,
-    ``im = sqrt(3)/2 * (w1 - w2)``) is linear and per position, so the map
-    is applied to the weights once. The folded conv emits channel
-    ``(s * pairs + p) * 2 + ri``: phase-major, so one reshape recovers
-    the shuffled bin order. The model's own conv is left untouched.
+    ``conv`` is the bias-free conv under ``ccm_up`` whose output channel ``(p *
+    3 + v) * 2 + s`` carries tap ``p``, vector component ``v`` and sub-pixel
+    phase ``s``. Everything after it (shuffle, frequency fit, ``re = w0 - w1/2
+    - w2/2``, ``im = sqrt(3)/2 * (w1 - w2)``) is linear and per position, so
+    the map is applied to the weights once; the model's own conv is untouched.
     """
     weight = conv.weight.detach()
     if conv.bias is not None or weight.shape[0] != pairs * 3 * 2:
@@ -492,12 +482,10 @@ def _fold_batch_norm_into_upsample_conv(conv: nn.Conv2d,
     """Fold an eval-mode BatchNorm that follows a sub-pixel shuffle into the
     bias-free conv before it.
 
-    The conv emits ``2 * C`` channels and the shuffle reads them as
-    ``(c, phase)``, so channel ``2c + phase`` lands in post-shuffle channel
-    ``c``. The norm is a per-``c`` affine map, which commutes with the
-    shuffle and with a frequency crop: every phase of channel ``c`` gets the
-    same scale on its weights and the same shift as its new bias. The
-    model's own conv is left untouched.
+    The conv emits ``2 * C`` channels read as ``(c, phase)``; the norm is a
+    per-``c`` affine map that commutes with the shuffle and a frequency crop,
+    so both phases of channel ``c`` get the same weight scale and the same
+    shift as their new bias. The model's own conv is untouched.
     """
     if conv.bias is not None or norm.training or not norm.track_running_stats:
         raise ValueError('upsample norm cannot be folded: need a bias-free '
@@ -924,12 +912,11 @@ def export_graph(grid, built, checkpoint_path, output_path, checkpoint_depth,
                  opset=17, verify=False):
     """Write the streaming graph plus its metadata JSON; optionally verify.
 
-    Shared by the export CLI and the calib recorder, so the calibration
-    tensors and the graph they bind to always come from the same wrapper in
-    the same process. ``checkpoint_depth`` is the alignment depth the
-    checkpoint recorded, captured by the caller BEFORE any deployment
-    override -- it cannot be recovered from the model afterwards. Returns
-    the metadata written into the graph.
+    Shared by the export CLI and the calib recorder, so the calibration tensors
+    and the graph they bind to come from the same wrapper in the same process.
+    ``checkpoint_depth`` is the alignment depth the checkpoint recorded,
+    captured by the caller BEFORE any deployment override. Returns the metadata
+    written into the graph.
     """
     wrapper, inputs, input_names, output_names, split = built
     model_name = wrapper.model_name

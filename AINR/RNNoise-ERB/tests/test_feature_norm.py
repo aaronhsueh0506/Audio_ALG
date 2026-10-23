@@ -1,4 +1,5 @@
-"""Python contract tests for log_erb_dfn_mean_cplx_unit_0_4k_v5."""
+"""Python contract tests for the RNNoise-ERB feature contract
+(FEATURE_VERSION)."""
 
 import unittest
 import pathlib

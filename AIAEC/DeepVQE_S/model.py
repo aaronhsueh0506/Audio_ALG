@@ -1,9 +1,8 @@
 """DeepVQE-S: compact end-to-end AEC + NS + dereverberation model.
 
-Reconstructed from Indenbom et al., INTERSPEECH 2023 / arXiv:2306.03177.
-No official training implementation or checkpoint was published, so this file
-keeps the paper's stated channel schedules and operators and exposes every
-reconstruction choice in the sibling README.
+After Indenbom et al., INTERSPEECH 2023 / arXiv:2306.03177. It keeps the
+paper's channel schedules and operators; reconstruction choices are listed in
+the sibling README.
 """
 
 from __future__ import annotations

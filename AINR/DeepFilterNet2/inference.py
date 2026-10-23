@@ -112,14 +112,14 @@ def load_model(args):
 
 
 def apply_atten_lim(noisy_spec, enhanced_spec, atten_lim_db):
-    """Attenuation limit, ported verbatim from Rikorose/DeepFilterNet's
-    ``enhance.py``: ``enhanced = noisy*lim + enhanced*(1-lim)``,
-    ``lim = 10**(-|atten_lim_db|/20)``. Unlike RNNoise-ERB (a real-valued
-    per-band gain), DFN2's deep-filter output is a genuinely different
-    complex spectrum (multi-tap complex combination, not just noisy times a
-    real mask), so the mix has to happen on the complex spectra directly
-    rather than on some intermediate gain -- this is the exact mechanism the
-    upstream CLI's ``--atten-lim``/``-a`` flag uses.
+    """Attenuation limit, ported from Rikorose/DeepFilterNet's ``enhance.py``:
+    ``enhanced = noisy*lim + enhanced*(1-lim)``, ``lim =
+    10**(-|atten_lim_db|/20)``.
+
+    Unlike RNNoise-ERB (a real-valued per-band gain), DFN2's deep-filter output
+    is a multi-tap complex combination, not noisy times a real mask, so the mix
+    happens on the complex spectra directly (the mechanism of the upstream
+    CLI's ``--atten-lim``/``-a`` flag).
     """
     if atten_lim_db is None or abs(atten_lim_db) == 0:
         return enhanced_spec

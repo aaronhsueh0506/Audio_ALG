@@ -218,12 +218,11 @@ def test_alignment_qa_accepts_a_delay_that_agrees_with_the_offline_truth():
 def test_alignment_qa_marks_a_confidently_wrong_delay_invalid():
     """The gate must reject a lock the raw signals contradict.
 
-    Same clip as above, but the estimator reports a delay far from the one the
-    raw correlation measures -- the shape of the mis-lock this QA exists to
-    keep out of a delay-profile statistic. Both directions are checked: a
-    reference left too early (a large positive residual the model's attention
-    could not span) and one pushed too late (a negative residual no causal
-    filter can explain).
+    Same clip, but the estimator reports a delay far from the one the raw
+    correlation measures (the mis-lock this QA keeps out of a delay-profile
+    statistic). Both directions are checked: a reference left too early (a
+    large positive residual the attention could not span) and one pushed too
+    late (a negative residual no causal filter can explain).
     """
     true_delay = 1600
     offline = None
@@ -316,9 +315,7 @@ def test_alignment_qa_does_not_treat_negative_bulk_lag_as_in_range():
     assert qa['qa_valid'] is False
 
     # Same negative offline verdict with an ACQUIRED delay: also undecidable
-    # (before the negative-lag guard this arm reported 'mislock'; either way
-    # qa_valid stays False, but the changed diagnosis in summary.csv is
-    # intended, so pin it).
+    # (qa_valid stays False); the diagnosis in summary.csv is pinned.
     acquired_run = dataclasses.replace(
         run, delay_samples=np.full(4, 160, dtype=np.int64)
     )

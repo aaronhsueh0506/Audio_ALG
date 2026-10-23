@@ -1,76 +1,46 @@
-"""Phase-0 alignment-residual meter for the AEC -> NN seam.
+"""Alignment-residual meter for the AEC -> NN seam.
 
 The AIAEC models consume the frozen Python PBFDKF frontend's ``linear_error``
 together with a far-end reference. The frontend aligns that reference itself
-(delay estimator + ring-buffer compensation), so the question this tool
-answers is: after the frontend's own alignment, HOW MUCH residual lag is left
-between the far-end the filter actually consumed and the echo path -- i.e.
-how far into the past (or, pathologically, the future) would a causal NN have
-to look to explain the echo.
+(delay estimator + ring-buffer compensation); this tool measures how much
+residual lag is left between the far-end the filter actually consumed
+(``engine.filter.far_buffer[-hop:]``, post ring compensation) and the echo
+path, i.e. how far into the past a causal NN has to look.
 
-Per processed hop it records, read-only from the engine:
+Per processed hop it records, read-only from the engine, the applied delay
+(``_current_delay``; -1 = not yet acquired), the estimator confidence
+(0 / 0.5 / 1) and that aligned far-end. Per ~1 s window it cross-correlates the
+aligned far-end against an echo target over +-``max_lag`` samples (default 2048
+= +-128 ms at 16 kHz) and reports the peak lag. Every number is labelled with
+its source:
 
-* the applied delay (orchestrator ``_current_delay``; -1 = not yet acquired),
-* the delay-estimator confidence (0 / 0.5 / 1),
-* the ACTUAL aligned far-end the PBFDKF consumed this hop
-  (``engine.filter.far_buffer[-hop:]`` -- the post-ring-compensation samples,
-  which is the whole point of tapping here instead of re-deriving alignment
-  from the reported delay).
+* ``d_hat_proxy``: the target is ``D_hat = mic - linear_error`` (corpus/--mic
+  modes and ``--self-test``); valid only once the filter has converged.
+* ``true_echo``: ``--synthetic-echo-test`` renders short sequences in memory
+  with ``aec_dataset.AecSequenceRenderer`` and measures the same tap against
+  ``RenderedSequence.audit['echo']``, asserting the post-lock residual is
+  positive and < 12 ms and that the proxy agrees within one histogram quantum
+  (64 samples).
 
-Per ~1 s analysis window it cross-correlates that aligned far-end against an
-echo target over lags of +-``max_lag`` samples (default 2048 = +-128 ms at
-16 kHz, wide enough to bound a D=8 hop attention span) and reports the peak
-lag.
+Sign convention: ``lag > 0`` means the aligned far-end is EARLY relative to the
+echo path (a causal NN looks ``lag`` samples into the past; the healthy
+direction). ``lag < 0`` means it is LATE: explaining the echo would need FUTURE
+far-end samples, which is the alignment failure this meter counts.
 
-MEASUREMENT SOURCES (every reported number is labelled with one of these):
+Trust gates: a window is LOCKED only when the estimator confidence is solid
+(>= 1.0 if the run's confidence reaches 1.0, else >= 0.5), the applied delay is
+unchanged across the window and at least ``--settle-s`` (default 0.5 s) has
+passed since the last delay change; other measured windows count as
+``n_windows_unsettled``. ``frac_boundary_peak`` is the fraction of windows
+peaking ON the search boundary (the range is too small). ``frac_undecidable`` =
+(silent + low-correlation + unsettled) / total; ``--max-undecidable`` (default
+0.5) makes the CLI exit nonzero when exceeded.
 
-* ``d_hat_proxy`` -- the target is ``D_hat = mic - linear_error``, the
-  PBFDKF's OWN echo estimate. This is what the corpus/--mic modes and
-  ``--self-test`` measure; it is a valid proxy only once the filter has
-  converged, which is exactly why the tool also has:
-* ``true_echo`` -- ``--synthetic-echo-test`` renders short sequences in
-  memory with the repo's own generator (``aec_dataset.AecSequenceRenderer``)
-  and measures the SAME aligned-far tap against the rendered ground-truth
-  echo (``RenderedSequence.audit['echo']``), asserting the post-lock residual
-  is positive and < 12 ms and that the proxy agrees with the true echo within
-  one histogram quantum (64 samples). Source WAV fixtures live in an
-  ephemeral temporary directory; no corpus is written to disk.
-
-Sign convention (load-bearing -- keep consistent everywhere):
-    ``lag > 0``  means the aligned far-end is EARLY relative to the echo
-    path: the target is best explained by ``aligned_far(t - lag)``, so a
-    causal NN looks ``lag`` samples into PAST far-end context. This is the
-    healthy direction (delay headroom + estimator quantization).
-    ``lag < 0``  means the aligned far-end is LATE: explaining the echo would
-    require FUTURE far-end samples, which neither the linear filter nor a
-    causal NN can see. Negative-lag windows are the alignment failures this
-    meter exists to count.
-
-TRUST GATES (a report full of unmeasurable windows must never read as a pass):
-
-* A window only counts as LOCKED when the estimator confidence is solid
-  (>= 1.0 when the run's confidence scale reaches 1.0, else >= 0.5), the
-  applied delay is unchanged across the whole window, AND at least
-  ``--settle-s`` (default 0.5 s) has elapsed since the last delay change.
-  Windows that measured a lag but fail this gate are counted as
-  ``n_windows_unsettled`` and excluded from the residual statistics.
-* ``frac_boundary_peak`` is the fraction of measured windows whose
-  correlation peak lands ON the +-``max_lag`` search boundary; any nonzero
-  value means the search range is too small and the report says so.
-* ``frac_undecidable`` = (silent + low-correlation + unsettled) / total
-  windows. ``--max-undecidable`` (default 0.5) makes the CLI exit nonzero
-  when it is exceeded.
-
-The engine under ``lib/aec`` is used strictly read-only (public ``process``/
-``get_formed_output`` plus attribute reads); nothing in ``lib/`` is imported
-for mutation and nothing there is modified.
-
-Self-proof: ``--self-test`` builds synthetic scenes internally (white-noise
-far, mic = delayed far + short echo tail), asserts the measured residual
-(vs the D_hat proxy) is positive and bounded after delay lock, that
-artificially shifting the tool's own aligned-far tap by +N samples moves the
-measurement by ~N, and that an injected negative lag is reported negative.
-It needs no corpus and exits nonzero on failure.
+The engine under ``lib/aec`` is used strictly read-only. ``--self-test`` builds
+synthetic scenes (white-noise far, mic = delayed far + short echo tail) and
+asserts the residual is positive and bounded after lock, that shifting the
+tool's own tap by +N samples moves the measurement by ~N, and that an injected
+negative lag reads negative; it needs no corpus and exits nonzero on failure.
 
 Usage:
     python3 -m AIAEC.dataset_gen.measure_align_residual --self-test
@@ -164,18 +134,11 @@ def run_linear_aec_with_taps(
 ) -> EngineRun:
     """Run the frozen PBFDKF hop loop, tapping per-hop alignment state.
 
-    THE seam of ``LinearAecProcessor.process_numpy`` -- this drives that very
-    loop through its ``hop_tap`` callback rather than maintaining a copy of
-    it -- with per-hop reads of the applied delay, estimator confidence, and
-    the filter's actual aligned far-end input. Inputs are zero-padded at the
-    tail to a whole number of hops (``process_numpy`` itself refuses partial
-    hops).
-
-    ``delay_num_filters`` deploys a matched-filter bank other than the corpus
-    one for THIS diagnostic run; ``contract`` is untouched by it (the bank size
-    is not a recorded contract field). The size reported back in
-    :class:`EngineRun` is read off the constructed engine, so a run cannot
-    claim a profile it did not actually execute.
+    Drives ``LinearAecProcessor.process_numpy``'s own loop through its
+    ``hop_tap`` callback, reading the applied delay, estimator confidence and
+    the filter's aligned far-end input per hop. ``delay_num_filters`` deploys
+    another matched-filter bank for THIS diagnostic run without touching
+    ``contract``; the size in :class:`EngineRun` is read off the engine.
     """
     processor = LinearAecProcessor(
         contract, delay_num_filters=delay_num_filters
@@ -302,11 +265,9 @@ def _correlate_valid(fseg: np.ndarray, dwin: np.ndarray) -> np.ndarray:
     """``np.correlate(fseg, dwin, mode="valid")`` computed via FFT.
 
     The same quantity to floating-point rounding (~5e-15 relative at this
-    meter's window sizes, verified argmax-identical); the direct form is
-    O(window x lag_range) per window and dominates wall time once the QA path
-    searches +-1 s of lag, where this is >100x faster. Zero-padding to
-    >= len(fseg) keeps every retained output index free of circular
-    wraparound.
+    meter's window sizes, argmax-identical); the direct form is O(window x
+    lag_range) per window and >100x slower on the QA path's +-1 s search.
+    Zero-padding to >= len(fseg) avoids circular wraparound.
     """
     n_out = fseg.size - dwin.size + 1
     n_fft = 1
@@ -345,26 +306,13 @@ def measure_residual_windows(
     min_peak_corr: float = MIN_PEAK_CORR,
     settle_s: float = DEFAULT_SETTLE_S,
 ) -> Tuple[List[WindowMeasurement], Dict[str, int]]:
-    """Windowed residual lag between the aligned far tap and ``echo_target``.
+    """Windowed residual lag of the aligned far tap against ``echo_target``.
 
-    ``echo_target`` is either the engine's own ``D_hat`` (proxy) or a
-    rendered true echo -- the measurement is identical; the CALLER is
-    responsible for labelling the result with its source.
-
-    Returns ``(measurements, skipped)`` where ``skipped`` counts windows
-    dropped for ``far_silent`` (no reference excitation) or ``low_corr``
-    (echo target not explained by the reference at any searched lag).
-
-    A window is ``locked`` only when, over every hop it overlaps: the applied
-    delay is acquired AND constant, the estimator confidence is solid (see
-    :func:`solid_confidence_threshold`; hops with no confidence signal cannot
-    be gated and pass vacuously), and at least ``settle_s`` has elapsed
-    between the last applied-delay change and the window start.
-
-    ``far_tap_shift`` artificially shifts the tool's OWN aligned-far tap (see
-    :func:`shift_signal`) before measuring; it exists so the self-test can
-    prove the meter tracks an injected alignment error. It never touches the
-    engine.
+    ``echo_target`` is the engine's ``D_hat`` (proxy) or a rendered true echo;
+    the CALLER labels the source. A window is ``locked`` only when, over every
+    hop it overlaps, the applied delay is acquired and constant, the confidence
+    is solid and ``settle_s`` has elapsed since the last delay change.
+    ``far_tap_shift`` shifts the tool's OWN tap for the self-test.
     """
     far = np.asarray(aligned_far, dtype=np.float64)
     dhat = np.asarray(echo_target, dtype=np.float64)
@@ -543,14 +491,10 @@ def measure_pair(
 def aggregate_results(results: Sequence[FileResult]) -> Dict:
     """Corpus-level residual statistics over LOCKED windows.
 
-    Unsettled windows (pre-lock, mid-delay-change, low confidence, or inside
-    the post-change settle time) measure the estimator's transient, not the
-    steady-state seam the NN trains on; they are excluded from the lag
-    statistics and accounted for via ``n_windows_unsettled`` and
-    ``frac_undecidable``.
-
-    The aggregation itself is source-agnostic: the caller labels the result
-    with whichever echo target (D_hat proxy or true echo) produced it.
+    Unsettled windows measure the estimator's transient, not the steady-state
+    seam the NN trains on, so they are excluded from the lag statistics and
+    accounted for via ``n_windows_unsettled`` and ``frac_undecidable``. The
+    aggregation is source-agnostic: the caller labels the echo target.
     """
     measured = [w for r in results for w in r.windows]
     locked_lags_ms = [w.lag_ms for w in measured if w.locked]
@@ -766,18 +710,11 @@ def run_self_test(
 ) -> Dict:
     """Prove the meter on synthetic scenes with known ground truth.
 
-    Residuals here are measured against the D_HAT PROXY (mic - linear_error),
-    the same seam the corpus modes use; ``run_synthetic_echo_test`` is the
-    true-echo counterpart. Three properties per bulk delay (see module
-    docstring for context):
-      1. after the locked-window gate (stable delay + solid confidence +
-         settle), the measured residual is positive and below
-         ``max_residual_ms``;
-      2. shifting the tool's own aligned-far tap by +N samples moves the
-         measured residual by ~N (the meter tracks an injected error);
-      3. an injected negative lag (delaying the tap past the true residual)
-         is reported negative.
-    Needs no corpus. Returns a report dict with ``passed``.
+    Residuals are measured against the D_HAT PROXY. Per bulk delay: (1) after
+    the locked-window gate the residual is positive and below
+    ``max_residual_ms``; (2) shifting the tool's aligned-far tap by +N samples
+    moves it by ~N; (3) an injected negative lag reads negative. Needs no
+    corpus; returns a report dict with ``passed``.
     """
     contract = make_linear_aec_contract(sample_rate)
     n = int(duration_s * sample_rate)
@@ -1035,19 +972,11 @@ def run_synthetic_echo_test(
 ) -> Dict:
     """Prove the residual bound against TRUE echo, not just the D_hat proxy.
 
-    The corpus modes correlate aligned_far against D_hat = mic -
-    linear_error, the PBFDKF's OWN estimate -- a valid proxy only when the
-    filter converged. This mode renders a few short clean sequences with the
-    repo's own generator and measures the SAME aligned-far tap against the
-    rendered ground-truth echo (``RenderedSequence.audit['echo']``).
-
-    Per sequence it asserts, over locked windows:
-      1. the TRUE-ECHO residual is positive and below ``max_residual_ms``
-         (the same bounds the D_hat self-test enforces);
-      2. the D_hat-proxy residual agrees with the true-echo residual within
-         ``agreement_quantum`` samples (one histogram quantum);
-      3. no measured window peaks on the +-max_lag search boundary.
-    Both numbers are reported, each labelled with its source.
+    Renders short clean sequences and measures the aligned-far tap against
+    ``RenderedSequence.audit['echo']``. Per sequence, over locked windows: (1)
+    the true-echo residual is positive and below ``max_residual_ms``; (2) the
+    proxy residual agrees within ``agreement_quantum`` samples; (3) no window
+    peaks on the +-max_lag boundary.
     """
     cases: List[Dict] = []
     passed = True

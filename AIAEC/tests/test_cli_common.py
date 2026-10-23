@@ -167,13 +167,11 @@ def test_every_inference_entry_uses_shared_resampling(candidate):
 def test_shared_hop_loop_reproduces_the_offline_forward(candidate, tmp_path):
     """The generic CLIs share ONE hop loop, and it must still be the reference.
 
-    Three near-identical schedules were folded into ``_cli_common``;
-    nothing else drives that loop end to end.  This runs the real
-    ``_streaming.main`` over real WAVs -- with only the checkpoint loader
-    injected, so no checkpoint fixture is needed -- and compares the file it
-    wrote against the whole-utterance forward.  That is the comparison
-    ``--verify`` prints without gating, so a resampling, framing, flush or
-    state-handoff mistake in the shared loop fails here instead of shipping.
+    Nothing else drives that loop end to end. This runs the real
+    ``_streaming.main`` over real WAVs (only the checkpoint loader injected)
+    and compares the file it wrote against the whole-utterance forward, the
+    comparison ``--verify`` prints without gating, so a resampling, framing,
+    flush or state-handoff mistake in the shared loop fails here.
     """
     from types import SimpleNamespace
 

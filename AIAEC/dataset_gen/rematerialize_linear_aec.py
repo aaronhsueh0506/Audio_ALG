@@ -4,38 +4,27 @@
 This does not rerender speech/noise/RIR mixtures. It concatenates each parent
 sequence in ``chunk_index`` order, runs one fresh Python PBFDKF over that full
 waveform, then atomically rewrites every chunk with ``linear_error`` as the
-last channel (channel five under the current ``STEM_ORDER``; legacy
-``BASE_STEM_ORDER``-only inputs have four).
+last channel (channel five under ``STEM_ORDER``; ``BASE_STEM_ORDER``-only
+inputs have four).
 
-Input is the rendered audio and ``--config``, nothing else -- the corpus has no
-sidecars and no run meta.json (see gen_aec_dataset.py). Sequences and chunk
-order come from the ``SSSSSS_CCC.wav`` filenames; rate, length and the current
-channel count come from the WAV headers.
+Input is the rendered audio and ``--config``, nothing else (see
+gen_aec_dataset.py): sequences and chunk order come from the ``SSSSSS_CCC.wav``
+filenames; rate, length and channel count from the WAV headers.
 
-Sequences are independent by construction -- each gets a fresh PBFDKF -- and
-each writes only its own chunks, so ``--jobs N`` fans them across processes
-and scales approximately with N until CPU or memory bandwidth saturates.
-That is the only lever worth pulling: measured on a 16 kHz corpus the Python
-PBFDKF is 99.8% of the run and all file I/O is 0.1%, at roughly 3.3x realtime
-per process. Nothing about the WAV handling is worth optimizing, and the
-read-back check after every write costs nothing measurable.
+Sequences are independent (each gets a fresh PBFDKF and writes only its own
+chunks), so ``--jobs N`` fans them across processes and scales roughly with N;
+the Python PBFDKF is 99.8% of the run, so nothing about the WAV handling is
+worth optimizing. The output does not depend on N
+(tests/test_rematerialize_linear_aec.py compares --jobs 1 with --jobs 3). ⚠
+Compare AUDIO, not file bytes: libsndfile stamps a PEAK chunk with the
+wall-clock time, so any two runs differ in one byte.
 
-The output does not depend on N: structurally there is no shared state and no
-random source for it to depend on, and tests/test_rematerialize_linear_aec.py
-compares every sample of --jobs 1 against --jobs 3.
-
-⚠ If you check that yourself, compare AUDIO, not file bytes. libsndfile stamps
-a PEAK chunk with the wall-clock time when it writes a float WAV, so any two
-runs seconds apart differ in one byte at offset 61 -- at any --jobs, including
-two serial runs.
-
-``--resume`` skips a sequence only when THIS contract already wrote it and
-that sequence's chunks still match on disk -- the ledger (see linear_error_ledger) records what was WRITTEN, not what survived. A full pass empties
-the ledger first, so it cannot inherit a claim it did not make, and
-pack_aec_dataset refuses a ledger that names only some of the corpus. A ledger written
-by a different contract is ignored wholesale rather than partially trusted, so
-a resumed run after a [linear_aec] change redoes everything instead of leaving
-a corpus with two frontends mixed into it.
+``--resume`` skips a sequence only when THIS contract already wrote it and its
+chunks still match on disk; the ledger (see linear_error_ledger) records what
+was WRITTEN, not what survived. A full pass empties the ledger first, and
+pack_aec_dataset refuses a ledger that names only some of the corpus. A ledger
+written by a different contract is ignored wholesale, so a resumed run after a
+[linear_aec] change redoes everything instead of mixing two frontends.
 """
 
 from __future__ import annotations
@@ -225,11 +214,9 @@ def rematerialize(args) -> None:
     if args.resume:
         claimed = load_ledger(seqs_dir, contract_hash)
         # The ledger records what this contract WROTE, not what is still on
-        # disk. A file deleted, truncated or half-restored since then would be
+        # disk. A file deleted, truncated or half-restored since would be
         # skipped on its say-so, so every claim is re-checked against the
-        # actual chunks before it is honoured. One torchaudio.info() per chunk,
-        # measured at 67 us warm: about 5 s to re-check a whole 200-hour corpus,
-        # and zero on a full pass, which never enters this branch.
+        # actual chunks (one torchaudio.info() each) before it is honoured.
         done = {sid for sid in claimed
                 if sid in sequences
                 and _sequence_is_current(sequences[sid], sr, chunk_samples)}

@@ -1,22 +1,9 @@
-/**
- * audio_pipeline_4ch.c — complete four-channel spatial pipeline.
- *
- * This is the deployable orchestrator around 4aec_nr_res.c:
- *
- *   four_aec_front_process -> SRP-PHAT DOA -> BF effective weights
- *   -> four_aec_fuse -> RES/NR gains -> CNG -> ISTFT
- *
- * It follows the same pool-first layout and lifecycle as 4aec_nr_res.c
- * (descriptor-tier: get_mem_requirements()/init_ex() compose the core's own
- * descriptor-tier API with SRP/BF's simple size_t tier plus this wrapper's
- * own scratch), with create() as a heap convenience wrapper over that same
- * pool-first implementation. See audio_pipeline_4ch.h's own doc comment for
- * the caller-pool vs. heap usage patterns.
- *
- * The file follows audio_pipeline.c's order: instance, config validation,
- * default config, pool-first construction, heap convenience, processing,
- * reset/destroy, and accessors.
- */
+/** Complete four-channel spatial pipeline: four_aec_front_process -> SRP-PHAT DOA -> BF
+ * effective weights -> four_aec_fuse -> RES/NR gains -> CNG -> ISTFT. Same pool-first
+ * layout and lifecycle as 4aec_nr_res.c (get_mem_requirements()/init_ex() compose the
+ * core's descriptor-tier API with SRP/BF's size_t tier and this wrapper's scratch);
+ * create() is the heap convenience over the same implementation (see
+ * audio_pipeline_4ch.h). */
 
 #include <stdlib.h>
 #include <string.h>
@@ -42,10 +29,6 @@
 #define DEFAULT_SPACING_M 0.035f
 #define DEFAULT_ANGLES    72
 
-/* ============================================================================
- * Instance
- * ========================================================================== */
-
 struct AudioPipeline4Ch {
     AudioPipeline4ChConfig cfg;
     FourAecNrRes* core;
@@ -70,31 +53,23 @@ struct AudioPipeline4Ch {
     uint32_t rng_state;         /* comfort-noise generator                   */
 
     float noise_power;
-    float vad_power_threshold;    /* live-computed from cfg.auto_vad_threshold_dbfs,
-                                    * cached so auto_vad()'s per-hop path doesn't
-                                    * re-derive a config-only constant every call */
+    float vad_power_threshold;    /* derived from cfg.auto_vad_threshold_dbfs and cached for auto_vad() */
     int vad_hangover;
-    int vad_hangover_frames;      /* live-computed, was raw cfg.auto_vad_hangover_frames */
-    float vad_speech_noise_keep;  /* live-computed, was raw literal 0.999f */
-    float vad_speech_new_weight;  /* live-computed, was raw literal 0.001f */
-    float vad_silence_noise_keep; /* live-computed, was raw literal 0.95f */
-    float vad_silence_new_weight; /* live-computed, was raw literal 0.05f */
+    int vad_hangover_frames;      /* derived from cfg.auto_vad_hangover_frames */
+    float vad_speech_noise_keep;  /* derived (speech noise-EMA retention) */
+    float vad_speech_new_weight;  /* derived (speech noise-EMA new weight) */
+    float vad_silence_noise_keep; /* derived (silence noise-EMA retention) */
+    float vad_silence_new_weight; /* derived (silence noise-EMA new weight) */
     uint64_t frame_index;
 
-    /* Non-NULL only on the audio_pipeline_4ch_create() heap path: the single
-     * posix_memalign()'d block backing this whole struct plus every carved
-     * sub-region below it (core/srp/bf/scratch), freed by
-     * audio_pipeline_4ch_destroy(). NULL on the audio_pipeline_4ch_init()
-     * caller-pool path, where the caller owns the memory and destroy() must
-     * not free it. Same convention as FourAecNrRes::owned_heap/SRP::
-     * owned_heap/BF::owned_heap one layer down. */
+    /* Non-NULL only on the audio_pipeline_4ch_create() heap path: the single block backing
+     * this struct and every carved sub-region, freed by destroy(). NULL on the caller-pool
+     * path, where destroy() must not free. */
     void* owned_heap;
     int destroyed;
 };
 
-/* ============================================================================
- * Config validation
- * ========================================================================== */
+/* Config validation */
 
 static int is_bool(int value) {
     return value == 0 || value == 1;
@@ -105,8 +80,7 @@ static int validate_config(const AudioPipeline4ChConfig* cfg) {
     if (!cfg) return 0;
     if (cfg->core.sample_rate != 16000 &&
         cfg->core.sample_rate != 48000) return 0;
-    /* The standard wrapper always runs four_aec_fuse(). Front-only is a
-     * direct-core/internal ULCNet profile, not a valid standard-wrapper cfg. */
+    /* The standard wrapper always runs four_aec_fuse(); front-only is a different profile. */
     if (cfg->core.enable_post != 1) return 0;
     nyquist = 0.5f * (float)cfg->core.sample_rate;
     if (cfg->geometry != AUDIO_PIPELINE_4CH_GEOMETRY_UCA &&
@@ -155,10 +129,6 @@ static int validate_config(const AudioPipeline4ChConfig* cfg) {
     return 1;
 }
 
-/* ============================================================================
- * Public config and heap construction
- * ========================================================================== */
-
 AudioPipeline4ChConfig audio_pipeline_4ch_default_config(int sample_rate) {
     AudioPipeline4ChConfig cfg;
     float radius = DEFAULT_RADIUS_M;
@@ -194,11 +164,7 @@ AudioPipeline4ChConfig audio_pipeline_4ch_default_config(int sample_rate) {
     return cfg;
 }
 
-/* ============================================================================
- * Pool-first construction: file-private PoolCursor/pool_carve(), same
- * bump-allocator shape kept file-private by 4aec_nr_res.c/srp.c/bf.c (each
- * keeps its own copy per those files' own precedent, not shared).
- * ========================================================================== */
+/* Pool-first construction: file-private bump allocator. */
 
 typedef struct PoolCursor {
     uint8_t* ptr;
@@ -221,10 +187,6 @@ static void* pool_carve(PoolCursor* cursor, size_t count,
     return out;
 }
 
-/* ============================================================================
- * Build-flags hash
- * ========================================================================== */
-
 static uint32_t fnv1a_str(const char* text, uint32_t hash) {
     while (*text) {
         hash ^= (uint32_t)(unsigned char)*text++;
@@ -233,15 +195,10 @@ static uint32_t fnv1a_str(const char* text, uint32_t hash) {
     return hash;
 }
 
-/* Plain FNV-style integer mix, no snprintf/stdio -- this path must stay
- * NO_STDIO-safe (see Makefile's audit-no-stdio). Folds in the core layer's
- * own build_flags_hash, so a change to the core's CARVE TOKEN propagates
- * here. A core LAYOUT VERSION bump does not: the core's hash is taken over
- * its backend string, carve token and alignment only, so a control-block-only
- * growth leaves it -- and therefore this hash -- unchanged. Only bumping
- * AUDIO_PIPELINE_4CH_LAYOUT_VERSION by hand invalidates a persisted composite
- * descriptor -- see AudioPipeline4ChMemReq's doc comment, which states this
- * correctly. */
+/* Plain integer mix, no snprintf/stdio (must stay NO_STDIO-safe; see Makefile
+ * audit-no-stdio). Folds in the core's build_flags_hash, which sees its carve token but
+ * not a control-block-only growth; bump AUDIO_PIPELINE_4CH_LAYOUT_VERSION by hand to
+ * invalidate a persisted composite descriptor. */
 static uint32_t audio_pipeline_4ch_build_flags_hash(
     uint32_t core_build_flags_hash) {
     uint32_t hash = 2166136261u;
@@ -254,18 +211,9 @@ static uint32_t audio_pipeline_4ch_build_flags_hash(
     return ac_memreq_abi_hash(hash);
 }
 
-/* ============================================================================
- * Stack-only array geometry (no malloc)
- *
- * Fill formulas copied verbatim from audiolib/doa/steering.c's
- * array_geometry_create_uca/_ula/_custom() so a stack-local ArrayGeometry
- * here produces bit-identical x/y coordinates to what the malloc-based
- * geometry helper produces -- calling that helper (even though its result
- * would be freed immediately after use) would otherwise be a hidden
- * allocation inside what is supposed to be a zero-allocator init_ex() path.
- * M is kept as a local int matching the originals' own locals, so the
- * float/double promotion sequence in the UCA phi expression stays identical.
- * ========================================================================== */
+/* Stack-only array geometry: the fill formulas match audiolib/doa/steering.c's
+ * array_geometry_create_uca/_ula/_custom() so coordinates are identical, without the
+ * helper's hidden allocation in the zero-heap init_ex() path. */
 
 static void fill_uca_geometry(float radius, float* x, float* y) {
     int M = FOUR_AEC_NR_RES_CHANNELS;
@@ -296,12 +244,9 @@ static void fill_custom_geometry(
     }
 }
 
-/* Builds geom in place from caller-supplied x/y storage (sized
- * FOUR_AEC_NR_RES_CHANNELS, a compile-time constant -- no VLA needed).
- * ArrayGeometry is never stored long-term (SRP does not keep a pointer to
- * it, only reads geom->x/geom->y transiently inside srp_init()), so a
- * stack-local temporary that goes out of scope right after the srp_init()
- * call below is safe. */
+/* Builds geom in place from caller-supplied x/y storage (FOUR_AEC_NR_RES_CHANNELS
+ * entries). ArrayGeometry is only read transiently inside srp_init(), so a stack
+ * temporary is safe. */
 static int fill_stack_geometry(
     const AudioPipeline4ChConfig* cfg,
     float* x, float* y, ArrayGeometry* geom) {
@@ -324,17 +269,8 @@ static int fill_stack_geometry(
     return 1;
 }
 
-/* ============================================================================
- * Config -> SRP/BF module configs (shared by get_mem_requirements/init_ex)
- * ========================================================================== */
-
-/*
- * Builds srp_cfg/bf_cfg from cfg plus the core's own already-derived
- * hop/fft/n_freqs -- mirrors 4aec_nr_res.c's derive_dims_and_configs()'s role
- * of "compute once, reuse in both sizing and init", so
- * audio_pipeline_4ch_get_mem_requirements() and audio_pipeline_4ch_init_ex()
- * can never silently diverge on this logic.
- */
+/* Builds srp_cfg/bf_cfg from cfg plus the core's derived hop/fft/n_freqs, computed once
+ * for both sizing and init. */
 static int derive_spatial_configs(
     const AudioPipeline4ChConfig* cfg,
     int hop, int fft, int n_freqs,
@@ -359,38 +295,19 @@ static int derive_spatial_configs(
     srp_cfg->angle_tol = cfg->doa_angle_tolerance_rad;
     srp_cfg->update_interval = cfg->doa_update_interval;
 
-    /* bf_create()/bf_init() force the RLS update cadence to 1 (every hop)
-     * whenever fixed-notebook mode is requested (bf_fixed_mode &&
-     * bf_fixed_align_notebook), regardless of the caller's configured
-     * bf_adapt_interval -- see bf.c's bf_effective_adapt_interval().
-     * Derive that SAME effective value here, once, and feed it into both the
-     * lambda retime scaling below and bf_cfg->adapt_interval, so the
-     * cadence lambda is calibrated for and the cadence BF actually runs at
-     * can never silently diverge (scaling lambda by the raw pre-forced
-     * bf_adapt_interval while bf_create() forces the real cadence to 1
-     * would mis-calibrate it). */
+    /* bf_create()/bf_init() force the RLS cadence to 1 in fixed-notebook mode
+     * (bf_effective_adapt_interval()); derive that effective value once and use it for both
+     * the lambda retime and bf_cfg->adapt_interval. */
     bf_effective_interval = bf_effective_adapt_interval(
         cfg->bf_fixed_mode, cfg->bf_fixed_align_notebook,
         cfg->bf_adapt_interval);
 
     memset(bf_cfg, 0, sizeof(*bf_cfg));
     bf_cfg->enable = cfg->bf_enable;
-    /* bf_lambda is an RLS forgetting/retention factor tuned at a 10-ms
-     * reference update (like NR's alpha_d/alpha_attack in the mono/4ch NR
-     * config derivation) -- its real wall-clock forgetting time varies with
-     * hop_size/sample_rate, so it is retimed via the same helper NR uses for
-     * this exact class of constant. mu is a step-size gain, not a decay
-     * time-constant, so it is left as-is.
-     *
-     * The RLS update itself only actually applies once every
-     * bf_effective_interval hops (bf.c gates the whole P/gain/weight-update
-     * block on frame_idx % adapt_interval == 0; default adapt_interval=1,
-     * i.e. every hop). Unlike AEC's ERLE 6-point cadence, the ORIGINAL
-     * "10ms reference" tuning assumed one update per hop (interval=1) --
-     * there is no matching batching on the authored side to cancel against
-     * -- so when the effective interval > 1 the real wall-clock update
-     * period is that many hops, and the retime call must scale hop by it
-     * (no-op at the shipped default of 1). */
+    /* bf_lambda is an RLS retention factor tuned at a 10 ms update, so it is retimed with
+     * anr_retime_alpha() like NR's constants; mu is a step size and is left as is. The RLS
+     * update runs once per bf_effective_interval hops, so the retime scales hop by it (no-op
+     * at the default 1). */
     bf_cfg->lambda = anr_retime_alpha(
         cfg->bf_lambda, cfg->core.sample_rate,
         hop * bf_effective_interval);
@@ -402,12 +319,8 @@ static int derive_spatial_configs(
     return 1;
 }
 
-/* ============================================================================
- * Memory sizing -- compute once, reuse in get_mem_requirements()/init_ex()
- * ========================================================================== */
-
-/* The post-beam stages this wrapper carves after the core: sizes and the
- * configurations their init needs. */
+/* The post-beam stages carved after the core: sizes and the configurations their init
+ * needs. */
 typedef struct PostStages {
     AecConfig res_cfg;
     AnrConfig nr_cfg;
@@ -448,8 +361,7 @@ static int derive_pipeline_layout(
     if (!validate_config(cfg)) return 0;
     if (four_aec_nr_res_get_mem_requirements(&cfg->core, core_req) != 0)
         return 0;
-    /* four_aec_nr_res_get_mem_breakdown() already derives hop/fft/n_freqs
-     * from cfg alone -- no live core instance required. */
+    /* four_aec_nr_res_get_mem_breakdown() derives hop/fft/n_freqs from cfg alone. */
     if (four_aec_nr_res_get_mem_breakdown(&cfg->core, &breakdown) != 0)
         return 0;
     *hop = breakdown.hop_size;
@@ -515,10 +427,6 @@ int audio_pipeline_4ch_get_mem_requirements(
     return 0;
 }
 
-/* ============================================================================
- * Caller-pool init and heap convenience construction
- * ========================================================================== */
-
 AudioPipeline4Ch* audio_pipeline_4ch_init_ex(
     void* mem,
     size_t bytes,
@@ -574,12 +482,9 @@ AudioPipeline4Ch* audio_pipeline_4ch_init_ex(
     cursor.ptr = (uint8_t*)mem + ALIGN16(sizeof(*p));
     cursor.remaining = (size_t)current.bytes - ALIGN16(sizeof(*p));
 
-    /* Composition order: query each sub-module's own size -> carve an
-     * equal-sized sub-region from this cursor -> call that sub-module's own
-     * init/init_ex. This is the same technique 4aec_nr_res.c's
-     * pipeline_build() uses to carve its four Aec lanes. Carving core first
-     * is what actually switches this wrapper from four_aec_nr_res_create()
-     * (heap) to four_aec_nr_res_init_ex() (pool). */
+    /* Composition: query each sub-module's size, carve an equal-sized sub-region, call its
+     * init/init_ex. Carving the core first selects four_aec_nr_res_init_ex() (pool) over
+     * create() (heap). */
     core_region = pool_carve(&cursor, 1, (size_t)core_req.bytes);
     if (!core_region) return NULL;
     p->core = four_aec_nr_res_init_ex(
@@ -590,9 +495,7 @@ AudioPipeline4Ch* audio_pipeline_4ch_init_ex(
     if (!srp_region) return NULL;
     p->srp = srp_init(srp_region, srp_bytes, &srp_cfg, &geom);
     if (!p->srp) return NULL;
-    /* Same borrow relationship as the heap path: BF never owns/frees
-     * a_array. It points into pool memory with a lifetime tied to p
-     * itself, rather than to a separately heap-managed SRP. */
+    /* BF never owns a_array; it points into pool memory tied to p. */
     p->bf_steering = p->srp->a_array;
     if (!p->bf_steering) return NULL;
 
@@ -649,12 +552,9 @@ AudioPipeline4Ch* audio_pipeline_4ch_init_ex(
     p->fft_size = fft;
     p->n_freqs = n_freqs;
 
-    /* auto_vad_hangover_frames + the speech/silence noise-EMA pairs are
-     * authored literals (8 frames; 0.999/0.001; 0.95/0.05) and are retimed to
-     * the actual grid, as bf_lambda is in derive_spatial_configs(). The EMA pairs
-     * are retention/new-weight complements (old_weight + new_weight == 1 by
-     * construction); retime the retention factor and derive new_weight from
-     * it so that invariant still holds post-retime. */
+    /* auto_vad_hangover_frames and the speech/silence noise-EMA pairs are retimed to the
+     * actual grid like bf_lambda; the retention factor is retimed and new_weight derived so
+     * old + new == 1 holds. */
     p->vad_hangover_frames = anr_retime_frames(
         cfg_copy.auto_vad_hangover_frames, cfg_copy.core.sample_rate, hop);
     p->vad_speech_noise_keep = anr_retime_alpha(
@@ -671,9 +571,7 @@ AudioPipeline4Ch* audio_pipeline_4ch_init_ex(
     p->owned_heap = NULL;
     p->destroyed = 0;
 
-    /* Lockstep proof: audio_pipeline_4ch_get_mem_requirements()'s walk and
-     * the carves above must consume exactly current.bytes, no more, no
-     * less -- every sub-pointer above is already non-NULL-checked. */
+    /* The sizing walk and the carves must consume exactly current.bytes. */
     if (cursor.remaining != 0) return NULL;
     return p;
 }
@@ -706,10 +604,6 @@ AudioPipeline4Ch* audio_pipeline_4ch_create(
     return p;
 }
 
-/* ============================================================================
- * Per-hop processing
- * ========================================================================== */
-
 static void fill_frame_info(
     AudioPipeline4Ch* p,
     const FourAecFront* front,
@@ -729,10 +623,9 @@ static void fill_frame_info(
     info->doa_analysis_frames = doa_analysis_frames;
 }
 
-/* The frequency-domain stages after the fuse, written out: RES gain, NR gain,
- * min of the two, apply, comfort noise on the RES-cut bins, synthesis.
- * Returns FOUR_AEC_NR_RES_OK, or DSP_ERROR when a stage refused the hop or
- * the synthesised hop is not finite. */
+/* The stages after the fuse: RES gain, NR gain, min, apply, comfort noise on the
+ * RES-cut bins, synthesis. Returns FOUR_AEC_NR_RES_OK, or DSP_ERROR when a stage refused
+ * the hop or the synthesised hop is not finite. */
 static int run_post_stages(AudioPipeline4Ch* p, const SeSpecFrame* frame,
                            float* output) {
     const float* res_gain;
@@ -740,17 +633,15 @@ static int run_post_stages(AudioPipeline4Ch* p, const SeSpecFrame* frame,
     int n = p->n_freqs;
     int k;
 
-    /* A disabled gain source reads as the unity vector, so one min serves
-     * every combination: min(1, G_res) is G_res and min(G_nr, 1) is G_nr.
-     * sk_min_f32 is the mono twin's kernel: a non-finite gain propagates to
-     * the output finite gate instead of being masked the way fminf would
-     * mask it. */
+    /* A disabled gain source reads as the unity vector, so one min serves every combination.
+     * sk_min_f32 propagates a non-finite gain to the output finite gate (fminf would mask
+     * it). */
     res_gain = p->res ? se_res_stage_gain(p->res, frame) : p->unity_gain;
     if (!res_gain) return FOUR_AEC_NR_RES_DSP_ERROR;
     nr_gain = p->unity_gain;
     if (p->nr) {
-        /* The denoiser's residual-echo prior is the fused R^2 (the stage
-         * rescales it into extra_noise); legacy_amin hands it no prior. */
+        /* The denoiser's residual-echo prior is the fused R^2 (rescaled into extra_noise);
+         * legacy_amin gives it no prior. */
         nr_gain = se_anr_stage_gain(p->nr, frame, p->extra_noise,
                                     !p->cfg.core.legacy_amin);
         if (!nr_gain) return FOUR_AEC_NR_RES_DSP_ERROR;
@@ -758,10 +649,8 @@ static int run_post_stages(AudioPipeline4Ch* p, const SeSpecFrame* frame,
     sk_min_f32(p->total_gain, nr_gain, res_gain, n);
     sk_capply_gain_f32(p->spec, frame->e, p->total_gain, n);
 
-    /* Comfort noise on the RES-cut bins, scaled by G_nr (bounded below by
-     * SE_CNG_NR_GAIN_FLOOR) so the fill follows the denoised floor rather
-     * than the ambient level: the denoiser never sees the comfort noise, so
-     * its gain is applied to it here. */
+    /* Comfort noise on the RES-cut bins, scaled by G_nr (floored at
+     * SE_CNG_NR_GAIN_FLOOR), as the denoiser never sees the fill. */
     if (p->cfg.core.enable_cng && p->res)
         aec_cng_fill(&p->rng_state, p->spec, frame->cn, res_gain, nr_gain,
                      SE_CNG_NR_GAIN_FLOOR, n);
@@ -799,10 +688,8 @@ int audio_pipeline_4ch_process_with_activity(
         return FOUR_AEC_NR_RES_DSP_ERROR;
     }
 
-    /* front.linear_spectra[ch] borrows each lane's own live spectrum
-     * (const Complex*) -- SRP/BF only ever read through X, never write, so
-     * feeding them this array directly needs no per-hop copy into a
-     * wrapper-owned scratch buffer. */
+    /* front.linear_spectra[ch] borrows each lane's live spectrum; SRP/BF only read it, so no
+     * copy is needed. */
     doa_step(
         p->srp, front.linear_spectra, frequency_mask,
         vad_raw, vad_out);
@@ -812,16 +699,9 @@ int audio_pipeline_4ch_process_with_activity(
         vad_out ? 0 : 1, frequency_mask, p->bf_spectrum,
         p->bf_weights);
 
-    /* bf_spectrum and bf_weights were produced atomically by the same
-     * bf_process_with_weights() call above. Hand the mono error over as it
-     * is instead of reconstructing one weighted sum a second time; the fuse
-     * still projects near/R2/comfort with those exact weights.
-     *
-     * No finite check here: four_aec_fuse() unconditionally re-validates the
-     * identical arrays on every call (weights, and the spectrum in the
-     * projection) before either is read, and the status check below resets
-     * on any failure -- a duplicate scan here can only ever agree with that
-     * authoritative check, never catch something it would miss. */
+    /* bf_spectrum and bf_weights come atomically from one bf_process_with_weights() call, so
+     * the mono error is handed over as is. No finite check here: four_aec_fuse() re-validates
+     * both arrays on every call. */
     status = four_aec_fuse(p->core, p->bf_weights, p->bf_spectrum, &frame);
     if (status == FOUR_AEC_NR_RES_OK)
         status = run_post_stages(p, &frame, output);
@@ -859,13 +739,8 @@ static int auto_vad(
     }
     power = sum / (float)count;
     if (!isfinite(power)) {
-        /* A non-finite input hop must never touch any VAD state -- not
-         * noise_power's EMA, not vad_hangover, nothing. The deeper pipeline
-         * rejects this frame on its own finite check regardless of what
-         * this function returns, so the return value itself is never
-         * actually consumed; only reading (never writing) p->vad_hangover
-         * here matters, so the NEXT valid frame's decision is computed as
-         * if this rejected one never happened. */
+        /* A non-finite input hop must not touch any VAD state; only p->vad_hangover is read, so
+         * the next valid frame decides as if this one never happened. */
         return p->vad_hangover > 0;
     }
     speech = power >= threshold &&
@@ -896,15 +771,9 @@ int audio_pipeline_4ch_process(
     if (!p || p->destroyed || !microphones_interleaved || !far_reference ||
         !output)
         return FOUR_AEC_NR_RES_INVALID_ARGUMENT;
-    /* auto_vad() only reads microphones_interleaved (and guards itself
-     * against non-finite mic data), so a non-finite far_reference sails
-     * through unnoticed here and still reaches auto_vad() below -- on
-     * perfectly finite mic data, auto_vad() runs its normal (state-
-     * mutating) path and only the deeper finite check inside
-     * four_aec_front_process() ever notices far_reference was bad,
-     * by which point noise_power/vad_hangover have already moved. Reject
-     * before that call, not just via a NULL check, so this invalid call
-     * touches no VAD state at all -- same contract as the mic-NaN case. */
+    /* auto_vad() reads only the microphones, so a non-finite far_reference would otherwise
+     * move noise_power/vad_hangover before the deeper finite check notices it. Reject before
+     * that call so an invalid call touches no VAD state. */
     if (!floats_finite(far_reference, (size_t)p->hop_size))
         return FOUR_AEC_NR_RES_INVALID_ARGUMENT;
     speech = auto_vad(p, microphones_interleaved);
@@ -913,21 +782,13 @@ int audio_pipeline_4ch_process(
         speech, speech, NULL, output, info);
 }
 
-/* ============================================================================
- * Reset and teardown
- * ========================================================================== */
-
 int audio_pipeline_4ch_set_aec_preset(AudioPipeline4Ch* p, AecPreset preset,
                                       float ramp_ms) {
     if (!p || p->destroyed || !p->res) return -1;
-    /* The four lanes run with spatial_linear_context, so they never reach
-     * their own suppressor and their floors shape nothing. The gain that
-     * actually multiplies the output -- and scales the comfort noise -- comes
-     * from the post-beam suppressor, so that is what a preset change has to
-     * move. aec_res_set_preset() validates the preset and the ramp before it
-     * writes, so a rejected call leaves the instance unchanged. The lanes are
-     * left alone: retargeting them would be inert but would park all four
-     * permanently mid-ramp. */
+    /* The lanes never reach their own suppressor, so a preset change moves the post-beam
+     * suppressor, whose gain multiplies the output and scales the comfort noise.
+     * aec_res_set_preset() validates before writing, so a rejected call changes nothing. The
+     * lanes are left alone (retargeting them would be inert and park them mid-ramp). */
     if (aec_res_set_preset(p->res, preset, ramp_ms) != 0) return -1;
     p->cfg.core.aec_preset = preset;
     return 0;
@@ -966,12 +827,8 @@ void audio_pipeline_4ch_reset(AudioPipeline4Ch* p) {
 void audio_pipeline_4ch_destroy(AudioPipeline4Ch* p) {
     void* owned_heap;
     if (!p || p->destroyed) return;
-    /* BF borrows the steering table; destroy it before its owner. Each of
-     * these three is a no-op free on the pool-carved sub-objects this
-     * wrapper builds inside its own pool/heap block (their own owned_heap
-     * fields stay NULL -- see audio_pipeline_4ch_init_ex()); only this
-     * wrapper's OWN owned_heap (set only by audio_pipeline_4ch_create()) is
-     * ever actually freed below, exactly once. */
+    /* BF borrows the steering table, so destroy it first. The sub-destroys are no-ops for
+     * pool-carved objects; only this wrapper's own owned_heap (create()) is freed. */
     bf_destroy(p->bf);
     srp_destroy(p->srp);
     if (p->nr) se_anr_stage_destroy(p->nr);
@@ -980,10 +837,6 @@ void audio_pipeline_4ch_destroy(AudioPipeline4Ch* p) {
     p->destroyed = 1;
     if (owned_heap) free(owned_heap);
 }
-
-/* ============================================================================
- * Read-only shape/topology accessors
- * ========================================================================== */
 
 int audio_pipeline_4ch_hop_size(const AudioPipeline4Ch* p) {
     return (p && !p->destroyed) ? p->hop_size : -1;

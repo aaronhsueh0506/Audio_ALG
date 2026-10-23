@@ -2,14 +2,12 @@
 4-channel AEC + beamformer + RES + DeepFilterNet2 (Python reference)
 
 The four-channel front end (shared delay, four linear AEC lanes, the fused
-post-beam residual gain) is the existing ``4ch_aec_bf_nr_res/pipeline.py``
-reference, unchanged.  This module adds the post half that has no Python twin
--- the spectrum-to-hop tail after ``res_gain`` -- in two flavours:
+post-beam residual gain) is the ``4ch_aec_bf_nr_res/pipeline.py`` reference.
+This module adds the spectrum-to-hop tail after ``res_gain`` in two flavours:
 
 * ``post_conventional``: MMSE-LSA on the fused pre-RES spectrum,
   ``min(G_nr, G_res)``, comfort noise, WOLA -- the post chain of the C
-  application (``4aec_nr_res_static.c``), giving evaluation variant (a)
-  a 4-channel Python counterpart;
+  application (``4aec_nr_res_static.c``);
 * ``post_dfn2``: ``P = E * G_res`` plus comfort noise (the conventional
   post spectrum with the denoiser off), the dual-input DFN2 stage estimated
   on ``E`` (the beamformed spectrum) and applied on ``P``, WOLA -- the

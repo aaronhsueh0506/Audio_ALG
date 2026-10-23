@@ -1,6 +1,4 @@
-/* CLI and lifecycle/hop-loop skeleton shared by the four 4-channel samples.
- * Pipeline configs and model resources stay in their typed sample adapters.
- * This host/sample code is not part of a delivered algorithm archive. */
+/* CLI and lifecycle/hop-loop skeleton shared by the four 4-channel samples; pipeline configs stay in the typed sample adapters. Sample code, not part of a delivered archive. */
 #ifndef MCAB_SAMPLE_DRIVER_H
 #define MCAB_SAMPLE_DRIVER_H
 
@@ -23,8 +21,8 @@ typedef struct McabSpatialOptions {
     float fixed_doa_rad;
     int print_mem_size;
 } McabSpatialOptions;
-/* raw=1 preserves raw-runner numeric/grid validation; raw=0 preserves the
- * static sample's legacy atoi/atof conversion and deferred config checks. */
+/* raw=1 validates numeric/grid values strictly; raw=0 uses atoi/atof conversion and
+ * defers config checks. */
 int mcab_parse_spatial_cli(int argc, char **argv, int raw,
                            McabSpatialOptions *out);
 
@@ -55,6 +53,7 @@ typedef struct McabSampleOps {
     int (*process)(void *user, McabHopView *hop, int frame);
     int (*consume)(void *user, McabHopView *hop, int frame);
     void (*nonfinite)(void *user);
+    /* Optional (NULL = success). */
     int (*finish)(void *user, McabHopView *hop, int frames);
     void (*cleanup)(void *user);
     /* Optional success report after resource destruction. */

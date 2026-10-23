@@ -3,11 +3,9 @@
 
 The shell script builds the C code twice (Layer 1: std-math, Layer 2: shipped) and the two C drivers
 (pyc_drv.c). This program runs the drivers, runs the Python references of the pipelines, compares, prints a
-table and writes a JSON file. Every tolerance below is FROZEN (2026-10-20): measured as the actual max
-error over every scenario in both layers on the real tree (S-25/S-26/S-27 landed, EXPECTED_RED empty),
-then set with a reasoned margin -- see the comment above TOL1/TOL2 and the pipelines CHANGELOG's "S-28"
-entry. A tolerance still prints next to the number it judged; it changes only by re-running this same
-measure-then-sign-off process, never silently.
+table and writes a JSON file. Every tolerance below is frozen: set from the measured max error over every
+scenario in both layers, with a margin (see the comment above TOL1/TOL2). A tolerance prints next to the
+number it judged and changes only by re-measuring, never silently.
 
 Statuses: PASS / FAIL, EXPECTED_RED(S-xx) (a known gap exceeds its tolerance: allowed), UNEXPECTED_GREEN(S-xx)
 (a known gap is within tolerance: FAIL, remove the tag with the fix), SKIP, NOT_RUN (could not be exercised:
@@ -32,26 +30,21 @@ import numpy as np
 GRIDS = [('16k256', 16000, 256), ('16k512', 16000, 512), ('48k1024', 48000, 1024)]
 GRID_LABEL = {'16k256': '16k/256', '16k512': '16k/512', '48k1024': '48k/1024'}
 PRESETS = ['balanced', 'mild', 'aggressive']
-# b.res4 only -- NOT the shared PRESETS list, so l2.res4.*.replay and every other PRESETS-driven
-# scenario are unaffected by adding this preset. aec=no_floor on the C side is a direct
-# construction-time preset (se_derive()'s preset_valid() whitelists NO_FLOOR; see pyc_drv.c),
-# matching the Python side's FourChannelAecConfig(aec_preset=NO_FLOOR).
+# b.res4 only (not the shared PRESETS list, so PRESETS-driven scenarios such as l2.res4.*.replay
+# are unaffected). aec=no_floor on the C side is a direct construction-time preset
+# (se_derive()'s preset_valid() whitelists NO_FLOOR; see pyc_drv.c), matching the Python side's
+# FourChannelAecConfig(aec_preset=NO_FLOOR).
 PRESETS_B = PRESETS + ['no_floor']
 
-# Known gaps (PY_C_SYNC_AUDIT.md) that still exist after wave 1. A row listed here may exceed its tolerance
-# without failing; if it does not, the script fails so the tag is removed together with the fix.
-# S-25 (4ch usable_linear lost-update), S-26 (RES aggressive DT floor) and S-27 (mixed warm/soft-realign hop
-# far-spectrum handling) all landed for real by 2026-10-20 (confirmed by a fresh run on the current tree:
-# 84 PASS, 1 SKIP, 1 INFO, no FAIL/UNEXPECTED_GREEN/NOT_RUN); no gap is currently known, so this is empty.
+# Known gaps: a row listed here may exceed its tolerance without failing; if it does not, the script
+# fails so the tag is removed together with the fix. Empty while no gap is known.
 EXPECTED_RED = {}
 
-# Frozen tolerances (S-28, 2026-10-20; was provisional, deferred until S-27 landed for real -- see pipelines
-# CHANGELOG). Each value = ceil(actual max error measured over EVERY scenario that is judged against it, in
-# a `pyc_parity_pipelines.sh --layers 1,2` run on the current real tree, with EXPECTED_RED empty) rounded up
-# to a clean figure with roughly a 1.8-2.7x margin in the linear constants (~1.9x in amplitude for the one dB
-# constant): enough that a rebuild on another compiler/toolchain's libm or NEON lowering should not flip a
-# PASS to FAIL, tight enough that a regression that doubles the error is still caught. Measured max (this
-# run; see the S-28 CHANGELOG entry for the full table) in a comment next to each constant.
+# Frozen tolerances. Each value is the max error measured over every scenario judged against it (a
+# `pyc_parity_pipelines.sh --layers 1,2` run, EXPECTED_RED empty), rounded up to a clean figure with roughly
+# a 1.8-2.7x margin in the linear constants (~1.9x in amplitude for the dB constant): enough that another
+# toolchain's libm or NEON lowering should not flip a PASS to FAIL, tight enough that a regression that
+# doubles the error is still caught. The measured max is in a comment next to each constant.
 TOL1 = {
     'gain_abs': 2e-5,        # Layer 1: a gain in [0, 1], std-math C against Python; measured max 8.3e-6 (d.mono.16k256.nr_glue)
     'out_abs': 2e-7,         # Layer 1: float output samples (full scale 1.0); measured max 7.5e-8 (d.mono.48k1024.min_apply_ola)
@@ -135,7 +128,7 @@ def stats(c, p, ref=None):
 
 
 def first_div_hop(a, b, thr=1e-2):
-    """First hop where the L2 norm of (a - b) exceeds thr * L2 norm of b (A6's divergence definition)."""
+    """First hop where the L2 norm of (a - b) exceeds thr * L2 norm of b."""
     a = np.asarray(a)
     b = np.asarray(b)
     n = min(a.shape[0], b.shape[0])
@@ -451,10 +444,9 @@ def py4_stock(cx, g, sr, fft):
 
 
 def py4_run(cx, g, sr, fft):
-    """Python 4-channel pipeline, whole input. A mixed warm/soft-realign hop's lane-0-far-spec fusion is the
-    stock pipeline's own behavior now (S-27: _fuse_contexts() fuses it directly instead of raising, matching
-    the C core) -- no monkeypatch needed here any more; this helper just counts such hops itself, from the
-    pipeline's own realign lane counters, for the verdict_flag row below."""
+    """Python 4-channel pipeline, whole input. A mixed warm/soft-realign hop fuses lane 0's far spectrum in
+    the stock pipeline (_fuse_contexts() does not raise, as the C core); this helper counts such hops from
+    the pipeline's own realign lane counters for the verdict_flag row below."""
     key = ('py4', g)
     if key in cx.cache:
         return cx.cache[key]

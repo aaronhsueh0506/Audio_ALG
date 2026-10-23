@@ -7,9 +7,6 @@
 用法:
     python plot_curve.py --log output/train_log.csv --output output/curve.png
     python plot_curve.py --log output/train_log.csv          # 預設存到同目錄 curve.png
-
-備註: 即使沒這個 CSV，舊 checkpoint 的 ckpt['loss']/['epoch'] 也存了 per-epoch val loss，
-可另行重建 val 曲線。
 """
 
 import argparse

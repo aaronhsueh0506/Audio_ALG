@@ -55,24 +55,16 @@ from .aec_behavior_hash import (  # noqa: E402
 
 LINEAR_AEC_CONTRACT_VERSION = "aiaec-linear-error-v3"
 # The signal is get_formed_output(): the shadow/main-selected, crossfaded,
-# WOLA-formed residual. It keeps RES/CNG disabled and is independent of any
-# product-level output dynamics applied after the AEC chain. (v1 data was
-# materialized from a different seam and must be regenerated, not mixed with
-# later output in the same packed dataset.)
-# v3 compatibility condition: `aec_behavior_hash` (normalized AST,
-# comment/format insensitive); `aec_commit`/`aec_source_hash` are provenance
-# only. v2 compared the raw-text `aec_source_hash`; v2 DATA is still valid,
-# but v2 contract dicts lack the new field and are rejected by from_dict --
-# rerun the contract stamp, not the audio.
+# WOLA-formed residual, with RES/CNG disabled and independent of any
+# product-level output dynamics applied after the AEC chain. Compatibility
+# condition: `aec_behavior_hash` (normalized AST, comment/format insensitive);
+# `aec_commit`/`aec_source_hash` are provenance only.
 
 # The linear-AEC frontend is a frozen, versioned contract: its (frame_size,
-# hop_size) per sample rate is a deliberate, pinned choice of this dataset,
-# not meant to track whatever lib/aec's own production preset currently
-# defaults to -- that default may change independently. Every caller that
-# resolves a frame_size (the contract validator below, the config-driven
-# path, and the factories' own fallback when a caller omits frame_size) reads
-# this one map, so the frontend cannot
-# silently drift with an unrelated upstream default change.
+# hop_size) per sample rate is a pinned choice of this dataset, not meant to
+# track lib/aec's own production preset default. Every caller that resolves a
+# frame_size (the contract validator, the config-driven path and the factories'
+# fallback) reads this one map.
 FROZEN_FRAME_HOP_BY_SR = {16000: (512, 256), 48000: (1024, 512)}
 
 # Matched-filter bank size every AIAEC corpus is, and stays, materialized
@@ -83,17 +75,12 @@ FROZEN_FRAME_HOP_BY_SR = {16000: (512, 256), 48000: (1024, 512)}
 # and as the number a diagnostic override is reported against.
 DATASET_DELAY_NUM_FILTERS = 5
 # The bank size is a deployment/diagnostic knob, not a data-contract one:
-#   * dataset generation always runs the value above --
-#     `materialize_linear_error` and the config-driven contract builder take no
-#     bank-size argument, so there is no code path by which a corpus can be
-#     produced at another size;
-#   * inference/diagnostics may deploy another size through
-#     `LinearAecEngine(..., delay_num_filters=n)` or
-#     `LinearAecProcessor(..., delay_num_filters=n)`. The recorded data contract
-#     remains unchanged and fingerprints identically.
-# lib/aec sizes its downsampled search ring and aggregator histograms from n at
-# construction and exposes no runtime setter, which is why the override arrives
-# at init and not through a mutator.
+# dataset generation always runs the value above (`materialize_linear_error`
+# and the config-driven contract builder take no bank-size argument), while
+# inference/diagnostics may pass `delay_num_filters=n` to `LinearAecEngine` or
+# `LinearAecProcessor` without changing the recorded contract or its
+# fingerprint. lib/aec sizes its rings and histograms at construction and has
+# no runtime setter, so the override arrives at init.
 DELAY_NUM_FILTERS_RANGE = (1, 5)
 
 # Reliable bulk-delay reach of an n-filter matched bank, in ms: lib/aec's
@@ -192,7 +179,7 @@ class LinearAecContract:
     enable_delay_est: bool
     enable_highpass: bool
     output_seam: str
-    # Retained in the v2 serialized contract for backward compatibility.
+    # Pinned by ``__post_init__``.
     limiter: bool
     # Provenance: exactly which bytes produced this data. Not compared for
     # compatibility -- see aec_python_source_hash()/aec_python_behavior_hash().
@@ -250,14 +237,13 @@ class LinearAecContract:
         return dataclasses.asdict(self)
 
     def compatibility_dict(self) -> Dict:
-        """Fields that decide whether recorded data may be used with this build.
+        """Fields that decide whether recorded data may be used with this
+        build.
 
-        Drops ONLY ``aec_commit``/``aec_source_hash`` -- raw-text provenance
-        that changes on a comment reflow. ``aec_behavior_hash`` stays, and is
-        the one field carrying the AEC's actual code identity: without it this
-        dict is fully determined by the four values both call sites echo out of
-        the recorded contract plus eleven ``__post_init__`` literals, i.e. a
-        tautology. Do not remove it.
+        Drops ONLY ``aec_commit``/``aec_source_hash`` (raw-text provenance that
+        changes on a comment reflow). ``aec_behavior_hash`` stays: without the
+        AEC's code identity the dict is fully determined by values both call
+        sites echo from the recorded contract, i.e. a tautology.
         """
         value = self.as_dict()
         value.pop("aec_commit")
@@ -282,20 +268,16 @@ class LinearAecContract:
         expected = {field.name for field in dataclasses.fields(cls)}
         missing = sorted(expected - set(value))
         extra = sorted(set(value) - expected)
-        # A v2 contract lacks both v3 compatibility fields. `behavior_hash_schema`
-        # alone missing is NOT v2 -- it is a v3 dict written before the schema
-        # field existed; no stamped artifact carries one, so it falls through to the
-        # generic error rather than getting a migration path built for a state
-        # that cannot exist.
+        # A v2 contract lacks both v3 compatibility fields.
+        # `behavior_hash_schema` alone missing is not v2 and falls through to
+        # the generic error.
         if "aec_behavior_hash" in missing and not extra and set(missing) <= {
                 "aec_behavior_hash", "behavior_hash_schema"}:
-            # v2 contract. There is deliberately NO automatic migration: a v2
-            # contract records only a raw-text source hash, and once lib/aec has
-            # moved on there is no way to recover what the producing build's
-            # BEHAVIOUR hash was, so stamping the current one would assert a
+            # v2 has deliberately NO automatic migration: it records only a
+            # raw-text source hash, so the producing build's BEHAVIOUR hash is
+            # unrecoverable and stamping the current one would assert a
             # compatibility nobody verified. Shards can be re-stamped by
-            # re-running the materializer; a v2 CHECKPOINT cannot be repaired at
-            # all and must be retrained against a v3 corpus.
+            # re-running the materializer; a v2 checkpoint must be retrained.
             raise ValueError(
                 "linear_aec contract is v2 (no 'aec_behavior_hash'). v2 -> v3 "
                 "has no safe automatic migration: v2 records only a raw-text "
@@ -338,11 +320,9 @@ def make_linear_aec_config(
     """Build the frozen frontend's ``AecConfig``.
 
     ``delay_num_filters`` is the diagnostic/inference-only matched-filter bank
-    size (see ``DATASET_DELAY_NUM_FILTERS``). ``None`` -- what dataset
-    generation and every contract-driven call site pass -- leaves the key out
-    of the overrides entirely, so the resulting config is the one this
-    frontend has always built, not merely one that happens to carry the same
-    number.
+    size (see ``DATASET_DELAY_NUM_FILTERS``). ``None`` (dataset generation and
+    every contract-driven call site) leaves the key out of the overrides, so
+    the config is exactly the frozen one.
     """
     if AecPreset(preset) is not AecPreset.BALANCED:
         raise ValueError(f"linear AEC preset must be 'balanced', got {preset!r}")
@@ -368,7 +348,7 @@ def make_linear_aec_config(
         "enable_shadow": True,
         "enable_delay_est": True,
         "enable_highpass": True,
-        # v2 seam: selected/crossfaded WOLA output, not raw process() output.
+        # Seam: selected/crossfaded WOLA output, not raw process() output.
         "return_formed_output": True,
     }
     if frame_size is not None:
@@ -482,129 +462,36 @@ def linear_aec_contract_from_config(
 
 
 # Recorded-hash -> current-hash pairs that are the SAME materialized signal.
-#
-# `aec_behavior_hash` is deliberately conservative: it changes on any edit to an
-# expression, constant or control-flow path under the signal scope, including
-# one that provably cannot move a sample. Refusing is the right default, but the
-# blunt version of it strands an already-trained checkpoint that no
-# rematerialization can repair -- the shards are fine, the weights are fine, and
-# only the recorded identity disagrees. This table is the narrow, evidence-backed
-# escape: an EXPLICIT single hop, one direction, one pair at a time.
-#
-# Admission rule for a new entry. All four, or it does not go in:
-#   1. the ONLY compared field that differs is `aec_behavior_hash`;
-#   2. the lib/aec change is inert on the path this corpus is materialized with
-#      -- typically a new mechanism defaulted OFF, never a retune of a live one;
-#   3. that inertness is MEASURED, not argued: the frozen frontend
-#      (`LinearAecProcessor`, formed_output seam) renders byte-identical before
-#      and after, over a scene that actually reaches the changed code;
-#   4. the same harness is shown to be capable of failing. For a rate-scoped
-#      correction, an effective-value test may supply that control only when
-#      the migration is explicitly restricted to unaffected sample rates.
-#
-# Single hop by construction: the lookup is not applied transitively, so a value
-# here is never re-read as a key. Two stacked migrations need the composed pair
-# (oldest recorded -> current), re-verified end to end, not a chain.
-# One direction by construction: a checkpoint recorded under the NEW hash run
-# against the OLD build is a genuine downgrade -- the mechanism it may have been
-# trained through is absent -- and stays refused.
+# `aec_behavior_hash` is deliberately conservative (any expression, constant or
+# control-flow edit under the signal scope changes it), so this table is the
+# narrow escape for a checkpoint that cannot be rebuilt. A pair is admitted
+# only if (1) `aec_behavior_hash` is the sole differing field, (2) the lib/aec
+# change is inert on this path, (3) inertness is MEASURED byte-identical on the
+# frozen frontend over a scene that reaches the changed code and (4) the same
+# harness is shown able to fail. One hop, one direction, not transitive.
 ACCEPTED_BEHAVIOR_HASH_MIGRATIONS: Dict[str, str] = {
-    # Empty: no pair is admitted. 37ed5ad9 -> 19dd4f90 (the fresh-instance
-    # reset composed with the 48-kHz FilterAnalyzer correction, 16 kHz only)
-    # is retired: the shadow-copy baseline retention is retimed per grid and
-    # C's hard restart clears coarse/leakage evidence, and both move
-    # `linear_error`, so no byte-identity evidence can describe a frontend
-    # after them. A retired pair may never be retargeted.
-    #
-    # 2026-10-20: the combined NO_FLOOR runtime-setter + S-05 hop
-    # (428aa9b796c2...562d -> 419f473e609e...ff8fa) also admits nothing here.
-    # Both changes are inert on this materialization path (measured
-    # byte-identical `formed_output`/`error` on real AEC 2021/2023/self-
-    # recorded doubletalk clips at 16 kHz and 48 kHz -- see
-    # AIAEC/tests/test_linear_aec_behavior_migration.py's note and the
-    # harness-can-fail BALANCED-vs-NO_FLOOR control that accompanies it), but
-    # a grep of every corpus/checkpoint ledger under this tree found nothing
-    # recorded at the pre-hop hash and in progress -- nothing is STRANDED, so
-    # there is no rescue for this table to grant. The unconditional
-    # RELEASED_INFERENCE_BEHAVIOR_HASH_COMPATIBILITY pointer below is bumped
-    # regardless, since that one is not a migration admission.
+    # Empty: no pair is admitted.
 }
 
-# One released 16-kHz Align-ULCNet checkpoint was trained with this frontend
-# immediately before the causal-half TD-constraint correction. That correction
-# moves ``linear_error`` and therefore MUST NOT enter the byte-equivalent table
-# above or make an old corpus packable. Product inference nevertheless needs a
-# deliberate transition window for the released weights. The separate gate
-# below accepts this exact one-way pair only in LinearAecEngine, emits a warning
-# that output can differ, and is never called by materialization or packing.
+# A released 16-kHz Align-ULCNet checkpoint was trained on the frontend before
+# the causal-half TD-constraint correction, which moves ``linear_error`` and so
+# MUST NOT enter the table above. The separate gate below accepts that exact
+# one-way pair only in LinearAecEngine, warns that output can differ, and is
+# never called by materialization or packing.
 RELEASED_INFERENCE_BEHAVIOR_HASH_COMPATIBILITY: Dict[str, str] = {
-    # Bumped 2026-10-21. This pointer had actually drifted to 5fe64e4648...3f4
-    # (set 2026-09-22, Audio_ALG commit 29916a4) before this bump, not to
-    # 428aa9b7...562d as the ACCEPTED_BEHAVIOR_HASH_MIGRATIONS comment above
-    # frames it -- lib/aec picked up 21 unrelated commits touching
-    # python/aec.py/modules between those two hashes (full-rate delay
-    # estimator, bad-relock revert, live-observer R2 path, round-robin TD
-    # constraint and mechanism removals, among others), none individually
-    # measured for inertness against this exception. This bump covers the
-    # FULL hop 5fe64e46...3f4 -> 9fa7a2de...245e5, not just the NO_FLOOR+S-05
-    # slice. The NO_FLOOR+S-05 slice (428aa9b7...562d -> 419f473e...ff8fa) is
-    # measured inert (see test_linear_aec_behavior_migration.py); the
-    # 5fe64e46->428aa9b7 slice is NOT separately measured -- this exception
-    # already only emits a warning and is never called by materialization or
-    # packing (see the comment above this table), and the decision was made
-    # to keep moving rather than spend a round re-validating a month of
-    # unrelated frontend history against one inference-only compatibility
-    # warning. If this checkpoint's inference output is ever found to have
-    # degraded, re-check this unmeasured slice first.
-    # The additional 419f473e...ff8fa -> 9fa7a2de...245e5 slice only splits
-    # orchestrator stages and enables numeric/name CLI presets. Its frozen
-    # formed_output/error/echo samples and RES context/state traces were
-    # measured byte-identical on full real AEC 2021/2023/self-recorded clips
-    # at 16/48 kHz (8,636 hops across frozen/full/observer profiles). A one-bit
-    # perturbation at the actual formed_output getter is rejected by that
-    # same comparator. This new evidence does not validate the historical
-    # unmeasured slice above. No local corpus/checkpoint ledger is stranded
-    # at 419f473e, so ACCEPTED_BEHAVIOR_HASH_MIGRATIONS stays empty.
+    # Inference-only pointer for the released checkpoint; every bump is logged
+    # in the guard table below.
     "c1b1f5433fa244a2f7369938992bff95f00d1bdc394c4f21a5862f2dc547f786":
         "9fa7a2dec85cef8f123cc4dd02e7eb3c5dc0c1b45d7ec0f32b766cf9cda245e5",
 }
 
 # --- Staleness guard for the pointer above ----------------------------------
-# The bug this guards against (opus review item C2, 2026-10-20): an agent
-# bumping the single entry above ASSUMED its prior value was the hash
-# immediately before their own change, bumped it to their new hash, and in
-# doing so silently re-admitted roughly a month and 21 unrelated lib/aec
-# commits of un-vetted drift that had piled up on the pointer in between (see
-# the comment on the entry above for that incident's own account). The
-# pre-existing test only checked that the pointer equals the LIVE hash right
-# now; it had no way to notice that the gap between two bumps was never
-# individually vetted.
-#
-# Fix: every time the entry above is bumped, append one row here --
-# (date, old_value, new_value) -- where `old_value` is copied from this
-# table's own immediately preceding row's `new_value` (or, for the very
-# first row, read directly from `git show HEAD:...`) -- never assumed or
-# independently recomputed. Both values are LITERAL 64-hex-char hashes, not
-# the abbreviated "prefix...suffix" form used in prose comments elsewhere in
-# this file -- elided values can't be compared against git's byte-for-byte.
-#
-# `AIAEC/tests/test_released_pointer_bump_guard.py` (backed by
-# `AIAEC/dataset_gen/released_pointer_bump_guard.py`, also runnable standalone
-# as `python3 -m AIAEC.dataset_gen.released_pointer_bump_guard`; both covered
-# by `make test`) enforces this mechanically, not by convention:
-#   1. stateless, runs in any checkout forever: the rows must chain --
-#      row[i].old == row[i-1].new -- and the LAST row's `new` must equal the
-#      live value of the entry above. A wrong `old`, or a bump with no new
-#      row, fails this the moment it is checked, in this commit or any later
-#      one.
-#   2. bump-time: whenever `git show HEAD:<this file>`'s entry value differs
-#      from the working tree's, the working tree must carry a row whose
-#      `old` is literally HEAD's value and whose `new` is literally the
-#      working tree's value -- making "I assumed the old value was X"
-#      structurally visible, since X is checked against git, not the
-#      author's claim.
-# Run `python3 -m pytest AIAEC/tests/test_released_pointer_bump_guard.py`
-# before committing a bump to the entry above.
+# Every bump of the entry above appends one row (date, old_value, new_value)
+# here, with `old_value` copied from the preceding row's `new_value` (the first
+# from `git show HEAD:...`), so a bump cannot silently re-admit unvetted drift.
+# Values are literal 64-hex hashes. `test_released_pointer_bump_guard.py`
+# checks that rows chain, the last `new` equals the live entry, and a changed
+# entry carries a row whose `old` is git's HEAD value.
 RELEASED_INFERENCE_POINTER_BUMPS: Tuple[Tuple[str, str, str], ...] = (
     ("2026-10-21",
      "5fe64e46480c7e2a75c90718f1b64c09ca29f611d09713ea4ec2a9ef61c813f4",
@@ -617,9 +504,9 @@ _RELEASED_INFERENCE_SAMPLE_RATES: Dict[str, frozenset] = {
 }
 
 # A migration pair can be frontend-equivalent at one sample rate and
-# intentionally different at another. Never infer this from the hash alone:
-# the FilterAnalyzer correction above is a no-op at 16 kHz but changes the live
-# 48-kHz detector window. Old 48-kHz material must therefore fail closed.
+# intentionally different at another (e.g. a correction that is a no-op at 16
+# kHz but changes the live 48-kHz detector window), so this is never inferred
+# from the hash alone: such material must fail closed at that rate.
 _BEHAVIOR_MIGRATION_SAMPLE_RATES: Dict[str, frozenset] = {
     # Keyed like ACCEPTED_BEHAVIOR_HASH_MIGRATIONS; empty while it is.
 }
@@ -633,67 +520,26 @@ def _behavior_migration_applies(recorded: str, current: str,
             recorded, frozenset())
     )
 
-# Provenance of every build each accepted migration's SOURCE identity ran on.
-#
-# Needed because one gate downstream cannot use ACCEPTED_BEHAVIOR_HASH_MIGRATIONS
-# on its own: a LEGACY rematerialization ledger records a contract as its
-# `fingerprint()` and nothing else, and that fingerprint folds in `aec_commit`
-# and `aec_source_hash` alongside the behaviour hash and is one-way. A build
-# that computes the migration TARGET cannot re-derive the SOURCE build's
-# fingerprint from such a ledger, so without this it cannot tell one written by
-# a migrated frontend from one written by an unrelated build, and a COMPLETED
-# corpus gets refused with advice its operator cannot follow (the config is
-# identical; what moved is lib/aec). A ledger that records the producing
-# contract dict needs none of this -- see `linear_error_ledger.save_ledger` --
-# and the reconstruction here exists for the ones written before it did.
-#
-# A behaviour hash is carried by a RANGE of revisions, not by one: it is
-# insensitive to comments and formatting, so every docs-only or comment-only
-# lib/aec commit in the range keeps it while moving `aec_commit` and usually
-# `aec_source_hash` too. One pair per behaviour hash therefore under-covers --
-# a corpus materialized under any other revision in the range reconstructs to a
-# fingerprint the bridge does not hold. Each behaviour hash maps to the TUPLE
-# of revisions that carried it; adding a newly discovered one is appending a
-# `{"aec_commit": ..., "aec_source_hash": ...}` row.
-#
-# How a range is derived, so the next person can extend it. Walk lib/aec back
-# from the revision that changed the hash and measure each commit with
-# `aec_python_behavior_hash()` / `aec_python_source_hash()`, repointing
-# `aec_behavior_hash._AEC_PYTHON` at a checkout of that commit -- ONE COMMIT PER
-# PROCESS, because both functions are `lru_cache`d and a second call in the same
-# process is served the first checkout's digest. The range runs from the commit
-# that INTRODUCED the hash (its parent measures differently) to the last commit
-# before the one that changed it. Record every distinct (commit, source_hash)
-# pair in it, including the commits that share a source hash: `fingerprint()`
-# folds in `aec_commit`, so each commit is its own fingerprint regardless.
-#
-# An entry here grants nothing on its own: it is consulted only after
-# ACCEPTED_BEHAVIOR_HASH_MIGRATIONS has already admitted the pair, and only to
-# reconstruct a fingerprint the guard then compares WHOLE -- an unrelated build
-# still fails. A source with no entry simply gets no legacy-ledger bridge; the
-# migration still applies to every other gate.
+# Provenance of every build each accepted migration's SOURCE identity ran on. A
+# legacy rematerialization ledger records only `fingerprint()`, which folds in
+# `aec_commit` and `aec_source_hash` and is one-way, so a build computing the
+# migration TARGET cannot re-derive the SOURCE fingerprint without this table.
+# A behaviour hash is carried by a RANGE of revisions (docs-only commits keep
+# it), so each maps to the `{"aec_commit": ..., "aec_source_hash": ...}` rows
+# of every revision that carried it. An entry grants nothing on its own: it is
+# consulted only after ACCEPTED_BEHAVIOR_HASH_MIGRATIONS admitted the pair.
 MIGRATED_SOURCE_PROVENANCE: Dict[str, tuple] = {
-    # Empty while no migration is admitted; a retired source never needs a
-    # bridge because the
-    # guard refuses it before the ledger is consulted.
+    # Empty while no migration is admitted.
 }
 
 
 def migrated_ledger_fingerprints(contract: "LinearAecContract") -> tuple:
     """Fingerprints a migration SOURCE build would have written for ``contract``.
 
-    ``contract`` is what THIS build makes of the corpus's config. A migration
-    source differs from it only in the three provenance fields, all of which
-    are recorded, so the source's fingerprint is reconstructible exactly rather
-    than guessed. One candidate per recorded REVISION, since `fingerprint()`
-    folds in `aec_commit` and every revision that carried the behaviour hash
-    wrote a different one.
-
-    Yields ``(behaviour_hash, aec_commit, fingerprint)``: a caller that matches
-    one has to be able to name the build it matched, not just its behaviour.
-    Returns an empty tuple when nothing migrates to this build, or when the
-    source that does has no recorded provenance -- both of which must leave the
-    caller's exact-match behaviour untouched.
+    The source differs from ``contract`` only in the three recorded provenance
+    fields, so one candidate per recorded REVISION is reconstructible exactly.
+    Yields ``(behaviour_hash, aec_commit, fingerprint)``; empty when nothing
+    migrates to this build or the source has no recorded provenance.
     """
     out = []
     for recorded, current in ACCEPTED_BEHAVIOR_HASH_MIGRATIONS.items():
@@ -715,24 +561,18 @@ def migrated_ledger_fingerprints(contract: "LinearAecContract") -> tuple:
 # build. Listed so the refusal can say what to do about it. Nothing may migrate
 # from these: they are named to be rejected clearly, not to be accepted.
 RETIRED_BEHAVIOR_HASHES = frozenset({
-    # The frontend the shipped corpus and the Align-ULCNet checkpoints were
-    # materialized and trained on, and the three identities that had been
-    # verified frontend-equivalent to it.
     "abd8aa04272d8f833e948999fb54c5a9b2348d0f57f38efb21f43a15bbe6a239",
     "eda3c3be25b4bb69762572b22447db7e004f870a395d7cf84ad1ce02ddd28cfe",
     "ffc2e044d031f06a9d685ee77159e5a8d7d3075e5e3eaea8156746c416c1dd4e",
     "8198bd0e29e4530f16a1ada6eafb86148e09ec749d10e84771bf2c86598143cd",
     "7c9249dee507f31837e6025c91ca855c05c59febcdee1cad5189cba7ce49cf88",
-    # The shipped corpus's materialization frontend and the identity it was
-    # carried forward to, retired because the shadow-copy baseline
-    # retention retime (0.995 -> 0.992 at 16 kHz/512/256) and C's restart
-    # evidence clearing both move `linear_error`.
+    # `linear_error` moved by the shadow-copy baseline retention retime and C's
+    # restart evidence clearing.
     "37ed5ad9b75ce42902361d8195fcf04a650b940744ec036a16c8736dec9d5061",
     "19dd4f90f482e15072d535964ac9816cdc21cae2c350b98de12a0e9ab561ff45",
-    # The frontend immediately before the causal-half TD-constraint window.
-    # Its corpus is retired because the corrected window moves linear_error.
-    # A released 16-kHz checkpoint has a separate inference-only exception;
-    # this entry intentionally keeps materialization/packing strict.
+    # The frontend before the causal-half TD-constraint window; its corpus is
+    # retired because the corrected window moves linear_error (the released
+    # 16-kHz checkpoint has a separate inference-only exception).
     "c1b1f5433fa244a2f7369938992bff95f00d1bdc394c4f21a5862f2dc547f786",
 })
 
@@ -740,27 +580,11 @@ RETIRED_BEHAVIOR_HASHES = frozenset({
 def require_linear_aec_contract(actual: Dict, expected: Dict, context: str) -> None:
     """Refuse a linear-AEC frontend that differs from the recorded one.
 
-    The comparison MUST retain ``aec_behavior_hash``. Every other compared field
-    is either pinned to a literal by ``__post_init__`` (engine, mode, the
-    enable_* flags, output_seam, limiter, version) or echoed out of the recorded
-    contract by both call sites, which build their ``runtime`` contract from
-    ``contract.sample_rate/preset/frame_size/filter_length``. Drop the hash and
-    the comparison becomes a tautology that cannot fail -- a changed PBFDKF step
-    size, delay tolerance or formed-output crossfade would then feed inference a
-    ``linear_error`` from a different filter than the one the checkpoint was
-    trained on, silently. ``test_contract_comparison_is_not_vacuous`` guards
-    against this.
-
-    ``aec_commit``/``aec_source_hash`` are deliberately NOT compared here: they
-    are raw-text provenance and would reject byte-identical data over a comment
-    reflow. They remain in ``fingerprint()`` for resume/integrity.
-
-    The single documented exception is
-    ``ACCEPTED_BEHAVIOR_HASH_MIGRATIONS``: a recorded/current hash pair proven
-    to describe the same materialized signal. It applies only when the hash is
-    the ONLY field that differs, so a migration cannot smuggle a second change
-    through with it, and it warns rather than passing silently -- the operator
-    should see which frontend identity was accepted and why.
+    The comparison MUST retain ``aec_behavior_hash``: every other field is
+    pinned or echoed from the recorded contract, so without it a changed PBFDKF
+    step size would silently feed inference a ``linear_error`` from another
+    filter. ``aec_commit``/``aec_source_hash`` are NOT compared. The one
+    exception is ``ACCEPTED_BEHAVIOR_HASH_MIGRATIONS`` (warns).
     """
     got = LinearAecContract.from_dict(actual)
     want = LinearAecContract.from_dict(expected)
@@ -843,14 +667,10 @@ class LinearAecProcessor:
     """One stateful PBFDKF instance for one complete parent sequence.
 
     ``delay_num_filters`` deploys a matched-filter bank other than the
-    ``DATASET_DELAY_NUM_FILTERS`` one this corpus is materialized with. It is
-    a DIAGNOSTIC/INFERENCE knob: it changes what the engine searches, never
-    what ``contract`` says, so the contract carried by an overridden processor
-    is the recorded one, unmodified and identically fingerprinted. That also
-    means an overridden run must never be written back into a dataset -- the
-    resulting ``linear_error`` would be indistinguishable from a default-bank
-    one by contract comparison alone. ``materialize_linear_error`` therefore
-    takes no bank size at all.
+    ``DATASET_DELAY_NUM_FILTERS`` one the corpus is materialized with. It is a
+    DIAGNOSTIC/INFERENCE knob: it changes what the engine searches, never what
+    ``contract`` says, so an overridden run must never be written back into a
+    dataset (``materialize_linear_error`` takes no bank size at all).
     """
 
     def __init__(

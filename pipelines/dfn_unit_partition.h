@@ -1,7 +1,5 @@
-/* The unit ERB partition: band 0 owns every bin, a partition of unity by
- * construction. It lets the DFN2 fail-open path run without the model's
- * exported matrices (board smoke runs, tests); it is NOT the model's ERB
- * analysis and must not be used with a real callback. */
+/* Unit ERB partition (band 0 owns every bin): lets the DFN2 fail-open path run
+ * without the model's exported matrices; not the model's ERB analysis. */
 #ifndef DFN_UNIT_PARTITION_H
 #define DFN_UNIT_PARTITION_H
 

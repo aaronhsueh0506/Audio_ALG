@@ -1,15 +1,10 @@
-/* 4aec_dfn_res acceptance test.
- *
- * Backbone gate: with the identity model (no callback) the wrapper must be
- * the conventional chain with the denoiser off (ConvChain: the front end and
- * the stages written out), delayed by exactly two hops, byte for byte, over
- * both beamformed-error entries (reconstructed and trusted spectrum) and
- * with comfort noise OFF and ON. The stimulus is an echo delayed by 384
- * samples under the shared matched delay estimator; the test asserts the
- * estimator reported a delay change during the run (the "no reset on a
- * delay change" contract is exercised) and that the post-beam RES actually
- * cuts (a RES-off core produces a different output), so the post-RES
- * spectrum differs from the pre-RES one. */
+/* 4aec_dfn_res acceptance test. Backbone gate: with the identity model (no callback) the
+ * wrapper must equal the conventional chain with the denoiser off (ConvChain), delayed by
+ * exactly two hops, byte for byte, over both beamformed-error entries (reconstructed and
+ * trusted spectrum) and with comfort noise OFF and ON. The stimulus is a 384-sample echo
+ * under the shared matched delay estimator; the test asserts the estimator reported a
+ * delay change (the "no reset on a delay change" contract is exercised) and that the
+ * post-beam RES cuts (a RES-off core produces a different output). */
 #include <math.h>
 #include <stdio.h>
 #include <stdlib.h>

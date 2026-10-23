@@ -161,13 +161,11 @@ def test_input_schema_shapes_match_the_c_cache_struct(tmp_path):
 def test_calibration_frame_shapes_equal_the_exported_graph_inputs(tmp_path):
     """One recorded calibration frame must BE one graph invocation.
 
-    ``capture_calibration_inputs`` keeps the graph's batch dimension and
-    ``np.stack`` adds the calibration-frame axis on top of it.  Dropping the
-    batch axis would leave every ``.bin`` one rank short of the input the
-    accelerator binds it to, and nothing downstream re-derives the shape --
-    the manifest is what a quantizer reads.  So the per-frame shapes are
-    compared against the ONNX graph this exporter really produces rather than
-    against a literal that could be edited to match a regression.
+    Dropping the batch axis would leave every ``.bin`` one rank short of the
+    input the accelerator binds it to, and nothing downstream re-derives the
+    shape -- the manifest is what a quantizer reads. So the per-frame shapes
+    are compared against the ONNX graph this exporter really produces rather
+    than against a literal that could be edited to match a regression.
     """
     onnx = pytest.importorskip('onnx')
     from calibration_io import (

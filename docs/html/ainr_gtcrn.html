@@ -35,7 +35,7 @@ th{background:#eef1f5}
 
 <h2>概要</h2>
 <p>超輕量 16 kHz 降噪模型(ShuffleNetV2 conv + SFE + TRA + 2×DPGRNN,
-輸出 complex ratio mask)。model layout v5 起固定前後端全部搬到 host；出貨的
+輸出 complex ratio mask)。前後端固定在 host；出貨的
 <b>state layout version 8(11 個 graph input)</b>:六個 depth-conv 各一個完整 window、兩顆 stacked GRU 狀態
 <code>h_tra</code>／<code>h_dpgrnn</code>,每個 state 的輸入與 <code>*_out</code> 輸出 shape 相同、綁同一個位址:
 C 端 <code>gtcrn_process.c</code> 負責串流 STFT/WOLA 之外,還以
@@ -169,7 +169,7 @@ spectrum 寬度隨 n_fft，cache extent 隨 GT block kernel/dilation 與 encoder
 runtime 把每個 state input 與對應 <code>*_out</code> 綁到<b>同一個欄位</b>（綁定表在 <code>gtcrn_process.h</code>），
 更新後的 state 就是下一次呼叫的輸入，沒有複製；須先讀完所有 state 輸入才寫同位址的輸出（目標平台已確認 NPU 的行為）。
 呼叫端在每次 invocation 後用 <code>gtcrn_model_state_validate()</code> 檢查（見下）。
-匯出不再 pin 單一 grid——config 與 checkpoint 不成對時在 strict
+匯出不 pin 單一 grid——config 與 checkpoint 不成對時在 strict
 <code>load_state_dict</code>（形狀）或 checkpoint contract（同形語意）就大聲失敗。
 v5 起固定前後端全在 host：<code>gtcrn_model_input</code>（magnitude＋ERB 前向矩陣）
 產生 <code>mag/real/imag</code> 三個獨立輸入（各自量化 scale）；圖回傳 ERB 域
@@ -184,7 +184,7 @@ shape）；<b>C 只吃呼叫端載入的指標</b>，loader 擁有檔案、可�
 <p><b>State 邊界(layout version 8)</b>:所有 state tensor 都是 rank 4,輸入與 <code>*_out</code> 輸出 shape 完全相同;
 metadata 記 <code>state_binding = in_place_same_address</code>。版本 3–7 已退役(<code>RETIRED_LAYOUT_VERSIONS</code>)。</p>
 <ul>
-<li><code>conv_enc0/1/2</code>、<code>conv_dec0/1/2</code> <code>(1,16,3|5|11,33)</code>:depth-conv 的<b>完整</b>因果 window(= 舊歷史 + 新的一幀)。
+<li><code>conv_enc0/1/2</code>、<code>conv_dec0/1/2</code> <code>(1,16,3|5|11,33)</code>:depth-conv 的<b>完整</b>因果 window(= 歷史 + 新的一幀)。
 圖在輸入上做一個 Slice(axes=[2]、starts=[1]、ends=[K]、step 1,end 是明確整數)丟掉最舊一幀,接上新的一幀,卷積,
 並把<b>整個</b> K 幀 Concat 結果當作 <code>conv_*_out</code>。輸入只有這一個 consumer,沒有任何 state 輸出由 Slice 產生。
 decoder 的 window 深度與 encoder 反向(11、5、3)。</li>
@@ -192,9 +192,8 @@ decoder 的 window 深度與 encoder 反向(11、5、3)。</li>
 (<code>h_dpgrnn1_0</code>、<code>h_dpgrnn1_1</code>、<code>h_dpgrnn2_0</code>、<code>h_dpgrnn2_1</code>),hidden batch 是頻率軸。
 每顆 GRU 用輸入上 dim 1 的 Slice 取自己的列再 squeeze,下一個 state 以一個 Concat(dim 1)接回。</li>
 </ul>
-<p class="note">同一份 compute:舊的逐 block／逐 GRU 輸入對照以 ONNX Runtime 重播驗證——240 hops 實音訊與 27 hops 隨機輸入,
-輸出 head 與舊圖逐位元相同(最大差 0),新 window 前 K−1 幀等於舊輸入、後 K−1 幀等於舊輸出,<code>h_tra</code>／<code>h_dpgrnn</code>
-等於舊的六個／四個 hidden 依序串接。匯出圖經 exporter 內建 onnxoptimizer ＋ ORT 常數折疊後本機量測 299 節點(36 個 Slice,皆 step 1;合約測試門檻 ≤ 300)。
+<p class="note">新 window 的前 K−1 幀等於輸入 window 的後 K−1 幀,<code>h_tra</code>／<code>h_dpgrnn</code>
+是六個／四個 hidden 依序串接。匯出圖經 exporter 內建 onnxoptimizer ＋ ORT 常數折疊後本機量測 299 節點(36 個 Slice,皆 step 1;合約測試門檻 ≤ 300)。
 <code>AINR/onnx_streaming_contract.py</code> 的 <code>validate_inplace_state_graph()</code> 在匯出時檢查上述條件,
 <code>AINR/check_state_quantization.py</code> 可對量化後的圖與報告再檢查 state 輸入／輸出的 dtype、scale、zero point、shape 是否一致。
 Slice 沿 axis 2 的起點在 int8 下落在 33 byte 的整數倍(window 一列 33 個元素),不是 16 byte 對齊;對齊處理由量化工具鏈決定,尚未在板上驗證。</p>

@@ -1,7 +1,6 @@
 # AIAEC streaming 與硬體匯出現況
 
-本文件只描述目前保留的四個模型。已移除的 GTCRN/DFN2 AENR 衍生候選不
-再是 release surface，也不應出現在 checkpoint、export 或文件清單。
+本文件描述目前保留的四個模型。
 
 ## 共通原則
 
@@ -28,8 +27,8 @@
 
 ## Align-ULCNet
 
-CPU 每 hop 執行 PBFDKF，取得 formed linear error 與該 hop 實際消費的
-aligned far，再推進 STFT。
+CPU 每 hop 執行 PBFDKF，取得 formed linear error，連同原始 raw far
+（PBFDKF 的 aligned 副本只用來形成 linear error，對齊由模型的 TA block 負責）再推進 STFT。
 accelerator 每次收到當前 frame，以及 CPU 保存的 K/V、logit 與 GRU
 state。graph 回傳複數 mask（planar `[1,2,1,BINS]`）與每個 state 的完整下一個 window（輸入是完整 window，位移在 graph 內：
 輸入端 Slice 加 Concat；runtime 把每個 `*_out` 綁到同名輸入的位址）。CPU 的 commit 驗證後以壓縮域 error 乘上 mask、做逆冪，再以 WOLA 合成。
@@ -71,27 +70,27 @@ calibration 也從同一個模型目錄執行：
       --frames 8192 --format bin \
       --output calib/model
 
-BIN layout 是 tensor/tensor_1.bin、tensor/tensor_2.bin 等，一個 invocation
+BIN layout 是 tensor/tensor_0000.bin、tensor/tensor_0001.bin 等，一個 invocation
 一個檔案，manifest.json 記錄 dtype、shape、grid 與 state contract。NPZ
 則使用 --format npz 與 .npz output。
 
-Align-ULCNet calibration 的 far WAV 是現有 raw far；manifest 會把
-calibration_far_input_mode=raw_far 與
-deployment_far_input_mode=aligned_far 分開記錄，避免誤認兩個 seam 相同。
+Align-ULCNet calibration 的 far WAV 是 raw far；manifest 把
+calibration_far_input_mode 與 deployment_far_input_mode（兩者皆為 raw_far）
+分開記錄，讓 checkpoint 與板端契約不一致時可被偵測。
 
 ## C 前後處理
 
-> 已被取代：archive 改為依 configuration 分目錄（`make -C AIAEC
-> print-lib-path` 印出絕對路徑），成員另增 `ulcnet_prepost`、`deepvqe_prepost`
-> 與 `ulcnet_accelerator_adapter`；現況見 AIAEC/README.md「C pre/post-processing」。
-> 以下保留當時的盤點。
-
-AIAEC/build/libaiaec_prepost.a 提供：
+archive 依 configuration 分目錄（`make -C AIAEC print-lib-path` 印出
+`libaiaec_prepost.a` 的絕對路徑）。成員：
 
 - aiaec_process.c/.h：Align-CRUSE 與 CAGCRN mask 合成及共通 STFT/WOLA
 - DeepVQE_S/deepvqe_process.c/.h：DeepVQE CCM 合成
+- DeepVQE_S/deepvqe_prepost.c/.h：DeepVQE-S pre/post 類別
 - Align_ULCNet/ulcnet_process.c/.h：ULCNet analysis/synthesis
 - Align_ULCNet/ulcnet_model_io.c/.h：外部 state/ring descriptor 與更新
+- Align_ULCNet/ulcnet_prepost.c/.h、ulcnet_accelerator_adapter.c/.h：ULCNet pre/post 類別與 accelerator adapter
+
+細節見 AIAEC/README.md「C pre/post-processing」。
 
 ## Release gate
 

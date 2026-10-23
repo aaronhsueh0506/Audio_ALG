@@ -2,50 +2,30 @@
 source-disjoint train/validation split, both decided BEFORE any audio is
 rendered.
 
-``build_unified_manifest`` / ``--split all`` is the selected training
-protocol: every source goes in one pool, and
-``AIAEC.training_common.split_dataset_by_sample`` performs a deterministic
-per-chunk random split at load time. Chunks from one source or parent
-sequence may therefore straddle train and validation. This is useful for
-optimization tracking, but generalisation must be measured with a separate
-source-disjoint or real-recording set -- which is what the rest of this
-module (``build_manifest``) also provides, for that purpose.
+``build_unified_manifest`` / ``--split all`` puts every source in one pool and
+``AIAEC.training_common.split_dataset_by_sample`` splits per chunk at load
+time, so chunks of one source or parent sequence may straddle train and
+validation; generalisation must be measured with a source-disjoint or
+real-recording set, which ``build_manifest`` also provides.
 
-WHY THE SOURCE-DISJOINT MODE IS NOT THE NR SPLIT
--------------------------------------------------
-``AINR/dataset_gen/loader.py`` splits the *generated* corpus: it draws a permutation
-over finished clips and holds 5% out.  That is fine when every clip is an
-independent draw, and it is wrong here.
+Why the source-disjoint mode is not the NR split: two AEC clips from the same
+speaker, echo RIR and loudspeaker model share the exact voice, room response
+and nonlinearity, so splitting after generation (as the NR loader does) puts
+both halves of such a pair on opposite sides and validation measures how well
+the model memorised a room. The split therefore happens over the SOURCE LISTS:
+speaker (which also makes speech files), noise, room/RIR (a room is split
+whole) and device (loudspeaker IDENTITY: its own EQ and drive) are disjoint.
 
-Two AEC clips rendered from the same speaker, the same echo RIR and the same
-loudspeaker model are not independent -- they share the exact nonlinearity, the
-exact room response and the exact voice.  Split after generation and both halves
-of that pair land on opposite sides of the fence, so validation measures how
-well the model memorised a room rather than how well it cancels echo.  The
-number that comes out is high, stable, reproducible, and meaningless.
+⚠ Device disjointness holds out identities, not loudspeaker MODELS: train is
+filled with one id per configured nonlinearity model first (the movement axis
+is calibrated through the population the corpus renders) and val is drawn from
+ids whose model train already carries. A split with too few spare ids falls
+back to a plain permutation and val can then carry a model train does not; the
+CLI prints what each split realises. ``[split] device_split = shared`` drops
+the holdout and the val score answers an easier question.
 
-So the source-disjoint split happens over the SOURCE LISTS, before a single
-sample is rendered:
-
-    speaker      disjoint   (which also makes speech FILES disjoint)
-    noise        disjoint
-    room / RIR   disjoint   (a room is split whole; its RIRs never straddle)
-    device       disjoint   (loudspeaker IDENTITY: its own EQ and drive)
-
-⚠ Device disjointness holds out identities, not loudspeaker MODELS.  Train is
-filled with one id per configured nonlinearity model first, because the
-movement axis is calibrated through the population the corpus renders and a
-train split missing a model renders a different corpus; val is then drawn from
-the ids whose model train already carries.  So validation is scored on
-loudspeakers the model has never heard -- their own EQ, drive and level
-realisation -- of nonlinearity families it has heard elsewhere.  A split with
-too few spare ids to fill val that way falls back to a plain permutation, and
-then val can also carry a model train does not; the CLI prints what each split
-realises.  ``[split] device_split = shared`` drops the holdout entirely, and
-then the val score answers a different, easier question -- say so if you use it.
-
-The manifest is written to disk so that the train run and the val run, which
-are separate invocations, provably draw from the same decision.
+The manifest is written to disk so the train run and the val run provably draw
+from the same decision.
 """
 
 import configparser
@@ -144,12 +124,11 @@ def _scan_wavs(root: str) -> List[str]:
 def _grouping_key(rel_path: str, pattern: Optional[str], fallback: str) -> str:
     """Extract a speaker/noise/room id from a relative path.
 
-    ``pattern`` is a regex whose first group is the id; corpora differ too much
-    for a single hardcoded rule (DNS4 read_speech encodes the reader in the
-    filename, most RIR sets encode the room in a directory).  When no pattern
-    matches, ``fallback`` selects a structural rule instead of silently
-    producing one giant group -- a single group would make a disjoint split
-    impossible and the failure would surface as an unexplained error much later.
+    ``pattern`` is a regex whose first group is the id (DNS4 read_speech
+    encodes the reader in the filename, most RIR sets the room in a directory).
+    When no pattern matches, ``fallback`` selects a structural rule instead of
+    silently producing one giant group, which would make a disjoint split
+    impossible.
     """
     if pattern:
         match = re.search(pattern, rel_path.replace(os.sep, '/'))
@@ -197,26 +176,13 @@ def _split_groups(groups: Dict[str, List[str]], val_fraction: float,
 def _split_devices(cfg: configparser.ConfigParser, device_ids: Sequence[str],
                    val_fraction: float, rng: random.Random,
                    seed: int) -> Dict[str, List[str]]:
-    """Hold devices out for validation while TRAIN keeps every loudspeaker model.
+    """Hold devices out for validation while TRAIN keeps every model.
 
-    The models are stratified over the whole configured id list, but a
-    source-disjoint corpus is rendered from ONE split's ids, so a val id drawn
-    without regard to its model takes that model out of training whenever it is
-    the only id carrying it -- with 8 ids over 7 models that is most seeds. The
-    movement axis is calibrated through the population the corpus actually
-    renders, so which models a split realises is not a detail of the seed.
-
-    The permutation therefore fills train with the first id of each distinct
-    model and val is drawn from the ids whose model is already covered. A split
-    that cannot hold every model -- fewer ids than models, or too few duplicate
-    models to fill val from -- falls back to the plain permutation, and the CLI
-    prints what each split realises.
-
-    ⚠ What val holds is therefore a held-out device IDENTITY: its own EQ,
-    drive and level draw of a nonlinearity model train also carries. There is
-    no unseen-MODEL guarantee on that side and none is available while train
-    keeps every model; the fallback above is the only case that can produce
-    one.
+    A val id drawn without regard to its model takes that model out of training
+    whenever it is the only id carrying it. The permutation therefore fills
+    train with one id per model and draws val from ids whose model is already
+    covered, falling back to the plain permutation when it cannot. ⚠ Val holds
+    a held-out device IDENTITY, not an unseen model.
     """
     if len(device_ids) < 2:
         raise ValueError(
@@ -375,12 +341,10 @@ def _split_entry(speaker_ids, speakers, noise_ids, noises, room_ids, rooms,
 def _apply_far_speech(manifest: dict, scanned: dict) -> None:
     """Add the optional independent far-end reference pool, if configured.
 
-    Deliberately NOT part of ``_split_entry``: this pool never participates in
-    a train/val decision (see ``[paths] far_speech_dir`` in
-    config.example.ini), so it lives once at the manifest's top level --
-    alongside ``roots``/``rt60`` -- rather than duplicated identically inside
-    every ``splits[...]`` entry. Absent entirely when unconfigured, so
-    ``SourcePools`` can tell "not set" apart from "empty".
+    NOT part of ``_split_entry``: this pool never participates in a train/val
+    decision (see ``[paths] far_speech_dir`` in config.example.ini), so it
+    lives once at the manifest's top level. Absent entirely when unconfigured,
+    so ``SourcePools`` can tell "not set" apart from "empty".
     """
     if scanned['far_speech_rel'] is not None:
         manifest['far_speech_files'] = scanned['far_speech_rel']
@@ -456,15 +420,11 @@ def build_unified_manifest(cfg: configparser.ConfigParser, seed: int,
                           progress: bool = True) -> dict:
     """One undifferentiated pool -- every source available to every clip.
 
-    For the selected unified-corpus protocol. See
-    AIAEC/training_common.py's split_dataset_by_sample for the deterministic
-    per-chunk random split this pairs with. Generalisation must be evaluated
+    For the unified-corpus protocol paired with
+    training_common.split_dataset_by_sample; generalisation must be evaluated
     separately because sources and parent sequences may straddle the split.
-    There is no train/val axis here
-    to keep disjoint, so assert_source_disjoint is never called on this
-    shape; ``seed`` is still recorded for provenance even though nothing in
-    THIS function is randomised by it (kept so the in-memory/optional persisted
-    manifest has one schema across both split shapes).
+    There is no train/val axis here, so assert_source_disjoint is never called
+    on this shape; ``seed`` is recorded for provenance only.
     """
     scanned = _scan_sources(cfg, progress)
     speakers, noises, rooms = scanned['speakers'], scanned['noises'], scanned['rooms']

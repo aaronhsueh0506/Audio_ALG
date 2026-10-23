@@ -116,7 +116,7 @@ def resampler_budget(native_rate: int):
     if native_rate == SAMPLE_RATE:
         one_up = one_down = 0
     else:
-        # audiolib's current polyphase layout gives 33 MAC/output for
+        # audiolib's polyphase layout gives 33 MAC/output for
         # every supported native->48k pair. Downstream taps differ by rate.
         import math
         def macs(rate_in, rate_out):

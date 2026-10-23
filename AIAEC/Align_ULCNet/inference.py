@@ -42,23 +42,21 @@ primary_source=raw_mic_via_frozen_pbfdkf:
 mic.wav / far.wav must be mono. Both are resampled to the checkpoint's sample
 rate before the linear AEC when needed; output stays at that model rate.
 
-This candidate's input is the FROZEN PRODUCTION LINEAR AEC's error, not the
-raw microphone -- see AIAEC/training_common.py's LinearAecEngine. This
-script runs that same reference Python engine (RES+CNG disabled) one hop at a
-time, followed by incremental STFT, one-frame model inference, and incremental
-ISTFT.  A fresh process starts with cold AEC/model state; state then persists
-for the complete file exactly as it does in deployment.
+This candidate's input is the FROZEN PRODUCTION LINEAR AEC's error, not the raw
+microphone (see AIAEC/training_common.py's LinearAecEngine). This script runs
+that reference Python engine (RES+CNG disabled) one hop at a time, followed by
+incremental STFT, one-frame model inference and incremental ISTFT; a fresh
+process starts with cold AEC/model state, which then persists for the whole
+file as in deployment. Output is the common denoised, echo-free,
+early/dereverberated near-end speech estimate.
 
-Output is the common denoised, echo-free, early/dereverberated near-end speech
-estimate used by every selected AIAEC candidate.
-
-config.ini is not read for model shape: every shape-relevant setting is
-recovered from the checkpoint's own contract, including the exact materialized
-Python-PBFDKF frontend. Inference refuses a missing or drifted AEC contract.
-
-``--input-is-linear-error`` is an evaluation-only bypass for published demos
-that already provide KF residual Z. It does not make an external KF equivalent
-to the frozen PBFDKF used to train this repository's checkpoint.
+config.ini is not read for model shape: every shape-relevant setting, including
+the exact materialized Python-PBFDKF frontend, is recovered from the
+checkpoint's own contract, and inference refuses a missing or drifted AEC
+contract. ``--input-is-linear-error`` is an evaluation-only bypass for
+published demos that already provide KF residual Z; it does not make an
+external KF equivalent to the frozen PBFDKF used to train this repository's
+checkpoint.
 """
 
 from __future__ import annotations
@@ -161,9 +159,9 @@ def load_model(checkpoint_path: str, device: str,
     ckpt = torch.load(checkpoint_path, map_location=device, weights_only=False)
     contract = ckpt['contract']
     require_checkpoint_model_identity(contract, 'Align_ULCNet')
-    # Missing field defaults to 'raw_far' (legacy checkpoints); an unknown
-    # recorded mode is rejected here, before any weights load. _streaming.py
-    # shares this loader, so both CLIs print the mode at load time.
+    # A missing field defaults to 'raw_far'; an unknown recorded mode is
+    # rejected here, before any weights load. _streaming.py shares this loader,
+    # so both CLIs print the mode at load time.
     print("checkpoint training far_input_mode: "
           f"{checkpoint_far_input_mode(contract)}; "
           "deployment default: raw_far")
