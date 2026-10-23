@@ -71,7 +71,7 @@
  * content bumps it, including a change of the composed AEC, NR or FFT pool;
  * the carve token string in audio_pipeline_build_flags_hash() moves with a
  * changed buffer set or order. */
-#define AUDIO_PIPELINE_LAYOUT_VERSION 14u
+#define AUDIO_PIPELINE_LAYOUT_VERSION 15u
 
 /* Compile-time FFT backend identity. pipelines/Makefile passes
  * -DAUDIO_PIPELINE_BACKEND_STR=\"ne10\" to match its own BACKEND= selection

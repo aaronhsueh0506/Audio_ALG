@@ -167,7 +167,7 @@ h1/h2/h3</b>——3 框 conv 窗由 C 端 ring 重送,圖內無 conv cache。</p
 <div class="tbl"><table>
 <tr><th>狀態</th><th>shape</th><th>bytes</th><th>儲存者</th><th>說明</th></tr>
 <tr><td><code>stft / istft</code></td><td>pointer ×2</td><td>16 (AArch64)</td><td>C struct <code>RNNoiseState</code></td><td>借用呼叫端 framing；init 檢查 grid、scale、窗與 OLA mode</td></tr>
-<tr><td>FFT / STFT / ISTFT objects</td><td>由 size-query 配置</td><td>15,600 + 6,240 + 6,240</td><td>host aligned pools</td><td>FFT、IFFT、frame scratch 與 OLA 均由 audiolib 管理；可依序共用 FFT handle</td></tr>
+<tr><td>FFT / STFT / ISTFT objects</td><td>由 size-query 配置</td><td>13,552 + 6,240 + 6,240</td><td>host aligned pools</td><td>FFT、IFFT、frame scratch 與 OLA 均由 audiolib 管理；可依序共用 FFT handle</td></tr>
 <tr><td><code>erb_feat_buf</code></td><td>[3][22]</td><td>264</td><td>C struct</td><td>3-frame ERB 特徵 ring</td></tr>
 <tr><td><code>spec_feat_buf</code></td><td>[3][2][129]</td><td>3,096</td><td>C struct</td><td>3-frame complex 特徵 ring</td></tr>
 <tr><td><code>feat_idx</code> / <code>feat_count</code></td><td>int ×2</td><td>8</td><td>C struct</td><td>ring 指標 / 暖機計數</td></tr>
@@ -179,7 +179,7 @@ h1/h2/h3</b>——3 框 conv 窗由 C 端 ring 重送,圖內無 conv cache。</p
 <tr><td>輸入滑動窗</td><td>[512]</td><td>2,048</td><td>host(呼叫端)</td><td><code>rnnoise_analysis</code> 吃整窗,C 不代管</td></tr>
 <tr><td>ERB/Hann 表格</td><td><code>nfftborder[22]</code>、<code>erb_fwd/erb_inv[257][22]</code>、<code>hann_win[512]</code></td><td>—(.rodata)</td><td>編譯期常數</td><td><code>gen_rnnoise_tables.c</code> 產生 <code>rnnoise_tables_gen.h</code>,無執行期可變表格</td></tr>
 </table></div>
-<p class="note"><code>sizeof(RNNoiseState)</code> = 5,104 bytes；獨立配置一個 FFT 與兩個 framing 的總 static memory 為 33,184 bytes，舊版為 15,328 bytes（本機量測，實際依 size-query 配置）。只有 host 已有可共用 FFT 時，RNNoise/framing 部分才是 17,584 bytes。<code>RNNOISE_PREPOST_LAYOUT_VERSION=2</code>，GRU/ONNX layout 仍為 1。同一 stream 分 chunk 必須保留 EMA、GRU、framing/OLA 與對應的 spectrum 延遲。</p>
+<p class="note"><code>sizeof(RNNoiseState)</code> = 5,104 bytes；獨立配置一個 FFT 與兩個 framing 的總 static memory 為 31,136 bytes，舊版為 15,328 bytes（本機量測，實際依 size-query 配置）。只有 host 已有可共用 FFT 時，RNNoise/framing 部分才是 17,584 bytes。<code>RNNOISE_PREPOST_LAYOUT_VERSION=2</code>，GRU/ONNX layout 仍為 1。同一 stream 分 chunk 必須保留 EMA、GRU、framing/OLA 與對應的 spectrum 延遲。</p>
 
 <h2>延遲與 warm-up</h2>
 <ul>

@@ -71,9 +71,9 @@ th{background:#eef2f8}
 <tr><th>state</th><th>大小</th><th>存放者</th><th>備註</th></tr>
 <tr><td>3 顆 <code>audio_resampler</code>;原生 <code>AcIstft</code> ×2、48 kHz <code>AcStft</code> ×2 與 <code>AcIstft</code> ×1;兩個 FFT handle、兩張窗表;48 kHz FIFO ×2</td><td>各自 pool;2×<code>AcIstft</code>(fft_n)+ 3×1024 點物件;<code>FIFO48_CAP</code> = 1,536 float ×2</td><td>bridge pool</td><td>E、P 各一顆升頻(→ 48 kHz)、共用一顆降頻(每顆自帶相位與 FIR 歷史)。<code>synth_e</code>/<code>synth_p</code> 各走一份 host 同款 sqrt-Hann WOLA 還原成時域;<code>fifo_e</code>/<code>fifo_p</code>(<code>FIFO48_CAP</code>:只放未湊滿 512 的餘量加一個 hop 的升頻量,每消耗一幀就左移 512;分析歷史由 <code>stft_e</code>/<code>stft_p</code> 持有)。五個 STFT/ISTFT 物件借用 bridge 的兩支 FFT handle 與兩張窗表（<code>win_n</code>、<code>win48</code>）,bridge 以「自帶 FFT 與窗的物件大小減去那兩段」估算借用物件大小</td></tr>
 <tr><td>原生 out FIFO</td><td>1024 float(<code>OUT_FIFO_CAP</code>)</td><td>bridge pool</td><td>init 預填 <code>prefill</code> 個零(16 k/hop 128 → 128、16 k/hop 256 → 85、8 k/hop 128 → 42),之後每 hop 取走一個 hop</td></tr>
-<tr><td>bridge 計數器;<b>bridge pool 小計</b></td><td><b>355,008 B(ne10)</b></td><td>bridge struct / 含在上層 pool 內</td><td><code>frames_48k</code>/<code>last_hop_frames</code>(<code>dfn_rate_bridge_get_counters()</code>,測試用 <code>last_hop_frames</code> 驗證排程)。小計為 16 kHz / fft 256 現查,<b>已含 stage 的 pool</b></td></tr>
+<tr><td>bridge 計數器;<b>bridge pool 小計</b></td><td><b>349,888 B(ne10)</b></td><td>bridge struct / 含在上層 pool 內</td><td><code>frames_48k</code>/<code>last_hop_frames</code>(<code>dfn_rate_bridge_get_counters()</code>,測試用 <code>last_hop_frames</code> 驗證排程)。小計為 16 kHz / fft 256 現查,<b>已含 stage 的 pool</b></td></tr>
 </table>
-<p>4ch wrapper 在 16 kHz／fft 256 的 bridge pool 小計同為 <b>355,008 B(ne10)</b>(已含 stage 的 pool);4ch 的 bridge 另有一個 <code>phase</code> 欄位供 begin/nn_begin/nn_end/finish 序列閘使用(struct 大小不變)。</p>
+<p>4ch wrapper 在 16 kHz／fft 256 的 bridge pool 小計同為 <b>349,888 B(ne10)</b>(已含 stage 的 pool);4ch 的 bridge 另有一個 <code>phase</code> 欄位供 begin/nn_begin/nn_end/finish 序列閘使用(struct 大小不變)。</p>
 
 <h2>4ch wrapper:估計用 E、套用在 P</h2>
 

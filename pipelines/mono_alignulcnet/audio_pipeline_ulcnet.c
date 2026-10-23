@@ -61,7 +61,7 @@
  * including a change of the self-resident Ulcnet state block or of a composed
  * pool; the token string in audio_pipeline_ulcnet_build_flags_hash() moves
  * with a changed carve. */
-#define AUDIO_PIPELINE_ULCNET_LAYOUT_VERSION 14u
+#define AUDIO_PIPELINE_ULCNET_LAYOUT_VERSION 15u
 
 /* Compile-time FFT backend identity -- same mechanism as audio_pipeline.c:
  * pipelines/Makefile passes -DAUDIO_PIPELINE_BACKEND_STR=\"ne10\"

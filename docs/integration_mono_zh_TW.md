@@ -371,19 +371,20 @@ if (audio_pipeline_get_mem_breakdown(&cfg, &b) == 0) { /* b.aec_bytes, ... */ }
 
 ### 4.5 實測記憶體（僅供量級參考，務必自己重查）
 
-以下是**本次 checkout（layout_version=14）、`BACKEND=kiss`、`pipelines/Makefile`
-預設選項**在 kiss 後端移除前的量測，直接以 `--print-mem-size` 量到的值。現行建置
-只有 ne10，數字會不同，請自己重查；換編譯選項、更新 submodule 也都會變。
+以下是**本次 checkout（layout_version=15）、`BACKEND=ne10`、`pipelines/Makefile`
+預設選項**下，以 `--print-mem-size` 量到的值（`aec_only` 與 delay 列用
+`audio_pipeline_get_mem_breakdown()`／`_get_mem_requirements()` 直接呼叫）。換編譯選項、
+更新 submodule 都會變，請自己重查。
 
 控制區塊為 160 B（`ALIGN16(sizeof(AudioPipeline))`）。
 
 | Config | `req.bytes` | `aec_bytes` | `fft_bytes` | `nr_bytes` | `pipeline_bytes` |
 |---|---:|---:|---:|---:|---:|
-| 8000，預設 | 360,992 | 278,256 | 8,784 | 67,504 | 6,288 |
-| 16000，預設（256/128） | 522,912 | 385,440 | 8,784 | 122,240 | 6,288 |
-| 16000，`fft_size=512` | 677,088 | 513,968 | 16,976 | 133,552 | 12,432 |
-| 48000，預設（1024/512） | 1,618,192 | 1,185,536 | 33,360 | 374,416 | 24,720 |
-| 16000，`aec_only=1` | 385,600 | 385,440 | 0 | 0 | 0 |
+| 8000，預設 | 358,736 | 284,352 | 7,152 | 60,784 | 6,288 |
+| 16000，預設（256/128） | 520,672 | 397,744 | 7,152 | 109,328 | 6,288 |
+| 16000，`fft_size=512` | 671,760 | 525,440 | 13,552 | 120,176 | 12,432 |
+| 48000，預設（1024/512） | 1,610,832 | 1,224,176 | 26,352 | 335,424 | 24,720 |
+| 16000，`aec_only=1` | 397,904 | 397,744 | 0 | 0 | 0 |
 
 `req.bytes` 減去四個分項（各自 16-byte 對齊後）的差額，就是 `AudioPipeline`
 控制區塊，本次量測在每一組 config 都是 160 B。
@@ -392,10 +393,10 @@ if (audio_pipeline_get_mem_breakdown(&cfg, &b) == 0) { /* b.aec_bytes, ... */ }
 
 | `delay_mode` | `req.bytes` | 相對 `MATCHED n=5` |
 |---|---:|---:|
-| `MATCHED` n=5（預設） | 522,912 | — |
-| `MATCHED` n=1 | 500,000 | −22,912 |
-| `FIXED`，`fixed_delay_samples=1600`（100 ms） | 363,648 | −158,096 |
-| `EXTERNAL_ALIGNED` | 357,904 | −165,008 |
+| `MATCHED` n=5（預設） | 520,672 | — |
+| `MATCHED` n=1 | 497,760 | −22,912 |
+| `FIXED`，`fixed_delay_samples=1600`（100 ms） | 362,576 | −158,096 |
+| `EXTERNAL_ALIGNED` | 355,664 | −165,008 |
 
 這四列的差額全部落在 `aec_bytes`（`delay_mode`/`delay_num_filters` 不影響
 FFT/NR/pipeline 分項），數字與 `lib/aec` 自己的 `aec_get_mem_size()` 一致
@@ -566,7 +567,7 @@ FFT/NR/pipeline 分項），數字與 `lib/aec` 自己的 `aec_get_mem_size()` �
 | Offset | 欄位 | 型別 | 目前值 |
 |---:|---|---|---|
 | 0 | `descriptor_version` | `uint32_t` | `2` |
-| 4 | `layout_version` | `uint32_t` | `14` |
+| 4 | `layout_version` | `uint32_t` | `15` |
 | 8 | `backend_id` | `uint32_t` | `2` = NE10（目前唯一的 FFT 後端）；`1` 已退役、不會再回傳；永遠不會是 0 |
 | 12 | `build_flags_hash` | `uint32_t` | FNV-1a-32，隨 build 變動 |
 | 16 | `alignment` | `uint32_t` | `16` |

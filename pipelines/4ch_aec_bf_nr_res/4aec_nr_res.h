@@ -78,7 +78,7 @@ extern "C" {
  * stages are carved by the application, not here. Any change of pool size,
  * carve order or descriptor content bumps it. Query a fresh descriptor for
  * every build; do not persist or synthesize one from this version number. */
-#define FOUR_AEC_NR_RES_LAYOUT_VERSION 21u
+#define FOUR_AEC_NR_RES_LAYOUT_VERSION 22u
 #define FOUR_AEC_NR_RES_BACKEND_NE10 2u   /* backend_id 1 is retired, never returned */
 
 /**

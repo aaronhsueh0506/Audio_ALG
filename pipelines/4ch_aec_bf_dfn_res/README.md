@@ -109,9 +109,9 @@ model dominates this arithmetic budget; A53/A73 CPU-only admission still
 requires the final int8/fp runtime and board cycle measurement.
 
 Host DSP pool (`four_aec_dfn_res_get_mem_requirements`, matched delay,
-five-filter bank, NE10): 1,409,264 bytes at the 16 kHz default (core plus
-the rate bridge) and 3,782,816 bytes at 48 kHz (the conventional
-four-channel MMSE-LSA pipeline on the 48 kHz grid needs 3,920,880 bytes).
+five-filter bank, NE10): 1,400,048 bytes at the 16 kHz default (core plus
+the rate bridge) and 3,762,336 bytes at 48 kHz (the conventional
+four-channel MMSE-LSA pipeline on the 48 kHz grid needs 3,861,408 bytes).
 Model weights and accelerator activation/workspace memory are external;
 adding int8 weights alone brings the known minimum to about 3.4 MiB at
 16 kHz.

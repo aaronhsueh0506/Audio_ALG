@@ -114,7 +114,7 @@ typedef struct AudioPipeline4Ch AudioPipeline4Ch;
  * this counter is the signal. Query a fresh descriptor for every build; do not
  * persist or synthesize one from this number. The exact totals come from
  * `make print-mem-size`. */
-#define AUDIO_PIPELINE_4CH_LAYOUT_VERSION 16u
+#define AUDIO_PIPELINE_4CH_LAYOUT_VERSION 17u
 
 /**
  * Fixed-width descriptor for a caller-owned static-memory pool. Same 32-byte

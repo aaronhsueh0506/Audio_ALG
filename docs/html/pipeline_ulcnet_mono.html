@@ -144,7 +144,7 @@ out             全零 256          hop#0 內容            hop p-1 內容
 <p>infer 介面以 <code>ULCNET_BINS</code> 為每個 RI array 的長度；回 0=成功。不要把 16 kHz 的 257 寫死在板端 callback。</p>
 
 <h2>State 表</h2>
-<p>Carve 順序(layout v14;pool 大小、carve 順序或 descriptor 內容任一改變,該模組的版本加一):self 控制塊(delay-transition bookkeeping、reprime 計數器、共用視窗表與幀 scratch)→ AEC pool → 共用 compiled-grid <code>FftHandle</code> → 兩個分析 <code>AcStft</code> → 合成 <code>AcIstft</code>(三者借用該 handle 與視窗表)。build hash 含 sample rate 與 FFT size，16/48 kHz descriptor 不可互用。幀 scratch 為 1 幀;kiss 後端移除前的 n=5 build 現查:16 kHz 為 560,080 B,48 kHz 為 1,276,704 B(<code>mono_alignulcnet</code> 執行檔的 banner;現行只有 ne10,總量不同,以自己 build 的 banner 為準)。控制塊另有 phased API 的相位與 job 狀態(<code>phase</code>、<code>nn_wanted</code>、<code>nn_accepted</code>)。<b>換 grid/backend/編譯選項/submodule 都必須以 <code>audio_pipeline_ulcnet_get_mem_requirements()</code> 現查並重新 init。</b></p>
+<p>Carve 順序(layout v15;pool 大小、carve 順序或 descriptor 內容任一改變,該模組的版本加一):self 控制塊(delay-transition bookkeeping、reprime 計數器、共用視窗表與幀 scratch)→ AEC pool → 共用 compiled-grid <code>FftHandle</code> → 兩個分析 <code>AcStft</code> → 合成 <code>AcIstft</code>(三者借用該 handle 與視窗表)。build hash 含 sample rate 與 FFT size，16/48 kHz descriptor 不可互用。幀 scratch 為 1 幀;kiss 後端移除前的 n=5 build 現查:16 kHz 為 560,080 B,48 kHz 為 1,276,704 B(<code>mono_alignulcnet</code> 執行檔的 banner;現行只有 ne10,總量不同,以自己 build 的 banner 為準)。控制塊另有 phased API 的相位與 job 狀態(<code>phase</code>、<code>nn_wanted</code>、<code>nn_accepted</code>)。<b>換 grid/backend/編譯選項/submodule 都必須以 <code>audio_pipeline_ulcnet_get_mem_requirements()</code> 現查並重新 init。</b></p>
 <table>
 <tr><th>state</th><th>shape / size</th><th>存放者</th><th>備註</th></tr>
 <tr><td><code>Aec</code> 全狀態</td><td>compiled-grid pool 內</td><td>pool(C struct)</td><td><code>enable_res=0 / return_res_context=1 / spatial_linear_context=AEC_CONTEXT_LINEAR_ONLY</code>(只留線性半邊,線性輸出與完整 context 逐位元相同,省約 11–14 % 的 AEC 時間);delay estimation 開</td></tr>
@@ -170,7 +170,7 @@ out             全零 256          hop#0 內容            hop p-1 內容
 <h2>相關檔案與測試路徑</h2>
 <table>
 <tr><th>路徑(repo-relative)</th><th>內容</th></tr>
-<tr><td><code>pipelines/mono_alignulcnet/audio_pipeline_ulcnet.h / .c</code></td><td>本頁 API 與實作(descriptor v1 / layout v14)</td></tr>
+<tr><td><code>pipelines/mono_alignulcnet/audio_pipeline_ulcnet.h / .c</code></td><td>本頁 API 與實作(descriptor v1 / layout v15)</td></tr>
 <tr><td><code>AIAEC/Align_ULCNet/ulcnet_process.h / .c</code></td><td>C 前後處理 + <code>UlcnetModel</code> 邊界(Python parity gate:<code>AIAEC/tests/test_ulcnet_process_c.py</code>,~1e-5 float-ULP 級)</td></tr>
 <tr><td><code>AIAEC/Align_ULCNet/ulcnet_accelerator_adapter.h / .c</code></td><td>accelerator adapter(無狀態 run() callback 包裝,見上方專節);內部驅動 <code>ulcnet_prepost</code> 的 <code>ULCNET_IO_FREQ</code> 實例</td></tr>
 <tr><td><code>AIAEC/Align_ULCNet/ulcnet_prepost.h / .c</code></td><td>ULCNet 前後處理 class:<code>_config_defaults</code>/<code>_get_mem_size</code>/<code>_init_ex</code>(32-byte MemReq stale-pool gate)/<code>_reset</code> + 每幀 <code>_pre_process[_freq]</code> → <code>_frame_inputs</code> → accelerator → <code>_frame_commit</code>|<code>_frame_skip</code> → <code>_post_process[_freq]</code>;<code>ULCNET_IO_TIME</code> 由 class 跑 framing(用呼叫端的 <code>FftHandle</code> 與窗表),<code>ULCNET_IO_FREQ</code> 頻譜進出、不做轉換</td></tr>

@@ -6,15 +6,17 @@
 ## [Unreleased] — 2026-10-23 — Smaller AEC pool; DFN3 pre/post accessor and ERB-swap tests
 
 ### Changed
-- The AEC pool shrank (`PBFDAF.scr_e2` and the filters' `is_static` fields were removed), so every
-  pipeline that composes it carries a new carve layout version, as the version comments require:
-  `AUDIO_PIPELINE_LAYOUT_VERSION` 14, `AUDIO_PIPELINE_ULCNET_LAYOUT_VERSION` 14,
-  `MONO_AEC_DFN_RES_LAYOUT_VERSION` 4, `FOUR_AEC_NR_RES_LAYOUT_VERSION` 21,
-  `AUDIO_PIPELINE_4CH_LAYOUT_VERSION` 16, `AUDIO_PIPELINE_4CH_ULCNET_LAYOUT_VERSION` 22 and
-  `FOUR_AEC_DFN_RES_LAYOUT_VERSION` 5. A persisted descriptor from the previous layout is refused by
-  `init_ex()`; query a fresh one. DFN stage/bridge and the AIAEC model layouts are unchanged.
+- The AEC pool shrank (`PBFDAF.scr_e2` and the filters' `is_static` fields were removed; the FFT handle
+  stages its preserving transforms in one block), and the denoiser's start-up rows share the minimum
+  ring, so every pipeline that composes them carries a new carve layout version, as the version
+  comments require: `AUDIO_PIPELINE_LAYOUT_VERSION` 15, `AUDIO_PIPELINE_ULCNET_LAYOUT_VERSION` 15,
+  `MONO_AEC_DFN_RES_LAYOUT_VERSION` 5, `FOUR_AEC_NR_RES_LAYOUT_VERSION` 22,
+  `AUDIO_PIPELINE_4CH_LAYOUT_VERSION` 17, `AUDIO_PIPELINE_4CH_ULCNET_LAYOUT_VERSION` 23,
+  `FOUR_AEC_DFN_RES_LAYOUT_VERSION` 6 and `DFN_RATE_BRIDGE_LAYOUT_VERSION` 3. A persisted descriptor
+  from the previous layout is refused by `init_ex()`; query a fresh one. The DFN stage and the
+  AINR/AIAEC pre/post and model layouts are unchanged (their pools borrow the FFT handle).
 - Pool totals in the memory tables and CLI examples are re-measured (for example mono 16 kHz/256
-  535,632 B, 4-channel front end 16 kHz/256 1,044,000 B).
+  520,672 B, 4-channel front end 16 kHz/256 1,039,904 B).
 
 ### Added
 - `AINR/tests/test_dfn3_prepost_c.py`: ctypes tests of `dfn3_prepost_hop_size/num_bins/io_mode` and of

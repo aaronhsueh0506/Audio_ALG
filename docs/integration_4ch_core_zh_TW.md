@@ -492,22 +492,22 @@ lane 的 `filter_converged` / `dt_indicator` / `saturation_level` 縮成三個�
 
 ### 4.6 實測記憶體（僅供量級參考，務必自己重查）
 
-以下是本次 checkout（`layout_version=21`）、`BACKEND=ne10`、`SIMD=1`、
+以下是本次 checkout（`layout_version=22`）、`BACKEND=ne10`、`SIMD=1`、
 `delay_mode=MATCHED`（預設,n=5）、`enable_post=1`（預設）下直接呼叫 API
 量到的前端值。換 backend、換編譯選項、更新 submodule 都會變。前端不含 RES／NR／iFFT，
 所以 `FourAecNrResMemBreakdown` 只有 `aec_bytes`、`wrapper_bytes`（控制區塊、共用 aligner 與 fuse 緩衝）與 `total_bytes`。
 
 | Config | `req.bytes` | `aec_bytes`（四路合計） | `wrapper_bytes` |
 |---|---:|---:|---:|
-| 16000，預設（256/128，`max_delay_ms=1024`） | 1,044,000 | 935,040 | 108,960 |
-| 16000，`fft_size=512` | 1,566,048 | 1,449,920 | 116,128 |
-| 16000，`max_delay_ms=100` | 984,864 | 935,040 | 49,824 |
-| 16000，`filter_length=512` | 920,160 | 811,200 | 108,960 |
-| 48000，預設（1024/512） | 3,461,888 | 3,198,976 | 262,912 |
+| 16000，預設（256/128，`max_delay_ms=1024`） | 1,039,904 | 930,944 | 108,960 |
+| 16000，`fft_size=512` | 1,557,856 | 1,441,728 | 116,128 |
+| 16000，`max_delay_ms=100` | 980,768 | 930,944 | 49,824 |
+| 16000，`filter_length=512` | 916,064 | 807,104 | 108,960 |
+| 48000，預設（1024/512） | 3,445,504 | 3,182,592 | 262,912 |
 
 `four_aec_nr_res_get_mem_breakdown()` 的 `total_bytes` 與 `get_mem_requirements()` 的
 `req.bytes` 在上述每一組都相等；`wrapper_bytes` 已包含控制區塊。四路合計的
-`aec_bytes` 除以 4 得單路 233,760 B（@16k/256）——與 `lib/aec` 的
+`aec_bytes` 除以 4 得單路 232,736 B（@16k/256）——與 `lib/aec` 的
 `AEC_DELAY_EXTERNAL_ALIGNED` 單體大小完全相同,因為每路內部本來就是
 `EXTERNAL_ALIGNED`（delay 由本層共用估計器提供,不建自己的 estimator/ring）。
 
@@ -515,9 +515,9 @@ lane 的 `filter_converged` / `dt_indicator` / `saturation_level` 縮成三個�
 
 | `delay_mode` | `req.bytes` | 相對 `MATCHED n=5` |
 |---|---:|---:|
-| `MATCHED` n=5（預設） | 1,044,000 | — |
-| `FIXED`，`fixed_delay_samples=1600`（100 ms） | 950,400 | −93,600 |
-| `EXTERNAL_ALIGNED` | 943,488 | −100,512 |
+| `MATCHED` n=5（預設） | 1,039,904 | — |
+| `FIXED`，`fixed_delay_samples=1600`（100 ms） | 946,304 | −93,600 |
+| `EXTERNAL_ALIGNED` | 939,392 | −100,512 |
 
 省下的量比單聲道版本小，因為這裡只省**一份共用**的 estimator/ring（四路
 共用一個 aligner），不是四份各自的——與本頁「單一共用 aligner」的結構
@@ -716,7 +716,7 @@ front / fuse 協定：
 | Offset | 欄位 | 型別 | 目前值 |
 |---:|---|---|---|
 | 0 | `descriptor_version` | `uint32_t` | `1` |
-| 4 | `layout_version` | `uint32_t` | `21` |
+| 4 | `layout_version` | `uint32_t` | `22` |
 | 8 | `backend_id` | `uint32_t` | `2` = NE10（目前唯一的 FFT 後端）；`1` 已退役、不會再回傳；永遠不會是 0 |
 | 12 | `build_flags_hash` | `uint32_t` | FNV-1a-32，隨 build 變動 |
 | 16 | `alignment` | `uint32_t` | `16` |

@@ -74,7 +74,7 @@
  * audio_pipeline.h) actually depends on.
  *
  * The arena is sized from the LARGEST configuration this repo
- * supports — 48 kHz, balanced presets: 1,658,016 B measured with
+ * supports — 48 kHz, balanced presets: 1,610,832 B measured with
  * `aec_nr_pipeline_static --print-mem-size --sample-rate 48000` — plus
  * headroom; 2 MiB leaves ~425 KiB of margin. This is a REFERENCE
  * sizing choice for the host simulation, not a platform requirement —

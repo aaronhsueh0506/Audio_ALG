@@ -724,7 +724,7 @@ Config：
 
 固定 32 bytes、每個欄位固定 byte offset（由 header 內的 `_Static_assert` 釘死），
 全部是定寬整數。形狀與核心層 `FourAecNrResMemReq`、單聲道 `AudioPipelineMemReq`
-相同，但**版本號各自獨立**；本次 checkout，`layout_version=16`（`AUDIO_PIPELINE_4CH_LAYOUT_VERSION`）。
+相同，但**版本號各自獨立**；本次 checkout，`layout_version=17`（`AUDIO_PIPELINE_4CH_LAYOUT_VERSION`）。
 
 | Offset | 欄位 | 型別 | 目前值 |
 |---:|---|---|---|

@@ -877,7 +877,7 @@ static void run_static_parity(int sample_rate, int fft_size) {
           "static init_ex rejects a descriptor from the superseded layout "
           "even when its byte count exactly covers the current pool");
     CHECK(req.layout_version == FOUR_AEC_NR_RES_LAYOUT_VERSION &&
-          FOUR_AEC_NR_RES_LAYOUT_VERSION == 21u,
+          FOUR_AEC_NR_RES_LAYOUT_VERSION == 22u,
           "the queried descriptor publishes the current carve layout");
 
     stat = four_aec_nr_res_init_ex(

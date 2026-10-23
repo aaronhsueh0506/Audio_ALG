@@ -53,7 +53,7 @@ IFFT plus one RFFT and one extra hop of latency per hop). The pipeline has none 
 one-hop far compensation buffer, and the C API entry point
 `audio_pipeline_4ch_ulcnet_last_beamformed_error()` — there is no
 reconstructed beam hop to hand out. The layout version
-(`AUDIO_PIPELINE_4CH_ULCNET_LAYOUT_VERSION`) is **22**; a persisted
+(`AUDIO_PIPELINE_4CH_ULCNET_LAYOUT_VERSION`) is **23**; a persisted
 descriptor from any earlier version is refused by
 `audio_pipeline_4ch_ulcnet_init_ex()`.
 
@@ -118,7 +118,7 @@ no state to the instance: the pool size and the layout version are unchanged.
 The matched-filter bank size `n` is a product deployment decision, so it is a
 command-line argument rather than a literal in `main.c`; the resolved profile
 and the pool it costs are printed at start-up — at the default matched/n=5
-profile, that banner reads 3,164,176 B at 16 kHz and 6,642,608 B at 48 kHz
+profile, that banner reads 3,153,936 B at 16 kHz and 6,622,128 B at 48 kHz
 (`ULCNET_GRID=48k`). Read it from your own build rather than copying it.
 `n` is an init parameter, not a runtime setter —
 changing it means re-querying the pool and re-initializing.

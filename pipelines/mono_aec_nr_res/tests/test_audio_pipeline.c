@@ -706,7 +706,7 @@ static void test_init_ex_descriptor(void) {
     /* The literal, not a relative tamper: a carve or ABI change that forgets
      * the bump must fail here. A persisted layout-13 descriptor is refused on
      * the counter alone. */
-    CHECK(req.layout_version == 14u, "AudioPipelineMemReq reports layout_version 14");
+    CHECK(req.layout_version == 15u, "AudioPipelineMemReq reports layout_version 15");
     AudioPipelineMemReq stale_lv = req;
     stale_lv.layout_version = 13u;
     AudioPipeline* p_stale = audio_pipeline_init_ex(pool, (size_t)req.bytes, &cfg, &stale_lv);

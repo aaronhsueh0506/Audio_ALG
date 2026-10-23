@@ -89,8 +89,8 @@ immutable model window：512 個窗值必須與模型表逐位元相同。若另
 首 hop、重置與固定係數網路輸出；本機沒有已訓練 RNNoise 權重，**尚未量測真實模型的
 感知品質**，固定係數測試不能替代這項評估。
 
-在目前 AArch64 host，獨立配置的總 static memory 為 **33,184 bytes**，舊版為
-15,328 bytes；其中 RNNoiseState 5,104、FFT 15,600、analysis 6,240、synthesis 6,240。
+在目前 AArch64 host，獨立配置的總 static memory 為 **31,136 bytes**，舊版為
+15,328 bytes；其中 RNNoiseState 5,104、FFT 13,552、analysis 6,240、synthesis 6,240。
 只有呼叫端原本就持有可共用 FFT 時，新增的 RNNoise/framing 部分才是 17,584 bytes。
 這些是目前實作的量測，整合端仍應依 size-query 配置。
 

@@ -98,9 +98,9 @@ moves the AEC itself to 48 kHz; that extra AEC cost is separate from this
 resampler count and must be included in the board measurement.
 
 Host DSP pool (`mono_aec_dfn_res_get_mem_requirements`, matched delay,
-five-filter bank, NE10): 771,264 bytes at the 16 kHz default (host plus the
-rate bridge, whose own pool is 326,896 bytes including the stage) and
-1,530,240 bytes at 48 kHz (the conventional MMSE-LSA pipeline on the 48 kHz
-grid needs 1,658,016 bytes). Model weights and accelerator activation/
+five-filter bank, NE10): 764,096 bytes at the 16 kHz default (host plus the
+rate bridge, whose own pool is 349,888 bytes including the stage) and
+1,522,048 bytes at 48 kHz (the conventional MMSE-LSA pipeline on the 48 kHz
+grid needs 1,610,832 bytes). Model weights and accelerator activation/
 workspace memory are external to this descriptor; adding int8 weights alone
 brings the known minimum to about 2.8 MiB at 16 kHz.

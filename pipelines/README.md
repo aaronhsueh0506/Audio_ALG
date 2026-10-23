@@ -209,10 +209,10 @@ stays explicitly selectable.
 
 | Rate | AEC | FFT (OLA) | NR | Pipeline bufs | **Total** |
 |------|-----|-----------|-----|---------------|-----------|
-| **8 kHz** | 285,376 B | 8,176 B | 67,504 B | 6,288 B | **367,504 B (358.9 KB)** |
-| **16 kHz (default, 256/128)** | 398,768 B | 8,176 B | 122,240 B | 6,288 B | **535,632 B (523.1 KB)** |
-| **16 kHz (alt, 512/256)** | 527,488 B | 15,600 B | 133,552 B | 12,432 B | **689,232 B (673.1 KB)** |
-| **48 kHz** | 1,228,272 B | 30,448 B | 374,416 B | 24,720 B | **1,658,016 B (1,619.2 KB)** |
+| **8 kHz** | 284,352 B | 7,152 B | 60,784 B | 6,288 B | **358,736 B (350.3 KB)** |
+| **16 kHz (default, 256/128)** | 397,744 B | 7,152 B | 109,328 B | 6,288 B | **520,672 B (508.5 KB)** |
+| **16 kHz (alt, 512/256)** | 525,440 B | 13,552 B | 120,176 B | 12,432 B | **671,760 B (656.0 KB)** |
+| **48 kHz** | 1,224,176 B | 26,352 B | 335,424 B | 24,720 B | **1,610,832 B (1,573.1 KB)** |
 
 The AEC column is owned by `lib/aec/docs/c_user_manual_zh_TW.md` §4 — re-measure from
 there rather than editing it here, and always prefer the value

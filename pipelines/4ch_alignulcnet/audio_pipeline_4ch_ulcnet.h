@@ -162,7 +162,7 @@ enum { AUDIO_PIPELINE_4CH_ULCNET_REPRIME_FRAMES = 1 };
  * content bumps it, including a change of the composed core's pool or layout
  * version, which build_flags_hash does not see. The token string in the
  * build-flags hash moves with a changed carve. */
-#define AUDIO_PIPELINE_4CH_ULCNET_LAYOUT_VERSION 22u
+#define AUDIO_PIPELINE_4CH_ULCNET_LAYOUT_VERSION 23u
 
 /**
  * Fixed-width descriptor for a caller-owned static-memory pool. Same 32-byte
