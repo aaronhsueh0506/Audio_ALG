@@ -4,9 +4,9 @@ all:
 	$(MAKE) -C .. aec_nr_pipeline aec_nr_pipeline_static
 
 test: all
-	$(MAKE) -C .. test_audio_pipeline example-adapter
+	$(MAKE) -C .. test_mono_chain example-adapter
 	bin="$$($(MAKE) -s -C .. print-bin-dir)"; \
-	  "$$bin/test_audio_pipeline"
+	  "$$bin/test_mono_chain"
 
 clean:
 	$(MAKE) -C .. clean

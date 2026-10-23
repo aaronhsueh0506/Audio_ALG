@@ -114,10 +114,6 @@ def run_aec_linear(mic_signal: np.ndarray, ref_signal: np.ndarray,
 # apply_strength() overlaid); this module keeps no preset table of its own.
 _NR_YAML_CONFIG = os.path.join(_ROOT, 'lib', 'nr', 'python', 'config', 'v3_2_config.yaml')
 
-# MCRA minima-tracking window (MmseLsaDenoiser's `L`, authored on the 16 ms
-# grid): 94 frames = 1.5 s, independent of NR's own L=32.
-_NR_L_MINIMA_WINDOW = 94
-
 # Production recipe: the AEC residual-echo PSD R²(f) is folded into the OM-LSA
 # noise floor (ξ = S²/(N²+R²)) so the NR also suppresses residual echo, while
 # g_res stays in the min (--legacy-amin selects the noise-only NR). There is no
@@ -155,8 +151,7 @@ def _build_denoiser(sample_rate: int,
     Parameters come from NR's single source of truth: the base params of
     lib/nr/python/config/v3_2_config.yaml (``build_v3_2_base_params``) with
     ``apply_strength(nr_preset)`` overlaid, as ``create_denoiser_from_config()``
-    does (no content-mode overlay).  The one pipeline-specific overlay is the
-    MCRA minima window ``L`` (``_NR_L_MINIMA_WINDOW``), applied last.
+    does (no content-mode overlay), with no pipeline-specific overlay.
     ``broadband_threshold`` stays at the canonical 1.0 (scene-reset gate off).
     """
     # An explicit fft_size selects the matching frame/hop defaults.
@@ -192,10 +187,6 @@ def _build_denoiser(sample_rate: int,
     params = apply_strength(params, nr_preset)
     params['strength'] = nr_preset  # recorded on the denoiser
     params['mode'] = 'full'         # no content-mode selection in this pipeline (empty overlay)
-
-    # The one pipeline-specific overlay.
-    params['L'] = _NR_L_MINIMA_WINDOW
-
     return MmseLsaDenoiser(**params)
 
 

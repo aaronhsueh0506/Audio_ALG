@@ -1,9 +1,13 @@
 # 4-channel PBFDKF + beamforming + NR/RES application
 
 This is the conventional four-channel product application directory. It owns
-the reusable four-lane linear-AEC front end, the SRP-PHAT/BF integration, host
-evaluation tools and their tests. The sibling `../4ch_alignulcnet/`
-application reuses the public front-only core API; it does not duplicate AEC,
+the reusable four-lane linear-AEC front end (`FourAecNrRes`), the one wrapped unit
+`AudioPipeline4Ch` (front end + SRP-PHAT + BF), the example programs that chain the
+post-beam stages over them, host evaluation tools and their tests. Only the linear AEC + BF is
+wrapped: RES, NR, comfort noise, synthesis and neural post-filters are separate libraries that
+the integrator initialises (each with its own `mem_size` and `init`) and chains;
+`../samples/se_sample_chain.h` is the example chain. The sibling `../4ch_alignulcnet/` and
+`../4ch_aec_bf_dfn_res/` applications reuse the unit and the core; they do not duplicate AEC,
 DOA, BF or NR implementations.
 
 This shares the mono pipeline's zero-padding-free grid convention (frame ==
@@ -78,7 +82,7 @@ Hard invariants:
 - `delay_num_filters`, each PBFDKF lane's `filter_length`, and an
   Align-ULCNet checkpoint's TA depth `D` are independent budgets.
 - The Python reference and the C front end leave SRP-PHAT/BF at an explicit
-  ownership seam. The complete C wrapper in `audio_pipeline_4ch.*` connects
+  ownership seam. The C unit in `audio_pipeline_4ch.*` connects
   that seam to the reusable implementations under `../../../audiolib/{doa,bf}`
   (a sibling checkout of this repo, shared by every pipeline).
 - `EqualWeightBeamformer` exists only as a deterministic offline/test adapter;
@@ -101,8 +105,8 @@ from the weights, so independently supplied output samples and context cannot
 come from different beamformer states. A beamformer that atomically returns both
 its mono spectrum and effective weights passes the spectrum and skips that
 duplicate weighted sum; both arrays are validated for finiteness, while their
-coherence remains an explicit caller contract. The bundled complete wrapper uses
-this form with `bf_process_with_weights()`. The far-end spectrum remains the one
+coherence remains an explicit caller contract. The unit's
+`audio_pipeline_4ch_fuse()` uses this form with `bf_process_with_weights()`. The far-end spectrum remains the one
 shared digital render reference -- it is verified equal across lanes and is not
 spatially weighted. The result passes through one mono NR+RES path without a
 fifth AEC or replicated post-filters. When `front.delay.changed` is non-zero, an
@@ -115,8 +119,10 @@ before consuming the frame; the application's own synthesis is not restarted
 The deployable C seam is:
 
 - [`4aec_nr_res.h`](4aec_nr_res.h): public config, lifecycle, the two per-hop
-  calls (`four_aec_front_process()`, `four_aec_fuse()`), the stage-config helper
-  and structural audit accessors;
+  calls (`four_aec_front_process()`, `four_aec_fuse()`) and structural audit
+  accessors. Its config carries only the front end's fields (grid, delay policy,
+  `enable_post`); the RES, NR and comfort-noise settings belong to the chain the
+  application builds;
 - [`4aec_nr_res.c`](4aec_nr_res.c): one shared `DelayAec`, four linear `Aec`
   instances and the coherent context projection. The residual suppressor (`AecRes`,
   `aec_res.h`), the MMSE-LSA instance and the inverse transform are carved and
@@ -127,21 +133,24 @@ The deployable C seam is:
 - [`4aec_nr_res_internal.h`](4aec_nr_res_internal.h): private delay-admission
   helpers;
 - [`4aec_nr_res_static.c`](4aec_nr_res_static.c): caller-owned-pool example
-  that carves the front end and the post-beam stages from one block and chains
-  them, following the same query → allocate → `init` → process → destroy →
-  release sequence as the mono `mono_aec_nr_res/static_main.c`;
+  that carves the front end and a `SeSampleChain` (post-beam RES, NR, comfort noise, synthesis)
+  from one block and chains them, following the same query → allocate → `init` → process →
+  destroy → release sequence as the mono `mono_aec_nr_res/static_main.c`;
 - [`audio_pipeline_4ch.h`](audio_pipeline_4ch.h) and
-  [`audio_pipeline_4ch.c`](audio_pipeline_4ch.c): complete wrapper (pool-first
+  [`audio_pipeline_4ch.c`](audio_pipeline_4ch.c): the one unit (pool-first
   `get_mem_requirements`/`init_ex`/`init`, plus a `create` heap convenience
   wrapper — same two-tier convention as `4aec_nr_res.h` above) that inserts
   third-party SRP-PHAT/DOA smoothing and BF between `four_aec_front_process()`
-  and `four_aec_fuse()` and chains the post-beam stages (`run_post_stages()`);
+  and `four_aec_fuse()`. Per hop `process_front()` / `process_beam()` (or
+  `process_with_activity()` / `process()`) give the beamformed spectrum and weights;
+  `audio_pipeline_4ch_fuse()` fills the `SeSpecFrame` for the frequency-domain stages. No
+  RES, NR, comfort noise or synthesis is inside it;
 - [`audio_pipeline_4ch_raw.c`](audio_pipeline_4ch_raw.c): raw-float host CLI for running
-  the complete wrapper on recorded four-channel fixtures (heap `create()` —
+  the unit plus the example chain on recorded four-channel fixtures (heap `create()` —
   a one-shot host tool, not a board-deployment demo);
 - [`audio_pipeline_4ch_static.c`](audio_pipeline_4ch_static.c): caller-owned-pool
-  example for the COMPLETE wrapper (front end + real SRP-PHAT + real BF, not an
-  externally-supplied fixed-weight stand-in), following the same query →
+  example for the unit (front end + real SRP-PHAT + real BF, not an
+  externally-supplied fixed-weight stand-in) and the chain, following the same query →
   allocate → `init_ex` → process → destroy → release sequence as
   `4aec_nr_res_static.c` above;
 - [`tests/test_4aec_nr_res.c`](tests/test_4aec_nr_res.c): 16/48 kHz grid, lifecycle,
@@ -149,36 +158,35 @@ The deployable C seam is:
   weight, delay-machine and finite-output acceptance tests of the front end;
   [`tests/conv_chain_4ch.h`](tests/conv_chain_4ch.h) writes the post-beam chain over
   it as the reference the application tests compare against;
-- [`tests/test_audio_pipeline_4ch.c`](tests/test_audio_pipeline_4ch.c): complete-wrapper lifecycle,
-  topology, reset, strength setters, stage sizing, finite-output tests, and the
-  bit-exact equality of the wrapper's chain with the reference chain;
+- [`tests/test_audio_pipeline_4ch.c`](tests/test_audio_pipeline_4ch.c): unit lifecycle,
+  topology, reset, split calls and their sequence guards, `enable_post = 0`, the descriptor
+  gate, finite-output tests, and the bit-exact equality of unit + `audio_pipeline_4ch_fuse()` +
+  `se_sample_chain` with the reference chain;
 - [`../../../audiolib/tests/test_spatial_third_party.c`](../../../audiolib/tests/test_spatial_third_party.c):
   scalar/SIMD PHAT, cached SRP, exported-BF-weight and VAD pool equivalence
   tests; `make test` here delegates to `make -C ../../../audiolib test`.
 
-For side-by-side reading, the files and public calls map directly:
+For side-by-side reading, the mono example and its four-channel counterpart:
 
-| Original mono pipeline | Four-channel counterpart |
+| Mono example | Four-channel counterpart |
 |---|---|
-| `mono_aec_nr_res/audio_pipeline.h` | `4ch_aec_bf_nr_res/4aec_nr_res.h` (front end) + `audio_pipeline_4ch.h` |
-| `mono_aec_nr_res/audio_pipeline.c` | `4ch_aec_bf_nr_res/4aec_nr_res.c` + `audio_pipeline_4ch.c` (chain) |
+| lib/aec `Aec` (`aec_get_mem_size`, `aec_init`) | `4ch_aec_bf_nr_res/4aec_nr_res.h` (front end) + `audio_pipeline_4ch.h` (unit) |
+| `common/se_stage.h` `se_frame_from_aec()` | `audio_pipeline_4ch_fuse()` / `four_aec_fuse()` |
+| `samples/se_sample_chain.h` | the same header, with `res = SE_SAMPLE_RES_AEC_RES` |
 | `mono_aec_nr_res/static_main.c` | `4ch_aec_bf_nr_res/4aec_nr_res_static.c` |
 | `mono_aec_nr_res/main.c` host runner | `4ch_aec_bf_nr_res/audio_pipeline_4ch_raw.c` raw host runner |
-| `mono_aec_nr_res/tests/test_audio_pipeline.c` | `4ch_aec_bf_nr_res/tests/test_4aec_nr_res.c` |
+| `mono_aec_nr_res/tests/test_mono_chain.c` | `4ch_aec_bf_nr_res/tests/test_4aec_nr_res.c`, `test_audio_pipeline_4ch.c` |
 
-The spatial layer keeps the same order as `audio_pipeline.c`: instance,
-validation, default config/construction, per-hop processing, reset/teardown,
-then read-only accessors. The front-end layer retains caller-pool APIs; the
-complete spatial wrapper is a separate heap convenience layer.
-
-| Mono `audio_pipeline_*` | Four-channel `four_aec_*` front end |
+| Mono | Four-channel front end |
 |---|---|
-| `default_config` | `four_aec_nr_res_default_config` |
-| `get_mem_requirements` | `four_aec_nr_res_get_mem_requirements` |
-| `init_ex` / `init` | `four_aec_nr_res_init_ex` / `_init` |
-| `create` | `four_aec_nr_res_create` |
-| `process_spec` | `four_aec_front_process` → external beamformer → `four_aec_fuse` |
-| `reset` / `destroy` | `four_aec_nr_res_reset` / `_destroy` |
+| `se_derive()` + `aec_get_mem_size()` | `four_aec_nr_res_default_config` / `four_aec_nr_res_get_mem_requirements` |
+| `aec_init` | `four_aec_nr_res_init_ex` / `_init` |
+| (heap flavor) | `four_aec_nr_res_create` |
+| `aec_process_context` + `se_frame_from_aec` | `four_aec_front_process` → external beamformer → `four_aec_fuse` |
+| `aec_reset` / `aec_destroy` | `four_aec_nr_res_reset` / `_destroy` |
+
+The unit adds the same lifecycle one level up (`audio_pipeline_4ch_get_mem_requirements` /
+`_init_ex` / `_init` / `_create` / `_reset` / `_destroy`) around the SRP-PHAT and BF.
 
 Heap convenience (the front end, with the post-beam stages written out):
 
@@ -198,33 +206,28 @@ external_srp_bf_update(front.linear_spectra, weights);
 
 four_aec_fuse(pipeline, weights, NULL, &f);       /* NULL: rebuild E from the weights */
 
-/* The application chains its own stages over f (tests/conv_chain_4ch.h is the
- * reference): */
-res_gain = se_res_stage_gain(res, &f);
-nr_gain  = se_anr_stage_gain(nr, &f, extra_noise, 1);
-sk_min_f32(total_gain, nr_gain, res_gain, f.n_freqs);
-sk_capply_gain_f32(spec, f.e, total_gain, f.n_freqs);
-aec_cng_fill(&rng, spec, f.cn, res_gain, nr_gain, SE_CNG_NR_GAIN_FLOOR, f.n_freqs);
-ac_istft_push(istft, spec, mono_output);
+/* The application chains its own stages over f (samples/se_sample_chain.h is the
+ * example, tests/conv_chain_4ch.h the independent reference): */
+P = se_sample_chain_form(chain, &f);               /* RES gain, NR gain, min, apply, comfort noise */
+se_sample_chain_synthesize(chain, P, mono_output);
 
 four_aec_nr_res_destroy(pipeline);
+se_sample_chain_destroy(chain);
 ```
 
-For a product that keeps linear AEC, shared RES, CNG and synthesis but omits
-MMSE-LSA, set `cfg.enable_nr = 0` in the `AudioPipeline4ChConfig.core` before
-querying memory or constructing the wrapper. The wrapper's static-memory
-requirement then excludes the NR state. The front end itself reads none of
-`enable_res` / `enable_nr` / `enable_cng` / `legacy_amin`: they configure the
-application's stages (`four_aec_nr_res_stage_configs()` derives the `AecConfig`
-and `AnrConfig`; with `enable_nr = 0` the `AnrConfig` is returned all-zero and
-no denoiser is sized). `enable_post` selects whether the lanes keep the
+A product that keeps linear AEC, shared RES, CNG and synthesis but omits
+MMSE-LSA sets `enable_nr = 0` in the `SeSampleChainConfig` it passes to
+`se_sample_chain_mem_size()` / `se_sample_chain_init()`; the chain's pool then excludes the NR
+state. The front end itself has no RES, NR or comfort-noise setting: those configure the
+application's chain (`res`, `res_preset`, `enable_nr`, `nr_mode`, `legacy_amin`, `enable_cng`,
+`with_synthesis`). `enable_post` selects whether the lanes keep the
 frequency-domain post context and the front end carves the fuse buffers
 (`enable_post = 0` is the front-only seam the Align-ULCNet application uses).
 
-`enable_res` (default 1) selects the post-beam residual suppressor. With 0 no
-suppressor is built (its storage leaves the pool), the gain is the denoiser's
-alone and comfort noise, which fills only RES-cut bins, is skipped;
-`audio_pipeline_4ch_set_aec_preset()` and `_post_split_floor()` then refuse.
+`res = SE_SAMPLE_RES_AEC_RES` selects the post-beam residual suppressor (an `AecRes` in the
+chain's pool). With `res = SE_SAMPLE_RES_OFF` no suppressor is built (its storage leaves the
+pool), the gain is the denoiser's alone and comfort noise, which fills only RES-cut bins, is
+skipped; `se_sample_chain_res()` then returns NULL and `aec_res_set_preset()` has nothing to act on.
 
 `total_gain` is `min(G_nr, G_res)` applied as computed. The post path has no
 near-end floor or other level-dependent lift, so a loud background cannot cap
@@ -251,13 +254,12 @@ four_aec_nr_res_destroy(pipeline); /* does not release caller-owned memory */
 platform_free(pool);
 ```
 
-The COMPLETE wrapper (front end + SRP-PHAT + BF + the post-beam stages in one
-instance) uses the same pattern one level up --
+The unit (front end + SRP-PHAT + BF) uses the same pattern one level up --
 `audio_pipeline_4ch_get_mem_requirements()` composes the front end's own
-requirement with the SRP/BF sub-modules' `*_get_mem_size()`, the `AecRes`, the
-denoiser, the synthesis object and this wrapper's own scratch, and
+requirement with the SRP/BF sub-modules' `*_get_mem_size()` and the unit's own
+scratch (the beamformed spectrum and the weights), and
 `audio_pipeline_4ch_init_ex()` places all of it, zero-heap, in one
-caller-owned pool:
+caller-owned pool. The chain is a second block with its own size query:
 
 ```c
 AudioPipeline4ChConfig cfg = audio_pipeline_4ch_default_config(16000);
@@ -267,9 +269,18 @@ void *pool = platform_alloc(req.bytes, req.alignment);
 AudioPipeline4Ch *p =
     audio_pipeline_4ch_init_ex(pool, (size_t)req.bytes, &cfg, &req);
 
-/* audio_pipeline_4ch_process()/_process_with_activity() per hop. */
+SeSampleChainConfig sc = se_sample_chain_default_config(16000, audio_pipeline_4ch_fft_size(p));
+void *chain_pool = platform_alloc(se_sample_chain_mem_size(&sc), 16);   /* RES, NR, CNG, synthesis */
+SeSampleChain *chain = se_sample_chain_init(chain_pool, se_sample_chain_mem_size(&sc), &sc);
+
+/* per hop: audio_pipeline_4ch_process_with_activity() (or process_front() + process_beam()),
+ * audio_pipeline_4ch_fuse(p, &frame), se_sample_chain_form(chain, &frame),
+ * se_sample_chain_synthesize(chain, P, out). A refused call: audio_pipeline_4ch_reset(p)
+ * and se_sample_chain_reset(chain) together. */
 
 audio_pipeline_4ch_destroy(p); /* does not release caller-owned memory */
+se_sample_chain_destroy(chain);
+platform_free(chain_pool);
 platform_free(pool);
 ```
 
@@ -285,11 +296,12 @@ Build the applications or run the complete C acceptance gate from
 `Audio_ALG/pipelines/4ch_aec_bf_nr_res`:
 
 ```bash
-make 4aec_nr_res_static     # build caller-pool reference executable (front end + stages)
-make audio_pipeline_4ch_static    # build caller-pool reference executable (complete wrapper)
-make audio_pipeline_4ch_raw      # build the complete recording-validation runner
+make 4aec_nr_res_static     # build caller-pool reference executable (front end + chain)
+make audio_pipeline_4ch_static    # build caller-pool reference executable (unit + chain)
+make audio_pipeline_4ch_raw      # build the recording-validation runner (unit + chain)
 make test_4aec_nr_res      # build only the front-end 4-channel test binary
-make test_audio_pipeline_4ch     # build only the complete spatial-wrapper test
+make test_audio_pipeline_4ch     # build only the unit test
+make test_4ch_dfn test_4ch_ulcnet   # the DFN2 / Align-ULCNet compositions
 make 4ch_alignulcnet       # model callback remains a board TODO; fail-open smoke
 make test                  # run only the isolated 4ch acceptance gate
 make NO_STDIO=1 audit-no-stdio
@@ -303,12 +315,11 @@ make NO_STDIO=1 audit-no-stdio
 "$(make -s print-bin-dir)/audio_pipeline_4ch_static" --print-mem-size --sample-rate 48000
 ```
 
-`libaudio_pipeline_4ch.a` contains `4aec_nr_res.o` and the shared
-`se_config.o` / `se_anr_stage.o` of `pipelines/common`. Standard and ULCNet
-wrapper objects are linked directly into their application binaries; no
-per-application archive is produced. A standard consumer links the front end with
-`audio_pipeline_4ch.o`, `libdoa.a`, `libbf.a`,
-`libspatial_common.a`, `libaec.a`, `libanr.a`, `libaudio_common.a`, and
+`libaudio_pipeline_4ch.a` contains `4aec_nr_res.o`, `audio_pipeline_4ch.o` (the unit) and the
+shared `se_config.o` of `pipelines/common`. The example chain headers and the ULCNet stage object
+(`ulcnet_nn_stage.o`) are compiled into the application binaries that use them; no
+per-application archive is produced. A consumer of the unit links `libaudio_pipeline_4ch.a`,
+`libdoa.a`, `libbf.a`, `libspatial_common.a`, `libaec.a`, `libanr.a`, `libaudio_common.a`, and
 `-lm`, in the order demonstrated by this directory's Makefile.
 
 ## Python reference seam
@@ -325,17 +336,21 @@ pipeline = FourChannelAecPipeline()      # no beamformer is created
 # 1. Our code: one shared aligner + four linear AEC lanes.
 pre = pipeline.front_process(microphones_hop, far_hop)
 
-# 2. External Python owner: SRP-PHAT + BF. The complete C wrapper supplies
+# 2. External Python owner: SRP-PHAT + BF. The C unit supplies
 #    this stage, but the Python reference intentionally keeps the seam open.
 mono_hop, effective_weights = external_srp_bf.process(pre.linear_channels)
 
-# 3. Our code again: project AEC context with those exact weights and calculate
-#    one mono residual-suppression gain. The existing mono NR+RES seam consumes
-#    post.beamformed and post.context.
+# 3. Our code again: project AEC context with those exact weights.
+#    post.context.res_gain is None: fuse() computes no gain.
 post = pipeline.fuse(
     pre,
     BeamformerFrame(samples=mono_hop, weights=effective_weights),
 )
+
+# 4. The caller's own post-beam RES (the one stateful gain calculator):
+suppressor = aec4.PostBeamResidualSuppressor(sample_rate, hop_size, n_freqs, preset)
+context = suppressor.process(post.context, post.aligned_render)   # res_gain filled in
+#    The existing mono NR+RES seam consumes post.beamformed and context.
 ```
 
 Python shapes and ordering are contractual:
@@ -344,13 +359,15 @@ Python shapes and ordering are contractual:
 - returned `samples`: `[hop]`;
 - returned effective `weights`: `[4, n_freqs]`, under
   `out[f] = sum(weights[ch,f] * in[ch,f])`;
-- external results must resume in `frame_index` order because post-BF RES has
-  temporal state;
+- external results must resume in `frame_index` order because the caller's
+  `PostBeamResidualSuppressor` has temporal state;
 - a queued Python `FrontFrame` owns snapshots of all four contexts, so
   later linear-AEC calls cannot overwrite it;
 - a queued frame is bound to the pipeline instance that created it and cannot
   resume on another instance;
-- `reset()` invalidates every frame still in flight.
+- `reset()` invalidates every frame still in flight and resets the lanes and the
+  shared delay; it does not touch the caller's `PostBeamResidualSuppressor`, so call
+  `suppressor.reset()` with it.
 
 If the external BF is a multi-frame/time-domain filter, `weights` must mean
 its exact current effective frequency response. Returning only a mono waveform
@@ -359,12 +376,12 @@ is insufficient for the traditional RES path.
 The implementation never chooses one lane's RES and never takes the minimum
 of four lane gains. It coherently projects error and near spectra, converts
 each lane's R2 into an echo-phase-bearing residual vector and combines that
-vector with the same spatial weights, then runs exactly one stateful
-`PostBeamResidualSuppressor` to calculate the mono gain used after NR. It does
+vector with the same spatial weights; the caller then runs exactly one stateful
+`PostBeamResidualSuppressor` (outside `fuse()`) to calculate the mono gain used after NR. It does
 not calculate unused beamformed echo/far spectra. Residual normalization uses
 one square root and one divide per channel/bin; the public weights-only path
 performs 12 complex MACs per bin (error + near + residual across four lanes),
-while the complete BF wrapper reuses its atomic mono spectrum and performs 8
+while the unit's `audio_pipeline_4ch_fuse()` reuses its atomic mono spectrum and performs 8
 (near + residual). Comfort-noise power projection is a separate real SIMD
 accumulation.
 
@@ -384,8 +401,8 @@ clamp would simply understate residual echo. Only the overflow
 fallback guards the intermediates, and it preserves the same magnitude
 contract for every finite float32 input.
 
-The core C API does not expose an async multi-frame queue. The complete C
-wrapper does execute SRP-PHAT/BF and remains synchronous; it supports both
+The core C API does not expose an async multi-frame queue. The C
+unit does execute SRP-PHAT/BF and remains synchronous; it supports both
 the heap convenience constructor and the caller-owned, zero-heap static-pool
 constructor shown above. Automated tests prove caller-pool and heap lifecycle,
 byte-identical core construction paths, topology, supported grids, spatial
@@ -434,12 +451,12 @@ nonzero unless both cases remain finite, preserve the `1 matcher / 4 linear /
 finish within the declared delay tolerance of the independent file-level
 measurement (the C low-latency evaluator uses `max(half hop, 5 ms)`).
 Use `--no-contract-check` only when inspecting a deliberately changed fixture.
-`evaluate_external_recordings` runs the complete C wrapper—shared matcher,
-four linear AEC lanes, SRP-PHAT, BF, one NR and one post-beam RES—and verifies
+`evaluate_external_recordings` runs the C unit and the example chain (`audio_pipeline_4ch_raw`)—shared
+matcher, four linear AEC lanes, SRP-PHAT, BF, one NR and one post-beam RES—and verifies
 the reported DOA/BF grids. The separate Python `evaluate_recordings` command
 uses `EqualWeightBeamformer` only to test the open Python pre/post seam.
 
-The wrapper default is a four-microphone UCA with 35 mm radius only so the API
+The unit's default is a four-microphone UCA with 35 mm radius only so the API
 has a runnable example. Product integration must set the measured UCA radius,
 ULA spacing, or all four custom `(x, y)` coordinates and confirm channel order.
 The checked-in recordings do not carry array-geometry metadata, so their DOA

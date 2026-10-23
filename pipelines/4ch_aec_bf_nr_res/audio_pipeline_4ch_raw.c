@@ -1,4 +1,7 @@
-/** Host-only raw-float runner for recording validation.
+/** Host-only raw-float runner for recording validation, written as an example of the
+ * composition: the linear AEC + BF unit (audio_pipeline_4ch.h) followed by its fuse and the
+ * post-beam chain RES -> NR -> CNG -> synthesis (samples/se_sample_chain.h). A product
+ * initialises those libraries separately; the chain only sequences them.
  * Input mic: interleaved float32 [frames][4]; input ref: mono float32 [frames];
  * optional VAD: uint8 [complete_hops], nonzero = target speech; output: mono float32
  * [complete_hops * hop]. */
@@ -12,6 +15,7 @@
 
 #include "audio_pipeline_4ch.h"
 #include "mcab_sample_driver.h"
+#include "se_sample_chain.h"
 
 #ifndef M_PI
 #define M_PI 3.14159265358979323846
@@ -41,7 +45,11 @@ static void json_float(char* output, size_t capacity, float value) {
 typedef struct RawSample {
     McabSpatialOptions options;
     AudioPipeline4ChConfig cfg;
+    SeSampleChainConfig chain_cfg;
     AudioPipeline4Ch *p;
+    SeSampleChain *chain;
+    void *chain_mem;
+    AudioPipeline4ChBeam beam;
     AudioPipeline4ChFrameInfo info;
     FILE *mic_file, *ref_file, *output_file, *vad_file;
     float *microphones, *reference, *output;
@@ -64,9 +72,14 @@ static int raw_setup(void *user, McabHopView *view) {
         s->cfg.bf_fixed_mode = 1;
         s->cfg.bf_fixed_doa_rad = s->options.fixed_doa_rad;
     }
+    s->chain_cfg = se_sample_chain_default_config(
+        s->cfg.core.sample_rate,
+        mcab_resolved_fft(s->cfg.core.sample_rate, s->cfg.core.fft_size));
     if (s->options.print_mem_size) {
+        McabMemLine chain_line = {"Chain:", se_sample_chain_mem_size(&s->chain_cfg)};
         return mcab_print_mem_budget(
-                   "4ch spatial pipeline: core + SRP-PHAT + BF", &s->cfg, audio_pipeline_4ch_get_mem_requirements) == 0
+                   "4ch linear AEC + BF unit and post-beam chain", &s->cfg,
+                   audio_pipeline_4ch_get_mem_requirements, &chain_line, 1) == 0
                    ? 2
                    : 1;
     }
@@ -74,6 +87,17 @@ static int raw_setup(void *user, McabHopView *view) {
     if (!s->p) {
         fprintf(stderr, "failed to create 4ch DOA/BF pipeline\n");
         return 1;
+    }
+    {
+        size_t chain_bytes = se_sample_chain_mem_size(&s->chain_cfg);
+        if (chain_bytes == 0 || posix_memalign(&s->chain_mem, 16, chain_bytes) != 0)
+            s->chain_mem = NULL;
+        s->chain = s->chain_mem
+            ? se_sample_chain_init(s->chain_mem, chain_bytes, &s->chain_cfg) : NULL;
+        if (!s->chain) {
+            fprintf(stderr, "failed to create the post-beam chain\n");
+            return 1;
+        }
     }
     s->hop = audio_pipeline_4ch_hop_size(s->p);
     s->microphones =
@@ -112,14 +136,34 @@ static int raw_read(void *user, McabHopView *view, int frame) {
     }
     return 1;
 }
+/* Fuse, then the chain into s->output. A refusal anywhere takes both the unit and the chain
+ * down: the unit's fuse resets the unit itself, the rest is reset here. */
+static int raw_post(RawSample *s) {
+    SeSpecFrame frame;
+    const Complex *spectrum;
+    int status = audio_pipeline_4ch_fuse(s->p, &frame);
+    if (status != FOUR_AEC_NR_RES_OK) {
+        se_sample_chain_reset(s->chain);
+        return status;
+    }
+    spectrum = se_sample_chain_form(s->chain, &frame);
+    if (!spectrum || se_sample_chain_synthesize(s->chain, spectrum, s->output) != 0 ||
+        !se_hop_is_finite(s->output, s->hop)) {
+        audio_pipeline_4ch_reset(s->p);
+        se_sample_chain_reset(s->chain);
+        return FOUR_AEC_NR_RES_DSP_ERROR;
+    }
+    return FOUR_AEC_NR_RES_OK;
+}
 static int raw_process(void *user, McabHopView *view, int frame) {
     RawSample *s=user; (void)view;
     int status;
     if (s->vad_file)
         status=audio_pipeline_4ch_process_with_activity(s->p,s->microphones,
-            s->reference,s->activity!=0,s->activity!=0,NULL,s->output,&s->info);
+            s->reference,s->activity!=0,s->activity!=0,NULL,&s->beam,&s->info);
     else status=audio_pipeline_4ch_process(s->p,s->microphones,s->reference,
-                                          s->output,&s->info);
+                                          &s->beam,&s->info);
+    if (status == FOUR_AEC_NR_RES_OK) status=raw_post(s);
     if (status != FOUR_AEC_NR_RES_OK) {
         fprintf(stderr,"pipeline failed at frame %d: %d\n",frame,status); return 1;
     }
@@ -182,8 +226,8 @@ static int raw_finish(void *user, McabHopView *view, int processed) {
            audio_pipeline_4ch_bf_fft_size(s->p),
            audio_pipeline_4ch_matched_filter_count(s->p),
            audio_pipeline_4ch_linear_aec_count(s->p),
-           audio_pipeline_4ch_nr_count(s->p),
-           audio_pipeline_4ch_post_res_count(s->p),
+           se_sample_chain_nr(s->chain) ? 1 : 0,
+           se_sample_chain_res(s->chain) ? 1 : 0,
            audio_pipeline_4ch_spatial_backend(),
            s->doa_analysis_frames, s->doa_frames, s->adaptive_frames,
            processed > 0 ? s->info.delay.delay_samples : 0,
@@ -200,6 +244,8 @@ static void raw_cleanup(void *user) {
     free(s->output);
     free(s->reference);
     free(s->microphones);
+    se_sample_chain_destroy(s->chain);
+    free(s->chain_mem);
     audio_pipeline_4ch_destroy(s->p);
 }
 int main(int argc, char **argv) {

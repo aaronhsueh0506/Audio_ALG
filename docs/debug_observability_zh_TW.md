@@ -35,8 +35,8 @@
 |---|---|
 | AEC 狀態快照 | `AecDebugStatus` 10 欄，零 per-hop 成本（只讀引擎本來就每 hop 維護的欄位） |
 | NR 狀態快照 | `AnrDebugStatus` 5 欄 |
-| 4ch 計數器 | duty census、realign warm/soft、pending delay candidate、far-FFT 實跑次數、post split floor（live vs target；經 `audio_pipeline_4ch_post_split_floor()`，抑制器由 wrapper 擁有） |
-| 記憶體 | `aec_get_mem_breakdown()` / `audio_pipeline_get_mem_breakdown()` |
+| 4ch 計數器 | duty census、realign warm/soft、pending delay candidate、far-FFT 實跑次數、post split floor（live vs target；經 `aec_res_split_floor()`，抑制器由應用的後級鏈擁有） |
+| 記憶體 | `aec_get_mem_breakdown()` / `four_aec_nr_res_get_mem_breakdown()` / `se_sample_chain_sizes()` |
 | 錯誤分級 | 4ch core 的 `FourAecNrResStatus` 四值（唯一有語意分級的） |
 | Finite guards | 4ch 的輸入與輸出各一道；兩條 ULCNet 的 model 輸出 guard（含先填 `NAN` 的 FULL-WRITE CONTRACT） |
 
@@ -46,7 +46,7 @@
 |---|---|---|
 | **G1** | **`assert()` 在出貨板上是活的**。四個 Makefile 沒有任何一個設 `-DNDEBUG`；`suppression_gain.c` 的 table-length assert **沒有 release-path fallback**，失敗即 `abort()`——沒有回傳碼、沒有 log、沒有 hook 可攔 | 全樹 grep `-DNDEBUG` = 0 命中 |
 | **G2** | **沒有層級式 log**。`aec_debug_set_level()`／`aec_debug_set_log()` 只把值存進 `aec_debug.c` 的靜態變數，library 內沒有任何讀取端，也沒有 emit 函式；CLI 的 `--debug-level`／`--debug-log` 因此不會產生輸出 | `src/aec_debug.c` 的 `g_level`／`g_fp` 只被賦值 |
-| **G3** | **per-hop CSV trace 在四條 pipeline 全部不可達**。唯一填寫點要求 `cfg.enable_res == 1` 且走 `aec_process()`；四條 pipeline **全部**無條件設 `enable_res = 0` | `audio_pipeline.c`、`audio_pipeline_ulcnet.c`、`4aec_nr_res.c` 的 `derive_dims_and_configs()` |
+| **G3** | **per-hop CSV trace 在四條 pipeline 全部不可達**。唯一填寫點要求 `cfg.enable_res == 1` 且走 `aec_process()`；四條 pipeline **全部**無條件設 `enable_res = 0` | `common/se_config.c` 的 `se_derive()`、`4aec_nr_res.c` 的 `derive_dims_and_configs()` |
 | **G4** | **self-reset 不計數，而且會抹掉證據**。`DSP_ERROR` 路徑內部呼叫 `reset()`，而 `reset()` 把 realign counters / duty census 全部歸零 → 事後完全看不出發生過 | `4aec_nr_res.c` 的 reset 實作 |
 | **G5** | **delay lock 遺失不可見**。`delay_state` 與 `generation` 每 hop 可讀，但 `AecDebugStatus` **兩者都沒有** → 只 poll 快照的整合者看不到 lock 的丟失與重獲 | `aec.h` 的 `AecDebugStatus` 欄位表 |
 | **G6** | **mis-lock 連代理指標都沒有**。`delay_updates` 是更新總數，**不區分**「同一值重複確認」與「跳到新值」 | — |
@@ -139,8 +139,7 @@ T0.3 之所以關鍵：`dominant_nearend`、`saturated_echo`、`usable_linear`�
 
 `aec_get_last_timing()` 回全 0 目前有兩種意思，而函式不會告訴你是哪一種。
 提案：在 `AecStageTiming` 加一個 `enabled` 欄位（或導出
-`*_stage_timing_available()`），wrapper 層的兩個宏（`AUDIO_PIPELINE_STAGE_TIMING`、
-`FOUR_AEC_NR_RES_STAGE_TIMING`）目前是 `.c` 內部宏、consumer 測不到，也一併導出。
+`*_stage_timing_available()`），四路核心的宏（`FOUR_AEC_NR_RES_STAGE_TIMING`）目前是 `.c` 內部宏、consumer 測不到，也一併導出。
 
 ### T6 — 兩條 ULCNet pipeline 補上觀測面
 

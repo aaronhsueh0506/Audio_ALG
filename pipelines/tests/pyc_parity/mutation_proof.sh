@@ -13,11 +13,11 @@
 # largest K of each mutation, to show whether the existing gates notice it.
 #
 # Mutations (name: file / change / rows that must notice it at the largest K):
-#   fold_coef_ulp          pipelines/common/se_anr_stage.c   r2 fold coefficient SE_PSD_SCALE_INV * (1 + K * 2^-23)
+#   fold_coef_ulp          pipelines/samples/se_anr_stage.h  r2 fold coefficient SE_PSD_SCALE_INV * (1 + K * 2^-23)
 #   xi_min_db_div10_5      lib/nr/c_impl/src/spp_estimator.c xi_min_db / 10.0f -> / 10.5f
 #   aec_floor_balanced_ulp lib/aec/c_impl/src/aec.c          balanced far-active floor -28.0f - K * 2^-19 dB
 #   cng_seed_1bit          pipelines/common/se_stage.h       SE_CNG_RNG_SEED 0x9e3779b9u -> 0x9e3779b8u
-#   usable_gate_dropped    pipelines/common/se_anr_stage.c   "&& frame->usable_linear" removed from the r2 fold condition
+#   usable_gate_dropped    pipelines/samples/se_anr_stage.h  "&& frame->usable_linear" removed from the r2 fold condition
 #
 # Flip tests (name flip_*): a known past defect is planted back into the copy; the row(s) guarding it must turn FAIL:
 #   flip_s25_c_flag_forced  4aec_nr_res.c        four_aec_fuse forces frame->usable_linear = 1   (a.nr4.*.verdict_flag)
@@ -32,8 +32,10 @@ mp_def() {
   M_ONLY=""; M_MUST=""
   case "$1" in
     fold_coef_ulp)
-      M_FILE="Audio_ALG/pipelines/common/se_anr_stage.c"
-      M_PERL='s|(#include "utility/simd_kernels.h"\n)|$1#undef SE_PSD_SCALE_INV\n#define SE_PSD_SCALE_INV (0x1p-30f * (1.0f + '"$k"'.0f * 0x1p-23f))\n|'
+      M_FILE="Audio_ALG/pipelines/samples/se_anr_stage.h"
+      # The constant is replaced on its own #define line: a redefinition placed above it would be
+      # overwritten by the header itself and the mutation would silently do nothing.
+      M_PERL='s|#define SE_PSD_SCALE_INV \(1\.0f / SE_PSD_SCALE\)|#define SE_PSD_SCALE_INV (0x1p-30f * (1.0f + '"$k"'.0f * 0x1p-23f))|'
       M_ONLY="a.nr4.16k256.glue_cflag,a.nr4.16k256.glue_fold,d.mono.16k256.nr_glue"
       M_MUST="a.nr4.16k256.glue_fold d.mono.16k256.nr_glue" ;;
     xi_min_db_div10_5)
@@ -52,7 +54,7 @@ mp_def() {
       M_ONLY="d.mono.16k256.cng_glue,d.mono.16k256.min_apply_ola"
       M_MUST="d.mono.16k256.cng_glue" ;;
     usable_gate_dropped)
-      M_FILE="Audio_ALG/pipelines/common/se_anr_stage.c"
+      M_FILE="Audio_ALG/pipelines/samples/se_anr_stage.h"
       M_PERL='s| \&\& frame->usable_linear\)|)|'
       M_ONLY="a.nr4.16k256.glue_cflag,a.nr4.16k256.glue_fold,d.mono.16k256.nr_glue"
       M_MUST="a.nr4.16k256.glue_cflag d.mono.16k256.nr_glue" ;;

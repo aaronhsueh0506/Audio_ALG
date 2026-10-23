@@ -127,7 +127,6 @@ int main(int argc, char** argv) {
 
     cfg = four_aec_nr_res_default_config(sample_rate);
     cfg.fft_size = fft_size;
-    cfg.enable_cng = 0;
     cfg.enable_post = 0;          /* the alignment seam lives in front_process */
     cfg.delay_backward_quarantine_enabled = quarantine;
     if (quarantine_s >= 0.0f) cfg.delay_backward_quarantine_s = quarantine_s;

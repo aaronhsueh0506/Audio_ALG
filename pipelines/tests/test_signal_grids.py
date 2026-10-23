@@ -60,6 +60,16 @@ def test_integrated_pipeline_builds_explicit_low_latency_16k_grid():
 
 
 @pytest.mark.parametrize(
+    "sample_rate,fft_size,expected_l",
+    # NR's own minimum window, 512 ms in whole hops; the C library default on the same grids.
+    [(16000, 256, 64), (16000, 512, 32), (48000, 1024, 48)],
+)
+def test_integrated_pipeline_keeps_nr_minimum_window(sample_rate, fft_size, expected_l):
+    denoiser = _build_denoiser(sample_rate, fft_size=fft_size)
+    assert denoiser.noise_estimator.L == expected_l
+
+
+@pytest.mark.parametrize(
     "sample_rate,fft_size",
     [(16000, 1024), (48000, 256), (48000, 512)],
 )

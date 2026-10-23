@@ -34,7 +34,7 @@
 # builds, print-lib-path) use the submodule paths.
 #
 # Scenario index:
-#   S6:      audit-no-stdio false-pass check
+#   S6:      audit-no-stdio false-pass check (the nm filter must be able to report a stdio reference)
 #   S7:      publish -- lock-first driver and concurrent-publish semantics
 #   SP1:     pipeline-level A->B->A (SIMD=1 -> SIMD=0 -> SIMD=1)
 #   SP2:     producer-change propagation (audiolib hpf.c / fast_math.h) against disposable clones of
@@ -46,7 +46,7 @@
 #            with the internal -DAUDIO_PIPELINE_BACKEND_STR define reaching the compile line)
 #   SP-S9c:  link-flags (LDFLAGS/EXTRA_LDFLAGS) character safety: the `EXTRA_LDFLAGS=';id'` injection repro, the
 #            SP-S9b glob/tilde/redirect matrix for EXTRA_LDFLAGS, a positive control (a real `-Wl,-rpath,... -L...`
-#            flag still builds and runs test_audio_pipeline to ALL PASS), and override rejection of
+#            flag still builds and runs test_se_common to ALL PASS), and override rejection of
 #            SHELL_SAFE_INPUT_FLAGS/SHELL_SAFE_ALLOWLIST_RC via an EXTRA_LDFLAGS payload
 #   SP-S10:  lib/aec fresh-archive discipline against the PRIMARY AEC repo ($AEC_R6_DIR) with scratch
 #            OBJ_ROOT/BIN_ROOT; the foreign member goes into a scratch archive, never the real libaec.a
@@ -445,7 +445,7 @@ echo "############################################################"
 echo "# S6: audit-no-stdio false-pass regression"
 echo "############################################################"
 mkscratch s6
-make -s BACKEND=ne10 libaudio_pipeline.a >/dev/null
+make -s BACKEND=ne10 libaudio_pipeline_dfn.a >/dev/null
 default_lib="$(make -s BACKEND=ne10 NO_STDIO=0 print-lib-path)"
 sha_default_before="$(file_sha "$default_lib")"
 
@@ -465,11 +465,23 @@ nostdio_lib="$(make -s BACKEND=ne10 NO_STDIO=1 print-lib-path)"
 [ -f "$nostdio_lib" ] && pass "S6: NO_STDIO=1 archive exists on disk" || fail "S6: NO_STDIO=1 archive missing"
 
 sha_default_after="$(file_sha "$default_lib")"
-[ "$sha_default_before" = "$sha_default_after" ] && pass "S6: default (stdio) archive untouched (sha stable) by the audit run" \
+[ "$sha_default_before" = "$sha_default_after" ] && pass "S6: default archive untouched (sha stable) by the audit run" \
   || fail "S6: default archive CHANGED by the audit-no-stdio run (sha $sha_default_before -> $sha_default_after)"
 
-nm "$default_lib" 2>/dev/null | grep -Eq '_?fprintf' && pass "S6: default archive still contains fprintf refs (nm)" \
-  || fail "S6: default archive unexpectedly has NO fprintf refs"
+# The archive holds no stdio code in either configuration, so the audit's nm filter is exercised on a scratch copy
+# of the NO_STDIO archive with one member added that references fprintf/stderr: the same pattern must report it.
+S6_PROBE_SRC="$SCRATCH_ROOT/s6/probe.c"
+S6_PROBE_OBJ="$SCRATCH_ROOT/s6/probe.o"
+S6_TAMPERED="$SCRATCH_ROOT/s6/tampered.a"
+printf '#include <stdio.h>\nvoid s6_probe(void) { fprintf(stderr, "x"); }\n' > "$S6_PROBE_SRC"
+cc -c "$S6_PROBE_SRC" -o "$S6_PROBE_OBJ"
+cp "$nostdio_lib" "$S6_TAMPERED"
+ar r "$S6_TAMPERED" "$S6_PROBE_OBJ" 2>/dev/null
+s6_hits_clean="$(nm -A "$nostdio_lib" | awk '{ n = $NF; if (n ~ /^_?(fprintf|printf|puts|fputs|stderr|__stderrp)$/) print }')"
+s6_hits_tampered="$(nm -A "$S6_TAMPERED" | awk '{ n = $NF; if (n ~ /^_?(fprintf|printf|puts|fputs|stderr|__stderrp)$/) print }')"
+[ -z "$s6_hits_clean" ] && [ -n "$s6_hits_tampered" ] \
+  && pass "S6: the audit's nm filter reports a stdio reference added to a copy of the archive, and none in the shipped one" \
+  || fail "S6: the nm filter did not separate the shipped archive (hits: '$s6_hits_clean') from the tampered copy (hits: '$s6_hits_tampered')"
 
 echo "############################################################"
 echo "# S7: publish (v4 -- lock-first driver + concurrent semantics)"
@@ -834,14 +846,14 @@ mkscratch sp9b_pos
 SP9B_POS_OBJ_ROOT="$SCRATCH_ROOT/sp9b_pos/obj"
 SP9B_POS_BIN_ROOT="$SCRATCH_ROOT/sp9b_pos/bin"
 SP9B_POS_LOG="$SCRATCH_ROOT/tmp/sp9b_positive_build.log"
-if make BACKEND=ne10 OBJ_ROOT="$SP9B_POS_OBJ_ROOT" BIN_ROOT="$SP9B_POS_BIN_ROOT" libaudio_pipeline.a >"$SP9B_POS_LOG" 2>&1; then
-  pass "SP-S9b: plain override-free 'make libaudio_pipeline.a' SUCCEEDS under the new allow-list"
+if make BACKEND=ne10 OBJ_ROOT="$SP9B_POS_OBJ_ROOT" BIN_ROOT="$SP9B_POS_BIN_ROOT" libaudio_pipeline_dfn.a >"$SP9B_POS_LOG" 2>&1; then
+  pass "SP-S9b: plain override-free 'make libaudio_pipeline_dfn.a' SUCCEEDS under the new allow-list"
 else
-  fail "SP-S9b: plain override-free 'make libaudio_pipeline.a' unexpectedly FAILED under the new allow-list"
+  fail "SP-S9b: plain override-free 'make libaudio_pipeline_dfn.a' unexpectedly FAILED under the new allow-list"
   cat "$SP9B_POS_LOG" >&2
 fi
 if grep -qF -- '-DAUDIO_PIPELINE_BACKEND_STR=\"ne10\"' "$SP9B_POS_LOG"; then
-  pass "SP-S9b: -DAUDIO_PIPELINE_BACKEND_STR=\\\"ne10\\\" still reaches the audio_pipeline.c compile line"
+  pass "SP-S9b: -DAUDIO_PIPELINE_BACKEND_STR=\\\"ne10\\\" still reaches the archive's compile lines"
 else
   fail "SP-S9b: -DAUDIO_PIPELINE_BACKEND_STR define did NOT appear on the compile line"
   cat "$SP9B_POS_LOG" >&2
@@ -898,27 +910,27 @@ else
 fi
 
 # Positive control: a real link flag the Makefile's allow-list comment anticipates (-Wl,-rpath,dir style
-# pass-through) must pass the character check, build and run. test_audio_pipeline is a real linked binary (unlike
-# SP-S9b's libaudio_pipeline.a, an `ar` recipe that never touches $(LDFLAGS)) and prints "ALL PASS" with exit 0, so it
+# pass-through) must pass the character check, build and run. test_se_common is a real linked binary (unlike
+# SP-S9b's libaudio_pipeline_dfn.a, an `ar` recipe that never touches $(LDFLAGS)) and prints "ALL PASS" with exit 0, so it
 # doubles as the link-succeeded-and-still-correct assertion. Uses scratch OBJ_ROOT/BIN_ROOT.
 mkscratch sp9c_pos
 SP9C_POS_OBJ_ROOT="$SCRATCH_ROOT/sp9c_pos/obj"
 SP9C_POS_BIN_ROOT="$SCRATCH_ROOT/sp9c_pos/bin"
 SP9C_POS_BUILD_LOG="$SCRATCH_ROOT/tmp/sp9c_positive_build.log"
-if env EXTRA_LDFLAGS='-Wl,-rpath,/usr/lib -L/usr/lib' make BACKEND=ne10 OBJ_ROOT="$SP9C_POS_OBJ_ROOT" BIN_ROOT="$SP9C_POS_BIN_ROOT" test_audio_pipeline >"$SP9C_POS_BUILD_LOG" 2>&1; then
-  pass "SP-S9c: EXTRA_LDFLAGS='-Wl,-rpath,/usr/lib -L/usr/lib' (positive control, real rpath/library-path link flag) builds test_audio_pipeline"
+if env EXTRA_LDFLAGS='-Wl,-rpath,/usr/lib -L/usr/lib' make BACKEND=ne10 OBJ_ROOT="$SP9C_POS_OBJ_ROOT" BIN_ROOT="$SP9C_POS_BIN_ROOT" test_se_common >"$SP9C_POS_BUILD_LOG" 2>&1; then
+  pass "SP-S9c: EXTRA_LDFLAGS='-Wl,-rpath,/usr/lib -L/usr/lib' (positive control, real rpath/library-path link flag) builds test_se_common"
   if grep -qF -- '-Wl,-rpath,/usr/lib -L/usr/lib' "$SP9C_POS_BUILD_LOG"; then
-    pass "SP-S9c: the real link flag reaches the actual \$(LINK) recipe line for test_audio_pipeline"
+    pass "SP-S9c: the real link flag reaches the actual \$(LINK) recipe line for test_se_common"
   else
-    fail "SP-S9c: the real link flag did NOT appear on the test_audio_pipeline link recipe line"
+    fail "SP-S9c: the real link flag did NOT appear on the test_se_common link recipe line"
     cat "$SP9C_POS_BUILD_LOG" >&2
   fi
   SP9C_POS_BINDIR="$(env EXTRA_LDFLAGS='-Wl,-rpath,/usr/lib -L/usr/lib' make -s BACKEND=ne10 OBJ_ROOT="$SP9C_POS_OBJ_ROOT" BIN_ROOT="$SP9C_POS_BIN_ROOT" print-bin-dir)"
   SP9C_POS_RUN_LOG="$SCRATCH_ROOT/tmp/sp9c_positive_run.log"
-  if "$SP9C_POS_BINDIR/test_audio_pipeline" >"$SP9C_POS_RUN_LOG" 2>&1 && grep -q "^ALL PASS$" "$SP9C_POS_RUN_LOG"; then
-    pass "SP-S9c: test_audio_pipeline (built with the real rpath/library-path link flag) RUNS to ALL PASS"
+  if "$SP9C_POS_BINDIR/test_se_common" >"$SP9C_POS_RUN_LOG" 2>&1 && grep -q "^ALL PASS$" "$SP9C_POS_RUN_LOG"; then
+    pass "SP-S9c: test_se_common (built with the real rpath/library-path link flag) RUNS to ALL PASS"
   else
-    fail "SP-S9c: test_audio_pipeline (built with the real rpath/library-path link flag) did not run to ALL PASS"
+    fail "SP-S9c: test_se_common (built with the real rpath/library-path link flag) did not run to ALL PASS"
     cat "$SP9C_POS_RUN_LOG" >&2
   fi
 else
@@ -1184,7 +1196,7 @@ echo "############################################################"
 mkscratch sp12
 # This shim's path lives under $SCRATCH_ROOT, which is fresh every run -- and
 # CXX participates in this repo's own CFG_SIG payload -- so building
-# libaudio_pipeline.a with it in the REAL (default-rooted) obj/bin would mint a
+# libaudio_pipeline_dfn.a with it in the REAL (default-rooted) obj/bin would mint a
 # brand-new orphan keyed directory there on every run of this suite. Both shim
 # builds use a scratch OBJ_ROOT/BIN_ROOT; the guard under test doesn't care
 # where the objects land.
@@ -1202,10 +1214,10 @@ SHIM_EOF
 chmod +x "$SP12_SHIM"
 
 assert_cmd_fails_with "SP-S12: BACKEND=ne10 with a CXX whose -dumpmachine disagrees with CC's is rejected" "different targets" \
-  make BACKEND=ne10 CXX="$SP12_SHIM" OBJ_ROOT="$SP12_OBJ_ROOT" BIN_ROOT="$SP12_BIN_ROOT" libaudio_pipeline.a
+  make BACKEND=ne10 CXX="$SP12_SHIM" OBJ_ROOT="$SP12_OBJ_ROOT" BIN_ROOT="$SP12_BIN_ROOT" libaudio_pipeline_dfn.a
 
 S12_LOG="$SCRATCH_ROOT/sp12/log"
-if make TOOLCHAIN_CHECK=0 CXX="$SP12_SHIM" OBJ_ROOT="$SP12_OBJ_ROOT" BIN_ROOT="$SP12_BIN_ROOT" libaudio_pipeline.a >"$S12_LOG" 2>&1; then
+if make TOOLCHAIN_CHECK=0 CXX="$SP12_SHIM" OBJ_ROOT="$SP12_OBJ_ROOT" BIN_ROOT="$SP12_BIN_ROOT" libaudio_pipeline_dfn.a >"$S12_LOG" 2>&1; then
   pass "SP-S12: TOOLCHAIN_CHECK=0 with the same mismatched-triple CXX shim SUCCEEDS (the guard is the only thing that rejected it)"
 else
   fail "SP-S12: TOOLCHAIN_CHECK=0 build unexpectedly FAILED with the CXX shim in place"
@@ -1330,11 +1342,11 @@ echo "--- SP-S14b: COMBINED dry-run flags stay zero-write (PIPELINES Makefile) -
 # Combined dry-run flags (as in audiolib's script): `make -nt publish` could take the -n branch and recurse, and the
 # child then sees both flags and applies real touch semantics down the _publish_impl prerequisite chain; the
 # pipelines Makefile's dry-run guard checks t first to avoid this. Exercised against a scratch-root
-# libaudio_pipeline.a deliberately backdated below its object, the state a leaked -t would "fix" by touching. Scratch
-# side only. libaudio_pipeline.a needs no producer archive, so no COMMON_LIB/AEC_LIB/NR_LIB resolution is needed.
+# libaudio_pipeline_dfn.a deliberately backdated below its object, the state a leaked -t would "fix" by touching. Scratch
+# side only. libaudio_pipeline_dfn.a contains no producer object, but its goal still goes through the three-producer dispatch.
 mkscratch sp14b
 SP14B_OBJ="$SCRATCH_ROOT/sp14b/obj"; SP14B_BIN="$SCRATCH_ROOT/sp14b/bin"; SP14B_DIST="$SCRATCH_ROOT/sp14b/nx"
-make -s BACKEND=ne10 OBJ_ROOT="$SP14B_OBJ" BIN_ROOT="$SP14B_BIN" libaudio_pipeline.a >/dev/null
+make -s BACKEND=ne10 OBJ_ROOT="$SP14B_OBJ" BIN_ROOT="$SP14B_BIN" libaudio_pipeline_dfn.a >/dev/null
 sp14b_lib="$(make -s BACKEND=ne10 OBJ_ROOT="$SP14B_OBJ" BIN_ROOT="$SP14B_BIN" print-lib-path)"
 touch -t 202001010000 "$sp14b_lib"
 sp14b_ref="$(stat -f '%m %z' "$sp14b_lib")"
@@ -1666,7 +1678,7 @@ mkscratch sp18
 # submodule's gate instead of pipelines'. COMMON_LIB=/AEC_LIB=/NR_LIB= are therefore forced to dummy values on every
 # call (harmless for the lib/aec and lib/nr primary cases, which have no such variables), skipping the dispatch, so a
 # PASS can only come from the Makefile named by <dir>. For the same reason the pipelines cases target
-# `libaudio_pipeline.a` rather than `all`.
+# `libaudio_pipeline_dfn.a` rather than `all`.
 SP18_COUNTER=0
 assert_make_e_rejected() {
   local desc="$1" dir="$2" target="$3" mode="$4" needle="$5" log
@@ -1703,7 +1715,7 @@ assert_make_e_rejected() {
 
 echo "--- FP_POLICY= (empty) via make -e -----------------------------------"
 assert_make_e_rejected "SP-S18: pipelines env FP_POLICY= (empty) make -e -n rejected" \
-  "$PIPE_DIR" libaudio_pipeline.a present "-ffp-contract=off" FP_POLICY=
+  "$PIPE_DIR" libaudio_pipeline_dfn.a present "-ffp-contract=off" FP_POLICY=
 assert_make_e_rejected "SP-S18: lib/aec (primary) env FP_POLICY= (empty) make -e -n rejected" \
   "$AEC_R6_DIR" lib present "-ffp-contract=off" FP_POLICY=
 assert_make_e_rejected "SP-S18: lib/nr (primary) env FP_POLICY= (empty) make -e -n rejected" \
@@ -1711,7 +1723,7 @@ assert_make_e_rejected "SP-S18: lib/nr (primary) env FP_POLICY= (empty) make -e 
 
 echo "--- FP_POLICY=-ffp-contract=fast via make -e (environment-override regression) ---"
 assert_make_e_rejected "SP-S18: pipelines env FP_POLICY=-ffp-contract=fast make -e -n rejected" \
-  "$PIPE_DIR" libaudio_pipeline.a absent "-ffp-contract=fast" FP_POLICY=-ffp-contract=fast
+  "$PIPE_DIR" libaudio_pipeline_dfn.a absent "-ffp-contract=fast" FP_POLICY=-ffp-contract=fast
 assert_make_e_rejected "SP-S18: lib/aec (primary) env FP_POLICY=-ffp-contract=fast make -e -n rejected" \
   "$AEC_R6_DIR" lib absent "-ffp-contract=fast" FP_POLICY=-ffp-contract=fast
 assert_make_e_rejected "SP-S18: lib/nr (primary) env FP_POLICY=-ffp-contract=fast make -e -n rejected" \
@@ -1719,7 +1731,7 @@ assert_make_e_rejected "SP-S18: lib/nr (primary) env FP_POLICY=-ffp-contract=fas
 
 echo "--- CPPFLAGS=<poison> via make -e -------------------------------------"
 assert_make_e_rejected "SP-S18: pipelines env CPPFLAGS=-DSP18_POISON make -e -n rejected" \
-  "$PIPE_DIR" libaudio_pipeline.a absent "-DSP18_POISON" CPPFLAGS=-DSP18_POISON
+  "$PIPE_DIR" libaudio_pipeline_dfn.a absent "-DSP18_POISON" CPPFLAGS=-DSP18_POISON
 assert_make_e_rejected "SP-S18: lib/aec (primary) env CPPFLAGS=-DSP18_POISON make -e -n rejected" \
   "$AEC_R6_DIR" lib absent "-DSP18_POISON" CPPFLAGS=-DSP18_POISON
 assert_make_e_rejected "SP-S18: lib/nr (primary) env CPPFLAGS=-DSP18_POISON make -e -n rejected" \
@@ -1727,7 +1739,7 @@ assert_make_e_rejected "SP-S18: lib/nr (primary) env CPPFLAGS=-DSP18_POISON make
 
 echo "--- CXXFLAGS=<poison> via make -e -------------------------------------"
 assert_make_e_rejected "SP-S18: pipelines env CXXFLAGS=-DSP18_POISON make -e -n rejected" \
-  "$PIPE_DIR" libaudio_pipeline.a absent "-DSP18_POISON" CXXFLAGS=-DSP18_POISON
+  "$PIPE_DIR" libaudio_pipeline_dfn.a absent "-DSP18_POISON" CXXFLAGS=-DSP18_POISON
 assert_make_e_rejected "SP-S18: lib/aec (primary) env CXXFLAGS=-DSP18_POISON make -e -n rejected" \
   "$AEC_R6_DIR" lib absent "-DSP18_POISON" CXXFLAGS=-DSP18_POISON
 assert_make_e_rejected "SP-S18: lib/nr (primary) env CXXFLAGS=-DSP18_POISON make -e -n rejected" \
@@ -1737,7 +1749,7 @@ echo "--- LDFLAGS=<poison> via make -e -- pipelines-specific (the one repo"
 echo "    whose LDFLAGS composition itself needed relocating; AEC's/NR's"
 echo "    LDFLAGS already precede their own foreach and never needed it) ---"
 assert_make_e_rejected "SP-S18: pipelines env LDFLAGS=-lSP18POISON make -e -n rejected" \
-  "$PIPE_DIR" libaudio_pipeline.a absent "-lSP18POISON" LDFLAGS=-lSP18POISON
+  "$PIPE_DIR" libaudio_pipeline_dfn.a absent "-lSP18POISON" LDFLAGS=-lSP18POISON
 
 echo "############################################################"
 echo "# Final integrity guards"

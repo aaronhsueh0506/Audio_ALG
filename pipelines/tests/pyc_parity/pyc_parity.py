@@ -31,9 +31,9 @@ GRIDS = [('16k256', 16000, 256), ('16k512', 16000, 512), ('48k1024', 48000, 1024
 GRID_LABEL = {'16k256': '16k/256', '16k512': '16k/512', '48k1024': '48k/1024'}
 PRESETS = ['balanced', 'mild', 'aggressive']
 # b.res4 only (not the shared PRESETS list, so PRESETS-driven scenarios such as l2.res4.*.replay
-# are unaffected). aec=no_floor on the C side is a direct construction-time preset
-# (se_derive()'s preset_valid() whitelists NO_FLOOR; see pyc_drv.c), matching the Python side's
-# FourChannelAecConfig(aec_preset=NO_FLOOR).
+# are unaffected). aec=no_floor on the C side is a direct construction-time preset (the RES stage of
+# se_sample_chain takes any AecPreset; see pyc_drv.c), matching the Python side's
+# PostBeamResidualSuppressor.set_preset('no_floor').
 PRESETS_B = PRESETS + ['no_floor']
 
 # Known gaps: a row listed here may exceed its tolerance without failing; if it does not, the script
@@ -61,11 +61,12 @@ TOL2 = {                     # Layer 2: shipped (fast-math, NEON) against std-ma
 SOURCES = [   # hashed into the JSON so a result can be tied to the code it judged
     'Audio_ALG/pipelines/4ch_aec_bf_nr_res/4aec_nr_res.c',
     'Audio_ALG/pipelines/4ch_aec_bf_nr_res/pipeline.py',
-    'Audio_ALG/pipelines/4ch_aec_bf_nr_res/tests/conv_chain_4ch.h',
     'Audio_ALG/pipelines/aec_nr_pipeline.py',
     'Audio_ALG/pipelines/cng_aec3.py',
-    'Audio_ALG/pipelines/common/se_anr_stage.c',
-    'Audio_ALG/pipelines/mono_aec_nr_res/audio_pipeline.c',
+    'Audio_ALG/pipelines/common/se_stage.h',
+    'Audio_ALG/pipelines/samples/se_anr_stage.h',
+    'Audio_ALG/pipelines/samples/se_sample_chain.h',
+    'Audio_ALG/pipelines/tests/pyc_parity/pyc_drv.c',
     'Audio_ALG/lib/aec/c_impl/src/aec_res.c',
 ]
 
@@ -512,10 +513,10 @@ def sec_a(cx, g, sr, fft, want):
                            usable=np.concatenate([verdict, np.zeros(base.nh - n, np.uint8)]))
             m = stats(rep.Gnr, g_pyv)
             rows.append(make_row(pre + 'glue_fold', 1,
-                                 'NR glue with the R^2 fold active: Python NR vs C se_anr_stage over the same frame, usable = Python verdict',
+                                 'NR glue with the R^2 fold active: Python NR vs C se_anr_stage_gain over the same frame, usable = Python verdict',
                                  'pyc_drv_4ch replay (usable = Python verdict); run_nr_spectrum(C E, C R2, Python verdict)',
                                  gate=m['max_abs'] <= tol, metrics=m, tol={'max_abs': tol}, grid=g, ref='Python',
-                                 note='verdict true on %d of %d hops (this row exercises se_anr_stage.c r2 fold)' % (int(verdict.sum()), n)))
+                                 note='verdict true on %d of %d hops (this row exercises the se_anr_stage.h r2 fold)' % (int(verdict.sum()), n)))
         if want(pre + 'verdict_flag'):
             mism = int(np.count_nonzero(verdict.astype(bool) != base.usable[:n]))
             first = np.flatnonzero(verdict.astype(bool) != base.usable[:n])

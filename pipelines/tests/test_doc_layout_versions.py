@@ -23,24 +23,14 @@ _REPO = pathlib.Path(__file__).resolve().parents[2]
 
 # 巨集名 -> 定義它的檔案（相對 repo 根）。#define 只有一處，所以不必去重。
 _SOURCES = {
-    'AUDIO_PIPELINE_LAYOUT_VERSION':
-        'pipelines/mono_aec_nr_res/audio_pipeline.c',
-    'AUDIO_PIPELINE_ULCNET_LAYOUT_VERSION':
-        'pipelines/mono_alignulcnet/audio_pipeline_ulcnet.c',
     'AUDIO_PIPELINE_4CH_LAYOUT_VERSION':
         'pipelines/4ch_aec_bf_nr_res/audio_pipeline_4ch.h',
     'FOUR_AEC_NR_RES_LAYOUT_VERSION':
         'pipelines/4ch_aec_bf_nr_res/4aec_nr_res.h',
-    'AUDIO_PIPELINE_4CH_ULCNET_LAYOUT_VERSION':
-        'pipelines/4ch_alignulcnet/audio_pipeline_4ch_ulcnet.h',
     'DFN_RES_STAGE_LAYOUT_VERSION':
         'pipelines/dfn_res_stage.h',
     'DFN_RATE_BRIDGE_LAYOUT_VERSION':
         'pipelines/dfn_rate_bridge.h',
-    'MONO_AEC_DFN_RES_LAYOUT_VERSION':
-        'pipelines/mono_aec_dfn_res/audio_pipeline_dfn.h',
-    'FOUR_AEC_DFN_RES_LAYOUT_VERSION':
-        'pipelines/4ch_aec_bf_dfn_res/4aec_dfn_res.h',
     'ULCNET_MODEL_IO_LAYOUT_VERSION':
         'AIAEC/Align_ULCNet/ulcnet_model_io.h',
     'DEEPVQE_PREPOST_LAYOUT_VERSION':
@@ -55,10 +45,6 @@ _DOC_SUFFIXES = ('.html', '.md')
 # historical prose, so pin only the narrowly-scoped forms that explicitly say
 # "current checkout/value" (or identify the measured build in the HTML table).
 _UNQUALIFIED_CURRENT_CLAIMS = (
-    ('docs/integration_mono_zh_TW.md', 'AUDIO_PIPELINE_LAYOUT_VERSION',
-     re.compile(r'本次 checkout（layout_version=(\d+)')),
-    ('docs/integration_mono_zh_TW.md', 'AUDIO_PIPELINE_LAYOUT_VERSION',
-     re.compile(r'\| 4 \| `layout_version` \| `uint32_t` \| `(\d+)` \|')),
     ('docs/integration_4ch_core_zh_TW.md', 'FOUR_AEC_NR_RES_LAYOUT_VERSION',
      re.compile(r'本次 checkout（`layout_version=(\d+)`')),
     ('docs/integration_4ch_core_zh_TW.md', 'FOUR_AEC_NR_RES_LAYOUT_VERSION',
@@ -69,18 +55,6 @@ _UNQUALIFIED_CURRENT_CLAIMS = (
     ('docs/html/pipeline_4ch.html', 'AUDIO_PIPELINE_4CH_LAYOUT_VERSION',
      re.compile(r'audio_pipeline_4ch_get_mem_requirements\(\)</code>'
                 r'\(ne10,layout_version=(\d+)\)')),
-    ('docs/html/pipeline_4ch.html', 'AUDIO_PIPELINE_4CH_LAYOUT_VERSION',
-     re.compile(r'run_post_stages\(\)</code>;layout v(\d+)\)')),
-    ('docs/html/pipeline_mono.html', 'AUDIO_PIPELINE_LAYOUT_VERSION',
-     re.compile(r'本頁 API 與實作\(layout v(\d+)\)')),
-    ('docs/html/pipeline_ulcnet_mono.html', 'AUDIO_PIPELINE_ULCNET_LAYOUT_VERSION',
-     re.compile(r'descriptor v1 / layout v(\d+)\)')),
-    ('docs/html/pipeline_ulcnet_4ch.html',
-     'AUDIO_PIPELINE_4CH_ULCNET_LAYOUT_VERSION',
-     re.compile(r'descriptor v1 / <b>layout v(\d+)</b>')),
-    ('pipelines/4ch_alignulcnet/README.md',
-     'AUDIO_PIPELINE_4CH_ULCNET_LAYOUT_VERSION',
-     re.compile(r'LAYOUT_VERSION`\) is \*\*(\d+)\*\*')),
 )
 
 

@@ -16,7 +16,7 @@ SITES = {
                         r'^#define\s+SE_CNG_NR_GAIN_FLOOR\s+([0-9.]+)f\s*$'),
     'python twin': (ROOT / 'aec_nr_pipeline.py',
                     r'^CNG_NR_GAIN_FLOOR\s*=\s*([0-9.]+)\s*$'),
-    'mono witness': (ROOT / 'mono_aec_nr_res' / 'tests' / 'test_audio_pipeline.c',
+    'mono witness': (ROOT / 'mono_aec_nr_res' / 'tests' / 'test_mono_chain.c',
                      r'const double floor_amp = ([0-9.]+),'),
     '4ch witness': (ROOT / '4ch_aec_bf_nr_res' / 'tests' / 'test_4aec_nr_res.c',
                     r'const double floor_amp = ([0-9.]+),'),

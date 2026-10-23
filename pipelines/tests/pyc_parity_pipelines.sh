@@ -159,22 +159,22 @@ build_layer() { # name simd debug extra opt
   [ -n "$opt" ] && knobs4+=("OPT_CFLAGS=$opt")
   if [ "$REUSE" = 0 ]; then rm -rf "$root"; : > "$log"; fi
   mkdir -p "$root"
-  make_quiet "$log" "$PL" "${knobs[@]}" libs libaudio_pipeline.a || { tail -20 "$log" >&2; die "build $name (pipelines) failed"; }
+  make_quiet "$log" "$PL" "${knobs[@]}" aec_nr_pipeline || { tail -20 "$log" >&2; die "build $name (pipelines) failed"; }
   make_quiet "$log" "$P4" "${knobs4[@]}" libaudio_pipeline_4ch.a || { tail -20 "$log" >&2; die "build $name (4ch) failed"; }
   local ac aec nr mono four
   ac="$(make -s -C "$AC" "${knobs[@]}" print-lib-path | tail -1)"
   aec="$(make -s -C "$ALG/lib/aec/c_impl" "${knobs[@]}" COMMON_DIR="$AC" COMMON_LIB="$ac" print-lib-path | tail -1)"
   nr="$(make -s -C "$ALG/lib/nr/c_impl" "${knobs[@]}" COMMON_DIR="$AC" COMMON_LIB="$ac" print-lib-path | tail -1)"
-  mono="$(make -s -C "$PL" "${knobs[@]}" print-lib-path | tail -1)"
+  mono="$(make -s -C "$PL" "${knobs[@]}" print-obj-dir | tail -1)/se_config.o"
   four="$(make -s -C "$P4" "${knobs4[@]}" print-lib-path | tail -1)"
-  for f in "$ac" "$aec" "$nr" "$mono" "$four"; do [ -f "$f" ] || die "archive $f missing after build $name"; done
+  for f in "$ac" "$aec" "$nr" "$mono" "$four"; do [ -f "$f" ] || die "archive or object $f missing after build $name"; done
 
   # Compile line of the C drivers: the same math/SIMD macros as the libraries, and the FP policy of the
   # Makefiles (-ffp-contract=off -fno-math-errno).
   local macros="" inc
   if [ "$simd" = 0 ]; then macros="-DSIMD_KERNELS_FORCE_SCALAR"; fi
   case "$extra" in *USE_STANDARD_MATH*) macros="$macros -DUSE_STANDARD_MATH" ;; esac
-  inc="-I$PL -I$P4 -I$PL/mono_aec_nr_res -I$ALG/lib/aec/c_impl/include -I$ALG/lib/aec/c_impl/example -I$ALG/lib/nr/c_impl/include -I$AC/include -I$AC"
+  inc="-I$PL -I$PL/samples -I$P4 -I$ALG/lib/aec/c_impl/include -I$ALG/lib/aec/c_impl/example -I$ALG/lib/nr/c_impl/include -I$AC/include -I$AC"
   mkdir -p "$root/drv"
   # shellcheck disable=SC2086
   "$CC" -Wall -Wextra -O2 -std=gnu99 -ffp-contract=off -fno-math-errno $macros $inc -DPYC_WITH_4CH \

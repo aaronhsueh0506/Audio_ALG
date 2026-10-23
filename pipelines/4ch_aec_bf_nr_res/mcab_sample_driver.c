@@ -19,22 +19,31 @@ const char* mcab_backend_id_name(uint32_t backend_id) {
 }
 
 int mcab_print_mem_budget(const char* title, const AudioPipeline4ChConfig* cfg,
-                          McabMemoryQuery query) {
+                          McabMemoryQuery query,
+                          const McabMemLine* extra, size_t n_extra) {
     AudioPipeline4ChMemReq req;
+    unsigned long long total;
+    size_t i;
     if (query(cfg, &req) != 0) {
         fprintf(stderr, "Error: invalid 4ch spatial pipeline config\n");
         return -1;
     }
+    total = (unsigned long long)req.bytes;
+    for (i = 0; i < n_extra; ++i) total += extra[i].bytes;
     printf("Memory Budget (%s)\n", title);
     printf("=============================================================\n");
     /* cfg->core.fft_size may be the unresolved 0 sentinel; print the grid actually used. */
     printf("  sample_rate=%d fft=%d geometry=%d num_angles=%d\n",
            cfg->core.sample_rate,
-           cfg->core.fft_size ? cfg->core.fft_size
-                              : (cfg->core.sample_rate == 16000 ? 256 : 1024),
+           mcab_resolved_fft(cfg->core.sample_rate, cfg->core.fft_size),
            (int)cfg->geometry, cfg->num_angles);
-    printf("  Total:          %9llu bytes (%7.1f KB)\n",
+    printf("  Unit:           %9llu bytes (%7.1f KB)\n",
            (unsigned long long)req.bytes, (float)req.bytes / 1024.0f);
+    for (i = 0; i < n_extra; ++i)
+        printf("  %-14s  %9llu bytes (%7.1f KB)\n", extra[i].label,
+               extra[i].bytes, (float)extra[i].bytes / 1024.0f);
+    printf("  Total:          %9llu bytes (%7.1f KB)\n",
+           total, (float)total / 1024.0f);
     printf("  Descriptor:     descriptor_version=%u alignment=%u "
            "layout_version=%u backend_id=%u (%s) "
            "build_flags_hash=0x%08x\n\n",

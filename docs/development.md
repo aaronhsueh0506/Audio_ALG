@@ -45,7 +45,7 @@ git commit -m "pin: NR to version xxx"
 | `AINR/` | standalone AI noise reduction models |
 | `AIAEC/` | neural AEC candidate models and dataset |
 | `shared/` | 共享工具代碼 |
-| `pipelines/` | conventional mono pipeline and 4-channel AEC shell |
+| `pipelines/` | mono AEC examples and the 4-channel linear AEC + beamformer unit |
 | `docs/` | current docs and archived design records |
 | `scripts/` | 管理腳本 |
 

@@ -30,18 +30,19 @@ COMMON_DIR="${COMMON_DIR:-../../audiolib/common}"
 FMA_RE="$FP_CONTRACT_FMA_RE"
 disas() { fp_contract_disas "$1"; }
 
-# One row per TU: "make-dir:build-goal:object:note". These either run WOLA or
-# implement the DFN spectrum/compose path, and must stay fma-free so the
-# scalar/NEON and C/Python multiply-then-add contracts remain comparable.
+# One row per TU: "make-dir:build-goal:object:note". These either run WOLA, implement the
+# DFN spectrum/compose path or do per-bin spectral arithmetic that the C/Python parity gate
+# compares, and must stay fma-free so the scalar/NEON and C/Python multiply-then-add
+# contracts remain comparable. The gain chain of samples/ is header-only and compiled into the
+# example programs; it only calls kernels audited elsewhere.
 ENTRIES='
-.:libaudio_pipeline.a:audio_pipeline.o:mono AEC+NR pipeline -- post-NR/RES synthesis WOLA
-.:libaudio_pipeline.a:se_anr_stage.o:NR stage -- retimed configuration and the residual-echo prior scaling
 .:libaudio_pipeline_dfn.a:dfn_res_stage.o:shared DFN post-RES stage -- 2^-5/2^5 boundary scaling
 .:libaudio_pipeline_dfn.a:dfn_rate_bridge.o:DFN rate bridge -- native and 48 kHz WOLA, analysis windows
 .:libaudio_pipeline_dfn.a:dfn2_process.o:DFN feature and streaming compose kernels
-4ch_aec_bf_nr_res:libs:4aec_nr_res.o:4-channel core -- post-beam synthesis WOLA
-4ch_aec_bf_nr_res:libs:se_anr_stage.o:NR stage -- retimed configuration and the residual-echo prior scaling
-4ch_aec_bf_nr_res:4ch_alignulcnet:audio_pipeline_4ch_ulcnet.o:4-channel Align-ULCNet -- beamformed-spectrum WOLA
+.:mono_alignulcnet:ulcnet_nn_stage.o:Align-ULCNet stage (mono build) -- far-end analysis and enhanced-spectrum synthesis
+4ch_aec_bf_nr_res:libs:4aec_nr_res.o:4-channel core -- lane-spectrum projection and the fused PSD views
+4ch_aec_bf_nr_res:libs:audio_pipeline_4ch.o:4-channel unit -- SRP-PHAT and beamformer spectral math
+4ch_aec_bf_nr_res:4ch_alignulcnet:ulcnet_nn_stage.o:Align-ULCNet stage (4-channel build) -- far-end analysis and enhanced-spectrum synthesis
 '
 
 fail=0

@@ -1,12 +1,19 @@
 /**
- * Acceptance tests for audio_pipeline_ulcnet.h (mono linear AEC -> Align-ULCNet
- * post-filter): API surface, one-hop STFT/WOLA latency, delay-event identity reprime
- * and the model-callback policy. A contract test, not a DSP-quality test.
+ * Composition tests of the mono linear AEC feeding the Align-ULCNet stage (lib/aec's Aec +
+ * samples/ulcnet_nn_stage.h), wired as mono_alignulcnet/main.c wires them: one-hop STFT/WOLA
+ * latency, delay-event identity reprime on the real alignment state and the model-callback
+ * policy on real framing. A contract test, not a DSP-quality test. The stage alone (synthetic
+ * alignment events) is tested in samples/tests/test_ulcnet_nn_stage.c; what needs the real AEC
+ * (FIXED and MATCHED delay states, the framing straddle derivation, acquisition of a known
+ * delay) stays here.
  * Stimuli: a zero-delay echo (the delay state stays UNLOCKED) and a bulk-delay echo
  * (ECHO_DELAY is beyond the filter reach, so the matched filter locks and a model is
  * applied). Each test banner states its case. Build and run: `make test` in pipelines/.
  */
-#include "audio_pipeline_ulcnet.h"
+#include "aec.h"
+#include "common/se_config.h"
+#include "samples/ulcnet_nn_stage.h"
+#include "utility/mem_align.h"
 
 #include <stdio.h>
 #include <stdlib.h>
@@ -29,6 +36,177 @@ static const UlcnetModelIoDescriptor* test_io_descriptor(void) {
         ready = 1;
     }
     return &d;
+}
+
+/* ---------------------------------------------------------------------------------------
+ * The composition under test: Aec (linear context only) + UlcnetNnStage, as main.c builds
+ * them. A small test-local shim gives the pieces the shape the tests below drive.
+ * --------------------------------------------------------------------------------------- */
+
+typedef struct MonoUlcnetConfig {
+    int sample_rate, fft_size, filter_length;
+    AecDelayMode delay_mode;
+    int delay_num_filters, fixed_delay_samples;
+    AecPreset aec_preset;
+    UlcnetModel model;            /* all-zero: identity */
+} MonoUlcnetConfig;
+
+typedef struct MonoUlcnetMemReq { uint64_t bytes; } MonoUlcnetMemReq;
+
+typedef struct MonoUlcnet {
+    Aec* aec;
+    UlcnetNnStage* stage;
+    Aec* heap_aec;                /* separate-allocation construction only */
+    void* heap_stage_mem;
+} MonoUlcnet;
+
+static MonoUlcnetConfig mu_default_config(int sample_rate) {
+    MonoUlcnetConfig cfg;
+    memset(&cfg, 0, sizeof(cfg));
+    cfg.sample_rate = sample_rate;
+    cfg.fft_size = ULCNET_N_FFT;           /* compiled checkpoint grid */
+    cfg.delay_mode = AEC_DELAY_MATCHED;
+    cfg.delay_num_filters = 5;
+    cfg.fixed_delay_samples = -1;
+    cfg.aec_preset = AEC_PRESET_BALANCED;
+    return cfg;
+}
+
+/* The lane on the compiled grid, linear context only; -1 for a request the grid refuses. */
+static int mu_lane(const MonoUlcnetConfig* cfg, AecConfig* aec_cfg) {
+    static const SeRules rules = { .fixed_rate = ULCNET_SR, .fixed_fft = ULCNET_N_FFT,
+                                   .spatial_context = AEC_CONTEXT_LINEAR_ONLY };
+    SeRequest req;
+    SeGrid grid;
+    if (!cfg) return -1;
+    memset(&req, 0, sizeof(req));
+    req.sample_rate = cfg->sample_rate;
+    req.fft_size = cfg->fft_size;
+    req.filter_length = cfg->filter_length;
+    req.delay_mode = cfg->delay_mode;
+    req.delay_num_filters = cfg->delay_num_filters;
+    req.fixed_delay_samples = cfg->fixed_delay_samples;
+    req.aec_preset = cfg->aec_preset;
+    return se_derive(&req, &rules, &grid, aec_cfg);
+}
+
+/* Pool bytes of the AEC and the stage (with its error analysis), 0 for a refused config. */
+static int mu_get_mem_requirements(const MonoUlcnetConfig* cfg, MonoUlcnetMemReq* req) {
+    AecConfig aec_cfg;
+    size_t aec_bytes, stage_bytes = ulcnet_nn_stage_mem_size(1);
+    if (!req || mu_lane(cfg, &aec_cfg) != 0) return -1;
+    aec_bytes = aec_get_mem_size(&aec_cfg);
+    if (aec_bytes == 0 || stage_bytes == 0) return -1;
+    req->bytes = (uint64_t)(ALIGN16(aec_bytes) + ALIGN16(stage_bytes));
+    return 0;
+}
+
+static MonoUlcnet* mu_wrap(Aec* aec, void* stage_mem, size_t stage_bytes, const MonoUlcnetConfig* cfg,
+                           MonoUlcnet* p) {
+    p->aec = aec;
+    p->stage = aec ? ulcnet_nn_stage_init(stage_mem, stage_bytes, 1) : NULL;
+    if (!p->stage || ulcnet_nn_stage_set_model(p->stage, &cfg->model) != 0) return NULL;
+    return p;
+}
+
+/* A fresh instance in one block of `bytes` at `pool` (AEC first, then the stage). */
+static MonoUlcnet* mu_init(void* pool, size_t bytes, const MonoUlcnetConfig* cfg) {
+    AecConfig aec_cfg;
+    MonoUlcnetMemReq req;
+    MonoUlcnet* p;
+    size_t aec_bytes;
+    if (!pool || mu_get_mem_requirements(cfg, &req) != 0 || bytes < req.bytes) return NULL;
+    if (mu_lane(cfg, &aec_cfg) != 0) return NULL;
+    aec_bytes = aec_get_mem_size(&aec_cfg);
+    p = (MonoUlcnet*)calloc(1, sizeof(*p));
+    if (!p) return NULL;
+    if (!mu_wrap(aec_init(pool, aec_bytes, &aec_cfg), (uint8_t*)pool + ALIGN16(aec_bytes),
+                 ulcnet_nn_stage_mem_size(1), cfg, p)) {
+        free(p);
+        return NULL;
+    }
+    return p;
+}
+
+/* A fresh instance from separate allocations (the heap path). */
+static MonoUlcnet* mu_create(const MonoUlcnetConfig* cfg) {
+    AecConfig aec_cfg;
+    MonoUlcnet* p;
+    size_t stage_bytes = ulcnet_nn_stage_mem_size(1);
+    if (mu_lane(cfg, &aec_cfg) != 0) return NULL;
+    p = (MonoUlcnet*)calloc(1, sizeof(*p));
+    if (!p) return NULL;
+    p->heap_aec = (Aec*)calloc(1, sizeof(Aec));
+    if (!p->heap_aec || aec_create(p->heap_aec, &aec_cfg) != 0 ||
+        posix_memalign(&p->heap_stage_mem, 16, stage_bytes) != 0) {
+        p->heap_stage_mem = NULL;
+        free(p->heap_aec);
+        free(p);
+        return NULL;
+    }
+    memset(p->heap_stage_mem, 0x5A, stage_bytes);
+    if (!mu_wrap(p->heap_aec, p->heap_stage_mem, stage_bytes, cfg, p)) {
+        aec_destroy(p->heap_aec);
+        free(p->heap_aec);
+        free(p->heap_stage_mem);
+        free(p);
+        return NULL;
+    }
+    return p;
+}
+
+static void mu_destroy(MonoUlcnet* p) {
+    if (!p) return;
+    if (p->aec) aec_destroy(p->aec);
+    free(p->heap_aec);
+    free(p->heap_stage_mem);
+    free(p);
+}
+
+static int mu_hop_size(const MonoUlcnet* p) { return p ? ULCNET_HOP : -1; }
+static Aec* mu_get_aec(const MonoUlcnet* p) { return p ? p->aec : NULL; }
+
+static void mu_reset(MonoUlcnet* p) {
+    if (!p) return;
+    aec_reset(p->aec);
+    ulcnet_nn_stage_reset(p->stage);
+}
+
+/* AEC, then the stage's begin with the lane's formed hop, the raw reference and the alignment
+ * events (changed = CHANGED, solid = not UNLOCKED). */
+static int mu_process_begin(MonoUlcnet* p, const float* mic, const float* ref) {
+    AecResContext rctx;
+    AecLinearContext lctx;
+    UlcnetNnDelay delay;
+    if (!p || !mic || !ref) return -1;
+    aec_process_context(p->aec, mic, ref);
+    aec_get_res_context(p->aec, &rctx);
+    aec_get_linear_context(p->aec, &lctx);
+    delay.changed = lctx.delay_state == AEC_LINEAR_DELAY_CHANGED;
+    delay.solid = lctx.delay_state != AEC_LINEAR_DELAY_UNLOCKED;
+    return ulcnet_nn_stage_begin_time(p->stage, rctx.formed_hop, ref, delay) == 0 ? 0 : -1;
+}
+
+static int mu_nn_begin(MonoUlcnet* p, UlcnetNnJob* job) {
+    int r;
+    if (!p || !job) return -1;
+    r = ulcnet_nn_stage_nn_begin(p->stage, job);
+    return r < 0 ? -1 : r;
+}
+
+static int mu_nn_end(MonoUlcnet* p, int model_rc) {
+    return p && ulcnet_nn_stage_nn_end(p->stage, model_rc) == 0 ? 0 : -1;
+}
+
+static int mu_process_end(MonoUlcnet* p, float* out) {
+    return p && out && ulcnet_nn_stage_end(p->stage, out) == 0 ? 0 : -1;
+}
+
+/* The whole hop with the installed model (identity when unset). */
+static int mu_process(MonoUlcnet* p, const float* mic, const float* ref, float* out) {
+    if (!p || !mic || !ref || !out) return -1;
+    if (mu_process_begin(p, mic, ref) != 0) return -1;
+    return ulcnet_nn_stage_process(p->stage, out) == 0 ? 0 : -1;
 }
 
 
@@ -56,7 +234,7 @@ static const char* fmt_msg(const char* fmt, ...) {
  * exactly three on the 48 kHz product grid. */
 #define DELAY_RATE_FACTOR (ULCNET_SR / 16000)
 
-/* ---- LCG synthetic generator (mirrors test_audio_pipeline.c) ---- */
+/* ---- LCG synthetic generator (as the other mono tests) ---- */
 static uint32_t lcg_state;
 static float lcg_sample(void) {
     lcg_state = lcg_state * 1664525u + 1013904223u;
@@ -93,9 +271,9 @@ static void echo_sim_hop(EchoSim* s, float* mic, float* ref) {
     }
 }
 
-static AecLinearDelayState pipeline_delay_state(const AudioPipelineUlcnet* p) {
+static AecLinearDelayState pipeline_delay_state(const MonoUlcnet* p) {
     AecLinearContext lctx;
-    aec_get_linear_context(audio_pipeline_ulcnet_get_aec(p), &lctx);
+    aec_get_linear_context(mu_get_aec(p), &lctx);
     return lctx.delay_state;
 }
 
@@ -121,11 +299,11 @@ static int reprime_take(int* armed, int frames) {
  * ========================================================================= */
 static void test_identity_e2e(void) {
     enum { N = 100 };
-    AudioPipelineUlcnetConfig cfg = audio_pipeline_ulcnet_default_config(ULCNET_SR);
-    AudioPipelineUlcnet* p = audio_pipeline_ulcnet_create(&cfg);
+    MonoUlcnetConfig cfg = mu_default_config(ULCNET_SR);
+    MonoUlcnet* p = mu_create(&cfg);
     if (!p) { fprintf(stderr, "FAIL: setup (create) for identity E2E test\n"); g_failures++; return; }
 
-    CHECK(audio_pipeline_ulcnet_hop_size(p) == HOP,
+    CHECK(mu_hop_size(p) == HOP,
           fmt_msg("hop_size accessor reports the compiled ULCNet hop (%d)", HOP));
 
     float mic[HOP], ref[HOP];
@@ -135,11 +313,11 @@ static void test_identity_e2e(void) {
 
     for (int h = 0; h < N; h++) {
         echo_sim_hop(&sim, mic, ref);
-        audio_pipeline_ulcnet_process(p, mic, ref, out_hist[h]);
+        mu_process(p, mic, ref, out_hist[h]);
         /* Read the tap AFTER process, BEFORE the next AEC call — the seam
          * pointers alias AEC-internal buffers valid until then. */
         AecResContext rctx;
-        aec_get_res_context(audio_pipeline_ulcnet_get_aec(p), &rctx);
+        aec_get_res_context(mu_get_aec(p), &rctx);
         memcpy(formed_hist[h], rctx.formed_hop, sizeof(formed_hist[h]));
     }
 
@@ -162,12 +340,12 @@ static void test_identity_e2e(void) {
     CHECK(max_sig > 1e-4,
           fmt_msg("identity E2E carries real signal (max |out| = %.3e), not silence", max_sig));
 
-    audio_pipeline_ulcnet_destroy(p);
+    mu_destroy(p);
 }
 
 /* =========================================================================
  * 2. counting model, bulk-delay echo (UNLOCKED -> CHANGED -> LOCKED). infer is stepped
- *    for every emitted frame except the AUDIO_PIPELINE_ULCNET_REPRIME_FRAMES identity
+ *    for every emitted frame except the ULCNET_NN_STAGE_REPRIME_FRAMES identity
  *    frames after each CHANGED hop; model->reset fires once per CHANGED hop plus once
  *    per pipeline reset. The expectation is built hop by hop from that policy, so a
  *    missing or an over-long reprime fails.
@@ -197,13 +375,13 @@ static void test_counting_model(void) {
     enum { N = 200 };
     CountingModelState st = {0, 0};
 
-    AudioPipelineUlcnetConfig cfg = audio_pipeline_ulcnet_default_config(ULCNET_SR);
+    MonoUlcnetConfig cfg = mu_default_config(ULCNET_SR);
     cfg.model.user  = &st;
     cfg.model.infer = counting_infer;
     cfg.model.io_descriptor = test_io_descriptor();
     cfg.model.reset = counting_reset;
 
-    AudioPipelineUlcnet* p = audio_pipeline_ulcnet_create(&cfg);
+    MonoUlcnet* p = mu_create(&cfg);
     if (!p) { fprintf(stderr, "FAIL: setup (create) for counting-model test\n"); g_failures++; return; }
 
     float mic[HOP], ref[HOP], out[HOP];
@@ -217,10 +395,10 @@ static void test_counting_model(void) {
     for (int h = 0; h < N; h++) {
         int frames, skipped_here;
         echo_sim_hop(&sim, mic, ref);
-        audio_pipeline_ulcnet_process(p, mic, ref, out);
+        mu_process(p, mic, ref, out);
         AecLinearDelayState ds = pipeline_delay_state(p);
         if (ds == AEC_LINEAR_DELAY_CHANGED)
-            armed = AUDIO_PIPELINE_ULCNET_REPRIME_FRAMES;
+            armed = ULCNET_NN_STAGE_REPRIME_FRAMES;
         frames = frames_at_hop(h);
         skipped_here = reprime_take(&armed, frames);
         skipped_total += skipped_here;
@@ -241,9 +419,9 @@ static void test_counting_model(void) {
           fmt_msg("counting model: one infer per emitted frame at every hop except the "
                   "%d reprime frames per alignment generation "
                   "(%d calls after %d hops, %d skipped, first bad hop %d [-1=none])",
-                  (int)AUDIO_PIPELINE_ULCNET_REPRIME_FRAMES,
+                  (int)ULCNET_NN_STAGE_REPRIME_FRAMES,
                   st.infer_calls, N, skipped_total, first_bad_hop));
-    CHECK(skipped_total == n_changed * AUDIO_PIPELINE_ULCNET_REPRIME_FRAMES &&
+    CHECK(skipped_total == n_changed * ULCNET_NN_STAGE_REPRIME_FRAMES &&
           skipped_total > 0,
           fmt_msg("counting model: the reprime really ran (%d frames skipped over %d "
                   "generations) -- compute DROPS on those frames, never doubles",
@@ -256,33 +434,33 @@ static void test_counting_model(void) {
                   st.reset_calls, n_changed));
 
     int resets_before = st.reset_calls;
-    audio_pipeline_ulcnet_reset(p);
+    mu_reset(p);
     CHECK(st.reset_calls == resets_before + 1,
-          "audio_pipeline_ulcnet_reset invokes model->reset exactly once");
+          "mu_reset invokes model->reset exactly once");
 
     int calls_before = st.infer_calls;
     echo_sim_hop(&sim, mic, ref);
-    audio_pipeline_ulcnet_process(p, mic, ref, out);
+    mu_process(p, mic, ref, out);
     int hop0_zero = 1;
     for (int i = 0; i < HOP; i++) if (out[i] != 0.0f) hop0_zero = 0;
     CHECK(st.infer_calls == calls_before + 1 && hop0_zero,
           "after pipeline reset the next hop is hop #0 again: one inference "
           "(like every hop), all-zero output (synthesis preamble)");
 
-    audio_pipeline_ulcnet_destroy(p);
+    mu_destroy(p);
 }
 
 /* FIXED has no estimator generation event: its seam is raw while the alignment ring
- * fills, then aligned. The wrapper must still reset the model at that boundary.
+ * fills, then aligned. The composition must still reset the model at that boundary.
  * The far branch carries real noise, so "UNLOCKED means the RAW far" is asserted
  * byte-exactly against the caller's far history on every fill hop, and the shifted
  * content the same way from the first LOCKED hop on. */
 static void test_fixed_first_alignment_resets_model(void) {
     enum { FIXED_DELAY = 2 * HOP, N = 8 };
-    AudioPipelineUlcnetConfig cfg =
-        audio_pipeline_ulcnet_default_config(ULCNET_SR);
+    MonoUlcnetConfig cfg =
+        mu_default_config(ULCNET_SR);
     CountingModelState st = {0, 0};
-    AudioPipelineUlcnet* p;
+    MonoUlcnet* p;
     float mic[HOP] = {0};
     float ref[HOP];
     float out[HOP];
@@ -300,7 +478,7 @@ static void test_fixed_first_alignment_resets_model(void) {
     cfg.model.infer = counting_infer;
     cfg.model.io_descriptor = test_io_descriptor();
     cfg.model.reset = counting_reset;
-    p = audio_pipeline_ulcnet_create(&cfg);
+    p = mu_create(&cfg);
     if (!p) {
         fprintf(stderr, "FAIL: setup fixed-delay transition test\n");
         g_failures++;
@@ -313,12 +491,12 @@ static void test_fixed_first_alignment_resets_model(void) {
         AecLinearContext lctx;
         for (int i = 0; i < HOP; ++i) ref[i] = lcg_sample();
         memcpy(ref_hist[h], ref, sizeof(ref));
-        CHECK(audio_pipeline_ulcnet_process(p, mic, ref, out) == 0,
+        CHECK(mu_process(p, mic, ref, out) == 0,
               "FIXED transition frame processes");
         state = pipeline_delay_state(p);
         /* The far tap aliases AEC-internal memory valid only until the next
          * aec call, so it is read here, right after process. */
-        aec_get_linear_context(audio_pipeline_ulcnet_get_aec(p), &lctx);
+        aec_get_linear_context(mu_get_aec(p), &lctx);
         if (state == AEC_LINEAR_DELAY_CHANGED) changed++;
         if (state == AEC_LINEAR_DELAY_LOCKED && first_locked < 0)
             first_locked = h;
@@ -351,17 +529,17 @@ static void test_fixed_first_alignment_resets_model(void) {
                   "fixed_delay_samples (%d locked hops, first mismatch %d "
                   "[-1=none])", shifted_hops, shifted_mismatch));
     CHECK(st.reset_calls == 1,
-          fmt_msg("wrapper resets model exactly once when FIXED switches from "
+          fmt_msg("the model is reset exactly once when FIXED switches from "
                   "raw to aligned far (got %d)", st.reset_calls));
     /* The transition suppresses inference for the identity reprime and for
      * nothing else: N hops emit N frames, of which exactly
-     * AUDIO_PIPELINE_ULCNET_REPRIME_FRAMES straddle the switch. */
-    CHECK(st.infer_calls == N - AUDIO_PIPELINE_ULCNET_REPRIME_FRAMES,
+     * ULCNET_NN_STAGE_REPRIME_FRAMES straddle the switch. */
+    CHECK(st.infer_calls == N - ULCNET_NN_STAGE_REPRIME_FRAMES,
           fmt_msg("FIXED transition suppresses inference for exactly the %d "
                   "straddling frames and no others (%d calls over %d emitted "
-                  "frames)", (int)AUDIO_PIPELINE_ULCNET_REPRIME_FRAMES,
+                  "frames)", (int)ULCNET_NN_STAGE_REPRIME_FRAMES,
                   st.infer_calls, N));
-    audio_pipeline_ulcnet_destroy(p);
+    mu_destroy(p);
 }
 
 /* =========================================================================
@@ -370,11 +548,11 @@ static void test_fixed_first_alignment_resets_model(void) {
  *     LOCKED(V) -> forced UNLOCKED for several hops -> LOCKED(V) issues exactly one
  *     model->reset, on the relock hop. Same contract as the 4ch twin test.
  *     MUTATION: removing the `delay_state == AEC_LINEAR_DELAY_CHANGED` model reset in
- *     audio_pipeline_ulcnet.c turns this test red.
+ *     samples/ulcnet_nn_stage.c turns this test red.
  * ========================================================================= */
-static int pipeline_delay_samples(const AudioPipelineUlcnet* p) {
+static int pipeline_delay_samples(const MonoUlcnet* p) {
     AecLinearContext lctx;
-    aec_get_linear_context(audio_pipeline_ulcnet_get_aec(p), &lctx);
+    aec_get_linear_context(mu_get_aec(p), &lctx);
     return lctx.delay_samples;
 }
 
@@ -383,13 +561,13 @@ static void test_relock_same_delay_resets_model(void) {
     const int bulk_delay = 64 * DELAY_RATE_FACTOR;
     CountingModelState st = {0, 0};
 
-    AudioPipelineUlcnetConfig cfg = audio_pipeline_ulcnet_default_config(ULCNET_SR);
+    MonoUlcnetConfig cfg = mu_default_config(ULCNET_SR);
     cfg.model.user  = &st;
     cfg.model.infer = counting_infer;
     cfg.model.io_descriptor = test_io_descriptor();
     cfg.model.reset = counting_reset;
 
-    AudioPipelineUlcnet* p = audio_pipeline_ulcnet_create(&cfg);
+    MonoUlcnet* p = mu_create(&cfg);
     if (!p) { fprintf(stderr, "FAIL: setup (create) for mono relock test\n"); g_failures++; return; }
 
     float mic[HOP], ref[HOP], out[HOP];
@@ -410,12 +588,12 @@ static void test_relock_same_delay_resets_model(void) {
              * own). The stimulus continues unchanged, so the AEC re-acquires
              * the very same bulk delay. */
             resets_before_reset = st.reset_calls;
-            audio_pipeline_ulcnet_reset(p);
+            mu_reset(p);
             resets_at_pipeline_reset = st.reset_calls;
             echo_sim_init(&sim, bulk_delay, 0xC0FFEEu);
         }
         echo_sim_hop(&sim, mic, ref);
-        audio_pipeline_ulcnet_process(p, mic, ref, out);
+        mu_process(p, mic, ref, out);
 
         AecLinearDelayState ds = pipeline_delay_state(p);
         int locked = (ds == AEC_LINEAR_DELAY_LOCKED ||
@@ -466,7 +644,7 @@ static void test_relock_same_delay_resets_model(void) {
           fmt_msg("mono relock: the stream goes on running locked after the relock (%d hops)",
                   applied_after_relock));
 
-    audio_pipeline_ulcnet_destroy(p);
+    mu_destroy(p);
 }
 
 /* =========================================================================
@@ -500,19 +678,19 @@ static void test_fail_open_and_delay_gating(void) {
     enum { N = 200, FAIL_LEN = 8, FAIL_GAP = 10 };
     FailModelState st = {0};
 
-    AudioPipelineUlcnetConfig cfg_a = audio_pipeline_ulcnet_default_config(ULCNET_SR);
+    MonoUlcnetConfig cfg_a = mu_default_config(ULCNET_SR);
     cfg_a.model.user  = &st;
     cfg_a.model.infer = failing_infer;
     cfg_a.model.io_descriptor = test_io_descriptor();
-    AudioPipelineUlcnetConfig cfg_b = audio_pipeline_ulcnet_default_config(ULCNET_SR); /* NULL model */
+    MonoUlcnetConfig cfg_b = mu_default_config(ULCNET_SR); /* NULL model */
 
-    AudioPipelineUlcnet* pa = audio_pipeline_ulcnet_create(&cfg_a);
-    AudioPipelineUlcnet* pb = audio_pipeline_ulcnet_create(&cfg_b);
+    MonoUlcnet* pa = mu_create(&cfg_a);
+    MonoUlcnet* pb = mu_create(&cfg_b);
     if (!pa || !pb) {
         fprintf(stderr, "FAIL: setup (create) for fail-open test\n");
         g_failures++;
-        if (pa) audio_pipeline_ulcnet_destroy(pa);
-        if (pb) audio_pipeline_ulcnet_destroy(pb);
+        if (pa) mu_destroy(pa);
+        if (pb) mu_destroy(pb);
         return;
     }
 
@@ -533,8 +711,8 @@ static void test_fail_open_and_delay_gating(void) {
         if (st.fail_now) n_failing++;
 
         echo_sim_hop(&sim, mic, ref);
-        audio_pipeline_ulcnet_process(pa, mic, ref, out_a);
-        audio_pipeline_ulcnet_process(pb, mic, ref, out_b);
+        mu_process(pa, mic, ref, out_a);
+        mu_process(pb, mic, ref, out_b);
 
         AecLinearDelayState ds_a = pipeline_delay_state(pa);
         AecLinearDelayState ds_b = pipeline_delay_state(pb);
@@ -551,7 +729,7 @@ static void test_fail_open_and_delay_gating(void) {
          * region (lock_hop >= 2, asserted below), so one reprime frame is
          * consumed per hop here. */
         if (ds_a == AEC_LINEAR_DELAY_CHANGED)
-            reprime_left = AUDIO_PIPELINE_ULCNET_REPRIME_FRAMES;
+            reprime_left = ULCNET_NN_STAGE_REPRIME_FRAMES;
         {
             int reprimed = reprime_take(&reprime_left, 1);
             ident[h] = st.fail_now || reprimed > 0;
@@ -579,7 +757,7 @@ static void test_fail_open_and_delay_gating(void) {
                   "and the reprime lands in the steady 1-frame-per-hop region",
                   lock_hop, MAX_LOCK_HOPS));
     CHECK(n_unlocked >= 2 && n_failing == FAIL_LEN &&
-          n_reprime_hops == AUDIO_PIPELINE_ULCNET_REPRIME_FRAMES,
+          n_reprime_hops == ULCNET_NN_STAGE_REPRIME_FRAMES,
           fmt_msg("coverage: %d UNLOCKED hops, %d scheduled infer failures, %d reprime "
                   "identity frames", n_unlocked, n_failing, n_reprime_hops));
     CHECK(states_ok, "model presence does not perturb the AEC (identical delay states A vs B)");
@@ -592,98 +770,15 @@ static void test_fail_open_and_delay_gating(void) {
                   "with a successful model frame (first bad hop %d [-1=none])",
                   n_differ_hops, first_bad_differ));
 
-    audio_pipeline_ulcnet_destroy(pa);
-    audio_pipeline_ulcnet_destroy(pb);
-}
-
-/* =========================================================================
- * 4a. reject-first config validation (mirrors test_config_validation_rejects)
- * ========================================================================= */
-static void test_config_validation_rejects(void) {
-    AudioPipelineUlcnetMemReq req;
-
-    CHECK(audio_pipeline_ulcnet_get_mem_requirements(NULL, &req) == -1,
-          "get_mem_requirements rejects a NULL config");
-
-    AudioPipelineUlcnetConfig good = audio_pipeline_ulcnet_default_config(ULCNET_SR);
-    CHECK(good.sample_rate == ULCNET_SR && good.fft_size == ULCNET_N_FFT,
-          fmt_msg("default config is the compiled %d Hz / frame-FFT %d / hop %d grid",
-                  ULCNET_SR, ULCNET_N_FFT, ULCNET_HOP));
-    CHECK(audio_pipeline_ulcnet_get_mem_requirements(&good, NULL) == -1,
-          "get_mem_requirements rejects a NULL out-param");
-
-    static const int bad_rates[] = {8000, 44100, ULCNET_OTHER_SR};
-    for (int i = 0; i < 3; i++) {
-        AudioPipelineUlcnetConfig c = audio_pipeline_ulcnet_default_config(bad_rates[i]);
-        CHECK(audio_pipeline_ulcnet_get_mem_requirements(&c, &req) == -1,
-              fmt_msg("get_mem_requirements rejects sample_rate=%d (compiled ULCNet rate differs)",
-                      bad_rates[i]));
-    }
-
-    AudioPipelineUlcnetConfig bad_fft = audio_pipeline_ulcnet_default_config(ULCNET_SR);
-    bad_fft.fft_size = ULCNET_OTHER_N_FFT;   /* legal elsewhere — NOT on this grid */
-    CHECK(audio_pipeline_ulcnet_get_mem_requirements(&bad_fft, &req) == -1,
-          fmt_msg("get_mem_requirements rejects fft_size=%d (compiled ULCNet grid is %d)",
-                  ULCNET_OTHER_N_FFT, ULCNET_N_FFT));
-
-    AudioPipelineUlcnetConfig bad_preset = audio_pipeline_ulcnet_default_config(ULCNET_SR);
-    bad_preset.aec_preset = (AecPreset)99;
-    CHECK(audio_pipeline_ulcnet_get_mem_requirements(&bad_preset, &req) == -1,
-          "get_mem_requirements rejects an out-of-enum aec_preset");
-
-    AudioPipelineUlcnetConfig matched2 =
-        audio_pipeline_ulcnet_default_config(ULCNET_SR);
-    AudioPipelineUlcnetConfig external = matched2;
-    AudioPipelineUlcnetMemReq matched_req, external_req;
-    matched2.delay_num_filters = 2;
-    external.delay_mode = AEC_DELAY_EXTERNAL_ALIGNED;
-    external.delay_num_filters = 5;
-    CHECK(audio_pipeline_ulcnet_get_mem_requirements(&matched2, &matched_req) == 0 &&
-          audio_pipeline_ulcnet_get_mem_requirements(&external, &external_req) == 0 &&
-          matched_req.bytes > external_req.bytes,
-          "ULCNet wrapper passes AEC delay configuration into pool sizing");
-
-    AudioPipelineUlcnetMemReq req0, req_explicit;
-    AudioPipelineUlcnetConfig c0 = audio_pipeline_ulcnet_default_config(ULCNET_SR);
-    AudioPipelineUlcnetConfig c_explicit = audio_pipeline_ulcnet_default_config(ULCNET_SR);
-    c0.fft_size = 0;  /* 0 resolves to the compiled grid */
-    c_explicit.fft_size = ULCNET_N_FFT;
-    CHECK(audio_pipeline_ulcnet_get_mem_requirements(&c0, &req0) == 0 &&
-          audio_pipeline_ulcnet_get_mem_requirements(&c_explicit, &req_explicit) == 0 &&
-          req0.bytes == req_explicit.bytes && req0.bytes > 0,
-          fmt_msg("fft_size=0 resolves to the same descriptor as the explicit %d",
-                  ULCNET_N_FFT));
-    printf("       (descriptor: descriptor_version=%u bytes=%llu alignment=%u "
-           "layout_version=%u backend_id=%u build_flags_hash=0x%08x)\n",
-           req0.descriptor_version, (unsigned long long)req0.bytes, req0.alignment,
-           req0.layout_version, req0.backend_id, req0.build_flags_hash);
-
-    /* Same rejections on the init() entry point (one shared gate). */
-    void* pool = NULL;
-    if (posix_memalign(&pool, 16, (size_t)req0.bytes) != 0 || !pool) {
-        fprintf(stderr, "FAIL: pool alloc for config-validation init test\n");
-        g_failures++;
-        return;
-    }
-    AudioPipelineUlcnetConfig bad_init = audio_pipeline_ulcnet_default_config(ULCNET_SR);
-    bad_init.fft_size = ULCNET_OTHER_N_FFT;
-    CHECK(audio_pipeline_ulcnet_init(pool, (size_t)req0.bytes, &bad_init) == NULL,
-          fmt_msg("audio_pipeline_ulcnet_init rejects fft_size=%d too", ULCNET_OTHER_N_FFT));
-    AudioPipelineUlcnetConfig bad_init_rate = audio_pipeline_ulcnet_default_config(ULCNET_OTHER_SR);
-    CHECK(audio_pipeline_ulcnet_init(pool, (size_t)req0.bytes, &bad_init_rate) == NULL,
-          fmt_msg("audio_pipeline_ulcnet_init rejects sample_rate=%d too", ULCNET_OTHER_SR));
-
-    AudioPipelineUlcnet* p_ok = audio_pipeline_ulcnet_init(pool, (size_t)req0.bytes, &good);
-    CHECK(p_ok != NULL, "pool is still usable via a valid config after rejected init() attempts");
-    if (p_ok) audio_pipeline_ulcnet_destroy(p_ok);
-    free(pool);
+    mu_destroy(pa);
+    mu_destroy(pb);
 }
 
 /* =========================================================================
  * 10. far-input contract gate: a model that publishes a model-I/O
- * descriptor may only be wired to a pipeline whose far branch matches the
+ * descriptor may only be wired to a stage whose far branch matches the
  * checkpoint the descriptor describes. Both directions are checked, on
- * every entry point that funnels through the shared config gate.
+ * every construction path of the composition.
  * ========================================================================= */
 static int gate_infer_identity(void* user,
                                const float er[ULCNET_BINS], const float ei[ULCNET_BINS],
@@ -697,8 +792,9 @@ static int gate_infer_identity(void* user,
 
 static void test_raw_descriptor_gate(void) {
     UlcnetModelIoDescriptor raw_desc, aligned_desc;
-    AudioPipelineUlcnetMemReq req;
+    MonoUlcnetMemReq req;
     void* pool = NULL;
+    MonoUlcnet* p;
 
     if (ulcnet_model_io_descriptor_default(8, &raw_desc) != 0 ||
         ulcnet_model_io_descriptor_default(8, &aligned_desc) != 0) {
@@ -711,188 +807,130 @@ static void test_raw_descriptor_gate(void) {
           "descriptor_default publishes the fixed raw-far contract");
 
     /* An undescribed model remains valid for the identity/test boundary. */
-    AudioPipelineUlcnetConfig undescribed = audio_pipeline_ulcnet_default_config(ULCNET_SR);
+    MonoUlcnetConfig undescribed = mu_default_config(ULCNET_SR);
     undescribed.model.user = NULL;
     undescribed.model.infer = gate_infer_identity;
-    undescribed.model.io_descriptor = test_io_descriptor();
     undescribed.model.reset = NULL;
     undescribed.model.io_descriptor = NULL;
     /* An INFERRING model must publish a descriptor: its delay depth and
      * history shapes are what the host-side rings are carved from, and a
      * disagreement with the graph is undetectable downstream. An identity
      * model -- no infer callback -- has no shapes to agree about. */
-    CHECK(audio_pipeline_ulcnet_get_mem_requirements(&undescribed, &req) == -1,
-          "an INFERRING model with io_descriptor == NULL is refused");
+    p = mu_create(&undescribed);
+    CHECK(p == NULL, "an INFERRING model with io_descriptor == NULL is refused");
+    mu_destroy(p);
     {
-        AudioPipelineUlcnetConfig identity_only = undescribed;
+        MonoUlcnetConfig identity_only = undescribed;
         identity_only.model.infer = NULL;
-        CHECK(audio_pipeline_ulcnet_get_mem_requirements(&identity_only, &req) == 0,
-              "an identity model (no infer) may still leave the descriptor NULL");
+        p = mu_create(&identity_only);
+        CHECK(p != NULL, "an identity model (no infer) may still leave the descriptor NULL");
+        mu_destroy(p);
     }
     undescribed.model.io_descriptor = test_io_descriptor();
 
-    AudioPipelineUlcnetConfig raw_model = undescribed;
+    MonoUlcnetConfig raw_model = undescribed;
     raw_model.model.io_descriptor = &raw_desc;
-    CHECK(audio_pipeline_ulcnet_get_mem_requirements(&raw_model, &req) == 0,
-          "raw descriptor is accepted");
+    p = mu_create(&raw_model);
+    CHECK(p != NULL, "raw descriptor is accepted");
+    mu_destroy(p);
 
-    AudioPipelineUlcnetConfig aligned_model = undescribed;
+    MonoUlcnetConfig aligned_model = undescribed;
     aligned_model.model.io_descriptor = &aligned_desc;
-    CHECK(audio_pipeline_ulcnet_get_mem_requirements(&aligned_model, &req) == -1,
-          "aligned-far descriptor is rejected");
+    p = mu_create(&aligned_model);
+    CHECK(p == NULL, "aligned-far descriptor is rejected");
+    mu_destroy(p);
 
-    /* init/init_ex/create share the gate, so the mismatch is fail-fast on
-     * every construction path, not only on the sizing query. */
-    if (audio_pipeline_ulcnet_get_mem_requirements(&raw_model, &req) != 0 ||
+    /* The one-block construction shares the gate, so the mismatch is fail-fast on
+     * both construction paths. */
+    if (mu_get_mem_requirements(&raw_model, &req) != 0 ||
         posix_memalign(&pool, 16, (size_t)req.bytes) != 0 || !pool) {
         fprintf(stderr, "FAIL: pool alloc for far-mode gate test\n");
         g_failures++;
         return;
     }
-    CHECK(audio_pipeline_ulcnet_init(pool, (size_t)req.bytes, &aligned_model) == NULL,
-          "audio_pipeline_ulcnet_init rejects aligned descriptor too");
-    CHECK(audio_pipeline_ulcnet_init_ex(pool, (size_t)req.bytes, &aligned_model, NULL) == NULL,
-          "audio_pipeline_ulcnet_init_ex rejects aligned descriptor too");
-    CHECK(audio_pipeline_ulcnet_create(&aligned_model) == NULL,
-          "audio_pipeline_ulcnet_create rejects aligned descriptor too");
+    CHECK(mu_init(pool, (size_t)req.bytes, &aligned_model) == NULL,
+          "mu_init rejects aligned descriptor too");
 
-    AudioPipelineUlcnet* p_ok =
-        audio_pipeline_ulcnet_init(pool, (size_t)req.bytes, &raw_model);
-    CHECK(p_ok != NULL, "raw descriptor initializes in the same pool");
-    if (p_ok) audio_pipeline_ulcnet_destroy(p_ok);
+    p = mu_init(pool, (size_t)req.bytes, &raw_model);
+    CHECK(p != NULL, "raw descriptor initializes in the same pool");
+    mu_destroy(p);
     free(pool);
 }
 
 /* =========================================================================
- * 4b. pool rejection (mirrors test_pool_rejection)
+ * The grid and the pool plan of the composition: the lane refuses what is not the compiled grid, the delay request reaches the
+ * AEC pool size, and the stage and AEC blocks are refused when misaligned or short.
  * ========================================================================= */
-static void test_pool_rejection(void) {
-    AudioPipelineUlcnetConfig cfg = audio_pipeline_ulcnet_default_config(ULCNET_SR);
-    AudioPipelineUlcnetMemReq req;
-    if (audio_pipeline_ulcnet_get_mem_requirements(&cfg, &req) != 0) {
-        fprintf(stderr, "FAIL: setup (get_mem_requirements) for pool-rejection test\n");
-        g_failures++;
-        return;
+static void test_grid_and_pool_plan(void) {
+    MonoUlcnetMemReq req;
+    MonoUlcnetConfig good = mu_default_config(ULCNET_SR);
+    static const int bad_rates[] = {8000, 44100, ULCNET_OTHER_SR};
+
+    CHECK(good.sample_rate == ULCNET_SR && good.fft_size == ULCNET_N_FFT,
+          fmt_msg("default config is the compiled %d Hz / frame-FFT %d / hop %d grid",
+                  ULCNET_SR, ULCNET_N_FFT, ULCNET_HOP));
+    CHECK(mu_get_mem_requirements(NULL, &req) == -1 && mu_get_mem_requirements(&good, NULL) == -1,
+          "the plan rejects NULL arguments");
+    for (int i = 0; i < 3; i++) {
+        MonoUlcnetConfig c = mu_default_config(bad_rates[i]);
+        CHECK(mu_get_mem_requirements(&c, &req) == -1,
+              fmt_msg("the lane rejects sample_rate=%d (compiled ULCNet rate differs)", bad_rates[i]));
+    }
+    {
+        MonoUlcnetConfig bad_fft = mu_default_config(ULCNET_SR);
+        bad_fft.fft_size = ULCNET_OTHER_N_FFT;   /* legal elsewhere -- NOT on this grid */
+        CHECK(mu_get_mem_requirements(&bad_fft, &req) == -1,
+              fmt_msg("the lane rejects fft_size=%d (compiled ULCNet grid is %d)",
+                      ULCNET_OTHER_N_FFT, ULCNET_N_FFT));
+    }
+    {
+        MonoUlcnetConfig bad_preset = mu_default_config(ULCNET_SR);
+        bad_preset.aec_preset = (AecPreset)99;
+        CHECK(mu_get_mem_requirements(&bad_preset, &req) == -1,
+              "the lane rejects an out-of-enum aec_preset");
+    }
+    {
+        MonoUlcnetConfig matched2 = mu_default_config(ULCNET_SR);
+        MonoUlcnetConfig external = matched2;
+        MonoUlcnetMemReq matched_req, external_req;
+        matched2.delay_num_filters = 2;
+        external.delay_mode = AEC_DELAY_EXTERNAL_ALIGNED;
+        external.delay_num_filters = 5;
+        CHECK(mu_get_mem_requirements(&matched2, &matched_req) == 0 &&
+              mu_get_mem_requirements(&external, &external_req) == 0 &&
+              matched_req.bytes > external_req.bytes,
+              "the AEC delay configuration reaches the pool size");
+    }
+    {
+        MonoUlcnetMemReq req0, req_explicit;
+        MonoUlcnetConfig c0 = mu_default_config(ULCNET_SR);
+        c0.fft_size = 0;  /* 0 resolves to the compiled grid */
+        CHECK(mu_get_mem_requirements(&c0, &req0) == 0 &&
+              mu_get_mem_requirements(&good, &req_explicit) == 0 &&
+              req0.bytes == req_explicit.bytes && req0.bytes > 0,
+              fmt_msg("fft_size=0 resolves to the same pool as the explicit %d", ULCNET_N_FFT));
     }
 
-    /* +16 headroom so the misaligned base+1 probe is never an OOB setup. */
-    void* pool = NULL;
-    if (posix_memalign(&pool, 16, (size_t)req.bytes + 16) != 0 || !pool) {
-        fprintf(stderr, "FAIL: pool alloc for pool-rejection test\n");
-        g_failures++;
-        return;
+    /* Pool plan: a misaligned or short block is refused, the exact block accepted, and the
+     * block stays usable after the refusals. */
+    {
+        void* pool = NULL;
+        MonoUlcnet* p;
+        CHECK(mu_get_mem_requirements(&good, &req) == 0 &&
+              posix_memalign(&pool, 16, (size_t)req.bytes + 16) == 0 && pool,
+              "pool plan: the block allocates");
+        if (pool) {
+            memset(pool, 0xA5, (size_t)req.bytes + 16);
+            CHECK(mu_init((uint8_t*)pool + 1, (size_t)req.bytes, &good) == NULL,
+                  "init rejects a misaligned (base+1) pool");
+            CHECK(mu_init(pool, (size_t)req.bytes - 1, &good) == NULL,
+                  "init rejects an undersized (bytes-1) pool");
+            p = mu_init(pool, (size_t)req.bytes, &good);
+            CHECK(p != NULL, "init accepts a correctly aligned/sized pool");
+            mu_destroy(p);
+            free(pool);
+        }
     }
-
-    CHECK(audio_pipeline_ulcnet_init((uint8_t*)pool + 1, (size_t)req.bytes, &cfg) == NULL,
-          "audio_pipeline_ulcnet_init rejects a misaligned (base+1) pool");
-    CHECK(audio_pipeline_ulcnet_init(pool, (size_t)req.bytes - 1, &cfg) == NULL,
-          "audio_pipeline_ulcnet_init rejects an undersized (bytes-1) pool");
-
-    AudioPipelineUlcnet* p_ok = audio_pipeline_ulcnet_init(pool, (size_t)req.bytes, &cfg);
-    CHECK(p_ok != NULL, "audio_pipeline_ulcnet_init accepts a correctly aligned/sized pool");
-    if (p_ok) audio_pipeline_ulcnet_destroy(p_ok);
-    free(pool);
-}
-
-/* =========================================================================
- * 4c. init_ex 8-point descriptor gate (mirrors test_init_ex_descriptor)
- * ========================================================================= */
-static void test_init_ex_descriptor(void) {
-    AudioPipelineUlcnetConfig cfg = audio_pipeline_ulcnet_default_config(ULCNET_SR);
-    AudioPipelineUlcnetMemReq req;
-    if (audio_pipeline_ulcnet_get_mem_requirements(&cfg, &req) != 0) {
-        fprintf(stderr, "FAIL: setup (get_mem_requirements) for init_ex descriptor test\n");
-        g_failures++;
-        return;
-    }
-    void* pool = NULL;
-    if (posix_memalign(&pool, (size_t)req.alignment, (size_t)req.bytes) != 0 || !pool) {
-        fprintf(stderr, "FAIL: pool alloc for init_ex descriptor test\n");
-        g_failures++;
-        return;
-    }
-
-    AudioPipelineUlcnet* p_ok = audio_pipeline_ulcnet_init_ex(pool, (size_t)req.bytes, &cfg, &req);
-    CHECK(p_ok != NULL, "init_ex accepts a correct/current descriptor");
-    if (p_ok) audio_pipeline_ulcnet_destroy(p_ok);
-
-    AudioPipelineUlcnet* p_null = audio_pipeline_ulcnet_init_ex(pool, (size_t)req.bytes, &cfg, NULL);
-    CHECK(p_null != NULL, "init_ex(expected=NULL) accepts, same as init");
-    if (p_null) audio_pipeline_ulcnet_destroy(p_null);
-
-    AudioPipelineUlcnetMemReq bad;
-
-    bad = req; bad.descriptor_version = req.descriptor_version + 1;
-    CHECK(audio_pipeline_ulcnet_init_ex(pool, (size_t)req.bytes, &cfg, &bad) == NULL,
-          "init_ex rejects a tampered descriptor_version");
-
-    bad = req; bad.layout_version = req.layout_version + 1;
-    CHECK(audio_pipeline_ulcnet_init_ex(pool, (size_t)req.bytes, &cfg, &bad) == NULL,
-          "init_ex rejects a tampered layout_version");
-
-    bad = req; bad.backend_id = 99u;
-    CHECK(audio_pipeline_ulcnet_init_ex(pool, (size_t)req.bytes, &cfg, &bad) == NULL,
-          "init_ex rejects a tampered backend_id");
-
-    bad = req; bad.build_flags_hash = req.build_flags_hash ^ 0xFFFFFFFFu;
-    CHECK(audio_pipeline_ulcnet_init_ex(pool, (size_t)req.bytes, &cfg, &bad) == NULL,
-          "init_ex rejects a tampered build_flags_hash");
-
-    bad = req; bad.alignment = req.alignment * 2u;
-    CHECK(audio_pipeline_ulcnet_init_ex(pool, (size_t)req.bytes, &cfg, &bad) == NULL,
-          "init_ex rejects a tampered alignment");
-
-    bad = req; bad.reserved = 1u;
-    CHECK(audio_pipeline_ulcnet_init_ex(pool, (size_t)req.bytes, &cfg, &bad) == NULL,
-          "init_ex rejects a nonzero reserved field");
-
-    bad = req; bad.bytes = req.bytes - 1u;
-    CHECK(audio_pipeline_ulcnet_init_ex(pool, (size_t)req.bytes, &cfg, &bad) == NULL,
-          "init_ex rejects expected->bytes smaller than the current requirement");
-
-    CHECK(audio_pipeline_ulcnet_init_ex(pool, (size_t)req.bytes - 1u, &cfg, &req) == NULL,
-          "init_ex rejects an undersized pool even with a correct descriptor");
-
-    AudioPipelineUlcnet* p_final = audio_pipeline_ulcnet_init_ex(pool, (size_t)req.bytes, &cfg, &req);
-    CHECK(p_final != NULL, "pool is still usable via init_ex after rejected attempts");
-    if (p_final) audio_pipeline_ulcnet_destroy(p_final);
-    free(pool);
-}
-
-/* =========================================================================
- * 4d. destroy idempotence (pool instance) + pool reuse
- * ========================================================================= */
-static void test_destroy_idempotence(void) {
-    AudioPipelineUlcnetConfig cfg = audio_pipeline_ulcnet_default_config(ULCNET_SR);
-    AudioPipelineUlcnetMemReq req;
-    if (audio_pipeline_ulcnet_get_mem_requirements(&cfg, &req) != 0) {
-        fprintf(stderr, "FAIL: setup for destroy-idempotence test\n");
-        g_failures++;
-        return;
-    }
-    void* pool = NULL;
-    if (posix_memalign(&pool, (size_t)req.alignment, (size_t)req.bytes) != 0 || !pool) {
-        fprintf(stderr, "FAIL: pool alloc for destroy-idempotence test\n");
-        g_failures++;
-        return;
-    }
-    AudioPipelineUlcnet* p = audio_pipeline_ulcnet_init(pool, (size_t)req.bytes, &cfg);
-    if (!p) {
-        fprintf(stderr, "FAIL: init for destroy-idempotence test\n");
-        g_failures++;
-        free(pool);
-        return;
-    }
-    audio_pipeline_ulcnet_destroy(p);
-    audio_pipeline_ulcnet_destroy(p);      /* second call on the same pool instance */
-    audio_pipeline_ulcnet_destroy(NULL);   /* NULL-safe */
-    printf("PASS: audio_pipeline_ulcnet_destroy is idempotent (2x) and NULL-safe on a "
-           "pool-resident instance\n");
-
-    AudioPipelineUlcnet* p2 = audio_pipeline_ulcnet_init(pool, (size_t)req.bytes, &cfg);
-    CHECK(p2 != NULL, "pool is reusable via a fresh init after destroy");
-    if (p2) audio_pipeline_ulcnet_destroy(p2);
-    free(pool);
 }
 
 /* =========================================================================
@@ -902,28 +940,28 @@ static void test_destroy_idempotence(void) {
  * ========================================================================= */
 static void test_create_vs_init_parity(void) {
     enum { N = 300 };
-    AudioPipelineUlcnetConfig cfg = audio_pipeline_ulcnet_default_config(ULCNET_SR);
-    AudioPipelineUlcnetMemReq req;
-    if (audio_pipeline_ulcnet_get_mem_requirements(&cfg, &req) != 0) {
+    MonoUlcnetConfig cfg = mu_default_config(ULCNET_SR);
+    MonoUlcnetMemReq req;
+    if (mu_get_mem_requirements(&cfg, &req) != 0) {
         fprintf(stderr, "FAIL: setup for create-vs-init parity test\n");
         g_failures++;
         return;
     }
 
-    AudioPipelineUlcnet* p_heap = audio_pipeline_ulcnet_create(&cfg);
+    MonoUlcnet* p_heap = mu_create(&cfg);
     void* pool = NULL;
-    if (!p_heap || posix_memalign(&pool, (size_t)req.alignment, (size_t)req.bytes) != 0 || !pool) {
+    if (!p_heap || posix_memalign(&pool, 16, (size_t)req.bytes) != 0 || !pool) {
         fprintf(stderr, "FAIL: setup alloc for create-vs-init parity test\n");
         g_failures++;
-        if (p_heap) audio_pipeline_ulcnet_destroy(p_heap);
+        if (p_heap) mu_destroy(p_heap);
         return;
     }
     memset(pool, 0xA5, (size_t)req.bytes);   /* dirty pool: init must not rely on zeros */
-    AudioPipelineUlcnet* p_pool = audio_pipeline_ulcnet_init(pool, (size_t)req.bytes, &cfg);
+    MonoUlcnet* p_pool = mu_init(pool, (size_t)req.bytes, &cfg);
     if (!p_pool) {
         fprintf(stderr, "FAIL: init on a poisoned (0xA5) pool\n");
         g_failures++;
-        audio_pipeline_ulcnet_destroy(p_heap);
+        mu_destroy(p_heap);
         free(pool);
         return;
     }
@@ -935,12 +973,12 @@ static void test_create_vs_init_parity(void) {
     echo_sim_init(&sim, ECHO_DELAY, 0xC0FFEEu);
     for (int h = 0; h < N; h++) {
         echo_sim_hop(&sim, mic, ref);
-        audio_pipeline_ulcnet_process(p_heap, mic, ref, out_heap[h]);
+        mu_process(p_heap, mic, ref, out_heap[h]);
     }
     echo_sim_init(&sim, ECHO_DELAY, 0xC0FFEEu);
     for (int h = 0; h < N; h++) {
         echo_sim_hop(&sim, mic, ref);
-        audio_pipeline_ulcnet_process(p_pool, mic, ref, out_pool[h]);
+        mu_process(p_pool, mic, ref, out_pool[h]);
     }
 
     CHECK(memcmp(out_heap, out_pool, sizeof(out_heap)) == 0,
@@ -952,8 +990,8 @@ static void test_create_vs_init_parity(void) {
             if (out_heap[h][i] != out_heap[h][i]) { finite = 0; break; }
     CHECK(finite, fmt_msg("%d-hop synthetic run produces no NaN in the output", N));
 
-    audio_pipeline_ulcnet_destroy(p_heap);
-    audio_pipeline_ulcnet_destroy(p_pool);
+    mu_destroy(p_heap);
+    mu_destroy(p_pool);
     free(pool);
 }
 
@@ -966,20 +1004,20 @@ static void test_null_model_equals_identity_model(void) {
     enum { N = 200 };
     CountingModelState st = {0, 0};
 
-    AudioPipelineUlcnetConfig cfg_null = audio_pipeline_ulcnet_default_config(ULCNET_SR);
-    AudioPipelineUlcnetConfig cfg_id   = audio_pipeline_ulcnet_default_config(ULCNET_SR);
+    MonoUlcnetConfig cfg_null = mu_default_config(ULCNET_SR);
+    MonoUlcnetConfig cfg_id   = mu_default_config(ULCNET_SR);
     cfg_id.model.user  = &st;
     cfg_id.model.infer = counting_infer;   /* copies err -> out, returns 0 */
     cfg_id.model.io_descriptor = test_io_descriptor();
     cfg_id.model.reset = counting_reset;
 
-    AudioPipelineUlcnet* pn = audio_pipeline_ulcnet_create(&cfg_null);
-    AudioPipelineUlcnet* pi = audio_pipeline_ulcnet_create(&cfg_id);
+    MonoUlcnet* pn = mu_create(&cfg_null);
+    MonoUlcnet* pi = mu_create(&cfg_id);
     if (!pn || !pi) {
         fprintf(stderr, "FAIL: setup (create) for NULL-vs-identity test\n");
         g_failures++;
-        if (pn) audio_pipeline_ulcnet_destroy(pn);
-        if (pi) audio_pipeline_ulcnet_destroy(pi);
+        if (pn) mu_destroy(pn);
+        if (pi) mu_destroy(pi);
         return;
     }
 
@@ -990,8 +1028,8 @@ static void test_null_model_equals_identity_model(void) {
     int equal = 1, first_bad = -1, saw_locked = 0, n_changed = 0;
     for (int h = 0; h < N; h++) {
         echo_sim_hop(&sim, mic, ref);
-        audio_pipeline_ulcnet_process(pn, mic, ref, out_n);
-        audio_pipeline_ulcnet_process(pi, mic, ref, out_i);
+        mu_process(pn, mic, ref, out_n);
+        mu_process(pi, mic, ref, out_i);
         if (memcmp(out_n, out_i, sizeof(out_n)) != 0 && equal) { equal = 0; first_bad = h; }
         if (pipeline_delay_state(pi) != AEC_LINEAR_DELAY_UNLOCKED) saw_locked = 1;
         if (pipeline_delay_state(pi) == AEC_LINEAR_DELAY_CHANGED) n_changed++;
@@ -1004,21 +1042,21 @@ static void test_null_model_equals_identity_model(void) {
     /* Stepped on every emitted frame except the reprime frames -- which are
      * identity frames too, so the bit-identity above is unaffected by them. */
     CHECK(st.infer_calls ==
-          N - n_changed * AUDIO_PIPELINE_ULCNET_REPRIME_FRAMES,
+          N - n_changed * ULCNET_NN_STAGE_REPRIME_FRAMES,
           fmt_msg("identity model was stepped on every frame except the %d reprime "
                   "frames of its %d alignment generations (%d calls)",
-                  (int)AUDIO_PIPELINE_ULCNET_REPRIME_FRAMES, n_changed,
+                  (int)ULCNET_NN_STAGE_REPRIME_FRAMES, n_changed,
                   st.infer_calls));
 
-    audio_pipeline_ulcnet_destroy(pn);
-    audio_pipeline_ulcnet_destroy(pi);
+    mu_destroy(pn);
+    mu_destroy(pi);
 }
 
 /* =========================================================================
  * 6. far-timestamp after fixed-delay acquisition. A far-passthrough model, silence on
  *    the mic and one unit impulse in far at sample T: the mono far tap is same-hop
  *    with the error tap and the chain lags the input by one hop, so the impulse must
- *    land at exactly T + HOP. A wrapper feeding AEC's aligned far would move it by
+ *    land at exactly T + HOP. Feeding the AEC's aligned far would move it by
  *    FIXED_DELAY.
  * ========================================================================= */
 static int passthrough_far_infer(void* user,
@@ -1036,12 +1074,12 @@ static void test_raw_far_timestamp_after_fixed_delay_lock(void) {
     const int imp_index = IMP_HOP * HOP + IMP_OFF;
     const int expect_index = imp_index + HOP;   /* same-hop far tap + 1-hop chain */
 
-    AudioPipelineUlcnetConfig cfg = audio_pipeline_ulcnet_default_config(ULCNET_SR);
+    MonoUlcnetConfig cfg = mu_default_config(ULCNET_SR);
     cfg.delay_mode = AEC_DELAY_FIXED;
     cfg.fixed_delay_samples = FIXED_DELAY;
     cfg.model.infer = passthrough_far_infer;
     cfg.model.io_descriptor = test_io_descriptor();
-    AudioPipelineUlcnet* p = audio_pipeline_ulcnet_create(&cfg);
+    MonoUlcnet* p = mu_create(&cfg);
     if (!p) { fprintf(stderr, "FAIL: setup (create) for far-timestamp test\n"); g_failures++; return; }
 
     float mic[HOP], ref[HOP];
@@ -1050,7 +1088,7 @@ static void test_raw_far_timestamp_after_fixed_delay_lock(void) {
         memset(mic, 0, sizeof(mic));
         memset(ref, 0, sizeof(ref));
         if (h == IMP_HOP) ref[IMP_OFF] = 1.0f;
-        audio_pipeline_ulcnet_process(p, mic, ref, out_hist[h]);
+        mu_process(p, mic, ref, out_hist[h]);
     }
 
     int   found_index = -1;
@@ -1069,7 +1107,7 @@ static void test_raw_far_timestamp_after_fixed_delay_lock(void) {
     CHECK(peak > 0.9f,
           fmt_msg("far impulse reconstructed at ~unit amplitude (peak %.4f)", peak));
 
-    audio_pipeline_ulcnet_destroy(p);
+    mu_destroy(p);
 }
 
 /* =========================================================================
@@ -1093,18 +1131,18 @@ static int halving_infer(void* user,
 
 static void test_model_applies_unlocked(void) {
     enum { N = 30 };
-    AudioPipelineUlcnetConfig cfg_raw = audio_pipeline_ulcnet_default_config(ULCNET_SR);
+    MonoUlcnetConfig cfg_raw = mu_default_config(ULCNET_SR);
     cfg_raw.model.infer = halving_infer;
     cfg_raw.model.io_descriptor = test_io_descriptor();
-    AudioPipelineUlcnetConfig cfg_null = audio_pipeline_ulcnet_default_config(ULCNET_SR);
+    MonoUlcnetConfig cfg_null = mu_default_config(ULCNET_SR);
 
-    AudioPipelineUlcnet* pr = audio_pipeline_ulcnet_create(&cfg_raw);
-    AudioPipelineUlcnet* pn = audio_pipeline_ulcnet_create(&cfg_null);
+    MonoUlcnet* pr = mu_create(&cfg_raw);
+    MonoUlcnet* pn = mu_create(&cfg_null);
     if (!pr || !pn) {
         fprintf(stderr, "FAIL: setup (create) for unlocked-model test\n");
         g_failures++;
-        if (pr) audio_pipeline_ulcnet_destroy(pr);
-        if (pn) audio_pipeline_ulcnet_destroy(pn);
+        if (pr) mu_destroy(pr);
+        if (pn) mu_destroy(pn);
         return;
     }
 
@@ -1115,8 +1153,8 @@ static void test_model_applies_unlocked(void) {
     int applied_from_hop1 = 1, first_equal_hop = -1, all_unlocked_seen = 1;
     for (int h = 0; h < N; h++) {
         echo_sim_hop(&sim, mic, ref);
-        audio_pipeline_ulcnet_process(pr, mic, ref, out_r);
-        audio_pipeline_ulcnet_process(pn, mic, ref, out_n);
+        mu_process(pr, mic, ref, out_r);
+        mu_process(pn, mic, ref, out_n);
         if (h == 0) {
             int zero = 1;
             for (int i = 0; i < HOP; i++) if (out_r[i] != 0.0f) zero = 0;
@@ -1137,8 +1175,8 @@ static void test_model_applies_unlocked(void) {
                   "delay lock (output != NULL-model on every hop >= 1; first equal "
                   "hop %d [-1=none])", first_equal_hop));
 
-    audio_pipeline_ulcnet_destroy(pr);
-    audio_pipeline_ulcnet_destroy(pn);
+    mu_destroy(pr);
+    mu_destroy(pn);
 }
 
 /* =========================================================================
@@ -1175,19 +1213,19 @@ static void test_nan_guard(void) {
     enum { N = 60 };
     NanModelState st = {0};
 
-    AudioPipelineUlcnetConfig cfg_a = audio_pipeline_ulcnet_default_config(ULCNET_SR);
+    MonoUlcnetConfig cfg_a = mu_default_config(ULCNET_SR);
     cfg_a.model.user  = &st;
     cfg_a.model.infer = nan_infer;
     cfg_a.model.io_descriptor = test_io_descriptor();
-    AudioPipelineUlcnetConfig cfg_b = audio_pipeline_ulcnet_default_config(ULCNET_SR);
+    MonoUlcnetConfig cfg_b = mu_default_config(ULCNET_SR);
 
-    AudioPipelineUlcnet* pa = audio_pipeline_ulcnet_create(&cfg_a);
-    AudioPipelineUlcnet* pb = audio_pipeline_ulcnet_create(&cfg_b);
+    MonoUlcnet* pa = mu_create(&cfg_a);
+    MonoUlcnet* pb = mu_create(&cfg_b);
     if (!pa || !pb) {
         fprintf(stderr, "FAIL: setup (create) for NaN-guard test\n");
         g_failures++;
-        if (pa) audio_pipeline_ulcnet_destroy(pa);
-        if (pb) audio_pipeline_ulcnet_destroy(pb);
+        if (pa) mu_destroy(pa);
+        if (pb) mu_destroy(pb);
         return;
     }
 
@@ -1206,8 +1244,8 @@ static void test_nan_guard(void) {
         poisoned[h] = st.poison_now;
 
         echo_sim_hop(&sim, mic, ref);
-        audio_pipeline_ulcnet_process(pa, mic, ref, out_a);
-        audio_pipeline_ulcnet_process(pb, mic, ref, out_b);
+        mu_process(pa, mic, ref, out_a);
+        mu_process(pb, mic, ref, out_b);
         if (pipeline_delay_state(pa) == AEC_LINEAR_DELAY_CHANGED) n_changed++;
 
         for (int i = 0; i < HOP; i++)
@@ -1246,8 +1284,8 @@ static void test_nan_guard(void) {
                   "pipeline on all %d hops with a clean applied frame (first bad "
                   "hop %d [-1=none])", n_differ, first_bad_differ));
 
-    audio_pipeline_ulcnet_destroy(pa);
-    audio_pipeline_ulcnet_destroy(pb);
+    mu_destroy(pa);
+    mu_destroy(pb);
 }
 
 /* =========================================================================
@@ -1282,19 +1320,19 @@ static void test_partial_write_guard(void) {
     enum { N = 60 };
     PartialModelState st = {0};
 
-    AudioPipelineUlcnetConfig cfg_a = audio_pipeline_ulcnet_default_config(ULCNET_SR);
+    MonoUlcnetConfig cfg_a = mu_default_config(ULCNET_SR);
     cfg_a.model.user  = &st;
     cfg_a.model.infer = partial_write_infer;
     cfg_a.model.io_descriptor = test_io_descriptor();
-    AudioPipelineUlcnetConfig cfg_b = audio_pipeline_ulcnet_default_config(ULCNET_SR);
+    MonoUlcnetConfig cfg_b = mu_default_config(ULCNET_SR);
 
-    AudioPipelineUlcnet* pa = audio_pipeline_ulcnet_create(&cfg_a);
-    AudioPipelineUlcnet* pb = audio_pipeline_ulcnet_create(&cfg_b);
+    MonoUlcnet* pa = mu_create(&cfg_a);
+    MonoUlcnet* pb = mu_create(&cfg_b);
     if (!pa || !pb) {
         fprintf(stderr, "FAIL: setup (create) for partial-write test\n");
         g_failures++;
-        if (pa) audio_pipeline_ulcnet_destroy(pa);
-        if (pb) audio_pipeline_ulcnet_destroy(pb);
+        if (pa) mu_destroy(pa);
+        if (pb) mu_destroy(pb);
         return;
     }
 
@@ -1313,8 +1351,8 @@ static void test_partial_write_guard(void) {
         partial[h] = st.partial_now;
 
         echo_sim_hop(&sim, mic, ref);
-        audio_pipeline_ulcnet_process(pa, mic, ref, out_a);
-        audio_pipeline_ulcnet_process(pb, mic, ref, out_b);
+        mu_process(pa, mic, ref, out_a);
+        mu_process(pb, mic, ref, out_b);
         if (pipeline_delay_state(pa) == AEC_LINEAR_DELAY_CHANGED) n_changed++;
 
         for (int i = 0; i < HOP; i++)
@@ -1352,8 +1390,8 @@ static void test_partial_write_guard(void) {
                   "pipeline on all %d hops with a clean applied frame (first bad "
                   "hop %d [-1=none])", n_differ, first_bad_differ));
 
-    audio_pipeline_ulcnet_destroy(pa);
-    audio_pipeline_ulcnet_destroy(pb);
+    mu_destroy(pa);
+    mu_destroy(pb);
 }
 
 /* 11. Identity-reprime straddle derivation: per branch, how many frames emitted at or after
@@ -1361,7 +1399,7 @@ static void test_partial_write_guard(void) {
  *     One unit impulse at the middle of hop T-1 (window weight 0.707 in both covering
  *     frames) is marked on the error or the far branch in separate runs. The count comes
  *     from a boundary-free control (FIXED delay 0, no reprime armed). The boundary run
- *     (FIXED delay = T hops) must skip exactly AUDIO_PIPELINE_ULCNET_REPRIME_FRAMES frames,
+ *     (FIXED delay = T hops) must skip exactly ULCNET_NN_STAGE_REPRIME_FRAMES frames,
  *     at hops T.., and the first frame the model then sees must be marker-free on both
  *     branches. MUTATION: no reprime, or one frame too few, turns that red. */
 enum {
@@ -1423,8 +1461,8 @@ static void probe_reset(void* user) { ((ProbeModelState*)user)->resets++; }
  * fixed_delay == RP_T*HOP puts the FIXED raw->aligned switch on hop RP_T.
  * mark_far selects which branch carries the impulse. */
 static int reprime_probe_run(int fixed_delay, int mark_far, ProbeModelState* st) {
-    AudioPipelineUlcnetConfig cfg = audio_pipeline_ulcnet_default_config(ULCNET_SR);
-    AudioPipelineUlcnet* p;
+    MonoUlcnetConfig cfg = mu_default_config(ULCNET_SR);
+    MonoUlcnet* p;
     float mic[HOP], ref[HOP], out[HOP];
 
     memset(st, 0, sizeof(*st));
@@ -1434,7 +1472,7 @@ static int reprime_probe_run(int fixed_delay, int mark_far, ProbeModelState* st)
     cfg.model.infer = probe_infer;
     cfg.model.io_descriptor = test_io_descriptor();
     cfg.model.reset = probe_reset;
-    p = audio_pipeline_ulcnet_create(&cfg);
+    p = mu_create(&cfg);
     if (!p) return -1;
 
     for (int h = 0; h < RP_RUN; h++) {
@@ -1445,9 +1483,9 @@ static int reprime_probe_run(int fixed_delay, int mark_far, ProbeModelState* st)
             else          mic[RP_MARK_POS] = 1.0f;
         }
         st->hop = h;
-        audio_pipeline_ulcnet_process(p, mic, ref, out);
+        mu_process(p, mic, ref, out);
     }
-    audio_pipeline_ulcnet_destroy(p);
+    mu_destroy(p);
     return 0;
 }
 
@@ -1511,12 +1549,12 @@ static void test_reprime_straddle_derivation(void) {
     printf("reprime derivation (mono, ERROR branch): %d straddling frames at hops "
            "%d..%d; marked peak >= %.4f, unmarked peak <= %.3e\n",
            straddle_err, RP_T, RP_T + RP_WINDOW - 1, dmin, cmax);
-    CHECK(straddle_err >= AUDIO_PIPELINE_ULCNET_REPRIME_FRAMES,
+    CHECK(straddle_err >= ULCNET_NN_STAGE_REPRIME_FRAMES,
           fmt_msg("mono ERROR branch: chain memory of %d frames from hop %d on is at "
-                  "least AUDIO_PIPELINE_ULCNET_REPRIME_FRAMES (%d) -- it carries the "
+                  "least ULCNET_NN_STAGE_REPRIME_FRAMES (%d) -- it carries the "
                   "AEC filter tail on top of the straddle, so it bounds rather than "
                   "derives it", straddle_err, RP_T,
-                  (int)AUDIO_PIPELINE_ULCNET_REPRIME_FRAMES));
+                  (int)ULCNET_NN_STAGE_REPRIME_FRAMES));
     /* No absolute floor on dmin here: the impulse arrives spread by the AEC
      * filter, so its peak is grid-dependent. The separation ratio is what
      * makes the classification sound. */
@@ -1531,22 +1569,22 @@ static void test_reprime_straddle_derivation(void) {
            straddle_far, RP_T, RP_T + RP_WINDOW - 1, dmin, cmax);
     /* The unfiltered branch IS the derivation: no filter tail, so its chain
      * memory is the window straddle and nothing else. */
-    CHECK(straddle_far == AUDIO_PIPELINE_ULCNET_REPRIME_FRAMES,
+    CHECK(straddle_far == ULCNET_NN_STAGE_REPRIME_FRAMES,
           fmt_msg("mono FAR branch: %d emitted frames from hop %d on still contain "
-                  "pre-switch samples == AUDIO_PIPELINE_ULCNET_REPRIME_FRAMES (%d)",
-                  straddle_far, RP_T, (int)AUDIO_PIPELINE_ULCNET_REPRIME_FRAMES));
+                  "pre-switch samples == ULCNET_NN_STAGE_REPRIME_FRAMES (%d)",
+                  straddle_far, RP_T, (int)ULCNET_NN_STAGE_REPRIME_FRAMES));
     CHECK(straddle_far > 0 && dmin > 20.0f * cmax && dmin > 0.5f,
           fmt_msg("mono FAR branch marker is unambiguous (marked %.4f vs unmarked "
                   "%.3e, ratio %.1fx)", dmin, cmax,
                   cmax > 0.0f ? (double)(dmin / cmax) : 1e30));
 
-    /* ---- the boundary runs: the wrapper skips exactly those frames ---- */
+    /* ---- the boundary runs: the stage skips exactly those frames ---- */
     CHECK(err_bnd.resets == 1 && far_bnd.resets == 1,
           fmt_msg("boundary run: FIXED raw->aligned switch fired model->reset once "
                   "(err %d, far %d)", err_bnd.resets, far_bnd.resets));
     for (int c = 0; c < err_bnd.calls; c++) {
         if (err_bnd.call_hop[c] >= RP_T &&
-            err_bnd.call_hop[c] < RP_T + AUDIO_PIPELINE_ULCNET_REPRIME_FRAMES)
+            err_bnd.call_hop[c] < RP_T + ULCNET_NN_STAGE_REPRIME_FRAMES)
             stepped_inside_reprime++;
         if (err_bnd.call_hop[c] >= RP_T && first_visible_err < 0) {
             first_visible_err = err_bnd.call_hop[c];
@@ -1555,7 +1593,7 @@ static void test_reprime_straddle_derivation(void) {
     }
     for (int c = 0; c < far_bnd.calls; c++) {
         if (far_bnd.call_hop[c] >= RP_T &&
-            far_bnd.call_hop[c] < RP_T + AUDIO_PIPELINE_ULCNET_REPRIME_FRAMES)
+            far_bnd.call_hop[c] < RP_T + ULCNET_NN_STAGE_REPRIME_FRAMES)
             stepped_inside_reprime++;
         if (far_bnd.call_hop[c] >= RP_T && first_visible_far < 0) {
             first_visible_far = far_bnd.call_hop[c];
@@ -1579,18 +1617,18 @@ static void test_reprime_straddle_derivation(void) {
     CHECK(stepped_inside_reprime == 0,
           fmt_msg("boundary run: the model is not stepped on any hop in [%d, %d) "
                   "(%d stray calls)", RP_T,
-                  RP_T + (int)AUDIO_PIPELINE_ULCNET_REPRIME_FRAMES,
+                  RP_T + (int)ULCNET_NN_STAGE_REPRIME_FRAMES,
                   stepped_inside_reprime));
-    CHECK(first_visible_err == RP_T + AUDIO_PIPELINE_ULCNET_REPRIME_FRAMES &&
-          first_visible_far == RP_T + AUDIO_PIPELINE_ULCNET_REPRIME_FRAMES,
+    CHECK(first_visible_err == RP_T + ULCNET_NN_STAGE_REPRIME_FRAMES &&
+          first_visible_far == RP_T + ULCNET_NN_STAGE_REPRIME_FRAMES,
           fmt_msg("boundary run: stepping resumes on hop %d (err) / %d (far), "
                   "expected %d", first_visible_err, first_visible_far,
-                  RP_T + (int)AUDIO_PIPELINE_ULCNET_REPRIME_FRAMES));
-    CHECK(err_bnd.calls == expected_frames - AUDIO_PIPELINE_ULCNET_REPRIME_FRAMES &&
-          far_bnd.calls == expected_frames - AUDIO_PIPELINE_ULCNET_REPRIME_FRAMES,
+                  RP_T + (int)ULCNET_NN_STAGE_REPRIME_FRAMES));
+    CHECK(err_bnd.calls == expected_frames - ULCNET_NN_STAGE_REPRIME_FRAMES &&
+          far_bnd.calls == expected_frames - ULCNET_NN_STAGE_REPRIME_FRAMES,
           fmt_msg("boundary run: exactly %d of %d emitted frames skipped inference "
                   "(err %d calls, far %d calls)",
-                  (int)AUDIO_PIPELINE_ULCNET_REPRIME_FRAMES, expected_frames,
+                  (int)ULCNET_NN_STAGE_REPRIME_FRAMES, expected_frames,
                   err_bnd.calls, far_bnd.calls));
 }
 
@@ -1603,8 +1641,8 @@ static void test_reprime_straddle_derivation(void) {
 static void test_reprime_behavior(void) {
     enum { N = 60, FIXED_HOPS = 8 };
     CountingModelState st = {0, 0};
-    AudioPipelineUlcnetConfig cfg = audio_pipeline_ulcnet_default_config(ULCNET_SR);
-    AudioPipelineUlcnet* p;
+    MonoUlcnetConfig cfg = mu_default_config(ULCNET_SR);
+    MonoUlcnet* p;
     float mic[HOP], ref[HOP], out[HOP];
     EchoSim sim;
     int armed = 0, n_changed = 0, skipped_total = 0;
@@ -1617,16 +1655,16 @@ static void test_reprime_behavior(void) {
     cfg.model.infer = counting_infer;
     cfg.model.io_descriptor = test_io_descriptor();
     cfg.model.reset = counting_reset;
-    p = audio_pipeline_ulcnet_create(&cfg);
+    p = mu_create(&cfg);
     if (!p) { fprintf(stderr, "FAIL: setup (create) for reprime behaviour test\n"); g_failures++; return; }
 
     echo_sim_init(&sim, ECHO_DELAY, 0xC0FFEEu);
     for (int h = 0; h < N; h++) {
         calls_before = st.infer_calls;
         echo_sim_hop(&sim, mic, ref);
-        audio_pipeline_ulcnet_process(p, mic, ref, out);
+        mu_process(p, mic, ref, out);
         if (pipeline_delay_state(p) == AEC_LINEAR_DELAY_CHANGED) {
-            armed = AUDIO_PIPELINE_ULCNET_REPRIME_FRAMES;
+            armed = ULCNET_NN_STAGE_REPRIME_FRAMES;
             n_changed++;
             if (boundary_hop < 0) boundary_hop = h;
         }
@@ -1650,25 +1688,25 @@ static void test_reprime_behavior(void) {
           fmt_msg("reprime behaviour (MATCHED): infer is stepped once per emitted frame "
                   "EXCEPT the %d reprime frames after each CHANGED hop "
                   "(first mismatching hop %d [-1=none])",
-                  (int)AUDIO_PIPELINE_ULCNET_REPRIME_FRAMES, first_bad_hop));
-    CHECK(skipped_total == n_changed * AUDIO_PIPELINE_ULCNET_REPRIME_FRAMES &&
+                  (int)ULCNET_NN_STAGE_REPRIME_FRAMES, first_bad_hop));
+    CHECK(skipped_total == n_changed * ULCNET_NN_STAGE_REPRIME_FRAMES &&
           st.infer_calls == N - skipped_total,
           fmt_msg("reprime behaviour (MATCHED): %d frames skipped inference over %d "
                   "generations (%d infer calls in %d hops)",
                   skipped_total, n_changed, st.infer_calls, N));
-    CHECK(resumed_hop == boundary_hop + AUDIO_PIPELINE_ULCNET_REPRIME_FRAMES,
+    CHECK(resumed_hop == boundary_hop + ULCNET_NN_STAGE_REPRIME_FRAMES,
           fmt_msg("reprime behaviour (MATCHED): stepping stops on the boundary hop %d "
                   "and resumes on hop %d (expected %d)", boundary_hop, resumed_hop,
-                  boundary_hop + (int)AUDIO_PIPELINE_ULCNET_REPRIME_FRAMES));
+                  boundary_hop + (int)ULCNET_NN_STAGE_REPRIME_FRAMES));
     CHECK(st.reset_calls == n_changed,
           fmt_msg("reprime behaviour (MATCHED): still exactly one model->reset per "
                   "generation (%d resets, %d generations)", st.reset_calls, n_changed));
-    audio_pipeline_ulcnet_destroy(p);
+    mu_destroy(p);
 
     /* ---- (b) FIXED ring-fill completion ---- */
     {
         CountingModelState fst = {0, 0};
-        AudioPipelineUlcnetConfig fcfg = audio_pipeline_ulcnet_default_config(ULCNET_SR);
+        MonoUlcnetConfig fcfg = mu_default_config(ULCNET_SR);
         int fixed_calls_at_boundary = -1, fixed_calls_after = -1;
         int fixed_boundary = -1;
 
@@ -1678,7 +1716,7 @@ static void test_reprime_behavior(void) {
         fcfg.model.infer = counting_infer;
         fcfg.model.io_descriptor = test_io_descriptor();
         fcfg.model.reset = counting_reset;
-        p = audio_pipeline_ulcnet_create(&fcfg);
+        p = mu_create(&fcfg);
         if (!p) { fprintf(stderr, "FAIL: setup (create) for FIXED reprime test\n"); g_failures++; return; }
 
         lcg_state = 0xA11FEEDu;
@@ -1691,10 +1729,10 @@ static void test_reprime_behavior(void) {
             calls_before = fst.infer_calls;
             memset(mic, 0, sizeof(mic));
             for (int i = 0; i < HOP; i++) ref[i] = lcg_sample();
-            audio_pipeline_ulcnet_process(p, mic, ref, out);
+            mu_process(p, mic, ref, out);
             if (h != 0 && prev == AEC_LINEAR_DELAY_UNLOCKED &&
                 pipeline_delay_state(p) == AEC_LINEAR_DELAY_LOCKED) {
-                armed = AUDIO_PIPELINE_ULCNET_REPRIME_FRAMES;
+                armed = ULCNET_NN_STAGE_REPRIME_FRAMES;
                 fixed_boundary = h;
             }
             frames = frames_at_hop(h);
@@ -1708,31 +1746,31 @@ static void test_reprime_behavior(void) {
             if (fixed_boundary >= 0 && h == fixed_boundary)
                 fixed_calls_at_boundary = delta;
             if (fixed_boundary >= 0 &&
-                h == fixed_boundary + AUDIO_PIPELINE_ULCNET_REPRIME_FRAMES)
+                h == fixed_boundary + ULCNET_NN_STAGE_REPRIME_FRAMES)
                 fixed_calls_after = delta;
         }
 
         CHECK(fixed_boundary == FIXED_HOPS,
               fmt_msg("reprime behaviour (FIXED): the raw->aligned switch is on hop %d "
                       "(expected %d)", fixed_boundary, FIXED_HOPS));
-        CHECK(pattern_ok && skipped_total == AUDIO_PIPELINE_ULCNET_REPRIME_FRAMES,
+        CHECK(pattern_ok && skipped_total == ULCNET_NN_STAGE_REPRIME_FRAMES,
               fmt_msg("reprime behaviour (FIXED): exactly %d frames skipped inference at "
                       "the fill completion (%d skipped, first mismatching hop %d [-1=none])",
-                      (int)AUDIO_PIPELINE_ULCNET_REPRIME_FRAMES, skipped_total,
+                      (int)ULCNET_NN_STAGE_REPRIME_FRAMES, skipped_total,
                       first_bad_hop));
         CHECK(fixed_calls_at_boundary == 0 && fixed_calls_after == 1,
               fmt_msg("reprime behaviour (FIXED): the boundary hop steps the model 0 times "
                       "and hop boundary+%d steps it once (%d then %d)",
-                      (int)AUDIO_PIPELINE_ULCNET_REPRIME_FRAMES,
+                      (int)ULCNET_NN_STAGE_REPRIME_FRAMES,
                       fixed_calls_at_boundary, fixed_calls_after));
         CHECK(fst.reset_calls == 1,
               fmt_msg("reprime behaviour (FIXED): exactly one model->reset (%d)",
                       fst.reset_calls));
-        CHECK(fst.infer_calls == N - AUDIO_PIPELINE_ULCNET_REPRIME_FRAMES,
+        CHECK(fst.infer_calls == N - ULCNET_NN_STAGE_REPRIME_FRAMES,
               fmt_msg("reprime behaviour (FIXED): %d infer calls over %d hops "
                       "(%d emitted frames minus the reprime)",
                       fst.infer_calls, N, N));
-        audio_pipeline_ulcnet_destroy(p);
+        mu_destroy(p);
     }
 }
 
@@ -1771,8 +1809,8 @@ static void mono_known_delay_run(int num_filters, int hops,
                                  int early_delay, float early_gain,
                                  MonoKnownDelayRun* out) {
     const int kd_pad = 16384 * DELAY_RATE_FACTOR;
-    AudioPipelineUlcnetConfig cfg = audio_pipeline_ulcnet_default_config(ULCNET_SR);
-    AudioPipelineUlcnet* p;
+    MonoUlcnetConfig cfg = mu_default_config(ULCNET_SR);
+    MonoUlcnet* p;
     float* far_hist;
     float mic[HOP], ref[HOP], outbuf[HOP];
     clock_t t0, t1;
@@ -1784,11 +1822,11 @@ static void mono_known_delay_run(int num_filters, int hops,
 
     cfg.delay_mode = AEC_DELAY_MATCHED;
     cfg.delay_num_filters = num_filters;
-    p = audio_pipeline_ulcnet_create(&cfg);
+    p = mu_create(&cfg);
     if (!p) return;
 
     far_hist = (float*)malloc((size_t)(hops * HOP + kd_pad) * sizeof(float));
-    if (!far_hist) { audio_pipeline_ulcnet_destroy(p); return; }
+    if (!far_hist) { mu_destroy(p); return; }
     lcg_state = 0xC0FFEEu;
     for (i = 0; i < hops * HOP + kd_pad; i++) far_hist[i] = lcg_sample();
 
@@ -1801,7 +1839,7 @@ static void mono_known_delay_run(int num_filters, int hops,
             mic[i] = dominant_gain * far_hist[t - dominant_delay] +
                      early_gain * far_hist[t - early_delay];
         }
-        audio_pipeline_ulcnet_process(p, mic, ref, outbuf);
+        mu_process(p, mic, ref, outbuf);
         {
             AecLinearDelayState ds = pipeline_delay_state(p);
             if (ds == AEC_LINEAR_DELAY_CHANGED) out->changed_hops++;
@@ -1819,13 +1857,13 @@ static void mono_known_delay_run(int num_filters, int hops,
         : 0.0;
 
     free(far_hist);
-    audio_pipeline_ulcnet_destroy(p);
+    mu_destroy(p);
 }
 
 static void test_known_delay_profile(void) {
     static const int inside_ms[6] = { 0, 125, 221, 317, 413, 509 };
     MonoKnownDelayRun mislock, control, cost;
-    AudioPipelineUlcnetMemReq req[6];
+    MonoUlcnetMemReq req[6];
     int n;
     int mem_ok = 1;
     int mislock_error;
@@ -1905,9 +1943,9 @@ static void test_known_delay_profile(void) {
 
     /* RAM: the per-filter pool cost lands in this single AEC instance. */
     for (n = 1; n <= 5; n++) {
-        AudioPipelineUlcnetConfig cfg = audio_pipeline_ulcnet_default_config(ULCNET_SR);
+        MonoUlcnetConfig cfg = mu_default_config(ULCNET_SR);
         cfg.delay_num_filters = n;
-        if (audio_pipeline_ulcnet_get_mem_requirements(&cfg, &req[n]) != 0)
+        if (mu_get_mem_requirements(&cfg, &req[n]) != 0)
             mem_ok = 0;
     }
     CHECK(mem_ok, "mono pool query answers for every n=1..5");
@@ -1950,7 +1988,7 @@ static void test_known_delay_profile(void) {
 }
 
 /* The phased hop (process_begin / nn_begin / nn_end / process_end) is
- * audio_pipeline_ulcnet_process() with the model call moved out: a twin driven
+ * mu_process() with the model call moved out: a twin driven
  * phase by phase, with the same network run by the caller, reproduces the
  * callback-driven instance byte for byte -- across an alignment boundary (the
  * echo path is delayed, so the reprime hops are part of the claim). The
@@ -1960,11 +1998,11 @@ static void test_known_delay_profile(void) {
 enum { PH_RUN, PH_FAIL, PH_NAN, PH_OPEN, PH_UNFETCHED };
 
 static int phased_twin_matches(int mode, int hops) {
-    AudioPipelineUlcnetConfig cfg = audio_pipeline_ulcnet_default_config(ULCNET_SR);
-    AudioPipelineUlcnetConfig cb_cfg = cfg;
+    MonoUlcnetConfig cfg = mu_default_config(ULCNET_SR);
+    MonoUlcnetConfig cb_cfg = cfg;
     NanModelState nan_state;
     FailModelState fail_state;
-    AudioPipelineUlcnet *ph, *cb;
+    MonoUlcnet *ph, *cb;
     EchoSim sim;
     float mic[ULCNET_HOP], ref[ULCNET_HOP], a[ULCNET_HOP], b[ULCNET_HOP];
     UlcnetNnJob job;
@@ -1981,22 +2019,22 @@ static int phased_twin_matches(int mode, int hops) {
                           : mode == PH_FAIL ? (void*)&fail_state : NULL;
         cb_cfg.model.io_descriptor = test_io_descriptor();
     }
-    ph = audio_pipeline_ulcnet_create(&cfg);
-    cb = audio_pipeline_ulcnet_create(&cb_cfg);
+    ph = mu_create(&cfg);
+    cb = mu_create(&cb_cfg);
     if (!ph || !cb) {
-        audio_pipeline_ulcnet_destroy(ph);
-        audio_pipeline_ulcnet_destroy(cb);
+        mu_destroy(ph);
+        mu_destroy(cb);
         return 0;
     }
     echo_sim_init(&sim, ECHO_DELAY, 0xBEEFu + (uint32_t)mode);
     for (h = 0; h < hops && ok; ++h) {
         int r = 0;
         echo_sim_hop(&sim, mic, ref);
-        ok = audio_pipeline_ulcnet_process(cb, mic, ref, b) == 0 &&
-             audio_pipeline_ulcnet_process_begin(ph, mic, ref) == 0;
+        ok = mu_process(cb, mic, ref, b) == 0 &&
+             mu_process_begin(ph, mic, ref) == 0;
         if (!ok) break;
         if (mode != PH_UNFETCHED) {
-            r = audio_pipeline_ulcnet_nn_begin(ph, &job);
+            r = mu_nn_begin(ph, &job);
             if (r < 0) { ok = 0; break; }
         }
         if (r == 1) {
@@ -2004,30 +2042,30 @@ static int phased_twin_matches(int mode, int hops) {
             if (mode == PH_RUN)
                 ok = halving_infer(NULL, job.err_re, job.err_im, job.far_re, job.far_im,
                                    job.out_re, job.out_im) == 0 &&
-                     audio_pipeline_ulcnet_nn_end(ph, 0) == 0;
+                     mu_nn_end(ph, 0) == 0;
             else if (mode == PH_FAIL)
-                ok = audio_pipeline_ulcnet_nn_end(ph, -1) == 0;
+                ok = mu_nn_end(ph, -1) == 0;
             else if (mode == PH_NAN)
                 ok = nan_infer(&nan_state, job.err_re, job.err_im, job.far_re, job.far_im,
                                job.out_re, job.out_im) == 0 &&
-                     audio_pipeline_ulcnet_nn_end(ph, 0) == 0;
+                     mu_nn_end(ph, 0) == 0;
             /* PH_OPEN: the frame stays open into process_end */
         }
-        ok = ok && audio_pipeline_ulcnet_process_end(ph, a) == 0;
+        ok = ok && mu_process_end(ph, a) == 0;
         if (!ok) break;
         if (memcmp(a, b, sizeof(a)) != 0) ok = 0;
         for (int i = 0; i < ULCNET_HOP; ++i) if (a[i] != 0.0f) nonzero = 1;
     }
-    audio_pipeline_ulcnet_destroy(ph);
-    audio_pipeline_ulcnet_destroy(cb);
+    mu_destroy(ph);
+    mu_destroy(cb);
     /* mode PH_UNFETCHED never fetches; every other mode must have run frames
      * (the first hops after the boundary are reprime and run none). */
     return ok && nonzero && (mode == PH_UNFETCHED || ran > 0);
 }
 
 static void test_phased_hop(void) {
-    AudioPipelineUlcnetConfig cfg = audio_pipeline_ulcnet_default_config(ULCNET_SR);
-    AudioPipelineUlcnet* p = audio_pipeline_ulcnet_create(&cfg);
+    MonoUlcnetConfig cfg = mu_default_config(ULCNET_SR);
+    MonoUlcnet* p = mu_create(&cfg);
     UlcnetNnJob job;
     float mic[ULCNET_HOP] = {0}, ref[ULCNET_HOP] = {0}, out[ULCNET_HOP];
 
@@ -2040,92 +2078,83 @@ static void test_phased_hop(void) {
 
     CHECK(p != NULL, "phased: instance creates");
     if (!p) return;
-    CHECK(audio_pipeline_ulcnet_nn_begin(p, &job) == -1 &&
-          audio_pipeline_ulcnet_nn_end(p, 0) == -1 &&
-          audio_pipeline_ulcnet_process_end(p, out) == -1,
+    CHECK(mu_nn_begin(p, &job) == -1 &&
+          mu_nn_end(p, 0) == -1 &&
+          mu_process_end(p, out) == -1,
           "phased: nn/end calls before process_begin are refused");
-    CHECK(audio_pipeline_ulcnet_process_begin(NULL, mic, ref) == -1 &&
-          audio_pipeline_ulcnet_process_begin(p, NULL, ref) == -1 &&
-          audio_pipeline_ulcnet_process_begin(p, mic, NULL) == -1,
+    CHECK(mu_process_begin(NULL, mic, ref) == -1 &&
+          mu_process_begin(p, NULL, ref) == -1 &&
+          mu_process_begin(p, mic, NULL) == -1,
           "phased: NULL arguments are refused");
-    CHECK(audio_pipeline_ulcnet_process_begin(p, mic, ref) == 0 &&
-          audio_pipeline_ulcnet_process_begin(p, mic, ref) == -1,
+    CHECK(mu_process_begin(p, mic, ref) == 0 &&
+          mu_process_begin(p, mic, ref) == -1,
           "phased: a second process_begin before process_end is refused");
-    CHECK(audio_pipeline_ulcnet_nn_begin(p, &job) == 1 &&
-          audio_pipeline_ulcnet_nn_begin(p, &job) == -1,
+    CHECK(mu_nn_begin(p, &job) == 1 &&
+          mu_nn_begin(p, &job) == -1,
           "phased: one frame per hop; a second nn_begin is refused while it is open");
-    CHECK(audio_pipeline_ulcnet_nn_end(p, 0) == 0 &&
-          audio_pipeline_ulcnet_nn_end(p, 0) == -1 &&
-          audio_pipeline_ulcnet_nn_begin(p, &job) == 0,
+    CHECK(mu_nn_end(p, 0) == 0 &&
+          mu_nn_end(p, 0) == -1 &&
+          mu_nn_begin(p, &job) == 0,
           "phased: nn_end closes the frame; none is left in this hop");
-    CHECK(audio_pipeline_ulcnet_process_end(p, out) == 0 &&
-          audio_pipeline_ulcnet_process_end(p, out) == -1,
+    CHECK(mu_process_end(p, out) == 0 &&
+          mu_process_end(p, out) == -1,
           "phased: process_end closes the hop; a second one is refused");
-    audio_pipeline_ulcnet_destroy(p);
+    mu_destroy(p);
 }
 
 int main(void) {
-    printf("=== audio_pipeline_ulcnet: identity E2E (one-hop latency) ===\n");
+    printf("=== mono_alignulcnet: identity E2E (one-hop latency) ===\n");
     test_identity_e2e();
 
-    printf("\n=== audio_pipeline_ulcnet: counting model (stepping + reset policy) ===\n");
+    printf("\n=== mono_alignulcnet: counting model (stepping + reset policy) ===\n");
     test_counting_model();
 
-    printf("\n=== audio_pipeline_ulcnet: same-delay relock resets the model ===\n");
+    printf("\n=== mono_alignulcnet: same-delay relock resets the model ===\n");
     test_relock_same_delay_resets_model();
 
     /* Grid-relative (2 * HOP), so it runs everywhere. */
-    printf("\n=== audio_pipeline_ulcnet: FIXED first alignment resets the model ===\n");
+    printf("\n=== mono_alignulcnet: FIXED first alignment resets the model ===\n");
     test_fixed_first_alignment_resets_model();
 
     /* The far branch derives REPRIME_FRAMES exactly; the error branch only bounds it
      * (its marker carries the AEC filter's causal tail). */
-    printf("\n=== audio_pipeline_ulcnet: identity-reprime straddle derivation ===\n");
+    printf("\n=== mono_alignulcnet: identity-reprime straddle derivation ===\n");
     test_reprime_straddle_derivation();
 
-    printf("\n=== audio_pipeline_ulcnet: identity-reprime behaviour ===\n");
+    printf("\n=== mono_alignulcnet: identity-reprime behaviour ===\n");
     test_reprime_behavior();
 
-    printf("\n=== audio_pipeline_ulcnet: fail-open callback handling ===\n");
+    printf("\n=== mono_alignulcnet: fail-open callback handling ===\n");
     test_fail_open_and_delay_gating();
 
-    printf("\n=== audio_pipeline_ulcnet: config validation ===\n");
-    test_config_validation_rejects();
+    printf("\n=== mono_alignulcnet: grid and pool plan ===\n");
+    test_grid_and_pool_plan();
 
-    printf("\n=== audio_pipeline_ulcnet: pool rejection ===\n");
-    test_pool_rejection();
-
-    printf("\n=== audio_pipeline_ulcnet: init_ex descriptor gate ===\n");
-    test_init_ex_descriptor();
-
-    printf("\n=== audio_pipeline_ulcnet: destroy idempotence ===\n");
-    test_destroy_idempotence();
-
-    printf("\n=== audio_pipeline_ulcnet: create-vs-init parity (poisoned pool) ===\n");
+    printf("\n=== mono_alignulcnet: create-vs-init parity (poisoned pool) ===\n");
     test_create_vs_init_parity();
 
-    printf("\n=== audio_pipeline_ulcnet: NULL model == identity model ===\n");
+    printf("\n=== mono_alignulcnet: NULL model == identity model ===\n");
     test_null_model_equals_identity_model();
 
-    printf("\n=== audio_pipeline_ulcnet: raw-far timestamp after fixed-delay lock ===\n");
+    printf("\n=== mono_alignulcnet: raw-far timestamp after fixed-delay lock ===\n");
     test_raw_far_timestamp_after_fixed_delay_lock();
 
-    printf("\n=== audio_pipeline_ulcnet: model applies while UNLOCKED ===\n");
+    printf("\n=== mono_alignulcnet: model applies while UNLOCKED ===\n");
     test_model_applies_unlocked();
 
-    printf("\n=== audio_pipeline_ulcnet: NaN/Inf guard ===\n");
+    printf("\n=== mono_alignulcnet: NaN/Inf guard ===\n");
     test_nan_guard();
 
-    printf("\n=== audio_pipeline_ulcnet: full-write contract (partial-write guard) ===\n");
+    printf("\n=== mono_alignulcnet: full-write contract (partial-write guard) ===\n");
     test_partial_write_guard();
 
-    printf("\n=== audio_pipeline_ulcnet: phased hop (begin / nn / end) ===\n");
+    printf("\n=== mono_alignulcnet: phased hop (begin / nn / end) ===\n");
     test_phased_hop();
 
-    printf("\n=== audio_pipeline_ulcnet: raw-far descriptor gate ===\n");
+    printf("\n=== mono_alignulcnet: raw-far descriptor gate ===\n");
     test_raw_descriptor_gate();
 
-    printf("\n=== audio_pipeline_ulcnet: known-delay profile (acquisition/coverage/mislock/cost) ===\n");
+    printf("\n=== mono_alignulcnet: known-delay profile (acquisition/coverage/mislock/cost) ===\n");
     test_known_delay_profile();
 
     if (g_failures) {

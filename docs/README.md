@@ -12,7 +12,7 @@ document disagrees with them.
 | C and caller-owned-pool integration | [`c_user_manual_zh_TW.md`](c_user_manual_zh_TW.md) |
 | AEC / NR / audiolib public API quick reference | [`audio_libraries_c_api_zh_TW.md`](audio_libraries_c_api_zh_TW.md) |
 | DEBUG observability: current inventory and proposals | [`debug_observability_zh_TW.md`](debug_observability_zh_TW.md) |
-| Board integration of `libaudio_pipeline.a` | [`pipeline_board_integration.md`](pipeline_board_integration.md) |
+| Board integration (separate libraries, the one 4-channel unit's descriptor) | [`pipeline_board_integration.md`](pipeline_board_integration.md) |
 | Frequency-domain gain fusion | [`freq_domain_pipeline_design.md`](freq_domain_pipeline_design.md) |
 | Four-channel C/Python AEC / external beamformer seam | [`../pipelines/4ch_aec_bf_nr_res/README.md`](../pipelines/4ch_aec_bf_nr_res/README.md) |
 | Four-channel Align-ULCNet application (direct GSC-spectrum path) | [`../pipelines/4ch_alignulcnet/README.md`](../pipelines/4ch_alignulcnet/README.md) |
@@ -27,7 +27,7 @@ document disagrees with them.
 | AIAEC four-candidate streaming readiness audit | [`aiaec_streaming_readiness_zh_TW.md`](aiaec_streaming_readiness_zh_TW.md) |
 | Mono pipeline integration (config/pool/errors) | [`integration_mono_zh_TW.md`](integration_mono_zh_TW.md) |
 | 4ch core integration (`4aec_nr_res`) | [`integration_4ch_core_zh_TW.md`](integration_4ch_core_zh_TW.md) |
-| 4ch spatial wrapper integration (SRP/GSC) | [`integration_4ch_spatial_zh_TW.md`](integration_4ch_spatial_zh_TW.md) |
+| 4ch linear AEC + BF unit integration (SRP/GSC) | [`integration_4ch_spatial_zh_TW.md`](integration_4ch_spatial_zh_TW.md) |
 | Release gate and reference test targets | [`release_checklist.md`](release_checklist.md) |
 | Development / submodules | [`development.md`](development.md) |
 

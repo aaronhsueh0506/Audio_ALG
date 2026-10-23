@@ -1,16 +1,16 @@
 /** Four-microphone linear-AEC front end with one shared far aligner. The external
  * owner supplies SRP-PHAT/BF. This module owns one shared DelayAec matcher, four
  * independent linear AEC adaptive filters and the coherent projection of the four
- * lane contexts onto one mono frame. The residual-echo, noise-reduction and
- * synthesis stages are carved and chained by the application over the SeSpecFrame
- * that four_aec_fuse() returns (common/se_stage.h). Per hop:
+ * lane contexts onto one mono frame. The residual-echo, noise-reduction, comfort-noise
+ * and synthesis stages are separate libraries that the application initialises and
+ * chains over the SeSpecFrame that four_aec_fuse() returns (common/se_stage.h; the
+ * chain is shown in samples/se_sample_chain.h). Per hop:
  *   four_aec_front_process()  shared delay + four linear AEC lanes; the lane spectra
  *                             go to the external SRP-PHAT/BF
  *   (SRP-PHAT, BF)            effective weights and the beamformed error
  *   four_aec_fuse()           project near / R^2 / comfort noise -> SeSpecFrame
- *   stages                    se_res_stage_gain(), se_anr_stage_gain(), ...
+ *   stages                    se_res_stage_gain(), anr_process_gain(), ...
  *   sk_min_f32 -> sk_capply_gain_f32 -> aec_cng_fill -> ac_istft_push
- * Lifecycle and naming follow mono_aec_nr_res/audio_pipeline.h.
  * Caller-owned pool (board/static path):
  *     FourAecNrResConfig cfg = four_aec_nr_res_default_config(16000);
  *     FourAecNrResMemReq req;
@@ -32,7 +32,6 @@
 #include <stdint.h>
 
 #include "aec.h"
-#include "anr.h"
 #include "common/se_stage.h"    /* SeSpecFrame */
 
 #ifdef __cplusplus
@@ -47,10 +46,10 @@ extern "C" {
  * delay estimator and ring. Bumped on any change of pool size, carve order or
  * descriptor content. Query a fresh descriptor for every build; never persist or
  * synthesize one from this number. */
-#define FOUR_AEC_NR_RES_LAYOUT_VERSION 22u
+#define FOUR_AEC_NR_RES_LAYOUT_VERSION 23u
 #define FOUR_AEC_NR_RES_BACKEND_NE10 2u   /* backend_id 1 is never returned */
 
-/** Fixed 32-byte descriptor for a caller-owned pool (fields as AudioPipelineMemReq): descriptor_version (ABI, checked first), layout_version, backend_id (compared with ==), build_flags_hash (FNV-1a-32 over the carve structure, not tunable values), alignment, reserved (0, validated), bytes. Query it at init time and pass it to init_ex(); do not cache it across library, backend, flag or config changes. */
+/** Fixed 32-byte descriptor for a caller-owned pool: descriptor_version (ABI, checked first), layout_version, backend_id (compared with ==), build_flags_hash (FNV-1a-32 over the carve structure, not tunable values), alignment, reserved (0, validated), bytes. Query it at init time and pass it to init_ex(); do not cache it across library, backend, flag or config changes. */
 typedef struct FourAecNrResMemReq {
     uint32_t descriptor_version;
     uint32_t layout_version;
@@ -107,15 +106,7 @@ typedef struct FourAecNrResConfig {
     /* Shared matched-filter duty-cycle throttle: once the published estimate has held still for delay_est_init_s (0.3 s, fixed), the matched filter is analysed once in round(delay_est_period_s / hop_s) / 5 hops instead of every hop (update_shared_delay() in 4aec_nr_res.c). 0.0 (default) = full rate. A positive value saves compute but may settle on a different lag. Range: finite, [0, 3600]. */
     float delay_est_period_s;
     float max_delay_ms;           /* MATCHED reference delay-line capacity   */
-    AecPreset aec_preset;
-    AnrMode nr_mode;
-    int enable_post;              /* 1 = keep the post context (R^2, comfort noise, fuse buffers); 0 = front only (AEC_CONTEXT_LINEAR_ONLY); the 4ch AEC+NR pipelines need 1 */
-    /* The next four fields configure the application's own post-beam stages
-     * (four_aec_nr_res_stage_configs()); the core validates them and reads none. */
-    int enable_res;               /* bool: run the post-beam RES; when 0, G_res is unity and CNG has nothing to fill */
-    int enable_nr;                /* bool: run the MMSE-LSA denoiser         */
-    int enable_cng;               /* bool                                   */
-    int legacy_amin;              /* bool: do not fold R2 into NR prior      */
+    int enable_post;              /* 1 = keep the post context (R^2, comfort noise, fuse buffers) for four_aec_fuse(); 0 = front only (AEC_CONTEXT_LINEAR_ONLY) */
 } FourAecNrResConfig;
 
 /** Per-hop view of the single shared reference alignment. `changed` marks the hop on which a new usable alignment generation begins: under MATCHED on first acquisition, on a relock after an unlocked stretch (even with an unchanged delay value) and on an admitted delay change while locked. A consumer holding history derived from the aligned reference (STFT/OLA tails, recurrent model state) must flush it on `changed`, before the frame it produces for this hop; `solid` alone is not enough. FIXED and EXTERNAL_ALIGNED never set `changed`. An admitted change while locked follows lib/aec's Path-B rule: movement above 32 native samples, offered again within 16, before the candidate's 3 hops run out; first acquisition is exempt. `delay_samples` never moves on a hop without `changed`.
@@ -158,8 +149,7 @@ typedef struct FourAecFront {
 
 typedef struct FourAecNrRes FourAecNrRes;
 
-/** Returns the default config for sample_rate (counterpart of
- * audio_pipeline_default_config()). */
+/** Returns the default config for sample_rate. */
 FourAecNrResConfig four_aec_nr_res_default_config(int sample_rate);
 
 /** Queries the 16-byte-aligned caller pool required by cfg. No allocation; returns 0
@@ -201,16 +191,6 @@ int four_aec_fuse(
     const Complex* weights,
     const Complex* beamformed_error,
     SeSpecFrame* frame);
-
-/** Configurations for the application's own post-beam stages on the core's grid:
- * res_cfg sizes and initialises the AecRes (aec_res_get_mem_size / aec_res_init),
- * nr_cfg the denoiser (se_anr_stage_mem_size / se_anr_stage_init). With
- * cfg->enable_nr = 0, *nr_cfg is zeroed (sized as 0) and must not be used. Returns 0,
- * or -1 for a NULL argument or a config the core would reject. */
-int four_aec_nr_res_stage_configs(
-    const FourAecNrResConfig* cfg,
-    AecConfig* res_cfg,
-    AnrConfig* nr_cfg);
 
 /** Resets all delay/AEC state and invalidates the front view and every frame fused from
  * it. A caller holding an outstanding FourAecFront must stop reading its pointers: they

@@ -1,22 +1,21 @@
 # Audio_ALG/pipelines/samples/Makefile
 #
-# Reference examples only -- see each source file's own top-of-file comment
-# (e.g. mcab_demo.c) for what it demonstrates and what production machinery
-# it deliberately omits. Nothing built here is linked into any of the three
-# production pipeline targets (4ch_aec_bf_nr_res, 4ch_aec_bf_dfn_res,
-# 4ch_alignulcnet); this directory is a sibling, not a dependency, of theirs.
+# Reference examples only -- see each source file's own top-of-file comment for what it
+# demonstrates and what production machinery it deliberately omits. The pipeline example mains
+# include the headers of this directory (se_sample_chain.h, se_anr_stage.h, dfn_hop.h,
+# ulcnet_nn_stage.h); the production targets (the 4-channel unit and its archives) do not.
 #
 # Same two-phase recursive-make producer dispatch as the other pipeline
 # Makefiles in this repo (see pipelines/Makefile and
 # 4ch_aec_bf_nr_res/Makefile for the long-form explanation), trimmed to the
-# three producers this directory's demos actually need: audiolib's own
-# libaudio_common.a, lib/aec's libaec.a, and audiolib's
-# libspatial_common.a/libdoa.a/libbf.a.
+# producers this directory's examples need: audiolib's own libaudio_common.a,
+# lib/aec's libaec.a, and audiolib's libspatial_common.a/libdoa.a/libbf.a.
 #
 # Usage:
-#   make                  # build mcab_demo
+#   make                  # build mcab_demo, test_ulcnet_nn_stage, test_dfn_hop
 #   make SIMD=0           # scalar spatial/SIMD kernels
-#   make test             # build + run mcab_demo (self-checking: nonzero
+#   make ULCNET_GRID=48k  # the 48 kHz / fft 1024 Align-ULCNet grid (default 16k)
+#   make test             # build + run the three (mcab_demo is self-checking: nonzero
 #                          # exit on any NaN/degenerate output)
 #   make clean            # remove this dir's own obj/bin trees
 
@@ -25,7 +24,10 @@ AR ?= ar
 RANLIB ?= ranlib
 
 ALG_DIR := ../..
+PIPELINES_DIR := ..
 AEC_DIR ?= $(ALG_DIR)/lib/aec/c_impl
+ULCNET_DIR ?= $(ALG_DIR)/AIAEC/Align_ULCNet
+DFN2_DIR ?= $(ALG_DIR)/AINR/DeepFilterNet2
 AUDIOLIB_DIR ?= ../../../audiolib
 COMMON_DIR ?= ../../../audiolib/common
 
@@ -59,6 +61,17 @@ ifneq ($(BACKEND),ne10)
 $(error BACKEND must be ne10 (got '$(BACKEND)'): ne10 is the only FFT backend)
 endif
 
+# Align-ULCNet grid: one build serves one grid; the flags reach only the ULCNet translation
+# units and are part of the build identity below.
+ULCNET_GRID ?= 16k
+ifeq ($(ULCNET_GRID),16k)
+ULCNET_GRID_CFLAGS = -DULCNET_MODEL_IO_SR=16000 -DULCNET_MODEL_IO_N_FFT=512
+else ifeq ($(ULCNET_GRID),48k)
+ULCNET_GRID_CFLAGS = -DULCNET_MODEL_IO_SR=48000 -DULCNET_MODEL_IO_N_FFT=1024
+else
+$(error ULCNET_GRID must be 16k or 48k, got '$(ULCNET_GRID)')
+endif
+
 ifeq ($(filter print-%,$(MAKECMDGOALS)),)
 $(info Audio_ALG/pipelines/samples: FFT backend = $(BACKEND))
 endif
@@ -87,7 +100,8 @@ WERROR_CFLAGS :=
 endif
 
 override CFLAGS := -Wall -Wextra $(OPT_CFLAGS) -std=gnu99 \
-          -I. -I$(AEC_DIR)/include -I$(AEC_DIR)/example \
+          -I. -I$(PIPELINES_DIR) -I$(AEC_DIR)/include -I$(AEC_DIR)/example \
+          -I$(ULCNET_DIR) -I$(DFN2_DIR) \
           -I$(COMMON_DIR)/include -I$(COMMON_DIR) \
           -I$(AUDIOLIB_DIR)/common/utility \
           -I$(AUDIOLIB_DIR)/doa -I$(AUDIOLIB_DIR)/bf \
@@ -101,8 +115,8 @@ FWD = BACKEND=$(BACKEND) SIMD=$(SIMD) WERROR=$(WERROR) \
       TOOLCHAIN_CHECK=$(TOOLCHAIN_CHECK) DEBUG=$(DEBUG)
 
 ifeq ($(COMMON_LIB),)
-.PHONY: all test libs lib mcab_demo print-bin-dir print-obj-dir
-all test libs lib mcab_demo print-bin-dir print-obj-dir:
+.PHONY: all test libs lib mcab_demo test_ulcnet_nn_stage test_dfn_hop print-bin-dir print-obj-dir
+all test libs lib mcab_demo test_ulcnet_nn_stage test_dfn_hop print-bin-dir print-obj-dir:
 	+@ac="$$($(MAKE) -s --no-print-directory -C $(COMMON_DIR) $(FWD) print-lib-path)"; \
 	 test -n "$$ac" || { echo "FATAL: cannot resolve common archive" >&2; exit 1; }; \
 	 aec="$$($(MAKE) -s --no-print-directory -C $(AEC_DIR) $(FWD) COMMON_DIR=$(abspath $(COMMON_DIR)) COMMON_LIB="$$ac" print-lib-path)"; \
@@ -127,7 +141,7 @@ endif
 # The same CC command can select a different SDK through PATH.
 # Include effective pointer/FP/ISA predefines to avoid cross-ABI cache reuse.
 override CC_TARGET_SIG := $(shell sh $(COMMON_DIR)/scripts/target_abi_signature.sh $(CC) $(CPPFLAGS) $(CFLAGS))
-CFG_SIG_PAYLOAD := CC_TARGET_SIG=$(CC_TARGET_SIG) CC=$(CC) AR=$(AR) RANLIB=$(RANLIB) CFLAGS=$(CFLAGS) \
+CFG_SIG_PAYLOAD := CC_TARGET_SIG=$(CC_TARGET_SIG) ULCNET_GRID=$(ULCNET_GRID) CC=$(CC) AR=$(AR) RANLIB=$(RANLIB) CFLAGS=$(CFLAGS) \
   LDFLAGS=$(LDLIBS) BACKEND=$(BACKEND) SIMD=$(SIMD) WERROR=$(WERROR) \
   DEBUG=$(DEBUG) TOOLCHAIN_CHECK=$(TOOLCHAIN_CHECK) \
   COMMON_PRODUCER_SIG=$(COMMON_PRODUCER_SIG) AEC_PRODUCER_SIG=$(AEC_PRODUCER_SIG) \
@@ -183,21 +197,68 @@ _cfg_guard:
 $(OBJ_DIR)/mcab_demo.o: mcab_demo.c | _cfg_guard
 	$(CC) $(CFLAGS) -MD -MP -c -o $@ $<
 
+# Align-ULCNet stage and its test: the grid flags go on every TU that sees the compiled grid.
+$(OBJ_DIR)/ulcnet_process.o: $(ULCNET_DIR)/ulcnet_process.c $(ULCNET_DIR)/ulcnet_process.h | _cfg_guard
+	$(CC) $(CFLAGS) $(ULCNET_GRID_CFLAGS) -MD -MP -c -o $@ $<
+
+$(OBJ_DIR)/ulcnet_model_io.o: $(ULCNET_DIR)/ulcnet_model_io.c $(ULCNET_DIR)/ulcnet_model_io.h | _cfg_guard
+	$(CC) $(CFLAGS) $(ULCNET_GRID_CFLAGS) -MD -MP -c -o $@ $<
+
+$(OBJ_DIR)/ulcnet_nn_stage.o: ulcnet_nn_stage.c ulcnet_nn_stage.h $(ULCNET_DIR)/ulcnet_process.h | _cfg_guard
+	$(CC) $(CFLAGS) $(ULCNET_GRID_CFLAGS) -MD -MP -c -o $@ $<
+
+$(OBJ_DIR)/test_ulcnet_nn_stage.o: tests/test_ulcnet_nn_stage.c ulcnet_nn_stage.h | _cfg_guard
+	$(CC) $(CFLAGS) $(ULCNET_GRID_CFLAGS) -MD -MP -c -o $@ $<
+
+# DeepFilterNet2 stage, rate bridge and the hop driver test.
+$(OBJ_DIR)/dfn2_process.o: $(DFN2_DIR)/dfn2_process.c $(DFN2_DIR)/dfn2_process.h | _cfg_guard
+	$(CC) $(CFLAGS) -MD -MP -c -o $@ $<
+
+$(OBJ_DIR)/dfn2_model_io.o: $(DFN2_DIR)/dfn2_model_io.c $(DFN2_DIR)/dfn2_model_io.h | _cfg_guard
+	$(CC) $(CFLAGS) -MD -MP -c -o $@ $<
+
+$(OBJ_DIR)/dfn2_prepost.o: $(DFN2_DIR)/dfn2_prepost.c $(DFN2_DIR)/dfn2_prepost.h | _cfg_guard
+	$(CC) $(CFLAGS) -MD -MP -c -o $@ $<
+
+# The stage and the bridge bake the FFT backend identity into their descriptors.
+$(OBJ_DIR)/dfn_res_stage.o: $(PIPELINES_DIR)/dfn_res_stage.c $(PIPELINES_DIR)/dfn_res_stage.h | _cfg_guard
+	$(CC) $(CFLAGS) -DAUDIO_PIPELINE_BACKEND_STR=\"$(BACKEND)\" -MD -MP -c -o $@ $<
+
+$(OBJ_DIR)/dfn_rate_bridge.o: $(PIPELINES_DIR)/dfn_rate_bridge.c $(PIPELINES_DIR)/dfn_rate_bridge.h | _cfg_guard
+	$(CC) $(CFLAGS) -DAUDIO_PIPELINE_BACKEND_STR=\"$(BACKEND)\" -MD -MP -c -o $@ $<
+
+$(OBJ_DIR)/test_dfn_hop.o: tests/test_dfn_hop.c dfn_hop.h $(PIPELINES_DIR)/tests/dfn_test_fixture.h | _cfg_guard
+	$(CC) $(CFLAGS) -I$(PIPELINES_DIR)/tests -MD -MP -c -o $@ $<
+
 ifneq ($(COMMON_LIB),)
-.PHONY: all test libs lib mcab_demo
+.PHONY: all test libs lib mcab_demo test_ulcnet_nn_stage test_dfn_hop
+
+ULCNET_STAGE_OBJS := $(OBJ_DIR)/ulcnet_nn_stage.o $(OBJ_DIR)/ulcnet_process.o $(OBJ_DIR)/ulcnet_model_io.o
+DFN_OBJS := $(OBJ_DIR)/dfn_res_stage.o $(OBJ_DIR)/dfn_rate_bridge.o $(OBJ_DIR)/dfn2_prepost.o \
+            $(OBJ_DIR)/dfn2_model_io.o $(OBJ_DIR)/dfn2_process.o
 
 $(BIN_DIR)/mcab_demo: $(OBJ_DIR)/mcab_demo.o $(DOA_LIB) $(BF_LIB) $(SPATIAL_COMMON_LIB) $(AEC_LIB) $(COMMON_LIB) | _cfg_guard
 	$(CC) -o $@ $(OBJ_DIR)/mcab_demo.o $(DOA_LIB) $(BF_LIB) $(SPATIAL_COMMON_LIB) $(AEC_LIB) $(COMMON_LIB) $(LDLIBS)
 
-all: $(BIN_DIR)/mcab_demo
+$(BIN_DIR)/test_ulcnet_nn_stage: $(OBJ_DIR)/test_ulcnet_nn_stage.o $(ULCNET_STAGE_OBJS) $(COMMON_LIB) | _cfg_guard
+	$(CC) -o $@ $(OBJ_DIR)/test_ulcnet_nn_stage.o $(ULCNET_STAGE_OBJS) $(COMMON_LIB) $(LDLIBS)
+
+$(BIN_DIR)/test_dfn_hop: $(OBJ_DIR)/test_dfn_hop.o $(DFN_OBJS) $(COMMON_LIB) | _cfg_guard
+	$(CC) -o $@ $(OBJ_DIR)/test_dfn_hop.o $(DFN_OBJS) $(COMMON_LIB) $(LDLIBS)
+
+all: $(BIN_DIR)/mcab_demo $(BIN_DIR)/test_ulcnet_nn_stage $(BIN_DIR)/test_dfn_hop
 
 mcab_demo: $(BIN_DIR)/mcab_demo
+test_ulcnet_nn_stage: $(BIN_DIR)/test_ulcnet_nn_stage
+test_dfn_hop: $(BIN_DIR)/test_dfn_hop
 
 # Self-checking: mcab_demo itself exits nonzero on any NaN/zero/degenerate
 # result (see mcab_demo.c's own isfinite()/final-summary checks), so running
 # it IS the test.
-test: $(BIN_DIR)/mcab_demo
+test: $(BIN_DIR)/mcab_demo $(BIN_DIR)/test_ulcnet_nn_stage $(BIN_DIR)/test_dfn_hop
 	"$(abspath $(BIN_DIR))/mcab_demo"
+	"$(abspath $(BIN_DIR))/test_ulcnet_nn_stage"
+	"$(abspath $(BIN_DIR))/test_dfn_hop"
 
 libs lib: $(COMMON_LIB) $(AEC_LIB) $(SPATIAL_COMMON_LIB) $(DOA_LIB) $(BF_LIB)
 
@@ -205,6 +266,8 @@ print-bin-dir:
 	@echo "$(BIN_DIR)"
 print-obj-dir:
 	@echo "$(OBJ_DIR)"
+
+-include $(wildcard $(OBJ_DIR)/*.d)
 endif
 
 clean:

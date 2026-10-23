@@ -3,6 +3,172 @@
 `Audio_ALG/pipelines`（含它建置的 `AINR`、`AIAEC` C 程式）的重要改動記錄在此，格式依
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/)。README 只寫現況，改動經過寫在這裡。
 
+## [Unreleased] — 2026-10-24 — NR minimum window: library default
+
+### Changed
+- The pipelines build their denoiser from the NR library preset alone,
+  `anr_config_for_mode_grid(sample_rate, fft_size, nr_mode)`. The override of the minimum-tracking
+  window `L` (`anr_retime_frames(150, sample_rate, hop)`: 188 / 94 / 141 hops at 16 kHz 256/128,
+  16 kHz 512/256, 48 kHz 1024/512, about 1.5 s) is gone; `L` is the library default, 32 frames of
+  16 ms (64 / 32 / 48 hops, about 0.512 s; 32 hops at 8 kHz). The `alpha_decay = alpha_g` line went with
+  it: the preset already sets both from the same expression. Python mirrors it: `_build_denoiser()`
+  no longer sets `L = 94` (`_NR_L_MINIMA_WINDOW`), so its `L` comes from `v3_2_config.yaml`.
+- Output is bit-identical. With the scene-reset gate off (`broadband_threshold = 1.0`) the window
+  length does not reach the gain: the golden matrix (audio, seam and driver rows) and the
+  `pyc_parity` rows are unchanged at `SIMD=1` and `SIMD=0`; a control with the gate on
+  (`broadband_threshold = 0.8`) does tell the two windows apart.
+- `anr_set_mode()` now accepts the chain's denoiser: `anr_set_mode(se_sample_chain_nr(chain), mode)`
+  changes its strength while it runs.
+- The tests' oracles (`conv_chain_mono.h`, `conv_chain_4ch.h`, `test_se_common.c`) write the 512 ms
+  window out in whole hops; `test_se_common` checks the window per grid as literals, that the chain
+  sizes its denoiser like the oracle, that `anr_set_mode()` before the first hop equals a denoiser
+  built in that mode on every grid, and that a target one hop longer is refused.
+
+### Removed (example code, no ABI)
+- `se_anr_compose_config()`, `se_anr_stage_set_mode()` and the pass-throughs
+  `se_anr_stage_{mem_size,init,reset,destroy}()` (`samples/se_anr_stage.h`; call
+  `anr_config_for_mode_grid()`, `anr_get_mem_size()`, `anr_init()`, `anr_set_mode()`, `anr_reset()`,
+  `anr_destroy()`). `samples/se_anr_stage.h` keeps `se_anr_stage_gain()`, `se_psd_scale()` and
+  `SE_PSD_SCALE` / `SE_PSD_SCALE_INV`.
+- `se_sample_chain_set_nr_mode()` (`samples/se_sample_chain.h`): use `anr_set_mode()` on
+  `se_sample_chain_nr(chain)`; a chain without NR returns `NULL` there and `anr_set_mode()` returns -1.
+
+### Pool sizes (NE10, `SIMD=1`; bytes, after the split entry below -> now)
+| Item | 8 kHz 256/128 | 16 kHz 256/128 | 16 kHz 512/256 | 48 kHz 1024/512 |
+|---|---|---|---|---|
+| `AnrDenoiser` (`anr_get_mem_size()`; `L` in hops) | 60,784 -> 28,784 (94 -> 32) | 109,328 -> 45,344 (188 -> 64) | 120,176 -> 56,432 (94 -> 32) | 335,424 -> 144,576 (141 -> 48) |
+| Mono AEC + chain (`aec_nr_pipeline_static --print-mem-size`) | 359,232 -> 327,232 | 521,168 -> 457,184 | 672,768 -> 609,024 | 1,612,864 -> 1,422,016 |
+| 4-channel front end + chain (`4aec_nr_res_static`) | | 1,171,200 -> 1,107,216 | 1,719,200 -> 1,655,456 | 3,863,568 -> 3,672,720 |
+| 4-channel unit + chain (`audio_pipeline_4ch_static`; chain alone) | | 1,963,504 -> 1,899,520 (131,328 -> 67,344) | 3,289,232 -> 3,225,488 (161,376 -> 97,632) | 6,989,056 -> 6,798,208 (418,096 -> 227,248) |
+
+Layout versions and `build_flags_hash` are unchanged: the denoiser lives in the header-only sample
+chain, not in the unit or the core.
+
+
+## [Unreleased] — 2026-10-24 — Pipeline split: one wrapped unit, separate libraries
+
+### Changed
+- Only the multi-channel linear AEC + beamformer is wrapped as one unit: `AudioPipeline4Ch`
+  (`4ch_aec_bf_nr_res/audio_pipeline_4ch.{h,c}`), now `process_front()` / `process_beam()` /
+  `process_with_activity()` / `process()` returning the beamformed spectrum and weights
+  (`AudioPipeline4ChBeam`), plus an independent `audio_pipeline_4ch_fuse()` that fills a `SeSpecFrame`.
+  RES, NR, comfort noise, synthesis and the neural post-filters are separate libraries that the
+  integrator initialises (each with its own `mem_size` and `init`) and chains. Outputs of the
+  example programs are bit-identical to the previous revision at `SIMD=1` and `SIMD=0` (a golden
+  matrix of audio, seam and driver outputs, plus the `pyc_parity` seam rows); only pool sizes, titles and
+  memory lines changed.
+- The gain sequence (RES gain, NR gain, `min`, apply, comfort noise, synthesis) is example code:
+  `pipelines/samples/se_sample_chain.h`. The NR recipe moved to `samples/se_anr_stage.h`, the DFN2
+  hop driver to `samples/dfn_hop.h`, the Align-ULCNet stage to `samples/ulcnet_nn_stage.{h,c}`.
+  The samples have no ABI, no layout version and no descriptor, and are in no archive.
+- `se_frame_from_aec()` (`common/se_stage.h`) fills the `SeSpecFrame` of a mono `Aec`; mono has no
+  unit at all (`Aec` + `se_frame_from_aec` + the chain).
+- `pipelines/mono_*`, `4ch_alignulcnet` and `4ch_aec_bf_dfn_res` mains, the static mains, the raw
+  runner, the mcab driver and `pyc_drv.c` are compositions of the above and stay as examples; CLI
+  flags, positional arguments, output formats and the raw runner JSON keys are unchanged.
+  `pyc_drv` now runs the shipped sample chain instead of the test oracle.
+- Python: `FourChannelAecPipeline.fuse()` no longer runs the post-beam suppressor; its
+  `context.res_gain` is `None`, and the caller applies `PostBeamResidualSuppressor` (exported from
+  `4ch_aec_bf_nr_res/__init__.py`) to `FourChannelFrame.aligned_render`.
+  `PostBeamResidualSuppressor.from_aec_config()` builds one from an `AecConfig`.
+  `run_front_end` (DFN2 4-channel), `evaluate_recordings.py` and `tools/eval_dfn2_4ch_inputs.py`
+  own their suppressor. Output is unchanged. `FourChannelAecPipeline.reset()` no longer resets the
+  suppressor: the caller calls `suppressor.reset()` together with `pipeline.reset()`.
+- Tests: `test_audio_pipeline*.c` and `test_4aec_dfn_res.c` are replaced by composition-level tests
+  against hand-written oracles (`conv_chain_mono.h`, `conv_chain_4ch.h`): `test_mono_chain`,
+  `test_mono_dfn`, `test_mono_ulcnet`, `test_4ch_dfn`, `test_4ch_ulcnet`, and
+  `samples/tests/test_ulcnet_nn_stage.c`, `test_dfn_hop.c`. The cng-floor witness line lives in
+  `mono_aec_nr_res/tests/test_mono_chain.c`.
+- Fixed in the mono examples: `--no-nr` no longer dereferences a NULL denoiser under `DUMP_CTX`
+  (the NR gain reads as the unity vector), and `static_main.c --print-mem-size` honours
+  `--no-nr`, `--no-res` and `--no-cng`.
+- A refused hop is recovered by the integrator, not by a library: reset the unit (or `Aec`), the
+  chain and any neural stage together (`audio_pipeline_4ch_reset()` / `aec_reset()`,
+  `se_sample_chain_reset()` — which also restarts the comfort-noise generator —
+  `ulcnet_nn_stage_reset()` / `dfn_hop_reset()`). The DFN stage is still not reset by an AEC delay change.
+- `audio_pipeline_4ch_process_front()` (and the calls built on it) leaves no front or beam pending
+  after any refusal, so a following `process_beam()` / `audio_pipeline_4ch_fuse()` returns
+  `SEQUENCE_ERROR`; `audio_pipeline_4ch_fuse()` no longer resets the unit on `SEQUENCE_ERROR`.
+  A caller that skips a hop refused for a non-finite sample keeps all adaptive state.
+
+### Removed (hard break, no shims)
+- Mono: `audio_pipeline_{default_config,get_mem_requirements,init,init_ex,create,process,process_spec,synthesize,set_aec_preset,set_nr_mode,reset,destroy,hop_size,n_freqs,sample_rate,get_aec,get_nr,get_mem_breakdown,get_last_timing}`,
+  `AudioPipelineConfig` / `AudioPipelineMemReq` / `AudioPipelineMemBreakdown` / `AudioPipelineLastTiming`,
+  `mono_aec_nr_res/audio_pipeline.{h,c}`, `libaudio_pipeline.a`.
+- `audio_pipeline_ulcnet_*`, `audio_pipeline_4ch_ulcnet_*`, `mono_aec_dfn_res_*`, `four_aec_dfn_res_*`
+  and their config / memory-requirement types, headers and sources.
+- `FourAecNrResConfig.{aec_preset,nr_mode,enable_res,enable_nr,enable_cng,legacy_amin}` and
+  `four_aec_nr_res_stage_configs()`: the lanes are always derived with `AEC_PRESET_BALANCED` and
+  compute only the linear residual; the settings belong to the chain (`SeSampleChainConfig`).
+- `AudioPipeline4Ch`: the time-domain `output` of `process()` / `process_with_activity()`,
+  `audio_pipeline_4ch_{set_aec_preset,post_split_floor,set_nr_mode,nr_count,post_res_count}`.
+  The unit's config validation no longer requires `core.enable_post == 1`; with `enable_post = 0`
+  `audio_pipeline_4ch_fuse()` returns `INVALID_ARGUMENT`.
+- Build: `-DAUDIO_PIPELINE_STAGE_TIMING`, `-DAUDIO_PIPELINE_NO_STDIO` and `-DAUDIO_PIPELINE_NOW_US`
+  (`PROFILE=1` now sets `-DAEC_STAGE_TIMING=1` only; the example programs read their own clock).
+  `libaudio_pipeline_4ch.a` now holds `4aec_nr_res.o`, `audio_pipeline_4ch.o` and `se_config.o`.
+- `common/se_anr_stage.{c,h}` (the recipe lives in `samples/se_anr_stage.h`), `SeRules.with_nr` and
+  `SeRequest.nr_mode` (`common/se_config.h`; `se_derive()` no longer looks at the NR mode, and
+  `se_config.h` no longer includes `anr_types.h`).
+- Python: `FourChannelAecConfig.aec_preset`, `FourChannelAecPipeline.set_aec_preset()`,
+  `FourChannelAecPipeline.residual_suppressor_instance_count`.
+
+### Layout versions
+| Macro | Old | New |
+|---|---|---|
+| `AUDIO_PIPELINE_4CH_LAYOUT_VERSION` | 17 | **18** (pool no longer carries RES / NR / synthesis; `build_flags_hash` carve token changed) |
+| `FOUR_AEC_NR_RES_LAYOUT_VERSION` | 22 | **23** (the config embedded in the control block shrank) |
+| `AUDIO_PIPELINE_LAYOUT_VERSION` (+ descriptor version 2) | 15 | removed |
+| `AUDIO_PIPELINE_ULCNET_LAYOUT_VERSION` | 15 | removed |
+| `AUDIO_PIPELINE_4CH_ULCNET_LAYOUT_VERSION` | 23 | removed |
+| `MONO_AEC_DFN_RES_LAYOUT_VERSION` | 5 | removed |
+| `FOUR_AEC_DFN_RES_LAYOUT_VERSION` | 6 | removed |
+
+`DFN_RES_STAGE_LAYOUT_VERSION` (3), `DFN_RATE_BRIDGE_LAYOUT_VERSION` (3) and the AINR / AIAEC layouts are
+unchanged. The unit's `build_flags_hash` is `0x0ac1063e` -> `0x8aabdea5`; the core's is `0x5812ead9`.
+`tests/test_doc_layout_versions.py` no longer lists the removed macros.
+
+### Pool sizes (NE10, `SIMD=1`, matched n=5; bytes, old -> new)
+| Item | 16 kHz | 48 kHz |
+|---|---|---|
+| Mono AEC + NR chain, `--print-mem-size` (16 kHz default 256/128; 48 kHz 1024/512) | 520,672 -> 521,168 | 1,610,832 -> 1,612,864 |
+| Mono chain at 16 kHz 512/256; 8 kHz | 671,760 -> 672,768; 358,736 -> 359,232 | |
+| 4-channel front end (`FourAecNrRes`) | 1,039,904 -> 1,039,872 | 3,445,504 -> 3,445,472 |
+| 4-channel front end + chain (`4aec_nr_res_static`, 16 kHz 512/256 in the second row) | 1,170,576 -> 1,171,200; 1,718,064 -> 1,719,200 | 3,861,408 -> 3,863,568 |
+| 4-channel unit + chain (`audio_pipeline_4ch_static`; the unit alone is 1,832,176 / 6,570,960) | 1,962,960 -> 1,963,504 | 6,986,976 -> 6,989,056 |
+| Mono DFN2 | 764,096 -> 750,384 | 1,522,048 -> 1,513,536 |
+| 4-channel DFN2 | 1,400,048 -> 1,400,416 | 3,762,336 -> 3,764,240 |
+| Mono Align-ULCNet (n=5) | 568,128 -> 568,080 | 1,308,336 -> 1,308,288 |
+| 4-channel Align-ULCNet (unit + stage) | 3,153,936 -> 3,117,520 + 36,400 | 6,622,128 -> 6,550,384 + 71,728 |
+
+The READMEs, the integration manuals and the HTML pages carry the re-measured numbers; the
+8 kHz mono DFN2 host is 652,336 -> 638,624.
+
+### Migration notes for board code
+- Recompile. A persisted unit or core descriptor from the previous layout is refused by `init_ex()`
+  (layout 17 -> 18, 22 -> 23): query a fresh one.
+- Mono: replace the `audio_pipeline_*` calls by `se_derive()` -> `aec_get_mem_size()` /
+  `se_sample_chain_mem_size()` -> `aec_init()` / `se_sample_chain_init()`; per hop
+  `aec_process_context()` -> `se_frame_from_aec()` -> `se_sample_chain_form()` ->
+  `se_sample_chain_synthesize()`; `--aec-only` is `aec_process()`. Runtime strength moves to
+  `aec_set_preset()` and `anr_set_mode(se_sample_chain_nr(chain), mode)` (see the NR entry above).
+- 4-channel: `audio_pipeline_4ch_process*()` now returns the beam; call `audio_pipeline_4ch_fuse()`
+  and the chain for the frequency-domain stages (`aec_res_set_preset(se_sample_chain_res(chain), ...)`
+  replaces `audio_pipeline_4ch_set_aec_preset()`). Align-ULCNet code builds the unit with
+  `core.enable_post = 0` and feeds `beam.spectrum`, the raw far hop and the unit's
+  `delay.changed` / `delay.solid` to `ulcnet_nn_stage_begin_complex()`.
+- DFN2: `dfn_hop_*` over the stage or the rate bridge replaces `*_process_begin` / `nn_begin` /
+  `nn_end` / `process_end`; P must be formed before `dfn_hop_begin()`.
+- The pool of each library is sized and carved separately; the 4-channel unit and the chain no longer
+  share one block.
+- Everything an application did with a failed hop (`reset` of the whole wrapper) is now the integrator's
+  paired reset (see Changed).
+
+### NR configuration
+This entry changes no NR numbers. The NR window override it carried over into `samples/se_anr_stage.h`
+is removed by the entry above.
+
+
 ## [Unreleased] — 2026-10-23 — Sample driver tidy-up; sources and docs condensed
 
 ### Changed

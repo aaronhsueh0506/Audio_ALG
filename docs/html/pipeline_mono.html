@@ -3,7 +3,7 @@
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
-<title>audio_pipeline (mono AEC→NR→RES)</title>
+<title>mono AEC→NR→RES 串接</title>
 <style>
 body{font-family:-apple-system,"PingFang TC","Noto Sans TC",sans-serif;max-width:960px;margin:0 auto;padding:16px;line-height:1.55;color:#222;background:#fff}
 nav{border-bottom:1px solid #ccc;padding-bottom:8px;margin-bottom:16px;font-size:14px}
@@ -27,10 +27,10 @@ th{background:#eef3ee}
 <a href="pipeline_dfn_mono.html">pipeline_dfn_mono</a>
 <a href="pipeline_dfn_4ch.html">pipeline_dfn_4ch</a>
 </nav>
-<h1>audio_pipeline — mono AEC(linear) → echo-aware NR → RES</h1>
+<h1>mono AEC(linear) → echo-aware NR → RES — <code>Aec</code> + 範例鏈</h1>
 
 <h2>概要</h2>
-<p>可連結的單聲道傳統管線(<code>pipelines/mono_aec_nr_res/audio_pipeline.{h,c}</code>):線性 AEC → echo-aware NR gain → <code>g_total=min(g_nr,g_res)</code> → 頻譜套 gain(+選配 CNG)→ irfft + sqrt-Hann OLA。兩支 CLI(<code>mono_aec_nr_res/main.c</code> malloc 版 / <code>mono_aec_nr_res/static_main.c</code> 靜態記憶體版)都是它的薄殼。Pool-first 建構為板端路徑:init→destroy 之間零 heap。</p>
+<p>mono 沒有 unit,也沒有 pipeline 函式庫(沒有 mono archive)。處理鏈由獨立的函式庫物件組成,<b>各有自己的 <code>mem_size</code> 與 <code>init</code></b>,初始化與串接是整合者的事:lib/aec 的 <code>Aec</code>(線性 AEC,<code>aec_process_context()</code>)→ <code>common/se_stage.h</code> 的 <code>se_frame_from_aec()</code>(填 <code>SeSpecFrame</code>)→ 範例鏈 <code>pipelines/samples/se_sample_chain.h</code>(RES 增益取 <code>g_res_ctx</code>、echo-aware NR 增益、<code>g_total=min(g_nr,g_res)</code>、頻譜套 gain、選配 CNG、irfft + sqrt-Hann OLA)。範例鏈是 header-only 範例碼:沒有 ABI、沒有 layout version、沒有 descriptor、不進任何 archive,可整份複製改寫。兩支 CLI(<code>mono_aec_nr_res/main.c</code> malloc 版 / <code>mono_aec_nr_res/static_main.c</code> 靜態記憶體版)就是這個組合的範例;Pool-first 建構為板端路徑:init→destroy 之間零 heap。</p>
 <table>
 <tr><th>訊號格點</th><th>fft/hop/bins</th><th>備註</th></tr>
 <tr><td>8 kHz</td><td>256 / 128 / 129</td><td><code>fft_size=0</code> 的 rate default</td></tr>
@@ -38,95 +38,100 @@ th{background:#eef3ee}
 <tr><td>16 kHz(替代)</td><td>512 / 256 / 257</td><td>需明示 <code>fft_size=512</code></td></tr>
 <tr><td>48 kHz</td><td>1024 / 512 / 513</td><td>rate default</td></tr>
 </table>
-<p><code>aec_only=1</code> 時整條 NR/RES/OLA 被跳過(FFT/NR 連 pool 都不佔),輸出即線性 AEC 殘差,鏡射 CLI 的 <code>--aec-only</code>。</p>
+<p><code>--aec-only</code> 時不建鏈(NR/RES/OLA 連 pool 都不佔),直接用 <code>aec_process(aec, mic, ref, out)</code> 輸出線性 AEC 殘差。</p>
 
 <h2>API 用法</h2>
-<pre>AudioPipelineConfig cfg = audio_pipeline_default_config(16000);
-/* cfg.fft_size=0(rate default) aec_preset=BALANCED nr_mode=BALANCED
- * aec_only=0 enable_nr=1 enable_res=1 enable_cng=1 legacy_amin=0
- * (aec_only 優先於 enable_nr/enable_res) */
-AudioPipelineMemReq req;
-audio_pipeline_get_mem_requirements(&cfg, &req);      /* 0=ok, -1=reject */
-void* pool = platform_alloc(req.bytes, req.alignment); /* 16-byte aligned */
-AudioPipeline* p = audio_pipeline_init_ex(pool, req.bytes, &cfg, &req);
+<pre>static const SeRules rules = { .allow_8k = 1, .spatial_context = SE_CONTEXT_PRESET };
+SeRequest req = {0};  req.sample_rate = 16000;  req.delay_mode = AEC_DELAY_MATCHED;
+req.delay_num_filters = 5;  req.fixed_delay_samples = -1;  req.aec_preset = AEC_PRESET_BALANCED;
+SeGrid grid;  AecConfig aec_cfg;
+se_derive(&amp;req, &amp;rules, &amp;grid, &amp;aec_cfg);                   /* 格點 + AecConfig; 0=ok, -1=reject */
 
-int hop = audio_pipeline_hop_size(p);                  /* 128 @16k default */
-while (stream) {
-    audio_pipeline_process(p, mic, ref, out);          /* 各 hop 一次, 皆 hop floats */
+SeSampleChainConfig sc = se_sample_chain_default_config(16000, grid.fft_size);
+sc.res = SE_SAMPLE_RES_FRAME_GAIN;                         /* mono: 取 AEC 自己的 G_res */
+/* sc.enable_nr=1 nr_mode=BALANCED enable_cng=1 legacy_amin=0 with_synthesis=1 (預設) */
+size_t aec_bytes   = aec_get_mem_size(&amp;aec_cfg);            /* 0 = invalid */
+size_t chain_bytes = se_sample_chain_mem_size(&amp;sc);         /* 0 = invalid */
+void* pool = platform_alloc(ALIGN16(aec_bytes) + chain_bytes, 16);
+Aec* aec = aec_init(pool, aec_bytes, &amp;aec_cfg);
+SeSampleChain* chain = se_sample_chain_init((uint8_t*)pool + ALIGN16(aec_bytes), chain_bytes, &amp;sc);
+
+while (stream) {                                           /* 每 hop 一次, 皆 grid.hop_size floats */
+    SeSpecFrame f;  const Complex* P;
+    aec_process_context(aec, mic, ref);
+    if (se_frame_from_aec(aec, &amp;f) != 0 || !(P = se_sample_chain_form(chain, &amp;f)) ||
+        se_sample_chain_synthesize(chain, P, out) != 0 || !se_hop_is_finite(out, grid.hop_size)) {
+        aec_reset(aec);  se_sample_chain_reset(chain);     /* 被拒的 hop: 兩者一起 reset */
+    }
 }
-audio_pipeline_reset(p);      /* echo-path 變更時; 不動 pool */
-audio_pipeline_destroy(p);    /* 不釋放 caller pool */
+se_sample_chain_destroy(chain);  aec_destroy(aec);         /* 不釋放 caller pool */
 platform_free(pool);</pre>
-<p>桌面便利路徑 <code>audio_pipeline_create(&amp;cfg)</code>(內部 posix_memalign;destroy 會 free)。診斷用唯讀 handle:<code>audio_pipeline_get_aec()</code> / <code>audio_pipeline_get_nr()</code>(aec_only 時為 NULL);byte 分解表 <code>audio_pipeline_get_mem_breakdown()</code>。</p>
-<h3>接進外部後級(<code>audio_pipeline_process_spec</code> / <code>audio_pipeline_synthesize</code>)</h3>
-<p>公開 API 另有兩個入口,把 <code>process()</code> 拆成「分析」與「合成」兩半,給要在線性 AEC 之後串自己頻域 stage 的變體用(<code>pipelines/mono_aec_nr_res/audio_pipeline.h</code>)。<code>audio_pipeline_process_spec(p, mic, ref, &amp;frame)</code> 只跑線性 AEC(context-only),交出一個 <code>SeSpecFrame</code>(<code>pipelines/common/se_stage.h</code>):<code>e</code>=線性 AEC 誤差頻譜 E、<code>y</code>=近端頻譜、<code>x</code>=far 頻譜、<code>r2</code>=殘餘回音 PSD、<code>cn</code>=comfort-noise PSD、<code>g_res_ctx</code>=AEC 自己的 G_res、<code>far_hop</code>／<code>formed_hop</code> 與 delay 旗標;全部是借用視圖,指向 AEC 的 per-hop buffer,到下一次處理呼叫或 reset 前有效,任何 stage 都不得寫入。呼叫端自己串後級,然後以 <code>audio_pipeline_synthesize(p, spectrum, out)</code> 收尾,它走的是 <code>process()</code> <b>同一組</b> sqrt-Hann iFFT/OLA 狀態。要求 <code>!aec_only</code>,否則回 -1。<code>process()</code> 本身就是用同一個內部 <code>analyse_hop()</code> 加下列明寫的鏈,逐位元相同(<code>test_stage_seam_chain</code> 在 <code>enable_nr</code> 0／1 兩種組態下以 <code>memcmp</code> 釘住):</p>
-<pre>audio_pipeline_process_spec(p, mic, ref, &amp;f);
+<p>桌面便利路徑 <code>aec_create()</code>(內部配置)。診斷用唯讀 handle:<code>se_sample_chain_nr(chain)</code>(<code>enable_nr = 0</code> 時為 NULL)、<code>se_sample_chain_last_res_gain()</code> / <code>se_sample_chain_last_nr_gain()</code>;byte 分解表 <code>se_sample_chain_sizes()</code>。逐步的呼叫表、錯誤語意與 config 對照見 <code>docs/integration_mono_zh_TW.md</code>。</p>
+<h3>接進外部後級(<code>se_frame_from_aec</code> / 範例鏈)</h3>
+<p><code>se_frame_from_aec(aec, &amp;frame)</code>(<code>pipelines/common/se_stage.h</code>)在 <code>aec_process_context()</code> 之後把 lane 的 context 填成 <code>SeSpecFrame</code>:<code>e</code>=線性 AEC 誤差頻譜 E、<code>y</code>=近端頻譜、<code>x</code>=far 頻譜、<code>r2</code>=殘餘回音 PSD、<code>cn</code>=comfort-noise PSD、<code>g_res_ctx</code>=AEC 自己的 G_res、<code>far_hop</code>／<code>formed_hop</code> 與 delay 旗標;全部是借用視圖,指向 AEC 的 per-hop buffer,到下一次處理呼叫或 reset 前有效,任何 stage 都不得寫入。lane 必須帶 seam(<code>enable_res=0</code>、<code>return_res_context=1</code>,<code>se_derive()</code> 這樣建),否則回 −1。要在鏈上插自己的 stage,就照 <code>se_sample_chain_form()</code> 的順序明寫(<code>tests/test_readme_flow.c</code> 編譯並執行這段,單位 stage 時與手寫 oracle <code>mono_aec_nr_res/tests/conv_chain_mono.h</code> 逐位元相同):</p>
+<pre>aec_process_context(aec, mic, ref);  se_frame_from_aec(aec, &amp;f);
 nr_gain  = se_anr_stage_gain(nr, &amp;f, extra, 1);        /* 無 NR 實例時用 unity 全 1 向量 */
 sk_min_f32(g_total, nr_gain, f.g_res_ctx, f.n_freqs);
 sk_capply_gain_f32(spec, f.e, g_total, f.n_freqs);
 aec_cng_fill(&amp;rng, spec, f.cn, f.g_res_ctx, nr_gain, SE_CNG_NR_GAIN_FLOOR, f.n_freqs);
-audio_pipeline_synthesize(p, spec, out);</pre>
-<p>沒有函式指標表:每個應用把自己的幾行寫出來。<code>AUDIO_PIPELINE_LAYOUT_VERSION = 15</code>。目前的消費者是 <a href="pipeline_dfn_mono.html">pipeline_dfn_mono</a>(自己 carve 增益暫存與 CNG 狀態,不用本實例的 <code>enable_nr</code> 路徑)。</p>
+ac_istft_push(istft, spec, out);</pre>
+<p>沒有函式指標表:每個應用把自己的幾行寫出來。目前的消費者是 <a href="pipeline_dfn_mono.html">pipeline_dfn_mono</a>(<code>enable_nr = 0</code>、<code>with_synthesis = 0</code>,P 交給 DFN2 hop)。</p>
 
 <h3>執行期強度控制</h3>
-<pre>int audio_pipeline_set_aec_preset(AudioPipeline* p, AecPreset preset, float ramp_ms);
-int audio_pipeline_set_nr_mode(AudioPipeline* p, AnrMode mode);
+<pre>int aec_set_preset(Aec* a, AecPreset preset, float ramp_ms);
+int anr_set_mode(AnrDenoiser* nr, AnrMode mode);           /* nr = se_sample_chain_nr(chain) */
 
 /* 使用者轉旋鈕:在兩個 hop 之間呼叫,不重建、不動 pool */
-audio_pipeline_set_aec_preset(p, AEC_PRESET_AGGRESSIVE, 100.0f);   /* 100 ms 內以 dB 線性走到新地板 */
-audio_pipeline_set_nr_mode(p, ANR_MODE_MILD);
-audio_pipeline_process(p, mic, ref, out);                          /* 下一個 hop 起生效 */</pre>
+aec_set_preset(aec, AEC_PRESET_AGGRESSIVE, 100.0f);        /* 100 ms 內以 dB 線性走到新地板 */
+anr_set_mode(se_sample_chain_nr(chain), ANR_MODE_MILD);
+aec_process_context(aec, mic, ref);                        /* 下一個 hop 起生效 */</pre>
 <table>
 <tr><th>呼叫</th><th>改什麼</th><th>回 −1 的情況(−1 時什麼都不寫)</th></tr>
-<tr><td><code>audio_pipeline_set_aec_preset()</code></td><td>底層 <code>Aec</code> 的 far-active 殘留回音地板(三個 preset 唯一的差異軸);轉呼叫 <code>aec_set_preset()</code></td><td><code>p</code> 或其 AEC 為 NULL;<code>preset</code> 超出 enum;<code>ramp_ms</code> 非有限值或超出 [0, 60000]</td></tr>
-<tr><td><code>audio_pipeline_set_nr_mode()</code></td><td>共用降噪器的 tuning 純量</td><td><code>p</code> 為 NULL;<code>aec_only</code> 建置(根本沒有降噪器);<code>mode</code> 超出 enum;重組出的 target 被拒</td></tr>
+<tr><td><code>aec_set_preset()</code></td><td><code>Aec</code> 的 far-active 殘留回音地板(三個 preset 唯一的差異軸;mono 的 <code>g_res_ctx</code> 就是這個 lane 算的)</td><td><code>a</code> 為 NULL;<code>preset</code> 超出 enum;<code>ramp_ms</code> 非有限值或超出 [0, 60000]</td></tr>
+<tr><td><code>anr_set_mode()</code></td><td>範例鏈降噪器的強度 preset</td><td><code>nr</code> 為 NULL(含鏈沒有降噪器、<code>enable_nr = 0</code>);<code>mode</code> 超出 enum</td></tr>
 </table>
-<p><code>ramp_ms == 0</code> 下一個 hop 套用(<b>不是錯誤</b>),落點與「用該 preset 從頭建一個新實例」完全相同;<code>&gt; 0</code> 以 dB 線性走過去,上限 60 s(mild ↔ aggressive 是 18 dB 落差、地板又是硬 clamp,互動式旋鈕應給 ramp)。ramp 途中再呼叫會從當前 live 值重新起走。兩個 setter 都<b>不是重啟</b>:AEC 濾波器與延遲鎖定、NR 噪聲底與增益平滑歷史全部繼續跑(要重啟用 <code>audio_pipeline_reset()</code>)。<b>在兩個 hop 之間呼叫、與 <code>audio_pipeline_process()</code> 序列化;非 thread-safe。</b></p>
-<p class="note"><b>不要繞過 <code>set_nr_mode()</code> 去呼叫 <code>anr_set_mode()</code>。</b>本 pipeline 的 NR 組態是「canonical 強度 preset <b>加上</b>自己的覆寫」(<code>L</code>、<code>alpha_decay</code>;組成見 <code>se_anr_compose_config()</code>,<code>pipelines/common/se_anr_stage.h</code>)。<code>anr_set_mode()</code> 組的是裸的 canonical preset,在本 pipeline 的實例上會被<b>拒絕</b>(它的 <code>L</code> 不同)——所以 <code>audio_pipeline_set_nr_mode()</code> 做的事是重組本 pipeline 的完整組態,再交給 <code>anr_reconfigure()</code>。</p>
+<p><code>ramp_ms == 0</code> 下一個 hop 套用(<b>不是錯誤</b>),落點與「用該 preset 從頭建一個新實例」完全相同;<code>&gt; 0</code> 以 dB 線性走過去,上限 60 s(mild ↔ aggressive 是 18 dB 落差、地板又是硬 clamp,互動式旋鈕應給 ramp)。ramp 途中再呼叫會從當前 live 值重新起走。兩個 setter 都<b>不是重啟</b>:AEC 濾波器與延遲鎖定、NR 噪聲底與增益平滑歷史全部繼續跑(要重啟用 <code>aec_reset()</code> 加 <code>se_sample_chain_reset()</code>)。<b>在兩個 hop 之間呼叫、與 process 序列化;非 thread-safe。</b></p>
+<p class="note">範例鏈的降噪器以 <code>anr_config_for_mode_grid()</code> 建立、沒有覆寫任何欄位,所以 <code>anr_set_mode()</code> 直接換強度。在 preset 之上改過欄位的實例,<code>anr_set_mode()</code> 會把那些覆寫蓋回 preset 值,要自己組好完整 target 再呼叫 <code>anr_reconfigure()</code>。</p>
 <p class="note"><b>A/B 量測時該預期什麼。</b>far-active 地板只在 <b>far-active 且非 double-talk</b> 的 hop 生效:DT 期間套的是 DT 地板(三個 preset <b>完全相同</b>),far-active latch 觸發前套的是 far-silent 地板。同一個 <code>ctx.res_gain</code> 還決定注入的 comfort noise 量(振幅 ∝ <code>sqrt(1 − G_res²)</code> 再乘該 bin 的 NR gain(下限 −10 dB),見下方 block diagram 的 CNG 步驟——地板越深、CNG 反而越多)。所以<b>整段錄音的平均移動幅度會小於 dB 落差所暗示的量</b>,而且只量 echo/degradation 的 A/B 會把 CNG 的變化錯記到別的機制。請在 echo 對齊或 degradation 對齊的條件下比較,並實際試聽。</p>
 
 <h3>逐階段耗時(診斷用)</h3>
-<pre>typedef struct AudioPipelineLastTiming {
-    uint32_t delay_us;      /* AEC: <b>延遲估計 + ring 對齊</b>(matched filter) */
-    uint32_t frontend_us;   /* AEC: 其餘的主濾波器前處理,<b>不含 delay</b>     */
-    uint32_t linear_us;     /* AEC: pbfdkf_process,含 far-end FFT       */
-    uint32_t res_us;        /* AEC: AEC3 post/RES 區塊                  */
-    uint32_t nr_us;         /* r2/PSD_SCALE 摺入 + anr_process_gain() */
-    uint32_t post_us;       /* min(G_nr,G_res)+CNG                      */
-    uint32_t synth_us;      /* IFFT + WOLA + hop 送出                   */
-} AudioPipelineLastTiming;
-
-void audio_pipeline_get_last_timing(const AudioPipeline* p,
-                                    AudioPipelineLastTiming* out);</pre>
-<p>前四欄由 <code>aec_get_last_timing()</code>(<code>aec.h</code>)帶出,後三欄本層自己量。<b>與四聲道版本的差異</b>:那邊把 estimator <b>外提</b>到 wrapper、四條 lane 共用,所以 <code>delay_us</code> 是 wrapper 自己的階段;這裡 estimator 留在單一 AEC 內部,經 <code>aec_get_last_timing()</code> 帶出——<b>同一個量,不同的擁有者</b>。真正沒有的是 <code>fuse_us</code>(只有一條 lane)。</p>
-<p class="note"><b>預設關閉,而且分成兩半。</b>每 hop 這層 4 次、AEC 內部 7 次 clock 讀取,release build 一次都不做,所有欄位讀 0。<code>make PROFILE=1</code> 同時開兩半(<code>-DAUDIO_PIPELINE_STAGE_TIMING=1</code> 與 <code>-DAEC_STAGE_TIMING=1</code>);只開一半是可讀的狀態而非壞掉——另一半讀 0。呼叫端的顯示旗標(兩支 CLI 的 <code>--timing</code>)決定「印不印」,不決定「有沒有量」;建置一種、讀成另一種,報表就是一整排 0(CLI 會用文字說明,不會假裝有數字)。</p>
-<p class="note"><b>目標平台沒有 CLOCK_MONOTONIC 時。</b><code>clock_gettime</code> 是 POSIX 而非 C99。這種平台用 <code>make PROFILE=1 EXTRA_CFLAGS='-DAUDIO_PIPELINE_NOW_US=board_timer_us -DAEC_NOW_US=board_timer_us -include my_timer.h'</code> 換掉時鐘:巨集要是<b>純識別字</b>(Makefile 的 FP policy 不允許 <code>EXTRA_CFLAGS</code> 出現括號),指向不收參數、回傳 <code>uint32_t</code> 微秒的函式,宣告由整合者自備。替代時鐘必須<b>單調</b>,否則無號減法會產生接近 32-bit 全距的荒謬值。每個元件各有自己的覆寫點(這層、<code>lib/aec</code>、四路 pipeline),刻意不共用——一個元件的時鐘屬於該元件自己的建置契約。開著旗標但指向常數函式是合法用法,所有欄位讀 0,<code>--timing</code> 報表無法分辨這種情況與「根本沒開旗標」。</p>
+<pre>typedef struct AecStageTiming {            /* aec.h; aec_get_last_timing(aec, &amp;t) */
+    uint32_t delay_us;      /* <b>延遲估計 + ring 對齊</b>(matched filter) */
+    uint32_t frontend_us;   /* 其餘的主濾波器前處理,<b>不含 delay</b>     */
+    uint32_t linear_us;     /* pbfdkf_process,含 far-end FFT       */
+    uint32_t res_us;        /* AEC3 post/RES 區塊                  */
+} AecStageTiming;</pre>
+<p>四欄由 lib/aec 帶出。鏈與合成的耗時是<b>範例程式自己</b>在呼叫前後讀時鐘量的(<code>mono_aec_nr_res/main.c</code> 的 <code>process_hop()</code> 與 <code>timing_now_us()</code>),不是任何函式庫的 API。<b>與四聲道版本的差異</b>:那邊把 estimator <b>外提</b>到共用 aligner、四條 lane 共用,所以 <code>delay_us</code> 是前端自己的階段;這裡 estimator 留在單一 AEC 內部,經 <code>aec_get_last_timing()</code> 帶出——<b>同一個量,不同的擁有者</b>。真正沒有的是 <code>fuse_us</code>(只有一條 lane)。</p>
+<p class="note"><b>預設關閉。</b>AEC 內部 7 次 clock 讀取,release build 一次都不做,欄位讀 0。<code>make PROFILE=1</code> 開啟(<code>-DAEC_STAGE_TIMING=1</code>)。呼叫端的顯示旗標(兩支 CLI 的 <code>--timing</code>)決定「印不印」,不決定「有沒有量」;建置一種、讀成另一種,AEC 那幾列就是 0(CLI 會用文字說明,不會假裝有數字)。</p>
+<p class="note"><b>目標平台沒有 CLOCK_MONOTONIC 時。</b><code>clock_gettime</code> 是 POSIX 而非 C99。這種平台用 <code>make PROFILE=1 EXTRA_CFLAGS='-DAEC_NOW_US=board_timer_us -include my_timer.h'</code> 換掉 AEC 的時鐘:巨集要是<b>純識別字</b>(Makefile 的 FP policy 不允許 <code>EXTRA_CFLAGS</code> 出現括號),指向不收參數、回傳 <code>uint32_t</code> 微秒的函式,宣告由整合者自備。替代時鐘必須<b>單調</b>,否則無號減法會產生接近 32-bit 全距的荒謬值。每個元件各有自己的覆寫點(<code>lib/aec</code>、四路核心),刻意不共用。開著旗標但指向常數函式是合法用法,所有欄位讀 0,<code>--timing</code> 報表無法分辨這種情況與「根本沒開旗標」。</p>
 <p class="note"><b>各階段不會加總成整通呼叫。</b>餘數含引數檢查、<code>aec_get_res_context()</code>,以及 AEC 內部因此看不見的 stationarity 更新、<code>e2_coarse</code>/ERL 發布、DT analyzer、EPV、shadow_rise、失調估計、功率 EMA 與收斂偵測。呼叫端要呈現完整分解就必須把餘數明列。<b>記錄本身不是條件編譯的,只有取樣是</b>——欄位無論旗標開關都在 struct 裡,所以 profile 與 release build 切出來的 pool 逐位元相同。</p>
-<p>16 kHz/256 ne10 實測(<code>--timing</code>,1250 hops 平均):<code>delay</code> 21.1 us(<b>60.9%</b>)、<code>frontend</code> 2.4 us(6.8%)、<code>linear</code> 1.3 us(3.8%)、<code>res</code> 3.5 us(10.1%)、<code>nr</code> 1.6 us(4.6%)、<code>post</code> 3.1 us(8.9%)、<code>synth</code> 0.2 us(0.5%),已量測合計 33.1 us,未歸屬 1.6 us,整通呼叫 34.6 us。<b>最大的一塊是 matched filter,不是主濾波器</b>(主濾波器只有 3.8%)——這條線直接對應 <code>delay_num_filters</code>(1..5)這個可調旋鈕。</p>
+<p>16 kHz/256 ne10 的 <code>--timing</code> 分解(早期量測,舊版 wrapper 時代 1250 hops 平均;AEC 列來自同一個 lib/aec 計時,沒有重量):<code>delay</code> 21.1 us(<b>60.9%</b>)、<code>frontend</code> 2.4 us(6.8%)、<code>linear</code> 1.3 us(3.8%)、<code>res</code> 3.5 us(10.1%)。<b>最大的一塊是 matched filter,不是主濾波器</b>——這條線直接對應 <code>delay_num_filters</code>(1..5)這個可調旋鈕。鏈與合成的列隨範例而異,待重量。</p>
 
-<p>Descriptor 慣例:<code>AudioPipelineMemReq</code> 為固定 32-byte 同 endian ABI(<code>descriptor_version=2</code> / <code>layout_version=15</code> / <code>backend_id</code> NE10=2 / <code>build_flags_hash</code>=FNV-1a-32(backend+carve token 字串) / <code>alignment=16</code> / <code>reserved=0</code> / <code>bytes</code>)。<code>init_ex</code> 對非 NULL 的 <code>expected</code> 做 8 點整數比對閘(七欄位 + pool 實際 bytes),任何 build/config 變更後必須重新 query。組態驗證是 reject-first:sample_rate 白名單 {8000,16000,48000}、enum/bool 逐項檢查,全部在 <code>derive_dims_and_configs()</code> 一處把關(格點與 <code>AecConfig</code> 由 <code>pipelines/common/se_config.c</code> 的 <code>se_derive()</code> 推導,三個 pipeline 共用)。</p>
-<p><code>AudioPipelineConfig</code> 含四個 delay 相關欄位:<code>filter_length</code>(0=rate default,PBFDKF taps,init-time immutable)、<code>delay_mode</code>(<code>AEC_DELAY_MATCHED</code>|<code>FIXED</code>|<code>EXTERNAL_ALIGNED</code>,語意同 <code>lib/aec</code>)、<code>delay_num_filters</code>(僅 <code>MATCHED</code>,[1,5])、<code>fixed_delay_samples</code>(僅 <code>FIXED</code>,原生取樣點數;其餘模式須為 −1)。<code>audio_pipeline_default_config()</code> 填 <code>MATCHED</code>/n=5/−1。<b>目前兩支 CLI(<code>aec_nr_pipeline</code>/<code>aec_nr_pipeline_static</code>)都沒有對應旗標</b>——只能由呼叫端直接寫 struct 欄位(如板端 adapter 或測試);CLI 只留 <code>--fft-size</code>/<code>--sample-rate</code>。</p>
+<p>Descriptor 慣例:mono 沒有 descriptor 也沒有 layout version(<code>Aec</code>、<code>AnrDenoiser</code>、<code>AecRes</code>、<code>AcIstft</code> 只提供大小查詢,範例鏈是範例碼),所以每次 build 都要重查大小;<code>aec_init()</code> 與 <code>se_sample_chain_init()</code> 只擋下過小或未對齊的 pool、無效 config。需要 descriptor 8 點閘的出貨單元只有 <a href="pipeline_4ch.html">4ch 的 <code>AudioPipeline4Ch</code></a>。組態驗證是 reject-first:sample_rate 白名單 {8000,16000,48000}、enum 逐項檢查在 <code>se_derive()</code> 一處把關(格點與 <code>AecConfig</code> 由 <code>pipelines/common/se_config.c</code> 的 <code>se_derive()</code> 推導,各應用以 <code>SeRules</code> 傳入自己的規則),鏈的 bool／enum 欄位由 <code>se_sample_chain_mem_size()</code> 回 0 拒絕。</p>
+<p><code>SeRequest</code> 含四個 delay 相關欄位:<code>filter_length</code>(0=rate default,PBFDKF taps,init-time immutable)、<code>delay_mode</code>(<code>AEC_DELAY_MATCHED</code>|<code>FIXED</code>|<code>EXTERNAL_ALIGNED</code>,語意同 <code>lib/aec</code>)、<code>delay_num_filters</code>(僅 <code>MATCHED</code>,[1,5])、<code>fixed_delay_samples</code>(僅 <code>FIXED</code>,原生取樣點數;其餘模式須為 −1)。<b>目前兩支 CLI(<code>aec_nr_pipeline</code>/<code>aec_nr_pipeline_static</code>)都沒有對應旗標</b>——只能由呼叫端直接寫 struct 欄位(如板端 adapter 或測試);CLI 只留 <code>--fft-size</code>/<code>--sample-rate</code>。</p>
 
 <h2>Block diagram(每 hop 程式流)</h2>
-<pre>audio_pipeline_process(p, mic, ref, out)
+<pre>process_hop(): (mono_aec_nr_res/main.c)
  │
- ├─ aec_only ──► aec_process(aec, mic, ref, out) ──► return        (0-hop lag)
+ ├─ --aec-only ──► aec_process(aec, mic, ref, out) ──► return        (0-hop lag)
  │
- ├─ analyse_hop(): aec_process_context(aec, mic, ref)  沒有時域輸出 copy
- │      aec_get_res_context() + aec_get_linear_context() → SeSpecFrame f
+ ├─ aec_process_context(aec, mic, ref)  沒有時域輸出 copy
+ ├─ se_frame_from_aec(aec, &amp;f): aec_get_res_context() + aec_get_linear_context() → SeSpecFrame
  │      f.e / y / x / r2 / cn / g_res_ctx / far_hop / formed_hop / delay 旗標(借用)
- ├─ nr_gain = se_anr_stage_gain(nr, &amp;f, extra, !legacy_amin)
- │      extra[k] = f.r2[k]/PSD_SCALE (PSD_SCALE = 32768^2) 折進噪聲底;無 NR 時 nr_gain = unity
- ├─ sk_min_f32(g_total, nr_gain, res_gain)     res_gain = enable_res ? f.g_res_ctx : unity
- ├─ sk_capply_gain_f32(spec, f.e, g_total)
- ├─ aec_cng_fill(&amp;rng_state, spec, f.cn, f.g_res_ctx, nr_gain, SE_CNG_NR_GAIN_FLOOR=0.316, n)
- │      (enable_cng_effective): spec[1..n-2] += sqrt(N²/PSD_SCALE)
- │      * sqrt(1-res_gain²) * max(g_nr[k], 0.316) * AECB_SQRT2_SIN_LUT[ix / (ix+8)&amp;31]
- │      ix = (rng_state*69069+1)&amp;0x7FFFFFFF &gt;&gt; 26, seed SE_CNG_RNG_SEED = 0x9e3779b9
- │      (aec_res.h 的函式,與 lib/aec aec_post.c 同一份 CNG 配方:期望功率不變、|樣本| ≤ sqrt(2))
- └─ synthesize_hop(): ac_istft_push(istft, spec, out)   (AcIstft, ACCUMULATE):
+ ├─ se_sample_chain_form(chain, &amp;f):
+ │    ├─ res_gain = (res == FRAME_GAIN) ? f.g_res_ctx : unity
+ │    ├─ nr_gain = se_anr_stage_gain(nr, &amp;f, extra, !legacy_amin)
+ │    │      extra[k] = f.r2[k]/PSD_SCALE (PSD_SCALE = 32768^2) 折進噪聲底;無 NR 時 nr_gain = unity
+ │    ├─ sk_min_f32(g_total, nr_gain, res_gain)
+ │    ├─ sk_capply_gain_f32(spec, f.e, g_total)
+ │    └─ aec_cng_fill(&amp;rng_state, spec, f.cn, res_gain, nr_gain, SE_CNG_NR_GAIN_FLOOR=0.316, n)
+ │           (enable_cng 且 res != OFF): spec[1..n-2] += sqrt(N²/PSD_SCALE)
+ │           * sqrt(1-res_gain²) * max(g_nr[k], 0.316) * AECB_SQRT2_SIN_LUT[ix / (ix+8)&amp;31]
+ │           ix = (rng_state*69069+1)&amp;0x7FFFFFFF &gt;&gt; 26, seed SE_CNG_RNG_SEED = 0x9e3779b9
+ │           (aec_res.h 的函式,與 lib/aec aec_post.c 同一份 CNG 配方:期望功率不變、|樣本| ≤ sqrt(2))
+ └─ se_sample_chain_synthesize(chain, P, out): ac_istft_push(istft, spec, out)   (AcIstft, ACCUMULATE):
         fft_inverse ─► acc += ifft*w ─► emit hop ─► shift acc    (1-hop lag)
-        (audio_pipeline_synthesize() 走的是同一個函式)</pre>
+ 失敗(任一步被拒或輸出非有限): aec_reset(aec) + se_sample_chain_reset(chain)</pre>
 
 <h2>訊號泳道圖</h2>
 <pre>lane \ hop      #0              #1              #p (穩態)
@@ -137,8 +142,8 @@ Aec (C)         ctx frame0      ctx frame1      ctx frame_p
 NR+RES 融合(C)  g_total frame0  g_total frame1  g_total frame_p (同 hop 算)
 WOLA (C)        out=frame0 前半 out=hop#0 重建   out = hop p-1 的重建
                 (≈0, 半窗 ramp)                  ── 輸出恆落後輸入 1 hop
-─────────────── aec_only 泳道: aec_process 直接輸出 hop p (0-hop lag)</pre>
-<p>NR gain 與 RES gain 都在同一 hop 內算完並套在同一張 <code>ctx.error_spec</code> 上;唯一的 hop-lag 來自最後的 50% overlap WOLA。實測(白噪 cross-correlation,16 kHz 預設格點):full chain lag = 128 samples(1.00 hop),<code>aec_only</code> lag = 0 samples。</p>
+─────────────── --aec-only 泳道: aec_process 直接輸出 hop p (0-hop lag)</pre>
+<p>NR gain 與 RES gain 都在同一 hop 內算完並套在同一張 <code>ctx.error_spec</code> 上;唯一的 hop-lag 來自最後的 50% overlap WOLA。實測(白噪 cross-correlation,16 kHz 預設格點,舊版 wrapper 時代量測;鏈的數學未變):full chain lag = 128 samples(1.00 hop),<code>--aec-only</code> lag = 0 samples。</p>
 
 <h2>I/O 表</h2>
 <table>
@@ -148,54 +153,54 @@ WOLA (C)        out=frame0 前半 out=hop#0 重建   out = hop p-1 的重建
 <tr><td><code>out</code>(out)</td><td>[hop]</td><td>float32</td><td>1 hop(全覆寫)</td><td>同上</td></tr>
 <tr><td><code>ctx.error_spec</code>(內部 seam)</td><td>[n_freqs]</td><td>Complex(2×f32)</td><td>1 frame</td><td>對應 2 hop 分析窗</td></tr>
 <tr><td><code>ctx.res_gain</code>/<code>ctx.r2</code>/<code>ctx.comfort_noise</code></td><td>[n_freqs]</td><td>float32</td><td>1 frame</td><td>—(AEC 內部 buffer 別名,hop 內有效)</td></tr>
-<tr><td>NR gain(<code>anr_get_gain</code>)</td><td>[n_freqs]</td><td>float32</td><td>1 frame</td><td>—</td></tr>
+<tr><td>NR gain(<code>se_sample_chain_last_nr_gain</code>)</td><td>[n_freqs]</td><td>float32</td><td>1 frame</td><td>—</td></tr>
 </table>
 <p>n_freqs = 129(16k 預設)/ 257(16k alt)/ 513(48k)。<code>mic/ref</code> 只在呼叫期間讀取(AEC 自己再 copy 一層),<code>out</code> 從不讀取。</p>
-<p class="note"><b><code>ctx.error_spec</code> 不保證每個 hop 都是誤差。</b>本 pipeline 無條件以 <code>enable_res=0</code> / <code>return_res_context=1</code> 建 AEC,而 <code>lib/aec</code> 的 formed 選擇器<b>只在這個 context-only 模式</b>多開一個 capture 候選:上一個 hop 的濾波品質判定尚未認可線性估計、且被選中的殘差在這個 hop 的能量大於同一 hop 的 mic capture 時,formed 時域 hop 與 <code>ctx.error_spec</code> 一起改送 capture,既有的 30-sample crossfade 承接邊界。換句話說,濾波器在加訊號的 hop 上這條 seam 就是 mic;NR/RES 照常套在它上面。<code>aec_only=1</code> 走 <code>aec_process()</code>,輸出仍是 raw 線性殘差,不受影響。</p>
+<p class="note"><b><code>ctx.error_spec</code> 不保證每個 hop 都是誤差。</b>mono lane 無條件以 <code>enable_res=0</code> / <code>return_res_context=1</code> 建 AEC(<code>se_derive()</code>),而 <code>lib/aec</code> 的 formed 選擇器<b>只在這個 context-only 模式</b>多開一個 capture 候選:上一個 hop 的濾波品質判定尚未認可線性估計、且被選中的殘差在這個 hop 的能量大於同一 hop 的 mic capture 時,formed 時域 hop 與 <code>ctx.error_spec</code> 一起改送 capture,既有的 30-sample crossfade 承接邊界。換句話說,濾波器在加訊號的 hop 上這條 seam 就是 mic;NR/RES 照常套在它上面。<code>--aec-only</code> 走 <code>aec_process()</code>,輸出仍是 raw 線性殘差,不受影響。</p>
 
 <h2>State 表</h2>
-<p>全部 cross-call state 都住在 caller 的單一 pool(C struct 持有;host 只擁有 pool 記憶體本身)。carve 順序 = <code>self, aec, istft(含 fft、窗、acc、time、spec 暫存), nr, g_total, extra, spec</code>(layout v15;pool 大小、carve 順序或 descriptor 內容任一改變,該模組的版本加一)。實測 bytes 為 16 kHz/256 ne10,<code>aec_nr_pipeline_static --print-mem-size</code>:</p>
-<p class="note">FFT backend 預設是 ne10(<code>audiolib</code> 對 NEON 目標自動偵測;見 <code>audio_common.html</code>);下表是 ne10 在 16 kHz/256 的量測值,合計 <b>520,672 B</b>(<code>Aec</code> 397,744 B、<code>FftHandle</code> 7,152 B、NR 109,328 B、pipeline bufs 6,288 B、控制塊 160 B)。</p>
+<p>全部 cross-call state 都住在 caller 的 pool(<code>Aec</code> 一塊、範例鏈一塊,依序放進同一個 16-byte 對齊 block;host 只擁有 pool 記憶體本身)。範例鏈的 carve 順序 = <code>SeSampleChain</code> 控制塊, <code>AecRes</code>(僅 <code>AEC_RES</code>), <code>nr</code>, <code>istft</code>(含 fft、窗、acc、time、spec 暫存), <code>unity</code>, <code>total_gain</code>, <code>extra_noise</code>, <code>spec</code>;它是範例碼,沒有 layout version。實測 bytes 為 16 kHz/256 ne10,<code>aec_nr_pipeline_static --print-mem-size</code>:</p>
+<p class="note">FFT backend 預設是 ne10(<code>audiolib</code> 對 NEON 目標自動偵測;見 <code>audio_common.html</code>);下表是 ne10 在 16 kHz/256 的量測值,合計 <b>457,184 B</b>(<code>Aec</code> 397,744 B、合成 <code>AcIstft</code>(含 <code>FftHandle</code>)11,344 B、NR 45,344 B、鏈控制塊與增益／頻譜暫存 2,752 B)。</p>
 <table>
 <tr><th>state</th><th>shape / size</th><th>存放者</th><th>備註</th></tr>
 <tr><td><code>Aec</code> 全狀態</td><td>397,744 B</td><td>pool(C struct)</td><td>HPF、PBFDKF×2(main+shadow)、delay estimator(<code>delay_mode=MATCHED</code> n=5)、RES context、AEC 內部 FFT</td></tr>
-<tr><td><code>FftHandle</code>(<code>AcIstft</code> 內)</td><td>7,152 B</td><td>pool</td><td>算在 <code>AcIstft</code> 區塊裡;aec_only 時不存在</td></tr>
-<tr><td><code>AnrDenoiser</code></td><td>109,328 B</td><td>pool</td><td>噪聲估計/SPP 等 NR 狀態</td></tr>
-<tr><td><code>AcIstft</code>(不含 FFT)＋ <code>g_total</code>/<code>extra</code>/<code>spec</code></td><td>6,288 B(pipeline bufs)</td><td>pool</td><td>窗表（常數 sqrt periodic Hann）、唯一跨 hop 的音訊累加器 <code>acc</code>、IFFT 輸出、頻譜暫存，以及 hop 內 scratch(carve 時明確清零)；init／reset 清零</td></tr>
-<tr><td><code>rng_state</code></td><td>u32</td><td>C struct(self)</td><td>CNG RNG seed 0x9e3779b9</td></tr>
-<tr><td>合計</td><td>520,672 B(508.5 KB)</td><td>—</td><td>含 160 B 控制塊;pipeline bufs 6,288 B(<code>--print-mem-size</code> 現查)</td></tr>
+<tr><td><code>AcIstft</code>(含 <code>FftHandle</code>)</td><td>11,344 B</td><td>pool</td><td>窗表(常數 sqrt periodic Hann)、唯一跨 hop 的音訊累加器 <code>acc</code>、IFFT 輸出、頻譜暫存;<code>--aec-only</code> 時不存在</td></tr>
+<tr><td><code>AnrDenoiser</code></td><td>45,344 B</td><td>pool</td><td>噪聲估計/SPP 等 NR 狀態</td></tr>
+<tr><td><code>SeSampleChain</code> 控制塊＋ <code>unity</code>/<code>total_gain</code>/<code>extra_noise</code>/<code>spec</code></td><td>2,752 B</td><td>pool</td><td>hop 內 scratch;init 時整塊清零</td></tr>
+<tr><td><code>rng</code></td><td>u32</td><td>鏈控制塊</td><td>CNG RNG seed 0x9e3779b9(<code>se_sample_chain_reset()</code> 重設)</td></tr>
+<tr><td>合計</td><td>457,184 B(446.5 KB)</td><td>—</td><td><code>ALIGN16(Aec)</code> 加鏈;<code>--print-mem-size</code> 現查</td></tr>
 </table>
-<p>delay_mode 對總量的影響(16 kHz/256 ne10;AEC 子項與 <code>lib/aec</code> 一致,這裡多疊了 FFT(OLA)+NR+160 B 控制塊+6,288 B pipeline bufs 的固定開銷)。<b>換 backend/編譯選項/submodule 都會讓這些數字失效,一律現查為準:</b></p>
+<p>delay_mode 對總量的影響(16 kHz/256 ne10;AEC 子項與 <code>lib/aec</code> 一致,鏈的 59,440 B 固定)。<b>換 backend/編譯選項/submodule 都會讓這些數字失效,一律現查為準:</b></p>
 <table>
 <tr><th>delay_mode</th><th>total_bytes</th><th>相對 MATCHED n=5</th></tr>
-<tr><td><code>MATCHED</code> n=5(預設)</td><td>520,672 B</td><td>—</td></tr>
-<tr><td><code>MATCHED</code> n=1</td><td>497,760 B</td><td>−22,912 B</td></tr>
-<tr><td><code>FIXED</code>,fixed=1600(100 ms)</td><td>362,576 B</td><td>−158,096 B</td></tr>
-<tr><td><code>EXTERNAL_ALIGNED</code></td><td>355,664 B</td><td>−165,008 B</td></tr>
+<tr><td><code>MATCHED</code> n=5(預設)</td><td>457,184 B</td><td>—</td></tr>
+<tr><td><code>MATCHED</code> n=1</td><td>434,272 B</td><td>−22,912 B</td></tr>
+<tr><td><code>FIXED</code>,fixed=1600(100 ms)</td><td>299,088 B</td><td>−158,096 B</td></tr>
+<tr><td><code>EXTERNAL_ALIGNED</code></td><td>292,176 B</td><td>−165,008 B</td></tr>
 </table>
-<p class="note">上表用直接呼叫 <code>audio_pipeline_get_mem_requirements()</code>/<code>_get_mem_breakdown()</code> 量得(無對應 CLI 旗標,見上方 API 用法節)。</p>
+<p class="note">上表用直接呼叫 <code>aec_get_mem_size()</code> 加 <code>se_sample_chain_mem_size()</code> 量得(無對應 CLI 旗標,見上方 API 用法節)。</p>
 
 <h2>延遲與 warm-up</h2>
 <ul>
-<li>演算法延遲:full chain = <b>1 hop</b>(實測 128 samples = 8 ms @16k 預設;16k-alt 16 ms、48k ~10.7 ms)。<code>aec_only</code> = <b>0 samples</b>(overlap-save 線性路徑,實測)。</li>
-<li>warm-up:hop#0 輸出僅含半窗 ramp(≈0);AEC 線性濾波器收斂與 delay acquisition 需要 far 活動;NR 噪聲底估計以 wall-clock ~1.5 s 的 retimed 幀數(<code>anr_retime_frames(150, sr, hop)</code>)收斂。</li>
-<li><code>audio_pipeline_reset()</code> 重置 OLA/RNG/hangover 與子模組,等同同 pool 重 init(不重驗 alignment/size)。</li>
-<li><code>audio_pipeline.c</code> 在同一個 processing call 內計算並套用當前 AEC context 與 NR gain；只有最後的 WOLA time-domain emission 形成 1 hop 延遲，與 <code>pipelines/README.md</code> 一致。</li>
+<li>演算法延遲:full chain = <b>1 hop</b>(128 samples = 8 ms @16k 預設;16k-alt 16 ms、48k ~10.7 ms)。<code>--aec-only</code> = <b>0 samples</b>(overlap-save 線性路徑)。</li>
+<li>warm-up:hop#0 輸出僅含半窗 ramp(≈0);AEC 線性濾波器收斂與 delay acquisition 需要 far 活動;NR 噪聲底的最小值追蹤視窗是函式庫預設的 wall-clock 約 512 ms(<code>L</code> 依 hop 換算,16 kHz/256 為 64 hops)。</li>
+<li>重置:<code>aec_reset()</code> 加 <code>se_sample_chain_reset()</code> 重置 OLA/RNG 與子模組,等同同 pool 重 init(不重驗 alignment/size);兩者必須一起呼叫。</li>
+<li>範例在同一個 processing call 內計算並套用當前 AEC context 與 NR gain;只有最後的 WOLA time-domain emission 形成 1 hop 延遲,與 <code>pipelines/README.md</code> 一致。</li>
 </ul>
 
 <h2>相關檔案與測試路徑</h2>
 <table>
 <tr><th>路徑(repo-relative)</th><th>內容</th></tr>
-<tr><td><code>pipelines/mono_aec_nr_res/audio_pipeline.h / .c</code></td><td>本頁 API 與實作(layout v15)</td></tr>
-<tr><td><code>pipelines/common/se_config.h / .c</code></td><td>三個 pipeline 共用的格點解析、檢查與 <code>AecConfig</code> 推導(<code>se_derive()</code>,規則以 <code>SeRules</code> 傳入)</td></tr>
-<tr><td><code>pipelines/common/se_anr_stage.h / .c</code></td><td>NR 級:組態組成、init、逐 hop gain、強度 setter(<code>se_anr_stage_set_mode()</code>)、reset、destroy;與 <code>se_config.o</code> 同為 <code>libaudio_pipeline.a</code> 成員</td></tr>
-<tr><td><code>pipelines/mono_aec_nr_res/main.c</code> / <code>pipelines/mono_aec_nr_res/static_main.c</code></td><td>malloc / static CLI 薄殼(WAV I/O、--debug、--timing、--print-mem-size)</td></tr>
-<tr><td><code>pipelines/mono_aec_nr_res/example_board_adapter.c</code></td><td>板端 adapter 參考(REFERENCE ONLY)</td></tr>
-<tr><td><code>pipelines/mono_aec_nr_res/tests/test_audio_pipeline.c</code></td><td>API 驗收:poisoned-pool create-vs-init byte parity、descriptor 8 點閘、reject-first 驗證,8k/16k/48k 各跑一輪,以及 <code>test_stage_seam_chain</code>(process_spec ＋ 明寫鏈 ＋ synthesize 對 process 逐位元相同,aec_only 被拒)</td></tr>
-<tr><td><code>pipelines/Makefile</code></td><td>targets:<code>all</code>/<code>test</code>/<code>libaudio_pipeline.a</code>/<code>audit-no-stdio</code>/<code>publish</code>;-ffp-contract=off 最後附加</td></tr>
-<tr><td><code>pipelines/common/se_stage.h</code></td><td><code>SeSpecFrame</code>、<code>SE_CNG_NR_GAIN_FLOOR</code>、<code>SE_CNG_RNG_SEED</code>、<code>se_res_stage_gain()</code></td></tr>
+<tr><td><code>pipelines/samples/se_sample_chain.h</code></td><td>範例鏈(header-only,沒有 ABI):RES 增益、NR 增益、min、apply、CNG、合成</td></tr>
+<tr><td><code>pipelines/samples/se_anr_stage.h</code></td><td>NR 級的逐 hop gain(<code>se_anr_stage_gain()</code>,把 AEC 殘留回音功率折入噪聲底);降噪器本身是函式庫的 preset(<code>anr_config_for_mode_grid()</code>)</td></tr>
+<tr><td><code>pipelines/common/se_config.h / .c</code></td><td>格點解析、檢查與 <code>AecConfig</code> 推導(<code>se_derive()</code>,規則以 <code>SeRules</code> 傳入);<code>se_config.o</code> 由範例直接連結</td></tr>
+<tr><td><code>pipelines/common/se_stage.h</code></td><td><code>SeSpecFrame</code>、<code>se_frame_from_aec()</code>、<code>se_res_stage_gain()</code>、<code>SE_CNG_NR_GAIN_FLOOR</code>、<code>SE_CNG_RNG_SEED</code></td></tr>
+<tr><td><code>pipelines/mono_aec_nr_res/main.c</code> / <code>pipelines/mono_aec_nr_res/static_main.c</code></td><td>malloc / static CLI 範例(組合、WAV I/O、--debug、--timing、--print-mem-size)</td></tr>
+<tr><td><code>pipelines/mono_aec_nr_res/example_board_adapter.c</code></td><td>板端 adapter 參考(REFERENCE ONLY):pool 大小加總、過小／未對齊 pool 與重複 destroy 的拒絕</td></tr>
+<tr><td><code>pipelines/mono_aec_nr_res/tests/test_mono_chain.c</code></td><td>鏈驗收:poisoned-pool 與 heap byte parity、reset==fresh、NR／RES／CNG 開關、comfort noise 契約、鏈對手寫 oracle <code>conv_chain_mono.h</code> 逐位元相同,8k/16k/48k 各跑一輪</td></tr>
+<tr><td><code>pipelines/Makefile</code></td><td>targets:<code>all</code>/<code>test</code>/<code>libaudio_pipeline_dfn.a</code>/<code>audit-no-stdio</code>/<code>publish</code>;-ffp-contract=off 最後附加</td></tr>
 <tr><td><code>pipelines/aec_nr_pipeline.py</code>、<code>pipelines/se_stage.py</code></td><td>Python reference(PROD_* 常數同源;<code>total_gain</code>／<code>apply_gain</code>／<code>comfort_noise_fill</code>／<code>synthesize_hop</code> 與 C 的 stage 一一對應)</td></tr>
 </table>
-<p>測試實測(BACKEND=ne10 預設):<code>mono_aec_nr_res/</code> 目錄 <code>make test</code>(= <code>test_audio_pipeline</code> + 建置 <code>example_board_adapter</code>,不含 ULCNet——已移到 <code>mono_alignulcnet/</code>)共 <b>136 行 PASS: / 0 FAIL</b>,結尾 <code>ALL PASS</code>。</p>
+<p>測試實測(BACKEND=ne10,SIMD=1):<code>test_mono_chain</code> 共 <b>83 行 PASS / 0 FAIL</b>,結尾 <code>ALL PASS</code>;<code>example_board_adapter</code>:2 個正向循環加 5 項負向檢查全過。</p>
 </body>
 </html>

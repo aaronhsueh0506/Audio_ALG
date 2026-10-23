@@ -1,43 +1,46 @@
 # 4-channel AEC + beamformer (bf) + RES + DeepFilterNet2
 
-This wrapper replaces the post-beam MMSE-LSA denoiser of the four-channel
+This example replaces the post-beam MMSE-LSA denoiser of the four-channel
 core (`4ch_aec_bf_nr_res/4aec_nr_res.h`) with DeepFilterNet2 while keeping
-the shared delay estimator, the four linear AEC lanes, the external
-beamformer (bf) seam, the post-beam AEC3 residual suppressor, the comfort-noise recipe and
-the synthesis WOLA. The front end is configured with `enable_post=1`,
-`enable_res=1`, `enable_nr=0`; this application chains its own RES and
-synthesis and inserts the network between the post-RES spectrum and the
-synthesis:
+the shared delay estimator, the four linear AEC lanes, the beamformer (bf)
+seam, the post-beam AEC3 residual suppressor and the comfort-noise recipe. There is no DFN
+wrapper library: `main.c` initialises the core (`FourAecNrRes`), the gain chain
+`samples/se_sample_chain.h` (RES gain only: `enable_nr = 0`, no synthesis) and the DFN2 stage
+(or the rate bridge) separately, and `samples/dfn_hop.h` runs the network between the
+post-RES spectrum and the synthesis:
 
 ```text
-mics/ref -> four_aec_dfn_res_front_process()         four lanes, front view
-            (external beamformer (bf) -> effective weights, optional trusted spectrum)
-         -> four_aec_dfn_res_process_begin(weights, error)
+mics/ref -> four_aec_front_process(core, mics, far, &front)   four lanes, front view
+            (beamformer (bf) -> effective weights, optional trusted spectrum)
+         -> four_aec_fuse(core, weights, trusted, &frame)
               E = beamformed error spectrum         -> DFN2 feature input
+         -> P = se_sample_chain_form(chain, &frame)
               P = E * G_res + comfort noise         -> DFN2 applied here
-         -> while (nn_begin(&job) > 0) { run the model on the job; nn_end(rc) }
-         -> four_aec_dfn_res_process_end(out)       -> enhanced P, frame t-2,
-                                                       this app's iFFT / OLA
+         -> dfn_hop_begin(&hop, frame.e, P)
+         -> while (dfn_hop_nn_begin(&hop, &job) > 0) { run the model on the job; dfn_hop_nn_end(&hop, rc) }
+         -> dfn_hop_end(&hop, out)                  -> enhanced P, frame t-2,
+                                                       the host's iFFT / OLA
 ```
 
-The external beamformer seam is the same as `FourAecNrRes`'s: `process_begin()`
-reconstructs the beamformed error from the weights, or takes the BF's own
-spectrum when one is passed (`four_aec_fuse()`). `four_aec_dfn_res_process()`
-is the sequence of the four calls with `dfn_res_stage_infer()` as the model
-runner. This application owns its RES, gain scratch, comfort-noise state and
-ISTFT: the front end carries none of them. The
+The beamformer seam is the same as `FourAecNrRes`'s: `four_aec_fuse()` reconstructs the
+beamformed error from the weights, or takes the BF's own spectrum when one is passed.
+`dfn_hop_process(&hop, frame.e, P, out)` is the sequence of the `dfn_hop_*` calls with the
+model callback (`dfn_res_stage_infer()` here) as the runner. The example owns its RES, gain
+scratch and comfort-noise state in the chain and the ISTFT in the `DfnHop`: the core carries none
+of them, and a refused call resets the core, the chain and the `DfnHop` together
+(`dfn_reset()` in `main.c`). The
 network estimates from the beamformed error and is applied to the post-RES
-spectrum. The core's comfort-noise fill is kept as a switch but is OFF by
+spectrum. The comfort-noise fill is kept as a switch but is OFF by
 default in this variant: with it on, the additive fill perturbs P's phase in
 the RES-cut bins, which breaks the estimate/apply phase consistency the
 complex deep filter relies on (when on it travels through the network with the
 rest of P and `atten_lim_db` bounds the attenuation of every bin). With no model callback
 (or a failing one) the output is the
-conventional core with `enable_nr=0` delayed: bit for bit by two hops at
-48 kHz (the acceptance gate in `tests/test_4aec_dfn_res.c` asserts it for
-both post entries, with comfort noise off and on, across a real
+conventional chain with the denoiser off delayed: bit for bit by two hops at
+48 kHz (the acceptance gate in `tests/test_4ch_dfn.c` asserts it against the hand-written chain of
+`4ch_aec_bf_nr_res/tests/conv_chain_4ch.h`, with comfort noise off and on, across a real
 shared-estimator delay re-lock, on a stimulus where a RES-off core provably
-differs), and through the resampler round trip by the bridge delay at
+differs, and checks that the stage is not reset on the shared aligner's delay change), and through the resampler round trip by the bridge delay at
 16 kHz (the same test pins the delay with a near-end impulse, the frame
 schedule, and the pass-band error against the conventional 16 kHz core,
 measured at 1e-5).
@@ -59,11 +62,11 @@ Build and test from `pipelines/4ch_aec_bf_nr_res/` (the directory `Makefile`
 forwards):
 
 ```sh
-make WERROR=1 lib4aec_dfn_res.a 4ch_aec_bf_dfn_res
-make WERROR=1 test        # includes test_4aec_dfn_res and the skeleton
+make WERROR=1 libdfn_res_stage.a 4ch_aec_bf_dfn_res
+make WERROR=1 test        # includes test_4ch_dfn and the skeleton
 ```
 
-`lib4aec_dfn_res.a` holds the wrapper, the shared stage and the DFN2 host
+`libdfn_res_stage.a` holds the shared stage, the rate bridge and the DFN2 host
 pre/post objects; link it with `libaudio_pipeline_4ch.a` (the core), `libaec`,
 `libanr` and `libaudio_common`. The board supplies the stateless model
 callback (`DFN2Model`) and the exported ERB matrices. `main.c` is the board
@@ -74,7 +77,7 @@ publishes the compiled-in model I/O descriptor, which a product replaces with
 the one from its model's exported metadata).
 
 The Python evaluator compares the original NR+RES tail, RES-only and the DFN
-feature-source experiments on the same fused contexts. The C wrapper ships
+feature-source experiments on the same fused contexts. The C example uses
 the beamformed-error source only; a raw-capture or single-lane estimate is
 not phase-consistent with the post-beam spectrum, so those arms are
 meaningful with the mask-only compose and stay experiments:
@@ -105,10 +108,10 @@ mono mic+render+output, or 9.472 MMAC/s for four mics+render+output. The DFN
 model dominates this arithmetic budget; A53/A73 CPU-only admission still
 requires the final int8/fp runtime and board cycle measurement.
 
-Host DSP pool (`four_aec_dfn_res_get_mem_requirements`, matched delay,
-five-filter bank, NE10): 1,400,048 bytes at the 16 kHz default (core plus
-the rate bridge) and 3,762,336 bytes at 48 kHz (the conventional
-four-channel MMSE-LSA pipeline on the 48 kHz grid needs 3,861,408 bytes).
+Pool printed by the skeleton (`4ch_aec_bf_dfn_res`, matched delay, five-filter bank, NE10; the
+core, the RES chain and the stage or bridge, each 16-byte aligned): 1,400,416 bytes at the 16 kHz
+default (core plus the rate bridge) and 3,764,240 bytes at 48 kHz (the conventional
+four-channel MMSE-LSA chain on the 48 kHz grid needs 3,672,720 bytes).
 Model weights and accelerator activation/workspace memory are external;
 adding int8 weights alone brings the known minimum to about 3.4 MiB at
 16 kHz.

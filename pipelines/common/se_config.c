@@ -60,7 +60,6 @@ int se_derive(const SeRequest* req, const SeRules* rules,
         return -1;
     }
     if (!preset_valid(req->aec_preset)) return -1;
-    if (rules->with_nr && !anr_nr_mode_is_valid(req->nr_mode)) return -1;
     if (req->filter_length < 0 || req->filter_length > SE_FILTER_LENGTH_MAX) return -1;
     if (rules->check_delay && !delay_request_valid(req)) return -1;
 

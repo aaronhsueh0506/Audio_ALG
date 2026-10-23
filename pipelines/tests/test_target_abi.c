@@ -12,12 +12,10 @@
 #include <stdlib.h>
 #include <string.h>
 
-#include "audio_pipeline.h"
-#include "audio_pipeline_ulcnet.h"
+#include "4aec_nr_res.h"
 #include "audio_pipeline_4ch.h"
-#include "audio_pipeline_4ch_ulcnet.h"
-#include "audio_pipeline_dfn.h"
-#include "4aec_dfn_res.h"
+#include "dfn_res_stage.h"
+#include "dfn_rate_bridge.h"
 #include "dfn2_prepost.h"
 #include "dfn3_prepost.h"
 #include "ulcnet_prepost.h"
@@ -62,20 +60,14 @@ static unsigned cases;
 
 int main(int argc, char **argv) {
     uint32_t pointer_bytes = (uint32_t)sizeof(void *), foreign_pointer_bytes;
-    AudioPipelineConfig mono = audio_pipeline_default_config(16000);
     FourAecNrResConfig core = four_aec_nr_res_default_config(16000);
     AudioPipeline4ChConfig spatial = audio_pipeline_4ch_default_config(16000);
-    AudioPipelineUlcnetConfig mono_ulc =
-        audio_pipeline_ulcnet_default_config(ULCNET_SR);
-    AudioPipeline4ChConfig spatial_ulc = audio_pipeline_4ch_ulcnet_default_config();
     DFN2PrepostConfig dfn2;
     DFN3PrepostConfig dfn3;
     UlcnetPrepostConfig ulc;
     DeepVqePrepostConfig deep;
     DfnResStageConfig stage = dfn_res_stage_default_config(DFN2_SR);
     DfnRateBridgeConfig bridge = dfn_rate_bridge_default_config(16000);
-    MonoAecDfnResConfig mono_dfn = mono_aec_dfn_res_default_config();
-    FourAecDfnResConfig spatial_dfn = four_aec_dfn_res_default_config();
 
     if (argc == 3 && strcmp(argv[1], "--write") == 0) {
         write_file = fopen(argv[2], "wb");
@@ -100,23 +92,16 @@ int main(int argc, char **argv) {
     dfn2.erb_inv = dfn3.erb_inv = erb_inv;
     stage.erb_fwd = bridge.stage.erb_fwd = erb_fwd;
     stage.erb_inv = bridge.stage.erb_inv = erb_inv;
-    mono_dfn.erb_fwd = spatial_dfn.erb_fwd = erb_fwd;
-    mono_dfn.erb_inv = spatial_dfn.erb_inv = erb_inv;
 
     EXERCISE(dfn2_prepost, DFN2PrepostMemReq, dfn2);
     EXERCISE(dfn3_prepost, DFN3PrepostMemReq, dfn3);
     EXERCISE(ulcnet_prepost, UlcnetPrepostMemReq, ulc);
     EXERCISE(deepvqe_prepost, DeepVqePrepostMemReq, deep);
-    EXERCISE(audio_pipeline, AudioPipelineMemReq, mono);
     EXERCISE(four_aec_nr_res, FourAecNrResMemReq, core);
     EXERCISE(audio_pipeline_4ch, AudioPipeline4ChMemReq, spatial);
-    EXERCISE(audio_pipeline_ulcnet, AudioPipelineUlcnetMemReq, mono_ulc);
-    EXERCISE(audio_pipeline_4ch_ulcnet, AudioPipeline4ChUlcnetMemReq, spatial_ulc);
     EXERCISE(dfn_res_stage, DfnResStageMemReq, stage);
     EXERCISE(dfn_rate_bridge, DfnRateBridgeMemReq, bridge);
-    EXERCISE(mono_aec_dfn_res, MonoAecDfnResMemReq, mono_dfn);
-    EXERCISE(four_aec_dfn_res, FourAecDfnResMemReq, spatial_dfn);
-    assert(cases == 13u);
+    assert(cases == 8u);
     if (write_file) assert(fclose(write_file) == 0);
     if (foreign_file) {
         assert(fgetc(foreign_file) == EOF);

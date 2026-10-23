@@ -1,4 +1,4 @@
-/** Implementation of 4aec_nr_res.h: one shared DelayAec -> one aligned render -> four independent linear AEC filters -> externally supplied beamformer weights -> coherent projection of the four lane contexts (four_aec_fuse). The application chains the RES, NR, comfort-noise and synthesis stages over the fused frame. Pool-first layout as AudioPipeline; create() is the heap convenience. */
+/** Implementation of 4aec_nr_res.h: one shared DelayAec -> one aligned render -> four independent linear AEC filters -> externally supplied beamformer weights -> coherent projection of the four lane contexts (four_aec_fuse). The application chains the RES, NR, comfort-noise and synthesis stages over the fused frame. Pool-first layout; create() is the heap convenience. */
 
 #include <stdlib.h>
 #include <string.h>
@@ -13,7 +13,6 @@
 #include "4aec_projection_kernels.h"
 #include "utility/simd_kernel_nn.h"        /* skn_all_finite_cf32 */
 #include "common/se_config.h"     /* se_derive(): grid + AecConfig, shared by every application */
-#include "common/se_anr_stage.h"  /* se_anr_compose_config()                                     */
 
 /* Matched-filter duty cycle: full-rate analysis until the estimate has been solid and unchanged for delay_est_init_s (lane AecConfig), then one hop in K = round(delay_est_period_s / hop_s) / DUTY_PERIOD_DIVISOR (cfg.delay_est_period_s). Divisor and hold floor are the schedule's shape; the period floor is 1, so 0.0 means true full rate. The watchdog leak is lib/aec's 0.1 dB per second, converted to this grid's hop by duty_leak_db_for_grid(). */
 #define DUTY_PERIOD_DIVISOR       5
@@ -165,7 +164,7 @@ static float duty_leak_db_for_grid(int hop_size, int sample_rate) {
 }
 
 /* Returns 1 and fills the out-params, or 0 (NULL argument; rate outside {16000,
- * 48000}; grid, preset, mode, flag, filter length or delay setting outside its range;
+ * 48000}; grid, flag, filter length or delay setting outside its range;
  * or a MATCHED/FIXED request whose delay ring or estimator cannot be sized). Grid,
  * AecConfig and the delay-request rules come from se_derive(); what only this core has
  * (capture proxy, quarantine and delay-line ranges, shared ring and estimator sizes) is
@@ -187,10 +186,10 @@ static int derive_dims_and_configs(
         !n_freqs || !delay_ring_size ||
         !delay_estimator_bytes) return 0;
 
-    if (!se_flag_valid(cfg->enable_cng) || !se_flag_valid(cfg->legacy_amin) ||
-        !se_flag_valid(cfg->enable_post) || !se_flag_valid(cfg->enable_nr) ||
-        !se_flag_valid(cfg->enable_res)) return 0;
+    if (!se_flag_valid(cfg->enable_post)) return 0;
 
+    memset(&rules, 0, sizeof(rules));
+    memset(&req, 0, sizeof(req));
     rules.allow_8k = 0;
     rules.fixed_rate = 0;
     rules.fixed_fft = 0;
@@ -200,7 +199,6 @@ static int derive_dims_and_configs(
      * context; with a post stage the lanes' own G_res is still never read. */
     rules.spatial_context =
         cfg->enable_post ? AEC_CONTEXT_NO_GAIN : AEC_CONTEXT_LINEAR_ONLY;
-    rules.with_nr = 1;
 
     req.sample_rate = cfg->sample_rate;
     req.fft_size = cfg->fft_size;
@@ -208,8 +206,7 @@ static int derive_dims_and_configs(
     req.delay_mode = cfg->delay_mode;
     req.delay_num_filters = cfg->delay_num_filters;
     req.fixed_delay_samples = cfg->fixed_delay_samples;
-    req.aec_preset = cfg->aec_preset;
-    req.nr_mode = cfg->nr_mode;
+    req.aec_preset = AEC_PRESET_BALANCED;
     if (se_derive(&req, &rules, &grid, aec_cfg) != 0) return 0;
 
     if (cfg->capture_proxy_channel < 0 ||
@@ -391,7 +388,7 @@ static uint32_t four_aec_nr_res_build_flags_hash(void) {
     uint32_t hash = 2166136261u;
     hash = fnv1a_str(AUDIO_PIPELINE_BACKEND_STR, hash);
     hash = fnv1a_str(
-        "|carve:self" LANE_TAG(0) LANE_TAG(1) LANE_TAG(2) LANE_TAG(3) ",hop2,"
+        "|carve:self(cfg-delay-v2)" LANE_TAG(0) LANE_TAG(1) LANE_TAG(2) LANE_TAG(3) ",hop2,"
         "fuse?(complex4,float2),"
         "lanebind,delayest?,delayring?",
         hash);
@@ -413,13 +410,7 @@ FourAecNrResConfig four_aec_nr_res_default_config(int sample_rate) {
     cfg.delay_backward_quarantine_s = 1.0f;
     cfg.delay_est_period_s = 0.0f;   /* full rate; see 4aec_nr_res.h */
     cfg.max_delay_ms = 1024.0f;
-    cfg.aec_preset = AEC_PRESET_BALANCED;
-    cfg.nr_mode = ANR_MODE_BALANCED;
     cfg.enable_post = 1;
-    cfg.enable_res = 1;
-    cfg.enable_nr = 1;
-    cfg.enable_cng = 1;
-    cfg.legacy_amin = 0;
     return cfg;
 }
 
@@ -1136,22 +1127,6 @@ int four_aec_fuse(
     frame->delay_changed = p->last_delay.changed;
     frame->delay_locked = p->last_delay.solid;
     return FOUR_AEC_NR_RES_OK;
-}
-
-int four_aec_nr_res_stage_configs(
-    const FourAecNrResConfig* cfg,
-    AecConfig* res_cfg,
-    AnrConfig* nr_cfg) {
-    int fft, hop, n, delay_ring_size;
-    size_t delay_estimator_bytes;
-    if (!res_cfg || !nr_cfg || !derive_dims_and_configs(
-            cfg, res_cfg, &fft, &hop, &n, &delay_ring_size,
-            &delay_estimator_bytes)) return -1;
-    if (cfg->enable_nr)
-        *nr_cfg = se_anr_compose_config(cfg->sample_rate, fft, hop, cfg->nr_mode);
-    else
-        memset(nr_cfg, 0, sizeof(*nr_cfg));
-    return 0;
 }
 
 /* Legal at any time. A caller holding a FourAecFront must stop reading its pointers: they

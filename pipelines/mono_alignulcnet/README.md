@@ -1,9 +1,11 @@
 # Mono PBFDKF + Align-ULCNet application
 
 This directory is an application integration example, not another DSP
-library. The executable directly links the pipeline wrapper object, the
-Align-ULCNet C pre/post-processing object, and the existing AEC/audiolib/common
-libraries.
+library, and there is no mono unit: `main.c` composes lib/aec's `Aec` (the linear stage) with the
+example stage `samples/ulcnet_nn_stage.{h,c}` (far-end STFT, model call policy, WOLA). The
+executable links the stage object, the Align-ULCNet C pre/post-processing object, and the existing
+AEC/audiolib/common libraries. The AEC and the stage are initialised separately
+(`aec_get_mem_size()`, `ulcnet_nn_stage_mem_size()`); the example prints both pool sizes.
 
 `main.c` shows the board boundary. CPU memory owns the K/V windows, logit
 window and GRU hidden state through `ulcnet_accelerator_adapter`; only the
@@ -24,9 +26,9 @@ to form the linear error; the model's TA block aligns raw far to that error.
 The model state is reset when the AEC delay regime changes, including FIXED
 mode's first usable error. The C-side STFT keeps running across it, so the
 frames still straddling the error change emit identity WITHOUT stepping the model:
-`AUDIO_PIPELINE_ULCNET_REPRIME_FRAMES` = 1 frame (both branches are framed
-from the current hop, as in the 4ch wrapper). The constant is derived and
-asserted by the straddle-derivation test, not estimated.
+`ULCNET_NN_STAGE_REPRIME_FRAMES` = 1 frame (both branches are framed
+from the current hop, as in the 4ch example). The constant is derived and
+asserted by the straddle-derivation test (`tests/test_mono_ulcnet.c`), not estimated.
 
 Raw/aligned selection exists only in `sweep_delay_depth.py`, not in this
 runtime API. Export metadata requires the checkpoint and deployment contracts
@@ -34,22 +36,29 @@ to both be raw far.
 
 ## One hop in phases
 
-`audio_pipeline_ulcnet_process()` is the sequence below with the config's model
-callback. A board that runs the network itself (the NPU between `nn_begin` and
+`ulcnet_nn_stage_process()` is the sequence below with the model callback installed
+on the stage. A board that runs the network itself (the NPU between `nn_begin` and
 `nn_end`) calls the phases directly and needs no `infer` callback:
 
 ```c
 UlcnetNnJob job;
-audio_pipeline_ulcnet_process_begin(p, mic, ref);        /* AEC, both analyses */
-if (audio_pipeline_ulcnet_nn_begin(p, &job) > 0) {       /* 1 = a frame to run */
+UlcnetNnDelay delay;                                     /* from AecLinearContext.delay_state */
+aec_process_context(aec, mic, ref);                      /* linear stage */
+aec_get_res_context(aec, &rctx);  aec_get_linear_context(aec, &lctx);
+delay.changed = lctx.delay_state == AEC_LINEAR_DELAY_CHANGED;
+delay.solid   = lctx.delay_state != AEC_LINEAR_DELAY_UNLOCKED;
+ulcnet_nn_stage_begin_time(stage, rctx.formed_hop, ref, delay);   /* far analysis, reprime / model reset */
+if (ulcnet_nn_stage_nn_begin(stage, &job) > 0) {         /* 1 = a frame to run */
     int rc = run_network(&job);                          /* write every bin of job.out_re/out_im */
-    audio_pipeline_ulcnet_nn_end(p, rc);                 /* accepted only if rc == 0 and finite */
+    ulcnet_nn_stage_nn_end(stage, rc);                   /* accepted only if rc == 0 and finite */
 }
-audio_pipeline_ulcnet_process_end(p, out);               /* WOLA, one hop */
+ulcnet_nn_stage_end(stage, out);                         /* WOLA, one hop */
+/* on any negative return: aec_reset(aec); ulcnet_nn_stage_reset(stage); */
 ```
 
 A frame left open or never fetched is the identity (fail-open); the reprime
-frame after an alignment boundary has no model frame (`nn_begin` returns 0).
+frame after an alignment boundary has no model frame (`nn_begin` returns 0). The stage is built
+with `ulcnet_nn_stage_mem_size(1)` here because the time-domain error entry needs its own STFT.
 
 ## Delay profile
 

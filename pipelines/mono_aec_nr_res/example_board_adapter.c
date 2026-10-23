@@ -1,43 +1,46 @@
-/** Reference board-adapter integration example for audio_pipeline.h (REFERENCE
- * ONLY): a compilable host simulation of a board-side common-memory-manager
- * integration. It shows the calling sequence, error handling and memory-descriptor
- * contract of pipelines/README.md "Board Integration". It does not replace the
- * platform adapter, memory manager, target build or link map. Every `board_mem_*`
- * function is a stand-in over a static host array; points where platform code must
- * be substituted are marked `BOARD:`.
+/** Reference board-adapter integration example for the mono AEC -> NR -> RES chain (REFERENCE
+ * ONLY): a compilable host simulation of a board-side common-memory-manager integration. It
+ * shows the calling sequence, error handling and pool-size accounting of pipelines/README.md
+ * "Board Integration". It does not replace the platform adapter, memory manager, target build
+ * or link map. Every `board_mem_*` function is a stand-in over a static host array; points
+ * where platform code must be substituted are marked `BOARD:`.
  * Build/run (from pipelines/):  make example-adapter
- * Flow: 1 query audio_pipeline_get_mem_requirements() (every time, never cached
- * across a build/backend/config change); 2 allocate (board_mem_alloc); 3
- * audio_pipeline_init_ex(pool, req.bytes, &cfg, &req) with the queried `req` as
- * `expected`; 4 process N hops; 5 audio_pipeline_reset(); 6 process N more hops; 7
- * audio_pipeline_destroy(); 8 board_mem_free() (after 7). The cycle then repeats on
- * the same arena (pool reuse). run_negative_demonstrations() checks the rejection
- * paths: undersized pool, misaligned pool, stale descriptor (backend_id /
- * descriptor_version / build_flags_hash), double destroy, and that a rejected
- * init_ex() leaves the pool usable.
- * Exit code 0 iff every step succeeded and every negative demonstration rejected
- * what it should. */
+ *
+ * The integrator sums the pool of each stage it uses. Here that is lib/aec's Aec
+ * (aec_get_mem_size) followed by the gain chain of samples/se_sample_chain.h
+ * (se_sample_chain_mem_size), both 16-byte aligned, in one block.
+ * Flow: 1 size the pool from the two stage queries (every time, never cached across a build or
+ * config change); 2 allocate (board_mem_alloc); 3 aec_init() and se_sample_chain_init() on the
+ * block; 4 process N hops; 5 reset both stages; 6 process N more hops; 7 destroy both stages;
+ * 8 board_mem_free() (after 7). The cycle then repeats on the same arena (pool reuse).
+ * run_negative_demonstrations() checks the rejection paths: undersized pool, misaligned pool,
+ * double destroy, and that a rejected init leaves the pool usable.
+ * Exit code 0 iff every step succeeded and every negative demonstration rejected what it
+ * should. */
 
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 #include <stdint.h>
 
-#include "audio_pipeline.h"
+#include "aec.h"
+#include "common/se_config.h"
+#include "common/se_stage.h"
+#include "samples/se_sample_chain.h"
+#include "utility/mem_align.h"
 
 /* board_mem: simulated platform common-memory manager (REFERENCE ONLY).
  * BOARD: replace this whole module with the platform's memory manager; it only needs
  * a capacity check, an alloc and a free. The arena covers the largest supported
  * configuration (48 kHz, balanced presets) plus headroom; BOARD: size the real pool
- * from the configs the product ships, using
- * audio_pipeline_get_mem_requirements() / audio_pipeline_get_mem_breakdown(). */
+ * from the configs the product ships, using the size queries of the stages. */
 #define BOARD_ARENA_BYTES ((size_t)2u * 1024u * 1024u)  /* 2 MiB */
 
 static uint8_t g_board_arena[BOARD_ARENA_BYTES] __attribute__((aligned(16)));
 static int     g_board_mem_in_use = 0;   /* exclusive-lifetime simulation */
 
 /** BOARD: replace with the platform allocator. Must return a pointer aligned to at
- * least `alignment` with at least `bytes` usable bytes, or NULL; init_ex() re-checks
+ * least `alignment` with at least `bytes` usable bytes, or NULL; the stage inits re-check
  * both. The capacity check below stands in for the pool manager's own accounting. */
 static void* board_mem_alloc(uint64_t bytes, uint32_t alignment) {
     if (g_board_mem_in_use) {
@@ -52,7 +55,7 @@ static void* board_mem_alloc(uint64_t bytes, uint32_t alignment) {
         return NULL;
     }
     if (((uintptr_t)g_board_arena) % alignment != 0) {
-        /* Fails loudly here instead of as a confusing rejection in init_ex(). */
+        /* Fails loudly here instead of as a confusing rejection in the init. */
         fprintf(stderr, "board_mem_alloc: arena base is not %u-byte aligned\n", alignment);
         return NULL;
     }
@@ -78,9 +81,86 @@ static void board_mem_free(void* p) {
      * cache maintenance of its own. */
 }
 
+/* The mono stages of one product configuration and the pool they share. */
+
+#define POOL_ALIGNMENT 16u
+
+typedef struct MonoPlan {
+    SeGrid grid;
+    AecConfig aec_cfg;
+    SeSampleChainConfig chain_cfg;
+    size_t aec_bytes, chain_bytes, total;
+} MonoPlan;
+
+typedef struct MonoStages {
+    Aec* aec;
+    SeSampleChain* chain;
+} MonoStages;
+
+/** Step 1: the lane's grid and AecConfig, the chain config, and the pool as the sum of the two
+ * stage sizes. Returns 0, or -1 for a configuration a stage refuses. */
+static int mono_plan(MonoPlan* plan, int sample_rate) {
+    static const SeRules rules = { .allow_8k = 1, .spatial_context = SE_CONTEXT_PRESET };
+    SeRequest req;
+    memset(plan, 0, sizeof(*plan));
+    memset(&req, 0, sizeof(req));
+    req.sample_rate = sample_rate;
+    req.delay_mode = AEC_DELAY_MATCHED;
+    req.delay_num_filters = DA_NUM_FILTERS;
+    req.fixed_delay_samples = -1;
+    req.aec_preset = AEC_PRESET_BALANCED;
+    if (se_derive(&req, &rules, &plan->grid, &plan->aec_cfg) != 0) return -1;
+    plan->chain_cfg = se_sample_chain_default_config(sample_rate, plan->grid.fft_size);
+    plan->chain_cfg.res = SE_SAMPLE_RES_FRAME_GAIN;
+    plan->aec_bytes = aec_get_mem_size(&plan->aec_cfg);
+    plan->chain_bytes = se_sample_chain_mem_size(&plan->chain_cfg);
+    if (plan->aec_bytes == 0 || plan->chain_bytes == 0) return -1;
+    plan->total = ALIGN16(plan->aec_bytes) + plan->chain_bytes;
+    return 0;
+}
+
+/** Step 3: both stages on one block of `bytes`. Each stage gets the share of the block it
+ * would own and checks it itself: the AEC refuses a misaligned base or a short block, the
+ * chain a short remainder. A refused chain rolls the AEC back. NULL stages on refusal. */
+static int mono_init(MonoStages* s, void* pool, size_t bytes, const MonoPlan* plan) {
+    uint8_t* cur = (uint8_t*)pool;
+    size_t chain_offset = ALIGN16(plan->aec_bytes);
+    memset(s, 0, sizeof(*s));
+    if (!pool) return -1;
+    s->aec = aec_init(cur, bytes < plan->aec_bytes ? bytes : plan->aec_bytes, &plan->aec_cfg);
+    if (!s->aec) return -1;
+    s->chain = se_sample_chain_init(cur + chain_offset,
+                                    bytes > chain_offset ? bytes - chain_offset : 0,
+                                    &plan->chain_cfg);
+    if (!s->chain) { aec_destroy(s->aec); s->aec = NULL; return -1; }
+    return 0;
+}
+
+static int mono_hop(MonoStages* s, const float* mic, const float* ref, float* out) {
+    SeSpecFrame frame;
+    const Complex* spec;
+    aec_process_context(s->aec, mic, ref);
+    if (se_frame_from_aec(s->aec, &frame) != 0) return -1;
+    spec = se_sample_chain_form(s->chain, &frame);
+    if (!spec) return -1;
+    return se_sample_chain_synthesize(s->chain, spec, out);
+}
+
+static void mono_reset(MonoStages* s) {
+    aec_reset(s->aec);
+    se_sample_chain_reset(s->chain);
+}
+
+/** Step 7: reverse carve order (NR inside the chain, then the AEC); a no-op per module on a
+ * pool-resident instance, but still required. Safe to call twice. */
+static void mono_destroy(MonoStages* s) {
+    se_sample_chain_destroy(s->chain);
+    aec_destroy(s->aec);
+}
+
 /* Synthetic signal (smoke test, not a quality test) */
 
-#define MAX_HOP 512   /* covers every supported rate's hop (80 @ 8k / 160 @ 16k / 480 @ 48k) */
+#define MAX_HOP 512   /* covers every supported grid's hop (128 @ 8k / 128, 256 @ 16k / 512 @ 48k) */
 
 static uint32_t g_lcg_state = 0xC0FFEEu;
 static float lcg_sample(void) {
@@ -88,12 +168,12 @@ static float lcg_sample(void) {
     return ((float)(int)(g_lcg_state >> 9) / 4194304.0f - 1.0f) * 0.25f;
 }
 
-/** Drives `n_hops` hops of a synthetic mic/ref stream, checking that
- * audio_pipeline_process() succeeds and the output has no NaN.
+/** Drives `n_hops` hops of a synthetic mic/ref stream, checking that every call succeeds and
+ * the output is finite.
  * BOARD: on a target, mic/ref come from the codec DMA ring and the far-end tap;
- * invalidate the cache lines they occupy before calling process(), and flush `out`
+ * invalidate the cache lines they occupy before calling the hop, and flush `out`
  * before any DMA-out. */
-static int run_hops(AudioPipeline* p, int hop, int n_hops) {
+static int run_hops(MonoStages* s, int hop, int n_hops) {
     float mic[MAX_HOP], ref[MAX_HOP], out[MAX_HOP];
     if (hop <= 0 || hop > MAX_HOP) {
         fprintf(stderr, "run_hops: hop=%d out of expected range (1..%d)\n", hop, MAX_HOP);
@@ -104,81 +184,79 @@ static int run_hops(AudioPipeline* p, int hop, int n_hops) {
             ref[i] = lcg_sample();
             mic[i] = 0.3f * ref[i] + 0.05f * lcg_sample();   /* echo + a bit of near-end */
         }
-        if (audio_pipeline_process(p, mic, ref, out) != 0) {
-            fprintf(stderr, "run_hops: audio_pipeline_process failed at hop %d\n", h);
+        if (mono_hop(s, mic, ref, out) != 0) {
+            fprintf(stderr, "run_hops: the hop failed at hop %d\n", h);
             return 0;
         }
-        for (int i = 0; i < hop; i++) {
-            if (out[i] != out[i]) {   /* NaN check */
-                fprintf(stderr, "run_hops: NaN in output at hop %d, sample %d\n", h, i);
-                return 0;
-            }
+        if (!se_hop_is_finite(out, hop)) {
+            fprintf(stderr, "run_hops: non-finite output at hop %d\n", h);
+            return 0;
         }
     }
     return 1;
 }
 
-/* Positive flow: query -> alloc -> init_ex -> process -> reset -> process -> destroy
+/* Positive flow: size -> alloc -> init -> process -> reset -> process -> destroy
  * -> free, run twice on the same arena to show pool reuse. */
 
 #define HOPS_BEFORE_RESET 200
 #define HOPS_AFTER_RESET  200
 
 static int run_one_cycle(int sample_rate, int cycle_no) {
+    MonoPlan plan;
+    MonoStages stages;
+    void* pool;
     printf("--- cycle %d (%d Hz) ---\n", cycle_no, sample_rate);
 
-    /* Step 1: query, always fresh right before init_ex; never cache `req`. */
-    AudioPipelineConfig cfg = audio_pipeline_default_config(sample_rate);
-    AudioPipelineMemReq req;
-    if (audio_pipeline_get_mem_requirements(&cfg, &req) != 0) {
-        fprintf(stderr, "cycle %d: audio_pipeline_get_mem_requirements failed\n", cycle_no);
+    /* Step 1: size, always fresh right before the init; never cache the plan. */
+    if (mono_plan(&plan, sample_rate) != 0) {
+        fprintf(stderr, "cycle %d: the stage size queries failed\n", cycle_no);
         return 0;
     }
-    printf("  queried: bytes=%llu alignment=%u descriptor_version=%u backend_id=%u\n",
-           (unsigned long long)req.bytes, req.alignment, req.descriptor_version, req.backend_id);
+    printf("  sized: aec=%zu chain=%zu total=%zu bytes alignment=%u\n",
+           plan.aec_bytes, plan.chain_bytes, plan.total, POOL_ALIGNMENT);
 
     /* Step 2: board alloc. BOARD: replace board_mem_alloc()/board_mem_free(). */
-    void* pool = board_mem_alloc(req.bytes, req.alignment);
+    pool = board_mem_alloc(plan.total, POOL_ALIGNMENT);
     if (!pool) {
         fprintf(stderr, "cycle %d: board_mem_alloc failed\n", cycle_no);
         return 0;
     }
 
-    /* Step 3: init_ex with `req` as `expected`, so a stale descriptor is rejected. */
-    AudioPipeline* p = audio_pipeline_init_ex(pool, (size_t)req.bytes, &cfg, &req);
-    if (!p) {
-        fprintf(stderr, "cycle %d: audio_pipeline_init_ex failed\n", cycle_no);
+    /* Step 3: init both stages on the block. */
+    if (mono_init(&stages, pool, (size_t)plan.total, &plan) != 0) {
+        fprintf(stderr, "cycle %d: stage init failed\n", cycle_no);
         board_mem_free(pool);
         return 0;
     }
-    int hop = audio_pipeline_hop_size(p);
-    printf("  init OK: hop=%d n_freqs=%d\n", hop, audio_pipeline_n_freqs(p));
+    int hop = plan.grid.hop_size;
+    printf("  init OK: hop=%d n_freqs=%d\n", hop, plan.grid.n_freqs);
 
     /* Step 4: N hops of synthetic audio. */
-    if (!run_hops(p, hop, HOPS_BEFORE_RESET)) {
+    if (!run_hops(&stages, hop, HOPS_BEFORE_RESET)) {
         fprintf(stderr, "cycle %d: run_hops (pre-reset) failed\n", cycle_no);
-        audio_pipeline_destroy(p);
+        mono_destroy(&stages);
         board_mem_free(pool);
         return 0;
     }
 
-    /* Step 5: reset (echo-path change or a new stream on the same instance).
+    /* Step 5: reset (echo-path change or a new stream on the same instance); the AEC and
+     * the chain are reset together.
      * BOARD: on suspend/resume either confirm the platform preserved the pool contents
-     * and keep using `p`, or destroy and init_ex() again on the same pool; resuming on
+     * and keep using the stages, or destroy and init again on the same pool; resuming on
      * unpreserved contents corrupts state the library cannot detect. */
-    audio_pipeline_reset(p);
+    mono_reset(&stages);
 
     /* Step 6: more hops on the reset instance. */
-    if (!run_hops(p, hop, HOPS_AFTER_RESET)) {
+    if (!run_hops(&stages, hop, HOPS_AFTER_RESET)) {
         fprintf(stderr, "cycle %d: run_hops (post-reset) failed\n", cycle_no);
-        audio_pipeline_destroy(p);
+        mono_destroy(&stages);
         board_mem_free(pool);
         return 0;
     }
 
-    /* Step 7: destroy (reverse carve order; a no-op per module on a pool-resident
-     * instance, but still required). */
-    audio_pipeline_destroy(p);
+    /* Step 7: destroy. */
+    mono_destroy(&stages);
 
     /* Step 8: release, only after step 7. */
     board_mem_free(pool);
@@ -188,8 +266,8 @@ static int run_one_cycle(int sample_rate, int cycle_no) {
     return 1;
 }
 
-/* Negative demonstrations: each attempts something init_ex() must reject, confirms
- * the NULL, and finally confirms the pool is still usable. */
+/* Negative demonstrations: each attempts something the init must reject, confirms the NULL,
+ * and finally confirms the pool is still usable. */
 
 static int g_failures = 0;
 #define CHECK(cond, msg) do { \
@@ -198,64 +276,47 @@ static int g_failures = 0;
     } while (0)
 
 static int run_negative_demonstrations(void) {
+    MonoPlan plan;
+    MonoStages s;
+    void* pool;
     printf("--- negative demonstrations ---\n");
 
-    AudioPipelineConfig cfg = audio_pipeline_default_config(16000);
-    AudioPipelineMemReq req;
-    if (audio_pipeline_get_mem_requirements(&cfg, &req) != 0) {
-        fprintf(stderr, "negative demo: get_mem_requirements setup failed\n");
+    if (mono_plan(&plan, 16000) != 0) {
+        fprintf(stderr, "negative demo: the stage size queries failed\n");
         return 0;
     }
-    void* pool = board_mem_alloc(req.bytes, req.alignment);
+    pool = board_mem_alloc(plan.total, POOL_ALIGNMENT);
     if (!pool) {
         fprintf(stderr, "negative demo: board_mem_alloc setup failed\n");
         return 0;
     }
 
-    /* 1. Undersized pool (bytes-1), correct descriptor. */
-    AudioPipeline* p_short = audio_pipeline_init_ex(pool, (size_t)req.bytes - 1, &cfg, &req);
-    CHECK(p_short == NULL, "init_ex rejects an undersized (bytes-1) pool");
-    if (p_short) audio_pipeline_destroy(p_short);
+    /* 1. A block one byte short of the AEC's own size: aec_init() refuses it. */
+    CHECK(mono_init(&s, pool, plan.aec_bytes - 1, &plan) != 0 && !s.aec && !s.chain,
+          "init rejects a pool smaller than the AEC (aec_bytes-1)");
 
-    /* 2. Misaligned base (+8), correct descriptor and bytes; the arena has margin, so no
-     * out-of-bounds access (init_ex() rejects before touching memory). */
-    AudioPipeline* p_misaligned =
-        audio_pipeline_init_ex((uint8_t*)pool + 8, (size_t)req.bytes, &cfg, &req);
-    CHECK(p_misaligned == NULL, "init_ex rejects a misaligned (base+8) pool");
-    if (p_misaligned) audio_pipeline_destroy(p_misaligned);
+    /* 2. Misaligned base (+8); the arena has margin, so no out-of-bounds access (the init
+     * rejects before touching memory). */
+    CHECK(mono_init(&s, (uint8_t*)pool + 8, (size_t)plan.total, &plan) != 0 && !s.aec && !s.chain,
+          "init rejects a misaligned (base+8) pool");
 
-    /* 3. Stale/tampered descriptor: wrong descriptor_version. */
-    AudioPipelineMemReq bad_dv = req;
-    bad_dv.descriptor_version = req.descriptor_version + 1;
-    AudioPipeline* p_dv = audio_pipeline_init_ex(pool, (size_t)req.bytes, &cfg, &bad_dv);
-    CHECK(p_dv == NULL, "init_ex rejects a tampered descriptor_version");
-    if (p_dv) audio_pipeline_destroy(p_dv);
+    /* 3. The AEC fits, the chain does not: se_sample_chain_init() refuses the short remainder
+     * and the AEC is rolled back. */
+    CHECK(mono_init(&s, pool, (size_t)ALIGN16(plan.aec_bytes) + plan.chain_bytes / 2, &plan) != 0 &&
+              !s.aec && !s.chain,
+          "init rejects a pool that holds the AEC but not the chain");
 
-    /* 4. Stale descriptor: wrong backend_id. */
-    AudioPipelineMemReq bad_backend = req;
-    bad_backend.backend_id = 99;
-    AudioPipeline* p_be = audio_pipeline_init_ex(pool, (size_t)req.bytes, &cfg, &bad_backend);
-    CHECK(p_be == NULL, "init_ex rejects a tampered backend_id");
-    if (p_be) audio_pipeline_destroy(p_be);
+    /* 4. Init after rejected attempts still works; run real hops to prove it. */
+    if (mono_init(&s, pool, (size_t)plan.total, &plan) == 0) {
+        CHECK(1, "pool is still usable via a correct init after rejected attempts");
+        CHECK(run_hops(&s, plan.grid.hop_size, 10), "the still-usable instance actually processes audio");
 
-    /* 5. Stale/tampered descriptor: wrong build_flags_hash. */
-    AudioPipelineMemReq bad_hash = req;
-    bad_hash.build_flags_hash = req.build_flags_hash ^ 0xFFFFFFFFu;
-    AudioPipeline* p_hash = audio_pipeline_init_ex(pool, (size_t)req.bytes, &cfg, &bad_hash);
-    CHECK(p_hash == NULL, "init_ex rejects a tampered build_flags_hash");
-    if (p_hash) audio_pipeline_destroy(p_hash);
-
-    /* 6. Init after rejected attempts still works; run real hops to prove it. */
-    AudioPipeline* p_ok = audio_pipeline_init_ex(pool, (size_t)req.bytes, &cfg, &req);
-    CHECK(p_ok != NULL, "pool is still usable via a correct init_ex after rejected attempts");
-    if (p_ok) {
-        int hop = audio_pipeline_hop_size(p_ok);
-        CHECK(run_hops(p_ok, hop, 10), "the still-usable instance actually processes audio");
-
-        /* 7. Double-destroy safety. */
-        audio_pipeline_destroy(p_ok);
-        audio_pipeline_destroy(p_ok);   /* second call: must be a safe no-op */
-        printf("PASS: audio_pipeline_destroy is safe to call twice\n");
+        /* 5. Double-destroy safety. */
+        mono_destroy(&s);
+        mono_destroy(&s);   /* second call: must be a safe no-op */
+        printf("PASS: destroy is safe to call twice\n");
+    } else {
+        CHECK(0, "pool is still usable via a correct init after rejected attempts");
     }
 
     board_mem_free(pool);
@@ -282,6 +343,6 @@ int main(void) {
     }
     printf("example_board_adapter: ALL PASS (2 positive cycles + %d negative-demo checks)\n",
            /* number of CHECK() calls above, kept in sync by hand */
-           7);
+           5);
     return 0;
 }

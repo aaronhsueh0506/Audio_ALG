@@ -115,7 +115,7 @@ make -C AINR -s print-lib-path   # 印出本組態的 archive 絕對路徑</pre>
 <code>gtcrn_process.o</code>。<b>RNNoise-ERB 不在裡面</b>(它有自己的 Makefile、沒有 archive)。
 <code>WERROR=1</code> 會傳到 compiler 並進組態簽章。對應的 AIAEC archive 是 <code>libaiaec_prepost.a</code>。</li>
 <li>兩支 DFN2 pipeline<b>不</b>連這個 archive:<code>pipelines/Makefile</code> 直接把三個 DFN2 TU 編進
-<code>libaudio_pipeline_dfn.a</code>／<code>lib4aec_dfn_res.a</code>。</li>
+<code>libaudio_pipeline_dfn.a</code>（<code>pipelines/</code> 建置）或 <code>libdfn_res_stage.a</code>（<code>4ch_aec_bf_nr_res/</code> 建置）。</li>
 </ul>
 
 <h2>skip identity 的 partition of unity 檢查</h2>

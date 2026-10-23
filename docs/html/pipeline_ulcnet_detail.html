@@ -31,7 +31,7 @@ th{background:#f5efe8}
 <h1>ULCNet pipeline 細節 — accelerator adapter 與 identity reprime</h1>
 
 <h2>概要</h2>
-<p>本頁收兩條 ULCNet pipeline(<a href="pipeline_ulcnet_mono.html">mono</a>、<a href="pipeline_ulcnet_4ch.html">4ch</a>)共用、但會把單頁撐過 30 KB 的兩段細節:(1) 參考 accelerator adapter 如何把模型 state 留在 CPU 端、(2) alignment 邊界的 identity reprime 與它的實測推導。兩頁的 API 用法、block diagram、泳道圖、I/O 表、State 表、延遲與檔案清單仍各自留在原頁。</p>
+<p>本頁收兩條 ULCNet 範例(<a href="pipeline_ulcnet_mono.html">mono</a>、<a href="pipeline_ulcnet_4ch.html">4ch</a>,共用 <code>pipelines/samples/ulcnet_nn_stage.{h,c}</code>)共用、但會把單頁撐過 30 KB 的兩段細節:(1) 參考 accelerator adapter 如何把模型 state 留在 CPU 端、(2) alignment 邊界的 identity reprime 與它的實測推導。兩頁的 API 用法、block diagram、泳道圖、I/O 表、State 表、延遲與檔案清單仍各自留在原頁。</p>
 
 <h2>accelerator adapter(CPU 擁有 state,加速器本身無狀態)</h2>
 <p><code>AIAEC/Align_ULCNet/ulcnet_accelerator_adapter.{h,c}</code> 是「graph 內」那格的參考實作,把 <a href="pipeline_ulcnet_mono.html">pipeline_ulcnet_mono</a> 邊界表裡的「runtime 保存」變成具體的 C 結構:accelerator 的單次呼叫是<b>無狀態</b>的(<code>UlcnetAcceleratorRun run(user, inputs, outputs)</code>,一次一幀),K/V window、attention-logit window、GRU hidden 全部由 <b>CPU 端 <code>UlcnetModelIoState</code></b> 的 caller-owned pool 在呼叫之間保存,每個 <code>*_out</code> 就地綁定到同名輸入的位址——這是刻意選的邊界(export_onnx.py 稱其 boundary 為 <code>stateless_one_frame_full_state</code>,metadata <code>state_binding = in_place_same_address</code>):ONNX graph 本身只吃「當前幀 + 顯式 state 輸入(完整 window)」、只吐「當前幀增強頻譜(<code>output</code>)+ 每個 state 的完整下一個 window」(位移在 graph 內:輸入端 Slice 加 Concat),runtime 在 <code>run()</code> 內先讀完所有 state 輸入、再把輸出寫到綁定的位址;沒有複製路徑,CPU 不搬 ring。不在 graph 內部遞迴。<code>run()</code> 不需處理 state 的清零:C 端清零(reset 或拒絕一幀)時 <code>ulcnet_accelerator_adapter_state_generation()</code> 加一,fixed-point 的 accelerator 另有 state 緩衝時,板端 sample 依它重填量化後的 0。</p>
@@ -43,7 +43,7 @@ th{background:#f5efe8}
 <tr><td>GRU hidden(兩顆 subband GRU 各 2 層)</td><td>[1,4,1,128]</td><td>—(無 ring;前兩列 subband 0、後兩列 subband 1)</td></tr>
 </table>
 <p><code>ulcnet_model_io_prepare()</code> 在每次 infer 前把目前的 err/far RI 與上述三組 state 包成 <code>UlcnetModelIoInputs</code>(唯讀視圖)並把 <code>UlcnetModelIoOutputs</code>(accelerator 要寫的 <code>output</code> 與四個 <code>*_out</code>)綁好:只有 <code>output</code> 預填 NaN;每個 <code>*_out</code> 指向對應輸入的位址,不預填。<code>ulcnet_model_io_commit()</code> 不更新任何 state,先驗證:<code>output</code>(mask)、<code>h_gru</code> 全部、K/V 的 slot 0 與 logit 的最後一幀(graph 這一幀新寫的那一格)皆有限才成功(NaN 未被覆蓋或任何非有限值 = 判定失敗;state 已被覆寫無法回滾,四個 state 全部歸零、state generation 加一、交易丟棄——與 pipeline 自己的 fail-open 全有限值檢查是兩層獨立保護;較舊的格子與被丟掉的那一格不重查,殘留的非有限值會在下一幀進到 <code>output</code> 被擋下),再乘上壓縮域 error、逆冪並解包 <code>enhanced_re/im</code>。descriptor 發布固定 raw-far deployment ABI(<code>ULCNET_FAR_RAW</code>)。</p>
-<pre>model.infer(user, err_ri, far_ri, out_ri)                 ← pipeline 每個發射幀呼叫一次
+<pre>model.infer(user, err_ri, far_ri, out_ri)                 ← stage 每個發射幀呼叫一次
  │  (adapter 內部,對 pipeline 不可見;adapter 只是驅動 class)
  ├─ ulcnet_prepost_pre_process_freq(prepost, err_re, err_im, far_re, far_im)
  │      FREQ 模式下一個頻譜 = 一次 accelerator 呼叫,回傳恆 1(否則即失敗)
@@ -61,18 +61,18 @@ th{background:#f5efe8}
  │        是 → 解包 enhanced_re/im(四個 state 已由 runtime 就地寫好,commit 不位移、不複製)
  │        否 → 四個 state 全歸零(state generation +1),frame_skip 收尾,回 -1(pipeline fail-open)
  └─ ulcnet_prepost_post_process_freq(prepost, enhanced_re, enhanced_im)</pre>
-<p class="note">D(<code>delay_depth</code>)決定 K/V 與 logit window 的深度,依 export descriptor 而定;主機範例以 D=8 實測 model-I/O + adapter pool 為 75,280 B(16 kHz)與 142,864 B(48 kHz)。差異來自 TA_BINS 26→52；此記憶體<b>不在</b>audio pipeline pool 內，而是 caller 另外配置。實際產品一律以 <code>ulcnet_accelerator_adapter_get_mem_size()</code> 現查，不可跨 grid 沿用常數。</p>
+<p class="note">D(<code>delay_depth</code>)決定 K/V 與 logit window 的深度,依 export descriptor 而定;主機範例以 D=8 實測 model-I/O + adapter pool 為 75,280 B(16 kHz)與 142,864 B(48 kHz)。差異來自 TA_BINS 26→52；此記憶體<b>不在</b>單元／<code>Aec</code> 與 stage 的 pool 內，而是 caller 另外配置。實際產品一律以 <code>ulcnet_accelerator_adapter_get_mem_size()</code> 現查，不可跨 grid 沿用常數。</p>
 
 <h2>Identity reprime(alignment 邊界,option A)</h2>
-<h3>mono(<code>audio_pipeline_ulcnet</code>)</h3>
+<h3>mono(<code>Aec</code> + <code>ulcnet_nn_stage</code>)</h3>
 <p>reset 清掉 runtime 的 K/V history、logit history 與 GRU h，但 C 側 STFT 狀態是連續跑的:邊界當下還在飛的分析窗仍<b>跨在邊界上</b>(<code>ULCNET_N_FFT</code> 樣本窗裡一半是切換前推入的 hop)。在那種幀上 step 模型，等於用半舊的 err/far 幀對把剛清掉的 state 重建回去。</p>
-<p>政策:從邊界 hop 起的 <code>AUDIO_PIPELINE_ULCNET_REPRIME_FRAMES</code> 個發射幀走 identity(誤差原樣)且<b>完全不呼叫 infer</b>——K/V、logit、GRU 都不前進;等到 err 與 far 兩路分析窗都只含切換後的 hop，才同時恢復 step 與 apply。reprime 期間再來一次邊界會重新武裝(不累加)。<code>audio_pipeline_ulcnet_reset()</code> 會把它歸零(analysis history 已清空,不存在跨界幀)。</p>
-<p>常數是<b>量出來的</b>,不是寫死的:mono 兩路都由當前 hop 推入(error tap 與 raw-far tap 同 hop,無 wrapper 端 far 補償),rolling 50%-overlap 分析在 hop T 發射的那一幀恆橫跨推入 hop T−1 與 T ⇒ 邊界在 hop T 時，只有 hop T 發射的那一幀跨界，hop T+1 的窗已全是切換後樣本。預設 16 kHz build 的脈衝推導測試兩路各得 <b>1</b>,與常數相符；同一拓撲也適用 48 kHz build。</p>
+<p>政策:從邊界 hop 起的 <code>ULCNET_NN_STAGE_REPRIME_FRAMES</code> 個發射幀走 identity(誤差原樣)且<b>完全不呼叫 infer</b>——K/V、logit、GRU 都不前進;等到 err 與 far 兩路分析窗都只含切換後的 hop，才同時恢復 step 與 apply。reprime 期間再來一次邊界會重新武裝(不累加)。<code>ulcnet_nn_stage_reset()</code> 會把它歸零(analysis history 已清空,不存在跨界幀)。</p>
+<p>常數是<b>量出來的</b>,不是寫死的:mono 兩路都由當前 hop 推入(error tap 與 raw-far tap 同 hop,無 far 補償),rolling 50%-overlap 分析在 hop T 發射的那一幀恆橫跨推入 hop T−1 與 T ⇒ 邊界在 hop T 時，只有 hop T 發射的那一幀跨界，hop T+1 的窗已全是切換後樣本。預設 16 kHz build 的脈衝推導測試兩路各得 <b>1</b>,與常數相符；同一拓撲也適用 48 kHz build。</p>
 <p>邊界後不 step 模型(identity reprime),是為了不讓 recurrent state 由半舊幀重建。</p>
-<h3>4ch(<code>audio_pipeline_4ch_ulcnet</code>)</h3>
-<p><code>model-&gt;reset</code> 清掉 runtime 的 K/V history、logit history 與 GRU h,但 C 側 framing 狀態是<b>連續跑</b>的(核心 lane 的分析、本 wrapper 的 far 分析與 synthesis 都不清):邊界當下還在飛的分析窗仍<b>跨在邊界上</b>。在那種幀上 step 模型,等於用半舊的 err/far 幀對把剛清掉的 state 重建回去。</p>
-<p>政策:從邊界 hop 起的 <code>AUDIO_PIPELINE_4CH_ULCNET_REPRIME_FRAMES</code> 個發射幀走 identity(誤差原樣)且<b>完全不呼叫 infer</b>——K/V、logit、GRU 都不前進;等到 err 與 far 兩路分析窗都只含切換後的 hop,才同時恢復 step 與 apply。reprime 期間再來一次邊界會重新武裝(不累加);<code>audio_pipeline_4ch_ulcnet_reset()</code> 會把它歸零(該路徑會 re-init 兩個 chain 結構,history 已清空)。compute 只會少 1 幀推論,不會加倍。</p>
-<p><b>常數 = 1,而且是量出來的</b>(<code>audio_pipeline_4ch_ulcnet.h</code>)。推導:兩個分支都從<b>當前</b> input hop 取幀(hop T 的 GSC 頻譜、以及用 hop T 推入的 far 分析),而每個 50%-overlap 幀橫跨兩個 hop,所以只有邊界 hop T 發射的那一幀還蓋到切換前的 hop T−1,hop T+1 的幀已經只含切換後的兩個 hop。這與 mono wrapper 的 1 相同(mono 同樣兩路都從當前 hop 取幀)。測試 <code>test_reprime_straddle_derivation()</code> 用「切換前最後一個 input hop 正中央打一個單位脈衝、其餘全靜音」在一個<b>完全沒有邊界</b>的對照跑(FIXED delay 0)裡量,所以 reprime 邏輯不參與量自己;兩路分開標記。</p>
+<h3>4ch(<code>AudioPipeline4Ch</code> + <code>ulcnet_nn_stage</code>)</h3>
+<p><code>model-&gt;reset</code> 清掉 runtime 的 K/V history、logit history 與 GRU h,但 C 側 framing 狀態是<b>連續跑</b>的(核心 lane 的分析、stage 的 far 分析與 synthesis 都不清):邊界當下還在飛的分析窗仍<b>跨在邊界上</b>。在那種幀上 step 模型,等於用半舊的 err/far 幀對把剛清掉的 state 重建回去。</p>
+<p>政策:從邊界 hop 起的 <code>ULCNET_NN_STAGE_REPRIME_FRAMES</code>(兩個範例共用同一個常數)個發射幀走 identity(誤差原樣)且<b>完全不呼叫 infer</b>——K/V、logit、GRU 都不前進;等到 err 與 far 兩路分析窗都只含切換後的 hop,才同時恢復 step 與 apply。reprime 期間再來一次邊界會重新武裝(不累加);<code>ulcnet_nn_stage_reset()</code> 會把它歸零(該路徑會 re-init 兩個 chain 結構,history 已清空)。compute 只會少 1 幀推論,不會加倍。</p>
+<p><b>常數 = 1,而且是量出來的</b>(<code>samples/ulcnet_nn_stage.h</code>)。推導:兩個分支都從<b>當前</b> input hop 取幀(hop T 的 GSC 頻譜、以及用 hop T 推入的 far 分析),而每個 50%-overlap 幀橫跨兩個 hop,所以只有邊界 hop T 發射的那一幀還蓋到切換前的 hop T−1,hop T+1 的幀已經只含切換後的兩個 hop。這與 mono 範例的 1 相同(mono 同樣兩路都從當前 hop 取幀)。<code>4ch_alignulcnet/tests/test_4ch_ulcnet.c</code> 與 <code>mono_alignulcnet/tests/test_mono_ulcnet.c</code> 的 <code>test_reprime_straddle_derivation()</code> 用「切換前最後一個 input hop 正中央打一個單位脈衝、其餘全靜音」在一個<b>完全沒有邊界</b>的對照跑(FIXED delay 0)裡量,所以 reprime 邏輯不參與量自己;兩路分開標記。</p>
 <table>
 <tr><th>grid</th><th>ERROR 路</th><th>FAR 路</th><th>邊界後第一個模型可見幀</th></tr>
 <tr><td>16 kHz / 512</td><td><b>1</b> 個跨界幀;marked peak ≥ 0.6761 vs unmarked ≤ 1.256e-02</td><td><b>1</b>;marked peak ≥ 0.7071 vs unmarked 0.000e+00</td><td>邊界 hop T=8 → hop 9(兩路皆無切換前樣本)</td></tr>

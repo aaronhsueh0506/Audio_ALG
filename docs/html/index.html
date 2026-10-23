@@ -95,8 +95,10 @@ SE/                                (同層四個 repo)
       │     ├── 4ch_aec_bf_nr_res/    4ch AEC + BF + NR/RES（並擁有共用 4-lane core）
       │     ├── 4ch_alignulcnet/      4ch AEC + BF + Align-ULCNet
       │     ├── 4ch_aec_bf_dfn_res/   4ch AEC + BF + RES + DFN2（包住上面的核心）
-      │     ├── common/               se_config（格點 + AecConfig 推導）、se_anr_stage（NR 級）：
+      │     ├── common/               se_config（格點 + AecConfig 推導）、se_stage（SeSpecFrame）：
       │     │                         mono / 4ch / mono ULCNet 共用
+      │     ├── samples/              範例碼：se_sample_chain、se_anr_stage（NR 級）、
+      │     │                         dfn_hop、ulcnet_nn_stage
       │     ├── dfn_res_stage.{h,c}   兩支 DFN2 變體共用的 post-RES stage
       │     └── dfn_rate_bridge.{h,c} 原生格點 host ↔ stage 的 48 kHz 格點
       │                               （tests/test_dfn_rate_bridge.c）
@@ -167,37 +169,37 @@ fast_math、WAV I/O、HPF、resampler；三個上層 repo 的唯一 FFT 來源�
 <table>
 <tr><th>頁面</th><th>一行描述</th></tr>
 <tr><td><a href="pipeline_mono.html">pipeline_mono</a></td>
-<td><code>pipelines/mono_aec_nr_res/audio_pipeline.c</code>：AEC(linear) → echo-aware NR → RES，
-pool-first 零 heap；grid 8k/256、16k/256|512、48k/1024。</td></tr>
+<td><code>pipelines/mono_aec_nr_res/main.c</code>：沒有 mono unit，<code>Aec</code>（linear）＋範例鏈 <code>samples/se_sample_chain.h</code>（RES 增益、echo-aware NR、CNG、合成）；
+各函式庫各自 <code>mem_size</code>／<code>init</code>，pool-first 零 heap；grid 8k/256、16k/256|512、48k/1024。</td></tr>
 <tr><td><a href="pipeline_ulcnet_mono.html">pipeline_ulcnet_mono</a></td>
-<td><code>pipelines/mono_alignulcnet/audio_pipeline_ulcnet.c</code>：AEC 線性誤差 + Align-ULCNet
-NN post-filter（per-frame callback）；一個 build 一個編譯期格點（16k/512/256 或
+<td><code>pipelines/mono_alignulcnet/main.c</code>：<code>Aec</code> 線性誤差 + 範例 stage <code>samples/ulcnet_nn_stage</code>（Align-ULCNet
+NN post-filter，per-frame callback）；一個 build 一個編譯期格點（16k/512/256 或
 48k/1024/512），演算法延遲 1 hop = 16 ms（48 k 為 10.67 ms）。</td></tr>
 <tr><td><a href="pipeline_4ch.html">pipeline_4ch</a></td>
-<td><code>pipelines/4ch_aec_bf_nr_res/</code>：4×AEC lanes + 共享 delay + SRP-PHAT DOA +
-GSC beamforming + post RES/NR（<code>4aec_nr_res.c</code> 核心）。</td></tr>
+<td><code>pipelines/4ch_aec_bf_nr_res/</code>：唯一包起來的單元 <code>AudioPipeline4Ch</code>——4×AEC lanes + 共享 delay + SRP-PHAT DOA +
+BF beamforming（<code>4aec_nr_res.c</code> 核心）；post RES/NR/CNG/合成是獨立函式庫，由範例鏈串接。</td></tr>
 <tr><td><a href="pipeline_4ch_detail.html">pipeline_4ch_detail</a></td>
-<td>4ch pipeline 的執行期強度控制（<code>audio_pipeline_4ch_set_aec_preset()</code>／<code>_set_nr_mode()</code>／<code>_post_split_floor()</code>）與逐階段耗時診斷。</td></tr>
+<td>4ch 後級的執行期強度控制（<code>aec_res_set_preset()</code>／<code>anr_set_mode()</code>／<code>aec_res_split_floor()</code>）與逐階段耗時診斷。</td></tr>
 <tr><td><a href="pipeline_ulcnet_4ch.html">pipeline_ulcnet_4ch</a></td>
-<td><code>pipelines/4ch_alignulcnet/audio_pipeline_4ch_ulcnet.c</code>：GSC 的 beamformed 誤差<b>頻譜直送</b>
+<td><code>pipelines/4ch_alignulcnet/main.c</code>：4ch 單元（<code>enable_post=0</code>）的 BF 誤差<b>頻譜直送</b>
 Align-ULCNet NN post stage（不重建、不再分析）；新增演算法延遲 1 hop = 16 ms（48 k 為 10.67 ms）。</td></tr>
 <tr><td><a href="pipeline_ulcnet_detail.html">pipeline_ulcnet_detail</a></td>
-<td>兩條 ULCNet pipeline 共用的細節：參考 accelerator adapter（state 留在 CPU 端、每幀 prepare → run → commit）與 alignment 邊界的 identity reprime 推導。</td></tr>
+<td>兩條 ULCNet 範例共用的細節：參考 accelerator adapter（state 留在 CPU 端、每幀 prepare → run → commit）與 alignment 邊界的 identity reprime 推導。</td></tr>
 <tr><td><a href="pipeline_dfn_mono.html">pipeline_dfn_mono</a></td>
-<td><code>pipelines/mono_aec_dfn_res/audio_pipeline_dfn.c</code>：<b>內含</b>傳統 mono pipeline（<code>enable_nr=0</code>/<code>enable_res=1</code>，經 <code>audio_pipeline_process_spec()</code>），
+<td><code>pipelines/mono_aec_dfn_res/main.c</code>：<code>Aec</code> ＋範例鏈（只取 RES 增益，<code>enable_nr=0</code>，經 <code>se_frame_from_aec()</code>）＋ <code>samples/dfn_hop.h</code>，
 以 DeepFilterNet2 取代 MMSE-LSA——估計用 pre-RES 頻譜 E、套用在 post-RES 頻譜 P。host 跑產品自己的取樣率
 （8/16/48 k，預設 16 k），只有 DFN2 stage 在 48 k，由 <code>dfn_rate_bridge.c</code> 來回；演算法延遲
 16 k/256 為 800 samples = 50 ms、48 k 為 3 hop = 32 ms。</td></tr>
 <tr><td><a href="pipeline_dfn_4ch.html">pipeline_dfn_4ch</a></td>
-<td><code>pipelines/4ch_aec_bf_dfn_res/4aec_dfn_res.c</code>：同一個 DFN2 stage 接在四聲道前端
-<code>4aec_nr_res</code> 之後（<code>enable_post=1</code>/<code>enable_res=1</code>/<code>enable_nr=0</code>），
+<td><code>pipelines/4ch_aec_bf_dfn_res/main.c</code>：同一個 DFN2 stage 接在四聲道前端
+<code>4aec_nr_res</code> 之後（<code>enable_post=1</code>，範例鏈只取 post-beam RES 增益），
 前端 front_process／外部 beamformer／fuse 接縫相同，RES 與合成由應用自己串；前端跑 16 k（預設）或 48 k，16 k 經同一支 rate bridge；
 演算法延遲 16 k/256 為 800 samples = 50 ms、48 k 為 3 hop = 32 ms。</td></tr>
 <tr><td><a href="pipeline_dfn_detail.html">pipeline_dfn_detail</a></td>
-<td>兩支 DFN2 pipeline 共用的細節：公開入口逐項語意與 reject-first 清單、<code>DfnRateBridge</code> pool 逐項、各測試檔檢查的內容。</td></tr>
+<td>兩支 DFN2 範例共用的細節：<code>dfn_hop</code> 呼叫語意與 reject-first 清單、<code>DfnRateBridge</code> pool 逐項、各測試檔檢查的內容。</td></tr>
 </table>
 <p class="note">兩支 DFN2 變體共用 <code>pipelines/dfn_res_stage.{h,c}</code> 與 <code>dfn_rate_bridge.{h,c}</code>；
-沒有模型或模型失敗時輸出即「<code>enable_nr=0</code> 的傳統路徑延後」（fail-open）：48 k 是逐位元等值、
+沒有模型或模型失敗時輸出即「降噪器關的傳統鏈延後」（fail-open）：48 k 是逐位元等值、
 延後兩個 hop，原生格點是經 resampler 往返、延後 added delay 的通帶容差等值。</p>
 
 <h3>AINR（NN 降噪模型）</h3>

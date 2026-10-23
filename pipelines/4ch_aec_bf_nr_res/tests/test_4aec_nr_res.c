@@ -10,6 +10,7 @@
 #include "4aec_projection_kernels.h"
 #include "aec_res.h"
 #include "conv_chain_4ch.h"
+#include "common/se_config.h"
 #include "fft_wrapper.h"
 #include "audio_window.h"
 
@@ -341,8 +342,40 @@ static void test_weights_gate(void) {
           "weight gate: an empty matrix is refused");
 }
 
+/* The AecConfig each lane of the core runs with, derived here from the same rules the core
+ * states (balanced preset, EXTERNAL_ALIGNED lanes, no-gain context with the post context),
+ * for tests that rebuild reference lanes beside the core. */
+static int lane_config_for(const FourAecNrResConfig* cfg, AecConfig* out) {
+    SeRules rules;
+    SeRequest req;
+    SeGrid grid;
+    memset(&rules, 0, sizeof(rules));
+    memset(&req, 0, sizeof(req));
+    rules.check_delay = 1;
+    rules.lane_aligned = 1;
+    rules.spatial_context = cfg->enable_post ? AEC_CONTEXT_NO_GAIN : AEC_CONTEXT_LINEAR_ONLY;
+    req.sample_rate = cfg->sample_rate;
+    req.fft_size = cfg->fft_size;
+    req.filter_length = cfg->filter_length;
+    req.delay_mode = cfg->delay_mode;
+    req.delay_num_filters = cfg->delay_num_filters;
+    req.fixed_delay_samples = cfg->fixed_delay_samples;
+    req.aec_preset = AEC_PRESET_BALANCED;
+    if (se_derive(&req, &rules, &grid, out) != 0) return -1;
+    out->delay_est_period_s = cfg->delay_est_period_s;
+    return 0;
+}
+
+/* The chain options of a post-beam stage chain with comfort noise off. */
+static ConvChainOptions no_cng_options(void) {
+    ConvChainOptions o = conv_default_options();
+    o.enable_cng = 0;
+    return o;
+}
+
 static void test_trusted_spectrum_path(void) {
     FourAecNrResConfig cfg = four_aec_nr_res_default_config(16000);
+    ConvChainOptions opt = no_cng_options();
     ConvChain* reconstructed = NULL;
     ConvChain* trusted = NULL;
     float* microphones = NULL;
@@ -358,9 +391,8 @@ static void test_trusted_spectrum_path(void) {
     int k;
 
     cfg.fft_size = 256;
-    cfg.enable_cng = 0;
-    reconstructed = conv_create(&cfg);
-    trusted = conv_create(&cfg);
+    reconstructed = conv_create(&cfg, &opt);
+    trusted = conv_create(&cfg, &opt);
     CHECK(reconstructed && trusted,
           "trusted-spectrum parity instances create");
     if (!reconstructed || !trusted) goto cleanup;
@@ -458,7 +490,6 @@ static void test_trusted_spectrum_finite_gate(void) {
     int b;
 
     cfg.fft_size = 256;
-    cfg.enable_cng = 0;
     p = four_aec_nr_res_create(&cfg);
     CHECK(p != NULL, "finite gate: core creates");
     if (!p) return;
@@ -543,6 +574,7 @@ static void fill_inputs(float* microphones, float* ref, int hop,
 
 static int run_grid(int sample_rate, int fft_size) {
     FourAecNrResConfig cfg;
+    ConvChainOptions opt = no_cng_options();
     FourAecNrRes* p;
     ConvChain* chain;
     FourAecFront pre;
@@ -560,7 +592,6 @@ static int run_grid(int sample_rate, int fft_size) {
 
     cfg = four_aec_nr_res_default_config(sample_rate);
     cfg.fft_size = fft_size;
-    cfg.enable_cng = 0;
     p = four_aec_nr_res_create(&cfg);
     CHECK(p != NULL, "create supported rate");
     if (!p) return 0;
@@ -586,7 +617,7 @@ static int run_grid(int sample_rate, int fft_size) {
     weights = (Complex*)calloc(
         (size_t)FOUR_AEC_NR_RES_CHANNELS * n_freqs,
         sizeof(Complex));
-    chain = conv_attach(p, &cfg);
+    chain = conv_attach(p, &cfg, &opt);
     CHECK(microphones && ref && out && weights && chain,
           "test buffers and post stages allocate");
     if (!microphones || !ref || !out || !weights || !chain) {
@@ -701,17 +732,11 @@ static void test_invalid_configs(void) {
           "invalid capture proxy is rejected");
 
     cfg = four_aec_nr_res_default_config(16000);
-    cfg.enable_nr = 2;
+    CHECK(cfg.enable_post == 1, "the default config keeps the post context on");
+    cfg.enable_post = 2;
     CHECK(four_aec_nr_res_create(&cfg) == NULL &&
           four_aec_nr_res_get_mem_requirements(&cfg, &req) != 0,
-          "a non-boolean NR enable is rejected by create and sizing");
-
-    cfg = four_aec_nr_res_default_config(16000);
-    CHECK(cfg.enable_res == 1, "the default config keeps the post RES on");
-    cfg.enable_res = 2;
-    CHECK(four_aec_nr_res_create(&cfg) == NULL &&
-          four_aec_nr_res_get_mem_requirements(&cfg, &req) != 0,
-          "a non-boolean RES enable is rejected by create and sizing");
+          "a non-boolean post-context enable is rejected by create and sizing");
 
     /* Backward-jump quarantine. The WINDOW is checked even though the enable
      * defaults to 0: a config that would misbehave the moment someone flips
@@ -866,13 +891,13 @@ static void run_static_parity(int sample_rate, int fft_size) {
      * matches and the layout counter is the whole signal. Keep the literals in step with
      * FOUR_AEC_NR_RES_LAYOUT_VERSION. */
     stale = req;
-    stale.layout_version = 20u;
+    stale.layout_version = 22u;
     CHECK(four_aec_nr_res_init_ex(
               pool, (size_t)req.bytes, &cfg, &stale) == NULL,
           "static init_ex rejects a descriptor from the superseded layout "
           "even when its byte count exactly covers the current pool");
     CHECK(req.layout_version == FOUR_AEC_NR_RES_LAYOUT_VERSION &&
-          FOUR_AEC_NR_RES_LAYOUT_VERSION == 22u,
+          FOUR_AEC_NR_RES_LAYOUT_VERSION == 23u,
           "the queried descriptor publishes the current carve layout");
 
     stat = four_aec_nr_res_init_ex(
@@ -881,8 +906,8 @@ static void run_static_parity(int sample_rate, int fft_size) {
     CHECK(stat != NULL && heap != NULL,
           "poisoned caller pool and heap construction both succeed");
     if (!stat || !heap) goto cleanup;
-    heap_chain = conv_attach(heap, &cfg);
-    stat_chain = conv_attach(stat, &cfg);
+    heap_chain = conv_attach(heap, &cfg, NULL);
+    stat_chain = conv_attach(stat, &cfg, NULL);
     CHECK(heap_chain && stat_chain, "post stages for both instances build");
     if (!heap_chain || !stat_chain) goto cleanup;
 
@@ -1018,7 +1043,6 @@ static void test_pre_frame_wola_identity(int sample_rate, int fft_size) {
     char label[224];
 
     cfg.fft_size = fft_size;
-    cfg.enable_cng = 0;
     pipeline = four_aec_nr_res_create(&cfg);
     if (pipeline) fft = fft_create(fft_size);
     CHECK(pipeline != NULL && fft != NULL,
@@ -1374,7 +1398,6 @@ static void known_delay_run(int num_filters, int hops,
     out->first_changed_hop = -1;
 
     cfg.fft_size = 512;             /* the ULCNet grid: hop 256 */
-    cfg.enable_cng = 0;
     cfg.delay_num_filters = num_filters;
     p = four_aec_nr_res_create(&cfg);
     if (!p) return;
@@ -1582,7 +1605,6 @@ static void test_known_delay_memory_and_cost(void) {
     for (n = 1; n <= 5; ++n) {
         FourAecNrResConfig cfg = four_aec_nr_res_default_config(16000);
         cfg.fft_size = 512;
-        cfg.enable_cng = 0;
         cfg.delay_num_filters = n;
         if (four_aec_nr_res_get_mem_breakdown(&cfg, &b[n]) != 0 ||
             four_aec_nr_res_get_mem_requirements(&cfg, &req[n]) != 0) {
@@ -1722,7 +1744,6 @@ static void realign_run(int hops, int delay_a, int delay_b, float second_gain,
     out->applied_at_end = -1;
 
     cfg.fft_size = 512;             /* the ULCNet grid: hop 256 */
-    cfg.enable_cng = 0;
     p = four_aec_nr_res_create(&cfg);
     if (!p) return;
 
@@ -1977,7 +1998,6 @@ static void test_delay_change_candidate_ttl(void) {
      * the estimator can answer holds no candidate to clear. */
     cfg = four_aec_nr_res_default_config(16000);
     cfg.fft_size = 512;
-    cfg.enable_cng = 0;
     p = four_aec_nr_res_create(&cfg);
     CHECK(p != NULL, "candidate-reset scene creates");
     if (p) {
@@ -2149,7 +2169,6 @@ static void duty_run(int hops, int delay_a, int delay_b, int shift_at,
     out->leak_mismatches = 0;
 
     cfg.fft_size = 512;             /* the ULCNet grid: hop 256 */
-    cfg.enable_cng = 0;
     /* The throttle is opt-in (the default is full rate) -- this scene exists
      * specifically to characterize the throttle, so it asks for the regime
      * explicitly. 0.5 s is the period this scene's numbers were measured at. */
@@ -2608,7 +2627,6 @@ static void low_erle_run(int pin_full_rate, LowErleRun* out) {
     out->relock_delay = -1;
 
     cfg.fft_size = 512;             /* the ULCNet grid: hop 256 */
-    cfg.enable_cng = 0;
     /* The throttle is opt-in (the default is full rate) -- this scene exists
      * to compare the throttled duty arm against a full-rate one, so it asks
      * for the throttled regime explicitly. 0.5 s is the period LE_DUTY_K was
@@ -2925,7 +2943,6 @@ static void mixed_hop_run(int sample_rate, int fft_size, int strong_delay,
     enum { MH_PAD = 4096 };
     FourAecNrResConfig cfg = four_aec_nr_res_default_config(sample_rate);
     AecConfig lane_cfg;
-    AnrConfig nr_cfg;
     FourAecNrRes* p = NULL;
     Aec* ref_lane[FOUR_AEC_NR_RES_CHANNELS] = {NULL, NULL, NULL, NULL};
     void* ref_pool[FOUR_AEC_NR_RES_CHANNELS] = {NULL, NULL, NULL, NULL};
@@ -2948,9 +2965,8 @@ static void mixed_hop_run(int sample_rate, int fft_size, int strong_delay,
     out->first_mismatch_hop = -1;
 
     cfg.fft_size = fft_size;
-    cfg.enable_cng = 0;
     p = four_aec_nr_res_create(&cfg);
-    if (!p || four_aec_nr_res_stage_configs(&cfg, &lane_cfg, &nr_cfg) != 0)
+    if (!p || lane_config_for(&cfg, &lane_cfg) != 0)
         goto cleanup;
     hop = four_aec_nr_res_hop_size(p);
     n_freqs = four_aec_nr_res_n_freqs(p);
@@ -3164,8 +3180,9 @@ static void synth_echo_hop(int h, int hop, float* mics, float* far,
  * non-zero output (the equality would hold trivially on silence) and a later divergence (a
  * denoiser that never shapes anything would make the equality prove nothing). */
 static void test_nr_bypass_output_identity(void) {
-    FourAecNrResConfig on_cfg = four_aec_nr_res_default_config(16000);
-    FourAecNrResConfig off_cfg = on_cfg;
+    FourAecNrResConfig cfg = four_aec_nr_res_default_config(16000);
+    ConvChainOptions on_opt = conv_default_options();
+    ConvChainOptions off_opt = on_opt;
     ConvChain* on;
     ConvChain* off;
     float *mics, *far, *out_on, *out_off;
@@ -3174,9 +3191,9 @@ static void test_nr_bypass_output_identity(void) {
     int hop, n, init_hops, total_hops, h, i, ch, k;
     int prefix_equal = 1, prefix_nonzero = 0, diverged_after_init = 0;
 
-    off_cfg.enable_nr = 0;
-    on = conv_create(&on_cfg);
-    off = conv_create(&off_cfg);
+    off_opt.enable_nr = 0;
+    on = conv_create(&cfg, &on_opt);
+    off = conv_create(&cfg, &off_opt);
     CHECK(on != NULL && off != NULL,
           "NR-enabled and NR-disabled instances both create");
     if (!on || !off) {
@@ -3253,8 +3270,9 @@ static void test_nr_bypass_output_identity(void) {
  * the same stimulus must not satisfy it, or the identity proves nothing about the switch.
  * Structural rows: no suppressor is built. */
 static void test_res_bypass_passthrough(void) {
-    FourAecNrResConfig def_cfg = four_aec_nr_res_default_config(16000);
-    FourAecNrResConfig off_cfg = def_cfg;
+    FourAecNrResConfig cfg = four_aec_nr_res_default_config(16000);
+    ConvChainOptions def_opt = conv_default_options();
+    ConvChainOptions off_opt = def_opt;
     ConvChain* off;
     ConvChain* def;
     float *mics, *far, *out_off, *out_def, *prev_lin;
@@ -3263,12 +3281,12 @@ static void test_res_bypass_passthrough(void) {
     double max_abs = 0.0, max_err_off = 0.0, max_err_def = 0.0;
     int hop, n, h, i, k, total_hops = 200;
 
-    def_cfg.enable_cng = 0;
-    off_cfg.enable_cng = 0;
-    off_cfg.enable_res = 0;
-    off_cfg.enable_nr = 0;
-    off = conv_create(&off_cfg);
-    def = conv_create(&def_cfg);
+    def_opt.enable_cng = 0;
+    off_opt.enable_cng = 0;
+    off_opt.enable_res = 0;
+    off_opt.enable_nr = 0;
+    off = conv_create(&cfg, &off_opt);
+    def = conv_create(&cfg, &def_opt);
     CHECK(off != NULL && def != NULL, "RES-disabled and default chains create");
     if (!off || !def) {
         conv_destroy(off);
@@ -3439,8 +3457,9 @@ static void test_stage_timing(void) {
  * bytes are pinned. The pipeline half differences a CNG-on run against a byte-identical
  * CNG-off one: comfort noise is added after every gain, so the difference is the noise. */
 static void test_comfort_noise_contract(void) {
-    FourAecNrResConfig on = four_aec_nr_res_default_config(16000);
-    FourAecNrResConfig off = four_aec_nr_res_default_config(16000);
+    FourAecNrResConfig cfg = four_aec_nr_res_default_config(16000);
+    ConvChainOptions on = conv_default_options();
+    ConvChainOptions off = conv_default_options();
     ConvChain* p_on;
     ConvChain* p_off;
     float* mics;
@@ -3486,8 +3505,8 @@ static void test_comfort_noise_contract(void) {
           "bin's injected power is exactly 2*amplitude^2");
 
     off.enable_cng = 0;
-    p_on = conv_create(&on);
-    p_off = conv_create(&off);
+    p_on = conv_create(&cfg, &on);
+    p_off = conv_create(&cfg, &off);
     CHECK(p_on != NULL && p_off != NULL, "cng: both chains create");
     if (!p_on || !p_off) {
         conv_destroy(p_on);
@@ -3554,8 +3573,8 @@ static void test_comfort_noise_contract(void) {
      * same input must inject the byte-identical stream. A process-wide
      * generator state would fail here. */
     {
-        ConvChain* q_on = conv_create(&on);
-        ConvChain* q_off = conv_create(&off);
+        ConvChain* q_on = conv_create(&cfg, &on);
+        ConvChain* q_off = conv_create(&cfg, &off);
         int same = 1;
         if (q_on && q_off) {
             for (h = 0; h < hops && same; ++h) {
@@ -3651,7 +3670,7 @@ static void test_pool_placement_invariance(int sample_rate, int fft_size) {
 
         p = four_aec_nr_res_init_ex(pool, (size_t)req.bytes, &cfg, &req);
         if (!p) { free(block); break; }
-        chain = conv_attach(p, &cfg);
+        chain = conv_attach(p, &cfg, NULL);
         if (!chain) { four_aec_nr_res_destroy(p); free(block); break; }
         built += 1;
 
@@ -3724,15 +3743,16 @@ static void test_pool_placement_invariance(int sample_rate, int fft_size) {
     free(reference);
 }
 
-/* four_aec_nr_res_reset() has the contract of the mono wrapper's reset: the instance it
- * leaves behind is the one a fresh four_aec_nr_res_init() on the same pool/cfg would
- * produce. The subject is warmed on a different stretch of the scene than the one compared,
- * so what it remembers is wrong for what follows. Run with CNG both ON and OFF: reset
- * re-seeds the comfort-noise generator, so the CNG path is compared for real. */
+/* After four_aec_nr_res_reset() and the reset of the stages it chains (conv_reset()), the
+ * core and the chain equal a freshly created pair with the same config. The subject
+ * is warmed on a different stretch of the scene than the one compared, so what it remembers
+ * is wrong for what follows. Run with CNG both ON and OFF: conv_reset() re-seeds the
+ * comfort-noise generator, so the CNG path is compared for real. */
 static void test_reset_equals_fresh_instance(int sample_rate, int fft_size,
                                              int enable_cng) {
     enum { WARM = 400, WARM_OFFSET = 100000, COMPARE = 200 };
     FourAecNrResConfig cfg;
+    ConvChainOptions opt = conv_default_options();
     ConvChain* fresh;
     ConvChain* warmed;
     float* mics;
@@ -3746,9 +3766,9 @@ static void test_reset_equals_fresh_instance(int sample_rate, int fft_size,
 
     cfg = four_aec_nr_res_default_config(sample_rate);
     cfg.fft_size = fft_size;
-    cfg.enable_cng = enable_cng;
-    fresh = conv_create(&cfg);
-    warmed = conv_create(&cfg);
+    opt.enable_cng = enable_cng;
+    fresh = conv_create(&cfg, &opt);
+    warmed = conv_create(&cfg, &opt);
     CHECK(fresh != NULL && warmed != NULL, "reset parity: both chains create");
     if (!fresh || !warmed) {
         conv_destroy(fresh);
@@ -3811,7 +3831,8 @@ static void test_reset_equals_fresh_instance(int sample_rate, int fft_size,
  * at floor^2 (no scaling at all would leave it at 1). */
 static void test_comfort_noise_follows_nr_gain(void) {
     const double floor_amp = 0.31622777, floor_sq = floor_amp * floor_amp;
-    FourAecNrResConfig cfg[4];
+    FourAecNrResConfig cfg = four_aec_nr_res_default_config(16000);
+    ConvChainOptions opt[4];
     ConvChain* p[4] = { NULL, NULL, NULL, NULL };
     float* out[4] = { NULL, NULL, NULL, NULL };
     float *mics, *far;
@@ -3823,10 +3844,10 @@ static void test_comfort_noise_follows_nr_gain(void) {
     /* [0] CNG off / NR on, [1] CNG on / NR on, [2] CNG off / NR off,
      * [3] CNG on / NR off. */
     for (i = 0; i < 4; ++i) {
-        cfg[i] = four_aec_nr_res_default_config(16000);
-        cfg[i].enable_cng = (i & 1);
-        cfg[i].enable_nr = (i < 2);
-        p[i] = conv_create(&cfg[i]);
+        opt[i] = conv_default_options();
+        opt[i].enable_cng = (i & 1);
+        opt[i].enable_nr = (i < 2);
+        p[i] = conv_create(&cfg, &opt[i]);
         if (!p[i]) created = 0;
     }
     CHECK(created, "cng/nr: all four chains create");
@@ -3941,9 +3962,6 @@ static void test_fuse_frame_contract(void) {
 
     front_only = cfg;
     front_only.enable_post = 0;
-    front_only.enable_res = 0;
-    front_only.enable_nr = 0;
-    front_only.enable_cng = 0;
     q = four_aec_nr_res_create(&front_only);
     CHECK(q != NULL, "fuse frame: front-only core creates");
     if (q) {

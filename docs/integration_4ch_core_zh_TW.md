@@ -3,8 +3,8 @@
 適用對象：**已經擁有自己的 beamformer（SRP-PHAT / GSC 或任何等效方案）**，
 想要四路 linear AEC 前端，並自己串接後級頻域 stage（RES / NR / CNG / ISTFT，或自己的 NN）的函式庫使用者。
 
-如果你**沒有**自己的 beamformer、想要含 direction finding 與 beamformer 的完整
-pipeline，請看 `docs/integration_4ch_spatial_zh_TW.md`。
+如果你**沒有**自己的 beamformer、想要含 direction finding 與 beamformer 的線性 AEC + BF
+單元（`AudioPipeline4Ch`），請看 `docs/integration_4ch_spatial_zh_TW.md`。
 
 本文只講「什麼時候呼叫哪個 function」「每個參數怎麼設」。演算法內部推導不在本文範圍。
 頻域 stage 串接的總覽（任何 pipeline 都適用）見 `pipelines/README.md` 的 Call flow。
@@ -41,10 +41,11 @@ mic hop [hop][4] + ref hop [hop]
 
 這個模組**明確擁有**：1 個共用 delay matcher、4 個獨立 linear AEC adaptive filter、
 beamformer 權重的同調投影。post-beam residual suppressor（`AecRes`）、mono MMSE-LSA
-denoiser（`AnrDenoiser`）與最終 iFFT/OLA（`AcIstft`）**不在**前端內：由應用 carve 並明寫串接
-（`four_aec_nr_res_stage_configs()` 給出它們的 config；完整範例見 §2 與
-`4aec_nr_res_static.c`、`tests/conv_chain_4ch.h`）。完整 wrapper `audio_pipeline_4ch.c`
-就是這樣一個應用。
+denoiser（`AnrDenoiser`）、comfort noise 與最終 iFFT/OLA（`AcIstft`）**不在**前端內：
+每一個都是獨立的函式庫物件，有自己的 `mem_size` 與 `init`，由應用初始化並明寫串接
+（`samples/se_sample_chain.h` 是把它們放進一塊 pool 的範例；完整範例見 §2 與
+`4aec_nr_res_static.c`、`tests/conv_chain_4ch.h`）。線性 AEC + BF 單元 `audio_pipeline_4ch.c`
+（`AudioPipeline4Ch`）在這個前端之上加 SRP-PHAT 與 BF，同樣不含後級 stage。
 
 它**明確不做**：beamformer、DOA、VAD。它也不會挑某一支麥克風的 RES gain，
 更不會每聲道各跑一份 NR/RES。
@@ -55,8 +56,8 @@ denoiser（`AnrDenoiser`）與最終 iFFT/OLA（`AcIstft`）**不在**前端內�
 #include "4aec_nr_res.h"
 ```
 
-一行就夠前端本身用。它自己會拉進 `aec.h`、`anr.h` 與 `common/se_stage.h`（`SeSpecFrame`）。
-要串後級 stage 時另外 include `common/se_anr_stage.h`、`audio_stft.h`、`utility/simd_kernels.h`。
+一行就夠前端本身用。它自己會拉進 `aec.h` 與 `common/se_stage.h`（`SeSpecFrame`）；NR 的 header 不在其中。
+要串後級 stage 時另外 include `samples/se_sample_chain.h`（範例鏈；它會拉進 `samples/se_anr_stage.h`、`anr.h`、`aec_res.h`、`audio_stft.h`、`common/se_config.h`、`utility/simd_kernels.h`），或自己逐個 include 那些 header。
 
 ### 1.3 `Complex` type 從哪來
 
@@ -80,9 +81,9 @@ denoiser（`AnrDenoiser`）與最終 iFFT/OLA（`AcIstft`）**不在**前端內�
 ```
 
 這五個 include roots 足以使用前端；下方串接範例另加 `-I <audiolib>/common`，
-讓 `utility/mem_align.h` 與 `utility/simd_kernels.h` 找得到。`-I pipelines` 讓 `common/se_stage.h`、`common/se_anr_stage.h` 找得到。
+讓 `utility/mem_align.h` 與 `utility/simd_kernels.h` 找得到。`-I pipelines` 讓 `common/se_stage.h`、`samples/se_sample_chain.h` 找得到。
 **注意：不需要 `audiolib/doa`、`audiolib/bf`、`audiolib/common/utility`**
-—— 那三個是完整 spatial wrapper 才需要的（見另一份手冊）。
+—— 那三個是線性 AEC + BF 單元才需要的（見另一份手冊）。
 
 語言標準：`-std=gnu99`（或以上的 GNU 方言）。
 
@@ -97,14 +98,11 @@ libaudio_common.a
 -lm
 ```
 
-* `libaudio_pipeline_4ch.a` 含三個 object：`4aec_nr_res.o`、`se_config.o`、`se_anr_stage.o`（Makefile
-  `PIPELINE_OBJS`；後兩者是 `pipelines/common/` 的共用組態與 NR 級）。`audio_pipeline_4ch.o`（完整 spatial
-  wrapper）**不在這個 archive 裡**——需要它的每個執行檔（`audio_pipeline_4ch_raw`
-  等）各自把 `audio_pipeline_4ch.o` 當獨立 object 加進自己的 link 命令，不是
-  從 archive 帶出來的。只用本手冊這套 API 時，你的 link 命令根本不提
-  `audio_pipeline_4ch.o`，所以你**不需要**連 `libdoa.a` / `libbf.a` /
-  `libspatial_common.a`。
-  （已實測：上面五項就能把只用 `4aec_nr_res.h` 的程式連成執行檔。）
+* `libaudio_pipeline_4ch.a` 含三個 object：`4aec_nr_res.o`、`audio_pipeline_4ch.o`（線性 AEC + BF 單元）、
+  `se_config.o`（Makefile `PIPELINE_OBJS`；後者是 `pipelines/common/` 的共用組態）。只用本手冊這套 API
+  時，你的程式不參照 `audio_pipeline_4ch.o` 裡的符號，linker 不會把它從 archive 帶出來，所以你**不需要**連
+  `libdoa.a` / `libbf.a` / `libspatial_common.a`。
+  （已實測：上面五項就能把只用 `4aec_nr_res.h` 與範例鏈的程式連成執行檔。）
 * archive 路徑是 config-keyed 的（`bin/<backend>-<hash>/`）。用各 Makefile 的
   `make -s print-lib-path` 取得，不要硬寫。
 * `BACKEND=ne10` 時最終 link 要用 C++ driver（`c++`）。
@@ -115,45 +113,31 @@ libaudio_common.a
 
 ## 2. Quick start
 
-完整、可編譯、已實際跑過的最小整合（heap 路徑，權重先用固定值佔位；後級 stage 由應用 carve 一整塊 16-byte 對齊記憶體）：
+完整、可編譯、已實際跑過的最小整合（heap 路徑，權重先用固定值佔位；後級 stage 由範例鏈 `SeSampleChain`
+放進應用自己配置的一塊 16-byte 對齊記憶體）：
 
 ```c
 #include <stdio.h>
 #include <stdlib.h>
 #include "4aec_nr_res.h"
-#include "audio_stft.h"
-#include "utility/mem_align.h"
-#include "utility/simd_kernels.h"
-#include "common/se_anr_stage.h"
-#include "common/se_stage.h"
+#include "samples/se_sample_chain.h"
 
 int main(void) {
     FourAecNrResConfig cfg = four_aec_nr_res_default_config(16000);
-    AecConfig res_cfg; AnrConfig nr_cfg; AcStftConfig scfg;
     FourAecNrRes* p = four_aec_nr_res_create(&cfg);          /* heap path */
-    if (!p || four_aec_nr_res_stage_configs(&cfg, &res_cfg, &nr_cfg) != 0) return 1;
+    if (!p) return 1;
 
     const int hop = four_aec_nr_res_hop_size(p);
     const int n = four_aec_nr_res_n_freqs(p);
-    ac_stft_config_default(&scfg, four_aec_nr_res_fft_size(p));
 
-    /* The application owns the post-beam stages: one 16-byte-aligned block. */
-    size_t res_b = ALIGN16(aec_res_get_mem_size(&res_cfg));
-    size_t nr_b = ALIGN16(se_anr_stage_mem_size(&nr_cfg));
-    size_t sy_b = ALIGN16(ac_istft_get_mem_size(&scfg));
-    size_t vec = ALIGN16((size_t)n * sizeof(float));
-    size_t cvec = ALIGN16((size_t)n * sizeof(Complex));
+    /* The application owns the post-beam stages: RES, NR, comfort noise and synthesis
+     * in one chain (one 16-byte-aligned block, sized by the chain's own query). */
+    SeSampleChainConfig sc = se_sample_chain_default_config(16000, four_aec_nr_res_fft_size(p));
+    size_t chain_bytes = se_sample_chain_mem_size(&sc);      /* 0 = invalid */
     void* mem;
-    if (posix_memalign(&mem, 16, res_b + nr_b + sy_b + 2 * vec + cvec) != 0) return 1;
-    unsigned char* cur = (unsigned char*)mem;
-    AecRes* res = aec_res_init(cur, aec_res_get_mem_size(&res_cfg), &res_cfg); cur += res_b;
-    AnrDenoiser* nr = se_anr_stage_init(cur, se_anr_stage_mem_size(&nr_cfg), &nr_cfg); cur += nr_b;
-    AcIstft* istft = ac_istft_init(cur, ac_istft_get_mem_size(&scfg), &scfg); cur += sy_b;
-    float* total_gain = (float*)cur; cur += vec;
-    float* extra_noise = (float*)cur; cur += vec;
-    Complex* spec = (Complex*)cur;
-    if (!res || !nr || !istft) return 1;
-    uint32_t rng = SE_CNG_RNG_SEED;
+    if (chain_bytes == 0 || posix_memalign(&mem, 16, chain_bytes) != 0) return 1;
+    SeSampleChain* chain = se_sample_chain_init(mem, chain_bytes, &sc);
+    if (!chain) return 1;
 
     float mics[4 * 1024], ref[1024], out[1024];
     Complex weights[FOUR_AEC_NR_RES_CHANNELS * 1024];
@@ -176,15 +160,16 @@ int main(void) {
 
         SeSpecFrame f;
         if (four_aec_fuse(p, weights, NULL, &f) != FOUR_AEC_NR_RES_OK) break;
-        const float* res_gain = se_res_stage_gain(res, &f);
-        const float* nr_gain = se_anr_stage_gain(nr, &f, extra_noise, 1);
-        if (!res_gain || !nr_gain) break;
-        sk_min_f32(total_gain, nr_gain, res_gain, n);
-        sk_capply_gain_f32(spec, f.e, total_gain, n);
-        aec_cng_fill(&rng, spec, f.cn, res_gain, nr_gain, SE_CNG_NR_GAIN_FLOOR, n);
-        ac_istft_push(istft, spec, out);
+        const Complex* post = se_sample_chain_form(chain, &f);   /* RES gain, NR gain, min, CNG */
+        if (!post || se_sample_chain_synthesize(chain, post, out) != 0 ||
+            !se_hop_is_finite(out, hop)) {
+            four_aec_nr_res_reset(p);                            /* a refused call: reset both */
+            se_sample_chain_reset(chain);
+            continue;
+        }
         /* consume out: hop floats of enhanced mono audio */
     }
+    se_sample_chain_destroy(chain);
     free(mem);
     four_aec_nr_res_destroy(p);
     printf("ok hop=%d n_freqs=%d\n", hop, n);
@@ -210,7 +195,9 @@ c++ -o app app.o \
   -lm
 ```
 
-只要回音抑制、不要降噪的產品：不建 `AnrDenoiser`，把 `nr_gain` 換成全 1 的 unity 向量即可（`sk_min_f32` 涵蓋所有組合）。
+只要回音抑制、不要降噪的產品：設 `sc.enable_nr = 0`，鏈不建 `AnrDenoiser`，NR 增益讀 unity 全 1 向量（`sk_min_f32` 涵蓋所有組合）。
+自己逐個 stage 接線也可以：`aec_res_get_mem_size()`／`anr_get_mem_size()`／`ac_istft_get_mem_size()` 各自查大小、各自 init，
+再照 `samples/se_sample_chain.h` 的 `se_sample_chain_form()` 的順序呼叫。
 
 ---
 
@@ -221,12 +208,12 @@ c++ -o app app.o \
 | 1 | query | `four_aec_nr_res_get_mem_requirements(&cfg, &req)` | **每次 init 之前**都要重查，不可跨 build / backend / config 快取 | 回傳 `-1`：`out` 為 NULL；`cfg` 未通過驗證（§4）；此 TU 編譯時沒帶 `-DAUDIO_PIPELINE_BACKEND_STR="ne10"` |
 | 2 | allocate | 你自己的配置器，取得 `req.bytes` 且對齊 `req.alignment`（16）的記憶體 | 拿到 `req` 之後 | pool **不需要**預先清零（poison pattern 可接受，已實測）。`init_ex()` 自己會把整塊 memset 成 0 |
 | 3 | init | `four_aec_nr_res_init_ex(pool, req.bytes, &cfg, &req)` | 拿到 pool 之後，處理第一個 hop 之前 | 回傳 `NULL`：8 項 descriptor 檢查任一不符；pool 未 16-byte 對齊；pool 太小；config 無效；子模組 init 失敗。**沒有任何診斷輸出**（見 §5.5） |
-| 3b | stage 配置 | `four_aec_nr_res_stage_configs(&cfg, &res_cfg, &nr_cfg)`，再 `aec_res_init()`／`se_anr_stage_init()`／`ac_istft_init()` | 你的後級 stage 要用時 | `-1`：NULL 引數或前端會拒絕的 config。stage 的記憶體由你自己查大小、自己 carve（§2 的範例） |
+| 3b | 後級 stage | `se_sample_chain_mem_size(&sc)` → `se_sample_chain_init()`（或各 stage 自己的 `aec_res_init()`／`anr_init()`／`ac_istft_init()`） | 你的後級 stage 要用時 | `mem_size` 回 `0`、`init` 回 `NULL`：config 無效或 pool 太小／未對齊。stage 的記憶體由你自己查大小、自己 carve，與前端的 pool 分開（§2 的範例） |
 | 4a | front_process | `four_aec_front_process(p, mics, ref, &front)` | 每收到一個 hop 呼叫一次 | `-1` / `-3`，見 §5.2 |
 | 4b | 你的 beamformer | — | 在 front 與 fuse 之間 | 由你負責 |
 | 4c | fuse | `four_aec_fuse(p, weights, beamformed_error, &frame)` | 緊接著同一幀的 `front_process()` | `-1` / `-2` / `-3`，見 §5.3 |
 | 4d | 你的後級 stage | `se_res_stage_gain` … `ac_istft_push` | fuse 之後、下一次 `front_process()` 之前 | 由你負責 |
-| 5 | reset | `four_aec_nr_res_reset(p)` | 換回聲路徑、切換串流時 | 不會失敗。`p == NULL` 或已 destroy 時是 no-op。**會作廢目前的 front 視圖與 `SeSpecFrame`**；你的 stage 要各自 reset（`aec_res_reset`／`se_anr_stage_reset`／`ac_istft_reset`，並把 CNG 的 rng 設回 `SE_CNG_RNG_SEED`） |
+| 5 | reset | `four_aec_nr_res_reset(p)` | 換回聲路徑、切換串流時 | 不會失敗。`p == NULL` 或已 destroy 時是 no-op。**會作廢目前的 front 視圖與 `SeSpecFrame`**；你的 stage 要各自 reset（`se_sample_chain_reset()` 一次做完 `aec_res_reset`／`anr_reset`／`ac_istft_reset` 並把 CNG 的 rng 設回 `SE_CNG_RNG_SEED`） |
 | 6 | destroy | `four_aec_nr_res_destroy(p)` | 不再處理任何 hop 之後、釋放 pool 之前 | 不會失敗。NULL 安全。pool instance 冪等；`create()` instance 只能呼叫一次 |
 | 7 | release | 你自己的釋放器 | **一定要在第 6 步之後** | 順序顛倒 = use-after-free |
 
@@ -248,8 +235,7 @@ heap 便利路徑：`four_aec_nr_res_create(&cfg)` 把第 1~3 步合成一步，
 
 後面的計數是**結構稽核用**的：前兩個對有效 handle 回傳固定常數（`linear_aec_count` 恆 4），
 用來在整合測試裡證明拓撲沒有被改掉；`far_fft_real_compute_count` 用來證明跨聲道的 far-end 共用真的生效。
-它們對處理結果沒有任何影響。`nr` 與 `post_res` 的稽核計數屬於擁有它們的應用：
-完整 wrapper 提供 `audio_pipeline_4ch_nr_count()`／`audio_pipeline_4ch_post_res_count()`。
+它們對處理結果沒有任何影響。後級 stage 是否存在由你的鏈設定決定（`se_sample_chain_res()`／`se_sample_chain_nr()` 是否為 NULL），前端與單元沒有 `nr`／`post_res` 的稽核計數。
 
 ### 3.1b 逐階段耗時（診斷用）
 
@@ -301,12 +287,13 @@ wall-clock 成本。lane 內部的 `delay_us` 也一併加進上面的 `delay_us
 
 ```c
 aec_res_set_preset(res, AEC_PRESET_AGGRESSIVE, 100.0f);          /* 回 0 成功 */
-se_anr_stage_set_mode(nr, sample_rate, fft_size, hop, ANR_MODE_MILD);
+anr_set_mode(nr, ANR_MODE_MILD);
 float live, target;
 aec_res_split_floor(res, &live, &target);                        /* 唯讀，線性功率 */
 ```
 
-完整 wrapper 把這三個包成 `audio_pipeline_4ch_set_aec_preset()`／`_set_nr_mode()`／`_post_split_floor()`
+範例鏈的兩個 stage 是 `se_sample_chain_res(chain)` 與 `se_sample_chain_nr(chain)`
+（見 `pipelines/samples/se_sample_chain.h`）；線性 AEC + BF 單元同樣沒有強度 setter
 （見 `docs/integration_4ch_spatial_zh_TW.md`）。
 
 > **本節最重要的一件事：對四條 lane 重新指定 preset 是無效操作。**
@@ -316,12 +303,12 @@ aec_res_split_floor(res, &live, &target);                        /* 唯讀，線
 > 也真正決定 comfort noise 量的那個 gain，來自**唯一一個**共用的 post 級抑制器
 > （`AecRes`，由你的應用擁有）。這也是為什麼 preset setter 要作用在它上面，而不是要你自己
 > 對四條 lane 迴圈呼叫 `aec_set_preset()`。這一點由測試釘住
-> （`tests/test_audio_pipeline_4ch.c` 的 runtime strength 測試），不是推測。
+> （`tests/test_se_common.c` 的 sample chain 強度測試與 `tests/test_audio_pipeline_4ch.c`），不是推測。
 
 | 呼叫 | 改／讀什麼 | 失敗（回 `-1`，**什麼都不寫**） |
 |---|---|---|
 | `aec_res_set_preset(res, preset, ramp_ms)` | **共用 post 級抑制器**的 far-active split floor | `res` 為 NULL；`preset` 超出 enum；`ramp_ms` 非有限值或超出 `[0, 60000]` |
-| `se_anr_stage_set_mode(nr, …, mode)` | 你擁有的**那一個**降噪器（NR 是對 beamform 後的訊號跑，不是每條 lane 一個） | `nr` 為 NULL；`mode` 超出 enum；重組出的 target 被拒 |
+| `anr_set_mode(nr, mode)` | 你擁有的**那一個**降噪器（NR 是對 beamform 後的訊號跑，不是每條 lane 一個） | `nr` 為 NULL；`mode` 超出 enum |
 | `aec_res_split_floor(res, &live, &target)` | 唯讀。`live` = 抑制器**當下**套用的值，`target` = 撐得過 reset 的已設定值；兩者只有在 ramp 走到一半時才不同。任一指標可為 NULL | `res` 為 NULL |
 
 `live` / `target` 這一對是**板端唯一值得記錄的強度量**：它是真正塑形輸出的東西
@@ -336,10 +323,9 @@ aec_res_split_floor(res, &live, &target);                        /* 唯讀，線
 平滑歷史全部繼續跑。preset 的改動**撐得過**該 stage 的 reset（目標值另存一份，reset 會重新套用），但 ramp 進度會被丟掉。
 **在兩個 hop 之間呼叫、與 `front_process()`／`fuse()` 序列化；非 thread-safe。**
 
-> **不要繞過 `se_anr_stage_set_mode()` 去呼叫 `anr_set_mode()`。** 本管線的 NR 組態是
-> 「canonical 強度 preset **加上**自己的覆寫」（`L`、`alpha_decay`；組成見 `pipelines/common/se_anr_stage.h` 的 `se_anr_compose_config()`）。`anr_set_mode()` 組的是裸的 canonical preset，在這個
-> 實例上會被**拒絕**（它的 `L` 不同）——所以 `se_anr_stage_set_mode()` 做的
-> 事是重組完整組態，再交給 `anr_reconfigure()`。
+> 範例鏈的降噪器以 `anr_config_for_mode_grid()` 建立、沒有覆寫任何欄位，所以 `anr_set_mode()`
+> 直接換強度。若你在 preset 之上改過欄位，`anr_set_mode()` 會把它們蓋回 preset 值：
+> 那種實例請自己組好完整 target 再呼叫 `anr_reconfigure()`。
 
 **A/B 量測時該預期什麼。** far-active 地板只在 **far-active 且非 double-talk** 的
 hop 上生效：double-talk 期間強制套用 DT 地板，而 DT 地板在三個 preset 之間
@@ -379,13 +365,11 @@ FourAecNrResConfig cfg = four_aec_nr_res_default_config(16000);
 | `delay_backward_quarantine_enabled` | `int`（bool） | `0` | `0` 或 `1` | 僅 `MATCHED`。開啟後，比現行 accepted delay **更早**的共用估計會先被隔離（`capture_proxy_channel` 那條 lane 在目前對齊上仍明顯在消除回音時），到期才採用；往後跳與首次取得對齊不受影響。產品組態維持 `0`；機制說明見 `integration_4ch_spatial_zh_TW.md` 的 `core.delay_backward_quarantine_enabled` 列 |
 | `delay_backward_quarantine_s` | `float` | `1.0` | 有限值，`[0.0, 3600.0]` | 隔離窗長（秒），`init` 時換算成 hop 數（最小 1）；enable 為 0 時無作用但仍被驗證 |
 | `delay_est_period_s` | `float` | `0.0` | 有限值，`[0.0, 3600.0]` | 共用 matched-filter 的 duty-cycle 週期：`0.0` = 每 hop 全速分析；正值時估計 solid 且不變 `delay_est_init_s`（0.3 s，固定）後，改為每 round(`delay_est_period_s`/hop)÷5 個 hop（最小 1）分析一次，省算力但可能鎖到不同的 lag |
-| `aec_preset` | `AecPreset` | `AEC_PRESET_BALANCED`（= 1） | `MILD`(0) / `BALANCED`(1) / `AGGRESSIVE`(2) / `NO_FLOOR`(3)。列舉以外拒絕（**不會**默默 fallback） | 近端保留優先 → `MILD`；回聲抑制優先 → `AGGRESSIVE` |
-| `nr_mode` | `AnrMode` | `ANR_MODE_BALANCED`（= 2） | `MILD`(0) / `MODERATE`(1) / `BALANCED`(2) / `AGGRESSIVE`(3)。列舉以外拒絕 | 降噪強度，四級都可用；前端不讀它，`four_aec_nr_res_stage_configs()` 用它推導 `AnrConfig` |
-| `enable_nr` | `int`（bool） | `1` | 只接受 `0` 或 `1` | 前端自己不讀；它與 `enable_res`／`enable_cng`／`legacy_amin` 配置的是**你的後級**（`four_aec_nr_res_stage_configs()` 據此導出 `AecConfig`／`AnrConfig`；完整 wrapper 用它們決定 carve 哪些 stage）。`0` = 不建 MMSE-LSA，`total_gain` 只由 RES 決定。給「要回聲抑制但不要降噪」的產品 |
-| `enable_res` | `int`（bool） | `1` | 只接受 `0` 或 `1` | 同上，後級的設定。`0` = 不建 post-beam RES，`total_gain` 只由 NR 決定，CNG 沒有被 RES 挖掉的 bin 可填故略過；缺席的增益來源讀 unity 全 1 向量。`enable_post` 優先：`enable_post=0` 時前端不 carve fuse 緩衝（見 4.6b）；`enable_post=1` 時兩者獨立組合，都 `0` 即 beamform 後線性誤差經合成直通 |
 | `enable_post` | `int`（bool） | `1` | 只接受 `0` 或 `1` | `1` = 前端 carve fuse 緩衝，可呼叫 `four_aec_fuse()`；`0` = front-only 前端（只有 `four_aec_front_process()`，`four_aec_fuse()` 回 `INVALID_ARGUMENT`），給從不 fuse 的應用（例如 ULCNet）。見 4.6b |
-| `enable_cng` | `int`（bool） | `1` | 只接受 `0` 或 `1` | `1` = 在 RES 抑制掉的 bin 填舒適噪音，位準再乘該 bin 的 NR gain、下限 −10 dB |
-| `legacy_amin` | `int`（bool） | `0` | 只接受 `0` 或 `1` | `1` = NR 的 noise prior 不摺入 R²。只用於比對，新整合請保持 `0` |
+
+前端**沒有** RES、NR、comfort noise 或 preset 的設定欄位：`aec_preset`、`nr_mode`、`enable_res`、`enable_nr`、
+`enable_cng`、`legacy_amin` 都不在 `FourAecNrResConfig` 裡（lane 一律以 `AEC_PRESET_BALANCED` 導出，且只算線性殘留）。
+這些屬於你的後級鏈，例如 `SeSampleChainConfig` 的 `res`、`res_preset`、`enable_nr`、`nr_mode`、`legacy_amin`、`enable_cng`。
 
 ### 4.2 Grid（由 `sample_rate` + `fft_size` 唯一決定）
 
@@ -486,27 +470,27 @@ lane 的 `filter_converged` / `dt_indicator` / `saturation_level` 縮成三個�
 | `delay_num_filters` | 僅 `MATCHED` 有效，每少一個固定省 5,728 B |
 | `fixed_delay_samples` | 僅 `FIXED` 有效，決定共用 delay ring 大小 |
 | `max_delay_ms` | 會（僅 `MATCHED` 用於 sizing delay ring） |
-| `enable_post` | 會（`0` 時不 carve fuse 緩衝，見 4.6b；ULCNet wrapper 用這個） |
+| `enable_post` | 會（`0` 時不 carve fuse 緩衝，見 4.6b；ULCNet 範例用這個） |
 | `capture_proxy_channel` | 不變 |
-| `enable_nr` / `enable_res` / `enable_cng` / `legacy_amin` / `aec_preset` / `nr_mode` | 前端記憶體不變；它們決定你的後級 stage 的 config 與大小（`four_aec_nr_res_stage_configs()`，再用 `se_anr_stage_mem_size()`／`aec_res_get_mem_size()` 查） |
 
-後級 stage 的記憶體（`AecRes`、`AnrDenoiser`、`AcIstft` 與暫存向量）由應用自己加總；
-完整 wrapper 的 `audio_pipeline_4ch_get_mem_requirements()` 已把它們算進總量。
+後級 stage 的記憶體（`AecRes`、`AnrDenoiser`、`AcIstft` 與暫存向量）不在前端的 `req.bytes` 裡：
+由應用用各自的 `mem_size`（或 `se_sample_chain_mem_size()`）查、自己加總。
+線性 AEC + BF 單元的 `audio_pipeline_4ch_get_mem_requirements()` 也不含它們。
 
 ### 4.6 實測記憶體（僅供量級參考，務必自己重查）
 
-以下是本次 checkout（`layout_version=22`）、`BACKEND=ne10`、`SIMD=1`、
+以下是本次 checkout（`layout_version=23`）、`BACKEND=ne10`、`SIMD=1`、
 `delay_mode=MATCHED`（預設,n=5）、`enable_post=1`（預設）下直接呼叫 API
 量到的前端值。換 backend、換編譯選項、更新 submodule 都會變。前端不含 RES／NR／iFFT，
 所以 `FourAecNrResMemBreakdown` 只有 `aec_bytes`、`wrapper_bytes`（控制區塊、共用 aligner 與 fuse 緩衝）與 `total_bytes`。
 
 | Config | `req.bytes` | `aec_bytes`（四路合計） | `wrapper_bytes` |
 |---|---:|---:|---:|
-| 16000，預設（256/128，`max_delay_ms=1024`） | 1,039,904 | 930,944 | 108,960 |
-| 16000，`fft_size=512` | 1,557,856 | 1,441,728 | 116,128 |
-| 16000，`max_delay_ms=100` | 980,768 | 930,944 | 49,824 |
-| 16000，`filter_length=512` | 916,064 | 807,104 | 108,960 |
-| 48000，預設（1024/512） | 3,445,504 | 3,182,592 | 262,912 |
+| 16000，預設（256/128，`max_delay_ms=1024`） | 1,039,872 | 930,944 | 108,928 |
+| 16000，`fft_size=512` | 1,557,824 | 1,441,728 | 116,096 |
+| 16000，`max_delay_ms=100` | 980,736 | 930,944 | 49,792 |
+| 16000，`filter_length=512` | 916,032 | 807,104 | 108,928 |
+| 48000，預設（1024/512） | 3,445,472 | 3,182,592 | 262,880 |
 
 `four_aec_nr_res_get_mem_breakdown()` 的 `total_bytes` 與 `get_mem_requirements()` 的
 `req.bytes` 在上述每一組都相等；`wrapper_bytes` 已包含控制區塊。四路合計的
@@ -518,23 +502,23 @@ lane 的 `filter_converged` / `dt_indicator` / `saturation_level` 縮成三個�
 
 | `delay_mode` | `req.bytes` | 相對 `MATCHED n=5` |
 |---|---:|---:|
-| `MATCHED` n=5（預設） | 1,039,904 | — |
-| `FIXED`，`fixed_delay_samples=1600`（100 ms） | 946,304 | −93,600 |
-| `EXTERNAL_ALIGNED` | 939,392 | −100,512 |
+| `MATCHED` n=5（預設） | 1,039,872 | — |
+| `FIXED`，`fixed_delay_samples=1600`（100 ms） | 946,272 | −93,600 |
+| `EXTERNAL_ALIGNED` | 939,360 | −100,512 |
 
 省下的量比單聲道版本小，因為這裡只省**一份共用**的 estimator/ring（四路
 共用一個 aligner），不是四份各自的——與本頁「單一共用 aligner」的結構
 一致。
 
-#### 4.6b `enable_post=0`（ULCNet wrapper 用的 front-only 前端）
+#### 4.6b `enable_post=0`（ULCNet 範例用的 front-only 前端）
 
 | Config | `req.bytes` |
 |---|---:|
-| 16000，`fft_size=512`，`enable_post=0` | 1,496,080 |
-| 48000，`enable_post=0` | 3,258,672 |
+| 16000，`fft_size=512`，`enable_post=0` | 1,547,488 |
+| 48000，`enable_post=0` | 3,424,896 |
 
-即 [`pipeline_ulcnet_4ch.html`](html/pipeline_ulcnet_4ch.html) 記載的 ULCNet
-4ch wrapper 私有前端大小；比同格點 `enable_post=1` 少的是 fuse 緩衝（16 kHz/512：10,336 B，48 kHz：20,576 B）。
+這是 [`pipeline_ulcnet_4ch.html`](html/pipeline_ulcnet_4ch.html) 的 ULCNet 4ch 範例所用單元
+（`AudioPipeline4Ch`，`core.enable_post = 0`）內的前端大小；比同格點 `enable_post=1` 少的是 fuse 緩衝（16 kHz/512：10,336 B，48 kHz：20,576 B）。
 **實際配置一律以 `req.bytes` 為準。**
 
 ---
@@ -587,7 +571,6 @@ lane 的 `filter_converged` / `dt_indicator` / `saturation_level` 縮成三個�
 | `four_aec_nr_res_default_config()` | 回傳填好的 struct | 不會失敗，**也不驗證** | 傳入非法 `sample_rate` 也照填，之後才會被拒 |
 | `four_aec_nr_res_get_mem_requirements()` | `0`，`*out` 填妥 | `-1` | — |
 | `four_aec_nr_res_get_mem_breakdown()` | `0`，`*out` 填妥 | `-1` | — |
-| `four_aec_nr_res_stage_configs()` | `0`，`*res_cfg`／`*nr_cfg` 填妥 | `-1` | NULL 引數或前端會拒絕的 config |
 | `four_aec_nr_res_init()` | 非 NULL handle | `NULL` | 等同 `init_ex(..., NULL)` |
 | `four_aec_nr_res_init_ex()` | 非 NULL handle | `NULL` | 8 項檢查任一不符即 NULL |
 | `four_aec_nr_res_create()` | 非 NULL handle | `NULL` | config 無效或配置失敗 |
@@ -635,8 +618,9 @@ destroy 之後不要再呼叫任何 accessor。
 | Source | 產出 | 說明 |
 |---|---|---|
 | `pipelines/4ch_aec_bf_nr_res/4aec_nr_res.c` | `libaudio_pipeline_4ch.a`（object 之一） | **本手冊的主體** |
-| `pipelines/common/se_config.c`、`se_anr_stage.c` | `libaudio_pipeline_4ch.a`（object 之二、三） | 共用組態與 NR 級；`se_stage.h` / `se_res_stage_gain()` 為 header-only |
-| `pipelines/4ch_aec_bf_nr_res/audio_pipeline_4ch.c` | 獨立 object | 完整 spatial wrapper（擁有 RES／NR／ISTFT 並串接）。只用本手冊 API 時不會被拉進來 |
+| `pipelines/4ch_aec_bf_nr_res/audio_pipeline_4ch.c` | `libaudio_pipeline_4ch.a`（object 之二） | 線性 AEC + BF 單元（SRP-PHAT + BF；不含 RES／NR／ISTFT）。只用本手冊 API 時不會被拉進來 |
+| `pipelines/common/se_config.c` | `libaudio_pipeline_4ch.a`（object 之三） | 共用組態；`se_stage.h` / `se_res_stage_gain()` 為 header-only |
+| `pipelines/samples/se_sample_chain.h`、`se_anr_stage.h` | header-only 範例碼 | 後級鏈與 NR 級的 gain 呼叫：沒有 ABI、沒有 layout version、不進任何 archive，可整份複製改寫 |
 | `pipelines/4ch_aec_bf_nr_res/4aec_nr_res.h` | — | 本手冊的公開 API |
 | `pipelines/4ch_aec_bf_nr_res/audio_pipeline_4ch.h` | — | 另一份手冊的公開 API |
 | `pipelines/4ch_aec_bf_nr_res/4aec_nr_res_internal.h`、`4aec_projection_kernels.h` | — | 內部 header，**不是**公開 API，不要 include |
@@ -646,8 +630,8 @@ destroy 之後不要再呼叫任何 accessor。
 | Source | 是什麼 | 為什麼存在 |
 |---|---|---|
 | `pipelines/4ch_aec_bf_nr_res/4aec_nr_res_static.c` | caller-owned pool 路徑的主機參考程式 | 示範 query → allocate → init → front_process → fuse → 明寫的 stage 鏈 → destroy → release。它在 front/fuse 之間塞的是**固定等權重**，那是決定性的 smoke adapter，**不是** production beamformer |
-| `pipelines/4ch_aec_bf_nr_res/audio_pipeline_4ch_static.c` | 完整 spatial pipeline 的 pool 路徑主機參考程式 | 屬於另一份手冊；列在這裡是為了讓目錄內容一目了然 |
-| `pipelines/4ch_aec_bf_nr_res/audio_pipeline_4ch_raw.c` | raw-float 錄音驗證 runner | 主機一次性工具，走 heap `create()` 路徑 |
+| `pipelines/4ch_aec_bf_nr_res/audio_pipeline_4ch_static.c` | 線性 AEC + BF 單元加範例鏈的 pool 路徑主機參考程式 | 屬於另一份手冊；列在這裡是為了讓目錄內容一目了然 |
+| `pipelines/4ch_aec_bf_nr_res/audio_pipeline_4ch_raw.c` | raw-float 錄音驗證 runner（單元加範例鏈） | 主機一次性工具，走 heap `create()` 路徑 |
 
 單聲道的 library 與參考程式（`pipelines/mono_aec_nr_res/main.c`、
 `static_main.c`、`example_board_adapter.c`）見 `docs/integration_mono_zh_TW.md`。
@@ -680,14 +664,14 @@ destroy 之後不要再呼叫任何 accessor。
 - [ ] `init_ex()` 回 `NULL` 時你的程式會停下來 —— 而且你**自己**在呼叫端印出了
       是哪一個欄位不符（函式庫不會告訴你）
 - [ ] `sample_rate` 沒有設成 8000
-- [ ] 後級 stage 的記憶體以 `four_aec_nr_res_stage_configs()` 導出的 config 查大小，16-byte 對齊
+- [ ] 後級 stage 的記憶體以各自的 `mem_size`（或 `se_sample_chain_mem_size()`）查大小，16-byte 對齊，與前端 pool 分開
 
 front / fuse 協定：
 
 - [ ] 每 hop 先 `front_process()` 再 `fuse()`；`fuse()` 之前沒有 front frame 會得到 `-2`
 - [ ] `weights` 是 channel-major `[ch * n_freqs + bin]`，不是 bin-major
 - [ ] `weights` 不會全零（會被 `-1` 拒絕；front 幀保留，可重試）
-- [ ] 有處理 `-3`（instance 已被自動 reset，你的外部狀態與後級 stage 也要跟著 reset）
+- [ ] 有處理 `-3`（instance 已被自動 reset，你的外部狀態與後級 stage 也要跟著 reset：`se_sample_chain_reset()`）
 - [ ] `front.delay.changed` 非 0 時，你外部 beamformer 的 STFT / OLA 歷史有跟著清掉
 - [ ] `FourAecFront` 與 `SeSpecFrame` 的指標只在下一次 `front_process()`／`reset()`／`destroy()` 之前讀取，沒有跨幀保存，也沒有寫入
 - [ ] `reset()` 之後你的 beamformer 立刻停止讀那些指標
@@ -713,12 +697,12 @@ front / fuse 協定：
 ### 8.1 `FourAecNrResMemReq`
 
 固定 32 bytes、每個欄位固定 byte offset（由 header 內的 `_Static_assert` 釘死），
-全部是定寬整數。與單聲道 `AudioPipelineMemReq` 同形狀、同語意，但**版本號各自獨立**。
+全部是定寬整數。與 `AudioPipeline4ChMemReq` 同形狀、同語意，但**版本號各自獨立**（單元內嵌這個核心，其 `build_flags_hash` 折入核心的 hash）。
 
 | Offset | 欄位 | 型別 | 目前值 |
 |---:|---|---|---|
 | 0 | `descriptor_version` | `uint32_t` | `1` |
-| 4 | `layout_version` | `uint32_t` | `22` |
+| 4 | `layout_version` | `uint32_t` | `23` |
 | 8 | `backend_id` | `uint32_t` | `2` = NE10（目前唯一的 FFT 後端）；永遠不會是 0 |
 | 12 | `build_flags_hash` | `uint32_t` | FNV-1a-32，隨 build 變動 |
 | 16 | `alignment` | `uint32_t` | `16` |

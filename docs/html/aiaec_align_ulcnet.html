@@ -20,7 +20,7 @@ th{background:#eef0f2}
 </head>
 <body>
 <nav><a href="index.html">index</a><a href="aiaec_align_ulcnet.html"><b>Align-ULCNet</b></a><a href="aiaec_align_ulcnet_detail.html">Align-ULCNet 細節</a><a href="aiaec_align_cruse.html">Align-CRUSE</a><a href="aiaec_deepvqe_s.html">DeepVQE-S</a><a href="aiaec_cagcrn.html">CAGCRN</a></nav>
-<h1>Align-ULCNet（linear AEC → RES+NR post-filter，paper reference）</h1>
+<h1>Align-ULCNet（linear AEC → RES+NR post-filter，selected）</h1>
 
 <h2>概要</h2>
 <p>Shetu et al.（EUSIPCO 2025, arXiv:2410.13620）兩級混合式殘響/殘迴聲 + 噪音抑制器的重建。
@@ -276,7 +276,7 @@ Python reference 仍是兩個 <code>(2, 1, 128)</code> 的 nn.GRU hidden，測�
 實測 stream-vs-offline 最差差異：enhanced 4.1e-8 / mask 1.2e-7 / magnitude_mask 6.0e-8 /
 delay 4.0e-7（test 檔頭記載；tolerances 以 ~10x headroom 釘在 5e-7 / 2e-6 / 1e-6 / 5e-6）。</li>
 <li>Framing：類別與 AEC/GSC seam 用 <b>center=False、每 hop 一幀</b>的 rolling 分析；centered
-push 只剩 Python parity gate 使用（mono wrapper 用同一套排程）。端到端
+push 只剩 Python parity gate 使用（mono 範例 <code>mono_alignulcnet/main.c</code> 用同一套排程）。端到端
 演算法延遲仍是 <b>HOP samples</b>＝16 kHz 256 smp（16 ms）、48 kHz 512 smp（10.67 ms），但它來自
 <b>synthesis 的半窗 trim</b>、不是分析排程（<code>ulcnet_prepost.h</code> 明文）。</li>
 <li>C 前後處理 vs Python：float-ULP 級（實測 ~2e-5 絕對值，NE10 f32 FFT vs torch

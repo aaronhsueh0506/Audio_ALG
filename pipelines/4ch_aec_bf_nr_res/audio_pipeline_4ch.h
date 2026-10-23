@@ -1,10 +1,19 @@
-/** Complete four-channel spatial speech-enhancement pipeline: one shared far aligner ->
- * four linear AEC lanes -> SRP-PHAT DOA -> BF -> one NR + one post-beam RES. SRP-PHAT and
- * BF come from audiolib/doa and audiolib/bf; this wrapper owns their lifetime. Between
- * the core's four_aec_front_process() and four_aec_fuse() it runs the spatial stage, then
- * chains the post-beam stages itself (RES gain, NR gain, min, apply, comfort noise,
- * synthesis). Lifecycle follows 4aec_nr_res.h; both construction paths give identical
- * output for the same inputs, config and backend.
+/** Four-channel linear AEC plus beamformer unit: one shared far aligner -> four linear AEC
+ * lanes -> SRP-PHAT DOA -> BF. SRP-PHAT and BF come from audiolib/doa and audiolib/bf; this
+ * unit owns their lifetime. The residual-echo, noise-reduction, comfort-noise and synthesis
+ * stages and any neural post-filter are separate libraries that the application initialises
+ * and chains over the unit's output (samples/se_sample_chain.h shows the chain).
+ * Per hop, one of two equivalent forms:
+ *     audio_pipeline_4ch_process_front()   shared delay + four linear AEC lanes
+ *     [mask / activity from the lane spectra]
+ *     audio_pipeline_4ch_process_beam()    SRP-PHAT + BF -> beamformed spectrum and weights
+ *     audio_pipeline_4ch_fuse()            optional: project near / R^2 / comfort noise into a
+ *                                          SeSpecFrame for the frequency-domain stages
+ * or audio_pipeline_4ch_process_with_activity() / audio_pipeline_4ch_process() for front plus
+ * beam in one call. With core.enable_post = 0 the lanes keep only the linear context and
+ * fuse() is unavailable (the profile of a neural post-filter that reads the beam spectrum).
+ * Lifecycle follows 4aec_nr_res.h; both construction paths give identical output for the same
+ * inputs, config and backend.
  * Caller-owned pool (board/static path):
  *     AudioPipeline4ChConfig cfg = audio_pipeline_4ch_default_config(16000);
  *     AudioPipeline4ChMemReq req;
@@ -59,7 +68,7 @@ typedef struct AudioPipeline4ChConfig {
     int bf_adapt_interval;
 
     /* Fallback activity detector used only by audio_pipeline_4ch_process(); integrations that
-     * own a VAD call audio_pipeline_4ch_process_with_activity(). */
+     * own a VAD call audio_pipeline_4ch_process_with_activity() or the split calls. */
     float auto_vad_threshold_dbfs;
     float auto_vad_snr_ratio;
     int auto_vad_hangover_frames;
@@ -80,11 +89,11 @@ typedef struct AudioPipeline4ChFrameInfo {
 typedef struct AudioPipeline4Ch AudioPipeline4Ch;
 
 #define AUDIO_PIPELINE_4CH_DESCRIPTOR_VERSION 1u
-/* Carve layout version of this wrapper; bumped on any change of pool size, carve order or
+/* Carve layout version of this unit; bumped on any change of pool size, carve order or
  * descriptor content, including a control-block-only change of the composed core
  * (build_flags_hash folds in only the core's carve-token hash). Query a fresh descriptor
  * for every build; never persist or synthesize one. */
-#define AUDIO_PIPELINE_4CH_LAYOUT_VERSION 17u
+#define AUDIO_PIPELINE_4CH_LAYOUT_VERSION 18u
 
 /** Fixed 32-byte descriptor with the fields of FourAecNrResMemReq (4aec_nr_res.h). Its
  * build_flags_hash folds in the core's, so a core-layer layout bump invalidates persisted
@@ -128,7 +137,7 @@ AudioPipeline4ChConfig audio_pipeline_4ch_default_config(int sample_rate);
 
 /** Queries the 16-byte-aligned caller pool required by cfg. No allocation; returns 0 on
  * success. Composes the core's requirements with srp_get_mem_size()/bf_get_mem_size() and
- * this wrapper's bf_spectrum/bf_weights scratch. */
+ * this unit's bf_spectrum/bf_weights scratch. */
 int audio_pipeline_4ch_get_mem_requirements(
     const AudioPipeline4ChConfig* cfg,
     AudioPipeline4ChMemReq* out);
@@ -154,18 +163,45 @@ AudioPipeline4Ch* audio_pipeline_4ch_init_ex(
 AudioPipeline4Ch* audio_pipeline_4ch_create(
     const AudioPipeline4ChConfig* cfg);
 
-/** Completes one hop using the wrapper's energy-VAD fallback. */
-int audio_pipeline_4ch_process(
+/** The beamformed result of one hop. Both pointers alias unit memory and stay valid until the
+ * next process_front(), process_with_activity(), process(), reset() or destroy(). */
+typedef struct AudioPipeline4ChBeam {
+    const Complex* spectrum;   /* beamformed error E, n_freqs bins                              */
+    const Complex* weights;    /* effective weights, channel-major [4][n_freqs], from the same
+                                  bf_process_with_weights() call as `spectrum`                  */
+} AudioPipeline4ChBeam;
+
+/** Starts a hop: the shared aligner and the four linear AEC lanes. microphones_interleaved is
+ * [hop][4], far_reference is [hop]. On OK, *out is the core's borrowed front view of this hop
+ * (delay state, lane spectra and hops, aligned reference). Always legal as the first call of a
+ * hop, after any earlier state; it supersedes a pending front. Returns FOUR_AEC_NR_RES_OK;
+ * INVALID_ARGUMENT for a NULL argument or a non-finite sample (no adaptive state changed);
+ * DSP_ERROR when a lane refused the hop or the front disagrees with the unit's grid (the unit
+ * has been reset in the second case, the core in the first). After any refusal past the NULL
+ * checks no front or beam is pending: process_beam() and fuse() return SEQUENCE_ERROR. */
+int audio_pipeline_4ch_process_front(
     AudioPipeline4Ch* p,
     const float* microphones_interleaved,
     const float* far_reference,
-    float* output,
+    FourAecFront* out);
+
+/** Completes a hop begun by process_front(): SRP-PHAT and BF over `front`'s lane spectra.
+ * vad_raw controls whether SRP-PHAT gets a fresh observation; vad_out is the held target-speech
+ * state used by the DOA smoother, and freezes the BF RLS update when nonzero. frequency_mask may
+ * be NULL or n_freqs integers; 1 selects a bin for SRP and freezes BF adaptation there. Fills
+ * *beam (required) and, when non-NULL, *info. Returns OK; INVALID_ARGUMENT for a NULL argument,
+ * a non-boolean flag or a front of another grid (nothing changed); SEQUENCE_ERROR without a
+ * pending front, or when this hop's beam has already run. */
+int audio_pipeline_4ch_process_beam(
+    AudioPipeline4Ch* p,
+    const FourAecFront* front,
+    int vad_raw,
+    int vad_out,
+    const int* frequency_mask,
+    AudioPipeline4ChBeam* beam,
     AudioPipeline4ChFrameInfo* info);
 
-/** Completes one hop with activity from the product VAD. vad_raw controls whether SRP-PHAT
- * gets a fresh observation; vad_out is the held target-speech state used by the DOA
- * smoother, and freezes the BF RLS update when nonzero. frequency_mask may be NULL or
- * n_freqs integers; 1 selects a bin for SRP and freezes BF adaptation there. */
+/** process_front() plus process_beam() with activity from the product VAD. */
 int audio_pipeline_4ch_process_with_activity(
     AudioPipeline4Ch* p,
     const float* microphones_interleaved,
@@ -173,23 +209,37 @@ int audio_pipeline_4ch_process_with_activity(
     int vad_raw,
     int vad_out,
     const int* frequency_mask,
-    float* output,
+    AudioPipeline4ChBeam* beam,
     AudioPipeline4ChFrameInfo* info);
 
+/** process_with_activity() using the unit's energy-VAD fallback. */
+int audio_pipeline_4ch_process(
+    AudioPipeline4Ch* p,
+    const float* microphones_interleaved,
+    const float* far_reference,
+    AudioPipeline4ChBeam* beam,
+    AudioPipeline4ChFrameInfo* info);
+
+/** Independent step after process_beam() (or process_with_activity()/process()): projects the
+ * hop with the unit's own weights and beamformed spectrum into *frame (four_aec_fuse(); frame
+ * pointers are valid until the next process_front() or reset). Requires core.enable_post.
+ * Returns OK; INVALID_ARGUMENT for a NULL argument or enable_post = 0 (nothing changed);
+ * SEQUENCE_ERROR without a beam of this hop (nothing changed). Any other refusal resets the
+ * whole unit (core, SRP, BF) and is returned: the caller resets its own post stages. */
+int audio_pipeline_4ch_fuse(AudioPipeline4Ch* p, SeSpecFrame* frame);
+
+/** Resets the core, SRP-PHAT, BF and the fallback VAD. The caller resets its own post stages. */
 void audio_pipeline_4ch_reset(AudioPipeline4Ch* p);
 
-/* Runtime strength control. The lanes never reach their own suppression-gain path, so strength lives in the single post-beam suppressor (AecRes) and the single denoiser. set_aec_preset retargets the suppressor's two gain floors and split-floor gate: the far-active floor ramps (ramp_ms 0 applies on the next hop at the floor a fresh instance would hold, a positive value walks there linearly in dB); the DT floor (-20 dB mild/balanced, -30 dB aggressive) and the gate jump immediately. Switching to/from AEC_PRESET_NO_FLOOR is allowed. Requires core.enable_res. set_nr_mode recomposes this pipeline's NR configuration (canonical preset plus its overrides) and calls anr_reconfigure(); noise floor and smoothing carry on. Requires core.enable_nr. Call between hops. Returns 0, or -1 with nothing written. */
-int audio_pipeline_4ch_set_aec_preset(AudioPipeline4Ch* p, AecPreset preset,
-                                      float ramp_ms);
-
-/* The suppressor's far-active split floor as a linear power ratio: `live` is what it
- * applies now (differs from `target` only during a ramp), `target` the reset-surviving
- * configured value; either may be NULL. Returns 0, or -1 on NULL or an instance without a
- * suppressor. */
-int audio_pipeline_4ch_post_split_floor(const AudioPipeline4Ch* p,
-                                        float* live, float* target);
-int audio_pipeline_4ch_set_nr_mode(AudioPipeline4Ch* p, AnrMode mode);
 void audio_pipeline_4ch_destroy(AudioPipeline4Ch* p);
+
+/** The composed core, read-only, for diagnostics. NULL for a NULL or destroyed handle. */
+const FourAecNrRes* audio_pipeline_4ch_get_core(const AudioPipeline4Ch* p);
+
+/** Stage timings (microseconds) of the core's most recent hop. A NULL/destroyed handle zeroes
+ * *out; `out` must not be NULL. */
+void audio_pipeline_4ch_last_core_timing(const AudioPipeline4Ch* p,
+                                         FourAecNrResLastTiming* out);
 
 int audio_pipeline_4ch_hop_size(const AudioPipeline4Ch* p);
 int audio_pipeline_4ch_frame_size(const AudioPipeline4Ch* p);
@@ -213,8 +263,6 @@ float audio_pipeline_4ch_bf_lambda(const AudioPipeline4Ch* p);
 
 int audio_pipeline_4ch_matched_filter_count(const AudioPipeline4Ch* p);
 int audio_pipeline_4ch_linear_aec_count(const AudioPipeline4Ch* p);
-int audio_pipeline_4ch_nr_count(const AudioPipeline4Ch* p);
-int audio_pipeline_4ch_post_res_count(const AudioPipeline4Ch* p);
 const char* audio_pipeline_4ch_spatial_backend(void);
 
 #ifdef __cplusplus

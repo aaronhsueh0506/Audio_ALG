@@ -47,6 +47,13 @@ static int set(void *u,const char *name,const char *value) {
     assert(value && !strcmp(value,"12"));(*seen)++;return 0;
 }
 static int unknown(void *u,const char *name) {(void)u;(void)name;return 2;}
+static int fake_query(const AudioPipeline4ChConfig *c,AudioPipeline4ChMemReq *r) {
+    (void)c;memset(r,0,sizeof(*r));r->bytes=100;r->alignment=16;
+    r->backend_id=FOUR_AEC_NR_RES_BACKEND_NE10;return 0;
+}
+static int refusing_query(const AudioPipeline4ChConfig *c,AudioPipeline4ChMemReq *r) {
+    (void)c;(void)r;return -1;
+}
 int main(void) {
     Probe p=fresh();assert(run(&p)==0);assert(p.processed==3 && p.consumed==3);
     assert(p.frames==3 && p.finished==1 && p.cleaned==1 && p.completed==1);
@@ -79,5 +86,13 @@ int main(void) {
     assert(mcab_parse_spatial_cli(3,legacy,1,&o)==2);
     McabDelayOptions d={AEC_DELAY_FIXED,1,0,0,1};
     assert(mcab_validate_delay_options(&d,"probe")==0 && d.num_filters==DA_NUM_FILTERS);
+    {   /* The budget printer: the unit's size comes from the caller's query. */
+        AudioPipeline4ChConfig cfg;
+        McabMemLine extra[2]={{"Chain:",28},{"Stage:",4}};
+        memset(&cfg,0,sizeof(cfg));cfg.core.sample_rate=16000;
+        assert(mcab_print_mem_budget("probe",&cfg,fake_query,extra,2)==0);
+        assert(mcab_print_mem_budget("probe",&cfg,fake_query,NULL,0)==0);
+        assert(mcab_print_mem_budget("probe",&cfg,refusing_query,extra,2)==-1);
+    }
     puts("mcab_sample_driver: control-flow and CLI gates PASS");return 0;
 }

@@ -448,7 +448,7 @@ non-centered 第 k-1 幀覆蓋**完全相同的樣本**（逐 bit 同頻譜）�
 
 **4ch 的 latency contract**：4ch Align-ULCNet pipeline 的「加總後額外演算法延遲」是
 **1 hop**（16 kHz 256 samples = 16 ms、48 kHz 512 samples = 10.67 ms），與 mono
-wrapper 相同。GSC 產出的 beamformed error **頻譜**直接餵給模型（它已經是本 hop 的
+範例（`pipelines/mono_alignulcnet/main.c`）相同。GSC 產出的 beamformed error **頻譜**直接餵給模型（它已經是本 hop 的
 sqrt-Hann 50%-overlap 單幀），中間沒有 beam WOLA→再 analysis 的來回，far 路也沒有
 one-hop 補償 buffer；唯一的延遲來源就是本節的 ULCNet synthesis WOLA。`process()`
 只有 hop #0 輸出零，之後 hop p 的輸出是 input hop p-1 的 beamformed error。每個 hop
@@ -456,8 +456,8 @@ one-hop 補償 buffer；唯一的延遲來源就是本節的 ULCNet synthesis WO
 
 ## 8. Delay 狀態機與 Fallback
 
-兩個 pipeline 變體（`pipelines/mono_alignulcnet/audio_pipeline_ulcnet` 與
-`pipelines/4ch_alignulcnet/audio_pipeline_4ch_ulcnet`）的行為一致：
+兩個 pipeline 範例（`pipelines/mono_alignulcnet/main.c` 與
+`pipelines/4ch_alignulcnet/main.c`，共用 `pipelines/samples/ulcnet_nn_stage.{h,c}`）的行為一致：
 
 - UNLOCKED：模型照常步進並套用成功輸出（far 本來就是 raw far）；
 - delay_state 變為 CHANGED，或 FIXED 首次 UNLOCKED→LOCKED：`model->reset` 清除 far
@@ -469,8 +469,8 @@ one-hop 補償 buffer；唯一的延遲來源就是本節的 ULCNet synthesis WO
 identity reprime：邊界的 `model->reset` 之後，C 側 STFT 狀態仍連續，緊接著發射的幀其
 512 樣本分析窗**跨在邊界上**（一半是切換前推入的 hop）。這些幀走 identity 且**完全
 不呼叫 infer**（K/V、logit、GRU 都不前進），等 err 與 far 兩路窗都只含切換後的 hop 才
-同時恢復 step 與 apply：mono `AUDIO_PIPELINE_ULCNET_REPRIME_FRAMES=1`、4ch
-`AUDIO_PIPELINE_4CH_ULCNET_REPRIME_FRAMES=1`。兩個常數由各自 test suite 的
+同時恢復 step 與 apply：mono 與 4ch 共用 `ULCNET_NN_STAGE_REPRIME_FRAMES=1`。這個常數由
+`mono_alignulcnet/tests/test_mono_ulcnet.c` 與 `4ch_alignulcnet/tests/test_4ch_ulcnet.c` 的
 `test_reprime_straddle_derivation()` 以脈衝標記在**無邊界對照跑**中量出並斷言，不是
 寫死的估計值。
 
@@ -481,7 +481,7 @@ identity reprime：邊界的 `model->reset` 之後，C 側 STFT 狀態仍連續�
 只剩邊界 hop 那一幀。邊界處理只做 `model->reset` ＋ arm reprime，不清任何 buffer
 （C 側成幀狀態一路連續）。
 
-**mono 的 rolling push**：mono wrapper 的兩路 analysis 用 rolling center=False 的
+**mono 的 rolling push**：mono 範例（`mono_alignulcnet/main.c` 經 `samples/ulcnet_nn_stage`）的兩路 analysis 用 rolling center=False 的
 `AcStft`（`ac_stft_push_planar()`）（自 hop#0 起每 hop 恰一幀、每 hop 至多一次推論），
 排程與 AEC/GSC seam 一致。reprime 每 hop 遞減（與每發射幀遞減相等），1 hop 端到端
 延遲來自 synthesis 半窗 trim，幀 scratch 為 1 幀。
@@ -581,7 +581,7 @@ flowchart LR
 ```
 
 每個 256-sample hop 產生一個 model frame，且每 hop 至多一次 inference。
-rolling 分析（`AcStft`，`center` 0；mono wrapper、4ch direct path、pre/post
+rolling 分析（`AcStft`，`center` 0；mono 範例、4ch direct path、pre/post
 class 的 TIME 模式全走這個）從第一次推入起就固定一幀一次 inference，沒有
 priming 例外。centered 分析（`center` 1，0/2/1 幀發射，priming 期間的
 第二次 push 會連續產生兩幀）不再有出貨 pipeline 呼叫，只剩
@@ -693,7 +693,7 @@ identity reprime。
   （RI frame）。兩種 analysis 排程：`center` 1（centered、0/2/1 出幀排程，
   不再有出貨 pipeline 呼叫，只剩 Python parity gate 使用）與
   `center` 0（rolling、每次推入固定出一幀，與同一 hop 的 centered
-  最後一幀逐 bit 相同；mono wrapper 兩路、4ch direct path 的 far 路，以及兩個 AIAEC
+  最後一幀逐 bit 相同；mono 範例的兩路、4ch direct path 的 far 路，以及兩個 AIAEC
   pre/post class 的 TIME 模式都在用）。同一個 `AcStft` 不可混用兩種 `center`。
 - model-I/O/state `c/.h`：caller-owned memory requirement/init/reset、四個
   state tensor 的保存、commit（驗證 state、壓縮域 error × mask、逆冪；不更新 state）、

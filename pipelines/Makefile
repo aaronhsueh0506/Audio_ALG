@@ -1,13 +1,14 @@
 # Audio_ALG/pipelines/Makefile
 #
-# AEC(linear) -> echo-aware NR -> RES pipeline in two builds of the same algorithm (DSP
-# chain: see mono_aec_nr_res/main.c):
+# AEC(linear) -> echo-aware NR -> RES example programs in two builds of the same algorithm
+# (DSP chain: see mono_aec_nr_res/main.c):
 #   aec_nr_pipeline         heap-allocated modules
 #   aec_nr_pipeline_static  one caller pool, no malloc after init
-# Both are thin CLI shells (arg parsing, WAV I/O, diagnostics) over
-# mono_aec_nr_res/audio_pipeline.h/.c, linked from libaudio_pipeline.a; the ULCNet
-# application links its wrapper/pre-post objects directly. All link against the submodule
-# libs (lib/aec, lib/nr) and audiolib's FFT/fast_math layer (../../audiolib/common).
+# Both compose lib/aec's Aec, common/se_stage.h and samples/se_sample_chain.h themselves. The
+# mono DFN2 and Align-ULCNet programs compose the same way
+# (samples/dfn_hop.h, samples/ulcnet_nn_stage.h). All link against the submodule libs (lib/aec,
+# lib/nr) and audiolib's FFT/fast_math layer (../../audiolib/common). The only archive built
+# here is libaudio_pipeline_dfn.a (the DFN2 stage and rate bridge).
 #
 # Build isolation: this repo consumes three producer archives (audiolib's libaudio_common.a,
 # lib/aec's libaec.a, lib/nr's libanr.a), each CFG_SIG-keyed.
@@ -28,10 +29,10 @@
 #   make                       # all three producer archives + both pipeline binaries
 #   make EXTRA_CFLAGS="..."    # forwarded to the producers and this compile
 #   make WERROR=1              # -Werror for this file's own TUs
-#   make test                  # build + run the mono API and board-adapter tests
-#   make NO_STDIO=1 libaudio_pipeline.a   # stdio-less library object only (no link, so no
+#   make test                  # build + run the mono chain, board-adapter and stage tests
+#   make NO_STDIO=1 libaudio_pipeline_dfn.a   # stdio-less archive only (no link, so no
 #                              # producer archive is needed)
-#   make audit-no-stdio        # PASS/FAIL: the NO_STDIO=1 libaudio_pipeline.a has no
+#   make audit-no-stdio        # PASS/FAIL: the NO_STDIO=1 libaudio_pipeline_dfn.a has no
 #                              # fprintf/printf/puts/fputs/stderr refs and a keyed path that
 #                              # differs from the default (stdio) config's
 #   make print-bin-dir | print-obj-dir | print-lib-path
@@ -61,8 +62,8 @@ AEC_DIR = ../lib/aec/c_impl
 NR_DIR  = ../lib/nr/c_impl
 
 # Align-ULCNet C pre/post (STFT/WOLA + UlcnetModel callback boundary) --
-# consumed by the audio_pipeline_ulcnet variant below. Header-only include
-# path plus one TU (ulcnet_process.c) compiled by THIS Makefile (that file
+# consumed by the mono Align-ULCNet example and samples/ulcnet_nn_stage.c below. Header-only
+# include path plus one TU (ulcnet_process.c) compiled by THIS Makefile (that file
 # is not in any producer archive). Not part of CFG_SIG's caller-varying
 # axes: a fixed repo-relative constant, like AEC_DIR/NR_DIR above.
 AIAEC_DIR = ../AIAEC
@@ -122,7 +123,7 @@ RANLIB  ?= ranlib
 # "environment override" under `make -e`; `+=` is an unconditional assignment attempt that does
 # flip it (so the foreach rejects it) while appending an empty string leaves the value unchanged,
 # so a plain environment value still folds in. EXTRA_LDFLAGS/NO_STDIO are real here (see
-# LDFLAGS/LIB_CFLAGS below).
+# LDFLAGS and the NO_STDIO note below).
 CXXFLAGS      +=
 CPPFLAGS      +=
 EXTRA_LDFLAGS ?=
@@ -193,11 +194,9 @@ ATTEST_STAMP ?=
 # Changing EXTRA_CFLAGS, SIMD, WERROR or NO_STDIO needs no `make clean-libs`: every Makefile in the
 # stack keys its objects/archives on the same axes.
 EXTRA_CFLAGS ?=
-# PROFILE=1 turns on per-hop stage timing for everything built here: the mono pipeline's own
-# nr/post/synth, and lib/aec's stages through the same knob forwarded by name. Off by default so a
-# release build takes no clock reads. Folded into CFG_SIG by name and through CFLAGS, so profile and
-# release builds occupy different obj/bin directories. Setting only one component's -D by hand is
-# legible rather than broken: the other half reads 0.
+# PROFILE=1 turns on lib/aec's per-hop stage timing (the knob is forwarded by name). Off by
+# default so a release build takes no clock reads. Folded into CFG_SIG by name and through CFLAGS,
+# so profile and release builds occupy different obj/bin directories.
 PROFILE ?= 0
 ifneq ($(words $(PROFILE)),1)
 $(error PROFILE must be exactly 0 or 1, got '$(PROFILE)')
@@ -212,12 +211,11 @@ endif
 # assignment (FP policy guard below). These -D land in this Makefile's CFLAGS only: lib/aec gets
 # AEC_STAGE_TIMING from the PROFILE knob forwarded in FWD.
 
-# AEC_STAGE_TIMING is repeated on purpose: this layer's own TUs test it, to decide whether to copy
-# the lanes' record out and what the tests may assert about it, and deriving both flags from
-# PROFILE keeps the two views consistent. A lib/aec pin without the PROFILE knob degrades to the
-# one-half state: the wrapper's stages measure and the AEC block reads zero.
+# AEC_STAGE_TIMING is repeated on purpose: this layer's own TUs test it, to decide what the tests
+# may assert about the AEC record. A lib/aec pin without the PROFILE knob leaves the AEC block at
+# zero.
 ifeq ($(PROFILE),1)
-PROFILE_CFLAGS := -DAUDIO_PIPELINE_STAGE_TIMING=1 -DAEC_STAGE_TIMING=1
+PROFILE_CFLAGS := -DAEC_STAGE_TIMING=1
 else
 PROFILE_CFLAGS :=
 endif
@@ -241,12 +239,12 @@ endif
 # EXTRA_CFLAGS can never land after it and override it.
 CFLAGS = -Wall -Wextra -O2 -std=gnu99 \
          -I. \
-         -Imono_aec_nr_res -Imono_alignulcnet -I$(ULCNET_DIR) -I$(DFN2_DIR) \
+         -I$(ULCNET_DIR) -I$(DFN2_DIR) \
          -I$(AEC_DIR)/include -I$(AEC_DIR)/example \
          -I$(NR_DIR)/include \
          -I$(COMMON_DIR)/include -I$(COMMON_DIR)
-# AUDIO_PIPELINE_BACKEND_STR: compile-time FFT backend identity baked into audio_pipeline.c's
-# AudioPipelineMemReq.backend_id; it matches the libaudio_common.a variant this build links
+# AUDIO_PIPELINE_BACKEND_STR: compile-time FFT backend identity baked into the DFN stage and
+# rate-bridge descriptors (backend_id); it matches the libaudio_common.a variant this build links
 # (BACKEND= above), so the descriptor never needs the backend told separately.
 CFLAGS += -DAUDIO_PIPELINE_BACKEND_STR=\"$(BACKEND)\"
 CFLAGS += $(EXTRA_CFLAGS)
@@ -260,20 +258,14 @@ ifeq ($(WERROR),1)
   CFLAGS += -Werror
 endif
 
-# NO_STDIO=1 compiles audio_pipeline.o with -DAUDIO_PIPELINE_NO_STDIO, which turns every
-# AP_LOG_ERR() into a no-op and drops <stdio.h> (see audio_pipeline.c). It is a board-firmware
-# concern, so it is scoped to LIB_CFLAGS (used only by the libaudio_pipeline.a objects) rather than
-# the shared CFLAGS: the host CLIs and the tests use stdio unconditionally.
-LIB_CFLAGS = $(CFLAGS)
-ifeq ($(NO_STDIO),1)
-  LIB_CFLAGS += -DAUDIO_PIPELINE_NO_STDIO
-endif
+# NO_STDIO=1 is forwarded to the producers (audiolib, lib/aec, lib/nr compile their diagnostics
+# out) and folded into CFG_SIG; this repo's archived objects use no stdio at all. The host
+# programs and the tests use stdio unconditionally.
 
 # --- FP-contraction policy (unified across the four repos) -------------------
 # -ffp-contract=off is appended LAST to CFLAGS (`CFLAGS += $(FP_POLICY)` below), after
 # EXTRA_CFLAGS/WERROR and before CFG_SIG_PAYLOAD, so a caller's EXTRA_CFLAGS=-ffp-contract=fast
-# (or -Ofast/-ffast-math) cannot land later and win. LIB_CFLAGS = $(CFLAGS) is recursively
-# expanded, so the append reaches it too; appending to LIB_CFLAGS as well would duplicate the flag.
+# (or -Ofast/-ffast-math) cannot land later and win.
 # See audiolib's Makefile and its scripts/audit_fp_contract.sh for the design and the
 # disassembly-level check.
 
@@ -291,10 +283,9 @@ FP_ALLOWED_CHARS_RE := ^[A-Za-z0-9_./=,+ -]*$$
 
 # LDFLAGS is link flags only (-lm plus EXTRA_LDFLAGS), not the producer archive paths: those are
 # resolved by the two-phase dispatch below and appended to each link recipe in the fixed order
-# pipeline.o, libaudio_pipeline.a, libaec.a, libanr.a, libaudio_common.a, -lm. libaudio_pipeline.a
-# holds only this repo's TUs (audio_pipeline.o, se_config.o, se_anr_stage.o), so the producer
-# archives follow it. Defined ahead of the override-rejection foreach for the same `make -e`
-# origin reason as FP_POLICY.
+# program objects, libaudio_pipeline_dfn.a (where used), libaec.a, libanr.a, libaudio_common.a,
+# -lm. Defined ahead of the override-rejection foreach for the same `make -e` origin reason as
+# FP_POLICY.
 LDFLAGS = -lm
 LDFLAGS += $(EXTRA_LDFLAGS)
 
@@ -318,7 +309,7 @@ $(foreach v,CFLAGS CXXFLAGS CPPFLAGS LDFLAGS FP_POLICY FP_ALLOWED_CHARS_RE,\
 # ($(findstring)): a harmless `-DNOTE=-Ofastness` is not the flag -Ofast.
 
 # FP_INPUT_FLAGS excludes the one Makefile-generated token `-DAUDIO_PIPELINE_BACKEND_STR=%`, which
-# legitimately contains a backslash and double quotes (audio_pipeline.c reads it as a C string
+# legitimately contains a backslash and double quotes (dfn_res_stage.c reads it as a C string
 # literal). Without the exclusion an override-free `make all` would trip the quote/allow-list checks
 # on this file's own CFLAGS. The token has a fixed shape and is never caller-controlled, so it
 # cannot carry a conflicting flag past the gate. The same FP_INPUT_FLAGS feeds the single-quote
@@ -398,8 +389,8 @@ LINK = $(CXX)
 #   Phase 2 (COMMON_LIB known): the real rules, with $(COMMON_LIB)/$(AEC_LIB)/$(NR_LIB) as normal
 #     prerequisites of the binaries that link them, so relinking happens iff an archive's mtime advanced.
 
-# clean/clean-all have real rules outside the dispatch; libaudio_pipeline.a and the audit targets go
-# through it so the archive's keyed path folds in the producer identities.
+# clean/clean-all have real rules outside the dispatch; libaudio_pipeline_dfn.a and the audit
+# targets go through it so the archive's keyed path folds in the producer identities.
 
 # `make -n`: the dispatch recipe mentions $(MAKE), so GNU Make runs it even under -n; -n reaches each
 # child make through MAKEFLAGS, so the children only print their recipes and create no files.
@@ -412,8 +403,8 @@ LINK = $(CXX)
 FWD = BACKEND=$(BACKEND) SIMD=$(SIMD) PROFILE=$(PROFILE) WERROR=$(WERROR) CC='$(CC)' CXX='$(CXX)' EXTRA_CFLAGS='$(EXTRA_CFLAGS)' NO_STDIO=$(NO_STDIO) TOOLCHAIN_CHECK=$(TOOLCHAIN_CHECK) DEBUG=$(DEBUG)
 
 ifeq ($(COMMON_LIB),)
-.PHONY: all test test_target_abi target-abi-test libs _publish_impl aec_nr_pipeline aec_nr_pipeline_static mono_alignulcnet mono_aec_dfn_res test_audio_pipeline test_audio_pipeline_ulcnet test_ulcnet_accelerator_adapter test_dfn_res_stage test_dfn_rate_bridge test_audio_pipeline_dfn test_se_common test_readme_flow example-adapter libaudio_pipeline.a libaudio_pipeline_dfn.a
-all test test_target_abi target-abi-test libs _publish_impl aec_nr_pipeline aec_nr_pipeline_static mono_alignulcnet mono_aec_dfn_res test_audio_pipeline test_audio_pipeline_ulcnet test_ulcnet_accelerator_adapter test_dfn_res_stage test_dfn_rate_bridge test_audio_pipeline_dfn test_se_common test_readme_flow example-adapter libaudio_pipeline.a libaudio_pipeline_dfn.a:
+.PHONY: all test test_target_abi target-abi-test libs _publish_impl aec_nr_pipeline aec_nr_pipeline_static mono_alignulcnet mono_aec_dfn_res test_mono_chain test_mono_ulcnet test_ulcnet_accelerator_adapter test_dfn_res_stage test_dfn_rate_bridge test_mono_dfn test_se_common test_readme_flow example-adapter libaudio_pipeline_dfn.a
+all test test_target_abi target-abi-test libs _publish_impl aec_nr_pipeline aec_nr_pipeline_static mono_alignulcnet mono_aec_dfn_res test_mono_chain test_mono_ulcnet test_ulcnet_accelerator_adapter test_dfn_res_stage test_dfn_rate_bridge test_mono_dfn test_se_common test_readme_flow example-adapter libaudio_pipeline_dfn.a:
 	+@ac="$$($(MAKE) -s --no-print-directory -C $(COMMON_DIR) $(FWD) print-lib-path)"; \
 	 test -n "$$ac" || { echo "FATAL: could not resolve audiolib archive path (COMMON_DIR=$(COMMON_DIR) -- is audiolib present as a sibling of Audio_ALG?)" >&2; exit 1; }; \
 	 aec="$$($(MAKE) -s --no-print-directory -C $(AEC_DIR) $(FWD) COMMON_DIR=$(abspath $(COMMON_DIR)) COMMON_LIB="$$ac" print-lib-path)"; \
@@ -442,10 +433,8 @@ endif
 
 # One optional descriptor test (test_target_abi) spans all public pipeline/prepost APIs.
 TARGET_ABI_SRCS := tests/test_target_abi.c \
- mono_aec_nr_res/audio_pipeline.c common/se_config.c common/se_anr_stage.c \
- mono_alignulcnet/audio_pipeline_ulcnet.c mono_aec_dfn_res/audio_pipeline_dfn.c \
+ common/se_config.c \
  4ch_aec_bf_nr_res/4aec_nr_res.c 4ch_aec_bf_nr_res/audio_pipeline_4ch.c \
- 4ch_alignulcnet/audio_pipeline_4ch_ulcnet.c 4ch_aec_bf_dfn_res/4aec_dfn_res.c \
  dfn_res_stage.c dfn_rate_bridge.c \
  $(DFN2_DIR)/dfn2_process.c $(DFN2_DIR)/dfn2_model_io.c $(DFN2_DIR)/dfn2_prepost.c \
  ../AINR/DeepFilterNet3/dfn3_process.c ../AINR/DeepFilterNet3/dfn3_model_io.c \
@@ -456,8 +445,7 @@ TARGET_ABI_SRCS := tests/test_target_abi.c \
  $(COMMON_DIR)/../bf/bf.c $(COMMON_DIR)/../doa/srp.c \
  $(COMMON_DIR)/../doa/doa_smoother.c $(COMMON_DIR)/../doa/steering.c \
  $(COMMON_DIR)/utility/spatial_complex.c $(COMMON_DIR)/utility/spatial_simd.c
-TARGET_ABI_INCLUDES := -Imono_aec_nr_res -Imono_alignulcnet -Imono_aec_dfn_res \
- -I4ch_aec_bf_nr_res -I4ch_alignulcnet -I4ch_aec_bf_dfn_res \
+TARGET_ABI_INCLUDES := -I4ch_aec_bf_nr_res -Isamples \
  -I$(DFN2_DIR) -I../AINR/DeepFilterNet3 -I$(ULCNET_DIR) \
  -I$(AIAEC_DIR) -I$(AIAEC_DIR)/DeepVQE_S -I$(COMMON_DIR)/utility \
  -I$(COMMON_DIR)/../bf -I$(COMMON_DIR)/../doa
@@ -465,7 +453,7 @@ TARGET_ABI_INCLUDES := -Imono_aec_nr_res -Imono_alignulcnet -Imono_aec_dfn_res \
 # The same CC command can select a different SDK through PATH.
 # Include effective pointer/FP/ISA predefines to avoid cross-ABI cache reuse.
 override CC_TARGET_SIG := $(shell sh $(COMMON_DIR)/scripts/target_abi_signature.sh $(CC) $(CPPFLAGS) $(CFLAGS))
-CFG_SIG_PAYLOAD := CC_TARGET_SIG=$(CC_TARGET_SIG) ULCNET_GRID=$(ULCNET_GRID) CC=$(CC) CXX=$(CXX) AR=$(AR) RANLIB=$(RANLIB) LINK=$(LINK) CFLAGS=$(CFLAGS) CXXFLAGS=$(CXXFLAGS) CPPFLAGS=$(CPPFLAGS) LDFLAGS=$(LDFLAGS) EXTRA_CFLAGS=$(EXTRA_CFLAGS) EXTRA_LDFLAGS=$(EXTRA_LDFLAGS) BACKEND=$(BACKEND) SIMD=$(SIMD) PROFILE=$(PROFILE) WERROR=$(WERROR) NO_STDIO=$(NO_STDIO) DEBUG=$(DEBUG) TOOLCHAIN_CHECK=$(TOOLCHAIN_CHECK) COMMON_PRODUCER_SIG=$(COMMON_PRODUCER_SIG) AEC_PRODUCER_SIG=$(AEC_PRODUCER_SIG) NR_PRODUCER_SIG=$(NR_PRODUCER_SIG) SRCS=$(sort common/se_anr_stage.c common/se_config.c mono_aec_nr_res/audio_pipeline.c mono_aec_nr_res/main.c mono_aec_nr_res/static_main.c mono_aec_nr_res/tests/test_audio_pipeline.c mono_aec_nr_res/example_board_adapter.c mono_alignulcnet/audio_pipeline_ulcnet.c mono_alignulcnet/tests/test_audio_pipeline_ulcnet.c $(ULCNET_DIR)/ulcnet_accelerator_adapter.c $(ULCNET_DIR)/ulcnet_prepost.c $(ULCNET_DIR)/ulcnet_process.c $(ULCNET_DIR)/ulcnet_model_io.c $(AIAEC_DIR)/tests/test_ulcnet_accelerator_adapter.c mono_alignulcnet/main.c dfn_res_stage.c dfn_rate_bridge.c tests/test_dfn_res_stage.c tests/test_dfn_rate_bridge.c tests/test_se_common.c tests/test_readme_flow.c mono_aec_dfn_res/audio_pipeline_dfn.c mono_aec_dfn_res/tests/test_audio_pipeline_dfn.c mono_aec_dfn_res/main.c $(DFN2_DIR)/dfn2_process.c $(DFN2_DIR)/dfn2_model_io.c $(DFN2_DIR)/dfn2_prepost.c $(TARGET_ABI_SRCS))
+CFG_SIG_PAYLOAD := CC_TARGET_SIG=$(CC_TARGET_SIG) ULCNET_GRID=$(ULCNET_GRID) CC=$(CC) CXX=$(CXX) AR=$(AR) RANLIB=$(RANLIB) LINK=$(LINK) CFLAGS=$(CFLAGS) CXXFLAGS=$(CXXFLAGS) CPPFLAGS=$(CPPFLAGS) LDFLAGS=$(LDFLAGS) EXTRA_CFLAGS=$(EXTRA_CFLAGS) EXTRA_LDFLAGS=$(EXTRA_LDFLAGS) BACKEND=$(BACKEND) SIMD=$(SIMD) PROFILE=$(PROFILE) WERROR=$(WERROR) NO_STDIO=$(NO_STDIO) DEBUG=$(DEBUG) TOOLCHAIN_CHECK=$(TOOLCHAIN_CHECK) COMMON_PRODUCER_SIG=$(COMMON_PRODUCER_SIG) AEC_PRODUCER_SIG=$(AEC_PRODUCER_SIG) NR_PRODUCER_SIG=$(NR_PRODUCER_SIG) SRCS=$(sort common/se_config.c mono_aec_nr_res/main.c mono_aec_nr_res/static_main.c mono_aec_nr_res/tests/test_mono_chain.c mono_aec_nr_res/tests/test_no_stdio_stack.c mono_aec_nr_res/example_board_adapter.c samples/ulcnet_nn_stage.c mono_alignulcnet/tests/test_mono_ulcnet.c $(ULCNET_DIR)/ulcnet_accelerator_adapter.c $(ULCNET_DIR)/ulcnet_prepost.c $(ULCNET_DIR)/ulcnet_process.c $(ULCNET_DIR)/ulcnet_model_io.c $(AIAEC_DIR)/tests/test_ulcnet_accelerator_adapter.c mono_alignulcnet/main.c dfn_res_stage.c dfn_rate_bridge.c tests/test_dfn_res_stage.c tests/test_dfn_rate_bridge.c tests/test_se_common.c tests/test_readme_flow.c mono_aec_dfn_res/tests/test_mono_dfn.c mono_aec_dfn_res/main.c $(DFN2_DIR)/dfn2_process.c $(DFN2_DIR)/dfn2_model_io.c $(DFN2_DIR)/dfn2_prepost.c $(TARGET_ABI_SRCS))
 CFG_SIG := $(shell printf '%s' "$(CFG_SIG_PAYLOAD)" | cksum | cut -d' ' -f1)
 
 # OBJ_ROOT / BIN_ROOT: where this repo's keyed obj/bin trees live (default obj/ and bin/ here). A
@@ -518,46 +506,29 @@ _cfg_guard:
 
 # -MD -MP: emits $(OBJ_DIR)/<name>.d per object (header dependency tracking)
 # -- included near the bottom of this file via `-include $(wildcard $(OBJ_DIR)/*.d)`.
-$(OBJ_DIR)/aec_nr_pipeline.o: mono_aec_nr_res/main.c mono_aec_nr_res/audio_pipeline.h | _cfg_guard
+$(OBJ_DIR)/aec_nr_pipeline.o: mono_aec_nr_res/main.c samples/se_sample_chain.h samples/se_anr_stage.h common/se_stage.h common/se_config.h | _cfg_guard
 	$(CC) $(CFLAGS) -MD -MP -c -o $@ $<
 
-$(OBJ_DIR)/aec_nr_pipeline_static.o: mono_aec_nr_res/static_main.c mono_aec_nr_res/audio_pipeline.h | _cfg_guard
+$(OBJ_DIR)/aec_nr_pipeline_static.o: mono_aec_nr_res/static_main.c samples/se_sample_chain.h samples/se_anr_stage.h common/se_stage.h common/se_config.h | _cfg_guard
 	$(CC) $(CFLAGS) -MD -MP -c -o $@ $<
 
-# audio_pipeline.o / libaudio_pipeline.a: the pool-sizing/
-# carving/per-hop-processing library TU, linkable independently of either
-# CLI -- see audio_pipeline.h. The archive holds this object and the two shared
-# common/ objects below (not a fat archive bundling libaec/libanr/libaudio_common); those stay
-# separate libraries a consumer links alongside it, same as both CLIs do.
-# Compiled with $(LIB_CFLAGS) (not the shared $(CFLAGS)) so NO_STDIO=1 only
-# ever affects THIS object -- see the NO_STDIO comment near CFLAGS above.
-$(OBJ_DIR)/audio_pipeline.o: mono_aec_nr_res/audio_pipeline.c mono_aec_nr_res/audio_pipeline.h common/se_config.h common/se_anr_stage.h | _cfg_guard
-	$(CC) $(LIB_CFLAGS) -MD -MP -c -o $@ $<
-
-# se_config.o / se_anr_stage.o: the configuration and noise-reduction stage code
-# shared by the AEC pipelines. Members of libaudio_pipeline.a; the ULCNet
-# application, which has no NR, links se_config.o directly. LIB_CFLAGS for the
-# same NO_STDIO reason as audio_pipeline.o.
+# se_config.o: the grid and AecConfig derivation the example programs link directly. There is
+# no mono archive: the gain chain is header-only (samples/se_sample_chain.h).
 $(OBJ_DIR)/se_config.o: common/se_config.c common/se_config.h | _cfg_guard
-	$(CC) $(LIB_CFLAGS) -MD -MP -c -o $@ $<
-
-$(OBJ_DIR)/se_anr_stage.o: common/se_anr_stage.c common/se_anr_stage.h | _cfg_guard
-	$(CC) $(LIB_CFLAGS) -MD -MP -c -o $@ $<
-
-# test_audio_pipeline: standalone acceptance test for audio_pipeline.h itself
-# (create-vs-init byte equality incl. a dirty/poisoned pool, destroy
-# idempotence, misaligned/undersized pool rejection, sample-rate whitelist
-# rejection) -- see test_audio_pipeline.c's own header for detail.
-$(OBJ_DIR)/test_audio_pipeline.o: mono_aec_nr_res/tests/test_audio_pipeline.c mono_aec_nr_res/audio_pipeline.h | _cfg_guard
 	$(CC) $(CFLAGS) -MD -MP -c -o $@ $<
 
-# Align-ULCNet pipeline variant objects. ulcnet_process.o compiles the
+# test_mono_chain: the mono chain over lib/aec's Aec -- pool carve vs heap, reset, switches,
+# comfort noise, chain vs the hand-written oracle (tests/conv_chain_mono.h).
+$(OBJ_DIR)/test_mono_chain.o: mono_aec_nr_res/tests/test_mono_chain.c mono_aec_nr_res/tests/conv_chain_mono.h samples/se_sample_chain.h | _cfg_guard
+	$(CC) $(CFLAGS) -MD -MP -c -o $@ $<
+
+# Align-ULCNet objects. ulcnet_process.o compiles the
 # AIAEC-owned C pre/post TU (centered sqrt-Hann STFT / WOLA / model
 # boundary) -- read-only from this Makefile's perspective, never edited
 # here. It transforms through audiolib's fft_wrapper; the -I$(COMMON_DIR)/
 # include already in $(CFLAGS) resolves that header, and -I$(ULCNET_DIR)
-# resolves its own. The pipeline TU and its test also need the ULCNET
-# include path for ulcnet_process.h (via audio_pipeline_ulcnet.h).
+# resolves its own. The stage TU and the programs and tests built on it also need the ULCNET
+# include path for ulcnet_process.h.
 $(OBJ_DIR)/ulcnet_process.o: $(ULCNET_DIR)/ulcnet_process.c $(ULCNET_DIR)/ulcnet_process.h | _cfg_guard
 	$(CC) $(CFLAGS) -I$(ULCNET_DIR) $(ULCNET_GRID_CFLAGS) -MD -MP -c -o $@ $<
 
@@ -575,100 +546,73 @@ $(OBJ_DIR)/ulcnet_prepost.o: $(ULCNET_DIR)/ulcnet_prepost.c $(ULCNET_DIR)/ulcnet
 $(OBJ_DIR)/ulcnet_accelerator_adapter.o: $(ULCNET_DIR)/ulcnet_accelerator_adapter.c $(ULCNET_DIR)/ulcnet_accelerator_adapter.h $(ULCNET_DIR)/ulcnet_prepost.h $(ULCNET_DIR)/ulcnet_model_io.h $(ULCNET_DIR)/ulcnet_process.h | _cfg_guard
 	$(CC) $(CFLAGS) -I$(ULCNET_DIR) $(ULCNET_GRID_CFLAGS) -MD -MP -c -o $@ $<
 
-$(OBJ_DIR)/mono_alignulcnet_main.o: mono_alignulcnet/main.c mono_alignulcnet/audio_pipeline_ulcnet.h $(ULCNET_DIR)/ulcnet_accelerator_adapter.h | _cfg_guard
+$(OBJ_DIR)/mono_alignulcnet_main.o: mono_alignulcnet/main.c samples/ulcnet_nn_stage.h common/se_config.h $(ULCNET_DIR)/ulcnet_accelerator_adapter.h | _cfg_guard
 	$(CC) $(CFLAGS) -I$(ULCNET_DIR) $(ULCNET_GRID_CFLAGS) -MD -MP -c -o $@ $<
 
 $(OBJ_DIR)/test_ulcnet_accelerator_adapter.o: $(AIAEC_DIR)/tests/test_ulcnet_accelerator_adapter.c $(ULCNET_DIR)/ulcnet_accelerator_adapter.h | _cfg_guard
 	$(CC) $(CFLAGS) -I$(ULCNET_DIR) $(ULCNET_GRID_CFLAGS) -MD -MP -c -o $@ $<
 
-# audio_pipeline_ulcnet.o: the AEC(linear) -> Align-ULCNet post-filter
-# pipeline TU (audio_pipeline_ulcnet.h). It is deliberately not a member of
-# libaudio_pipeline.a. ULCNet applications link this object and the AIAEC
-# pre/post object directly alongside libaec/libaudio_common, avoiding a
-# second application-specific wrapper archive.
-$(OBJ_DIR)/audio_pipeline_ulcnet.o: mono_alignulcnet/audio_pipeline_ulcnet.c mono_alignulcnet/audio_pipeline_ulcnet.h | _cfg_guard
+# ulcnet_nn_stage.o: the Align-ULCNet post-filter stage (samples/ulcnet_nn_stage.h), example
+# code linked by the programs and tests that use it. Not a member of any archive.
+$(OBJ_DIR)/ulcnet_nn_stage.o: samples/ulcnet_nn_stage.c samples/ulcnet_nn_stage.h $(ULCNET_DIR)/ulcnet_process.h | _cfg_guard
 	$(CC) $(CFLAGS) -I$(ULCNET_DIR) $(ULCNET_GRID_CFLAGS) -MD -MP -c -o $@ $<
 
-# test_audio_pipeline_ulcnet: standalone acceptance test for
-# audio_pipeline_ulcnet.h (identity E2E one-hop-latency proof, model
-# callback counting/reset policy, fail-open + delay-gating, pool/descriptor
-# rejection, create-vs-init parity, NULL-model == identity-model) -- see
-# tests/test_audio_pipeline_ulcnet.c's own header for detail.
-$(OBJ_DIR)/test_audio_pipeline_ulcnet.o: mono_alignulcnet/tests/test_audio_pipeline_ulcnet.c mono_alignulcnet/audio_pipeline_ulcnet.h | _cfg_guard
+# test_mono_ulcnet: the mono linear AEC feeding the stage (identity end to end, alignment
+# events from the real delay state, reprime, model policy on real framing).
+$(OBJ_DIR)/test_mono_ulcnet.o: mono_alignulcnet/tests/test_mono_ulcnet.c samples/ulcnet_nn_stage.h common/se_config.h | _cfg_guard
 	$(CC) $(CFLAGS) -I$(ULCNET_DIR) $(ULCNET_GRID_CFLAGS) -MD -MP -c -o $@ $<
 
 $(OBJ_DIR)/dfn2_process.o: $(DFN2_DIR)/dfn2_process.c $(DFN2_DIR)/dfn2_process.h | _cfg_guard
-	$(CC) $(LIB_CFLAGS) -I$(DFN2_DIR) -MD -MP -c -o $@ $<
+	$(CC) $(CFLAGS) -I$(DFN2_DIR) -MD -MP -c -o $@ $<
 
 $(OBJ_DIR)/dfn2_model_io.o: $(DFN2_DIR)/dfn2_model_io.c $(DFN2_DIR)/dfn2_model_io.h | _cfg_guard
-	$(CC) $(LIB_CFLAGS) -I$(DFN2_DIR) -MD -MP -c -o $@ $<
+	$(CC) $(CFLAGS) -I$(DFN2_DIR) -MD -MP -c -o $@ $<
 
 $(OBJ_DIR)/dfn2_prepost.o: $(DFN2_DIR)/dfn2_prepost.c $(DFN2_DIR)/dfn2_prepost.h | _cfg_guard
-	$(CC) $(LIB_CFLAGS) -I$(DFN2_DIR) -MD -MP -c -o $@ $<
+	$(CC) $(CFLAGS) -I$(DFN2_DIR) -MD -MP -c -o $@ $<
 
 $(OBJ_DIR)/dfn_res_stage.o: dfn_res_stage.c dfn_res_stage.h $(DFN2_DIR)/dfn2_prepost.h | _cfg_guard
-	$(CC) $(LIB_CFLAGS) -I$(DFN2_DIR) -MD -MP -c -o $@ $<
+	$(CC) $(CFLAGS) -I$(DFN2_DIR) -MD -MP -c -o $@ $<
 
-$(OBJ_DIR)/test_se_common.o: tests/test_se_common.c common/se_config.h common/se_anr_stage.h | _cfg_guard
+$(OBJ_DIR)/test_se_common.o: tests/test_se_common.c common/se_config.h common/se_stage.h samples/se_sample_chain.h samples/se_anr_stage.h | _cfg_guard
 	$(CC) $(CFLAGS) -MD -MP -c -o $@ $<
 
-$(OBJ_DIR)/test_readme_flow.o: tests/test_readme_flow.c mono_aec_nr_res/audio_pipeline.h mono_aec_dfn_res/audio_pipeline_dfn.h mono_alignulcnet/audio_pipeline_ulcnet.h common/se_stage.h common/se_anr_stage.h tests/dfn_test_fixture.h | _cfg_guard
-	$(CC) $(CFLAGS) -Imono_aec_dfn_res -I$(ULCNET_DIR) $(ULCNET_GRID_CFLAGS) -MD -MP -c -o $@ $<
+$(OBJ_DIR)/test_readme_flow.o: tests/test_readme_flow.c common/se_config.h common/se_stage.h samples/se_sample_chain.h samples/dfn_hop.h samples/ulcnet_nn_stage.h mono_aec_nr_res/tests/conv_chain_mono.h tests/dfn_test_fixture.h | _cfg_guard
+	$(CC) $(CFLAGS) -I$(ULCNET_DIR) $(ULCNET_GRID_CFLAGS) -MD -MP -c -o $@ $<
 
 $(OBJ_DIR)/test_dfn_res_stage.o: tests/test_dfn_res_stage.c dfn_res_stage.h tests/dfn_test_fixture.h dfn_unit_partition.h | _cfg_guard
 	$(CC) $(CFLAGS) -I$(DFN2_DIR) -MD -MP -c -o $@ $<
 
 $(OBJ_DIR)/dfn_rate_bridge.o: dfn_rate_bridge.c dfn_rate_bridge.h dfn_res_stage.h | _cfg_guard
-	$(CC) $(LIB_CFLAGS) -I$(DFN2_DIR) -MD -MP -c -o $@ $<
+	$(CC) $(CFLAGS) -I$(DFN2_DIR) -MD -MP -c -o $@ $<
 
 $(OBJ_DIR)/test_dfn_rate_bridge.o: tests/test_dfn_rate_bridge.c dfn_rate_bridge.h tests/dfn_test_fixture.h | _cfg_guard
 	$(CC) $(CFLAGS) -I$(DFN2_DIR) -MD -MP -c -o $@ $<
 
-$(OBJ_DIR)/audio_pipeline_dfn.o: mono_aec_dfn_res/audio_pipeline_dfn.c mono_aec_dfn_res/audio_pipeline_dfn.h mono_aec_nr_res/audio_pipeline.h dfn_res_stage.h dfn_rate_bridge.h | _cfg_guard
-	$(CC) $(LIB_CFLAGS) -Imono_aec_dfn_res -MD -MP -c -o $@ $<
+$(OBJ_DIR)/test_mono_dfn.o: mono_aec_dfn_res/tests/test_mono_dfn.c mono_aec_nr_res/tests/conv_chain_mono.h samples/dfn_hop.h samples/se_sample_chain.h common/se_config.h dfn_res_stage.h dfn_rate_bridge.h tests/dfn_test_fixture.h | _cfg_guard
+	$(CC) $(CFLAGS) -MD -MP -c -o $@ $<
 
-$(OBJ_DIR)/test_audio_pipeline_dfn.o: mono_aec_dfn_res/tests/test_audio_pipeline_dfn.c mono_aec_dfn_res/audio_pipeline_dfn.h mono_aec_nr_res/audio_pipeline.h tests/dfn_test_fixture.h | _cfg_guard
-	$(CC) $(CFLAGS) -Imono_aec_dfn_res -MD -MP -c -o $@ $<
-
-$(OBJ_DIR)/mono_aec_dfn_res_main.o: mono_aec_dfn_res/main.c mono_aec_dfn_res/audio_pipeline_dfn.h dfn_example_args.h dfn_unit_partition.h | _cfg_guard
-	$(CC) $(CFLAGS) -Imono_aec_dfn_res -MD -MP -c -o $@ $<
+$(OBJ_DIR)/mono_aec_dfn_res_main.o: mono_aec_dfn_res/main.c samples/dfn_hop.h samples/se_sample_chain.h common/se_config.h dfn_res_stage.h dfn_rate_bridge.h dfn_example_args.h dfn_unit_partition.h | _cfg_guard
+	$(CC) $(CFLAGS) -MD -MP -c -o $@ $<
 
 # example_board_adapter: REFERENCE ONLY host simulation of a board-side
 # common-memory-manager integration -- see that
 # file's own header. Not the real board adapter; demonstrates the calling
 # sequence/error handling/descriptor contract only.
-$(OBJ_DIR)/example_board_adapter.o: mono_aec_nr_res/example_board_adapter.c mono_aec_nr_res/audio_pipeline.h | _cfg_guard
+$(OBJ_DIR)/example_board_adapter.o: mono_aec_nr_res/example_board_adapter.c samples/se_sample_chain.h common/se_stage.h common/se_config.h | _cfg_guard
 	$(CC) $(CFLAGS) -MD -MP -c -o $@ $<
 
-LIB_TARGET = $(BIN_DIR)/libaudio_pipeline.a
 DFN_LIB_TARGET = $(BIN_DIR)/libaudio_pipeline_dfn.a
 DFN_STAGE_OBJS = $(OBJ_DIR)/dfn_res_stage.o $(OBJ_DIR)/dfn2_prepost.o \
                  $(OBJ_DIR)/dfn2_model_io.o $(OBJ_DIR)/dfn2_process.o
-DFN_PIPELINE_OBJS = $(OBJ_DIR)/audio_pipeline_dfn.o $(OBJ_DIR)/dfn_rate_bridge.o $(DFN_STAGE_OBJS)
-
-# libaudio_pipeline.a is built from this repo's own objects only (audio_pipeline.o, se_config.o,
-# se_anr_stage.o); no producer archive is linked into it. The phony alias keeps
-# `make libaudio_pipeline.a` working; the keyed archive is $(LIB_TARGET).
-.PHONY: libaudio_pipeline.a
-libaudio_pipeline.a: $(LIB_TARGET)
-
-# Fresh-archive discipline: always built from scratch
-# into a temp file and renamed into place -- never `ar` onto an existing
-# archive (which only adds/replaces members and would keep a removed source's
-# stale member forever). See audiolib's Makefile for the full writeup.
-# One chained shell line with a PID-suffixed temp: two
-# same-config processes racing this rule each write their OWN temp, final mv
-# is atomic last-writer-wins. See audiolib's Makefile.
-$(LIB_TARGET): $(OBJ_DIR)/audio_pipeline.o $(OBJ_DIR)/se_config.o $(OBJ_DIR)/se_anr_stage.o | _cfg_guard
-	t="$@.tmp.$$$$" && rm -f "$$t" && $(AR) rcs "$$t" $^ && $(RANLIB) "$$t" && mv -f "$$t" $@
-	@echo "libaudio_pipeline.a [$(BACKEND)] -> $@"
+DFN_PIPELINE_OBJS = $(OBJ_DIR)/dfn_rate_bridge.o $(DFN_STAGE_OBJS)
 
 # =============================================================================
 # Phase 2 real rules: only defined once COMMON_LIB (and, transitively, AEC_LIB/
 # NR_LIB, always set together by phase 1's re-invoke) is known.
 # =============================================================================
 ifneq ($(COMMON_LIB),)
-.PHONY: all test libs aec_nr_pipeline aec_nr_pipeline_static mono_alignulcnet mono_aec_dfn_res test_audio_pipeline test_audio_pipeline_ulcnet test_ulcnet_accelerator_adapter test_dfn_res_stage test_dfn_rate_bridge test_audio_pipeline_dfn test_se_common test_readme_flow example-adapter example_board_adapter libaudio_pipeline_dfn.a FORCE
+.PHONY: all test libs aec_nr_pipeline aec_nr_pipeline_static mono_alignulcnet mono_aec_dfn_res test_mono_chain test_mono_ulcnet test_ulcnet_accelerator_adapter test_dfn_res_stage test_dfn_rate_bridge test_mono_dfn test_se_common test_readme_flow example-adapter example_board_adapter libaudio_pipeline_dfn.a FORCE
 # This branch is entered through the recursive `$(MAKE) ... COMMON_LIB=... AEC_LIB=... NR_LIB=...`
 # re-invoke. Make folds command-line variables into MAKEOVERRIDES/MAKEFLAGS for every further
 # $(MAKE) recipe, including the `samples/` test call below, whose own producer variables would
@@ -687,14 +631,14 @@ $(DFN_LIB_TARGET): $(DFN_PIPELINE_OBJS) | _cfg_guard
 
 # test: also builds and runs example_board_adapter, whose exit code signals any failed positive-flow
 # step or negative demonstration. `make example-adapter` (below) runs it standalone.
-test: $(BIN_DIR)/test_audio_pipeline $(BIN_DIR)/example_board_adapter $(BIN_DIR)/test_audio_pipeline_ulcnet $(BIN_DIR)/test_ulcnet_accelerator_adapter $(BIN_DIR)/test_dfn_res_stage $(BIN_DIR)/test_dfn_rate_bridge $(BIN_DIR)/test_audio_pipeline_dfn $(BIN_DIR)/test_se_common $(BIN_DIR)/test_readme_flow $(BIN_DIR)/mono_alignulcnet $(BIN_DIR)/mono_aec_dfn_res
-	"$(abspath $(BIN_DIR))/test_audio_pipeline"
+test: $(BIN_DIR)/test_mono_chain $(BIN_DIR)/example_board_adapter $(BIN_DIR)/test_mono_ulcnet $(BIN_DIR)/test_ulcnet_accelerator_adapter $(BIN_DIR)/test_dfn_res_stage $(BIN_DIR)/test_dfn_rate_bridge $(BIN_DIR)/test_mono_dfn $(BIN_DIR)/test_se_common $(BIN_DIR)/test_readme_flow $(BIN_DIR)/mono_alignulcnet $(BIN_DIR)/mono_aec_dfn_res
+	"$(abspath $(BIN_DIR))/test_mono_chain"
 	"$(abspath $(BIN_DIR))/example_board_adapter"
-	"$(abspath $(BIN_DIR))/test_audio_pipeline_ulcnet"
+	"$(abspath $(BIN_DIR))/test_mono_ulcnet"
 	"$(abspath $(BIN_DIR))/test_ulcnet_accelerator_adapter"
 	"$(abspath $(BIN_DIR))/test_dfn_res_stage"
 	"$(abspath $(BIN_DIR))/test_dfn_rate_bridge"
-	"$(abspath $(BIN_DIR))/test_audio_pipeline_dfn"
+	"$(abspath $(BIN_DIR))/test_mono_dfn"
 	"$(abspath $(BIN_DIR))/test_se_common"
 	"$(abspath $(BIN_DIR))/test_readme_flow"
 	"$(abspath $(BIN_DIR))/mono_alignulcnet"
@@ -727,7 +671,7 @@ test: $(BIN_DIR)/test_audio_pipeline $(BIN_DIR)/example_board_adapter $(BIN_DIR)
 example-adapter: $(BIN_DIR)/example_board_adapter
 	"$(abspath $(BIN_DIR))/example_board_adapter"
 
-# Root-name alias for the binary itself (mirrors test_audio_pipeline: below)
+# Root-name alias for the binary itself (mirrors test_mono_chain: below)
 # -- `example-adapter` (above) is the build-AND-run entry point; this is just
 # "build the binary" for whoever wants that split.
 example_board_adapter: $(BIN_DIR)/example_board_adapter
@@ -759,12 +703,12 @@ aec_nr_pipeline: $(BIN_DIR)/aec_nr_pipeline
 aec_nr_pipeline_static: $(BIN_DIR)/aec_nr_pipeline_static
 mono_alignulcnet: $(BIN_DIR)/mono_alignulcnet
 mono_aec_dfn_res: $(BIN_DIR)/mono_aec_dfn_res
-test_audio_pipeline: $(BIN_DIR)/test_audio_pipeline
-test_audio_pipeline_ulcnet: $(BIN_DIR)/test_audio_pipeline_ulcnet
+test_mono_chain: $(BIN_DIR)/test_mono_chain
+test_mono_ulcnet: $(BIN_DIR)/test_mono_ulcnet
 test_ulcnet_accelerator_adapter: $(BIN_DIR)/test_ulcnet_accelerator_adapter
 test_dfn_res_stage: $(BIN_DIR)/test_dfn_res_stage
 test_dfn_rate_bridge: $(BIN_DIR)/test_dfn_rate_bridge
-test_audio_pipeline_dfn: $(BIN_DIR)/test_audio_pipeline_dfn
+test_mono_dfn: $(BIN_DIR)/test_mono_dfn
 test_se_common: $(BIN_DIR)/test_se_common
 test_readme_flow: $(BIN_DIR)/test_readme_flow
 
@@ -789,31 +733,29 @@ $(NR_LIB): FORCE
 
 # Compile with $(CC) (always a plain-C driver, -std=gnu99 valid) then link
 # with $(LINK) (c++ -- the NE10 archive's one C++ TU needs it). Link order
-# matters (see the LDFLAGS comment above): pipeline.o,
-# libaudio_pipeline.a, libaec.a, libanr.a, libaudio_common.a, -lm.
-$(BIN_DIR)/aec_nr_pipeline: $(OBJ_DIR)/aec_nr_pipeline.o $(LIB_TARGET) $(AEC_LIB) $(NR_LIB) $(COMMON_LIB) | _cfg_guard
-	$(LINK) -o $@ $(OBJ_DIR)/aec_nr_pipeline.o $(LIB_TARGET) $(AEC_LIB) $(NR_LIB) $(COMMON_LIB) $(LDFLAGS)
+# matters (see the LDFLAGS comment above): program objects, se_config.o,
+# libaec.a, libanr.a, libaudio_common.a, -lm.
+$(BIN_DIR)/aec_nr_pipeline: $(OBJ_DIR)/aec_nr_pipeline.o $(OBJ_DIR)/se_config.o $(AEC_LIB) $(NR_LIB) $(COMMON_LIB) | _cfg_guard
+	$(LINK) -o $@ $(OBJ_DIR)/aec_nr_pipeline.o $(OBJ_DIR)/se_config.o $(AEC_LIB) $(NR_LIB) $(COMMON_LIB) $(LDFLAGS)
 	@echo "aec_nr_pipeline [$(BACKEND)] -> $@"
 
-$(BIN_DIR)/aec_nr_pipeline_static: $(OBJ_DIR)/aec_nr_pipeline_static.o $(LIB_TARGET) $(AEC_LIB) $(NR_LIB) $(COMMON_LIB) | _cfg_guard
-	$(LINK) -o $@ $(OBJ_DIR)/aec_nr_pipeline_static.o $(LIB_TARGET) $(AEC_LIB) $(NR_LIB) $(COMMON_LIB) $(LDFLAGS)
+$(BIN_DIR)/aec_nr_pipeline_static: $(OBJ_DIR)/aec_nr_pipeline_static.o $(OBJ_DIR)/se_config.o $(AEC_LIB) $(NR_LIB) $(COMMON_LIB) | _cfg_guard
+	$(LINK) -o $@ $(OBJ_DIR)/aec_nr_pipeline_static.o $(OBJ_DIR)/se_config.o $(AEC_LIB) $(NR_LIB) $(COMMON_LIB) $(LDFLAGS)
 	@echo "aec_nr_pipeline_static [$(BACKEND)] -> $@"
 
-$(BIN_DIR)/test_audio_pipeline: $(OBJ_DIR)/test_audio_pipeline.o $(LIB_TARGET) $(AEC_LIB) $(NR_LIB) $(COMMON_LIB) | _cfg_guard
-	$(LINK) -o $@ $(OBJ_DIR)/test_audio_pipeline.o $(LIB_TARGET) $(AEC_LIB) $(NR_LIB) $(COMMON_LIB) $(LDFLAGS)
-	@echo "test_audio_pipeline [$(BACKEND)] -> $@"
+$(BIN_DIR)/test_mono_chain: $(OBJ_DIR)/test_mono_chain.o $(OBJ_DIR)/se_config.o $(AEC_LIB) $(NR_LIB) $(COMMON_LIB) | _cfg_guard
+	$(LINK) -o $@ $(OBJ_DIR)/test_mono_chain.o $(OBJ_DIR)/se_config.o $(AEC_LIB) $(NR_LIB) $(COMMON_LIB) $(LDFLAGS)
+	@echo "test_mono_chain [$(BACKEND)] -> $@"
 
-# ULCNet applications link their wrapper/pre-post objects directly. They are
-# applications, not additional libraries layered over the component libs.
-ULCNET_PIPELINE_OBJS = $(OBJ_DIR)/audio_pipeline_ulcnet.o $(OBJ_DIR)/se_config.o $(OBJ_DIR)/ulcnet_process.o
+# The Align-ULCNet programs link the stage, the AIAEC pre/post objects and se_config.o
+# directly. They are applications, not additional libraries layered over the component libs.
+ULCNET_PIPELINE_OBJS = $(OBJ_DIR)/ulcnet_nn_stage.o $(OBJ_DIR)/se_config.o $(OBJ_DIR)/ulcnet_process.o
 
-# The wrapper itself needs no ulcnet_model_io symbol (it only READS the
-# descriptor a runtime published, so a board integrating the wrapper alone
-# gains no new link dependency); the test links it to BUILD descriptors for
-# the far-input contract gate.
-$(BIN_DIR)/test_audio_pipeline_ulcnet: $(OBJ_DIR)/test_audio_pipeline_ulcnet.o $(ULCNET_PIPELINE_OBJS) $(OBJ_DIR)/ulcnet_model_io.o $(AEC_LIB) $(COMMON_LIB) | _cfg_guard
-	$(LINK) -o $@ $(OBJ_DIR)/test_audio_pipeline_ulcnet.o $(ULCNET_PIPELINE_OBJS) $(OBJ_DIR)/ulcnet_model_io.o $(AEC_LIB) $(COMMON_LIB) $(LDFLAGS)
-	@echo "test_audio_pipeline_ulcnet [$(BACKEND)] -> $@"
+# The stage only READS the descriptor a runtime published, but it validates it through
+# ulcnet_model_io, which the test also uses to BUILD descriptors for the far-input contract gate.
+$(BIN_DIR)/test_mono_ulcnet: $(OBJ_DIR)/test_mono_ulcnet.o $(ULCNET_PIPELINE_OBJS) $(OBJ_DIR)/ulcnet_model_io.o $(AEC_LIB) $(COMMON_LIB) | _cfg_guard
+	$(LINK) -o $@ $(OBJ_DIR)/test_mono_ulcnet.o $(ULCNET_PIPELINE_OBJS) $(OBJ_DIR)/ulcnet_model_io.o $(AEC_LIB) $(COMMON_LIB) $(LDFLAGS)
+	@echo "test_mono_ulcnet [$(BACKEND)] -> $@"
 
 # The adapter drives the pre/post class, so anything linking the adapter
 # links ulcnet_prepost.o with it. The class in turn references
@@ -832,20 +774,19 @@ $(BIN_DIR)/mono_alignulcnet: $(OBJ_DIR)/mono_alignulcnet_main.o $(ULCNET_ADAPTER
 $(BIN_DIR)/test_ulcnet_accelerator_adapter: $(OBJ_DIR)/test_ulcnet_accelerator_adapter.o $(ULCNET_ADAPTER_OBJS) $(OBJ_DIR)/ulcnet_process.o $(COMMON_LIB) | _cfg_guard
 	$(LINK) -o $@ $(OBJ_DIR)/test_ulcnet_accelerator_adapter.o $(ULCNET_ADAPTER_OBJS) $(OBJ_DIR)/ulcnet_process.o $(COMMON_LIB) $(LDFLAGS)
 
-# The mono DFN2 application hosts the conventional pipeline, so it links
-# libaudio_pipeline.a (and through it the NR archive) next to the DFN
-# archive; a board integrating the wrapper needs the same set.
-$(BIN_DIR)/mono_aec_dfn_res: $(OBJ_DIR)/mono_aec_dfn_res_main.o $(DFN_LIB_TARGET) $(LIB_TARGET) $(AEC_LIB) $(NR_LIB) $(COMMON_LIB) | _cfg_guard
-	$(LINK) -o $@ $(OBJ_DIR)/mono_aec_dfn_res_main.o $(DFN_LIB_TARGET) $(LIB_TARGET) $(AEC_LIB) $(NR_LIB) $(COMMON_LIB) $(LDFLAGS)
+# The mono DFN2 program composes lib/aec's Aec with the chain header, so it links the AEC and NR
+# archives next to the DFN archive (the chain header references the denoiser).
+$(BIN_DIR)/mono_aec_dfn_res: $(OBJ_DIR)/mono_aec_dfn_res_main.o $(DFN_LIB_TARGET) $(OBJ_DIR)/se_config.o $(AEC_LIB) $(NR_LIB) $(COMMON_LIB) | _cfg_guard
+	$(LINK) -o $@ $(OBJ_DIR)/mono_aec_dfn_res_main.o $(DFN_LIB_TARGET) $(OBJ_DIR)/se_config.o $(AEC_LIB) $(NR_LIB) $(COMMON_LIB) $(LDFLAGS)
 	@echo "mono_aec_dfn_res [$(BACKEND)] -> $@"
 
-$(BIN_DIR)/test_se_common: $(OBJ_DIR)/test_se_common.o $(OBJ_DIR)/se_config.o $(OBJ_DIR)/se_anr_stage.o $(AEC_LIB) $(NR_LIB) $(COMMON_LIB) | _cfg_guard
-	$(LINK) -o $@ $(OBJ_DIR)/test_se_common.o $(OBJ_DIR)/se_config.o $(OBJ_DIR)/se_anr_stage.o $(AEC_LIB) $(NR_LIB) $(COMMON_LIB) $(LDFLAGS)
+$(BIN_DIR)/test_se_common: $(OBJ_DIR)/test_se_common.o $(OBJ_DIR)/se_config.o $(AEC_LIB) $(NR_LIB) $(COMMON_LIB) | _cfg_guard
+	$(LINK) -o $@ $(OBJ_DIR)/test_se_common.o $(OBJ_DIR)/se_config.o $(AEC_LIB) $(NR_LIB) $(COMMON_LIB) $(LDFLAGS)
 	@echo "test_se_common [$(BACKEND)] -> $@"
 
 # test_readme_flow: the call-flow examples of README.md, compiled and run (chain a stage, DFN and ULCNet phased hops).
-$(BIN_DIR)/test_readme_flow: $(OBJ_DIR)/test_readme_flow.o $(ULCNET_PIPELINE_OBJS) $(OBJ_DIR)/ulcnet_model_io.o $(DFN_LIB_TARGET) $(LIB_TARGET) $(AEC_LIB) $(NR_LIB) $(COMMON_LIB) | _cfg_guard
-	$(LINK) -o $@ $(OBJ_DIR)/test_readme_flow.o $(ULCNET_PIPELINE_OBJS) $(OBJ_DIR)/ulcnet_model_io.o $(DFN_LIB_TARGET) $(LIB_TARGET) $(AEC_LIB) $(NR_LIB) $(COMMON_LIB) $(LDFLAGS)
+$(BIN_DIR)/test_readme_flow: $(OBJ_DIR)/test_readme_flow.o $(ULCNET_PIPELINE_OBJS) $(OBJ_DIR)/ulcnet_model_io.o $(DFN_LIB_TARGET) $(AEC_LIB) $(NR_LIB) $(COMMON_LIB) | _cfg_guard
+	$(LINK) -o $@ $(OBJ_DIR)/test_readme_flow.o $(ULCNET_PIPELINE_OBJS) $(OBJ_DIR)/ulcnet_model_io.o $(DFN_LIB_TARGET) $(AEC_LIB) $(NR_LIB) $(COMMON_LIB) $(LDFLAGS)
 	@echo "test_readme_flow [$(BACKEND)] -> $@"
 
 $(BIN_DIR)/test_dfn_res_stage: $(OBJ_DIR)/test_dfn_res_stage.o $(DFN_STAGE_OBJS) $(COMMON_LIB) | _cfg_guard
@@ -856,12 +797,12 @@ $(BIN_DIR)/test_dfn_rate_bridge: $(OBJ_DIR)/test_dfn_rate_bridge.o $(OBJ_DIR)/df
 	$(LINK) -o $@ $(OBJ_DIR)/test_dfn_rate_bridge.o $(OBJ_DIR)/dfn_rate_bridge.o $(DFN_STAGE_OBJS) $(COMMON_LIB) $(LDFLAGS)
 	@echo "test_dfn_rate_bridge [$(BACKEND)] -> $@"
 
-$(BIN_DIR)/test_audio_pipeline_dfn: $(OBJ_DIR)/test_audio_pipeline_dfn.o $(DFN_LIB_TARGET) $(LIB_TARGET) $(AEC_LIB) $(NR_LIB) $(COMMON_LIB) | _cfg_guard
-	$(LINK) -o $@ $(OBJ_DIR)/test_audio_pipeline_dfn.o $(DFN_LIB_TARGET) $(LIB_TARGET) $(AEC_LIB) $(NR_LIB) $(COMMON_LIB) $(LDFLAGS)
-	@echo "test_audio_pipeline_dfn [$(BACKEND)] -> $@"
+$(BIN_DIR)/test_mono_dfn: $(OBJ_DIR)/test_mono_dfn.o $(DFN_LIB_TARGET) $(OBJ_DIR)/se_config.o $(AEC_LIB) $(NR_LIB) $(COMMON_LIB) | _cfg_guard
+	$(LINK) -o $@ $(OBJ_DIR)/test_mono_dfn.o $(DFN_LIB_TARGET) $(OBJ_DIR)/se_config.o $(AEC_LIB) $(NR_LIB) $(COMMON_LIB) $(LDFLAGS)
+	@echo "test_mono_dfn [$(BACKEND)] -> $@"
 
-$(BIN_DIR)/example_board_adapter: $(OBJ_DIR)/example_board_adapter.o $(LIB_TARGET) $(AEC_LIB) $(NR_LIB) $(COMMON_LIB) | _cfg_guard
-	$(LINK) -o $@ $(OBJ_DIR)/example_board_adapter.o $(LIB_TARGET) $(AEC_LIB) $(NR_LIB) $(COMMON_LIB) $(LDFLAGS)
+$(BIN_DIR)/example_board_adapter: $(OBJ_DIR)/example_board_adapter.o $(OBJ_DIR)/se_config.o $(AEC_LIB) $(NR_LIB) $(COMMON_LIB) | _cfg_guard
+	$(LINK) -o $@ $(OBJ_DIR)/example_board_adapter.o $(OBJ_DIR)/se_config.o $(AEC_LIB) $(NR_LIB) $(COMMON_LIB) $(LDFLAGS)
 	@echo "example_board_adapter [$(BACKEND)] -> $@"
 endif
 
@@ -885,7 +826,7 @@ else
 print-bin-dir:
 	@echo $(abspath $(BIN_DIR))
 print-lib-path:
-	@echo $(abspath $(LIB_TARGET))
+	@echo $(abspath $(DFN_LIB_TARGET))
 print-obj-dir:
 	@echo $(abspath $(OBJ_DIR))
 endif
@@ -900,17 +841,18 @@ endif
 test-fp-contract:
 	@scripts/audit_fp_contract.sh $(BACKEND)
 
-# audit-no-stdio: builds libaudio_pipeline.a with NO_STDIO=1 and asserts, with `nm` over the delivered
+# audit-no-stdio: builds libaudio_pipeline_dfn.a with NO_STDIO=1 and asserts, with `nm` over the delivered
 # keyed archive itself, that none of fprintf/printf/puts/fputs/stderr/__stderrp is in it, and that its
 # resolved path differs from the default (NO_STDIO=0) config's path so the two cannot alias. `ar -t`
-# confirms the three members (audio_pipeline.o, se_config.o, se_anr_stage.o). The regex tolerates a
+# confirms the members (dfn_rate_bridge.o, dfn_res_stage.o, dfn2_prepost.o, dfn2_model_io.o,
+# dfn2_process.o). The regex tolerates a
 # leading underscore and matches the last field of nm's NAME column, as
 # ../../audiolib/common/scripts/audit_alloc_symbols.sh does, so it works with macOS/BSD and GNU nm.
 # Prints PASS/FAIL; non-zero exit on FAIL.
 .PHONY: audit-no-stdio
 audit-no-stdio:
-	@echo "audit-no-stdio: building libaudio_pipeline.a (BACKEND=$(BACKEND), NO_STDIO=1)"
-	@$(MAKE) --no-print-directory BACKEND=$(BACKEND) NO_STDIO=1 libaudio_pipeline.a >/dev/null
+	@echo "audit-no-stdio: building libaudio_pipeline_dfn.a (BACKEND=$(BACKEND), NO_STDIO=1)"
+	@$(MAKE) --no-print-directory BACKEND=$(BACKEND) NO_STDIO=1 libaudio_pipeline_dfn.a >/dev/null
 	@lib_nostdio="$$($(MAKE) -s --no-print-directory BACKEND=$(BACKEND) NO_STDIO=1 print-lib-path)"; \
 	 lib_default="$$($(MAKE) -s --no-print-directory BACKEND=$(BACKEND) NO_STDIO=0 print-lib-path)"; \
 	 if [ "$$lib_nostdio" = "$$lib_default" ]; then \
@@ -918,10 +860,10 @@ audit-no-stdio:
 	   exit 1; \
 	 fi; \
 	 if [ ! -f "$$lib_nostdio" ]; then \
-	   echo "FAIL: $$lib_nostdio not found after building libaudio_pipeline.a with NO_STDIO=1"; \
+	   echo "FAIL: $$lib_nostdio not found after building libaudio_pipeline_dfn.a with NO_STDIO=1"; \
 	   exit 1; \
 	 fi; \
-	 for m in audio_pipeline se_config se_anr_stage; do \
+	 for m in dfn_rate_bridge dfn_res_stage dfn2_prepost dfn2_model_io dfn2_process; do \
 	   ar -t "$$lib_nostdio" | grep -q "^$$m\.o$$" || { echo "FAIL: $$lib_nostdio missing $$m.o member"; exit 1; }; \
 	 done; \
 	 echo "audit-no-stdio: nm -A $$lib_nostdio | grep -E '^_?(fprintf|printf|puts|fputs|stderr|__stderrp)$$' (NAME column)"; \
@@ -933,18 +875,17 @@ audit-no-stdio:
 	 fi; \
 	 echo "PASS: no fprintf/printf/puts/fputs/stderr/__stderrp symbols in $$lib_nostdio (NO_STDIO=1); path differs from default-config path $$lib_default"
 
-# audit-no-stdio-stack (full-image gate): builds all five delivered archives with NO_STDIO=1 (the
+# audit-no-stdio-stack (full-image gate): builds the delivered archives with NO_STDIO=1 (the
 # dispatch forwards it to audiolib / lib/aec / lib/nr; lib/aec compiles its trace/debug TU out under
 # it), nm-gates each archive, then links test_no_stdio_stack.c (a minimal main that runs
-# query->init_ex->process->reset->destroy using no stdio) and nm-gates the executable, so a stdio
-# symbol from any archive fails at the image level. The stdio set is
+# query->init->process->reset->destroy over Aec and the sample chain, using no stdio) and nm-gates the
+# executable, so a stdio symbol from any archive fails at the image level. The stdio set is
 # fprintf/vfprintf/printf/puts/fputs/stderr/__stderrp/fputc/fwrite.
 .PHONY: audit-no-stdio-stack
 audit-no-stdio-stack:
 	@echo "audit-no-stdio-stack: building the full stack (BACKEND=$(BACKEND), NO_STDIO=1)"
-	@$(MAKE) --no-print-directory BACKEND=$(BACKEND) NO_STDIO=1 libaudio_pipeline.a libaudio_pipeline_dfn.a >/dev/null
-	@pl="$$($(MAKE) -s --no-print-directory BACKEND=$(BACKEND) NO_STDIO=1 print-lib-path)"; \
-	 bd="$$($(MAKE) -s --no-print-directory BACKEND=$(BACKEND) NO_STDIO=1 print-bin-dir)"; \
+	@$(MAKE) --no-print-directory BACKEND=$(BACKEND) NO_STDIO=1 libaudio_pipeline_dfn.a >/dev/null
+	@bd="$$($(MAKE) -s --no-print-directory BACKEND=$(BACKEND) NO_STDIO=1 print-bin-dir)"; \
 	 dfnpl="$$bd/libaudio_pipeline_dfn.a"; \
 	 ac="$$($(MAKE) -s --no-print-directory -C $(COMMON_DIR) BACKEND=$(BACKEND) SIMD=$(SIMD) WERROR=$(WERROR) CC='$(CC)' CXX='$(CXX)' EXTRA_CFLAGS='$(EXTRA_CFLAGS)' NO_STDIO=1 print-lib-path)"; \
 	 aec="$$($(MAKE) -s --no-print-directory -C $(AEC_DIR) BACKEND=$(BACKEND) SIMD=$(SIMD) WERROR=$(WERROR) CC='$(CC)' CXX='$(CXX)' EXTRA_CFLAGS='$(EXTRA_CFLAGS)' NO_STDIO=1 COMMON_DIR=$(abspath $(COMMON_DIR)) COMMON_LIB="$$ac" print-lib-path)"; \
@@ -953,19 +894,20 @@ audit-no-stdio-stack:
 	 $(MAKE) --no-print-directory -C $(AEC_DIR) BACKEND=$(BACKEND) SIMD=$(SIMD) WERROR=$(WERROR) CC='$(CC)' CXX='$(CXX)' EXTRA_CFLAGS='$(EXTRA_CFLAGS)' NO_STDIO=1 COMMON_DIR=$(abspath $(COMMON_DIR)) COMMON_LIB="$$ac" lib >/dev/null; \
 	 $(MAKE) --no-print-directory -C $(NR_DIR) BACKEND=$(BACKEND) SIMD=$(SIMD) WERROR=$(WERROR) CC='$(CC)' CXX='$(CXX)' EXTRA_CFLAGS='$(EXTRA_CFLAGS)' NO_STDIO=1 COMMON_DIR=$(abspath $(COMMON_DIR)) COMMON_LIB="$$ac" lib >/dev/null; \
 	 pat='^_?(fprintf|vfprintf|printf|puts|fputs|stderr|__stderrp|fputc|fwrite)$$'; \
-	 for lib in "$$pl" "$$dfnpl" "$$aec" "$$nr" "$$ac"; do \
+	 for lib in "$$dfnpl" "$$aec" "$$nr" "$$ac"; do \
 	   test -f "$$lib" || { echo "FAIL: archive not found: $$lib"; exit 1; }; \
 	   hits=$$(nm -A "$$lib" | awk -v re="$$pat" '{ n=$$NF; if (n ~ re) print }'); \
 	   if [ -n "$$hits" ]; then echo "FAIL: stdio symbol(s) in delivered archive $$lib:"; echo "$$hits"; exit 1; fi; \
 	   echo "  archive clean: $$lib"; \
 	 done; \
 	 mkdir -p "$$bd"; \
-	 $(CC) $(CFLAGS) -DAUDIO_PIPELINE_NO_STDIO -c -o "$$bd/test_no_stdio_stack.o" mono_aec_nr_res/tests/test_no_stdio_stack.c; \
-	 $(LINK) -o "$$bd/test_no_stdio_stack" "$$bd/test_no_stdio_stack.o" "$$pl" "$$aec" "$$nr" "$$ac" -lm; \
+	 $(CC) $(CFLAGS) -c -o "$$bd/se_config_nostdio.o" common/se_config.c; \
+	 $(CC) $(CFLAGS) -c -o "$$bd/test_no_stdio_stack.o" mono_aec_nr_res/tests/test_no_stdio_stack.c; \
+	 $(LINK) -o "$$bd/test_no_stdio_stack" "$$bd/test_no_stdio_stack.o" "$$bd/se_config_nostdio.o" "$$aec" "$$nr" "$$ac" -lm; \
 	 hits=$$(nm "$$bd/test_no_stdio_stack" | awk -v re="$$pat" '{ n=$$NF; if (n ~ re) print }'); \
 	 if [ -n "$$hits" ]; then echo "FAIL: stdio symbol(s) in the linked EXECUTABLE:"; echo "$$hits"; exit 1; fi; \
 	 "$$bd/test_no_stdio_stack" || { rc=$$?; echo "FAIL: test_no_stdio_stack exit $$rc"; exit 1; }; \
-	 echo "PASS: full NO_STDIO=1 stack -- 5 delivered archives scanned + conventional-stack executable clean ($$pat tier), runtime exit 0"
+	 echo "PASS: full NO_STDIO=1 stack -- 4 delivered archives scanned + conventional-stack executable clean ($$pat tier), runtime exit 0"
 
 # publish: immutable, content-addressed release under $(DIST_ROOT), same design as audiolib's publish
 # (see its Makefile): dist/<backend>/<cfg_sig>/ plus an atomic dist/<backend>/current symlink, a
@@ -999,7 +941,7 @@ audit-no-stdio-stack:
 # comment); _publish_impl is internal (direct invocation skips the lock) and uses the same
 # three-producer dispatch as `all`/`test`.
 # =============================================================================
-PUBLISH_ARTIFACTS = $(LIB_TARGET) $(DFN_LIB_TARGET) $(BIN_DIR)/aec_nr_pipeline $(BIN_DIR)/aec_nr_pipeline_static $(BIN_DIR)/mono_alignulcnet $(BIN_DIR)/mono_aec_dfn_res
+PUBLISH_ARTIFACTS = $(DFN_LIB_TARGET) $(BIN_DIR)/aec_nr_pipeline $(BIN_DIR)/aec_nr_pipeline_static $(BIN_DIR)/mono_alignulcnet $(BIN_DIR)/mono_aec_dfn_res
 
 # Release gate (deliberately NOT wired into `test:` -- it runs a full real
 # publish): publishes into a throwaway DIST_ROOT and asserts every
@@ -1323,7 +1265,7 @@ endif
 # is not removed (publish is a deliberate release, not a build cache).
 clean:
 	rm -rf $(OBJ_ROOT) $(BIN_ROOT)
-	rm -f aec_nr_pipeline aec_nr_pipeline_static libaudio_pipeline.a test_audio_pipeline
+	rm -f aec_nr_pipeline aec_nr_pipeline_static libaudio_pipeline_dfn.a test_mono_chain
 
 # clean-all: this dir's artifacts plus all three submodule/shared build trees (lib/aec, lib/nr,
 # audiolib). clean-libs is an alias with the same effect.

@@ -1,14 +1,32 @@
 # Mono AEC + NR/RES application
 
-The application uses the existing AEC, NR and audiolib libraries through
-`audio_pipeline.h`. The heap and caller-pool WAV runners are `main.c` and
-`static_main.c`; `example_board_adapter.c` demonstrates board integration.
-This directory is the stable application entry point and does not introduce
-an additional application-specific archive beyond the reusable
-`libaudio_pipeline.a` integration library.
+There is no mono pipeline library and no mono unit: the example composes the libraries itself.
+`lib/aec`'s `Aec` runs the linear stage (`aec_process_context()`), `se_frame_from_aec()`
+(`common/se_stage.h`) turns its context into a `SeSpecFrame`, and
+`samples/se_sample_chain.h` runs the gain sequence (the AEC's own RES gain, the denoiser,
+`min`, apply, comfort noise) and the synthesis. Each library has its own `mem_size` and `init`;
+the example sums the two sizes it needs (`aec_get_mem_size()`, `se_sample_chain_mem_size()`).
 
-The top-level `pipelines/Makefile` owns the actual build so all four
-applications share one backend/SIMD configuration contract:
+The heap and caller-pool WAV runners are `main.c` and `static_main.c`;
+`example_board_adapter.c` simulates the board's memory manager around the same sequence.
+This directory builds no archive: the examples link `common/se_config.o` and the producer
+libraries directly.
+
+Per hop (the code is `process_hop()` in `main.c`):
+
+```c
+aec_process_context(aec, mic, ref);              /* --aec-only: aec_process(aec, mic, ref, out) */
+se_frame_from_aec(aec, &frame);
+P = se_sample_chain_form(chain, &frame);         /* NULL: a stage refused the hop */
+se_sample_chain_synthesize(chain, P, out);
+/* on any refusal: aec_reset(aec); se_sample_chain_reset(chain); */
+```
+
+Strength: `aec_set_preset(aec, preset, ramp_ms)` for the AEC's RES gain,
+`anr_set_mode(se_sample_chain_nr(chain), mode)` for the denoiser.
+
+The top-level `pipelines/Makefile` owns the actual build so all applications
+share one backend/SIMD configuration contract:
 
 ```sh
 make SIMD=0 test

@@ -62,6 +62,39 @@ static inline const float* se_res_stage_gain(AecRes* res, const SeSpecFrame* fra
     return aec_res_process(res, &in);
 }
 
+/* The SeSpecFrame view of one hop of a mono Aec after aec_process_context(). The lane
+ * must carry the seam (enable_res = 0, return_res_context = 1, as se_derive builds it);
+ * its own gain is exposed as g_res_ctx. All pointers alias the AEC and are valid until its
+ * next processing call or reset. Returns 0, or -1 for a NULL argument or a lane without
+ * the seam. */
+static inline int se_frame_from_aec(const Aec* aec, SeSpecFrame* frame) {
+    AecResContext ctx;
+    AecLinearContext lin;
+    if (!aec || !frame) return -1;
+    aec_get_res_context(aec, &ctx);
+    aec_get_linear_context(aec, &lin);
+    if (!ctx.error_spec) return -1;
+    frame->n_freqs = ctx.n_freqs;
+    frame->hop = ctx.hop_size;
+    frame->e = ctx.error_spec;
+    frame->y = ctx.near_spec;
+    frame->x = ctx.far_spec;
+    frame->r2 = ctx.r2;
+    frame->cn = ctx.comfort_noise;
+    frame->g_res_ctx = ctx.res_gain;
+    frame->far_hop = lin.aligned_far_hop;
+    frame->formed_hop = ctx.formed_hop;
+    frame->far_power = ctx.far_power;
+    frame->max_dt = ctx.dt_indicator;
+    frame->max_sat = ctx.saturation_level;
+    frame->all_converged = ctx.filter_converged;
+    frame->usable_linear = ctx.usable_linear;
+    frame->clock_drift = 0;
+    frame->delay_changed = lin.delay_state == AEC_LINEAR_DELAY_CHANGED;
+    frame->delay_locked = lin.delay_state != AEC_LINEAR_DELAY_UNLOCKED;
+    return 0;
+}
+
 #ifdef __cplusplus
 }
 #endif

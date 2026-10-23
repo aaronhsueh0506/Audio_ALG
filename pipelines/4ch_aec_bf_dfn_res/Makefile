@@ -4,9 +4,9 @@ all:
 	$(MAKE) -C ../4ch_aec_bf_nr_res 4ch_aec_bf_dfn_res
 
 test: all
-	$(MAKE) -C ../4ch_aec_bf_nr_res test_4aec_dfn_res
+	$(MAKE) -C ../4ch_aec_bf_nr_res test_4ch_dfn
 	set -e; bin="$$($(MAKE) -s -C ../4ch_aec_bf_nr_res print-bin-dir)"; \
-	  "$$bin/test_4aec_dfn_res"; \
+	  "$$bin/test_4ch_dfn"; \
 	  "$$bin/4ch_aec_bf_dfn_res"; \
 	  "$$bin/4ch_aec_bf_dfn_res" --delay-num-filters 1 --cng --atten-lim 12; \
 	  "$$bin/4ch_aec_bf_dfn_res" --sample-rate 48000; \

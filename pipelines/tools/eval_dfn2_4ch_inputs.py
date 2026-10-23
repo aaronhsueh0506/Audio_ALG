@@ -127,6 +127,7 @@ def evaluate(case_dir: Path, checkpoint: Path, seconds: float,
     config = four.FourChannelAecConfig(sample_rate=native_rate)
     front = four.FourChannelAecPipeline(config)
     hop = front.hop_size
+    suppressor = four.PostBeamResidualSuppressor(native_rate, hop, front.n_freqs)
     count = min(len(mics), len(far_native))
     count = count // hop * hop
     mics = mics[:count]
@@ -141,12 +142,13 @@ def evaluate(case_dir: Path, checkpoint: Path, seconds: float,
                                            far_native[start:start + hop])
         bf = beamformer.process(pre.linear_hops, pre.contexts)
         frame = front.fuse(pre, bf)
-        contexts.append(frame.context)
+        context = suppressor.process(frame.context, frame.aligned_render)
+        contexts.append(context)
         candidates['raw_capture'].append(
             np.asarray(pre.contexts[config.capture_proxy_channel].near_spec).copy())
         candidates['linear_capture'].append(
             np.asarray(pre.contexts[config.capture_proxy_channel].error_spec).copy())
-        candidates['beamformed'].append(np.asarray(frame.context.error_spec).copy())
+        candidates['beamformed'].append(np.asarray(context.error_spec).copy())
         linear[start:start + hop] = frame.beamformed
 
     assets = (load_dfn2(seed=0) if identity_model

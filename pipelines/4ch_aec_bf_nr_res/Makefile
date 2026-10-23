@@ -1,8 +1,9 @@
-# Four-channel traditional AEC -> spatial -> mono NR/RES pipeline.
+# Four-channel linear AEC + beamformer unit and the examples composed over it.
 #
-# This Makefile lives beside the 4-channel implementation; the parent pipelines/Makefile is the mono
-# AEC -> NR producer/runner. The archive built here holds only the reusable four-lane linear core.
-# The standard and ULCNet wrappers are linked directly into application binaries; AEC, NR, common,
+# This Makefile lives beside the 4-channel implementation; the parent pipelines/Makefile builds the
+# mono examples. libaudio_pipeline_4ch.a holds the unit (the four-lane linear core and the
+# SRP-PHAT/BF composition); RES, NR, comfort noise, synthesis and the neural post-filters are
+# separate libraries that the example binaries initialise and chain (../samples). AEC, NR, common,
 # DOA, BF and spatial kernels remain component libs.
 #
 # Common invocations:
@@ -47,7 +48,7 @@ NO_STDIO = 0
 DEBUG = 0
 TOOLCHAIN_CHECK = 1
 EXTRA_CFLAGS =
-# PROFILE=1 turns on per-hop stage timing across the whole chain: this wrapper's own stages and,
+# PROFILE=1 turns on per-hop stage timing across the whole chain: the core's own stages and,
 # through the PROFILE knob forwarded to the lib/aec build, the four summed off the lanes. Off
 # otherwise, so a release build takes no clock reads; FourAecNrResLastTiming's doc comment
 # (4aec_nr_res.h) carries the field list.
@@ -62,7 +63,7 @@ EXTRA_CFLAGS =
 # AEC_STAGE_TIMING is repeated on purpose: this layer's own TUs test it, to decide whether to copy
 # the lanes' record out and what the tests may assert about it; deriving both flags from PROFILE
 # keeps the two views consistent. A lib/aec pin without the PROFILE knob degrades to the one-half
-# state: the wrapper's stages measure and the AEC block reads zero.
+# state: the core's stages measure and the AEC block reads zero.
 PROFILE ?= 0
 ifeq ($(PROFILE),1)
 PROFILE_CFLAGS := -DFOUR_AEC_NR_RES_STAGE_TIMING=1 -DAEC_STAGE_TIMING=1
@@ -131,7 +132,7 @@ WERROR_CFLAGS :=
 endif
 
 override CFLAGS := -Wall -Wextra $(OPT_CFLAGS) -std=gnu99 \
-          -I. -I$(PIPELINES_DIR) -I$(PIPELINES_DIR)/4ch_alignulcnet \
+          -I. -I$(PIPELINES_DIR) \
           -I$(AEC_DIR)/include -I$(AEC_DIR)/example \
           -I$(NR_DIR)/include -I$(COMMON_DIR)/include -I$(COMMON_DIR) \
           -I$(AUDIOLIB_DIR)/common/utility \
@@ -142,6 +143,9 @@ override CFLAGS := -Wall -Wextra $(OPT_CFLAGS) -std=gnu99 \
           -DAUDIO_PIPELINE_BACKEND_STR=\"$(BACKEND)\" \
           $(WERROR_CFLAGS) -ffp-contract=off -fno-math-errno
 LIB_CFLAGS := $(CFLAGS)
+# Examples and tests compose the unit with the example headers; the unit and its archive do not
+# reference ../samples.
+EX_CFLAGS := $(CFLAGS) -I$(PIPELINES_DIR)/samples
 
 LINK := $(CXX)
 LDLIBS := $(EXTRA_LDFLAGS) $(LDFLAGS) -lm
@@ -153,18 +157,18 @@ FWD = BACKEND=$(BACKEND) SIMD=$(SIMD) PROFILE=$(PROFILE) WERROR=$(WERROR) \
 
 # Resolve every producer before constructing this consumer's CFG identity.
 ifeq ($(COMMON_LIB),)
-.PHONY: all test libs lib libaudio_pipeline_4ch.a lib4aec_dfn_res.a \
+.PHONY: all test libs lib libaudio_pipeline_4ch.a libdfn_res_stage.a \
         audio_pipeline_4ch_raw 4aec_nr_res_static audio_pipeline_4ch_static 4ch_alignulcnet \
         4ch_aec_bf_dfn_res \
-        test_4aec_nr_res test_audio_pipeline_4ch test_4aec_dfn_res \
-        test_audio_pipeline_4ch_ulcnet dump_delay_parity \
+        test_4aec_nr_res test_audio_pipeline_4ch test_4ch_dfn \
+        test_4ch_ulcnet dump_delay_parity \
         print-bin-dir print-obj-dir print-lib-path audit-no-stdio \
         test-third-party
-all test libs lib libaudio_pipeline_4ch.a lib4aec_dfn_res.a \
+all test libs lib libaudio_pipeline_4ch.a libdfn_res_stage.a \
 audio_pipeline_4ch_raw 4aec_nr_res_static audio_pipeline_4ch_static 4ch_alignulcnet \
 4ch_aec_bf_dfn_res \
-test_4aec_nr_res test_audio_pipeline_4ch test_4aec_dfn_res \
-test_audio_pipeline_4ch_ulcnet dump_delay_parity \
+test_4aec_nr_res test_audio_pipeline_4ch test_4ch_dfn \
+test_4ch_ulcnet dump_delay_parity \
 print-bin-dir print-obj-dir print-lib-path audit-no-stdio \
 test-third-party:
 	+@ac="$$($(MAKE) -s --no-print-directory -C $(COMMON_DIR) $(FWD) print-lib-path)"; \
@@ -192,18 +196,18 @@ SPATIAL_PRODUCER_SIG := $(notdir $(patsubst %/,%,$(dir $(SPATIAL_COMMON_LIB))))
 endif
 
 SRCS := 4aec_nr_res.c audio_pipeline_4ch.c \
-        ../common/se_config.c ../common/se_anr_stage.c \
-        ../4ch_aec_bf_dfn_res/4aec_dfn_res.c ../dfn_res_stage.c ../dfn_rate_bridge.c \
+        ../common/se_config.c \
+        ../dfn_res_stage.c ../dfn_rate_bridge.c \
         $(DFN2_DIR)/dfn2_process.c $(DFN2_DIR)/dfn2_model_io.c \
         $(DFN2_DIR)/dfn2_prepost.c \
-        ../4ch_alignulcnet/audio_pipeline_4ch_ulcnet.c \
+        ../samples/ulcnet_nn_stage.c \
         audio_pipeline_4ch_raw.c mcab_sample_driver.c \
         4aec_nr_res_static.c audio_pipeline_4ch_static.c \
         tests/test_4aec_nr_res.c tests/test_mcab_sample_driver.c \
-        ../4ch_aec_bf_dfn_res/tests/test_4aec_dfn_res.c \
+        ../4ch_aec_bf_dfn_res/tests/test_4ch_dfn.c \
         ../4ch_aec_bf_dfn_res/main.c \
         tests/test_audio_pipeline_4ch.c tests/dump_delay_parity.c \
-        ../4ch_alignulcnet/tests/test_audio_pipeline_4ch_ulcnet.c \
+        ../4ch_alignulcnet/tests/test_4ch_ulcnet.c \
         $(ULCNET_DIR)/ulcnet_accelerator_adapter.c \
         $(ULCNET_DIR)/ulcnet_prepost.c \
         ../4ch_alignulcnet/main.c $(ULCNET_DIR)/ulcnet_process.c \
@@ -219,14 +223,12 @@ BIN_ROOT ?= bin
 OBJ_DIR := $(OBJ_ROOT)/$(BACKEND)-$(CFG_SIG)
 BIN_DIR := $(BIN_ROOT)/$(BACKEND)-$(CFG_SIG)
 PIPELINE_LIB := $(BIN_DIR)/libaudio_pipeline_4ch.a
-DFN_PIPELINE_LIB := $(BIN_DIR)/lib4aec_dfn_res.a
+DFN_PIPELINE_LIB := $(BIN_DIR)/libdfn_res_stage.a
 
-# Only the reusable 4-lane linear core and the shared configuration/NR stage
-# code it uses are archived. Standard and ULCNet application wrappers are
-# linked as objects into their respective binaries.
-PIPELINE_OBJS := $(OBJ_DIR)/4aec_nr_res.o $(OBJ_DIR)/se_config.o $(OBJ_DIR)/se_anr_stage.o
-DFN_PIPELINE_OBJS := $(OBJ_DIR)/4aec_dfn_res.o \
-                     $(OBJ_DIR)/dfn_res_stage.o \
+# The unit: the four-lane linear core, the SRP-PHAT/BF composition over it and the grid
+# configuration code they share. The post-beam stages and the NN stages are not part of it.
+PIPELINE_OBJS := $(OBJ_DIR)/4aec_nr_res.o $(OBJ_DIR)/audio_pipeline_4ch.o $(OBJ_DIR)/se_config.o
+DFN_PIPELINE_OBJS := $(OBJ_DIR)/dfn_res_stage.o \
                      $(OBJ_DIR)/dfn_rate_bridge.o \
                      $(OBJ_DIR)/dfn2_process.o \
                      $(OBJ_DIR)/dfn2_model_io.o \
@@ -257,17 +259,14 @@ _cfg_guard:
 	  fi; \
 	done
 
-$(OBJ_DIR)/4aec_nr_res.o: 4aec_nr_res.c 4aec_nr_res.h 4aec_nr_res_internal.h ../common/se_config.h ../common/se_anr_stage.h | _cfg_guard
+$(OBJ_DIR)/4aec_nr_res.o: 4aec_nr_res.c 4aec_nr_res.h 4aec_nr_res_internal.h ../common/se_config.h | _cfg_guard
 	$(CC) $(LIB_CFLAGS) -MD -MP -c -o $@ $<
 
 $(OBJ_DIR)/se_config.o: ../common/se_config.c ../common/se_config.h | _cfg_guard
 	$(CC) $(LIB_CFLAGS) -MD -MP -c -o $@ $<
 
-$(OBJ_DIR)/se_anr_stage.o: ../common/se_anr_stage.c ../common/se_anr_stage.h | _cfg_guard
+$(OBJ_DIR)/audio_pipeline_4ch.o: audio_pipeline_4ch.c audio_pipeline_4ch.h 4aec_nr_res.h | _cfg_guard
 	$(CC) $(LIB_CFLAGS) -MD -MP -c -o $@ $<
-
-$(OBJ_DIR)/4aec_dfn_res.o: ../4ch_aec_bf_dfn_res/4aec_dfn_res.c ../4ch_aec_bf_dfn_res/4aec_dfn_res.h 4aec_nr_res.h ../dfn_res_stage.h ../dfn_rate_bridge.h | _cfg_guard
-	$(CC) $(LIB_CFLAGS) -I../4ch_aec_bf_dfn_res -MD -MP -c -o $@ $<
 
 $(OBJ_DIR)/dfn_res_stage.o: ../dfn_res_stage.c ../dfn_res_stage.h | _cfg_guard
 	$(CC) $(LIB_CFLAGS) -MD -MP -c -o $@ $<
@@ -284,17 +283,18 @@ $(OBJ_DIR)/dfn2_model_io.o: $(DFN2_DIR)/dfn2_model_io.c $(DFN2_DIR)/dfn2_model_i
 $(OBJ_DIR)/dfn2_prepost.o: $(DFN2_DIR)/dfn2_prepost.c $(DFN2_DIR)/dfn2_prepost.h | _cfg_guard
 	$(CC) $(LIB_CFLAGS) -MD -MP -c -o $@ $<
 
-$(OBJ_DIR)/test_4aec_dfn_res.o: ../4ch_aec_bf_dfn_res/tests/test_4aec_dfn_res.c ../4ch_aec_bf_dfn_res/4aec_dfn_res.h ../tests/dfn_test_fixture.h | _cfg_guard
-	$(CC) $(CFLAGS) -I../4ch_aec_bf_dfn_res -MD -MP -c -o $@ $<
+# ../4ch_aec_bf_dfn_res/main.c and tests/test_4ch_dfn.c compose the core with
+# ../samples/se_sample_chain.h and ../samples/dfn_hop.h.
+$(OBJ_DIR)/test_4ch_dfn.o: ../4ch_aec_bf_dfn_res/tests/test_4ch_dfn.c ../samples/dfn_hop.h ../samples/se_sample_chain.h ../tests/dfn_test_fixture.h | _cfg_guard
+	$(CC) $(EX_CFLAGS) -I../4ch_aec_bf_dfn_res -MD -MP -c -o $@ $<
 
-$(OBJ_DIR)/4ch_aec_bf_dfn_res_main.o: ../4ch_aec_bf_dfn_res/main.c mcab_sample_driver.h ../4ch_aec_bf_dfn_res/4aec_dfn_res.h ../dfn_example_args.h ../dfn_unit_partition.h | _cfg_guard
-	$(CC) $(CFLAGS) -I../4ch_aec_bf_dfn_res -MD -MP -c -o $@ $<
+$(OBJ_DIR)/4ch_aec_bf_dfn_res_main.o: ../4ch_aec_bf_dfn_res/main.c mcab_sample_driver.h ../samples/dfn_hop.h ../samples/se_sample_chain.h ../dfn_example_args.h ../dfn_unit_partition.h | _cfg_guard
+	$(CC) $(EX_CFLAGS) -I../4ch_aec_bf_dfn_res -MD -MP -c -o $@ $<
 
-$(OBJ_DIR)/audio_pipeline_4ch.o: audio_pipeline_4ch.c audio_pipeline_4ch.h 4aec_nr_res.h | _cfg_guard
-	$(CC) $(LIB_CFLAGS) -MD -MP -c -o $@ $<
-
-$(OBJ_DIR)/audio_pipeline_4ch_ulcnet.o: ../4ch_alignulcnet/audio_pipeline_4ch_ulcnet.c ../4ch_alignulcnet/audio_pipeline_4ch_ulcnet.h audio_pipeline_4ch.h 4aec_nr_res.h $(ULCNET_DIR)/ulcnet_process.h | _cfg_guard
-	$(CC) $(LIB_CFLAGS) -I$(ULCNET_DIR) $(ULCNET_GRID_CFLAGS) -MD -MP -c -o $@ $<
+# ../4ch_alignulcnet/main.c and tests/test_4ch_ulcnet.c compose the unit with the
+# ULCNet NN stage example.
+$(OBJ_DIR)/ulcnet_nn_stage.o: ../samples/ulcnet_nn_stage.c ../samples/ulcnet_nn_stage.h $(ULCNET_DIR)/ulcnet_process.h | _cfg_guard
+	$(CC) $(EX_CFLAGS) -I$(ULCNET_DIR) $(ULCNET_GRID_CFLAGS) -MD -MP -c -o $@ $<
 
 $(OBJ_DIR)/ulcnet_process.o: $(ULCNET_DIR)/ulcnet_process.c $(ULCNET_DIR)/ulcnet_process.h | _cfg_guard
 	$(CC) $(LIB_CFLAGS) -I$(ULCNET_DIR) $(ULCNET_GRID_CFLAGS) -MD -MP -c -o $@ $<
@@ -311,32 +311,32 @@ $(OBJ_DIR)/ulcnet_prepost.o: $(ULCNET_DIR)/ulcnet_prepost.c $(ULCNET_DIR)/ulcnet
 $(OBJ_DIR)/ulcnet_accelerator_adapter.o: $(ULCNET_DIR)/ulcnet_accelerator_adapter.c $(ULCNET_DIR)/ulcnet_accelerator_adapter.h $(ULCNET_DIR)/ulcnet_prepost.h $(ULCNET_DIR)/ulcnet_model_io.h $(ULCNET_DIR)/ulcnet_process.h | _cfg_guard
 	$(CC) $(LIB_CFLAGS) -I$(ULCNET_DIR) $(ULCNET_GRID_CFLAGS) -MD -MP -c -o $@ $<
 
-$(OBJ_DIR)/4ch_alignulcnet_main.o: ../4ch_alignulcnet/main.c mcab_sample_driver.h ../4ch_alignulcnet/audio_pipeline_4ch_ulcnet.h $(ULCNET_DIR)/ulcnet_accelerator_adapter.h | _cfg_guard
-	$(CC) $(CFLAGS) -I$(ULCNET_DIR) $(ULCNET_GRID_CFLAGS) -MD -MP -c -o $@ $<
+$(OBJ_DIR)/4ch_alignulcnet_main.o: ../4ch_alignulcnet/main.c mcab_sample_driver.h audio_pipeline_4ch.h ../samples/ulcnet_nn_stage.h $(ULCNET_DIR)/ulcnet_accelerator_adapter.h | _cfg_guard
+	$(CC) $(EX_CFLAGS) -I$(ULCNET_DIR) $(ULCNET_GRID_CFLAGS) -MD -MP -c -o $@ $<
 
-$(OBJ_DIR)/audio_pipeline_4ch_raw.o: audio_pipeline_4ch_raw.c audio_pipeline_4ch.h mcab_sample_driver.h | _cfg_guard
-	$(CC) $(CFLAGS) -MD -MP -c -o $@ $<
+$(OBJ_DIR)/test_4ch_ulcnet.o: ../4ch_alignulcnet/tests/test_4ch_ulcnet.c audio_pipeline_4ch.h ../samples/ulcnet_nn_stage.h $(ULCNET_DIR)/ulcnet_process.h | _cfg_guard
+	$(CC) $(EX_CFLAGS) -I$(ULCNET_DIR) $(ULCNET_GRID_CFLAGS) -MD -MP -c -o $@ $<
+
+$(OBJ_DIR)/audio_pipeline_4ch_raw.o: audio_pipeline_4ch_raw.c audio_pipeline_4ch.h mcab_sample_driver.h ../samples/se_sample_chain.h | _cfg_guard
+	$(CC) $(EX_CFLAGS) -MD -MP -c -o $@ $<
 
 $(OBJ_DIR)/mcab_sample_driver.o: mcab_sample_driver.c mcab_sample_driver.h audio_pipeline_4ch.h | _cfg_guard
 	$(CC) $(CFLAGS) -MD -MP -c -o $@ $<
 
-$(OBJ_DIR)/4aec_nr_res_static.o: 4aec_nr_res_static.c 4aec_nr_res.h | _cfg_guard
+$(OBJ_DIR)/4aec_nr_res_static.o: 4aec_nr_res_static.c 4aec_nr_res.h ../samples/se_sample_chain.h | _cfg_guard
+	$(CC) $(EX_CFLAGS) -MD -MP -c -o $@ $<
+
+$(OBJ_DIR)/audio_pipeline_4ch_static.o: audio_pipeline_4ch_static.c audio_pipeline_4ch.h mcab_sample_driver.h ../samples/se_sample_chain.h | _cfg_guard
+	$(CC) $(EX_CFLAGS) -MD -MP -c -o $@ $<
+
+$(OBJ_DIR)/test_4aec_nr_res.o: tests/test_4aec_nr_res.c 4aec_nr_res.h tests/conv_chain_4ch.h | _cfg_guard
 	$(CC) $(CFLAGS) -MD -MP -c -o $@ $<
 
-$(OBJ_DIR)/audio_pipeline_4ch_static.o: audio_pipeline_4ch_static.c audio_pipeline_4ch.h mcab_sample_driver.h | _cfg_guard
-	$(CC) $(CFLAGS) -MD -MP -c -o $@ $<
-
-$(OBJ_DIR)/test_4aec_nr_res.o: tests/test_4aec_nr_res.c 4aec_nr_res.h | _cfg_guard
-	$(CC) $(CFLAGS) -MD -MP -c -o $@ $<
-
-$(OBJ_DIR)/test_audio_pipeline_4ch.o: tests/test_audio_pipeline_4ch.c audio_pipeline_4ch.h | _cfg_guard
-	$(CC) $(CFLAGS) -MD -MP -c -o $@ $<
+$(OBJ_DIR)/test_audio_pipeline_4ch.o: tests/test_audio_pipeline_4ch.c audio_pipeline_4ch.h tests/conv_chain_4ch.h ../samples/se_sample_chain.h | _cfg_guard
+	$(CC) $(EX_CFLAGS) -MD -MP -c -o $@ $<
 
 $(OBJ_DIR)/dump_delay_parity.o: tests/dump_delay_parity.c 4aec_nr_res.h 4aec_nr_res_internal.h | _cfg_guard
 	$(CC) $(CFLAGS) -MD -MP -c -o $@ $<
-
-$(OBJ_DIR)/test_audio_pipeline_4ch_ulcnet.o: ../4ch_alignulcnet/tests/test_audio_pipeline_4ch_ulcnet.c ../4ch_alignulcnet/audio_pipeline_4ch_ulcnet.h audio_pipeline_4ch.h 4aec_nr_res.h $(ULCNET_DIR)/ulcnet_process.h | _cfg_guard
-	$(CC) $(CFLAGS) -I$(ULCNET_DIR) $(ULCNET_GRID_CFLAGS) -MD -MP -c -o $@ $<
 
 $(PIPELINE_LIB): $(PIPELINE_OBJS) | _cfg_guard
 	t="$@.tmp.$$$$" && rm -f "$$t" && $(AR) rcs "$$t" $^ && \
@@ -346,35 +346,34 @@ $(PIPELINE_LIB): $(PIPELINE_OBJS) | _cfg_guard
 $(DFN_PIPELINE_LIB): $(DFN_PIPELINE_OBJS) | _cfg_guard
 	t="$@.tmp.$$$$" && rm -f "$$t" && $(AR) rcs "$$t" $^ && \
 	  $(RANLIB) "$$t" && mv -f "$$t" $@
-	@echo "lib4aec_dfn_res.a [$(BACKEND), SIMD=$(SIMD)] -> $@"
+	@echo "libdfn_res_stage.a [$(BACKEND), SIMD=$(SIMD)] -> $@"
 
 ifneq ($(COMMON_LIB),)
-.PHONY: all test libs lib libaudio_pipeline_4ch.a lib4aec_dfn_res.a \
+.PHONY: all test libs lib libaudio_pipeline_4ch.a libdfn_res_stage.a \
         audio_pipeline_4ch_raw 4aec_nr_res_static audio_pipeline_4ch_static 4ch_alignulcnet \
         4ch_aec_bf_dfn_res \
-        test_4aec_nr_res test_audio_pipeline_4ch test_4aec_dfn_res \
-        test_audio_pipeline_4ch_ulcnet dump_delay_parity \
+        test_4aec_nr_res test_audio_pipeline_4ch test_4ch_dfn \
+        test_4ch_ulcnet dump_delay_parity \
         audit-no-stdio test-third-party
 
 all: $(PIPELINE_LIB) $(DFN_PIPELINE_LIB) $(BIN_DIR)/audio_pipeline_4ch_raw \
      $(BIN_DIR)/4aec_nr_res_static $(BIN_DIR)/audio_pipeline_4ch_static \
      $(BIN_DIR)/4ch_aec_bf_dfn_res
 
-# The 4ch_alignulcnet application shares this Makefile (its wrapper compiles
-# against this directory's core), so its acceptance test and board skeleton
-# run here too: this directory's `make test` is the one-stop gate, mirroring
-# the mono arrangement in pipelines/Makefile.
+# The 4ch_alignulcnet application shares this Makefile (it composes the unit with the NN stage
+# example), so its acceptance test and board skeleton run here too: this directory's `make test`
+# is the one-stop gate, mirroring the mono arrangement in pipelines/Makefile.
 test: test-third-party test-mcab-sample-driver \
       $(BIN_DIR)/test_4aec_nr_res \
-      $(BIN_DIR)/test_4aec_dfn_res \
+      $(BIN_DIR)/test_4ch_dfn \
       $(BIN_DIR)/test_audio_pipeline_4ch $(BIN_DIR)/4aec_nr_res_static \
       $(BIN_DIR)/audio_pipeline_4ch_static \
-      $(BIN_DIR)/test_audio_pipeline_4ch_ulcnet $(BIN_DIR)/4ch_alignulcnet \
+      $(BIN_DIR)/test_4ch_ulcnet $(BIN_DIR)/4ch_alignulcnet \
       $(BIN_DIR)/4ch_aec_bf_dfn_res
 	"$(abspath $(BIN_DIR))/test_4aec_nr_res"
-	"$(abspath $(BIN_DIR))/test_4aec_dfn_res"
+	"$(abspath $(BIN_DIR))/test_4ch_dfn"
 	"$(abspath $(BIN_DIR))/test_audio_pipeline_4ch"
-	"$(abspath $(BIN_DIR))/test_audio_pipeline_4ch_ulcnet"
+	"$(abspath $(BIN_DIR))/test_4ch_ulcnet"
 	"$(abspath $(BIN_DIR))/4aec_nr_res_static" --sample-rate 16000
 	"$(abspath $(BIN_DIR))/4aec_nr_res_static" --sample-rate 48000
 	"$(abspath $(BIN_DIR))/audio_pipeline_4ch_static" --sample-rate 16000
@@ -391,7 +390,7 @@ test: test-third-party test-mcab-sample-driver \
 	"$(abspath $(BIN_DIR))/4ch_aec_bf_dfn_res" --atten-lim 12dB >/dev/null 2>&1; test $$? -eq 2
 
 lib libaudio_pipeline_4ch.a: $(PIPELINE_LIB)
-lib4aec_dfn_res.a: $(DFN_PIPELINE_LIB)
+libdfn_res_stage.a: $(DFN_PIPELINE_LIB)
 libs: $(COMMON_LIB) $(AEC_LIB) $(NR_LIB) $(SPATIAL_COMMON_LIB) $(DOA_LIB) $(BF_LIB) $(PIPELINE_LIB) $(DFN_PIPELINE_LIB)
 audio_pipeline_4ch_raw: $(BIN_DIR)/audio_pipeline_4ch_raw
 4aec_nr_res_static: $(BIN_DIR)/4aec_nr_res_static
@@ -399,16 +398,16 @@ audio_pipeline_4ch_static: $(BIN_DIR)/audio_pipeline_4ch_static
 4ch_alignulcnet: $(BIN_DIR)/4ch_alignulcnet
 4ch_aec_bf_dfn_res: $(BIN_DIR)/4ch_aec_bf_dfn_res
 test_4aec_nr_res: $(BIN_DIR)/test_4aec_nr_res
-test_4aec_dfn_res: $(BIN_DIR)/test_4aec_dfn_res
+test_4ch_dfn: $(BIN_DIR)/test_4ch_dfn
 test_audio_pipeline_4ch: $(BIN_DIR)/test_audio_pipeline_4ch
-test_audio_pipeline_4ch_ulcnet: $(BIN_DIR)/test_audio_pipeline_4ch_ulcnet
+test_4ch_ulcnet: $(BIN_DIR)/test_4ch_ulcnet
 # CSV dumper for the C/Python per-hop alignment parity test
 # (tests/test_delay_parity.py builds and runs it); not part of `make test`,
 # which only runs self-checking binaries.
 dump_delay_parity: $(BIN_DIR)/dump_delay_parity
 
 # Same audit as the mono full stack: no archive may reference the stdio set
-# (printf family, stderr, fputc, fwrite).
+# (printf family, stderr, fputc, fwrite). The unit's archive carries the unit TU.
 audit-no-stdio: $(PIPELINE_LIB) $(DFN_PIPELINE_LIB) $(AEC_LIB) $(NR_LIB) $(COMMON_LIB) \
                 $(SPATIAL_COMMON_LIB) $(DOA_LIB) $(BF_LIB)
 	@test "$(NO_STDIO)" = 1 || { \
@@ -452,8 +451,8 @@ $(BF_LIB): FORCE
 $(BIN_DIR)/test_4aec_nr_res: $(OBJ_DIR)/test_4aec_nr_res.o $(PIPELINE_LIB) $(AEC_LIB) $(NR_LIB) $(COMMON_LIB) | _cfg_guard
 	$(LINK) -o $@ $(OBJ_DIR)/test_4aec_nr_res.o $(PIPELINE_LIB) $(AEC_LIB) $(NR_LIB) $(COMMON_LIB) $(LDLIBS)
 
-$(BIN_DIR)/test_4aec_dfn_res: $(OBJ_DIR)/test_4aec_dfn_res.o $(DFN_PIPELINE_LIB) $(PIPELINE_LIB) $(AEC_LIB) $(NR_LIB) $(COMMON_LIB) | _cfg_guard
-	$(LINK) -o $@ $(OBJ_DIR)/test_4aec_dfn_res.o $(DFN_PIPELINE_LIB) $(PIPELINE_LIB) $(AEC_LIB) $(NR_LIB) $(COMMON_LIB) $(LDLIBS)
+$(BIN_DIR)/test_4ch_dfn: $(OBJ_DIR)/test_4ch_dfn.o $(DFN_PIPELINE_LIB) $(PIPELINE_LIB) $(AEC_LIB) $(NR_LIB) $(COMMON_LIB) | _cfg_guard
+	$(LINK) -o $@ $(OBJ_DIR)/test_4ch_dfn.o $(DFN_PIPELINE_LIB) $(PIPELINE_LIB) $(AEC_LIB) $(NR_LIB) $(COMMON_LIB) $(LDLIBS)
 
 $(BIN_DIR)/dump_delay_parity: $(OBJ_DIR)/dump_delay_parity.o $(PIPELINE_LIB) $(AEC_LIB) $(NR_LIB) $(COMMON_LIB) | _cfg_guard
 	$(LINK) -o $@ $(OBJ_DIR)/dump_delay_parity.o $(PIPELINE_LIB) $(AEC_LIB) $(NR_LIB) $(COMMON_LIB) $(LDLIBS)
@@ -463,19 +462,23 @@ $(BIN_DIR)/dump_delay_parity: $(OBJ_DIR)/dump_delay_parity.o $(PIPELINE_LIB) $(A
 test-third-party: FORCE
 	+$(MAKE) -C $(AUDIOLIB_DIR) $(FWD) test
 
-$(BIN_DIR)/test_audio_pipeline_4ch: $(OBJ_DIR)/test_audio_pipeline_4ch.o $(OBJ_DIR)/audio_pipeline_4ch.o $(PIPELINE_LIB) $(DOA_LIB) $(BF_LIB) $(SPATIAL_COMMON_LIB) $(AEC_LIB) $(NR_LIB) $(COMMON_LIB) | _cfg_guard
-	$(LINK) -o $@ $(OBJ_DIR)/test_audio_pipeline_4ch.o $(OBJ_DIR)/audio_pipeline_4ch.o $(PIPELINE_LIB) $(DOA_LIB) $(BF_LIB) $(SPATIAL_COMMON_LIB) $(AEC_LIB) $(NR_LIB) $(COMMON_LIB) $(LDLIBS)
+# The unit (PIPELINE_LIB) pulls SRP-PHAT and BF from the spatial archives; the order of the
+# archives on the link line is unit first, then DOA, BF, spatial kernels, AEC, NR, common.
+UNIT_LIBS := $(PIPELINE_LIB) $(DOA_LIB) $(BF_LIB) $(SPATIAL_COMMON_LIB) $(AEC_LIB) $(NR_LIB) $(COMMON_LIB)
 
-ULCNET_4CH_OBJS := $(OBJ_DIR)/audio_pipeline_4ch_ulcnet.o \
-                   $(OBJ_DIR)/audio_pipeline_4ch.o \
+$(BIN_DIR)/test_audio_pipeline_4ch: $(OBJ_DIR)/test_audio_pipeline_4ch.o $(UNIT_LIBS) | _cfg_guard
+	$(LINK) -o $@ $(OBJ_DIR)/test_audio_pipeline_4ch.o $(UNIT_LIBS) $(LDLIBS)
+
+# The NN stage example and the ULCNet framing objects the stage links.
+ULCNET_4CH_OBJS := $(OBJ_DIR)/ulcnet_nn_stage.o \
                    $(OBJ_DIR)/ulcnet_process.o
 
-# The wrapper itself needs no ulcnet_model_io symbol (it only READS the
-# descriptor a runtime published, so a board integrating the wrapper alone
+# The stage itself needs no ulcnet_model_io symbol (it only READS the
+# descriptor a runtime published, so a board integrating the stage alone
 # gains no new link dependency); the test links it to BUILD descriptors for
 # the far-input contract gate.
-$(BIN_DIR)/test_audio_pipeline_4ch_ulcnet: $(OBJ_DIR)/test_audio_pipeline_4ch_ulcnet.o $(ULCNET_4CH_OBJS) $(OBJ_DIR)/ulcnet_model_io.o $(PIPELINE_LIB) $(DOA_LIB) $(BF_LIB) $(SPATIAL_COMMON_LIB) $(AEC_LIB) $(NR_LIB) $(COMMON_LIB) | _cfg_guard
-	$(LINK) -o $@ $(OBJ_DIR)/test_audio_pipeline_4ch_ulcnet.o $(ULCNET_4CH_OBJS) $(OBJ_DIR)/ulcnet_model_io.o $(PIPELINE_LIB) $(DOA_LIB) $(BF_LIB) $(SPATIAL_COMMON_LIB) $(AEC_LIB) $(NR_LIB) $(COMMON_LIB) $(LDLIBS)
+$(BIN_DIR)/test_4ch_ulcnet: $(OBJ_DIR)/test_4ch_ulcnet.o $(ULCNET_4CH_OBJS) $(OBJ_DIR)/ulcnet_model_io.o $(UNIT_LIBS) | _cfg_guard
+	$(LINK) -o $@ $(OBJ_DIR)/test_4ch_ulcnet.o $(ULCNET_4CH_OBJS) $(OBJ_DIR)/ulcnet_model_io.o $(UNIT_LIBS) $(LDLIBS)
 
 # The adapter drives the pre/post class, so the application links
 # ulcnet_prepost.o with it (the test above does not link the adapter).
@@ -483,23 +486,23 @@ ULCNET_ADAPTER_OBJS := $(OBJ_DIR)/ulcnet_accelerator_adapter.o \
                        $(OBJ_DIR)/ulcnet_prepost.o \
                        $(OBJ_DIR)/ulcnet_model_io.o
 
-$(BIN_DIR)/4ch_alignulcnet: $(OBJ_DIR)/4ch_alignulcnet_main.o $(OBJ_DIR)/mcab_sample_driver.o $(ULCNET_ADAPTER_OBJS) $(ULCNET_4CH_OBJS) $(PIPELINE_LIB) $(DOA_LIB) $(BF_LIB) $(SPATIAL_COMMON_LIB) $(AEC_LIB) $(NR_LIB) $(COMMON_LIB) | _cfg_guard
-	$(LINK) -o $@ $(OBJ_DIR)/4ch_alignulcnet_main.o $(OBJ_DIR)/mcab_sample_driver.o $(ULCNET_ADAPTER_OBJS) $(ULCNET_4CH_OBJS) $(PIPELINE_LIB) $(DOA_LIB) $(BF_LIB) $(SPATIAL_COMMON_LIB) $(AEC_LIB) $(NR_LIB) $(COMMON_LIB) $(LDLIBS)
+$(BIN_DIR)/4ch_alignulcnet: $(OBJ_DIR)/4ch_alignulcnet_main.o $(OBJ_DIR)/mcab_sample_driver.o $(ULCNET_ADAPTER_OBJS) $(ULCNET_4CH_OBJS) $(UNIT_LIBS) | _cfg_guard
+	$(LINK) -o $@ $(OBJ_DIR)/4ch_alignulcnet_main.o $(OBJ_DIR)/mcab_sample_driver.o $(ULCNET_ADAPTER_OBJS) $(ULCNET_4CH_OBJS) $(UNIT_LIBS) $(LDLIBS)
 
-# The 4-channel DFN2 application wraps the core alone (the beamformer (bf) seam stays
-# external, as in 4aec_nr_res_static), so it links the DFN archive and the
-# core archive, not the spatial libraries.
+# The 4-channel DFN2 example composes the core alone (the beamformer (bf) seam
+# stays external, as in 4aec_nr_res_static), so it links the DFN archive and the core archive,
+# not the spatial libraries.
 $(BIN_DIR)/4ch_aec_bf_dfn_res: $(OBJ_DIR)/4ch_aec_bf_dfn_res_main.o $(OBJ_DIR)/mcab_sample_driver.o $(DFN_PIPELINE_LIB) $(PIPELINE_LIB) $(AEC_LIB) $(NR_LIB) $(COMMON_LIB) | _cfg_guard
 	$(LINK) -o $@ $(OBJ_DIR)/4ch_aec_bf_dfn_res_main.o $(OBJ_DIR)/mcab_sample_driver.o $(DFN_PIPELINE_LIB) $(PIPELINE_LIB) $(AEC_LIB) $(NR_LIB) $(COMMON_LIB) $(LDLIBS)
 
 $(BIN_DIR)/4aec_nr_res_static: $(OBJ_DIR)/4aec_nr_res_static.o $(PIPELINE_LIB) $(AEC_LIB) $(NR_LIB) $(COMMON_LIB) | _cfg_guard
 	$(LINK) -o $@ $(OBJ_DIR)/4aec_nr_res_static.o $(PIPELINE_LIB) $(AEC_LIB) $(NR_LIB) $(COMMON_LIB) $(LDLIBS)
 
-$(BIN_DIR)/audio_pipeline_4ch_static: $(OBJ_DIR)/audio_pipeline_4ch_static.o $(OBJ_DIR)/audio_pipeline_4ch.o $(OBJ_DIR)/mcab_sample_driver.o $(PIPELINE_LIB) $(DOA_LIB) $(BF_LIB) $(SPATIAL_COMMON_LIB) $(AEC_LIB) $(NR_LIB) $(COMMON_LIB) | _cfg_guard
-	$(LINK) -o $@ $(OBJ_DIR)/audio_pipeline_4ch_static.o $(OBJ_DIR)/audio_pipeline_4ch.o $(OBJ_DIR)/mcab_sample_driver.o $(PIPELINE_LIB) $(DOA_LIB) $(BF_LIB) $(SPATIAL_COMMON_LIB) $(AEC_LIB) $(NR_LIB) $(COMMON_LIB) $(LDLIBS)
+$(BIN_DIR)/audio_pipeline_4ch_static: $(OBJ_DIR)/audio_pipeline_4ch_static.o $(OBJ_DIR)/mcab_sample_driver.o $(UNIT_LIBS) | _cfg_guard
+	$(LINK) -o $@ $(OBJ_DIR)/audio_pipeline_4ch_static.o $(OBJ_DIR)/mcab_sample_driver.o $(UNIT_LIBS) $(LDLIBS)
 
-$(BIN_DIR)/audio_pipeline_4ch_raw: $(OBJ_DIR)/audio_pipeline_4ch_raw.o $(OBJ_DIR)/audio_pipeline_4ch.o $(OBJ_DIR)/mcab_sample_driver.o $(PIPELINE_LIB) $(DOA_LIB) $(BF_LIB) $(SPATIAL_COMMON_LIB) $(AEC_LIB) $(NR_LIB) $(COMMON_LIB) | _cfg_guard
-	$(LINK) -o $@ $(OBJ_DIR)/audio_pipeline_4ch_raw.o $(OBJ_DIR)/audio_pipeline_4ch.o $(OBJ_DIR)/mcab_sample_driver.o $(PIPELINE_LIB) $(DOA_LIB) $(BF_LIB) $(SPATIAL_COMMON_LIB) $(AEC_LIB) $(NR_LIB) $(COMMON_LIB) $(LDLIBS)
+$(BIN_DIR)/audio_pipeline_4ch_raw: $(OBJ_DIR)/audio_pipeline_4ch_raw.o $(OBJ_DIR)/mcab_sample_driver.o $(UNIT_LIBS) | _cfg_guard
+	$(LINK) -o $@ $(OBJ_DIR)/audio_pipeline_4ch_raw.o $(OBJ_DIR)/mcab_sample_driver.o $(UNIT_LIBS) $(LDLIBS)
 endif
 
 ifeq ($(COMMON_LIB),)

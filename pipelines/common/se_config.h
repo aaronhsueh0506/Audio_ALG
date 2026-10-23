@@ -7,7 +7,6 @@
 #define PIPELINES_SE_CONFIG_H
 
 #include "aec.h"
-#include "anr_types.h"
 
 #ifdef __cplusplus
 extern "C" {
@@ -35,7 +34,6 @@ typedef struct SeRequest {
     int          delay_num_filters;
     int          fixed_delay_samples;
     AecPreset    aec_preset;
-    AnrMode      nr_mode;              /* checked only when SeRules.with_nr    */
 } SeRequest;
 
 /* What an application accepts and how its AEC stage is wired. */
@@ -46,7 +44,6 @@ typedef struct SeRules {
     int check_delay;       /* reject delay settings that contradict delay_mode          */
     int lane_aligned;      /* the AEC consumes an already aligned reference (EXTERNAL_ALIGNED) */
     int spatial_context;   /* AecConfig.spatial_linear_context, or SE_CONTEXT_PRESET    */
-    int with_nr;           /* validate nr_mode                                          */
 } SeRules;
 
 static inline int se_flag_valid(int v) { return v == 0 || v == 1; }

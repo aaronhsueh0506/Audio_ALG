@@ -1,9 +1,11 @@
-# 四麥克風完整 Spatial Pipeline 整合手冊（`audio_pipeline_4ch.h`）
+# 四麥克風線性 AEC + BF 單元整合手冊（`audio_pipeline_4ch.h`）
 
-適用對象：想要**一整條**四麥克風語音增強 pipeline（含 direction finding 與
-beamformer）的函式庫使用者。你只餵四路麥克風與一路 reference，拿回一路 mono。
+適用對象：想要四麥克風的**共用 delay 對齊 + 四條線性 AEC + SRP-PHAT direction finding + beamformer**
+這一個單元（`AudioPipeline4Ch`）的函式庫使用者。你餵四路麥克風與一路 reference，拿回 BF 後的誤差頻譜與
+權重；RES、NR、comfort noise、合成與神經網路後濾波**不在單元內**，是各自獨立的函式庫，
+由你初始化並串接（範例鏈見 `pipelines/samples/se_sample_chain.h`）。
 
-如果你**已經有**自己的 beamformer，只想要 AEC 前端 + NR/RES 後端，
+如果你**已經有**自己的 beamformer，只想要 AEC 前端，
 請改看 `docs/integration_4ch_core_zh_TW.md`。
 
 本文只講「什麼時候呼叫哪個 function」「每個參數怎麼設」。演算法內部推導不在本文範圍。
@@ -16,31 +18,40 @@ beamformer）的函式庫使用者。你只餵四路麥克風與一路 reference
 
 ---
 
-## 1. 這個函式庫是什麼、你連結什麼、你 `#include` 什麼
+## 1. 這個單元是什麼、你連結什麼、你 `#include` 什麼
 
 ### 1.1 這是什麼
 
 ```
 mic hop [hop][4] + ref hop [hop]
    │
-   ├─► 1 個共用 delay matcher → 4 條獨立 linear AEC
-   ├─► SRP-PHAT direction finding（DOA）
-   ├─► BF beamformer（產生這一幀的有效權重）
-   ├─► four_aec_fuse → 1 次 post-beam RES gain + 1 次 NR（wrapper 明寫串接）
-   └─► 1 次 iFFT / OLA
+   ├─► audio_pipeline_4ch_process_front()   1 個共用 delay matcher → 4 條獨立 linear AEC
+   │      （可選：由 front.linear_spectra 算 mask / VAD）
+   ├─► audio_pipeline_4ch_process_beam()    SRP-PHAT direction finding + BF beamformer
+   │      → AudioPipeline4ChBeam { spectrum（BF 後誤差頻譜）, weights（有效權重） } + frame telemetry
    │
+   ├─► audio_pipeline_4ch_fuse()            （可選，要 core.enable_post = 1）
+   │      以那組權重做 post-beam 同調投影 → SeSpecFrame（e, y, x, r2, cn, far_hop, …）
    ▼
- out hop [hop]（mono）+ 一份唯讀的 frame telemetry
+ 【你的後級】  se_res_stage_gain → se_anr_stage_gain → sk_min_f32 → apply → aec_cng_fill → ac_istft_push
+              （或 ULCNet／DFN2 的 NN stage）→ out hop [hop]（mono）
 ```
 
-這一層**擁有** SRP-PHAT 與 BF 的生命週期，並把它們接在前端的
-`four_aec_front_process()` 與 `four_aec_fuse()` 之間，再自己串接後級 stage（RES、NR、CNG、ISTFT）。對你而言只有**一個** process 呼叫。
+單元**擁有**共用 delay 對齊、四條線性 AEC、SRP-PHAT 與 BF 的生命週期。它**不擁有**也不初始化 RES（`AecRes`）、
+降噪器（`AnrDenoiser`）、comfort noise、合成（`AcIstft`）或任何 NN stage：每一個都是獨立的函式庫物件，
+有自己的 `mem_size` 與 `init`，初始化與串接是整合者的事。`pipelines/samples/se_sample_chain.h` 是把它們放進
+一塊 pool 的範例（header-only，沒有 ABI）。
 
-兩種入口：
+每 hop 的呼叫有三種形式：
 
-* `audio_pipeline_4ch_process()` —— 用內建的保守能量 VAD 當 fallback。
-* `audio_pipeline_4ch_process_with_activity()` —— 由**你的產品 VAD** 提供活動偵測。
+* `audio_pipeline_4ch_process_front()` → （可選：mask／VAD）→ `audio_pipeline_4ch_process_beam()`：
+  你的 VAD／mask 要由 lane 頻譜算出時用這一組。
+* `audio_pipeline_4ch_process_with_activity()` —— 兩段合一，由**你的產品 VAD** 提供活動偵測。
   **有自己 VAD 的產品整合請用這一個。**
+* `audio_pipeline_4ch_process()` —— 用內建的保守能量 VAD 當 fallback。
+
+`audio_pipeline_4ch_fuse()` 是獨立步驟，不在上述 per-hop 呼叫裡；只吃頻域 stage 的流程才需要，
+`core.enable_post = 0`（ULCNet 等直接吃 BF 頻譜的後濾波）時回 `INVALID_ARGUMENT`。
 
 ### 1.2 Header closure
 
@@ -48,17 +59,19 @@ mic hop [hop][4] + ref hop [hop]
 #include "audio_pipeline_4ch.h"
 ```
 
-一行就夠。它會拉進 `4aec_nr_res.h`，後者再拉進 `aec.h` / `anr.h` /
-`fft_wrapper.h`。你**不需要** include `bf.h`、`srp.h` 或任何 `audiolib` 的 header。
+一行就夠單元本身用。它會拉進 `4aec_nr_res.h`，後者再拉進 `aec.h` /
+`fft_wrapper.h` / `common/se_stage.h`（不含 NR 的 header）。你**不需要** include `bf.h`、`srp.h` 或任何 `audiolib` 的 header。
+要串範例鏈時另外 `#include "samples/se_sample_chain.h"`（它會拉進 `anr.h`）；NN stage 另 include `samples/ulcnet_nn_stage.h`
+或 `samples/dfn_hop.h`。
 
 ### 1.3 `Complex` type 從哪來
 
 `Complex` 定義在 `<audiolib>/common/include/fft_wrapper.h`，
 透過 `audio_pipeline_4ch.h` → `4aec_nr_res.h` → `aec.h` → `fft_wrapper.h` 傳遞進來。
 
-本層的公開 API **不需要**你直接使用 `Complex`：
-`audio_pipeline_4ch_process()` / `..._with_activity()` 的參數只有 `float*` 與 `int*`。
-權重完全由本層內部產生與消費。
+你會直接用到它：`AudioPipeline4ChBeam.spectrum` 與 `.weights` 是 `const Complex*`，
+`FourAecFront.linear_spectra[ch]` 也是。這些指標都借自單元，到下一次
+`process_front()`／`process_with_activity()`／`process()`／`reset()`／`destroy()` 之前有效。
 
 ### 1.4 編譯需要的 `-I` 清單（consumer 端最小集合）
 
@@ -71,6 +84,8 @@ mic hop [hop][4] + ref hop [hop]
 ```
 
 五個 include roots 涵蓋 `audio_pipeline_4ch.h` 與其 `common/se_stage.h` 相依。
+串範例鏈（`samples/se_sample_chain.h`）時另加 `-I <audiolib>/common`，讓 `utility/mem_align.h` 與
+`utility/simd_kernels.h` 找得到。
 `<audiolib>/doa`、`<audiolib>/bf`、`<audiolib>/common/utility` 這三個 `-I`
 是**建置這個 library 自己**才需要的，consumer 端不需要。
 
@@ -80,7 +95,6 @@ mic hop [hop][4] + ref hop [hop]
 
 ```
 你的 .o
-audio_pipeline_4ch.o          ← 見下方「不是 archive 成員」
 libaudio_pipeline_4ch.a
 libdoa.a
 libbf.a
@@ -91,19 +105,12 @@ libaudio_common.a
 -lm
 ```
 
-* **`audio_pipeline_4ch.o` 不是 archive 成員，必須自己編。**
-  `libaudio_pipeline_4ch.a` 的 `PIPELINE_OBJS` 只含 `4aec_nr_res.o`、`se_config.o`、`se_anr_stage.o`（見核心版
-  手冊 §1.5）——本手冊這層的公開 API(`audio_pipeline_4ch_*`)是從
-  `pipelines/4ch_aec_bf_nr_res/audio_pipeline_4ch.c` 編出來的獨立 object,不在
-  任何 archive 裡。只連七個 archive、漏了這個 object 會在 link 階段報
-  `audio_pipeline_4ch_default_config` 等符號 undefined(已實測重現此失敗、
-  補上該 object 後可正常連結執行)。頂層 Makefile 的每個消費者(`audio_pipeline_4ch_raw`
-  等)都是這樣連的:`$(OBJ_DIR)/audio_pipeline_4ch.o $(PIPELINE_LIB) ...`。
+* `libaudio_pipeline_4ch.a` 的 `PIPELINE_OBJS` 含 `4aec_nr_res.o`（核心）、`audio_pipeline_4ch.o`（本單元）與
+  `se_config.o`（見核心版手冊 §1.5）——本手冊這層的公開 API（`audio_pipeline_4ch_*`）就在 archive 裡，
+  不需要另外編 object。
 * 比核心版（另一份手冊）多了 `libdoa.a` / `libbf.a` / `libspatial_common.a` 三個
-  archive,以及上述那個額外的 object。這一層真的會參照它們，少連就是
-  undefined symbol。
-* 順序有意義：`audio_pipeline_4ch.o`、`libaudio_pipeline_4ch.a` 在前，三個
-  spatial archive 在中，AEC / NR / audiolib 在後。
+  archive。這一層真的會參照它們，少連就是 undefined symbol。
+* 順序有意義：`libaudio_pipeline_4ch.a` 在前，三個 spatial archive 在中，AEC / NR / audiolib 在後。
 * 所有 archive 路徑都是 config-keyed 的（`bin/<backend>-<hash>/`）。
   用各 Makefile 的 `make -s print-lib-path` 取得，不要硬寫。
 * `BACKEND=ne10` 時最終 link 要用 C++ driver（`c++`）。
@@ -111,16 +118,20 @@ libaudio_common.a
   這一層的 `build_flags_hash` 有把核心層的 hash 摺進去，所以核心層版本一變動，
   這一層所有已保存的 descriptor 也會一併失效 —— 不會發生「用舊核心佈局的 pool
   還剛好塞得下」這種事。
+* 範例鏈、`ulcnet_nn_stage.c` 等範例碼不在任何 archive 裡：header-only 的直接 include，
+  `ulcnet_nn_stage.c` 由你的專案自己編（`4ch_aec_bf_nr_res/Makefile` 的 `ulcnet_nn_stage.o` 規則是範例）。
 
 ---
 
 ## 2. Quick start
 
-完整、可編譯、已實際跑過的最小整合（heap 路徑）：
+完整、可編譯、已實際跑過的最小整合（單元 heap 路徑，後級用範例鏈）：
 
 ```c
 #include <stdio.h>
+#include <stdlib.h>
 #include "audio_pipeline_4ch.h"
+#include "samples/se_sample_chain.h"
 
 int main(void) {
     AudioPipeline4ChConfig cfg = audio_pipeline_4ch_default_config(16000);
@@ -130,9 +141,17 @@ int main(void) {
     AudioPipeline4Ch* p = audio_pipeline_4ch_create(&cfg);   /* heap path */
     if (!p) { fprintf(stderr, "create failed\n"); return 1; }
 
+    /* RES, NR, comfort noise and synthesis are separate libraries; the example chain holds
+     * them in one block with its own size query. */
     const int hop = audio_pipeline_4ch_hop_size(p);
-    float mics[4 * 1024], ref[1024], out[1024];
+    SeSampleChainConfig sc = se_sample_chain_default_config(16000, audio_pipeline_4ch_fft_size(p));
+    size_t chain_bytes = se_sample_chain_mem_size(&sc);      /* 0 = invalid */
+    void* chain_pool;
+    if (chain_bytes == 0 || posix_memalign(&chain_pool, 16, chain_bytes) != 0) return 1;
+    SeSampleChain* chain = se_sample_chain_init(chain_pool, chain_bytes, &sc);
+    if (!chain) return 1;
 
+    float mics[4 * 1024], ref[1024], out[1024];
     for (int frame = 0; frame < 100; frame++) {
         for (int i = 0; i < hop; i++) {                    /* 換成你自己的擷取來源 */
             for (int ch = 0; ch < FOUR_AEC_NR_RES_CHANNELS; ch++)
@@ -140,16 +159,31 @@ int main(void) {
             ref[i] = 0.02f * (float)((i % 37) - 18);
         }
 
+        AudioPipeline4ChBeam beam;
         AudioPipeline4ChFrameInfo info;
-        int status = audio_pipeline_4ch_process(p, mics, ref, out, &info);
-        if (status != FOUR_AEC_NR_RES_OK) { fprintf(stderr, "status=%d\n", status); break; }
+        SeSpecFrame f;
+        const Complex* post;
+        int status = audio_pipeline_4ch_process(p, mics, ref, &beam, &info);   /* lanes + DOA + BF */
+        if (status == FOUR_AEC_NR_RES_OK)
+            status = audio_pipeline_4ch_fuse(p, &f);                          /* SeSpecFrame */
+        if (status != FOUR_AEC_NR_RES_OK ||
+            !(post = se_sample_chain_form(chain, &f)) ||                      /* RES, NR, min, CNG */
+            se_sample_chain_synthesize(chain, post, out) != 0 ||
+            !se_hop_is_finite(out, hop)) {
+            fprintf(stderr, "status=%d\n", status);
+            audio_pipeline_4ch_reset(p);                   /* a refused call: reset both */
+            se_sample_chain_reset(chain);
+            continue;
+        }
         /* 消費 out：hop 個 float，已增強的 mono 音訊；
-         * info.doa_used_rad / info.vad_out / info.delay 是唯讀 telemetry。 */
+         * info.doa_used_rad / info.vad_out / info.delay 與 beam.spectrum 是唯讀 telemetry。 */
     }
 
     printf("ok hop=%d effective_adapt_interval=%d lambda=%.9f\n", hop,
            audio_pipeline_4ch_bf_effective_adapt_interval(p),
            (double)audio_pipeline_4ch_bf_lambda(p));
+    se_sample_chain_destroy(chain);
+    free(chain_pool);
     audio_pipeline_4ch_destroy(p);
     return 0;
 }
@@ -163,8 +197,9 @@ cc -std=gnu99 -O2 -Wall -Wextra -c app.c -o app.o \
   -I pipelines \
   -I lib/aec/c_impl/include \
   -I lib/nr/c_impl/include \
-  -I <audiolib>/common/include
-c++ -o app app.o <4ch-obj>/audio_pipeline_4ch.o \
+  -I <audiolib>/common/include \
+  -I <audiolib>/common
+c++ -o app app.o \
   <4ch-bin>/libaudio_pipeline_4ch.a \
   <spatial-bin>/libdoa.a <spatial-bin>/libbf.a <spatial-bin>/libspatial_common.a \
   <aec-bin>/libaec.a \
@@ -172,6 +207,9 @@ c++ -o app app.o <4ch-obj>/audio_pipeline_4ch.o \
   <audiolib-bin>/libaudio_common.a \
   -lm
 ```
+
+要接 ULCNet 後濾波時，不呼叫 `fuse()`、`core.enable_post = 0`，把 `beam.spectrum`、同一次呼叫的**原始** far hop 與
+`info.delay.changed`／`info.delay.solid` 交給 `ulcnet_nn_stage_begin_complex()`（見 `pipelines/4ch_alignulcnet/README.md`）。
 
 ---
 
@@ -182,8 +220,10 @@ c++ -o app app.o <4ch-obj>/audio_pipeline_4ch.o \
 | 1 | query | `audio_pipeline_4ch_get_mem_requirements(&cfg, &req)` | **每次 init 之前**都要重查，不可跨 build / backend / config 快取 | 回傳 `-1`：`out` 為 NULL；`cfg` 未通過本層驗證（§4.2）或核心層驗證（§4.1）；SRP 或 BF 回報 size 0；此 TU 編譯時沒帶 `-DAUDIO_PIPELINE_BACKEND_STR="ne10"` |
 | 2 | allocate | 你自己的配置器，取得 `req.bytes` 且對齊 `req.alignment`（16）的記憶體 | 拿到 `req` 之後 | pool **不需要**預先清零（poison pattern 可接受）。`init_ex()` 自己會把整塊 memset 成 0 |
 | 3 | init | `audio_pipeline_4ch_init_ex(pool, req.bytes, &cfg, &req)` | 拿到 pool 之後，處理第一個 hop 之前 | 回傳 `NULL`：8 項 descriptor 檢查任一不符；pool 未 16-byte 對齊；pool 太小；config 無效；core / SRP / BF 任一 init 失敗。**沒有任何診斷輸出**（見 §5.4） |
-| 4 | process | `audio_pipeline_4ch_process()` 或 `audio_pipeline_4ch_process_with_activity()` | 每收到一個 hop 呼叫一次 | `-1` / `-2` / `-3`，見 §5.2 |
-| 5 | reset | `audio_pipeline_4ch_reset(p)` | 換回聲路徑、換場景、切換到不相關的另一條串流時 | 不會失敗。`p == NULL` 或已 destroy 時是 no-op |
+| 4a | process | `audio_pipeline_4ch_process_front()` → `audio_pipeline_4ch_process_beam()`；或 `process_with_activity()`；或 `process()` | 每收到一個 hop 呼叫一次 | `-1` / `-2` / `-3`，見 §5.2 |
+| 4b | fuse（可選） | `audio_pipeline_4ch_fuse(p, &frame)` | 同一 hop 的 beam 之後、下一次 `process_front()` 之前 | `-1` / `-2` / `-3`，見 §5.2 |
+| 4c | 你的後級 | `se_sample_chain_form()` … `se_sample_chain_synthesize()`，或 NN stage | fuse（或 beam）之後 | 由你負責；任何一步被拒，你必須把單元與你的後級**一起** reset（§3.1） |
+| 5 | reset | `audio_pipeline_4ch_reset(p)`，加上你的後級的 reset | 換回聲路徑、換場景、切換到不相關的另一條串流時 | 不會失敗。`p == NULL` 或已 destroy 時是 no-op |
 | 6 | destroy | `audio_pipeline_4ch_destroy(p)` | 不再處理任何 hop 之後、釋放 pool 之前 | 不會失敗。NULL 安全。pool instance 冪等；`create()` instance 只能呼叫一次 |
 | 7 | release | 你自己的釋放器 | **一定要在第 6 步之後** | 順序顛倒 = use-after-free |
 
@@ -192,16 +232,24 @@ heap 便利路徑：`audio_pipeline_4ch_create(&cfg)` 把第 1~3 步合成一步
 `audio_pipeline_4ch_init(pool, bytes, &cfg)` 等同
 `audio_pipeline_4ch_init_ex(pool, bytes, &cfg, NULL)` —— 不做 descriptor 檢查。
 
-### 3.1 `reset()` 到底重置了什麼
+### 3.1 `reset()` 到底重置了什麼，以及失敗時整合者要做什麼
 
-* 前端（delay matcher、四路 AEC、front 有效旗標）與本層擁有的後級（NR、post-beam RES、OLA、CNG rng）
+單元的 `reset()` 重置：
+
+* 前端（delay matcher、四路 AEC、front 有效旗標）
 * SRP-PHAT 狀態
 * BF 狀態
 * 本層的內建 VAD 狀態（`noise_power` 回到門檻值、hangover 歸零）
-* `frame_index` 歸零
+* `frame_index` 與 per-hop phase 歸零
 
-**不會**重新驗證 config，也**不會**重新計算 §4.6 那三個「生效值」——
-那三個是在 init 時算好的，`reset()` 不動它們。
+它**不會**重置你的後級（RES、NR、CNG rng、合成、NN stage），也**不會**重新驗證 config，
+更不會重新計算 §4.6 那三個「生效值」——那三個是在 init 時算好的，`reset()` 不動它們。
+
+**失敗語意是整合者的責任。** 單元的任何一個呼叫回非 `OK`，或你的 `se_sample_chain_form()` 回 `NULL`，
+或合成輸出不是有限值，你要**同時**呼叫 `audio_pipeline_4ch_reset()`、`se_sample_chain_reset()`
+（它也把 comfort-noise RNG 設回 `SE_CNG_RNG_SEED`），以及用到 NN stage 時的 `ulcnet_nn_stage_reset()`。
+漏掉其中一個，系統就不等於新建的實例。DFN2 的 stage 不因為 AEC 的 delay change 而 reset（見
+`pipelines/dfn_res_stage.h`）。
 
 ### 3.2 執行期唯讀存取
 
@@ -217,7 +265,7 @@ heap 便利路徑：`audio_pipeline_4ch_create(&cfg)` 把第 1~3 步合成一步
 | `audio_pipeline_4ch_doa_sample_rate/frame_size/hop_size/fft_size(p)` | DOA 階段的格點 |
 | `audio_pipeline_4ch_bf_sample_rate/frame_size/hop_size/fft_size(p)` | BF 階段的格點 |
 
-AEC、DOA、BF、NR、RES 全部**共用同一組格點**，`frame == fft_size`、`hop == fft_size / 2`。
+AEC、DOA、BF，以及你串的 NR／RES，全部**共用同一組格點**，`frame == fft_size`、`hop == fft_size / 2`。
 你不能分別指定互相矛盾的 frame / hop / FFT。上面三組 accessor 之所以分開，
 是讓整合測試能證明三者確實一致（實測 16 kHz 預設下三組皆為 hop 128 / fft 256 / n_freqs 129）。
 
@@ -227,11 +275,16 @@ AEC、DOA、BF、NR、RES 全部**共用同一組格點**，`frame == fft_size`�
 |---|---|
 | `audio_pipeline_4ch_matched_filter_count(p)` | `1` |
 | `audio_pipeline_4ch_linear_aec_count(p)` | `4` |
-| `audio_pipeline_4ch_nr_count(p)` | `1` |
-| `audio_pipeline_4ch_post_res_count(p)` | `1` |
+
+單元只有線性 AEC 與 SRP/BF，所以只有上面兩個結構稽核計數；後級 stage 是否存在由你的鏈設定決定。
 
 生效值 accessor（見 §4.6）：`audio_pipeline_4ch_bf_effective_adapt_interval(p)`、
 `audio_pipeline_4ch_bf_lambda(p)`。
+
+診斷：`audio_pipeline_4ch_get_core(p)`（唯讀的 `const FourAecNrRes*`，給核心層的稽核 accessor 與
+`four_aec_nr_res_get_last_timing()` 用；不要拿它去呼叫會改狀態的函式）與
+`audio_pipeline_4ch_last_core_timing(p, &t)`（核心最近一個 hop 的各階段耗時，`FourAecNrResLastTiming`；
+`p` 為 NULL 時把 `t` 清零，`t` 不得為 NULL）。
 
 建置資訊：`audio_pipeline_4ch_spatial_backend()` —— **不吃 handle**，回傳一個
 `const char*`（永不為 NULL），表示 spatial kernel 實際編進去的是哪一種實作
@@ -239,37 +292,31 @@ AEC、DOA、BF、NR、RES 全部**共用同一組格點**，`frame == fft_size`�
 
 ### 3.3 執行期強度控制
 
-```c
-int audio_pipeline_4ch_set_aec_preset(AudioPipeline4Ch* p, AecPreset preset, float ramp_ms);
-int audio_pipeline_4ch_set_nr_mode(AudioPipeline4Ch* p, AnrMode mode);
-```
-
-兩者都直接作用在本層自己 carve 的 `AecRes` 與 `AnrDenoiser` 上（`p`／已 destroy 或對應實例不存在時回 `-1`）。
-唯讀的 `audio_pipeline_4ch_post_split_floor(p, &live, &target)` 回報抑制器的當下值與撐得過 reset 的目標值。
-完整契約見核心手冊
-[`integration_4ch_core_zh_TW.md` §3.2](integration_4ch_core_zh_TW.md)，這裡只重述
-整合時最容易踩到的一點：
-
-> **不要自己對四條 lane 迴圈呼叫 `aec_set_preset()`。** 四條 lane 都以
-> `spatial_linear_context` 建立，永遠不會走到自己的 suppression-gain 路徑，
-> 它們的地板什麼都不塑形。真正乘上本 pipeline 輸出的 gain 來自本層**唯一一個**
-> 共用的 post 級抑制器；同樣地，NR 也只有一個共用實例，不是每條 lane 一個。
-> 上面兩個 setter 針對的就是那兩個共用實例——這就是它們存在的理由。
+單元**沒有**強度 setter：四條 lane 只算線性殘留，RES 與 NR 不在裡面。強度屬於你串的後級，
+直接對後級物件呼叫（完整契約見核心手冊
+[`integration_4ch_core_zh_TW.md` §3.2](integration_4ch_core_zh_TW.md)）：
 
 ```c
-if (audio_pipeline_4ch_set_aec_preset(p, AEC_PRESET_AGGRESSIVE, 100.0f) != 0) { /* 引數不合法 */ }
-if (audio_pipeline_4ch_set_nr_mode(p, ANR_MODE_MILD) != 0)                  { /* 同上 */ }
-
-float live, target;                                        /* 線性功率 */
-if (audio_pipeline_4ch_post_split_floor(p, &live, &target) == 0 && live == target) {
+aec_res_set_preset(se_sample_chain_res(chain), AEC_PRESET_AGGRESSIVE, 100.0f);   /* 回 0 成功 */
+anr_set_mode(se_sample_chain_nr(chain), ANR_MODE_MILD);                         /* 函式庫的 setter */
+float live, target;                                                              /* 線性功率 */
+if (aec_res_split_floor(se_sample_chain_res(chain), &live, &target) == 0 && live == target) {
     /* ramp 已經走完 */
 }
 ```
 
+這裡只重述整合時最容易踩到的一點：
+
+> **不要自己對四條 lane 迴圈呼叫 `aec_set_preset()`。** 四條 lane 都以
+> `spatial_linear_context` 建立，永遠不會走到自己的 suppression-gain 路徑，
+> 它們的地板什麼都不塑形。真正乘上輸出的 gain 來自你的鏈**唯一一個**
+> 後級 `AecRes`；同樣地，NR 也只有一個共用實例，不是每條 lane 一個。
+> 上面兩個 setter 針對的就是那兩個共用實例。
+
 `ramp_ms == 0` 代表下一個 hop 就套用（**不是錯誤**），`> 0` 則以 dB 為單位線性走
 過去，上限 60 秒。兩個 setter 都不是重啟：AEC、SRP、BF、NR 的狀態全部繼續跑；
-preset 的改動撐得過 `audio_pipeline_4ch_reset()`，ramp 進度不會。**在兩個 hop 之間
-呼叫、與 `process()` 序列化；非 thread-safe。**
+preset 的改動撐得過該 stage 的 reset，ramp 進度不會。**在兩個 hop 之間
+呼叫、與 process 序列化；非 thread-safe。**
 
 A/B 量測時：far-active 地板只在 **far-active 且非 double-talk** 的 hop 上生效
 （DT 地板三個 preset 完全相同，latch 觸發前用的是 far-silent 地板），而同一個 gain
@@ -280,8 +327,8 @@ A/B 量測時：far-active 地板只在 **far-active 且非 double-talk** 的 ho
 
 ## 4. Config 完整參考
 
-`AudioPipeline4ChConfig` = 巢狀的 `FourAecNrResConfig core`（18 個欄位）
-+ 本層自己的 23 個欄位。取得預設值的唯一正確方式：
+`AudioPipeline4ChConfig` = 巢狀的 `FourAecNrResConfig core`（12 個欄位）
++ 本層自己的 23 個欄位。RES、NR、comfort noise 與 preset 的設定**不在**這裡（它們屬於你的後級鏈）。取得預設值的唯一正確方式：
 
 ```c
 AudioPipeline4ChConfig cfg = audio_pipeline_4ch_default_config(16000);
@@ -290,7 +337,7 @@ AudioPipeline4ChConfig cfg = audio_pipeline_4ch_default_config(16000);
 
 `audio_pipeline_4ch_default_config()` **不做驗證**，只是填值。
 
-### 4.1 `cfg.core`（核心層 9 欄）
+### 4.1 `cfg.core`（核心層欄位）
 
 本層會把 `cfg.core` 原封不動交給核心層驗證與建構，規則完全一樣：
 
@@ -303,12 +350,11 @@ AudioPipeline4ChConfig cfg = audio_pipeline_4ch_default_config(16000);
 | `core.delay_backward_quarantine_enabled` | `int`（bool） | `0` | `0` 或 `1` | 預設關閉。開啟後只隔離**一種**共用估計：比現行 accepted delay **更早**（backward／pre-echo 方向）、且 **`capture_proxy_channel` 那一條 lane**（不是任一條——那正是餵給共用 estimator 的那支 mic，也是唯一能對這個估計提供證據的 lane）在目前對齊上仍明顯在消除回音（`aec_linear_is_cancelling()`）。**往後跳（delay 變大）永不隔離**，**首次取得對齊不受影響**。隔離**有上限**（見下一列），到期就採用；消除能力崩掉時則立即採用，但這是 hard replacement 常見而非所有真實路徑變化必然具備的現象。**它不是 pre-echo 誤鎖的解藥**：那個誤鎖已在估計器端根治（aggregator 改為回報 dominant peak，見 `AEC/docs/aec_methods.md`），這個機制擋的是真實路徑往前移動時的候選變動，仍然只是延後一個窗。`FIXED` / `EXTERNAL_ALIGNED` 不重新決定對齊，此旗標對它們無作用 |
 | `core.delay_backward_quarantine_s` | `float` | `1.0` | 有限值，`[0.0, 3600.0]` | 上一列的隔離窗長（秒），在 `init` 時按解析後的 hop／取樣率換算成 hop 數（最小 1；要關閉請用上一列的 enable）。enable 為 0 時無作用，但仍會被驗證——設定檔今天就要是「翻一個旗標也不會壞」的狀態。實測（multipath 場景，舊路徑不消失所以消除能力不崩、只有到期能釋放）：窗 1.0 s = 62 hops，採用點精確等於「未隔離 hop ＋ 窗長」。 |
 | `core.max_delay_ms` | `float` | `1024.0f` | 有限值，`[0.0, 4096.0]` | 設成略大於系統真實最大 mic↔ref 延遲。設太大只是白吃記憶體 |
-| `core.aec_preset` | `AecPreset` | `AEC_PRESET_BALANCED` | `MILD` / `BALANCED` / `AGGRESSIVE`，列舉以外拒絕 | — |
-| `core.nr_mode` | `AnrMode` | `ANR_MODE_BALANCED` | `MILD` / `MODERATE` / `BALANCED` / `AGGRESSIVE`，列舉以外拒絕 | — |
-| `core.enable_nr` | `int`（bool） | `1` | `0` 或 `1` | `0` = post 級跳過 MMSE-LSA，只留 RES／CNG／iFFT／WOLA |
-| `core.enable_res` | `int`（bool） | `1` | `0` 或 `1` | `0` = 不建 post-beam RES，只留 NR／iFFT／WOLA（CNG 略過）；與 `enable_nr` 都 `0` 即 beamform 後線性誤差直通 |
-| `core.enable_cng` | `int`（bool） | `1` | `0` 或 `1` | — |
-| `core.legacy_amin` | `int`（bool） | `0` | `0` 或 `1` | 新整合保持 `0` |
+| `core.enable_post` | `int`（bool） | `1` | `0` 或 `1` | `1` = lane 保留 post context，`audio_pipeline_4ch_fuse()` 可用；`0` = 只留線性 context（`AEC_CONTEXT_LINEAR_ONLY`），`fuse()` 回 `INVALID_ARGUMENT`，給直接吃 BF 頻譜的 ULCNet。單元的驗證**不再**要求它為 1 |
+
+另外還有 `core.delay_mode`、`core.delay_num_filters`、`core.fixed_delay_samples`、`core.delay_est_period_s`
+（語意見核心手冊 §4.1）。`aec_preset`、`nr_mode`、`enable_res`、`enable_nr`、`enable_cng`、`legacy_amin`
+這六個舊欄位已移除：lane 一律以 `AEC_PRESET_BALANCED` 導出並只算線性殘留。
 
 > Quarantine 窗只對「連續符合條件的 backward episode」有界。候選轉為
 > forward／無效、confidence 中斷，或 proxy lane 的 cancellation 證據消失時
@@ -479,15 +525,16 @@ effective_frames = ceil( auto_vad_hangover_frames * sample_rate / (100 * hop_siz
 | 其他 DOA / BF / VAD 欄位 | 不變 |
 | `geometry` 與座標 | 不變 |
 
-ne10、`SIMD=1`、`delay_mode=MATCHED` 預設的 `req.bytes`
-（`layout_version=17`；請以 `--print-mem-size` 重查；最後一欄標明每一列的來源）：
+ne10、`SIMD=1`、`delay_mode=MATCHED` 預設的單元 `req.bytes`
+（`layout_version=18`；請以 `--print-mem-size` 重查；最後一欄標明每一列的來源）。單元**不含**後級；
+範例鏈（`se_sample_chain_mem_size()`，RES + NR + CNG + 合成，預設設定）另計，加起來是 static smoke 的 `Total:`：
 
-| Config | `req.bytes` | 來源 |
-|---|---:|---|
-| 16000，全預設（256/128，`num_angles=72`） | 1,962,960 | 實測 |
-| 16000，`core.fft_size = 512` | 3,288,176 | 實測 |
-| 16000，`num_angles = 360` | 4,965,072 | 實測（直接呼叫 `get_mem_requirements()`）|
-| 48000，全預設（1024/512，`num_angles=72`） | 6,986,976 | 實測 |
+| Config | 單元 `req.bytes` | 範例鏈 | 合計 | 來源 |
+|---|---:|---:|---:|---|
+| 16000，全預設（256/128，`num_angles=72`） | 1,832,176 | 67,344 | 1,899,520 | 實測 |
+| 16000，`core.fft_size = 512` | 3,127,856 | 97,632 | 3,225,488 | 實測 |
+| 16000，`num_angles = 360` | 4,834,288 | 67,344 | 4,901,632 | 實測（直接呼叫 `get_mem_requirements()`）|
+| 48000，全預設（1024/512，`num_angles=72`） | 6,570,960 | 227,248 | 6,798,208 | 實測 |
 
 ⚠ 覆蓋差異：只有 `num_angles = 72` 的 16 kHz/256 與 48 kHz/1024 兩組會被
 C 關卡自動驗證（static smoke 各印一次 `Total:` bytes）。`core.fft_size = 512`
@@ -495,11 +542,11 @@ C 關卡自動驗證（static smoke 各印一次 `Total:` bytes）。`core.fft_s
 config 上呼叫 `audio_pipeline_4ch_get_mem_requirements()`，所以它們不會隨程式
 改動自動失效——引用前請自己現查一次。
 
-`num_angles` 從 72 調到 360，記憶體約從 1.93 MB 變成約 4.93 MB（量級可信，
+`num_angles` 從 72 調到 360，單元的記憶體約從 1.83 MB 變成約 4.83 MB（量級可信，
 精確值見上）。**先確認你的角度解析度真的需要那麼細，再調這個值。**
 
 換 backend、換編譯選項、更新 submodule 都會讓上表失效。
-**實際配置一律以 `audio_pipeline_4ch_get_mem_requirements()` 現查的 `req.bytes` 為準。**
+**實際配置一律以 `audio_pipeline_4ch_get_mem_requirements()` 現查的 `req.bytes`，加上你各後級 stage 自己查的大小為準。**
 
 ---
 
@@ -517,15 +564,20 @@ config 上呼叫 `audio_pipeline_4ch_get_mem_requirements()`，所以它們不�
 | `audio_pipeline_4ch_init()` | 非 NULL handle | `NULL` | 等同 `init_ex(..., NULL)` |
 | `audio_pipeline_4ch_init_ex()` | 非 NULL handle | `NULL` | 8 項 descriptor 檢查任一不符即 NULL |
 | `audio_pipeline_4ch_create()` | 非 NULL handle | `NULL` | config 無效或配置失敗 |
-| `audio_pipeline_4ch_process()` | `0` | `-1` / `-2` / `-3` | 見 §5.2 |
+| `audio_pipeline_4ch_process_front()` | `0`，`*out` 為借用的前端視圖 | `-1` / `-3` | 見 §5.2 |
+| `audio_pipeline_4ch_process_beam()` | `0`，填 `*beam` 與（非 NULL 時）`*info` | `-1` / `-2` | 見 §5.2 |
 | `audio_pipeline_4ch_process_with_activity()` | `0` | `-1` / `-2` / `-3` | 見 §5.2 |
+| `audio_pipeline_4ch_process()` | `0` | `-1` / `-2` / `-3` | 見 §5.2 |
+| `audio_pipeline_4ch_fuse()` | `0`，填 `*frame` | `-1` / `-2` / `-3` | 見 §5.2；失敗時整個單元已 reset |
+| `audio_pipeline_4ch_get_core()` | 非 NULL（唯讀） | `NULL`（`p == NULL` 或已 destroy） | 診斷用 |
+| `audio_pipeline_4ch_last_core_timing()` | `void`，`*out` 填妥 | 不會失敗 | `p` 為 NULL 或已 destroy 時把 `*out` 清零 |
 | `audio_pipeline_4ch_reset()` | `void` | 不會失敗 | `p == NULL` 或已 destroy → 靜默 no-op |
 | `audio_pipeline_4ch_destroy()` | `void` | 不會失敗 | 見 §5.5 |
 | `*_hop_size` / `*_frame_size` / `*_fft_size` / `*_n_freqs` / `*_sample_rate` | 正值 | `-1` | `p == NULL` 或已 destroy |
 | `*_doa_*` / `*_bf_sample_rate` / `*_bf_frame_size` / `*_bf_hop_size` / `*_bf_fft_size` | 正值 | `-1` | 同上 |
 | `audio_pipeline_4ch_bf_effective_adapt_interval()` | `>= 1` | `-1` | `p == NULL`、已 destroy，或 BF 不存在 |
 | **`audio_pipeline_4ch_bf_lambda()`** | 有限的 `float` | **`NaN`** | `p == NULL`、已 destroy，或 BF 不存在。**這是本 API 面上唯一用 NaN 表示錯誤的 function** —— 要用 `isnan()` 判斷，不能用 `== -1` 之類 |
-| `*_matched_filter_count` / `*_linear_aec_count` / `*_nr_count` / `*_post_res_count` | `1` / `4` / `1` / `1` | `0` | `p == NULL` |
+| `*_matched_filter_count` / `*_linear_aec_count` | `1` / `4` | `0` | `p == NULL` |
 | `audio_pipeline_4ch_spatial_backend()` | `const char*`，永不為 NULL | 不會失敗 | 不吃 handle |
 
 > **注意慣例不一致**：`get_mem_requirements()` 用 **0 = 成功 / −1 = 失敗**；
@@ -534,22 +586,32 @@ config 上呼叫 `audio_pipeline_4ch_get_mem_requirements()`，所以它們不�
 > 是**回傳 0 代表失敗**。形狀 accessor 用 `-1`、結構稽核 accessor 用 `0`、
 > 而 `bf_lambda()` 用 `NaN`。三種都不一樣，寫錯誤處理時請逐一對照本表。
 
-### 5.2 兩個 process 入口的完整拒絕清單
+### 5.2 process 各入口與 fuse 的完整拒絕清單
 
-`audio_pipeline_4ch_process_with_activity()`（依實際檢查順序）：
-
-| # | 條件 | 回傳 | 副作用 |
-|---|---|---|---|
-| 1 | `p` 為 NULL、`p` 已 destroy、`microphones_interleaved` / `far_reference` / `output` 任一為 NULL、`vad_raw` 或 `vad_out` 不是 0 或 1 | `INVALID_ARGUMENT`(-1) | 無 |
-| 2 | 前端 `four_aec_front_process()` 失敗（含 mic/ref 含非有限值 → `-1`） | 原樣傳回核心層的碼 | `-3` 時核心層已自動 reset |
-| 3 | 核心層回報的形狀與本層記錄的不一致 | `DSP_ERROR`(-3) | **整條 pipeline 已被自動 reset** |
-| 4 | 前端 `four_aec_fuse()` 失敗 | 原樣傳回核心層的碼 | **整條 pipeline 已被自動 reset** |
-
-`audio_pipeline_4ch_process()` 在上述之前，額外先做兩件事：
+`audio_pipeline_4ch_process_front()`（依實際檢查順序）：
 
 | # | 條件 | 回傳 | 副作用 |
 |---|---|---|---|
-| 0a | `p` 為 NULL、`p` 已 destroy、三個 buffer 任一為 NULL | `INVALID_ARGUMENT`(-1) | 無，**內建 VAD 狀態不受影響** |
+| 1 | `p` 為 NULL、`p` 已 destroy、`microphones_interleaved` / `far_reference` / `out` 任一為 NULL | `INVALID_ARGUMENT`(-1) | 無 |
+| 2 | 前端 `four_aec_front_process()` 失敗（含 mic/ref 含非有限值 → `-1`） | 原樣傳回核心層的碼 | 不留待處理的 front／beam（之後的 `process_beam()`／`fuse()` 回 `SEQUENCE_ERROR`、不動狀態）；`-1` 時自適應狀態不變，`-3` 時核心層已自動 reset |
+| 3 | 核心層回報的形狀與本層記錄的不一致 | `DSP_ERROR`(-3) | **整個單元已被自動 reset** |
+
+隨時都可以作為一個 hop 的第一個呼叫；它會取代尚未完成的前一個 front。
+
+`audio_pipeline_4ch_process_beam()`（依實際檢查順序）：
+
+| # | 條件 | 回傳 | 副作用 |
+|---|---|---|---|
+| 1 | `p` 為 NULL、已 destroy、`front` 或 `beam` 為 NULL、`vad_raw` 或 `vad_out` 不是 0 或 1、`front->n_freqs` 與單元不同、`front->linear_spectra[ch]` 有 NULL | `INVALID_ARGUMENT`(-1) | 無 |
+| 2 | 沒有待處理的 front，或這一 hop 的 beam 已經跑過 | `SEQUENCE_ERROR`(-2) | 無 |
+
+`audio_pipeline_4ch_process_with_activity()` = `process_front()` 加 `process_beam()`：先檢查 `p`／三個 buffer／`beam` 非 NULL、
+`vad_raw`／`vad_out` 為 0 或 1（`-1`，無副作用），再依序得到上面兩張表的結果。
+`audio_pipeline_4ch_process()` 在這之前額外先做兩件事：
+
+| # | 條件 | 回傳 | 副作用 |
+|---|---|---|---|
+| 0a | `p` 為 NULL、`p` 已 destroy、`microphones_interleaved` / `far_reference` / `beam` 任一為 NULL | `INVALID_ARGUMENT`(-1) | 無，**內建 VAD 狀態不受影響** |
 | 0b | `far_reference`（`hop` 個）含非有限值 | `INVALID_ARGUMENT`(-1) | 無，**內建 VAD 狀態不受影響** |
 
 （0b 之所以存在：內建 VAD 只看麥克風資料，不看 reference。若不在這裡先擋，
@@ -558,9 +620,17 @@ config 上呼叫 `audio_pipeline_4ch_get_mem_requirements()`，所以它們不�
 內建 VAD 遇到非有限的**麥克風**資料時也不會動任何 VAD 狀態；
 那一幀會在核心層被 `-1` 拒絕。
 
-`info` 參數可以是 `NULL`（實測不影響回傳值）。
+`info` 參數可以是 `NULL`（不影響回傳值）。**所有入口都不會檢查 buffer 長度** —— `hop * 4` 與 `hop` 是你的責任。
 
-**兩個入口都不會檢查 buffer 長度** —— `hop * 4` 與 `hop` 是你的責任。
+`audio_pipeline_4ch_fuse()`（依實際檢查順序）：
+
+| # | 條件 | 回傳 | 副作用 |
+|---|---|---|---|
+| 1 | `p` 為 NULL、已 destroy、`frame` 為 NULL，或 `core.enable_post == 0` | `INVALID_ARGUMENT`(-1) | 無 |
+| 2 | 這一 hop 沒有 beam（沒跑過 `process_beam()`/`process_with_activity()`/`process()`） | `SEQUENCE_ERROR`(-2) | 無 |
+| 3 | 核心層 `four_aec_fuse()` 失敗（權重／頻譜非有限、lane 的 far 頻譜不一致等；`SEQUENCE_ERROR` 除外，它照 #2 處理） | 原樣傳回核心層的碼 | **整個單元（核心、SRP、BF）已被自動 reset**；你的後級也要跟著 reset |
+
+`frame` 的指標借自核心，到下一次 `process_front()`／`reset()` 為止有效。
 
 ### 5.3 `process_with_activity()` 的三個活動參數
 
@@ -620,8 +690,9 @@ destroy 之後不要再呼叫任何 accessor。
 
 | Source | 產出 | 說明 |
 |---|---|---|
-| `pipelines/4ch_aec_bf_nr_res/audio_pipeline_4ch.c` | 獨立 object（**不進** `libaudio_pipeline_4ch.a`，見 §1.5） | **本手冊的主體**；每個消費它的執行檔各自編、各自連 |
-| `pipelines/4ch_aec_bf_nr_res/4aec_nr_res.c` | `libaudio_pipeline_4ch.a` 唯一成員 | 核心層，本層一定會用到 |
+| `pipelines/4ch_aec_bf_nr_res/audio_pipeline_4ch.c` | `libaudio_pipeline_4ch.a`（object 之一） | **本手冊的主體**（線性 AEC + BF 單元；不含 RES／NR／合成） |
+| `pipelines/4ch_aec_bf_nr_res/4aec_nr_res.c` | `libaudio_pipeline_4ch.a`（object 之二） | 核心層，本層一定會用到 |
+| `pipelines/common/se_config.c` | `libaudio_pipeline_4ch.a`（object 之三） | 共用組態 |
 | `pipelines/4ch_aec_bf_nr_res/audio_pipeline_4ch.h` | — | 本手冊的公開 API |
 | `pipelines/4ch_aec_bf_nr_res/4aec_nr_res.h` | — | 核心層公開 API（本 header 會 include 它） |
 | `<audiolib>/doa/` | `libdoa.a` | SRP-PHAT / steering / DOA 平滑。可重用函式庫 |
@@ -633,9 +704,10 @@ destroy 之後不要再呼叫任何 accessor。
 
 | Source | 是什麼 | 為什麼存在 |
 |---|---|---|
-| `pipelines/4ch_aec_bf_nr_res/audio_pipeline_4ch_static.c` | caller-owned pool 路徑的主機參考程式 | 示範完整 wrapper 的 query → allocate → init_ex → process → destroy → release。真正的 SRP-PHAT + BF 在這個 process 裡跑，不是固定權重的替身 |
+| `pipelines/samples/se_sample_chain.h`、`se_anr_stage.h`、`ulcnet_nn_stage.{h,c}`、`dfn_hop.h` | header-only／單檔範例碼 | 後級鏈、NR 級的 gain 呼叫與 NN stage：沒有 ABI、沒有 layout version、不進任何 archive，可整份複製改寫 |
+| `pipelines/4ch_aec_bf_nr_res/audio_pipeline_4ch_static.c` | caller-owned pool 路徑的主機參考程式 | 示範單元加範例鏈的 query → allocate → init_ex → process → fuse → 後級 → destroy → release。真正的 SRP-PHAT + BF 在這個 process 裡跑，不是固定權重的替身 |
 | `pipelines/4ch_aec_bf_nr_res/4aec_nr_res_static.c` | **核心層**（外部 beamformer seam）的 pool 路徑參考程式 | 屬於另一份手冊。它在 front/fuse 之間塞的是固定等權重的 smoke adapter，不是 production beamformer |
-| `pipelines/4ch_aec_bf_nr_res/audio_pipeline_4ch_raw.c` | raw-float 錄音驗證 runner | 主機一次性工具，刻意走 heap `create()` 路徑（不是板端佈署示範） |
+| `pipelines/4ch_aec_bf_nr_res/audio_pipeline_4ch_raw.c` | raw-float 錄音驗證 runner（單元加範例鏈） | 主機一次性工具，刻意走 heap `create()` 路徑（不是板端佈署示範） |
 
 單聲道的 library 與參考程式（`pipelines/mono_aec_nr_res/main.c`、
 `static_main.c`、`example_board_adapter.c`）見 `docs/integration_mono_zh_TW.md`。
@@ -654,10 +726,7 @@ destroy 之後不要再呼叫任何 accessor。
 
 - [ ] 七個 archive（`libaudio_pipeline_4ch.a` / `libdoa.a` / `libbf.a` /
       `libspatial_common.a` / `libaec.a` / `libanr.a` / `libaudio_common.a`）
-      **加上**獨立 object `audio_pipeline_4ch.o`（不在任何 archive 裡,見 §1.5）
       全部是用**同一組** backend、`SIMD` 與編譯選項建出來的
-- [ ] link 命令裡有把 `audio_pipeline_4ch.o` 當獨立 object 加進去(只連七個
-      archive 會在 `audio_pipeline_4ch_*` 符號上 undefined)
 - [ ] link 順序照 §1.5
 - [ ] `BACKEND=ne10` 時最終 link 用 C++ driver
 - [ ] archive 路徑是用 `print-lib-path` 查的
@@ -703,7 +772,9 @@ Config：
 - [ ] `microphones_interleaved` 是 `[sample * 4 + channel]` interleaved，長度 `hop * 4`
 - [ ] mic / ref 內容都是有限值
 - [ ] hop / n_freqs 是查來的，不是寫死的
-- [ ] 有處理 `-3`（整條 pipeline 已被自動 reset，你的外部狀態也要跟著清）
+- [ ] 有處理 `-3`（整個單元已被自動 reset，你的後級——`se_sample_chain_reset()`、NN stage——與外部狀態也要跟著清）
+- [ ] 任何呼叫被拒、鏈回 `NULL` 或輸出非有限時，單元與後級是**一起** reset 的
+- [ ] 每一個後級 stage 都各自查大小（`se_sample_chain_mem_size()` 等），與單元 pool 分開配置
 - [ ] 用 `isnan()` 判斷 `audio_pipeline_4ch_bf_lambda()` 的失敗，不是拿它跟數值比較
 - [ ] 同一個 instance 沒有被多 thread 同時處理
 
@@ -720,18 +791,18 @@ Config：
 ### 8.1 `AudioPipeline4ChMemReq`
 
 固定 32 bytes、每個欄位固定 byte offset（由 header 內的 `_Static_assert` 釘死），
-全部是定寬整數。形狀與核心層 `FourAecNrResMemReq`、單聲道 `AudioPipelineMemReq`
-相同，但**版本號各自獨立**；本次 checkout，`layout_version=17`（`AUDIO_PIPELINE_4CH_LAYOUT_VERSION`）。
+全部是定寬整數。形狀與核心層 `FourAecNrResMemReq`
+相同，但**版本號各自獨立**；本次 checkout，`layout_version=18`（`AUDIO_PIPELINE_4CH_LAYOUT_VERSION`）。
 
 | Offset | 欄位 | 型別 | 目前值 |
 |---:|---|---|---|
 | 0 | `descriptor_version` | `uint32_t` | `1` |
-| 4 | `layout_version` | `uint32_t` | `17` |
+| 4 | `layout_version` | `uint32_t` | `18` |
 | 8 | `backend_id` | `uint32_t` | `2` = NE10（直接沿用核心層的值；目前唯一的 FFT 後端；永遠不會是 0） |
 | 12 | `build_flags_hash` | `uint32_t` | FNV-1a-32，**已把核心層的 `build_flags_hash` 摺進去** |
 | 16 | `alignment` | `uint32_t` | `16` |
 | 20 | `reserved` | `uint32_t` | `0`（必須為 0，`init_ex()` 會驗證） |
-| 24 | `bytes` | `uint64_t` | pool 總需求（含 core + SRP + BF + 本層 scratch） |
+| 24 | `bytes` | `uint64_t` | pool 總需求（含 core + SRP + BF + 本層 scratch；不含後級 stage） |
 
 `build_flags_hash` 摺入核心層 hash 的意義：**核心層佈局一改版，
 你所有已保存的複合 descriptor 就一起失效**，不會出現「用舊核心佈局算出來的 pool

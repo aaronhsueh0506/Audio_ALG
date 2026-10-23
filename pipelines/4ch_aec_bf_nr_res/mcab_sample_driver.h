@@ -61,8 +61,19 @@ typedef struct McabSampleOps {
 } McabSampleOps;
 int mcab_sample_main(int argc, char **argv, const McabSampleOps *ops, void *user);
 
+/* The grid a requested fft_size (0 = the rate's default) resolves to. */
+static inline int mcab_resolved_fft(int sample_rate, int fft_size) {
+    return fft_size ? fft_size : (sample_rate == 16000 ? 256 : 1024);
+}
 const char *mcab_backend_id_name(uint32_t backend_id);
+/* One pool the sample carves beside the unit (a post-beam chain, an NN stage). */
+typedef struct McabMemLine { const char *label; unsigned long long bytes; } McabMemLine;
+/* The unit's size query (audio_pipeline_4ch_get_mem_requirements), passed in so this driver
+ * links without the unit. */
 typedef int (*McabMemoryQuery)(const AudioPipeline4ChConfig *, AudioPipeline4ChMemReq *);
+/* Prints the unit's pool, the extra pools and their total, then the unit's descriptor.
+ * Returns -1 (message on stderr) when the unit's config is invalid. */
 int mcab_print_mem_budget(const char *title, const AudioPipeline4ChConfig *cfg,
-                          McabMemoryQuery query);
+                          McabMemoryQuery query,
+                          const McabMemLine *extra, size_t n_extra);
 #endif

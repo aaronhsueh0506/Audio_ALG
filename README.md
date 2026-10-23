@@ -81,7 +81,7 @@ git clone https://github.com/aaronhsueh0506/audio_common.git ../audiolib
 git -C ../audiolib checkout "$(sed -n 's/^AUDIOLIB_COMMIT=//p' pipelines/audiolib.pin)"
 make -C pipelines check-pins
 
-# Build the conventional mono binaries and libaudio_pipeline.a.
+# Build the conventional mono example programs and the DFN2 stage archive.
 make -C pipelines
 
 # Build the independent four-channel pipeline and its reusable dependencies.

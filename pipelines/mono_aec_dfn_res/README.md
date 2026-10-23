@@ -1,21 +1,26 @@
 # Mono AEC + RES + DeepFilterNet2
 
-This pipeline replaces the MMSE-LSA denoiser of the conventional mono
-pipeline with DeepFilterNet2 while keeping everything else of that pipeline:
-the linear AEC, the AEC3 residual echo suppressor, the comfort-noise recipe
-and the synthesis WOLA. It does so by *hosting* the conventional pipeline
-(`mono_aec_nr_res/audio_pipeline.h`, configured `enable_nr=0`,
-`enable_res=1`) and inserting the network between the host's post-RES
-spectrum and the host's synthesis:
+This example replaces the MMSE-LSA denoiser of the conventional mono
+chain with DeepFilterNet2 while keeping the linear AEC, the AEC3 residual echo
+suppressor and the comfort-noise recipe. There is no mono unit and no DFN wrapper
+library: `main.c` initialises lib/aec's `Aec`, the gain chain
+`samples/se_sample_chain.h` (RES gain only: `enable_nr = 0`, no synthesis) and the DFN2
+stage (`dfn_res_stage.h`, or `dfn_rate_bridge.h` below 48 kHz) separately, and
+`samples/dfn_hop.h` runs the network between the post-RES spectrum and the synthesis:
 
 ```text
-mic/ref -> mono_aec_dfn_res_process_begin()
-             E = linear-AEC error spectrum        -> DFN2 feature input
-             P = E * G_res + comfort noise        -> DFN2 applied here
-         -> while (nn_begin(&job) > 0) { run the model on the job; nn_end(rc) }
-         -> mono_aec_dfn_res_process_end(out)     -> enhanced P, frame t-2,
-                                                     sqrt-Hann iFFT / OLA
+mic/ref -> aec_process_context(aec, mic, ref)
+           se_frame_from_aec(aec, &frame)          E = linear-AEC error spectrum -> DFN2 feature input
+           P = se_sample_chain_form(chain, &frame) P = E * G_res (+ comfort noise) -> DFN2 applied here
+         -> dfn_hop_begin(&hop, frame.e, P)
+         -> while (dfn_hop_nn_begin(&hop, &job) > 0) { run the model on the job; dfn_hop_nn_end(&hop, rc) }
+         -> dfn_hop_end(&hop, out)                  -> enhanced P, frame t-2,
+                                                       sqrt-Hann iFFT / OLA
 ```
+
+`dfn_hop_process(&hop, frame.e, P, out)` runs the same sequence with the model callback; P must
+be formed before `dfn_hop_begin()`. A refused hop is the integrator's to recover: reset the AEC,
+the chain and the `DfnHop` together (`rig_reset()` in `main.c`).
 
 The network estimates from the pre-RES spectrum because it was trained on
 unprocessed noisy speech and must not see the spectral holes RES cuts; it is
@@ -32,8 +37,9 @@ its quality against a mask-only compose is evaluated by
 `pipelines/tools/eval_dfn2_variants.py`.
 
 With no model callback (or a failing one) the output is the conventional
-pipeline with `enable_nr=0` delayed: bit for bit by two hops at 48 kHz
-(the acceptance gate in `tests/test_audio_pipeline_dfn.c`, asserted with
+chain with the denoiser off delayed: bit for bit by two hops at 48 kHz
+(the acceptance gate in `tests/test_mono_dfn.c`, compared with the hand-written chain of
+`mono_aec_nr_res/tests/conv_chain_mono.h`, asserted with
 comfort noise off and on, across a real matched-delay re-lock, with the
 suppressor demonstrably active), and through the resampler round trip by
 the bridge delay on a native grid (the same test pins the delay with a
@@ -63,13 +69,12 @@ Build and test from `pipelines/` (the directory `Makefile` forwards):
 ```sh
 make WERROR=1 libaudio_pipeline_dfn.a mono_aec_dfn_res
 make WERROR=1 test        # includes test_dfn_res_stage,
-                          # test_audio_pipeline_dfn and the skeleton
+                          # test_mono_dfn and the skeleton
 ```
 
-`libaudio_pipeline_dfn.a` holds the wrapper, the shared stage and the DFN2
-host pre/post objects. It is linked together with `libaudio_pipeline.a` (the
-host), `libaec`, `libanr` (referenced by the host archive) and
-`libaudio_common`; the board supplies the stateless model callback
+`libaudio_pipeline_dfn.a` holds the shared stage, the rate bridge and the DFN2
+host pre/post objects. The example links it with `common/se_config.o`, `libaec`,
+`libanr` (the example chain's denoiser type) and `libaudio_common`; the board supplies the stateless model callback
 (`DFN2Model`) and the exported ERB matrices (`erb_fwd.bin` / `erb_inv.bin`
 from `AINR/DeepFilterNet2/export_erb_matrix.py`). `main.c` is the board
 skeleton: delay-profile flags in the `aec_wav` spelling, `--erb-fwd` /
@@ -95,10 +100,11 @@ Whole-front-end conversion also
 moves the AEC itself to 48 kHz; that extra AEC cost is separate from this
 resampler count and must be included in the board measurement.
 
-Host DSP pool (`mono_aec_dfn_res_get_mem_requirements`, matched delay,
-five-filter bank, NE10): 764,096 bytes at the 16 kHz default (host plus the
-rate bridge, whose own pool is 349,888 bytes including the stage) and
-1,522,048 bytes at 48 kHz (the conventional MMSE-LSA pipeline on the 48 kHz
-grid needs 1,610,832 bytes). Model weights and accelerator activation/
+Pool printed by the skeleton (`mono_aec_dfn_res`, matched delay, five-filter bank, NE10; the sum
+of `aec_get_mem_size()`, `se_sample_chain_mem_size()` and the stage or bridge requirement, each
+16-byte aligned): 750,384 bytes at the 16 kHz default (the AEC and the RES chain plus the
+rate bridge, whose own pool is 349,888 bytes including the stage), 1,513,536 bytes at 48 kHz (the
+stage's 231,984 bytes, its synthesis and the AEC; the conventional MMSE-LSA chain on the 48 kHz
+grid needs 1,422,016 bytes) and 638,624 bytes at 8 kHz. Model weights and accelerator activation/
 workspace memory are external to this descriptor; adding int8 weights alone
 brings the known minimum to about 2.8 MiB at 16 kHz.

@@ -65,7 +65,7 @@ the handover documentation, and check them off here.
       match AIAEC.
 
 - [ ] **Static pools are fully supported but are NOT what `*_create()` gives
-      you.** `aec_create()` / `audio_pipeline_init()` / the 4ch equivalents use
+      you.** `aec_create()` / `audio_pipeline_4ch_create()` / the other `*_create()` constructors use
       the heap. Zero-heap operation requires the caller to explicitly use
       `*_get_mem_requirements()` (or `aec_get_mem_size()`) followed by
       `*_init_ex()` / `aec_init()`. A board integration that calls `*_create()`
@@ -335,27 +335,29 @@ Pass conditions:
 
 `make -C pipelines test` also builds and runs the shared post-RES DFN2
 stage, the rate bridge that takes that stage to its 48 kHz grid from a
-product-rate host, and the mono wrapper that hosts the conventional pipeline
-with `enable_nr=0` / `enable_res=1`:
+product-rate host, and the mono example that composes lib/aec's `Aec`, the
+sample chain with the RES gain only (`enable_nr=0`, no synthesis) and
+`samples/dfn_hop.h`:
 
 ```bash
 make -C pipelines BACKEND=ne10 SIMD=<0-or-1> WERROR=1 test
-# adds: test_dfn_res_stage, test_dfn_rate_bridge, test_audio_pipeline_dfn,
+# adds: test_dfn_res_stage, test_dfn_rate_bridge, test_mono_dfn, test_se_common,
 #       mono_aec_dfn_res (board skeleton at its 16 kHz default, also run with
 #       --delay-num-filters 1 --cng --atten-lim 12, and with
 #       --sample-rate 48000)
 make -C pipelines/mono_aec_dfn_res test   # scoped: test_dfn_res_stage,
-#       test_audio_pipeline_dfn and the skeleton only -- it does NOT cover
+#       test_mono_dfn and the skeleton only -- it does NOT cover
 #       test_dfn_rate_bridge or the --sample-rate 48000 run, so the top-level
 #       target above is the one that gates a release.
 ```
 
 Pass conditions:
 
-- [ ] At a 48 kHz host, with no model (or a failing one), the wrapper output is
-      byte-equal to the conventional pipeline at `enable_nr=0`, delayed by
-      exactly two hops, with comfort noise OFF and ON, across an AEC delay
-      change.
+- [ ] At a 48 kHz host, with no model (or a failing one), the example output is
+      byte-equal to the hand-written conventional chain
+      (`mono_aec_nr_res/tests/conv_chain_mono.h`) with the denoiser off,
+      delayed by exactly two hops, with comfort noise OFF and ON, across an AEC
+      delay change.
 - [ ] The stimulus actually engages RES (`min G_res < 0.9`), so an
       estimate/apply swap cannot pass unnoticed.
 - [ ] Stage counters show no mid-stream reset (`frames == hops`,
@@ -404,22 +406,27 @@ Pass conditions:
       NR+RES path follows it.
 - [ ] SRP/GSC and AEC/NR use the same selected grid.
 - [ ] Pre/post token, reset, replay, and cross-instance misuse fail closed.
-- [ ] The complete wrapper supports heap and caller-owned static-pool init.
-- [ ] SRP/GSC and the complete wrapper allocate no heap after static init.
+- [ ] The unit (`AudioPipeline4Ch`) supports heap and caller-owned static-pool init.
+- [ ] SRP/GSC and the unit allocate no heap after static init.
+- [ ] The unit contains no RES, NR, comfort noise or synthesis; those stages are
+      separate libraries that the example programs initialise and chain, and
+      `unit + fuse + sample chain` equals the hand-written reference chain bit
+      for bit (`test_audio_pipeline_4ch`).
 - [ ] SIMD/scalar parity passes.
 - [ ] All three product grids pass.
 
 ### 9.0 Four-channel DeepFilterNet2 variant (`4ch_aec_bf_dfn_res`)
 
 `make -C pipelines/4ch_aec_bf_nr_res test` also builds and runs the DFN2
-wrapper over the core (`enable_post=1` / `enable_res=1` / `enable_nr=0`):
+example over the core (`enable_post=1`; the sample chain with the RES gain only,
+no denoiser, no synthesis; `samples/dfn_hop.h`):
 
 ```bash
 make -C pipelines/4ch_aec_bf_nr_res BACKEND=ne10 SIMD=<0-or-1> WERROR=1 test
-# adds: test_4aec_dfn_res, 4ch_aec_bf_dfn_res (board skeleton at its 16 kHz
+# adds: test_4ch_dfn, 4ch_aec_bf_dfn_res (board skeleton at its 16 kHz
 #       default, also run with --delay-num-filters 1 --cng --atten-lim 12,
 #       and with --sample-rate 48000)
-make -C pipelines/4ch_aec_bf_dfn_res test   # scoped: test_4aec_dfn_res and the
+make -C pipelines/4ch_aec_bf_dfn_res test   # scoped: test_4ch_dfn and the
 #       skeleton only -- it does NOT cover the --sample-rate 48000 run, and the
 #       rate bridge's own unit test lives under the mono target
 #       (`make -C pipelines test`, section 8.1). Run both before a release.
@@ -427,23 +434,28 @@ make -C pipelines/4ch_aec_bf_dfn_res test   # scoped: test_4aec_dfn_res and the
 
 Pass conditions:
 
-- [ ] At a 48 kHz core, with no model (or a failing one), the wrapper output is
-      byte-equal to the conventional core at `enable_nr=0`, delayed by exactly
-      two hops, over BOTH post entries (reconstructed weights and trusted
-      spectrum) and with comfort noise OFF and ON, across an AEC delay change.
+- [ ] At a 48 kHz core, with no model (or a failing one), the example output is
+      byte-equal to the hand-written conventional chain
+      (`4ch_aec_bf_nr_res/tests/conv_chain_4ch.h`) with the denoiser off,
+      delayed by exactly two hops, with both fuse forms (reconstructed weights
+      and trusted spectrum) and with comfort noise OFF and ON, across an AEC
+      delay change.
 - [ ] The stimulus actually engages the post-beam RES (a RES-off core differs).
-- [ ] Stage counters show no mid-stream reset.
-- [ ] A core config with `enable_nr=1`, `enable_res=0`, a rate the core does
-      not offer, or a non-partition-of-unity `erb_inv` is refused at
-      `get_mem_requirements()`. 8 kHz in particular must be refused: the core
-      has no 8 kHz grid, so the DFN2 wrapper cannot offer one either.
+- [ ] Stage counters show no mid-stream reset (the stage is not reset by a
+      delay change of the shared aligner).
+- [ ] A rate the core does not offer is refused at
+      `four_aec_nr_res_get_mem_requirements()`, and a non-partition-of-unity
+      `erb_inv` at `dfn_res_stage_get_mem_requirements()` (`test_dfn_res_stage`).
+      8 kHz in particular must be refused: the core has no 8 kHz grid, so the
+      4-channel DFN2 example cannot offer one either.
 - [ ] Native-grid gates pass for 16 kHz/fft 256 and 16 kHz/fft 512: the
       per-hop 48 kHz frame schedule (0,1,1,1 at hop 128; 1,2 at hop 256), the
       cumulative frame count, the impulse-pinned added delay (672 / 629 native
       samples) and a pass-band tolerance against the conventional NR-off
       output. The native path is a tolerance, NOT a memcmp.
-- [ ] The build produces `lib4aec_dfn_res.a` (carrying
-      `dfn_rate_bridge.o`); `FOUR_AEC_NR_RES_LAYOUT_VERSION` is 22.
+- [ ] The build produces `libdfn_res_stage.a` (carrying
+      `dfn_rate_bridge.o`); `FOUR_AEC_NR_RES_LAYOUT_VERSION` is 23 and
+      `AUDIO_PIPELINE_4CH_LAYOUT_VERSION` is 18.
 
 ### 9.1 Real four-microphone validation
 
@@ -775,7 +787,7 @@ C-side `make test` targets that print `PASS:` markers rather than a count
 `pipelines/mono_aec_nr_res`, `pipelines/mono_alignulcnet` (the same count on the
 16 kHz and the `ULCNET_GRID=48k` build) and `pipelines/4ch_aec_bf_nr_res`
 (one-stop gate; also builds and runs the `4ch_alignulcnet` binaries, whose test
-prints a single `All audio_pipeline_4ch_ulcnet tests passed` line and no `PASS:`
+prints a single `All 4ch_ulcnet tests passed` line and no `PASS:`
 markers, and the `4ch_aec_bf_dfn_res` command-line runs; the same count on the
 `ULCNET_GRID=48k` build). Each additionally prints a small number of non-`PASS:`
 pass lines (static smokes, board-skeleton profiles, adapter).

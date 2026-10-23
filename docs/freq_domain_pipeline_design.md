@@ -63,15 +63,15 @@ training/checkpoint contract even when a numeric grid happens to match.
 
 ## Public implementation boundary
 
-The reusable C API is implemented in:
-
-- `pipelines/mono_aec_nr_res/audio_pipeline.h`;
-- `pipelines/mono_aec_nr_res/audio_pipeline.c`;
-- `libaudio_pipeline.a`.
-
-It supports both a heap convenience constructor and a caller-owned,
-16-byte-aligned pool initialized from a versioned memory descriptor. The two
-CLI executables are reference wrappers around this implementation.
+There is no mono pipeline library. The reusable parts are separate libraries, each
+with its own size query and `init`: lib/aec's `Aec` (`aec_process_context()`),
+`common/se_stage.h` (`SeSpecFrame`, `se_frame_from_aec()`, `se_res_stage_gain()`), the denoiser
+(`anr.h`), `AecRes` and `AcIstft`. The example chain that sequences them is header-only code,
+`pipelines/samples/se_sample_chain.h` (no ABI, no layout version). The only wrapped unit is the
+4-channel linear AEC + beamformer, `pipelines/4ch_aec_bf_nr_res/audio_pipeline_4ch.h`
+(caller-owned 16-byte-aligned pool initialized from a versioned memory descriptor, or a heap
+convenience constructor). The two mono CLI executables are example programs that compose the
+libraries.
 
 Low-level details, backend/release rules, memory sizing, presets, and tests are
 maintained in [`../pipelines/README.md`](../pipelines/README.md).
@@ -82,8 +82,9 @@ Each application writes its frequency-domain chain explicitly over a borrowed
 view of the analysis frame (`pipelines/common/se_stage.h`, `SeSpecFrame`):
 
 ```text
-frame = analysis stage           (mono: audio_pipeline_process_spec,
-                                  4ch: four_aec_front_process -> beamformer -> four_aec_fuse)
+frame = analysis stage           (mono: aec_process_context -> se_frame_from_aec,
+                                  4ch: audio_pipeline_4ch_process_* -> audio_pipeline_4ch_fuse
+                                       (or four_aec_front_process -> beamformer -> four_aec_fuse))
 res_gain = se_res_stage_gain(res, frame)        gain stages return const float*
 nr_gain  = se_anr_stage_gain(nr, frame, scratch, use_r2)
 total    = sk_min_f32(nr_gain, res_gain)        a disabled source reads as the unity vector
@@ -94,7 +95,7 @@ out      = ac_istft_push(spec)                  one iFFT/OLA per hop
 
 The frame is valid until its producer runs again and is never written through.
 Stages that run a neural model are split around the model call
-(`_process_begin`, `_nn_begin`, caller runs the NPU, `_nn_end`, `_process_end`);
+(`ulcnet_nn_stage_begin*` / `dfn_hop_begin`, `nn_begin`, caller runs the NPU, `nn_end`, `end`);
 a failed, non-finite or never-fetched model frame takes the identity, so the
 output timing does not depend on the model's health. There is no function-pointer
 table: the call order is part of each application's source.

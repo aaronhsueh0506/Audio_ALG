@@ -11,8 +11,8 @@ checked without running any DSP:
   source file, nothing is imported, so no torch / numpy / checkpoint is needed;
 * every C function it names is still defined in the named file, and every
   function defined in a covered file is accounted for in exactly one row;
-* the coverage statistics in the header equal the numbers recomputed from the
-  table rows;
+* the coverage statistics in the header, and the one-line reading of their
+  TOTAL row below them, equal the numbers recomputed from the table rows;
 * every gap id (S-xx / D-xx / T-xx) a row cites is defined in the document's
   glossary, and every repo path a row cites as its parity tool exists.
 
@@ -62,6 +62,10 @@ _PY_SPAN_RE = re.compile(
     r'`([A-Za-z0-9_./+-]+\.py):([A-Za-z_]\w*(?:\.[A-Za-z_]\w*)?)`')
 _GAP_RE = re.compile(r'\b([SDT]-\d{2})\b')
 _PATH_TOKEN_RE = re.compile(r'`((?:pipelines|AINR|AIAEC|lib|audiolib|docs)/[A-Za-z0-9_./+-]+)(?:::\w+)?`')
+_PROSE_FORMAT = ('讀法：{0} 個 C 函式中，{1} 個有 Python 對應（mirror {2}、partial {3}），'
+                 '其中 {7} 個的配對是推論；{4} 個是 C-only；未能判斷 {5} 個。'
+                 '另有 {6} 個 Python 符號只在 Python。')
+_PROSE_RE = re.compile(r'^讀法：.*$', re.M)
 
 
 # ---------------------------------------------------------------------------
@@ -484,6 +488,21 @@ def test_statistics_match_the_table(doc):
                        + '\n  '.join(wrong))
 
 
+def prose_summary(total):
+    """The document's one-line reading of the TOTAL statistics row."""
+    return _PROSE_FORMAT.format(*total)
+
+
+def test_statistics_prose_matches_the_table(doc):
+    rows, _, _, _ = doc
+    found = _PROSE_RE.findall(DOC.read_text(encoding='utf-8'))
+    assert len(found) == 1, 'expected exactly one 讀法： line under the statistics, found %d' % len(found)
+    expected = prose_summary(compute_statistics(rows)['TOTAL'])
+    assert found[0].strip() == expected, ('the reading of the statistics is stale '
+                                          '(recompute with --stats):\n  doc:      %s\n  expected: %s'
+                                          % (found[0].strip(), expected))
+
+
 def test_cited_gap_ids_are_defined_in_the_glossary(doc):
     rows, _, _, glossary = doc
     assert glossary, 'the gap glossary region is empty'
@@ -581,5 +600,8 @@ if __name__ == '__main__':          # maintenance helper: recompute the statisti
     import sys
     if '--stats' not in sys.argv:
         sys.exit('usage: python3 pipelines/tests/test_c_python_map.py --stats')
-    for key, numbers in compute_statistics(_load()[0]).items():
+    statistics = compute_statistics(_load()[0])
+    for key, numbers in statistics.items():
         print('| `%s` | %s |' % (key, ' | '.join(str(n) for n in numbers)))
+    print()
+    print(prose_summary(statistics['TOTAL']))

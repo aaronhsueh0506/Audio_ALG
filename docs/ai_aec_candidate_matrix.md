@@ -7,7 +7,7 @@ This is the current implementation map.
 | Route | Candidate | Public input | Supervised target | Current role |
 |---|---|---|---|---|
 | end-to-end AEC+RES+NR | `Align_CRUSE` | mic + unaligned far | early near target | selected |
-| linear AEC → RES+NR | `Align_ULCNet` | production linear error + far | early near target | paper reference |
+| linear AEC → RES+NR | `Align_ULCNet` | production linear error + far | early near target | selected |
 | end-to-end AEC+RES+NR | `DeepVQE_S` | mic + unaligned far | early near target | primary |
 | end-to-end AEC+RES+NR | `CAGCRN` | mic + unaligned far | early near target | backup |
 

@@ -1,9 +1,8 @@
-/** Complete four-channel spatial pipeline: four_aec_front_process -> SRP-PHAT DOA -> BF
- * effective weights -> four_aec_fuse -> RES/NR gains -> CNG -> ISTFT. Same pool-first
- * layout and lifecycle as 4aec_nr_res.c (get_mem_requirements()/init_ex() compose the
- * core's descriptor-tier API with SRP/BF's size_t tier and this wrapper's scratch);
- * create() is the heap convenience over the same implementation (see
- * audio_pipeline_4ch.h). */
+/** Four-channel linear AEC plus beamformer unit: four_aec_front_process -> SRP-PHAT DOA -> BF
+ * effective weights, and four_aec_fuse as a separate step. Same pool-first layout and
+ * lifecycle as 4aec_nr_res.c (get_mem_requirements()/init_ex() compose the core's
+ * descriptor-tier API with SRP/BF's size_t tier and this unit's scratch); create() is the heap
+ * convenience over the same implementation (see audio_pipeline_4ch.h). */
 
 #include <stdlib.h>
 #include <string.h>
@@ -11,14 +10,13 @@
 #include <stdint.h>
 
 #include "audio_pipeline_4ch.h"
+#include "anr_types.h"   /* anr_retime_alpha, anr_retime_frames */
 #include "bf.h"
 #include "srp.h"
 #include "spatial_simd.h"
 #include "utility/mem_align.h"
-#include "audio_stft.h"         /* AcIstft: inverse FFT + sqrt-Hann OLA */
-#include "utility/simd_kernels.h"       /* sk_min_f32 / sk_capply_gain_f32 */
-#include "common/se_stage.h"    /* SeSpecFrame, se_res_stage_gain, comfort-noise constants */
-#include "common/se_anr_stage.h"/* NR stage */
+#include "common/se_config.h"   /* se_flag_valid */
+#include "common/se_stage.h"    /* SeSpecFrame */
 
 #ifndef M_PI
 #define M_PI 3.14159265358979323846
@@ -42,15 +40,7 @@ struct AudioPipeline4Ch {
     Complex* bf_spectrum;
     Complex* bf_weights;
 
-    /* Post-beam stages, chained in audio_pipeline_4ch_process_with_activity(). */
-    AecRes* res;                /* iff cfg.core.enable_res */
-    AnrDenoiser* nr;            /* iff cfg.core.enable_nr  */
-    AcIstft* istft;             /* inverse FFT, sqrt-Hann window, overlap-add */
-    float* total_gain;          /* min(G_nr, G_res)                         */
-    float* extra_noise;         /* R^2 prior scratch of the denoiser         */
-    Complex* spec;              /* E * total_gain (+ comfort noise)          */
-    float* unity_gain;          /* iff !enable_res or !enable_nr: all-ones   */
-    uint32_t rng_state;         /* comfort-noise generator                   */
+    int phase;                  /* 0 idle, 1 front done, 2 beam done */
 
     float noise_power;
     float vad_power_threshold;    /* derived from cfg.auto_vad_threshold_dbfs and cached for auto_vad() */
@@ -71,17 +61,11 @@ struct AudioPipeline4Ch {
 
 /* Config validation */
 
-static int is_bool(int value) {
-    return value == 0 || value == 1;
-}
-
 static int validate_config(const AudioPipeline4ChConfig* cfg) {
     float nyquist;
     if (!cfg) return 0;
     if (cfg->core.sample_rate != 16000 &&
         cfg->core.sample_rate != 48000) return 0;
-    /* The standard wrapper always runs four_aec_fuse(); front-only is a different profile. */
-    if (cfg->core.enable_post != 1) return 0;
     nyquist = 0.5f * (float)cfg->core.sample_rate;
     if (cfg->geometry != AUDIO_PIPELINE_4CH_GEOMETRY_UCA &&
         cfg->geometry != AUDIO_PIPELINE_4CH_GEOMETRY_ULA &&
@@ -97,18 +81,18 @@ static int validate_config(const AudioPipeline4ChConfig* cfg) {
         cfg->doa_high_freq_hz > nyquist) return 0;
     if (cfg->doa_high_freq_hz > 0.0f &&
         cfg->doa_high_freq_hz < cfg->doa_low_freq_hz) return 0;
-    if (!is_bool(cfg->doa_enable_smoothing) ||
+    if (!se_flag_valid(cfg->doa_enable_smoothing) ||
         cfg->doa_switch_consecutive <= 0 ||
         !isfinite(cfg->doa_angle_tolerance_rad) ||
         cfg->doa_angle_tolerance_rad < 0.0f ||
         cfg->doa_update_interval <= 0) return 0;
-    if (!is_bool(cfg->bf_enable) ||
+    if (!se_flag_valid(cfg->bf_enable) ||
         !isfinite(cfg->bf_lambda) || cfg->bf_lambda <= 0.0f ||
         cfg->bf_lambda > 1.0f ||
         !isfinite(cfg->bf_mu) || cfg->bf_mu < 0.0f ||
-        !is_bool(cfg->bf_fixed_mode) ||
+        !se_flag_valid(cfg->bf_fixed_mode) ||
         !isfinite(cfg->bf_fixed_doa_rad) ||
-        !is_bool(cfg->bf_fixed_align_notebook) ||
+        !se_flag_valid(cfg->bf_fixed_align_notebook) ||
         cfg->bf_adapt_interval <= 0) return 0;
     if (!isfinite(cfg->auto_vad_threshold_dbfs) ||
         !isfinite(cfg->auto_vad_snr_ratio) ||
@@ -197,13 +181,13 @@ static uint32_t fnv1a_str(const char* text, uint32_t hash) {
 
 /* Plain integer mix, no snprintf/stdio (must stay NO_STDIO-safe; see Makefile
  * audit-no-stdio). Folds in the core's build_flags_hash, which sees its carve token but
- * not a control-block-only growth; bump AUDIO_PIPELINE_4CH_LAYOUT_VERSION by hand to
- * invalidate a persisted composite descriptor. */
+ * not a control-block-only growth; bump AUDIO_PIPELINE_4CH_LAYOUT_VERSION and the token by
+ * hand to invalidate a persisted composite descriptor. */
 static uint32_t audio_pipeline_4ch_build_flags_hash(
     uint32_t core_build_flags_hash) {
     uint32_t hash = 2166136261u;
     hash = fnv1a_str(
-        "|carve:self(corecfg-delay-v2),core,srp,bf,bf_spectrum,bf_weights",
+        "|carve:self(corecfg-delay-v3),core,srp,bf,bf_spectrum,bf_weights",
         hash);
     hash = fnv1a_str("|align16", hash);
     hash ^= core_build_flags_hash;
@@ -319,44 +303,14 @@ static int derive_spatial_configs(
     return 1;
 }
 
-/* The post-beam stages carved after the core: sizes and the configurations their init
- * needs. */
-typedef struct PostStages {
-    AecConfig res_cfg;
-    AnrConfig nr_cfg;
-    size_t res_bytes;     /* 0 when cfg.core.enable_res = 0 */
-    size_t nr_bytes;      /* 0 when cfg.core.enable_nr  = 0 */
-    size_t synth_bytes;
-    int need_unity;
-} PostStages;
-
-static int derive_post_stages(const AudioPipeline4ChConfig* cfg, PostStages* ps) {
-    AcStftConfig scfg;
-    int fft;
-    FourAecNrResMemBreakdown bd;
-    if (four_aec_nr_res_stage_configs(&cfg->core, &ps->res_cfg, &ps->nr_cfg) != 0 ||
-        four_aec_nr_res_get_mem_breakdown(&cfg->core, &bd) != 0) return 0;
-    fft = bd.fft_size;
-    ps->res_bytes = cfg->core.enable_res ? aec_res_get_mem_size(&ps->res_cfg) : 0;
-    ps->nr_bytes = cfg->core.enable_nr ? se_anr_stage_mem_size(&ps->nr_cfg) : 0;
-    ac_stft_config_default(&scfg, fft);
-    ps->synth_bytes = ac_istft_get_mem_size(&scfg);
-    ps->need_unity = !cfg->core.enable_res || !cfg->core.enable_nr;
-    if (ps->synth_bytes == 0 ||
-        (cfg->core.enable_res && ps->res_bytes == 0) ||
-        (cfg->core.enable_nr && ps->nr_bytes == 0)) return 0;
-    return 1;
-}
-
 static int derive_pipeline_layout(
     const AudioPipeline4ChConfig* cfg,
     FourAecNrResMemReq* core_req,
     SRP_Config* srp_cfg, BF_Config* bf_cfg,
-    PostStages* ps,
     int* hop, int* fft, int* n_freqs,
     size_t* srp_bytes, size_t* bf_bytes) {
     FourAecNrResMemBreakdown breakdown;
-    if (!cfg || !core_req || !srp_cfg || !bf_cfg || !ps || !hop || !fft ||
+    if (!cfg || !core_req || !srp_cfg || !bf_cfg || !hop || !fft ||
         !n_freqs || !srp_bytes || !bf_bytes) return 0;
     if (!validate_config(cfg)) return 0;
     if (four_aec_nr_res_get_mem_requirements(&cfg->core, core_req) != 0)
@@ -367,7 +321,6 @@ static int derive_pipeline_layout(
     *hop = breakdown.hop_size;
     *fft = breakdown.fft_size;
     *n_freqs = breakdown.n_freqs;
-    if (!derive_post_stages(cfg, ps)) return 0;
     if (!derive_spatial_configs(cfg, *hop, *fft, *n_freqs, srp_cfg, bf_cfg))
         return 0;
     *srp_bytes = srp_get_mem_size(srp_cfg);
@@ -382,14 +335,13 @@ int audio_pipeline_4ch_get_mem_requirements(
     FourAecNrResMemReq core_req;
     SRP_Config srp_cfg;
     BF_Config bf_cfg;
-    PostStages ps;
     int hop, fft, n_freqs;
     size_t srp_bytes, bf_bytes;
     size_t spectral_count;
     size_t total;
 
     if (!out || !derive_pipeline_layout(
-            cfg, &core_req, &srp_cfg, &bf_cfg, &ps,
+            cfg, &core_req, &srp_cfg, &bf_cfg,
             &hop, &fft, &n_freqs, &srp_bytes, &bf_bytes)) return -1;
     if (core_req.bytes > (uint64_t)SIZE_MAX) return -1;
 
@@ -403,16 +355,6 @@ int audio_pipeline_4ch_get_mem_requirements(
         total, (size_t)n_freqs, sizeof(Complex));       /* bf_spectrum */
     total = ck_field_size(
         total, spectral_count, sizeof(Complex));        /* bf_weights */
-
-    /* Post-beam stages, in carve order. */
-    if (ps.res_bytes) total = ck_add_size(total, ck_align16_size(ps.res_bytes));
-    if (ps.nr_bytes) total = ck_add_size(total, ck_align16_size(ps.nr_bytes));
-    total = ck_add_size(total, ck_align16_size(ps.synth_bytes));
-    total = ck_field_size(total, (size_t)n_freqs, sizeof(float));    /* total_gain  */
-    total = ck_field_size(total, (size_t)n_freqs, sizeof(float));    /* extra_noise */
-    total = ck_field_size(total, (size_t)n_freqs, sizeof(Complex));  /* spec        */
-    if (ps.need_unity)
-        total = ck_field_size(total, (size_t)n_freqs, sizeof(float)); /* unity_gain */
 
     if (MEM_SIZE_INVALID(total)) return -1;
 
@@ -437,7 +379,6 @@ AudioPipeline4Ch* audio_pipeline_4ch_init_ex(
     FourAecNrResMemReq core_req;
     SRP_Config srp_cfg;
     BF_Config bf_cfg;
-    PostStages ps;
     int hop, fft, n_freqs;
     size_t srp_bytes, bf_bytes;
     float geom_x[FOUR_AEC_NR_RES_CHANNELS];
@@ -470,7 +411,7 @@ AudioPipeline4Ch* audio_pipeline_4ch_init_ex(
         (uint64_t)bytes < current.bytes) return NULL;
 
     if (!derive_pipeline_layout(
-            &cfg_copy, &core_req, &srp_cfg, &bf_cfg, &ps,
+            &cfg_copy, &core_req, &srp_cfg, &bf_cfg,
             &hop, &fft, &n_freqs, &srp_bytes, &bf_bytes)) return NULL;
     if (core_req.bytes > (uint64_t)SIZE_MAX) return NULL;
     if (!fill_stack_geometry(&cfg_copy, geom_x, geom_y, &geom)) return NULL;
@@ -512,41 +453,6 @@ AudioPipeline4Ch* audio_pipeline_4ch_init_ex(
     p->bf_weights =
         (Complex*)pool_carve(&cursor, spectral_count, sizeof(Complex));
     if (!p->bf_spectrum || !p->bf_weights) return NULL;
-
-    /* Post-beam stages. */
-    if (cfg_copy.core.enable_res) {
-        void* res_region = pool_carve(&cursor, 1, ps.res_bytes);
-        if (!res_region) return NULL;
-        p->res = aec_res_init(res_region, ps.res_bytes, &ps.res_cfg);
-        if (!p->res || aec_res_n_bins(p->res) != n_freqs ||
-            aec_res_hop_size(p->res) != hop) return NULL;
-    }
-    if (cfg_copy.core.enable_nr) {
-        void* nr_region = pool_carve(&cursor, 1, ps.nr_bytes);
-        if (!nr_region) return NULL;
-        p->nr = se_anr_stage_init(nr_region, ps.nr_bytes, &ps.nr_cfg);
-        if (!p->nr || anr_get_hop_size(p->nr) != hop ||
-            anr_get_n_freqs(p->nr) != n_freqs) return NULL;
-    }
-    {
-        AcStftConfig scfg;
-        void* synth_region = pool_carve(&cursor, 1, ps.synth_bytes);
-        if (!synth_region) return NULL;
-        ac_stft_config_default(&scfg, fft);
-        p->istft = ac_istft_init(synth_region, ps.synth_bytes, &scfg);
-        if (!p->istft) return NULL;
-    }
-    p->total_gain = (float*)pool_carve(&cursor, (size_t)n_freqs, sizeof(float));
-    p->extra_noise = (float*)pool_carve(&cursor, (size_t)n_freqs, sizeof(float));
-    p->spec = (Complex*)pool_carve(&cursor, (size_t)n_freqs, sizeof(Complex));
-    if (!p->total_gain || !p->extra_noise || !p->spec) return NULL;
-    if (ps.need_unity) {
-        int k;
-        p->unity_gain = (float*)pool_carve(&cursor, (size_t)n_freqs, sizeof(float));
-        if (!p->unity_gain) return NULL;
-        for (k = 0; k < n_freqs; ++k) p->unity_gain[k] = 1.0f;
-    }
-    p->rng_state = SE_CNG_RNG_SEED;
 
     p->hop_size = hop;
     p->fft_size = fft;
@@ -623,41 +529,62 @@ static void fill_frame_info(
     info->doa_analysis_frames = doa_analysis_frames;
 }
 
-/* The stages after the fuse: RES gain, NR gain, min, apply, comfort noise on the
- * RES-cut bins, synthesis. Returns FOUR_AEC_NR_RES_OK, or DSP_ERROR when a stage refused
- * the hop or the synthesised hop is not finite. */
-static int run_post_stages(AudioPipeline4Ch* p, const SeSpecFrame* frame,
-                           float* output) {
-    const float* res_gain;
-    const float* nr_gain;
-    int n = p->n_freqs;
-    int k;
-
-    /* A disabled gain source reads as the unity vector, so one min serves every combination.
-     * sk_min_f32 propagates a non-finite gain to the output finite gate (fminf would mask
-     * it). */
-    res_gain = p->res ? se_res_stage_gain(p->res, frame) : p->unity_gain;
-    if (!res_gain) return FOUR_AEC_NR_RES_DSP_ERROR;
-    nr_gain = p->unity_gain;
-    if (p->nr) {
-        /* The denoiser's residual-echo prior is the fused R^2 (rescaled into extra_noise);
-         * legacy_amin gives it no prior. */
-        nr_gain = se_anr_stage_gain(p->nr, frame, p->extra_noise,
-                                    !p->cfg.core.legacy_amin);
-        if (!nr_gain) return FOUR_AEC_NR_RES_DSP_ERROR;
+int audio_pipeline_4ch_process_front(
+    AudioPipeline4Ch* p,
+    const float* microphones_interleaved,
+    const float* far_reference,
+    FourAecFront* out) {
+    int status;
+    if (!p || p->destroyed || !microphones_interleaved || !far_reference || !out)
+        return FOUR_AEC_NR_RES_INVALID_ARGUMENT;
+    status = four_aec_front_process(
+        p->core, microphones_interleaved, far_reference, out);
+    if (status != FOUR_AEC_NR_RES_OK) {
+        /* The core dropped its front view on any refusal, so no beam or fuse may follow. */
+        p->phase = 0;
+        return status;
     }
-    sk_min_f32(p->total_gain, nr_gain, res_gain, n);
-    sk_capply_gain_f32(p->spec, frame->e, p->total_gain, n);
+    if (out->n_channels != FOUR_AEC_NR_RES_CHANNELS ||
+        out->hop_size != p->hop_size ||
+        out->n_freqs != p->n_freqs) {
+        audio_pipeline_4ch_reset(p);
+        return FOUR_AEC_NR_RES_DSP_ERROR;
+    }
+    p->phase = 1;
+    return FOUR_AEC_NR_RES_OK;
+}
 
-    /* Comfort noise on the RES-cut bins, scaled by G_nr (floored at
-     * SE_CNG_NR_GAIN_FLOOR), as the denoiser never sees the fill. */
-    if (p->cfg.core.enable_cng && p->res)
-        aec_cng_fill(&p->rng_state, p->spec, frame->cn, res_gain, nr_gain,
-                     SE_CNG_NR_GAIN_FLOOR, n);
+int audio_pipeline_4ch_process_beam(
+    AudioPipeline4Ch* p,
+    const FourAecFront* front,
+    int vad_raw,
+    int vad_out,
+    const int* frequency_mask,
+    AudioPipeline4ChBeam* beam,
+    AudioPipeline4ChFrameInfo* info) {
+    int m;
+    if (!p || p->destroyed || !front || !beam || !se_flag_valid(vad_raw) ||
+        !se_flag_valid(vad_out) || front->n_freqs != p->n_freqs)
+        return FOUR_AEC_NR_RES_INVALID_ARGUMENT;
+    for (m = 0; m < FOUR_AEC_NR_RES_CHANNELS; ++m)
+        if (!front->linear_spectra[m]) return FOUR_AEC_NR_RES_INVALID_ARGUMENT;
+    if (p->phase != 1) return FOUR_AEC_NR_RES_SEQUENCE_ERROR;
 
-    ac_istft_push(p->istft, p->spec, output);
-    for (k = 0; k < p->hop_size; ++k)
-        if (!isfinite(output[k])) return FOUR_AEC_NR_RES_DSP_ERROR;
+    /* front->linear_spectra[ch] borrows each lane's live spectrum; SRP/BF only read it, so no
+     * copy is needed. */
+    doa_step(
+        p->srp, front->linear_spectra, frequency_mask,
+        vad_raw, vad_out);
+    bf_process_with_weights(
+        p->bf, front->linear_spectra, doa_get_smooth(p->srp),
+        vad_out ? 0 : 1, frequency_mask, p->bf_spectrum,
+        p->bf_weights);
+
+    beam->spectrum = p->bf_spectrum;
+    beam->weights = p->bf_weights;
+    fill_frame_info(p, front, vad_raw, vad_out, 1, info);
+    p->frame_index += 1;
+    p->phase = 2;
     return FOUR_AEC_NR_RES_OK;
 }
 
@@ -668,51 +595,34 @@ int audio_pipeline_4ch_process_with_activity(
     int vad_raw,
     int vad_out,
     const int* frequency_mask,
-    float* output,
+    AudioPipeline4ChBeam* beam,
     AudioPipeline4ChFrameInfo* info) {
     FourAecFront front;
-    SeSpecFrame frame;
     int status;
-    int doa_analysis_frames;
     if (!p || p->destroyed || !microphones_interleaved || !far_reference ||
-        !output || !is_bool(vad_raw) || !is_bool(vad_out)) {
+        !beam || !se_flag_valid(vad_raw) || !se_flag_valid(vad_out)) {
         return FOUR_AEC_NR_RES_INVALID_ARGUMENT;
     }
-    status = four_aec_front_process(
-        p->core, microphones_interleaved, far_reference, &front);
+    status = audio_pipeline_4ch_process_front(
+        p, microphones_interleaved, far_reference, &front);
     if (status != FOUR_AEC_NR_RES_OK) return status;
-    if (front.n_channels != FOUR_AEC_NR_RES_CHANNELS ||
-        front.hop_size != p->hop_size ||
-        front.n_freqs != p->n_freqs) {
-        audio_pipeline_4ch_reset(p);
-        return FOUR_AEC_NR_RES_DSP_ERROR;
-    }
+    return audio_pipeline_4ch_process_beam(
+        p, &front, vad_raw, vad_out, frequency_mask, beam, info);
+}
 
-    /* front.linear_spectra[ch] borrows each lane's live spectrum; SRP/BF only read it, so no
-     * copy is needed. */
-    doa_step(
-        p->srp, front.linear_spectra, frequency_mask,
-        vad_raw, vad_out);
-    doa_analysis_frames = 1;
-    bf_process_with_weights(
-        p->bf, front.linear_spectra, doa_get_smooth(p->srp),
-        vad_out ? 0 : 1, frequency_mask, p->bf_spectrum,
-        p->bf_weights);
-
+int audio_pipeline_4ch_fuse(AudioPipeline4Ch* p, SeSpecFrame* frame) {
+    int status;
+    if (!p || p->destroyed || !frame || !p->cfg.core.enable_post)
+        return FOUR_AEC_NR_RES_INVALID_ARGUMENT;
+    if (p->phase != 2) return FOUR_AEC_NR_RES_SEQUENCE_ERROR;
     /* bf_spectrum and bf_weights come atomically from one bf_process_with_weights() call, so
-     * the mono error is handed over as is. No finite check here: four_aec_fuse() re-validates
-     * both arrays on every call. */
-    status = four_aec_fuse(p->core, p->bf_weights, p->bf_spectrum, &frame);
-    if (status == FOUR_AEC_NR_RES_OK)
-        status = run_post_stages(p, &frame, output);
-    if (status != FOUR_AEC_NR_RES_OK) {
+     * the beamformed error is handed over as is. No finite check here: four_aec_fuse()
+     * re-validates both arrays on every call. A refused fuse takes the whole unit down
+     * (the core resets itself), not only the core; a sequence refusal changed nothing. */
+    status = four_aec_fuse(p->core, p->bf_weights, p->bf_spectrum, frame);
+    if (status != FOUR_AEC_NR_RES_OK && status != FOUR_AEC_NR_RES_SEQUENCE_ERROR)
         audio_pipeline_4ch_reset(p);
-        return status;
-    }
-    fill_frame_info(
-        p, &front, vad_raw, vad_out, doa_analysis_frames, info);
-    p->frame_index += 1;
-    return FOUR_AEC_NR_RES_OK;
+    return status;
 }
 
 static int floats_finite(const float* values, size_t count) {
@@ -765,11 +675,11 @@ int audio_pipeline_4ch_process(
     AudioPipeline4Ch* p,
     const float* microphones_interleaved,
     const float* far_reference,
-    float* output,
+    AudioPipeline4ChBeam* beam,
     AudioPipeline4ChFrameInfo* info) {
     int speech;
     if (!p || p->destroyed || !microphones_interleaved || !far_reference ||
-        !output)
+        !beam)
         return FOUR_AEC_NR_RES_INVALID_ARGUMENT;
     /* auto_vad() reads only the microphones, so a non-finite far_reference would otherwise
      * move noise_power/vad_hangover before the deeper finite check notices it. Reject before
@@ -779,33 +689,7 @@ int audio_pipeline_4ch_process(
     speech = auto_vad(p, microphones_interleaved);
     return audio_pipeline_4ch_process_with_activity(
         p, microphones_interleaved, far_reference,
-        speech, speech, NULL, output, info);
-}
-
-int audio_pipeline_4ch_set_aec_preset(AudioPipeline4Ch* p, AecPreset preset,
-                                      float ramp_ms) {
-    if (!p || p->destroyed || !p->res) return -1;
-    /* The lanes never reach their own suppressor, so a preset change moves the post-beam
-     * suppressor, whose gain multiplies the output and scales the comfort noise.
-     * aec_res_set_preset() validates before writing, so a rejected call changes nothing. The
-     * lanes are left alone (retargeting them would be inert and park them mid-ramp). */
-    if (aec_res_set_preset(p->res, preset, ramp_ms) != 0) return -1;
-    p->cfg.core.aec_preset = preset;
-    return 0;
-}
-
-int audio_pipeline_4ch_post_split_floor(const AudioPipeline4Ch* p,
-                                        float* live, float* target) {
-    if (!p || p->destroyed || !p->res) return -1;
-    return aec_res_split_floor(p->res, live, target);
-}
-
-int audio_pipeline_4ch_set_nr_mode(AudioPipeline4Ch* p, AnrMode mode) {
-    if (!p || p->destroyed || !p->nr) return -1;
-    if (se_anr_stage_set_mode(p->nr, p->cfg.core.sample_rate, p->fft_size,
-                              p->hop_size, mode) != 0) return -1;
-    p->cfg.core.nr_mode = mode;
-    return 0;
+        speech, speech, NULL, beam, info);
 }
 
 void audio_pipeline_4ch_reset(AudioPipeline4Ch* p) {
@@ -813,10 +697,7 @@ void audio_pipeline_4ch_reset(AudioPipeline4Ch* p) {
     four_aec_nr_res_reset(p->core);
     srp_reset(p->srp);
     bf_reset(p->bf);
-    if (p->nr) se_anr_stage_reset(p->nr);
-    if (p->res) aec_res_reset(p->res);
-    ac_istft_reset(p->istft);
-    p->rng_state = SE_CNG_RNG_SEED;
+    p->phase = 0;
     p->vad_power_threshold =
         powf(10.0f, p->cfg.auto_vad_threshold_dbfs / 10.0f);
     p->noise_power = p->vad_power_threshold;
@@ -831,7 +712,6 @@ void audio_pipeline_4ch_destroy(AudioPipeline4Ch* p) {
      * pool-carved objects; only this wrapper's own owned_heap (create()) is freed. */
     bf_destroy(p->bf);
     srp_destroy(p->srp);
-    if (p->nr) se_anr_stage_destroy(p->nr);
     four_aec_nr_res_destroy(p->core);
     owned_heap = p->owned_heap;
     p->destroyed = 1;
@@ -907,12 +787,18 @@ int audio_pipeline_4ch_linear_aec_count(const AudioPipeline4Ch* p) {
     return p ? four_aec_nr_res_linear_aec_count(p->core) : 0;
 }
 
-int audio_pipeline_4ch_nr_count(const AudioPipeline4Ch* p) {
-    return p && !p->destroyed && p->nr ? 1 : 0;
+const FourAecNrRes* audio_pipeline_4ch_get_core(const AudioPipeline4Ch* p) {
+    return (p && !p->destroyed) ? p->core : NULL;
 }
 
-int audio_pipeline_4ch_post_res_count(const AudioPipeline4Ch* p) {
-    return p && !p->destroyed && p->res ? 1 : 0;
+void audio_pipeline_4ch_last_core_timing(const AudioPipeline4Ch* p,
+                                         FourAecNrResLastTiming* out) {
+    if (!out) return;
+    if (!p || p->destroyed) {
+        memset(out, 0, sizeof(*out));
+        return;
+    }
+    four_aec_nr_res_get_last_timing(p->core, out);
 }
 
 const char* audio_pipeline_4ch_spatial_backend(void) {
