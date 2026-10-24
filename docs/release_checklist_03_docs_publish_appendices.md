@@ -26,7 +26,7 @@ specifications.
 After all required gates pass:
 
 1. Freeze final commits.
-2. Change AEC from `4.0.0rc1` to the approved final version.
+2. Change AEC from `5.0.0rc1` to the approved final version.
 3. Consolidate NR's applicable `Unreleased` entries into a final version.
 4. Record Audio_ALG compatibility and exact AEC/NR pins.
 5. Add benchmark, real-array, board, and framework-smoke verdicts to the
