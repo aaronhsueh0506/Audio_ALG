@@ -786,7 +786,7 @@ $(BIN_DIR)/test_se_common: $(OBJ_DIR)/test_se_common.o $(OBJ_DIR)/se_config.o $(
 	$(LINK) -o $@ $(OBJ_DIR)/test_se_common.o $(OBJ_DIR)/se_config.o $(AEC_LIB) $(NR_LIB) $(COMMON_LIB) $(LDFLAGS)
 	@echo "test_se_common [$(BACKEND)] -> $@"
 
-# test_readme_flow: the call-flow examples of README.md, compiled and run (chain a stage, DFN and ULCNet phased hops).
+# test_readme_flow: the call-flow examples of README_01_latency_call_flow.md, compiled and run (chain a stage, DFN and ULCNet phased hops).
 $(BIN_DIR)/test_readme_flow: $(OBJ_DIR)/test_readme_flow.o $(ULCNET_PIPELINE_OBJS) $(OBJ_DIR)/ulcnet_model_io.o $(DFN_LIB_TARGET) $(AEC_LIB) $(NR_LIB) $(COMMON_LIB) | _cfg_guard
 	$(LINK) -o $@ $(OBJ_DIR)/test_readme_flow.o $(ULCNET_PIPELINE_OBJS) $(OBJ_DIR)/ulcnet_model_io.o $(DFN_LIB_TARGET) $(AEC_LIB) $(NR_LIB) $(COMMON_LIB) $(LDFLAGS)
 	@echo "test_readme_flow [$(BACKEND)] -> $@"

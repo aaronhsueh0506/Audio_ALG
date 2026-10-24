@@ -54,7 +54,7 @@ audiolib,Audio_ALG}`）**：
    （新 pipeline、新 model、新 seam API）→ 新頁面 + 更新 `index.html` 與
    `conventions.html` 的對照表（連結套用上面的 sibling 相對路徑規約）。
 3. **校正 md 文件**：受影響的 README、`docs/*.md`（尤其
-   `align_ulcnet_embedded_streaming_design_zh_TW.md`、
+   `align_ulcnet_embedded_streaming_design_zh_TW.md`（索引檔，第 6–11 章在同名 `_01_`／`_02_` part 檔）、
    `aiaec_streaming_readiness_zh_TW.md`、AEC 的 `c_user_manual_zh_TW.md` 與
    `nn_integration_interface.md`）。已被實作推翻的「現況」敘述必須改寫成
    「實作前查證紀錄」或直接更新，並標日期。

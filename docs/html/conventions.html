@@ -239,7 +239,7 @@ partition 的因果半、清掉其餘，避免 wrap-around 能量漏進下一個
 <p>AINR DFN2 的 C 是 center=False 串流（<code>dfn2_process.h</code> parity 限制 (1)），
 Align-ULCNet 的 C 出貨路徑也是 center=False rolling 分析，與 torch <code>center=True</code>
 的穩態幀逐 bit 重合（<code>ulcnet_process.h</code> 檔頭 +
-<code>docs/align_ulcnet_embedded_streaming_design_zh_TW.md</code> §7）。</p>
+<code>docs/align_ulcnet_embedded_streaming_design_zh_TW_01_state_wola_delay.md</code> §7）。</p>
 <p><b>穩態幀為何重合（逐 bit）：</b>本 grid 下 win = n_fft、hop = win/2、同一
 sqrt-Hann 窗。centered 第 k 幀以樣本 k·hop 為中心，覆蓋
 [k·hop − win/2, k·hop + win/2) = [(k−1)·hop, (k+1)·hop)；
@@ -341,7 +341,7 @@ rolling 排程後兩者天生 hop-locked，不需再靠 centered 排程的 0/2/1
 <code>lib/aec/c_impl/include/aec_balanced_config.h</code>、
 <code>pipelines/mono_aec_nr_res/main.c</code>、<code>pipelines/4ch_aec_bf_nr_res/audio_pipeline_4ch_static.c</code>（各 main 的 <code>AcIstft</code>）、
 <code>AIAEC/Align_ULCNet/ulcnet_process.c</code></td></tr>
-<tr><td>Framing 決策</td><td><code>docs/align_ulcnet_embedded_streaming_design_zh_TW.md</code> §7、
+<tr><td>Framing 決策</td><td><code>docs/align_ulcnet_embedded_streaming_design_zh_TW_01_state_wola_delay.md</code> §7、
 <code>AINR/DeepFilterNet2/dfn2_process.h</code> parity 限制 (1)</td></tr>
 <tr><td>測試</td><td><code>pipelines/tests/test_signal_grids.py</code>、
 <code>pipelines/mono_alignulcnet/tests/test_mono_ulcnet.c</code>、

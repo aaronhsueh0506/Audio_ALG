@@ -48,7 +48,7 @@ App                      Aec                 AnrDenoiser        AcIstft
 One hop is `grid.hop_size` samples (128 at 8 kHz and at the 16 kHz default, 256 at 16 kHz/512, 512 at
 48 kHz); the output trails the input by that one hop (the synthesis), `--aec-only` by none.
 Per-flow detail with return values: section 0 of
-[`../../docs/integration_mono_zh_TW.md`](../../docs/integration_mono_zh_TW.md).
+[`../../docs/integration_mono_zh_TW.md`](../../docs/integration_mono_zh_TW_01_overview_link_quickstart.md#0-速覽流程時序圖公開內部函式外部內部參數).
 
 Command line of the three programs (`main.c`, `static_main.c`; `example_board_adapter.c` takes none):
 

@@ -1,4 +1,4 @@
-/* The call-flow examples of pipelines/README.md, compiled and run.
+/* The call-flow examples of pipelines/README_01_latency_call_flow.md, compiled and run.
  *
  * Each function below is the code the README shows for one question: chaining
  * a new frequency-domain stage behind the AEC, finishing the hop, the memory a

@@ -1,6 +1,6 @@
 /** Reference board-adapter integration example for the mono AEC -> NR -> RES chain (REFERENCE
  * ONLY): a compilable host simulation of a board-side common-memory-manager integration. It
- * shows the calling sequence, error handling and pool-size accounting of pipelines/README.md
+ * shows the calling sequence, error handling and pool-size accounting of pipelines/README_02_build_debug_board.md
  * "Board Integration". It does not replace the platform adapter, memory manager, target build
  * or link map. Every `board_mem_*` function is a stand-in over a static host array; points
  * where platform code must be substituted are marked `BOARD:`.

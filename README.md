@@ -110,7 +110,7 @@ README inside the corresponding model directory.
 
 - [Documentation index](docs/README.md)
 - [C integration manual](docs/c_user_manual_zh_TW.md)
-- [AEC / NR / audiolib C API quick reference](docs/audio_libraries_c_api_zh_TW.md)
+- [AEC / NR / audiolib C API quick reference](docs/audio_libraries_c_api_zh_TW.md) (index; chapters in `docs/audio_libraries_c_api_zh_TW_01_*.md` to `_04_*.md`, linked from the index)
 - [Frequency-domain pipeline design](docs/freq_domain_pipeline_design.md)
 - [AIAEC current candidate matrix](docs/ai_aec_candidate_matrix.md)
 - [Development and submodule workflow](docs/development.md)

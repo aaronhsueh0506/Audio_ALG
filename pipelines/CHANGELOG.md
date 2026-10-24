@@ -3,54 +3,65 @@
 `Audio_ALG/pipelines`（含它建置的 `AINR`、`AIAEC` C 程式）的重要改動記錄在此，格式依
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/)。README 只寫現況，改動經過寫在這裡。
 
-## [Unreleased] — 2026-10-24 — 4ch 單元不再帶 post-beam RES：應用用 libaec 自建 AecRes
+## [Unreleased] — 2026-10-24 — The 4-channel unit no longer carries the post-beam RES: applications create the AecRes with libaec
 
-取代同日「Pipeline usage fix」那一條中關於 4ch 單元持有 RES 的敘述（`enable_res` / `res_preset` 欄位、
-`audio_pipeline_4ch_res()`、單元 `fuse()` 填 `g_res_ctx`、Python 管線持有抑制器、layout 19 與 hash 0x9a3abcc7）。
-同一條裡刪除 `samples/se_sample_chain.h` 的部分不變。mono 不變。
+Supersedes the statements in the same-day "Pipeline usage fix" entry that the 4-channel unit owns the RES
+(`enable_res` / `res_preset` fields, `audio_pipeline_4ch_res()`, `fuse()` filling `g_res_ctx`, the Python
+pipeline owning the suppressor, layout 19 and hash 0x9a3abcc7). The removal of `samples/se_sample_chain.h`
+recorded there stands. Mono is unchanged.
 
 ### Changed
-- `AudioPipeline4Ch` 回到只含共用 delay aligner、四條 AEC lane、SRP-PHAT、BF 與 `fuse()` 投影。`AudioPipeline4ChConfig`
-  沒有 `enable_res` / `res_preset`，沒有 `audio_pipeline_4ch_res()`；單元 pool 不再切 `AecRes`。`audio_pipeline_4ch_fuse()` 與核心的
-  `four_aec_fuse()` 一樣讓 `frame->g_res_ctx = NULL`。`audio_pipeline_4ch_reset()` 只重置核心、SRP、BF 與備援 VAD，
-  應用要自己 `aec_res_reset()`。
-- RES 由 libaec 管理。要 RES 的 4ch 應用在自己的 init 裡建：`aec_config_from_preset(preset, sample_rate)`（`fft_size` 取單元的格點）、
-  `aec_res_get_mem_size()`、`aec_res_init()`；每 hop 呼叫 `se_res_stage_gain(res, &frame)`（`common/se_stage.h`，包 `aec_res_process()`）；
-  強度用 `aec_res_set_preset(res, preset, ramp_ms)`；重置用 `aec_res_reset()`（沒有 `aec_res_destroy`，header 寫明無物可釋放）。
-  做法的範例：`4ch_aec_bf_nr_res/audio_pipeline_4ch_raw.c`、`audio_pipeline_4ch_static.c`、`4aec_nr_res_static.c`（核心）與
-  `4ch_aec_bf_dfn_res/main.c`。`4ch_alignulcnet` 以 `core.enable_post = 0` 跑單元，沒有 RES。
-- 4ch 應用的每 hop 順序：`process`（delay、lane、SRP-PHAT、BF）→ `fuse`（E、R2、CN；`g_res_ctx` 為 NULL）→
-  `se_res_stage_gain()` → NR gain → `sk_min_f32()` → CNG → 合成。RES 被拒（回 NULL）時，單元與所有後級一起 reset。
-- mono 不變：RES gain 在 `aec_process_context()` 內算，經 `se_frame_from_aec()` 以 `frame.g_res_ctx` 交出，強度用 `aec_set_preset()`；
-  純 AEC 的範例可呼叫完整的 `aec_process()`（RES 與最後的合成在同一呼叫內）。
-- `AUDIO_PIPELINE_4CH_LAYOUT_VERSION` 20 -> **21**；單元的 `build_flags_hash`（carve token 不再含 `res`）0x9a3abcc7 -> 0x8aabdea5。
-  `FOUR_AEC_NR_RES_LAYOUT_VERSION` 維持 **24**。
-- NR 範例（`audio_pipeline_4ch_raw`、`audio_pipeline_4ch_static`、`4aec_nr_res_static`）的輸出與上一版逐位元相同。
-- Python：`FourChannelAecPipeline` 不再持有 post-beam 抑制器；`fuse()` 只做投影（`context.res_gain` 為 None）。
-  `PostBeamResidualSuppressor.from_aec_config()`、`FourChannelFrame.aligned_render` 與 `PostBeamResidualSuppressor` 的套件匯出回來
-  （與 2a01f0e 時相同），應用自己建抑制器並呼叫 `process(post.context, post.aligned_render)`；強度用它的 `set_preset()`。
+- `AudioPipeline4Ch` is again only the shared delay aligner, the four AEC lanes, SRP-PHAT, BF and the `fuse()`
+  projection. `AudioPipeline4ChConfig` has no `enable_res` / `res_preset`, there is no `audio_pipeline_4ch_res()`, and
+  the unit pool carves no `AecRes`. `audio_pipeline_4ch_fuse()` leaves `frame->g_res_ctx = NULL`, like the core's
+  `four_aec_fuse()`. `audio_pipeline_4ch_reset()` resets only the core, SRP, BF and the fallback VAD; the application
+  calls `aec_res_reset()` itself.
+- RES is managed by libaec. A 4-channel application that wants it builds it in its own init:
+  `aec_config_from_preset(preset, sample_rate)` (with `fft_size` taken from the unit's grid), `aec_res_get_mem_size()`,
+  `aec_res_init()`; per hop it calls `se_res_stage_gain(res, &frame)` (`common/se_stage.h`, a wrapper over
+  `aec_res_process()`); strength is `aec_res_set_preset(res, preset, ramp_ms)`; reset is `aec_res_reset()` (there is
+  no `aec_res_destroy`: the header states there is nothing to release). Examples: `4ch_aec_bf_nr_res/audio_pipeline_4ch_raw.c`,
+  `audio_pipeline_4ch_static.c`, `4aec_nr_res_static.c` (core) and `4ch_aec_bf_dfn_res/main.c`. `4ch_alignulcnet` runs the
+  unit with `core.enable_post = 0` and has no RES.
+- Per-hop order of a 4-channel application: `process` (delay, lanes, SRP-PHAT, BF) -> `fuse` (E, R2, CN; `g_res_ctx`
+  NULL) -> `se_res_stage_gain()` -> NR gain -> `sk_min_f32()` -> CNG -> synthesis. A refused call (including a NULL
+  RES gain) resets the unit and every post stage together; a refusal of the unit's own `process` also resets the post
+  stages in `audio_pipeline_4ch_raw` and `audio_pipeline_4ch_static`.
+- Mono is unchanged: the RES gain is computed inside `aec_process_context()` and handed over as `frame.g_res_ctx` by
+  `se_frame_from_aec()`, strength through `aec_set_preset()`; a pure-AEC example may call the full `aec_process()`
+  (RES and the final synthesis in one call).
+- `AUDIO_PIPELINE_4CH_LAYOUT_VERSION` 20 -> **21**; the unit's `build_flags_hash` (the carve token no longer contains
+  `res`) 0x9a3abcc7 -> 0x8aabdea5. `FOUR_AEC_NR_RES_LAYOUT_VERSION` stays **24**.
+- The NR examples (`audio_pipeline_4ch_raw`, `audio_pipeline_4ch_static`, `4aec_nr_res_static`) produce output
+  bit-identical to the previous commit.
+- Python: `FourChannelAecPipeline` no longer owns the post-beam suppressor; `fuse()` only projects
+  (`context.res_gain` is None). `PostBeamResidualSuppressor.from_aec_config()`, `FourChannelFrame.aligned_render` and the
+  package export of `PostBeamResidualSuppressor` are back (as at 2a01f0e); the application builds the suppressor and calls
+  `process(post.context, post.aligned_render)`, strength through its `set_preset()`.
 
 ### Removed
-- `AudioPipeline4ChConfig.enable_res`、`AudioPipeline4ChConfig.res_preset`、`audio_pipeline_4ch_res()`。
-- Python：`FourChannelAecConfig.enable_res` / `aec_preset`、`pipeline.post_beam_res`。
+- `AudioPipeline4ChConfig.enable_res`, `AudioPipeline4ChConfig.res_preset`, `audio_pipeline_4ch_res()`.
+- Python: `FourChannelAecConfig.enable_res` / `aec_preset`, `pipeline.post_beam_res`.
 
-### Pool sizes（NE10、`SIMD=1`、matched n=5；單位 byte；`--print-mem-size` 與範例執行檔印出的值）
+### Pool sizes (NE10, `SIMD=1`, matched n=5; bytes; as printed by `--print-mem-size` and the example binaries)
 | Item | 16 kHz 256/128 | 16 kHz 512/256 | 48 kHz 1024/512 |
 |---|---|---|---|
-| 4ch 單元單獨（`audio_pipeline_4ch_get_mem_requirements()`） | 1,698,864 | 2,992,496 | 6,300,432 |
-| 範例另切的 `AecRes`（`aec_res_get_mem_size()`） | 7,904 | 14,048 | 29,408 |
-| 單元 + 後級（`audio_pipeline_4ch_static`） | 1,765,552 | 3,088,960 | 6,525,488 |
-| 4ch 前端 + 自建 `AecRes` + 後級（`4aec_nr_res_static`，未變） | 973,776 | 1,519,968 | 3,402,064 |
-| 4ch DFN2（`4ch_aec_bf_dfn_res`，主機端） | 2,058,752 | | 6,617,008 |
-| 4ch Align-ULCNet 單元（無 RES）+ stage（`4ch_alignulcnet`） | 2,982,160 + 36,400 | | 6,279,856 + 71,728 |
+| 4ch unit alone (`audio_pipeline_4ch_get_mem_requirements()`) | 1,698,864 | 2,992,496 | 6,300,432 |
+| `AecRes` carved by the example (`aec_res_get_mem_size()`) | 7,904 | 14,048 | 29,408 |
+| Unit + post stages (`audio_pipeline_4ch_static`) | 1,765,552 | 3,088,960 | 6,525,488 |
+| 4ch front end + own `AecRes` + post stages (`4aec_nr_res_static`, unchanged) | 973,776 | 1,519,968 | 3,402,064 |
+| 4ch DFN2 (`4ch_aec_bf_dfn_res`, host side) | 2,058,752 | | 6,617,008 |
+| 4ch Align-ULCNet unit (no RES) + stage (`4ch_alignulcnet`) | 2,982,160 + 36,400 | | 6,279,856 + 71,728 |
 
-單元單獨比上一條少 `AecRes` 加 16 B 控制區塊（16 kHz/256：1,706,784 -> 1,698,864）；`core.enable_post = 0` 的單元
-16 kHz/256 為 1,693,648、16 kHz/512 為 2,982,160、48 kHz/1024 為 6,279,856。
+The unit alone is smaller than in the previous entry by the `AecRes` plus a 16 B control block (16 kHz/256:
+1,706,784 -> 1,698,864); with `core.enable_post = 0` the unit is 1,693,648 at 16 kHz/256, 2,982,160 at 16 kHz/512 and
+6,279,856 at 48 kHz/1024.
 
 ### Migration notes for board code
-- 重新編譯。layout 18、19、20 的單元 descriptor 會被 `init_ex()` 拒絕，請重新查詢。
-- 設過 `cfg.enable_res` / `cfg.res_preset`、呼叫過 `audio_pipeline_4ch_res(p)` 的程式：改成自己建 `AecRes`（上面的順序），
-  每 hop 讀 `se_res_stage_gain()` 的回傳，不再讀 `frame.g_res_ctx`；reset 時加上 `aec_res_reset(res)`。
+- Rebuild. `init_ex()` rejects unit descriptors of layout 18, 19 and 20; query them again.
+- Code that set `cfg.enable_res` / `cfg.res_preset` or called `audio_pipeline_4ch_res(p)`: create the `AecRes` yourself
+  (sequence above), use the return value of `se_res_stage_gain()` instead of `frame.g_res_ctx`, and add
+  `aec_res_reset(res)` to your reset path.
 
 ## [Unreleased] — 2026-10-24 — AEC streaming FIFO removed: smaller lane pools
 

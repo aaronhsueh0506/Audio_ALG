@@ -103,12 +103,23 @@ def test_docs_publish_the_current_layout_version(macro):
         % (macro, expected, '\n  '.join(stale)))
 
 
+def _manual_text(path: pathlib.Path) -> str:
+    """Text of a manual: the entry file plus its ``<stem>_NN_<topic>.md`` parts.
+
+    A long manual is split into an index and part files; the claim may live in
+    any of them, so the scan covers the whole set instead of weakening the pin.
+    """
+    files = [path] + sorted(
+        path.parent.glob('%s_[0-9][0-9]_*%s' % (path.stem, path.suffix)))
+    return '\n'.join(f.read_text(encoding='utf-8') for f in files)
+
+
 @pytest.mark.parametrize('relative_path,macro,pattern',
                          _UNQUALIFIED_CURRENT_CLAIMS)
 def test_unqualified_current_layout_claims(relative_path, macro, pattern):
     """Current-value prose must move with the corresponding C counter."""
     path = _REPO / relative_path
-    matches = pattern.findall(path.read_text(encoding='utf-8'))
+    matches = pattern.findall(_manual_text(path))
     assert matches, '%s 的目前版號宣稱格式已改；請同步更新測試' % relative_path
     expected = _declared_version(macro)
     assert all(int(value) == expected for value in matches), (

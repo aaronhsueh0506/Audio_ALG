@@ -333,7 +333,7 @@ delta_ratio &lt; 0.3
 
 <p><strong>問題場景</strong>：白噪音、風扇、冷氣等穩態 far-end + 近端有人講話 → 傳統 DT 偵測全部失效（dt_indicator → 0, coh² → 1），RES 把語音當 echo 壓掉。</p>
 
-<p>AEC3 post chain 以 StationarityEstimator 與 <code>is_stationary_dt</code> 旗標處理這個場景，演算法見 <a href="../lib/aec/docs/aec_methods.md">lib/aec/docs/aec_methods.md</a> §3.1。</p>
+<p>AEC3 post chain 以 StationarityEstimator 與 <code>is_stationary_dt</code> 旗標處理這個場景，演算法見 <a href="../lib/aec/docs/aec_methods.md">lib/aec/docs/aec_methods.md</a> <a href="../lib/aec/docs/aec_methods_02_post_filter.md#31-stationarityestimator">§3.1</a>。</p>
 
 </div>
 

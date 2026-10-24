@@ -8,13 +8,13 @@ document disagrees with them.
 | Topic | Document |
 |---|---|
 | Repository scope and signal-grid boundary | [`../README.md`](../README.md) |
-| Conventional mono AEC + NR/RES | [`../pipelines/README.md`](../pipelines/README.md) |
+| Conventional mono AEC + NR/RES (index, architecture and call sequence; latency and call flow in [`part 01`](../pipelines/README_01_latency_call_flow.md), build, debug flags and board integration in [`part 02`](../pipelines/README_02_build_debug_board.md), tunable parameters and troubleshooting in [`part 03`](../pipelines/README_03_tuning_troubleshooting.md)) | [`../pipelines/README.md`](../pipelines/README.md) |
 | C and caller-owned-pool integration | [`c_user_manual_zh_TW.md`](c_user_manual_zh_TW.md) |
-| AEC / NR / audiolib public API quick reference | [`audio_libraries_c_api_zh_TW.md`](audio_libraries_c_api_zh_TW.md) |
+| AEC / NR / audiolib public API quick reference (index, chapters 1-2; chapters 3-5 in [`part 01`](audio_libraries_c_api_zh_TW_01_aec_nr_audiolib.md), 6.1-6.5 in [`part 02`](audio_libraries_c_api_zh_TW_02_ai_prepost_models.md), 6.6-6.10 in [`part 03`](audio_libraries_c_api_zh_TW_03_ai_prepost_pipeline.md), chapters 7-9 in [`part 04`](audio_libraries_c_api_zh_TW_04_pool_build_checklist.md)) | [`audio_libraries_c_api_zh_TW.md`](audio_libraries_c_api_zh_TW.md) |
 | DEBUG observability: current inventory and proposals | [`debug_observability_zh_TW.md`](debug_observability_zh_TW.md) |
-| Board integration (separate libraries, the one 4-channel unit's descriptor) | [`pipeline_board_integration.md`](pipeline_board_integration.md) |
+| Board integration (separate libraries, the one 4-channel unit's descriptor) (index and scope; sequence and pool sizing in [`part 01`](pipeline_board_integration_01_sequence.md), warnings, descriptor, dirty-pool, `NO_STDIO=1` and teardown in [`part 02`](pipeline_board_integration_02_contract.md), verification checklist, board build and compile flags in [`part 03`](pipeline_board_integration_03_verify_build.md)) | [`pipeline_board_integration.md`](pipeline_board_integration.md) |
 | Frequency-domain gain fusion | [`freq_domain_pipeline_design.md`](freq_domain_pipeline_design.md) |
-| Four-channel front end (external beamformer seam), the linear AEC + BF unit and the Python reference | [`../pipelines/4ch_aec_bf_nr_res/README.md`](../pipelines/4ch_aec_bf_nr_res/README.md) |
+| Four-channel front end (external beamformer seam), the linear AEC + BF unit and the Python reference (index, call sequence and Python reference seam; the C API chapter in [`part 01`](../pipelines/4ch_aec_bf_nr_res/README_01_c_api.md)) | [`../pipelines/4ch_aec_bf_nr_res/README.md`](../pipelines/4ch_aec_bf_nr_res/README.md) |
 | Four-channel Align-ULCNet application (the unit's BF spectrum goes to the model directly) | [`../pipelines/4ch_alignulcnet/README.md`](../pipelines/4ch_alignulcnet/README.md) |
 | Mono AEC + RES + DeepFilterNet2 application | [`../pipelines/mono_aec_dfn_res/README.md`](../pipelines/mono_aec_dfn_res/README.md) |
 | Four-channel unit + application-owned libaec `AecRes` + DeepFilterNet2 application | [`../pipelines/4ch_aec_bf_dfn_res/README.md`](../pipelines/4ch_aec_bf_dfn_res/README.md) |
@@ -23,12 +23,12 @@ document disagrees with them.
 | DFN3 raw-low / masked-high comparison contract | [`../AINR/DeepFilterNet3/README.md`](../AINR/DeepFilterNet3/README.md) |
 | Neural AEC candidates | [`../AIAEC/README.md`](../AIAEC/README.md) |
 | AIAEC candidate decision matrix | [`ai_aec_candidate_matrix.md`](ai_aec_candidate_matrix.md) |
-| PBFDKF + Align-ULCNet embedded streaming proposal | [`align_ulcnet_embedded_streaming_design_zh_TW.md`](align_ulcnet_embedded_streaming_design_zh_TW.md) |
+| PBFDKF + Align-ULCNet embedded streaming proposal (index, chapters 1-5; chapters 6-9 in [`part 01`](align_ulcnet_embedded_streaming_design_zh_TW_01_state_wola_delay.md), chapters 10-11 in [`part 02`](align_ulcnet_embedded_streaming_design_zh_TW_02_npu_boundary_validation.md)) | [`align_ulcnet_embedded_streaming_design_zh_TW.md`](align_ulcnet_embedded_streaming_design_zh_TW.md) |
 | AIAEC four-candidate streaming readiness audit | [`aiaec_streaming_readiness_zh_TW.md`](aiaec_streaming_readiness_zh_TW.md) |
-| Mono integration (sequence diagram, calls, external/internal parameters, config/pool/errors) | [`integration_mono_zh_TW.md`](integration_mono_zh_TW.md) |
-| 4ch core integration (`4aec_nr_res`; own beamformer; sequence, calls, parameters) | [`integration_4ch_core_zh_TW.md`](integration_4ch_core_zh_TW.md) |
-| 4ch linear AEC + BF unit integration (`AudioPipeline4Ch`, up to `fuse()`; the application creates its own libaec `AecRes`; sequence, calls, parameters) | [`integration_4ch_spatial_zh_TW.md`](integration_4ch_spatial_zh_TW.md) |
-| Release gate and reference test targets | [`release_checklist.md`](release_checklist.md) |
+| Mono integration (sequence diagram, calls, external/internal parameters, config/pool/errors; index and chapters 6-8, chapters 0-2 in [`part 01`](integration_mono_zh_TW_01_overview_link_quickstart.md), chapters 3-5 in [`part 02`](integration_mono_zh_TW_02_lifecycle_config_errors.md)) | [`integration_mono_zh_TW.md`](integration_mono_zh_TW.md) |
+| 4ch core integration (`4aec_nr_res`; own beamformer; sequence, calls, parameters; index and chapter 0, chapters 1-2 in [`part 01`](integration_4ch_core_zh_TW_01_library_quickstart.md), chapter 3 in [`part 02`](integration_4ch_core_zh_TW_02_lifecycle.md), chapter 4 in [`part 03`](integration_4ch_core_zh_TW_03_config.md), chapters 5-8 in [`part 04`](integration_4ch_core_zh_TW_04_errors_checklist_versions.md)) | [`integration_4ch_core_zh_TW.md`](integration_4ch_core_zh_TW.md) |
+| 4ch linear AEC + BF unit integration (`AudioPipeline4Ch`, up to `fuse()`; the application creates its own libaec `AecRes`; sequence, calls, parameters) (index, chapters 0-1; chapter 2 in [`part 01`](integration_4ch_spatial_zh_TW_01_quick_start.md), 3 in [`part 02`](integration_4ch_spatial_zh_TW_02_lifecycle.md), 4 in [`part 03`](integration_4ch_spatial_zh_TW_03_config.md), 5 in [`part 04`](integration_4ch_spatial_zh_TW_04_errors.md), 6 in [`part 05`](integration_4ch_spatial_zh_TW_05_shipped_vs_examples.md), 7 in [`part 06`](integration_4ch_spatial_zh_TW_06_checklist.md), 8 in [`part 07`](integration_4ch_spatial_zh_TW_07_versioning.md)) | [`integration_4ch_spatial_zh_TW.md`](integration_4ch_spatial_zh_TW.md) |
+| Release gate and reference test targets (index, chapters 1-7; chapters 8-10 in [`part 01`](release_checklist_01_pipeline_gates.md), chapters 11-12 in [`part 02`](release_checklist_02_ainr_aiaec_gates.md), chapters 13-15 and appendices A-C in [`part 03`](release_checklist_03_docs_publish_appendices.md)) | [`release_checklist.md`](release_checklist.md) |
 | Development / submodules | [`development.md`](development.md) |
 
 The offline HTML documentation site lives in [`html/`](html/index.html): one

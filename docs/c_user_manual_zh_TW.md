@@ -101,7 +101,7 @@ mic/ref
 
 主要設計點：
 
-1. AEC 設 `enable_res=0`，讓 time output 保持 linear residual；同時設 `return_res_context=1`，仍由 AEC3 post block 計算 frequency seam（此組態下 formed seam 另有 capture 候選，`ctx.error_spec` 不保證每個 hop 都是誤差，見 [AEC C 使用手冊](../lib/aec/docs/c_user_manual_zh_TW.md) §8.1）。
+1. AEC 設 `enable_res=0`，讓 time output 保持 linear residual；同時設 `return_res_context=1`，仍由 AEC3 post block 計算 frequency seam（此組態下 formed seam 另有 capture 候選，`ctx.error_spec` 不保證每個 hop 都是誤差，見 [AEC C 使用手冊](../lib/aec/docs/c_user_manual_zh_TW_04_seam_troubleshooting.md#81-context-only-處理路徑) §8.1）。
 2. `R²` 除以 `32768²` 後，作為 NR 的 `extra_noise_psd`，得到 echo-aware `G_nr`。
 3. `G_nr` 與 AEC3 `G_res` 逐 bin 取較小值，不重複跑另一個時域 RES。
 4. `g_total` 直接取 `min(G_nr, G_res)`。post 段沒有 near-end floor，也沒有任何依賴廣帶能量的 lift；一個 bin 是否被保留，完全由 NR 自己的 speech-presence 模型與 AEC3 的 `G_res` 決定，所以環境噪聲大也不會把 NR 壓住或讓噪聲底跟著遠端起伏。
@@ -496,7 +496,7 @@ Audio_ALG 的範例程式（`pipelines/mono_aec_nr_res/main.c` 等）直接用 N
 
 - 每條串流各有一組 AEC、NR、FFT、OLA 與 RNG state。
 - instance 不可由多個 thread 無同步同時 process。
-- 換獨立串流前 reset AEC、NR、合成 OLA 與 comfort-noise RNG（四件一起，見 [mono 手冊 §3](integration_mono_zh_TW.md)）；或直接 destroy/create。
+- 換獨立串流前 reset AEC、NR、合成 OLA 與 comfort-noise RNG（四件一起，見 [mono 手冊 §3](integration_mono_zh_TW_02_lifecycle_config_errors.md#3-lifecycle)）；或直接 destroy/create。
 - create 失敗時必須釋放已成功建立的子模組與 buffer。
 - malloc reference path（`aec_nr_pipeline`）在初始化時用 `posix_memalign()` 配置各函式庫的區塊；process loop 本身不配置記憶體。
 - 單一 caller-owned pool 的 static-memory 版本已完整支援：`aec_nr_pipeline_static` 各自查大小、各自 init
@@ -517,6 +517,6 @@ Audio_ALG 的範例程式（`pipelines/mono_aec_nr_res/main.c` 等）直接用 N
 | 輸出有洞或不自然靜音 | CNG 關閉或 gain 過深 | A/B 比較有無 `--no-cng`；CNG 只填 `G_res` 切掉的 bin，位準乘該 bin 的 NR gain（下限 −10 dB） |
 | 不同檔案結果互相影響 | state 未 reset | 每個獨立 stream reset 或重建全部 instance |
 | 尾端樣本變短 | CLI 只處理完整 hop | 上層先 padding，並在輸出後裁回原長度 |
-| 想用現成的 mono 整合寫法 | — | 見 `pipelines/mono_aec_nr_res/main.c`／`static_main.c` + `pipelines/README.md`「Board Integration」；本手冊第 5 節的 wrapper 是直接組合 AEC／NR 的範例 |
+| 想用現成的 mono 整合寫法 | — | 見 `pipelines/mono_aec_nr_res/main.c`／`static_main.c` + `pipelines/README_02_build_debug_board.md`「Board Integration」；本手冊第 5 節的 wrapper 是直接組合 AEC／NR 的範例 |
 
 定位問題時建議依序比較：`--aec-only`、完整 production、`--no-cng`、`--legacy-amin`，再用 `DUMP_CTX` 檢查 `E(f)`、`G_res`、`R²` 與 `G_nr`。
