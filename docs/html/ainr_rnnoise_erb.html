@@ -1,3 +1,6 @@
+<!doctype html>
+<html lang="zh-Hant">
+<head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title>AINR RNNoise-ERB</title>
@@ -24,16 +27,28 @@ th{background:#eef1f5}
  .note{color:#9aa7b4}
 }
 </style>
+</head>
+<body>
 <nav>
-<a href="index.html">index</a>
+<a href="index.html">索引</a>
+<a href="conventions.html">慣例</a>
+<a href="conventions_latency.html">延遲預算</a>
+<a href="onnx_prepost.html">ONNX 邊界</a>
 <a href="ainr_dfn2.html">DFN2</a>
+<a href="ainr_dfn2_detail.html">DFN2 細節</a>
+<a href="ainr_dfn2_usage.html">DFN2 使用</a>
+<a href="ainr_dfn3.html">DFN3</a>
+<a href="ainr_dfn3_usage.html">DFN3 使用</a>
 <a href="ainr_gtcrn.html">GTCRN</a>
+<a href="ainr_gtcrn_usage.html">GTCRN 使用</a>
 <a href="ainr_rnnoise_erb.html"><b>RNNoise-ERB</b></a>
+<a href="ainr_rnnoise_erb_usage.html">RNNoise-ERB 使用</a>
 </nav>
 
 <h1>AINR RNNoise-ERB (16 kHz ERB band-gain 模型)</h1>
 
 <h2>概要</h2>
+<p class="note">如何呼叫、流程時序圖、外部／內部參數表：<a href="ainr_rnnoise_erb_usage.html">ainr_rnnoise_erb_usage</a>。</p>
 <p>RNNoise v0.2 方向(Conv+GRU)的輕量 16 kHz 降噪模型:網路輸出 22 個實數
 ERB band gain(sigmoid ∈ [0,1]),由 C 端經 partition-of-unity 反向三角矩陣展開為
 257 個 bin gain 後套在頻譜上。出貨設定為<b>純 ERB</b>
@@ -207,3 +222,5 @@ config/Python/C feature 合約、feature-state 行為、framing 拒絕錯誤設�
 <li>Python 測試:<code>AINR/RNNoise-ERB/tests/</code>(pytest);
 共用測試位於 <code>AINR/tests/</code>；全樹請執行 <code>python3 -m pytest AINR</code>。</li>
 </ul>
+</body>
+</html>

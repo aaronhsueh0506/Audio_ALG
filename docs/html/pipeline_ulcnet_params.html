@@ -1,0 +1,98 @@
+<!DOCTYPE html>
+<html lang="zh-Hant">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>ULCNet pipeline 參數表</title>
+<style>
+body{font-family:-apple-system,"PingFang TC","Noto Sans TC",sans-serif;max-width:960px;margin:0 auto;padding:16px;line-height:1.55;color:#222;background:#fff}
+nav{border-bottom:1px solid #ccc;padding-bottom:8px;margin-bottom:16px;font-size:14px}
+nav a{margin-right:12px;text-decoration:none;color:#0645ad}
+h1{font-size:22px}h2{font-size:17px;border-left:4px solid #47a;padding-left:8px;margin-top:28px}
+h3{font-size:15px}
+pre{background:#f6f6f4;border:1px solid #ddd;padding:10px;overflow-x:auto;font-size:12px;line-height:1.35}
+code{background:#f0f0ee;padding:1px 3px;font-size:0.92em}
+table{border-collapse:collapse;font-size:13px;margin:8px 0;display:block;overflow-x:auto}
+th,td{border:1px solid #bbb;padding:4px 8px;text-align:left;vertical-align:top}
+th{background:#eef2f8}
+.note{background:#fff8e0;border:1px solid #e0d090;padding:8px;font-size:13px}
+</style>
+</head>
+<body>
+<nav>
+<a href="index.html">index</a>
+<a href="pipeline_mono.html">pipeline_mono</a>
+<a href="pipeline_4ch.html">pipeline_4ch</a>
+<a href="pipeline_ulcnet_mono.html">pipeline_ulcnet_mono</a>
+<a href="pipeline_ulcnet_4ch.html">pipeline_ulcnet_4ch</a>
+<a href="pipeline_ulcnet_usage.html">呼叫</a>
+<a href="pipeline_ulcnet_sequence.html">時序圖</a>
+<a href="pipeline_ulcnet_params.html"><b>參數表</b></a>
+<a href="pipeline_ulcnet_detail.html">pipeline_ulcnet_detail</a>
+<a href="aiaec_align_ulcnet.html">Align-ULCNet</a>
+<a href="onnx_prepost.html">ONNX 邊界</a>
+</nav>
+
+<h1>Align-ULCNet pipeline 的參數表(外部／內部)</h1>
+
+<h2>概要</h2>
+<p>分類準則同 <a href="pipeline_dfn_params.html">pipeline_dfn_params</a>:<b>外部</b> = 第三方整合者可以調的;<b>整合者專用</b> = 串接拓樸;<b>內部</b> = 存在且可改、但不建議開放。範圍涵蓋 <a href="pipeline_ulcnet_mono.html">mono</a> 與 <a href="pipeline_ulcnet_4ch.html">4ch</a> 兩個範例使用的設定面。出處是 Audio_ALG 內的 <code>檔案:行號</code>(行號隨原始碼移動,以符號為準)。</p>
+<p class="note"><b>沒有執行期強度 setter,而且是刻意的</b>:這條鏈沒有 RES、NR 實例，AEC 側只留線性半邊，塑形輸出的是 ULCNet 的 mask，所以「回音壓多深」是模型的性質。要改強度請重新訓練／更換模型，或改用有 DSP 後級的 <a href="pipeline_mono.html">pipeline_mono</a>／<a href="pipeline_4ch.html">pipeline_4ch</a>。</p>
+
+<h2>1. 外部參數</h2>
+<table>
+<tr><th>參數</th><th>出處</th><th>範圍／預設</th><th>何時改、備註</th></tr>
+<tr><td><code>ULCNET_GRID=16k|48k</code></td><td><code>pipelines/Makefile:83</code></td><td>16k(預設)→ <code>ULCNET_MODEL_IO_SR=16000</code>／<code>N_FFT=512</code>;48k → 48000／1024</td><td>build 時。一個 binary 一個格點;其他 SR／FFT 組合是編譯錯誤(<code>AIAEC/Align_ULCNet/ulcnet_model_io.h:49</code>)</td></tr>
+<tr><td><code>ULCNET_EXAMPLE_DELAY_FRAMES</code>(delay depth D)</td><td><code>pipelines/mono_alignulcnet/main.c:32</code></td><td>預設 8;<code>[ULCNET_MODEL_IO_MIN_D, MAX_D]</code> = [2, 64]</td><td><b>必須等於模型匯出時的 D</b>:descriptor 驗證只查範圍,不符不會報錯。板端應由匯出 metadata 填 <code>UlcnetModelIoDescriptor</code>(出貨 checkpoint 不全是 D=8)</td></tr>
+<tr><td><code>ULCNET_EXAMPLE_DELAY_NUM_FILTERS</code></td><td><code>pipelines/mono_alignulcnet/main.c:42</code></td><td>預設 <code>DA_NUM_FILTERS</code> = 5;1..5</td><td>build 時的預設,CLI 優先</td></tr>
+<tr><td><code>--delay-mode</code> <code>--delay-num-filters</code> <code>--fixed-delay</code> <code>-h</code></td><td><code>pipelines/mono_alignulcnet/main.c:87</code></td><td>matched(預設)|fixed|external;n 1..5(僅 matched);fixed 樣本 ≥ 0(僅 fixed)</td><td>兩個範例的 CLI。mono 用 atoi(非數字當 0),4ch 也用非嚴格的 <code>mcab_set_delay_option(…, 0, …)</code>(<code>pipelines/4ch_alignulcnet/main.c:109</code>);被拒回 2。n 不是 runtime 旋鈕,改了要重查 pool。可靠搜尋範圍 n=1…5 約 125／221／317／413／509 ms</td></tr>
+<tr><td><code>SeRequest</code> 的 <code>delay_*</code>、<code>aec_preset</code>(mono)</td><td><code>pipelines/common/se_config.h:29</code></td><td>preset 須為 enum 內的值</td><td>此鏈不使用 <code>Aec</code> 的抑制增益(post 區塊停在 AecState 更新後);preset 只是必填且須合法</td></tr>
+<tr><td><code>AudioPipeline4ChConfig.core.delay_*</code>、<code>capture_proxy_channel</code>、<code>geometry</code>、<code>uca_radius_m</code>／<code>ula_spacing_m</code>／<code>microphone_x_m[]</code>／<code>y_m[]</code>、<code>num_angles</code>、<code>speed_of_sound_m_s</code>(4ch)</td><td><code>pipelines/4ch_aec_bf_nr_res/audio_pipeline_4ch.h:48</code></td><td>與 DFN2 的 4ch 範例相同</td><td>範圍、預設與驗證規則見 <a href="pipeline_dfn_params.html">pipeline_dfn_params</a></td></tr>
+<tr><td><code>ulcnet_nn_stage_init(mem, bytes, err_analysis)</code></td><td><code>pipelines/samples/ulcnet_nn_stage.h:64</code></td><td>1：另帶時域 error 分析(<code>begin_time</code>,mono 用);0：不帶(4ch，error = BF 頻譜)</td><td>init 時。pool 大小隨之變(mono 16 kHz：42,640 B；4ch：36,400 B)</td></tr>
+<tr><td><code>UlcnetModel{user, infer, reset, io_descriptor}</code></td><td><code>AIAEC/Align_ULCNet/ulcnet_process.h:83</code></td><td>infer 回 0 = out_re／out_im 每個 bin 寫滿;reset 可為 NULL;會 infer 的 model 必須發布 descriptor</td><td>用 <code>ulcnet_accelerator_adapter_model()</code> 取得即可。全零 = identity(無模型)</td></tr>
+<tr><td><code>UlcnetModelIoDescriptor</code>(12 欄)</td><td><code>AIAEC/Align_ULCNet/ulcnet_model_io.h:80</code></td><td>只接受 <code>far_input_mode = ULCNET_FAR_RAW</code>、layout 18、本 build 的格點、D 在 [2, 64]</td><td><code>ulcnet_model_io_descriptor_default(D, &amp;desc)</code> 填本 build 的契約;板端改從 ONNX metadata 填</td></tr>
+<tr><td><code>ulcnet_accelerator_adapter_state_generation()</code></td><td><code>AIAEC/Align_ULCNet/ulcnet_accelerator_adapter.h:42</code></td><td>單調遞增計數</td><td>定點加速器的 state 緩衝在 C 清零時不會跟著變：每 hop 比較，變了就填量化後的 0</td></tr>
+<tr><td><code>audio_pipeline_4ch_process_with_activity(…, vad_raw, vad_out, mask, …)</code>(4ch)</td><td><code>pipelines/4ch_aec_bf_nr_res/audio_pipeline_4ch.h:205</code></td><td>vad ∈ {0,1};mask 可為 NULL</td><td>每 hop。範例骨架固定帶 0／0</td></tr>
+</table>
+<h2>2. 整合者專用(拓樸，不是調參)</h2>
+<table>
+<tr><th>項目</th><th>出處</th><th>值</th><th>說明</th></tr>
+<tr><td><code>SeRules{fixed_rate, fixed_fft, spatial_context}</code></td><td><code>pipelines/common/se_config.h:40</code></td><td><code>ULCNET_SR</code>、<code>ULCNET_N_FFT</code>、<code>AEC_CONTEXT_LINEAR_ONLY</code></td><td>mono lane 只留線性半邊 context:<code>res_gain</code>／<code>r2</code>／<code>comfort_noise</code> 為 NULL,範例只讀 <code>formed_hop</code> 與 <code>delay_state</code>;線性輸出與完整 context 逐位元相同(<code>lib/aec</code> 的 <code>test_process_context</code>)</td></tr>
+<tr><td><code>AecConfig.enable_res = 0</code>、<code>return_res_context = 1</code></td><td><code>pipelines/common/se_config.c:80</code></td><td>由 <code>se_derive()</code> 設定</td><td>lane 不套用 RES;context-only 模式下，濾波器未認可線性估計且殘差能量大於 mic 時 <code>formed_hop</code> 改送 capture(模型看到的 error 幀不保證每個 hop 都是誤差)</td></tr>
+<tr><td><code>core.enable_post = 0</code>(4ch)</td><td><code>pipelines/4ch_aec_bf_nr_res/4aec_nr_res.h:110</code></td><td>0</td><td>只留線性 context；不 carve fuse 緩衝；<code>audio_pipeline_4ch_fuse()</code> 回 <code>INVALID_ARGUMENT</code></td></tr>
+<tr><td><code>UlcnetNnDelay{changed, solid}</code></td><td><code>pipelines/samples/ulcnet_nn_stage.h:51</code></td><td>mono：changed = CHANGED，solid = 非 UNLOCKED；4ch：單元 <code>info.delay</code> 的同名欄位</td><td>alignment 事件。<code>changed</code> 涵蓋 unlock 後同值重鎖；FIXED 的首次 UNLOCKED→LOCKED 由 stage 自己偵測</td></tr>
+<tr><td><code>far</code> 輸入</td><td><code>pipelines/samples/ulcnet_nn_stage.h:15</code></td><td>呼叫端的原始 far hop</td><td>絕不能給 AEC 對齊後的副本</td></tr>
+</table>
+<h2>3. 內部:存在且可調，但不建議開放</h2>
+<table>
+<tr><th>名稱</th><th>位置</th><th>值</th><th>為何不建議開放</th></tr>
+<tr><td><code>ULCNET_NN_STAGE_REPRIME_FRAMES</code></td><td><code>pipelines/samples/ulcnet_nn_stage.h:39</code></td><td>1</td><td><b>量出來的</b>(脈衝標記)而非調參；常數與框架、50 % overlap 的幀數綁定。見 <a href="pipeline_ulcnet_detail.html">pipeline_ulcnet_detail</a></td></tr>
+<tr><td><code>ULCNET_MODEL_IO_COMPRESSION_EXP</code></td><td><code>AIAEC/Align_ULCNet/ulcnet_model_io.h:65</code></td><td>0.3f</td><td>壓縮域冪次，模型訓練時固定；<code>export_onnx.py</code> 拒絕其他值</td></tr>
+<tr><td><code>ULCNET_MODEL_IO_TA_CHANNELS／SCORE_WINDOW／GRU_SUBBANDS／GRU_LAYERS／GRU_HIDDEN／TA_BINS</code></td><td><code>AIAEC/Align_ULCNet/ulcnet_model_io.h:55</code></td><td>32／5／2／2／128／26(16 kHz)或 52(48 kHz)</td><td>圖的幾何，與匯出的 graph 一一對應；descriptor 驗證</td></tr>
+<tr><td><code>ulcnet_framing_config()</code> 的框架</td><td><code>AIAEC/Align_ULCNet/ulcnet_process.h:62</code></td><td>sqrt-Hann、center 0、一 hop 一幀；synthesis 為 <code>AC_OLA_ENV_NORM</code></td><td>與模型訓練的 STFT 慣例綁定，改了模型輸入就錯(慣例見 <a href="conventions.html">conventions</a>)</td></tr>
+<tr><td><code>AudioPipeline4ChConfig.doa_*</code>、<code>bf_*</code>、<code>auto_vad_*</code>、<code>core.delay_est_period_s</code>、<code>max_delay_ms</code>、<code>delay_backward_quarantine_*</code></td><td><code>pipelines/4ch_aec_bf_nr_res/audio_pipeline_4ch.c:132</code></td><td>預設值見 <a href="pipeline_dfn_params.html">pipeline_dfn_params</a></td><td>DOA／BF／VAD fallback／延遲追蹤的門檻與時間常數,互相耦合；範例以預設運作</td></tr>
+<tr><td><code>AecConfig</code> 其餘欄位</td><td><code>lib/aec/c_impl/include/aec.h:59</code></td><td>由 <code>aec_config_from_preset()</code> 給出</td><td>分類與理由見 <a href="../../../AEC/docs/html/aec.html">AEC 元件頁</a></td></tr>
+<tr><td><code>ULCNET_MODEL_IO_LAYOUT_VERSION</code>、<code>AUDIO_PIPELINE_4CH_LAYOUT_VERSION</code>、<code>FOUR_AEC_NR_RES_LAYOUT_VERSION</code></td><td><code>AIAEC/Align_ULCNet/ulcnet_model_io.h:32</code></td><td>18、21、24</td><td>契約／版面計數器，不是參數</td></tr>
+</table>
+<h2>4. 函式:public 與 internal</h2>
+<table>
+<tr><th>類別</th><th>函式</th><th>說明</th></tr>
+<tr><td>public(整合者呼叫)</td><td><code>se_derive</code></td><td>格點與 lane 的 AecConfig(mono)</td></tr>
+<tr><td></td><td><code>aec_get_mem_size / aec_init / aec_destroy / aec_reset / aec_process_context / aec_get_res_context / aec_get_linear_context</code></td><td>mono 前端；取 <code>formed_hop</code> 與 <code>delay_state</code></td></tr>
+<tr><td></td><td><code>audio_pipeline_4ch_default_config / _get_mem_requirements / _init_ex / _process_with_activity / _process_front / _process_beam / _reset / _destroy / _hop_size / _n_freqs</code></td><td>4ch 單元</td></tr>
+<tr><td></td><td><code>ulcnet_nn_stage_mem_size / _init / _set_model / _begin / _begin_complex / _begin_time / _nn_begin / _nn_end / _end / _process / _reset</code></td><td>範例 stage(沒有 destroy)</td></tr>
+<tr><td></td><td><code>ulcnet_model_io_descriptor_default / ulcnet_accelerator_adapter_get_mem_size / _init / _model / _state_generation</code></td><td>adapter 與 descriptor</td></tr>
+<tr><td>診斷(不必呼叫)</td><td><code>ulcnet_frame_is_finite / ulcnet_accelerator_adapter_descriptor / audio_pipeline_4ch_last_core_timing / audio_pipeline_4ch_get_core</code></td><td>檢查與診斷</td></tr>
+<tr><td>internal(.c 內 <code>static</code>)</td><td><code>ulcnet_nn_stage.c: framing_bytes / gate_delay / start_frame / begin_check</code></td><td>framing 大小、alignment 邊界記帳、reprime 武裝；<code>pipelines/samples/ulcnet_nn_stage.c:126</code></td></tr>
+<tr><td></td><td><code>ulcnet_accelerator_adapter.c: adapter_layout / infer / reset</code></td><td>只經 <code>UlcnetModel</code> 的函式指標暴露；<code>AIAEC/Align_ULCNet/ulcnet_accelerator_adapter.c:107</code></td></tr>
+</table>
+
+<h2>相關檔案</h2>
+<ul>
+<li><code>pipelines/samples/ulcnet_nn_stage.h / .c</code>、<code>pipelines/mono_alignulcnet/main.c</code>、<code>pipelines/4ch_alignulcnet/main.c</code>、<code>pipelines/Makefile</code></li>
+<li><code>AIAEC/Align_ULCNet/ulcnet_process.h</code>、<code>ulcnet_model_io.h</code>、<code>ulcnet_accelerator_adapter.h</code>、<code>pipelines/common/se_config.h</code>、<code>pipelines/4ch_aec_bf_nr_res/audio_pipeline_4ch.h</code></li>
+<li>各頁:<a href="pipeline_ulcnet_usage.html">pipeline_ulcnet_usage</a>、<a href="pipeline_ulcnet_sequence.html">pipeline_ulcnet_sequence</a>、<a href="pipeline_ulcnet_mono.html">pipeline_ulcnet_mono</a>、<a href="pipeline_ulcnet_4ch.html">pipeline_ulcnet_4ch</a>、<a href="pipeline_ulcnet_detail.html">pipeline_ulcnet_detail</a>、<a href="aiaec_align_ulcnet.html">aiaec_align_ulcnet</a>、<a href="../../../AEC/docs/html/aec.html">AEC 元件頁</a>、<a href="index.html">index</a></li>
+</ul>
+
+</body>
+</html>

@@ -1,3 +1,6 @@
+<!doctype html>
+<html lang="zh-Hant">
+<head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title>AINR GTCRN</title>
@@ -24,16 +27,28 @@ th{background:#eef1f5}
  .note{color:#9aa7b4}
 }
 </style>
+</head>
+<body>
 <nav>
-<a href="index.html">index</a>
+<a href="index.html">索引</a>
+<a href="conventions.html">慣例</a>
+<a href="conventions_latency.html">延遲預算</a>
+<a href="onnx_prepost.html">ONNX 邊界</a>
 <a href="ainr_dfn2.html">DFN2</a>
+<a href="ainr_dfn2_detail.html">DFN2 細節</a>
+<a href="ainr_dfn2_usage.html">DFN2 使用</a>
+<a href="ainr_dfn3.html">DFN3</a>
+<a href="ainr_dfn3_usage.html">DFN3 使用</a>
 <a href="ainr_gtcrn.html"><b>GTCRN</b></a>
+<a href="ainr_gtcrn_usage.html">GTCRN 使用</a>
 <a href="ainr_rnnoise_erb.html">RNNoise-ERB</a>
+<a href="ainr_rnnoise_erb_usage.html">RNNoise-ERB 使用</a>
 </nav>
 
 <h1>AINR GTCRN (16 kHz complex-mask baseline)</h1>
 
 <h2>概要</h2>
+<p class="note">如何呼叫、流程時序圖、外部／內部參數表：<a href="ainr_gtcrn_usage.html">ainr_gtcrn_usage</a>。</p>
 <p>超輕量 16 kHz 降噪模型(ShuffleNetV2 conv + SFE + TRA + 2×DPGRNN,
 輸出 complex ratio mask)。前後端固定在 host；出貨的
 <b>state layout version 8(11 個 graph input)</b>:六個 depth-conv 各一個完整 window、兩顆 stacked GRU 狀態
@@ -157,7 +172,7 @@ hop-lag: 0 框 (模型 causal); I/O 延遲僅 WOLA 重疊 win-hop = 256 samples
 <p class="note">圖內中間特徵(不跨越模型邊界):concat (B,3,T,129)
 → SFE (B,9,T,129) → encoder (B,16,T,33) → decoder → mask_erb (B,2,T,129)。
 離線 Python <code>GTCRN.forward(spec)</code> 仍是整段自含(特徵/ERB/CRM 在模型內),
-host 前後端邊界(v5 起)只描述部署用的 stream graph。</p>
+host 前後端邊界只描述部署用的 stream graph。</p>
 
 <h2>State 表</h2>
 <p><b>ONNX/匯出邊界</b>:<code>export_onnx.py</code> 交付 one-frame stateless
@@ -171,7 +186,7 @@ runtime 把每個 state input 與對應 <code>*_out</code> 綁到<b>同一個欄
 呼叫端在每次 invocation 後用 <code>gtcrn_model_state_validate()</code> 檢查（見下）。
 匯出不 pin 單一 grid——config 與 checkpoint 不成對時在 strict
 <code>load_state_dict</code>（形狀）或 checkpoint contract（同形語意）就大聲失敗。
-v5 起固定前後端全在 host：<code>gtcrn_model_input</code>（magnitude＋ERB 前向矩陣）
+固定前後端全在 host：<code>gtcrn_model_input</code>（magnitude＋ERB 前向矩陣）
 產生 <code>mag/real/imag</code> 三個獨立輸入（各自量化 scale）；圖回傳 ERB 域
 complex mask，<code>gtcrn_model_output</code> 做 ERB 逆矩陣＋CRM。矩陣由
 <code>export_erb_matrix.py --runtime-bins</code> 匯出成 raw float32 的
@@ -245,3 +260,5 @@ metadata/layout 互鎖(退役號碼不得被出貨版本使用)、calibration/ON
 <code>AINR/tests/test_onnx_state_contract.py</code> 測邊界驗證器與量化後檢查。</li>
 <li>串流 vs 離線等價:<code>AINR/tests/test_gtcrn_stream_export.py</code>(兩組 grid,誤差 &lt; 2e-5)</li>
 </ul>
+</body>
+</html>

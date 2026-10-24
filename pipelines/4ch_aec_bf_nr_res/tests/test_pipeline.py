@@ -45,17 +45,12 @@ def test_resource_boundary_is_one_matcher_and_four_linear_filters():
     assert not pipeline.beamformer_configured
 
 
-def test_post_beam_res_is_owned_by_the_pipeline():
-    """One suppressor, built at config.aec_preset; none with enable_res off."""
+def test_post_beam_res_is_not_owned_by_the_pipeline():
+    """The suppressor and its strength setter live with the caller."""
     pipeline = _new_pipeline()
-    assert isinstance(pipeline.post_beam_res, PostBeamResidualSuppressor)
     assert not hasattr(pipeline, "set_aec_preset")
-    assert _new_pipeline(enable_res=False).post_beam_res is None
-    seeded = _new_pipeline(aec_preset=AecPreset.AGGRESSIVE).post_beam_res
-    reference = _new_suppressor(AecPreset.AGGRESSIVE)
-    assert _live_floor(seeded) == _live_floor(reference)
-    assert _dt_floor(seeded) == _dt_floor(reference)
-    assert _live_floor(seeded) != _live_floor(_new_pipeline().post_beam_res)
+    assert not hasattr(pipeline, "residual_suppressor_instance_count")
+    assert "aec_preset" not in FourChannelAecConfig.__dataclass_fields__
 
 
 def test_one_hop_is_finite_and_exports_post_beam_context():
@@ -80,83 +75,31 @@ def test_one_hop_is_finite_and_exports_post_beam_context():
     assert np.all(np.isfinite(result.linear_channels))
     assert np.all(np.isfinite(result.beamformed))
     assert np.all(np.isfinite(result.context.error_spec))
-    assert result.context.res_gain.shape == (129,)
-    assert result.spec_frame().g_res_ctx is result.context.res_gain
+    # fuse() computes no gain: a reader that skips the suppressor must fail.
+    assert result.context.res_gain is None
+    assert result.spec_frame().g_res_ctx is None
+    np.testing.assert_array_equal(result.aligned_render, pre.aligned_render)
 
 
-def _echo_hops(n_hops, seed=7):
-    rng = np.random.default_rng(seed)
-    hops = []
-    for _ in range(n_hops):
+def test_fuse_plus_external_suppressor_gives_a_bounded_gain():
+    pipeline = _new_pipeline()
+    suppressor = _new_suppressor()
+    rng = np.random.default_rng(7)
+    for _ in range(6):
         render = (rng.standard_normal(128) * 0.01).astype(np.float32)
         microphones = np.stack(
             [np.roll(render, channel + 1) for channel in range(4)], axis=1
         )
-        hops.append((microphones, render))
-    return hops
-
-
-def _fused_contexts(pipeline, hops):
-    out = []
-    for microphones, render in hops:
         pre = pipeline.front_process(microphones, render)
-        out.append((pre, pipeline.fuse(pre, _external_equal_weight(pre)).context))
-    return out
-
-
-def test_res_off_leaves_the_gain_absent():
-    pipeline = _new_pipeline(enable_res=False)
-    for _, context in _fused_contexts(pipeline, _echo_hops(3)):
-        # A reader that expects a RES gain must fail, not read a silent unity.
-        assert context.res_gain is None
-
-
-def test_owned_suppressor_equals_a_separate_one_over_the_same_frames():
-    """enable_res = 1 is enable_res = 0 plus one suppressor at the same preset
-    over the fused context and the aligned reference, bit for bit."""
-    hops = _echo_hops(40)
-    on = _fused_contexts(_new_pipeline(aec_preset=AecPreset.AGGRESSIVE), hops)
-    off = _fused_contexts(_new_pipeline(enable_res=False), hops)
-    separate = _new_suppressor(AecPreset.AGGRESSIVE)
-    cut = False
-    for (_, with_res), (pre, without) in zip(on, off):
-        expected = separate.process(without, pre.aligned_render)
-        assert with_res.res_gain.dtype == np.float32
-        assert np.all((0.0 <= with_res.res_gain) & (with_res.res_gain <= 1.0))
-        np.testing.assert_array_equal(with_res.res_gain, expected.res_gain)
+        result = pipeline.fuse(pre, _external_equal_weight(pre))
+        assert result.context.res_gain is None
+        context = suppressor.process(result.context, result.aligned_render)
+        assert context.res_gain.shape == (129,)
+        assert context.res_gain.dtype == np.float32
+        assert np.all((0.0 <= context.res_gain) & (context.res_gain <= 1.0))
         # The suppressor adds the gain and nothing else.
-        np.testing.assert_array_equal(with_res.error_spec, without.error_spec)
-        np.testing.assert_array_equal(with_res.r2, without.r2)
-        np.testing.assert_array_equal(with_res.comfort_noise, without.comfort_noise)
-        cut = cut or bool(np.any(with_res.res_gain < 0.9))
-    assert cut, "the stimulus never made the suppressor cut"
-
-
-def _nonlinear_echo_hops(n_hops, seed):
-    """Broadband render through a nonlinear echo path, so a residual (and the
-    suppressor's temporal state) survives the linear filters."""
-    rng = np.random.default_rng(seed)
-    hops = []
-    for _ in range(n_hops):
-        render = (rng.standard_normal(128) * 0.1).astype(np.float32)
-        echo = render + 1.5 * render ** 3
-        microphones = np.stack(
-            [0.4 * np.roll(echo, channel + 1) + 0.003 * rng.standard_normal(128)
-             for channel in range(4)], axis=1).astype(np.float32)
-        hops.append((microphones, render))
-    return hops
-
-
-def test_reset_restarts_the_suppressor():
-    """After reset() the pipeline, suppressor included, equals a fresh one."""
-    hops = _nonlinear_echo_hops(60, seed=7)
-    used = _new_pipeline()
-    _fused_contexts(used, _nonlinear_echo_hops(120, seed=3))
-    used.reset()
-    after = _fused_contexts(used, hops)
-    fresh = _fused_contexts(_new_pipeline(), hops)
-    for (_, a), (_, b) in zip(after, fresh):
-        np.testing.assert_array_equal(a.res_gain, b.res_gain)
+        np.testing.assert_array_equal(context.error_spec, result.context.error_spec)
+        np.testing.assert_array_equal(context.r2, result.context.r2)
 
 
 @pytest.mark.parametrize(
@@ -541,8 +484,8 @@ def test_admitted_delay_change_realigns_four_lanes_instead_of_resetting_them():
 
 # ── runtime strength retarget ────────────────────────────────────────────
 #
-# The strength is carried by the pipeline's PostBeamResidualSuppressor
-# (pipeline.post_beam_res); the four lanes compute no gain of their own.
+# The strength is carried by the caller's PostBeamResidualSuppressor; the four
+# lanes compute no gain of their own.
 
 def _live_floor(suppressor):
     return suppressor._gain._split_floor_far_active_live
@@ -552,10 +495,9 @@ def _dt_floor(suppressor):
     return suppressor._gain._split_floor_dt
 
 
-def _new_pipeline(**overrides):
+def _new_pipeline():
     return FourChannelAecPipeline(
-        FourChannelAecConfig(sample_rate=16000, frame_size=256, hop_size=128,
-                             **overrides)
+        FourChannelAecConfig(sample_rate=16000, frame_size=256, hop_size=128)
     )
 
 
@@ -570,7 +512,7 @@ def test_preset_retarget_moves_the_suppressor_not_the_lanes():
     the strength that shapes the output lives in the ONE post-beam suppressor.
     """
     pipeline = _new_pipeline()
-    suppressor = pipeline.post_beam_res
+    suppressor = _new_suppressor()
     before_post = _live_floor(suppressor)
     before_lanes = [
         lane._aec3_sg._split_floor_far_active_live for lane in pipeline._lanes
@@ -741,6 +683,39 @@ def test_construction_time_no_floor_matches_runtime_retarget():
     assert _gate(built_no_floor) == _gate(retargeted) is False
     assert _live_floor(built_no_floor) == _live_floor(retargeted)
     assert _dt_floor(built_no_floor) == _dt_floor(retargeted)
+
+
+@pytest.mark.parametrize("preset", list(AecPreset))
+def test_from_aec_config_matches_preset_construction(preset):
+    """An AecConfig carrying a preset's floors builds the same suppressor as
+    the preset itself, and keeps the floors across reset()."""
+    from lib.aec.python.modules.config import AecConfig
+
+    config = AecConfig.from_preset(
+        preset, sample_rate=16000, frame_size=256, hop_size=128
+    )
+    built = PostBeamResidualSuppressor.from_aec_config(config)
+    reference = _new_suppressor(preset)
+    assert built.n_freqs == reference.n_freqs == 129
+    assert _live_floor(built) == _live_floor(reference)
+    assert _dt_floor(built) == _dt_floor(reference)
+    assert _gate(built) == _gate(reference)
+    built.reset()
+    assert _live_floor(built) == _live_floor(reference)
+    assert _dt_floor(built) == _dt_floor(reference)
+    assert _gate(built) == _gate(reference)
+
+
+def test_from_aec_config_default_is_the_default_suppressor():
+    from lib.aec.python.modules.config import AecConfig
+
+    config = AecConfig(sample_rate=16000, frame_size=256, hop_size=128)
+    built = PostBeamResidualSuppressor.from_aec_config(config)
+    reference = _new_suppressor()
+    ctx, render = _no_floor_scene_context(129, 128)
+    np.testing.assert_array_equal(
+        built.process(ctx, render).res_gain, reference.process(ctx, render).res_gain
+    )
 
 
 def _no_floor_scene_context(nf, hop):

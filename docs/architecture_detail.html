@@ -1,0 +1,284 @@
+<!DOCTYPE html>
+<html lang="zh-Hant">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Audio_ALG 架構細節 — 效能、preset 與限制</title>
+<style>
+  :root {
+    --bg: #fafafa;
+    --panel: #ffffff;
+    --border: #d8d8d8;
+    --accent: #2563eb;
+    --accent-soft: #dbeafe;
+    --aec: #f97316;
+    --nr: #10b981;
+    --res: #8b5cf6;
+    --hpf: #94a3b8;
+    --text: #1f2937;
+    --muted: #64748b;
+  }
+  * { box-sizing: border-box; }
+  body {
+    margin: 0;
+    font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", "PingFang TC",
+                 "Microsoft JhengHei", sans-serif;
+    background: var(--bg);
+    color: var(--text);
+    line-height: 1.7;
+  }
+  .container { max-width: 1200px; margin: 0 auto; padding: 32px 24px; }
+  header {
+    background: linear-gradient(135deg, #1e40af 0%, #2563eb 100%);
+    color: white;
+    padding: 48px 24px;
+    margin-bottom: 32px;
+  }
+  header h1 { margin: 0 0 8px; font-size: 32px; }
+  header p { margin: 0; opacity: 0.9; font-size: 16px; }
+  h2 {
+    margin-top: 56px;
+    padding-bottom: 8px;
+    border-bottom: 2px solid var(--accent);
+    color: #1e40af;
+  }
+  h3 { color: #334155; margin-top: 32px; }
+  h4 { color: #475569; margin-top: 24px; margin-bottom: 8px; }
+  .panel {
+    background: var(--panel);
+    border: 1px solid var(--border);
+    border-radius: 8px;
+    padding: 20px 24px;
+    margin: 16px 0;
+  }
+  .figure {
+    text-align: center;
+    margin: 24px 0;
+  }
+  .figure svg {
+    max-width: 100%;
+    height: auto;
+  }
+  .caption {
+    color: var(--muted);
+    font-size: 13px;
+    margin-top: 8px;
+    font-style: italic;
+  }
+  .formula {
+    background: #f8fafc;
+    border-left: 4px solid var(--accent);
+    padding: 12px 18px;
+    margin: 12px 0;
+    font-family: "STIX Two Math", "Latin Modern Math", "Cambria Math", serif;
+    font-size: 17px;
+    text-align: center;
+  }
+  .formula em { font-style: italic; }
+  table {
+    width: 100%;
+    border-collapse: collapse;
+    margin: 16px 0;
+    font-size: 14px;
+  }
+  th, td {
+    text-align: left;
+    padding: 10px 12px;
+    border-bottom: 1px solid var(--border);
+    vertical-align: top;
+  }
+  th { background: var(--accent-soft); color: #1e3a8a; font-weight: 600; }
+  tr:hover td { background: #f8fafc; }
+  code {
+    background: #f1f5f9;
+    padding: 2px 6px;
+    border-radius: 4px;
+    font-family: "SF Mono", Monaco, "Cascadia Code", monospace;
+    font-size: 0.9em;
+    color: #334155;
+  }
+  .key-point {
+    background: #ecfdf5;
+    border-left: 4px solid #10b981;
+    padding: 12px 16px;
+    margin: 12px 0;
+    border-radius: 4px;
+  }
+  .key-point strong { color: #047857; }
+  .note {
+    background: #fffbeb;
+    border-left: 4px solid #f59e0b;
+    padding: 12px 16px;
+    margin: 12px 0;
+    border-radius: 4px;
+  }
+  .note strong { color: #92400e; }
+  .grid-2 {
+    display: grid;
+    grid-template-columns: 1fr 1fr;
+    gap: 16px;
+  }
+  .toc {
+    background: var(--panel);
+    border-left: 4px solid var(--accent);
+    padding: 16px 24px;
+    margin: 24px 0;
+  }
+  .toc ul { margin: 8px 0; padding-left: 20px; }
+  .toc li { margin: 4px 0; }
+  .toc a { color: var(--accent); text-decoration: none; }
+  .toc a:hover { text-decoration: underline; }
+  @media (max-width: 768px) {
+    .grid-2 { grid-template-columns: 1fr; }
+  }
+</style>
+</head>
+<body>
+<header>
+  <div class="container">
+    <h1>Audio_ALG 架構細節</h1>
+    <p>mono pipeline 的規格與資源、AEC／NR 強度 preset 與已知限制</p>
+  </div>
+</header>
+
+<div class="container">
+
+<div class="note">
+  <strong>範圍：</strong>本頁是 <a href="architecture.html">architecture.html</a> 第 6、7 節的完整內容(拆頁以維持單頁大小)；訊號流與各階段演算法留在原頁。呼叫順序見 <a href="html/integration_sequence.html">integration_sequence</a>。
+</div>
+
+<!-- ============================================================ -->
+<h2 id="perf">6. 效能、資源消耗與分數</h2>
+
+<div class="panel">
+
+<h3>6.1 系統規格與資源消耗 (C 實作 @16kHz)</h3>
+
+<table>
+  <tr><th>項目</th><th>AEC</th><th>NR</th><th>備註</th></tr>
+  <tr><td>取樣率</td><td>8 / 16 / 48 kHz</td><td>8 / 16 / 48 kHz</td><td>單通道</td></tr>
+  <tr><td>Frame / Hop</td><td colspan="2">8k 256/128；16k 256/128（預設）或 512/256；48k 1024/512</td><td>frame=FFT、50% overlap、無補零</td></tr>
+  <tr><td>FFT size</td><td>256 / 512 / 1024</td><td>256 / 512 / 1024</td><td>NE10，float32</td></tr>
+  <tr><td>Algorithmic delay</td><td>0 samples（linear 路徑）</td><td>—</td><td>完整 mono pipeline 為 1 grid hop（final sqrt-Hann OLA）；不含裝置 I/O／resampler／OS scheduling</td></tr>
+  <tr><td>靜態記憶體</td><td><code>aec_get_mem_size()</code></td><td><code>anr_get_mem_size()</code></td><td>各函式庫各自查大小，整合者加總（各 main 自己加總 <code>aec_get_mem_size()</code>、<code>anr_get_mem_size()</code>、<code>ac_istft_get_mem_size()</code>；4ch 單元用 <code>audio_pipeline_4ch_get_mem_requirements()</code>，其後的 RES 另用 <code>aec_res_get_mem_size()</code>）</td></tr>
+  <tr><td>計算量</td><td>依 grid、partition、shadow 與 backend</td><td>依 n_freqs、MCRA 視窗與 backend</td><td>release 前在目標 SoC profile，不使用本頁固定估算</td></tr>
+</table>
+
+<h3>6.2 AEC 收斂與保護時間（來自 config 常數）</h3>
+
+<table>
+  <tr><th>項目</th><th>時間</th><th>出處</th></tr>
+  <tr><td>Warmup（不更新收斂判定）</td><td>1.0 s</td><td><code>warmup_frames</code> = 100 hops @10 ms 格點撰寫，建立時 retime；僅在有效 far-active hop 遞減</td></tr>
+  <tr><td>EPC hangover</td><td>200 ms</td><td><code>epc_hangover</code> = 20 hops @10 ms，建立時 retime</td></tr>
+  <tr><td>冷啟動到 ERLE 10／20／30 dB、EPC 後 re-convergence、stationary far-end 收斂</td><td>待量測</td><td>取決於 far-end 頻寬與 echo 路徑；本頁不重複舊量測，量測方式見 <a href="../lib/aec/README.md">AEC README</a></td></tr>
+</table>
+
+<h3>6.3 分數</h3>
+
+<div class="note">
+<strong>分數不在本頁維護。</strong>AEC 模組的 800-case AECMOS（ours / AEC3 / Speex，官方分段、無 pre-align）見 <a href="../../AEC/README.md">AEC/README.md</a> 的 Status snapshot；整路（AEC+NR）對比需用 <code>pipelines/tools/rebench_joint.py</code> 以同一語料重量（<code>NO_PREALIGN=1</code>），本頁不放舊版數字，現況待量測。AECMOS <strong>不量背景噪音抑制</strong>——那才是 NR 的本職，只看 AECMOS 看不到 NR 的降噪價值。
+</div>
+
+<h3>6.4 AEC Preset — 單一 Pareto 旋鈕</h3>
+
+<p style="margin: 8px 0 4px;">preset 改動的欄位為 <code>min_gain_floor_far_active_db</code>（far-active 殘響 gain 地板，權衡回音消除 ↔ 近端保留）、<code>min_gain_floor_dt_db</code>（double-talk 地板）與 <code>min_gain_split_floor_enabled</code>（<code>aec_config_from_preset()</code> 實測）：</p>
+
+<table>
+  <tr><th>Preset</th><th>far-active floor</th><th>DT floor</th><th>split floor</th><th>特性 / 場景</th></tr>
+  <tr><td><strong>mild</strong></td><td>−20 dB</td><td>−20 dB</td><td>開</td><td>近端優先 — 保留更多近端、回音漏更多</td></tr>
+  <tr><td><strong>balanced ★</strong></td><td>−28 dB</td><td>−20 dB</td><td>開</td><td><strong>預設、通用</strong></td></tr>
+  <tr><td><strong>aggressive</strong></td><td>−38 dB</td><td>−30 dB</td><td>開</td><td>回音優先 — 壓更深、近端損失較多，高 echo 環境</td></tr>
+  <tr><td><strong>no_floor</strong></td><td>—（惰性）</td><td>—（惰性）</td><td>關</td><td>移除地板機制，這條軸最深的操作點，近端損失最大</td></tr>
+</table>
+
+<p style="font-size: 12px; color: var(--muted); margin-top: 8px;">
+  執行期用 <code>aec_set_preset(aec, preset, ramp_ms)</code> 改（ramp 範圍 [0, 60000] ms；DT floor 與 split floor 一律立即階躍）。完整 ours / AEC3 / Speex 三方對照見 <a href="../../AEC/README.md">AEC/README.md</a>。
+</p>
+
+<h3>6.5 NR 降噪等級</h3>
+
+<p>NR 的強度 preset 只改 <code>g_min_db</code>（最大抑制量，amplitude dB）、<code>q</code>（語音先驗機率）、<code>xi_min_db</code> 與 <code>noise_over_subtraction</code>；時域平滑 <code>alpha_attack</code>／<code>alpha_decay</code> 各等級相同（<code>alpha_g</code> 在增益路徑上不被讀取）：</p>
+
+<table>
+  <tr><th>等級</th><th>g_min_db</th><th>q</th><th>推薦場景</th></tr>
+  <tr><td><strong>Mild</strong></td><td>−20 dB</td><td>0.58</td><td>高 SNR (&gt;10 dB)、近端品質優先、保留細節</td></tr>
+  <tr><td><strong>Moderate</strong></td><td>−23 dB</td><td>0.54</td><td>介於 mild 與 balanced</td></tr>
+  <tr><td><strong>Balanced</strong></td><td>−25 dB</td><td>0.52</td><td><strong>預設</strong>、一般場景</td></tr>
+  <tr><td><strong>Aggressive</strong></td><td>−28 dB</td><td>0.45</td><td>低 SNR (&lt;5 dB)、需要安靜背景</td></tr>
+</table>
+
+<div class="key-point">
+<strong>等級選擇 trade-off：</strong>
+<ul style="margin: 6px 0 0 20px;">
+  <li><strong>Mild</strong>：語音失真最小，但靜音段仍聽得到底噪</li>
+  <li><strong>Balanced</strong>：echo/quality 平衡，適合通用語音場景</li>
+  <li><strong>Aggressive</strong>：背景幾乎靜音，但低 SNR 下語音可能有 musical noise / 鈍化</li>
+</ul>
+</div>
+
+<p style="font-size: 12px; color: var(--muted); margin-top: 8px;">
+  詳細參數調整指南見 <a href="../../NR/docs/parameter_tuning.md">NR/docs/parameter_tuning.md</a>。
+</p>
+
+</div>
+
+<!-- ============================================================ -->
+<h2 id="limits">7. 已知限制</h2>
+
+<div class="panel">
+<table>
+  <tr><th>類別</th><th>限制</th></tr>
+  <tr>
+    <td><strong>輸入</strong></td>
+    <td>單通道、8 / 16 / 48 kHz，無 spatial filtering</td>
+  </tr>
+  <tr>
+    <td><strong>AEC 線性模型</strong></td>
+    <td>非線性 echo（speaker 飽和）靠 RES 壓制，無獨立非線性模型</td>
+  </tr>
+  <tr>
+    <td><strong>AEC 穩態 far-end 弱信號段</strong></td>
+    <td>linear AEC 仍可能在弱信號段把語音吸收</td>
+  </tr>
+  <tr>
+    <td><strong>AEC delay estimation</strong></td>
+    <td>matched-filter delay estimator 在低 SNR 或強非線性場景可能鎖到錯的 delay</td>
+  </tr>
+  <tr>
+    <td><strong>NR 突發噪音</strong></td>
+    <td>impulse / crackle / 敲擊 — MCRA TC 跟不上</td>
+  </tr>
+  <tr>
+    <td><strong>NR 噪音突升 / 突降</strong></td>
+    <td>minimum tracking 需收斂（視窗 <code>L</code> 約 512 ms 的 wall-clock），期間噪音可能漏抑制</td>
+  </tr>
+  <tr>
+    <td><strong>NR 音樂背景</strong></td>
+    <td>SPP 二元假設（語音 vs 噪音），音樂被誤判為語音保留</td>
+  </tr>
+  <tr>
+    <td><strong>NR 強迴響</strong></td>
+    <td>reverb tail 與穩態噪音相近，可能被誤抑制</td>
+  </tr>
+  <tr>
+    <td><strong>RES musical noise</strong></td>
+    <td>低 SNR 下仍可能殘留</td>
+  </tr>
+</table>
+
+<p style="margin-top: 16px;">完整限制詳見：</p>
+<ul>
+  <li><a href="../lib/aec/README.md">AEC submodule README — 已知限制</a></li>
+  <li><a href="../lib/nr/README.md">NR submodule README — SPP+OMLSA 限制</a></li>
+  <li><a href="../pipelines/README.md">Pipeline README — 現行整合契約</a></li>
+</ul>
+</div>
+
+
+<footer style="text-align: center; color: var(--muted); padding: 32px 0; border-top: 1px solid var(--border); margin-top: 48px;">
+  <a href="architecture.html">architecture.html</a> · <a href="html/index.html">docs/html/index.html</a>
+</footer>
+
+</div>
+</body>
+</html>

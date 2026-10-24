@@ -30,13 +30,13 @@ code,pre{background:#f3f3f3}code{padding:.1rem .25rem}pre{padding:.8rem;overflow
 
 <p>所有 production export 都是 stateless accelerator graph。GRU hidden、
 convolution cache、attention/KV ring 都是明確 input/output，由 CPU 或
-driver 保存；Align-ULCNet 與 DeepVQE-S 的每個 state 輸出就地綁定到同名輸入的位址，沒有複製路徑（下方「遞迴 state」）。STFT、WOLA、linear AEC 與 output
+driver 保存；Align-ULCNet、DeepVQE-S、DFN2、DFN3 與 GTCRN 的每個 state 輸出就地綁定到同名輸入的位址，沒有複製路徑（下方「遞迴 state」）。STFT、WOLA、linear AEC 與 output
 composition 留在 graph 外。複數一律以 real/imag pair 表示。</p>
-<p>DFN2 與 GTCRN 的 state 輸入與 <code>*_out</code> 輸出一律 rank 4、shape 相同，綁到同一個位址；兩者沒有複製路徑（沒有 inherit）。
+<p>DFN2、DFN3 與 GTCRN 的 state 輸入與 <code>*_out</code> 輸出一律 rank 4、shape 相同，綁到同一個位址；三者沒有複製路徑（沒有 inherit）。
 滑動視窗型的 state（DFN2 <code>df_convp_history</code>、GTCRN 六個 conv window）是完整 window：圖在輸入上以明確整數範圍的 Slice 丟掉最舊一幀，接上新的一幀，並把整個 Concat 結果當輸出；
 GRU 型 state 以 dim 1 的 Slice 取列、一個 Concat 接回。<code>AINR/onnx_streaming_contract.py</code> 的 <code>validate_inplace_state_graph()</code> 在匯出時檢查這些條件，metadata 記 <code>state_binding = in_place_same_address</code>。
-C 端的 reset 與被拒的 commit／validate 只歸零 host 的 state，加速器那份定點 state 看不到，所以兩個模型各有一個 generation 計數器
-（<code>dfn2_prepost_state_generation()</code>／<code>dfn2_model_io_state_generation()</code>、<code>gtcrn_model_state_generation()</code>）：init 後為 1，每次 reset 與每次被拒的 commit／validate 加 1；
+C 端的 reset 與被拒的 commit／validate 只歸零 host 的 state，加速器那份定點 state 看不到，所以每個模型各有一個 generation 計數器
+（<code>dfn2_prepost_state_generation()</code>／<code>dfn2_model_io_state_generation()</code>、<code>dfn3_prepost_state_generation()</code>／<code>dfn3_model_io_state_generation()</code>、<code>gtcrn_model_state_generation()</code>）：init 後為 1，每次 reset 與每次被拒的 commit／validate 加 1；
 runtime 發現數值與上一幀不同就把自己的 state tensor 填成量化後的零。</p>
 
 <h2>使用者入口</h2>
@@ -111,11 +111,11 @@ framing、特徵前後端、recurrent ring／state buffer。整合者不需自�
 每 hop：
   n = &lt;pfx&gt;_pre_process(p, hop…);      /* 或 _pre_process_freq()：這一 hop 的推論次數 */
       &lt;pfx&gt;_frame_inputs(p, &amp;in, &amp;out); /* pool 內的 view；非 state 輸出預填 NaN */
-      加速器填 out                          /* Align-ULCNet、DeepVQE-S、DFN2、GTCRN：每個 state 輸出綁到同名輸入的位址（先讀完 state 輸入再寫輸出），沒有 inherit；RNNoise-ERB 的 runtime 寫自己的 tensor，再 rnnoise_model_state_inherit() */
+      加速器填 out                          /* Align-ULCNet、DeepVQE-S、DFN2、DFN3、GTCRN：每個 state 輸出綁到同名輸入的位址（先讀完 state 輸入再寫輸出），沒有 inherit；RNNoise-ERB 的 runtime 寫自己的 tensor，再 rnnoise_model_state_inherit() */
       &lt;pfx&gt;_frame_commit(p);            /* 或 &lt;pfx&gt;_frame_skip(p) */
   &lt;pfx&gt;_post_process(p, out_hop, &amp;written);   /* 或 _post_process_freq() */
 其餘：_reset / _destroy / _hop_size / _num_bins / _io_mode / _descriptor
-      Align-ULCNet 與 DeepVQE-S 另有 _state_generation(p)（C 清零 state 的次數，見下）</pre>
+      四個類別都有 _state_generation(p)（C 清零 state 的次數，見下）</pre>
 
 <p><b><code>io_mode</code> 在 init 固定</b>（它決定 pool 大小，不是可切換的旗標）：
 <code>*_IO_TIME</code> hop 進 hop 出，framing／加窗／overlap-add 由類別做，但呼叫的是
@@ -127,11 +127,12 @@ framing、特徵前後端、recurrent ring／state buffer。整合者不需自�
 Align-ULCNet 與 DeepVQE-S <b>從 hop 0 起恆為 1</b>；DFN2 在<b>第一個 hop 回 0</b>（它的 graph 要
 <code>[t−1, t, t+1]</code>，hop 0 沒有右鄰居，不可以呼叫），之後每 hop 1 次。</p>
 
-<p><b>pipeline 層的對應</b>：四個應用（<code>mono_alignulcnet</code>、<code>4ch_alignulcnet</code>、<code>mono_aec_dfn_res</code>、<code>4ch_aec_bf_dfn_res</code>）把同一個 hop 拆成
-<code>_process_begin</code>（AEC／分析，備好第一個模型幀）→ <code>_nn_begin</code>（回 1 並交出 job：<code>UlcnetNnJob</code> 或 <code>DfnResStageJob</code>，輸出預填 NaN；回 0 表示本 hop 無模型幀）→
-呼叫端在 NPU 上推論 → <code>_nn_end(rc)</code>（<code>rc==0</code> 且輸出有限才提交，否則走 <code>_frame_skip</code> 的 identity）→ <code>_process_end</code>（合成剛好一個 hop）。
-DFN 應用經 rate bridge 時一個 native hop 可能有 0..2 個幀，所以 <code>_nn_begin</code> 放在迴圈裡。
-呼叫序列與範例見 <a href="integration_example.html">integration_example</a> 與 <code>pipelines/README.md</code> 的 Call flow。</p>
+<p><b>pipeline 層的對應</b>：四個應用（<code>mono_alignulcnet</code>、<code>4ch_alignulcnet</code>、<code>mono_aec_dfn_res</code>、<code>4ch_aec_bf_dfn_res</code>）把同一個 hop 拆成 begin → 取 job → 呼叫端在 NPU 上推論 → 回報 rc → end。
+DFN2 應用用 <code>samples/dfn_hop.h</code>：<code>dfn_hop_begin()</code> → <code>while (dfn_hop_nn_begin() &gt; 0) { 推論; dfn_hop_nn_end(rc) }</code> → <code>dfn_hop_end()</code>，job 是 <code>DfnResStageJob</code>（<code>DFN2PrepostInputs/Outputs</code> 視圖）。
+ULCNet 應用用 <code>samples/ulcnet_nn_stage.h</code>：<code>ulcnet_nn_stage_begin_time()</code>／<code>_begin_complex()</code> → <code>ulcnet_nn_stage_nn_begin()</code>（回 1 並交出 <code>UlcnetNnJob</code>；回 0 表示本 hop 無模型幀）→ 推論 → <code>ulcnet_nn_stage_nn_end(rc)</code> → <code>ulcnet_nn_stage_end()</code>。
+兩者都是：<code>rc==0</code> 且輸出有限才提交，否則該幀走 identity（等同 <code>_frame_skip</code> 的語意）；輸出預填 NaN；合成剛好一個 hop。
+DFN 應用經 rate bridge 時一個 native hop 可能有 0..2 個幀，所以 <code>dfn_hop_nn_begin()</code> 放在迴圈裡。
+逐步呼叫序列見 <a href="pipeline_dfn_usage.html">pipeline_dfn_usage</a>、<a href="pipeline_ulcnet_usage.html">pipeline_ulcnet_usage</a>,時序圖見 <a href="pipeline_dfn_sequence.html">pipeline_dfn_sequence</a>、<a href="pipeline_ulcnet_sequence.html">pipeline_ulcnet_sequence</a>，範例總覽見 <a href="integration_example.html">integration_example</a>，另見 <code>pipelines/README.md</code> 的 Call flow。</p>
 
 <p><b>frame 狀態機</b>：<code>frame_inputs</code> 只把<b>非 state 的輸出</b>
 （heads：<code>output</code>／<code>taps</code>／<code>erb_mask</code>／<code>coefs</code>／<code>alpha</code>，
@@ -142,14 +143,14 @@ synthesis 照常前進，commit 本身不複製任何 state。只有 RNNoise-ERB
 回 −1、state 與原來逐位元相同，呼叫端回報該次推論失敗、取 <code>frame_skip</code>，這一幀被跳過。
 <b>就地路徑</b>：state 已被加速器覆寫、<b>無法回滾</b>，commit 遇到任何一處非有限值時<b>所有遞迴 state 歸零</b>（冷啟動）、
 framing／CCM ring 不前進、幀維持開啟、回 −1
-（Align-ULCNet：key／value／logit 三個 window 與 h_gru 共四個 state；DFN2：<code>h_gru</code> 與 pathway window 兩個遞迴張量；DeepVQE-S：16 個 state），
+（Align-ULCNet：key／value／logit 三個 window 與 h_gru 共四個 state；DFN2、DFN3：<code>h_gru</code> 與 pathway window 兩個遞迴張量；DeepVQE-S：16 個 state），
 呼叫端再選 <code>frame_skip</code> 或用新的 <code>frame_inputs</code> 從冷 state 重跑加速器。
 <code>frame_skip</code> 取 identity（DeepVQE-S 為靜音）、ring／CCM 不步進，state 維持原樣
 （就地路徑為加速器寫完的樣子；回報失敗的 runtime 視為沒有寫入）。寫一半或混寫只有在出現非有限值時才偵測得到。commit 必須有
-<code>frame_inputs</code> 墊背（<code>prepared</code> 閂，三個類別皆然），所以「加速器根本沒跑」
+<code>frame_inputs</code> 墊背（<code>prepared</code> 閂，四個類別皆然），所以「加速器根本沒跑」
 不可能把未動過的緩衝區當成結果收下；幀還開著時再呼叫 <code>pre_process</code> 回 −1。</p>
 
-<p><b>遞迴 state：Align-ULCNet、DeepVQE-S、DFN2、GTCRN 就地綁定，沒有複製路徑</b>。每個 state 張量在 caller pool 裡只有一個 buffer、位址在實例壽命內不變，
+<p><b>遞迴 state：Align-ULCNet、DeepVQE-S、DFN2、DFN3、GTCRN 就地綁定，沒有複製路徑</b>。每個 state 張量在 caller pool 裡只有一個 buffer、位址在實例壽命內不變，
 沒有交替的 bank、沒有指標交換。runtime 把每個 <code>*_out</code> 綁到 <code>frame_inputs()</code> 回傳的同名輸入位址，
 <b>先讀完</b>所有 state 輸入、<b>才寫</b>輸出（做不到的 runtime 要自己用暫存區暫存讀取）；維護者的板端驗證確認 NPU 以這個順序工作。
 graph 回每個 state 的<b>完整下一個 window</b>，shape 與輸入完全相同：位移在 graph 內，用輸入端的 Slice 切掉一幀、
@@ -163,7 +164,7 @@ head 與 <code>h_gru</code> 全部，較舊的格子不重查。</p>
 先檢查再複製；指標等於目的位址的 tensor 不會被複製或檢查，所以同一個呼叫兩種綁定都適用。</p>
 <p><b>state generation</b>：<code>ulcnet_model_io_state_generation()</code>、<code>ulcnet_prepost_state_generation()</code>、
 <code>ulcnet_accelerator_adapter_state_generation()</code>、<code>deepvqe_prepost_state_generation()</code>、
-<code>dfn2_prepost_state_generation()</code>、<code>dfn2_model_io_state_generation()</code>、<code>gtcrn_model_state_generation()</code> 數 C 端把 state 清零的次數
+<code>dfn2_prepost_state_generation()</code>、<code>dfn2_model_io_state_generation()</code>、<code>dfn3_prepost_state_generation()</code>、<code>dfn3_model_io_state_generation()</code>、<code>gtcrn_model_state_generation()</code> 數 C 端把 state 清零的次數
 （<code>reset</code> 與被拒絕的 commit 各加一）。定點 accelerator 的 state 緩衝在 C 清零時不會跟著變，
 板端 sample 比較這個值，變了就用量化後的 0 重填 state 輸入。RNNoise-ERB 的 state 綁定見它自己的頁面。</p>
 
@@ -178,9 +179,9 @@ head 與 <code>h_gru</code> 全部，較舊的格子不重查。</p>
 
 <p><b>為什麼各自是第三個 TU</b>：被組合的兩個檔（<code>ulcnet_process.c</code> +
 <code>ulcnet_model_io.c</code>；<code>aiaec_process.c</code> + <code>deepvqe_process.c</code>；
-<code>dfn2_process.c</code> + <code>dfn2_model_io.c</code>）必須維持<b>各自可獨立連結</b>——它們的
+<code>dfn2_process.c</code> + <code>dfn2_model_io.c</code>；<code>dfn3_process.c</code> + <code>dfn3_model_io.c</code>）必須維持<b>各自可獨立連結</b>——它們的
 parity 測試各自只編其中一個。把類別塞進任一邊，就會在另一邊的 parity build 留下未定義符號。
-三個類別都是純組合，被組合的檔一行沒改。</p>
+這些類別都是純組合，被組合的檔一行沒改。</p>
 
 <h2>哪些模型有 C 類別</h2>
 
@@ -195,9 +196,13 @@ parity 測試各自只編其中一個。把類別塞進任一邊，就會在另�
 <td><b>mute_fail_closed</b>：靜音（stream 0 是原始 mic，放行＝未消迴聲）</td>
 <td><code>state_layout_version</code> + <code>c_descriptor</code>（<code>AIAEC/_streaming_export.py</code>）</td></tr>
 <tr><td>DeepFilterNet2</td><td><code>AINR/DeepFilterNet2/dfn2_prepost.c/h</code></td>
-<td><code>AINR/tests/test_dfn2_prepost_c.py</code>（17 案例）</td>
+<td><code>AINR/tests/test_dfn2_prepost_c.py</code>（17 個測試函式）</td>
 <td>identity：unit ERB mask + alpha 0</td>
 <td><code>state_layout_version</code>（<code>DeepFilterNet2/export_onnx.py</code>）</td></tr>
+<tr><td><a href="ainr_dfn3.html">DeepFilterNet3</a></td><td><code>AINR/DeepFilterNet3/dfn3_prepost.c/h</code></td>
+<td><code>AINR/tests/test_dfn3_prepost_c.py</code>（7 個測試函式）</td>
+<td>identity：高頻 unit ERB gain + 低頻 raw bin 的 unit center DF tap</td>
+<td><code>state_layout_version</code>（<code>DeepFilterNet3/export_onnx.py</code>）</td></tr>
 <tr><td>Align-CRUSE</td><td><b>沒有</b>——只有共用的 <code>AIAEC/aiaec_process.c/h</code> helper</td>
 <td>—</td><td>—</td>
 <td><b>兩個 key 都沒有</b></td></tr>
@@ -244,7 +249,7 @@ make -C AIAEC test                                  # 建庫 + pytest</pre>
 <code>ulcnet_accelerator_adapter</code>、<code>aiaec_process</code>、
 <code>deepvqe_process</code>、<code>deepvqe_prepost</code>。
 <code>libainr_prepost.a</code> 成員：<code>dfn2_process</code>、<code>dfn2_model_io</code>、
-<code>dfn2_prepost</code>、<code>gtcrn_process</code>——<b>RNNoise-ERB 不在裡面</b>：它有自己的
+<code>dfn2_prepost</code>、<code>dfn3_process</code>、<code>dfn3_model_io</code>、<code>dfn3_prepost</code>、<code>gtcrn_process</code>——<b>RNNoise-ERB 不在裡面</b>：它有自己的
 Makefile、沒有封存檔，板端要用就把它的 <code>process.c</code> 直接加進自己的 build。</p>
 
 <h2>Calibration signal seam</h2>
@@ -263,7 +268,7 @@ tensor（目標平台量化工具鏈要求 rank-4）。<code>onnx_batch1_optimiz
 Audio_ALG/PTQ，不屬於任何單一模型；測試在
 <code>AIAEC/tests/test_onnx_batch1_optimizer.py</code>）<b>不屬於任何匯出器</b>：匯出、契約檢查、
 等價比對與量化一致檢查都在未整理的圖上完成，最後才對匯出的 .onnx 單獨執行下列指令，產出可上板的圖。它可用在任何靜態形狀的 ONNX：</p>
-<pre>python3 onnx_batch1_optimizer.py model.onnx -o model_b1.onnx --verify</pre>
+<pre>python3 PTQ/onnx_batch1_optimizer.py model.onnx -o model_b1.onnx --verify</pre>
 <p>三道 pass 都只重新標記軸、不改任何算術，因此結果必須與原圖在 onnxruntime 逐位元相同
 （<code>--verify</code> 要求差 0）：</p>
 <ul>
@@ -275,8 +280,7 @@ Audio_ALG/PTQ，不屬於任何單一模型；測試在
 MatMul、ReduceSum/Mean/Max/Min、Softmax；其他 op 會列在 <code>blocked</code>），再由
 merge_views 抵消成對的 Reshape。</li>
 </ul>
-<p>實測節點數（ONNX Runtime 常數折疊後 → 整理後）：DeepVQE-S 121 → 101、Align-ULCNet 115 → 96、
-DFN2 128 → 103，三者整理後都不再有 rank &gt; 4 的 tensor，輸出差 0。
+<p>整理前後的節點數與是否仍有 rank &gt; 4 的 tensor 隨模型而定，以 <code>--verify</code> 的輸出為準（各模型的實測數字待量測）。
 這些 op 在目標平台上是否有成本、rank-4 限制是否涵蓋中間 tensor，尚待工具鏈的算子報告確認。
 改變算式的重寫（例如把 attention 的 Mul＋ReduceSum 改成 MatMul）不在此工具範圍，由各模型的匯出器決定。</p>
 
@@ -289,5 +293,12 @@ DFN2 128 → 103，三者整理後都不再有 rank &gt; 4 的 tensor，輸出�
 <li>非有限 input/state fail closed，不提交部分 state。</li>
 <li>C scalar/SIMD 測試通過。</li>
 </ol>
+
+<h2>相關檔案</h2>
+<ul>
+<li>pipeline 呼叫與時序：<a href="pipeline_dfn_usage.html">pipeline_dfn_usage</a>、<a href="pipeline_dfn_sequence.html">pipeline_dfn_sequence</a>、<a href="pipeline_ulcnet_usage.html">pipeline_ulcnet_usage</a>、<a href="pipeline_ulcnet_sequence.html">pipeline_ulcnet_sequence</a>；參數表：<a href="pipeline_dfn_params.html">pipeline_dfn_params</a>、<a href="pipeline_ulcnet_params.html">pipeline_ulcnet_params</a></li>
+<li>範例組合：<a href="pipeline_dfn_mono.html">pipeline_dfn_mono</a>、<a href="pipeline_dfn_4ch.html">pipeline_dfn_4ch</a>、<a href="pipeline_ulcnet_mono.html">pipeline_ulcnet_mono</a>、<a href="pipeline_ulcnet_4ch.html">pipeline_ulcnet_4ch</a>；總覽見 <a href="index.html">index</a>、<a href="conventions.html">conventions</a></li>
+<li>原始碼：<code>AINR/onnx_streaming_contract.py</code>、<code>AIAEC/_streaming_export.py</code>、<code>AINR/DeepFilterNet2/dfn2_prepost.h</code>、<code>AINR/DeepFilterNet3/dfn3_prepost.h</code>、<code>AIAEC/Align_ULCNet/ulcnet_prepost.h</code>、<code>AIAEC/DeepVQE_S/deepvqe_prepost.h</code></li>
+</ul>
 </body>
 </html>

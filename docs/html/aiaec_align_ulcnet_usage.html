@@ -1,0 +1,226 @@
+<!doctype html>
+<html lang="zh-TW">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>AIAEC Align-ULCNet 使用與參數</title>
+<style>
+body{font-family:-apple-system,"Segoe UI",Roboto,"Noto Sans TC",sans-serif;max-width:62rem;margin:0 auto;padding:1rem 1.25rem 3rem;line-height:1.55;color:#1a222c;background:#fff}
+nav{font-size:.9rem;border-bottom:1px solid #ccd3dc;padding-bottom:.5rem;margin-bottom:1rem}
+nav a{margin-right:.7rem}
+h1{font-size:1.45rem;margin-bottom:.2em}
+h2{font-size:1.1rem;margin-top:1.7em;border-bottom:1px solid #dde3ea;padding-bottom:.2em}
+h3{font-size:1rem;margin-top:1.3em}
+code,pre{font-family:ui-monospace,SFMono-Regular,Menlo,Consolas,monospace;font-size:.85em}
+pre{background:#f5f7fa;border:1px solid #dde3ea;border-radius:6px;padding:.7rem .9rem;overflow-x:auto;line-height:1.35}
+.tbl{overflow-x:auto}
+table{border-collapse:collapse;font-size:.86rem}
+th,td{border:1px solid #ccd3dc;padding:.25rem .55rem;text-align:left;vertical-align:top}
+th{background:#eef1f5}
+.note{font-size:.88rem;color:#54606e}
+@media (prefers-color-scheme:dark){
+ body{background:#14181d;color:#dbe2ea}
+ pre{background:#1c2229;border-color:#2c343d}
+ th{background:#212932}
+ th,td{border-color:#2c343d}
+ nav,h2{border-color:#2c343d}
+ a{color:#7cb3ff}
+ .note{color:#9aa7b4}
+}
+</style>
+</head>
+<body>
+<nav><a href="index.html">索引</a><a href="conventions.html">慣例</a><a href="conventions_latency.html">延遲預算</a><a href="onnx_prepost.html">ONNX 邊界</a><a href="aiaec_align_ulcnet.html">Align-ULCNet</a><a href="aiaec_align_ulcnet_detail.html">Align-ULCNet 細節</a><a href="aiaec_align_ulcnet_usage.html"><b>Align-ULCNet 使用</b></a><a href="aiaec_align_cruse.html">Align-CRUSE</a><a href="aiaec_align_cruse_usage.html">Align-CRUSE 使用</a><a href="aiaec_deepvqe_s.html">DeepVQE-S</a><a href="aiaec_deepvqe_s_usage.html">DeepVQE-S 使用</a><a href="aiaec_cagcrn.html">CAGCRN</a><a href="aiaec_cagcrn_usage.html">CAGCRN 使用</a></nav>
+
+<h1>AIAEC Align-ULCNet：如何呼叫、流程時序圖、外部／內部參數</h1>
+
+<h2>概要</h2>
+<p>Align-ULCNet 是接在 linear AEC 後面的 RES+NR post-filter：輸入是 linear AEC 的 <b>error</b> 與<b>未對齊的 raw far</b>（兩者取自同一個輸入 hop）。C 端有三個層次，整合者通常只用第一或第二個：</p>
+<div class="tbl"><table>
+<tr><th>入口</th><th>用途</th><th>標頭</th></tr>
+<tr><td><b>A. <code>UlcnetPrepost</code> 類別（建議）</b></td><td>hop 進 hop 出（<code>ULCNET_IO_TIME</code>）或頻譜進頻譜出（<code>ULCNET_IO_FREQ</code>，串接 AEC 或 4ch 單元輸出頻譜用）；framing、壓縮域前端、四個 state、mask 套用全在物件內</td><td><code>ulcnet_prepost.h</code></td></tr>
+<tr><td>B. <code>UlcnetAcceleratorAdapter</code></td><td>把加速器 graph 包成 <code>UlcnetModel</code> callback，交給 pipeline／sample stage（<code>pipelines/samples/ulcnet_nn_stage.c</code>）驅動；內部就是一個 <code>ULCNET_IO_FREQ</code> 的類別實例</td><td><code>ulcnet_accelerator_adapter.h</code></td></tr>
+<tr><td>C. <code>ulcnet_model_io_*</code></td><td>只要 state 與 prepare／commit，不含 framing；類別就是由它組成</td><td><code>ulcnet_model_io.h</code></td></tr>
+</table></div>
+<p>模型內容、graph 邊界（layout 18）、I/O 表、State 表見 <a href="aiaec_align_ulcnet.html">aiaec_align_ulcnet</a>；far branch／PTQ／reprime 見 <a href="aiaec_align_ulcnet_detail.html">aiaec_align_ulcnet_detail</a>。</p>
+
+<h2>如何呼叫使用</h2>
+<ol>
+<li><b>grid 是編譯期參數</b>：一個 build 只服務一組 grid，16 kHz／512（預設）或 48 kHz／1024，以 <code>-DULCNET_MODEL_IO_SR</code>／<code>-DULCNET_MODEL_IO_N_FFT</code> 選擇（<code>pipelines/Makefile</code> 以 <code>ULCNET_GRID=16k|48k</code> 傳入）；其他組合在 <code>ulcnet_model_io.h</code> 直接 <code>#error</code>。</li>
+<li><b>D（delay depth）必須等於匯出該 ONNX 時的 <code>--max-delay-frames</code></b>：C 端只檢查範圍 <code>ULCNET_MODEL_IO_MIN_D</code>(2)…<code>MAX_D</code>(64)，檢查不出與 graph 不符。D 不跨 grid 沿用（D 數的是 hop）。</li>
+<li>準備 <code>FftHandle</code>（<code>ULCNET_N_FFT</code> 點）與 sqrt-Hann 窗表（<code>ac_window_build(w, ULCNET_N_FFT)</code>）；TIME 模式兩者必填，FREQ 可為 NULL。皆為 caller-owned、borrowed。</li>
+<li><code>ulcnet_prepost_config_defaults(&amp;cfg, io_mode, D)</code> → 填 <code>fft</code>／<code>window</code> → <code>ulcnet_prepost_get_mem_size(&amp;cfg, &amp;req)</code>（<code>req.alignment</code> = 16）→ <code>ulcnet_prepost_init_ex(pool, req.bytes, &amp;cfg, &amp;req)</code>；host 工具可用 <code>_create</code>／<code>_destroy</code>。</li>
+<li>每個 hop（<b>從 hop 0 起一次推論</b>，沒有只暖機不推論的拍）：<code>pre_process(err_hop, far_hop)</code> 恆回 1 → <code>frame_inputs</code> → 加速器 → <code>frame_commit</code>（失敗改 <code>frame_skip</code>）→ <code>post_process</code>。</li>
+<li>每次 <code>ulcnet_prepost_state_generation()</code> 改變（<code>reset</code>、被拒的 <code>frame_commit</code>），把加速器自己的 state 重填成量化後的 0。新建實例的 generation 為 0。</li>
+<li>重新開始：<code>ulcnet_prepost_reset(p)</code>（清四個 state、framing，丟掉未結束的 frame；config 與 pool 不動）；結束：<code>_destroy</code>（對 <code>_init</code> 實例是 no-op）。</li>
+</ol>
+<pre>#include &lt;stdlib.h&gt;
+#include "Align_ULCNet/ulcnet_prepost.h"
+
+extern int  npu_run(const UlcnetModelIoInputs *in, UlcnetModelIoOutputs *out);
+extern void npu_fill_state_with_quantized_zero(void);
+
+/* D 必須等於匯出該 ONNX 時的 --max-delay-frames。fft/window 的 grid 與編譯期
+ * ULCNET_MODEL_IO_SR / _N_FFT 一致; window = ac_window_build(window, ULCNET_N_FFT)。 */
+int run_ulcnet(FftHandle *fft, const float *window, int D,
+               const float *err, const float *far, float *out, long hops)
+{
+    UlcnetPrepostConfig cfg;
+    UlcnetPrepostMemReq req;
+    int rc = 0;
+
+    if (ulcnet_prepost_config_defaults(&amp;cfg, ULCNET_IO_TIME, D) != 0) return -1;
+    cfg.fft = fft;  cfg.window = window;
+    if (ulcnet_prepost_get_mem_size(&amp;cfg, &amp;req) != 0) return -1;
+    size_t bytes = ((size_t)req.bytes + req.alignment - 1) / req.alignment * req.alignment;
+    void *pool = aligned_alloc(req.alignment, bytes);
+    UlcnetPrepost *p = pool ? ulcnet_prepost_init_ex(pool, (size_t)req.bytes, &amp;cfg, &amp;req) : NULL;
+    if (!p) { free(pool); return -1; }
+
+    uint32_t seen = ulcnet_prepost_state_generation(p);        /* 新實例為 0 */
+    npu_fill_state_with_quantized_zero();
+    for (long h = 0; h &lt; hops &amp;&amp; rc == 0; ++h) {
+        UlcnetModelIoInputs xin;
+        UlcnetModelIoOutputs xout;
+        int written = 0;
+        /* err: linear AEC 的 error hop; far: 同一輸入 hop 的原始 far hop (未對齊) */
+        if (ulcnet_prepost_pre_process(p, err + h * ULCNET_HOP, far + h * ULCNET_HOP) != 1 ||
+            ulcnet_prepost_frame_inputs(p, &amp;xin, &amp;xout) != 0) { rc = -1; break; }
+        if (ulcnet_prepost_state_generation(p) != seen) {
+            npu_fill_state_with_quantized_zero();
+            seen = ulcnet_prepost_state_generation(p);
+        }
+        if (npu_run(&amp;xin, &amp;xout) != 0 || ulcnet_prepost_frame_commit(p) != 0)
+            ulcnet_prepost_frame_skip(p);                      /* error 頻譜原樣通過 */
+        if (ulcnet_prepost_post_process(p, out + h * ULCNET_HOP, &amp;written) != 0) rc = -1;
+    }
+    ulcnet_prepost_destroy(p);
+    free(pool);
+    return rc;
+}</pre>
+<p>入口 B（交給 pipeline 的 callback 邊界）：</p>
+<pre>#include &lt;stdlib.h&gt;
+#include "Align_ULCNet/ulcnet_accelerator_adapter.h"
+
+/* 目標平台 runtime: 綁定 inputs 的八個張量與 outputs 的五個張量;
+ * 每個 *_out 綁在同名 state 輸入的位址, 先讀完所有 state 輸入才寫輸出。成功回 0。 */
+extern int run_graph(void *user, const UlcnetModelIoInputs *in, UlcnetModelIoOutputs *out);
+
+/* 給 pipeline 用的 UlcnetModel (callback 邊界): adapter 內含 CPU 端的全部 state。
+ * D 必須等於匯出該 ONNX 時的 --max-delay-frames; descriptor 只做範圍檢查。 */
+UlcnetAcceleratorAdapter *make_adapter(int D, void *runtime, UlcnetModel *model)
+{
+    UlcnetModelIoDescriptor desc;
+    size_t bytes = 0, align = 0;
+
+    if (ulcnet_model_io_descriptor_default(D, &amp;desc) != 0) return NULL;     /* D 超出 2..64 */
+    /* 從 ONNX／JSON metadata 載入的 descriptor 用 ulcnet_model_io_descriptor_validate() 檢查 */
+    if (ulcnet_accelerator_adapter_get_mem_size(&amp;desc, &amp;bytes, &amp;align) != 0) return NULL;
+
+    void *mem = aligned_alloc(align, (bytes + align - 1) / align * align);  /* 板端: 靜態 arena */
+    if (!mem) return NULL;
+    UlcnetAcceleratorAdapter *a =
+        ulcnet_accelerator_adapter_init(mem, bytes, &amp;desc, run_graph, runtime);
+    if (!a) { free(mem); return NULL; }
+    *model = ulcnet_accelerator_adapter_model(a);   /* 交給 pipeline; adapter 與 pool 須活得比 pipeline 久 */
+    return a;
+}</pre>
+<p class="note">兩段片語已在暫存副本以 <code>-std=c11 -Wall -Wextra -Wpedantic -Werror</code> 編譯通過（16 kHz grid）；<code>npu_run</code>／<code>run_graph</code>／<code>npu_fill_state_with_quantized_zero</code> 由目標平台提供。<code>UlcnetModel.infer</code> 回非 0 或輸出非有限時，pipeline 會改走 identity（輸出 linear error）；<code>io_descriptor</code> 必須發布，且須比 pipeline 活得久（pipeline 只複製 struct）。</p>
+
+<h3>錯誤處理速查</h3>
+<div class="tbl"><table>
+<tr><th>呼叫</th><th>失敗回傳</th><th>原因／處置</th></tr>
+<tr><td><code>config_defaults</code></td><td>-1</td><td>NULL、io_mode 未知、D 超出 2…64</td></tr>
+<tr><td><code>get_mem_size</code></td><td>-1，<code>*req</code> 不動</td><td>同上，或 TIME 缺 <code>fft</code>／<code>window</code>、<code>fft</code> 的 bin 數不是 <code>ULCNET_BINS</code>、<code>model_layout_version</code> 非 0 又不等於 18</td></tr>
+<tr><td><code>init</code>／<code>init_ex</code></td><td>NULL</td><td>pool 未對齊／太小、config 錯、<code>expected</code> 與本 build 不符（陳舊 pool）</td></tr>
+<tr><td><code>pre_process*</code></td><td>-1</td><td>NULL、模式不符、上一個 frame 尚未 commit／skip</td></tr>
+<tr><td><code>frame_inputs</code></td><td>-1</td><td>沒有開啟中的 frame</td></tr>
+<tr><td><code>frame_commit</code></td><td>-1</td><td>mask 或 state 有非有限值（或沒先 <code>frame_inputs</code>）：四個 state 全部歸零、generation +1、frame 仍開；呼叫 <code>frame_skip</code> 或重新 <code>frame_inputs</code></td></tr>
+<tr><td><code>frame_skip</code></td><td>-1</td><td>沒有開啟中的 frame；成功＝<b>identity</b>（error 頻譜原樣通過，state 維持加速器寫完的樣子，framing 照常前進）</td></tr>
+<tr><td><code>post_process</code></td><td>-1</td><td>NULL、模式不符、frame 還開著；成功時 out_hop 恆寫滿，hop 0 為零且 <code>*written</code> = 0</td></tr>
+</table></div>
+
+<h2>流程時序圖</h2>
+<pre>
+caller                         UlcnetPrepost (C)                   NPU runtime
+  |                                  |                                  |
+  |== init ==========================|==================================|
+  | config_defaults(io_mode, D) ---->| -1: D 不在 2..64                 |
+  | get_mem_size(cfg,&amp;req) --------->| TIME 需 fft+window               |
+  | init_ex(pool,bytes,cfg,&amp;req) --->| 四個 state = 0, generation = 0   |
+  | ------------------------------ fill state with quantized 0 ------>|
+  |                                  |                                  |
+  |== 每個 hop (含 hop 0) ============|==================================|
+  | pre_process(err_hop,far_hop) --->| 兩路 rolling 分析 (center = 0)   |
+  | &lt;-------- 1 ----------------------|                                  |
+  | frame_inputs(&amp;in,&amp;out) -------->| 壓縮域特徵 error_mag/far_mag/    |
+  |                                  | error_cos/error_sin; mask 預填 NaN|
+  | state_generation() ------------->| (變了 -&gt; 重填量化零) ------------->|
+  | -------------------------------------- run(in, out) ------------->| 讀完 state 輸入, 再寫
+  | &lt;---------------------------------------- rc --------------------| mask 與四個 *_out
+  | frame_commit() ----------------->| finite 檢查; mask x 壓縮域 error;|
+  |                                  | 逆冪; 推進 ISTFT                 |
+  | post_process(out,&amp;written) ----->| hop 0: written = 0; 之後 H 樣本  |
+  | &lt;-------- 0 -----------------------|                                  |
+  |                                  |                                  |
+  |== 失敗 ===========================|==================================|
+  | frame_commit() ----------------->| 四個 state 歸零, generation+1    |
+  | &lt;-------- -1 ----------------------|                                  |
+  | frame_skip() ------------------->| identity: error 頻譜原樣通過     |
+  |== reset() ----------------------&gt;| state, framing 清空; generation+1 |
+</pre>
+<div class="tbl"><table>
+<tr><th>項目</th><th>16 kHz／512</th><th>48 kHz／1024</th><th>出處</th></tr>
+<tr><td>hop（H）</td><td>256 samples = 16.00 ms</td><td>512 samples = 10.67 ms</td><td><code>ULCNET_HOP</code></td></tr>
+<tr><td>模型 lookahead</td><td colspan="2">0 hop（同一次 invocation 出同一框）</td><td><a href="aiaec_align_ulcnet.html">aiaec_align_ulcnet</a></td></tr>
+<tr><td>端到端延遲</td><td colspan="2">1 hop（H samples），來自 synthesis 的半窗 trim；hop 0 無輸出，hop p ≥ 1 輸出對應輸入 [(p−1)·H, p·H)</td><td><code>ulcnet_process.h</code></td></tr>
+<tr><td>pool，<code>ULCNET_IO_FREQ</code>，D = 8</td><td>75,248 B</td><td>142,832 B</td><td>本機量測</td></tr>
+<tr><td>pool，<code>ULCNET_IO_TIME</code>，D = 8</td><td>97,040 B</td><td>186,128 B</td><td>本機量測</td></tr>
+<tr><td>adapter pool，D = 8</td><td>75,280 B（FREQ + 32 B header）</td><td>142,864 B</td><td>本機量測</td></tr>
+</table></div>
+<p class="note">其他 D 的 pool 大小（D = 4…64）見 <a href="aiaec_align_ulcnet.html">aiaec_align_ulcnet</a> 的 State 表；pool 隨 D 線性成長，<code>ULCNET_IO_TIME</code> 在 FREQ 之上另加與 D 無關的 framing（16 kHz +21,792 B、48 kHz +43,296 B）。</p>
+
+<h2>函式清單：公開 vs 內部</h2>
+<div class="tbl"><table>
+<tr><th>分類</th><th>函式</th></tr>
+<tr><td><b>公開（整合者）</b><br><code>ulcnet_prepost.h</code></td><td><code>ulcnet_prepost_config_defaults</code>、<code>_get_mem_size</code>、<code>_init</code>、<code>_init_ex</code>、<code>_create</code>、<code>_destroy</code>、<code>_reset</code>、<code>_state_generation</code>、<code>_hop_size</code>、<code>_num_bins</code>、<code>_io_mode</code>、<code>_descriptor</code>、<code>_pre_process</code>、<code>_pre_process_freq</code>、<code>_frame_inputs</code>、<code>_frame_commit</code>、<code>_frame_skip</code>、<code>_post_process</code>、<code>_post_process_freq</code></td></tr>
+<tr><td><b>公開（adapter／callback）</b></td><td><code>ulcnet_accelerator_adapter_get_mem_size</code>、<code>_init</code>、<code>_state_generation</code>、<code>_descriptor</code>、<code>_model</code>；struct <code>UlcnetModel</code>、<code>UlcnetNnJob</code>；<code>ulcnet_frame_is_finite</code></td></tr>
+<tr><td><b>低階（類別內部使用）</b></td><td><code>ulcnet_model_io_descriptor_default</code>／<code>_validate</code>、<code>ulcnet_far_input_mode_name</code>、<code>ulcnet_model_io_align_up</code>、<code>_get_mem_requirements</code>、<code>_init</code>、<code>_reset</code>、<code>_prepare</code>、<code>_commit</code>、<code>_descriptor</code>、<code>_state_generation</code>、<code>ulcnet_model_io_signed_pow</code>（inline）；<code>ulcnet_framing_config</code>（<code>ulcnet_process.h</code>，描述 audiolib 的 sqrt-Hann <code>AcStft</code>／<code>AcIstft</code>）</td></tr>
+<tr><td><b>內部（<code>static</code>）</b></td><td><code>ulcnet_prepost.c</code>：<code>pp_carve</code>、<code>pp_layout</code>、<code>pp_build_hash</code>、<code>pp_check_config</code>、<code>pp_descriptor_for</code>、<code>pp_close_frame</code>；<code>ulcnet_model_io.c</code>：<code>front_end</code>／<code>back_end</code>（含 NEON 版）、<code>carve_float</code>、<code>clear_recurrent_state</code> 等；<code>ulcnet_accelerator_adapter.c</code>：<code>adapter_layout</code>、<code>infer</code>、<code>reset</code></td></tr>
+</table></div>
+
+<h2>參數表</h2>
+<h3>外部：第三方可調</h3>
+<div class="tbl"><table>
+<tr><th>名稱</th><th>位置</th><th>型別／範圍</th><th>預設</th><th>何時設定</th><th>說明</th></tr>
+<tr><td><code>io_mode</code></td><td><code>UlcnetPrepostConfig</code></td><td><code>ULCNET_IO_TIME</code>(1)／<code>ULCNET_IO_FREQ</code>(0)</td><td>參數</td><td>init 前</td><td>決定 pool 大小；FREQ 不做任何 transform</td></tr>
+<tr><td><code>delay_depth</code>（D）</td><td>同上；<code>UlcnetModelIoDescriptor.delay_depth</code></td><td>整數 2…64</td><td>參數</td><td>init 前；<b>必須等於 export 的 D</b></td><td>決定 K/V／logit window 與 pool 大小；不改權重形狀；跨 grid 不沿用；訓練 <code>config.ini</code> 的 <code>max_delay_frames</code>（出貨 32）與部署 D 可以不同</td></tr>
+<tr><td><code>fft</code>／<code>window</code></td><td>同上</td><td><code>FftHandle*</code>（<code>ULCNET_BINS</code> bins）；<code>ULCNET_N_FFT</code> 個 float</td><td>NULL</td><td>init 前</td><td>TIME 必填；borrowed，須與物件同壽命</td></tr>
+<tr><td><code>model_layout_version</code></td><td>同上</td><td>0 或 18</td><td>0（用本 build 的 18）</td><td>init 前</td><td>非 0 時須等於 <code>ULCNET_MODEL_IO_LAYOUT_VERSION</code> 並與 ONNX metadata 一致；用來在載入舊圖時早期拒絕</td></tr>
+<tr><td>grid</td><td>build</td><td>16 kHz／512 或 48 kHz／1024</td><td>16 kHz</td><td>編譯期</td><td>16 kHz checkpoint 不能當 48 kHz 用（頻率軸張量形狀不同），需另訓</td></tr>
+<tr><td><code>--max-delay-frames</code>、<code>--opset</code>(17)、<code>--verify</code></td><td><code>export_onnx.py</code></td><td>D 2…64</td><td>checkpoint 的 D</td><td>匯出</td><td>D 與 PTQ calibration、C 端 descriptor 必須同一個值</td></tr>
+<tr><td><code>--max-delay-frames</code>、<code>--delay-num-filters</code>、<code>--far-input-mode</code>、<code>--input-is-linear-error</code>、<code>--device</code>、<code>--verify</code></td><td><code>inference.py</code></td><td>far 模式 <code>raw_far</code>／<code>aligned_far</code></td><td>raw_far；n = 5</td><td>離線推論</td><td><code>--delay-num-filters</code> 是 AEC 前端 matched filter bank 大小，與 <code>--input-is-linear-error</code> 互斥；<code>aligned_far</code> 只用於診斷比較，C descriptor 只接受 raw</td></tr>
+<tr><td><code>calib</code> 子命令</td><td><code>inference.py calib</code></td><td><code>--checkpoint</code>／<code>--primary-dir</code>／<code>--far-dir</code>／<code>--output</code>／<code>--format</code>(bin|npz)／<code>--frames</code>(256)／<code>--max-delay-frames</code>／<code>--seed</code>(42)／<code>--onnx</code>／<code>--pair-replace</code></td><td>—</td><td>PTQ 校正</td><td>primary 是 linear-error WAV；同 process 匯出並 parity 檢查 graph</td></tr>
+</table></div>
+<h3>內部：存在且可改，但不建議開放</h3>
+<div class="tbl"><table>
+<tr><th>名稱</th><th>值</th><th>位置</th><th>不開放的原因</th></tr>
+<tr><td><code>ULCNET_MODEL_IO_LAYOUT_VERSION</code></td><td>18（3–17 已退役）</td><td><code>ulcnet_model_io.h</code></td><td>與 <code>export_onnx.py</code> 的 <code>LAYOUT_VERSION</code> 互鎖；是擋下相同張量名稱但邊界不同的舊圖的唯一閘門</td></tr>
+<tr><td><code>ULCNET_MODEL_IO_TA_CHANNELS</code>／<code>_SCORE_WINDOW</code>／<code>_GRU_SUBBANDS</code>／<code>_GRU_LAYERS</code>／<code>_GRU_HIDDEN</code></td><td>32／5／2／2／128</td><td><code>ulcnet_model_io.h</code></td><td>state 張量形狀（K/V、logit、<code>h_gru</code> (1,4,1,128)）</td></tr>
+<tr><td><code>ULCNET_MODEL_IO_TA_BINS</code>／<code>_HOP</code>／<code>_BINS</code></td><td>⌈BINS/10⌉（26／52）、N_FFT/2、N_FFT/2+1</td><td><code>ulcnet_model_io.h</code></td><td>由 grid 導出，無獨立自由度</td></tr>
+<tr><td><code>ULCNET_MODEL_IO_COMPRESSION_EXP</code></td><td>0.3</td><td><code>ulcnet_model_io.h</code></td><td>host 前後端與訓練 loss 共用；<code>export_onnx.py</code> 拒絕其他指數</td></tr>
+<tr><td><code>ULCNET_FAR_RAW</code>／<code>ULCNET_FAR_ALIGNED</code></td><td>0／1</td><td><code>ulcnet_model_io.h</code></td><td>production descriptor 只驗證 raw；aligned 為診斷模式</td></tr>
+<tr><td><code>ULCNET_PREPOST_CARVE_VERSION</code>／<code>_DESCRIPTOR_VERSION</code>、<code>ULCNET_MODEL_IO_ALIGNMENT</code></td><td>6／1／16</td><td><code>ulcnet_prepost.h</code>、<code>ulcnet_model_io.h</code></td><td>pool 切分與 32-byte descriptor 版本；進 <code>build_flags_hash</code></td></tr>
+<tr><td>訓練端 <code>config.ini</code> 的 <code>[model]</code>（<code>gamma</code>、<code>subband_bins</code>、<code>compression_exponent</code>）</td><td>5、2、0.3</td><td><code>Align_ULCNet/config.ini</code></td><td>權重形狀的一部分，寫進 checkpoint contract</td></tr>
+</table></div>
+
+<h2>相關檔案與測試路徑</h2>
+<ul>
+<li><code>AIAEC/Align_ULCNet/ulcnet_prepost.c</code> / <code>.h</code>、<code>ulcnet_model_io.c</code> / <code>.h</code>、<code>ulcnet_process.c</code> / <code>.h</code>、<code>ulcnet_accelerator_adapter.c</code> / <code>.h</code>；建置：<code>make -C AIAEC lib</code>（<code>libaiaec_prepost.a</code>）</li>
+<li>測試：<code>AIAEC/tests/test_ulcnet_prepost_c.py</code>、<code>test_ulcnet_model_io_c.py</code>、<code>test_ulcnet_process_c.py</code>、<code>test_ulcnet_accelerator_adapter.c</code></li>
+<li>host 範例：<code>pipelines/mono_alignulcnet/main.c</code>、<code>pipelines/4ch_alignulcnet/main.c</code>（<a href="pipeline_ulcnet_mono.html">pipeline_ulcnet_mono</a>、<a href="pipeline_ulcnet_4ch.html">pipeline_ulcnet_4ch</a>、<a href="pipeline_ulcnet_detail.html">pipeline_ulcnet_detail</a>）</li>
+<li>同類頁面：<a href="aiaec_align_ulcnet.html">aiaec_align_ulcnet</a>、<a href="aiaec_deepvqe_s_usage.html">aiaec_deepvqe_s_usage</a>、<a href="onnx_prepost.html">onnx_prepost</a>、<a href="index.html">index</a></li>
+<li>文件：<a href="../../AIAEC/Align_ULCNet/README.md">README.md</a>、<a href="../../AIAEC/README.md">AIAEC/README.md</a></li>
+</ul>
+</body>
+</html>

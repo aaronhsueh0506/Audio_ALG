@@ -135,15 +135,11 @@ analysis 降頻。預設 `delay_est_period_s = 0` 不降頻。
    windowed-ERLE duty watchdog 與 `delay_acquire_protect_converged` 讀
    `last_erle_windowed`，它不論 `enable_res` 都會更新，且不進訊號路徑；
    warm tap-transfer gate 讀的 inst-ERLE ring 無條件每 hop 填充。
-3. **`delay_backward_quarantine_enabled` / `_s`**（預設 OFF，見
-   `lib/aec/docs/c_user_manual_zh_TW.md` 與
-   `lib/aec/docs/delay_estimator_design_zh_TW.md`）是
-   `delay_acquire_protect_converged` 的 Path-B 姊妹機制，針對**已鎖定後被 pre-echo
-   誤鎖搶走**。只隔離比現行 delay **更早**的候選，且有時間上限——到期就採用，所以是
-   「延後一個窗」而不是「治癒誤鎖」。判別式 `aec_linear_is_cancelling()` 同時看
-   windowed 與 inst-ERLE 兩個讀數，兩端共用同一函式；4ch core 只問
-   `capture_proxy_channel` 那一條 lane（餵給共用 estimator 的那支 mic）。產品組態與
-   AIAEC 的 frozen frontend 都維持預設 OFF。
+3. **4ch 核心的 `delay_backward_quarantine_enabled` / `_s`**（`FourAecNrResConfig`，預設 OFF；lib/aec 的 `AecConfig`
+   沒有這個欄位，mono 的 `Aec` 也沒有這個機制）是 `delay_acquire_protect_converged` 的 Path-B 姊妹機制，針對**已鎖定後被
+   pre-echo 誤鎖搶走**。只隔離比現行 delay **更早**的共用估計，且有時間上限——到期就採用，所以是
+   「延後一個窗」而不是「治癒誤鎖」。判別式是 `aec_linear_is_cancelling()`（同時看 windowed 與 inst-ERLE 兩個讀數）；
+   核心只問 `capture_proxy_channel` 那一條 lane（餵給共用 estimator 的那支 mic）。4ch 產品組態維持預設 OFF；欄位語意見 `docs/integration_4ch_core_zh_TW.md` 與 `4aec_nr_res.h`。
 
 watchdog leak 依各 grid 的 hop 時間重定時，使衰減固定為 0.1 dB/s；C/Python
 effective-value 與 mutation 測試鎖住此契約。
@@ -448,7 +444,7 @@ non-centered 第 k-1 幀覆蓋**完全相同的樣本**（逐 bit 同頻譜）�
 
 **4ch 的 latency contract**：4ch Align-ULCNet pipeline 的「加總後額外演算法延遲」是
 **1 hop**（16 kHz 256 samples = 16 ms、48 kHz 512 samples = 10.67 ms），與 mono
-範例（`pipelines/mono_alignulcnet/main.c`）相同。GSC 產出的 beamformed error **頻譜**直接餵給模型（它已經是本 hop 的
+範例（`pipelines/mono_alignulcnet/main.c`）相同。BF 產出的 beamformed error **頻譜**直接餵給模型（它已經是本 hop 的
 sqrt-Hann 50%-overlap 單幀），中間沒有 beam WOLA→再 analysis 的來回，far 路也沒有
 one-hop 補償 buffer；唯一的延遲來源就是本節的 ULCNet synthesis WOLA。`process()`
 只有 hop #0 輸出零，之後 hop p 的輸出是 input hop p-1 的 beamformed error。每個 hop
@@ -474,7 +470,7 @@ identity reprime：邊界的 `model->reset` 之後，C 側 STFT 狀態仍連續�
 `test_reprime_straddle_derivation()` 以脈衝標記在**無邊界對照跑**中量出並斷言，不是
 寫死的估計值。
 
-**4ch direct path**：GSC 的 beamformed error **頻譜**直接當成模型的 error frame（它本來
+**4ch direct path**：BF 的 beamformed error **頻譜**直接當成模型的 error frame（它本來
 就是本 hop 的 sqrt-Hann 50%-overlap 單幀），far 路用同一個 hop 的
 `ac_stft_push_planar()`（`center` 0 的 `AcStft`），中間沒有 beam WOLA、沒有 error 路的
 二次 analysis，也沒有 one-hop far buffer。兩路因此都從**當前** input hop 成幀，跨界幀
@@ -483,7 +479,7 @@ identity reprime：邊界的 `model->reset` 之後，C 側 STFT 狀態仍連續�
 
 **mono 的 rolling push**：mono 範例（`mono_alignulcnet/main.c` 經 `samples/ulcnet_nn_stage`）的兩路 analysis 用 rolling center=False 的
 `AcStft`（`ac_stft_push_planar()`）（自 hop#0 起每 hop 恰一幀、每 hop 至多一次推論），
-排程與 AEC/GSC seam 一致。reprime 每 hop 遞減（與每發射幀遞減相等），1 hop 端到端
+排程與 AEC/BF seam 一致。reprime 每 hop 遞減（與每發射幀遞減相等），1 hop 端到端
 延遲來自 synthesis 半窗 trim，幀 scratch 為 1 幀。
 
 兩個變體的 production far branch 固定讀 caller 的 raw far，沒有 runtime mode；

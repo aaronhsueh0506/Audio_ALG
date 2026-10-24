@@ -3,20 +3,21 @@
 This example replaces the post-beam MMSE-LSA denoiser of the conventional four-channel
 application (`4ch_aec_bf_nr_res/`) with DeepFilterNet2 while keeping the shared delay estimator,
 the four linear AEC lanes, the SRP-PHAT and beamformer (bf) of the linear AEC + BF unit
-(`4ch_aec_bf_nr_res/audio_pipeline_4ch.h`), the unit's post-beam AEC3 residual suppressor and the
+(`4ch_aec_bf_nr_res/audio_pipeline_4ch.h`), a post-beam AEC3 residual suppressor and the
 comfort-noise recipe. There is no DFN wrapper library: `main.c` initialises the unit
-(`AudioPipeline4Ch`, whose pool already holds the post-beam `AecRes`: `enable_res`, `res_preset`),
-the gain and spectrum buffers of the RES path (no denoiser) and the DFN2 stage (or the rate bridge)
-separately, forms P in `dfn_form()`, and `samples/dfn_hop.h` runs the network between the post-RES
-spectrum and the synthesis:
+(`AudioPipeline4Ch`, which holds no RES), the post-beam `AecRes` (libaec: `aec_res_get_mem_size()` /
+`aec_res_init()` on the unit's grid, balanced preset), the gain and spectrum buffers of the RES path
+(no denoiser) and the DFN2 stage (or the rate bridge) separately, forms P in `dfn_form()`, and
+`samples/dfn_hop.h` runs the network between the post-RES spectrum and the synthesis:
 
 ```text
 mics/ref -> audio_pipeline_4ch_process(unit, mics, far, &beam, NULL)
             shared delay, four lanes, SRP-PHAT, beamformer (bf)
          -> audio_pipeline_4ch_fuse(unit, &frame)
               E = beamformed error spectrum         -> DFN2 feature input
-              frame.g_res_ctx = the unit's RES gain
-         -> P = E * min(1, frame.g_res_ctx)         P = E * G_res (+ comfort noise) -> DFN2 applied here
+              frame.g_res_ctx = NULL (the unit has no RES)
+         -> G_res = se_res_stage_gain(res, &frame)  the example's own AecRes
+         -> P = E * min(1, G_res)                   P = E * G_res (+ comfort noise) -> DFN2 applied here
                                                    (dfn_form(): sk_min_f32 + sk_capply_gain_f32 + aec_cng_fill)
          -> dfn_hop_begin(&hop, frame.e, P)
          -> while (dfn_hop_nn_begin(&hop, &job) > 0) { run the model on the job; dfn_hop_nn_end(&hop, rc) }
@@ -27,9 +28,9 @@ mics/ref -> audio_pipeline_4ch_process(unit, mics, far, &beam, NULL)
 The skeleton uses the unit's own SRP-PHAT and BF, so `audio_pipeline_4ch_fuse()` builds E from the BF's
 spectrum and weights. `dfn_hop_process(&hop, frame.e, P, out)` is the sequence of the `dfn_hop_*`
 calls with the model callback (`dfn_res_stage_infer()` here) as the runner. The RES strength is
-`aec_res_set_preset(audio_pipeline_4ch_res(unit), preset, ramp_ms)`. The example owns its gain
+`aec_res_set_preset(res, preset, ramp_ms)` on the example's own `AecRes`. The example owns its RES, gain
 scratch and comfort-noise state and the ISTFT in the `DfnHop`: the unit carries none of them, and a
-refused call resets the unit, the comfort-noise generator and the `DfnHop` together
+refused call resets the unit, the `AecRes`, the comfort-noise generator and the `DfnHop` together
 (`dfn_reset()` in `main.c`). The
 network estimates from the beamformed error and is applied to the post-RES
 spectrum. The comfort-noise fill is kept as a switch but is OFF by
@@ -41,7 +42,7 @@ rest of P and `atten_lim_db` bounds the attenuation of every bin). With no model
 conventional chain with the denoiser off delayed: bit for bit by two hops at
 48 kHz (the acceptance gate in `tests/test_4ch_dfn.c` asserts it against the hand-written chain of
 `4ch_aec_bf_nr_res/tests/conv_chain_4ch.h`, with comfort noise off and on, across a real
-shared-estimator delay re-lock, on a stimulus where a RES-off unit provably
+shared-estimator delay re-lock, on a stimulus where a run without the example's `AecRes` provably
 differs, and checks that the stage is not reset on the shared aligner's delay change), and through the resampler round trip by the bridge delay at
 16 kHz (the same test pins the delay with a near-end impulse, the frame
 schedule, and the pass-band error against the conventional 16 kHz output,
@@ -87,13 +88,35 @@ meaningful with the mask-only compose and stay experiments:
 ```sh
 python pipelines/tools/eval_dfn2_4ch_inputs.py \
   --checkpoint /path/to/a-v6-checkpoint.pth \
-  --output-dir /tmp/dfn2-input-ab
+  --output-dir dfn2-input-ab
 ```
 
 `--identity-model` is a pipeline/resampler smoke gate only. It requires every
 DFN arm to equal RES-only exactly and makes no speech-quality claim. The
 contract gate refuses a checkpoint whose model/feature versions differ from the
 current model-v6/feature-v5.
+
+## Calling sequence and parameters
+
+```
+App               AudioPipeline4Ch     libaec AecRes     DfnHop + DfnResStage | DfnRateBridge     AcIstft (48 kHz only)
+ |-- audio_pipeline_4ch_default_config; _get_mem_requirements; _init_ex -->|
+ |-- aec_config_from_preset (fft_size = audio_pipeline_4ch_fft_size); aec_res_get_mem_size; aec_res_init -->|
+ |-- dfn_res_stage_* (48 kHz) or dfn_rate_bridge_* (16 kHz): size query + init_ex, dfn_hop_init_*
+ |   per hop: audio_pipeline_4ch_process --> audio_pipeline_4ch_fuse --> se_res_stage_gain(res) --> P = E * min(1, G_res) (dfn_form())
+ |            --> dfn_hop_begin(E, P) --> while (dfn_hop_nn_begin == 1) { model; dfn_hop_nn_end } --> dfn_hop_end --> out
+ |   refused call: audio_pipeline_4ch_reset + aec_res_reset + comfort-noise rng = SE_CNG_RNG_SEED + dfn_hop_reset   (dfn_reset())
+ |   never reset the stage on the shared aligner's delay change
+ |-- audio_pipeline_4ch_destroy; stage / bridge destroy; release the blocks
+```
+
+External parameters: the same board-skeleton flags as the mono variant (`--sample-rate` 16000 default or
+48000, delay profile, `--erb-fwd` / `--erb-inv`, `--atten-lim`, `--cng`), plus the unit's `AudioPipeline4ChConfig`
+(array geometry, `num_angles`; the skeleton uses the default 35 mm UCA, which a
+product replaces with the measured one) and `aec_res_set_preset(res, ...)` on the example's own `AecRes`.
+Internal: the unit's BF / DOA / VAD constants (section 0.3 of
+[`../../docs/integration_4ch_spatial_zh_TW.md`](../../docs/integration_4ch_spatial_zh_TW.md)), the stage
+grid and scale constants, the bridge FIR and schedule.
 
 ## Compute admission
 
@@ -111,10 +134,10 @@ model dominates this arithmetic budget; A53/A73 CPU-only admission still
 requires the final int8/fp runtime and board cycle measurement.
 
 Pool printed by the skeleton (`4ch_aec_bf_dfn_res`, matched delay, five-filter bank, NE10; the
-unit with its post-beam RES, the P and gain buffers, and the stage or bridge, each 16-byte
-aligned): 2,058,768 bytes at the 16 kHz default (the unit plus the rate bridge) and
-6,617,024 bytes at 48 kHz (the conventional four-channel application on the same unit,
-`audio_pipeline_4ch_static`, needs 6,527,568 bytes on the 48 kHz grid).
+unit, the post-beam `AecRes` carved by the example, the P and gain buffers, and the stage or bridge, each 16-byte
+aligned): 2,058,752 bytes at the 16 kHz default (the unit plus the rate bridge) and
+6,617,008 bytes at 48 kHz (the conventional four-channel application on the same unit,
+`audio_pipeline_4ch_static`, needs 6,525,488 bytes on the 48 kHz grid).
 Model weights and accelerator activation/workspace memory are external;
 adding int8 weights alone brings the known minimum to about 4.0 MiB at
 16 kHz.

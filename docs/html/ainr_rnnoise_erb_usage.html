@@ -1,0 +1,197 @@
+<!doctype html>
+<html lang="zh-TW">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>AINR RNNoise-ERB 使用與參數</title>
+<style>
+body{font-family:-apple-system,"Segoe UI",Roboto,"Noto Sans TC",sans-serif;max-width:62rem;margin:0 auto;padding:1rem 1.25rem 3rem;line-height:1.55;color:#1a222c;background:#fff}
+nav{font-size:.9rem;border-bottom:1px solid #ccd3dc;padding-bottom:.5rem;margin-bottom:1rem}
+nav a{margin-right:.7rem}
+h1{font-size:1.45rem;margin-bottom:.2em}
+h2{font-size:1.1rem;margin-top:1.7em;border-bottom:1px solid #dde3ea;padding-bottom:.2em}
+h3{font-size:1rem;margin-top:1.3em}
+code,pre{font-family:ui-monospace,SFMono-Regular,Menlo,Consolas,monospace;font-size:.85em}
+pre{background:#f5f7fa;border:1px solid #dde3ea;border-radius:6px;padding:.7rem .9rem;overflow-x:auto;line-height:1.35}
+.tbl{overflow-x:auto}
+table{border-collapse:collapse;font-size:.86rem}
+th,td{border:1px solid #ccd3dc;padding:.25rem .55rem;text-align:left;vertical-align:top}
+th{background:#eef1f5}
+.note{font-size:.88rem;color:#54606e}
+@media (prefers-color-scheme:dark){
+ body{background:#14181d;color:#dbe2ea}
+ pre{background:#1c2229;border-color:#2c343d}
+ th{background:#212932}
+ th,td{border-color:#2c343d}
+ nav,h2{border-color:#2c343d}
+ a{color:#7cb3ff}
+ .note{color:#9aa7b4}
+}
+</style>
+</head>
+<body>
+<nav>
+<a href="index.html">索引</a>
+<a href="conventions.html">慣例</a>
+<a href="conventions_latency.html">延遲預算</a>
+<a href="onnx_prepost.html">ONNX 邊界</a>
+<a href="ainr_dfn2.html">DFN2</a>
+<a href="ainr_dfn2_detail.html">DFN2 細節</a>
+<a href="ainr_dfn2_usage.html">DFN2 使用</a>
+<a href="ainr_dfn3.html">DFN3</a>
+<a href="ainr_dfn3_usage.html">DFN3 使用</a>
+<a href="ainr_gtcrn.html">GTCRN</a>
+<a href="ainr_gtcrn_usage.html">GTCRN 使用</a>
+<a href="ainr_rnnoise_erb.html">RNNoise-ERB</a>
+<a href="ainr_rnnoise_erb_usage.html"><b>RNNoise-ERB 使用</b></a>
+</nav>
+
+<h1>AINR RNNoise-ERB：如何呼叫、流程時序圖、外部／內部參數</h1>
+
+<h2>概要</h2>
+<p>RNNoise-ERB 沒有 pre/post 類別，C 端是 <code>RNNoise-ERB/process.h</code> 的一組函式。它與 DFN／GTCRN 有三處不同，整合時最容易寫錯：(1) <code>rnnoise_analysis()</code> 吃<b>完整 512 samples</b> 的窗，呼叫端自己維護 256-hop 滑動窗；(2) <code>lookahead_frames=1</code>：新特徵窗 <code>[t-2,t-1,t]</code> 的 gain 屬於 spectrum <code>t-1</code>，呼叫端必須把頻譜延遲一框再套 gain；(3) 模型輸入是前 3 框特徵（oldest → newest），前 2 框無模型輸出。模型內容見 <a href="ainr_rnnoise_erb.html">ainr_rnnoise_erb</a>。</p>
+
+<h2>如何呼叫使用</h2>
+<ol>
+<li><b>大小查詢</b>（呼叫端配置，16-byte 對齊）：<code>fft_get_mem_size(512)</code> = 13,552 B；<code>ac_stft_get_mem_size()</code>／<code>ac_istft_get_mem_size()</code> 各 6,240 B（<code>rnnoise_framing_config()</code> 借用內建 Hann 表，不另切窗表）；<code>sizeof(RNNoiseState)</code> = 5,104 B；<code>sizeof(RNNoiseModelState)</code> = 1,536 B（皆本機量測）。獨立配置的總 static memory 31,136 B；已有可共用 FFT 時 RNNoise／framing 部分為 17,584 B（<a href="../../AINR/RNNoise-ERB/README.md">README</a> 的量測值）。</li>
+<li><code>rnnoise_framing_config(&amp;cfg, fft)</code>（<code>fft</code> 可為 NULL，此時各物件在自己的 pool 內建 plan，記憶體需求要重查）→ <code>ac_stft_init</code>／<code>ac_istft_init</code> → <code>rnnoise_state_init(&amp;st, analysis, synthesis)</code>。回 -1＝framing 設定不符（FFT 大小、<code>center</code>、縮放、窗或合成模式）且不綁定物件。</li>
+<li><code>rnnoise_model_state_init(&amp;ms)</code>：三組 GRU hidden 歸零；同一段 stream 分 chunk 時須保留 EMA、GRU、framing／OLA 與對應的 spectrum 延遲；不同 WAV 之間必須重置。</li>
+<li>每個 hop：更新 512 窗 → <code>rnnoise_analysis</code> → <code>rnnoise_compute_features</code>（前 2 框回 0）→ 回 1 時跑加速器 → 檢查 state → <code>rnnoise_apply_atten_lim</code>（可選）→ <code>rnnoise_expand_gains</code> → 對「前一框」頻譜 <code>rnnoise_synthesis</code> → 儲存本框頻譜。</li>
+<li>GRU state 兩種餵法：<b>就地</b>（<code>h1_in/h1_out</code> 等綁 <code>&amp;state-&gt;hidden[0..2]</code>，之後可呼叫 <code>rnnoise_model_state_validate()</code>）或<b>複製</b>（runtime 寫到自己的輸出，呼叫 <code>rnnoise_model_state_inherit(state, hidden_out)</code>：先檢查有限再複製，非有限回 -1 且 state 不變）。<b>沒有 generation 計數器</b>（標頭無此介面）：<code>validate</code> 回 -1 代表函式庫的 hidden 已歸零，加速器端若另存定點 hidden，須由呼叫端自行重設。</li>
+<li>沒有 destroy／reset 函式：重新開始＝再呼叫 <code>rnnoise_state_init</code>（同時重置兩個 framing 物件與特徵 EMA）加 <code>rnnoise_model_state_init</code>，並清掉呼叫端的滑動窗與延遲頻譜。</li>
+</ol>
+<pre>#include &lt;stdlib.h&gt;
+#include &lt;string.h&gt;
+#include "RNNoise-ERB/process.h"
+
+/* 目標平台: 輸入 erb3[3][22]、spec3[3][2][129] 與 3 組 GRU hidden (綁 state-&gt;hidden, 就地);
+ * 輸出 band_gains[22]。 */
+extern int npu_run(const float erb3[3][RNNOISE_N_BANDS],
+                   const float spec3[3][2][RNNOISE_SPEC_BINS],
+                   RNNoiseModelState *state, float band_gains[RNNOISE_N_BANDS]);
+
+static void *carve(size_t bytes) { return aligned_alloc(16, (bytes + 15) / 16 * 16); }
+
+int run_rnnoise(const float *in, float *out, long hops, float atten_lim_db)
+{
+    RNNoiseState st;
+    static RNNoiseModelState model_state;
+    AcStftConfig cfg;
+    float win[RNNOISE_WIN_LEN] = {0};                  /* 呼叫端維護的 512 滑動窗 */
+    float prev_re[RNNOISE_N_BINS] = {0}, prev_im[RNNOISE_N_BINS] = {0};
+
+    FftHandle *fft = fft_init(carve(fft_get_mem_size(RNNOISE_N_FFT)),
+                              fft_get_mem_size(RNNOISE_N_FFT), RNNOISE_N_FFT);
+    if (!fft) return -1;
+    rnnoise_framing_config(&amp;cfg, fft);                 /* 分析/合成可共用同一個 FFT handle */
+    size_t a_bytes = ac_stft_get_mem_size(&amp;cfg), s_bytes = ac_istft_get_mem_size(&amp;cfg);
+    AcStft *analysis = ac_stft_init(carve(a_bytes), a_bytes, &amp;cfg);
+    AcIstft *synthesis = ac_istft_init(carve(s_bytes), s_bytes, &amp;cfg);
+    if (!analysis || !synthesis) return -1;
+    if (rnnoise_state_init(&amp;st, analysis, synthesis) != 0) return -1;
+    rnnoise_model_state_init(&amp;model_state);
+
+    for (long h = 0; h &lt; hops; ++h) {
+        float re[RNNOISE_N_BINS], im[RNNOISE_N_BINS];
+        float erb3[3][RNNOISE_N_BANDS], spec3[3][2][RNNOISE_SPEC_BINS];
+        float band[RNNOISE_N_BANDS], bins[RNNOISE_N_BINS];
+
+        memmove(win, win + RNNOISE_HOP_LEN, (RNNOISE_WIN_LEN - RNNOISE_HOP_LEN) * sizeof(float));
+        memcpy(win + RNNOISE_WIN_LEN - RNNOISE_HOP_LEN, in + h * RNNOISE_HOP_LEN,
+               RNNOISE_HOP_LEN * sizeof(float));
+        if (rnnoise_analysis(&amp;st, win, re, im) != 0) return -1;
+        int ready = rnnoise_compute_features(&amp;st, re, im, erb3, spec3);   /* 前 2 框回 0 */
+        if (ready) {
+            if (npu_run(erb3, spec3, &amp;model_state, band) != 0 ||
+                rnnoise_model_state_validate(&amp;model_state) != 0) {
+                for (int b = 0; b &lt; RNNOISE_N_BANDS; ++b) band[b] = 1.0f;   /* 此框原樣通過 */
+            }
+            rnnoise_apply_atten_lim(band, atten_lim_db);   /* &lt;= 0: 不作用 */
+            rnnoise_expand_gains(band, bins);
+            /* gain 屬於 t-1: 套在延遲一框的頻譜上 (函式內會就地改寫 prev_re/prev_im) */
+            if (rnnoise_synthesis(&amp;st, prev_re, prev_im, bins, out + h * RNNOISE_HOP_LEN) != 0)
+                return -1;
+        } else {
+            memset(out + h * RNNOISE_HOP_LEN, 0, RNNOISE_HOP_LEN * sizeof(float));
+        }
+        memcpy(prev_re, re, sizeof(prev_re));
+        memcpy(prev_im, im, sizeof(prev_im));
+    }
+    return 0;
+}</pre>
+<p class="note">片語已在暫存副本以 <code>-std=c11 -Wall -Wextra -Wpedantic -Werror</code> 編譯通過；<code>npu_run</code> 由目標平台 runtime 提供。<code>rnnoise_analysis</code>／<code>rnnoise_synthesis</code> 對 NULL 參數或綁定錯誤回 -1，且不寫輸出；<code>rnnoise_synthesis</code> 會就地修改傳入頻譜（含 × N_FFT^+0.5 的反正規化）。</p>
+
+<h2>流程時序圖</h2>
+<pre>
+caller                         rnnoise (process.c)                 NPU graph
+  |                                  |                                  |
+  |== init ==========================|==================================|
+  | fft_init / rnnoise_framing_config / ac_stft_init / ac_istft_init   |
+  | rnnoise_state_init(&amp;st,A,S) ---->| 綁定並 reset; EMA 起始值        |
+  | rnnoise_model_state_init(&amp;ms) -->| hidden = 0                       |
+  |                                  |                                  |
+  |== hop 0, 1 (暖機) ================|==================================|
+  | rnnoise_analysis(win512) ------->| 完整 512 窗, x N^-0.5            |
+  | rnnoise_compute_features ------->| 推入 3-frame ring                |
+  | &lt;-------- 0 ----------------------|  (無模型輸出, 輸出補零)          |
+  | save prev = spec ----------------|                                  |
+  |                                  |                                  |
+  |== hop t >= 2 =====================|==================================|
+  | rnnoise_analysis(win512) ------->| spec(t)                          |
+  | rnnoise_compute_features ------->| erb3[3][22], spec3[3][2][129]    |
+  | &lt;-------- 1 ----------------------|                                  |
+  | ----------------------- run(erb3, spec3, h1..h3) ----------------->| 輸出 band_gains[22] (屬 t-1)
+  | &lt;----------------------- gains, h*_out ---------------------------|
+  | model_state_validate / _inherit ->| 非有限: -1 (validate 歸零; inherit 不複製)
+  | apply_atten_lim(gains, dB) ----->| 22 帶線性混合, dB &lt;= 0 不作用     |
+  | expand_gains(22 -&gt; 257) -------->| erb_inv, partition of unity      |
+  | rnnoise_synthesis(prev, bins) -->| x gain, x N^+0.5, IFFT, OLA      |
+  | &lt;-------- out256 (對應 spectrum t-1)                                 |
+  | save prev = spec(t) -------------|                                  |
+</pre>
+<div class="tbl"><table>
+<tr><th>項目</th><th>值</th><th>出處</th></tr>
+<tr><td>hop／窗</td><td>256／512 samples（16 ms／32 ms @16 kHz）</td><td><code>RNNOISE_HOP_LEN</code>、<code>RNNOISE_WIN_LEN</code></td></tr>
+<tr><td>額外模型 lookahead</td><td>1 hop = 256 samples = 16 ms（<code>RNNOISE_LOOKAHEAD</code>；<code>RNNOISE_CONV_DELAY</code> = 1）</td><td><code>process.h</code></td></tr>
+<tr><td>WOLA 重疊結構延遲</td><td>win − hop = 256 samples = 16 ms</td><td><a href="ainr_rnnoise_erb.html">ainr_rnnoise_erb</a></td></tr>
+<tr><td>暖機</td><td><code>rnnoise_compute_features()</code> 前 2 框回 0；EMA 正規化另有 tau = 1.0 s 的收斂期</td><td><code>process.h</code></td></tr>
+</table></div>
+
+<h2>函式清單：公開 vs 內部</h2>
+<div class="tbl"><table>
+<tr><th>分類</th><th>函式（<code>process.h</code>）</th></tr>
+<tr><td><b>公開（整合者呼叫）</b></td><td><code>rnnoise_framing_config</code>、<code>rnnoise_state_init</code>、<code>rnnoise_model_state_init</code>、<code>rnnoise_model_state_validate</code>、<code>rnnoise_model_state_inherit</code>、<code>rnnoise_analysis</code>、<code>rnnoise_compute_features</code>、<code>rnnoise_apply_atten_lim</code>、<code>rnnoise_expand_gains</code>、<code>rnnoise_synthesis</code>、<code>rnnoise_simd_backend</code></td></tr>
+<tr><td><b>內部</b></td><td><code>process.c</code> 的 <code>hidden_finite</code>（<code>static</code>）；編譯期常數表 <code>rnnoise_tables_gen.h</code>（ERB 前向／反向矩陣、<code>nfftborder</code>、Hann 窗），由 <code>gen_rnnoise_tables.c</code> 產生；沒有執行期可變表格</td></tr>
+</table></div>
+
+<h2>參數表</h2>
+<h3>外部：第三方可調</h3>
+<div class="tbl"><table>
+<tr><th>名稱</th><th>位置</th><th>型別／範圍</th><th>預設</th><th>何時設定</th><th>說明</th></tr>
+<tr><td><code>fft</code></td><td><code>rnnoise_framing_config(cfg, fft)</code></td><td><code>FftHandle*</code>，512 點，或 NULL</td><td>—</td><td>建立 framing 物件時</td><td>分析與合成依序執行時可共用同一個 handle；NULL 時各物件自建 plan</td></tr>
+<tr><td><code>atten_lim_db</code></td><td><code>rnnoise_apply_atten_lim(gains, db)</code> 的參數</td><td>float；<code>&lt;= 0</code> 不作用</td><td>由呼叫端決定（Python <code>--atten-lim</code> 預設 None＝關）</td><td>每框，可隨時改</td><td><code>gain' = lim + gain × (1 − lim)</code>，<code>lim = 10^(−dB/20)</code>；在 22 個 band 上作用，與在 257 bins 上作用等價（反向矩陣是 partition of unity）</td></tr>
+<tr><td>hidden 餵法</td><td><code>RNNoiseModelState</code></td><td>就地綁定或 <code>inherit</code></td><td>—</td><td>整合設計時</td><td>就地省一次複製；兩種路徑的失敗語意見上方步驟 5</td></tr>
+<tr><td>Python CLI</td><td><code>RNNoise-ERB/inference.py</code>、<code>export_onnx.py</code>、<code>export_erb_matrix.py</code></td><td><code>--atten-lim</code>、<code>--pf-beta</code>(0)、<code>--dump-debug</code>、<code>--dump-calib</code>＋<code>--format</code>(bin|npz)＋<code>--max-frames</code>(200)＋<code>--onnx</code>、<code>--input-dir</code>／<code>--output-dir</code>；匯出：<code>--verify</code>；ERB：<code>--format</code>、<code>--output-dir</code></td><td>—</td><td>離線推論、校正、匯出</td><td><code>--pf-beta</code> 只在 Python 參考存在，C 端沒有 post-filter</td></tr>
+</table></div>
+<h3>內部：存在且可改，但不建議開放</h3>
+<div class="tbl"><table>
+<tr><th>名稱</th><th>值</th><th>位置</th><th>不開放的原因</th></tr>
+<tr><td><code>RNNOISE_SR</code>／<code>_N_FFT</code>／<code>_N_BINS</code>／<code>_WIN_LEN</code>／<code>_HOP_LEN</code></td><td>16000／512／257／512／256</td><td><code>process.h</code></td><td>C 部署固定這一組；Python 允許 <code>win_len &lt; n_fft</code>，C 不支援，不能只改巨集；<code>rnnoise_state_init</code> 會檢查 framing</td></tr>
+<tr><td><code>RNNOISE_N_BANDS</code>／<code>RNNOISE_MIN_BINS_PER_BAND</code></td><td>22／2</td><td><code>process.h</code>、<code>rnnoise_tables_gen.h</code></td><td>ERB 矩陣與模型輸出寬度；表由產生器依此導出</td></tr>
+<tr><td><code>RNNOISE_LOOKAHEAD</code>／<code>RNNOISE_CONV_DELAY</code></td><td>1／1</td><td><code>process.h</code></td><td>訓練時的 conv 窗對齊方式；改了 gain 與頻譜的配對就錯</td></tr>
+<tr><td><code>RNNOISE_ERB_NORM_ALPHA</code>／<code>_TAU_SEC</code>／<code>_INIT_LO_DB</code>／<code>_INIT_HI_DB</code>／<code>_SCALE_DB</code></td><td>0.984／1.0／−20／−45／40</td><td><code>process.h</code></td><td>feature version 的一部分（<code>log_erb_dfn_mean_cplx_unit_0_4k_v8</code>），須與 <code>config.ini [feature]</code> 與 checkpoint 一致；init 值以 16 kHz 語料校準，alpha 改了要重新校準</td></tr>
+<tr><td><code>RNNOISE_SPEC_MAX_HZ</code>／<code>_SPEC_BINS</code>／<code>_SPEC_NORM_ALPHA</code>／<code>_INIT_LO</code>／<code>_INIT_HI</code>／<code>_EPS</code></td><td>4000／129／0.984／0.04／0.008／1e-12</td><td><code>process.h</code></td><td>complex 分支的特徵契約（出貨為純 ERB，但 ONNX 簽名仍保留 <code>spec_input</code>）</td></tr>
+<tr><td><code>RNNOISE_PREPOST_LAYOUT_VERSION</code>／<code>RNNOISE_MODEL_IO_LAYOUT_VERSION</code></td><td>2／1</td><td><code>process.h</code></td><td>前者：state 借用 framing 的 API 版本；後者：GRU／ONNX state 版本，匯出 metadata 帶同一個數值</td></tr>
+<tr><td><code>RNNOISE_MODEL_GRU_COUNT</code>／<code>RNNOISE_MODEL_GRU_SIZE</code></td><td>3／128</td><td><code>process.h</code></td><td>hidden 張量形狀</td></tr>
+<tr><td>訓練端 <code>[model] cond_size／gru_size／use_complex_input</code></td><td>64／128／false</td><td><code>RNNoise-ERB/config.ini</code></td><td>寫進 checkpoint；<code>inference.py</code> 以 checkpoint 內的容量為準並與 runtime config 比對</td></tr>
+</table></div>
+
+<h2>相關檔案與測試路徑</h2>
+<ul>
+<li><code>AINR/RNNoise-ERB/process.c</code> / <code>process.h</code>、<code>gen_rnnoise_tables.c</code>、<code>rnnoise_tables_gen.h</code></li>
+<li>測試：<code>AINR/RNNoise-ERB/test/</code>（<code>make -C AINR/RNNoise-ERB test</code>：tables、feature contract、feature state、SIMD、framing）、<code>AINR/RNNoise-ERB/tests/</code>（pytest：feature、loss、Python／C features、export metadata）</li>
+<li>同類頁面：<a href="ainr_rnnoise_erb.html">ainr_rnnoise_erb</a>、<a href="ainr_gtcrn_usage.html">ainr_gtcrn_usage</a>、<a href="onnx_prepost.html">onnx_prepost</a>、<a href="index.html">index</a></li>
+<li>文件：<a href="../../AINR/RNNoise-ERB/README.md">README.md</a></li>
+</ul>
+</body>
+</html>

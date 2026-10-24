@@ -19,10 +19,11 @@ th{background:#eef0f2}
 </style>
 </head>
 <body>
-<nav><a href="index.html">index</a><a href="aiaec_align_ulcnet.html">Align-ULCNet</a><a href="aiaec_align_cruse.html">Align-CRUSE</a><a href="aiaec_deepvqe_s.html">DeepVQE-S</a><a href="aiaec_cagcrn.html"><b>CAGCRN</b></a></nav>
+<nav><a href="index.html">索引</a><a href="conventions.html">慣例</a><a href="conventions_latency.html">延遲預算</a><a href="onnx_prepost.html">ONNX 邊界</a><a href="aiaec_align_ulcnet.html">Align-ULCNet</a><a href="aiaec_align_ulcnet_detail.html">Align-ULCNet 細節</a><a href="aiaec_align_ulcnet_usage.html">Align-ULCNet 使用</a><a href="aiaec_align_cruse.html">Align-CRUSE</a><a href="aiaec_align_cruse_usage.html">Align-CRUSE 使用</a><a href="aiaec_deepvqe_s.html">DeepVQE-S</a><a href="aiaec_deepvqe_s_usage.html">DeepVQE-S 使用</a><a href="aiaec_cagcrn.html"><b>CAGCRN</b></a><a href="aiaec_cagcrn_usage.html">CAGCRN 使用</a></nav>
 <h1>CAGCRN（end-to-end AEC+RES+NR，backup）</h1>
 
 <h2>概要</h2>
+<p class="note">如何呼叫、流程時序圖、外部／內部參數表：<a href="aiaec_cagcrn_usage.html">aiaec_cagcrn_usage</a>。</p>
 <p>Wang et al.（INTERSPEECH 2025-608）的重建。task（<code>dataset_gen/model_views.py</code>）=
 <code>end_to_end_aec_res_nr_dereverb</code>：輸入是<b>未對齊的 microphone 與 far-end
 複數頻譜</b>（<code>mic_postclip</code> / <code>far_render</code>）；target 是
@@ -43,7 +44,7 @@ graph <b>內</b> = <code>mag_ri_feature</code>、<code>ErbBandCodec.merge/split<
 常數 log-bias，<code>create_stream_state()</code> 已預先算成 <code>cata_gate_log</code>）、
 TFGRU ×2（<b>頻率軸 bidirectional GRU</b> 每幀獨立 + 時間軸 GRU，hidden 是
 per-frequency-bin）、TFAG、mirror decoder（含 <code>ConvTranspose2d</code>）、Tanh mask。
-graph <b>外</b>（C 前後處理）= centered sqrt-Hann STFT/ISTFT 與 complex↔RI。
+graph <b>外</b>（目前沒有 C 前後處理類別；C 端現有零件為 audiolib 的 <code>AcStft</code>／<code>AcIstft</code> 與 <code>aiaec_apply_complex_mask</code>）= centered sqrt-Hann STFT/ISTFT 與 complex↔RI。
 recurrent state 全為顯式 I/O tensor。</p>
 <p><b>State boundary</b>（實作在共用的 <code>AIAEC/_streaming_export.py</code>，
 <code>export_onnx.py</code> 與 <code>inference.py calib</code> 沒有 layout 旗標）：
@@ -65,7 +66,7 @@ decoder 的 <code>ConvTranspose2d</code> 用動態 <code>output_size</code>，ex
 from AIAEC.aiaec_streaming import StreamSTFT, StreamISTFT
 
 model, grid = load_model("ckpt.pth", "cpu")
-state = model.create_stream_state()   # 23 個 cell/常數（見 State 表）
+state = model.create_stream_state()   # 21 個 cell/常數（20 個 cell + cata_gate_log 常數；見 State 表）
 mic_stft = StreamSTFT(grid.n_fft, grid.hop_len, window)
 far_stft = StreamSTFT(grid.n_fft, grid.hop_len, window)
 synth    = StreamISTFT(grid.n_fft, grid.hop_len, window)
@@ -105,11 +106,11 @@ for s in range(0, n, grid.hop_len):
 <h2>訊號泳道圖</h2>
 <pre>hop（256 smp = 16 ms @16k）  h0          h1                h2         h3       …  flush
 caller（送樣本）             mic/far 256  256               256        256         —
-C pre：StreamSTFT×2          0 幀        F0+F1（reflect    F2         F3          尾幀
+前處理：StreamSTFT×2          0 幀        F0+F1（reflect    F2         F3          尾幀
 （centered sqrt-Hann）                    前綴湊滿後補發）
 NN：forward_stream           —           out(F0), out(F1)  out(F2)    out(F3)     每尾幀 1 out
 （delay 0；同 invocation 出幀）
-C post：StreamISTFT          —           out(F0)→0 smp     256 smp    256 smp     尾段補齊
+後處理：StreamISTFT          —           out(F0)→0 smp     256 smp    256 smp     尾段補齊
                                           out(F1)→256 smp
 輸出樣本對應輸入區間         —           [0,256)           [256,512)  [512,768)
 hop-lag：端到端 256 samples（16 ms）＝ centered 半窗 lookahead；NN 本身 0 hop。</pre>

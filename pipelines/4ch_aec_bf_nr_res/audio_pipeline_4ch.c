@@ -1,9 +1,8 @@
 /** Four-channel linear AEC plus beamformer unit: four_aec_front_process -> SRP-PHAT DOA -> BF
- * effective weights, and four_aec_fuse plus the post-beam RES gain as a separate step. Same
- * pool-first layout and lifecycle as 4aec_nr_res.c (get_mem_requirements()/init_ex() compose
- * the core's descriptor-tier API with SRP/BF's and AecRes's size_t tier and this unit's
- * scratch); create() is the heap convenience over the same implementation (see
- * audio_pipeline_4ch.h). */
+ * effective weights, and four_aec_fuse as a separate step. Same pool-first layout and
+ * lifecycle as 4aec_nr_res.c (get_mem_requirements()/init_ex() compose the core's
+ * descriptor-tier API with SRP/BF's size_t tier and this unit's scratch); create() is the heap
+ * convenience over the same implementation (see audio_pipeline_4ch.h). */
 
 #include <stdlib.h>
 #include <string.h>
@@ -17,7 +16,7 @@
 #include "spatial_simd.h"
 #include "utility/mem_align.h"
 #include "common/se_config.h"   /* se_flag_valid */
-#include "common/se_stage.h"    /* SeSpecFrame, se_res_stage_gain */
+#include "common/se_stage.h"    /* SeSpecFrame */
 
 #ifndef M_PI
 #define M_PI 3.14159265358979323846
@@ -40,7 +39,6 @@ struct AudioPipeline4Ch {
     int n_freqs;
     Complex* bf_spectrum;
     Complex* bf_weights;
-    AecRes* res;                /* iff cfg.enable_res and cfg.core.enable_post */
 
     int phase;                  /* 0 idle, 1 front done, 2 beam done */
 
@@ -96,11 +94,6 @@ static int validate_config(const AudioPipeline4ChConfig* cfg) {
         !isfinite(cfg->bf_fixed_doa_rad) ||
         !se_flag_valid(cfg->bf_fixed_align_notebook) ||
         cfg->bf_adapt_interval <= 0) return 0;
-    if (!se_flag_valid(cfg->enable_res)) return 0;
-    if (cfg->enable_res) {
-        float floor_db;
-        if (aec_preset_floor_db(cfg->res_preset, &floor_db) != 0) return 0;
-    }
     if (!isfinite(cfg->auto_vad_threshold_dbfs) ||
         !isfinite(cfg->auto_vad_snr_ratio) ||
         cfg->auto_vad_snr_ratio < 1.0f ||
@@ -149,8 +142,6 @@ AudioPipeline4ChConfig audio_pipeline_4ch_default_config(int sample_rate) {
     cfg.bf_fixed_doa_rad = 0.0f;
     cfg.bf_fixed_align_notebook = 0;
     cfg.bf_adapt_interval = 1;
-    cfg.enable_res = 1;
-    cfg.res_preset = AEC_PRESET_BALANCED;
     cfg.auto_vad_threshold_dbfs = -55.0f;
     cfg.auto_vad_snr_ratio = 3.0f;
     cfg.auto_vad_hangover_frames = 8;
@@ -196,7 +187,7 @@ static uint32_t audio_pipeline_4ch_build_flags_hash(
     uint32_t core_build_flags_hash) {
     uint32_t hash = 2166136261u;
     hash = fnv1a_str(
-        "|carve:self(corecfg-delay-v3),core,srp,bf,bf_spectrum,bf_weights,res",
+        "|carve:self(corecfg-delay-v3),core,srp,bf,bf_spectrum,bf_weights",
         hash);
     hash = fnv1a_str("|align16", hash);
     hash ^= core_build_flags_hash;
@@ -311,25 +302,15 @@ static int derive_spatial_configs(
     return 1;
 }
 
-/* The RES config: the preset's AecConfig on the unit's resolved grid. */
-static void derive_res_config(const AudioPipeline4ChConfig* cfg, int fft, AecConfig* res_cfg) {
-    aec_config_from_preset(res_cfg, cfg->res_preset, cfg->core.sample_rate);
-    res_cfg->fft_size = fft;
-}
-
-static int has_res(const AudioPipeline4ChConfig* cfg) {
-    return cfg->enable_res && cfg->core.enable_post;
-}
-
 static int derive_pipeline_layout(
     const AudioPipeline4ChConfig* cfg,
     FourAecNrResMemReq* core_req,
-    SRP_Config* srp_cfg, BF_Config* bf_cfg, AecConfig* res_cfg,
+    SRP_Config* srp_cfg, BF_Config* bf_cfg,
     int* hop, int* fft, int* n_freqs,
-    size_t* srp_bytes, size_t* bf_bytes, size_t* res_bytes) {
+    size_t* srp_bytes, size_t* bf_bytes) {
     FourAecNrResMemBreakdown breakdown;
-    if (!cfg || !core_req || !srp_cfg || !bf_cfg || !res_cfg || !hop || !fft ||
-        !n_freqs || !srp_bytes || !bf_bytes || !res_bytes) return 0;
+    if (!cfg || !core_req || !srp_cfg || !bf_cfg || !hop || !fft ||
+        !n_freqs || !srp_bytes || !bf_bytes) return 0;
     if (!validate_config(cfg)) return 0;
     if (four_aec_nr_res_get_mem_requirements(&cfg->core, core_req) != 0)
         return 0;
@@ -344,13 +325,6 @@ static int derive_pipeline_layout(
     *srp_bytes = srp_get_mem_size(srp_cfg);
     *bf_bytes = bf_get_mem_size(FOUR_AEC_NR_RES_CHANNELS, *n_freqs);
     if (*srp_bytes == 0 || *bf_bytes == 0) return 0;
-    *res_bytes = 0;
-    memset(res_cfg, 0, sizeof(*res_cfg));
-    if (has_res(cfg)) {
-        derive_res_config(cfg, *fft, res_cfg);
-        *res_bytes = aec_res_get_mem_size(res_cfg);
-        if (*res_bytes == 0) return 0;
-    }
     return 1;
 }
 
@@ -360,15 +334,14 @@ int audio_pipeline_4ch_get_mem_requirements(
     FourAecNrResMemReq core_req;
     SRP_Config srp_cfg;
     BF_Config bf_cfg;
-    AecConfig res_cfg;
     int hop, fft, n_freqs;
-    size_t srp_bytes, bf_bytes, res_bytes;
+    size_t srp_bytes, bf_bytes;
     size_t spectral_count;
     size_t total;
 
     if (!out || !derive_pipeline_layout(
-            cfg, &core_req, &srp_cfg, &bf_cfg, &res_cfg,
-            &hop, &fft, &n_freqs, &srp_bytes, &bf_bytes, &res_bytes)) return -1;
+            cfg, &core_req, &srp_cfg, &bf_cfg,
+            &hop, &fft, &n_freqs, &srp_bytes, &bf_bytes)) return -1;
     if (core_req.bytes > (uint64_t)SIZE_MAX) return -1;
 
     total = ck_align16_size(sizeof(AudioPipeline4Ch));
@@ -381,7 +354,6 @@ int audio_pipeline_4ch_get_mem_requirements(
         total, (size_t)n_freqs, sizeof(Complex));       /* bf_spectrum */
     total = ck_field_size(
         total, spectral_count, sizeof(Complex));        /* bf_weights */
-    if (res_bytes) total = ck_add_size(total, ck_align16_size(res_bytes));
 
     if (MEM_SIZE_INVALID(total)) return -1;
 
@@ -406,9 +378,8 @@ AudioPipeline4Ch* audio_pipeline_4ch_init_ex(
     FourAecNrResMemReq core_req;
     SRP_Config srp_cfg;
     BF_Config bf_cfg;
-    AecConfig res_cfg;
     int hop, fft, n_freqs;
-    size_t srp_bytes, bf_bytes, res_bytes;
+    size_t srp_bytes, bf_bytes;
     float geom_x[FOUR_AEC_NR_RES_CHANNELS];
     float geom_y[FOUR_AEC_NR_RES_CHANNELS];
     ArrayGeometry geom;
@@ -439,8 +410,8 @@ AudioPipeline4Ch* audio_pipeline_4ch_init_ex(
         (uint64_t)bytes < current.bytes) return NULL;
 
     if (!derive_pipeline_layout(
-            &cfg_copy, &core_req, &srp_cfg, &bf_cfg, &res_cfg,
-            &hop, &fft, &n_freqs, &srp_bytes, &bf_bytes, &res_bytes)) return NULL;
+            &cfg_copy, &core_req, &srp_cfg, &bf_cfg,
+            &hop, &fft, &n_freqs, &srp_bytes, &bf_bytes)) return NULL;
     if (core_req.bytes > (uint64_t)SIZE_MAX) return NULL;
     if (!fill_stack_geometry(&cfg_copy, geom_x, geom_y, &geom)) return NULL;
 
@@ -481,14 +452,6 @@ AudioPipeline4Ch* audio_pipeline_4ch_init_ex(
     p->bf_weights =
         (Complex*)pool_carve(&cursor, spectral_count, sizeof(Complex));
     if (!p->bf_spectrum || !p->bf_weights) return NULL;
-
-    if (res_bytes) {
-        void* res_region = pool_carve(&cursor, 1, res_bytes);
-        if (!res_region) return NULL;
-        p->res = aec_res_init(res_region, res_bytes, &res_cfg);
-        if (!p->res || aec_res_n_bins(p->res) != n_freqs ||
-            aec_res_hop_size(p->res) != hop) return NULL;
-    }
 
     p->hop_size = hop;
     p->fft_size = fft;
@@ -656,10 +619,6 @@ int audio_pipeline_4ch_fuse(AudioPipeline4Ch* p, SeSpecFrame* frame) {
      * re-validates both arrays on every call. A refused fuse takes the whole unit down
      * (the core resets itself), not only the core; a sequence refusal changed nothing. */
     status = four_aec_fuse(p->core, p->bf_weights, p->bf_spectrum, frame);
-    if (status == FOUR_AEC_NR_RES_OK && p->res) {
-        frame->g_res_ctx = se_res_stage_gain(p->res, frame);
-        if (!frame->g_res_ctx) status = FOUR_AEC_NR_RES_DSP_ERROR;
-    }
     if (status != FOUR_AEC_NR_RES_OK && status != FOUR_AEC_NR_RES_SEQUENCE_ERROR)
         audio_pipeline_4ch_reset(p);
     return status;
@@ -737,7 +696,6 @@ void audio_pipeline_4ch_reset(AudioPipeline4Ch* p) {
     four_aec_nr_res_reset(p->core);
     srp_reset(p->srp);
     bf_reset(p->bf);
-    if (p->res) aec_res_reset(p->res);
     p->phase = 0;
     p->vad_power_threshold =
         powf(10.0f, p->cfg.auto_vad_threshold_dbfs / 10.0f);
@@ -826,10 +784,6 @@ int audio_pipeline_4ch_matched_filter_count(const AudioPipeline4Ch* p) {
 
 int audio_pipeline_4ch_linear_aec_count(const AudioPipeline4Ch* p) {
     return p ? four_aec_nr_res_linear_aec_count(p->core) : 0;
-}
-
-AecRes* audio_pipeline_4ch_res(const AudioPipeline4Ch* p) {
-    return (p && !p->destroyed) ? p->res : NULL;
 }
 
 const FourAecNrRes* audio_pipeline_4ch_get_core(const AudioPipeline4Ch* p) {

@@ -19,10 +19,11 @@ th{background:#eef0f2}
 </style>
 </head>
 <body>
-<nav><a href="index.html">index</a><a href="aiaec_align_ulcnet.html">Align-ULCNet</a><a href="aiaec_align_cruse.html"><b>Align-CRUSE</b></a><a href="aiaec_deepvqe_s.html">DeepVQE-S</a><a href="aiaec_cagcrn.html">CAGCRN</a></nav>
+<nav><a href="index.html">索引</a><a href="conventions.html">慣例</a><a href="conventions_latency.html">延遲預算</a><a href="onnx_prepost.html">ONNX 邊界</a><a href="aiaec_align_ulcnet.html">Align-ULCNet</a><a href="aiaec_align_ulcnet_detail.html">Align-ULCNet 細節</a><a href="aiaec_align_ulcnet_usage.html">Align-ULCNet 使用</a><a href="aiaec_align_cruse.html"><b>Align-CRUSE</b></a><a href="aiaec_align_cruse_usage.html">Align-CRUSE 使用</a><a href="aiaec_deepvqe_s.html">DeepVQE-S</a><a href="aiaec_deepvqe_s_usage.html">DeepVQE-S 使用</a><a href="aiaec_cagcrn.html">CAGCRN</a><a href="aiaec_cagcrn_usage.html">CAGCRN 使用</a></nav>
 <h1>Align-CRUSE（end-to-end AEC+RES+NR，selected）</h1>
 
 <h2>概要</h2>
+<p class="note">如何呼叫、流程時序圖、外部／內部參數表：<a href="aiaec_align_cruse_usage.html">aiaec_align_cruse_usage</a>。</p>
 <p>Indenbom et al.（arXiv:2208.11308）的 cross-attention 對齊 CRUSE 重建。task
 （<code>dataset_gen/model_views.py</code>）= <code>end_to_end_aec_res_nr_dereverb</code>：
 輸入是<b>未對齊的 microphone 與 far-end 複數頻譜</b>（<code>mic_postclip</code> /
@@ -39,7 +40,7 @@ graph <b>內</b> = <code>log_power_feature</code>（square+clamp+log）、causal
 BatchNorm + ELU（<code>mic1..mic4</code> / <code>far1..far2</code>）、alignment 的
 MaxPool(1,4) + Linear query/key + <code>softmax</code>（作用在 cumsum 積分 score 上）、
 GRU(192)、頻率 stride-2 的 <code>ConvTranspose2d(1,3)</code> 解碼、sigmoid mask 與
-<code>mask_gain</code> clamp。graph <b>外</b>（C 前後處理）= centered sqrt-Hann
+<code>mask_gain</code> clamp。graph <b>外</b>（目前沒有 C 前後處理類別；C 端現有零件為 audiolib 的 <code>AcStft</code>／<code>AcIstft</code> 與 <code>aiaec_apply_real_mask</code>）= centered sqrt-Hann
 STFT/ISTFT 與 complex↔RI（Python reference <code>StreamSTFT/StreamISTFT</code>）。
 所有 recurrent state（conv 史、K/V ring、score 積分、GRU h、幀計數）為顯式 state，
 由 runtime 逐次傳入傳回。</p>
@@ -92,11 +93,11 @@ for s in range(0, n, grid.hop_len):
 <h2>訊號泳道圖</h2>
 <pre>hop（256 smp = 16 ms @16k）  h0          h1                h2         h3       …  flush
 caller（送樣本）             mic/far 256  256               256        256         —
-C pre：StreamSTFT×2          0 幀        F0+F1（reflect    F2         F3          尾幀
+前處理：StreamSTFT×2          0 幀        F0+F1（reflect    F2         F3          尾幀
 （centered sqrt-Hann）                    前綴湊滿後補發）
 NN：forward_stream           —           out(F0), out(F1)  out(F2)    out(F3)     每尾幀 1 out
 （delay 0；同 invocation 出幀）
-C post：StreamISTFT          —           out(F0)→0 smp     256 smp    256 smp     尾段補齊
+後處理：StreamISTFT          —           out(F0)→0 smp     256 smp    256 smp     尾段補齊
 （WOLA + 半窗 trim）                      out(F1)→256 smp
 輸出樣本對應輸入區間         —           [0,256)           [256,512)  [512,768)
 hop-lag：端到端 256 samples（16 ms）＝ centered 半窗 lookahead；NN 本身 0 hop。</pre>

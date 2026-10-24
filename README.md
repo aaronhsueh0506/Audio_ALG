@@ -12,8 +12,8 @@ contracts.
 | `pipelines/` | Production-oriented linear AEC + echo-aware NR/RES | [`pipelines/README.md`](pipelines/README.md) |
 | `AINR/` | Standalone speech enhancement | [`AINR/README.md`](AINR/README.md) |
 | `AIAEC/` | Four neural AEC candidate architectures | [`AIAEC/README.md`](AIAEC/README.md) |
-| `pipelines/4ch_aec_bf_nr_res/` | Python reference and C API for four linear AEC lanes around an externally owned SRP-PHAT/GSC | [`pipelines/4ch_aec_bf_nr_res/README.md`](pipelines/4ch_aec_bf_nr_res/README.md) |
-| `lib/aec/`, `lib/nr/` | Conventional algorithm libraries | Git submodules |
+| `pipelines/4ch_aec_bf_nr_res/` | C API for the four-lane linear-AEC front end (`FourAecNrRes`, external beamformer seam) and the one wrapped unit `AudioPipeline4Ch` (shared aligner, four AEC lanes, SRP-PHAT, BF and the fuse projection; no RES), plus the Python reference | [`pipelines/4ch_aec_bf_nr_res/README.md`](pipelines/4ch_aec_bf_nr_res/README.md) |
+| `lib/aec/`, `lib/nr/` | Conventional algorithm libraries (AEC, NR) | Git submodules (`.gitmodules`) |
 | `../audiolib/common/` | Shared FFT / fast-math / SIMD kernel layer used by AEC, NR and the pipelines | Sibling checkout, expected revision in [`pipelines/audiolib.pin`](pipelines/audiolib.pin) (`make -C pipelines check-pins`) |
 
 The conventional pipeline is the deployable reference path. `AINR/` and
@@ -95,8 +95,9 @@ make -C pipelines/4ch_aec_bf_nr_res SIMD=0 test
 make -C AINR SIMD=0 test
 make -C AINR/RNNoise-ERB SIMD=0 test
 
-# Run the malloc reference executable.
-./pipelines/aec_nr_pipeline mic.wav ref.wav out.wav balanced \
+# Run the malloc reference executable (binaries land in a config-keyed directory).
+BIN="$(make -s -C pipelines print-bin-dir)"
+"$BIN"/aec_nr_pipeline mic.wav ref.wav out.wav balanced \
     --nr-preset balanced
 ```
 

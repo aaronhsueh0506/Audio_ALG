@@ -1,0 +1,243 @@
+<!doctype html>
+<html lang="zh-TW">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>AINR DFN2 使用與參數</title>
+<style>
+body{font-family:-apple-system,"Segoe UI",Roboto,"Noto Sans TC",sans-serif;max-width:62rem;margin:0 auto;padding:1rem 1.25rem 3rem;line-height:1.55;color:#1a222c;background:#fff}
+nav{font-size:.9rem;border-bottom:1px solid #ccd3dc;padding-bottom:.5rem;margin-bottom:1rem}
+nav a{margin-right:.7rem}
+h1{font-size:1.45rem;margin-bottom:.2em}
+h2{font-size:1.1rem;margin-top:1.7em;border-bottom:1px solid #dde3ea;padding-bottom:.2em}
+h3{font-size:1rem;margin-top:1.3em}
+code,pre{font-family:ui-monospace,SFMono-Regular,Menlo,Consolas,monospace;font-size:.85em}
+pre{background:#f5f7fa;border:1px solid #dde3ea;border-radius:6px;padding:.7rem .9rem;overflow-x:auto;line-height:1.35}
+.tbl{overflow-x:auto}
+table{border-collapse:collapse;font-size:.86rem}
+th,td{border:1px solid #ccd3dc;padding:.25rem .55rem;text-align:left;vertical-align:top}
+th{background:#eef1f5}
+.note{font-size:.88rem;color:#54606e}
+@media (prefers-color-scheme:dark){
+ body{background:#14181d;color:#dbe2ea}
+ pre{background:#1c2229;border-color:#2c343d}
+ th{background:#212932}
+ th,td{border-color:#2c343d}
+ nav,h2{border-color:#2c343d}
+ a{color:#7cb3ff}
+ .note{color:#9aa7b4}
+}
+</style>
+</head>
+<body>
+<nav>
+<a href="index.html">索引</a>
+<a href="conventions.html">慣例</a>
+<a href="conventions_latency.html">延遲預算</a>
+<a href="onnx_prepost.html">ONNX 邊界</a>
+<a href="ainr_dfn2.html">DFN2</a>
+<a href="ainr_dfn2_detail.html">DFN2 細節</a>
+<a href="ainr_dfn2_usage.html"><b>DFN2 使用</b></a>
+<a href="ainr_dfn3.html">DFN3</a>
+<a href="ainr_dfn3_usage.html">DFN3 使用</a>
+<a href="ainr_gtcrn.html">GTCRN</a>
+<a href="ainr_gtcrn_usage.html">GTCRN 使用</a>
+<a href="ainr_rnnoise_erb.html">RNNoise-ERB</a>
+<a href="ainr_rnnoise_erb_usage.html">RNNoise-ERB 使用</a>
+</nav>
+
+<h1>AINR DeepFilterNet2：如何呼叫、流程時序圖、外部／內部參數</h1>
+
+<h2>概要</h2>
+<p>本頁把整合者用得到的三件事集中在一處：呼叫順序（含錯誤處理）、流程時序圖、可調整與不建議開放的參數表。模型本身（cascade 結構、I/O 表、State 表、延遲）見 <a href="ainr_dfn2.html">ainr_dfn2</a>；pool 大小與 callback 邊界見 <a href="ainr_dfn2_detail.html">ainr_dfn2_detail</a>。</p>
+<div class="tbl"><table>
+<tr><th>入口</th><th>適用</th><th>標頭</th></tr>
+<tr><td><b>A. <code>DFN2Prepost</code> 類別（建議）</b></td><td>整合者只管音訊（或頻譜）與加速器張量；framing、特徵、遞迴 state、compose 全在物件內</td><td><code>AINR/DeepFilterNet2/dfn2_prepost.h</code></td></tr>
+<tr><td>B. <code>DFN2Model</code> callback</td><td>由 hosting stage 擁有 runtime 的 <code>DFN2Model</code>（<code>infer</code>／<code>reset</code>／descriptor 四個指標）；<code>dfn2_model_run_frame()</code> 把 <code>frame_inputs</code>→<code>infer</code>→<code>frame_commit</code>／<code>frame_skip</code> 包成一次呼叫（<code>pipelines/dfn_res_stage.c</code> 持有 <code>DFN2Model</code>，自己依序呼叫這幾個函式）</td><td><code>dfn2_prepost.h</code></td></tr>
+<tr><td>C. 低階 API</td><td>自帶 state struct、做 parity 對照；類別就是由這些函式組成，A 或 B 能滿足就不必直接呼叫</td><td><code>dfn2_process.h</code>、<code>dfn2_model_io.h</code></td></tr>
+</table></div>
+
+<h2>如何呼叫使用</h2>
+<ol>
+<li><b>準備借用物件</b>：<code>FftHandle</code>（<code>fft_init</code> 於 <code>DFN2_N_FFT</code> = 1024 點，<code>fft_get_mem_size(1024)</code> = 26,352 bytes，本機量測；TIME 模式必填，FREQ 可為 NULL）；<code>erb_fwd.bin</code>／<code>erb_inv.bin</code> 由呼叫端載入成 float 陣列（<code>export_erb_matrix.py --runtime-bins</code> 產生，各 513×32 個 float32 = 65,664 bytes；函式庫從不讀檔，也不複製）。</li>
+<li><code>dfn2_prepost_config_defaults(&amp;cfg, io_mode)</code> 後填 <code>fft</code>／<code>erb_fwd</code>／<code>erb_inv</code>（<code>window</code> 出貨留 NULL）。</li>
+<li><code>dfn2_prepost_get_mem_size(&amp;cfg, &amp;req)</code>：<code>req.bytes</code> 是整個 pool，<code>req.alignment</code> = 16；<code>DFN2_IO_TIME</code> 246,320 bytes、<code>DFN2_IO_FREQ</code> 219,536 bytes（本機量測）。板端把 pool 放進靜態 arena，host 工具可改用 <code>dfn2_prepost_create(&amp;cfg)</code>／<code>_destroy()</code>。</li>
+<li><code>dfn2_prepost_init_ex(pool, req.bytes, &amp;cfg, &amp;req)</code>：起始即 reset，<code>state_generation</code> = 1。傳入查詢時的 <code>req</code> 可擋下「別的 build／io_mode 查出來的陳舊 pool 大小」。</li>
+<li>加速器那份定點 state 在啟動時填成量化後的 0；之後每次 <code>state_generation</code> 變了就重填（見時序圖）。</li>
+<li>每個 hop：<code>pre_process</code> → （回 1 才）<code>frame_inputs</code> → 加速器 → <code>frame_commit</code>（或 <code>frame_skip</code>）→ <code>post_process</code>。</li>
+<li>串流結尾：再餵 2 個全零 hop 並照常跑加速器，才能把尾端排出（<code>dfn2_prepost.h</code> 檔頭）。</li>
+<li>重新開始一段串流：<code>dfn2_prepost_reset(p)</code>，然後把加速器 state 重填量化零；結束：<code>dfn2_prepost_destroy(p)</code>（對 <code>_init</code> 實例是 no-op）。</li>
+</ol>
+<pre>#include &lt;stdlib.h&gt;
+#include "DeepFilterNet2/dfn2_prepost.h"
+
+/* 目標平台提供: 兩個 state 輸出綁在輸入的同一個位址, 先讀完所有 state 輸入才寫輸出 */
+extern int  npu_run(const DFN2PrepostInputs *in, DFN2PrepostOutputs *out);
+extern void npu_fill_state_with_quantized_zero(void);
+
+/* erb_fwd / erb_inv: 呼叫端從 export_erb_matrix.py --runtime-bins 產生的 .bin 載入 (函式庫不讀檔)。
+ * fft: fft_init(..., DFN2_N_FFT) 建好的 handle。回 0 成功, -1 失敗。 */
+int run_dfn2(FftHandle *fft, const float *erb_fwd, const float *erb_inv,
+             const float *in, float *out, long hops)
+{
+    DFN2PrepostConfig cfg;
+    DFN2PrepostMemReq req;
+    int rc = 0;
+
+    if (dfn2_prepost_config_defaults(&amp;cfg, DFN2_IO_TIME) != 0) return -1;
+    cfg.fft = fft;  cfg.erb_fwd = erb_fwd;  cfg.erb_inv = erb_inv;
+    cfg.atten_lim_db = 0.0f;                           /* 0 = 不限制衰減量 */
+    if (dfn2_prepost_get_mem_size(&amp;cfg, &amp;req) != 0) return -1;
+
+    /* 板端: 靜態 arena, 位址對齊 req.alignment (16)。此處用 heap 示意。 */
+    size_t bytes = ((size_t)req.bytes + req.alignment - 1) / req.alignment * req.alignment;
+    void *pool = aligned_alloc(req.alignment, bytes);
+    DFN2Prepost *p = pool ? dfn2_prepost_init_ex(pool, (size_t)req.bytes, &amp;cfg, &amp;req) : NULL;
+    if (!p) { free(pool); return -1; }
+
+    unsigned seen = dfn2_prepost_state_generation(p);
+    npu_fill_state_with_quantized_zero();              /* 加速器那份 state 起始為 0 */
+
+    for (long h = 0; h &lt; hops &amp;&amp; rc == 0; ++h) {
+        int calls = dfn2_prepost_pre_process(p, in + h * DFN2_HOP_LEN);
+        if (calls &lt; 0) { rc = -1; break; }
+        if (calls == 1) {                              /* 第 0 拍回 0: 不可呼叫加速器 */
+            DFN2PrepostInputs xin;
+            DFN2PrepostOutputs xout;
+            if (dfn2_prepost_frame_inputs(p, &amp;xin, &amp;xout) != 0) { rc = -1; break; }
+            if (dfn2_prepost_state_generation(p) != seen) {  /* reset 或被拒的 commit 清了 state */
+                npu_fill_state_with_quantized_zero();
+                seen = dfn2_prepost_state_generation(p);
+            }
+            if (npu_run(&amp;xin, &amp;xout) != 0 || dfn2_prepost_frame_commit(p) != 0)
+                dfn2_prepost_frame_skip(p);            /* identity, 時鐘照走 */
+        }
+        int written = 0;                               /* 前 2 拍 written = 0, out 補零 */
+        if (dfn2_prepost_post_process(p, out + h * DFN2_HOP_LEN, &amp;written) != 0) rc = -1;
+    }
+    dfn2_prepost_destroy(p);                           /* _init 實例為 no-op */
+    free(pool);
+    return rc;
+}</pre>
+<p class="note">以上片語已在暫存副本以 <code>-std=c11 -Wall -Wextra -Wpedantic -Werror</code> 編譯通過；<code>npu_run</code>／<code>npu_fill_state_with_quantized_zero</code> 由目標平台 runtime 提供。頻域入口把 <code>pre_process</code>／<code>post_process</code> 換成 <code>_pre_process_freq</code>／<code>_post_process_freq</code>（頻譜為 <code>torch.stft(normalized=True)</code> 尺度，見 <a href="ainr_dfn2.html">ainr_dfn2</a> 的尺度警告）；估計與套用分支來自不同頻譜時用 <code>_pre_process_freq_dual</code>。</p>
+
+<h3>錯誤處理速查</h3>
+<div class="tbl"><table>
+<tr><th>呼叫</th><th>失敗回傳</th><th>原因</th><th>處置</th></tr>
+<tr><td><code>get_mem_size</code></td><td>-1，<code>*req</code> 不動</td><td>NULL、未知 io_mode、缺 ERB 矩陣、<code>atten_lim_db</code> 非有限、TIME 缺 <code>fft</code> 或其 bin 數不是 513</td><td>修正 config</td></tr>
+<tr><td><code>init</code>／<code>init_ex</code></td><td>NULL</td><td>config 同上；pool 為 NULL、未對齊 16、太小；<code>expected</code> 與本 build 的 descriptor 不符</td><td>重新查大小、重新配置</td></tr>
+<tr><td><code>pre_process*</code></td><td>-1</td><td>NULL 參數、io_mode 不符、上一個 frame 還開著（沒 commit 也沒 skip）</td><td>先 <code>frame_commit</code>／<code>frame_skip</code></td></tr>
+<tr><td><code>frame_inputs</code></td><td>-1</td><td>沒有開啟中的 frame（例如第 0 拍 <code>pre_process</code> 回 0 之後）</td><td>只在 <code>pre_process</code> 回 1 後呼叫</td></tr>
+<tr><td><code>frame_commit</code></td><td>-1</td><td>三個 head 或兩個遞迴 state 有非有限值，或沒先 <code>frame_inputs</code></td><td>兩個遞迴 state 已歸零、<code>state_generation</code> +1、frame 仍開著：呼叫 <code>frame_skip</code>，或重新 <code>frame_inputs</code> 再跑一次加速器</td></tr>
+<tr><td><code>frame_skip</code></td><td>-1</td><td>沒有開啟中的 frame</td><td>—（成功即 identity，時鐘照走）</td></tr>
+<tr><td><code>post_process*</code></td><td>-1</td><td>NULL、io_mode 不符、frame 還開著</td><td>先關閉 frame</td></tr>
+<tr><td><code>set_atten_lim</code>／<code>set_erb_matrices</code></td><td>-1</td><td>NULL、非有限值，或 frame 開著</td><td>在 hop 之間呼叫</td></tr>
+</table></div>
+<p class="note">寫了一半但仍有限的加速器輸出偵測不到（三個 head 預填 NaN 只抓得到「沒寫」）；兩個 state 是就地覆寫，commit 失敗時前一份已不存在，所以只能歸零。</p>
+
+<h2>流程時序圖</h2>
+<p>lifeline：<code>caller</code>（應用）、<code>DFN2Prepost</code>（C，pool 內）、<code>NPU</code>（目標平台 runtime）。箭頭上是實際函式名。</p>
+<pre>
+caller                         DFN2Prepost (C)                     NPU runtime
+  |                                  |                                  |
+  |== init ==========================|==================================|
+  | config_defaults(io_mode) ------->|                                  |
+  | get_mem_size(cfg,&amp;req) --------->| -1: config 不完整                |
+  | init_ex(pool,bytes,cfg,&amp;req) --->| reset, generation = 1            |
+  | ---------------------------------- fill state with quantized 0 ---->|
+  |                                  |                                  |
+  |== hop 0 ==========================|==================================|
+  | pre_process(in_hop) ------------>| STFT, features, push window      |
+  | &lt;-------- 0 (沒有右鄰居) ---------|                                  |
+  | post_process(out,&amp;written) ----->|                                  |
+  | &lt;-------- written = 0 (補零) -----|                                  |
+  |                                  |                                  |
+  |== hop n >= 1 (steady) ===========|==================================|
+  | pre_process(in_hop) ------------>| features, window [t-1,t,t+1]     |
+  | &lt;-------- 1 ----------------------|                                  |
+  | frame_inputs(&amp;in,&amp;out) -------->| heads = NaN, views into pool     |
+  | state_generation() ------------->| (變了 -&gt; 重填量化零) ------------->|
+  | ---------------------------------------- run(in, out) ------------->| 先讀完 state 輸入,
+  | &lt;---------------------------------------- rc ----------------------| 再寫 heads 與 *_next
+  | frame_commit() ----------------->| finite 檢查, compose, synthesis  |
+  | &lt;-------- 0 -----------------------|                                  |
+  | post_process(out,&amp;written) ----->| hop 1: written = 0               |
+  | &lt;-------- written = 512 (hop &gt;= 2)|                                  |
+  |                                  |                                  |
+  |== 失敗路徑 =======================|==================================|
+  | frame_commit() ----------------->| 非有限: state 歸零, generation+1 |
+  | &lt;-------- -1 ----------------------| frame 仍開著                     |
+  | frame_skip() ------------------->| identity (unit mask, alpha 0)    |
+  | (下一拍 state_generation 變了) ---------- fill quantized 0 ------->|
+  |                                  |                                  |
+  |== 設定與重置 =====================|==================================|
+  | set_atten_lim(db) / set_erb_matrices(fwd,inv)  (hop 之間, frame 開著 -> -1)
+  | reset() ------------------------>| 清 state/ring/framing, generation+1
+  | destroy() ----------------------&gt;| _create 配置的才釋放             |
+</pre>
+<h3>時間軸（延遲）</h3>
+<div class="tbl"><table>
+<tr><th>項目</th><th>值</th><th>出處</th></tr>
+<tr><td>hop</td><td>512 samples = 10.67 ms @48 kHz</td><td><code>DFN2_HOP_LEN</code></td></tr>
+<tr><td><code>pre_process</code> 回 0 的拍數</td><td>1（hop 0）</td><td><code>dfn2_prepost.h</code></td></tr>
+<tr><td><code>post_process</code> 的 <code>written = 0</code> 拍數</td><td>2（hop 0、1），第 2 拍起 512</td><td><code>dfn2_prepost.h</code></td></tr>
+<tr><td>identity 路徑輸出落後輸入</td><td>3 hops = 1536 samples = 32 ms（framing 1 + 模型 2）</td><td><code>dfn2_prepost.h</code>；<code>dfn2_prepost_model_lookahead_frames()</code> 回 2</td></tr>
+<tr><td>結尾 flush</td><td>2 個零 hop，加速器照跑</td><td><code>dfn2_prepost.h</code></td></tr>
+</table></div>
+<p class="note">逐 hop 的泳道圖（caller／C pre／NPU／C post）見 <a href="ainr_dfn2.html">ainr_dfn2</a> 的「訊號泳道圖」。</p>
+
+<h2>函式清單：公開 vs 內部</h2>
+<div class="tbl"><table>
+<tr><th>分類</th><th>函式</th></tr>
+<tr><td><b>公開（整合者呼叫）</b><br><code>dfn2_prepost.h</code></td><td><code>dfn2_prepost_config_defaults</code>、<code>_get_mem_size</code>、<code>_init</code>、<code>_init_ex</code>、<code>_create</code>、<code>_destroy</code>、<code>_reset</code>、<code>_state_generation</code>；查詢 <code>_hop_size</code>、<code>_num_bins</code>、<code>_io_mode</code>、<code>_model_lookahead_frames</code>、<code>_layout_version</code>、<code>_output_frame_index</code>；設定 <code>_set_erb_matrices</code>、<code>_set_atten_lim</code>；每 hop <code>_pre_process</code>、<code>_pre_process_freq</code>、<code>_pre_process_freq_dual</code>、<code>_frame_inputs</code>、<code>_frame_commit</code>、<code>_frame_skip</code>、<code>_post_process</code>、<code>_post_process_freq</code></td></tr>
+<tr><td><b>公開（callback 邊界）</b></td><td><code>dfn2_model_run_frame</code>（struct <code>DFN2Model</code>）、<code>dfn2_model_io_descriptor_default</code>、<code>dfn2_model_io_descriptor_validate</code></td></tr>
+<tr><td><b>低階（類別內部使用；自帶 state 或做 parity 時才直接呼叫）</b></td><td><code>dfn2_process.h</code>：<code>dfn2_framing_config</code>、<code>dfn2_state_init</code>、<code>dfn2_set_erb_matrices</code>、<code>dfn2_analysis</code>、<code>dfn2_compute_features</code>、<code>dfn2_apply_atten_lim</code>、<code>dfn2_compose</code>（aligned 參考）、<code>dfn2_compose_stream</code>、<code>dfn2_synthesis</code>、<code>dfn2_simd_backend</code>。<code>dfn2_model_io.h</code>：<code>dfn2_model_io_init</code>、<code>_push_erb_window</code>、<code>_push_spec_window</code>、<code>_push_features</code>、<code>_validate_arrays</code>、<code>_validate_state</code>、<code>_reset</code>、<code>_zero_recurrent</code>、<code>_state_generation</code></td></tr>
+<tr><td><b>內部（<code>static</code>，不在標頭）</b></td><td><code>dfn2_prepost.c</code>：<code>pp_carve</code>、<code>pp_layout</code>、<code>pp_build_hash</code>、<code>pp_check_config</code>、<code>pp_begin_frame</code>、<code>pp_close_frame</code> 等；<code>dfn2_process.c</code>：<code>df_common_features</code>、<code>df_common_expand_mask</code>、<code>df_common_atten_lim</code>、<code>df_common_deep_filter</code>、<code>erb_spans</code>；<code>dfn2_model_io.c</code>：<code>all_finite</code></td></tr>
+</table></div>
+<p class="note">低階 <code>dfn2_compose()</code> 與 <code>dfn2_compose_stream()</code> 不可混用（切換須重新 <code>dfn2_state_init()</code>）；類別只用 stream 版。</p>
+
+<h2>參數表</h2>
+<h3>外部：第三方可調（公開 API，有範圍檢查）</h3>
+<div class="tbl"><table>
+<tr><th>名稱</th><th>位置</th><th>型別／範圍</th><th>預設</th><th>何時設定</th><th>說明</th></tr>
+<tr><td><code>io_mode</code></td><td><code>DFN2PrepostConfig</code></td><td><code>DFN2_IO_TIME</code>(1)／<code>DFN2_IO_FREQ</code>(0)</td><td><code>config_defaults</code> 的第二個參數</td><td>init 前，之後固定</td><td>決定 pool 大小（TIME 246,320／FREQ 219,536 bytes）與可呼叫的 pre／post 函式</td></tr>
+<tr><td><code>fft</code></td><td>同上</td><td><code>FftHandle*</code>，<code>fft_get_n_freqs</code> = 513</td><td>NULL</td><td>init 前</td><td>TIME 必填（borrowed，不由本物件建立或銷毀）；FREQ 可為 NULL</td></tr>
+<tr><td><code>window</code></td><td>同上</td><td><code>const float*</code>，<code>DFN2_WIN_LEN</code>(1024) 個值</td><td>NULL</td><td>init 前</td><td>NULL＝pool 內自帶 sqrt-Hann；出貨路徑一律留 NULL；非 NULL 須與物件同壽命且不變</td></tr>
+<tr><td><code>erb_fwd</code>／<code>erb_inv</code></td><td>同上</td><td><code>const float*</code>；fwd bin-major [513][32]、inv band-major [32][513]</td><td>NULL（必填，兩種模式）</td><td>init 前；執行期用 <code>set_erb_matrices</code></td><td>borrowed；<code>erb_inv</code> 須是 partition of unity（skip identity 依賴此性質）；就地改寫內容後須再呼叫 <code>set_erb_matrices</code></td></tr>
+<tr><td><code>atten_lim_db</code></td><td>同上；<code>set_atten_lim</code></td><td>有限 float；以 |dB| 計</td><td>0（關閉）</td><td>init 前，或 hop 之間</td><td>輸出 = noisy×lim + enhanced×(1−lim)，lim = 10^(−|dB|/20)，在最後的複數頻譜上混合；非有限值被拒（-1）</td></tr>
+<tr><td><code>set_erb_matrices(p, fwd, inv)</code></td><td>函式</td><td>兩個指標皆非 NULL</td><td>—</td><td>hop 之間（frame 開著回 -1）</td><td>換 .bin 不需重編譯；保證 per-hop 原子性，不保證 per-source-frame 一致（要一致就先 <code>reset</code>）</td></tr>
+<tr><td><code>--atten-lim</code>、<code>--input</code>／<code>--output</code>、<code>--input-dir</code>／<code>--output-dir</code></td><td><code>DeepFilterNet2/inference.py</code></td><td>float；路徑</td><td><code>--atten-lim</code> 預設 None（關）</td><td>離線推論</td><td>Python 參考；與 C 的 <code>atten_lim_db</code> 同義</td></tr>
+<tr><td><code>--frames</code>、<code>--format</code>、<code>--seed</code>、<code>--onnx</code>、<code>--wav-dir</code>、<code>--output</code></td><td><code>inference.py calib</code></td><td>frames 預設 256；format <code>bin</code>／<code>npz</code>；seed 42</td><td>—</td><td>PTQ 校正資料</td><td>同一 process 匯出並 parity 檢查 graph（預設 <code>&lt;output&gt;.onnx</code>）</td></tr>
+<tr><td><code>--opset</code>、<code>--verify</code></td><td><code>export_onnx.py</code></td><td>opset 預設 17</td><td>—</td><td>匯出</td><td>匯出後逐項檢查 state 邊界</td></tr>
+<tr><td><code>--runtime-bins DIR</code></td><td><code>export_erb_matrix.py</code></td><td>目錄</td><td>—</td><td>匯出一次</td><td>寫 <code>erb_fwd.bin</code>／<code>erb_inv.bin</code>；寫檔前檢查 partition of unity</td></tr>
+</table></div>
+
+<h3>內部：存在且可改，但不建議開放</h3>
+<p>下列都是 checkpoint／graph 契約的一部分：改任何一項都等於換一個模型，需重訓、重匯出，並讓 layout 版號或 feature 版本跟著變；開放給第三方只會得到「形狀合法但數值錯誤」的結果。</p>
+<div class="tbl"><table>
+<tr><th>名稱</th><th>值</th><th>位置</th><th>不開放的原因</th></tr>
+<tr><td><code>DFN2_SR</code>／<code>DFN2_N_FFT</code>／<code>DFN2_N_BINS</code>／<code>DFN2_WIN_LEN</code>／<code>DFN2_HOP_LEN</code></td><td>48000／1024／513／1024／512</td><td><code>dfn2_process.h</code></td><td>與 checkpoint 的 signal contract、ERB 矩陣尺寸、所有 ring 大小綁定；只支援這一組 grid</td></tr>
+<tr><td><code>DFN2_N_ERB</code>／<code>DFN2_DF_BINS</code>／<code>DFN2_DF_ORDER</code></td><td>32／96／5</td><td><code>dfn2_process.h</code></td><td>網路 head 的輸出形狀；<code>df_bins=96</code> 對應 0..4.5 kHz</td></tr>
+<tr><td><code>DFN2_MASK_LOOKAHEAD</code>／<code>DFN2_DF_LOOKAHEAD</code></td><td>1／1（cascade 串聯，總延遲 2 hops）</td><td><code>dfn2_process.h</code></td><td>訓練時的因果結構；改了延遲與對齊邏輯都變，需重訓</td></tr>
+<tr><td><code>DFN2_ERB_NORM_ALPHA</code>／<code>DFN2_SPEC_NORM_ALPHA</code></td><td>0.989／0.989（tau = 1.0 s）</td><td><code>dfn2_process.h</code></td><td>由 sr、hop、tau 推導；feature version 的一部分，須與 <code>train.py</code> 相同</td></tr>
+<tr><td><code>DFN2_ERB_NORM_INIT_LO_DB</code>／<code>_HI_DB</code>、<code>DFN2_ERB_NORM_SCALE_DB</code>、<code>DFN2_ERB_LOG_FLOOR</code></td><td>−60／−90 dB、40、1e-10</td><td><code>dfn2_process.h</code></td><td>三者互相一致（|log floor − init_lo| = scale_db），須一起改</td></tr>
+<tr><td><code>DFN2_SPEC_NORM_INIT_LO</code>／<code>_HI</code>、<code>DFN2_SPEC_NORM_EPS</code></td><td>0.001／0.0001、1e-12</td><td><code>dfn2_process.h</code></td><td>libDF 初值；eps 防止 flush-to-zero 後 x/√0 產生 NaN</td></tr>
+<tr><td><code>DFN2_ANALYSIS_SCALE</code></td><td>0.03125</td><td><code>dfn2_process.h</code></td><td>只作用在餵給正規化器的拷貝；<b>不是</b>頻譜進出的 1/32 換算</td></tr>
+<tr><td><code>DFN2_FEATURE_VERSION</code></td><td><code>dfn2_libdf_wnorm_upstream_init_no_eps_v5</code></td><td><code>dfn2_process.h</code></td><td>checkpoint 與前端的共同契約</td></tr>
+<tr><td><code>DFN2_MODEL_IO_LAYOUT_VERSION</code></td><td>8</td><td><code>dfn2_model_io.h</code></td><td>graph 邊界版號；與 <code>export_onnx.py</code> 互鎖，4–7 已退役不可重用</td></tr>
+<tr><td><code>DFN2_MODEL_INPUT_FRAMES</code>／<code>_GRU_ROWS</code>／<code>_GRU_ROW_*</code>／<code>_GRU_HIDDEN</code>／<code>_ENCODER_CHANNELS</code>／<code>_DF_PATHWAY_WINDOW</code></td><td>3／5／0,1,3／256／64／5</td><td><code>dfn2_model_io.h</code></td><td>graph 輸入／state 形狀；<code>DFN2ModelIoDescriptor</code> 逐欄位檢查</td></tr>
+<tr><td><code>DFN2_PREPOST_CARVE_VERSION</code>／<code>_DESCRIPTOR_VERSION</code>／<code>_ALIGNMENT</code></td><td>7／1／16</td><td><code>dfn2_prepost.h</code></td><td>pool 切分順序與 32-byte descriptor 的版本；進 <code>build_flags_hash</code>，由 <code>init_ex</code> 把關</td></tr>
+<tr><td>cascade 合成（全頻 mask → 低頻 5-tap FIR → alpha 混合）</td><td>固定算式</td><td><code>dfn2_process.c</code></td><td>parameter-free 地重現 <code>model.py compose()</code>；改動等於換模型</td></tr>
+<tr><td>訓練端 <code>config.ini</code> 的 <code>[signal]</code>／<code>[model]</code>／<code>[feature]</code></td><td>見 <code>DeepFilterNet2/config.ini</code></td><td>Python</td><td>寫進 checkpoint contract，<code>inference.py</code>／<code>train.py --resume</code> 逐項比對，不一致即拒絕載入</td></tr>
+</table></div>
+
+<h2>相關檔案與測試路徑</h2>
+<ul>
+<li><code>AINR/DeepFilterNet2/dfn2_prepost.c</code> / <code>.h</code>、<code>dfn2_process.c</code> / <code>.h</code>、<code>dfn2_model_io.c</code> / <code>.h</code></li>
+<li>行為閘門：<code>AINR/tests/test_dfn2_prepost_c.py</code>；串流對齊與 ERB 稀疏範圍：<code>AINR/tests/test_c_prepost.c</code></li>
+<li>host 消費者：<code>pipelines/dfn_res_stage.c</code>（<a href="pipeline_dfn_mono.html">pipeline_dfn_mono</a>、<a href="pipeline_dfn_4ch.html">pipeline_dfn_4ch</a>）</li>
+<li>同類頁面：<a href="ainr_dfn2.html">ainr_dfn2</a>、<a href="ainr_dfn2_detail.html">ainr_dfn2_detail</a>、<a href="ainr_dfn3_usage.html">ainr_dfn3_usage</a>、<a href="onnx_prepost.html">onnx_prepost</a>、<a href="conventions.html">conventions</a>、<a href="index.html">index</a></li>
+<li>文件：<a href="../../AINR/DeepFilterNet2/README.md">README.md</a>、<a href="../../AINR/README.md">AINR/README.md</a></li>
+</ul>
+</body>
+</html>

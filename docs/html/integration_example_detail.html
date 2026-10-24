@@ -38,6 +38,7 @@ pre code{background:none;padding:0}
 <a href="../../../NR/docs/html/nr_c_api.html">NR API</a>
 <a href="../../../audiolib/common/docs/html/audio_common_c_api.html">audiolib API</a>
 <a href="integration_example.html">串接範例</a>
+<a href="integration_sequence.html">整合時序圖</a>
 <a href="integration_example_detail.html"><b>串接範例細節</b></a>
 </nav>
 
@@ -52,7 +53,7 @@ pre code{background:none;padding:0}
 <tr><th>類別</th><th class="ok">存活</th><th class="dead">消失</th></tr>
 <tr><td><b>狀態快照(pull)</b></td><td><code>aec_debug_status</code>、<code>aec_get_res_context</code>、<code>aec_get_linear_context</code>、<code>aec_linear_is_cancelling</code>、<code>aec_far_fft_real_compute_count</code>、<code>aec_get_mem_breakdown</code>、<code>anr_debug_status</code>、<code>anr_get_gain/_noise_psd</code>、4ch 的全部 census/counter accessor</td><td>—</td></tr>
 <tr><td><b>耗時</b></td><td>函式在(<b>回 0</b>)</td><td><b>全部數值</b>(<code>AecStageTiming</code>／<code>FourAecNrResLastTiming</code>)</td></tr>
-<tr><td><b>Log / trace(push)</b></td><td>—</td><td><b>全部</b>:<code>aec_debug_set_level/_log/_frame</code>、<code>aec_debug_set_trace</code>、<code>AecDebugTraceRow</code> 的 14 欄;mono 的 init 期 stderr 診斷</td></tr>
+<tr><td><b>Log / trace(push)</b></td><td>—</td><td><b>全部</b>:<code>aec_debug_set_level/_log/_frame</code>、<code>aec_debug_set_trace</code>、<code>AecDebugTraceRow</code> 的 CSV 14 欄</td></tr>
 <tr><td><b>錯誤碼</b></td><td>全部</td><td>—</td></tr>
 <tr><td><b>Finite guards</b></td><td>全部(不受任何開關影響)</td><td>—</td></tr>
 </table></div>
@@ -95,7 +96,7 @@ log("delay=%d conf=%.1f upd=%d erle=%.1fdB usable=%d conv=%d "
 <tr><td class="dead">self-reset 不計數</td><td><code>DSP_ERROR</code> 路徑會內部呼叫 <code>reset()</code>,而 <code>reset()</code> 本身<b>清掉所有 instrumentation</b>(realign counters／duty census 全歸零)→ 一次 self-reset 之後「之前發生過什麼」在計數器上完全消失</td></tr>
 <tr><td class="dead">delay lock 遺失不計數</td><td><code>AecLinearContext.delay_state</code> 與 <code>generation</code> 每 hop 可讀,但 <code>AecDebugStatus</code> <b>兩者都沒有</b> → 只 poll <code>aec_debug_status()</code> 的整合者<b>看不到 lock 的丟失與重獲</b></td></tr>
 <tr><td class="dead">NN fail-open 是靜默的</td><td>三種 fallback 走<b>同一條 else 分支、無區別、無計數</b> → 「NPU 掛了整段跑 identity」與「NPU 正常但某幾 frame 吐 NaN」<b>從外部無法區分</b></td></tr>
-<tr><td class="dead">4ch init 失敗<b>一個字都不說</b></td><td>核心與單元的 <code>init_ex()</code> 8 項檢查任一失敗都<b>靜默回 NULL</b>。mono 的 <code>aec_init()</code> 等函式庫 init 只在 stderr 留診斷,但 <code>NO_STDIO=1</code>(正是板端組態)一開就沒了;mono 沒有 descriptor 閘</td></tr>
+<tr><td class="dead">4ch init 失敗<b>一個字都不說</b></td><td>核心與單元的 <code>init_ex()</code> 8 項檢查任一失敗都<b>靜默回 NULL</b>。mono 的 <code>aec_init()</code>／<code>anr_init()</code>／<code>ac_istft_init()</code> 也沒有任何診斷輸出,只回 NULL(大小查詢回 0);mono 沒有 descriptor 閘,所以「過小／未對齊／無效 config」三種原因從回傳值分不出來,要在呼叫前自己比對 <code>*_get_mem_size()</code> 與 pool 的大小和對齊</td></tr>
 <tr><td class="dead">幾乎沒有 frame counter</td><td>mono(<code>Aec</code>、<code>AnrDenoiser</code>、<code>AcIstft</code>)與 NN stage <b>都沒有</b> frame counter 的 public accessor;4ch 單元只在 <code>AudioPipeline4ChFrameInfo.frame_index</code> 給(且 self-reset 後歸零)→ 「這條 stream 到目前為止處理了幾個 hop」多半答不出來,遑論 xrun</td></tr>
 <tr><td class="dead">mono 沒有內建 finite 守衛</td><td><code>aec_process_context()</code> 與 <code>se_anr_stage_gain()</code> 輸入不檢、輸出不檢;輸出有限性要整合者自己用 <code>se_hop_is_finite()</code> 檢查(範例這樣做)。4ch 核心／單元的輸入有檢查(<code>four_aec_front_process()</code>)</td></tr>
 <tr><td class="dead">兩條 ULCNet 範例的 stage 沒有觀測面</td><td><code>ulcnet_nn_stage</code> 沒有診斷 accessor(沒有 model 呼叫計數、沒有 reprime 計數);mono 範例手上有 <code>Aec</code> handle,4ch 單元提供 <code>audio_pipeline_4ch_get_core()</code>、<code>_last_core_timing()</code> 與 <code>AudioPipeline4ChFrameInfo</code>(DOA、BF 適應、delay 狀態)。stage 這一側的狀態(reprime、fail-open 次數)對整合者不可達</td></tr>

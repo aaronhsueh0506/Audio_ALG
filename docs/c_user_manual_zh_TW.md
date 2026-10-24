@@ -22,15 +22,14 @@
 - malloc reference executable：config-keyed `pipelines/bin/.../aec_nr_pipeline`
   （source：`pipelines/mono_aec_nr_res/main.c`）
 - static-memory reference executable：config-keyed `pipelines/bin/.../aec_nr_pipeline_static`
-  （source：`pipelines/mono_aec_nr_res/static_main.c`；單一 caller pool、init 後零 malloc、輸出與 malloc 版
-  byte-identical；`--print-mem-size` 可直接查任一取樣率的 pool 需求）
+  （source：`pipelines/mono_aec_nr_res/static_main.c`；單一 caller pool、init 後零 malloc、與 malloc 版的輸出相等由 `tests/test_mono_chain.c` 驗證；`--print-mem-size` 可直接查任一取樣率的 pool 需求）
 - mono 的 reusable 零件：`lib/aec` 的 `Aec`（`aec_process_context()`）、`pipelines/common/se_stage.h`
   的 `se_frame_from_aec()`、`lib/nr` 的 `AnrDenoiser`、audiolib 的 `AcIstft`，以及 header-only 的 NR 級範例 `pipelines/samples/se_anr_stage.h`（沒有 mono 函式庫 archive；每 hop 的串接寫在各範例 `main`）
 - 四麥克風前端 API：`pipelines/4ch_aec_bf_nr_res/4aec_nr_res.h` / `4aec_nr_res.c`
 - 四麥克風線性 AEC + BF 單元（唯一包起來的單元）：`pipelines/4ch_aec_bf_nr_res/audio_pipeline_4ch.h` /
-  `audio_pipeline_4ch.c`；post-beam RES 在單元內（`enable_res`、`audio_pipeline_4ch_res()`），NR／CNG／合成不在單元內
+  `audio_pipeline_4ch.c`；單元只含共用 delay 對齊、四條線性 AEC、SRP-PHAT 與 BF，post-beam RES（libaec 的 `AecRes`）／NR／CNG／合成不在單元內
 - 四麥克風 static 對照範例：`pipelines/4ch_aec_bf_nr_res/4aec_nr_res_static.c`
-- 單元加 NR／合成的實錄 runner：`pipelines/4ch_aec_bf_nr_res/audio_pipeline_4ch_raw.c`
+- 單元加 RES／NR／合成的實錄 runner：`pipelines/4ch_aec_bf_nr_res/audio_pipeline_4ch_raw.c`
 - 四麥克風 archive：`pipelines/4ch_aec_bf_nr_res` 的 config-keyed build directory
   內的 `libaudio_pipeline_4ch.a`（前端、單元、`se_config.o`）
 
@@ -50,22 +49,23 @@ function、descriptor version、ownership 與錯誤行為，mono 以 lib/aec 與
 
 | 取樣率 | frame | FFT | hop | bins | 資源拓撲 |
 |---|---:|---:|---:|---:|---|
-| 16 kHz | 256 | 256 | 128 | 129 | 1 shared matcher + 4 linear AEC（後接 1 post-beam RES + 1 NR：核心由應用自己建，單元內建 RES）（預設） |
+| 16 kHz | 256 | 256 | 128 | 129 | 1 shared matcher + 4 linear AEC（後接 1 post-beam RES + 1 NR：核心與單元都由應用自己建）（預設） |
 | 16 kHz | 512 | 512 | 256 | 257 | 同上（可選） |
 | 48 kHz | 1024 | 1024 | 512 | 513 | 同上（唯一合法 48 kHz 格點） |
 
 呼叫端先用 `four_aec_front_process()` 取得借用的 `FourAecFront`
-（四路 linear 頻譜與時域 hop），交由外部 SRP-PHAT/GSC 更新 channel-major
+（四路 linear 頻譜與時域 hop），交由外部 SRP-PHAT／beamformer 更新 channel-major
 `Complex[4][n_freqs]` 有效權重，再呼叫 `four_aec_fuse()` 取得 `SeSpecFrame`。
 模組不實作 beamformer，但會以該組權重一致地投影 error／near／echo／R2 context；
 之後由應用明寫串接一次 RES 增益、一次 NR 增益、`sk_min_f32`、`sk_capply_gain_f32`、
-CNG 與 iFFT/OLA（`4aec_nr_res_static.c` 的 `post_hop()` 是範例；單元的 `fuse()` 已替你算好 RES 增益）。
+CNG 與 iFFT/OLA（`4aec_nr_res_static.c` 的 `post_hop()` 是範例；單元的 `fuse()` 也不算 RES 增益，`frame.g_res_ctx` 為 NULL，要用 `se_res_stage_gain()` 呼叫你自己的 `AecRes`）。
 
-`FourAecNrRes*` core 本身不實作 beamformer；若要直接包入現有的第三方
-SRP-PHAT/GSC，使用線性 AEC + BF 單元 `AudioPipeline4Ch*`（含 post-beam RES；不含 NR／合成）。單元的 AEC、DOA、GSC，
-以及你串的 NR、RES 都繼承同一個格點，`frame == FFT`、`hop == frame/2`，不能分別
-指定互相矛盾的 frame/hop/FFT。`audio_pipeline_4ch_*_size()` accessors 可
-分別查詢 main、DOA 與 GSC 實際格點；預設三組設定中三者必須一致。
+`FourAecNrRes*` core 本身不實作 beamformer；若要接入現有的第三方
+SRP-PHAT/GSC，就用這個核心加自己的 beamformer（`four_aec_front_process()` → 你的 BF → `four_aec_fuse()`）；
+不想自備 beamformer，改用線性 AEC + BF 單元 `AudioPipeline4Ch*`（內建 SRP-PHAT 與 BF；不含 RES／NR／合成）。單元的 AEC、DOA、BF，
+以及你串的 RES 與 NR 都繼承同一個格點，`frame == FFT`、`hop == frame/2`，不能分別
+指定互相矛盾的 frame/hop/FFT。`audio_pipeline_4ch_hop_size()`／`_doa_hop_size()`／`_bf_hop_size()`
+等 accessors 可分別查詢 main、DOA 與 BF 實際格點；預設三組設定中三者必須一致。
 
 目前只允許一個 in-flight front frame（下一次 `four_aec_front_process()` 會使上一幀的視圖失效）。建立方式與 mono 的 `Aec` 一致（heap 便利路徑與 caller-owned pool 兩種）：
 
@@ -105,7 +105,7 @@ mic/ref
 2. `R²` 除以 `32768²` 後，作為 NR 的 `extra_noise_psd`，得到 echo-aware `G_nr`。
 3. `G_nr` 與 AEC3 `G_res` 逐 bin 取較小值，不重複跑另一個時域 RES。
 4. `g_total` 直接取 `min(G_nr, G_res)`。post 段沒有 near-end floor，也沒有任何依賴廣帶能量的 lift；一個 bin 是否被保留，完全由 NR 自己的 speech-presence 模型與 AEC3 的 `G_res` 決定，所以環境噪聲大也不會把 NR 壓住或讓噪聲底跟著遠端起伏。
-5. CNG 只依 `G_res` 決定填哪些 bin（AEC 抑制留下的頻譜空洞），注入位準再乘該 bin 的 `G_nr`（下限 −10 dB，`CNG_NR_GAIN_FLOOR`）：NR 看不到 comfort noise，所以它的 gain 在這裡補套，讓補進去的噪聲落在降噪後的底噪，而不是未降噪的環境噪聲。
+5. CNG 只依 `G_res` 決定填哪些 bin（AEC 抑制留下的頻譜空洞），注入位準再乘該 bin 的 `G_nr`（下限 −10 dB，`SE_CNG_NR_GAIN_FLOOR`）：NR 看不到 comfort noise，所以它的 gain 在這裡補套，讓補進去的噪聲落在降噪後的底噪，而不是未降噪的環境噪聲。
 
 ## 3. 取得 submodule 與建置
 
@@ -155,41 +155,47 @@ AEC library 本身使用 `-ffp-contract=off -fno-math-errno` 建置；若 applic
 ## 4. 命令列使用
 
 ```bash
+# 執行檔在 config-keyed 目錄（由 make 依 backend／旗標雜湊決定）
+BIN="$(make -s -C pipelines print-bin-dir)"
+
 # balanced AEC + balanced NR
-./pipelines/aec_nr_pipeline mic.wav ref.wav out.wav balanced
+"$BIN"/aec_nr_pipeline mic.wav ref.wav out.wav balanced
 
 # 各自指定 preset
-./pipelines/aec_nr_pipeline mic.wav ref.wav out.wav mild \
+"$BIN"/aec_nr_pipeline mic.wav ref.wav out.wav mild \
   --nr-preset mild
-./pipelines/aec_nr_pipeline mic.wav ref.wav out.wav aggressive \
+"$BIN"/aec_nr_pipeline mic.wav ref.wav out.wav aggressive \
   --nr-preset aggressive
 
 # 只輸出 linear AEC path，不跑 NR／frequency gain combine／final OLA
-./pipelines/aec_nr_pipeline mic.wav ref.wav out.wav balanced --aec-only
+"$BIN"/aec_nr_pipeline mic.wav ref.wav out.wav balanced --aec-only
 
 # 只關其中一個 gain 來源：--no-nr 只剩 RES；--no-res 只剩 NR（CNG 隨之略過）；
 # 兩個都關 = 線性殘差經 iFFT/OLA 直通（與 --aec-only 差一個 hop 的延遲）
-./pipelines/aec_nr_pipeline mic.wav ref.wav out.wav balanced --no-nr
-./pipelines/aec_nr_pipeline mic.wav ref.wav out.wav balanced --no-res
+"$BIN"/aec_nr_pipeline mic.wav ref.wav out.wav balanced --no-nr
+"$BIN"/aec_nr_pipeline mic.wav ref.wav out.wav balanced --no-res
 
 # NR 的 noise prior 不折入 R²（noise-only NR）；只作比對用
-./pipelines/aec_nr_pipeline mic.wav ref.wav out.wav balanced --legacy-amin
+"$BIN"/aec_nr_pipeline mic.wav ref.wav out.wav balanced --legacy-amin
 
 # 不加入 comfort noise
-./pipelines/aec_nr_pipeline mic.wav ref.wav out.wav balanced --no-cng
+"$BIN"/aec_nr_pipeline mic.wav ref.wav out.wav balanced --no-cng
 ```
 
 ### 4.1 CLI 參數
 
 | 參數 | 值 | 預設 | 說明 |
 |---|---|---|---|
-| 第 4 個 positional argument | `mild`／`balanced`／`aggressive` | `balanced` | AEC preset |
+| 第 4 個 positional argument | `mild`／`balanced`／`aggressive`／`no_floor`（或 `0`..`3`） | `balanced` | AEC preset；未知字串退回 `balanced` |
 | `--nr-preset` | `mild`／`moderate`／`balanced`／`aggressive` | `balanced` | NR strength |
 | `--aec-only` | flag | off | 跳過 NR 與最終 gain combine |
+| `--no-nr` | flag | off | 不建降噪器，總增益只剩 RES |
+| `--no-res` | flag | off | RES 增益視為全 1（comfort noise 隨之略過） |
 | `--legacy-amin` | flag | off | NR 的 noise prior 不折入 R²（noise-only NR），只作比對用 |
 | `--no-cng` | flag | off | 關閉最終 CNG 注入 |
 | `--fft-size` | `256`／`512`／`1024` | 0（rate default） | 覆寫訊號格點的 FFT/frame 長度（16 kHz 唯一可切換的一項，見 pipeline_mono.html「訊號格點」表） |
 | `--debug` | flag | off | 每秒一行 AEC+NR 狀態（read-only，不影響輸出） |
+| `--timing` | flag | off | 結束時印每個階段的平均耗時；AEC 的列需要 `make PROFILE=1` |
 
 `delay_mode`／`delay_num_filters`／`fixed_delay_samples`／`filter_length`
 （見 `common/se_config.h` 的 `SeRequest`）**沒有對應 CLI 旗標**；
@@ -205,8 +211,8 @@ AEC library 本身使用 `-ffp-contract=off -fno-math-errno` 建置；若 applic
 設定 `DUMP_CTX` 可將每 hop 的中間資料寫成 binary dump，供 port parity 或離線分析：
 
 ```bash
-DUMP_CTX=/tmp/pipeline_ctx.bin \
-./pipelines/aec_nr_pipeline mic.wav ref.wav out.wav balanced
+DUMP_CTX=pipeline_ctx.bin \
+"$BIN"/aec_nr_pipeline mic.wav ref.wav out.wav balanced
 ```
 
 檔案開頭是兩個 `int`：`n_freqs`、`hop`；後續每幀依序包含 `error_spec`、`res_gain`（lane 自己的增益）、`r2`、`comfort_noise`、`far_power`、`g_nr`（沒有降噪器時是 unity 全 1 向量）與 output hop。這是診斷格式，沒有穩定 ABI 保證。
@@ -218,11 +224,11 @@ DUMP_CTX=/tmp/pipeline_ctx.bin \
 - 處理長度取 mic/ref 中較短者。
 - 每次處理所選 signal grid 的一個 hop，最後不足一個 hop 的尾端捨棄。
 - pipeline 沒有主動改寫 `AEC_OUT_FLOAT`，因此預設輸出單聲道 PCM16。
-- 若要 float32 WAV：`AEC_OUT_FLOAT=1 ./pipelines/aec_nr_pipeline ...`。
+- 若要 float32 WAV：`AEC_OUT_FLOAT=1 "$BIN"/aec_nr_pipeline ...`。
 
 ## 5. 可編譯的 C integration wrapper
 
-下列範例只使用目前 submodule 已存在的 API，重現 production 的 malloc path。上層每次傳入 `audio_alg_hop_size()` 個 float sample。
+下列範例只使用目前 submodule 已存在的 API，以 malloc 手寫一份與 `pipelines/mono_aec_nr_res` 範例等價的串接（RES 增益取自 AEC 自己的 context）。上層每次傳入 `audio_alg_hop_size()` 個 float sample。
 
 ```c
 /* AUDIO_ALG_PIPELINE_EXAMPLE_BEGIN */
@@ -232,6 +238,7 @@ DUMP_CTX=/tmp/pipeline_ctx.bin \
 #include <string.h>
 
 #include "aec.h"
+#include "aec_res.h"   /* aec_cng_fill */
 #include "fft_wrapper.h"
 #include "anr.h"
 #include "anr_types.h"
@@ -263,23 +270,6 @@ typedef struct {
     float *extra;
     Complex *spec;
 } AudioAlgPipeline;
-
-static float pipeline_uniform(AudioAlgPipeline *p)
-{
-    p->rng ^= p->rng << 13;
-    p->rng ^= p->rng >> 17;
-    p->rng ^= p->rng << 5;
-    return ((p->rng >> 8) + 0.5f) * (1.0f / 16777216.0f);
-}
-
-static float pipeline_gauss(AudioAlgPipeline *p)
-{
-    float u1 = pipeline_uniform(p);
-    float u2 = pipeline_uniform(p);
-    if (u1 < 1e-7f) u1 = 1e-7f;
-    return sqrtf(-2.0f * logf(u1)) *
-           cosf(2.0f * (float)M_PI * u2);
-}
 
 void audio_alg_destroy(AudioAlgPipeline *p)
 {
@@ -375,6 +365,7 @@ int audio_alg_process(AudioAlgPipeline *p,
                       const float *mic, const float *ref, float *out)
 {
     AecResContext ctx;
+    const float *extra = NULL;
     int k;
 
     if (!p || !p->aec_ready || !p->nr || !mic || !ref || !out)
@@ -385,11 +376,14 @@ int audio_alg_process(AudioAlgPipeline *p,
     if (!ctx.error_spec || !ctx.res_gain || ctx.n_freqs != p->n_freqs)
         return -1;
 
-    for (k = 0; k < p->n_freqs; ++k)
-        p->extra[k] = ctx.r2 ? ctx.r2[k] / PSD_SCALE : 0.0f;
+    /* 與 production（se_anr_stage_gain）相同：R^2 只在 usable_linear != 0 時摺進降噪器的 noise floor */
+    if (ctx.r2 && ctx.usable_linear) {
+        for (k = 0; k < p->n_freqs; ++k)
+            p->extra[k] = ctx.r2[k] / PSD_SCALE;
+        extra = p->extra;
+    }
 
-    if (anr_process_gain(p->nr, ctx.error_spec,
-                              ctx.r2 ? p->extra : NULL, p->g_nr) < 0)
+    if (anr_process_gain(p->nr, ctx.error_spec, extra, p->g_nr) < 0)
         return -1;
 
     for (k = 0; k < p->n_freqs; ++k) {
@@ -403,16 +397,9 @@ int audio_alg_process(AudioAlgPipeline *p,
         p->spec[k].i = ctx.error_spec[k].i * p->g_total[k];
     }
 
-    if (p->enable_cng && ctx.comfort_noise) {
-        for (k = 1; k < p->n_freqs - 1; ++k) {
-            float n2 = ctx.comfort_noise[k] / PSD_SCALE;
-            float ng2 = 1.0f - p->g_aec[k] * p->g_aec[k];
-            float amp = sqrtf(n2 > 0.0f ? n2 : 0.0f) *
-                        sqrtf(ng2 > 0.0f ? ng2 : 0.0f);
-            p->spec[k].r += amp * pipeline_gauss(p);
-            p->spec[k].i += amp * pipeline_gauss(p);
-        }
-    }
+    if (p->enable_cng && ctx.comfort_noise)   /* 只填 RES 挖掉的 bin，位準乘該 bin 的 NR 增益（下限 -10 dB） */
+        aec_cng_fill(&p->rng, p->spec, ctx.comfort_noise, p->g_aec, p->g_nr,
+                     0.31622777f, p->n_freqs);
 
     fft_inverse(p->fft, p->spec, p->ifft_buf);
     for (k = 0; k < p->frame_size; ++k)
@@ -509,12 +496,13 @@ Audio_ALG 的範例程式（`pipelines/mono_aec_nr_res/main.c` 等）直接用 N
 
 - 每條串流各有一組 AEC、NR、FFT、OLA 與 RNG state。
 - instance 不可由多個 thread 無同步同時 process。
-- 換獨立串流前 reset AEC、NR、OLA、near hangover 與 RNG；或直接 destroy/create。
+- 換獨立串流前 reset AEC、NR、合成 OLA 與 comfort-noise RNG（四件一起，見 [mono 手冊 §3](integration_mono_zh_TW.md)）；或直接 destroy/create。
 - create 失敗時必須釋放已成功建立的子模組與 buffer。
-- malloc reference path（`aec_nr_pipeline`）在初始化時使用 malloc/calloc；process loop 本身不應配置記憶體。
-- 單一 caller-owned pool 的 static-memory 版本已完整支援：`aec_nr_pipeline_static` 用三個複合 API
-  （`aec_get_mem_size`/`aec_init`、`anr_get_mem_size`/`anr_init`、`fft_get_mem_size`/`fft_init`）
-  從一塊 16-byte 對齊的 pool 切出全部記憶體，init 後零 malloc，輸出與 malloc 版 byte-identical。
+- malloc reference path（`aec_nr_pipeline`）在初始化時用 `posix_memalign()` 配置各函式庫的區塊；process loop 本身不配置記憶體。
+- 單一 caller-owned pool 的 static-memory 版本已完整支援：`aec_nr_pipeline_static` 各自查大小、各自 init
+  （`aec_get_mem_size`/`aec_init`、`anr_get_mem_size`/`anr_init`、`ac_istft_get_mem_size`/`ac_istft_init`），
+  從一塊 16-byte 對齊的 pool 依序切出全部記憶體，init 後零 malloc；`pipelines/mono_aec_nr_res/tests/test_mono_chain.c` 以逐位元比對兩支 CLI 與手寫 oracle
+  （pooled 與 heap 的輸出因此相等，範圍為該測試涵蓋的選項組合）。
   NR 與 AEC 的 heap 與 static API 並存於同一份 `.a`（runtime 選擇）。
 
 ## 9. Troubleshooting

@@ -1,15 +1,14 @@
 /** Four-channel linear AEC plus beamformer unit: one shared far aligner -> four linear AEC
- * lanes -> SRP-PHAT DOA -> BF, and the post-beam residual-echo suppressor (lib/aec AecRes) over
- * the beamformed frame. SRP-PHAT and BF come from audiolib/doa and audiolib/bf; this unit owns
- * their lifetime and the AecRes. Noise reduction, comfort noise, synthesis and any neural
- * post-filter are separate libraries that the application initialises and chains over the
- * frame of fuse() (the examples show the chain).
+ * lanes -> SRP-PHAT DOA -> BF. SRP-PHAT and BF come from audiolib/doa and audiolib/bf; this
+ * unit owns their lifetime. The residual-echo, noise-reduction, comfort-noise and synthesis
+ * stages and any neural post-filter are separate libraries that the application initialises
+ * and chains over the unit's output (RES comes from libaec: aec_res_init / se_res_stage_gain).
  * Per hop, one of two equivalent forms:
  *     audio_pipeline_4ch_process_front()   shared delay + four linear AEC lanes
  *     [mask / activity from the lane spectra]
  *     audio_pipeline_4ch_process_beam()    SRP-PHAT + BF -> beamformed spectrum and weights
  *     audio_pipeline_4ch_fuse()            optional: project near / R^2 / comfort noise into a
- *                                          SeSpecFrame and add the RES gain (g_res_ctx)
+ *                                          SeSpecFrame for the frequency-domain stages
  * or audio_pipeline_4ch_process_with_activity() / audio_pipeline_4ch_process() for front plus
  * beam in one call. With core.enable_post = 0 the lanes keep only the linear context and
  * fuse() is unavailable (the profile of a neural post-filter that reads the beam spectrum).
@@ -32,7 +31,6 @@
 #define AUDIO_PIPELINE_4CH_H
 
 #include "4aec_nr_res.h"
-#include "aec_res.h"
 
 #ifdef __cplusplus
 extern "C" {
@@ -69,11 +67,6 @@ typedef struct AudioPipeline4ChConfig {
     int bf_fixed_align_notebook;
     int bf_adapt_interval;
 
-    /* Post-beam RES, built only with core.enable_post (it reads the fused frame). Strength at
-     * runtime: aec_res_set_preset(audio_pipeline_4ch_res(p), preset, ramp_ms). */
-    int enable_res;
-    AecPreset res_preset;
-
     /* Fallback activity detector used only by audio_pipeline_4ch_process(); integrations that
      * own a VAD call audio_pipeline_4ch_process_with_activity() or the split calls. */
     float auto_vad_threshold_dbfs;
@@ -100,7 +93,7 @@ typedef struct AudioPipeline4Ch AudioPipeline4Ch;
  * descriptor content, including a control-block-only change of the composed core
  * (build_flags_hash folds in only the core's carve-token hash). Query a fresh descriptor
  * for every build; never persist or synthesize one. */
-#define AUDIO_PIPELINE_4CH_LAYOUT_VERSION 20u
+#define AUDIO_PIPELINE_4CH_LAYOUT_VERSION 21u
 
 /** Fixed 32-byte descriptor with the fields of FourAecNrResMemReq (4aec_nr_res.h). Its
  * build_flags_hash folds in the core's, so a core-layer layout bump invalidates persisted
@@ -149,7 +142,7 @@ int audio_pipeline_4ch_get_mem_requirements(
     const AudioPipeline4ChConfig* cfg,
     AudioPipeline4ChMemReq* out);
 
-/** Places the pipeline (core + SRP-PHAT + BF + scratch + RES) in caller-owned memory that
+/** Places the pipeline (core + SRP-PHAT + BF + scratch) in caller-owned memory that
  * satisfies the queried alignment and size. No heap allocation; a dirty pool is accepted. */
 AudioPipeline4Ch* audio_pipeline_4ch_init(
     void* mem,
@@ -228,24 +221,17 @@ int audio_pipeline_4ch_process(
     AudioPipeline4ChFrameInfo* info);
 
 /** Independent step after process_beam() (or process_with_activity()/process()): projects the
- * hop with the unit's own weights and beamformed spectrum into *frame (four_aec_fuse()) and,
- * with enable_res, sets frame->g_res_ctx to the RES gain over that frame (NULL without RES).
- * Frame pointers are valid until the next process_front() or reset. Requires core.enable_post.
+ * hop with the unit's own weights and beamformed spectrum into *frame (four_aec_fuse(); frame
+ * pointers are valid until the next process_front() or reset). Requires core.enable_post.
  * Returns OK; INVALID_ARGUMENT for a NULL argument or enable_post = 0 (nothing changed);
- * SEQUENCE_ERROR without a beam of this hop (nothing changed). Any other refusal (DSP_ERROR
- * also when the RES refuses the frame) resets the whole unit (core, SRP, BF, RES) and is
- * returned: the caller resets its own post stages. */
+ * SEQUENCE_ERROR without a beam of this hop (nothing changed). Any other refusal resets the
+ * whole unit (core, SRP, BF) and is returned: the caller resets its own post stages. */
 int audio_pipeline_4ch_fuse(AudioPipeline4Ch* p, SeSpecFrame* frame);
 
-/** Resets the core, SRP-PHAT, BF, RES and the fallback VAD (a preset set through
- * audio_pipeline_4ch_res() is kept). The caller resets its own post stages. */
+/** Resets the core, SRP-PHAT, BF and the fallback VAD. The caller resets its own post stages. */
 void audio_pipeline_4ch_reset(AudioPipeline4Ch* p);
 
 void audio_pipeline_4ch_destroy(AudioPipeline4Ch* p);
-
-/** The post-beam RES for aec_res_set_preset() / aec_res_split_floor(); NULL for a NULL or
- * destroyed handle, enable_res = 0 or core.enable_post = 0. */
-AecRes* audio_pipeline_4ch_res(const AudioPipeline4Ch* p);
 
 /** The composed core, read-only, for diagnostics. NULL for a NULL or destroyed handle. */
 const FourAecNrRes* audio_pipeline_4ch_get_core(const AudioPipeline4Ch* p);

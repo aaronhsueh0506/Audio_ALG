@@ -19,10 +19,11 @@ th{background:#eef0f2}
 </style>
 </head>
 <body>
-<nav><a href="index.html">index</a><a href="aiaec_align_ulcnet.html"><b>Align-ULCNet</b></a><a href="aiaec_align_ulcnet_detail.html">Align-ULCNet 細節</a><a href="aiaec_align_cruse.html">Align-CRUSE</a><a href="aiaec_deepvqe_s.html">DeepVQE-S</a><a href="aiaec_cagcrn.html">CAGCRN</a></nav>
+<nav><a href="index.html">索引</a><a href="conventions.html">慣例</a><a href="conventions_latency.html">延遲預算</a><a href="onnx_prepost.html">ONNX 邊界</a><a href="aiaec_align_ulcnet.html"><b>Align-ULCNet</b></a><a href="aiaec_align_ulcnet_detail.html">Align-ULCNet 細節</a><a href="aiaec_align_ulcnet_usage.html">Align-ULCNet 使用</a><a href="aiaec_align_cruse.html">Align-CRUSE</a><a href="aiaec_align_cruse_usage.html">Align-CRUSE 使用</a><a href="aiaec_deepvqe_s.html">DeepVQE-S</a><a href="aiaec_deepvqe_s_usage.html">DeepVQE-S 使用</a><a href="aiaec_cagcrn.html">CAGCRN</a><a href="aiaec_cagcrn_usage.html">CAGCRN 使用</a></nav>
 <h1>Align-ULCNet（linear AEC → RES+NR post-filter，selected）</h1>
 
 <h2>概要</h2>
+<p class="note">如何呼叫、流程時序圖、外部／內部參數表：<a href="aiaec_align_ulcnet_usage.html">aiaec_align_ulcnet_usage</a>。</p>
 <p>Shetu et al.（EUSIPCO 2025, arXiv:2410.13620）兩級混合式殘響/殘迴聲 + 噪音抑制器的重建。
 task（<code>dataset_gen/model_views.py</code> 的 <code>MODEL_TASKS</code>）=
 <code>linear_aec_postfilter_res_nr_dereverb</code>：輸入是<b>凍結 PBFDKF linear AEC 的
@@ -37,13 +38,13 @@ error</b>（<code>linear_error = mic_postclip − D_hat</code>，不是 oracle r
 <tr><td>16 kHz</td><td><code>512/512/256</code></td><td>257</td><td>52</td><td>26</td><td>16.00 ms</td></tr>
 <tr><td>48 kHz</td><td><code>1024/1024/512</code></td><td>513</td><td>104</td><td>52</td><td>10.67 ms</td></tr>
 </table>
-<p>alignment 深度 D 在 16 kHz 固定 64（論文 Dmax）。<b>D 不能跨 grid 沿用</b>：它數的是 hop，
+<p>alignment 深度 D：建構子預設在 16 kHz 為 64（論文 Dmax），出貨 16 kHz 訓練 <code>config.ini</code> 的 <code>max_delay_frames</code> 為 32；部署 D 是匯出時另定的值。<b>D 不能跨 grid 沿用</b>：它數的是 hop，
 而兩個 grid 的 hop 長度不同。深度 D 往回搆到 <code>(D−1)</code> 個 hop，所以 D=8 在 16 kHz
 是 112 ms、在 48 kHz 只剩 74.7 ms；要在 48 kHz 搆到同樣的 112 ms 需要 D=12。
 <b>「由一個物理秒導出 D」在 48 kHz 走不通</b>：
 <code>SignalGrid.delay_frames(1.0)</code> 在該 grid 給出 94，超過 <code>MAX_DELAY_DEPTH</code>
 ／<code>ULCNET_MODEL_IO_MAX_D</code> 共同的 <b>D ≤ 64</b> 上限——這種 run 訓練成功、到 export
-才失敗，因此 48 kHz 必須在 <code>[model] max_delay_frames</code> 明寫 D（出貨 <code>config.ini</code> 為 8）。
+才失敗，因此 48 kHz 必須在 <code>[model] max_delay_frames</code> 明寫 D（16 kHz 出貨 <code>config.ini</code> 為 32；沒有 48 kHz 出貨 config）。
 參數量實測 <b>672,441</b> trainable（16k grid；落在論文 0.69 M class）。<code>stream_output_delay = 0</code>。</p>
 <p><b>ONNX / NPU graph boundary</b>（<code>Align_ULCNet/export_onnx.py</code> 匯出 stateless
 one-frame graph，<code>key_history</code>/<code>value_history</code>/<code>logit_history</code>/<code>h_gru</code>
@@ -123,7 +124,7 @@ recurrent state）。它組合 <code>ulcnet_process.c</code> ＋ <code>ulcnet_mo
 狀態機與「為何是第三個 TU」是三個模型<b>共用的形狀</b>，寫在
 <a href="onnx_prepost.html">onnx_prepost</a>；以下只記 Align-ULCNet 自己的部分。</p>
 <pre>UlcnetPrepostConfig cfg;  UlcnetPrepostMemReq req;
-ulcnet_prepost_config_defaults(&amp;cfg, ULCNET_IO_TIME, /*D=*/8);
+ulcnet_prepost_config_defaults(&amp;cfg, ULCNET_IO_TIME, /*D=*/8);  /* D 須等於 export 的 D */
 cfg.fft = fft;  cfg.window = window;      /* caller-owned 借用；本類別不建也不毀 */
 ulcnet_prepost_get_mem_size(&amp;cfg, &amp;req);
 UlcnetPrepost *p = ulcnet_prepost_init_ex(pool, req.bytes, &amp;cfg, &amp;req);  /* 或 _init / _create */
@@ -138,7 +139,7 @@ UlcnetPrepost *p = ulcnet_prepost_init_ex(pool, req.bytes, &amp;cfg, &amp;req); 
 <code>io_mode</code> 在 init 固定（它決定 pool 大小）：<code>ULCNET_IO_TIME</code> hop 進 hop 出，
 framing／加窗／overlap-add 由類別做、但呼叫的是 <b>caller 的 <code>FftHandle</code> 與 window 表</b>；
 <code>ULCNET_IO_FREQ</code> 頻譜進頻譜出、不做任何 transform，<code>fft</code>/<code>window</code>
-可為 NULL，這是<b>串接</b>（AEC/GSC seam）用的模式。</p>
+可為 NULL，這是<b>串接</b>（AEC seam 或 4ch 單元輸出頻譜）用的模式。</p>
 <p><b>四個 state 就地綁定</b>：<code>key_history</code>/<code>value_history</code>/<code>logit_history</code>/
 <code>h_gru</code> 在 caller pool 各一份，graph 回每個 state 的完整下一個 window（shape 同輸入，位移在 graph 內），
 runtime 把每個 <code>*_out</code> 綁到 <code>frame_inputs()</code> 回傳的同名位址，先讀完所有 state 輸入才寫輸出；
@@ -196,7 +197,7 @@ cksum）；<code>make -C AIAEC print-lib-path</code> 印出該組態封存檔的
   enhanced = 逆冪( (zr,zi)·mask ) → StreamISTFT.push → HOP samples
 
 K = n_fft/2+1（16k: 257、48k: 513）；TA = ceil(K/10)（16k: 26、48k: 52）；
-HOP = n_fft/2（16k: 256、48k: 512）；D = max_delay_frames（出貨 config 為 8）。
+HOP = n_fft/2（16k: 256、48k: 512）；D = max_delay_frames（16 kHz 出貨 config 為 32）。
 上圖 joint2 的 [B,96,1,7] 與 fgru 的 [B,64,1,7] 是 16 kHz 值，48 kHz 為 …,13（TA 之後兩次
 ceil-halving：26→13→7、52→26→13）。subband split = (ceil(w/2), w//2)，兩顆 GRU 各出 128、
 concat 恆為 256，所以 mask_fc1/fc2 的輸入寬度與 grid 無關，只有輸出寬度是 K。</pre>
@@ -275,7 +276,7 @@ Python reference 仍是兩個 <code>(2, 1, 128)</code> 的 nn.GRU hidden，測�
 從 reset 開始的 stream 與 whole-utterance forward 等價，<b>無 warm-up 特例</b>。
 實測 stream-vs-offline 最差差異：enhanced 4.1e-8 / mask 1.2e-7 / magnitude_mask 6.0e-8 /
 delay 4.0e-7（test 檔頭記載；tolerances 以 ~10x headroom 釘在 5e-7 / 2e-6 / 1e-6 / 5e-6）。</li>
-<li>Framing：類別與 AEC/GSC seam 用 <b>center=False、每 hop 一幀</b>的 rolling 分析；centered
+<li>Framing：類別與 AEC seam／4ch 單元用 <b>center=False、每 hop 一幀</b>的 rolling 分析；centered
 push 只剩 Python parity gate 使用（mono 範例 <code>mono_alignulcnet/main.c</code> 用同一套排程）。端到端
 演算法延遲仍是 <b>HOP samples</b>＝16 kHz 256 smp（16 ms）、48 kHz 512 smp（10.67 ms），但它來自
 <b>synthesis 的半窗 trim</b>、不是分析排程（<code>ulcnet_prepost.h</code> 明文）。</li>

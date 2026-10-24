@@ -19,10 +19,11 @@ th{background:#eef0f2}
 </style>
 </head>
 <body>
-<nav><a href="index.html">index</a><a href="aiaec_align_ulcnet.html">Align-ULCNet</a><a href="aiaec_align_cruse.html">Align-CRUSE</a><a href="aiaec_deepvqe_s.html"><b>DeepVQE-S</b></a><a href="aiaec_cagcrn.html">CAGCRN</a></nav>
+<nav><a href="index.html">索引</a><a href="conventions.html">慣例</a><a href="conventions_latency.html">延遲預算</a><a href="onnx_prepost.html">ONNX 邊界</a><a href="aiaec_align_ulcnet.html">Align-ULCNet</a><a href="aiaec_align_ulcnet_detail.html">Align-ULCNet 細節</a><a href="aiaec_align_ulcnet_usage.html">Align-ULCNet 使用</a><a href="aiaec_align_cruse.html">Align-CRUSE</a><a href="aiaec_align_cruse_usage.html">Align-CRUSE 使用</a><a href="aiaec_deepvqe_s.html"><b>DeepVQE-S</b></a><a href="aiaec_deepvqe_s_usage.html">DeepVQE-S 使用</a><a href="aiaec_cagcrn.html">CAGCRN</a><a href="aiaec_cagcrn_usage.html">CAGCRN 使用</a></nav>
 <h1>DeepVQE-S（end-to-end AEC+RES+NR，primary）</h1>
 
 <h2>概要</h2>
+<p class="note">如何呼叫、流程時序圖、外部／內部參數表：<a href="aiaec_deepvqe_s_usage.html">aiaec_deepvqe_s_usage</a>。</p>
 <p>Indenbom et al.（INTERSPEECH 2023, arXiv:2306.03177）0.59 M-class 小模型的重建。task
 （<code>dataset_gen/model_views.py</code>）= <code>end_to_end_aec_res_nr_dereverb</code>：
 輸入是<b>未對齊的 microphone 與 far-end 複數頻譜</b>（<code>mic_postclip</code> /
@@ -74,11 +75,11 @@ for s in range(0, n, grid.hop_len):
 <p>板端整合點：<b>一個物件</b>包住 caller 音訊與加速器張量之間的一切（framing、RI staging、
 CCM 頻譜 ring、16 個 state buffer）。它組合 <code>aiaec_process.c</code> ＋
 <code>DeepVQE_S/deepvqe_process.c</code>。<code>deepvqe_ccm_process</code> 的 CCM 內圈（bin 1..N-2，每 bin 9 個 tap）走共用 NEON 核心 <code>skn_ctaps_mac_f32</code>（audiolib，與標量 twin 逐位元相同）；兩個邊界 bin 走標量路徑，略過落在頻譜外的 tap。<code>frame_inputs</code> 的壓縮（<code>compress_planar</code>）是 sqrtf／逐元素 libm <code>powf</code>／縮放三段迴圈；
-本機工具鏈已把 sqrtf 迴圈編成 <code>fsqrt.4s</code>，未改用 <code>sk_fast_sqrt_f32</code>——它把 NaN 輸入映成 0，與 <code>sqrtf</code> 不逐位元相同。生命週期、32-byte
+壓縮不用 <code>sk_fast_sqrt_f32</code>：它把 NaN 輸入映成 0，與 <code>sqrtf</code> 不逐位元相同。生命週期、32-byte
 <code>DeepVqePrepostMemReq</code> 陳舊 pool 閘、交易式 frame 狀態機與「為何是第三個 TU」是三個
 模型<b>共用的形狀</b>，寫在 <a href="onnx_prepost.html">onnx_prepost</a>；以下只記 DeepVQE-S
-自己的部分。grid 只支援 16 kHz/512/256——<code>aiaec_process.h</code> 帶 <code>#error</code>
-守衛，Align-ULCNet 若改成 48 kHz，這裡是編譯失敗而不是張量被默默重新解讀。</p>
+自己的部分。grid 固定 16 kHz/512/256——由 <code>aiaec_process.h</code> 的 <code>AIAEC_SR</code>／<code>AIAEC_N_FFT</code> 常數決定，
+與 Align-ULCNet 的 <code>ULCNET_MODEL_IO_SR</code>／<code>_N_FFT</code> 建置參數無關；<code>get_mem_size</code>／<code>init</code> 也會拒絕大小不符的 <code>FftHandle</code>。</p>
 <pre>DeepVqePrepostConfig cfg;  DeepVqePrepostMemReq req;
 deepvqe_prepost_config_defaults(&amp;cfg, DEEPVQE_IO_TIME, /*D=*/DEEPVQE_PREPOST_DEFAULT_D);
 cfg.fft = fft;  cfg.window = window;      /* caller-owned 借用；本類別不建也不毀 */
@@ -123,11 +124,11 @@ runtime 把 <code>*_out</code> 綁到輸入位址（<code>state_out[id]</code> �
 <b>第一次 push 起每次恰一幀</b>。它與 <code>center</code> 1（centered）對同一個 hop
 吐出的<b>最後一幀位元相同</b>（同一個幾何：win = n_fft、hop = n_fft/2、共用同一張 sqrt-Hann 表；
 centered 只是在開頭多發一幀 reflect 前綴），所以這是<b>換標籤不是換訊號</b>，也讓類別和
-center=False 的 AEC/GSC seam 對得上。<b>演算法延遲仍是 1 個 hop</b>：它來自 synthesis 的
+center=False 的 AEC seam 與 4ch 單元輸出頻譜對得上。<b>演算法延遲仍是 1 個 hop</b>：它來自 synthesis 的
 半窗 trim，不是分析排程。</p>
 <p><b>Pool</b>（<code>deepvqe_prepost_get_mem_size</code>，16 kHz、D=32）：
-<code>DEEPVQE_IO_TIME</code> <b>636,896 B</b>、<code>DEEPVQE_IO_FREQ</code> <b>615,296 B</b>
-（差額 21,600 B ＝ 兩路 rolling 分析歷史＋共用 transform scratch＋一個 synthesis＋輸出 hop
+<code>DEEPVQE_IO_TIME</code> <b>637,072 B</b>、<code>DEEPVQE_IO_FREQ</code> <b>615,280 B</b>
+（差額 21,792 B ＝ 兩路 rolling 分析歷史＋共用 transform scratch＋一個 synthesis＋輸出 hop
 staging）。16 個 state 張量佔掉絕大部分。</p>
 
 <h2>Block diagram</h2>

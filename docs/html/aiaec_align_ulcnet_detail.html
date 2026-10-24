@@ -19,8 +19,7 @@ th{background:#eef0f2}
 </style>
 </head>
 <body>
-<nav><a href="index.html">index</a><a href="aiaec_align_ulcnet.html"><b>Align-ULCNet</b></a><a href="aiaec_align_cruse.html">Align-CRUSE</a><a href="aiaec_deepvqe_s.html">DeepVQE-S</a><a href="aiaec_cagcrn.html">CAGCRN</a></nav>
-<nav><a href="index.html">index</a><a href="aiaec_align_ulcnet.html">Align-ULCNet</a><a href="aiaec_align_ulcnet_detail.html"><b>Align-ULCNet 細節</b></a><a href="aiaec_align_cruse.html">Align-CRUSE</a><a href="aiaec_deepvqe_s.html">DeepVQE-S</a><a href="aiaec_cagcrn.html">CAGCRN</a></nav>
+<nav><a href="index.html">索引</a><a href="conventions.html">慣例</a><a href="conventions_latency.html">延遲預算</a><a href="onnx_prepost.html">ONNX 邊界</a><a href="aiaec_align_ulcnet.html">Align-ULCNet</a><a href="aiaec_align_ulcnet_detail.html"><b>Align-ULCNet 細節</b></a><a href="aiaec_align_ulcnet_usage.html">Align-ULCNet 使用</a><a href="aiaec_align_cruse.html">Align-CRUSE</a><a href="aiaec_align_cruse_usage.html">Align-CRUSE 使用</a><a href="aiaec_deepvqe_s.html">DeepVQE-S</a><a href="aiaec_deepvqe_s_usage.html">DeepVQE-S 使用</a><a href="aiaec_cagcrn.html">CAGCRN</a><a href="aiaec_cagcrn_usage.html">CAGCRN 使用</a></nav>
 <h1>Align-ULCNet 細節 — far branch、PTQ calibration、layout 18 重匯出與 rolling 分析</h1>
 
 <h2>概要</h2>
@@ -57,9 +56,9 @@ D 不改權重；checkpoint 與 dataset 不因 layout 而需要重新訓練或�
 <code>test_ulcnet_prepost_c.py</code> 的 <code>equiv</code> 案例逐 hop memcmp 釘住這件事
 （400 hop，真的跑 0/2/1 排程），所以是<b>實測</b>；hop 0 的 centered 排程 0 幀，兩者<b>自第二個
 hop 起</b>對得起來。<b>排程由建立 <code>AcStft</code> 時的 <code>center</code> 決定</b>，同一個物件不會混用兩種排程。
-centered（<code>center</code> 1）<b>沒有出貨 pipeline 使用</b>：mono 範例
-以 <code>center</code> 0 的 <code>AcStft</code> 呼叫
-<code>ac_stft_push_planar()</code>，與 4ch 的 far 分支同排程；只剩上述 parity 測試還在用 <code>center</code> 1 當比對基準。</p>
+centered（<code>center</code> 1）<b>沒有出貨 pipeline 使用</b>：<code>pipelines/samples/ulcnet_nn_stage.c</code>
+（mono 與 4ch 範例共用）以 <code>center</code> 0 的 <code>AcStft</code> 呼叫
+<code>ac_stft_push_planar()</code>；只剩上述 parity 測試還在用 <code>center</code> 1 當比對基準。</p>
 
 <h2>graph 內位移與就地綁定的驗證</h2>
 <p>輸出是 <code>output</code>（planar mask <code>(1,2,1,K)</code>）加 <code>key_history_out</code>/<code>value_history_out</code>/

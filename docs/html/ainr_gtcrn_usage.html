@@ -1,0 +1,199 @@
+<!doctype html>
+<html lang="zh-TW">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>AINR GTCRN 使用與參數</title>
+<style>
+body{font-family:-apple-system,"Segoe UI",Roboto,"Noto Sans TC",sans-serif;max-width:62rem;margin:0 auto;padding:1rem 1.25rem 3rem;line-height:1.55;color:#1a222c;background:#fff}
+nav{font-size:.9rem;border-bottom:1px solid #ccd3dc;padding-bottom:.5rem;margin-bottom:1rem}
+nav a{margin-right:.7rem}
+h1{font-size:1.45rem;margin-bottom:.2em}
+h2{font-size:1.1rem;margin-top:1.7em;border-bottom:1px solid #dde3ea;padding-bottom:.2em}
+h3{font-size:1rem;margin-top:1.3em}
+code,pre{font-family:ui-monospace,SFMono-Regular,Menlo,Consolas,monospace;font-size:.85em}
+pre{background:#f5f7fa;border:1px solid #dde3ea;border-radius:6px;padding:.7rem .9rem;overflow-x:auto;line-height:1.35}
+.tbl{overflow-x:auto}
+table{border-collapse:collapse;font-size:.86rem}
+th,td{border:1px solid #ccd3dc;padding:.25rem .55rem;text-align:left;vertical-align:top}
+th{background:#eef1f5}
+.note{font-size:.88rem;color:#54606e}
+@media (prefers-color-scheme:dark){
+ body{background:#14181d;color:#dbe2ea}
+ pre{background:#1c2229;border-color:#2c343d}
+ th{background:#212932}
+ th,td{border-color:#2c343d}
+ nav,h2{border-color:#2c343d}
+ a{color:#7cb3ff}
+ .note{color:#9aa7b4}
+}
+</style>
+</head>
+<body>
+<nav>
+<a href="index.html">索引</a>
+<a href="conventions.html">慣例</a>
+<a href="conventions_latency.html">延遲預算</a>
+<a href="onnx_prepost.html">ONNX 邊界</a>
+<a href="ainr_dfn2.html">DFN2</a>
+<a href="ainr_dfn2_detail.html">DFN2 細節</a>
+<a href="ainr_dfn2_usage.html">DFN2 使用</a>
+<a href="ainr_dfn3.html">DFN3</a>
+<a href="ainr_dfn3_usage.html">DFN3 使用</a>
+<a href="ainr_gtcrn.html">GTCRN</a>
+<a href="ainr_gtcrn_usage.html"><b>GTCRN 使用</b></a>
+<a href="ainr_rnnoise_erb.html">RNNoise-ERB</a>
+<a href="ainr_rnnoise_erb_usage.html">RNNoise-ERB 使用</a>
+</nav>
+
+<h1>AINR GTCRN：如何呼叫、流程時序圖、外部／內部參數</h1>
+
+<h2>概要</h2>
+<p>GTCRN 沒有 pre/post 類別：整合者直接用 <code>gtcrn_process.h</code> 的函式，自己持有 framing 物件（<code>AcStft</code>／<code>AcIstft</code>）、<code>FftHandle</code>、兩張 ERB 矩陣與一份 <code>GTCRNModelState</code>。每個 hop（256 samples = 16 ms @16 kHz）一次加速器呼叫，從第 0 個 hop 就有輸出，模型本身 lookahead 為 0。模型內容、I/O 表、State 表見 <a href="ainr_gtcrn.html">ainr_gtcrn</a>。</p>
+
+<h2>如何呼叫使用</h2>
+<ol>
+<li><b>大小查詢與配置</b>（皆需 16-byte 對齊的呼叫端記憶體）：<code>fft_get_mem_size(512)</code> = 13,552 B；<code>ac_stft_get_mem_size()</code> = 8,288 B（自帶窗表）；<code>ac_istft_get_mem_size()</code> = 6,240 B（借用同一張窗）（皆本機量測）；<code>sizeof(GTCRNProcessState)</code> = 16 B（兩個物件指標）；<code>sizeof(GTCRNModelState)</code> = 84,868 B（八個 state 張量加一個 4-byte generation，64-bit 本機量測）。</li>
+<li>建立順序：<code>fft_init</code> → <code>gtcrn_framing_config(&amp;cfg, fft, NULL)</code> → <code>ac_stft_init</code> → <code>gtcrn_framing_config(&amp;cfg, fft, ac_stft_window(stft))</code> → <code>ac_istft_init</code> → <code>gtcrn_process_init(&amp;st, stft, istft)</code>（兩個物件借用、並一併 reset）。</li>
+<li><code>gtcrn_model_state_init(&amp;ms)</code>（generation = 1）；加速器那份定點 state 填成量化後的 0。</li>
+<li>ERB 矩陣：<code>erb_fwd.bin</code>（bin-major <code>[192][64]</code> float32）與 <code>erb_inv.bin</code>（band-major <code>[64][192]</code>），由 <code>export_erb_matrix.py --runtime-bins</code> 產生（各 12,288 個 float32 = 49,152 bytes），呼叫端載入成指標傳入；函式庫不讀檔。</li>
+<li>每個 hop：<code>gtcrn_analysis</code> → <code>gtcrn_model_input</code> → 加速器（11 個輸入：<code>mag</code>／<code>real</code>／<code>imag</code> 與八個 state；每個 <code>*_out</code> 綁在同一個 <code>GTCRNModelState</code> 欄位，先讀完所有 state 輸入才寫輸出）→ <code>gtcrn_model_state_validate</code> → <code>gtcrn_model_output</code> → <code>gtcrn_synthesis</code>。</li>
+<li>重新開始一段串流：<code>gtcrn_process_init</code>（重設 framing）＋ <code>gtcrn_model_state_reset</code>，並把加速器 state 重填量化零。<b>沒有 destroy</b>：所有記憶體都是呼叫端的。</li>
+</ol>
+<pre>#include &lt;stdlib.h&gt;
+#include "GTCRN/gtcrn_process.h"
+
+/* 目標平台: 11 個 graph input = mag/real/imag + GTCRNModelState 的 8 個欄位;
+ * 每個 *_out 綁到同一個欄位, 先讀完所有 state 輸入才寫輸出。 */
+extern int  npu_run(const float mag[GTCRN_MODEL_ERB_BANDS],
+                    const float re[GTCRN_MODEL_ERB_BANDS],
+                    const float im[GTCRN_MODEL_ERB_BANDS],
+                    GTCRNModelState *state,
+                    float mask_erb[GTCRN_MODEL_ERB_BANDS][2]);
+extern void npu_fill_state_with_quantized_zero(void);
+
+static void *carve(size_t bytes) { return aligned_alloc(16, (bytes + 15) / 16 * 16); }
+
+/* erb_fwd / erb_inv: export_erb_matrix.py --runtime-bins 產生的 .bin, 由呼叫端載入。 */
+int run_gtcrn(const float *erb_fwd, const float *erb_inv,
+              const float *in, float *out, long hops)
+{
+    static GTCRNModelState model_state;                /* 84,868 bytes, 同時是 NPU state buffer */
+    GTCRNProcessState st;
+    AcStftConfig fc;
+    int rc = 0;
+
+    FftHandle *fft = fft_init(carve(fft_get_mem_size(GTCRN_N_FFT)),
+                              fft_get_mem_size(GTCRN_N_FFT), GTCRN_N_FFT);
+    if (!fft) return -1;
+    gtcrn_framing_config(&amp;fc, fft, NULL);              /* 窗表由分析物件自帶 */
+    size_t stft_bytes = ac_stft_get_mem_size(&amp;fc);
+    AcStft *stft = ac_stft_init(carve(stft_bytes), stft_bytes, &amp;fc);
+    if (!stft) return -1;
+    gtcrn_framing_config(&amp;fc, fft, ac_stft_window(stft));   /* 合成物件借用同一張窗 */
+    size_t istft_bytes = ac_istft_get_mem_size(&amp;fc);
+    AcIstft *istft = ac_istft_init(carve(istft_bytes), istft_bytes, &amp;fc);
+    if (!istft) return -1;
+    gtcrn_process_init(&amp;st, stft, istft);
+
+    gtcrn_model_state_init(&amp;model_state);              /* generation = 1 */
+    unsigned seen = gtcrn_model_state_generation(&amp;model_state);
+    npu_fill_state_with_quantized_zero();
+
+    for (long h = 0; h &lt; hops &amp;&amp; rc == 0; ++h) {
+        float spec[GTCRN_N_BINS][2], enhanced[GTCRN_N_BINS][2];
+        float mag[GTCRN_MODEL_ERB_BANDS], re[GTCRN_MODEL_ERB_BANDS], im[GTCRN_MODEL_ERB_BANDS];
+        float mask[GTCRN_MODEL_ERB_BANDS][2];
+
+        gtcrn_analysis(&amp;st, in + h * GTCRN_HOP_LEN, spec);
+        gtcrn_model_input(spec, erb_fwd, mag, re, im);
+        if (gtcrn_model_state_generation(&amp;model_state) != seen) {
+            npu_fill_state_with_quantized_zero();
+            seen = gtcrn_model_state_generation(&amp;model_state);
+        }
+        if (npu_run(mag, re, im, &amp;model_state, mask) != 0 ||
+            gtcrn_model_state_validate(&amp;model_state) != 0) {
+            /* 失敗: state 已歸零 (validate) 或加速器未寫; 此框改為原樣通過 */
+            for (int k = 0; k &lt; GTCRN_MODEL_ERB_BANDS; ++k) { mask[k][0] = 1.0f; mask[k][1] = 0.0f; }
+        }
+        gtcrn_model_output(mask, erb_inv, spec, enhanced);
+        gtcrn_synthesis(&amp;st, enhanced, out + h * GTCRN_HOP_LEN);
+    }
+    return rc;
+}</pre>
+<p class="note">片語已在暫存副本以 <code>-std=c11 -Wall -Wextra -Wpedantic -Werror</code> 編譯通過；<code>npu_run</code> 由目標平台 runtime 提供。<code>gtcrn_analysis</code>／<code>gtcrn_synthesis</code> 等沒有回傳值；<code>gtcrn_model_state_validate</code> 回 0（全部有限）或 -1（NULL，或有 NaN／Inf——此時整個 state 已歸零、generation +1，前一份 state 不存在，寫一半而仍有限者偵測不到）。</p>
+
+<h2>流程時序圖</h2>
+<pre>
+caller                       gtcrn_process (C)                  NPU graph
+  |                                 |                                |
+  |== init ==========================|================================|
+  | fft_init / gtcrn_framing_config / ac_stft_init / ac_istft_init   |
+  | gtcrn_process_init(&amp;st,stft,istft) -> reset framing              |
+  | gtcrn_model_state_init(&amp;ms) -----> generation = 1                |
+  | ----------------------------- fill state with quantized 0 ------>|
+  |                                 |                                |
+  |== 每個 hop (含 hop 0) ===========|================================|
+  | gtcrn_analysis(in256) --------->| root-Hann + FFT512, 未正規化    |
+  | &lt;-------- spec[257][2] ----------|                                |
+  | gtcrn_model_input(spec,erb_fwd)&gt;| mag/real/imag 各 (1,129,1)      |
+  | model_state_generation() ------>| (變了 -&gt; 重填量化零) ----------->|
+  | ----------------------- run(mag,real,imag,state) ---------------->| 讀完 state 輸入再寫
+  | &lt;---------------------- mask_erb (1,129,1,2), state_out ----------| *_out 與輸入同位址
+  | gtcrn_model_state_validate(&amp;ms)>| NaN/Inf: 全部歸零, generation+1, -1
+  | gtcrn_model_output(mask,erb_inv,spec) -> enhanced[257][2]       |
+  | gtcrn_synthesis(enhanced) ----->| IFFT, root-Hann, OLA            |
+  | &lt;-------- out256 -----------------|                                |
+  |                                 |                                |
+  |== 失敗 (run 失敗或 validate = -1) ==============================|
+  |   此框的 mask 改用 unit (re=1, im=0) 使頻譜原樣通過; 下一個 hop 偵測到
+  |   generation 變了 -> 重填加速器 state。
+  |== reset ====== gtcrn_process_init + gtcrn_model_state_reset ======|
+</pre>
+<div class="tbl"><table>
+<tr><th>項目</th><th>值</th><th>出處</th></tr>
+<tr><td>hop</td><td>256 samples = 16 ms（FFT/win/hop = 512/512/256）</td><td><code>GTCRN_HOP_LEN</code></td></tr>
+<tr><td>模型 lookahead</td><td>0 框（時間 conv 全部左填充、inter RNN 單向）</td><td><a href="ainr_gtcrn.html">ainr_gtcrn</a></td></tr>
+<tr><td>端到端延遲</td><td>WOLA 重疊 win − hop = 256 samples = 16 ms</td><td><a href="ainr_gtcrn.html">ainr_gtcrn</a></td></tr>
+<tr><td>warm-up</td><td>第 0 個 hop 即有輸出；起始 framing 以零填充，conv／TRA／inter cache 由零起始</td><td><a href="ainr_gtcrn.html">ainr_gtcrn</a></td></tr>
+</table></div>
+
+<h2>函式清單：公開 vs 內部</h2>
+<div class="tbl"><table>
+<tr><th>分類</th><th>函式（<code>gtcrn_process.h</code>）</th></tr>
+<tr><td><b>公開（整合者呼叫）</b></td><td><code>gtcrn_framing_config</code>、<code>gtcrn_process_init</code>、<code>gtcrn_analysis</code>、<code>gtcrn_model_input</code>、<code>gtcrn_model_output</code>、<code>gtcrn_synthesis</code>、<code>gtcrn_model_state_init</code>、<code>gtcrn_model_state_reset</code>、<code>gtcrn_model_state_validate</code>、<code>gtcrn_model_state_generation</code>、<code>gtcrn_simd_backend</code></td></tr>
+<tr><td><b>內部（<code>static</code>，<code>gtcrn_process.c</code>）</b></td><td><code>erb_band3</code>／<code>erb_band3_neon</code>、<code>mask_expand</code>／<code>mask_expand_neon</code>、<code>all_finite</code>、<code>state_tensors</code></td></tr>
+</table></div>
+
+<h2>參數表</h2>
+<h3>外部：第三方可調</h3>
+<div class="tbl"><table>
+<tr><th>名稱</th><th>位置</th><th>型別／範圍</th><th>預設</th><th>何時設定</th><th>說明</th></tr>
+<tr><td><code>fft</code></td><td><code>gtcrn_framing_config(cfg, fft, window)</code></td><td><code>FftHandle*</code>，512 點</td><td>—</td><td>建立 framing 物件時</td><td>兩個物件共用同一個 handle（依序執行）；borrowed</td></tr>
+<tr><td><code>window</code></td><td>同上</td><td><code>GTCRN_WIN_LEN</code>(512) 個 float 或 NULL</td><td>NULL</td><td>建立時</td><td>NULL＝分析物件自帶 root-Hann，合成物件借用 <code>ac_stft_window()</code>；借用的表須與物件同壽命且不變</td></tr>
+<tr><td><code>erb_fwd</code></td><td><code>gtcrn_model_input</code> 參數</td><td><code>const float*</code>，bin-major [192][64]</td><td>—</td><td>每個 hop 傳入</td><td>呼叫端載入 <code>erb_fwd.bin</code>，可隨時替換檔案，不需重編譯；但須與 checkpoint 的 ERB 設定相符</td></tr>
+<tr><td><code>erb_inv</code></td><td><code>gtcrn_model_output</code> 參數</td><td><code>const float*</code>，band-major [64][192]</td><td>—</td><td>每個 hop 傳入</td><td>呼叫端載入 <code>erb_inv.bin</code></td></tr>
+<tr><td><code>GTCRNModelState</code></td><td>呼叫端配置</td><td>84,868 B</td><td>—</td><td><code>_state_init</code>；重置用 <code>_state_reset</code></td><td>同時是 NPU 的 state buffer；加速器端定點 state 由呼叫端依 <code>_state_generation()</code> 重填</td></tr>
+<tr><td>Python CLI</td><td><code>GTCRN/inference.py</code>、<code>export_onnx.py</code>、<code>export_erb_matrix.py</code></td><td><code>--config</code>／<code>--model</code>／<code>--input</code>／<code>--output</code>／<code>--input-dir</code>／<code>--output-dir</code>；calib：<code>--wav-dir</code>／<code>--output</code>／<code>--format</code>(bin|npz)／<code>--frames</code>(256)／<code>--seed</code>(42)／<code>--onnx</code>；<code>--opset</code>(17)／<code>--verify</code>；<code>--runtime-bins</code></td><td>—</td><td>離線推論、PTQ 校正、匯出</td><td>GTCRN 沒有衰減上限或強度旋鈕（C 與 Python 皆無）</td></tr>
+</table></div>
+<h3>內部：存在且可改，但不建議開放</h3>
+<div class="tbl"><table>
+<tr><th>名稱</th><th>值</th><th>位置</th><th>不開放的原因</th></tr>
+<tr><td><code>GTCRN_SR</code>／<code>_N_FFT</code>／<code>_N_BINS</code>／<code>_WIN_LEN</code>／<code>_HOP_LEN</code></td><td>16000／512／257／512／256</td><td><code>gtcrn_process.h</code></td><td>與 checkpoint 的 signal contract 綁定；只有這一組 grid；STFT 不縮放（<code>spec_scale</code> = <code>ispec_scale</code> = 1）</td></tr>
+<tr><td><code>GTCRN_MODEL_ERB_KEPT</code>／<code>_HIGH_BANDS</code>／<code>_BANDS</code>／<code>_HIGH_BINS</code></td><td>65／64／129／192</td><td><code>gtcrn_process.h</code></td><td>ERB 前後端的矩陣尺寸；graph I/O 在任何 n_fft 下都是 129 帶</td></tr>
+<tr><td><code>GTCRN_MODEL_CONV_STATES</code>／<code>_CONV_CHANNELS</code>／<code>_CONV_WINDOW_0..2</code>／<code>_CONV_FREQ</code></td><td>6／16／3,5,11／33</td><td><code>gtcrn_process.h</code></td><td>depth-conv 完整因果 window 的形狀；decoder 與 encoder 反向</td></tr>
+<tr><td><code>GTCRN_MODEL_TRA_GRUS</code>／<code>_TRA_HIDDEN</code>、<code>_DPGRNN_GRUS</code>／<code>_DPGRNN_FREQ</code>／<code>_DPGRNN_HIDDEN</code></td><td>6／16、4／33／8</td><td><code>gtcrn_process.h</code></td><td><code>h_tra</code>、<code>h_dpgrnn</code> 的形狀</td></tr>
+<tr><td><code>GTCRN_MODEL_LAYOUT_VERSION</code></td><td>8（3–7 已退役）</td><td><code>gtcrn_process.h</code></td><td>與 <code>export_onnx.py</code> 的 <code>STATE_LAYOUT_VERSION</code> 互鎖，是拒絕舊圖的唯一閘門</td></tr>
+<tr><td><code>GTCRNModelState.state_generation</code></td><td>init 後 1，reset 與被拒的 validate 各 +1（mod 2^32）</td><td><code>gtcrn_process.h</code></td><td>由函式庫維護；呼叫端只讀，不可自行寫入</td></tr>
+<tr><td>訓練端 <code>config.ini</code> 的 <code>[signal]</code>／<code>erb_subband_1</code>／<code>erb_subband_2</code></td><td>65／64</td><td>Python</td><td>寫進 checkpoint contract，<code>inference.py</code> 逐項比對</td></tr>
+</table></div>
+
+<h2>相關檔案與測試路徑</h2>
+<ul>
+<li><code>AINR/GTCRN/gtcrn_process.c</code> / <code>.h</code>；匯出：<code>stream_model.py</code>、<code>export_onnx.py</code>、<code>export_erb_matrix.py</code></li>
+<li>測試：<code>AINR/tests/test_c_prepost.c</code>（<code>test_gtcrn_model_state</code>、<code>test_gtcrn_state_evolution</code>、<code>test_gtcrn</code>）、<code>AINR/GTCRN/tests/test_gtcrn_export_contract.py</code>、<code>AINR/tests/test_gtcrn_stream_export.py</code></li>
+<li>同類頁面：<a href="ainr_gtcrn.html">ainr_gtcrn</a>、<a href="onnx_prepost.html">onnx_prepost</a>、<a href="conventions.html">conventions</a>、<a href="index.html">index</a></li>
+<li>文件：<a href="../../AINR/GTCRN/README.md">README.md</a>、<a href="../../AINR/GTCRN/docs/architecture_notes.md">architecture_notes.md</a></li>
+</ul>
+</body>
+</html>

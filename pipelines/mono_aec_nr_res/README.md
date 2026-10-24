@@ -30,6 +30,46 @@ ac_istft_push(istft, spec, out);
 Strength: `aec_set_preset(aec, preset, ramp_ms)` for the AEC's RES gain,
 `anr_set_mode(anr, mode)` for the denoiser.
 
+## Calling sequence
+
+```
+App                      Aec                 AnrDenoiser        AcIstft
+ |-- se_derive(&req,&rules,&grid,&aec_cfg)                       (derive_lane())
+ |-- aec_get_mem_size / aec_init ---->|                          (rig_build())
+ |-- anr_config_for_mode_grid; anr_get_mem_size / anr_init ----->|
+ |-- ac_stft_config_default; ac_istft_get_mem_size / ac_istft_init ---------->|
+ |   per hop: aec_process_context --> se_frame_from_aec --> se_anr_stage_gain --> sk_min_f32
+ |            --> sk_capply_gain_f32 --> aec_cng_fill --> ac_istft_push --> out   (process_hop())
+ |   refused hop or non-finite out: aec_reset + anr_reset + ac_istft_reset + rng = SE_CNG_RNG_SEED  (rig_reset())
+ |-- aec_set_preset(...) / anr_set_mode(...) between two hops
+ |-- anr_destroy; aec_destroy; release the block (AcIstft has no destroy)
+```
+
+One hop is `grid.hop_size` samples (128 at 8 kHz and at the 16 kHz default, 256 at 16 kHz/512, 512 at
+48 kHz); the output trails the input by that one hop (the synthesis), `--aec-only` by none.
+Per-flow detail with return values: section 0 of
+[`../../docs/integration_mono_zh_TW.md`](../../docs/integration_mono_zh_TW.md).
+
+Command line of the three programs (`main.c`, `static_main.c`; `example_board_adapter.c` takes none):
+
+| Argument | Meaning | Default |
+|---|---|---|
+| fourth positional (`mild`, `balanced`, `aggressive`, `no_floor`, or `0`..`3`) | AEC preset (`AecPreset`); an unknown word falls back to `balanced` | `balanced` |
+| `--nr-preset mild\|moderate\|balanced\|aggressive` | `AnrMode` | `balanced` |
+| `--aec-only` | only the `Aec` (`aec_process()`), no NR, RES gain, comfort noise or synthesis | off |
+| `--no-nr`, `--no-res`, `--no-cng` | leave out the denoiser, the RES gain, the comfort noise | off |
+| `--legacy-amin` | the denoiser's noise floor without the residual-echo powers (`use_r2 = 0`) | off |
+| `--fft-size 256\|512\|1024` | grid; 0 = the rate's default | 0 |
+| `--debug`, `--timing` | once-per-second status line; per-stage cost at exit (`make PROFILE=1` for the AEC rows) | off |
+| `--sample-rate <hz>` (`static_main --print-mem-size` only) | the rate of the pool query | 16000 |
+
+Public functions an integrator copies from these mains: the ones in the sequence above and `aec_debug_status()`,
+`anr_debug_status()`. Internal (not for application code): the AEC and NR headers other than
+`aec.h`, `aec_res.h`, `anr.h`. External parameters: `SeRequest` (rate, FFT size, `filter_length`, delay
+mode, `delay_num_filters`, `fixed_delay_samples`, AEC preset), `AnrMode`, the three switches above.
+Internal: the remaining `AecConfig` and `AnrConfig` fields, including the denoiser's `L` and
+`num_init_frames` (pool-sizing); classification with header lines in section 0.3 of the manual above.
+
 The top-level `pipelines/Makefile` owns the actual build so all applications
 share one backend/SIMD configuration contract:
 

@@ -135,6 +135,7 @@ def test_the_scan_actually_reaches_the_pages_that_publish_versions():
 # there.
 _CARVE_SOURCES = {
     'DFN2_PREPOST_CARVE_VERSION': 'AINR/DeepFilterNet2/dfn2_prepost.h',
+    'DFN3_PREPOST_CARVE_VERSION': 'AINR/DeepFilterNet3/dfn3_prepost.h',
     'ULCNET_PREPOST_CARVE_VERSION': 'AIAEC/Align_ULCNet/ulcnet_prepost.h',
     'DEEPVQE_PREPOST_CARVE_VERSION': 'AIAEC/DeepVQE_S/deepvqe_prepost.h',
 }

@@ -25,6 +25,9 @@ th{background:#f5efe8}
 <a href="pipeline_4ch.html">pipeline_4ch</a>
 <a href="pipeline_ulcnet_mono.html">pipeline_ulcnet_mono</a>
 <a href="pipeline_ulcnet_4ch.html">pipeline_ulcnet_4ch</a>
+<a href="pipeline_ulcnet_usage.html">呼叫</a>
+<a href="pipeline_ulcnet_sequence.html">時序圖</a>
+<a href="pipeline_ulcnet_params.html">參數表</a>
 <a href="pipeline_ulcnet_detail.html"><b>pipeline_ulcnet_detail</b></a>
 <a href="aiaec_align_ulcnet.html">aiaec_align_ulcnet</a>
 </nav>
@@ -71,14 +74,21 @@ th{background:#f5efe8}
 <p>邊界後不 step 模型(identity reprime),是為了不讓 recurrent state 由半舊幀重建。</p>
 <h3>4ch(<code>AudioPipeline4Ch</code> + <code>ulcnet_nn_stage</code>)</h3>
 <p><code>model-&gt;reset</code> 清掉 runtime 的 K/V history、logit history 與 GRU h,但 C 側 framing 狀態是<b>連續跑</b>的(核心 lane 的分析、stage 的 far 分析與 synthesis 都不清):邊界當下還在飛的分析窗仍<b>跨在邊界上</b>。在那種幀上 step 模型,等於用半舊的 err/far 幀對把剛清掉的 state 重建回去。</p>
-<p>政策:從邊界 hop 起的 <code>ULCNET_NN_STAGE_REPRIME_FRAMES</code>(兩個範例共用同一個常數)個發射幀走 identity(誤差原樣)且<b>完全不呼叫 infer</b>——K/V、logit、GRU 都不前進;等到 err 與 far 兩路分析窗都只含切換後的 hop,才同時恢復 step 與 apply。reprime 期間再來一次邊界會重新武裝(不累加);<code>ulcnet_nn_stage_reset()</code> 會把它歸零(該路徑會 re-init 兩個 chain 結構,history 已清空)。compute 只會少 1 幀推論,不會加倍。</p>
-<p><b>常數 = 1,而且是量出來的</b>(<code>samples/ulcnet_nn_stage.h</code>)。推導:兩個分支都從<b>當前</b> input hop 取幀(hop T 的 GSC 頻譜、以及用 hop T 推入的 far 分析),而每個 50%-overlap 幀橫跨兩個 hop,所以只有邊界 hop T 發射的那一幀還蓋到切換前的 hop T−1,hop T+1 的幀已經只含切換後的兩個 hop。這與 mono 範例的 1 相同(mono 同樣兩路都從當前 hop 取幀)。<code>4ch_alignulcnet/tests/test_4ch_ulcnet.c</code> 與 <code>mono_alignulcnet/tests/test_mono_ulcnet.c</code> 的 <code>test_reprime_straddle_derivation()</code> 用「切換前最後一個 input hop 正中央打一個單位脈衝、其餘全靜音」在一個<b>完全沒有邊界</b>的對照跑(FIXED delay 0)裡量,所以 reprime 邏輯不參與量自己;兩路分開標記。</p>
+<p>政策:從邊界 hop 起的 <code>ULCNET_NN_STAGE_REPRIME_FRAMES</code>(兩個範例共用同一個常數)個發射幀走 identity(誤差原樣)且<b>完全不呼叫 infer</b>——K/V、logit、GRU 都不前進;等到 err 與 far 兩路分析窗都只含切換後的 hop,才同時恢復 step 與 apply。reprime 期間再來一次邊界會重新武裝(不累加);<code>ulcnet_nn_stage_reset()</code> 會把它歸零(同時 reset far 分析與 synthesis 的 <code>AcStft</code>/<code>AcIstft</code>,history 已清空,不存在跨界幀)。compute 只會少 1 幀推論,不會加倍。</p>
+<p><b>常數 = 1,而且是量出來的</b>(<code>samples/ulcnet_nn_stage.h</code>)。推導:兩個分支都從<b>當前</b> input hop 取幀(hop T 的 BF 頻譜(<code>beam.spectrum</code>)、以及用 hop T 推入的 far 分析),而每個 50%-overlap 幀橫跨兩個 hop,所以只有邊界 hop T 發射的那一幀還蓋到切換前的 hop T−1,hop T+1 的幀已經只含切換後的兩個 hop。這與 mono 範例的 1 相同(mono 同樣兩路都從當前 hop 取幀)。<code>4ch_alignulcnet/tests/test_4ch_ulcnet.c</code> 與 <code>mono_alignulcnet/tests/test_mono_ulcnet.c</code> 的 <code>test_reprime_straddle_derivation()</code> 用「切換前最後一個 input hop 正中央打一個單位脈衝、其餘全靜音」在一個<b>完全沒有邊界</b>的對照跑(FIXED delay 0)裡量,所以 reprime 邏輯不參與量自己;兩路分開標記。</p>
 <table>
 <tr><th>grid</th><th>ERROR 路</th><th>FAR 路</th><th>邊界後第一個模型可見幀</th></tr>
-<tr><td>16 kHz / 512</td><td><b>1</b> 個跨界幀;marked peak ≥ 0.6761 vs unmarked ≤ 1.256e-02</td><td><b>1</b>;marked peak ≥ 0.7071 vs unmarked 0.000e+00</td><td>邊界 hop T=8 → hop 9(兩路皆無切換前樣本)</td></tr>
-<tr><td>48 kHz / 1024</td><td>2;marked ≥ 0.0602 vs unmarked ≤ 1.144e-03(見下)</td><td><b>1</b>;marked ≥ 0.7071 vs unmarked 0.000e+00</td><td>同樣是 hop 9</td></tr>
+<tr><td>16 kHz / 512</td><td><b>1</b> 個跨界幀;marked peak ≥ 0.7072 vs unmarked ≤ 1.257e-02(mono);≥ 0.6761 vs ≤ 1.256e-02(4ch)</td><td><b>1</b>;marked peak ≥ 0.7071 vs unmarked 0.000e+00</td><td>邊界 hop T=8 → hop 9(兩路皆無切換前樣本)</td></tr>
+<tr><td>48 kHz / 1024</td><td>2;marked ≥ 0.0602 vs unmarked ≤ 1.144e-03(mono 與 4ch 相同;見下)</td><td><b>1</b>;marked ≥ 0.7071 vs unmarked 0.000e+00</td><td>同樣是 hop 9</td></tr>
 </table>
-<p>FAR 路是<b>推導</b>(斷言 == 常數),ERROR 路只是<b>上界</b>(斷言 &gt;= 常數):error 標記要先穿過 AEC 濾波器,量到的含因果尾音,48 kHz 下 filter length 由 52 ms 變成 64 ms(3.25 → 6.00 hops)因此多算一幀——那是尾音不是 straddle,straddle 在兩個 grid 都是一個 hop。Mutation 已驗:REPRIME 改 0 紅、改 2 紅、far 分支延一個 hop 紅(+256)。</p>
-<p>option B(邊界後照常 step、輸出也照常套用)<b>暫緩</b>,要先做音檔 A/B 才能換。</p>
+<p>FAR 路是<b>推導</b>(斷言 == 常數),ERROR 路只是<b>上界</b>(斷言 &gt;= 常數):error 標記要先穿過 AEC 濾波器,量到的含因果尾音,48 kHz 下 filter length 由 52 ms 變成 64 ms(3.25 → 6.00 hops)因此多算一幀——那是尾音不是 straddle,straddle 在兩個 grid 都是一個 hop。</p>
+
+<h2>相關檔案與測試路徑</h2>
+<ul>
+<li><code>pipelines/samples/ulcnet_nn_stage.h / .c</code>(<code>ULCNET_NN_STAGE_REPRIME_FRAMES</code>、<code>gate_delay()</code>)</li>
+<li><code>AIAEC/Align_ULCNet/ulcnet_accelerator_adapter.h / .c</code>、<code>ulcnet_prepost.h / .c</code>、<code>ulcnet_model_io.h / .c</code>、<code>ulcnet_process.h / .c</code>、<code>export_onnx.py</code></li>
+<li><code>pipelines/mono_alignulcnet/tests/test_mono_ulcnet.c</code>、<code>pipelines/4ch_alignulcnet/tests/test_4ch_ulcnet.c</code>(<code>test_reprime_straddle_derivation()</code>、<code>test_reprime_behavior()</code>)、<code>pipelines/samples/tests/test_ulcnet_nn_stage.c</code>、<code>AIAEC/tests/test_ulcnet_accelerator_adapter.c</code></li>
+<li>各頁:<a href="pipeline_ulcnet_mono.html">pipeline_ulcnet_mono</a>、<a href="pipeline_ulcnet_4ch.html">pipeline_ulcnet_4ch</a>、<a href="pipeline_ulcnet_usage.html">pipeline_ulcnet_usage</a>、<a href="pipeline_ulcnet_params.html">pipeline_ulcnet_params</a>、<a href="aiaec_align_ulcnet.html">aiaec_align_ulcnet</a>、<a href="onnx_prepost.html">onnx_prepost</a>、<a href="index.html">index</a>。</li>
+</ul>
 </body>
 </html>

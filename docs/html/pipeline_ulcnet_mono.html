@@ -25,6 +25,9 @@ th{background:#f5efe8}
 <a href="pipeline_4ch.html">pipeline_4ch</a>
 <a href="pipeline_ulcnet_mono.html"><b>pipeline_ulcnet_mono</b></a>
 <a href="pipeline_ulcnet_4ch.html">pipeline_ulcnet_4ch</a>
+<a href="pipeline_ulcnet_usage.html">呼叫</a>
+<a href="pipeline_ulcnet_sequence.html">時序圖</a>
+<a href="pipeline_ulcnet_params.html">參數表</a>
 <a href="pipeline_ulcnet_detail.html">pipeline_ulcnet_detail</a>
 </nav>
 <h1>mono AEC(linear) → Align-ULCNet NN 後級(<code>Aec</code> + <code>ulcnet_nn_stage</code>)</h1>
@@ -45,50 +48,17 @@ th{background:#f5efe8}
 <p><code>AIAEC/Align_ULCNet/ulcnet_accelerator_adapter.{h,c}</code> 是「graph 內」那格的參考實作:accelerator 的單次呼叫無狀態(<code>UlcnetAcceleratorRun run(user, inputs, outputs)</code>,一次一幀),K/V window、attention-logit window、GRU hidden 由 <b>CPU 端 <code>UlcnetModelIoState</code></b> 的 caller-owned pool 在呼叫之間保存,每個 <code>*_out</code> 就地綁定到同名輸入的位址(export metadata <code>state_binding = in_place_same_address</code>)。state 張量的排列、每幀 prepare → run → commit-or-discard 交易與記憶體大小見 <a href="pipeline_ulcnet_detail.html">pipeline_ulcnet_detail</a>。</p>
 
 <h2>API 用法</h2>
-<pre>/* lane: 固定格點(ULCNET_SR / ULCNET_N_FFT), delay 規則由命令列 profile 填 */
-static const SeRules rules = { .fixed_rate = ULCNET_SR, .fixed_fft = ULCNET_N_FFT,
-                               .spatial_context = AEC_CONTEXT_LINEAR_ONLY };
-SeRequest req = {0};  /* sample_rate = ULCNET_SR, fft_size = ULCNET_N_FFT, delay_mode/num_filters/fixed_delay, aec_preset */
-SeGrid grid;  AecConfig aec_cfg;
-se_derive(&amp;req, &amp;rules, &amp;grid, &amp;aec_cfg);
-
-/* 推薦路徑:用 accelerator adapter 包一個無狀態 run() callback(main.c 範例) */
-UlcnetModelIoDescriptor descriptor;
-size_t adapter_bytes, adapter_align;
-ulcnet_model_io_descriptor_default(8 /* export-time D */, &amp;descriptor);
-ulcnet_accelerator_adapter_get_mem_size(&amp;descriptor, &amp;adapter_bytes, &amp;adapter_align);
-void* adapter_pool = platform_alloc(adapter_bytes, adapter_align);
-UlcnetAcceleratorAdapter* adapter = ulcnet_accelerator_adapter_init(
-    adapter_pool, adapter_bytes, &amp;descriptor,
-    board_run_stateless_tensor_invocation, NULL);
-
-/* 各自查大小、切塊、init: AEC 一塊, stage 一塊(1 = 另帶時域 error 分析用的 STFT) */
-size_t aec_b = aec_get_mem_size(&amp;aec_cfg), stage_b = ulcnet_nn_stage_mem_size(1);
-void* pool = platform_alloc(ALIGN16(aec_b) + stage_b, 16);
-Aec* aec = aec_init(pool, aec_b, &amp;aec_cfg);
-UlcnetNnStage* stage = ulcnet_nn_stage_init((uint8_t*)pool + ALIGN16(aec_b), stage_b, 1);
-UlcnetModel model = ulcnet_accelerator_adapter_model(adapter);   /* 帶 raw-far descriptor */
-ulcnet_nn_stage_set_model(stage, &amp;model);                       /* raw descriptor 以外會 reject */
-
-while (stream) {   /* mic/ref/out 各 ULCNET_HOP floats */
-    AecResContext rctx;  AecLinearContext lctx;  UlcnetNnDelay delay;
-    aec_process_context(aec, mic, ref);
-    aec_get_res_context(aec, &amp;rctx);  aec_get_linear_context(aec, &amp;lctx);
-    delay.changed = lctx.delay_state == AEC_LINEAR_DELAY_CHANGED;
-    delay.solid   = lctx.delay_state != AEC_LINEAR_DELAY_UNLOCKED;
-    ulcnet_nn_stage_begin_time(stage, rctx.formed_hop, ref, delay);   /* err／far 分析 */
-    ulcnet_nn_stage_process(stage, out);                              /* 模型回呼 + WOLA */
-}
-aec_reset(aec);  ulcnet_nn_stage_reset(stage);   /* 一起 reset; 也呼叫 model-&gt;reset */
-platform_free(pool);                               /* stage 與 Aec 的 pool 由 caller 釋放 */</pre>
-<p>板端把推論留給 NPU 時,同一個 hop 拆成四個呼叫(模型的 <code>infer</code> 回呼因此可以不設;<code>reset</code> 回呼若有設,邊界與 <code>reset()</code> 時仍會被呼叫):</p>
-<pre>UlcnetNnJob job;
-ulcnet_nn_stage_begin_time(stage, rctx.formed_hop, ref, delay);  /* err／far 兩路分析, reprime／model reset */
-if (ulcnet_nn_stage_nn_begin(stage, &amp;job) &gt; 0) {              /* 1 = 有一幀要跑;0 = 本 hop 無模型幀(reprime) */
-    int rc = board_run_ulcnet_on_npu(&amp;job);                  /* job.err_*、job.far_*;寫滿 job.out_*(預填 NaN) */
-    ulcnet_nn_stage_nn_end(stage, rc);                         /* rc==0 且每個 bin 有限才採用,否則 identity */
-}
-ulcnet_nn_stage_end(stage, out);                               /* WOLA,剛好一個 hop */</pre>
+<p>呼叫順序:<code>se_derive()</code>(固定格點、context-only 的 lane)→ <code>ulcnet_model_io_descriptor_default(D, &amp;desc)</code> → <code>ulcnet_accelerator_adapter_get_mem_size()</code> / <code>_init()</code> → <code>aec_get_mem_size()</code>、<code>ulcnet_nn_stage_mem_size(1)</code> → 切塊 <code>aec_init()</code>、<code>ulcnet_nn_stage_init()</code> → <code>ulcnet_accelerator_adapter_model()</code> 交給 <code>ulcnet_nn_stage_set_model()</code> → 每 hop 一次(<code>aec_process_context</code>、取 context、<code>ulcnet_nn_stage_begin_time</code>、<code>ulcnet_nn_stage_process</code>)→ destroy。完整可編譯範例(含 phased 變體)、流程時序圖與參數表收在 <a href="pipeline_ulcnet_usage.html">pipeline_ulcnet_usage</a>、<a href="pipeline_ulcnet_sequence.html">pipeline_ulcnet_sequence</a> 與 <a href="pipeline_ulcnet_params.html">pipeline_ulcnet_params</a>。每 hop 的核心如下:</p>
+<pre>AecResContext rctx;  AecLinearContext lctx;  UlcnetNnDelay delay;
+aec_process_context(aec, mic, ref);                                  /* mic/ref/out 各 ULCNET_HOP 個 float */
+aec_get_res_context(aec, &amp;rctx);  aec_get_linear_context(aec, &amp;lctx);
+delay.changed = lctx.delay_state == AEC_LINEAR_DELAY_CHANGED;
+delay.solid   = lctx.delay_state != AEC_LINEAR_DELAY_UNLOCKED;
+ulcnet_nn_stage_begin_time(stage, rctx.formed_hop, ref, delay);      /* err／far 兩路分析;模型的 far = 原始 ref */
+ulcnet_nn_stage_process(stage, out);                                 /* 已安裝的模型回呼 + WOLA */
+/* 或 ulcnet_nn_stage_nn_begin() → 在 NPU 上跑 → ulcnet_nn_stage_nn_end(rc) → ulcnet_nn_stage_end(stage, out) */
+/* 任一步回負值: aec_reset(aec); ulcnet_nn_stage_reset(stage);  (後者也呼叫 model-&gt;reset) */</pre>
+<p>板端把推論留給 NPU 時,同一個 hop 拆成 <code>nn_begin</code>／<code>nn_end</code>／<code>end</code>(模型的 <code>infer</code> 回呼因此可以不設;<code>reset</code> 回呼若有設,邊界與 <code>reset()</code> 時仍會被呼叫)。</p>
 <p><code>ulcnet_nn_stage_process()</code> 就是這個序列加上 stage 設定的模型回呼;<code>nn_begin</code> 回 1、0 或負值(序列錯誤),開著沒取走或沒關閉的幀走 identity(fail-open)。mono 範例每 hop 以 <code>aec_get_res_context()</code> 的 <code>formed_hop</code> 走 <code>ulcnet_nn_stage_begin_time()</code> 做 error 分析(不重用 AEC 的頻譜),所以兩路分析都在 begin 內;4ch 範例則用 <code>ulcnet_nn_stage_begin_complex()</code> 直接吃 BF 頻譜。任何一步回負值,整合者把 <code>Aec</code> 與 stage 一起 reset。</p>
 <p class="note"><b>沒有執行期強度 setter,而且是刻意的。</b><code>pipeline_mono</code> 與 <code>pipeline_4ch</code> 的後級有 <code>aec_set_preset()</code> / <code>anr_set_mode()</code>,本範例 <b>兩個都不提供</b>——因為它沒有可以重新指定的強度面。這條範例完全沒有 NR 實例(<code>anr_*</code> 在 <code>main.c</code> 與 stage 一次都沒出現);AEC 側以 <code>enable_res=0</code> / <code>return_res_context=1</code> / <code>spatial_linear_context=AEC_CONTEXT_LINEAR_ONLY</code> 建立:post 區塊在 AecState 更新後停止,<code>G_res</code>、R²、comfort noise 都不計算(<code>res_gain</code>/<code>r2</code>/<code>comfort_noise</code> 為 NULL),範例只讀 <code>formed_hop</code> 與線性 context 的 <code>delay_state</code>(模型的 far 取 caller 的 raw <code>ref</code>)——塑形輸出的是 ULCNet 的 mask。所以「回音壓多深」在這裡是模型的性質,不是一個 runtime 旋鈕。<code>aec_preset</code> 仍是 <code>SeRequest</code> 要填的欄位(須為定義內的 enum 值),但它只決定那個不執行的抑制器的地板。要改強度,請重新訓練/更換模型,或改用有 DSP 後級的 <code>pipeline_mono</code>。</p>
 <p class="note"><b>模型 error 分支不保證每個 hop 都是誤差。</b>context-only(<code>enable_res=0</code> / <code>return_res_context=1</code>)是 <code>lib/aec</code> 唯一開放 formed capture 候選的模式:上一個 hop 的濾波品質判定尚未認可線性估計、且被選中的殘差在這個 hop 的能量大於同一 hop 的 mic capture 時,<code>formed_hop</code> 與 <code>error_spec</code> 一起改送 capture 本身(時域與頻譜同步切換,既有 30-sample crossfade 承接邊界)。所以「濾波器在加訊號」的 hop 上模型看到的是 mic 原樣;<code>AIAEC/dataset_gen/linear_aec.py</code> 產生訓練用 linear error 時走的是同一組設定。</p>
@@ -103,7 +73,7 @@ ulcnet_nn_stage_end(stage, out);                               /* WOLA,剛好一
 </ul>
 
 <h3>Identity reprime(alignment 邊界,option A)</h3>
-<p>alignment 邊界(MATCHED 的 <code>AEC_LINEAR_DELAY_CHANGED</code>、FIXED 首次 <code>UNLOCKED→LOCKED</code>)呼叫 <code>model-&gt;reset</code> 後,從邊界 hop 起的 <code>ULCNET_NN_STAGE_REPRIME_FRAMES</code>(= 1)個發射幀走 identity(誤差原樣)且完全不呼叫 infer;之後才同時恢復 step 與 apply。常數是在無邊界對照跑中用脈衝標記量出的,推導、實測數字與 option B 暫緩的理由見 <a href="pipeline_ulcnet_detail.html">pipeline_ulcnet_detail</a>。</p>
+<p>alignment 邊界(MATCHED 的 <code>AEC_LINEAR_DELAY_CHANGED</code>、FIXED 首次 <code>UNLOCKED→LOCKED</code>)呼叫 <code>model-&gt;reset</code> 後,從邊界 hop 起的 <code>ULCNET_NN_STAGE_REPRIME_FRAMES</code>(= 1)個發射幀走 identity(誤差原樣)且完全不呼叫 infer;之後才同時恢復 step 與 apply。常數是在無邊界對照跑中用脈衝標記量出的,推導與兩個 grid 的實測數字見 <a href="pipeline_ulcnet_detail.html">pipeline_ulcnet_detail</a>。</p>
 
 <h2>Block diagram(每 hop 程式流)</h2>
 <pre>ulcnet_nn_stage_process(stage, out)
@@ -163,11 +133,11 @@ out             全零 256          hop#0 內容            hop p-1 內容
 <p>Pool 切分(<code>main.c</code>,每塊 16-byte 對齊):<code>Aec</code> pool → <code>UlcnetNnStage</code> pool(<code>ulcnet_nn_stage_mem_size(1)</code>)。stage 內部 carve 順序:控制塊(delay-transition bookkeeping、reprime 計數器、共用視窗表與幀 scratch)→ 共用 compiled-grid <code>FftHandle</code> → 兩個分析 <code>AcStft</code> → 合成 <code>AcIstft</code>(三者借用該 handle 與視窗表)。stage 是範例碼,沒有 layout version 或 descriptor;mono 的 <code>Aec</code> 也沒有。大小隨編譯期格點:幀 scratch 為 1 幀;n=5 build:16 kHz 為 534,240 B(<code>Aec</code> 491,600 B + stage 42,640 B),48 kHz 為 1,240,656 B(<code>mono_alignulcnet</code> 執行檔的 banner;以自己 build 的 banner 為準)。控制塊另有 phased API 的相位與 job 狀態(<code>phase</code>、<code>nn_wanted</code>、<code>nn_accepted</code>)。<b>換 grid/backend/編譯選項/submodule 都必須現查大小並重新 init。</b></p>
 <table>
 <tr><th>state</th><th>shape / size</th><th>存放者</th><th>備註</th></tr>
-<tr><td><code>Aec</code> 全狀態</td><td>491,600 B(16 kHz/512,<code>aec_get_mem_size()</code>)</td><td>pool(C struct)</td><td><code>enable_res=0 / return_res_context=1 / spatial_linear_context=AEC_CONTEXT_LINEAR_ONLY</code>(只留線性半邊,線性輸出與完整 context 逐位元相同,省約 11–14 % 的 AEC 時間);delay estimation 開</td></tr>
+<tr><td><code>Aec</code> 全狀態</td><td>491,600 B(16 kHz/512,<code>aec_get_mem_size()</code>)</td><td>pool(C struct)</td><td><code>enable_res=0 / return_res_context=1 / spatial_linear_context=AEC_CONTEXT_LINEAR_ONLY</code>(只留線性半邊,線性輸出與完整 context 逐位元相同,<code>lib/aec</code> 的 <code>test_process_context</code> 釘住);delay estimation 開</td></tr>
 <tr><td><code>FftHandle</code>(共用)</td><td>ULCNET_N_FFT</td><td>pool</td><td>chain 三個物件共用一支</td></tr>
 <tr><td><code>ana_err/ana_far</code>(<code>AcStft</code> ×2,借用 handle 與視窗表)</td><td>各:結構 + <code>history</code> [ULCNET_N_FFT] f32 + <code>seg</code> [ULCNET_N_FFT] f32 + 頻譜暫存 [ULCNET_BINS] Complex</td><td>pool</td><td>rolling 原始樣本(跨 hop 必要狀態);seg／頻譜暫存是 per-call FFT scratch,刻意不放 stack</td></tr>
 <tr><td><code>synth</code>(<code>AcIstft</code>,<code>AC_OLA_ENV_NORM</code>)</td><td>結構 + <code>acc</code>／<code>env</code>／<code>time</code> 各 [ULCNET_N_FFT] f32 + 頻譜暫存</td><td>pool</td><td>WOLA 累加器 + 窗平方包絡 + IFFT 輸出</td></tr>
-<tr><td><code>ulcnet_window</code></td><td>[ULCNET_N_FFT] f32</td><td>C struct(self)</td><td>共用 sqrt-Hann 表(<code>ac_window_build()</code>)</td></tr>
+<tr><td><code>window</code>(stage 的成員)</td><td>[ULCNET_N_FFT] f32</td><td>C struct(self)</td><td>共用 sqrt-Hann 表(<code>ac_window_build()</code>)</td></tr>
 <tr><td>幀 scratch</td><td>約6 KB(16 kHz)或12 KB(48 kHz)</td><td>C struct(self)</td><td>err/far 各 1 幀 + model 輸出 1 幀,每 hop 用量</td></tr>
 <tr><td><code>model</code>(by value)+delay transition+<code>reprime_frames</code></td><td>純量級</td><td>C struct(self)</td><td>model 指標指向物由 caller 保活;<code>reprime_frames</code> 在 alignment 邊界武裝為 <code>ULCNET_NN_STAGE_REPRIME_FRAMES</code>=1,每發射一幀遞減</td></tr>
 <tr><td>NN 顯式 states(far K/V history、logit history、GRU h)</td><td>依 export D 與 grid;D=8 參考值 75,280 B(16 kHz)/142,864 B(48 kHz,現查 banner)</td><td><b>host/CPU 端獨立 pool</b>(參考實作 <code>ulcnet_model_io.c</code>;真正的矩陣運算在 NPU,但 state 本身活在 CPU RAM,經 <code>UlcnetModelIoInputs/Outputs</code> 每幀交給加速器)</td><td>不在 audio pipeline pool 內;pipeline 只透過 <code>model.reset</code> 要求 flush(對應 <code>ulcnet_model_io_reset()</code>)</td></tr>
@@ -186,9 +156,10 @@ out             全零 256          hop#0 內容            hop p-1 內容
 <h2>相關檔案與測試路徑</h2>
 <table>
 <tr><th>路徑(repo-relative)</th><th>內容</th></tr>
+<tr><td><a href="pipeline_ulcnet_usage.html">pipeline_ulcnet_usage</a>、<a href="pipeline_ulcnet_sequence.html">pipeline_ulcnet_sequence</a>、<a href="pipeline_ulcnet_params.html">pipeline_ulcnet_params</a></td><td>呼叫範例(init／每 hop／reset／destroy)、流程時序圖、外部／內部參數表與 public／internal 函式表</td></tr>
 <tr><td><code>pipelines/samples/ulcnet_nn_stage.h / .c</code>、<code>pipelines/mono_alignulcnet/main.c</code></td><td>本頁的 stage(範例碼,沒有 ABI)與 mono 組合</td></tr>
 <tr><td><code>pipelines/samples/tests/test_ulcnet_nn_stage.c</code></td><td>stage 層測試(合成的 delay 事件驅動:counting model、fail-open、reprime、phased twin、pool 切法)</td></tr>
-<tr><td><code>AIAEC/Align_ULCNet/ulcnet_process.h / .c</code></td><td>C 前後處理 + <code>UlcnetModel</code> 邊界(Python parity gate:<code>AIAEC/tests/test_ulcnet_process_c.py</code>,~1e-5 float-ULP 級)</td></tr>
+<tr><td><code>AIAEC/Align_ULCNet/ulcnet_process.h / .c</code></td><td>C 前後處理 + <code>UlcnetModel</code> 邊界(Python parity gate:<code>AIAEC/tests/test_ulcnet_process_c.py</code>,對 torch 參考的最大差閘 &lt; 2e-4)</td></tr>
 <tr><td><code>AIAEC/Align_ULCNet/ulcnet_accelerator_adapter.h / .c</code></td><td>accelerator adapter(無狀態 run() callback 包裝,見上方專節);內部驅動 <code>ulcnet_prepost</code> 的 <code>ULCNET_IO_FREQ</code> 實例</td></tr>
 <tr><td><code>AIAEC/Align_ULCNet/ulcnet_prepost.h / .c</code></td><td>ULCNet 前後處理 class:<code>_config_defaults</code>/<code>_get_mem_size</code>/<code>_init_ex</code>(32-byte MemReq stale-pool gate)/<code>_reset</code> + 每幀 <code>_pre_process[_freq]</code> → <code>_frame_inputs</code> → accelerator → <code>_frame_commit</code>|<code>_frame_skip</code> → <code>_post_process[_freq]</code>;<code>ULCNET_IO_TIME</code> 由 class 跑 framing(用呼叫端的 <code>FftHandle</code> 與窗表),<code>ULCNET_IO_FREQ</code> 頻譜進出、不做轉換</td></tr>
 <tr><td><code>AIAEC/Align_ULCNet/ulcnet_model_io.h / .c</code></td><td>CPU 端 K/V / logit window / GRU hidden 四個 state(就地綁定;commit 驗證後做 mask 乘法與逆冪、不更新 state),內建固定前後端(signed-pow 特徵/mask 乘法/逆冪);Python parity:<code>AIAEC/tests/test_ulcnet_model_io_c.py</code></td></tr>

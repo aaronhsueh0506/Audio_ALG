@@ -2,8 +2,9 @@
 4-channel AEC + beamformer + RES + DeepFilterNet2 (Python reference)
 
 The four-channel front end (shared delay, four linear AEC lanes, the fused
-post-beam residual gain) is the ``4ch_aec_bf_nr_res/pipeline.py`` reference.
-This module adds the spectrum-to-hop tail after ``res_gain`` in two flavours:
+context) and its post-beam residual suppressor are the
+``4ch_aec_bf_nr_res/pipeline.py`` reference.  This module adds the
+spectrum-to-hop tail after ``res_gain`` in two flavours:
 
 * ``post_conventional``: MMSE-LSA on the fused pre-RES spectrum,
   ``min(G_nr, G_res)``, comfort noise, WOLA -- the post chain of the C
@@ -38,7 +39,7 @@ _AEC_PY = os.path.join(_ROOT, 'lib', 'aec', 'python')
 if _AEC_PY not in sys.path:
     sys.path.insert(0, _AEC_PY)
 
-from lib.aec.python.aec import AecConfig, AecMode, AecResContext  # noqa: E402
+from lib.aec.python.aec import AecConfig, AecMode, AecPreset, AecResContext  # noqa: E402
 from pipelines.aec_dfn2_res_pipeline import run_dfn2_res  # noqa: E402
 from pipelines.aec_nr_pipeline import run_nr_spectrum, run_res  # noqa: E402
 from pipelines.dfn2_stage import Dfn2Stage  # noqa: E402
@@ -62,25 +63,30 @@ four_channel = _load_four_channel_reference()
 FourChannelAecConfig = four_channel.FourChannelAecConfig
 FourChannelAecPipeline = four_channel.FourChannelAecPipeline
 EqualWeightBeamformer = four_channel.EqualWeightBeamformer
+PostBeamResidualSuppressor = four_channel.PostBeamResidualSuppressor
 
 
 def run_front_end(microphones: np.ndarray, render: np.ndarray,
                   config: Optional[FourChannelAecConfig] = None,
-                  beamformer=None) -> List[AecResContext]:
+                  beamformer=None,
+                  aec_preset: AecPreset = AecPreset.BALANCED) -> List[AecResContext]:
     """Shared delay + four lanes + beamformer adapter + fused post-beam RES.
 
-    Returns the fused per-hop contexts (``error_spec`` = the beamformed
-    pre-RES spectrum, ``res_gain`` = the pipeline's one post-beam suppression
-    gain at ``config.aec_preset``, ``comfort_noise``/``r2`` fused), which both
+    The one post-beam suppressor is owned here (the pipeline fuses the context
+    and leaves ``res_gain`` None).  Returns the fused per-hop contexts
+    (``error_spec`` = the beamformed pre-RES spectrum, ``res_gain`` = the one
+    post-beam suppression gain, ``comfort_noise``/``r2`` fused), which both
     tails consume.
     """
     pipeline = FourChannelAecPipeline(config, beamformer or EqualWeightBeamformer())
     hop = pipeline.hop_size
+    suppressor = PostBeamResidualSuppressor(
+        pipeline.config.sample_rate, hop, pipeline.n_freqs, aec_preset)
     n = min(len(render), microphones.shape[0])
     contexts: List[AecResContext] = []
     for start in range(0, n - hop + 1, hop):
         frame = pipeline.process(microphones[start:start + hop], render[start:start + hop])
-        contexts.append(frame.context)
+        contexts.append(suppressor.process(frame.context, frame.aligned_render))
     return contexts
 
 

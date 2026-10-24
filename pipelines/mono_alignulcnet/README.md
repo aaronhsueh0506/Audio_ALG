@@ -60,6 +60,26 @@ A frame left open or never fetched is the identity (fail-open); the reprime
 frame after an alignment boundary has no model frame (`nn_begin` returns 0). The stage is built
 with `ulcnet_nn_stage_mem_size(1)` here because the time-domain error entry needs its own STFT.
 
+## Calling sequence and parameters
+
+```
+App                 Aec           UlcnetNnStage + adapter          accelerator (board)
+ |-- se_derive; aec_get_mem_size / aec_init -->|
+ |-- ulcnet_nn_stage_mem_size(1) / ulcnet_nn_stage_init; ulcnet_accelerator_adapter_* (K/V, logit, GRU state)
+ |   per hop: aec_process_context --> aec_get_res_context / aec_get_linear_context --> delay {changed, solid}
+ |            --> ulcnet_nn_stage_begin_time(formed_hop, ref, delay)
+ |            --> ulcnet_nn_stage_nn_begin == 1 --> run_accelerator(job) --> ulcnet_nn_stage_nn_end(rc)
+ |            --> ulcnet_nn_stage_end(out)                (hop 0 is zeros; fail-open = the error spectrum)
+ |   refused call: aec_reset + ulcnet_nn_stage_reset   (an alignment change resets the model state itself)
+ |-- aec_destroy; release the blocks
+```
+
+External parameters: the delay profile below (`--delay-mode`, `--delay-num-filters` 1..5, `--fixed-delay`), the
+grid of the build (`ULCNET_GRID=16k|48k`) and `D` of the exported graph (the example builds a `D=8`
+descriptor; production loads the descriptor exported with its graph). There is no strength setter on
+purpose: the strength is a property of the model. Internal: `ULCNET_NN_STAGE_REPRIME_FRAMES` (derived by the
+test, not a knob), the AEC lane constants, the model's pre/post constants.
+
 ## Delay profile
 
 The matched-filter bank size `n` is a product deployment decision, so it is a

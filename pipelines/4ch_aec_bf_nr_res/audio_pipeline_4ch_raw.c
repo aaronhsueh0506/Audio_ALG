@@ -1,6 +1,6 @@
 /** Host-only raw-float runner for recording validation, written as an example of the
- * composition: the linear AEC + BF unit (audio_pipeline_4ch.h, its fuse carries the post-beam RES
- * gain) followed by NR, comfort noise and synthesis, each library initialised here and chained
+ * composition: the linear AEC + BF unit (audio_pipeline_4ch.h) followed by the post-beam RES
+ * (lib/aec AecRes), NR, comfort noise and synthesis, each library initialised here and chained
  * per hop in raw_chain().
  * Input mic: interleaved float32 [frames][4]; input ref: mono float32 [frames];
  * optional VAD: uint8 [complete_hops], nonzero = target speech; output: mono float32
@@ -13,6 +13,7 @@
 #include <stdlib.h>
 #include <string.h>
 
+#include "aec_res.h"
 #include "anr.h"
 #include "audio_pipeline_4ch.h"
 #include "audio_stft.h"
@@ -48,23 +49,27 @@ static void json_float(char* output, size_t capacity, float value) {
 
 /* The stages after the fuse, carved in this order from one aligned block. */
 typedef struct PostStages {
+    AecConfig res_cfg;
     AnrConfig nr_cfg;
     AcStftConfig synth_cfg;
-    size_t nr_bytes, synth_bytes, vec_bytes, spec_bytes, total;
+    size_t res_bytes, nr_bytes, synth_bytes, vec_bytes, spec_bytes, total;
 } PostStages;
 
 static int post_plan(int sample_rate, int fft_size, PostStages *ps) {
     int n_freqs = fft_size / 2 + 1;
+    aec_config_from_preset(&ps->res_cfg, AEC_PRESET_BALANCED, sample_rate);
+    ps->res_cfg.fft_size = fft_size;
+    ps->res_bytes = aec_res_get_mem_size(&ps->res_cfg);
     ps->nr_cfg = anr_config_for_mode_grid(sample_rate, fft_size, ANR_MODE_BALANCED);
     ac_stft_config_default(&ps->synth_cfg, fft_size);
     ps->nr_bytes = anr_get_mem_size(&ps->nr_cfg);
     ps->synth_bytes = ac_istft_get_mem_size(&ps->synth_cfg);
     ps->vec_bytes = ALIGN16((size_t)n_freqs * sizeof(float));
     ps->spec_bytes = ALIGN16((size_t)n_freqs * sizeof(Complex));
-    if (ps->nr_bytes == 0 || ps->synth_bytes == 0) return -1;
-    /* nr, synthesis, unity, total gain, NR prior, output spectrum */
-    ps->total = ALIGN16(ps->nr_bytes) + ALIGN16(ps->synth_bytes) + 3 * ps->vec_bytes +
-                ps->spec_bytes;
+    if (ps->res_bytes == 0 || ps->nr_bytes == 0 || ps->synth_bytes == 0) return -1;
+    /* res, nr, synthesis, total gain, NR prior, output spectrum */
+    ps->total = ALIGN16(ps->res_bytes) + ALIGN16(ps->nr_bytes) + ALIGN16(ps->synth_bytes) +
+                2 * ps->vec_bytes + ps->spec_bytes;
     return 0;
 }
 
@@ -74,9 +79,10 @@ typedef struct RawSample {
     PostStages post;
     AudioPipeline4Ch *p;
     void *post_mem;
+    AecRes *res;
     AnrDenoiser *nr;
     AcIstft *istft;
-    float *unity, *total_gain, *extra_noise;
+    float *total_gain, *extra_noise;
     Complex *spec;
     uint32_t rng;
     int n_freqs;
@@ -110,13 +116,13 @@ static int raw_setup(void *user, McabHopView *view) {
         return 1;
     }
     if (s->options.print_mem_size) {
-        McabMemLine lines[3] = {
-            {"NR:", s->post.nr_bytes}, {"Synthesis:", s->post.synth_bytes},
-            {"Buffers:", s->post.total - ALIGN16(s->post.nr_bytes) -
-                         ALIGN16(s->post.synth_bytes)}};
+        McabMemLine lines[4] = {
+            {"RES:", s->post.res_bytes}, {"NR:", s->post.nr_bytes},
+            {"Synthesis:", s->post.synth_bytes},
+            {"Buffers:", 2 * s->post.vec_bytes + s->post.spec_bytes}};
         return mcab_print_mem_budget(
-                   "4ch linear AEC + BF unit with RES, NR and synthesis", &s->cfg,
-                   audio_pipeline_4ch_get_mem_requirements, lines, 3) == 0
+                   "4ch linear AEC + BF unit, RES, NR and synthesis", &s->cfg,
+                   audio_pipeline_4ch_get_mem_requirements, lines, 4) == 0
                    ? 2
                    : 1;
     }
@@ -127,25 +133,24 @@ static int raw_setup(void *user, McabHopView *view) {
     }
     {
         unsigned char *cur;
-        int k;
         if (posix_memalign(&s->post_mem, 16, s->post.total) != 0) s->post_mem = NULL;
         cur = s->post_mem;
         if (cur) {
+            s->res = aec_res_init(cur, s->post.res_bytes, &s->post.res_cfg);
+            cur += ALIGN16(s->post.res_bytes);
             s->nr = anr_init(cur, s->post.nr_bytes, &s->post.nr_cfg);
             cur += ALIGN16(s->post.nr_bytes);
             s->istft = ac_istft_init(cur, s->post.synth_bytes, &s->post.synth_cfg);
             cur += ALIGN16(s->post.synth_bytes);
-            s->unity = (float *)cur;       cur += s->post.vec_bytes;
             s->total_gain = (float *)cur;  cur += s->post.vec_bytes;
             s->extra_noise = (float *)cur; cur += s->post.vec_bytes;
             s->spec = (Complex *)cur;
         }
-        if (!s->nr || !s->istft) {
+        if (!s->res || !s->nr || !s->istft) {
             fprintf(stderr, "failed to create the post-beam stages\n");
             return 1;
         }
         s->n_freqs = audio_pipeline_4ch_n_freqs(s->p);
-        for (k = 0; k < s->n_freqs; ++k) s->unity[k] = 1.0f;
         s->rng = SE_CNG_RNG_SEED;
     }
     s->hop = audio_pipeline_4ch_hop_size(s->p);
@@ -185,41 +190,39 @@ static int raw_read(void *user, McabHopView *view, int frame) {
     }
     return 1;
 }
-/* One hop after the fuse into s->output: P = E * min(G_nr, G_res), comfort noise on the bins
- * the RES cut, synthesis. 0, or -1 when the denoiser refuses the hop. */
+/* One hop after the fuse into s->output: G_res, G_nr, P = E * min(G_nr, G_res), comfort noise on
+ * the bins the RES cut, synthesis. 0, or -1 when the RES or the denoiser refuses the hop. */
 static int raw_chain(RawSample *s, const SeSpecFrame *f) {
-    const float *res = f->g_res_ctx ? f->g_res_ctx : s->unity;
-    const float *nr = se_anr_stage_gain(s->nr, f, s->extra_noise, 1);
+    const float *res = se_res_stage_gain(s->res, f);
+    const float *nr = res ? se_anr_stage_gain(s->nr, f, s->extra_noise, 1) : NULL;
     if (!nr) return -1;
     sk_min_f32(s->total_gain, nr, res, s->n_freqs);   /* keeps a non-finite gain visible */
     sk_capply_gain_f32(s->spec, f->e, s->total_gain, s->n_freqs);
-    if (f->g_res_ctx && f->cn)
+    if (f->cn)
         aec_cng_fill(&s->rng, s->spec, f->cn, res, nr, SE_CNG_NR_GAIN_FLOOR, s->n_freqs);
     (void)ac_istft_push(s->istft, s->spec, s->output);
     return 0;
 }
 
 static void raw_post_reset(RawSample *s) {
+    aec_res_reset(s->res);
     anr_reset(s->nr);
     ac_istft_reset(s->istft);
     s->rng = SE_CNG_RNG_SEED;
 }
 
 /* Fuse, then the chain. A refusal anywhere takes the unit and the post stages down together:
- * the unit's fuse resets the unit itself, the rest is reset here. */
+ * the unit resets itself on its own refusals, the rest is reset here. */
 static int raw_post(RawSample *s) {
     SeSpecFrame frame;
     int status = audio_pipeline_4ch_fuse(s->p, &frame);
-    if (status != FOUR_AEC_NR_RES_OK) {
-        raw_post_reset(s);
-        return status;
-    }
-    if (raw_chain(s, &frame) != 0 || !se_hop_is_finite(s->output, s->hop)) {
+    if (status == FOUR_AEC_NR_RES_OK &&
+        (raw_chain(s, &frame) != 0 || !se_hop_is_finite(s->output, s->hop))) {
         audio_pipeline_4ch_reset(s->p);
-        raw_post_reset(s);
-        return FOUR_AEC_NR_RES_DSP_ERROR;
+        status = FOUR_AEC_NR_RES_DSP_ERROR;
     }
-    return FOUR_AEC_NR_RES_OK;
+    if (status != FOUR_AEC_NR_RES_OK) raw_post_reset(s);
+    return status;
 }
 static int raw_process(void *user, McabHopView *view, int frame) {
     RawSample *s=user; (void)view;
@@ -230,6 +233,7 @@ static int raw_process(void *user, McabHopView *view, int frame) {
     else status=audio_pipeline_4ch_process(s->p,s->microphones,s->reference,
                                           &s->beam,&s->info);
     if (status == FOUR_AEC_NR_RES_OK) status=raw_post(s);
+    else raw_post_reset(s);
     if (status != FOUR_AEC_NR_RES_OK) {
         fprintf(stderr,"pipeline failed at frame %d: %d\n",frame,status); return 1;
     }
@@ -293,7 +297,7 @@ static int raw_finish(void *user, McabHopView *view, int processed) {
            audio_pipeline_4ch_matched_filter_count(s->p),
            audio_pipeline_4ch_linear_aec_count(s->p),
            s->nr ? 1 : 0,
-           audio_pipeline_4ch_res(s->p) ? 1 : 0,
+           s->res ? 1 : 0,
            audio_pipeline_4ch_spatial_backend(),
            s->doa_analysis_frames, s->doa_frames, s->adaptive_frames,
            processed > 0 ? s->info.delay.delay_samples : 0,

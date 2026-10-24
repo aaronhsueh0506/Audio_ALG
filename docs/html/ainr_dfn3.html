@@ -1,11 +1,12 @@
 <!doctype html>
 <html lang="zh-Hant"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>AINR DeepFilterNet3</title>
 <style>body{font:15px/1.55 system-ui,sans-serif;max-width:1000px;margin:2rem auto;padding:0 1rem;color:#222}nav a{margin-right:.7rem}table{border-collapse:collapse;width:100%;margin:1rem 0}th,td{border:1px solid #bbb;padding:.45rem;text-align:left;vertical-align:top}code,pre{background:#f3f3f3}pre{padding:.8rem;overflow:auto}</style></head><body>
-<nav><a href="index.html">索引</a><a href="conventions.html">慣例</a><a href="onnx_prepost.html">ONNX 邊界</a><a href="ainr_dfn2.html">DFN2</a><a href="../../../audiolib/common/docs/html/audio_common.html">audiolib</a></nav>
+<nav><a href="index.html">索引</a><a href="conventions.html">慣例</a><a href="conventions_latency.html">延遲預算</a><a href="onnx_prepost.html">ONNX 邊界</a><a href="ainr_dfn2.html">DFN2</a><a href="ainr_dfn2_detail.html">DFN2 細節</a><a href="ainr_dfn2_usage.html">DFN2 使用</a><a href="ainr_dfn3.html"><b>DFN3</b></a><a href="ainr_dfn3_usage.html">DFN3 使用</a><a href="ainr_gtcrn.html">GTCRN</a><a href="ainr_gtcrn_usage.html">GTCRN 使用</a><a href="ainr_rnnoise_erb.html">RNNoise-ERB</a><a href="ainr_rnnoise_erb_usage.html">RNNoise-ERB 使用</a></nav>
 <h1>DeepFilterNet3：raw 低頻 DF / 高頻 ERB split</h1>
 <h2>概要</h2>
 <p>本機 DFN3 是 48 kHz 單路降噪模型，FFT/window/hop = 1024/1024/512，32 ERB bands、96 個低頻 DF bins、5 個複數 taps。低頻直接濾原始 noisy 頻譜，高頻乘 ERB gain；沒有 alpha 混合輸出。DFN2 的產品 pipeline 仍使用 DFN2，切換模型須另外整合與使用相容權重。</p>
 <h2>API 用法</h2>
+<p>完整呼叫順序（含錯誤處理與 reset）、流程時序圖、外部／內部參數表：<a href="ainr_dfn3_usage.html">ainr_dfn3_usage</a>。</p>
 <pre>DFN3PrepostConfig cfg;
 dfn3_prepost_config_defaults(&amp;cfg, DFN3_IO_FREQ);
 cfg.erb_fwd = fwd;  /* bin-major [513][32] */
@@ -41,7 +42,7 @@ TIME synthesis          silence       first WOLA hop    next WOLA hop</pre>
 <table><tr><th>方向</th><th>名稱</th><th>Shape</th></tr><tr><td>input</td><td>erb</td><td>[1,1,3,32]</td></tr><tr><td>input</td><td>spec</td><td>[1,2,3,96]</td></tr><tr><td>input / output</td><td>h_gru / h_gru_out</td><td>[1,5,1,256]</td></tr><tr><td>input / output</td><td>df_convp_history / df_convp_history_out</td><td>[1,64,5,96]</td></tr><tr><td>output</td><td>erb_mask</td><td>[1,1,1,32]</td></tr><tr><td>output</td><td>df_coefs</td><td>[1,1,96,10]；bin/tap/re-im</td></tr></table>
 <h2>State 表</h2>
 <table><tr><th>跨 hop 狀態</th><th>Shape / 大小</th><th>保存者</th></tr><tr><td>GRU hidden</td><td>1280 floats = 5120 bytes</td><td>host pool；graph input/output 同位址</td></tr><tr><td>DF pathway window</td><td>30720 floats = 122880 bytes</td><td>host pool；graph 內 Slice/Concat 更新</td></tr><tr><td>feature windows</td><td>ERB 96 floats、complex 576 floats</td><td>C host 滑動，runtime 唯讀</td></tr><tr><td>normalizers、raw spectrum rings、framing/OLA</td><td>依 dfn3_process.h / fresh pool query</td><td>C host；不進 graph</td></tr></table>
-<p><code>DFN3_MODEL_IO_LAYOUT_VERSION = 9</code>；DFN2 layout 8 不相容。單路 C descriptor 不能拿 batch-N graph 代替。init generation 為 1，reset 與被拒的 commit 會清零兩個 recurrent state 並增加 generation；runtime 必須同步重填自己的量化 state。</p>
+<p><code>DFN3_MODEL_IO_LAYOUT_VERSION = 9</code>；DFN2 layout 8 不相容。<code>get_mem_size</code> 實測（本機）：<code>DFN3_IO_TIME</code> 246,256 bytes、<code>DFN3_IO_FREQ</code> 219,472 bytes；<code>sizeof(DFN3State)</code> = 67,344 bytes。單路 C descriptor 不能拿 batch-N graph 代替。init generation 為 1，reset 與被拒的 commit 會清零兩個 recurrent state 並增加 generation；runtime 必須同步重填自己的量化 state。</p>
 <h2>延遲與 warm-up</h2>
 <p>mask/DF lookahead = 1/1，兩條路平行，模型需等 1 hop。TIME identity 路徑再加 WOLA，位移為 1024 samples = 2 hops = 21.33 ms（不含推論時間或外部排隊）。第一 hop pre_process 回 0，其後每 hop 回 1；skip 使用 unit 高頻 gain 和 unit current DF tap，維持相同時序。有限 clip 的精確尾端應補模型 feature 的零 padding；持續餵零音訊只是在延續 live stream。</p>
 <h2>相關檔案與測試</h2>

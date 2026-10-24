@@ -1,3 +1,6 @@
+<!doctype html>
+<html lang="zh-Hant">
+<head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title>AINR DeepFilterNet2</title>
@@ -25,19 +28,28 @@ th{background:#eef1f5}
  .note{color:#9aa7b4}
 }
 </style>
+</head>
+<body>
 <nav>
-<a href="index.html">index</a>
+<a href="index.html">索引</a>
+<a href="conventions.html">慣例</a>
+<a href="conventions_latency.html">延遲預算</a>
+<a href="onnx_prepost.html">ONNX 邊界</a>
 <a href="ainr_dfn2.html"><b>DFN2</b></a>
 <a href="ainr_dfn2_detail.html">DFN2 細節</a>
+<a href="ainr_dfn2_usage.html">DFN2 使用</a>
+<a href="ainr_dfn3.html">DFN3</a>
+<a href="ainr_dfn3_usage.html">DFN3 使用</a>
 <a href="ainr_gtcrn.html">GTCRN</a>
+<a href="ainr_gtcrn_usage.html">GTCRN 使用</a>
 <a href="ainr_rnnoise_erb.html">RNNoise-ERB</a>
-<a href="pipeline_dfn_mono.html">mono-DFN2</a>
-<a href="pipeline_dfn_4ch.html">4ch-DFN2</a>
+<a href="ainr_rnnoise_erb_usage.html">RNNoise-ERB 使用</a>
 </nav>
 
 <h1>AINR DeepFilterNet2 (48 kHz cascade + learned alpha)</h1>
 
 <h2>概要</h2>
+<p class="note">如何呼叫、流程時序圖、外部／內部參數表：<a href="ainr_dfn2_usage.html">ainr_dfn2_usage</a>。</p>
 <p>48 kHz 全頻帶降噪模型。網路只預測三個 head(ERB mask、低頻 deep-filter 係數、alpha
 殘差混合權重),頻譜合成(cascade:全頻 ERB mask → 低頻 5-tap 複數 FIR → alpha blend)
 全部由 C 端 <code>dfn2_process.c</code> 以 parameter-free 算式重現,對應
@@ -69,6 +81,7 @@ AcStft  *stft  = ac_stft_init(mem_a, ac_stft_get_mem_size(&amp;fc), &amp;fc);   
 dfn2_framing_config(&amp;fc, fft, ac_stft_window(stft));   /* 合成物件借用同一張窗 */
 AcIstft *istft = ac_istft_init(mem_s, ac_istft_get_mem_size(&amp;fc), &amp;fc);
 dfn2_state_init(&amp;st, stft, istft);               /* 兩個物件可為 NULL(只走頻譜入口時) */
+dfn2_set_erb_matrices(&amp;st, erb_fwd, erb_inv);    /* 呼叫端載入的 .bin;特徵與 mask 展開之前必呼叫 */
 
 for (each hop of 512 new samples) {
     dfn2_analysis(&amp;st, frame512, spec_re, spec_im);        /* 原尺度頻譜 [513] */
@@ -167,13 +180,12 @@ for (each hop of DFN2_HOP_LEN samples) {
 直接餵進來會<b>剛好過驅動 32 倍</b>,反向欠驅動 32 倍;兩邊都偵測不到——都是量綱合法的 float 頻譜,
 ERB 特徵又是 EMA 正規化的,mask 仍看起來合理,只有輸出電平是錯的。跨這個邊界必須自己換算
 (<code>× 1/32</code> 進、<code>× 32</code> 出)。</p>
-<p class="note">兩支 DFN2 pipeline 就是這樣做的:<code>pipelines/dfn_res_stage.c</code> 以 hex-float
-<code>0x1p-5f</code>/<code>0x1p5f</code> 精確的 2 的次方換算。
+<p class="note">兩支 DFN2 pipeline 以 <code>dfn_res_stage.h</code> 的 <code>DFN_RES_STAGE_IN_SCALE</code>／<code>_OUT_SCALE</code>（<code>0x1p-5f</code>／<code>0x1p5f</code>，精確的 2 的次方）換算。
 <b><code>DFN2_ANALYSIS_SCALE</code> 不是這個因子</b>——那是特徵分支內部(libDF wnorm 殘留),
 只作用在餵給正規化器的那份拷貝,從不碰 masking/ISTFT 路徑上的頻譜。</p>
 
 <h3>記憶體、callback 邊界與建置</h3>
-<p>pool 大小(<code>DFN2_IO_TIME</code> 246,320 bytes、<code>DFN2_IO_FREQ</code> 219,536 bytes)與所有權規則、<code>DFN2PrepostMemReq</code> 七欄、<code>DFN2_PREPOST_CARVE_VERSION</code>、ERB 非零範圍、<code>DFN2Model</code> callback 與 18 欄 <code>DFN2ModelIoDescriptor</code>、<code>make -C AINR lib</code> 建置,收在 <a href="ainr_dfn2_detail.html">ainr_dfn2_detail</a>。</p>
+<p>pool 大小(<code>DFN2_IO_TIME</code> 246,320 bytes、<code>DFN2_IO_FREQ</code> 219,536 bytes)與所有權規則、<code>DFN2PrepostMemReq</code>、<code>DFN2_PREPOST_CARVE_VERSION</code>、ERB 非零範圍、<code>DFN2Model</code> callback 與 <code>DFN2ModelIoDescriptor</code>、建置,收在 <a href="ainr_dfn2_detail.html">ainr_dfn2_detail</a>。</p>
 <p class="note"><b>延遲:類別不改變模型自己的 2 hop lookahead。</b>identity 路徑(unit mask、alpha 0)實測輸出落後輸入
 <b>3 hops = 1536 samples = 32.0 ms @48 kHz</b>(WOLA 1 hop + 模型 2 hops);見下「延遲與 warm-up」。</p>
 
@@ -275,7 +287,7 @@ Slice 沿 axis 2 起於第 1 列,對齊由量化工具鏈決定,尚未在板上�
 <tr><th>狀態</th><th>shape</th><th>bytes</th><th>儲存者</th><th>說明</th></tr>
 <tr><td><code>AcStft</code> 的 history／seg／頻譜暫存、窗表</td><td>[1024] f32 ×3 + [513] Complex</td><td>16,480（含窗）</td><td>pool(<code>AcStft</code>)</td><td>分析滑窗;窗表 init 後不變,借給合成物件</td></tr>
 <tr><td><code>AcIstft</code> 的 acc／time／頻譜暫存</td><td>[1024] f32 ×2 + [513] Complex</td><td>12,384（借用窗與 FFT）</td><td>pool(<code>AcIstft</code>)</td><td>OLA 累加器（跨 hop）與 IFFT 輸出</td></tr>
-<tr><td><code>erb_borders</code></td><td>[32] i32</td><td>128</td><td>C struct</td><td>init 後不變表格</td></tr>
+<tr><td><code>stft</code>／<code>istft</code>／<code>erb_fwd</code>／<code>erb_inv</code></td><td>4 pointers</td><td>32</td><td>C struct</td><td>借用呼叫端的 framing 物件與 ERB 矩陣</td></tr>
 <tr><td><code>erb_norm_state</code></td><td>[32]</td><td>128</td><td>C struct</td><td>dB mean EMA,α=0.989,init linspace −60→−90 dB</td></tr>
 <tr><td><code>spec_norm_state</code></td><td>[96]</td><td>384</td><td>C struct</td><td>magnitude EMA,init 0.001→0.0001;C 保留 eps 1e-12(FTZ 防 NaN)</td></tr>
 <tr><td><code>df_ring_re/im</code></td><td>[5][96] ×2</td><td>3,840</td><td>C struct</td><td>已套 ERB mask 的低頻 ring(cascade)</td></tr>
@@ -283,8 +295,8 @@ Slice 沿 axis 2 起於第 1 列,對齊由量化工具鏈決定,尚未在板上�
 <tr><td><code>alpha_ring</code></td><td>[5]</td><td>20</td><td>C struct</td><td>各框 alpha</td></tr>
 <tr><td><code>noisy_ring_re/im</code></td><td>[5][513] ×2</td><td>20,520</td><td>C struct</td><td>延遲的原譜(PF/atten-lim 的 noisy target)</td></tr>
 <tr><td><code>hi_delay_re/im</code></td><td>[5][417] ×2</td><td>16,680</td><td>C struct</td><td>高頻段同步延遲(band split 對時)</td></tr>
-<tr><td><code>stream_frame_index</code> 等 index</td><td>—</td><td>16</td><td>C struct</td><td>串流框編號 / ring 指標</td></tr>
-<tr><td>scratch 區</td><td>—</td><td>~12.4 KB</td><td>C struct</td><td>非跨呼叫,每次覆寫</td></tr>
+<tr><td><code>stream_frame_index</code> 等 index</td><td>—</td><td>20</td><td>C struct</td><td>串流框編號 / ring 指標(含對齊填充)</td></tr>
+<tr><td>scratch 區／ERB 非零範圍表</td><td>power[513]、erb_db[32]、bin_gain[513]／6 組 uint16</td><td>4,232／2,312</td><td>C struct</td><td>scratch 非跨呼叫;範圍表見<a href="ainr_dfn2_detail.html">細節頁</a></td></tr>
 <tr><td><code>h_gru</code></td><td>(1,5,1,256)</td><td>5,120</td><td>host caller(C: <code>gru_hidden[5][256]</code>)</td><td>顯式 graph I/O,<code>h_gru_out</code> 與輸入同位址;列 0 encoder、列 1–2 ERB decoder、列 3–4 DF decoder</td></tr>
 <tr><td><code>df_convp_history</code></td><td>(1,64,5,96)</td><td>122,880</td><td>host caller(C: <code>df_convp_window[64][5][96]</code>)</td><td>顯式 graph I/O,完整 5 幀 window,<code>df_convp_history_out</code> 與輸入同位址;erb_conv0/df_conv0 的 3 幀輸入 window 由 host 位移,不在此</td></tr>
 </table></div>
@@ -298,7 +310,7 @@ Slice 沿 axis 2 起於第 1 列,對齊由量化工具鏈決定,尚未在板上�
 <li>STFT framing 結構延遲:win−hop = 512 samples = 10.67 ms(WOLA 重疊)。</li>
 <li>Warm-up:<code>dfn2_compose_stream()</code> 前 2 次呼叫回 0(無輸出,不送 ISTFT);
 右端 flush 須由中介硬體以訓練同款 zero padding 產生剩餘 heads 再以零頻譜續呼。</li>
-<li>正規化器 EMA warm-up:tau = 1.0 s(α=0.989,3·tau ≈ 273 框);init 用 libDF linspace 值。</li>
+<li>正規化器 EMA warm-up:tau = 1.0 s(α=0.989,有效 tau 0.9644 s ≈ 90.4 框,3·tau ≈ 271 框);init 用 libDF linspace 值。</li>
 <li>對齊守衛:<code>tests/test_c_prepost.c: test_dfn_stream_alignment()</code> 用逐框變動的 mask/coefs 驗證
 <code>output_frame_index</code> 與逐 bin 3e-6 一致性,off-by-one 的配對無法以「輸出有限」矇混過關。</li>
 </ul>
@@ -312,8 +324,10 @@ Slice 沿 axis 2 起於第 1 列,對齊由量化工具鏈決定,尚未在板上�
 <li>模型 / 訓練 / 推論 / 匯出:<code>AINR/DeepFilterNet2/model.py</code>、<code>train.py</code>、<code>inference.py</code>、<code>export_onnx.py</code>、<code>config.ini</code></li>
 <li>文件:<a href="../../AINR/DeepFilterNet2/README.md">README.md</a>、<a href="../../AINR/DeepFilterNet2/UPSTREAM_ALIGNMENT.md">UPSTREAM_ALIGNMENT.md</a></li>
 <li>C 測試:<code>AINR/tests/test_c_prepost.c</code> — <code>make -C AINR test-simd</code>
-實測 NEON/scalar digest 皆 <code>de7e511600d05a10</code>(bit 相同);deep filter 的 96 bin×5 tap 複數乘加走共用 NEON 核心 <code>skn_ctaps_mac_f32</code>(不依賴編譯器自動向量化)</li>
+實測 NEON/scalar digest 皆 <code>5871f9cf42a59a3b</code>(bit 相同);deep filter 的 96 bin×5 tap 複數乘加走共用 NEON 核心 <code>skn_ctaps_mac_f32</code>(不依賴編譯器自動向量化)</li>
 <li>Python 合約測試:<code>AINR/DeepFilterNet2/tests/test_dfn2_contract.py</code>(layout version 互鎖、
 <code>h_gru</code> 各列抵達自己的 GRU、匯出圖的 state 邊界)、<code>AINR/tests/test_onnx_state_contract.py</code>(邊界驗證器與量化後檢查);<code>AINR/tests/</code> 另有
 <code>test_python_c_prepost_parity.py</code>;全樹請執行 <code>python3 -m pytest AINR</code>。</li>
 </ul>
+</body>
+</html>

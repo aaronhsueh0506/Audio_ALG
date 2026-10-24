@@ -64,8 +64,9 @@ The conventional 4-channel path remains:
 ```text
 one shared delay matcher
     → four linear adaptive filters
-    → externally owned SRP-PHAT/GSC
-    → one mono NR/RES path
+    → SRP-PHAT + BF (inside the AudioPipeline4Ch unit, or an externally owned
+      beamformer on the FourAecNrRes core)
+    → one post-beam RES, one mono NR path (separate libraries chained by the integrator)
 ```
 
 It is not an AIAEC model bake-off surface. See

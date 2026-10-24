@@ -44,7 +44,8 @@ The traditional signal contract is:
 - heap/static and SIMD/scalar paths must satisfy their documented parity
   contract within one backend;
 - static APIs use caller-owned pools and allocate no heap after init;
-- Python/C AEC parity is tolerance-based, not bit-exact.
+- Python/C AEC parity is tolerance-based, not bit-exact (frozen tolerances: `AEC/CHANGELOG.md`,
+  `pipelines/tests/pyc_parity/pyc_parity.py`).
 
 AINR and AIAEC retain model-specific grids. A model must validate its own
 sample-rate/frame/hop/checkpoint contract and must not silently inherit the
@@ -99,10 +100,14 @@ the handover documentation, and check them off here.
 - [ ] Public headers compile from a clean external C99 consumer.
 - [ ] Every public API/ABI/layout break has a version bump, migration note,
       and negative compatibility test.
-- [ ] Third-party NE10, SRP, GSC, and other redistributed code has
+- [ ] Third-party NE10 and other redistributed code has
       correct license/source attribution.
 
 ## 3. `audiolib` gate
+
+Every repository's Makefile also has the aggregate entry points `make test` (core tier) and `make test-full`
+(extended tier); the lists in sections 3 to 9 name the individual targets that a release report must
+record one by one.
 
 Run from `audiolib/common/`:
 
@@ -344,7 +349,7 @@ make -C pipelines BACKEND=ne10 SIMD=<0-or-1> WERROR=1 test
 # adds: test_dfn_res_stage, test_dfn_rate_bridge, test_mono_dfn, test_se_common,
 #       mono_aec_dfn_res (board skeleton at its 16 kHz default, also run with
 #       --delay-num-filters 1 --cng --atten-lim 12, and with
-#       --sample-rate 48000)
+#       --sample-rate 48000 and 8000)
 make -C pipelines/mono_aec_dfn_res test   # scoped: test_dfn_res_stage,
 #       test_mono_dfn and the skeleton only -- it does NOT cover
 #       test_dfn_rate_bridge or the --sample-rate 48000 run, so the top-level
@@ -404,15 +409,14 @@ Pass conditions:
 - [ ] Far-reference analysis FFT is computed once per hop.
 - [ ] Four linear spectra cross the beamformer boundary and only one mono
       NR+RES path follows it.
-- [ ] SRP/GSC and AEC/NR use the same selected grid.
-- [ ] Pre/post token, reset, replay, and cross-instance misuse fail closed.
+- [ ] SRP-PHAT/BF and AEC/NR use the same selected grid.
+- [ ] Sequence rules (front before beam before fuse), reset and refused calls fail closed: a call out of order returns `SEQUENCE_ERROR` and changes nothing, a refused fuse resets the unit.
 - [ ] The unit (`AudioPipeline4Ch`) supports heap and caller-owned static-pool init.
-- [ ] SRP/GSC and the unit allocate no heap after static init.
-- [ ] The unit contains the post-beam RES (`enable_res`, `audio_pipeline_4ch_res()`;
-      `fuse()` fills `frame.g_res_ctx`) but no NR, comfort noise or synthesis; those
-      stages are separate libraries that the example programs initialise and chain,
-      the unit's RES gain equals a separate `AecRes` built from explicit parameters
-      over the same fused frame, and the unit plus the examples' per-hop chain equals
+- [ ] SRP-PHAT/BF and the unit allocate no heap after static init.
+- [ ] The unit contains no post-beam RES, NR, comfort noise or synthesis
+      (`fuse()` leaves `frame.g_res_ctx` NULL); those stages are separate libraries that the
+      example programs initialise and chain (the RES is an `AecRes` created with the
+      `aec_res_*` functions of lib/aec), and the unit plus the examples' per-hop chain equals
       the hand-written reference chain bit for bit (`test_audio_pipeline_4ch`).
 - [ ] SIMD/scalar parity passes.
 - [ ] All three product grids pass.
@@ -420,8 +424,8 @@ Pass conditions:
 ### 9.0 Four-channel DeepFilterNet2 variant (`4ch_aec_bf_dfn_res`)
 
 `make -C pipelines/4ch_aec_bf_nr_res test` also builds and runs the DFN2
-example over the unit (`AudioPipeline4Ch`: real SRP-PHAT/BF, RES inside the unit;
-no denoiser, no synthesis; `samples/dfn_hop.h`):
+example over the unit (`AudioPipeline4Ch`: real SRP-PHAT/BF; the post-beam RES is an `AecRes`
+the example creates itself; no denoiser, no synthesis; `samples/dfn_hop.h`):
 
 ```bash
 make -C pipelines/4ch_aec_bf_nr_res BACKEND=ne10 SIMD=<0-or-1> WERROR=1 test
@@ -442,7 +446,7 @@ Pass conditions:
       and beamformed spectrum) with the denoiser off,
       delayed by exactly two hops, with comfort noise OFF and ON, across an AEC
       delay change.
-- [ ] The stimulus actually engages the post-beam RES (a RES-off unit differs).
+- [ ] The stimulus actually engages the post-beam RES (a run without the example's `AecRes` differs).
 - [ ] Stage counters show no mid-stream reset (the stage is not reset by a
       delay change of the shared aligner).
 - [ ] A rate the core does not offer is refused at
@@ -457,12 +461,12 @@ Pass conditions:
       output. The native path is a tolerance, NOT a memcmp.
 - [ ] The build produces `libdfn_res_stage.a` (carrying
       `dfn_rate_bridge.o`); `FOUR_AEC_NR_RES_LAYOUT_VERSION` is 24 and
-      `AUDIO_PIPELINE_4CH_LAYOUT_VERSION` is 20.
+      `AUDIO_PIPELINE_4CH_LAYOUT_VERSION` is 21.
 
 ### 9.1 Real four-microphone validation
 
 Use the final microphone geometry, synchronized four-channel recordings, and
-the production external beamformer or production SRP-PHAT/GSC implementation.
+the production external beamformer or production SRP-PHAT/BF implementation.
 Cover near-end angles, far-end only, double-talk, moving speakers, moving echo
 paths, unstable/wrong DOA, silence, low-level input, channel imbalance, failed
 channels, and clipping.
@@ -578,8 +582,8 @@ Do not claim trained-model quality without a trained checkpoint.
 ### 11.4 C pre/post archive
 
 `AINR/Makefile` builds `libainr_prepost.a` — `dfn2_process`, `dfn2_model_io`,
-`dfn2_prepost` and `gtcrn_process`. RNNoise-ERB is deliberately NOT a member:
-it has its own Makefile and no archive.
+`dfn2_prepost`, `dfn3_process`, `dfn3_model_io`, `dfn3_prepost` and `gtcrn_process`.
+RNNoise-ERB is deliberately NOT a member: it has its own Makefile and no archive.
 
 ```bash
 make -C AINR SIMD=1 WERROR=1 lib
@@ -592,8 +596,10 @@ make -C AINR SIMD=0 WERROR=1 test
       `SIMD=1` archive; resolve the archive with `print-lib-path`, never by
       spelling the directory.
 - [ ] `WERROR=1` actually reaches the compiler.
-- [ ] The SIMD knob changes only `dfn2_process.o` and `gtcrn_process.o`; the
-      other members are byte-identical between `SIMD=0` and `SIMD=1`.
+- [ ] The SIMD knob changes every member that includes `utility/simd_kernel_nn.h`
+      (dfn2/dfn3 `process`, `model_io`, `prepost` and `gtcrn_process`: all seven
+      members); never mix a `SIMD=0` archive with a `SIMD=1` application, and
+      resolve the archive with `print-lib-path`.
 
 ## 12. AIAEC framework gate
 

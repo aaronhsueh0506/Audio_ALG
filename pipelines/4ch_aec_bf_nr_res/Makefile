@@ -1,10 +1,10 @@
 # Four-channel linear AEC + beamformer unit and the examples composed over it.
 #
 # This Makefile lives beside the 4-channel implementation; the parent pipelines/Makefile builds the
-# mono examples. libaudio_pipeline_4ch.a holds the unit (the four-lane linear core, the
-# SRP-PHAT/BF composition and the post-beam RES); NR, comfort noise, synthesis and the neural
-# post-filters are separate libraries that the example binaries initialise and chain. AEC, NR,
-# common, DOA, BF and spatial kernels remain component libs.
+# mono examples. libaudio_pipeline_4ch.a holds the unit (the four-lane linear core and the
+# SRP-PHAT/BF composition); the post-beam RES (lib/aec), NR, comfort noise, synthesis and the
+# neural post-filters are separate libraries that the example binaries initialise and chain.
+# AEC, NR, common, DOA, BF and spatial kernels remain component libs.
 #
 # Common invocations:
 #   make SIMD=1
@@ -487,8 +487,8 @@ ULCNET_ADAPTER_OBJS := $(OBJ_DIR)/ulcnet_accelerator_adapter.o \
 $(BIN_DIR)/4ch_alignulcnet: $(OBJ_DIR)/4ch_alignulcnet_main.o $(OBJ_DIR)/mcab_sample_driver.o $(ULCNET_ADAPTER_OBJS) $(ULCNET_4CH_OBJS) $(UNIT_LIBS) | _cfg_guard
 	$(LINK) -o $@ $(OBJ_DIR)/4ch_alignulcnet_main.o $(OBJ_DIR)/mcab_sample_driver.o $(ULCNET_ADAPTER_OBJS) $(ULCNET_4CH_OBJS) $(UNIT_LIBS) $(LDLIBS)
 
-# The 4-channel DFN2 example and its test compose the unit (its RES included), so they link
-# the DFN archive ahead of the unit's archives.
+# The 4-channel DFN2 example and its test compose the unit and an AecRes of their own, so they
+# link the DFN archive ahead of the unit's archives.
 $(BIN_DIR)/4ch_aec_bf_dfn_res: $(OBJ_DIR)/4ch_aec_bf_dfn_res_main.o $(OBJ_DIR)/mcab_sample_driver.o $(DFN_PIPELINE_LIB) $(UNIT_LIBS) | _cfg_guard
 	$(LINK) -o $@ $(OBJ_DIR)/4ch_aec_bf_dfn_res_main.o $(OBJ_DIR)/mcab_sample_driver.o $(DFN_PIPELINE_LIB) $(UNIT_LIBS) $(LDLIBS)
 

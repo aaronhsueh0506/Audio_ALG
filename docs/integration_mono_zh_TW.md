@@ -13,6 +13,114 @@
 
 ---
 
+## 0. 速覽：流程時序圖、公開／內部函式、外部／內部參數
+
+本節是整份手冊的地圖；每一列都對得到後面章節或原始碼。名詞：**外部** = 第三方整合者可以調的參數；
+**內部** = 程式碼裡存在、技術上也調得動，但**不建議開放**（理由與所在位置都列出）。
+
+### 0.1 流程時序圖（mono：`Aec` 加逐個初始化的函式庫）
+
+生命線：應用（你的 `main`）、`Aec`（lib/aec）、`AnrDenoiser`（lib/nr）、`AcIstft`（audiolib）。
+箭頭上的名稱都是真實函式；`se_derive()`（`common/se_config.c`）與 `se_frame_from_aec()`（`common/se_stage.h`）是 `pipelines/common/` 的共用程式碼，
+`se_anr_stage_gain()` 在 `samples/`（範例碼，不進任何 archive，可整份複製改寫）。
+
+```
+應用                       Aec                 AnrDenoiser            AcIstft
+ │                          │                       │                     │
+ │══ 初始化（一次；每次 init 前都重查大小，不快取）═══════════════════════════
+ │ se_derive(&req,&rules,&grid,&aec_cfg)      → grid、AecConfig（-1 = 規則被違反）
+ │ aec_get_mem_size(&aec_cfg) ─────►│            → bytes（0 = 無效）
+ │ anr_config_for_mode_grid(sr,fft,mode); anr_get_mem_size(&nr_cfg) ──►│   → bytes（0 = 無效）
+ │ ac_stft_config_default(&sc,fft); ac_istft_get_mem_size(&sc) ───────────────►│   → bytes（0 = 無效）
+ │ 配置一塊 16-byte 對齊的 pool = Σ ALIGN16(各塊) + 增益/頻譜暫存
+ │ aec_init(mem,bytes,&aec_cfg) ────►│  anr_init(mem,bytes,&nr_cfg) ─►│  ac_istft_init(mem,bytes,&sc) ─►│
+ │                                  （任一個回 NULL：停止，不要繼續跑）
+ │══ 每個 hop（mic[hop]、ref[hop]；hop = grid.hop_size）════════════════════
+ │ aec_process_context(aec,mic,ref) ►│            （void；線性 AEC + AEC 自己的 RES 增益）
+ │ se_frame_from_aec(aec,&frame) ◄──│            frame{e,y,x,r2,cn,g_res_ctx,...}；0 / -1
+ │ g_res = frame.g_res_ctx            （NULL = 該 hop 被拒；關 RES 時用 unity 向量）
+ │ se_anr_stage_gain(nr,&frame,extra_noise,use_r2) ──────►│ anr_process_gain → G_nr（NULL = 被拒）
+ │ sk_min_f32(total,G_nr,g_res,n); sk_capply_gain_f32(spec,frame.e,total,n)
+ │ aec_cng_fill(&rng,spec,frame.cn,g_res,G_nr,SE_CNG_NR_GAIN_FLOOR,n)    （CNG 開、有 RES 增益時）
+ │ ac_istft_push(istft,spec,out) ────────────────────────────────────────►│ 寫出 hop 個樣本
+ │ se_hop_is_finite(out,hop)          （0 = 輸出不可用）
+ │══ 任一步被拒，或輸出非有限 ══════════════════════════════════════════════
+ │ aec_reset(aec); anr_reset(nr); ac_istft_reset(istft); rng = SE_CNG_RNG_SEED     （四件一起做）
+ │══ 強度（兩個 hop 之間呼叫，非 thread-safe）═══════════════════════════════
+ │ aec_set_preset(aec,preset,ramp_ms) ►│          anr_set_mode(nr,mode) ──►│
+ │══ 結束 ═══════════════════════════════════════════════════════════════
+ │ anr_destroy(nr); aec_destroy(aec); 釋放 pool    （AcIstft 沒有 destroy；先 destroy 再釋放 pool）
+ │
+ │ --aec-only：只建 Aec，每 hop 改呼叫 aec_process(aec,mic,ref,out)（不經 NR、合成與增益暫存）
+```
+
+延遲泳道（橫軸 = hop；`ac_istft_push()` 的 identity 鏈延遲 = 1 hop，見 `audio_stft.h` 檔頭）：
+
+```
+hop 序號          t        t+1       t+2
+輸入 mic/ref      m[t]     m[t+1]    m[t+2]
+Aec + RES + NR    處理 m[t] 處理 m[t+1] 處理 m[t+2]     （同一次呼叫內完成，線性路徑本身延遲 0）
+輸出 out          y[t-1]   y[t]      y[t+1]            （合成 OLA 多 1 hop；--aec-only 沒有這 1 hop）
+```
+
+1 hop = `grid.hop_size` 個樣本：16 kHz/256 為 128 個樣本（8 ms）、16 kHz/512 為 256（16 ms）、48 kHz 為 512（約 10.7 ms）；8 kHz/256 為 128（16 ms）。數字由 §4.3 的格點推得。
+
+### 0.2 公開函式與內部函式
+
+**整合者實際會呼叫的（公開）**
+
+| 階段 | 函式（標頭） | 備註 |
+|---|---|---|
+| 規則與格點 | `se_derive()`（`common/se_config.h`） | 純函式，`SeRequest` + `SeRules` → `SeGrid` + `AecConfig`；回 `-1` 即拒絕 |
+| 大小查詢 | `aec_get_mem_size()`（`aec.h`）、`anr_get_mem_size()`（`anr.h`）、`ac_istft_get_mem_size()`（`audio_stft.h`） | 回 `0` = config 無效 |
+| 建立 | `aec_init()`、`anr_init()`、`ac_istft_init()`；桌面也可 `aec_create()`、`anr_create()` | pool 路徑回 `NULL` = 失敗 |
+| 每 hop | `aec_process_context()`、`se_frame_from_aec()`（`common/se_stage.h`）、`se_anr_stage_gain()`（`samples/se_anr_stage.h`）、`sk_min_f32()`、`sk_capply_gain_f32()`（`utility/simd_kernels.h`）、`aec_cng_fill()`（`aec_res.h`）、`ac_istft_push()`、`se_hop_is_finite()` | 順序見 §0.1 |
+| 只要線性 AEC | `aec_process()` | 與 `aec_process_context()` 推進相同狀態 |
+| 強度 | `aec_set_preset()`、`anr_set_mode()`（需要整組覆寫時 `anr_reconfigure()`） | §3.2 |
+| 重置／收尾 | `aec_reset()`、`anr_reset()`、`ac_istft_reset()`、`aec_destroy()`、`anr_destroy()` | §3、§5 |
+| 診斷（唯讀） | `aec_debug_status()`、`anr_debug_status()`、`aec_get_last_timing()` | §3.1、§3.1b |
+
+**內部函式（不要依賴，隨版本改變）**：`aec.h` 以外的 AEC 內部標頭（`pbfdkf.h`、`delay_aec.h`、`aec_post.h`、
+`suppression_gain.h`、`aec_config_build.h`、`aec_balanced_config.h`）；NR 的 `noise_estimator.h`、`spp_estimator.h`、
+`anr_internal.h`，以及 `anr_apply_*_experiment()`；audiolib 的 `utility/` 內核（除上表列出的 `sk_*`、`ALIGN16` 外）。
+`struct Aec` 目前整個攤在 `aec.h` 裡，只是因為 C 需要完整型別；欄位是內部，只能經由函式存取。
+
+### 0.3 參數面：外部與內部
+
+**外部（建議讓第三方整合者調）**
+
+| 名稱 | 位置 | 範圍／預設 | 何時設定 | 作用 |
+|---|---|---|---|---|
+| `sample_rate`、`fft_size` | `SeRequest`（`se_config.h:29-37`） | 8000（需 `rules.allow_8k`）／16000／48000；`fft_size` 0 = rate 預設，16 kHz 另可 256／512 | init 前，之後不可變 | 決定格點（§4.3）；改了要重查所有大小 |
+| `filter_length` | `SeRequest` | 0 = preset／rate 預設，否則 `[1, 4096]` | init 前 | 回聲路徑長度（taps）；越長記憶體與算量越大 |
+| `delay_mode`、`delay_num_filters`、`fixed_delay_samples` | `SeRequest` | `MATCHED`（預設，bank 1..5，預設 5）／`FIXED`（已知延遲）／`EXTERNAL_ALIGNED`（上游已對齊） | init 前，之後不可變 | 對齊方式；決定 pool 版面（§4.4、§4.5a） |
+| `aec_preset` | `SeRequest` | `MILD`／`BALANCED`（預設）／`AGGRESSIVE`／`NO_FLOOR`；enum 外被拒 | init 前；執行期用下一列 | 回聲抑制 vs 近端保留的單一取捨軸 |
+| `aec_set_preset(aec, preset, ramp_ms)` | `aec.h` | `ramp_ms` 屬於 `[0, 60000]`，`0` = 下一 hop 生效 | 兩個 hop 之間 | 執行期換 AEC 強度；回 `-1` 時什麼都不寫 |
+| NR 強度 | `AnrMode`（`anr_types.h`）：`anr_config_for_mode_grid()`、`anr_set_mode()` | `MILD`／`MODERATE`／`BALANCED`（預設）／`AGGRESSIVE` | init 前或兩個 hop 之間 | 降噪深度的單一入口（一次調 `g_min_db`、`q`、`xi_min_db`、`noise_over_subtraction`） |
+| 後級開關（範例程式的欄位，不是函式庫 config） | `PostOptions`／`PostPlan`（`main.c`、`static_main.c`）；CLI `--no-res`、`--no-nr`、`--no-cng`、`--legacy-amin` | 各 0／1 | init 前 | RES 增益用不用、要不要建降噪器、CNG、NR 是否折入 R²（§4.2） |
+
+進階外部（選擇性；改了以後自己重跑三個 grid 的驗證）：`AecConfig` 的 `enable_cng`（`aec.h:67`，下游已有舒適噪音時關）、
+`enable_highpass`／`highpass_cutoff_hz`（`aec.h:70,105`，上游已有高通時關；開啟時截止頻率須 `> 0` 且低於 `0.45 × sample_rate`）、
+`enable_shadow`（`aec.h:72`，關掉省記憶體但路徑突變後恢復變慢）、`delay_est_period_s`（`aec.h:99`，預設 0 = 每 hop 全速分析；非 0 會省算力，但可能改變選到的 lag）。這些在 `se_derive()` 之後、`aec_get_mem_size()` 之前直接改 `aec_cfg`。
+
+**內部（存在、可調，但不建議開放）**
+
+| 家族 | 位置 | 為什麼不開放 |
+|---|---|---|
+| `se_derive()` 固定的接縫：`enable_res = 0`、`return_res_context = 1`、`spatial_linear_context`（`SE_CONTEXT_PRESET` = 沿用 preset） | `aec.h:73,78,82`；`se_config.c` 的 `se_derive()` | 改了就沒有 `frame.g_res_ctx`（或時域輸出改道），串接整個失效 |
+| 以 10 ms 格點撰寫、建立時 retime 的時間欄位：`warmup_frames`、`epc_hangover`、`ne_recent_hold`、`filter_misadjustment_*_frames`、`shadow_err_alpha` | `aec.h:84-136` | 單位是「N × 10 ms」，不是 hop 數；填錯單位會靜默失效 |
+| 適應步進與模型不確定度：`mu`、`delta`、`kalman_q_high`、`kalman_q_low`、`shadow_mu_*`、`epc_mu_floor` | `aec.h:64-65,86-93,107-108` | 決定收斂與發散邊界；驗證器範圍很寬，範圍內多數值不收斂 |
+| 偵測門檻：`epc_*`、`ne_recent_*`、`saturation_threshold`、`filter_misadjustment_scale_*` | `aec.h:91-92,106,123-136` | 與其他偵測器聯合調過；`scale_min > scale_max` 不會被驗證器擋 |
+| 延遲獲取策略：`delay_acquire_*`、`delay_est_init_s`、`max_delay_ms`、`delay_buffer_ms`（`delay_est_period_s` 是上面的進階外部） | `aec.h:94-114` | 影響冷啟動；`max_delay_ms`／`delay_buffer_ms` 只決定搜尋環大小，不是可擷取上限（上限由 `delay_num_filters` 決定） |
+| Double-talk 政策與 floor：`dt_aware_*`、`min_gain_floor_*_db`、`min_gain_split_floor_enabled` | `aec.h:119-129,155` | 三個 floor 欄位已由 `aec_preset`／`aec_set_preset()` 成組設定；單獨改 dB 值會得到沒有物理意義的 floor |
+| 預設關閉的實驗：`live_observer_*`、`cng_n2_windowed_psd` | `aec.h:68,147-152` | 未通過 default-on 門檻；observer 開啟會增加 pool 與算量 |
+| 衍生值：`n_partitions`、`enable_delay_est`（deprecated） | `aec.h:63,69` | 由 `filter_length` 與 hop 推導，手填只會造成不一致 |
+| `SuppressionGainConfig`、`AecPostConfig`、`AecStateConfig`、`aec_balanced_config.h` 的常數 | AEC 內部標頭 | 編譯期依 `(sample_rate, fft_size)` 查表，runtime 改不了，也不該提供接口 |
+| NR 的追蹤器與平滑欄位：`alpha_xi`、`alpha_s`、`alpha_d`、`alpha_p`、`alpha_attack`、`alpha_decay`、`delta_db`、`scene_change_*`、`speech_protect_*`、`speech_aware_*`、`noise_gate_*`、`makeup_*`、`cross_band_*` | `anr_types.h:56-110` | 聯合調出的操作點，四個 `AnrMode` 共用；`alpha_g` 在增益路徑上沒有作用（`anr_types.h:107`） |
+| NR 的 `L`、`num_init_frames` | `anr_types.h:94,96` | 決定 pool 版面，`anr_reconfigure()` 與 `anr_set_mode()` 不能改它們；範例用函式庫預設 |
+
+---
+
 ## 1. 你連結什麼、你 `#include` 什麼
 
 ### 1.1 構成：每個函式庫各自初始化，每個 hop 的串接由你寫
@@ -28,6 +136,10 @@ mic hop + ref hop ──► Aec (aec_process_context) ──► se_frame_from_ae
    nr = se_anr_stage_gain(...)  ─►  sk_min_f32(nr, G_res)  ─►  sk_capply_gain_f32(E)
         ─►  aec_cng_fill（CNG 開著、且有 RES gain 時）  ─►  ac_istft_push  ──► out hop
 ```
+
+mono 的 RES 是明確的例外：它在 `Aec` 的呼叫裡（`aec_process_context()` 算出殘留 gain，`se_frame_from_aec()` 以
+`frame.g_res_ctx` 交出，強度用 `aec_set_preset()`），沒有獨立的 `AecRes` 物件；範例只決定要不要套用這個 gain。
+純 AEC 的範例（`--aec-only`）可改呼叫完整的 `aec_process()`，RES 與最後的合成在同一個呼叫內完成。
 
 | 物件 | 來源 | 大小查詢 | 初始化 |
 |---|---|---|---|
@@ -239,7 +351,7 @@ c++ -o app app.o se_config.o \
 | 4 | init | `aec_init(pool, aec_bytes, &aec_cfg)`、`anr_init(pool + ALIGN16(aec_bytes), nr_bytes, &nr_cfg)`、`ac_istft_init(...)`；每一塊的起點都是前一塊加 `ALIGN16(前一塊大小)` | 拿到 pool 之後，處理第一個 hop 之前 | 回傳 `NULL`：pool 未 16-byte 對齊、太小、config 無效、子模組 init 失敗。已建好的那幾個要由你 destroy |
 | 5 | process | `aec_process_context(aec, mic, ref)` → `se_frame_from_aec(aec, &f)` → 每 hop 串接（§1.1：`g_res_ctx`、`se_anr_stage_gain()`、`sk_min_f32()`、`sk_capply_gain_f32()`、`aec_cng_fill()`）→ `ac_istft_push(istft, spec, out)` | 每收到一個 hop 呼叫一次。`mic`/`ref`/`out` 都必須剛好 `grid.hop_size` 個 float | `aec_process_context()` 回傳 `void`；`se_frame_from_aec()` 回 `-1`（NULL 引數或 lane 沒有 seam）；`g_res_ctx` 為 NULL、`se_anr_stage_gain()` 回 `NULL`（NULL 引數、或降噪器拒絕該 hop）；`ac_istft_push()` 的回傳值與輸出有限性（`se_hop_is_finite()`）要自己檢查。**不會**檢查 buffer 長度 —— 長度錯是你的責任 |
 | 6 | recover | `aec_reset(aec)`、`anr_reset(nr)`、`ac_istft_reset(istft)`，並把你的 comfort-noise RNG 設回 `SE_CNG_RNG_SEED` | 任何一步被拒、輸出非有限、換回聲路徑（換喇叭、重新 seat）或切換到不相關的另一條串流時 | 不會失敗。必須全部一起 reset：漏掉其中一個就不等於新建的實例（`main.c`／`static_main.c` 的 `rig_reset()` 就是這四件事） |
-| 7 | destroy | `anr_destroy(nr)`、`aec_destroy(aec)` | 不再處理任何 hop 之後、釋放 pool 之前 | 不會失敗。`aec_destroy` NULL 安全、可重複；`anr_destroy` 只釋放降噪器的資源 |
+| 7 | destroy | `anr_destroy(nr)`、`aec_destroy(aec)` | 不再處理任何 hop 之後、釋放 pool 之前 | 不會失敗。`aec_destroy` NULL 安全、可重複，只放開實例內部的參照，**不**釋放你的 pool；`anr_destroy` 對 pool 實例立即返回，對 `anr_create()` 的 heap 實例才釋放記憶體 |
 | 8 | release | 你自己的釋放器 | **一定要在第 7 步之後** | 順序顛倒 = use-after-free |
 
 補充規則：
@@ -282,9 +394,10 @@ aec_get_last_timing(aec, &t);
 | `linear_us` | AEC 主自適應濾波器（`pbfdkf_process_with_far_cmag2`），含 far-end FFT |
 | `res_us` | AEC 自己的 AEC3 post/RES 區塊 |
 
-**實測：`delay_us` 通常是整個 hop 最大的一塊。** 16 kHz/256 ne10 上量到
-60.9%，`frontend_us`（mic HPF/RSA/shadow filter）只有 6.8%。這條線直接對應
-`delay_num_filters`（1..5）這個可調旋鈕。
+**本機實測：`delay_us` 是整個 hop 最大的一塊。** 主機（macOS）上以 `make PROFILE=1` 建置，
+`aec_nr_pipeline --timing`、16 kHz/256、balanced、一段 20 s 的合成雜訊輸入、跑兩次：`delay_us` 約佔呼叫牆鐘的
+54.6–54.8 %，`frontend_us`（mic HPF/RSA/shadow filter）約 10.1 %。比例隨輸入與平台改變，目標平台上的比例待量測。
+這條線直接對應 `delay_num_filters`（1..5）這個可調旋鈕。
 
 **各階段不會加總成整通呼叫。** 餘數包含引數檢查、`aec_get_res_context()`，以及
 AEC 內部（因此從這層看不見）的 stationarity 更新、`e2_coarse`/ERL 發布、DT
@@ -295,7 +408,7 @@ analyzer、EPV、shadow_rise、失調估計、功率 EMA 與收斂偵測。要�
 `make PROFILE=1` 會開啟（`-DAEC_STAGE_TIMING=1`）。呼叫端自己的顯示旗標（`--timing`）**不會**打開 AEC 的量測。
 
 **記錄本身不是條件編譯的，只有取樣是。** 欄位無論旗標開關都在 struct 裡，所以
-profile build 與 release build 切出來的 pool 逐位元相同，開旗標永遠不會移動任何 offset。
+profile build 與 release build 的 pool 大小與每個 offset 都相同，開旗標不會移動任何 offset。
 
 **目標平台沒有 `CLOCK_MONOTONIC` 時。** `clock_gettime` 是 POSIX 而非 C99。這種
 平台用 `make PROFILE=1 EXTRA_CFLAGS='-DAEC_NOW_US=board_timer_us -include my_timer.h'`
@@ -325,7 +438,7 @@ aec_process_context(aec, mic, ref);   /* 下一個 hop 起生效 */
 
 | 呼叫 | 改什麼 | 回 `-1` 的情況（`-1` 時**什麼都不寫**） |
 |---|---|---|
-| `aec_set_preset()` | `Aec` 的 far-active 殘留回音地板（三個 preset 唯一的差異軸；mono 的 RES 增益 `g_res_ctx` 就是這個 lane 自己算的，所以 mono 的 RES 強度就是這個 setter） | `a` 為 NULL；`preset` 超出 enum；`ramp_ms` 非有限值或超出 `[0, 60000]` |
+| `aec_set_preset()` | `Aec` 的殘留回音地板（preset 改變 far-active 地板 -20/-28/-38 dB；aggressive 另把 DT 地板設成 -30 dB；NO_FLOOR 關閉 `min_gain_split_floor_enabled`；mono 的 RES 增益 `g_res_ctx` 就是這個 lane 自己算的，所以 mono 的 RES 強度就是這個 setter） | `a` 為 NULL；`preset` 超出 enum；`ramp_ms` 非有限值或超出 `[0, 60000]` |
 | `anr_set_mode()` | 降噪器的強度 preset（`q`、`xi_min_db`、`g_min_db`、`noise_over_subtraction`） | `nr` 為 NULL（含你沒有建降噪器）；`mode` 超出 enum |
 
 `ramp_ms == 0` 代表下一個 hop 就套用，**不是錯誤**，落點與「用該 preset 從頭建一個
@@ -342,8 +455,7 @@ process 序列化；非 thread-safe。**
 > 那種實例請自己組好完整 target 再呼叫 `anr_reconfigure()`。
 
 **A/B 量測時該預期什麼。** far-active 地板只在 **far-active 且非 double-talk** 的
-hop 上生效：double-talk 期間套用的是 DT 地板，而 DT 地板在三個 preset 之間**完全
-相同**；far-active latch 觸發之前套用的是 far-silent 地板。同一個 `ctx.res_gain`
+hop 上生效：double-talk 期間套用的是 DT 地板（mild/balanced 共用 -20 dB，aggressive 為 -30 dB）；far-active latch 觸發之前套用的是 far-silent 地板。同一個 `ctx.res_gain`
 還決定注入的 comfort noise 量（振幅正比於 `sqrt(1 − G_res²)`，再乘該 bin 的 NR gain（下限 −10 dB），見
 `aec_cng_fill()`，範例的 `mono_form()` 在 CNG 步驟呼叫它——地板壓得越深、CNG 反而越多）。
 因此**整段錄音的平均值移動
@@ -496,7 +608,7 @@ lane 不自己輸出時域音訊，增益由你的每 hop 串接套用。
 
 ### 5.3 `destroy()` 的語意
 
-`aec_destroy()` 與 `anr_destroy()` 都**不釋放**你的 pool；`aec_destroy()` NULL 安全、可重複呼叫；`anr_destroy()` 釋放降噪器的內部資源。
+`aec_destroy()` 與 `anr_destroy()` 都**不釋放**你的 pool；`aec_destroy()` NULL 安全、可重複呼叫（只放開實例內部的參照）；`anr_destroy()` 對 pool 實例立即返回，只有 `anr_create()` 的 heap 實例才釋放記憶體。`AcIstft` 沒有 destroy。
 `posix_memalign` 之類由你配置的 pool，由你在 destroy 之後釋放。
 
 ### 5.4 診斷輸出去向

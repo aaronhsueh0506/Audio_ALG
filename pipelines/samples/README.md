@@ -6,7 +6,7 @@ the raw and mcab drivers) include the headers of this directory for the stage ca
 chain; the production targets (the 4-channel unit `AudioPipeline4Ch` and its archives) do not. Built and tested on its own (`make -C samples test`, also wired into the
 top-level `pipelines/Makefile`'s `make test`).
 
-Only the multi-channel linear AEC + beamformer (with its post-beam RES) is wrapped as one unit.
+Only the multi-channel linear AEC + beamformer is wrapped as one unit; it holds no RES.
 Noise reduction, comfort noise, synthesis and the neural post-filters are separate libraries
 that the integrator initialises (each with its own `mem_size` and `init`) and chains. There is
 no shared chain header: each example `main` initialises the libraries it uses and writes the
@@ -22,9 +22,22 @@ per-hop sequence itself (RES gain, `se_anr_stage_gain()`, `sk_min_f32()`,
 | `mcab_demo.c` | N linear AEC lanes wired to SRP-PHAT and the beamformer, without the production scheduling. |
 
 `common/se_stage.h` carries `se_frame_from_aec()`, which fills the `SeSpecFrame` of a mono
-`Aec` after `aec_process_context()` (its `g_res_ctx` is the AEC's own RES gain); the 4-channel
-unit fills the same view in `audio_pipeline_4ch_fuse()` (its `g_res_ctx` is the unit's post-beam
-RES gain). It also carries `se_hop_is_finite()`, the finite check on an emitted hop.
+`Aec` after `aec_process_context()` (its `g_res_ctx` is the AEC's own RES gain; mono keeps the RES inside the
+AEC call); the 4-channel unit fills the same view in `audio_pipeline_4ch_fuse()` with `g_res_ctx` NULL, and the
+4-channel examples create their own libaec `AecRes` (`aec_res_init()`) and call `se_res_stage_gain()` on that view.
+It also carries `se_hop_is_finite()`, the finite check on an emitted hop.
+
+## How the examples are called
+
+| Header | Sequence (app-side order) | Return values |
+|---|---|---|
+| `se_anr_stage.h` | `anr_config_for_mode_grid()` -> `anr_get_mem_size()` -> `anr_init()`; per hop `se_anr_stage_gain(nr, &frame, scratch, use_r2)`; on a refusal `anr_reset()` | gains owned by the denoiser, valid until its next call; `NULL` = a NULL argument or a refused hop |
+| `dfn_hop.h` | `dfn_hop_init_stage()` (48 kHz, caller-owned `AcIstft`) or `dfn_hop_init_bridge()`; per hop `dfn_hop_begin(E, P)` -> `while (dfn_hop_nn_begin() == 1) dfn_hop_nn_end(rc)` -> `dfn_hop_end(out)`; `dfn_hop_reset()` on a refusal | `DFN_HOP_INVALID` (-1), `DFN_HOP_SEQUENCE_ERROR` (-2) |
+| `ulcnet_nn_stage.{h,c}` | `ulcnet_nn_stage_mem_size()` -> `_init()` -> `_set_model()`; per hop `_begin()` (re/im arrays), `_begin_time()` or `_begin_complex()` -> `_nn_begin()` -> `_nn_end(rc)` -> `_end(out)`; `_reset()` on a refusal | `nn_begin` 1 = a frame to run, 0 = none (warm-up or reprime) |
+
+All three are public only in the sense of "copy and adapt": external parameters are the arguments
+shown (`use_r2`, the `AnrMode`, `atten_lim_db`, the ULCNet grid and `D`); the stage constants
+(`SE_PSD_SCALE`, `ULCNET_NN_STAGE_REPRIME_FRAMES`, the DFN scale powers of two) are internal.
 
 ## mcab_demo (`mcab_*` = Multi-Channel AEC-BF)
 

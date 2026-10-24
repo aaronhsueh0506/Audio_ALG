@@ -232,7 +232,7 @@ also expose `*_state_generation()`, which counts the times the C side zeroed the
 state (reset, refused commit) so a board with fixed-point accelerator state can
 refill it with quantized zeros. Each is compiled once with the io mode fixed at init: TIME
 (hop in, hop out; the class runs the framing on the caller's `FftHandle`) or
-FREQ (spectrum in, spectrum out; for chaining behind the AEC/GSC seam, whose
+FREQ (spectrum in, spectrum out; for chaining behind the AEC seam or the 4-channel unit, whose
 spectra are already in this center=False framing). Both AIAEC classes are one
 inference per hop from the first hop. The classes are a third TU on top of
 the two parity-tested files each composes, so those keep their own
@@ -248,6 +248,14 @@ header's warning block.
 Align-ULCNet state ownership (caller-owned pool, four state tensors bound in place,
 commit that validates and applies the mask) is documented in Align_ULCNet/README.md and
 implemented by ulcnet_model_io.c/.h.
+
+Per-model call order (with error handling), sequence diagrams and the external/internal
+parameter tables are in the HTML site, one page per model:
+[`aiaec_align_ulcnet_usage`](../docs/html/aiaec_align_ulcnet_usage.html),
+[`aiaec_deepvqe_s_usage`](../docs/html/aiaec_deepvqe_s_usage.html),
+[`aiaec_align_cruse_usage`](../docs/html/aiaec_align_cruse_usage.html),
+[`aiaec_cagcrn_usage`](../docs/html/aiaec_cagcrn_usage.html). Align-CRUSE and CAGCRN have no C
+pre/post class; their pages describe the Python reference and the ONNX boundary.
 
 ## Tests
 

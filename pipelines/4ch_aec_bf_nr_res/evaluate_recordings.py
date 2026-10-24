@@ -27,6 +27,7 @@ from . import (
     EqualWeightBeamformer,
     FourChannelAecConfig,
     FourChannelAecPipeline,
+    PostBeamResidualSuppressor,
 )
 from pipelines.aec_nr_pipeline import run_nr_spectrum, run_res
 
@@ -117,6 +118,10 @@ def evaluate_case(case_dir: Path, output_dir: Optional[Path] = None) -> dict:
     # drives front_process()/fuse() around the
     # externally owned SRP-PHAT/BF implementation.
     pipeline = FourChannelAecPipeline(config)
+    # The one post-beam RES lives in the evaluator: fuse() leaves res_gain None.
+    suppressors = [
+        PostBeamResidualSuppressor(sample_rate, pipeline.hop_size, pipeline.n_freqs)
+    ]
     fixture_beamformer = EqualWeightBeamformer()
     n_complete = min(microphones.shape[0], far_aligned.size) // pipeline.hop_size
     linear = np.zeros(n_complete * pipeline.hop_size, dtype=np.float32)
@@ -134,7 +139,7 @@ def evaluate_case(case_dir: Path, output_dir: Optional[Path] = None) -> dict:
         external = fixture_beamformer.process(pre.linear_hops, pre.contexts)
         result = pipeline.fuse(pre, external)
         linear[start:stop] = result.beamformed
-        contexts.append(result.context)
+        contexts.append(suppressors[0].process(result.context, result.aligned_render))
         delays.append(result.delay)
     n_frames = len(contexts)
     n_samples = linear.size
@@ -213,7 +218,7 @@ def evaluate_case(case_dir: Path, output_dir: Optional[Path] = None) -> dict:
         "hop_size": int(hop),
         "matched_filter_instances": pipeline.matched_filter_instance_count,
         "linear_filter_instances": pipeline.linear_filter_instance_count,
-        "residual_suppressor_instances": int(pipeline.post_beam_res is not None),
+        "residual_suppressor_instances": len(suppressors),
         "beamformer_configured": pipeline.beamformer_configured,
         "source_timeline_offset_samples": int(fixture_lag),
         "source_timeline_offset_ms": float(fixture_lag * 1000.0 / sample_rate),

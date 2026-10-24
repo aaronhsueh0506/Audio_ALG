@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Analyse a PTQ calibration artifact and help choose which patterns to keep.
+r"""Analyse a PTQ calibration artifact and help choose which patterns to keep.
 
 A calibration artifact is what ``inference.py calib`` writes: one array per
 graph input whose leading axis is the captured invocation ("frame"), either a

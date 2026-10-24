@@ -1,0 +1,158 @@
+<!doctype html>
+<html lang="zh-TW">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>AIAEC Align-CRUSE 使用與參數</title>
+<style>
+body{font-family:-apple-system,"Segoe UI",Roboto,"Noto Sans TC",sans-serif;max-width:62rem;margin:0 auto;padding:1rem 1.25rem 3rem;line-height:1.55;color:#1a222c;background:#fff}
+nav{font-size:.9rem;border-bottom:1px solid #ccd3dc;padding-bottom:.5rem;margin-bottom:1rem}
+nav a{margin-right:.7rem}
+h1{font-size:1.45rem;margin-bottom:.2em}
+h2{font-size:1.1rem;margin-top:1.7em;border-bottom:1px solid #dde3ea;padding-bottom:.2em}
+h3{font-size:1rem;margin-top:1.3em}
+code,pre{font-family:ui-monospace,SFMono-Regular,Menlo,Consolas,monospace;font-size:.85em}
+pre{background:#f5f7fa;border:1px solid #dde3ea;border-radius:6px;padding:.7rem .9rem;overflow-x:auto;line-height:1.35}
+.tbl{overflow-x:auto}
+table{border-collapse:collapse;font-size:.86rem}
+th,td{border:1px solid #ccd3dc;padding:.25rem .55rem;text-align:left;vertical-align:top}
+th{background:#eef1f5}
+.note{font-size:.88rem;color:#54606e}
+@media (prefers-color-scheme:dark){
+ body{background:#14181d;color:#dbe2ea}
+ pre{background:#1c2229;border-color:#2c343d}
+ th{background:#212932}
+ th,td{border-color:#2c343d}
+ nav,h2{border-color:#2c343d}
+ a{color:#7cb3ff}
+ .note{color:#9aa7b4}
+}
+</style>
+</head>
+<body>
+<nav><a href="index.html">索引</a><a href="conventions.html">慣例</a><a href="conventions_latency.html">延遲預算</a><a href="onnx_prepost.html">ONNX 邊界</a><a href="aiaec_align_ulcnet.html">Align-ULCNet</a><a href="aiaec_align_ulcnet_detail.html">Align-ULCNet 細節</a><a href="aiaec_align_ulcnet_usage.html">Align-ULCNet 使用</a><a href="aiaec_align_cruse.html">Align-CRUSE</a><a href="aiaec_align_cruse_usage.html"><b>Align-CRUSE 使用</b></a><a href="aiaec_deepvqe_s.html">DeepVQE-S</a><a href="aiaec_deepvqe_s_usage.html">DeepVQE-S 使用</a><a href="aiaec_cagcrn.html">CAGCRN</a><a href="aiaec_cagcrn_usage.html">CAGCRN 使用</a></nav>
+
+<h1>AIAEC Align-CRUSE：如何呼叫、流程時序圖、外部／內部參數</h1>
+
+<h2>概要</h2>
+<p>Align-CRUSE 是端到端 AEC+RES+NR：輸入是未對齊的 mic 與 far 複數頻譜（前面沒有 linear AEC），輸出是 real magnitude mask，乘在 mic 頻譜上（保留 mic 相位）。<b>目前沒有對應的 C pre/post 類別</b>（<a href="onnx_prepost.html">onnx_prepost</a> 的缺口表有一列）：可執行、有測試的呼叫路徑是 Python 參考實作與 ONNX 匯出／校正工具；C 端現有的零件只有 audiolib 的 <code>AcStft</code>／<code>AcIstft</code> 與 <code>aiaec_process.h</code> 的 <code>aiaec_apply_real_mask()</code>。模型內容、I/O 表、State 表、warm-up 的 T ≥ D 限制見 <a href="aiaec_align_cruse.html">aiaec_align_cruse</a>。</p>
+
+<h2>如何呼叫使用</h2>
+<h3>A. Python 串流參考（逐 hop，已測試）</h3>
+<ol>
+<li><code>load_model(checkpoint, device)</code> 回 <code>(model, grid)</code>：grid、alignment 設定全由 checkpoint 內的 contract 還原，<b>不讀 <code>config.ini</code></b>，所以推論不會悄悄偏離訓練設定。</li>
+<li><code>model.create_stream_state()</code>：新的一段串流＝新的全零 state（<code>alignment_mode="paper_global"</code> 的 checkpoint 會直接 <code>ValueError</code>，因為整段非因果）。</li>
+<li>每個 hop 把 mic／far 各推入 <code>StreamSTFT</code>，對每個吐出的框呼叫 <code>forward_stream(microphone, far_end, state)</code>，把 <code>res.enhanced[:, 0]</code> 推入 <code>StreamISTFT</code>。第一個 hop 的 STFT 不吐框、ISTFT 輸出 0 個樣本（centered 排程的 reflect 前綴）。</li>
+</ol>
+<pre>import soundfile as sf
+import torch
+from AIAEC.Align_CRUSE.inference import load_model
+from AIAEC.aiaec_streaming import StreamSTFT, StreamISTFT
+
+model, grid = load_model("checkpoint.pth", "cpu")   # grid/D 全部取自 checkpoint contract
+state = model.create_stream_state()                 # 新的一段串流 = 新的全零 state
+window = grid.window(device="cpu")                  # sqrt-Hann, 長度 n_fft
+H = grid.hop_len                                    # 16 kHz: 256
+mic_stft = StreamSTFT(grid.n_fft, H, window)
+far_stft = StreamSTFT(grid.n_fft, H, window)
+synth = StreamISTFT(grid.n_fft, H, window)
+
+mic, sr = sf.read("mic.wav", dtype="float32")       # 單聲道, 取樣率須等於 checkpoint 的 sr
+far, _ = sf.read("far.wav", dtype="float32")
+mic, far = torch.from_numpy(mic)[None], torch.from_numpy(far)[None]
+
+pieces = []
+with torch.no_grad():
+    for s in range(0, mic.shape[1] - H + 1, H):
+        for m, f in zip(mic_stft.push(mic[:, s:s + H]), far_stft.push(far[:, s:s + H])):
+            res = model.forward_stream(m.unsqueeze(1), f.unsqueeze(1), state)
+            pieces.append(synth.push(res.enhanced[:, 0]))   # 輸出頭一個 hop 為 0 個樣本
+sf.write("out.wav", torch.cat(pieces, dim=1)[0].numpy(), sr)</pre>
+<p class="note">片語已用隨機權重的模型代入 <code>load_model</code> 實際跑過（1 秒、16 kHz 輸入得到 15,616 個輸出樣本＝少第一個 hop）。命令列等價形式：<code>python3 AIAEC/Align_CRUSE/inference.py checkpoint.pth mic.wav far.wav out.wav [--device cpu] [--verify]</code>，或目錄模式 <code>--mic-dir D [--ref-dir D2] --out-dir D3</code>（沒給 <code>--ref-dir</code> 則 reference 為靜音，等同純降噪）。取樣率不同的 WAV 會先重取樣到 checkpoint 的 rate；兩路必須描述同一條時間軸。<code>--verify</code> 只列印差異、不改變結束碼。</p>
+<h3>B. 匯出與 PTQ 校正（給目標平台工具鏈）</h3>
+<pre>python3 AIAEC/Align_CRUSE/export_onnx.py --checkpoint checkpoint.pth \
+    --output output/align_cruse.onnx [--max-delay-frames D] [--opset 17] --verify
+python3 AIAEC/Align_CRUSE/inference.py calib --checkpoint checkpoint.pth \
+    --primary-dir /path/to/microphone --far-dir /path/to/far \
+    --frames 8192 --format bin --output calib/align_cruse</pre>
+<p>校正需要<b>一條不中斷的錄音</b>（拼接短檔會讓 <code>score_sum</code> 在每個接縫歸零）；<code>state_align_score_sum</code> 是 <code>float32_no_ptq</code>、<code>state_align_frame_index</code> 是 <code>int64_no_ptq</code>，不可整數量化。</p>
+<h3>C. 部署契約（以現有零件組成；沒有對應的 C 類別與測試）</h3>
+<ol>
+<li>graph 輸入：<code>mic</code>、<code>far</code>（各 <code>[1,1,257,2]</code>，未正規化 RI 頻譜）加 11 個 state；輸出：<code>output</code>（<code>[1,1,257]</code> mask）與 11 個 <code>*_out</code>，每個與同名輸入同 shape，由 runtime 綁在同一個位址。</li>
+<li>host 前端：audiolib 的 sqrt-Hann STFT（512/512/256）把 mic 與 far 轉成頻譜，排成 <code>[bin][re,im]</code> 餵圖；<b>圖內自己做 log-power</b>，C 端不做壓縮。</li>
+<li>host 後端：<code>aiaec_apply_real_mask(mic_re, mic_im, mask, out_re, out_im)</code>，再經 <code>AcIstft</code> 合成。</li>
+<li>匯出 metadata 沒有 <code>state_layout_version</code> 與 <code>c_descriptor</code>（缺席就是「C 端沒有綁定這個模型」）；<code>state_binding</code> 為 <code>in_place_same_address</code>。</li>
+</ol>
+
+<h2>流程時序圖</h2>
+<p><b>A. Python 參考（已測試）</b>：</p>
+<pre>
+caller                 StreamSTFT x2 / StreamISTFT        AlignCRUSE (PyTorch)
+  |                                 |                                |
+  | load_model(ckpt, dev) ----------------------------------------->| 由 contract 還原 grid, 權重
+  | create_stream_state() ------------------------------------------>| 8 個 cell（匯出後為 graph 的 11 個 state tensor）, 全零
+  |                                 |                                |
+  | push(mic hop), push(far hop) -->| hop 0: 0 幀; hop 1: 2 幀        |
+  | &lt;--------- frames ---------------|                                |
+  | forward_stream(m,f,state) ------------------------------------>| 就地推進 state
+  | &lt;--------- enhanced [B,1,257] ---------------------------------|
+  | synth.push(enhanced) ---------->| hop 0 輸出 0 樣本; 之後每幀 256  |
+</pre>
+<p><b>C. 部署契約（現有零件的組合）</b>：</p>
+<pre>
+caller            C 前處理 (audiolib)        NPU graph                C 後處理
+  |                    |                        |                         |
+  | mic/far hop ------>| AcStft: sqrt-Hann FFT512                         |
+  |                    | -- mic[1,1,257,2], far[1,1,257,2] ---------->|   |
+  |                    |                        | log-power, conv, align  |
+  |                    |                        | attention, GRU, decoder |
+  |                    |                        | output = mask[1,1,257]  |
+  |                    |                        | + 11 個 *_out (同位址)   |
+  |                    |    mask -------------------------------------->| aiaec_apply_real_mask
+  |                    |                        |                         | AcIstft: IFFT, OLA
+  | &lt;-------------------------------------------------------- out hop ----|
+</pre>
+<div class="tbl"><table>
+<tr><th>項目</th><th>值</th><th>出處</th></tr>
+<tr><td>hop</td><td>256 samples = 16 ms @16 kHz</td><td><code>grid.hop_len</code></td></tr>
+<tr><td>NN lookahead</td><td>0 hop；端到端延遲＝centered 半窗 256 samples（16 ms）</td><td><a href="aiaec_align_cruse.html">aiaec_align_cruse</a></td></tr>
+<tr><td>state 總量（D = 63）</td><td>572,612 bytes（11 個張量，含 1 個 int64）；<code>state_report</code> 以 KB 記為 559.2</td><td>匯出 wrapper 的 <code>initial_state()</code> 實測</td></tr>
+</table></div>
+
+<h2>函式清單：公開 vs 內部</h2>
+<div class="tbl"><table>
+<tr><th>分類</th><th>名稱</th></tr>
+<tr><td><b>公開（Python）</b></td><td><code>AIAEC.Align_CRUSE.inference.load_model</code>、<code>AlignCRUSE.create_stream_state</code>、<code>AlignCRUSE.forward_stream</code>、<code>AIAEC.aiaec_streaming.StreamSTFT</code>／<code>StreamISTFT</code>、<code>export_onnx.py</code>／<code>inference.py</code>（含 <code>calib</code>）兩個命令列入口</td></tr>
+<tr><td><b>公開（C，可用零件）</b></td><td><code>aiaec_apply_real_mask</code>（<code>aiaec_process.h</code>）；audiolib <code>ac_stft_*</code>／<code>ac_istft_*</code>、<code>ac_window_build</code></td></tr>
+<tr><td><b>內部</b></td><td>底線開頭的模組（<code>_cli_common.py</code>、<code>_streaming_export.py</code>、<code>_streaming_calibration.py</code> 等）是實作細節，不是命令列入口；<code>aiaec_streaming.py</code> 的 cell 類別（<code>GlobalDelayAttentionCell</code> 等）與 <code>AlignCRUSE.forward</code>（整段版）供測試與訓練使用</td></tr>
+</table></div>
+
+<h2>參數表</h2>
+<h3>外部：第三方可調</h3>
+<div class="tbl"><table>
+<tr><th>名稱</th><th>位置</th><th>範圍</th><th>預設</th><th>何時設定</th><th>說明</th></tr>
+<tr><td><code>alignment_mode</code></td><td><code>config.ini [model]</code>、<code>AlignCRUSE(...)</code></td><td><code>causal_running</code>／<code>paper_global</code></td><td><code>causal_running</code></td><td>訓練</td><td>部署只能用 <code>causal_running</code>（逐幀只用過去證據）；<code>paper_global</code> 整段非因果，不可串流</td></tr>
+<tr><td><code>max_delay_seconds</code></td><td><code>AlignCRUSE(...)</code></td><td>秒</td><td>1.0（16 kHz 上 D = 63）</td><td>訓練（config.ini [model] 內為註解掉的建構子預設值 1.0，取消註解即可覆寫）</td><td>delay 搜尋範圍；D 數的是 hop，grid 改了 D 就不同</td></tr>
+<tr><td><code>--max-delay-frames</code>、<code>--opset</code>(17)、<code>--verify</code></td><td><code>export_onnx.py</code></td><td>D</td><td>checkpoint 的 D</td><td>匯出</td><td>D 與 calibration、板端 state 配置須一致</td></tr>
+<tr><td>位置參數、<code>--device</code>、<code>--verify</code>、<code>--mic-dir</code>／<code>--ref-dir</code>／<code>--out-dir</code></td><td><code>inference.py</code></td><td>—</td><td>—</td><td>離線推論</td><td>見上方 A</td></tr>
+<tr><td><code>calib</code>：<code>--checkpoint</code>／<code>--primary-dir</code>／<code>--far-dir</code>／<code>--output</code>／<code>--format</code>(bin|npz)／<code>--frames</code>(256)／<code>--max-delay-frames</code>／<code>--seed</code>(42)／<code>--onnx</code>／<code>--pair-replace</code></td><td><code>inference.py calib</code></td><td>—</td><td>—</td><td>PTQ 校正</td><td>primary 為 mic WAV；同 process 匯出並 parity 檢查 graph；需連續錄音</td></tr>
+</table></div>
+<h3>內部：存在且可改，但不建議開放</h3>
+<div class="tbl"><table>
+<tr><th>名稱</th><th>值</th><th>位置</th><th>不開放的原因</th></tr>
+<tr><td><code>projection_size</code>、<code>gru_hidden</code></td><td>64、192</td><td><code>AlignCRUSE(...)</code></td><td>權重形狀；為對應論文 0.75 M class 的重建選擇，寫進 checkpoint contract</td></tr>
+<tr><td>encoder／decoder 通道數、<code>4x3</code> 因果 conv、頻率 stride-2</td><td>mic 16,40,72,32；far 8,24；decoder 32,48,48</td><td><code>model.py</code></td><td>拓撲決定所有 state 形狀</td></tr>
+<tr><td>grid</td><td>16 kHz，512/512/256</td><td><code>config.ini [signal]</code>、checkpoint contract</td><td>checkpoint 內記錄完整 grid，推論遇到不相容設定直接拒絕</td></tr>
+<tr><td>state 精度政策</td><td><code>state_align_score_sum</code>＝float32 不量化；<code>state_align_frame_index</code>＝int64 不量化</td><td><code>_streaming_export.py</code></td><td>score 是無衰減累加器，沒有任何有限長校正錄音能決定與部署時長無關的 int8 範圍</td></tr>
+<tr><td>訓練配方（Adam 1.5e-4、PLCPA c = 0.3 β = 0.7、50 epoch）</td><td>—</td><td><code>config.ini</code>、<code>AIAEC/README.md</code></td><td>換 loss 即換 <code>loss_version</code>，舊 checkpoint 會被拒絕續訓</td></tr>
+</table></div>
+
+<h2>相關檔案與測試路徑</h2>
+<ul>
+<li><code>AIAEC/Align_CRUSE/model.py</code>、<code>inference.py</code>、<code>export_onnx.py</code>、<code>train.py</code>、<code>config.ini</code>；<code>AIAEC/aiaec_streaming.py</code>、<code>AIAEC/aiaec_process.c</code> / <code>.h</code></li>
+<li>測試：<code>AIAEC/tests/test_streaming_align_cruse.py</code>、<code>test_export_stateless.py</code>、<code>test_onnx_state_contract_names.py</code>、<code>test_candidate_models.py</code></li>
+<li>同類頁面：<a href="aiaec_align_cruse.html">aiaec_align_cruse</a>、<a href="aiaec_cagcrn_usage.html">aiaec_cagcrn_usage</a>、<a href="onnx_prepost.html">onnx_prepost</a>、<a href="index.html">index</a></li>
+<li>文件：<a href="../../AIAEC/Align_CRUSE/README.md">README.md</a>、<a href="../../AIAEC/README.md">AIAEC/README.md</a></li>
+</ul>
+</body>
+</html>

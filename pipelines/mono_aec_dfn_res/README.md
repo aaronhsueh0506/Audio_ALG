@@ -87,6 +87,32 @@ of the geometry it was compiled against; a product fills that descriptor from
 its model's exported metadata instead, which is what makes a mismatched graph
 detectable.
 
+## Calling sequence and parameters
+
+```
+App                 Aec           DfnHop + DfnResStage | DfnRateBridge      AcIstft (48 kHz only)
+ |-- se_derive; aec_get_mem_size / aec_init -->|
+ |-- dfn_res_stage_get_mem_requirements / dfn_res_stage_init_ex            (48 kHz host)
+ |   or dfn_rate_bridge_get_mem_requirements / dfn_rate_bridge_init_ex     (8 / 16 kHz host)
+ |-- dfn_hop_init_stage(...) or dfn_hop_init_bridge(...)
+ |   per hop: aec_process_context --> se_frame_from_aec --> P = E * min(1, g_res_ctx) (+ comfort noise, off by default)
+ |            --> dfn_hop_begin(E, P) --> while (dfn_hop_nn_begin == 1) { model; dfn_hop_nn_end } --> dfn_hop_end --> out
+ |   refused hop: aec_reset + comfort-noise rng = SE_CNG_RNG_SEED + dfn_hop_reset   (rig_reset())
+ |   never reset the stage on an AEC delay change
+ |-- aec_destroy; dfn_res_stage_destroy | dfn_rate_bridge_destroy; release the blocks
+```
+
+External parameters (board-skeleton command line, `dfn_example_args.h`): `--sample-rate` (8000 / 16000 default
+/ 48000), the delay profile `--delay-mode matched|fixed|external` with `--delay-num-filters` (1..5) and
+`--fixed-delay`, `--erb-fwd` / `--erb-inv` (the exported ERB matrices; without them the skeleton runs a
+fail-open smoke only), `--atten-lim` (dB, 0 = unlimited; `dfn_res_stage_set_atten_lim()` between hops),
+`--cng` (comfort noise, off by default). Strength of the RES gain: `aec_set_preset()`. Internal: the
+stage grid (48 kHz / 1024 / 512 only), the `DFN_RES_STAGE_IN_SCALE` / `_OUT_SCALE` powers of two, the rate
+bridge's FIR resamplers and frame schedule, the AEC and DFN2 model constants. Public functions are the
+`dfn_res_stage_*`, `dfn_rate_bridge_*` of `dfn_res_stage.h` / `dfn_rate_bridge.h` and the
+`dfn_hop_*` of `samples/dfn_hop.h`; the stage and the bridge carry 32-byte descriptors
+(`DFN_RES_STAGE_LAYOUT_VERSION`, `DFN_RATE_BRIDGE_LAYOUT_VERSION`).
+
 ## Compute admission
 
 `pipelines/tools/profile_dfn2_ops.py` counts 2,134,971 trainable parameters

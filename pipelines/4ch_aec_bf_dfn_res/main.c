@@ -1,10 +1,11 @@
 /* 4ch_aec_bf_dfn_res board skeleton: four-channel linear AEC -> beamformer (bf) -> RES ->
  * DeepFilterNet2 composed from the library calls. Example code: the linear AEC + BF unit
- * (audio_pipeline_4ch.h, whose fuse carries the post-beam RES gain), P = E * G_res (+ comfort
- * noise) formed here, and samples/dfn_hop.h for the DFN2 hop. Per hop:
+ * (audio_pipeline_4ch.h), the post-beam RES (lib/aec AecRes) initialised here, P = E * G_res
+ * (+ comfort noise) formed here, and samples/dfn_hop.h for the DFN2 hop. Per hop:
  *
  *     audio_pipeline_4ch_process(unit, mics, far, &beam, &info);   // delay, lanes, SRP-PHAT, BF
- *     audio_pipeline_4ch_fuse(unit, &frame);                        // E, R2, CN and G_res
+ *     audio_pipeline_4ch_fuse(unit, &frame);                        // E, R2, CN
+ *     G_res = se_res_stage_gain(res, &frame);                       // the RES over that frame
  *     P = E * G_res (+ comfort noise);                              // before the DFN hop begins
  *     dfn_hop_process(&hop, frame.e, P, out);                       // or begin / nn_begin / ...
  *
@@ -16,6 +17,7 @@
  * The program builds the pool from the command-line delay profile and ERB matrices, installs a
  * fail-open model callback and runs a few silent hops. Replace run_accelerator() with the board
  * runtime call. */
+#include "aec_res.h"
 #include "audio_pipeline_4ch.h"
 #include "samples/dfn_hop.h"
 #include "utility/mem_align.h"
@@ -55,10 +57,12 @@ typedef struct DfnSample {
     DfnResStageConfig stage_cfg;
     DfnRateBridgeConfig bridge_cfg;
     DFN2ModelIoDescriptor descriptor;
+    AecConfig res_cfg;
     int use_bridge;                   /* host below 48 kHz */
-    size_t vec_bytes, spec_bytes, stage_bytes, istft_bytes, total;
+    size_t vec_bytes, spec_bytes, res_bytes, stage_bytes, istft_bytes, total;
     void *pool;
     AudioPipeline4Ch *unit;
+    AecRes *res;
     float *unity, *total_gain;        /* the RES gain path: min(1, G_res) */
     Complex *post;                    /* P */
     uint32_t rng;
@@ -133,6 +137,11 @@ static int dfn_plan(DfnSample *s) {
         four_aec_nr_res_get_mem_breakdown(&s->unit_cfg.core,&s->grid) != 0 ||
         !isfinite(s->args.atten_lim_db))
         return -1;
+    /* The RES: the balanced preset's AecConfig on the unit's grid. */
+    aec_config_from_preset(&s->res_cfg,AEC_PRESET_BALANCED,s->args.sample_rate);
+    s->res_cfg.fft_size=s->grid.fft_size;
+    s->res_bytes=aec_res_get_mem_size(&s->res_cfg);
+    if (s->res_bytes == 0) return -1;
     s->use_bridge=s->args.sample_rate != DFN2_SR;
     s->n_freqs=s->grid.n_freqs;
     s->vec_bytes=ALIGN16((size_t)s->n_freqs*sizeof(float));
@@ -161,8 +170,8 @@ static int dfn_plan(DfnSample *s) {
         if (s->istft_bytes == 0) return -1;
         s->stage_bytes=(size_t)stage_req.bytes;
     }
-    /* unit, unity, total gain, P, then the stage (or bridge) and its synthesis */
-    s->total=ALIGN16((size_t)s->unit_req.bytes)+2*s->vec_bytes+s->spec_bytes+
+    /* unit, RES, unity, total gain, P, then the stage (or bridge) and its synthesis */
+    s->total=ALIGN16((size_t)s->unit_req.bytes)+ALIGN16(s->res_bytes)+2*s->vec_bytes+s->spec_bytes+
              ALIGN16(s->stage_bytes)+ALIGN16(s->istft_bytes)+
              (s->use_bridge ? 0 : ALIGN16((size_t)DFN2_N_BINS*sizeof(Complex)));
     return 0;
@@ -171,6 +180,7 @@ static int dfn_plan(DfnSample *s) {
 /* A refused hop: back to the state of a fresh pipeline, every stage together. */
 static void dfn_reset(DfnSample *s) {
     audio_pipeline_4ch_reset(s->unit);
+    aec_res_reset(s->res);
     s->rng=SE_CNG_RNG_SEED;
     dfn_hop_reset(&s->hop);
 }
@@ -182,10 +192,10 @@ static void dfn_cleanup(void *user) {
     if (s->unit) audio_pipeline_4ch_destroy(s->unit);
     free(s->pool);
     s->pool=NULL;
-    s->bridge=NULL; s->stage=NULL; s->unit=NULL; s->istft=NULL;
+    s->bridge=NULL; s->stage=NULL; s->unit=NULL; s->res=NULL; s->istft=NULL;
 }
 
-/* Carves the planned pool: the unit, the P buffers, then the stage (or bridge) and its
+/* Carves the planned pool: the unit, the RES, the P buffers, then the stage (or bridge) and its
  * synthesis. */
 static int dfn_build(DfnSample *s) {
     unsigned char *cur;
@@ -195,6 +205,11 @@ static int dfn_build(DfnSample *s) {
     s->unit=audio_pipeline_4ch_init_ex(cur,(size_t)s->unit_req.bytes,&s->unit_cfg,&s->unit_req);
     cur+=ALIGN16((size_t)s->unit_req.bytes);
     if (!s->unit) return -1;
+    s->res=aec_res_init(cur,s->res_bytes,&s->res_cfg);
+    cur+=ALIGN16(s->res_bytes);
+    if (!s->res || aec_res_n_bins(s->res) != audio_pipeline_4ch_n_freqs(s->unit) ||
+        aec_res_hop_size(s->res) != audio_pipeline_4ch_hop_size(s->unit))
+        return -1;
     s->unity=(float *)cur;      cur+=s->vec_bytes;
     s->total_gain=(float *)cur; cur+=s->vec_bytes;
     s->post=(Complex *)cur;     cur+=s->spec_bytes;
@@ -235,7 +250,7 @@ static int dfn_setup(void *user, McabHopView *view) {
     if (dfn_example_load_matrices(&s->args, g_erb_fwd, g_erb_inv, name) != 0)
         return 1;
 
-    /* The unit's RES is on by default (balanced); the comfort-noise fill is the program's
+    /* The RES (balanced, built in dfn_plan) is always on; the comfort-noise fill is the program's
      * switch: E and P must share a phase for the DFN2 stage, so it is off unless asked for. */
     s->unit_cfg = audio_pipeline_4ch_default_config(s->args.sample_rate);
     s->unit_cfg.core.fft_size = 0;   /* the core's rate default */
@@ -282,23 +297,25 @@ static int dfn_read(void *user, McabHopView *view, int frame) {
 }
 /* P = E * min(1, G_res), plus comfort noise on the bins the RES cut when enabled (no denoiser:
  * its gain is the unity vector). */
-static void dfn_form(DfnSample *s, const SeSpecFrame *f) {
-    sk_min_f32(s->total_gain,s->unity,f->g_res_ctx,s->n_freqs);
+static void dfn_form(DfnSample *s, const SeSpecFrame *f, const float *g_res) {
+    sk_min_f32(s->total_gain,s->unity,g_res,s->n_freqs);
     sk_capply_gain_f32(s->post,f->e,s->total_gain,s->n_freqs);
     if (s->args.enable_cng && f->cn)
-        aec_cng_fill(&s->rng,s->post,f->cn,f->g_res_ctx,s->unity,SE_CNG_NR_GAIN_FLOOR,s->n_freqs);
+        aec_cng_fill(&s->rng,s->post,f->cn,g_res,s->unity,SE_CNG_NR_GAIN_FLOOR,s->n_freqs);
 }
 
 static int dfn_process(void *user, McabHopView *view, int frame) {
     DfnSample *s=user; (void)view; (void)frame;
     AudioPipeline4ChBeam beam;
     SeSpecFrame spec;
+    const float *g_res;
     if (audio_pipeline_4ch_process(s->unit,microphones,far,&beam,NULL) != FOUR_AEC_NR_RES_OK ||
-        audio_pipeline_4ch_fuse(s->unit,&spec) != FOUR_AEC_NR_RES_OK || !spec.g_res_ctx) {
+        audio_pipeline_4ch_fuse(s->unit,&spec) != FOUR_AEC_NR_RES_OK ||
+        !(g_res=se_res_stage_gain(s->res,&spec))) {
         dfn_reset(s);
         return 1;
     }
-    dfn_form(s,&spec);
+    dfn_form(s,&spec,g_res);
     if (dfn_hop_process(&s->hop,spec.e,s->post,output) != 0) {
         dfn_reset(s);
         return 1;

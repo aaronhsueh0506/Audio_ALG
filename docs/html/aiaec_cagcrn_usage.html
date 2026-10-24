@@ -1,0 +1,162 @@
+<!doctype html>
+<html lang="zh-TW">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>AIAEC CAGCRN 使用與參數</title>
+<style>
+body{font-family:-apple-system,"Segoe UI",Roboto,"Noto Sans TC",sans-serif;max-width:62rem;margin:0 auto;padding:1rem 1.25rem 3rem;line-height:1.55;color:#1a222c;background:#fff}
+nav{font-size:.9rem;border-bottom:1px solid #ccd3dc;padding-bottom:.5rem;margin-bottom:1rem}
+nav a{margin-right:.7rem}
+h1{font-size:1.45rem;margin-bottom:.2em}
+h2{font-size:1.1rem;margin-top:1.7em;border-bottom:1px solid #dde3ea;padding-bottom:.2em}
+h3{font-size:1rem;margin-top:1.3em}
+code,pre{font-family:ui-monospace,SFMono-Regular,Menlo,Consolas,monospace;font-size:.85em}
+pre{background:#f5f7fa;border:1px solid #dde3ea;border-radius:6px;padding:.7rem .9rem;overflow-x:auto;line-height:1.35}
+.tbl{overflow-x:auto}
+table{border-collapse:collapse;font-size:.86rem}
+th,td{border:1px solid #ccd3dc;padding:.25rem .55rem;text-align:left;vertical-align:top}
+th{background:#eef1f5}
+.note{font-size:.88rem;color:#54606e}
+@media (prefers-color-scheme:dark){
+ body{background:#14181d;color:#dbe2ea}
+ pre{background:#1c2229;border-color:#2c343d}
+ th{background:#212932}
+ th,td{border-color:#2c343d}
+ nav,h2{border-color:#2c343d}
+ a{color:#7cb3ff}
+ .note{color:#9aa7b4}
+}
+</style>
+</head>
+<body>
+<nav><a href="index.html">索引</a><a href="conventions.html">慣例</a><a href="conventions_latency.html">延遲預算</a><a href="onnx_prepost.html">ONNX 邊界</a><a href="aiaec_align_ulcnet.html">Align-ULCNet</a><a href="aiaec_align_ulcnet_detail.html">Align-ULCNet 細節</a><a href="aiaec_align_ulcnet_usage.html">Align-ULCNet 使用</a><a href="aiaec_align_cruse.html">Align-CRUSE</a><a href="aiaec_align_cruse_usage.html">Align-CRUSE 使用</a><a href="aiaec_deepvqe_s.html">DeepVQE-S</a><a href="aiaec_deepvqe_s_usage.html">DeepVQE-S 使用</a><a href="aiaec_cagcrn.html">CAGCRN</a><a href="aiaec_cagcrn_usage.html"><b>CAGCRN 使用</b></a></nav>
+
+<h1>AIAEC CAGCRN：如何呼叫、流程時序圖、外部／內部參數</h1>
+
+<h2>概要</h2>
+<p>CAGCRN 是端到端 AEC+RES+NR 的備援候選：輸入是未對齊的 mic 與 far 複數頻譜，輸出是 bounded complex ratio mask（Tanh，<code>[1,1,257,2]</code>），乘在 mic 頻譜上。<b>目前沒有對應的 C pre/post 類別</b>（<a href="onnx_prepost.html">onnx_prepost</a> 的缺口表有一列）：可執行、有測試的路徑是 Python 參考實作與 ONNX 匯出／校正；C 端現有零件只有 audiolib 的 <code>AcStft</code>／<code>AcIstft</code> 與 <code>aiaec_process.h</code> 的 <code>aiaec_apply_complex_mask()</code>。模型內容、I/O 表、State 表見 <a href="aiaec_cagcrn.html">aiaec_cagcrn</a>。</p>
+
+<h2>如何呼叫使用</h2>
+<h3>A. Python 串流參考（逐 hop，已測試）</h3>
+<ol>
+<li><code>load_model(checkpoint, device)</code> 回 <code>(model, grid)</code>，grid 與模型設定全取自 checkpoint contract（不讀 <code>config.ini</code>）。</li>
+<li><code>model.create_stream_state()</code> 建立全零 state；其中 <code>cata_gate_log</code> 是推論期常數（可學的 delay window 已預先算好），不是跨呼叫的 state。</li>
+<li>每個 hop 把 mic／far 推入 <code>StreamSTFT</code>，對每個吐出的框呼叫 <code>forward_stream(microphone=..., far_end=..., state=...)</code>，把 <code>res.enhanced[:, 0]</code> 推入 <code>StreamISTFT</code>；第一個 hop 的 STFT 不吐框、ISTFT 輸出 0 個樣本。</li>
+</ol>
+<pre>import soundfile as sf
+import torch
+from AIAEC.CAGCRN.inference import load_model
+from AIAEC.aiaec_streaming import StreamSTFT, StreamISTFT
+
+model, grid = load_model("checkpoint.pth", "cpu")   # grid/D 全部取自 checkpoint contract
+state = model.create_stream_state()                 # 新的一段串流 = 新的全零 state
+window = grid.window(device="cpu")                  # sqrt-Hann, 長度 n_fft
+H = grid.hop_len                                    # 16 kHz: 256
+mic_stft = StreamSTFT(grid.n_fft, H, window)
+far_stft = StreamSTFT(grid.n_fft, H, window)
+synth = StreamISTFT(grid.n_fft, H, window)
+
+mic, sr = sf.read("mic.wav", dtype="float32")       # 單聲道, 取樣率須等於 checkpoint 的 sr
+far, _ = sf.read("far.wav", dtype="float32")
+mic, far = torch.from_numpy(mic)[None], torch.from_numpy(far)[None]
+
+pieces = []
+with torch.no_grad():
+    for s in range(0, mic.shape[1] - H + 1, H):
+        for m, f in zip(mic_stft.push(mic[:, s:s + H]), far_stft.push(far[:, s:s + H])):
+            res = model.forward_stream(m.unsqueeze(1), f.unsqueeze(1), state)
+            pieces.append(synth.push(res.enhanced[:, 0]))   # 輸出頭一個 hop 為 0 個樣本
+sf.write("out.wav", torch.cat(pieces, dim=1)[0].numpy(), sr)</pre>
+<p class="note">片語已用隨機權重的模型代入 <code>load_model</code> 實際跑過（1 秒、16 kHz 輸入得到 15,616 個輸出樣本）。命令列等價形式：<code>python3 AIAEC/CAGCRN/inference.py checkpoint.pth mic.wav far.wav out.wav [--device cpu] [--verify]</code>，或目錄模式 <code>--mic-dir D [--ref-dir D2] --out-dir D3</code>。</p>
+<h3>B. 匯出與 PTQ 校正</h3>
+<pre>python3 AIAEC/CAGCRN/export_onnx.py --checkpoint checkpoint.pth \
+    --output output/cagcrn.onnx [--max-delay-frames D] [--opset 17] --verify
+python3 AIAEC/CAGCRN/inference.py calib --checkpoint checkpoint.pth \
+    --primary-dir /path/to/microphone --far-dir /path/to/far \
+    --frames 8192 --format bin --output calib/cagcrn
+python3 AIAEC/CAGCRN/export_erb_matrix.py --checkpoint checkpoint.pth \
+    --output-dir output --format all     # checkpoint-exact ERB map，供工具鏈比對</pre>
+<h3>C. 部署契約（以現有零件組成；沒有對應的 C 類別與測試）</h3>
+<ol>
+<li>graph 輸入 21 個：<code>mic</code>、<code>far</code>（各 <code>[1,1,257,2]</code>，未正規化 RI 頻譜）加 19 個 state；輸出：<code>output</code>（<code>[1,1,257,2]</code> 的 CRM，最後一軸為 re／im）與 19 個 <code>*_out</code>，每個與同名輸入同 shape，綁在同一個位址。兩顆 GRU hidden 疊成單一 <code>h_gru (1,2,25,24)</code>（far 在前）。</li>
+<li>ERB merge／split 與 Tanh mask 都在圖內；C 端不載入任何 ERB 矩陣。</li>
+<li>host 後端：把 <code>output</code> 拆成 mask_re／mask_im，呼叫 <code>aiaec_apply_complex_mask(mic_re, mic_im, mask_re, mask_im, out_re, out_im)</code>，再經 <code>AcIstft</code> 合成。</li>
+<li>匯出 metadata 沒有 <code>state_layout_version</code> 與 <code>c_descriptor</code>（缺席＝C 端沒有綁定這個模型）；<code>state_binding</code> 為 <code>in_place_same_address</code>。</li>
+</ol>
+
+<h2>流程時序圖</h2>
+<p><b>A. Python 參考（已測試）</b>：</p>
+<pre>
+caller                 StreamSTFT x2 / StreamISTFT        CAGCRN (PyTorch)
+  |                                 |                                |
+  | load_model(ckpt, dev) ----------------------------------------->| 由 contract 還原 grid, 權重
+  | create_stream_state() ------------------------------------------>| 21 個 cell/常數（20 個 cell + cata_gate_log 常數；graph 為 19 個 state tensor）, 全零
+  |                                 |                                |
+  | push(mic hop), push(far hop) -->| hop 0: 0 幀; hop 1: 2 幀        |
+  | &lt;--------- frames ---------------|                                |
+  | forward_stream(microphone=m, far_end=f, state) ----------------->| 就地推進 state
+  | &lt;--------- enhanced [B,1,257] ---------------------------------|
+  | synth.push(enhanced) ---------->| hop 0 輸出 0 樣本; 之後每幀 256  |
+</pre>
+<p><b>C. 部署契約（現有零件的組合）</b>：</p>
+<pre>
+caller            C 前處理 (audiolib)        NPU graph                C 後處理
+  |                    |                        |                         |
+  | mic/far hop ------>| AcStft: sqrt-Hann FFT512                         |
+  |                    | -- mic[1,1,257,2], far[1,1,257,2] ---------->|   |
+  |                    |                        | ERB merge, encoders,    |
+  |                    |                        | CATA, TFGRU, TFAG,      |
+  |                    |                        | decoder, Tanh, ERB split|
+  |                    |                        | output = CRM[1,1,257,2] |
+  |                    |                        | + 19 個 *_out (同位址)   |
+  |                    |    mask -------------------------------------->| aiaec_apply_complex_mask
+  |                    |                        |                         | AcIstft: IFFT, OLA
+  | &lt;-------------------------------------------------------- out hop ----|
+</pre>
+<div class="tbl"><table>
+<tr><th>項目</th><th>值</th><th>出處</th></tr>
+<tr><td>hop</td><td>256 samples = 16 ms @16 kHz</td><td><code>grid.hop_len</code></td></tr>
+<tr><td>NN lookahead</td><td>0 hop；端到端延遲＝centered 半窗 256 samples（16 ms）</td><td><a href="aiaec_cagcrn.html">aiaec_cagcrn</a></td></tr>
+<tr><td>state 總量（D = 63）</td><td>480,912 bytes（19 個 float32 張量）；<code>state_report</code> 另含 0.2 KB 的 <code>cata_gate_log</code> 常數，合計記為 469.9 KB</td><td>匯出 wrapper 的 <code>initial_state()</code> 實測</td></tr>
+<tr><td>NPU 風險</td><td>CATA 逐幀仍有 <code>[B,24,1,63,49]</code>（約 74k 元素）的 broadcast；decoder 的 <code>ConvTranspose2d</code> 輸出大小須在匯出前固定</td><td><a href="aiaec_cagcrn.html">aiaec_cagcrn</a></td></tr>
+</table></div>
+
+<h2>函式清單：公開 vs 內部</h2>
+<div class="tbl"><table>
+<tr><th>分類</th><th>名稱</th></tr>
+<tr><td><b>公開（Python）</b></td><td><code>AIAEC.CAGCRN.inference.load_model</code>、<code>CAGCRN.create_stream_state</code>、<code>CAGCRN.forward_stream</code>、<code>StreamSTFT</code>／<code>StreamISTFT</code>、<code>export_onnx.py</code>／<code>inference.py</code>（含 <code>calib</code>）／<code>export_erb_matrix.py</code> 命令列入口</td></tr>
+<tr><td><b>公開（C，可用零件）</b></td><td><code>aiaec_apply_complex_mask</code>（<code>aiaec_process.h</code>）；audiolib <code>ac_stft_*</code>／<code>ac_istft_*</code>、<code>ac_window_build</code></td></tr>
+<tr><td><b>內部</b></td><td>底線開頭的模組（<code>_cli_common.py</code>、<code>_streaming_export.py</code>、<code>_streaming_calibration.py</code> 等）；<code>model.py</code> 的 <code>_stream_*</code> helper（<code>_stream_encoder_block</code>、<code>_stream_cata</code>、<code>_stream_tfgru</code>、<code>_stream_tfag</code>、<code>_stream_decoder_block</code>）與 <code>CrossAttentionTemporalAlignment</code>、<code>TFGRU</code>、<code>TFAG</code>、<code>ErbBandCodec</code></td></tr>
+</table></div>
+
+<h2>參數表</h2>
+<h3>外部：第三方可調</h3>
+<div class="tbl"><table>
+<tr><th>名稱</th><th>位置</th><th>範圍</th><th>預設</th><th>何時設定</th><th>說明</th></tr>
+<tr><td><code>max_delay_seconds</code></td><td><code>CAGCRN(...)</code>（<code>config.ini [model]</code> 為空，用預設）</td><td>秒</td><td>1.0（16 kHz 上 D = 63）</td><td>訓練</td><td>可微分 soft delay-window gate 的緩衝長度；論文的整數 <code>floor(D)</code> 窗無法以一般 autograd 訓練，因此與任何未公開的作者 checkpoint 不相容</td></tr>
+<tr><td><code>high_erb_bands</code></td><td><code>CAGCRN(...)</code></td><td>整數</td><td>32</td><td>訓練</td><td>2 kHz 以上的 ERB 帶數；16 kHz grid 上 <code>compressed_bins</code> = 97；改了權重形狀就變</td></tr>
+<tr><td><code>--max-delay-frames</code>、<code>--opset</code>(17)、<code>--verify</code></td><td><code>export_onnx.py</code></td><td>D</td><td>checkpoint 的 D</td><td>匯出</td><td>D 與 calibration、板端 state 配置須一致</td></tr>
+<tr><td>位置參數、<code>--device</code>、<code>--verify</code>、<code>--mic-dir</code>／<code>--ref-dir</code>／<code>--out-dir</code></td><td><code>inference.py</code></td><td>—</td><td>—</td><td>離線推論</td><td>見上方 A</td></tr>
+<tr><td><code>calib</code>：<code>--checkpoint</code>／<code>--primary-dir</code>／<code>--far-dir</code>／<code>--output</code>／<code>--format</code>(bin|npz)／<code>--frames</code>(256)／<code>--max-delay-frames</code>／<code>--seed</code>(42)／<code>--onnx</code>／<code>--pair-replace</code></td><td><code>inference.py calib</code></td><td>—</td><td>—</td><td>PTQ 校正</td><td>primary 為 mic WAV；同 process 匯出並 parity 檢查 graph</td></tr>
+<tr><td><code>--checkpoint</code>、<code>--output-dir</code>、<code>--format</code>(bin|npy|c|all)</td><td><code>export_erb_matrix.py</code></td><td>—</td><td>—</td><td>匯出</td><td>checkpoint-exact ERB 前向／反向矩陣，供工具鏈比對</td></tr>
+</table></div>
+<h3>內部：存在且可改，但不建議開放</h3>
+<div class="tbl"><table>
+<tr><th>名稱</th><th>值</th><th>位置</th><th>不開放的原因</th></tr>
+<tr><td>encoder 通道數、CATA、TFGRU、TFAG、decoder 結構</td><td>mic 12,12,12,24；far 12,24,24,24；TF-GRU 24 通道；TFAG 12</td><td><code>model.py</code></td><td>拓撲決定全部 19 個 state 形狀；論文未公開的細節以重建選擇固定</td></tr>
+<tr><td><code>raw_window</code>（可學的 delay window）</td><td>推論期為常數，預先算成 <code>cata_gate_log</code></td><td><code>model.py</code></td><td>訓練產物；不是部署旋鈕</td></tr>
+<tr><td>ERB 設定</td><td>2 kHz 以下線性 65 bins + 高頻 32 帶 → 97</td><td><code>ErbBandCodec</code></td><td>固定矩陣屬於權重的一部分（12,929 個 buffer 值）</td></tr>
+<tr><td>grid</td><td>16 kHz，512/512/256</td><td><code>config.ini [signal]</code>、checkpoint contract</td><td>checkpoint 記錄完整 grid，推論遇不相容設定直接拒絕</td></tr>
+<tr><td>訓練配方（AdamW 1.2e-3、MSE + SI-SNR + 參數 L1、batch 32、50 epoch）</td><td>—</td><td><code>config.ini</code>、<code>AIAEC/README.md</code></td><td>L1 以參數平均絕對值正規化，記錄在 checkpoint 的 loss version；改配方等於換 loss version</td></tr>
+</table></div>
+
+<h2>相關檔案與測試路徑</h2>
+<ul>
+<li><code>AIAEC/CAGCRN/model.py</code>、<code>inference.py</code>、<code>export_onnx.py</code>、<code>export_erb_matrix.py</code>、<code>train.py</code>、<code>config.ini</code>；<code>AIAEC/aiaec_streaming.py</code>、<code>AIAEC/aiaec_process.c</code> / <code>.h</code></li>
+<li>測試：<code>AIAEC/tests/test_streaming_cagcrn.py</code>、<code>test_export_stateless.py</code>、<code>test_onnx_state_contract_names.py</code>、<code>test_candidate_models.py</code></li>
+<li>同類頁面：<a href="aiaec_cagcrn.html">aiaec_cagcrn</a>、<a href="aiaec_align_cruse_usage.html">aiaec_align_cruse_usage</a>、<a href="onnx_prepost.html">onnx_prepost</a>、<a href="index.html">index</a></li>
+<li>文件：<a href="../../AIAEC/CAGCRN/README.md">README.md</a>、<a href="../../AIAEC/README.md">AIAEC/README.md</a></li>
+</ul>
+</body>
+</html>

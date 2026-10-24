@@ -38,7 +38,7 @@ survive is decided per bin by the denoiser's own speech-presence model and by
 follow the far talker. Comfort noise is driven by the AEC suppression gain so
 it fills echo-removal holes rather than every bin attenuated by NR, and its
 level is scaled by the denoiser gain of the bin, bounded below at -10 dB
-(`CNG_NR_GAIN_FLOOR`): the denoiser never sees the comfort noise, so applying
+(`SE_CNG_NR_GAIN_FLOOR`): the denoiser never sees the comfort noise, so applying
 its gain here keeps the fill near the denoised floor instead of the ambient
 level, while the bound keeps enough of it to mask the residual echo.
 
@@ -54,8 +54,8 @@ with 50% overlap:
 | 16 kHz (alternate) | 512 | 256 | 512 | 257 |
 | 48 kHz | 1024 | 512 | 1024 | 513 |
 
-AEC, final OLA, NR gains, and `AecResContext` are validated against the same
-derived dimensions during initialization.
+The AEC, the denoiser and the synthesis configs of an application are derived from the same
+grid (`se_derive()` yields one `SeGrid`), so they share one set of dimensions by construction.
 
 The `pipelines/4ch_aec_bf_nr_res/` shell uses the same three primary product grids
 (16k/256/128, 16k/512/256, 48k/1024/512). AIAEC models remain a separate
@@ -70,11 +70,11 @@ with its own size query and `init`: lib/aec's `Aec` (`aec_process_context()`),
 `frame.g_res_ctx`, strength through `aec_set_preset()`). Each example `main` initialises the
 libraries it uses and writes the per-hop sequence itself; the only shared example header is
 `pipelines/samples/se_anr_stage.h` (no ABI, no layout version). The only wrapped unit is the
-4-channel linear AEC + beamformer + post-beam RES, `pipelines/4ch_aec_bf_nr_res/audio_pipeline_4ch.h`
+4-channel linear AEC + beamformer, `pipelines/4ch_aec_bf_nr_res/audio_pipeline_4ch.h`
 (caller-owned 16-byte-aligned pool initialized from a versioned memory descriptor, or a heap
-convenience constructor; its own `AecRes` is reached through `audio_pipeline_4ch_res()` and
-`audio_pipeline_4ch_fuse()` fills `frame.g_res_ctx`). The two mono CLI executables are example
-programs that compose the libraries.
+convenience constructor; it holds no RES: `audio_pipeline_4ch_fuse()` leaves `frame.g_res_ctx` NULL, and a
+4-channel application creates its own lib/aec `AecRes` after the unit). The two mono CLI executables are
+example programs that compose the libraries.
 
 Low-level details, backend/release rules, memory sizing, presets, and tests are
 maintained in [`../pipelines/README.md`](../pipelines/README.md).
@@ -88,9 +88,9 @@ view of the analysis frame (`pipelines/common/se_stage.h`, `SeSpecFrame`):
 frame = analysis stage           (mono: aec_process_context -> se_frame_from_aec,
                                   4ch: audio_pipeline_4ch_process_* -> audio_pipeline_4ch_fuse
                                        (or four_aec_front_process -> beamformer -> four_aec_fuse))
-res_gain = frame.g_res_ctx                      mono: the AEC's own gain; 4ch unit: filled by fuse();
-                                                a core-level example with its own AecRes calls
-                                                se_res_stage_gain(res, frame) instead
+res_gain = frame.g_res_ctx                      mono: the AEC's own gain (inside the AEC call);
+                                                4ch (unit or core): g_res_ctx is NULL, the application's
+                                                own AecRes gives se_res_stage_gain(res, frame)
 nr_gain  = se_anr_stage_gain(nr, frame, scratch, use_r2)    gain stages return const float*
 total    = sk_min_f32(nr_gain, res_gain)        a disabled source reads as the unity vector
 spec     = sk_capply_gain_f32(frame.e, total)

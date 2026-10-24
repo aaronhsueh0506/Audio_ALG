@@ -246,3 +246,10 @@ pool, so the class itself is the adapter. The FREQ mode also offers
 `dfn2_prepost_pre_process_freq_dual()`, which estimates the heads from one
 spectrum and applies them to another on the same frame clock; the two
 branches touch disjoint state inside `dfn2_process.c`.
+
+Per-model call order (with error handling), sequence diagrams and the external/internal
+parameter tables are in the HTML site, one page per model:
+[`ainr_dfn2_usage`](../docs/html/ainr_dfn2_usage.html),
+[`ainr_dfn3_usage`](../docs/html/ainr_dfn3_usage.html),
+[`ainr_gtcrn_usage`](../docs/html/ainr_gtcrn_usage.html),
+[`ainr_rnnoise_erb_usage`](../docs/html/ainr_rnnoise_erb_usage.html).

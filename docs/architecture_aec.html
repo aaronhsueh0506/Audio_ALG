@@ -1,0 +1,347 @@
+<!DOCTYPE html>
+<html lang="zh-Hant">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Audio_ALG 架構 — AEC</title>
+<style>
+  :root {
+    --bg: #fafafa;
+    --panel: #ffffff;
+    --border: #d8d8d8;
+    --accent: #2563eb;
+    --accent-soft: #dbeafe;
+    --aec: #f97316;
+    --nr: #10b981;
+    --res: #8b5cf6;
+    --hpf: #94a3b8;
+    --text: #1f2937;
+    --muted: #64748b;
+  }
+  * { box-sizing: border-box; }
+  body {
+    margin: 0;
+    font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", "PingFang TC",
+                 "Microsoft JhengHei", sans-serif;
+    background: var(--bg);
+    color: var(--text);
+    line-height: 1.7;
+  }
+  .container { max-width: 1200px; margin: 0 auto; padding: 32px 24px; }
+  header {
+    background: linear-gradient(135deg, #1e40af 0%, #2563eb 100%);
+    color: white;
+    padding: 48px 24px;
+    margin-bottom: 32px;
+  }
+  header h1 { margin: 0 0 8px; font-size: 32px; }
+  header p { margin: 0; opacity: 0.9; font-size: 16px; }
+  h2 {
+    margin-top: 56px;
+    padding-bottom: 8px;
+    border-bottom: 2px solid var(--accent);
+    color: #1e40af;
+  }
+  h3 { color: #334155; margin-top: 32px; }
+  h4 { color: #475569; margin-top: 24px; margin-bottom: 8px; }
+  .panel {
+    background: var(--panel);
+    border: 1px solid var(--border);
+    border-radius: 8px;
+    padding: 20px 24px;
+    margin: 16px 0;
+  }
+  .figure {
+    text-align: center;
+    margin: 24px 0;
+  }
+  .figure svg {
+    max-width: 100%;
+    height: auto;
+  }
+  .caption {
+    color: var(--muted);
+    font-size: 13px;
+    margin-top: 8px;
+    font-style: italic;
+  }
+  .formula {
+    background: #f8fafc;
+    border-left: 4px solid var(--accent);
+    padding: 12px 18px;
+    margin: 12px 0;
+    font-family: "STIX Two Math", "Latin Modern Math", "Cambria Math", serif;
+    font-size: 17px;
+    text-align: center;
+  }
+  .formula em { font-style: italic; }
+  table {
+    width: 100%;
+    border-collapse: collapse;
+    margin: 16px 0;
+    font-size: 14px;
+  }
+  th, td {
+    text-align: left;
+    padding: 10px 12px;
+    border-bottom: 1px solid var(--border);
+    vertical-align: top;
+  }
+  th { background: var(--accent-soft); color: #1e3a8a; font-weight: 600; }
+  tr:hover td { background: #f8fafc; }
+  code {
+    background: #f1f5f9;
+    padding: 2px 6px;
+    border-radius: 4px;
+    font-family: "SF Mono", Monaco, "Cascadia Code", monospace;
+    font-size: 0.9em;
+    color: #334155;
+  }
+  .key-point {
+    background: #ecfdf5;
+    border-left: 4px solid #10b981;
+    padding: 12px 16px;
+    margin: 12px 0;
+    border-radius: 4px;
+  }
+  .key-point strong { color: #047857; }
+  .note {
+    background: #fffbeb;
+    border-left: 4px solid #f59e0b;
+    padding: 12px 16px;
+    margin: 12px 0;
+    border-radius: 4px;
+  }
+  .note strong { color: #92400e; }
+  .grid-2 {
+    display: grid;
+    grid-template-columns: 1fr 1fr;
+    gap: 16px;
+  }
+  .toc {
+    background: var(--panel);
+    border-left: 4px solid var(--accent);
+    padding: 16px 24px;
+    margin: 24px 0;
+  }
+  .toc ul { margin: 8px 0; padding-left: 20px; }
+  .toc li { margin: 4px 0; }
+  .toc a { color: var(--accent); text-decoration: none; }
+  .toc a:hover { text-decoration: underline; }
+  @media (max-width: 768px) {
+    .grid-2 { grid-template-columns: 1fr; }
+  }
+</style>
+</head>
+<body>
+<header>
+  <div class="container">
+    <h1>Audio_ALG 架構：AEC</h1>
+    <p>PBFDKF + Shadow Filter + EPC 偵測 + Stationary DT 保護</p>
+  </div>
+</header>
+
+<div class="container">
+
+<div class="note">
+  <strong>範圍：</strong>本頁是 <a href="architecture.html">architecture.html</a> 第 3 節的完整內容(拆頁以維持單頁大小)。AEC 的 C 介面與參數見 <a href="../../AEC/docs/html/aec_c_api.html">aec_c_api</a>。
+</div>
+
+<!-- ============================================================ -->
+<h2 id="aec">3. AEC — PBFDKF + Shadow Filter</h2>
+
+<div class="panel">
+<p>核心是 <strong>PBFDKF (Partitioned Block Frequency-Domain Kalman Filter)</strong>，搭配 shadow filter 做雙濾波器策略。</p>
+
+<h3>3.1 PBFDKF 架構</h3>
+
+<div class="figure">
+<svg viewBox="0 0 880 380" xmlns="http://www.w3.org/2000/svg">
+  <defs>
+    <marker id="arr2" markerWidth="10" markerHeight="10" refX="9" refY="3" orient="auto">
+      <path d="M0,0 L0,6 L9,3 z" fill="#64748b"/>
+    </marker>
+  </defs>
+
+  <!-- ============ ref path (top row, y=60) ============ -->
+  <text x="50" y="65" font-size="13" font-weight="600" fill="#1e40af">ref[n]</text>
+  <line x1="95" y1="60" x2="155" y2="60" stroke="#64748b" stroke-width="2" marker-end="url(#arr2)"/>
+
+  <!-- FFT ref -->
+  <rect x="160" y="40" width="70" height="40" rx="4" fill="#dbeafe" stroke="#2563eb"/>
+  <text x="195" y="65" font-size="13" fill="#1e40af" text-anchor="middle" font-weight="600">FFT</text>
+  <line x1="230" y1="60" x2="290" y2="60" stroke="#64748b" stroke-width="2" marker-end="url(#arr2)"/>
+
+  <!-- partitioned weights -->
+  <rect x="295" y="35" width="180" height="50" rx="4" fill="#fef3c7" stroke="#f59e0b" stroke-width="2"/>
+  <text x="385" y="55" font-size="13" fill="#92400e" text-anchor="middle" font-weight="700">W₀ W₁ W₂ W₃</text>
+  <text x="385" y="73" font-size="10" fill="#92400e" text-anchor="middle">(per-partition weights)</text>
+
+  <!-- arrow to Σ -->
+  <line x1="475" y1="60" x2="510" y2="60" stroke="#64748b" stroke-width="2" marker-end="url(#arr2)"/>
+
+  <!-- Σ accumulator -->
+  <circle cx="530" cy="60" r="16" fill="#fef3c7" stroke="#f59e0b" stroke-width="2"/>
+  <text x="530" y="66" font-size="16" text-anchor="middle" font-weight="700" fill="#92400e">Σ</text>
+
+  <!-- Σ → Ŷ → bend down to minus -->
+  <line x1="546" y1="60" x2="660" y2="60" stroke="#64748b" stroke-width="2"/>
+  <text x="595" y="52" font-size="13" font-weight="700" fill="#92400e">Ŷ[k]</text>
+
+  <!-- ============ mic path (middle row, y=180) ============ -->
+  <text x="50" y="185" font-size="13" font-weight="600" fill="#1e40af">mic[n]</text>
+  <line x1="95" y1="180" x2="155" y2="180" stroke="#64748b" stroke-width="2" marker-end="url(#arr2)"/>
+
+  <!-- FFT mic -->
+  <rect x="160" y="160" width="70" height="40" rx="4" fill="#dbeafe" stroke="#2563eb"/>
+  <text x="195" y="185" font-size="13" fill="#1e40af" text-anchor="middle" font-weight="600">FFT</text>
+
+  <!-- D[k] label -->
+  <line x1="230" y1="180" x2="280" y2="180" stroke="#64748b" stroke-width="2"/>
+  <text x="290" y="185" font-size="13" font-weight="700" fill="#1e40af">D[k]</text>
+  <line x1="320" y1="180" x2="642" y2="180" stroke="#64748b" stroke-width="2" marker-end="url(#arr2)"/>
+
+  <!-- subtract circle (D - Ŷ = e) — aligned with mic horizontal line -->
+  <circle cx="660" cy="180" r="18" fill="#fee2e2" stroke="#dc2626" stroke-width="2"/>
+  <text x="660" y="186" font-size="18" font-weight="700" text-anchor="middle" fill="#991b1b">−</text>
+
+  <!-- Ŷ[k] vertical drop into subtract from above -->
+  <line x1="660" y1="60" x2="660" y2="162" stroke="#64748b" stroke-width="2" marker-end="url(#arr2)"/>
+
+  <!-- e[k] output -->
+  <line x1="678" y1="180" x2="720" y2="180" stroke="#64748b" stroke-width="2" marker-end="url(#arr2)"/>
+  <text x="735" y="185" font-size="13" font-weight="700" fill="#dc2626">e[k]</text>
+
+  <!-- IFFT -->
+  <line x1="770" y1="180" x2="780" y2="180" stroke="#64748b" stroke-width="2"/>
+  <rect x="785" y="160" width="60" height="40" rx="4" fill="#dbeafe" stroke="#2563eb"/>
+  <text x="815" y="185" font-size="12" fill="#1e40af" text-anchor="middle" font-weight="600">IFFT</text>
+  <line x1="845" y1="180" x2="868" y2="180" stroke="#64748b" stroke-width="2" marker-end="url(#arr2)"/>
+  <text x="800" y="220" font-size="11" font-weight="600" fill="#16a34a" text-anchor="middle">error[n]</text>
+
+  <!-- ============ Kalman update box (bottom) ============ -->
+  <rect x="280" y="290" width="320" height="80" rx="6" fill="#f3e8ff" stroke="#8b5cf6" stroke-width="2"/>
+  <text x="440" y="315" font-size="14" fill="#6b21a8" text-anchor="middle" font-weight="700">Kalman update</text>
+  <text x="440" y="335" font-size="11" fill="#6b21a8" text-anchor="middle">Kₚ = Pₚ · Xₚ* / (Σ |X|²·P + R)</text>
+  <text x="440" y="352" font-size="11" fill="#6b21a8" text-anchor="middle">Wₚ ← Wₚ + Kₚ · e[k]</text>
+
+  <!-- e[k] feedback to Kalman -->
+  <line x1="660" y1="198" x2="660" y2="330" stroke="#8b5cf6" stroke-width="1.5" stroke-dasharray="4,3"/>
+  <line x1="660" y1="330" x2="603" y2="330" stroke="#8b5cf6" stroke-width="1.5" stroke-dasharray="4,3" marker-end="url(#arr2)"/>
+  <text x="668" y="265" font-size="10" fill="#8b5cf6">e[k] feedback</text>
+
+  <!-- Kalman update → W -->
+  <line x1="385" y1="290" x2="385" y2="90" stroke="#8b5cf6" stroke-width="1.5" stroke-dasharray="4,3"/>
+  <line x1="385" y1="90" x2="385" y2="86" stroke="#8b5cf6" stroke-width="1.5" stroke-dasharray="4,3" marker-end="url(#arr2)"/>
+  <text x="393" y="180" font-size="10" fill="#8b5cf6">W update</text>
+</svg>
+<div class="caption">圖 3：PBFDKF 結構 — 頻域 partition 卷積 + Kalman 權重更新</div>
+</div>
+
+<div class="key-point">
+  <strong>為什麼用 PBFDKF？</strong>
+  <ul style="margin: 4px 0 0 20px;">
+    <li><strong>頻域處理</strong>：FFT 加速卷積，降低複雜度</li>
+    <li><strong>Partition</strong>：把長 filter 切成多個短 partition，減少 latency</li>
+    <li><strong>Kalman</strong>：動態調整 step size（Q/R），比固定 mu 的 NLMS 收斂更快、追蹤更穩</li>
+  </ul>
+</div>
+
+<table>
+  <tr><th>項目</th><th>值</th></tr>
+  <tr><td>block_size</td><td>256 samples (= 2 × hop，16 kHz 預設 256/128)</td></tr>
+  <tr><td>fft_size</td><td>256 (= frame size)</td></tr>
+  <tr><td>n_partitions</td><td>ceil(filter_length ÷ hop) = 7（16 kHz 預設 FL=832）</td></tr>
+  <tr><td>Kalman Q (model uncertainty)</td><td>1e−3 (<code>kalman_q_high</code>，未收斂), 1e−6 (<code>kalman_q_low</code>，收斂後)</td></tr>
+  <tr><td>main filter step size <code>mu</code></td><td>0.3</td></tr>
+</table>
+
+<h3>3.2 Shadow Filter 雙濾波器策略</h3>
+
+<div class="figure">
+<svg viewBox="0 0 800 280" xmlns="http://www.w3.org/2000/svg">
+  <defs>
+    <marker id="arr3" markerWidth="10" markerHeight="10" refX="9" refY="3" orient="auto">
+      <path d="M0,0 L0,6 L9,3 z" fill="#64748b"/>
+    </marker>
+  </defs>
+
+  <!-- mic + ref input -->
+  <text x="40" y="140" font-size="13" font-weight="600" fill="#1e40af">mic[n]</text>
+  <text x="40" y="160" font-size="13" font-weight="600" fill="#1e40af">ref[n]</text>
+  <line x1="100" y1="145" x2="180" y2="80" stroke="#64748b" stroke-width="2" marker-end="url(#arr3)"/>
+  <line x1="100" y1="145" x2="180" y2="200" stroke="#64748b" stroke-width="2" marker-end="url(#arr3)"/>
+
+  <!-- Main filter -->
+  <rect x="185" y="50" width="200" height="80" rx="8" fill="#fef3c7" stroke="#f59e0b" stroke-width="2"/>
+  <text x="285" y="78" font-size="14" fill="#92400e" text-anchor="middle" font-weight="700">Main Filter (保守)</text>
+  <text x="285" y="98" font-size="11" fill="#92400e" text-anchor="middle">mu 0.3 · 慢追蹤</text>
+  <text x="285" y="115" font-size="11" fill="#92400e" text-anchor="middle">DT 段不被污染</text>
+
+  <!-- Shadow filter -->
+  <rect x="185" y="170" width="200" height="80" rx="8" fill="#dbeafe" stroke="#2563eb" stroke-width="2"/>
+  <text x="285" y="198" font-size="14" fill="#1e40af" text-anchor="middle" font-weight="700">Shadow Filter (激進)</text>
+  <text x="285" y="218" font-size="11" fill="#1e40af" text-anchor="middle">mu 0.5 · 快追蹤</text>
+  <text x="285" y="235" font-size="11" fill="#1e40af" text-anchor="middle">FS 收斂快、能追 EPC</text>
+
+  <!-- comparator -->
+  <line x1="385" y1="90" x2="430" y2="120" stroke="#64748b" stroke-width="2"/>
+  <line x1="385" y1="210" x2="430" y2="180" stroke="#64748b" stroke-width="2"/>
+  <rect x="430" y="110" width="120" height="80" rx="8" fill="#f3e8ff" stroke="#8b5cf6" stroke-width="2"/>
+  <text x="490" y="138" font-size="13" fill="#6b21a8" text-anchor="middle" font-weight="700">comparator</text>
+  <text x="490" y="158" font-size="10" fill="#6b21a8" text-anchor="middle">err_main vs</text>
+  <text x="490" y="172" font-size="10" fill="#6b21a8" text-anchor="middle">err_shadow</text>
+
+  <!-- copy arrows -->
+  <path d="M 490 110 Q 490 70 360 60" fill="none" stroke="#16a34a" stroke-width="2" stroke-dasharray="5,3" marker-end="url(#arr3)"/>
+  <text x="430" y="50" font-size="10" fill="#16a34a">if shadow 持續較好</text>
+  <text x="430" y="65" font-size="10" fill="#16a34a">→ copy to main</text>
+
+  <path d="M 490 190 Q 490 230 360 240" fill="none" stroke="#16a34a" stroke-width="2" stroke-dasharray="5,3" marker-end="url(#arr3)"/>
+  <text x="395" y="262" font-size="10" fill="#16a34a">↓ 反向亦然 (main → shadow)</text>
+
+  <!-- main output -->
+  <line x1="385" y1="90" x2="600" y2="90" stroke="#64748b" stroke-width="2" marker-end="url(#arr3)"/>
+  <text x="610" y="95" font-size="13" font-weight="600" fill="#16a34a">error[n]</text>
+  <text x="610" y="112" font-size="10" fill="#64748b">(輸出給後段)</text>
+</svg>
+<div class="caption">圖 4：Shadow Filter 雙濾波器策略 — main 穩定輸出, shadow 快速追蹤</div>
+</div>
+
+<div class="key-point">
+  <strong>為什麼要兩個 filter？</strong>
+  <p style="margin: 4px 0 0;">單一 filter 必須在「快速追蹤 echo path 變化」和「DT 段抗污染」之間取捨。雙 filter 各司其職，再用 bidirectional copy 自動把較好的權重複製過去，兩全其美。</p>
+</div>
+
+<h3>3.3 Echo Path Change (EPC) 偵測</h3>
+
+<p>當 main + shadow 兩者誤差<strong>同時</strong>上升、且差距<strong>變小</strong>時，視為 echo path 變化（移動、新的反射路徑等）：</p>
+
+<div class="formula">
+errors_rising = (total_err &gt; prev_total_err × 1.5) &nbsp;&amp;&nbsp;
+delta_ratio &lt; 0.3
+</div>
+
+<p>此判定即 <code>epc_update_shadow_rise()</code>（<code>epc_total_rise</code>=1.5、<code>epc_delta_threshold</code>=0.3）；far-end 穩態時事件被丟棄。EPC 另有兩個來源：delay 改變（<code>epc_force_delay()</code>）與 EPV 偵測。觸發後 <code>epc.active</code> 維持 <code>epc_hangover</code> 個 hop（authored 20 hops @10 ms，建立時 retime），期間：</p>
+<ul>
+  <li>收斂穩定旗標要求 <code>!epc.active</code>，不會被判為已穩定</li>
+  <li>double-talk 指標被抑制（<code>raw_dt</code> 歸零、<code>is_stationary_dt</code> 清除、<code>shadow_dt</code> ×0.08）</li>
+  <li><code>epc_active</code> 隨 <code>AecResContext</code> 交給後級</li>
+</ul>
+
+<h3>3.4 Stationary far-end DT 保護</h3>
+
+<p><strong>問題場景</strong>：白噪音、風扇、冷氣等穩態 far-end + 近端有人講話 → 傳統 DT 偵測全部失效（dt_indicator → 0, coh² → 1），RES 把語音當 echo 壓掉。</p>
+
+<p>AEC3 post chain 以 StationarityEstimator 與 <code>is_stationary_dt</code> 旗標處理這個場景，演算法見 <a href="../lib/aec/docs/aec_methods.md">lib/aec/docs/aec_methods.md</a> §3.1。</p>
+
+</div>
+
+
+<footer style="text-align: center; color: var(--muted); padding: 32px 0; border-top: 1px solid var(--border); margin-top: 48px;">
+  <a href="architecture.html">architecture.html</a> · <a href="architecture_detail.html">architecture_detail.html</a> · <a href="html/index.html">docs/html/index.html</a>
+</footer>
+
+</div>
+</body>
+</html>
