@@ -1,9 +1,11 @@
-/* 4-channel AEC -> RES -> DeepFilterNet2 composition test: the four-lane core (4aec_nr_res.h), the
- * RES gain chain (samples/se_sample_chain.h, no denoiser, no synthesis) and the DFN2 hop
- * (samples/dfn_hop.h), wired as 4ch_aec_bf_dfn_res/main.c wires them.
+/* 4-channel AEC -> BF -> RES -> DeepFilterNet2 composition test: the linear AEC + BF unit
+ * (audio_pipeline_4ch.h, its fuse carries the post-beam RES gain), P = E * min(1, G_res)
+ * (+ comfort noise) and the DFN2 hop (samples/dfn_hop.h), wired as 4ch_aec_bf_dfn_res/main.c
+ * wires them.
  * 48 kHz: with the identity model the composition equals the hand-written conventional chain with
- * the denoiser off (tests/conv_chain_4ch.h), delayed by exactly two hops, byte for byte, over both
- * beamformed-error entries (reconstructed and trusted spectrum) and with comfort noise OFF and ON.
+ * the denoiser off (tests/conv_chain_4ch.h, its own front end and AecRes, fed the unit's beam
+ * weights and beamformed spectrum), delayed by exactly two hops, byte for byte, with comfort noise
+ * OFF and ON.
  * The stimulus is a 384-sample echo under the shared matched delay estimator; the test asserts
  * the estimator reported a delay change (the stage must not reset on one: its frame count keeps
  * growing with no commit and exactly one skipped frame) and that the RES cuts.
@@ -17,10 +19,10 @@
 #include <stdlib.h>
 #include <string.h>
 
-#include "4aec_nr_res.h"
+#include "audio_pipeline_4ch.h"
 #include "samples/dfn_hop.h"
-#include "samples/se_sample_chain.h"
 #include "utility/mem_align.h"
+#include "utility/simd_kernels.h"
 #include "tests/dfn_test_fixture.h"
 #include "../../4ch_aec_bf_nr_res/tests/conv_chain_4ch.h"
 
@@ -66,24 +68,17 @@ static void make_hop(float *mics, float *ref, int frame) {
     }
 }
 
-static void form_trusted(const FourAecFront *pre,
-                         const Complex *weights, Complex *out) {
-    int ch, k;
-    memset(out, 0, (size_t)DFN2_N_BINS * sizeof(*out));
-    for (ch = 0; ch < FOUR_AEC_NR_RES_CHANNELS; ++ch) {
-        for (k = 0; k < DFN2_N_BINS; ++k) {
-            const Complex *w = weights + (size_t)ch * DFN2_N_BINS + k;
-            const Complex *x = pre->linear_spectra[ch] + k;
-            out[k].r += w->r * x->r - w->i * x->i;
-            out[k].i += w->r * x->i + w->i * x->r;
-        }
-    }
-}
-
-/* The core every composition and every oracle in this file starts from. */
+/* The core every oracle in this file starts from. */
 static FourAecNrResConfig core_config(int sample_rate, int fft_size) {
     FourAecNrResConfig cfg = four_aec_nr_res_default_config(sample_rate);
     cfg.fft_size = fft_size;
+    return cfg;
+}
+
+/* The unit of the composition: its rate default, the RES on at balanced. */
+static AudioPipeline4ChConfig unit_config(int sample_rate, int fft_size) {
+    AudioPipeline4ChConfig cfg = audio_pipeline_4ch_default_config(sample_rate);
+    cfg.core.fft_size = fft_size;
     return cfg;
 }
 
@@ -101,9 +96,15 @@ static ConvChain *oracle_create(const FourAecNrResConfig *cfg, int enable_res, i
  * --------------------------------------------------------------------------------------- */
 
 typedef struct FourDfn {
-    FourAecNrRes *core;
-    SeSampleChain *chain;
-    void *chain_mem;
+    AudioPipeline4Ch *unit;
+    AudioPipeline4ChBeam beam;   /* the last hop's beam, for the oracle */
+    AudioPipeline4ChFrameInfo info;
+    const float *res_gain;       /* the last hop's G_res */
+    float *unity, *total;
+    Complex *post;
+    void *post_mem;
+    uint32_t rng;
+    int n_freqs, enable_cng;
     DfnResStage *stage;          /* driven directly at 48 kHz; the bridge's own below 48 kHz */
     DfnRateBridge *bridge;
     AcIstft *istft;
@@ -117,41 +118,41 @@ static void fdfn_destroy(FourDfn *m) {
     if (!m) return;
     if (m->bridge) dfn_rate_bridge_destroy(m->bridge);
     else if (m->stage) dfn_res_stage_destroy(m->stage);
-    if (m->chain) se_sample_chain_destroy(m->chain);
-    if (m->core) four_aec_nr_res_destroy(m->core);
-    free(m->chain_mem);
+    if (m->unit) audio_pipeline_4ch_destroy(m->unit);
+    free(m->post_mem);
     free(m->istft_mem);
     free(m->stage_out);
     free(m);
 }
 
-/* fft_size 0: the core's rate default grid. */
-static FourDfn *fdfn_create(int sample_rate, int fft_size, int enable_cng, const DFN2Model *model) {
+/* fft_size 0: the core's rate default grid. bf_enable 0 bypasses the BF (lane 0's error, unit
+ * weights), which keeps an impulse's timing unchanged by the spatial filter. */
+static FourDfn *fdfn_create(int sample_rate, int fft_size, int enable_cng, const DFN2Model *model,
+                            int bf_enable) {
     FourDfn *m = (FourDfn *)calloc(1, sizeof(*m));
-    FourAecNrResConfig ccfg = core_config(sample_rate, fft_size);
-    SeSampleChainConfig sc;
+    AudioPipeline4ChConfig ucfg = unit_config(sample_rate, fft_size);
     DfnResStageConfig stage_cfg = dfn_res_stage_default_config(DFN2_SR);
-    size_t chain_bytes;
-    int n_freqs;
+    size_t vec;
+    int n_freqs, k;
     if (!m) return NULL;
-    m->core = four_aec_nr_res_create(&ccfg);
-    if (!m->core) goto fail;
-    m->hop_size = four_aec_nr_res_hop_size(m->core);
-    n_freqs = four_aec_nr_res_n_freqs(m->core);
+    ucfg.bf_enable = bf_enable;
+    m->unit = audio_pipeline_4ch_create(&ucfg);
+    if (!m->unit) goto fail;
+    m->hop_size = audio_pipeline_4ch_hop_size(m->unit);
+    n_freqs = audio_pipeline_4ch_n_freqs(m->unit);
 
-    sc = se_sample_chain_default_config(sample_rate, four_aec_nr_res_fft_size(m->core));
-    sc.res = SE_SAMPLE_RES_AEC_RES;
-    sc.res_preset = AEC_PRESET_BALANCED;
-    sc.enable_nr = 0;
-    sc.enable_cng = enable_cng;
-    sc.with_synthesis = 0;
-    chain_bytes = se_sample_chain_mem_size(&sc);
-    if (chain_bytes == 0 || posix_memalign(&m->chain_mem, 16, chain_bytes) != 0) {
-        m->chain_mem = NULL;
+    m->n_freqs = n_freqs;
+    m->enable_cng = enable_cng;
+    vec = ALIGN16((size_t)n_freqs * sizeof(float));
+    if (posix_memalign(&m->post_mem, 16, 2 * vec + ALIGN16((size_t)n_freqs * sizeof(Complex))) != 0) {
+        m->post_mem = NULL;
         goto fail;
     }
-    m->chain = se_sample_chain_init(m->chain_mem, chain_bytes, &sc);
-    if (!m->chain) goto fail;
+    m->unity = (float *)m->post_mem;
+    m->total = (float *)((unsigned char *)m->post_mem + vec);
+    m->post = (Complex *)((unsigned char *)m->post_mem + 2 * vec);
+    for (k = 0; k < n_freqs; ++k) m->unity[k] = 1.0f;
+    m->rng = SE_CNG_RNG_SEED;
 
     stage_cfg.erb_fwd = erb_fwd;
     stage_cfg.erb_inv = erb_inv;
@@ -191,50 +192,45 @@ fail:
 
 /* What an integrator does after a refused call or to start over: every stage together. */
 static void fdfn_reset(FourDfn *m) {
-    four_aec_nr_res_reset(m->core);
-    se_sample_chain_reset(m->chain);
+    audio_pipeline_4ch_reset(m->unit);
+    m->rng = SE_CNG_RNG_SEED;
     dfn_hop_reset(&m->hop);
 }
 
-/* Front end, fuse (trusted spectrum from the weights, or rebuilt from them), RES, P; the DFN
- * hop begins on (E, P). `front` receives the front frame. */
-static int fdfn_begin(FourDfn *m, const float *mics, const float *ref, const Complex *weights,
-                      int trusted_mode, FourAecFront *front) {
-    static Complex trusted[DFN2_N_BINS];
-    SeSpecFrame frame;
-    const Complex *post;
-    if (four_aec_front_process(m->core, mics, ref, front) != FOUR_AEC_NR_RES_OK) return -1;
-    if (trusted_mode) form_trusted(front, weights, trusted);
-    if (four_aec_fuse(m->core, weights, trusted_mode ? trusted : NULL, &frame) !=
-        FOUR_AEC_NR_RES_OK)
+/* Unit (front end, SRP-PHAT, BF), fuse with its RES gain, P; the DFN hop begins on (E, P). */
+static int fdfn_begin(FourDfn *m, const float *mics, const float *ref) {
+    SeSpecFrame f;
+    if (audio_pipeline_4ch_process(m->unit, mics, ref, &m->beam, &m->info) != FOUR_AEC_NR_RES_OK ||
+        audio_pipeline_4ch_fuse(m->unit, &f) != FOUR_AEC_NR_RES_OK || !f.g_res_ctx)
         return -1;
-    post = se_sample_chain_form(m->chain, &frame);
-    if (!post) return -1;
-    return dfn_hop_begin(&m->hop, frame.e, post) == 0 ? 0 : -1;
+    m->res_gain = f.g_res_ctx;
+    sk_min_f32(m->total, m->unity, f.g_res_ctx, m->n_freqs);
+    sk_capply_gain_f32(m->post, f.e, m->total, m->n_freqs);
+    if (m->enable_cng && f.cn)
+        aec_cng_fill(&m->rng, m->post, f.cn, f.g_res_ctx, m->unity, SE_CNG_NR_GAIN_FLOOR,
+                     m->n_freqs);
+    return dfn_hop_begin(&m->hop, f.e, m->post) == 0 ? 0 : -1;
 }
 
-static int fdfn_process(FourDfn *m, const float *mics, const float *ref, const Complex *weights,
-                        int trusted_mode, FourAecFront *front, float *out) {
+static int fdfn_process(FourDfn *m, const float *mics, const float *ref, float *out) {
     DfnResStageJob job;
     int r;
-    if (fdfn_begin(m, mics, ref, weights, trusted_mode, front) != 0) return -1;
+    if (fdfn_begin(m, mics, ref) != 0) return -1;
     while ((r = dfn_hop_nn_begin(&m->hop, &job)) == 1)
         if (dfn_hop_nn_end(&m->hop, dfn_res_stage_infer(m->stage, &job)) != 0) return -1;
     if (r < 0) return -1;
     return dfn_hop_end(&m->hop, out) == 0 ? 0 : -1;
 }
 
-static int run_identity(int trusted_mode, int enable_cng) {
-    FourDfn *dfn = fdfn_create(DFN2_SR, DFN2_N_FFT, enable_cng, NULL);
+static int run_identity(int enable_cng) {
+    FourDfn *dfn = fdfn_create(DFN2_SR, DFN2_N_FFT, enable_cng, NULL, 1);
     FourAecNrResConfig ccfg = core_config(DFN2_SR, DFN2_N_FFT);
     ConvChain *conventional;
-    Complex weights[FOUR_AEC_NR_RES_CHANNELS * DFN2_N_BINS];
     float mics[DFN2_HOP_LEN * FOUR_AEC_NR_RES_CHANNELS];
     float ref[DFN2_HOP_LEN];
     float dfn_out[DFN2_HOP_LEN];
-    Complex trusted[DFN2_N_BINS];
     long long frames = -1, commits = -1, skips = -1;
-    float min_res = 1.0f;
+    float min_res = 1.0f, live0 = 0.0f, live1 = 0.0f;
     int frame, i, k, delay_changes = 0, nonzero_hops = 0;
 
     if (!dfn || dfn->hop_size != DFN2_HOP_LEN || dfn->bridge != NULL ||
@@ -242,23 +238,15 @@ static int run_identity(int trusted_mode, int enable_cng) {
         return 1;
     conventional = oracle_create(&ccfg, 1, enable_cng);
     if (!conventional) return 2;
-    make_weights(weights);
 
     for (frame = 0; frame < TEST_FRAMES; ++frame) {
-        FourAecFront dp;
-        const float *res_gain;
         int any = 0;
         make_hop(mics, ref, frame);
-        if (fdfn_process(dfn, mics, ref, weights, trusted_mode, &dp, dfn_out) != 0 ||
-            !dp.linear_spectra[0])
-            return 10 + frame;
-        if (dp.delay.changed) ++delay_changes;
-        res_gain = se_sample_chain_last_res_gain(dfn->chain);
-        if (res_gain)
-            for (k = 0; k < dp.n_freqs; ++k)
-                if (res_gain[k] < min_res) min_res = res_gain[k];
-        if (trusted_mode) form_trusted(&dp, weights, trusted);
-        if (conv_hop(conventional, mics, ref, weights, trusted_mode ? trusted : NULL,
+        if (fdfn_process(dfn, mics, ref, dfn_out) != 0) return 10 + frame;
+        if (dfn->info.delay.changed) ++delay_changes;
+        for (k = 0; k < dfn->n_freqs; ++k)
+            if (dfn->res_gain[k] < min_res) min_res = dfn->res_gain[k];
+        if (conv_hop(conventional, mics, ref, dfn->beam.weights, dfn->beam.spectrum,
                      conventional_out[frame]) != 0)
             return 200 + frame;
         for (i = 0; i < DFN2_HOP_LEN; ++i) {
@@ -274,13 +262,15 @@ static int run_identity(int trusted_mode, int enable_cng) {
     dfn_res_stage_get_counters(dfn->stage, &frames, &commits, &skips);
     if (frames != TEST_FRAMES || commits != 0 || skips != TEST_FRAMES - 1)
         return 5;                             /* a reset would leave a gap */
-    if (aec_res_set_preset(se_sample_chain_res(dfn->chain), AEC_PRESET_AGGRESSIVE, 0.0f) != 0)
+    if (aec_res_split_floor(audio_pipeline_4ch_res(dfn->unit), &live0, NULL) != 0 ||
+        aec_res_set_preset(audio_pipeline_4ch_res(dfn->unit), AEC_PRESET_AGGRESSIVE, 0.0f) != 0 ||
+        aec_res_split_floor(audio_pipeline_4ch_res(dfn->unit), &live1, NULL) != 0 || live1 == live0)
         return 6;
     if (dfn_res_stage_set_atten_lim(dfn->stage, 12.0f) != 0 ||
         dfn_res_stage_set_atten_lim(dfn->stage, NAN) != -1)
         return 7;
-    printf("4ch_aec_bf_dfn_res: trusted=%d cng=%d identity over %d hops, "
-           "%d delay change(s), min G_res %.3f\n", trusted_mode, enable_cng, TEST_FRAMES,
+    printf("4ch_aec_bf_dfn_res: cng=%d identity over %d hops, "
+           "%d delay change(s), min G_res %.3f\n", enable_cng, TEST_FRAMES,
            delay_changes, min_res);
     conv_destroy(conventional);
     fdfn_destroy(dfn);
@@ -311,15 +301,14 @@ static int run_res_is_active(void) {
     return differing > 0 ? 0 : 3;
 }
 
-/* Native grid (the 16 kHz default): the core on its own grid, the stage through the bridge. The
- * conventional chain's NR-off output delayed by the bridge's added delay must match within the
- * resampler round-trip error; a near-end impulse pins the delay; the 48 kHz schedule is the
- * documented one. Reconstructed error entry, weights uniform. */
+/* Native grid (the 16 kHz default): the unit on its own grid, the stage through the bridge. The
+ * conventional chain's NR-off output (fed the unit's beam, BF bypassed) delayed by the bridge's
+ * added delay must match within the resampler round-trip error; a near-end impulse pins the
+ * delay; the 48 kHz schedule is the documented one. */
 static int run_native(int sample_rate, int fft_size, int expected_added) {
-    FourDfn *dfn = fdfn_create(sample_rate, fft_size, 0, NULL);
+    FourDfn *dfn = fdfn_create(sample_rate, fft_size, 0, NULL, 0);
     FourAecNrResConfig ccfg = core_config(sample_rate, fft_size);
     ConvChain *conventional;
-    Complex weights[FOUR_AEC_NR_RES_CHANNELS * DFN2_N_BINS];
     static float mics[512 * FOUR_AEC_NR_RES_CHANNELS];
     static float ref[512], out[512];
     static float conv[TEST_FRAMES * 4 * 256];
@@ -337,12 +326,10 @@ static int run_native(int sample_rate, int fft_size, int expected_added) {
     if (added != expected_added) return 2;
     conventional = oracle_create(&ccfg, 1, 0);
     if (!conventional || conventional->hop != hop) return 3;
-    make_weights(weights);
     n = frames * hop;
     dfn_fixture_multitone(far_tones, (size_t)n, sample_rate);
     imp = (frames * 3 / 4) * hop + 5;
     for (frame = 0; frame < frames; ++frame) {
-        FourAecFront dp;
         for (i = 0; i < hop; ++i) {
             int t = frame * hop + i;
             ref[i] = far_tones[t];
@@ -354,8 +341,9 @@ static int run_native(int sample_rate, int fft_size, int expected_added) {
                     (t == imp ? 1.0f : 0.0f);
             }
         }
-        if (fdfn_process(dfn, mics, ref, weights, 0, &dp, out) != 0 ||
-            conv_hop(conventional, mics, ref, weights, NULL, conv + frame * hop) != 0)
+        if (fdfn_process(dfn, mics, ref, out) != 0 ||
+            conv_hop(conventional, mics, ref, dfn->beam.weights, dfn->beam.spectrum,
+                     conv + frame * hop) != 0)
             return 10 + frame;
         memcpy(mine + frame * hop, out, (size_t)hop * sizeof(float));
         dfn_rate_bridge_get_counters(dfn->bridge, &total_frames, &last);
@@ -394,38 +382,36 @@ static int run_native(int sample_rate, int fft_size, int expected_added) {
     return 0;
 }
 
-/* The core serves 16 and 48 kHz only: the composition has no 8 kHz or off-grid host. */
+/* The unit serves 16 and 48 kHz only: the composition has no 8 kHz or off-grid host. */
 static int run_rejections(void) {
-    FourAecNrResConfig cfg = core_config(8000, 0);
-    FourAecNrResMemReq req;
-    if (four_aec_nr_res_get_mem_requirements(&cfg, &req) == 0) return 1;
-    cfg = core_config(44100, 0);
-    if (four_aec_nr_res_get_mem_requirements(&cfg, &req) == 0) return 2;
-    cfg = core_config(DFN2_SR, 512);   /* not a 48 kHz grid */
-    if (four_aec_nr_res_get_mem_requirements(&cfg, &req) == 0) return 3;
-    cfg = core_config(DFN2_SR, 0);
-    if (four_aec_nr_res_get_mem_requirements(&cfg, &req) != 0) return 4;
+    AudioPipeline4ChConfig cfg = unit_config(8000, 0);
+    AudioPipeline4ChMemReq req;
+    if (audio_pipeline_4ch_get_mem_requirements(&cfg, &req) == 0) return 1;
+    cfg = unit_config(44100, 0);
+    if (audio_pipeline_4ch_get_mem_requirements(&cfg, &req) == 0) return 2;
+    cfg = unit_config(DFN2_SR, 512);   /* not a 48 kHz grid */
+    if (audio_pipeline_4ch_get_mem_requirements(&cfg, &req) == 0) return 3;
+    cfg = unit_config(DFN2_SR, 0);
+    if (audio_pipeline_4ch_get_mem_requirements(&cfg, &req) != 0) return 4;
     return 0;
 }
 
-/* A reset of every stage (core, chain, hop) returns the composition to the state of a fresh one:
+/* A reset of every stage (unit with its RES, comfort-noise seed, hop) returns the composition to
+ * the state of a fresh one:
  * the first hops after it reproduce the first hops of a new instance bit for bit, the second pass
  * of a loop equals the first. */
 static int run_reset_equals_fresh(int sample_rate, int fft_size) {
-    FourDfn *dfn = fdfn_create(sample_rate, fft_size, 1, NULL);
-    Complex weights[FOUR_AEC_NR_RES_CHANNELS * DFN2_N_BINS];
+    FourDfn *dfn = fdfn_create(sample_rate, fft_size, 1, NULL, 1);
     static float mics[512 * FOUR_AEC_NR_RES_CHANNELS], ref[512];
     static float first[40][512], again[40][512];
     static float tones[40 * 512];
     int hop, frame, pass, i, ch, e;
     if (!dfn) return 1;
     hop = dfn->hop_size;
-    make_weights(weights);
     dfn_fixture_multitone(tones, (size_t)40 * hop, sample_rate);
     e = (ECHO_DELAY * sample_rate) / DFN2_SR;
     for (pass = 0; pass < 2; ++pass) {
         for (frame = 0; frame < 40; ++frame) {
-            FourAecFront dp;
             for (i = 0; i < hop; ++i) {
                 int t = frame * hop + i;
                 ref[i] = tones[t];
@@ -434,7 +420,7 @@ static int run_reset_equals_fresh(int sample_rate, int fft_size) {
                         (t >= e ? 0.5f * tones[t - e] : 0.0f) +
                         0.01f * sinf((float)t * 0.071f + (float)ch);
             }
-            if (fdfn_process(dfn, mics, ref, weights, 0, &dp, pass ? again[frame] : first[frame]) != 0)
+            if (fdfn_process(dfn, mics, ref, pass ? again[frame] : first[frame]) != 0)
                 return 2;
         }
         if (pass == 0) fdfn_reset(dfn);
@@ -448,9 +434,8 @@ static int run_reset_equals_fresh(int sample_rate, int fft_size) {
 
 /* The phased hop (begin / nn_begin ... nn_end / end) against the callback-driven one: a
  * non-identity model (a uniform 0.5 band mask) run by the caller reproduces the configured
- * callback byte for byte at 48 kHz and through the rate bridge, comfort noise on, reconstructed
- * and trusted error spectra; a failed run, a frame left open and a frame never fetched equal the
- * model-free composition. */
+ * callback byte for byte at 48 kHz and through the rate bridge, comfort noise on; a failed run,
+ * a frame left open and a frame never fetched equal the model-free composition. */
 static int half_mask_infer(void *user, const DFN2PrepostInputs *in,
                            DFN2PrepostOutputs *out) {
     size_t i;
@@ -463,14 +448,12 @@ static int half_mask_infer(void *user, const DFN2PrepostInputs *in,
 
 enum { BP_RUN, BP_FAIL, BP_OPEN, BP_UNFETCHED };
 
-static int run_phased(int sample_rate, int fft_size, int behaviour, int trusted_mode) {
+static int run_phased(int sample_rate, int fft_size, int behaviour) {
     DFN2Model cb_model;
     DFN2ModelIoDescriptor descriptor;
     FourDfn *ph, *cb;
-    Complex weights[FOUR_AEC_NR_RES_CHANNELS * DFN2_N_BINS];
     static float mics[512 * FOUR_AEC_NR_RES_CHANNELS], ref[512], oa[512], ob[512];
     static float tones[100 * 512];
-    FourAecFront fa, fb;
     DfnResStageJob job;
     int hop, frame, i, ch, r, nonzero = 0, ran = 0, frames = 80;
 
@@ -480,11 +463,10 @@ static int run_phased(int sample_rate, int fft_size, int behaviour, int trusted_
         cb_model.infer = half_mask_infer;
         cb_model.io_descriptor = &descriptor;
     }
-    ph = fdfn_create(sample_rate, fft_size, 1, NULL);
-    cb = fdfn_create(sample_rate, fft_size, 1, &cb_model);
+    ph = fdfn_create(sample_rate, fft_size, 1, NULL, 1);
+    cb = fdfn_create(sample_rate, fft_size, 1, &cb_model, 1);
     if (!ph || !cb) return 2;
     hop = ph->hop_size;
-    make_weights(weights);
     dfn_fixture_multitone(tones, (size_t)frames * hop, sample_rate);
     for (frame = 0; frame < frames; ++frame) {
         int e = (ECHO_DELAY * sample_rate) / DFN2_SR;
@@ -496,8 +478,8 @@ static int run_phased(int sample_rate, int fft_size, int behaviour, int trusted_
                     (t >= e ? 0.5f * tones[t - e] : 0.0f) +
                     0.01f * sinf((float)t * 0.071f + (float)ch);
         }
-        if (fdfn_process(cb, mics, ref, weights, trusted_mode, &fb, ob) != 0) return 5;
-        if (fdfn_begin(ph, mics, ref, weights, trusted_mode, &fa) != 0) return 6;
+        if (fdfn_process(cb, mics, ref, ob) != 0) return 5;
+        if (fdfn_begin(ph, mics, ref) != 0) return 6;
         if (behaviour != BP_UNFETCHED) {
             while ((r = dfn_hop_nn_begin(&ph->hop, &job)) == 1) {
                 int rc;
@@ -520,21 +502,18 @@ static int run_phased(int sample_rate, int fft_size, int behaviour, int trusted_
 }
 
 int main(void) {
-    int rc, trusted, cng;
+    int rc, cng;
     make_partition();
     make_far();
     rc = run_rejections();
     if (rc) { fprintf(stderr, "4ch DFN grid rejection row failed: %d\n", rc); return 1; }
     rc = run_res_is_active();
     if (rc) { fprintf(stderr, "4ch DFN stimulus never engaged RES: %d\n", rc); return 1; }
-    for (trusted = 0; trusted <= 1; ++trusted) {
-        for (cng = 0; cng <= 1; ++cng) {
-            rc = run_identity(trusted, cng);
-            if (rc != 0) {
-                fprintf(stderr, "4ch DFN identity trusted=%d cng=%d failed: %d\n",
-                        trusted, cng, rc);
-                return 1;
-            }
+    for (cng = 0; cng <= 1; ++cng) {
+        rc = run_identity(cng);
+        if (rc != 0) {
+            fprintf(stderr, "4ch DFN identity cng=%d failed: %d\n", cng, rc);
+            return 1;
         }
     }
     rc = run_native(16000, 256, 672);
@@ -543,7 +522,7 @@ int main(void) {
     if (rc) { fprintf(stderr, "4ch DFN 16 kHz/512 bridge gate failed: %d\n", rc); return 1; }
     {
         static const int grids[3][2] = {{48000, 1024}, {16000, 256}, {16000, 512}};
-        int g, b, t;
+        int g, b;
         for (g = 0; g < 3; ++g) {
             rc = run_reset_equals_fresh(grids[g][0], grids[g][1]);
             if (rc) {
@@ -551,15 +530,14 @@ int main(void) {
                         grids[g][0], grids[g][1], rc);
                 return 1;
             }
-            for (b = 0; b < 4; ++b)
-                for (t = 0; t <= 1; ++t) {
-                    rc = run_phased(grids[g][0], grids[g][1], b, t);
-                    if (rc) {
-                        fprintf(stderr, "4ch DFN phased %d Hz/%d behaviour %d trusted %d failed: %d\n",
-                                grids[g][0], grids[g][1], b, t, rc);
-                        return 1;
-                    }
+            for (b = 0; b < 4; ++b) {
+                rc = run_phased(grids[g][0], grids[g][1], b);
+                if (rc) {
+                    fprintf(stderr, "4ch DFN phased %d Hz/%d behaviour %d failed: %d\n",
+                            grids[g][0], grids[g][1], b, rc);
+                    return 1;
                 }
+            }
         }
     }
     puts("4ch_aec_bf_dfn_res: PASS");

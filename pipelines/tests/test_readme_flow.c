@@ -18,7 +18,6 @@
 #include "common/se_stage.h"
 #include "samples/dfn_hop.h"
 #include "samples/se_anr_stage.h"
-#include "samples/se_sample_chain.h"
 #include "samples/ulcnet_nn_stage.h"
 #include "dfn_unit_partition.h"
 #include "tests/dfn_test_fixture.h"
@@ -234,11 +233,13 @@ static int npu_callback(void* user, const DFN2PrepostInputs* in, DFN2PrepostOutp
 
 static float g_erb_fwd[DFN2_N_BINS * DFN2_N_ERB], g_erb_inv[DFN2_N_ERB * DFN2_N_BINS];
 
-/* One DFN2 host: the AEC, the RES gain chain without denoiser or synthesis, and the rate
- * bridge with its DfnHop. */
+/* One DFN2 host: the AEC (its own RES gain), P = E * min(1, G_res) without denoiser or comfort
+ * noise (E and P must share a phase), and the rate bridge with its DfnHop. */
 typedef struct DfnHost {
     Aec* aec;
-    SeSampleChain* chain;
+    float *unity, *total;
+    Complex* post;
+    int n_freqs;
     DfnRateBridge* bridge;
     DfnHop hop;
     uint8_t* mem;
@@ -247,37 +248,37 @@ typedef struct DfnHost {
 static int dfn_host_build(DfnHost* d, const DFN2Model* model) {
     SeGrid grid;
     AecConfig aec_cfg;
-    SeSampleChainConfig sc;
     DfnRateBridgeConfig bc = dfn_rate_bridge_default_config(16000);
     DfnRateBridgeMemReq breq;
-    size_t aec_b, chain_b;
+    size_t aec_b, vec, cvec;
+    uint8_t* cur;
+    int k;
     memset(d, 0, sizeof(*d));
     if (derive_mono_lane(16000, 0, &grid, &aec_cfg) != 0) return -1;
-    sc = se_sample_chain_default_config(16000, grid.fft_size);
-    sc.res = SE_SAMPLE_RES_FRAME_GAIN;       /* the AEC's own residual gain */
-    sc.enable_nr = 0;
-    sc.with_synthesis = 0;                   /* the DFN hop synthesises */
-    sc.enable_cng = 0;                       /* E and P must share a phase */
     bc.stage.erb_fwd = g_erb_fwd;
     bc.stage.erb_inv = g_erb_inv;
     bc.stage.model = *model;
     aec_b = aec_get_mem_size(&aec_cfg);
-    chain_b = se_sample_chain_mem_size(&sc);
+    vec = ALIGN16((size_t)grid.n_freqs * sizeof(float));
+    cvec = ALIGN16((size_t)grid.n_freqs * sizeof(Complex));
     if (dfn_rate_bridge_get_mem_requirements(&bc, &breq) != 0) return -1;
-    if (posix_memalign((void**)&d->mem, 16, ALIGN16(aec_b) + ALIGN16(chain_b) + (size_t)breq.bytes) != 0)
+    if (posix_memalign((void**)&d->mem, 16, ALIGN16(aec_b) + 2 * vec + cvec + (size_t)breq.bytes) != 0)
         return -1;
-    d->aec = aec_init(d->mem, aec_b, &aec_cfg);
-    d->chain = se_sample_chain_init(d->mem + ALIGN16(aec_b), chain_b, &sc);
-    d->bridge = dfn_rate_bridge_init(d->mem + ALIGN16(aec_b) + ALIGN16(chain_b),
-                                     (size_t)breq.bytes, &bc);
-    if (!d->aec || !d->chain || !d->bridge) return -1;
+    cur = d->mem;
+    d->aec = aec_init(cur, aec_b, &aec_cfg);  cur += ALIGN16(aec_b);
+    d->unity = (float*)cur;                    cur += vec;
+    d->total = (float*)cur;                    cur += vec;
+    d->post = (Complex*)cur;                   cur += cvec;
+    d->n_freqs = grid.n_freqs;
+    for (k = 0; k < d->n_freqs; ++k) d->unity[k] = 1.0f;
+    d->bridge = dfn_rate_bridge_init(cur, (size_t)breq.bytes, &bc);
+    if (!d->aec || !d->bridge) return -1;
     dfn_hop_init_bridge(&d->hop, d->bridge);
     return 0;
 }
 
 static void dfn_host_free(DfnHost* d) {
     if (d->bridge) dfn_rate_bridge_destroy(d->bridge);
-    if (d->chain) se_sample_chain_destroy(d->chain);
     if (d->aec) aec_destroy(d->aec);
     free(d->mem);
 }
@@ -285,11 +286,11 @@ static void dfn_host_free(DfnHost* d) {
 /* AEC, RES gain, P; the DFN hop begins on (E, P). */
 static int dfn_host_begin(DfnHost* d, const float* mic, const float* ref) {
     SeSpecFrame f;
-    const Complex* post;
     aec_process_context(d->aec, mic, ref);
-    if (se_frame_from_aec(d->aec, &f) != 0) return -1;
-    post = se_sample_chain_form(d->chain, &f);
-    return post && dfn_hop_begin(&d->hop, f.e, post) == 0 ? 0 : -1;
+    if (se_frame_from_aec(d->aec, &f) != 0 || !f.g_res_ctx) return -1;
+    sk_min_f32(d->total, d->unity, f.g_res_ctx, d->n_freqs);
+    sk_capply_gain_f32(d->post, f.e, d->total, d->n_freqs);
+    return dfn_hop_begin(&d->hop, f.e, d->post) == 0 ? 0 : -1;
 }
 
 static void example_dfn_phased(void) {

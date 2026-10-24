@@ -1,12 +1,12 @@
 # Audio_ALG C User Manual（繁體中文）
 
 本手冊說明 conventional mono pipeline 的建置、命令列使用方式，以及
-以 lib/aec 的 `Aec` 加範例鏈（`pipelines/samples/se_sample_chain.h`）組成 mono 處理的整合方式
+以 lib/aec 的 `Aec` 加逐個初始化的 NR／合成函式庫（範例見 `pipelines/mono_aec_nr_res/main.c`、`static_main.c`）組成 mono 處理的整合方式
 （沒有 mono pipeline 函式庫；每個函式庫各自 `mem_size`／`init`，heap 與 caller-owned-pool 兩種）；
 四麥克風 C seam 另列於第 1.1 節。
 
 > 現行 API 與 sizing contract 以 `lib/aec/c_impl/include/aec.h`、`pipelines/common/se_stage.h`、
-> `pipelines/samples/se_sample_chain.h` 和 `pipelines/README.md` 為準。更新 submodule
+> `pipelines/samples/se_anr_stage.h`、`pipelines/mono_aec_nr_res/static_main.c` 和 `pipelines/README.md` 為準。更新 submodule
 > 或 tuning 後，必須重新建置並執行 pipeline tests；不要只依賴本手冊中的
 > 範例常數。
 
@@ -25,20 +25,20 @@
   （source：`pipelines/mono_aec_nr_res/static_main.c`；單一 caller pool、init 後零 malloc、輸出與 malloc 版
   byte-identical；`--print-mem-size` 可直接查任一取樣率的 pool 需求）
 - mono 的 reusable 零件：`lib/aec` 的 `Aec`（`aec_process_context()`）、`pipelines/common/se_stage.h`
-  的 `se_frame_from_aec()`、header-only 範例鏈 `pipelines/samples/se_sample_chain.h`（沒有 mono 函式庫 archive）
+  的 `se_frame_from_aec()`、`lib/nr` 的 `AnrDenoiser`、audiolib 的 `AcIstft`，以及 header-only 的 NR 級範例 `pipelines/samples/se_anr_stage.h`（沒有 mono 函式庫 archive；每 hop 的串接寫在各範例 `main`）
 - 四麥克風前端 API：`pipelines/4ch_aec_bf_nr_res/4aec_nr_res.h` / `4aec_nr_res.c`
 - 四麥克風線性 AEC + BF 單元（唯一包起來的單元）：`pipelines/4ch_aec_bf_nr_res/audio_pipeline_4ch.h` /
-  `audio_pipeline_4ch.c`；RES／NR／CNG／合成不在單元內
+  `audio_pipeline_4ch.c`；post-beam RES 在單元內（`enable_res`、`audio_pipeline_4ch_res()`），NR／CNG／合成不在單元內
 - 四麥克風 static 對照範例：`pipelines/4ch_aec_bf_nr_res/4aec_nr_res_static.c`
-- 單元加範例鏈的實錄 runner：`pipelines/4ch_aec_bf_nr_res/audio_pipeline_4ch_raw.c`
+- 單元加 NR／合成的實錄 runner：`pipelines/4ch_aec_bf_nr_res/audio_pipeline_4ch_raw.c`
 - 四麥克風 archive：`pipelines/4ch_aec_bf_nr_res` 的 config-keyed build directory
   內的 `libaudio_pipeline_4ch.a`（前端、單元、`se_config.o`）
 
-function、descriptor version、ownership 與錯誤行為，mono 以 lib/aec 與 `se_sample_chain.h`、
+function、descriptor version、ownership 與錯誤行為，mono 以 lib/aec 與 `pipelines/common/se_stage.h`、
 四麥克風以 `4ch_aec_bf_nr_res/4aec_nr_res.h` 與 `audio_pipeline_4ch.h` 為準。
 
 嵌入產品時，各函式庫各自查大小、各自 init，再由整合者串接：mono 是 `se_derive()` →
-`aec_get_mem_size()`／`se_sample_chain_mem_size()` → 對齊配置 → `aec_init()`／`se_sample_chain_init()`
+`aec_get_mem_size()`／`anr_get_mem_size()`／`ac_istft_get_mem_size()` → 對齊配置 → `aec_init()`／`anr_init()`／`ac_istft_init()`
 （桌面也可用 `aec_create()`）；4ch 的單元是 `audio_pipeline_4ch_get_mem_requirements()` → 對齊配置 →
 `audio_pipeline_4ch_init_ex()`（桌面可用 `audio_pipeline_4ch_create()`）。見
 [`integration_mono_zh_TW.md`](integration_mono_zh_TW.md)。第 5 節是直接
@@ -50,7 +50,7 @@ function、descriptor version、ownership 與錯誤行為，mono 以 lib/aec 與
 
 | 取樣率 | frame | FFT | hop | bins | 資源拓撲 |
 |---|---:|---:|---:|---:|---|
-| 16 kHz | 256 | 256 | 128 | 129 | 1 shared matcher + 4 linear AEC（後接 1 post-beam RES + 1 NR，由應用的後級鏈提供）（預設） |
+| 16 kHz | 256 | 256 | 128 | 129 | 1 shared matcher + 4 linear AEC（後接 1 post-beam RES + 1 NR：核心由應用自己建，單元內建 RES）（預設） |
 | 16 kHz | 512 | 512 | 256 | 257 | 同上（可選） |
 | 48 kHz | 1024 | 1024 | 512 | 513 | 同上（唯一合法 48 kHz 格點） |
 
@@ -59,10 +59,10 @@ function、descriptor version、ownership 與錯誤行為，mono 以 lib/aec 與
 `Complex[4][n_freqs]` 有效權重，再呼叫 `four_aec_fuse()` 取得 `SeSpecFrame`。
 模組不實作 beamformer，但會以該組權重一致地投影 error／near／echo／R2 context；
 之後由應用明寫串接一次 RES 增益、一次 NR 增益、`sk_min_f32`、`sk_capply_gain_f32`、
-CNG 與 iFFT/OLA（範例鏈 `se_sample_chain.h` 已串好）。
+CNG 與 iFFT/OLA（`4aec_nr_res_static.c` 的 `post_hop()` 是範例；單元的 `fuse()` 已替你算好 RES 增益）。
 
 `FourAecNrRes*` core 本身不實作 beamformer；若要直接包入現有的第三方
-SRP-PHAT/GSC，使用線性 AEC + BF 單元 `AudioPipeline4Ch*`（不含 RES／NR／合成）。單元的 AEC、DOA、GSC，
+SRP-PHAT/GSC，使用線性 AEC + BF 單元 `AudioPipeline4Ch*`（含 post-beam RES；不含 NR／合成）。單元的 AEC、DOA、GSC，
 以及你串的 NR、RES 都繼承同一個格點，`frame == FFT`、`hop == frame/2`，不能分別
 指定互相矛盾的 frame/hop/FFT。`audio_pipeline_4ch_*_size()` accessors 可
 分別查詢 main、DOA 與 GSC 實際格點；預設三組設定中三者必須一致。
@@ -326,7 +326,7 @@ int audio_alg_init(AudioAlgPipeline *p, int sample_rate,
     p->fft_size = p->frame_size;   /* no padding: AEC's grid is frame == FFT */
     p->n_freqs = p->fft_size / 2 + 1;
 
-    /* Use the grid-explicit entry point (as pipelines/samples/se_sample_chain.h does)
+    /* Use the grid-explicit entry point (as the pipelines/ examples do)
      * so NR resolves the SAME fft_size the AEC instance above just picked --
      * the 2-arg anr_config_for_mode() instead resolves NR's OWN
      * independent per-rate default grid, which is not the AEC default at
@@ -501,7 +501,7 @@ NR preset（`--nr-preset`，見 §4.1）：
 
 > `anr_config_for_mode()` 有四級：`mild`／`moderate`／`balanced`／`aggressive`（`moderate` 介於 mild 與 balanced 之間）。`aec_nr_pipeline` 的 `parse_nr_mode()`（`pipelines/mono_aec_nr_res/main.c`）經 `anr_nr_mode_from_name()` 接受這四個名稱（或 `0`..`3`），其餘字串一律 silently 落回 `balanced`，不會報錯。
 
-Audio_ALG 的範例鏈（`pipelines/samples/se_sample_chain.h`）直接用 NR 函式庫的 preset：`anr_config_for_mode_grid(sample_rate, fft_size, nr_mode)`，不另外覆寫欄位（最小值追蹤視窗 `L` 為函式庫預設，約 512 ms；16 kHz 256/128 為 64 hops），所以 `anr_set_mode()` 可以直接在執行中換強度。
+Audio_ALG 的範例程式（`pipelines/mono_aec_nr_res/main.c` 等）直接用 NR 函式庫的 preset：`anr_config_for_mode_grid(sample_rate, fft_size, nr_mode)`，不另外覆寫欄位（最小值追蹤視窗 `L` 為函式庫預設，約 512 ms；16 kHz 256/128 為 64 hops），所以 `anr_set_mode()` 可以直接在執行中換強度。
 
 若要改 CNG 或 gain combine（例如在 `min(G_nr, G_res)` 之外再加任何 floor），這已不是單純 API integration，而是演算法 operating point 變更，應重新跑 far-end-only、near-end-only、double-talk、movement 與 noisy cases。
 

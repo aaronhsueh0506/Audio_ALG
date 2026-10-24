@@ -2,7 +2,7 @@
  * copy and adapt.
  *
  * The host forms E (the linear-AEC error) and P (E after the RES gain, plus comfort noise when
- * enabled; se_sample_chain.h with synthesis off) before the hop begins. DFN2 then runs on (E, P):
+ * enabled; the DFN example mains show it) before the hop begins. DFN2 then runs on (E, P):
  *   48 kHz       the stage (dfn_res_stage.h) on the host grid; DfnHop synthesises its output
  *                through the caller's AcIstft
  *   other rates  dfn_rate_bridge.h runs the same stage on its 48 kHz grid and synthesises
@@ -17,8 +17,8 @@
  * are not owned; the stage, bridge, synthesis and output spectrum come from the caller's
  * pool. The stage does not reset on an AEC delay change. It adds two hops of delay at 48 kHz
  * and dfn_rate_bridge_added_delay_samples() otherwise; the first output hops are zero. A
- * negative return leaves recovery to the caller: reset the AEC front end, the chain and DfnHop
- * together. */
+ * negative return leaves recovery to the caller: reset the AEC front end, the comfort-noise
+ * generator and DfnHop together. */
 #ifndef PIPELINES_SAMPLES_DFN_HOP_H
 #define PIPELINES_SAMPLES_DFN_HOP_H
 

@@ -4,8 +4,9 @@
 # (DSP chain: see mono_aec_nr_res/main.c):
 #   aec_nr_pipeline         heap-allocated modules
 #   aec_nr_pipeline_static  one caller pool, no malloc after init
-# Both compose lib/aec's Aec, common/se_stage.h and samples/se_sample_chain.h themselves. The
-# mono DFN2 and Align-ULCNet programs compose the same way
+# Both compose lib/aec's Aec (its own RES gain), lib/nr's denoiser and the synthesis themselves,
+# over common/se_stage.h and samples/se_anr_stage.h. The mono DFN2 and Align-ULCNet programs
+# compose the same way
 # (samples/dfn_hop.h, samples/ulcnet_nn_stage.h). All link against the submodule libs (lib/aec,
 # lib/nr) and audiolib's FFT/fast_math layer (../../audiolib/common). The only archive built
 # here is libaudio_pipeline_dfn.a (the DFN2 stage and rate bridge).
@@ -443,7 +444,7 @@ TARGET_ABI_SRCS := tests/test_target_abi.c \
  $(AIAEC_DIR)/aiaec_process.c $(AIAEC_DIR)/DeepVQE_S/deepvqe_process.c \
  $(AIAEC_DIR)/DeepVQE_S/deepvqe_prepost.c \
  $(COMMON_DIR)/../bf/bf.c $(COMMON_DIR)/../doa/srp.c \
- $(COMMON_DIR)/../doa/doa_smoother.c $(COMMON_DIR)/../doa/steering.c \
+ $(COMMON_DIR)/../doa/doa_smoother.c \
  $(COMMON_DIR)/utility/spatial_complex.c $(COMMON_DIR)/utility/spatial_simd.c
 TARGET_ABI_INCLUDES := -I4ch_aec_bf_nr_res -Isamples \
  -I$(DFN2_DIR) -I../AINR/DeepFilterNet3 -I$(ULCNET_DIR) \
@@ -506,20 +507,21 @@ _cfg_guard:
 
 # -MD -MP: emits $(OBJ_DIR)/<name>.d per object (header dependency tracking)
 # -- included near the bottom of this file via `-include $(wildcard $(OBJ_DIR)/*.d)`.
-$(OBJ_DIR)/aec_nr_pipeline.o: mono_aec_nr_res/main.c samples/se_sample_chain.h samples/se_anr_stage.h common/se_stage.h common/se_config.h | _cfg_guard
+$(OBJ_DIR)/aec_nr_pipeline.o: mono_aec_nr_res/main.c samples/se_anr_stage.h common/se_stage.h common/se_config.h | _cfg_guard
 	$(CC) $(CFLAGS) -MD -MP -c -o $@ $<
 
-$(OBJ_DIR)/aec_nr_pipeline_static.o: mono_aec_nr_res/static_main.c samples/se_sample_chain.h samples/se_anr_stage.h common/se_stage.h common/se_config.h | _cfg_guard
+$(OBJ_DIR)/aec_nr_pipeline_static.o: mono_aec_nr_res/static_main.c samples/se_anr_stage.h common/se_stage.h common/se_config.h | _cfg_guard
 	$(CC) $(CFLAGS) -MD -MP -c -o $@ $<
 
 # se_config.o: the grid and AecConfig derivation the example programs link directly. There is
-# no mono archive: the gain chain is header-only (samples/se_sample_chain.h).
+# no mono archive: each example chains the stages itself.
 $(OBJ_DIR)/se_config.o: common/se_config.c common/se_config.h | _cfg_guard
 	$(CC) $(CFLAGS) -MD -MP -c -o $@ $<
 
 # test_mono_chain: the mono chain over lib/aec's Aec -- pool carve vs heap, reset, switches,
-# comfort noise, chain vs the hand-written oracle (tests/conv_chain_mono.h).
-$(OBJ_DIR)/test_mono_chain.o: mono_aec_nr_res/tests/test_mono_chain.c mono_aec_nr_res/tests/conv_chain_mono.h samples/se_sample_chain.h | _cfg_guard
+# comfort noise, chain vs the hand-written oracle (tests/conv_chain_mono.h), and the two example
+# programs run as black boxes against the same oracle.
+$(OBJ_DIR)/test_mono_chain.o: mono_aec_nr_res/tests/test_mono_chain.c mono_aec_nr_res/tests/conv_chain_mono.h samples/se_anr_stage.h | _cfg_guard
 	$(CC) $(CFLAGS) -MD -MP -c -o $@ $<
 
 # Align-ULCNet objects. ulcnet_process.o compiles the
@@ -574,10 +576,10 @@ $(OBJ_DIR)/dfn2_prepost.o: $(DFN2_DIR)/dfn2_prepost.c $(DFN2_DIR)/dfn2_prepost.h
 $(OBJ_DIR)/dfn_res_stage.o: dfn_res_stage.c dfn_res_stage.h $(DFN2_DIR)/dfn2_prepost.h | _cfg_guard
 	$(CC) $(CFLAGS) -I$(DFN2_DIR) -MD -MP -c -o $@ $<
 
-$(OBJ_DIR)/test_se_common.o: tests/test_se_common.c common/se_config.h common/se_stage.h samples/se_sample_chain.h samples/se_anr_stage.h | _cfg_guard
+$(OBJ_DIR)/test_se_common.o: tests/test_se_common.c common/se_config.h common/se_stage.h samples/se_anr_stage.h | _cfg_guard
 	$(CC) $(CFLAGS) -MD -MP -c -o $@ $<
 
-$(OBJ_DIR)/test_readme_flow.o: tests/test_readme_flow.c common/se_config.h common/se_stage.h samples/se_sample_chain.h samples/dfn_hop.h samples/ulcnet_nn_stage.h mono_aec_nr_res/tests/conv_chain_mono.h tests/dfn_test_fixture.h | _cfg_guard
+$(OBJ_DIR)/test_readme_flow.o: tests/test_readme_flow.c common/se_config.h common/se_stage.h samples/se_anr_stage.h samples/dfn_hop.h samples/ulcnet_nn_stage.h mono_aec_nr_res/tests/conv_chain_mono.h tests/dfn_test_fixture.h | _cfg_guard
 	$(CC) $(CFLAGS) -I$(ULCNET_DIR) $(ULCNET_GRID_CFLAGS) -MD -MP -c -o $@ $<
 
 $(OBJ_DIR)/test_dfn_res_stage.o: tests/test_dfn_res_stage.c dfn_res_stage.h tests/dfn_test_fixture.h dfn_unit_partition.h | _cfg_guard
@@ -589,17 +591,17 @@ $(OBJ_DIR)/dfn_rate_bridge.o: dfn_rate_bridge.c dfn_rate_bridge.h dfn_res_stage.
 $(OBJ_DIR)/test_dfn_rate_bridge.o: tests/test_dfn_rate_bridge.c dfn_rate_bridge.h tests/dfn_test_fixture.h | _cfg_guard
 	$(CC) $(CFLAGS) -I$(DFN2_DIR) -MD -MP -c -o $@ $<
 
-$(OBJ_DIR)/test_mono_dfn.o: mono_aec_dfn_res/tests/test_mono_dfn.c mono_aec_nr_res/tests/conv_chain_mono.h samples/dfn_hop.h samples/se_sample_chain.h common/se_config.h dfn_res_stage.h dfn_rate_bridge.h tests/dfn_test_fixture.h | _cfg_guard
+$(OBJ_DIR)/test_mono_dfn.o: mono_aec_dfn_res/tests/test_mono_dfn.c mono_aec_nr_res/tests/conv_chain_mono.h samples/dfn_hop.h common/se_config.h dfn_res_stage.h dfn_rate_bridge.h tests/dfn_test_fixture.h | _cfg_guard
 	$(CC) $(CFLAGS) -MD -MP -c -o $@ $<
 
-$(OBJ_DIR)/mono_aec_dfn_res_main.o: mono_aec_dfn_res/main.c samples/dfn_hop.h samples/se_sample_chain.h common/se_config.h dfn_res_stage.h dfn_rate_bridge.h dfn_example_args.h dfn_unit_partition.h | _cfg_guard
+$(OBJ_DIR)/mono_aec_dfn_res_main.o: mono_aec_dfn_res/main.c samples/dfn_hop.h common/se_config.h dfn_res_stage.h dfn_rate_bridge.h dfn_example_args.h dfn_unit_partition.h | _cfg_guard
 	$(CC) $(CFLAGS) -MD -MP -c -o $@ $<
 
 # example_board_adapter: REFERENCE ONLY host simulation of a board-side
 # common-memory-manager integration -- see that
 # file's own header. Not the real board adapter; demonstrates the calling
 # sequence/error handling/descriptor contract only.
-$(OBJ_DIR)/example_board_adapter.o: mono_aec_nr_res/example_board_adapter.c samples/se_sample_chain.h common/se_stage.h common/se_config.h | _cfg_guard
+$(OBJ_DIR)/example_board_adapter.o: mono_aec_nr_res/example_board_adapter.c samples/se_anr_stage.h common/se_stage.h common/se_config.h | _cfg_guard
 	$(CC) $(CFLAGS) -MD -MP -c -o $@ $<
 
 DFN_LIB_TARGET = $(BIN_DIR)/libaudio_pipeline_dfn.a
@@ -631,8 +633,8 @@ $(DFN_LIB_TARGET): $(DFN_PIPELINE_OBJS) | _cfg_guard
 
 # test: also builds and runs example_board_adapter, whose exit code signals any failed positive-flow
 # step or negative demonstration. `make example-adapter` (below) runs it standalone.
-test: $(BIN_DIR)/test_mono_chain $(BIN_DIR)/example_board_adapter $(BIN_DIR)/test_mono_ulcnet $(BIN_DIR)/test_ulcnet_accelerator_adapter $(BIN_DIR)/test_dfn_res_stage $(BIN_DIR)/test_dfn_rate_bridge $(BIN_DIR)/test_mono_dfn $(BIN_DIR)/test_se_common $(BIN_DIR)/test_readme_flow $(BIN_DIR)/mono_alignulcnet $(BIN_DIR)/mono_aec_dfn_res
-	"$(abspath $(BIN_DIR))/test_mono_chain"
+test: $(BIN_DIR)/test_mono_chain $(BIN_DIR)/aec_nr_pipeline $(BIN_DIR)/aec_nr_pipeline_static $(BIN_DIR)/example_board_adapter $(BIN_DIR)/test_mono_ulcnet $(BIN_DIR)/test_ulcnet_accelerator_adapter $(BIN_DIR)/test_dfn_res_stage $(BIN_DIR)/test_dfn_rate_bridge $(BIN_DIR)/test_mono_dfn $(BIN_DIR)/test_se_common $(BIN_DIR)/test_readme_flow $(BIN_DIR)/mono_alignulcnet $(BIN_DIR)/mono_aec_dfn_res
+	"$(abspath $(BIN_DIR))/test_mono_chain" "$(abspath $(BIN_DIR))" "$(abspath $(OBJ_DIR))"
 	"$(abspath $(BIN_DIR))/example_board_adapter"
 	"$(abspath $(BIN_DIR))/test_mono_ulcnet"
 	"$(abspath $(BIN_DIR))/test_ulcnet_accelerator_adapter"
@@ -774,10 +776,10 @@ $(BIN_DIR)/mono_alignulcnet: $(OBJ_DIR)/mono_alignulcnet_main.o $(ULCNET_ADAPTER
 $(BIN_DIR)/test_ulcnet_accelerator_adapter: $(OBJ_DIR)/test_ulcnet_accelerator_adapter.o $(ULCNET_ADAPTER_OBJS) $(OBJ_DIR)/ulcnet_process.o $(COMMON_LIB) | _cfg_guard
 	$(LINK) -o $@ $(OBJ_DIR)/test_ulcnet_accelerator_adapter.o $(ULCNET_ADAPTER_OBJS) $(OBJ_DIR)/ulcnet_process.o $(COMMON_LIB) $(LDFLAGS)
 
-# The mono DFN2 program composes lib/aec's Aec with the chain header, so it links the AEC and NR
-# archives next to the DFN archive (the chain header references the denoiser).
-$(BIN_DIR)/mono_aec_dfn_res: $(OBJ_DIR)/mono_aec_dfn_res_main.o $(DFN_LIB_TARGET) $(OBJ_DIR)/se_config.o $(AEC_LIB) $(NR_LIB) $(COMMON_LIB) | _cfg_guard
-	$(LINK) -o $@ $(OBJ_DIR)/mono_aec_dfn_res_main.o $(DFN_LIB_TARGET) $(OBJ_DIR)/se_config.o $(AEC_LIB) $(NR_LIB) $(COMMON_LIB) $(LDFLAGS)
+# The mono DFN2 program composes lib/aec's Aec (its RES gain) with the DFN archive; it has no
+# denoiser.
+$(BIN_DIR)/mono_aec_dfn_res: $(OBJ_DIR)/mono_aec_dfn_res_main.o $(DFN_LIB_TARGET) $(OBJ_DIR)/se_config.o $(AEC_LIB) $(COMMON_LIB) | _cfg_guard
+	$(LINK) -o $@ $(OBJ_DIR)/mono_aec_dfn_res_main.o $(DFN_LIB_TARGET) $(OBJ_DIR)/se_config.o $(AEC_LIB) $(COMMON_LIB) $(LDFLAGS)
 	@echo "mono_aec_dfn_res [$(BACKEND)] -> $@"
 
 $(BIN_DIR)/test_se_common: $(OBJ_DIR)/test_se_common.o $(OBJ_DIR)/se_config.o $(AEC_LIB) $(NR_LIB) $(COMMON_LIB) | _cfg_guard
@@ -878,7 +880,7 @@ audit-no-stdio:
 # audit-no-stdio-stack (full-image gate): builds the delivered archives with NO_STDIO=1 (the
 # dispatch forwards it to audiolib / lib/aec / lib/nr; lib/aec compiles its trace/debug TU out under
 # it), nm-gates each archive, then links test_no_stdio_stack.c (a minimal main that runs
-# query->init->process->reset->destroy over Aec and the sample chain, using no stdio) and nm-gates the
+# query->init->process->reset->destroy over Aec, the denoiser and the synthesis, using no stdio) and nm-gates the
 # executable, so a stdio symbol from any archive fails at the image level. The stdio set is
 # fprintf/vfprintf/printf/puts/fputs/stderr/__stderrp/fputc/fwrite.
 .PHONY: audit-no-stdio-stack

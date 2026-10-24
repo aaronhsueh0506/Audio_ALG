@@ -141,7 +141,7 @@ vs 上游 4800 Hz）</td><td>編譯期固定</td>
 <td><code>pbfdkf.c</code> <code>pbfdaf_fill_windows()</code>（<code>ac_window_build()</code>,denom = block_size）</td></tr>
 <tr><td>AEC3 post 合成窗（16k/512 grid 表格化 = sin(πk/512)）</td>
 <td><code>aec_balanced_config.h</code> <code>AECB_SYNTH_WINDOW[512]</code>（per-rate 表）</td></tr>
-<tr><td>mono / 4ch 範例鏈合成窗</td><td><code>pipelines/samples/se_sample_chain.h</code>、<code>pipelines/4ch_aec_bf_nr_res/4aec_nr_res.c</code>：<code>AcIstft</code> 自帶的窗表（<code>ac_window_build()</code>，<code>audiolib/common/src/audio_window.c</code>）</td></tr>
+<tr><td>mono / 4ch 範例合成窗</td><td><code>pipelines/mono_aec_nr_res/main.c</code>、<code>pipelines/4ch_aec_bf_nr_res/audio_pipeline_4ch_static.c</code>：各 main 自己初始化的 <code>AcIstft</code> 自帶的窗表（<code>ac_window_build()</code>，<code>audiolib/common/src/audio_window.c</code>）</td></tr>
 <tr><td>DFN rate bridge（原生格點合成 + 48 kHz 分析／合成）</td><td><code>pipelines/dfn_rate_bridge.c</code>：bridge 自建的兩張表（<code>win_n</code>、<code>win48</code>，<code>ac_window_build()</code>），借給五個 <code>AcStft</code>／<code>AcIstft</code></td></tr>
 <tr><td>ULCNet 兩條範例</td><td><code>samples/ulcnet_nn_stage.c</code>：stage 自有的 <code>ulcnet_window</code>（<code>ac_window_build()</code>），借給分析與合成物件</td></tr>
 <tr><td>Align-ULCNet／DeepVQE-S 前後處理 class</td><td>呼叫端在 config 給的表（<code>ac_window_build()</code>），分析與合成共用</td></tr>
@@ -283,7 +283,7 @@ exactly ONE hop」；輸出 hop p ≙ 輸入 hop p−1</td></tr>
 <div class="tbl">
 <table>
 <tr><th>階段</th><th>新增延遲</th><th>說明</th></tr>
-<tr><td>傳統前級（線性 AEC → RES gain → comfort noise；4ch 另含共用 delay、4 lane、外部 BF 的逐 bin 加權）</td>
+<tr><td>傳統前級（線性 AEC → RES gain → comfort noise；4ch 另含共用 delay、4 lane、BF 的逐 bin 加權）</td>
 <td>+0 hop</td><td>同 hop 交出兩個頻譜：<code>error_spec</code>/<code>beamformed_error</code>（E，pre-RES，即 <code>dfn_res_stage_begin()</code> 的 <code>estimate_spec</code>）與
 post-RES 頻譜（P = E·G_res，開啟 CNG 時再加 comfort noise；DFN2 變體預設關；即 <code>apply_spec</code>）</td></tr>
 <tr><td><code>dfn_res_stage</code> 的尺度換算</td><td>+0 hop</td>
@@ -293,7 +293,7 @@ post-RES 頻譜（P = E·G_res，開啟 CNG 時再加 comfort noise；DFN2 變�
 <tr><td>DFN2 模型 lookahead（48 k host）</td><td>+2 hop（1024 samples = 21.33 ms）</td>
 <td><code>DFN2_MASK_LOOKAHEAD + DFN2_DF_LOOKAHEAD = 1+1</code>，cascade 串聯<b>相加</b>而非取 max；
 前兩個 hop 的 stage 輸出是全零頻譜（寫滿，故延遲是純延遲）</td></tr>
-<tr><td>host／應用的 sqrt-Hann WOLA（48 k：<code>se_sample_chain_synthesize()</code> 或 <code>dfn_hop_end()</code> 內的 <code>ac_istft_push()</code>）</td><td>+1 hop（512 samples = 10.67 ms）</td>
+<tr><td>host／應用的 sqrt-Hann WOLA（48 k：各 main 的 <code>ac_istft_push()</code> 或 <code>dfn_hop_end()</code> 內的 <code>ac_istft_push()</code>）</td><td>+1 hop（512 samples = 10.67 ms）</td>
 <td>OLA 狀態屬於收尾的那個 <code>AcIstft</code>；同一個物件上混用兩種收尾方式仍連續</td></tr>
 <tr><td><b>合計（48 k host）</b></td><td><b>3 hop = 1536 samples = 32.0 ms</b></td>
 <td>兩個範例 <code>main.c</code> 印出的延遲（48 k：<code>hop * (DFN_RES_STAGE_LOOKAHEAD_FRAMES + 1)</code>；原生格點：<code>hop + dfn_rate_bridge_added_delay_samples()</code>）；
@@ -338,7 +338,7 @@ alpha_xi=0.92、L=32、strength overlay 的 alpha_d/g/attack/decay）。
 <code>lib/nr/c_impl/include/anr_types.h</code>、<code>pipelines/common/se_config.c</code></td></tr>
 <tr><td>視窗</td><td><code>lib/aec/c_impl/src/pbfdkf.c</code>、
 <code>lib/aec/c_impl/include/aec_balanced_config.h</code>、
-<code>pipelines/samples/se_sample_chain.h</code>、<code>pipelines/4ch_aec_bf_nr_res/4aec_nr_res.c</code>、
+<code>pipelines/mono_aec_nr_res/main.c</code>、<code>pipelines/4ch_aec_bf_nr_res/audio_pipeline_4ch_static.c</code>（各 main 的 <code>AcIstft</code>）、
 <code>AIAEC/Align_ULCNet/ulcnet_process.c</code></td></tr>
 <tr><td>Framing 決策</td><td><code>docs/align_ulcnet_embedded_streaming_design_zh_TW.md</code> §7、
 <code>AINR/DeepFilterNet2/dfn2_process.h</code> parity 限制 (1)</td></tr>

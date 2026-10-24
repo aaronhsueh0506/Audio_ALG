@@ -602,7 +602,7 @@ G[k] = G<sub>LSA</sub><sup>p[k]</sup> · g<sub>min</sub><sup>1−p[k]</sup>
 <h2 id="res">5. Post-filter — RES + CNG</h2>
 
 <div class="panel">
-<p>RES 是 AEC3-aligned 的抑制鏈（<code>AecState</code> → <code>ResidualEchoEstimator</code> → <code>SuppressionGain</code>），在 AEC 內部以頻域計算 <code>G_res(f)</code> 與 <code>R²(f)</code>，經 <code>AecResContext</code> 交給 pipeline；它不是 NR 之後的第二個時域濾波器。演算法本體見 <a href="../lib/aec/docs/aec_methods.md">lib/aec/docs/aec_methods.md</a> §3。</p>
+<p>RES 是 AEC3-aligned 的抑制鏈（<code>AecState</code> → <code>ResidualEchoEstimator</code> → <code>SuppressionGain</code>），在 AEC 內部以頻域計算 <code>G_res(f)</code> 與 <code>R²(f)</code>，經 <code>AecResContext</code> 交給 pipeline；它不是 NR 之後的第二個時域濾波器。演算法本體見 <a href="../lib/aec/docs/aec_methods.md">lib/aec/docs/aec_methods.md</a> §3。mono 的 RES 增益就是這個 AEC 自己的 <code>ctx.res_gain</code>（經 <code>se_frame_from_aec()</code> 放進 <code>frame.g_res_ctx</code>，強度用 <code>aec_set_preset()</code>）；4ch 的 post-beam RES 由 <code>AudioPipeline4Ch</code> 單元持有（<code>enable_res</code>／<code>res_preset</code>，<code>audio_pipeline_4ch_fuse()</code> 填 <code>g_res_ctx</code>，強度用 <code>aec_res_set_preset(audio_pipeline_4ch_res(p), …)</code>）；NR 與最後合成一律是另外初始化的函式庫物件。</p>
 
 <h3>5.1 Gain fusion</h3>
 
@@ -627,7 +627,7 @@ G[k] = G<sub>LSA</sub><sup>p[k]</sup> · g<sub>min</sub><sup>1−p[k]</sup>
   <tr><td>Frame / Hop</td><td colspan="2">8k 256/128；16k 256/128（預設）或 512/256；48k 1024/512</td><td>frame=FFT、50% overlap、無補零</td></tr>
   <tr><td>FFT size</td><td>256 / 512 / 1024</td><td>256 / 512 / 1024</td><td>NE10，float32</td></tr>
   <tr><td>Algorithmic delay</td><td>0 samples（linear 路徑）</td><td>—</td><td>完整 mono pipeline 為 1 grid hop（final sqrt-Hann OLA）；不含裝置 I/O／resampler／OS scheduling</td></tr>
-  <tr><td>靜態記憶體</td><td><code>aec_get_mem_size()</code></td><td><code>anr_get_mem_size()</code></td><td>各函式庫各自查大小，整合者加總（<code>se_sample_chain_mem_size()</code>；4ch 單元用 <code>audio_pipeline_4ch_get_mem_requirements()</code>）</td></tr>
+  <tr><td>靜態記憶體</td><td><code>aec_get_mem_size()</code></td><td><code>anr_get_mem_size()</code></td><td>各函式庫各自查大小，整合者加總（各 main 自己加總 <code>aec_get_mem_size()</code>、<code>anr_get_mem_size()</code>、<code>ac_istft_get_mem_size()</code>；4ch 單元用 <code>audio_pipeline_4ch_get_mem_requirements()</code>）</td></tr>
   <tr><td>計算量</td><td>依 grid、partition、shadow 與 backend</td><td>依 n_freqs、MCRA 視窗與 backend</td><td>release 前在目標 SoC profile，不使用本頁固定估算</td></tr>
 </table>
 

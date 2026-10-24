@@ -8,16 +8,21 @@ wrapped unit, the board build, and the on-target verification checklist.
 
 What is delivered, and how it is initialised:
 
-- Only the multi-channel linear AEC + beamformer is wrapped as one unit
-  (`AudioPipeline4Ch`, `../pipelines/4ch_aec_bf_nr_res/audio_pipeline_4ch.h`). It has a
+- Only the multi-channel linear AEC + beamformer + post-beam RES is wrapped as one unit
+  (`AudioPipeline4Ch`, `../pipelines/4ch_aec_bf_nr_res/audio_pipeline_4ch.h`; the RES is the
+  unit's own `AecRes`, `fuse()` fills `frame->g_res_ctx`). It has a
   fixed 32-byte descriptor and an 8-point `init_ex()` gate.
 - Every other stage is a separate library that the integrator initialises with its own size
-  query and `init`, and chains: the mono `Aec` (lib/aec), `AecRes` (lib/aec), `AnrDenoiser`
-  (lib/nr), `AcIstft` (audiolib), the DFN2 stage and rate bridge (`dfn_res_stage.h`,
+  query and `init`, and chains: the mono `Aec` (lib/aec, whose own RES gain is `ctx.res_gain`),
+  `AecRes` (lib/aec; only for an application that drives the core `FourAecNrRes` directly, as
+  `4aec_nr_res_static.c` does: the 4-channel unit carries its own),
+  `AnrDenoiser` (lib/nr), `AcIstft` (audiolib), the DFN2 stage and rate bridge (`dfn_res_stage.h`,
   `dfn_rate_bridge.h`, which carry their own descriptors). There is no mono unit and no "complete"
-  wrapper object; the mono flow is `Aec` plus the chain.
-- `../pipelines/samples/` holds example code that does the chaining (`se_sample_chain.h`,
-  `se_anr_stage.h`, `dfn_hop.h`, `ulcnet_nn_stage.{h,c}`). It has no ABI, no layout version and no
+  wrapper object; the mono flow is `Aec` plus the libraries it chains per hop.
+- Each example `main` initialises the libraries it uses and writes the per-hop chaining itself
+  (res gain, `se_anr_stage_gain()`, `sk_min_f32()`, `sk_capply_gain_f32()`, `aec_cng_fill()`,
+  `ac_istft_push()`). `../pipelines/samples/` holds the shared example code (`se_anr_stage.h`,
+  `dfn_hop.h`, `ulcnet_nn_stage.{h,c}`). It has no ABI, no layout version and no
   descriptor; copy and adapt it. The example mains, `static_main.c` and `example_board_adapter.c`
   show the composition.
 
@@ -39,16 +44,18 @@ each size, aligns every segment to 16 bytes (`ALIGN16`) and places them in one b
 several):
 
 ```c
-size_t aec_sz   = aec_get_mem_size(&aec_cfg);              /* lib/aec; 0 = invalid config        */
-size_t chain_sz = se_sample_chain_mem_size(&chain_cfg);    /* RES/NR/CNG/synthesis example; 0 = invalid */
-/* + your own stages; every segment 16-byte aligned (ALIGN16)                          */
+size_t aec_sz   = aec_get_mem_size(&aec_cfg);       /* lib/aec; 0 = invalid config        */
+size_t nr_sz    = anr_get_mem_size(&nr_cfg);         /* lib/nr; 0 = invalid config         */
+size_t synth_sz = ac_istft_get_mem_size(&synth_cfg); /* audiolib; 0 = invalid config       */
+/* + your gain/spectrum buffers and your own stages; every segment 16-byte aligned (ALIGN16) */
 
-Aec*           aec   = aec_init(mem_aec, aec_sz, &aec_cfg);
-SeSampleChain* chain = se_sample_chain_init(mem_chain, chain_sz, &chain_cfg);
+Aec*         aec   = aec_init(mem_aec, aec_sz, &aec_cfg);
+AnrDenoiser* nr    = anr_init(mem_nr, nr_sz, &nr_cfg);
+AcIstft*     istft = ac_istft_init(mem_synth, synth_sz, &synth_cfg);
 /* destroy() on static instances frees no pool memory (runtime is_static)
  * and, with the NE10 backend (vendored patch P0001), releases no
  * backend-owned handle OUTSIDE the pool either: aec_destroy and
- * se_sample_chain_destroy (the denoiser) are genuine no-ops for a pool-resident
+ * anr_destroy (the denoiser) are genuine no-ops for a pool-resident
  * instance -- nothing lives outside the pool to leak or double-free, so each is
  * safe to call any number of times (including never, if the caller is about to
  * free/reuse the whole pool anyway). */
@@ -66,25 +73,30 @@ block of the summed total from the platform allocator, pass it in place of
 the desktop `malloc` — no other change. Each pool base MUST be 16-byte
 aligned (the libraries assert this).
 
-## Sequence (mono: `Aec` plus the example chain)
+## Sequence (mono: `Aec` plus the libraries it chains)
 
 ```
 1. query    se_derive(&req, &rules, &grid, &aec_cfg);         // grid + AecConfig
-            SeSampleChainConfig sc = se_sample_chain_default_config(sample_rate, grid.fft_size);
-            sc.res = SE_SAMPLE_RES_FRAME_GAIN;  sc.enable_nr/nr_mode/enable_cng/... = ...;
+            AnrConfig nr_cfg = anr_config_for_mode_grid(sample_rate, grid.fft_size, mode);
+            AcStftConfig synth_cfg;  ac_stft_config_default(&synth_cfg, grid.fft_size);
             size_t aec_bytes   = aec_get_mem_size(&aec_cfg);       // 0 = invalid
-            size_t chain_bytes = se_sample_chain_mem_size(&sc);    // 0 = invalid
+            size_t nr_bytes    = anr_get_mem_size(&nr_cfg);        // 0 = invalid
+            size_t synth_bytes = ac_istft_get_mem_size(&synth_cfg);// 0 = invalid
+            size_t buf_bytes   = 3*ALIGN16(n_freqs*sizeof(float)) + ALIGN16(n_freqs*sizeof(Complex));
             // Query these fresh, immediately before every init below — never cache a size
             // across a build/backend/config change and replay it later. See "Warnings" below.
 
-2. allocate void* pool = platform_alloc(ALIGN16(aec_bytes) + chain_bytes, 16);
+2. allocate void* pool = platform_alloc(ALIGN16(aec_bytes) + ALIGN16(nr_bytes) +
+                                       ALIGN16(synth_bytes) + buf_bytes, 16);
             // pool need NOT be zeroed — see "Dirty-pool contract" below. Pool must stay STABLE
             // and EXCLUSIVE (nothing else reads/writes it, not shared with any other
             // instance) for the entire lifetime of the handles below.
 
-3. init     Aec* aec = aec_init(pool, aec_bytes, &aec_cfg);
-            SeSampleChain* chain = se_sample_chain_init((uint8_t*)pool + ALIGN16(aec_bytes),
-                                                        chain_bytes, &sc);
+3. init     uint8_t* cur = pool;
+            Aec* aec = aec_init(cur, aec_bytes, &aec_cfg);           cur += ALIGN16(aec_bytes);
+            AnrDenoiser* nr = anr_init(cur, nr_bytes, &nr_cfg);      cur += ALIGN16(nr_bytes);
+            AcIstft* istft = ac_istft_init(cur, synth_bytes, &synth_cfg);  cur += ALIGN16(synth_bytes);
+            // gain/spectrum buffers follow (unity, total gain, NR prior, output spectrum)
             // NULL on: a misaligned/undersized pool, an invalid config, or a sub-object init
             // failure (stderr has detail from the libraries, UNLESS they were built with
             // NO_STDIO=1 — see "NO_STDIO=1" below). A rejected init writes nothing outside
@@ -94,25 +106,27 @@ aligned (the libraries assert this).
             while (have_audio()) {
                 read_hop(mic, ref, hop);
                 aec_process_context(aec, mic, ref);
-                if (se_frame_from_aec(aec, &f) != 0 || !(P = se_sample_chain_form(chain, &f)) ||
-                    se_sample_chain_synthesize(chain, P, out) != 0 || !se_hop_is_finite(out, hop)) {
-                    aec_reset(aec); se_sample_chain_reset(chain);   // a refused hop: reset together
-                    continue;
+                // per hop: G_res = f.g_res_ctx; nr = se_anr_stage_gain(nr, &f, extra, use_r2);
+                //          sk_min_f32; sk_capply_gain_f32; aec_cng_fill; ac_istft_push
+                if (se_frame_from_aec(aec, &f) != 0 || !(P = mono_form(&f)) ||
+                    !se_hop_is_finite(out, hop)) {
+                    aec_reset(aec); anr_reset(nr); ac_istft_reset(istft); rng = SE_CNG_RNG_SEED;
+                    continue;                                       // a refused hop: reset together
                 }
                 write_hop(out, hop);
             }
 
-5. reset?   aec_reset(aec); se_sample_chain_reset(chain);   // optional: echo-path change, stream switch
-            // re-zeros AEC/NR/synthesis state in place and restarts the comfort-noise generator;
-            // no re-validation, no pool re-touch beyond that.
+5. reset?   aec_reset(aec); anr_reset(nr); ac_istft_reset(istft); rng = SE_CNG_RNG_SEED;
+            // optional: echo-path change, stream switch; re-zeros AEC/NR/synthesis state in place
+            // and restarts the comfort-noise generator; no re-validation, no pool re-touch beyond that.
 
-6. destroy  se_sample_chain_destroy(chain); aec_destroy(aec);
+6. destroy  anr_destroy(nr); aec_destroy(aec);
             // NULL-safe; idempotent for these pool-resident instances.
 
 7. release  platform_free(pool);   // only after step 6
 ```
 
-## Sequence (4-channel: the unit plus the chain)
+## Sequence (4-channel: the unit plus the libraries it feeds)
 
 The unit is the one object with a descriptor. Its query, init and teardown:
 
@@ -132,19 +146,21 @@ The unit is the one object with a descriptor. Its query, init and teardown:
             // No diagnostic output at all (the unit links no stdio). audio_pipeline_4ch_init()
             // is init_ex(..., NULL): no descriptor check.
 
-   (the chain, the neural stage or DFN2 stage and bridge are separate blocks with their own
-    size queries and inits: se_sample_chain_mem_size / _init, ulcnet_nn_stage_mem_size / _init,
-    dfn_rate_bridge_get_mem_requirements / dfn_rate_bridge_init)
+   (NR and synthesis, the neural stage or DFN2 stage and bridge are separate blocks with their own
+    size queries and inits: anr_get_mem_size / anr_init, ac_istft_get_mem_size / ac_istft_init,
+    ulcnet_nn_stage_mem_size / _init, dfn_rate_bridge_get_mem_requirements / dfn_rate_bridge_init;
+    the RES is inside the unit)
 
 4. process  audio_pipeline_4ch_process_with_activity(p, mics, far, vad, vad, NULL, &beam, &info);
             audio_pipeline_4ch_fuse(p, &frame);            // optional (core.enable_post = 1)
-            P = se_sample_chain_form(chain, &frame);  se_sample_chain_synthesize(chain, P, out);
+            // frame.g_res_ctx = the unit's RES gain (NULL with enable_res = 0); then
+            // se_anr_stage_gain -> sk_min_f32 -> sk_capply_gain_f32 -> aec_cng_fill -> ac_istft_push
             // or process_front() / process_beam() with your own mask and VAD in between
 
-5. reset?   audio_pipeline_4ch_reset(p);  se_sample_chain_reset(chain);  [ulcnet_nn_stage_reset(stage);]
-            // after ANY refused call too: the integrator resets the unit and the chain together
+5. reset?   audio_pipeline_4ch_reset(p);  anr_reset(nr);  ac_istft_reset(istft);  rng = SE_CNG_RNG_SEED;  [ulcnet_nn_stage_reset(stage);]
+            // after ANY refused call too: the integrator resets the unit and its own stages together
 
-6. destroy  audio_pipeline_4ch_destroy(p); ...      // the chain, stage and bridge each have their own
+6. destroy  audio_pipeline_4ch_destroy(p); ...      // NR, stage and bridge each have their own
 7. release  platform_free(pool); ...                // only after step 6
 ```
 
@@ -165,7 +181,7 @@ if (ulcnet_nn_stage_nn_begin(stage, &job) > 0) {                   // 1 = a fram
 ulcnet_nn_stage_end(stage, out);                                   // WOLA, exactly one hop
 
 // DFN2 (samples/dfn_hop.h): up to two frames per hop through the rate bridge
-dfn_hop_begin(&hop, e, p);               // P = E.G_res formed first (se_sample_chain_form)
+dfn_hop_begin(&hop, e, p);               // P = E.G_res formed first (by the example main)
 while (dfn_hop_nn_begin(&hop, &job) == 1)
     dfn_hop_nn_end(&hop, run_npu(&job));
 dfn_hop_end(&hop, out);
@@ -181,7 +197,7 @@ alignment state (`info.delay`). `process_with_activity(v)` is `process_front` pl
 
 A frame that is never fetched, or left open at `end`, takes the
 identity, so latency does not depend on the model. Every library's pool is
-sized by its own query and carved from a caller-owned block; the stage chain adds
+sized by its own query and carved from a caller-owned block; the per-hop stage chaining adds
 no heap use in the hop path.
 
 ## Warnings
@@ -209,18 +225,19 @@ no heap use in the hop path.
   to), re-derive it fresh at the next boot from THAT boot's
   `audio_pipeline_4ch_get_mem_requirements()` and treat any persisted copy as
   advisory at best — never trust a persisted value as `expected` without
-  also having a freshly-queried one to fall back to. The mono objects and the example chain have no
+  also having a freshly-queried one to fall back to. The mono objects and the example programs have no
   descriptor, so re-querying the size on every build is the whole rule there.
 - **Mixing `_create()` and pool APIs per submodule is not supported.**
   Don't hand-carve one of AEC/SRP/BF into a pool segment yourself while
   letting `audio_pipeline_4ch_create()` heap-allocate another. `audio_pipeline_4ch_init()`/`_init_ex()`
   own the ENTIRE unit pool layout (control block + core + SRP + BF + scratch) as one unit — there is
   no supported way to substitute a heap-obtained sub-module handle into a pool-resident
-  `AudioPipeline4Ch`, or vice versa. The chain and the NN stages are separate objects with their own
+  `AudioPipeline4Ch`, or vice versa. NR, synthesis and the NN stages are separate objects with their own
   pools.
-- **Failure recovery is yours.** When the unit, the chain or a stage refuses a call, or the emitted
-  hop is not finite, reset the unit (or `Aec`), the chain and any neural stage together
-  (`audio_pipeline_4ch_reset()` / `aec_reset()`, `se_sample_chain_reset()`, `ulcnet_nn_stage_reset()`).
+- **Failure recovery is yours.** When the unit, the denoiser or a stage refuses a call, or the emitted
+  hop is not finite, reset the unit (or `Aec`), the denoiser, the synthesis (and the comfort-noise
+  generator) and any neural stage together
+  (`audio_pipeline_4ch_reset()` / `aec_reset()`, `anr_reset()`, `ac_istft_reset()`, `ulcnet_nn_stage_reset()`).
   The DFN2 stage is not reset by an AEC delay change.
 
 ## Descriptor semantics (`AudioPipeline4ChMemReq`)
@@ -235,12 +252,12 @@ own version counters.
 | Field | Meaning |
 |-------|---------|
 | `descriptor_version` | This STRUCT's own ABI version — `AUDIO_PIPELINE_4CH_DESCRIPTOR_VERSION` (currently `1`). Bumped only when `AudioPipeline4ChMemReq`'s field set/order/width changes, independent of `layout_version` below. `audio_pipeline_4ch_init_ex()` checks this FIRST, before interpreting any other field. |
-| `layout_version` | `AUDIO_PIPELINE_4CH_LAYOUT_VERSION` (currently `18`). Bumped whenever the pool size, carve order or descriptor content of `../pipelines/4ch_aec_bf_nr_res/audio_pipeline_4ch.c` changes — including a control-block-only change of the composed core. A cached `bytes` alone is only a lower bound, so this counter is what refuses a descriptor persisted by another build. |
+| `layout_version` | `AUDIO_PIPELINE_4CH_LAYOUT_VERSION` (currently `20`). Bumped whenever the pool size, carve order or descriptor content of `../pipelines/4ch_aec_bf_nr_res/audio_pipeline_4ch.c` changes — including a control-block-only change of the composed core. A cached `bytes` alone is only a lower bound, so this counter is what refuses a descriptor persisted by another build. |
 | `backend_id` | Compile-time FFT backend identity this build was made with, as a small integer — the core's `backend_id`, `FOUR_AEC_NR_RES_BACKEND_NE10` (2, `4aec_nr_res.h`), the only FFT backend (matches the `BACKEND=` of `../pipelines/4ch_aec_bf_nr_res/Makefile`). A process-local rodata pointer cannot be serialized safely, so `backend_id` is compared with a plain integer `==`. A descriptor carrying any other value is never valid, even at matching `bytes`. `0` is reserved for "unknown backend" and is never present in a descriptor this library actually returns. |
 | `build_flags_hash` | FNV-1a-32 of a small fixed set of compile-time strings that affect the unit's carve STRUCTURE: the backend identity above, a literal carve-order token list, the alignment granularity, and the core's own hash — see `audio_pipeline_4ch_build_flags_hash()` in `../pipelines/4ch_aec_bf_nr_res/audio_pipeline_4ch.c`. **Covers:** a change to the unit's own carve order/buffer set/alignment, and (through the core's hash) a core-layer layout bump. **Does NOT cover:** config VALUES (`sample_rate`, `num_angles`, ...) — those change `bytes` but are config, not layout, so a caller re-querying `get_mem_requirements()` for its actual config already gets the right `bytes` regardless of this hash; AEC's/SRP's/BF's/an FFT backend's internal struct layouts (opaque blobs); the compiler/ABI/toolchain. |
 | `alignment` | Required base alignment of the pool pointer, bytes. Always 16 today (the one alignment every module in this stack — AEC, NR, the NE10 FFT backend, `mem_align.h`'s `ALIGN16` — carves to). `uint32_t`, not `size_t`. |
 | `reserved` | Always 0. Exists only so `bytes` (a `uint64_t`) lands on an 8-byte-aligned offset within the struct with no compiler-inserted padding — part of the fixed 32-byte layout, not a field to read or write. |
-| `bytes` | Total pool size to allocate (includes the opaque `AudioPipeline4Ch` control block itself, carved at the front, plus the core, SRP-PHAT, BF and the unit's scratch buffers; it does NOT include the chain or any neural stage). `uint64_t`, not `size_t` — cast to `size_t` before passing to `malloc`/`posix_memalign`/`audio_pipeline_4ch_init*()` on a target where the two widths differ. |
+| `bytes` | Total pool size to allocate (includes the opaque `AudioPipeline4Ch` control block itself, carved at the front, plus the core, SRP-PHAT, BF, the unit's scratch buffers and its RES; it does NOT include NR, synthesis or any neural stage). `uint64_t`, not `size_t` — cast to `size_t` before passing to `malloc`/`posix_memalign`/`audio_pipeline_4ch_init*()` on a target where the two widths differ. |
 
 `audio_pipeline_4ch_init_ex(mem, bytes, cfg, expected)` (see "Sequence" above)
 automates exactly this comparison: passing the descriptor straight back in
@@ -280,7 +297,7 @@ serialization":
 ## Dirty-pool contract
 
 None of the init functions requires a zero-filled pool. The unit clears the whole block it is
-given, `SeSampleChain` clears its whole block, and AEC/NR/the FFT backend each zero
+given, and AEC/NR/the FFT backend each zero
 their own sub-region during their own `_init()` — so a pool filled with poison bytes inits and
 processes identically to a freshly-zeroed one.
 `../pipelines/4ch_aec_bf_nr_res/tests/test_audio_pipeline_4ch.c` (unit, `0xA5`-poisoned pool against heap) and
@@ -291,7 +308,7 @@ need for a caller-side blanket `memset(pool, 0, bytes)` before `init`.
 ## `NO_STDIO=1` — building without libc stdio
 
 The unit and the core print nothing at all on any path (no stdio symbol is linked), and the example
-chain headers use none. lib/aec, lib/nr and audiolib compile their init-time diagnostics out under
+header `se_anr_stage.h` uses none. lib/aec, lib/nr and audiolib compile their init-time diagnostics out under
 `NO_STDIO=1`; the DFN2 stage and rate bridge archive is audited for stdio symbols. Every failure is
 signalled through the return value (`NULL`/`-1`/`0` size), so a board image that cannot or will not
 link libc's stdio (no console, or a policy that forbids the stdio symbol set
@@ -310,7 +327,7 @@ make BACKEND=ne10 audit-no-stdio-stack
 `4ch_aec_bf_nr_res/` (run with `NO_STDIO=1`) scans the 4-channel archive, which includes the unit, the DFN archive and the producers. `audit-no-stdio-stack` also builds
 AEC, NR and audiolib with `NO_STDIO=1`, scans each archive and links
 `mono_aec_nr_res/tests/test_no_stdio_stack.c` (query -> init -> one hop -> reset -> destroy over
-`Aec` and the example chain) to prove the linked image has no stdio symbol. Run them after touching
+`Aec`, the denoiser and the synthesis, chained as the examples do) to prove the linked image has no stdio symbol. Run them after touching
 any diagnostic.
 
 `NO_STDIO` participates in `../pipelines/Makefile`'s `CFG_SIG`/`OBJ_DIR` so a `NO_STDIO=1` build
@@ -327,7 +344,7 @@ beyond what each function already returns.
 ## Teardown order
 
 `audio_pipeline_4ch_destroy()` tears down BF -> SRP-PHAT -> core — BF borrows the
-steering table, so it goes first. For the mono flow destroy the chain (the denoiser) and then the
+steering table, so it goes first. For the mono flow destroy the denoiser and then the
 `Aec`. Every one of these calls is a genuine no-op for a pool-resident instance today, with the NE10
 backend (matches the "Two Versions" section in
 [`../pipelines/README.md`](../pipelines/README.md) — NE10's twiddle configs live in the pool under
@@ -359,7 +376,7 @@ platform allocator, DMA engine, or power state behind that pointer.
   allocation, DMA buffer, or another instance's pool — every
   sub-module pointer inside a pool is a raw pointer into it, not a copy,
   so an overlapping region is silent memory corruption, not a caught error.
-  The chain's block and the unit's block (or `Aec` block) must not overlap each other.
+  The NR/synthesis block and the unit's block (or `Aec` block) must not overlap each other.
 - **Exclusive lifetime**: nothing else reads or writes a pool for the
   entire lifetime of its handle, from `init` through
   the matching `destroy` — no other task, ISR, or DMA
@@ -373,13 +390,13 @@ platform allocator, DMA engine, or power state behind that pointer.
   any DMA-out on it begins.
 - **Allocator-failure / partial-init rollback**: confirm the caller's own
   rollback path is correct for a `platform_alloc()` failure BEFORE any
-  init is ever called, and for an init that fails after another succeeded (the AEC built, the chain
+  init is ever called, and for an init that fails after another succeeded (the AEC built, the denoiser
   refused: destroy the AEC and free the pool) — each init never partially
   commits (every rejection path returns `NULL` before writing into `mem`),
   so there is nothing on ITS side to roll back, but the caller's own
   pool-acquisition failure handling is not something a library can verify.
 - **Reset / reconfigure / double-destroy / power-resume**: exercise
-  the paired reset (`aec_reset()`/`audio_pipeline_4ch_reset()` with `se_sample_chain_reset()` and any
+  the paired reset (`aec_reset()`/`audio_pipeline_4ch_reset()` with `anr_reset()`, `ac_istft_reset()` and any
   neural stage reset — echo-path change), a full destroy-then-
   re-`init` on the SAME pool (config change), calling
   `destroy` twice in a row (must be a safe no-op the

@@ -2,7 +2,7 @@
 #
 # Reference examples only -- see each source file's own top-of-file comment for what it
 # demonstrates and what production machinery it deliberately omits. The pipeline example mains
-# include the headers of this directory (se_sample_chain.h, se_anr_stage.h, dfn_hop.h,
+# include the headers of this directory (se_anr_stage.h, dfn_hop.h,
 # ulcnet_nn_stage.h); the production targets (the 4-channel unit and its archives) do not.
 #
 # Same two-phase recursive-make producer dispatch as the other pipeline

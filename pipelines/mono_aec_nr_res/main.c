@@ -1,13 +1,13 @@
 /** Binary aec_nr_pipeline (heap flavor): AEC(linear) -> echo-aware NR -> RES, composed here from
- * the library calls. Example code: Aec (lib/aec) for the linear stage, se_frame_from_aec() for the
- * frame view, samples/se_sample_chain.h for RES gain -> NR gain -> min -> comfort noise ->
- * synthesis. Per hop:
+ * the library calls. Example code: Aec (lib/aec) for the linear stage and its own RES gain,
+ * se_frame_from_aec() for the frame view, AnrDenoiser (lib/nr) and AcIstft (audiolib) initialised
+ * here. Per hop:
  *     aec_process_context(aec, mic, ref);
- *     se_frame_from_aec(aec, &frame);
- *     P = se_sample_chain_form(chain, &frame);
- *     se_sample_chain_synthesize(chain, P, out);
- * A refused call resets the AEC and the chain together. See static_main.c for the caller-pool
- * flavor.
+ *     se_frame_from_aec(aec, &frame);                  // E, R2, CN and G_res (frame.g_res_ctx)
+ *     G_nr = se_anr_stage_gain(nr, &frame, ...);
+ *     P = E * min(G_nr, G_res) + comfort noise;        // mono_form()
+ *     ac_istft_push(istft, P, out);
+ * A refused call resets every stage together. See static_main.c for the caller-pool flavor.
  * Build:  make libs && make aec_nr_pipeline
  * Usage:
  *   AEC preset: 0=mild, 1=balanced, 2=aggressive, 3=no_floor; names also accepted.
@@ -23,9 +23,13 @@
 #include <time.h>
 
 #include "aec.h"
+#include "anr.h"
+#include "audio_stft.h"
 #include "common/se_config.h"
 #include "common/se_stage.h"
-#include "samples/se_sample_chain.h"
+#include "samples/se_anr_stage.h"
+#include "utility/mem_align.h"
+#include "utility/simd_kernels.h"
 #include "wav_io.h"
 
 /* CLI aliases only; unknown names fall back to balanced. */
@@ -61,7 +65,7 @@ static const char* nr_mode_name(AnrMode m) {
 }
 
 /* The mono lane: the rate's grid and the linear-stage AecConfig. The lane keeps its own gain
- * in the context (enable_res = 0, return_res_context = 1); the chain applies it. */
+ * in the context (enable_res = 0, return_res_context = 1); mono_form() applies it. */
 static int derive_lane(int sample_rate, int fft_size, AecPreset preset, SeGrid* grid,
                        AecConfig* aec_cfg) {
     static const SeRules rules = { .allow_8k = 1, .spatial_context = SE_CONTEXT_PRESET };
@@ -76,44 +80,108 @@ static int derive_lane(int sample_rate, int fft_size, AecPreset preset, SeGrid* 
     return se_derive(&req, &rules, grid, aec_cfg);
 }
 
-/* The AEC and the gain chain, each in its own aligned block. */
+/* What runs after the AEC (unused with --aec-only). */
+typedef struct PostOptions {
+    int with_res, with_nr, use_r2, enable_cng;
+    AnrMode nr_mode;
+} PostOptions;
+
+/* The AEC in its own aligned block; the denoiser, the synthesis and the gain/spectrum buffers
+ * carved in that order from a second one. */
 typedef struct Rig {
     Aec* aec;
     void* aec_mem;
-    SeSampleChain* chain;     /* NULL with --aec-only */
-    void* chain_mem;
+    void* post_mem;           /* NULL with --aec-only */
+    PostOptions opt;
+    AnrDenoiser* nr;          /* NULL with --no-nr */
+    AcIstft* istft;
+    float *unity, *total_gain, *extra_noise;
+    Complex* spec;
+    uint32_t rng;
+    int n_freqs;
+    const float* last_nr;     /* the NR gain of the last formed hop (unity without NR) */
 } Rig;
 
 static void rig_free(Rig* r) {
-    if (r->chain) se_sample_chain_destroy(r->chain);
+    if (r->nr) anr_destroy(r->nr);
     if (r->aec) aec_destroy(r->aec);
-    free(r->chain_mem);
+    free(r->post_mem);
     free(r->aec_mem);
     memset(r, 0, sizeof(*r));
 }
 
-static int rig_build(Rig* r, const AecConfig* aec_cfg, const SeSampleChainConfig* chain_cfg) {
+/* `opt` NULL: the AEC alone. */
+static int rig_build(Rig* r, int sample_rate, const SeGrid* grid, const AecConfig* aec_cfg,
+                     const PostOptions* opt) {
     size_t aec_bytes = aec_get_mem_size(aec_cfg);
+    AnrConfig nr_cfg;
+    AcStftConfig synth_cfg;
+    size_t nr_bytes = 0, synth_bytes, vec, cvec;
+    unsigned char* cur;
+    int k;
     memset(r, 0, sizeof(*r));
     if (aec_bytes == 0 || posix_memalign(&r->aec_mem, 16, aec_bytes) != 0) return -1;
     r->aec = aec_init(r->aec_mem, aec_bytes, aec_cfg);
     if (!r->aec) { rig_free(r); return -1; }
-    if (chain_cfg) {
-        size_t chain_bytes = se_sample_chain_mem_size(chain_cfg);
-        if (chain_bytes == 0 || posix_memalign(&r->chain_mem, 16, chain_bytes) != 0) {
-            rig_free(r);
-            return -1;
-        }
-        r->chain = se_sample_chain_init(r->chain_mem, chain_bytes, chain_cfg);
-        if (!r->chain) { rig_free(r); return -1; }
+    if (!opt) return 0;
+    r->opt = *opt;
+    r->n_freqs = grid->n_freqs;
+    if (opt->with_nr) {
+        nr_cfg = anr_config_for_mode_grid(sample_rate, grid->fft_size, opt->nr_mode);
+        nr_bytes = anr_get_mem_size(&nr_cfg);
+        if (nr_bytes == 0) { rig_free(r); return -1; }
     }
+    ac_stft_config_default(&synth_cfg, grid->fft_size);
+    synth_bytes = ac_istft_get_mem_size(&synth_cfg);
+    vec = ALIGN16((size_t)r->n_freqs * sizeof(float));
+    cvec = ALIGN16((size_t)r->n_freqs * sizeof(Complex));
+    if (synth_bytes == 0 ||
+        posix_memalign(&r->post_mem, 16,
+                       ALIGN16(nr_bytes) + ALIGN16(synth_bytes) + 3 * vec + cvec) != 0) {
+        r->post_mem = NULL;
+        rig_free(r);
+        return -1;
+    }
+    cur = (unsigned char*)r->post_mem;
+    if (opt->with_nr) {
+        r->nr = anr_init(cur, nr_bytes, &nr_cfg);
+        cur += ALIGN16(nr_bytes);
+    }
+    r->istft = ac_istft_init(cur, synth_bytes, &synth_cfg);
+    cur += ALIGN16(synth_bytes);
+    if ((opt->with_nr && !r->nr) || !r->istft) { rig_free(r); return -1; }
+    r->unity = (float*)cur;       cur += vec;
+    r->total_gain = (float*)cur;  cur += vec;
+    r->extra_noise = (float*)cur; cur += vec;
+    r->spec = (Complex*)cur;
+    for (k = 0; k < r->n_freqs; ++k) r->unity[k] = 1.0f;
+    r->rng = SE_CNG_RNG_SEED;
     return 0;
 }
 
 /* A stage refused a hop: back to the state of a fresh instance. */
 static void rig_reset(Rig* r) {
     aec_reset(r->aec);
-    if (r->chain) se_sample_chain_reset(r->chain);
+    if (r->nr) anr_reset(r->nr);
+    if (r->istft) ac_istft_reset(r->istft);
+    r->rng = SE_CNG_RNG_SEED;
+    r->last_nr = NULL;
+}
+
+/* P = E * min(G_nr, G_res) plus comfort noise on the bins the RES cut; an absent gain is the
+ * unity vector. NULL when a stage refuses the hop. */
+static const Complex* mono_form(Rig* r, const SeSpecFrame* f) {
+    const float* res = r->opt.with_res ? f->g_res_ctx : r->unity;
+    const float* nr = r->unity;
+    if (!res) return NULL;
+    if (r->nr && !(nr = se_anr_stage_gain(r->nr, f, r->extra_noise, r->opt.use_r2)))
+        return NULL;
+    sk_min_f32(r->total_gain, nr, res, r->n_freqs);   /* keeps a non-finite gain visible */
+    sk_capply_gain_f32(r->spec, f->e, r->total_gain, r->n_freqs);
+    if (r->opt.enable_cng && r->opt.with_res && f->cn)
+        aec_cng_fill(&r->rng, r->spec, f->cn, res, nr, SE_CNG_NR_GAIN_FLOOR, r->n_freqs);
+    r->last_nr = nr;
+    return r->spec;
 }
 
 /* --debug: one status line/sec to stderr from the read-only aec_debug_status() /
@@ -143,7 +211,7 @@ static void print_debug_status(const Aec* aec, const AnrDenoiser* nr, int aec_on
 
 /* --timing: per-stage cost summed over the run and reported as a mean per hop. The AEC rows
  * come from aec_get_last_timing() (built with -DAEC_STAGE_TIMING=1, `make PROFILE=1`); the
- * chain and synthesis rows are this program's own clock around the calls. */
+ * gain-chain and synthesis rows are this program's own clock around the calls. */
 typedef struct {
     uint64_t delay, frontend, linear, res, chain, synth, wall;
     uint64_t hops;
@@ -201,9 +269,9 @@ static uint32_t timing_now_us(void) {
                       + (uint64_t)ts.tv_nsec / 1000ull);
 }
 
-/* One hop. --aec-only is the AEC's own time-domain output; otherwise the chain over the AEC's
- * frame. The clock is read only when `timed`. Returns 0, or -1 after a refused hop (the caller
- * resets). */
+/* One hop. --aec-only is the AEC's own time-domain output; otherwise the post stages over the
+ * AEC's frame. The clock is read only when `timed`. Returns 0, or -1 after a refused hop (the
+ * caller resets). */
 static int process_hop(Rig* r, const float* mic, const float* ref, float* out, int timed,
                        uint32_t* chain_us, uint32_t* synth_us) {
     SeSpecFrame frame;
@@ -211,18 +279,18 @@ static int process_hop(Rig* r, const float* mic, const float* ref, float* out, i
     uint32_t t0, t1;
     *chain_us = 0u;
     *synth_us = 0u;
-    if (!r->chain) {
+    if (!r->post_mem) {
         aec_process(r->aec, mic, ref, out);
         return 0;
     }
     aec_process_context(r->aec, mic, ref);
     if (se_frame_from_aec(r->aec, &frame) != 0) return -1;
     t0 = timed ? timing_now_us() : 0u;
-    spec = se_sample_chain_form(r->chain, &frame);
+    spec = mono_form(r, &frame);
     t1 = timed ? timing_now_us() : 0u;
     *chain_us = t1 - t0;
     if (!spec) return -1;
-    if (se_sample_chain_synthesize(r->chain, spec, out) != 0) return -1;
+    (void)ac_istft_push(r->istft, spec, out);
     *synth_us = timed ? timing_now_us() - t1 : 0u;
     return 0;
 }
@@ -300,19 +368,16 @@ int main(int argc, char* argv[]) {
            !no_res ? "on" : "off", !no_cng ? "on" : "off");
 
     /* Comfort noise fills only bins the RES gain cut, and only when the AEC config allows it. */
-    SeSampleChainConfig chain_cfg;
-    memset(&chain_cfg, 0, sizeof(chain_cfg));
-    if (lane_ok) {
-        chain_cfg = se_sample_chain_default_config(sr, grid.fft_size);
-        chain_cfg.res = no_res ? SE_SAMPLE_RES_OFF : SE_SAMPLE_RES_FRAME_GAIN;
-        chain_cfg.enable_nr = !no_nr;
-        chain_cfg.nr_mode = nr_mode;
-        chain_cfg.legacy_amin = legacy;
-        chain_cfg.enable_cng = aec_cfg.enable_cng && !no_cng;
-    }
+    PostOptions post;
+    memset(&post, 0, sizeof(post));
+    post.with_res = !no_res;
+    post.with_nr = !no_nr;
+    post.use_r2 = !legacy;
+    post.nr_mode = nr_mode;
+    post.enable_cng = lane_ok && aec_cfg.enable_cng && !no_cng;
 
     Rig rig;
-    if (!lane_ok || rig_build(&rig, &aec_cfg, aec_only ? NULL : &chain_cfg) != 0) {
+    if (!lane_ok || rig_build(&rig, sr, &grid, &aec_cfg, aec_only ? NULL : &post) != 0) {
         fprintf(stderr, "Error: pipeline create failed\n");
         wav_close_read(mic_r); wav_close_read(ref_r); return 1;
     }
@@ -371,7 +436,7 @@ int main(int argc, char* argv[]) {
         if (dctx) {
             AecResContext ctx;
             aec_get_res_context(rig.aec, &ctx);
-            const float* g_nr = se_sample_chain_last_nr_gain(rig.chain);
+            const float* g_nr = rig.last_nr;
             if (ctx.error_spec && ctx.res_gain && g_nr) {
                 fwrite(ctx.error_spec, sizeof(Complex), n_freqs, dctx);
                 fwrite(ctx.res_gain, sizeof(float), n_freqs, dctx);
@@ -387,7 +452,7 @@ int main(int argc, char* argv[]) {
         if (processed % sr == 0) {
             printf("."); fflush(stdout);
             if (debug_status)
-                print_debug_status(rig.aec, se_sample_chain_nr(rig.chain), aec_only,
+                print_debug_status(rig.aec, rig.nr, aec_only,
                                    (float)processed / sr);
         }
     }

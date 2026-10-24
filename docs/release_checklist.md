@@ -124,7 +124,7 @@ Pass conditions:
 - [ ] No compiler warnings.
 - [ ] SIMD/scalar kernel parity passes.
 - [ ] FFT heap/static parity passes.
-- [ ] Pre-gain, resampler, WAV, invalid-input, and pool tests pass.
+- [ ] Resampler, WAV, invalid-input, and pool tests pass.
 - [ ] Invalid input does not modify a caller-owned pool.
 - [ ] Static processing allocates no heap after init.
 - [ ] The unified `-ffp-contract=off -fno-math-errno` policy and FP/FSQRT audits pass.
@@ -335,8 +335,8 @@ Pass conditions:
 
 `make -C pipelines test` also builds and runs the shared post-RES DFN2
 stage, the rate bridge that takes that stage to its 48 kHz grid from a
-product-rate host, and the mono example that composes lib/aec's `Aec`, the
-sample chain with the RES gain only (`enable_nr=0`, no synthesis) and
+product-rate host, and the mono example that composes lib/aec's `Aec` (its own RES
+gain, formed into P in the example's `rig_process`, no denoiser, no synthesis) and
 `samples/dfn_hop.h`:
 
 ```bash
@@ -408,17 +408,19 @@ Pass conditions:
 - [ ] Pre/post token, reset, replay, and cross-instance misuse fail closed.
 - [ ] The unit (`AudioPipeline4Ch`) supports heap and caller-owned static-pool init.
 - [ ] SRP/GSC and the unit allocate no heap after static init.
-- [ ] The unit contains no RES, NR, comfort noise or synthesis; those stages are
-      separate libraries that the example programs initialise and chain, and
-      `unit + fuse + sample chain` equals the hand-written reference chain bit
-      for bit (`test_audio_pipeline_4ch`).
+- [ ] The unit contains the post-beam RES (`enable_res`, `audio_pipeline_4ch_res()`;
+      `fuse()` fills `frame.g_res_ctx`) but no NR, comfort noise or synthesis; those
+      stages are separate libraries that the example programs initialise and chain,
+      the unit's RES gain equals a separate `AecRes` built from explicit parameters
+      over the same fused frame, and the unit plus the examples' per-hop chain equals
+      the hand-written reference chain bit for bit (`test_audio_pipeline_4ch`).
 - [ ] SIMD/scalar parity passes.
 - [ ] All three product grids pass.
 
 ### 9.0 Four-channel DeepFilterNet2 variant (`4ch_aec_bf_dfn_res`)
 
 `make -C pipelines/4ch_aec_bf_nr_res test` also builds and runs the DFN2
-example over the core (`enable_post=1`; the sample chain with the RES gain only,
+example over the unit (`AudioPipeline4Ch`: real SRP-PHAT/BF, RES inside the unit;
 no denoiser, no synthesis; `samples/dfn_hop.h`):
 
 ```bash
@@ -434,13 +436,13 @@ make -C pipelines/4ch_aec_bf_dfn_res test   # scoped: test_4ch_dfn and the
 
 Pass conditions:
 
-- [ ] At a 48 kHz core, with no model (or a failing one), the example output is
+- [ ] At a 48 kHz host, with no model (or a failing one), the example output is
       byte-equal to the hand-written conventional chain
-      (`4ch_aec_bf_nr_res/tests/conv_chain_4ch.h`) with the denoiser off,
-      delayed by exactly two hops, with both fuse forms (reconstructed weights
-      and trusted spectrum) and with comfort noise OFF and ON, across an AEC
+      (`4ch_aec_bf_nr_res/tests/conv_chain_4ch.h`, fed the unit's beam weights
+      and beamformed spectrum) with the denoiser off,
+      delayed by exactly two hops, with comfort noise OFF and ON, across an AEC
       delay change.
-- [ ] The stimulus actually engages the post-beam RES (a RES-off core differs).
+- [ ] The stimulus actually engages the post-beam RES (a RES-off unit differs).
 - [ ] Stage counters show no mid-stream reset (the stage is not reset by a
       delay change of the shared aligner).
 - [ ] A rate the core does not offer is refused at
@@ -454,8 +456,8 @@ Pass conditions:
       samples) and a pass-band tolerance against the conventional NR-off
       output. The native path is a tolerance, NOT a memcmp.
 - [ ] The build produces `libdfn_res_stage.a` (carrying
-      `dfn_rate_bridge.o`); `FOUR_AEC_NR_RES_LAYOUT_VERSION` is 23 and
-      `AUDIO_PIPELINE_4CH_LAYOUT_VERSION` is 18.
+      `dfn_rate_bridge.o`); `FOUR_AEC_NR_RES_LAYOUT_VERSION` is 24 and
+      `AUDIO_PIPELINE_4CH_LAYOUT_VERSION` is 20.
 
 ### 9.1 Real four-microphone validation
 

@@ -3,8 +3,8 @@
 `gain/` holds three stand-alone gain stages. It has no Makefile of its own and
 no shipped pipeline target links it.
 
-- `fix_gain` (`fix_gain.h`): per-channel input gain with an optional clip. For
-  a single gain use audiolib's `AudioPreGain` (`audio_pre_gain.h`).
+- `fix_gain` (`fix_gain.h`): per-channel input gain with an optional clip; one
+  channel gives a single-gain mono path.
 - `nr_gain` (`nr_gain.h`): post-NR broadcast gain chosen by whether a DOA
   estimate exists; the header maps the config fields.
 - `post_gain` (`post_gain.h`): directional per-bin post-gain over audiolib's

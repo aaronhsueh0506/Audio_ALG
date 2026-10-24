@@ -9,6 +9,8 @@
 #ifndef PIPELINES_SE_STAGE_H
 #define PIPELINES_SE_STAGE_H
 
+#include <math.h>
+
 #include "aec_res.h"
 #include "fft_wrapper.h"
 
@@ -93,6 +95,15 @@ static inline int se_frame_from_aec(const Aec* aec, SeSpecFrame* frame) {
     frame->delay_changed = lin.delay_state == AEC_LINEAR_DELAY_CHANGED;
     frame->delay_locked = lin.delay_state != AEC_LINEAR_DELAY_UNLOCKED;
     return 0;
+}
+
+/* 1 when all n samples are finite: the check an integrator runs on an emitted hop before
+ * trusting it. */
+static inline int se_hop_is_finite(const float* x, int n) {
+    int k;
+    for (k = 0; k < n; ++k)
+        if (!isfinite(x[k])) return 0;
+    return 1;
 }
 
 #ifdef __cplusplus

@@ -66,12 +66,15 @@ training/checkpoint contract even when a numeric grid happens to match.
 There is no mono pipeline library. The reusable parts are separate libraries, each
 with its own size query and `init`: lib/aec's `Aec` (`aec_process_context()`),
 `common/se_stage.h` (`SeSpecFrame`, `se_frame_from_aec()`, `se_res_stage_gain()`), the denoiser
-(`anr.h`), `AecRes` and `AcIstft`. The example chain that sequences them is header-only code,
-`pipelines/samples/se_sample_chain.h` (no ABI, no layout version). The only wrapped unit is the
-4-channel linear AEC + beamformer, `pipelines/4ch_aec_bf_nr_res/audio_pipeline_4ch.h`
+(`anr.h`) and `AcIstft`; the mono RES gain is the `Aec`'s own (`ctx.res_gain`, exposed as
+`frame.g_res_ctx`, strength through `aec_set_preset()`). Each example `main` initialises the
+libraries it uses and writes the per-hop sequence itself; the only shared example header is
+`pipelines/samples/se_anr_stage.h` (no ABI, no layout version). The only wrapped unit is the
+4-channel linear AEC + beamformer + post-beam RES, `pipelines/4ch_aec_bf_nr_res/audio_pipeline_4ch.h`
 (caller-owned 16-byte-aligned pool initialized from a versioned memory descriptor, or a heap
-convenience constructor). The two mono CLI executables are example programs that compose the
-libraries.
+convenience constructor; its own `AecRes` is reached through `audio_pipeline_4ch_res()` and
+`audio_pipeline_4ch_fuse()` fills `frame.g_res_ctx`). The two mono CLI executables are example
+programs that compose the libraries.
 
 Low-level details, backend/release rules, memory sizing, presets, and tests are
 maintained in [`../pipelines/README.md`](../pipelines/README.md).
@@ -85,8 +88,10 @@ view of the analysis frame (`pipelines/common/se_stage.h`, `SeSpecFrame`):
 frame = analysis stage           (mono: aec_process_context -> se_frame_from_aec,
                                   4ch: audio_pipeline_4ch_process_* -> audio_pipeline_4ch_fuse
                                        (or four_aec_front_process -> beamformer -> four_aec_fuse))
-res_gain = se_res_stage_gain(res, frame)        gain stages return const float*
-nr_gain  = se_anr_stage_gain(nr, frame, scratch, use_r2)
+res_gain = frame.g_res_ctx                      mono: the AEC's own gain; 4ch unit: filled by fuse();
+                                                a core-level example with its own AecRes calls
+                                                se_res_stage_gain(res, frame) instead
+nr_gain  = se_anr_stage_gain(nr, frame, scratch, use_r2)    gain stages return const float*
 total    = sk_min_f32(nr_gain, res_gain)        a disabled source reads as the unity vector
 spec     = sk_capply_gain_f32(frame.e, total)
 spec    += aec_cng_fill(...)                    comfort noise on the cut bins

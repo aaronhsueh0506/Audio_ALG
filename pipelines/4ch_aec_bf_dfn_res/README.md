@@ -1,33 +1,35 @@
 # 4-channel AEC + beamformer (bf) + RES + DeepFilterNet2
 
-This example replaces the post-beam MMSE-LSA denoiser of the four-channel
-core (`4ch_aec_bf_nr_res/4aec_nr_res.h`) with DeepFilterNet2 while keeping
-the shared delay estimator, the four linear AEC lanes, the beamformer (bf)
-seam, the post-beam AEC3 residual suppressor and the comfort-noise recipe. There is no DFN
-wrapper library: `main.c` initialises the core (`FourAecNrRes`), the gain chain
-`samples/se_sample_chain.h` (RES gain only: `enable_nr = 0`, no synthesis) and the DFN2 stage
-(or the rate bridge) separately, and `samples/dfn_hop.h` runs the network between the
-post-RES spectrum and the synthesis:
+This example replaces the post-beam MMSE-LSA denoiser of the conventional four-channel
+application (`4ch_aec_bf_nr_res/`) with DeepFilterNet2 while keeping the shared delay estimator,
+the four linear AEC lanes, the SRP-PHAT and beamformer (bf) of the linear AEC + BF unit
+(`4ch_aec_bf_nr_res/audio_pipeline_4ch.h`), the unit's post-beam AEC3 residual suppressor and the
+comfort-noise recipe. There is no DFN wrapper library: `main.c` initialises the unit
+(`AudioPipeline4Ch`, whose pool already holds the post-beam `AecRes`: `enable_res`, `res_preset`),
+the gain and spectrum buffers of the RES path (no denoiser) and the DFN2 stage (or the rate bridge)
+separately, forms P in `dfn_form()`, and `samples/dfn_hop.h` runs the network between the post-RES
+spectrum and the synthesis:
 
 ```text
-mics/ref -> four_aec_front_process(core, mics, far, &front)   four lanes, front view
-            (beamformer (bf) -> effective weights, optional trusted spectrum)
-         -> four_aec_fuse(core, weights, trusted, &frame)
+mics/ref -> audio_pipeline_4ch_process(unit, mics, far, &beam, NULL)
+            shared delay, four lanes, SRP-PHAT, beamformer (bf)
+         -> audio_pipeline_4ch_fuse(unit, &frame)
               E = beamformed error spectrum         -> DFN2 feature input
-         -> P = se_sample_chain_form(chain, &frame)
-              P = E * G_res + comfort noise         -> DFN2 applied here
+              frame.g_res_ctx = the unit's RES gain
+         -> P = E * min(1, frame.g_res_ctx)         P = E * G_res (+ comfort noise) -> DFN2 applied here
+                                                   (dfn_form(): sk_min_f32 + sk_capply_gain_f32 + aec_cng_fill)
          -> dfn_hop_begin(&hop, frame.e, P)
          -> while (dfn_hop_nn_begin(&hop, &job) > 0) { run the model on the job; dfn_hop_nn_end(&hop, rc) }
          -> dfn_hop_end(&hop, out)                  -> enhanced P, frame t-2,
                                                        the host's iFFT / OLA
 ```
 
-The beamformer seam is the same as `FourAecNrRes`'s: `four_aec_fuse()` reconstructs the
-beamformed error from the weights, or takes the BF's own spectrum when one is passed.
-`dfn_hop_process(&hop, frame.e, P, out)` is the sequence of the `dfn_hop_*` calls with the
-model callback (`dfn_res_stage_infer()` here) as the runner. The example owns its RES, gain
-scratch and comfort-noise state in the chain and the ISTFT in the `DfnHop`: the core carries none
-of them, and a refused call resets the core, the chain and the `DfnHop` together
+The skeleton uses the unit's own SRP-PHAT and BF, so `audio_pipeline_4ch_fuse()` builds E from the BF's
+spectrum and weights. `dfn_hop_process(&hop, frame.e, P, out)` is the sequence of the `dfn_hop_*`
+calls with the model callback (`dfn_res_stage_infer()` here) as the runner. The RES strength is
+`aec_res_set_preset(audio_pipeline_4ch_res(unit), preset, ramp_ms)`. The example owns its gain
+scratch and comfort-noise state and the ISTFT in the `DfnHop`: the unit carries none of them, and a
+refused call resets the unit, the comfort-noise generator and the `DfnHop` together
 (`dfn_reset()` in `main.c`). The
 network estimates from the beamformed error and is applied to the post-RES
 spectrum. The comfort-noise fill is kept as a switch but is OFF by
@@ -39,22 +41,22 @@ rest of P and `atten_lim_db` bounds the attenuation of every bin). With no model
 conventional chain with the denoiser off delayed: bit for bit by two hops at
 48 kHz (the acceptance gate in `tests/test_4ch_dfn.c` asserts it against the hand-written chain of
 `4ch_aec_bf_nr_res/tests/conv_chain_4ch.h`, with comfort noise off and on, across a real
-shared-estimator delay re-lock, on a stimulus where a RES-off core provably
+shared-estimator delay re-lock, on a stimulus where a RES-off unit provably
 differs, and checks that the stage is not reset on the shared aligner's delay change), and through the resampler round trip by the bridge delay at
 16 kHz (the same test pins the delay with a near-end impulse, the frame
-schedule, and the pass-band error against the conventional 16 kHz core,
+schedule, and the pass-band error against the conventional 16 kHz output,
 measured at 1e-5).
 
-The core runs on the product's own grid: 16 kHz (fft 256, hop 128) by
-default, 16 kHz/512, or 48 kHz (the core's rates). Only the DFN2 stage runs
-at 48 kHz: directly on the core's spectra at 48 kHz (algorithmic latency
+The unit runs on the product's own grid: 16 kHz (fft 256, hop 128) by
+default, 16 kHz/512, or 48 kHz (the unit's rates). Only the DFN2 stage runs
+at 48 kHz: directly on the unit's spectra at 48 kHz (algorithmic latency
 three hops, 32 ms), or through the rate bridge (`pipelines/dfn_rate_bridge.h`)
 at 16 kHz, which synthesises E and P on the native grid, resamples them up,
 runs the stage on the 48 kHz 1024/512 grid and resamples the result down.
 The four lanes, the beamformer (bf) seam, the RES and the comfort noise never leave
 the product rate. The bridge adds 672 samples (42 ms) at 16 kHz with hop
-128 and 629 (39 ms) with hop 256 to the core's own output; total algorithmic
-latency is that plus the core's WOLA hop (16 kHz, hop 128: 800 samples,
+128 and 629 (39 ms) with hop 256 to the host's own output; total algorithmic
+latency is that plus the host's WOLA hop (16 kHz, hop 128: 800 samples,
 50 ms). The stage schedule per native hop is 0,1,1,1 frames at hop 128 and
 1,2 at hop 256.
 
@@ -67,12 +69,12 @@ make WERROR=1 test        # includes test_4ch_dfn and the skeleton
 ```
 
 `libdfn_res_stage.a` holds the shared stage, the rate bridge and the DFN2 host
-pre/post objects; link it with `libaudio_pipeline_4ch.a` (the core), `libaec`,
-`libanr` and `libaudio_common`. The board supplies the stateless model
+pre/post objects; link it ahead of the unit's archives (`libaudio_pipeline_4ch.a`, the
+SRP/BF archives of audiolib, `libaec`, `libanr` and `libaudio_common`). The board supplies the stateless model
 callback (`DFN2Model`) and the exported ERB matrices. `main.c` is the board
 skeleton (delay-profile flags, `--sample-rate` (default 16000), `--erb-fwd`
-/ `--erb-inv`, `--atten-lim`, `--cng`, uniform weights standing in for the
-product's beamformer; it
+/ `--erb-inv`, `--atten-lim`, `--cng`; the unit's default array geometry stands in for
+the product's measured one; it
 publishes the compiled-in model I/O descriptor, which a product replaces with
 the one from its model's exported metadata).
 
@@ -109,9 +111,10 @@ model dominates this arithmetic budget; A53/A73 CPU-only admission still
 requires the final int8/fp runtime and board cycle measurement.
 
 Pool printed by the skeleton (`4ch_aec_bf_dfn_res`, matched delay, five-filter bank, NE10; the
-core, the RES chain and the stage or bridge, each 16-byte aligned): 1,400,416 bytes at the 16 kHz
-default (core plus the rate bridge) and 3,764,240 bytes at 48 kHz (the conventional
-four-channel MMSE-LSA chain on the 48 kHz grid needs 3,672,720 bytes).
+unit with its post-beam RES, the P and gain buffers, and the stage or bridge, each 16-byte
+aligned): 2,058,768 bytes at the 16 kHz default (the unit plus the rate bridge) and
+6,617,024 bytes at 48 kHz (the conventional four-channel application on the same unit,
+`audio_pipeline_4ch_static`, needs 6,527,568 bytes on the 48 kHz grid).
 Model weights and accelerator activation/workspace memory are external;
-adding int8 weights alone brings the known minimum to about 3.4 MiB at
+adding int8 weights alone brings the known minimum to about 4.0 MiB at
 16 kHz.

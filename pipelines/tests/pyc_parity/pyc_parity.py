@@ -31,8 +31,8 @@ GRIDS = [('16k256', 16000, 256), ('16k512', 16000, 512), ('48k1024', 48000, 1024
 GRID_LABEL = {'16k256': '16k/256', '16k512': '16k/512', '48k1024': '48k/1024'}
 PRESETS = ['balanced', 'mild', 'aggressive']
 # b.res4 only (not the shared PRESETS list, so PRESETS-driven scenarios such as l2.res4.*.replay
-# are unaffected). aec=no_floor on the C side is a direct construction-time preset (the RES stage of
-# se_sample_chain takes any AecPreset; see pyc_drv.c), matching the Python side's
+# are unaffected). aec=no_floor on the C side is a direct construction-time preset (the AecRes of
+# pyc_drv.c takes any AecPreset), matching the Python side's
 # PostBeamResidualSuppressor.set_preset('no_floor').
 PRESETS_B = PRESETS + ['no_floor']
 
@@ -65,7 +65,6 @@ SOURCES = [   # hashed into the JSON so a result can be tied to the code it judg
     'Audio_ALG/pipelines/cng_aec3.py',
     'Audio_ALG/pipelines/common/se_stage.h',
     'Audio_ALG/pipelines/samples/se_anr_stage.h',
-    'Audio_ALG/pipelines/samples/se_sample_chain.h',
     'Audio_ALG/pipelines/tests/pyc_parity/pyc_drv.c',
     'Audio_ALG/lib/aec/c_impl/src/aec_res.c',
 ]

@@ -2,10 +2,11 @@
  * by the caller. Minimal example of the frequency-domain stage chain over
  * 4aec_nr_res.h: default config -> get_mem_requirements -> caller allocation -> init ->
  * process -> destroy -> release.
- * The front end owns the shared aligner and the four lanes; this file places the
- * post-beam chain (samples/se_sample_chain.h: AecRes, denoiser, comfort noise, synthesis,
- * each a separate library) behind it in the same allocation:
- *   front_process -> (weights) -> fuse -> se_sample_chain_form -> se_sample_chain_synthesize
+ * The front end owns the shared aligner and the four lanes; this file places the post-beam
+ * stages behind it in the same allocation, each a separate library initialised here: the RES
+ * (AecRes: the front end computes no gain of its own; the unit audio_pipeline_4ch.h carries
+ * one), the denoiser and the synthesis:
+ *   front_process -> (weights) -> fuse -> RES gain -> NR gain -> min -> CNG -> synthesis
  * The beamformer is externally owned in a product; this executable supplies fixed
  * equal weights, a deterministic smoke adapter and not a production beamformer.
  * Build:  make -C pipelines/4ch_aec_bf_nr_res 4aec_nr_res_static
@@ -23,8 +24,12 @@
 #include <math.h>
 
 #include "4aec_nr_res.h"
+#include "aec_res.h"
+#include "anr.h"
+#include "audio_stft.h"
+#include "se_anr_stage.h"
 #include "utility/mem_align.h"
-#include "se_sample_chain.h"
+#include "utility/simd_kernels.h"
 
 /* CLI aliases only; unknown names fall back to balanced. */
 static AecPreset parse_preset(const char* s) {
@@ -65,14 +70,97 @@ static const char* backend_id_name(uint32_t backend_id) {
     }
 }
 
-static int print_mem_budget(const FourAecNrResConfig* cfg, const SeSampleChainConfig* sc) {
+/* The stages after the fuse, carved in this order behind the front end. */
+typedef struct Post {
+    AecConfig res_cfg;
+    AnrConfig nr_cfg;
+    AcStftConfig synth_cfg;
+    size_t res_bytes, nr_bytes, synth_bytes, vec_bytes, spec_bytes, total;
+    int use_r2, enable_cng;
+    AecRes* res;              /* NULL with --no-res */
+    AnrDenoiser* nr;
+    AcIstft* istft;
+    float *unity, *total_gain, *extra_noise;
+    Complex* spec;
+    uint32_t rng;
+    int n_freqs;
+} Post;
+
+static int post_plan(Post* q, int sample_rate, int fft_size, int with_res, AecPreset preset,
+                     AnrMode nr_mode) {
+    int n_freqs = fft_size / 2 + 1;
+    q->res_bytes = 0;
+    if (with_res) {
+        aec_config_from_preset(&q->res_cfg, preset, sample_rate);
+        q->res_cfg.fft_size = fft_size;
+        q->res_bytes = aec_res_get_mem_size(&q->res_cfg);
+        if (q->res_bytes == 0) return -1;
+    }
+    q->nr_cfg = anr_config_for_mode_grid(sample_rate, fft_size, nr_mode);
+    ac_stft_config_default(&q->synth_cfg, fft_size);
+    q->nr_bytes = anr_get_mem_size(&q->nr_cfg);
+    q->synth_bytes = ac_istft_get_mem_size(&q->synth_cfg);
+    q->vec_bytes = ALIGN16((size_t)n_freqs * sizeof(float));
+    q->spec_bytes = ALIGN16((size_t)n_freqs * sizeof(Complex));
+    if (q->nr_bytes == 0 || q->synth_bytes == 0) return -1;
+    /* res, nr, synthesis, unity, total gain, NR prior, output spectrum */
+    q->total = ALIGN16(q->res_bytes) + ALIGN16(q->nr_bytes) + ALIGN16(q->synth_bytes) +
+               3 * q->vec_bytes + q->spec_bytes;
+    q->n_freqs = n_freqs;
+    return 0;
+}
+
+static int post_init(Post* q, void* mem) {
+    unsigned char* cur = (unsigned char*)mem;
+    int k;
+    q->res = NULL;
+    if (q->res_bytes) {
+        q->res = aec_res_init(cur, q->res_bytes, &q->res_cfg);
+        if (!q->res) return -1;
+        cur += ALIGN16(q->res_bytes);
+    }
+    q->nr = anr_init(cur, q->nr_bytes, &q->nr_cfg);
+    cur += ALIGN16(q->nr_bytes);
+    q->istft = ac_istft_init(cur, q->synth_bytes, &q->synth_cfg);
+    cur += ALIGN16(q->synth_bytes);
+    if (!q->nr || !q->istft) return -1;
+    q->unity = (float*)cur;       cur += q->vec_bytes;
+    q->total_gain = (float*)cur;  cur += q->vec_bytes;
+    q->extra_noise = (float*)cur; cur += q->vec_bytes;
+    q->spec = (Complex*)cur;
+    for (k = 0; k < q->n_freqs; ++k) q->unity[k] = 1.0f;
+    q->rng = SE_CNG_RNG_SEED;
+    return 0;
+}
+
+/* One hop after the fuse into out: P = E * min(G_nr, G_res), comfort noise on the bins the RES
+ * cut, synthesis. 0, or -1 when a stage refuses the hop. */
+static int post_hop(Post* q, const SeSpecFrame* f, float* out) {
+    const float* res = q->res ? se_res_stage_gain(q->res, f) : q->unity;
+    const float* nr;
+    if (!res) return -1;
+    nr = se_anr_stage_gain(q->nr, f, q->extra_noise, q->use_r2);
+    if (!nr) return -1;
+    sk_min_f32(q->total_gain, nr, res, q->n_freqs);   /* keeps a non-finite gain visible */
+    sk_capply_gain_f32(q->spec, f->e, q->total_gain, q->n_freqs);
+    if (q->enable_cng && q->res && f->cn)
+        aec_cng_fill(&q->rng, q->spec, f->cn, res, nr, SE_CNG_NR_GAIN_FLOOR, q->n_freqs);
+    (void)ac_istft_push(q->istft, q->spec, out);
+    return 0;
+}
+
+static void post_destroy(Post* q) {
+    if (q->nr) anr_destroy(q->nr);
+    q->nr = NULL;
+}
+
+static int print_mem_budget(const FourAecNrResConfig* cfg, const Post* q) {
     FourAecNrResMemReq req;
     FourAecNrResMemBreakdown b;
-    SeSampleChainSizes z;
+    size_t bufs = 3 * q->vec_bytes + q->spec_bytes;
 
     if (four_aec_nr_res_get_mem_requirements(cfg, &req) != 0 ||
-        four_aec_nr_res_get_mem_breakdown(cfg, &b) != 0 ||
-        se_sample_chain_sizes(sc, &z) != 0) {
+        four_aec_nr_res_get_mem_breakdown(cfg, &b) != 0) {
         fprintf(stderr, "Error: invalid 4-channel config\n");
         return -1;
     }
@@ -87,19 +175,16 @@ static int print_mem_budget(const FourAecNrResConfig* cfg, const SeSampleChainCo
            (size_t)req.bytes - b.aec_bytes,
            (float)((size_t)req.bytes - b.aec_bytes) / 1024.0f);
     printf("  RES (AecRes):   %9zu bytes (%7.1f KB)\n",
-           z.res_bytes, (float)z.res_bytes / 1024.0f);
+           q->res_bytes, (float)q->res_bytes / 1024.0f);
     printf("  NR (MMSE-LSA):  %9zu bytes (%7.1f KB)\n",
-           z.nr_bytes, (float)z.nr_bytes / 1024.0f);
+           q->nr_bytes, (float)q->nr_bytes / 1024.0f);
     printf("  Synthesis(OLA): %9zu bytes (%7.1f KB)\n",
-           z.synth_bytes, (float)z.synth_bytes / 1024.0f);
-    printf("  Chain bufs:     %9zu bytes (%7.1f KB)\n",
-           z.total - ALIGN16(z.res_bytes) - ALIGN16(z.nr_bytes) - ALIGN16(z.synth_bytes),
-           (float)(z.total - ALIGN16(z.res_bytes) - ALIGN16(z.nr_bytes) -
-                   ALIGN16(z.synth_bytes)) / 1024.0f);
+           q->synth_bytes, (float)q->synth_bytes / 1024.0f);
+    printf("  Buffers:        %9zu bytes (%7.1f KB)\n", bufs, (float)bufs / 1024.0f);
     printf("  --------------------------------------\n");
     printf("  Total:          %9llu bytes (%7.1f KB)\n",
-           (unsigned long long)req.bytes + z.total,
-           (float)((size_t)req.bytes + z.total) / 1024.0f);
+           (unsigned long long)req.bytes + q->total,
+           (float)((size_t)req.bytes + q->total) / 1024.0f);
     printf("  Descriptor:     descriptor_version=%u alignment=%u "
            "layout_version=%u backend_id=%u (%s) "
            "build_flags_hash=0x%08x\n\n",
@@ -191,26 +276,22 @@ int main(int argc, char* argv[]) {
      * memory manager. */
     FourAecNrResMemReq req;
     FourAecNrResMemBreakdown bd;
-    SeSampleChainConfig sc;
-    SeSampleChainSizes st;
+    Post post;
+    memset(&post, 0, sizeof(post));
     if (four_aec_nr_res_get_mem_requirements(&cfg, &req) != 0 ||
         four_aec_nr_res_get_mem_breakdown(&cfg, &bd) != 0) {
         fprintf(stderr, "Error: invalid 4-channel config\n");
         return 1;
     }
-    sc = se_sample_chain_default_config(sample_rate, bd.fft_size);
-    sc.res = no_res ? SE_SAMPLE_RES_OFF : SE_SAMPLE_RES_AEC_RES;
-    sc.res_preset = preset;
-    sc.nr_mode = nr_mode;
-    sc.legacy_amin = legacy;
-    sc.enable_cng = !no_cng;
-
-    if (print_mem_budget(&cfg, &sc) != 0) return 1;
-    if (se_sample_chain_sizes(&sc, &st) != 0) {
+    if (post_plan(&post, sample_rate, bd.fft_size, !no_res, preset, nr_mode) != 0) {
         fprintf(stderr, "Error: invalid config\n");
         return 1;
     }
-    size_t pool_bytes = (size_t)req.bytes + st.total;
+    post.use_r2 = !legacy;
+    post.enable_cng = !no_cng;
+
+    if (print_mem_budget(&cfg, &post) != 0) return 1;
+    size_t pool_bytes = (size_t)req.bytes + post.total;
 
     void* pool = NULL;
     if (posix_memalign(&pool, req.alignment, pool_bytes) != 0) pool = NULL;
@@ -225,15 +306,14 @@ int main(int argc, char* argv[]) {
         return 1;
     }
 
-    /* Place the front end, then the chain behind it. */
+    /* Place the front end, then the post stages behind it. */
     FourAecNrRes* pipe = four_aec_nr_res_init(pool, (size_t)req.bytes, &cfg);
     if (!pipe) {
         free(pool);
         return 1;
     }
-    SeSampleChain* chain =
-        se_sample_chain_init((uint8_t*)pool + (size_t)req.bytes, st.total, &sc);
-    if (!chain) {
+    if (post_init(&post, (uint8_t*)pool + (size_t)req.bytes) != 0) {
+        post_destroy(&post);
         four_aec_nr_res_destroy(pipe);
         free(pool);
         return 1;
@@ -244,7 +324,7 @@ int main(int argc, char* argv[]) {
     printf("n_freqs agreement OK (n_freqs=%d, hop=%d) at %d Hz\n",
            n_freqs, hop, sample_rate);
     if (print_only) {
-        se_sample_chain_destroy(chain);
+        post_destroy(&post);
         four_aec_nr_res_destroy(pipe);
         free(pool);
         return 0;
@@ -259,7 +339,7 @@ int main(int argc, char* argv[]) {
         sizeof(Complex));
     if (!mic_buf || !ref_buf || !out_buf || !weights) {
         fprintf(stderr, "Error: hop-buffer alloc failed\n");
-        se_sample_chain_destroy(chain);
+        post_destroy(&post);
         four_aec_nr_res_destroy(pipe);
         free(pool);
         free(mic_buf);
@@ -281,15 +361,13 @@ int main(int argc, char* argv[]) {
     for (frame = 0; frame < 6; ++frame) {
         FourAecFront front;
         SeSpecFrame f;
-        const Complex* spec;
         fill_hop(mic_buf, ref_buf, hop, sample_rate, frame);
         if (four_aec_front_process(
                 pipe, mic_buf, ref_buf, &front) != FOUR_AEC_NR_RES_OK ||
             four_aec_fuse(pipe, weights, NULL, &f) != FOUR_AEC_NR_RES_OK ||
-            !(spec = se_sample_chain_form(chain, &f)) ||
-            se_sample_chain_synthesize(chain, spec, out_buf) != 0) {
+            post_hop(&post, &f, out_buf) != 0) {
             fprintf(stderr, "Error: 4AEC pipeline process failed\n");
-            se_sample_chain_destroy(chain);
+            post_destroy(&post);
             four_aec_nr_res_destroy(pipe);
             free(pool);
             free(mic_buf);
@@ -301,7 +379,7 @@ int main(int argc, char* argv[]) {
         for (k = 0; k < hop; ++k) {
             if (!isfinite(out_buf[k])) {
                 fprintf(stderr, "Error: non-finite output\n");
-                se_sample_chain_destroy(chain);
+                post_destroy(&post);
                 four_aec_nr_res_destroy(pipe);
                 free(pool);
                 free(mic_buf);
@@ -317,7 +395,7 @@ int main(int argc, char* argv[]) {
     printf("4aec_nr_res_static: smoke PASS\n");
 
     /* Cleanup */
-    se_sample_chain_destroy(chain);
+    post_destroy(&post);
     four_aec_nr_res_destroy(pipe);
     free(pool);
     free(mic_buf);

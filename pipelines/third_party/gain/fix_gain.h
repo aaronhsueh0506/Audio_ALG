@@ -7,8 +7,7 @@
 extern "C" {
 #endif
 
-/* Per-channel input gain with an optional clip. For a single-gain mono path use
- * AudioPreGain (audio_pre_gain.h); this module adds the per-microphone table. */
+/* Per-channel input gain with an optional clip; one channel gives a single-gain mono path. */
 
 typedef struct {
     int channels;

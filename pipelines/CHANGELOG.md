@@ -3,6 +3,93 @@
 `Audio_ALG/pipelines`（含它建置的 `AINR`、`AIAEC` C 程式）的重要改動記錄在此，格式依
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/)。README 只寫現況，改動經過寫在這裡。
 
+## [Unreleased] — 2026-10-24 — AEC streaming FIFO removed: smaller lane pools
+
+### Changed
+- Every `Aec` instance is smaller (the render FIFO and the shrunken struct): 16 kHz/256 33,328 B, 16 kHz/512
+  33,840 B, 48 kHz/1024 67,632 B, 8 kHz/256 16,944 B. The 4ch core and unit carry four lanes, so their pools
+  shrink by 133,312 B (16 kHz/256), 135,360 B (16 kHz/512) and 270,528 B (48 kHz); the mono chains by one `Aec`.
+  The pool tables in the docs and READMEs carry the values the example binaries print for this tree (rows
+  without a binary, such as `num_angles = 360`, are the previous value minus the lane reduction).
+- `FOUR_AEC_NR_RES_LAYOUT_VERSION` 23 -> **24** and `AUDIO_PIPELINE_4CH_LAYOUT_VERSION` 19 -> **20**: the pool size
+  changed while `build_flags_hash` (a hash of the carve tokens) did not, so the version is the only signal for a
+  persisted descriptor. The literal pins in `test_4aec_nr_res.c` and `test_audio_pipeline_4ch.c` and the
+  documentation claims read by `tests/test_doc_layout_versions.py` follow.
+- The 4ch core calls `aec_process_context_shared_far_from()` only; the removed `aec_process_context_shared_far()` is
+  no longer named in the comments and READMEs.
+
+## [Unreleased] — 2026-10-24 — Pipeline usage fix: the 4-channel unit carries the post-beam RES; no shared sample chain
+
+Supersedes the statements of the pipeline split entry below that RES is a separate library for the
+4-channel unit and that the gain sequence lives in `samples/se_sample_chain.h`.
+
+### Changed
+- `AudioPipeline4Ch` carries the post-beam RES. New config fields `enable_res` (default 1) and
+  `res_preset` (default `AEC_PRESET_BALANCED`); the `AecRes` is carved after `bf_weights` only when
+  `enable_res && core.enable_post` (the front-only Align-ULCNet profile carves none), from
+  `aec_config_from_preset(res_preset, sample_rate)` on the unit's resolved FFT. `audio_pipeline_4ch_fuse()`
+  runs it over the fused frame (`se_res_stage_gain()`) and sets `frame->g_res_ctx` (NULL with RES off); a
+  RES refusal is `FOUR_AEC_NR_RES_DSP_ERROR` and resets the whole unit. `audio_pipeline_4ch_reset()` resets
+  the suppressor and keeps a preset set at run time. New accessor `audio_pipeline_4ch_res(p)`; strength is
+  `aec_res_set_preset(audio_pipeline_4ch_res(p), preset, ramp_ms)` (`NULL` without RES). The core
+  (`FourAecNrRes`, `four_aec_fuse()`) is unchanged and has no RES.
+- `samples/se_sample_chain.h` is deleted. Every example `main` initialises the libraries it uses
+  (`Aec` or the unit, `AnrDenoiser` through `anr_config_for_mode_grid()` with the library-default `L`,
+  `AcIstft`) and writes the per-hop chain itself: RES gain (`frame.g_res_ctx` or the unity vector),
+  `se_anr_stage_gain()`, `sk_min_f32()`, `sk_capply_gain_f32()`, `aec_cng_fill()`, `ac_istft_push()`.
+  `se_hop_is_finite()` moved to `common/se_stage.h`; `samples/se_anr_stage.h` is unchanged. A refused
+  hop is reset by the integrator stage by stage, including `rng = SE_CNG_RNG_SEED`.
+- Two examples still build their own `AecRes` because they drive the core directly with fixed weights:
+  `4ch_aec_bf_nr_res/4aec_nr_res_static.c` (`--no-res`, `--legacy-amin`, `--no-cng` kept) and the parity
+  driver `tests/pyc_parity/pyc_drv.c`. `AecRes` stays a stand-alone lib API for that use.
+- `4ch_aec_bf_dfn_res/main.c` runs on the unit instead of the core with uniform weights: real SRP-PHAT and
+  BF, RES inside the unit. Its pool grows by 791,664 B at 16 kHz and 3,123,312 B at 48 kHz (against the
+  earlier core example on the same AEC sizes); its output was silent fail-open hops before and after.
+- Python: `FourChannelAecPipeline` owns the one `PostBeamResidualSuppressor` again
+  (`FourChannelAecConfig.enable_res` default True, `aec_preset` default balanced). `fuse()` applies it,
+  `reset()` resets it, `pipeline.post_beam_res` mirrors the C accessor (strength:
+  `post_beam_res.set_preset()`), and `FourChannelFrame.spec_frame()` carries `g_res_ctx = context.res_gain`.
+- `AUDIO_PIPELINE_4CH_LAYOUT_VERSION` 18 -> **19**; the unit's `build_flags_hash` (carve token now
+  `...,bf_weights,res`) 0x8aabdea5 -> 0x9a3abcc7. The FIFO entry above takes the version to 20 (the value in
+  this tree). `FOUR_AEC_NR_RES_LAYOUT_VERSION` and the core's hash are not touched by this change.
+- Output is bit-identical to the previous revision at `SIMD=1` and `SIMD=0` (golden subset 24 and 12
+  keys; 672 chain-level runs of the unfolded sequences against the removed object; 82 Python digest rows).
+
+### Removed
+- `samples/se_sample_chain.h`: `SeSampleRes`, `SE_SAMPLE_RES_{OFF,FRAME_GAIN,AEC_RES}`, `SeSampleChainConfig`,
+  `SeSampleChain`, `SeSampleChainSizes` and `se_sample_chain_{default_config,res_config,sizes,mem_size,init,res,nr,
+  last_res_gain,last_nr_gain,form,synthesize,reset,destroy}`. Board samples that include it must carry the
+  per-hop sequence themselves, as the examples now do.
+- Python: `PostBeamResidualSuppressor.from_aec_config()`, `FourChannelFrame.aligned_render` (only fed the
+  external suppressor; `FrontFrame.aligned_render` stays), the package export of
+  `PostBeamResidualSuppressor` (the class stays in `pipeline.py` for the parity driver), and the
+  `aec_preset` argument of `4ch_aec_bf_dfn_res/pipeline.py:run_front_end` (strength is `config.aec_preset`).
+
+### Pool sizes (NE10, `SIMD=1`, matched n=5; bytes, as printed by the example binaries of this tree)
+| Item | 16 kHz 256/128 | 16 kHz 512/256 | 48 kHz 1024/512 |
+|---|---|---|---|
+| Mono AEC + NR chain (`aec_nr_pipeline_static`) | 423,728 | 575,056 | 1,354,256 |
+| 4-channel front end + own `AecRes` + chain (`4aec_nr_res_static`; `AecRes` alone) | 973,776 (7,904) | 1,519,968 (14,048) | 3,402,064 (29,408) |
+| 4-channel unit + chain (`audio_pipeline_4ch_static`; the unit alone, RES included) | 1,766,096 (1,706,784) | 3,090,016 (3,006,560) | 6,527,568 (6,329,856) |
+| Mono DFN2 (`mono_aec_dfn_res`; 8 kHz 621,024) | 716,400 | | 1,443,712 |
+| 4-channel DFN2 (`4ch_aec_bf_dfn_res`) | 2,058,768 | | 6,617,024 |
+| 4-channel Align-ULCNet unit (no RES) + stage | 2,982,176 + 36,400 | | 6,279,872 + 71,728 |
+
+The unit grows by the `AecRes` plus 16 B of control block and the chain block shrinks with the removed
+control block (128 B in the mono and core chains); every unit pool, the front-only profile included, grows
+by 16 B.
+
+### Migration notes for board code
+- Recompile. A persisted unit descriptor from layout 18 (or 19) is refused by `init_ex()`; query a fresh one.
+- 4-channel code that kept its own post-beam `AecRes` next to the unit can drop it: set `enable_res` /
+  `res_preset` in the unit config, read `frame.g_res_ctx` after `audio_pipeline_4ch_fuse()` and call
+  `aec_res_set_preset(audio_pipeline_4ch_res(p), ...)`. Code that drives the core directly keeps its `AecRes`.
+- Code that used `se_sample_chain_*`: size and initialise the stages (`aec_get_mem_size()`,
+  `anr_get_mem_size()`, `ac_istft_get_mem_size()` plus the gain and spectrum buffers) and chain them as
+  `mono_aec_nr_res/main.c` (`mono_form()`) and `4ch_aec_bf_nr_res/audio_pipeline_4ch_raw.c` (`raw_chain()`) do;
+  `anr_set_mode(nr, mode)` takes the denoiser you initialised.
+
+
 ## [Unreleased] — 2026-10-24 — NR minimum window: library default
 
 ### Changed

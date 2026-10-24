@@ -3,15 +3,17 @@
 This example replaces the MMSE-LSA denoiser of the conventional mono
 chain with DeepFilterNet2 while keeping the linear AEC, the AEC3 residual echo
 suppressor and the comfort-noise recipe. There is no mono unit and no DFN wrapper
-library: `main.c` initialises lib/aec's `Aec`, the gain chain
-`samples/se_sample_chain.h` (RES gain only: `enable_nr = 0`, no synthesis) and the DFN2
-stage (`dfn_res_stage.h`, or `dfn_rate_bridge.h` below 48 kHz) separately, and
-`samples/dfn_hop.h` runs the network between the post-RES spectrum and the synthesis:
+library: `main.c` initialises lib/aec's `Aec` (which carries the RES gain itself), the gain
+and spectrum buffers of the RES path (no denoiser) and the DFN2
+stage (`dfn_res_stage.h`, or `dfn_rate_bridge.h` below 48 kHz) separately, forms P in
+`rig_process()`, and `samples/dfn_hop.h` runs the network between the post-RES spectrum and the
+synthesis:
 
 ```text
 mic/ref -> aec_process_context(aec, mic, ref)
            se_frame_from_aec(aec, &frame)          E = linear-AEC error spectrum -> DFN2 feature input
-           P = se_sample_chain_form(chain, &frame) P = E * G_res (+ comfort noise) -> DFN2 applied here
+           P = E * min(1, frame.g_res_ctx)         P = E * G_res (+ comfort noise) -> DFN2 applied here
+                                                   (sk_min_f32 + sk_capply_gain_f32 + aec_cng_fill)
          -> dfn_hop_begin(&hop, frame.e, P)
          -> while (dfn_hop_nn_begin(&hop, &job) > 0) { run the model on the job; dfn_hop_nn_end(&hop, rc) }
          -> dfn_hop_end(&hop, out)                  -> enhanced P, frame t-2,
@@ -20,7 +22,8 @@ mic/ref -> aec_process_context(aec, mic, ref)
 
 `dfn_hop_process(&hop, frame.e, P, out)` runs the same sequence with the model callback; P must
 be formed before `dfn_hop_begin()`. A refused hop is the integrator's to recover: reset the AEC,
-the chain and the `DfnHop` together (`rig_reset()` in `main.c`).
+the comfort-noise generator (`rng = SE_CNG_RNG_SEED`) and the `DfnHop` together (`rig_reset()` in
+`main.c`).
 
 The network estimates from the pre-RES spectrum because it was trained on
 unprocessed noisy speech and must not see the spectral holes RES cuts; it is
@@ -73,8 +76,8 @@ make WERROR=1 test        # includes test_dfn_res_stage,
 ```
 
 `libaudio_pipeline_dfn.a` holds the shared stage, the rate bridge and the DFN2
-host pre/post objects. The example links it with `common/se_config.o`, `libaec`,
-`libanr` (the example chain's denoiser type) and `libaudio_common`; the board supplies the stateless model callback
+host pre/post objects. The example links it with `common/se_config.o`, `libaec` and
+`libaudio_common` (no denoiser, so no `libanr`); the board supplies the stateless model callback
 (`DFN2Model`) and the exported ERB matrices (`erb_fwd.bin` / `erb_inv.bin`
 from `AINR/DeepFilterNet2/export_erb_matrix.py`). `main.c` is the board
 skeleton: delay-profile flags in the `aec_wav` spelling, `--erb-fwd` /
@@ -101,10 +104,10 @@ moves the AEC itself to 48 kHz; that extra AEC cost is separate from this
 resampler count and must be included in the board measurement.
 
 Pool printed by the skeleton (`mono_aec_dfn_res`, matched delay, five-filter bank, NE10; the sum
-of `aec_get_mem_size()`, `se_sample_chain_mem_size()` and the stage or bridge requirement, each
-16-byte aligned): 750,384 bytes at the 16 kHz default (the AEC and the RES chain plus the
-rate bridge, whose own pool is 349,888 bytes including the stage), 1,513,536 bytes at 48 kHz (the
+of `aec_get_mem_size()`, the three gain and spectrum buffers of the RES path and the stage or
+bridge requirement, each 16-byte aligned): 716,400 bytes at the 16 kHz default (the AEC and the RES gain path plus the
+rate bridge, whose own pool is 349,888 bytes including the stage), 1,443,712 bytes at 48 kHz (the
 stage's 231,984 bytes, its synthesis and the AEC; the conventional MMSE-LSA chain on the 48 kHz
-grid needs 1,422,016 bytes) and 638,624 bytes at 8 kHz. Model weights and accelerator activation/
+grid needs 1,354,256 bytes) and 621,024 bytes at 8 kHz. Model weights and accelerator activation/
 workspace memory are external to this descriptor; adding int8 weights alone
-brings the known minimum to about 2.8 MiB at 16 kHz.
+brings the known minimum to about 2.7 MiB at 16 kHz.

@@ -5,8 +5,8 @@ all:
 
 test: all
 	$(MAKE) -C .. test_mono_chain example-adapter
-	bin="$$($(MAKE) -s -C .. print-bin-dir)"; \
-	  "$$bin/test_mono_chain"
+	bin="$$($(MAKE) -s -C .. print-bin-dir)"; obj="$$($(MAKE) -s -C .. print-obj-dir)"; \
+	  "$$bin/test_mono_chain" "$$bin" "$$obj"
 
 clean:
 	$(MAKE) -C .. clean

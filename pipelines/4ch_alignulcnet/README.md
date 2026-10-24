@@ -5,7 +5,8 @@ BF unit (`AudioPipeline4Ch`, `audio_pipeline_4ch.h`) with the example stage
 `samples/ulcnet_nn_stage.{h,c}` and the Align-ULCNet C pre/post code, over their existing
 component libraries. The unit is initialized with `core.enable_post = 0`
 (`ulcnet_example_unit_config()` in `main.c`: 16 kHz or 48 kHz default config, `fft_size` =
-`ULCNET_N_FFT`), so the fuse buffers of the conventional post path are not allocated and
+`ULCNET_N_FFT`), so the fuse buffers of the conventional post path and the unit's post-beam RES
+(carved only with `enable_res` and `core.enable_post`) are not allocated and
 `audio_pipeline_4ch_fuse()` is unavailable. The unit and the stage are two libraries with two
 pools: `main.c` queries `audio_pipeline_4ch_get_mem_requirements()` and
 `ulcnet_nn_stage_mem_size(0)`, cuts both blocks (the stage's block 16-byte aligned) and prints the
@@ -51,7 +52,7 @@ nothing else. `ulcnet_nn_stage_end()` emits zeros for hop #0 only; the output of
 The beam hop is not reconstructed by WOLA and re-analysed (that would cost one
 IFFT plus one RFFT and one extra hop of latency per hop), so the pipeline has no
 reconstructed beam hop to hand out. The unit's layout version
-(`AUDIO_PIPELINE_4CH_LAYOUT_VERSION`) is **18**; a persisted
+(`AUDIO_PIPELINE_4CH_LAYOUT_VERSION`) is **20**; a persisted
 descriptor from any earlier version is refused by
 `audio_pipeline_4ch_init_ex()`. The stage is example code: it has no
 descriptor and no layout version.
@@ -124,8 +125,8 @@ no state to the instance: the pool size and the layout version are unchanged.
 The matched-filter bank size `n` is a product deployment decision, so it is a
 command-line argument rather than a literal in `main.c`; the resolved profile
 and the pool it costs are printed at start-up — at the default matched/n=5
-profile, that banner reads a 3,117,520 B unit pool plus a 36,400 B stage pool at 16 kHz and a
-6,550,384 B unit pool plus a 71,728 B stage pool at 48 kHz (`ULCNET_GRID=48k`). Read it from your
+profile, that banner reads a 2,982,176 B unit pool plus a 36,400 B stage pool at 16 kHz and a
+6,279,872 B unit pool plus a 71,728 B stage pool at 48 kHz (`ULCNET_GRID=48k`). Read it from your
 own build rather than copying it.
 `n` is an init parameter, not a runtime setter —
 changing it means re-querying the pool and re-initializing.

@@ -891,13 +891,13 @@ static void run_static_parity(int sample_rate, int fft_size) {
      * matches and the layout counter is the whole signal. Keep the literals in step with
      * FOUR_AEC_NR_RES_LAYOUT_VERSION. */
     stale = req;
-    stale.layout_version = 22u;
+    stale.layout_version = 23u;
     CHECK(four_aec_nr_res_init_ex(
               pool, (size_t)req.bytes, &cfg, &stale) == NULL,
           "static init_ex rejects a descriptor from the superseded layout "
           "even when its byte count exactly covers the current pool");
     CHECK(req.layout_version == FOUR_AEC_NR_RES_LAYOUT_VERSION &&
-          FOUR_AEC_NR_RES_LAYOUT_VERSION == 23u,
+          FOUR_AEC_NR_RES_LAYOUT_VERSION == 24u,
           "the queried descriptor publishes the current carve layout");
 
     stat = four_aec_nr_res_init_ex(
@@ -1157,7 +1157,7 @@ cleanup:
 }
 
 /* Group 6: lane 0 runs its own far-end FFT every hop; lanes 1-3 borrow it via
- * aec_process_context_shared_far(). The total (four_aec_nr_res_far_fft_real_compute_count(),
+ * aec_process_context_shared_far_from(). The total (four_aec_nr_res_far_fft_real_compute_count(),
  * summed over the four lanes) must rise by at most 1 per four_aec_front_process() call,
  * never 4. "At most", not "exactly": the call resets all four lanes (zeroing the counter)
  * whenever the shared delay estimate changes, e.g. during initial acquisition. A drop is

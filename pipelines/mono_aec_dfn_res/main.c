@@ -1,11 +1,11 @@
 /* mono_aec_dfn_res board skeleton: AEC -> RES -> DeepFilterNet2 composed from the library calls.
- * Example code: lib/aec's Aec for the linear stage, se_frame_from_aec() for
- * the frame view, samples/se_sample_chain.h (RES gain only, no denoiser, no synthesis) for
- * P = E * G_res (+ comfort noise), and samples/dfn_hop.h for the DFN2 hop. Per hop:
+ * Example code: lib/aec's Aec for the linear stage and its own RES gain, se_frame_from_aec() for
+ * the frame view, P = E * G_res (+ comfort noise) formed here, and samples/dfn_hop.h for the
+ * DFN2 hop. Per hop:
  *
  *     aec_process_context(aec, mic, ref);
- *     se_frame_from_aec(aec, &frame);
- *     P = se_sample_chain_form(chain, &frame);            // formed before the DFN hop begins
+ *     se_frame_from_aec(aec, &frame);                     // E, CN and G_res (frame.g_res_ctx)
+ *     P = E * G_res (+ comfort noise);                    // before the DFN hop begins
  *     dfn_hop_process(&hop, frame.e, P, out);             // or begin / nn_begin / nn_end / end
  *
  * 48 kHz hosts drive dfn_res_stage.h and synthesise through an AcIstft; 8/16 kHz hosts run the
@@ -19,8 +19,8 @@
 #include "common/se_config.h"
 #include "common/se_stage.h"
 #include "samples/dfn_hop.h"
-#include "samples/se_sample_chain.h"
 #include "utility/mem_align.h"
+#include "utility/simd_kernels.h"
 #include "dfn_example_args.h"
 
 #include <math.h>
@@ -63,11 +63,11 @@ static int derive_lane(const DfnExampleArgs *args, SeGrid *grid, AecConfig *aec_
 typedef struct Plan {
     AecConfig aec_cfg;
     SeGrid grid;
-    SeSampleChainConfig chain_cfg;
+    int enable_cng;
     DfnResStageConfig stage_cfg;
     DfnRateBridgeConfig bridge_cfg;
     int use_bridge;                   /* host below 48 kHz */
-    size_t aec_bytes, chain_bytes, stage_bytes, istft_bytes;
+    size_t aec_bytes, vec_bytes, spec_bytes, stage_bytes, istft_bytes;
     size_t total;
 } Plan;
 
@@ -80,11 +80,9 @@ static int make_plan(const DfnExampleArgs *args, const DFN2Model *model, Plan *p
 
     /* No denoiser, RES gain only; the comfort-noise fill is the program's switch. E and P must
      * share a phase for the DFN2 stage, so it is off unless asked for. */
-    p->chain_cfg = se_sample_chain_default_config(args->sample_rate, p->grid.fft_size);
-    p->chain_cfg.res = SE_SAMPLE_RES_FRAME_GAIN;
-    p->chain_cfg.enable_nr = 0;
-    p->chain_cfg.enable_cng = args->enable_cng;
-    p->chain_cfg.with_synthesis = 0;
+    p->enable_cng = args->enable_cng;
+    p->vec_bytes = ALIGN16((size_t)p->grid.n_freqs * sizeof(float));
+    p->spec_bytes = ALIGN16((size_t)p->grid.n_freqs * sizeof(Complex));
 
     p->stage_cfg = dfn_res_stage_default_config(DFN2_SR);
     p->stage_cfg.atten_lim_db = args->atten_lim_db;
@@ -94,8 +92,7 @@ static int make_plan(const DfnExampleArgs *args, const DFN2Model *model, Plan *p
 
     p->use_bridge = args->sample_rate != DFN2_SR;
     p->aec_bytes = aec_get_mem_size(&p->aec_cfg);
-    p->chain_bytes = se_sample_chain_mem_size(&p->chain_cfg);
-    if (p->aec_bytes == 0 || p->chain_bytes == 0 || !isfinite(args->atten_lim_db)) return -1;
+    if (p->aec_bytes == 0 || !isfinite(args->atten_lim_db)) return -1;
     if (p->use_bridge) {
         p->bridge_cfg = dfn_rate_bridge_default_config(args->sample_rate);
         p->bridge_cfg.fft_size = 0;
@@ -109,8 +106,9 @@ static int make_plan(const DfnExampleArgs *args, const DFN2Model *model, Plan *p
         if (p->istft_bytes == 0) return -1;
         p->stage_bytes = (size_t)stage_req.bytes;
     }
-    p->total = ALIGN16(p->aec_bytes) + ALIGN16(p->chain_bytes) + ALIGN16(p->stage_bytes) +
-               ALIGN16(p->istft_bytes) +
+    /* AEC, unity, total gain, P, then the stage (or bridge) and its synthesis */
+    p->total = ALIGN16(p->aec_bytes) + 2 * p->vec_bytes + p->spec_bytes +
+               ALIGN16(p->stage_bytes) + ALIGN16(p->istft_bytes) +
                (p->use_bridge ? 0 : ALIGN16((size_t)DFN2_N_BINS * sizeof(Complex)));
     return 0;
 }
@@ -119,7 +117,10 @@ static int make_plan(const DfnExampleArgs *args, const DFN2Model *model, Plan *p
 typedef struct Rig {
     void *pool;
     Aec *aec;
-    SeSampleChain *chain;
+    float *unity, *total_gain;        /* the RES gain path: min(1, G_res) */
+    Complex *post;                    /* P */
+    uint32_t rng;
+    int n_freqs, enable_cng;
     DfnResStage *stage;
     DfnRateBridge *bridge;
     AcIstft *istft;
@@ -129,7 +130,6 @@ typedef struct Rig {
 static void rig_free(Rig *r) {
     if (r->bridge) dfn_rate_bridge_destroy(r->bridge);
     else if (r->stage) dfn_res_stage_destroy(r->stage);
-    if (r->chain) se_sample_chain_destroy(r->chain);
     if (r->aec) aec_destroy(r->aec);
     free(r->pool);
     memset(r, 0, sizeof(*r));
@@ -137,15 +137,20 @@ static void rig_free(Rig *r) {
 
 static int rig_build(Rig *r, const Plan *p) {
     unsigned char *cur;
+    int k;
     memset(r, 0, sizeof(*r));
     if (posix_memalign(&r->pool, 16, p->total) != 0) { r->pool = NULL; return -1; }
     cur = (unsigned char *)r->pool;
     r->aec = aec_init(cur, p->aec_bytes, &p->aec_cfg);
     cur += ALIGN16(p->aec_bytes);
     if (!r->aec) goto fail;
-    r->chain = se_sample_chain_init(cur, p->chain_bytes, &p->chain_cfg);
-    cur += ALIGN16(p->chain_bytes);
-    if (!r->chain) goto fail;
+    r->n_freqs = p->grid.n_freqs;
+    r->enable_cng = p->enable_cng;
+    r->unity = (float *)cur;      cur += p->vec_bytes;
+    r->total_gain = (float *)cur; cur += p->vec_bytes;
+    r->post = (Complex *)cur;     cur += p->spec_bytes;
+    for (k = 0; k < r->n_freqs; ++k) r->unity[k] = 1.0f;
+    r->rng = SE_CNG_RNG_SEED;
     if (p->use_bridge) {
         r->bridge = dfn_rate_bridge_init(cur, p->stage_bytes, &p->bridge_cfg);
         if (!r->bridge ||
@@ -178,19 +183,23 @@ fail:
 /* A refused hop: back to the state of a fresh pipeline, every stage together. */
 static void rig_reset(Rig *r) {
     aec_reset(r->aec);
-    se_sample_chain_reset(r->chain);
+    r->rng = SE_CNG_RNG_SEED;
     dfn_hop_reset(&r->hop);
 }
 
-/* One host hop. Returns 0, or -1 after a refused call (the caller resets). */
+/* One host hop: P = E * min(1, G_res), plus comfort noise on the bins the RES cut when enabled
+ * (no denoiser: its gain is the unity vector). Returns 0, or -1 after a refused call (the
+ * caller resets). */
 static int rig_process(Rig *r, const float *mic, const float *ref, float *out) {
-    SeSpecFrame frame;
-    const Complex *post;
+    SeSpecFrame f;
     aec_process_context(r->aec, mic, ref);
-    if (se_frame_from_aec(r->aec, &frame) != 0) return -1;
-    post = se_sample_chain_form(r->chain, &frame);
-    if (!post) return -1;
-    return dfn_hop_process(&r->hop, frame.e, post, out) == 0 ? 0 : -1;
+    if (se_frame_from_aec(r->aec, &f) != 0 || !f.g_res_ctx) return -1;
+    sk_min_f32(r->total_gain, r->unity, f.g_res_ctx, r->n_freqs);
+    sk_capply_gain_f32(r->post, f.e, r->total_gain, r->n_freqs);
+    if (r->enable_cng && f.cn)
+        aec_cng_fill(&r->rng, r->post, f.cn, f.g_res_ctx, r->unity, SE_CNG_NR_GAIN_FLOOR,
+                     r->n_freqs);
+    return dfn_hop_process(&r->hop, f.e, r->post, out) == 0 ? 0 : -1;
 }
 
 int main(int argc, char **argv) {

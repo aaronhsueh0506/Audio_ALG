@@ -2,26 +2,29 @@
 
 Examples, not library API: no ABI, no layout version, no descriptor, in no archive. Copy a
 header into your project and change it. The pipeline example mains (`main.c`, `static_main.c`,
-the raw and mcab drivers) include the headers of this directory to show how the separate
-libraries chain; the production targets (the 4-channel unit `AudioPipeline4Ch` and its
-archives) do not. Built and tested on its own (`make -C samples test`, also wired into the
+the raw and mcab drivers) include the headers of this directory for the stage calls they
+chain; the production targets (the 4-channel unit `AudioPipeline4Ch` and its archives) do not. Built and tested on its own (`make -C samples test`, also wired into the
 top-level `pipelines/Makefile`'s `make test`).
 
-Only the multi-channel linear AEC + beamformer is wrapped as one unit. RES, noise reduction,
-comfort noise, synthesis and the neural post-filters are separate libraries that the
-integrator initialises (each with its own `mem_size` and `init`) and chains.
+Only the multi-channel linear AEC + beamformer (with its post-beam RES) is wrapped as one unit.
+Noise reduction, comfort noise, synthesis and the neural post-filters are separate libraries
+that the integrator initialises (each with its own `mem_size` and `init`) and chains. There is
+no shared chain header: each example `main` initialises the libraries it uses and writes the
+per-hop sequence itself (RES gain, `se_anr_stage_gain()`, `sk_min_f32()`,
+`sk_capply_gain_f32()`, `aec_cng_fill()`, `ac_istft_push()`), for instance `mono_form()` in
+`mono_aec_nr_res/main.c` and `raw_chain()` in `4ch_aec_bf_nr_res/audio_pipeline_4ch_raw.c`.
 
 | File | What it shows |
 |---|---|
-| `se_sample_chain.h` | The gain sequence from a `SeSpecFrame` to the output hop: RES gain, NR gain, `min`, apply to E, comfort noise on the RES-cut bins, synthesis. One caller pool; every stage is optional. |
-| `se_anr_stage.h` | The NR gain call that folds the AEC residual-echo powers into the denoiser's noise floor (`se_anr_stage_gain`). The denoiser is the library preset (`anr_config_for_mode_grid()`). |
+| `se_anr_stage.h` | The NR gain call that folds the AEC residual-echo powers into the denoiser's noise floor (`se_anr_stage_gain`), and the PSD scale (`se_psd_scale()`). The denoiser is the library preset (`anr_config_for_mode_grid()`). |
 | `dfn_hop.h` | One DeepFilterNet2 hop: the 48 kHz stage with a caller-owned synthesis, or the rate bridge below 48 kHz; the phased begin / model / end calls. |
 | `ulcnet_nn_stage.{h,c}` | The Align-ULCNet post-filter stage behind a linear AEC: far-end STFT, model call policy (reprime, alignment events, fail-open), WOLA. |
 | `mcab_demo.c` | N linear AEC lanes wired to SRP-PHAT and the beamformer, without the production scheduling. |
 
 `common/se_stage.h` carries `se_frame_from_aec()`, which fills the `SeSpecFrame` of a mono
-`Aec` after `aec_process_context()`; the 4-channel unit fills the same view in
-`audio_pipeline_4ch_fuse()`.
+`Aec` after `aec_process_context()` (its `g_res_ctx` is the AEC's own RES gain); the 4-channel
+unit fills the same view in `audio_pipeline_4ch_fuse()` (its `g_res_ctx` is the unit's post-beam
+RES gain). It also carries `se_hop_is_finite()`, the finite check on an emitted hop.
 
 ## mcab_demo (`mcab_*` = Multi-Channel AEC-BF)
 
@@ -31,37 +34,6 @@ in between. Production code uses `AudioPipeline4Ch` (`4ch_aec_bf_nr_res`), not t
 demo omits duty-cycle scheduling, quarantine and shared-delay coordination, which
 `4aec_nr_res.h` implements. See `mcab_demo.c`'s own top-of-file comment for the design
 rationale.
-
-## se_sample_chain.h
-
-```c
-SeSampleChainConfig cfg = se_sample_chain_default_config(16000, 256);
-cfg.res = SE_SAMPLE_RES_AEC_RES;      /* OFF, FRAME_GAIN (the front end's own gain), AEC_RES */
-cfg.res_preset = AEC_PRESET_BALANCED; /* AEC_RES only */
-cfg.enable_nr = 1;  cfg.nr_mode = ANR_MODE_BALANCED;
-cfg.enable_cng = 1; cfg.with_synthesis = 1;
-
-size_t bytes = se_sample_chain_mem_size(&cfg);            /* 0: invalid configuration */
-SeSampleChain* chain = se_sample_chain_init(pool, bytes, &cfg);   /* 16-byte aligned pool */
-
-/* per hop, after the front end filled a SeSpecFrame `frame` */
-const Complex* P = se_sample_chain_form(chain, &frame);   /* NULL: refused hop */
-if (!P || se_sample_chain_synthesize(chain, P, out) != 0 || !se_hop_is_finite(out, hop)) {
-    /* reset the front end and the chain together */
-    se_sample_chain_reset(chain);
-}
-```
-
-* A stage that is off reads as the unity vector. Comfort noise runs only with a RES source and
-  `enable_cng`, at the level of the RES gain before the `min`.
-* The RES strength is `aec_res_set_preset(se_sample_chain_res(chain), ...)`, the NR strength
-  `anr_set_mode(se_sample_chain_nr(chain), mode)`: the denoiser is the library preset for
-  `nr_mode` on the chain's grid.
-* `SeSpecFrame` pointers are borrowed from the front end and valid until its next call; `P`
-  must be formed in the same hop.
-* Failure is the integrator's: after any refused hop, reset the front end, the chain and any
-  post-filter stage together (`se_sample_chain_reset` also restarts the comfort-noise
-  generator).
 
 ## ulcnet_nn_stage
 

@@ -1,7 +1,8 @@
 /** Binary aec_nr_pipeline_static (caller-pool flavor): AEC(linear) -> echo-aware NR -> RES,
- * composed from the library calls as in main.c (Aec, se_frame_from_aec, samples/se_sample_chain.h),
- * with the AEC and the gain chain carved from one aligned caller-owned pool and no malloc after
- * the pool allocation. Also the `--debug` / `DUMP_CTX` / `--print-mem-size` diagnostics.
+ * composed from the library calls as in main.c (Aec with its own RES gain, se_frame_from_aec,
+ * AnrDenoiser, AcIstft), with every stage carved from one aligned caller-owned pool in the order
+ * AEC, denoiser, synthesis, gain/spectrum buffers and no malloc after the pool allocation. Also
+ * the `--debug` / `DUMP_CTX` / `--print-mem-size` diagnostics.
  * Build:  make -C pipelines            (builds both binaries)
  * Usage:
  *   AEC preset: 0=mild, 1=balanced, 2=aggressive, 3=no_floor; names also accepted.
@@ -19,10 +20,13 @@
 #include <time.h>
 
 #include "aec.h"
+#include "anr.h"
+#include "audio_stft.h"
 #include "common/se_config.h"
 #include "common/se_stage.h"
-#include "samples/se_sample_chain.h"
+#include "samples/se_anr_stage.h"
 #include "utility/mem_align.h"
+#include "utility/simd_kernels.h"
 #include "wav_io.h"
 
 /* CLI aliases only; unknown names fall back to balanced. */
@@ -58,7 +62,7 @@ static const char* nr_mode_name(AnrMode m) {
 }
 
 /* The mono lane: the rate's grid and the linear-stage AecConfig. The lane keeps its own gain
- * in the context (enable_res = 0, return_res_context = 1); the chain applies it. */
+ * in the context (enable_res = 0, return_res_context = 1); mono_form() applies it. */
 static int derive_lane(int sample_rate, int fft_size, AecPreset preset, SeGrid* grid,
                        AecConfig* aec_cfg) {
     static const SeRules rules = { .allow_8k = 1, .spatial_context = SE_CONTEXT_PRESET };
@@ -73,50 +77,125 @@ static int derive_lane(int sample_rate, int fft_size, AecPreset preset, SeGrid* 
     return se_derive(&req, &rules, grid, aec_cfg);
 }
 
-/* The AEC and the gain chain share one aligned pool: the AEC first, then the chain. */
+/* What runs after the AEC, and the pool it needs. */
+typedef struct PostPlan {
+    int with_res, with_nr, use_r2, enable_cng;
+    AnrConfig nr_cfg;
+    AcStftConfig synth_cfg;
+    int n_freqs;
+    size_t nr_bytes, synth_bytes, buf_bytes;
+} PostPlan;
+
+/* One aligned pool: the AEC first, then the denoiser, the synthesis and the gain/spectrum
+ * buffers. */
 typedef struct Rig {
     Aec* aec;
-    SeSampleChain* chain;     /* NULL with --aec-only */
     void* pool;
+    int with_post;            /* 0 with --aec-only */
+    PostPlan plan;
+    AnrDenoiser* nr;          /* NULL with --no-nr */
+    AcIstft* istft;
+    float *unity, *total_gain, *extra_noise;
+    Complex* spec;
+    uint32_t rng;
+    const float* last_nr;     /* the NR gain of the last formed hop (unity without NR) */
 } Rig;
 
 static void rig_free(Rig* r) {
-    if (r->chain) se_sample_chain_destroy(r->chain);
+    if (r->nr) anr_destroy(r->nr);
     if (r->aec) aec_destroy(r->aec);
     free(r->pool);
     memset(r, 0, sizeof(*r));
 }
 
-/* Bytes of the pool for the two configs; 0 for an invalid one. `chain_cfg` NULL: AEC only. */
-static size_t pool_bytes(const AecConfig* aec_cfg, const SeSampleChainConfig* chain_cfg) {
-    size_t aec_bytes = aec_get_mem_size(aec_cfg);
-    size_t chain_bytes = chain_cfg ? se_sample_chain_mem_size(chain_cfg) : 0;
-    if (aec_bytes == 0 || (chain_cfg && chain_bytes == 0)) return 0;
-    return ALIGN16(aec_bytes) + chain_bytes;
+/* 0, or -1 for a grid or mode a stage refuses. */
+static int post_plan(PostPlan* q, int sample_rate, const SeGrid* grid, const AecConfig* aec_cfg,
+                     AnrMode nr_mode, int no_nr, int no_res, int no_cng, int legacy) {
+    memset(q, 0, sizeof(*q));
+    q->with_res = !no_res;
+    q->with_nr = !no_nr;
+    q->use_r2 = !legacy;
+    /* Comfort noise fills only bins the RES gain cut, and only when the AEC config allows it. */
+    q->enable_cng = aec_cfg->enable_cng && !no_cng;
+    q->n_freqs = grid->n_freqs;
+    if (q->with_nr) {
+        q->nr_cfg = anr_config_for_mode_grid(sample_rate, grid->fft_size, nr_mode);
+        q->nr_bytes = anr_get_mem_size(&q->nr_cfg);
+        if (q->nr_bytes == 0) return -1;
+    }
+    ac_stft_config_default(&q->synth_cfg, grid->fft_size);
+    q->synth_bytes = ac_istft_get_mem_size(&q->synth_cfg);
+    /* unity, total gain, NR prior, output spectrum */
+    q->buf_bytes = 3 * ALIGN16((size_t)q->n_freqs * sizeof(float)) +
+                   ALIGN16((size_t)q->n_freqs * sizeof(Complex));
+    return q->synth_bytes ? 0 : -1;
 }
 
-static int rig_build(Rig* r, const AecConfig* aec_cfg, const SeSampleChainConfig* chain_cfg) {
+/* Bytes of the pool; 0 for an invalid config. `q` NULL: AEC only. */
+static size_t pool_bytes(const AecConfig* aec_cfg, const PostPlan* q) {
     size_t aec_bytes = aec_get_mem_size(aec_cfg);
-    size_t total = pool_bytes(aec_cfg, chain_cfg);
+    if (aec_bytes == 0) return 0;
+    return ALIGN16(aec_bytes) +
+           (q ? ALIGN16(q->nr_bytes) + ALIGN16(q->synth_bytes) + q->buf_bytes : 0);
+}
+
+static int rig_build(Rig* r, const AecConfig* aec_cfg, const PostPlan* q) {
+    size_t aec_bytes = aec_get_mem_size(aec_cfg);
+    size_t total = pool_bytes(aec_cfg, q);
+    size_t vec;
     uint8_t* cur;
+    int k;
     memset(r, 0, sizeof(*r));
     if (total == 0) return -1;
     if (posix_memalign(&r->pool, 16, total) != 0) { r->pool = NULL; return -1; }
     cur = (uint8_t*)r->pool;
     r->aec = aec_init(cur, aec_bytes, aec_cfg);
     if (!r->aec) { rig_free(r); return -1; }
-    if (chain_cfg) {
-        cur += ALIGN16(aec_bytes);
-        r->chain = se_sample_chain_init(cur, total - ALIGN16(aec_bytes), chain_cfg);
-        if (!r->chain) { rig_free(r); return -1; }
+    if (!q) return 0;
+    cur += ALIGN16(aec_bytes);
+    r->with_post = 1;
+    r->plan = *q;
+    if (q->with_nr) {
+        r->nr = anr_init(cur, q->nr_bytes, &q->nr_cfg);
+        if (!r->nr) { rig_free(r); return -1; }
+        cur += ALIGN16(q->nr_bytes);
     }
+    r->istft = ac_istft_init(cur, q->synth_bytes, &q->synth_cfg);
+    if (!r->istft) { rig_free(r); return -1; }
+    cur += ALIGN16(q->synth_bytes);
+    vec = ALIGN16((size_t)q->n_freqs * sizeof(float));
+    r->unity = (float*)cur;       cur += vec;
+    r->total_gain = (float*)cur;  cur += vec;
+    r->extra_noise = (float*)cur; cur += vec;
+    r->spec = (Complex*)cur;
+    for (k = 0; k < q->n_freqs; ++k) r->unity[k] = 1.0f;
+    r->rng = SE_CNG_RNG_SEED;
     return 0;
 }
 
 /* A stage refused a hop: back to the state of a fresh instance. */
 static void rig_reset(Rig* r) {
     aec_reset(r->aec);
-    if (r->chain) se_sample_chain_reset(r->chain);
+    if (r->nr) anr_reset(r->nr);
+    if (r->istft) ac_istft_reset(r->istft);
+    r->rng = SE_CNG_RNG_SEED;
+    r->last_nr = NULL;
+}
+
+/* P = E * min(G_nr, G_res) plus comfort noise on the bins the RES cut; an absent gain is the
+ * unity vector. NULL when a stage refuses the hop. */
+static const Complex* mono_form(Rig* r, const SeSpecFrame* f) {
+    const PostPlan* q = &r->plan;
+    const float* res = q->with_res ? f->g_res_ctx : r->unity;
+    const float* nr = r->unity;
+    if (!res) return NULL;
+    if (r->nr && !(nr = se_anr_stage_gain(r->nr, f, r->extra_noise, q->use_r2))) return NULL;
+    sk_min_f32(r->total_gain, nr, res, q->n_freqs);   /* keeps a non-finite gain visible */
+    sk_capply_gain_f32(r->spec, f->e, r->total_gain, q->n_freqs);
+    if (q->enable_cng && q->with_res && f->cn)
+        aec_cng_fill(&r->rng, r->spec, f->cn, res, nr, SE_CNG_NR_GAIN_FLOOR, q->n_freqs);
+    r->last_nr = nr;
+    return r->spec;
 }
 
 /* --debug: one status line/sec to stderr from the read-only aec_debug_status() /
@@ -146,7 +225,7 @@ static void print_debug_status(const Aec* aec, const AnrDenoiser* nr, int aec_on
 
 /* --timing: per-stage cost summed over the run and reported as a mean per hop. The AEC rows
  * come from aec_get_last_timing() (built with -DAEC_STAGE_TIMING=1, `make PROFILE=1`); the
- * chain and synthesis rows are this program's own clock around the calls. */
+ * gain-chain and synthesis rows are this program's own clock around the calls. */
 typedef struct {
     uint64_t delay, frontend, linear, res, chain, synth, wall;
     uint64_t hops;
@@ -204,9 +283,9 @@ static uint32_t timing_now_us(void) {
                       + (uint64_t)ts.tv_nsec / 1000ull);
 }
 
-/* One hop. --aec-only is the AEC's own time-domain output; otherwise the chain over the AEC's
- * frame. The clock is read only when `timed`. Returns 0, or -1 after a refused hop (the caller
- * resets). */
+/* One hop. --aec-only is the AEC's own time-domain output; otherwise the post stages over the
+ * AEC's frame. The clock is read only when `timed`. Returns 0, or -1 after a refused hop (the
+ * caller resets). */
 static int process_hop(Rig* r, const float* mic, const float* ref, float* out, int timed,
                        uint32_t* chain_us, uint32_t* synth_us) {
     SeSpecFrame frame;
@@ -214,44 +293,28 @@ static int process_hop(Rig* r, const float* mic, const float* ref, float* out, i
     uint32_t t0, t1;
     *chain_us = 0u;
     *synth_us = 0u;
-    if (!r->chain) {
+    if (!r->with_post) {
         aec_process(r->aec, mic, ref, out);
         return 0;
     }
     aec_process_context(r->aec, mic, ref);
     if (se_frame_from_aec(r->aec, &frame) != 0) return -1;
     t0 = timed ? timing_now_us() : 0u;
-    spec = se_sample_chain_form(r->chain, &frame);
+    spec = mono_form(r, &frame);
     t1 = timed ? timing_now_us() : 0u;
     *chain_us = t1 - t0;
     if (!spec) return -1;
-    if (se_sample_chain_synthesize(r->chain, spec, out) != 0) return -1;
+    (void)ac_istft_push(r->istft, spec, out);
     *synth_us = timed ? timing_now_us() - t1 : 0u;
     return 0;
 }
 
-/* Chain configuration shared by the run and the --print-mem-size query. */
-static SeSampleChainConfig make_chain_config(int sample_rate, const SeGrid* grid,
-                                             const AecConfig* aec_cfg, AnrMode nr_mode,
-                                             int no_nr, int no_res, int no_cng, int legacy) {
-    SeSampleChainConfig c = se_sample_chain_default_config(sample_rate, grid->fft_size);
-    c.res = no_res ? SE_SAMPLE_RES_OFF : SE_SAMPLE_RES_FRAME_GAIN;
-    c.enable_nr = !no_nr;
-    c.nr_mode = nr_mode;
-    c.legacy_amin = legacy;
-    /* Comfort noise fills only bins the RES gain cut, and only when the AEC config allows it. */
-    c.enable_cng = aec_cfg->enable_cng && !no_cng;
-    return c;
-}
-
-/* --print-mem-size table: the AEC block and the chain's stages. */
+/* --print-mem-size table: the AEC block and the post stages. */
 static void print_mem_budget(int sample_rate, const SeGrid* grid, const AecConfig* aec_cfg,
-                             const SeSampleChainConfig* chain_cfg) {
-    SeSampleChainSizes cs;
+                             const PostPlan* q) {
     size_t aec_bytes = aec_get_mem_size(aec_cfg);
-    size_t total = pool_bytes(aec_cfg, chain_cfg);
-    memset(&cs, 0, sizeof(cs));
-    if (total == 0 || (chain_cfg && se_sample_chain_sizes(chain_cfg, &cs) != 0)) {
+    size_t total = pool_bytes(aec_cfg, q);
+    if (total == 0) {
         fprintf(stderr, "Error: invalid config for memory budget query\n");
         return;
     }
@@ -260,11 +323,10 @@ static void print_mem_budget(int sample_rate, const SeGrid* grid, const AecConfi
     printf("  sample_rate=%d hop=%d fft_sz=%d n_freqs=%d\n",
            sample_rate, grid->hop_size, grid->fft_size, grid->n_freqs);
     printf("  AEC:            %7zu bytes (%6.1f KB)\n", aec_bytes, (float)aec_bytes / 1024.0f);
-    if (chain_cfg) {
-        printf("  Synthesis:      %7zu bytes (%6.1f KB)\n", cs.synth_bytes, (float)cs.synth_bytes / 1024.0f);
-        printf("  NR (MMSE-LSA):  %7zu bytes (%6.1f KB)\n", cs.nr_bytes, (float)cs.nr_bytes / 1024.0f);
-        printf("  Chain control + gain/spectrum bufs: %zu bytes\n",
-               cs.total - ALIGN16(cs.synth_bytes) - ALIGN16(cs.nr_bytes) - ALIGN16(cs.res_bytes));
+    if (q) {
+        printf("  Synthesis:      %7zu bytes (%6.1f KB)\n", q->synth_bytes, (float)q->synth_bytes / 1024.0f);
+        printf("  NR (MMSE-LSA):  %7zu bytes (%6.1f KB)\n", q->nr_bytes, (float)q->nr_bytes / 1024.0f);
+        printf("  Gain/spectrum buffers: %zu bytes\n", q->buf_bytes);
     }
     printf("  --------------------------------\n");
     printf("  Total:          %7zu bytes (%6.1f KB)\n", total, (float)total / 1024.0f);
@@ -272,8 +334,8 @@ static void print_mem_budget(int sample_rate, const SeGrid* grid, const AecConfi
 }
 
 int main(int argc, char* argv[]) {
-    /* --print-mem-size: report the pool byte budget and run a real aec_init() +
-     * se_sample_chain_init() on it, without WAV I/O. */
+    /* --print-mem-size: report the pool byte budget and run a real init of every stage on
+     * it, without WAV I/O. */
     if (argc >= 2 && strcmp(argv[1], "--print-mem-size") == 0) {
         AecPreset     preset      = AEC_PRESET_BALANCED;
         AnrMode nr_mode     = ANR_MODE_BALANCED;
@@ -303,14 +365,17 @@ int main(int argc, char* argv[]) {
             fprintf(stderr, "Error: invalid config (sample_rate=%d?)\n", sample_rate);
             return 1;
         }
-        SeSampleChainConfig chain_cfg =
-            make_chain_config(sample_rate, &grid, &aec_cfg, nr_mode, no_nr, no_res, no_cng, 0);
-        const SeSampleChainConfig* cc = aec_only ? NULL : &chain_cfg;
+        PostPlan plan;
+        if (post_plan(&plan, sample_rate, &grid, &aec_cfg, nr_mode, no_nr, no_res, no_cng, 0) != 0) {
+            fprintf(stderr, "Error: invalid config (sample_rate=%d?)\n", sample_rate);
+            return 1;
+        }
+        const PostPlan* pp = aec_only ? NULL : &plan;
 
-        print_mem_budget(sample_rate, &grid, &aec_cfg, cc);
+        print_mem_budget(sample_rate, &grid, &aec_cfg, pp);
 
         Rig rig;
-        if (rig_build(&rig, &aec_cfg, cc) != 0) {
+        if (rig_build(&rig, &aec_cfg, pp) != 0) {
             fprintf(stderr, "Error: invalid config (sample_rate=%d?)\n", sample_rate);
             return 1;
         }
@@ -395,15 +460,15 @@ int main(int argc, char* argv[]) {
 
     /* Size the single static pool, then allocate it (a host stand-in for a platform memory
      * block; a board replaces this malloc with its own allocator). */
-    SeSampleChainConfig chain_cfg;
-    memset(&chain_cfg, 0, sizeof(chain_cfg));
+    PostPlan plan;
+    memset(&plan, 0, sizeof(plan));
     if (lane_ok) {
-        chain_cfg = make_chain_config(sr, &grid, &aec_cfg, nr_mode, no_nr, no_res, no_cng, legacy);
-        print_mem_budget(sr, &grid, &aec_cfg, aec_only ? NULL : &chain_cfg);
+        lane_ok = post_plan(&plan, sr, &grid, &aec_cfg, nr_mode, no_nr, no_res, no_cng, legacy) == 0;
+        if (lane_ok) print_mem_budget(sr, &grid, &aec_cfg, aec_only ? NULL : &plan);
     }
 
     Rig rig;
-    if (!lane_ok || rig_build(&rig, &aec_cfg, aec_only ? NULL : &chain_cfg) != 0) {
+    if (!lane_ok || rig_build(&rig, &aec_cfg, aec_only ? NULL : &plan) != 0) {
         fprintf(stderr, "Error: invalid config\n");
         wav_close_read(mic_r); wav_close_read(ref_r); return 1;
     }
@@ -462,7 +527,7 @@ int main(int argc, char* argv[]) {
         if (dctx) {
             AecResContext ctx;
             aec_get_res_context(rig.aec, &ctx);
-            const float* g_nr = se_sample_chain_last_nr_gain(rig.chain);
+            const float* g_nr = rig.last_nr;
             if (ctx.error_spec && ctx.res_gain && g_nr) {
                 fwrite(ctx.error_spec, sizeof(Complex), n_freqs, dctx);
                 fwrite(ctx.res_gain, sizeof(float), n_freqs, dctx);
@@ -478,7 +543,7 @@ int main(int argc, char* argv[]) {
         if (processed % sr == 0) {
             printf("."); fflush(stdout);
             if (debug_status)
-                print_debug_status(rig.aec, se_sample_chain_nr(rig.chain), aec_only,
+                print_debug_status(rig.aec, rig.nr, aec_only,
                                    (float)processed / sr);
         }
     }
@@ -488,8 +553,8 @@ int main(int argc, char* argv[]) {
     if (show_timing) print_stage_timing(&acc);
     printf("Output: %s\n", out_path);
 
-    /* Cleanup: the AEC and the chain live in `rig.pool`; one free() releases both after the
-     * stages are destroyed. */
+    /* Cleanup: every stage lives in `rig.pool`; one free() releases them after the stages are
+     * destroyed. */
     wav_close_read(mic_r);
     wav_close_read(ref_r);
     wav_close_write(writer);

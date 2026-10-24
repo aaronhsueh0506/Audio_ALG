@@ -35,8 +35,8 @@
 |---|---|
 | AEC 狀態快照 | `AecDebugStatus` 10 欄，零 per-hop 成本（只讀引擎本來就每 hop 維護的欄位） |
 | NR 狀態快照 | `AnrDebugStatus` 5 欄 |
-| 4ch 計數器 | duty census、realign warm/soft、pending delay candidate、far-FFT 實跑次數、post split floor（live vs target；經 `aec_res_split_floor()`，抑制器由應用的後級鏈擁有） |
-| 記憶體 | `aec_get_mem_breakdown()` / `four_aec_nr_res_get_mem_breakdown()` / `se_sample_chain_sizes()` |
+| 4ch 計數器 | duty census、realign warm/soft、pending delay candidate、far-FFT 實跑次數、post split floor（live vs target；經 `aec_res_split_floor()`，抑制器：4ch 單元用 `audio_pipeline_4ch_res(p)` 取得，直接驅動核心的應用則由應用自己擁有） |
+| 記憶體 | `aec_get_mem_breakdown()` / `four_aec_nr_res_get_mem_breakdown()`；後級各函式庫的大小各自查（`anr_get_mem_size()`、`ac_istft_get_mem_size()`、`aec_res_get_mem_size()`） |
 | 錯誤分級 | 4ch core 的 `FourAecNrResStatus` 四值（唯一有語意分級的） |
 | Finite guards | 4ch 的輸入與輸出各一道；兩條 ULCNet 的 model 輸出 guard（含先填 `NAN` 的 FULL-WRITE CONTRACT） |
 
@@ -55,7 +55,7 @@
 | **G9** | **init 失敗一個字都不說**。4ch core `init_ex()` 的 8 項檢查任一失敗都靜默回 NULL；mono 有逐欄位 stderr，但 `NO_STDIO=1`（正是板端組態）一開就沒了 | `4aec_nr_res.h` 自承「not implemented here yet」 |
 | **G10** | **NN fail-open 靜默且不可區分**。三種 fallback（`infer==NULL` / 回非 0 / 輸出非有限）走同一條 else 分支、無計數 → 「NPU 掛了」與「偶發 NaN」外部無法分辨 | 兩條 ULCNet 的 infer／`nn_end` 分支 |
 
-另有四個次要盲點：4ch 前端的 `FourAecNrResLastTiming` 只涵蓋前端（delay／frontend／linear／lane_res／fuse），後級 stage（RES、NR、CNG、ISTFT）由應用串接，其耗時必須由應用自己量；backward quarantine 開火不可見；`far_spec_shared_hop` 退化到昂貴路徑不可見（provenance 函式只在 internal header）；mono pipeline 完全沒有 finite 守衛（輸入輸出都不檢）。
+另有四個次要盲點：4ch 前端的 `FourAecNrResLastTiming` 只涵蓋前端（delay／frontend／linear／lane_res／fuse），後級 stage（單元內的 RES 在 `fuse()` 內，不在核心的耗時欄位裡；NR、CNG、ISTFT 由應用串接）其耗時必須由應用自己量；backward quarantine 開火不可見；`far_spec_shared_hop` 退化到昂貴路徑不可見（provenance 函式只在 internal header）；mono pipeline 完全沒有 finite 守衛（輸入輸出都不檢）。
 
 ---
 

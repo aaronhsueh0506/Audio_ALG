@@ -6,16 +6,15 @@ the stage names of the C core (four_aec_front_process / four_aec_fuse)::
 
     front = pipeline.front_process(mics, render)
     bf = external_srp_bf(front.linear_channels)
-    post = pipeline.fuse(front, bf)     # context projection only; res_gain is None
+    post = pipeline.fuse(front, bf)     # projection + post-beam RES gain
     spec = post.spec_frame()            # the SeSpecFrame the later stages read
 
-The post-beam residual gain is a separate stage, owned by the caller::
-
-    suppressor = PostBeamResidualSuppressor(sr, pipeline.hop_size, pipeline.n_freqs)
-    context = suppressor.process(post.context, post.aligned_render)   # res_gain set
-
-The remaining stages (NR gain, min, apply, comfort noise, synthesis) are the
-functions of pipelines/aec_nr_pipeline.py over that context.
+The post-beam residual gain comes from the pipeline's one
+``PostBeamResidualSuppressor`` (config ``enable_res`` / ``aec_preset``, strength
+at runtime through ``pipeline.post_beam_res.set_preset()``), as the C unit
+fills ``g_res_ctx`` from its own AecRes.  The remaining stages (NR gain, min,
+apply, comfort noise, synthesis) are the functions of
+pipelines/aec_nr_pipeline.py over that frame.
 
 The optional ``Beamformer`` object and ``EqualWeightBeamformer`` exist only for
 integration tests and offline fixtures.  Requiring the external stage to return
@@ -343,6 +342,12 @@ class FourChannelAecConfig:
     capture_proxy_channel: int = 0
     max_delay_ms: float = 1024.0
     aec_mode: AecMode = AecMode.PBFDKF
+    # The post-beam suppressor (mirrors AudioPipeline4ChConfig.enable_res /
+    # res_preset).  The preset seeds the far-active floor, DT floor and
+    # split-floor gate at construction and reset(); post_beam_res.set_preset()
+    # retargets the same three fields at runtime.
+    enable_res: bool = True
+    aec_preset: AecPreset = AecPreset.BALANCED
     # Backward-jump quarantine on a shared-delay CHANGE (default off; mirrors
     # FourAecNrResConfig::delay_backward_quarantine_enabled / _s): an estimate
     # strictly EARLIER than the accepted delay is held while the estimator's own
@@ -390,16 +395,14 @@ class FourChannelFrame:
     beamformed: np.ndarray
     context: AecResContext
     delay: SharedDelayState
-    aligned_render: np.ndarray
 
     def spec_frame(self) -> SeSpecFrame:
-        """The borrowed-view equivalent of the C ``four_aec_fuse`` result: E is
-        the beamformed error, y / r2 / comfort noise the projected context, and
-        the residual gain is absent (``g_res_ctx`` None, ``context.res_gain``
-        None).  ``PostBeamResidualSuppressor`` computes the gain from this
-        frame's context and ``aligned_render``."""
+        """The borrowed-view equivalent of the C ``audio_pipeline_4ch_fuse``
+        result: E is the beamformed error, y / r2 / comfort noise the projected
+        context, and ``g_res_ctx`` the post-beam residual gain (None with
+        ``enable_res`` off)."""
         frame = frame_from_context(self.context, self.beamformed.shape[0])
-        return replace(frame, g_res_ctx=None, delay_changed=self.delay.changed,
+        return replace(frame, delay_changed=self.delay.changed,
                        delay_locked=bool(self.delay.solid))
 
 
@@ -451,9 +454,9 @@ def _fuse_contexts(
 
     Error/near/echo spectra are exactly coherent for the supplied weights.
     R2 is coherently combined using each channel's echo-estimate phase.
-    This function fuses measurements only. ``res_gain`` is left None: the
-    caller's one stateful ``PostBeamResidualSuppressor`` computes it afterward,
-    and per-lane gains are intentionally ignored.
+    This function fuses measurements only. ``res_gain`` is left None: the one
+    stateful ``PostBeamResidualSuppressor`` computes it afterward, and per-lane
+    gains are intentionally ignored.
     """
 
     n_freqs = _require_context_arrays(contexts)
@@ -538,8 +541,8 @@ def _fuse_contexts(
             sum(float(w) * float(c.erl_estimate) for w, c in zip(norm_weight, contexts))
         ),
         error_spec=error_spec.astype(np.complex64),
-        # None, so a reader that skips the suppressor fails instead of reading
-        # a silent unity gain. Never select/min a lane gain.
+        # None, so a reader of a RES-off frame fails instead of reading a
+        # silent unity gain. Never select/min a lane gain.
         res_gain=None,
         comfort_noise=np.maximum(fused_comfort, 0.0).astype(np.float32),
         r2=np.maximum(fused_r2, 0.0).astype(np.float32),
@@ -596,17 +599,6 @@ class PostBeamResidualSuppressor:
             self._split_floor_dt_db = None
             self._split_floor_enabled = None
         self._build_gain()
-
-    @classmethod
-    def from_aec_config(cls, config: AecConfig) -> "PostBeamResidualSuppressor":
-        """Build from an AecConfig: grid and the three strength fields come
-        from it, so the strength survives ``reset()``."""
-        sup = cls(config.sample_rate, config.hop_size, config.frame_size // 2 + 1)
-        sup._split_floor_far_active_db = config.min_gain_floor_far_active_db
-        sup._split_floor_dt_db = config.min_gain_floor_dt_db
-        sup._split_floor_enabled = config.min_gain_split_floor_enabled
-        sup._build_gain()
-        return sup
 
     def _build_gain(self) -> None:
         config = AecConfig(
@@ -788,6 +780,11 @@ class FourChannelAecPipeline:
         # a configured object enables only the one-call process/process_signal
         # helpers used by tests and offline fixtures.
         self._beamformer = beamformer
+        self._post_beam_res = (
+            PostBeamResidualSuppressor(
+                self.config.sample_rate, hop, self.n_freqs, self.config.aec_preset)
+            if self.config.enable_res else None
+        )
         self._last_delay = 0
         self._generation = 0
         self._owner_token = object()
@@ -803,6 +800,13 @@ class FourChannelAecPipeline:
     @property
     def linear_filter_instance_count(self) -> int:
         return len(self._lanes)
+
+    @property
+    def post_beam_res(self) -> Optional[PostBeamResidualSuppressor]:
+        """The post-beam suppressor (None with ``enable_res`` off); its
+        ``set_preset()`` is the runtime strength, as aec_res_set_preset() on
+        audio_pipeline_4ch_res() in C."""
+        return self._post_beam_res
 
     @property
     def beamformer_configured(self) -> bool:
@@ -833,6 +837,8 @@ class FourChannelAecPipeline:
         self._delay_line.reset()
         for lane in self._lanes:
             lane.reset()
+        if self._post_beam_res is not None:
+            self._post_beam_res.reset()
         self._last_delay = 0
         # Zeroed with the lanes' state (as four_aec_nr_res_reset()).
         self._realign_warm_lanes = 0
@@ -916,13 +922,13 @@ class FourChannelAecPipeline:
     def fuse(
         self, pre: FrontFrame, beamformed: BeamformerFrame
     ) -> FourChannelFrame:
-        """Resume with one external mono/weight result and project the context.
+        """Resume with one external mono/weight result and calculate mono RES.
 
         This method does not run SRP-PHAT or update the beamformer's
         coefficients.  It only reuses the supplied effective weights to project
-        the AEC context; ``context.res_gain`` stays None for the caller's
-        ``PostBeamResidualSuppressor``.  Results must be returned in order
-        because the shared delay generation is temporal.
+        the AEC context, then runs the one stateful post-beam residual-gain
+        calculator (``context.res_gain`` None with ``enable_res`` off).  Results
+        must be returned in order because that RES state is temporal.
         """
         if not isinstance(pre, FrontFrame):
             raise TypeError("pre must be a FrontFrame from this pipeline")
@@ -943,20 +949,20 @@ class FourChannelAecPipeline:
             )
 
         fused = _fuse_contexts(pre.contexts, beamformed)
+        if self._post_beam_res is not None:
+            fused = self._post_beam_res.process(fused, pre.aligned_render)
         result = FourChannelFrame(
             frame_index=pre.frame_index,
             linear_channels=pre.linear_channels.copy(),
             beamformed=samples.copy(),
             context=fused,
             delay=pre.delay,
-            aligned_render=pre.aligned_render.copy(),
         )
         self._next_post_frame += 1
         return result
 
     def process(self, microphones: np.ndarray, render: np.ndarray) -> FourChannelFrame:
-        """Test/offline convenience path using an explicitly configured adapter.
-        ``result.context.res_gain`` is None."""
+        """Test/offline convenience path using an explicitly configured adapter."""
         if self._beamformer is None:
             raise RuntimeError(
                 "no beamformer is configured: call front_process(), "
@@ -970,8 +976,7 @@ class FourChannelAecPipeline:
     def process_signal(
         self, microphones: np.ndarray, render: np.ndarray
     ) -> tuple[np.ndarray, list[AecResContext], list[SharedDelayState]]:
-        """Offline convenience path; production should use the explicit seam.
-        The returned contexts carry ``res_gain=None``."""
+        """Offline convenience path; production should use the explicit seam."""
         if self._beamformer is None:
             raise RuntimeError(
                 "process_signal requires an explicit test/offline beamformer; "

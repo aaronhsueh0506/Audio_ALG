@@ -1,6 +1,6 @@
-/* mono AEC -> RES -> DeepFilterNet2 composition test: lib/aec's Aec, the RES gain chain
- * (samples/se_sample_chain.h, no denoiser, no synthesis) and the DFN2 hop (samples/dfn_hop.h),
- * wired as mono_aec_dfn_res/main.c wires them.
+/* mono AEC -> RES -> DeepFilterNet2 composition test: lib/aec's Aec with its own RES gain,
+ * P = E * min(1, G_res) (+ comfort noise) and the DFN2 hop (samples/dfn_hop.h), wired as
+ * mono_aec_dfn_res/main.c wires them.
  * 48 kHz: with the identity model the composition equals the hand-written mono chain
  * (tests/conv_chain_mono.h with enable_nr=0), delayed by exactly two hops, byte for byte,
  * comfort noise OFF and ON. The echo (384-sample delay, matched estimator) must make the
@@ -20,8 +20,8 @@
 #include "common/se_config.h"
 #include "common/se_stage.h"
 #include "samples/dfn_hop.h"
-#include "samples/se_sample_chain.h"
 #include "utility/mem_align.h"
+#include "utility/simd_kernels.h"
 #include "tests/dfn_test_fixture.h"
 #include "../../mono_aec_nr_res/tests/conv_chain_mono.h"
 
@@ -58,8 +58,11 @@ static void make_hop(float *mic, float *ref, int frame) {
 
 typedef struct MonoDfn {
     Aec *aec;
-    SeSampleChain *chain;
-    void *chain_mem;
+    float *unity, *total;        /* the RES gain path: min(1, G_res) */
+    Complex *post;               /* P */
+    void *post_mem;
+    uint32_t rng;
+    int n_freqs, enable_cng;
     DfnResStage *stage;          /* driven directly at 48 kHz; the bridge's own below 48 kHz */
     DfnRateBridge *bridge;
     AcIstft *istft;
@@ -73,9 +76,8 @@ static void mdfn_destroy(MonoDfn *m) {
     if (!m) return;
     if (m->bridge) dfn_rate_bridge_destroy(m->bridge);
     else if (m->stage) dfn_res_stage_destroy(m->stage);
-    if (m->chain) se_sample_chain_destroy(m->chain);
     if (m->aec) { aec_destroy(m->aec); free(m->aec); }
-    free(m->chain_mem);
+    free(m->post_mem);
     free(m->istft_mem);
     free(m->stage_out);
     free(m);
@@ -88,9 +90,9 @@ static MonoDfn *mdfn_create(int sample_rate, int fft_size, int enable_cng, const
     SeRequest req;
     SeGrid grid;
     AecConfig lane;
-    SeSampleChainConfig sc;
     DfnResStageConfig stage_cfg = dfn_res_stage_default_config(DFN2_SR);
-    size_t chain_bytes;
+    size_t vec;
+    int k;
     if (!m) return NULL;
     memset(&req, 0, sizeof(req));
     req.sample_rate = sample_rate;
@@ -105,15 +107,18 @@ static MonoDfn *mdfn_create(int sample_rate, int fft_size, int enable_cng, const
     m->aec = (Aec *)calloc(1, sizeof(Aec));
     if (!m->aec || aec_create(m->aec, &lane) != 0) { free(m->aec); m->aec = NULL; goto fail; }
 
-    sc = se_sample_chain_default_config(sample_rate, grid.fft_size);
-    sc.res = SE_SAMPLE_RES_FRAME_GAIN;
-    sc.enable_nr = 0;
-    sc.enable_cng = enable_cng;
-    sc.with_synthesis = 0;
-    chain_bytes = se_sample_chain_mem_size(&sc);
-    if (chain_bytes == 0 || posix_memalign(&m->chain_mem, 16, chain_bytes) != 0) goto fail;
-    m->chain = se_sample_chain_init(m->chain_mem, chain_bytes, &sc);
-    if (!m->chain) goto fail;
+    m->n_freqs = grid.n_freqs;
+    m->enable_cng = enable_cng;
+    vec = ALIGN16((size_t)grid.n_freqs * sizeof(float));
+    if (posix_memalign(&m->post_mem, 16, 2 * vec + ALIGN16((size_t)grid.n_freqs * sizeof(Complex))) != 0) {
+        m->post_mem = NULL;
+        goto fail;
+    }
+    m->unity = (float *)m->post_mem;
+    m->total = (float *)((unsigned char *)m->post_mem + vec);
+    m->post = (Complex *)((unsigned char *)m->post_mem + 2 * vec);
+    for (k = 0; k < m->n_freqs; ++k) m->unity[k] = 1.0f;
+    m->rng = SE_CNG_RNG_SEED;
 
     stage_cfg.erb_fwd = erb_fwd;
     stage_cfg.erb_inv = erb_inv;
@@ -149,13 +154,15 @@ fail:
 
 /* AEC, RES gain, P; the DFN hop begins on (E, P). */
 static int mdfn_begin(MonoDfn *m, const float *mic, const float *ref) {
-    SeSpecFrame frame;
-    const Complex *post;
+    SeSpecFrame f;
     aec_process_context(m->aec, mic, ref);
-    if (se_frame_from_aec(m->aec, &frame) != 0) return -1;
-    post = se_sample_chain_form(m->chain, &frame);
-    if (!post) return -1;
-    return dfn_hop_begin(&m->hop, frame.e, post) == 0 ? 0 : -1;
+    if (se_frame_from_aec(m->aec, &f) != 0 || !f.g_res_ctx) return -1;
+    sk_min_f32(m->total, m->unity, f.g_res_ctx, m->n_freqs);
+    sk_capply_gain_f32(m->post, f.e, m->total, m->n_freqs);
+    if (m->enable_cng && f.cn)
+        aec_cng_fill(&m->rng, m->post, f.cn, f.g_res_ctx, m->unity, SE_CNG_NR_GAIN_FLOOR,
+                     m->n_freqs);
+    return dfn_hop_begin(&m->hop, f.e, m->post) == 0 ? 0 : -1;
 }
 
 static int mdfn_process(MonoDfn *m, const float *mic, const float *ref, float *out) {

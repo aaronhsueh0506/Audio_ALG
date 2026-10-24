@@ -1,7 +1,7 @@
 /** Host-only raw-float runner for recording validation, written as an example of the
- * composition: the linear AEC + BF unit (audio_pipeline_4ch.h) followed by its fuse and the
- * post-beam chain RES -> NR -> CNG -> synthesis (samples/se_sample_chain.h). A product
- * initialises those libraries separately; the chain only sequences them.
+ * composition: the linear AEC + BF unit (audio_pipeline_4ch.h, its fuse carries the post-beam RES
+ * gain) followed by NR, comfort noise and synthesis, each library initialised here and chained
+ * per hop in raw_chain().
  * Input mic: interleaved float32 [frames][4]; input ref: mono float32 [frames];
  * optional VAD: uint8 [complete_hops], nonzero = target speech; output: mono float32
  * [complete_hops * hop]. */
@@ -13,9 +13,13 @@
 #include <stdlib.h>
 #include <string.h>
 
+#include "anr.h"
 #include "audio_pipeline_4ch.h"
+#include "audio_stft.h"
 #include "mcab_sample_driver.h"
-#include "se_sample_chain.h"
+#include "se_anr_stage.h"
+#include "utility/mem_align.h"
+#include "utility/simd_kernels.h"
 
 #ifndef M_PI
 #define M_PI 3.14159265358979323846
@@ -42,13 +46,40 @@ static void json_float(char* output, size_t capacity, float value) {
     }
 }
 
+/* The stages after the fuse, carved in this order from one aligned block. */
+typedef struct PostStages {
+    AnrConfig nr_cfg;
+    AcStftConfig synth_cfg;
+    size_t nr_bytes, synth_bytes, vec_bytes, spec_bytes, total;
+} PostStages;
+
+static int post_plan(int sample_rate, int fft_size, PostStages *ps) {
+    int n_freqs = fft_size / 2 + 1;
+    ps->nr_cfg = anr_config_for_mode_grid(sample_rate, fft_size, ANR_MODE_BALANCED);
+    ac_stft_config_default(&ps->synth_cfg, fft_size);
+    ps->nr_bytes = anr_get_mem_size(&ps->nr_cfg);
+    ps->synth_bytes = ac_istft_get_mem_size(&ps->synth_cfg);
+    ps->vec_bytes = ALIGN16((size_t)n_freqs * sizeof(float));
+    ps->spec_bytes = ALIGN16((size_t)n_freqs * sizeof(Complex));
+    if (ps->nr_bytes == 0 || ps->synth_bytes == 0) return -1;
+    /* nr, synthesis, unity, total gain, NR prior, output spectrum */
+    ps->total = ALIGN16(ps->nr_bytes) + ALIGN16(ps->synth_bytes) + 3 * ps->vec_bytes +
+                ps->spec_bytes;
+    return 0;
+}
+
 typedef struct RawSample {
     McabSpatialOptions options;
     AudioPipeline4ChConfig cfg;
-    SeSampleChainConfig chain_cfg;
+    PostStages post;
     AudioPipeline4Ch *p;
-    SeSampleChain *chain;
-    void *chain_mem;
+    void *post_mem;
+    AnrDenoiser *nr;
+    AcIstft *istft;
+    float *unity, *total_gain, *extra_noise;
+    Complex *spec;
+    uint32_t rng;
+    int n_freqs;
     AudioPipeline4ChBeam beam;
     AudioPipeline4ChFrameInfo info;
     FILE *mic_file, *ref_file, *output_file, *vad_file;
@@ -72,14 +103,20 @@ static int raw_setup(void *user, McabHopView *view) {
         s->cfg.bf_fixed_mode = 1;
         s->cfg.bf_fixed_doa_rad = s->options.fixed_doa_rad;
     }
-    s->chain_cfg = se_sample_chain_default_config(
-        s->cfg.core.sample_rate,
-        mcab_resolved_fft(s->cfg.core.sample_rate, s->cfg.core.fft_size));
+    if (post_plan(s->cfg.core.sample_rate,
+                  mcab_resolved_fft(s->cfg.core.sample_rate, s->cfg.core.fft_size),
+                  &s->post) != 0) {
+        fprintf(stderr, "invalid post-stage grid\n");
+        return 1;
+    }
     if (s->options.print_mem_size) {
-        McabMemLine chain_line = {"Chain:", se_sample_chain_mem_size(&s->chain_cfg)};
+        McabMemLine lines[3] = {
+            {"NR:", s->post.nr_bytes}, {"Synthesis:", s->post.synth_bytes},
+            {"Buffers:", s->post.total - ALIGN16(s->post.nr_bytes) -
+                         ALIGN16(s->post.synth_bytes)}};
         return mcab_print_mem_budget(
-                   "4ch linear AEC + BF unit and post-beam chain", &s->cfg,
-                   audio_pipeline_4ch_get_mem_requirements, &chain_line, 1) == 0
+                   "4ch linear AEC + BF unit with RES, NR and synthesis", &s->cfg,
+                   audio_pipeline_4ch_get_mem_requirements, lines, 3) == 0
                    ? 2
                    : 1;
     }
@@ -89,15 +126,27 @@ static int raw_setup(void *user, McabHopView *view) {
         return 1;
     }
     {
-        size_t chain_bytes = se_sample_chain_mem_size(&s->chain_cfg);
-        if (chain_bytes == 0 || posix_memalign(&s->chain_mem, 16, chain_bytes) != 0)
-            s->chain_mem = NULL;
-        s->chain = s->chain_mem
-            ? se_sample_chain_init(s->chain_mem, chain_bytes, &s->chain_cfg) : NULL;
-        if (!s->chain) {
-            fprintf(stderr, "failed to create the post-beam chain\n");
+        unsigned char *cur;
+        int k;
+        if (posix_memalign(&s->post_mem, 16, s->post.total) != 0) s->post_mem = NULL;
+        cur = s->post_mem;
+        if (cur) {
+            s->nr = anr_init(cur, s->post.nr_bytes, &s->post.nr_cfg);
+            cur += ALIGN16(s->post.nr_bytes);
+            s->istft = ac_istft_init(cur, s->post.synth_bytes, &s->post.synth_cfg);
+            cur += ALIGN16(s->post.synth_bytes);
+            s->unity = (float *)cur;       cur += s->post.vec_bytes;
+            s->total_gain = (float *)cur;  cur += s->post.vec_bytes;
+            s->extra_noise = (float *)cur; cur += s->post.vec_bytes;
+            s->spec = (Complex *)cur;
+        }
+        if (!s->nr || !s->istft) {
+            fprintf(stderr, "failed to create the post-beam stages\n");
             return 1;
         }
+        s->n_freqs = audio_pipeline_4ch_n_freqs(s->p);
+        for (k = 0; k < s->n_freqs; ++k) s->unity[k] = 1.0f;
+        s->rng = SE_CNG_RNG_SEED;
     }
     s->hop = audio_pipeline_4ch_hop_size(s->p);
     s->microphones =
@@ -136,21 +185,38 @@ static int raw_read(void *user, McabHopView *view, int frame) {
     }
     return 1;
 }
-/* Fuse, then the chain into s->output. A refusal anywhere takes both the unit and the chain
- * down: the unit's fuse resets the unit itself, the rest is reset here. */
+/* One hop after the fuse into s->output: P = E * min(G_nr, G_res), comfort noise on the bins
+ * the RES cut, synthesis. 0, or -1 when the denoiser refuses the hop. */
+static int raw_chain(RawSample *s, const SeSpecFrame *f) {
+    const float *res = f->g_res_ctx ? f->g_res_ctx : s->unity;
+    const float *nr = se_anr_stage_gain(s->nr, f, s->extra_noise, 1);
+    if (!nr) return -1;
+    sk_min_f32(s->total_gain, nr, res, s->n_freqs);   /* keeps a non-finite gain visible */
+    sk_capply_gain_f32(s->spec, f->e, s->total_gain, s->n_freqs);
+    if (f->g_res_ctx && f->cn)
+        aec_cng_fill(&s->rng, s->spec, f->cn, res, nr, SE_CNG_NR_GAIN_FLOOR, s->n_freqs);
+    (void)ac_istft_push(s->istft, s->spec, s->output);
+    return 0;
+}
+
+static void raw_post_reset(RawSample *s) {
+    anr_reset(s->nr);
+    ac_istft_reset(s->istft);
+    s->rng = SE_CNG_RNG_SEED;
+}
+
+/* Fuse, then the chain. A refusal anywhere takes the unit and the post stages down together:
+ * the unit's fuse resets the unit itself, the rest is reset here. */
 static int raw_post(RawSample *s) {
     SeSpecFrame frame;
-    const Complex *spectrum;
     int status = audio_pipeline_4ch_fuse(s->p, &frame);
     if (status != FOUR_AEC_NR_RES_OK) {
-        se_sample_chain_reset(s->chain);
+        raw_post_reset(s);
         return status;
     }
-    spectrum = se_sample_chain_form(s->chain, &frame);
-    if (!spectrum || se_sample_chain_synthesize(s->chain, spectrum, s->output) != 0 ||
-        !se_hop_is_finite(s->output, s->hop)) {
+    if (raw_chain(s, &frame) != 0 || !se_hop_is_finite(s->output, s->hop)) {
         audio_pipeline_4ch_reset(s->p);
-        se_sample_chain_reset(s->chain);
+        raw_post_reset(s);
         return FOUR_AEC_NR_RES_DSP_ERROR;
     }
     return FOUR_AEC_NR_RES_OK;
@@ -226,8 +292,8 @@ static int raw_finish(void *user, McabHopView *view, int processed) {
            audio_pipeline_4ch_bf_fft_size(s->p),
            audio_pipeline_4ch_matched_filter_count(s->p),
            audio_pipeline_4ch_linear_aec_count(s->p),
-           se_sample_chain_nr(s->chain) ? 1 : 0,
-           se_sample_chain_res(s->chain) ? 1 : 0,
+           s->nr ? 1 : 0,
+           audio_pipeline_4ch_res(s->p) ? 1 : 0,
            audio_pipeline_4ch_spatial_backend(),
            s->doa_analysis_frames, s->doa_frames, s->adaptive_frames,
            processed > 0 ? s->info.delay.delay_samples : 0,
@@ -244,8 +310,8 @@ static void raw_cleanup(void *user) {
     free(s->output);
     free(s->reference);
     free(s->microphones);
-    se_sample_chain_destroy(s->chain);
-    free(s->chain_mem);
+    if (s->nr) anr_destroy(s->nr);
+    free(s->post_mem);
     audio_pipeline_4ch_destroy(s->p);
 }
 int main(int argc, char **argv) {

@@ -3,8 +3,9 @@
  * independent linear AEC adaptive filters and the coherent projection of the four
  * lane contexts onto one mono frame. The residual-echo, noise-reduction, comfort-noise
  * and synthesis stages are separate libraries that the application initialises and
- * chains over the SeSpecFrame that four_aec_fuse() returns (common/se_stage.h; the
- * chain is shown in samples/se_sample_chain.h). Per hop:
+ * chains over the SeSpecFrame that four_aec_fuse() returns (common/se_stage.h;
+ * 4aec_nr_res_static.c shows the chain; audio_pipeline_4ch.h adds SRP-PHAT, BF and the
+ * residual-echo stage). Per hop:
  *   four_aec_front_process()  shared delay + four linear AEC lanes; the lane spectra
  *                             go to the external SRP-PHAT/BF
  *   (SRP-PHAT, BF)            effective weights and the beamformed error
@@ -46,7 +47,7 @@ extern "C" {
  * delay estimator and ring. Bumped on any change of pool size, carve order or
  * descriptor content. Query a fresh descriptor for every build; never persist or
  * synthesize one from this number. */
-#define FOUR_AEC_NR_RES_LAYOUT_VERSION 23u
+#define FOUR_AEC_NR_RES_LAYOUT_VERSION 24u
 #define FOUR_AEC_NR_RES_BACKEND_NE10 2u   /* backend_id 1 is never returned */
 
 /** Fixed 32-byte descriptor for a caller-owned pool: descriptor_version (ABI, checked first), layout_version, backend_id (compared with ==), build_flags_hash (FNV-1a-32 over the carve structure, not tunable values), alignment, reserved (0, validated), bytes. Query it at init time and pass it to init_ex(); do not cache it across library, backend, flag or config changes. */

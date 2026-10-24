@@ -1,10 +1,10 @@
 # Four-channel linear AEC + beamformer unit and the examples composed over it.
 #
 # This Makefile lives beside the 4-channel implementation; the parent pipelines/Makefile builds the
-# mono examples. libaudio_pipeline_4ch.a holds the unit (the four-lane linear core and the
-# SRP-PHAT/BF composition); RES, NR, comfort noise, synthesis and the neural post-filters are
-# separate libraries that the example binaries initialise and chain (../samples). AEC, NR, common,
-# DOA, BF and spatial kernels remain component libs.
+# mono examples. libaudio_pipeline_4ch.a holds the unit (the four-lane linear core, the
+# SRP-PHAT/BF composition and the post-beam RES); NR, comfort noise, synthesis and the neural
+# post-filters are separate libraries that the example binaries initialise and chain. AEC, NR,
+# common, DOA, BF and spatial kernels remain component libs.
 #
 # Common invocations:
 #   make SIMD=1
@@ -283,12 +283,12 @@ $(OBJ_DIR)/dfn2_model_io.o: $(DFN2_DIR)/dfn2_model_io.c $(DFN2_DIR)/dfn2_model_i
 $(OBJ_DIR)/dfn2_prepost.o: $(DFN2_DIR)/dfn2_prepost.c $(DFN2_DIR)/dfn2_prepost.h | _cfg_guard
 	$(CC) $(LIB_CFLAGS) -MD -MP -c -o $@ $<
 
-# ../4ch_aec_bf_dfn_res/main.c and tests/test_4ch_dfn.c compose the core with
-# ../samples/se_sample_chain.h and ../samples/dfn_hop.h.
-$(OBJ_DIR)/test_4ch_dfn.o: ../4ch_aec_bf_dfn_res/tests/test_4ch_dfn.c ../samples/dfn_hop.h ../samples/se_sample_chain.h ../tests/dfn_test_fixture.h | _cfg_guard
+# ../4ch_aec_bf_dfn_res/main.c and tests/test_4ch_dfn.c compose the unit with
+# ../samples/dfn_hop.h.
+$(OBJ_DIR)/test_4ch_dfn.o: ../4ch_aec_bf_dfn_res/tests/test_4ch_dfn.c audio_pipeline_4ch.h tests/conv_chain_4ch.h ../samples/dfn_hop.h ../tests/dfn_test_fixture.h | _cfg_guard
 	$(CC) $(EX_CFLAGS) -I../4ch_aec_bf_dfn_res -MD -MP -c -o $@ $<
 
-$(OBJ_DIR)/4ch_aec_bf_dfn_res_main.o: ../4ch_aec_bf_dfn_res/main.c mcab_sample_driver.h ../samples/dfn_hop.h ../samples/se_sample_chain.h ../dfn_example_args.h ../dfn_unit_partition.h | _cfg_guard
+$(OBJ_DIR)/4ch_aec_bf_dfn_res_main.o: ../4ch_aec_bf_dfn_res/main.c mcab_sample_driver.h audio_pipeline_4ch.h ../samples/dfn_hop.h ../dfn_example_args.h ../dfn_unit_partition.h | _cfg_guard
 	$(CC) $(EX_CFLAGS) -I../4ch_aec_bf_dfn_res -MD -MP -c -o $@ $<
 
 # ../4ch_alignulcnet/main.c and tests/test_4ch_ulcnet.c compose the unit with the
@@ -317,22 +317,22 @@ $(OBJ_DIR)/4ch_alignulcnet_main.o: ../4ch_alignulcnet/main.c mcab_sample_driver.
 $(OBJ_DIR)/test_4ch_ulcnet.o: ../4ch_alignulcnet/tests/test_4ch_ulcnet.c audio_pipeline_4ch.h ../samples/ulcnet_nn_stage.h $(ULCNET_DIR)/ulcnet_process.h | _cfg_guard
 	$(CC) $(EX_CFLAGS) -I$(ULCNET_DIR) $(ULCNET_GRID_CFLAGS) -MD -MP -c -o $@ $<
 
-$(OBJ_DIR)/audio_pipeline_4ch_raw.o: audio_pipeline_4ch_raw.c audio_pipeline_4ch.h mcab_sample_driver.h ../samples/se_sample_chain.h | _cfg_guard
+$(OBJ_DIR)/audio_pipeline_4ch_raw.o: audio_pipeline_4ch_raw.c audio_pipeline_4ch.h mcab_sample_driver.h ../samples/se_anr_stage.h | _cfg_guard
 	$(CC) $(EX_CFLAGS) -MD -MP -c -o $@ $<
 
 $(OBJ_DIR)/mcab_sample_driver.o: mcab_sample_driver.c mcab_sample_driver.h audio_pipeline_4ch.h | _cfg_guard
 	$(CC) $(CFLAGS) -MD -MP -c -o $@ $<
 
-$(OBJ_DIR)/4aec_nr_res_static.o: 4aec_nr_res_static.c 4aec_nr_res.h ../samples/se_sample_chain.h | _cfg_guard
+$(OBJ_DIR)/4aec_nr_res_static.o: 4aec_nr_res_static.c 4aec_nr_res.h ../samples/se_anr_stage.h | _cfg_guard
 	$(CC) $(EX_CFLAGS) -MD -MP -c -o $@ $<
 
-$(OBJ_DIR)/audio_pipeline_4ch_static.o: audio_pipeline_4ch_static.c audio_pipeline_4ch.h mcab_sample_driver.h ../samples/se_sample_chain.h | _cfg_guard
+$(OBJ_DIR)/audio_pipeline_4ch_static.o: audio_pipeline_4ch_static.c audio_pipeline_4ch.h mcab_sample_driver.h ../samples/se_anr_stage.h | _cfg_guard
 	$(CC) $(EX_CFLAGS) -MD -MP -c -o $@ $<
 
 $(OBJ_DIR)/test_4aec_nr_res.o: tests/test_4aec_nr_res.c 4aec_nr_res.h tests/conv_chain_4ch.h | _cfg_guard
 	$(CC) $(CFLAGS) -MD -MP -c -o $@ $<
 
-$(OBJ_DIR)/test_audio_pipeline_4ch.o: tests/test_audio_pipeline_4ch.c audio_pipeline_4ch.h tests/conv_chain_4ch.h ../samples/se_sample_chain.h | _cfg_guard
+$(OBJ_DIR)/test_audio_pipeline_4ch.o: tests/test_audio_pipeline_4ch.c audio_pipeline_4ch.h tests/conv_chain_4ch.h ../samples/se_anr_stage.h | _cfg_guard
 	$(CC) $(EX_CFLAGS) -MD -MP -c -o $@ $<
 
 $(OBJ_DIR)/dump_delay_parity.o: tests/dump_delay_parity.c 4aec_nr_res.h 4aec_nr_res_internal.h | _cfg_guard
@@ -366,13 +366,14 @@ all: $(PIPELINE_LIB) $(DFN_PIPELINE_LIB) $(BIN_DIR)/audio_pipeline_4ch_raw \
 test: test-third-party test-mcab-sample-driver \
       $(BIN_DIR)/test_4aec_nr_res \
       $(BIN_DIR)/test_4ch_dfn \
-      $(BIN_DIR)/test_audio_pipeline_4ch $(BIN_DIR)/4aec_nr_res_static \
+      $(BIN_DIR)/test_audio_pipeline_4ch $(BIN_DIR)/audio_pipeline_4ch_raw \
+      $(BIN_DIR)/4aec_nr_res_static \
       $(BIN_DIR)/audio_pipeline_4ch_static \
       $(BIN_DIR)/test_4ch_ulcnet $(BIN_DIR)/4ch_alignulcnet \
       $(BIN_DIR)/4ch_aec_bf_dfn_res
 	"$(abspath $(BIN_DIR))/test_4aec_nr_res"
 	"$(abspath $(BIN_DIR))/test_4ch_dfn"
-	"$(abspath $(BIN_DIR))/test_audio_pipeline_4ch"
+	"$(abspath $(BIN_DIR))/test_audio_pipeline_4ch" "$(abspath $(BIN_DIR))" "$(abspath $(OBJ_DIR))"
 	"$(abspath $(BIN_DIR))/test_4ch_ulcnet"
 	"$(abspath $(BIN_DIR))/4aec_nr_res_static" --sample-rate 16000
 	"$(abspath $(BIN_DIR))/4aec_nr_res_static" --sample-rate 48000
@@ -451,9 +452,6 @@ $(BF_LIB): FORCE
 $(BIN_DIR)/test_4aec_nr_res: $(OBJ_DIR)/test_4aec_nr_res.o $(PIPELINE_LIB) $(AEC_LIB) $(NR_LIB) $(COMMON_LIB) | _cfg_guard
 	$(LINK) -o $@ $(OBJ_DIR)/test_4aec_nr_res.o $(PIPELINE_LIB) $(AEC_LIB) $(NR_LIB) $(COMMON_LIB) $(LDLIBS)
 
-$(BIN_DIR)/test_4ch_dfn: $(OBJ_DIR)/test_4ch_dfn.o $(DFN_PIPELINE_LIB) $(PIPELINE_LIB) $(AEC_LIB) $(NR_LIB) $(COMMON_LIB) | _cfg_guard
-	$(LINK) -o $@ $(OBJ_DIR)/test_4ch_dfn.o $(DFN_PIPELINE_LIB) $(PIPELINE_LIB) $(AEC_LIB) $(NR_LIB) $(COMMON_LIB) $(LDLIBS)
-
 $(BIN_DIR)/dump_delay_parity: $(OBJ_DIR)/dump_delay_parity.o $(PIPELINE_LIB) $(AEC_LIB) $(NR_LIB) $(COMMON_LIB) | _cfg_guard
 	$(LINK) -o $@ $(OBJ_DIR)/dump_delay_parity.o $(PIPELINE_LIB) $(AEC_LIB) $(NR_LIB) $(COMMON_LIB) $(LDLIBS)
 
@@ -489,11 +487,13 @@ ULCNET_ADAPTER_OBJS := $(OBJ_DIR)/ulcnet_accelerator_adapter.o \
 $(BIN_DIR)/4ch_alignulcnet: $(OBJ_DIR)/4ch_alignulcnet_main.o $(OBJ_DIR)/mcab_sample_driver.o $(ULCNET_ADAPTER_OBJS) $(ULCNET_4CH_OBJS) $(UNIT_LIBS) | _cfg_guard
 	$(LINK) -o $@ $(OBJ_DIR)/4ch_alignulcnet_main.o $(OBJ_DIR)/mcab_sample_driver.o $(ULCNET_ADAPTER_OBJS) $(ULCNET_4CH_OBJS) $(UNIT_LIBS) $(LDLIBS)
 
-# The 4-channel DFN2 example composes the core alone (the beamformer (bf) seam
-# stays external, as in 4aec_nr_res_static), so it links the DFN archive and the core archive,
-# not the spatial libraries.
-$(BIN_DIR)/4ch_aec_bf_dfn_res: $(OBJ_DIR)/4ch_aec_bf_dfn_res_main.o $(OBJ_DIR)/mcab_sample_driver.o $(DFN_PIPELINE_LIB) $(PIPELINE_LIB) $(AEC_LIB) $(NR_LIB) $(COMMON_LIB) | _cfg_guard
-	$(LINK) -o $@ $(OBJ_DIR)/4ch_aec_bf_dfn_res_main.o $(OBJ_DIR)/mcab_sample_driver.o $(DFN_PIPELINE_LIB) $(PIPELINE_LIB) $(AEC_LIB) $(NR_LIB) $(COMMON_LIB) $(LDLIBS)
+# The 4-channel DFN2 example and its test compose the unit (its RES included), so they link
+# the DFN archive ahead of the unit's archives.
+$(BIN_DIR)/4ch_aec_bf_dfn_res: $(OBJ_DIR)/4ch_aec_bf_dfn_res_main.o $(OBJ_DIR)/mcab_sample_driver.o $(DFN_PIPELINE_LIB) $(UNIT_LIBS) | _cfg_guard
+	$(LINK) -o $@ $(OBJ_DIR)/4ch_aec_bf_dfn_res_main.o $(OBJ_DIR)/mcab_sample_driver.o $(DFN_PIPELINE_LIB) $(UNIT_LIBS) $(LDLIBS)
+
+$(BIN_DIR)/test_4ch_dfn: $(OBJ_DIR)/test_4ch_dfn.o $(DFN_PIPELINE_LIB) $(UNIT_LIBS) | _cfg_guard
+	$(LINK) -o $@ $(OBJ_DIR)/test_4ch_dfn.o $(DFN_PIPELINE_LIB) $(UNIT_LIBS) $(LDLIBS)
 
 $(BIN_DIR)/4aec_nr_res_static: $(OBJ_DIR)/4aec_nr_res_static.o $(PIPELINE_LIB) $(AEC_LIB) $(NR_LIB) $(COMMON_LIB) | _cfg_guard
 	$(LINK) -o $@ $(OBJ_DIR)/4aec_nr_res_static.o $(PIPELINE_LIB) $(AEC_LIB) $(NR_LIB) $(COMMON_LIB) $(LDLIBS)

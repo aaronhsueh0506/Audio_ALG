@@ -6,24 +6,25 @@
  *   pyc_drv_4ch  -DPYC_WITH_4CH    modes: chain   replay
  *   pyc_drv_mono -DPYC_WITH_MONO   modes: mono    replay   probe
  *
- * Both run the shipped example code behind the front end, samples/se_sample_chain.h, so a deviation
- * planted there is seen by the comparison.
+ * Both run the chain the example programs write out behind the front end (post_hop() below:
+ * RES gain -> NR gain through samples/se_anr_stage.h -> min -> apply -> comfort noise ->
+ * synthesis), so a deviation planted in a stage is seen by the comparison.
  *
  * Command line: <mode> key=value ...
  *
  *   chain  mic=F ref=F sr=N fft=N out=F [aec=balanced|mild|aggressive|no_floor] [nr=mild|balanced|aggressive]
  *          [legacy_amin=0|1] [enable_nr=0|1] [enable_res=0|1] [enable_cng=0|1]
  *     The 4-channel chain as 4ch_aec_bf_nr_res/4aec_nr_res_static.c composes it (front end -> fuse
- *     with equal 0.25 weights -> se_sample_chain: RES stage -> NR stage -> min -> apply -> comfort
- *     noise -> synthesis), every hop dumped in the seam format below. Stops at the first non-zero
+ *     with equal 0.25 weights -> RES (an AecRes over the fused frame, as the unit builds it) -> NR
+ *     stage -> min -> apply -> comfort noise -> synthesis), every hop dumped in the seam format below. Stops at the first non-zero
  *     status of the core or the chain, recording it in the header; the Python side treats that as
  *     a result.
  *     aec=no_floor is accepted like the other presets (se_derive()'s preset_valid()).
  *   mono   mic=F ref=F sr=N fft=N out=F [aec=..] [nr=..] [legacy_amin=0|1] [enable_cng=0|1]
- *     Aec + se_frame_from_aec + se_sample_chain as mono_aec_nr_res/main.c composes them, with the AEC
+ *     Aec + se_frame_from_aec + the chain as mono_aec_nr_res/main.c composes them, with the AEC
  *     seam read back after each hop. The chain applies the lane's own RES gain (frame gain).
  *   replay seam=F out=F [aec=..] [nr=..] [legacy_amin=0|1] [enable_cng=0|1] [usable=F]
- *     Open-loop replay of se_sample_chain over a recorded seam: RES stage (4-channel only; mono reuses
+ *     Open-loop replay of the chain over a recorded seam: RES stage (4-channel only; mono reuses
  *     the recorded G_res), NR stage, min, apply, comfort noise, synthesis. `usable=F` is one
  *     byte per hop that replaces the recorded usable_linear flag (the Python verdict of the same hop).
  *     Output: header (8 x int32) then per hop float32 G_res(nf) G_nr(nf) out(hop).
@@ -48,9 +49,12 @@
 
 #include "aec.h"
 #include "aec_res.h"
+#include "anr.h"
 #include "audio_stft.h"
 #include "common/se_stage.h"
-#include "samples/se_sample_chain.h"
+#include "samples/se_anr_stage.h"
+#include "utility/mem_align.h"
+#include "utility/simd_kernels.h"
 
 #if defined(PYC_WITH_4CH)
 #include "4aec_nr_res.h"
@@ -143,13 +147,94 @@ static void write_rec(FILE* f, int nf, int hop, const Complex* e, const Complex*
     fwrite(sc, 4, PYC_SC, f);
 }
 
+/* The chain behind the front end. The RES gain comes from the frame (POST_RES_FRAME), from a
+ * separate AecRes at `preset` on the frame's grid (POST_RES_AECRES) or is the unity vector. */
+enum { POST_RES_OFF = 0, POST_RES_FRAME, POST_RES_AECRES };
+
+typedef struct Post {
+    int nf, res_mode, use_r2, enable_cng;
+    AecRes* res;
+    AnrDenoiser* nr;
+    AcIstft* istft;
+    float *unity, *total, *extra;
+    Complex* spec;
+    uint32_t rng;
+    const float *last_res, *last_nr;     /* the gains of the last hop (unity for an absent one) */
+    void* mem;
+} Post;
+
+static void post_destroy(Post* q) {
+    if (q->nr) anr_destroy(q->nr);
+    free(q->mem);
+    memset(q, 0, sizeof(*q));
+}
+
+static int post_create(Post* q, int sr, int fft, int res_mode, AecPreset preset, int enable_nr,
+                       AnrMode mode, int use_r2, int enable_cng) {
+    AecConfig rc;
+    AnrConfig nc;
+    AcStftConfig sc;
+    size_t res_b = 0, nr_b = 0, syn_b, vec, cvec;
+    unsigned char* cur;
+    int k;
+    memset(q, 0, sizeof(*q));
+    q->nf = fft / 2 + 1;
+    q->res_mode = res_mode;
+    q->use_r2 = use_r2;
+    q->enable_cng = enable_cng;
+    if (res_mode == POST_RES_AECRES) {
+        aec_config_from_preset(&rc, preset, sr);
+        rc.fft_size = fft;
+        if ((res_b = aec_res_get_mem_size(&rc)) == 0) return -1;
+    }
+    if (enable_nr) {
+        nc = anr_config_for_mode_grid(sr, fft, mode);
+        if ((nr_b = anr_get_mem_size(&nc)) == 0) return -1;
+    }
+    ac_stft_config_default(&sc, fft);
+    if ((syn_b = ac_istft_get_mem_size(&sc)) == 0) return -1;
+    vec = ALIGN16((size_t)q->nf * sizeof(float));
+    cvec = ALIGN16((size_t)q->nf * sizeof(Complex));
+    if (posix_memalign(&q->mem, 16, ALIGN16(res_b) + ALIGN16(nr_b) + ALIGN16(syn_b) + 3 * vec + cvec) != 0) {
+        q->mem = NULL;
+        return -1;
+    }
+    cur = (unsigned char*)q->mem;
+    if (res_b) { q->res = aec_res_init(cur, res_b, &rc); cur += ALIGN16(res_b); }
+    if (nr_b) { q->nr = anr_init(cur, nr_b, &nc); cur += ALIGN16(nr_b); }
+    q->istft = ac_istft_init(cur, syn_b, &sc); cur += ALIGN16(syn_b);
+    q->unity = (float*)cur; cur += vec;
+    q->total = (float*)cur; cur += vec;
+    q->extra = (float*)cur; cur += vec;
+    q->spec = (Complex*)cur;
+    for (k = 0; k < q->nf; ++k) q->unity[k] = 1.0f;
+    q->rng = SE_CNG_RNG_SEED;
+    if ((res_b && !q->res) || (nr_b && !q->nr) || !q->istft) { post_destroy(q); return -1; }
+    return 0;
+}
+
+/* One hop into out; 0, or -1 when a stage refuses. */
+static int post_hop(Post* q, const SeSpecFrame* f, float* out) {
+    const float* res = q->res_mode == POST_RES_FRAME ? f->g_res_ctx
+                     : q->res_mode == POST_RES_AECRES ? se_res_stage_gain(q->res, f) : q->unity;
+    const float* nr = q->unity;
+    if (!res || !f->e || f->n_freqs != q->nf) return -1;
+    if (q->nr && !(nr = se_anr_stage_gain(q->nr, f, q->extra, q->use_r2))) return -1;
+    sk_min_f32(q->total, nr, res, q->nf);
+    sk_capply_gain_f32(q->spec, f->e, q->total, q->nf);
+    if (q->enable_cng && q->res_mode != POST_RES_OFF && f->cn)
+        aec_cng_fill(&q->rng, q->spec, f->cn, res, nr, SE_CNG_NR_GAIN_FLOOR, q->nf);
+    (void)ac_istft_push(q->istft, q->spec, out);
+    q->last_res = res;
+    q->last_nr = nr;
+    return 0;
+}
+
 #if defined(PYC_WITH_4CH)
 static int run_chain(const Args* a) {
     FourAecNrResConfig cfg = four_aec_nr_res_default_config(a->sr);
-    SeSampleChainConfig cc;
     FourAecNrRes* core;
-    SeSampleChain* chain = NULL;
-    void* chain_mem = NULL;
+    Post chain;
     FILE *fm, *fr, *fo;
     long nm, nr_, n;
     int hop, nf, nh, h, fail_hop = -1, fail_rc = 0, done = 0;
@@ -159,19 +244,12 @@ static int run_chain(const Args* a) {
     core = four_aec_nr_res_create(&cfg);
     if (!core) { fprintf(stderr, "four_aec_nr_res_create failed\n"); return 1; }
     hop = four_aec_nr_res_hop_size(core); nf = four_aec_nr_res_n_freqs(core);
-    cc = se_sample_chain_default_config(a->sr, four_aec_nr_res_fft_size(core));
-    cc.res = a->enable_res ? SE_SAMPLE_RES_AEC_RES : SE_SAMPLE_RES_OFF;
-    cc.res_preset = a->aec;
-    cc.enable_nr = a->enable_nr;
-    cc.nr_mode = a->nr;
-    cc.legacy_amin = a->legacy_amin;
-    cc.enable_cng = a->enable_cng;
-    {
-        size_t bytes = se_sample_chain_mem_size(&cc);
-        if (bytes == 0 || posix_memalign(&chain_mem, 16, bytes) != 0) { fprintf(stderr, "chain alloc failed\n"); return 1; }
-        chain = se_sample_chain_init(chain_mem, bytes, &cc);
+    if (post_create(&chain, a->sr, four_aec_nr_res_fft_size(core),
+                    a->enable_res ? POST_RES_AECRES : POST_RES_OFF, a->aec, a->enable_nr, a->nr,
+                    !a->legacy_amin, a->enable_cng) != 0) {
+        fprintf(stderr, "post-stage init failed\n");
+        return 1;
     }
-    if (!chain) { fprintf(stderr, "se_sample_chain_init failed\n"); return 1; }
     fm = fopen(a->mic, "rb"); fr = fopen(a->ref, "rb"); fo = fopen(a->out, "wb");
     if (!fm || !fr || !fo) { fprintf(stderr, "open failed\n"); return 1; }
     nm = file_len(fm) / (4 * 4); nr_ = file_len(fr) / 4;
@@ -186,16 +264,12 @@ static int run_chain(const Args* a) {
         float sc[PYC_SC];
         FourAecFront front;
         SeSpecFrame f;
-        const Complex* spec;
         int rc;
         if (fread(mics, 4, 4 * (size_t)hop, fm) != 4 * (size_t)hop ||
             fread(ref, 4, (size_t)hop, fr) != (size_t)hop) { fprintf(stderr, "short read\n"); return 1; }
         rc = four_aec_front_process(core, mics, ref, &front);
         if (rc == FOUR_AEC_NR_RES_OK) rc = four_aec_fuse(core, w, NULL, &f);
-        if (rc == FOUR_AEC_NR_RES_OK) {
-            spec = se_sample_chain_form(chain, &f);
-            if (!spec || se_sample_chain_synthesize(chain, spec, out) != 0) rc = FOUR_AEC_NR_RES_DSP_ERROR;
-        }
+        if (rc == FOUR_AEC_NR_RES_OK && post_hop(&chain, &f, out) != 0) rc = FOUR_AEC_NR_RES_DSP_ERROR;
         if (rc != 0) { fail_hop = h; fail_rc = rc; break; }
         memset(sc, 0, sizeof(sc));
         sc[0] = f.far_power; sc[1] = f.max_dt; sc[2] = f.max_sat; sc[3] = (float)f.all_converged;
@@ -205,15 +279,14 @@ static int run_chain(const Args* a) {
         sc[9] = (float)four_aec_nr_res_realign_warm_lane_count(core);
         sc[10] = (float)four_aec_nr_res_realign_soft_lane_count(core);
         sc[11] = front.delay.confidence;
-        write_rec(fo, nf, hop, f.e, f.y, f.r2, f.cn, se_sample_chain_last_res_gain(chain),
-                  se_sample_chain_last_nr_gain(chain), f.far_hop, out, sc);
+        write_rec(fo, nf, hop, f.e, f.y, f.r2, f.cn, chain.last_res, chain.last_nr, f.far_hop,
+                  out, sc);
         ++done;
     }
     write_hdr(fo, 1, a->sr, a->fft, nf, hop, done, fail_hop, fail_rc);
     fclose(fo); fclose(fm); fclose(fr);
-    se_sample_chain_destroy(chain);
+    post_destroy(&chain);
     four_aec_nr_res_destroy(core);
-    free(chain_mem);
     free(mics); free(ref); free(out); free(w);
     return 0;
 }
@@ -238,29 +311,25 @@ static int derive_mono_lane(const Args* a, SeGrid* grid, AecConfig* aec_cfg) {
 static int run_mono(const Args* a) {
     SeGrid grid;
     AecConfig aec_cfg;
-    SeSampleChainConfig cc;
     Aec* aec;
-    SeSampleChain* chain;
-    void *aec_mem = NULL, *chain_mem = NULL;
-    size_t aec_bytes, chain_bytes;
+    Post chain;
+    void* aec_mem = NULL;
+    size_t aec_bytes;
     FILE *fm, *fr, *fo;
     long n;
     int hop, nf, nh, h;
     float *mic, *ref, *out;
     if (derive_mono_lane(a, &grid, &aec_cfg) != 0) { fprintf(stderr, "se_derive failed\n"); return 1; }
-    cc = se_sample_chain_default_config(a->sr, grid.fft_size);
-    cc.res = a->enable_res ? SE_SAMPLE_RES_FRAME_GAIN : SE_SAMPLE_RES_OFF;
-    cc.enable_nr = a->enable_nr;
-    cc.nr_mode = a->nr;
-    cc.legacy_amin = a->legacy_amin;
-    cc.enable_cng = aec_cfg.enable_cng && a->enable_cng;
     aec_bytes = aec_get_mem_size(&aec_cfg);
-    chain_bytes = se_sample_chain_mem_size(&cc);
-    if (aec_bytes == 0 || chain_bytes == 0 || posix_memalign(&aec_mem, 16, aec_bytes) != 0 ||
-        posix_memalign(&chain_mem, 16, chain_bytes) != 0) { fprintf(stderr, "alloc failed\n"); return 1; }
+    if (aec_bytes == 0 || posix_memalign(&aec_mem, 16, aec_bytes) != 0) { fprintf(stderr, "alloc failed\n"); return 1; }
     aec = aec_init(aec_mem, aec_bytes, &aec_cfg);
-    chain = se_sample_chain_init(chain_mem, chain_bytes, &cc);
-    if (!aec || !chain) { fprintf(stderr, "mono rig create failed\n"); return 1; }
+    if (!aec || post_create(&chain, a->sr, grid.fft_size,
+                            a->enable_res ? POST_RES_FRAME : POST_RES_OFF, AEC_PRESET_BALANCED,
+                            a->enable_nr, a->nr, !a->legacy_amin,
+                            aec_cfg.enable_cng && a->enable_cng) != 0) {
+        fprintf(stderr, "mono rig create failed\n");
+        return 1;
+    }
     hop = grid.hop_size; nf = grid.n_freqs;
     fm = fopen(a->mic, "rb"); fr = fopen(a->ref, "rb"); fo = fopen(a->out, "wb");
     if (!fm || !fr || !fo) { fprintf(stderr, "open failed\n"); return 1; }
@@ -275,15 +344,16 @@ static int run_mono(const Args* a) {
         AecResContext c;
         AecLinearContext lin;
         SeSpecFrame f;
-        const Complex* spec;
-        AnrDenoiser* nr = se_sample_chain_nr(chain);
+        AnrDenoiser* nr = chain.nr;
         const float* g;
         float sc[PYC_SC];
         if (fread(mic, 4, (size_t)hop, fm) != (size_t)hop ||
             fread(ref, 4, (size_t)hop, fr) != (size_t)hop) { fprintf(stderr, "short read\n"); return 1; }
         aec_process_context(aec, mic, ref);
-        if (se_frame_from_aec(aec, &f) != 0 || !(spec = se_sample_chain_form(chain, &f)) ||
-            se_sample_chain_synthesize(chain, spec, out) != 0) { fprintf(stderr, "process failed at hop %d\n", h); return 1; }
+        if (se_frame_from_aec(aec, &f) != 0 || post_hop(&chain, &f, out) != 0) {
+            fprintf(stderr, "process failed at hop %d\n", h);
+            return 1;
+        }
         aec_get_res_context(aec, &c);
         aec_get_linear_context(aec, &lin);
         g = nr ? anr_get_gain(nr, NULL) : NULL;
@@ -296,9 +366,9 @@ static int run_mono(const Args* a) {
     }
     write_hdr(fo, 0, a->sr, a->fft, nf, hop, nh, -1, 0);
     fclose(fo); fclose(fm); fclose(fr);
-    se_sample_chain_destroy(chain);
+    post_destroy(&chain);
     aec_destroy(aec);
-    free(chain_mem); free(aec_mem);
+    free(aec_mem);
     free(mic); free(ref); free(out);
     return 0;
 }
@@ -311,10 +381,7 @@ static int run_replay(const Args* a) {
     size_t rec;
     float* buf;
     unsigned char* usable = NULL;
-    SeSampleChainConfig cc;
-    SeSampleChain* chain;
-    void* chain_mem = NULL;
-    size_t chain_bytes;
+    Post chain;
     if (!fs) { fprintf(stderr, "cannot open seam\n"); return 1; }
     if (fread(h, 4, 10, fs) != 10 || h[0] != PYC_MAGIC) { fprintf(stderr, "bad seam header\n"); return 1; }
     kind = h[2]; sr = h[3]; fft = h[4]; nf = h[5]; hop = h[6]; nh = h[7];
@@ -329,24 +396,18 @@ static int run_replay(const Args* a) {
         fclose(fu);
     }
     /* 4-channel: a separate AecRes at the requested strength; mono: the recorded lane gain. */
-    cc = se_sample_chain_default_config(sr, fft);
-    cc.res = !a->enable_res ? SE_SAMPLE_RES_OFF : kind == 1 ? SE_SAMPLE_RES_AEC_RES : SE_SAMPLE_RES_FRAME_GAIN;
-    cc.res_preset = a->aec;
-    cc.enable_nr = a->enable_nr;
-    cc.nr_mode = a->nr;
-    cc.legacy_amin = a->legacy_amin;
-    cc.enable_cng = a->enable_cng;
-    chain_bytes = se_sample_chain_mem_size(&cc);
-    if (chain_bytes == 0 || posix_memalign(&chain_mem, 16, chain_bytes) != 0) { fprintf(stderr, "chain alloc failed\n"); return 1; }
-    chain = se_sample_chain_init(chain_mem, chain_bytes, &cc);
-    if (!chain) { fprintf(stderr, "stage init failed\n"); return 1; }
+    if (post_create(&chain, sr, fft,
+                    !a->enable_res ? POST_RES_OFF : kind == 1 ? POST_RES_AECRES : POST_RES_FRAME,
+                    a->aec, a->enable_nr, a->nr, !a->legacy_amin, a->enable_cng) != 0) {
+        fprintf(stderr, "stage init failed\n");
+        return 1;
+    }
     fo = fopen(a->out, "wb");
     if (!fo) { fprintf(stderr, "cannot open out\n"); return 1; }
     { int32_t oh[8] = { PYC_MAGIC, 1, kind, sr, fft, nf, hop, nh }; fwrite(oh, 4, 8, fo); }
     for (t = 0; t < nh; ++t) {
         const float* r = buf + rec * (size_t)t;
         SeSpecFrame f;
-        const Complex* spec;
         float* out = (float*)malloc(sizeof(float) * (size_t)hop);
         memset(&f, 0, sizeof(f));
         f.n_freqs = nf; f.hop = hop;
@@ -362,16 +423,15 @@ static int run_replay(const Args* a) {
             f.all_converged = (int)sc[3]; f.clock_drift = (int)sc[4];
             f.usable_linear = usable ? usable[t] : (int)sc[5];
         }
-        spec = se_sample_chain_form(chain, &f);
-        if (!spec || se_sample_chain_synthesize(chain, spec, out) != 0) { fprintf(stderr, "stage refused hop %d\n", t); return 1; }
-        fwrite(se_sample_chain_last_res_gain(chain), 4, (size_t)nf, fo);
-        fwrite(se_sample_chain_last_nr_gain(chain), 4, (size_t)nf, fo);
+        if (post_hop(&chain, &f, out) != 0) { fprintf(stderr, "stage refused hop %d\n", t); return 1; }
+        fwrite(chain.last_res, 4, (size_t)nf, fo);
+        fwrite(chain.last_nr, 4, (size_t)nf, fo);
         fwrite(out, 4, (size_t)hop, fo);
         free(out);
     }
     fclose(fo);
-    se_sample_chain_destroy(chain);
-    free(buf); free(usable); free(chain_mem);
+    post_destroy(&chain);
+    free(buf); free(usable);
     return 0;
 }
 

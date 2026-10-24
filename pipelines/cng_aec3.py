@@ -1,7 +1,7 @@
 """AEC3 comfort-noise generator, ported bit-for-bit from the C pipelines.
 
-The C gain chain (``samples/se_sample_chain.h``, used by the mono and the
-4-channel examples) fills the residual-suppressed bins through
+The C gain chain of the mono and the 4-channel example programs fills the
+residual-suppressed bins through
 ``aec_cng_fill`` (``lib/aec/c_impl/include/aec_res.h``) with comfort noise drawn
 from one multiplicative-congruential step per bin whose top five bits index
 ``AECB_SQRT2_SIN_LUT`` (``lib/aec/c_impl/include/aec_balanced_config.h``), the

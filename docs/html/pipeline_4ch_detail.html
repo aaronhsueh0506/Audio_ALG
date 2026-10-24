@@ -31,29 +31,29 @@ th{background:#eef0f5}
 <h1>audio_pipeline_4ch 細節 — 執行期強度控制與逐階段耗時</h1>
 
 <h2>概要</h2>
-<p>本頁收 <a href="pipeline_4ch.html">pipeline_4ch</a> 的兩段會把單頁撐過 30 KB 的 API 細節:(1) 後級鏈上 <code>aec_res_set_preset()</code>／<code>anr_set_mode()</code>／<code>aec_res_split_floor()</code> 的執行期強度控制(單元本身沒有強度 setter),(2) <code>four_aec_nr_res_get_last_timing()</code>／<code>audio_pipeline_4ch_last_core_timing()</code> 的逐階段耗時診斷。最小呼叫範例、前端輸出契約、block diagram、泳道圖、I/O 表、State 表、延遲與檔案清單仍留在原頁。</p>
+<p>本頁收 <a href="pipeline_4ch.html">pipeline_4ch</a> 的兩段會把單頁撐過 30 KB 的 API 細節:(1) 單元的 RES 與你自己的降噪器上 <code>aec_res_set_preset()</code>／<code>anr_set_mode()</code>／<code>aec_res_split_floor()</code> 的執行期強度控制(單元本身沒有強度 setter,只交出 RES 的 handle),(2) <code>four_aec_nr_res_get_last_timing()</code>／<code>audio_pipeline_4ch_last_core_timing()</code> 的逐階段耗時診斷。最小呼叫範例、前端輸出契約、block diagram、泳道圖、I/O 表、State 表、延遲與檔案清單仍留在原頁。</p>
 
 <h3>執行期強度控制</h3>
 <pre>int aec_res_set_preset(AecRes* r, AecPreset preset, float ramp_ms);
-int anr_set_mode(AnrDenoiser* nr, AnrMode mode);                     /* nr = se_sample_chain_nr(chain) */
+int anr_set_mode(AnrDenoiser* nr, AnrMode mode);                     /* nr = 你自己 anr_init() 的物件 */
 int aec_res_split_floor(const AecRes* r, float* live, float* target);  /* 唯讀 */
 
-AecRes* res = se_sample_chain_res(chain);                  /* res = SE_SAMPLE_RES_AEC_RES 的鏈才有 */
+AecRes* res = audio_pipeline_4ch_res(p);                   /* 單元的 RES; enable_res=0 或 core.enable_post=0 時為 NULL */
 aec_res_set_preset(res, AEC_PRESET_AGGRESSIVE, 100.0f);    /* 100 ms 內以 dB 線性走到新地板 */
-anr_set_mode(se_sample_chain_nr(chain), ANR_MODE_MILD);
+anr_set_mode(nr, ANR_MODE_MILD);
 
 float live, target;                                        /* 線性功率,不是 dB */
 aec_res_split_floor(res, &amp;live, &amp;target);              /* live == target ⇒ ramp 已走完 */</pre>
-<p class="note"><b>本節最重要的一件事:對四條 lane 重新指定 preset 是無效操作。</b>四條 lane 都以 <code>spatial_linear_context</code> 建立,因此<b>沒有任何一條</b>會走到自己的殘留抑制器;它們各自的地板什麼都不塑形。真正乘上本產品輸出、也真正決定 comfort noise 量的那個 gain,來自<b>唯一一個</b>共用的 post 級抑制器(你的鏈裡的 <code>AecRes</code>)——上面的 preset setter 針對的就是它,這也是它存在、而不是要呼叫端自己對四條 lane 迴圈呼叫 <code>aec_set_preset()</code> 的原因。同理 NR 也只有一個共用實例(對 beamform 後的訊號跑),不是每條 lane 一個。這個抑制器與降噪器由應用的鏈擁有,所以三個 setter 都作用在鏈上;前端 <code>FourAecNrRes</code> 與單元 <code>AudioPipeline4Ch</code> 都沒有它們。這一點由 <code>tests/test_audio_pipeline_4ch.c</code> 與 <code>tests/test_se_common.c</code> 的 sample chain 強度測試釘住,不是推測。</p>
+<p class="note"><b>本節最重要的一件事:對四條 lane 重新指定 preset 是無效操作。</b>四條 lane 都以 <code>spatial_linear_context</code> 建立,因此<b>沒有任何一條</b>會走到自己的殘留抑制器;它們各自的地板什麼都不塑形。真正乘上本產品輸出、也真正決定 comfort noise 量的那個 gain,來自<b>唯一一個</b>共用的 post-beam 抑制器(單元擁有的 <code>AecRes</code>)——上面的 preset setter 針對的就是它,這也是它存在、而不是要呼叫端自己對四條 lane 迴圈呼叫 <code>aec_set_preset()</code> 的原因。同理 NR 也只有一個共用實例(對 beamform 後的訊號跑),不是每條 lane 一個。RES 由單元擁有、經 <code>audio_pipeline_4ch_res(p)</code> 交出 handle;降噪器由應用自己初始化與持有。前端 <code>FourAecNrRes</code> 與單元 <code>AudioPipeline4Ch</code> 都沒有 preset／mode setter 本身(核心連 RES 都沒有)。這一點由 <code>tests/test_audio_pipeline_4ch.c</code>(單元 RES 的 preset／ramp／<code>split_floor</code> 與 reset 後保留)與 <code>pipelines/tests/test_se_common.c</code>(<code>anr_set_mode()</code> 對每個 mode)釘住,不是推測。</p>
 <table>
 <tr><th>呼叫</th><th>改／讀什麼</th><th>回 −1 的情況(−1 時什麼都不寫)</th></tr>
-<tr><td><code>aec_res_set_preset()</code></td><td><b>共用 post 級抑制器</b>的 far-active split floor</td><td><code>res</code> NULL(鏈的 <code>res != AEC_RES</code> 時 <code>se_sample_chain_res()</code> 回 NULL);<code>preset</code> 超出 enum;<code>ramp_ms</code> 非有限值或超出 [0, 60000]</td></tr>
-<tr><td><code>anr_set_mode()</code></td><td>鏈擁有的<b>那一個</b>降噪器</td><td><code>nr</code> NULL(<b><code>enable_nr == 0</code></b> 時 <code>se_sample_chain_nr()</code> 回 NULL);<code>mode</code> 超出 enum</td></tr>
+<tr><td><code>aec_res_set_preset()</code></td><td><b>共用 post 級抑制器</b>的 far-active split floor</td><td><code>res</code> NULL(<code>enable_res=0</code> 或 <code>core.enable_post=0</code> 時 <code>audio_pipeline_4ch_res()</code> 回 NULL);<code>preset</code> 超出 enum;<code>ramp_ms</code> 非有限值或超出 [0, 60000]</td></tr>
+<tr><td><code>anr_set_mode()</code></td><td>你持有的<b>那一個</b>降噪器</td><td><code>nr</code> NULL(例如範例沒有建降噪器);<code>mode</code> 超出 enum</td></tr>
 <tr><td><code>aec_res_split_floor()</code></td><td>唯讀。<code>live</code>=抑制器<b>當下</b>套用的值,<code>target</code>=撐得過 reset 的已設定值;只有 ramp 走到一半時兩者不同。任一指標可為 NULL</td><td><code>res</code> NULL</td></tr>
 </table>
 <p><code>live</code>/<code>target</code> 這一對是<b>板端唯一值得記錄的強度量</b>:它是真正塑形輸出的東西,兩個值合在一起就回答「我要求的改動落地了沒有」。</p>
-<p><code>ramp_ms == 0</code> 下一個 hop 套用(<b>不是錯誤</b>),落點與「用該 preset 從頭建一個新實例」完全相同;<code>&gt; 0</code> 以 dB 線性走過去,上限 60 s。ramp 途中再呼叫會從當前 live 值重新起走。兩個 setter 都<b>不是重啟</b>:四條 lane 的濾波器、共用延遲鎖定、NR 噪聲底與增益平滑歷史全部繼續跑。preset 改動<b>撐得過</b> 該 stage 的 reset(目標值另存一份,reset 會重新套用),ramp 進度則會被丟掉。<b>在兩個 hop 之間呼叫、與單元的 <code>audio_pipeline_4ch_process*()</code> 序列化;非 thread-safe。</b>Python 對應 <code>PostBeamResidualSuppressor.set_preset(preset, ramp_ms=0.0)</code>(抑制器由呼叫端持有;<code>FourChannelAecPipeline</code> 沒有 <code>set_aec_preset()</code>)。</p>
-<p class="note">範例鏈的降噪器以 <code>anr_config_for_mode_grid()</code> 建立、沒有覆寫任何欄位,所以 <code>anr_set_mode()</code> 直接換強度。在 preset 之上改過欄位的實例,<code>anr_set_mode()</code> 會把那些覆寫蓋回 preset 值,要自己組好完整 target 再呼叫 <code>anr_reconfigure()</code>。</p>
+<p><code>ramp_ms == 0</code> 下一個 hop 套用(<b>不是錯誤</b>),落點與「用該 preset 從頭建一個新實例」完全相同;<code>&gt; 0</code> 以 dB 線性走過去,上限 60 s。ramp 途中再呼叫會從當前 live 值重新起走。兩個 setter 都<b>不是重啟</b>:四條 lane 的濾波器、共用延遲鎖定、NR 噪聲底與增益平滑歷史全部繼續跑。preset 改動<b>撐得過</b> 該 stage 的 reset(目標值另存一份,reset 會重新套用;<code>audio_pipeline_4ch_reset()</code> 也保留經 handle 設的 preset),ramp 進度則會被丟掉。<b>在兩個 hop 之間呼叫、與單元的 <code>audio_pipeline_4ch_process*()</code> 序列化;非 thread-safe。</b>Python 對應 <code>PostBeamResidualSuppressor.set_preset(preset, ramp_ms=0.0)</code>(<code>FourChannelAecPipeline</code> 擁有一個,以 <code>pipeline.post_beam_res.set_preset()</code> 取得;沒有 <code>set_aec_preset()</code>)。</p>
+<p class="note">範例的降噪器以 <code>anr_config_for_mode_grid()</code> 建立、沒有覆寫任何欄位,所以 <code>anr_set_mode()</code> 直接換強度。在 preset 之上改過欄位的實例,<code>anr_set_mode()</code> 會把那些覆寫蓋回 preset 值,要自己組好完整 target 再呼叫 <code>anr_reconfigure()</code>。</p>
 <p class="note"><b>A/B 量測時該預期什麼。</b>far-active 地板只在 <b>far-active 且非 double-talk</b> 的 hop 生效:DT 期間套用 DT 地板(三個 preset <b>完全相同</b>),far-active latch 觸發前套的是 far-silent 地板。同一個 gain 還決定注入的 comfort noise 量(振幅 ∝ <code>sqrt(1 − G_res²)</code> 再乘該 bin 的 NR gain(下限 −10 dB),見 <a href="pipeline_4ch.html">pipeline_4ch</a> block diagram 的 CNG 步驟——地板越深、CNG 反而越多)。所以<b>整段錄音的平均移動幅度會小於 dB 落差所暗示的量</b>,而且只量 echo/degradation 的 A/B 會把 CNG 的變化錯記到別的機制。請在 echo 對齊或 degradation 對齊的條件下比較,並實際試聽。</p>
 
 <h3>逐階段耗時(診斷用)</h3>
@@ -64,7 +64,7 @@ aec_res_split_floor(res, &amp;live, &amp;target);              /* live == target
 
 void four_aec_nr_res_get_last_timing(const FourAecNrRes* p, FourAecNrResLastTiming* out);
 void audio_pipeline_4ch_last_core_timing(const AudioPipeline4Ch* p, FourAecNrResLastTiming* out);  /* 單元: 同一份, 經 get_core */</pre>
-<p>最近一個 hop 前端每個階段的 wall-clock 成本(微秒,<code>CLOCK_MONOTONIC</code>)。純診斷:pipeline 自己不回讀,也不影響處理。<code>p</code> 為 NULL 或已銷毀時把 <code>out</code> 清零而不是失敗;<code>out</code> 不得為 NULL。欄位:<code>delay_us</code>(<code>update_shared_delay()</code> 的共用 estimator,不含 <code>align_render()</code> 的 ring-buffer 複製與 realign 掃描)、<code>fuse_us</code>(<code>four_aec_fuse()</code>),以及四條 lane 加總的 <code>frontend_us</code>／<code>linear_us</code>／<code>lane_res_us</code>。RES、NR、CNG 與逆轉換由應用串接,耗時由應用自己量,不在這個記錄內。</p>
+<p>最近一個 hop 前端每個階段的 wall-clock 成本(微秒,<code>CLOCK_MONOTONIC</code>)。純診斷:pipeline 自己不回讀,也不影響處理。<code>p</code> 為 NULL 或已銷毀時把 <code>out</code> 清零而不是失敗;<code>out</code> 不得為 NULL。欄位:<code>delay_us</code>(<code>update_shared_delay()</code> 的共用 estimator,不含 <code>align_render()</code> 的 ring-buffer 複製與 realign 掃描)、<code>fuse_us</code>(<code>four_aec_fuse()</code>),以及四條 lane 加總的 <code>frontend_us</code>／<code>linear_us</code>／<code>lane_res_us</code>。RES(單元內的 <code>AecRes</code>,在 <code>audio_pipeline_4ch_fuse()</code> 裡)、NR、CNG 與逆轉換的耗時由應用自己量,不在這個記錄內。</p>
 <p class="note">後三者由 <code>aec_get_last_timing()</code>(<code>aec.h</code>)逐 lane 讀出後相加,受 <code>-DAEC_STAGE_TIMING=1</code> 這個<b>另一半</b>的旗標管轄——只建核心那半(<code>FOUR_AEC_NR_RES_STAGE_TIMING</code>),這三欄讀 0 而其餘照常量測,是可讀的狀態而非壞掉;<code>make PROFILE=1</code> 開啟 AEC 那半。lane 內部的 <code>delay_us</code> 也一併加進上面的 <code>delay_us</code>,但它<b>結構上恆為 0</b>:四條 lane 都是 <code>AEC_DELAY_EXTERNAL_ALIGNED</code>,沒有自己的 ring 或 estimator。相加而不是丟棄,是為了讓日後改變 lane 模式時不會靜默漏掉那筆成本。</p>
 <p class="note"><b>目標平台沒有 CLOCK_MONOTONIC 時。</b><code>clock_gettime</code> 是 POSIX 而非 C99。用 <code>make PROFILE=1 EXTRA_CFLAGS='-DFOUR_AEC_NR_RES_NOW_US=board_timer_us -DAEC_NOW_US=board_timer_us -include my_timer.h'</code> 換掉時鐘;巨集要是<b>純識別字</b>(FP policy 不允許 <code>EXTRA_CFLAGS</code> 出現括號),指向不收參數、回傳 <code>uint32_t</code> 微秒的函式。替代時鐘必須<b>單調</b>。這層與四條 lane 各有自己的覆寫點,刻意不共用。開著旗標但指向常數函式是合法用法,所有欄位讀 0。</p>
 <p>呼叫端若要呈現完整分解,前端的未歸屬餘額要自己用減法算:<code>front_total − (delay_us + frontend_us + linear_us + lane_res_us)</code> 涵蓋輸入去交錯／有限值檢查、<code>align_render()</code>、realign 掃描與 lane 迴圈自己的餘額。</p>
@@ -72,8 +72,8 @@ void audio_pipeline_4ch_last_core_timing(const AudioPipeline4Ch* p, FourAecNrRes
 
 <h2>相關檔案與測試路徑</h2>
 <ul>
-<li><code>pipelines/samples/se_sample_chain.h</code>(<code>se_sample_chain_res()</code>／<code>se_sample_chain_nr()</code>);<code>pipelines/4ch_aec_bf_nr_res/4aec_nr_res.h / .c</code>(<code>four_aec_nr_res_get_last_timing()</code>);<code>pipelines/4ch_aec_bf_nr_res/audio_pipeline_4ch.h / .c</code>(<code>audio_pipeline_4ch_last_core_timing()</code>)</li>
-<li><code>pipelines/tests/test_se_common.c</code>(sample chain 強度測試)、<code>pipelines/4ch_aec_bf_nr_res/tests/test_audio_pipeline_4ch.c</code>;完整清單見 <a href="pipeline_4ch.html">pipeline_4ch</a>。</li>
+<li><code>pipelines/4ch_aec_bf_nr_res/audio_pipeline_4ch.h</code>(<code>audio_pipeline_4ch_res()</code>);<code>pipelines/4ch_aec_bf_nr_res/4aec_nr_res.h / .c</code>(<code>four_aec_nr_res_get_last_timing()</code>);<code>pipelines/4ch_aec_bf_nr_res/audio_pipeline_4ch.h / .c</code>(<code>audio_pipeline_4ch_last_core_timing()</code>)</li>
+<li><code>pipelines/tests/test_se_common.c</code>(<code>anr_set_mode()</code> 強度測試)、<code>pipelines/4ch_aec_bf_nr_res/tests/test_audio_pipeline_4ch.c</code>;完整清單見 <a href="pipeline_4ch.html">pipeline_4ch</a>。</li>
 </ul>
 </body>
 </html>

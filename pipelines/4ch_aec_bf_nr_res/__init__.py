@@ -21,7 +21,6 @@ FourChannelAecConfig = _pipeline.FourChannelAecConfig
 FourChannelAecPipeline = _pipeline.FourChannelAecPipeline
 FourChannelFrame = _pipeline.FourChannelFrame
 FrontFrame = _pipeline.FrontFrame
-PostBeamResidualSuppressor = _pipeline.PostBeamResidualSuppressor
 SharedDelayState = _pipeline.SharedDelayState
 SharedMatchedDelayEstimator = _pipeline.SharedMatchedDelayEstimator
 
@@ -33,7 +32,6 @@ __all__ = [
     "FourChannelAecPipeline",
     "FourChannelFrame",
     "FrontFrame",
-    "PostBeamResidualSuppressor",
     "SharedDelayState",
     "SharedMatchedDelayEstimator",
 ]

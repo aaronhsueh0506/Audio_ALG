@@ -7,11 +7,12 @@
  * Build/run (from pipelines/):  make example-adapter
  *
  * The integrator sums the pool of each stage it uses. Here that is lib/aec's Aec
- * (aec_get_mem_size) followed by the gain chain of samples/se_sample_chain.h
- * (se_sample_chain_mem_size), both 16-byte aligned, in one block.
- * Flow: 1 size the pool from the two stage queries (every time, never cached across a build or
- * config change); 2 allocate (board_mem_alloc); 3 aec_init() and se_sample_chain_init() on the
- * block; 4 process N hops; 5 reset both stages; 6 process N more hops; 7 destroy both stages;
+ * (aec_get_mem_size, its own RES gain included), lib/nr's denoiser (anr_get_mem_size), the
+ * synthesis (ac_istft_get_mem_size) and the gain/spectrum buffers of the per-hop chain, each
+ * 16-byte aligned, in one block.
+ * Flow: 1 size the pool from the stage queries (every time, never cached across a build or
+ * config change); 2 allocate (board_mem_alloc); 3 aec_init(), anr_init(), ac_istft_init() on
+ * the block; 4 process N hops; 5 reset every stage; 6 process N more hops; 7 destroy the stages;
  * 8 board_mem_free() (after 7). The cycle then repeats on the same arena (pool reuse).
  * run_negative_demonstrations() checks the rejection paths: undersized pool, misaligned pool,
  * double destroy, and that a rejected init leaves the pool usable.
@@ -24,10 +25,13 @@
 #include <stdint.h>
 
 #include "aec.h"
+#include "anr.h"
+#include "audio_stft.h"
 #include "common/se_config.h"
 #include "common/se_stage.h"
-#include "samples/se_sample_chain.h"
+#include "samples/se_anr_stage.h"
 #include "utility/mem_align.h"
+#include "utility/simd_kernels.h"
 
 /* board_mem: simulated platform common-memory manager (REFERENCE ONLY).
  * BOARD: replace this whole module with the platform's memory manager; it only needs
@@ -88,17 +92,24 @@ static void board_mem_free(void* p) {
 typedef struct MonoPlan {
     SeGrid grid;
     AecConfig aec_cfg;
-    SeSampleChainConfig chain_cfg;
-    size_t aec_bytes, chain_bytes, total;
+    AnrConfig nr_cfg;
+    AcStftConfig synth_cfg;
+    size_t aec_bytes, nr_bytes, synth_bytes, vec_bytes, spec_bytes;
+    size_t nr_offset, synth_offset, buf_offset, total;
 } MonoPlan;
 
 typedef struct MonoStages {
     Aec* aec;
-    SeSampleChain* chain;
+    AnrDenoiser* nr;
+    AcIstft* istft;
+    float *total_gain, *extra_noise;
+    Complex* spec;
+    uint32_t rng;
 } MonoStages;
 
-/** Step 1: the lane's grid and AecConfig, the chain config, and the pool as the sum of the two
- * stage sizes. Returns 0, or -1 for a configuration a stage refuses. */
+/** Step 1: the lane's grid and AecConfig, the denoiser and synthesis configs, and the pool as
+ * the sum of the stage sizes in carve order (AEC, NR, synthesis, buffers). Returns 0, or -1
+ * for a configuration a stage refuses. */
 static int mono_plan(MonoPlan* plan, int sample_rate) {
     static const SeRules rules = { .allow_8k = 1, .spatial_context = SE_CONTEXT_PRESET };
     SeRequest req;
@@ -110,52 +121,76 @@ static int mono_plan(MonoPlan* plan, int sample_rate) {
     req.fixed_delay_samples = -1;
     req.aec_preset = AEC_PRESET_BALANCED;
     if (se_derive(&req, &rules, &plan->grid, &plan->aec_cfg) != 0) return -1;
-    plan->chain_cfg = se_sample_chain_default_config(sample_rate, plan->grid.fft_size);
-    plan->chain_cfg.res = SE_SAMPLE_RES_FRAME_GAIN;
+    plan->nr_cfg = anr_config_for_mode_grid(sample_rate, plan->grid.fft_size, ANR_MODE_BALANCED);
+    ac_stft_config_default(&plan->synth_cfg, plan->grid.fft_size);
     plan->aec_bytes = aec_get_mem_size(&plan->aec_cfg);
-    plan->chain_bytes = se_sample_chain_mem_size(&plan->chain_cfg);
-    if (plan->aec_bytes == 0 || plan->chain_bytes == 0) return -1;
-    plan->total = ALIGN16(plan->aec_bytes) + plan->chain_bytes;
+    plan->nr_bytes = anr_get_mem_size(&plan->nr_cfg);
+    plan->synth_bytes = ac_istft_get_mem_size(&plan->synth_cfg);
+    if (plan->aec_bytes == 0 || plan->nr_bytes == 0 || plan->synth_bytes == 0) return -1;
+    plan->vec_bytes = ALIGN16((size_t)plan->grid.n_freqs * sizeof(float));
+    plan->spec_bytes = ALIGN16((size_t)plan->grid.n_freqs * sizeof(Complex));
+    plan->nr_offset = ALIGN16(plan->aec_bytes);
+    plan->synth_offset = plan->nr_offset + ALIGN16(plan->nr_bytes);
+    plan->buf_offset = plan->synth_offset + ALIGN16(plan->synth_bytes);
+    /* total gain, NR prior, output spectrum */
+    plan->total = plan->buf_offset + 2 * plan->vec_bytes + plan->spec_bytes;
     return 0;
 }
 
-/** Step 3: both stages on one block of `bytes`. Each stage gets the share of the block it
- * would own and checks it itself: the AEC refuses a misaligned base or a short block, the
- * chain a short remainder. A refused chain rolls the AEC back. NULL stages on refusal. */
+static void mono_destroy(MonoStages* s);
+
+/** Step 3: every stage on one block of `bytes`. The block must hold the whole plan; the stage
+ * inits then check alignment and their own sizes. A refusal rolls back the stages already built.
+ * NULL stages on refusal. */
 static int mono_init(MonoStages* s, void* pool, size_t bytes, const MonoPlan* plan) {
     uint8_t* cur = (uint8_t*)pool;
-    size_t chain_offset = ALIGN16(plan->aec_bytes);
     memset(s, 0, sizeof(*s));
-    if (!pool) return -1;
-    s->aec = aec_init(cur, bytes < plan->aec_bytes ? bytes : plan->aec_bytes, &plan->aec_cfg);
-    if (!s->aec) return -1;
-    s->chain = se_sample_chain_init(cur + chain_offset,
-                                    bytes > chain_offset ? bytes - chain_offset : 0,
-                                    &plan->chain_cfg);
-    if (!s->chain) { aec_destroy(s->aec); s->aec = NULL; return -1; }
+    if (!pool || bytes < plan->total) return -1;
+    s->aec = aec_init(cur, plan->aec_bytes, &plan->aec_cfg);
+    if (s->aec) s->nr = anr_init(cur + plan->nr_offset, plan->nr_bytes, &plan->nr_cfg);
+    if (s->nr) s->istft = ac_istft_init(cur + plan->synth_offset, plan->synth_bytes, &plan->synth_cfg);
+    if (!s->istft) {
+        mono_destroy(s);
+        memset(s, 0, sizeof(*s));
+        return -1;
+    }
+    cur += plan->buf_offset;
+    s->total_gain = (float*)cur;  cur += plan->vec_bytes;
+    s->extra_noise = (float*)cur; cur += plan->vec_bytes;
+    s->spec = (Complex*)cur;
+    s->rng = SE_CNG_RNG_SEED;
     return 0;
 }
 
+/** One hop: G_res is the AEC's own (frame.g_res_ctx), G_nr the denoiser's over the same frame;
+ * P = E * min(G_nr, G_res) plus comfort noise on the bins the RES cut, then synthesis. */
 static int mono_hop(MonoStages* s, const float* mic, const float* ref, float* out) {
-    SeSpecFrame frame;
-    const Complex* spec;
+    SeSpecFrame f;
+    const float* nr;
     aec_process_context(s->aec, mic, ref);
-    if (se_frame_from_aec(s->aec, &frame) != 0) return -1;
-    spec = se_sample_chain_form(s->chain, &frame);
-    if (!spec) return -1;
-    return se_sample_chain_synthesize(s->chain, spec, out);
+    if (se_frame_from_aec(s->aec, &f) != 0 || !f.g_res_ctx) return -1;
+    nr = se_anr_stage_gain(s->nr, &f, s->extra_noise, 1);
+    if (!nr) return -1;
+    sk_min_f32(s->total_gain, nr, f.g_res_ctx, f.n_freqs);   /* keeps a non-finite gain visible */
+    sk_capply_gain_f32(s->spec, f.e, s->total_gain, f.n_freqs);
+    if (f.cn)
+        aec_cng_fill(&s->rng, s->spec, f.cn, f.g_res_ctx, nr, SE_CNG_NR_GAIN_FLOOR, f.n_freqs);
+    (void)ac_istft_push(s->istft, s->spec, out);
+    return 0;
 }
 
 static void mono_reset(MonoStages* s) {
     aec_reset(s->aec);
-    se_sample_chain_reset(s->chain);
+    anr_reset(s->nr);
+    ac_istft_reset(s->istft);
+    s->rng = SE_CNG_RNG_SEED;
 }
 
-/** Step 7: reverse carve order (NR inside the chain, then the AEC); a no-op per module on a
- * pool-resident instance, but still required. Safe to call twice. */
+/** Step 7: reverse carve order; a no-op per module on a pool-resident instance, but still
+ * required. Safe to call twice. */
 static void mono_destroy(MonoStages* s) {
-    se_sample_chain_destroy(s->chain);
-    aec_destroy(s->aec);
+    if (s->nr) anr_destroy(s->nr);
+    if (s->aec) aec_destroy(s->aec);
 }
 
 /* Synthetic signal (smoke test, not a quality test) */
@@ -213,8 +248,8 @@ static int run_one_cycle(int sample_rate, int cycle_no) {
         fprintf(stderr, "cycle %d: the stage size queries failed\n", cycle_no);
         return 0;
     }
-    printf("  sized: aec=%zu chain=%zu total=%zu bytes alignment=%u\n",
-           plan.aec_bytes, plan.chain_bytes, plan.total, POOL_ALIGNMENT);
+    printf("  sized: aec=%zu nr=%zu synthesis=%zu total=%zu bytes alignment=%u\n",
+           plan.aec_bytes, plan.nr_bytes, plan.synth_bytes, plan.total, POOL_ALIGNMENT);
 
     /* Step 2: board alloc. BOARD: replace board_mem_alloc()/board_mem_free(). */
     pool = board_mem_alloc(plan.total, POOL_ALIGNMENT);
@@ -223,7 +258,7 @@ static int run_one_cycle(int sample_rate, int cycle_no) {
         return 0;
     }
 
-    /* Step 3: init both stages on the block. */
+    /* Step 3: init every stage on the block. */
     if (mono_init(&stages, pool, (size_t)plan.total, &plan) != 0) {
         fprintf(stderr, "cycle %d: stage init failed\n", cycle_no);
         board_mem_free(pool);
@@ -240,8 +275,8 @@ static int run_one_cycle(int sample_rate, int cycle_no) {
         return 0;
     }
 
-    /* Step 5: reset (echo-path change or a new stream on the same instance); the AEC and
-     * the chain are reset together.
+    /* Step 5: reset (echo-path change or a new stream on the same instance); every stage is
+     * reset together.
      * BOARD: on suspend/resume either confirm the platform preserved the pool contents
      * and keep using the stages, or destroy and init again on the same pool; resuming on
      * unpreserved contents corrupts state the library cannot detect. */
@@ -291,20 +326,20 @@ static int run_negative_demonstrations(void) {
         return 0;
     }
 
-    /* 1. A block one byte short of the AEC's own size: aec_init() refuses it. */
-    CHECK(mono_init(&s, pool, plan.aec_bytes - 1, &plan) != 0 && !s.aec && !s.chain,
+    /* 1. A block one byte short of the AEC's own size: the init refuses it. */
+    CHECK(mono_init(&s, pool, plan.aec_bytes - 1, &plan) != 0 && !s.aec && !s.nr,
           "init rejects a pool smaller than the AEC (aec_bytes-1)");
 
     /* 2. Misaligned base (+8); the arena has margin, so no out-of-bounds access (the init
      * rejects before touching memory). */
-    CHECK(mono_init(&s, (uint8_t*)pool + 8, (size_t)plan.total, &plan) != 0 && !s.aec && !s.chain,
+    CHECK(mono_init(&s, (uint8_t*)pool + 8, (size_t)plan.total, &plan) != 0 && !s.aec && !s.nr,
           "init rejects a misaligned (base+8) pool");
 
-    /* 3. The AEC fits, the chain does not: se_sample_chain_init() refuses the short remainder
-     * and the AEC is rolled back. */
-    CHECK(mono_init(&s, pool, (size_t)ALIGN16(plan.aec_bytes) + plan.chain_bytes / 2, &plan) != 0 &&
-              !s.aec && !s.chain,
-          "init rejects a pool that holds the AEC but not the chain");
+    /* 3. The AEC fits, the denoiser does not: the init refuses the block and no stage is
+     * left built. */
+    CHECK(mono_init(&s, pool, plan.nr_offset + plan.nr_bytes / 2, &plan) != 0 &&
+              !s.aec && !s.nr && !s.istft,
+          "init rejects a pool that holds the AEC but not the denoiser");
 
     /* 4. Init after rejected attempts still works; run real hops to prove it. */
     if (mono_init(&s, pool, (size_t)plan.total, &plan) == 0) {

@@ -33,8 +33,8 @@ disas() { fp_contract_disas "$1"; }
 # One row per TU: "make-dir:build-goal:object:note". These either run WOLA, implement the
 # DFN spectrum/compose path or do per-bin spectral arithmetic that the C/Python parity gate
 # compares, and must stay fma-free so the scalar/NEON and C/Python multiply-then-add
-# contracts remain comparable. The gain chain of samples/ is header-only and compiled into the
-# example programs; it only calls kernels audited elsewhere.
+# contracts remain comparable. The per-hop gain chain the example programs write out only calls
+# kernels audited elsewhere.
 ENTRIES='
 .:libaudio_pipeline_dfn.a:dfn_res_stage.o:shared DFN post-RES stage -- 2^-5/2^5 boundary scaling
 .:libaudio_pipeline_dfn.a:dfn_rate_bridge.o:DFN rate bridge -- native and 48 kHz WOLA, analysis windows
