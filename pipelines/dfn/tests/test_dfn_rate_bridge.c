@@ -15,6 +15,12 @@
 #include "utility/mem_align.h"   /* ALIGN16 */
 #include "dfn/tests/dfn_test_fixture.h"
 
+/* The tolerance-identity input (300, 1000, 2500 Hz) in the precision of T, and the same tones as
+ * the reference at the exact delayed time. */
+#define THREE_TONES(T, SIN, PI, t) \
+    ((T)0.3 * SIN((T)2 * PI * (T)300 * t) + (T)0.2 * SIN((T)2 * PI * (T)1000 * t) + \
+     (T)0.1 * SIN((T)2 * PI * (T)2500 * t))
+
 #define MAX_FFT 512
 #define MAX_HOPS 200
 
@@ -69,9 +75,9 @@ static DfnRateBridgeConfig bridge_config(int sr, int fft) {
     return cfg;
 }
 
-/* prefill (the schedule's largest deficit) + 16 + (L + 1)*512*sr/48000 + 16. */
-static int expected_added_delay(int sr, int hop) {
-    return dfn_fixture_bridge_added_delay(sr, hop);
+/* prefill (the schedule's largest deficit) + 16 + (L + 1)*512*sr/48000 + 16, in sixths. */
+static int expected_added_delay_sixths(int sr, int hop) {
+    return dfn_fixture_bridge_added_delay_sixths(sr, hop);
 }
 
 /* Run `hops` hops of estimate=est, apply=app (either may be
@@ -101,6 +107,8 @@ static int run_grid(const Grid *g) {
     int hop = g->fft / 2, hops = 200, n = hops * hop;
     int schedule[16];
     int t, k, delay, frames, impulse_at = 40 * hop + 7, peak = -1;
+    int num = 0, den = 0;
+    double exact, centroid = 0.0, centroid_mass = 0.0;
     float peak_abs = 0.0f, max_err = 0.0f, max_sig = 0.0f;
     double near_energy = 0.0, total_energy = 0.0;
 
@@ -110,11 +118,16 @@ static int run_grid(const Grid *g) {
         dfn_rate_bridge_n_freqs(b) != g->fft / 2 + 1)
         return 2;
     delay = dfn_rate_bridge_added_delay_samples(b);
-    if (delay != expected_added_delay(g->sr, hop)) {
-        fprintf(stderr, "  %d/%d: added delay %d, expected %d\n", g->sr, g->fft,
-                delay, expected_added_delay(g->sr, hop));
+    if (dfn_rate_bridge_added_delay_exact(b, &num, &den) != 0 ||
+        den != DFN_RATE_BRIDGE_DELAY_DENOMINATOR ||
+        num != expected_added_delay_sixths(g->sr, hop) ||
+        delay != num / den) {
+        fprintf(stderr, "  %d/%d: added delay %d = %d/%d, expected %d/%d\n", g->sr, g->fft,
+                delay, num, den, expected_added_delay_sixths(g->sr, hop),
+                DFN_RATE_BRIDGE_DELAY_DENOMINATOR);
         return 3;
     }
+    exact = (double)num / (double)den;
 
     /* Schedule and cumulative frame count (the count contract). The bridge
      * calibrated its prefill over eight hops; a grid whose deficit outgrew
@@ -129,8 +142,10 @@ static int run_grid(const Grid *g) {
     }
     for (k = 0; k < n; ++k) if (g_out[k] != 0.0f) return 7;   /* silence in, silence out */
 
-    /* Impulse in P: the output peak sits exactly hop + added delay later
-     * (the hop is the host-style WOLA the bridge performs on P). */
+    /* Impulse in P: the output sits hop + the exact added delay later (the hop is the
+     * host-style WOLA the bridge performs on P). The round trip is a symmetric band-limited
+     * kernel, so its centroid is that position to a fraction of a sample, and the peak sample
+     * is the nearest one. */
     dfn_rate_bridge_reset(b);
     analyzer_reset(&ae);
     analyzer_reset(&ap);
@@ -142,11 +157,15 @@ static int run_grid(const Grid *g) {
         total_energy += (double)a * a;
         if (a > peak_abs) { peak_abs = a; peak = k; }
     }
-    /* A fractional stage delay (see dfn_fixture_bridge_delay_exact) moves it by one more. */
-    if (peak != impulse_at + hop + delay &&
-        (dfn_fixture_bridge_delay_exact(g->sr) || peak != impulse_at + hop + delay + 1)) {
-        fprintf(stderr, "  %d/%d: impulse at %d -> peak %d, expected %d\n",
-                g->sr, g->fft, impulse_at, peak, impulse_at + hop + delay);
+    for (k = peak - 24; k <= peak + 24; ++k) {
+        centroid += (double)k * g_out[k];
+        centroid_mass += g_out[k];
+    }
+    centroid /= centroid_mass;
+    if (fabs(centroid - (double)(impulse_at + hop) - exact) > 0.01 ||
+        fabs((double)peak - (double)(impulse_at + hop) - exact) >= 0.5) {
+        fprintf(stderr, "  %d/%d: impulse at %d -> peak %d centroid %.4f, expected %.4f\n",
+                g->sr, g->fft, impulse_at, peak, centroid, (double)(impulse_at + hop) + exact);
         return 9;
     }
     for (k = peak - 8; k <= peak + 8; ++k) near_energy += (double)g_out[k] * g_out[k];
@@ -160,24 +179,22 @@ static int run_grid(const Grid *g) {
     analyzer_reset(&ap);
     for (k = 0; k < n; ++k) {
         float t_s = (float)k / (float)g->sr;
-        g_signal[k] = 0.3f * sinf(2.0f * (float)M_PI * 300.0f * t_s) +
-                      0.2f * sinf(2.0f * (float)M_PI * 1000.0f * t_s) +
-                      0.1f * sinf(2.0f * (float)M_PI * 2500.0f * t_s);
+        g_signal[k] = THREE_TONES(float, sinf, (float)M_PI, t_s);
         g_out_b[k] = 0.5f * sinf(2.0f * (float)M_PI * 700.0f * t_s);   /* E */
     }
     if (run_bridge(b, &ae, &ap, g_out_b, g_signal, hops, g_out, NULL, 0) < 0) return 11;
     for (k = 4 * hop + delay + 2 * g->fft; k < n; ++k) {
-        float ref = g_signal[k - hop - delay];
+        /* The same three tones evaluated at the exact (possibly fractional) delayed time. */
+        double t_s = ((double)k - (double)hop - exact) / (double)g->sr;
+        float ref = (float)THREE_TONES(double, sin, M_PI, t_s);
         float err = fabsf(g_out[k] - ref);
         if (err > max_err) max_err = err;
         if (fabsf(ref) > max_sig) max_sig = fabsf(ref);
     }
-    printf("dfn_rate_bridge: %d Hz / fft %d: added delay %d samples, "
+    printf("dfn_rate_bridge: %d Hz / fft %d: added delay %d + %d/%d samples, "
            "round-trip max error %.2e (signal peak %.2f)\n", g->sr, g->fft,
-           delay, (double)max_err, (double)max_sig);
-    /* With a fractional stage delay the native signal is shifted by part of a sample, so the
-     * whole-sample comparison does not hold; the delay pin above still does. */
-    if (dfn_fixture_bridge_delay_exact(g->sr) && !(max_err < 5e-3f)) return 12;
+           delay, num - delay * den, den, (double)max_err, (double)max_sig);
+    if (!(max_err < 5e-3f)) return 12;
 
     /* E alone must not reach the output (identity heads apply to P). */
     dfn_rate_bridge_reset(b);

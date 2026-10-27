@@ -2,6 +2,41 @@
 
 ## Unreleased
 
+### DFN2 multi-frame export: N frames per invocation
+
+- `DeepFilterNet2/export_onnx.py --frames-per-call N` (default 1) and `inference.py calib --frames-per-call N`: the graph
+  takes `N + 2` feature frames and returns the heads of N consecutive frames; the three GRUs run over the N frames as one
+  sequence (5 GRU nodes, as before), `h_gru_out` is the state after the last frame, and `df_convp_history_out` is the last
+  five frames of the pathway input (for N > 5 the last five frames of the DF input convolution are computed from their own
+  slice of the `spec` window, because the in-place rule forbids a state output produced by a Slice). N = 1 writes the same
+  ONNX and JSON bytes as before (compared under a fixed `PYTHONHASHSEED`, 0..3; the exporter's optimizer pass order comes
+  from a set, so the bytes differ between runs with a random seed, as they did before this change).
+  Both command lines, and `StatelessDFN2Heads`, refuse an N outside 1..64 (`MAX_FRAMES_PER_CALL`, the C host's limit).
+- Export metadata of an N > 1 graph: `frames_per_call`, `chunk_window_alignment`; `input_feature_frames` = N + 2 and
+  `output_frames_per_invocation` = N. `onnx_streaming_contract.validate_frames_per_call` refuses a graph whose metadata
+  disagrees with its shapes and a one-frame graph that records `frames_per_call`.
+- C: `DFN2_FRAMES_PER_CALL` (1..64, `#error` outside; AINR Makefile variable of the same name, the `-D` flag is added only
+  when N != 1). Window of N + 2 frames, first call ready after `M + N` pushed frames and then every N,
+  `dfn2_model_io_frame_slot()`, `DFN2ModelIoDescriptor.frames_per_call` (the struct grows from 72 to 76 bytes) and
+  `input_frames` = N + 2, commit composes the N frames in one burst, `post_process` still returns one hop per call, latency
+  `1 + M + D + N - 1` hops (`DFN2_PREPOST_LATENCY_FRAMES`). N > 1 is folded into the pool hash and objects built for
+  different N do not link (`dfn2_frames_per_call<N>`). A unit written for one frame per call does not compile for N > 1
+  unless it defines `DFN2_MULTI_FRAME_HOST`; the pipelines DFN stage stays at N = 1.
+- `DFN2_MODEL_IO_LAYOUT_VERSION` stays 8 and `DFN2_PREPOST_CARVE_VERSION` stays 7: the state tensors do not change, and
+  with N = 1 the pool size, hash and compile lines are those of a build without the option (rationale in
+  `DeepFilterNet2/README.md`, "Multi-frame export").
+- Tests `tests/test_dfn2_frames_per_call.py` and `tests/test_dfn2_frames_per_call_c.py`, added to `make test-pairs`.
+- Not measured: a target toolchain, GRU support for a sequence longer than one, quantized accuracy of an N-frame graph (all
+  equivalence checks use random-initialised models and a stand-in accelerator).
+
+### Calibration: the NPZ report no longer overwrites the graph sidecar
+
+- A calibration run exports `<stem>.onnx` and the exporter writes that graph's metadata to `<stem>.json`; in NPZ mode the
+  calibration report went to the same `<stem>.json` and replaced it (the graph's `input_schema` was lost). The NPZ report is
+  now `<stem>.calib.json` (`calibration_io.calibration_report_path()`). The BIN `manifest.json` and the ONNX `<onnx>.json`
+  keep their names. `PTQ/calib_analyze.py` reads `<stem>.calib.json` first and falls back to `<stem>.json` only when that
+  file says `artifact_format` is `numpy_npz`, so archives written before still load.
+
 ### DFN2 / DFN3 lookahead pairs: 15 legal pairs, exported and run
 
 - Legal pairs are `mask_lookahead` in 0..2 and `df_lookahead` in

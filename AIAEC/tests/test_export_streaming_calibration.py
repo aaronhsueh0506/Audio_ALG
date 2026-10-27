@@ -23,7 +23,7 @@ from AIAEC._streaming_calibration import (
     input_range_report,
 )
 from AIAEC._streaming_export import state_precision_policy
-from calibration_io import write_calibration_artifact
+from calibration_io import calibration_report_path, write_calibration_artifact
 
 
 GRID = SignalGrid(16000, 512, 512, 256)
@@ -104,10 +104,15 @@ def ulcnet_pair(tmp_path_factory):
         calibration.main('Align_ULCNet')
 
     def _read(path):
-        with open(os.path.splitext(str(path))[0] + '.json') as stream:
+        with open(path) as stream:
             return json.load(stream)
 
-    return _read(graph), _read(capture)
+    # The run exported its own graph next to the archive; that graph's
+    # sidecar must have survived beside the calibration report.
+    own_graph = _read(os.path.splitext(str(capture))[0] + '.json')
+    assert 'input_schema' in own_graph and 'seed' not in own_graph
+    return (_read(os.path.splitext(str(graph))[0] + '.json'),
+            _read(calibration_report_path(capture, 'npz')))
 
 
 def test_calibration_and_graph_agree_on_the_d_chain(ulcnet_pair):

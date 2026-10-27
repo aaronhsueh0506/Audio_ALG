@@ -12,6 +12,9 @@
 #include "dfn/dfn_unit_partition.h"
 #include "audio_window.h"
 
+/* The one pi of the fixtures (a double literal; the float-precision tones use its float rounding). */
+#define DFN_FIXTURE_PI 3.14159265358979
+
 /* The periodic sqrt-Hann window the pipelines analyse and synthesise with. */
 static inline void dfn_fixture_root_hann(float *window, int n) {
     ac_window_build(window, n);
@@ -40,9 +43,27 @@ static inline void dfn_fixture_multitone(float *dst, size_t count,
     for (i = 0; i < count; ++i) {
         float t = (float)i / (float)sample_rate, v = 0.0f;
         for (k = 0; k < 16; ++k)
-            v += 0.06f * sinf(2.0f * 3.14159265f * tones[k] * t + (float)k);
+            v += 0.06f * sinf(2.0f * (float)DFN_FIXTURE_PI * tones[k] * t + (float)k);
         dst[i] = v;
     }
+}
+
+/* Hann-windowed sinc, 2 * half + 1 taps: kernel[m + half] is the low-pass of normalised cutoff
+ * `cutoff_norm` sampled at m - shift, windowed over +-(half + 1). Returns the kernel sum, which
+ * the callers divide by so the DC gain is exactly one. */
+static inline double dfn_fixture_hann_sinc(double *kernel, int half, double cutoff_norm,
+                                           double shift) {
+    double wsum = 0.0;
+    int m;
+    for (m = -half; m <= half; ++m) {
+        double u = (double)m - shift;
+        double x = 2.0 * cutoff_norm * u;
+        double sinc = fabs(x) < 1e-12 ? 1.0 : sin(DFN_FIXTURE_PI * x) / (DFN_FIXTURE_PI * x);
+        double w = 0.5 + 0.5 * cos(DFN_FIXTURE_PI * u / (double)(half + 1));
+        kernel[m + half] = 2.0 * cutoff_norm * sinc * w;
+        wsum += kernel[m + half];
+    }
+    return wsum;
 }
 
 /* Test-side Hann-windowed-sinc low-pass (odd `taps`, zero-phase by
@@ -53,16 +74,10 @@ static inline void dfn_fixture_multitone(float *dst, size_t count,
 static inline void dfn_fixture_lowpass(const float *in, float *out, int n,
                                        int taps, float cutoff_norm) {
     double kernel[257];
-    double wsum = 0.0;
+    double wsum;
     int half = taps / 2, i, k;
     if (taps > 257) taps = 257, half = 128;
-    for (k = -half; k <= half; ++k) {
-        double x = 2.0 * (double)cutoff_norm * (double)k;
-        double sinc = k == 0 ? 1.0 : sin(3.14159265358979 * x) / (3.14159265358979 * x);
-        double w = 0.5 + 0.5 * cos(3.14159265358979 * (double)k / (double)(half + 1));
-        kernel[k + half] = 2.0 * (double)cutoff_norm * sinc * w;
-        wsum += kernel[k + half];
-    }
+    wsum = dfn_fixture_hann_sinc(kernel, half, (double)cutoff_norm, 0.0);
     for (i = 0; i < n; ++i) {
         double acc = 0.0;
         for (k = -half; k <= half; ++k) {
@@ -104,21 +119,41 @@ static inline int dfn_fixture_half_mask_infer(void *user, const DFN2PrepostInput
  * the frame open, or never fetch it. */
 enum { BP_RUN, BP_FAIL, BP_OPEN, BP_UNFETCHED };
 
-/* The stage's output delay at 48 kHz, (L + 1) * 512 samples with L = mask + df lookahead, in
- * native samples at `sr` (8 or 16 kHz): a whole number only when L + 1 is a multiple of 3
- * (the shipped 1/1 pair). Otherwise the rate bridge rounds it down, and its output trails the
- * input by an extra fraction of a sample. */
+/* The stage's output delay at 48 kHz, (L + 1) * 512 samples with L = mask + df lookahead. In
+ * native samples at `sr` (8 or 16 kHz) it is a whole number only when L + 1 is a multiple of 3
+ * (the shipped 1/1 pair); otherwise the rate bridge's exact delay carries a third of a sample. */
 #define DFN_FIXTURE_STAGE_DELAY_48K ((DFN2_MASK_LOOKAHEAD + DFN2_DF_LOOKAHEAD + 1) * DFN2_HOP_LEN)
-static inline int dfn_fixture_bridge_delay_exact(int sr) {
-    return (long long)DFN_FIXTURE_STAGE_DELAY_48K * sr % DFN2_SR == 0;
+
+/* Native samples, in sixths, the rate bridge adds at `sr` / `hop`: the prefill of the grid's
+ * schedule, the 16-sample group delay of each resampler and the stage's delay (shipped pair at
+ * 16 kHz hop 128 / 16 kHz hop 256 / 8 kHz hop 128: 672 / 629 / 330 samples). */
+static inline int dfn_fixture_bridge_added_delay_sixths(int sr, int hop) {
+    int prefill = (sr == 16000 && hop == 128) ? 128 : (sr == 16000 && hop == 256) ? 85 : 42;
+    return (prefill + 16 + 16) * 6 + (int)((long long)DFN_FIXTURE_STAGE_DELAY_48K * sr / 8000);
 }
 
-/* Native samples the rate bridge adds at `sr` / `hop`: the prefill of the grid's schedule, the
- * 16-frame group delay of each resampler and the stage's delay (672 / 629 / 330 for the shipped
- * pair at 16 kHz hop 128 / 16 kHz hop 256 / 8 kHz hop 128). */
+/* The same delay floored to whole native samples (dfn_rate_bridge_added_delay_samples()). */
 static inline int dfn_fixture_bridge_added_delay(int sr, int hop) {
-    int prefill = (sr == 16000 && hop == 128) ? 128 : (sr == 16000 && hop == 256) ? 85 : 42;
-    return prefill + 16 + (int)((long long)DFN_FIXTURE_STAGE_DELAY_48K * sr / DFN2_SR) + 16;
+    return dfn_fixture_bridge_added_delay_sixths(sr, hop) / 6;
+}
+
+/* out[i] = in[i - delay] for a delay of `delay_sixths` / 6 native samples, by a Hann-windowed
+ * sinc of 129 taps (exact for a whole delay). Exact only for content well below Nyquist; the
+ * first and last 64 samples see a truncated kernel. */
+static inline void dfn_fixture_delay_sixths(const float *in, float *out, int n, int delay_sixths) {
+    const int whole = delay_sixths / 6;
+    const double frac = (double)(delay_sixths % 6) / 6.0;
+    double kernel[129], wsum;
+    int i, m;
+    wsum = dfn_fixture_hann_sinc(kernel, 64, 0.5, frac);
+    for (i = 0; i < n; ++i) {
+        double acc = 0.0;
+        for (m = -64; m <= 64; ++m) {
+            int j = i - whole - m;
+            if (j >= 0 && j < n) acc += kernel[m + 64] * (double)in[j];
+        }
+        out[i] = (float)(acc / wsum);
+    }
 }
 
 #endif /* DFN_TEST_FIXTURE_H */

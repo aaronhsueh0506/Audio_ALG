@@ -14,7 +14,8 @@
  *   ./mcab_external_static [aec-preset] [--nr-preset mild|moderate|balanced|aggressive]
  *       [--sample-rate 16000|48000] [--fft-size 256|512|1024]
  *       [--capture-proxy 0|1|2|3] [--legacy-amin] [--no-cng] [--no-res]
- *   ./mcab_external_static --print-mem-size [same options] */
+ *   ./mcab_external_static --print-mem-size [same options]
+ * Numbers are whole decimal ints. Exit: 0 done, 1 refused config or failed run, 2 command line. */
 
 #include <stdio.h>
 #include <stdlib.h>
@@ -27,6 +28,7 @@
 #include "anr.h"
 #include "audio_stft.h"
 #include "mcab_sample_post.h"
+#include "common/example_cli.h"
 #include "utility/mem_align.h"
 #include "utility/simd_kernels.h"
 #include "utility/simd_kernel_nn.h"   /* skn_all_finite_f32 */
@@ -281,6 +283,22 @@ static void fill_hop(float* microphones, float* reference,
     }
 }
 
+/* The whole-number value of argv[*i] (an option name): *i moves onto it. 2, with a message, when
+ * the value is missing or is not an int. */
+static int int_option(int argc, char* argv[], int* i, int* value) {
+    const char* name = argv[*i];
+    if (*i + 1 >= argc) {
+        fprintf(stderr, "%s: %s needs a value\n", argv[0], name);
+        return 2;
+    }
+    if (example_cli_parse_int(argv[*i + 1], value) != 0) {
+        fprintf(stderr, "%s: %s '%s' is not an integer\n", argv[0], name, argv[*i + 1]);
+        return 2;
+    }
+    ++*i;
+    return 0;
+}
+
 int main(int argc, char* argv[]) {
     AecPreset preset = AEC_PRESET_BALANCED;
     AnrMode nr_mode = ANR_MODE_BALANCED;
@@ -310,17 +328,17 @@ int main(int argc, char* argv[]) {
             no_cng = 1;
         } else if (strcmp(argv[i], "--no-res") == 0) {
             no_res = 1;
-        } else if (strcmp(argv[i], "--sample-rate") == 0 &&
-                   i + 1 < argc) {
-            sample_rate = atoi(argv[++i]);
-        } else if (strcmp(argv[i], "--fft-size") == 0 &&
-                   i + 1 < argc) {
-            fft_size = atoi(argv[++i]);
-        } else if (strcmp(argv[i], "--capture-proxy") == 0 &&
-                   i + 1 < argc) {
-            capture_proxy = atoi(argv[++i]);
-        } else if (strcmp(argv[i], "--nr-preset") == 0 &&
-                   i + 1 < argc) {
+        } else if (strcmp(argv[i], "--sample-rate") == 0) {
+            if (int_option(argc, argv, &i, &sample_rate) != 0) return 2;
+        } else if (strcmp(argv[i], "--fft-size") == 0) {
+            if (int_option(argc, argv, &i, &fft_size) != 0) return 2;
+        } else if (strcmp(argv[i], "--capture-proxy") == 0) {
+            if (int_option(argc, argv, &i, &capture_proxy) != 0) return 2;
+        } else if (strcmp(argv[i], "--nr-preset") == 0) {
+            if (i + 1 >= argc) {
+                fprintf(stderr, "%s: --nr-preset needs a value\n", argv[0]);
+                return 2;
+            }
             nr_mode = parse_nr_mode(argv[++i]);
         } else if (argv[i][0] != '-') {
             preset = parse_preset(argv[i]);
@@ -333,7 +351,7 @@ int main(int argc, char* argv[]) {
                 "[--legacy-amin] [--no-cng] [--no-res] [--print-mem-size]\n"
                 "AEC preset: 0=mild, 1=balanced, 2=aggressive, 3=no_floor; names also accepted.\n",
                 argv[0]);
-            return 1;
+            return 2;
         }
     }
 

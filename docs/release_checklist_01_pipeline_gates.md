@@ -131,6 +131,8 @@ Pass conditions:
       `4ch_aec_bf_nr_res/tests/conv_chain_mcab.h`).
 - [ ] `libaudio_pipeline_mcab.a` holds `mcab.o` only and references no SRP-PHAT/BF symbol; the
       sample helpers (`mcab_sample_flow.o`, `mcab_sample_beam.o`) are not in it.
+- [ ] `make libaudio_pipeline_mcab.a` builds with `NR_DIR` absent (the archive needs only audiolib common and
+      lib/aec; check SP-S21 in `pipelines/scripts/test_build_isolation.sh`).
 - [ ] SIMD/scalar parity passes.
 - [ ] All three product grids pass.
 

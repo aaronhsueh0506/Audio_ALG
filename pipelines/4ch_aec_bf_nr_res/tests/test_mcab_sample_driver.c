@@ -9,6 +9,10 @@
 #include <stdio.h>
 #include <string.h>
 
+#ifndef M_PI
+#define M_PI 3.14159265358979323846
+#endif
+
 typedef struct Probe {
     int parse_rc,setup_rc,read_rc,process_rc,consume_rc;
     int cleaned,processed,consumed,finished,nonfinite,frames,finite,completed;
@@ -37,7 +41,7 @@ static int finish(void *u,McabSampleHopView *v,int frames) {
 static void cleanup(void *u) {((Probe*)u)->cleaned++;}
 static void complete(void *u) { Probe *p=u;assert(p->cleaned==1);p->completed++; }
 static int run(Probe *p) {
-    static const McabSampleOps ops={parse,2,setup,read_hop,process,consume,
+    static const McabSampleOps ops={parse,setup,read_hop,process,consume,
                                    nonfinite,finish,cleanup,complete};
     char *args[]={"probe",NULL};return mcab_sample_main(1,args,&ops,p);
 }
@@ -71,7 +75,7 @@ int main(void) {
     p=fresh();p.output[1]=NAN;assert(run(&p)==1 && p.nonfinite==1 && p.cleaned==1 && p.consumed==0);
     p=fresh();p.output[1]=NAN;p.finite=0;assert(run(&p)==0 && p.nonfinite==0 && p.consumed==3);
     {   /* finish is optional: NULL means success after the hop loop. */
-        static const McabSampleOps no_finish={parse,2,setup,read_hop,process,
+        static const McabSampleOps no_finish={parse,setup,read_hop,process,
                                               NULL,NULL,NULL,cleanup,complete};
         char *args[]={"probe",NULL};
         p=fresh();assert(mcab_sample_main(1,args,&no_finish,&p)==0);
@@ -84,9 +88,9 @@ int main(void) {
     assert(mcab_sample_scan_cli(2,missing,opts,2,&seen,set,unknown)==2);
     char *help[]={"probe","--help","--bogus"};
     assert(mcab_sample_scan_cli(3,help,opts,2,&seen,set,unknown)==1);
-    McabSampleSpatialOptions o;char *legacy[]={"probe","--sample-rate","16000Hz"};
-    assert(mcab_sample_parse_spatial_cli(3,legacy,0,&o)==0 && o.sample_rate==16000);
-    assert(mcab_sample_parse_spatial_cli(3,legacy,1,&o)==2);
+    McabSampleSpatialOptions o;char *trailing[]={"probe","--sample-rate","16000Hz"};
+    assert(mcab_sample_parse_spatial_cli(3,trailing,0,&o)==2);
+    assert(mcab_sample_parse_spatial_cli(3,trailing,1,&o)==2);
     {   /* Strict numbers: empty, padded, trailing garbage, outside int, non-finite. */
         static const char *bad_int[]={"", " 3", "3 ", "x3", "3x", "+-1", "2147483648", "-2147483649",
                                       "99999999999999999999999"};
@@ -97,9 +101,41 @@ int main(void) {
         assert(example_cli_parse_int("-2147483648",&iv)==0 && iv==-2147483647-1);
         assert(example_cli_parse_int("+3",&iv)==0 && iv==3);
         assert(example_cli_parse_float("-0.5",&fv)==0 && fv==-0.5f);
-        char *empty_doa[]={"probe","--print-mem-size","--sample-rate","16000","--fixed-doa-deg",""};
-        assert(mcab_sample_parse_spatial_cli(6,empty_doa,1,&o)==2);
-        assert(mcab_sample_parse_spatial_cli(6,empty_doa,0,&o)==0);
+        static const char *int_opts[]={"--sample-rate","--fft-size"};
+        static const char *float_opts[]={"--uca-radius-m","--fixed-doa-deg"};
+        size_t m;int raw;
+        /* Both modes refuse a bad number of every numeric option. */
+        for(raw=0;raw<2;++raw){
+            for(m=0;m<2;++m){
+                for(k=0;k<sizeof(bad_int)/sizeof(bad_int[0]);++k){
+                    char *argv[]={"probe","--print-mem-size","--sample-rate","16000",
+                                  (char*)int_opts[m],(char*)bad_int[k]};
+                    assert(mcab_sample_parse_spatial_cli(6,argv,raw,&o)==2);
+                }
+                for(k=0;k<sizeof(bad_float)/sizeof(bad_float[0]);++k){
+                    char *argv[]={"probe","--print-mem-size","--sample-rate","16000",
+                                  (char*)float_opts[m],(char*)bad_float[k]};
+                    assert(mcab_sample_parse_spatial_cli(6,argv,raw,&o)==2);
+                }
+                {   /* An option without its value is a rejected argument. */
+                    char *argv_int[]={"probe","--print-mem-size",(char*)int_opts[m]};
+                    char *argv_float[]={"probe","--print-mem-size",(char*)float_opts[m]};
+                    assert(mcab_sample_parse_spatial_cli(3,argv_int,raw,&o)==2);
+                    assert(mcab_sample_parse_spatial_cli(3,argv_float,raw,&o)==2);
+                }
+            }
+        }
+        {   /* Valid numbers are taken as the conversion gives them; raw=0 defers the grid. */
+            char *good[]={"probe","--sample-rate","+48000","--fft-size","1024",
+                          "--uca-radius-m","0.0325","--fixed-doa-deg","-30.5"};
+            assert(mcab_sample_parse_spatial_cli(9,good,0,&o)==0);
+            assert(o.sample_rate==48000 && o.fft_size==1024 && o.uca_radius_m==0.0325f);
+            assert(o.fixed_doa==1 && o.fixed_doa_rad==-30.5f*(float)(M_PI/180.0));
+            char *off_grid[]={"probe","--sample-rate","44100","--fft-size","300"};
+            assert(mcab_sample_parse_spatial_cli(5,off_grid,0,&o)==0);
+            assert(o.sample_rate==44100 && o.fft_size==300);
+            assert(mcab_sample_parse_spatial_cli(1,off_grid,0,&o)==0 && o.sample_rate==16000);
+        }
     }
     ExampleCliDelayOptions d={AEC_DELAY_FIXED,1,0,0,1};
     assert(example_cli_delay_validate(&d,"probe")==0 && d.num_filters==DA_NUM_FILTERS);

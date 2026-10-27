@@ -4,7 +4,7 @@ Both bridges get identical native spectra (a host-style sqrt-Hann analysis of
 the same 16 kHz / 8 kHz signals) and the identity model.  The resamplers are
 the same C kernel on both sides, so the only differences are the FFT
 backends; the outputs must agree to float32 round-off, and the calibrated
-prefill / added delay must be the same integers.  Runs for the shipped
+prefill / added delay (floored and exact) must be the same integers.  Runs for the shipped
 lookahead pair and two others (``C_PAIRS``), the C rebuilt with the pair's
 ``-D`` overrides."""
 import ctypes
@@ -44,6 +44,9 @@ void bridge_parity_destroy(void *b) { dfn_rate_bridge_destroy((DfnRateBridge *)b
 int bridge_parity_hop(void *b) { return dfn_rate_bridge_hop_size((DfnRateBridge *)b); }
 int bridge_parity_added_delay(void *b) {
     return dfn_rate_bridge_added_delay_samples((DfnRateBridge *)b);
+}
+int bridge_parity_added_delay_exact(void *b, int *numerator, int *denominator) {
+    return dfn_rate_bridge_added_delay_exact((DfnRateBridge *)b, numerator, denominator);
 }
 int bridge_parity_process(void *b, const float *est_re, const float *est_im,
                           const float *app_re, const float *app_im, float *out) {
@@ -88,6 +91,9 @@ def c_lib(pair, tmp_path_factory):
     lib.bridge_parity_hop.restype = ctypes.c_int
     lib.bridge_parity_added_delay.argtypes = [ctypes.c_void_p]
     lib.bridge_parity_added_delay.restype = ctypes.c_int
+    lib.bridge_parity_added_delay_exact.argtypes = [
+        ctypes.c_void_p, ctypes.POINTER(ctypes.c_int), ctypes.POINTER(ctypes.c_int)]
+    lib.bridge_parity_added_delay_exact.restype = ctypes.c_int
     lib.bridge_parity_process.argtypes = [ctypes.c_void_p, fp, fp, fp, fp, fp]
     lib.bridge_parity_process.restype = ctypes.c_int
     return lib
@@ -116,14 +122,10 @@ def _multitone(count, sample_rate):
                ).astype(np.float32)
 
 
-@pytest.mark.parametrize('sample_rate,fft', [(16000, 256), (16000, 512), (8000, 256)])
-def test_python_bridge_matches_the_c_bridge(c_lib, assets, sample_rate, fft):
+def _run_c_and_py(c_lib, assets, sample_rate, fft, e_signal, p_signal):
+    """Both bridges on the same host-analysed signals: (c_out, py_out, python bridge)."""
     hop = fft // 2
-    hops = 120
-    n = hops * hop
-    p_signal = _multitone(n, sample_rate)
-    e_signal = (0.5 * np.sin(2 * np.pi * 700.0 * np.arange(n) / sample_rate)).astype(np.float32)
-    p_signal[40 * hop + 7] += 1.0
+    n = len(p_signal)
     e_spec = _host_spectra(e_signal, fft)
     p_spec = _host_spectra(p_signal, fft)
 
@@ -137,6 +139,11 @@ def test_python_bridge_matches_the_c_bridge(c_lib, assets, sample_rate, fft):
     try:
         assert c_lib.bridge_parity_hop(handle) == hop == py.hop
         assert c_lib.bridge_parity_added_delay(handle) == py.added_delay
+        num, den = ctypes.c_int(0), ctypes.c_int(0)
+        assert c_lib.bridge_parity_added_delay_exact(
+            handle, ctypes.byref(num), ctypes.byref(den)) == 0
+        assert (num.value, den.value) == py.added_delay_exact
+        assert num.value // den.value == py.added_delay
         c_out = np.zeros(n, np.float32)
         py_out = np.zeros(n, np.float32)
         for t, (e, p) in enumerate(zip(e_spec, p_spec)):
@@ -151,17 +158,39 @@ def test_python_bridge_matches_the_c_bridge(c_lib, assets, sample_rate, fft):
             py_out[t * hop:(t + 1) * hop] = py.push(e, p)
     finally:
         c_lib.bridge_parity_destroy(handle)
+    return c_out, py_out, py
+
+
+@pytest.mark.parametrize('sample_rate,fft', [(16000, 256), (16000, 512), (8000, 256)])
+def test_python_bridge_matches_the_c_bridge(c_lib, assets, sample_rate, fft):
+    hop = fft // 2
+    n = 120 * hop
+    p_signal = _multitone(n, sample_rate)
+    e_signal = (0.5 * np.sin(2 * np.pi * 700.0 * np.arange(n) / sample_rate)).astype(np.float32)
+    p_signal[40 * hop + 7] += 1.0
+    c_out, py_out, _ = _run_c_and_py(c_lib, assets, sample_rate, fft, e_signal, p_signal)
     assert np.max(np.abs(c_out)) > 0.1
     np.testing.assert_allclose(py_out, c_out, rtol=2e-4, atol=2e-6)
-    # And both are the P signal delayed by hop + added delay, in the pass band. The
-    # stage's (L + 1) * 512 samples at 48 kHz are a whole number of native samples only
-    # for some pairs (L = 2 at 16 kHz and 8 kHz); otherwise the delay rounds down and the
-    # impulse lands up to one sample later.
-    delay = hop + py.added_delay
-    expected = 40 * hop + 7 + delay
-    exact = ((py.stage.output_delay_frames + 1) * 512 * sample_rate) % 48000 == 0
-    if exact:
-        assert int(np.argmax(np.abs(c_out))) == expected
-    else:
-        window = np.abs(c_out[expected - hop:expected + hop])
-        assert 0 <= int(np.argmax(window)) - hop <= 1
+
+
+@pytest.mark.parametrize('sample_rate,fft', [(16000, 256), (16000, 512), (8000, 256)])
+def test_an_impulse_lands_at_the_exact_added_delay(c_lib, assets, sample_rate, fft):
+    """The P signal comes back hop + the exact added delay later in both bridges. The round
+    trip is a symmetric band-limited kernel, so its centroid sits at that position to a
+    fraction of a sample, where the floored delay is off by up to 2/3 of a sample for the
+    pairs with L + 1 not a multiple of 3."""
+    hop = fft // 2
+    n = 120 * hop
+    at = 40 * hop + 7
+    p_signal = np.zeros(n, np.float32)
+    p_signal[at] = 1.0
+    c_out, py_out, py = _run_c_and_py(c_lib, assets, sample_rate, fft,
+                                      np.zeros(n, np.float32), p_signal)
+    num, den = py.added_delay_exact
+    expected = at + hop + num / den
+    for out in (c_out, py_out):
+        peak = int(np.argmax(np.abs(out)))
+        window = slice(peak - 24, peak + 25)
+        centroid = float((np.arange(n)[window] * out[window]).sum() / out[window].sum())
+        assert abs(centroid - expected) < 0.01, (centroid, expected)
+        assert abs(peak - expected) < 0.5

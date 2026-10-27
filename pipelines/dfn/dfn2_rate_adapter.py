@@ -304,13 +304,18 @@ class Dfn2RateBridge:
     (silence for its warm-up frames, as in C), synthesised at 48 kHz,
     downsampled, and emitted one native hop at a time from an output FIFO
     prefilled with the schedule's largest deficit.  ``added_delay`` is the
-    native-sample delay this adds to the host's own output; the C header
+    native-sample delay this adds to the host's own output, floored; the C header
     tabulates it for the shipped 1/1 pair (16 kHz/128: 672, 16 kHz/256: 629,
-    8 kHz/128: 330).
+    8 kHz/128: 330).  ``added_delay_exact`` is the same delay without the floor,
+    ``(numerator, DELAY_DENOMINATOR)`` native samples: the stage's
+    ``(L + 1) * 512 * sr / 48000`` is a whole number only when ``L + 1`` is a
+    multiple of 3, and every other term is a whole number of native samples.
     """
 
     N48_FFT = 1024
     N48_HOP = 512
+    #: Denominator of ``added_delay_exact``: 8 and 16 kHz give sixths and thirds.
+    DELAY_DENOMINATOR = 6
 
     def __init__(self, stage, sample_rate: int, fft_size: int = 0):
         fft = 256 if fft_size == 0 else int(fft_size)
@@ -335,9 +340,14 @@ class Dfn2RateBridge:
         self.prefill = self._calibrate_prefill()
         lat_up = self.up_e.latency_input_frames
         lat_down = self.down.latency_input_frames
-        self.added_delay = (self.prefill + lat_up
-                            + (stage.output_delay_frames + 1) * self.N48_HOP * sample_rate // 48000
-                            + lat_down * sample_rate // 48000)
+        # Every term but the stage's is a whole number of native samples; sr is a multiple
+        # of 8000, so (frames * sr) // 8000 is that product in sixths of a native sample.
+        stage_frames = (stage.output_delay_frames + 1) * self.N48_HOP
+        self.added_delay_exact = (
+            (self.prefill + lat_up) * self.DELAY_DENOMINATOR
+            + (stage_frames + lat_down) * sample_rate // 8000,
+            self.DELAY_DENOMINATOR)
+        self.added_delay = self.added_delay_exact[0] // self.DELAY_DENOMINATOR
         self.reset()
 
     def _calibrate_prefill(self) -> int:

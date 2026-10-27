@@ -159,9 +159,17 @@ make BACKEND=ne10 SIMD=1 selftest test_audio_utils test_pool \
 make test_ne10_force_c
 ```
 
+Run from `audiolib/` (the DOA/BF/VAD spatial chain), with `SIMD=0` and `SIMD=1`:
+
+```bash
+make SIMD=<0-or-1> WERROR=1 test         # includes audit-no-bf-test-symbols
+make SIMD=<0-or-1> WERROR=1 test-ubsan   # the same test under -fsanitize=undefined
+```
+
 Pass conditions:
 
 - [ ] No compiler warnings.
+- [ ] `test_spatial_third_party` passes plain and under UBSan (`test-ubsan`).
 - [ ] SIMD/scalar kernel parity passes.
 - [ ] FFT heap/static parity passes.
 - [ ] Resampler, WAV, invalid-input, and pool tests pass.

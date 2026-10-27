@@ -216,20 +216,20 @@ def calibration_main():
         from .export_onnx import (
             GRU_STATE_NAME,
             HEAD_OUTPUT_NAMES,
-            INPUT_FRAMES,
+            MAX_FRAMES_PER_CALL,
             StatelessDFN2Heads,
             export_graph,
-            feature_windows,
+            feature_chunk_windows,
             gru_state_slice_report,
         )
     except ImportError:
         from export_onnx import (
             GRU_STATE_NAME,
             HEAD_OUTPUT_NAMES,
-            INPUT_FRAMES,
+            MAX_FRAMES_PER_CALL,
             StatelessDFN2Heads,
             export_graph,
-            feature_windows,
+            feature_chunk_windows,
             gru_state_slice_report,
         )
 
@@ -247,9 +247,15 @@ def calibration_main():
     parser.add_argument('--onnx', default=None,
                         help='where to write the graph these tensors bind to '
                              '(default: <output>.onnx)')
+    parser.add_argument('--frames-per-call', type=int, default=1,
+                        help='heads per invocation of the graph (export_onnx.py '
+                             '--frames-per-call); --frames counts invocations')
     args = parser.parse_args()
     if args.frames <= 0:
         parser.error('--frames must be positive')
+    if not 1 <= args.frames_per_call <= MAX_FRAMES_PER_CALL:
+        parser.error('--frames-per-call must be in [1, %d]'
+                     % MAX_FRAMES_PER_CALL)
     try:
         artifact_format = resolve_calibration_format(args.output, args.format)
     except ValueError as error:
@@ -267,7 +273,8 @@ def calibration_main():
     model, params = load_model(SimpleNamespace(
         config=args.config, model=args.model
     ))
-    wrapper = StatelessDFN2Heads(model).eval()
+    wrapper = StatelessDFN2Heads(
+        model, frames_per_call=args.frames_per_call).eval()
     # The graph is exported (and parity-checked) in the same process, from the
     # same model instance the tensors below are recorded against, so the two
     # deployment artifacts cannot drift apart.
@@ -306,9 +313,12 @@ def calibration_main():
             )
             state = wrapper.initial_inputs()[2:]
             used = False
-            for erb_window, spec_window in zip(
-                    feature_windows(erb, model.mask_lookahead),
-                    feature_windows(spec, model.mask_lookahead)):
+            windows = zip(
+                feature_chunk_windows(erb, model.mask_lookahead,
+                                      args.frames_per_call),
+                feature_chunk_windows(spec, model.mask_lookahead,
+                                      args.frames_per_call))
+            for erb_window, spec_window in windows:
                 inputs = (erb_window, spec_window) + state
                 capture_calibration_inputs(captured, input_names, inputs)
                 outputs = wrapper(*inputs)
@@ -351,7 +361,7 @@ def calibration_main():
         'n_fft': params['N_FFT'],
         'win_len': params['WIN_LEN'],
         'hop_len': params['HOP_LEN'],
-        'input_feature_frames': INPUT_FRAMES,
+        'input_feature_frames': wrapper.input_frames,
         # The pair the windows below were captured for (the graph's metadata
         # carries it too): a calibration artifact is only valid for a host
         # built with the same pair.
@@ -362,6 +372,8 @@ def calibration_main():
         'source_files': source_files,
         'inputs': {name: _stats(value) for name, value in arrays.items()},
     }
+    if args.frames_per_call != 1:
+        report['frames_per_call'] = args.frames_per_call
     report['gru_state_slices'] = gru_state_slice_report(
         arrays[GRU_STATE_NAME], _stats, wrapper.gru_state_slices,
     )

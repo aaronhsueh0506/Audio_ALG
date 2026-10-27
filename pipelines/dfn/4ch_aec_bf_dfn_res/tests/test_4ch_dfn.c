@@ -326,7 +326,7 @@ static int run_res_is_active(void) {
  * conventional chain's NR-off output (fed the unit's beam, BF bypassed) delayed by the bridge's
  * added delay must match within the resampler round-trip error; a near-end impulse pins the
  * delay; the 48 kHz schedule is the documented one. */
-static int run_native(int sample_rate, int fft_size, int expected_added) {
+static int run_native(int sample_rate, int fft_size, int expected_sixths) {
     FourDfn *dfn = fdfn_create(sample_rate, fft_size, 0, NULL, 0);
     McabConfig ccfg = core_config(sample_rate, fft_size);
     ConvChain *conventional;
@@ -335,8 +335,10 @@ static int run_native(int sample_rate, int fft_size, int expected_added) {
     static float conv[TEST_FRAMES * 4 * 256];
     static float mine[TEST_FRAMES * 4 * 256];
     static float conv_lp[TEST_FRAMES * 4 * 256];
+    static float conv_ref[TEST_FRAMES * 4 * 256];
     static float mine_lp[TEST_FRAMES * 4 * 256];
     int hop, frames = TEST_FRAMES * 4, frame, i, ch, n, added, peak = -1, imp;
+    int num = 0, den = 0;
     float max_err = 0.0f, max_sig = 0.0f, peak_abs = 0.0f;
     int schedule[8], last, max_err_at = -1;
     long long total_frames = 0;
@@ -344,7 +346,10 @@ static int run_native(int sample_rate, int fft_size, int expected_added) {
     if (!dfn || dfn->bridge == NULL) return 1;
     hop = dfn->hop_size;
     added = dfn_rate_bridge_added_delay_samples(dfn->bridge);
-    if (added != expected_added) return 2;
+    if (dfn_rate_bridge_added_delay_exact(dfn->bridge, &num, &den) != 0 ||
+        den != DFN_RATE_BRIDGE_DELAY_DENOMINATOR || num != expected_sixths ||
+        added != num / den)
+        return 2;
     conventional = oracle_create(&ccfg, 1, 0);
     if (!conventional || conventional->hop != hop) return 3;
     n = frames * hop;
@@ -377,12 +382,13 @@ static int run_native(int sample_rate, int fft_size, int expected_added) {
     }
     if (total_frames != ((long long)n * DFN2_SR / sample_rate) / DFN2_HOP_LEN) return 5;
     /* Compare inside the pass band: both signals through the same low-pass
-     * (cut-off 0.35 fs), the conventional one delayed by `added`. */
+     * (cut-off 0.35 fs), the conventional one delayed by the exact added delay. */
     dfn_fixture_lowpass(conv, conv_lp, n, 129, 0.35f);
     dfn_fixture_lowpass(mine, mine_lp, n, 129, 0.35f);
+    dfn_fixture_delay_sixths(conv_lp, conv_ref, n, num);
     /* The test low-pass truncates at both ends: keep 64 samples clear. */
     for (i = added + 8 * hop + 64; i < n - 64; ++i) {
-        float ref_s = conv_lp[i - added], err;
+        float ref_s = conv_ref[i], err;
         if (abs(i - (imp + hop + added)) < 4 * hop + 128) continue;
         err = fabsf(mine_lp[i] - ref_s);
         if (err > max_err) { max_err = err; max_err_at = i; }
@@ -392,16 +398,13 @@ static int run_native(int sample_rate, int fft_size, int expected_added) {
         float a = fabsf(mine[i]);
         if (a > peak_abs) { peak_abs = a; peak = i; }
     }
-    printf("4ch_aec_bf_dfn_res: core %d Hz/hop %d: added delay %d, pass-band max "
+    printf("4ch_aec_bf_dfn_res: core %d Hz/hop %d: added delay %d + %d/%d, pass-band max "
            "error %.2e at %d (of %d; impulse at %d; signal peak %.2f), impulse "
-           "peak at +%d\n", sample_rate, hop, added, (double)max_err, max_err_at,
+           "peak at +%d\n", sample_rate, hop, added, num - added * den, den, (double)max_err, max_err_at,
            n, imp, (double)max_sig, peak - imp - hop);
-    /* A fractional stage delay (dfn_fixture_bridge_delay_exact) moves the impulse by one more
-     * sample and defeats the whole-sample comparison; the delay pin still holds. */
-    if (peak != imp + hop + added &&
-        (dfn_fixture_bridge_delay_exact(sample_rate) || peak != imp + hop + added + 1))
-        return 6;
-    if (dfn_fixture_bridge_delay_exact(sample_rate) && !(max_err < 1e-3f)) return 7;
+    /* The impulse peak is the sample nearest to the exact position imp + hop + num / den. */
+    if (abs(den * (peak - imp - hop) - num) * 2 >= den) return 6;
+    if (!(max_err < 1e-3f)) return 7;
     conv_destroy(conventional);
     fdfn_destroy(dfn);
     return 0;
@@ -536,9 +539,9 @@ int main(void) {
             return 1;
         }
     }
-    rc = run_native(16000, 256, dfn_fixture_bridge_added_delay(16000, 128));
+    rc = run_native(16000, 256, dfn_fixture_bridge_added_delay_sixths(16000, 128));
     if (rc) { fprintf(stderr, "4ch DFN 16 kHz/256 bridge gate failed: %d\n", rc); return 1; }
-    rc = run_native(16000, 512, dfn_fixture_bridge_added_delay(16000, 256));
+    rc = run_native(16000, 512, dfn_fixture_bridge_added_delay_sixths(16000, 256));
     if (rc) { fprintf(stderr, "4ch DFN 16 kHz/512 bridge gate failed: %d\n", rc); return 1; }
     {
         static const int grids[3][2] = {{48000, 1024}, {16000, 256}, {16000, 512}};

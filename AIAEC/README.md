@@ -189,7 +189,8 @@ Calibration formats:
 - --format bin: tensor/tensor_0000.bin, tensor/tensor_0001.bin, and so on, plus
   manifest.json. Each file is one complete ONNX input tensor, including batch
   dimension. This is the board-facing format.
-- --format npz: one NumPy archive plus a sibling JSON report.
+- --format npz: one NumPy archive plus `<name>.calib.json` beside it. The graph exported by the same run is
+  `<name>.onnx` with its own `<name>.json`; the report has a different name so the two never share a file.
 
 If --format is omitted, a .npz suffix selects NPZ; otherwise BIN is used.
 Generated calib/ directories are ignored by Git.

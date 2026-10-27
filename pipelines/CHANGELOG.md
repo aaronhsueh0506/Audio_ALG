@@ -3,6 +3,68 @@
 `Audio_ALG/pipelines`（含它建置的 `AINR`、`AIAEC` C 程式）的重要改動記錄在此，格式依
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/)。README 只寫現況，改動經過寫在這裡。
 
+## [Unreleased] — 2026-10-27 — Follow-up to the mcab round: strict CLI numbers in the static examples, per-goal producer scopes of the 4ch Makefile, exact rate-bridge delay, lib/aec rate guard, DFN2 frames per call (AINR)
+
+No DSP changed; for valid input the example programs' outputs are those of the previous entry (the 136 baseline-matrix
+rows of `mcab_raw`, `mcab_static` and `mcab_external_static` were compared before and after: only the three exit codes
+listed under "Behaviour changes" differ). The AEC behaviour hash `aec_python_behavior_hash()` is unchanged.
+
+### Changed
+- **`mcab_static` and `mcab_external_static` parse their numeric options strictly** (`--sample-rate`, `--fft-size`,
+  `--uca-radius-m`, `--fixed-doa-deg`, `--capture-proxy`) with `example_cli_parse_int()` / `_float()`, like `mcab_raw`, the
+  DFN2 and the ULCNet examples: a bad number, an option without its value and an unknown option exit 2. The shared
+  `mcab_sample_parse_spatial_cli()` no longer has an `atoi` / `atof` path; its `raw` argument now only selects the option
+  set (9 versus 5 options) and the parse-time checks of the grid, the radius and the file options. A number that parses but
+  names no grid or channel (`--sample-rate 44100`, `--capture-proxy 4`) is still refused when the config is built and exits
+  1. Still lenient: an unknown AEC preset or `--nr-preset` name falls back to balanced, and a repeated option keeps the
+  last value. Only `mono_aec_nr_res/main.c` still reads its numbers with `atoi()` (and the test helpers `pyc_drv.c` and
+  `dump_delay_parity.c`). New `4ch_aec_bf_nr_res/tests/test_cli_strict.sh <bin_dir>` runs the real binaries over 198 command
+  lines and is part of `make -C 4ch_aec_bf_nr_res test`; `tests/test_mcab_sample_driver.c` covers the shared parser in both
+  `raw` modes.
+- **The 4ch Makefile resolves, and keys its build directories on, only the producers a goal needs.**
+  `libaudio_pipeline_mcab.a` (and `lib`) needs audiolib common and lib/aec only (lib/nr, audiolib's spatial kernels may be
+  absent; `mcab.o` is byte-identical in every scope); `test_mcab` adds lib/nr; every other goal, `all` and `test` included,
+  keeps all four producers and its previous build signature. A goal that lacks a producer it needs stops and names it.
+  `make -s print-lib-path` now prints the flow archive of its own (smaller) scope; `print-bin-dir` / `print-obj-dir` still
+  print the directory of `make all`, and `PRINT_FOR=<goal>` selects the scope a query reports (`PRINT_FOR=all` locates the
+  copy of the archive that `make all` builds). `scripts/test_build_isolation.sh` gains SP-S21..SP-S25 for these rules.
+- **Rate bridge: exact added delay.** `dfn_rate_bridge_added_delay_exact(b, &numerator, &denominator)` returns the delay
+  without the floor as `numerator / DFN_RATE_BRIDGE_DELAY_DENOMINATOR` native samples (the denominator is 6, not reduced;
+  Python: `Dfn2RateBridge.added_delay_exact`). `dfn_rate_bridge_added_delay_samples()` is its floor, so its values (672 / 629
+  / 330 for the shipped pair) and every output are unchanged; the private struct field `added_delay` became
+  `added_delay_sixths` with the same size, so `DFN_RATE_BRIDGE_LAYOUT_VERSION` stays 3. The bridge test, the mono example
+  test and the 4ch example test now compare against the exact delay for every lookahead pair (impulse centroid within 0.01
+  sample of `hop + exact delay`) and keep their pass-band error gates (5e-3 and 1e-3) for the non-integer pairs too, with
+  the references evaluated at the fractional time. Pair 0/1 gives 501 1/3 / 458 1/3 / 244 2/3 at 16 kHz hop 128 / 16 kHz
+  hop 256 / 8 kHz hop 128. Python `pipeline.py` of the mono DFN example still aligns by the integer delay, and the two
+  `main.c` print the floored one.
+- **lib/aec** (submodule bump): `aec_config_defaults()` / `aec_config_from_preset()` give `filter_length = 0` (with the
+  `fft_size = 0` they already gave) for a sample rate other than 8000, 16000 or 48000 instead of forming `sr * 64` in `int`
+  (signed overflow for `sr >= 33554432`); `aec_get_mem_size()` returns 0, `aec_init()` NULL and `aec_create()` nonzero for
+  such a config. The 8 / 16 / 48 kHz configs are byte-identical. The pipeline rejection paths for 44100 now see
+  `filter_length = 0` instead of 2822.
+- **`AINR/DeepFilterNet2`: N frames per invocation** (`export_onnx.py --frames-per-call N`, C build `DFN2_FRAMES_PER_CALL`,
+  details in `AINR/CHANGELOG.md`). The pipelines DFN stage, rate bridge and `dfn2_stage.py` are one-frame units and stay at
+  N = 1: building them with `-DDFN2_FRAMES_PER_CALL=<N>`, N > 1, stops at the `DFN2_MULTI_FRAME_HOST` `#error` of
+  `dfn2_model_io.h`; at N = 1 the pool sizes and hashes are unchanged and `make test` / `make test-pairs` pass.
+- `docs/c_python_function_map.md`: rows for `dfn_rate_bridge_added_delay_exact`, `int_option` and the DFN2 frame-slot
+  helpers; the removed `mcab_sample_raw_int` / `mcab_sample_raw_float` are gone from the rows and the coverage table.
+
+### Behaviour changes
+- `mcab_static` exits 2 (was 1) for every command-line error: an unknown option or a missing value (both were 1) and a bad
+  number (it was read by `atoi` / `atof`, so `--sample-rate 16000Hz` ran as 16000 and an empty `--fixed-doa-deg` as 0, and
+  what was not a grid failed later at config, exit 1). `mcab_external_static` exits 2 for an unknown option (was 1) and,
+  like `mcab_static`, for a bad number or a missing value (`--nr-preset` included), which the old parser accepted or
+  refused with exit 1. Config refusals (a number that names no grid or channel) still exit 1. The baseline matrix has three
+  rows that change, in the exit code only: `static_err_unknown_flag`, `static_err_missing_value` and
+  `ext_err_unknown_flag` (136 rows compared, per the strict-parse run's `rowdiff.log`); it has no bad-number rows.
+- `make -s print-lib-path` in `4ch_aec_bf_nr_res` prints the narrow-scope archive. A script that wants the archive next to
+  the binaries of `make all` passes `PRINT_FOR=all`.
+
+### Removed
+- `McabSampleOps.cli_error_status` (every example passed 2): `mcab_sample_main()` returns 2 for a parse error.
+- `tests/pyc_parity/mutation_proof.sh` and the `--mutation-proof` / `--make-test` options of `pyc_parity_pipelines.sh`; this was the only checked-in proof that the parity gate can fail.
+
 ## [Unreleased] — 2026-10-27 — mcab: the 4-channel flow layer replaces `4aec_nr_res` and `audio_pipeline_4ch`; `dfn/` and `ulcnet/` folders; the `se_*` glue, `samples/` and `third_party/` are gone; DFN2 lookahead pairs
 
 Supersedes the 2026-10-24 entries that describe `FourAecNrRes`, `AudioPipeline4Ch`, their layouts 24 and 21 and

@@ -24,7 +24,7 @@ DFN3 的兩個 heads、layout 9、state 綁定、lookahead 與 API 範例見
 DFN2／DFN3 的 lookahead 是 M（`mask_lookahead`，0..2）與 D（`df_lookahead`，0..4）兩個獨立設定，共 15 個 pair，出貨為 1/1。
 pair 是模型合約，C 端在建置時以 `-DDFN2_MASK_LOOKAHEAD=<M> -DDFN2_DF_LOOKAHEAD=<D>`（DFN3 為 `DFN3_*`）加在每個編譯單元上，
 須與 checkpoint 一致；不同 pair 的目標檔連結失敗。模型延遲 DFN2（cascade）為 M+D hops，DFN3（平行）為 max(M, D) hops；
-`pre_process` 在前 M 拍回 0。規則見 [DFN2 細節頁](html/ainr_dfn2_detail.html)。
+`pre_process` 在前 M 拍回 0。DFN2 另可每次 invocation 跑 N 個 frame（`export_onnx.py --frames-per-call N` 加 `-DDFN2_FRAMES_PER_CALL=N`，預設 1；`pre_process` 每 N 拍回 1 一次，延遲多 N-1 hop，pipelines 固定 N=1）。規則見 [DFN2 細節頁](html/ainr_dfn2_detail.html)。
 
 ```text
 _config_defaults(&cfg, io_mode[, delay_depth])

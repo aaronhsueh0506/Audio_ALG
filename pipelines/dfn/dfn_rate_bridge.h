@@ -14,8 +14,12 @@
  * Delay added to the hosting pipeline's own output: prefill + up group delay +
  * (L + 1)*512*sr/48000 + down group delay native samples, L = DFN_RES_STAGE_LOOKAHEAD_FRAMES;
  * for the shipped 1/1 pair 16 kHz/hop 128 -> 672 (42.0 ms), 16 kHz/hop 256 -> 629 (39.3 ms),
- * 8 kHz/hop 128 -> 330 (41.3 ms), as returned by dfn_rate_bridge_added_delay_samples(). The
- * resamplers are not an identity (pass-band response applied twice).
+ * 8 kHz/hop 128 -> 330 (41.3 ms), as returned by dfn_rate_bridge_added_delay_samples(), which
+ * floors the sum. The stage term is a whole number of native samples only when L + 1 is a
+ * multiple of 3; every other term is whole, so the exact delay is the floored one plus 0, 1/3
+ * or 2/3 of a sample, from dfn_rate_bridge_added_delay_exact() (e.g. pair 0/1 at 16 kHz/hop
+ * 128: 501 1/3). The resamplers are not an identity (pass-band
+ * response applied twice).
  * Fail-open: with no model the stage emits P48 delayed L frames.
  * Memory: static pool with the 32-byte descriptor; the stage and resampler pools
  * are carved inside it. No heap after init, no stdio. */
@@ -35,6 +39,8 @@ extern "C" {
 #define DFN_RATE_BRIDGE_DESCRIPTOR_VERSION 1u
 /* Carve layout version; bumped on any change of pool size, carve order or descriptor. */
 #define DFN_RATE_BRIDGE_LAYOUT_VERSION     3u
+/* Denominator of dfn_rate_bridge_added_delay_exact(): sixths of a native sample. */
+#define DFN_RATE_BRIDGE_DELAY_DENOMINATOR  6
 
 /* Grid contract: hop = fft_size / 2 (50 % overlap). Supported native grids are
  * 8 kHz/256, 16 kHz/256 and 16 kHz/512 only. */
@@ -106,7 +112,15 @@ int dfn_rate_bridge_process(DfnRateBridge *b,
 int dfn_rate_bridge_hop_size(const DfnRateBridge *b);      /* -1 on NULL */
 int dfn_rate_bridge_n_freqs(const DfnRateBridge *b);       /* -1 on NULL */
 /* Native samples the bridge adds to the hosting pipeline's own latency. */
-int dfn_rate_bridge_added_delay_samples(const DfnRateBridge *b);
+int dfn_rate_bridge_added_delay_samples(const DfnRateBridge *b);   /* floor of the exact value */
+/* The same delay without the floor: *numerator / *denominator native samples, the denominator
+ * always DFN_RATE_BRIDGE_DELAY_DENOMINATOR (not reduced). With the grid's rate `sr` (8000 or
+ * 16000):
+ *     numerator = (prefill + up latency) * 6
+ *               + ((L + 1) * 512 + down latency in 48 kHz frames) * sr / 8000
+ * whose division is exact. Returns 0, or -1 on a NULL argument. */
+int dfn_rate_bridge_added_delay_exact(const DfnRateBridge *b, int *numerator,
+                                      int *denominator);
 DfnResStage *dfn_rate_bridge_stage(const DfnRateBridge *b);
 /* Frame counters for diagnostics: 48 kHz frames run in total and in the last hop. */
 void dfn_rate_bridge_get_counters(const DfnRateBridge *b,

@@ -3,7 +3,6 @@
 
 #include <stdio.h>
 #include <math.h>
-#include <stdlib.h>
 #include <string.h>
 
 #ifndef M_PI
@@ -69,31 +68,20 @@ int mcab_sample_scan_cli(int argc, char **argv, const McabSampleCliOption *optio
     return 0;
 }
 
-static int mcab_sample_raw_int(const char *text, int *value) {
-    return example_cli_parse_int(text, value) == 0;
-}
-static int mcab_sample_raw_float(const char *text, float *value) {
-    return example_cli_parse_float(text, value) == 0;
-}
-typedef struct SpatialCli { McabSampleSpatialOptions *out; int raw; } SpatialCli;
 static int mcab_sample_spatial_set(void *user, const char *name, const char *value) {
-    SpatialCli *cli = user;
-    McabSampleSpatialOptions *o = cli->out;
+    McabSampleSpatialOptions *o = user;
     if (!strcmp(name, "--print-mem-size")) o->print_mem_size = 1;
     else if (!strcmp(name, "--mic-raw")) o->mic_path = value;
     else if (!strcmp(name, "--ref-raw")) o->ref_path = value;
     else if (!strcmp(name, "--output-raw")) o->output_path = value;
     else if (!strcmp(name, "--vad-u8")) o->vad_path = value;
     else if (!strcmp(name, "--sample-rate")) {
-        if (cli->raw) { if (!mcab_sample_raw_int(value, &o->sample_rate)) return 2; }
-        else o->sample_rate = atoi(value);
+        if (example_cli_parse_int(value, &o->sample_rate) != 0) return 2;
     } else if (!strcmp(name, "--fft-size")) {
-        if (cli->raw) { if (!mcab_sample_raw_int(value, &o->fft_size)) return 2; }
-        else o->fft_size = atoi(value);
+        if (example_cli_parse_int(value, &o->fft_size) != 0) return 2;
     } else {
         float number;
-        if (cli->raw) { if (!mcab_sample_raw_float(value, &number)) return 2; }
-        else number = (float)atof(value);
+        if (example_cli_parse_float(value, &number) != 0) return 2;
         if (!strcmp(name, "--uca-radius-m")) o->uca_radius_m = number;
         else {
             o->fixed_doa = 1;
@@ -115,8 +103,7 @@ int mcab_sample_parse_spatial_cli(int argc, char **argv, int raw, McabSampleSpat
     memset(out, 0, sizeof(*out));
     out->sample_rate = raw ? 0 : 16000;
     out->uca_radius_m = 0.035f;
-    SpatialCli cli = {out, raw};
-    if (mcab_sample_scan_cli(argc, argv, spatial, raw ? 9 : 5, &cli,
+    if (mcab_sample_scan_cli(argc, argv, spatial, raw ? 9 : 5, out,
                       mcab_sample_spatial_set, mcab_sample_spatial_unknown) != 0) return 2;
     if (!raw) return 0;
     if (!out->print_mem_size && (!out->mic_path || !out->ref_path ||
@@ -133,7 +120,7 @@ int mcab_sample_main(int argc, char **argv, const McabSampleOps *ops, void *user
     McabSampleHopView hop = {0};
     hop.program = argv[0];
     int rc = ops->parse(user, argc, argv);
-    if (rc != 0) return rc == 1 ? 0 : ops->cli_error_status;
+    if (rc != 0) return rc == 1 ? 0 : 2;
     int result = 1, frames = 0;
     rc = ops->setup(user, &hop);
     if (rc == 2) { result = 0; goto cleanup; }

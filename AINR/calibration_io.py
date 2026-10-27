@@ -53,6 +53,19 @@ def resolve_calibration_format(output_path, requested=None):
     return result
 
 
+def calibration_report_path(output_path, artifact_format):
+    """Where the report of a calibration artifact lives.
+
+    BIN keeps ``manifest.json`` inside its directory. NPZ writes
+    ``<stem>.calib.json``: a calibration run also exports ``<stem>.onnx``,
+    whose exporter owns ``<stem>.json``, so the report must not take that name.
+    """
+    output_path = os.path.abspath(output_path)
+    if artifact_format == 'npz':
+        return os.path.splitext(output_path)[0] + '.calib.json'
+    return os.path.join(output_path, 'manifest.json')
+
+
 def sibling_onnx_path(output_path, override=None):
     """Where a calibration run writes the graph its tensors bind to.
 
@@ -105,7 +118,7 @@ def write_calibration_artifact(output_path, arrays, report, artifact_format):
         os.makedirs(os.path.dirname(output_path), exist_ok=True)
         report['artifact_format'] = 'numpy_npz'
         np.savez_compressed(output_path, **arrays)
-        report_path = os.path.splitext(output_path)[0] + '.json'
+        report_path = calibration_report_path(output_path, 'npz')
         with open(report_path, 'w', encoding='utf-8') as stream:
             json.dump(report, stream, indent=2, sort_keys=True)
             stream.write('\n')

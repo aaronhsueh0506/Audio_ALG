@@ -253,7 +253,8 @@ hop-lag: 輸出音訊落後輸入 M+D = 2 hops (heads M + DF future tap D, 串�
 <tr><td><code>out_frame</code>(C 出)</td><td>[512]</td><td>float32</td><td>1 hop</td><td>512</td><td>WOLA 輸出</td></tr>
 </table></div>
 <p class="note">上表圖側 shape 取自出貨 config 匯出的 <code>input_schema</code>/<code>output_schema</code>
-(串流圖 T 固定:輸入視窗 3 幀、輸出 1 幀);離線 <code>model.py heads()</code> 仍吃整段 T。</p>
+(串流圖 T 固定:輸入視窗 3 幀、輸出 1 幀);離線 <code>model.py heads()</code> 仍吃整段 T。
+<code>--frames-per-call N</code> 匯出的 graph 為輸入 N+2 幀、輸出 N 幀,state 不變,見 <a href="ainr_dfn2_detail.html">ainr_dfn2_detail</a>;本頁描述出貨的 N=1。</p>
 
 <h2>State 表</h2>
 <p><b>ONNX/匯出邊界</b>:<code>model.py heads()</code> 即匯出邊界——圖內只有網路
@@ -306,7 +307,7 @@ Slice 沿 axis 2 起於第 1 列,對齊由量化工具鏈決定,尚未在板上�
 <code>MASK_LOOKAHEAD + DF_LOOKAHEAD</code> 框,<u>相加而非取 max</u>。</li>
 <li>STFT framing 結構延遲:win−hop = 512 samples = 10.67 ms(WOLA 重疊)。</li>
 <li>Warm-up:<code>dfn2_compose_stream()</code> 前 M+D 次呼叫回 0(無輸出,不送 ISTFT);
-右端 flush 須再推 M+D 個全零 hop,加速器照跑。</li>
+右端 flush 須再推 M+D 個全零 hop,加速器照跑。N 個 frame 時以上再加 N-1 hop。</li>
 <li>正規化器 EMA warm-up:tau = 1.0 s(α=0.989,有效 tau 0.9644 s ≈ 90.4 框,3·tau ≈ 271 框);init 用 libDF linspace 值。</li>
 <li>對齊守衛:<code>tests/test_c_prepost.c: test_dfn_stream_alignment()</code> 用逐框變動的 mask/coefs 驗證
 <code>output_frame_index</code> 與逐 bin 3e-6 一致性,off-by-one 的配對無法以「輸出有限」矇混過關。</li>

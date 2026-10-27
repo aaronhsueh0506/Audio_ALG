@@ -1,6 +1,7 @@
 /* Rate bridge between a pipeline's 8/16 kHz grid and the DFN2 stage's 48 kHz grid;
  * see dfn_rate_bridge.h for the signal, clock and delay contract. */
 
+#include <limits.h>
 #include <stdint.h>
 #include <stdlib.h>
 #include <string.h>
@@ -27,7 +28,7 @@ struct DfnRateBridge {
     int fft_n;
     int hop_n;
     int prefill;
-    int added_delay;
+    int added_delay_sixths;   /* added delay in sixths of a native sample */
     FftHandle *fft_n_handle;
     FftHandle *fft48;
     DfnResStage *stage;
@@ -281,6 +282,7 @@ DfnRateBridge *dfn_rate_bridge_init_ex(void *mem, size_t bytes,
     DfnRateBridge *b;
     unsigned char *cursor;
     int lat_up, lat_down;
+    long long sixths;
     if (!mem || (uintptr_t)mem % BRIDGE_ALIGN != 0u || resolve(cfg, &r) != 0)
         return NULL;
     fill_descriptor(cfg, &r, &req);
@@ -357,11 +359,14 @@ DfnRateBridge *dfn_rate_bridge_init_ex(void *mem, size_t bytes,
     if (b->prefill < 0 || b->prefill > OUT_FIFO_CAP / 2 || lat_up < 0 ||
         lat_down < 0)
         return NULL;
-    /* Down latency is in 48 kHz input frames; the grids divide. */
-    b->added_delay = b->prefill + lat_up +
-                     (DFN_RES_STAGE_LOOKAHEAD_FRAMES + 1) * B48_HOP *
-                         cfg->sample_rate / DFN2_SR +
-                     lat_down * cfg->sample_rate / DFN2_SR;
+    /* Prefill and up latency are whole native samples; the stage and the down latency are
+     * 48 kHz frames, and sample_rate is a multiple of 8000, so frames * sample_rate / 8000
+     * is their native-sample value in sixths. */
+    sixths = ((long long)b->prefill + lat_up) * DFN_RATE_BRIDGE_DELAY_DENOMINATOR +
+             ((long long)(DFN_RES_STAGE_LOOKAHEAD_FRAMES + 1) * B48_HOP + lat_down) *
+                 cfg->sample_rate / 8000;
+    if (sixths > INT_MAX) return NULL;
+    b->added_delay_sixths = (int)sixths;
     clear_streams(b);
     return b;
 }
@@ -521,7 +526,15 @@ int dfn_rate_bridge_n_freqs(const DfnRateBridge *b) {
 }
 
 int dfn_rate_bridge_added_delay_samples(const DfnRateBridge *b) {
-    return b ? b->added_delay : -1;
+    return b ? b->added_delay_sixths / DFN_RATE_BRIDGE_DELAY_DENOMINATOR : -1;
+}
+
+int dfn_rate_bridge_added_delay_exact(const DfnRateBridge *b, int *numerator,
+                                      int *denominator) {
+    if (!b || !numerator || !denominator) return -1;
+    *numerator = b->added_delay_sixths;
+    *denominator = DFN_RATE_BRIDGE_DELAY_DENOMINATOR;
+    return 0;
 }
 
 DfnResStage *dfn_rate_bridge_stage(const DfnRateBridge *b) {

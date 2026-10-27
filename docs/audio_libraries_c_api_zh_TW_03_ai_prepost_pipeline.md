@@ -6,7 +6,7 @@
 額外 API：
 
 ```c
-int  dfn2_prepost_model_lookahead_frames(const DFN2Prepost *p);  /* = DFN2_MASK_LOOKAHEAD + DFN2_DF_LOOKAHEAD（出貨 1/1 為 2） */
+int  dfn2_prepost_model_lookahead_frames(const DFN2Prepost *p);  /* = DFN2_MASK_LOOKAHEAD + DFN2_DF_LOOKAHEAD + DFN2_FRAMES_PER_CALL - 1（出貨 1/1、每次 1 個 frame 為 2） */
 int  dfn2_prepost_layout_version(const DFN2Prepost *p);
 unsigned int dfn2_prepost_state_generation(const DFN2Prepost *p);  /* init 後 1；每次 _reset 與被拒的 commit 加 1 */
 int  dfn2_prepost_set_erb_matrices(DFN2Prepost *p, const float *erb_fwd, const float *erb_inv);
@@ -34,6 +34,7 @@ int  dfn2_prepost_output_frame_index(const DFN2Prepost *p, long long *frame);
   用來把輸出串流與其他同框時鐘的東西配對；還沒有輸出時回 `-1`。
 - 暖機：`_pre_process()` 的前 `M` 拍回 0（不要跑加速器）；輸出前 `M + D` 拍（出貨 1/1 為兩拍）是暖機：`_post_process()` 的 `*written` = 0
   （`out_hop` 仍然寫滿零），`_post_process_freq()` 的 `*valid` = 0。收尾 flush 要用全零 hop 再跑 `M + D` 拍，**加速器那幾拍也要照跑**。
+  DFN2 以 `-DDFN2_FRAMES_PER_CALL=N`（N > 1，需要 `export_onnx.py --frames-per-call N` 匯出的 graph）建置時，`_pre_process()` 每 N 拍回 1 一次、暖機與 flush 都多 `N - 1` 拍；pipelines 固定 N = 1（見 [ainr_dfn2_detail](html/ainr_dfn2_detail.html)）。
 - **`DFN2_IO_FREQ` 的頻譜是 `torch.stft(normalized=True)` 尺度**（乘了 1/√`DFN2_N_FFT` = 1/32），
   AIAEC 兩個模型交出的則是**未正規化**的 rfft。直接串接會剛好差 32 倍（過驅動或欠驅動），
   而且兩邊都偵測不到——都是量綱合法的 float 頻譜，ERB 特徵又是 EMA 正規化的。

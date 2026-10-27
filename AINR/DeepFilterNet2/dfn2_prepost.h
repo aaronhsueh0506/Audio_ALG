@@ -17,6 +17,15 @@
  * accelerator on them. L and D are build-time constants (dfn2_process.h) and
  * must equal the pair the graph was trained and exported for.
  *
+ * With N = DFN2_FRAMES_PER_CALL > 1 (a graph exported with --frames-per-call N)
+ * pre_process returns 1 on hops L + N - 1, L + 2N - 1, ... and 0 on the others;
+ * frame_inputs() publishes the N + 2 frame window and N heads, and commit
+ * composes the N frames in one burst. post_process still returns one hop per
+ * call, from the burst, so the output trails the input by N - 1 more hops:
+ * latency 1 + L + D + N - 1 hops (DFN2_PREPOST_LATENCY_FRAMES + 1), and the
+ * first L + D + N - 1 hops report written = 0. To flush, keep pushing zero hops
+ * and running the accelerator until the last real hop has been emitted.
+ *
  * DFN2_IO_FREQ spectra are torch.stft(normalized=True): the rfft of the
  * sqrt-Hann-windowed block times 1/sqrt(DFN2_N_FFT). AIAEC spectra are
  * unnormalised: scale by 1.0f / sqrtf(DFN2_N_FFT) into DFN2 and by
@@ -41,22 +50,28 @@ extern "C" {
  * descriptor content. */
 #define DFN2_PREPOST_CARVE_VERSION      7u
 
+/* Hops the output trails the input by on top of the framing. */
+#define DFN2_PREPOST_LATENCY_FRAMES \
+    (DFN2_MASK_LOOKAHEAD + DFN2_DF_LOOKAHEAD + DFN2_FRAMES_PER_CALL - 1)
+
 /* One shared alignment for every module (audiolib mem_align.h). */
 #define DFN2_PREPOST_ALIGNMENT 16u
 
-/* Flat element counts at the accelerator boundary, for binding tensors by count. */
+/* Flat element counts at the accelerator boundary, for binding tensors by count.
+ * The heads hold DFN2_FRAMES_PER_CALL frames, oldest first. */
 #define DFN2_PREPOST_ERB_WINDOW_ELEMENTS \
-    (DFN2_MODEL_INPUT_FRAMES * DFN2_N_ERB)
+    (DFN2_MODEL_WINDOW_FRAMES * DFN2_N_ERB)
 #define DFN2_PREPOST_SPEC_WINDOW_ELEMENTS \
-    (2 * DFN2_MODEL_INPUT_FRAMES * DFN2_DF_BINS)
+    (2 * DFN2_MODEL_WINDOW_FRAMES * DFN2_DF_BINS)
 #define DFN2_PREPOST_GRU_HIDDEN_ELEMENTS \
     (DFN2_MODEL_GRU_ROWS * DFN2_MODEL_GRU_HIDDEN)
 #define DFN2_PREPOST_CONVP_WINDOW_ELEMENTS \
     (DFN2_MODEL_ENCODER_CHANNELS * DFN2_MODEL_DF_PATHWAY_WINDOW * \
      DFN2_DF_BINS)
-#define DFN2_PREPOST_ERB_MASK_ELEMENTS   DFN2_N_ERB
-#define DFN2_PREPOST_COEFS_ELEMENTS      (DFN2_DF_BINS * DFN2_DF_ORDER * 2)
-#define DFN2_PREPOST_ALPHA_ELEMENTS      1
+#define DFN2_PREPOST_ERB_MASK_ELEMENTS   (DFN2_FRAMES_PER_CALL * DFN2_N_ERB)
+#define DFN2_PREPOST_COEFS_ELEMENTS \
+    (DFN2_FRAMES_PER_CALL * DFN2_DF_BINS * DFN2_DF_ORDER * 2)
+#define DFN2_PREPOST_ALPHA_ELEMENTS      DFN2_FRAMES_PER_CALL
 
 /* Which side of the transform the caller works on; fixed at init because it
  * decides the pool size (DFN2_IO_TIME also carves the output staging and the
@@ -103,10 +118,10 @@ typedef struct DFN2Prepost DFN2Prepost;
  * (read every state input before writing any state output). The feature windows
  * are read-only. Graph input names are given for binding by name. */
 typedef struct DFN2PrepostInputs {
-    /* 'erb'  (1,1,DFN2_MODEL_INPUT_FRAMES,DFN2_N_ERB) */
+    /* 'erb'  (1,1,DFN2_MODEL_WINDOW_FRAMES,DFN2_N_ERB) */
     const float (*erb_window)[DFN2_N_ERB];
-    /* 'spec' (1,2,DFN2_MODEL_INPUT_FRAMES,DFN2_DF_BINS) */
-    const float (*spec_window)[DFN2_MODEL_INPUT_FRAMES][DFN2_DF_BINS];
+    /* 'spec' (1,2,DFN2_MODEL_WINDOW_FRAMES,DFN2_DF_BINS) */
+    const float (*spec_window)[DFN2_MODEL_WINDOW_FRAMES][DFN2_DF_BINS];
     /* 'h_gru' (1,DFN2_MODEL_GRU_ROWS,1,DFN2_MODEL_GRU_HIDDEN); rows start at
      * DFN2_MODEL_GRU_ROW_ENCODER / _ERB / _DF */
     const float (*gru_hidden)[DFN2_MODEL_GRU_HIDDEN];
@@ -125,11 +140,13 @@ typedef struct DFN2PrepostInputs {
  * frame_inputs() NaN-fills the heads so frame_commit() detects a partial write.
  * The next-state tensors alias the inputs' state (nothing copied, not prefilled).
  * `coefs` is (DFN2_DF_BINS, DFN2_DF_ORDER, 2): bin, tap, re/im. `alpha` is a
- * one-element tensor. */
+ * one-element tensor. With N frames per call each head holds N such frames,
+ * frame-major and oldest first ('erb_mask' (1,1,N,DFN2_N_ERB), 'df_coefs'
+ * (1,N,bins,order*2), 'df_alpha' (1,N,1)). */
 typedef struct DFN2PrepostOutputs {
-    float *erb_mask;                /* 'erb_mask'  [DFN2_N_ERB]             */
-    float *coefs;                   /* 'df_coefs'  [bins][order][2]         */
-    float *alpha;                   /* 'df_alpha'  [1]                      */
+    float *erb_mask;                /* 'erb_mask'  [N][DFN2_N_ERB]          */
+    float *coefs;                   /* 'df_coefs'  [N][bins][order][2]      */
+    float *alpha;                   /* 'df_alpha'  [N]                      */
     float (*gru_hidden_next)[DFN2_MODEL_GRU_HIDDEN];          /* h_gru_out */
     float (*df_convp_window_next)[DFN2_MODEL_DF_PATHWAY_WINDOW]
                                  [DFN2_DF_BINS];  /* df_convp_history_out  */
@@ -186,7 +203,8 @@ int dfn2_prepost_hop_size(const DFN2Prepost *p);   /* or -1 */
 int dfn2_prepost_num_bins(const DFN2Prepost *p);   /* or -1 */
 int dfn2_prepost_io_mode(const DFN2Prepost *p);    /* or -1 */
 /* Frames of end-to-end lookahead the model costs on top of the framing:
- * DFN2_MASK_LOOKAHEAD + DFN2_DF_LOOKAHEAD. -1 on NULL. */
+ * DFN2_MASK_LOOKAHEAD + DFN2_DF_LOOKAHEAD, plus DFN2_FRAMES_PER_CALL - 1
+ * (DFN2_PREPOST_LATENCY_FRAMES). -1 on NULL. */
 int dfn2_prepost_model_lookahead_frames(const DFN2Prepost *p);
 /* The graph contract this build binds. -1 on NULL. */
 int dfn2_prepost_layout_version(const DFN2Prepost *p);
@@ -200,7 +218,9 @@ int dfn2_prepost_set_erb_matrices(DFN2Prepost *p, const float *erb_fwd,
 
 /* Runtime attenuation limit in dB (0 disables), applied by the compose stage.
  * Between hops only. Returns 0, or -1 on NULL, a non-finite value, or with a
- * frame open. */
+ * frame open. With N frames per call the compose stage runs at the commit, so
+ * this limit (and an inverse ERB matrix set above) applies to every frame of
+ * the next committed call, including frames pushed before the change. */
 int dfn2_prepost_set_atten_lim(DFN2Prepost *p, float atten_lim_db);
 
 /* ---- per-hop stages -------------------------------------------------- */
@@ -208,13 +228,15 @@ int dfn2_prepost_set_atten_lim(DFN2Prepost *p, float atten_lim_db);
 /* DFN2_IO_TIME. One hop of noisy input (DFN2 is single-stream): runs the
  * analysis and feature front end, slides the graph window and advances the
  * compose clock. Returns the number of accelerator invocations this hop needs (0
- * on the first DFN2_MASK_LOOKAHEAD hops, 1 after), or -1 on NULL args, in
- * DFN2_IO_FREQ, or with a frame open. */
+ * on the first DFN2_MASK_LOOKAHEAD hops, 1 after; with N frames per call 1 on
+ * every N-th hop from hop L + N - 1), or -1 on NULL args, in DFN2_IO_FREQ, or
+ * with a frame open. */
 int dfn2_prepost_pre_process(DFN2Prepost *p, const float in_hop[DFN2_HOP_LEN]);
 
 /* DFN2_IO_FREQ. One analysed frame at normalized=True scale: rfft of a
  * sqrt-Hann-windowed DFN2_N_FFT block on the DFN2_HOP_LEN grid. No transform is
- * done. Returns 0 on the first DFN2_MASK_LOOKAHEAD frames, 1 after, or -1. */
+ * done. Returns 0 on the first DFN2_MASK_LOOKAHEAD frames, 1 after (with N
+ * frames per call, on the same hops as pre_process), or -1. */
 int dfn2_prepost_pre_process_freq(DFN2Prepost *p,
                                   const float spec_re[DFN2_N_BINS],
                                   const float spec_im[DFN2_N_BINS]);
@@ -223,8 +245,10 @@ int dfn2_prepost_pre_process_freq(DFN2Prepost *p,
  * window, heads); `app` feeds the application branch (the noisy ring that the
  * mask, deep filter and attenuation limit act on). Same frame clock and scale;
  * est == app equals dfn2_prepost_pre_process_freq(). Returns 0 on the first
- * DFN2_MASK_LOOKAHEAD frames, 1 after, or -1 on NULL args, in DFN2_IO_TIME, or
- * with a frame open. */
+ * DFN2_MASK_LOOKAHEAD frames, 1 after (with N frames per call, on the same hops
+ * as pre_process), or -1 on NULL args, in DFN2_IO_TIME, or with a frame open.
+ * The entry may change from hop to hop; each frame keeps the spectrum its own
+ * hop supplied. */
 int dfn2_prepost_pre_process_freq_dual(DFN2Prepost *p,
                                        const float est_re[DFN2_N_BINS],
                                        const float est_im[DFN2_N_BINS],
@@ -239,27 +263,28 @@ int dfn2_prepost_frame_inputs(DFN2Prepost *p, DFN2PrepostInputs *inputs,
                               DFN2PrepostOutputs *outputs);
 
 /* Validate the heads and both recurrent-state tensors (all finite), then run the
- * compose stage and, in DFN2_IO_TIME, the synthesis. Requires a frame published
+ * compose stage and, in DFN2_IO_TIME, the synthesis, once per frame of the call
+ * (N times with N frames per call, oldest first). Requires a frame published
  * by frame_inputs(). On a non-finite value the recurrent tensors are zeroed, the
  * state generation advances, the frame stays open and -1 is returned; call
  * dfn2_prepost_frame_skip() or re-run via a fresh frame_inputs(). */
 int dfn2_prepost_frame_commit(DFN2Prepost *p);
 
-/* Take the identity for the current frame (unit ERB mask, alpha 0: the noisy
- * spectrum passes through). Clocks advance and the recurrent state is left as is.
+/* Take the identity for the current frame, or every frame of the call (unit ERB
+ * mask, alpha 0: the noisy spectrum passes through). Clocks advance and the
+ * recurrent state is left as is.
  * Used after a failed accelerator run. Returns 0, or -1 if no frame is open. */
 int dfn2_prepost_frame_skip(DFN2Prepost *p);
 
 /* DFN2_IO_TIME. Emit this hop's output: DFN2_HOP_LEN samples, zero-filled during
- * the first DFN2_MASK_LOOKAHEAD + DFN2_DF_LOOKAHEAD warm-up hops; `*written`
- * (may be NULL) reports 0 or DFN2_HOP_LEN. Returns 0, or -1. */
+ * the first DFN2_PREPOST_LATENCY_FRAMES warm-up hops; `*written` (may be NULL)
+ * reports 0 or DFN2_HOP_LEN. Returns 0, or -1. */
 int dfn2_prepost_post_process(DFN2Prepost *p, float out_hop[DFN2_HOP_LEN],
                               int *written);
 
 /* DFN2_IO_FREQ. The enhanced spectrum of the frame just emitted, at the input's
- * normalized=True scale. Zeros during the DFN2_MASK_LOOKAHEAD +
- * DFN2_DF_LOOKAHEAD warm-up frames, where `*valid` (may be NULL) reports 0.
- * Returns 0, or -1. */
+ * normalized=True scale. Zeros during the DFN2_PREPOST_LATENCY_FRAMES warm-up
+ * frames, where `*valid` (may be NULL) reports 0. Returns 0, or -1. */
 int dfn2_prepost_post_process_freq(DFN2Prepost *p, float re[DFN2_N_BINS],
                                    float im[DFN2_N_BINS], int *valid);
 
@@ -286,7 +311,8 @@ typedef struct DFN2Model {
  * result or a refused commit takes the frame with frame_skip(), so the clocks
  * advance exactly once. Returns 1 when the heads were committed, 0 when skipped,
  * -1 on a contract error (NULL model or instance, no infer callback, invalid
- * io_descriptor -- NULL, or another graph or lookahead pair -- or no frame open). */
+ * io_descriptor -- NULL, or another graph, lookahead pair or frames_per_call --
+ * or no frame open). */
 int dfn2_model_run_frame(const DFN2Model *model, DFN2Prepost *p);
 
 #ifdef __cplusplus

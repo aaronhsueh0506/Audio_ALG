@@ -302,6 +302,19 @@ DOA, BF and AEC/NR/RES always use the same selected tuple, so changing the grid
 changes the complete pipeline atomically; there is no second spatial timing
 domain.
 
+**Command lines of the examples.** `mcab_raw`, `mcab_static` and `mcab_external_static` read their numeric
+options (`--sample-rate`, `--fft-size`, `--uca-radius-m`, `--fixed-doa-deg`, `--capture-proxy`) with the
+strict parsers of `../common/example_cli.h`: the whole string must be one number, so an empty string, a leading
+space, trailing characters (`16000Hz`), a value outside `int`, `inf` and `nan` are command-line errors, and so
+are an option without its value and an unknown option. All three exit with code 2 and print a message or the
+usage line on stderr. A number that parses but names no grid or channel (`--sample-rate 44100`,
+`--capture-proxy 4`) is refused later, when the config is built, and exits 1 in `mcab_static` and
+`mcab_external_static`; `mcab_raw` checks the grid while parsing and exits 2. `tests/test_cli_strict.sh <bin_dir>`
+runs both static programs through every case (`make test` runs it), and `tests/test_mcab_sample_driver.c` covers the
+shared parser.
+Still lenient in `mcab_external_static`: an unknown AEC preset or `--nr-preset` name falls back to balanced, and
+a repeated option keeps the last value.
+
 Reproduce the two recording tests from the `Audio_ALG` directory. The evaluators read the case directories
 `aec_take_turn` and `aec_together` under `--datasets-root` (default: the `datasets` directory beside `Audio_ALG`,
 which is not in git); each needs `unprocessed_4ch.wav`, `man.wav` and `woman(ref).wav` (or `women(ref).wav`):

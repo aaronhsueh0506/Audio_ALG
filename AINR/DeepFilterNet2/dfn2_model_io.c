@@ -1,9 +1,16 @@
+#ifndef DFN2_MULTI_FRAME_HOST
+#define DFN2_MULTI_FRAME_HOST 1
+#endif
 #include "dfn2_model_io.h"
 
 #include <math.h>
 #include <string.h>
 
 #include "utility/simd_kernel_nn.h"
+
+/* The frames per call this object was built for (dfn2_model_io.h): objects
+ * of another N fail to link. */
+const unsigned char DFN2_FRAMES_PER_CALL_SYMBOL = 0;
 
 void dfn2_model_io_init(DFN2ModelIOState *state)
 {
@@ -27,14 +34,15 @@ void dfn2_model_io_init(DFN2ModelIOState *state)
     X(df_order, DFN2_DF_ORDER)                                        \
     X(mask_lookahead, DFN2_MASK_LOOKAHEAD)                            \
     X(df_lookahead, DFN2_DF_LOOKAHEAD)                                \
-    X(input_frames, DFN2_MODEL_INPUT_FRAMES)                          \
+    X(input_frames, DFN2_MODEL_WINDOW_FRAMES)                         \
     X(encoder_gru_layers, DFN2_MODEL_ENCODER_GRU_LAYERS)              \
     X(erb_gru_layers, DFN2_MODEL_ERB_GRU_LAYERS)                      \
     X(df_gru_layers, DFN2_MODEL_DF_GRU_LAYERS)                        \
     X(gru_hidden, DFN2_MODEL_GRU_HIDDEN)                              \
     X(encoder_channels, DFN2_MODEL_ENCODER_CHANNELS)                  \
     X(df_pathway_window, DFN2_MODEL_DF_PATHWAY_WINDOW)              \
-    X(state_tensor_count, DFN2_MODEL_IO_STATE_TENSORS)
+    X(state_tensor_count, DFN2_MODEL_IO_STATE_TENSORS)                \
+    X(frames_per_call, DFN2_FRAMES_PER_CALL)
 
 int dfn2_model_io_descriptor_default(DFN2ModelIoDescriptor *descriptor)
 {
@@ -58,25 +66,25 @@ int dfn2_model_io_descriptor_validate(
 }
 
 void dfn2_model_io_push_erb_window(
-    float window[DFN2_MODEL_INPUT_FRAMES][DFN2_N_ERB],
+    float window[DFN2_MODEL_WINDOW_FRAMES][DFN2_N_ERB],
     const float frame[DFN2_N_ERB])
 {
     if (window == NULL || frame == NULL) return;
     memmove(window[0], window[1],
-            (DFN2_MODEL_INPUT_FRAMES - 1) * sizeof(window[0]));
-    memcpy(window[DFN2_MODEL_INPUT_FRAMES - 1], frame, sizeof(window[0]));
+            (DFN2_MODEL_WINDOW_FRAMES - 1) * sizeof(window[0]));
+    memcpy(window[DFN2_MODEL_WINDOW_FRAMES - 1], frame, sizeof(window[0]));
 }
 
 void dfn2_model_io_push_spec_window(
-    float window[2][DFN2_MODEL_INPUT_FRAMES][DFN2_DF_BINS],
+    float window[2][DFN2_MODEL_WINDOW_FRAMES][DFN2_DF_BINS],
     const float frame[2][DFN2_DF_BINS])
 {
     if (window == NULL || frame == NULL) return;
     for (int channel = 0; channel < 2; ++channel) {
         memmove(window[channel][0], window[channel][1],
-                (DFN2_MODEL_INPUT_FRAMES - 1) *
+                (DFN2_MODEL_WINDOW_FRAMES - 1) *
                     sizeof(window[channel][0]));
-        memcpy(window[channel][DFN2_MODEL_INPUT_FRAMES - 1],
+        memcpy(window[channel][DFN2_MODEL_WINDOW_FRAMES - 1],
                frame[channel], sizeof(window[channel][0]));
     }
 }
@@ -113,9 +121,23 @@ int dfn2_model_io_push_features(DFN2ModelIOState *state,
     if (state == NULL || erb == NULL || spec == NULL) return -1;
     dfn2_model_io_push_erb_window(state->erb_window, erb);
     dfn2_model_io_push_spec_window(state->spec_window, spec);
+    /* The count runs to L + N and, after each complete call, steps back by N,
+     * so it stays at L + 1 .. L + N once the warm-up is over. */
+    if (state->feature_frames_seen == DFN2_MODEL_READY_FRAMES)
+        state->feature_frames_seen -= DFN2_FRAMES_PER_CALL;
     if (state->feature_frames_seen < DFN2_MODEL_READY_FRAMES)
         ++state->feature_frames_seen;
     return state->feature_frames_seen == DFN2_MODEL_READY_FRAMES ? 1 : 0;
+}
+
+int dfn2_model_io_frame_slot(const DFN2ModelIOState *state)
+{
+    unsigned long long seen;
+    if (state == NULL) return -1;
+    seen = state->feature_frames_seen;
+    if (seen <= DFN2_MASK_LOOKAHEAD || seen > DFN2_MODEL_READY_FRAMES)
+        return -1;
+    return (int)(seen - DFN2_MASK_LOOKAHEAD - 1U);
 }
 
 int dfn2_model_io_validate_state(DFN2ModelIOState *state)

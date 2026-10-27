@@ -1,6 +1,7 @@
 """The Python resampler twin against the C it mirrors, and the round-trip
 delay constant the non-48 kHz DFN2 path relies on."""
 import ctypes
+import fractions
 import pathlib
 import shutil
 import sys
@@ -12,7 +13,8 @@ ROOT = pathlib.Path(__file__).resolve().parents[3]
 if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
-from pipelines.dfn.dfn2_rate_adapter import AudioResampler, CResampler, round_trip  # noqa: E402
+from pipelines.dfn.dfn2_rate_adapter import (  # noqa: E402
+    AudioResampler, CResampler, Dfn2RateBridge, round_trip)
 
 AC = ROOT.parent / 'audiolib' / 'common'
 
@@ -123,3 +125,45 @@ def test_a_cached_file_others_can_write_is_rebuilt_not_loaded(tmp_path, monkeypa
     assert planted.read_bytes() != b'not a library'      # replaced by a fresh build
     assert planted.stat().st_mode & 0o077 == 0
     assert lib.audio_resampler_create(16000, 48000, 1)
+
+
+class _StubStage:
+    """What the bridge's delay bookkeeping reads from a stage."""
+
+    def __init__(self, lookahead):
+        self.output_delay_frames = lookahead
+
+    def reset(self):
+        pass
+
+
+@pytest.mark.parametrize('sample_rate,fft', [(16000, 256), (16000, 512), (8000, 256)])
+def test_exact_added_delay_for_every_lookahead_pair(c_lib, sample_rate, fft):
+    """The floored delay keeps its values; the exact one is the same sum without the floor."""
+    for mask in range(3):
+        for df in range(5):
+            lookahead = mask + df
+            bridge = Dfn2RateBridge(_StubStage(lookahead), sample_rate, fft)
+            lat_up = bridge.up_e.latency_input_frames
+            lat_down = bridge.down.latency_input_frames
+            exact = (fractions.Fraction(bridge.prefill + lat_up)
+                     + fractions.Fraction((lookahead + 1) * 512 * sample_rate
+                                          + lat_down * sample_rate, 48000))
+            num, den = bridge.added_delay_exact
+            assert den == Dfn2RateBridge.DELAY_DENOMINATOR
+            assert fractions.Fraction(num, den) == exact
+            # The integer accessor is the floor of the exact value and equals the long-standing
+            # per-term integer formula.
+            assert bridge.added_delay == num // den == int(exact)
+            assert bridge.added_delay == (
+                bridge.prefill + lat_up + (lookahead + 1) * 512 * sample_rate // 48000
+                + lat_down * sample_rate // 48000)
+            # Only the stage term can carry a fraction: none when L + 1 is a multiple of 3.
+            assert (num % den == 0) == ((lookahead + 1) % 3 == 0)
+
+
+def test_shipped_pair_added_delay_values():
+    for (rate, fft), expected in {(16000, 256): 672, (16000, 512): 629, (8000, 256): 330}.items():
+        bridge = Dfn2RateBridge(_StubStage(2), rate, fft)
+        assert bridge.added_delay == expected
+        assert bridge.added_delay_exact == (expected * 6, 6)

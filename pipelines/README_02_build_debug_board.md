@@ -83,7 +83,7 @@ audio quality of every other pair is unmeasured. `Makefile` takes `DFN2_MASK_LOO
 forwarded as `-DDFN2_MASK_LOOKAHEAD=<M> -DDFN2_DF_LOOKAHEAD=<D>` to every unit and is part of the build signature: it gets
 its own `bin/` and `obj/` directories, and units built for different pairs fail to link (pair symbol
 `dfn2_lookahead_mask<M>_df<D>`). `4ch_aec_bf_nr_res/Makefile` takes the same two DFN2 variables. The DFN2 stage delays its
-output by `M + D` frames of 48 kHz; the rate bridge adds `dfn_rate_bridge_added_delay_samples()` native samples, which grow
+output by `M + D` frames of 48 kHz; the rate bridge adds `dfn_rate_bridge_added_delay_samples()` native samples (the floor; `dfn_rate_bridge_added_delay_exact()` returns the exact value as a multiple of 1/3 sample), which grow
 with `M + D` (shipped pair: 672, 629 and 330 samples at 16 kHz hop 128, 16 kHz hop 256 and 8 kHz hop 128). `make test-pairs`
 rebuilds and runs the DFN C tests and the mono DFN2 program for each pair of `DFN_TEST_PAIRS` (default `0/0 0/1 2/0 2/4`); the
 other pairs are not exercised by it.
@@ -92,7 +92,10 @@ other pairs are not exercised by it.
 library archive: the mono examples link the producer libraries (`libaec.a`, `libanr.a`,
 `libaudio_common.a`) directly and carry their grid derivation and per-hop chain in their own
 sources. `4ch_aec_bf_nr_res/libaudio_pipeline_mcab.a` holds
-`mcab.o` only (the flow). The sample objects `mcab_sample_flow.o`
+`mcab.o` only (the flow), and its build directory is keyed on audiolib common and lib/aec alone: `make
+libaudio_pipeline_mcab.a` succeeds with lib/nr and audiolib's spatial kernels absent (`make -s print-lib-path` in
+`4ch_aec_bf_nr_res` prints it; the same goal built by `make all` lands in the full-scope directory, which
+`PRINT_FOR=all` selects). The sample objects `mcab_sample_flow.o`
 and `mcab_sample_beam.o` (the application-side init and the SRP-PHAT/BF helper) are not in it
 either; `audit-no-stdio` (run there with `NO_STDIO=1`) covers the archive, the DFN archive, the
 producers and those two objects. The example programs (`mcab_raw`, `mcab_static`,

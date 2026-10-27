@@ -117,10 +117,11 @@ def defines(family, pair):
             '-D%s_DF_LOOKAHEAD=%d' % (prefix, pair[1])]
 
 
-def header_compiles(family, pair, std, workdir):
+def header_compiles(family, pair, std, workdir, extra=()):
     """Whether ``<family>_model_io.h`` compiles (syntax only) for ``pair`` under
-    ``-std=<std>`` (``c++11`` selects the C++ compiler); returns the finished
-    process so a caller can read the diagnostic."""
+    ``-std=<std>`` (``c++11`` selects the C++ compiler), with ``extra`` flags
+    after the pair's; returns the finished process so a caller can read the
+    diagnostic."""
     prefix = macro_prefix(family)
     cxx = std.startswith('c++')
     source = Path(workdir) / ('header_%s.%s' % (_SOURCE_PREFIX[family],
@@ -132,7 +133,7 @@ def header_compiles(family, pair, std, workdir):
          '-I', str(family_dir(family)),
          '-I', str(AUDIO_COMMON / 'include'), '-I', str(AUDIO_COMMON),
          '-D%s_MASK_LOOKAHEAD=%d' % (prefix, pair[0]),
-         '-D%s_DF_LOOKAHEAD=%d' % (prefix, pair[1]), str(source)],
+         '-D%s_DF_LOOKAHEAD=%d' % (prefix, pair[1]), *extra, str(source)],
         capture_output=True, text=True)
 
 

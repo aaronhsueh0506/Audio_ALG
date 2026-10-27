@@ -84,18 +84,18 @@ th{background:#eef2f8}
 <tr><th>項目</th><th>規則</th></tr>
 <tr><td>stage</td><td><code>DFN_RES_STAGE_LOOKAHEAD_FRAMES</code> = L(cascade 相加)。第 t 個 hop 輸出的頻譜屬於 source frame t−L;<code>dfn_res_stage_begin()</code> 只在前 M 個 hop 回 0(M = 0 時沒有),<code>dfn_res_stage_end()</code> 在前 L 個 hop 回 0 並寫滿零頻譜。收尾 flush 推 L 個全零 hop。</td></tr>
 <tr><td>48 kHz host</td><td>演算法延遲 (L+1)×512 samples(1/1:1536 = 32 ms)。</td></tr>
-<tr><td>rate bridge</td><td>added delay = <code>prefill + 16 + (L+1)×512×sr/48000 + 16</code>(乘積先算再整數除法;<code>dfn_rate_bridge_added_delay_samples()</code>);prefill 為 128(16 k/hop 128)、85(16 k/hop 256)、42(8 k/hop 128)。(L+1)×512×sr/48000 只在 L+1 是 3 的倍數(L = 2 或 5)時為整數;其他 pair 的 stage 延遲含小數個原生樣本,向下取整,輸出再多落後不到一個樣本(脈衝峰值可落在 added delay 或其後一個樣本)。</td></tr>
+<tr><td>rate bridge</td><td>added delay = <code>prefill + 16 + (L+1)×512×sr/48000 + 16</code>(乘積先算再整數除法;<code>dfn_rate_bridge_added_delay_samples()</code>);prefill 為 128(16 k/hop 128)、85(16 k/hop 256)、42(8 k/hop 128)。(L+1)×512×sr/48000 只在 L+1 是 3 的倍數(L = 2 或 5)時為整數;其他 pair 的 stage 延遲含小數個原生樣本:<code>dfn_rate_bridge_added_delay_samples()</code> 向下取整,<code>dfn_rate_bridge_added_delay_exact()</code>(Python:<code>Dfn2RateBridge.added_delay_exact</code>)回不取整的值,為「分子／6 個原生樣本」(分母 <code>DFN_RATE_BRIDGE_DELAY_DENOMINATOR</code> = 6,不約分;合法 grid 上小數部分只有 0、1/3、2/3)。pair 0/1 在 16 k/hop 128、16 k/hop 256、8 k/hop 128 分別是 501 1/3、458 1/3、244 2/3。測試以精確值為準:脈衝響應的重心與 <code>hop + 精確延遲</code> 的差在 0.01 樣本內。</td></tr>
 </table>
 <table>
 <tr><th>pair(M/D)</th><th>L</th><th>16 k/hop 128</th><th>16 k/hop 256</th><th>8 k/hop 128</th><th>來源</th></tr>
 <tr><td>1/1(出貨)</td><td>2</td><td>672</td><td>629</td><td>330</td><td>公式;<code>test_dfn_rate_bridge</code> 現查</td></tr>
-<tr><td>0/1</td><td>1</td><td>501</td><td>458</td><td>244</td><td>公式;該 pair 建置的 <code>test_dfn_rate_bridge</code> 與 mono 骨架現查</td></tr>
-<tr><td>2/4</td><td>6</td><td>1354</td><td>1311</td><td>671</td><td>同上</td></tr>
+<tr><td>0/1</td><td>1</td><td>501(精確 501 1/3)</td><td>458(458 1/3)</td><td>244(244 2/3)</td><td>公式;該 pair 建置的 <code>test_dfn_rate_bridge</code> 與 mono 骨架現查</td></tr>
+<tr><td>2/4</td><td>6</td><td>1354(精確 1354 2/3)</td><td>1311(1311 2/3)</td><td>671(671 1/3)</td><td>同上</td></tr>
 </table>
 <ul>
 <li><b>建置</b>:pipelines 的 make 變數 <code>DFN2_MASK_LOOKAHEAD</code>／<code>DFN2_DF_LOOKAHEAD</code>(預設 1／1;單一個範圍內的十進位數,否則 Makefile 報錯;DFN3 有同樣的 <code>DFN3_*</code> 變數,pipelines 只用在 target-ABI 測試)。pair 不是 1/1 時以 <code>-DDFN2_MASK_LOOKAHEAD=&lt;M&gt; -DDFN2_DF_LOOKAHEAD=&lt;D&gt;</code> 轉給<b>每一個</b>編譯單元,並計入 build signature(各 pair 有自己的 obj／bin 目錄)。不同 pair 的目標檔連結失敗(符號 <code>dfn2_lookahead_mask&lt;M&gt;_df&lt;D&gt;</code>);範圍外的 pair 編譯失敗。4ch 的 <code>4ch_aec_bf_nr_res/Makefile</code> 取同樣兩個變數,沒有 <code>test-pairs</code>。</li>
 <li><b>測試</b>:<code>make -C pipelines test</code> 跑出貨 pair。<code>make -C pipelines test-pairs [DFN_TEST_PAIRS="0/0 0/1 2/0 2/4"]</code>(預設即括號內的四組,<code>mask/df</code>,範圍 0..2／0..4;清單為空會報錯,<code>make -n／-q／-t</code> 只印計畫)對每一組重建 <code>libaudio_pipeline_dfn.a</code> 與 <code>test_dfn_res_stage</code>、<code>test_dfn_rate_bridge</code>、<code>test_dfn_hop</code>、<code>test_mono_dfn</code>、<code>test_readme_flow</code>、<code>mono_aec_dfn_res</code>,先確認 archive 帶有該 pair 的符號再執行。Python 側(<code>pipelines/dfn/tests/dfn2_pairs.py</code>):stage 測試跑出貨 pair 與 (0,0)、(0,1)、(2,0)、(2,4),C parity 測試重建 shim 的 pair 為出貨 pair、(0,1)、(2,4)。C 端只建置、執行過其中一部分 pair,不宣稱 15 組全跑過。</li>
-<li><b>閘門</b>:通帶誤差閘(bridge 測試 5e-3、兩個範例測試 1e-3)只在延遲為整數個原生樣本時成立;其餘 pair 釘的是脈衝位置(added delay 或其後一個樣本)、幀排程、fail-open 的 L hop 延後 identity 與計數器(<code>skips = 幀數 − M</code>)。</li>
+<li><b>閘門</b>:所有 pair 都以精確延遲比對——bridge 測試的脈衝響應重心與 <code>hop + 精確延遲</code> 差在 0.01 樣本內,兩個範例測試釘最近的峰值樣本;通帶誤差閘(bridge 測試 5e-3、兩個範例測試 1e-3)對出貨 pair 與非整數 pair 一律成立(參考訊號分別取小數時間的音調、以及延遲了小數樣本的傳統輸出);另釘幀排程、fail-open 的 L hop 延後 identity 與計數器(<code>skips = 幀數 − M</code>)。</li>
 <li><b>Pool</b>:DFN2 ring 為 <code>max(5, M+D+1)</code> 格,M+D 超過 4 才比出貨 pair 大(16 kHz mono 骨架 pair 2/4 印 740,496 B,出貨 pair 716,400 B)。</li>
 <li><b>板端</b>:pair 不是 1/1 時,<code>dfn2_process.c</code>、<code>dfn2_model_io.c</code>、<code>dfn2_prepost.c</code>、<code>dfn_res_stage.c</code>、<code>dfn_rate_bridge.c</code> 與任何 include 它們標頭的單元都要帶同一組 <code>-D</code>,並載入同一個 pair 匯出的模型;出貨 pair 不必帶旗標。<code>alg_ai3_dfn.c</code> 與 <code>uvc_ai_nr_stream.c</code> 這類板端範例把 MASK／DF 寫死為 1,並以 static assert 擋下其他 pair。</li>
 <li><b>Python</b>:<code>Dfn2Stage</code> 的 M、D 取自載入的模型(<code>config.ini [model]</code>),<code>Dfn2RateBridge.added_delay</code> 用同一條公式。</li>

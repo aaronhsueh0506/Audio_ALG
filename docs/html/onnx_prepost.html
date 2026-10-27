@@ -125,7 +125,7 @@ framing、特徵前後端、recurrent ring／state buffer。整合者不需自�
 
 <p><b>一 hop = 一次推論</b>：<code>pre_process</code> 回傳這一 hop 需要的加速器呼叫次數。
 Align-ULCNet 與 DeepVQE-S <b>從 hop 0 起恆為 1</b>；DFN2、DFN3 在<b>前 M 個 hop 回 0</b>（M = <code>mask_lookahead</code>；graph 的視窗是
-<code>[t−(2−M), …, t+M]</code>，右鄰居還沒到，不可以呼叫；出貨 M = 1 即第一個 hop），之後每 hop 1 次。M 與 <code>df_lookahead</code> D 是匯出圖之外、host 與 checkpoint 共同遵守的 pair（15 組，圖本身與 pair 無關，metadata 記錄 pair；見 <a href="ainr_dfn2_detail.html">ainr_dfn2_detail</a>）。</p>
+<code>[t−(2−M), …, t+M]</code>，右鄰居還沒到，不可以呼叫；出貨 M = 1 即第一個 hop），之後每 hop 1 次。M 與 <code>df_lookahead</code> D 是匯出圖之外、host 與 checkpoint 共同遵守的 pair（15 組，圖本身與 pair 無關，metadata 記錄 pair；見 <a href="ainr_dfn2_detail.html">ainr_dfn2_detail</a>）。DFN2 另可匯出每次 invocation N 個 frame 的 graph（<code>--frames-per-call N</code>，輸入 N+2 個 feature frame、輸出 N 個 frame 的 heads、GRU state 取最後一個 frame 之後的值）：host 以 <code>-DDFN2_FRAMES_PER_CALL=N</code> 建置後，<code>pre_process</code> 改為每 N 個 hop 回 1 一次，輸出多落後 N−1 hop；pipelines 固定 N=1。</p>
 
 <p><b>pipeline 層的對應</b>：四個應用（<code>mono_alignulcnet</code>、<code>4ch_alignulcnet</code>、<code>mono_aec_dfn_res</code>、<code>4ch_aec_bf_dfn_res</code>）把同一個 hop 拆成 begin → 取 job → 呼叫端在 NPU 上推論 → 回報 rc → end。
 DFN2 應用用 <code>dfn/dfn_hop.h</code>：<code>dfn_hop_begin()</code> → <code>while (dfn_hop_nn_begin() &gt; 0) { 推論; dfn_hop_nn_end(rc) }</code> → <code>dfn_hop_end()</code>，job 是 <code>DfnResStageJob</code>（<code>DFN2PrepostInputs/Outputs</code> 視圖）。

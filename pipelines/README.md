@@ -174,11 +174,15 @@ no overrides), so `anr_set_mode()` changes the strength of a running denoiser;
 the per-hop gain call that folds the AEC residual-echo powers into the noise floor is written in
 each example (`mono_nr_gain()` in `mono_aec_nr_res/main.c`) and, shared by the 4-channel programs,
 `mcab_sample_anr_gain()` in `4ch_aec_bf_nr_res/mcab_sample_post.h`. The numeric options of the DFN2 and ULCNet
-examples and of `mcab_raw` go through the strict parser of `common/example_cli.h`
-(`example_cli_parse_int()`, `example_cli_parse_float()`): an empty string, leading space, trailing
-characters, an out-of-range value, `inf` or `nan` exit with code 2 (for example
-`--delay-num-filters 3x`, or an empty `--fixed-doa-deg` of `mcab_raw`). The smoke and reference CLIs
-`mono_aec_nr_res/main.c`, `mcab_static` and `mcab_external_static` still use `atoi()` / `atof()`.
+examples and of `mcab_raw`, `mcab_static` and `mcab_external_static` go through the strict parser of
+`common/example_cli.h` (`example_cli_parse_int()`, `example_cli_parse_float()`): an empty string, leading space,
+trailing characters, an out-of-range value, `inf` or `nan` exit with code 2 (for example
+`--delay-num-filters 3x`, or an empty `--fixed-doa-deg` of `mcab_raw`). `mcab_static` and `mcab_external_static`
+also exit 2 for an option without its value and for an unknown option; a number that parses but names no grid
+or channel (`--sample-rate 44100`) is refused when the config is built and still exits 1. Still lenient:
+`mono_aec_nr_res/main.c` (`aec_nr_pipeline`, `aec_nr_pipeline_static`) reads `--sample-rate` and `--fft-size` with
+`atoi()` and ignores an unknown option; the test and smoke helpers `tests/pyc_parity/pyc_drv.c` and
+`4ch_aec_bf_nr_res/tests/dump_delay_parity.c` also read numbers with `atoi()` / `atof()` / `strtoul()`.
 
 The ULCNet applications use `../AIAEC/Align_ULCNet/ulcnet_accelerator_adapter.*`: CPU memory owns
 K/V, logit and GRU state, while the board implements one stateless tensor

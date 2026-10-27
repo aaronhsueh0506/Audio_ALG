@@ -70,6 +70,16 @@
 #            with a nonzero exit (see assert_make_e_rejected()).
 #   SP-S19:  the 4ch test_mcab_sample_driver object records its header dependencies (.d)
 #   SP-S20:  test-pairs: an empty DFN_TEST_PAIRS is refused; -n/-q/-t print no FAIL and build nothing
+#   SP-S21..SP-S25: the producer scopes of the 4ch Makefile (every goal resolves, and keys on, only the producers
+#            it needs; one shared scratch obj/bin root)
+#   SP-S21:  libaudio_pipeline_mcab.a builds with lib/nr and audiolib's spatial kernels absent; its key ignores
+#            NR_DIR and carries only the common and lib/aec identities
+#   SP-S22:  test_mcab builds and passes without audiolib's spatial archives, keyed on lib/aec and lib/nr
+#   SP-S23:  a goal that needs a missing producer stops naming it (dispatch FATAL, or the phase-2 scope check)
+#   SP-S24:  the full-scope payload keeps all four identities in order, the narrower payloads are exactly that
+#            payload minus the unused parts, mcab.o is byte-identical in every scope, SIMD/EXTRA_CFLAGS still move
+#            the narrow key, and a tampered config.manifest trips the CFG_SIG collision guard
+#   SP-S25:  PRINT_FOR selects the scope print-bin-dir / print-obj-dir / print-lib-path report
 #
 # Design rules (as in audiolib's script):
 #   - No `make clean` inside any scenario body (except SP-S13's trailing `make -C RNNoise-ERB clean`, which only
@@ -599,6 +609,191 @@ done
 grep -q "would build and run" "$SCRATCH_ROOT/sp20/-n.log" && pass "SP-S20: make -n test-pairs prints what it would run" \
   || fail "SP-S20: make -n test-pairs printed no plan"
 
+echo "############################################################"
+echo "# SP-S21: libaudio_pipeline_mcab.a needs only audiolib common and lib/aec"
+echo "############################################################"
+# The 4ch Makefile dispatches every goal on its own and resolves, and keys on, only the producers that goal
+# needs (SP-S21..SP-S25). mcab.o references lib/aec and audiolib's common utilities and nothing else, so lib/nr
+# and audiolib's spatial kernels may be absent. All five scenarios share one scratch obj/bin root, so the
+# producers are compiled once; nothing here touches a real obj/ or bin/.
+mkscratch sp21
+FOURCH_DIR="$PIPE_DIR/4ch_aec_bf_nr_res"
+SP21_ARGS=(-C "$FOURCH_DIR" BACKEND=ne10 SIMD=1 WERROR=0
+  OBJ_ROOT="$SCRATCH_ROOT/sp21/obj" BIN_ROOT="$SCRATCH_ROOT/sp21/bin")
+# Directories that do not exist, and a copy of audiolib's include directories without its Makefile (the
+# spatial archives cannot be resolved there, the sample beam headers can be found).
+SP21_NO_NR="$SCRATCH_ROOT/sp21/absent/lib-nr"
+SP21_NO_AUDIOLIB="$SCRATCH_ROOT/sp21/absent/audiolib"
+SP21_HEADERS_ONLY="$SCRATCH_ROOT/sp21/audiolib_headers_only"
+mkdir -p "$SP21_HEADERS_ONLY"
+for sp21_d in doa bf common; do ln -s "$AUDIOLIB_DIR/$sp21_d" "$SP21_HEADERS_ONLY/$sp21_d"; done
+sp21_spatial_built() { find "$SCRATCH_ROOT/sp21/bin" \( -name libanr.a -o -name libdoa.a -o -name libbf.a -o -name libspatial_common.a \) 2>/dev/null | grep -q .; }
+
+if make -s "${SP21_ARGS[@]}" NR_DIR="$SP21_NO_NR" libaudio_pipeline_mcab.a >"$SCRATCH_ROOT/sp21/t0_no_nr.log" 2>&1; then
+  pass "SP-S21: libaudio_pipeline_mcab.a builds with lib/nr absent"
+else
+  fail "SP-S21: libaudio_pipeline_mcab.a failed with lib/nr absent"; tail -20 "$SCRATCH_ROOT/sp21/t0_no_nr.log" >&2
+fi
+sp21_t0_lib="$(make -s "${SP21_ARGS[@]}" print-lib-path | tail -1)" || true
+sp21_t0_lib_no_nr="$(make -s "${SP21_ARGS[@]}" NR_DIR="$SP21_NO_NR" print-lib-path | tail -1)" || true
+[ -f "$sp21_t0_lib" ] && pass "SP-S21: the archive is at print-lib-path" || fail "SP-S21: no archive at print-lib-path ($sp21_t0_lib)"
+[ "$sp21_t0_lib" = "$sp21_t0_lib_no_nr" ] \
+  && pass "SP-S21: the archive's keyed path does not depend on NR_DIR" \
+  || fail "SP-S21: NR_DIR changes the archive's keyed path ($sp21_t0_lib vs $sp21_t0_lib_no_nr)"
+sp21_t0_bin="$(dirname "$sp21_t0_lib")"
+sp21_t0_man="$(cat "$sp21_t0_bin/config.manifest" 2>/dev/null || true)"
+case "$sp21_t0_man" in
+  *COMMON_PRODUCER_SIG=*AEC_PRODUCER_SIG=*) pass "SP-S21: the signature carries the common and lib/aec identities" ;;
+  *) fail "SP-S21: the signature lacks the common/lib-aec identities: $sp21_t0_man" ;;
+esac
+case "$sp21_t0_man" in
+  *NR_PRODUCER_SIG=*|*SPATIAL_PRODUCER_SIG=*) fail "SP-S21: the signature carries a producer the archive does not need: $sp21_t0_man" ;;
+  *) pass "SP-S21: the signature carries no lib/nr or spatial identity" ;;
+esac
+if make -s "${SP21_ARGS[@]}" NR_DIR="$SP21_NO_NR" AUDIOLIB_DIR="$SP21_NO_AUDIOLIB" libaudio_pipeline_mcab.a >"$SCRATCH_ROOT/sp21/t0_no_al.log" 2>&1; then
+  pass "SP-S21: libaudio_pipeline_mcab.a builds with lib/nr and audiolib's spatial kernels both absent"
+else
+  fail "SP-S21: libaudio_pipeline_mcab.a failed with lib/nr and audiolib's spatial kernels absent"; tail -20 "$SCRATCH_ROOT/sp21/t0_no_al.log" >&2
+fi
+sp21_spatial_built && fail "SP-S21: a lib/nr or spatial archive was built for the flow archive" \
+  || pass "SP-S21: no lib/nr or spatial archive was resolved into a build"
+
+echo "############################################################"
+echo "# SP-S22: test_mcab needs lib/aec and lib/nr, not the spatial kernels"
+echo "############################################################"
+if make -s "${SP21_ARGS[@]}" AUDIOLIB_DIR="$SP21_HEADERS_ONLY" test_mcab >"$SCRATCH_ROOT/sp21/t1.log" 2>&1; then
+  pass "SP-S22: test_mcab builds with audiolib's spatial archives unresolvable"
+else
+  fail "SP-S22: test_mcab failed with audiolib's spatial archives unresolvable"; tail -20 "$SCRATCH_ROOT/sp21/t1.log" >&2
+fi
+sp21_t1_bin="$(make -s "${SP21_ARGS[@]}" AUDIOLIB_DIR="$SP21_HEADERS_ONLY" print-bin-dir PRINT_FOR=test_mcab | tail -1)" || true
+if [ -x "$sp21_t1_bin/test_mcab" ] && "$sp21_t1_bin/test_mcab" >"$SCRATCH_ROOT/sp21/t1_run.log" 2>&1 && tail -1 "$SCRATCH_ROOT/sp21/t1_run.log" | grep -q "^All mcab tests passed$"; then
+  pass "SP-S22: test_mcab is at print-bin-dir PRINT_FOR=test_mcab and passes"
+else
+  fail "SP-S22: test_mcab missing at $sp21_t1_bin or failed"; tail -5 "$SCRATCH_ROOT/sp21/t1_run.log" >&2 || true
+fi
+sp21_t1_man="$(cat "$sp21_t1_bin/config.manifest" 2>/dev/null || true)"
+case "$sp21_t1_man" in
+  *AEC_PRODUCER_SIG=*NR_PRODUCER_SIG=*) pass "SP-S22: the signature carries the lib/aec and lib/nr identities" ;;
+  *) fail "SP-S22: the signature lacks the lib/aec or lib/nr identity: $sp21_t1_man" ;;
+esac
+case "$sp21_t1_man" in
+  *SPATIAL_PRODUCER_SIG=*) fail "SP-S22: the signature carries the spatial identity: $sp21_t1_man" ;;
+  *) pass "SP-S22: the signature carries no spatial identity" ;;
+esac
+[ "$sp21_t1_bin" != "$(dirname "$sp21_t0_lib")" ] \
+  && pass "SP-S22: test_mcab keys differently from the flow archive" \
+  || fail "SP-S22: test_mcab and the flow archive share a keyed directory"
+find "$SCRATCH_ROOT/sp21/bin" \( -name libdoa.a -o -name libbf.a -o -name libspatial_common.a \) 2>/dev/null | grep -q . \
+  && fail "SP-S22: a spatial archive was built for test_mcab" || pass "SP-S22: no spatial archive was built for test_mcab"
+assert_cmd_fails_with "SP-S22: test_mcab with lib/nr absent stops at the NR archive" "cannot resolve NR archive" \
+  make -s "${SP21_ARGS[@]}" NR_DIR="$SP21_NO_NR" test_mcab
+
+echo "############################################################"
+echo "# SP-S23: a goal that needs a producer fails loudly when it is missing"
+echo "############################################################"
+assert_cmd_fails_with "SP-S23: mcab_raw with lib/nr absent" "cannot resolve NR archive" \
+  make -s "${SP21_ARGS[@]}" NR_DIR="$SP21_NO_NR" mcab_raw
+assert_cmd_fails_with "SP-S23: all with lib/nr absent" "cannot resolve NR archive" \
+  make -s "${SP21_ARGS[@]}" NR_DIR="$SP21_NO_NR" all
+assert_cmd_fails_with "SP-S23: print-bin-dir (the 'all' directory) with lib/nr absent" "cannot resolve NR archive" \
+  make -s "${SP21_ARGS[@]}" NR_DIR="$SP21_NO_NR" print-bin-dir
+assert_cmd_fails_with "SP-S23: mcab_static with audiolib's spatial archives unresolvable" "cannot resolve spatial-common archive" \
+  make -s "${SP21_ARGS[@]}" AUDIOLIB_DIR="$SP21_HEADERS_ONLY" mcab_static
+assert_cmd_fails_with "SP-S23: test_mcab_sample_beam with audiolib absent" "cannot resolve spatial-common archive" \
+  make -s "${SP21_ARGS[@]}" AUDIOLIB_DIR="$SP21_NO_AUDIOLIB" test_mcab_sample_beam
+assert_cmd_fails_with "SP-S23: a phase-2 call that did not receive the spatial archives (mcab_static)" "needs the spatial producer" \
+  make -s "${SP21_ARGS[@]}" mcab_static COMMON_LIB=/dev/null AEC_LIB=/dev/null NR_LIB=/dev/null
+assert_cmd_fails_with "SP-S23: a phase-2 call that did not receive lib/nr (test_mcab)" "needs the nr producer" \
+  make -s "${SP21_ARGS[@]}" test_mcab COMMON_LIB=/dev/null AEC_LIB=/dev/null
+assert_cmd_fails_with "SP-S23: a phase-2 call with part of the spatial archives" "must be supplied together" \
+  make -s "${SP21_ARGS[@]}" mcab_static COMMON_LIB=/dev/null AEC_LIB=/dev/null NR_LIB=/dev/null DOA_LIB=/dev/null
+find "$SCRATCH_ROOT/sp21/bin" \( -name mcab_raw -o -name mcab_static -o -name test_mcab_sample_beam \) 2>/dev/null | grep -q . \
+  && fail "SP-S23: a refused goal left a binary behind" || pass "SP-S23: no refused goal left a binary behind"
+
+echo "############################################################"
+echo "# SP-S24: the full-scope signature is unchanged, a narrower one is a subset of it, and the collision guard holds"
+echo "############################################################"
+if make -s "${SP21_ARGS[@]}" mcab_external_static >"$SCRATCH_ROOT/sp21/t2.log" 2>&1; then
+  pass "SP-S24: mcab_external_static (full scope) builds"
+else
+  fail "SP-S24: mcab_external_static failed"; tail -20 "$SCRATCH_ROOT/sp21/t2.log" >&2
+fi
+sp21_t2_bin="$(make -s "${SP21_ARGS[@]}" print-bin-dir | tail -1)" || true
+sp21_t2_obj="$(make -s "${SP21_ARGS[@]}" print-obj-dir | tail -1)" || true
+sp21_t2_man="$(cat "$sp21_t2_bin/config.manifest" 2>/dev/null || true)"
+case "$sp21_t2_man" in
+  *"COMMON_PRODUCER_SIG="*" AEC_PRODUCER_SIG="*" NR_PRODUCER_SIG="*" SPATIAL_PRODUCER_SIG="*" SRCS="*) pass "SP-S24: the full-scope signature carries all four producer identities in the fixed order" ;;
+  *) fail "SP-S24: the full-scope signature lost a producer identity: $sp21_t2_man" ;;
+esac
+if [ "$sp21_t2_bin" != "$sp21_t0_bin" ] && [ "$sp21_t2_bin" != "$sp21_t1_bin" ] && [ "$sp21_t0_bin" != "$sp21_t1_bin" ]; then
+  pass "SP-S24: the three scopes occupy three keyed directories"
+else
+  fail "SP-S24: two scopes share a keyed directory (flow archive $sp21_t0_bin, test_mcab $sp21_t1_bin, all $sp21_t2_bin)"
+fi
+# The narrower payloads are the full payload minus the producers they do not use (identity fields and the
+# lib/nr include path), nothing else. test_mcab is built once more against the default audiolib so its
+# payload carries the same paths as the full one.
+make -s "${SP21_ARGS[@]}" test_mcab >"$SCRATCH_ROOT/sp21/t1_default.log" 2>&1 \
+  || { fail "SP-S24: test_mcab (default audiolib) failed"; tail -20 "$SCRATCH_ROOT/sp21/t1_default.log" >&2; }
+sp21_t1_default_bin="$(make -s "${SP21_ARGS[@]}" print-bin-dir PRINT_FOR=test_mcab | tail -1)" || true
+sp21_t1_default_man="$(cat "$sp21_t1_default_bin/config.manifest" 2>/dev/null || true)"
+sp21_t2_wo_spatial="$(printf '%s' "$sp21_t2_man" | sed -e 's# SPATIAL_PRODUCER_SIG=[^ ]*##' | tr -s ' ')"
+sp21_t2_wo_nr="$(printf '%s' "$sp21_t2_man" | sed -e 's# -I[^ ]*/lib/nr/c_impl/include##' -e 's# SPATIAL_PRODUCER_SIG=[^ ]*##' -e 's# NR_PRODUCER_SIG=[^ ]*##' | tr -s ' ')"
+sp21_t1_norm="$(printf '%s' "$sp21_t1_default_man" | tr -s ' ')"
+sp21_t0_norm="$(printf '%s' "$sp21_t0_man" | tr -s ' ')"
+[ "$sp21_t0_norm" = "$sp21_t2_wo_nr" ] \
+  && pass "SP-S24: the flow archive's payload is the full payload without the lib/nr and spatial parts" \
+  || { fail "SP-S24: the flow archive's payload differs from the full payload in more than the lib/nr and spatial parts"
+       printf '    t0: %s\n    t2: %s\n' "$sp21_t0_norm" "$sp21_t2_wo_nr" >&2; }
+[ "$sp21_t1_norm" = "$sp21_t2_wo_spatial" ] \
+  && pass "SP-S24: test_mcab's payload is the full payload without the spatial part" \
+  || { fail "SP-S24: test_mcab's payload differs from the full payload in more than the spatial part"
+       printf '    t1: %s\n    t2: %s\n' "$sp21_t1_norm" "$sp21_t2_wo_spatial" >&2; }
+# The object code is the same in every scope (the archive's content is unchanged).
+sp21_t0_obj="$(make -s "${SP21_ARGS[@]}" print-obj-dir PRINT_FOR=libaudio_pipeline_mcab.a | tail -1)" || true
+sp21_t1_obj="$(make -s "${SP21_ARGS[@]}" AUDIOLIB_DIR="$SP21_HEADERS_ONLY" print-obj-dir PRINT_FOR=test_mcab | tail -1)" || true
+if cmp -s "$sp21_t0_obj/mcab.o" "$sp21_t2_obj/mcab.o" && cmp -s "$sp21_t1_obj/mcab.o" "$sp21_t2_obj/mcab.o"; then
+  pass "SP-S24: mcab.o is byte-identical in the three scopes"
+else
+  fail "SP-S24: mcab.o differs between scopes"
+fi
+# Differences are still detected: a flag the producers fold in moves the narrow scopes too.
+sp21_t0_simd0="$(make -s "${SP21_ARGS[@]}" SIMD=0 print-lib-path | tail -1)" || true
+sp21_t0_xcf="$(make -s "${SP21_ARGS[@]}" EXTRA_CFLAGS=-DSP21_PROBE=1 print-lib-path | tail -1)" || true
+[ "$sp21_t0_simd0" != "$sp21_t0_lib" ] && [ "$sp21_t0_xcf" != "$sp21_t0_lib" ] && [ "$sp21_t0_simd0" != "$sp21_t0_xcf" ] \
+  && pass "SP-S24: SIMD and EXTRA_CFLAGS still move the flow archive's keyed path" \
+  || fail "SP-S24: SIMD/EXTRA_CFLAGS no longer move the flow archive's keyed path"
+# Collision guard: a manifest that no longer matches its key stops the build in the narrow and the full scope.
+sp21_save="$SCRATCH_ROOT/sp21/manifest_t0.saved"; sp21_save2="$SCRATCH_ROOT/sp21/manifest_t2.saved"
+cp "$sp21_t0_bin/config.manifest" "$sp21_save"; cp "$sp21_t2_bin/config.manifest" "$sp21_save2"
+printf 'tampered\n' >> "$sp21_t0_bin/config.manifest"; printf 'tampered\n' >> "$sp21_t2_bin/config.manifest"
+rm -f "$sp21_t0_bin/libaudio_pipeline_mcab.a" "$sp21_t0_obj/mcab.o" "$sp21_t2_bin/mcab_external_static"
+assert_cmd_fails_with "SP-S24: a tampered manifest stops the flow archive build" "CFG_SIG collision" \
+  make -s "${SP21_ARGS[@]}" libaudio_pipeline_mcab.a
+assert_cmd_fails_with "SP-S24: a tampered manifest stops the full-scope build" "CFG_SIG collision" \
+  make -s "${SP21_ARGS[@]}" mcab_external_static
+cp "$sp21_save" "$sp21_t0_bin/config.manifest"; cp "$sp21_save2" "$sp21_t2_bin/config.manifest"
+make -s "${SP21_ARGS[@]}" libaudio_pipeline_mcab.a >/dev/null 2>&1 && [ -f "$sp21_t0_bin/libaudio_pipeline_mcab.a" ] \
+  && pass "SP-S24: with the manifest restored the flow archive builds again" \
+  || fail "SP-S24: the flow archive does not build after the manifest is restored"
+
+echo "############################################################"
+echo "# SP-S25: PRINT_FOR selects the scope a query reports"
+echo "############################################################"
+assert_cmd_fails_with "SP-S25: PRINT_FOR with an unknown goal is refused" "is not a goal of this Makefile" \
+  make -s "${SP21_ARGS[@]}" print-bin-dir PRINT_FOR=no_such_goal
+assert_cmd_fails_with "SP-S25: PRINT_FOR with two goals is refused" "must name exactly one goal" \
+  make -s "${SP21_ARGS[@]}" print-bin-dir "PRINT_FOR=test_mcab mcab_raw"
+[ "$(make -s "${SP21_ARGS[@]}" print-bin-dir PRINT_FOR=all | tail -1)" = "$sp21_t2_bin" ] \
+  && [ "$(make -s "${SP21_ARGS[@]}" print-bin-dir PRINT_FOR=mcab_external_static | tail -1)" = "$sp21_t2_bin" ] \
+  && pass "SP-S25: print-bin-dir reports the 'all' scope by default and for any full-scope goal" \
+  || fail "SP-S25: print-bin-dir without or with a full-scope PRINT_FOR does not report the full-scope directory"
+[ "$(make -s "${SP21_ARGS[@]}" print-lib-path | tail -1)" = "$sp21_t0_lib" ] \
+  && [ "$(make -s "${SP21_ARGS[@]}" print-lib-path PRINT_FOR=all | tail -1)" = "$sp21_t2_bin/libaudio_pipeline_mcab.a" ] \
+  && [ -f "$sp21_t2_bin/libaudio_pipeline_mcab.a" ] \
+  && pass "SP-S25: print-lib-path reports the flow archive's own scope, and the 'all' copy with PRINT_FOR=all" \
+  || fail "SP-S25: print-lib-path / PRINT_FOR=all report an unexpected archive path"
 echo "############################################################"
 echo "# SP1: pipeline-level A->B->A (SIMD=1 -> SIMD=0 -> SIMD=1)"
 echo "############################################################"

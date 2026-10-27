@@ -12,11 +12,13 @@ to the tensors names the pair, so a stray artifact is attributable.
 """
 
 import json
+from pathlib import Path
 import sys
 
 import numpy as np
 import pytest
 
+from calibration_io import calibration_report_path
 import dfn_pairs
 
 pytest.importorskip('soundfile')
@@ -44,7 +46,13 @@ def _assert_window_of(window, mask_lookahead):
 
 
 def _check_artifact(output, pair):
-    report = json.loads(output.with_suffix('.json').read_text())
+    report = json.loads(
+        Path(calibration_report_path(output, 'npz')).read_text()
+    )
+    # The graph's own sidecar sits next to the report; the report must not
+    # have replaced it.
+    graph_sidecar = json.loads(output.with_suffix('.json').read_text())
+    assert 'input_schema' in graph_sidecar and 'seed' not in graph_sidecar
     assert (report['mask_lookahead'], report['df_lookahead']) == pair
     assert report['input_feature_frames'] == INPUT_FRAMES
     props = {prop.key: prop.value for prop in

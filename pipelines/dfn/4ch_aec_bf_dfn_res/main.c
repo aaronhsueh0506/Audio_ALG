@@ -305,7 +305,7 @@ static void dfn_complete(void *user) {
 }
 int main(int argc, char **argv) {
     DfnSample sample={0};
-    static const McabSampleOps ops={dfn_parse,2,dfn_setup,dfn_read,dfn_process,
+    static const McabSampleOps ops={dfn_parse,dfn_setup,dfn_read,dfn_process,
                                   NULL,NULL,NULL,dfn_cleanup,dfn_complete};
     return mcab_sample_main(argc,argv,&ops,&sample);
 }

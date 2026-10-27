@@ -136,7 +136,7 @@ mono 的設定分成兩份：lib/aec 的 `AecConfig`（格點與接縫欄位由�
 `derive_lane(sample_rate, fft_size, preset, &grid, &aec_cfg)`（`mono_aec_nr_res/main.c`）依序做：
 `aec_resolve_signal_grid(sample_rate, fft_size ? fft_size : aec_default_fft_size(sample_rate), &grid)`（回 `0` 即回報失敗）、
 `aec_config_from_preset(&aec_cfg, preset, sample_rate)`，然後設下表的欄位。`aec_get_mem_size()` 與 `aec_init()` 會用 libaec 自己的驗證器
-再檢查整份 `AecConfig`（回 `0`／`NULL`）。
+再檢查整份 `AecConfig`（回 `0`／`NULL`）。`aec_config_from_preset()` 對 8000／16000／48000 以外的取樣率回傳 `fft_size` 與 `filter_length` 皆為 `0` 的不可用設定，`aec_get_mem_size()` 回 `0`、`aec_init()` 回 `NULL`、`aec_create()` 回非 0，函式本身不會溢位。
 
 | 欄位 | 型別 | 範例的值 | 合法值（驗證器實際檢查的） | 你該怎麼設 |
 |---|---|---|---|---|

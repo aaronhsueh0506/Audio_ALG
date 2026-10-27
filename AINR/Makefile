@@ -42,6 +42,28 @@ ifeq ($(SIMD),0)
 SIMD_CPPFLAGS += -DSIMD_KERNELS_FORCE_SCALAR
 endif
 
+# DeepFilterNet2 heads per accelerator invocation (README "Multi-frame
+# export"): a plain decimal in 1..64, the --frames-per-call of the exported
+# graph. Anything else is -DDFN2_FRAMES_PER_CALL=<N> on every unit, so the
+# default adds no flag and keeps its compile lines and build signature; N lands
+# in CFLAGS and therefore in CFG_SIG_PAYLOAD. The contract and chain binaries
+# are one-frame drivers and do not compile for N > 1 (dfn2_model_io.h);
+# `make lib` and tests/test_dfn2_frames_per_call_c.py do.
+DFN2_FRAMES_PER_CALL ?= 1
+override DFN2_FRAMES_PER_CALL := $(strip $(DFN2_FRAMES_PER_CALL))
+DFN2_FRAMES_PER_CALL_VALUES := 1 2 3 4 5 6 7 8 9 10 11 12 13 14 15 16 17 18 19 \
+	20 21 22 23 24 25 26 27 28 29 30 31 32 33 34 35 36 37 38 39 40 41 42 43 \
+	44 45 46 47 48 49 50 51 52 53 54 55 56 57 58 59 60 61 62 63 64
+ifneq ($(words $(DFN2_FRAMES_PER_CALL)),1)
+$(error DFN2_FRAMES_PER_CALL must be one plain decimal in 1..64, got '$(DFN2_FRAMES_PER_CALL)')
+endif
+ifeq ($(filter $(DFN2_FRAMES_PER_CALL),$(DFN2_FRAMES_PER_CALL_VALUES)),)
+$(error DFN2_FRAMES_PER_CALL must be one plain decimal in 1..64, got '$(DFN2_FRAMES_PER_CALL)')
+endif
+ifneq ($(DFN2_FRAMES_PER_CALL),1)
+override CFLAGS += -DDFN2_FRAMES_PER_CALL=$(DFN2_FRAMES_PER_CALL)
+endif
+
 # --- Configuration-keyed outputs --------------------------------------------
 # Every knob that changes what a binary or object contains is folded into a
 # signature, and everything this file builds lives under build/simd<N>-<sig>/.
@@ -227,11 +249,14 @@ test-simd: $(TEST_BIN) $(SCALAR_BIN) $(KERNEL_TEST_BIN) $(KERNEL_TEST_SCALAR_BIN
 # The DeepFilterNet2/3 lookahead pairs the trainer accepts: `make test` and
 # `make test-simd` build the shipped pair only; these pytest files rebuild the
 # C hosts for every other pair (-DDFN2_/DFN3_MASK_LOOKAHEAD, _DF_LOOKAHEAD) and
-# check the link-time and compile-time pair guards.
+# check the link-time and compile-time pair guards. The two frames_per_call
+# files do the same for DFN2_FRAMES_PER_CALL against the one-frame graph and
+# host, per pair.
 PYTHON ?= python3
 PAIR_TESTS := tests/test_dfn2_lookahead_pairs.py tests/test_dfn2_prepost_c.py \
 	tests/test_dfn3_prepost_c.py tests/test_dfn3_stream_c.py \
-	tests/test_dfn_lookahead_link.py tests/test_dfn_lookahead_calibration.py
+	tests/test_dfn_lookahead_link.py tests/test_dfn_lookahead_calibration.py \
+	tests/test_dfn2_frames_per_call.py tests/test_dfn2_frames_per_call_c.py
 test-pairs:
 	PYTHONDONTWRITEBYTECODE=1 $(PYTHON) -m pytest -q -p no:cacheprovider $(PAIR_TESTS)
 

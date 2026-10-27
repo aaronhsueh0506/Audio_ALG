@@ -239,7 +239,7 @@ static void ulc_cleanup(void *user) {
 }
 int main(int argc, char **argv) {
     UlcSample sample={0};
-    static const McabSampleOps ops={ulc_parse,2,ulc_setup,ulc_read,ulc_process,
+    static const McabSampleOps ops={ulc_parse,ulc_setup,ulc_read,ulc_process,
                                   NULL,NULL,NULL,ulc_cleanup,ulc_complete};
     return mcab_sample_main(argc,argv,&ops,&sample);
 }

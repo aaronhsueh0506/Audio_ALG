@@ -3,7 +3,7 @@ r"""Analyse a PTQ calibration artifact and help choose which patterns to keep.
 
 A calibration artifact is what ``inference.py calib`` writes: one array per
 graph input whose leading axis is the captured invocation ("frame"), either a
-``.npz`` (+ sibling ``.json``) or a per-frame ``.bin`` directory
+``.npz`` (+ sibling ``.calib.json``) or a per-frame ``.bin`` directory
 (+ ``manifest.json``).  A range-based quantizer sets each tensor's scale from
 the extremes it sees, so a handful of frames holding an outlier can stretch the
 range and cost every other frame resolution.  This tool shows where that
@@ -47,7 +47,10 @@ _AINR_DIR = os.path.join(os.path.dirname(_HERE), 'AINR')  # home of calibration_
 if _AINR_DIR not in sys.path:
     sys.path.insert(0, _AINR_DIR)
 
-from calibration_io import write_calibration_artifact  # noqa: E402
+from calibration_io import (  # noqa: E402
+    calibration_report_path,
+    write_calibration_artifact,
+)
 
 SAMPLE_CAP = 2_000_000       # elements per tensor used for percentiles / SQNR
 EPS = 1e-12
@@ -86,6 +89,17 @@ def _read_json(path):
         return json.load(stream)
 
 
+def _npz_report(path):
+    report = _read_json(calibration_report_path(path, 'npz'))
+    if report:
+        return report
+    # An archive written before the report had its own name keeps it at
+    # <stem>.json; that file is a report only when it says so, since the graph
+    # exported with the archive shares the stem.
+    legacy = _read_json(os.path.splitext(path)[0] + '.json')
+    return legacy if legacy.get('artifact_format') == 'numpy_npz' else {}
+
+
 def load_artifact(path):
     path = os.path.abspath(path)
     if os.path.isdir(path):
@@ -115,8 +129,7 @@ def load_artifact(path):
     if path.endswith('.npz') and os.path.isfile(path):
         with np.load(path) as data:
             arrays = {name: data[name] for name in data.files}
-        report = _read_json(os.path.splitext(path)[0] + '.json')
-        return Artifact(path, 'npz', arrays, report)
+        return Artifact(path, 'npz', arrays, _npz_report(path))
     raise ValueError('expected a .npz file or a BIN directory: %s' % path)
 
 

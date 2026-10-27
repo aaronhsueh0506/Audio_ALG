@@ -189,13 +189,35 @@ The C hosts are exercised for the shipped pair by `make test` / `make test-simd`
 and for every other pair by pytest, which rebuilds them per pair
 (`make test-pairs`: `tests/test_dfn2_lookahead_pairs.py`,
 `test_dfn2_prepost_c.py`, `test_dfn3_stream_c.py`, `test_dfn3_prepost_c.py`,
-`test_dfn_lookahead_link.py`, `test_dfn_lookahead_calibration.py`). The Python
+`test_dfn_lookahead_link.py`, `test_dfn_lookahead_calibration.py`, and the
+multi-frame files `test_dfn2_frames_per_call.py`,
+`test_dfn2_frames_per_call_c.py`). The Python
 parts (export, replay, calibration, offline inference) run for all 15 pairs;
 the C builds for the six pairs with `D <= M` and (0,1), (1,3), (2,4). The
 pairs, the shipped pair and the compile flags the tests use come from
 `tests/dfn_pairs.py` (constructor, `config.ini`, `make print-cflags`). No
 checkpoint trained for a pair other than the shipped one exists here, so the
 audio quality of the others is unmeasured.
+
+### Multi-frame export
+
+DeepFilterNet2 only. `export_onnx.py --frames-per-call N` (default 1) exports
+a graph that takes `N + 2` feature frames and returns the heads of N
+consecutive frames with the state after the last one; the state tensors keep
+their shapes. N = 1 writes exactly the one-frame graph and JSON. The metadata of
+an N-frame graph records `frames_per_call` and `chunk_window_alignment`
+(`input_feature_frames` = N + 2, `output_frames_per_invocation` = N), and
+`onnx_streaming_contract.validate_frames_per_call` refuses a graph whose
+metadata and shapes disagree. The C host is built with
+`make DFN2_FRAMES_PER_CALL=<N>` (1..64; `-DDFN2_FRAMES_PER_CALL=<N>` on every
+unit): it runs the accelerator every N hops, composes the N frames in one
+burst and still emits one hop per call, so the output trails by N - 1 more
+hops (DFN2 latency `1 + M + D + N - 1` hops). The pool hash, the descriptor
+(`frames_per_call`) and a link-time symbol carry N; a unit written for one
+frame per call does not compile for N > 1, so `make test` / `make test-simd`
+(one-frame drivers) and the pipelines DFN stage stay at N = 1 while
+`make lib` builds for any N. Details in
+[`DeepFilterNet2/README.md`](DeepFilterNet2/README.md#multi-frame-export).
 
 The DFN C API also performs ERB/complex feature normalization, mask expansion,
 deep-filter composition, optional post-filter/attenuation limiting, and WOLA.
@@ -240,7 +262,7 @@ The active deployment exports are stateless accelerator graphs:
 | Model | New signal context per call | Caller-owned model state |
 |---|---:|---|
 | RNNoise-ERB | 3 feature frames -> 1 gain frame | 3 GRU hidden tensors |
-| DeepFilterNet2 | 3 feature frames -> 1 head frame | `h_gru` (1,5,1,256) + 5-frame DF pathway window (1,64,5,96) |
+| DeepFilterNet2 | 3 feature frames -> 1 head frame (N + 2 -> N with `--frames-per-call N`) | `h_gru` (1,5,1,256) + 5-frame DF pathway window (1,64,5,96) |
 | DeepFilterNet3 | 3 feature frames -> 1 two-head frame | same state tensor geometry as DFN2, independent layout 9, no alpha output |
 | GTCRN | 1 complex STFT frame | 6 conv windows (1,16,3\|5\|11,33) + `h_tra` (1,6,1,16) + `h_dpgrnn` (1,4,33,8) |
 

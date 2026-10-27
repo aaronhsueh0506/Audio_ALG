@@ -242,7 +242,8 @@ Build the applications or run the complete C acceptance gate from
 make mcab_external_static  # build caller-pool reference executable (flow + chain)
 make mcab_static           # build caller-pool reference executable (flow + sample beam helper + chain)
 make mcab_raw              # build the recording-validation runner (flow + sample beam helper + chain)
-make test_mcab             # build only the flow test binary
+make libaudio_pipeline_mcab.a  # the flow archive alone (needs only audiolib common and lib/aec)
+make test_mcab             # build only the flow test binary (needs lib/aec and lib/nr, not the spatial kernels)
 make test_mcab_sample_beam # build only the sample beam helper test
 make test_4ch_dfn test_4ch_ulcnet   # the DFN2 / Align-ULCNet compositions
 make 4ch_alignulcnet       # the Align-ULCNet board skeleton
@@ -268,8 +269,20 @@ directory. Only the 1/1 pair has a trained checkpoint, and the audio quality of 
 `mcab_sample_beam.o`, `mcab_sample_driver.o`), the example chain headers and the ULCNet stage object
 (`ulcnet_nn_stage.o`) are compiled into the application binaries that use them; no
 per-application archive is produced. A consumer of the flow alone links `libaudio_pipeline_mcab.a`, `libaec.a`,
-`libanr.a`, `libaudio_common.a` and `-lm`. A consumer of the sample beam helper links `mcab_sample_beam.o` and
+`libaudio_common.a` and `-lm` (`mcab.o` references lib/aec and audiolib's common utilities only; `libanr.a` is for
+the programs that chain NR behind the flow). A consumer of the sample beam helper links `mcab_sample_beam.o` and
 `mcab_sample_flow.o`, then `libaudio_pipeline_mcab.a`, `libdoa.a`, `libbf.a`, `libspatial_common.a`, `libaec.a`,
 `libanr.a`, `libaudio_common.a`, and `-lm`, in the order demonstrated by this directory's Makefile.
+
+Each goal resolves, and keys its `bin/ne10-<sig>/` and `obj/ne10-<sig>/` directories on, only the producers it
+needs: `libaudio_pipeline_mcab.a` lib/aec and audiolib common (lib/nr and audiolib's spatial kernels may be absent),
+`test_mcab` adds lib/nr, every other goal all of them; a goal missing a producer it needs stops and names it. The
+same goal built in a narrower scope lands in its own directory. `make -s print-lib-path` prints the flow archive of
+its own scope, `make -s print-bin-dir` / `print-obj-dir` the directory of `make all`, and `PRINT_FOR=<goal>` the one
+of that goal (`PRINT_FOR=all` locates the copy of the archive that `make all` builds):
+
+```bash
+make test_mcab && "$(make -s print-bin-dir PRINT_FOR=test_mcab)/test_mcab"
+```
 
 [Index](README.md) | previous: [Call sequence and parameter surface](README.md#call-sequence-and-parameter-surface) | next: [Python reference seam](README.md#python-reference-seam) <!-- split-nav -->

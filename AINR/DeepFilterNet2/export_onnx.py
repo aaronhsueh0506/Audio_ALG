@@ -21,6 +21,18 @@ window, and the metadata publishes ``mask_lookahead``, ``df_lookahead`` and the
 alignment so a host built for another pair is detectable. ``df_lookahead`` only
 shifts the host's deep-filter taps.
 
+Frames per call
+---------------
+
+``--frames-per-call N`` (default 1) exports a graph that takes ``N + 2``
+feature frames ``[t-(2-L) .. t+N-1+L]`` and emits the heads of frames
+``t .. t+N-1``; head ``i`` reads the three frames from slot ``i``. The GRUs run
+over the N frames as one sequence and the state outputs are the state after
+the last frame, with the same shapes as for one frame. ``feature_chunk_windows``
+builds these windows. N = 1 is the one-frame graph, byte for byte; for N > 1
+the metadata adds ``frames_per_call`` and ``chunk_window_alignment`` and
+``validate_frames_per_call`` checks them against the shapes.
+
 State boundary
 --------------
 
@@ -38,7 +50,8 @@ is the next call's input with no copy (``state_binding`` in the metadata).
 ``df_convp_history`` ``(1, 64, 5, 96)``
     The full causal window of the deep-filter pathway convolution. The graph
     drops the oldest frame with a Slice on the input, concatenates the new
-    frame, convolves, and returns the whole concatenation as the next window.
+    frame, convolves, and returns the whole concatenation as the next window
+    (its last five frames for N frames per call, see ``_df_pathway_step``).
     The Slice is the only consumer of the input, has explicit integer bounds
     and step 1, and no state output is produced by a Slice.
 
@@ -78,11 +91,15 @@ if _AINR_ROOT not in sys.path:
 from onnx_streaming_contract import (
     lookahead_window_alignment,
     lookahead_window_offsets,
+    validate_frames_per_call,
     validate_inplace_state_from_metadata,
     validate_nctf_no_temporal_padding,
 )
 
 INPUT_FRAMES = 3
+# Heads per invocation the C host and the Makefile accept
+# (DFN2_MODEL_MAX_FRAMES_PER_CALL in dfn2_model_io.h).
+MAX_FRAMES_PER_CALL = 64
 
 # Kept numerically equal to DFN2_MODEL_IO_LAYOUT_VERSION in dfn2_model_io.h,
 # which declares the caller-owned state struct this graph consumes and emits.
@@ -111,6 +128,11 @@ STATE_NAMES = (GRU_STATE_NAME, PATHWAY_STATE_NAME)
 
 INPUT_NAMES = CONTENT_INPUT_NAMES + STATE_NAMES
 OUTPUT_NAMES = HEAD_OUTPUT_NAMES + tuple(name + '_out' for name in STATE_NAMES)
+
+# The time axis of each feature-window input and head output: it holds
+# frames_per_call + 2 frames on an input and frames_per_call on an output.
+WINDOW_INPUT_TIME_AXES = {'erb': 2, 'spec': 2}
+HEAD_OUTPUT_TIME_AXES = {'erb_mask': 2, 'df_coefs': 1, 'df_alpha': 1}
 
 # Which output hands each state input back. Zipped, not indexed.
 STATE_HANDOFF = dict(zip(STATE_NAMES, OUTPUT_NAMES[len(HEAD_OUTPUT_NAMES):]))
@@ -267,10 +289,33 @@ def window_alignment(mask_lookahead):
     return lookahead_window_alignment(mask_lookahead, INPUT_FRAMES)
 
 
-def _lookahead_centre(module, window):
-    """Run a LookaheadConv2d on its complete temporal window, emitting frame t."""
-    if window.shape[2] != INPUT_FRAMES:
-        raise ValueError('DFN2 expects exactly three input feature frames')
+def chunk_input_frames(frames_per_call):
+    """Feature frames of one invocation that emits ``frames_per_call`` heads:
+    the N three-frame windows overlap, so they span ``N + 2`` frames."""
+    if (isinstance(frames_per_call, bool)
+            or not isinstance(frames_per_call, int)
+            or not 1 <= frames_per_call <= MAX_FRAMES_PER_CALL):
+        raise ValueError('frames_per_call must be an integer in [1, %d], got %r'
+                         % (MAX_FRAMES_PER_CALL, frames_per_call))
+    return INPUT_FRAMES - 1 + frames_per_call
+
+
+def chunk_window_alignment(mask_lookahead, frames_per_call):
+    """``'[t-1 .. t+N] -> heads[t .. t+N-1]'``-style string of one N-frame
+    call's window; head ``i`` reads the three frames starting at slot ``i``."""
+    offsets = window_frames(mask_lookahead)
+    last = frames_per_call - 1
+    names = ['t' if offset == 0 else 't%+d' % offset
+             for offset in (offsets[0], last + offsets[-1])]
+    return '[%s .. %s] -> heads[t .. t+%d]' % (names[0], names[1], last)
+
+
+def _lookahead_centre(module, window, frames=1):
+    """Run a LookaheadConv2d on its complete temporal window, emitting
+    ``frames`` frames (frame t, and the following ones for a longer window)."""
+    if window.shape[2] != INPUT_FRAMES - 1 + frames:
+        raise ValueError('DFN2 expects %d input feature frames for %d heads'
+                         % (INPUT_FRAMES - 1 + frames, frames))
     layers = list(module.children())
     conv = layers[1]
     if conv.kernel_size[0] != INPUT_FRAMES:
@@ -283,8 +328,9 @@ def _lookahead_centre(module, window):
     output = F.pad(window, (pad.padding[0], pad.padding[1], 0, 0))
     for layer in layers[1:]:
         output = layer(output)
-    if output.shape[2] != 1:
-        raise RuntimeError('DFN2 centre convolution did not emit one frame')
+    if output.shape[2] != frames:
+        raise RuntimeError('DFN2 centre convolution did not emit %d frames'
+                           % frames)
     return output
 
 
@@ -298,24 +344,41 @@ def _squeezed_gru(module, value, hidden):
     return value, hidden_next
 
 
-def _df_pathway_step(module, current, window):
+def _df_pathway_step(module, current, window, current_tail=None):
     """Run the causal kernel-5 DF residual and return its next window.
 
     ``window`` is the previous call's full concatenation. Its oldest frame is
     dropped by a Slice on the graph input with explicit integer bounds, the
-    new frame is appended, and the whole result is the next window.
+    new frames are appended, and the convolution runs over the result without
+    padding, one output per new frame. With one new frame the whole result is
+    the next window. With N new frames the next window is its last ``kernel``
+    frames: the kept history followed by the N frames while N < kernel, the
+    new frames alone at N == kernel, and for N > kernel ``current_tail``,
+    which the caller computes as its own tensor so the state output is not
+    produced by a Slice.
     """
     kernel = module.conv.kernel_size[0]
     if window.shape[2] != kernel:
         raise ValueError('df_convp_history has the wrong temporal depth')
-    combined = torch.cat((window[:, :, 1:kernel], current), dim=2)
+    frames = current.shape[2]
+    history = window[:, :, 1:kernel]
+    combined = torch.cat((history, current), dim=2)
     output = module.conv(combined)
     output = module.pw(output)
     output = module.bn(output)
     output = module.act(output)
-    if output.shape[2] != 1:
-        raise RuntimeError('DF pathway did not emit one frame')
-    return output, combined
+    if output.shape[2] != frames:
+        raise RuntimeError('DF pathway did not emit %d frames' % frames)
+    if frames == 1:
+        return output, combined
+    if frames < kernel:
+        return output, torch.cat((history[:, :, frames - 1:], current), dim=2)
+    if frames == kernel:
+        return output, current
+    if current_tail is None or current_tail.shape[2] != kernel:
+        raise ValueError('more new frames than the pathway window needs '
+                         'its last %d frames as a separate tensor' % kernel)
+    return output, current_tail
 
 
 def feature_windows(feature, mask_lookahead):
@@ -329,22 +392,47 @@ def feature_windows(feature, mask_lookahead):
     ``mask_lookahead`` has no default and is checked when this is called, not
     when the first window is taken.
     """
+    return feature_chunk_windows(feature, mask_lookahead, 1)
+
+
+def feature_chunk_windows(feature, mask_lookahead, frames_per_call):
+    """Return the ``N + 2``-frame windows of an N-frame graph over a stream.
+
+    Window ``c`` yields ``heads[cN .. cN+N-1]`` and spans
+    ``[cN-(2-L) .. cN+N-1+L]``; its 3-frame slice ``i`` is
+    ``feature_windows``' window ``cN+i``. A stream whose length is not a
+    multiple of N is zero-padded on the right to complete the last call, as
+    the host does when it flushes with zero frames. ``frames_per_call=1``
+    gives exactly ``feature_windows``.
+    """
+    span = chunk_input_frames(frames_per_call)
     offsets = window_frames(mask_lookahead)
-    padded = F.pad(feature, (0, 0, -offsets[0], offsets[-1]))
-    return (padded[:, :, index:index + INPUT_FRAMES]
-            for index in range(feature.shape[2]))
+    chunks = -(-feature.shape[2] // frames_per_call)
+    tail = chunks * frames_per_call - feature.shape[2]
+    padded = F.pad(feature, (0, 0, -offsets[0], offsets[-1] + tail))
+    return (padded[:, :, index * frames_per_call:
+                   index * frames_per_call + span]
+            for index in range(chunks))
 
 
 class StatelessDFN2Heads(nn.Module):
-    """Functional one-output-frame twin of ``DeepFilterNet2.heads``.
+    """Functional twin of ``DeepFilterNet2.heads`` for N output frames.
 
     ``batch_size`` is a fixed graph contract, not a dynamic ONNX axis.  Each
     batch element is an independent streaming lane with its own recurrent and
     convolutional state.  The normal deployment graph keeps the default of
     one; ``inference_batch.py`` uses larger values for NPU profiling.
+
+    ``frames_per_call`` (N, default 1) is fixed the same way: one invocation
+    takes ``N + 2`` feature frames and emits the heads of N consecutive
+    frames. The three GRUs run over the N frames as one sequence and the
+    returned state is the one after the last frame; the pathway window
+    advances by N. Every other layer acts on one frame at a time. Fed in
+    chunks of N with the state carried between calls, it equals the
+    one-frame graph fed frame by frame.
     """
 
-    def __init__(self, model, batch_size=1):
+    def __init__(self, model, batch_size=1, frames_per_call=1):
         super().__init__()
         self.model = model
         if isinstance(batch_size, bool) or not isinstance(batch_size, int):
@@ -352,6 +440,8 @@ class StatelessDFN2Heads(nn.Module):
         if batch_size <= 0:
             raise ValueError('batch_size must be positive')
         self.batch_size = batch_size
+        chunk_input_frames(frames_per_call)
+        self.frames_per_call = frames_per_call
         # The host window for heads[t] is [t-(2-L), ..., t+L]; the model's own
         # input convolutions must have been built for that same L.
         offsets = window_frames(model.mask_lookahead)
@@ -394,9 +484,15 @@ class StatelessDFN2Heads(nn.Module):
     def df_lookahead(self):
         return self.model.df_lookahead
 
+    @property
+    def input_frames(self):
+        """Feature frames per invocation, ``frames_per_call + 2``."""
+        return chunk_input_frames(self.frames_per_call)
+
     def initial_inputs(self):
         """This instance's dummy inputs."""
-        return initial_inputs(self.model, batch_size=self.batch_size)
+        return initial_inputs(self.model, batch_size=self.batch_size,
+                              frames_per_call=self.frames_per_call)
 
     def forward(self, feat_erb_window, feat_spec_window, gru_state,
                 df_convp_history):
@@ -415,17 +511,32 @@ class StatelessDFN2Heads(nn.Module):
             )
         model = self.model
         enc = model.encoder
+        frames = self.frames_per_call
+        pathway = model.df_dec.df_convp.conv.kernel_size[0]
 
-        e0 = _lookahead_centre(enc.erb_conv0, feat_erb_window)
+        e0 = _lookahead_centre(enc.erb_conv0, feat_erb_window, frames)
         e1 = enc.erb_conv1(e0)
         e2 = enc.erb_conv2(e1)
         e3 = enc.erb_conv3(e2)
-        c0 = _lookahead_centre(enc.df_conv0, feat_spec_window)
+        c0_tail = None
+        if frames > pathway:
+            # The last `pathway` frames of c0 are the next pathway window;
+            # they are convolved from their own window slice (the same
+            # products as one convolution over the whole window).
+            split = frames - pathway
+            c0_tail = _lookahead_centre(
+                enc.df_conv0, feat_spec_window[:, :, split:], pathway)
+            c0 = torch.cat((_lookahead_centre(
+                enc.df_conv0,
+                feat_spec_window[:, :, :split + INPUT_FRAMES - 1], split),
+                c0_tail), dim=2)
+        else:
+            c0 = _lookahead_centre(enc.df_conv0, feat_spec_window, frames)
         c1 = enc.df_conv1(c0)
 
         batch = e3.shape[0]
-        e3_flat = e3.permute(0, 2, 3, 1).reshape(batch, 1, -1)
-        c1_flat = c1.permute(0, 2, 3, 1).reshape(batch, 1, -1)
+        e3_flat = e3.permute(0, 2, 3, 1).reshape(batch, frames, -1)
+        c1_flat = c1.permute(0, 2, 3, 1).reshape(batch, frames, -1)
         df_embedding = enc.df_fc_emb(c1_flat)
         if enc.enc_concat:
             embedding = torch.cat((e3_flat, df_embedding), dim=-1)
@@ -440,7 +551,7 @@ class StatelessDFN2Heads(nn.Module):
             erb.emb_gru, embedding, erb_gru_hidden
         )
         erb_value = erb_value.reshape(
-            batch, 1, erb.n_erb_4, erb.enc_ch
+            batch, frames, erb.n_erb_4, erb.enc_ch
         ).permute(0, 3, 1, 2)
         erb_value = erb.convt3(erb.conv3p(e3) + erb_value)
         erb_value = erb.convt2(erb.conv2p(e2) + erb_value)
@@ -454,12 +565,12 @@ class StatelessDFN2Heads(nn.Module):
         if decoder.df_skip is not None:
             df_value = df_value + decoder.df_skip(embedding)
         c0_residual, pathway_window_next = _df_pathway_step(
-            decoder.df_convp, c0, df_convp_history
+            decoder.df_convp, c0, df_convp_history, c0_tail
         )
         c0_residual = c0_residual.permute(0, 2, 3, 1)
         alpha = decoder.df_fc_a(df_value)
         coefficients = decoder.df_out(df_value).view(
-            batch, 1, decoder.df_bins, decoder.df_order * 2
+            batch, frames, decoder.df_bins, decoder.df_order * 2
         )
         coefficients = coefficients + c0_residual
         heads = (erb_mask, coefficients, alpha)
@@ -520,16 +631,17 @@ def gru_state_shape(model, batch_size=1):
             widths.pop())
 
 
-def initial_inputs(model, batch_size=1):
+def initial_inputs(model, batch_size=1, frames_per_call=1):
     if isinstance(batch_size, bool) or not isinstance(batch_size, int):
         raise TypeError('batch_size must be an integer')
     if batch_size <= 0:
         raise ValueError('batch_size must be positive')
+    input_frames = chunk_input_frames(frames_per_call)
     enc_ch = model.encoder.erb_conv0[1].out_channels
     pathway_window = model.df_dec.df_convp.conv.kernel_size[0]
     return (
-        torch.randn(batch_size, 1, INPUT_FRAMES, model.n_erb),
-        torch.randn(batch_size, 2, INPUT_FRAMES, model.df_bins),
+        torch.randn(batch_size, 1, input_frames, model.n_erb),
+        torch.randn(batch_size, 2, input_frames, model.df_bins),
         torch.zeros(gru_state_shape(model, batch_size)),
         torch.zeros(
             batch_size, enc_ch, pathway_window, model.df_bins
@@ -576,13 +688,15 @@ def gru_state_slice_report(combined, stats, slices):
 
 
 def build_metadata(checkpoint_path, params, inputs, outputs, mask_lookahead,
-                   df_lookahead):
+                   df_lookahead, frames_per_call=1):
     """The exported graph's metadata.
 
     Separate from ``main`` so the contract test can compare
     ``state_layout_version`` against dfn2_model_io.h without an ONNX export.
+    A graph for one frame per call carries no ``frames_per_call`` key, so its
+    metadata is the same as before the option existed.
     """
-    return {
+    metadata = {
         'model_family': 'DeepFilterNet2',
         'checkpoint_sha256': file_sha256(checkpoint_path),
         'boundary': 'stateless_streaming_heads_explicit_state',
@@ -610,6 +724,13 @@ def build_metadata(checkpoint_path, params, inputs, outputs, mask_lookahead,
         'input_schema': _schema(INPUT_NAMES, inputs),
         'output_schema': _schema(OUTPUT_NAMES, outputs),
     }
+    if frames_per_call != 1:
+        metadata['input_feature_frames'] = chunk_input_frames(frames_per_call)
+        metadata['output_frames_per_invocation'] = int(frames_per_call)
+        metadata['frames_per_call'] = int(frames_per_call)
+        metadata['chunk_window_alignment'] = chunk_window_alignment(
+            mask_lookahead, frames_per_call)
+    return metadata
 
 
 def export_graph(wrapper, params, checkpoint_path, output_path,
@@ -642,11 +763,14 @@ def export_graph(wrapper, params, checkpoint_path, output_path,
     onnx.checker.check_model(graph)
     validate_nctf_no_temporal_padding(graph, require_static=verify)
     metadata = build_metadata(checkpoint_path, params, inputs, outputs,
-                              wrapper.mask_lookahead, wrapper.df_lookahead)
+                              wrapper.mask_lookahead, wrapper.df_lookahead,
+                              wrapper.frames_per_call)
     set_onnx_metadata(graph, metadata)
     _pin_static_output_shapes(graph, output_names, outputs)
     graph = _resolve_internal_shapes(graph)
     validate_inplace_state_from_metadata(graph)
+    validate_frames_per_call(graph, WINDOW_INPUT_TIME_AXES,
+                             HEAD_OUTPUT_TIME_AXES, INPUT_FRAMES)
     onnx.save(graph, output_path)
     with open(os.path.splitext(output_path)[0] + '.json', 'w',
               encoding='utf-8') as stream:
@@ -682,7 +806,14 @@ def main():
     parser.add_argument('--output', required=True)
     parser.add_argument('--opset', type=int, default=17)
     parser.add_argument('--verify', action='store_true')
+    parser.add_argument('--frames-per-call', type=int, default=1,
+                        help='heads emitted per invocation (N); the graph '
+                             'takes N + 2 feature frames. 1 writes the '
+                             'one-frame graph')
     args = parser.parse_args()
+    if not 1 <= args.frames_per_call <= MAX_FRAMES_PER_CALL:
+        parser.error('--frames-per-call must be in [1, %d]'
+                     % MAX_FRAMES_PER_CALL)
 
     try:
         from .inference import load_model
@@ -691,7 +822,8 @@ def main():
     model, params = load_model(SimpleNamespace(
         config=args.config, model=args.model
     ))
-    wrapper = StatelessDFN2Heads(model).eval()
+    wrapper = StatelessDFN2Heads(
+        model, frames_per_call=args.frames_per_call).eval()
     export_graph(wrapper, params, args.model, args.output,
                  opset=args.opset, verify=args.verify)
     print(args.output)

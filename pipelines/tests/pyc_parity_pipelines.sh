@@ -48,12 +48,8 @@
 #   --only P[,P...]  run only scenarios whose id starts with one of the prefixes (see --list)
 #   --list           print the scenario ids and exit
 #   --reuse-build    keep the build trees of an earlier run (skips the build-flag assertion)
-#   --mutation-proof ["name[:K,K,..] ..."] [--make-test]
-#                    plant small deviations, one at a time, in a scratch copy of the sources and show that the
-#                    script FAILS on each (details at the top of pyc_parity/mutation_proof.sh); --make-test also
-#                    runs the repository's own `make SIMD=0 test` on the mutated copy
 # environment: PYTHON (python3 with numpy, scipy, soundfile, pyyaml), PYC_TREE (a directory holding
-#   Audio_ALG/ and audiolib/common/ to build and test instead of this checkout; used by --mutation-proof),
+#   Audio_ALG/ and audiolib/common/ to build and test instead of this checkout),
 #   PYC_JOBS (make -j, default 4), CC / CXX (default cc / c++).
 # Python runs serially (OMP_NUM_THREADS=1); the C builds use PYC_JOBS.
 
@@ -62,7 +58,6 @@ set -o pipefail
 
 HERE="$(cd "$(dirname "$0")" && pwd)"
 PARITY="$HERE/pyc_parity"
-SELF="$HERE/$(basename "$0")"
 SELF_ALG="$(cd "$HERE/../.." && pwd)"
 TREE="${PYC_TREE:-$(cd "$SELF_ALG/.." && pwd)}"
 ALG="$TREE/Audio_ALG"
@@ -80,9 +75,6 @@ LAYERS="1,2"
 ONLY=""
 LIST=0
 REUSE=0
-MUTATION=""
-MUTATION_ARGS_SET=0
-MAKE_TEST=0
 
 die() { echo "pyc_parity: $*" >&2; exit 2; }
 
@@ -94,9 +86,6 @@ while [ $# -gt 0 ]; do
     --only) ONLY="$2"; shift 2 ;;
     --list) LIST=1; shift ;;
     --reuse-build) REUSE=1; shift ;;
-    --mutation-proof) MUTATION_ARGS_SET=1; shift
-                      if [ $# -gt 0 ] && [ "${1#--}" = "$1" ]; then MUTATION="$1"; shift; fi ;;
-    --make-test) MAKE_TEST=1; shift ;;
     -h|--help) sed -n '2,/^$/p' "$0" | sed 's/^# \{0,1\}//'; exit 0 ;;
     *) die "unknown option $1" ;;
   esac
@@ -115,16 +104,6 @@ case "$(cd "$(dirname "$WORK")" 2>/dev/null && pwd)/$(basename "$WORK")" in
   "$TREE"/*) die "work directory $WORK is inside the source tree $TREE" ;;
 esac
 [ -n "$JSON" ] || JSON="$WORK/results.json"
-
-# --------------------------------------------------------------------------------------------
-# Mutation proof: see the end of the file.
-# --------------------------------------------------------------------------------------------
-if [ "$MUTATION_ARGS_SET" = 1 ]; then
-  # shellcheck disable=SC1090
-  . "$PARITY/mutation_proof.sh"
-  mutation_proof_main
-  exit $?
-fi
 
 mkdir -p "$WORK" || die "cannot create $WORK"
 mkdir -p "$WORK/logs" "$WORK/inputs" "$WORK/run"

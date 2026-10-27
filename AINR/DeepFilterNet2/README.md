@@ -67,7 +67,9 @@ reference; `make -C .. SIMD=0 test` forces the latter.
 composes `dfn2_process.c` and `dfn2_model_io.c` behind the same lifecycle and per-hop
 shape as the AIAEC classes, described once in `../../AIAEC/README.md`
 ("C pre/post-processing"). Specific to this one: `pre_process` returns 0 on
-the first hop (the graph needs its right-hand neighbour) and 1 after; the
+the first hop (the graph needs its right-hand neighbour) and 1 after (every
+N-th hop in a build for N frames per call, see
+[Multi-frame export](#multi-frame-export)); the
 spectra at the `DFN2_IO_FREQ` boundary are torch.stft normalized=True on this
 48 kHz/1024 grid, so chaining an AIAEC spectrum in is a 32x scale error (the
 header's warning block); the window is borrowed (a `cfg.window` of NULL
@@ -191,6 +193,76 @@ all four lanes.  The recurrent input is `(B,5,1,256)` and the pathway window
 JSON records `fixed_batch_size`, exact tensor shapes, and the number of source
 frame snapshots.  The C model-I/O helper remains the shipped batch-one
 contract; fixed batch is a profiling contract only.
+
+## Multi-frame export
+
+`export_onnx.py --frames-per-call N` (default 1, at most 64 as in the C host) writes a graph that runs N
+frames per invocation, for an accelerator where one call per hop costs more
+than the extra latency. `--frames-per-call 1`, or no option, writes the same
+ONNX and JSON bytes as before the option existed.
+
+| | one frame per call | N frames per call |
+| --- | --- | --- |
+| `erb`, `spec` | `(1,1,3,32)`, `(1,2,3,96)` | `(1,1,N+2,32)`, `(1,2,N+2,96)`, frames `[t-(2-M) .. t+N-1+M]` |
+| `erb_mask`, `df_coefs`, `df_alpha` | heads of frame `t` | heads of frames `t .. t+N-1`, oldest first |
+| `h_gru`, `df_convp_history` | `(1,5,1,256)`, `(1,64,5,96)` | unchanged |
+| metadata | — | `frames_per_call`, `chunk_window_alignment`; `input_feature_frames` = N+2, `output_frames_per_invocation` = N |
+
+Head `i` reads the three window frames starting at slot `i`, exactly the
+one-frame window of frame `t+i`. The three GRUs run over the N frames as one
+sequence (one GRU node per layer, as for N = 1) and `h_gru_out` is the hidden
+state after the last frame. `df_convp_history_out` is the last five frames of
+the pathway input: the kept history and the new frames for N < 5, the new
+frames for N = 5; for N > 5 the last five frames of the DF input convolution
+are computed from their own slice of the `spec` window, so the state output is
+a convolution result and not a Slice (the in-place rule above; the same
+multiply-adds as one convolution). Every other layer works on one frame at a
+time. Fed in chunks of N with the state carried between calls, the graph equals
+the one-frame graph fed frame by frame. `onnx_streaming_contract.py`
+(`validate_frames_per_call`) refuses a graph whose `frames_per_call` disagrees
+with its window and head shapes, and a one-frame graph that records one.
+
+`inference.py calib --frames-per-call N` exports the N-frame graph and records
+its invocations (`--frames` counts invocations, the report records
+`frames_per_call`).
+
+The C host takes N as `-DDFN2_FRAMES_PER_CALL=<N>` (1..64, plain decimal; the
+AINR Makefile variable `DFN2_FRAMES_PER_CALL` adds it) on every translation
+unit, with the lookahead pair:
+
+- the window holds `N + 2` frames; the first call is ready after `M + N`
+  pushed frames, every later one after N more (`pre_process` returns 1 on hops
+  `M+N-1`, `M+2N-1`, ...); `dfn2_model_io_frame_slot()` names the slot of the
+  last pushed frame;
+- `frame_inputs()` publishes N heads per tensor, commit composes the N frames
+  in one burst, and `post_process` returns one hop per call from that burst,
+  so the output trails by N - 1 more hops: latency `1 + M + D + N - 1` hops
+  (`DFN2_PREPOST_LATENCY_FRAMES` + 1; 10 hops, 106.7 ms, at the shipped pair
+  with N = 8). A refused commit zeroes the state once and passes all N frames
+  as the identity; flushing means pushing zero hops until the last real one
+  has been emitted;
+- `DFN2ModelIoDescriptor` has `frames_per_call` (metadata `frames_per_call`,
+  1 when absent) and `input_frames` = N + 2 (metadata `input_feature_frames`);
+  `dfn2_model_io_descriptor_validate()` and `dfn2_model_run_frame()` refuse
+  another N;
+- N > 1 is folded into the pool hash (a pool of another N is refused) and
+  objects built for different N do not link (`dfn2_frames_per_call<N>`);
+- N > 1 changes the per-hop contract, so a unit written for one frame per call
+  does not compile against it (`#error` in `dfn2_model_io.h`); a unit that
+  drives N frames defines `DFN2_MULTI_FRAME_HOST`. The pipelines DFN stage and
+  its Python twin are one-frame units and stay at N = 1.
+
+`DFN2_MODEL_IO_LAYOUT_VERSION` stays 8: it names the state tensors, which N
+does not change, the window and head shapes carry N through `frames_per_call`
+in the descriptor and the metadata, and a bump would change the one-frame
+graph's metadata. With N = 1 the pool size, the pool hash and every compile
+line are those of a build without the option.
+
+Tests: `../tests/test_dfn2_frames_per_call.py` (wrapper and exported graph
+streamed in chunks against the one-frame graph, all pairs; a wrong state carry
+fails; metadata and validator; calibration) and
+`../tests/test_dfn2_frames_per_call_c.py` (the C host against the one-frame
+host, byte for byte, with a stand-in accelerator; reset, refusal, guards).
 
 ## State boundary
 

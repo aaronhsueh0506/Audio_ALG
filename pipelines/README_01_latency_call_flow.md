@@ -18,7 +18,7 @@ Navigation: [Index](README.md) | [Previous part](README.md) | [Next part](README
 The two DFN2 applications have an algorithmic latency of `M + D + 1` hops on a 48 kHz host (`M` = mask lookahead, `D` =
 deep-filter lookahead, fixed at build time; the shipped 1/1 pair gives 3 hops, 32 ms). Below 48 kHz the rate bridge is used and
 the latency is the host's own WOLA hop plus `dfn_rate_bridge_added_delay_samples()` native samples (shipped 1/1 pair: 672 at
-16 kHz hop 128, 629 at 16 kHz hop 256, 330 at 8 kHz hop 128), a figure that grows with `M + D`; the other `(M, D)` pairs
+16 kHz hop 128, 629 at 16 kHz hop 256, 330 at 8 kHz hop 128; the floor of the exact value, which `dfn_rate_bridge_added_delay_exact()` returns as a multiple of 1/3 sample, whole only when `M + D + 1` is a multiple of 3), a figure that grows with `M + D`; the other `(M, D)` pairs
 follow the same formula but have no trained checkpoint, so their audio quality is unmeasured. See [`dfn/README.md`](dfn/README.md) and [Build](README_02_build_debug_board.md#build).
 
 ### Memory Budget

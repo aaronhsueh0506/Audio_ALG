@@ -180,8 +180,8 @@ post-RES 頻譜（P = E·G_res，開啟 CNG 時再加 comfort noise；DFN2 變�
 出貨 pair：<b>16 k/hop 128 → 672（42.0 ms），總延遲 800 = 50.0 ms</b>；
 16 k/hop 256 → 629（39.3 ms），總 885 = 55.3 ms；
 8 k/hop 128 → 330（41.3 ms），總 458 = 57.3 ms（mono 專有）。
-(L+1)×512×sr/48000 是整數除法；L+1 不是 3 的倍數時 stage 延遲含小數個原生樣本而向下取整（pair 0/1：501／458／244；pair 2/4：1354／1311／671），
-脈衝峰值可落在 added delay 或其後一個樣本。延遲由脈衝釘住，但訊號經兩顆 FIR resampler 往返，<b>不是</b>逐位元等值
+(L+1)×512×sr/48000 是整數除法；L+1 不是 3 的倍數時 stage 延遲含小數個原生樣本，<code>dfn_rate_bridge_added_delay_samples()</code> 向下取整（pair 0/1：501／458／244；pair 2/4：1354／1311／671），
+<code>dfn_rate_bridge_added_delay_exact()</code> 回精確值（分子／6：pair 0/1 為 501 1/3、458 1/3、244 2/3；pair 2/4 為 1354 2/3、1311 2/3、671 1/3）。延遲由脈衝釘住（重心對精確值，容差 0.01 樣本），但訊號經兩顆 FIR resampler 往返，<b>不是</b>逐位元等值
 （<code>pipelines/dfn/dfn_rate_bridge.c</code>、
 <code>pipelines/dfn/tests/test_dfn_rate_bridge.c</code>）</td></tr>
 </table>

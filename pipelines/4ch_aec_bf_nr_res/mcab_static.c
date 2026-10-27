@@ -8,7 +8,8 @@
  * Usage:
  *   ./mcab_static [--sample-rate 16000|48000] [--fft-size 256|512|1024]
  *       [--uca-radius-m 0.035] [--fixed-doa-deg DEG]
- *   ./mcab_static --print-mem-size [same options] */
+ *   ./mcab_static --print-mem-size [same options]
+ * Numbers are whole decimals. Exit: 0 done, 1 refused config or failed run, 2 command line. */
 
 #include <math.h>
 #include <stdint.h>
@@ -371,7 +372,7 @@ static void static_cleanup(void *user) {
 }
 int main(int argc, char **argv) {
     StaticSample sample={0};
-    static const McabSampleOps ops={static_parse,1,static_setup,static_read,
+    static const McabSampleOps ops={static_parse,static_setup,static_read,
         static_process,static_consume,NULL,static_finish,static_cleanup,NULL};
     return mcab_sample_main(argc,argv,&ops,&sample);
 }

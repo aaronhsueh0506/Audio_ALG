@@ -211,7 +211,7 @@ BIN="$(make -s -C pipelines print-bin-dir)"
 （或改 CLI 原始碼），見 `pipeline_mono.html` API 節。
 
 目前 parser 對未知 positional preset 會退回 balanced，且不會為所有未知 dash option 報錯。產品或自動化腳本應只傳上表列出的值，不要依賴 silent fallback。
-`--fft-size`、`--sample-rate` 以 `atoi()` 轉換、不嚴格檢查（`12x` 當成 12）；DFN2／ULCNet 範例與 `mcab_raw` 走 `common/example_cli.h` 的嚴格解析，非法數字 exit 2（見 [`pipelines/README.md`](../pipelines/README.md)）。
+只有 mono 的 smoke CLI（`mono_aec_nr_res/main.c`）的 `--fft-size`、`--sample-rate` 以 `atoi()` 轉換、不嚴格檢查（`12x` 當成 12）；DFN2／ULCNet 範例、`mcab_raw`、`mcab_static`、`mcab_external_static` 走 `common/example_cli.h` 的嚴格解析，非法數字 exit 2（見 [`pipelines/README.md`](../pipelines/README.md)）。
 
 ### 4.2 Debug context dump
 

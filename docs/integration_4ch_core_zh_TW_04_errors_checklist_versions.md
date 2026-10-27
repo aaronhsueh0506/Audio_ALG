@@ -136,6 +136,7 @@ sample 層檔案（範例碼，**不在** archive 內，沒有 ABI、沒有 layo
 
 - [ ] 四個 archive（`libaudio_pipeline_mcab.a` / `libaec.a` / `libanr.a` /
       `libaudio_common.a`）是用**同一組** backend 與編譯選項建出來的
+      （只用流程、不串 NR 時 flow 只連 `libaudio_pipeline_mcab.a` + `libaec.a` + `libaudio_common.a`；`libanr.a` 只給有串 NR 的程式）
 - [ ] link 順序照 [§1.5](integration_4ch_core_zh_TW_01_library_quickstart.md#15-archive-link-order)；沒有多連 `libdoa.a` / `libbf.a` / `libspatial_common.a`
 - [ ] `BACKEND=ne10` 時最終 link 用 C++ driver
 - [ ] archive 路徑是用 `print-lib-path` 查的
@@ -144,7 +145,7 @@ sample 層檔案（範例碼，**不在** archive 內，沒有 ABI、沒有 layo
 初始化：
 
 - [ ] 每次 init 之前都重新呼叫 `mcab_get_mem_requirements()`，lane 與 estimator 也各自重查 `get_mem_size`
-- [ ] 四條 lane 是**四個不同**的 `Aec`，config 由 `mcab_lane_config()`（或 `aec_config_from_preset()` ＋ `mcab_apply_lane_contract()`）產生；MATCHED 時給 `McabLibs.delay`，其他模式給 `NULL`
+- [ ] 四條 lane 是**四個不同**的 `Aec`，config 由 `mcab_lane_config()`（或 `aec_config_from_preset()` ＋ `mcab_apply_lane_contract()`）產生（`aec_config_from_preset()` 對 8000／16000／48000 以外的取樣率回傳 `fft_size`、`filter_length` 皆為 0 的設定，`aec_get_mem_size()` 回 0、`aec_init()` 回 NULL）；MATCHED 時給 `McabLibs.delay`，其他模式給 `NULL`
 - [ ] lane 與 estimator 是剛建好的，或已經 reset 過（`aec_reset()`／`delay_aec_reset()`，或先前那個 flow 的 `mcab_reset()`）
 - [ ] pool 對齊 16、大小 ≥ `req.bytes`
 - [ ] 用 `mcab_init_ex()` 並把剛查到的 `req` 當 `expected` 傳回去

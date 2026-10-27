@@ -7,10 +7,27 @@
 # separate libraries the example binaries chain.
 # AEC, NR, common, DOA, BF and spatial kernels remain component libs.
 #
+# Producers: audiolib's libaudio_common.a, lib/aec's libaec.a, lib/nr's libanr.a and audiolib's
+# spatial kernels (libspatial_common.a, libdoa.a, libbf.a, built by one audiolib invocation and
+# treated as one producer, "spatial"). Every goal is dispatched on its own (phase 1) and resolves
+# the keyed archive path of the producers it needs; those identities, and only those, enter its
+# CFG_SIG, so the object/binary directory of a goal does not change when a producer it never
+# uses is reconfigured, and that producer need not exist:
+#   libaudio_pipeline_mcab.a, lib   common, aec         (mcab.o references only lib/aec)
+#   test_mcab                       common, aec, nr     (its reference chain calls the NR)
+#   every other goal                common, aec, nr, spatial
+# A goal built in a smaller scope lands in a different bin/obj directory than the same goal built
+# by `make all` or `make test`. print-lib-path prints the flow archive of the smaller scope;
+# print-bin-dir and print-obj-dir print the directory of `make all`, and PRINT_FOR=<goal> prints
+# the one `make <goal>` uses (PRINT_FOR=all for the archive of `make all`):
+#   make test_mcab && "$(make -s print-bin-dir PRINT_FOR=test_mcab)/test_mcab"
+# Phase 2 (producer archives supplied) refuses a goal whose producers it did not receive.
+#
 # Common invocations:
 #   make SIMD=1
 #   make SIMD=0 test
 #   make mcab_raw
+#   make libaudio_pipeline_mcab.a   # needs only common and lib/aec (NR_DIR may be absent)
 
 CC ?= cc
 CXX ?= c++
@@ -146,10 +163,16 @@ else
 WERROR_CFLAGS :=
 endif
 
+# lib/nr's headers are on the include path only when this goal received libanr.a (see the producer
+# scope below): a goal that needs no NR neither names NR_DIR on its compile lines nor keys on it.
+# audiolib's include directories (common, doa, bf) stay on every goal: they are source directories,
+# and test_mcab reaches the sample beam headers through tests/mcab_test_rig.h without linking them.
+NR_INC := $(if $(NR_LIB),-I$(NR_DIR)/include)
+
 override CFLAGS := -Wall -Wextra $(OPT_CFLAGS) -std=gnu99 \
           -I. -I$(PIPELINES_DIR) \
           -I$(AEC_DIR)/include \
-          -I$(NR_DIR)/include -I$(COMMON_DIR)/include -I$(COMMON_DIR) \
+          $(NR_INC) -I$(COMMON_DIR)/include -I$(COMMON_DIR) \
           -I$(AUDIOLIB_DIR)/common/utility \
           -I$(AUDIOLIB_DIR)/doa \
           -I$(AUDIOLIB_DIR)/bf \
@@ -170,44 +193,92 @@ FWD = BACKEND=$(BACKEND) SIMD=$(SIMD) PROFILE=$(PROFILE) WERROR=$(WERROR) \
       EXTRA_CFLAGS='$(EXTRA_CFLAGS)' NO_STDIO=$(NO_STDIO) \
       TOOLCHAIN_CHECK=$(TOOLCHAIN_CHECK) DEBUG=$(DEBUG)
 
-# Resolve every producer before constructing this consumer's CFG identity.
-ifeq ($(COMMON_LIB),)
-.PHONY: all test libs lib libaudio_pipeline_mcab.a libdfn_res_stage.a \
+# Producer scope. Each goal is dispatched on its own and resolves only the producers in its
+# scope (PRODUCERS_ALL unless a NEEDS_<goal> line below narrows it); audiolib's libaudio_common.a
+# is in every scope because the keyed paths of lib/aec and lib/nr fold it in. A goal that links an
+# archive, or whose archive consumer links it, lists that producer; the rest are neither
+# resolved nor keyed. aec = lib/aec's libaec.a, nr = lib/nr's libanr.a, spatial = audiolib's
+# libspatial_common.a + libdoa.a + libbf.a (one audiolib invocation builds the three).
+PRODUCERS_ALL := aec nr spatial
+NEEDS_lib := aec
+NEEDS_libaudio_pipeline_mcab.a := aec
+NEEDS_test_mcab := aec nr
+
+DISPATCH_GOALS := all test libs lib libaudio_pipeline_mcab.a libdfn_res_stage.a \
         mcab_raw mcab_external_static mcab_static 4ch_alignulcnet \
         4ch_aec_bf_dfn_res \
         test_mcab test_mcab_sample_beam test_4ch_dfn \
         test_4ch_ulcnet dump_delay_parity \
         print-bin-dir print-obj-dir print-lib-path audit-no-stdio \
         test-third-party test-mcab-sample-driver
-all test libs lib libaudio_pipeline_mcab.a libdfn_res_stage.a \
-mcab_raw mcab_external_static mcab_static 4ch_alignulcnet \
-4ch_aec_bf_dfn_res \
-test_mcab test_mcab_sample_beam test_4ch_dfn \
-test_4ch_ulcnet dump_delay_parity \
-print-bin-dir print-obj-dir print-lib-path audit-no-stdio \
-test-third-party test-mcab-sample-driver:
-	+@ac="$$($(MAKE) -s --no-print-directory -C $(COMMON_DIR) $(FWD) print-lib-path)"; \
-	 test -n "$$ac" || { echo "FATAL: cannot resolve common archive" >&2; exit 1; }; \
-	 aec="$$($(MAKE) -s --no-print-directory -C $(AEC_DIR) $(FWD) COMMON_DIR=$(abspath $(COMMON_DIR)) COMMON_LIB="$$ac" print-lib-path)"; \
-	 test -n "$$aec" || { echo "FATAL: cannot resolve AEC archive" >&2; exit 1; }; \
-	 nr="$$($(MAKE) -s --no-print-directory -C $(NR_DIR) $(FWD) COMMON_DIR=$(abspath $(COMMON_DIR)) COMMON_LIB="$$ac" print-lib-path)"; \
-	 test -n "$$nr" || { echo "FATAL: cannot resolve NR archive" >&2; exit 1; }; \
-	 spatial="$$($(MAKE) -s --no-print-directory -C $(AUDIOLIB_DIR) $(FWD) print-spatial-common-lib-path)"; \
+
+# The query goals report the directory of another goal's build: PRINT_FOR=<goal> names it. Without
+# it print-bin-dir and print-obj-dir report `make all` and print-lib-path the flow archive of
+# `make libaudio_pipeline_mcab.a`.
+PRINT_FOR ?=
+ifneq ($(PRINT_FOR),)
+ifneq ($(words $(PRINT_FOR)),1)
+$(error PRINT_FOR must name exactly one goal, got '$(PRINT_FOR)')
+endif
+ifeq ($(filter $(PRINT_FOR),$(filter-out print-%,$(DISPATCH_GOALS))),)
+$(error PRINT_FOR='$(PRINT_FOR)' is not a goal of this Makefile)
+endif
+endif
+
+goal_scope = $(strip $(if $(filter print-lib-path,$(1)),$(or $(PRINT_FOR),libaudio_pipeline_mcab.a),$(if $(filter print-bin-dir print-obj-dir,$(1)),$(or $(PRINT_FOR),all),$(1))))
+goal_needs = $(if $(filter undefined,$(origin NEEDS_$(call goal_scope,$(1)))),$(PRODUCERS_ALL),$(NEEDS_$(call goal_scope,$(1))))
+
+# Resolve the producers of the goal's scope before constructing this consumer's CFG identity.
+ifeq ($(COMMON_LIB),)
+.PHONY: $(DISPATCH_GOALS)
+RESOLVE_AEC = aec="$$($(MAKE) -s --no-print-directory -C $(AEC_DIR) $(FWD) COMMON_DIR=$(abspath $(COMMON_DIR)) COMMON_LIB="$$ac" print-lib-path)"; \
+	 test -n "$$aec" || { echo "FATAL: cannot resolve AEC archive" >&2; exit 1; };
+RESOLVE_NR = nr="$$($(MAKE) -s --no-print-directory -C $(NR_DIR) $(FWD) COMMON_DIR=$(abspath $(COMMON_DIR)) COMMON_LIB="$$ac" print-lib-path)"; \
+	 test -n "$$nr" || { echo "FATAL: cannot resolve NR archive" >&2; exit 1; };
+RESOLVE_SPATIAL = spatial="$$($(MAKE) -s --no-print-directory -C $(AUDIOLIB_DIR) $(FWD) print-spatial-common-lib-path)"; \
 	 doa="$$($(MAKE) -s --no-print-directory -C $(AUDIOLIB_DIR) $(FWD) print-doa-lib-path)"; \
 	 bf="$$($(MAKE) -s --no-print-directory -C $(AUDIOLIB_DIR) $(FWD) print-bf-lib-path)"; \
 	 test -n "$$spatial" || { echo "FATAL: cannot resolve spatial-common archive" >&2; exit 1; }; \
 	 test -n "$$doa" || { echo "FATAL: cannot resolve DOA archive" >&2; exit 1; }; \
-	 test -n "$$bf" || { echo "FATAL: cannot resolve BF archive" >&2; exit 1; }; \
-	 $(MAKE) --no-print-directory $@ COMMON_LIB="$$ac" AEC_LIB="$$aec" NR_LIB="$$nr" \
-	   SPATIAL_COMMON_LIB="$$spatial" DOA_LIB="$$doa" BF_LIB="$$bf"
+	 test -n "$$bf" || { echo "FATAL: cannot resolve BF archive" >&2; exit 1; };
+$(DISPATCH_GOALS):
+	+@ac="$$($(MAKE) -s --no-print-directory -C $(COMMON_DIR) $(FWD) print-lib-path)"; \
+	 test -n "$$ac" || { echo "FATAL: cannot resolve common archive" >&2; exit 1; }; \
+	 $(if $(filter aec,$(call goal_needs,$@)),$(RESOLVE_AEC)) \
+	 $(if $(filter nr,$(call goal_needs,$@)),$(RESOLVE_NR)) \
+	 $(if $(filter spatial,$(call goal_needs,$@)),$(RESOLVE_SPATIAL)) \
+	 $(MAKE) --no-print-directory $@ COMMON_LIB="$$ac" \
+	   $(if $(filter aec,$(call goal_needs,$@)),AEC_LIB="$$aec") \
+	   $(if $(filter nr,$(call goal_needs,$@)),NR_LIB="$$nr") \
+	   $(if $(filter spatial,$(call goal_needs,$@)),SPATIAL_COMMON_LIB="$$spatial" DOA_LIB="$$doa" BF_LIB="$$bf")
 else
-ifneq ($(words $(COMMON_LIB) $(AEC_LIB) $(NR_LIB) $(SPATIAL_COMMON_LIB) $(DOA_LIB) $(BF_LIB)),6)
-$(error COMMON_LIB, AEC_LIB, NR_LIB, SPATIAL_COMMON_LIB, DOA_LIB, and BF_LIB must be supplied together)
+ifneq ($(words $(SPATIAL_COMMON_LIB) $(DOA_LIB) $(BF_LIB)),$(if $(SPATIAL_COMMON_LIB)$(DOA_LIB)$(BF_LIB),3,0))
+$(error SPATIAL_COMMON_LIB, DOA_LIB and BF_LIB must be supplied together)
 endif
-COMMON_PRODUCER_SIG := $(notdir $(patsubst %/,%,$(dir $(COMMON_LIB))))
+HAVE_PRODUCERS := $(if $(AEC_LIB),aec) $(if $(NR_LIB),nr) $(if $(SPATIAL_COMMON_LIB),spatial)
+# A goal runs only with the producers of its scope: a missing one is named here, at parse time,
+# instead of surfacing as an unresolved symbol or header at the end of a compile or link.
+$(foreach g,$(filter $(DISPATCH_GOALS),$(or $(MAKECMDGOALS),all)),\
+  $(foreach p,$(call goal_needs,$(g)),\
+    $(if $(filter $(p),$(HAVE_PRODUCERS)),,\
+      $(error '$(g)' needs the $(p) producer archive(s), which this invocation did not receive (AEC_LIB / NR_LIB / SPATIAL_COMMON_LIB+DOA_LIB+BF_LIB); run plain 'make $(g)' so the dispatch resolves them))))
+COMMON_PRODUCER_SIG  := $(notdir $(patsubst %/,%,$(dir $(COMMON_LIB))))
 AEC_PRODUCER_SIG := $(notdir $(patsubst %/,%,$(dir $(AEC_LIB))))
 NR_PRODUCER_SIG := $(notdir $(patsubst %/,%,$(dir $(NR_LIB))))
 SPATIAL_PRODUCER_SIG := $(notdir $(patsubst %/,%,$(dir $(SPATIAL_COMMON_LIB))))
+endif
+
+# The producer identities of this goal's scope, in the payload's fixed order. The common archive
+# is always present; a producer outside the scope has no field, so it cannot change the sig.
+PRODUCER_SIGS := COMMON_PRODUCER_SIG=$(COMMON_PRODUCER_SIG)
+ifneq ($(AEC_LIB),)
+PRODUCER_SIGS += AEC_PRODUCER_SIG=$(AEC_PRODUCER_SIG)
+endif
+ifneq ($(NR_LIB),)
+PRODUCER_SIGS += NR_PRODUCER_SIG=$(NR_PRODUCER_SIG)
+endif
+ifneq ($(SPATIAL_COMMON_LIB),)
+PRODUCER_SIGS += SPATIAL_PRODUCER_SIG=$(SPATIAL_PRODUCER_SIG)
 endif
 
 SRCS := mcab.c mcab_sample_flow.c mcab_sample_beam.c \
@@ -229,7 +300,7 @@ SRCS := mcab.c mcab_sample_flow.c mcab_sample_beam.c \
 # The same CC command can select a different SDK through PATH.
 # Include effective pointer/FP/ISA predefines to avoid cross-ABI cache reuse.
 override CC_TARGET_SIG := $(shell sh $(COMMON_DIR)/scripts/target_abi_signature.sh $(CC) $(CPPFLAGS) $(CFLAGS))
-CFG_SIG_PAYLOAD := CC_TARGET_SIG=$(CC_TARGET_SIG) ULCNET_GRID=$(ULCNET_GRID) DFN2_LOOKAHEAD=$(DFN2_MASK_LOOKAHEAD)/$(DFN2_DF_LOOKAHEAD) CC=$(CC) CXX=$(CXX) AR=$(AR) RANLIB=$(RANLIB) LINK=$(LINK) CFLAGS=$(CFLAGS) CXXFLAGS=$(CXXFLAGS) LDFLAGS=$(LDLIBS) BACKEND=$(BACKEND) SIMD=$(SIMD) WERROR=$(WERROR) NO_STDIO=$(NO_STDIO) DEBUG=$(DEBUG) TOOLCHAIN_CHECK=$(TOOLCHAIN_CHECK) COMMON_PRODUCER_SIG=$(COMMON_PRODUCER_SIG) AEC_PRODUCER_SIG=$(AEC_PRODUCER_SIG) NR_PRODUCER_SIG=$(NR_PRODUCER_SIG) SPATIAL_PRODUCER_SIG=$(SPATIAL_PRODUCER_SIG) SRCS=$(sort $(SRCS))
+CFG_SIG_PAYLOAD := CC_TARGET_SIG=$(CC_TARGET_SIG) ULCNET_GRID=$(ULCNET_GRID) DFN2_LOOKAHEAD=$(DFN2_MASK_LOOKAHEAD)/$(DFN2_DF_LOOKAHEAD) CC=$(CC) CXX=$(CXX) AR=$(AR) RANLIB=$(RANLIB) LINK=$(LINK) CFLAGS=$(CFLAGS) CXXFLAGS=$(CXXFLAGS) LDFLAGS=$(LDLIBS) BACKEND=$(BACKEND) SIMD=$(SIMD) WERROR=$(WERROR) NO_STDIO=$(NO_STDIO) DEBUG=$(DEBUG) TOOLCHAIN_CHECK=$(TOOLCHAIN_CHECK) $(PRODUCER_SIGS) SRCS=$(sort $(SRCS))
 CFG_SIG := $(shell printf '%s' "$(CFG_SIG_PAYLOAD)" | cksum | cut -d' ' -f1)
 
 OBJ_ROOT ?= obj
@@ -399,6 +470,8 @@ test: test-third-party test-mcab-sample-driver \
 	"$(abspath $(BIN_DIR))/mcab_external_static" --sample-rate 48000
 	"$(abspath $(BIN_DIR))/mcab_static" --sample-rate 16000
 	"$(abspath $(BIN_DIR))/mcab_static" --sample-rate 48000
+# The command lines of mcab_static and mcab_external_static: bad numbers exit 2, refused configs 1.
+	bash tests/test_cli_strict.sh "$(abspath $(BIN_DIR))"
 	"$(abspath $(BIN_DIR))/4ch_alignulcnet"
 	"$(abspath $(BIN_DIR))/4ch_alignulcnet" --delay-num-filters 1
 	"$(abspath $(BIN_DIR))/4ch_aec_bf_dfn_res"
@@ -454,14 +527,19 @@ $(COMMON_LIB): FORCE
 	+$(MAKE) -C $(COMMON_DIR) $(FWD) lib
 	@test -f '$@' || { echo "FATAL: common did not produce $@" >&2; exit 1; }
 
+ifneq ($(AEC_LIB),)
 $(AEC_LIB): FORCE
 	+$(MAKE) -C $(AEC_DIR) $(FWD) COMMON_DIR=$(abspath $(COMMON_DIR)) COMMON_LIB=$(COMMON_LIB) lib
 	@test -f '$@' || { echo "FATAL: AEC did not produce $@" >&2; exit 1; }
+endif
 
+ifneq ($(NR_LIB),)
 $(NR_LIB): FORCE
 	+$(MAKE) -C $(NR_DIR) $(FWD) COMMON_DIR=$(abspath $(COMMON_DIR)) COMMON_LIB=$(COMMON_LIB) lib
 	@test -f '$@' || { echo "FATAL: NR did not produce $@" >&2; exit 1; }
+endif
 
+ifneq ($(SPATIAL_COMMON_LIB),)
 $(SPATIAL_COMMON_LIB): FORCE
 	+$(MAKE) -C $(AUDIOLIB_DIR) $(FWD) libspatial_common.a
 	@test -f '$@' || { echo "FATAL: spatial-common did not produce $@" >&2; exit 1; }
@@ -473,6 +551,7 @@ $(DOA_LIB): FORCE
 $(BF_LIB): FORCE
 	+$(MAKE) -C $(AUDIOLIB_DIR) $(FWD) libbf.a
 	@test -f '$@' || { echo "FATAL: BF did not produce $@" >&2; exit 1; }
+endif
 
 
 # The spatial dependencies (SRP-PHAT, BF, VAD) live in audiolib and test themselves there; this

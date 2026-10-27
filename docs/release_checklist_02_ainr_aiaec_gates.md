@@ -94,6 +94,13 @@ make -C AINR test-pairs   # DeepFilterNet2/3 lookahead pairs other than the ship
       pairs the tests list (the six pairs with `D <= M`, and (0,1), (1,3),
       (2,4)); a pair outside that list is not claimed as tested in C, and the
       audio quality of any pair other than 1/1 is unmeasured (no checkpoint).
+- [ ] DeepFilterNet2 frames per call (`export_onnx.py --frames-per-call N`, `make -C AINR DFN2_FRAMES_PER_CALL=<N>`, N in
+      1..64): N = 1 writes the one-frame graph byte for byte and builds with the same compile lines; for N > 1 the
+      chunked stream equals the one-frame stream (`tests/test_dfn2_frames_per_call.py`,
+      `tests/test_dfn2_frames_per_call_c.py`, both in `make -C AINR test-pairs`); `make test` and the pipelines stay at
+      N = 1 and an N > 1 build of a one-frame unit stops at the `DFN2_MULTI_FRAME_HOST` `#error`. The accelerator
+      toolchain's support for a GRU with a sequence longer than one and the quantized accuracy of an N-frame graph are
+      not measured.
 - [ ] `WERROR=1` actually reaches the compiler.
 - [ ] The SIMD knob changes every member that includes `utility/simd_kernel_nn.h`
       (dfn2/dfn3 `process`, `model_io`, `prepost` and `gtcrn_process`: all seven

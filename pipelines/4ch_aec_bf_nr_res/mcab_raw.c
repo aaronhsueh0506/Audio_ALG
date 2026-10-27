@@ -412,7 +412,7 @@ static void raw_cleanup(void *user) {
 }
 int main(int argc, char **argv) {
     RawSample sample={0};
-    static const McabSampleOps ops={raw_parse,2,raw_setup,raw_read,raw_process,
+    static const McabSampleOps ops={raw_parse,raw_setup,raw_read,raw_process,
                                   raw_consume,NULL,raw_finish,raw_cleanup,NULL};
     return mcab_sample_main(argc,argv,&ops,&sample);
 }

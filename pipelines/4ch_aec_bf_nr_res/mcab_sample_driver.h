@@ -23,8 +23,9 @@ typedef struct McabSampleSpatialOptions {
     float fixed_doa_rad;
     int print_mem_size;
 } McabSampleSpatialOptions;
-/* raw=1 validates numeric/grid values strictly; raw=0 uses atoi/atof conversion and
- * defers config checks. */
+/* Numbers are parsed whole (example_cli_parse_int / _float): an empty or padded string, trailing
+ * characters, a value outside int, inf or nan, and an option without its value return 2. raw=1
+ * also checks the file options, the radius and the grid here; raw=0 defers those to the setup. */
 int mcab_sample_parse_spatial_cli(int argc, char **argv, int raw,
                            McabSampleSpatialOptions *out);
 
@@ -35,9 +36,8 @@ typedef struct McabSampleHopView {
     int check_finite;
 } McabSampleHopView;
 typedef struct McabSampleOps {
-    /* parse: 0=run, 1=help/exit success, 2=CLI error. */
+    /* parse: 0=run, 1=help/exit success, 2=CLI error (the process exits 2). */
     int (*parse)(void *user, int argc, char **argv);
-    int cli_error_status;
     /* setup: 0=run, 1=failure, 2=print-only success. */
     int (*setup)(void *user, McabSampleHopView *hop);
     /* read: 1=complete hop, 0=end, -1=failure. No hot-path allocations. */

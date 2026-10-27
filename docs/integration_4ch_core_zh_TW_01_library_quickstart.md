@@ -92,11 +92,14 @@ libaudio_common.a
 
 * `libaudio_pipeline_mcab.a` 只含一個 object：`mcab.o`。`mcab_sample_flow.o` 與 `mcab_sample_beam.o` 是 sample 層 helper，
   由同一個 Makefile 編出（`make libs`），**不在** archive 內。
-  `libanr.a` 只在你串 NR 後級時才需要。`mcab.o` 不參照 SRP／BF／spatial 符號，所以你**不需要**連
-  `libdoa.a` / `libbf.a` / `libspatial_common.a`。
+  `libanr.a` 只在你串 NR 後級時才需要（上面的範例有串 NR，所以連了它）：`mcab.o` 只參照 lib/aec 與 audiolib common 的
+  utility，不參照 NR、SRP／BF／spatial 符號，所以只要流程本身時你**不需要**連 `libanr.a` / `libdoa.a` / `libbf.a` /
+  `libspatial_common.a`，`make libaudio_pipeline_mcab.a` 也只要求 common 與 lib/aec 兩個 producer（`NR_DIR` 與 spatial
+  kernel 不在也能建）。
   （此連結集合就是本目錄 Makefile 的 `CORE_LIBS`，`mcab_external_static` 即以它連成執行檔：mcab、AEC、NR、common。）
 * archive 路徑是 config-keyed 的（`bin/<backend>-<hash>/`）。用各 Makefile 的
-  `make -s print-lib-path` 取得，不要硬寫。
+  `make -s print-lib-path` 取得，不要硬寫。本目錄的 `print-lib-path` 印的是只含 common 與 lib/aec 的窄範圍
+  archive；要 `make all` 建出、與各執行檔同一目錄的那一份，用 `make -s print-lib-path PRINT_FOR=all`。
 * `BACKEND=ne10` 時最終 link 要用 C++ driver（`c++`）。
 * 四個 archive 必須用同一組 backend / 編譯選項建置。`mcab_init_ex()` 的 descriptor 只涵蓋 mcab 自己的 pool 版面與
   `backend_id`（[§8](integration_4ch_core_zh_TW_04_errors_checklist_versions.md#8-版本與相容性)），不會替 `libaec.a`、`libanr.a`、`libaudio_common.a` 把關。

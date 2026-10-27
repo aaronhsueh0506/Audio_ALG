@@ -1,7 +1,9 @@
 """Validate stateless streaming ONNX graphs.
 
-Two checks live here: no temporal padding inside the graph, and the
-in-place state boundary (``validate_inplace_state_graph``). The input-window
+Three checks live here: no temporal padding inside the graph, the
+in-place state boundary (``validate_inplace_state_graph``), and the agreement
+of a multi-frame graph's ``frames_per_call`` with its shapes
+(``validate_frames_per_call``). The input-window
 alignment that a ``mask_lookahead`` implies (``lookahead_window_offsets``) is
 defined here once for the families that share the lookahead contract.
 
@@ -58,6 +60,57 @@ def lookahead_window_alignment(mask_lookahead, input_frames):
              for offset in lookahead_window_offsets(mask_lookahead,
                                                     input_frames)]
     return '[%s] -> heads[t]' % ','.join(names)
+
+
+def validate_frames_per_call(graph, window_inputs, head_outputs,
+                             input_frames):
+    """Check a graph's ``frames_per_call`` metadata against its shapes.
+
+    A graph that emits N heads per invocation records ``frames_per_call = N``
+    (N >= 2); a one-frame graph records nothing, so an explicit 1 is refused.
+    ``window_inputs`` maps each feature-window input to its time axis, which
+    must hold ``input_frames - 1 + N`` frames; ``head_outputs`` maps each
+    head output to its time axis, which must hold N. When present,
+    ``input_feature_frames`` and ``output_frames_per_invocation`` must state
+    the same two numbers. Returns N; raises RuntimeError on the first
+    mismatch.
+    """
+    props = {prop.key: prop.value for prop in graph.metadata_props}
+    frames = 1
+    if 'frames_per_call' in props:
+        try:
+            frames = int(props['frames_per_call'])
+        except ValueError:
+            frames = 0
+        if str(frames) != props['frames_per_call'] or frames < 2:
+            raise RuntimeError(
+                'metadata frames_per_call must be an integer >= 2 (a '
+                'one-frame graph records none), got %r'
+                % props['frames_per_call'])
+    span = input_frames - 1 + frames
+    for key, expected in (('input_feature_frames', span),
+                          ('output_frames_per_invocation', frames)):
+        if key in props and props[key] != str(expected):
+            raise RuntimeError('metadata %s is %s, not %d for frames_per_call '
+                               '%d' % (key, props[key], expected, frames))
+    inputs = {item.name: item for item in graph.graph.input}
+    outputs = {item.name: item for item in graph.graph.output}
+    for table, values, expected, kind in (
+            (window_inputs, inputs, span, 'input'),
+            (head_outputs, outputs, frames, 'output')):
+        for name, axis in table.items():
+            if name not in values:
+                raise RuntimeError('graph has no %s %s' % (kind, name))
+            dims = _dims(values[name])
+            if dims is None or not 0 <= axis < len(dims):
+                raise RuntimeError('%s %s has no static axis %d'
+                                   % (kind, name, axis))
+            if dims[axis] != expected:
+                raise RuntimeError(
+                    '%s %s has %d frames on axis %d, not %d for '
+                    'frames_per_call %d'
+                    % (kind, name, dims[axis], axis, expected, frames))
+    return frames
 
 
 def _attribute(node, name):
