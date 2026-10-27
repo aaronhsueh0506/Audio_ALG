@@ -12,22 +12,23 @@ document disagrees with them.
 | C and caller-owned-pool integration | [`c_user_manual_zh_TW.md`](c_user_manual_zh_TW.md) |
 | AEC / NR / audiolib public API quick reference (index, chapters 1-2; chapters 3-5 in [`part 01`](audio_libraries_c_api_zh_TW_01_aec_nr_audiolib.md), 6.1-6.5 in [`part 02`](audio_libraries_c_api_zh_TW_02_ai_prepost_models.md), 6.6-6.10 in [`part 03`](audio_libraries_c_api_zh_TW_03_ai_prepost_pipeline.md), chapters 7-9 in [`part 04`](audio_libraries_c_api_zh_TW_04_pool_build_checklist.md)) | [`audio_libraries_c_api_zh_TW.md`](audio_libraries_c_api_zh_TW.md) |
 | DEBUG observability: current inventory and proposals | [`debug_observability_zh_TW.md`](debug_observability_zh_TW.md) |
-| Board integration (separate libraries, the one 4-channel unit's descriptor) (index and scope; sequence and pool sizing in [`part 01`](pipeline_board_integration_01_sequence.md), warnings, descriptor, dirty-pool, `NO_STDIO=1` and teardown in [`part 02`](pipeline_board_integration_02_contract.md), verification checklist, board build and compile flags in [`part 03`](pipeline_board_integration_03_verify_build.md)) | [`pipeline_board_integration.md`](pipeline_board_integration.md) |
+| Board integration (separate libraries, the mcab pool descriptor) (index and scope; sequence and pool sizing in [`part 01`](pipeline_board_integration_01_sequence.md), warnings, descriptor, dirty-pool, `NO_STDIO=1` and teardown in [`part 02`](pipeline_board_integration_02_contract.md), verification checklist, board build and compile flags in [`part 03`](pipeline_board_integration_03_verify_build.md)) | [`pipeline_board_integration.md`](pipeline_board_integration.md) |
 | Frequency-domain gain fusion | [`freq_domain_pipeline_design.md`](freq_domain_pipeline_design.md) |
-| Four-channel front end (external beamformer seam), the linear AEC + BF unit and the Python reference (index, call sequence and Python reference seam; the C API chapter in [`part 01`](../pipelines/4ch_aec_bf_nr_res/README_01_c_api.md)) | [`../pipelines/4ch_aec_bf_nr_res/README.md`](../pipelines/4ch_aec_bf_nr_res/README.md) |
-| Four-channel Align-ULCNet application (the unit's BF spectrum goes to the model directly) | [`../pipelines/4ch_alignulcnet/README.md`](../pipelines/4ch_alignulcnet/README.md) |
-| Mono AEC + RES + DeepFilterNet2 application | [`../pipelines/mono_aec_dfn_res/README.md`](../pipelines/mono_aec_dfn_res/README.md) |
-| Four-channel unit + application-owned libaec `AecRes` + DeepFilterNet2 application | [`../pipelines/4ch_aec_bf_dfn_res/README.md`](../pipelines/4ch_aec_bf_dfn_res/README.md) |
+| Four-channel `mcab` flow (the application injects four libaec lanes and, in MATCHED mode, one shared `DelayAec`; the caller's beamformer; the sample SRP-PHAT/BF helper) and its Python twin (index, call sequence and Python reference seam; the C API chapter in [`part 01`](../pipelines/4ch_aec_bf_nr_res/README_01_c_api.md)) | [`../pipelines/4ch_aec_bf_nr_res/README.md`](../pipelines/4ch_aec_bf_nr_res/README.md) |
+| Four-channel Align-ULCNet application (mcab front plus the sample beam helper; the beamformed spectrum goes to the model directly) | [`../pipelines/ulcnet/4ch_alignulcnet/README.md`](../pipelines/ulcnet/4ch_alignulcnet/README.md) |
+| Mono Align-ULCNet application | [`../pipelines/ulcnet/mono_alignulcnet/README.md`](../pipelines/ulcnet/mono_alignulcnet/README.md) |
+| Mono AEC + RES + DeepFilterNet2 application | [`../pipelines/dfn/mono_aec_dfn_res/README.md`](../pipelines/dfn/mono_aec_dfn_res/README.md) |
+| Four-channel mcab flow + application-owned libaec `AecRes` + DeepFilterNet2 application | [`../pipelines/dfn/4ch_aec_bf_dfn_res/README.md`](../pipelines/dfn/4ch_aec_bf_dfn_res/README.md) |
 | Standalone AINR models | [`../AINR/README.md`](../AINR/README.md) |
-| DFN2 cascade/alpha contract | [`../AINR/DeepFilterNet2/README.md`](../AINR/DeepFilterNet2/README.md) |
-| DFN3 raw-low / masked-high comparison contract | [`../AINR/DeepFilterNet3/README.md`](../AINR/DeepFilterNet3/README.md) |
+| DFN2 cascade/alpha contract and its mask/DF lookahead pair | [`../AINR/DeepFilterNet2/README.md`](../AINR/DeepFilterNet2/README.md) |
+| DFN3 raw-low / masked-high comparison contract and its lookahead pair | [`../AINR/DeepFilterNet3/README.md`](../AINR/DeepFilterNet3/README.md) |
 | Neural AEC candidates | [`../AIAEC/README.md`](../AIAEC/README.md) |
 | AIAEC candidate decision matrix | [`ai_aec_candidate_matrix.md`](ai_aec_candidate_matrix.md) |
 | PBFDKF + Align-ULCNet embedded streaming proposal (index, chapters 1-5; chapters 6-9 in [`part 01`](align_ulcnet_embedded_streaming_design_zh_TW_01_state_wola_delay.md), chapters 10-11 in [`part 02`](align_ulcnet_embedded_streaming_design_zh_TW_02_npu_boundary_validation.md)) | [`align_ulcnet_embedded_streaming_design_zh_TW.md`](align_ulcnet_embedded_streaming_design_zh_TW.md) |
 | AIAEC four-candidate streaming readiness audit | [`aiaec_streaming_readiness_zh_TW.md`](aiaec_streaming_readiness_zh_TW.md) |
 | Mono integration (sequence diagram, calls, external/internal parameters, config/pool/errors; index and chapters 6-8, chapters 0-2 in [`part 01`](integration_mono_zh_TW_01_overview_link_quickstart.md), chapters 3-5 in [`part 02`](integration_mono_zh_TW_02_lifecycle_config_errors.md)) | [`integration_mono_zh_TW.md`](integration_mono_zh_TW.md) |
-| 4ch core integration (`4aec_nr_res`; own beamformer; sequence, calls, parameters; index and chapter 0, chapters 1-2 in [`part 01`](integration_4ch_core_zh_TW_01_library_quickstart.md), chapter 3 in [`part 02`](integration_4ch_core_zh_TW_02_lifecycle.md), chapter 4 in [`part 03`](integration_4ch_core_zh_TW_03_config.md), chapters 5-8 in [`part 04`](integration_4ch_core_zh_TW_04_errors_checklist_versions.md)) | [`integration_4ch_core_zh_TW.md`](integration_4ch_core_zh_TW.md) |
-| 4ch linear AEC + BF unit integration (`AudioPipeline4Ch`, up to `fuse()`; the application creates its own libaec `AecRes`; sequence, calls, parameters) (index, chapters 0-1; chapter 2 in [`part 01`](integration_4ch_spatial_zh_TW_01_quick_start.md), 3 in [`part 02`](integration_4ch_spatial_zh_TW_02_lifecycle.md), 4 in [`part 03`](integration_4ch_spatial_zh_TW_03_config.md), 5 in [`part 04`](integration_4ch_spatial_zh_TW_04_errors.md), 6 in [`part 05`](integration_4ch_spatial_zh_TW_05_shipped_vs_examples.md), 7 in [`part 06`](integration_4ch_spatial_zh_TW_06_checklist.md), 8 in [`part 07`](integration_4ch_spatial_zh_TW_07_versioning.md)) | [`integration_4ch_spatial_zh_TW.md`](integration_4ch_spatial_zh_TW.md) |
+| 4ch `mcab` integration, flow half (`mcab.h`: the application creates the lanes and the estimator and injects them; your own beamformer; sequence, calls, parameters; index and chapter 0, chapters 1-2 in [`part 01`](integration_4ch_core_zh_TW_01_library_quickstart.md), chapter 3 in [`part 02`](integration_4ch_core_zh_TW_02_lifecycle.md), chapter 4 in [`part 03`](integration_4ch_core_zh_TW_03_config.md), chapters 5-8 in [`part 04`](integration_4ch_core_zh_TW_04_errors_checklist_versions.md)) | [`integration_4ch_core_zh_TW.md`](integration_4ch_core_zh_TW.md) |
+| 4ch `mcab` integration, sample beam helper half (`mcab_sample_beam.h`: SRP-PHAT/BF glue up to `mcab_sample_beam_fuse()`; the application creates its own libaec `AecRes`; sequence, calls, parameters) (index, chapters 0-1; chapter 2 in [`part 01`](integration_4ch_spatial_zh_TW_01_quick_start.md), 3 in [`part 02`](integration_4ch_spatial_zh_TW_02_lifecycle.md), 4 in [`part 03`](integration_4ch_spatial_zh_TW_03_config.md), 5 in [`part 04`](integration_4ch_spatial_zh_TW_04_errors.md), 6 in [`part 05`](integration_4ch_spatial_zh_TW_05_shipped_vs_examples.md), 7 in [`part 06`](integration_4ch_spatial_zh_TW_06_checklist.md), 8 in [`part 07`](integration_4ch_spatial_zh_TW_07_versioning.md)) | [`integration_4ch_spatial_zh_TW.md`](integration_4ch_spatial_zh_TW.md) |
 | Release gate and reference test targets (index, chapters 1-7; chapters 8-10 in [`part 01`](release_checklist_01_pipeline_gates.md), chapters 11-12 in [`part 02`](release_checklist_02_ainr_aiaec_gates.md), chapters 13-15 and appendices A-C in [`part 03`](release_checklist_03_docs_publish_appendices.md)) | [`release_checklist.md`](release_checklist.md) |
 | Development / submodules | [`development.md`](development.md) |
 
@@ -58,9 +59,11 @@ variants (shared entry-point, rate-bridge and test detail in
 `pipeline_dfn_detail.html`, with `pipeline_dfn_usage.html`, `pipeline_dfn_sequence.html` and
 `pipeline_dfn_params.html`; the host runs at the product rate -- mono 8/16/48 kHz, 4ch 16/48 kHz,
 16 kHz by default -- and only the DFN2 stage runs at 48 kHz / 1024 / 512,
-reached through `pipelines/dfn_rate_bridge.{h,c}`; the shared post-RES stage
-`pipelines/dfn_res_stage.{h,c}` estimates the model from the pre-RES spectrum
-and applies it to the post-RES one). Model pages: `ainr_dfn2.html` (pool, callback and build detail in
+reached through `pipelines/dfn/dfn_rate_bridge.{h,c}`; the shared post-RES stage
+`pipelines/dfn/dfn_res_stage.{h,c}` estimates the model from the pre-RES spectrum
+and applies it to the post-RES one; the stage is built for one DFN2 lookahead pair, `DFN2_MASK_LOOKAHEAD` /
+`DFN2_DF_LOOKAHEAD` make variables with default 1/1, and every delay figure on these pages is for that
+shipped pair). Model pages: `ainr_dfn2.html` (pool, callback and build detail in
 `ainr_dfn2_detail.html`), `ainr_dfn3.html`, `ainr_gtcrn.html`, `ainr_rnnoise_erb.html`, each with a
 usage page (`ainr_dfn2_usage.html`, `ainr_dfn3_usage.html`, `ainr_gtcrn_usage.html`,
 `ainr_rnnoise_erb_usage.html`), and the four AIAEC pages `aiaec_align_ulcnet.html`,
@@ -72,18 +75,22 @@ usage page (`ainr_dfn2_usage.html`, `ainr_dfn3_usage.html`, `ainr_gtcrn_usage.ht
 Who owns the residual-echo suppressor (RES):
 
 - **mono**: the AEC computes the RES gain inside `aec_process_context()` and hands it over as
-  `frame.g_res_ctx` through `se_frame_from_aec()`; its strength is set with `aec_set_preset()`.
-  The sample only decides whether to apply it. A pure-AEC sample may call the full `aec_process()`
-  (RES and the final synthesis in one call).
-- **4ch**: the unit `AudioPipeline4Ch` (shared delay aligner, four AEC lanes, SRP-PHAT, BF, `fuse()`)
-  has no RES; `fuse()` leaves `frame->g_res_ctx` NULL, like the core. An application that wants RES creates
-  it in its own init with `aec_res_get_mem_size()` / `aec_res_init()` (config from
-  `aec_config_from_preset()`), calls `se_res_stage_gain()` (`pipelines/common/se_stage.h`) once per hop,
-  sets strength with `aec_res_set_preset()` and clears it with `aec_res_reset()`. The 4ch Align-ULCNet
-  application runs the unit with `core.enable_post = 0` and has no RES.
+  `AecResContext.res_gain` (read with `aec_get_res_context()`); its strength is set with
+  `aec_set_preset()`. The sample (`mono_form()` in `pipelines/mono_aec_nr_res/main.c`) only decides
+  whether to apply it. A pure-AEC sample may call the full `aec_process()` (RES and the final
+  synthesis in one call).
+- **4ch**: the `mcab` flow (`mcab_process_front()` over the shared delay and four lanes, then `mcab_fuse()` with
+  the caller's beamformer weights; the sample helper `mcab_sample_beam_*` supplies SRP-PHAT/BF when no
+  beamformer of your own is at hand) has no RES; `mcab_fuse()` leaves `frame->g_res_ctx` NULL. An application
+  that wants RES creates it in its own init with `aec_res_get_mem_size()` / `aec_res_init()` (config from
+  `aec_config_from_preset()`), calls `aec_res_process()` once per hop over an `AecResInput` filled from the
+  fused `McabFrame` (the sample header `pipelines/4ch_aec_bf_nr_res/mcab_sample_post.h` does this in
+  `mcab_sample_res_input()`), sets strength with `aec_res_set_preset()` and clears it with `aec_res_reset()`. The 4ch Align-ULCNet
+  application builds the flow with `cfg.enable_post = 0` and has no RES.
 
-Current layout versions: `AUDIO_PIPELINE_4CH_LAYOUT_VERSION = 21` (unit) and
-`FOUR_AEC_NR_RES_LAYOUT_VERSION = 24` (core); the full table is in `html/conventions.html`.
+Current layout version of the 4-channel flow: `MCAB_LAYOUT_VERSION = 25` (mcab.h; the lanes, the
+shared estimator and the sample SRP/BF helper are separate objects); the full table is in
+`html/conventions.html`.
 
 For integrator-facing C API reference, the site also carries one page per
 library -- `aec_c_api.html`, `nr_c_api.html` and `audio_common_c_api.html` in

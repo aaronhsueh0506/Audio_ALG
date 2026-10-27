@@ -1,6 +1,6 @@
 """Per-hop C/Python parity for the shared four-channel reference alignment.
 
-The C core (4aec_nr_res.c) and pipeline.py publish the same three per-hop
+The C flow (mcab.c) and pipeline.py publish the same three per-hop
 fields (applied delay, ``solid``, ``changed``) and hand the four linear lanes
 the same aligned far hop.  Both sides are driven from ONE synthetic scene
 (xorshift32 far noise plus a half-amplitude echo at a known bulk delay) and
@@ -37,8 +37,8 @@ import pytest
 from _scripted_delay import ScriptedDelay as _ScriptedEstimator
 
 _pipeline = import_module("pipelines.4ch_aec_bf_nr_res.pipeline")
-FourChannelAecConfig = _pipeline.FourChannelAecConfig
-FourChannelAecPipeline = _pipeline.FourChannelAecPipeline
+McabConfig = _pipeline.McabConfig
+McabPipeline = _pipeline.McabPipeline
 _SharedReferenceDelayLine = _pipeline._SharedReferenceDelayLine
 
 _CORE_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
@@ -247,11 +247,11 @@ def _python_fixed_rows(delay, fft, hops):
 def _python_matched_rows(delay, fft, hops, shift_at=None, shift_delay=None,
                          quarantine=False, quarantine_s=1.0, proxy_noise=0.0):
     hop, far, mic = _scene(delay, fft, hops, shift_at, shift_delay)
-    config = FourChannelAecConfig(
+    config = McabConfig(
         sample_rate=_SAMPLE_RATE, frame_size=fft, hop_size=hop,
         delay_backward_quarantine_enabled=quarantine,
         delay_backward_quarantine_s=quarantine_s)
-    pipeline = FourChannelAecPipeline(config)
+    pipeline = McabPipeline(config)
     # Mirror of the dumper's --proxy-noise: an independent stream added to the
     # capture-proxy microphone only, so "judge the estimator's own lane" and
     # "judge any lane" become distinguishable.
@@ -270,7 +270,7 @@ def _python_matched_rows(delay, fft, hops, shift_at=None, shift_delay=None,
             mics = mics.copy()
             mics[:, config.capture_proxy_channel] += (
                 proxy_extra[index * hop:(index + 1) * hop])
-        pre = pipeline.front_process(mics, far_hop)
+        pre = pipeline.process_front(mics, far_hop)
         rows.append(_row(index, pre.delay.delay_samples, pre.delay.solid,
                          pre.delay.changed, far_hop, pre.aligned_render))
     return hop, far, rows

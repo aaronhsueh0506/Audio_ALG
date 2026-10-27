@@ -19,6 +19,10 @@
 #endif
 #define DF_COMMON_HAVE_NEON SK_HAVE_NEON
 
+/* The pair this object was built for, read by dfn2_model_io.c and
+ * dfn2_prepost.c (dfn2_process.h): objects of another pair fail to link. */
+const unsigned char DFN2_LOOKAHEAD_PAIR_SYMBOL = 0;
+
 /* The deep filter's taps before the stream start read this row. */
 static const float df_zero_row[DFN2_DF_BINS];
 

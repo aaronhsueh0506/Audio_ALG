@@ -127,7 +127,7 @@ non-centered 第 k-1 幀覆蓋**完全相同的樣本**（逐 bit 同頻譜）�
 
 **4ch 的 latency contract**：4ch Align-ULCNet pipeline 的「加總後額外演算法延遲」是
 **1 hop**（16 kHz 256 samples = 16 ms、48 kHz 512 samples = 10.67 ms），與 mono
-範例（`pipelines/mono_alignulcnet/main.c`）相同。BF 產出的 beamformed error **頻譜**直接餵給模型（它已經是本 hop 的
+範例（`pipelines/ulcnet/mono_alignulcnet/main.c`）相同。BF 產出的 beamformed error **頻譜**直接餵給模型（它已經是本 hop 的
 sqrt-Hann 50%-overlap 單幀），中間沒有 beam WOLA→再 analysis 的來回，far 路也沒有
 one-hop 補償 buffer；唯一的延遲來源就是本節的 ULCNet synthesis WOLA。`process()`
 只有 hop #0 輸出零，之後 hop p 的輸出是 input hop p-1 的 beamformed error。每個 hop
@@ -135,8 +135,8 @@ one-hop 補償 buffer；唯一的延遲來源就是本節的 ULCNet synthesis WO
 
 ## 8. Delay 狀態機與 Fallback
 
-兩個 pipeline 範例（`pipelines/mono_alignulcnet/main.c` 與
-`pipelines/4ch_alignulcnet/main.c`，共用 `pipelines/samples/ulcnet_nn_stage.{h,c}`）的行為一致：
+兩個 pipeline 範例（`pipelines/ulcnet/mono_alignulcnet/main.c` 與
+`pipelines/ulcnet/4ch_alignulcnet/main.c`，共用 `pipelines/ulcnet/ulcnet_nn_stage.{h,c}`）的行為一致：
 
 - UNLOCKED：模型照常步進並套用成功輸出（far 本來就是 raw far）；
 - delay_state 變為 CHANGED，或 FIXED 首次 UNLOCKED→LOCKED：`model->reset` 清除 far
@@ -149,7 +149,7 @@ identity reprime：邊界的 `model->reset` 之後，C 側 STFT 狀態仍連續�
 512 樣本分析窗**跨在邊界上**（一半是切換前推入的 hop）。這些幀走 identity 且**完全
 不呼叫 infer**（K/V、logit、GRU 都不前進），等 err 與 far 兩路窗都只含切換後的 hop 才
 同時恢復 step 與 apply：mono 與 4ch 共用 `ULCNET_NN_STAGE_REPRIME_FRAMES=1`。這個常數由
-`mono_alignulcnet/tests/test_mono_ulcnet.c` 與 `4ch_alignulcnet/tests/test_4ch_ulcnet.c` 的
+`pipelines/ulcnet/mono_alignulcnet/tests/test_mono_ulcnet.c` 與 `pipelines/ulcnet/4ch_alignulcnet/tests/test_4ch_ulcnet.c` 的
 `test_reprime_straddle_derivation()` 以脈衝標記在**無邊界對照跑**中量出並斷言，不是
 寫死的估計值。
 
@@ -160,7 +160,7 @@ identity reprime：邊界的 `model->reset` 之後，C 側 STFT 狀態仍連續�
 只剩邊界 hop 那一幀。邊界處理只做 `model->reset` ＋ arm reprime，不清任何 buffer
 （C 側成幀狀態一路連續）。
 
-**mono 的 rolling push**：mono 範例（`mono_alignulcnet/main.c` 經 `samples/ulcnet_nn_stage`）的兩路 analysis 用 rolling center=False 的
+**mono 的 rolling push**：mono 範例（`ulcnet/mono_alignulcnet/main.c` 經 `ulcnet/ulcnet_nn_stage`）的兩路 analysis 用 rolling center=False 的
 `AcStft`（`ac_stft_push_planar()`）（自 hop#0 起每 hop 恰一幀、每 hop 至多一次推論），
 排程與 AEC/BF seam 一致。reprime 每 hop 遞減（與每發射幀遞減相等），1 hop 端到端
 延遲來自 synthesis 半窗 trim，幀 scratch 為 1 幀。

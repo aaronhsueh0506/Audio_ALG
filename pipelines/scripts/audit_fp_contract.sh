@@ -40,8 +40,8 @@ ENTRIES='
 .:libaudio_pipeline_dfn.a:dfn_rate_bridge.o:DFN rate bridge -- native and 48 kHz WOLA, analysis windows
 .:libaudio_pipeline_dfn.a:dfn2_process.o:DFN feature and streaming compose kernels
 .:mono_alignulcnet:ulcnet_nn_stage.o:Align-ULCNet stage (mono build) -- far-end analysis and enhanced-spectrum synthesis
-4ch_aec_bf_nr_res:libs:4aec_nr_res.o:4-channel core -- lane-spectrum projection and the fused PSD views
-4ch_aec_bf_nr_res:libs:audio_pipeline_4ch.o:4-channel unit -- SRP-PHAT and beamformer spectral math
+4ch_aec_bf_nr_res:libs:mcab.o:4-channel flow -- lane-spectrum projection and the fused PSD views
+4ch_aec_bf_nr_res:libs:mcab_sample_beam.o:4-channel sample beamformer helper -- SRP-PHAT and beamformer glue
 4ch_aec_bf_nr_res:4ch_alignulcnet:ulcnet_nn_stage.o:Align-ULCNet stage (4-channel build) -- far-end analysis and enhanced-spectrum synthesis
 '
 

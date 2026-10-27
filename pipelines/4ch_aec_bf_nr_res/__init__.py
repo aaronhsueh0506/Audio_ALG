@@ -15,25 +15,25 @@ from importlib import import_module
 # path-level ``__init__`` module).
 _pipeline = import_module("pipelines.4ch_aec_bf_nr_res.pipeline")
 Beamformer = _pipeline.Beamformer
-BeamformerFrame = _pipeline.BeamformerFrame
+McabBeam = _pipeline.McabBeam
 EqualWeightBeamformer = _pipeline.EqualWeightBeamformer
-FourChannelAecConfig = _pipeline.FourChannelAecConfig
-FourChannelAecPipeline = _pipeline.FourChannelAecPipeline
-FourChannelFrame = _pipeline.FourChannelFrame
-FrontFrame = _pipeline.FrontFrame
+McabConfig = _pipeline.McabConfig
+McabPipeline = _pipeline.McabPipeline
+McabFrame = _pipeline.McabFrame
+McabFront = _pipeline.McabFront
 PostBeamResidualSuppressor = _pipeline.PostBeamResidualSuppressor
-SharedDelayState = _pipeline.SharedDelayState
+McabDelayState = _pipeline.McabDelayState
 SharedMatchedDelayEstimator = _pipeline.SharedMatchedDelayEstimator
 
 __all__ = [
     "Beamformer",
-    "BeamformerFrame",
+    "McabBeam",
     "EqualWeightBeamformer",
-    "FourChannelAecConfig",
-    "FourChannelAecPipeline",
-    "FourChannelFrame",
-    "FrontFrame",
+    "McabConfig",
+    "McabPipeline",
+    "McabFrame",
+    "McabFront",
     "PostBeamResidualSuppressor",
-    "SharedDelayState",
+    "McabDelayState",
     "SharedMatchedDelayEstimator",
 ]

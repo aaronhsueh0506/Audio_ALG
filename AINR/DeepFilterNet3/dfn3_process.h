@@ -48,14 +48,72 @@
 #define DFN3_N_ERB          32
 #define DFN3_DF_BINS        96    /* bins owned by the deep filter (0..95) */
 #define DFN3_DF_ORDER       5     /* FIR taps */
+
+/* The lookahead pair is part of the trained model: a build must carry the pair
+ * its checkpoint was trained with (config.ini [model] mask_lookahead /
+ * df_lookahead, recorded in the export metadata). Override the shipped 1/1 with
+ * -DDFN3_MASK_LOOKAHEAD=<0..2> -DDFN3_DF_LOOKAHEAD=<0..DF_ORDER-1>, plain
+ * decimals, on every translation unit of the build; the two are independent.
+ * dfn3_model_io_descriptor_validate() and the pre/post pool hash refuse a host
+ * built for another pair, and objects built for different pairs do not link
+ * (see DFN3_REQUIRE_LOOKAHEAD_PAIR_LINK below). */
+#ifndef DFN3_DF_LOOKAHEAD
 #define DFN3_DF_LOOKAHEAD   1     /* future taps */
-#define DFN3_MASK_LOOKAHEAD 1
+#endif
+#ifndef DFN3_MASK_LOOKAHEAD
+#define DFN3_MASK_LOOKAHEAD 1     /* future feature frames behind each head */
+#endif
+
+#if DFN3_MASK_LOOKAHEAD < 0 || DFN3_MASK_LOOKAHEAD > 2
+#error "DFN3_MASK_LOOKAHEAD must be in [0, 2]: the graph window holds three frames"
+#endif
+#if DFN3_DF_LOOKAHEAD < 0 || DFN3_DF_LOOKAHEAD >= DFN3_DF_ORDER
+#error "DFN3_DF_LOOKAHEAD must be in [0, DFN3_DF_ORDER - 1]: the filter keeps at least its current tap"
+#endif
 
 /* The deep-filter window is [t-(ORDER-LOOKAHEAD-1) .. t+LOOKAHEAD], i.e.
- * [t-3 .. t+1] for the shipped 5/1: one frame of output delay (10.67 ms at
- * 48 kHz) where the reference 2/2 would cost about 21.3 ms. */
-#define DFN3_DF_HISTORY     (DFN3_DF_ORDER - DFN3_DF_LOOKAHEAD - 1)  /* 3 */
-#define DFN3_DF_RING        (DFN3_DF_ORDER + DFN3_MASK_LOOKAHEAD - DFN3_DF_LOOKAHEAD) /* 5 */
+ * [t-3 .. t+1] for the shipped 5/1. DFN3 is a parallel split: the taps read the
+ * raw spectrum, so output frame t needs the heads of t (input up to
+ * t+MASK_LOOKAHEAD) and the spectrum up to t+DF_LOOKAHEAD, and the output is
+ * delayed by DFN3_OUTPUT_DELAY = max(MASK, DF) frames (10.67 ms each at
+ * 48 kHz; 1 for the shipped pair where the reference 2/2 would cost about
+ * 21.3 ms). When DF > MASK the heads arrive before their output frame and wait
+ * in the ring (DFN3_HEAD_QUEUE).
+ * The ring keeps every frame from the oldest tap of the delayed frame,
+ * HISTORY frames before it, to the newest write, OUTPUT_DELAY frames after it:
+ * HISTORY + OUTPUT_DELAY + 1 = ORDER + OUTPUT_DELAY - DF slots (5 for the
+ * shipped pair). */
+#define DFN3_OUTPUT_DELAY \
+    (DFN3_MASK_LOOKAHEAD > DFN3_DF_LOOKAHEAD ? DFN3_MASK_LOOKAHEAD \
+                                             : DFN3_DF_LOOKAHEAD)
+#define DFN3_HEAD_QUEUE     (DFN3_DF_LOOKAHEAD > DFN3_MASK_LOOKAHEAD)
+#define DFN3_DF_HISTORY     (DFN3_DF_ORDER - DFN3_DF_LOOKAHEAD - 1)
+#define DFN3_DF_RING        (DFN3_DF_ORDER + DFN3_OUTPUT_DELAY - DFN3_DF_LOOKAHEAD)
+
+/* Link-time pair check. dfn3_process.c defines a one-byte symbol named after
+ * the pair it was built for (dfn3_lookahead_mask1_df1 for the shipped 1/1);
+ * dfn3_model_io.c and dfn3_prepost.c execute DFN3_REQUIRE_LOOKAHEAD_PAIR_LINK()
+ * and so reference the symbol of their own pair. An object built for another
+ * pair than dfn3_process.c fails to link with that symbol undefined, instead of
+ * running a window, ring or pool of one pair against a graph of another (the
+ * state size depends on the ring). The read is volatile so it survives
+ * optimisation and section garbage collection together with the code that holds
+ * it; no other code, allocation or I/O. */
+#define DFN3_LOOKAHEAD_PAIR_SYMBOL_JOIN_(mask, df) \
+    dfn3_lookahead_mask##mask##_df##df
+#define DFN3_LOOKAHEAD_PAIR_SYMBOL_JOIN(mask, df) \
+    DFN3_LOOKAHEAD_PAIR_SYMBOL_JOIN_(mask, df)
+#define DFN3_LOOKAHEAD_PAIR_SYMBOL \
+    DFN3_LOOKAHEAD_PAIR_SYMBOL_JOIN(DFN3_MASK_LOOKAHEAD, DFN3_DF_LOOKAHEAD)
+#ifdef __cplusplus
+extern "C" {
+#endif
+extern const unsigned char DFN3_LOOKAHEAD_PAIR_SYMBOL;
+#ifdef __cplusplus
+}
+#endif
+#define DFN3_REQUIRE_LOOKAHEAD_PAIR_LINK() \
+    ((void)*(const volatile unsigned char *)&DFN3_LOOKAHEAD_PAIR_SYMBOL)
 
 /* ---- Feature normalisation (= config.ini [feature]) ----
  * FEATURE_VERSION must equal train.py's, otherwise the checkpoint and this front
@@ -191,7 +249,16 @@ void dfn3_apply_atten_lim(const float *noisy_re, const float *noisy_im,
  *   spec_re/spec_im: current frame, original scale; pushed into the ring
  *   out_re/out_im  : enhanced spectrum delayed by DF_LOOKAHEAD frames
  * Returns 1 when out is valid, 0 during warm-up (those frames must not go to the
- * ISTFT). */
+ * ISTFT).
+ *
+ * Offline alignment: the heads are those of the spectrum passed in the same
+ * call (heads[t] with spectrum t), and there is no MASK_LOOKAHEAD offset. A
+ * live accelerator delivers heads[t] only after frame t+MASK_LOOKAHEAD has been
+ * captured, so this entry fits a live stream only when MASK_LOOKAHEAD == 0, or
+ * when the caller holds each spectrum back by MASK_LOOKAHEAD frames itself to
+ * pair it with its heads (and then the output is DF_LOOKAHEAD + MASK_LOOKAHEAD
+ * frames behind the newest capture). dfn3_compose_stream() does that pairing
+ * from the ring and is the path for the accelerator handoff. */
 int dfn3_compose(DFN3State *st,
                  const float *spec_re, const float *spec_im,
                  const float *erb_mask, const float *coefs,
@@ -203,8 +270,11 @@ int dfn3_compose(DFN3State *st,
  * heads_valid=0 and may pass NULL heads.
  *
  * DFN3 is a parallel band split: the DF's future taps read the raw spectrum and
- * never wait for a future mask, so the latency is max(MASK_LOOKAHEAD,
- * DF_LOOKAHEAD) = 1 hop = 10.67 ms at 48 kHz for the shipped 1/1.
+ * never wait for a future mask, so the latency is DFN3_OUTPUT_DELAY =
+ * max(MASK_LOOKAHEAD, DF_LOOKAHEAD) = 1 hop = 10.67 ms at 48 kHz for the
+ * shipped 1/1. The first MASK_LOOKAHEAD calls take no heads and return 0; with
+ * DF_LOOKAHEAD > MASK_LOOKAHEAD the following calls take heads, keep them and
+ * still return 0 until the first output frame is complete.
  * output_frame_index may be NULL; otherwise it reports the frame id of out.
  * atten_lim_db=0 disables the complex attenuation-limit mix.
  *

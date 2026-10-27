@@ -3,7 +3,7 @@
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
-<title>audio_pipeline_4ch + 4aec_nr_res(四聲道空間管線)</title>
+<title>mcab + mcab_sample_beam(四聲道線性 AEC flow 與 SRP/BF)</title>
 <style>
 body{font-family:-apple-system,"PingFang TC","Noto Sans TC",sans-serif;max-width:960px;margin:0 auto;padding:16px;line-height:1.55;color:#222;background:#fff}
 nav{border-bottom:1px solid #ccc;padding-bottom:8px;margin-bottom:16px;font-size:14px}
@@ -31,38 +31,42 @@ th{background:#eef0f5}
 <a href="pipeline_dfn_mono.html">pipeline_dfn_mono</a>
 <a href="pipeline_dfn_4ch.html">pipeline_dfn_4ch</a>
 </nav>
-<h1>audio_pipeline_4ch — 4 mic 共用 delay + 4 條線性 AEC + SRP/BF(唯一包起來的單元;RES 由應用用 libaec 自備)</h1>
+<h1>mcab + mcab_sample_beam — 4 mic 共用 delay + 4 條線性 AEC(flow 層)與 SRP/BF(sample helper);RES 由應用用 libaec 自備</h1>
 
 <h2>概要</h2>
-<p>兩層結構(<code>pipelines/4ch_aec_bf_nr_res/</code>),<b>只有「多聲道線性 AEC + BF」被包成一個單元</b>:</p>
+<p>四聲道線性 AEC 的 flow 層加一個 sample 層 helper(<code>pipelines/4ch_aec_bf_nr_res/</code>):</p>
 <ul>
-<li><b>核心 <code>4aec_nr_res</code>(<code>FourAecNrRes</code>)</b>:1 個共用 far aligner(<code>delay_mode=MATCHED</code> 時是 1 個 <code>DelayAec</code> matcher + 1 條共用 aligned render delay line;<code>FIXED</code>/<code>EXTERNAL_ALIGNED</code> 時 matcher count = 0,兩者都不 carve)→ <b>4 條獨立線性 AEC lane</b> → 外部 beamformer 權重投影。每 hop 兩個呼叫:<code>four_aec_front_process()</code>(delay + 四條 lane,交出借用的 <code>FourAecFront</code>)與 <code>four_aec_fuse()</code>(用外部權重投影,填 <code>SeSpecFrame</code>)。RES、NR、CNG 與 iFFT <b>不在核心內</b>(<code>SeSpecFrame.g_res_ctx</code> 恆為 NULL);直接驅動核心的範例自己建一個 <code>AecRes</code>。</li>
-<li><b>單元 <code>audio_pipeline_4ch</code>(<code>AudioPipeline4Ch</code>)</b>:把 SRP-PHAT DOA + BF(<code>audiolib/doa</code>、<code>audiolib/bf</code>)接進 <code>four_aec_front_process()</code> 與 <code>four_aec_fuse()</code> 之間,擁有它們的生命週期,並提供保守 energy-VAD fallback。輸出是 BF 後誤差頻譜與有效權重(<code>AudioPipeline4ChBeam</code>);<code>audio_pipeline_4ch_fuse()</code> 是獨立的可選步驟,填 <code>SeSpecFrame</code> 給後級。<code>fuse()</code> 與核心一樣讓 <code>frame->g_res_ctx</code> 為 NULL。<b>單元內沒有 RES、NR、CNG、合成與神經後濾波</b>(單元 pool 不含 <code>AecRes</code>)。RES 由 libaec 管理:要在單元之後做 RES 的應用在<b>自己的 init</b> 用 <code>aec_res_get_mem_size()</code>／<code>aec_res_init()</code> 建 <code>AecRes</code>(config 取 <code>aec_config_from_preset(preset, sample_rate)</code>,<code>fft_size</code> 設成單元的格點),每 hop 以 <code>se_res_stage_gain(res, &amp;frame)</code>(包 <code>aec_res_process()</code>)取增益,強度 <code>aec_res_set_preset()</code>,重設 <code>aec_res_reset()</code>(沒有 destroy)。NR(<code>AnrDenoiser</code>)與合成(<code>AcIstft</code>)同為獨立函式庫物件,由應用初始化並明寫逐 hop 串接。mono 是例外:RES 增益在 <code>aec_process_context()</code> 內算(見 <a href="pipeline_mono.html">pipeline_mono</a>)。</li>
+<li><b>flow 層 <code>mcab</code>(<code>Mcab</code>;<code>mcab.h</code>／<code>mcab.c</code>;<code>libaudio_pipeline_mcab.a</code> 只含 <code>mcab.o</code>)</b>:不是 lib 外殼,lib 物件由應用用各 lib 自己的 <code>get_mem_size</code>／<code>init</code> 建立,以指標注入——4 條 libaec <code>Aec</code> lane(config 由 <code>mcab_lane_config()</code>,或 <code>aec_config_from_preset()</code> 加 <code>mcab_apply_lane_contract()</code> 取得)與 <code>delay_mode=MATCHED</code> 時 1 個共用 <code>DelayAec</code>(<code>FIXED</code>／<code>EXTERNAL_ALIGNED</code> 不需要,matcher count = 0)。mcab 不配置、不釋放它們,只持有自己小 pool 的 flow 狀態(delay admission、對齊環、aligned far、per-lane view、fuse 緩衝)。每 hop 兩個呼叫:<code>mcab_process_front()</code>(共用 delay → 4 條 lane,交出借用的 <code>McabFront</code>)與 <code>mcab_fuse(p, W, E, frame)</code>(以呼叫端 beamformer 的權重 <code>W</code>[4][n_freqs]與可選的 beamformed 頻譜 <code>E</code> 投影,填 <code>McabFrame</code>)。mcab 內<b>沒有 beamformer</b>,也沒有 RES、NR、CNG 與 iFFT(<code>McabFrame.g_res_ctx</code> 恆為 NULL)。</li>
+<li><b>sample helper <code>mcab_sample_beam</code>(<code>mcab_sample_beam.{h,c}</code>;範例碼,不在 archive)</b>:擁有 SRP-PHAT DOA 與 BF(<code>audiolib/doa</code>、<code>audiolib/bf</code>)及保守 energy-VAD fallback,把 <code>doa_step()</code> + <code>bf_process_with_weights()</code> 接在 <code>mcab_process_front()</code> 與 <code>mcab_fuse()</code> 之間,輸出 BF 後誤差頻譜與有效權重(<code>McabSampleBeamResult</code>);<code>mcab_sample_beam_fuse()</code> 是獨立的可選步驟。builder <code>mcab_sample_flow.{h,c}</code> 把應用端 init 順序(4 條 lane、<code>DelayAec</code>、mcab)寫在一處。有自己 beamformer 的產品直接用 mcab,不需要 helper。<b>mcab 與 helper 內都沒有 RES、NR、CNG、合成與神經後濾波。</b>RES 由 libaec 管理:要做 RES 的應用在<b>自己的 init</b> 用 <code>aec_res_get_mem_size()</code>／<code>aec_res_init()</code> 建 <code>AecRes</code>(config 取 <code>aec_config_from_preset(preset, sample_rate)</code>,<code>fft_size</code> 設成 <code>mcab_fft_size()</code>),每 hop 以 <code>mcab_sample_res_input(&amp;frame, &amp;in)</code> 填 <code>AecResInput</code>、<code>aec_res_process(res, &amp;in)</code> 取增益,強度 <code>aec_res_set_preset()</code>,重設 <code>aec_res_reset()</code>(沒有 destroy)。NR(<code>AnrDenoiser</code>)與合成(<code>AcIstft</code>)同為獨立函式庫物件,由應用初始化並明寫逐 hop 串接。mono 是例外:RES 增益在 <code>aec_process_context()</code> 內算(見 <a href="pipeline_mono.html">pipeline_mono</a>)。</li>
 </ul>
-<p>結構稽核值:<code>*_matched_filter_count()</code> 在 <code>MATCHED</code> 時 1、其餘 delay_mode 為 0;<code>*_linear_aec_count()</code> 恆 4(核心 <code>four_aec_nr_res_*</code>、單元 <code>audio_pipeline_4ch_*</code>)。Lane 0 每 hop 跑真 far-FFT,lane 1–3 經 <code>aec_process_context_shared_far_from()</code> 借用 lane 0 的 far 頻譜(4 次 far-FFT → 1 次,測試以 <code>four_aec_nr_res_far_fft_real_compute_count()</code> 證明)。支援 16 kHz(fft 256 預設 / 512 明示)與 48 kHz(fft 1024)。</p>
-<p>Descriptor 慣例(32-byte 固定 ABI、init_ex 8 點閘)只存在於核心、單元與 DFN stage／bridge;<code>AnrDenoiser</code>、<code>AcIstft</code> 等函式庫物件只提供大小查詢。核心 <code>FOUR_AEC_NR_RES_LAYOUT_VERSION=24</code>、單元 <code>AUDIO_PIPELINE_4CH_LAYOUT_VERSION=21</code>,兩者 descriptor_version 皆 1;單元的 build_flags_hash 摺入核心的 hash。設定欄位分級、固定常數、函式清單、狀態碼與核心輸出契約(<code>FourAecFront</code>／<code>SeSpecFrame</code>)收在 <a href="pipeline_4ch_params.html">pipeline_4ch_params</a>。</p>
+<p>結構稽核值:<code>mcab_matched_filter_count()</code> 在 <code>MATCHED</code> 時 1、其餘 delay_mode 為 0;<code>mcab_linear_aec_count()</code> 恆 4。Lane 0 每 hop 跑真 far-FFT,lane 1–3 經 <code>aec_process_context_shared_far_from()</code> 借用 lane 0 的 far 頻譜(4 次 far-FFT → 1 次,測試以 <code>mcab_far_fft_real_compute_count()</code> 證明)。支援 16 kHz(fft 256 預設 / 512 明示)與 48 kHz(fft 1024)。</p>
+<p>Descriptor 慣例(32-byte 固定 ABI、init_ex 8 點閘)只存在於 mcab 與 DFN stage／bridge;<code>Aec</code>、<code>AnrDenoiser</code>、<code>AcIstft</code> 與 sample helper 只提供大小查詢。4ch flow <code>MCAB_LAYOUT_VERSION=25</code>,descriptor_version 1,只描述 mcab 自己的 pool(lane 與 estimator 由應用建立後注入,SRP/BF 在 sample helper)。欄位分級、固定常數、函式清單、狀態碼與輸出契約收在 <a href="pipeline_4ch_params.html">pipeline_4ch_params</a>。</p>
 
 <h2>如何呼叫使用</h2>
-<p>單元的呼叫順序(括號為失敗訊號):<code>audio_pipeline_4ch_default_config(sr)</code> → 視需要改欄位 → <code>get_mem_requirements()</code>(−1 = config 無效)→ 配置 <code>req.bytes</code>、<code>req.alignment</code>(16)的 pool → <code>init_ex(pool, bytes, &amp;cfg, &amp;req)</code>(NULL = descriptor 過期、pool 過小／未對齊、config 無效,<b>靜默</b>無診斷)→ 應用在自己的 init 為 RES、NR、合成各自查大小、init(另一塊 post pool)→ 每 hop <code>process_front()</code> → <code>process_beam()</code> → <code>fuse()</code> → <code>se_res_stage_gain()</code> → NR 增益 → 後級 → 任一步非 OK、RES／NR 增益為 NULL 或輸出非有限時 <code>audio_pipeline_4ch_reset()</code> 加上自己的 <code>aec_res_reset()</code>、<code>anr_reset()</code>、<code>ac_istft_reset()</code>、rng 一起重設 → <code>destroy()</code>(不釋放 caller pool)。descriptor 與大小都不可跨 build 快取。範例已在 <code>-Wall -Wextra -Werror</code> 下編譯檢查(<code>platform_alloc()</code>、<code>stream_next4()</code>、<code>product_vad()</code> 是平台／I/O 佔位)。</p>
-<h3>單元(含 SRP/BF)+ 自備 RES + NR + 合成</h3>
-<pre>AudioPipeline4ChConfig cfg = audio_pipeline_4ch_default_config(16000);
-/* 建立前可改 cfg 欄位(見 pipeline_4ch_params) */
-AudioPipeline4ChMemReq req;
-if (audio_pipeline_4ch_get_mem_requirements(&amp;cfg, &amp;req) != 0) return -1;      /* -1 = 無效 */
-void* pool = platform_alloc(req.bytes, req.alignment);
-AudioPipeline4Ch* p = audio_pipeline_4ch_init_ex(pool, req.bytes, &amp;cfg, &amp;req);
-if (!p) return -1;                                          /* NULL = 拒絕, 無診斷輸出 */
+<p>呼叫順序(括號為失敗訊號):<code>mcab_default_config(sr)</code> 與 <code>mcab_sample_beam_default_params()</code> → 視需要改欄位 → 查大小(<code>mcab_sample_flow_get_mem_size()</code> 合計 4 條 lane、estimator 與 mcab,<code>mcab_sample_beam_get_mem_size()</code> 查 helper;−1 = 無效)→ 配置 16-byte 對齊的 pool → <code>mcab_sample_flow_init()</code>(內部依序 <code>aec_init</code> ×4、MATCHED 時 <code>delay_aec_init</code>、<code>mcab_init_ex()</code>;−1 = config 無效、pool 過小／未對齊、任一物件 init 失敗,<b>靜默</b>無診斷)→ <code>mcab_sample_beam_init(mem, bytes, &amp;cfg, &amp;bp, flow)</code>(NULL = 拒絕)→ 應用自己為 RES、NR、合成查大小並 init(另一塊 post pool)→ 每 hop <code>process_front()</code> → <code>process_beam()</code> → <code>fuse()</code> → <code>aec_res_process()</code> → NR 增益 → 後級 → 任一步非 OK、增益為 NULL 或輸出非有限時 <code>mcab_sample_beam_reset()</code> 加上自己的 <code>aec_res_reset()</code>、<code>anr_reset()</code>、<code>ac_istft_reset()</code>、rng 一起重設 → 拆除 helper → <code>mcab_destroy()</code> → <code>aec_destroy()</code> ×4(<code>mcab_sample_flow_destroy()</code> 含後兩步;都不釋放 caller 記憶體)。descriptor 與大小不可跨 build 快取。範例已在 <code>-Wall -Wextra -Werror</code> 下做過語法檢查(<code>platform_alloc()</code>、<code>stream_next4()</code>、<code>product_vad()</code> 是平台／I/O 佔位)。</p>
+<h3>flow + helper(含 SRP/BF)+ 自備 RES + NR + 合成</h3>
+<pre>McabConfig cfg = mcab_default_config(16000);                  /* 建立前可改 cfg 欄位(見 pipeline_4ch_params) */
+McabSampleBeamParams bp = mcab_sample_beam_default_params();   /* 陣列幾何、SRP/BF 參數 */
+size_t flow_b, beam_b;
+if (mcab_sample_flow_get_mem_size(&amp;cfg, &amp;flow_b) != 0 ||        /* -1 = 無效 */
+    mcab_sample_beam_get_mem_size(&amp;cfg, &amp;bp, &amp;beam_b) != 0) return -1;
+void* flow_mem = platform_alloc(flow_b, 16);
+void* beam_mem = platform_alloc(beam_b, 16);
+McabSampleFlow flow;                                           /* 4 條 lane + 共用 DelayAec + mcab */
+if (mcab_sample_flow_init(&amp;flow, flow_mem, flow_b, &amp;cfg) != 0) return -1;   /* -1 = 拒絕, 無診斷輸出 */
+McabSampleBeam* b = mcab_sample_beam_init(beam_mem, beam_b, &amp;cfg, &amp;bp, flow.flow);
+if (!b) return -1;
 
-/* RES(libaec)、NR、合成: 應用自己的 init, 另一塊 post pool, 格點取單元解析後的值 */
-int fft = audio_pipeline_4ch_fft_size(p), nf = audio_pipeline_4ch_n_freqs(p), hop = audio_pipeline_4ch_hop_size(p);
-AecConfig res_cfg;  aec_config_from_preset(&amp;res_cfg, AEC_PRESET_BALANCED, cfg.core.sample_rate);
+/* RES(libaec)、NR、合成: 應用自己的 init, 另一塊 post pool, 格點取 flow 的值 */
+int fft = mcab_fft_size(flow.flow), nf = mcab_n_freqs(flow.flow), hop = mcab_hop_size(flow.flow);
+AecConfig res_cfg;  aec_config_from_preset(&amp;res_cfg, AEC_PRESET_BALANCED, cfg.sample_rate);
 res_cfg.fft_size = fft;
-AnrConfig nr_cfg = anr_config_for_mode_grid(cfg.core.sample_rate, fft, ANR_MODE_BALANCED);
+AnrConfig nr_cfg = anr_config_for_mode_grid(cfg.sample_rate, fft, ANR_MODE_BALANCED);
 AcStftConfig syn_cfg;  ac_stft_config_default(&amp;syn_cfg, fft);
 size_t res_b = aec_res_get_mem_size(&amp;res_cfg), nr_b = anr_get_mem_size(&amp;nr_cfg), syn_b = ac_istft_get_mem_size(&amp;syn_cfg);
 if (!res_b || !nr_b || !syn_b) return -1;                   /* 0 = 無效 */
 size_t vec = ALIGN16(nf * sizeof(float)), cvec = ALIGN16(nf * sizeof(Complex));
-uint8_t* post = platform_alloc(ALIGN16(res_b) + ALIGN16(nr_b) + ALIGN16(syn_b) + 2 * vec + cvec, 16);
+uint8_t* post = (uint8_t*)platform_alloc(ALIGN16(res_b) + ALIGN16(nr_b) + ALIGN16(syn_b) + 2 * vec + cvec, 16);
 AecRes* res = aec_res_init(post, res_b, &amp;res_cfg);
 AnrDenoiser* nr = anr_init(post + ALIGN16(res_b), nr_b, &amp;nr_cfg);
 AcIstft* istft = ac_istft_init(post + ALIGN16(res_b) + ALIGN16(nr_b), syn_b, &amp;syn_cfg);
@@ -70,88 +74,88 @@ if (!res || !nr || !istft) return -1;
 float* total_gain = (float*)(post + ALIGN16(res_b) + ALIGN16(nr_b) + ALIGN16(syn_b));
 float* extra_noise = total_gain + vec / sizeof(float);
 Complex* spec = (Complex*)(extra_noise + vec / sizeof(float));
-uint32_t rng = SE_CNG_RNG_SEED;
+uint32_t rng = MCAB_SAMPLE_CNG_RNG_SEED;
 
 const float *mics, *ref;  float out[512];
 while (stream_next4(&amp;mics, &amp;ref, out)) {
-    AudioPipeline4ChBeam beam;  AudioPipeline4ChFrameInfo info;  SeSpecFrame frame;
-    int vad = product_vad(mics);                            /* 沒有產品 VAD 時改呼叫 audio_pipeline_4ch_process() (內建 energy VAD) */
-    int rc = audio_pipeline_4ch_process_with_activity(p, mics, ref, vad, vad, NULL, &amp;beam, &amp;info);
-    if (rc == FOUR_AEC_NR_RES_OK) rc = audio_pipeline_4ch_fuse(p, &amp;frame);   /* 需要 core.enable_post=1; frame.g_res_ctx 為 NULL */
-    if (rc == FOUR_AEC_NR_RES_OK) {
-        const float* g_res = se_res_stage_gain(res, &amp;frame);                  /* RES 在單元之外, 由應用呼叫; 被拒回 NULL */
-        const float* g_nr = g_res ? se_anr_stage_gain(nr, &amp;frame, extra_noise, 1) : NULL;
-        if (!g_nr) rc = FOUR_AEC_NR_RES_DSP_ERROR;
+    McabSampleBeamResult beam;  McabSampleBeamInfo info;  McabFrame frame;
+    int vad = product_vad(mics);                            /* 沒有產品 VAD 時改呼叫 mcab_sample_beam_process() (內建 energy VAD) */
+    int rc = mcab_sample_beam_process_with_activity(b, mics, ref, vad, vad, NULL, &amp;beam, &amp;info);
+    if (rc == MCAB_OK) rc = mcab_sample_beam_fuse(b, &amp;frame);   /* 需要 enable_post=1; frame.g_res_ctx 為 NULL */
+    if (rc == MCAB_OK) {
+        AecResInput rin;  mcab_sample_res_input(&amp;frame, &amp;rin);
+        const float* g_res = aec_res_process(res, &amp;rin);                      /* RES 在 mcab 之外, 由應用呼叫; 被拒回 NULL */
+        const float* g_nr = g_res ? mcab_sample_anr_gain(nr, &amp;frame, extra_noise, 1) : NULL;
+        if (!g_nr) rc = MCAB_DSP_ERROR;
         else {
             sk_min_f32(total_gain, g_nr, g_res, frame.n_freqs);
             sk_capply_gain_f32(spec, frame.e, total_gain, frame.n_freqs);
-            if (frame.cn) aec_cng_fill(&amp;rng, spec, frame.cn, g_res, g_nr, SE_CNG_NR_GAIN_FLOOR, frame.n_freqs);
+            if (frame.cn) aec_cng_fill(&amp;rng, spec, frame.cn, g_res, g_nr, MCAB_SAMPLE_CNG_NR_GAIN_FLOOR, frame.n_freqs);
             ac_istft_push(istft, spec, out);                                  /* 一次 iFFT/OLA */
-            if (!se_hop_is_finite(out, hop)) rc = FOUR_AEC_NR_RES_DSP_ERROR;
+            if (!skn_all_finite_f32(out, (size_t)hop)) rc = MCAB_DSP_ERROR;
         }
     }
-    if (rc != FOUR_AEC_NR_RES_OK) {                         /* 任一步被拒或輸出非有限: 單元與後級一起 reset */
-        audio_pipeline_4ch_reset(p);  aec_res_reset(res);  anr_reset(nr);  ac_istft_reset(istft);  rng = SE_CNG_RNG_SEED;
+    if (rc != MCAB_OK) {                                    /* 任一步被拒或輸出非有限: helper(含 flow)與後級一起 reset */
+        mcab_sample_beam_reset(b);  aec_res_reset(res);  anr_reset(nr);  ac_istft_reset(istft);  rng = MCAB_SAMPLE_CNG_RNG_SEED;
         memset(out, 0, (size_t)hop * sizeof(float));
     }
 }
-anr_destroy(nr);  audio_pipeline_4ch_destroy(p);            /* 不釋放 caller pool; AecRes 沒有 destroy */
-platform_free(post);  platform_free(pool);</pre>
-<p>產品有 VAD 時用 <code>process_with_activity()</code>(如上);沒有則 <code>audio_pipeline_4ch_process()</code>(內建 energy VAD)。要由 lane 頻譜算 mask／VAD 時拆成 <code>process_front(p, mics, ref, &amp;front)</code> → 在 <code>front.linear_spectra</code> 上算 mask → <code>process_beam(p, &amp;front, vad_raw, vad_out, mask, &amp;beam, &amp;info)</code>。外部 NN 後級(如 ULCNet)用 <code>core.enable_post=0</code> 的單元:不呼叫 fuse,下一個 <code>process_front()</code> 直接接手。</p>
-<h3>只用核心 + 自備 beamformer 與 RES</h3>
-<p>產品的波束器在別處時,單元沒有「外部波束權重」入口(目前的能力缺口),要退回核心:<code>four_aec_front_process()</code> → 自己的 beamformer → <code>four_aec_fuse(core, weights, NULL, &amp;frame)</code> → 自備 <code>AecRes</code> 的 <code>se_res_stage_gain()</code> → 同樣的後級。完整、已編譯檢查的範例在 <a href="pipeline_4ch_detail.html">pipeline_4ch_detail</a>;可執行範例是 <code>4aec_nr_res_static.c</code>。</p>
-<p><b>換用別的後級(例如 DFN2)。</b>單元只交出 <code>SeSpecFrame</code>(<code>frame.e</code> 是估計用的 pre-RES 誤差頻譜,<code>cn</code>／<code>r2</code> 是同一次投影的 PSD);想插入神經後濾波的應用用自備 <code>AecRes</code> 的增益自己組 <code>P = E · G_res (+ comfort noise)</code>,現成消費者是 <a href="pipeline_dfn_4ch.html">pipeline_dfn_4ch</a>。</p>
-<p>強度屬於擁有 RES 與 NR 的那一層:RES 用自建 handle 的 <code>aec_res_set_preset(res, preset, ramp_ms)</code>,NR 用 <code>anr_set_mode(nr, mode)</code>;單元與核心沒有 setter,對四條 lane 重新指定 preset 是無效操作。呼叫表、回 −1 條件、ramp 與逐階段耗時診斷(<code>four_aec_nr_res_get_last_timing()</code>／<code>audio_pipeline_4ch_last_core_timing()</code>)收在 <a href="pipeline_4ch_detail.html">pipeline_4ch_detail</a>。</p>
+anr_destroy(nr);                                            /* AecRes 沒有 destroy */
+mcab_sample_beam_destroy(b);  mcab_sample_flow_destroy(&amp;flow);   /* 先 helper, 再 mcab 與 lane; 都不釋放 caller 記憶體 */
+platform_free(post);  platform_free(beam_mem);  platform_free(flow_mem);</pre>
+<p>產品有 VAD 時用 <code>process_with_activity()</code>(如上);沒有則 <code>mcab_sample_beam_process()</code>(內建 energy VAD)。要由 lane 頻譜算 mask／VAD 時拆成 <code>mcab_sample_beam_process_front(b, mics, ref, &amp;front)</code> → 在 <code>front.linear_spectra</code> 上算 mask → <code>mcab_sample_beam_process_beam(b, &amp;front, vad_raw, vad_out, mask, &amp;beam, &amp;info)</code>。外部 NN 後級(如 ULCNet)用 <code>enable_post=0</code> 的 flow:不呼叫 fuse,下一個 <code>process_front()</code> 直接接手。</p>
+<h3>只用 mcab + 自備 beamformer 與 RES</h3>
+<p>產品的波束器在別處時不需要 helper:<code>mcab_process_front()</code> → 自己的 beamformer → <code>mcab_fuse(p, weights, NULL, &amp;frame)</code> → 自備 <code>AecRes</code> 的 <code>aec_res_process()</code> → 同樣的後級。完整、已語法檢查的範例(含 lane／estimator 的顯式 init)在 <a href="pipeline_4ch_detail.html">pipeline_4ch_detail</a>;可執行範例是 <code>mcab_external_static.c</code>。</p>
+<p><b>換用別的後級(例如 DFN2)。</b>mcab 只交出 <code>McabFrame</code>(<code>frame.e</code> 是 pre-RES 誤差頻譜,<code>cn</code>／<code>r2</code> 是同一次投影的 PSD);神經後濾波用自備 <code>AecRes</code> 的增益自己組 <code>P = E · G_res (+ comfort noise)</code>,現成消費者是 <a href="pipeline_dfn_4ch.html">pipeline_dfn_4ch</a>。</p>
+<p>強度屬於擁有 RES 與 NR 的那一層(<code>aec_res_set_preset()</code>、<code>anr_set_mode()</code>);mcab 與 helper 沒有 setter,對四條 lane 重新指定 preset 是無效操作。呼叫表、ramp 與逐階段耗時診斷(<code>mcab_get_last_timing()</code>)見 <a href="pipeline_4ch_detail.html">pipeline_4ch_detail</a>。</p>
 
 <h2>流程時序圖</h2>
-<p>lifeline = 應用、單元(核心／SRP／BF)、libaec 的 AecRes、AnrDenoiser、AcIstft;完整版與錯誤矩陣見 <a href="integration_sequence.html">整合時序圖</a>。</p>
-<pre>應用              AudioPipeline4Ch [core | SRP | BF]        AecRes(libaec)  AnrDenoiser  AcIstft
- │─ get_mem_requirements ─ 配置 pool ─ init_ex ►│ (NULL=拒絕)
- │─ aec_res_get_mem_size ─ aec_res_init(post pool;config=aec_config_from_preset,fft_size=單元格點) ►│;anr_init / ac_istft_init 同一塊 post pool
+<p>lifeline = 應用、mcab flow(共用 aligner＋4 lane)、helper(SRP／BF)、libaec 的 AecRes、AnrDenoiser、AcIstft;完整版與錯誤矩陣見 <a href="integration_sequence.html">整合時序圖</a>。</p>
+<pre>應用              Mcab [aligner | 4 lanes]   McabSampleBeam [SRP | BF]    AecRes(libaec)  AnrDenoiser  AcIstft
+ │─ 查大小 ─ 配置 ─ mcab_sample_flow_init (aec_init×4, delay_aec_init, mcab_init_ex) ►│ (-1=拒絕)
+ │─ mcab_sample_beam_get_mem_size ─ 配置 ─ mcab_sample_beam_init(...,flow) ►│ (NULL=拒絕)
+ │─ aec_res_get_mem_size ─ aec_res_init(post pool;config=aec_config_from_preset,fft_size=flow 格點) ►│;anr_init / ac_istft_init 同一塊 post pool
  │  ┌ 每 hop ─────────────────────────────────────────────────────────────────────┐
- │─ process_front(mics,ref,&amp;front) ►│ core: delay → 4 lanes  → front.{linear_spectra,formed_hop,aligned_ref}
+ │─ mcab_sample_beam_process_front(mics,ref,&amp;front) ►│ mcab_process_front: delay → 4 lanes → front.{linear_spectra,formed_hop,aligned_ref}
  │  [應用: front.linear_spectra → mask / vad_raw / vad_out]
- │─ process_beam(&amp;front,vad,vad,mask,&amp;beam,&amp;info) ►│ SRP doa_step → BF weights/spectrum
- │─ fuse(&amp;frame) ►│ four_aec_fuse → frame(E, R2, CN;g_res_ctx=NULL)
- │─ se_res_stage_gain(res,&amp;frame) ────────────────────────►│ G_res(NULL=被拒)
- │─ se_anr_stage_gain(nr,&amp;frame,...) ─────────────────────────────────────►│ G_nr
- │  sk_min_f32 → sk_capply_gain_f32 → aec_cng_fill ─ ac_istft_push(spec,out) ───────────────►│ out[hop]
+ │─ mcab_sample_beam_process_beam(&amp;front,vad,vad,mask,&amp;beam,&amp;info) ►│ SRP doa_step → BF weights/spectrum
+ │─ mcab_sample_beam_fuse(&amp;frame) ►│ mcab_fuse(weights, spectrum) → frame(E, R2, CN;g_res_ctx=NULL)
+ │─ mcab_sample_res_input(&amp;frame,&amp;in); aec_res_process(res,&amp;in) ─────────────►│ G_res(NULL=被拒)
+ │─ mcab_sample_anr_gain(nr,&amp;frame,...) ──────────────────────────────────────────►│ G_nr
+ │  sk_min_f32 → sk_capply_gain_f32 → aec_cng_fill ─ ac_istft_push(spec,out) ───────────────────────►│ out[hop]
  │  └─────────────────────────────────────────────────────────────────────────────┘
- │─ 非 OK / 增益 NULL / 非有限:audio_pipeline_4ch_reset ─ aec_res_reset ─ anr_reset ─ ac_istft_reset ─ rng=SE_CNG_RNG_SEED
- │─ 結束:anr_destroy; audio_pipeline_4ch_destroy(AecRes 沒有 destroy); 釋放兩塊 pool</pre>
+ │─ 非 OK / 增益 NULL / 非有限:mcab_sample_beam_reset ─ aec_res_reset ─ anr_reset ─ ac_istft_reset ─ rng=MCAB_SAMPLE_CNG_RNG_SEED
+ │─ 結束:anr_destroy; mcab_sample_beam_destroy ─ mcab_destroy ─ aec_destroy×4(AecRes 沒有 destroy); 釋放各塊記憶體</pre>
 <h3>每 hop 程式流(block diagram)</h3>
-<pre>audio_pipeline_4ch_process_with_activity(p, mics, ref, vad_raw, vad_out, mask, &amp;beam, &amp;info)
- │   (= audio_pipeline_4ch_process_front() + audio_pipeline_4ch_process_beam())
- ├─ audio_pipeline_4ch_process_front(p, mics, ref, &amp;front)
- │    └─ four_aec_front_process(core, mics, ref, &amp;front)
- │         ├─ inputs_finite() 拒非有限輸入
+<pre>mcab_sample_beam_process_with_activity(b, mics, ref, vad_raw, vad_out, mask, &amp;beam, &amp;info)
+ │   (= mcab_sample_beam_process_front() + mcab_sample_beam_process_beam())
+ ├─ mcab_sample_beam_process_front(b, mics, ref, &amp;front)
+ │    └─ mcab_process_front(flow, mics, ref, &amp;front)
+ │         ├─ skn_all_finite_f32() 拒非有限輸入
  │         ├─ update_shared_delay(): delay_aec_accumulate_ex(proxy_ch, ref, run)
- │         │     eligible = est&gt;=0 &amp;&amp; solid &amp;&amp; n_updates&gt;=3 → accepted_delay
+ │         │     eligible = est&gt;=0 &amp;&amp; solid &amp;&amp; n_updates&gt;=3 → mcab_admission_offer() → accepted_delay
  │         ├─ align_render(): 共用 delay ring → aligned_ref[hop]
  │         ├─ delay.changed → aec_apply_external_realign(lane 0..3, Δdelay)
  │         └─ 4 lanes: lane0 aec_process_context(mic0, aligned_ref)
  │                     lane1-3 aec_process_context_shared_far_from(..., lane0)
  │                     bind_lane_view() → front.linear_spectra / formed_hop(借用 lane buffer)
  ├─ [可選: 由 front.linear_spectra 算 mask / vad_raw / vad_out]
- ├─ audio_pipeline_4ch_process_beam(p, &amp;front, vad_raw, vad_out, mask, &amp;beam, &amp;info)
+ ├─ mcab_sample_beam_process_beam(b, &amp;front, vad_raw, vad_out, mask, &amp;beam, &amp;info)
  │    ├─ doa_step(srp, front.linear_spectra, mask, vad_raw, vad_out)    SRP-PHAT
  │    └─ bf_process_with_weights(bf, front.linear_spectra, doa_get_smooth(srp),
  │            vad_out?0:1, mask, bf_spectrum, bf_weights)              BF(RLS) → beam.spectrum / beam.weights
- ├─ audio_pipeline_4ch_fuse(p, &amp;frame)   (可選, enable_post=1) → four_aec_fuse(core, bf_weights, bf_spectrum, &amp;frame)
- │      ├─ validate_weights()(全零/非有限權重拒收,front frame 仍可重試)
- │      ├─ fuse_contexts(): 用同一組 weights 投影 near / residual / comfort
+ ├─ mcab_sample_beam_fuse(b, &amp;frame)   (可選, enable_post=1) → mcab_fuse(flow, bf_weights, bf_spectrum, &amp;frame)
+ │      ├─ mcab_weights_valid()(全零/非有限權重拒收;直接用 mcab 時 front 仍可重試,經 helper 則整體 reset)
+ │      ├─ fuse_contexts(): 用同一組 weights 投影 near / residual / comfort(結果非有限 → DSP_ERROR)
  │            residual_vec[k] = sqrt(r2[k])·echo[k]/|echo[k]| (取 echo 相位,|residual_vec|² == max(r2,0))
  │            frame.r2 = |Σ_ch w·residual_vec|²(coherent);frame.cn = Σ_ch |w|²·cn
- │      └─ frame.g_res_ctx = NULL(單元與核心都不算 RES 增益)
- └─ 單元之外(各 main 的逐 hop 區段, 例如 audio_pipeline_4ch_static.c 的 static_chain())
-        res_gain = se_res_stage_gain(res, &amp;frame)  應用自備的 1 個 AecRes(libaec aec_res_process; NULL = 被拒)
-        nr_gain  = se_anr_stage_gain(nr, &amp;frame, extra_noise, 1)  1 個 mono NR(AnrDenoiser)
-        sk_min_f32(total_gain, nr_gain, res_gain, n)
-        sk_capply_gain_f32(spec, frame.e, total_gain, n)
-        aec_cng_fill(&amp;rng, spec, frame.cn, res_gain, nr_gain, SE_CNG_NR_GAIN_FLOOR=0.316, n)
-          (frame.cn 非 NULL 時; sqrt(1-res²)·sqrt(cn/32768²)·max(nr,0.316) × 隨機相位)
+ │      └─ frame.g_res_ctx = NULL(mcab 不算 RES 增益)
+ └─ mcab 之外(各 main 的逐 hop 區段, 例如 mcab_static.c 的 static_chain())
+        mcab_sample_res_input(&amp;frame, &amp;in) → aec_res_process(res, &amp;in) → mcab_sample_anr_gain(nr, &amp;frame, extra_noise, 1)   (自備 AecRes + 1 個 mono NR; NULL = 被拒)
+        sk_min_f32 → sk_capply_gain_f32(spec, frame.e, total_gain, n)
+        aec_cng_fill(..., MCAB_SAMPLE_CNG_NR_GAIN_FLOOR=0.316, n)  (frame.cn 非 NULL 時; sqrt(1-res²)·sqrt(cn/32768²)·max(nr,0.316) × 隨機相位)
         ac_istft_push(istft, spec, out)   (AcIstft: fft_inverse + sqrt-Hann OLA) → out[hop]</pre>
-<p>範例一律建 RES;換用別的後級(例如 DFN2、ULCNet)就是換掉最後一個方塊裡的幾行,單元與核心不變。</p>
+<p>範例一律建 RES;換用別的後級(例如 DFN2、ULCNet)就是換掉最後一個方塊裡的幾行,mcab 與 helper 不變。</p>
 
 <h2>訊號泳道圖</h2>
 <pre>lane \ hop        #0                #1                #p (穩態)
@@ -164,16 +168,16 @@ SRP/BF (C)        doa/weights #0    doa/weights #1    weights frame_p(同 hop)
 fuse+RES+後級 (C)  out=半窗 ramp≈0   out=hop#0 重建    out = hop p-1 的重建
                                                       ── 同一呼叫內完成, 輸出
                                                          落後輸入 1 hop(WOLA)</pre>
-<p>front → SRP/BF → fuse → 後級都在同一個 hop;唯一 hop-lag 是 ISTFT 端 WOLA。實測(4 mic 同號白噪、ref 全零,16 kHz/256 預設,<code>audio_pipeline_4ch_raw</code>):cross-correlation lag argmax = 127 samples ≈ 1.0 hop。</p>
+<p>front → SRP/BF → fuse → 後級都在同一個 hop;唯一 hop-lag 是 ISTFT 端 WOLA。實測(4 mic 同號白噪、ref 全零,16 kHz/256 預設,<code>mcab_raw</code>):cross-correlation lag argmax = 127 samples ≈ 1.0 hop。</p>
 
 <h2>參數表(摘要)</h2>
 <p>完整分級(每個欄位的範圍、預設、何時設、為什麼不開放)與公開／內部函式清單在 <a href="pipeline_4ch_params.html">pipeline_4ch_params</a>。</p>
 <table>
 <tr><th>類別</th><th>項目</th></tr>
-<tr><td>外部</td><td><code>core.sample_rate／fft_size／filter_length／delay_mode／delay_num_filters／fixed_delay_samples</code>;<code>geometry／uca_radius_m／ula_spacing_m／microphone_x_m／y_m</code>;<code>bf_enable／bf_fixed_mode／bf_fixed_doa_rad</code>;應用自備 RES 的 <code>aec_config_from_preset(preset, sr)</code>;執行期 <code>aec_res_set_preset()</code>、<code>anr_set_mode()</code></td></tr>
-<tr><td>外部(進階)</td><td><code>core.capture_proxy_channel／max_delay_ms／delay_est_period_s</code>;<code>num_angles</code>;<code>doa_low_freq_hz／doa_high_freq_hz</code>;<code>bf_adapt_interval</code>;<code>auto_vad_*</code>(僅備援 VAD)</td></tr>
-<tr><td>整合者專用</td><td><code>core.enable_post</code>(0 = 只留線性 context,NN 後級的設定檔;fuse 不可用)</td></tr>
-<tr><td>內部</td><td><code>core.delay_backward_quarantine_*</code>、<code>speed_of_sound_m_s</code>、<code>doa_enable_smoothing／doa_switch_consecutive／doa_angle_tolerance_rad／doa_update_interval</code>、<code>bf_lambda／bf_mu／bf_fixed_align_notebook</code>、lane 的 preset(固定 BALANCED)、delay admission 與 duty-cycle 常數</td></tr>
+<tr><td>外部</td><td><code>McabConfig</code>:<code>sample_rate／fft_size／delay_mode／delay_num_filters／fixed_delay_samples</code>;lane 的 <code>AecConfig.filter_length</code>;<code>McabSampleBeamParams</code>:<code>geometry／uca_radius_m／ula_spacing_m／microphone_x_m／y_m</code>、<code>bf_enable／bf_fixed_mode／bf_fixed_doa_rad</code>;應用自備 RES 的 <code>aec_config_from_preset(preset, sr)</code>;執行期 <code>aec_res_set_preset()</code>、<code>anr_set_mode()</code></td></tr>
+<tr><td>外部(進階)</td><td><code>McabConfig</code>:<code>capture_proxy_channel／max_delay_ms／delay_est_period_s</code>;<code>McabSampleBeamParams</code>:<code>num_angles</code>、<code>doa_low_freq_hz／doa_high_freq_hz</code>、<code>bf_adapt_interval</code>、<code>auto_vad_*</code>(僅備援 VAD)</td></tr>
+<tr><td>整合者專用</td><td><code>enable_post</code>(0 = 只留線性 context,NN 後級的設定檔;fuse 不可用)</td></tr>
+<tr><td>內部</td><td><code>delay_backward_quarantine_*</code>、<code>speed_of_sound_m_s</code>、<code>doa_enable_smoothing／doa_switch_consecutive／doa_angle_tolerance_rad／doa_update_interval</code>、<code>bf_lambda／bf_mu／bf_fixed_align_notebook</code>、delay admission 與 duty-cycle 常數;lane 的其餘 <code>AecConfig</code> 欄位 mcab 不檢查(<code>mcab_lane_config()</code> 預設為 BALANCED preset)</td></tr>
 </table>
 
 <h2>I/O 表</h2>
@@ -181,33 +185,26 @@ fuse+RES+後級 (C)  out=半窗 ramp≈0   out=hop#0 重建    out = hop p-1 的
 <tr><th>張量</th><th>shape</th><th>dtype</th><th>每次呼叫幀數</th><th>時域樣本</th></tr>
 <tr><td><code>microphones_interleaved</code>(in)</td><td>[hop][4] interleaved</td><td>float32</td><td>1 hop</td><td>128×4 @16k 預設(256×4 @fft512;512×4 @48k)</td></tr>
 <tr><td><code>far_reference</code>(in)</td><td>[hop]</td><td>float32</td><td>1 hop</td><td>128 @16k 預設</td></tr>
-<tr><td><code>out</code>(你的 <code>ac_istft_push()</code> 的輸出,單元不產生)</td><td>[hop]</td><td>float32</td><td>1 hop mono</td><td>128 @16k 預設</td></tr>
-<tr><td><code>beam.spectrum</code> / <code>beam.weights</code>(單元輸出)</td><td>[n_freqs] / [4][n_freqs]</td><td>Complex</td><td>1 frame</td><td>beamformed 誤差頻譜與有效權重;借用至下一次 <code>process_front()</code>／reset</td></tr>
-<tr><td><code>SeSpecFrame</code>(<code>fuse</code> out;<code>g_res_ctx</code> 為 NULL)</td><td><code>e,y,x,r2,cn</code> 各 [n_freqs];<code>far_hop</code> [hop](<code>formed_hop</code> 為 NULL)</td><td>Complex／float32</td><td>1 frame</td><td>借用視圖,有效至下一次 <code>process_front()</code>／reset;不可寫入</td></tr>
+<tr><td><code>out</code>(你的 <code>ac_istft_push()</code> 的輸出,mcab 與 helper 不產生)</td><td>[hop]</td><td>float32</td><td>1 hop mono</td><td>128 @16k 預設</td></tr>
+<tr><td><code>beam.spectrum</code> / <code>beam.weights</code>(helper 輸出)</td><td>[n_freqs] / [4][n_freqs]</td><td>Complex</td><td>1 frame</td><td>beamformed 誤差頻譜與有效權重;借用至下一次 <code>process_front()</code>／reset</td></tr>
+<tr><td><code>McabFrame</code>(<code>fuse</code> out;<code>g_res_ctx</code> 為 NULL)</td><td><code>e,y,x,r2,cn</code> 各 [n_freqs];<code>far_hop</code> [hop](<code>formed_hop</code> 為 NULL)</td><td>Complex／float32</td><td>1 frame</td><td>借用視圖,有效至下一次 <code>process_front()</code>／reset;不可寫入</td></tr>
 <tr><td><code>frequency_mask</code>(可選 in)</td><td>[n_freqs]</td><td>int</td><td>—</td><td>1=選給 SRP 且凍結該 bin 的 BF 適應</td></tr>
 </table>
-<p>n_freqs = 129(16k/256)/ 257(16k/512)/ 513(48k/1024)。<code>FourAecFront</code>(<code>linear_spectra[4]</code>、<code>formed_hop[4]</code>、<code>aligned_ref</code>)與核心 <code>weights</code>[4][n_freqs] 的欄位契約見 <a href="pipeline_4ch_params.html">pipeline_4ch_params</a> 第 7 節。</p>
+<p>n_freqs = 129(16k/256)/ 257(16k/512)/ 513(48k/1024)。<code>McabFront</code>(<code>linear_spectra[4]</code>、<code>formed_hop[4]</code>、<code>aligned_ref</code>)與 mcab 的 <code>weights</code>[4][n_freqs] 的欄位契約見 <a href="pipeline_4ch_params.html">pipeline_4ch_params</a> 第 7 節。</p>
 
 <h2>State 表</h2>
-<p>單元一個 caller pool,carve 順序 <code>self, core, srp, bf, bf_spectrum, bf_weights</code>(<code>audio_pipeline_4ch.c</code> 的 <code>build_flags_hash</code> carve token,layout v21,hash 0x8aabdea5)。核心自己只 carve 4 條 lane、共用 aligner、delay ring 與 fuse 緩衝,<b>不含</b> RES／NR／iFFT。單元的 <code>req.bytes</code> <b>不含</b> <code>AecRes</code>;RES、NR、合成與 <code>total_gain / extra_noise / spec</code> 三個暫存是普通的函式庫物件／緩衝,由各 main 自己 carve(另一塊 post pool),各有自己的 <code>mem_size</code>。數字為 ne10 實測(<code>audio_pipeline_4ch_static --print-mem-size</code>、<code>4aec_nr_res_static --print-mem-size</code>,SRP／BF 以 <code>srp_get_mem_size()</code>／<code>bf_get_mem_size()</code> 直接查);換 backend／編譯選項／submodule 即失效,一律現查。</p>
+<p>三塊 caller 記憶體:(1) 應用端 flow 區塊(各自 16-byte 對齊):4 條 lane、<code>DelayAec</code> 結構與 estimator pool(MATCHED)、mcab 自己的 pool(control block、mic lane、aligned far、fuse 緩衝、對齊環;<code>build_flags_hash</code> 只涵蓋這個 carve);(2) helper pool(control block、SRP 含 steering table、BF、<code>bf_spectrum</code>／<code>bf_weights</code>);(3) 應用的 post pool。mcab 與 helper 的 <code>req.bytes</code> <b>都不含</b> <code>AecRes</code>;RES、NR、合成與三個暫存各有自己的 <code>mem_size</code>。數字為 ne10 實測(<code>mcab_external_static</code>、<code>mcab_static</code> 的 <code>--print-mem-size</code>);換 backend／編譯選項／submodule 即失效,一律現查。</p>
 <table>
 <tr><th>state</th><th>shape / size</th><th>存放者</th><th>備註</th></tr>
-<tr><td>4× <code>Aec</code> lanes</td><td>1,306,368 B(@16k/512;@16k/256 797,632 B;@48k 2,912,064 B)</td><td>pool(核心)</td><td>lane 各自 PBFDKF/shadow/context;<code>enable_delay_est=0</code>(delay 共用)。取自 <code>4aec_nr_res_static --print-mem-size</code> 的 <code>AEC x4</code></td></tr>
-<tr><td>核心其餘(shared_delay、delay ring、working／fuse 緩衝、control block)</td><td>108,928 B(@16k/256;@16k/512 116,096 B;@48k 262,880 B)</td><td>pool(核心)</td><td><code>4aec_nr_res_static --print-mem-size</code> 的 <code>Front end</code> 列</td></tr>
-<tr><td><code>SRP</code>(含 steering table)</td><td>758,608 B(@16k/256;@16k/512 1,503,568 B;@48k 2,993,488 B)</td><td>pool(單元)</td><td><code>num_angles</code>=72 預設;BF 借用 <code>srp-&gt;a_array</code></td></tr>
-<tr><td><code>BF</code>(RLS P／weights)</td><td>28,224 B(@16k/256;@16k/512 55,872 B;@48k 111,168 B)</td><td>pool(單元)</td><td>內部排列 <code>P[M][M][F]</code>;備援 VAD 的純量 state 在單元 struct;單元另有 <code>bf_spectrum</code>／<code>bf_weights</code> 暫存(n_freqs＋4·n_freqs 個 Complex)。lambda 0.995 依 hop×adapt_interval retime;mu 0.1</td></tr>
-<tr><td><code>AecRes</code>(×1)</td><td>7,904 B(@16k/256;@16k/512 14,048 B;@48k 29,408 B)</td><td>pool(<b>應用</b>的 post pool)</td><td>post-beam RES(libaec <code>aec_res.h</code>;<code>aec_res_get_mem_size()</code>;單元與核心都不含)</td></tr>
-<tr><td><code>AnrDenoiser</code>(×1)</td><td>45,344 B(@16k/256;@16k/512 56,432 B;@48k 144,576 B)</td><td>pool(應用)</td><td>mono NR;函式庫 preset <code>anr_config_for_mode_grid()</code>,大小由 <code>anr_get_mem_size()</code> 取得</td></tr>
-<tr><td><code>AcIstft</code>(含 <code>FftHandle</code>)</td><td>11,344 B(@16k/256;@16k/512 21,840 B;@48k 42,832 B)</td><td>pool(應用)</td><td>最終合成(<code>ac_istft_push()</code>)</td></tr>
-<tr><td><code>rng</code>、<code>total_gain / extra_noise / spec</code></td><td>uint32;各 [n_freqs](<code>spec</code> 為 Complex)</td><td>應用</td><td>CNG seed <code>SE_CNG_RNG_SEED</code>=0x9e3779b9</td></tr>
-<tr><td>單元 <code>req.bytes</code></td><td>1,698,864 B @16k/256(預設)/ 2,992,496 B @16k/512 / 6,300,432 B @48k/1024</td><td>—</td><td>實測 <code>audio_pipeline_4ch_get_mem_requirements()</code>(ne10,layout_version=21);不含 RES／NR／合成</td></tr>
-<tr><td>單元＋RES／NR／合成／暫存</td><td>1,765,552 B @16k/256(預設)/ 3,088,960 B @16k/512 / 6,525,488 B @48k/1024</td><td>—</td><td><code>audio_pipeline_4ch_static --print-mem-size</code> 的 <code>Unit</code> + <code>RES</code> + <code>NR</code> + <code>Synthesis</code> + <code>Buffers</code> = <code>Total:</code> 行(後四項 66,688 B @16k/256／225,056 B @48k)</td></tr>
+<tr><td>Unit(flow 物件 + SRP/BF helper)合計</td><td>1,698,784 B @16k/256(預設)/ 2,992,416 B @16k/512 / 6,300,352 B @48k/1024</td><td>—</td><td>實測 <code>mcab_sample_unit_memory()</code>(ne10,layout_version=25);不含 RES／NR／合成</td></tr>
+<tr><td>Unit＋RES／NR／合成／暫存</td><td>1,765,472 B @16k/256(預設)/ 3,088,880 B @16k/512 / 6,525,408 B @48k/1024</td><td>—</td><td><code>mcab_static --print-mem-size</code> 的 <code>Unit</code> + <code>RES</code> + <code>NR</code> + <code>Synthesis</code> + <code>Buffers</code> = <code>Total:</code> 行(後四項 66,688 B @16k/256／96,464 B @16k/512／225,056 B @48k)</td></tr>
 </table>
+<p>各 state 的細項(4 條 lane、estimator＋mcab pool、helper pool、<code>AecRes</code>、<code>AnrDenoiser</code>、<code>AcIstft</code>、暫存)的大小與存放者見 <a href="pipeline_4ch_detail.html">pipeline_4ch_detail</a> 的 State 表(細項)。</p>
 
 <h2>延遲與 warm-up</h2>
 <ul>
 <li>演算法延遲:<b>1 hop</b>(WOLA;實測 argmax 127 samples @hop=128 → 8 ms @16k 預設)。</li>
-<li>delay acquisition:估計值要 <code>solid</code> 且 <code>n_updates≥3</code> 才被接受;<b>開始新的可用 alignment generation 的那個 hop</b> 回報 <code>delay.changed=1</code>——首次 acquisition、unlock 後<b>同值重鎖</b>、鎖定中值改變皆屬之(見 <code>4aec_nr_res.h</code> 的 <code>FourAecNrResDelayState</code> 契約),核心對四條 lane 做 <code>aec_apply_external_realign()</code>(濾波器依 delay 差位移,不重置、不清合成 OLA);外部 beamformer 若自帶 STFT/OLA 狀態,應照 <code>changed</code> 清除。ring 未累積到 delay 樣本前 <code>aligned_ref</code> 為 raw ref。</li>
+<li>delay acquisition:估計值要 <code>solid</code> 且 <code>n_updates≥3</code> 才被接受;<b>開始新的可用 alignment generation 的那個 hop</b> 回報 <code>delay.changed=1</code>——MATCHED 的首次 acquisition(init 或 reset 之後)與鎖定中值改變(移動 &gt; 32 樣本且 16 樣本內再次被提出)才會;FIXED／EXTERNAL_ALIGNED 不設(見 <code>mcab.h</code> 的 <code>McabDelayState</code> 契約),mcab 對四條 lane 做 <code>aec_apply_external_realign()</code>(濾波器依 delay 差位移,不重置、不清合成 OLA);外部 beamformer 若自帶 STFT/OLA 狀態,應照 <code>changed</code> 清除。ring 未累積到 delay 樣本前 <code>aligned_ref</code> 為 raw ref。</li>
 <li>SRP/BF warm-up:DOA 平滑值為 NaN(尚無可用 DOA)時 BF 旁路取 mic 0 且不適應;DOA smoother 需 <code>doa_switch_consecutive=3</code> 次一致觀測才切換;BF RLS 由 vad_out 凍結(vad_out=1 → 凍結適應)。</li>
 <li>NR 噪聲底的最小值追蹤視窗是函式庫預設的 wall-clock 約 512 ms。</li>
 </ul>
@@ -215,17 +212,17 @@ fuse+RES+後級 (C)  out=半窗 ramp≈0   out=hop#0 重建    out = hop p-1 的
 <h2>相關檔案與測試路徑</h2>
 <table>
 <tr><th>路徑(repo-relative)</th><th>內容</th></tr>
-<tr><td><code>pipelines/4ch_aec_bf_nr_res/4aec_nr_res.h / .c</code></td><td>核心(<code>four_aec_front_process</code> / <code>four_aec_fuse</code>;layout v24)</td></tr>
-<tr><td><code>pipelines/4ch_aec_bf_nr_res/audio_pipeline_4ch.h / .c</code></td><td>線性 AEC + BF 單元(SRP/BF/auto-VAD、<code>process_front</code>／<code>process_beam</code>／<code>fuse</code>;無 RES／NR／合成;layout v21)</td></tr>
-<tr><td><code>pipelines/common/se_stage.h</code>、<code>pipelines/samples/se_anr_stage.h</code>、<code>4aec_projection_kernels.h</code></td><td><code>SeSpecFrame</code>、<code>se_res_stage_gain()</code>、<code>se_anr_stage_gain()</code>;投影 kernels</td></tr>
-<tr><td><code>../../../audiolib/{doa,bf,common/utility}</code></td><td>SRP-PHAT / BF / spatial SIMD</td></tr>
-<tr><td><code>pipelines/4ch_aec_bf_nr_res/audio_pipeline_4ch_raw.c</code> / <code>audio_pipeline_4ch_static.c</code>；<code>4aec_nr_res_static.c</code>；<code>mcab_sample_driver.c</code></td><td>應用 CLI 與靜態記憶體範例(各自初始化 NR／合成並明寫逐 hop 串接;<code>4aec_nr_res_static.c</code> 是「核心＋外部固定權重＋自備 <code>AecRes</code>」的最小範例;raw／static 是單元＋自備 <code>AecRes</code>＋NR＋合成;<code>mcab_sample_driver</code> 是四個 4ch 範例共用的 CLI 與 hop 迴圈骨架)</td></tr>
-<tr><td><code>pipelines/4ch_aec_bf_nr_res/tests/test_4aec_nr_res.c</code>、<code>tests/conv_chain_4ch.h</code></td><td>核心的 sequence 規則、heap-vs-static byte parity、far-FFT sharing、descriptor 閘、known-delay profile(acquisition／coverage／mislock／cost, n=1..5)、per-filter RAM／CPU 實測;<code>conv_chain_4ch.h</code> 把後級串接寫成參考鏈(以明確參數建立 <code>AecRes</code>,不引用單元內部)</td></tr>
-<tr><td><code>pipelines/4ch_aec_bf_nr_res/tests/test_audio_pipeline_4ch.c</code> / <code>../../../audiolib/tests/test_spatial_third_party.c</code></td><td>單元(split 呼叫與 sequence 守衛、<code>enable_post=0</code>、descriptor 閘、單元＋fuse＋範例逐 hop 串接與參考鏈比對)與空間庫驗收</td></tr>
-<tr><td><code>pipelines/4ch_aec_bf_nr_res/pipeline.py</code>、<code>pipelines/se_stage.py</code> + <code>tests/test_pipeline.py</code></td><td>Python reference(<code>front_process</code> → <code>fuse</code>(<code>res_gain</code> 為 None)→ 呼叫端的 <code>PostBeamResidualSuppressor</code> → stage functions;copy 語意,允許多個 frame 在飛)</td></tr>
-<tr><td><code>pipelines/4ch_aec_bf_nr_res/Makefile</code></td><td>建置 <code>libaudio_pipeline_4ch.a</code>(核心、單元與 <code>se_config.o</code>;範例碼不進 archive)、<code>test</code>、<code>audit-no-stdio</code>;<code>4ch_alignulcnet/</code>、<code>4ch_aec_bf_dfn_res/</code> 轉發建置到這裡</td></tr>
+<tr><td><code>pipelines/4ch_aec_bf_nr_res/mcab.h / .c</code>、<code>mcab_internal.h</code></td><td>flow 層(<code>mcab_process_front</code> / <code>mcab_fuse</code>;layout v25);<code>mcab_internal.h</code> 為私有(admission 狀態機、診斷 hook、投影 kernel)</td></tr>
+<tr><td><code>pipelines/4ch_aec_bf_nr_res/mcab_sample_beam.h / .c</code>、<code>mcab_sample_flow.h / .c</code></td><td>sample helper(SRP/BF/auto-VAD、<code>process_front</code>／<code>process_beam</code>／<code>fuse</code>;無 RES／NR／合成;不在 archive)與應用端 init builder</td></tr>
+<tr><td><code>pipelines/4ch_aec_bf_nr_res/mcab_sample_post.h</code></td><td>範例碼(header-only):<code>mcab_sample_res_input()</code>、<code>mcab_sample_anr_gain()</code>、<code>MCAB_SAMPLE_CNG_*</code>;<code>McabFrame</code> 本身定義在 <code>mcab.h</code></td></tr>
+<tr><td><code>../audiolib/{doa,bf,common/utility}</code></td><td>SRP-PHAT / BF / spatial SIMD</td></tr>
+<tr><td><code>pipelines/4ch_aec_bf_nr_res/mcab_raw.c</code> / <code>mcab_static.c</code>；<code>mcab_external_static.c</code>；<code>mcab_sample_driver.c</code></td><td>應用 CLI 與靜態記憶體範例(各自初始化 NR／合成並明寫逐 hop 串接;<code>mcab_external_static.c</code> 是「mcab＋外部固定權重＋自備 <code>AecRes</code>」的最小範例;raw／static 是 flow＋helper＋RES＋NR＋合成;<code>mcab_sample_driver</code> 是四個 4ch 範例共用的 CLI 與 hop 迴圈骨架)</td></tr>
+<tr><td><code>pipelines/4ch_aec_bf_nr_res/tests/test_mcab.c</code>、<code>tests/conv_chain_mcab.h</code>、<code>tests/mcab_test_rig.h</code></td><td>mcab 的 sequence 規則、heap-vs-static byte parity、far-FFT sharing、descriptor 閘、known-delay profile(n=1..5);<code>conv_chain_mcab.h</code> 是後級參考鏈</td></tr>
+<tr><td><code>pipelines/4ch_aec_bf_nr_res/tests/test_mcab_sample_beam.c</code>、<code>test_mcab_sample_post.c</code> / <code>../audiolib/tests/test_spatial_third_party.c</code></td><td>helper(split 呼叫與 sequence 守衛、<code>enable_post=0</code>、pool 契約、與參考鏈逐 hop 比對)與空間庫驗收</td></tr>
+<tr><td><code>pipelines/4ch_aec_bf_nr_res/pipeline.py</code> + <code>tests/test_pipeline.py</code></td><td>Python reference(<code>McabPipeline.process_front</code> → <code>fuse</code>(<code>res_gain</code> 為 None)→ 呼叫端的 <code>PostBeamResidualSuppressor</code> → stage functions;copy 語意,允許多個 frame 在飛;不含 SRP-PHAT／BF)</td></tr>
+<tr><td><code>pipelines/4ch_aec_bf_nr_res/Makefile</code></td><td>建置 <code>libaudio_pipeline_mcab.a</code>(只含 <code>mcab.o</code>)、<code>mcab_sample_flow.o</code>、<code>mcab_sample_beam.o</code>、<code>test</code>、<code>audit-no-stdio</code>;<code>pipelines/ulcnet/4ch_alignulcnet/</code>、<code>pipelines/dfn/4ch_aec_bf_dfn_res/</code> 轉發建置到這裡</td></tr>
 <tr><td>其他頁</td><td><a href="pipeline_4ch_params.html">pipeline_4ch_params</a>、<a href="pipeline_4ch_detail.html">pipeline_4ch_detail</a>、<a href="integration_sequence.html">integration_sequence</a>、<a href="integration_example.html">integration_example</a>、<a href="index.html">index</a></td></tr>
 </table>
-<p>測試實測(BACKEND=ne10,SIMD=1,WERROR=1):本目錄 <code>make test</code>(空間庫、核心／單元／DFN／ULCNet 單元測試、static smoke、NN 範例骨架)輸出含 <code>PASS</code> 的行共 <b>600</b> 行 / 0 FAIL;<code>4ch_alignulcnet/</code> 的 <code>make test</code> 見 <a href="pipeline_ulcnet_4ch.html">pipeline_ulcnet_4ch</a>。</p>
+<p>測試:本目錄 <code>make test</code>(BACKEND=ne10,SIMD=1)輸出含 <code>PASS</code> 的行共 719 行 / 0 FAIL(<code>test_mcab_sample_post</code> 由 <code>pipelines/Makefile</code> 的 <code>make test</code> 執行);<code>pipelines/ulcnet/4ch_alignulcnet/</code> 見 <a href="pipeline_ulcnet_4ch.html">pipeline_ulcnet_4ch</a>。</p>
 </body>
 </html>

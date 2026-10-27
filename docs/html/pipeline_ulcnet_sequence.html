@@ -36,10 +36,10 @@ th{background:#eef2f8}
 <h1>Align-ULCNet pipeline 流程時序圖(mono / 4ch)</h1>
 <h2>概要</h2>
 <p>本頁是 <a href="pipeline_ulcnet_usage.html">pipeline_ulcnet_usage</a> 的時序圖:初始化、穩態 hop(mono 與 4ch,含 adapter 與 NPU)、拆開的 front／beam 形式、失敗與 reset。箭頭標的是實際函式名,順序就是呼叫順序;「|」是生命線,箭頭太短放不下的標籤寫在箭頭上一行。端到端延遲是 1 個編譯期格點 hop(16 kHz 為 256 samples = 16 ms,48 kHz 為 512 samples = 10.67 ms),來源是 synthesis 的半窗 trim;hop #0 輸出全零,hop p 輸出對應輸入 hop p-1(各頁的 hop 泳道圖見 <a href="pipeline_ulcnet_mono.html">mono</a>、<a href="pipeline_ulcnet_4ch.html">4ch</a>)。</p>
-<h2>1. 初始化(mono;4ch 把 <code>Aec</code> 換成 <code>AudioPipeline4Ch</code>,stage 用 <code>ulcnet_nn_stage_mem_size(0)</code>)</h2>
+<h2>1. 初始化(mono;4ch 把 <code>Aec</code> 換成 <code>mcab_sample_flow_init()</code> 加 <code>mcab_sample_beam_init()</code>,stage 用 <code>ulcnet_nn_stage_mem_size(0)</code>)</h2>
 <pre>App(main.c)                 Aec                   UlcnetNnStage                 Adapter                   NPU run()
   |                          |                          |                          |                          |
-  | se_derive(&amp;req, &amp;rules{fixed_rate, fixed_fft, LINEAR_ONLY}, &amp;grid, &amp;aec_cfg)   -&gt; 0 | -1                  |
+  | aec_config_from_preset(&amp;aec_cfg, BALANCED, ULCNET_SR) + fft_size / delay_* / enable_res = 0 / return_res_context = 1 / LINEAR_ONLY(derive_lane())|
   | ulcnet_model_io_descriptor_default(D, &amp;desc)        D 必須等於匯出時的 delay depth                        |
   |-- ulcnet_accelerator_adapter_get_mem_size(&amp;desc, &amp;bytes, &amp;align) -------------&gt;|                          |
   |-- ulcnet_accelerator_adapter_init(pool, bytes, &amp;desc, run, user) -------------&gt;|                          |
@@ -95,35 +95,37 @@ th{background:#eef2f8}
   | 0 | ULCNET_NN_STAGE_DSP_ERROR(-3,非整 hop)| SEQUENCE_ERROR(-2)| INVALID_ARGUMENT(-1)                      |
   |&lt;----------------------------------------------------|                          |                          |</pre>
 <h2>3. 穩態 hop:4ch(直送路徑)</h2>
-<pre>App(main.c)          AudioPipeline4Ch             UlcnetNnStage          Adapter(model.infer)             NPU run()
+<pre>App(main.c)          McabSampleBeam            Mcab(flow)              UlcnetNnStage          Adapter → NPU
   |                          |                          |                          |                          |
 -- 每個 hop(mics = [ULCNET_HOP][4] interleaved,far / out 各 ULCNET_HOP 個 float) -----------------------------------------
-  | audio_pipeline_4ch_process_with_activity(unit, mics, far, vad, vad, NULL, &amp;beam, &amp;info)                   |
+  | mcab_sample_beam_process_with_activity(unit, mics, far, vad, vad, NULL, &amp;beam, &amp;info)                       |
   |-------------------------&gt;|                          |                          |                          |
-  |                          | 共用 delay aligner -&gt; 4 條線性 AEC lane -&gt; SRP-PHAT -&gt; BF;不 fuse(enable_post = 0);此鏈沒有 RES
-  | FOUR_AEC_NR_RES_OK;beam.spectrum(BF 後頻譜)、info.delay.{changed, solid}       |                          |
+  |                          | mcab_process_front(flow, mics, far, &amp;front):共用 delay aligner -&gt; 4 條線性 AEC lane |
+  |                          |-------------------------&gt;|                          |                          |
+  |                          | doa_step -&gt; bf_process_with_weights;不 fuse(enable_post = 0);此鏈沒有 RES        |
+  | MCAB_OK;beam.spectrum(BF 後頻譜)、info.delay.{changed, solid}                   |                          |
   |&lt;-------------------------|                          |                          |                          |
   | ulcnet_nn_stage_begin_complex(stage, beam.spectrum, far, {changed, solid})     |                          |
-  |----------------------------------------------------&gt;|                          |                          |
+  |-------------------------------------------------------------------------------&gt;|                          |
   |                          |                          | beam.spectrum 直接拆成 err_re / err_im(不重建、不再分析);只有 far 做 ac_stft_push_planar
   |                          |                          | delay.changed 或 首次 solid:model.reset + reprime_frames = 1;其餘同 mono
   | ulcnet_nn_stage_process(stage, out)   |   nn_begin / nn_end / end              |                          |
-  |----------------------------------------------------&gt;|                          |                          |
+  |-------------------------------------------------------------------------------&gt;|                          |
   |                          |                          | model.infer(...) -&gt; run(...) -&gt; NPU(與 mono 完全相同)
-  |                          |                          |-------------------------&gt;|                          |
-  |&lt;- 0;out = 一個 hop(hop #0 全零) --------------------|                          |                          |
+  |                          |                          |------------------------------------------------&gt;|
+  |&lt;- 0;out = 一個 hop(hop #0 全零) ---------------------------------------------------|                          |
 -- 拆開形式(需要用 lane 頻譜算 mask / VAD 時) ----------------------------------------------------------------------------
-  | audio_pipeline_4ch_process_front(unit, mics, far, &amp;front)       front.linear_spectra[4] 唯讀              |
+  | mcab_sample_beam_process_front(unit, mics, far, &amp;front)       front.linear_spectra[4] 唯讀              |
   |-------------------------&gt;|                          |                          |                          |
   | 由 front.linear_spectra[0] 算 mask(n_freqs 個 int)與 vad_raw / vad_out         |                          |
-  | audio_pipeline_4ch_process_beam(unit, &amp;front, vad_raw, vad_out, mask, &amp;beam, &amp;info)                       |
+  | mcab_sample_beam_process_beam(unit, &amp;front, vad_raw, vad_out, mask, &amp;beam, &amp;info)                       |
   |-------------------------&gt;|                          |                          |                          |
-  |                          | 沒有待處理的 front 時回 SEQUENCE_ERROR;之後 begin_complex 與上面相同           |</pre>
+  |                          | 沒有待處理的 front 時回 MCAB_SEQUENCE_ERROR;之後 begin_complex 與上面相同           |</pre>
 <h2>4. 失敗與 reset</h2>
-<pre>App(main.c)             Aec | 單元                UlcnetNnStage                 Adapter                      NPU
+<pre>App(main.c)             Aec | helper+flow          UlcnetNnStage                 Adapter                      NPU
   |                          |                          |                          |                          |
 -- 任何一步回負值(process_hop 回 -1) -------------------------------------------------------------------------------------
-  | aec_reset(aec)  |  audio_pipeline_4ch_reset(unit)   |                          |                          |
+  | aec_reset(aec)  |  mcab_sample_beam_reset(unit)(連帶 flow、lane、estimator、SRP/BF)   |                          |
   |-------------------------&gt;|                          |                          |                          |
   |-- ulcnet_nn_stage_reset(stage) --------------------&gt;|                          |                          |
   |                          |                          | ac_stft_reset(far[, err]);ac_istft_reset;last_delay、frame_index、phase、reprime_frames 清零;安裝的模型保留
@@ -138,7 +140,7 @@ th{background:#eef2f8}
 
 <h2>相關檔案</h2>
 <ul>
-<li><code>pipelines/samples/ulcnet_nn_stage.h / .c</code>、<code>AIAEC/Align_ULCNet/ulcnet_accelerator_adapter.c</code>(<code>infer()</code>、<code>reset()</code>)、<code>pipelines/4ch_aec_bf_nr_res/audio_pipeline_4ch.c</code></li>
+<li><code>pipelines/ulcnet/ulcnet_nn_stage.h / .c</code>、<code>AIAEC/Align_ULCNet/ulcnet_accelerator_adapter.c</code>(<code>infer()</code>、<code>reset()</code>)、<code>pipelines/4ch_aec_bf_nr_res/mcab.c</code>、<code>mcab_sample_beam.c</code>、<code>mcab_sample_flow.c</code></li>
 <li>各頁:<a href="pipeline_ulcnet_usage.html">pipeline_ulcnet_usage</a>、<a href="pipeline_ulcnet_params.html">pipeline_ulcnet_params</a>、<a href="pipeline_ulcnet_mono.html">pipeline_ulcnet_mono</a>、<a href="pipeline_ulcnet_4ch.html">pipeline_ulcnet_4ch</a>、<a href="pipeline_ulcnet_detail.html">pipeline_ulcnet_detail</a>、<a href="index.html">index</a></li>
 </ul>
 

@@ -9,10 +9,10 @@ contracts.
 
 | Area | Purpose | Current entry point |
 |---|---|---|
-| `pipelines/` | Production-oriented linear AEC + echo-aware NR/RES | [`pipelines/README.md`](pipelines/README.md) |
+| `pipelines/` | Production-oriented linear AEC + echo-aware NR/RES (mono), plus the DeepFilterNet2 (`dfn/`) and Align-ULCNet (`ulcnet/`) application examples | [`pipelines/README.md`](pipelines/README.md) |
 | `AINR/` | Standalone speech enhancement | [`AINR/README.md`](AINR/README.md) |
 | `AIAEC/` | Four neural AEC candidate architectures | [`AIAEC/README.md`](AIAEC/README.md) |
-| `pipelines/4ch_aec_bf_nr_res/` | C API for the four-lane linear-AEC front end (`FourAecNrRes`, external beamformer seam) and the one wrapped unit `AudioPipeline4Ch` (shared aligner, four AEC lanes, SRP-PHAT, BF and the fuse projection; no RES), plus the Python reference | [`pipelines/4ch_aec_bf_nr_res/README.md`](pipelines/4ch_aec_bf_nr_res/README.md) |
+| `pipelines/4ch_aec_bf_nr_res/` | `mcab`, the four-microphone linear-AEC flow layer (`mcab.h`): the application creates four libaec `Aec` lanes and, in MATCHED delay mode, one shared `DelayAec`, and passes them in `McabLibs`; `mcab` keeps only flow state (delay admission, alignment ring, fuse buffers) and its per-hop output is `mcab_process_front()` then `mcab_fuse()` with the caller's beamformer weights. It holds no beamformer and no RES. Beside it: sample helpers outside the archive (`mcab_sample_flow`, `mcab_sample_beam` for SRP-PHAT/BF, `mcab_sample_driver`), the programs `mcab_raw`, `mcab_static` and `mcab_external_static`, and the Python twin `McabPipeline` | [`pipelines/4ch_aec_bf_nr_res/README.md`](pipelines/4ch_aec_bf_nr_res/README.md) |
 | `lib/aec/`, `lib/nr/` | Conventional algorithm libraries (AEC, NR) | Git submodules (`.gitmodules`) |
 | `../audiolib/common/` | Shared FFT / fast-math / SIMD kernel layer used by AEC, NR and the pipelines | Sibling checkout, expected revision in [`pipelines/audiolib.pin`](pipelines/audiolib.pin) (`make -C pipelines check-pins`) |
 
@@ -32,7 +32,10 @@ pipeline.
 | `DeepFilterNet3` | 48 kHz / 1024 / 1024 / 512 | raw low-band DF + high-band ERB mask → concatenate |
 
 Each model carries its own feature contract and `MODEL_VERSION`; checkpoints
-are not interchangeable between them.
+are not interchangeable between them. `DeepFilterNet2` and `DeepFilterNet3`
+additionally have a mask/deep-filter lookahead pair (15 legal pairs, shipped
+1/1) that is part of the checkpoint contract and is chosen at build time for the C hosts; see
+[`AINR/README.md`](AINR/README.md).
 
 ### Neural AEC candidates
 
@@ -45,8 +48,8 @@ Every AIAEC candidate is a joint AEC+RES+NR route; there is no AEC-only
 candidate (see `AIAEC/README.md`).
 
 These candidates use clip-level PyTorch APIs. The 4-channel conventional AEC
-shell is a separate integration boundary and does not replicate any neural
-model per microphone.
+flow (`mcab`) is a separate integration boundary and does not replicate any
+neural model per microphone.
 
 ## Signal-grid boundary
 
@@ -55,11 +58,11 @@ model per microphone.
 | Conventional mono pipeline, 8 kHz | frame/FFT 256, hop 128 |
 | Conventional mono pipeline, 16 kHz | frame/FFT 256, hop 128 (default); frame/FFT 512, hop 256 (also supported) |
 | Conventional mono pipeline, 48 kHz | frame/FFT 1024, hop 512 |
-| Four-channel AEC shell, 16 / 48 kHz | 16k: 256/128 or 512/256; 48k: 1024/512, no padding |
+| Four-channel `mcab` flow, 16 / 48 kHz | 16k: 256/128 or 512/256; 48k: 1024/512, no padding |
 | AIAEC, 16 kHz | frame/window/FFT 512, hop 256 |
 | AIAEC, 48 kHz | frame/window/FFT 1024, hop 512 |
 
-The conventional mono path, the 4-channel shell, and AIAEC all use explicit,
+The conventional mono path, the 4-channel flow, and AIAEC all use explicit,
 zero-padding-free 50%-overlap grids (frame == FFT, hop == FFT/2) — they
 remain separate integration surfaces, but none of them derives a 20 ms
 frame/10 ms hop.
@@ -81,12 +84,13 @@ git clone https://github.com/aaronhsueh0506/audio_common.git ../audiolib
 git -C ../audiolib checkout "$(sed -n 's/^AUDIOLIB_COMMIT=//p' pipelines/audiolib.pin)"
 make -C pipelines check-pins
 
-# Build the conventional mono example programs and the DFN2 stage archive.
+# Build the conventional mono example programs, the mono DFN2 and Align-ULCNet
+# examples and the DFN2 stage archive.
 make -C pipelines
 
-# Build the independent four-channel pipeline and its reusable dependencies.
+# Build the four-channel flow archive (libaudio_pipeline_mcab.a), the programs
+# mcab_raw, mcab_static and mcab_external_static, and the 4-channel DFN2 example.
 make -C pipelines/4ch_aec_bf_nr_res
-make -C pipelines/4ch_aec_bf_nr_res 4aec_nr_res_static
 
 # The same switch is forwarded through every conventional/AI pre-post layer.
 # SIMD=1 is the default; SIMD=0 forces scalar fallback for A/B tests.

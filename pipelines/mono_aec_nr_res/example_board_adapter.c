@@ -25,13 +25,12 @@
 #include <stdint.h>
 
 #include "aec.h"
+#include "aec_res.h"           /* aec_cng_fill */
 #include "anr.h"
 #include "audio_stft.h"
-#include "common/se_config.h"
-#include "common/se_stage.h"
-#include "samples/se_anr_stage.h"
 #include "utility/mem_align.h"
 #include "utility/simd_kernels.h"
+#include "utility/simd_kernel_nn.h"   /* skn_all_finite_f32 */
 
 /* board_mem: simulated platform common-memory manager (REFERENCE ONLY).
  * BOARD: replace this whole module with the platform's memory manager; it only needs
@@ -89,8 +88,17 @@ static void board_mem_free(void* p) {
 
 #define POOL_ALIGNMENT 16u
 
+/* Comfort noise follows the denoiser gain of its bin but never below this amplitude (-10 dB),
+ * so the residual echo it masks does not surface. */
+#define CNG_NR_GAIN_FLOOR 0.31622777f
+/* Start state of the comfort-noise generator (aec_cng_fill). */
+#define CNG_RNG_SEED 0x9e3779b9u
+/* The AEC's residual-echo powers are on the int16^2 scale, the denoiser's on the audio scale;
+ * the reciprocal is a power of two, so the multiply is exact. */
+#define PSD_SCALE_INV (1.0f / (32768.0f * 32768.0f))
+
 typedef struct MonoPlan {
-    SeGrid grid;
+    AecSignalGrid grid;
     AecConfig aec_cfg;
     AnrConfig nr_cfg;
     AcStftConfig synth_cfg;
@@ -111,16 +119,18 @@ typedef struct MonoStages {
  * the sum of the stage sizes in carve order (AEC, NR, synthesis, buffers). Returns 0, or -1
  * for a configuration a stage refuses. */
 static int mono_plan(MonoPlan* plan, int sample_rate) {
-    static const SeRules rules = { .allow_8k = 1, .spatial_context = SE_CONTEXT_PRESET };
-    SeRequest req;
     memset(plan, 0, sizeof(*plan));
-    memset(&req, 0, sizeof(req));
-    req.sample_rate = sample_rate;
-    req.delay_mode = AEC_DELAY_MATCHED;
-    req.delay_num_filters = DA_NUM_FILTERS;
-    req.fixed_delay_samples = -1;
-    req.aec_preset = AEC_PRESET_BALANCED;
-    if (se_derive(&req, &rules, &plan->grid, &plan->aec_cfg) != 0) return -1;
+    if (!aec_resolve_signal_grid(sample_rate, aec_default_fft_size(sample_rate), &plan->grid))
+        return -1;
+    /* The lane keeps its own gain in the context; mono_hop() applies it. */
+    aec_config_from_preset(&plan->aec_cfg, AEC_PRESET_BALANCED, sample_rate);
+    plan->aec_cfg.fft_size = plan->grid.fft_size;
+    plan->aec_cfg.delay_mode = AEC_DELAY_MATCHED;
+    plan->aec_cfg.delay_num_filters = DA_NUM_FILTERS;
+    plan->aec_cfg.fixed_delay_samples = -1;
+    plan->aec_cfg.enable_delay_est = 1;
+    plan->aec_cfg.enable_res = 0;
+    plan->aec_cfg.return_res_context = 1;
     plan->nr_cfg = anr_config_for_mode_grid(sample_rate, plan->grid.fft_size, ANR_MODE_BALANCED);
     ac_stft_config_default(&plan->synth_cfg, plan->grid.fft_size);
     plan->aec_bytes = aec_get_mem_size(&plan->aec_cfg);
@@ -158,23 +168,33 @@ static int mono_init(MonoStages* s, void* pool, size_t bytes, const MonoPlan* pl
     s->total_gain = (float*)cur;  cur += plan->vec_bytes;
     s->extra_noise = (float*)cur; cur += plan->vec_bytes;
     s->spec = (Complex*)cur;
-    s->rng = SE_CNG_RNG_SEED;
+    s->rng = CNG_RNG_SEED;
     return 0;
 }
 
-/** One hop: G_res is the AEC's own (frame.g_res_ctx), G_nr the denoiser's over the same frame;
- * P = E * min(G_nr, G_res) plus comfort noise on the bins the RES cut, then synthesis. */
+/** One hop: G_res is the AEC's own (ctx.res_gain), G_nr the denoiser's over the same error
+ * spectrum with the residual-echo powers folded into its noise floor while the linear estimate
+ * is usable; P = E * min(G_nr, G_res) plus comfort noise on the bins the RES cut, then
+ * synthesis. */
 static int mono_hop(MonoStages* s, const float* mic, const float* ref, float* out) {
-    SeSpecFrame f;
+    AecResContext c;
+    const float* extra = NULL;
     const float* nr;
     aec_process_context(s->aec, mic, ref);
-    if (se_frame_from_aec(s->aec, &f) != 0 || !f.g_res_ctx) return -1;
-    nr = se_anr_stage_gain(s->nr, &f, s->extra_noise, 1);
+    aec_get_res_context(s->aec, &c);
+    if (!c.error_spec || !c.res_gain) return -1;
+    if (c.r2 && c.usable_linear) {
+        sk_scale_f32(s->extra_noise, c.r2, PSD_SCALE_INV, c.n_freqs);
+        extra = s->extra_noise;
+    }
+    if (anr_process_gain(s->nr, c.error_spec, extra, NULL) != 0) return -1;
+    nr = anr_get_gain(s->nr, NULL);
     if (!nr) return -1;
-    sk_min_f32(s->total_gain, nr, f.g_res_ctx, f.n_freqs);   /* keeps a non-finite gain visible */
-    sk_capply_gain_f32(s->spec, f.e, s->total_gain, f.n_freqs);
-    if (f.cn)
-        aec_cng_fill(&s->rng, s->spec, f.cn, f.g_res_ctx, nr, SE_CNG_NR_GAIN_FLOOR, f.n_freqs);
+    sk_min_f32(s->total_gain, nr, c.res_gain, c.n_freqs);   /* NaN in the second operand reaches the finite gate; in the first it is replaced */
+    sk_capply_gain_f32(s->spec, c.error_spec, s->total_gain, c.n_freqs);
+    if (c.comfort_noise)
+        aec_cng_fill(&s->rng, s->spec, c.comfort_noise, c.res_gain, nr, CNG_NR_GAIN_FLOOR,
+                     c.n_freqs);
     (void)ac_istft_push(s->istft, s->spec, out);
     return 0;
 }
@@ -183,7 +203,7 @@ static void mono_reset(MonoStages* s) {
     aec_reset(s->aec);
     anr_reset(s->nr);
     ac_istft_reset(s->istft);
-    s->rng = SE_CNG_RNG_SEED;
+    s->rng = CNG_RNG_SEED;
 }
 
 /** Step 7: reverse carve order; a no-op per module on a pool-resident instance, but still
@@ -223,7 +243,7 @@ static int run_hops(MonoStages* s, int hop, int n_hops) {
             fprintf(stderr, "run_hops: the hop failed at hop %d\n", h);
             return 0;
         }
-        if (!se_hop_is_finite(out, hop)) {
+        if (!skn_all_finite_f32(out, (size_t)hop)) {
             fprintf(stderr, "run_hops: non-finite output at hop %d\n", h);
             return 0;
         }

@@ -36,22 +36,24 @@ are compiled once for the module):
 
 The accelerator stand-in is deterministic and input-dependent, so a class that
 dropped a state advance would diverge rather than agree.
+
+The driver is built for the shipped (mask, df) lookahead pair with no override
+and, in the last tests, for every other pair in ``dfn_pairs.c_build_pairs`` with
+-DDFN2_MASK_LOOKAHEAD / -DDFN2_DF_LOOKAHEAD: every warm-up length, readiness
+count and delay-line length in it follows the compiled constants. The pool
+identity (build_flags_hash) is checked to differ between pairs, and a pool of
+another pair is refused by _init_ex.
 """
 
-import os
-import shutil
+import re
 import subprocess
 
 import pytest
 
+import dfn_pairs
 
-_THIS_DIR = os.path.dirname(os.path.abspath(__file__))
-_DFN_DIR = os.path.join(os.path.dirname(_THIS_DIR), 'DeepFilterNet2')
-_AC_DIR = os.path.abspath(
-    os.path.join(_THIS_DIR, '..', '..', '..', 'audiolib', 'common'))
-_AC_INCLUDE = os.path.join(_AC_DIR, 'include')
-
-_SOURCES = ('dfn2_prepost.c', 'dfn2_process.c', 'dfn2_model_io.c')
+FAMILY = 'DeepFilterNet2'
+_SOURCES = ('prepost', 'process', 'model_io')
 
 _DRIVER = r'''
 #include <math.h>
@@ -59,7 +61,7 @@ _DRIVER = r'''
 #include <stdlib.h>
 #include <string.h>
 
-#include "dfn2_prepost.h"
+#include "DeepFilterNet2/dfn2_prepost.h"
 #include "utility/mem_align.h"
 
 #define CHECK(x) do { if (!(x)) { \
@@ -70,6 +72,11 @@ _DRIVER = r'''
 #define HOPS        400
 #define SHORT_HOPS  40
 #define LOOKAHEAD   (DFN2_MASK_LOOKAHEAD + DFN2_DF_LOOKAHEAD)
+
+/* What pre_process returns on stream hop t of a cold instance: the accelerator
+ * has nothing to run until the window of heads[0] is complete, which takes
+ * DFN2_MASK_LOOKAHEAD + 1 hops. */
+#define PRE_RET(t)  ((t) >= DFN2_MASK_LOOKAHEAD ? 1 : 0)
 
 /* skip: frames driven purely on frame_skip, then five more for the freeze. */
 #define SKIP_FRAMES 24
@@ -338,8 +345,9 @@ static int written_log[HOPS];
 static long long frame_log[HOPS];
 
 /* ---- the canonical per-hop loop from dfn2_prepost.h -------------------
- * `n` is 0 on the very first hop of a cold instance and 1 on every hop after
- * -- never 2 -- so that is asserted per hop rather than merely looped over. */
+ * `n` is 0 on the first DFN2_MASK_LOOKAHEAD hops of a cold instance and 1 on
+ * every hop after -- never 2 -- so that is asserted per hop rather than merely
+ * looped over. */
 static int drive_time_ex(DFN2Prepost *p, const float *in, float *out,
                          int hops, int cold, int *written_out,
                          long long *frame_out) {
@@ -350,7 +358,7 @@ static int drive_time_ex(DFN2Prepost *p, const float *in, float *out,
         int n, written = -1;
         long long frame = -1;
         n = dfn2_prepost_pre_process(p, in + (size_t)hop * DFN2_HOP_LEN);
-        if (n != ((cold && hop == 0) ? 0 : 1)) return -1;
+        if (n != (cold ? PRE_RET(hop) : 1)) return -1;
         if (n == 1) {
             if (dfn2_prepost_frame_inputs(p, &inputs, &outputs) != 0)
                 return -1;
@@ -370,6 +378,28 @@ static int drive_time_ex(DFN2Prepost *p, const float *in, float *out,
 
 static int drive_time(DFN2Prepost *p, const float *in, float *out, int hops) {
     return drive_time_ex(p, in, out, hops, 1, NULL, NULL);
+}
+
+/* Drive a cold DFN2_IO_TIME instance through its warm-up hops (they ask for no
+ * inference) and the first hop that opens a frame. Returns the index of the
+ * next hop, or -1 if the instance disagreed. */
+static int open_first_frame_time(DFN2Prepost *p) {
+    int t;
+    for (t = 0; t < DFN2_MASK_LOOKAHEAD; ++t)
+        if (dfn2_prepost_pre_process(p, pcm_in + (size_t)t * DFN2_HOP_LEN) != 0)
+            return -1;
+    if (dfn2_prepost_pre_process(p, pcm_in + (size_t)t * DFN2_HOP_LEN) != 1)
+        return -1;
+    return t + 1;
+}
+
+/* The DFN2_IO_FREQ twin, feeding the same spectrum on every hop. */
+static int open_first_frame_freq(DFN2Prepost *p, const float *re,
+                                 const float *im) {
+    int t;
+    for (t = 0; t < DFN2_MASK_LOOKAHEAD; ++t)
+        if (dfn2_prepost_pre_process_freq(p, re, im) != 0) return -1;
+    return dfn2_prepost_pre_process_freq(p, re, im) == 1 ? t + 1 : -1;
 }
 
 /* ---- equiv: the class vs the hand-composed path ---------------------- */
@@ -521,7 +551,7 @@ static int case_freq(FftHandle *fft) {
         dfn2_analysis(&caller_st, pcm_in + (size_t)hop * DFN2_HOP_LEN,
                       spec_re, spec_im);
         n = dfn2_prepost_pre_process_freq(p_freq, spec_re, spec_im);
-        CHECK(n == (hop == 0 ? 0 : 1));
+        CHECK(n == PRE_RET(hop));
         if (n == 1) {
             CHECK(dfn2_prepost_frame_inputs(p_freq, &inputs, &outputs) == 0);
             fake_run(&inputs, &outputs);
@@ -696,7 +726,7 @@ static int case_dual_identity(void) {
         na = dfn2_prepost_pre_process_freq(pa, in_re[t], in_im[t]);
         nb = dfn2_prepost_pre_process_freq_dual(pb, in_re[t], in_im[t],
                                                 in_re[t], in_im[t]);
-        CHECK(na == (t == 0 ? 0 : 1) && nb == na);
+        CHECK(na == PRE_RET(t) && nb == na);
         CHECK(dual_step(pa, na, got_a_re, got_a_im, &va) == 0);
         CHECK(dual_step(pb, nb, got_b_re, got_b_im, &vb) == 0);
         CHECK(va == vb);
@@ -760,7 +790,7 @@ static int case_dual_split(void) {
         ns = dfn2_prepost_pre_process_freq(ps, est_re[t], est_im[t]);
         nd = dfn2_prepost_pre_process_freq_dual(pd, est_re[t], est_im[t],
                                                 app_re, app_im);
-        CHECK(ns == nd && ns == (t == 0 ? 0 : 1));
+        CHECK(ns == nd && ns == PRE_RET(t));
         CHECK(dual_step(ps, ns, got_s_re, got_s_im, &vs) == 0);
         CHECK(dual_step(pd, nd, got_d_re, got_d_im, &vd) == 0);
         CHECK(vs == vd);
@@ -809,17 +839,21 @@ static int case_dual_guards(FftHandle *fft) {
 
     /* Wrong mode: refused and no frame opened. */
     CHECK(dfn2_prepost_pre_process_freq_dual(pt, re, im, re, im) == -1);
-    CHECK(dfn2_prepost_pre_process(pt, pcm_in) == 0);
+    CHECK(dfn2_prepost_pre_process(pt, pcm_in) == PRE_RET(0));
     /* NULL arguments. */
     CHECK(dfn2_prepost_pre_process_freq_dual(NULL, re, im, re, im) == -1);
     CHECK(dfn2_prepost_pre_process_freq_dual(pf, NULL, im, re, im) == -1);
     CHECK(dfn2_prepost_pre_process_freq_dual(pf, re, NULL, re, im) == -1);
     CHECK(dfn2_prepost_pre_process_freq_dual(pf, re, im, NULL, im) == -1);
     CHECK(dfn2_prepost_pre_process_freq_dual(pf, re, im, re, NULL) == -1);
-    /* Hop 0: no heads. */
-    CHECK(dfn2_prepost_pre_process_freq_dual(pf, re, im, re, im) == 0);
-    /* Hop 1: a frame open refuses a second pre-stage of either kind; taken
-     * as the identity the hop closes normally. */
+    /* The warm-up hops: no heads. */
+    {
+        int w;
+        for (w = 0; w < DFN2_MASK_LOOKAHEAD; ++w)
+            CHECK(dfn2_prepost_pre_process_freq_dual(pf, re, im, re, im) == 0);
+    }
+    /* The first hop with heads: a frame open refuses a second pre-stage of
+     * either kind; taken as the identity the hop closes normally. */
     frame_spectrum(1, re, im);
     CHECK(dfn2_prepost_pre_process_freq_dual(pf, re, im, re, im) == 1);
     CHECK(dfn2_prepost_pre_process_freq_dual(pf, re, im, re, im) == -1);
@@ -882,7 +916,8 @@ static int case_model_run(void) {
     StubModel stub = {0, 0, 0};
     DFN2Model model;
     DFN2Model bad;
-    int t, valid = -1;
+    DFN2ModelIoDescriptor descriptor;
+    int t, valid = -1, calls;
 
     config_freq(&cfg);
     CHECK(dfn2_prepost_get_mem_size(&cfg, &req) == 0);
@@ -897,34 +932,59 @@ static int case_model_run(void) {
     model.user = &stub;
     model.infer = stub_infer;
     model.reset = stub_reset;
+    CHECK(dfn2_model_io_descriptor_default(&descriptor) == 0);
+    model.io_descriptor = &descriptor;
 
     /* Contract errors: no frame open, NULL model, no infer callback. */
     CHECK(dfn2_model_run_frame(&model, p) == -1);
-    CHECK(dfn2_prepost_pre_process_freq(p, in_re[0], in_im[0]) == 0);
-    CHECK(dfn2_model_run_frame(&model, p) == -1);   /* hop 0 opens nothing */
-    CHECK(dfn2_prepost_pre_process_freq(p, in_re[1], in_im[1]) == 1);
+    for (t = 0; t < DFN2_MASK_LOOKAHEAD; ++t) {
+        CHECK(dfn2_prepost_pre_process_freq(p, in_re[t], in_im[t]) == 0);
+        CHECK(dfn2_model_run_frame(&model, p) == -1);   /* opens nothing */
+    }
+    CHECK(dfn2_prepost_pre_process_freq(p, in_re[t], in_im[t]) == 1);
     CHECK(dfn2_model_run_frame(NULL, p) == -1);
     CHECK(dfn2_model_run_frame(&model, NULL) == -1);
     memset(&bad, 0, sizeof(bad));
     CHECK(dfn2_model_run_frame(&bad, p) == -1);
+    /* No published graph contract, or one of another lookahead pair: refused
+     * before infer() runs, the frame stays open. */
+    bad = model;
+    bad.io_descriptor = NULL;
+    CHECK(dfn2_model_run_frame(&bad, p) == -1);
+    descriptor.mask_lookahead ^= 1;
+    CHECK(dfn2_model_run_frame(&model, p) == -1);
+    descriptor.mask_lookahead ^= 1;
+    descriptor.df_lookahead ^= 1;
+    CHECK(dfn2_model_run_frame(&model, p) == -1);
+    descriptor.df_lookahead ^= 1;
     CHECK(stub.calls == 0);
     /* A full write commits and steps the recurrent state. */
     snapshot_state(p, gru0, convp0);
     CHECK(dfn2_model_run_frame(&model, p) == 1);
     CHECK(stub.calls == 1);
     CHECK(dfn2_prepost_post_process_freq(p, got_re, got_im, &valid) == 0);
-    CHECK(valid == 0);   /* still inside the lookahead warm-up */
-    CHECK(dfn2_prepost_pre_process_freq(p, in_re[2], in_im[2]) == 1);
+    CHECK(valid == (t >= LOOKAHEAD));   /* the lookahead warm-up emits nothing */
+    /* Committed hops until the next hop emits, so the refused ones below are
+     * emitting hops whatever the lookahead pair. */
+    while (t + 1 < LOOKAHEAD) {
+        ++t;
+        CHECK(dfn2_prepost_pre_process_freq(p, in_re[t], in_im[t]) == 1);
+        CHECK(dfn2_model_run_frame(&model, p) == 1);
+    }
+    ++t;
+    CHECK(dfn2_prepost_pre_process_freq(p, in_re[t], in_im[t]) == 1);
     snapshot_state(p, gru1, convp1);
     CHECK(!identical(gru0, gru1, DFN2_PREPOST_GRU_HIDDEN_ELEMENTS));
     /* A refused inference (nonzero return, nothing written) is taken as the
      * identity: state frozen, frame closed, the hop still emits. */
     stub.mode = 1;
+    calls = stub.calls;
     CHECK(dfn2_model_run_frame(&model, p) == 0);
-    CHECK(stub.calls == 2);
+    CHECK(stub.calls == calls + 1);
     CHECK(dfn2_prepost_post_process_freq(p, got_re, got_im, &valid) == 0);
     CHECK(valid == 1);
-    CHECK(dfn2_prepost_pre_process_freq(p, in_re[3], in_im[3]) == 1);
+    ++t;
+    CHECK(dfn2_prepost_pre_process_freq(p, in_re[t], in_im[t]) == 1);
     snapshot_state(p, gru0, convp0);
     CHECK(identical(gru0, gru1, DFN2_PREPOST_GRU_HIDDEN_ELEMENTS));
     CHECK(identical(convp0, convp1, DFN2_PREPOST_CONVP_WINDOW_ELEMENTS));
@@ -932,11 +992,13 @@ static int case_model_run(void) {
      * taken as the identity the same way -- but the accelerator already wrote
      * the state in place, so the refusal zeroes both recurrent tensors. */
     stub.mode = 2;
+    calls = stub.calls;
     CHECK(dfn2_model_run_frame(&model, p) == 0);
-    CHECK(stub.calls == 3);
+    CHECK(stub.calls == calls + 1);
     CHECK(dfn2_prepost_post_process_freq(p, got_re, got_im, &valid) == 0);
     CHECK(valid == 1);
-    CHECK(dfn2_prepost_pre_process_freq(p, in_re[4], in_im[4]) == 1);
+    ++t;
+    CHECK(dfn2_prepost_pre_process_freq(p, in_re[t], in_im[t]) == 1);
     snapshot_state(p, gru0, convp0);
     CHECK(all_zero(gru0, DFN2_PREPOST_GRU_HIDDEN_ELEMENTS));
     CHECK(all_zero(convp0, DFN2_PREPOST_CONVP_WINDOW_ELEMENTS));
@@ -1232,8 +1294,7 @@ static int case_reject(FftHandle *fft) {
         CHECK(all_zero(out_a, DFN2_HOP_LEN));
 
         /* Open a frame, then refuse the emit that would strand it. */
-        CHECK(dfn2_prepost_pre_process(p, pcm_in) == 0);
-        CHECK(dfn2_prepost_pre_process(p, pcm_in + DFN2_HOP_LEN) == 1);
+        CHECK(open_first_frame_time(p) >= 0);
         CHECK(dfn2_prepost_post_process(p, out_a, NULL) == -1);
         /* An accelerator that never wrote leaves the NaN prefill in place,
          * so the transaction refuses rather than committing garbage. */
@@ -1270,8 +1331,9 @@ static int case_reset(FftHandle *fft) {
     CHECK(!identical(out_a, out_b, (size_t)SHORT_HOPS * DFN2_HOP_LEN));
 
     dfn2_prepost_reset(p);
-    /* The framing clock is cold again: the first hop asks for no inference. */
-    CHECK(dfn2_prepost_pre_process(p, pcm_in) == 0);
+    /* The framing clock is cold again: the first hop asks for no inference
+     * unless the window of heads[0] is already complete. */
+    CHECK(dfn2_prepost_pre_process(p, pcm_in) == PRE_RET(0));
     dfn2_prepost_reset(p);
     CHECK(drive_time(p, pcm_in, out_b, SHORT_HOPS) == 0);
     CHECK(identical(out_a, out_b, (size_t)SHORT_HOPS * DFN2_HOP_LEN));
@@ -1281,8 +1343,7 @@ static int case_reset(FftHandle *fft) {
         DFN2PrepostInputs inputs;
         DFN2PrepostOutputs outputs;
         dfn2_prepost_reset(p);
-        CHECK(dfn2_prepost_pre_process(p, pcm_in) == 0);
-        CHECK(dfn2_prepost_pre_process(p, pcm_in + DFN2_HOP_LEN) == 1);
+        CHECK(open_first_frame_time(p) >= 0);
         CHECK(dfn2_prepost_frame_inputs(p, &inputs, &outputs) == 0);
         dfn2_prepost_reset(p);
         CHECK(dfn2_prepost_frame_commit(p) == -1);
@@ -1297,6 +1358,22 @@ static int case_reset(FftHandle *fft) {
 }
 
 /* ---- skip: the exact identity, and no state advance ------------------ */
+
+/* Hop h emits source frame h - LOOKAHEAD. Its mask and blend weight come from
+ * the heads of hop h - DFN2_DF_LOOKAHEAD (hop k's heads describe frame
+ * k - DFN2_MASK_LOOKAHEAD, which hop k + DFN2_DF_LOOKAHEAD emits), so the
+ * emission is the plain delayed noisy frame unless one of the hops committed
+ * for real (real_a, real_b) supplied them. */
+static int skip_emission_ok(int h, int real_a, int real_b,
+                            const float *got_re, const float *got_im,
+                            float (*in_re)[DFN2_N_BINS],
+                            float (*in_im)[DFN2_N_BINS]) {
+    const int shaped = h - DFN2_DF_LOOKAHEAD == real_a ||
+                       h - DFN2_DF_LOOKAHEAD == real_b;
+    const int same = identical(got_re, in_re[h - LOOKAHEAD], DFN2_N_BINS) &&
+                     identical(got_im, in_im[h - LOOKAHEAD], DFN2_N_BINS);
+    return shaped ? !same : same;
+}
 
 static int case_skip(void) {
     static float in_re[SKIP_TOTAL][DFN2_N_BINS];
@@ -1333,7 +1410,7 @@ static int case_skip(void) {
     for (t = 0; t < SKIP_FRAMES; ++t) {
         int n, valid = -1;
         n = dfn2_prepost_pre_process_freq(p, in_re[t], in_im[t]);
-        CHECK(n == (t == 0 ? 0 : 1));
+        CHECK(n == PRE_RET(t));
         if (n == 1) CHECK(dfn2_prepost_frame_skip(p) == 0);
         CHECK(dfn2_prepost_post_process_freq(p, got_re, got_im, &valid) == 0);
         if (t < LOOKAHEAD) {
@@ -1350,20 +1427,21 @@ static int case_skip(void) {
     /* One REAL commit, so the recurrent tensors are non-zero and "unchanged"
      * below means something.
      *
-     * The frame this hop EMITS is still the identity, and that is the
+     * Whether the frame this hop EMITS is still the identity is the
      * cascade's timing rather than a coincidence: the heads shaping source
-     * frame t - LOOKAHEAD were supplied one hop EARLIER (they land in the
-     * ring at head_frame = hop - MASK_LOOKAHEAD), and that hop was a skip.
-     * A commit therefore never reaches back and re-masks the frame it
-     * emits. */
+     * frame t - LOOKAHEAD were supplied DFN2_DF_LOOKAHEAD hops EARLIER (they
+     * land in the ring at head_frame = hop - MASK_LOOKAHEAD), and with a
+     * positive DF lookahead that hop was a skip. A commit never reaches back
+     * and re-masks a frame already emitted; it shapes the emission
+     * DFN2_DF_LOOKAHEAD hops later (skip_emission_ok). */
     t = SKIP_FRAMES;
     CHECK(dfn2_prepost_pre_process_freq(p, in_re[t], in_im[t]) == 1);
     CHECK(dfn2_prepost_frame_inputs(p, &inputs, &outputs) == 0);
     fake_run(&inputs, &outputs);
     CHECK(dfn2_prepost_frame_commit(p) == 0);
     CHECK(dfn2_prepost_post_process_freq(p, got_re, got_im, NULL) == 0);
-    CHECK(identical(got_re, in_re[t - LOOKAHEAD], DFN2_N_BINS));
-    CHECK(identical(got_im, in_im[t - LOOKAHEAD], DFN2_N_BINS));
+    CHECK(skip_emission_ok(t, SKIP_FRAMES, SKIP_FRAMES + 3,
+                           got_re, got_im, in_re, in_im));
 
     /* Snapshot, then skip even though the accelerator produced a COMPLETE,
      * perfectly committable result.  The full write is the point: skipping
@@ -1391,13 +1469,13 @@ static int case_skip(void) {
                      DFN2_PREPOST_CONVP_WINDOW_ELEMENTS));
     CHECK(dfn2_prepost_frame_skip(p) == 0);
     CHECK(dfn2_prepost_post_process_freq(p, got_re, got_im, NULL) == 0);
-    /* This hop's emission is NOT the identity, and asserting the difference
-     * is the point: source frame t - LOOKAHEAD was masked by the REAL heads
-     * committed one hop earlier, so a mismatch here proves that commit
-     * actually reached the compose stage. A skip only takes the identity for
-     * the frame whose heads IT supplies, which is emitted one hop later. */
-    CHECK(!identical(got_re, in_re[t - LOOKAHEAD], DFN2_N_BINS));
-    CHECK(!identical(got_im, in_im[t - LOOKAHEAD], DFN2_N_BINS));
+    /* Whether this hop's emission is the identity follows the same rule, and
+     * asserting the difference where the rule predicts one is the point: the
+     * emission that source frame was masked into by the REAL heads proves
+     * that commit actually reached the compose stage. A skip only takes the
+     * identity for the frame whose heads IT supplies. */
+    CHECK(skip_emission_ok(t, SKIP_FRAMES, SKIP_FRAMES + 3,
+                           got_re, got_im, in_re, in_im));
 
     /* The skip left the two recurrent tensors exactly as the accelerator
      * wrote them -- not restored to the snapshot, not zeroed -- while the two
@@ -1422,6 +1500,8 @@ static int case_skip(void) {
      * so the state stays frozen exactly as it is. */
     CHECK(dfn2_prepost_frame_skip(p) == 0);
     CHECK(dfn2_prepost_post_process_freq(p, got_re, got_im, NULL) == 0);
+    CHECK(skip_emission_ok(t, SKIP_FRAMES, SKIP_FRAMES + 3,
+                           got_re, got_im, in_re, in_im));
     ++t;
     CHECK(dfn2_prepost_pre_process_freq(p, in_re[t], in_im[t]) == 1);
     CHECK(dfn2_prepost_frame_inputs(p, &inputs, &outputs) == 0);
@@ -1435,6 +1515,8 @@ static int case_skip(void) {
     fake_run(&inputs, &outputs);
     CHECK(dfn2_prepost_frame_commit(p) == 0);
     CHECK(dfn2_prepost_post_process_freq(p, got_re, got_im, NULL) == 0);
+    CHECK(skip_emission_ok(t, SKIP_FRAMES, SKIP_FRAMES + 3,
+                           got_re, got_im, in_re, in_im));
     ++t;
     CHECK(dfn2_prepost_pre_process_freq(p, in_re[t], in_im[t]) == 1);
     CHECK(dfn2_prepost_frame_inputs(p, &inputs, &outputs) == 0);
@@ -1477,9 +1559,12 @@ static int case_guard(FftHandle *fft) {
 
     /* (1) A second pre_process with a frame open is refused, and the refusal
      * does not eat the open frame: it is still committable afterwards. */
-    CHECK(dfn2_prepost_pre_process(pt, pcm_in) == 0);
-    CHECK(dfn2_prepost_pre_process(pt, pcm_in + DFN2_HOP_LEN) == 1);
-    CHECK(dfn2_prepost_pre_process(pt, pcm_in + 2 * DFN2_HOP_LEN) == -1);
+    {
+        int next = open_first_frame_time(pt);
+        CHECK(next >= 0);
+        CHECK(dfn2_prepost_pre_process(
+                  pt, pcm_in + (size_t)next * DFN2_HOP_LEN) == -1);
+    }
     /* The setters are between-hops operations. With the frame open they
      * are refused, so a swap can never land inside one transaction (between
      * the features just taken and the compose still pending), and the
@@ -1494,8 +1579,7 @@ static int case_guard(FftHandle *fft) {
                                         &erb_inv[0][0]) == 0);
     CHECK(dfn2_prepost_set_atten_lim(pt, 0.0f) == 0);
 
-    CHECK(dfn2_prepost_pre_process_freq(pf, re_a, im_a) == 0);
-    CHECK(dfn2_prepost_pre_process_freq(pf, re_b, im_b) == 1);
+    CHECK(open_first_frame_freq(pf, re_b, im_b) >= 0);
     CHECK(dfn2_prepost_pre_process_freq(pf, re_a, im_a) == -1);
     /* Same refusal in FREQ mode: the guard is keyed to the frame, not to
      * who owns the transform. */
@@ -1511,8 +1595,7 @@ static int case_guard(FftHandle *fft) {
      * that never ran must not be able to pass untouched buffers off as a
      * result.  The frame stays open and commits normally afterwards. */
     dfn2_prepost_reset(pt);
-    CHECK(dfn2_prepost_pre_process(pt, pcm_in) == 0);
-    CHECK(dfn2_prepost_pre_process(pt, pcm_in + DFN2_HOP_LEN) == 1);
+    CHECK(open_first_frame_time(pt) >= 0);
     CHECK(dfn2_prepost_frame_commit(pt) == -1);
     CHECK(dfn2_prepost_frame_inputs(pt, &inputs, &outputs) == 0);
     fake_run(&inputs, &outputs);
@@ -1522,8 +1605,7 @@ static int case_guard(FftHandle *fft) {
      * transaction: retrying it without a fresh frame_inputs is refused,
      * and the fresh frame_inputs NaN-refills every writable element. */
     dfn2_prepost_reset(pt);
-    CHECK(dfn2_prepost_pre_process(pt, pcm_in) == 0);
-    CHECK(dfn2_prepost_pre_process(pt, pcm_in + DFN2_HOP_LEN) == 1);
+    CHECK(open_first_frame_time(pt) >= 0);
     CHECK(dfn2_prepost_frame_inputs(pt, &inputs, &outputs) == 0);
     fake_run(&inputs, &outputs);
     {
@@ -1554,8 +1636,7 @@ static int case_guard(FftHandle *fft) {
     /* (4) frame_skip is exactly the accelerator-never-ran path, so it needs
      * no frame_inputs behind it. */
     dfn2_prepost_reset(pt);
-    CHECK(dfn2_prepost_pre_process(pt, pcm_in) == 0);
-    CHECK(dfn2_prepost_pre_process(pt, pcm_in + DFN2_HOP_LEN) == 1);
+    CHECK(open_first_frame_time(pt) >= 0);
     CHECK(dfn2_prepost_frame_skip(pt) == 0);
     CHECK(dfn2_prepost_post_process(pt, hop_scratch, NULL) == 0);
 
@@ -1579,7 +1660,7 @@ static int txn_reference(DFN2Prepost *p, float *out, int mode) {
         DFN2PrepostOutputs outputs;
         int n = dfn2_prepost_pre_process(
             p, pcm_in + (size_t)hop * DFN2_HOP_LEN);
-        if (n != (hop == 0 ? 0 : 1)) return -1;
+        if (n != PRE_RET(hop)) return -1;
         if (n == 1) {
             if (hop == TXN_PRE && mode != 1) {
                 if (mode == 2) {
@@ -1616,7 +1697,7 @@ static int txn_poisoned(DFN2Prepost *p, float *out, int tensor, size_t index) {
         DFN2PrepostOutputs outputs;
         int n = dfn2_prepost_pre_process(
             p, pcm_in + (size_t)hop * DFN2_HOP_LEN);
-        CHECK(n == (hop == 0 ? 0 : 1));
+        CHECK(n == PRE_RET(hop));
         if (n == 1 && hop == TXN_PRE) {
             float *target;
             size_t count = 0;
@@ -1701,9 +1782,7 @@ static int case_txn(FftHandle *fft) {
              * recomputing it here, so a shape change cannot drift. */
             probe_p = dfn2_prepost_init(pool, (size_t)req.bytes, &cfg);
             CHECK(probe_p != NULL);
-            CHECK(dfn2_prepost_pre_process(probe_p, pcm_in) == 0);
-            CHECK(dfn2_prepost_pre_process(probe_p,
-                                           pcm_in + DFN2_HOP_LEN) == 1);
+            CHECK(open_first_frame_time(probe_p) >= 0);
             CHECK(dfn2_prepost_frame_inputs(probe_p, &probe, &shape) == 0);
             (void)output_tensor(&shape, tensor, &count);
             CHECK(count > 0u);
@@ -1743,8 +1822,7 @@ static int case_state_inplace(void) {
     config_freq(&cfg);
     p = dfn2_prepost_create(&cfg);
     CHECK(p != NULL);
-    CHECK(dfn2_prepost_pre_process_freq(p, re, im) == 0);
-    CHECK(dfn2_prepost_pre_process_freq(p, re, im) == 1);
+    CHECK(open_first_frame_freq(p, re, im) >= 0);
     CHECK(dfn2_prepost_frame_inputs(p, &in, &out) == 0);
     a = &in.df_convp_window[0][0][0];
     CHECK(state_aliased(&in, &out));
@@ -1776,8 +1854,7 @@ static int case_state_inplace(void) {
         }
     }
     dfn2_prepost_reset(p);
-    CHECK(dfn2_prepost_pre_process_freq(p, re, im) == 0);
-    CHECK(dfn2_prepost_pre_process_freq(p, re, im) == 1);
+    CHECK(open_first_frame_freq(p, re, im) >= 0);
     CHECK(dfn2_prepost_frame_inputs(p, &in, &out) == 0);
     CHECK(&in.df_convp_window[0][0][0] == a);
     CHECK(state_aliased(&in, &out));
@@ -1803,8 +1880,7 @@ static int case_inplace_nan(void) {
         float *poison;
         p = dfn2_prepost_create(&cfg);
         CHECK(p != NULL);
-        CHECK(dfn2_prepost_pre_process_freq(p, re, im) == 0);
-        CHECK(dfn2_prepost_pre_process_freq(p, re, im) == 1);
+        CHECK(open_first_frame_freq(p, re, im) >= 0);
         /* A healthy frame first, so the state is non-zero going in. */
         CHECK(dfn2_prepost_frame_inputs(p, &in, &out) == 0);
         fake_run(&in, &out);
@@ -1858,6 +1934,7 @@ static int case_generation(void) {
     DFN2PrepostOutputs out;
     float re[DFN2_N_BINS] = {0}, im[DFN2_N_BINS] = {0};
     unsigned int g;
+    int hop;
 
     CHECK(dfn2_prepost_state_generation(NULL) == 0u);
     config_freq(&cfg);
@@ -1866,8 +1943,10 @@ static int case_generation(void) {
     g = dfn2_prepost_state_generation(p);
     CHECK(g == 1u);
 
-    CHECK(dfn2_prepost_pre_process_freq(p, re, im) == 0);
-    CHECK(dfn2_prepost_state_generation(p) == g);
+    for (hop = 0; hop < DFN2_MASK_LOOKAHEAD; ++hop) {
+        CHECK(dfn2_prepost_pre_process_freq(p, re, im) == 0);
+        CHECK(dfn2_prepost_state_generation(p) == g);
+    }
     CHECK(dfn2_prepost_pre_process_freq(p, re, im) == 1);
     CHECK(dfn2_prepost_frame_inputs(p, &in, &out) == 0);
     fake_run(&in, &out);
@@ -1918,13 +1997,60 @@ static int case_generation(void) {
     return 0;
 }
 
+/* ---- identity: the pool identity carries the lookahead pair ----------- */
+
+/* A pool sized by a build for another (mask, df) pair is refused by this one:
+ * req_dump writes this build's MemReq, req_check hands a dumped one to
+ * _init_ex as the expected identity. Mode 1 expects it accepted, 0 refused, and
+ * 2 refused although size and alignment were made equal to this build's, so
+ * only the build identity can tell the pools apart. */
+static int case_req_dump(const char *path, FftHandle *fft) {
+    DFN2PrepostConfig cfg;
+    DFN2PrepostMemReq req;
+    FILE *file;
+    config_time(&cfg, fft);
+    CHECK(dfn2_prepost_get_mem_size(&cfg, &req) == 0);
+    file = fopen(path, "wb");
+    CHECK(file != NULL);
+    CHECK(fwrite(&req, sizeof req, 1, file) == 1);
+    CHECK(fclose(file) == 0);
+    printf("req: mask=%d df=%d hash=%u\n", DFN2_MASK_LOOKAHEAD,
+           DFN2_DF_LOOKAHEAD, (unsigned)req.build_flags_hash);
+    return 0;
+}
+
+static int case_req_check(const char *path, int mode, FftHandle *fft) {
+    DFN2PrepostConfig cfg;
+    DFN2PrepostMemReq req, expected;
+    DFN2Prepost *p;
+    void *pool;
+    FILE *file = fopen(path, "rb");
+    CHECK(file != NULL);
+    CHECK(fread(&expected, sizeof expected, 1, file) == 1);
+    CHECK(fclose(file) == 0);
+    config_time(&cfg, fft);
+    CHECK(dfn2_prepost_get_mem_size(&cfg, &req) == 0);
+    pool = alloc_aligned(req.alignment, (size_t)req.bytes);
+    CHECK(pool != NULL);
+    if (mode == 2) {
+        expected.bytes = req.bytes;
+        expected.alignment = req.alignment;
+    }
+    p = dfn2_prepost_init_ex(pool, (size_t)req.bytes, &cfg, &expected);
+    CHECK((p != NULL) == (mode == 1));
+    if (p) dfn2_prepost_destroy(p);
+    free(pool);
+    return 0;
+}
+
 int main(int argc, char **argv) {
     void *fft_mem = NULL;
     FftHandle *fft;
     int status;
 
-    if (argc != 2) {
-        fprintf(stderr, "usage: %s <case>\n", argv[0]);
+    if (argc < 2 || argc > 4) {
+        fprintf(stderr, "usage: %s <case> [req_dump file | req_check file 0|1|2]\n",
+                argv[0]);
         return 2;
     }
     build_erb();
@@ -1938,7 +2064,11 @@ int main(int argc, char **argv) {
     CHECK(fft != NULL);
     CHECK(fft_get_n_freqs(fft) == DFN2_N_BINS);
 
-    if (strcmp(argv[1], "equiv") == 0)          status = case_equiv(fft);
+    if (argc == 3 && !strcmp(argv[1], "req_dump"))
+        status = case_req_dump(argv[2], fft);
+    else if (argc == 4 && !strcmp(argv[1], "req_check"))
+        status = case_req_check(argv[2], atoi(argv[3]), fft);
+    else if (strcmp(argv[1], "equiv") == 0)     status = case_equiv(fft);
     else if (strcmp(argv[1], "freq") == 0)      status = case_freq(fft);
     else if (strcmp(argv[1], "freqpool") == 0)  status = case_freqpool(fft);
     else if (strcmp(argv[1], "lifecycle") == 0) status = case_lifecycle(fft);
@@ -1968,41 +2098,63 @@ int main(int argc, char **argv) {
 @pytest.fixture(scope='module')
 def audio_common_lib():
     """audiolib's NE10 static lib (the default backend), built and located the way the other AINR C tests do it."""
-    if shutil.which('make') is None:
-        pytest.skip('no make available')
-    subprocess.run(
-        ['make', '-s', '-C', _AC_DIR, 'BACKEND=ne10', 'lib'],
-        check=True, capture_output=True,
-    )
-    out = subprocess.run(
-        ['make', '-s', '-C', _AC_DIR, 'BACKEND=ne10', 'print-lib-path'],
-        check=True, capture_output=True, text=True,
-    )
-    lib = out.stdout.strip().splitlines()[-1]
-    assert os.path.isfile(lib), lib
-    return lib
+    reason = dfn_pairs.require_toolchain()
+    if reason:
+        pytest.skip(reason)
+    return dfn_pairs.audio_common_lib()
 
 
-@pytest.fixture(scope='module')
-def driver(tmp_path_factory, audio_common_lib):
+# Every (DFN2_MASK_LOOKAHEAD, DFN2_DF_LOOKAHEAD) pair built here is one the model
+# accepts. The shipped pair is the header default and is built with no override;
+# the others are built with -D overrides, which is how a board build selects a
+# checkpoint trained for another pair.
+_LOOKAHEAD_PAIRS = dfn_pairs.c_build_pairs(FAMILY)
+_SHIPPED_PAIR = dfn_pairs.shipped_pair(FAMILY)
+# The argument-free cases the driver dispatches on argv[1]; every case the
+# driver defines must be among them, so a case written another way cannot be
+# silently left out of the per-pair run.
+_CASES = tuple(re.findall(r'strcmp\(argv\[1\], "(\w+)"\) == 0\)', _DRIVER))
+assert set(_CASES) == (
+    set(re.findall(r'^static int case_(\w+)\(', _DRIVER, re.M))
+    - {'req_dump', 'req_check'})
+
+
+def _build_driver(tmp_path_factory, audio_common_lib, pair=None):
     """One executable for every case: the class plus the two TUs it composes,
-    compiled at the house flags with -Werror."""
-    cc = shutil.which('cc') or shutil.which('gcc') or shutil.which('clang')
-    if cc is None:
-        pytest.skip('no C compiler available')
+    compiled at the house flags with -Werror. `pair` overrides the lookahead
+    constants; None builds the header defaults."""
     work = tmp_path_factory.mktemp('dfn2_prepost_c')
     source = work / 'driver.c'
     source.write_text(_DRIVER, encoding='utf-8')
     executable = work / 'driver'
     subprocess.run(
-        [cc, '-O2', '-std=c11',
-         '-Wall', '-Wextra', '-Wpedantic', '-Werror', '-ffp-contract=off',
-         '-I', _DFN_DIR, '-I', _AC_INCLUDE, '-I', _AC_DIR, str(source),
-         *[os.path.join(_DFN_DIR, name) for name in _SOURCES],
+        ['cc', *dfn_pairs.house_cflags(),
+         *([] if pair is None else dfn_pairs.defines(FAMILY, pair)),
+         str(source),
+         *[str(dfn_pairs.source_path(FAMILY, kind)) for kind in _SOURCES],
          audio_common_lib, '-lm', '-o', str(executable)],
         check=True, capture_output=True,
     )
     return executable
+
+
+@pytest.fixture(scope='module')
+def driver(tmp_path_factory, audio_common_lib):
+    return _build_driver(tmp_path_factory, audio_common_lib)
+
+
+_OTHER_PAIRS = [pair for pair in _LOOKAHEAD_PAIRS if pair != _SHIPPED_PAIR]
+
+
+@pytest.fixture(scope='module')
+def other_pair_drivers(tmp_path_factory, audio_common_lib):
+    return {pair: _build_driver(tmp_path_factory, audio_common_lib, pair)
+            for pair in _OTHER_PAIRS}
+
+
+@pytest.fixture(params=_OTHER_PAIRS, ids=dfn_pairs.pair_id)
+def pair_driver(request, other_pair_drivers):
+    return other_pair_drivers[request.param]
 
 
 def _run(driver, case):
@@ -2016,8 +2168,8 @@ def test_time_mode_matches_the_hand_composed_path(driver):
     """The class vs dfn2_analysis + dfn2_compute_features + the model-I/O
     transaction + dfn2_compose_stream + dfn2_synthesis wired up by hand from
     the two composed TUs, byte-identical over 400 hops -- with the
-    attenuation limit both disabled and at -20 dB. Also pins the two-hop
-    model lookahead: `written` is 0 for exactly the first two hops and
+    attenuation limit both disabled and at -20 dB. Also pins the model
+    lookahead (MASK + DF hops): `written` is 0 for exactly the first MASK + DF hops and
     DFN2_HOP_LEN after, and the reported output frame index is unavailable
     until the first emission and then counts source frames without a gap."""
     assert 'io_mode=TIME' in _run(driver, 'equiv')
@@ -2129,7 +2281,8 @@ def test_dual_entry_guards_and_gain_accessor(driver):
 
 def test_model_run_frame_commits_or_takes_the_identity(driver):
     """dfn2_model_run_frame: contract errors (-1) for no open frame, a NULL
-    model/instance or no infer callback; a full write returns 1 and steps the
+    model/instance, no infer callback, a NULL io_descriptor or one whose
+    mask_lookahead or df_lookahead differs from the build; a full write returns 1 and steps the
     recurrent state; a refused inference (nothing written) returns 0, leaves
     every recurrent tensor byte-identical and still emits; a partial write
     (state written in place, one head unwritten) returns 0 with both
@@ -2165,3 +2318,36 @@ def test_state_generation_counts_every_zeroing_and_nothing_else(driver):
     reset and each refused commit (bad state element or bad head); commit and
     skip never move it. A runtime refills its fixed-point state from it."""
     _run(driver, 'generation')
+
+
+@pytest.mark.parametrize('case', _CASES)
+def test_every_case_holds_for_every_other_lookahead_pair(pair_driver, case):
+    """The whole driver, rebuilt for each non-shipped (mask, df) lookahead
+    pair: warm-up length, delay-line length, readiness and the frame clocks
+    all follow the compiled constants rather than the shipped 1/1."""
+    _run(pair_driver, case)
+
+
+def test_a_pool_identity_from_another_lookahead_pair_is_refused(
+        tmp_path, driver, other_pair_drivers):
+    """The build identity folds in both lookahead constants: a host built for
+    one trained pair refuses a pool (and so a graph description) sized by a
+    build for another: refused outright, and still refused when the dumped
+    request is given this build's size and alignment (identity alone)."""
+    builds = {_SHIPPED_PAIR: driver, **other_pair_drivers}
+    dumps, hashes = {}, set()
+    for pair, exe in builds.items():
+        path = tmp_path / ('req_%d%d.bin' % pair)
+        out = subprocess.run([str(exe), 'req_dump', str(path)],
+                             capture_output=True, text=True)
+        assert out.returncode == 0, out.stderr
+        dumps[pair] = path
+        hashes.add(re.search(r'hash=(\d+)', out.stdout).group(1))
+    assert len(hashes) == len(_LOOKAHEAD_PAIRS)
+    for host, exe in builds.items():
+        for pool, path in dumps.items():
+            for mode in ((1,) if host == pool else (0, 2)):
+                done = subprocess.run(
+                    [str(exe), 'req_check', str(path), str(mode)],
+                    capture_output=True, text=True)
+                assert done.returncode == 0, (host, pool, mode, done.stderr)

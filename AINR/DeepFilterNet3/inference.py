@@ -307,7 +307,8 @@ def calibration_main():
             state = wrapper.initial_inputs()[2:]
             used = False
             for erb_window, spec_window in zip(
-                    feature_windows(erb), feature_windows(spec)):
+                    feature_windows(erb, model.mask_lookahead),
+                    feature_windows(spec, model.mask_lookahead)):
                 inputs = (erb_window, spec_window) + state
                 capture_calibration_inputs(captured, input_names, inputs)
                 outputs = wrapper(*inputs)
@@ -351,6 +352,11 @@ def calibration_main():
         'win_len': params['WIN_LEN'],
         'hop_len': params['HOP_LEN'],
         'input_feature_frames': INPUT_FRAMES,
+        # The pair the windows below were captured for (the graph's metadata
+        # carries it too): a calibration artifact is only valid for a host
+        # built with the same pair.
+        'mask_lookahead': graph_metadata['mask_lookahead'],
+        'df_lookahead': graph_metadata['df_lookahead'],
         'frames': int(arrays['erb'].shape[0]),
         'seed': args.seed,
         'source_files': source_files,

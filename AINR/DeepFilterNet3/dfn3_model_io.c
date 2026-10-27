@@ -5,12 +5,6 @@
 
 #include "utility/simd_kernel_nn.h"
 
-/* The exported graph consumes the fixed [t-1,t,t+1] window; a different head
- * delay needs a different graph window and readiness contract, not only
- * different ring constants. */
-_Static_assert(DFN3_MASK_LOOKAHEAD == 1 && DFN3_MODEL_INPUT_FRAMES == 3,
-               "DFN3 layout9 requires a three-frame window and mask lookahead1");
-
 #define DFN3_MODEL_IO_STATE_TENSORS 2
 
 /* One list of (field, contract value) drives both the default and the validator,
@@ -108,11 +102,13 @@ int dfn3_model_io_push_features(DFN3ModelIOState *state,
                                 const float erb[DFN3_N_ERB],
                                 const float spec[2][DFN3_DF_BINS])
 {
+    DFN3_REQUIRE_LOOKAHEAD_PAIR_LINK();
     if (state == NULL || erb == NULL || spec == NULL) return -1;
     dfn3_model_io_push_erb_window(state->erb_window, erb);
     dfn3_model_io_push_spec_window(state->spec_window, spec);
-    if (state->feature_frames_seen < 2U) ++state->feature_frames_seen;
-    return state->feature_frames_seen == 2U ? 1 : 0;
+    if (state->feature_frames_seen < DFN3_MODEL_READY_FRAMES)
+        ++state->feature_frames_seen;
+    return state->feature_frames_seen == DFN3_MODEL_READY_FRAMES ? 1 : 0;
 }
 
 int dfn3_model_io_validate_state(DFN3ModelIOState *state)

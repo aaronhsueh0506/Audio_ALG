@@ -18,8 +18,13 @@
 ### 6.1 共通生命週期
 
 四個類別的生命週期形狀相同，前綴為 `ulcnet_` / `deepvqe_` / `dfn2_` / `dfn3_`。
-DFN3 的兩個 heads、layout 9、state 綁定、單 hop lookahead 與 API 範例見
+DFN3 的兩個 heads、layout 9、state 綁定、lookahead 與 API 範例見
 [DFN3 模型頁](html/ainr_dfn3.html)；下面原有的 DFN2 專節仍描述其 cascade/alpha。
+
+DFN2／DFN3 的 lookahead 是 M（`mask_lookahead`，0..2）與 D（`df_lookahead`，0..4）兩個獨立設定，共 15 個 pair，出貨為 1/1。
+pair 是模型合約，C 端在建置時以 `-DDFN2_MASK_LOOKAHEAD=<M> -DDFN2_DF_LOOKAHEAD=<D>`（DFN3 為 `DFN3_*`）加在每個編譯單元上，
+須與 checkpoint 一致；不同 pair 的目標檔連結失敗。模型延遲 DFN2（cascade）為 M+D hops，DFN3（平行）為 max(M, D) hops；
+`pre_process` 在前 M 拍回 0。規則見 [DFN2 細節頁](html/ainr_dfn2_detail.html)。
 
 ```text
 _config_defaults(&cfg, io_mode[, delay_depth])
@@ -58,7 +63,7 @@ if (n == 1) {
     UlcnetModelIoOutputs out;
     ulcnet_prepost_frame_inputs(p, &in, &out);   /* 指向本實例 pool 的 view */
     /* 每個 out.*_out 綁到 in 的同名位址；先讀完所有 state 輸入、才寫輸出。
-     * （DFN2、GTCRN 同樣就地綁定。） */
+     * （DFN2、DFN3、GTCRN 同樣就地綁定。） */
     if (accelerator_run(&in, &out) != 0 ||
         ulcnet_prepost_frame_commit(p) != 0)
         ulcnet_prepost_frame_skip(p);            /* 保住 framing 節奏 */
@@ -69,8 +74,8 @@ ulcnet_prepost_post_process(p, out_hop, &written);
 
 - **`_pre_process()` 回的是「這一拍需要的加速器呼叫次數」，不是布林。**
   Align-ULCNet 與 DeepVQE-S **從第 0 拍起恆為 1**（一 hop 進、一次推論、一 hop 出，兩個 io_mode 皆然）；
-  DeepFilterNet2 **第 0 拍回 0**、之後恆 1，因為它的圖吃 `[t-1, t, t+1]`，第 0 拍沒有右鄰居，
-  那一拍**不可以**呼叫加速器。
+  DeepFilterNet2／3 **前 M 拍回 0**（M = `mask_lookahead`；出貨 M = 1 即第 0 拍）、之後恆 1，因為它們的圖吃
+  `[t-(2-M), …, t+M]`，前 M 拍右鄰居還沒到，那幾拍**不可以**呼叫加速器。
 - `_frame_inputs()` 只把**非 state 的輸出**（heads：`output`／`taps`／`erb_mask`／`coefs`／`alpha`，
   Align-ULCNet 的 `output`）**預填 NaN**，所以加速器只寫一半會在 commit
   被抓到，而不是把上一框的值當成本框結果。**state 不預填**（它同時是下一框的輸入）。
@@ -83,7 +88,7 @@ ulcnet_prepost_post_process(p, out_hop, &written);
 - **commit 前面一定要有一次 `_frame_inputs()`**（`prepared` 閂鎖，四個類別皆然）：
   沒跑過的加速器不能把沒被碰過的 buffer 當成結果送出。
 - **遞迴 state 的綁定。** 每個 state 張量在 pool 裡只有一個 buffer，位址在實例壽命內固定（沒有交替的 bank、沒有指標交換）。
-  - **Align-ULCNet、DeepVQE-S、DFN2、GTCRN：就地綁定，沒有複製路徑。** runtime 把每個 `*_out`（C 端欄位名 `*_next`）綁到
+  - **Align-ULCNet、DeepVQE-S、DFN2、DFN3、GTCRN：就地綁定，沒有複製路徑。** runtime 把每個 `*_out`（C 端欄位名 `*_next`）綁到
     `_frame_inputs()` 回傳的同名輸入位址，**先讀完**所有 state 輸入、**才寫**輸出；graph 回完整的下一個 window
     （位移在 graph 內），CPU 不搬、不複製。commit／validate 被拒時無法回滾：遞迴 state 從零重來、state generation 加一；
     回報失敗的 runtime 視為沒有寫入。
@@ -92,11 +97,11 @@ ulcnet_prepost_post_process(p, out_hop, &written);
     state 與原來逐位元相同，這一幀視為失敗。指標等於目的位址的 tensor 視為已就地寫入，不複製也不由 inherit 檢查，
     所以同一個呼叫兩種綁定都適用。
   非有限值以外的「寫一半／混寫」都偵測不到。
-- **state generation（Align-ULCNet、DeepVQE-S、DFN2、GTCRN）**：`ulcnet_model_io_state_generation()`、
+- **state generation（Align-ULCNet、DeepVQE-S、DFN2、DFN3、GTCRN）**：`ulcnet_model_io_state_generation()`、
   `ulcnet_prepost_state_generation()`、`ulcnet_accelerator_adapter_state_generation()`、
   `deepvqe_prepost_state_generation()`、`dfn2_prepost_state_generation()`、`dfn2_model_io_state_generation()`、
-  `gtcrn_model_state_generation()` 回傳 C 端把 state 清零的次數：`_reset()` 與被拒絕的 `_frame_commit()` 各加一，
-  新建實例的起始值：Align-ULCNet、DeepVQE-S 為 0，DFN2、GTCRN 為 1；成功的 commit、`_frame_skip()` 與再次呼叫被拒的 commit 都不動它；`NULL` 回 0，數值回繞於 2^32。
+  `dfn3_prepost_state_generation()`、`dfn3_model_io_state_generation()`、`gtcrn_model_state_generation()` 回傳 C 端把 state 清零的次數：`_reset()` 與被拒絕的 `_frame_commit()` 各加一，
+  新建實例的起始值：Align-ULCNet、DeepVQE-S 為 0，DFN2、DFN3、GTCRN 為 1；成功的 commit、`_frame_skip()` 與再次呼叫被拒的 commit 都不動它；`NULL` 回 0，數值回繞於 2^32。
   定點 accelerator 的 state 緩衝在 C 清零時不會跟著變，板端 sample 比較這個值，變了就用量化後的 0 重填 state 輸入。
 - **Align-ULCNet 的四個 state**（`key_history`／`value_history`／`logit_history`／`h_gru`
   ↔ 對應的 `*_out`）：輸入是完整 window、graph 回每個 state 的**完整下一個 window**，shape 與輸入完全相同：

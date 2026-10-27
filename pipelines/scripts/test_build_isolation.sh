@@ -46,7 +46,7 @@
 #            with the internal -DAUDIO_PIPELINE_BACKEND_STR define reaching the compile line)
 #   SP-S9c:  link-flags (LDFLAGS/EXTRA_LDFLAGS) character safety: the `EXTRA_LDFLAGS=';id'` injection repro, the
 #            SP-S9b glob/tilde/redirect matrix for EXTRA_LDFLAGS, a positive control (a real `-Wl,-rpath,... -L...`
-#            flag still builds and runs test_se_common to ALL PASS), and override rejection of
+#            flag still builds and runs test_mcab_sample_post to ALL PASS), and override rejection of
 #            SHELL_SAFE_INPUT_FLAGS/SHELL_SAFE_ALLOWLIST_RC via an EXTRA_LDFLAGS payload
 #   SP-S10:  lib/aec fresh-archive discipline against the PRIMARY AEC repo ($AEC_R6_DIR) with scratch
 #            OBJ_ROOT/BIN_ROOT; the foreign member goes into a scratch archive, never the real libaec.a
@@ -68,6 +68,8 @@
 #            producers, plus LDFLAGS=<poison> against pipelines only. Every case is a true `-n` dry run against
 #            scratch OBJ_ROOT/BIN_ROOT; the only passing outcome is parse-time rejection ("cannot be overridden")
 #            with a nonzero exit (see assert_make_e_rejected()).
+#   SP-S19:  the 4ch test_mcab_sample_driver object records its header dependencies (.d)
+#   SP-S20:  test-pairs: an empty DFN_TEST_PAIRS is refused; -n/-q/-t print no FAIL and build nothing
 #
 # Design rules (as in audiolib's script):
 #   - No `make clean` inside any scenario body (except SP-S13's trailing `make -C RNNoise-ERB clean`, which only
@@ -553,6 +555,51 @@ final_target="$(readlink "$S7_DIST_ROOT/ne10/current" || true)"
   || fail "S7: after concurrent publish, current points at an incomplete/missing release dir"
 
 echo "############################################################"
+echo "# SP-S19: the 4ch test_mcab_sample_driver object tracks the headers it includes"
+echo "############################################################"
+mkscratch sp19
+SP19_ARGS=(-C "$PIPE_DIR/4ch_aec_bf_nr_res" BACKEND=ne10 SIMD=1 WERROR=0
+  OBJ_ROOT="$SCRATCH_ROOT/sp19/obj" BIN_ROOT="$SCRATCH_ROOT/sp19/bin")
+if make -s "${SP19_ARGS[@]}" test-mcab-sample-driver >"$SCRATCH_ROOT/sp19/build.log" 2>&1; then
+  pass "SP-S19: make test-mcab-sample-driver builds and passes"
+  sp19_obj="$(make -s "${SP19_ARGS[@]}" print-obj-dir | tail -1)"
+  sp19_missing=""
+  for h in mcab.h mcab_sample_beam.h mcab_sample_flow.h mcab_sample_driver.h aec.h example_cli.h; do
+    grep -q "[/ ]$h" "$sp19_obj/test_mcab_sample_driver.d" 2>/dev/null || sp19_missing="$sp19_missing $h"
+  done
+  [ -z "$sp19_missing" ] && pass "SP-S19: test_mcab_sample_driver.d lists mcab.h, the sample headers, aec.h and example_cli.h" \
+    || fail "SP-S19: test_mcab_sample_driver.d is missing (or lacks):$sp19_missing -- a header edit would leave a stale test binary"
+  case "$sp19_obj" in
+    "$SCRATCH_ROOT/sp19/obj/"*) pass "SP-S19: the test builds under the producer-keyed object directory the rest of 4ch uses" ;;
+    *) fail "SP-S19: unexpected object directory $sp19_obj" ;;
+  esac
+else
+  fail "SP-S19: make test-mcab-sample-driver failed"; tail -20 "$SCRATCH_ROOT/sp19/build.log" >&2
+fi
+
+echo "############################################################"
+echo "# SP-S20: test-pairs refuses an empty pair list and is side-effect free under -n/-q/-t"
+echo "############################################################"
+mkscratch sp20
+SP20_ARGS=(BACKEND=ne10 OBJ_ROOT="$SCRATCH_ROOT/sp20/obj" BIN_ROOT="$SCRATCH_ROOT/sp20/bin")
+rc=0; make "${SP20_ARGS[@]}" DFN_TEST_PAIRS= test-pairs >"$SCRATCH_ROOT/sp20/empty.log" 2>&1 || rc=$?
+[ "$rc" -ne 0 ] && grep -q "DFN_TEST_PAIRS is empty" "$SCRATCH_ROOT/sp20/empty.log" \
+  && pass "SP-S20: an empty DFN_TEST_PAIRS is refused with its own error (rc=$rc)" \
+  || fail "SP-S20: an empty DFN_TEST_PAIRS was not refused (rc=$rc)"
+for f in -n -q -t -nq -nt; do
+  rc=0; make "$f" "${SP20_ARGS[@]}" DFN_TEST_PAIRS="0/0 2/4" test-pairs >"$SCRATCH_ROOT/sp20/$f.log" 2>&1 || rc=$?
+  want=0; case "$f" in *q*) want=1 ;; esac
+  if [ "$rc" -eq "$want" ] && ! grep -q "FAIL" "$SCRATCH_ROOT/sp20/$f.log" && \
+     [ ! -e "$SCRATCH_ROOT/sp20/obj" ] && [ ! -e "$SCRATCH_ROOT/sp20/bin" ]; then
+    pass "SP-S20: make $f test-pairs: rc=$rc, no FAIL line, nothing built"
+  else
+    fail "SP-S20: make $f test-pairs: rc=$rc (expected $want), FAIL lines=$(grep -c FAIL "$SCRATCH_ROOT/sp20/$f.log"), obj/bin created=$([ -e "$SCRATCH_ROOT/sp20/obj" ] || [ -e "$SCRATCH_ROOT/sp20/bin" ] && echo yes || echo no)"
+  fi
+done
+grep -q "would build and run" "$SCRATCH_ROOT/sp20/-n.log" && pass "SP-S20: make -n test-pairs prints what it would run" \
+  || fail "SP-S20: make -n test-pairs printed no plan"
+
+echo "############################################################"
 echo "# SP1: pipeline-level A->B->A (SIMD=1 -> SIMD=0 -> SIMD=1)"
 echo "############################################################"
 resolve_producers ne10 1
@@ -910,27 +957,27 @@ else
 fi
 
 # Positive control: a real link flag the Makefile's allow-list comment anticipates (-Wl,-rpath,dir style
-# pass-through) must pass the character check, build and run. test_se_common is a real linked binary (unlike
+# pass-through) must pass the character check, build and run. test_mcab_sample_post is a real linked binary (unlike
 # SP-S9b's libaudio_pipeline_dfn.a, an `ar` recipe that never touches $(LDFLAGS)) and prints "ALL PASS" with exit 0, so it
 # doubles as the link-succeeded-and-still-correct assertion. Uses scratch OBJ_ROOT/BIN_ROOT.
 mkscratch sp9c_pos
 SP9C_POS_OBJ_ROOT="$SCRATCH_ROOT/sp9c_pos/obj"
 SP9C_POS_BIN_ROOT="$SCRATCH_ROOT/sp9c_pos/bin"
 SP9C_POS_BUILD_LOG="$SCRATCH_ROOT/tmp/sp9c_positive_build.log"
-if env EXTRA_LDFLAGS='-Wl,-rpath,/usr/lib -L/usr/lib' make BACKEND=ne10 OBJ_ROOT="$SP9C_POS_OBJ_ROOT" BIN_ROOT="$SP9C_POS_BIN_ROOT" test_se_common >"$SP9C_POS_BUILD_LOG" 2>&1; then
-  pass "SP-S9c: EXTRA_LDFLAGS='-Wl,-rpath,/usr/lib -L/usr/lib' (positive control, real rpath/library-path link flag) builds test_se_common"
+if env EXTRA_LDFLAGS='-Wl,-rpath,/usr/lib -L/usr/lib' make BACKEND=ne10 OBJ_ROOT="$SP9C_POS_OBJ_ROOT" BIN_ROOT="$SP9C_POS_BIN_ROOT" test_mcab_sample_post >"$SP9C_POS_BUILD_LOG" 2>&1; then
+  pass "SP-S9c: EXTRA_LDFLAGS='-Wl,-rpath,/usr/lib -L/usr/lib' (positive control, real rpath/library-path link flag) builds test_mcab_sample_post"
   if grep -qF -- '-Wl,-rpath,/usr/lib -L/usr/lib' "$SP9C_POS_BUILD_LOG"; then
-    pass "SP-S9c: the real link flag reaches the actual \$(LINK) recipe line for test_se_common"
+    pass "SP-S9c: the real link flag reaches the actual \$(LINK) recipe line for test_mcab_sample_post"
   else
-    fail "SP-S9c: the real link flag did NOT appear on the test_se_common link recipe line"
+    fail "SP-S9c: the real link flag did NOT appear on the test_mcab_sample_post link recipe line"
     cat "$SP9C_POS_BUILD_LOG" >&2
   fi
   SP9C_POS_BINDIR="$(env EXTRA_LDFLAGS='-Wl,-rpath,/usr/lib -L/usr/lib' make -s BACKEND=ne10 OBJ_ROOT="$SP9C_POS_OBJ_ROOT" BIN_ROOT="$SP9C_POS_BIN_ROOT" print-bin-dir)"
   SP9C_POS_RUN_LOG="$SCRATCH_ROOT/tmp/sp9c_positive_run.log"
-  if "$SP9C_POS_BINDIR/test_se_common" >"$SP9C_POS_RUN_LOG" 2>&1 && grep -q "^ALL PASS$" "$SP9C_POS_RUN_LOG"; then
-    pass "SP-S9c: test_se_common (built with the real rpath/library-path link flag) RUNS to ALL PASS"
+  if "$SP9C_POS_BINDIR/test_mcab_sample_post" >"$SP9C_POS_RUN_LOG" 2>&1 && grep -q "^ALL PASS$" "$SP9C_POS_RUN_LOG"; then
+    pass "SP-S9c: test_mcab_sample_post (built with the real rpath/library-path link flag) RUNS to ALL PASS"
   else
-    fail "SP-S9c: test_se_common (built with the real rpath/library-path link flag) did not run to ALL PASS"
+    fail "SP-S9c: test_mcab_sample_post (built with the real rpath/library-path link flag) did not run to ALL PASS"
     cat "$SP9C_POS_RUN_LOG" >&2
   fi
 else

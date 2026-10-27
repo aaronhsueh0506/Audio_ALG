@@ -159,7 +159,8 @@ def _capture_fixed_batches(model, params, files, batch_wrapper, batches):
             state = single.initial_inputs()[2:]
             used = False
             for erb_window, spec_window in zip(
-                    feature_windows(erb), feature_windows(spec)):
+                    feature_windows(erb, model.mask_lookahead),
+                    feature_windows(spec, model.mask_lookahead)):
                 inputs = (erb_window, spec_window) + state
                 # Clone before the next invocation.  These snapshots are
                 # independent calibration lanes even if they came from
@@ -251,6 +252,11 @@ def calibration_main(args):
         'win_len': params['WIN_LEN'],
         'hop_len': params['HOP_LEN'],
         'input_feature_frames': INPUT_FRAMES,
+        # The pair the windows below were captured for (the graph's metadata
+        # carries it too): a calibration artifact is only valid for a host
+        # built with the same pair.
+        'mask_lookahead': graph_metadata['mask_lookahead'],
+        'df_lookahead': graph_metadata['df_lookahead'],
         # calibration_io calls the leading axis "frames"; here one entry is
         # one NPU invocation containing batch_size independent frame states.
         'frames': produced,

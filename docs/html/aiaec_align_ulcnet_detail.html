@@ -56,7 +56,7 @@ D 不改權重；checkpoint 與 dataset 不因 layout 而需要重新訓練或�
 <code>test_ulcnet_prepost_c.py</code> 的 <code>equiv</code> 案例逐 hop memcmp 釘住這件事
 （400 hop，真的跑 0/2/1 排程），所以是<b>實測</b>；hop 0 的 centered 排程 0 幀，兩者<b>自第二個
 hop 起</b>對得起來。<b>排程由建立 <code>AcStft</code> 時的 <code>center</code> 決定</b>，同一個物件不會混用兩種排程。
-centered（<code>center</code> 1）<b>沒有出貨 pipeline 使用</b>：<code>pipelines/samples/ulcnet_nn_stage.c</code>
+centered（<code>center</code> 1）<b>沒有出貨 pipeline 使用</b>：<code>pipelines/ulcnet/ulcnet_nn_stage.c</code>
 （mono 與 4ch 範例共用）以 <code>center</code> 0 的 <code>AcStft</code> 呼叫
 <code>ac_stft_push_planar()</code>；只剩上述 parity 測試還在用 <code>center</code> 1 當比對基準。</p>
 

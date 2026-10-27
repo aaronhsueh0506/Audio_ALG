@@ -109,11 +109,13 @@ int dfn2_model_io_push_features(DFN2ModelIOState *state,
                                 const float erb[DFN2_N_ERB],
                                 const float spec[2][DFN2_DF_BINS])
 {
+    DFN2_REQUIRE_LOOKAHEAD_PAIR_LINK();
     if (state == NULL || erb == NULL || spec == NULL) return -1;
     dfn2_model_io_push_erb_window(state->erb_window, erb);
     dfn2_model_io_push_spec_window(state->spec_window, spec);
-    if (state->feature_frames_seen < 2U) ++state->feature_frames_seen;
-    return state->feature_frames_seen == 2U ? 1 : 0;
+    if (state->feature_frames_seen < DFN2_MODEL_READY_FRAMES)
+        ++state->feature_frames_seen;
+    return state->feature_frames_seen == DFN2_MODEL_READY_FRAMES ? 1 : 0;
 }
 
 int dfn2_model_io_validate_state(DFN2ModelIOState *state)

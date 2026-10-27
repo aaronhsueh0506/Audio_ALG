@@ -3,7 +3,7 @@ Navigation: [Index](README.md) | [Previous part](README_01_latency_call_flow.md)
 
 ```bash
 # From Audio_ALG/pipelines/ — builds component libs and mono applications
-make                # aec_nr_pipeline, static variant, mono_alignulcnet, mono_aec_dfn_res
+make                # aec_nr_pipeline, aec_nr_pipeline_static, mono_alignulcnet, mono_aec_dfn_res, libaudio_pipeline_dfn.a
 make SIMD=0         # one switch: examples + AEC + NR + audiolib all scalar
 
 # SIMD=0 and SIMD=1 outputs are not bit-identical end to end (see the note below).
@@ -14,29 +14,33 @@ make SIMD=0         # one switch: examples + AEC + NR + audiolib all scalar
 # dist/<backend>/current/ handoff path.
 BIN="$(make -s print-bin-dir)"
 
-# Run Version A (malloc)
+# Run Version A (split pool: the AEC block and a post-stage block)
 "$BIN"/aec_nr_pipeline mic.wav ref.wav output.wav balanced
 "$BIN"/aec_nr_pipeline mic.wav ref.wav output.wav --aec-only
 "$BIN"/aec_nr_pipeline mic.wav ref.wav output.wav aggressive --nr-preset aggressive
 
-# Run Version B (static memory) — same CLI, plus a mem-size query mode
+# Run Version B (one caller pool) — same CLI, plus a mem-size query mode
 "$BIN"/aec_nr_pipeline_static mic.wav ref.wav output.wav balanced
 "$BIN"/aec_nr_pipeline_static --print-mem-size --sample-rate 16000
 
 # Mono chain test (the examples' pool carve vs heap, reset, switches, comfort noise, and both
 # mono programs run as black boxes against the hand-written oracle
 # mono_aec_nr_res/tests/conv_chain_mono.h; mono_aec_nr_res/tests/test_mono_chain.c)
-# plus the example_board_adapter smoke test (see "Board Integration" below).
+# plus the example_board_adapter smoke test (see "Board Integration" below), the DFN2 and
+# ULCNet stage tests and the mono DFN2 / ULCNet programs.
 # Four-channel tests live in 4ch_aec_bf_nr_res/Makefile.
 make test
 
-# Build/test the four application packages.
+# Build/test the application packages.
 make -C mono_aec_nr_res SIMD=0 test
-make -C mono_alignulcnet SIMD=0 test
+make -C ulcnet/mono_alignulcnet SIMD=0 test
+make -C dfn/mono_aec_dfn_res SIMD=0 test
 make -C 4ch_aec_bf_nr_res SIMD=0 test
-make -C 4ch_alignulcnet SIMD=0 test
-make -C 4ch_aec_bf_nr_res 4aec_nr_res_static
-make -C 4ch_aec_bf_nr_res audio_pipeline_4ch_raw
+make -C ulcnet/4ch_alignulcnet SIMD=0 test
+make -C dfn/4ch_aec_bf_dfn_res SIMD=0 test
+make -C 4ch_aec_bf_nr_res mcab_external_static
+make -C 4ch_aec_bf_nr_res mcab_raw
+make -C 4ch_aec_bf_nr_res mcab_static
 
 # Build + run JUST the REFERENCE ONLY board-adapter example standalone
 # (also runs as part of `make test` above):
@@ -46,6 +50,14 @@ make example-adapter
 # forbid the stdio symbol set), and audit that it holds:
 make NO_STDIO=1 libaudio_pipeline_dfn.a
 make audit-no-stdio
+
+# A DeepFilterNet2 lookahead pair other than the default 1/1 (see "DFN lookahead pair" below),
+# and the DFN C tests rebuilt and run per pair:
+make DFN2_MASK_LOOKAHEAD=2 DFN2_DF_LOOKAHEAD=4 libaudio_pipeline_dfn.a mono_aec_dfn_res
+make test-pairs DFN_TEST_PAIRS="0/0 2/4"
+
+# Python twin (module paths are relative to the Audio_ALG root):
+(cd .. && python3 -m pipelines.mono_aec_nr_res.pipeline --mic mic.wav --ref ref.wav --output out.wav --nr-preset balanced)
 ```
 
 > **SIMD=0 and SIMD=1 are not bit-identical end to end, by design.** Each shared
@@ -56,29 +68,51 @@ make audit-no-stdio
 > configurations only finite output, the same delay winner/state and a quality
 > tolerance hold; do not gate a release on cross-SIMD WAV equality.
 
+The Python twins sit beside their applications: `mono_aec_nr_res/pipeline.py`, `4ch_aec_bf_nr_res/pipeline.py`
+(`McabPipeline`, `McabFrame`, `mcab_apply_lane_contract()`, `mcab_lane_config()`), `dfn/dfn2_stage.py`,
+`dfn/dfn2_rate_adapter.py`, `dfn/mono_aec_dfn_res/pipeline.py`, `dfn/4ch_aec_bf_dfn_res/pipeline.py` and
+`common/cng_aec3.py` (module paths `pipelines.<folder>.<module>`). Python and C agree for the default settings; the documented
+differences S-02 (AEC live observer guard) and S-13 (NR make-up prior) exist only when those default-off features are enabled,
+so do not read the twins as identical for every setting (`docs/c_python_function_map.md`, `make pyc-parity`; the two differences are defined in `lib/aec/c_impl/test/pyc_parity/pyc_parity.py` and `lib/nr/docs/c_python_function_map.md`).
+
+**DFN lookahead pair.** The DeepFilterNet2/3 model lookahead is a build-time pair: mask `M` in 0..2 and deep-filter
+`D` in 0..4 (15 legal pairs, no ordering rule between them; `AINR/README.md`, "Lookahead pairs"). The exported graph does
+not depend on the pair, but a checkpoint is tied to the pair it was trained for, and only the shipped 1/1 has one: the
+audio quality of every other pair is unmeasured. `Makefile` takes `DFN2_MASK_LOOKAHEAD` and `DFN2_DF_LOOKAHEAD` (and
+`DFN3_MASK_LOOKAHEAD`, `DFN3_DF_LOOKAHEAD`), default 1/1, each a single decimal in range. A pair other than 1/1 is
+forwarded as `-DDFN2_MASK_LOOKAHEAD=<M> -DDFN2_DF_LOOKAHEAD=<D>` to every unit and is part of the build signature: it gets
+its own `bin/` and `obj/` directories, and units built for different pairs fail to link (pair symbol
+`dfn2_lookahead_mask<M>_df<D>`). `4ch_aec_bf_nr_res/Makefile` takes the same two DFN2 variables. The DFN2 stage delays its
+output by `M + D` frames of 48 kHz; the rate bridge adds `dfn_rate_bridge_added_delay_samples()` native samples, which grow
+with `M + D` (shipped pair: 672, 629 and 330 samples at 16 kHz hop 128, 16 kHz hop 256 and 8 kHz hop 128). `make test-pairs`
+rebuilds and runs the DFN C tests and the mono DFN2 program for each pair of `DFN_TEST_PAIRS` (default `0/0 0/1 2/0 2/4`); the
+other pairs are not exercised by it.
+
 `make` builds the mono executables and the DFN2 stage archive. There is no mono
-library archive: the mono examples link `common/se_config.o` and the producer
-libraries (`libaec.a`, `libanr.a`, `libaudio_common.a`) directly and carry their
-per-hop chain in their own sources. `4ch_aec_bf_nr_res/libaudio_pipeline_4ch.a` holds the shared
-linear core (`4aec_nr_res.o`), the unit (`audio_pipeline_4ch.o`) and
-`common/`'s `se_config.o`; `audit-no-stdio` covers it for the 4-channel build. The example
-programs (`audio_pipeline_4ch_raw`, `audio_pipeline_4ch_static`, `4aec_nr_res_static`,
-`4ch_aec_bf_dfn_res`, `4ch_alignulcnet`) link the archive and the example headers or objects
-of `samples/`. The unit carries no RES: every 4-channel example that has a RES (all but `4ch_alignulcnet`, which runs
-with `core.enable_post = 0` and has none) builds its own `AecRes` after it
-(`aec_res_init()`), `4aec_nr_res_static` on the core. `four_aec_nr_res_create()` is the heap convenience
-path, while `four_aec_nr_res_get_mem_requirements()` +
-`four_aec_nr_res_init_ex()` place the complete four-AEC/FFT/shared-aligner
-state in one caller-owned 16-byte-aligned pool; the unit does the same with
-`audio_pipeline_4ch_get_mem_requirements()` + `audio_pipeline_4ch_init_ex()`. Both construction
-paths share the same allocation-free processing core and are byte-parity tested
-at 16 and 48 kHz. See [`4ch_aec_bf_nr_res/README.md`](4ch_aec_bf_nr_res/README.md) and
-`4aec_nr_res_static` for the directly comparable board sequence.
+library archive: the mono examples link the producer libraries (`libaec.a`, `libanr.a`,
+`libaudio_common.a`) directly and carry their grid derivation and per-hop chain in their own
+sources. `4ch_aec_bf_nr_res/libaudio_pipeline_mcab.a` holds
+`mcab.o` only (the flow). The sample objects `mcab_sample_flow.o`
+and `mcab_sample_beam.o` (the application-side init and the SRP-PHAT/BF helper) are not in it
+either; `audit-no-stdio` (run there with `NO_STDIO=1`) covers the archive, the DFN archive, the
+producers and those two objects. The example programs (`mcab_raw`, `mcab_static`,
+`mcab_external_static`, `4ch_aec_bf_dfn_res`, `4ch_alignulcnet`) link the archive and the
+example headers or objects. `Mcab` carries no RES: every 4-channel example that has a RES (all
+but `4ch_alignulcnet`, which runs with `enable_post = 0` and has none) builds its own `AecRes`
+(`aec_res_init()`). The four lanes and the shared estimator are likewise built by the
+application with `aec_init()` and `delay_aec_init()` and passed to `mcab_init_ex()` by pointer;
+`mcab_create()` is only the heap convenience for mcab's own pool, while
+`mcab_get_mem_requirements()` + `mcab_init_ex()` place the flow state in one caller-owned
+16-byte-aligned pool. Both paths share the same allocation-free processing code;
+`4ch_aec_bf_nr_res/tests/test_mcab.c` checks the pooled flow at 16 kHz/256, 16 kHz/512 and
+48 kHz/1024 over four pool placements and four fill patterns. See
+[`4ch_aec_bf_nr_res/README.md`](4ch_aec_bf_nr_res/README.md) and `mcab_external_static.c` for the
+directly comparable board sequence.
 
 ## Debugging & Performance Flags
 
 `aec_nr_pipeline` and `aec_nr_pipeline_static` support the same debug CLI
-options (mirrored, byte-for-byte identical wiring in both binaries): `--debug`
+options (one source file, `mono_aec_nr_res/main.c`, builds both binaries): `--debug`
 for the periodic AEC+NR status line, and `--timing` for a per-stage cost
 summary printed once at exit.
 
@@ -98,8 +132,8 @@ the report says so in words rather than printing a table of zeros.
 `CLOCK_MONOTONIC` is POSIX rather than C99. A target whose libc lacks it names
 its own microsecond timer for lib/aec instead — `make PROFILE=1
 EXTRA_CFLAGS='-DAEC_NOW_US=board_timer_us -include my_timer.h'`, a plain
-identifier because these Makefiles reject parentheses in `EXTRA_CFLAGS`. The 4-channel
-core has its own override (`-DFOUR_AEC_NR_RES_NOW_US=...`), so a build names one timer per
+identifier because these Makefiles reject parentheses in `EXTRA_CFLAGS`. `mcab`
+has its own override (`-DMCAB_NOW_US=...`), so a build names one timer per
 component it actually builds. A substitute that returns a constant keeps the flag on
 and reads 0, which `--timing` cannot distinguish from a build without it. The example
 programs read their own clock in `timing_now_us()` (`mono_aec_nr_res/main.c`).
@@ -142,13 +176,18 @@ The pipelines in this directory leave it at `0`.
 
 ## Two Versions
 
-### Version A: malloc (`mono_aec_nr_res/main.c`)
-Each library block (the `Aec`, the denoiser with its synthesis and gain buffers) is allocated on the
-heap with `posix_memalign()` at the size its own `*_get_mem_size()` query returned, then initialised
-with the same `aec_init()` / `anr_init()` / `ac_istft_init()` calls as Version B; `rig_free()` releases
-the blocks after `anr_destroy()` / `aec_destroy()`. Suitable for desktop testing and Linux servers.
+One source file, `mono_aec_nr_res/main.c`, builds both binaries; they differ only in how the
+stages are placed in memory. The `Aec`, the denoiser and the synthesis are initialised with the same
+`aec_init()` / `anr_init()` / `ac_istft_init()` calls in both.
 
-### Version B: static memory (`mono_aec_nr_res/static_main.c`)
+### Version A: split pool (`aec_nr_pipeline`)
+Built with `-DAEC_NR_POOL_SPLIT=1`. Two blocks, each allocated with `posix_memalign()` at the size
+the libraries' `*_get_mem_size()` queries returned: the `Aec`, and one block for the post stages
+(denoiser, synthesis, gain and spectrum buffers); `rig_free()` releases them after
+`anr_destroy()` / `aec_destroy()`. Suitable for desktop testing and Linux servers. It has no
+`--print-mem-size`.
+
+### Version B: one caller pool (`aec_nr_pipeline_static`)
 
 Built by default alongside Version A. One caller-owned pool, no malloc after
 init; its output equals Version A's (see [Verification](README_03_tuning_troubleshooting.md#verification) below). With NE10
@@ -161,15 +200,16 @@ allocation ever, end to end, not just on the per-hop audio path.
 
 ## Board Integration
 
-沒有 mono 函式庫 TU：板端自己用 `se_derive()` 導出 grid 與 `AecConfig`，查
+沒有 mono 函式庫 TU：板端自己用 `aec_resolve_signal_grid()` 與 `aec_config_from_preset()` 導出 grid 與 `AecConfig`
+（再設接縫欄位 `enable_res = 0`、`return_res_context = 1` 等），查
 `aec_get_mem_size()`、`anr_get_mem_size()` 與 `ac_istft_get_mem_size()`，加上每 hop 的
 增益／頻譜緩衝，把各塊切在自己的 pool 裡，再逐個 `init`
-（`mono_aec_nr_res/static_main.c` 的 `post_plan()` / `pool_bytes()` / `rig_build()` 就是這段
-的最小寫法；每 hop 的串接寫在該檔的 `mono_form()`，可整段複製改寫）。唯一帶 descriptor 的單元是 4ch
-的 `AudioPipeline4Ch`（`audio_pipeline_4ch_get_mem_requirements()` →
-`audio_pipeline_4ch_init_ex()`；後波束 `AecRes` 不在它的 pool 內），其餘函式庫（`Aec`、
-`AnrDenoiser`、`AcIstft`、`DfnResStage`、`DfnRateBridge`，以及 4ch 應用在單元之後自備的
-`AecRes`）各有自己的 `*_mem_size` 與 `init`，整合者自己加總。
+（`mono_aec_nr_res/main.c` 的 `derive_lane()` / `post_plan()` / `pool_bytes()` / `rig_build()` 就是這段
+的最小寫法；每 hop 的串接寫在該檔的 `mono_form()`，可整段複製改寫）。帶 descriptor 的物件是 4ch
+的 flow 層 `Mcab`（`mcab_get_mem_requirements()` → `mcab_init_ex()`；它只涵蓋 mcab 自己的 pool，四條
+`Aec` lane、共用 `DelayAec`、後波束 `AecRes` 都不在內）以及 DFN2 的 stage／bridge，其餘函式庫
+（`Aec`、`AnrDenoiser`、`AcIstft`、`DfnResStage`、`DfnRateBridge`，以及 4ch 應用自備的 lane、
+estimator 與 `AecRes`）各有自己的 `*_mem_size` 與 `init`，整合者自己加總。
 
 [`example_board_adapter.c`](mono_aec_nr_res/example_board_adapter.c) 是這個順序的可編譯、
 可執行的 HOST 模擬（`make example-adapter`，也接進 `make test`）：pool 計畫（AEC、

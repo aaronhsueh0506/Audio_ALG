@@ -25,11 +25,11 @@ from scipy import signal
 from lib.aec.python.modules.config import AecConfig
 from . import (
     EqualWeightBeamformer,
-    FourChannelAecConfig,
-    FourChannelAecPipeline,
+    McabConfig,
+    McabPipeline,
     PostBeamResidualSuppressor,
 )
-from pipelines.aec_nr_pipeline import run_nr_spectrum, run_res
+from pipelines.mono_aec_nr_res.pipeline import run_nr_spectrum, run_res
 
 
 # ---------------------------------------------------------------------------
@@ -113,11 +113,11 @@ def evaluate_case(case_dir: Path, output_dir: Optional[Path] = None) -> dict:
     far_aligned = place_on_timeline(far[:, 0], fixture_lag, microphones.shape[0])
     near_aligned = place_on_timeline(near[:, 0], near_lag, microphones.shape[0])
 
-    config = FourChannelAecConfig(sample_rate=sample_rate)
+    config = McabConfig(sample_rate=sample_rate)
     # Explicit fixture adapter. Production leaves the beamformer unset and
-    # drives front_process()/fuse() around the
+    # drives process_front()/fuse() around the
     # externally owned SRP-PHAT/BF implementation.
-    pipeline = FourChannelAecPipeline(config)
+    pipeline = McabPipeline(config)
     # The one post-beam RES lives in the evaluator: fuse() leaves res_gain None.
     suppressors = [
         PostBeamResidualSuppressor(sample_rate, pipeline.hop_size, pipeline.n_freqs)
@@ -130,7 +130,7 @@ def evaluate_case(case_dir: Path, output_dir: Optional[Path] = None) -> dict:
     for frame_index in range(n_complete):
         start = frame_index * pipeline.hop_size
         stop = start + pipeline.hop_size
-        pre = pipeline.front_process(
+        pre = pipeline.process_front(
             microphones[start:stop], far_aligned[start:stop]
         )
         # Deliberately cross the same ownership seam the external algorithm

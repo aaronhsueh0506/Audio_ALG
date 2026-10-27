@@ -12,23 +12,30 @@ only. Two groups of contract:
   mid-stream swap leaves the rows already in the graph window untouched, and a
   refused call (NULL argument, or a frame still open) changes nothing.
 
+Everything runs for every pair in ``dfn_pairs.c_build_pairs``, each its own
+build of the C host (-DDFN3_MASK_LOOKAHEAD, -DDFN3_DF_LOOKAHEAD; the shipped
+pair is the build with no override): the first ``mask_lookahead`` hops only
+fill the graph window, and the first output comes ``max(mask, df)`` hops in.
+
 Comparisons between instances are ``tobytes()`` equality, never a tolerance, on
 both halves of the pair: the forward matrix through the ERB feature window and
 the inverse matrix through the enhanced spectrum.
 """
 import ctypes
 from pathlib import Path
-import shutil
 import subprocess
 import sys
 
 import numpy as np
 import pytest
 
-AINR = Path(__file__).resolve().parents[1]
-ROOT = AINR.parent.parent
-AC = ROOT / 'audiolib' / 'common'
-DFN = AINR / 'DeepFilterNet3'
+import dfn_pairs
+
+FAMILY = 'DeepFilterNet3'
+DFN = dfn_pairs.family_dir(FAMILY)
+
+LOOKAHEAD_PAIRS = dfn_pairs.c_build_pairs(FAMILY)
+SHIPPED_PAIR = dfn_pairs.shipped_pair(FAMILY)
 
 HOP = 512
 BINS = 513
@@ -36,7 +43,7 @@ N_ERB = 32
 FRAMES_IN_WINDOW = 3
 IO_FREQ = 0
 IO_TIME = 1
-SOURCES = ('dfn3_prepost.c', 'dfn3_process.c', 'dfn3_model_io.c')
+SOURCES = ('prepost', 'process', 'model_io')
 
 # The shipped 48 kHz / 1024-point ERB band borders (N_ERB + 0 entries; the
 # last border is the bin count).
@@ -113,29 +120,25 @@ def _erb_pair(reverse_bands=False):
     return np.ascontiguousarray(fwd), np.ascontiguousarray(inv)
 
 
-@pytest.fixture(scope='module', params=[0, 1], ids=['scalar', 'simd'])
+@pytest.fixture(scope='module', params=[
+    (simd, pair) for pair in LOOKAHEAD_PAIRS for simd in (0, 1)],
+    ids=lambda case: ('simd' if case[0] else 'scalar') + (
+        '' if case[1] == SHIPPED_PAIR else '-' + dfn_pairs.pair_id(case[1])))
 def lib(request, tmp_path_factory):
-    cc = shutil.which('cc')
-    if cc is None or shutil.which('make') is None:
-        pytest.skip('C build tools unavailable')
-    simd = request.param
-    make = ['make', '-s', '-C', str(AC), 'BACKEND=ne10', f'SIMD={simd}']
-    subprocess.run(make + ['lib'], check=True, capture_output=True)
-    archive = subprocess.run(make + ['print-lib-path'], check=True,
-                             capture_output=True, text=True
-                             ).stdout.strip().splitlines()[-1]
-    work = tmp_path_factory.mktemp(f'dfn3_prepost_{simd}')
-    flags = [cc, '-O2', '-std=c11', '-Wall', '-Wextra', '-Wpedantic',
-             '-Werror', '-ffp-contract=off', '-fno-math-errno',
-             '-I', str(AINR), '-I', str(DFN),
-             '-I', str(AC / 'include'), '-I', str(AC)]
-    if not simd:
-        flags += ['-DSIMD_KERNELS_FORCE_SCALAR']
+    reason = dfn_pairs.require_toolchain()
+    if reason:
+        pytest.skip(reason)
+    simd, pair = request.param
+    archive = dfn_pairs.audio_common_lib(simd)
+    work = tmp_path_factory.mktemp(f'dfn3_prepost_{simd}_{pair[0]}{pair[1]}')
+    flags = ['cc', *dfn_pairs.house_cflags(simd),
+             *dfn_pairs.defines(FAMILY, pair)]
     library = work / ('dfn3_prepost.dylib' if sys.platform == 'darwin'
                       else 'dfn3_prepost.so')
     subprocess.run(flags + ['-dynamiclib' if sys.platform == 'darwin'
                             else '-shared', '-fPIC']
-                   + [str(DFN / name) for name in SOURCES]
+                   + [str(dfn_pairs.source_path(FAMILY, kind))
+                      for kind in SOURCES]
                    + [archive, '-lm', '-o', str(library)],
                    check=True, capture_output=True)
     dll = ctypes.CDLL(str(library))
@@ -166,6 +169,11 @@ def lib(request, tmp_path_factory):
     dll.dfn3_prepost_post_process_freq.argtypes = [
         vp, _FP, _FP, ctypes.POINTER(ci)]
     dll.dfn3_prepost_post_process_freq.restype = ci
+    dll.dfn3_prepost_output_frame_index.argtypes = [
+        vp, ctypes.POINTER(ctypes.c_longlong)]
+    dll.dfn3_prepost_output_frame_index.restype = ci
+    dll.mask_lookahead, dll.df_lookahead = pair
+    dll.output_delay = max(pair)
     return dll
 
 
@@ -302,6 +310,37 @@ def test_accessors_do_not_change_with_stream_state(lib, pair_a):
         inst.close()
 
 
+def test_warm_up_is_the_lookahead_and_the_window_is_zero_padded(lib, pair_a):
+    """Hop t opens a frame iff t >= mask_lookahead; the first window holds
+    frames [-(2-mask) .. mask], the frames before the stream start being zero
+    rows; the first output is source frame 0, so the delay is
+    max(mask, df) hops."""
+    mask, delay = lib.mask_lookahead, lib.output_delay
+    inst = _Instance(lib, *pair_a)
+    try:
+        re, im = _spectra(delay + 5)
+        trace = _run(inst, re, im)
+        for t, (window, valid, _re, _im) in enumerate(trace):
+            assert (window is not None) == (t >= mask), t
+            assert valid == int(t >= delay), t
+        rows = np.frombuffer(trace[mask][0], np.float32).reshape(
+            FRAMES_IN_WINDOW, N_ERB)
+        pad = FRAMES_IN_WINDOW - 1 - mask
+        assert not rows[:pad].any()
+        assert rows[pad:].any(axis=1).all()
+        # The newest row moves one frame per hop: the window of the next head
+        # drops its oldest row and keeps the other two.
+        later = np.frombuffer(trace[mask + 1][0], np.float32).reshape(
+            FRAMES_IN_WINDOW, N_ERB)
+        assert later[:-1].tobytes() == rows[1:].tobytes()
+        frame = ctypes.c_longlong(-1)
+        assert lib.dfn3_prepost_output_frame_index(
+            inst.handle, ctypes.byref(frame)) == 0
+        assert frame.value == len(trace) - 1 - delay
+    finally:
+        inst.close()
+
+
 def test_accessors_answer_minus_one_for_a_null_instance(lib):
     assert lib.dfn3_prepost_hop_size(None) == -1
     assert lib.dfn3_prepost_num_bins(None) == -1
@@ -386,13 +425,15 @@ def test_swap_is_refused_while_a_frame_is_open_and_accepted_after(
     control = _Instance(lib, *pair_a)
     probed = _Instance(lib, *pair_a)
     try:
-        expected = _run(control, re, im, last=3)
+        first = lib.mask_lookahead          # hops before the first open frame
+        expected = _run(control, re, im, last=first + 2)
         fwd_b, inv_b = pair_b
 
-        probed.hop(re[0], im[0])            # left warm-up: no frame is opened
-        assert probed.pre(re[1], im[1]) == 1
-        window, outputs = probed.erb_window()          # frame 1 is open
-        assert window.tobytes() == expected[1][0]
+        for t in range(first):              # left warm-up: no frame is opened
+            probed.hop(re[t], im[t])
+        assert probed.pre(re[first], im[first]) == 1
+        window, outputs = probed.erb_window()          # first frame is open
+        assert window.tobytes() == expected[first][0]
         assert lib.dfn3_prepost_set_erb_matrices(
             probed.handle, _fp(fwd_b), _fp(inv_b)) == -1
         if close_with == 'commit':
@@ -407,11 +448,11 @@ def test_swap_is_refused_while_a_frame_is_open_and_accepted_after(
         probed.fwd, probed.inv = pair_b
         # ... and the next hop's newest feature row comes from the new pair,
         # while the two older rows were already computed and stay.
-        assert probed.pre(re[2], im[2]) == 1
+        assert probed.pre(re[first + 1], im[first + 1]) == 1
         window2, _ = probed.erb_window()
         rows_new = np.frombuffer(window2, np.float32).reshape(
             FRAMES_IN_WINDOW, N_ERB)
-        rows_old = np.frombuffer(expected[2][0], np.float32).reshape(
+        rows_old = np.frombuffer(expected[first + 1][0], np.float32).reshape(
             FRAMES_IN_WINDOW, N_ERB)
         assert rows_new[:-1].tobytes() == rows_old[:-1].tobytes()
         assert rows_new[-1].tobytes() != rows_old[-1].tobytes()

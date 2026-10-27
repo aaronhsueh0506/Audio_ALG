@@ -7,7 +7,7 @@
 numpy
 scipy          # 4ch recording evaluator and evaluation/resampling tools
 soundfile      # WAV I/O
-PyYAML         # aec_nr_pipeline.py's load_config() -> lib/nr/python/process_audio.py reads v3_2_config.yaml
+PyYAML         # mono_aec_nr_res/pipeline.py's load_config() -> lib/nr/python/process_audio.py reads v3_2_config.yaml
 
 # --- dev / test only ---
 pytest

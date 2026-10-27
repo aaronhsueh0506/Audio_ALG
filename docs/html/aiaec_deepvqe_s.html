@@ -124,7 +124,7 @@ runtime 把 <code>*_out</code> 綁到輸入位址（<code>state_out[id]</code> �
 <b>第一次 push 起每次恰一幀</b>。它與 <code>center</code> 1（centered）對同一個 hop
 吐出的<b>最後一幀位元相同</b>（同一個幾何：win = n_fft、hop = n_fft/2、共用同一張 sqrt-Hann 表；
 centered 只是在開頭多發一幀 reflect 前綴），所以這是<b>換標籤不是換訊號</b>，也讓類別和
-center=False 的 AEC seam 與 4ch 單元輸出頻譜對得上。<b>演算法延遲仍是 1 個 hop</b>：它來自 synthesis 的
+center=False 的 AEC seam 與 4ch 的 <code>mcab_fuse()</code> 融合頻譜對得上。<b>演算法延遲仍是 1 個 hop</b>：它來自 synthesis 的
 半窗 trim，不是分析排程。</p>
 <p><b>Pool</b>（<code>deepvqe_prepost_get_mem_size</code>，16 kHz、D=32）：
 <code>DEEPVQE_IO_TIME</code> <b>637,072 B</b>、<code>DEEPVQE_IO_FREQ</code> <b>615,280 B</b>

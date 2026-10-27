@@ -1,8 +1,9 @@
 /**
  * tests/test_mono_chain.c -- acceptance tests of the mono AEC -> NR -> RES chain as the example
- * programs compose it: lib/aec's Aec (its own RES gain), se_frame_from_aec(), lib/nr's denoiser
- * through samples/se_anr_stage.h, min / apply / comfort noise / synthesis written out per hop.
- * The pool plan and hop of static_main.c (AEC, denoiser, synthesis, buffers in one aligned
+ * programs compose it: lib/aec's Aec (its own RES gain) read through aec_get_res_context(),
+ * lib/nr's denoiser through anr_process_gain(), min / apply / comfort noise / synthesis written
+ * out per hop.
+ * The pool plan and hop of main.c (AEC, denoiser, synthesis, buffers in one aligned
  * block) are repeated here and tested: the pooled instance behaves exactly like the heap one,
  * reset restores a fresh instance, the switches route what they claim to, comfort noise obeys
  * its contract, and the chain equals the hand-written oracle of conv_chain_mono.h bit for bit.
@@ -18,9 +19,6 @@
 #include "aec_res.h"               /* aec_cng_fill */
 #include "anr.h"
 #include "audio_stft.h"
-#include "common/se_config.h"
-#include "common/se_stage.h"
-#include "samples/se_anr_stage.h"
 #include "utility/simd_kernels.h"
 #include "wav_io.h"
 #include "conv_chain_mono.h"
@@ -80,13 +78,17 @@ static float lcg_sample(void) {
 }
 
 /* ---------------------------------------------------------------------------------------
- * The pool plan and hop of the example programs (static_main.c): the lane derived by se_derive,
+ * The pool plan and hop of the example programs (main.c): the lane composed from the preset,
  * one block holding the AEC, the denoiser, the synthesis and the gain/spectrum buffers.
  * --------------------------------------------------------------------------------------- */
 
+#define CNG_NR_GAIN_FLOOR 0.31622777f
+#define CNG_RNG_SEED 0x9e3779b9u
+#define PSD_SCALE_INV (1.0f / (32768.0f * 32768.0f))   /* int16^2 -> audio scale, exact */
+
 typedef struct Plan {
     ConvMonoConfig opt;
-    SeGrid grid;
+    AecSignalGrid grid;
     AecConfig aec_cfg;
     AnrConfig nr_cfg;
     AcStftConfig synth_cfg;
@@ -100,18 +102,25 @@ static ConvMonoConfig grid_opts(int sr, int fft_size) {
 
 /* 0, or -1 when the lane or a stage refuses the request. */
 static int plan_make(Plan* p, const ConvMonoConfig* o) {
-    static const SeRules rules = { .allow_8k = 1, .spatial_context = SE_CONTEXT_PRESET };
-    SeRequest req;
     memset(p, 0, sizeof(*p));
     p->opt = *o;
-    memset(&req, 0, sizeof(req));
-    req.sample_rate = o->sample_rate;
-    req.fft_size = o->fft_size;
-    req.delay_mode = o->delay_mode;
-    req.delay_num_filters = o->delay_num_filters;
-    req.fixed_delay_samples = o->fixed_delay_samples;
-    req.aec_preset = o->aec_preset;
-    if (se_derive(&req, &rules, &p->grid, &p->aec_cfg) != 0) return -1;
+    if (!aec_resolve_signal_grid(o->sample_rate,
+                                 o->fft_size ? o->fft_size : aec_default_fft_size(o->sample_rate),
+                                 &p->grid))
+        return -1;
+    /* The CLI maps unknown names to balanced; an out-of-enum value is this harness's own refusal
+     * (aec_config_from_preset would fall back to balanced). */
+    if (o->aec_preset != AEC_PRESET_MILD && o->aec_preset != AEC_PRESET_BALANCED &&
+        o->aec_preset != AEC_PRESET_AGGRESSIVE && o->aec_preset != AEC_PRESET_NO_FLOOR)
+        return -1;
+    aec_config_from_preset(&p->aec_cfg, o->aec_preset, o->sample_rate);
+    p->aec_cfg.fft_size = p->grid.fft_size;
+    p->aec_cfg.delay_mode = o->delay_mode;
+    p->aec_cfg.delay_num_filters = o->delay_num_filters;
+    p->aec_cfg.fixed_delay_samples = o->fixed_delay_samples;
+    p->aec_cfg.enable_delay_est = o->delay_mode == AEC_DELAY_MATCHED;
+    p->aec_cfg.enable_res = 0;
+    p->aec_cfg.return_res_context = 1;
     p->aec_bytes = aec_get_mem_size(&p->aec_cfg);
     if (p->aec_bytes == 0) return -1;
     p->total = ALIGN16(p->aec_bytes);
@@ -168,7 +177,7 @@ static int rig_carve_post(Rig* r, uint8_t* cur, const Plan* p) {
     r->extra_noise = (float*)cur; cur += vec;
     r->spec = (Complex*)cur;
     for (k = 0; k < r->n_freqs; ++k) r->unity[k] = 1.0f;
-    r->rng = SE_CNG_RNG_SEED;
+    r->rng = CNG_RNG_SEED;
     return 0;
 }
 
@@ -222,10 +231,10 @@ static void rig_destroy_only(Rig* r) {
     if (r->aec) aec_destroy(r->aec);
 }
 
-/* The hop of static_main.c: G_res is the lane's own (frame.g_res_ctx) or unity, G_nr the
+/* The hop of main.c: G_res is the lane's own (ctx.res_gain) or unity, G_nr the
  * denoiser's or unity; P = E * min(G_nr, G_res) plus comfort noise on the bins the RES cut. */
 static int rig_hop(Rig* r, const float* mic, const float* ref, float* out) {
-    SeSpecFrame f;
+    AecResContext c;
     const float* res;
     const float* nr;
     if (!r->with_post) {
@@ -233,15 +242,24 @@ static int rig_hop(Rig* r, const float* mic, const float* ref, float* out) {
         return 0;
     }
     aec_process_context(r->aec, mic, ref);
-    if (se_frame_from_aec(r->aec, &f) != 0) return -1;
-    res = r->with_res ? f.g_res_ctx : r->unity;
+    aec_get_res_context(r->aec, &c);
+    if (!c.error_spec) return -1;
+    res = r->with_res ? c.res_gain : r->unity;
     nr = r->unity;
     if (!res) return -1;
-    if (r->nr && !(nr = se_anr_stage_gain(r->nr, &f, r->extra_noise, r->use_r2))) return -1;
+    if (r->nr) {
+        const float* extra = NULL;
+        if (r->use_r2 && c.r2 && c.usable_linear) {
+            sk_scale_f32(r->extra_noise, c.r2, PSD_SCALE_INV, r->n_freqs);
+            extra = r->extra_noise;
+        }
+        if (anr_process_gain(r->nr, c.error_spec, extra, NULL) != 0) return -1;
+        if (!(nr = anr_get_gain(r->nr, NULL))) return -1;
+    }
     sk_min_f32(r->total_gain, nr, res, r->n_freqs);
-    sk_capply_gain_f32(r->spec, f.e, r->total_gain, r->n_freqs);
-    if (r->enable_cng && r->with_res && f.cn)
-        aec_cng_fill(&r->rng, r->spec, f.cn, res, nr, SE_CNG_NR_GAIN_FLOOR, r->n_freqs);
+    sk_capply_gain_f32(r->spec, c.error_spec, r->total_gain, r->n_freqs);
+    if (r->enable_cng && r->with_res && c.comfort_noise)
+        aec_cng_fill(&r->rng, r->spec, c.comfort_noise, res, nr, CNG_NR_GAIN_FLOOR, r->n_freqs);
     (void)ac_istft_push(r->istft, r->spec, out);
     return 0;
 }
@@ -250,7 +268,7 @@ static void rig_reset(Rig* r) {
     aec_reset(r->aec);
     if (r->nr) anr_reset(r->nr);
     if (r->istft) ac_istft_reset(r->istft);
-    r->rng = SE_CNG_RNG_SEED;
+    r->rng = CNG_RNG_SEED;
 }
 
 static void* aligned_block(size_t bytes, int fill) {
@@ -861,7 +879,7 @@ static void test_comfort_noise_follows_nr_gain(void) {
 }
 
 /* ---- the chain against the hand-written oracle ---------------------------------------
- * The example composition (Aec + se_frame_from_aec + the per-hop chain) must be conv_chain_mono.h
+ * The example composition (Aec + aec_get_res_context + the per-hop chain) must be conv_chain_mono.h
  * with its stages written out: the oracle's output is reproduced bit for bit, comfort noise ON
  * so the fill and its RNG are part of the claim. Every combination of the switches runs on
  * 16 kHz / FFT 256; the other grids run a sample of them. */
@@ -959,7 +977,8 @@ static void test_frame_and_chain_args(void) {
     ConvMonoConfig o = grid_opts(16000, 256);
     Rig r;
     void* pool;
-    SeSpecFrame f;
+    AecResContext c;
+    AecResContext untouched;
     static float mic[128], ref[128], out[128];
 
     if (plan_make(&p, &o) != 0 || !(pool = aligned_block(p.total, 0xA5)) ||
@@ -968,10 +987,13 @@ static void test_frame_and_chain_args(void) {
         return;
     }
     aec_process_context(r.aec, mic, ref);
-    CHECK(se_frame_from_aec(r.aec, &f) == 0 && f.e != NULL && f.g_res_ctx != NULL && f.n_freqs == 129,
-          "args: the frame view of the lane carries the error spectrum and the lane's own gain");
-    CHECK(se_frame_from_aec(NULL, &f) == -1 && se_frame_from_aec(r.aec, NULL) == -1,
-          "args: se_frame_from_aec rejects NULL arguments");
+    aec_get_res_context(r.aec, &c);
+    CHECK(c.error_spec != NULL && c.res_gain != NULL && c.n_freqs == 129,
+          "args: the res context of the lane carries the error spectrum and the lane's own gain");
+    memset(&untouched, 0x5A, sizeof untouched);
+    aec_get_res_context(NULL, &untouched);
+    aec_get_res_context(r.aec, NULL);
+    CHECK(untouched.n_freqs == 0x5A5A5A5A, "args: aec_get_res_context ignores NULL arguments");
     rig_free(&r);
     free(pool);
 

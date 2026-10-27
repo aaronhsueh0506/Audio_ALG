@@ -94,7 +94,7 @@ aec_get_linear_context(aec, &linear);
 
 這些 context 指標借用 AEC 內部記憶體，只能讀到下一次 process/reset。多 lane 共用同一
 far 時，`aec_process_context_shared_far_from()` 可讓其他 lane 借用同 hop 已算好的 far FFT 與 magnitude²；它有嚴格
-same-hop/same-reference 前提，通常只應由 4 通道核心（`pipelines/4ch_aec_bf_nr_res/4aec_nr_res.c`）使用。
+same-hop/same-reference 前提，通常只應由 4 通道 flow（`pipelines/4ch_aec_bf_nr_res/mcab.c`）使用。
 
 ### 3.4 Reset、context 與診斷
 
@@ -154,10 +154,10 @@ int aec_res_split_floor(const AecRes *res, float *live, float *target);
 > 所暗示的量，只量 echo／degradation 的 A/B 會把 CNG 的變化錯記到別的機制。請在
 > echo 對齊或 degradation 對齊的條件下比較，並實際試聽。
 >
-> 4ch 產品另有一條：四條 lane 以 `spatial_linear_context` 建立，從不走到自己的
+> 4ch 產品另有一條：四條 lane 以 `spatial_linear_context` 建立（`mcab_apply_lane_contract()` 蓋上），從不走到自己的
 > suppression-gain 路徑，對 lane 呼叫 `aec_set_preset()` 依建構方式即為無效操作。
-> 請改用共用的 post-beam `AecRes` 的 `aec_res_set_preset()`：無論用 `AudioPipeline4Ch` 還是直接驅動核心 `FourAecNrRes`，
-> 都是對應用自己用 libaec 建的那個 `AecRes` 呼叫。它針對的是那個共用的 post 級抑制器；單元沒有任何強度 setter。
+> 請改用共用的 post-beam `AecRes` 的 `aec_res_set_preset()`：都是對應用自己用 libaec 建的那個 `AecRes` 呼叫。
+> 它針對的是那個共用的 post 級抑制器；`Mcab` 沒有任何強度 setter。
 > pipeline 層的對應入口見 [4ch 核心整合手冊 §3.2](integration_4ch_core_zh_TW_02_lifecycle.md#32-執行期強度控制)
 > 與 [mono 整合手冊 §3.2](integration_mono_zh_TW_02_lifecycle_config_errors.md#32-執行期強度控制)。
 
@@ -249,7 +249,7 @@ if (anr_process_gain(nr, error_spec, extra_r2, gain) != 0) {
 ```
 
 AEC 的 `AecResContext.r2` 是 int16-square scale，直接交給 NR 前必須除以
-`32768^2`；`pipelines/samples/se_anr_stage.h` 的 `se_anr_stage_gain()` 已正確處理，直接呼叫它，不要在 application 再複製一份。
+`32768^2`；範例都這樣做（mono：`pipelines/mono_aec_nr_res/main.c` 的 `mono_nr_gain()`；4ch：`pipelines/4ch_aec_bf_nr_res/mcab_sample_post.h` 的 `mcab_sample_anr_gain()`，兩者都只在 `usable_linear` 時折入），照抄其中一份，不要自己另寫一套尺度換算。
 
 ### 4.4 Reset 與查詢
 

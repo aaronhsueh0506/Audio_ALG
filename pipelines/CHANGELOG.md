@@ -3,6 +3,192 @@
 `Audio_ALG/pipelines`（含它建置的 `AINR`、`AIAEC` C 程式）的重要改動記錄在此，格式依
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/)。README 只寫現況，改動經過寫在這裡。
 
+## [Unreleased] — 2026-10-27 — mcab: the 4-channel flow layer replaces `4aec_nr_res` and `audio_pipeline_4ch`; `dfn/` and `ulcnet/` folders; the `se_*` glue, `samples/` and `third_party/` are gone; DFN2 lookahead pairs
+
+Supersedes the 2026-10-24 entries that describe `FourAecNrRes`, `AudioPipeline4Ch`, their layouts 24 and 21 and
+their pool sizes; those entries stay as history. No DSP was changed: for valid input the example programs' outputs
+equal those of the previous tree (compared run by run with `SIMD=1`, `SIMD=0` and the 48 kHz grid). The changes a
+user can notice are listed under "Behaviour changes".
+
+### Changed
+- **`mcab` is a flow layer, not a library.** `4ch_aec_bf_nr_res/mcab.{h,c}` (private `mcab_internal.h`) replaces
+  the 4-lane core (`4aec_nr_res`) and the 4-channel unit (`audio_pipeline_4ch`). The application creates the four
+  libaec `Aec` lanes and, in MATCHED mode only, one shared `DelayAec` with their own `get_mem_size` / `init`, and
+  passes the pointers in `McabLibs` to `mcab_init_ex()`. `mcab` owns only flow state in its own pool: the shared-delay
+  admission state machine, the alignment ring, the aligned-reference buffer, the per-lane views and the fuse buffers.
+  It never allocates, resets by destroying or frees an injected object; `mcab_destroy()` ends the flow and touches
+  no library object. Injected lanes and the estimator must be freshly initialised, or reset (`aec_reset()`,
+  `delay_aec_reset()`, or `mcab_reset()` of the flow that ran them), before `mcab_init()`; `mcab` cannot see that an
+  object has already run (a used estimator would hand the new flow a stale delay).
+- **There is no beamformer inside `mcab`.** `mcab_fuse(p, weights, beamformed_error, frame)` takes the caller's
+  weights `W[4][n_freqs]` and optionally the beamformed spectrum `E`, fills a `McabFrame` (declared in `mcab.h`) and
+  leaves `frame->g_res_ctx` NULL (RES stays outside: the application creates a libaec `AecRes`). `McabConfig` holds
+  flow parameters only (`sample_rate`, `fft_size`, `delay_mode`, `delay_num_filters`, `fixed_delay_samples`,
+  `capture_proxy_channel`, the backward-quarantine pair, `delay_est_period_s`, `max_delay_ms`, `enable_post`); it has
+  no `filter_length` and no beamformer field.
+- **Lane contract split.** The lane parameters (preset, filter length, ...) belong to the application's `AecConfig`.
+  `mcab_apply_lane_contract(&cfg, &lane)` stamps only the contract fields (`fft_size`, EXTERNAL_ALIGNED with
+  `delay_num_filters = DA_NUM_FILTERS`, `fixed_delay_samples = -1`, `enable_delay_est = 0`, `enable_res = 0`,
+  `return_res_context = 1`, `spatial_linear_context` = `AEC_CONTEXT_NO_GAIN` with `enable_post` else
+  `AEC_CONTEXT_LINEAR_ONLY`, `delay_est_period_s`), is idempotent and refuses a lane built for another sample rate.
+  `mcab_lane_config(&cfg, &lane)` is the convenience: balanced preset plus the contract.
+  `mcab_delay_estimator_config()` gives the estimator's `(sample_rate, hop_size, num_filters)`; it is required only
+  in MATCHED. `mcab_init()` checks what the public getters can show (each lane's hop and bin count, a context
+  without a gain of its own, the post half against `enable_post`, an already aligned far, four distinct lanes; the
+  estimator's bank size, rate and 48 kHz scratch). `Aec` has no config getter, so the lane parameters themselves are
+  not checked.
+- **Descriptor.** `MCAB_DESCRIPTOR_VERSION` 1 and **`MCAB_LAYOUT_VERSION` 25**, which describes mcab's own pool only
+  (control block, mic lane, aligned far, fuse buffers when `enable_post`, alignment ring in MATCHED/FIXED);
+  library objects are not in it. It replaces `FOUR_AEC_NR_RES_LAYOUT_VERSION` 24 and
+  `AUDIO_PIPELINE_4CH_LAYOUT_VERSION` 21; `mcab_init_ex()` refuses descriptors carrying layouts 17 to 24
+  (`test_mcab`), so a persisted descriptor must be queried again with `mcab_get_mem_requirements()`.
+- **Archive.** `libaudio_pipeline_mcab.a` holds `mcab.o` only and references no SRP-PHAT/BF symbol;
+  `libaudio_pipeline_4ch.a` is gone. `libdfn_res_stage.a` (built by `4ch_aec_bf_nr_res/Makefile`) is unchanged in role.
+- **Sample-level helpers (header and source beside `mcab`, outside the archive).** `mcab_sample_flow.{h,c}` builds
+  lanes, estimator and `mcab` in one caller pool (`mcab_sample_flow_get_mem_size/_init/_create/_destroy`).
+  `mcab_sample_beam.{h,c}` owns audiolib's SRP-PHAT and BF and a fallback energy VAD and runs the per-hop glue
+  (`doa_step()` + `bf_process_with_weights()`) between `mcab_process_front()` and `mcab_fuse()`
+  (`mcab_sample_beam_process_front/_process_beam/_process_with_activity/_process/_fuse`); a front `DSP_ERROR` resets
+  only the flow (SRP, BF, the VAD and `frame_index` stay), a refusal of `mcab_sample_beam_fuse()` other than a sequence error
+  resets everything the helper owns. `mcab_sample_driver.{h,c}` is the CLI/driver. `mcab_sample_post.h` (header-only) carries the post-beam
+  wiring of the 4-channel programs: `mcab_sample_res_input()` fills the `AecResInput` of the application's `AecRes`
+  from a `McabFrame`, `mcab_sample_anr_gain()` returns the denoiser gain, and `MCAB_SAMPLE_CNG_NR_GAIN_FLOOR`,
+  `MCAB_SAMPLE_CNG_RNG_SEED` and `MCAB_SAMPLE_PSD_SCALE_INV` are the comfort-noise and scale constants
+  (`test_mcab_sample_post`). An application with its own beamformer calls `mcab_process_front()` and `mcab_fuse()`
+  directly.
+- **Programs.** `mcab_raw`, `mcab_static` and `mcab_external_static` write their application-side init out in the
+  file; the DFN2 and Align-ULCNet 4-channel examples and the tests build through `mcab_sample_flow` plus the beam
+  helper. `make PROFILE=1` sets `-DMCAB_STAGE_TIMING=1 -DAEC_STAGE_TIMING=1`.
+- **Folders.** `pipelines/` holds `common/`, `mono_aec_nr_res/`, `4ch_aec_bf_nr_res/`, `dfn/`, `ulcnet/`, `tests/`,
+  `tools/` and `scripts/`. `dfn/` holds `dfn_res_stage`, `dfn_rate_bridge`, `dfn_hop.h`, `dfn_hop_pool.h`,
+  `dfn_unit_partition.h`, `dfn_example_args.h`, the Python twins `dfn2_stage.py` and `dfn2_rate_adapter.py`, `tests/`,
+  `mono_aec_dfn_res/` and `4ch_aec_bf_dfn_res/` (each with its `pipeline.py` and `tests/`). `ulcnet/` holds
+  `ulcnet_nn_stage.{c,h}`, `tests/`, `mono_alignulcnet/` and `4ch_alignulcnet/`. `common/` holds `example_cli.h`,
+  the Python `cng_aec3.py` and `tests/`. `pipelines/tests/` keeps the cross-cutting tests (`test_c_python_map.py`,
+  `test_doc_layout_versions.py`, `test_readme_flow.c`, `test_target_abi.c`, `pyc_parity*`, `c_shim.py`). Tests moved
+  with their code. Cross-directory `#include`s are written relative to the `pipelines/` root (`"dfn/dfn_hop.h"`,
+  `"common/example_cli.h"`), includes inside one family directory use the plain file name. `pipelines/Makefile` and
+  `4ch_aec_bf_nr_res/Makefile` build, each folder's `Makefile` is a thin forwarder.
+- **Python twins moved.** `dfn2_stage.py` and `dfn2_rate_adapter.py` are `pipelines/dfn/dfn2_stage.py` and
+  `pipelines/dfn/dfn2_rate_adapter.py` (modules `pipelines.dfn.dfn2_stage`, `pipelines.dfn.dfn2_rate_adapter`);
+  `aec_dfn2_res_pipeline.py` is `dfn/mono_aec_dfn_res/pipeline.py` (`python -m pipelines.dfn.mono_aec_dfn_res.pipeline`);
+  the 4-channel DFN2 twin is `dfn/4ch_aec_bf_dfn_res/pipeline.py`; `aec_nr_pipeline.py` is
+  `mono_aec_nr_res/pipeline.py` (`python -m pipelines.mono_aec_nr_res.pipeline`); `cng_aec3.py` is
+  `common/cng_aec3.py`. The Python tests moved to `dfn/tests/`, `dfn/mono_aec_dfn_res/tests/`,
+  `dfn/4ch_aec_bf_dfn_res/tests/`, `mono_aec_nr_res/tests/` (`test_signal_grids.py`) and `common/tests/`.
+- **Example glue.** The `se_*` layer is gone: `common/se_config.{h,c}`, `se_stage.h`, `se_anr_stage.h`,
+  `se_delay_cli.h`, `pipelines/se_stage.py` and `pipelines/third_party/gain` (`fix_gain`, `nr_gain`, `post_gain`).
+  Each mono program calls libaec and libanr directly: `derive_lane()` resolves the grid with `aec_resolve_signal_grid()`
+  and builds the lane `AecConfig` from `aec_config_from_preset()` plus explicit fields, the AEC's own RES gain is read
+  with `aec_get_res_context()`, the NR gain comes from `anr_process_gain()` (`mono_nr_gain()` in `mono_aec_nr_res/main.c`),
+  and the program chains gain minimum, `aec_cng_fill()` comfort noise (local `CNG_*` constants) and synthesis itself
+  (`mono_form()`). The 4-channel programs use `mcab_sample_post.h` (above). The finite check of an emitted hop is
+  `skn_all_finite_f32()` from audiolib's `utility/simd_kernel_nn.h`.
+- **Strict number parsing.** `common/example_cli.h` (header-only; it also holds the `example_cli_delay_*` helpers
+  that check the `--delay-mode` / `--delay-num-filters` / `--fixed-delay` combination) is the one parser for the
+  numeric options of the DFN2 and Align-ULCNet examples (`dfn_example_args.h` builds on it) and of `mcab_raw`:
+  `example_cli_parse_int()` / `example_cli_parse_float()` reject the empty string, a leading space, trailing
+  characters, `ERANGE`, values outside `int` and (floats) `inf`/`nan`, and accept plain decimals with an optional
+  leading `+`.
+- **Mono.** `mono_aec_nr_res/main.c` and `static_main.c` are one `main.c`; it builds both binaries
+  (`-DAEC_NR_POOL_SPLIT=1` gives `aec_nr_pipeline` its two-block pool; `aec_nr_pipeline_static` keeps
+  `--print-mem-size`).
+- **DFN2 lookahead pairs.** The DFN2 stage and rate bridge follow AINR's mask/deep-filter lookahead pair
+  (`AINR/README.md`, "Lookahead pairs": 15 legal pairs, mask 0..2, deep filter 0..4, no ordering rule between them;
+  the exported graph does not depend on the pair, a checkpoint is tied to it). The pair is set with the make
+  variables `DFN2_MASK_LOOKAHEAD` / `DFN2_DF_LOOKAHEAD` (default 1/1, one decimal in range, otherwise a Makefile
+  error; `pipelines/Makefile` also takes `DFN3_MASK_LOOKAHEAD` / `DFN3_DF_LOOKAHEAD` for the DFN3 sources it compiles
+  for the target-ABI test, `4ch_aec_bf_nr_res/Makefile` only the DFN2 pair). A pair other than 1/1 is forwarded as
+  `-DDFN2_MASK_LOOKAHEAD=<M> -DDFN2_DF_LOOKAHEAD=<D>` to every unit and is part of the build signature, so it gets
+  its own `obj`/`bin` directories; objects built for different pairs fail to link (symbol
+  `dfn2_lookahead_mask<M>_df<D>`), an out-of-range pair is a compile error. `DFN_RES_STAGE_LOOKAHEAD_FRAMES` =
+  `DFN2_MASK_LOOKAHEAD + DFN2_DF_LOOKAHEAD` = L (the DFN2 cascade adds the two): the spectrum emitted on hop t belongs
+  to source frame t - L and the first L hops emit zeros. The rate bridge adds `prefill + up and down resampler group delays (16 + 16 native samples) +
+  (L + 1) * 512 * sr / 48000` native samples (`dfn_rate_bridge_added_delay_samples()`; integer arithmetic, floored, so a
+  fraction of a sample is lost for some pairs):
+  672 / 629 / 330 samples at 16 kHz hop 128, 16 kHz hop 256 and 8 kHz hop 128 for the shipped 1/1 pair; 501 / 458 / 244
+  for 0/1 and 1354 / 1311 / 671 for 2/4. `make -C pipelines test-pairs` rebuilds and runs the DFN C tests and
+  `mono_aec_dfn_res` for each pair in `DFN_TEST_PAIRS` (default `0/0 0/1 2/0 2/4`, e.g.
+  `make -C pipelines test-pairs DFN_TEST_PAIRS="0/1 2/4"`); the 4-channel DFN2 example takes the same variables and has no `test-pairs` target.
+  The Python `Dfn2Stage` takes the pair from the loaded model. Only the shipped 1/1 pair has a trained checkpoint, so
+  the audio quality of any other pair is not measured, and the C builds were exercised for a subset of the pairs only.
+- **Python twin of `mcab`.** Classes `Mcab*` (`McabConfig`, `McabPipeline`, `McabFront`, `McabBeam`, `McabFrame`,
+  `McabDelayState`), `McabPipeline.process_front()`, `mcab_apply_lane_contract()`, `mcab_lane_config()`;
+  `McabPipeline(config=None, beamformer=None, lane_config=None)` stamps the contract onto an application-supplied lane config.
+  Python and C agree for the default settings; the documented differences S-02 (AEC live observer guard) and S-13
+  (NR make-up prior) exist only when those default-off features are enabled.
+
+### Behaviour changes
+- Malformed numbers (`12x`, `3x`, an empty string, a leading space) given to `mono_alignulcnet`, `4ch_alignulcnet`,
+  the DFN2 examples or `mcab_raw` exit with status 2 (the ULCNet examples used `atoi()` before and accepted them);
+  `mcab_raw` with an empty `--fixed-doa-deg` exits 2. `aec_nr_pipeline`, `aec_nr_pipeline_static`, `mcab_static` and
+  `mcab_external_static` still accept them through `atoi()` / `atof()`.
+- `mcab_raw` reports a failed write of its output file.
+- `mcab_fuse()` returns `MCAB_DSP_ERROR` and resets the flow when the lanes do not share one far spectrum, when the
+  beamformed spectrum is non-finite or when the projection overflows (finite but huge weights).
+- Injected lanes and the estimator must be fresh or reset before `mcab_init()` (see above).
+
+### Removed
+- `4aec_nr_res.{c,h}`, `4aec_nr_res_internal.h`, `4aec_projection_kernels.h`, `audio_pipeline_4ch.{c,h}`,
+  `audio_pipeline_4ch_raw.c`, `audio_pipeline_4ch_static.c`, `4aec_nr_res_static.c`; the binaries
+  `audio_pipeline_4ch_raw`, `audio_pipeline_4ch_static`, `4aec_nr_res_static`, `test_4aec_nr_res`,
+  `test_audio_pipeline_4ch`; the `libaudio_pipeline_4ch.a` alias target; `mono_aec_nr_res/static_main.c`;
+  `samples/mcab_demo.c`; `test_se_common` (replaced by `test_mcab_sample_post`).
+- `pipelines/common/se_config.{h,c}`, `se_stage.h`, `se_anr_stage.h`, `se_delay_cli.h`, `pipelines/se_stage.py`.
+- `pipelines/third_party/` (`gain`: `nr_gain`, `post_gain`, `fix_gain` and `test_gain`) and `pipelines/samples/`.
+- Python: the `FourChannelAec*` names, with no alias.
+
+### Pool sizes (NE10, `SIMD=1`, MATCHED n=5, 16 kHz/256 unless noted; bytes, as printed by `test_target_abi` and the example binaries)
+| Item | Bytes |
+|---|---|
+| `mcab` pool alone (`enable_post = 1`, default config; `test_target_abi`) | 73,504 |
+| `mcab` pool alone (`enable_post = 0`; `test_target_abi`) | 68,288 |
+| `mcab_external_static` "Front end" (shared estimator + `mcab` pool), 16 kHz/256 | 108,928 |
+| `mcab_external_static` "Front end", 48 kHz/1024 | 262,880 |
+| `mcab_static` "Unit" (flow objects + beam helper), 16 kHz/256 | 1,698,784 |
+| `mcab_static` "Unit", 48 kHz/1024 | 6,300,352 |
+
+The four lanes (printed as "AEC x4" by `mcab_external_static`: 797,632 at 16 kHz/256) and the shared estimator are
+sized by their own libraries and are part of the application's total: "Front end" is the estimator plus the `mcab`
+pool, "Unit" adds the four lanes and the beam helper. Re-query every number with `mcab_get_mem_requirements()`,
+`aec_get_mem_size()`, `delay_aec_get_mem_size()` and `mcab_sample_beam_get_mem_size()` on the target build; do not copy
+these.
+
+### Migration notes
+| Before | After |
+|---|---|
+| `FourAecNrRes`, `FourAecNrResConfig`, `FourAecNrResStatus`, `FOUR_AEC_NR_RES_*` | `Mcab`, `McabConfig`, `McabStatus`, `MCAB_*` (`MCAB_OK`, `MCAB_INVALID_ARGUMENT`, `MCAB_SEQUENCE_ERROR`, `MCAB_DSP_ERROR`) |
+| `four_aec_nr_res_default_config()`, `_get_mem_requirements()`, `_init()`, `_init_ex()`, `_create()`, `_destroy()`, `_reset()` | `mcab_default_config()`, `mcab_get_mem_requirements()`, `mcab_init()`, `mcab_init_ex()`, `mcab_create()`, `mcab_destroy()`, `mcab_reset()`; init now also takes `const McabLibs*` (lanes and, in MATCHED, the estimator, created by the application) |
+| `four_aec_front_process()`, `four_aec_fuse()` | `mcab_process_front()`, `mcab_fuse()` |
+| `four_aec_nr_res_hop_size()`, `_fft_size()`, `_n_freqs()`, `_sample_rate()`, `_matched_filter_count()`, `_linear_aec_count()`, `_far_fft_real_compute_count()`, `_realign_warm_lane_count()`, `_realign_soft_lane_count()`, `_pending_delay_candidate()`, `_duty_hops_total()`, `_duty_hops_run()`, `_get_last_timing()`, `_get_mem_breakdown()` | the same accessors with the prefix `mcab_` (`mcab_hop_size()`, ...); new: `mcab_enable_post()` |
+| `FourAecFront`, `FourAecNrResDelayState`, `FourAecNrResLastTiming`, `FourAecNrResMemBreakdown` | `McabFront`, `McabDelayState`, `McabLastTiming`, `McabMemBreakdown` (`control_bytes` / `buffer_bytes` / `total_bytes`; no lane bytes) |
+| `FourAecNrResConfig.filter_length` | the application's lane `AecConfig`; apply the contract with `mcab_apply_lane_contract()` or take `mcab_lane_config()` |
+| `AudioPipeline4Ch`, `audio_pipeline_4ch_*` (SRP-PHAT/BF inside the unit) | `mcab` plus `McabSampleBeam` / `mcab_sample_beam_*`; `AudioPipeline4ChBeam`, `AudioPipeline4ChFrameInfo`, `AudioPipeline4ChGeometry` become `McabSampleBeamResult`, `McabSampleBeamInfo`, `McabSampleGeometry`; the beam-related `AudioPipeline4ChConfig` fields become `McabSampleBeamParams` |
+| `audio_pipeline_4ch_get_core()`, `_last_core_timing()` | the flow handle you passed to `mcab_sample_beam_init()`; `mcab_get_last_timing()`. The `audio_pipeline_4ch_doa_*` / `_bf_*` grid getters are removed (they equalled the main grid); `_bf_effective_adapt_interval()`, `_bf_lambda()` and `_spatial_backend()` became `mcab_sample_beam_bf_effective_adapt_interval()`, `mcab_sample_beam_bf_lambda()` and `mcab_sample_beam_spatial_backend()` |
+| `FOUR_AEC_NR_RES_LAYOUT_VERSION` 24, `AUDIO_PIPELINE_4CH_LAYOUT_VERSION` 21 | `MCAB_LAYOUT_VERSION` 25 |
+| `FOUR_AEC_NR_RES_STAGE_TIMING` | `MCAB_STAGE_TIMING` |
+| `libaudio_pipeline_4ch.a` | `libaudio_pipeline_mcab.a` (`mcab.o` only); add `mcab_sample_flow.o` / `mcab_sample_beam.o` if you use the helpers |
+| binaries `audio_pipeline_4ch_raw`, `audio_pipeline_4ch_static`, `4aec_nr_res_static` | `mcab_raw`, `mcab_static`, `mcab_external_static` |
+| tests `test_4aec_nr_res`, `test_audio_pipeline_4ch`, `tests/conv_chain_4ch.h` | `test_mcab`, `test_mcab_sample_beam`, `tests/conv_chain_mcab.h` (new `tests/mcab_test_rig.h`) |
+| `FourChannelAecConfig`, `FourChannelAecPipeline` (`front_process`), `FourChannelFrame`, `FrontFrame`, `BeamformerFrame`, `SharedDelayState` | `McabConfig`, `McabPipeline` (`process_front`), `McabFrame`, `McabFront`, `McabBeam`, `McabDelayState` |
+| `pipelines/dfn_res_stage.*`, `dfn_rate_bridge.*`, `dfn_unit_partition.h`, `dfn_example_args.h` | `pipelines/dfn/...` |
+| `pipelines/samples/dfn_hop.h`, `samples/ulcnet_nn_stage.*` | `pipelines/dfn/dfn_hop.h`, `pipelines/ulcnet/ulcnet_nn_stage.*` |
+| `common/se_stage.h` (`SeSpecFrame`, `se_frame_from_aec()`, `se_res_stage_gain()`), `samples/se_anr_stage.h` (`se_anr_stage_gain()`) | `aec_get_res_context()` (`AecResContext.res_gain`), `aec_res_process()` over `mcab_sample_res_input()`, `mono_nr_gain()` / `mcab_sample_anr_gain()` (`4ch_aec_bf_nr_res/mcab_sample_post.h`) |
+| `common/se_config.{h,c}` (grid and lane derivation), `se_hop_is_finite()` | `derive_lane()` in each program over `aec_resolve_signal_grid()` and `aec_config_from_preset()`; `skn_all_finite_f32()` |
+| `common/se_delay_cli.h` (`se_cli_parse_int()`, `se_cli_parse_float()`) | `common/example_cli.h` (`example_cli_parse_int()`, `example_cli_parse_float()`) |
+| `pipelines/third_party/gain` (`fix_gain`, `nr_gain`, `post_gain`) | `mono_nr_gain()` / `mcab_sample_anr_gain()` for the NR gain; an input gain is `sk_scale_f32()` plus `sk_clip_f32()` from audiolib's `utility/simd_kernels.h` |
+| `pipelines/mono_aec_dfn_res/`, `4ch_aec_bf_dfn_res/`, `mono_alignulcnet/`, `4ch_alignulcnet/` | `pipelines/dfn/mono_aec_dfn_res/`, `pipelines/dfn/4ch_aec_bf_dfn_res/`, `pipelines/ulcnet/mono_alignulcnet/`, `pipelines/ulcnet/4ch_alignulcnet/` |
+| `pipelines/dfn2_stage.py`, `dfn2_rate_adapter.py`, `aec_dfn2_res_pipeline.py`, `aec_nr_pipeline.py`, `cng_aec3.py` | `pipelines/dfn/dfn2_stage.py`, `pipelines/dfn/dfn2_rate_adapter.py`, `pipelines/dfn/mono_aec_dfn_res/pipeline.py`, `pipelines/mono_aec_nr_res/pipeline.py`, `pipelines/common/cng_aec3.py` |
+| `pipelines/tests/test_dfn_res_stage.c`, `test_dfn_rate_bridge.c`, `dfn_test_fixture.h`, `test_dfn2_*.py`, `test_signal_grids.py`, `test_cng_aec3.py` | `pipelines/dfn/tests/...`, `pipelines/dfn/mono_aec_dfn_res/tests/`, `pipelines/dfn/4ch_aec_bf_dfn_res/tests/`, `pipelines/mono_aec_nr_res/tests/test_signal_grids.py`, `pipelines/common/tests/` |
+
+Board code: create the four lanes with `aec_init()` over `mcab_lane_config()` (or your own `AecConfig` plus
+`mcab_apply_lane_contract()`), the `DelayAec` when `mcab_delay_estimator_config()` reports `required`, then
+`mcab_get_mem_requirements()` and `mcab_init_ex()`. Tear down in the opposite order: sample helper, `mcab_destroy()`,
+the lanes. Board build notes: drop `fix_gain.c` and the `third_party/gain` include path (an input gain is
+`sk_scale_f32()` plus `sk_clip_f32()`); when the DFN2 lookahead pair is not 1/1, pass the same
+`-DDFN2_MASK_LOOKAHEAD` / `-DDFN2_DF_LOOKAHEAD` flags to every DFN2 unit and install a model exported for that pair.
+`alg_ai3_dfn.c` and `uvc_ai_nr_stream.c` hard-code mask and DF lookahead 1 with a static assert.
+
 ## [Unreleased] — 2026-10-24 — The 4-channel unit no longer carries the post-beam RES: applications create the AecRes with libaec
 
 Supersedes the statements in the same-day "Pipeline usage fix" entry that the 4-channel unit owns the RES

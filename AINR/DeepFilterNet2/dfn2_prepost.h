@@ -8,11 +8,14 @@
  *     }
  *     dfn2_prepost_post_process(p, out_hop, &written);
  *
- * pre_process returns 0 on the first hop (no right-hand neighbour for the
- * [t-1, t, t+1] graph window; do not run the accelerator) and 1 afterwards.
- * Latency is 3 hops (1536 samples, 32 ms at 48 kHz): 1 of framing plus 2 of model
- * lookahead; post_process reports written = 0 for the first two hops. Flush the
- * tail with 2 more zero hops and run the accelerator on them.
+ * With L = DFN2_MASK_LOOKAHEAD and D = DFN2_DF_LOOKAHEAD, pre_process returns 0
+ * on the first L hops (the graph window [t-(2-L) .. t+L] is not complete yet;
+ * do not run the accelerator) and 1 afterwards. Latency is 1 + L + D hops: one
+ * of framing plus L + D of model lookahead (3 hops, 1536 samples, 32 ms at
+ * 48 kHz for the shipped L = D = 1); post_process reports written = 0 for the
+ * first L + D hops. Flush the tail with L + D more zero hops and run the
+ * accelerator on them. L and D are build-time constants (dfn2_process.h) and
+ * must equal the pair the graph was trained and exported for.
  *
  * DFN2_IO_FREQ spectra are torch.stft(normalized=True): the rfft of the
  * sqrt-Hann-windowed block times 1/sqrt(DFN2_N_FFT). AIAEC spectra are
@@ -205,13 +208,13 @@ int dfn2_prepost_set_atten_lim(DFN2Prepost *p, float atten_lim_db);
 /* DFN2_IO_TIME. One hop of noisy input (DFN2 is single-stream): runs the
  * analysis and feature front end, slides the graph window and advances the
  * compose clock. Returns the number of accelerator invocations this hop needs (0
- * on the first hop, 1 after), or -1 on NULL args, in DFN2_IO_FREQ, or with a
- * frame open. */
+ * on the first DFN2_MASK_LOOKAHEAD hops, 1 after), or -1 on NULL args, in
+ * DFN2_IO_FREQ, or with a frame open. */
 int dfn2_prepost_pre_process(DFN2Prepost *p, const float in_hop[DFN2_HOP_LEN]);
 
 /* DFN2_IO_FREQ. One analysed frame at normalized=True scale: rfft of a
  * sqrt-Hann-windowed DFN2_N_FFT block on the DFN2_HOP_LEN grid. No transform is
- * done. Returns 0 on the first frame, 1 after, or -1. */
+ * done. Returns 0 on the first DFN2_MASK_LOOKAHEAD frames, 1 after, or -1. */
 int dfn2_prepost_pre_process_freq(DFN2Prepost *p,
                                   const float spec_re[DFN2_N_BINS],
                                   const float spec_im[DFN2_N_BINS]);
@@ -219,8 +222,9 @@ int dfn2_prepost_pre_process_freq(DFN2Prepost *p,
 /* DFN2_IO_FREQ, dual input. `est` feeds the estimation branch (features, graph
  * window, heads); `app` feeds the application branch (the noisy ring that the
  * mask, deep filter and attenuation limit act on). Same frame clock and scale;
- * est == app equals dfn2_prepost_pre_process_freq(). Returns 0 on the first frame,
- * 1 after, or -1 on NULL args, in DFN2_IO_TIME, or with a frame open. */
+ * est == app equals dfn2_prepost_pre_process_freq(). Returns 0 on the first
+ * DFN2_MASK_LOOKAHEAD frames, 1 after, or -1 on NULL args, in DFN2_IO_TIME, or
+ * with a frame open. */
 int dfn2_prepost_pre_process_freq_dual(DFN2Prepost *p,
                                        const float est_re[DFN2_N_BINS],
                                        const float est_im[DFN2_N_BINS],
@@ -247,14 +251,15 @@ int dfn2_prepost_frame_commit(DFN2Prepost *p);
 int dfn2_prepost_frame_skip(DFN2Prepost *p);
 
 /* DFN2_IO_TIME. Emit this hop's output: DFN2_HOP_LEN samples, zero-filled during
- * the two warm-up hops; `*written` (may be NULL) reports 0 or DFN2_HOP_LEN.
- * Returns 0, or -1. */
+ * the first DFN2_MASK_LOOKAHEAD + DFN2_DF_LOOKAHEAD warm-up hops; `*written`
+ * (may be NULL) reports 0 or DFN2_HOP_LEN. Returns 0, or -1. */
 int dfn2_prepost_post_process(DFN2Prepost *p, float out_hop[DFN2_HOP_LEN],
                               int *written);
 
 /* DFN2_IO_FREQ. The enhanced spectrum of the frame just emitted, at the input's
- * normalized=True scale. Zeros during the two warm-up frames, where `*valid` (may
- * be NULL) reports 0. Returns 0, or -1. */
+ * normalized=True scale. Zeros during the DFN2_MASK_LOOKAHEAD +
+ * DFN2_DF_LOOKAHEAD warm-up frames, where `*valid` (may be NULL) reports 0.
+ * Returns 0, or -1. */
 int dfn2_prepost_post_process_freq(DFN2Prepost *p, float re[DFN2_N_BINS],
                                    float im[DFN2_N_BINS], int *valid);
 
@@ -280,8 +285,8 @@ typedef struct DFN2Model {
 /* Drive one open frame: frame_inputs(), infer(), frame_commit(). A nonzero infer()
  * result or a refused commit takes the frame with frame_skip(), so the clocks
  * advance exactly once. Returns 1 when the heads were committed, 0 when skipped,
- * -1 on a contract error (NULL model or instance, no infer callback, or no frame
- * open). */
+ * -1 on a contract error (NULL model or instance, no infer callback, invalid
+ * io_descriptor -- NULL, or another graph or lookahead pair -- or no frame open). */
 int dfn2_model_run_frame(const DFN2Model *model, DFN2Prepost *p);
 
 #ifdef __cplusplus

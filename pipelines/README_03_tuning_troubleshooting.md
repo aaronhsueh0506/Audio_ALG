@@ -36,14 +36,14 @@ differ in exactly three fields:
 
 | Entry point | 目標 |
 |---|---|
-| `aec_set_preset(aec, preset, ramp_ms)` | mono：`Aec` 的 far-active 地板（mono 的 RES 增益 `ctx.res_gain` 就在 AEC 裡，經 `se_frame_from_aec()` 成為 `g_res_ctx`） |
-| `aec_res_set_preset(res, preset, ramp_ms)` | 4ch：應用自備的後波束 `AecRes`（單元與核心都不持有；`res` 為 `NULL` 時回 `-1`） |
+| `aec_set_preset(aec, preset, ramp_ms)` | mono：`Aec` 的 far-active 地板（mono 的 RES 增益 `ctx.res_gain` 就在 AEC 裡，經 `aec_get_res_context()` 讀出） |
+| `aec_res_set_preset(res, preset, ramp_ms)` | 4ch：應用自備的後波束 `AecRes`（`Mcab` 不持有；`res` 為 `NULL` 時回 `-1`） |
 | `aec_res_split_floor(res, &live, &target)` | 4ch：唯讀，線性功率。`live == target` 代表 ramp 已走完 |
 | `anr_set_mode(nr, mode)` | 範例自己初始化的**那一個**降噪器（`anr_init()` 回傳的 `AnrDenoiser*`）；`NULL` 回 `-1` |
 
 4ch 的初始 RES 強度由應用傳給 `aec_config_from_preset()` 的 preset 決定，執行中改強度走上面的
-`aec_res_set_preset()`；`aec_res_reset()` 不會把它改回建構時的 preset。單元 `AudioPipeline4Ch` 與核心
-`FourAecNrRes` 都沒有強度 setter：它們的 lane 只算線性殘留，RES 與 NR 不在裡面。
+`aec_res_set_preset()`；`aec_res_reset()` 不會把它改回建構時的 preset。`Mcab`（與取樣用的
+`mcab_sample_beam` helper）沒有強度 setter：它的 lane 只算線性殘留，RES 與 NR 不在裡面。
 
 `ramp_ms == 0` 代表下一個 hop 套用（**不是錯誤**），落點與「用該 preset 從頭建一個新
 實例」完全相同；`> 0` 則以 dB 為單位線性走過去，上限 60 秒（mild ↔ aggressive 是
@@ -55,17 +55,17 @@ live 值重新起走。兩者都**不是重啟**：濾波器、延遲鎖定、�
 `min_gain_split_floor_enabled` 這個 gate 會跟兩個 dB 欄位同一次呼叫一起 retarget（沒有
 ramp，立即生效，跟 DT 地板一樣是硬切），所以不會有一個 hop 是「preset 標籤已經是
 NO_FLOOR，但 gate 還沒跟上」的中間狀態。Python 對應：mono 的 `AEC.set_preset()`；4ch 的
-`PostBeamResidualSuppressor.set_preset()`（Python 的 `FourChannelAecPipeline` 不持有它：應用自己建一個，
+`PostBeamResidualSuppressor.set_preset()`（Python 的 `McabPipeline` 不持有它：應用自己建一個，
 `PostBeamResidualSuppressor.from_aec_config(config)` 或 `PostBeamResidualSuppressor(sr, hop, n_freqs, preset)`，
 每 hop 呼叫 `process(post.context, post.aligned_render)`，`reset()` 自己重置）。
 
 > **4ch：對四條 lane 重新指定 preset 是無效操作。** 四條 lane 都以
-> `spatial_linear_context` 建立，從不走到自己的殘留抑制器，它們的地板
+> `spatial_linear_context` 建立（`mcab_apply_lane_contract()` 蓋上），從不走到自己的殘留抑制器，它們的地板
 > 什麼都不塑形。真正乘上輸出的 gain 來自應用自備的**唯一一個**後波束 `AecRes`，所以強度要設在它身上
-> （由 `4ch_aec_bf_nr_res/tests/test_audio_pipeline_4ch.c` 的 `test_caller_res_reset_and_preset` 釘住）。
+> （由 `4ch_aec_bf_nr_res/tests/test_mcab_sample_beam.c` 的 `test_caller_res_reset_and_preset` 釘住）。
 
 > **NR：範例的降噪器就是函式庫的 preset。** 它以 `anr_config_for_mode_grid()` 建立、
-> 沒有任何覆寫，所以 `anr_set_mode()` 直接換強度（`tests/test_se_common.c` 的 `test_nr_set_mode` 釘住）。要改 preset 以外的欄位時，自己組好
+> 沒有任何覆寫，所以 `anr_set_mode()` 直接換強度（`4ch_aec_bf_nr_res/tests/test_mcab_sample_post.c` 的 `test_nr_set_mode` 釘住）。要改 preset 以外的欄位時，自己組好
 > 完整 target 再呼叫 `anr_reconfigure()`（grid、`L`、`num_init_frames` 不可變）。
 
 > **A/B 量測時該預期什麼。** far-active 地板只在 **far-active 且非 double-talk** 的
@@ -76,9 +76,9 @@ NO_FLOOR，但 gate 還沒跟上」的中間狀態。Python 對應：mono 的 `A
 > echo／degradation 的 A/B 會把 CNG 的變化錯記到別的機制。請在 echo 對齊或
 > degradation 對齊的條件下比較，並實際試聽。
 
-兩條 Align-ULCNet 範例（`mono_alignulcnet/`、`4ch_alignulcnet/`）**刻意不提供**
+兩條 Align-ULCNet 範例（`ulcnet/mono_alignulcnet/`、`ulcnet/4ch_alignulcnet/`）**刻意不提供**
 這些 setter：mono 變體沒有 NR 實例、且算出的 `G_res` 沒有任何消費者（輸出由 ULCNet
-mask 塑形）；4ch 變體用的是 `core.enable_post = 0` 的單元，抑制器與降噪器
+mask 塑形）；4ch 變體用的是 `enable_post = 0` 的 flow，抑制器與降噪器
 根本不存在。強度是模型的性質，不是 runtime 旋鈕。
 
 ### NR (`AnrConfig`, see `anr_types.h`)
@@ -86,9 +86,10 @@ mask 塑形）；4ch 變體用的是 `core.enable_post = 0` 的單元，抑制�
 **Modes**: `ANR_MODE_MILD` / `ANR_MODE_MODERATE` / `ANR_MODE_BALANCED`（default）/ `ANR_MODE_AGGRESSIVE`
 
 > Both C pipeline CLIs' `parse_nr_mode()` — `mono_aec_nr_res/main.c` and
-> `4ch_aec_bf_nr_res/4aec_nr_res_static.c` — accept
-> `--nr-preset mild|moderate|balanced|aggressive`; anything else falls back to
-> `ANR_MODE_BALANCED` with no error. The Python `aec_nr_pipeline.py` CLI accepts
+> `4ch_aec_bf_nr_res/mcab_external_static.c` — accept
+> `--nr-preset mild|moderate|balanced|aggressive` (or the digits `0`..`3`, through
+> `anr_nr_mode_from_name()`); anything else falls back to
+> `ANR_MODE_BALANCED` with no error. The Python `mono_aec_nr_res/pipeline.py` CLI accepts
 > `mild|balanced|aggressive` only.
 
 `g_min_db` is amplitude dB (`g_min = 10^(g_min_db/20)`).
@@ -101,7 +102,7 @@ mask 塑形）；4ch 變體用的是 `core.enable_post = 0` 的單元，抑制�
 > for `alpha_xi`, `alpha_attack`, `alpha_d_speech` and `L`, and 10 ms/hop for the
 > other `alpha_*` and the frame counts. The tables list the authored constants,
 > not the realized value at a grid; read that back from `anr_default_config()` /
-> `anr_config_for_mode()` (or Python `core/nr_strength.py`) instead of scaling by hand.
+> `anr_config_for_mode()` (or Python `lib/nr/python/core/nr_strength.py`) instead of scaling by hand.
 
 The strength presets change only these four fields:
 
@@ -170,9 +171,9 @@ re-validation.
 
 ### Verification
 
-Both versions build from the default `make`; `tests/test_mono_chain.c` checks both programs against the
+Both versions build from the default `make` (one source, `mono_aec_nr_res/main.c`); `mono_aec_nr_res/tests/test_mono_chain.c` checks both programs against the
 hand-written oracle bit for bit (so the pooled and the heap outputs are equal for the tested option sets). The
-static build derives the AEC, denoiser and synthesis configs from one `SeGrid`, so the three share
+static build derives the AEC, denoiser and synthesis configs from one `AecSignalGrid` (`derive_lane()`), so the three share
 one grid by construction (`--print-mem-size` prints the grid and runs a real init of every stage).
 
 Navigation: [Index](README.md) | [Previous part](README_02_build_debug_board.md) <!-- split-nav -->

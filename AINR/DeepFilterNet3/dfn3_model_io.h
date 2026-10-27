@@ -28,6 +28,15 @@ extern "C" {
 #define DFN3_MODEL_GRU_HIDDEN               256
 #define DFN3_MODEL_ENCODER_CHANNELS         64
 #define DFN3_MODEL_DF_PATHWAY_WINDOW        5
+/* The exported graph consumes a full three-frame window whatever the mask
+ * lookahead; the lookahead only decides which frames the host puts in it
+ * ([t-(2-MASK), ..., t+MASK]) and when the first one is complete: the window for
+ * heads[t] ends at frame t+MASK, so heads[0] needs MASK + 1 pushed frames. */
+#define DFN3_MODEL_READY_FRAMES             (DFN3_MASK_LOOKAHEAD + 1U)
+
+#if DFN3_MODEL_READY_FRAMES > DFN3_MODEL_INPUT_FRAMES
+#error "the first window must fit in the three-frame model input"
+#endif
 
 #ifdef __STDC_VERSION__
 #if __STDC_VERSION__ >= 201112L
@@ -90,8 +99,10 @@ typedef struct {
     unsigned int state_generation;
 } DFN3ModelIOState;
 
-/* Slide a [t-1,t,t+1] feature window by one frame and write the newest frame
- * into the last slot. */
+/* Slide the feature window by one frame and write the newest frame into the
+ * last slot. After frame n is pushed the window holds [n-2, n-1, n], which is
+ * the window of heads[n-MASK_LOOKAHEAD] -- [t-1,t,t+1] for the shipped
+ * mask_lookahead 1; frames before the first stay zero, as in training. */
 void dfn3_model_io_push_erb_window(
     float window[DFN3_MODEL_INPUT_FRAMES][DFN3_N_ERB],
     const float frame[DFN3_N_ERB]);
@@ -109,9 +120,11 @@ int dfn3_model_io_validate_arrays(
                          [DFN3_MODEL_DF_PATHWAY_WINDOW]
                          [DFN3_DF_BINS]);
 
-/* Push one newly computed feature frame. Returns 1 when [t-1,t,t+1] is
- * available and the graph may emit heads[t], or 0 after the first frame.
- * To flush the final source frame, push one all-zero feature frame. */
+/* Push one newly computed feature frame. Returns 1 when the window of
+ * heads[t] is available and the graph may emit it, or 0 while fewer than
+ * DFN3_MODEL_READY_FRAMES frames were pushed (no run: the first
+ * DFN3_MASK_LOOKAHEAD frames). To flush the final source frames, push
+ * DFN3_MASK_LOOKAHEAD all-zero feature frames. */
 int dfn3_model_io_push_features(DFN3ModelIOState *state,
                                 const float erb[DFN3_N_ERB],
                                 const float spec[2][DFN3_DF_BINS]);

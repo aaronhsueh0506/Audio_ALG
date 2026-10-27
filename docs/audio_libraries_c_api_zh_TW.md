@@ -50,7 +50,7 @@
   - [6.7 Pool 大小](audio_libraries_c_api_zh_TW_03_ai_prepost_pipeline.md#67-pool-大小) <!-- split-toc -->
   - [6.8 Framing：一 hop 一框的 analysis](audio_libraries_c_api_zh_TW_03_ai_prepost_pipeline.md#68-framing一-hop-一框的-analysis) <!-- split-toc -->
   - [6.9 Pipeline 層：頻域 stage 串接與 NN 的 begin / nn_begin / nn_end / end](audio_libraries_c_api_zh_TW_03_ai_prepost_pipeline.md#69-pipeline-層頻域-stage-串接與-nn-的-begin--nn_begin--nn_end--end) <!-- split-toc -->
-  - [6.10 各函式庫各自初始化：記憶體加總與單元的公開面](audio_libraries_c_api_zh_TW_03_ai_prepost_pipeline.md#610-各函式庫各自初始化記憶體加總與單元的公開面) <!-- split-toc -->
+  - [6.10 各函式庫各自初始化：記憶體加總與 flow 的公開面](audio_libraries_c_api_zh_TW_03_ai_prepost_pipeline.md#610-各函式庫各自初始化記憶體加總與-flow-的公開面) <!-- split-toc -->
 - [7. Static-pool 共通規則](audio_libraries_c_api_zh_TW_04_pool_build_checklist.md#7-static-pool-共通規則) <!-- split-toc -->
 - [8. 建置、SIMD 與連結](audio_libraries_c_api_zh_TW_04_pool_build_checklist.md#8-建置simd-與連結) <!-- split-toc -->
 - [9. 最小整合檢查清單](audio_libraries_c_api_zh_TW_04_pool_build_checklist.md#9-最小整合檢查清單) <!-- split-toc -->
@@ -61,9 +61,9 @@
 
 | 需求 | 建議入口 |
 |---|---|
-| mono `AEC + NR + RES` | 沒有 mono 單元：`aec.h` 的 `Aec`（`aec_process_context()`）加 `common/se_stage.h` 的 `se_frame_from_aec()`，再串 `anr.h`、`audio_stft.h`（RES gain 就是 `Aec` 自己的 `ctx.res_gain`，經 `se_frame_from_aec()` 變成 `frame.g_res_ctx`）；範例 `pipelines/mono_aec_nr_res/main.c`、`static_main.c` |
-| 4ch linear AEC + BF（唯一包起來的單元；不含 RES／NR／合成） | `pipelines/4ch_aec_bf_nr_res/audio_pipeline_4ch.h` |
-| 4ch linear AEC 與外部 beamformer seam | `pipelines/4ch_aec_bf_nr_res/4aec_nr_res.h` |
+| mono `AEC + NR + RES` | 沒有 mono 包裝模組：`aec.h` 的 `Aec`（`aec_process_context()`，再用 `aec_get_res_context()` 讀出 `AecResContext`），再串 `anr.h`、`audio_stft.h`（RES gain 就是 `Aec` 自己的 `ctx.res_gain`）；範例 `pipelines/mono_aec_nr_res/main.c` |
+| 4ch linear AEC flow（`Mcab`：共用 delay、四條 lane 的驅動與 fuse；lane 與 estimator 由應用建立；不含 beamformer／RES／NR／合成） | `pipelines/4ch_aec_bf_nr_res/mcab.h` |
+| 4ch 的 SRP-PHAT／BF 串接（sample 層 helper，範例碼，不進 archive） | `pipelines/4ch_aec_bf_nr_res/mcab_sample_beam.h` |
 | 只做單路 AEC，或自行組合 NN／其他 post-filter | `aec.h` |
 | 已有 STFT/WOLA，只需要頻域 NR | `anr.h` |
 | 只需要 FFT、resample、HPF | `audiolib/common/include/*.h` |
@@ -72,16 +72,17 @@
 | DeepFilterNet2 加速器 handoff | `AINR/DeepFilterNet2/dfn2_prepost.h` |
 | DeepFilterNet3 加速器 handoff | `AINR/DeepFilterNet3/dfn3_prepost.h` |
 
-只有「多聲道線性 AEC + BF」被包成一個單元（`AudioPipeline4Ch`；`fuse()` 之後 `frame->g_res_ctx` 為 NULL，單元不持有 `AecRes`）。
-mono 是例外：它的 RES gain 就在 `Aec` 的呼叫裡（`aec_process_context()` 算出，`se_frame_from_aec()` 交成 `frame.g_res_ctx`）。
-4ch 的 post-beam RES、NR、comfort noise、合成與 NN 後濾波都是獨立的 library，各自查大小、各自 init，由整合者串接。
-各範例 `main` 自己初始化用到的函式庫並明寫每 hop 的串接（4ch 為 `se_res_stage_gain()` 的 RES gain → `se_anr_stage_gain()` → `sk_min_f32()` →
-`sk_capply_gain_f32()` → `aec_cng_fill()` → `ac_istft_push()`）；`pipelines/samples/` 的共用範例碼
-（`se_anr_stage.h`、`dfn_hop.h`、`ulcnet_nn_stage.{h,c}`）示範 NR 級與 NN stage 怎麼串；沒有 ABI，
+只有「多聲道線性 AEC 的 flow」被包成一個模組（`Mcab`；`mcab_fuse()` 之後 `frame->g_res_ctx` 為 NULL，mcab 不持有 `AecRes`、也不含 beamformer）。
+它是 flow 層而不是函式庫：四條 `Aec` lane 與（MATCHED）共用的 `DelayAec` 由應用用 lib/aec 自己的 `*_get_mem_size`／`*_init` 建立，以指標交給 `mcab_init_ex()`；mcab 只擁有自己 pool 裡的 flow 狀態。
+mono 是例外：它的 RES gain 就在 `Aec` 的呼叫裡（`aec_process_context()` 算出，`aec_get_res_context()` 以 `ctx.res_gain` 交出）。
+4ch 的 beamformer（範例用 sample 層 helper `mcab_sample_beam_*`）、post-beam RES、NR、comfort noise、合成與 NN 後濾波都是獨立的物件，各自查大小、各自 init，由整合者串接。
+各範例 `main` 自己初始化用到的函式庫並明寫每 hop 的串接（4ch 為 `aec_res_process()` 的 RES gain → `mcab_sample_anr_gain()` → `sk_min_f32()` →
+`sk_capply_gain_f32()` → `aec_cng_fill()` → `ac_istft_push()`）；共用的範例碼
+（`pipelines/4ch_aec_bf_nr_res/mcab_sample_post.h`、`pipelines/dfn/dfn_hop.h`、`pipelines/ulcnet/ulcnet_nn_stage.{h,c}`）示範 4ch 的 RES／NR 串接與 NN stage 怎麼串；沒有 ABI，
 可整份複製改寫，不要在 application 重新發明 AEC/NR gain fusion、window、OLA 或 CNG 的順序。
 
 各條流程的**呼叫時序圖**（含回傳值、被拒時的處理與 hop 泳道）與**公開／內部函式、外部／內部參數**分級見各整合手冊的第 0 節：
-[mono](integration_mono_zh_TW.md)、[4ch 核心](integration_4ch_core_zh_TW.md)、[4ch 單元](integration_4ch_spatial_zh_TW.md)；
+[mono](integration_mono_zh_TW.md)、[4ch 核心手冊](integration_4ch_core_zh_TW.md)、[4ch 空間手冊](integration_4ch_spatial_zh_TW.md)；
 板端的 query → allocate → init → teardown 順序見 [pipeline_board_integration.md](pipeline_board_integration.md)。本文 [§3.6](audio_libraries_c_api_zh_TW_01_aec_nr_audiolib.md#36-參數分級外部與內部)、[§4.6](audio_libraries_c_api_zh_TW_01_aec_nr_audiolib.md#46-參數分級外部與內部) 是 AEC 與 NR 兩個函式庫自己的參數分級。
 
 ---
@@ -96,7 +97,7 @@ mono 是例外：它的 RES gain 就在 `Aec` 的呼叫裡（`aec_process_contex
 | 16 kHz | 512 | 256 | 257 | 可選 |
 | 48 kHz | 1024 | 512 | 513 | 48 kHz 產品 grid |
 
-AEC 與 NR 另支援 8 kHz grid（非產品主 grid），4ch product pipeline 不接受它。不要只傳
+AEC 與 NR 另支援 8 kHz grid（非產品主 grid），4ch 的 `Mcab` 不接受它（`McabConfig.sample_rate` 只收 16000／48000）。不要只傳
 `sample_rate` 後讓底層猜 FFT；16 kHz 有兩個合法值，建立實例前必須 resolve 成明確的
 `fft_size`。
 

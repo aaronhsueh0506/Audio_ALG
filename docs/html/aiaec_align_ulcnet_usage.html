@@ -38,8 +38,8 @@ th{background:#eef1f5}
 <p>Align-ULCNet 是接在 linear AEC 後面的 RES+NR post-filter：輸入是 linear AEC 的 <b>error</b> 與<b>未對齊的 raw far</b>（兩者取自同一個輸入 hop）。C 端有三個層次，整合者通常只用第一或第二個：</p>
 <div class="tbl"><table>
 <tr><th>入口</th><th>用途</th><th>標頭</th></tr>
-<tr><td><b>A. <code>UlcnetPrepost</code> 類別（建議）</b></td><td>hop 進 hop 出（<code>ULCNET_IO_TIME</code>）或頻譜進頻譜出（<code>ULCNET_IO_FREQ</code>，串接 AEC 或 4ch 單元輸出頻譜用）；framing、壓縮域前端、四個 state、mask 套用全在物件內</td><td><code>ulcnet_prepost.h</code></td></tr>
-<tr><td>B. <code>UlcnetAcceleratorAdapter</code></td><td>把加速器 graph 包成 <code>UlcnetModel</code> callback，交給 pipeline／sample stage（<code>pipelines/samples/ulcnet_nn_stage.c</code>）驅動；內部就是一個 <code>ULCNET_IO_FREQ</code> 的類別實例</td><td><code>ulcnet_accelerator_adapter.h</code></td></tr>
+<tr><td><b>A. <code>UlcnetPrepost</code> 類別（建議）</b></td><td>hop 進 hop 出（<code>ULCNET_IO_TIME</code>）或頻譜進頻譜出（<code>ULCNET_IO_FREQ</code>，串接 AEC 或 4ch 路徑的頻譜用）；framing、壓縮域前端、四個 state、mask 套用全在物件內</td><td><code>ulcnet_prepost.h</code></td></tr>
+<tr><td>B. <code>UlcnetAcceleratorAdapter</code></td><td>把加速器 graph 包成 <code>UlcnetModel</code> callback，交給 pipeline／sample stage（<code>pipelines/ulcnet/ulcnet_nn_stage.c</code>）驅動；內部就是一個 <code>ULCNET_IO_FREQ</code> 的類別實例</td><td><code>ulcnet_accelerator_adapter.h</code></td></tr>
 <tr><td>C. <code>ulcnet_model_io_*</code></td><td>只要 state 與 prepare／commit，不含 framing；類別就是由它組成</td><td><code>ulcnet_model_io.h</code></td></tr>
 </table></div>
 <p>模型內容、graph 邊界（layout 18）、I/O 表、State 表見 <a href="aiaec_align_ulcnet.html">aiaec_align_ulcnet</a>；far branch／PTQ／reprime 見 <a href="aiaec_align_ulcnet_detail.html">aiaec_align_ulcnet_detail</a>。</p>
@@ -218,7 +218,7 @@ caller                         UlcnetPrepost (C)                   NPU runtime
 <ul>
 <li><code>AIAEC/Align_ULCNet/ulcnet_prepost.c</code> / <code>.h</code>、<code>ulcnet_model_io.c</code> / <code>.h</code>、<code>ulcnet_process.c</code> / <code>.h</code>、<code>ulcnet_accelerator_adapter.c</code> / <code>.h</code>；建置：<code>make -C AIAEC lib</code>（<code>libaiaec_prepost.a</code>）</li>
 <li>測試：<code>AIAEC/tests/test_ulcnet_prepost_c.py</code>、<code>test_ulcnet_model_io_c.py</code>、<code>test_ulcnet_process_c.py</code>、<code>test_ulcnet_accelerator_adapter.c</code></li>
-<li>host 範例：<code>pipelines/mono_alignulcnet/main.c</code>、<code>pipelines/4ch_alignulcnet/main.c</code>（<a href="pipeline_ulcnet_mono.html">pipeline_ulcnet_mono</a>、<a href="pipeline_ulcnet_4ch.html">pipeline_ulcnet_4ch</a>、<a href="pipeline_ulcnet_detail.html">pipeline_ulcnet_detail</a>）</li>
+<li>host 範例：<code>pipelines/ulcnet/mono_alignulcnet/main.c</code>、<code>pipelines/ulcnet/4ch_alignulcnet/main.c</code>（<a href="pipeline_ulcnet_mono.html">pipeline_ulcnet_mono</a>、<a href="pipeline_ulcnet_4ch.html">pipeline_ulcnet_4ch</a>、<a href="pipeline_ulcnet_detail.html">pipeline_ulcnet_detail</a>）</li>
 <li>同類頁面：<a href="aiaec_align_ulcnet.html">aiaec_align_ulcnet</a>、<a href="aiaec_deepvqe_s_usage.html">aiaec_deepvqe_s_usage</a>、<a href="onnx_prepost.html">onnx_prepost</a>、<a href="index.html">index</a></li>
 <li>文件：<a href="../../AIAEC/Align_ULCNet/README.md">README.md</a>、<a href="../../AIAEC/README.md">AIAEC/README.md</a></li>
 </ul>

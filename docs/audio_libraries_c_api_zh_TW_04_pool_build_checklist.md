@@ -20,15 +20,15 @@ config
 - 不要共用同一塊可寫 pool 給兩個 live instance。
 - `_init()` 回傳 NULL 就停止，不可退回較小尺寸或默默改 config。
 - static path 的 destroy 是 no-op 或只做狀態清理；pool ownership 永遠在 caller。
-- 沒有「整條 pipeline」的 aggregate sizing API：mono 的每個函式庫各自查大小、整合者加總（[§6.10](audio_libraries_c_api_zh_TW_03_ai_prepost_pipeline.md#610-各函式庫各自初始化記憶體加總與單元的公開面)）；4ch 單元的
-  `audio_pipeline_4ch_get_mem_requirements()` 只含單元自己，RES（`AecRes`）、NR、合成與 NN stage 另計。
+- 沒有「整條 pipeline」的 aggregate sizing API：mono 的每個函式庫各自查大小、整合者加總（[§6.10](audio_libraries_c_api_zh_TW_03_ai_prepost_pipeline.md#610-各函式庫各自初始化記憶體加總與-flow-的公開面)）；4ch 的
+  `mcab_get_mem_requirements()` 只含 mcab 自己的 pool，四條 lane、共用 estimator、SRP-PHAT／BF helper、RES（`AecRes`）、NR、合成與 NN stage 另計。
 
 ---
 
 ## 8. 建置、SIMD 與連結
 
 從 `SE/` 根目錄做參考建置（`libaudio_common.a` 在 `audiolib/common`；`audiolib` 根目錄的 `lib` 另建 `libspatial_common.a`、
-`libdoa.a`、`libbf.a`、`libvad.a`，只有 4ch 單元需要）：
+`libdoa.a`、`libbf.a`、`libvad.a`；4ch 的 sample 層 helper `mcab_sample_beam` 連結其中的 `libdoa.a`、`libbf.a`、`libspatial_common.a`，`libaudio_pipeline_mcab.a` 本身不參照它們）：
 
 ```bash
 make -C audiolib/common lib BACKEND=ne10 SIMD=0
@@ -50,8 +50,8 @@ make -C NR/c_impl       lib BACKEND=ne10 SIMD=1
 模型 pre/post 類別（[§6](audio_libraries_c_api_zh_TW_02_ai_prepost_models.md#6-ai-模型-prepost-類別)）另有兩個 archive，同樣是 configuration-keyed：
 
 ```bash
-make -C AIAEC lib ; make -C AIAEC -s print-lib-path   # libaiaec_prepost.a
-make -C AINR  lib ; make -C AINR  -s print-lib-path   # libainr_prepost.a
+make -C Audio_ALG/AIAEC lib ; make -C Audio_ALG/AIAEC -s print-lib-path   # libaiaec_prepost.a
+make -C Audio_ALG/AINR  lib ; make -C Audio_ALG/AINR  -s print-lib-path   # libainr_prepost.a
 ```
 
 兩者都落在自己 repo 的 `build/simd<N>-<sig>/` 下（`<sig>` 是各自 Makefile 的組態簽章 cksum：

@@ -19,7 +19,7 @@ sys.path.insert(0, ROOT)
 sys.path.insert(0, os.path.join(ROOT, 'lib', 'aec', 'python'))
 
 from aec import AecConfig, AecMode                              # noqa: E402
-from pipelines.aec_nr_pipeline import (                         # noqa: E402
+from pipelines.mono_aec_nr_res.pipeline import (                         # noqa: E402
     run_aec_linear, run_nr_spectrum, run_res,
     PROD_INJECT_ECHO_PSD,
 )

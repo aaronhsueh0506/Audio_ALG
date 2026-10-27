@@ -59,12 +59,12 @@ TOL2 = {                     # Layer 2: shipped (fast-math, NEON) against std-ma
 }
 
 SOURCES = [   # hashed into the JSON so a result can be tied to the code it judged
-    'Audio_ALG/pipelines/4ch_aec_bf_nr_res/4aec_nr_res.c',
+    'Audio_ALG/pipelines/4ch_aec_bf_nr_res/mcab.c',
     'Audio_ALG/pipelines/4ch_aec_bf_nr_res/pipeline.py',
-    'Audio_ALG/pipelines/aec_nr_pipeline.py',
-    'Audio_ALG/pipelines/cng_aec3.py',
-    'Audio_ALG/pipelines/common/se_stage.h',
-    'Audio_ALG/pipelines/samples/se_anr_stage.h',
+    'Audio_ALG/pipelines/mono_aec_nr_res/pipeline.py',
+    'Audio_ALG/pipelines/common/cng_aec3.py',
+    'Audio_ALG/pipelines/4ch_aec_bf_nr_res/mcab.h',
+    'Audio_ALG/pipelines/4ch_aec_bf_nr_res/mcab_sample_post.h',
     'Audio_ALG/pipelines/tests/pyc_parity/pyc_drv.c',
     'Audio_ALG/lib/aec/c_impl/src/aec_res.c',
 ]
@@ -224,7 +224,7 @@ class Ctx:
 
     @property
     def P(self):
-        return self.mod('pipelines.aec_nr_pipeline')
+        return self.mod('pipelines.mono_aec_nr_res.pipeline')
 
     @property
     def M4(self):
@@ -374,7 +374,7 @@ def quiet():
 
 
 def py_nr(cx, seam, usable, nr_preset='balanced'):
-    """aec_nr_pipeline.run_nr_spectrum over a recorded seam, usable_linear from `usable`."""
+    """mono_aec_nr_res.pipeline.run_nr_spectrum over a recorded seam, usable_linear from `usable`."""
     ctxs = [types.SimpleNamespace(error_spec=seam.E[h], r2=seam.R2[h], usable_linear=bool(usable[h]))
             for h in range(seam.nh)]
     with quiet():
@@ -408,7 +408,7 @@ def py4_stock(cx, g, sr, fft):
     ins = grid_inputs(sr)
     mics = np.fromfile(cx.inp(ins['mic4']), np.float32).reshape(-1, 4)
     ref = np.fromfile(cx.inp(ins['ref']), np.float32)
-    pipe = M4.FourChannelAecPipeline(M4.FourChannelAecConfig(sample_rate=sr, frame_size=fft))
+    pipe = M4.McabPipeline(M4.McabConfig(sample_rate=sr, frame_size=fft))
     hop, nf = pipe.hop_size, pipe.n_freqs
     W = np.full((4, nf), 0.25, np.complex64)
     nh = min(len(mics), len(ref)) // hop
@@ -429,8 +429,8 @@ def py4_stock(cx, g, sr, fft):
     try:
         for h in range(nh):
             sl = slice(h * hop, (h + 1) * hop)
-            front = pipe.front_process(mics[sl], ref[sl])
-            bf = M4.BeamformerFrame(samples=front.linear_channels.mean(axis=1, dtype=np.float32), weights=W)
+            front = pipe.process_front(mics[sl], ref[sl])
+            bf = M4.McabBeam(samples=front.linear_channels.mean(axis=1, dtype=np.float32), weights=W)
             pipe.fuse(front, bf)
             res['hops_run'] = h + 1
     except Exception as exc:                                     # noqa: BLE001 -- the exception is the result
@@ -454,7 +454,7 @@ def py4_run(cx, g, sr, fft):
     ins = grid_inputs(sr)
     mics = np.fromfile(cx.inp(ins['mic4']), np.float32).reshape(-1, 4)
     ref = np.fromfile(cx.inp(ins['ref']), np.float32)
-    pipe = M4.FourChannelAecPipeline(M4.FourChannelAecConfig(sample_rate=sr, frame_size=fft))
+    pipe = M4.McabPipeline(M4.McabConfig(sample_rate=sr, frame_size=fft))
     hop, nf = pipe.hop_size, pipe.n_freqs
     W = np.full((4, nf), 0.25, np.complex64)
     nh = min(len(mics), len(ref)) // hop
@@ -465,8 +465,8 @@ def py4_run(cx, g, sr, fft):
     prev_warm, prev_soft = pipe.realign_warm_lane_count, pipe.realign_soft_lane_count
     for h in range(nh):
         sl = slice(h * hop, (h + 1) * hop)
-        front = pipe.front_process(mics[sl], ref[sl])
-        bf = M4.BeamformerFrame(samples=front.linear_channels.mean(axis=1, dtype=np.float32), weights=W)
+        front = pipe.process_front(mics[sl], ref[sl])
+        bf = M4.McabBeam(samples=front.linear_channels.mean(axis=1, dtype=np.float32), weights=W)
         fr = pipe.fuse(front, bf)
         r['verdict'][h] = 1 if fr.context.usable_linear else 0
         r['conv'][h] = 1 if fr.context.filter_converged else 0
@@ -512,10 +512,10 @@ def sec_a(cx, g, sr, fft, want):
                            usable=np.concatenate([verdict, np.zeros(base.nh - n, np.uint8)]))
             m = stats(rep.Gnr, g_pyv)
             rows.append(make_row(pre + 'glue_fold', 1,
-                                 'NR glue with the R^2 fold active: Python NR vs C se_anr_stage_gain over the same frame, usable = Python verdict',
+                                 'NR glue with the R^2 fold active: Python NR vs C mcab_sample_anr_gain over the same frame, usable = Python verdict',
                                  'pyc_drv_4ch replay (usable = Python verdict); run_nr_spectrum(C E, C R2, Python verdict)',
                                  gate=m['max_abs'] <= tol, metrics=m, tol={'max_abs': tol}, grid=g, ref='Python',
-                                 note='verdict true on %d of %d hops (this row exercises the se_anr_stage.h r2 fold)' % (int(verdict.sum()), n)))
+                                 note='verdict true on %d of %d hops (this row exercises the mcab_sample_post.h r2 fold)' % (int(verdict.sum()), n)))
         if want(pre + 'verdict_flag'):
             mism = int(np.count_nonzero(verdict.astype(bool) != base.usable[:n]))
             first = np.flatnonzero(verdict.astype(bool) != base.usable[:n])
@@ -525,7 +525,7 @@ def sec_a(cx, g, sr, fft, want):
             rows.append(make_row(pre + 'verdict_flag', 1, 'fused usable_linear: Python verdict vs C frame flag, per hop',
                                  prod_c + '; pipeline.fuse() context.usable_linear (stock Python 4ch; lane-0 far-spec fusion on a mixed warm/soft-realign hop, S-27, no raise)',
                                  gate=mism == 0, metrics=m, tol={'mismatch_hops': 0}, grid=g, ref='Python',
-                                 note='C flag = four_aec_fuse AND of usable_linear over contributing lanes'))
+                                 note='C flag = mcab_fuse AND of usable_linear over contributing lanes'))
         if want(pre + 'gnr_e2e'):
             g_pyv = py_nr(cx, base, np.concatenate([verdict, np.zeros(base.nh - n, np.uint8)]))
             m = stats(base.Gnr, g_pyv)
@@ -632,7 +632,7 @@ def sec_c(cx, g, sr, fft, want):
          'python_message': stock['message'], 'python_lane_far_spread': stock.get('lane_far_spread'),
          'python_lane_far_peak': stock.get('lane_far_peak'), 'hops_compared': int(n2),
          'trajectory_equal_hops': traj_eq}
-    prod = 'pyc_drv_4ch chain sr=%d fft=%d; stock FourChannelAecPipeline.front_process/fuse until the first exception' % (sr, fft)
+    prod = 'pyc_drv_4ch chain sr=%d fft=%d; stock McabPipeline.process_front/fuse until the first exception' % (sr, fft)
     if g == '48k1024':
         # The scenario is vacuous unless the C core really took a mixed warm/soft realign on this input.
         vac = not mixed
@@ -657,7 +657,7 @@ def sec_c(cx, g, sr, fft, want):
 # --------------------------------------------------------------------------------------------------
 def mono_cng_twin_out(cx, seam, cn_floor):
     """Python min / apply / comfort noise (cng_aec3 twin, the amplitude recipe of aec_cng_fill) / OLA over a C seam."""
-    from pipelines.cng_aec3 import Aec3ComfortNoise
+    from pipelines.common.cng_aec3 import Aec3ComfortNoise
     P = cx.P
     nf, hop = seam.nf, seam.hop
     bs = 2 * (nf - 1)
@@ -668,7 +668,7 @@ def mono_cng_twin_out(cx, seam, cn_floor):
     out = np.zeros(seam.nh * hop, np.float32)
     for h in range(seam.nh):
         gt = P.total_gain(seam.Gnr[h], seam.Gres[h], True, True, 'min', nf)
-        spec = P.apply_gain(types.SimpleNamespace(e=seam.E[h]), gt)
+        spec = P.apply_gain(seam.E[h], gt)
         if cn_floor is not None:
             n_amp = np.sqrt(np.maximum(seam.CN[h] / psd, 0.0)).astype(np.float32)
             ng = np.sqrt(np.maximum(1.0 - seam.Gres[h] * seam.Gres[h], 0.0)).astype(np.float32)
@@ -696,7 +696,7 @@ def sec_d(cx, g, sr, fft, want):
         out_py = mono_cng_twin_out(cx, nocng, None)
         m = stats(nocng.out, out_py)
         rows.append(make_row(pre + 'min_apply_ola', 1, 'mono min / apply / OLA: Python total_gain, apply_gain, synthesize_hop over the C seam and C gains vs C output (CNG off)',
-                             prod + ' enable_cng=0; aec_nr_pipeline.total_gain/apply_gain/synthesize_hop', gate=m['max_abs'] <= tol_out,
+                             prod + ' enable_cng=0; mono_aec_nr_res.pipeline.total_gain/apply_gain/synthesize_hop', gate=m['max_abs'] <= tol_out,
                              metrics=m, tol={'max_abs': tol_out}, grid=g, ref='Python'))
     if want(pre + 'cng_glue'):
         cng = c_mono(cx, 1, g, sr, fft, tag='cng', enable_cng=1)
@@ -705,7 +705,7 @@ def sec_d(cx, g, sr, fft, want):
         rows.append(make_row(pre + 'cng_glue', 1, 'mono min / apply / comfort noise / OLA with CNG on: Python glue + cng_aec3 twin over the C seam vs C output',
                              prod + ' enable_cng=1; total_gain/apply_gain + cng_aec3.Aec3ComfortNoise.add/synthesize_hop', gate=m['max_abs'] <= tol_out,
                              metrics=m, tol={'max_abs': tol_out}, grid=g, ref='Python',
-                             note='aec_nr_pipeline.comfort_noise_fill is a documented Gaussian look-alike and is not compared here (see d.mono.cng_lookalike)'))
+                             note='mono_aec_nr_res.pipeline.comfort_noise_fill is a documented Gaussian look-alike and is not compared here (see d.mono.cng_lookalike)'))
     if want(pre + 'legacy_amin'):
         a = c_mono(cx, 1, g, sr, fft, tag='nocng', enable_cng=0)
         b = c_mono(cx, 1, g, sr, fft, tag='leg1', enable_cng=0, legacy_amin=1)
@@ -733,7 +733,7 @@ def sec_d_global(cx, want):
         r = subprocess.run([cx.drv(1, 'mono'), 'probe', 'sr=8000', 'fft=0'], stdout=subprocess.PIPE, stderr=subprocess.PIPE)
         c_line = r.stdout.decode(errors='replace').strip()
         m = {'python_supports_8k': not raised, 'python_message': msg, 'c_accepts_8k': r.returncode == 0, 'c_probe': c_line}
-        rows.append(make_row('d.mono.8k', 1, 'mono at 8 kHz', 'aec_nr_pipeline._project_grid(8000); pyc_drv_mono probe sr=8000', skip=True,
+        rows.append(make_row('d.mono.8k', 1, 'mono at 8 kHz', 'mono_aec_nr_res.pipeline._project_grid(8000); pyc_drv_mono probe sr=8000', skip=True,
                              metrics=m, grid=None, ref='Python',
                              note='SKIP: Python mono pipeline admits only 16000 and 48000 Hz (%s); C mono at 8 kHz: %s (C only, documented) -- no reference to compare' % (msg, c_line)))
     return rows
@@ -741,7 +741,7 @@ def sec_d_global(cx, want):
 
 def cng_twin(cx):
     """C aec_cng_fill against cng_aec3.Aec3ComfortNoise, three hops with carried state, 18 cases."""
-    from pipelines.cng_aec3 import Aec3ComfortNoise, SEED
+    from pipelines.common.cng_aec3 import Aec3ComfortNoise, SEED
     rs = np.random.RandomState(1)
     psd = np.float32(32768.0 ** 2)
     exe = cx.drv(1, 'mono')
@@ -801,9 +801,8 @@ def run_cng_c(cx, exe, n, rng, floor, spec, cn, gr, gn, use_gnr):
 
 
 def cng_lookalike(cx):
-    """aec_nr_pipeline.comfort_noise_fill (Gaussian look-alike) against the C fill: noise level only."""
-    from pipelines.cng_aec3 import SEED
-    from pipelines.se_stage import SeSpecFrame
+    """mono_aec_nr_res.pipeline.comfort_noise_fill (Gaussian look-alike) against the C fill: noise level only."""
+    from pipelines.common.cng_aec3 import SEED
     P = cx.P
     rs = np.random.RandomState(1)
     n = 513
@@ -811,21 +810,20 @@ def cng_lookalike(cx):
     gr = (rs.rand(n) * 0.5).astype(np.float32)
     gn = np.ones(n, np.float32)
     spec0 = np.zeros(n, np.complex64)
-    fr = SeSpecFrame(n_freqs=n, hop=512, e=spec0, cn=cn)
     exe = cx.drv(1, 'mono')
     tp, tc = [], []
     rng = np.random.RandomState(0)
     rng_c, sc = SEED, spec0.copy()
     for _ in range(400):
-        tp.append(P.comfort_noise_fill(spec0, fr, gr, np.ones(n, np.float32), rng))
+        tp.append(P.comfort_noise_fill(spec0, cn, gr, np.ones(n, np.float32), rng))
         rng_c, sc = run_cng_c(cx, exe, n, rng_c, 0.31622777, spec0, cn, gr, gn, True)
         tc.append(sc)
     tp, tc = np.array(tp), np.array(tc)
     rms = lambda x: float(np.sqrt(np.mean(x[:, 1:-1] ** 2)))             # noqa: E731
     m = {'rms_re_python': rms(tp.real), 'rms_re_c': rms(tc.real), 'rms_im_python': rms(tp.imag), 'rms_im_c': rms(tc.imag),
          'rms_ratio_python_over_c': rms(tp.real) / rms(tc.real), 'identical_samples': int(np.count_nonzero(tp == tc)), 'n': int(tp.size)}
-    return make_row('d.mono.cng_lookalike', 1, 'mono comfort-noise fill of aec_nr_pipeline.py vs C (noise level; the source differs by design)',
-                    'aec_nr_pipeline.comfort_noise_fill vs pyc_drv_mono cng, 400 hops, n=513', gate=None, metrics=m,
+    return make_row('d.mono.cng_lookalike', 1, 'mono comfort-noise fill of mono_aec_nr_res/pipeline.py vs C (noise level; the source differs by design)',
+                    'mono_aec_nr_res.pipeline.comfort_noise_fill vs pyc_drv_mono cng, 400 hops, n=513', gate=None, metrics=m,
                     ref='Python', note='INFO: documented (D1) Gaussian look-alike of the AEC3 sin-LUT/LCG source; only the level recipe is shared. The exact twin is d.mono.cng_twin')
 
 

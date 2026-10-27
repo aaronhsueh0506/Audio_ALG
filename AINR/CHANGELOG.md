@@ -2,6 +2,39 @@
 
 ## Unreleased
 
+### DFN2 / DFN3 lookahead pairs: 15 legal pairs, exported and run
+
+- Legal pairs are `mask_lookahead` in 0..2 and `df_lookahead` in
+  0..`df_order`-1, independent of each other (15 pairs); the former rule
+  `df_lookahead <= mask_lookahead` is gone from the models, the C range checks
+  and the tests. A checkpoint trained for one pair is still refused under
+  another, with one shared instruction (`onnx_streaming_contract`).
+- The graph, tensor names, shapes, state layouts (DFN2 8, DFN3 9) and the shipped
+  1/1 graph are unchanged; `mask_lookahead` only selects the host window
+  `[t-(2-M) .. t+M]`. `feature_windows()` takes the lookahead (no default) and
+  validates it when called; the export metadata gains `mask_lookahead`,
+  `df_lookahead` and a derived `input_window_alignment` (unchanged string for 1);
+  the calibration reports (`inference.py calib`, `inference_batch.py calib`) name
+  the pair.
+- C: `DFN2_MASK_LOOKAHEAD` / `DFN2_DF_LOOKAHEAD` and the DFN3 twins are build
+  constants (defaults 1/1) range-checked by preprocessor `#error` in every
+  language mode; objects built for different pairs fail to link (a one-byte
+  symbol named after the pair, no code or allocation); model-io readiness is
+  `MASK + 1` frames. DFN2 (cascade) delays `M + D` frames with a ring of
+  `max(DF_ORDER, M + D + 1)`; DFN3 (parallel) delays `max(M, D)` frames with a
+  ring of `DF_ORDER + max(M, D) - D`, and keeps the heads in the ring when
+  `D > M` (`DFN3_HEAD_QUEUE`). For the shipped pair the code, state sizes, pool
+  hash and test digests are unchanged. `dfn3_compose()` documents its
+  same-frame head pairing.
+- Tests: `tests/dfn_pairs.py` is the one source of the pair set (probed from the
+  model constructors), the shipped pair (`config.ini`) and the compile flags
+  (`make print-cflags`, `make print-sources`); `make test-pairs` runs the
+  per-pair pytest files. New: `test_dfn_lookahead_link.py` (link and compile
+  guards), `test_dfn_lookahead_calibration.py`, `test_dfn_lookahead_contract.py`,
+  `test_dfn2_lookahead_pairs.py`; the DFN3 stream driver gained a pool-identity
+  check across pairs. C builds run for the six pairs with `D <= M` plus (0,1),
+  (1,3), (2,4).
+
 ### Known gap (AIAEC)
 - `AIAEC/dataset_gen/linear_aec.py` registers the AEC Python behaviour-hash step 5fe64e46 -> 428aa9b7 as a
   compatible migration without a measurement that the frozen front end is unchanged over that step; a mismatch only

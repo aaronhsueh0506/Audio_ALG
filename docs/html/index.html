@@ -111,13 +111,13 @@ I-O 表 / State 表 / 延遲與 warm-up / 相關檔案與測試路徑。全站�
 <code>audiolib/docs/html/</code>（空間鏈：VAD／DOA／BF）。本站以連結方式指向；連結假設 SE 樹 sibling 佈局
 （<code>SE/{AEC,NR,audiolib,Audio_ALG}</code> 同層)。</p>
 <p class="note"><b>RES 的歸屬</b>：mono 的 RES 增益在 <code>aec_process_context()</code> 內算出，經
-<code>se_frame_from_aec()</code> 以 <code>frame.g_res_ctx</code> 交出，強度用 <code>aec_set_preset()</code>（mono 是明確例外，
-範例只決定套不套用）。4ch 單元 <code>AudioPipeline4Ch</code> 只做到 <code>fuse()</code>（<code>g_res_ctx</code> 為 NULL），
+<code>aec_get_res_context()</code> 以 <code>AecResContext.res_gain</code> 交出，強度用 <code>aec_set_preset()</code>（mono 是明確例外，
+範例的 <code>mono_form()</code> 只決定套不套用）。4ch flow <code>Mcab</code>（<code>mcab.h</code>）只做到 <code>mcab_fuse()</code>（<code>g_res_ctx</code> 為 NULL），
 <b>不含 RES</b>；要 RES 的應用在自己的 init 用 libaec 的 <code>aec_res_get_mem_size()</code>／<code>aec_res_init()</code> 建立
-<code>AecRes</code>，每 hop 呼叫 <code>se_res_stage_gain()</code>（<code>common/se_stage.h</code>），強度用
+<code>AecRes</code>，每 hop 呼叫 <code>aec_res_process()</code>（輸入由 <code>mcab_sample_res_input()</code> 自 <code>McabFrame</code> 填入），強度用
 <code>aec_res_set_preset()</code>。</p>
 <p class="note"><b>版號</b>（出處為 header，<code>pipelines/tests/test_doc_layout_versions.py</code> 逐頁核對）：
-4ch 單元 <code>AUDIO_PIPELINE_4CH_LAYOUT_VERSION</code> = 21、4ch 核心 <code>FOUR_AEC_NR_RES_LAYOUT_VERSION</code> = 24；
+4ch flow <code>MCAB_LAYOUT_VERSION</code> = 25；
 全表見 <a href="conventions.html">conventions</a>。</p>
 
 <h2>Repo 架構總覽</h2>
@@ -128,8 +128,8 @@ SE/                                (同層四個 repo)
 │     common/include/: fft_wrapper.h (NE10 RFFT/IRFFT) · ac_complex.h · wav_io.h
 │                      hpf.h · audio_resampler.h · audio_stft.h · audio_window.h
 │     common/utility/: simd_kernels.h · simd_kernel_nn.h · fast_math.h · mem_align.h
-│     doa/ (SRP-PHAT)  bf/ (RLS beamformer)  ← 4ch 單元連結的空間庫
-│     VAD/ (遮罩 + 有聲判定)  ← 應用自選，單元不連結
+│     doa/ (SRP-PHAT)  bf/ (RLS beamformer)  ← 4ch sample beam helper 連結的空間庫
+│     VAD/ (遮罩 + 有聲判定)  ← 應用自選，mcab 與 helper 都不連結
 │         ▲            ▲            ▲
 │         │            │            │ (libaudio_common.a)
 ├── AEC/  ┘            │            │   primary dev repo：線性 AEC (PBFDKF
@@ -140,20 +140,20 @@ SE/                                (同層四個 repo)
       ├── lib/aec        = SE/AEC  submodule (c_impl/: libaec.a)
       ├── lib/nr         = SE/NR   submodule (c_impl/: libanr.a)
       ├── pipelines/     六個應用入口 + 共用 build
-      │     ├── mono_aec_nr_res/      mono AEC（RES 在 AEC 內）+ NR（無 unit：Aec + 各 main 自寫串接）
-      │     ├── mono_alignulcnet/     mono AEC + Align-ULCNet
-      │     ├── mono_aec_dfn_res/     mono AEC（RES 在 AEC 內）+ DFN2
-      │     ├── 4ch_aec_bf_nr_res/    4ch 單元（AudioPipeline4Ch：共享 delay + 4×AEC lanes + SRP-PHAT + BF + fuse，
-      │     │                         不含 RES）+ 共用 4-lane 核心；RES（libaec AecRes）／NR／CNG／合成由各 main 串接
-      │     ├── 4ch_alignulcnet/      4ch 單元（enable_post = 0，無 RES）+ Align-ULCNet
-      │     ├── 4ch_aec_bf_dfn_res/   4ch 單元 + main 自建的 libaec AecRes + DFN2
-      │     ├── common/               se_config（格點 + AecConfig 推導）、se_stage（SeSpecFrame、
-      │     │                         se_res_stage_gain）：mono / 4ch / mono ULCNet 共用
-      │     ├── samples/              範例碼：se_anr_stage（NR 級）、
-      │     │                         dfn_hop、ulcnet_nn_stage
-      │     ├── dfn_res_stage.{h,c}   兩支 DFN2 變體共用的 post-RES stage
-      │     └── dfn_rate_bridge.{h,c} 原生格點 host ↔ stage 的 48 kHz 格點
-      │                               （tests/test_dfn_rate_bridge.c）
+      │     ├── common/               example_cli.h（範例的數字與 delay 選項解析）、cng_aec3.py（Python 舒適噪音）
+      │     ├── mono_aec_nr_res/      mono AEC（RES 在 AEC 內）+ NR（Aec + main.c 自寫串接；
+      │     │                         一份 main.c 建兩個 binary）
+      │     ├── 4ch_aec_bf_nr_res/    mcab：4ch flow 層（共享 delay + 四條注入的 AEC lane + fuse，
+      │     │                         不含 RES、不含 beamformer）＋ sample 層 helper
+      │     │                         （mcab_sample_flow／_beam／_driver）＋ 範例 mcab_raw、mcab_static、
+      │     │                         mcab_external_static；RES（libaec AecRes）／NR／CNG／合成由各 main 串接
+      │     │                         （header-only 的 mcab_sample_post.h 收 RES 輸入、NR 增益與 CNG 常數）
+      │     ├── dfn/                  dfn_res_stage、dfn_rate_bridge、dfn_hop 等 DFN2 共用碼（lookahead pair 以 make 變數選，預設 1/1）
+      │     │     ├── mono_aec_dfn_res/     mono AEC（RES 在 AEC 內）+ DFN2
+      │     │     └── 4ch_aec_bf_dfn_res/   mcab + main 自建的 libaec AecRes + DFN2
+      │     └── ulcnet/               ulcnet_nn_stage（Align-ULCNet NN stage 範例）
+      │           ├── mono_alignulcnet/     mono AEC + Align-ULCNet
+      │           └── 4ch_alignulcnet/      mcab（enable_post = 0，無 RES）+ Align-ULCNet
       ├── AINR/          NN NR：DFN2 / DFN3 / GTCRN / RNNoise-ERB
       │                  (各自的 C 前後處理 + DFN2/DFN3 prepost class
       │                   + 訓練/推論 Python)
@@ -216,7 +216,7 @@ resampler、STFT／ISTFT、共用 <code>sk_*</code> 核心與建置旗標。</td
 <td><b>怎麼把三個 lib 接起來</b>：使用層級選擇、誰做 FFT／誰擁有 window／
 WOLA 在哪的三種答案、4ch front／fuse 協定、接 NN 的做法、整合檢查清單。</td></tr>
 <tr><td><a href="integration_sequence.html">integration_sequence</a></td>
-<td><b>整合時序圖</b>：mono、4ch 單元（process → fuse → 應用的 <code>se_res_stage_gain()</code> → NR → 合成）、4ch 核心＋外部 beamformer 的建立（size → alloc → init）、逐 hop、reset 與 destroy 時序，
+<td><b>整合時序圖</b>：mono、4ch mcab flow（<code>mcab_process_front()</code> → beamformer → <code>mcab_fuse()</code> → 應用的 <code>aec_res_process()</code> → NR → 合成）的建立（應用建 lane／estimator → size → alloc → <code>mcab_init_ex()</code>）、逐 hop、reset 與 destroy 時序，
 以及每個呼叫被拒時誰重設什麼的錯誤矩陣。</td></tr>
 <tr><td><a href="integration_example_detail.html">integration_example_detail</a></td>
 <td>release build 還剩什麼可 DEBUG：<code>nm</code> 實測結論、板端監看迴圈、現況的已知盲點。</td></tr>
@@ -241,58 +241,59 @@ fast_math、WAV I/O、HPF、resampler；三個上層 repo 的唯一 FFT 來源�
 <tr><td><a href="../../../audiolib/docs/html/doa_srp.html">doa_srp</a></td>
 <td>SRP-PHAT 方向估計與 <code>doa_smoother</code>：參數與函式表。</td></tr>
 <tr><td><a href="../../../audiolib/docs/html/bf.html">bf</a></td>
-<td>頻域 RLS 自適應波束器（GSC 結構：固定波束減自適應分支，<code>bf.c</code>）：參數與函式表；4ch 單元連結此模組。</td></tr>
+<td>頻域 RLS 自適應波束器（GSC 結構：固定波束減自適應分支，<code>bf.c</code>）：參數與函式表；4ch 的 sample beam helper 連結此模組（<code>mcab</code> 本體不連結）。</td></tr>
 <tr><td><a href="../../../audiolib/docs/html/vad.html">vad</a></td>
-<td>VAD 與頻率遮罩（<code>vad_api.h</code>、<code>masker.h</code>、<code>vad.h</code>）；4ch 單元不連結，由應用自選。</td></tr>
+<td>VAD 與頻率遮罩（<code>vad_api.h</code>、<code>masker.h</code>、<code>vad.h</code>）；<code>mcab</code> 與 sample helper 都不連結，由應用自選。</td></tr>
 </table>
 
 <h3>Pipelines（C 整合層）</h3>
 <table>
 <tr><th>頁面</th><th>一行描述</th></tr>
 <tr><td><a href="pipeline_mono.html">pipeline_mono</a></td>
-<td><code>pipelines/mono_aec_nr_res/main.c</code>：沒有 mono unit，<code>Aec</code>（linear，自帶 RES 增益）＋ <code>samples/se_anr_stage.h</code>（echo-aware NR 增益）；
+<td><code>pipelines/mono_aec_nr_res/main.c</code>：沒有 mono 單元層，<code>Aec</code>（linear，自帶 RES 增益）＋ main 內的 <code>mono_nr_gain()</code>（echo-aware NR 增益）；
 NR 與合成（<code>AnrDenoiser</code>、<code>AcIstft</code>）由 main 自己初始化並明寫逐 hop 串接（min、套 gain、CNG、合成）；
 各函式庫各自 <code>mem_size</code>／<code>init</code>，pool-first 零 heap；grid 8k/256、16k/256|512、48k/1024。頁內含呼叫順序、已編譯檢查的範例與時序圖。</td></tr>
 <tr><td><a href="pipeline_mono_params.html">pipeline_mono_params</a></td>
-<td>mono 的參數與入口分級：外部（<code>SeRequest</code>、<code>AnrMode</code>、執行期 setter、組成開關、進階 <code>AecConfig</code> 欄位）vs 內部（時間常數、門檻、seam、編譯期常數），公開 vs 內部函式清單。</td></tr>
+<td>mono 的參數與入口分級：外部（命令列旗標、<code>AnrMode</code>、執行期 setter、組成開關、進階 <code>AecConfig</code> 欄位）vs 內部（時間常數、門檻、seam、編譯期常數），公開 vs 內部函式清單。</td></tr>
 <tr><td><a href="pipeline_mono_detail.html">pipeline_mono_detail</a></td>
 <td>mono 的執行期強度控制（<code>aec_set_preset()</code>／<code>anr_set_mode()</code>）與逐階段耗時診斷。</td></tr>
 <tr><td><a href="pipeline_ulcnet_mono.html">pipeline_ulcnet_mono</a></td>
-<td><code>pipelines/mono_alignulcnet/main.c</code>：<code>Aec</code> 線性誤差 + 範例 stage <code>samples/ulcnet_nn_stage</code>（Align-ULCNet
+<td><code>pipelines/ulcnet/mono_alignulcnet/main.c</code>：<code>Aec</code> 線性誤差 + 範例 stage <code>ulcnet/ulcnet_nn_stage.c</code>（Align-ULCNet
 NN post-filter，per-frame callback）；一個 build 一個編譯期格點（16k/512/256 或
 48k/1024/512），演算法延遲 1 hop = 16 ms（48 k 為 10.67 ms）。</td></tr>
 <tr><td><a href="pipeline_4ch.html">pipeline_4ch</a></td>
-<td><code>pipelines/4ch_aec_bf_nr_res/</code>：唯一包起來的單元 <code>AudioPipeline4Ch</code>——共享 delay 對齊 + 4×AEC lanes（<code>4aec_nr_res.c</code> 核心）+ SRP-PHAT DOA +
-BF + <code>fuse</code>（把 E、R²、comfort noise 投影成 <code>SeSpecFrame</code>，<code>g_res_ctx</code> 為 NULL）。<b>單元不含 RES</b>：
-RES（libaec 的 <code>AecRes</code>）、NR、CNG、合成都是獨立函式庫，由各 main 在自己的 init 建立並串接：
-<code>se_res_stage_gain()</code> → NR gain → min → CNG → synthesis。頁內含呼叫順序、單元的已編譯檢查範例與時序圖。版號：單元 <code>AUDIO_PIPELINE_4CH_LAYOUT_VERSION</code> = 21、核心 <code>FOUR_AEC_NR_RES_LAYOUT_VERSION</code> = 24。</td></tr>
+<td><code>pipelines/4ch_aec_bf_nr_res/</code>：<code>mcab</code>，4ch 的 flow 層而不是函式庫——應用自己建立四條 <code>Aec</code> lane（<code>mcab_lane_config()</code> 或 <code>mcab_apply_lane_contract()</code>）與（MATCHED）一個共享 <code>DelayAec</code>，以指標交給 <code>mcab_init_ex()</code>；
+mcab 只擁有共享 delay 的 admission、對齊環與 fuse 緩衝。每 hop：<code>mcab_process_front()</code> → 呼叫端的 beamformer 權重 → <code>mcab_fuse()</code>（把 E、R²、comfort noise 投影成 <code>McabFrame</code>，<code>g_res_ctx</code> 為 NULL）。
+<b>mcab 不含 RES、不含 beamformer</b>；SRP-PHAT／BF 的 sample 層 helper 是 <code>mcab_sample_beam.{h,c}</code>（不在 archive 內）。
+RES（libaec 的 <code>AecRes</code>）、NR、CNG、合成由各 main 自己建立並串接：
+<code>aec_res_process()</code> → NR gain（<code>mcab_sample_anr_gain()</code>）→ min → CNG → synthesis。頁內含呼叫順序、已編譯檢查的範例與時序圖。版號：<code>MCAB_LAYOUT_VERSION</code> = 25。</td></tr>
 <tr><td><a href="pipeline_4ch_params.html">pipeline_4ch_params</a></td>
-<td>4ch 單元與核心的設定欄位分級（外部／外部進階／整合者專用／內部）、每 hop 輸入、固定常數、公開／內部函式清單、狀態碼與核心輸出契約。</td></tr>
+<td>4ch mcab 的設定欄位分級（<code>McabConfig</code>、lane 契約欄位、sample helper 參數）、每 hop 輸入、固定常數、公開／內部函式清單、狀態碼與輸出契約。</td></tr>
 <tr><td><a href="pipeline_4ch_detail.html">pipeline_4ch_detail</a></td>
-<td>核心＋外部 beamformer＋自備 <code>AecRes</code> 的呼叫範例、4ch 應用後級的執行期強度控制（<code>aec_res_set_preset()</code>／<code>anr_set_mode()</code>）與逐階段耗時診斷。</td></tr>
+<td>mcab＋呼叫端 beamformer＋自備 <code>AecRes</code> 的呼叫範例、4ch 應用後級的執行期強度控制（<code>aec_res_set_preset()</code>／<code>anr_set_mode()</code>）與逐階段耗時診斷。</td></tr>
 <tr><td><a href="pipeline_ulcnet_4ch.html">pipeline_ulcnet_4ch</a></td>
-<td><code>pipelines/4ch_alignulcnet/main.c</code>：4ch 單元（<code>enable_post=0</code>，不建 RES）的 BF 誤差<b>頻譜直送</b>
+<td><code>pipelines/ulcnet/4ch_alignulcnet/main.c</code>：mcab（<code>enable_post=0</code>，不建 RES）加 sample beam helper 的 BF 誤差<b>頻譜直送</b>
 Align-ULCNet NN post stage（不重建、不再分析）；新增演算法延遲 1 hop = 16 ms（48 k 為 10.67 ms）。</td></tr>
 <tr><td><a href="pipeline_ulcnet_detail.html">pipeline_ulcnet_detail</a></td>
 <td>兩條 ULCNet 範例共用的細節：參考 accelerator adapter（state 留在 CPU 端、每幀 prepare → run → commit）與 alignment 邊界的 identity reprime 推導。</td></tr>
 <tr><td><a href="pipeline_ulcnet_usage.html">pipeline_ulcnet_usage</a>／<a href="pipeline_ulcnet_sequence.html">pipeline_ulcnet_sequence</a>／<a href="pipeline_ulcnet_params.html">pipeline_ulcnet_params</a></td>
 <td>兩條 ULCNet 範例的呼叫方式、時序圖與參數表。</td></tr>
 <tr><td><a href="pipeline_dfn_mono.html">pipeline_dfn_mono</a></td>
-<td><code>pipelines/mono_aec_dfn_res/main.c</code>：<code>Aec</code> ＋ main 自寫的 P 形成（只取 AEC 自己的 RES 增益，不建 NR，經 <code>se_frame_from_aec()</code>）＋ <code>samples/dfn_hop.h</code>，
+<td><code>pipelines/dfn/mono_aec_dfn_res/main.c</code>：<code>Aec</code> ＋ main 自寫的 P 形成（只取 AEC 自己的 RES 增益，不建 NR，取自 <code>aec_get_res_context()</code>）＋ <code>dfn/dfn_hop.h</code>，
 以 DeepFilterNet2 取代 MMSE-LSA——估計用 pre-RES 頻譜 E、套用在 post-RES 頻譜 P。host 跑產品自己的取樣率
-（8/16/48 k，預設 16 k），只有 DFN2 stage 在 48 k，由 <code>dfn_rate_bridge.c</code> 來回；演算法延遲
+（8/16/48 k，預設 16 k），只有 DFN2 stage 在 48 k，由 <code>dfn/dfn_rate_bridge.c</code> 來回；演算法延遲（lookahead 1/1）
 16 k/256 為 800 samples = 50 ms、48 k 為 3 hop = 32 ms。</td></tr>
 <tr><td><a href="pipeline_dfn_4ch.html">pipeline_dfn_4ch</a></td>
-<td><code>pipelines/4ch_aec_bf_dfn_res/main.c</code>：同一個 DFN2 stage 接在四聲道單元
-<code>AudioPipeline4Ch</code> 之後（<code>enable_post=1</code>，單元只到 <code>fuse()</code>），RES 增益由 main 自建的 libaec
-<code>AecRes</code> 經 <code>se_res_stage_gain()</code> 算出，P 的形成與合成由應用自己串；前端跑 16 k（預設）或 48 k，16 k 經同一支 rate bridge；
-演算法延遲 16 k/256 為 800 samples = 50 ms、48 k 為 3 hop = 32 ms。</td></tr>
+<td><code>pipelines/dfn/4ch_aec_bf_dfn_res/main.c</code>：同一個 DFN2 stage 接在四聲道 mcab
+之後（<code>enable_post=1</code>，mcab 只到 <code>mcab_fuse()</code>，SRP-PHAT／BF 經 sample beam helper），RES 增益由 main 自建的 libaec
+<code>AecRes</code> 經 <code>aec_res_process()</code> 算出，P 的形成與合成由應用自己串；前端跑 16 k（預設）或 48 k，16 k 經同一支 rate bridge；
+演算法延遲（lookahead 1/1）16 k/256 為 800 samples = 50 ms、48 k 為 3 hop = 32 ms。</td></tr>
 <tr><td><a href="pipeline_dfn_detail.html">pipeline_dfn_detail</a></td>
 <td>兩支 DFN2 範例共用的細節：<code>dfn_hop</code> 呼叫語意與 reject-first 清單、<code>DfnRateBridge</code> pool 逐項、各測試檔檢查的內容。</td></tr>
 <tr><td><a href="pipeline_dfn_usage.html">pipeline_dfn_usage</a>／<a href="pipeline_dfn_sequence.html">pipeline_dfn_sequence</a>／<a href="pipeline_dfn_params.html">pipeline_dfn_params</a></td>
 <td>兩支 DFN2 範例的呼叫方式、時序圖與參數表。</td></tr>
 </table>
-<p class="note">兩支 DFN2 變體共用 <code>pipelines/dfn_res_stage.{h,c}</code> 與 <code>dfn_rate_bridge.{h,c}</code>；
+<p class="note">兩支 DFN2 變體共用 <code>pipelines/dfn/dfn_res_stage.{h,c}</code> 與 <code>dfn/dfn_rate_bridge.{h,c}</code>；
 沒有模型或模型失敗時輸出即「降噪器關的傳統鏈延後」（fail-open）：48 k 是逐位元等值、
 延後兩個 hop，原生格點是經 resampler 往返、延後 added delay 的通帶容差等值。</p>
 
@@ -306,7 +307,7 @@ graph 只含 heads。</td></tr>
 <tr><td><a href="ainr_dfn2_detail.html">ainr_dfn2_detail</a></td>
 <td>DFN2 prepost 類別的 pool 大小與所有權、<code>DFN2Model</code> callback 與 descriptor、<code>libainr_prepost.a</code> 建置、skip identity 的 partition-of-unity 檢查。</td></tr>
 <tr><td><a href="ainr_dfn3.html">ainr_dfn3</a></td>
-<td>48 kHz DFN3 raw-low DF / masked-high split；兩個 heads、layout 9、TIME/FREQ 靜態 pool API，lookahead 1 hop，identity 音訊位移 2 hops。</td></tr>
+<td>48 kHz DFN3 raw-low DF / masked-high split；兩個 heads、layout 9、TIME/FREQ 靜態 pool API，lookahead pair 預設 1/1（15 組合法 pair，建置期選定），1/1 的 identity 音訊位移 2 hops。</td></tr>
 <tr><td><a href="ainr_gtcrn.html">ainr_gtcrn</a></td>
 <td>GTCRN：16k、512/256；C 端 <code>gtcrn_process.c</code> 只做 STFT/ISTFT，
 頻譜之間全部在網路；stateless ONNX 以三組 cache 作顯式 I/O。</td></tr>
@@ -345,17 +346,16 @@ attention），輸出 3×3 complex convolving mask。</td></tr>
 <tr><th>類別</th><th>路徑（相對 repo 根）</th></tr>
 <tr><td>本站</td><td><code>docs/html/</code>（本頁 = <code>index.html</code>）；mono 管線演算法概觀：<a href="../architecture.html"><code>docs/architecture.html</code></a></td></tr>
 <tr><td>整合手冊</td><td><code>docs/c_user_manual_zh_TW.md</code>、
-<code>docs/integration_mono_zh_TW.md</code>、<code>docs/integration_mono_zh_TW_01_overview_link_quickstart.md</code>、<code>docs/integration_mono_zh_TW_02_lifecycle_config_errors.md</code>、<code>docs/integration_4ch_core_zh_TW.md</code>、<code>docs/integration_4ch_core_zh_TW_01_library_quickstart.md</code>、<code>docs/integration_4ch_core_zh_TW_02_lifecycle.md</code>、<code>docs/integration_4ch_core_zh_TW_03_config.md</code>、<code>docs/integration_4ch_core_zh_TW_04_errors_checklist_versions.md</code>、
-<code>docs/integration_4ch_spatial_zh_TW.md</code>、<code>docs/integration_4ch_spatial_zh_TW_01_quick_start.md</code>、<code>docs/integration_4ch_spatial_zh_TW_02_lifecycle.md</code>、<code>docs/integration_4ch_spatial_zh_TW_03_config.md</code>、<code>docs/integration_4ch_spatial_zh_TW_04_errors.md</code>、<code>docs/integration_4ch_spatial_zh_TW_05_shipped_vs_examples.md</code>、<code>docs/integration_4ch_spatial_zh_TW_06_checklist.md</code>、<code>docs/integration_4ch_spatial_zh_TW_07_versioning.md</code></td></tr>
+<code>docs/integration_mono_zh_TW.md</code>（含 <code>_01_</code>、<code>_02_</code> 分冊）、<code>docs/integration_4ch_core_zh_TW.md</code>（4ch mcab flow）、<code>docs/integration_4ch_spatial_zh_TW.md</code>（4ch sample beam helper）及兩者各自的分冊</td></tr>
 <tr><td>AIAEC 設計文件</td><td><code>docs/aiaec_streaming_readiness_zh_TW.md</code>、
 <code>docs/align_ulcnet_embedded_streaming_design_zh_TW.md</code></td></tr>
 <tr><td>ONNX 匯出／calibration</td><td><code>AIAEC/&lt;model&gt;/export_onnx.py</code>、
 <code>AIAEC/&lt;model&gt;/inference.py calib</code>、
 <code>AINR/*/export_onnx.py</code></td></tr>
-<tr><td>pipeline 測試</td><td><code>pipelines/tests/</code>（共用格點測試）、
-<code>pipelines/mono_aec_nr_res/tests/</code>、<code>pipelines/mono_alignulcnet/tests/</code>、
-<code>pipelines/mono_aec_dfn_res/tests/</code>、<code>pipelines/4ch_aec_bf_nr_res/tests/</code>、
-<code>pipelines/4ch_alignulcnet/tests/</code>、<code>pipelines/4ch_aec_bf_dfn_res/tests/</code></td></tr>
+<tr><td>pipeline 測試</td><td><code>pipelines/tests/</code>（跨目錄測試：C/Python 對照表、文件版號、target ABI、pyc parity）、<code>pipelines/common/tests/</code>、
+<code>pipelines/mono_aec_nr_res/tests/</code>、<code>pipelines/4ch_aec_bf_nr_res/tests/</code>（mcab）、
+<code>pipelines/dfn/tests/</code>、<code>pipelines/dfn/mono_aec_dfn_res/tests/</code>、<code>pipelines/dfn/4ch_aec_bf_dfn_res/tests/</code>、
+<code>pipelines/ulcnet/tests/</code>、<code>pipelines/ulcnet/mono_alignulcnet/tests/</code>、<code>pipelines/ulcnet/4ch_alignulcnet/tests/</code></td></tr>
 <tr><td>模型測試</td><td><code>AINR/*/tests/</code>、<code>AINR/tests/</code>、
 <code>AIAEC/tests/</code></td></tr>
 <tr><td>程式庫測試</td><td><code>lib/aec/c_impl/test/</code>、<code>lib/nr/c_impl/test/</code></td></tr>

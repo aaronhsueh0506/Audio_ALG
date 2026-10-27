@@ -44,12 +44,12 @@ import sys
 import numpy as np
 import soundfile as sf
 
-# Match aec_nr_pipeline's import wiring (lib.* + pipelines.* + the AEC package).
+# Match mono_aec_nr_res/pipeline.py's import wiring (lib.* + pipelines.* + the AEC package).
 _ROOT = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 sys.path.insert(0, _ROOT)
 sys.path.insert(0, os.path.join(_ROOT, 'lib', 'aec', 'python'))
 
-from pipelines.aec_nr_pipeline import (                       # noqa: E402
+from pipelines.mono_aec_nr_res.pipeline import (                       # noqa: E402
     run_aec_linear, run_nr_spectrum, run_res,
     PROD_INJECT_ECHO_PSD,
 )

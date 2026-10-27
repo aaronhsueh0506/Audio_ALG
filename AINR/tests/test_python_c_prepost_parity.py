@@ -195,8 +195,10 @@ def test_dfn2_features_and_compose_match_python(c_prepost):
     finally:
         c_prepost.parity_dfn_destroy(state)
     got = np.stack(c_out, axis=1)
-    np.testing.assert_allclose(got, expected[:, :frames - 1].numpy(),
-                               rtol=4e-5, atol=8e-6)
+    # The aligned entry emits the frame df_lookahead behind the newest input.
+    np.testing.assert_allclose(
+        got, expected[:, :frames - model.df_lookahead].numpy(),
+        rtol=4e-5, atol=8e-6)
 
 
 def test_gtcrn_host_boundary_matches_python(c_prepost):

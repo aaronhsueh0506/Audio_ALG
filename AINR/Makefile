@@ -109,7 +109,7 @@ LIB_OBJECTS := $(OBJ_DIR)/dfn2_process.o \
 	$(OBJ_DIR)/gtcrn_process.o
 VPATH := DeepFilterNet2:DeepFilterNet3:GTCRN
 
-.PHONY: all lib print-lib-path test test-simd clean _cfg_guard
+.PHONY: all lib print-lib-path print-cflags print-sources test test-simd test-pairs clean _cfg_guard
 
 all: lib $(TEST_BIN)
 
@@ -117,6 +117,15 @@ lib: $(LIB)
 
 print-lib-path:
 	@echo "$(abspath $(LIB))"
+
+# The compile flags of this configuration (pytest builds its own C drivers
+# with them, so they cannot drift from `make`).
+print-cflags:
+	@printf '%s\n' "$(CFLAGS) $(SIMD_CPPFLAGS)"
+
+# The model sources the contract binaries compile, test driver first.
+print-sources:
+	@printf '%s\n' "$(SOURCES)"
 
 # rm first: `ar rcs` updates in place and never prunes, so an object dropped
 # from LIB_OBJECTS would otherwise linger in the archive under the same key.
@@ -214,6 +223,17 @@ test-simd: $(TEST_BIN) $(SCALAR_BIN) $(KERNEL_TEST_BIN) $(KERNEL_TEST_SCALAR_BIN
 	test "$$auto_digest" = "$$scalar_digest" || { \
 		echo "FAIL: SIMD/scalar digest mismatch" >&2; exit 1; \
 	}
+
+# The DeepFilterNet2/3 lookahead pairs the trainer accepts: `make test` and
+# `make test-simd` build the shipped pair only; these pytest files rebuild the
+# C hosts for every other pair (-DDFN2_/DFN3_MASK_LOOKAHEAD, _DF_LOOKAHEAD) and
+# check the link-time and compile-time pair guards.
+PYTHON ?= python3
+PAIR_TESTS := tests/test_dfn2_lookahead_pairs.py tests/test_dfn2_prepost_c.py \
+	tests/test_dfn3_prepost_c.py tests/test_dfn3_stream_c.py \
+	tests/test_dfn_lookahead_link.py tests/test_dfn_lookahead_calibration.py
+test-pairs:
+	PYTHONDONTWRITEBYTECODE=1 $(PYTHON) -m pytest -q -p no:cacheprovider $(PAIR_TESTS)
 
 clean:
 	rm -rf "$(BUILD_DIR)"

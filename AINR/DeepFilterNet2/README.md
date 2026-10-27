@@ -29,7 +29,8 @@ Default signal contract:
 Each one-frame lookahead is a deliberate model choice. Upstream releases use
 2/2; this port uses 1/1. In DFN2's cascade those two dependencies are serial,
 so the deployed total is two hops. Changing either value requires retraining
-and a new checkpoint contract.
+and a new checkpoint contract; the other legal pairs export and run too (see
+[Lookahead pairs](#lookahead-pairs)).
 
 ## Checkpoints
 
@@ -96,6 +97,23 @@ the future DF source. Therefore the shipped `mask_lookahead=1` and
 masks and nontrivial future taps so an off-by-one head/spectrum pairing cannot
 pass as a merely finite output.
 
+## Lookahead pairs
+
+`mask_lookahead` (M, 0..2) and `df_lookahead` (D, 0..4, i.e. below `df_order`)
+are independent and part of the trained contract (`config.ini [model]`; a
+checkpoint is refused under another pair). All 15 pairs export and run; (1,1)
+is the shipped one. The shared rules (window, build flags, guards, tests) are in
+[`../README.md`](../README.md#lookahead-pairs-deepfilternet2-and-deepfilternet3).
+Specific to DFN2:
+
+- DFN2 is a cascade: the deep filter reads the ERB-masked spectrum, so the
+  output is `M + D` frames behind the input and the end-to-end latency is
+  `1 + M + D` hops (three for the shipped pair). The first M hops only fill the
+  window; the following D hops run the accelerator but emit nothing.
+- The rings hold `max(DF_ORDER, M + D + 1)` frames (`DFN2_DF_RING`): five up to
+  `M + D = 4`, six for `M + D = 5`, seven for `M + D = 6` (2/4). The state
+  struct, the pool size and the pool hash follow the pair.
+
 ## ONNX, ERB tables and calibration
 
 Install the optional export dependencies from `../requirements-export.txt`.
@@ -117,9 +135,10 @@ The C runtime loads the files written by `export_erb_matrix.py --runtime-bins DI
 are for toolchain validation.
 
 The graph is stateless from the accelerator's perspective. Each invocation
-receives exactly three feature frames `[t-1,t,t+1]`, emits the heads for frame
-`t`, and returns two state tensors: `h_gru_out` `(1,5,1,256)` and
-`df_convp_history_out` `(1,64,5,96)`. Each state input and its output have the
+receives exactly three feature frames `[t-(2-M) .. t+M]` (`[t-1,t,t+1]` for the
+shipped `mask_lookahead` M = 1), emits the heads for frame `t`, and returns
+two state tensors: `h_gru_out` `(1,5,1,256)` and `df_convp_history_out`
+`(1,64,5,96)`. Each state input and its output have the
 same shape and are bound to one address. `h_gru` holds the five GRU hidden
 rows in `DFN2ModelIOState` memory order -- encoder (row 0), ERB decoder (rows
 1-2), DF decoder (rows 3-4; `DFN2_MODEL_GRU_ROW_*`). `df_convp_history` is the

@@ -34,13 +34,13 @@ th{background:#eef5f0}
 <h1>整合時序圖 — 每個函式庫何時被誰呼叫</h1>
 
 <h2>概要</h2>
-<p>只有「4 聲道線性 AEC + BF」被包成一個單元(<code>AudioPipeline4Ch</code>)。其餘 stage(4ch 的 RES 亦然;mono 的 RES 在 AEC 呼叫內)都是獨立函式庫,各有 <code>*_get_mem_size()</code> 與 <code>*_init()</code>,<b>初始化、逐 hop 串接、錯誤後的 reset 順序都是整合者(應用)的責任</b>,範例 <code>main</code> 就是參考寫法。本頁用時序圖把三件事畫在一起:建立(一次)、每 hop 的呼叫順序、被拒絕或換串流時的 reset。圖中的箭頭標的都是真實函式名;「借用」代表回傳的指標指向函式庫內部 buffer,只到下一次處理呼叫或 reset 之前有效,不可寫入。</p>
+<p>4 聲道的線性 AEC 前端是 flow 層 <code>mcab</code>(四條 lane 與共用 estimator 由應用建立後以指標注入,mcab 不擁有它們),SRP-PHAT／BF 在 sample helper <code>mcab_sample_beam</code>。其餘 stage(4ch 的 RES 亦然;mono 的 RES 在 AEC 呼叫內)都是獨立函式庫,各有 <code>*_get_mem_size()</code> 與 <code>*_init()</code>,<b>初始化、逐 hop 串接、錯誤後的 reset 順序都是整合者(應用)的責任</b>,範例 <code>main</code> 就是參考寫法。本頁用時序圖把三件事畫在一起:建立(一次)、每 hop 的呼叫順序、被拒絕或換串流時的 reset。圖中的箭頭標的都是真實函式名;「借用」代表回傳的指標指向函式庫內部 buffer,只到下一次處理呼叫或 reset 之前有效,不可寫入。</p>
 <table>
 <tr><th>責任</th><th>誰擁有</th></tr>
 <tr><td>pool 記憶體(16-byte 對齊的一塊或多塊)</td><td>應用:每個函式庫先 <code>*_get_mem_size()</code>(0 = 設定無效),應用配置並 carve 成 16-byte 對齊的子區塊,<code>*_init()</code> 在上面建構;<code>*_destroy()</code> 不釋放 caller pool</td></tr>
 <tr><td>格點與 config 的一致性</td><td>應用:AEC、NR、合成都用同一個 <code>grid.fft_size</code> 導出 config(三者 <code>n_freqs</code>／<code>hop</code> 對不上不會被偵測,會在頻域靜默錯位)</td></tr>
-<tr><td>輸入守衛(是否有限)</td><td>mono:<b>沒有</b>(<code>aec_process_context()</code> 與 <code>se_anr_stage_gain()</code> 不檢輸入);4ch 核心／單元:<code>four_aec_front_process()</code> 拒非有限樣本。輸出守衛 <code>se_hop_is_finite()</code> 由應用做</td></tr>
-<tr><td>RES(殘留回音增益)</td><td>mono:在 <code>aec_process_context()</code> 內算,經 <code>se_frame_from_aec()</code> 以 <code>frame.g_res_ctx</code> 交出;4ch:單元與核心都不算(<code>g_res_ctx</code> 為 NULL),應用自己用 libaec 的 <code>AecRes</code>(<code>se_res_stage_gain()</code>)</td></tr>
+<tr><td>輸入守衛(是否有限)</td><td>mono:<b>沒有</b>(<code>aec_process_context()</code> 與 <code>anr_process_gain()</code> 不檢輸入);4ch:<code>mcab_process_front()</code> 拒非有限樣本。輸出守衛由應用做(<code>skn_all_finite_f32()</code>;mono 的 <code>main.c</code> 本身不做,<code>example_board_adapter.c</code> 有做)</td></tr>
+<tr><td>RES(殘留回音增益)</td><td>mono:在 <code>aec_process_context()</code> 內算,經 <code>aec_get_res_context()</code> 的 <code>ctx.res_gain</code> 交出;4ch:mcab 與 helper 都不算(<code>McabFrame.g_res_ctx</code> 為 NULL),應用自己用 libaec 的 <code>AecRes</code>(<code>aec_res_process()</code>)</td></tr>
 <tr><td>reset 的範圍</td><td>函式庫只 reset 自己;任何一步被拒,<b>應用把所有 stage 與自己的 CNG 亂數狀態一起 reset</b>(見第 4 節)</td></tr>
 </table>
 
@@ -48,7 +48,7 @@ th{background:#eef5f0}
 <pre>應用(main)                  Aec(lib/aec)            AnrDenoiser(lib/nr)     AcIstft(audiolib)
    │                              │                          │                       │
    │═ ① 建立(一次;此後 hop 路徑零 heap)═══════════════════════════════════════════
-   │ se_derive(&amp;req,&amp;rules,&amp;grid,&amp;aec_cfg)              純函式: 0=ok, -1=拒絕(格點/delay/preset)
+   │ derive_lane(sr,fft,preset,&amp;grid,&amp;aec_cfg)              main.c 內: 0=ok, -1=拒絕(格點);aec_resolve_signal_grid + aec_config_from_preset
    │ anr_config_for_mode_grid(sr, grid.fft_size, mode) -&gt; nr_cfg      ac_stft_config_default(&amp;syn_cfg, fft)
    │── aec_get_mem_size ───────►│  0=無效                  │                       │
    │── anr_get_mem_size ─────────────────────────────────►│  0=無效               │
@@ -57,93 +57,96 @@ th{background:#eef5f0}
    │── aec_init(pool,...) ─────►│  NULL=過小/未對齊/無效   │                       │
    │── anr_init(pool+a,...) ─────────────────────────────►│  NULL=同左            │
    │── ac_istft_init(pool+a+n,...) ─────────────────────────────────────────────►│  NULL=同左
-   │ unity[k]=1; rng=SE_CNG_RNG_SEED
+   │ unity[k]=1; rng=CNG_RNG_SEED
    │
    │═ ② 每 hop(mic、ref 各 grid.hop_size floats,同 sample rate、同時鐘)═══════════
    │── aec_process_context(aec,mic,ref) ►│ 線性 AEC + delay 估計 + AEC 內部 RES 增益
-   │── se_frame_from_aec(aec,&amp;f) ─────►│ 借用視圖 f: e,y,x,r2,cn,g_res_ctx;-1=lane 沒有 seam
-   │── se_anr_stage_gain(nr,&amp;f,extra,1) ───────────────►│ r2/32768² 折進噪聲底 → anr_process_gain → G_nr
-   │ sk_min_f32(g_total, G_nr, f.g_res_ctx, n)             ← 應用自己呼叫 audiolib kernel
-   │ sk_capply_gain_f32(spec, f.e, g_total, n)
-   │ aec_cng_fill(&amp;rng,spec,f.cn,f.g_res_ctx,G_nr,SE_CNG_NR_GAIN_FLOOR,n)   ← 選用(AecConfig.enable_cng)
+   │── aec_get_res_context(aec,&amp;ctx) ►│ 借用視圖 ctx: error_spec,r2,comfort_noise,res_gain
+   │── mono_nr_gain: anr_process_gain(nr,ctx.error_spec,extra,NULL) ─►│ r2*PSD_SCALE_INV 折進噪聲底 → anr_get_gain → G_nr
+   │ sk_min_f32(g_total, G_nr, ctx.res_gain, n)            ← 應用自己呼叫 audiolib kernel
+   │ sk_capply_gain_f32(spec, ctx.error_spec, g_total, n)
+   │ aec_cng_fill(&amp;rng,spec,ctx.comfort_noise,ctx.res_gain,G_nr,CNG_NR_GAIN_FLOOR,n)   ← 選用(AecConfig.enable_cng)
    │── ac_istft_push(istft,spec,out) ───────────────────────────────────────────►│ iFFT + sqrt-Hann OLA → out[hop]
-   │ se_hop_is_finite(out,hop)                              ← 輸出守衛,應用自己做
+   │ skn_all_finite_f32(out,hop)                            ← 輸出守衛,應用自己做(example_board_adapter.c 有做)
    │
    │═ ③ 任一步被拒 / 輸出非有限 / 換串流 ══════════════════════════════════════════
-   │── aec_reset ─────────────►│ ── anr_reset ───────────────►│ ── ac_istft_reset ──►│   rng=SE_CNG_RNG_SEED
+   │── aec_reset ─────────────►│ ── anr_reset ───────────────►│ ── ac_istft_reset ──►│   rng=CNG_RNG_SEED
    │
    │═ ④ 結束 ══════════════════════════════════════════════════════════════════════
    │ anr_destroy(nr); aec_destroy(aec); platform_free(pool)          (destroy 不釋放 caller pool)</pre>
-<p><code>se_anr_stage_gain()</code> 只在 <code>use_r2=1</code>、<code>frame.r2</code> 與暫存非 NULL 且 <code>frame.usable_linear</code> 非零時才把 <code>r2/32768²</code> 折進噪聲底,否則等於純降噪。<code>--aec-only</code>:只建 <code>Aec</code>,每 hop 一個呼叫 <code>aec_process(aec,mic,ref,out)</code>(直寫 <code>out</code>,0-hop lag)。逐 hop 的 swimlane 與延遲見 <a href="pipeline_mono.html">pipeline_mono</a>。</p>
+<p><code>mono_nr_gain()</code> 只在 <code>use_r2</code>、<code>ctx.r2</code> 非 NULL 且 <code>ctx.usable_linear</code> 非零時才把 <code>r2/32768²</code> 折進噪聲底,否則等於純降噪。<code>--aec-only</code>:只建 <code>Aec</code>,每 hop 一個呼叫 <code>aec_process(aec,mic,ref,out)</code>(直寫 <code>out</code>,0-hop lag)。逐 hop 的 swimlane 與延遲見 <a href="pipeline_mono.html">pipeline_mono</a>。</p>
 
-<h2>2. 4ch 單元:AudioPipeline4Ch(共用 delay、4 lane、SRP-PHAT、BF)+ 應用的 RES</h2>
-<pre>應用(main)       AudioPipeline4Ch                          AecRes(libaec)  AnrDenoiser  AcIstft
-                  [共用 aligner + 4 lanes]  [SRP] [BF]
+<h2>2. 4ch:mcab flow(共用 delay、4 lane)+ sample helper(SRP-PHAT、BF)+ 應用的 RES</h2>
+<pre>應用(main)       Mcab(flow)                         McabSampleBeam(helper)     AecRes(libaec)  AnrDenoiser  AcIstft
+                 [共用 aligner + 注入的 4 lanes]    [SRP] [BF]
    │                       │
    │═ ① 建立 ═════════════════════════════════════════════════════════════════════
-   │ cfg = audio_pipeline_4ch_default_config(sr)     之後可改 cfg.core.* / geometry / bf_*(見 4ch 參數頁)
-   │── audio_pipeline_4ch_get_mem_requirements(&amp;cfg,&amp;req) ►│ 0=ok, -1=無效;req.{bytes,alignment=16,layout_version,...}
+   │ cfg = mcab_default_config(sr);  bp = mcab_sample_beam_default_params()   之後可改 cfg / bp.geometry / bp.bf_*(見 4ch 參數頁)
+   │ lane: mcab_lane_config(&amp;cfg,&amp;lane) → aec_get_mem_size → aec_init ×4;MATCHED: mcab_delay_estimator_config → delay_aec_get_mem_size → delay_aec_init
+   │── mcab_get_mem_requirements(&amp;cfg,&amp;req) ►│ 0=ok, -1=無效;req.{bytes,alignment=16,layout_version,...}
    │ pool = platform_alloc(req.bytes, req.alignment)
-   │── audio_pipeline_4ch_init_ex(pool,req.bytes,&amp;cfg,&amp;req) ►│ carve: self,core,srp,bf,bf_spectrum,bf_weights
-   │                       │  8 點閘;任何失敗一律靜默回 NULL(無診斷輸出)
+   │── mcab_init_ex(pool,req.bytes,&amp;cfg,&amp;libs,&amp;req) ►│ carve: 控制區, mic lane, aligned far, fuse 緩衝, 對齊環;8 點閘 + lane／estimator 驗證,
+   │                       │  任何失敗一律靜默回 NULL(無診斷輸出)       (以上 = mcab_sample_flow_init)
+   │── mcab_sample_beam_get_mem_size → mcab_sample_beam_init(mem,bytes,&amp;cfg,&amp;bp,flow) ►│ carve: self, srp, bf, bf_spectrum, bf_weights;NULL=拒絕
    │ RES / NR / 合成另開一塊 post pool(應用自己的 init):
-   │   aec_config_from_preset(&amp;res_cfg,preset,sr); res_cfg.fft_size = audio_pipeline_4ch_fft_size(p)
+   │   aec_config_from_preset(&amp;res_cfg,preset,sr); res_cfg.fft_size = mcab_fft_size(flow)
    │── aec_res_get_mem_size → aec_res_init(post,...) ►│ 0 / NULL = 無效或 pool 過小;沒有 destroy
    │ anr_init、ac_istft_init(同 mono 的 ①)
    │
    │═ ② 每 hop(mics_interleaved[hop][4]、ref[hop])═══════════════════════════════
-   │── audio_pipeline_4ch_process_front(p,mics,ref,&amp;front) ►│ four_aec_front_process: 共用 delay → aligned_ref
+   │── mcab_sample_beam_process_front(b,mics,ref,&amp;front) ►│ mcab_process_front: 共用 delay → aligned_ref
    │                       │   → 4 條 lane(lane 0 真 far-FFT,lane 1-3 借用)
    │   front.{delay, linear_spectra[4], formed_hop[4], aligned_ref}(借用)
    │ [應用: 由 front.linear_spectra 算 frequency_mask / vad_raw / vad_out]
-   │── audio_pipeline_4ch_process_beam(p,&amp;front,vad_raw,vad_out,mask,&amp;beam,&amp;info) ►│ doa_step → bf_process_with_weights
+   │── mcab_sample_beam_process_beam(b,&amp;front,vad_raw,vad_out,mask,&amp;beam,&amp;info) ►│ doa_step → bf_process_with_weights
    │   beam.{spectrum, weights}(借用)        (一次做完前兩步: process_with_activity / process)
-   │── audio_pipeline_4ch_fuse(p,&amp;frame) ►│ four_aec_fuse(weights,spectrum) → frame(E, R2, CN)
+   │── mcab_sample_beam_fuse(b,&amp;frame) ►│ mcab_fuse(weights,spectrum) → frame(E, R2, CN)
    │   frame.{e,y,x,r2,cn,far_hop,...}(借用;g_res_ctx 恆為 NULL)
-   │── se_res_stage_gain(res,&amp;frame) ─────────────────────────►│ aec_res_process → G_res(NULL = 被拒)
-   │── se_anr_stage_gain(nr,&amp;frame,extra,1) ──────────────────────────────────►│ G_nr
+   │── mcab_sample_res_input(&amp;frame,&amp;in); aec_res_process(res,&amp;in) ►│ G_res(NULL = 被拒)
+   │── mcab_sample_anr_gain(nr,&amp;frame,extra,1) ───────────────────────────────►│ G_nr
    │ sk_min_f32 -&gt; sk_capply_gain_f32 -&gt; aec_cng_fill(僅 frame.cn 非 NULL)   (應用自己)
    │── ac_istft_push(istft,spec,out) ─────────────────────────────────────────────────────►│ out[hop]
    │
    │═ ③ 錯誤 / 換串流 ═════════════════════════════════════════════════════════════
-   │── audio_pipeline_4ch_reset(p) ►│(core,SRP,BF,fallback VAD)
-   │── aec_res_reset(res) (preset 保留);  anr_reset(nr);  ac_istft_reset(istft);  rng=SE_CNG_RNG_SEED   ← 應用自己的後級
+   │── mcab_sample_beam_reset(b) ►│(flow: 4 lanes＋estimator;SRP, BF, fallback VAD)
+   │── aec_res_reset(res) (preset 保留);  anr_reset(nr);  ac_istft_reset(istft);  rng=MCAB_SAMPLE_CNG_RNG_SEED   ← 應用自己的後級
    │
    │═ ④ 結束 ═══════════════════════════════════════════════════════════════════════
-   │ anr_destroy(nr); audio_pipeline_4ch_destroy(p); platform_free(post); platform_free(pool)    (AecRes 沒有 destroy;unit destroy 不釋放 caller pool)</pre>
+   │ anr_destroy(nr); mcab_sample_beam_destroy(b); mcab_destroy(flow); aec_destroy ×4; platform_free(post, flow 區塊, helper pool)
+   │ (AecRes 沒有 destroy;mcab_destroy 不碰 lane 與 estimator,所以拆除順序是 helper → mcab → lane;mcab_sample_flow_destroy 含後兩步)</pre>
 <p>RES 強度在執行期用 <code>aec_res_set_preset(res, preset, ramp_ms)</code>(<code>res</code> 是應用自備的 <code>AecRes</code>),NR 用 <code>anr_set_mode(nr, mode)</code>,兩者都在兩個 hop 之間呼叫;見 <a href="pipeline_4ch_detail.html">pipeline_4ch_detail</a>。</p>
 
-<h2>3. 4ch 核心 + 外部 beamformer(產品自己的波束器)</h2>
-<p>單元沒有「外部波束權重」入口(目前的能力缺口);波束器在別處時退回核心(<code>4aec_nr_res.h</code>),RES 就由應用自備 <code>AecRes</code>(<code>aec_res_get_mem_size()</code>／<code>aec_res_init()</code>,config 由 <code>aec_config_from_preset()</code> 在同一個 fft 上取得)。範例:<code>4aec_nr_res_static.c</code>(權重為每個 bin 皆 1/4 的等權佔位)。</p>
-<pre>應用            FourAecNrRes(核心)         外部 BF(產品自己的)        AecRes(應用自備)  AnrDenoiser  AcIstft
- │── four_aec_front_process(core,mics,ref,&amp;front) ►│ 共用 delay + 4 lanes
+<h2>3. 4ch:mcab + 外部 beamformer(產品自己的波束器,不用 helper)</h2>
+<p>波束器在別處時不需要 helper:<code>mcab_fuse(p, weights, beamformed_error, frame)</code> 就是外部權重的入口,RES 由應用自備 <code>AecRes</code>(<code>aec_res_get_mem_size()</code>／<code>aec_res_init()</code>,config 由 <code>aec_config_from_preset()</code> 在同一個 fft 上取得)。範例:<code>mcab_external_static.c</code>(權重為每個 bin 皆 1/4 的等權佔位)。</p>
+<pre>應用            Mcab(flow)                 外部 BF(產品自己的)        AecRes(應用自備)  AnrDenoiser  AcIstft
+ │── mcab_process_front(p,mics,ref,&amp;front) ►│ 共用 delay + 4 lanes
  │   front.linear_spectra[4] / formed_hop[4] / aligned_ref / delay(delay.changed 非零 ⇒ 外部 STFT/OLA 歷史須清)
  │── front.linear_spectra ─────────────────────────►│ weights Complex[4][n_freqs](channel-major, out=Σ w·x 無共軛)
- │── four_aec_fuse(core,weights,beamformed_error|NULL,&amp;frame) ►│ frame.g_res_ctx=NULL(核心不算增益)
- │── se_res_stage_gain(res,&amp;frame) ──────────────────────────────►│ G_res
- │── se_anr_stage_gain(nr,&amp;frame,extra,1) ────────────────────────────────────────►│ G_nr
+ │── mcab_fuse(p,weights,beamformed_error|NULL,&amp;frame) ►│ frame.g_res_ctx=NULL(mcab 不算增益)
+ │── mcab_sample_res_input(&amp;frame,&amp;in); aec_res_process(res,&amp;in) ►│ G_res
+ │── mcab_sample_anr_gain(nr,&amp;frame,extra,1) ──────────────────────────────────────►│ G_nr
  │   sk_min_f32 -&gt; sk_capply_gain_f32 -&gt; aec_cng_fill -&gt; ac_istft_push ─────────────────────────────►│ out
- │── four_aec_nr_res_reset(core); aec_res_reset(res); anr_reset(nr); ac_istft_reset(istft); rng=SE_CNG_RNG_SEED</pre>
+ │── mcab_reset(p); aec_res_reset(res); anr_reset(nr); ac_istft_reset(istft); rng=MCAB_SAMPLE_CNG_RNG_SEED</pre>
 
 <h2>4. 錯誤與 reset:誰重設什麼</h2>
 <table>
 <tr><th>呼叫</th><th>回傳／情況</th><th>函式庫自己做了什麼</th><th>應用要做什麼</th></tr>
-<tr><td><code>four_aec_front_process()</code>／<code>audio_pipeline_4ch_process_front()</code></td><td><code>INVALID_ARGUMENT</code>(NULL 或非有限樣本)</td><td>不動 adaptive state;非有限樣本時單元不再有 pending 的 front／beam(NULL 引數則維持原狀)</td><td>修正輸入後重送;不需 reset</td></tr>
-<tr><td>同上</td><td><code>DSP_ERROR</code>(lane 拒絕)</td><td>核心已 reset;單元另在「front 與單元格點不符」時 reset 單元</td><td>reset 自己的後級(4ch:<code>AecRes</code>、NR、合成、rng)</td></tr>
-<tr><td><code>audio_pipeline_4ch_process_beam()</code></td><td><code>SEQUENCE_ERROR</code>(沒有 pending front,或本 hop 的 beam 已跑);<code>INVALID_ARGUMENT</code>(NULL、flag 不是 0／1、他格點的 front)</td><td>不改動</td><td>修正呼叫順序</td></tr>
-<tr><td><code>audio_pipeline_4ch_fuse()</code></td><td><code>INVALID_ARGUMENT</code>(NULL 或 <code>enable_post=0</code>)、<code>SEQUENCE_ERROR</code>(本 hop 沒有 beam)</td><td>不改動</td><td>修正呼叫</td></tr>
-<tr><td>同上</td><td>其餘非 OK(含核心因權重非有限或 lane far 頻譜不一致回的值)</td><td>依 <code>audio_pipeline_4ch.c</code>:單元整體 reset(core、SRP、BF)後回傳</td><td>reset 自己的後級(含 <code>AecRes</code>)</td></tr>
-<tr><td><code>four_aec_fuse()</code>(核心)</td><td><code>INVALID_ARGUMENT</code>(權重全零或非有限)</td><td>front frame 保持可用</td><td>修正權重後可重試同一 hop</td></tr>
-<tr><td>同上</td><td><code>SEQUENCE_ERROR</code>(沒有 front frame);<code>DSP_ERROR</code>(lane far 頻譜不一致或頻譜非有限)</td><td>前者不改動;後者核心已 reset</td><td>後者 reset 自己的後級(含 <code>AecRes</code>)</td></tr>
-<tr><td><code>se_anr_stage_gain()</code>／<code>se_res_stage_gain()</code></td><td>回 NULL</td><td>NR 該 hop 被拒;4ch 的 RES 缺輸入(mono 對應 <code>se_frame_from_aec()</code> 回 −1 或 <code>g_res_ctx</code> 為 NULL)</td><td>視為該 hop 被拒,所有 stage 一起 reset:mono CLI 把該 hop 輸出填 0 後繼續;4ch 範例 reset 後回 <code>DSP_ERROR</code> 並結束該次執行</td></tr>
-<tr><td>輸出 <code>se_hop_is_finite()</code> 為 0</td><td>—</td><td>—</td><td>unit／Aec 與後級一起 reset(範例 <code>static_hop()</code>／<code>raw_post()</code> 的寫法)</td></tr>
+<tr><td><code>mcab_process_front()</code>／<code>mcab_sample_beam_process_front()</code></td><td><code>INVALID_ARGUMENT</code>(NULL 或非有限樣本)</td><td>不動 adaptive state;非有限樣本時不再有 pending 的 front(helper 也不再有 pending beam;NULL 引數則維持原狀)</td><td>修正輸入後重送;不需 reset</td></tr>
+<tr><td>同上</td><td><code>DSP_ERROR</code>(lane 拒絕該 hop,或對齊環無法服務目前 delay)</td><td>mcab 已 reset(lane＋estimator＋flow);helper 的 SRP、BF、fallback VAD 與 <code>frame_index</code> 不動</td><td>reset 自己的後級(4ch:<code>AecRes</code>、NR、合成、rng)</td></tr>
+<tr><td><code>mcab_sample_beam_process_beam()</code></td><td><code>SEQUENCE_ERROR</code>(沒有 pending front,或本 hop 的 beam 已跑);<code>INVALID_ARGUMENT</code>(NULL、flag 不是 0／1、他格點的 front)</td><td>不改動</td><td>修正呼叫順序</td></tr>
+<tr><td><code>mcab_sample_beam_fuse()</code></td><td><code>INVALID_ARGUMENT</code>(NULL 或 flow 的 <code>enable_post=0</code>)、<code>SEQUENCE_ERROR</code>(本 hop 沒有 beam)</td><td>不改動</td><td>修正呼叫</td></tr>
+<tr><td>同上</td><td>其餘非 OK(含 mcab 因權重非有限回的 <code>INVALID_ARGUMENT</code>、lane far 頻譜不一致或頻譜非有限回的 <code>DSP_ERROR</code>)</td><td>依 <code>mcab_sample_beam.c</code>:整個 helper reset(flow、SRP、BF、VAD、<code>frame_index</code>)後回傳</td><td>reset 自己的後級(含 <code>AecRes</code>)</td></tr>
+<tr><td><code>mcab_fuse()</code>(直接用 mcab)</td><td><code>INVALID_ARGUMENT</code>(權重全零或非有限)</td><td>front 保持可用</td><td>修正權重後可重試同一 hop</td></tr>
+<tr><td>同上</td><td><code>SEQUENCE_ERROR</code>(沒有 front);<code>DSP_ERROR</code>(lane far 頻譜不一致、頻譜非有限或投影溢位)</td><td>前者不改動;後者 mcab 已 reset</td><td>後者 reset 自己的後級(含 <code>AecRes</code>)</td></tr>
+<tr><td>NR 增益(mono:<code>mono_nr_gain()</code>;4ch:<code>mcab_sample_anr_gain()</code>)／4ch 的 <code>aec_res_process()</code></td><td>回 NULL</td><td>NR 該 hop 被拒;4ch 的 RES 缺輸入(mono 對應 <code>ctx.res_gain</code> 為 NULL)</td><td>視為該 hop 被拒,所有 stage 一起 reset:mono CLI 把該 hop 輸出填 0 後繼續;4ch 範例 reset 後回 <code>MCAB_DSP_ERROR</code> 並結束該次執行</td></tr>
+<tr><td>輸出非有限(<code>skn_all_finite_f32()</code> 為 0)</td><td>—</td><td>—</td><td>flow／helper／Aec 與後級一起 reset(範例 <code>static_hop()</code>／<code>raw_post()</code> 的寫法)</td></tr>
 </table>
-<div class="note">4ch 的後級物件(<code>AecRes</code>、<code>AnrDenoiser</code>、<code>AcIstft</code>)與 CNG 的亂數種子 <code>SE_CNG_RNG_SEED</code> 都不在單元／核心裡,單元的 <code>audio_pipeline_4ch_reset()</code> 不會動它們。mono 的 <code>mono_aec_nr_res/main.c</code> 與 <code>static_main.c</code> 在 <code>process_hop()</code> 回 −1 時呼叫 <code>rig_reset()</code> 並把該 hop 輸出填 0;這兩支 CLI 本身不做輸出有限檢查,<code>example_board_adapter.c</code> 與 4ch 的 <code>static_hop()</code>／<code>raw_post()</code> 才有。</div>
+<div class="note">4ch 的後級物件(<code>AecRes</code>、<code>AnrDenoiser</code>、<code>AcIstft</code>)與 CNG 的亂數種子 <code>MCAB_SAMPLE_CNG_RNG_SEED</code> 都不在 mcab／helper 裡,<code>mcab_sample_beam_reset()</code> 與 <code>mcab_reset()</code> 不會動它們。mcab 的 reset 會呼叫被注入 lane 與 estimator 自己的 reset 函式,但不會 destroy 或重新 init 它們。mono 的 <code>mono_aec_nr_res/main.c</code>(同一份原始碼建出 <code>aec_nr_pipeline_static</code> 與 <code>-DAEC_NR_POOL_SPLIT=1</code> 的 <code>aec_nr_pipeline</code>)在 <code>process_hop()</code> 回 −1 時呼叫 <code>rig_reset()</code> 並把該 hop 輸出填 0;這支 CLI 本身不做輸出有限檢查,<code>example_board_adapter.c</code> 與 4ch 的 <code>static_hop()</code>／<code>raw_post()</code> 才有。</div>
 
 <h2>5. 接 NN 後級的 hop 骨架(摘要)</h2>
 <p>NN 後級把一個 hop 拆成四個呼叫,加速器夾在 <code>nn_begin</code> 與 <code>nn_end</code> 之間;細節與 fail-open 規則在 <a href="integration_example.html">串接範例</a> 第 5 節、<a href="pipeline_ulcnet_mono.html">pipeline_ulcnet_mono</a>／<a href="pipeline_dfn_mono.html">pipeline_dfn_mono</a>。</p>
-<pre>應用            Aec 或 4ch 單元          NN stage(範例碼)            NN runtime／加速器
- │── (Aec: aec_process_context + aec_get_res_context／aec_get_linear_context) 或 (單元: process_front/beam[/fuse]) ►│
+<pre>應用            Aec 或 4ch(mcab＋helper)  NN stage(範例碼)            NN runtime／加速器
+ │── (Aec: aec_process_context + aec_get_res_context／aec_get_linear_context) 或 (4ch: mcab_sample_beam_process_front/beam[/fuse]) ►│
  │── ulcnet_nn_stage_begin_time / _begin_complex  (dfn: dfn_hop_begin) ►│ 分析 err／far
  │── ulcnet_nn_stage_nn_begin(stage,&amp;job) ►│ 回 1=有一幀、0=本 hop 無模型幀
  │── board_run_npu(job.*) ───────────────────────────────────────────────►│ out 已預填 NaN,必須寫滿
@@ -153,10 +156,10 @@ th{background:#eef5f0}
 <h2>相關檔案與測試路徑</h2>
 <table>
 <tr><th>路徑(repo-relative)</th><th>內容</th></tr>
-<tr><td><code>pipelines/mono_aec_nr_res/main.c</code>、<code>static_main.c</code>、<code>example_board_adapter.c</code></td><td>mono 的建立／逐 hop／reset 參考寫法;板端 adapter 含 size → alloc → init → process → reset → destroy → free 的完整循環與負向檢查</td></tr>
-<tr><td><code>pipelines/4ch_aec_bf_nr_res/audio_pipeline_4ch_static.c</code>、<code>audio_pipeline_4ch_raw.c</code>、<code>4aec_nr_res_static.c</code></td><td>4ch 單元(static／raw)與核心+外部權重的參考寫法</td></tr>
-<tr><td><code>pipelines/common/se_stage.h</code>、<code>se_config.h</code>、<code>pipelines/samples/se_anr_stage.h</code></td><td><code>SeSpecFrame</code>、<code>se_frame_from_aec()</code>、<code>se_res_stage_gain()</code>、<code>se_hop_is_finite()</code>、<code>se_derive()</code>、<code>se_anr_stage_gain()</code></td></tr>
-<tr><td><code>pipelines/tests/test_readme_flow.c</code>、<code>mono_aec_nr_res/tests/test_mono_chain.c</code>、<code>4ch_aec_bf_nr_res/tests/test_audio_pipeline_4ch.c</code></td><td>呼叫流程、reset 等於新建、sequence 守衛的測試</td></tr>
+<tr><td><code>pipelines/mono_aec_nr_res/main.c</code>、<code>example_board_adapter.c</code></td><td>mono 的建立／逐 hop／reset 參考寫法;板端 adapter 含 size → alloc → init → process → reset → destroy → free 的完整循環與負向檢查</td></tr>
+<tr><td><code>pipelines/4ch_aec_bf_nr_res/mcab_static.c</code>、<code>mcab_raw.c</code>、<code>mcab_external_static.c</code></td><td>4ch flow＋helper(static／raw)與 mcab＋外部權重的參考寫法</td></tr>
+<tr><td><code>lib/aec/c_impl/include/aec.h</code>、<code>aec_res.h</code>；<code>pipelines/4ch_aec_bf_nr_res/mcab.h</code>、<code>mcab_sample_post.h</code></td><td>mono:<code>AecResContext</code>、<code>aec_get_res_context()</code>;4ch:<code>McabFrame</code>、<code>mcab_sample_res_input()</code>、<code>aec_res_process()</code>、<code>mcab_sample_anr_gain()</code></td></tr>
+<tr><td><code>pipelines/tests/test_readme_flow.c</code>、<code>mono_aec_nr_res/tests/test_mono_chain.c</code>、<code>4ch_aec_bf_nr_res/tests/test_mcab_sample_beam.c</code>、<code>tests/test_mcab.c</code></td><td>呼叫流程、reset 等於新建、sequence 守衛的測試</td></tr>
 <tr><td>其他頁</td><td><a href="integration_example.html">integration_example</a>、<a href="pipeline_mono.html">pipeline_mono</a>、<a href="pipeline_4ch.html">pipeline_4ch</a>、<a href="pipeline_mono_params.html">pipeline_mono_params</a>、<a href="pipeline_4ch_params.html">pipeline_4ch_params</a>、<a href="index.html">index</a></td></tr>
 </table>
 </body>

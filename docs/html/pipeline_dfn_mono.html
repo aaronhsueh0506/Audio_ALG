@@ -35,52 +35,53 @@ th{background:#eef2f8}
 <h1>mono AEC(linear) → RES → DeepFilterNet2 後級(<code>Aec</code> + <code>dfn_hop</code>)</h1>
 
 <h2>概要</h2>
-<p><code>pipelines/mono_aec_dfn_res/main.c</code>:<b>沒有 DFN wrapper 函式庫,也沒有 mono unit</b>——範例直接組合獨立的函式庫:lib/aec 的 <code>Aec</code>(<code>aec_process_context()</code>)→ <code>se_frame_from_aec()</code> → <code>main.c</code> 的 <code>rig_process()</code> 自己形成 P(只取 AEC 自己的 RES 增益 <code>frame.g_res_ctx</code>:<code>sk_min_f32</code> 對 unity 取 min、<code>sk_capply_gain_f32</code> 套在 E 上,預設不做 CNG,<code>--cng</code> 才呼叫 <code>aec_cng_fill</code>)→ <code>samples/dfn_hop.h</code> 把 DeepFilterNet2 插在「post-RES 頻譜」與「合成」之間;傳統 MMSE-LSA 整個不建構。每個物件(<code>Aec</code>、<code>DfnResStage</code>／<code>DfnRateBridge</code>、48 kHz 路徑的 <code>AcIstft</code>)各有自己的 <code>mem_size</code> 與 <code>init</code>,由 <code>main.c</code> 加總並切塊;<code>DfnHop</code> 只是非擁有指標的 phase 機器。中間那一段由共用的 <code>pipelines/dfn_res_stage.{h,c}</code> 負責,4ch 變體用同一份。</p>
-<p class="note"><b>Host 跑產品自己的取樣率(預設 16 kHz),只有 DFN2 stage 在 48 kHz。</b><code>--sample-rate</code>(<code>SeRequest.sample_rate</code>)接受 8000 / 16000 / 48000;48 kHz 時 stage 直接吃 host 的頻譜,8/16 kHz 時範例改建一個 <code>DfnRateBridge</code>(<code>dfn_hop_init_bridge()</code>)負責兩個格點之間的來回,每個 native hop 進一個、出一個。AEC、RES、CNG 一律留在產品取樣率,呼叫端<b>不</b>再需要在 API 之外把訊號 resample 到 48 kHz。</p>
+<p><code>pipelines/dfn/mono_aec_dfn_res/main.c</code>:<b>沒有 DFN wrapper 函式庫,也沒有 mono unit</b>——範例直接組合獨立的函式庫:lib/aec 的 <code>Aec</code>(<code>aec_process_context()</code>)→ <code>aec_get_res_context()</code>(<code>AecResContext</code>)→ <code>main.c</code> 的 <code>rig_process()</code> 自己形成 P(只取 AEC 自己的 RES 增益 <code>res_gain</code>:<code>sk_min_f32</code> 對 unity 取 min、<code>sk_capply_gain_f32</code> 套在 E 上,預設不做 CNG,<code>--cng</code> 才呼叫 <code>aec_cng_fill</code>)→ <code>dfn/dfn_hop.h</code> 把 DeepFilterNet2 插在「post-RES 頻譜」與「合成」之間;傳統 MMSE-LSA 整個不建構。每個物件(<code>Aec</code>、<code>DfnResStage</code>／<code>DfnRateBridge</code>、48 kHz 路徑的 <code>AcIstft</code>)各有自己的 <code>mem_size</code> 與 <code>init</code>,由 <code>main.c</code> 加總並切塊;<code>DfnHop</code> 只是非擁有指標的 phase 機器。中間那一段由共用的 <code>pipelines/dfn/dfn_res_stage.{h,c}</code> 負責,4ch 變體用同一份。</p>
+<p class="note"><b>Host 跑產品自己的取樣率(預設 16 kHz),只有 DFN2 stage 在 48 kHz。</b><code>--sample-rate</code> 接受 8000 / 16000 / 48000;48 kHz 時 stage 直接吃 host 的頻譜,8/16 kHz 時範例改建一個 <code>DfnRateBridge</code>(<code>dfn_hop_init_bridge()</code>)負責兩個格點之間的來回,每個 native hop 進一個、出一個。AEC、RES、CNG 一律留在產品取樣率,呼叫端<b>不</b>再需要在 API 之外把訊號 resample 到 48 kHz。</p>
 
 <h3>為什麼「估計用 E、套用在 P」</h3>
-<p>DFN2 是以<b>未經處理的 noisy speech</b> 訓練的,RES 挖出的頻譜洞不在它的訓練分佈裡,所以 stage 把兩件事拆開(<code>dfn_res_stage.h</code>):<b>E</b> = <code>frame.e</code>(線性 AEC 誤差,即 RES gain 當初<b>據以估計</b>的 pre-RES 頻譜)只用來<b>估計</b>(ERB/複數特徵、<code>[t-1,t,t+1]</code> 視窗、三個 head);<b>P</b> = <code>rig_process()</code> 組出的頻譜(= <code>E * min(1, G_res)</code> + CNG,傳統鏈本來就會合成的那一個)才是三個 head <b>套用</b>的對象(ERB mask、deep filter、alpha blend、atten limit)。分工是:<b>像語音的 far-end 殘留由 DFN 保留、交給 RES 處理;不像語音的兩級都壓</b>。</p>
+<p>DFN2 是以<b>未經處理的 noisy speech</b> 訓練的,RES 挖出的頻譜洞不在它的訓練分佈裡,所以 stage 把兩件事拆開(<code>dfn_res_stage.h</code>):<b>E</b> = <code>error_spec</code>(線性 AEC 誤差,即 RES gain 當初<b>據以估計</b>的 pre-RES 頻譜)只用來<b>估計</b>(ERB/複數特徵、<code>[t-(2-M)..t+M]</code> 視窗、三個 head);<b>P</b> = <code>rig_process()</code> 組出的頻譜(= <code>E * min(1, G_res)</code> + CNG,傳統鏈本來就會合成的那一個)才是三個 head <b>套用</b>的對象(ERB mask、deep filter、alpha blend、atten limit)。分工是:<b>像語音的 far-end 殘留由 DFN 保留、交給 RES 處理;不像語音的兩級都壓</b>。</p>
 <p>Comfort-noise fill 關閉時 E 與 P 逐 bin 同相位(<code>G_res</code> 是實數),deep-filter tap 不會相位錯配;開啟時 comfort noise 恰好在 RES 挖得最兇的 bin 改變 P 的相位,estimate/apply 一致性在那裡不成立(實數的 ERB mask 不敏感得多)。所以本變體<b>預設關閉</b> comfort-noise fill(<code>--cng</code> 才開),只留為產品 A/B 開關;雙輸入拓樸仍是產品假說,C 端 gate 只證明結構正確。</p>
 
 <h3>格點、尺度與版本</h3>
 <table>
 <tr><th>項目</th><th>值</th><th>出處</th></tr>
-<tr><td>格點</td><td><b>stage:48 kHz / FFT 1024 / hop 512 / 513 bins</b>(periodic sqrt-Hann、50% overlap;stage 自己其他取樣率一律 reject)。<b>host:8 k/256、16 k/256(預設)、16 k/512、48 k/1024</b>,即 <code>se_derive()</code>(mono rules,<code>allow_8k</code>)的清單,範例預設 16 kHz</td><td><code>dfn2_process.h</code>;<code>dfn_res_stage.c</code>;<code>mono_aec_dfn_res/main.c</code>;<code>dfn_rate_bridge.c</code></td></tr>
-<tr><td>兩個格點怎麼接</td><td>48 kHz host 的格點與窗<b>就是</b> DFN2 的格點與窗,E 直接是合法的 DFN2 分析幀,不需第二次 transform。8/16 kHz 由 <code>DfnRateBridge</code> 承擔(範例的 <code>use_bridge</code>,48 kHz 不建):原生 WOLA → 升頻 → 48 kHz 上另做一次同款 sqrt-Hann 1024/512 分析 → stage → 48 kHz WOLA → 降頻。升頻器兩顆(E、P 各一)、降頻器一顆,都是 audiolib 的 <code>audio_resampler</code>(16 kHz ×3、8 kHz ×6),輸出因此是通帶容差等值而<b>非</b>逐位元等值</td><td><code>dfn_res_stage.h</code>;<code>dfn_rate_bridge.h</code>;<code>dfn_rate_bridge.c</code>;<code>samples/dfn_hop.h</code></td></tr>
+<tr><td>格點</td><td><b>stage:48 kHz / FFT 1024 / hop 512 / 513 bins</b>(periodic sqrt-Hann、50% overlap;stage 自己其他取樣率一律 reject)。<b>host:8 k/256、16 k/256(預設)、16 k/512、48 k/1024</b>,即 <code>aec_resolve_signal_grid()</code> 的清單(<code>derive_lane()</code> 取 <code>aec_default_fft_size()</code>),範例預設 16 kHz</td><td><code>dfn2_process.h</code>;<code>dfn_res_stage.c</code>;<code>dfn/mono_aec_dfn_res/main.c</code>;<code>dfn_rate_bridge.c</code></td></tr>
+<tr><td>兩個格點怎麼接</td><td>48 kHz host 的格點與窗<b>就是</b> DFN2 的格點與窗,E 直接是合法的 DFN2 分析幀,不需第二次 transform。8/16 kHz 由 <code>DfnRateBridge</code> 承擔(範例的 <code>use_bridge</code>,48 kHz 不建):原生 WOLA → 升頻 → 48 kHz 上另做一次同款 sqrt-Hann 1024/512 分析 → stage → 48 kHz WOLA → 降頻。升頻器兩顆(E、P 各一)、降頻器一顆,都是 audiolib 的 <code>audio_resampler</code>(16 kHz ×3、8 kHz ×6),輸出因此是通帶容差等值而<b>非</b>逐位元等值</td><td><code>dfn_res_stage.h</code>;<code>dfn_rate_bridge.h</code>;<code>dfn_rate_bridge.c</code>;<code>dfn/dfn_hop.h</code></td></tr>
 <tr><td>邊界尺度</td><td>入 <code>2^-5</code>、出 <code>2^5</code>(hex-float <code>0x1p-5f</code>/<code>0x1p5f</code>,精確的 2 的次方):pipeline 頻譜是 audio-scale 未正規化 STFT,DFN2 邊界要 <code>torch.stft(normalized=True)</code>(=1/32)</td><td><code>dfn_res_stage.h</code>;<code>dfn_res_stage.c</code></td></tr>
 <tr><td>版本</td><td><code>DFN_RES_STAGE_LAYOUT_VERSION = 3</code>、<code>DFN_RATE_BRIDGE_LAYOUT_VERSION = 3</code>;兩者 <code>descriptor_version</code> 皆 1。規則:pool 大小、carve 順序或 descriptor 內容任一改變,該模組的版本加一。<code>dfn_hop</code> 是範例碼,沒有 layout version 或 descriptor;mono 的 <code>Aec</code> 沒有 descriptor</td><td><code>dfn_res_stage.h</code>、<code>dfn_rate_bridge.h</code></td></tr>
 </table>
-<p class="note"><b>Fail-open = 傳統鏈的等值(延後)。</b>沒有模型(<code>model.infer == NULL</code>)、<code>infer()</code> 回非 0、或輸出有未寫/非有限值時,該幀走 <code>dfn2_prepost_frame_skip()</code>:unit ERB mask 經 partition-of-unity 的 <code>erb_inv</code> 展開成 unit bin gain、zero taps、alpha 0,是<b>精確</b>的 identity;遞迴 state 維持加速器寫完的樣子,輸出非有限時已歸零(commit 讓 state generation 加 1)(<code>dfn_res_stage.h</code>、<code>.c</code>)。48 kHz 輸出就是「手寫傳統鏈(<code>tests/conv_chain_mono.h</code>,降噪器關)延後兩個 hop」(CNG 也一樣),由 C 測試逐 byte 釘死;8/16 kHz 因為多了 resampler 往返,gate 改為「延後 added delay 後的通帶容差」。</p>
+<p class="note"><b>Fail-open = 傳統鏈的等值(延後)。</b>沒有模型(<code>model.infer == NULL</code>)、<code>infer()</code> 回非 0、或輸出有未寫/非有限值時,該幀走 <code>dfn2_prepost_frame_skip()</code>:unit ERB mask 經 partition-of-unity 的 <code>erb_inv</code> 展開成 unit bin gain、zero taps、alpha 0,是<b>精確</b>的 identity;遞迴 state 維持加速器寫完的樣子,輸出非有限時已歸零(commit 讓 state generation 加 1)(<code>dfn_res_stage.h</code>、<code>.c</code>)。48 kHz 輸出就是「手寫傳統鏈(<code>pipelines/mono_aec_nr_res/tests/conv_chain_mono.h</code>,降噪器關)延後 L = M + D 個 hop」(CNG 也一樣;出貨 pair 1/1 的 L = 2),由 C 測試逐 byte 釘死;8/16 kHz 因為多了 resampler 往返,gate 改為「延後 added delay 後的通帶容差」。</p>
 
 <h2>API 用法</h2>
-<p>呼叫順序:<code>se_derive()</code> → 填 ERB 矩陣與 model callback → 各物件 <code>mem_size</code> → 切塊 <code>init</code> → 每 hop 一次(<code>aec_process_context</code>、<code>se_frame_from_aec</code>、自寫的 P 形成、<code>dfn_hop_process</code>)→ destroy。每次吃<b>剛好一個 host hop</b> 的 mic 與 ref、寫出同樣長度(16 k/256 預設 128、16 k/512 為 256、8 k/256 為 128、48 k/1024 為 512)。完整可編譯範例(設定、pool 切分、init、每 hop、reset、destroy,含 48 kHz 與 phased 變體)、流程時序圖與參數表收在 <a href="pipeline_dfn_usage.html">pipeline_dfn_usage</a>、<a href="pipeline_dfn_sequence.html">pipeline_dfn_sequence</a> 與 <a href="pipeline_dfn_params.html">pipeline_dfn_params</a>。每 hop 的核心如下:</p>
-<pre>SeSpecFrame f;
+<p>呼叫順序:<code>derive_lane()</code>(<code>aec_resolve_signal_grid()</code> 加 <code>aec_config_from_preset()</code>)→ 填 ERB 矩陣與 model callback → 各物件 <code>mem_size</code> → 切塊 <code>init</code> → 每 hop 一次(<code>aec_process_context</code>、<code>aec_get_res_context</code>、自寫的 P 形成、<code>dfn_hop_process</code>)→ destroy。每次吃<b>剛好一個 host hop</b> 的 mic 與 ref、寫出同樣長度(16 k/256 預設 128、16 k/512 為 256、8 k/256 為 128、48 k/1024 為 512)。完整範例(含 48 kHz 與 phased 變體)、流程時序圖與參數表收在 <a href="pipeline_dfn_usage.html">pipeline_dfn_usage</a>、<a href="pipeline_dfn_sequence.html">pipeline_dfn_sequence</a> 與 <a href="pipeline_dfn_params.html">pipeline_dfn_params</a>。每 hop 的核心如下:</p>
+<pre>AecResContext c;
 aec_process_context(aec, mic, ref);                          /* 剛好一個 host hop */
-if (se_frame_from_aec(aec, &amp;f) != 0 || !f.g_res_ctx) { /* 被拒: aec + rng + hop 一起 reset */ }
-sk_min_f32(gain, unity, f.g_res_ctx, n_freqs);               /* P 必須在 dfn_hop_begin 之前形成 */
-sk_capply_gain_f32(post, f.e, gain, n_freqs);                /* P = E * min(1, G_res) */
-if (cng_on &amp;&amp; f.cn)                                       /* 預設關: E 與 P 要同相位 */
-    aec_cng_fill(&amp;rng, post, f.cn, f.g_res_ctx, unity, SE_CNG_NR_GAIN_FLOOR, n_freqs);
+aec_get_res_context(aec, &amp;c);
+if (!c.error_spec || !c.res_gain) { /* 被拒: aec + rng + hop 一起 reset */ }
+sk_min_f32(gain, unity, c.res_gain, n_freqs);                /* P 必須在 dfn_hop_begin 之前形成 */
+sk_capply_gain_f32(post, c.error_spec, gain, n_freqs);       /* P = E * min(1, G_res) */
+if (cng_on &amp;&amp; c.comfort_noise)                               /* 預設關: E 與 P 要同相位 */
+    aec_cng_fill(&amp;rng, post, c.comfort_noise, c.res_gain, unity, CNG_NR_GAIN_FLOOR, n_freqs);
 
-dfn_hop_process(&amp;hop, f.e, post, out);                       /* (a) 一次完成:模型由 model.infer 執行(沒設就是 identity) */
+dfn_hop_process(&amp;hop, c.error_spec, post, out);                       /* (a) 一次完成:模型由 model.infer 執行(沒設就是 identity) */
 /* (b) 或自己在中間跑加速器:dfn_hop_begin → while (dfn_hop_nn_begin() &gt; 0) { 跑 NPU; dfn_hop_nn_end(rc) } → dfn_hop_end(&amp;hop, out) */</pre>
 <p>各 stage 與 bridge 的 reject-first 清單(其中最容易踩到的是 <code>erb_inv</code> 必須是 partition of unity),以及入口的逐項語意,收在 <a href="pipeline_dfn_detail.html">pipeline_dfn_detail</a>。任一步失敗,整合者要把 <code>Aec</code>、CNG RNG 與 <code>DfnHop</code> 一起 reset(<code>main.c</code> 的 <code>rig_reset()</code>)。</p>
 
 <h2>Block diagram(每 hop 程式流)</h2>
 <pre>rig_process(): aec_process_context(aec, mic, ref)             1 host hop in
- ├─ se_frame_from_aec(aec, &amp;frame)                          → SeSpecFrame(借用)
- │     線性 AEC(context-only);frame.e = E [n_freqs] Complex (pre-RES,RES 據以估計)
- │     frame.g_res_ctx = AEC 自己的 G_res,frame.cn = comfort-noise PSD
+ ├─ aec_get_res_context(aec, &amp;c)                            → AecResContext(借用)
+ │     線性 AEC(context-only);c.error_spec = E [n_freqs] Complex (pre-RES,RES 據以估計)
+ │     c.res_gain = AEC 自己的 G_res,c.comfort_noise = comfort-noise PSD
  ├─ P 的形成(rig_process() 內自寫):
- │     sk_min_f32(g_total, unity, frame.g_res_ctx)   sk_capply_gain_f32(post, frame.e, g_total)
- │     aec_cng_fill(&amp;rng, post, frame.cn, frame.g_res_ctx, unity, …)   (cng=1 時)
+ │     sk_min_f32(g_total, unity, c.res_gain)   sk_capply_gain_f32(post, c.error_spec, g_total)
+ │     aec_cng_fill(&amp;rng, post, c.comfort_noise, c.res_gain, unity, …)   (cng=1 時)
  │     post = P [n_freqs] Complex  (= E*min(1,G_res) + CNG)
- └─ dfn_hop_process(&amp;hop, frame.e, P, out) = 下面四個呼叫的序列:
+ └─ dfn_hop_process(&amp;hop, c.error_spec, P, out) = 下面四個呼叫的序列:
 
 dfn_hop_begin(&amp;hop, E, P)
- ├─【48 kHz host】dfn_res_stage_begin(stage, E, P, &amp;job)   回 1 = job 已開(兩個 warm-up hop 回 0)
+ ├─【48 kHz host】dfn_res_stage_begin(stage, E, P, &amp;job)   回 1 = job 已開(前 M 個 hop 回 0,出貨 M=1 即第 0 個 hop;輸出頻譜到第 L 個 hop 才有)
  │      A = E*0x1p-5f, B = P*0x1p-5f → pre_process_freq_dual()(est 走特徵/
- │      [t-1,t,t+1] 視窗,app 走 noisy ring)
+ │      [t-(2-M)..t+M] 視窗,app 走 noisy ring)
  └─【8/16 kHz host】dfn_rate_bridge_begin(bridge, E, P)
         ac_istft_push(synth_e, E)、ac_istft_push(synth_p, P)  同款 sqrt-Hann WOLA,各得一個 native hop
         → 兩顆 audio_resampler 各自升到 48 kHz(16 k ×3、8 k ×6)→ 兩條 48 kHz FIFO
@@ -91,7 +92,7 @@ while (dfn_hop_nn_begin(&amp;hop, &amp;job) &gt; 0) {            (每 hop 0..2 �
 }   【48 kHz】dfn_res_stage_end(stage, rc, stage_output):
         rc≠0／輸出未寫／非有限 → dfn2_prepost_frame_skip() ← fail-open
         → post_process_freq()(ERB mask → deep filter → alpha → atten limit)
-        → valid ? Y * 0x1p5f(source frame t-2) : 全零
+        → valid ? Y * 0x1p5f(source frame t-L) : 全零
     【8/16 kHz】bridge:FIFO 每滿 512,ac_stft_push(stft_e)、ac_stft_push(stft_p)
         sqrt-Hann 1024/512、center=0(歷史在 AcStft 內)開一個 job;nn_end 之後 stage_end
         → ac_istft_push(synth48) 48 kHz iFFT + WOLA → 降頻回原生 → 原生 out FIFO
@@ -104,7 +105,7 @@ dfn_hop_end(&amp;hop, out)
 任一步回負值 → 整合者 reset(aec + rng + hop)後重來(main.c 的 rig_reset())</pre>
 
 <h2>訊號泳道圖</h2>
-<p><b>48 kHz host</b> 的泳道很短:每 hop 一次推論,第 0 幀因為沒有右鄰居而不呼叫加速器,stage 前兩個 hop 輸出全零頻譜,之後第 p 個 hop 的輸出就是「傳統 pipeline 的 hop#(p-2) 輸出」,合計 3 hop 純延遲(見「延遲與 warm-up」)。原生格點則多了 bridge 的兩個時鐘:</p>
+<p><b>48 kHz host</b> 的泳道很短:每 hop 一次推論,前 M 幀因為沒有右鄰居而不呼叫加速器,stage 前 L 個 hop 輸出全零頻譜,之後第 p 個 hop 的輸出就是「傳統 pipeline 的 hop#(p-L) 輸出」(出貨 pair:M=1、L=2,合計 3 hop 純延遲,見「延遲與 warm-up」)。原生格點則多了 bridge 的兩個時鐘:</p>
 <h3>原生格點 host + rate bridge(示例 16 kHz / fft 256 / hop 128)</h3>
 <pre>lane \ native hop   #0            #1            #2            #3            #4(週期重複)
 ─────────────────── ───────────── ───────────── ───────────── ───────────── ─────────────
@@ -119,13 +120,13 @@ out(128 samples)    每個 hop 恰好吐 1 個 hop;內容 = host 自己的輸出
 每 native hop 的幀排程:16 k/hop 128 → 0,1,1,1(週期 4);16 k/hop 256 與 8 k/hop 128 → 1,2
 (週期 2)。<b>一個 hop 內最多跑兩次推論</b>,這是板端算力預算該看的峰值而非平均值
 (dfn_rate_bridge.h;測試釘死於 tests/test_dfn_rate_bridge.c)</pre>
-<p class="note"><b>E 與 P 一路都是兩個指標。</b>它們從 SeSpecFrame 與 P 緩衝出來就分開,在 <code>dfn2_process.c</code> 內部也踩互斥的狀態(est 走特徵/視窗,app 走 noisy ring);<code>est == app</code> 時 <code>..._freq_dual()</code> <b>等同</b><code>dfn2_prepost_pre_process_freq()</code>。命名為 est/app 而非 a/b,是因為兩個同型別的 pair 最容易對調(<code>dfn2_prepost.h</code>)。Bridge 內也維持這個分離:E、P 各有自己的原生 <code>AcIstft</code>、升頻器、48 kHz FIFO 與 48 kHz <code>AcStft</code>(分析歷史在物件內),只有<b>降頻器</b>與 48 kHz 合成物件是一份,因為 stage 只輸出一條訊號。</p>
+<p class="note"><b>E 與 P 一路都是兩個指標。</b>它們從 <code>AecResContext</code> 與 P 緩衝出來就分開,在 <code>dfn2_process.c</code> 內部也踩互斥的狀態(est 走特徵/視窗,app 走 noisy ring);<code>est == app</code> 時 <code>..._freq_dual()</code> <b>等同</b><code>dfn2_prepost_pre_process_freq()</code>。命名為 est/app 而非 a/b,是因為兩個同型別的 pair 最容易對調(<code>dfn2_prepost.h</code>)。Bridge 內也維持這個分離:E、P 各有自己的原生 <code>AcIstft</code>、升頻器、48 kHz FIFO 與 48 kHz <code>AcStft</code>(分析歷史在物件內),只有<b>降頻器</b>與 48 kHz 合成物件是一份,因為 stage 只輸出一條訊號。</p>
 
 <h2>I/O 表</h2>
 <h3>pipeline 邊界</h3>
 <pre>mic, ref, out  [hop] float32  一個 host hop(48 k/1024 = 512、16 k/256 = 128);out 全覆寫,
                               開頭全零(見延遲一節)
-frame.e(E) / P  [n_freqs] Complex ×2,1 幀/hop;E 借用 Aec 的 per-hop buffer,
+error_spec(E) / P  [n_freqs] Complex ×2,1 幀/hop;E 借用 Aec 的 per-hop buffer,
                               有效至下一次 aec_process_context;P 在 <code>main.c</code> 自己 carve 的 <code>post</code> 緩衝內
 DfnResStageJob  dfn_hop_nn_begin 的輸出:DFN2PrepostInputs/Outputs 視圖,每 hop 0..1 個(48 kHz)或
                               0..2 個(原生格點),有效至對應的 nn_end</pre>
@@ -139,11 +140,11 @@ out: erb_mask -&gt; erb_mask [32]=32 | df_coefs -&gt; coefs [96][5][2]=960(bin �
 <p>幾何常數 <code>DFN2_N_BINS=513</code>、<code>DFN2_N_ERB=32</code>、<code>DFN2_DF_BINS=96</code>、<code>DFN2_DF_ORDER=5</code>、<code>DFN2_MODEL_INPUT_FRAMES=3</code>、<code>DFN2_MODEL_GRU_HIDDEN=256</code>。<code>frame_inputs()</code> 只對三個 head 輸出<b>預填 NaN</b>,「只寫一半」會在 commit 被抓到;兩個 state 張量位址固定,輸入與 <code>*_next</code> 綁同一個位址就地更新(須先讀完 state 輸入才寫同位址輸出;commit 遇非有限時兩個全歸零並讓 <code>dfn2_prepost_state_generation()</code> 加 1,runtime 據此把自己的定點 state 填成量化後的零);形狀不對由 18 欄位的 <code>DFN2ModelIoDescriptor</code> 擋下。詳見 <a href="ainr_dfn2.html">ainr_dfn2</a>。</p>
 
 <h2>State 表</h2>
-<p>Pool 切分(<code>mono_aec_dfn_res/main.c</code> 的 <code>make_plan()</code>／<code>rig_build()</code>,每塊 16-byte 對齊):<code>Aec</code> pool → <code>unity</code>／<code>total_gain</code>(各 [n_freqs] float)與 P 緩衝 <code>post</code>([n_freqs] <code>Complex</code>;這裡無 NR、無額外合成)→ 二擇一:48 kHz 是 <code>DfnResStage</code> pool + 呼叫端的 <code>AcIstft</code> + stage 輸出頻譜 [513] <code>Complex</code>,原生格點是<b>整個 <code>DfnRateBridge</code> pool</b>(stage 的 pool 在它裡面)。<code>DfnHop</code> 是 <code>main.c</code> 裡的非擁有指標結構。stage 內部再 carve:stage 控制塊 → <code>DFN2Prepost</code> pool → 一塊 6×513 float 的 slab。</p>
+<p>Pool 切分(<code>dfn/mono_aec_dfn_res/main.c</code> 的 <code>make_plan()</code>／<code>rig_build()</code>,每塊 16-byte 對齊):<code>Aec</code> pool → <code>unity</code>／<code>total_gain</code>(各 [n_freqs] float)與 P 緩衝 <code>post</code>([n_freqs] <code>Complex</code>;這裡無 NR、無額外合成)→ 二擇一:48 kHz 是 <code>DfnResStage</code> pool + 呼叫端的 <code>AcIstft</code> + stage 輸出頻譜 [513] <code>Complex</code>,原生格點是<b>整個 <code>DfnRateBridge</code> pool</b>(stage 的 pool 在它裡面)。<code>DfnHop</code> 是 <code>main.c</code> 裡的非擁有指標結構。stage 內部再 carve:stage 控制塊 → <code>DFN2Prepost</code> pool → 一塊 6×513 float 的 slab。</p>
 <table>
 <tr><th>state</th><th>大小</th><th>存放者</th><th>備註</th></tr>
-<tr><td><code>Aec</code> 全狀態(線性濾波器、delay estimator、RES/post)</td><td>364,416 B(16 kHz/256,<code>aec_get_mem_size()</code>)</td><td>pool</td><td>lane 以 <code>enable_res=0</code>/<code>return_res_context=1</code> 建,RES 增益由 <code>Aec</code> 自己算(<code>frame.g_res_ctx</code>);NR 實例<b>完全不存在</b>。合成 <code>AcIstft</code>(OLA／窗表)只有 48 kHz 路徑用到(由 <code>DfnHop</code> 持有),原生格點改由 bridge 合成</td></tr>
-<tr><td>暫存 <code>unity</code> / <code>total_gain</code> / <code>post</code>(P)、comfort-noise RNG</td><td>各 [n_freqs];RNG 為 uint32;三者合計 2,096 B(16 kHz/256:2×528 + 1,040)</td><td>pool(<code>main.c</code> 的 <code>Rig</code>)</td><td><code>unity</code> 是缺席的降噪器讀到的全 1 向量;RNG 種子 <code>SE_CNG_RNG_SEED</code>(<code>rig_reset()</code> 重設)。CNG 在 <code>rig_process()</code> 裡產生、已包在 P 裡,stage 與 bridge <b>沒有任何 comfort-noise 程式碼</b></td></tr>
+<tr><td><code>Aec</code> 全狀態(線性濾波器、delay estimator、RES/post)</td><td>364,416 B(16 kHz/256,<code>aec_get_mem_size()</code>)</td><td>pool</td><td>lane 以 <code>enable_res=0</code>/<code>return_res_context=1</code> 建,RES 增益由 <code>Aec</code> 自己算(<code>res_gain</code>);NR 實例<b>完全不存在</b>。合成 <code>AcIstft</code>(OLA／窗表)只有 48 kHz 路徑用到(由 <code>DfnHop</code> 持有),原生格點改由 bridge 合成</td></tr>
+<tr><td>暫存 <code>unity</code> / <code>total_gain</code> / <code>post</code>(P)、comfort-noise RNG</td><td>各 [n_freqs];RNG 為 uint32;三者合計 2,096 B(16 kHz/256:2×528 + 1,040)</td><td>pool(<code>main.c</code> 的 <code>Rig</code>)</td><td><code>unity</code> 是缺席的降噪器讀到的全 1 向量;RNG 種子 <code>CNG_RNG_SEED</code>(<code>main.c</code> 的巨集)(<code>rig_reset()</code> 重設)。CNG 在 <code>rig_process()</code> 裡產生、已包在 P 裡,stage 與 bridge <b>沒有任何 comfort-noise 程式碼</b></td></tr>
 <tr><td>相位與 job 狀態(<code>DfnHop</code>:phase、job 旗標、stage 輸出指標)</td><td>純量、指標與 <code>DfnResStageJob</code></td><td>C struct(<code>DfnHop</code>,非擁有)</td><td>phased API 的序列閘:<code>dfn_hop_begin</code> 之後才能 <code>nn_begin</code>,一個 job 開著時不能再 <code>nn_begin</code>;違反回非 0</td></tr>
 <tr><td><code>DFN2Prepost</code> pool(含遞迴狀態)</td><td><code>DFN2_IO_FREQ</code>:219,536 bytes(現查)</td><td>stage pool 內</td><td><code>DFN2State</code>(EMA 正規化器、df/coef/alpha/noisy/hi-delay ring;<code>sizeof</code> = 67,368 B,不內嵌分析/合成緩衝與窗表,FREQ 模式沒有 STFT/ISTFT 物件)+ feature 視窗 + 兩個顯式 state 陣列(<code>h_gru</code>、<code>df_convp_history</code>) + est/app staging(<code>DFN2_PREPOST_CARVE_VERSION = 7</code>)</td></tr>
 <tr><td>stage 暫存 slab + 計數器</td><td>6 × 513 float = 12,312 bytes</td><td>stage pool / struct</td><td>est/app/out 的 re/im,逐 hop 覆寫;<code>frames_in</code>/<code>commits</code>/<code>skips</code>/<code>output_frame</code> 由 <code>dfn_res_stage_get_counters()</code> 讀出,測試用它證明「中途沒有 reset」</td></tr>
@@ -154,39 +155,38 @@ out: erb_mask -&gt; erb_mask [32]=32 | df_coefs -&gt; coefs [96][5][2]=960(bin �
 </table>
 
 <h2>延遲與 warm-up</h2>
-<p><b>端到端演算法延遲 = host 的 1 hop WOLA + DFN2 段的延遲</b>(範例 <code>main.c</code> 以 hop 加 <code>dfn_rate_bridge_added_delay_samples()</code> 或 <code>hop * (DFN_RES_STAGE_LOOKAHEAD_FRAMES + 1)</code> 印出)。48 kHz 時 DFN2 段就是 <b>2 hop 模型 lookahead</b>(<code>DFN2_MASK_LOOKAHEAD + DFN2_DF_LOOKAHEAD = 1+1</code>,cascade 串聯<b>相加</b>而非取 max);原生格點時是 bridge 的 added delay:</p>
+<p><b>端到端演算法延遲 = host 的 1 hop WOLA + DFN2 段的延遲</b>(範例 <code>main.c</code> 以 hop 加 <code>dfn_rate_bridge_added_delay_samples()</code> 或 <code>hop * (DFN_RES_STAGE_LOOKAHEAD_FRAMES + 1)</code> 印出)。48 kHz 時 DFN2 段就是 <b>L = M + D 個 hop 的模型 lookahead</b>(<code>DFN2_MASK_LOOKAHEAD + DFN2_DF_LOOKAHEAD</code>,cascade 串聯<b>相加</b>而非取 max;出貨 pair 1/1 → L = 2);原生格點時是 bridge 的 added delay。下表與數字都是出貨 pair 1/1(其餘 pair 的規則見 <a href="pipeline_dfn_detail.html">pipeline_dfn_detail</a>「lookahead pair」):</p>
 <table>
 <tr><th>host 格點</th><th>hop</th><th>prefill</th><th>bridge added delay</th><th>總演算法延遲</th></tr>
 <tr><td>16 kHz / fft 256(預設)</td><td>128</td><td>128</td><td>672(42.0 ms)</td><td><b>800 samples = 50.0 ms</b></td></tr>
 <tr><td>16 kHz / fft 512</td><td>256</td><td>85</td><td>629(39.3 ms)</td><td>885 samples = 55.3 ms</td></tr>
 <tr><td>8 kHz / fft 256</td><td>128</td><td>42</td><td>330(41.3 ms)</td><td>458 samples = 57.3 ms</td></tr>
-<tr><td>48 kHz / fft 1024</td><td>512</td><td>—(無 bridge)</td><td>—</td><td>1536 samples = 32.0 ms(3 hop)</td></tr>
+<tr><td>48 kHz / fft 1024</td><td>512</td><td>—(無 bridge)</td><td>—</td><td>1536 samples = 32.0 ms(L+1 = 3 hop)</td></tr>
 </table>
 <ul>
-<li>added delay = <code>prefill + 升頻群延遲 + 1536×sr/48000 + 降頻群延遲</code>;兩個群延遲在每個支援格點都各是 16 個原生樣本,測試即以 <code>prefill + 16 + 1536*sr/48000 + 16</code> 釘死。1536 = stage 自己的 1 個分析/合成 hop 加兩個 lookahead hop。</li>
+<li>added delay = <code>prefill + 升頻群延遲 + (L+1)×512×sr/48000 + 降頻群延遲</code>(整數除法);兩個群延遲在每個支援格點都各是 16 個原生樣本,測試即以此釘死。(L+1)×512 = stage 自己的 1 個分析/合成 hop 加 L 個 lookahead hop;出貨 pair 為 1536。L+1 不是 3 的倍數時 stage 延遲含小數個原生樣本,向下取整。</li>
 <li><code>prefill</code> <b>不是寫死的常數</b>:init 用真正的 resampler 在靜音上走一遍排程,量出「吐出 − 產生」的最大缺口,<code>_process()</code> 因此永遠拿得到完整 hop。</li>
-<li><b>原生格點不是逐位元等值</b>:訊號走過兩顆 FIR resampler,通帶響應被套用兩次,測試因此用容差而非 <code>memcmp</code>——<b>延遲本身則由脈衝精確釘住</b>。單元測試閘 <code>&lt; 5e-3</code>(現查 7.4e-05 / 9.6e-05 / 1.2e-04);<code>test_mono_dfn</code> 把兩路都過 0.35 fs 低通後比對,閘 <code>&lt; 1e-3</code>(現查 8.73e-06 / 8.91e-06 / 1.30e-05)。</li>
-<li><b>Warm-up:開頭的輸出是全零</b>(48 kHz 兩個 hop;原生格點為 added delay,來自預填的 out FIFO)。<code>dfn_res_stage_process()</code> 暖機時回 0 並<b>寫滿</b>零頻譜,呼叫端可以無條件合成,延遲是純延遲而非條件分支。第 0 幀 <b>不呼叫</b>加速器(分析是 center=False、一個 hop 一幀,但 graph 吃 <code>[t-1,t,t+1]</code>,第 0 幀沒有右鄰居);之後 48 kHz 每 hop 恰好一次推論,原生格點照泳道圖的排程,一個 hop 可能 0、1 或 2 次。</li>
-<li><b>AEC delay 改變不 reset stage/bridge。</b>它們不消費 far-end,delay 改變後兩個輸入仍然連續;reset 會白付暖機並讓遞迴狀態重來。只有整合者的 reset(<code>dfn_hop_reset()</code> 連帶 reset stage/bridge 與 <code>model.reset</code>)(<code>dfn_res_stage.h</code> 開頭)。收尾 flush 要再推兩個全零 hop(原生格點推滿 added delay)才吐得出最後的 source frame,<b>那幾拍加速器也要照跑</b>。</li>
+<li><b>原生格點不是逐位元等值</b>:訊號走過兩顆 FIR resampler,通帶響應被套用兩次,測試因此用容差而非 <code>memcmp</code>——<b>延遲本身則由脈衝精確釘住</b>。bridge 測試閘 <code>&lt; 5e-3</code>(現查 7.4e-05 / 9.6e-05 / 1.2e-04);<code>test_mono_dfn</code> 把兩路都過 0.35 fs 低通後比對,閘 <code>&lt; 1e-3</code>(現查 8.73e-06 / 8.91e-06 / 1.30e-05)。</li>
+<li><b>Warm-up:開頭的輸出是全零</b>(48 kHz 為 L 個 hop;原生格點為 added delay,來自預填的 out FIFO)。<code>dfn_res_stage_end()</code> 暖機時回 0 並<b>寫滿</b>零頻譜,呼叫端可以無條件合成,延遲是純延遲而非條件分支。前 M 幀 <b>不呼叫</b>加速器(graph 的視窗是 <code>[t-(2-M)..t+M]</code>,前 M 幀還湊不齊右鄰居;出貨 M=1 即第 0 幀);之後 48 kHz 每 hop 恰好一次推論,原生格點照泳道圖的排程,一個 hop 可能 0、1 或 2 次。</li>
+<li><b>AEC delay 改變不 reset stage/bridge。</b>它們不消費 far-end,delay 改變後兩個輸入仍然連續;reset 會白付暖機並讓遞迴狀態重來。只有整合者的 reset(<code>dfn_hop_reset()</code> 連帶 reset stage/bridge 與 <code>model.reset</code>)(<code>dfn_res_stage.h</code> 開頭)。收尾 flush 要再推 L 個全零 hop(原生格點推滿 added delay)才吐得出最後的 source frame,<b>那幾拍加速器也要照跑</b>。</li>
 </ul>
 
 <h2>相關檔案與測試路徑</h2>
 <table>
 <tr><th>路徑(相對 repo 根)</th><th>內容</th></tr>
 <tr><td><a href="pipeline_dfn_usage.html">pipeline_dfn_usage</a>、<a href="pipeline_dfn_sequence.html">pipeline_dfn_sequence</a>、<a href="pipeline_dfn_params.html">pipeline_dfn_params</a></td><td>呼叫範例(init／每 hop／reset／destroy)、流程時序圖、外部／內部參數表與 public／internal 函式表</td></tr>
-<tr><td><code>pipelines/mono_aec_dfn_res/main.c</code></td><td>本頁的組合(<code>rig_build()</code>／<code>rig_process()</code>／<code>rig_reset()</code>,P 的形成寫在 <code>rig_process()</code>),沒有 wrapper 函式庫</td></tr>
-<tr><td><code>pipelines/samples/dfn_hop.h</code></td><td>範例碼(header-only,沒有 ABI):<code>DfnHop</code> 的 begin／nn_begin／nn_end／end</td></tr>
-<tr><td><code>pipelines/dfn_res_stage.h / .c</code></td><td>共用 post-RES DFN2 stage(<code>DFN_RES_STAGE_LAYOUT_VERSION = 3</code>),契約在 header 開頭</td></tr>
-<tr><td><code>pipelines/common/se_stage.h</code>、<code>pipelines/mono_aec_nr_res/tests/conv_chain_mono.h</code></td><td><code>se_frame_from_aec()</code>(見 <a href="pipeline_mono.html">pipeline_mono</a>);測試的手寫 oracle 鏈</td></tr>
-<tr><td><code>pipelines/dfn_rate_bridge.h / .c</code></td><td>rate bridge(<code>DFN_RATE_BRIDGE_LAYOUT_VERSION = 3</code>):原生格點 ↔ 48 kHz 的來回、幀排程、prefill 校正與 added delay;訊號/時鐘/延遲契約寫在 header 開頭</td></tr>
+<tr><td><code>pipelines/dfn/mono_aec_dfn_res/main.c</code></td><td>本頁的組合(<code>rig_build()</code>／<code>rig_process()</code>／<code>rig_reset()</code>,P 的形成寫在 <code>rig_process()</code>),沒有 wrapper 函式庫</td></tr>
+<tr><td><code>pipelines/dfn/dfn_hop.h</code></td><td>範例碼(header-only,沒有 ABI):<code>DfnHop</code> 的 begin／nn_begin／nn_end／end</td></tr>
+<tr><td><code>pipelines/dfn/dfn_res_stage.h / .c</code></td><td>共用 post-RES DFN2 stage(<code>DFN_RES_STAGE_LAYOUT_VERSION = 3</code>),契約在 header 開頭</td></tr>
+<tr><td><code>lib/aec/c_impl/include/aec.h</code>、<code>pipelines/mono_aec_nr_res/tests/conv_chain_mono.h</code></td><td><code>aec_get_res_context()</code>／<code>AecResContext</code>、<code>aec_resolve_signal_grid()</code>(見 <a href="pipeline_mono.html">pipeline_mono</a>);手寫 oracle 鏈</td></tr>
+<tr><td><code>pipelines/dfn/dfn_rate_bridge.h / .c</code></td><td>rate bridge(<code>DFN_RATE_BRIDGE_LAYOUT_VERSION = 3</code>):原生格點 ↔ 48 kHz 的來回、幀排程、prefill 校正與 added delay;訊號/時鐘/延遲契約寫在 header 開頭</td></tr>
 <tr><td><code>AINR/DeepFilterNet2/dfn2_prepost.{h,c}</code>、<code>dfn2_model_io.{h,c}</code>、<code>export_erb_matrix.py</code></td><td>DFN2 前後處理 class + 雙輸入入口 <code>dfn2_prepost_pre_process_freq_dual()</code>、<code>DFN2Model</code>/<code>dfn2_model_run_frame()</code>;<code>DFN2ModelIoDescriptor</code>(18 欄位);<code>--runtime-bins</code> 產生 <code>erb_fwd.bin</code>/<code>erb_inv.bin</code>,<code>write_runtime_bins()</code> 會拒絕非 partition-of-unity 的 <code>erb_inv</code></td></tr>
-<tr><td><code>pipelines/mono_aec_dfn_res/main.c</code><br><code>pipelines/dfn_example_args.h</code></td><td>板端骨架(fail-open,<code>run_accelerator()</code> 回 -1 佔位);旗標 <code>--sample-rate {8000|16000|48000}</code>(預設 16000)、<code>--delay-mode</code>/<code>--delay-num-filters</code>/<code>--fixed-delay</code>、<code>--erb-fwd</code>/<code>--erb-inv</code>、<code>--atten-lim</code>、<code>--cng</code>(預設關),並印出 pool bytes、hop 與演算法延遲。沒給矩陣時用 unit partition,只供 fail-open smoke</td></tr>
-<tr><td><code>pipelines/mono_aec_dfn_res/tests/test_mono_dfn.c</code></td><td>48 kHz backbone gate(對手寫傳統鏈 <code>conv_chain_mono.h</code>(降噪器關)延後兩個 hop 逐 byte 相同,跨一次真實的 delay 改變,且 stage 不因 delay 改變而 reset)、phased 序列列、三個原生格點閘(16 k/256、16 k/512、8 k/256)與拒絕列;逐項與現查輸出見 <a href="pipeline_dfn_detail.html">pipeline_dfn_detail</a></td></tr>
-<tr><td><code>pipelines/tests/test_dfn_res_stage.c</code></td><td>stage 自身:identity、reset parity、拒絕列(含 <code>erb_inv</code> unity)、stale-pool、非有限輸入</td></tr>
-<tr><td><code>pipelines/tests/test_dfn_rate_bridge.c</code><br><code>pipelines/tests/test_dfn2_rate_bridge_c_parity.py</code></td><td>bridge 自身(三個格點的排程、prefill/added-delay 表、脈衝釘延遲、容差 identity、reset parity、拒絕列)與 Python <code>Dfn2RateBridge</code> 對 C 的 parity;逐項見 <a href="pipeline_dfn_detail.html">pipeline_dfn_detail</a></td></tr>
-<tr><td><code>pipelines/aec_dfn2_res_pipeline.py</code>、<code>dfn2_stage.py</code>、<code>cng_aec3.py</code>、<code>dfn2_rate_adapter.py</code>;<code>tests/test_dfn2_stage.py</code>、<code>test_dfn2_stage_c_parity.py</code>、<code>test_dfn2_pipeline_contract.py</code>、<code>test_dfn2_rate_adapter.py</code>、<code>test_cng_aec3.py</code></td><td>Python twin(參考 pipeline 跑輸入檔自己的取樣率,&lt; 48 kHz 走 <code>Dfn2RateBridge</code>;雙輸入 stage;comfort-noise 產生器與 C 的查表和 LCG 遞迴一致,見 <code>test_cng_aec3.py</code>)與其契約、C↔Python parity 測試。評估器 <code>tools/eval_dfn2_variants.py</code> 以 16 kHz host 跑(<code>SR_NATIVE = 16000</code>)</td></tr>
-<tr><td><code>pipelines/Makefile</code>、<code>pipelines/mono_aec_dfn_res/Makefile</code></td><td>targets:<code>mono_aec_dfn_res</code>、<code>test_dfn_res_stage</code>、<code>test_dfn_rate_bridge</code>、<code>test_mono_dfn</code>、archive <code>libaudio_pipeline_dfn.a</code>(成員 = <code>dfn_rate_bridge.o</code> + <code>dfn_res_stage.o</code> + 三個 DFN2 TU)。<code>make -C pipelines test</code> 建置並執行這四者與板端骨架(含 <code>--sample-rate 48000</code> 那一輪)</td></tr>
+<tr><td><code>pipelines/dfn/mono_aec_dfn_res/main.c</code><br><code>pipelines/dfn/dfn_example_args.h</code></td><td>板端骨架(fail-open,<code>run_accelerator()</code> 回 -1 佔位);旗標 <code>--sample-rate {8000|16000|48000}</code>(預設 16000;<code>16000Hz</code> 這類非整數值被拒,結束碼 2)、<code>--delay-mode</code>/<code>--delay-num-filters</code>/<code>--fixed-delay</code>、<code>--erb-fwd</code>/<code>--erb-inv</code>、<code>--atten-lim</code>、<code>--cng</code>(預設關),並印出 pool bytes、hop 與演算法延遲。數字由 <code>common/example_cli.h</code> 嚴格解析;沒給矩陣時用 <code>dfn_unit_partition.h</code> 的 unit partition,只供 fail-open smoke</td></tr>
+<tr><td><code>pipelines/dfn/mono_aec_dfn_res/tests/test_mono_dfn.c</code></td><td>48 kHz backbone gate(對手寫傳統鏈 <code>conv_chain_mono.h</code>(降噪器關)延後 L 個 hop 逐 byte 相同,跨一次真實的 delay 改變,且 stage 不因 delay 改變而 reset)、phased 序列列、三個原生格點閘(16 k/256、16 k/512、8 k/256)與拒絕列;逐項與現查輸出見 <a href="pipeline_dfn_detail.html">pipeline_dfn_detail</a></td></tr>
+<tr><td><code>pipelines/dfn/tests/test_dfn_res_stage.c</code></td><td>stage 自身:identity、reset parity、拒絕列(含 <code>erb_inv</code> unity)、stale-pool、非有限輸入</td></tr>
+<tr><td><code>pipelines/dfn/tests/test_dfn_rate_bridge.c</code><br><code>pipelines/dfn/tests/test_dfn2_rate_bridge_c_parity.py</code></td><td>bridge 自身(三個格點的排程、prefill/added-delay 表、脈衝釘延遲、容差 identity、reset parity、拒絕列)與 Python <code>Dfn2RateBridge</code> 對 C 的 parity;逐項見 <a href="pipeline_dfn_detail.html">pipeline_dfn_detail</a></td></tr>
+<tr><td><code>pipelines/dfn/mono_aec_dfn_res/pipeline.py</code>、<code>pipelines/dfn/dfn2_stage.py</code>、<code>pipelines/common/cng_aec3.py</code>、<code>pipelines/dfn/dfn2_rate_adapter.py</code>;<code>pipelines/dfn/tests/</code> 的 <code>test_dfn2_stage.py</code>、<code>test_dfn2_stage_c_parity.py</code>、<code>test_dfn2_rate_adapter.py</code>,<code>pipelines/dfn/mono_aec_dfn_res/tests/test_dfn2_pipeline_contract.py</code>,<code>pipelines/common/tests/test_cng_aec3.py</code></td><td>Python twin(參考 pipeline 跑輸入檔自己的取樣率,&lt; 48 kHz 走 <code>Dfn2RateBridge</code>;雙輸入 stage;comfort-noise 產生器與 C 的查表和 LCG 遞迴一致,見 <code>test_cng_aec3.py</code>)與其契約、C↔Python parity 測試。評估器 <code>tools/eval_dfn2_variants.py</code> 以 16 kHz host 跑(<code>SR_NATIVE = 16000</code>)</td></tr>
+<tr><td><code>pipelines/Makefile</code>、<code>pipelines/dfn/mono_aec_dfn_res/Makefile</code></td><td>targets:<code>mono_aec_dfn_res</code>、<code>test_dfn_res_stage</code>、<code>test_dfn_rate_bridge</code>、<code>test_mono_dfn</code>、archive <code>libaudio_pipeline_dfn.a</code>(成員 = <code>dfn_rate_bridge.o</code> + <code>dfn_res_stage.o</code> + 三個 DFN2 TU)。<code>make -C pipelines test</code> 建置並執行這四者與板端骨架(含 <code>--sample-rate 48000</code> 與 <code>--sample-rate 8000</code> 兩輪);<code>dfn/mono_aec_dfn_res/Makefile</code> 是轉發薄殼(<code>make -C pipelines/dfn/mono_aec_dfn_res test</code>)</td></tr>
 </table>
-<p>測試現查(BACKEND=ne10):<code>test_dfn_rate_bridge</code> 印 bridge pool 行、三行格點行與 <code>dfn_rate_bridge: PASS</code>;<code>test_mono_dfn</code> 印兩行 identity 行、三行原生格點行與 <code>mono_aec_dfn_res: PASS</code>;<code>test_dfn_res_stage</code> 與板端骨架各印自己的 PASS 行。</p>
 </body>
 </html>

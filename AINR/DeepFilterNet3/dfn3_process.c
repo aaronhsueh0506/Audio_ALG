@@ -18,13 +18,9 @@
 #endif
 #define DF_COMMON_HAVE_NEON SK_HAVE_NEON
 
-/* This graph consumes heads[current-MASK_LOOKAHEAD]; a larger DF lookahead needs
- * a coefficient queue and a changed graph/runtime contract, so it is refused at
- * compile time. */
-_Static_assert(DFN3_DF_LOOKAHEAD <= DFN3_MASK_LOOKAHEAD,
-               "DFN3 stream requires DF lookahead <= mask lookahead");
-_Static_assert(DFN3_DF_LOOKAHEAD >= 0 && DFN3_DF_HISTORY >= 0,
-               "DF lookahead must be within the tap window");
+/* The pair this object was built for, read by dfn3_model_io.c and
+ * dfn3_prepost.c (dfn3_process.h): objects of another pair fail to link. */
+const unsigned char DFN3_LOOKAHEAD_PAIR_SYMBOL = 0;
 
 /* The deep filter's taps before the stream start read this row. */
 static const float df_zero_row[DFN3_DF_BINS];
@@ -298,8 +294,10 @@ int dfn3_compose_stream(DFN3State* st,
                         long long* output_frame_index)
 {
     long long current;
+    long long head_frame;
     long long target_frame;
     int current_slot;
+    int head_slot;
     int target_slot;
     const float *src_re[DFN3_DF_ORDER];
     const float *src_im[DFN3_DF_ORDER];
@@ -333,12 +331,32 @@ int dfn3_compose_stream(DFN3State* st,
            sizeof(st->noisy_ring_im[current_slot]));
 
     if (current < DFN3_MASK_LOOKAHEAD) return 0;
-    target_frame = current - DFN3_MASK_LOOKAHEAD;
-    target_slot = (int)(target_frame % DFN3_DF_RING);
+    head_frame = current - DFN3_MASK_LOOKAHEAD;
+    head_slot = (int)(head_frame % DFN3_DF_RING);
     df_common_expand_mask(erb_mask, st->erb_inv,
                           st->erb_inv_lo, st->erb_inv_hi,
                           DFN3_N_BINS, DFN3_N_ERB,
                           st->scratch_power);
+#if DFN3_HEAD_QUEUE
+    /* The output frame is DF - MASK calls behind these heads: keep what it
+     * needs from them (the coefficients, and the masked high band, which reads
+     * the noisy frame of the head) until its turn. */
+    memcpy(st->coef_ring[head_slot], coefs, sizeof(st->coef_ring[head_slot]));
+    for (int k = DFN3_DF_BINS; k < DFN3_N_BINS; ++k) {
+        int high = k - DFN3_DF_BINS;
+        st->hi_delay_re[head_slot][high] =
+            st->noisy_ring_re[head_slot][k] * st->scratch_power[k];
+        st->hi_delay_im[head_slot][high] =
+            st->noisy_ring_im[head_slot][k] * st->scratch_power[k];
+    }
+    if (current < DFN3_OUTPUT_DELAY) return 0;
+    target_frame = current - DFN3_OUTPUT_DELAY;
+    target_slot = (int)(target_frame % DFN3_DF_RING);
+    coefs = &st->coef_ring[target_slot][0][0][0];
+#else
+    target_frame = head_frame;
+    target_slot = head_slot;
+#endif
 
     for (int tap = 0; tap < DFN3_DF_ORDER; ++tap) {
         long long source_frame = target_frame - DFN3_DF_HISTORY + tap;
@@ -354,8 +372,13 @@ int dfn3_compose_stream(DFN3State* st,
     skn_ctaps_mac_f32(out_re, out_im, DFN3_DF_BINS, DFN3_DF_ORDER,
                       src_re, src_im, coefs);
     for (int k = DFN3_DF_BINS; k < DFN3_N_BINS; ++k) {
+#if DFN3_HEAD_QUEUE
+        out_re[k] = st->hi_delay_re[target_slot][k - DFN3_DF_BINS];
+        out_im[k] = st->hi_delay_im[target_slot][k - DFN3_DF_BINS];
+#else
         out_re[k] = st->noisy_ring_re[target_slot][k] * st->scratch_power[k];
         out_im[k] = st->noisy_ring_im[target_slot][k] * st->scratch_power[k];
+#endif
     }
     dfn3_apply_atten_lim(st->noisy_ring_re[target_slot],
                          st->noisy_ring_im[target_slot],

@@ -8,7 +8,7 @@ _ROOT = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__
 sys.path.insert(0, _ROOT)                                       # lib.* + pipelines.*
 sys.path.insert(0, os.path.join(_ROOT, 'lib', 'aec', 'python')) # aec + modules
 from lib.aec.python.aec import AEC, AecConfig, AecMode, AecPreset
-from pipelines.aec_nr_pipeline import run_aec_linear, run_nr, run_res
+from pipelines.mono_aec_nr_res.pipeline import run_aec_linear, run_nr, run_res
 
 
 def process_case(mic_path, lpb_path, out_path, preset, fl, nr_preset):

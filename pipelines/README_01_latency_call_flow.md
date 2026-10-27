@@ -13,7 +13,13 @@ Navigation: [Index](README.md) | [Previous part](README.md) | [Next part](README
 加總額外延遲同樣是 **1 hop**（唯一來源是 ULCNet synthesis WOLA）：mono 與
 4ch 變體都是——4ch 把 BF 的 beamformed error 頻譜直接當成模型的分析幀，
 沒有中間的 beam WOLA→再 analysis 來回，也沒有 one-hop far 補償。細節見
-[`4ch_alignulcnet/README.md`](4ch_alignulcnet/README.md)。
+[`ulcnet/4ch_alignulcnet/README.md`](ulcnet/4ch_alignulcnet/README.md)。
+
+The two DFN2 applications have an algorithmic latency of `M + D + 1` hops on a 48 kHz host (`M` = mask lookahead, `D` =
+deep-filter lookahead, fixed at build time; the shipped 1/1 pair gives 3 hops, 32 ms). Below 48 kHz the rate bridge is used and
+the latency is the host's own WOLA hop plus `dfn_rate_bridge_added_delay_samples()` native samples (shipped 1/1 pair: 672 at
+16 kHz hop 128, 629 at 16 kHz hop 256, 330 at 8 kHz hop 128), a figure that grows with `M + D`; the other `(M, D)` pairs
+follow the same formula but have no trained checkpoint, so their audio quality is unmeasured. See [`dfn/README.md`](dfn/README.md) and [Build](README_02_build_debug_board.md#build).
 
 ### Memory Budget
 
@@ -50,44 +56,66 @@ there rather than editing it here, and always prefer the values `aec_get_mem_siz
 > `n_partitions` 由 `filter_length` 與 hop 推導，不建議手填。三個 rate 各自依 grid 的 hop=fft_size/2
 > 規則自動推導 (`aec_derive_dims()`），不是統一的 10 ms 規則；16 kHz 另外還有一個可選的
 > 512/256 grid（見上表）。靜態範例的 AEC、NR 與合成 config 都由同一個
-> `SeGrid`（`se_derive()` 的輸出）導出，三方格點因此一致。
+> `AecSignalGrid`（`derive_lane()` 的輸出，即 `aec_resolve_signal_grid()` 的結果）導出，三方格點因此一致。
 
 ## Call flow
 
-Every application analyses once per hop. The front end (the mono `Aec`, or the 4-channel
-unit's `audio_pipeline_4ch_fuse()`) returns its context spectra as one borrowed view,
-`SeSpecFrame` ([`common/se_stage.h`](common/se_stage.h); `se_frame_from_aec()` fills it from a mono
-`Aec`). Each later stage is a plain function over that frame, and the application
-writes the combination itself; each example `main` shows it (`mono_form()` in
+Every application analyses once per hop. The front end returns its context spectra as one borrowed
+view: `AecResContext` ([`aec.h`](../lib/aec/c_impl/include/aec.h); read with `aec_get_res_context()` after
+`aec_process_context()`) for the mono `Aec`, and `McabFrame` ([`mcab.h`](4ch_aec_bf_nr_res/mcab.h); filled
+by `mcab_fuse()`) for the 4-channel flow. Each later stage is a plain function over that view, and the
+application writes the combination itself; each example `main` shows it (`mono_form()` in
 [`mono_aec_nr_res/main.c`](mono_aec_nr_res/main.c), `raw_chain()` in
-[`audio_pipeline_4ch_raw.c`](4ch_aec_bf_nr_res/audio_pipeline_4ch_raw.c)):
+[`mcab_raw.c`](4ch_aec_bf_nr_res/mcab_raw.c)):
 
 ```
-mic/ref ─► AEC ─► SeSpecFrame { e, y, x, r2, cn, g_res_ctx, far_hop, ... }
+mono:  mic/ref ─► Aec ─► AecResContext { error_spec, near_spec, far_spec, r2, comfort_noise, res_gain, usable_linear, ... }
+4-ch:  mics/ref ─► mcab_process_front ─► beamformer ─► mcab_fuse ─► McabFrame { e, y, x, r2, cn, g_res_ctx = NULL, far_hop, ... }
                       │
-        gain stages   ├─ se_anr_stage_gain(nr, &f, scratch, use_r2)  → G_nr
-                      ├─ G_res = f.g_res_ctx                         (mono: the AEC's own ctx.res_gain;
-                      │                                               4-ch: g_res_ctx is NULL, G_res = se_res_stage_gain(res, &f)
-                      │                                               from the application's AecRes)
+        gain stages   ├─ G_nr: anr_process_gain(nr, E, extra_noise) + anr_get_gain(nr)    (extra_noise = R² / 32768², while the linear estimate is usable)
+                      ├─ G_res: mono: ctx.res_gain (the AEC's own)
+                      │         4-ch: aec_res_process(res, &in) from the application's AecRes, in from mcab_sample_res_input(&frame, &in)
         combination   └─ sk_min_f32 → sk_capply_gain_f32 → aec_cng_fill → ac_istft_push → out
+```
+
+The mono per-hop calls with their signatures (`aec.h`, `aec_res.h`, `anr.h`, `audio_stft.h`,
+`utility/simd_kernels.h`); every returned pointer is borrowed from its producer:
+
+```c
+void  aec_process_context(Aec* a, const float* mic, const float* ref);     /* hop floats each; no time-domain output */
+void  aec_get_res_context(const Aec* a, AecResContext* ctx);              /* error_spec, r2, comfort_noise, res_gain, ...; NULL members = no context */
+int   anr_process_gain(AnrDenoiser* self, const Complex* spectrum_in,
+                       const float* extra_noise_psd, float* gain_out);     /* 0, or -1; gain_out = NULL: read it with anr_get_gain() */
+const float* anr_get_gain(const AnrDenoiser* self, int* n_freqs);          /* n_freqs may be NULL */
+void  sk_scale_f32(float* out, const float* x, float g, int n);            /* extra_noise = R^2 * (1/32768^2) */
+void  sk_min_f32(float* out, const float* a, const float* b, int n);       /* g_total = min(g_nr, g_res) */
+void  sk_capply_gain_f32(Complex* out, const Complex* z, const float* g, int n);   /* out may equal z */
+void  aec_cng_fill(uint32_t* rng, Complex* spec, const float* cn, const float* g_res,
+                   const float* g_nr, float nr_floor, int n);              /* adds comfort noise to spec; g_nr may be NULL */
+int   ac_istft_push(AcIstft* s, const Complex* spec, float* out);          /* writes hop samples (0 only for the first AC_OLA_ENV_NORM frame) */
 ```
 
 There is no independent time-domain RES filter after NR and no function-pointer
 table of stages: `G_res` comes with the linear residual (mono, inside the AEC call) or from the application's own `AecRes`
-(4-ch, through `se_res_stage_gain()` after `audio_pipeline_4ch_fuse()`), is fused with `G_nr` by `sk_min_f32` and applied once to
+(4-ch, through `aec_res_process()` after `mcab_fuse()`), is fused with `G_nr` by `sk_min_f32` and applied once to
 `E(f)`. Which stages exist, in which order, is read straight from each example's per-hop
 function ([`main.c`](mono_aec_nr_res/main.c) `process_hop()` / `mono_form()`,
-[`audio_pipeline_4ch_raw.c`](4ch_aec_bf_nr_res/audio_pipeline_4ch_raw.c) `raw_post()` / `raw_chain()`).
+[`mcab_raw.c`](4ch_aec_bf_nr_res/mcab_raw.c) `raw_post()` / `raw_chain()`). The 4-channel
+programs share two small header-only helpers, [`mcab_sample_post.h`](4ch_aec_bf_nr_res/mcab_sample_post.h)
+(`mcab_sample_res_input()`, `mcab_sample_anr_gain()`, `MCAB_SAMPLE_CNG_NR_GAIN_FLOOR`,
+`MCAB_SAMPLE_CNG_RNG_SEED`; tested by `test_mcab_sample_post`); the mono examples keep their own
+`#define`s (`CNG_NR_GAIN_FLOOR`, `CNG_RNG_SEED`, `PSD_SCALE_INV`) in the file.
 
-Only the multi-channel linear AEC + beamformer is wrapped as one unit; every other
-stage (the 4-ch post-beam RES included) is a separate library that the integrator initialises (its own `mem_size` and `init`) and chains.
+Only the multi-channel shared delay and four-lane flow is one module (`Mcab`, over lanes and an
+estimator the application initialises); every other stage (the beamformer and the 4-ch post-beam RES
+included) is a separate object that the integrator initialises (its own `mem_size` and `init`) and chains.
 
 | Application | Analysis call | Stages written out | Synthesis |
 |---|---|---|---|
-| Mono AEC + NR/RES | `aec_process_context()` → `se_frame_from_aec()` | `frame.g_res_ctx`, `se_anr_stage_gain`, `sk_min_f32`, `sk_capply_gain_f32`, `aec_cng_fill` | `ac_istft_push()` |
-| 4-ch AEC + BF + NR/RES | `audio_pipeline_4ch_process_front()` + `process_beam()` (or `process_with_activity()`) → `audio_pipeline_4ch_fuse()` (`frame.g_res_ctx` is NULL) | `se_res_stage_gain` (the application's `AecRes`), `se_anr_stage_gain`, `sk_min_f32`, `sk_capply_gain_f32`, `aec_cng_fill` | `ac_istft_push()` |
-| Mono / 4-ch Align-ULCNet | mono: `aec_process_context()`; 4-ch: the unit with `enable_post = 0`; then `ulcnet_nn_stage_begin_time()` / `_begin_complex()` | the network (`ulcnet_nn_stage_nn_begin` / `nn_end`) | `ulcnet_nn_stage_end()` |
-| Mono / 4-ch DFN2 | mono: `aec_process_context()` → `se_frame_from_aec()`; 4-ch: `audio_pipeline_4ch_process()` → `audio_pipeline_4ch_fuse()` | the example forms P itself (`rig_process()` / `dfn_form()`: `frame.g_res_ctx` for mono, `se_res_stage_gain()` for 4-ch, `sk_min_f32` with the unity gain, apply, optional comfort noise; no NR, no synthesis of its own), then the DFN2 stage through `dfn_hop_*` | `dfn_hop_end()` |
+| Mono AEC + NR/RES | `aec_process_context()` → `aec_get_res_context()` | `ctx.res_gain`, `anr_process_gain()` + `anr_get_gain()`, `sk_min_f32`, `sk_capply_gain_f32`, `aec_cng_fill` | `ac_istft_push()` |
+| 4-ch AEC + BF + NR/RES | `mcab_process_front()` → the beamformer (the sample helper's `mcab_sample_beam_process_beam()` or your own) → `mcab_fuse()` (`frame.g_res_ctx` is NULL) | `mcab_sample_res_input()` + `aec_res_process()` (the application's `AecRes`), `mcab_sample_anr_gain()`, `sk_min_f32`, `sk_capply_gain_f32`, `aec_cng_fill` | `ac_istft_push()` |
+| Mono / 4-ch Align-ULCNet | mono: `aec_process_context()`; 4-ch: the flow with `enable_post = 0` and the sample beam helper; then `ulcnet_nn_stage_begin_time()` / `_begin_complex()` | the network (`ulcnet_nn_stage_nn_begin` / `nn_end`) | `ulcnet_nn_stage_end()` |
+| Mono / 4-ch DFN2 | mono: `aec_process_context()` → `aec_get_res_context()`; 4-ch: `mcab_sample_beam_process()` → `mcab_sample_beam_fuse()` | the example forms P itself (`rig_process()` / `dfn_form()`: `ctx.res_gain` for mono, `mcab_sample_res_input()` + `aec_res_process()` for 4-ch, `sk_min_f32` with the unity gain, apply, optional comfort noise; no NR, no synthesis of its own), then the DFN2 stage through `dfn_hop_*` | `dfn_hop_end()` |
 
 ### How do I chain a new frequency-domain stage?
 
@@ -100,22 +128,30 @@ with a unity stage the chain is bit-identical to the hand-written chain of
 ```c
 typedef struct HfTilt { int bin_hi; float amount; float* g; } HfTilt;   /* g: n_freqs floats, caller memory */
 
-static const float* hf_tilt_gain(HfTilt* s, const SeSpecFrame* f) {
-    for (int k = 0; k < f->n_freqs; ++k) s->g[k] = k > s->bin_hi ? s->amount : 1.0f;
+static const float* hf_tilt_gain(HfTilt* s, int n_freqs) {
+    for (int k = 0; k < n_freqs; ++k) s->g[k] = k > s->bin_hi ? s->amount : 1.0f;
     return s->g;                     /* valid until the next call, like every gain stage */
 }
 
 int chain_hop(Chain* c, const float* mic, const float* ref, float* out) {
-    SeSpecFrame f;
+    AecResContext f;
+    const float* extra = NULL;
     aec_process_context(c->aec, mic, ref);                                        /* the one analysis */
-    if (se_frame_from_aec(c->aec, &f) != 0) return -1;
-    const float* nr_gain = se_anr_stage_gain(c->nr, &f, c->g_nr_scratch, 1);
-    const float* tilt    = hf_tilt_gain(c->tilt, &f);                              /* the new stage */
-    sk_min_f32(c->g_min,   nr_gain,  f.g_res_ctx, f.n_freqs);                      /* min of the gains */
-    sk_min_f32(c->g_total, c->g_min, tilt,        f.n_freqs);
-    sk_capply_gain_f32(c->spec, f.e, c->g_total, f.n_freqs);                       /* S(f) = E(f) . g */
-    aec_cng_fill(&c->rng, c->spec, f.cn, f.g_res_ctx, nr_gain,                     /* comfort noise on the cut bins */
-                 SE_CNG_NR_GAIN_FLOOR, f.n_freqs);
+    aec_get_res_context(c->aec, &f);
+    if (!f.error_spec) return -1;
+    if (f.r2 && f.usable_linear) {                      /* residual-echo powers into the noise floor */
+        sk_scale_f32(c->g_nr_scratch, f.r2, PSD_SCALE_INV, f.n_freqs);
+        extra = c->g_nr_scratch;
+    }
+    if (anr_process_gain(c->nr, f.error_spec, extra, NULL) != 0) return -1;
+    const float* nr_gain = anr_get_gain(c->nr, NULL);
+    if (!nr_gain) return -1;
+    const float* tilt = hf_tilt_gain(c->tilt, f.n_freqs);                          /* the new stage */
+    sk_min_f32(c->g_min,   nr_gain,  f.res_gain, f.n_freqs);                       /* min of the gains */
+    sk_min_f32(c->g_total, c->g_min, tilt,       f.n_freqs);
+    sk_capply_gain_f32(c->spec, f.error_spec, c->g_total, f.n_freqs);              /* S(f) = E(f) . g */
+    aec_cng_fill(&c->rng, c->spec, f.comfort_noise, f.res_gain, nr_gain,           /* comfort noise on the cut bins */
+                 CNG_NR_GAIN_FLOOR, f.n_freqs);
     (void)ac_istft_push(c->istft, c->spec, out);                                   /* the one inverse transform */
     return 0;
 }
@@ -124,21 +160,24 @@ int chain_hop(Chain* c, const float* mic, const float* ref, float* out) {
 Rules the chain relies on:
 
 - A disabled gain source reads as the **unity vector** (all ones), so one
-  `sk_min_f32` serves every combination. `sk_min_f32` propagates a non-finite gain
-  to the output gate instead of masking it the way `fminf` would.
+  `sk_min_f32` serves every combination. `sk_min_f32` is a compare-and-select (`a < b ? a : b`), not
+  `fminf`: a NaN in its second operand reaches the output, a NaN in its first operand is replaced by the second,
+  so a finite check on the emitted hop (`skn_all_finite_f32()`) stays the guard against a non-finite gain.
 - `aec_cng_fill` is told the AEC's own gain (`g_res`), which alone decides *which*
-  bins are filled, and the denoiser gain (floored at `SE_CNG_NR_GAIN_FLOOR`),
-  which scales the *level*; it advances the caller's `rng` state, so one RNG word
-  per generator, reset to `SE_CNG_RNG_SEED`.
+  bins are filled, and the denoiser gain (floored at `CNG_NR_GAIN_FLOOR`, or
+  `MCAB_SAMPLE_CNG_NR_GAIN_FLOOR` in the 4-channel programs), which scales the *level*; it advances the
+  caller's `rng` state, so one RNG word per generator, reset to `CNG_RNG_SEED`
+  (`MCAB_SAMPLE_CNG_RNG_SEED`).
 - A spectrum-type stage (the 4-channel beamformer) is a function that takes the
-  lane spectra and returns a spectrum; it replaces `f.e` in the chain. The unit
-  hands the BF spectrum to `four_aec_fuse()` inside `audio_pipeline_4ch_fuse()`.
+  lane spectra and returns a spectrum; it replaces the error spectrum (`f.e` of the
+  `McabFrame`) in the chain. The sample helper hands the BF spectrum to `mcab_fuse()` inside
+  `mcab_sample_beam_fuse()`.
 - Every pointer in the frame is borrowed from the producer. It is valid until the
-  producer runs again (the next `aec_process_context()` / `audio_pipeline_4ch_process_front()`,
+  producer runs again (the next `aec_process_context()` / `mcab_process_front()`,
   a reset) and is never written through.
 - A refused call (a stage returns NULL or an error, or the emitted hop is not finite) is the
   integrator's to recover: reset the front end and every stage of the chain together
-  (the comfort-noise generator is restarted too: `rng = SE_CNG_RNG_SEED`).
+  (the comfort-noise generator is restarted too: `rng = CNG_RNG_SEED`).
 
 ### Where do I call the inverse transform?
 
@@ -159,8 +198,8 @@ Nothing allocates inside `process`. Every library is queried and initialised on 
 own; the integrator sums the sizes and cuts the blocks:
 
 ```c
-size_t aec_b   = aec_get_mem_size(&aec_cfg);                       /* aec_cfg from se_derive(); 0 = invalid */
-AnrConfig nr_cfg = anr_config_for_mode_grid(sample_rate, grid.fft_size, ANR_MODE_BALANCED);
+size_t aec_b   = aec_get_mem_size(&aec_cfg);                       /* aec_cfg: aec_config_from_preset() + the lane's seam fields; 0 = invalid */
+AnrConfig nr_cfg = anr_config_for_mode_grid(sample_rate, grid.fft_size, ANR_MODE_BALANCED);   /* grid from aec_resolve_signal_grid() */
 size_t nr_b    = anr_get_mem_size(&nr_cfg);
 AcStftConfig sy_cfg;  ac_stft_config_default(&sy_cfg, grid.fft_size);
 size_t sy_b    = ac_istft_get_mem_size(&sy_cfg);
@@ -172,19 +211,24 @@ AcIstft* istft = ac_istft_init(pool + ALIGN16(aec_b) + ALIGN16(nr_b), sy_b, &sy_
 ```
 
 - A stage keeps no state of its own when its functions take the object the
-  application carved (`se_anr_stage_gain` takes the `AnrDenoiser`, `se_res_stage_gain`
+  application carved (`anr_process_gain()` takes the `AnrDenoiser`, `aec_res_process()`
   the `AecRes`). Gain vectors the chain needs (`g_total`, the NR prior scratch, the
   spectrum buffer) are `n_freqs` floats / bins each, also from the caller's block.
-- The 4-channel core (`FourAecNrRes`) owns only the shared aligner, the four
-  lanes and the fuse buffers; the unit (`AudioPipeline4Ch`) adds SRP-PHAT, the BF and their
-  scratch (no RES). The post-beam stages, the RES included, are separate blocks sized by their own queries
-  (`aec_res_get_mem_size()` on an `AecConfig` from `aec_config_from_preset()` with the unit's `fft_size`,
+- `Mcab` owns only the flow state in its own pool (control block, mic lane, aligned far, the fuse
+  buffers with `enable_post`, the alignment ring): 73,504 B at 16 kHz/256 (MATCHED,
+  `enable_post = 1`; 68,288 B with `enable_post = 0`, `test_target_abi`). The four `Aec` lanes
+  (4 x 199,408 B at 16 kHz/256) and, MATCHED only, the shared `DelayAec` are separate objects the
+  application sizes and initialises (`aec_get_mem_size()`, `delay_aec_get_mem_size()`);
+  `mcab_external_static --print-mem-size` prints lanes 797,632 B and front end (estimator plus the
+  mcab pool) 108,928 B at 16 kHz/256 (48 kHz/1024: 2,912,064 B and 262,880 B). The sample beam helper
+  (SRP-PHAT, BF, scratch) is one more block. The post-beam stages, the RES included, are separate blocks sized by their own queries
+  (`aec_res_get_mem_size()` on an `AecConfig` from `aec_config_from_preset()` with the flow's `fft_size`,
   `anr_get_mem_size()`, `ac_istft_get_mem_size()`),
   and a neural stage (`ulcnet_nn_stage_mem_size()`, `dfn_rate_bridge_get_mem_requirements()`)
   is one more block.
 - Re-query the descriptor after any library, backend, build-option or config
-  change; `init_ex()` refuses a stale one (8-point gate). Only the 4-channel core and unit
-  and the DFN stage and bridge carry descriptors; the example headers do not.
+  change; `mcab_init_ex()` refuses a stale one. Only `Mcab` (`McabMemReq`, its own pool) and the
+  DFN stage and bridge carry descriptors; the example headers do not.
 
 ### How do I run the NN stage on the NPU?
 
@@ -210,13 +254,13 @@ dfn_hop_end(&hop, out);
 
 The 4-ch Align-ULCNet application also splits before the beamformer, for a
 caller whose mask and VAD come from the lane spectra of the same hop (the masker
-reads lane 0): `audio_pipeline_4ch_process_front()` returns the read-only lane
+reads lane 0): `mcab_sample_beam_process_front()` returns the read-only lane
 spectra, the caller computes mask, `vad_raw` and `vad_out`,
-`audio_pipeline_4ch_process_beam()` runs SRP and BF with them and fills the
-`AudioPipeline4ChFrameInfo` (DOA and BF adaptation state).
-`audio_pipeline_4ch_process_with_activity()` is `process_front()` +
+`mcab_sample_beam_process_beam()` runs SRP and BF with them and fills the
+`McabSampleBeamInfo` (DOA, BF adaptation state and `info.delay`).
+`mcab_sample_beam_process_with_activity()` is `process_front()` +
 `process_beam(front, v, v, NULL)`; see
-[`4ch_alignulcnet/README.md`](4ch_alignulcnet/README.md). The stage reads the unit's
+[`ulcnet/4ch_alignulcnet/README.md`](ulcnet/4ch_alignulcnet/README.md). The stage reads the flow's
 `front.delay` (`changed`, `solid`) and the caller's raw far hop; nothing else crosses.
 
 Fail-open is part of the contract, not an option: a non-zero result, an output
@@ -232,40 +276,52 @@ board keeps its recurrent state in step.
 ### How do the 4-channel applications split the hop?
 
 ```c
-audio_pipeline_4ch_process_front(unit, mics_interleaved, ref, &front);   /* shared aligner + 4 lanes; front.linear_spectra[4] */
-/* [optional] mask / VAD from the lane spectra */
-audio_pipeline_4ch_process_beam(unit, &front, vad_raw, vad_out, mask, &beam, &info);   /* SRP-PHAT + BF -> beam.spectrum, beam.weights */
-SeSpecFrame f;
-audio_pipeline_4ch_fuse(unit, &f);       /* project near, R^2, comfort noise with those weights (four_aec_fuse()); f.g_res_ctx = NULL */
-/* then the application's chain: se_res_stage_gain(res, &f) (its own AecRes), se_anr_stage_gain(), sk_min_f32(),
-   sk_capply_gain_f32(), aec_cng_fill(), ac_istft_push() */
+mcab_process_front(flow, mics_interleaved, ref, &front);  /* shared delay + 4 lanes; front.linear_spectra[4], front.aligned_ref */
+/* your beamformer on front.linear_spectra -> weights W (channel-major Complex[4][n_freqs]) and, optionally, its spectrum E */
+McabFrame f;
+mcab_fuse(flow, W, E, &f);       /* project near, R^2, comfort noise with those weights; E == NULL rebuilds it from W; f.g_res_ctx = NULL */
+/* then the application's chain: mcab_sample_res_input(&f, &in) + aec_res_process(res, &in) (its own AecRes),
+   mcab_sample_anr_gain(), sk_min_f32(), sk_capply_gain_f32(), aec_cng_fill(), ac_istft_push() */
 ```
 
-A caller that runs its own beamformer uses the core instead:
-`four_aec_front_process(core, ...)`, `bf_process_with_weights(...)`, `four_aec_fuse(core, bf_weights,
-bf_spectrum, &f)`. Neither the core nor the unit has a RES: `f.g_res_ctx` is NULL, and the caller builds its own `AecRes`
-and calls `se_res_stage_gain(res, &f)` (`audio_pipeline_4ch_static.c` and `4aec_nr_res_static.c` do).
+The examples run SRP-PHAT and the beamformer through the sample helper, which sits between the two
+`mcab` calls (the flow is then driven only through the helper):
 
-`four_aec_fuse()` needs a front frame processed since the last reset (otherwise
-`FOUR_AEC_NR_RES_SEQUENCE_ERROR`), refuses an all-zero or non-finite weight set
-and resets the core on a lane disagreement. The unit's `audio_pipeline_4ch_fuse()` returns
-`SEQUENCE_ERROR` without a beam of the hop, `INVALID_ARGUMENT` when `core.enable_post = 0`, and
-resets the whole unit (core, SRP, BF) on any other refusal; the caller resets its own post stages (the `AecRes` included) too, also after a refusal of its own `se_res_stage_gain()`.
-The front view lives until the next `process_front()` or `audio_pipeline_4ch_reset()`; there is
-no token to return. The Align-ULCNet application never fuses: it takes the BF spectrum as
+```c
+mcab_sample_beam_process_front(b, mics_interleaved, ref, &front);
+/* [optional] mask / VAD from the lane spectra */
+mcab_sample_beam_process_beam(b, &front, vad_raw, vad_out, mask, &beam, &info);   /* SRP-PHAT + BF -> beam.spectrum, beam.weights */
+mcab_sample_beam_fuse(b, &f);    /* mcab_fuse() with this hop's beam; f.g_res_ctx = NULL */
+```
+
+Neither `Mcab` nor the helper has a RES: `f.g_res_ctx` is NULL, and the caller builds its own `AecRes`
+and calls `aec_res_process(res, &in)` on the input `mcab_sample_res_input(&f, &in)` makes (`mcab_static.c`
+and `mcab_external_static.c` do).
+
+`mcab_fuse()` needs a front frame processed since the last reset (otherwise
+`MCAB_SEQUENCE_ERROR`, nothing changed), refuses an all-zero or non-finite weight set and
+`enable_post = 0` (`MCAB_INVALID_ARGUMENT`, nothing changed), and resets the flow (lanes and
+estimator included) with `MCAB_DSP_ERROR` when the lanes do not share one far spectrum, the
+beamformed spectrum is non-finite or a projection overflows (finite but huge weights). The helper's `mcab_sample_beam_fuse()` returns
+`MCAB_SEQUENCE_ERROR` without a beam of the hop, `MCAB_INVALID_ARGUMENT` when `enable_post = 0`, and
+resets the whole helper (`mcab_sample_beam_reset()`: flow, SRP, BF, VAD) on any other refusal; the
+caller resets its own post stages (the `AecRes` included) too, also after a refusal of its own
+`aec_res_process()` (a NULL return). The front view lives until the next `mcab_process_front()`, `mcab_reset()` or
+`mcab_destroy()`; there is no token to return. The Align-ULCNet application never fuses: it takes the BF spectrum as
 its error frame directly.
 
 ### What is in the frame?
 
-| Field | Meaning | Mono | 4-ch |
-|---|---|---|---|
-| `e` | linear-AEC error E(f) | AEC error | beamformed error |
-| `y`, `x` | matching capture / far spectra | AEC | projected near / lane 0 far |
-| `r2`, `cn` | residual-echo and comfort-noise PSD (int16²) | AEC | projected |
-| `g_res_ctx` | the residual gain | the AEC's own `G_res` | NULL (the unit's `fuse()` and the core's `four_aec_fuse()` do not run a RES; the gain comes from the application's `AecRes`) |
-| `far_hop`, `formed_hop` | aligned far, time-domain hop under `e` | AEC | aligned far / NULL |
-| `max_dt`, `max_sat`, `all_converged`, `clock_drift` | control scalars | AEC | worst contributing lane |
-| `delay_changed`, `delay_locked` | alignment generation flags | AEC | shared aligner |
+| Meaning | Mono: `AecResContext` (`aec_get_res_context()`) | 4-ch: `McabFrame` (`mcab_fuse()`) |
+|---|---|---|
+| linear-AEC error E(f) | `error_spec` | `e` (beamformed error) |
+| capture / far spectra | `near_spec`, `far_spec` | `y` (projected near), `x` (lane 0 far) |
+| residual-echo and comfort-noise PSD (int16²) | `r2`, `comfort_noise` | `r2`, `cn` (projected) |
+| the residual gain | `res_gain` (the AEC's own `G_res`) | `g_res_ctx`: NULL (`mcab_fuse()` runs no RES; the gain comes from the application's `AecRes`) |
+| time-domain hop under E | `formed_hop` | `formed_hop`: NULL (one per lane in `McabFront.formed_hop`) |
+| aligned far hop | `AecLinearContext.aligned_far_hop` (`aec_get_linear_context()`) | `far_hop` |
+| control scalars | `far_power`, `dt_indicator`, `saturation_level`, `filter_converged`, `usable_linear` | `far_power`, `max_dt`, `max_sat`, `all_converged`, `usable_linear`, `clock_drift` (worst contributing lane) |
+| alignment generation flags | `AecLinearContext.delay_state` (`UNLOCKED` / `LOCKED` / `CHANGED`) | `delay_changed`, `delay_locked` (shared estimator) |
 
 ## NR OLA Delay
 

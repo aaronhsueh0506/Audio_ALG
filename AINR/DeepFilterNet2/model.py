@@ -605,16 +605,6 @@ class DeepFilterNet2(nn.Module):
                 f"df_lookahead must be in [0, {df_order - 1}], "
                 f"got {df_lookahead}"
             )
-        # Single source of truth for the lookahead relation (as upstream); checking
-        # it here covers training, inference and export.
-        if df_lookahead > mask_lookahead:
-            raise ValueError(
-                "df_lookahead must not exceed mask_lookahead: the DF window "
-                "cannot see further into the future than the model delay the "
-                f"mask path pays for (got df_lookahead={df_lookahead}, "
-                f"mask_lookahead={mask_lookahead})"
-            )
-
         # ERB filterbank — non-trainable buffers
         erb_fb, erb_inv = _build_erb_fb(n_fft, sr, n_erb)
         self.register_buffer('erb_fb',  erb_fb)   # (n_erb, n_bins)

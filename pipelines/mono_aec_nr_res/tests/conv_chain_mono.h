@@ -4,7 +4,7 @@
  *   aec_process_context -> aec_get_res_context -> NR gain (if enabled) -> min with the lane's
  *   RES gain (if enabled) -> apply to E -> comfort noise -> ac_istft_push
  *
- * Independent of samples/: the AecConfig, the NR configuration (anr_config_for_mode_grid with
+ * Independent of the example headers: the AecConfig, the NR configuration (anr_config_for_mode_grid with
  * the 512 ms minimum window written out, r2 scaled by 2^-30 as the residual-echo prior) and the
  * min/apply loops are spelled out here, so a defect in the shared sample code cannot hide behind itself. A disabled
  * gain source reads as the unity vector; the comfort-noise fill runs only with the RES gain and
@@ -21,8 +21,11 @@
 #include "aec_res.h"
 #include "anr.h"
 #include "audio_stft.h"
-#include "common/se_stage.h"
 #include "utility/mem_align.h"
+
+/* The comfort-noise floor and seed of the example programs. */
+#define CONV_MONO_CNG_NR_GAIN_FLOOR 0.31622777f
+#define CONV_MONO_CNG_RNG_SEED 0x9e3779b9u
 
 typedef struct ConvMonoConfig {
     int sample_rate;
@@ -132,7 +135,7 @@ static inline ConvMono* conv_mono_create(const ConvMonoConfig* cfg) {
     c->extra_noise = (float*)cur; cur += vec;
     c->spec = (Complex*)cur;
     for (k = 0; k < c->n_freqs; ++k) c->unity[k] = 1.0f;
-    c->rng = SE_CNG_RNG_SEED;
+    c->rng = CONV_MONO_CNG_RNG_SEED;
     if ((cfg->enable_nr && !c->nr) || !c->istft) {
         conv_mono_destroy(c);
         return NULL;
@@ -172,7 +175,7 @@ static inline int conv_mono_hop(ConvMono* c, const float* mic, const float* ref,
     }
     if (c->cfg.enable_cng && c->cfg.enable_res && ctx.comfort_noise)
         aec_cng_fill(&c->rng, c->spec, ctx.comfort_noise, ctx.res_gain, nr_gain,
-                     SE_CNG_NR_GAIN_FLOOR, c->n_freqs);
+                     CONV_MONO_CNG_NR_GAIN_FLOOR, c->n_freqs);
     (void)ac_istft_push(c->istft, c->spec, out);
     return 0;
 }

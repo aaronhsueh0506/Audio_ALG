@@ -17,7 +17,8 @@
 #define PP_ALIGN ((size_t)DFN2_PREPOST_ALIGNMENT)
 
 /* Frames of model lookahead; the two lookaheads add (cascade), see
- * dfn2_compose_stream() in dfn2_process.h. */
+ * dfn2_compose_stream() in dfn2_process.h. It is also the number of warm-up hops
+ * that report written = 0. */
 #define PP_MODEL_LOOKAHEAD (DFN2_MASK_LOOKAHEAD + DFN2_DF_LOOKAHEAD)
 
 struct DFN2Prepost {
@@ -117,6 +118,7 @@ static uint32_t pp_fnv1a_str(uint32_t h, const char *s) {
  * included so a pool handed across a mode or checkpoint-contract change is refused. */
 static uint32_t pp_build_hash(int io_mode) {
     uint32_t h = 2166136261u;
+    DFN2_REQUIRE_LOOKAHEAD_PAIR_LINK();
     h = pp_fnv1a_u32(h, (uint32_t)DFN2_SR);
     h = pp_fnv1a_u32(h, (uint32_t)DFN2_N_FFT);
     h = pp_fnv1a_u32(h, (uint32_t)DFN2_HOP_LEN);
@@ -286,7 +288,7 @@ static void pp_reset_states(DFN2Prepost *p) {
 }
 
 /* Per-hop bookkeeping only. The staging buffers are zero from init/reset, the
- * compose stage returns before writing them on the two warm-up hops, and every
+ * compose stage returns before writing them on the warm-up hops, and every
  * later hop writes them wholesale, so they are not cleared here. */
 static void pp_clear_frame(DFN2Prepost *p) {
     p->frame_open = 0;
@@ -483,9 +485,10 @@ static int pp_begin_frame(DFN2Prepost *p, const float *est_re,
     if (heads_needed < 0) return -1;
 
     if (heads_needed == 0) {
-        /* Left warm-up: no right-hand neighbour yet, so the compose clock advances
-         * with heads_valid=0. dfn2_compose_stream() accepts this exactly while
-         * current < DFN2_MASK_LOOKAHEAD; a disagreement returns -1 and is surfaced. */
+        /* Warm-up: the first head's window is not complete, so the compose
+         * clock advances with heads_valid=0. dfn2_compose_stream() accepts this
+         * exactly while current < DFN2_MASK_LOOKAHEAD; a disagreement returns -1
+         * and is surfaced. */
         if (dfn2_compose_stream(p->dsp, p->compose_re, p->compose_im, 0,
                                 NULL, NULL, 0.0f, p->atten_lim_db, p->enh_re,
                                 p->enh_im, NULL) != 0) {
@@ -677,7 +680,8 @@ int dfn2_prepost_post_process_freq(DFN2Prepost *p, float re[DFN2_N_BINS],
 int dfn2_model_run_frame(const DFN2Model *model, DFN2Prepost *p) {
     DFN2PrepostInputs inputs;
     DFN2PrepostOutputs outputs;
-    if (!model || !model->infer || !p || !p->frame_open) return -1;
+    if (!model || !model->infer || !p || !p->frame_open ||
+        dfn2_model_io_descriptor_validate(model->io_descriptor) != 0) return -1;
     if (dfn2_prepost_frame_inputs(p, &inputs, &outputs) != 0) return -1;
     if (model->infer(model->user, &inputs, &outputs) != 0) {
         return dfn2_prepost_frame_skip(p) == 0 ? 0 : -1;

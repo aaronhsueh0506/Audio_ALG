@@ -7,7 +7,7 @@
  * published shared-delay state and a hash of the aligned far the four lanes consumed.
  * pipeline.py generates the same scene and must reproduce every column.
  * The matched-filter duty cycle is pinned at full rate
- * (four_aec_nr_res_pin_duty_full_rate(), 4aec_nr_res_internal.h) because it is a C-only
+ * (mcab_pin_duty_full_rate(), mcab_internal.h) because it is a C-only
  * schedule. printf lives in this test binary only; the core stays stdio-free.
  *
  * Build:  make -C pipelines/4ch_aec_bf_nr_res dump_delay_parity
@@ -19,7 +19,7 @@
  *                       [--backward-quarantine] [--quarantine-s SECONDS]
  *                       [--proxy-noise GAIN]
  * --seed reseeds the far/echo stream only. --backward-quarantine sets
- * FourAecNrResConfig::delay_backward_quarantine_enabled (default off) and
+ * McabConfig::delay_backward_quarantine_enabled (default off) and
  * --quarantine-s its window (default 1.0 s). --proxy-noise adds independent noise to the
  * capture-proxy channel only, so the proxy lane cannot cancel while the other three can
  * and the proxy-lane rule is told apart from a judge-any-lane rule.
@@ -30,8 +30,9 @@
 #include <stdlib.h>
 #include <string.h>
 
-#include "4aec_nr_res.h"
-#include "4aec_nr_res_internal.h"
+#include "mcab.h"
+#include "mcab_internal.h"
+#include "mcab_test_rig.h"
 
 /* xorshift32 -> [-0.125, 0.125). Every operation is exactly representable in
  * float32 (the 24-bit mantissa feed is exact, the two scale factors are
@@ -67,8 +68,8 @@ static uint64_t hash_hop(const float* samples, int count) {
 }
 
 int main(int argc, char** argv) {
-    FourAecNrResConfig cfg;
-    FourAecNrRes* p = NULL;
+    McabConfig cfg;
+    Mcab* p = NULL;
     float* far_hist = NULL;
     float* proxy_hist = NULL;
     float* mic = NULL;
@@ -125,9 +126,9 @@ int main(int argc, char** argv) {
     }
     if (shift_delay < 0) shift_delay = delay;
 
-    cfg = four_aec_nr_res_default_config(sample_rate);
+    cfg = mcab_default_config(sample_rate);
     cfg.fft_size = fft_size;
-    cfg.enable_post = 0;          /* the alignment seam lives in front_process */
+    cfg.enable_post = 0;          /* the alignment seam lives in mcab_process_front */
     cfg.delay_backward_quarantine_enabled = quarantine;
     if (quarantine_s >= 0.0f) cfg.delay_backward_quarantine_s = quarantine_s;
     if (strcmp(mode, "fixed") == 0) {
@@ -138,23 +139,23 @@ int main(int argc, char** argv) {
         return 2;
     }
 
-    p = four_aec_nr_res_create(&cfg);
+    p = mcab_test_create(&cfg);
     if (!p) {
-        fprintf(stderr, "four_aec_nr_res_create failed\n");
+        fprintf(stderr, "mcab flow init failed\n");
         return 3;
     }
     /* Analyse every hop: the duty-cycle schedule is C-only with no Python counterpart;
      * everything else runs as in production. The schedule is covered in
-     * tests/test_4aec_nr_res.c. */
-    four_aec_nr_res_pin_duty_full_rate(p);
-    hop = four_aec_nr_res_hop_size(p);
+     * tests/test_mcab.c. */
+    mcab_pin_duty_full_rate(p);
+    hop = mcab_hop_size(p);
 
     /* `pad` samples of pre-history so the echo is valid from the first
      * streamed sample, at either bulk delay. */
     pad = delay > shift_delay ? delay : shift_delay;
     total = pad + hops * hop;
     far_hist = (float*)malloc((size_t)total * sizeof(float));
-    mic = (float*)malloc((size_t)hop * FOUR_AEC_NR_RES_CHANNELS *
+    mic = (float*)malloc((size_t)hop * MCAB_CHANNELS *
                          sizeof(float));
     far = (float*)malloc((size_t)hop * sizeof(float));
     if (!far_hist || !mic || !far) {
@@ -181,21 +182,21 @@ int main(int argc, char** argv) {
     printf("hop,delay_samples,solid,changed,far_hash,aligned_hash,"
            "aligned_first\n");
     for (h = 0; h < hops; ++h) {
-        FourAecFront pre;
+        McabFront pre;
         int base = pad + h * hop;
         int echo_delay = (shift_at >= 0 && h >= shift_at) ? shift_delay : delay;
         for (i = 0; i < hop; ++i) {
             float echo = 0.5f * far_hist[base + i - echo_delay];
             far[i] = far_hist[base + i];
-            for (ch = 0; ch < FOUR_AEC_NR_RES_CHANNELS; ++ch)
-                mic[i * FOUR_AEC_NR_RES_CHANNELS + ch] = echo;
+            for (ch = 0; ch < MCAB_CHANNELS; ++ch)
+                mic[i * MCAB_CHANNELS + ch] = echo;
             if (proxy_hist)
-                mic[i * FOUR_AEC_NR_RES_CHANNELS + cfg.capture_proxy_channel] +=
+                mic[i * MCAB_CHANNELS + cfg.capture_proxy_channel] +=
                     proxy_hist[base + i];
         }
-        if (four_aec_front_process(p, mic, far, &pre) !=
-            FOUR_AEC_NR_RES_OK) {
-            fprintf(stderr, "front_process failed at hop %d\n", h);
+        if (mcab_process_front(p, mic, far, &pre) !=
+            MCAB_OK) {
+            fprintf(stderr, "mcab_process_front failed at hop %d\n", h);
             status = 5;
             goto cleanup;
         }
@@ -212,6 +213,6 @@ cleanup:
     free(proxy_hist);
     free(mic);
     free(far);
-    four_aec_nr_res_destroy(p);
+    mcab_test_destroy(p);
     return status;
 }

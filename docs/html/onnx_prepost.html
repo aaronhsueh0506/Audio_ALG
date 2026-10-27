@@ -124,12 +124,12 @@ framing、特徵前後端、recurrent ring／state buffer。整合者不需自�
 可為 NULL，是<b>串接</b>用的模式（Align-ULCNet 的 accelerator adapter 就是開一個 FREQ 實例）。</p>
 
 <p><b>一 hop = 一次推論</b>：<code>pre_process</code> 回傳這一 hop 需要的加速器呼叫次數。
-Align-ULCNet 與 DeepVQE-S <b>從 hop 0 起恆為 1</b>；DFN2 在<b>第一個 hop 回 0</b>（它的 graph 要
-<code>[t−1, t, t+1]</code>，hop 0 沒有右鄰居，不可以呼叫），之後每 hop 1 次。</p>
+Align-ULCNet 與 DeepVQE-S <b>從 hop 0 起恆為 1</b>；DFN2、DFN3 在<b>前 M 個 hop 回 0</b>（M = <code>mask_lookahead</code>；graph 的視窗是
+<code>[t−(2−M), …, t+M]</code>，右鄰居還沒到，不可以呼叫；出貨 M = 1 即第一個 hop），之後每 hop 1 次。M 與 <code>df_lookahead</code> D 是匯出圖之外、host 與 checkpoint 共同遵守的 pair（15 組，圖本身與 pair 無關，metadata 記錄 pair；見 <a href="ainr_dfn2_detail.html">ainr_dfn2_detail</a>）。</p>
 
 <p><b>pipeline 層的對應</b>：四個應用（<code>mono_alignulcnet</code>、<code>4ch_alignulcnet</code>、<code>mono_aec_dfn_res</code>、<code>4ch_aec_bf_dfn_res</code>）把同一個 hop 拆成 begin → 取 job → 呼叫端在 NPU 上推論 → 回報 rc → end。
-DFN2 應用用 <code>samples/dfn_hop.h</code>：<code>dfn_hop_begin()</code> → <code>while (dfn_hop_nn_begin() &gt; 0) { 推論; dfn_hop_nn_end(rc) }</code> → <code>dfn_hop_end()</code>，job 是 <code>DfnResStageJob</code>（<code>DFN2PrepostInputs/Outputs</code> 視圖）。
-ULCNet 應用用 <code>samples/ulcnet_nn_stage.h</code>：<code>ulcnet_nn_stage_begin_time()</code>／<code>_begin_complex()</code> → <code>ulcnet_nn_stage_nn_begin()</code>（回 1 並交出 <code>UlcnetNnJob</code>；回 0 表示本 hop 無模型幀）→ 推論 → <code>ulcnet_nn_stage_nn_end(rc)</code> → <code>ulcnet_nn_stage_end()</code>。
+DFN2 應用用 <code>dfn/dfn_hop.h</code>：<code>dfn_hop_begin()</code> → <code>while (dfn_hop_nn_begin() &gt; 0) { 推論; dfn_hop_nn_end(rc) }</code> → <code>dfn_hop_end()</code>，job 是 <code>DfnResStageJob</code>（<code>DFN2PrepostInputs/Outputs</code> 視圖）。
+ULCNet 應用用 <code>ulcnet/ulcnet_nn_stage.h</code>：<code>ulcnet_nn_stage_begin_time()</code>／<code>_begin_complex()</code> → <code>ulcnet_nn_stage_nn_begin()</code>（回 1 並交出 <code>UlcnetNnJob</code>；回 0 表示本 hop 無模型幀）→ 推論 → <code>ulcnet_nn_stage_nn_end(rc)</code> → <code>ulcnet_nn_stage_end()</code>。
 兩者都是：<code>rc==0</code> 且輸出有限才提交，否則該幀走 identity（等同 <code>_frame_skip</code> 的語意）；輸出預填 NaN；合成剛好一個 hop。
 DFN 應用經 rate bridge 時一個 native hop 可能有 0..2 個幀，所以 <code>dfn_hop_nn_begin()</code> 放在迴圈裡。
 逐步呼叫序列見 <a href="pipeline_dfn_usage.html">pipeline_dfn_usage</a>、<a href="pipeline_ulcnet_usage.html">pipeline_ulcnet_usage</a>,時序圖見 <a href="pipeline_dfn_sequence.html">pipeline_dfn_sequence</a>、<a href="pipeline_ulcnet_sequence.html">pipeline_ulcnet_sequence</a>，範例總覽見 <a href="integration_example.html">integration_example</a>，另見 <code>pipelines/README.md</code> 的 Call flow。</p>
@@ -196,11 +196,11 @@ parity 測試各自只編其中一個。把類別塞進任一邊，就會在另�
 <td><b>mute_fail_closed</b>：靜音（stream 0 是原始 mic，放行＝未消迴聲）</td>
 <td><code>state_layout_version</code> + <code>c_descriptor</code>（<code>AIAEC/_streaming_export.py</code>）</td></tr>
 <tr><td>DeepFilterNet2</td><td><code>AINR/DeepFilterNet2/dfn2_prepost.c/h</code></td>
-<td><code>AINR/tests/test_dfn2_prepost_c.py</code>（17 個測試函式）</td>
+<td><code>AINR/tests/test_dfn2_prepost_c.py</code>（19 個測試函式）</td>
 <td>identity：unit ERB mask + alpha 0</td>
 <td><code>state_layout_version</code>（<code>DeepFilterNet2/export_onnx.py</code>）</td></tr>
 <tr><td><a href="ainr_dfn3.html">DeepFilterNet3</a></td><td><code>AINR/DeepFilterNet3/dfn3_prepost.c/h</code></td>
-<td><code>AINR/tests/test_dfn3_prepost_c.py</code>（7 個測試函式）</td>
+<td><code>AINR/tests/test_dfn3_prepost_c.py</code>（8 個測試函式）</td>
 <td>identity：高頻 unit ERB gain + 低頻 raw bin 的 unit center DF tap</td>
 <td><code>state_layout_version</code>（<code>DeepFilterNet3/export_onnx.py</code>）</td></tr>
 <tr><td>Align-CRUSE</td><td><b>沒有</b>——只有共用的 <code>AIAEC/aiaec_process.c/h</code> helper</td>

@@ -28,6 +28,16 @@ extern "C" {
 #define DFN2_MODEL_GRU_HIDDEN               256
 #define DFN2_MODEL_ENCODER_CHANNELS         64
 #define DFN2_MODEL_DF_PATHWAY_WINDOW        5
+/* The window that yields heads[t] is frames [t-(2-L) .. t+L] for
+ * L = DFN2_MASK_LOOKAHEAD: it is complete once frame t+L has been pushed, so the
+ * first heads (t = 0) need L + 1 pushed frames. Frames before the stream start
+ * read as zero (the window is zeroed at init); at the end of a stream, L zero
+ * frames flush the last L heads. */
+#define DFN2_MODEL_READY_FRAMES            (DFN2_MASK_LOOKAHEAD + 1U)
+
+#if DFN2_MODEL_READY_FRAMES > DFN2_MODEL_INPUT_FRAMES
+#error "the first window must fit in the three-frame model input"
+#endif
 
 #ifdef __STDC_VERSION__
 #if __STDC_VERSION__ >= 201112L
@@ -95,8 +105,10 @@ typedef struct {
  * state once afterwards. */
 void dfn2_model_io_init(DFN2ModelIOState *state);
 
-/* Slide a [t-1,t,t+1] feature window by one frame and write the newest frame
- * into the last slot. */
+/* Slide a feature window by one frame and write the newest frame into the last
+ * slot. Slot 2 holds frame f, slot 1 f-1, slot 0 f-2: with f = t + L that is
+ * [t-(2-L) .. t+L], the alignment export_onnx.py publishes as
+ * input_window_alignment. */
 void dfn2_model_io_push_erb_window(
     float window[DFN2_MODEL_INPUT_FRAMES][DFN2_N_ERB],
     const float frame[DFN2_N_ERB]);
@@ -114,9 +126,10 @@ int dfn2_model_io_validate_arrays(
                          [DFN2_MODEL_DF_PATHWAY_WINDOW]
                          [DFN2_DF_BINS]);
 
-/* Push one newly computed feature frame. Returns 1 when [t-1,t,t+1] is
- * available and the graph may emit heads[t], or 0 after the first frame.
- * To flush the final source frame, push one all-zero feature frame. */
+/* Push one newly computed feature frame f. Returns 1 when the window
+ * [t-(2-L) .. t+L] of t = f - L is available and the graph may emit heads[t],
+ * or 0 for the first DFN2_MASK_LOOKAHEAD frames (nothing to run yet). To flush
+ * the final heads, push DFN2_MASK_LOOKAHEAD all-zero feature frames. */
 int dfn2_model_io_push_features(DFN2ModelIOState *state,
                                 const float erb[DFN2_N_ERB],
                                 const float spec[2][DFN2_DF_BINS]);

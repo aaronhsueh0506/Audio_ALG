@@ -9,10 +9,10 @@ import pytest
 from _scripted_delay import ScriptedDelay as _ScriptedDelay
 
 _pipeline = import_module("pipelines.4ch_aec_bf_nr_res.pipeline")
-BeamformerFrame = _pipeline.BeamformerFrame
+McabBeam = _pipeline.McabBeam
 EqualWeightBeamformer = _pipeline.EqualWeightBeamformer
-FourChannelAecConfig = _pipeline.FourChannelAecConfig
-FourChannelAecPipeline = _pipeline.FourChannelAecPipeline
+McabConfig = _pipeline.McabConfig
+McabPipeline = _pipeline.McabPipeline
 PostBeamResidualSuppressor = _pipeline.PostBeamResidualSuppressor
 SharedMatchedDelayEstimator = _pipeline.SharedMatchedDelayEstimator
 AecPreset = _pipeline.AecPreset
@@ -30,15 +30,15 @@ class _ZeroSumBeamformer:
         weights = np.zeros((4, n_freqs), dtype=np.complex64)
         weights[0] = 1.0
         weights[1] = -1.0
-        return BeamformerFrame(
+        return McabBeam(
             samples=np.asarray(linear_hops[0] - linear_hops[1], dtype=np.float32),
             weights=weights,
         )
 
 
 def test_resource_boundary_is_one_matcher_and_four_linear_filters():
-    pipeline = FourChannelAecPipeline(
-        FourChannelAecConfig(sample_rate=16000, frame_size=256, hop_size=128)
+    pipeline = McabPipeline(
+        McabConfig(sample_rate=16000, frame_size=256, hop_size=128)
     )
     assert pipeline.matched_filter_instance_count == 1
     assert pipeline.linear_filter_instance_count == 4
@@ -50,19 +50,19 @@ def test_post_beam_res_is_not_owned_by_the_pipeline():
     pipeline = _new_pipeline()
     assert not hasattr(pipeline, "set_aec_preset")
     assert not hasattr(pipeline, "residual_suppressor_instance_count")
-    assert "aec_preset" not in FourChannelAecConfig.__dataclass_fields__
+    assert "aec_preset" not in McabConfig.__dataclass_fields__
 
 
 def test_one_hop_is_finite_and_exports_post_beam_context():
-    pipeline = FourChannelAecPipeline(
-        FourChannelAecConfig(sample_rate=16000, frame_size=256, hop_size=128)
+    pipeline = McabPipeline(
+        McabConfig(sample_rate=16000, frame_size=256, hop_size=128)
     )
     rng = np.random.default_rng(7)
     render = (rng.standard_normal(128) * 0.01).astype(np.float32)
     microphones = np.stack(
         [np.roll(render, channel + 1) for channel in range(4)], axis=1
     )
-    pre = pipeline.front_process(microphones, render)
+    pre = pipeline.process_front(microphones, render)
     result = pipeline.fuse(pre, _external_equal_weight(pre))
     assert pre.linear_channels.shape == (128, 4)
     assert len(pre.contexts) == 4
@@ -77,7 +77,6 @@ def test_one_hop_is_finite_and_exports_post_beam_context():
     assert np.all(np.isfinite(result.context.error_spec))
     # fuse() computes no gain: a reader that skips the suppressor must fail.
     assert result.context.res_gain is None
-    assert result.spec_frame().g_res_ctx is None
     np.testing.assert_array_equal(result.aligned_render, pre.aligned_render)
 
 
@@ -90,7 +89,7 @@ def test_fuse_plus_external_suppressor_gives_a_bounded_gain():
         microphones = np.stack(
             [np.roll(render, channel + 1) for channel in range(4)], axis=1
         )
-        pre = pipeline.front_process(microphones, render)
+        pre = pipeline.process_front(microphones, render)
         result = pipeline.fuse(pre, _external_equal_weight(pre))
         assert result.context.res_gain is None
         context = suppressor.process(result.context, result.aligned_render)
@@ -107,8 +106,8 @@ def test_fuse_plus_external_suppressor_gives_a_bounded_gain():
 )
 def test_pre_beamformer_context_is_reconstructing_wola(sample_rate, frame_size):
     hop = frame_size // 2
-    pipeline = FourChannelAecPipeline(
-        FourChannelAecConfig(
+    pipeline = McabPipeline(
+        McabConfig(
             sample_rate=sample_rate,
             frame_size=frame_size,
             hop_size=hop,
@@ -131,7 +130,7 @@ def test_pre_beamformer_context_is_reconstructing_wola(sample_rate, frame_size):
             ],
             axis=1,
         ).astype(np.float32)
-        pre = pipeline.front_process(microphones, render)
+        pre = pipeline.process_front(microphones, render)
         if pre.delay.changed:
             previous.fill(0.0)
         for channel, context in enumerate(pre.contexts):
@@ -154,13 +153,13 @@ def test_pre_beamformer_context_is_reconstructing_wola(sample_rate, frame_size):
 
 
 def test_shared_far_reference_survives_zero_sum_beamformer_weights():
-    pipeline = FourChannelAecPipeline(
-        FourChannelAecConfig(sample_rate=16000, frame_size=256, hop_size=128)
+    pipeline = McabPipeline(
+        McabConfig(sample_rate=16000, frame_size=256, hop_size=128)
     )
     rng = np.random.default_rng(11)
     render = (rng.standard_normal(128) * 0.05).astype(np.float32)
     microphones = np.stack([render * (0.2 + 0.1 * i) for i in range(4)], axis=1)
-    pre = pipeline.front_process(microphones, render)
+    pre = pipeline.process_front(microphones, render)
     beamformed = _ZeroSumBeamformer().process(pre.linear_hops, pre.contexts)
     result = pipeline.fuse(pre, beamformed)
     assert float(np.linalg.norm(result.context.far_spec)) > 0.0
@@ -169,15 +168,15 @@ def test_shared_far_reference_survives_zero_sum_beamformer_weights():
 
 def _contexts_for_scalar_fusion(sample_rate, frame_size):
     hop = frame_size // 2
-    pipeline = FourChannelAecPipeline(
-        FourChannelAecConfig(
+    pipeline = McabPipeline(
+        McabConfig(
             sample_rate=sample_rate, frame_size=frame_size, hop_size=hop
         )
     )
     rng = np.random.default_rng(29)
     render = (rng.standard_normal(hop) * 0.02).astype(np.float32)
     microphones = np.stack([render * (0.2 + 0.1 * i) for i in range(4)], axis=1)
-    return pipeline.front_process(microphones, render)
+    return pipeline.process_front(microphones, render)
 
 
 @pytest.mark.parametrize("sample_rate,frame_size", [(16000, 256), (16000, 512), (48000, 1024)])
@@ -196,7 +195,7 @@ def test_zero_weight_lanes_do_not_drive_control_scalars(sample_rate, frame_size,
     weights = np.zeros((4, frame_size // 2 + 1), dtype=np.complex64)
     weights[active_lane] = 1.0
     fused = _pipeline._fuse_contexts(
-        contexts, BeamformerFrame(samples=pre.linear_hops[active_lane].copy(), weights=weights)
+        contexts, McabBeam(samples=pre.linear_hops[active_lane].copy(), weights=weights)
     )
     assert fused.filter_converged
     assert fused.dt_indicator == pytest.approx(0.1)
@@ -214,7 +213,7 @@ def test_all_contributing_lanes_keep_existing_control_reductions(sample_rate, fr
     ]
     weights = np.full((4, frame_size // 2 + 1), 0.25, dtype=np.complex64)
     fused = _pipeline._fuse_contexts(
-        contexts, BeamformerFrame(samples=pre.linear_hops.mean(axis=0), weights=weights)
+        contexts, McabBeam(samples=pre.linear_hops.mean(axis=0), weights=weights)
     )
     assert fused.filter_converged == all(c.filter_converged for c in contexts)
     assert fused.dt_indicator == max(c.dt_indicator for c in contexts)
@@ -237,7 +236,7 @@ def test_single_nonzero_bin_still_votes_on_control_scalars(sample_rate, frame_si
     # magnitude that could underflow or round a genuine contributor to zero.
     weights[3, -1] = complex(0.0, float(np.nextafter(np.float32(0), np.float32(1))))
     fused = _pipeline._fuse_contexts(
-        contexts, BeamformerFrame(samples=pre.linear_hops[0].copy(), weights=weights)
+        contexts, McabBeam(samples=pre.linear_hops[0].copy(), weights=weights)
     )
     assert not fused.filter_converged
     assert fused.dt_indicator == pytest.approx(0.7)
@@ -250,25 +249,51 @@ def test_zero_weights_remain_rejected(sample_rate, frame_size):
     weights = np.zeros((4, frame_size // 2 + 1), dtype=np.complex64)
     with pytest.raises(ValueError, match="zero weight"):
         _pipeline._fuse_contexts(
-            pre.contexts, BeamformerFrame(samples=pre.linear_hops[0].copy(), weights=weights)
+            pre.contexts, McabBeam(samples=pre.linear_hops[0].copy(), weights=weights)
         )
 
 
 def test_default_grids_are_no_padding_power_of_two():
-    assert FourChannelAecConfig(sample_rate=16000).resolved_grid() == (256, 128)
-    assert FourChannelAecConfig(sample_rate=48000).resolved_grid() == (1024, 512)
-    assert FourChannelAecConfig(sample_rate=16000, frame_size=512).resolved_grid() == (
+    assert McabConfig(sample_rate=16000).resolved_grid() == (256, 128)
+    assert McabConfig(sample_rate=48000).resolved_grid() == (1024, 512)
+    assert McabConfig(sample_rate=16000, frame_size=512).resolved_grid() == (
         512,
         256,
     )
     with pytest.raises(ValueError, match="256, 512"):
-        FourChannelAecConfig(sample_rate=16000, frame_size=320).resolved_grid()
+        McabConfig(sample_rate=16000, frame_size=320).resolved_grid()
     # 128 is a power of two but outside the C core's whitelist (16 kHz: 256/512,
-    # 4aec_nr_res.c derive_dims_and_configs); it must be rejected here too.
+    # mcab.c derive_flow); it must be rejected here too.
     with pytest.raises(ValueError, match="256, 512"):
-        FourChannelAecConfig(sample_rate=16000, frame_size=128).resolved_grid()
+        McabConfig(sample_rate=16000, frame_size=128).resolved_grid()
     with pytest.raises(ValueError, match="1024"):
-        FourChannelAecConfig(sample_rate=48000, frame_size=512).resolved_grid()
+        McabConfig(sample_rate=48000, frame_size=512).resolved_grid()
+
+
+def test_lane_parameters_are_the_applications():
+    """mcab_apply_lane_contract stamps only the contract fields and is idempotent; a
+    pipeline over an application-composed lane uses that lane's own parameters."""
+    from lib.aec.python.modules.config import AecConfig
+    config = McabConfig(sample_rate=16000, frame_size=256, hop_size=128)
+    app = AecConfig.from_preset(AecPreset.AGGRESSIVE, sample_rate=16000, filter_length=1024)
+    stamped = _pipeline.mcab_apply_lane_contract(config, app)
+    assert (stamped.frame_size, stamped.hop_size) == (256, 128)
+    assert not stamped.enable_delay_est and stamped.fixed_delay_samples == -1
+    assert not stamped.enable_res and stamped.return_res_context
+    contract = dict(frame_size=256, hop_size=128, enable_delay_est=False,
+                    fixed_delay_samples=-1, enable_res=False, return_res_context=True)
+    assert replace(app, **contract) == stamped
+    assert stamped.filter_length == 1024
+    assert stamped.min_gain_floor_far_active_db == app.min_gain_floor_far_active_db
+    assert _pipeline.mcab_apply_lane_contract(config, stamped) == stamped
+    with pytest.raises(ValueError, match="another sample rate"):
+        _pipeline.mcab_apply_lane_contract(
+            config, AecConfig.from_preset(AecPreset.BALANCED, sample_rate=48000))
+    pipeline = McabPipeline(config, lane_config=app)
+    assert all(lane.config.filter_length == 1024 for lane in pipeline._lanes)
+    default = McabPipeline(config)
+    explicit = McabPipeline(config, lane_config=_pipeline.mcab_lane_config(config))
+    assert default._lanes[0].config == explicit._lanes[0].config
 
 
 def test_48k_wrapper_feeds_inner_estimator_raw_native_rate_hops(monkeypatch):
@@ -296,24 +321,24 @@ def test_48k_wrapper_feeds_inner_estimator_raw_native_rate_hops(monkeypatch):
 
 
 def test_shape_and_nonfinite_rejection():
-    pipeline = FourChannelAecPipeline(
-        FourChannelAecConfig(sample_rate=16000, frame_size=256, hop_size=128)
+    pipeline = McabPipeline(
+        McabConfig(sample_rate=16000, frame_size=256, hop_size=128)
     )
     with pytest.raises(ValueError, match="shape"):
-        pipeline.front_process(
+        pipeline.process_front(
             np.zeros((128, 3), np.float32), np.zeros(128, np.float32)
         )
     bad = np.zeros((128, 4), np.float32)
     bad[0, 0] = np.nan
     with pytest.raises(ValueError, match="non-finite"):
-        pipeline.front_process(bad, np.zeros(128, np.float32))
+        pipeline.process_front(bad, np.zeros(128, np.float32))
 
 
 def test_one_call_path_requires_an_explicit_test_or_offline_adapter():
-    pipeline = FourChannelAecPipeline(
-        FourChannelAecConfig(sample_rate=16000, frame_size=256, hop_size=128)
+    pipeline = McabPipeline(
+        McabConfig(sample_rate=16000, frame_size=256, hop_size=128)
     )
-    with pytest.raises(RuntimeError, match="front_process"):
+    with pytest.raises(RuntimeError, match="process_front"):
         pipeline.process(np.zeros((128, 4), np.float32), np.zeros(128, np.float32))
     with pytest.raises(RuntimeError, match="explicit test/offline beamformer"):
         pipeline.process_signal(
@@ -322,8 +347,8 @@ def test_one_call_path_requires_an_explicit_test_or_offline_adapter():
 
 
 def test_explicit_adapter_keeps_legacy_offline_convenience_path():
-    pipeline = FourChannelAecPipeline(
-        FourChannelAecConfig(sample_rate=16000, frame_size=256, hop_size=128),
+    pipeline = McabPipeline(
+        McabConfig(sample_rate=16000, frame_size=256, hop_size=128),
         beamformer=EqualWeightBeamformer(),
     )
     result = pipeline.process(
@@ -334,8 +359,8 @@ def test_explicit_adapter_keeps_legacy_offline_convenience_path():
 
 
 def test_queued_pre_frames_are_snapshots_and_post_results_must_be_ordered():
-    pipeline = FourChannelAecPipeline(
-        FourChannelAecConfig(sample_rate=16000, frame_size=256, hop_size=128)
+    pipeline = McabPipeline(
+        McabConfig(sample_rate=16000, frame_size=256, hop_size=128)
     )
     rng = np.random.default_rng(19)
     render0 = (rng.standard_normal(128) * 0.01).astype(np.float32)
@@ -343,9 +368,9 @@ def test_queued_pre_frames_are_snapshots_and_post_results_must_be_ordered():
     mics0 = np.stack([np.roll(render0, i + 1) for i in range(4)], axis=1)
     mics1 = np.stack([np.roll(render1, i + 2) for i in range(4)], axis=1)
 
-    pre0 = pipeline.front_process(mics0, render0)
+    pre0 = pipeline.process_front(mics0, render0)
     saved = pre0.contexts[0].error_spec.copy()
-    pre1 = pipeline.front_process(mics1, render1)
+    pre1 = pipeline.process_front(mics1, render1)
     np.testing.assert_array_equal(pre0.contexts[0].error_spec, saved)
 
     with pytest.raises(ValueError, match="out of order"):
@@ -356,10 +381,10 @@ def test_queued_pre_frames_are_snapshots_and_post_results_must_be_ordered():
 
 
 def test_reset_invalidates_external_frames_that_are_still_in_flight():
-    pipeline = FourChannelAecPipeline(
-        FourChannelAecConfig(sample_rate=16000, frame_size=256, hop_size=128)
+    pipeline = McabPipeline(
+        McabConfig(sample_rate=16000, frame_size=256, hop_size=128)
     )
-    pre = pipeline.front_process(
+    pre = pipeline.process_front(
         np.zeros((128, 4), np.float32), np.zeros(128, np.float32)
     )
     beamformed = _external_equal_weight(pre)
@@ -369,10 +394,10 @@ def test_reset_invalidates_external_frames_that_are_still_in_flight():
 
 
 def test_pre_frame_cannot_resume_on_a_different_pipeline_instance():
-    config = FourChannelAecConfig(sample_rate=16000, frame_size=256, hop_size=128)
-    source = FourChannelAecPipeline(config)
-    other = FourChannelAecPipeline(config)
-    pre = source.front_process(
+    config = McabConfig(sample_rate=16000, frame_size=256, hop_size=128)
+    source = McabPipeline(config)
+    other = McabPipeline(config)
+    pre = source.process_front(
         np.zeros((128, 4), np.float32), np.zeros(128, np.float32)
     )
     with pytest.raises(ValueError, match="different pipeline"):
@@ -407,8 +432,8 @@ def _realign_scene():
 
 
 def _run_realign_scene():
-    pipeline = FourChannelAecPipeline(
-        FourChannelAecConfig(sample_rate=16000, frame_size=2 * _REALIGN_HOP,
+    pipeline = McabPipeline(
+        McabConfig(sample_rate=16000, frame_size=2 * _REALIGN_HOP,
                              hop_size=_REALIGN_HOP)
     )
     far, mic, script = _realign_scene()
@@ -417,7 +442,7 @@ def _run_realign_scene():
     for index in range(len(script)):
         lo, hi = index * _REALIGN_HOP, (index + 1) * _REALIGN_HOP
         mics = np.repeat(mic[lo:hi, None], 4, axis=1)
-        pre = pipeline.front_process(mics, far[lo:hi])
+        pre = pipeline.process_front(mics, far[lo:hi])
         rows.append({
             "changed": bool(pre.delay.changed),
             "delay": int(pre.delay.delay_samples),
@@ -476,7 +501,7 @@ def test_admitted_delay_change_realigns_four_lanes_instead_of_resetting_them():
         )
 
     # 4. The counters share the lanes' reset epoch, so an instrumentation
-    #    total can never span two of them (matches four_aec_nr_res_reset()).
+    #    total can never span two of them (matches mcab_reset()).
     pipeline.reset()
     assert pipeline.realign_warm_lane_count == 0
     assert pipeline.realign_soft_lane_count == 0
@@ -496,8 +521,8 @@ def _dt_floor(suppressor):
 
 
 def _new_pipeline():
-    return FourChannelAecPipeline(
-        FourChannelAecConfig(sample_rate=16000, frame_size=256, hop_size=128)
+    return McabPipeline(
+        McabConfig(sample_rate=16000, frame_size=256, hop_size=128)
     )
 
 
@@ -609,7 +634,7 @@ def test_construction_time_no_floor_disables_split_floor():
 def test_construction_time_preset_matches_runtime_retarget():
     """Building with AGGRESSIVE must match balanced-then-retarget.
 
-    The C construction path (se_derive -> aec_config_from_preset) applies both
+    The C construction path (aec_config_from_preset) applies both
     floor fields from the preset before aec_res_init(), the same two fields
     set_preset() retargets; a seed that left them at balanced's values would
     diverge from the C side.

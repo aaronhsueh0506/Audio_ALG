@@ -158,8 +158,44 @@ make test-simd          # NEON and forced-scalar digest must match, the
                         # both builds (tests/test_nn_chains.c)
 make SIMD=0 test        # scalar-only build, including DFN3 streaming
 python3 -m pytest DeepFilterNet2/tests DeepFilterNet3/tests tests -q
+make test-pairs         # only the lookahead-pair pytest files (rebuilds the DFN2/DFN3
+                        # C hosts per pair)
 make -C RNNoise-ERB SIMD=0 test
 ```
+
+### Lookahead pairs (DeepFilterNet2 and DeepFilterNet3)
+
+`mask_lookahead` M in 0..2 and `df_lookahead` D in 0..`df_order`-1 are
+independent model contracts (15 pairs, `config.ini [model]`); a checkpoint
+trained for one pair is refused under another. The ONNX graph does not depend on
+them; they decide what the host does:
+
+- the window for `heads[t]` is frames `[t-(2-M) .. t+M]` (zero before the
+  stream start), the first heads are ready once frame M has been pushed, and
+  `export_onnx.feature_windows(feature, mask_lookahead)`, the calibration
+  captures and the export metadata (`mask_lookahead`, `df_lookahead`,
+  `input_window_alignment`) all use it; the calibration report names the pair;
+- the C host takes the pair as `-DDFN2_MASK_LOOKAHEAD=<M> -DDFN2_DF_LOOKAHEAD=<D>`
+  or `-DDFN3_MASK_LOOKAHEAD=<M> -DDFN3_DF_LOOKAHEAD=<D>` (plain decimals,
+  defaults = `config.ini`) on every translation unit of the build. An
+  out-of-range pair does not compile (preprocessor `#error`, so also under
+  gnu99 and C++); objects built for different pairs do not link (each unit that
+  depends on the pair references a symbol named after its pair that
+  `*_process.c` defines); a graph description or pool of another pair is
+  refused at run time (descriptor validation, pool hash);
+- latency: DFN2 (cascade) `1 + M + D` hops, DFN3 (parallel) `1 + max(M, D)`.
+
+The C hosts are exercised for the shipped pair by `make test` / `make test-simd`
+and for every other pair by pytest, which rebuilds them per pair
+(`make test-pairs`: `tests/test_dfn2_lookahead_pairs.py`,
+`test_dfn2_prepost_c.py`, `test_dfn3_stream_c.py`, `test_dfn3_prepost_c.py`,
+`test_dfn_lookahead_link.py`, `test_dfn_lookahead_calibration.py`). The Python
+parts (export, replay, calibration, offline inference) run for all 15 pairs;
+the C builds for the six pairs with `D <= M` and (0,1), (1,3), (2,4). The
+pairs, the shipped pair and the compile flags the tests use come from
+`tests/dfn_pairs.py` (constructor, `config.ini`, `make print-cflags`). No
+checkpoint trained for a pair other than the shipped one exists here, so the
+audio quality of the others is unmeasured.
 
 The DFN C API also performs ERB/complex feature normalization, mask expansion,
 deep-filter composition, optional post-filter/attenuation limiting, and WOLA.
@@ -239,7 +275,9 @@ and validated with `rnnoise_model_state_validate()`.
 DeepFilterNet2 additionally publishes the host-side callback boundary a
 pipeline binds a runtime to -- `DFN2Model` / `dfn2_model_run_frame()` in
 `DeepFilterNet2/dfn2_prepost.h`, with `DFN2ModelIoDescriptor` in
-`dfn2_model_io.h` as the graph contract a runtime must present. There is no
+`dfn2_model_io.h` as the graph contract a runtime must present;
+`dfn2_model_run_frame()` returns -1 without calling `infer` for a NULL or invalid
+descriptor. There is no
 separate accelerator adapter for DFN2, unlike Align-ULCNet: the feature
 windows and both recurrent state tensors already live inside the `DFN2Prepost`
 pool, so the class itself is the adapter. The FREQ mode also offers

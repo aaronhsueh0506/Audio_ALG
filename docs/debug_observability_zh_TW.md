@@ -16,7 +16,7 @@
 
 | | 結果 |
 |---|---|
-| **pull 型結構化快照** | **全部存活**（`aec_debug_status`、`aec_get_res_context`、`aec_get_linear_context`、`aec_get_mem_breakdown`、`aec_linear_is_cancelling`、`aec_far_fft_real_compute_count`、`anr_debug_status`、4ch 的全部 counter accessor） |
+| **pull 型結構化快照** | **全部存活**（`aec_debug_status`、`aec_get_res_context`、`aec_get_linear_context`、`aec_get_mem_breakdown`、`aec_linear_is_cancelling`、`aec_far_fft_real_compute_count`、`anr_debug_status`、`mcab` 的全部 counter accessor） |
 | **push 型 log / trace** | **全部消失**（沒有 `aec_debug_set_trace`、沒有每 hop CSV trace，`aec_debug.o` 不進 archive，archive 內連 `fprintf`/`vfprintf` 的引用都沒有） |
 | **stage timing** | 函式存活但**數值全為 0**（`AEC_STAGE_TIMING` 預設 0） |
 | **finite guards / 錯誤碼** | 全部存活，不受任何開關影響 |
@@ -35,11 +35,11 @@
 |---|---|
 | AEC 狀態快照 | `AecDebugStatus` 10 欄，零 per-hop 成本（只讀引擎本來就每 hop 維護的欄位） |
 | NR 狀態快照 | `AnrDebugStatus` 5 欄 |
-| 4ch 計數器 | duty census、realign warm/soft、pending delay candidate、far-FFT 實跑次數、post split floor（live vs target；經 `aec_res_split_floor()`，抑制器是 4ch 應用自己用 libaec 建的 `AecRes`，單元與核心都不持有） |
-| 記憶體 | `aec_get_mem_breakdown()` / `four_aec_nr_res_get_mem_breakdown()`；後級各函式庫的大小各自查（`anr_get_mem_size()`、`ac_istft_get_mem_size()`、`aec_res_get_mem_size()`） |
-| 錯誤分級 | 4ch core 的 `FourAecNrResStatus` 四值（唯一有語意分級的） |
-| Finite guards | 4ch 核心與單元的輸入檢查；兩條 ULCNet 的 model 輸出 guard（含先填 `NAN` 的 FULL-WRITE CONTRACT）；`se_hop_is_finite()`（`common/se_stage.h`）給整合者檢查輸出 hop，4ch 的 raw／static 範例與板端 adapter 範例會呼叫它 |
-| 階段計數 | `dfn_res_stage_get_counters()`／`dfn_rate_bridge_get_counters()`（frames、commits、skips）；4ch 單元的 `AudioPipeline4ChFrameInfo.frame_index` |
+| 4ch 計數器 | duty census、realign warm/soft、pending delay candidate、far-FFT 實跑次數（`mcab_*` accessor）、post split floor（live vs target；經 `aec_res_split_floor()`，抑制器是 4ch 應用自己用 libaec 建的 `AecRes`，`mcab` 不持有） |
+| 記憶體 | `aec_get_mem_breakdown()` / `mcab_get_mem_breakdown()`（只含 mcab 自己的 pool；lane 與共享 estimator 各自查）；後級各函式庫的大小各自查（`anr_get_mem_size()`、`ac_istft_get_mem_size()`、`aec_res_get_mem_size()`） |
+| 錯誤分級 | `mcab` 的 `McabStatus` 四值（唯一有語意分級的） |
+| Finite guards | `mcab_process_front()`／`mcab_fuse()` 的輸入與投影檢查；兩條 ULCNet 的 model 輸出 guard（含先填 `NAN` 的 FULL-WRITE CONTRACT）；audiolib 的 `skn_all_finite_f32()`（`utility/simd_kernel_nn.h`）給整合者檢查輸出 hop，4ch 的 `mcab_raw`／`mcab_static`／`mcab_external_static` 與 mono 的 `example_board_adapter.c` 範例會呼叫它 |
+| 階段計數 | `dfn_res_stage_get_counters()`／`dfn_rate_bridge_get_counters()`（frames、commits、skips）；sample beam helper 的 `McabSampleBeamInfo.frame_index` |
 
 ### 2.2 十個已驗證的盲點
 
@@ -47,16 +47,16 @@
 |---|---|---|
 | **G1** | **`assert()` 在出貨板上是活的**。四個 Makefile 沒有任何一個設 `-DNDEBUG`；`suppression_gain.c` 的 table-length assert **沒有 release-path fallback**，失敗即 `abort()`——沒有回傳碼、沒有 log、沒有 hook 可攔 | 全樹 grep `-DNDEBUG` = 0 命中 |
 | **G2** | **沒有層級式 log**。`aec_debug_set_level()`／`aec_debug_set_log()` 只把值存進 `aec_debug.c` 的靜態變數，library 內沒有任何讀取端，也沒有 emit 函式；CLI 的 `--debug-level`／`--debug-log` 因此不會產生輸出 | `src/aec_debug.c` 的 `g_level`／`g_fp` 只被賦值 |
-| **G3** | **per-hop CSV trace 在所有 pipeline 範例全部不可達**。唯一填寫點（`aec.c` 的 `aec_debug_trace_row()` 呼叫）要求 `cfg.enable_res == 1` 且走 `aec_process()`；`se_derive()` 與 4ch 核心的 lane **全部**無條件設 `enable_res = 0` | `common/se_config.c` 的 `se_derive()`、`4aec_nr_res.c` 的 `derive_dims_and_configs()` |
-| **G4** | **self-reset 不計數，而且會抹掉證據**。`DSP_ERROR` 路徑內部呼叫 `reset()`，而 `reset()` 把 realign counters / duty census 全部歸零 → 事後完全看不出發生過 | `4aec_nr_res.c` 的 reset 實作 |
+| **G3** | **per-hop CSV trace 在所有 pipeline 範例全部不可達**。唯一填寫點（`aec.c` 的 `aec_debug_trace_row()` 呼叫）要求 `cfg.enable_res == 1` 且走 `aec_process()`；各 mono 範例的 `derive_lane()`（`aec_nr_pipeline`、`mono_aec_dfn_res`、`mono_alignulcnet`）、板端 adapter 範例與 `mcab` 的 lane 契約（`mcab_apply_lane_contract()`）**全部**無條件設 `enable_res = 0` | `mono_aec_nr_res/main.c`、`dfn/mono_aec_dfn_res/main.c`、`ulcnet/mono_alignulcnet/main.c` 的 `derive_lane()`、`mono_aec_nr_res/example_board_adapter.c`、`mcab.c` 的 `mcab_apply_lane_contract()` |
+| **G4** | **self-reset 不計數，而且會抹掉證據**。`DSP_ERROR` 路徑內部呼叫 `reset()`，而 `reset()` 把 realign counters / duty census 全部歸零 → 事後完全看不出發生過 | `mcab.c` 的 `mcab_reset()` |
 | **G5** | **delay lock 遺失不可見**。`delay_state` 與 `generation` 每 hop 可讀，但 `AecDebugStatus` **兩者都沒有** → 只 poll 快照的整合者看不到 lock 的丟失與重獲 | `aec.h` 的 `AecDebugStatus` 欄位表 |
 | **G6** | **mis-lock 連代理指標都沒有**。`delay_updates` 是更新總數，**不區分**「同一值重複確認」與「跳到新值」 | — |
-| **G7** | **realign 第三種落點不計數**。只累加 `outcome==1`（warm）與 `==0`（soft）；`-1`（wiring fault）不計 | `4aec_nr_res.c` realign sweep |
-| **G8** | **除 4ch 單元的 `AudioPipeline4ChFrameInfo.frame_index` 外，沒有 frame counter**。mono（`Aec`）、4ch 核心與降噪器都答不出「處理了幾個 hop」，遑論 xrun；`frame_index` 隨 `reset()` 歸零，所以也看不出 self-reset 發生過 | `audio_pipeline_4ch.h`、`aec.h`、`anr.h` |
-| **G9** | **init 失敗一個字都不說**。4ch 核心與單元 `init_ex()` 的 8 項檢查任一失敗都靜默回 NULL（header 寫明 no diagnostic）；mono 各函式庫有逐欄位 stderr，但 `NO_STDIO=1`（正是板端組態）一開就沒了 | `4aec_nr_res.h`、`audio_pipeline_4ch.h` 的 `init_ex()` 註解 |
-| **G10** | **NN fail-open 的三種原因不可區分**。三種 fallback（`infer==NULL` / 回非 0 / 輸出非有限）走同一條 else 分支。DFN2 stage 有 `skips` 總數，ULCNet stage 沒有任何計數 → 「NPU 掛了」與「偶發 NaN」外部無法分辨 | `dfn_res_stage.h` 的計數器；`samples/ulcnet_nn_stage.c` 的 `nn_end` 分支 |
+| **G7** | **realign 第三種落點不計數**。只累加 `outcome==1`（warm）與 `==0`（soft）；`-1`（wiring fault）不計 | `mcab.c` 的 realign sweep |
+| **G8** | **除 sample beam helper 的 `McabSampleBeamInfo.frame_index` 外，沒有通用的 frame counter**（`mcab` 只有 MATCHED 才累計的 `estimator_calls`）。mono（`Aec`）、`mcab` 與降噪器都答不出「處理了幾個 hop」，遑論 xrun；`frame_index` 隨 `mcab_sample_beam_reset()` 與 `mcab_sample_beam_fuse()` 失敗時的整體重設歸零（front 失敗只重設 flow，`frame_index` 不動），所以 fuse 失敗的 self-reset 也看不出發生過 | `mcab_sample_beam.h`、`mcab.h`、`aec.h`、`anr.h` |
+| **G9** | **init 失敗一個字都不說**。`mcab_init_ex()`（descriptor 檢查與 lane／estimator 驗證）和 `mcab_sample_beam_init()` 的檢查任一失敗都靜默回 NULL；mono 各函式庫有逐欄位 stderr，但 `NO_STDIO=1`（正是板端組態）一開就沒了 | `mcab.h` 的 `mcab_init()`／`mcab_init_ex()` 註解（NULL on any refusal） |
+| **G10** | **NN fail-open 的三種原因不可區分**。三種 fallback（`infer==NULL` / 回非 0 / 輸出非有限）走同一條 else 分支。DFN2 stage 有 `skips` 總數，ULCNet stage 沒有任何計數 → 「NPU 掛了」與「偶發 NaN」外部無法分辨 | `pipelines/dfn/dfn_res_stage.h` 的計數器；`pipelines/ulcnet/ulcnet_nn_stage.c` 的 `nn_end` 分支 |
 
-另有四個次要盲點：4ch 前端的 `FourAecNrResLastTiming` 只涵蓋前端（delay／frontend／linear／lane_res／fuse），後級 stage（RES、NR、CNG、ISTFT 都由應用串接，不在核心的耗時欄位裡）其耗時必須由應用自己量；backward quarantine 開火不可見；`far_spec_shared_hop` 退化到昂貴路徑不可見（provenance 函式只在 internal header）；mono 的 `Aec` 與兩支 mono CLI 不檢查輸入是否有限（`se_hop_is_finite()` 只是給整合者的工具，mono CLI 不呼叫它）。
+另有四個次要盲點：4ch 的 `McabLastTiming` 只涵蓋 mcab 本身（delay／frontend／linear／lane_res／fuse），後級 stage（RES、NR、CNG、ISTFT 都由應用串接，不在 mcab 的耗時欄位裡）其耗時必須由應用自己量；backward quarantine 開火不可見；`far_spec_shared_hop` 退化到昂貴路徑不可見（provenance 函式 `mcab_far_spec_provenance()` 只在 `mcab_internal.h`）；mono 的 `Aec` 與兩支 mono CLI 不檢查輸入是否有限（輸出 hop 的 finite 檢查是各範例自己的事：4ch 的 `mcab_raw`／`mcab_static`／`mcab_external_static` 與 mono 的 `example_board_adapter.c` 呼叫 `skn_all_finite_f32()`，兩支 mono CLI 不呼叫）。
 
 ---
 
@@ -140,13 +140,13 @@ T0.3 之所以關鍵：`dominant_nearend`、`saturated_echo`、`usable_linear`�
 
 `aec_get_last_timing()` 回全 0 目前有兩種意思，而函式不會告訴你是哪一種。
 提案：在 `AecStageTiming` 加一個 `enabled` 欄位（或導出
-`*_stage_timing_available()`），四路核心的宏（`FOUR_AEC_NR_RES_STAGE_TIMING`）目前是 `.c` 內部宏、consumer 測不到，也一併導出。
+`*_stage_timing_available()`），mcab 的宏（`MCAB_STAGE_TIMING`）目前是 `mcab.c` 內部宏、consumer 測不到，也一併導出。
 
 ### T6 — 兩條 ULCNet 範例補上計數
 
-沒有 wrapper 物件了，整合者直接持有 `Aec`（mono）或 `AudioPipeline4Ch`（4ch，已有 `audio_pipeline_4ch_get_core()` 與
-`audio_pipeline_4ch_last_core_timing()`），所以核心的 duty census、realign counters 與 timing 都可達。剩下的缺口在
-`samples/ulcnet_nn_stage`：沒有 `frames`／`commits`／`skips` 計數（DFN2 的 stage 有，見 §2.1），
+整合者直接持有 `Aec`（mono）或 `Mcab`（4ch；`mcab_get_last_timing()`、duty census 與 realign counters
+的 accessor 都在 `mcab.h`），所以 mcab 的 duty census、realign counters 與 timing 都可達。剩下的缺口在
+`pipelines/ulcnet/ulcnet_nn_stage.c`：沒有 `frames`／`commits`／`skips` 計數（DFN2 的 stage 有，見 §2.1），
 補上即可，成本是三個非熱路徑的 `++`。
 
 ---

@@ -139,7 +139,7 @@ UlcnetPrepost *p = ulcnet_prepost_init_ex(pool, req.bytes, &amp;cfg, &amp;req); 
 <code>io_mode</code> 在 init 固定（它決定 pool 大小）：<code>ULCNET_IO_TIME</code> hop 進 hop 出，
 framing／加窗／overlap-add 由類別做、但呼叫的是 <b>caller 的 <code>FftHandle</code> 與 window 表</b>；
 <code>ULCNET_IO_FREQ</code> 頻譜進頻譜出、不做任何 transform，<code>fft</code>/<code>window</code>
-可為 NULL，這是<b>串接</b>（AEC seam 或 4ch 單元輸出頻譜）用的模式。</p>
+可為 NULL，這是<b>串接</b>（AEC seam 或 4ch 路徑的 beamformed 頻譜）用的模式。</p>
 <p><b>四個 state 就地綁定</b>：<code>key_history</code>/<code>value_history</code>/<code>logit_history</code>/
 <code>h_gru</code> 在 caller pool 各一份，graph 回每個 state 的完整下一個 window（shape 同輸入，位移在 graph 內），
 runtime 把每個 <code>*_out</code> 綁到 <code>frame_inputs()</code> 回傳的同名位址，先讀完所有 state 輸入才寫輸出；
@@ -276,8 +276,8 @@ Python reference 仍是兩個 <code>(2, 1, 128)</code> 的 nn.GRU hidden，測�
 從 reset 開始的 stream 與 whole-utterance forward 等價，<b>無 warm-up 特例</b>。
 實測 stream-vs-offline 最差差異：enhanced 4.1e-8 / mask 1.2e-7 / magnitude_mask 6.0e-8 /
 delay 4.0e-7（test 檔頭記載；tolerances 以 ~10x headroom 釘在 5e-7 / 2e-6 / 1e-6 / 5e-6）。</li>
-<li>Framing：類別與 AEC seam／4ch 單元用 <b>center=False、每 hop 一幀</b>的 rolling 分析；centered
-push 只剩 Python parity gate 使用（mono 範例 <code>mono_alignulcnet/main.c</code> 用同一套排程）。端到端
+<li>Framing：類別與 AEC seam／4ch 路徑用 <b>center=False、每 hop 一幀</b>的 rolling 分析；centered
+push 只剩 Python parity gate 使用（mono 範例 <code>pipelines/ulcnet/mono_alignulcnet/main.c</code> 用同一套排程）。端到端
 演算法延遲仍是 <b>HOP samples</b>＝16 kHz 256 smp（16 ms）、48 kHz 512 smp（10.67 ms），但它來自
 <b>synthesis 的半窗 trim</b>、不是分析排程（<code>ulcnet_prepost.h</code> 明文）。</li>
 <li>C 前後處理 vs Python：float-ULP 級（實測 ~2e-5 絕對值，NE10 f32 FFT vs torch

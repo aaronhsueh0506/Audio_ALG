@@ -201,7 +201,7 @@ identity reprime。
 - 板端 NPU driver/runtime implementation。
 - 加速器內部 persistent state（不存在）。
 - 特定產品的狀態機與板端 accelerator 呼叫。共用 CPU state adapter 與
-  mono/4ch fail-open wiring 在 `pipelines/`，其中板端 callback 保留為
+  mono/4ch fail-open wiring 在 `pipelines/ulcnet/`，其中板端 callback 保留為
   board TODO。
 - PBFDKF/matched-filter 演算法改動。
 

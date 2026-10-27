@@ -421,7 +421,7 @@ G[k] = G<sub>LSA</sub><sup>p[k]</sup> · g<sub>min</sub><sup>1−p[k]</sup>
 <h2 id="res">5. Post-filter — RES + CNG</h2>
 
 <div class="panel">
-<p>RES 是 AEC3-aligned 的抑制鏈（<code>AecState</code> → <code>ResidualEchoEstimator</code> → <code>SuppressionGain</code>），在 AEC 內部以頻域計算 <code>G_res(f)</code> 與 <code>R²(f)</code>，經 <code>AecResContext</code> 交給 pipeline；它不是 NR 之後的第二個時域濾波器。演算法本體見 <a href="../lib/aec/docs/aec_methods.md">lib/aec/docs/aec_methods.md</a> <a href="../lib/aec/docs/aec_methods_02_post_filter.md#3-aec3-post-filter-_aec3_post">§3</a>。mono 的 RES 增益就是這個 AEC 自己的 <code>ctx.res_gain</code>（經 <code>se_frame_from_aec()</code> 放進 <code>frame.g_res_ctx</code>，強度用 <code>aec_set_preset()</code>）；4ch 的 post-beam RES 不在 <code>AudioPipeline4Ch</code> 單元內（單元與核心的 <code>audio_pipeline_4ch_fuse()</code>／<code>four_aec_fuse()</code> 讓 <code>g_res_ctx</code> 為 NULL），而是由 libaec 管理、應用在自己的 init 建立的 <code>AecRes</code>（<code>aec_res_get_mem_size()</code>／<code>aec_res_init()</code>，每 hop <code>se_res_stage_gain(res, &amp;frame)</code>，強度用 <code>aec_res_set_preset(res, …)</code>）；NR 與最後合成一律是另外初始化的函式庫物件。</p>
+<p>RES 是 AEC3-aligned 的抑制鏈（<code>AecState</code> → <code>ResidualEchoEstimator</code> → <code>SuppressionGain</code>），在 AEC 內部以頻域計算 <code>G_res(f)</code> 與 <code>R²(f)</code>，經 <code>AecResContext</code> 交給 pipeline；它不是 NR 之後的第二個時域濾波器。演算法本體見 <a href="../lib/aec/docs/aec_methods.md">lib/aec/docs/aec_methods.md</a> <a href="../lib/aec/docs/aec_methods_02_post_filter.md#3-aec3-post-filter-_aec3_post">§3</a>。mono 的 RES 增益就是這個 AEC 自己的 <code>ctx.res_gain</code>（經 <code>aec_get_res_context()</code> 讀 <code>AecResContext.res_gain</code>，強度用 <code>aec_set_preset()</code>）；4ch 的 post-beam RES 不在 <code>mcab</code> 內（<code>mcab_fuse()</code> 讓 <code>g_res_ctx</code> 為 NULL），而是由 libaec 管理、應用在自己的 init 建立的 <code>AecRes</code>（<code>aec_res_get_mem_size()</code>／<code>aec_res_init()</code>，每 hop <code>aec_res_process(res, &amp;in)</code>，強度用 <code>aec_res_set_preset(res, …)</code>）；NR 與最後合成一律是另外初始化的函式庫物件。</p>
 
 <h3>5.1 Gain fusion</h3>
 
@@ -429,7 +429,7 @@ G[k] = G<sub>LSA</sub><sup>p[k]</sup> · g<sub>min</sub><sup>1−p[k]</sup>
 
 <h3>5.2 CNG (Comfort Noise Generation)</h3>
 
-<p>Comfort noise 由 AEC 的 <code>comfort_noise</code> PSD 產生，只填 <code>G_res</code> 切掉的 bin；位準再乘該 bin 的 <code>G_nr</code>（下限 −10 dB，<code>SE_CNG_NR_GAIN_FLOOR</code>），讓補進去的噪聲落在降噪後的底噪。pipeline 預設 <code>enable_cng=1</code>。</p>
+<p>Comfort noise 由 AEC 的 <code>comfort_noise</code> PSD 產生，只填 <code>G_res</code> 切掉的 bin；位準再乘該 bin 的 <code>G_nr</code>（下限 −10 dB，範例內的 <code>CNG_NR_GAIN_FLOOR</code>／<code>MCAB_SAMPLE_CNG_NR_GAIN_FLOOR</code>），讓補進去的噪聲落在降噪後的底噪。pipeline 預設 <code>enable_cng=1</code>。</p>
 
 </div>
 
@@ -451,8 +451,8 @@ G[k] = G<sub>LSA</sub><sup>p[k]</sup> · g<sub>min</sub><sup>1−p[k]</sup>
   <tr><td><a href="architecture_aec.html">architecture_aec.html</a>、<a href="architecture_detail.html">architecture_detail.html</a></td><td>本頁拆出的 AEC 細節，以及效能／preset／已知限制</td></tr>
   <tr><td><a href="../pipelines/README.md">pipelines/README.md</a></td><td>目前的介面契約、CLI 與建置</td></tr>
   <tr><td><a href="../lib/aec/docs/aec_methods.md">lib/aec/docs/aec_methods.md</a></td><td>AEC／RES 演算法本體</td></tr>
-  <tr><td><code>pipelines/mono_aec_nr_res/main.c</code>、<code>static_main.c</code></td><td>範例：各自初始化 <code>Aec</code>／<code>AnrDenoiser</code>／<code>AcIstft</code> 並以 <code>mono_form()</code> 明寫逐 hop 串接</td></tr>
-  <tr><td><code>pipelines/common/se_stage.h</code>、<code>pipelines/samples/se_anr_stage.h</code></td><td><code>SeSpecFrame</code>／<code>se_frame_from_aec()</code>；NR 級 <code>se_anr_stage_gain()</code></td></tr>
+  <tr><td><code>pipelines/mono_aec_nr_res/main.c</code></td><td>範例：初始化 <code>Aec</code>／<code>AnrDenoiser</code>／<code>AcIstft</code> 並以 <code>mono_form()</code> 明寫逐 hop 串接；同一份原始碼建出 <code>aec_nr_pipeline</code>（<code>-DAEC_NR_POOL_SPLIT=1</code>，兩塊 pool）與 <code>aec_nr_pipeline_static</code>（一塊 pool，另有 <code>--print-mem-size</code>）</td></tr>
+  <tr><td><code>pipelines/4ch_aec_bf_nr_res/mcab_sample_post.h</code></td><td>4ch 範例的後級接線：<code>mcab_sample_res_input()</code>（<code>AecResInput</code>）、<code>mcab_sample_anr_gain()</code>（NR 增益）與 CNG 常數；mono 的對應函式是 <code>mono_nr_gain()</code>（同在 <code>main.c</code>）</td></tr>
   <tr><td><code>pipelines/mono_aec_nr_res/tests/test_mono_chain.c</code></td><td>串接驗收，對手寫 oracle <code>conv_chain_mono.h</code> 比對</td></tr>
 </table>
 </div>

@@ -1,41 +1,41 @@
 > [Index](pipeline_board_integration.md) | [Next: Warnings, descriptor and teardown contract](pipeline_board_integration_02_contract.md) <!-- split-nav -->
 ## At a glance: sequence, public/internal functions, external/internal parameters
 
-Lifelines of the board path. The mono flow has three library objects, the 4-channel flow has the
-one wrapped unit and the same two post libraries; every box is queried and initialised on its own.
-The numbered sequences further down give the exact calls; the per-flow diagrams (with return values
-and the swimlane over hops) are in section 0 of
+Lifelines of the board path. The mono flow has three library objects; the 4-channel flow has four
+`Aec` lanes, one shared `DelayAec`, the `Mcab` flow module and the same post libraries; every box is
+queried and initialised on its own. The numbered sequences further down give the exact calls; the
+per-flow diagrams (with return values and the swimlane over hops) are in section 0 of
 [`integration_mono_zh_TW.md`](integration_mono_zh_TW_01_overview_link_quickstart.md#0-速覽流程時序圖公開內部函式外部內部參數),
 [`integration_4ch_core_zh_TW.md`](integration_4ch_core_zh_TW.md) and
 [`integration_4ch_spatial_zh_TW.md`](integration_4ch_spatial_zh_TW.md).
 
 ```
-Firmware         Aec | AudioPipeline4Ch       AnrDenoiser          AcIstft
+Firmware         Aec (mono) | Aec x4, DelayAec, Mcab       AnrDenoiser          AcIstft
    |                  |                           |                   |
    |== boot (once; re-query every size, never cache) ==========================
-   |-- *_get_mem_size / audio_pipeline_4ch_get_mem_requirements (0 / -1 = invalid)
+   |-- *_get_mem_size (0 = invalid) / mcab_get_mem_requirements (0 = ok, -1 = invalid)
    |-- platform_alloc(Sum ALIGN16(each block), 16)         pool need not be zeroed
-   |-- aec_init | audio_pipeline_4ch_init_ex -->|-- aec_res_init (4ch only) -->|-- anr_init -->|-- ac_istft_init -->|   (NULL = stop)
+   |-- aec_init | aec_init x4, delay_aec_init (MATCHED), mcab_init_ex -->|-- aec_res_init (4ch only) -->|-- anr_init -->|-- ac_istft_init -->|   (NULL = stop)
    |== per hop ================================================================
-   |-- aec_process_context | audio_pipeline_4ch_process_* (+ _fuse) -->|  frame{e,r2,cn,g_res_ctx}
-   |      (mono: g_res_ctx is the Aec's own RES gain; 4ch: g_res_ctx = NULL)
-   |-- se_res_stage_gain(res, &f) (4ch only) ---->|  G_res from your AecRes
-   |-- se_anr_stage_gain ------------------------>|  G_nr
+   |-- aec_process_context, aec_get_res_context | mcab_process_front, your beamformer, mcab_fuse -->|  mono: ctx{error_spec,r2,comfort_noise,res_gain}; 4ch: frame{e,r2,cn,g_res_ctx}
+   |      (mono: res_gain is the Aec's own RES gain; 4ch: g_res_ctx = NULL)
+   |-- mcab_sample_res_input + aec_res_process(res, &in) (4ch only) ---->|  G_res from your AecRes
+   |-- anr_process_gain + anr_get_gain ---------->|  G_nr   (4ch: mcab_sample_anr_gain)
    |-- sk_min_f32, sk_capply_gain_f32, aec_cng_fill (firmware code)
    |-- ac_istft_push ------------------------------------------------>|  out[hop]   (1 hop behind the input)
    |== refused call or non-finite output =======================================
-   |-- aec_reset | audio_pipeline_4ch_reset, aec_res_reset (4ch only), anr_reset, ac_istft_reset, rng = SE_CNG_RNG_SEED   (all together)
+   |-- aec_reset | mcab_reset (also resets the lanes and the estimator), aec_res_reset (4ch only), anr_reset, ac_istft_reset, rng = your comfort-noise seed   (all together)
    |== teardown ================================================================
-   |-- anr_destroy, aec_destroy | audio_pipeline_4ch_destroy, then platform_free(pool)
+   |-- anr_destroy, aec_destroy | mcab_destroy, aec_destroy x4, then platform_free(pool)
 ```
 
 | | Public (the firmware calls these) | Internal (do not call or include) |
 |---|---|---|
-| Mono | `se_derive()`, `aec_get_mem_size()`/`aec_init()`, `anr_get_mem_size()`/`anr_init()`, `ac_istft_get_mem_size()`/`ac_istft_init()`, `aec_process_context()`, `se_frame_from_aec()`, `se_anr_stage_gain()`, `aec_cng_fill()`, `ac_istft_push()`, resets, destroys, `aec_set_preset()`, `anr_set_mode()` | AEC headers other than `aec.h`/`aec_res.h`, NR `noise_estimator.h`/`spp_estimator.h`/`anr_internal.h` |
-| 4-channel | `audio_pipeline_4ch_*` of `audio_pipeline_4ch.h` (or `four_aec_*` of `4aec_nr_res.h` when the firmware owns the beamformer) plus the same post libraries | `4aec_nr_res_internal.h`, `4aec_projection_kernels.h`, `bf.h`/`srp.h` and `audiolib/{doa,bf}` |
+| Mono | `aec_resolve_signal_grid()`/`aec_config_from_preset()`, `aec_get_mem_size()`/`aec_init()`, `anr_get_mem_size()`/`anr_init()`, `ac_istft_get_mem_size()`/`ac_istft_init()`, `aec_process_context()`, `aec_get_res_context()`, `anr_process_gain()`/`anr_get_gain()`, `aec_cng_fill()`, `ac_istft_push()`, resets, destroys, `aec_set_preset()`, `anr_set_mode()` | AEC headers other than `aec.h`/`aec_res.h`, NR `noise_estimator.h`/`spp_estimator.h`/`anr_internal.h` |
+| 4-channel | `mcab.h` (`mcab_*`), `aec.h` for the lanes, `delay_aec_get_mem_size()`/`delay_aec_init()` for the estimator, plus the same post libraries | `mcab_internal.h`; `bf.h`/`srp.h` and `audiolib/{doa,bf}` (used by the sample helper `mcab_sample_beam` only) |
 
 Parameters: what a third party may tune (grid and rate, `filter_length`, delay mode and bank size,
-presets and modes, array geometry, `num_angles`) and what stays inside
+presets and modes, array geometry and `num_angles` of the sample helper) and what stays inside
 (time constants, step sizes, detector thresholds, DOA/BF recursion constants, NR tracker constants)
 is classified field by field in section 0.3 of the three manuals above.
 
@@ -64,7 +64,7 @@ Query the exact pool budget for any configuration without running audio:
 
 ```bash
 ./aec_nr_pipeline_static --print-mem-size --sample-rate 16000
-./audio_pipeline_4ch_static --print-mem-size --sample-rate 16000     # in 4ch_aec_bf_nr_res/
+./mcab_static --print-mem-size --sample-rate 16000                   # in 4ch_aec_bf_nr_res/
 ```
 
 **Embedded-target integration:** allocate one contiguous, 16-byte-aligned
@@ -75,7 +75,10 @@ aligned (the libraries assert this).
 ## Sequence (mono: `Aec` plus the libraries it chains)
 
 ```
-1. query    se_derive(&req, &rules, &grid, &aec_cfg);         // grid + AecConfig
+1. query    AecSignalGrid grid;  AecConfig aec_cfg;
+            if (!aec_resolve_signal_grid(sample_rate, aec_default_fft_size(sample_rate), &grid)) fail;  // 0 = no such grid
+            aec_config_from_preset(&aec_cfg, preset, sample_rate);   // then fft_size = grid.fft_size, enable_res = 0,
+                                                                    // return_res_context = 1 (see mono_aec_nr_res/main.c derive_lane())
             AnrConfig nr_cfg = anr_config_for_mode_grid(sample_rate, grid.fft_size, mode);
             AcStftConfig synth_cfg;  ac_stft_config_default(&synth_cfg, grid.fft_size);
             size_t aec_bytes   = aec_get_mem_size(&aec_cfg);       // 0 = invalid
@@ -105,17 +108,18 @@ aligned (the libraries assert this).
             while (have_audio()) {
                 read_hop(mic, ref, hop);
                 aec_process_context(aec, mic, ref);
-                // per hop: G_res = f.g_res_ctx; nr = se_anr_stage_gain(nr, &f, extra, use_r2);
+                aec_get_res_context(aec, &c);
+                // per hop: G_res = c.res_gain; nr = anr_process_gain(nr, c.error_spec, extra, NULL) + anr_get_gain(nr, NULL);
                 //          sk_min_f32; sk_capply_gain_f32; aec_cng_fill; ac_istft_push
-                if (se_frame_from_aec(aec, &f) != 0 || !(P = mono_form(&f)) ||
-                    ac_istft_push(istft, P, out) != hop || !se_hop_is_finite(out, hop)) {
-                    aec_reset(aec); anr_reset(nr); ac_istft_reset(istft); rng = SE_CNG_RNG_SEED;
+                if (!c.error_spec || !(P = mono_form(&c)) ||
+                    ac_istft_push(istft, P, out) != hop || !skn_all_finite_f32(out, hop)) {
+                    aec_reset(aec); anr_reset(nr); ac_istft_reset(istft); rng = CNG_RNG_SEED;
                     continue;                                       // a refused hop: reset together
                 }
                 write_hop(out, hop);
             }
 
-5. reset?   aec_reset(aec); anr_reset(nr); ac_istft_reset(istft); rng = SE_CNG_RNG_SEED;
+5. reset?   aec_reset(aec); anr_reset(nr); ac_istft_reset(istft); rng = CNG_RNG_SEED;
             // optional: echo-path change, stream switch; re-zeros AEC/NR/synthesis state in place
             // and restarts the comfort-noise generator; no re-validation, no pool re-touch beyond that.
 
@@ -125,44 +129,62 @@ aligned (the libraries assert this).
 7. release  platform_free(pool);   // only after step 6
 ```
 
-## Sequence (4-channel: the unit plus the libraries it feeds)
+## Sequence (4-channel: the `mcab` flow plus the libraries it feeds)
 
-The unit is the one object with a descriptor. Its query, init and teardown:
+`Mcab` is the one object with a descriptor, and it covers its own pool only; the lanes and the
+estimator are the application's. Query, init and teardown:
 
 ```
-1. query    AudioPipeline4ChConfig cfg = audio_pipeline_4ch_default_config(sample_rate);
-            cfg.geometry/uca_radius_m/num_angles/core.* = ...;
-            AudioPipeline4ChMemReq req;
-            audio_pipeline_4ch_get_mem_requirements(&cfg, &req);   // 0 = OK, -1 = invalid
+1. query    McabConfig cfg = mcab_default_config(sample_rate);
+            cfg.delay_mode/delay_num_filters/capture_proxy_channel/enable_post = ...;
+            AecConfig lane;   mcab_lane_config(&cfg, &lane);      // balanced preset + the flow contract;
+                              // or aec_config_from_preset() + your own fields + mcab_apply_lane_contract(&cfg, &lane)
+            McabDelayEstimatorConfig dc;  mcab_delay_estimator_config(&cfg, &dc);   // dc.required: MATCHED only
+            size_t lane_bytes = aec_get_mem_size(&lane);                            // 0 = invalid
+            size_t delay_bytes = dc.required ? delay_aec_get_mem_size(dc.sample_rate, dc.hop_size, dc.num_filters) : 0;
+            McabMemReq req;
+            mcab_get_mem_requirements(&cfg, &req);                   // 0 = OK, -1 = invalid; the flow's own pool
             // fresh before every init_ex(); see "Warnings" below (pipeline_board_integration_02_contract.md)
 
-2. allocate void* pool = platform_alloc(req.bytes, req.alignment);
+2. allocate one 16-byte-aligned block for 4 x ALIGN16(lane_bytes) + ALIGN16(delay_bytes) + the DelayAec struct +
+            ALIGN16(req.bytes) (+ the post libraries), at req.alignment
 
-3. init     AudioPipeline4Ch* p = audio_pipeline_4ch_init_ex(pool, req.bytes, &cfg, &req);
+3. init     McabLibs libs = {0};
+            for (ch = 0; ch < MCAB_CHANNELS; ++ch) libs.lanes[ch] = aec_init(mem_lane[ch], lane_bytes, &lane);
+            if (dc.required) { delay_aec_init(&delay, mem_delay, delay_bytes, dc.sample_rate, dc.hop_size, dc.num_filters);
+                               libs.delay = &delay; }
+            Mcab* p = mcab_init_ex(mem_mcab, req.bytes, &cfg, &libs, &req);
             // NULL on: any expected-descriptor mismatch (descriptor_version / layout_version /
-            // backend_id / build_flags_hash / alignment / reserved / bytes), a
-            // misaligned/undersized pool, an invalid cfg, or a core / SRP / BF init failure.
-            // No diagnostic output at all (the unit links no stdio). audio_pipeline_4ch_init()
-            // is init_ex(..., NULL): no descriptor check.
+            // backend_id / build_flags_hash / alignment / reserved / bytes below the current), a
+            // misaligned/undersized pool, an invalid cfg, or a lane/estimator that does not fit the
+            // flow (wrong grid or post half, lane not EXTERNAL_ALIGNED, duplicate lane, wrong bank size,
+            // delay object missing/unexpected). The lanes and the estimator must be freshly
+            // initialised or reset first. mcab_init() is init_ex(..., NULL): no descriptor check.
+            // mcab_sample_flow_init() (mcab_sample_flow.h) is this whole sequence in one pool.
 
-   (The post-beam RES, NR and synthesis, the neural stage or DFN2 stage and bridge are separate blocks with
-    their own size queries and inits: aec_config_from_preset + aec_res_get_mem_size / aec_res_init (config
-    fft_size = audio_pipeline_4ch_fft_size(p); no destroy), anr_get_mem_size / anr_init,
+   (The beamformer, post-beam RES, NR and synthesis, the neural stage or DFN2 stage and bridge are separate
+    objects with their own size queries and inits: the sample helper mcab_sample_beam_get_mem_size /
+    mcab_sample_beam_init (SRP-PHAT, BF), aec_config_from_preset + aec_res_get_mem_size / aec_res_init
+    (config fft_size = mcab_fft_size(p); no destroy), anr_get_mem_size / anr_init,
     ac_istft_get_mem_size / ac_istft_init, ulcnet_nn_stage_mem_size / _init,
-    dfn_rate_bridge_get_mem_requirements / dfn_rate_bridge_init; the unit holds no RES)
+    dfn_rate_bridge_get_mem_requirements / dfn_rate_bridge_init; mcab holds no RES)
 
-4. process  audio_pipeline_4ch_process_with_activity(p, mics, far, vad, vad, NULL, &beam, &info);
-            audio_pipeline_4ch_fuse(p, &frame);            // optional (core.enable_post = 1)
-            // frame.g_res_ctx = NULL (the unit has no RES); then
-            // se_res_stage_gain(res, &frame) -> se_anr_stage_gain -> sk_min_f32 -> sk_capply_gain_f32
-            // -> aec_cng_fill -> ac_istft_push
-            // or process_front() / process_beam() with your own mask and VAD in between
+4. process  mcab_process_front(p, mics, far, &front);              // shared delay + 4 lanes
+            // your beamformer on front.linear_spectra -> weights W (+ its spectrum E); or the helper:
+            // mcab_sample_beam_process_with_activity(b, mics, far, vad, vad, NULL, &beam, &info);
+            mcab_fuse(p, W, E, &frame);                            // optional (cfg.enable_post = 1)
+            // frame.g_res_ctx = NULL (mcab has no RES); then
+            // mcab_sample_res_input(&frame, &in) + aec_res_process(res, &in) -> mcab_sample_anr_gain -> sk_min_f32
+            // -> sk_capply_gain_f32 -> aec_cng_fill -> ac_istft_push
+            // or the helper's process_front() / process_beam() with your own mask and VAD in between
 
-5. reset?   audio_pipeline_4ch_reset(p);  aec_res_reset(res);  anr_reset(nr);  ac_istft_reset(istft);  rng = SE_CNG_RNG_SEED;  [ulcnet_nn_stage_reset(stage);]
-            // after ANY refused call too: the integrator resets the unit and its own stages together
+5. reset?   mcab_reset(p);  aec_res_reset(res);  anr_reset(nr);  ac_istft_reset(istft);  rng = MCAB_SAMPLE_CNG_RNG_SEED;  [ulcnet_nn_stage_reset(stage);]
+            // mcab_reset() resets the four lanes and the estimator too.
+            // after ANY refused call too: the integrator resets the flow and its own stages together
 
-6. destroy  audio_pipeline_4ch_destroy(p); ...      // NR, stage and bridge each have their own
-7. release  platform_free(pool); ...                // only after step 6
+6. destroy  mcab_destroy(p); aec_destroy(lane) x4; ...   // helper first (mcab_sample_beam_destroy), then mcab, then the lanes;
+                                                      // NR, stage and bridge each have their own
+7. release  platform_free(pool); ...                  // only after step 6
 ```
 
 ### Running the model on the NPU (NN applications)
@@ -173,7 +195,7 @@ no `infer` callback; a `reset` callback is still called on an alignment
 boundary and by the stage's `reset`):
 
 ```
-// ULCNet (samples/ulcnet_nn_stage.h)
+// ULCNet (ulcnet/ulcnet_nn_stage.h)
 ulcnet_nn_stage_begin_complex(stage, beam.spectrum, far, delay);   // mono: ulcnet_nn_stage_begin_time(...)
 if (ulcnet_nn_stage_nn_begin(stage, &job) > 0) {                   // 1 = a frame is open (UlcnetNnJob)
     rc = run_npu(&job);                                            // job outputs are NaN-prefilled; write every one
@@ -181,19 +203,19 @@ if (ulcnet_nn_stage_nn_begin(stage, &job) > 0) {                   // 1 = a fram
 }
 ulcnet_nn_stage_end(stage, out);                                   // WOLA, exactly one hop
 
-// DFN2 (samples/dfn_hop.h): up to two frames per hop through the rate bridge
+// DFN2 (dfn/dfn_hop.h): up to two frames per hop through the rate bridge
 dfn_hop_begin(&hop, e, p);               // P = E.G_res formed first (by the example main)
 while (dfn_hop_nn_begin(&hop, &job) == 1)
     dfn_hop_nn_end(&hop, run_npu(&job));
 dfn_hop_end(&hop, out);
 ```
 
-The 4-channel Align-ULCNet example splits the unit's hop once more for a board that derives a per-bin
-mask and a VAD from the lane spectra of the same hop: `audio_pipeline_4ch_process_front(p, mics, far, &front)`
+The 4-channel Align-ULCNet example splits the sample helper's hop once more for a board that derives a per-bin
+mask and a VAD from the lane spectra of the same hop: `mcab_sample_beam_process_front(b, mics, far, &front)`
 (lanes), the caller reads `front.linear_spectra[0]`, then
-`audio_pipeline_4ch_process_beam(p, &front, vad_raw, vad_out, mask, &beam, &info)` (SRP, BF; `mask`
+`mcab_sample_beam_process_beam(b, &front, vad_raw, vad_out, mask, &beam, &info)` (SRP, BF; `mask`
 may be NULL). `info` returns the DOA (radians, NaN when none), the BF adaptation flag and the
-alignment state (`info.delay`). `process_with_activity(v)` is `process_front` plus
+alignment state (`info.delay`). `mcab_sample_beam_process_with_activity(b, mics, far, v, v, NULL, &beam, &info)` is `process_front` plus
 `process_beam(front, v, v, NULL)`.
 
 A frame that is never fetched, or left open at `end`, takes the

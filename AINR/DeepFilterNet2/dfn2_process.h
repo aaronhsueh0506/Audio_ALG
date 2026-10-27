@@ -47,16 +47,74 @@
 #define DFN2_N_ERB          32
 #define DFN2_DF_BINS        96    /* bins owned by the deep filter (0..95) */
 #define DFN2_DF_ORDER       5     /* FIR taps */
+
+/* The lookahead pair is a model contract: it must equal config.ini [model]
+ * mask_lookahead / df_lookahead of the checkpoint the graph was exported from.
+ * The defaults are the shipped 1/1; a build for another trained pair overrides
+ * both as plain decimals on every translation unit of the build
+ * (-DDFN2_MASK_LOOKAHEAD=0 -DDFN2_DF_LOOKAHEAD=0). Both are part of the
+ * model-I/O descriptor and of the pre/post build hash, so a host built for one
+ * pair refuses a graph description or a pool of another, and objects built for
+ * different pairs do not link (see DFN2_REQUIRE_LOOKAHEAD_PAIR_LINK below).
+ * Valid pairs are 0 <= MASK <= 2 (the mask path reads a three-frame window) and
+ * 0 <= DF < DF_ORDER, independent of each other. */
+#ifndef DFN2_DF_LOOKAHEAD
 #define DFN2_DF_LOOKAHEAD   1     /* future taps */
-#define DFN2_MASK_LOOKAHEAD 1
+#endif
+#ifndef DFN2_MASK_LOOKAHEAD
+#define DFN2_MASK_LOOKAHEAD 1     /* future frames of the input window */
+#endif
+
+#if DFN2_MASK_LOOKAHEAD < 0 || DFN2_MASK_LOOKAHEAD > 2
+#error "DFN2_MASK_LOOKAHEAD must be in [0, 2]: the graph window holds three frames"
+#endif
+#if DFN2_DF_LOOKAHEAD < 0 || DFN2_DF_LOOKAHEAD >= DFN2_DF_ORDER
+#error "DFN2_DF_LOOKAHEAD must be in [0, DFN2_DF_ORDER - 1]: the filter keeps at least its current tap"
+#endif
 
 /* The deep-filter window is [t-(ORDER-LOOKAHEAD-1) .. t+LOOKAHEAD], i.e.
- * [t-3 .. t+1] for the shipped 5/1: ring depth 5, one frame of output delay.
- * DFN2 is a cascade (masked(t+1) waits for mask head(t+1), whose conv lookahead
- * is 1), so the streaming head-to-audio latency is MASK_LOOKAHEAD + DF_LOOKAHEAD
- * = 2 frames. See dfn2_compose_stream(). */
-#define DFN2_DF_HISTORY     (DFN2_DF_ORDER - DFN2_DF_LOOKAHEAD - 1)  /* 3 */
-#define DFN2_DF_RING        DFN2_DF_ORDER                            /* 5 */
+ * [t-3 .. t+1] for the shipped 5/1.
+ * DFN2 is a cascade (masked(t+DF) waits for mask head(t+DF), which needs feature
+ * frame t+DF+MASK_LOOKAHEAD), so the streaming head-to-audio latency is
+ * MASK_LOOKAHEAD + DF_LOOKAHEAD frames (2 for the shipped 1/1, up to 6). See
+ * dfn2_compose_stream().
+ *
+ * Ring depth. At stream frame `current` the heads are those of
+ * head = current - MASK_LOOKAHEAD and the output is target = head - DF_LOOKAHEAD:
+ *   noisy spectra   written at current, read at head and target
+ *                   -> MASK_LOOKAHEAD + DF_LOOKAHEAD + 1 frames live
+ *   masked spectra  written at head, read at the ORDER taps target-HISTORY..head
+ *                   -> ORDER frames live
+ *   coefs/alpha/high band written at head, read at target -> DF_LOOKAHEAD + 1
+ * so the ring is the larger of the first two: 5 up to MASK + DF = 4, 7 for 2/4. */
+#define DFN2_DF_HISTORY     (DFN2_DF_ORDER - DFN2_DF_LOOKAHEAD - 1)
+#define DFN2_DF_RING_NOISY  (DFN2_MASK_LOOKAHEAD + DFN2_DF_LOOKAHEAD + 1)
+#define DFN2_DF_RING \
+    (DFN2_DF_ORDER > DFN2_DF_RING_NOISY ? DFN2_DF_ORDER : DFN2_DF_RING_NOISY)
+
+/* Link-time pair check. dfn2_process.c defines a one-byte symbol named after
+ * the pair it was built for (dfn2_lookahead_mask1_df1 for the shipped 1/1);
+ * dfn2_model_io.c and dfn2_prepost.c execute DFN2_REQUIRE_LOOKAHEAD_PAIR_LINK()
+ * and so reference the symbol of their own pair. An object built for another
+ * pair than dfn2_process.c fails to link with that symbol undefined, instead of
+ * running a window, ring or pool of one pair against a graph of another. The
+ * read is volatile so it survives optimisation and section garbage collection
+ * together with the code that holds it; no other code, allocation or I/O. */
+#define DFN2_LOOKAHEAD_PAIR_SYMBOL_JOIN_(mask, df) \
+    dfn2_lookahead_mask##mask##_df##df
+#define DFN2_LOOKAHEAD_PAIR_SYMBOL_JOIN(mask, df) \
+    DFN2_LOOKAHEAD_PAIR_SYMBOL_JOIN_(mask, df)
+#define DFN2_LOOKAHEAD_PAIR_SYMBOL \
+    DFN2_LOOKAHEAD_PAIR_SYMBOL_JOIN(DFN2_MASK_LOOKAHEAD, DFN2_DF_LOOKAHEAD)
+#ifdef __cplusplus
+extern "C" {
+#endif
+extern const unsigned char DFN2_LOOKAHEAD_PAIR_SYMBOL;
+#ifdef __cplusplus
+}
+#endif
+#define DFN2_REQUIRE_LOOKAHEAD_PAIR_LINK() \
+    ((void)*(const volatile unsigned char *)&DFN2_LOOKAHEAD_PAIR_SYMBOL)
 
 /* ---- Feature normalisation (= config.ini [feature]) ----
  * FEATURE_VERSION must equal train.py's, otherwise the checkpoint and this front
@@ -204,7 +262,8 @@ int dfn2_compose(DFN2State *st,
 /* Streaming/hardware handoff: each call pushes one CURRENT spectrum. With
  * heads_valid=1, erb_mask/coefs/alpha must be the heads the accelerator returned
  * for current_frame-MASK_LOOKAHEAD; heads_valid=0 is for the left warm-up only
- * and the three head pointers may be NULL.
+ * (the first MASK_LOOKAHEAD frames, none when it is 0) and the three head
+ * pointers may be NULL.
  *
  * Because of the cascade, a valid output corresponds to
  * current_frame - MASK_LOOKAHEAD - DF_LOOKAHEAD (2 hops = 21.33 ms at 48 kHz for

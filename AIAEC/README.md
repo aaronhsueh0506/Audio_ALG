@@ -232,7 +232,8 @@ also expose `*_state_generation()`, which counts the times the C side zeroed the
 state (reset, refused commit) so a board with fixed-point accelerator state can
 refill it with quantized zeros. Each is compiled once with the io mode fixed at init: TIME
 (hop in, hop out; the class runs the framing on the caller's `FftHandle`) or
-FREQ (spectrum in, spectrum out; for chaining behind the AEC seam or the 4-channel unit, whose
+FREQ (spectrum in, spectrum out; for chaining behind the AEC seam or the 4-channel path (the sample beam
+helper's beamformed spectrum from `mcab_sample_beam_process()`, or the frame `mcab_fuse()` returns), whose
 spectra are already in this center=False framing). Both AIAEC classes are one
 inference per hop from the first hop. The classes are a third TU on top of
 the two parity-tested files each composes, so those keep their own

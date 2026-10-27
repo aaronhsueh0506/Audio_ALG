@@ -2,7 +2,7 @@
 
 Publishes a scripted ``(delay, solid)`` per hop in place of a live DelayAec.
 Scripted rather than provoked, as the C side drives its admission state
-machine directly (tests/test_4aec_nr_res.c): a live estimator re-offers a
+machine directly (tests/test_mcab.c): a live estimator re-offers a
 movement on every hop, so a held candidate is resolved on the next eligible hop
 and its TTL never runs out, and the scene, not the estimator, must choose the
 hop a lock is published on.

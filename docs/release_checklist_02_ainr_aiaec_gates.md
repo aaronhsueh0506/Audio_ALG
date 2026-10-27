@@ -81,12 +81,19 @@ RNNoise-ERB is deliberately NOT a member: it has its own Makefile and no archive
 make -C AINR SIMD=1 WERROR=1 lib
 make -C AINR SIMD=1 WERROR=1 print-lib-path   # absolute path of THIS config
 make -C AINR SIMD=0 WERROR=1 test
+make -C AINR test-pairs   # DeepFilterNet2/3 lookahead pairs other than the shipped 1/1
 ```
 
 - [ ] Objects, test binaries and the archive are configuration-keyed
       (`build/simd<N>-<sig>/`), so a `SIMD=0` build never hands back the
       `SIMD=1` archive; resolve the archive with `print-lib-path`, never by
       spelling the directory.
+- [ ] DeepFilterNet2 and DeepFilterNet3 lookahead pairs (`mask_lookahead` 0..2,
+      `df_lookahead` 0..4, 15 pairs, shipped 1/1): the Python parts pass for all
+      pairs, and `make -C AINR test-pairs` rebuilds the C hosts only for the
+      pairs the tests list (the six pairs with `D <= M`, and (0,1), (1,3),
+      (2,4)); a pair outside that list is not claimed as tested in C, and the
+      audio quality of any pair other than 1/1 is unmeasured (no checkpoint).
 - [ ] `WERROR=1` actually reaches the compiler.
 - [ ] The SIMD knob changes every member that includes `utility/simd_kernel_nn.h`
       (dfn2/dfn3 `process`, `model_io`, `prepost` and `gtcrn_process`: all seven

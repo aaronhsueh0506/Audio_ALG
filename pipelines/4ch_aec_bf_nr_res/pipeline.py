@@ -2,12 +2,11 @@
 
 This Python reference deliberately does not implement SRP-PHAT or the
 beamformer (bf).  Its production API is split at that ownership boundary, with
-the stage names of the C core (four_aec_front_process / four_aec_fuse)::
+the stage names of the C core (mcab_process_front / mcab_fuse)::
 
-    front = pipeline.front_process(mics, render)
+    front = pipeline.process_front(mics, render)
     bf = external_srp_bf(front.linear_channels)
     post = pipeline.fuse(front, bf)     # context projection only; res_gain is None
-    spec = post.spec_frame()            # the SeSpecFrame the later stages read
 
 The post-beam residual gain is a separate stage, owned by the caller::
 
@@ -15,7 +14,7 @@ The post-beam residual gain is a separate stage, owned by the caller::
     context = suppressor.process(post.context, post.aligned_render)   # res_gain set
 
 The remaining stages (NR gain, min, apply, comfort noise, synthesis) are the
-functions of pipelines/aec_nr_pipeline.py over that context.
+functions of pipelines/mono_aec_nr_res/pipeline.py over that context.
 
 The optional ``Beamformer`` object and ``EqualWeightBeamformer`` exist only for
 integration tests and offline fixtures.  Requiring the external stage to return
@@ -31,10 +30,6 @@ from typing import Optional, Protocol, Sequence
 
 import numpy as np
 
-try:                                    # imported as pipelines.4ch_aec_bf_nr_res
-    from pipelines.se_stage import SeSpecFrame, frame_from_context
-except ImportError:                     # run from the pipelines directory
-    from se_stage import SeSpecFrame, frame_from_context
 from lib.aec.python.modules.config import AecConfig
 from lib.aec.python.modules.dataclasses import AecResContext
 from lib.aec.python.modules.delay.legacy_compat import LegacyDelayShim
@@ -52,8 +47,8 @@ _SUPPORTED_SAMPLE_RATES = (16000, 48000)
 _N_CHANNELS = 4
 
 # Admission of a shared-delay CHANGE (lib/aec's Path B; same values as the C
-# core's FOUR_DELAY_CHANGE_MIN_SAMPLES / _CONFIRM_SAMPLES / _CANDIDATE_TTL in
-# 4aec_nr_res_internal.h): the movement must exceed MIN samples and be offered
+# core's MCAB_DELAY_CHANGE_MIN_SAMPLES / _CONFIRM_SAMPLES / _CANDIDATE_TTL in
+# mcab_internal.h): the movement must exceed MIN samples and be offered
 # again within CONFIRM samples before the held candidate's TTL hops run out.
 _DELAY_CHANGE_MIN_SAMPLES = 32
 _DELAY_CHANGE_CONFIRM_SAMPLES = 16
@@ -65,7 +60,7 @@ _DELAY_CHANGE_CANDIDATE_TTL = 3
 # ---------------------------------------------------------------------------
 
 @dataclass(frozen=True)
-class SharedDelayState:
+class McabDelayState:
     """Observable state of the one shared matched-filter instance.
 
     ``solid``: a usable accepted alignment generation exists; it never leads
@@ -73,7 +68,7 @@ class SharedDelayState:
     generation begins on this hop (first acquisition included, even at applied
     delay 0); consumers flush history derived from the aligned reference.  A
     change while locked must pass the admission rule above.  Same contract as
-    the C core's ``FourAecNrResDelayState`` (4aec_nr_res.h).
+    the C core's ``McabDelayState`` (mcab.h).
     """
 
     delay_samples: int
@@ -140,7 +135,7 @@ class SharedMatchedDelayEstimator:
         capture_proxy: np.ndarray,
         render: np.ndarray,
         proxy_lane_cancelling: bool = False,
-    ) -> SharedDelayState:
+    ) -> McabDelayState:
         """``proxy_lane_cancelling`` mirrors the C core's read of
         ``p->lanes[cfg.capture_proxy_channel]`` in ``update_shared_delay()``:
         True when the lane the estimator is fed from still cancels at the
@@ -175,7 +170,7 @@ class SharedMatchedDelayEstimator:
             if self._pending_ttl <= 0:
                 self._pending_ttl = 0
                 self._pending_delay = 0
-        # Backward-jump quarantine (FourChannelAecConfig
+        # Backward-jump quarantine (McabConfig
         # .delay_backward_quarantine_enabled): only once a usable generation
         # exists and only for an estimate strictly EARLIER than the accepted
         # one.  Armed once per continuous backward episode, then one tick per
@@ -225,7 +220,7 @@ class SharedMatchedDelayEstimator:
         if changed:
             self._accepted_delay = estimated
         self._usable = now_usable
-        return SharedDelayState(
+        return McabDelayState(
             delay_samples=int(self._accepted_delay),
             confidence=float(self._estimator.confidence),
             solid=bool(now_usable),
@@ -273,7 +268,7 @@ class _SharedReferenceDelayLine:
 
 
 @dataclass(frozen=True)
-class BeamformerFrame:
+class McabBeam:
     """One external-beamformer result.
 
     ``weights[ch, bin]`` uses the convention
@@ -285,7 +280,7 @@ class BeamformerFrame:
 
 
 @dataclass(frozen=True)
-class FrontFrame:
+class McabFront:
     """Owned handoff from four linear AEC lanes to external SRP-PHAT/BF.
 
     ``linear_channels`` is ``[hop, 4]``.  ``contexts`` and ``aligned_render``
@@ -300,7 +295,7 @@ class FrontFrame:
     linear_channels: np.ndarray
     contexts: tuple[AecResContext, ...]
     aligned_render: np.ndarray
-    delay: SharedDelayState
+    delay: McabDelayState
 
     @property
     def linear_hops(self) -> np.ndarray:
@@ -311,7 +306,7 @@ class FrontFrame:
 class Beamformer(Protocol):
     def process(
         self, linear_hops: np.ndarray, contexts: Sequence[AecResContext]
-    ) -> BeamformerFrame:
+    ) -> McabBeam:
         ...
 
 
@@ -320,7 +315,7 @@ class EqualWeightBeamformer:
 
     def process(
         self, linear_hops: np.ndarray, contexts: Sequence[AecResContext]
-    ) -> BeamformerFrame:
+    ) -> McabBeam:
         linear_hops = np.asarray(linear_hops, dtype=np.float32)
         if linear_hops.ndim != 2 or linear_hops.shape[0] != _N_CHANNELS:
             raise ValueError("linear_hops must have shape [4, hop]")
@@ -328,23 +323,21 @@ class EqualWeightBeamformer:
             raise ValueError("exactly four AEC contexts are required")
         n_freqs = int(np.asarray(contexts[0].error_spec).size)
         weights = np.full((_N_CHANNELS, n_freqs), 0.25, dtype=np.complex64)
-        return BeamformerFrame(
+        return McabBeam(
             samples=np.mean(linear_hops, axis=0, dtype=np.float32),
             weights=weights,
         )
 
 
 @dataclass(frozen=True)
-class FourChannelAecConfig:
+class McabConfig:
     sample_rate: int = 16000
     frame_size: Optional[int] = None
     hop_size: Optional[int] = None
-    filter_length: Optional[int] = None
     capture_proxy_channel: int = 0
     max_delay_ms: float = 1024.0
-    aec_mode: AecMode = AecMode.PBFDKF
     # Backward-jump quarantine on a shared-delay CHANGE (default off; mirrors
-    # FourAecNrResConfig::delay_backward_quarantine_enabled / _s): an estimate
+    # McabConfig::delay_backward_quarantine_enabled / _s): an estimate
     # strictly EARLIER than the accepted delay is held while the estimator's own
     # capture lane (capture_proxy_channel) still cancels at the applied
     # alignment, and is adopted at the window's expiry or when cancellation
@@ -360,11 +353,11 @@ class FourChannelAecConfig:
                 f"four-channel path supports {_SUPPORTED_SAMPLE_RATES}, got {self.sample_rate}"
             )
         # 16 kHz default is 256/128 (8 ms hop), as the C core's
-        # derive_dims_and_configs (4aec_nr_res.c); 512/256 is an explicit alternate.
+        # derive_flow (mcab.c); 512/256 is an explicit alternate.
         default_frame = 256 if self.sample_rate == 16000 else 1024
         frame = default_frame if self.frame_size is None else int(self.frame_size)
         hop = frame // 2 if self.hop_size is None else int(self.hop_size)
-        # Same whitelist as the C core (4aec_nr_res.c derive_dims_and_configs):
+        # Same whitelist as the C core (mcab.c derive_flow):
         # 16 kHz frame/FFT in {256, 512}, 48 kHz only 1024.
         if self.sample_rate == 16000:
             if frame not in (256, 512):
@@ -383,24 +376,44 @@ class FourChannelAecConfig:
         return frame, hop
 
 
+def mcab_apply_lane_contract(config: McabConfig, lane: AecConfig) -> AecConfig:
+    """Twin of C ``mcab_apply_lane_contract``: the flow's contract stamped onto an
+    application-composed lane config (the flow's grid, no own delay estimation, the
+    linear context returned without a gain of its own).  Every other field is the
+    application's.  Raises ValueError for a lane built for another sample rate."""
+    frame, hop = config.resolved_grid()
+    if lane.sample_rate != config.sample_rate:
+        raise ValueError("the lane config is for another sample rate")
+    return replace(
+        lane,
+        frame_size=frame,
+        hop_size=hop,
+        enable_delay_est=False,
+        fixed_delay_samples=-1,
+        enable_res=False,
+        return_res_context=True,
+    )
+
+
+def mcab_lane_config(config: McabConfig) -> AecConfig:
+    """Twin of C ``mcab_lane_config``: the default lane (PBFDKF, 52 ms filter at 16 kHz,
+    64 ms at 48 kHz) with the contract stamped."""
+    filter_length = config.sample_rate * (64 if config.sample_rate == 48000 else 52) // 1000
+    return mcab_apply_lane_contract(
+        config,
+        AecConfig(sample_rate=config.sample_rate, filter_length=int(filter_length),
+                  mode=AecMode.PBFDKF),
+    )
+
+
 @dataclass(frozen=True)
-class FourChannelFrame:
+class McabFrame:
     frame_index: int
     linear_channels: np.ndarray
     beamformed: np.ndarray
     context: AecResContext
-    delay: SharedDelayState
+    delay: McabDelayState
     aligned_render: np.ndarray
-
-    def spec_frame(self) -> SeSpecFrame:
-        """The borrowed-view equivalent of the C ``four_aec_fuse`` result: E is
-        the beamformed error, y / r2 / comfort noise the projected context, and
-        the residual gain is absent (``g_res_ctx`` None, ``context.res_gain``
-        None).  ``PostBeamResidualSuppressor`` computes the gain from this
-        frame's context and ``aligned_render``."""
-        frame = frame_from_context(self.context, self.beamformed.shape[0])
-        return replace(frame, g_res_ctx=None, delay_changed=self.delay.changed,
-                       delay_locked=bool(self.delay.solid))
 
 
 # ---------------------------------------------------------------------------
@@ -445,7 +458,7 @@ def _require_context_arrays(contexts: Sequence[AecResContext]) -> int:
 
 
 def _fuse_contexts(
-    contexts: Sequence[AecResContext], beamformed: BeamformerFrame
+    contexts: Sequence[AecResContext], beamformed: McabBeam
 ) -> AecResContext:
     """Cross the beamformer boundary without creating a fifth AEC.
 
@@ -743,38 +756,24 @@ class PostBeamResidualSuppressor:
 # Four-channel pipeline
 # ---------------------------------------------------------------------------
 
-class FourChannelAecPipeline:
+class McabPipeline:
     """Pre/post shell around an externally owned SRP-PHAT/BF stage."""
 
     def __init__(
         self,
-        config: Optional[FourChannelAecConfig] = None,
+        config: Optional[McabConfig] = None,
         beamformer: Optional[Beamformer] = None,
+        lane_config: Optional[AecConfig] = None,
     ) -> None:
-        self.config = config or FourChannelAecConfig()
+        """``lane_config``: the application's lane parameters (preset, filter length,
+        ...); the flow stamps its contract onto them.  None selects mcab_lane_config()."""
+        self.config = config or McabConfig()
         frame, hop = self.config.resolved_grid()
         self.frame_size = frame
         self.hop_size = hop
         self.n_freqs = frame // 2 + 1
-        filter_length = (
-            self.config.filter_length
-            if self.config.filter_length is not None
-            else (
-                self.config.sample_rate * (64 if self.config.sample_rate == 48000 else 52)
-                // 1000
-            )
-        )
-        lane_config = AecConfig(
-            sample_rate=self.config.sample_rate,
-            frame_size=frame,
-            hop_size=hop,
-            filter_length=int(filter_length),
-            mode=self.config.aec_mode,
-            enable_delay_est=False,
-            fixed_delay_samples=-1,
-            enable_res=False,
-            return_res_context=True,
-        )
+        lane_config = (mcab_lane_config(self.config) if lane_config is None
+                       else mcab_apply_lane_contract(self.config, lane_config))
         # ``replace`` gives each lane its own config object.
         self._lanes = [AEC(replace(lane_config)) for _ in range(_N_CHANNELS)]
         self._shared_delay = SharedMatchedDelayEstimator(
@@ -820,7 +819,7 @@ class FourChannelAecPipeline:
         (``apply_external_realign`` returns 0 for both), so read the pair
         against the delay trajectory.  The rejection outcome (-1) cannot occur
         here (the lanes resolve to EXTERNAL_ALIGNED).  Mirrors the C core's
-        ``four_aec_nr_res_realign_warm_lane_count()`` pair.
+        ``mcab_realign_warm_lane_count()`` pair.
         """
         return self._realign_warm_lanes
 
@@ -834,16 +833,16 @@ class FourChannelAecPipeline:
         for lane in self._lanes:
             lane.reset()
         self._last_delay = 0
-        # Zeroed with the lanes' state (as four_aec_nr_res_reset()).
+        # Zeroed with the lanes' state (as mcab_reset()).
         self._realign_warm_lanes = 0
         self._realign_soft_lanes = 0
         self._generation += 1
         self._next_pre_frame = 0
         self._next_post_frame = 0
 
-    def front_process(
+    def process_front(
         self, microphones: np.ndarray, render: np.ndarray
-    ) -> FrontFrame:
+    ) -> McabFront:
         """Run only shared alignment and four independent linear AEC lanes."""
         microphones = np.asarray(microphones, dtype=np.float32)
         render = np.asarray(render, dtype=np.float32)
@@ -878,7 +877,7 @@ class FourChannelAecPipeline:
             # cancellation survives and the WOLA sequences continue.
             # ``_last_delay`` is the alignment served before this hop's decision
             # (0 until the estimate first turns solid).  Same sweep as the C
-            # core's four_aec_front_process (4aec_nr_res.c).
+            # flow's mcab_process_front (mcab.c).
             delta = int(delay.delay_samples) - int(self._last_delay)
             for lane in self._lanes:
                 outcome = lane.apply_external_realign(delta)
@@ -901,7 +900,7 @@ class FourChannelAecPipeline:
             )
             contexts.append(_snapshot_context(context))
 
-        frame = FrontFrame(
+        frame = McabFront(
             frame_index=self._next_pre_frame,
             generation=self._generation,
             _owner_token=self._owner_token,
@@ -914,8 +913,8 @@ class FourChannelAecPipeline:
         return frame
 
     def fuse(
-        self, pre: FrontFrame, beamformed: BeamformerFrame
-    ) -> FourChannelFrame:
+        self, pre: McabFront, beamformed: McabBeam
+    ) -> McabFrame:
         """Resume with one external mono/weight result and project the context.
 
         This method does not run SRP-PHAT or update the beamformer's
@@ -924,8 +923,8 @@ class FourChannelAecPipeline:
         ``PostBeamResidualSuppressor``.  Results must be returned in order
         because the shared delay generation is temporal.
         """
-        if not isinstance(pre, FrontFrame):
-            raise TypeError("pre must be a FrontFrame from this pipeline")
+        if not isinstance(pre, McabFront):
+            raise TypeError("pre must be a McabFront from this pipeline")
         if pre._owner_token is not self._owner_token:
             raise ValueError("pre-beamformer frame belongs to a different pipeline")
         if pre.generation != self._generation:
@@ -943,7 +942,7 @@ class FourChannelAecPipeline:
             )
 
         fused = _fuse_contexts(pre.contexts, beamformed)
-        result = FourChannelFrame(
+        result = McabFrame(
             frame_index=pre.frame_index,
             linear_channels=pre.linear_channels.copy(),
             beamformed=samples.copy(),
@@ -954,22 +953,22 @@ class FourChannelAecPipeline:
         self._next_post_frame += 1
         return result
 
-    def process(self, microphones: np.ndarray, render: np.ndarray) -> FourChannelFrame:
+    def process(self, microphones: np.ndarray, render: np.ndarray) -> McabFrame:
         """Test/offline convenience path using an explicitly configured adapter.
         ``result.context.res_gain`` is None."""
         if self._beamformer is None:
             raise RuntimeError(
-                "no beamformer is configured: call front_process(), "
+                "no beamformer is configured: call process_front(), "
                 "run the external SRP-PHAT/BF, then call "
                 "fuse()"
             )
-        pre = self.front_process(microphones, render)
+        pre = self.process_front(microphones, render)
         beamformed = self._beamformer.process(pre.linear_hops, pre.contexts)
         return self.fuse(pre, beamformed)
 
     def process_signal(
         self, microphones: np.ndarray, render: np.ndarray
-    ) -> tuple[np.ndarray, list[AecResContext], list[SharedDelayState]]:
+    ) -> tuple[np.ndarray, list[AecResContext], list[McabDelayState]]:
         """Offline convenience path; production should use the explicit seam.
         The returned contexts carry ``res_gain=None``."""
         if self._beamformer is None:
@@ -985,7 +984,7 @@ class FourChannelAecPipeline:
         n_complete = n_samples // self.hop_size
         output = np.zeros(n_complete * self.hop_size, dtype=np.float32)
         contexts: list[AecResContext] = []
-        delays: list[SharedDelayState] = []
+        delays: list[McabDelayState] = []
         for frame in range(n_complete):
             start = frame * self.hop_size
             stop = start + self.hop_size

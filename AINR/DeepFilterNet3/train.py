@@ -41,6 +41,7 @@ from dataset_gen import (  # noqa: E402
     set_seed,
     split_sizes,
 )
+from onnx_streaming_contract import LOOKAHEAD_CONTRACT_NOTE  # noqa: E402
 from training_common import (  # noqa: E402
     GradNormLog,
     NonFiniteTraining,
@@ -289,9 +290,6 @@ def validate_signal_config(n_fft, win_len, hop_len, n_erb, df_bins, df_order,
         raise ValueError('mask_lookahead must be in [0, 2]')
     if not 0 <= df_lookahead < df_order:
         raise ValueError('df_lookahead must be in [0, df_order)')
-    # The df_lookahead <= mask_lookahead relation is enforced ONCE, in
-    # DeepFilterNet3.__init__ -- every entry point constructs the model, so
-    # re-checking it here would be a fourth independent copy of the same rule.
 
 
 def analysis_scale(n_fft, win_len, hop_len):
@@ -478,9 +476,14 @@ def require_checkpoint_contract(
                 float(got), float(want), rel_tol=1e-7, abs_tol=1e-7
             )
         if not matches:
+            hint = (
+                " " + LOOKAHEAD_CONTRACT_NOTE
+                if key in ('mask_lookahead', 'df_lookahead') else ""
+            )
             raise ValueError(
                 f"{context} {key}={got!r}, runtime requires {want!r}; "
                 "use the training config that belongs to this checkpoint."
+                + hint
             )
 
 

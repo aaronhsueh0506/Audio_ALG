@@ -42,8 +42,8 @@ if _ROOT not in sys.path:
 import torch  # noqa: E402
 import torchaudio  # noqa: E402
 
-from pipelines.dfn2_rate_adapter import CResampler  # noqa: E402
-from pipelines.dfn2_stage import (  # noqa: E402
+from pipelines.dfn.dfn2_rate_adapter import CResampler  # noqa: E402
+from pipelines.dfn.dfn2_stage import (  # noqa: E402
     DF_BINS, HOP, N_FFT, SAMPLE_RATE, dfn2_modules, load_dfn2,
 )
 

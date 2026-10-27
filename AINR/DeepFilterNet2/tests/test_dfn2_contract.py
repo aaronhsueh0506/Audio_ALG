@@ -17,6 +17,10 @@ import torch.nn.functional as F
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 ROOT_PATH = pathlib.Path(ROOT)
 sys.path.insert(0, ROOT)
+# AINR/tests holds dfn_pairs; pytest adds it through AINR/conftest.py, a direct run here.
+_AINR_TESTS = os.path.join(os.path.dirname(ROOT), 'tests')
+if _AINR_TESTS not in sys.path:
+    sys.path.insert(0, _AINR_TESTS)
 
 # Each of the three model projects has its own top-level ``train.py`` (and
 # ``inference.py``/``model.py``). Under a single pytest session the first one
@@ -68,7 +72,15 @@ from export_onnx import (  # noqa: E402
     feature_windows,
     gru_state_slice_report,
     initial_inputs as streaming_export_inputs,
+    window_frames,
+    window_alignment,
 )
+
+import dfn_pairs  # noqa: E402
+
+# Every (mask_lookahead, df_lookahead) pair the model accepts; each one must
+# export and stream.
+LOOKAHEAD_PAIRS = list(dfn_pairs.accepted_pairs('DeepFilterNet2'))
 
 
 def c_macro(header_text, name):
@@ -293,14 +305,12 @@ def test_checkpoint_contract_rejects_legacy_and_accepts_current():
         raise AssertionError('legacy checkpoint was accepted')
 
 
-def test_stateless_export_replays_heads_with_explicit_state():
+@pytest.mark.parametrize('mask_lookahead,df_lookahead', LOOKAHEAD_PAIRS)
+def test_stateless_export_replays_heads_with_explicit_state(
+        mask_lookahead, df_lookahead):
     """Three feature frames plus returned state must equal offline heads."""
     torch.manual_seed(73)
-    model = DeepFilterNet2(
-        n_fft=512, sr=16000, n_erb=32, df_bins=64,
-        enc_ch=8, emb_size=32, df_hidden=32,
-        lin_groups=4, enc_lin_groups=4,
-    ).eval()
+    model = _small_dfn2(mask_lookahead, df_lookahead)
     wrapper = StatelessDFN2Heads(model).eval()
     frames = 9
     erb = torch.randn(1, 1, frames, model.n_erb)
@@ -311,7 +321,8 @@ def test_stateless_export_replays_heads_with_explicit_state():
         state = streaming_export_inputs(model)[2:]
         streamed = [[], [], []]
         for erb_window, spec_window in zip(
-            feature_windows(erb), feature_windows(spec)
+            feature_windows(erb, mask_lookahead),
+            feature_windows(spec, mask_lookahead),
         ):
             output = wrapper(erb_window, spec_window, *state)
             for index in range(3):
@@ -401,11 +412,12 @@ def test_c_model_io_layout_constants_match_the_shipped_export_shapes():
     )
 
 
-def _small_dfn2():
+def _small_dfn2(mask_lookahead=1, df_lookahead=1):
     return DeepFilterNet2(
         n_fft=512, sr=16000, n_erb=32, df_bins=64,
         enc_ch=8, emb_size=32, df_hidden=32,
         lin_groups=4, enc_lin_groups=4,
+        mask_lookahead=mask_lookahead, df_lookahead=df_lookahead,
     ).eval()
 
 
@@ -489,6 +501,8 @@ def test_state_layout_version_is_pinned_to_the_c_header(tmp_path):
         {'SR': 16000, 'N_FFT': 512, 'WIN_LEN': 512, 'HOP_LEN': 256},
         inputs,
         outputs,
+        model.mask_lookahead,
+        model.df_lookahead,
     )
     header_version = c_macro(model_io_header(),
                              'DFN2_MODEL_IO_LAYOUT_VERSION')
@@ -508,6 +522,130 @@ def test_state_layout_version_is_pinned_to_the_c_header(tmp_path):
         'h_gru': 'h_gru_out',
         'df_convp_history': 'df_convp_history_out',
     }
+
+
+def test_the_tested_pairs_are_the_fifteen_legal_pairs():
+    """The legal set is mask_lookahead in [0, 2] and df_lookahead in
+    [0, df_order - 1], independent of each other: 15 pairs. The test pairs are
+    probed from the model constructor (``dfn_pairs.accepted_pairs``), so this
+    is the one place the rule is stated."""
+    cfg = load_config()
+    df_order = read_model_config(cfg)['df_order']
+    assert LOOKAHEAD_PAIRS == [(mask, df) for mask in range(3)
+                               for df in range(df_order)]
+    assert len(LOOKAHEAD_PAIRS) == 15
+    assert dfn_pairs.shipped_pair('DeepFilterNet2') in LOOKAHEAD_PAIRS
+
+
+def test_window_alignment_names_the_frames_the_host_must_supply():
+    """The shipped string is unchanged; the others follow from the padding."""
+    assert window_alignment(1) == '[t-1,t,t+1] -> heads[t]'
+    assert window_alignment(0) == '[t-2,t-1,t] -> heads[t]'
+    assert window_alignment(2) == '[t,t+1,t+2] -> heads[t]'
+
+
+@pytest.mark.parametrize('mask_lookahead', [0, 1, 2])
+def test_feature_windows_hold_frames_t_minus_2_plus_L_through_t_plus_L(
+        mask_lookahead):
+    """Each slot of window t is frame t-(2-L)+slot, or zero off either end.
+
+    Independent of the model: the frames carry their own index, so any
+    off-by-one padding shows as a wrong number in a named slot."""
+    frames = 6
+    feature = torch.arange(1, frames + 1, dtype=torch.float32)
+    feature = feature.view(1, 1, frames, 1).expand(1, 1, frames, 3).contiguous()
+    windows = list(feature_windows(feature, mask_lookahead))
+    assert len(windows) == frames
+    for t, window in enumerate(windows):
+        assert tuple(window.shape) == (1, 1, INPUT_FRAMES, 3)
+        for slot in range(INPUT_FRAMES):
+            source = t - (INPUT_FRAMES - 1 - mask_lookahead) + slot
+            want = float(source + 1) if 0 <= source < frames else 0.0
+            assert float(window[0, 0, slot, 0]) == want, (t, slot)
+
+
+def test_mask_lookahead_outside_the_three_frame_window_names_the_contract():
+    for bad in (-1, 3):
+        with pytest.raises(ValueError, match='model contract'):
+            window_frames(bad)
+        with pytest.raises(ValueError, match='model contract'):
+            window_alignment(bad)
+        # Checked when the iterator is built, not when its first window is
+        # taken.
+        with pytest.raises(ValueError, match='fresh training run'):
+            feature_windows(torch.zeros(1, 1, 4, 3), bad)
+
+
+def test_the_host_window_must_match_the_convolution_padding():
+    """The window is derived from mask_lookahead, the padding from the module
+    that was built: a model whose recorded lookahead disagrees with its
+    convolution is refused rather than exported with a mis-aligned window."""
+    model = _small_dfn2(1, 1)
+    model.mask_lookahead = 0
+    with pytest.raises(ValueError, match='pads time'):
+        StatelessDFN2Heads(model)
+
+
+@pytest.mark.parametrize('mask_lookahead,df_lookahead', LOOKAHEAD_PAIRS)
+def test_export_metadata_publishes_the_lookahead_pair(
+        tmp_path, mask_lookahead, df_lookahead):
+    """The pair and the window it implies are in the graph's metadata, so a
+    host built for another pair is detectable from the exported artefact."""
+    checkpoint = tmp_path / 'ckpt.pth'
+    checkpoint.write_bytes(b'only hashed')
+    model = _small_dfn2(mask_lookahead, df_lookahead)
+    wrapper = StatelessDFN2Heads(model).eval()
+    inputs = wrapper.initial_inputs()
+    with torch.no_grad():
+        outputs = wrapper(*inputs)
+    metadata = build_metadata(
+        str(checkpoint),
+        {'SR': 16000, 'N_FFT': 512, 'WIN_LEN': 512, 'HOP_LEN': 256},
+        inputs, outputs, wrapper.mask_lookahead, wrapper.df_lookahead,
+    )
+    assert metadata['mask_lookahead'] == mask_lookahead
+    assert metadata['df_lookahead'] == df_lookahead
+    assert metadata['input_window_alignment'] == window_alignment(
+        mask_lookahead)
+    assert metadata['input_feature_frames'] == INPUT_FRAMES
+
+
+def test_config_lookahead_pair_is_pinned_to_the_c_header_defaults():
+    """config.ini names the pair a checkpoint is trained for; the C build's
+    default constants must be the same pair, or the shipped host and the
+    shipped training config describe different models. A build for another
+    pair overrides the macros (-DDFN2_MASK_LOOKAHEAD=..) and is a deliberate
+    act; the defaults are what ships."""
+    model_cfg = read_model_config(load_config())
+    process = (ROOT_PATH / 'dfn2_process.h').read_text(encoding='utf-8')
+    assert model_cfg['mask_lookahead'] == c_macro(
+        process, 'DFN2_MASK_LOOKAHEAD')
+    assert model_cfg['df_lookahead'] == c_macro(process, 'DFN2_DF_LOOKAHEAD')
+
+
+def test_changing_the_lookahead_pair_of_a_checkpoint_asks_for_retraining():
+    cfg = load_config()
+    feature_cfg = read_feature_config(cfg, 48000, 512)
+    loss_cfg = read_loss_config(cfg)
+
+    def contract(mask, df):
+        return make_checkpoint_contract(
+            sr=48000, n_fft=1024, win_len=1024, hop_len=512, n_erb=32,
+            df_bins=96, df_order=5, mask_lookahead=mask, df_lookahead=df,
+            mask_pf=False, pf_beta=0.02, feature_cfg=feature_cfg,
+            loss_cfg=loss_cfg,
+        )
+
+    trained = {
+        'model_version': MODEL_VERSION,
+        'feature_version': FEATURE_VERSION,
+        'loss_version': LOSS_VERSION,
+        'contract': contract(1, 1),
+    }
+    require_checkpoint_contract(trained, contract(1, 1))
+    for mask, df in ((1, 0), (0, 0), (2, 1)):
+        with pytest.raises(ValueError, match='fresh training run'):
+            require_checkpoint_contract(trained, contract(mask, df))
 
 
 if __name__ == '__main__':
@@ -645,16 +783,21 @@ def test_model_to_loss_backward_is_finite_on_a_silent_target():
     assert grads, 'no parameter received a gradient'
     for grad in grads:
         assert torch.isfinite(grad).all()
-def test_lookahead_relation_is_enforced_in_the_model_constructor():
-    """df_lookahead > mask_lookahead must be rejected at the single source.
+def test_lookahead_ranges_are_enforced_in_the_model_constructor():
+    """Each lookahead is checked against its own range, at the single source.
 
     Guards against the invariant drifting back out into per-entry-point copies:
     train.py and inference.py deliberately do not check it, so if the
-    constructor stops enforcing it nothing does.
+    constructor stops enforcing it nothing does. The two are independent: a
+    deep filter may look further ahead than the mask path.
     """
     cfg = load_config()
-    with pytest.raises(ValueError, match='mask_lookahead'):
-        build_shipped_model(cfg, mask_lookahead=0, df_lookahead=1)
+    df_order = read_model_config(cfg)['df_order']
+    for bad in ({'mask_lookahead': 3}, {'mask_lookahead': -1},
+                {'df_lookahead': df_order}, {'df_lookahead': -1}):
+        with pytest.raises(ValueError, match='_lookahead'):
+            build_shipped_model(cfg, **bad)
+    build_shipped_model(cfg, mask_lookahead=0, df_lookahead=df_order - 1)
     # The shipped pairing must remain constructible.
     build_shipped_model(cfg)
 
@@ -937,7 +1080,9 @@ def test_gru_state_rows_are_routed_to_their_own_gru():
         'the encoder row feeds the embedding both decoders read')
 
 
-def test_stateless_graph_chain_is_the_offline_stream_in_both_state_tensors():
+@pytest.mark.parametrize('mask_lookahead,df_lookahead', LOOKAHEAD_PAIRS)
+def test_stateless_graph_chain_is_the_offline_stream_in_both_state_tensors(
+        mask_lookahead, df_lookahead):
     """The window the graph returns is the next call's input, unchanged.
 
     ``h_gru_out`` and ``df_convp_history_out`` are fed straight back for
@@ -946,7 +1091,7 @@ def test_stateless_graph_chain_is_the_offline_stream_in_both_state_tensors():
     returned at hop t is exactly the last five frames the pathway has seen.
     """
     torch.manual_seed(74)
-    model = _small_dfn2()
+    model = _small_dfn2(mask_lookahead, df_lookahead)
     wrapper = StatelessDFN2Heads(model).eval()
     frames = 12
     erb = torch.randn(1, 1, frames, model.n_erb)
@@ -957,7 +1102,8 @@ def test_stateless_graph_chain_is_the_offline_stream_in_both_state_tensors():
         heads = []
         windows = []
         for erb_window, spec_window in zip(
-                feature_windows(erb), feature_windows(spec)):
+                feature_windows(erb, mask_lookahead),
+                feature_windows(spec, mask_lookahead)):
             output = wrapper(erb_window, spec_window, *state)
             heads.append(output[1])
             windows.append(output[4])
@@ -1188,6 +1334,8 @@ def test_fixed_batch_metadata_publishes_static_lane_count(tmp_path):
         {'SR': 16000, 'N_FFT': 512, 'WIN_LEN': 512, 'HOP_LEN': 256},
         inputs,
         outputs,
+        model.mask_lookahead,
+        model.df_lookahead,
     )
     assert metadata['fixed_batch_size'] == 4
     assert metadata['batch_semantics'] == 'independent_streaming_lanes'

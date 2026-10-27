@@ -10,7 +10,7 @@ the `expected` descriptor if one was passed); it has no visibility into the
 platform allocator, DMA engine, or power state behind that pointer.
 
 - **16-byte alignment**: every pool pointer is aligned exactly as
-  the size query reports (16 today). `audio_pipeline_4ch_init_ex()` and `aec_init()` reject a
+  the size query reports (16 today). `mcab_init_ex()` and `aec_init()` reject a
   misaligned `mem` argument, but only if one is actually passed in
   misaligned — the platform allocator itself must honor the alignment it
   was asked for.
@@ -22,7 +22,7 @@ platform allocator, DMA engine, or power state behind that pointer.
   allocation, DMA buffer, or another instance's pool — every
   sub-module pointer inside a pool is a raw pointer into it, not a copy,
   so an overlapping region is silent memory corruption, not a caught error.
-  The NR/synthesis block and the unit's block (or `Aec` block) must not overlap each other.
+  The NR/synthesis block, the flow's pool, each lane and the estimator (or the `Aec` block) must not overlap each other.
 - **Exclusive lifetime**: nothing else reads or writes a pool for the
   entire lifetime of its handle, from `init` through
   the matching `destroy` — no other task, ISR, or DMA
@@ -42,7 +42,7 @@ platform allocator, DMA engine, or power state behind that pointer.
   so there is nothing on ITS side to roll back, but the caller's own
   pool-acquisition failure handling is not something a library can verify.
 - **Reset / reconfigure / double-destroy / power-resume**: exercise
-  the paired reset (`aec_reset()`/`audio_pipeline_4ch_reset()` with `aec_res_reset()` (4ch), `anr_reset()`, `ac_istft_reset()` and any
+  the paired reset (`aec_reset()`/`mcab_reset()` with `aec_res_reset()` (4ch), `anr_reset()`, `ac_istft_reset()` and any
   neural stage reset — echo-path change), a full destroy-then-
   re-`init` on the SAME pool (config change), calling
   `destroy` twice in a row (must be a safe no-op the
@@ -190,6 +190,15 @@ Guard rails (all four repos):
   `libc++` on macOS/clang) — there is no hardcoded `-lc++`, so GNU
   toolchains link cleanly.
 
+**Board sample build notes.** The board samples live outside this repository and are built from the same
+library sources. Their build lists drop `fix_gain.c` and the `third_party/gain` include path (the
+samples apply their input gain with a small `InputGain` helper over `sk_scale_f32()` and `sk_clip_f32()`).
+A DeepFilterNet2 lookahead pair other than 1/1 is passed as `-DDFN2_MASK_LOOKAHEAD=<M> -DDFN2_DF_LOOKAHEAD=<D>` to
+**every** unit that includes the DFN2 headers (the `AINR/DeepFilterNet2` sources, `dfn_res_stage.c`,
+`dfn_rate_bridge.c` and the sample's own units); units built for different pairs fail to link, and the
+checkpoint must be the one trained for that pair. `alg_ai3_dfn.c` and `uvc_ai_nr_stream.c` hard-code mask and
+deep-filter lookahead 1 with a static assert, so they build only with the default pair.
+
 ## Compile flags (`EXTRA_CFLAGS`)
 
 `../pipelines/Makefile` passes `EXTRA_CFLAGS` through to the `lib/aec` and
@@ -222,7 +231,7 @@ is rejected at parse time:
 
 ```
 $ make EXTRA_CFLAGS=-ffast-math
-Makefile:217: *** FP policy conflict: CFLAGS/EXTRA_CFLAGS contains -ffast-math; this repo pins -ffp-contract=off; remove -ffast-math from EXTRA_CFLAGS.  Stop.
+Makefile:387: *** FP policy conflict: CFLAGS/CXXFLAGS/CPPFLAGS/EXTRA_CFLAGS contains -ffast-math; this repo pins -ffp-contract=off; remove -ffast-math from CFLAGS/CXXFLAGS/CPPFLAGS/EXTRA_CFLAGS.  Stop.
 ```
 
 `../../audiolib/common/scripts/audit_fp_contract.sh` is the disassembly-level

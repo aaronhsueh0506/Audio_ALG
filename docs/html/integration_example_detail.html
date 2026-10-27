@@ -3,7 +3,7 @@
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
-<title>串接範例細節:DEBUG 現況</title>
+<title>串接範例細節:mcab 序列與 DEBUG 現況</title>
 <style>
 body{font-family:-apple-system,"PingFang TC","Noto Sans TC",sans-serif;margin:0 auto;padding:0 1rem 3rem;line-height:1.55;color:#1a1a1a;max-width:70rem}
 nav{padding:.6rem 0;border-bottom:2px solid #2a6;margin-bottom:1rem;font-size:.95rem}
@@ -42,8 +42,32 @@ pre code{background:none;padding:0}
 <a href="integration_example_detail.html"><b>串接範例細節</b></a>
 </nav>
 
-<h1>串接範例細節 — 出貨板上還剩什麼 DEBUG 觀測面</h1>
-<p class="small">本頁是 <a href="integration_example.html">串接範例</a> 第 7 節的完整內容(release build 的實測結論、板端監看迴圈、已知盲點);串接骨架、四個範例、layout_version 與整合檢查清單仍留在原頁。</p>
+<h1>串接範例細節 — mcab 的 front／fuse 序列與出貨板上還剩什麼 DEBUG 觀測面</h1>
+<p class="small">本頁收 <a href="integration_example.html">串接範例</a> 的兩段細節:第 4 節 mcab 的 front 與 fuse 兩半的內部呼叫序列,以及第 7 節的完整內容(release build 的實測結論、板端監看迴圈、已知盲點);串接骨架、四個範例、layout_version 與整合檢查清單仍留在原頁。</p>
+
+<h2>4. mcab 的 front／fuse 呼叫序列</h2>
+<h3>4.1 front 半的呼叫序列(重點在 far-FFT 共用)</h3>
+<pre>1. skn_all_finite_f32(mic_interleaved, hop*4) &amp;&amp; skn_all_finite_f32(ref, hop)   ← 唯一的輸入 NaN gate
+2. de-interleave proxy channel → mic_lane
+3. update_shared_delay(...)          ← duty 決策 + matched filter + ERLE watchdog
+4. align_render(ref, delay)  → aligned_ref
+5. if (delay.changed) 四 lane 各跑 aec_apply_external_realign(lanes[ch], delta)
+6. for ch in 0..3:
+     de-interleave lane ch
+     ch==0 : aec_process_context(lanes[0], mic_lane, aligned_ref)
+     ch!=0 : aec_process_context_shared_far_from(lanes[ch], mic_lane, aligned_ref, lanes[0])
+     aec_get_res_context(lanes[ch], &amp;context)
+     bind_lane_view(&amp;snapshots[ch], &amp;context)          ← 借指標,不複製
+7. front-valid 旗標置位(mcab_fuse 的序列閘)</pre>
+<div class="note"><b>四條 lane 這一 hop 看到同一個 <code>aligned_ref</code> 指標</b>,所以其他三條可借用 lane 0 的 far 頻譜 → <b>4 次 far-FFT/hop 變成 1 次</b>(混合 warm／soft realign 的 hop 改為各 lane 自算,見 <a href="pipeline_4ch_params.html">pipeline_4ch_params</a>)。這是 <code>aec_process_context_shared_far_from()</code> 存在的理由,也是它嚴格的 same-hop/same-reference 前提的由來。</div>
+<h3>4.2 fuse 半</h3>
+<pre>1. front-valid 檢查                         ← 序列協定
+2. mcab_weights_valid():逐元 isfinite + Σ|.| > 1e-12
+3. fuse_contexts():coherent projection,四 lane far_power 一致性檢查,投影結果與 beamformed 頻譜的有限檢查
+   (失敗 → MCAB_DSP_ERROR,mcab 已 reset)
+   → 填 McabFrame(e/y/x/r2/cn/far_hop/formed_hop/max_dt/max_sat/all_converged/delay 旗標)</pre>
+
+
 
 <h2>7. DEBUG:出貨板上還剩什麼</h2>
 <p>這一節只描述<b>現況</b>。要新增哪些 DEBUG 資訊的評估與提案,見 <code>docs/debug_observability_zh_TW.md</code>。</p>
@@ -51,8 +75,8 @@ pre code{background:none;padding:0}
 <p>以 <code>NO_STDIO=1</code> 建出 archive 後用 <code>nm</code> 檢查,結果是一個很乾淨的分界:</p>
 <div class="tblwrap"><table>
 <tr><th>類別</th><th class="ok">存活</th><th class="dead">消失</th></tr>
-<tr><td><b>狀態快照(pull)</b></td><td><code>aec_debug_status</code>、<code>aec_get_res_context</code>、<code>aec_get_linear_context</code>、<code>aec_linear_is_cancelling</code>、<code>aec_far_fft_real_compute_count</code>、<code>aec_get_mem_breakdown</code>、<code>anr_debug_status</code>、<code>anr_get_gain/_noise_psd</code>、4ch 的全部 census/counter accessor</td><td>—</td></tr>
-<tr><td><b>耗時</b></td><td>函式在(<b>回 0</b>)</td><td><b>全部數值</b>(<code>AecStageTiming</code>／<code>FourAecNrResLastTiming</code>)</td></tr>
+<tr><td><b>狀態快照(pull)</b></td><td><code>aec_debug_status</code>、<code>aec_get_res_context</code>、<code>aec_get_linear_context</code>、<code>aec_linear_is_cancelling</code>、<code>aec_far_fft_real_compute_count</code>、<code>aec_get_mem_breakdown</code>、<code>anr_debug_status</code>、<code>anr_get_gain/_noise_psd</code>、4ch 的全部 census/counter accessor(<code>mcab_*_count()</code>、<code>mcab_duty_hops_*()</code> 等)</td><td>—</td></tr>
+<tr><td><b>耗時</b></td><td>函式在(<b>回 0</b>)</td><td><b>全部數值</b>(<code>AecStageTiming</code>／<code>McabLastTiming</code>)</td></tr>
 <tr><td><b>Log / trace(push)</b></td><td>—</td><td><b>全部</b>:<code>aec_debug_set_level/_log/_frame</code>、<code>aec_debug_set_trace</code>、<code>AecDebugTraceRow</code> 的 CSV 14 欄</td></tr>
 <tr><td><b>錯誤碼</b></td><td>全部</td><td>—</td></tr>
 <tr><td><b>Finite guards</b></td><td>全部(不受任何開關影響)</td><td>—</td></tr>
@@ -84,7 +108,7 @@ log("delay=%d conf=%.1f upd=%d erle=%.1fdB usable=%d conv=%d "
 <ul>
 <li><code>aec_get_last_timing()</code> 回全 0 <b>不代表很快</b>——代表沒有用 <code>PROFILE=1</code> 建 library。而且函式<b>不會告訴你</b>它沒被啟用。</li>
 <li><code>delay_updates</code> 是 matched-filter 的<b>更新總數</b>,<b>不區分</b>「同一值重複確認」與「跳到新值」,不能當成 lock 穩定度指標。</li>
-<li><code>near_power</code>／<code>out_power</code> 是 <b>EMA(alpha=0.95)</b>,不是瞬時值;<code>duty_*</code> 會被 <code>reset()</code> 清零。</li>
+<li><code>near_power</code>／<code>out_power</code> 是逐樣本的 <b>EMA</b>(alpha = 0.95^(16000/取樣率),16 kHz 為 0.95),不是瞬時值;<code>duty_*</code> 會被 <code>reset()</code> 清零。</li>
 </ul></div>
 
 <h3>7.3 現況的已知盲點(整合前先知道)</h3>
@@ -96,10 +120,10 @@ log("delay=%d conf=%.1f upd=%d erle=%.1fdB usable=%d conv=%d "
 <tr><td class="dead">self-reset 不計數</td><td><code>DSP_ERROR</code> 路徑會內部呼叫 <code>reset()</code>,而 <code>reset()</code> 本身<b>清掉所有 instrumentation</b>(realign counters／duty census 全歸零)→ 一次 self-reset 之後「之前發生過什麼」在計數器上完全消失</td></tr>
 <tr><td class="dead">delay lock 遺失不計數</td><td><code>AecLinearContext.delay_state</code> 與 <code>generation</code> 每 hop 可讀,但 <code>AecDebugStatus</code> <b>兩者都沒有</b> → 只 poll <code>aec_debug_status()</code> 的整合者<b>看不到 lock 的丟失與重獲</b></td></tr>
 <tr><td class="dead">NN fail-open 是靜默的</td><td>三種 fallback 走<b>同一條 else 分支、無區別、無計數</b> → 「NPU 掛了整段跑 identity」與「NPU 正常但某幾 frame 吐 NaN」<b>從外部無法區分</b></td></tr>
-<tr><td class="dead">4ch init 失敗<b>一個字都不說</b></td><td>核心與單元的 <code>init_ex()</code> 8 項檢查任一失敗都<b>靜默回 NULL</b>。mono 的 <code>aec_init()</code>／<code>anr_init()</code>／<code>ac_istft_init()</code> 也沒有任何診斷輸出,只回 NULL(大小查詢回 0);mono 沒有 descriptor 閘,所以「過小／未對齊／無效 config」三種原因從回傳值分不出來,要在呼叫前自己比對 <code>*_get_mem_size()</code> 與 pool 的大小和對齊</td></tr>
-<tr><td class="dead">幾乎沒有 frame counter</td><td>mono(<code>Aec</code>、<code>AnrDenoiser</code>、<code>AcIstft</code>)與 NN stage <b>都沒有</b> frame counter 的 public accessor;4ch 單元只在 <code>AudioPipeline4ChFrameInfo.frame_index</code> 給(且 self-reset 後歸零)→ 「這條 stream 到目前為止處理了幾個 hop」多半答不出來,遑論 xrun</td></tr>
-<tr><td class="dead">mono 沒有內建 finite 守衛</td><td><code>aec_process_context()</code> 與 <code>se_anr_stage_gain()</code> 輸入不檢、輸出不檢;輸出有限性要整合者自己用 <code>se_hop_is_finite()</code> 檢查(範例這樣做)。4ch 核心／單元的輸入有檢查(<code>four_aec_front_process()</code>)</td></tr>
-<tr><td class="dead">兩條 ULCNet 範例的 stage 沒有觀測面</td><td><code>ulcnet_nn_stage</code> 沒有診斷 accessor(沒有 model 呼叫計數、沒有 reprime 計數);mono 範例手上有 <code>Aec</code> handle,4ch 單元提供 <code>audio_pipeline_4ch_get_core()</code>、<code>_last_core_timing()</code> 與 <code>AudioPipeline4ChFrameInfo</code>(DOA、BF 適應、delay 狀態)。stage 這一側的狀態(reprime、fail-open 次數)對整合者不可達</td></tr>
+<tr><td class="dead">4ch init 失敗<b>一個字都不說</b></td><td><code>mcab_init_ex()</code> 的 8 項檢查與 lane／estimator 驗證任一失敗,以及 <code>mcab_sample_beam_init()</code> 失敗,都<b>靜默回 NULL</b>。mono 的 <code>aec_init()</code>／<code>anr_init()</code>／<code>ac_istft_init()</code> 也沒有任何診斷輸出,只回 NULL(大小查詢回 0);mono 沒有 descriptor 閘,所以「過小／未對齊／無效 config」三種原因從回傳值分不出來,要在呼叫前自己比對 <code>*_get_mem_size()</code> 與 pool 的大小和對齊</td></tr>
+<tr><td class="dead">幾乎沒有 frame counter</td><td>mono(<code>Aec</code>、<code>AnrDenoiser</code>、<code>AcIstft</code>)與 NN stage <b>都沒有</b> frame counter 的 public accessor;4ch 的 helper 只在 <code>McabSampleBeamInfo.frame_index</code> 給(且 <code>mcab_sample_beam_reset()</code> 後歸零)→ 「這條 stream 到目前為止處理了幾個 hop」多半答不出來,遑論 xrun</td></tr>
+<tr><td class="dead">mono 沒有內建 finite 守衛</td><td><code>aec_process_context()</code> 與 <code>anr_process_gain()</code> 輸入不檢、輸出不檢;輸出有限性要整合者自己用 <code>skn_all_finite_f32()</code> 檢查(<code>example_board_adapter.c</code> 這樣做,<code>main.c</code> 的 CLI 本身不做)。4ch 的輸入有檢查(<code>mcab_process_front()</code>)</td></tr>
+<tr><td class="dead">兩條 ULCNet 範例的 stage 沒有觀測面</td><td><code>ulcnet_nn_stage</code> 沒有診斷 accessor(沒有 model 呼叫計數、沒有 reprime 計數);mono 範例手上有 <code>Aec</code> handle,4ch 範例手上有 <code>Mcab*</code>(<code>mcab_get_last_timing()</code> 與計數器 accessor)與 helper 填的 <code>McabSampleBeamInfo</code>(DOA、BF 適應、delay 狀態)。stage 這一側的狀態(reprime、fail-open 次數)對整合者不可達</td></tr>
 </table></div>
 
 <h2>相關檔案與測試路徑</h2>

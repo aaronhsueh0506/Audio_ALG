@@ -1,0 +1,124 @@
+/* Fixtures shared by the DFN2 pipeline tests and the board skeletons: the
+ * unit ERB partition that makes the fail-open path an exact identity, a
+ * deterministic far-end, and an identity model callback. stdio-free. */
+#ifndef DFN_TEST_FIXTURE_H
+#define DFN_TEST_FIXTURE_H
+
+#include <math.h>
+#include <stdint.h>
+#include <string.h>
+
+#include "dfn2_prepost.h"
+#include "dfn/dfn_unit_partition.h"
+#include "audio_window.h"
+
+/* The periodic sqrt-Hann window the pipelines analyse and synthesise with. */
+static inline void dfn_fixture_root_hann(float *window, int n) {
+    ac_window_build(window, n);
+}
+
+/* Uniform noise in [-0.25, 0.25) from the LCG the sibling tests use. */
+static inline void dfn_fixture_lcg_far(float *dst, size_t count, uint32_t seed) {
+    size_t i;
+    for (i = 0; i < count; ++i) {
+        seed = seed * 1664525u + 1013904223u;
+        dst[i] = ((float)(int)(seed >> 9) / 4194304.0f - 1.0f) * 0.25f;
+    }
+}
+
+/* A band-limited far-end (16 tones between 211 and 2999 Hz, fixed phases)
+ * for the native-grid gates: rich enough for the AEC to adapt on, and
+ * inside the resamplers' pass band, so the round trip through the rate
+ * bridge is compared where it is specified to be transparent. */
+static inline void dfn_fixture_multitone(float *dst, size_t count,
+                                         int sample_rate) {
+    static const float tones[16] = {
+        211.0f, 347.0f, 503.0f, 659.0f, 811.0f, 977.0f, 1123.0f, 1301.0f,
+        1487.0f, 1693.0f, 1901.0f, 2129.0f, 2357.0f, 2609.0f, 2803.0f, 2999.0f };
+    size_t i;
+    int k;
+    for (i = 0; i < count; ++i) {
+        float t = (float)i / (float)sample_rate, v = 0.0f;
+        for (k = 0; k < 16; ++k)
+            v += 0.06f * sinf(2.0f * 3.14159265f * tones[k] * t + (float)k);
+        dst[i] = v;
+    }
+}
+
+/* Test-side Hann-windowed-sinc low-pass (odd `taps`, zero-phase by
+ * compensating the group delay), so a native-grid comparison measures the
+ * rate bridge inside the resamplers' pass band: the conventional pipeline's
+ * own output carries low-level content up to Nyquist (adaptation noise,
+ * gain switching) that the bridge's FIR round trip is specified to remove. */
+static inline void dfn_fixture_lowpass(const float *in, float *out, int n,
+                                       int taps, float cutoff_norm) {
+    double kernel[257];
+    double wsum = 0.0;
+    int half = taps / 2, i, k;
+    if (taps > 257) taps = 257, half = 128;
+    for (k = -half; k <= half; ++k) {
+        double x = 2.0 * (double)cutoff_norm * (double)k;
+        double sinc = k == 0 ? 1.0 : sin(3.14159265358979 * x) / (3.14159265358979 * x);
+        double w = 0.5 + 0.5 * cos(3.14159265358979 * (double)k / (double)(half + 1));
+        kernel[k + half] = 2.0 * (double)cutoff_norm * sinc * w;
+        wsum += kernel[k + half];
+    }
+    for (i = 0; i < n; ++i) {
+        double acc = 0.0;
+        for (k = -half; k <= half; ++k) {
+            int j = i + k;
+            if (j >= 0 && j < n) acc += kernel[k + half] * (double)in[j];
+        }
+        out[i] = (float)(acc / wsum);
+    }
+}
+
+/* A model whose heads are the exact identity: unit ERB mask, zero deep
+ * filter, alpha 0. The recurrent state passes through unchanged by writing
+ * nothing: each state output is the same buffer as its input. */
+static inline int dfn_fixture_identity_infer(void *user, const DFN2PrepostInputs *in,
+                                      DFN2PrepostOutputs *out) {
+    size_t i;
+    (void)user;
+    (void)in;
+    for (i = 0; i < out->erb_mask_elements; ++i) out->erb_mask[i] = 1.0f;
+    memset(out->coefs, 0, out->coefs_elements * sizeof(float));
+    out->alpha[0] = 0.0f;
+    return 0;
+}
+
+/* A model whose heads are a uniform 0.5 band mask, zero deep filter and alpha 0: an output that
+ * differs from the input, for comparing the callback-driven hop with the caller-run one. */
+static inline int dfn_fixture_half_mask_infer(void *user, const DFN2PrepostInputs *in,
+                                              DFN2PrepostOutputs *out) {
+    size_t i;
+    (void)user;
+    (void)in;
+    for (i = 0; i < out->erb_mask_elements; ++i) out->erb_mask[i] = 0.5f;
+    memset(out->coefs, 0, out->coefs_elements * sizeof(float));
+    out->alpha[0] = 0.0f;
+    return 0;
+}
+
+/* What a phased-hop test does with an open model frame: run the model, report a failure, leave
+ * the frame open, or never fetch it. */
+enum { BP_RUN, BP_FAIL, BP_OPEN, BP_UNFETCHED };
+
+/* The stage's output delay at 48 kHz, (L + 1) * 512 samples with L = mask + df lookahead, in
+ * native samples at `sr` (8 or 16 kHz): a whole number only when L + 1 is a multiple of 3
+ * (the shipped 1/1 pair). Otherwise the rate bridge rounds it down, and its output trails the
+ * input by an extra fraction of a sample. */
+#define DFN_FIXTURE_STAGE_DELAY_48K ((DFN2_MASK_LOOKAHEAD + DFN2_DF_LOOKAHEAD + 1) * DFN2_HOP_LEN)
+static inline int dfn_fixture_bridge_delay_exact(int sr) {
+    return (long long)DFN_FIXTURE_STAGE_DELAY_48K * sr % DFN2_SR == 0;
+}
+
+/* Native samples the rate bridge adds at `sr` / `hop`: the prefill of the grid's schedule, the
+ * 16-frame group delay of each resampler and the stage's delay (672 / 629 / 330 for the shipped
+ * pair at 16 kHz hop 128 / 16 kHz hop 256 / 8 kHz hop 128). */
+static inline int dfn_fixture_bridge_added_delay(int sr, int hop) {
+    int prefill = (sr == 16000 && hop == 128) ? 128 : (sr == 16000 && hop == 256) ? 85 : 42;
+    return prefill + 16 + (int)((long long)DFN_FIXTURE_STAGE_DELAY_48K * sr / DFN2_SR) + 16;
+}
+
+#endif /* DFN_TEST_FIXTURE_H */

@@ -21,7 +21,7 @@ ROOT = Path(__file__).resolve().parents[2]
 if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
-from pipelines.dfn2_stage import HOP, SAMPLE_RATE, dfn2_modules, load_dfn2  # noqa: E402
+from pipelines.dfn.dfn2_stage import HOP, SAMPLE_RATE, dfn2_modules, load_dfn2  # noqa: E402
 
 
 def count_model():

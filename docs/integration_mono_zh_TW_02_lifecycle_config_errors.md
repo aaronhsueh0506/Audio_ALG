@@ -5,31 +5,31 @@
 
 | # | 步驟 | 呼叫 | 什麼時候呼叫 | 這一步可能怎麼失敗 |
 |---|---|---|---|---|
-| 1 | derive | `se_derive(&req, &rules, &grid, &aec_cfg)` | 每次 init 之前 | 回傳 `-1`：任何一條規則被違反（[§4.1](#41-serequest--se_derive)）；輸出內容未定義 |
-| 2 | query | `aec_get_mem_size(&aec_cfg)`、`anr_get_mem_size(&nr_cfg)`、`ac_istft_get_mem_size(&synth_cfg)`，加上你自己的增益／頻譜暫存 | **每次 init 之前**都要重查，不可跨 build / backend / config 快取 | 回傳 `0`：config 無效（**注意：這幾個是 0 = 失敗，與 4ch 單元的 `-1` 慣例不同**） |
+| 1 | derive | `aec_resolve_signal_grid(sr, fft_size, &grid)`、`aec_config_from_preset(&aec_cfg, preset, sr)`，再設接縫欄位（範例的 `derive_lane()`，[§4.1](#41-aecconfig-的接縫欄位範例的-derive_lane)） | 每次 init 之前 | `aec_resolve_signal_grid()` 回 `0`：沒有這組 `(sample_rate, fft_size)` 的格點，`grid` 不被寫入（`fft_size = 0` 也是 `0`）；`aec_config_from_preset()` 是 `void` |
+| 2 | query | `aec_get_mem_size(&aec_cfg)`、`anr_get_mem_size(&nr_cfg)`、`ac_istft_get_mem_size(&synth_cfg)`，加上你自己的增益／頻譜暫存 | **每次 init 之前**都要重查，不可跨 build / backend / config 快取 | 回傳 `0`：config 無效（**注意：這幾個是 0 = 失敗，與 4ch `mcab_get_mem_requirements()` 的 `0` = 成功、`-1` = 失敗慣例不同**） |
 | 3 | allocate | 你自己的配置器，取得各塊 `ALIGN16(...)` 相加且 16-byte 對齊的記憶體 | 拿到大小之後 | 配置失敗由你自己處理。pool **不需要**預先清零（poison pattern 也可以）；但必須在 handle 生命週期內獨佔、不被其他人寫入 |
 | 4 | init | `aec_init(pool, aec_bytes, &aec_cfg)`、`anr_init(pool + ALIGN16(aec_bytes), nr_bytes, &nr_cfg)`、`ac_istft_init(...)`；每一塊的起點都是前一塊加 `ALIGN16(前一塊大小)` | 拿到 pool 之後，處理第一個 hop 之前 | 回傳 `NULL`：pool 未 16-byte 對齊、太小、config 無效、子模組 init 失敗。已建好的那幾個要由你 destroy |
-| 5 | process | `aec_process_context(aec, mic, ref)` → `se_frame_from_aec(aec, &f)` → 每 hop 串接（[§1.1](integration_mono_zh_TW_01_overview_link_quickstart.md#11-構成每個函式庫各自初始化每個-hop-的串接由你寫)：`g_res_ctx`、`se_anr_stage_gain()`、`sk_min_f32()`、`sk_capply_gain_f32()`、`aec_cng_fill()`）→ `ac_istft_push(istft, spec, out)` | 每收到一個 hop 呼叫一次。`mic`/`ref`/`out` 都必須剛好 `grid.hop_size` 個 float | `aec_process_context()` 回傳 `void`；`se_frame_from_aec()` 回 `-1`（NULL 引數或 lane 沒有 seam）；`g_res_ctx` 為 NULL、`se_anr_stage_gain()` 回 `NULL`（NULL 引數、或降噪器拒絕該 hop）；`ac_istft_push()` 的回傳值與輸出有限性（`se_hop_is_finite()`）要自己檢查。**不會**檢查 buffer 長度 —— 長度錯是你的責任 |
-| 6 | recover | `aec_reset(aec)`、`anr_reset(nr)`、`ac_istft_reset(istft)`，並把你的 comfort-noise RNG 設回 `SE_CNG_RNG_SEED` | 任何一步被拒、輸出非有限、換回聲路徑（換喇叭、重新 seat）或切換到不相關的另一條串流時 | 不會失敗。必須全部一起 reset：漏掉其中一個就不等於新建的實例（`main.c`／`static_main.c` 的 `rig_reset()` 就是這四件事） |
+| 5 | process | `aec_process_context(aec, mic, ref)` → `aec_get_res_context(aec, &ctx)` → 每 hop 串接（[§1.1](integration_mono_zh_TW_01_overview_link_quickstart.md#11-構成每個函式庫各自初始化每個-hop-的串接由你寫)：`ctx.res_gain`、`anr_process_gain()` + `anr_get_gain()`、`sk_min_f32()`、`sk_capply_gain_f32()`、`aec_cng_fill()`）→ `ac_istft_push(istft, spec, out)` | 每收到一個 hop 呼叫一次。`mic`/`ref`/`out` 都必須剛好 `grid.hop_size` 個 float | `aec_process_context()` 與 `aec_get_res_context()` 回傳 `void`；`ctx.error_spec` 或 `ctx.res_gain` 為 NULL（沒有 context）、`anr_process_gain()` 回非 0 或 `anr_get_gain()` 回 `NULL`（降噪器拒絕該 hop）都是你要處理的拒絕；`ac_istft_push()` 的回傳值與輸出有限性（選用 `skn_all_finite_f32()`）要自己檢查。**不會**檢查 buffer 長度 —— 長度錯是你的責任 |
+| 6 | recover | `aec_reset(aec)`、`anr_reset(nr)`、`ac_istft_reset(istft)`，並把你的 comfort-noise RNG 設回起始值（範例的 `CNG_RNG_SEED`） | 任何一步被拒、輸出非有限（若你有檢查）、換回聲路徑（換喇叭、重新 seat）或切換到不相關的另一條串流時 | 不會失敗。必須全部一起 reset：漏掉其中一個就不等於新建的實例（`mono_aec_nr_res/main.c` 的 `rig_reset()` 就是這四件事；`main.c` 在某個 stage 拒絕該 hop 時呼叫它，輸出有限性檢查是 `example_board_adapter.c` 的 `run_hops()` 做的） |
 | 7 | destroy | `anr_destroy(nr)`、`aec_destroy(aec)` | 不再處理任何 hop 之後、釋放 pool 之前 | 不會失敗。`aec_destroy` NULL 安全、可重複，只放開實例內部的參照，**不**釋放你的 pool；`anr_destroy` 對 pool 實例立即返回，對 `anr_create()` 的 heap 實例才釋放記憶體 |
 | 8 | release | 你自己的釋放器 | **一定要在第 7 步之後** | 順序顛倒 = use-after-free |
 
 補充規則：
 
 * **大小不可快取**。firmware image 若拿舊 build 算出的大小去餵新 library，就會在錯誤大小/佈局的 pool 上切記憶體。
-  mono 沒有 descriptor 閘（那是 4ch 單元的 `AudioPipeline4Ch` 才有的契約，見
-  [`integration_4ch_spatial_zh_TW.md`](integration_4ch_spatial_zh_TW.md)），所以每次 build 都重查大小是你的責任；
+  mono 沒有 descriptor 閘（那是 4ch flow 層 `Mcab` 的 `McabMemReq` 才有的契約，見
+  [`integration_4ch_core_zh_TW.md`](integration_4ch_core_zh_TW.md)），所以每次 build 都重查大小是你的責任；
   `aec_init()`、`anr_init()` 與 `ac_istft_init()` 只會擋下過小或未對齊的 pool。
 * pool 生命週期內 sub-module 都是指進 pool 的裸指標，不是拷貝。pool 不能被搬動、
   不能被別人寫、不能和另一個 `Aec`/NR/FFT instance 共用。
 * 單一 instance 不可被多個 thread 同時 `process`。多條串流請各自建立 instance。
-* `SeSpecFrame` 的指標都借自 `Aec`，到下一次 `aec_process_context()` 或 reset 為止有效；`P`（輸出頻譜）必須在同一個 hop 內形成並合成。
+* `AecResContext` 的指標都借自 `Aec`，到下一次 `aec_process_context()` 或 reset 為止有效（見 `aec.h`）；`P`（輸出頻譜）必須在同一個 hop 內形成並合成。
 
 ### 3.1 執行期唯讀存取
 
 | 呼叫 | 用途 |
 |---|---|
-| `grid.hop_size` / `grid.n_freqs` / `grid.fft_size`（`se_derive()` 輸出） | 每次 process 要餵幾個 float、頻域 bin 數 |
+| `grid.hop_size` / `grid.n_freqs` / `grid.fft_size`（`aec_resolve_signal_grid()` 輸出的 `AecSignalGrid`） | 每次 process 要餵幾個 float、頻域 bin 數 |
 | `anr_debug_status(nr, &st)` | 診斷：降噪器的 init 旗標、增益、噪聲底（唯讀，不改狀態） |
 | `aec_debug_status(aec, &st)` | 診斷：delay、ERLE、收斂旗標（mono CLI 的 `--debug` 就是這個加 `anr_debug_status()`） |
 
@@ -41,7 +41,7 @@
 AecStageTiming t;
 aec_process_context(aec, mic, ref);
 aec_get_last_timing(aec, &t);
-/* t.delay_us t.frontend_us t.linear_us t.res_us ← lib/aec 量 */
+/* t.delay_us t.frontend_us t.linear_us t.steering_us t.res_us ← lib/aec 量 */
 ```
 
 增益串接與合成的耗時是**範例程式自己**在呼叫前後讀時鐘量的（`mono_aec_nr_res/main.c` 的 `process_hop()`
@@ -52,17 +52,16 @@ aec_get_last_timing(aec, &t);
 | `delay_us` | **延遲估計與 ring 對齊**：matched-filter bank、其 duty-cycle 記帳、reference ring 寫入與延遲補償讀取。`EXTERNAL_ALIGNED` 下為 0，`FIXED` 下很小 |
 | `frontend_us` | AEC 到主濾波器之前的**其餘**部分：mic HPF、飽和、render activity、`mu_scale`、mic-clip、RSA、shadow filter。**不含 `delay_us`**，兩者不重複計算 |
 | `linear_us` | AEC 主自適應濾波器（`pbfdkf_process_with_far_cmag2`），含 far-end FFT |
+| `steering_us` | 主濾波器之後、RES 之前的 stationarity 更新、coarse-error 發布、DT analyzer、EPV、shadow_rise 與失調估計（`aec.h` 的註解） |
 | `res_us` | AEC 自己的 AEC3 post/RES 區塊 |
 
-**本機實測：`delay_us` 是整個 hop 最大的一塊。** 主機（macOS）上以 `make PROFILE=1` 建置，
-`aec_nr_pipeline --timing`、16 kHz/256、balanced、一段 20 s 的合成雜訊輸入、跑兩次：`delay_us` 約佔呼叫牆鐘的
-54.6–54.8 %，`frontend_us`（mic HPF/RSA/shadow filter）約 10.1 %。比例隨輸入與平台改變，目標平台上的比例待量測。
+**本機實測：`delay_us` 是整個 hop 最大的一塊。** 主機（桌面 aarch64、NE10）上以 `-DAEC_STAGE_TIMING=1` 建置，
+`aec_nr_pipeline_static --timing`、16 kHz/256、balanced、一段 10 s 的合成回音輸入、連跑兩次：`delay_us` 約佔呼叫牆鐘的
+53.2–54.0 %，`frontend_us`（mic HPF/RSA/shadow filter）約 10.2–10.3 %。比例隨輸入與平台改變，目標平台上的比例待量測。
 這條線直接對應 `delay_num_filters`（1..5）這個可調旋鈕。
 
-**各階段不會加總成整通呼叫。** 餘數包含引數檢查、`aec_get_res_context()`，以及
-AEC 內部（因此從這層看不見）的 stationarity 更新、`e2_coarse`/ERL 發布、DT
-analyzer、EPV、shadow_rise、失調估計、功率 EMA 與收斂偵測。要呈現完整分解的
-呼叫端必須把餘數明確列出來，不能讓部分看起來像全部。
+**各階段不會加總成整通呼叫。** 餘數包含引數檢查、`aec_get_res_context()` 與每 hop 結尾的收尾步驟，它們都不在上面五欄內。範例的 `--timing` 表只列 `delay_us`、`frontend_us`、`linear_us`、`res_us` 四列，
+`steering_us` 落在 unattributed。要呈現完整分解的呼叫端必須把餘數明確列出來，不能讓部分看起來像全部。
 
 **預設關閉。** AEC 內部 7 次 clock 讀取，release build 一次都不做，欄位讀 0。
 `make PROFILE=1` 會開啟（`-DAEC_STAGE_TIMING=1`）。呼叫端自己的顯示旗標（`--timing`）**不會**打開 AEC 的量測。
@@ -74,7 +73,7 @@ profile build 與 release build 的 pool 大小與每個 offset 都相同，開�
 平台用 `make PROFILE=1 EXTRA_CFLAGS='-DAEC_NOW_US=board_timer_us -include my_timer.h'`
 換掉 AEC 的時鐘：巨集要是**純識別字**（Makefile 的 FP policy 不允許 `EXTRA_CFLAGS` 出現括號），
 指向不收參數、回傳 `uint32_t` 微秒的函式。替代時鐘必須單調，否則無號減法會產生接近 32-bit 全距的
-荒謬值。每個元件各有自己的覆寫點（`lib/aec`、四路核心），刻意不共用——一個元件的時鐘屬於該元件自己的建置契約。
+荒謬值。每個元件各有自己的覆寫點（`lib/aec` 的 `AEC_NOW_US`、`mcab` 的 `MCAB_NOW_US`），刻意不共用——一個元件的時鐘屬於該元件自己的建置契約。
 開著旗標但指向常數函式是合法用法，所有欄位讀 0，`--timing` 的報表無法分辨這種情況與「根本沒開旗標」。
 
 兩支 CLI 都有 `--timing`，在結束時印出整段 run 的每 hop 平均與佔比（含未歸屬餘數）。
@@ -126,39 +125,44 @@ hop 上生效：double-talk 期間套用的是 DT 地板（mild/balanced 共用 
 
 ## 4. Config 完整參考
 
-mono 的設定分成兩份：`SeRequest`（交給 `se_derive()`，決定格點與 `AecConfig`）與
-範例程式自己的後級選項（RES gain 用不用、NR 開不開與強度、CNG、`use_r2`、合成），後者**不是**任何函式庫的
-config struct，是 `main.c`／`static_main.c` 的 `PostOptions`／`PostPlan` 這類程式內部欄位，決定要不要呼叫、
-要不要建對應的函式庫物件。驗證發生在 `se_derive()` 本身（回 `-1`）與
+mono 的設定分成兩份：lib/aec 的 `AecConfig`（格點與接縫欄位由範例的 `derive_lane()` 填，其餘欄位的預設來自
+`aec_config_from_preset()`）與範例程式自己的後級選項（RES gain 用不用、NR 開不開與強度、CNG、`use_r2`、合成），
+後者**不是**任何函式庫的 config struct，是 `mono_aec_nr_res/main.c` 的 `PostPlan` 這類程式內部欄位，決定要不要呼叫、
+要不要建對應的函式庫物件。驗證發生在 `aec_resolve_signal_grid()`（回 `0`）與
 `aec_get_mem_size()`／`anr_get_mem_size()`／`ac_istft_get_mem_size()`（回 `0`）。
 
-### 4.1 `SeRequest` → `se_derive()`
+### 4.1 `AecConfig` 的接縫欄位（範例的 `derive_lane()`）
+
+`derive_lane(sample_rate, fft_size, preset, &grid, &aec_cfg)`（`mono_aec_nr_res/main.c`）依序做：
+`aec_resolve_signal_grid(sample_rate, fft_size ? fft_size : aec_default_fft_size(sample_rate), &grid)`（回 `0` 即回報失敗）、
+`aec_config_from_preset(&aec_cfg, preset, sample_rate)`，然後設下表的欄位。`aec_get_mem_size()` 與 `aec_init()` 會用 libaec 自己的驗證器
+再檢查整份 `AecConfig`（回 `0`／`NULL`）。
 
 | 欄位 | 型別 | 範例的值 | 合法值（驗證器實際檢查的） | 你該怎麼設 |
 |---|---|---|---|---|
-| `sample_rate` | `int` | 你的取樣率 | `8000`（需 `rules.allow_8k`）/ `16000` / `48000`。其他一律拒絕（例如 `44100`） | 設成你音訊實際的取樣率。這個值同時決定預設 grid |
-| `fft_size` | `int` | `0` | `0` = 依 rate 取預設。明確指定時：8 kHz 只接受 `256`；16 kHz 接受 `256` 或 `512`；48 kHz 只接受 `1024`。其他組合拒絕 | 除非你有明確理由要 16 kHz 的 512 grid，否則留 `0` |
-| `filter_length` | `int` | `0` | `0` = 依 preset／rate 取預設；否則 `[1, SE_FILTER_LENGTH_MAX(4096)]` | PBFDKF taps，init 後不可變；沒有明確需求就留 `0` |
+| `sample_rate` | `int` | 你的取樣率 | `8000` / `16000` / `48000`，其他一律拒絕（例如 `44100`；`aec_is_valid_sample_rate()` 可先查） | 設成你音訊實際的取樣率。這個值同時決定預設 grid |
+| `fft_size` | `int` | `aec_default_fft_size(sample_rate)`（CLI `--fft-size 0` 時） | 8 kHz 只接受 `256`；16 kHz 接受 `256` 或 `512`；48 kHz 只接受 `1024`；`0` 與其他組合拒絕（`aec_resolve_signal_grid()` 回 `0`） | 除非你有明確理由要 16 kHz 的 512 grid，否則取 rate 預設 |
+| `filter_length` | `int` | `aec_config_from_preset()` 的預設（52 ms；≥ 44.1 kHz 為 64 ms） | `[1, 4096]`，範圍外 `aec_get_mem_size()` 回 `0` | PBFDKF taps，init 後不可變；沒有明確需求就不改 |
 | `delay_mode` | `AecDelayMode` | `AEC_DELAY_MATCHED` | `AEC_DELAY_MATCHED` / `AEC_DELAY_FIXED` / `AEC_DELAY_EXTERNAL_ALIGNED` | 語意同 `lib/aec`；記憶體差異見 [§4.5a](#45a-delay_mode-對-16000預設-grid-的影響matched-n5-為-baseline) |
-| `delay_num_filters` | `int` | `5` | 僅 `MATCHED` 有效：`[1, 5]`；其他模式要求維持 `5`（`rules.check_delay = 1` 時檢查） | matched-filter bank 大小，決定 bulk delay 搜尋範圍；init 參數，不是 runtime setter |
-| `fixed_delay_samples` | `int` | `-1` | 僅 `FIXED` 有效（原生取樣點數，上限為該取樣率下的兩分鐘）；其他模式須為 `-1`（`rules.check_delay = 1` 時檢查） | 已知固定 delay 時使用 |
-| `aec_preset` | `AecPreset` | `AEC_PRESET_BALANCED`（= 1） | `AEC_PRESET_MILD`(0) / `AEC_PRESET_BALANCED`(1) / `AEC_PRESET_AGGRESSIVE`(2) / `AEC_PRESET_NO_FLOOR`(3)。列舉以外的整數會被拒絕（**不會**默默 fallback 成 balanced） | 近端保留優先 → `MILD`；回聲抑制優先 → `AGGRESSIVE`；不確定就留預設 |
+| `delay_num_filters` | `int` | `DA_NUM_FILTERS`（5） | 一律 `[1, DA_NUM_FILTERS]`；`FIXED` 與 `EXTERNAL_ALIGNED` 要求維持 `DA_NUM_FILTERS` | matched-filter bank 大小，決定 bulk delay 搜尋範圍；init 參數，不是 runtime setter |
+| `fixed_delay_samples` | `int` | `-1` | 僅 `FIXED` 有效（原生取樣點數 ≥ 0，上限為該取樣率下的 120 秒）；其他模式須為 `-1` | 已知固定 delay 時使用 |
+| `enable_delay_est` | `int` | `1` | 與 `delay_mode` 的舊式鏡像（deprecated，見 `aec_config_resolve_delay()`） | 範例固定為 `1`（MATCHED）；改用 `delay_mode` |
+| `enable_res`、`return_res_context` | `int` | `0`、`1` | `{0, 1}` | 接縫：lane 不自己輸出時域音訊，`aec_get_res_context()` 交出 `error_spec`／`res_gain`／`r2`／`comfort_noise`，增益由你的每 hop 串接套用 |
+| `preset`（`aec_config_from_preset()` 的引數） | `AecPreset` | `AEC_PRESET_BALANCED`（= 1） | `AEC_PRESET_MILD`(0) / `AEC_PRESET_BALANCED`(1) / `AEC_PRESET_AGGRESSIVE`(2) / `AEC_PRESET_NO_FLOOR`(3)；列舉以外的整數**退回 balanced**（執行期換強度用 `aec_set_preset()`，它對 enum 外回 `-1`） | 近端保留優先 → `MILD`；回聲抑制優先 → `AGGRESSIVE`；不確定就留預設 |
 
-`SeRules` 是你的應用自己的規則：`allow_8k`、`check_delay`（是否拒絕與 `delay_mode` 矛盾的 delay 設定；
-mono 範例沒開）、`spatial_context`（mono 用 `SE_CONTEXT_PRESET`：lane 保留 preset 自己的 context 層級，
-所以 `g_res_ctx` 有值）。`se_derive()` 輸出的 `AecConfig` 已設好 `enable_res = 0`、`return_res_context = 1`：
-lane 不自己輸出時域音訊，增益由你的每 hop 串接套用。
+`spatial_linear_context` 保持預設 `0`（完整 context）：`ctx.res_gain` 才有值；4ch 的 lane 設成 `AEC_CONTEXT_NO_GAIN` 或
+`AEC_CONTEXT_LINEAR_ONLY` 是 `mcab_apply_lane_contract()` 的事，不是 mono 範例的。
 
 ### 4.2 後級選項（範例程式的欄位與 CLI 旗標）
 
 | 選項 | 範例的預設 | 它決定什麼 |
 |---|---|---|
-| RES gain | 用（`frame.g_res_ctx`，即 AEC 自己的殘留 gain） | `--no-res`：`G_res` 視為全 1 的 unity 向量，comfort noise 因為沒有被 RES 挖掉的 bin 而不填。強度用 `aec_set_preset()`（[§3.2](#32-執行期強度控制)），沒有獨立的 `AecRes`、也沒有 `res_preset` |
+| RES gain | 用（`ctx.res_gain`，即 AEC 自己的殘留 gain） | `--no-res`：`G_res` 視為全 1 的 unity 向量，comfort noise 因為沒有被 RES 挖掉的 bin 而不填。強度用 `aec_set_preset()`（[§3.2](#32-執行期強度控制)），沒有獨立的 `AecRes`、也沒有 `res_preset` |
 | NR | 用 | `--no-nr`：不建 `AnrDenoiser`（state 不進 pool），總增益只剩 `G_res`，`anr_set_mode()` 沒有對象 |
 | NR 強度 | `ANR_MODE_BALANCED`（= 2） | `--nr-preset mild\|moderate\|balanced\|aggressive`：交給 `anr_config_for_mode_grid(sr, fft_size, mode)`，四級都可用；最小值追蹤視窗 `L` 為函式庫預設，不覆寫 |
-| `use_r2` | 用 | `--legacy-amin`：`se_anr_stage_gain(..., use_r2 = 0)`，noise-only NR（noise floor 不摺入 R²）。只用於比對，新整合請保持用 R² |
-| CNG | 開，與 `aec_cfg.enable_cng`（AEC preset 自己的值）取 AND | `--no-cng`：不呼叫 `aec_cng_fill()`。位準再乘該 bin 的 NR gain、下限 −10 dB（`SE_CNG_NR_GAIN_FLOOR`；NR 看不到 comfort noise，在此補套）；沒有 RES gain 時也不填 |
-| 合成 | 用 | 範例是 `ac_istft_push()` 之後直接輸出；DFN2 之類後接的 stage 自己合成時就不建 `AcIstft`（見 `mono_aec_dfn_res`） |
+| `use_r2` | 用 | `--legacy-amin`：`use_r2 = 0`，`mono_nr_gain()` 不把 R² 摺進 noise floor（noise-only NR）。只用於比對，新整合請保持用 R² |
+| CNG | 開，與 `aec_cfg.enable_cng`（AEC preset 自己的值）取 AND | `--no-cng`：不呼叫 `aec_cng_fill()`。位準再乘該 bin 的 NR gain、下限 −10 dB（範例的 `CNG_NR_GAIN_FLOOR`；NR 看不到 comfort noise，在此補套）；沒有 RES gain 時也不填 |
+| 合成 | 用 | 範例是 `ac_istft_push()` 之後直接輸出；DFN2 之類後接的 stage 自己合成時就不建 `AcIstft`（見 `dfn/mono_aec_dfn_res`） |
 
 `--aec-only` 不建任何後級、用 `aec_process()`（[§1.2](integration_mono_zh_TW_01_overview_link_quickstart.md#12---aec-only)）。
 
@@ -175,14 +179,14 @@ lane 不自己輸出時域音訊，增益由你的每 hop 串接套用。
 | 48000 | 1024 | 512 | 1024 | 513 | `fft_size = 0` 的 rate 預設 |
 
 **不要把 hop 寫死。** 16 kHz 有兩組合法 grid，寫死任一組對另一組就是錯的。
-一律用 `se_derive()` 輸出的 `grid.hop_size` / `grid.n_freqs` 查。
+一律用 `aec_resolve_signal_grid()` 輸出的 `grid.hop_size` / `grid.n_freqs` 查。
 
 ### 4.4 哪些欄位會改變記憶體用量
 
 | 欄位 | 影響 pool 大小嗎 |
 |---|---|
 | `sample_rate`、`fft_size` | 會（改 grid、改 AEC filter 長度） |
-| `filter_length` | 會（非 0 時覆寫 AEC filter 長度／n_partitions） |
+| `filter_length` | 會（有效範圍 `[1, 4096]`，`n_partitions` 由它與 hop 推導；16 kHz/256 把 832 改成 1664，AEC 那一塊多 61,824 B） |
 | `delay_mode` | 會（`MATCHED` 建 matched-filter estimator + 大 ring；`FIXED` 只建剛好夠用的小 ring；`EXTERNAL_ALIGNED` 兩者都不建，見 [§4.5a](#45a-delay_mode-對-16000預設-grid-的影響matched-n5-為-baseline)） |
 | `delay_num_filters` | 僅 `MATCHED` 有效：每少一個固定省 5,728 B（四格點皆同，與 `lib/aec` 一致） |
 | `fixed_delay_samples` | 僅 `FIXED` 有效：ring 大小 = `ALIGN16((fixed_delay_samples+hop)×4)` B |
@@ -194,7 +198,7 @@ lane 不自己輸出時域音訊，增益由你的每 hop 串接套用。
 ### 4.4b 診斷用的分項
 
 沒有「後級總大小」的單一查詢：你的 pool 大小就是各個 `mem_size` 的回傳值各自 `ALIGN16` 後相加，再加上你自己的
-增益／頻譜暫存。`static_main.c --print-mem-size` 印的表格（`AEC`、`Synthesis`、`NR (MMSE-LSA)`、
+增益／頻譜暫存。`aec_nr_pipeline_static --print-mem-size` 印的表格（`AEC`、`Synthesis`、`NR (MMSE-LSA)`、
 `Gain/spectrum buffers`、`Total`）就是這個加總，並且真的在那塊 pool 上跑一次每個物件的 init。
 這只是給人看的表格；**真正要配置多少，永遠以各 `mem_size` 的回傳值為準**，加上各塊的對齊。
 
@@ -242,21 +246,21 @@ lane 不自己輸出時域音訊，增益由你的每 hop 串接套用。
 
 | Function | 成功 | 失敗 | 備註 |
 |---|---|---|---|
-| `se_derive()` | `0`，輸出填妥 | `-1` | 輸出未定義；無任何 log |
-| `aec_get_mem_size()` | pool bytes | `0`（config 無效） | 與 4ch 的 `get_mem_requirements()`（0 = 成功）相反 |
+| `aec_resolve_signal_grid()` | `1`，`grid` 填妥 | `0` | 沒有這組 `(sample_rate, fft_size)`（含 `fft_size = 0`）；`grid` 不被寫入。**`1` = 成功**，與 `aec_get_mem_size()` 的 `0` = 失敗相反方向，判斷式別混用 |
+| `aec_get_mem_size()` | pool bytes | `0`（config 無效） | 與 4ch 的 `mcab_get_mem_requirements()`（0 = 成功）相反 |
 | `anr_get_mem_size()` / `ac_istft_get_mem_size()` | pool bytes | `0`（config 無效） | 同上 |
 | `aec_init()` / `anr_init()` / `ac_istft_init()` | 非 NULL handle | `NULL` | pool 未對齊、太小、config 無效；失敗後 pool 仍可重新用於正確的 init |
-| `aec_process_context()` / `aec_process()` | `void` | – | 不回傳錯誤；異常由後面的 `se_frame_from_aec()`／`se_anr_stage_gain()` 回傳值看出 |
-| `se_frame_from_aec()` | `0` | `-1` | NULL 引數，或 lane 沒有 seam（`enable_res=0`、`return_res_context=1`） |
-| `se_anr_stage_gain()` | 降噪器擁有的 `n_freqs` 個增益 | `NULL` | NULL 引數、`frame->e` 為 NULL，或降噪器拒絕該 hop |
+| `aec_process_context()` / `aec_process()` | `void` | – | 不回傳錯誤；異常由後面的 `ctx.error_spec`／`ctx.res_gain` 為 NULL 與 `anr_process_gain()` 回傳值看出 |
+| `aec_get_res_context()` | `void` | – | 沒有可用 context 時（例如該 hop 的 seam 沒開）`ctx.error_spec` 為 NULL；lane 沒有自己的 gain 時 `ctx.res_gain` 為 NULL |
+| `anr_process_gain()` | `0` | `-1` | NULL 引數或降噪器拒絕該 hop；成功後 `anr_get_gain(nr, NULL)` 回降噪器擁有的 `n_freqs` 個增益 |
 | `ac_istft_push()` | 寫出的樣本數（`hop`；`AC_OLA_ENV_NORM` 的第一個 frame 為 `0`） | – | 不檢查輸出是否有限，要另外查 |
-| `se_hop_is_finite()` | `1` | `0` | 你在採用輸出之前要做的檢查 |
-| `aec_reset()` / `anr_reset()` / `ac_istft_reset()` | `void` | 不會失敗 | 要一起呼叫，並把 comfort-noise RNG 設回 `SE_CNG_RNG_SEED` |
+| `skn_all_finite_f32()` | `1` | `0` | 選用：你在採用輸出之前要做的檢查（`example_board_adapter.c` 的 `run_hops()` 就這樣檢查） |
+| `aec_reset()` / `anr_reset()` / `ac_istft_reset()` | `void` | 不會失敗 | 要一起呼叫，並把 comfort-noise RNG 設回起始值（範例的 `CNG_RNG_SEED`） |
 | `aec_destroy()` / `anr_destroy()` | `void` | 不會失敗 | NULL 安全 |
 | `aec_set_preset()` / `anr_set_mode()` | `0` | `-1` | `-1` 時什麼都不寫（[§3.2](#32-執行期強度控制)） |
 
 > **注意慣例不一致**：`aec_get_mem_size()` / `anr_get_mem_size()` / `ac_istft_get_mem_size()` /
-> `fft_get_mem_size()` 是 **回傳 0 代表失敗**；4ch 單元的 `audio_pipeline_4ch_get_mem_requirements()` 是
+> `fft_get_mem_size()` 是 **回傳 0 代表失敗**；4ch 的 `mcab_get_mem_requirements()` 是
 > **0 = 成功 / −1 = 失敗**。判斷式別混用。
 
 ### 5.2 init 的拒絕清單
@@ -273,9 +277,9 @@ lane 不自己輸出時域音訊，增益由你的每 hop 串接套用。
 
 ### 5.4 診斷輸出去向
 
-* mono 範例的每 hop 串接（`se_anr_stage.h` 與 `mono_form()`）不輸出任何東西。lib/aec／lib/nr／audiolib 的 init 期診斷寫到 **stderr**，
+* mono 範例的每 hop 串接（`mono_form()` 與 `mono_nr_gain()`）不輸出任何東西。lib/aec／lib/nr／audiolib 的 init 期診斷寫到 **stderr**，
   以 `NO_STDIO=1` 建置時編成 no-op，**回傳值語意完全不變**。
-* 每 hop 的 `aec_process_context()`、`se_anr_stage_gain()`、`ac_istft_push()` **在任何 build 下都不會輸出任何東西**。
+* 每 hop 的 `aec_process_context()`、`anr_process_gain()`、`ac_istft_push()` **在任何 build 下都不會輸出任何東西**。
 
 ---
 

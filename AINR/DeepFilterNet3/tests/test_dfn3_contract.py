@@ -18,6 +18,10 @@ ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 ROOT_PATH = pathlib.Path(ROOT)
 # Qualified imports keep DFN2 and DFN3 independent in a combined pytest run.
 sys.path.insert(0, str(ROOT_PATH.parents[1]))
+# AINR/tests holds dfn_pairs; pytest adds it through AINR/conftest.py, a direct run here.
+_AINR_TESTS = str(ROOT_PATH.parent / 'tests')
+if _AINR_TESTS not in sys.path:
+    sys.path.insert(0, _AINR_TESTS)
 
 
 from AINR.DeepFilterNet3.model import (  # noqa: E402
@@ -417,15 +421,20 @@ def test_scan_non_finite_excludes_buffers_by_default():
     assert params_only[0][1:3] == (0, 1)
 
 
-def test_lookahead_relation_is_enforced_in_the_model_constructor():
-    """df_lookahead > mask_lookahead must be rejected at the single source.
+def test_lookahead_ranges_are_enforced_in_the_model_constructor():
+    """Each lookahead is checked against its own range, at the single source.
 
-    train.py and inference.py deliberately do not check it, so if the
-    constructor stops enforcing it nothing does.
+    train.py and inference.py deliberately do not check them, so if the
+    constructor stops enforcing it nothing does. The two are independent: a
+    deep filter may look further ahead than the mask path.
     """
     cfg = load_config()
-    with pytest.raises(ValueError, match='mask_lookahead'):
-        build_shipped_model(cfg, mask_lookahead=0, df_lookahead=1)
+    df_order = read_model_config(cfg)['df_order']
+    for bad in ({'mask_lookahead': 3}, {'mask_lookahead': -1},
+                {'df_lookahead': df_order}, {'df_lookahead': -1}):
+        with pytest.raises(ValueError, match='_lookahead'):
+            build_shipped_model(cfg, **bad)
+    build_shipped_model(cfg, mask_lookahead=0, df_lookahead=df_order - 1)
     # The shipped pairing must remain constructible.
     build_shipped_model(cfg)
 
@@ -642,14 +651,37 @@ from AINR.DeepFilterNet3.export_onnx import (  # noqa: E402
     build_metadata,
     export_graph,
     feature_windows,
+    window_alignment,
 )
 
+import dfn_pairs  # noqa: E402
 
-def _small_dfn3():
+# Every pair the model accepts, probed from the constructor.
+LOOKAHEAD_PAIRS = list(dfn_pairs.accepted_pairs('DeepFilterNet3'))
+SHIPPED_PAIR = dfn_pairs.shipped_pair('DeepFilterNet3')
+
+
+_pair_id = dfn_pairs.pair_id
+
+
+def test_the_tested_pairs_are_the_fifteen_legal_pairs():
+    """The legal set is mask_lookahead in [0, 2] and df_lookahead in
+    [0, df_order - 1], independent of each other: 15 pairs. The test pairs are
+    probed from the model constructor (``dfn_pairs.accepted_pairs``), so this
+    is the one place the rule is stated."""
+    df_order = read_model_config(load_config())['df_order']
+    assert LOOKAHEAD_PAIRS == [(mask, df) for mask in range(3)
+                               for df in range(df_order)]
+    assert len(LOOKAHEAD_PAIRS) == 15
+    assert SHIPPED_PAIR in LOOKAHEAD_PAIRS
+
+
+def _small_dfn3(mask_lookahead=1, df_lookahead=1):
     return DeepFilterNet3(
         n_fft=512, sr=16000, n_erb=32, df_bins=64,
         enc_ch=8, emb_size=32, df_hidden=32,
         lin_groups=4, enc_lin_groups=4,
+        mask_lookahead=mask_lookahead, df_lookahead=df_lookahead,
     ).eval()
 
 
@@ -692,7 +724,9 @@ def test_restored_checkpoint_loads_historical_v5_but_rejects_dfn2(tmp_path):
     restored, params = load_model(SimpleNamespace(
         config=str(ROOT_PATH / 'config.ini'), model=str(path)))
     assert params['DF_BINS'] == 96
-    assert restored.df_lookahead == 1
+    shipped = read_model_config(cfg)
+    assert (restored.mask_lookahead, restored.df_lookahead) == (
+        shipped['mask_lookahead'], shipped['df_lookahead'])
     torch.testing.assert_close(restored.erb_fb, model.erb_fb, rtol=0, atol=0)
     require_checkpoint_contract(historical, contract, for_training=True)
     with pytest.raises(ValueError, match='model_version'):
@@ -724,8 +758,17 @@ def test_dfn3_compose_uses_raw_low_bins_and_masked_high_bins():
 
 
 def test_stateless_dfn3_two_heads_replay_offline_and_pathway_history():
+    _check_stateless_replay(SHIPPED_PAIR)
+
+
+@pytest.mark.parametrize('pair', LOOKAHEAD_PAIRS, ids=_pair_id)
+def test_stateless_dfn3_replays_offline_for_every_lookahead_pair(pair):
+    _check_stateless_replay(pair)
+
+
+def _check_stateless_replay(pair):
     torch.manual_seed(76)
-    model = _small_dfn3()
+    model = _small_dfn3(*pair)
     wrapper = StatelessDFN3Heads(model).eval()
     assert HEAD_OUTPUT_NAMES == ('erb_mask', 'df_coefs')
     assert wrapper.output_names == (
@@ -736,8 +779,9 @@ def test_stateless_dfn3_two_heads_replay_offline_and_pathway_history():
         reference = model.heads(erb, spec)
         states = wrapper.initial_inputs()[2:]
         masks, coefs, histories = [], [], []
-        for erb_window, spec_window in zip(feature_windows(erb),
-                                            feature_windows(spec)):
+        for erb_window, spec_window in zip(
+                feature_windows(erb, model.mask_lookahead),
+                feature_windows(spec, model.mask_lookahead)):
             outputs = wrapper(erb_window, spec_window, *states)
             masks.append(outputs[0])
             coefs.append(outputs[1])
@@ -768,16 +812,19 @@ def test_fixed_batch_dfn3_replays_independent_streaming_lanes():
             rtol=1e-5, atol=1e-6)
 
 
+def c_macro(header_text, name):
+    """Read a plain integer ``#define`` out of a shipped C header."""
+    match = re.search(r'^#define\s+' + name + r'\s+(\d+)u?\b',
+                      header_text, flags=re.MULTILINE)
+    assert match, name
+    return int(match.group(1))
+
+
 def test_dfn3_export_state_layout_and_c_dimensions_match(tmp_path):
     header = (ROOT_PATH / 'dfn3_model_io.h').read_text()
     process = (ROOT_PATH / 'dfn3_process.h').read_text()
 
-    def macro(text, name):
-        match = re.search(r'^#define\s+' + name + r'\s+(\d+)u?\b',
-                          text, flags=re.MULTILINE)
-        assert match, name
-        return int(match.group(1))
-
+    macro = c_macro
     model = build_shipped_model(load_config()).eval()
     wrapper = StatelessDFN3Heads(model).eval()
     inputs = wrapper.initial_inputs()
@@ -787,7 +834,7 @@ def test_dfn3_export_state_layout_and_c_dimensions_match(tmp_path):
     checkpoint.write_bytes(b'hash only')
     metadata = build_metadata(str(checkpoint),
         {'SR': 48000, 'N_FFT': 1024, 'WIN_LEN': 1024, 'HOP_LEN': 512},
-        inputs, outputs)
+        inputs, outputs, wrapper.mask_lookahead, wrapper.df_lookahead)
     assert STATE_LAYOUT_VERSION == macro(header, 'DFN3_MODEL_IO_LAYOUT_VERSION') == 9
     assert STATE_LAYOUT_VERSION not in RETIRED_LAYOUT_VERSIONS
     assert 8 in RETIRED_LAYOUT_VERSIONS
@@ -852,6 +899,165 @@ def test_dfn3_onnx_executes_multiple_hops_with_explicit_state(tmp_path, batch_si
     persisted = json.loads(path.with_suffix('.json').read_text())
     assert persisted['model_family'] == 'DeepFilterNet3'
     assert persisted['state_layout_version'] == 9
+
+
+def _export_small(tmp_path, model, name):
+    checkpoint = tmp_path / (name + '.pth')
+    checkpoint.write_bytes(b'hash only')
+    path = tmp_path / (name + '.onnx')
+    metadata = export_graph(
+        StatelessDFN3Heads(model).eval(),
+        {'SR': 16000, 'N_FFT': 512, 'WIN_LEN': 512, 'HOP_LEN': 256},
+        str(checkpoint), str(path), verify=True)
+    return path, metadata
+
+
+@pytest.mark.parametrize('pair', LOOKAHEAD_PAIRS, ids=_pair_id)
+def test_dfn3_onnx_replays_offline_heads_for_every_lookahead_pair(tmp_path, pair):
+    """The exported file, fed the host windows of its own pair, equals the
+    offline model: the check an exporter and a replay helper that share one
+    wrong alignment would both pass is the comparison with ``model.heads``."""
+    ort = pytest.importorskip('onnxruntime')
+    torch.manual_seed(79)
+    model = _small_dfn3(*pair)
+    path, metadata = _export_small(tmp_path, model, 'dfn3')
+    assert (metadata['mask_lookahead'], metadata['df_lookahead']) == pair
+    assert metadata['input_window_alignment'] == window_alignment(pair[0])
+    persisted = json.loads(path.with_suffix('.json').read_text())
+    assert persisted == json.loads(json.dumps(metadata))
+    assert persisted['state_layout_version'] == STATE_LAYOUT_VERSION == 9
+
+    erb = torch.randn(1, 1, 9, model.n_erb)
+    spec = torch.randn(1, 2, 9, model.df_bins)
+    with torch.no_grad():
+        reference = model.heads(erb, spec)
+    session = ort.InferenceSession(str(path), providers=['CPUExecutionProvider'])
+    states = [value.numpy() for value in StatelessDFN3Heads(model).initial_inputs()[2:]]
+    masks, coefs = [], []
+    for erb_window, spec_window in zip(feature_windows(erb, pair[0]),
+                                       feature_windows(spec, pair[0])):
+        outputs = session.run(None, dict(zip(
+            INPUT_NAMES, [erb_window.numpy(), spec_window.numpy()] + states)))
+        masks.append(outputs[0])
+        coefs.append(outputs[1])
+        states = outputs[2:]
+    np.testing.assert_allclose(np.concatenate(masks, 2), reference[0].numpy(),
+                               rtol=1e-4, atol=2e-5)
+    np.testing.assert_allclose(np.concatenate(coefs, 1), reference[1].numpy(),
+                               rtol=1e-4, atol=2e-5)
+
+
+def test_dfn3_graph_does_not_depend_on_the_lookahead_pair(tmp_path):
+    """Same weights, all fifteen pairs: the graph is one graph, only the host window
+    and two metadata entries differ."""
+    onnx = pytest.importorskip('onnx')
+    from onnx import numpy_helper
+    torch.manual_seed(80)
+    weights = _small_dfn3(*SHIPPED_PAIR).state_dict()
+
+    def structure(path):
+        graph = onnx.load(str(path)).graph
+        return (
+            [node.op_type for node in graph.node],
+            sorted(numpy_helper.to_array(init).tobytes()
+                   for init in graph.initializer),
+            [(value.name, [dim.dim_value for dim in value.type.tensor_type.shape.dim])
+             for value in list(graph.input) + list(graph.output)],
+        )
+
+    reference = None
+    for pair in LOOKAHEAD_PAIRS:
+        model = _small_dfn3(*pair)
+        model.load_state_dict(weights)
+        path, metadata = _export_small(tmp_path, model.eval(), _pair_id(pair))
+        if reference is None:
+            reference, base = structure(path), metadata
+            continue
+        assert structure(path) == reference, pair
+        changed = {key for key in metadata
+                   if metadata[key] != base[key]} - {'checkpoint_sha256'}
+        assert changed <= {'mask_lookahead', 'df_lookahead',
+                           'input_window_alignment'}, pair
+
+
+def test_dfn3_window_alignment_is_derived_from_the_lookahead():
+    assert window_alignment(0) == '[t-2,t-1,t] -> heads[t]'
+    assert window_alignment(1) == '[t-1,t,t+1] -> heads[t]'
+    assert window_alignment(2) == '[t,t+1,t+2] -> heads[t]'
+    for bad in (-1, 3):
+        with pytest.raises(ValueError, match='model contract'):
+            window_alignment(bad)
+        # Checked when the iterator is built, not when its first window is
+        # taken.
+        with pytest.raises(ValueError, match='fresh training run'):
+            feature_windows(torch.zeros(1, 1, 4, 2), bad)
+
+
+@pytest.mark.parametrize('mask', [0, 1, 2])
+def test_dfn3_feature_windows_hold_frames_t_minus_2_plus_l_to_t_plus_l(mask):
+    frames = 6
+    feature = torch.arange(1, frames + 1, dtype=torch.float32).view(1, 1, frames, 1)
+    windows = list(feature_windows(feature, mask))
+    assert len(windows) == frames
+    for t, window in enumerate(windows):
+        assert window.shape == (1, 1, 3, 1)
+        expected = [float(f + 1) if 0 <= f < frames else 0.0
+                    for f in range(t - (2 - mask), t + mask + 1)]
+        assert window.flatten().tolist() == expected, (mask, t)
+
+
+def test_dfn3_wrapper_rejects_a_model_padded_for_another_window():
+    model = _small_dfn3(1, 1)
+    model.encoder.erb_conv0[0].padding = (1, 1, 2, 0)
+    with pytest.raises(ValueError, match='pads time'):
+        StatelessDFN3Heads(model)
+
+
+def test_config_lookaheads_equal_c_header_constants():
+    """config.ini [model] holds the trained pair and dfn3_process.h the pair the
+    host is built for by default; the export metadata does not tie them, so a
+    one-sided edit would only change latency and tap alignment on the device."""
+    cfg = load_config()
+    header = (ROOT_PATH / 'dfn3_process.h').read_text()
+    pair = (c_macro(header, 'DFN3_MASK_LOOKAHEAD'),
+            c_macro(header, 'DFN3_DF_LOOKAHEAD'))
+    assert pair == (cfg.getint('model', 'mask_lookahead'),
+                    cfg.getint('model', 'df_lookahead')) == SHIPPED_PAIR
+
+
+@pytest.mark.parametrize('trained, runtime, key', [
+    ((1, 1), (1, 0), 'df_lookahead'),
+    ((1, 1), (0, 0), 'mask_lookahead'),
+    ((2, 1), (2, 2), 'df_lookahead'),
+])
+def test_checkpoint_trained_for_another_pair_is_refused_with_the_reason(
+        tmp_path, trained, runtime, key):
+    from types import SimpleNamespace
+    from AINR.DeepFilterNet3.inference import load_model
+
+    def config_for(pair, name):
+        cfg = load_config()
+        cfg.set('model', 'mask_lookahead', str(pair[0]))
+        cfg.set('model', 'df_lookahead', str(pair[1]))
+        path = tmp_path / name
+        with path.open('w') as stream:
+            cfg.write(stream)
+        return cfg, str(path)
+
+    trained_cfg, _ = config_for(trained, 'trained.ini')
+    _, runtime_path = config_for(runtime, 'runtime.ini')
+    model = build_shipped_model(trained_cfg).eval()
+    checkpoint = tmp_path / 'trained.pth'
+    torch.save({
+        'model_version': MODEL_VERSION, 'feature_version': FEATURE_VERSION,
+        'loss_version': LOSS_VERSION,
+        'contract': _checkpoint_contract(trained_cfg),
+        'state_dict': model.state_dict(),
+    }, checkpoint)
+    with pytest.raises(ValueError, match=key) as refused:
+        load_model(SimpleNamespace(config=runtime_path, model=str(checkpoint)))
+    message = str(refused.value)
+    assert 'model contract' in message and 'fresh training run' in message
 
 
 @pytest.mark.parametrize('override', [

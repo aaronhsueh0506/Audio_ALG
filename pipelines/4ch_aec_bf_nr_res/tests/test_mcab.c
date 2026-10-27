@@ -1,0 +1,5109 @@
+/**
+ * Structural and lifecycle tests for 4ch_aec_bf_nr_res/mcab.h (the flow; the objects it drives
+ * come from tests/mcab_test_rig.h, which builds them with their own libraries' init calls).
+ *
+ * The test intentionally uses equal weights as an external-beamformer stand
+ * in. The library itself must never choose those weights in production.
+ */
+
+#include "mcab.h"
+#include "mcab_internal.h"
+#include "aec_res.h"
+#include "conv_chain_mcab.h"
+#include "mcab_test_rig.h"
+#include "mcab_sample_flow.h"
+#include "fft_wrapper.h"
+#include "audio_window.h"
+
+#include <float.h>
+#include <math.h>
+#include <stdint.h>
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include <time.h>
+
+/* sqrt(2)*sin(2*pi*i/32): the phase table aec_cng_fill indexes (aec_res.h). */
+static const float kCngTable[32] = {
+    0.0f, 0.27589938f, 0.541196108f, 0.785694957f, 1.0f, 1.17587554f,
+    1.30656302f, 1.3870399f, 1.41421354f, 1.3870399f, 1.30656302f,
+    1.17587554f, 1.0f, 0.785694957f, 0.541196108f, 0.27589938f,
+    1.73191212e-16f, -0.27589938f, -0.541196108f, -0.785694957f, -1.0f,
+    -1.17587554f, -1.30656302f, -1.3870399f, -1.41421354f, -1.3870399f,
+    -1.30656302f, -1.17587554f, -1.0f, -0.785694957f, -0.541196108f,
+    -0.27589938f};
+
+static int failures = 0;
+
+#define CHECK(condition, label)                                            \
+    do {                                                                   \
+        if (condition) {                                                   \
+            printf("PASS: %s\n", label);                                   \
+        } else {                                                           \
+            printf("FAIL: %s\n", label);                                   \
+            failures += 1;                                                 \
+        }                                                                  \
+    } while (0)
+
+static int all_finite(const float* values, int count) {
+    int i;
+    for (i = 0; i < count; ++i) {
+        if (!isfinite(values[i])) return 0;
+    }
+    return 1;
+}
+
+static void fill_inputs(float* microphones, float* ref, int hop,
+                        int sample_rate, int frame_index);
+
+/* The fuse on the front frame just processed, for tests that only need the
+ * lanes advanced through a complete hop. */
+static int fuse_only(Mcab* p, const Complex* weights) {
+    McabFrame view;
+    return mcab_fuse(p, weights, NULL, &view);
+}
+
+/* Production-scale seed shared by the two residual-projection blocks: an
+ * audio-domain echo estimate against an int16^2-domain residual PSD. */
+static void seed_residual_inputs(Complex* echo, float* r2, int n) {
+    int b;
+    for (b = 0; b < n; ++b) {
+        echo[b].r = 0.05f * (float)(b - 7);
+        echo[b].i = -0.03f * (float)(b + 1);
+        r2[b] = 6.0e11f * (float)(b + 1);
+    }
+}
+
+static void test_projection_kernels(void) {
+    enum { N = 17 };
+    Complex weights[N];
+    Complex input[N];
+    Complex echo[N];
+    Complex acc_scalar[N];
+    Complex acc_dispatch[N];
+    Complex residual_scalar[N];
+    Complex residual_dispatch[N];
+    float r2[N];
+    float comfort[N];
+    float comfort_scalar[N];
+    float comfort_dispatch[N];
+    float mag2_scalar[N];
+    float mag2_dispatch[N];
+    int i;
+
+    for (i = 0; i < N; ++i) {
+        float x = (float)(i + 1);
+        weights[i].r = 0.03125f * x;
+        weights[i].i = -0.015625f * (float)(i % 5);
+        input[i].r = 0.0078125f * (float)(i - 8);
+        input[i].i = 0.00390625f * (float)(7 - i);
+        echo[i].r = 0.002f * (float)(i - 6);
+        echo[i].i = -0.001f * (float)(i + 2);
+        r2[i] = 1.0e-5f * x;
+        comfort[i] = (i % 4 == 0) ? -0.25f : 0.01f * x;
+        acc_scalar[i].r = acc_dispatch[i].r = 0.125f * x;
+        acc_scalar[i].i = acc_dispatch[i].i = -0.0625f * x;
+        comfort_scalar[i] = comfort_dispatch[i] = 0.5f * x;
+    }
+    /* Explicitly exercise both no-phase fallback shapes and a zero R2 bin. */
+    echo[0].r = echo[0].i = 0.0f;
+    echo[1].r = 1.0e-21f;
+    echo[1].i = -1.0e-21f;
+    r2[2] = 0.0f;
+
+    mcab_projection_cmac_scalar(
+        acc_scalar, weights, input, N);
+    mcab_projection_cmac(
+        acc_dispatch, weights, input, N);
+    CHECK(memcmp(acc_scalar, acc_dispatch, sizeof(acc_scalar)) == 0,
+          "context complex-MAC SIMD matches scalar bytes");
+
+    mcab_complex_mag2_scalar(mag2_scalar, input, N);
+    mcab_complex_mag2(mag2_dispatch, input, N);
+    CHECK(memcmp(mag2_scalar, mag2_dispatch, sizeof(mag2_scalar)) == 0,
+          "context magnitude-squared SIMD matches scalar bytes");
+
+    mcab_residual_vector_scalar(
+        residual_scalar, echo, r2, N);
+    mcab_residual_vector(
+        residual_dispatch, echo, r2, N);
+    CHECK(memcmp(
+              residual_scalar, residual_dispatch,
+              sizeof(residual_scalar)) == 0,
+          "residual projection SIMD matches scalar bytes");
+
+    /* The kernel's contract: |out|^2 == max(r2, 0), with echo supplying phase only. The
+     * byte-equality check above cannot see a wrong magnitude (scalar and SIMD agree on it),
+     * and the seed magnitudes (r2 ~ 1e-5, echo ~ 1e-3) are far from production, where r2 is
+     * int16^2-scaled (~1e11) against an audio-scaled echo (~1e-2); so the identity is
+     * asserted at the production levels. */
+    {
+        Complex prod_echo[N];
+        float prod_r2[N];
+        Complex prod_out[N];
+        int b;
+        seed_residual_inputs(prod_echo, prod_r2, N);
+        prod_echo[0].r = prod_echo[0].i = 0.0f;   /* no-phase fallback */
+        prod_r2[1] = 0.0f;                        /* zero-power bin */
+        mcab_residual_vector(prod_out, prod_echo, prod_r2, N);
+        for (b = 0; b < N; ++b) {
+            float got = prod_out[b].r * prod_out[b].r
+                      + prod_out[b].i * prod_out[b].i;
+            float want = prod_r2[b] > 0.0f ? prod_r2[b] : 0.0f;
+            float tol = want * 1.0e-5f + 1.0e-6f;
+            CHECK(fabsf(got - want) <= tol,
+                  "residual projection carries r2 as its squared magnitude "
+                  "at production scales");
+        }
+    }
+
+    /* Range safety, exercised where it actually lives. A length below four
+     * falls straight through to the scalar tail, so a scalar-vs-dispatch
+     * memcmp on one element compares the scalar path against itself and the
+     * vectorized repair goes untested. These pathological lanes therefore sit
+     * inside vector blocks (1, 5, 9) and one in the tail (N-1). */
+    {
+        Complex range_echo[N];
+        float range_r2[N];
+        Complex range_scalar[N];
+        Complex range_dispatch[N];
+        int b;
+
+        seed_residual_inputs(range_echo, range_r2, N);
+        /* power / mag2 overflows although the normalized result cannot. */
+        range_echo[1].r = 1.1e-6f;
+        range_echo[1].i = 0.2e-6f;
+        range_r2[1] = FLT_MAX;
+        /* mag2 itself overflows on finite components. */
+        range_echo[5].r = FLT_MAX;
+        range_echo[5].i = FLT_MAX / 2.0f;
+        range_r2[5] = 4.0f;
+        /* Below the phase floor: no usable phase, real-axis fallback. */
+        range_echo[9].r = 1.0e-9f;
+        range_echo[9].i = 0.0f;
+        /* Same overflow in the scalar tail. */
+        range_echo[N - 1].r = 2.0e-6f;
+        range_echo[N - 1].i = -0.5e-6f;
+        range_r2[N - 1] = FLT_MAX;
+
+        mcab_residual_vector_scalar(
+            range_scalar, range_echo, range_r2, N);
+        mcab_residual_vector(
+            range_dispatch, range_echo, range_r2, N);
+
+        CHECK(memcmp(range_scalar, range_dispatch,
+                     sizeof(range_scalar)) == 0,
+              "range-safe residual projection SIMD matches scalar bytes");
+        /* Compares |out|, not |out|^2 like the block above: at r2 == FLT_MAX
+         * the squared form overflows inside the assertion itself. An inf or
+         * NaN component fails this compare too, so it doubles as the
+         * finiteness check. */
+        for (b = 0; b < N; ++b) {
+            float want = sqrtf(range_r2[b]);
+            float got = hypotf(range_dispatch[b].r, range_dispatch[b].i);
+            CHECK(fabsf(got - want) <= want * 4.0e-6f,
+                  "range-safe residual projection preserves sqrt(r2)");
+        }
+    }
+
+    mcab_comfort_accumulate_scalar(
+        comfort_scalar, weights, comfort, N);
+    mcab_comfort_accumulate(
+        comfort_dispatch, weights, comfort, N);
+    CHECK(memcmp(
+              comfort_scalar, comfort_dispatch,
+              sizeof(comfort_scalar)) == 0,
+          "comfort projection SIMD matches scalar bytes");
+
+    /* n=0 is part of every header kernel's boundary contract. */
+    mcab_projection_cmac(acc_dispatch, weights, input, 0);
+    mcab_complex_mag2(mag2_dispatch, input, 0);
+    mcab_residual_vector(residual_dispatch, echo, r2, 0);
+    mcab_comfort_accumulate(
+        comfort_dispatch, weights, comfort, 0);
+    CHECK(1, "projection kernels accept an empty range");
+}
+
+/* The weight-matrix gate against its sequential definition, written out here
+ * rather than taken from the header. */
+static int weights_gate_reference(const Complex* w, size_t count) {
+    size_t i;
+    float sum = 0.0f;
+    for (i = 0; i < count; ++i) {
+        if (!isfinite(w[i].r) || !isfinite(w[i].i)) return 0;
+        sum += fabsf(w[i].r) + fabsf(w[i].i);
+    }
+    return isfinite(sum) && sum > 1e-12f;
+}
+
+static float weights_float_from_bits(uint32_t bits) {
+    float f;
+    memcpy(&f, &bits, sizeof f);
+    return f;
+}
+
+static int weights_gate_agrees(const Complex* w, size_t count) {
+    int want = weights_gate_reference(w, count);
+    return mcab_weights_valid_scalar(w, count) == want &&
+           mcab_weights_valid(w, count) == want;
+}
+
+static void test_weights_gate(void) {
+    enum { MAXC = 40 };
+    Complex w[MAXC];
+    const float specials[] = {
+        0.0f, -0.0f, 1.0f, -1.0f, 1e-13f, 1e-12f, 1.0000001e-12f,
+        FLT_MIN, FLT_MIN * 0.5f, 1.0e-40f, -1.0e-45f, 1e30f, 0x1p100f,
+        0x1.000002p100f, 0x1p101f, FLT_MAX, -FLT_MAX, INFINITY, -INFINITY,
+        NAN, weights_float_from_bits(0x7fc00001u),
+        weights_float_from_bits(0xffa00000u)};
+    const int n_special = (int)(sizeof specials / sizeof specials[0]);
+    uint32_t seed = 20240611u;
+    int ok = 1, ok_tiny = 1, ok_tail = 1, ok_big = 1, ok_edge = 1;
+    int trial, c, i;
+    size_t count;
+
+    /* Random vectors: mostly ordinary values, a few special entries. */
+    for (trial = 0; trial < 60000 && ok; ++trial) {
+        seed = seed * 1664525u + 1013904223u;
+        count = (size_t)(seed >> 8) % (MAXC + 1);
+        for (i = 0; i < (int)count; ++i) {
+            seed = seed * 1664525u + 1013904223u;
+            w[i].r = (float)((int32_t)seed >> 8) / (float)(1 << 23);
+            seed = seed * 1664525u + 1013904223u;
+            w[i].i = (float)((int32_t)seed >> 8) / (float)(1 << 23);
+            seed = seed * 1664525u + 1013904223u;
+            if ((seed >> 24) < 6u) {
+                w[i].r = specials[(seed >> 4) % (uint32_t)n_special];
+                seed = seed * 1664525u + 1013904223u;
+                if ((seed >> 24) < 128u)
+                    w[i].i = specials[(seed >> 4) % (uint32_t)n_special];
+            }
+        }
+        ok = weights_gate_agrees(w, count);
+    }
+
+    /* Every special in every position of every length, against zeros and
+     * against ones. */
+    for (c = 0; c <= 12 && ok_edge; ++c) {
+        int s, pos, comp, fill;
+        for (fill = 0; fill < 2 && ok_edge; ++fill)
+            for (s = 0; s < n_special && ok_edge; ++s)
+                for (pos = 0; pos < c && ok_edge; ++pos)
+                    for (comp = 0; comp < 2 && ok_edge; ++comp) {
+                        for (i = 0; i < c; ++i) {
+                            w[i].r = fill ? 1.0f : 0.0f;
+                            w[i].i = 0.0f;
+                        }
+                        if (comp) w[pos].i = specials[s];
+                        else w[pos].r = specials[s];
+                        ok_edge = weights_gate_agrees(w, (size_t)c);
+                    }
+    }
+    CHECK(ok && ok_edge,
+          "weight gate: dispatch and scalar twin equal the sequential definition");
+
+    /* Only small terms: the sequential sum decides, and it crosses the floor
+     * after enough of them. */
+    for (c = 1; c <= MAXC && ok_tiny; ++c) {
+        for (i = 0; i < c; ++i) { w[i].r = 3e-14f; w[i].i = 0.0f; }
+        ok_tiny = weights_gate_agrees(w, (size_t)c);
+    }
+    for (i = 0; i < 40; ++i) { w[i].r = 3e-14f; w[i].i = 0.0f; }
+    CHECK(ok_tiny && mcab_weights_valid(w, 40) == 1 &&
+          mcab_weights_valid(w, 8) == 0,
+          "weight gate: small terms that only add up past 1e-12 pass");
+
+    /* The single qualifying term sits in the scalar tail. */
+    for (c = 1; c <= 11 && ok_tail; ++c) {
+        for (i = 0; i < c; ++i) { w[i].r = 0.0f; w[i].i = 0.0f; }
+        w[c - 1].i = 2e-12f;
+        ok_tail = weights_gate_agrees(w, (size_t)c) &&
+                  mcab_weights_valid(w, (size_t)c) == 1;
+        w[c - 1].i = 1e-12f;
+        ok_tail = ok_tail && mcab_weights_valid(w, (size_t)c) == 0;
+    }
+    CHECK(ok_tail, "weight gate: a lone term above 1e-12 in the tail decides");
+
+    /* Terms above the screen bound and sums that overflow. */
+    for (i = 0; i < MAXC; ++i) { w[i].r = 0x1p100f; w[i].i = 0.0f; }
+    ok_big = weights_gate_agrees(w, MAXC) &&
+             mcab_weights_valid(w, MAXC) == 1;
+    for (i = 0; i < MAXC; ++i) { w[i].r = 0x1p127f; w[i].i = 0.0f; }
+    ok_big = ok_big && weights_gate_agrees(w, MAXC) &&
+             mcab_weights_valid(w, MAXC) == 0;
+    for (i = 0; i < MAXC; ++i) { w[i].r = FLT_MAX; w[i].i = FLT_MAX; }
+    ok_big = ok_big && mcab_weights_valid(w, MAXC) == 0;
+    for (i = 0; i < MAXC; ++i) { w[i].r = 0x1.000002p100f; w[i].i = 0.0f; }
+    ok_big = ok_big && weights_gate_agrees(w, MAXC) &&
+             mcab_weights_valid(w, MAXC) == 1;
+    CHECK(ok_big, "weight gate: large terms and an overflowing sum");
+
+    CHECK(mcab_weights_valid(w, 0) == 0,
+          "weight gate: an empty matrix is refused");
+}
+
+/* The default lane as mcab.h documents it, written out here: lib/aec's balanced preset on the
+ * flow's rate and grid, EXTERNAL_ALIGNED, the linear context returned without a gain of its own,
+ * the context level of enable_post and the flow's duty period. -1 for a config the flow refuses. */
+static int lane_config_for(const McabConfig* cfg, AecConfig* out) {
+    McabMemBreakdown b;
+    if (mcab_get_mem_breakdown(cfg, &b) != 0) return -1;
+    memset(out, 0, sizeof(*out));
+    aec_config_from_preset(out, AEC_PRESET_BALANCED, cfg->sample_rate);
+    out->fft_size = b.fft_size;
+    out->delay_mode = AEC_DELAY_EXTERNAL_ALIGNED;
+    out->delay_num_filters = DA_NUM_FILTERS;
+    out->fixed_delay_samples = -1;
+    out->enable_delay_est = 0;
+    out->enable_res = 0;
+    out->return_res_context = 1;
+    out->spatial_linear_context = cfg->enable_post ? AEC_CONTEXT_NO_GAIN : AEC_CONTEXT_LINEAR_ONLY;
+    out->delay_est_period_s = cfg->delay_est_period_s;
+    return 0;
+}
+
+/* The chain options of a post-beam stage chain with comfort noise off. */
+static ConvChainOptions no_cng_options(void) {
+    ConvChainOptions o = conv_default_options();
+    o.enable_cng = 0;
+    return o;
+}
+
+static void test_trusted_spectrum_path(void) {
+    McabConfig cfg = mcab_default_config(16000);
+    ConvChainOptions opt = no_cng_options();
+    ConvChain* reconstructed = NULL;
+    ConvChain* trusted = NULL;
+    float* microphones = NULL;
+    float* ref = NULL;
+    float* reconstructed_out = NULL;
+    float* trusted_out = NULL;
+    Complex* weights = NULL;
+    Complex* trusted_spectrum = NULL;
+    int hop;
+    int n_freqs;
+    int frame;
+    int ch;
+    int k;
+
+    cfg.fft_size = 256;
+    reconstructed = conv_create(&cfg, &opt);
+    trusted = conv_create(&cfg, &opt);
+    CHECK(reconstructed && trusted,
+          "trusted-spectrum parity instances create");
+    if (!reconstructed || !trusted) goto cleanup;
+
+    hop = reconstructed->hop;
+    n_freqs = reconstructed->n_freqs;
+    microphones = (float*)calloc(
+        (size_t)hop * MCAB_CHANNELS, sizeof(float));
+    ref = (float*)calloc((size_t)hop, sizeof(float));
+    reconstructed_out = (float*)calloc((size_t)hop, sizeof(float));
+    trusted_out = (float*)calloc((size_t)hop, sizeof(float));
+    weights = (Complex*)calloc(
+        (size_t)MCAB_CHANNELS * n_freqs,
+        sizeof(Complex));
+    trusted_spectrum = (Complex*)calloc(
+        (size_t)n_freqs, sizeof(Complex));
+    CHECK(microphones && ref && reconstructed_out && trusted_out &&
+              weights && trusted_spectrum,
+          "trusted-spectrum parity buffers allocate");
+    if (!microphones || !ref || !reconstructed_out || !trusted_out ||
+        !weights || !trusted_spectrum) goto cleanup;
+
+    for (ch = 0; ch < MCAB_CHANNELS; ++ch) {
+        for (k = 0; k < n_freqs; ++k) {
+            Complex* w = weights + (size_t)ch * n_freqs + k;
+            w->r = 0.20f + 0.025f * (float)ch;
+            w->i = 0.0001f * (float)((k % 7) - 3) * (float)ch;
+        }
+    }
+
+    for (frame = 0; frame < 4; ++frame) {
+        fill_inputs(microphones, ref, hop, 16000, frame);
+        CHECK(mcab_process_front(
+                  reconstructed->core, microphones, ref, &reconstructed->front) ==
+                  MCAB_OK &&
+              mcab_process_front(
+                  trusted->core, microphones, ref, &trusted->front) ==
+                  MCAB_OK,
+              "trusted-spectrum parity front stages succeed");
+        memset(
+            trusted_spectrum, 0,
+            (size_t)n_freqs * sizeof(Complex));
+        for (ch = 0; ch < MCAB_CHANNELS; ++ch) {
+            mcab_projection_cmac_scalar(
+                trusted_spectrum,
+                weights + (size_t)ch * n_freqs,
+                trusted->front.linear_spectra[ch], n_freqs);
+        }
+        CHECK(conv_post(reconstructed, weights, NULL, reconstructed_out) ==
+                  MCAB_OK &&
+              conv_post(trusted, weights, trusted_spectrum, trusted_out) ==
+                  MCAB_OK,
+              "trusted and reconstructed fuse stages succeed");
+        CHECK(trusted->frame.e == trusted_spectrum &&
+              reconstructed->frame.e != trusted_spectrum,
+              "a supplied spectrum is used in place, a missing one rebuilt");
+        CHECK(memcmp(
+                  reconstructed_out, trusted_out,
+                  (size_t)hop * sizeof(float)) == 0,
+              "trusted spectrum skips reconstruction without output drift");
+    }
+
+cleanup:
+    free(trusted_spectrum);
+    free(weights);
+    free(trusted_out);
+    free(reconstructed_out);
+    free(ref);
+    free(microphones);
+    conv_destroy(trusted);
+    conv_destroy(reconstructed);
+}
+
+/* A beamformed spectrum handed to the fuse must be finite in every bin and
+ * component: one NaN or infinity anywhere is a DSP error. */
+static void test_trusted_spectrum_finite_gate(void) {
+    McabConfig cfg = mcab_default_config(16000);
+    Mcab* p;
+    float* microphones;
+    float* ref;
+    Complex* weights;
+    Complex* trusted_spectrum;
+    int n_freqs;
+    int hop;
+    int ch;
+    int k;
+    int ok_clean = 1;
+    int ok_bad = 1;
+    const float bad_values[4] = {
+        (float)NAN, INFINITY, -INFINITY, -(float)NAN};
+    const int bin_count_offsets[9] = {0, 1, 2, 3, 4, 5, 64, 127, 128};
+    int frame = 0;
+    int v;
+    int comp;
+    int b;
+
+    cfg.fft_size = 256;
+    p = mcab_test_create(&cfg);
+    CHECK(p != NULL, "finite gate: core creates");
+    if (!p) return;
+    hop = mcab_hop_size(p);
+    n_freqs = mcab_n_freqs(p);
+    microphones = (float*)calloc(
+        (size_t)hop * MCAB_CHANNELS, sizeof(float));
+    ref = (float*)calloc((size_t)hop, sizeof(float));
+    weights = (Complex*)calloc(
+        (size_t)MCAB_CHANNELS * n_freqs, sizeof(Complex));
+    trusted_spectrum = (Complex*)calloc((size_t)n_freqs, sizeof(Complex));
+    if (!microphones || !ref || !weights || !trusted_spectrum) {
+        CHECK(0, "finite gate: buffers allocate");
+        goto cleanup;
+    }
+    for (ch = 0; ch < MCAB_CHANNELS; ++ch)
+        for (k = 0; k < n_freqs; ++k) {
+            weights[(size_t)ch * n_freqs + k].r = 0.25f;
+            weights[(size_t)ch * n_freqs + k].i = 0.0f;
+        }
+    for (k = 0; k < n_freqs; ++k) {
+        trusted_spectrum[k].r = 1e-3f * (float)(k % 5);
+        trusted_spectrum[k].i = -1e-3f * (float)(k % 3);
+    }
+    {
+        McabFront front;
+        McabFrame view;
+        fill_inputs(microphones, ref, hop, 16000, frame++);
+        ok_clean = mcab_process_front(p, microphones, ref, &front) ==
+                       MCAB_OK &&
+                   mcab_fuse(p, weights, trusted_spectrum, &view) ==
+                       MCAB_OK;
+        for (v = 0; v < 4 && ok_bad; ++v)
+            for (comp = 0; comp < 2 && ok_bad; ++comp)
+                for (b = 0; b < 9 && ok_bad; ++b) {
+                    Complex saved;
+                    int bin = bin_count_offsets[b];
+                    if (bin >= n_freqs) bin = n_freqs - 1;
+                    saved = trusted_spectrum[bin];
+                    if (comp) trusted_spectrum[bin].i = bad_values[v];
+                    else trusted_spectrum[bin].r = bad_values[v];
+                    fill_inputs(microphones, ref, hop, 16000, frame++);
+                    ok_bad = mcab_process_front(
+                                 p, microphones, ref, &front) ==
+                                 MCAB_OK &&
+                             mcab_fuse(
+                                 p, weights, trusted_spectrum, &view) ==
+                                 MCAB_DSP_ERROR;
+                    trusted_spectrum[bin] = saved;
+                }
+    }
+    CHECK(ok_clean, "finite gate: a finite beamformed spectrum is accepted");
+    CHECK(ok_bad,
+          "finite gate: a NaN or infinity in any component is a DSP error");
+    {
+        /* A DSP refusal resets the flow (mcab.h): the front is gone, so the next fuse is a
+         * sequence error, and the shared estimator's census starts over. */
+        McabFront front;
+        McabFrame view;
+        int warm;
+        fill_inputs(microphones, ref, hop, 16000, frame++);
+        warm = mcab_process_front(p, microphones, ref, &front) == MCAB_OK;
+        fill_inputs(microphones, ref, hop, 16000, frame++);
+        warm = warm && mcab_process_front(p, microphones, ref, &front) == MCAB_OK &&
+               mcab_duty_hops_total(p) >= 2;
+        trusted_spectrum[3].r = (float)NAN;
+        CHECK(warm && mcab_fuse(p, weights, trusted_spectrum, &view) == MCAB_DSP_ERROR &&
+                  mcab_fuse(p, weights, NULL, &view) == MCAB_SEQUENCE_ERROR &&
+                  mcab_duty_hops_total(p) == 0,
+              "finite gate: the DSP refusal reset the flow (no front, census restarted)");
+    }
+
+cleanup:
+    free(trusted_spectrum);
+    free(weights);
+    free(ref);
+    free(microphones);
+    mcab_test_destroy(p);
+}
+
+static void fill_inputs(float* microphones, float* ref, int hop,
+                        int sample_rate, int frame_index) {
+    int i;
+    int ch;
+    for (i = 0; i < hop; ++i) {
+        int64_t absolute = (int64_t)frame_index * hop + i;
+        float phase = 2.0f * 3.14159265358979323846f *
+                      440.0f * (float)absolute / (float)sample_rate;
+        ref[i] = 0.08f * sinf(phase);
+        for (ch = 0; ch < MCAB_CHANNELS; ++ch) {
+            float near = 0.01f * sinf(
+                phase * (1.0f + 0.05f * (float)ch));
+            microphones[
+                i * MCAB_CHANNELS + ch] =
+                ref[i] * (0.4f + 0.05f * (float)ch) + near;
+        }
+    }
+}
+
+static int run_grid(int sample_rate, int fft_size) {
+    McabConfig cfg;
+    ConvChainOptions opt = no_cng_options();
+    Mcab* p;
+    ConvChain* chain;
+    McabFront pre;
+    McabFrame frame_view;
+    float* microphones;
+    float* ref;
+    float* out;
+    Complex* weights;
+    int hop;
+    int n_freqs;
+    int frame;
+    int ch;
+    int k;
+    int rc;
+
+    cfg = mcab_default_config(sample_rate);
+    cfg.fft_size = fft_size;
+    p = mcab_test_create(&cfg);
+    CHECK(p != NULL, "create supported rate");
+    if (!p) return 0;
+
+    hop = mcab_hop_size(p);
+    n_freqs = mcab_n_freqs(p);
+    CHECK(hop == fft_size / 2,
+          "rate-specific hop");
+    CHECK(mcab_fft_size(p) == 2 * hop,
+          "FFT is two hops");
+    CHECK(mcab_sample_rate(p) == sample_rate,
+          "sample-rate accessor");
+    CHECK(mcab_matched_filter_count(p) == 1,
+          "one shared matcher");
+    CHECK(mcab_linear_aec_count(p) ==
+              MCAB_CHANNELS,
+          "four linear AEC filters");
+
+    microphones = (float*)calloc(
+        (size_t)hop * MCAB_CHANNELS, sizeof(float));
+    ref = (float*)calloc((size_t)hop, sizeof(float));
+    out = (float*)calloc((size_t)hop, sizeof(float));
+    weights = (Complex*)calloc(
+        (size_t)MCAB_CHANNELS * n_freqs,
+        sizeof(Complex));
+    chain = conv_attach(p, &cfg, &opt);
+    CHECK(microphones && ref && out && weights && chain,
+          "test buffers and post stages allocate");
+    if (!microphones || !ref || !out || !weights || !chain) {
+        free(microphones);
+        free(ref);
+        free(out);
+        free(weights);
+        conv_destroy(chain);
+        mcab_test_destroy(p);
+        return 0;
+    }
+
+    for (ch = 0; ch < MCAB_CHANNELS; ++ch) {
+        for (k = 0; k < n_freqs; ++k) {
+            weights[(size_t)ch * n_freqs + k].r = 0.25f;
+        }
+    }
+
+    /* The fuse needs a front frame processed since construction. */
+    CHECK(mcab_fuse(p, weights, NULL, &frame_view) ==
+              MCAB_SEQUENCE_ERROR,
+          "fuse before any front frame is a sequence error");
+
+    for (frame = 0; frame < 3; ++frame) {
+        fill_inputs(microphones, ref, hop, sample_rate, frame);
+        rc = mcab_process_front(
+            p, microphones, ref, &pre);
+        CHECK(rc == MCAB_OK, "front stage succeeds");
+        if (rc != MCAB_OK) break;
+        CHECK(pre.hop_size == hop && pre.n_freqs == n_freqs &&
+              pre.n_channels == MCAB_CHANNELS &&
+              pre.aligned_ref != NULL,
+              "front view shape contract");
+        for (ch = 0; ch < MCAB_CHANNELS; ++ch) {
+            CHECK(pre.linear_spectra[ch] != NULL &&
+                  all_finite(pre.formed_hop[ch], hop),
+                  "lane spectrum and finite formed hop");
+        }
+
+        rc = conv_post(chain, weights, NULL, out);
+        CHECK(rc == MCAB_OK, "fuse + NR/RES stages succeed");
+        CHECK(all_finite(out, hop), "mono output is finite");
+    }
+
+    fill_inputs(microphones, ref, hop, sample_rate, 4);
+    CHECK(mcab_process_front(
+              p, microphones, ref, &pre) == MCAB_OK,
+          "front before reset succeeds");
+    mcab_reset(p);
+    CHECK(mcab_fuse(p, weights, NULL, &frame_view) ==
+              MCAB_SEQUENCE_ERROR,
+          "reset invalidates the front frame");
+
+    fill_inputs(microphones, ref, hop, sample_rate, 5);
+    CHECK(mcab_process_front(
+              p, microphones, ref, &pre) == MCAB_OK,
+          "front after reset succeeds");
+    memset(weights, 0,
+           (size_t)MCAB_CHANNELS * n_freqs *
+           sizeof(Complex));
+    CHECK(mcab_fuse(p, weights, NULL, &frame_view) ==
+              MCAB_INVALID_ARGUMENT,
+          "all-zero beamformer weights are rejected");
+    for (ch = 0; ch < MCAB_CHANNELS; ++ch) {
+        for (k = 0; k < n_freqs; ++k) {
+            weights[(size_t)ch * n_freqs + k].r = 0.25f;
+        }
+    }
+    CHECK(mcab_fuse(p, weights, NULL, &frame_view) ==
+              MCAB_OK,
+          "the front frame may retry after invalid weights");
+    CHECK(mcab_fuse(NULL, weights, NULL, &frame_view) ==
+              MCAB_INVALID_ARGUMENT &&
+          mcab_fuse(p, NULL, NULL, &frame_view) ==
+              MCAB_INVALID_ARGUMENT &&
+          mcab_fuse(p, weights, NULL, NULL) ==
+              MCAB_INVALID_ARGUMENT,
+          "fuse rejects NULL arguments");
+    CHECK(frame_view.n_freqs == n_freqs && frame_view.hop == hop &&
+          frame_view.e != NULL && frame_view.r2 != NULL &&
+          frame_view.cn != NULL && frame_view.g_res_ctx == NULL &&
+          frame_view.far_hop == pre.aligned_ref,
+          "fused frame carries E, R^2, comfort noise and the aligned far");
+
+    free(microphones);
+    free(ref);
+    free(out);
+    free(weights);
+    conv_destroy(chain);
+    mcab_test_destroy(p);
+    return 1;
+}
+
+static void test_invalid_configs(void) {
+    McabConfig cfg;
+    McabMemReq req;
+
+    cfg = mcab_default_config(8000);
+    CHECK(mcab_test_create(&cfg) == NULL,
+          "8 kHz is outside the 4-channel contract");
+    CHECK(mcab_get_mem_requirements(&cfg, &req) != 0,
+          "static sizing rejects 8 kHz");
+
+    cfg = mcab_default_config(16000);
+    cfg.fft_size = 1024;
+    CHECK(mcab_test_create(&cfg) == NULL,
+          "cross-rate FFT grid is rejected");
+
+    cfg = mcab_default_config(16000);
+    cfg.capture_proxy_channel = 4;
+    CHECK(mcab_test_create(&cfg) == NULL,
+          "invalid capture proxy is rejected");
+
+    cfg = mcab_default_config(16000);
+    CHECK(cfg.enable_post == 1, "the default config keeps the post context on");
+    cfg.enable_post = 2;
+    CHECK(mcab_test_create(&cfg) == NULL &&
+          mcab_get_mem_requirements(&cfg, &req) != 0,
+          "a non-boolean post-context enable is rejected by create and sizing");
+
+    /* Backward-jump quarantine. The WINDOW is checked even though the enable
+     * defaults to 0: a config that would misbehave the moment someone flips
+     * one field must not pass validation today. The accept row at the end is
+     * what stops all of this from being a comparison that cannot fail. */
+    cfg = mcab_default_config(16000);
+    CHECK(cfg.delay_backward_quarantine_enabled == 0 &&
+          cfg.delay_backward_quarantine_s == 1.0f,
+          "the quarantine defaults to OFF with a 1.0 s window");
+    cfg.delay_backward_quarantine_enabled = 2;
+    CHECK(mcab_test_create(&cfg) == NULL,
+          "a non-boolean quarantine enable is rejected");
+
+    cfg = mcab_default_config(16000);
+    cfg.delay_backward_quarantine_s = -1.0f;
+    CHECK(mcab_test_create(&cfg) == NULL,
+          "a negative quarantine window is rejected");
+    cfg.delay_backward_quarantine_s = 3601.0f;
+    CHECK(mcab_test_create(&cfg) == NULL,
+          "an out-of-range quarantine window is rejected");
+    cfg.delay_backward_quarantine_s = (float)NAN;
+    CHECK(mcab_test_create(&cfg) == NULL,
+          "a NaN quarantine window is rejected");
+
+    cfg = mcab_default_config(16000);
+    cfg.delay_backward_quarantine_enabled = 1;
+    cfg.delay_backward_quarantine_s = 0.25f;
+    CHECK(mcab_get_mem_requirements(&cfg, &req) == 0,
+          "a valid enabled quarantine config is ACCEPTED (so the rows above "
+          "are a real check, not an identity)");
+
+    /* Shared-estimator duty-cycle throttle: same range contract as the
+     * quarantine window above, and checked for the same reason -- a config
+     * that would misbehave the moment someone opts into the throttle must
+     * not pass validation today. */
+    cfg = mcab_default_config(16000);
+    CHECK(cfg.delay_est_period_s == 0.0f,
+          "the duty-cycle throttle defaults to OFF (full rate)");
+    cfg.delay_est_period_s = -1.0f;
+    CHECK(mcab_test_create(&cfg) == NULL,
+          "a negative duty-cycle period is rejected");
+    cfg.delay_est_period_s = 3601.0f;
+    CHECK(mcab_test_create(&cfg) == NULL,
+          "an out-of-range duty-cycle period is rejected");
+    cfg.delay_est_period_s = (float)NAN;
+    CHECK(mcab_test_create(&cfg) == NULL,
+          "a NaN duty-cycle period is rejected");
+
+    cfg = mcab_default_config(16000);
+    cfg.delay_est_period_s = 0.5f;
+    CHECK(mcab_get_mem_requirements(&cfg, &req) == 0,
+          "a valid opted-in duty-cycle period is ACCEPTED (so the rows above "
+          "are a real check, not an identity)");
+}
+
+static void run_static_parity(int sample_rate, int fft_size) {
+    McabConfig cfg;
+    ConvChain* heap_chain = NULL;
+    ConvChain* stat_chain = NULL;
+    McabMemReq req;
+    McabMemReq stale;
+    McabMemBreakdown breakdown;
+    McabTestLibs objs;
+    Mcab* heap = NULL;
+    Mcab* stat = NULL;
+    McabFront heap_pre;
+    McabFront stat_pre;
+    unsigned char* pool = NULL;
+    float* microphones = NULL;
+    float* ref = NULL;
+    float* heap_out = NULL;
+    float* stat_out = NULL;
+    Complex* weights = NULL;
+    int hop;
+    int n_freqs;
+    int frame;
+    int ch;
+    int k;
+    int rc;
+
+    cfg = mcab_default_config(sample_rate);
+    cfg.fft_size = fft_size;
+    rc = mcab_get_mem_requirements(&cfg, &req);
+    CHECK(rc == 0, "static memory requirement query succeeds");
+    CHECK(
+        mcab_get_mem_breakdown(&cfg, &breakdown) == 0 &&
+        req.bytes == (uint64_t)breakdown.total_bytes &&
+        breakdown.control_bytes > 0 &&
+        breakdown.buffer_bytes > 0 &&
+        breakdown.total_bytes == breakdown.control_bytes + breakdown.buffer_bytes,
+        "static memory breakdown reconciles with descriptor");
+    {
+        AecConfig lane;
+        CHECK(mcab_lane_config(&cfg, &lane) == 0 && aec_get_mem_size(&lane) > 0,
+              "the lanes the flow drives have a pool of their own");
+    }
+    if (rc != 0 || req.bytes > (uint64_t)SIZE_MAX) return;
+    CHECK(mcab_test_libs_create(&cfg, &objs) == 0, "lanes and estimator for the caller pool build");
+
+    if (posix_memalign(
+            (void**)&pool, (size_t)req.alignment,
+            (size_t)req.bytes + 32u) != 0)
+        pool = NULL;
+    CHECK(pool != NULL, "aligned caller pool allocates");
+    if (!pool) return;
+    memset(pool, 0xa5, (size_t)req.bytes + 32u);
+
+    CHECK(mcab_init(
+              pool + 1, (size_t)req.bytes, &cfg, &objs.libs) == NULL,
+          "static init rejects a misaligned pool");
+    CHECK(mcab_init(
+              pool, (size_t)req.bytes - 1u, &cfg, &objs.libs) == NULL,
+          "static init rejects an undersized pool");
+
+    stale = req;
+    stale.descriptor_version += 1u;
+    CHECK(mcab_init_ex(
+              pool, (size_t)req.bytes, &cfg, &objs.libs, &stale) == NULL,
+          "static init_ex rejects a stale descriptor ABI");
+    stale = req;
+    stale.layout_version += 1u;
+    CHECK(mcab_init_ex(
+              pool, (size_t)req.bytes, &cfg, &objs.libs, &stale) == NULL,
+          "static init_ex rejects a stale carve layout");
+    stale = req;
+    stale.backend_id = 99u;
+    CHECK(mcab_init_ex(
+              pool, (size_t)req.bytes, &cfg, &objs.libs, &stale) == NULL,
+          "static init_ex rejects a backend mismatch");
+    stale = req;
+    stale.build_flags_hash ^= 0xffffffffu;
+    CHECK(mcab_init_ex(
+              pool, (size_t)req.bytes, &cfg, &objs.libs, &stale) == NULL,
+          "static init_ex rejects a build-layout mismatch");
+    stale = req;
+    stale.alignment *= 2u;
+    CHECK(mcab_init_ex(
+              pool, (size_t)req.bytes, &cfg, &objs.libs, &stale) == NULL,
+          "static init_ex rejects an alignment mismatch");
+    stale = req;
+    stale.reserved = 1u;
+    CHECK(mcab_init_ex(
+              pool, (size_t)req.bytes, &cfg, &objs.libs, &stale) == NULL,
+          "static init_ex rejects a corrupt reserved field");
+    stale = req;
+    stale.bytes -= 1u;
+    CHECK(mcab_init_ex(
+              pool, (size_t)req.bytes, &cfg, &objs.libs, &stale) == NULL,
+          "static init_ex rejects stale descriptor bytes");
+    stale = req;
+    stale.layout_version -= 1u;
+    stale.bytes += 4096u;
+    CHECK(mcab_init_ex(
+              pool, (size_t)req.bytes, &cfg, &objs.libs, &stale) == NULL,
+          "static init_ex rejects a stale layout even when its cached "
+          "bytes are larger than current (byte count fitting must never "
+          "substitute for layout/hash agreement)");
+    /* A descriptor from an older layout, with the current byte count so the layout is the only
+     * mismatch. A control-block-only growth moves no carve token, so build_flags_hash still
+     * matches and the layout counter is the whole signal. Keep the literals in step with
+     * MCAB_LAYOUT_VERSION. */
+    stale = req;
+    stale.layout_version = 24u;
+    CHECK(mcab_init_ex(
+              pool, (size_t)req.bytes, &cfg, &objs.libs, &stale) == NULL,
+          "static init_ex rejects a descriptor from the superseded layout "
+          "even when its byte count exactly covers the current pool");
+    /* 21..24 belonged to the two predecessor layers (MCAB_LAYOUT_VERSION's comment); 17 and 20
+     * are older unit layouts that a persisted descriptor might still carry. */
+    for (k = 17; k <= 23; ++k) {
+        stale = req;
+        stale.layout_version = (uint32_t)k;
+        stale.bytes += 4096u;
+        CHECK(mcab_init_ex(pool, (size_t)req.bytes, &cfg, &objs.libs, &stale) == NULL,
+              "static init_ex rejects every predecessor layout (17..24), even with larger cached bytes");
+    }
+    {
+        int untouched = 1;
+        for (k = 0; k < (int)req.bytes + 32; ++k) untouched &= pool[k] == 0xa5;
+        CHECK(untouched, "every refused init left the pool unwritten");
+    }
+    CHECK(req.layout_version == MCAB_LAYOUT_VERSION &&
+          MCAB_LAYOUT_VERSION == 25u,
+          "the queried descriptor publishes the current carve layout");
+
+    stat = mcab_init_ex(
+        pool, (size_t)req.bytes, &cfg, &objs.libs, &req);
+    heap = mcab_test_create(&cfg);
+    CHECK(stat != NULL && heap != NULL,
+          "poisoned caller pool and heap construction both succeed");
+    if (!stat || !heap) goto cleanup;
+    heap_chain = conv_attach(heap, &cfg, NULL);
+    stat_chain = conv_attach(stat, &cfg, NULL);
+    CHECK(heap_chain && stat_chain, "post stages for both instances build");
+    if (!heap_chain || !stat_chain) goto cleanup;
+
+    for (k = 0; k < 32; ++k) {
+        if (pool[(size_t)req.bytes + (size_t)k] != 0xa5) break;
+    }
+    CHECK(k == 32, "static init stays inside the queried pool");
+
+    hop = mcab_hop_size(stat);
+    n_freqs = mcab_n_freqs(stat);
+    microphones = (float*)calloc(
+        (size_t)hop * MCAB_CHANNELS, sizeof(float));
+    ref = (float*)calloc((size_t)hop, sizeof(float));
+    heap_out = (float*)calloc((size_t)hop, sizeof(float));
+    stat_out = (float*)calloc((size_t)hop, sizeof(float));
+    weights = (Complex*)calloc(
+        (size_t)MCAB_CHANNELS * n_freqs,
+        sizeof(Complex));
+    CHECK(microphones && ref && heap_out && stat_out && weights,
+          "static parity buffers allocate");
+    if (!microphones || !ref || !heap_out || !stat_out || !weights)
+        goto cleanup;
+
+    for (ch = 0; ch < MCAB_CHANNELS; ++ch) {
+        for (k = 0; k < n_freqs; ++k)
+            weights[(size_t)ch * n_freqs + k].r = 0.25f;
+    }
+
+    for (frame = 0; frame < 4; ++frame) {
+        fill_inputs(microphones, ref, hop, sample_rate, frame);
+        if (mcab_process_front(
+                heap, microphones, ref, &heap_pre) !=
+                MCAB_OK ||
+            mcab_process_front(
+                stat, microphones, ref, &stat_pre) !=
+                MCAB_OK) {
+            CHECK(0, "heap/static pre stages both succeed");
+            break;
+        }
+        for (ch = 0; ch < MCAB_CHANNELS; ++ch)
+            CHECK(memcmp(
+                      heap_pre.formed_hop[ch],
+                      stat_pre.formed_hop[ch],
+                      (size_t)hop * sizeof(float)) == 0,
+                  "heap/static linear outputs are byte-identical");
+
+        if (conv_post(heap_chain, weights, NULL, heap_out) !=
+                MCAB_OK ||
+            conv_post(stat_chain, weights, NULL, stat_out) !=
+                MCAB_OK) {
+            CHECK(0, "heap/static post stages both succeed");
+            break;
+        }
+        CHECK(memcmp(
+                  heap_out, stat_out,
+                  (size_t)hop * sizeof(float)) == 0,
+              "heap/static mono outputs are byte-identical");
+    }
+
+    {
+        /* mcab_destroy() touches no library object: the lanes' pools stay byte-identical. */
+        AecConfig lane;
+        size_t lane_bytes;
+        unsigned char* before = NULL;
+        int same = 1;
+        mcab_lane_config(&cfg, &lane);
+        lane_bytes = aec_get_mem_size(&lane);
+        before = (unsigned char*)malloc(lane_bytes * MCAB_CHANNELS);
+        for (ch = 0; before && ch < MCAB_CHANNELS; ++ch)
+            memcpy(before + (size_t)ch * lane_bytes, objs.lane_mem[ch], lane_bytes);
+        mcab_destroy(stat);
+        for (ch = 0; before && ch < MCAB_CHANNELS; ++ch)
+            same &= memcmp(before + (size_t)ch * lane_bytes, objs.lane_mem[ch], lane_bytes) == 0;
+        CHECK(before && same, "mcab_destroy leaves the four lane pools byte-identical");
+        free(before);
+    }
+    CHECK(mcab_hop_size(stat) == -1,
+          "destroy marks a caller-pool instance inactive");
+    mcab_destroy(stat);
+    CHECK(mcab_hop_size(stat) == -1,
+          "caller-pool destroy is idempotent");
+    CHECK(aec_hop_size(objs.libs.lanes[0]) == hop,
+          "mcab_destroy leaves the injected lanes alive");
+    stat = mcab_init_ex(
+        pool, (size_t)req.bytes, &cfg, &objs.libs, &req);
+    CHECK(stat != NULL, "caller pool is reusable after destroy");
+    CHECK(stat != NULL &&
+              mcab_process_front(stat, microphones, ref, &stat_pre) == MCAB_OK,
+          "the lanes keep working for a flow built again on them");
+
+cleanup:
+    conv_destroy(stat_chain);
+    conv_destroy(heap_chain);
+    mcab_destroy(stat);
+    mcab_test_destroy(heap);
+    mcab_test_libs_free(&objs);
+    free(weights);
+    free(stat_out);
+    free(heap_out);
+    free(ref);
+    free(microphones);
+    free(pool);
+}
+
+/* The WOLA identity below is measured across a realign boundary, so the scene is a delayed
+ * echo that MOVES: on a zero-delay scene `changed` realigns by a delta of 0, which
+ * aec_apply_external_realign() treats as a no-op. `history` holds WOLA_SCENE_PAD samples of
+ * pre-roll so the echo is valid from the first sample. The run is long because the second
+ * boundary is a re-lock and the shared matched filter is duty-cycled (coarsest grid:
+ * 48 kHz, hop 512), so the scene has to outlast the decimated analysis. */
+#define WOLA_SCENE_PAD   16384
+#define WOLA_SHIFT_HOP   150
+#define WOLA_SCENE_HOPS  3000
+
+static void fill_delayed_echo(float* microphones, float* ref, int hop,
+                              const float* history, int base, int delay) {
+    int i;
+    int ch;
+    for (i = 0; i < hop; ++i) {
+        float echo = 0.6f * history[base + i - delay];
+        ref[i] = history[base + i];
+        for (ch = 0; ch < MCAB_CHANNELS; ++ch) {
+            microphones[i * MCAB_CHANNELS + ch] =
+                echo * (1.0f + 0.05f * (float)ch);
+        }
+    }
+}
+
+static void test_pre_frame_wola_identity(int sample_rate, int fft_size) {
+    McabConfig cfg = mcab_default_config(sample_rate);
+    Mcab* pipeline = NULL;
+    McabFront pre;
+    FftHandle* fft = NULL;
+    float* microphones = NULL;
+    float* ref = NULL;
+    float* out = NULL;
+    float* previous = NULL;
+    float* ola = NULL;
+    float* time_frame = NULL;
+    Complex* weights = NULL;
+    float* window = NULL;
+    float* history = NULL;
+    uint32_t rng = 0x1234567u;
+    float max_error = 0.0f;
+    long sweeps_before = 0;
+    int applied_before = -1;
+    int moving_realigns = 0;
+    int lanes_swept_on_moves = 0;
+    int rate_scale = sample_rate / 16000;
+    int base_delay = 512 * rate_scale;
+    int moved_delay = 1024 * rate_scale;
+    int valid = 1;
+    int hop;
+    int n_freqs;
+    char label[224];
+
+    cfg.fft_size = fft_size;
+    pipeline = mcab_test_create(&cfg);
+    if (pipeline) fft = fft_create(fft_size);
+    CHECK(pipeline != NULL && fft != NULL,
+          "4ch WOLA identity instances create");
+    if (!pipeline || !fft) goto cleanup;
+
+    hop = mcab_hop_size(pipeline);
+    n_freqs = mcab_n_freqs(pipeline);
+    microphones = (float*)calloc(
+        (size_t)hop * MCAB_CHANNELS, sizeof(float));
+    ref = (float*)calloc((size_t)hop, sizeof(float));
+    out = (float*)calloc((size_t)hop, sizeof(float));
+    previous = (float*)calloc(
+        (size_t)hop * MCAB_CHANNELS, sizeof(float));
+    ola = (float*)calloc(
+        (size_t)fft_size * MCAB_CHANNELS, sizeof(float));
+    time_frame = (float*)calloc((size_t)fft_size, sizeof(float));
+    weights = (Complex*)calloc(
+        (size_t)n_freqs * MCAB_CHANNELS, sizeof(Complex));
+    window = (float*)calloc((size_t)fft_size, sizeof(float));
+    history = (float*)calloc(
+        (size_t)(WOLA_SCENE_HOPS * hop + WOLA_SCENE_PAD), sizeof(float));
+    if (!microphones || !ref || !out || !previous || !ola ||
+        !time_frame || !weights || !window || !history) {
+        valid = 0;
+        goto check_result;
+    }
+    for (int i = 0; i < WOLA_SCENE_HOPS * hop + WOLA_SCENE_PAD; ++i) {
+        rng ^= rng << 13; rng ^= rng >> 17; rng ^= rng << 5;
+        history[i] = 0.1f * (((float)(rng >> 8) *
+                              (1.0f / 16777216.0f)) - 0.5f);
+    }
+    ac_window_build(window, fft_size);
+    for (int ch = 0; ch < MCAB_CHANNELS; ++ch) {
+        for (int k = 0; k < n_freqs; ++k)
+            weights[(size_t)ch * n_freqs + k].r = 0.25f;
+    }
+
+    for (int frame = 0; frame < WOLA_SCENE_HOPS; ++frame) {
+        long sweeps_after;
+        fill_delayed_echo(
+            microphones, ref, hop, history, frame * hop + WOLA_SCENE_PAD,
+            frame >= WOLA_SHIFT_HOP ? moved_delay : base_delay);
+        if (mcab_process_front(
+                pipeline, microphones, ref, &pre) != MCAB_OK) {
+            valid = 0;
+            break;
+        }
+        /* A delay realignment does not restart any WOLA sequence: the
+         * lanes realign their filters in place, so the external mirror keeps
+         * its OLA running too and this identity proves the seams stay
+         * continuous ACROSS the realign boundary, not merely after both
+         * sides were wiped. Counted here so the claim rests on realigns this
+         * scene actually performed: a generation that MOVES the alignment is
+         * the only one that shifts an IR, and each must sweep four lanes. */
+        sweeps_after = mcab_realign_warm_lane_count(pipeline) +
+                       mcab_realign_soft_lane_count(pipeline);
+        if (pre.delay.changed && applied_before >= 0 &&
+            pre.delay.delay_samples != applied_before) {
+            moving_realigns += 1;
+            lanes_swept_on_moves += (int)(sweeps_after - sweeps_before);
+        }
+        applied_before = pre.delay.delay_samples;
+        sweeps_before = sweeps_after;
+        for (int ch = 0; ch < MCAB_CHANNELS; ++ch) {
+            float* channel_ola = ola + (size_t)ch * fft_size;
+            float* channel_previous = previous + (size_t)ch * hop;
+            fft_inverse(fft, pre.linear_spectra[ch], time_frame);
+            for (int i = 0; i < fft_size; ++i)
+                channel_ola[i] += time_frame[i] * window[i];
+            for (int i = 0; i < hop; ++i) {
+                float d = fabsf(channel_ola[i] - channel_previous[i]);
+                if (d > max_error) max_error = d;
+                channel_previous[i] = pre.formed_hop[ch][i];
+            }
+            memmove(channel_ola, channel_ola + hop,
+                    (size_t)(fft_size - hop) * sizeof(float));
+            memset(channel_ola + (fft_size - hop), 0,
+                   (size_t)hop * sizeof(float));
+        }
+    }
+
+check_result:
+    snprintf(label, sizeof(label),
+             "4ch front time/spectrum seams share one reconstructing WOLA grid "
+             "sr=%d/fft=%d (max error %.3g across %d alignment moves)",
+             sample_rate, fft_size, (double)max_error, moving_realigns);
+    CHECK(valid && max_error <= 1e-4f, label);
+    /* Two moves at least: the acquisition off raw far, and the mid-stream
+     * shift. Without them the identity above would only have been measured on
+     * a stream whose alignment never moved. */
+    snprintf(label, sizeof(label),
+             "sr=%d/fft=%d: the scene really crosses realign boundaries (%d "
+             "alignment moves, %d lane realigns)",
+             sample_rate, fft_size, moving_realigns, lanes_swept_on_moves);
+    CHECK(moving_realigns >= 2 &&
+          lanes_swept_on_moves ==
+              moving_realigns * MCAB_CHANNELS, label);
+
+cleanup:
+    free(history);
+    free(window);
+    free(weights);
+    free(time_frame);
+    free(ola);
+    free(previous);
+    free(out);
+    free(ref);
+    free(microphones);
+    fft_destroy(fft);
+    mcab_test_destroy(pipeline);
+}
+
+/* Group 6: lane 0 runs its own far-end FFT every hop; lanes 1-3 borrow it via
+ * aec_process_context_shared_far_from(). The total (mcab_far_fft_real_compute_count(),
+ * summed over the four lanes) must rise by at most 1 per mcab_process_front() call,
+ * never 4. "At most", not "exactly": the call resets all four lanes (zeroing the counter)
+ * whenever the shared delay estimate changes, e.g. during initial acquisition. A drop is
+ * fine; a jump by more than 1 would mean lanes 1-3 stopped sharing. */
+static void test_far_fft_sharing_reduces_four_to_one(
+        int sample_rate, int fft_size) {
+    McabConfig cfg;
+    Mcab* p;
+    McabFront pre;
+    McabFrame fused;
+    float* microphones;
+    float* ref;
+    float* out;
+    Complex* weights;
+    int hop;
+    int n_freqs;
+    int frame;
+    int ch, k;
+    long before, after;
+    int saw_a_plus_one_increment = 0;
+    int max_single_hop_increment = 0;
+    char label[160];
+
+    cfg = mcab_default_config(sample_rate);
+    cfg.fft_size = fft_size;
+    p = mcab_test_create(&cfg);
+    CHECK(p != NULL, "far-FFT sharing test: create");
+    if (!p) return;
+
+    hop = mcab_hop_size(p);
+    n_freqs = mcab_n_freqs(p);
+    microphones = (float*)calloc(
+        (size_t)hop * MCAB_CHANNELS, sizeof(float));
+    ref = (float*)calloc((size_t)hop, sizeof(float));
+    out = (float*)calloc((size_t)hop, sizeof(float));
+    weights = (Complex*)calloc(
+        (size_t)MCAB_CHANNELS * n_freqs, sizeof(Complex));
+    CHECK(microphones && ref && out && weights,
+          "far-FFT sharing test: buffers allocate");
+    if (!microphones || !ref || !out || !weights) {
+        free(microphones); free(ref); free(out); free(weights);
+        mcab_test_destroy(p);
+        return;
+    }
+    for (ch = 0; ch < MCAB_CHANNELS; ++ch)
+        for (k = 0; k < n_freqs; ++k)
+            weights[(size_t)ch * n_freqs + k].r = 0.25f;
+
+    snprintf(label, sizeof(label),
+             "far-FFT sharing sr=%d/fft=%d: counter starts at 0",
+             sample_rate, fft_size);
+    CHECK(mcab_far_fft_real_compute_count(p) == 0, label);
+
+    for (frame = 0; frame < 40; ++frame) {
+        fill_inputs(microphones, ref, hop, sample_rate, frame);
+        before = mcab_far_fft_real_compute_count(p);
+        if (mcab_process_front(p, microphones, ref, &pre) !=
+                MCAB_OK) {
+            CHECK(0, "far-FFT sharing test: pre stage succeeds");
+            break;
+        }
+        after = mcab_far_fft_real_compute_count(p);
+        if (after - before > max_single_hop_increment)
+            max_single_hop_increment = (int)(after - before);
+        if (after == before + 1) saw_a_plus_one_increment = 1;
+        if (mcab_fuse(p, weights, NULL, &fused) !=
+                MCAB_OK) {
+            CHECK(0, "far-FFT sharing test: fuse stage succeeds");
+            break;
+        }
+    }
+
+    snprintf(label, sizeof(label),
+             "far-FFT sharing sr=%d/fft=%d: total never jumps by more than "
+             "1 in a single mcab_process_front() call across 40 hops (max seen: %d)",
+             sample_rate, fft_size, max_single_hop_increment);
+    CHECK(max_single_hop_increment <= 1, label);
+    snprintf(label, sizeof(label),
+             "far-FFT sharing sr=%d/fft=%d: at least one hop actually shows "
+             "the +1 increment (not a vacuous pass from e.g. every hop "
+             "being a reset)",
+             sample_rate, fft_size);
+    CHECK(saw_a_plus_one_increment, label);
+
+    mcab_reset(p);
+    snprintf(label, sizeof(label),
+             "far-FFT sharing sr=%d/fft=%d: mcab_reset() zeroes "
+             "the counter",
+             sample_rate, fft_size);
+    CHECK(mcab_far_fft_real_compute_count(p) == 0, label);
+
+    free(microphones);
+    free(ref);
+    free(out);
+    free(weights);
+    mcab_test_destroy(p);
+}
+
+static void test_delay_modes_and_bank_sizing(void) {
+    McabConfig matched5 = mcab_default_config(16000);
+    McabConfig matched2 = matched5;
+    McabConfig fixed = matched5;
+    McabConfig external = matched5;
+    McabConfig pre_only;
+    McabMemReq r5, r2, rf, re, rp;
+    size_t t5 = 0, t2 = 0, tf = 0, te = 0, tp = 0;
+    Mcab *pf = NULL, *pe = NULL;
+    McabFront pre;
+    float *mic = NULL, *far = NULL;
+    int hop;
+
+    matched5.fft_size = 256;
+    matched2.fft_size = 256;
+    matched2.delay_num_filters = 2;
+    fixed.fft_size = 256;
+    fixed.delay_mode = AEC_DELAY_FIXED;
+    fixed.fixed_delay_samples = 320;
+    external.fft_size = 256;
+    external.delay_mode = AEC_DELAY_EXTERNAL_ALIGNED;
+    pre_only = external;
+    pre_only.enable_post = 0;
+
+    CHECK(mcab_get_mem_requirements(&matched5, &r5) == 0 &&
+          mcab_get_mem_requirements(&matched2, &r2) == 0 &&
+          mcab_get_mem_requirements(&fixed, &rf) == 0 &&
+          mcab_get_mem_requirements(&external, &re) == 0,
+          "all three delay modes and a short matched bank size cleanly");
+    /* The estimator is an object of its own now: the bank size moves the total the application
+     * provides (mcab_sample_flow_get_mem_size), not mcab's own pool. */
+    CHECK(mcab_sample_flow_get_mem_size(&matched5, &t5) == 0 &&
+          mcab_sample_flow_get_mem_size(&matched2, &t2) == 0 &&
+          mcab_sample_flow_get_mem_size(&fixed, &tf) == 0 &&
+          mcab_sample_flow_get_mem_size(&external, &te) == 0 &&
+          mcab_sample_flow_get_mem_size(&pre_only, &tp) == 0,
+          "every delay mode has an application-side total");
+    CHECK(t5 > t2 && t2 > te,
+          "matched-filter bank size changes the 4ch total");
+    CHECK(r5.bytes == r2.bytes,
+          "the bank size lives in the shared estimator, not in mcab's pool");
+    CHECK(tf > te && tf < t2 && rf.bytes > re.bytes,
+          "FIXED keeps only its exact reference ring; EXTERNAL has no matcher/ring");
+    CHECK(mcab_get_mem_requirements(&pre_only, &rp) == 0 &&
+          rp.bytes < re.bytes && tp < te,
+          "front-only core omits the fuse buffers");
+
+    external.delay_num_filters = 2;
+    CHECK(mcab_get_mem_requirements(&external, &re) != 0,
+          "EXTERNAL rejects an inapplicable matched-filter bank size");
+    external.delay_num_filters = DA_NUM_FILTERS;
+    fixed.fixed_delay_samples = -1;
+    CHECK(mcab_get_mem_requirements(&fixed, &rf) != 0,
+          "FIXED rejects an unset fixed delay");
+    fixed.fixed_delay_samples = 320;
+
+    pf = mcab_test_create(&fixed);
+    pe = mcab_test_create(&pre_only);
+    CHECK(pf && pe, "FIXED and EXTERNAL instances initialize");
+    CHECK(mcab_matched_filter_count(pf) == 0 &&
+          mcab_matched_filter_count(pe) == 0,
+          "FIXED and EXTERNAL allocate no matched-filter instance");
+    if (!pf || !pe) goto cleanup;
+    hop = mcab_hop_size(pe);
+    mic = (float*)calloc((size_t)hop * MCAB_CHANNELS,
+                         sizeof(float));
+    far = (float*)calloc((size_t)hop, sizeof(float));
+    CHECK(mic && far, "delay-mode smoke buffers allocate");
+    if (!mic || !far) goto cleanup;
+
+    fill_inputs(mic, far, hop, 16000, 0);
+    CHECK(mcab_process_front(pe, mic, far, &pre) ==
+              MCAB_OK && pre.delay.solid &&
+              pre.delay.delay_samples == 0,
+          "EXTERNAL consumes caller-aligned far without acquisition");
+    CHECK(mcab_process_front(pf, mic, far, &pre) ==
+              MCAB_OK && !pre.delay.solid &&
+              pre.delay.delay_samples == 320,
+          "FIXED reports the configured delay and ring warm-up state");
+
+cleanup:
+    free(mic);
+    free(far);
+    mcab_test_destroy(pf);
+    mcab_test_destroy(pe);
+}
+
+/* ============================================================================
+ * Known-delay profile check (product delay gate, not an audio-quality run): a synthesised
+ * echo with an exactly known bulk delay, checked against ground truth for acquisition
+ * (each bank size acquires the delays it should, how fast and how accurately), coverage
+ * (the reliable range per n holds at its boundary), mislock (a delay beyond the bank's
+ * reach is detectable only against ground truth, not from the seam) and cost.
+ * ========================================================================== */
+
+/* Reliable bulk-delay search ceiling for a bank of n matched filters, in native 16 kHz
+ * samples, from lib/aec's own constants: the ring reaches (n-1)*DA_FILTER_INTRA_SHIFT +
+ * (DA_FILTER_SIZE - 11) downsampled samples (the -11 is the `lag < filter_size - 10`
+ * reliability cut), and one downsampled sample is DA_DOWN_SAMPLING_FACTOR native samples
+ * (0.25 ms at 16 kHz). For n = 1..5 that is 125/221/317/413/509 ms. */
+#define KD_RELIABLE_SAMPLES(n) \
+    (((n) - 1) * DA_FILTER_INTRA_SHIFT * DA_DOWN_SAMPLING_FACTOR + \
+     (DA_FILTER_SIZE - 11) * DA_DOWN_SAMPLING_FACTOR)
+
+/* The applied alignment must never land LATER than the true echo: the AEC
+ * delay estimator deliberately reports early so PBFDKF sees a POSITIVE residual it can
+ * model (a negative residual is non-causal for the filter and cannot be).
+ * Measured across n=1..5 and true delays 4..509 ms, the shortfall is 64 or 80
+ * samples -- one estimator headroom (32) plus pre-echo block quantisation.
+ * 128 samples (8 ms) leaves margin without admitting a whole extra hop. */
+#define KD_MAX_UNDERSHOOT 128
+
+typedef struct KnownDelayRun {
+    int locked;
+    int lock_hop;
+    int applied_delay;
+    float confidence;
+    int changed_events;
+    int first_changed_hop;
+    /* Hops on which the published `solid` disagreed with the acceptance
+     * predicate recomputed from the seam's OWN estimator fields, and hops on
+     * which `solid` was already 1 before any alignment generation had been
+     * accepted. Both must stay 0: see the invariant note above the recompute
+     * in known_delay_run(). */
+    int solid_disagreements;
+    int solid_before_accept;
+    double us_per_hop;
+} KnownDelayRun;
+
+/* Drives `hops` hops of a two-path synthetic echo (a dominant path at
+ * dominant_delay plus an optional weaker early path) through a MATCHED core
+ * with the given bank size, and reports what the shared estimator did. */
+static void known_delay_run(int num_filters, int hops,
+                            int dominant_delay, float dominant_gain,
+                            int early_delay, float early_gain,
+                            KnownDelayRun* out) {
+    enum { KD_HOP = 256, KD_PAD = 16384 };
+    McabConfig cfg = mcab_default_config(16000);
+    Mcab* p;
+    float* far_hist;
+    float mic[KD_HOP * MCAB_CHANNELS];
+    float far[KD_HOP];
+    uint32_t rng = 0x1234567u;
+    clock_t t0, t1;
+    int hop, i, ch;
+    int expect_solid = 0;
+
+    memset(out, 0, sizeof(*out));
+    out->lock_hop = -1;
+    out->applied_delay = -1;
+    out->first_changed_hop = -1;
+
+    cfg.fft_size = 512;             /* the ULCNet grid: hop 256 */
+    cfg.delay_num_filters = num_filters;
+    p = mcab_test_create(&cfg);
+    if (!p) return;
+
+    far_hist = (float*)malloc((size_t)(hops * KD_HOP + KD_PAD) * sizeof(float));
+    if (!far_hist) { mcab_test_destroy(p); return; }
+    for (i = 0; i < hops * KD_HOP + KD_PAD; ++i) {
+        rng ^= rng << 13; rng ^= rng >> 17; rng ^= rng << 5;
+        far_hist[i] = 0.25f * (((float)(rng >> 8) * (1.0f / 16777216.0f)) - 0.5f);
+    }
+
+    t0 = clock();
+    for (hop = 0; hop < hops; ++hop) {
+        McabFront pre;
+        int base = hop * KD_HOP + KD_PAD;
+        for (i = 0; i < KD_HOP; ++i) {
+            int t = base + i;
+            float echo = dominant_gain * far_hist[t - dominant_delay] +
+                         early_gain * far_hist[t - early_delay];
+            far[i] = far_hist[t];
+            for (ch = 0; ch < MCAB_CHANNELS; ++ch)
+                mic[i * MCAB_CHANNELS + ch] = echo;
+        }
+        if (mcab_process_front(p, mic, far, &pre) !=
+            MCAB_OK) break;
+        /* The published `solid` must be exactly "a usable accepted alignment generation exists",
+         * recomputed from the other published estimator fields (confidence >= 1.0 is
+         * delay_aec_is_solid(), estimator_updates is delay_aec_n_updates(); the remaining term,
+         * estimated >= 0, is implied by confidence >= 1.0). Sticky: a confidence dip must not
+         * retract an alignment still applied.
+         * MUTATIONS: publishing `solid` on COARSE confidence makes it lead the accepted delay and
+         * both counters go non-zero; widening the wrapper's `n_updates >= 3` term makes it lag and
+         * solid_disagreements alone goes non-zero. */
+        if (pre.delay.changed) {
+            out->changed_events += 1;
+            if (out->first_changed_hop < 0) out->first_changed_hop = hop;
+        }
+        {
+            int accepted_now = pre.delay.confidence >= 1.0f &&
+                               pre.delay.estimator_updates >= 3;
+            expect_solid = expect_solid || accepted_now;
+            if (pre.delay.solid != expect_solid) out->solid_disagreements += 1;
+            if (pre.delay.solid && out->first_changed_hop < 0)
+                out->solid_before_accept += 1;
+        }
+        if (!out->locked && pre.delay.solid) {
+            out->locked = 1;
+            out->lock_hop = hop;
+            out->applied_delay = pre.delay.delay_samples;
+            out->confidence = pre.delay.confidence;
+        }
+    }
+    t1 = clock();
+    out->us_per_hop = hops > 0
+        ? (double)(t1 - t0) * 1e6 / (double)CLOCKS_PER_SEC / (double)hops
+        : 0.0;
+
+    free(far_hist);
+    mcab_test_destroy(p);
+}
+
+static void test_known_delay_acquisition_and_coverage(void) {
+    /* One point just INSIDE each bank's reliable ceiling and one just
+     * OUTSIDE it (the next bank's inside point, which is by construction
+     * beyond this bank's reach). */
+    static const int inside_ms[6] = { 0, 125, 221, 317, 413, 509 };
+    int n;
+
+    printf("known-delay acquisition (16 kHz, hop 256, synthetic echo):\n");
+    for (n = 1; n <= 5; ++n) {
+        KnownDelayRun in_range, out_of_range;
+        int inside = inside_ms[n] * 16;             /* ms -> samples @16k */
+        /* n=5 has no next bank; 9271 samples = 579.44 ms is the real
+         * recording that first exposed its ceiling. */
+        int outside = (n == 5) ? 9271 : inside_ms[n + 1] * 16;
+        char label[192];
+
+        known_delay_run(n, 200, inside, 0.6f, inside, 0.0f, &in_range);
+        known_delay_run(n, 200, outside, 0.6f, outside, 0.0f, &out_of_range);
+
+        printf("  n=%d ceiling %d samples (%.2f ms): "
+               "in-range %d ms -> lock hop %d applied %d (short by %d); "
+               "out-of-range %d ms -> %s\n",
+               n, KD_RELIABLE_SAMPLES(n), KD_RELIABLE_SAMPLES(n) / 16.0,
+               inside_ms[n], in_range.lock_hop, in_range.applied_delay,
+               in_range.locked ? inside - in_range.applied_delay : -1,
+               outside / 16,
+               out_of_range.locked ? "LOCKED" : "no lock");
+
+        snprintf(label, sizeof(label),
+                 "n=%d acquires a %d ms bulk delay within 60 hops (lock hop "
+                 "%d, inside its %.2f ms ceiling)", n, inside_ms[n],
+                 in_range.lock_hop, KD_RELIABLE_SAMPLES(n) / 16.0);
+        CHECK(in_range.locked && in_range.lock_hop >= 0 &&
+              in_range.lock_hop < 60, label);
+
+        /* The alignment contract, not a tolerance pulled from the air: the
+         * applied delay may sit EARLY of the true echo (PBFDKF then models a
+         * positive residual) but must never sit LATE. */
+        snprintf(label, sizeof(label),
+                 "n=%d applied delay is early-or-exact and short by at most "
+                 "%d samples (true %d, applied %d)",
+                 n, KD_MAX_UNDERSHOOT, inside, in_range.applied_delay);
+        CHECK(in_range.locked &&
+              inside - in_range.applied_delay >= 0 &&
+              inside - in_range.applied_delay <= KD_MAX_UNDERSHOOT, label);
+
+        snprintf(label, sizeof(label),
+                 "n=%d exactly one alignment generation for a static delay "
+                 "(%d)", n, in_range.changed_events);
+        CHECK(in_range.changed_events == 1, label);
+
+        /* `solid` publishes "a usable accepted alignment exists", so it can
+         * never lead the accepted delay: the hop it first goes 1 is exactly
+         * the hop the generation is accepted on, and it agrees with the
+         * acceptance predicate on EVERY hop of the run (in range and out of
+         * range alike -- the out-of-range run must stay 0/0 too, which is
+         * what stops these from being vacuous). */
+        snprintf(label, sizeof(label),
+                 "n=%d `solid` never leads the accepted delay (first solid "
+                 "hop %d, first alignment generation hop %d, %d early-solid "
+                 "hops)", n, in_range.lock_hop, in_range.first_changed_hop,
+                 in_range.solid_before_accept);
+        CHECK(in_range.solid_before_accept == 0 &&
+              in_range.first_changed_hop == in_range.lock_hop, label);
+        snprintf(label, sizeof(label),
+                 "n=%d published `solid` equals the sticky acceptance "
+                 "predicate on every hop (%d in-range and %d out-of-range "
+                 "disagreements)", n, in_range.solid_disagreements,
+                 out_of_range.solid_disagreements);
+        CHECK(in_range.solid_disagreements == 0 &&
+              out_of_range.solid_disagreements == 0, label);
+
+        snprintf(label, sizeof(label),
+                 "n=%d does NOT acquire a %d ms bulk delay (beyond its "
+                 "%.2f ms ceiling)", n, outside / 16,
+                 KD_RELIABLE_SAMPLES(n) / 16.0);
+        CHECK(outside > KD_RELIABLE_SAMPLES(n) && !out_of_range.locked, label);
+    }
+}
+
+/* An out-of-range bulk delay is not always a clean "never locks": with any in-range echo
+ * component (early reflection, second speaker path) the estimator locks onto THAT with full
+ * confidence while the dominant path stays unmodelled. This reproduces a dominant path at
+ * 579.44 ms with a confident lock at ~32 ms. The seam cannot see the error (solid=1,
+ * confidence=1.0, as for a correct lock), so what is asserted is the applied delay against
+ * an independently known ground-truth delay. */
+static void test_known_delay_mislock_is_detectable(void) {
+    KnownDelayRun mislock, control;
+    const int dominant = 9271;      /* 579.44 ms -- beyond every bank */
+    const int early = 512;          /* 32 ms -- inside every bank */
+    int error_samples;
+    char label[224];
+
+    known_delay_run(5, 200, dominant, 0.6f, early, 0.5f, &mislock);
+    /* Control: same two paths, but the dominant one inside the ceiling.
+     * The estimator must prefer the dominant path, and the ground-truth
+     * check must stay quiet -- otherwise the check below is just "always
+     * flags", which would prove nothing. */
+    known_delay_run(5, 200, 3536, 0.6f, early, 0.5f, &control);
+
+    error_samples = mislock.locked ? dominant - mislock.applied_delay : -1;
+    printf("known-delay mislock: dominant %d samples (%.2f ms) + early %d "
+           "(%.2f ms) -> lock hop %d applied %d (%.2f ms) confidence %.2f, "
+           "wrong by %d samples (%.2f ms)\n",
+           dominant, dominant / 16.0, early, early / 16.0,
+           mislock.lock_hop, mislock.applied_delay,
+           mislock.applied_delay / 16.0, (double)mislock.confidence,
+           error_samples, error_samples / 16.0);
+
+    CHECK(mislock.locked,
+          "an in-range early path makes an out-of-range bulk delay lock "
+          "anyway");
+    CHECK(mislock.confidence >= 1.0f,
+          "the mislock is reported at FULL confidence -- the seam's own "
+          "fields cannot distinguish it from a correct lock");
+    snprintf(label, sizeof(label),
+             "ground-truth comparison FLAGS the mislock: applied is short by "
+             "%d samples (%.2f ms), far past the %d-sample alignment "
+             "contract", error_samples, error_samples / 16.0,
+             KD_MAX_UNDERSHOOT);
+    CHECK(mislock.locked && error_samples > KD_MAX_UNDERSHOOT, label);
+
+    snprintf(label, sizeof(label),
+             "control: with the dominant path in range the SAME check stays "
+             "quiet (applied %d, short by %d)",
+             control.applied_delay,
+             control.locked ? 3536 - control.applied_delay : -1);
+    CHECK(control.locked &&
+          3536 - control.applied_delay >= 0 &&
+          3536 - control.applied_delay <= KD_MAX_UNDERSHOOT, label);
+}
+
+/* Report the 4ch numbers by calling the 4ch queries. n drives the one shared estimator; the
+ * four lanes are EXTERNAL_ALIGNED and must not move with it, so the mono "5,728 B per
+ * filter per AEC instance" contract is not multiplied by four here. */
+static void test_known_delay_memory_and_cost(void) {
+    McabMemBreakdown b[6];
+    McabMemReq req[6];
+    size_t lanes[6], est[6], total[6];
+    KnownDelayRun cost;
+    int n;
+    int ok = 1;
+    char label[192];
+
+    /* The pieces the application allocates: four lanes, the shared estimator, mcab's pool. */
+    for (n = 1; n <= 5; ++n) {
+        McabConfig cfg = mcab_default_config(16000);
+        AecConfig lane;
+        McabDelayEstimatorConfig dc;
+        cfg.fft_size = 512;
+        cfg.delay_num_filters = n;
+        if (mcab_get_mem_breakdown(&cfg, &b[n]) != 0 ||
+            mcab_get_mem_requirements(&cfg, &req[n]) != 0 ||
+            mcab_lane_config(&cfg, &lane) != 0 ||
+            mcab_delay_estimator_config(&cfg, &dc) != 0 || !dc.required ||
+            mcab_sample_flow_get_mem_size(&cfg, &total[n]) != 0) {
+            ok = 0;
+            break;
+        }
+        lanes[n] = 4u * ALIGN16(aec_get_mem_size(&lane));
+        est[n] = delay_aec_get_mem_size(dc.sample_rate, dc.hop_size, dc.num_filters);
+    }
+    CHECK(ok, "4ch memory breakdown and pool query answer for every n=1..5");
+    if (!ok) return;
+
+    printf("4ch pools vs matched-filter bank size (16 kHz, fft 512):\n");
+    for (n = 1; n <= 5; ++n) {
+        printf("  n=%d  lanes(4x AEC) %9zu  shared est %9zu  mcab(ring + bufs) %9llu  "
+               "total %9zu",
+               n, lanes[n], est[n], (unsigned long long)req[n].bytes, total[n]);
+        if (n > 1)
+            printf("  (+%lld vs n=%d)",
+                   (long long)total[n] - (long long)total[n - 1], n - 1);
+        printf("\n");
+    }
+
+    for (n = 2; n <= 5; ++n) {
+        snprintf(label, sizeof(label),
+                 "n=%d leaves the four lane AEC pools untouched (%zu bytes, "
+                 "same as n=1) -- n lives in the ONE shared estimator",
+                 n, lanes[n]);
+        CHECK(lanes[n] == lanes[1], label);
+
+        snprintf(label, sizeof(label),
+                 "n=%d costs strictly more estimator RAM than n=%d "
+                 "(%zu > %zu)", n, n - 1, est[n], est[n - 1]);
+        CHECK(est[n] > est[n - 1], label);
+
+        snprintf(label, sizeof(label),
+                 "n=%d leaves mcab's own pool untouched (%llu bytes)", n,
+                 (unsigned long long)req[n].bytes);
+        CHECK(req[n].bytes == req[1].bytes, label);
+
+        snprintf(label, sizeof(label),
+                 "n=%d total grows by exactly the per-filter cost of "
+                 "one shared estimator bank (%lld bytes, same as every other "
+                 "step)", n, (long long)total[n] - (long long)total[n - 1]);
+        CHECK((long long)total[n] - (long long)total[n - 1] ==
+              (long long)total[2] - (long long)total[1], label);
+
+        snprintf(label, sizeof(label),
+                 "n=%d breakdown total agrees with the pool query (%zu == "
+                 "%llu)", n, b[n].total_bytes,
+                 (unsigned long long)req[n].bytes);
+        CHECK((unsigned long long)b[n].total_bytes ==
+              (unsigned long long)req[n].bytes, label);
+    }
+
+    /* Rough per-hop CPU, recorded rather than tuned: one hop is 256 samples
+     * = 16 ms of audio at 16 kHz, so the real-time factor is
+     * us_per_hop / 16000. The bound is a liveness guard (a catastrophic
+     * regression), not a performance target -- this is a host measurement on
+     * whatever machine ran the suite, not a board number. */
+    known_delay_run(5, 400, 3536, 0.6f, 3536, 0.0f, &cost);
+    printf("known-delay cost: 4 lanes + shared estimator (n=5) = "
+           "%.1f us/hop, %.4f x real time (hop = 16.00 ms of audio)\n",
+           cost.us_per_hop, cost.us_per_hop / 16000.0);
+    snprintf(label, sizeof(label),
+             "4ch core runs faster than real time on the host (%.1f us/hop "
+             "vs a 16000 us budget)", cost.us_per_hop);
+    CHECK(cost.us_per_hop > 0.0 && cost.us_per_hop < 16000.0, label);
+}
+
+/* Shared-delay change admission and the four-lane realign sweep. A published `changed`
+ * sweeps aec_apply_external_realign() over all four lanes; the rows pin that the sweep
+ * happens on exactly the hops it should, sized four, and that the applied alignment and
+ * the sweep are one event (the delay never moves on a hop without `changed`). Movement is
+ * absorbed at two scales: DelayAec publishes on a 16-downsampled-sample grid (64 native
+ * samples at 16 kHz), measured by the WANDER row; the wrapper's admission (> 32 samples,
+ * repeated within 16) holds every movement for one hop, measured by MOVING and SHIFT. */
+
+typedef struct RealignRun {
+    int acquisition_hop;        /* first `changed` (the acquisition)         */
+    int later_changes;          /* `changed` hops after the acquisition      */
+    int last_change_hop;
+    int applied_at_end;
+    int hold_hops;              /* hops holding an unconfirmed candidate     */
+    int unconfirmed_changes;    /* accepted with no candidate held first     */
+    int silent_delay_moves;     /* applied delay moved without a `changed`   */
+    int wrong_sized_sweeps;     /* a `changed` hop that did not realign 4    */
+    int sweeps_without_change;  /* lanes realigned on a hop with no `changed`*/
+    long warm;
+    long soft;
+} RealignRun;
+
+/* Shared synthesis for the realign/admission scenes: xorshift far history
+ * and one hop of 4-lane echo at the given dominant delay (optional
+ * simultaneous second path at delay_b when second_gain > 0). */
+static void realign_scene_history(float* far_hist, int count) {
+    uint32_t rng = 0x1234567u;
+    int i;
+    for (i = 0; i < count; ++i) {
+        rng ^= rng << 13; rng ^= rng >> 17; rng ^= rng << 5;
+        far_hist[i] = 0.25f *
+            (((float)(rng >> 8) * (1.0f / 16777216.0f)) - 0.5f);
+    }
+}
+
+static void realign_scene_hop(const float* far_hist, int base, int hop_len,
+                              int dominant, float second_gain, int delay_b,
+                              float* mic, float* far) {
+    int i, ch;
+    for (i = 0; i < hop_len; ++i) {
+        int t = base + i;
+        float echo = 0.6f * far_hist[t - dominant];
+        if (second_gain > 0.0f) echo += second_gain * far_hist[t - delay_b];
+        far[i] = far_hist[t];
+        for (ch = 0; ch < MCAB_CHANNELS; ++ch)
+            mic[i * MCAB_CHANNELS + ch] = echo;
+    }
+}
+
+/* Drives one 16 kHz/hop-256 MATCHED scene and reports what the shared alignment did: a
+ * single echo path at `delay_a`, except that second_gain > 0 adds a simultaneous second
+ * path at delay_b (an ambiguous scene whose peak moves on its own, like real jitter),
+ * shift_at >= 0 moves the path to delay_b from that hop on, and wander_hops > 0 alternates
+ * it between delay_a and delay_b every wander_hops hops. */
+static void realign_run(int hops, int delay_a, int delay_b, float second_gain,
+                        int shift_at, int wander_hops, RealignRun* out) {
+    enum { RA_HOP = 256, RA_PAD = 16384 };
+    McabConfig cfg = mcab_default_config(16000);
+    Mcab* p;
+    float* far_hist;
+    float mic[RA_HOP * MCAB_CHANNELS];
+    float far[RA_HOP];
+    int hop;
+    int previous_delay = 0;
+    int previous_pending = -1;
+    long previous_sweeps = 0;
+
+    memset(out, 0, sizeof(*out));
+    out->acquisition_hop = -1;
+    out->last_change_hop = -1;
+    out->applied_at_end = -1;
+
+    cfg.fft_size = 512;             /* the ULCNet grid: hop 256 */
+    p = mcab_test_create(&cfg);
+    if (!p) return;
+
+    far_hist = (float*)malloc((size_t)(hops * RA_HOP + RA_PAD) * sizeof(float));
+    if (!far_hist) { mcab_test_destroy(p); return; }
+    realign_scene_history(far_hist, hops * RA_HOP + RA_PAD);
+
+    for (hop = 0; hop < hops; ++hop) {
+        McabFront pre;
+        int base = hop * RA_HOP + RA_PAD;
+        int dominant = delay_a;
+        int pending;
+        long sweeps;
+        if (shift_at >= 0 && hop >= shift_at) dominant = delay_b;
+        if (wander_hops > 0 && ((hop / wander_hops) % 2)) dominant = delay_b;
+        realign_scene_hop(far_hist, base, RA_HOP, dominant, second_gain,
+                          delay_b, mic, far);
+        if (mcab_process_front(p, mic, far, &pre) !=
+            MCAB_OK) break;
+
+        sweeps = mcab_realign_warm_lane_count(p) +
+                 mcab_realign_soft_lane_count(p);
+        pending = mcab_pending_delay_candidate(p);
+        if (pending >= 0) out->hold_hops += 1;
+
+        if (pre.delay.changed) {
+            if (out->acquisition_hop < 0) {
+                out->acquisition_hop = hop;
+            } else {
+                out->later_changes += 1;
+                /* The candidate must have been HELD on the previous hop and
+                 * must be the value applied: that pair is the whole
+                 * two-step rule, and it is what disappears if acceptance
+                 * happens on the first sighting. */
+                if (previous_pending < 0 ||
+                    abs(previous_pending - pre.delay.delay_samples) >= 16)
+                    out->unconfirmed_changes += 1;
+            }
+            out->last_change_hop = hop;
+            if (sweeps - previous_sweeps != MCAB_CHANNELS)
+                out->wrong_sized_sweeps += 1;
+        } else {
+            if (hop > 0 && pre.delay.delay_samples != previous_delay)
+                out->silent_delay_moves += 1;
+            if (sweeps != previous_sweeps) out->sweeps_without_change += 1;
+        }
+
+        previous_delay = pre.delay.delay_samples;
+        previous_pending = pending;
+        previous_sweeps = sweeps;
+        out->applied_at_end = pre.delay.delay_samples;
+    }
+
+    out->warm = mcab_realign_warm_lane_count(p);
+    out->soft = mcab_realign_soft_lane_count(p);
+    free(far_hist);
+    mcab_test_destroy(p);
+}
+
+static void test_shared_delay_change_admission(void) {
+    RealignRun wander, moving, shift;
+    char label[224];
+
+    /* WANDER: the bulk delay itself moves by 24 samples (1.5 ms) back and
+     * forth, below both the wrapper's 32-sample admission and DelayAec's own
+     * 64-sample output grid. Nothing may reach the lanes: one acquisition
+     * sweep for the whole run and an alignment that never moves again. */
+    realign_run(240, 512, 536, 0.0f, -1, 30, &wander);
+    printf("shared-delay admission: wander +/-24 -> acquired hop %d applied "
+           "%d, %d later generations, %ld warm + %ld soft lane realigns\n",
+           wander.acquisition_hop, wander.applied_at_end, wander.later_changes,
+           wander.warm, wander.soft);
+    snprintf(label, sizeof(label),
+             "a 24-sample bulk-delay wander starts no alignment generation "
+             "after the acquisition (%d later generations)",
+             wander.later_changes);
+    CHECK(wander.acquisition_hop >= 0 && wander.later_changes == 0, label);
+    snprintf(label, sizeof(label),
+             "and realigns the four lanes exactly once, for the acquisition "
+             "itself (%ld warm + %ld soft = %ld lane calls)",
+             wander.warm, wander.soft, wander.warm + wander.soft);
+    CHECK(wander.warm + wander.soft == MCAB_CHANNELS, label);
+
+    /* MOVING: the echo path travels 512 <-> 1024 samples in 400-hop blocks, so the shared
+     * estimate moves several times, each move far larger than the admission band. This row
+     * makes the two-step rule falsifiable (a single-generation scene would pass the hold
+     * assertions for free). Blocks and run are long because the matched filter is
+     * duty-cycled: each re-lock costs a number of analysed hops. */
+    realign_run(2400, 512, 1024, 0.0f, -1, 400, &moving);
+    printf("shared-delay admission: 512<->1024 in 400-hop blocks -> acquired "
+           "hop %d, %d later generations, %d holds, applied %d, %ld warm + "
+           "%ld soft\n", moving.acquisition_hop, moving.later_changes,
+           moving.hold_hops, moving.applied_at_end, moving.warm, moving.soft);
+    snprintf(label, sizeof(label),
+             "control: the moving-path scene really does re-lock several "
+             "times (%d later generations)", moving.later_changes);
+    CHECK(moving.later_changes >= 4, label);
+    snprintf(label, sizeof(label),
+             "every alignment change is admitted only after the same value is "
+             "seen on a second eligible hop (%d accepted on a first sighting, "
+             "%d hold hops for %d changes)", moving.unconfirmed_changes,
+             moving.hold_hops, moving.later_changes);
+    CHECK(moving.unconfirmed_changes == 0 &&
+          moving.hold_hops == moving.later_changes, label);
+    snprintf(label, sizeof(label),
+             "the applied alignment never moves on a hop that publishes no "
+             "`changed` (%d silent moves)", moving.silent_delay_moves);
+    CHECK(moving.silent_delay_moves == 0, label);
+    snprintf(label, sizeof(label),
+             "every generation realigns exactly four lanes and no other hop "
+             "realigns any (%d wrong-sized sweeps, %d sweeps without a "
+             "generation)", moving.wrong_sized_sweeps,
+             moving.sweeps_without_change);
+    CHECK(moving.wrong_sized_sweeps == 0 &&
+          moving.sweeps_without_change == 0, label);
+    snprintf(label, sizeof(label),
+             "the warm/soft split accounts for every lane call (%ld + %ld == "
+             "4 x %d generations)", moving.warm, moving.soft,
+             moving.later_changes + 1);
+    CHECK(moving.warm + moving.soft ==
+          (long)MCAB_CHANNELS * (moving.later_changes + 1),
+          label);
+
+    /* SHIFT: the echo really moves, 512 -> 1024 samples, and stays there. One
+     * generation, held for one hop first, then all four lanes realigned. The
+     * run outlasts the re-lock for the same reason the MOVING scene's blocks
+     * are long. */
+    realign_run(700, 512, 1024, 0.0f, 100, 0, &shift);
+    printf("shared-delay admission: shift 512 -> 1024 at hop 100 -> acquired "
+           "hop %d, adopted hop %d applied %d, %ld warm + %ld soft\n",
+           shift.acquisition_hop, shift.last_change_hop, shift.applied_at_end,
+           shift.warm, shift.soft);
+    snprintf(label, sizeof(label),
+             "a sustained 512-sample shift starts exactly one new alignment "
+             "generation (%d), on hop %d", shift.later_changes,
+             shift.last_change_hop);
+    CHECK(shift.later_changes == 1 && shift.last_change_hop > 100, label);
+    snprintf(label, sizeof(label),
+             "it is held for confirmation for exactly one hop before it is "
+             "applied (%d holds, %d accepted on a first sighting)",
+             shift.hold_hops, shift.unconfirmed_changes);
+    CHECK(shift.hold_hops == 1 && shift.unconfirmed_changes == 0, label);
+    snprintf(label, sizeof(label),
+             "and then realigns all four lanes on that one hop (%ld warm + "
+             "%ld soft = %ld, two generations x 4 lanes)",
+             shift.warm, shift.soft, shift.warm + shift.soft);
+    CHECK(shift.wrong_sized_sweeps == 0 &&
+          shift.sweeps_without_change == 0 &&
+          shift.warm + shift.soft == 2 * MCAB_CHANNELS, label);
+    snprintf(label, sizeof(label),
+             "the alignment ends on the moved path, early-or-exact within the "
+             "%d-sample contract (applied %d for a true 1024)",
+             KD_MAX_UNDERSHOOT, shift.applied_at_end);
+    CHECK(1024 - shift.applied_at_end >= 0 &&
+          1024 - shift.applied_at_end <= KD_MAX_UNDERSHOOT, label);
+}
+
+/* ============================================================================
+ * Held-candidate lifetime. The admission state machine is driven directly: through a
+ * stream DelayAec re-offers a movement every hop, so the candidate is resolved on the next
+ * eligible hop and its TTL never runs out. What a scene does cover (a candidate is really
+ * held and spends a realign when confirmed) is asserted in
+ * test_shared_delay_change_admission(); the reset row below clears a candidate that a real
+ * stream produced.
+ * ========================================================================== */
+
+/* One hop, spent the way update_shared_delay() spends it: the held candidate
+ * always ages, and the estimate is only offered on a hop the estimator was
+ * eligible on. */
+static int admission_hop(McabDelayAdmission* admission, int accepted,
+                         int estimated, int eligible) {
+    mcab_admission_age(admission);
+    if (!eligible) return 0;
+    return mcab_admission_offer(admission, accepted, estimated);
+}
+
+static void test_delay_change_candidate_ttl(void) {
+    const int applied = 512;        /* the alignment in force */
+    const int moved = 1024;         /* a movement far outside the band */
+    McabDelayAdmission a;
+    McabConfig cfg;
+    Mcab* p;
+    char label[224];
+    int i;
+    int held_hop = -1;
+    int candidate_before_reset = -1;
+    int candidate_after_reset = 0;
+
+    /* Offered once, repeated on the very next hop: admitted, and nothing is
+     * left held afterwards. */
+    memset(&a, 0, sizeof(a));
+    CHECK(admission_hop(&a, applied, moved, 1) == 0 &&
+          a.ttl == MCAB_DELAY_CHANGE_CANDIDATE_TTL && a.candidate == moved,
+          "a first sighting is held, not applied, with a full life");
+    CHECK(admission_hop(&a, applied, moved, 1) == 1 &&
+          a.ttl == 0,
+          "the same movement on the next hop is admitted and releases the "
+          "candidate");
+
+    /* One hop without a usable estimate does not end it: lib/aec's rule is a
+     * bounded life, not a strictly consecutive pair. */
+    memset(&a, 0, sizeof(a));
+    admission_hop(&a, applied, moved, 1);
+    CHECK(admission_hop(&a, applied, 0, 0) == 0 && a.ttl > 0,
+          "a hop with no usable estimate spends one hop of the candidate's "
+          "life and keeps it");
+    CHECK(admission_hop(&a, applied, moved, 1) == 1,
+          "the movement is still admitted when it returns inside that life");
+
+    /* Aged out: the candidate is gone, and a single reappearance can only
+     * start a new one. */
+    memset(&a, 0, sizeof(a));
+    admission_hop(&a, applied, moved, 1);
+    for (i = 0; i < MCAB_DELAY_CHANGE_CANDIDATE_TTL - 1; ++i)
+        admission_hop(&a, applied, 0, 0);
+    snprintf(label, sizeof(label),
+             "the candidate survives exactly %d hops without a usable "
+             "estimate (life left %d)",
+             MCAB_DELAY_CHANGE_CANDIDATE_TTL - 1, a.ttl);
+    CHECK(a.ttl > 0 && a.candidate == moved, label);
+    admission_hop(&a, applied, 0, 0);
+    CHECK(a.ttl == 0 && a.candidate == 0,
+          "one hop later it has expired, holding nothing");
+    CHECK(admission_hop(&a, applied, moved, 1) == 0 &&
+          a.ttl == MCAB_DELAY_CHANGE_CANDIDATE_TTL,
+          "a single reappearance after expiry is NOT admitted -- it is only a "
+          "new first sighting");
+    CHECK(admission_hop(&a, applied, moved, 1) == 1,
+          "and it takes a repeat inside the new life to admit it");
+
+    /* An estimate back at the alignment in force is absorbed without ending
+     * the candidate (lib/aec's Path B has no such clear); a movement to a
+     * different place replaces it with a full life. */
+    memset(&a, 0, sizeof(a));
+    admission_hop(&a, applied, moved, 1);
+    CHECK(admission_hop(&a, applied,
+                        applied + MCAB_DELAY_CHANGE_MIN_SAMPLES, 1) == 0 &&
+          a.candidate == moved && a.ttl > 0,
+          "an estimate inside the admission band is absorbed and leaves the "
+          "held candidate to age");
+    CHECK(admission_hop(&a, applied, 2048, 1) == 0 &&
+          a.candidate == 2048 &&
+          a.ttl == MCAB_DELAY_CHANGE_CANDIDATE_TTL,
+          "a movement somewhere else entirely replaces the candidate and "
+          "restarts its life");
+
+    /* End to end: a candidate a real stream produced is cleared by reset(),
+     * together with the life left on it. The path alternates in long blocks
+     * and the run is long: the shared estimator's matched filter is
+     * duty-cycled, so a movement is published after a number of ANALYSED
+     * hops, not after a number of hops -- a scene that switches faster than
+     * the estimator can answer holds no candidate to clear. */
+    cfg = mcab_default_config(16000);
+    cfg.fft_size = 512;
+    p = mcab_test_create(&cfg);
+    CHECK(p != NULL, "candidate-reset scene creates");
+    if (p) {
+        enum { TR_HOP = 256, TR_PAD = 16384, TR_HOPS = 1600 };
+        float* far_hist = (float*)malloc(
+            (size_t)(TR_HOPS * TR_HOP + TR_PAD) * sizeof(float));
+        float mic[TR_HOP * MCAB_CHANNELS];
+        float far[TR_HOP];
+        int hop;
+        if (far_hist) {
+            realign_scene_history(far_hist, TR_HOPS * TR_HOP + TR_PAD);
+            for (hop = 0; hop < TR_HOPS && held_hop < 0; ++hop) {
+                McabFront pre;
+                int base = hop * TR_HOP + TR_PAD;
+                int dominant = ((hop / 400) % 2) ? 1024 : 512;
+                realign_scene_hop(far_hist, base, TR_HOP, dominant, 0.0f, 0,
+                                  mic, far);
+                if (mcab_process_front(p, mic, far, &pre) !=
+                    MCAB_OK) break;
+                candidate_before_reset =
+                    mcab_pending_delay_candidate(p);
+                if (candidate_before_reset >= 0) {
+                    held_hop = hop;
+                    mcab_reset(p);
+                    candidate_after_reset =
+                        mcab_pending_delay_candidate(p);
+                }
+            }
+        }
+        free(far_hist);
+        mcab_test_destroy(p);
+    }
+    snprintf(label, sizeof(label),
+             "reset() clears a candidate a real stream was holding (hop %d, "
+             "held %d, after reset %d)",
+             held_hop, candidate_before_reset, candidate_after_reset);
+    CHECK(held_hop >= 0 && candidate_before_reset >= 0 &&
+          candidate_after_reset == -1, label);
+}
+
+
+/* ============================================================================
+ * Runtime strength control. The lanes run with spatial_linear_context and never reach their
+ * own residual suppressor, so a preset change pushed at them is a no-op: the setter must
+ * move the shared post-stage suppressor (the AecRes), and the retargeted floor must survive
+ * a reset (test 3 below).
+ * ========================================================================== */
+
+/* Drives `hops` hops of the shared strength/timing stimulus. When
+ * last_pre_us/last_post_us are non-NULL they receive the wall-clock cost of
+ * the FINAL hop's mcab_process_front/fuse, which is what lets the timing
+ * test bracket the same workload this drives without a second copy of the
+ * stimulus. */
+static uint32_t elapsed_us(const struct timespec* a, const struct timespec* b) {
+    return (uint32_t)((b->tv_sec - a->tv_sec) * 1000000
+                      + (b->tv_nsec - a->tv_nsec) / 1000);
+}
+
+static int feed_strength_hops(Mcab* p, int hops,
+                              uint32_t* last_pre_us,
+                              uint32_t* last_post_us) {
+    int hop = mcab_hop_size(p);
+    int n = mcab_n_freqs(p);
+    float* mics = (float*)calloc((size_t)hop * 4u, sizeof(float));
+    float* far = (float*)calloc((size_t)hop, sizeof(float));
+    float* out = (float*)calloc((size_t)hop, sizeof(float));
+    /* Channel-major Complex[4][n_freqs] -- the weights contract in
+     * mcab.h. Sizing this as [n_freqs] would have mcab_fuse() read
+     * three channels past the end. */
+    Complex* w = (Complex*)calloc(
+        (size_t)MCAB_CHANNELS * (size_t)n, sizeof(Complex));
+    McabFront pre;
+    int h, i, ch, k;
+    for (ch = 0; ch < MCAB_CHANNELS; ++ch)
+        for (k = 0; k < n; ++k) {
+            w[(size_t)ch * (size_t)n + (size_t)k].r = 0.25f;
+            w[(size_t)ch * (size_t)n + (size_t)k].i = 0.0f;
+        }
+    for (h = 0; h < hops; ++h) {
+        struct timespec a, b;
+        for (i = 0; i < hop; ++i) {
+            float t = (float)(h * hop + i);
+            float r = 0.6f * sinf(0.06f * t);
+            far[i] = r;
+            for (ch = 0; ch < 4; ++ch)
+                mics[(size_t)i * 4u + (size_t)ch] = 0.5f * r + 0.02f * sinf(0.017f * t);
+        }
+        clock_gettime(CLOCK_MONOTONIC, &a);
+        if (mcab_process_front(p, mics, far, &pre) != MCAB_OK)
+            break;
+        clock_gettime(CLOCK_MONOTONIC, &b);
+        if (last_pre_us) *last_pre_us = elapsed_us(&a, &b);
+
+        clock_gettime(CLOCK_MONOTONIC, &a);
+        if (fuse_only(p, w) != MCAB_OK) break;
+        clock_gettime(CLOCK_MONOTONIC, &b);
+        if (last_post_us) *last_post_us = elapsed_us(&a, &b);
+    }
+    free(mics); free(far); free(out); free(w);
+    return h;
+}
+
+/* ============================================================================
+ * Matched-filter duty cycle
+ * ========================================================================== */
+
+/* Long enough that no 1-in-K schedule this file's grids produce could
+ * manufacture it by accident (the coarsest K here is well under this), short
+ * enough to fit inside the hold window the machine re-arms after. */
+#define DUTY_FULL_RATE_RUN 8
+
+typedef struct DutyRun {
+    unsigned long long total;
+    unsigned long long run;
+    int hops_seen;
+    /* Every hop must advance the census total exactly once: a census wired to
+     * anything but the decision site would drift from what actually ran. */
+    int census_total_mismatch;
+    /* An unanalysed hop must publish nothing new -- that is the whole
+     * contract of feeding without analysing. */
+    int updates_on_skipped_hop;
+    int stable_tail_hops;
+    int stable_tail_analysed;
+    int acquisition_hop;
+    int longest_analysed_streak_after_change;
+    /* Where the machine went back to full rate: the hop the first run of
+     * DUTY_FULL_RATE_RUN consecutive analysed hops after the move begins on.
+     * Consecutive analysed hops are impossible while the machine is engaged,
+     * so this is when it disengaged -- and WHEN is the whole question, since
+     * the estimate itself does not move at the point of the change. */
+    int first_full_rate_hop;
+    int analysed_after_change;
+    int hops_after_change;
+    int reacquire_hop;
+    int reacquire_delay;
+    /* Watchdog leak, reconstructed from the peak trajectory: hops on which
+     * the peak decayed, and how many of those decayed by anything other than
+     * the converted per-hop amount the core stored. A leak that is converted
+     * correctly and then not USED leaves every value-level assertion green,
+     * so this is the half that holds the branch. */
+    int leak_hops;
+    int leak_mismatches;
+} DutyRun;
+
+/* One 16 kHz/hop-256 MATCHED scene through the shared estimator, reporting
+ * what the duty machine did with it. Same single-path echo generator the
+ * realign scenes use; `shift_at` >= 0 moves the path to delay_b from that hop
+ * on, which is the scene the disengage rule exists for. */
+static void duty_run(int hops, int delay_a, int delay_b, int shift_at,
+                     int stable_tail, DutyRun* out) {
+    enum { DU_HOP = 256, DU_PAD = 32768 };
+    McabConfig cfg = mcab_default_config(16000);
+    Mcab* p;
+    float* far_hist;
+    float mic[DU_HOP * MCAB_CHANNELS];
+    float far[DU_HOP];
+    int hop;
+    int previous_updates = 0;
+    int streak = 0;
+    unsigned long long previous_total = 0;
+    unsigned long long previous_run = 0;
+
+    memset(out, 0, sizeof(*out));
+    out->acquisition_hop = -1;
+    out->reacquire_hop = -1;
+    out->reacquire_delay = -1;
+    out->first_full_rate_hop = -1;
+    out->leak_hops = 0;
+    out->leak_mismatches = 0;
+
+    cfg.fft_size = 512;             /* the ULCNet grid: hop 256 */
+    /* The throttle is opt-in (the default is full rate) -- this scene exists
+     * specifically to characterize the throttle, so it asks for the regime
+     * explicitly. 0.5 s is the period this scene's numbers were measured at. */
+    cfg.delay_est_period_s = 0.5f;
+    p = mcab_test_create(&cfg);
+    if (!p) return;
+
+    far_hist = (float*)malloc((size_t)(hops * DU_HOP + DU_PAD) * sizeof(float));
+    if (!far_hist) { mcab_test_destroy(p); return; }
+    realign_scene_history(far_hist, hops * DU_HOP + DU_PAD);
+
+    for (hop = 0; hop < hops; ++hop) {
+        McabFront pre;
+        int base = hop * DU_HOP + DU_PAD;
+        int dominant = (shift_at >= 0 && hop >= shift_at) ? delay_b : delay_a;
+        unsigned long long total_now, run_now;
+        int analysed;
+        float peak_before = mcab_duty_erle_peak(p);
+        realign_scene_hop(far_hist, base, DU_HOP, dominant, 0.0f, delay_b,
+                          mic, far);
+        if (mcab_process_front(p, mic, far, &pre) !=
+            MCAB_OK) break;
+        out->hops_seen += 1;
+
+        /* The watchdog's steady decay branch, reconstructed. A decrease is its signature (arming
+         * jumps the peak to the current lane ERLE and a rise re-seeds it); the other way down,
+         * a trip, zeroes the peak outright and is excluded by its value (15.50 -> 0 at hop 312
+         * on the moved scene). Compared with == because it is the identical float subtraction:
+         * anything else means the branch subtracted a different number than the core
+         * converted. */
+        {
+            float peak_after = mcab_duty_erle_peak(p);
+            if (peak_after < peak_before && peak_after != 0.0f) {
+                out->leak_hops += 1;
+                if (peak_after != peak_before -
+                        mcab_duty_erle_leak_db(p))
+                    out->leak_mismatches += 1;
+            }
+        }
+
+        total_now = mcab_duty_hops_total(p);
+        run_now = mcab_duty_hops_run(p);
+        analysed = (int)(run_now - previous_run);
+        if (total_now - previous_total != 1ull) out->census_total_mismatch += 1;
+        if (!analysed && hop > 0 &&
+            pre.delay.estimator_updates != previous_updates)
+            out->updates_on_skipped_hop += 1;
+
+        /* Tail window: the last stable_tail hops before the shift, or before
+         * the end of the run when there is no shift -- so a shift-free call
+         * measures its settled tail without a second, byte-identical run. */
+        {
+            int tail_end = (shift_at >= 0) ? shift_at : hops;
+            if (stable_tail > 0 && hop >= tail_end - stable_tail &&
+                hop < tail_end) {
+                out->stable_tail_hops += 1;
+                out->stable_tail_analysed += analysed;
+            }
+        }
+        if (shift_at >= 0 && hop >= shift_at) {
+            out->hops_after_change += 1;
+            out->analysed_after_change += analysed;
+            streak = analysed ? streak + 1 : 0;
+            if (streak > out->longest_analysed_streak_after_change)
+                out->longest_analysed_streak_after_change = streak;
+            if (streak >= DUTY_FULL_RATE_RUN && out->first_full_rate_hop < 0)
+                out->first_full_rate_hop = hop - streak + 1;
+        }
+        if (pre.delay.changed) {
+            if (out->acquisition_hop < 0) out->acquisition_hop = hop;
+            if (shift_at >= 0 && hop >= shift_at && out->reacquire_hop < 0) {
+                out->reacquire_hop = hop;
+                out->reacquire_delay = pre.delay.delay_samples;
+            }
+        }
+        previous_total = total_now;
+        previous_run = run_now;
+        previous_updates = pre.delay.estimator_updates;
+    }
+
+    out->total = mcab_duty_hops_total(p);
+    out->run = mcab_duty_hops_run(p);
+    free(far_hist);
+    mcab_test_destroy(p);
+}
+
+static void test_duty_cycle_machine(void) {
+    DutyRun stable, moved;
+    McabConfig cfg;
+    Mcab* p;
+    char label[224];
+
+    /* STABLE: one path, held for the whole run. This is exactly the condition
+     * the machine is built to decimate (estimate solid and unchanged for the
+     * hold window), so "it never armed" is a failure here, not a property of
+     * the stimulus. */
+    duty_run(400, 2048, 2048, -1, 120, &stable);
+    printf("duty cycle: static 2048-sample path -> acquired hop %d, analysed "
+           "%llu of %llu hops (%.1f%%)\n", stable.acquisition_hop,
+           stable.run, stable.total,
+           stable.total ? 100.0 * (double)stable.run / (double)stable.total
+                        : 0.0);
+
+    snprintf(label, sizeof(label),
+             "the census counts every hop through the shared delay stage "
+             "(%llu counted, %d hops driven, %d hops that advanced it by "
+             "anything but 1)", stable.total, stable.hops_seen,
+             stable.census_total_mismatch);
+    CHECK(stable.total == (unsigned long long)stable.hops_seen &&
+          stable.hops_seen == 400 && stable.census_total_mismatch == 0, label);
+
+    /* The assertion that can actually fail: a machine that never arms, or a
+     * census wired to a plain hop counter, makes run == total. The band is
+     * deliberately wide -- how fast the estimate goes solid is
+     * stimulus-dependent, and only the decimated REGIME is being pinned. */
+    snprintf(label, sizeof(label),
+             "engagement drops below full rate once the estimate holds still "
+             "(%llu analysed of %llu)", stable.run, stable.total);
+    CHECK(stable.run > 0ull && stable.run < stable.total &&
+          (double)stable.run < 0.6 * (double)stable.total, label);
+
+    snprintf(label, sizeof(label),
+             "the analysed share over the settled tail is decimated, not "
+             "merely reduced (%d of the last %d hops)",
+             stable.stable_tail_analysed, stable.stable_tail_hops);
+    CHECK(stable.stable_tail_hops == 120 &&
+          stable.stable_tail_analysed > 0 &&
+          stable.stable_tail_analysed <= 30, label);
+
+    snprintf(label, sizeof(label),
+             "a hop the matched filter did not analyse publishes no new "
+             "estimate (%d hops published one anyway)",
+             stable.updates_on_skipped_hop);
+    CHECK(stable.updates_on_skipped_hop == 0, label);
+
+    /* MOVED: the echo path really travels, from 2048 to 4096 samples, after
+     * the filters have converged on the first one. Nothing in the PUBLISHED
+     * estimate changes at the move -- it keeps reporting the old delay with
+     * full confidence -- so the only thing that can take the machine back to
+     * full rate is the cancellation watchdog. */
+    duty_run(900, 2048, 4096, 300, 120, &moved);
+    printf("duty cycle: 2048 -> 4096 at hop 300 -> re-acquired hop %d applied "
+           "%d, %d analysed of %d hops after the move, longest full-rate run "
+           "%d hops\n", moved.reacquire_hop, moved.reacquire_delay,
+           moved.analysed_after_change, moved.hops_after_change,
+           moved.longest_analysed_streak_after_change);
+
+    snprintf(label, sizeof(label),
+             "control: the moved path is really re-acquired, at the new "
+             "alignment (hop %d, applied %d for a true 4096)",
+             moved.reacquire_hop, moved.reacquire_delay);
+    CHECK(moved.reacquire_hop > 300 && moved.reacquire_delay >= 0 &&
+          4096 - moved.reacquire_delay >= 0 &&
+          4096 - moved.reacquire_delay <= KD_MAX_UNDERSHOOT, label);
+
+    /* While engaged the schedule is 1-in-K, so consecutive analysed hops are
+     * impossible: a run of them proves the machine DISENGAGED. Deleting the
+     * cancellation watchdog leaves this at 1 -- the estimate itself never
+     * moves at the point of the change, so nothing else can disengage it. */
+    snprintf(label, sizeof(label),
+             "the cancellation watchdog takes the machine back to full rate "
+             "PROMPTLY after the move (first run of %d consecutive analysed "
+             "hops starts on hop %d, %d hops after it; longest run %d)",
+             DUTY_FULL_RATE_RUN, moved.first_full_rate_hop,
+             moved.first_full_rate_hop >= 0 ? moved.first_full_rate_hop - 300
+                                            : -1,
+             moved.longest_analysed_streak_after_change);
+    CHECK(moved.first_full_rate_hop >= 300 &&
+          moved.first_full_rate_hop - 300 <= 60 &&
+          moved.longest_analysed_streak_after_change >= DUTY_FULL_RATE_RUN,
+          label);
+
+    snprintf(label, sizeof(label),
+             "and the census still accounts for every hop of the moved scene "
+             "(%llu counted, %d driven, %d skipped hops that published)",
+             moved.total, moved.hops_seen, moved.updates_on_skipped_hop);
+    CHECK(moved.total == (unsigned long long)moved.hops_seen &&
+          moved.census_total_mismatch == 0 &&
+          moved.updates_on_skipped_hop == 0, label);
+
+    /* The watchdog subtracts the CONVERTED leak, not the authored per-hop literal.
+     * test_duty_watchdog_leak_is_a_rate pins the value the core stores; this pins that the
+     * branch reads it (the only assertion that goes red if a use site reverts to
+     * DUTY_ERLE_LEAK_DB). The decay lives on the MOVED scene; on the static one the lanes
+     * converge monotonically, so the peak is re-seeded from a rising ERLE and never decays. */
+    snprintf(label, sizeof(label),
+             "the watchdog subtracts the converted leak on every decay hop "
+             "(%d decay hops, %d subtracted something else; static scene "
+             "never decays: %d)",
+             moved.leak_hops, moved.leak_mismatches, stable.leak_hops);
+    CHECK(moved.leak_mismatches == 0 && stable.leak_mismatches == 0, label);
+    snprintf(label, sizeof(label),
+             "and the decay branch was actually reached (%d hops)",
+             moved.leak_hops);
+    CHECK(moved.leak_hops > 0, label);
+
+    /* Only MATCHED builds a matched filter, so only MATCHED has a cost to
+     * decimate: the other two modes must leave both counters at 0 rather
+     * than reporting a saving on a machine that was never built. */
+    {
+        int mode;
+        for (mode = 0; mode < 2; ++mode) {
+            float mic[128 * MCAB_CHANNELS];
+            float far[128];
+            Complex* weights;
+            int hop, i, n_freqs;
+            cfg = mcab_default_config(16000);
+            if (mode == 0) {
+                cfg.delay_mode = AEC_DELAY_FIXED;
+                cfg.fixed_delay_samples = 256;
+            } else {
+                cfg.delay_mode = AEC_DELAY_EXTERNAL_ALIGNED;
+                cfg.fixed_delay_samples = -1;
+            }
+            p = mcab_test_create(&cfg);
+            CHECK(p != NULL, "duty census: non-MATCHED core creates");
+            if (!p) continue;
+            hop = mcab_hop_size(p);
+            n_freqs = mcab_n_freqs(p);
+            weights = (Complex*)calloc(
+                (size_t)MCAB_CHANNELS * n_freqs, sizeof(Complex));
+            for (i = 0; i < MCAB_CHANNELS * n_freqs; ++i)
+                weights[i].r = 0.25f;
+            for (i = 0; i < 20; ++i) {
+                McabFront pre;
+                fill_inputs(mic, far, hop, 16000, i);
+                if (mcab_process_front(p, mic, far, &pre) !=
+                    MCAB_OK) break;
+                fuse_only(p, weights);
+            }
+            snprintf(label, sizeof(label),
+                     "%s builds no matched filter, so its duty census stays "
+                     "at 0/0 (%llu/%llu)",
+                     mode == 0 ? "FIXED" : "EXTERNAL_ALIGNED",
+                     mcab_duty_hops_run(p),
+                     mcab_duty_hops_total(p));
+            CHECK(mcab_duty_hops_total(p) == 0ull &&
+                  mcab_duty_hops_run(p) == 0ull, label);
+            free(weights);
+            mcab_test_destroy(p);
+        }
+    }
+
+    /* The census measures ONE run of the machine: reset() restarts it, and
+     * counting resumes rather than sticking at zero. */
+    {
+        float mic[128 * MCAB_CHANNELS];
+        float far[128];
+        unsigned long long after_reset;
+        int hop, i;
+        cfg = mcab_default_config(16000);
+        cfg.enable_post = 0;
+        p = mcab_test_create(&cfg);
+        CHECK(p != NULL, "duty census: reset-scope core creates");
+        if (p) {
+            hop = mcab_hop_size(p);
+            for (i = 0; i < 12; ++i) {
+                McabFront pre;
+                fill_inputs(mic, far, hop, 16000, i);
+                if (mcab_process_front(p, mic, far, &pre) !=
+                    MCAB_OK) break;
+            }
+            CHECK(mcab_duty_hops_total(p) == 12ull,
+                  "duty census counts the hops before a reset");
+            mcab_reset(p);
+            CHECK(mcab_duty_hops_total(p) == 0ull &&
+                  mcab_duty_hops_run(p) == 0ull,
+                  "mcab_reset() zeroes the duty census");
+            for (i = 0; i < 5; ++i) {
+                McabFront pre;
+                fill_inputs(mic, far, hop, 16000, i);
+                if (mcab_process_front(p, mic, far, &pre) !=
+                    MCAB_OK) break;
+            }
+            after_reset = mcab_duty_hops_total(p);
+            snprintf(label, sizeof(label),
+                     "and counting resumes after it (%llu)", after_reset);
+            CHECK(after_reset == 5ull, label);
+            mcab_test_destroy(p);
+        }
+    }
+}
+
+/* ============================================================================
+ * The watchdog leak is a RATE, not a per-hop amount: the duty machine's windows convert
+ * from seconds at init, and so must its leak (0.001 dB/hop is 0.1 dB/s only on the 10 ms
+ * hop lib/aec calibrated it on). Asserted as the rate at all three shipped grids, none of
+ * which is the calibration grid, so reverting the conversion turns all rows red. The
+ * calibration grid cannot be built here (hop 160 at 16 kHz), so the retime identity is
+ * asserted against the pure conversion bit for bit.
+ * ========================================================================== */
+/* The authored per-hop amount, restated here because the core keeps it
+ * file-local -- same reason LE_ERLE_COLLAPSE_DB is restated further down. A
+ * divergence makes this test's premise false rather than its assertions
+ * wrong, which is why the per-grid rows below also tie back to the core's own
+ * conversion. */
+#define DUTY_LEAK_AUTHORED_PER_HOP 0.001f
+
+static void test_duty_watchdog_leak_is_a_rate(void) {
+    static const struct { int sample_rate; int fft_size; } grids[] = {
+        { 16000, 256 }, { 16000, 512 }, { 48000, 1024 }
+    };
+    const float target_db_per_s = 0.1f;
+    char label[192];
+    size_t g;
+
+    for (g = 0; g < sizeof(grids) / sizeof(grids[0]); ++g) {
+        McabConfig cfg =
+            mcab_default_config(grids[g].sample_rate);
+        Mcab* p;
+        float leak;
+        double per_s;
+        int hop;
+
+        cfg.fft_size = grids[g].fft_size;
+        p = mcab_test_create(&cfg);
+        snprintf(label, sizeof(label),
+                 "watchdog leak: core creates at %d Hz / fft %d",
+                 grids[g].sample_rate, grids[g].fft_size);
+        CHECK(p != NULL, label);
+        if (!p) continue;
+
+        hop = mcab_hop_size(p);
+        leak = mcab_duty_erle_leak_db(p);
+        per_s = (double)leak * grids[g].sample_rate / hop;
+
+        snprintf(label, sizeof(label),
+                 "watchdog leak: %d Hz / fft %d leaks %.9g dB per hop = "
+                 "%.6f dB/s (calibrated 0.100000)",
+                 grids[g].sample_rate, grids[g].fft_size, (double)leak, per_s);
+        CHECK(fabs(per_s - (double)target_db_per_s) <= 1e-6, label);
+
+        /* No shipped grid is the calibration grid, so every row must have
+         * moved off the authored literal -- this is the assertion a reverted
+         * conversion fails, on all three rows. */
+        snprintf(label, sizeof(label),
+                 "watchdog leak: %d Hz / fft %d moved off the 10 ms literal "
+                 "(%.9g != 0.001)",
+                 grids[g].sample_rate, grids[g].fft_size, (double)leak);
+        CHECK(leak != DUTY_LEAK_AUTHORED_PER_HOP, label);
+
+        /* And what init stored is the conversion's own answer for this grid,
+         * so the two cannot drift apart. */
+        snprintf(label, sizeof(label),
+                 "watchdog leak: %d Hz / fft %d stored the conversion's own "
+                 "answer", grids[g].sample_rate, grids[g].fft_size);
+        CHECK(leak == mcab_duty_leak_db_for_grid(
+                          hop, grids[g].sample_rate), label);
+
+        mcab_test_destroy(p);
+    }
+
+    /* The calibration point. Bit-exact, not within a tolerance: one ulp of
+     * drift here would mean the 10 ms grid's behaviour had been rewritten
+     * rather than preserved, which is the difference between a retime and a
+     * retune. */
+    snprintf(label, sizeof(label),
+             "watchdog leak: the conversion is the identity at the "
+             "calibration grid (hop 160 @ 16 kHz -> %.9g)",
+             (double)mcab_duty_leak_db_for_grid(160, 16000));
+    CHECK(mcab_duty_leak_db_for_grid(160, 16000) ==
+              DUTY_LEAK_AUTHORED_PER_HOP, label);
+
+    /* LINEAR in the hop period, which is the whole reason this is its own
+     * conversion and not the power law a retention takes: doubling the hop
+     * doubles the leak, exactly. A power-law conversion reproduces the
+     * calibration point above and fails here. Asserted with == because the
+     * two hop periods differ by a power of two, so the quotients do too and
+     * neither rounds. */
+    snprintf(label, sizeof(label),
+             "watchdog leak: doubling the hop doubles the leak exactly "
+             "(%.9g -> %.9g)",
+             (double)mcab_duty_leak_db_for_grid(128, 16000),
+             (double)mcab_duty_leak_db_for_grid(256, 16000));
+    CHECK(mcab_duty_leak_db_for_grid(256, 16000) ==
+              2.0f * mcab_duty_leak_db_for_grid(128, 16000), label);
+
+    /* Degenerate grid: fall back to the authored per-hop amount ("not
+     * converted") rather than dividing by zero. */
+    CHECK(mcab_duty_leak_db_for_grid(0, 16000) ==
+              DUTY_LEAK_AUTHORED_PER_HOP &&
+          mcab_duty_leak_db_for_grid(160, 0) ==
+              DUTY_LEAK_AUTHORED_PER_HOP,
+          "watchdog leak: a non-positive grid falls back to the authored "
+          "per-hop amount");
+}
+
+/* ============================================================================
+ * Duty cycle vs a delay change the watchdog cannot see
+ * ========================================================================== */
+
+/* The counterpart of test_duty_cycle_machine's MOVED scene (good cancellation, watchdog
+ * fires): here near-end noise of comparable power on every microphone caps lane ERLE near
+ * 3 dB, below DUTY_ERLE_COLLAPSE_DB (6 dB), so the watchdog never arms and the 1-in-K
+ * schedule is the whole re-lock mechanism. The scene runs with the schedule pinned at full
+ * rate (mcab_pin_duty_full_rate()) and with the throttle opted into via
+ * cfg.delay_est_period_s (K = 6 here: round(0.5/0.016)/5). The numbers are measured, so a
+ * change that widens the gap fails here. The estimate-moved disengage shortens neither
+ * latency (it fires after the matched filter found the new peak); the census check holds it. */
+
+#define LE_HOP              256
+#define LE_PAD              32768
+#define LE_SHIFT_AT         400
+#define LE_DELAY_A          2048
+#define LE_DELAY_B          4096
+#define LE_ECHO_GAIN        0.6f
+#define LE_NEAR_NOISE_GAIN  0.15f
+#define LE_SETTLED_WINDOW   60
+/* Analysis period in hops at 16 kHz / hop 256, and the full-rate re-lock
+ * bound (measured 319 hops, identical on both backends and both SIMD
+ * settings). The scene runs exactly LE_DUTY_K * LE_FULL_RATE_BOUND hops
+ * after the move, so "the duty arm re-locked before the scene ended" IS the
+ * "within K times the full-rate bound" assertion -- there is no second,
+ * looser number to drift. */
+#define LE_DUTY_K           6
+#define LE_FULL_RATE_BOUND  400
+#define LE_HOPS             (LE_SHIFT_AT + LE_DUTY_K * LE_FULL_RATE_BOUND)
+/* The lane-ERLE figure the watchdog arms on, restated here because the core
+ * keeps it file-local; a divergence makes this test's premise false. */
+#define LE_ERLE_COLLAPSE_DB 6.0f
+
+typedef struct LowErleRun {
+    int acquisition_hop;
+    /* First hop at or after the move that publishes an alignment covering
+     * the new path. Same acceptance window the realign scenes use. */
+    int relock_hop;
+    int relock_delay;
+    int hops_after;
+    int analysed_after;
+    /* Best per-hop lane ERLE anywhere in the run, measured from the core's
+     * own linear output against the microphone it was given -- audio, not a
+     * counter. If this ever clears LE_ERLE_COLLAPSE_DB the scene has stopped
+     * being the scene. */
+    double peak_erle_db;
+    /* The same figure over the settled window immediately before the move. */
+    double settled_erle_db;
+    unsigned long long run;
+    unsigned long long total;
+} LowErleRun;
+
+static void low_erle_run(int pin_full_rate, LowErleRun* out) {
+    McabConfig cfg = mcab_default_config(16000);
+    Mcab* p;
+    float* far_hist;
+    float mic[LE_HOP * MCAB_CHANNELS];
+    float far[LE_HOP];
+    uint32_t noise_rng = 0x77aa55u;
+    double settled_mic = 0.0;
+    double settled_err = 0.0;
+    unsigned long long previous_run = 0;
+    int hop;
+
+    memset(out, 0, sizeof(*out));
+    out->acquisition_hop = -1;
+    out->relock_hop = -1;
+    out->relock_delay = -1;
+
+    cfg.fft_size = 512;             /* the ULCNet grid: hop 256 */
+    /* The throttle is opt-in (the default is full rate) -- this scene exists
+     * to compare the throttled duty arm against a full-rate one, so it asks
+     * for the throttled regime explicitly. 0.5 s is the period LE_DUTY_K was
+     * measured against. */
+    cfg.delay_est_period_s = 0.5f;
+    p = mcab_test_create(&cfg);
+    if (!p) return;
+    if (pin_full_rate) mcab_pin_duty_full_rate(p);
+
+    far_hist = (float*)malloc(
+        (size_t)(LE_HOPS * LE_HOP + LE_PAD) * sizeof(float));
+    if (!far_hist) { mcab_test_destroy(p); return; }
+    realign_scene_history(far_hist, LE_HOPS * LE_HOP + LE_PAD);
+
+    for (hop = 0; hop < LE_HOPS; ++hop) {
+        McabFront pre;
+        int base = hop * LE_HOP + LE_PAD;
+        int dominant = (hop >= LE_SHIFT_AT) ? LE_DELAY_B : LE_DELAY_A;
+        double hop_best = -1.0e30;
+        unsigned long long run_now;
+        int analysed;
+        int i, ch;
+
+        for (i = 0; i < LE_HOP; ++i) {
+            int t = base + i;
+            float echo = LE_ECHO_GAIN * far_hist[t - dominant];
+            float noise;
+            noise_rng ^= noise_rng << 13;
+            noise_rng ^= noise_rng >> 17;
+            noise_rng ^= noise_rng << 5;
+            /* Independent of the far end, so no filter can cancel it: this
+             * is what holds ERLE under the watchdog's arming threshold. */
+            noise = LE_NEAR_NOISE_GAIN *
+                (((float)(noise_rng >> 8) * (1.0f / 16777216.0f)) - 0.5f);
+            far[i] = far_hist[t];
+            for (ch = 0; ch < MCAB_CHANNELS; ++ch)
+                mic[i * MCAB_CHANNELS + ch] = echo + noise;
+        }
+        if (mcab_process_front(p, mic, far, &pre) !=
+            MCAB_OK) break;
+
+        run_now = mcab_duty_hops_run(p);
+        analysed = (int)(run_now - previous_run);
+        previous_run = run_now;
+
+        /* The watchdog reads the BEST of the four lanes, so measure the same
+         * way -- one quiet lane must not be able to fake a low reading. */
+        for (ch = 0; ch < MCAB_CHANNELS; ++ch) {
+            double mic_power = 0.0;
+            double err_power = 0.0;
+            for (i = 0; i < LE_HOP; ++i) {
+                double m = (double)mic[i * MCAB_CHANNELS + ch];
+                double e = (double)pre.formed_hop[ch][i];
+                mic_power += m * m;
+                err_power += e * e;
+            }
+            if (mic_power > 0.0 && err_power > 0.0) {
+                double db = 10.0 * log10(mic_power / err_power);
+                if (db > hop_best) hop_best = db;
+            }
+            if (ch == 0 && hop >= LE_SHIFT_AT - LE_SETTLED_WINDOW &&
+                hop < LE_SHIFT_AT) {
+                settled_mic += mic_power;
+                settled_err += err_power;
+            }
+        }
+        if (hop_best > -1.0e29 && (hop == 0 || hop_best > out->peak_erle_db))
+            out->peak_erle_db = hop_best;
+
+        if (hop >= LE_SHIFT_AT) {
+            out->hops_after += 1;
+            out->analysed_after += analysed;
+        }
+        if (pre.delay.changed) {
+            if (out->acquisition_hop < 0) out->acquisition_hop = hop;
+            if (hop >= LE_SHIFT_AT && out->relock_hop < 0 &&
+                LE_DELAY_B - pre.delay.delay_samples >= 0 &&
+                LE_DELAY_B - pre.delay.delay_samples <= KD_MAX_UNDERSHOOT) {
+                out->relock_hop = hop;
+                out->relock_delay = pre.delay.delay_samples;
+            }
+        }
+    }
+
+    out->settled_erle_db = (settled_err > 0.0)
+        ? 10.0 * log10(settled_mic / settled_err) : 0.0;
+    out->run = mcab_duty_hops_run(p);
+    out->total = mcab_duty_hops_total(p);
+    free(far_hist);
+    mcab_test_destroy(p);
+}
+
+static void test_duty_low_erle_delay_change(void) {
+    LowErleRun full, duty;
+    int full_latency;
+    int duty_latency;
+    int pure_schedule;
+    char label[288];
+
+    low_erle_run(1, &full);
+    low_erle_run(0, &duty);
+
+    full_latency = full.relock_hop >= 0 ? full.relock_hop - LE_SHIFT_AT : -1;
+    duty_latency = duty.relock_hop >= 0 ? duty.relock_hop - LE_SHIFT_AT : -1;
+    /* What a schedule that never went back to full rate would have analysed. */
+    pure_schedule = duty.hops_after / LE_DUTY_K;
+
+    printf("duty low-ERLE: full rate re-locks %d hops after the move "
+           "(%.0f ms), duty %d hops (%.0f ms) -- %.2fx, K=%d; peak lane ERLE "
+           "%.2f dB full / %.2f dB duty (settled %.2f dB, watchdog arms above "
+           "%.1f dB); analysed %d of %d hops after the move against %d for a "
+           "schedule that never disengaged\n",
+           full_latency, (double)full_latency * 16.0,
+           duty_latency, (double)duty_latency * 16.0,
+           full_latency > 0 ? (double)duty_latency / (double)full_latency : 0.0,
+           LE_DUTY_K, full.peak_erle_db, duty.peak_erle_db,
+           duty.settled_erle_db, (double)LE_ERLE_COLLAPSE_DB,
+           duty.analysed_after, duty.hops_after, pure_schedule);
+
+    /* Premise first: if cancellation were good enough to arm the watchdog,
+     * everything below would be measuring the watchdog instead of the
+     * schedule, and the scene would be silently the wrong one. */
+    snprintf(label, sizeof(label),
+             "the scene really does hold lane ERLE under the watchdog's "
+             "arming threshold (peak %.2f dB full / %.2f dB duty, threshold "
+             "%.1f dB)", full.peak_erle_db, duty.peak_erle_db,
+             (double)LE_ERLE_COLLAPSE_DB);
+    CHECK(full.peak_erle_db < (double)LE_ERLE_COLLAPSE_DB &&
+          duty.peak_erle_db < (double)LE_ERLE_COLLAPSE_DB, label);
+
+    snprintf(label, sizeof(label),
+             "both arms acquire the first alignment identically, before the "
+             "schedule can differ (hop %d full, hop %d duty)",
+             full.acquisition_hop, duty.acquisition_hop);
+    CHECK(full.acquisition_hop >= 0 &&
+          full.acquisition_hop == duty.acquisition_hop, label);
+
+    snprintf(label, sizeof(label),
+             "full rate re-locks the moved path within its measured bound "
+             "(%d hops after the move, bound %d, applied %d for a true %d)",
+             full_latency, LE_FULL_RATE_BOUND, full.relock_delay, LE_DELAY_B);
+    CHECK(full_latency > 0 && full_latency <= LE_FULL_RATE_BOUND &&
+          LE_DELAY_B - full.relock_delay >= 0 &&
+          LE_DELAY_B - full.relock_delay <= KD_MAX_UNDERSHOOT, label);
+
+    /* The scene is exactly LE_DUTY_K * LE_FULL_RATE_BOUND hops long after the
+     * move, so re-locking at all inside it IS re-locking within K times the
+     * full-rate bound. */
+    snprintf(label, sizeof(label),
+             "duty re-locks the same path within K times that bound (%d hops "
+             "after the move, bound %d = %dx%d, applied %d)",
+             duty_latency, LE_DUTY_K * LE_FULL_RATE_BOUND, LE_DUTY_K,
+             LE_FULL_RATE_BOUND, duty.relock_delay);
+    CHECK(duty_latency > 0 &&
+          duty_latency <= LE_DUTY_K * LE_FULL_RATE_BOUND &&
+          LE_DELAY_B - duty.relock_delay >= 0 &&
+          LE_DELAY_B - duty.relock_delay <= KD_MAX_UNDERSHOOT, label);
+
+    /* The gap is the point. A build where the two arms cost the same has
+     * either stopped decimating or stopped honouring the pin, and every
+     * bound above would still be green. */
+    snprintf(label, sizeof(label),
+             "and it really is slower than full rate -- the gap this scene "
+             "exists to document (%d vs %d hops, %d hops of extra wait)",
+             duty_latency, full_latency, duty_latency - full_latency);
+    CHECK(duty_latency > full_latency, label);
+
+    snprintf(label, sizeof(label),
+             "the machine stayed engaged across the whole re-acquisition "
+             "(%d of %d hops analysed after the move; full rate would be %d)",
+             duty.analysed_after, duty.hops_after, duty.hops_after);
+    CHECK(duty.analysed_after > 0 &&
+          duty.analysed_after * 4 < duty.hops_after, label);
+
+    /* ...but it did disengage, once. The estimate-moved re-arm shortens no
+     * latency here (see this block's header), so the census is the only
+     * evidence it ran at all: a schedule that never disengaged would analyse
+     * exactly hops_after/K hops and not one more. */
+    snprintf(label, sizeof(label),
+             "the estimate-moved re-arm still fires once the filter finds the "
+             "new peak (%d analysed, more than the %d a never-disengaging "
+             "schedule would)", duty.analysed_after, pure_schedule);
+    CHECK(duty.analysed_after > pure_schedule, label);
+
+    snprintf(label, sizeof(label),
+             "the pinned arm analysed every hop and the census says so "
+             "(%llu of %llu)", full.run, full.total);
+    CHECK(full.total == (unsigned long long)LE_HOPS &&
+          full.run == full.total, label);
+}
+
+/* ============================================================================
+ * Cross-lane far-end spectrum guard
+ * ========================================================================== */
+
+static void test_far_spec_provenance_guard(void) {
+    enum { FS_N = 33 };
+    Complex reference[FS_N];
+    Complex lane[FS_N];
+    McabConfig cfg;
+    Mcab* p;
+    char label[224];
+    int k;
+
+    for (k = 0; k < FS_N; ++k) {
+        reference[k].r = 0.5f * (float)(k - 11);
+        reference[k].i = -0.25f * (float)(k + 3);
+    }
+    memcpy(lane, reference, sizeof(reference));
+
+    CHECK(mcab_far_spec_agrees(0, lane, reference, FS_N) == 1,
+          "a lane carrying the same far spectrum is accepted on the "
+          "comparison path");
+    CHECK(mcab_far_spec_agrees(1, lane, reference, FS_N) == 1,
+          "and on the provenance path");
+
+    /* A lane whose far-end spectrum genuinely differs must still be rejected
+     * -- X is one shared render reference, not a fourth observation of it.
+     * The divergence is far outside complex_close()'s relative window. */
+    lane[7].r = reference[7].r + 1.0f;
+    CHECK(mcab_far_spec_agrees(0, lane, reference, FS_N) == 0,
+          "a lane carrying a DIFFERENT far spectrum is rejected when nothing "
+          "establishes where it came from");
+
+    /* MUTATION, asserted rather than described: the provenance flag is what
+     * licenses skipping the comparison, so a flag that says "shared" when the
+     * lanes are not lets exactly this frame through. That is why nothing sets
+     * it except the counter evidence in mcab_process_front(), and why every bail-out
+     * path leaves it 0. Make mcab_far_spec_agrees() ignore its
+     * first argument and the row above goes red. */
+    CHECK(mcab_far_spec_agrees(1, lane, reference, FS_N) == 1,
+          "and would be accepted if provenance claimed the lanes shared one "
+          "spectrum (the flag is load-bearing, not decorative)");
+
+    CHECK(mcab_far_spec_agrees(0, NULL, reference, FS_N) == 0 &&
+          mcab_far_spec_agrees(1, lane, NULL, FS_N) == 0,
+          "a missing spectrum is rejected on either path");
+
+    /* End to end: production really does take the cheap path, and the
+     * evidence it rests on -- one real far transform per hop across the four
+     * lanes -- is the same figure the sharing test pins. */
+    cfg = mcab_default_config(16000);
+    p = mcab_test_create(&cfg);
+    CHECK(p != NULL, "far-spec provenance: core creates");
+    if (p) {
+        float mic[128 * MCAB_CHANNELS];
+        float far[128];
+        Complex* weights;
+        int hop = mcab_hop_size(p);
+        int n_freqs = mcab_n_freqs(p);
+        int established = 0;
+        int hops = 0;
+        int i;
+        weights = (Complex*)calloc(
+            (size_t)MCAB_CHANNELS * n_freqs, sizeof(Complex));
+        for (i = 0; i < MCAB_CHANNELS * n_freqs; ++i)
+            weights[i].r = 0.25f;
+        for (i = 0; i < 40; ++i) {
+            McabFront pre;
+            fill_inputs(mic, far, hop, 16000, i);
+            if (mcab_process_front(p, mic, far, &pre) !=
+                MCAB_OK) break;
+            hops += 1;
+            established += mcab_far_spec_provenance(p) ? 1 : 0;
+            if (fuse_only(p, weights) != MCAB_OK) break;
+        }
+        snprintf(label, sizeof(label),
+                 "every hop establishes the shared-far provenance (%d of %d), "
+                 "backed by one real far transform per hop (%ld)",
+                 established, hops,
+                 mcab_far_fft_real_compute_count(p));
+        CHECK(hops == 40 && established == 40 &&
+              mcab_far_fft_real_compute_count(p) == (long)hops,
+              label);
+        free(weights);
+        mcab_test_destroy(p);
+    }
+}
+
+
+/* A hop on which some lanes realign warm and others soft must give every lane its own far
+ * spectrum: a soft realign zeroes that lane's far_buffer history, a warm one keeps it, so
+ * lane 0's spectrum is wrong for the reset lanes. Borrowing it leaves no trace on the hop
+ * itself (a fresh filter has zero taps) but corrupts later adaptation. The reference is four
+ * stand-alone lanes through the ordinary local-far path (aec_process_context) with the same
+ * inputs and realign deltas; the core's lanes must match bit for bit, and the far-FFT counter
+ * must read 4 on the mixed hop and 1 otherwise. Lanes 0-1 carry a two-path echo (warm
+ * transfer on the swing), lanes 2-3 unrelated noise (filter-only reset). */
+typedef struct MixedHopRun {
+    int hops_run;
+    int mixed_hops;              /* hops with both warm and soft lane realigns */
+    int mixed_hop_first;         /* -1 when none                              */
+    int mixed_fft_not_four;      /* mixed hops whose far-FFT delta was not 4   */
+    int other_fft_not_one;       /* other hops whose far-FFT delta was not 1   */
+    int outcome_count_mismatch;  /* realign hops where reference warm/soft
+                                  * counts differ from the core's              */
+    int lane_hops_mismatched;    /* lane-hops where error spectrum or formed
+                                  * hop differs from the reference             */
+    int first_mismatch_hop;      /* -1 when none                              */
+    int far_spec_diverges;       /* mixed hops where the reference lanes' own
+                                  * far spectra differ between lanes           */
+    int fuse_failures;           /* hops whose fuse did not return OK          */
+    int valid;
+} MixedHopRun;
+
+static int mixed_hop_far_specs_differ(const Complex* a, const Complex* b,
+                                      int n) {
+    return memcmp(a, b, (size_t)n * sizeof(Complex)) != 0;
+}
+
+static void mixed_hop_run(int sample_rate, int fft_size, int strong_delay,
+                          int weak_delay, int swing_hop, int hops,
+                          MixedHopRun* out) {
+    enum { MH_PAD = 4096 };
+    McabConfig cfg = mcab_default_config(sample_rate);
+    AecConfig lane_cfg;
+    Mcab* p = NULL;
+    Aec* ref_lane[MCAB_CHANNELS] = {NULL, NULL, NULL, NULL};
+    void* ref_pool[MCAB_CHANNELS] = {NULL, NULL, NULL, NULL};
+    uint32_t noise_rng[MCAB_CHANNELS] = {
+        0u, 0u, 0x9e3779b9u, 0x85ebca6bu};
+    uint32_t rng = 0x1234567u;
+    float* history = NULL;
+    float* microphones = NULL;
+    float* lane_mic = NULL;
+    float* ref = NULL;
+    Complex* weights = NULL;
+    long warm_before = 0, soft_before = 0, fft_before = 0;
+    int previous_solid = 0;
+    int previous_delay = 0;
+    int hop = 0, n_freqs = 0;
+    int h, ch, i;
+
+    memset(out, 0, sizeof(*out));
+    out->mixed_hop_first = -1;
+    out->first_mismatch_hop = -1;
+
+    cfg.fft_size = fft_size;
+    p = mcab_test_create(&cfg);
+    if (!p || lane_config_for(&cfg, &lane_cfg) != 0)
+        goto cleanup;
+    hop = mcab_hop_size(p);
+    n_freqs = mcab_n_freqs(p);
+    {
+        size_t bytes = aec_get_mem_size(&lane_cfg);
+        for (ch = 0; ch < MCAB_CHANNELS; ++ch) {
+            if (bytes == 0 ||
+                posix_memalign(&ref_pool[ch], 16, bytes) != 0) goto cleanup;
+            ref_lane[ch] = aec_init(ref_pool[ch], bytes, &lane_cfg);
+            if (!ref_lane[ch]) goto cleanup;
+        }
+    }
+    history = (float*)calloc((size_t)(hops * hop + MH_PAD), sizeof(float));
+    microphones = (float*)calloc(
+        (size_t)hop * MCAB_CHANNELS, sizeof(float));
+    lane_mic = (float*)calloc((size_t)hop, sizeof(float));
+    ref = (float*)calloc((size_t)hop, sizeof(float));
+    weights = (Complex*)calloc(
+        (size_t)MCAB_CHANNELS * n_freqs, sizeof(Complex));
+    if (!history || !microphones || !lane_mic || !ref || !weights)
+        goto cleanup;
+    for (i = 0; i < hops * hop + MH_PAD; ++i) {
+        rng ^= rng << 13; rng ^= rng >> 17; rng ^= rng << 5;
+        history[i] = 0.1f * (((float)(rng >> 8) *
+                              (1.0f / 16777216.0f)) - 0.5f);
+    }
+    for (i = 0; i < MCAB_CHANNELS * n_freqs; ++i)
+        weights[i].r = 0.25f;
+
+    for (h = 0; h < hops; ++h) {
+        McabFront pre;
+        McabFrame fused;
+        int base = h * hop + MH_PAD;
+        float strong_gain = h >= swing_hop ? 0.25f : 0.6f;
+        float weak_gain = h >= swing_hop ? 0.6f : 0.25f;
+        int old_align = previous_solid ? previous_delay : 0;
+        long warm_after, soft_after, fft_after;
+        int warm_delta, soft_delta, fft_delta, mixed;
+        int ref_warm = 0, ref_soft = 0;
+        const Complex* first_far = NULL;
+        const Complex* soft_far = NULL;
+
+        for (i = 0; i < hop; ++i) {
+            float echo = strong_gain * history[base + i - strong_delay] +
+                         weak_gain * history[base + i - weak_delay];
+            ref[i] = history[base + i];
+            for (ch = 0; ch < MCAB_CHANNELS; ++ch) {
+                float v = echo;
+                if (ch >= 2) {
+                    noise_rng[ch] ^= noise_rng[ch] << 13;
+                    noise_rng[ch] ^= noise_rng[ch] >> 17;
+                    noise_rng[ch] ^= noise_rng[ch] << 5;
+                    v = 0.06f * (((float)(noise_rng[ch] >> 8) *
+                                  (1.0f / 16777216.0f)) - 0.5f);
+                }
+                microphones[i * MCAB_CHANNELS + ch] = v;
+            }
+        }
+        if (mcab_process_front(p, microphones, ref, &pre) !=
+                MCAB_OK) goto cleanup;
+        out->hops_run += 1;
+
+        warm_after = mcab_realign_warm_lane_count(p);
+        soft_after = mcab_realign_soft_lane_count(p);
+        fft_after = mcab_far_fft_real_compute_count(p);
+        warm_delta = (int)(warm_after - warm_before);
+        soft_delta = (int)(soft_after - soft_before);
+        fft_delta = (int)(fft_after - fft_before);
+        mixed = pre.delay.changed && warm_delta > 0 && soft_delta > 0;
+        if (mixed) {
+            out->mixed_hops += 1;
+            if (out->mixed_hop_first < 0) out->mixed_hop_first = h;
+        }
+
+        if (pre.delay.changed) {
+            for (ch = 0; ch < MCAB_CHANNELS; ++ch) {
+                int outcome = aec_apply_external_realign(
+                    ref_lane[ch], pre.delay.delay_samples - old_align);
+                if (outcome == 1) ref_warm += 1;
+                if (outcome == 0) ref_soft += 1;
+            }
+            if (ref_warm != warm_delta || ref_soft != soft_delta)
+                out->outcome_count_mismatch += 1;
+        }
+        for (ch = 0; ch < MCAB_CHANNELS; ++ch) {
+            AecResContext context;
+            int lane_bad;
+            for (i = 0; i < hop; ++i)
+                lane_mic[i] = microphones[i * MCAB_CHANNELS + ch];
+            aec_process_context(ref_lane[ch], lane_mic, pre.aligned_ref);
+            aec_get_res_context(ref_lane[ch], &context);
+            lane_bad =
+                memcmp(context.error_spec, pre.linear_spectra[ch],
+                       (size_t)n_freqs * sizeof(Complex)) != 0 ||
+                memcmp(context.formed_hop, pre.formed_hop[ch],
+                       (size_t)hop * sizeof(float)) != 0;
+            if (lane_bad) {
+                out->lane_hops_mismatched += 1;
+                if (out->first_mismatch_hop < 0) out->first_mismatch_hop = h;
+            }
+            if (ch == 0) first_far = context.far_spec;
+            else if (!soft_far && first_far && mixed &&
+                     mixed_hop_far_specs_differ(
+                         context.far_spec, first_far, n_freqs))
+                soft_far = context.far_spec;
+        }
+        if (mixed && soft_far) out->far_spec_diverges += 1;
+
+        if (mixed) {
+            if (fft_delta != MCAB_CHANNELS)
+                out->mixed_fft_not_four += 1;
+        } else if (fft_delta != 1) {
+            out->other_fft_not_one += 1;
+        }
+        if (mcab_fuse(p, weights, NULL, &fused) != MCAB_OK)
+            out->fuse_failures += 1;
+
+        previous_solid = pre.delay.solid;
+        previous_delay = pre.delay.delay_samples;
+        warm_before = warm_after;
+        soft_before = soft_after;
+        fft_before = fft_after;
+    }
+    out->valid = 1;
+
+cleanup:
+    free(weights);
+    free(ref);
+    free(lane_mic);
+    free(microphones);
+    free(history);
+    for (ch = 0; ch < MCAB_CHANNELS; ++ch) free(ref_pool[ch]);
+    mcab_test_destroy(p);
+}
+
+static void test_mixed_realign_hop_far_spectrum(
+        int sample_rate, int fft_size, int strong_delay, int weak_delay,
+        int swing_hop, int hops) {
+    MixedHopRun run;
+    char label[256];
+
+    mixed_hop_run(sample_rate, fft_size, strong_delay, weak_delay,
+                  swing_hop, hops, &run);
+    snprintf(label, sizeof(label),
+             "mixed realign sr=%d/fft=%d: the scene runs to completion and "
+             "really produces a hop with warm AND soft lane realigns (%d "
+             "mixed hop(s), first at hop %d of %d)",
+             sample_rate, fft_size, run.mixed_hops, run.mixed_hop_first,
+             run.hops_run);
+    CHECK(run.valid && run.hops_run == hops && run.mixed_hops >= 1, label);
+    snprintf(label, sizeof(label),
+             "mixed realign sr=%d/fft=%d: the independent reference lanes "
+             "realign with the same warm/soft split as the core's lanes (%d "
+             "hops differ)",
+             sample_rate, fft_size, run.outcome_count_mismatch);
+    CHECK(run.valid && run.outcome_count_mismatch == 0, label);
+    snprintf(label, sizeof(label),
+             "mixed realign sr=%d/fft=%d: on the mixed hop the lanes' own "
+             "far spectra really differ (%d of %d mixed hops)",
+             sample_rate, fft_size, run.far_spec_diverges, run.mixed_hops);
+    CHECK(run.valid && run.mixed_hops >= 1 &&
+          run.far_spec_diverges == run.mixed_hops, label);
+    snprintf(label, sizeof(label),
+             "mixed realign sr=%d/fft=%d: every mixed hop runs four local "
+             "far FFTs (%d mixed hops did not) and every other hop exactly "
+             "one (%d hops did not)",
+             sample_rate, fft_size, run.mixed_fft_not_four,
+             run.other_fft_not_one);
+    CHECK(run.valid && run.mixed_fft_not_four == 0 &&
+          run.other_fft_not_one == 0, label);
+    snprintf(label, sizeof(label),
+             "mixed realign sr=%d/fft=%d: every lane's error spectrum and "
+             "formed hop equals an ordinary local-far reference lane bit for "
+             "bit across the mixed hop and the hops after it (%d lane-hops "
+             "differ, first at hop %d)",
+             sample_rate, fft_size, run.lane_hops_mismatched,
+             run.first_mismatch_hop);
+    CHECK(run.valid && run.lane_hops_mismatched == 0, label);
+    snprintf(label, sizeof(label),
+             "mixed realign sr=%d/fft=%d: the fuse accepts the mixed hop "
+             "and every other (%d refusals)",
+             sample_rate, fft_size, run.fuse_failures);
+    CHECK(run.valid && run.fuse_failures == 0, label);
+}
+
+/* One hop of the echo stimulus the bypass tests share: a far-end tone, its
+ * half-level echo on every microphone, a weak near-end tone and a
+ * deterministic broadband term so the denoiser has something to shape once
+ * it leaves init -- a pure tone pair can leave the gain at its ceiling and a
+ * divergence row would never fire. */
+static void synth_echo_hop(int h, int hop, float* mics, float* far,
+                           uint32_t* rng) {
+    int i, ch;
+    for (i = 0; i < hop; ++i) {
+        float t = (float)(h * hop + i);
+        float r = 0.6f * sinf(0.06f * t);
+        float noise;
+        *rng = *rng * 1664525u + 1013904223u;
+        noise = 0.02f * ((float)((*rng >> 8) & 0xFFFFu) / 32768.0f - 1.0f);
+        far[i] = r;
+        for (ch = 0; ch < 4; ++ch)
+            mics[(size_t)i * 4u + (size_t)ch] =
+                0.5f * r + 0.02f * sinf(0.017f * t) + noise;
+    }
+}
+
+/* The NR-disabled post path must apply exactly the RES gain with no scaling of its own.
+ * MMSE-LSA passes through (gain == 1.0 in every bin) for its first num_init_frames hops,
+ * and min(1.0, res_gain) is res_gain, so over that window an NR-enabled and an NR-disabled
+ * instance fed the same stimulus must emit the same samples bit for bit. Also asserted: a
+ * non-zero output (the equality would hold trivially on silence) and a later divergence (a
+ * denoiser that never shapes anything would make the equality prove nothing). */
+static void test_nr_bypass_output_identity(void) {
+    McabConfig cfg = mcab_default_config(16000);
+    ConvChainOptions on_opt = conv_default_options();
+    ConvChainOptions off_opt = on_opt;
+    ConvChain* on;
+    ConvChain* off;
+    float *mics, *far, *out_on, *out_off;
+    Complex* w;
+    uint32_t rng = 12345u;
+    int hop, n, init_hops, total_hops, h, i, ch, k;
+    int prefix_equal = 1, prefix_nonzero = 0, diverged_after_init = 0;
+
+    off_opt.enable_nr = 0;
+    on = conv_create(&cfg, &on_opt);
+    off = conv_create(&cfg, &off_opt);
+    CHECK(on != NULL && off != NULL,
+          "NR-enabled and NR-disabled instances both create");
+    if (!on || !off) {
+        conv_destroy(on);
+        conv_destroy(off);
+        return;
+    }
+    hop = on->hop;
+    n = on->n_freqs;
+    CHECK(off->hop == hop && off->n_freqs == n,
+          "the two instances resolve the same grid");
+
+    /* The canonical noise-init length: the pipeline's NR overlay retimes L,
+     * not num_init_frames, so the denoiser's pass-through window is the
+     * canonical one for this grid. */
+    init_hops = anr_retime_frames(20, 16000, hop);
+    total_hops = init_hops + 80;
+
+    mics = (float*)calloc((size_t)hop * 4u, sizeof(float));
+    far = (float*)calloc((size_t)hop, sizeof(float));
+    out_on = (float*)calloc((size_t)hop, sizeof(float));
+    out_off = (float*)calloc((size_t)hop, sizeof(float));
+    w = (Complex*)calloc(
+        (size_t)MCAB_CHANNELS * (size_t)n, sizeof(Complex));
+    if (!mics || !far || !out_on || !out_off || !w) {
+        free(mics); free(far); free(out_on); free(out_off); free(w);
+        conv_destroy(on);
+        conv_destroy(off);
+        CHECK(0, "NR bypass identity stimulus allocates");
+        return;
+    }
+    for (ch = 0; ch < MCAB_CHANNELS; ++ch)
+        for (k = 0; k < n; ++k) {
+            w[(size_t)ch * (size_t)n + (size_t)k].r = 0.25f;
+            w[(size_t)ch * (size_t)n + (size_t)k].i = 0.0f;
+        }
+
+    for (h = 0; h < total_hops; ++h) {
+        synth_echo_hop(h, hop, mics, far, &rng);
+        if (conv_hop(on, mics, far, w, NULL, out_on) != MCAB_OK ||
+            conv_hop(off, mics, far, w, NULL, out_off) != MCAB_OK)
+            break;
+
+        if (h < init_hops) {
+            if (memcmp(out_on, out_off, (size_t)hop * sizeof(float)) != 0)
+                prefix_equal = 0;
+            for (i = 0; i < hop; ++i)
+                if (out_off[i] != 0.0f) prefix_nonzero = 1;
+        } else if (memcmp(out_on, out_off,
+                          (size_t)hop * sizeof(float)) != 0) {
+            diverged_after_init = 1;
+        }
+    }
+    CHECK(h == total_hops, "both instances process the whole stimulus");
+    CHECK(prefix_equal,
+          "NR-disabled output is bit-identical to NR-enabled while the "
+          "denoiser passes through -- the RES-only branch applies res_gain "
+          "with nothing of its own");
+    CHECK(prefix_nonzero,
+          "that identity window carries a non-zero signal");
+    CHECK(diverged_after_init,
+          "the two paths diverge once the denoiser starts shaping, so the "
+          "identity above is a constraint and not a silent no-op");
+
+    free(mics); free(far); free(out_on); free(out_off); free(w);
+    conv_destroy(on);
+    conv_destroy(off);
+}
+
+/* With RES, NR and CNG all disabled the post path has no gain source, so the core must be
+ * a transparent synthesis of the beamformed linear error: with identity weights on lane 0
+ * the fused error is lane 0's analysis spectrum, and a sqrt-Hann WOLA round trip
+ * reconstructs the previous hop of formed_hop[0] to float precision. The default core on
+ * the same stimulus must not satisfy it, or the identity proves nothing about the switch.
+ * Structural rows: no suppressor is built. */
+static void test_res_bypass_passthrough(void) {
+    McabConfig cfg = mcab_default_config(16000);
+    ConvChainOptions def_opt = conv_default_options();
+    ConvChainOptions off_opt = def_opt;
+    ConvChain* off;
+    ConvChain* def;
+    float *mics, *far, *out_off, *out_def, *prev_lin;
+    Complex* w;
+    uint32_t rng = 4242u;
+    double max_abs = 0.0, max_err_off = 0.0, max_err_def = 0.0;
+    int hop, n, h, i, k, total_hops = 200;
+
+    def_opt.enable_cng = 0;
+    off_opt.enable_cng = 0;
+    off_opt.enable_res = 0;
+    off_opt.enable_nr = 0;
+    off = conv_create(&cfg, &off_opt);
+    def = conv_create(&cfg, &def_opt);
+    CHECK(off != NULL && def != NULL, "RES-disabled and default chains create");
+    if (!off || !def) {
+        conv_destroy(off);
+        conv_destroy(def);
+        return;
+    }
+    CHECK(off->res == NULL && def->res != NULL,
+          "the RES-disabled chain builds no suppressor");
+    hop = off->hop;
+    n = off->n_freqs;
+    mics = (float*)calloc((size_t)hop * 4u, sizeof(float));
+    far = (float*)calloc((size_t)hop, sizeof(float));
+    out_off = (float*)calloc((size_t)hop, sizeof(float));
+    out_def = (float*)calloc((size_t)hop, sizeof(float));
+    prev_lin = (float*)calloc((size_t)hop, sizeof(float));
+    w = (Complex*)calloc(
+        (size_t)MCAB_CHANNELS * (size_t)n, sizeof(Complex));
+    if (!mics || !far || !out_off || !out_def || !prev_lin || !w) {
+        free(mics); free(far); free(out_off); free(out_def); free(prev_lin);
+        free(w);
+        conv_destroy(off);
+        conv_destroy(def);
+        CHECK(0, "RES bypass stimulus allocates");
+        return;
+    }
+    for (k = 0; k < n; ++k) w[k].r = 1.0f;
+    for (h = 0; h < total_hops; ++h) {
+        synth_echo_hop(h, hop, mics, far, &rng);
+        if (conv_hop(off, mics, far, w, NULL, out_off) != MCAB_OK ||
+            conv_hop(def, mics, far, w, NULL, out_def) != MCAB_OK)
+            break;
+        /* out(h) reconstructs lane 0's hop h-1; the two lanes see the same
+         * input, so either instance's copy of it is the reference. */
+        if (h >= 4)
+            for (i = 0; i < hop; ++i) {
+                double ref = prev_lin[i];
+                double e_off = fabs((double)out_off[i] - ref);
+                double e_def = fabs((double)out_def[i] - ref);
+                if (fabs(ref) > max_abs) max_abs = fabs(ref);
+                if (e_off > max_err_off) max_err_off = e_off;
+                if (e_def > max_err_def) max_err_def = e_def;
+            }
+        for (i = 0; i < hop; ++i)
+            prev_lin[i] = off->front.formed_hop[0][i];
+    }
+    CHECK(h == total_hops, "both cores process the whole stimulus");
+    printf("  RES bypass: max|lin|=%.4f  max err off=%.2e  def=%.2e\n",
+           max_abs, max_err_off, max_err_def);
+    CHECK(max_abs > 1e-3, "the linear reference carries signal");
+    CHECK(max_err_off <= 1e-4 * max_abs,
+          "with RES, NR and CNG off the core is a transparent synthesis of "
+          "the beamformed linear error");
+    CHECK(max_err_def > 1e-2 * max_abs,
+          "the default core shapes the same stimulus, so the identity above "
+          "is a constraint on the bypass and not on the stimulus");
+    free(mics); free(far); free(out_off); free(out_def); free(prev_lin); free(w);
+    conv_destroy(off);
+    conv_destroy(def);
+}
+
+/* Per-stage timing: the numbers must be REAL measurements, not just present.
+ * Each timed stage is bounded by the wall-clock cost of the call it sits in,
+ * and the two fields documented as always-zero must actually be zero -- that
+ * pair is what stops linear_us silently being re-labelled later. */
+static void test_stage_timing(void) {
+    McabConfig cfg = mcab_default_config(16000);
+    Mcab* p = mcab_test_create(&cfg);
+    McabLastTiming t, zero;
+    uint32_t pre_wall_us = 0, post_wall_us = 0;
+    uint32_t pre_sum, post_sum;
+
+    CHECK(p != NULL, "timing: core created");
+    if (!p) return;
+
+    /* A NULL pipeline must zero the whole record rather than fail. Compared
+     * as a struct, so the two always-zero fields are covered too -- they are
+     * exactly where a memset-versus-field-copy slip would hide. */
+    memset(&zero, 0, sizeof(zero));
+    memset(&t, 0xa5, sizeof(t));
+    mcab_get_last_timing(NULL, &t);
+    CHECK(memcmp(&t, &zero, sizeof(t)) == 0,
+          "timing: a NULL pipeline zeroes the record");
+
+    /* Warm up so the delay estimator and filters are doing real work; the
+     * driver hands back the final hop's wall time measured around the same
+     * two calls the library stamps inside. */
+    feed_strength_hops(p, 34, &pre_wall_us, &post_wall_us);
+    mcab_get_last_timing(p, &t);
+
+    /* Written so it can fail: four AEC lanes each run a main filter, a
+     * pre-filter stage and a post/RES block over a full hop, and the shared
+     * five-filter matched estimator runs once -- none of those can cost under
+     * a microsecond, so a zero anywhere here means that window never ran.
+     * frontend_us and lane_res_us come from aec_get_last_timing(); they read
+     * zero if the AEC-side windows are ever dropped. */
+    /* Each half is asserted against its OWN flag, because the two are
+     * separate builds: MCAB_STAGE_TIMING governs the wrapper's
+     * stages, AEC_STAGE_TIMING governs the three summed off the lanes. Both
+     * default off, and the zero branches are not filler -- they are what
+     * proves the flag removes the measurement rather than merely hiding it,
+     * and that a compiled-out build reports zeros instead of stale values. */
+#if MCAB_STAGE_TIMING
+    CHECK(t.delay_us > 0, "timing: the delay estimator reports a real cost");
+#else
+    CHECK(t.delay_us == 0,
+          "timing: the wrapper's stages read zero when compiled out");
+#endif
+#if AEC_STAGE_TIMING
+    CHECK(t.frontend_us > 0,
+          "timing: the lanes' pre-filter stage reports a real cost");
+    CHECK(t.linear_us > 0, "timing: the lanes' main filter reports a real cost");
+    CHECK(t.lane_res_us > 0,
+          "timing: the lanes' post/RES block reports a real cost");
+#else
+    CHECK(t.frontend_us == 0 && t.linear_us == 0 && t.lane_res_us == 0,
+          "timing: the lanes' stages read zero when compiled out");
+#endif
+
+    /* Every stage is bounded by the call that contains it. This is what
+     * distinguishes a measurement from a number: a stray or uninitialised
+     * value would almost certainly exceed its enclosing call. */
+    pre_sum = t.delay_us + t.frontend_us + t.linear_us + t.lane_res_us;
+    post_sum = t.fuse_us;
+    CHECK(pre_sum <= pre_wall_us,
+          "timing: lane stages must fit inside mcab_process_front's wall time");
+    CHECK(post_sum <= post_wall_us,
+          "timing: the fuse stage must fit inside mcab_fuse's wall time");
+
+    /* A hop that is accepted and then bails out must report zeros for the
+     * stages it never reached, not the previous hop's numbers. The non-finite
+     * input check is the reachable bail-out: it runs after the record is
+     * cleared, so without that clearing the values above would survive. */
+    {
+        int hop = mcab_hop_size(p);
+        float* nan_mics = (float*)malloc((size_t)hop * 4u * sizeof(float));
+        float* far = (float*)calloc((size_t)hop, sizeof(float));
+        McabFront pre;
+        McabLastTiming after_bail;
+        int i;
+        CHECK(nan_mics && far, "timing: allocation");
+        if (nan_mics && far) {
+            for (i = 0; i < hop * 4; ++i) nan_mics[i] = (float)NAN;
+            CHECK(mcab_process_front(p, nan_mics, far, &pre) ==
+                      MCAB_INVALID_ARGUMENT,
+                  "timing: a non-finite hop is rejected");
+            /* Read into its own record: `t` still holds the good hop the
+             * report below prints. */
+            mcab_get_last_timing(p, &after_bail);
+            CHECK(after_bail.delay_us == 0 && after_bail.linear_us == 0 &&
+                  after_bail.frontend_us == 0 && after_bail.lane_res_us == 0,
+                  "timing: a bailed-out hop reports zeros, not the last "
+                  "hop's numbers");
+        }
+        free(nan_mics); free(far);
+    }
+
+    mcab_test_destroy(p);
+    printf("timing: delay=%u frontend=%u linear=%u lane_res=%u "
+           "(pre wall %uus) | fuse=%u (fuse wall %uus)\n",
+           t.delay_us, t.frontend_us, t.linear_us, t.lane_res_us, pre_wall_us,
+           t.fuse_us, post_wall_us);
+}
+
+/* Comfort noise fills the AEC-suppressed bins from lib/aec's recipe: an LCG step per bin
+ * whose top five bits index kCngTable, the imaginary part a quarter turn (+8 of 32) ahead
+ * of the real one. The injected noise owes the caller bounded samples, the same expected
+ * per-bin power as the unit-variance Gaussian pair and an advancing sequence; no output
+ * bytes are pinned. The pipeline half differences a CNG-on run against a byte-identical
+ * CNG-off one: comfort noise is added after every gain, so the difference is the noise. */
+static void test_comfort_noise_contract(void) {
+    McabConfig cfg = mcab_default_config(16000);
+    ConvChainOptions on = conv_default_options();
+    ConvChainOptions off = conv_default_options();
+    ConvChain* p_on;
+    ConvChain* p_off;
+    float* mics;
+    float* far;
+    float* out_on;
+    float* out_off;
+    float* prev_noise;
+    float* noise_stream;
+    Complex* w;
+    double sum = 0.0;
+    double sq = 0.0;
+    double worst_pair = 0.0;
+    double noise_sq = 0.0;
+    double corr_sum = 0.0;
+    float bound = 0.0f;
+    const int hops = 240;
+    int hop;
+    int n;
+    int h, i, ch, k;
+    int injected = 0;
+    int prev_active = 0;
+    int corr_n = 0;
+    int finite = 1;
+
+    for (i = 0; i < 32; ++i) {
+        float v = kCngTable[i];
+        float q = kCngTable[(i + 8) & 31];
+        double power = (double)v * v + (double)q * q;
+        if (fabsf(v) > bound) bound = fabsf(v);
+        sum += v;
+        sq += (double)v * v;
+        if (fabs(power - 2.0) > worst_pair) worst_pair = fabs(power - 2.0);
+    }
+    CHECK(bound <= 1.41421366f,
+          "cng: every table entry is bounded by sqrt(2) (no unbounded tail)");
+    CHECK(fabs(sum / 32.0) < 1e-6,
+          "cng: the table is zero-mean over a uniform index");
+    CHECK(fabs(sq / 32.0 - 1.0) < 1e-6,
+          "cng: the table has unit mean square -- same expected per-bin power "
+          "as the unit-variance Gaussian pair it replaced");
+    CHECK(worst_pair < 1e-6,
+          "cng: real and imaginary entries are a quarter turn apart, so each "
+          "bin's injected power is exactly 2*amplitude^2");
+
+    off.enable_cng = 0;
+    p_on = conv_create(&cfg, &on);
+    p_off = conv_create(&cfg, &off);
+    CHECK(p_on != NULL && p_off != NULL, "cng: both chains create");
+    if (!p_on || !p_off) {
+        conv_destroy(p_on);
+        conv_destroy(p_off);
+        return;
+    }
+    hop = p_on->hop;
+    n = p_on->n_freqs;
+    mics = (float*)calloc((size_t)hop * MCAB_CHANNELS, sizeof(float));
+    far = (float*)calloc((size_t)hop, sizeof(float));
+    out_on = (float*)calloc((size_t)hop, sizeof(float));
+    out_off = (float*)calloc((size_t)hop, sizeof(float));
+    prev_noise = (float*)calloc((size_t)hop, sizeof(float));
+    noise_stream = (float*)calloc((size_t)hops * (size_t)hop, sizeof(float));
+    w = (Complex*)calloc(
+        (size_t)MCAB_CHANNELS * (size_t)n, sizeof(Complex));
+    for (ch = 0; ch < MCAB_CHANNELS; ++ch)
+        for (k = 0; k < n; ++k) w[(size_t)ch * (size_t)n + (size_t)k].r = 0.25f;
+
+    for (h = 0; h < hops; ++h) {
+        fill_inputs(mics, far, hop, 16000, h);
+        if (conv_hop(p_on, mics, far, w, NULL, out_on) != MCAB_OK ||
+            conv_hop(p_off, mics, far, w, NULL, out_off) != MCAB_OK) {
+            finite = 0;
+            break;
+        }
+        {
+            double hop_sq = 0.0;
+            double cross = 0.0;
+            double prev_sq = 0.0;
+            for (i = 0; i < hop; ++i) {
+                float noise = out_on[i] - out_off[i];
+                noise_stream[(size_t)h * (size_t)hop + (size_t)i] = noise;
+                if (!isfinite(out_on[i]) || !isfinite(noise)) finite = 0;
+                noise_sq += (double)noise * noise;
+                hop_sq += (double)noise * noise;
+                cross += (double)noise * prev_noise[i];
+                prev_sq += (double)prev_noise[i] * prev_noise[i];
+                if (noise != 0.0f) injected = 1;
+            }
+            /* A generator whose state never advanced would hand every bin of
+             * every hop the same table entry, so each hop's injected spectrum
+             * would be the amplitude profile times one fixed complex constant
+             * -- successive hops would then be nearly collinear. Advancing per
+             * bin decorrelates them. */
+            if (hop_sq > 0.0 && prev_active && prev_sq > 0.0) {
+                corr_sum += fabs(cross / sqrt(hop_sq * prev_sq));
+                corr_n += 1;
+            }
+            prev_active = (hop_sq > 0.0);
+            if (prev_active)
+                for (i = 0; i < hop; ++i) prev_noise[i] = out_on[i] - out_off[i];
+        }
+    }
+    CHECK(finite, "cng: every CNG-on sample and every injected sample is finite");
+    CHECK(injected && noise_sq > 0.0,
+          "cng: comfort noise is actually injected (CNG-on and CNG-off cores "
+          "carry different energy)");
+    CHECK(corr_n > 20 && corr_sum / corr_n < 0.5,
+          "cng: successive hops' injected noise is decorrelated -- the "
+          "generator advances instead of re-injecting one fixed spectrum");
+
+    /* The seed is per-INSTANCE: a second, independently created pair fed the
+     * same input must inject the byte-identical stream. A process-wide
+     * generator state would fail here. */
+    {
+        ConvChain* q_on = conv_create(&cfg, &on);
+        ConvChain* q_off = conv_create(&cfg, &off);
+        int same = 1;
+        if (q_on && q_off) {
+            for (h = 0; h < hops && same; ++h) {
+                fill_inputs(mics, far, hop, 16000, h);
+                if (conv_hop(q_on, mics, far, w, NULL, out_on) != MCAB_OK ||
+                    conv_hop(q_off, mics, far, w, NULL, out_off) != MCAB_OK) {
+                    same = 0;
+                    break;
+                }
+                for (i = 0; i < hop; ++i)
+                    if (out_on[i] - out_off[i] !=
+                        noise_stream[(size_t)h * (size_t)hop + (size_t)i])
+                        same = 0;
+            }
+        }
+        CHECK(q_on && q_off && same,
+              "cng: a second, independently created core injects the identical "
+              "noise stream (the seed is per-instance)");
+        conv_destroy(q_on);
+        conv_destroy(q_off);
+    }
+
+    printf("cng: %d hops, injected RMS %.3e, hop-to-hop |corr| %.4f over %d "
+           "pairs (bound %.8f)\n",
+           hops, sqrt(noise_sq / ((double)hops * (double)hop)),
+           corr_n ? corr_sum / corr_n : -1.0, corr_n, bound);
+    free(mics); free(far); free(out_on); free(out_off);
+    free(prev_noise); free(noise_stream); free(w);
+    conv_destroy(p_on);
+    conv_destroy(p_off);
+}
+
+/* ---------------------------------------------------------------------------
+ * Pool placement invariance: everything this module owns is carved from one caller block,
+ * so where it sits and what surrounds it must not reach the audio (a consumer reading past
+ * its carve, or a decision on a pointer value). One build runs four times with the pool at
+ * four different 16-aligned bases and a different filler on both sides; byte-equal output
+ * is the main assertion, and the filler check afterwards is the write-side half.
+ * ------------------------------------------------------------------------ */
+
+#define POOL_PLACEMENT_GUARD  4096u
+#define POOL_PLACEMENT_FRAMES 64
+
+static void test_pool_placement_invariance(int sample_rate, int fft_size) {
+    /* 16-aligned (the published alignment) but deliberately not all congruent
+     * modulo 32 or 64: a kernel quietly depending on a wider alignment than
+     * the descriptor promises separates these. */
+    static const size_t bases[] = { 0u, 16u, 32u, 48u };
+    static const int fillers[] = { 0xa5, 0x5a, 0x00, 0xff };
+    const int placements = (int)(sizeof(bases) / sizeof(bases[0]));
+    McabConfig cfg;
+    size_t app_bytes = 0;   /* lanes + estimator + mcab's pool, the whole application block */
+    float* reference = NULL;
+    float* current = NULL;
+    float* microphones = NULL;
+    float* ref = NULL;
+    float* out = NULL;
+    Complex* weights = NULL;
+    size_t stream_bytes = 0;
+    int hop = 0;
+    int n_freqs = 0;
+    int placement;
+    int built = 0;
+    int streamed = 0;
+    int identical = 1;
+    int guards_intact = 1;
+
+    cfg = mcab_default_config(sample_rate);
+    cfg.fft_size = fft_size;
+    if (mcab_sample_flow_get_mem_size(&cfg, &app_bytes) != 0) {
+        CHECK(0, "pool placement memory requirement query succeeds");
+        return;
+    }
+
+    for (placement = 0; placement < placements; ++placement) {
+        size_t lead = POOL_PLACEMENT_GUARD + bases[placement];
+        size_t block_bytes = lead + app_bytes + POOL_PLACEMENT_GUARD;
+        unsigned char* block = NULL;
+        unsigned char* pool;
+        McabSampleFlow objs;
+        Mcab* p;
+        ConvChain* chain;
+        McabFront pre;
+        float* destination;
+        size_t i;
+        int frame;
+
+        if (posix_memalign(
+                (void**)&block, 16u, block_bytes) != 0)
+            break;
+        memset(block, fillers[placement], block_bytes);
+        pool = block + lead;
+
+        if (mcab_sample_flow_init(&objs, pool, app_bytes, &cfg) != 0) { free(block); break; }
+        p = objs.flow;
+        chain = conv_attach(p, &cfg, NULL);
+        if (!chain) { mcab_sample_flow_destroy(&objs); free(block); break; }
+        built += 1;
+
+        if (built == 1) {
+            hop = mcab_hop_size(p);
+            n_freqs = mcab_n_freqs(p);
+            stream_bytes = (size_t)POOL_PLACEMENT_FRAMES * (size_t)hop *
+                           sizeof(float);
+            reference = (float*)malloc(stream_bytes);
+            current = (float*)malloc(stream_bytes);
+            microphones = (float*)calloc(
+                (size_t)hop * MCAB_CHANNELS, sizeof(float));
+            ref = (float*)calloc((size_t)hop, sizeof(float));
+            out = (float*)calloc((size_t)hop, sizeof(float));
+            weights = (Complex*)calloc(
+                (size_t)MCAB_CHANNELS * n_freqs, sizeof(Complex));
+            CHECK(reference && current && microphones && ref && out && weights,
+                  "pool placement buffers allocate");
+            if (!reference || !current || !microphones || !ref || !out ||
+                !weights) {
+                conv_destroy(chain);
+                mcab_sample_flow_destroy(&objs);
+                free(block);
+                break;
+            }
+            for (i = 0; i < (size_t)MCAB_CHANNELS * n_freqs; ++i)
+                weights[i].r = 0.25f;
+        }
+
+        destination = (built == 1) ? reference : current;
+        for (frame = 0; frame < POOL_PLACEMENT_FRAMES; ++frame) {
+            fill_inputs(microphones, ref, hop, sample_rate, frame);
+            if (mcab_process_front(
+                    p, microphones, ref, &pre) != MCAB_OK ||
+                conv_post(chain, weights, NULL, out) != MCAB_OK)
+                break;
+            memcpy(destination + (size_t)frame * hop, out,
+                   (size_t)hop * sizeof(float));
+        }
+        if (frame == POOL_PLACEMENT_FRAMES) streamed += 1;
+
+        for (i = 0; i < lead; ++i)
+            if (block[i] != (unsigned char)fillers[placement])
+                guards_intact = 0;
+        for (i = lead + app_bytes; i < block_bytes; ++i)
+            if (block[i] != (unsigned char)fillers[placement])
+                guards_intact = 0;
+
+        if (built > 1 && memcmp(reference, current, stream_bytes) != 0)
+            identical = 0;
+
+        conv_destroy(chain);
+        mcab_sample_flow_destroy(&objs);
+        free(block);
+    }
+
+    CHECK(built == placements && streamed == placements,
+          "every shifted pool base constructs and streams");
+    CHECK(streamed == placements && identical,
+          "output is byte-identical across four pool bases surrounded by "
+          "four different fillers");
+    CHECK(streamed == placements && guards_intact,
+          "processing writes nothing outside the queried pool");
+
+    free(weights);
+    free(out);
+    free(ref);
+    free(microphones);
+    free(current);
+    free(reference);
+}
+
+/* After mcab_reset() and the reset of the stages it chains (conv_reset()), the
+ * core and the chain equal a freshly created pair with the same config. The subject
+ * is warmed on a different stretch of the scene than the one compared, so what it remembers
+ * is wrong for what follows. Run with CNG both ON and OFF: conv_reset() re-seeds the
+ * comfort-noise generator, so the CNG path is compared for real. */
+static void test_reset_equals_fresh_instance(int sample_rate, int fft_size,
+                                             int enable_cng) {
+    enum { WARM = 400, WARM_OFFSET = 100000, COMPARE = 200 };
+    McabConfig cfg;
+    ConvChainOptions opt = conv_default_options();
+    ConvChain* fresh;
+    ConvChain* warmed;
+    float* mics;
+    float* far;
+    float* out_a;
+    float* out_b;
+    Complex* w;
+    long differing = 0;
+    int first_bad = -1;
+    int hop, n_freqs, h, ch, k, ok = 1;
+
+    cfg = mcab_default_config(sample_rate);
+    cfg.fft_size = fft_size;
+    opt.enable_cng = enable_cng;
+    fresh = conv_create(&cfg, &opt);
+    warmed = conv_create(&cfg, &opt);
+    CHECK(fresh != NULL && warmed != NULL, "reset parity: both chains create");
+    if (!fresh || !warmed) {
+        conv_destroy(fresh);
+        conv_destroy(warmed);
+        return;
+    }
+
+    hop = fresh->hop;
+    n_freqs = fresh->n_freqs;
+    mics = (float*)calloc((size_t)hop * MCAB_CHANNELS, sizeof(float));
+    far = (float*)calloc((size_t)hop, sizeof(float));
+    out_a = (float*)calloc((size_t)hop, sizeof(float));
+    out_b = (float*)calloc((size_t)hop, sizeof(float));
+    w = (Complex*)calloc((size_t)MCAB_CHANNELS * (size_t)n_freqs,
+                         sizeof(Complex));
+    for (ch = 0; ch < MCAB_CHANNELS; ++ch)
+        for (k = 0; k < n_freqs; ++k)
+            w[(size_t)ch * (size_t)n_freqs + (size_t)k].r = 0.25f;
+
+    for (h = 0; h < WARM && ok; ++h) {
+        fill_inputs(mics, far, hop, sample_rate, WARM_OFFSET + h);
+        if (conv_hop(warmed, mics, far, w, NULL, out_b) != MCAB_OK)
+            ok = 0;
+    }
+    CHECK(ok, "reset parity: the warm phase runs to completion");
+    conv_reset(warmed);
+
+    for (h = 0; h < COMPARE && ok; ++h) {
+        fill_inputs(mics, far, hop, sample_rate, h);
+        if (conv_hop(fresh, mics, far, w, NULL, out_a) != MCAB_OK ||
+            conv_hop(warmed, mics, far, w, NULL, out_b) != MCAB_OK) {
+            ok = 0;
+            break;
+        }
+        if (memcmp(out_a, out_b, (size_t)hop * sizeof(float)) != 0) {
+            differing++;
+            if (first_bad < 0) first_bad = h;
+        }
+    }
+    CHECK(ok, "reset parity: the compare phase runs to completion");
+    if (differing != 0)
+        printf("  reset parity @ %d Hz/%d cng=%d: %ld of %d hops differ, "
+               "first at %d\n",
+               sample_rate, fft_size, enable_cng, differing, COMPARE, first_bad);
+    CHECK(differing == 0,
+          "mcab_reset leaves a core byte-identical to a fresh one");
+
+    free(mics); free(far); free(out_a); free(out_b); free(w);
+    conv_destroy(fresh);
+    conv_destroy(warmed);
+}
+
+/* The comfort noise is scaled by the denoiser gain of its bin, bounded below by
+ * CNG_NR_GAIN_FLOOR (the denoiser never sees the fill). Witness on a broadband
+ * echo-plus-noise stimulus where the denoiser settles far below the floor: the injected
+ * noise is the exact difference between a CNG-on and a CNG-off core (added after every gain,
+ * same draw sequence). With the denoiser off that difference is the unscaled reference
+ * d_ref; with it on, d_nr must equal CNG_NR_GAIN_FLOOR * d_ref sample for sample. The
+ * residual d_nr - floor * d_ref must carry almost no energy, and the energy ratio must sit
+ * at floor^2 (no scaling at all would leave it at 1). */
+static void test_comfort_noise_follows_nr_gain(void) {
+    const double floor_amp = 0.31622777, floor_sq = floor_amp * floor_amp;
+    McabConfig cfg = mcab_default_config(16000);
+    ConvChainOptions opt[4];
+    ConvChain* p[4] = { NULL, NULL, NULL, NULL };
+    float* out[4] = { NULL, NULL, NULL, NULL };
+    float *mics, *far;
+    Complex* w;
+    uint32_t rng = 0xC0FFEEu;
+    int hop, n, settle_hops, hops, h, k, ch, i, created = 1, finite = 1;
+    double e_nr = 0.0, e_ref = 0.0, e_res = 0.0;
+
+    /* [0] CNG off / NR on, [1] CNG on / NR on, [2] CNG off / NR off,
+     * [3] CNG on / NR off. */
+    for (i = 0; i < 4; ++i) {
+        opt[i] = conv_default_options();
+        opt[i].enable_cng = (i & 1);
+        opt[i].enable_nr = (i < 2);
+        p[i] = conv_create(&cfg, &opt[i]);
+        if (!p[i]) created = 0;
+    }
+    CHECK(created, "cng/nr: all four chains create");
+    if (!created) { for (i = 0; i < 4; ++i) conv_destroy(p[i]); return; }
+    hop = p[0]->hop;
+    n = p[0]->n_freqs;
+    settle_hops = anr_retime_frames(20, 16000, hop) + 40;
+    hops = settle_hops + 200;
+    mics = (float*)calloc((size_t)hop * MCAB_CHANNELS, sizeof(float));
+    far = (float*)calloc((size_t)hop, sizeof(float));
+    for (i = 0; i < 4; ++i) out[i] = (float*)calloc((size_t)hop, sizeof(float));
+    w = (Complex*)calloc(
+        (size_t)MCAB_CHANNELS * (size_t)n, sizeof(Complex));
+    for (ch = 0; ch < MCAB_CHANNELS; ++ch)
+        for (k = 0; k < n; ++k) w[(size_t)ch * (size_t)n + (size_t)k].r = 0.25f;
+
+    for (h = 0; h < hops; ++h) {
+        for (k = 0; k < hop; ++k) {
+            float r, noise;
+            rng = rng * 1664525u + 1013904223u;
+            r = 0.25f * ((float)((rng >> 8) & 0xFFFFu) / 32768.0f - 1.0f);
+            rng = rng * 1664525u + 1013904223u;
+            noise = 0.3f * ((float)((rng >> 8) & 0xFFFFu) / 32768.0f - 1.0f);
+            far[k] = r;
+            for (ch = 0; ch < MCAB_CHANNELS; ++ch)
+                mics[(size_t)k * MCAB_CHANNELS + (size_t)ch] = 0.5f * r + noise;
+        }
+        for (i = 0; i < 4; ++i) {
+            if (conv_hop(p[i], mics, far, w, NULL, out[i]) != MCAB_OK)
+                finite = 0;
+        }
+        if (h < settle_hops) continue;
+        for (k = 0; k < hop; ++k) {
+            double d_nr = out[1][k] - out[0][k];
+            double d_ref = out[3][k] - out[2][k];
+            double res = d_nr - floor_amp * d_ref;
+            if (!isfinite(d_nr) || !isfinite(d_ref)) finite = 0;
+            e_nr += d_nr * d_nr;
+            e_ref += d_ref * d_ref;
+            e_res += res * res;
+        }
+    }
+    CHECK(finite && e_ref > 0.0,
+          "cng/nr: the NR-off reference core injects comfort noise");
+    CHECK(e_nr > 0.0 && e_nr > 0.8 * floor_sq * e_ref && e_nr < 1.5 * floor_sq * e_ref,
+          "cng/nr: with the denoiser on, the injected noise carries floor^2 of "
+          "the NR-off energy -- the fill is scaled by G_nr down to the floor");
+    CHECK(e_res < 0.02 * e_ref,
+          "cng/nr: the injected noise is floor * reference sample for sample "
+          "-- the scaling is bounded by exactly CNG_NR_GAIN_FLOOR");
+    for (i = 0; i < 4; ++i) { conv_destroy(p[i]); free(out[i]); }
+    free(mics); free(far); free(w);
+}
+
+/* The frame mcab_fuse() returns is the contract every stage reads: its
+ * fields carry the projected near spectrum, residual power and comfort noise,
+ * the aligned far, the shared aligner's flags, and no lane-level gain. A
+ * front-only core (enable_post = 0) has nothing to fuse and refuses. */
+static void test_fuse_frame_contract(void) {
+    McabConfig cfg = mcab_default_config(48000);
+    McabConfig front_only;
+    Mcab *p, *q;
+    static Complex weights[4 * 513];
+    static float mics[512 * 4];
+    float far[512];
+    McabFront front;
+    McabFrame fr;
+    uint32_t rng = 7u;
+    int h, i, hop, n, ok = 1, flags_match = 1, finite = 1;
+    int usable_linear_valid = 1, usable_linear_seen = 0;
+
+    cfg.fft_size = 1024;
+    p = mcab_test_create(&cfg);
+    CHECK(p != NULL, "fuse frame: 48 kHz core creates");
+    if (!p) return;
+    hop = mcab_hop_size(p);
+    n = mcab_n_freqs(p);
+    for (i = 0; i < 4 * n; ++i) { weights[i].r = 0.25f; weights[i].i = 0.0f; }
+    for (h = 0; h < 60; ++h) {
+        synth_echo_hop(h, hop, mics, far, &rng);
+        ok = ok && mcab_process_front(p, mics, far, &front) == MCAB_OK;
+        ok = ok && mcab_fuse(p, weights, NULL, &fr) == MCAB_OK;
+        if (!ok) break;
+        if (fr.n_freqs != n || fr.hop != hop || fr.e == NULL || fr.y == NULL ||
+            fr.r2 == NULL || fr.cn == NULL || fr.g_res_ctx != NULL ||
+            fr.far_hop != front.aligned_ref)
+            ok = 0;
+        if (fr.delay_changed != front.delay.changed ||
+            fr.delay_locked != front.delay.solid)
+            flags_match = 0;
+        if (!(fr.max_dt >= 0.0f) || !(fr.max_sat >= 0.0f) ||
+            !all_finite(fr.r2, n) || !all_finite(fr.cn, n))
+            finite = 0;
+        if (fr.usable_linear != 0 && fr.usable_linear != 1)
+            usable_linear_valid = 0;
+        if (fr.usable_linear)
+            usable_linear_seen = 1;
+    }
+    CHECK(ok, "fuse frame: shape, pointers and no lane-level gain on every hop");
+    CHECK(flags_match,
+          "fuse frame: delay flags follow the shared aligner");
+    CHECK(finite, "fuse frame: R^2, comfort noise and the worst-lane scalars are valid");
+    CHECK(usable_linear_valid,
+          "fuse frame: usable_linear is a 0/1 verdict on every hop");
+    CHECK(usable_linear_seen,
+          "fuse frame: usable_linear becomes true once four equally-weighted, "
+          "equally-converging lanes clear startup (regression guard for the "
+          "af914d4 lost-update: frame->usable_linear was memset to 0 and "
+          "never written)");
+    CHECK(mcab_fuse(p, weights, NULL, &fr) == MCAB_OK,
+          "fuse frame: a second fuse on the same front frame is allowed");
+
+    front_only = cfg;
+    front_only.enable_post = 0;
+    q = mcab_test_create(&front_only);
+    CHECK(q != NULL, "fuse frame: front-only core creates");
+    if (q) {
+        synth_echo_hop(0, hop, mics, far, &rng);
+        CHECK(mcab_process_front(q, mics, far, &front) == MCAB_OK &&
+              mcab_fuse(q, weights, NULL, &fr) == MCAB_INVALID_ARGUMENT,
+              "fuse frame: a front-only core refuses to fuse");
+        mcab_test_destroy(q);
+    }
+    mcab_test_destroy(p);
+}
+
+/* Like synth_echo_hop(), but lane decorrelated_ch gets capture content with
+ * zero correlation to the far-end reference (independent noise, no echo
+ * term at all) instead of the shared echo. That lane's adaptive filter has
+ * nothing stable to lock onto, so its own filter_converged never fires,
+ * convergence_seen never latches, and usable_linear (gated on
+ * convergence_seen -- see fq_update()/fq_linear_filter_usable() in
+ * lib/aec/c_impl/src/filter_quality.c) stays false for the whole run. */
+static void synth_echo_hop_decorrelated_lane(int h, int hop, float* mics,
+                                             float* far, int decorrelated_ch,
+                                             uint32_t* rng) {
+    int i, ch;
+    for (i = 0; i < hop; ++i) {
+        float t = (float)(h * hop + i);
+        float r = 0.6f * sinf(0.06f * t);
+        float noise;
+        *rng = *rng * 1664525u + 1013904223u;
+        noise = 0.02f * ((float)((*rng >> 8) & 0xFFFFu) / 32768.0f - 1.0f);
+        far[i] = r;
+        for (ch = 0; ch < 4; ++ch) {
+            if (ch == decorrelated_ch) {
+                uint32_t draw = (*rng = *rng * 1664525u + 1013904223u);
+                mics[(size_t)i * 4u + (size_t)ch] =
+                    0.3f * ((float)((draw >> 8) & 0xFFFFu) / 32768.0f - 1.0f);
+            } else {
+                mics[(size_t)i * 4u + (size_t)ch] =
+                    0.5f * r + 0.02f * sinf(0.017f * t) + noise;
+            }
+        }
+    }
+}
+
+/* Complement to test_fuse_frame_contract(): the usable_linear AND-fold in fuse_contexts()
+ * runs over contributing lanes only (the lane_contributes gate of the all_converged fold),
+ * matching Python's `all(... for c in contributors)`. Lane 3 gets capture content
+ * uncorrelated with the far end, so its usable_linear stays false while lanes 0-2 become
+ * usable. The same front frame is fused twice per hop: with lane 3 at zero weight
+ * usable_linear must eventually read true (an AND over all four lanes would latch it
+ * false); with lane 3 given real weight it must read false (an "always 1" mutation or a
+ * dropped AND-fold fails this, and the equal-weight setup of test_fuse_frame_contract()
+ * cannot tell it from the correct fold). */
+static void test_fuse_usable_linear_and_over_contributors(void) {
+    McabConfig cfg = mcab_default_config(48000);
+    Mcab* p;
+    static Complex noncontrib_w[4 * 513];
+    static Complex contrib_w[4 * 513];
+    static float mics[512 * 4];
+    float far[512];
+    McabFront front;
+    McabFrame fr;
+    uint32_t rng = 31u;
+    int h, i, hop, n, k, ok = 1;
+    int noncontrib_usable_seen = 0;
+    int contrib_usable_wrongly_true = 0;
+
+    cfg.fft_size = 1024;
+    p = mcab_test_create(&cfg);
+    CHECK(p != NULL, "fuse usable_linear AND-fold: core creates");
+    if (!p) return;
+    hop = mcab_hop_size(p);
+    n = mcab_n_freqs(p);
+    for (k = 0; k < n; ++k) {
+        for (i = 0; i < 3; ++i) {
+            noncontrib_w[(size_t)i * n + k].r = 1.0f / 3.0f;
+            noncontrib_w[(size_t)i * n + k].i = 0.0f;
+        }
+        noncontrib_w[3 * n + k].r = 0.0f;
+        noncontrib_w[3 * n + k].i = 0.0f;
+        for (i = 0; i < 4; ++i) {
+            contrib_w[(size_t)i * n + k].r = 0.25f;
+            contrib_w[(size_t)i * n + k].i = 0.0f;
+        }
+    }
+
+    for (h = 0; h < 60; ++h) {
+        synth_echo_hop_decorrelated_lane(h, hop, mics, far, 3, &rng);
+        ok = ok && mcab_process_front(p, mics, far, &front) ==
+                       MCAB_OK;
+        if (!ok) break;
+        ok = ok && mcab_fuse(p, noncontrib_w, NULL, &fr) ==
+                       MCAB_OK;
+        if (!ok) break;
+        if (fr.usable_linear) noncontrib_usable_seen = 1;
+
+        ok = ok &&
+             mcab_fuse(p, contrib_w, NULL, &fr) == MCAB_OK;
+        if (!ok) break;
+        if (noncontrib_usable_seen && fr.usable_linear)
+            contrib_usable_wrongly_true = 1;
+    }
+    CHECK(ok, "fuse usable_linear AND-fold: front/fuse succeed on every hop");
+    CHECK(noncontrib_usable_seen,
+          "fuse usable_linear AND-fold: zero-weight non-usable lane does not "
+          "block the other three (equally-weighted, equally-converging) "
+          "lanes from driving usable_linear true");
+    CHECK(!contrib_usable_wrongly_true,
+          "fuse usable_linear AND-fold: once the same never-converging lane "
+          "is given real weight, usable_linear must read false (AND over "
+          "contributing lanes, not 'always true')");
+
+    mcab_test_destroy(p);
+}
+
+static void test_proxy_lane_inputs(int sample_rate, int fft_size,
+                                   AecDelayMode mode) {
+    McabConfig cfg = mcab_default_config(sample_rate);
+    Mcab* pipelines[4] = {NULL, NULL, NULL, NULL};
+    McabFront views[4];
+    float* microphones = NULL;
+    float* ref = NULL;
+    int hop = 0, bins = 0, ok = 1, distinct = 0;
+    cfg.fft_size = fft_size;
+    cfg.delay_mode = mode;
+    cfg.fixed_delay_samples = mode == AEC_DELAY_FIXED ? 0 : -1;
+    for (int proxy = 0; proxy < 4; ++proxy) {
+        cfg.capture_proxy_channel = proxy;
+        pipelines[proxy] = mcab_test_create(&cfg);
+        if (!pipelines[proxy]) { ok = 0; break; }
+    }
+    if (ok) {
+        hop = mcab_hop_size(pipelines[0]);
+        bins = mcab_n_freqs(pipelines[0]);
+        microphones = (float*)calloc((size_t)hop * 4, sizeof(float));
+        ref = (float*)calloc((size_t)hop, sizeof(float));
+        ok = microphones != NULL && ref != NULL;
+    }
+    /* With alignment fixed, the matcher proxy must not change any lane's
+     * capture input. Distinct channels expose a reused deinterleave buffer. */
+    for (int h = 0; h < 12 && ok; ++h) {
+        if (h == 6)
+            for (int proxy = 0; proxy < 4; ++proxy)
+                mcab_reset(pipelines[proxy]);
+        for (int i = 0; i < hop; ++i)
+            for (int ch = 0; ch < 4; ++ch)
+                microphones[4 * i + ch] = 0.05f * (float)(ch + 1) *
+                    sinf((float)(h * hop + i) * (0.03f + 0.011f * ch));
+        for (int proxy = 0; proxy < 4; ++proxy)
+            if (mcab_process_front(pipelines[proxy], microphones, ref,
+                                      &views[proxy]) != MCAB_OK)
+                ok = 0;
+        if (!ok) break;
+        distinct |= memcmp(views[0].linear_spectra[0],
+                           views[0].linear_spectra[1],
+                           (size_t)bins * sizeof(Complex)) != 0;
+        for (int proxy = 1; proxy < 4; ++proxy)
+            for (int ch = 0; ch < 4; ++ch)
+                if (memcmp(views[0].linear_spectra[ch],
+                           views[proxy].linear_spectra[ch],
+                           (size_t)bins * sizeof(Complex)) != 0 ||
+                    memcmp(views[0].formed_hop[ch],
+                           views[proxy].formed_hop[ch],
+                           (size_t)hop * sizeof(float)) != 0)
+                    ok = 0;
+    }
+    CHECK(ok && distinct,
+          "every legal proxy preserves distinct per-lane capture across reset");
+    for (int proxy = 0; proxy < 4; ++proxy)
+        if (pipelines[proxy]) mcab_test_destroy(pipelines[proxy]);
+    free(microphones);
+    free(ref);
+}
+
+static void test_counter_boundaries(void) {
+    CHECK(mcab_count_add_sat(3, 7) == 10 &&
+          mcab_count_add_sat(LONG_MAX - 1, 1) == LONG_MAX &&
+          mcab_count_add_sat(LONG_MAX - 1, 2) == LONG_MAX &&
+          mcab_count_add_sat(LONG_MAX, LONG_MAX) == LONG_MAX,
+          "diagnostic counts saturate without signed overflow");
+    CHECK(mcab_far_fft_delta_matches(0, 1, 1) &&
+          mcab_far_fft_delta_matches(7, 7, 0) &&
+          !mcab_far_fft_delta_matches(LONG_MAX - 1, LONG_MAX, 1) &&
+          !mcab_far_fft_delta_matches(LONG_MAX, LONG_MAX, 0) &&
+          !mcab_far_fft_delta_matches(LONG_MAX, LONG_MAX, 1) &&
+          !mcab_far_fft_delta_matches(10, 0, 1) &&
+          !mcab_far_fft_delta_matches(-1, LONG_MAX, 1),
+          "ambiguous counter deltas never establish borrow provenance");
+}
+
+/* ===== The flow's own contract with the objects it is handed ===== */
+
+/* mcab_lane_config() is the module's statement of the lane config; lane_config_for() above
+ * re-derives it from the rules the module documents. They must agree on every grid and mode. */
+static void test_lane_config_matches_rules(void) {
+    static const int grids[3][2] = {{16000, 256}, {16000, 512}, {48000, 1024}};
+    int g, v, ok = 1, tried = 0;
+    for (g = 0; g < 3; ++g) {
+        for (v = 0; v < 5; ++v) {
+            McabConfig cfg = mcab_default_config(grids[g][0]);
+            AecConfig mine, module;
+            cfg.fft_size = grids[g][1];
+            if (v == 1) cfg.enable_post = 0;
+            if (v == 2) { cfg.delay_mode = AEC_DELAY_FIXED; cfg.fixed_delay_samples = 320; }
+            if (v == 3) cfg.delay_mode = AEC_DELAY_EXTERNAL_ALIGNED;
+            if (v == 4) cfg.delay_est_period_s = 0.5f;
+            memset(&mine, 0, sizeof(mine));
+            memset(&module, 0, sizeof(module));
+            if (lane_config_for(&cfg, &mine) != 0 || mcab_lane_config(&cfg, &module) != 0) {
+                ok = 0;
+                continue;
+            }
+            tried += 1;
+            if (memcmp(&mine, &module, sizeof(mine)) != 0 ||
+                module.delay_mode != AEC_DELAY_EXTERNAL_ALIGNED || module.enable_res != 0 ||
+                module.return_res_context != 1 ||
+                module.spatial_linear_context !=
+                    (cfg.enable_post ? AEC_CONTEXT_NO_GAIN : AEC_CONTEXT_LINEAR_ONLY))
+                ok = 0;
+        }
+    }
+    CHECK(ok && tried == 15,
+          "lane config: mcab_lane_config() equals the documented rules on every grid and mode");
+    {
+        McabConfig bad = mcab_default_config(16000);
+        AecConfig out;
+        McabDelayEstimatorConfig dc;
+        bad.fft_size = 1024;
+        CHECK(mcab_lane_config(&bad, &out) != 0 && mcab_delay_estimator_config(&bad, &dc) != 0,
+              "lane config: an invalid flow config has no lane or estimator config");
+        bad = mcab_default_config(48000);
+        CHECK(mcab_delay_estimator_config(&bad, &dc) == 0 && dc.required &&
+                  dc.sample_rate == 48000 && dc.hop_size == 512 &&
+                  dc.num_filters == DA_NUM_FILTERS,
+              "lane config: MATCHED needs the estimator on the flow's rate, hop and bank size");
+        bad.delay_mode = AEC_DELAY_EXTERNAL_ALIGNED;
+        CHECK(mcab_delay_estimator_config(&bad, &dc) == 0 && !dc.required,
+              "lane config: EXTERNAL_ALIGNED needs no estimator");
+    }
+}
+
+/* Every delay request mcab.c's rules accept or refuse, through each public entry point. A refused
+ * row is offered to mcab_init() with the objects and pool of an accepted neighbour, so only the
+ * delay rule can be what refuses it. */
+static void test_delay_request_rules(void) {
+    enum { M = AEC_DELAY_MATCHED, F = AEC_DELAY_FIXED, E = AEC_DELAY_EXTERNAL_ALIGNED };
+    static const struct {
+        int sr, mode, filters, fixed, accept, neighbour;
+    } rows[] = {
+        /* 0 */ {16000, M, 1, -1, 1, -1},
+        /* 1 */ {16000, M, DA_NUM_FILTERS, -1, 1, -1},
+        /* 2 */ {16000, F, DA_NUM_FILTERS, 0, 1, -1},
+        /* 3 */ {16000, F, DA_NUM_FILTERS, 120 * 16000, 1, -1},
+        /* 4 */ {48000, F, DA_NUM_FILTERS, 120 * 16000 + 1, 1, -1},
+        /* 5 */ {48000, F, DA_NUM_FILTERS, 120 * 48000, 1, -1},
+        /* 6 */ {16000, E, DA_NUM_FILTERS, -1, 1, -1},
+        {16000, M, 0, -1, 0, 0},
+        {16000, M, -1, -1, 0, 0},
+        {16000, M, DA_NUM_FILTERS + 1, -1, 0, 1},
+        {16000, M, 1, 0, 0, 0},
+        {16000, M, DA_NUM_FILTERS, 0, 0, 1},
+        {16000, M, DA_NUM_FILTERS, -2, 0, 1},
+        {16000, F, DA_NUM_FILTERS, -1, 0, 2},
+        {16000, F, DA_NUM_FILTERS, -2, 0, 2},
+        {16000, F, DA_NUM_FILTERS, 120 * 16000 + 1, 0, 3},
+        {16000, F, DA_NUM_FILTERS, 0x7fffffff, 0, 3},
+        {48000, F, DA_NUM_FILTERS, 120 * 48000 + 1, 0, 5},
+        {16000, F, DA_NUM_FILTERS - 1, 0, 0, 2},
+        {16000, F, DA_NUM_FILTERS + 1, 0, 0, 2},
+        {16000, F, 1, 0, 0, 2},
+        {16000, E, DA_NUM_FILTERS, 0, 0, 6},
+        {16000, E, DA_NUM_FILTERS, -2, 0, 6},
+        {16000, E, DA_NUM_FILTERS - 1, -1, 0, 6},
+        {16000, E, DA_NUM_FILTERS + 1, -1, 0, 6},
+        {16000, E, 2, -1, 0, 6},
+        {16000, 3, DA_NUM_FILTERS, -1, 0, 6},
+        {16000, -1, DA_NUM_FILTERS, -1, 0, 6},
+    };
+    const int count = (int)(sizeof(rows) / sizeof(rows[0]));
+    int r, bad = 0, refused_untouched = 1;
+    for (r = 0; r < count; ++r) {
+        McabConfig cfg, host;
+        McabTestLibs objs;
+        McabMemReq req, host_req;
+        AecConfig lane;
+        unsigned char* pool = NULL;
+        size_t i;
+        int h = rows[r].accept ? r : rows[r].neighbour;
+        int want = rows[r].accept ? 0 : -1;
+        int got_mem, got_lane, got_contract, got_init;
+        Mcab* p;
+        cfg = mcab_default_config(rows[r].sr);
+        cfg.fft_size = rows[r].sr == 48000 ? 1024 : 256;
+        cfg.delay_mode = (AecDelayMode)rows[r].mode;
+        cfg.delay_num_filters = rows[r].filters;
+        cfg.fixed_delay_samples = rows[r].fixed;
+        host = mcab_default_config(rows[h].sr);
+        host.fft_size = cfg.fft_size;
+        host.delay_mode = (AecDelayMode)rows[h].mode;
+        host.delay_num_filters = rows[h].filters;
+        host.fixed_delay_samples = rows[h].fixed;
+
+        got_mem = mcab_get_mem_requirements(&cfg, &req) == 0 ? 0 : -1;
+        got_lane = mcab_lane_config(&cfg, &lane) == 0 ? 0 : -1;
+        memset(&lane, 0, sizeof(lane));
+        aec_config_from_preset(&lane, AEC_PRESET_BALANCED, rows[r].sr);
+        got_contract = mcab_apply_lane_contract(&cfg, &lane) == 0 ? 0 : -1;
+        if (mcab_test_libs_create(&host, &objs) == 0 &&
+            mcab_get_mem_requirements(&host, &host_req) == 0 &&
+            posix_memalign((void**)&pool, 16, (size_t)host_req.bytes) == 0) {
+            memset(pool, 0xa5, (size_t)host_req.bytes);
+            p = mcab_init(pool, (size_t)host_req.bytes, &cfg, &objs.libs);
+            got_init = p ? 0 : -1;
+            if (!rows[r].accept)
+                for (i = 0; i < (size_t)host_req.bytes; ++i)
+                    if (pool[i] != 0xa5) { refused_untouched = 0; break; }
+            if (p) mcab_destroy(p);
+        } else {
+            got_init = -2;
+        }
+        if (got_mem != want || got_lane != want || got_contract != want || got_init != want) {
+            printf("  delay row %d (sr %d mode %d filters %d fixed %d): mem %d lane %d "
+                   "contract %d init %d, want %d\n", r, rows[r].sr, rows[r].mode,
+                   rows[r].filters, rows[r].fixed, got_mem, got_lane, got_contract, got_init,
+                   want);
+            bad += 1;
+        }
+        mcab_test_libs_free(&objs);
+        free(pool);
+    }
+    CHECK(bad == 0 && count == 28,
+          "delay rules: every MATCHED/FIXED/EXTERNAL_ALIGNED row is accepted or refused alike by "
+          "mem requirements, lane config, lane contract and init");
+    CHECK(refused_untouched, "delay rules: a refused delay request leaves the pool unwritten");
+}
+
+/* What mcab_init() can check from the handles (mcab.h): each refusal leaves the pool unwritten,
+ * and the valid set is accepted, so none of the rows is an identity. */
+static void test_init_validates_objects(void) {
+    McabConfig cfg = mcab_default_config(16000);
+    McabTestLibs objs, other;
+    McabMemReq req;
+    unsigned char* pool = NULL;
+    size_t i;
+    int untouched = 1;
+    Mcab* p;
+
+    CHECK(mcab_test_libs_create(&cfg, &objs) == 0 && mcab_get_mem_requirements(&cfg, &req) == 0 &&
+              posix_memalign((void**)&pool, 16, (size_t)req.bytes) == 0,
+          "init validation: objects and pool build");
+    if (!pool) return;
+    memset(pool, 0xa5, (size_t)req.bytes);
+#define REFUSED(libs_expr, cfg_ptr, label)                                       \
+    do {                                                                          \
+        McabLibs l_ = (libs_expr);                                                \
+        CHECK(mcab_init(pool, (size_t)req.bytes, (cfg_ptr), &l_) == NULL, label); \
+    } while (0)
+    {
+        McabLibs l = objs.libs;
+        int a, b, dup_ok = 1;
+        for (a = 0; a < MCAB_CHANNELS; ++a) {
+            for (b = 0; b < MCAB_CHANNELS; ++b) {
+                if (a == b) continue;
+                l = objs.libs;
+                l.lanes[b] = l.lanes[a];
+                dup_ok &= mcab_init(pool, (size_t)req.bytes, &cfg, &l) == NULL;
+            }
+        }
+        CHECK(dup_ok, "init validation: the same lane twice is refused at every position pair");
+        CHECK(mcab_init(NULL, (size_t)req.bytes, &cfg, &objs.libs) == NULL &&
+                  mcab_init(pool, (size_t)req.bytes, NULL, &objs.libs) == NULL &&
+                  mcab_init(pool, (size_t)req.bytes, &cfg, NULL) == NULL,
+              "init validation: NULL pool, config or objects are refused");
+        l = objs.libs;
+        l.lanes[3] = NULL;
+        REFUSED(l, &cfg, "init validation: a missing lane is refused");
+        l = objs.libs;
+        l.delay = NULL;
+        REFUSED(l, &cfg, "init validation: MATCHED without the shared estimator is refused");
+    }
+    {
+        McabConfig other_cfg = cfg;
+        other_cfg.delay_num_filters = 3;
+        REFUSED(objs.libs, &other_cfg, "init validation: an estimator of another bank size is refused");
+        other_cfg = cfg;
+        other_cfg.delay_mode = AEC_DELAY_EXTERNAL_ALIGNED;
+        REFUSED(objs.libs, &other_cfg, "init validation: an estimator outside MATCHED is refused");
+        other_cfg.fft_size = 512;
+        CHECK(mcab_test_libs_create(&other_cfg, &other) == 0, "init validation: 512-grid lanes build");
+        {
+            McabLibs l = objs.libs;
+            l.lanes[1] = other.libs.lanes[1];
+            REFUSED(l, &cfg, "init validation: a lane of another grid is refused");
+        }
+        mcab_test_libs_free(&other);
+        other_cfg = cfg;
+        other_cfg.enable_post = 0;
+        CHECK(mcab_test_libs_create(&other_cfg, &other) == 0, "init validation: front-only lanes build");
+        {
+            McabLibs l = objs.libs;
+            l.lanes[0] = other.libs.lanes[0];
+            REFUSED(l, &cfg, "init validation: a front-only lane under enable_post = 1 is refused");
+        }
+        mcab_test_libs_free(&other);
+    }
+    {
+        /* The converse of the front-only row: full-context lanes under enable_post = 0. */
+        McabConfig fo = cfg;
+        fo.enable_post = 0;
+        REFUSED(objs.libs, &fo, "init validation: a full-context lane under enable_post = 0 is refused");
+    }
+    {
+        /* Lanes that break one contract field each, built from the contract-stamped config. */
+        static const char* const labels[4] = {
+            "init validation: a lane with its own RES gain (enable_res = 1) is refused",
+            "init validation: a lane that does not return its context is refused",
+            "init validation: a lane locked on an offset of its own (FIXED 64, run) is refused",
+            "init validation: a lane not yet locked at offset 0 (FIXED 0, fresh) is refused"};
+        int v;
+        for (v = 0; v < 4; ++v) {
+            AecConfig lane;
+            void* mem = NULL;
+            Aec* bad;
+            size_t bytes;
+            mcab_lane_config(&cfg, &lane);
+            if (v == 0) { lane.enable_res = 1; lane.spatial_linear_context = 0; }
+            if (v == 1) { lane.return_res_context = 0; lane.spatial_linear_context = 0; }
+            if (v >= 2) {
+                lane.delay_mode = AEC_DELAY_FIXED;
+                lane.fixed_delay_samples = v == 2 ? 64 : 0;
+            }
+            bytes = aec_get_mem_size(&lane);
+            bad = bytes && posix_memalign(&mem, 16, bytes) == 0 ? aec_init(mem, bytes, &lane) : NULL;
+            CHECK(bad != NULL, "init validation: a contract-breaking lane builds in lib/aec");
+            if (bad && v == 2) {
+                /* Locked (LOCKED, 64) once the stored far covers the offset. */
+                float mic[128], far[128];
+                int h, i;
+                for (h = 0; h < 4; ++h) {
+                    for (i = 0; i < 128; ++i) {
+                        mic[i] = 0.0f;
+                        far[i] = 0.1f * (float)((i * 7 + h) % 13 - 6);
+                    }
+                    aec_process_context(bad, mic, far);
+                }
+            }
+            if (bad) {
+                McabLibs l = objs.libs;
+                l.lanes[v % 3 + 1] = bad;
+                REFUSED(l, &cfg, labels[v]);
+                aec_destroy(bad);
+            }
+            free(mem);
+        }
+    }
+    {
+        /* An estimator of the other rate: 48 kHz-built in a 16 kHz flow. */
+        DelayAec d48;
+        void* mem = NULL;
+        size_t bytes = delay_aec_get_mem_size(48000, 128, DA_NUM_FILTERS);
+        CHECK(bytes && posix_memalign(&mem, 16, bytes) == 0 &&
+                  delay_aec_init(&d48, mem, bytes, 48000, 128, DA_NUM_FILTERS) == 0,
+              "init validation: a 48 kHz estimator builds");
+        if (mem) {
+            McabLibs l = objs.libs;
+            l.delay = &d48;
+            REFUSED(l, &cfg, "init validation: a 48 kHz estimator in a 16 kHz flow is refused");
+        }
+        free(mem);
+    }
+    {
+        /* A lane that would estimate and align the far itself (MATCHED) is not a flow lane. */
+        AecConfig lane;
+        void* mem = NULL;
+        Aec* matched;
+        size_t bytes;
+        mcab_lane_config(&cfg, &lane);
+        lane.delay_mode = AEC_DELAY_MATCHED;
+        lane.enable_delay_est = 1;
+        bytes = aec_get_mem_size(&lane);
+        matched = bytes && posix_memalign(&mem, 16, bytes) == 0 ? aec_init(mem, bytes, &lane) : NULL;
+        CHECK(matched != NULL, "init validation: a self-aligning lane builds");
+        if (matched) {
+            McabLibs l = objs.libs;
+            l.lanes[2] = matched;
+            REFUSED(l, &cfg, "init validation: a lane that is not EXTERNAL_ALIGNED is refused");
+            aec_destroy(matched);
+        }
+        free(mem);
+    }
+    {
+        /* The 48 kHz estimator's scratch is sized by the hop it was built for. */
+        McabConfig c48 = mcab_default_config(48000);
+        McabTestLibs o48;
+        DelayAec small;
+        void* mem = NULL;
+        size_t bytes = delay_aec_get_mem_size(48000, 128, DA_NUM_FILTERS);
+        McabMemReq r48;
+        unsigned char* p48 = NULL;
+        CHECK(mcab_test_libs_create(&c48, &o48) == 0 && mcab_get_mem_requirements(&c48, &r48) == 0 &&
+                  posix_memalign(&mem, 16, bytes) == 0 &&
+                  delay_aec_init(&small, mem, bytes, 48000, 128, DA_NUM_FILTERS) == 0 &&
+                  posix_memalign((void**)&p48, 16, (size_t)r48.bytes) == 0,
+              "init validation: 48 kHz objects build");
+        if (p48) {
+            McabLibs l = o48.libs;
+            DelayAec d16;
+            void* mem16 = NULL;
+            size_t b16 = delay_aec_get_mem_size(16000, 512, DA_NUM_FILTERS);
+            size_t j;
+            int p48_untouched = 1;
+            memset(p48, 0xa5, (size_t)r48.bytes);
+            l.delay = &small;
+            CHECK(mcab_init(p48, (size_t)r48.bytes, &c48, &l) == NULL,
+                  "init validation: a 48 kHz estimator built for a smaller hop is refused");
+            if (b16 && posix_memalign(&mem16, 16, b16) == 0 &&
+                delay_aec_init(&d16, mem16, b16, 16000, 512, DA_NUM_FILTERS) == 0) {
+                l.delay = &d16;
+                CHECK(mcab_init(p48, (size_t)r48.bytes, &c48, &l) == NULL,
+                      "init validation: a 16 kHz estimator in a 48 kHz flow is refused");
+            } else {
+                CHECK(0, "init validation: a 16 kHz estimator for hop 512 builds");
+            }
+            free(mem16);
+            for (j = 0; j < (size_t)r48.bytes; ++j) p48_untouched &= p48[j] == 0xa5;
+            CHECK(p48_untouched, "init validation: no 48 kHz refusal wrote the pool");
+            CHECK(mcab_init(p48, (size_t)r48.bytes, &c48, &o48.libs) != NULL,
+                  "init validation: the matching 48 kHz objects are accepted");
+        }
+        mcab_test_libs_free(&o48);
+        free(mem);
+        free(p48);
+    }
+#undef REFUSED
+    for (i = 0; i < (size_t)req.bytes; ++i) untouched &= pool[i] == 0xa5;
+    CHECK(untouched, "init validation: no refusal wrote the pool");
+    p = mcab_init(pool, (size_t)req.bytes, &cfg, &objs.libs);
+    CHECK(p != NULL && mcab_enable_post(p) == 1 && mcab_enable_post(NULL) == -1,
+          "init validation: the valid objects are accepted; enable_post reads back");
+    mcab_destroy(p);
+    CHECK(mcab_enable_post(p) == -1, "init validation: a destroyed flow reports no enable_post");
+    mcab_test_libs_free(&objs);
+    free(pool);
+}
+
+/* The flow half of the aligned-reference check: the
+ * front's aligned reference is the delayed far, whole-hop exact, on every hop. */
+static uint32_t g_scene_rng = 0x1234567u;
+static float scene_frand(void) {
+    uint32_t x = g_scene_rng;
+    x ^= x << 13;
+    x ^= x >> 17;
+    x ^= x << 5;
+    g_scene_rng = x;
+    return ((float)(x >> 8) * (1.0f / 16777216.0f)) - 0.5f;
+}
+
+static void scene_echo_hop(int frame, int hop, int true_delay, float* far_hist, float* far,
+                           float* microphones) {
+    for (int i = 0; i < hop; ++i) {
+        int64_t t = (int64_t)frame * hop + i;
+        float noise = 0.25f * scene_frand();
+        float echo;
+        far_hist[t] = noise;
+        far[i] = noise;
+        echo = t >= true_delay ? 0.6f * far_hist[t - true_delay] : 0.0f;
+        for (int ch = 0; ch < MCAB_CHANNELS; ++ch)
+            microphones[i * MCAB_CHANNELS + ch] = echo * (1.0f - 0.02f * ch);
+    }
+}
+
+static void test_front_aligned_ref(void) {
+    enum { FRAMES = 240, TRUE_DELAY = 400 };
+    McabConfig cfg = mcab_default_config(16000);
+    Mcab* p;
+    McabFront pre;
+    float *microphones, *far, *far_hist;
+    int hop, locked = 0, aligned_checked = 0, exact = 1, frame;
+
+    cfg.fft_size = 512;
+    p = mcab_test_create(&cfg);
+    CHECK(p != NULL && mcab_hop_size(p) == 256, "aligned ref: 512/256 flow creates");
+    if (!p) return;
+    hop = mcab_hop_size(p);
+    microphones = (float*)malloc((size_t)hop * MCAB_CHANNELS * sizeof(float));
+    far = (float*)malloc((size_t)hop * sizeof(float));
+    far_hist = (float*)calloc((size_t)FRAMES * hop, sizeof(float));
+    for (frame = 0; microphones && far && far_hist && frame < FRAMES; ++frame) {
+        scene_echo_hop(frame, hop, TRUE_DELAY, far_hist, far, microphones);
+        /* Zeroed first: a front that stopped assigning aligned_ref fails the NULL check
+         * instead of reading stack garbage. */
+        memset(&pre, 0, sizeof(pre));
+        if (mcab_process_front(p, microphones, far, &pre) != MCAB_OK || !pre.aligned_ref ||
+            pre.delay.delay_samples < 0) {
+            exact = 0;
+            break;
+        }
+        {
+            /* The shift is a whole-hop decision: the raw far until the samples seen cover the
+             * applied delay, the delayed far from then on. */
+            int64_t hop_start = (int64_t)frame * hop;
+            int servable = hop_start >= (int64_t)pre.delay.delay_samples;
+            for (int i = 0; i < hop; ++i) {
+                int64_t t = hop_start + i;
+                float expected = servable ? far_hist[t - pre.delay.delay_samples] : far_hist[t];
+                if (pre.aligned_ref[i] != expected) exact = 0;
+                aligned_checked += 1;
+            }
+        }
+        if (pre.delay.solid && pre.delay.delay_samples > 0) locked = 1;
+    }
+    CHECK(exact, "aligned ref: aligned_ref content matches the delayed far on every hop");
+    CHECK(locked, "aligned ref: the delayed far eventually locks with positive delay_samples");
+    CHECK(aligned_checked == FRAMES * hop, "aligned ref: every sample was checked");
+    free(far_hist);
+    free(far);
+    free(microphones);
+    mcab_test_destroy(p);
+}
+
+/* The flow's view and timing queries, and its grid refusals. */
+static void test_flow_view_and_grid(void) {
+    McabConfig cfg = mcab_default_config(16000);
+    Mcab* p = mcab_test_create(&cfg);
+    McabLastTiming t, z;
+    CHECK(p != NULL && mcab_linear_aec_count(p) == MCAB_CHANNELS && mcab_hop_size(p) == 128 &&
+              mcab_fft_size(p) == 256 && mcab_n_freqs(p) == 129 && mcab_sample_rate(p) == 16000,
+          "flow view: lane count and grid read back");
+    memset(&t, 0xff, sizeof(t));
+    memset(&z, 0, sizeof(z));
+    mcab_get_last_timing(NULL, &t);
+    CHECK(memcmp(&t, &z, sizeof(t)) == 0, "flow view: a NULL handle zeroes the timing record");
+    CHECK(mcab_hop_size(NULL) == -1 && mcab_linear_aec_count(NULL) == 0 &&
+              mcab_matched_filter_count(NULL) == 0,
+          "flow view: a NULL handle reads -1 / 0");
+    mcab_test_destroy(p);
+
+    cfg = mcab_default_config(48000);
+    cfg.fft_size = 512;
+    CHECK(mcab_test_create(&cfg) == NULL, "flow grid: 48 kHz rejects cross-rate FFT 512");
+    cfg = mcab_default_config(16000);
+    cfg.enable_post = 0;
+    p = mcab_test_create(&cfg);
+    CHECK(p != NULL && mcab_enable_post(p) == 0,
+          "flow grid: the front-only profile (no fuse) is accepted");
+    mcab_test_destroy(p);
+}
+
+/* The lane parameters are the application's: mcab_apply_lane_contract() stamps the contract
+ * fields onto an application-composed AecConfig and nothing else, and a flow over such lanes
+ * runs. */
+static void copy_contract_fields(AecConfig* dst, const AecConfig* src) {
+    dst->fft_size = src->fft_size;
+    dst->delay_mode = src->delay_mode;
+    dst->delay_num_filters = src->delay_num_filters;
+    dst->fixed_delay_samples = src->fixed_delay_samples;
+    dst->enable_delay_est = src->enable_delay_est;
+    dst->enable_res = src->enable_res;
+    dst->return_res_context = src->return_res_context;
+    dst->spatial_linear_context = src->spatial_linear_context;
+    dst->delay_est_period_s = src->delay_est_period_s;
+}
+
+static void test_app_composed_lane(void) {
+    enum { FRAMES = 80, TRUE_DELAY = 160 };
+    McabConfig cfg = mcab_default_config(16000);
+    AecConfig app, stamped, again, rest, dflt;
+    McabTestLibs mine, ref;
+    McabMemReq req;
+    void *pool_a = NULL, *pool_b = NULL;
+    Mcab *a = NULL, *b = NULL;
+    float *mic = NULL, *far = NULL, *hist = NULL;
+    int frame, ok = 1, differs = 0;
+
+    cfg.delay_est_period_s = 0.4f;
+    memset(&app, 0, sizeof(app));
+    aec_config_from_preset(&app, AEC_PRESET_AGGRESSIVE, 16000);
+    app.filter_length = 1024;
+    app.mu = 0.2f;
+    stamped = app;
+    CHECK(mcab_apply_lane_contract(&cfg, &stamped) == 0 &&
+              stamped.fft_size == 256 && stamped.delay_mode == AEC_DELAY_EXTERNAL_ALIGNED &&
+              stamped.delay_num_filters == DA_NUM_FILTERS && stamped.fixed_delay_samples == -1 &&
+              stamped.enable_delay_est == 0 && stamped.enable_res == 0 &&
+              stamped.return_res_context == 1 &&
+              stamped.spatial_linear_context == AEC_CONTEXT_NO_GAIN &&
+              stamped.delay_est_period_s == 0.4f,
+          "lane contract: the contract fields are stamped");
+    rest = stamped;
+    copy_contract_fields(&rest, &app);
+    CHECK(memcmp(&rest, &app, sizeof(app)) == 0 && stamped.filter_length == 1024 &&
+              stamped.mu == 0.2f &&
+              stamped.min_gain_floor_far_active_db == app.min_gain_floor_far_active_db,
+          "lane contract: every other field (preset, filter length, step size) is the app's");
+    again = stamped;
+    CHECK(mcab_apply_lane_contract(&cfg, &again) == 0 && memcmp(&again, &stamped, sizeof(again)) == 0,
+          "lane contract: idempotent");
+    {
+        McabConfig fo = cfg;
+        fo.enable_post = 0;
+        again = app;
+        CHECK(mcab_apply_lane_contract(&fo, &again) == 0 &&
+                  again.spatial_linear_context == AEC_CONTEXT_LINEAR_ONLY,
+              "lane contract: front only stamps the linear-only context");
+    }
+    {
+        McabConfig bad = cfg;
+        AecConfig r48, keep;
+        memset(&r48, 0, sizeof(r48));
+        aec_config_from_preset(&r48, AEC_PRESET_BALANCED, 48000);
+        keep = r48;
+        CHECK(mcab_apply_lane_contract(&cfg, &r48) != 0 && memcmp(&r48, &keep, sizeof(r48)) == 0,
+              "lane contract: a lane built for another rate is refused, unchanged");
+        bad.fft_size = 1024;
+        again = app;
+        CHECK(mcab_apply_lane_contract(&bad, &again) != 0 && memcmp(&again, &app, sizeof(app)) == 0 &&
+                  mcab_apply_lane_contract(&cfg, NULL) != 0 &&
+                  mcab_apply_lane_contract(NULL, &again) != 0,
+              "lane contract: an invalid flow config or NULL is refused, the lane unchanged");
+    }
+    CHECK(mcab_lane_config(&cfg, &dflt) == 0 && lane_config_for(&cfg, &again) == 0 &&
+              memcmp(&dflt, &again, sizeof(dflt)) == 0,
+          "lane contract: mcab_lane_config() is the balanced preset plus the contract");
+
+    /* A flow over the app's lanes runs beside one over the default lanes; the lanes really run
+     * the app's parameters (their linear output differs). */
+    CHECK(mcab_test_libs_create_with_lane(&cfg, &stamped, &mine) == 0 &&
+              mcab_test_libs_create(&cfg, &ref) == 0 && mcab_get_mem_requirements(&cfg, &req) == 0 &&
+              posix_memalign(&pool_a, 16, (size_t)req.bytes) == 0 &&
+              posix_memalign(&pool_b, 16, (size_t)req.bytes) == 0,
+          "lane contract: app-composed and default lanes build");
+    if (pool_a && pool_b) {
+        a = mcab_init(pool_a, (size_t)req.bytes, &cfg, &mine.libs);
+        b = mcab_init(pool_b, (size_t)req.bytes, &cfg, &ref.libs);
+    }
+    CHECK(a != NULL && b != NULL, "lane contract: mcab_init accepts the app-composed lanes");
+    mic = (float*)malloc(128u * MCAB_CHANNELS * sizeof(float));
+    far = (float*)malloc(128u * sizeof(float));
+    hist = (float*)calloc((size_t)FRAMES * 128u, sizeof(float));
+    for (frame = 0; a && b && mic && far && hist && frame < FRAMES; ++frame) {
+        McabFront fa, fb;
+        McabFrame sa, sb;
+        Complex w[MCAB_CHANNELS * 129];
+        int k;
+        for (k = 0; k < MCAB_CHANNELS * 129; ++k) { w[k].r = 0.25f; w[k].i = 0.0f; }
+        scene_echo_hop(frame, 128, TRUE_DELAY, hist, far, mic);
+        if (mcab_process_front(a, mic, far, &fa) != MCAB_OK ||
+            mcab_process_front(b, mic, far, &fb) != MCAB_OK ||
+            mcab_fuse(a, w, NULL, &sa) != MCAB_OK || mcab_fuse(b, w, NULL, &sb) != MCAB_OK) {
+            ok = 0;
+            break;
+        }
+        for (k = 0; k < 129; ++k)
+            if (fa.linear_spectra[0][k].r != fb.linear_spectra[0][k].r) differs = 1;
+        if (!all_finite((const float*)sa.y, 2 * 129)) ok = 0;
+    }
+    CHECK(ok && differs, "lane contract: the app-composed flow runs, and its lanes are the app's");
+    free(hist);
+    free(far);
+    free(mic);
+    mcab_destroy(a);
+    mcab_destroy(b);
+    mcab_test_libs_free(&mine);
+    mcab_test_libs_free(&ref);
+    free(pool_a);
+    free(pool_b);
+}
+
+/* ---- refusal paths of the hop: every DSP_ERROR resets the flow, and an argument refusal
+ * changes nothing ---- */
+
+static void equal_weights(Complex* w, int n, float value) {
+    int k;
+    for (k = 0; k < MCAB_CHANNELS * n; ++k) { w[k].r = value; w[k].i = 0.0f; }
+}
+
+/* Finite weights that pass the gate but overflow the projection are a DSP refusal with the
+ * flow reset (mcab.h), and default weights on a new front still fuse. */
+static void test_fuse_overflow_is_dsp_error(void) {
+    McabConfig cfg = mcab_default_config(16000);
+    Mcab* p = mcab_test_create(&cfg);
+    float mic[128 * MCAB_CHANNELS], ref[128];
+    Complex w[MCAB_CHANNELS * 129];
+    McabFront front;
+    McabFrame view;
+    int frame, warm = 1;
+    CHECK(p != NULL, "fuse overflow: flow creates");
+    if (!p) return;
+    for (frame = 0; frame < 4; ++frame) {
+        fill_inputs(mic, ref, 128, 16000, frame);
+        warm &= mcab_process_front(p, mic, ref, &front) == MCAB_OK;
+    }
+    equal_weights(w, 129, 1e20f);
+    CHECK(warm && mcab_weights_valid(w, (size_t)MCAB_CHANNELS * 129u) == 1 &&
+              mcab_fuse(p, w, NULL, &view) == MCAB_DSP_ERROR,
+          "fuse overflow: gate-valid weights of 1e20 are a DSP error, not inf/NaN with MCAB_OK");
+    equal_weights(w, 129, 0.25f);
+    CHECK(mcab_fuse(p, w, NULL, &view) == MCAB_SEQUENCE_ERROR && mcab_duty_hops_total(p) == 0,
+          "fuse overflow: the refusal reset the flow (no front, census restarted)");
+    fill_inputs(mic, ref, 128, 16000, frame);
+    CHECK(mcab_process_front(p, mic, ref, &front) == MCAB_OK &&
+              mcab_fuse(p, w, NULL, &view) == MCAB_OK && all_finite(view.r2, 129) &&
+              all_finite(view.cn, 129),
+          "fuse overflow: a new front fuses with normal weights");
+    mcab_test_destroy(p);
+}
+
+/* A non-finite hop after a good front: INVALID_ARGUMENT, the old front is no longer fusable,
+ * and neither the estimator census nor any lane memory moved. */
+static void test_nonfinite_hop_invalidates_front(void) {
+    McabConfig cfg = mcab_default_config(16000);
+    McabTestLibs objs;
+    McabMemReq req;
+    void* pool = NULL;
+    Mcab* p = NULL;
+    float mic[128 * MCAB_CHANNELS], ref[128];
+    Complex w[MCAB_CHANNELS * 129];
+    McabFront front;
+    McabFrame view;
+    unsigned char* before = NULL;
+    size_t lane_bytes = 0;
+    unsigned long long calls;
+    int frame, ok = 1, ch, same = 1;
+    AecConfig lane;
+    if (mcab_test_libs_create(&cfg, &objs) == 0 && mcab_get_mem_requirements(&cfg, &req) == 0 &&
+        posix_memalign(&pool, 16, (size_t)req.bytes) == 0)
+        p = mcab_init(pool, (size_t)req.bytes, &cfg, &objs.libs);
+    CHECK(p != NULL, "non-finite hop: flow builds");
+    if (!p) goto out;
+    mcab_lane_config(&cfg, &lane);
+    lane_bytes = aec_get_mem_size(&lane);
+    equal_weights(w, 129, 0.25f);
+    for (frame = 0; frame < 6; ++frame) {
+        fill_inputs(mic, ref, 128, 16000, frame);
+        ok &= mcab_process_front(p, mic, ref, &front) == MCAB_OK;
+    }
+    calls = mcab_duty_hops_total(p);
+    before = (unsigned char*)malloc(lane_bytes * MCAB_CHANNELS);
+    for (ch = 0; before && ch < MCAB_CHANNELS; ++ch)
+        memcpy(before + (size_t)ch * lane_bytes, objs.lane_mem[ch], lane_bytes);
+    fill_inputs(mic, ref, 128, 16000, frame);
+    mic[5] = (float)NAN;
+    CHECK(ok && before && mcab_process_front(p, mic, ref, &front) == MCAB_INVALID_ARGUMENT &&
+              mcab_fuse(p, w, NULL, &view) == MCAB_SEQUENCE_ERROR,
+          "non-finite hop: refused, and the earlier front is no longer fusable");
+    for (ch = 0; before && ch < MCAB_CHANNELS; ++ch)
+        same &= memcmp(before + (size_t)ch * lane_bytes, objs.lane_mem[ch], lane_bytes) == 0;
+    CHECK(same && mcab_duty_hops_total(p) == calls,
+          "non-finite hop: no lane and no estimator state changed");
+    fill_inputs(mic, ref, 128, 16000, frame);
+    CHECK(mcab_process_front(p, mic, ref, &front) == MCAB_OK && mcab_fuse(p, w, NULL, &view) == MCAB_OK,
+          "non-finite hop: the next finite hop runs");
+out:
+    free(before);
+    mcab_destroy(p);
+    mcab_test_libs_free(&objs);
+    free(pool);
+}
+
+/* An accepted delay the alignment ring cannot serve (max_delay_ms = 0) is a front DSP refusal:
+ * the flow is reset, no front is pending, the census restarts. */
+static void test_unservable_delay_is_dsp_error(void) {
+    enum { FRAMES = 300, TRUE_DELAY = 608 };
+    McabConfig cfg = mcab_default_config(16000);
+    Mcab* p;
+    float *mic = NULL, *far = NULL, *hist = NULL;
+    Complex w[MCAB_CHANNELS * 129];
+    McabFront front;
+    McabFrame view;
+    int frame, refused = 0, rc = MCAB_OK;
+    cfg.max_delay_ms = 0.0f;
+    p = mcab_test_create(&cfg);
+    CHECK(p != NULL, "unservable delay: a flow with no alignment headroom builds");
+    if (!p) return;
+    equal_weights(w, 129, 0.25f);
+    mic = (float*)malloc(128u * MCAB_CHANNELS * sizeof(float));
+    far = (float*)malloc(128u * sizeof(float));
+    hist = (float*)calloc((size_t)FRAMES * 128u, sizeof(float));
+    for (frame = 0; mic && far && hist && frame < FRAMES; ++frame) {
+        scene_echo_hop(frame, 128, TRUE_DELAY, hist, far, mic);
+        rc = mcab_process_front(p, mic, far, &front);
+        if (rc != MCAB_OK) { refused = 1; break; }
+    }
+    CHECK(refused && rc == MCAB_DSP_ERROR && mcab_fuse(p, w, NULL, &view) == MCAB_SEQUENCE_ERROR &&
+              mcab_duty_hops_total(p) == 0 && mcab_realign_warm_lane_count(p) == 0,
+          "unservable delay: DSP error, flow reset (no front, census and realign counters cleared)");
+    free(hist);
+    free(far);
+    free(mic);
+    mcab_test_destroy(p);
+}
+
+/* mcab_create(): mcab's own pool on the heap (the objects stay the caller's), the same flow as
+ * a caller pool, freed by mcab_destroy(). */
+static void test_create_heap_path(void) {
+    McabConfig cfg = mcab_default_config(16000);
+    McabTestLibs a, b;
+    McabMemReq req;
+    void* pool = NULL;
+    Mcab *heap = NULL, *pooled = NULL;
+    float mic[128 * MCAB_CHANNELS], ref[128];
+    int frame, k, same = 1;
+    CHECK(mcab_test_libs_create(&cfg, &a) == 0 && mcab_test_libs_create(&cfg, &b) == 0 &&
+              mcab_get_mem_requirements(&cfg, &req) == 0 &&
+              posix_memalign(&pool, 16, (size_t)req.bytes) == 0,
+          "create: objects build");
+    heap = mcab_create(&cfg, &a.libs);
+    if (pool) pooled = mcab_init(pool, (size_t)req.bytes, &cfg, &b.libs);
+    CHECK(heap != NULL && pooled != NULL && mcab_hop_size(heap) == 128,
+          "create: the heap flow builds over the caller's objects");
+    for (frame = 0; heap && pooled && frame < 20; ++frame) {
+        McabFront fh, fp;
+        fill_inputs(mic, ref, 128, 16000, frame);
+        if (mcab_process_front(heap, mic, ref, &fh) != MCAB_OK ||
+            mcab_process_front(pooled, mic, ref, &fp) != MCAB_OK) { same = 0; break; }
+        for (k = 0; k < 129; ++k)
+            if (memcmp(&fh.linear_spectra[2][k], &fp.linear_spectra[2][k], sizeof(Complex)) != 0)
+                same = 0;
+    }
+    CHECK(same, "create: the heap flow equals a caller-pool flow bit for bit");
+    mcab_destroy(heap);   /* frees mcab's block; the lanes stay usable to the caller */
+    {
+        McabLibs dup = a.libs;
+        dup.lanes[1] = dup.lanes[0];
+        CHECK(mcab_create(&cfg, &dup) == NULL && mcab_create(NULL, &a.libs) == NULL &&
+                  mcab_create(&cfg, NULL) == NULL,
+              "create: refused objects or NULL give no handle");
+    }
+    mcab_destroy(pooled);
+    mcab_test_libs_free(&a);
+    mcab_test_libs_free(&b);
+    free(pool);
+}
+
+/* mcab_init() needs fresh objects (mcab.h): after destroy, the application resets its lanes and
+ * estimator, and a new flow on them then acquires exactly like a flow on new objects. */
+static void test_reinit_after_app_reset(void) {
+    enum { FRAMES = 300, TRUE_DELAY = 608 };
+    McabConfig cfg = mcab_default_config(16000);
+    McabTestLibs used, fresh;
+    McabMemReq req;
+    void *pool = NULL, *pool2 = NULL;
+    Mcab *p = NULL, *q = NULL;
+    float *mic = NULL, *far = NULL, *hist = NULL;
+    int frame, ch, solid_before = 0, ok = 1, same = 1, k;
+    CHECK(mcab_test_libs_create(&cfg, &used) == 0 && mcab_test_libs_create(&cfg, &fresh) == 0 &&
+              mcab_get_mem_requirements(&cfg, &req) == 0 &&
+              posix_memalign(&pool, 16, (size_t)req.bytes) == 0 &&
+              posix_memalign(&pool2, 16, (size_t)req.bytes) == 0,
+          "re-init: objects build");
+    if (pool) p = mcab_init(pool, (size_t)req.bytes, &cfg, &used.libs);
+    mic = (float*)malloc(128u * MCAB_CHANNELS * sizeof(float));
+    far = (float*)malloc(128u * sizeof(float));
+    hist = (float*)calloc((size_t)FRAMES * 128u, sizeof(float));
+    for (frame = 0; p && mic && far && hist && frame < FRAMES; ++frame) {
+        McabFront f;
+        scene_echo_hop(frame, 128, TRUE_DELAY, hist, far, mic);
+        if (mcab_process_front(p, mic, far, &f) != MCAB_OK) { ok = 0; break; }
+        solid_before = f.delay.solid && f.delay.delay_samples > 0;
+    }
+    CHECK(ok && solid_before && mcab_realign_warm_lane_count(p) + mcab_realign_soft_lane_count(p) > 0,
+          "re-init: the first flow acquired the delay");
+    mcab_destroy(p);
+    for (ch = 0; ch < MCAB_CHANNELS; ++ch) aec_reset(used.libs.lanes[ch]);
+    delay_aec_reset(used.libs.delay);
+    p = mcab_init(pool, (size_t)req.bytes, &cfg, &used.libs);
+    q = pool2 ? mcab_init(pool2, (size_t)req.bytes, &cfg, &fresh.libs) : NULL;
+    CHECK(p != NULL && q != NULL, "re-init: a new flow on the reset objects builds");
+    g_scene_rng = 0x1234567u;
+    memset(hist, 0, (size_t)FRAMES * 128u * sizeof(float));
+    for (frame = 0; p && q && frame < FRAMES; ++frame) {
+        McabFront a, b;
+        scene_echo_hop(frame, 128, TRUE_DELAY, hist, far, mic);
+        if (mcab_process_front(p, mic, far, &a) != MCAB_OK ||
+            mcab_process_front(q, mic, far, &b) != MCAB_OK) { same = 0; break; }
+        if (a.delay.solid != b.delay.solid || a.delay.changed != b.delay.changed ||
+            a.delay.delay_samples != b.delay.delay_samples) same = 0;
+        for (k = 0; k < 129; ++k)
+            if (memcmp(&a.linear_spectra[1][k], &b.linear_spectra[1][k], sizeof(Complex)) != 0)
+                same = 0;
+    }
+    CHECK(same && mcab_realign_warm_lane_count(p) == mcab_realign_warm_lane_count(q) &&
+              mcab_realign_soft_lane_count(p) == mcab_realign_soft_lane_count(q),
+          "re-init: on app-reset objects the new flow acquires exactly like one on new objects");
+    free(hist);
+    free(far);
+    free(mic);
+    mcab_destroy(p);
+    mcab_destroy(q);
+    mcab_test_libs_free(&used);
+    mcab_test_libs_free(&fresh);
+    free(pool);
+    free(pool2);
+}
+
+int main(void) {
+    test_counter_boundaries();
+    test_proxy_lane_inputs(16000, 256, AEC_DELAY_FIXED);
+    test_proxy_lane_inputs(16000, 512, AEC_DELAY_FIXED);
+    test_proxy_lane_inputs(48000, 1024, AEC_DELAY_FIXED);
+    test_proxy_lane_inputs(16000, 256, AEC_DELAY_EXTERNAL_ALIGNED);
+    test_proxy_lane_inputs(16000, 512, AEC_DELAY_EXTERNAL_ALIGNED);
+    test_proxy_lane_inputs(48000, 1024, AEC_DELAY_EXTERNAL_ALIGNED);
+    test_projection_kernels();
+    test_fuse_usable_linear_and_over_contributors();
+    test_weights_gate();
+    test_trusted_spectrum_finite_gate();
+    test_trusted_spectrum_path();
+    test_invalid_configs();
+    run_grid(16000, 256);
+    run_grid(16000, 512);
+    run_grid(48000, 1024);
+    run_static_parity(16000, 256);
+    run_static_parity(16000, 512);
+    run_static_parity(48000, 1024);
+    test_pool_placement_invariance(16000, 256);
+    test_pool_placement_invariance(16000, 512);
+    test_pool_placement_invariance(48000, 1024);
+    test_pre_frame_wola_identity(16000, 256);
+    test_pre_frame_wola_identity(16000, 512);
+    test_pre_frame_wola_identity(48000, 1024);
+    test_far_fft_sharing_reduces_four_to_one(16000, 256);
+    test_far_fft_sharing_reduces_four_to_one(16000, 512);
+    test_far_fft_sharing_reduces_four_to_one(48000, 1024);
+    test_delay_modes_and_bank_sizing();
+    test_known_delay_acquisition_and_coverage();
+    test_known_delay_mislock_is_detectable();
+    test_known_delay_memory_and_cost();
+    test_shared_delay_change_admission();
+    test_delay_change_candidate_ttl();
+    test_duty_cycle_machine();
+    test_duty_watchdog_leak_is_a_rate();
+    test_duty_low_erle_delay_change();
+    test_far_spec_provenance_guard();
+    test_mixed_realign_hop_far_spectrum(16000, 256, 256, 512, 150, 360);
+    test_mixed_realign_hop_far_spectrum(16000, 512, 512, 1024, 150, 360);
+    test_mixed_realign_hop_far_spectrum(48000, 1024, 1536, 3072, 150, 480);
+    test_nr_bypass_output_identity();
+    test_res_bypass_passthrough();
+    test_stage_timing();
+    test_comfort_noise_contract();
+    test_comfort_noise_follows_nr_gain();
+    test_fuse_frame_contract();
+    test_reset_equals_fresh_instance(16000, 256, 1);
+    test_reset_equals_fresh_instance(16000, 256, 0);
+    test_reset_equals_fresh_instance(16000, 512, 1);
+    test_reset_equals_fresh_instance(48000, 1024, 1);
+    test_lane_config_matches_rules();
+    test_delay_request_rules();
+    test_init_validates_objects();
+    test_front_aligned_ref();
+    test_flow_view_and_grid();
+    test_app_composed_lane();
+    test_fuse_overflow_is_dsp_error();
+    test_nonfinite_hop_invalidates_front();
+    test_unservable_delay_is_dsp_error();
+    test_create_heap_path();
+    test_reinit_after_app_reset();
+
+    if (failures) {
+        printf("%d test(s) failed\n", failures);
+        return 1;
+    }
+    printf("All mcab tests passed\n");
+    return 0;
+}

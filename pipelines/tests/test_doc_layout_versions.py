@@ -5,10 +5,10 @@ descriptor 的 ``bytes`` 只是下界，擋得住成長、擋不住等量的語�
 ``build_flags_hash`` 是 carve token 字串的 FNV-1a，對結構單純長大是盲的。
 所以文件把版號寫錯，整合者會沿用一份 ``init_ex()`` 其實會拒絕的 descriptor。
 
-C 測試把字面值釘死在 header 上（例如 ``test_4aec_nr_res.c`` 的
-``FOUR_AEC_NR_RES_LAYOUT_VERSION == Nu`` 那一列），這裡是文件端對稱的閘。
+C 測試把字面值釘死在 header 上（例如 ``test_mcab.c`` 的
+``MCAB_LAYOUT_VERSION == Nu`` 那一列），這裡是文件端對稱的閘。
 
-只檢查**具名巨集**的宣稱（``FOUR_AEC_NR_RES_LAYOUT_VERSION = N``）。文件裡另有
+只檢查**具名巨集**的宣稱（``MCAB_LAYOUT_VERSION = N``）。文件裡另有
 「layout vN 起新增…」這類**沿革**敘述不是在陳述目前值，刻意不納入；
 AIAEC 兩個 C 類別的版號（``ULCNET_MODEL_IO_LAYOUT_VERSION``、
 ``DEEPVQE_PREPOST_LAYOUT_VERSION``）以具名巨集形式納入，AINR 各模型自有的版號則不在此表。
@@ -23,14 +23,12 @@ _REPO = pathlib.Path(__file__).resolve().parents[2]
 
 # 巨集名 -> 定義它的檔案（相對 repo 根）。#define 只有一處，所以不必去重。
 _SOURCES = {
-    'AUDIO_PIPELINE_4CH_LAYOUT_VERSION':
-        'pipelines/4ch_aec_bf_nr_res/audio_pipeline_4ch.h',
-    'FOUR_AEC_NR_RES_LAYOUT_VERSION':
-        'pipelines/4ch_aec_bf_nr_res/4aec_nr_res.h',
+    'MCAB_LAYOUT_VERSION':
+        'pipelines/4ch_aec_bf_nr_res/mcab.h',
     'DFN_RES_STAGE_LAYOUT_VERSION':
-        'pipelines/dfn_res_stage.h',
+        'pipelines/dfn/dfn_res_stage.h',
     'DFN_RATE_BRIDGE_LAYOUT_VERSION':
-        'pipelines/dfn_rate_bridge.h',
+        'pipelines/dfn/dfn_rate_bridge.h',
     'ULCNET_MODEL_IO_LAYOUT_VERSION':
         'AIAEC/Align_ULCNet/ulcnet_model_io.h',
     'DEEPVQE_PREPOST_LAYOUT_VERSION':
@@ -45,15 +43,15 @@ _DOC_SUFFIXES = ('.html', '.md')
 # historical prose, so pin only the narrowly-scoped forms that explicitly say
 # "current checkout/value" (or identify the measured build in the HTML table).
 _UNQUALIFIED_CURRENT_CLAIMS = (
-    ('docs/integration_4ch_core_zh_TW.md', 'FOUR_AEC_NR_RES_LAYOUT_VERSION',
+    ('docs/integration_4ch_core_zh_TW.md', 'MCAB_LAYOUT_VERSION',
      re.compile(r'本次 checkout（`layout_version=(\d+)`')),
-    ('docs/integration_4ch_core_zh_TW.md', 'FOUR_AEC_NR_RES_LAYOUT_VERSION',
+    ('docs/integration_4ch_core_zh_TW.md', 'MCAB_LAYOUT_VERSION',
      re.compile(r'\| 4 \| `layout_version` \| `uint32_t` \| `(\d+)` \|')),
     ('docs/integration_4ch_spatial_zh_TW.md',
-     'AUDIO_PIPELINE_4CH_LAYOUT_VERSION',
+     'MCAB_LAYOUT_VERSION',
      re.compile(r'本次 checkout，`layout_version=(\d+)`')),
-    ('docs/html/pipeline_4ch.html', 'AUDIO_PIPELINE_4CH_LAYOUT_VERSION',
-     re.compile(r'audio_pipeline_4ch_get_mem_requirements\(\)</code>'
+    ('docs/html/pipeline_4ch.html', 'MCAB_LAYOUT_VERSION',
+     re.compile(r'mcab_sample_unit_memory\(\)</code>'
                 r'\(ne10,layout_version=(\d+)\)')),
 )
 
@@ -78,8 +76,8 @@ def _doc_files():
 
 
 # 巨集名之後允許夾一個 </code> 與空白，再吃 `=` 與數字。像
-# ``<code>FOUR_AEC_NR_RES_LAYOUT_VERSION</code> = N`` 與
-# ``FOUR_AEC_NR_RES_LAYOUT_VERSION=N`` 兩種寫法都要抓到。
+# ``<code>MCAB_LAYOUT_VERSION</code> = N`` 與
+# ``MCAB_LAYOUT_VERSION=N`` 兩種寫法都要抓到。
 def _claim_pattern(macro: str) -> re.Pattern:
     return re.compile(
         r'%s(?:</code>)?\s*=\s*(\d+)' % re.escape(macro))

@@ -22,7 +22,7 @@ sys.path.insert(0, ROOT)
 sys.path.insert(0, os.path.join(ROOT, 'lib', 'aec', 'python'))
 
 from aec import AecConfig, AecMode                              # noqa: E402
-from pipelines.aec_nr_pipeline import run_aec_classic           # noqa: E402
+from pipelines.mono_aec_nr_res.pipeline import run_aec_classic           # noqa: E402
 from pipelines.tools.rebench_sep_vs_classic import (            # noqa: E402
     CORPUS, SCENARIOS, SR, FL,
 )

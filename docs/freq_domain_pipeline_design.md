@@ -38,7 +38,8 @@ survive is decided per bin by the denoiser's own speech-presence model and by
 follow the far talker. Comfort noise is driven by the AEC suppression gain so
 it fills echo-removal holes rather than every bin attenuated by NR, and its
 level is scaled by the denoiser gain of the bin, bounded below at -10 dB
-(`SE_CNG_NR_GAIN_FLOOR`): the denoiser never sees the comfort noise, so applying
+(`CNG_NR_GAIN_FLOOR` in the mono example, `MCAB_SAMPLE_CNG_NR_GAIN_FLOOR` in
+`pipelines/4ch_aec_bf_nr_res/mcab_sample_post.h`): the denoiser never sees the comfort noise, so applying
 its gain here keeps the fill near the denoised floor instead of the ambient
 level, while the bound keeps enough of it to mask the residual echo.
 
@@ -54,10 +55,12 @@ with 50% overlap:
 | 16 kHz (alternate) | 512 | 256 | 512 | 257 |
 | 48 kHz | 1024 | 512 | 1024 | 513 |
 
-The AEC, the denoiser and the synthesis configs of an application are derived from the same
-grid (`se_derive()` yields one `SeGrid`), so they share one set of dimensions by construction.
+In the mono example `derive_lane()` resolves the rate's grid once with lib/aec's
+`aec_resolve_signal_grid()`; the AEC lane, the denoiser (`anr_config_for_mode_grid()`) and the synthesis
+(`ac_stft_config_default()`) are all built from that grid's `fft_size`, so they share one set of
+dimensions by construction.
 
-The `pipelines/4ch_aec_bf_nr_res/` shell uses the same three primary product grids
+The four-channel flow `mcab` (`pipelines/4ch_aec_bf_nr_res/`) uses the same three primary product grids
 (16k/256/128, 16k/512/256, 48k/1024/512). AIAEC models remain a separate
 training/checkpoint contract even when a numeric grid happens to match.
 
@@ -65,15 +68,20 @@ training/checkpoint contract even when a numeric grid happens to match.
 
 There is no mono pipeline library. The reusable parts are separate libraries, each
 with its own size query and `init`: lib/aec's `Aec` (`aec_process_context()`),
-`common/se_stage.h` (`SeSpecFrame`, `se_frame_from_aec()`, `se_res_stage_gain()`), the denoiser
-(`anr.h`) and `AcIstft`; the mono RES gain is the `Aec`'s own (`ctx.res_gain`, exposed as
-`frame.g_res_ctx`, strength through `aec_set_preset()`). Each example `main` initialises the
-libraries it uses and writes the per-hop sequence itself; the only shared example header is
-`pipelines/samples/se_anr_stage.h` (no ABI, no layout version). The only wrapped unit is the
-4-channel linear AEC + beamformer, `pipelines/4ch_aec_bf_nr_res/audio_pipeline_4ch.h`
-(caller-owned 16-byte-aligned pool initialized from a versioned memory descriptor, or a heap
-convenience constructor; it holds no RES: `audio_pipeline_4ch_fuse()` leaves `frame.g_res_ctx` NULL, and a
-4-channel application creates its own lib/aec `AecRes` after the unit). The two mono CLI executables are
+the denoiser (`anr.h`) and `AcIstft`; the mono RES gain is the `Aec`'s own (`AecResContext.res_gain`,
+read with `aec_get_res_context()`, strength through `aec_set_preset()`). Each example `main`
+initialises the libraries it uses and writes the per-hop sequence itself; the example headers
+(`pipelines/common/example_cli.h`, `pipelines/4ch_aec_bf_nr_res/mcab_sample_post.h`) carry no ABI and
+no layout version. The only multi-channel piece is
+`mcab`, the 4-channel flow layer, `pipelines/4ch_aec_bf_nr_res/mcab.h`: it is not a library that
+builds its own parts. The application creates the four `Aec` lanes and, in MATCHED mode, the shared
+`DelayAec`, and hands the pointers to `mcab_init_ex()`; mcab keeps only flow state (delay admission,
+alignment ring, fuse buffers) in a caller-owned 16-byte-aligned pool initialized from a versioned
+memory descriptor (or the heap convenience `mcab_create()` for that pool alone). It holds no
+beamformer and no RES: `mcab_fuse()` takes the caller's weights and leaves `frame.g_res_ctx` NULL,
+and a 4-channel application creates its own lib/aec `AecRes`. The SRP-PHAT/BF glue of the examples
+is the sample helper `mcab_sample_beam.{h,c}`, which is outside the module. The mono CLI executables
+(`aec_nr_pipeline`, `aec_nr_pipeline_static`, one `main.c` built twice) are
 example programs that compose the libraries.
 
 Low-level details, backend/release rules, memory sizing, presets, and tests are
@@ -82,16 +90,18 @@ maintained in [`../pipelines/README.md`](../pipelines/README.md).
 ## Stage chain
 
 Each application writes its frequency-domain chain explicitly over a borrowed
-view of the analysis frame (`pipelines/common/se_stage.h`, `SeSpecFrame`):
+view of the analysis frame (mono: lib/aec's `AecResContext`; 4ch: `McabFrame` of `mcab.h`):
 
 ```text
-frame = analysis stage           (mono: aec_process_context -> se_frame_from_aec,
-                                  4ch: audio_pipeline_4ch_process_* -> audio_pipeline_4ch_fuse
-                                       (or four_aec_front_process -> beamformer -> four_aec_fuse))
-res_gain = frame.g_res_ctx                      mono: the AEC's own gain (inside the AEC call);
-                                                4ch (unit or core): g_res_ctx is NULL, the application's
-                                                own AecRes gives se_res_stage_gain(res, frame)
-nr_gain  = se_anr_stage_gain(nr, frame, scratch, use_r2)    gain stages return const float*
+frame = analysis stage           (mono: aec_process_context -> aec_get_res_context,
+                                  4ch: mcab_process_front -> beamformer -> mcab_fuse
+                                       (examples: mcab_sample_beam_process* -> mcab_sample_beam_fuse))
+res_gain = ctx.res_gain                         mono: the AEC's own gain (inside the AEC call);
+                                                4ch (mcab): McabFrame.g_res_ctx is NULL, the application's
+                                                own AecRes gives aec_res_process(res, &in) with
+                                                in filled by mcab_sample_res_input(frame, &in)
+nr_gain  = mono_nr_gain(...)                    gain stages return const float*
+           / mcab_sample_anr_gain(nr, frame, scratch, use_r2)
 total    = sk_min_f32(nr_gain, res_gain)        a disabled source reads as the unity vector
 spec     = sk_capply_gain_f32(frame.e, total)
 spec    += aec_cng_fill(...)                    comfort noise on the cut bins

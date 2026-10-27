@@ -8,13 +8,17 @@
  *     }
  *     dfn3_prepost_post_process(p, out_hop, &written);
  *
- * pre_process returns 0 on the first hop (no right-hand neighbour for the
- * [t-1, t, t+1] graph window; do not run the accelerator) and 1 afterwards.
- * Latency is 2 hops (1024 samples, 21.33 ms at 48 kHz): 1 of framing plus 1 of
- * model lookahead; post_process reports written = 0 on the first hop only. Flush
- * the tail with zero hops while running the accelerator; an exact finite-clip
- * flush must zero-pad the model features (as training does), not recompute
- * normalised features from a zero spectrum.
+ * pre_process returns 0 on the first DFN3_MASK_LOOKAHEAD hops (the graph window
+ * [t-(2-MASK), ..., t+MASK] of the first head is not complete; do not run the
+ * accelerator) and 1 afterwards. Latency is 1 + DFN3_OUTPUT_DELAY hops: 1 of
+ * framing plus the model lookahead max(DFN3_MASK_LOOKAHEAD, DFN3_DF_LOOKAHEAD),
+ * 2 hops (1024 samples, 21.33 ms at 48 kHz) for the shipped 1/1. post_process
+ * reports written = 0 on the first DFN3_OUTPUT_DELAY hops only (with
+ * DF_LOOKAHEAD > MASK_LOOKAHEAD the accelerator runs on some hops that still
+ * emit nothing). Flush the tail with DFN3_OUTPUT_DELAY zero hops while running
+ * the accelerator on every hop after the first MASK; an exact finite-clip flush
+ * must zero-pad the model features (as training does), not recompute normalised
+ * features from a zero spectrum.
  *
  * DFN3_IO_FREQ spectra are torch.stft(normalized=True): the rfft of the
  * sqrt-Hann-windowed block times 1/sqrt(DFN3_N_FFT). AIAEC spectra are
@@ -182,7 +186,7 @@ int dfn3_prepost_hop_size(const DFN3Prepost *p);   /* or -1 */
 int dfn3_prepost_num_bins(const DFN3Prepost *p);   /* or -1 */
 int dfn3_prepost_io_mode(const DFN3Prepost *p);    /* or -1 */
 /* Frames of end-to-end lookahead the model costs on top of the framing:
- * max(DFN3_MASK_LOOKAHEAD, DFN3_DF_LOOKAHEAD). -1 on NULL. */
+ * DFN3_OUTPUT_DELAY = max(DFN3_MASK_LOOKAHEAD, DFN3_DF_LOOKAHEAD). -1 on NULL. */
 int dfn3_prepost_model_lookahead_frames(const DFN3Prepost *p);
 /* The graph contract this build binds. -1 on NULL. */
 int dfn3_prepost_layout_version(const DFN3Prepost *p);
@@ -204,13 +208,13 @@ int dfn3_prepost_set_atten_lim(DFN3Prepost *p, float atten_lim_db);
 /* DFN3_IO_TIME. One hop of noisy input (DFN3 is single-stream): runs the
  * analysis and feature front end, slides the graph window and advances the
  * compose clock. Returns the number of accelerator invocations this hop needs (0
- * on the first hop, 1 after), or -1 on NULL args, in DFN3_IO_FREQ, or with a
- * frame open. */
+ * on the first DFN3_MASK_LOOKAHEAD hops, 1 after), or -1 on NULL args, in
+ * DFN3_IO_FREQ, or with a frame open. */
 int dfn3_prepost_pre_process(DFN3Prepost *p, const float in_hop[DFN3_HOP_LEN]);
 
 /* DFN3_IO_FREQ. One analysed frame at normalized=True scale: rfft of a
  * sqrt-Hann-windowed DFN3_N_FFT block on the DFN3_HOP_LEN grid. No transform is
- * done. Returns 0 on the first frame, 1 after, or -1. */
+ * done. Returns 0 on the first DFN3_MASK_LOOKAHEAD frames, 1 after, or -1. */
 int dfn3_prepost_pre_process_freq(DFN3Prepost *p,
                                   const float spec_re[DFN3_N_BINS],
                                   const float spec_im[DFN3_N_BINS]);
@@ -218,8 +222,9 @@ int dfn3_prepost_pre_process_freq(DFN3Prepost *p,
 /* DFN3_IO_FREQ, dual input. `est` feeds the estimation branch (features, graph
  * window, heads); `app` feeds the application branch (the noisy ring that the
  * mask, deep filter and attenuation limit act on). Same frame clock and scale;
- * est == app equals dfn3_prepost_pre_process_freq(). Returns 0 on the first frame,
- * 1 after, or -1 on NULL args, in DFN3_IO_TIME, or with a frame open. */
+ * est == app equals dfn3_prepost_pre_process_freq(). Returns 0 on the first
+ * DFN3_MASK_LOOKAHEAD frames, 1 after, or -1 on NULL args, in DFN3_IO_TIME, or
+ * with a frame open. */
 int dfn3_prepost_pre_process_freq_dual(DFN3Prepost *p,
                                        const float est_re[DFN3_N_BINS],
                                        const float est_im[DFN3_N_BINS],
@@ -247,14 +252,15 @@ int dfn3_prepost_frame_commit(DFN3Prepost *p);
 int dfn3_prepost_frame_skip(DFN3Prepost *p);
 
 /* DFN3_IO_TIME. Emit this hop's output: DFN3_HOP_LEN samples, zero-filled during
- * the one warm-up hop; `*written` (may be NULL) reports 0 or DFN3_HOP_LEN.
+ * the DFN3_OUTPUT_DELAY warm-up hops; `*written` (may be NULL) reports 0 or
+ * DFN3_HOP_LEN.
  * Returns 0, or -1. */
 int dfn3_prepost_post_process(DFN3Prepost *p, float out_hop[DFN3_HOP_LEN],
                               int *written);
 
 /* DFN3_IO_FREQ. The enhanced spectrum of the frame just emitted, at the input's
- * normalized=True scale. Zeros during the one warm-up frame, where `*valid` (may
- * be NULL) reports 0. Returns 0, or -1. */
+ * normalized=True scale. Zeros during the DFN3_OUTPUT_DELAY warm-up frames,
+ * where `*valid` (may be NULL) reports 0. Returns 0, or -1. */
 int dfn3_prepost_post_process_freq(DFN3Prepost *p, float re[DFN3_N_BINS],
                                    float im[DFN3_N_BINS], int *valid);
 

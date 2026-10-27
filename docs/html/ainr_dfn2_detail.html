@@ -49,11 +49,11 @@ th{background:#eef1f5}
 <h1>AINR DeepFilterNet2 細節 — 記憶體與所有權、加速器 callback 邊界、建置</h1>
 
 <h2>概要</h2>
-<p>本頁收 <a href="ainr_dfn2.html">ainr_dfn2</a> 的 <code>dfn2_prepost</code> 類別中會把單頁撐過 30 KB 的細節:pool 大小與所有權、<code>DFN2Model</code> callback 邊界與 descriptor、<code>libainr_prepost.a</code> 的建置,以及 skip identity 所依賴的 partition-of-unity 檢查。API 用法、其餘 transaction 規則、頻譜尺度警告、block diagram、泳道圖、I/O 表、State 表、延遲與檔案清單仍留在原頁。</p>
+<p>本頁收 <a href="ainr_dfn2.html">ainr_dfn2</a> 的 <code>dfn2_prepost</code> 類別中會把單頁撐過 30 KB 的細節:pool 大小與所有權、<code>DFN2Model</code> callback 邊界與 descriptor、<code>libainr_prepost.a</code> 的建置、lookahead pair 的規則,以及 skip identity 所依賴的 partition-of-unity 檢查。API 用法、其餘 transaction 規則、頻譜尺度警告、block diagram、泳道圖、I/O 表、State 表、延遲與檔案清單仍留在原頁。</p>
 
 <h3>記憶體與所有權</h3>
 <div class="tbl"><table>
-<tr><th>io_mode</th><th>pool(<code>get_mem_size</code>)</th><th>說明</th></tr>
+<tr><th>io_mode</th><th>pool(<code>get_mem_size</code>,出貨 pair)</th><th>說明</th></tr>
 <tr><td><code>DFN2_IO_TIME</code></td><td>246,320 bytes</td><td>hop 進、hop 出;framing/window/OLA 由本類別做(pool 內一個 <code>AcStft</code> 與一個 <code>AcIstft</code>),transform 呼叫<b>呼叫端的</b> FftHandle</td></tr>
 <tr><td><code>DFN2_IO_FREQ</code></td><td>219,536 bytes</td><td>頻譜進、頻譜出,不做 transform,不 carve 任何 framing 物件;<code>fft</code> 可為 NULL</td></tr>
 </table></div>
@@ -94,11 +94,11 @@ NULL 時由分析物件在 pool 內自帶 sqrt-Hann 表、合成物件借用同�
 } DFN2Model;
 
 int dfn2_model_run_frame(const DFN2Model *model, DFN2Prepost *p);</pre>
-<p><code>dfn2_model_run_frame()</code> 把一個已開啟的 frame 走完:<code>frame_inputs()</code>(head 預填 NaN)→ <code>infer()</code> →
+<p><code>dfn2_model_run_frame()</code>(<code>io_descriptor</code> 為 NULL 或不通過 <code>dfn2_model_io_descriptor_validate()</code> 時回 -1,且不呼叫 <code>infer()</code>)把一個已開啟的 frame 走完:<code>frame_inputs()</code>(head 預填 NaN)→ <code>infer()</code> →
 <code>frame_commit()</code>;<code>infer()</code> 回非 0 或 commit 被拒時改走 <code>frame_skip()</code>,
 所以 framing 與 compose 兩個時鐘<b>永遠恰好前進一次</b>。有限性規則不在這裡重寫一份——那是
 <code>frame_commit()</code> 的責任。回 1 = heads 已 commit、0 = 該幀被 skip、-1 = 契約錯誤(model/instance 為 NULL、
-沒有 <code>infer</code>、或沒有開啟中的 frame)。<b>與 AIAEC 的 identity 政策不同</b>:被 skip 的幀仍然吐出兩拍前的 source frame
+沒有 <code>infer</code>、或沒有開啟中的 frame)。<b>與 AIAEC 的 identity 政策不同</b>:被 skip 的幀仍然吐出 M+D 拍前的 source frame
 ——identity 是<b>在 cascade 內部</b>套用的,時序從不改變。</p>
 <p><b>有 <code>infer</code> 就必須發布 descriptor。</b><code>DFN2ModelIoDescriptor</code>是
 <b>18 個欄位</b>的圖合約:<code>layout_version</code>、<code>sample_rate</code>、<code>fft_size</code>、<code>hop_size</code>、
@@ -109,11 +109,29 @@ int dfn2_model_run_frame(const DFN2Model *model, DFN2Prepost *p);</pre>
 <b>逐欄位</b>比對(不是 memcmp,padding 不得參與決定),不合即 -1。欄位全是編譯期常數(沒有 Align-ULCNet
 <code>delay_depth</code> 那種部署自由度),所以 <code>validate(default())==0</code> 恆真,它唯一的工作是<b>擋掉對著另一個
 layout 版本或另一組幾何匯出的圖</b>——那正是 NaN 預填看不見的一類錯誤(抓得到「沒寫」,抓不到「形狀不對」)。</p>
-<p class="note">實際消費者:<code>pipelines/dfn_res_stage.c</code>。它在 <code>get_mem_requirements()</code> 就把
+<p class="note">實際消費者:<code>pipelines/dfn/dfn_res_stage.c</code>。它在 <code>get_mem_requirements()</code> 就把
 「有 <code>infer</code> 卻沒 descriptor」「descriptor 被 <code>validate()</code> 拒絕」「有 <code>reset</code>／descriptor 卻沒
 <code>infer</code>」三種組合一併拒掉,再由 <a href="pipeline_dfn_mono.html">mono</a> 與
 <a href="pipeline_dfn_4ch.html">4ch</a> 兩支 DFN2 pipeline 使用;它們走的是雙輸入入口(估計用 pre-RES 頻譜、
 套用在 post-RES 頻譜)。</p>
+
+<h3>Lookahead pair(M／D)</h3>
+<p>DFN2 與 DFN3 各有兩個互相獨立的 lookahead:<code>mask_lookahead</code> M(0..2)與 <code>df_lookahead</code> D(0..<code>df_order</code>−1 = 4),共 15 個合法 pair,M 與 D 之間沒有大小限制(<code>config.ini [model]</code>)。pair 是模型合約:checkpoint 屬於一個 pair,另一個 pair 的 checkpoint 不會被載入。出貨的是 1/1,也是唯一有訓練好的 checkpoint 的 pair;其他 pair 的音質<b>未量測</b>。規則的完整敘述與匯出面在 <code>AINR/README.md</code>「Lookahead pairs」。</p>
+<table>
+<tr><th>項目</th><th>DFN2(cascade)</th><th>DFN3(平行)</th></tr>
+<tr><td>匯出的 ONNX graph</td><td colspan="2">與 pair 無關;匯出 metadata 帶 <code>mask_lookahead</code>、<code>df_lookahead</code> 與視窗對齊(<code>input_window_alignment</code>)</td></tr>
+<tr><td>host 視窗與就緒</td><td colspan="2">heads[t] 的視窗是 <code>[t-(2-M)..t+M]</code>(串流起點之前補零);已推入 M+1 幀(<code>*_MODEL_READY_FRAMES</code>)才有第一組 heads</td></tr>
+<tr><td>DF 視窗</td><td colspan="2"><code>[t-(4-D)..t+D]</code></td></tr>
+<tr><td>輸出延遲(framing 之外)</td><td>M+D hops(相加)</td><td><code>max(M, D)</code> hops</td></tr>
+<tr><td>ring 深度</td><td><code>DFN2_DF_RING</code> = <code>max(DF_ORDER, M+D+1)</code>;出貨 5,2/4 為 7</td><td><code>DFN3_DF_RING</code> = <code>DF_ORDER + max(M,D) − D</code></td></tr>
+<tr><td>C 建置</td><td><code>-DDFN2_MASK_LOOKAHEAD=&lt;M&gt; -DDFN2_DF_LOOKAHEAD=&lt;D&gt;</code></td><td><code>-DDFN3_MASK_LOOKAHEAD=&lt;M&gt; -DDFN3_DF_LOOKAHEAD=&lt;D&gt;</code></td></tr>
+<tr><td>pair 符號</td><td colspan="2"><code>dfn2_lookahead_mask&lt;M&gt;_df&lt;D&gt;</code>／<code>dfn3_lookahead_mask&lt;M&gt;_df&lt;D&gt;</code>:由 <code>*_process.c</code> 定義,依賴 pair 的單元引用它,所以不同 pair 的目標檔連結失敗</td></tr>
+</table>
+<ul>
+<li>預設 1／1,旗標值須是單純十進位數,且要加在<b>每一個</b>編譯單元;範圍外的 pair 是前處理器 <code>#error</code>(gnu99 與 C++ 下也一樣)。另一個 pair 的 graph descriptor 或 pool 在執行期被 descriptor 驗證與 pool hash 擋下。</li>
+<li><code>make -C AINR lib</code>、<code>test</code>、<code>test-simd</code> 建的是出貨 pair。其他 pair:<code>make -C AINR test-pairs</code>(pytest,逐 pair 重建 C 端並檢查連結與編譯期守衛)。Python 側(匯出、重播、校準、離線推論)對 15 個 pair 都跑;C 端只建置、執行其中一部分 pair(清單見 <code>AINR/README.md</code>),不宣稱 15 組都跑過。</li>
+<li>pipelines 的 stage 與 rate bridge 在這個 pair 之上的延遲與 make 變數見 <a href="pipeline_dfn_detail.html">pipeline_dfn_detail</a>。板端:pair 不是 1/1 時,<code>dfn2_process.c</code>、<code>dfn2_model_io.c</code>、<code>dfn2_prepost.c</code> 與每個 include 它們標頭的單元都要帶同一組 <code>-D</code>。</li>
+</ul>
 
 <h3>建置</h3>
 <pre>make -C AINR lib                 # 產出 libainr_prepost.a
@@ -135,14 +153,14 @@ make -C AINR -s print-lib-path   # 印出本組態的 archive 絕對路徑</pre>
 <b>兩條匯出路徑都會擋</b>:一般路徑查 <code>inverse_unity_max_error</code>(1e-6),<code>--runtime-bins</code>
 在寫檔前呼叫 <code>require_partition_of_unity()</code>——照 <code>df_common_expand_mask</code> 的順序逐 band
 以 float32 累加後<b>逐位元</b>比對 <code>1.0f</code>(<code>export_erb_matrix.py</code>)。C 側 host
-(<code>pipelines/dfn_res_stage.c</code>)在 <code>get_mem_requirements()</code> 再驗一次,所以載到一份
+(<code>pipelines/dfn/dfn_res_stage.c</code>)在 <code>get_mem_requirements()</code> 再驗一次,所以載到一份
 不是 partition of unity 的 <code>erb_inv.bin</code> 會被 init 擋下,而不是讓 identity 悄悄變成近似。</li>
 </ul>
 
 <h2>相關檔案與測試路徑</h2>
 <ul>
 <li>C 前後處理類別:<code>AINR/DeepFilterNet2/dfn2_prepost.c</code> / <code>.h</code>、<code>AINR/DeepFilterNet2/dfn2_model_io.c</code> / <code>.h</code>;完整清單見 <a href="ainr_dfn2.html">ainr_dfn2</a>。</li>
-<li>host 消費者:<code>pipelines/dfn_res_stage.c</code>、<code>pipelines/Makefile</code></li>
+<li>host 消費者:<code>pipelines/dfn/dfn_res_stage.c</code>、<code>pipelines/Makefile</code></li>
 <li>C 測試:<code>AINR/tests/test_c_prepost.c</code>(<code>test_dfn_erb_spans_exact</code>)</li>
 </ul>
 </body>

@@ -1,7 +1,9 @@
 """Validate stateless streaming ONNX graphs.
 
 Two checks live here: no temporal padding inside the graph, and the
-in-place state boundary (``validate_inplace_state_graph``).
+in-place state boundary (``validate_inplace_state_graph``). The input-window
+alignment that a ``mask_lookahead`` implies (``lookahead_window_offsets``) is
+defined here once for the families that share the lookahead contract.
 
 Learned 2-D feature maps in these graphs use NCTF layout.  The caller either
 supplies the complete temporal kernel window or carries older frames as an
@@ -14,6 +16,48 @@ machines; the AIAEC exporters import it through ``AIAEC/_onnx_contract.py``.
 """
 
 from __future__ import annotations
+
+import numbers
+
+# Stated once, shared by the exporters and the trainers' checkpoint contract
+# check, so every refusal of a lookahead pair gives the same instruction.
+LOOKAHEAD_CONTRACT_NOTE = (
+    'mask_lookahead and df_lookahead are part of the model contract (they fix '
+    'the feature-window alignment and the end-to-end latency): another value '
+    'needs a fresh training run and a C host built with the same pair, not an '
+    'edit of config.ini.'
+)
+
+
+def lookahead_window_offsets(mask_lookahead, input_frames):
+    """Frame offsets, relative to ``t``, of the window behind ``heads[t]``.
+
+    A graph that takes ``input_frames`` consecutive feature frames and emits
+    one frame is fed ``[t-(input_frames-1-L), ..., t+L]`` for
+    ``L = mask_lookahead``: ``(-2, -1, 0)``, ``(-1, 0, 1)`` and ``(0, 1, 2)``
+    for ``L`` = 0, 1, 2 at three frames. Raises ``ValueError`` for an ``L``
+    the window cannot express; a lookahead is a model contract, never a
+    free choice.
+    """
+    if (isinstance(mask_lookahead, bool)
+            or not isinstance(mask_lookahead, numbers.Integral)
+            or not 0 <= mask_lookahead < input_frames):
+        raise ValueError(
+            'mask_lookahead=%r is not an integer in 0..%d, the range a '
+            '%d-frame input window covers. %s'
+            % (mask_lookahead, input_frames - 1, input_frames,
+               LOOKAHEAD_CONTRACT_NOTE)
+        )
+    last = int(mask_lookahead)
+    return tuple(range(last + 1 - input_frames, last + 1))
+
+
+def lookahead_window_alignment(mask_lookahead, input_frames):
+    """``'[t-1,t,t+1] -> heads[t]'``-style string of the offsets above."""
+    names = ['t' if offset == 0 else 't%+d' % offset
+             for offset in lookahead_window_offsets(mask_lookahead,
+                                                    input_frames)]
+    return '[%s] -> heads[t]' % ','.join(names)
 
 
 def _attribute(node, name):

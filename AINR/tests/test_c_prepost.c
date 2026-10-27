@@ -171,11 +171,14 @@ static int test_dfn_stream_alignment(void)
 
     memset(spec2_re, 0, sizeof(spec2_re));
     memset(spec2_im, 0, sizeof(spec2_im));
-    CHECK(dfn2_compose_stream(
-              &dfn2, spec2_re, spec2_im, 1, mask2,
-              &coef2[0][0][0], 0.5f, 0.0f,
-              out2_re, out2_im, NULL) == -1,
-          "DFN2 rejects a head before model lookahead is satisfied");
+    /* With mask lookahead 0 the first frame already has heads, so there is
+     * nothing to reject. */
+    if (DFN2_MASK_LOOKAHEAD > 0)
+        CHECK(dfn2_compose_stream(
+                  &dfn2, spec2_re, spec2_im, 1, mask2,
+                  &coef2[0][0][0], 0.5f, 0.0f,
+                  out2_re, out2_im, NULL) == -1,
+              "DFN2 rejects a head before model lookahead is satisfied");
 
     for (int wall = 0; wall < 14; ++wall) {
         int head = wall - DFN2_MASK_LOOKAHEAD;
@@ -258,16 +261,40 @@ static int test_dfn2_model_io(void)
             for (int bin = 0; bin < DFN2_DF_BINS; ++bin)
                 spec[channel][bin] =
                     (float)(1000 * frame + 100 * channel + bin);
-        CHECK(dfn2_model_io_push_features(&state, erb, (const float (*)[DFN2_DF_BINS])spec) == (frame != 0),
-              "DFN2 model window warms up for one lookahead frame");
+        CHECK(dfn2_model_io_push_features(&state, erb, (const float (*)[DFN2_DF_BINS])spec) ==
+                  (frame >= DFN2_MASK_LOOKAHEAD),
+              "DFN2 model window warms up for the mask lookahead frames");
     }
     CHECK(state.erb_window[0][7] == 7.0f &&
           state.erb_window[1][7] == 107.0f &&
           state.erb_window[2][7] == 207.0f,
-          "DFN2 ERB model window keeps [t-1,t,t+1]");
+          "DFN2 ERB model window keeps the last three pushed frames");
     CHECK(state.spec_window[1][0][9] == 109.0f &&
           state.spec_window[1][2][9] == 2109.0f,
           "DFN2 complex model window preserves channel-major layout");
+
+    /* The first complete window is [t-(2-L) .. t+L] for t = 0, L the mask
+     * lookahead: frames before the stream start read as zero, whatever L is. */
+    dfn2_model_io_init(&state);
+    for (int frame = 0; frame <= DFN2_MASK_LOOKAHEAD; ++frame) {
+        for (int band = 0; band < DFN2_N_ERB; ++band)
+            erb[band] = (float)(10 + frame);
+        for (int channel = 0; channel < 2; ++channel)
+            for (int bin = 0; bin < DFN2_DF_BINS; ++bin)
+                spec[channel][bin] = (float)(20 + frame);
+        CHECK(dfn2_model_io_push_features(&state, erb, (const float (*)[DFN2_DF_BINS])spec) ==
+                  (frame == DFN2_MASK_LOOKAHEAD),
+              "DFN2 heads[0] is ready exactly when frame L has been pushed");
+    }
+    for (int slot = 0; slot < DFN2_MODEL_INPUT_FRAMES; ++slot) {
+        int source = slot - (DFN2_MODEL_INPUT_FRAMES - 1 - DFN2_MASK_LOOKAHEAD);
+        float want_erb = source >= 0 ? (float)(10 + source) : 0.0f;
+        float want_spec = source >= 0 ? (float)(20 + source) : 0.0f;
+        CHECK(state.erb_window[slot][3] == want_erb &&
+              state.spec_window[0][slot][5] == want_spec &&
+              state.spec_window[1][slot][5] == want_spec,
+              "DFN2 first window is [t-(2-L)..t+L] with zeros before the start");
+    }
 
     CHECK(dfn2_model_io_state_generation(&state) == 1u &&
           dfn2_model_io_state_generation(NULL) == 0u,
@@ -378,13 +405,15 @@ static int test_dfn2(uint64_t* digest)
     static DFN2State state;
     float input[DFN2_HOP_LEN];
     float spec_re[DFN2_N_BINS], spec_im[DFN2_N_BINS];
-    float previous_re[DFN2_N_BINS] = {0}, previous_im[DFN2_N_BINS] = {0};
+    enum { FRAMES = 24 };
+    static float history_re[FRAMES][DFN2_N_BINS], history_im[FRAMES][DFN2_N_BINS];
     float enhanced_re[DFN2_N_BINS], enhanced_im[DFN2_N_BINS];
     float output[DFN2_HOP_LEN];
     float erb[DFN2_N_ERB], feature_spec[2 * DFN2_DF_BINS];
     float mask[DFN2_N_ERB];
     float coefs[DFN2_DF_BINS][DFN2_DF_ORDER][2] = {{{0}}};
     float max_spectral_error = 0.0f;
+    int valid_frames = 0;
 
     dfn_test_build_erb();
     {
@@ -398,18 +427,30 @@ static int test_dfn2(uint64_t* digest)
     for (int k = 0; k < DFN2_DF_BINS; ++k)
         coefs[k][DFN2_DF_HISTORY][0] = 1.0f;
 
-    for (int frame = 0; frame < 24; ++frame) {
+    for (int frame = 0; frame < FRAMES; ++frame) {
+        int valid;
         for (int i = 0; i < DFN2_HOP_LEN; ++i)
             input[i] = signal_sample((int64_t)frame * DFN2_HOP_LEN + i,
                                      DFN2_SR);
         dfn2_analysis(&state, input, spec_re, spec_im);
+        memcpy(history_re[frame], spec_re, sizeof(spec_re));
+        memcpy(history_im[frame], spec_im, sizeof(spec_im));
         dfn2_compute_features(&state, spec_re, spec_im, erb, feature_spec);
         CHECK(all_finite(erb, DFN2_N_ERB), "DFN2 finite ERB features");
         CHECK(all_finite(feature_spec, 2 * DFN2_DF_BINS),
               "DFN2 finite complex features");
-        if (dfn2_compose(&state, spec_re, spec_im, mask,
-                         &coefs[0][0][0], 1.0f,
-                         enhanced_re, enhanced_im)) {
+        valid = dfn2_compose(&state, spec_re, spec_im, mask,
+                             &coefs[0][0][0], 1.0f,
+                             enhanced_re, enhanced_im);
+        /* The aligned entry emits from call DFN2_DF_LOOKAHEAD on: its target
+         * is that many frames behind the newest spectrum. */
+        CHECK(valid == (frame >= DFN2_DF_LOOKAHEAD),
+              "DFN2 aligned compose is valid from call DF_LOOKAHEAD on");
+        valid_frames += valid;
+        if (valid) {
+            /* The target is the spectrum DFN2_DF_LOOKAHEAD frames back. */
+            const float* previous_re = history_re[frame - DFN2_DF_LOOKAHEAD];
+            const float* previous_im = history_im[frame - DFN2_DF_LOOKAHEAD];
             for (int k = 0; k < DFN2_N_BINS; ++k) {
                 float er = fabsf(enhanced_re[k] - previous_re[k]);
                 float ei = fabsf(enhanced_im[k] - previous_im[k]);
@@ -424,9 +465,9 @@ static int test_dfn2(uint64_t* digest)
             *digest = hash_bytes(*digest, feature_spec, sizeof(feature_spec));
             *digest = hash_bytes(*digest, output, sizeof(output));
         }
-        memcpy(previous_re, spec_re, sizeof(spec_re));
-        memcpy(previous_im, spec_im, sizeof(spec_im));
     }
+    CHECK(valid_frames == FRAMES - DFN2_DF_LOOKAHEAD,
+          "DFN2 aligned compose drops exactly DF_LOOKAHEAD warm-up frames");
     CHECK(max_spectral_error < 2e-6f,
           "DFN2 lookahead ring returns the target spectrum");
     return 1;

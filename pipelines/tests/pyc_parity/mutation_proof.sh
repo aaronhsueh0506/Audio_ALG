@@ -13,18 +13,21 @@
 # largest K of each mutation, to show whether the existing gates notice it.
 #
 # Mutations (name: file / change / rows that must notice it at the largest K):
-#   fold_coef_ulp          pipelines/samples/se_anr_stage.h  r2 fold coefficient SE_PSD_SCALE_INV * (1 + K * 2^-23)
+#   fold_coef_ulp          4ch mcab_sample_post.h            r2 fold coefficient MCAB_SAMPLE_PSD_SCALE_INV * (1 + K * 2^-23)
 #   xi_min_db_div10_5      lib/nr/c_impl/src/spp_estimator.c xi_min_db / 10.0f -> / 10.5f
 #   aec_floor_balanced_ulp lib/aec/c_impl/src/aec.c          balanced far-active floor -28.0f - K * 2^-19 dB
-#   cng_seed_1bit          pipelines/common/se_stage.h       SE_CNG_RNG_SEED 0x9e3779b9u -> 0x9e3779b8u
-#   usable_gate_dropped    pipelines/samples/se_anr_stage.h  "&& frame->usable_linear" removed from the r2 fold condition
+#   usable_gate_dropped    4ch mcab_sample_post.h            "&& f->usable_linear" removed from the r2 fold condition
+# The mono chain is written out in each mono program and in pyc_drv.c (compiled from this checkout, not
+# the copy), so a deviation in a mono program is not visible to the d.mono rows; test_mono_chain (the
+# programs against the hand-written oracle, bit for bit) and the comfort-noise constant pins in
+# common/tests/test_cng_aec3.py / common/tests/test_cng_floor_constant.py are its gates (--make-test runs the former).
 #
 # Flip tests (name flip_*): a known past defect is planted back into the copy; the row(s) guarding it must turn FAIL:
-#   flip_s25_c_flag_forced  4aec_nr_res.c        four_aec_fuse forces frame->usable_linear = 1   (a.nr4.*.verdict_flag)
+#   flip_s25_c_flag_forced  mcab.c               mcab_fuse forces frame->usable_linear = 1       (a.nr4.*.verdict_flag)
 #   flip_s26_python_dt_floor 4ch pipeline.py     PostBeamResidualSuppressor.set_preset stops retargeting the DT floor (b.res4.*.aggressive)
 #   flip_s27_python_borrow  4ch pipeline.py      _fuse_contexts raises on lane far-spectrum disagreement (c.realign4.48k1024)
 
-MP_DEFAULT="fold_coef_ulp:1,16,256,4096,65536 xi_min_db_div10_5 aec_floor_balanced_ulp:1,64,4096,65536 cng_seed_1bit usable_gate_dropped flip_s25_c_flag_forced flip_s26_python_dt_floor flip_s27_python_borrow"
+MP_DEFAULT="fold_coef_ulp:1,16,256,4096,65536 xi_min_db_div10_5 aec_floor_balanced_ulp:1,64,4096,65536 usable_gate_dropped flip_s25_c_flag_forced flip_s26_python_dt_floor flip_s27_python_borrow"
 
 # mp_def NAME K  -> M_FILE M_PERL M_ONLY M_MUST (rows that must be FAIL when detected)
 mp_def() {
@@ -32,12 +35,12 @@ mp_def() {
   M_ONLY=""; M_MUST=""
   case "$1" in
     fold_coef_ulp)
-      M_FILE="Audio_ALG/pipelines/samples/se_anr_stage.h"
+      M_FILE="Audio_ALG/pipelines/4ch_aec_bf_nr_res/mcab_sample_post.h"
       # The constant is replaced on its own #define line: a redefinition placed above it would be
       # overwritten by the header itself and the mutation would silently do nothing.
-      M_PERL='s|#define SE_PSD_SCALE_INV \(1\.0f / SE_PSD_SCALE\)|#define SE_PSD_SCALE_INV (0x1p-30f * (1.0f + '"$k"'.0f * 0x1p-23f))|'
-      M_ONLY="a.nr4.16k256.glue_cflag,a.nr4.16k256.glue_fold,d.mono.16k256.nr_glue"
-      M_MUST="a.nr4.16k256.glue_fold d.mono.16k256.nr_glue" ;;
+      M_PERL='s|#define MCAB_SAMPLE_PSD_SCALE_INV \(1\.0f / \(32768\.0f \* 32768\.0f\)\)|#define MCAB_SAMPLE_PSD_SCALE_INV (0x1p-30f * (1.0f + '"$k"'.0f * 0x1p-23f))|'
+      M_ONLY="a.nr4.16k256.glue_cflag,a.nr4.16k256.glue_fold"
+      M_MUST="a.nr4.16k256.glue_fold" ;;
     xi_min_db_div10_5)
       M_FILE="Audio_ALG/lib/nr/c_impl/src/spp_estimator.c"
       M_PERL='s|config->xi_min_db / 10\.0f|config->xi_min_db / 10.5f|'
@@ -48,18 +51,13 @@ mp_def() {
       M_PERL='s|\[AEC_PRESET_BALANCED\]   = \{ -28\.0f, -20\.0f, 1 \}|[AEC_PRESET_BALANCED]   = { (-28.0f - '"$k"'.0f * 0x1p-19f), -20.0f, 1 }|'
       M_ONLY="b.res4.16k256.balanced,b.res4.16k256.mild"
       M_MUST="b.res4.16k256.balanced" ;;
-    cng_seed_1bit)
-      M_FILE="Audio_ALG/pipelines/common/se_stage.h"
-      M_PERL='s|SE_CNG_RNG_SEED 0x9e3779b9u|SE_CNG_RNG_SEED 0x9e3779b8u|'
-      M_ONLY="d.mono.16k256.cng_glue,d.mono.16k256.min_apply_ola"
-      M_MUST="d.mono.16k256.cng_glue" ;;
     usable_gate_dropped)
-      M_FILE="Audio_ALG/pipelines/samples/se_anr_stage.h"
-      M_PERL='s| \&\& frame->usable_linear\)|)|'
-      M_ONLY="a.nr4.16k256.glue_cflag,a.nr4.16k256.glue_fold,d.mono.16k256.nr_glue"
-      M_MUST="a.nr4.16k256.glue_cflag d.mono.16k256.nr_glue" ;;
+      M_FILE="Audio_ALG/pipelines/4ch_aec_bf_nr_res/mcab_sample_post.h"
+      M_PERL='s| \&\& f->usable_linear\)|)|'
+      M_ONLY="a.nr4.16k256.glue_cflag,a.nr4.16k256.glue_fold"
+      M_MUST="a.nr4.16k256.glue_cflag" ;;
     flip_s25_c_flag_forced)
-      M_FILE="Audio_ALG/pipelines/4ch_aec_bf_nr_res/4aec_nr_res.c"
+      M_FILE="Audio_ALG/pipelines/4ch_aec_bf_nr_res/mcab.c"
       M_PERL='s|(    frame->delay_locked = p->last_delay\.solid;\n)|$1    frame->usable_linear = 1;\n|'
       M_ONLY="a.nr4.16k256.verdict_flag,a.nr4.16k256.glue_cflag"
       M_MUST="a.nr4.16k256.verdict_flag" ;;

@@ -37,13 +37,13 @@ AEC_PY = ROOT / 'lib' / 'aec' / 'python'
 if str(AEC_PY) not in sys.path:
     sys.path.insert(0, str(AEC_PY))
 
-from pipelines.aec_dfn2_res_pipeline import make_stage, run_dfn2_res  # noqa: E402
-from pipelines.dfn2_stage import load_dfn2  # noqa: E402
+from pipelines.dfn.mono_aec_dfn_res.pipeline import make_stage, run_dfn2_res  # noqa: E402
+from pipelines.dfn.dfn2_stage import load_dfn2  # noqa: E402
 from lib.aec.python.aec import AecConfig  # noqa: E402
 
 
 def _load_dfn_post_module():
-    path = ROOT / 'pipelines' / '4ch_aec_bf_dfn_res' / 'pipeline.py'
+    path = ROOT / 'pipelines' / 'dfn' / '4ch_aec_bf_dfn_res' / 'pipeline.py'
     spec = importlib.util.spec_from_file_location('dfn_eval_four_post', path)
     module = importlib.util.module_from_spec(spec)
     sys.modules[spec.name] = module
@@ -124,8 +124,8 @@ def evaluate(case_dir: Path, checkpoint: Path, seconds: float,
     mics = mics[:limit]
     far_native = _place(far_source, timeline_lag, limit)
 
-    config = four.FourChannelAecConfig(sample_rate=native_rate)
-    front = four.FourChannelAecPipeline(config)
+    config = four.McabConfig(sample_rate=native_rate)
+    front = four.McabPipeline(config)
     hop = front.hop_size
     suppressor = four.PostBeamResidualSuppressor(native_rate, hop, front.n_freqs)
     count = min(len(mics), len(far_native))
@@ -138,7 +138,7 @@ def evaluate(case_dir: Path, checkpoint: Path, seconds: float,
     candidates = {name: [] for name in VARIANTS}
     linear = np.zeros(count, np.float32)
     for start in range(0, count, hop):
-        pre = front.front_process(mics[start:start + hop],
+        pre = front.process_front(mics[start:start + hop],
                                            far_native[start:start + hop])
         bf = beamformer.process(pre.linear_hops, pre.contexts)
         frame = front.fuse(pre, bf)
@@ -211,7 +211,7 @@ def evaluate(case_dir: Path, checkpoint: Path, seconds: float,
         'seconds': limit / native_rate,
         'native_rate': native_rate,
         'model_rate': 48000,
-        'rate_bridge': 'pipelines/dfn_rate_bridge.c twin',
+        'rate_bridge': 'pipelines/dfn/dfn_rate_bridge.c twin',
         'model_mode': 'identity-smoke' if identity_model else 'checkpoint',
         'compose_modes': list(compose_modes),
         'identity_max_abs_vs_res_only': identity_max_abs,

@@ -9,6 +9,18 @@ the centre feature frame together with every updated state tensor.
 STFT, feature normalisation, the three-frame feature window, deep-filter
 composition and WOLA remain in the host C code.
 
+Window alignment
+----------------
+
+The graph itself does not depend on ``mask_lookahead``; the host window does.
+``LookaheadConv2d`` pads ``2 - L`` frames before and ``L`` after, so the window
+that yields ``heads[t]`` is ``[t-(2-L) .. t+L]`` (``[t-1,t,t+1]`` at the
+shipped ``L = 1``, ``[t-2,t-1,t]`` at 0, ``[t,t+1,t+2]`` at 2). Every pair the
+trainer accepts exports; ``feature_windows`` is the one place that builds the
+window, and the metadata publishes ``mask_lookahead``, ``df_lookahead`` and the
+alignment so a host built for another pair is detectable. ``df_lookahead`` only
+shifts the host's deep-filter taps.
+
 State boundary
 --------------
 
@@ -64,6 +76,8 @@ if _AINR_ROOT not in sys.path:
     sys.path.insert(0, _AINR_ROOT)
 
 from onnx_streaming_contract import (
+    lookahead_window_alignment,
+    lookahead_window_offsets,
     validate_inplace_state_from_metadata,
     validate_nctf_no_temporal_padding,
 )
@@ -238,8 +252,23 @@ def file_sha256(path):
     return digest.hexdigest()
 
 
+def window_frames(mask_lookahead):
+    """Frame offsets, relative to ``t``, of the window behind ``heads[t]``.
+
+    The one place the alignment is derived: ``t-(2-L) .. t+L``, which is the
+    temporal padding ``LookaheadConv2d`` was built with
+    (``INPUT_FRAMES - 1 - L`` frames before, ``L`` after).
+    """
+    return lookahead_window_offsets(mask_lookahead, INPUT_FRAMES)
+
+
+def window_alignment(mask_lookahead):
+    """``'[t-1,t,t+1] -> heads[t]'`` for the shipped ``mask_lookahead=1``."""
+    return lookahead_window_alignment(mask_lookahead, INPUT_FRAMES)
+
+
 def _lookahead_centre(module, window):
-    """Run a LookaheadConv2d on [t-1,t,t+1] and emit only frame t."""
+    """Run a LookaheadConv2d on its complete temporal window, emitting frame t."""
     if window.shape[2] != INPUT_FRAMES:
         raise ValueError('DFN2 expects exactly three input feature frames')
     layers = list(module.children())
@@ -289,19 +318,21 @@ def _df_pathway_step(module, current, window):
     return output, combined
 
 
-def feature_windows(feature):
-    """Yield every ``[t-1,t,t+1]`` window of a ``(B,C,T,F)`` feature stream.
+def feature_windows(feature, mask_lookahead):
+    """Return every window of a ``(B,C,T,F)`` feature stream, ``[t-(2-L)..t+L]``.
 
-    The stream is zero-padded on both ends, so window ``t`` is exactly what
-    the host pushes into ``dfn2_model_io_push_features`` for frame ``t`` and
-    the graph turns into ``heads[t]``.  Every replay site -- calibration
-    capture and the contract tests -- must slide the window the same way, or
-    a test can agree with itself while disagreeing with the exporter.
+    The stream is zero-padded ``2 - L`` frames before and ``L`` after
+    (``L = mask_lookahead``), so window ``t`` is exactly what the host holds in
+    ``dfn2_model_io_push_features`` once frame ``t+L`` has been pushed and the
+    graph turns into ``heads[t]``.  Every replay site -- calibration capture
+    and the contract tests -- must slide the window the same way, so
+    ``mask_lookahead`` has no default and is checked when this is called, not
+    when the first window is taken.
     """
-    zero = torch.zeros_like(feature[:, :, :1])
-    padded = torch.cat((zero, feature, zero), dim=2)
-    for index in range(feature.shape[2]):
-        yield padded[:, :, index:index + INPUT_FRAMES]
+    offsets = window_frames(mask_lookahead)
+    padded = F.pad(feature, (0, 0, -offsets[0], offsets[-1]))
+    return (padded[:, :, index:index + INPUT_FRAMES]
+            for index in range(feature.shape[2]))
 
 
 class StatelessDFN2Heads(nn.Module):
@@ -321,12 +352,21 @@ class StatelessDFN2Heads(nn.Module):
         if batch_size <= 0:
             raise ValueError('batch_size must be positive')
         self.batch_size = batch_size
-        if model.mask_lookahead != 1:
-            raise ValueError(
-                'this three-frame export requires mask_lookahead=1'
-            )
-        if model.encoder.erb_conv0[1].kernel_size[0] != INPUT_FRAMES:
-            raise ValueError('this exporter requires a temporal kernel of 3')
+        # The host window for heads[t] is [t-(2-L), ..., t+L]; the model's own
+        # input convolutions must have been built for that same L.
+        offsets = window_frames(model.mask_lookahead)
+        for name in ('erb_conv0', 'df_conv0'):
+            module = getattr(model.encoder, name)
+            pad, conv = module[0], module[1]
+            if conv.kernel_size[0] != INPUT_FRAMES:
+                raise ValueError('this exporter requires input temporal kernels of 3')
+            if not isinstance(pad, nn.ConstantPad2d):
+                raise ValueError('unsupported DFN2 lookahead padding module')
+            if tuple(pad.padding[2:]) != (-offsets[0], offsets[-1]):
+                raise ValueError(
+                    '%s pads time by %r, not the window of mask_lookahead=%d' %
+                    (name, pad.padding[2:], model.mask_lookahead)
+                )
         if model.erb_dec.emb_gru.gru.num_layers != 2:
             raise ValueError('this exporter requires two ERB decoder GRU layers')
         if model.df_dec.df_gru.gru.num_layers != 2:
@@ -345,6 +385,14 @@ class StatelessDFN2Heads(nn.Module):
     @property
     def state_layout_version(self):
         return STATE_LAYOUT_VERSION
+
+    @property
+    def mask_lookahead(self):
+        return self.model.mask_lookahead
+
+    @property
+    def df_lookahead(self):
+        return self.model.df_lookahead
 
     def initial_inputs(self):
         """This instance's dummy inputs."""
@@ -527,7 +575,8 @@ def gru_state_slice_report(combined, stats, slices):
     }
 
 
-def build_metadata(checkpoint_path, params, inputs, outputs):
+def build_metadata(checkpoint_path, params, inputs, outputs, mask_lookahead,
+                   df_lookahead):
     """The exported graph's metadata.
 
     Separate from ``main`` so the contract test can compare
@@ -546,7 +595,9 @@ def build_metadata(checkpoint_path, params, inputs, outputs):
         'output_frames_per_invocation': 1,
         'fixed_batch_size': int(inputs[0].shape[0]),
         'batch_semantics': 'independent_streaming_lanes',
-        'input_window_alignment': '[t-1,t,t+1] -> heads[t]',
+        'mask_lookahead': int(mask_lookahead),
+        'df_lookahead': int(df_lookahead),
+        'input_window_alignment': window_alignment(mask_lookahead),
         'temporal_padding_inside_graph': False,
         'frequency_padding_inside_graph': True,
         'accelerator_persistent_state': False,
@@ -590,7 +641,8 @@ def export_graph(wrapper, params, checkpoint_path, output_path,
     graph = onnx.shape_inference.infer_shapes(onnx.load(output_path))
     onnx.checker.check_model(graph)
     validate_nctf_no_temporal_padding(graph, require_static=verify)
-    metadata = build_metadata(checkpoint_path, params, inputs, outputs)
+    metadata = build_metadata(checkpoint_path, params, inputs, outputs,
+                              wrapper.mask_lookahead, wrapper.df_lookahead)
     set_onnx_metadata(graph, metadata)
     _pin_static_output_shapes(graph, output_names, outputs)
     graph = _resolve_internal_shapes(graph)

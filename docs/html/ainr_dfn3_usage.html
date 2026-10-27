@@ -54,9 +54,9 @@ th{background:#eef1f5}
 <tr><th>項目</th><th>DFN2</th><th>DFN3</th><th>出處</th></tr>
 <tr><td>accelerator heads</td><td>erb_mask、coefs、alpha</td><td>erb_mask、coefs</td><td><code>dfn*_prepost.h</code></td></tr>
 <tr><td>組合方式</td><td>cascade（先全頻 mask，再 DF，alpha 混合）</td><td>平行 band split（bins &lt; 96 走 DF，≥ 96 乘 mask）</td><td><code>dfn3_process.h</code></td></tr>
-<tr><td>模型 lookahead</td><td>2 hops</td><td>1 hop（<code>dfn3_prepost_model_lookahead_frames()</code> = max(mask, DF)）</td><td><code>dfn3_prepost.h</code></td></tr>
-<tr><td>identity 路徑輸出落後</td><td>3 hops = 1536 samples</td><td>2 hops = 1024 samples = 21.33 ms</td><td><code>dfn3_prepost.h</code></td></tr>
-<tr><td><code>post_process</code> 的 <code>written = 0</code> 拍數</td><td>2</td><td>1（只有 hop 0）</td><td><code>dfn3_prepost.h</code></td></tr>
+<tr><td>模型 lookahead</td><td>2 hops</td><td>max(M, D) hops（出貨 1；<code>dfn3_prepost_model_lookahead_frames()</code> = max(mask, DF)）</td><td><code>dfn3_prepost.h</code></td></tr>
+<tr><td>identity 路徑輸出落後</td><td>3 hops = 1536 samples</td><td>1 + max(M, D) hops（出貨 2 hops = 1024 samples = 21.33 ms）</td><td><code>dfn3_prepost.h</code></td></tr>
+<tr><td><code>post_process</code> 的 <code>written = 0</code> 拍數</td><td>2</td><td>max(M, D)（出貨 1：只有 hop 0）</td><td><code>dfn3_prepost.h</code></td></tr>
 <tr><td><code>*_MODEL_IO_LAYOUT_VERSION</code></td><td>8</td><td>9（4–8 已退役）</td><td><code>dfn*_model_io.h</code></td></tr>
 <tr><td>pool（<code>get_mem_size</code>，本機量測）</td><td>TIME 246,320／FREQ 219,536</td><td>TIME 246,256／FREQ 219,472</td><td>—</td></tr>
 <tr><td><code>sizeof(State)</code>／<code>sizeof(ModelIOState)</code>（本機量測）</td><td>67,368／130,704</td><td>67,344／130,704</td><td>—</td></tr>
@@ -67,7 +67,7 @@ th{background:#eef1f5}
 <ol>
 <li>借用物件：<code>FftHandle</code>（1024 點，TIME 必填）；<code>erb_fwd.bin</code>／<code>erb_inv.bin</code>（<code>export_erb_matrix.py --runtime-bins</code> 產生，呼叫端載入，兩種模式都必填）。</li>
 <li><code>dfn3_prepost_config_defaults</code> → 填欄位 → <code>dfn3_prepost_get_mem_size</code>（alignment 16）→ <code>dfn3_prepost_init_ex(pool, req.bytes, &amp;cfg, &amp;req)</code>；host 工具可用 <code>_create</code>／<code>_destroy</code>。</li>
-<li>每個 frame：<code>pre_process[_freq]</code>（第 0 拍回 0，不可呼叫加速器；其後回 1）→ <code>frame_inputs</code> → 加速器 → <code>frame_commit</code>，失敗或被拒就 <code>frame_skip</code> → <code>post_process[_freq]</code>。</li>
+<li>每個 frame：<code>pre_process[_freq]</code>（前 M 拍回 0，不可呼叫加速器；其後回 1。出貨 M=1：第 0 拍）→ <code>frame_inputs</code> → 加速器 → <code>frame_commit</code>，失敗或被拒就 <code>frame_skip</code> → <code>post_process[_freq]</code>。</li>
 <li>每次 <code>dfn3_prepost_state_generation()</code> 改變（reset 或被拒的 commit），把加速器自己的定點 state 重填成量化後的 0。</li>
 <li>結尾：持續餵零 hop 並照跑加速器可把尾端排出；若要<b>精確</b>處理有限長 clip 的尾端，模型 feature 需補訓練時的零 padding，而不是用零頻譜重算正規化後特徵（<code>dfn3_prepost.h</code> 檔頭）。持續餵零音訊只是在延續 live stream。</li>
 </ol>
@@ -111,7 +111,7 @@ int run_dfn3_freq(const float *erb_fwd, const float *erb_inv,
             if (npu_run(&amp;xin, &amp;xout) != 0 || dfn3_prepost_frame_commit(p) != 0)
                 dfn3_prepost_frame_skip(p);
         }
-        int valid = 0;                                 /* 第 0 框 valid = 0, 輸出補零 */
+        int valid = 0;                                 /* 前 max(M, D) 框 valid = 0, 輸出補零（出貨：第 0 框） */
         if (dfn3_prepost_post_process_freq(p, out_re[t], out_im[t], &amp;valid) != 0) rc = -1;
     }
     dfn3_prepost_destroy(p);
@@ -150,9 +150,9 @@ caller                         DFN3Prepost (C)                     NPU runtime
 <div class="tbl"><table>
 <tr><th>項目</th><th>值</th></tr>
 <tr><td>hop</td><td>512 samples = 10.67 ms @48 kHz</td></tr>
-<tr><td>模型 lookahead（mask／DF 平行）</td><td>1 hop</td></tr>
-<tr><td>identity 輸出落後輸入（TIME，含 WOLA）</td><td>2 hops = 1024 samples = 21.33 ms（不含推論時間與外部排隊）</td></tr>
-<tr><td>host feature window</td><td>ERB 96 floats、complex 576 floats（<code>[t-1,t,t+1]</code>），由 C 滑動，加速器唯讀</td></tr>
+<tr><td>模型 lookahead（mask／DF 平行）</td><td>max(M, D) hops（出貨 1）</td></tr>
+<tr><td>identity 輸出落後輸入（TIME，含 WOLA）</td><td>1 + max(M, D) hops（出貨 2 hops = 1024 samples = 21.33 ms，不含推論時間與外部排隊）</td></tr>
+<tr><td>host feature window</td><td>ERB 96 floats、complex 576 floats（<code>[t-(2-M)..t+M]</code>，出貨 <code>[t-1,t,t+1]</code>），由 C 滑動，加速器唯讀</td></tr>
 </table></div>
 
 <h2>函式清單：公開 vs 內部</h2>
@@ -178,7 +178,7 @@ caller                         DFN3Prepost (C)                     NPU runtime
 <div class="tbl"><table>
 <tr><th>名稱</th><th>值</th><th>位置</th><th>不開放的原因</th></tr>
 <tr><td><code>DFN3_SR</code>／<code>_N_FFT</code>／<code>_N_BINS</code>／<code>_WIN_LEN</code>／<code>_HOP_LEN</code>、<code>_N_ERB</code>／<code>_DF_BINS</code>／<code>_DF_ORDER</code></td><td>48000／1024／513／1024／512、32／96／5</td><td><code>dfn3_process.h</code></td><td>與 checkpoint 和 head 輸出形狀綁定</td></tr>
-<tr><td><code>DFN3_MASK_LOOKAHEAD</code>／<code>DFN3_DF_LOOKAHEAD</code>、<code>DFN3_DF_RING</code></td><td>1／1、5</td><td><code>dfn3_process.h</code></td><td>平行 split 的延遲 = max(兩者)；ring 深度 = order + mask lookahead − DF lookahead</td></tr>
+<tr><td><code>DFN3_MASK_LOOKAHEAD</code>／<code>DFN3_DF_LOOKAHEAD</code>、<code>DFN3_DF_RING</code></td><td>M 0..2、D 0..4，預設 1／1；ring 出貨 5</td><td><code>dfn3_process.h</code></td><td>pair 是 checkpoint 的一部分，建置時以 <code>-DDFN3_MASK_LOOKAHEAD</code>／<code>-DDFN3_DF_LOOKAHEAD</code> 取得；平行 split 的延遲 = max(兩者)；ring 深度 = order + max(M, D) − D</td></tr>
 <tr><td>正規化常數（ERB／spec EMA alpha、init、scale、floor、eps、<code>DFN3_ANALYSIS_SCALE</code>）</td><td>與 DFN2 同值（0.989、−60／−90 dB、40、1e-10、0.001／0.0001、1e-12、0.03125）</td><td><code>dfn3_process.h</code></td><td>feature version 的一部分，須與 <code>train.py</code> 相同</td></tr>
 <tr><td><code>DFN3_FEATURE_VERSION</code></td><td><code>dfn2_libdf_wnorm_upstream_init_no_eps_v5</code></td><td><code>dfn3_process.h</code></td><td>與 DFN2 共用特徵契約，名稱沿用 dfn2 是刻意的（DFN3 README）</td></tr>
 <tr><td><code>DFN3_MODEL_IO_LAYOUT_VERSION</code></td><td>9</td><td><code>dfn3_model_io.h</code></td><td>與 <code>export_onnx.py</code> 互鎖；DFN2 的 layout 8 圖會被拒絕</td></tr>

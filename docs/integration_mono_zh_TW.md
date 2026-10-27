@@ -31,7 +31,7 @@
     - [3.1b 逐階段耗時（診斷用）](integration_mono_zh_TW_02_lifecycle_config_errors.md#31b-逐階段耗時診斷用) <!-- split-toc -->
     - [3.2 執行期強度控制](integration_mono_zh_TW_02_lifecycle_config_errors.md#32-執行期強度控制) <!-- split-toc -->
   - [4. Config 完整參考](integration_mono_zh_TW_02_lifecycle_config_errors.md#4-config-完整參考) <!-- split-toc -->
-    - [4.1 `SeRequest` → `se_derive()`](integration_mono_zh_TW_02_lifecycle_config_errors.md#41-serequest--se_derive) <!-- split-toc -->
+    - [4.1 `AecConfig` 的接縫欄位（範例的 `derive_lane()`）](integration_mono_zh_TW_02_lifecycle_config_errors.md#41-aecconfig-的接縫欄位範例的-derive_lane) <!-- split-toc -->
     - [4.2 後級選項（範例程式的欄位與 CLI 旗標）](integration_mono_zh_TW_02_lifecycle_config_errors.md#42-後級選項範例程式的欄位與-cli-旗標) <!-- split-toc -->
     - [4.3 Grid（由 `sample_rate` + `fft_size` 唯一決定）](integration_mono_zh_TW_02_lifecycle_config_errors.md#43-grid由-sample_rate--fft_size-唯一決定) <!-- split-toc -->
     - [4.4 哪些欄位會改變記憶體用量](integration_mono_zh_TW_02_lifecycle_config_errors.md#44-哪些欄位會改變記憶體用量) <!-- split-toc -->
@@ -56,26 +56,24 @@
 
 | Source | 產出 | 說明 |
 |---|---|---|
-| `lib/aec`、`lib/nr`、audiolib | `libaec.a`、`libanr.a`、`libaudio_common.a` | 線性 AEC（含 AEC3 殘留 gain context）、降噪、FFT／STFT／合成 |
-| `pipelines/common/se_config.c` / `.h` | `se_config.o`（4ch 單元的 archive 也含它） | 格點解析與 `AecConfig` 推導（`se_derive()`）；各應用的規則（rate 集合、delay 檢查、lane 對齊、seam context）以 `SeRules` 傳入 |
-| `pipelines/common/se_stage.h` | header-only | `SeSpecFrame`、`se_res_stage_gain()`、`se_frame_from_aec()`、CNG 常數 |
+| `lib/aec`、`lib/nr`、audiolib | `libaec.a`、`libanr.a`、`libaudio_common.a` | 線性 AEC（含 AEC3 殘留 gain context、格點解析 `aec_resolve_signal_grid()`）、降噪、FFT／STFT／合成 |
+
+pipelines 不提供 mono 的函式庫、object 或 header：mono 的整合只連上面三個 archive。
 
 ### 6.2 範例碼與參考執行檔（**沒有任何一個會進產品 archive**）
 
 | Source | 是什麼 | 為什麼存在 |
 |---|---|---|
-| `pipelines/samples/se_anr_stage.h` | header-only 的 NR 級 gain 呼叫（`se_anr_stage_gain()`） | 把 AEC 的殘留回音功率摺進降噪器的 noise floor 並回傳 NR 增益；可整份複製改寫，沒有 ABI |
-| `pipelines/mono_aec_nr_res/main.c` | heap 路徑 CLI（WAV in / WAV out） | 示範 `Aec` + `AnrDenoiser` + `AcIstft` 各自初始化（`aec`、`nr` 與合成/暫存各一塊 heap）與每 hop 串接（`mono_form()`）；離線比對用 |
-| `pipelines/mono_aec_nr_res/static_main.c` | caller-owned pool 路徑 CLI | 示範 query → allocate（AEC、降噪器、合成、暫存在**一塊**對齊 pool 內依序切）→ init → process → destroy → release；另提供 `--print-mem-size` |
+| `pipelines/mono_aec_nr_res/main.c`（同一份原始碼編成兩支執行檔） | WAV in / WAV out CLI | 示範 `Aec` + `AnrDenoiser` + `AcIstft` 各自初始化與每 hop 串接（`derive_lane()`、`mono_nr_gain()`、`mono_form()`；沒有共用的串接 header）。預設編成 `aec_nr_pipeline_static`：query → allocate（AEC、降噪器、合成、暫存在**一塊**對齊 pool 內依序切）→ init → process → destroy → release，另提供 `--print-mem-size`；以 `-DAEC_NR_POOL_SPLIT=1` 編成 `aec_nr_pipeline`：AEC 一塊、後級（降噪器、合成、暫存）另一塊，共兩塊 `posix_memalign`，沒有 `--print-mem-size`（離線比對用） |
 | `pipelines/mono_aec_nr_res/example_board_adapter.c` | 板端 adapter 的**主機模擬** | 示範完整呼叫序列（AEC、降噪器、合成、暫存在一塊 arena 內）、pool 大小加總與拒絕路徑。裡面每個 `board_mem_*` 都是主機上的假實作，不是平台程式碼。標了 `// BOARD:` 的地方就是你要換成真實平台程式碼的位置 |
 
-四麥克風的 library 與參考程式是**另外兩份**手冊的主題：
+四麥克風的 flow 層 `mcab`（`pipelines/4ch_aec_bf_nr_res/mcab.h`）與其範例是**另外兩份**手冊的主題：
 `docs/integration_4ch_core_zh_TW.md`、`docs/integration_4ch_spatial_zh_TW.md`。
 
 ### 6.3 測試（不出貨）
 
-`pipelines/mono_aec_nr_res/tests/test_mono_chain.c`（照 `static_main.c` 的展開順序建 Rig，並把兩支 mono 程式當黑箱跑，與手寫 oracle `conv_chain_mono.h` 逐位元比對）、
-`pipelines/mono_aec_nr_res/tests/test_no_stdio_stack.c`。
+`pipelines/mono_aec_nr_res/tests/test_mono_chain.c`（照 `main.c` 的展開順序建 Rig，並把兩支 mono 程式當黑箱跑，與手寫 oracle `conv_chain_mono.h` 逐位元比對）、
+`pipelines/mono_aec_nr_res/tests/test_no_stdio_stack.c`，以及 Python twin 的格點與 wall-clock retiming 契約測試 `pipelines/mono_aec_nr_res/tests/test_signal_grids.py`。
 
 ---
 
@@ -83,7 +81,7 @@
 
 建置與連結：
 
-- [ ] `libaec.a` / `libanr.a` / `libaudio_common.a` 與你的 `se_config.o` 是用**同一組** backend 與編譯選項建出來的
+- [ ] `libaec.a` / `libanr.a` / `libaudio_common.a` 與你的 TU 是用**同一組** backend 與編譯選項建出來的
 - [ ] link 順序照 [§1.5](integration_mono_zh_TW_01_overview_link_quickstart.md#15-archive-link-order)
 - [ ] `BACKEND=ne10` 時最終 link 用 C++ driver
 - [ ] archive 路徑是用各 Makefile 的 `print-lib-path` 查的，不是硬寫的
@@ -100,7 +98,7 @@
 
 - [ ] `mic` / `ref` / `out` 三個 buffer 都剛好 `grid.hop_size` 個 float
 - [ ] hop 大小是查來的，不是寫死的
-- [ ] `se_frame_from_aec()`、`g_res_ctx`、`se_anr_stage_gain()` 的回傳值，以及合成輸出的有限性（`se_hop_is_finite()`）都有檢查
+- [ ] `aec_get_res_context()` 之後的 `ctx.error_spec`／`ctx.res_gain` 是否為 NULL、`anr_process_gain()` 的回傳值與 `anr_get_gain()` 是否為 NULL 都有檢查；要擋非有限輸出時，合成輸出也檢查（`skn_all_finite_f32()`）
 - [ ] 任何一步被拒，或換回聲路徑／換串流時，`aec_reset()`、`anr_reset()`、`ac_istft_reset()` 與 comfort-noise RNG 的重設**一起**做
 - [ ] 同一個 instance 沒有被多 thread 同時 process
 - [ ] 降噪器的 reset／destroy 與 `Aec` 同進退，沒有只重設其中一個
@@ -121,9 +119,9 @@
 ## 8. 版本與相容性
 
 mono 沒有 descriptor，也沒有 layout version：`Aec`、`AnrDenoiser`、`AecRes`、`AcIstft` 只提供大小查詢，
-`se_anr_stage.h` 與各範例程式是範例碼。需要 descriptor 閘的出貨單元只有 4ch 的 `AudioPipeline4Ch`
-（`AudioPipeline4ChMemReq`，`AUDIO_PIPELINE_4CH_LAYOUT_VERSION`）與 DFN2 的 stage／bridge，
-見 [`integration_4ch_spatial_zh_TW.md`](integration_4ch_spatial_zh_TW.md) 與
+各範例程式是範例碼。需要 descriptor 閘的出貨物件只有 4ch 的 flow 層 `Mcab`
+（`McabMemReq`，`MCAB_LAYOUT_VERSION`，只涵蓋 mcab 自己的 pool）與 DFN2 的 stage／bridge，
+見 [`integration_4ch_core_zh_TW.md`](integration_4ch_core_zh_TW.md) 與
 [`pipeline_board_integration.md`](pipeline_board_integration.md)。
 
 給整合者的兩條規則：

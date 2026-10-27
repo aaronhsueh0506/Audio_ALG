@@ -39,15 +39,15 @@ git commit -m "pin: NR to version xxx"
 
 | 目錄 | 說明 |
 |------|------|
-| `lib/nr/` | NR submodule (CVNR) |
+| `lib/nr/` | NR submodule（`.gitmodules` 中的遠端 repository 名稱為 CVNR） |
 | `lib/aec/` | AEC submodule |
 | `../audiolib/common/` | 共用層，非 submodule；預期 commit 記在 `pipelines/audiolib.pin`，`make -C pipelines check-pins` 驗證；`publish` 也會在建置 artifact 前強制檢查 |
 | `AINR/` | standalone AI noise reduction models |
 | `AIAEC/` | neural AEC candidate models and dataset |
 | `shared/` | 共享工具代碼 |
-| `pipelines/` | mono AEC examples and the 4-channel linear AEC + beamformer unit |
+| `pipelines/` | 應用範例與共用 build（`Makefile`、`tests/`、`tools/`）：`common/`（範例的命令列解析標頭 `example_cli.h` 與 Python 的 `cng_aec3.py`）、`mono_aec_nr_res/`、`4ch_aec_bf_nr_res/`（`mcab` 4ch flow 層與 sample helper）、`dfn/`（DeepFilterNet2 stage 與兩支應用，含 Python 孿生）、`ulcnet/`（Align-ULCNet stage 與兩支應用） |
 | `docs/` | current docs and archived design records |
-| `scripts/` | 管理腳本 |
+| `scripts/` | 管理腳本（`update_submodules.sh`） |
 
 ## 文件維護
 
@@ -56,4 +56,6 @@ git commit -m "pin: NR to version xxx"
   同一個 commit；
 - signal grid 改動時同步更新 root、component README 與測試；
 - 已被實作取代的設計稿加上 archived notice，避免與現行 API 混用；
+- 文件裡寫出的 layout／carve 版號與 C↔Python 函式對照表由測試守衛，改文件後從 Audio_ALG 根目錄執行：
+  `python3 -m pytest -q pipelines/tests/test_doc_layout_versions.py pipelines/tests/test_c_python_map.py`；
 - 文件入口與 current/archive 分流見 [`README.md`](README.md)。

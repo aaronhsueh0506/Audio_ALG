@@ -12,15 +12,14 @@
 #include <stdlib.h>
 #include <string.h>
 
-#include "4aec_nr_res.h"
-#include "audio_pipeline_4ch.h"
-#include "dfn_res_stage.h"
-#include "dfn_rate_bridge.h"
+#include "mcab.h"
+#include "dfn/dfn_res_stage.h"
+#include "dfn/dfn_rate_bridge.h"
 #include "dfn2_prepost.h"
 #include "dfn3_prepost.h"
 #include "ulcnet_prepost.h"
 #include "deepvqe_prepost.h"
-#include "dfn_unit_partition.h"
+#include "dfn/dfn_unit_partition.h"
 
 static float erb_fwd[DFN2_N_BINS * DFN2_N_ERB];
 static float erb_inv[DFN2_N_ERB * DFN2_N_BINS];
@@ -52,6 +51,35 @@ static unsigned cases;
     free(pool); \
 } while (0)
 
+/* mcab's init takes the objects it drives: one set of lanes and the shared estimator, built
+ * once in main() with their own libaec init calls, serves both mcab cases. */
+static McabLibs g_mcab_libs;
+static Mcab *mcab_case_init_ex(void *mem, size_t bytes, const McabConfig *cfg,
+                               const McabMemReq *req) {
+    return mcab_init_ex(mem, bytes, cfg, &g_mcab_libs, req);
+}
+#define mcab_case_get_mem_requirements mcab_get_mem_requirements
+
+static void build_mcab_libs(const McabConfig *cfg) {
+    AecConfig lane;
+    McabDelayEstimatorConfig dc;
+    size_t bytes;
+    static DelayAec delay;
+    void *mem;
+    int ch;
+    assert(mcab_lane_config(cfg, &lane) == 0 && mcab_delay_estimator_config(cfg, &dc) == 0);
+    bytes = aec_get_mem_size(&lane);
+    for (ch = 0; ch < MCAB_CHANNELS; ++ch) {
+        assert(posix_memalign(&mem, 16, bytes) == 0);
+        assert((g_mcab_libs.lanes[ch] = aec_init(mem, bytes, &lane)) != NULL);
+    }
+    assert(dc.required);
+    bytes = delay_aec_get_mem_size(dc.sample_rate, dc.hop_size, dc.num_filters);
+    assert(posix_memalign(&mem, 16, bytes) == 0);
+    assert(delay_aec_init(&delay, mem, bytes, dc.sample_rate, dc.hop_size, dc.num_filters) == 0);
+    g_mcab_libs.delay = &delay;
+}
+
 /* The pre/post APIs call their descriptor query get_mem_size. */
 #define dfn2_prepost_get_mem_requirements dfn2_prepost_get_mem_size
 #define dfn3_prepost_get_mem_requirements dfn3_prepost_get_mem_size
@@ -60,8 +88,8 @@ static unsigned cases;
 
 int main(int argc, char **argv) {
     uint32_t pointer_bytes = (uint32_t)sizeof(void *), foreign_pointer_bytes;
-    FourAecNrResConfig core = four_aec_nr_res_default_config(16000);
-    AudioPipeline4ChConfig spatial = audio_pipeline_4ch_default_config(16000);
+    McabConfig flow = mcab_default_config(16000);
+    McabConfig front_only = flow;
     DFN2PrepostConfig dfn2;
     DFN3PrepostConfig dfn3;
     UlcnetPrepostConfig ulc;
@@ -97,8 +125,12 @@ int main(int argc, char **argv) {
     EXERCISE(dfn3_prepost, DFN3PrepostMemReq, dfn3);
     EXERCISE(ulcnet_prepost, UlcnetPrepostMemReq, ulc);
     EXERCISE(deepvqe_prepost, DeepVqePrepostMemReq, deep);
-    EXERCISE(four_aec_nr_res, FourAecNrResMemReq, core);
-    EXERCISE(audio_pipeline_4ch, AudioPipeline4ChMemReq, spatial);
+    /* Two carves of the one flow: with the fuse buffers and front only. */
+    front_only.enable_post = 0;
+    build_mcab_libs(&flow);
+    EXERCISE(mcab_case, McabMemReq, flow);
+    build_mcab_libs(&front_only);   /* the front-only flow needs front-only lanes */
+    EXERCISE(mcab_case, McabMemReq, front_only);
     EXERCISE(dfn_res_stage, DfnResStageMemReq, stage);
     EXERCISE(dfn_rate_bridge, DfnRateBridgeMemReq, bridge);
     assert(cases == 8u);

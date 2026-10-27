@@ -5,6 +5,8 @@ AINR release does not depend on its parent directory.  Trainers/tests import
 AINR's own ``dataset_gen`` bare; all three resolve by putting ``AINR`` on the
 path, exactly as every entry script's own shim does. The ``Audio_ALG`` root is
 added only for cross-package ``AIAEC.*`` imports used by integration tests.
+``tests/`` is on the path for ``dfn_pairs``, the lookahead-pair helper shared
+by the DeepFilterNet2 and DeepFilterNet3 tests.
 """
 
 import os
@@ -17,3 +19,6 @@ if _AUDIO_ALG not in sys.path:
     sys.path.insert(0, _AUDIO_ALG)
 if _AINR not in sys.path:
     sys.path.insert(0, _AINR)
+_TESTS = os.path.join(_AINR, 'tests')
+if _TESTS not in sys.path:
+    sys.path.insert(0, _TESTS)

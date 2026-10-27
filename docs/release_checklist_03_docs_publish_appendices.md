@@ -90,7 +90,7 @@ bites: every AINR project also defines a top-level `train`, `model` and
 `export_onnx`, and a bare import made after a sibling's is cached in
 `sys.modules` is handed the sibling's module at RUN time. Consumers of those
 modules drop the cached names and front their own directory before importing,
-as the projects' tests do; `pipelines/tests/test_dfn2_stage.py` pins that for
+as the projects' tests do; `pipelines/dfn/tests/test_dfn2_stage.py` pins that for
 the DFN2 stage. Re-run the combined row, not just the per-package rows.
 
 One combined-run test depends on the host rather than the tree:
@@ -98,16 +98,19 @@ One combined-run test depends on the host rather than the tree:
 probes the host's MPS backend and fails where the backend agrees with the CPU.
 
 C-side `make test` targets that print `PASS:` markers rather than a count
-(`make clean` first, `^PASS:` lines counted): `pipelines` (all applications),
-`pipelines/mono_aec_nr_res`, `pipelines/mono_alignulcnet` (the same count on the
-16 kHz and the `ULCNET_GRID=48k` build) and `pipelines/4ch_aec_bf_nr_res`
-(one-stop gate; also builds and runs the `4ch_alignulcnet` binaries, whose test
+(`make clean` first, `^PASS:` lines counted): `pipelines` (the mono applications, the
+`dfn/` and `ulcnet/` stage tests and `test_mcab_sample_post`), `pipelines/mono_aec_nr_res`, `pipelines/ulcnet/mono_alignulcnet`
+(the same count on the 16 kHz and the `ULCNET_GRID=48k` build) and `pipelines/4ch_aec_bf_nr_res`
+(`mcab`; one-stop gate for the four-channel side: `test_mcab`, `test_mcab_sample_beam`, `test_mcab_sample_driver`, the
+`mcab_raw`, `mcab_static` and `mcab_external_static` runs, `test_4ch_dfn` with the
+`4ch_aec_bf_dfn_res` command-line runs, and the `4ch_alignulcnet` binaries, whose test
 prints a single `All 4ch_ulcnet tests passed` line and no `PASS:`
-markers, and the `4ch_aec_bf_dfn_res` command-line runs; the same count on the
-`ULCNET_GRID=48k` build). Each additionally prints a small number of non-`PASS:`
+markers; the same count on the `ULCNET_GRID=48k` build). Each additionally prints a small number of non-`PASS:`
 pass lines (static smokes, board-skeleton profiles, adapter).
 
-Pass/fail-only targets (no count): `AEC` `selftest`, `test-counter-saturation`,
+Pass/fail-only targets (no count): `pipelines` `test-pairs` (the DFN C tests for
+the pairs of `DFN_TEST_PAIRS`; an empty list is an error, and `make -n`/`-q`/`-t` only print the plan) and `AINR` `test-pairs` (the lookahead-pair pytest
+files); `AEC` `selftest`, `test-counter-saturation`,
 `test-process-context`, `test-shared-far-spec`, `test-shared-fft-handle`,
 `test-static-aec` (needs the doubletalk blind-test wav pair, overridable with
 `TEST_STATIC_MIC` / `TEST_STATIC_REF`), `test-zero-heap`,

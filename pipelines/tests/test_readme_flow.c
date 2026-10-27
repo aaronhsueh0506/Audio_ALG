@@ -14,13 +14,12 @@
 #include <string.h>
 
 #include "aec.h"
-#include "common/se_config.h"
-#include "common/se_stage.h"
-#include "samples/dfn_hop.h"
-#include "samples/se_anr_stage.h"
-#include "samples/ulcnet_nn_stage.h"
-#include "dfn_unit_partition.h"
-#include "tests/dfn_test_fixture.h"
+#include "aec_res.h"           /* aec_cng_fill */
+#include "anr.h"
+#include "dfn/dfn_hop.h"
+#include "ulcnet/ulcnet_nn_stage.h"
+#include "dfn/dfn_unit_partition.h"
+#include "dfn/tests/dfn_test_fixture.h"
 #include "mono_aec_nr_res/tests/conv_chain_mono.h"
 #include "utility/mem_align.h"
 #include "utility/simd_kernels.h"
@@ -37,18 +36,26 @@ static float lcg(void) {
     return ((float)(int)(g_lcg >> 9) / 4194304.0f - 1.0f) * 0.25f;
 }
 
-/* The mono lane every example below starts from. */
-static int derive_mono_lane(int sample_rate, int fft_size, SeGrid* grid, AecConfig* aec_cfg) {
-    static const SeRules rules = { .allow_8k = 1, .spatial_context = SE_CONTEXT_PRESET };
-    SeRequest req;
-    memset(&req, 0, sizeof(req));
-    req.sample_rate = sample_rate;
-    req.fft_size = fft_size;
-    req.delay_mode = AEC_DELAY_MATCHED;
-    req.delay_num_filters = DA_NUM_FILTERS;
-    req.fixed_delay_samples = -1;
-    req.aec_preset = AEC_PRESET_BALANCED;
-    return se_derive(&req, &rules, grid, aec_cfg);
+#define CNG_NR_GAIN_FLOOR 0.31622777f
+#define CNG_RNG_SEED 0x9e3779b9u
+#define PSD_SCALE_INV (1.0f / (32768.0f * 32768.0f))   /* int16^2 -> audio scale, exact */
+
+/* The mono lane every example below starts from: the grid (fft_size 0: the rate's default) and
+ * the linear stage keeping its own gain in the context. */
+static int derive_mono_lane(int sample_rate, int fft_size, AecSignalGrid* grid,
+                            AecConfig* aec_cfg) {
+    if (!aec_resolve_signal_grid(sample_rate,
+                                 fft_size ? fft_size : aec_default_fft_size(sample_rate), grid))
+        return -1;
+    aec_config_from_preset(aec_cfg, AEC_PRESET_BALANCED, sample_rate);
+    aec_cfg->fft_size = grid->fft_size;
+    aec_cfg->delay_mode = AEC_DELAY_MATCHED;
+    aec_cfg->delay_num_filters = DA_NUM_FILTERS;
+    aec_cfg->fixed_delay_samples = -1;
+    aec_cfg->enable_delay_est = 1;
+    aec_cfg->enable_res = 0;
+    aec_cfg->return_res_context = 1;
+    return 0;
 }
 
 /* ---- Q: how do I chain a new frequency-domain stage? --------------------- */
@@ -74,9 +81,9 @@ static HfTilt* hf_tilt_init(void* mem, int n_freqs, int bin_hi, float amount) {
     return s;
 }
 
-static const float* hf_tilt_gain(HfTilt* s, const SeSpecFrame* f) {
+static const float* hf_tilt_gain(HfTilt* s, int n_freqs) {
     int k;
-    for (k = 0; k < f->n_freqs; ++k) s->g[k] = k > s->bin_hi ? s->amount : 1.0f;
+    for (k = 0; k < n_freqs; ++k) s->g[k] = k > s->bin_hi ? s->amount : 1.0f;
     return s->g;
 }
 
@@ -96,19 +103,26 @@ typedef struct Chain {
 } Chain;
 
 static int chain_hop(Chain* c, const float* mic, const float* ref, float* out) {
-    SeSpecFrame f;
+    AecResContext f;
+    const float* extra = NULL;
     const float* nr_gain;
     const float* tilt;
     aec_process_context(c->aec, mic, ref);
-    if (se_frame_from_aec(c->aec, &f) != 0) return -1;
-    nr_gain = se_anr_stage_gain(c->nr, &f, c->g_nr_scratch, 1);
+    aec_get_res_context(c->aec, &f);
+    if (!f.error_spec) return -1;
+    if (f.r2 && f.usable_linear) {         /* residual-echo powers into the noise floor */
+        sk_scale_f32(c->g_nr_scratch, f.r2, PSD_SCALE_INV, f.n_freqs);
+        extra = c->g_nr_scratch;
+    }
+    if (anr_process_gain(c->nr, f.error_spec, extra, NULL) != 0) return -1;
+    nr_gain = anr_get_gain(c->nr, NULL);
     if (!nr_gain) return -1;
-    tilt = hf_tilt_gain(c->tilt, &f);
-    sk_min_f32(c->g_min, nr_gain, f.g_res_ctx, f.n_freqs);
+    tilt = hf_tilt_gain(c->tilt, f.n_freqs);
+    sk_min_f32(c->g_min, nr_gain, f.res_gain, f.n_freqs);
     sk_min_f32(c->g_total, c->g_min, tilt, f.n_freqs);
-    sk_capply_gain_f32(c->spec, f.e, c->g_total, f.n_freqs);
-    aec_cng_fill(&c->rng, c->spec, f.cn, f.g_res_ctx, nr_gain,
-                 SE_CNG_NR_GAIN_FLOOR, f.n_freqs);
+    sk_capply_gain_f32(c->spec, f.error_spec, c->g_total, f.n_freqs);
+    aec_cng_fill(&c->rng, c->spec, f.comfort_noise, f.res_gain, nr_gain,
+                 CNG_NR_GAIN_FLOOR, f.n_freqs);
     (void)ac_istft_push(c->istft, c->spec, out);
     return 0;
 }
@@ -122,7 +136,7 @@ static double energy_above(const float* x, int n) {
 
 /* Builds the chain's objects in one caller block at `mem` (returns the bytes used, 0 on
  * failure). `bin_hi`/`amount` configure the new stage. */
-static size_t chain_build(Chain* c, void* mem, size_t bytes, const SeGrid* grid,
+static size_t chain_build(Chain* c, void* mem, size_t bytes, const AecSignalGrid* grid,
                           const AecConfig* aec_cfg, int sample_rate, int bin_hi, float amount) {
     uint8_t* cur = (uint8_t*)mem;
     size_t aec_b = aec_get_mem_size(aec_cfg), nr_b, synth_b, vec, used;
@@ -138,7 +152,7 @@ static size_t chain_build(Chain* c, void* mem, size_t bytes, const SeGrid* grid,
     if (bytes < used) return 0;
     memset(c, 0, sizeof(*c));
     c->n_freqs = n;
-    c->rng = SE_CNG_RNG_SEED;
+    c->rng = CNG_RNG_SEED;
     c->aec = aec_init(cur, aec_b, aec_cfg);            cur += ALIGN16(aec_b);
     c->nr = anr_init(cur, nr_b, &nc);                  cur += ALIGN16(nr_b);
     c->istft = ac_istft_init(cur, synth_b, &sc);       cur += ALIGN16(synth_b);
@@ -150,7 +164,7 @@ static size_t chain_build(Chain* c, void* mem, size_t bytes, const SeGrid* grid,
     return c->aec && c->nr && c->istft ? used : 0;
 }
 
-static size_t chain_bytes(const SeGrid* grid, const AecConfig* aec_cfg, int sample_rate) {
+static size_t chain_bytes(const AecSignalGrid* grid, const AecConfig* aec_cfg, int sample_rate) {
     AnrConfig nc = anr_config_for_mode_grid(sample_rate, grid->fft_size, ANR_MODE_BALANCED);
     AcStftConfig sc;
     int n = grid->n_freqs;
@@ -161,7 +175,7 @@ static size_t chain_bytes(const SeGrid* grid, const AecConfig* aec_cfg, int samp
 }
 
 static void example_chain_new_stage(void) {
-    SeGrid grid;
+    AecSignalGrid grid;
     AecConfig aec_cfg;
     ConvMonoConfig ocfg = conv_mono_default_config(16000, 256);
     ConvMono* oracle;
@@ -246,7 +260,7 @@ typedef struct DfnHost {
 } DfnHost;
 
 static int dfn_host_build(DfnHost* d, const DFN2Model* model) {
-    SeGrid grid;
+    AecSignalGrid grid;
     AecConfig aec_cfg;
     DfnRateBridgeConfig bc = dfn_rate_bridge_default_config(16000);
     DfnRateBridgeMemReq breq;
@@ -285,12 +299,13 @@ static void dfn_host_free(DfnHost* d) {
 
 /* AEC, RES gain, P; the DFN hop begins on (E, P). */
 static int dfn_host_begin(DfnHost* d, const float* mic, const float* ref) {
-    SeSpecFrame f;
+    AecResContext f;
     aec_process_context(d->aec, mic, ref);
-    if (se_frame_from_aec(d->aec, &f) != 0 || !f.g_res_ctx) return -1;
-    sk_min_f32(d->total, d->unity, f.g_res_ctx, d->n_freqs);
-    sk_capply_gain_f32(d->post, f.e, d->total, d->n_freqs);
-    return dfn_hop_begin(&d->hop, f.e, d->post) == 0 ? 0 : -1;
+    aec_get_res_context(d->aec, &f);
+    if (!f.error_spec || !f.res_gain) return -1;
+    sk_min_f32(d->total, d->unity, f.res_gain, d->n_freqs);
+    sk_capply_gain_f32(d->post, f.error_spec, d->total, d->n_freqs);
+    return dfn_hop_begin(&d->hop, f.error_spec, d->post) == 0 ? 0 : -1;
 }
 
 static void example_dfn_phased(void) {
@@ -356,21 +371,19 @@ typedef struct UlcHost {
 } UlcHost;
 
 static int ulc_host_build(UlcHost* u, const UlcnetModel* model) {
-    static const SeRules rules = { .fixed_rate = ULCNET_SR, .fixed_fft = ULCNET_N_FFT,
-                                   .spatial_context = AEC_CONTEXT_LINEAR_ONLY };
-    SeRequest req;
-    SeGrid grid;
     AecConfig aec_cfg;
     size_t aec_b, stage_b = ulcnet_nn_stage_mem_size(1);
     memset(u, 0, sizeof(*u));
-    memset(&req, 0, sizeof(req));
-    req.sample_rate = ULCNET_SR;
-    req.fft_size = ULCNET_N_FFT;
-    req.delay_mode = AEC_DELAY_MATCHED;
-    req.delay_num_filters = DA_NUM_FILTERS;
-    req.fixed_delay_samples = -1;
-    req.aec_preset = AEC_PRESET_BALANCED;
-    if (se_derive(&req, &rules, &grid, &aec_cfg) != 0) return -1;
+    /* the stage's compiled grid; the lane returns the linear context only */
+    aec_config_from_preset(&aec_cfg, AEC_PRESET_BALANCED, ULCNET_SR);
+    aec_cfg.fft_size = ULCNET_N_FFT;
+    aec_cfg.delay_mode = AEC_DELAY_MATCHED;
+    aec_cfg.delay_num_filters = DA_NUM_FILTERS;
+    aec_cfg.fixed_delay_samples = -1;
+    aec_cfg.enable_delay_est = 1;
+    aec_cfg.enable_res = 0;
+    aec_cfg.return_res_context = 1;
+    aec_cfg.spatial_linear_context = AEC_CONTEXT_LINEAR_ONLY;
     aec_b = aec_get_mem_size(&aec_cfg);
     if (posix_memalign((void**)&u->mem, 16, ALIGN16(aec_b) + ALIGN16(stage_b)) != 0) return -1;
     u->aec = aec_init(u->mem, aec_b, &aec_cfg);

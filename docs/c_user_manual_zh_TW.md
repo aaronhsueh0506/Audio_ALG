@@ -1,12 +1,12 @@
 # Audio_ALG C User Manual（繁體中文）
 
 本手冊說明 conventional mono pipeline 的建置、命令列使用方式，以及
-以 lib/aec 的 `Aec` 加逐個初始化的 NR／合成函式庫（範例見 `pipelines/mono_aec_nr_res/main.c`、`static_main.c`）組成 mono 處理的整合方式
+以 lib/aec 的 `Aec` 加逐個初始化的 NR／合成函式庫（範例見 `pipelines/mono_aec_nr_res/main.c`）組成 mono 處理的整合方式
 （沒有 mono pipeline 函式庫；每個函式庫各自 `mem_size`／`init`，heap 與 caller-owned-pool 兩種）；
-四麥克風 C seam 另列於第 1.1 節。
+四麥克風 flow 層 `mcab` 另列於第 1.1 節。
 
-> 現行 API 與 sizing contract 以 `lib/aec/c_impl/include/aec.h`、`pipelines/common/se_stage.h`、
-> `pipelines/samples/se_anr_stage.h`、`pipelines/mono_aec_nr_res/static_main.c` 和 `pipelines/README.md` 為準。更新 submodule
+> 現行 API 與 sizing contract 以 `lib/aec/c_impl/include/aec.h`、`pipelines/4ch_aec_bf_nr_res/mcab.h`、
+> `pipelines/mono_aec_nr_res/main.c` 和 `pipelines/README.md` 為準。更新 submodule
 > 或 tuning 後，必須重新建置並執行 pipeline tests；不要只依賴本手冊中的
 > 範例常數。
 
@@ -19,67 +19,70 @@
 - 共用層 library（FFT/fast_math/hpf）：`libaudio_common.a`，路徑 `make -s -C ../audiolib/common print-lib-path`
 - 三個 archive 都放在 `bin/<backend>-<config-hash>/` 下，路徑隨 BACKEND／SIMD 等建置設定改變，一律用 `print-lib-path` 取得
   （只印路徑、不建置）；link 前須先建好共用層（`make -C ../audiolib/common`），再建 `lib/aec/c_impl`、`lib/nr/c_impl`
-- malloc reference executable：config-keyed `pipelines/bin/.../aec_nr_pipeline`
-  （source：`pipelines/mono_aec_nr_res/main.c`）
+- split-pool reference executable：config-keyed `pipelines/bin/.../aec_nr_pipeline`
+  （source：`pipelines/mono_aec_nr_res/main.c` 以 `-DAEC_NR_POOL_SPLIT=1` 編譯；AEC 一塊、後級一塊，各用 `posix_memalign()`）
 - static-memory reference executable：config-keyed `pipelines/bin/.../aec_nr_pipeline_static`
-  （source：`pipelines/mono_aec_nr_res/static_main.c`；單一 caller pool、init 後零 malloc、與 malloc 版的輸出相等由 `tests/test_mono_chain.c` 驗證；`--print-mem-size` 可直接查任一取樣率的 pool 需求）
-- mono 的 reusable 零件：`lib/aec` 的 `Aec`（`aec_process_context()`）、`pipelines/common/se_stage.h`
-  的 `se_frame_from_aec()`、`lib/nr` 的 `AnrDenoiser`、audiolib 的 `AcIstft`，以及 header-only 的 NR 級範例 `pipelines/samples/se_anr_stage.h`（沒有 mono 函式庫 archive；每 hop 的串接寫在各範例 `main`）
-- 四麥克風前端 API：`pipelines/4ch_aec_bf_nr_res/4aec_nr_res.h` / `4aec_nr_res.c`
-- 四麥克風線性 AEC + BF 單元（唯一包起來的單元）：`pipelines/4ch_aec_bf_nr_res/audio_pipeline_4ch.h` /
-  `audio_pipeline_4ch.c`；單元只含共用 delay 對齊、四條線性 AEC、SRP-PHAT 與 BF，post-beam RES（libaec 的 `AecRes`）／NR／CNG／合成不在單元內
-- 四麥克風 static 對照範例：`pipelines/4ch_aec_bf_nr_res/4aec_nr_res_static.c`
-- 單元加 RES／NR／合成的實錄 runner：`pipelines/4ch_aec_bf_nr_res/audio_pipeline_4ch_raw.c`
+  （source：同一份 `pipelines/mono_aec_nr_res/main.c`；單一 caller pool、init 後零 malloc、與 split 版的輸出相等由 `mono_aec_nr_res/tests/test_mono_chain.c` 驗證；`--print-mem-size` 可直接查任一取樣率的 pool 需求）
+- mono 的 reusable 零件：`lib/aec` 的 `Aec`（`aec_process_context()`、`aec_get_res_context()`）、`lib/nr` 的 `AnrDenoiser`、audiolib 的 `AcIstft`（沒有 mono 函式庫 archive，也沒有共用的串接 header；格點推導與每 hop 的串接寫在各範例 `main`）
+- 四麥克風 flow 層：`pipelines/4ch_aec_bf_nr_res/mcab.h` / `mcab.c`；`Mcab` 只擁有共用 delay 的 admission 狀態機、reference ring、對齊後的 far 與 fuse 緩衝。
+  四條線性 `Aec` lane 與（MATCHED）共用的 `DelayAec` 由應用建立，以指標交給它；SRP-PHAT、BF、post-beam RES（libaec 的 `AecRes`）／NR／CNG／合成都不在 mcab 內
+- 四麥克風 sample 層 helper（不進 archive）：`mcab_sample_flow.{h,c}`（應用端依序建 lane、estimator 與 mcab）、`mcab_sample_beam.{h,c}`（SRP-PHAT、BF、auto-VAD）、`mcab_sample_driver.{h,c}`（CLI 與 hop 迴圈）
+- 四麥克風 static 對照範例（外部 beamformer，固定等權 smoke）：`pipelines/4ch_aec_bf_nr_res/mcab_external_static.c`
+- flow 加 sample beam helper 與 RES／NR／合成的 runner：`pipelines/4ch_aec_bf_nr_res/mcab_raw.c`（實錄）、`mcab_static.c`（合成訊號）
 - 四麥克風 archive：`pipelines/4ch_aec_bf_nr_res` 的 config-keyed build directory
-  內的 `libaudio_pipeline_4ch.a`（前端、單元、`se_config.o`）
+  內的 `libaudio_pipeline_mcab.a`（只有 `mcab.o`）
 
-function、descriptor version、ownership 與錯誤行為，mono 以 lib/aec 與 `pipelines/common/se_stage.h`、
-四麥克風以 `4ch_aec_bf_nr_res/4aec_nr_res.h` 與 `audio_pipeline_4ch.h` 為準。
+function、descriptor version、ownership 與錯誤行為，mono 以 lib/aec／lib/nr／audiolib 的標頭、
+四麥克風以 `4ch_aec_bf_nr_res/mcab.h` 為準。
 
-嵌入產品時，各函式庫各自查大小、各自 init，再由整合者串接：mono 是 `se_derive()` →
+嵌入產品時，各函式庫各自查大小、各自 init，再由整合者串接：mono 是 `aec_resolve_signal_grid()` 與 `aec_config_from_preset()` →
 `aec_get_mem_size()`／`anr_get_mem_size()`／`ac_istft_get_mem_size()` → 對齊配置 → `aec_init()`／`anr_init()`／`ac_istft_init()`
-（桌面也可用 `aec_create()`）；4ch 的單元是 `audio_pipeline_4ch_get_mem_requirements()` → 對齊配置 →
-`audio_pipeline_4ch_init_ex()`（桌面可用 `audio_pipeline_4ch_create()`）。見
+（桌面也可用 `aec_create()`）；4ch 的 `Mcab` 是應用先建四條 `Aec` lane 與（MATCHED）`DelayAec`，再 `mcab_get_mem_requirements()` → 對齊配置 →
+`mcab_init_ex()`（桌面可用 `mcab_create()`，只配置 mcab 自己的 pool）。見
 [`integration_mono_zh_TW.md`](integration_mono_zh_TW.md)。第 5 節是直接
 組合 AEC／NR 的 application-layer wrapper 範例。
 
-### 1.1 四麥克風 C seam
+### 1.1 四麥克風 flow（`mcab`）
 
-`FourAecNrRes*` 是 zero-padding-free 介面（單元 `AudioPipeline4Ch*` 建立在它之上），只支援：
+`Mcab` 是 zero-padding-free 的 flow 層，只支援：
 
 | 取樣率 | frame | FFT | hop | bins | 資源拓撲 |
 |---|---:|---:|---:|---:|---|
-| 16 kHz | 256 | 256 | 128 | 129 | 1 shared matcher + 4 linear AEC（後接 1 post-beam RES + 1 NR：核心與單元都由應用自己建）（預設） |
+| 16 kHz | 256 | 256 | 128 | 129 | 1 shared matcher + 4 linear AEC lane（皆由應用建立；後接 1 post-beam RES + 1 NR，也由應用自己建）（預設） |
 | 16 kHz | 512 | 512 | 256 | 257 | 同上（可選） |
 | 48 kHz | 1024 | 1024 | 512 | 513 | 同上（唯一合法 48 kHz 格點） |
 
-呼叫端先用 `four_aec_front_process()` 取得借用的 `FourAecFront`
-（四路 linear 頻譜與時域 hop），交由外部 SRP-PHAT／beamformer 更新 channel-major
-`Complex[4][n_freqs]` 有效權重，再呼叫 `four_aec_fuse()` 取得 `SeSpecFrame`。
+mcab 不配置、不以 destroy 代替 reset、也不釋放任何 lane 或 estimator：應用先以 `mcab_lane_config()`（balanced preset 加 flow 契約；
+自己組 `AecConfig` 時改用 `mcab_apply_lane_contract()` 蓋上契約欄位）建立四條 `Aec`，MATCHED 時再以
+`mcab_delay_estimator_config()` 查得參數建立一個 `DelayAec`，用 `McabLibs` 交給 `mcab_init_ex()`。交進去的 lane 與 estimator 必須是新建或已 reset 的。
+
+呼叫端先用 `mcab_process_front()` 取得借用的 `McabFront`
+（四路 linear 頻譜 `linear_spectra[4]`、`formed_hop[4]` 與對齊後的 `aligned_ref`），交由外部 SRP-PHAT／beamformer 更新 channel-major
+`Complex[4][n_freqs]` 有效權重，再呼叫 `mcab_fuse(p, weights, beamformed_error, &frame)` 取得 `McabFrame`。
 模組不實作 beamformer，但會以該組權重一致地投影 error／near／echo／R2 context；
 之後由應用明寫串接一次 RES 增益、一次 NR 增益、`sk_min_f32`、`sk_capply_gain_f32`、
-CNG 與 iFFT/OLA（`4aec_nr_res_static.c` 的 `post_hop()` 是範例；單元的 `fuse()` 也不算 RES 增益，`frame.g_res_ctx` 為 NULL，要用 `se_res_stage_gain()` 呼叫你自己的 `AecRes`）。
+CNG 與 iFFT/OLA（`mcab_external_static.c` 的 `post_hop()` 是範例；`mcab_fuse()` 也不算 RES 增益，`frame.g_res_ctx` 為 NULL，要用 `mcab_sample_res_input()` 加 `aec_res_process()` 呼叫你自己的 `AecRes`）。
 
-`FourAecNrRes*` core 本身不實作 beamformer；若要接入現有的第三方
-SRP-PHAT/GSC，就用這個核心加自己的 beamformer（`four_aec_front_process()` → 你的 BF → `four_aec_fuse()`）；
-不想自備 beamformer，改用線性 AEC + BF 單元 `AudioPipeline4Ch*`（內建 SRP-PHAT 與 BF；不含 RES／NR／合成）。單元的 AEC、DOA、BF，
-以及你串的 RES 與 NR 都繼承同一個格點，`frame == FFT`、`hop == frame/2`，不能分別
-指定互相矛盾的 frame/hop/FFT。`audio_pipeline_4ch_hop_size()`／`_doa_hop_size()`／`_bf_hop_size()`
-等 accessors 可分別查詢 main、DOA 與 BF 實際格點；預設三組設定中三者必須一致。
+`Mcab` 本身不實作 beamformer；若要接入現有的第三方
+SRP-PHAT/BF，就用 `mcab_process_front()` → 你的 BF → `mcab_fuse()`；
+不想自備 beamformer，可用 sample 層 helper `mcab_sample_beam_*`（內建 SRP-PHAT 與 BF；不在 archive 內，不含 RES／NR／合成）。
+helper 以 flow 的格點建立 SRP-PHAT 與 BF（`mcab_sample_beam_init()` 檢查 flow 的 hop／bin／sample rate 與 cfg 一致），你串的 RES 與 NR 也繼承同一個格點，
+`frame == FFT`、`hop == frame/2`，不能分別指定互相矛盾的 frame/hop/FFT；`mcab_hop_size()`／`mcab_fft_size()`／`mcab_n_freqs()`
+可查詢實際格點。
 
-目前只允許一個 in-flight front frame（下一次 `four_aec_front_process()` 會使上一幀的視圖失效）。建立方式與 mono 的 `Aec` 一致（heap 便利路徑與 caller-owned pool 兩種）：
+目前只允許一個 in-flight front frame（下一次 `mcab_process_front()` 會使上一幀的視圖失效）。建立方式與 mono 的 `Aec` 一致（heap 便利路徑與 caller-owned pool 兩種）：
 
-- `four_aec_nr_res_create()`：desktop／測試用 heap convenience；
-- `four_aec_nr_res_get_mem_requirements()` →
+- `mcab_create()`：desktop／測試用 heap convenience，只配置 mcab 自己的 pool；
+- `mcab_get_mem_requirements()` →
   caller 配置 16-byte aligned pool →
-  `four_aec_nr_res_init_ex()`：board/static 路徑；
-- 兩種建立方式共用完全相同的 `four_aec_front_process()`／`four_aec_fuse()` 核心，
-  process 不配置記憶體，16／48 kHz 皆有 byte-identical parity test。
+  `mcab_init_ex()`：board/static 路徑；
+- 兩種建立方式共用完全相同的 `mcab_process_front()`／`mcab_fuse()` 處理碼，
+  process 不配置記憶體；`pipelines/4ch_aec_bf_nr_res/tests/test_mcab.c` 以 16 kHz/256、16 kHz/512、48 kHz/1024 驗證 pool 放置不改變輸出。
 
-`four_aec_nr_res_destroy()` 對 static handle 不釋放 caller 的 pool；caller
-應在 destroy 後自行交還平台 memory manager。可直接對照
-`pipelines/mono_aec_nr_res/static_main.c` 與
-`pipelines/4ch_aec_bf_nr_res/4aec_nr_res_static.c` 的
+`mcab_destroy()` 不碰 lane 與 estimator，對 caller-pool handle 也不釋放 caller 的 pool（`mcab_create()` 的 handle 則釋放自己的區塊，只呼叫一次）；
+caller 應在 destroy 後自行拆除 lane（`aec_destroy()`）並交還平台 memory manager。可直接對照
+`pipelines/mono_aec_nr_res/main.c` 與
+`pipelines/4ch_aec_bf_nr_res/mcab_external_static.c` 的
 query → allocate → init → process → destroy → release 順序。完整 contract、
 權重 convention 與 parity 限制見
 [`../pipelines/4ch_aec_bf_nr_res/README.md`](../pipelines/4ch_aec_bf_nr_res/README.md)。
@@ -105,7 +108,7 @@ mic/ref
 2. `R²` 除以 `32768²` 後，作為 NR 的 `extra_noise_psd`，得到 echo-aware `G_nr`。
 3. `G_nr` 與 AEC3 `G_res` 逐 bin 取較小值，不重複跑另一個時域 RES。
 4. `g_total` 直接取 `min(G_nr, G_res)`。post 段沒有 near-end floor，也沒有任何依賴廣帶能量的 lift；一個 bin 是否被保留，完全由 NR 自己的 speech-presence 模型與 AEC3 的 `G_res` 決定，所以環境噪聲大也不會把 NR 壓住或讓噪聲底跟著遠端起伏。
-5. CNG 只依 `G_res` 決定填哪些 bin（AEC 抑制留下的頻譜空洞），注入位準再乘該 bin 的 `G_nr`（下限 −10 dB，`SE_CNG_NR_GAIN_FLOOR`）：NR 看不到 comfort noise，所以它的 gain 在這裡補套，讓補進去的噪聲落在降噪後的底噪，而不是未降噪的環境噪聲。
+5. CNG 只依 `G_res` 決定填哪些 bin（AEC 抑制留下的頻譜空洞），注入位準再乘該 bin 的 `G_nr`（下限 −10 dB，範例的 `CNG_NR_GAIN_FLOOR`）：NR 看不到 comfort noise，所以它的 gain 在這裡補套，讓補進去的噪聲落在降噪後的底噪，而不是未降噪的環境噪聲。
 
 ## 3. 取得 submodule 與建置
 
@@ -126,11 +129,11 @@ git submodule update --init --recursive
 
 ```bash
 # 從 Audio_ALG 根目錄執行；mono 與 4ch 的 producer 完全分離
-make -C pipelines            # mono heap/static 範例 + DFN2 stage archive
+make -C pipelines            # mono split/static 範例（aec_nr_pipeline、aec_nr_pipeline_static）、mono ULCNet／DFN2 範例 + DFN2 stage archive
 make -C pipelines BACKEND=ne10   # NE10 FFT 後端（obj/ 依 backend+參數雜湊分開目錄，免手動 clean-libs）
 make -C pipelines/4ch_aec_bf_nr_res BACKEND=ne10 SIMD=1
-make -C pipelines/4ch_aec_bf_nr_res 4aec_nr_res_static
-make -C pipelines/4ch_aec_bf_nr_res audio_pipeline_4ch_raw
+make -C pipelines/4ch_aec_bf_nr_res mcab_external_static
+make -C pipelines/4ch_aec_bf_nr_res mcab_raw
 make -C pipelines/4ch_aec_bf_nr_res test
 ```
 
@@ -197,14 +200,18 @@ BIN="$(make -s -C pipelines print-bin-dir)"
 | `--debug` | flag | off | 每秒一行 AEC+NR 狀態（read-only，不影響輸出） |
 | `--timing` | flag | off | 結束時印每個階段的平均耗時；AEC 的列需要 `make PROFILE=1` |
 
+`aec_nr_pipeline_static` 另有 `--print-mem-size [aec-preset] [--nr-preset ...] [--aec-only] [--no-nr] [--no-res]
+[--sample-rate <hz>] [--fft-size <n>]`：印出 pool 預算並真的在那塊 pool 上 init 每個 stage 後結束，不讀 WAV；`aec_nr_pipeline` 沒有這個模式。
+
 `delay_mode`／`delay_num_filters`／`fixed_delay_samples`／`filter_length`
-（見 `common/se_config.h` 的 `SeRequest`）**沒有對應 CLI 旗標**；
+（`AecConfig` 的欄位，見 `aec.h`）**沒有對應 CLI 旗標**；
 兩支 CLI（`aec_nr_pipeline`/`aec_nr_pipeline_static`）目前都只能吃
 預設值（`MATCHED`、n=5、−1）。要測試
-非預設 delay mode 得直接寫 C 呼叫 `se_derive()` 與 `aec_get_mem_size()`／`aec_init()`
+非預設 delay mode 得直接寫 C 改 `AecConfig` 後呼叫 `aec_get_mem_size()`／`aec_init()`
 （或改 CLI 原始碼），見 `pipeline_mono.html` API 節。
 
 目前 parser 對未知 positional preset 會退回 balanced，且不會為所有未知 dash option 報錯。產品或自動化腳本應只傳上表列出的值，不要依賴 silent fallback。
+`--fft-size`、`--sample-rate` 以 `atoi()` 轉換、不嚴格檢查（`12x` 當成 12）；DFN2／ULCNet 範例與 `mcab_raw` 走 `common/example_cli.h` 的嚴格解析，非法數字 exit 2（見 [`pipelines/README.md`](../pipelines/README.md)）。
 
 ### 4.2 Debug context dump
 
@@ -220,7 +227,7 @@ DUMP_CTX=pipeline_ctx.bin \
 ### 4.3 WAV contract
 
 - mic/ref 必須能被 submodule 的 `wav_io.h` 讀取，並具有相同 sample rate。
-- 支援 PCM16、PCM32、IEEE float32；多聲道只讀第一聲道。
+- 只接受 PCM16 與 IEEE float32（1 到 8 聲道；多聲道只讀第一聲道）；其他格式（例如 PCM32 整數）無法開啟，CLI 以 `Error: cannot open inputs` 結束。
 - 處理長度取 mic/ref 中較短者。
 - 每次處理所選 signal grid 的一個 hop，最後不足一個 hop 的尾端捨棄。
 - pipeline 沒有主動改寫 `AEC_OUT_FLOAT`，因此預設輸出單聲道 PCM16。
@@ -316,15 +323,9 @@ int audio_alg_init(AudioAlgPipeline *p, int sample_rate,
     p->fft_size = p->frame_size;   /* no padding: AEC's grid is frame == FFT */
     p->n_freqs = p->fft_size / 2 + 1;
 
-    /* Use the grid-explicit entry point (as the pipelines/ examples do)
-     * so NR resolves the SAME fft_size the AEC instance above just picked --
-     * the 2-arg anr_config_for_mode() instead resolves NR's OWN
-     * independent per-rate default grid, which is not the AEC default at
-     * every rate (e.g. NR defaults to 128 at 8 kHz, AEC to 256) and would
-     * silently create an NR instance sized for the wrong n_freqs.
-     * L/alpha_d/alpha_attack are already correctly wall-clock-retimed for
-     * this grid by anr_config_for_mode_grid() -- do not override them
-     * with fixed literals authored for a different (10 ms/16 ms) grid. */
+    /* Grid-explicit entry point: NR must resolve the SAME fft_size the AEC just picked
+     * (the 2-arg anr_config_for_mode() uses NR's own per-rate default, e.g. 128 at 8 kHz
+     * where the AEC uses 256). L/alpha_* are already retimed for this grid; do not override. */
     nr_cfg = anr_config_for_mode_grid(sample_rate, p->fft_size, nr_mode);
 
     p->nr = anr_create(&nr_cfg);
@@ -376,7 +377,7 @@ int audio_alg_process(AudioAlgPipeline *p,
     if (!ctx.error_spec || !ctx.res_gain || ctx.n_freqs != p->n_freqs)
         return -1;
 
-    /* 與 production（se_anr_stage_gain）相同：R^2 只在 usable_linear != 0 時摺進降噪器的 noise floor */
+    /* 與範例 main.c 的 mono_nr_gain() 相同：R^2 只在 usable_linear != 0 時摺進降噪器的 noise floor */
     if (ctx.r2 && ctx.usable_linear) {
         for (k = 0; k < p->n_freqs; ++k)
             p->extra[k] = ctx.r2[k] / PSD_SCALE;
@@ -498,11 +499,11 @@ Audio_ALG 的範例程式（`pipelines/mono_aec_nr_res/main.c` 等）直接用 N
 - instance 不可由多個 thread 無同步同時 process。
 - 換獨立串流前 reset AEC、NR、合成 OLA 與 comfort-noise RNG（四件一起，見 [mono 手冊 §3](integration_mono_zh_TW_02_lifecycle_config_errors.md#3-lifecycle)）；或直接 destroy/create。
 - create 失敗時必須釋放已成功建立的子模組與 buffer。
-- malloc reference path（`aec_nr_pipeline`）在初始化時用 `posix_memalign()` 配置各函式庫的區塊；process loop 本身不配置記憶體。
+- split-pool reference path（`aec_nr_pipeline`）在初始化時用 `posix_memalign()` 配置兩塊（AEC 一塊、降噪器／合成／暫存一塊）；process loop 本身不配置記憶體。
 - 單一 caller-owned pool 的 static-memory 版本已完整支援：`aec_nr_pipeline_static` 各自查大小、各自 init
   （`aec_get_mem_size`/`aec_init`、`anr_get_mem_size`/`anr_init`、`ac_istft_get_mem_size`/`ac_istft_init`），
   從一塊 16-byte 對齊的 pool 依序切出全部記憶體，init 後零 malloc；`pipelines/mono_aec_nr_res/tests/test_mono_chain.c` 以逐位元比對兩支 CLI 與手寫 oracle
-  （pooled 與 heap 的輸出因此相等，範圍為該測試涵蓋的選項組合）。
+  （單一 pool 與 split 版的輸出因此相等，範圍為該測試涵蓋的選項組合）。
   NR 與 AEC 的 heap 與 static API 並存於同一份 `.a`（runtime 選擇）。
 
 ## 9. Troubleshooting
@@ -517,6 +518,6 @@ Audio_ALG 的範例程式（`pipelines/mono_aec_nr_res/main.c` 等）直接用 N
 | 輸出有洞或不自然靜音 | CNG 關閉或 gain 過深 | A/B 比較有無 `--no-cng`；CNG 只填 `G_res` 切掉的 bin，位準乘該 bin 的 NR gain（下限 −10 dB） |
 | 不同檔案結果互相影響 | state 未 reset | 每個獨立 stream reset 或重建全部 instance |
 | 尾端樣本變短 | CLI 只處理完整 hop | 上層先 padding，並在輸出後裁回原長度 |
-| 想用現成的 mono 整合寫法 | — | 見 `pipelines/mono_aec_nr_res/main.c`／`static_main.c` + `pipelines/README_02_build_debug_board.md`「Board Integration」；本手冊第 5 節的 wrapper 是直接組合 AEC／NR 的範例 |
+| 想用現成的 mono 整合寫法 | — | 見 `pipelines/mono_aec_nr_res/main.c` + `pipelines/README_02_build_debug_board.md`「Board Integration」；本手冊第 5 節的 wrapper 是直接組合 AEC／NR 的範例 |
 
 定位問題時建議依序比較：`--aec-only`、完整 production、`--no-cng`、`--legacy-amin`，再用 `DUMP_CTX` 檢查 `E(f)`、`G_res`、`R²` 與 `G_nr`。

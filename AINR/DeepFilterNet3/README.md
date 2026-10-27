@@ -30,7 +30,7 @@ when the existing noisy/clean corpus already satisfies the 48 kHz contract.
 | Sampling rate | 48 kHz | 48 kHz |
 | FFT / window / hop | 1024 / 1024 / 512 | 1024 / 1024 / 512 |
 | ERB bands / DF bins / taps | 32 / 96 / 5 | 32 / 96 / 5 |
-| Mask / DF lookahead | 1 / 1 | 1 / 1 |
+| Mask / DF lookahead (shipped) | 1 / 1 | 1 / 1 |
 | Lookahead delay | 2 hops, 21.33 ms | 1 hop, 10.67 ms |
 | Identity audio delay, including WOLA | 3 hops, 32 ms | 2 hops, 21.33 ms |
 | Accelerator heads | mask, coefs, alpha | mask, coefs |
@@ -41,6 +41,28 @@ streaming warm-up, unit ERB mask and a unit current-frame DF tap. It excludes
 accelerator execution, external queues and resampling. Whole-clip Python
 inference uses centered STFT at clip boundaries; its boundary framing is not
 the streaming C timing reference.
+
+## Lookahead pairs
+
+`mask_lookahead` (M, 0..2) and `df_lookahead` (D, 0..4, i.e. below `df_order`)
+are independent and part of the trained contract (`config.ini [model]`; a
+checkpoint is refused under another pair). All 15 pairs export and run; (1,1)
+is the shipped one. The shared rules (window, build flags, guards, tests) are in
+[`../README.md`](../README.md#lookahead-pairs-deepfilternet2-and-deepfilternet3).
+Specific to DFN3:
+
+- DFN3 is a parallel split: the deep filter reads the raw spectrum, so output
+  frame `t` needs the heads of `t` (input up to `t+M`) and the spectrum up to
+  `t+D`. The output is `max(M, D)` frames behind the input and the end-to-end
+  latency is `1 + max(M, D)` hops. The first M hops only fill the window (no
+  accelerator run); with `D > M` the next `D - M` hops run the accelerator and
+  emit nothing, and the heads wait in the ring until their output frame.
+- The ring holds `DF_ORDER + max(M, D) - D` frames (`DFN3_DF_RING`): `HISTORY`
+  before the delayed frame, `max(M, D)` after it, and the frame itself (five for
+  the shipped pair, up to seven for `D = 0, M = 2`). The state struct, the pool
+  size and the pool hash follow the pair.
+- `dfn3_compose()` (aligned reference) pairs a spectrum with the heads passed
+  in the same call; the accelerator path is `dfn3_compose_stream()`.
 
 ## Checkpoints
 

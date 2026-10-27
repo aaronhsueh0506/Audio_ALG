@@ -42,11 +42,11 @@ if _AEC_PY not in sys.path:
 import torch  # noqa: E402
 
 from lib.aec.python.aec import AecConfig, AecMode, AecPreset  # noqa: E402
-from pipelines.aec_dfn2_res_pipeline import make_stage, run_dfn2_res  # noqa: E402
-from pipelines.aec_nr_pipeline import (  # noqa: E402
+from pipelines.dfn.mono_aec_dfn_res.pipeline import make_stage, run_dfn2_res  # noqa: E402
+from pipelines.mono_aec_nr_res.pipeline import (  # noqa: E402
     _project_grid, run_aec_linear, run_nr_spectrum, run_res,
 )
-from pipelines.dfn2_stage import load_dfn2  # noqa: E402
+from pipelines.dfn.dfn2_stage import load_dfn2  # noqa: E402
 
 VARIANTS = ('mmse', 'dfn2_bb', 'dfn2_ab', 'dfn2_ab_maskonly', 'dfn2_mic')
 SR_NATIVE = 16000
@@ -165,7 +165,7 @@ def main():
         'atten_lim_db': args.atten_lim, 'cng': args.cng, 'checkpoint': args.checkpoint,
         'cases': len(cases), 'sr_host': SR_NATIVE, 'sr_dfn': 48000,
         'sr_scoring': SR_NATIVE, 'no_prealign': True,
-        'dfn_rate_bridge': 'pipelines/dfn_rate_bridge.c twin',
+        'dfn_rate_bridge': 'pipelines/dfn/dfn_rate_bridge.c twin',
     }
     with open(os.path.join(args.output_dir, 'run.json'), 'w') as handle:
         json.dump(run_info, handle, indent=2)

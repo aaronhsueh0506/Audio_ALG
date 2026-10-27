@@ -3,7 +3,7 @@
 狀態：設計與實作對照。單幀 ONNX boundary（`AIAEC/Align_ULCNet/export_onnx.py`）、
 CPU external-state helper（`ulcnet_model_io.c/h`、`ulcnet_accelerator_adapter.c/h`）、
 C STFT/WOLA（`ulcnet_process.c/h`）與 delay 狀態機／fail-open 邏輯（[§8](align_ulcnet_embedded_streaming_design_zh_TW_01_state_wola_delay.md#8-delay-狀態機與-fallback)）都已實作，
-並接入 `pipelines/mono_alignulcnet/` 與 `pipelines/4ch_alignulcnet/` 兩個 ULCNet
+並接入 `pipelines/ulcnet/mono_alignulcnet/` 與 `pipelines/ulcnet/4ch_alignulcnet/` 兩個 ULCNet
 pipeline。state 邊界是 layout 18（`ULCNET_MODEL_IO_LAYOUT_VERSION`）：四個 rank-4
 state 以完整 window 進出，每個 `*_out` 就地綁定到同名輸入的位址（[§10.2](align_ulcnet_embedded_streaming_design_zh_TW_02_npu_boundary_validation.md#102-onnx-inputoutput-contract)）。
 
@@ -167,11 +167,11 @@ analysis 降頻。預設 `delay_est_period_s = 0` 不降頻。
    windowed-ERLE duty watchdog 與 `delay_acquire_protect_converged` 讀
    `last_erle_windowed`，它不論 `enable_res` 都會更新，且不進訊號路徑；
    warm tap-transfer gate 讀的 inst-ERLE ring 無條件每 hop 填充。
-3. **4ch 核心的 `delay_backward_quarantine_enabled` / `_s`**（`FourAecNrResConfig`，預設 OFF；lib/aec 的 `AecConfig`
+3. **4ch flow 的 `delay_backward_quarantine_enabled` / `_s`**（`McabConfig`，預設 OFF；lib/aec 的 `AecConfig`
    沒有這個欄位，mono 的 `Aec` 也沒有這個機制）是 `delay_acquire_protect_converged` 的 Path-B 姊妹機制，針對**已鎖定後被
    pre-echo 誤鎖搶走**。只隔離比現行 delay **更早**的共用估計，且有時間上限——到期就採用，所以是
    「延後一個窗」而不是「治癒誤鎖」。判別式是 `aec_linear_is_cancelling()`（同時看 windowed 與 inst-ERLE 兩個讀數）；
-   核心只問 `capture_proxy_channel` 那一條 lane（餵給共用 estimator 的那支 mic）。4ch 產品組態維持預設 OFF；欄位語意見 `docs/integration_4ch_core_zh_TW.md` 與 `4aec_nr_res.h`。
+   核心只問 `capture_proxy_channel` 那一條 lane（餵給共用 estimator 的那支 mic）。4ch 產品組態維持預設 OFF；欄位語意見 `docs/integration_4ch_core_zh_TW.md` 與 `mcab.h`。
 
 watchdog leak 依各 grid 的 hop 時間重定時，使衰減固定為 0.1 dB/s；C/Python
 effective-value 與 mutation 測試鎖住此契約。

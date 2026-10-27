@@ -64,8 +64,8 @@ The conventional 4-channel path remains:
 ```text
 one shared delay matcher
     → four linear adaptive filters
-    → SRP-PHAT + BF (inside the AudioPipeline4Ch unit, or an externally owned
-      beamformer on the FourAecNrRes core)
+    → SRP-PHAT + BF (the sample beam helper `mcab_sample_beam_*`, or the
+      application's own beamformer between `mcab_process_front()` and `mcab_fuse()`)
     → one post-beam RES, one mono NR path (separate libraries chained by the integrator)
 ```
 
