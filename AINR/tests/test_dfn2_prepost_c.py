@@ -323,9 +323,22 @@ static int make_framing(FftHandle *fft, AcStft **stft, AcIstft **istft) {
     return *istft ? 0 : -1;
 }
 
+/* The caller-owned synthesis object of DFN2_IO_TIME: audiolib's AcIstft built
+ * from dfn2_framing_config(), over the shared FFT handle and its own window. */
+static AcIstft *make_istft(FftHandle *fft, const float *window) {
+    AcStftConfig cfg;
+    size_t bytes;
+    void *mem;
+    dfn2_framing_config(&cfg, fft, window);
+    bytes = ac_istft_get_mem_size(&cfg);
+    mem = alloc_aligned(16u, bytes);
+    return mem ? ac_istft_init(mem, bytes, &cfg) : NULL;
+}
+
 static void config_time(DFN2PrepostConfig *cfg, FftHandle *fft) {
     (void)dfn2_prepost_config_defaults(cfg, DFN2_IO_TIME);
     cfg->fft = fft;
+    cfg->istft = make_istft(fft, NULL);
     cfg->erb_fwd = &erb_fwd[0][0];
     cfg->erb_inv = &erb_inv[0][0];
 }
@@ -607,28 +620,23 @@ static int case_freqpool(FftHandle *fft) {
            (unsigned long long)req_freq.bytes);
 
     /* The two modes differ in exactly these regions: IO_TIME carves the
-     * output hop staging and the two framing objects (the analysis object
-     * with its own window table, the synthesis object borrowing it; both
-     * share the caller's FFT handle), IO_FREQ carves the dual entry point's
-     * second staging pair instead.  The framing sizes come from audiolib
-     * with a real window table for the borrowing object, independent of the
-     * sizing path under test.  Pin the difference to the byte so a region
-     * silently added to one mode fails here. */
+     * output hop staging and the analysis object (with its own window table,
+     * sharing the caller's FFT handle), IO_FREQ carves the dual entry point's
+     * second staging pair instead.  The synthesis object is the caller's in
+     * both modes and is not in the pool.  The analysis size comes from
+     * audiolib, independent of the sizing path under test.  Pin the
+     * difference to the byte so a region silently added to one mode fails
+     * here. */
     {
-        static float real_window[DFN2_WIN_LEN];
         AcStftConfig sc;
-        size_t stft_bytes, istft_bytes;
-        ac_window_build(real_window, DFN2_WIN_LEN);
+        size_t stft_bytes;
         dfn2_framing_config(&sc, fft, NULL);
         stft_bytes = ac_stft_get_mem_size(&sc);
-        dfn2_framing_config(&sc, fft, real_window);
-        istft_bytes = ac_istft_get_mem_size(&sc);
-        CHECK(stft_bytes != 0 && istft_bytes != 0);
+        CHECK(stft_bytes != 0);
         CHECK(req_freq.bytes ==
               req_time.bytes -
                   ck_align16_size((size_t)DFN2_HOP_LEN * sizeof(float)) -
-                  ck_align16_size(stft_bytes) -
-                  ck_align16_size(istft_bytes) +
+                  ck_align16_size(stft_bytes) +
                   2u * ck_align16_size((size_t)DFN2_N_BINS * sizeof(float)));
     }
     CHECK(req_time.io_mode == (uint32_t)DFN2_IO_TIME);
@@ -823,7 +831,7 @@ static int case_dual_guards(FftHandle *fft) {
     DFN2Prepost *pt, *pf;
     void *pool_t, *pool_f;
 
-    CHECK(DFN2_PREPOST_CARVE_VERSION == 7u);
+    CHECK(DFN2_PREPOST_CARVE_VERSION == 8u);
 
     config_time(&cfg_time, fft);
     config_freq(&cfg_freq);
@@ -1149,6 +1157,8 @@ static int case_lifecycle(FftHandle *fft) {
     bad.erb_inv = &erb_inv[0][0];
     CHECK(dfn2_prepost_create(&bad) == NULL);      /* TIME without fft     */
     bad.fft = fft;
+    CHECK(dfn2_prepost_create(&bad) == NULL);      /* TIME without istft   */
+    bad.istft = make_istft(fft, NULL);
     bad.erb_fwd = NULL;
     CHECK(dfn2_prepost_create(&bad) == NULL);      /* erb_fwd missing      */
     bad.erb_fwd = &erb_fwd[0][0];
@@ -1246,6 +1256,66 @@ static int case_reject(FftHandle *fft) {
     CHECK(dfn2_prepost_get_mem_size(&cfg, &req) == -1);
     CHECK(memcmp(&req, &guard, sizeof req) == 0);
     CHECK(dfn2_prepost_init(NULL, 0, &cfg) == NULL);
+
+    /* DFN2_IO_TIME takes the caller's synthesis object and refuses one that is
+     * not the model's: missing, the other overlap-add mode, another synthesis
+     * scale, another FFT size (all at sizing), or another window table (at
+     * init, where the analysis window is known). */
+    {
+        AcStftConfig sc;
+        void *mem;
+        size_t bytes;
+        AcIstft *other;
+        static float hann_window[DFN2_WIN_LEN];
+        int i;
+
+        config_time(&cfg, fft);
+        cfg.istft = NULL;
+        req = guard;
+        CHECK(dfn2_prepost_get_mem_size(&cfg, &req) == -1);
+        CHECK(memcmp(&req, &guard, sizeof req) == 0);
+        CHECK(dfn2_prepost_create(&cfg) == NULL);
+
+        dfn2_framing_config(&sc, fft, NULL);
+        sc.ola = AC_OLA_ENV_NORM;                         /* wrong mode  */
+        bytes = ac_istft_get_mem_size(&sc);
+        mem = alloc_aligned(16u, bytes);
+        CHECK(mem != NULL && (other = ac_istft_init(mem, bytes, &sc)) != NULL);
+        config_time(&cfg, fft);
+        cfg.istft = other;
+        CHECK(dfn2_prepost_get_mem_size(&cfg, &req) == -1);
+
+        dfn2_framing_config(&sc, fft, NULL);
+        sc.ispec_scale = 1.0f;                            /* wrong scale */
+        bytes = ac_istft_get_mem_size(&sc);
+        mem = alloc_aligned(16u, bytes);
+        CHECK(mem != NULL && (other = ac_istft_init(mem, bytes, &sc)) != NULL);
+        cfg.istft = other;
+        CHECK(dfn2_prepost_get_mem_size(&cfg, &req) == -1);
+
+        dfn2_framing_config(&sc, NULL, NULL);             /* wrong size  */
+        sc.fft_size = DFN2_N_FFT / 2;
+        bytes = ac_istft_get_mem_size(&sc);
+        mem = alloc_aligned(16u, bytes);
+        CHECK(mem != NULL && (other = ac_istft_init(mem, bytes, &sc)) != NULL);
+        cfg.istft = other;
+        CHECK(dfn2_prepost_get_mem_size(&cfg, &req) == -1);
+
+        /* A window that is not the analysis window passes sizing and is
+         * refused at init; the same object with the matching table is not. */
+        for (i = 0; i < DFN2_WIN_LEN; ++i)
+            hann_window[i] = 0.5f - 0.5f * cosf(6.2831853f * (float)i /
+                                                 (float)DFN2_WIN_LEN);
+        config_time(&cfg, fft);
+        cfg.istft = make_istft(fft, hann_window);
+        CHECK(dfn2_prepost_get_mem_size(&cfg, &req) == 0);
+        pool = alloc_aligned(req.alignment, (size_t)req.bytes);
+        CHECK(pool != NULL);
+        CHECK(dfn2_prepost_init(pool, (size_t)req.bytes, &cfg) == NULL);
+        config_time(&cfg, fft);
+        CHECK(dfn2_prepost_init(pool, (size_t)req.bytes, &cfg) != NULL);
+        free(pool);
+    }
 
     /* DFN2_IO_FREQ ignores the transform entirely -- NULL is legal there. */
     config_freq(&cfg);

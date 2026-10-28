@@ -83,6 +83,7 @@ CCM 頻譜 ring、16 個 state buffer）。它組合 <code>aiaec_process.c</code
 <pre>DeepVqePrepostConfig cfg;  DeepVqePrepostMemReq req;
 deepvqe_prepost_config_defaults(&amp;cfg, DEEPVQE_IO_TIME, /*D=*/DEEPVQE_PREPOST_DEFAULT_D);
 cfg.fft = fft;  cfg.window = window;      /* caller-owned 借用；本類別不建也不毀 */
+cfg.istft = istft;   /* TIME 必填：應用端用 deepvqe_framing_config(&amp;sc, fft, window) + ac_istft_init() 建的 AcIstft */
 deepvqe_prepost_get_mem_size(&amp;cfg, &amp;req);
 DeepVqePrepost *p = deepvqe_prepost_init_ex(pool, req.bytes, &amp;cfg, &amp;req);  /* 或 _init / _create */
 每 hop：
@@ -95,9 +96,10 @@ DeepVqePrepost *p = deepvqe_prepost_init_ex(pool, req.bytes, &amp;cfg, &amp;req)
 邊界查詢：_state_name(id) / _state_name_out(id) / _state_shape(id, D, dims) / _state_elements(id, D)
         / _descriptor_default(D, &amp;desc) / _descriptor_validate(&amp;desc) / _skip_policy_name()</pre>
 <p><b>一 hop 進、一次推論、一 hop 出</b>——從 hop #0 起、兩種模式都成立。<code>io_mode</code> 在
-init 固定（它決定 pool 大小）：<code>DEEPVQE_IO_TIME</code> hop 進 hop 出，framing／加窗／
-overlap-add 由類別做、但呼叫的是 <b>caller 的 <code>FftHandle</code> 與 window 表</b>；
-<code>DEEPVQE_IO_FREQ</code> 頻譜進頻譜出、不做任何 transform，<code>fft</code>/<code>window</code>
+init 固定（它決定 pool 大小）：<code>DEEPVQE_IO_TIME</code> hop 進 hop 出，分析 framing 由類別做、
+呼叫的是 <b>caller 的 <code>FftHandle</code> 與 window 表</b>，合成是<b>應用端持有的 <code>AcIstft</code></b>（<code>cfg.istft</code>，borrowed，
+<code>frame_commit</code> 對它 push、<code>reset</code> 一併清它）；
+<code>DEEPVQE_IO_FREQ</code> 頻譜進頻譜出、不做任何 transform（合成由應用端自己呼叫 <code>ac_istft_push_planar</code>），<code>fft</code>/<code>window</code>/<code>istft</code>
 可為 NULL，是<b>串接</b>用的模式。<code>pre_process</code> 的兩路必須是<b>同一個輸入 hop</b>：
 類別不做任何內部 skew，模型自己的 alignment attention 只在那之上再搜 D 幀。</p>
 <div class="note"><b><code>frame_skip</code> 是 fail-CLOSED：輸出靜音</b>
@@ -119,17 +121,17 @@ runtime 把 <code>*_out</code> 綁到輸入位址（<code>state_out[id]</code> �
 <p><b>state generation</b>：<code>deepvqe_prepost_state_generation()</code> 是 C 端清零 state 的次數：
 <code>reset</code> 與被拒絕的 <code>frame_commit</code> 各加一，新建實例為 0，成功的 commit、skip 與再次呼叫被拒的 commit 都不動它。
 定點 accelerator 的 state 緩衝在 C 清零時不會跟著變，板端 sample 比較這個值，變了就用量化後的 0 重填 16 個 state 輸入。</p>
-<p><b>Framing</b>：<code>AcStft</code> 的 <code>center</code> 0（<code>deepvqe_prepost.c</code> 在 AIAEC 16 kHz／512 格點自建，
-分析兩個、合成 <code>AC_OLA_ENV_NORM</code> 一個，借用呼叫端的 FFT handle 與視窗表）＝center=False rolling 分析，
+<p><b>Framing</b>：<code>AcStft</code> 的 <code>center</code> 0（<code>deepvqe_framing_config()</code> 描述 AIAEC 16 kHz／512 格點：
+分析兩個在 pool 內、借用呼叫端的 FFT handle 與視窗表；合成 <code>AC_OLA_ENV_NORM</code> 一個，是應用端的 <code>AcIstft</code>）＝center=False rolling 分析，
 <b>第一次 push 起每次恰一幀</b>。它與 <code>center</code> 1（centered）對同一個 hop
 吐出的<b>最後一幀位元相同</b>（同一個幾何：win = n_fft、hop = n_fft/2、共用同一張 sqrt-Hann 表；
 centered 只是在開頭多發一幀 reflect 前綴），所以這是<b>換標籤不是換訊號</b>，也讓類別和
 center=False 的 AEC seam 與 4ch 的 <code>mcab_fuse()</code> 融合頻譜對得上。<b>演算法延遲仍是 1 個 hop</b>：它來自 synthesis 的
 半窗 trim，不是分析排程。</p>
 <p><b>Pool</b>（<code>deepvqe_prepost_get_mem_size</code>，16 kHz、D=32）：
-<code>DEEPVQE_IO_TIME</code> <b>637,072 B</b>、<code>DEEPVQE_IO_FREQ</code> <b>615,280 B</b>
-（差額 21,792 B ＝ 兩路 rolling 分析歷史＋共用 transform scratch＋一個 synthesis＋輸出 hop
-staging）。16 個 state 張量佔掉絕大部分。</p>
+<code>DEEPVQE_IO_TIME</code> <b>628,784 B</b>、<code>DEEPVQE_IO_FREQ</code> <b>615,280 B</b>
+（差額 13,504 B ＝ 兩路 rolling 分析歷史＋共用 transform scratch＋輸出 hop
+staging；合成的 <code>AcIstft</code>〔8,288 B〕是應用端的物件，不在 pool 內）。16 個 state 張量佔掉絕大部分。</p>
 
 <h2>Block diagram</h2>
 <pre>mic ──► StreamSTFT ──► [B,1,257] cplx      far ──► StreamSTFT ──► [B,1,257] cplx
@@ -279,7 +281,7 @@ kernel 路徑。</li>
 <li><code>AIAEC/DeepVQE_S/model.py</code>（<code>DeepVQES</code>、<code>_apply_ccm_frame</code>、<code>_StreamFreqUpsampleCell</code>、<code>_StreamResidualCell</code>）</li>
 <li><code>AIAEC/aiaec_common.py</code>（<code>FrameDelayAttention</code>、<code>apply_causal_tf_filter</code>、<code>three_vector_complex</code>）</li>
 <li><code>AIAEC/DeepVQE_S/inference.py</code>、<code>export_onnx.py</code>、<code>train.py</code>、<code>config.ini</code></li>
-<li><code>AIAEC/DeepVQE_S/deepvqe_prepost.c / .h</code>（pre/post 類別）、<code>deepvqe_process.c / .h</code>（CCM ring + <code>deepvqe_ccm_process</code>）、<code>AIAEC/aiaec_process.c / .h</code>（16 kHz 邊界常數與複數 mask helper；framing 由 audiolib 的 <code>AcStft</code>／<code>AcIstft</code> 提供，<code>deepvqe_prepost.c</code> 自建）；<code>AIAEC/Makefile</code> 把它們收進 <code>libaiaec_prepost.a</code>（<code>make -C AIAEC print-lib-path</code>）</li>
+<li><code>AIAEC/DeepVQE_S/deepvqe_prepost.c / .h</code>（pre/post 類別；<code>deepvqe_framing_config()</code> 描述框架設定）、<code>deepvqe_process.c / .h</code>（CCM ring + <code>deepvqe_ccm_process</code>）、<code>AIAEC/aiaec_process.c / .h</code>（16 kHz 邊界常數與複數 mask helper；framing 由 audiolib 的 <code>AcStft</code>／<code>AcIstft</code> 提供，分析在 <code>deepvqe_prepost.c</code> 的 pool 內，合成由應用端建）；<code>AIAEC/Makefile</code> 把它們收進 <code>libaiaec_prepost.a</code>（<code>make -C AIAEC print-lib-path</code>）</li>
 <li>tests：<code>AIAEC/tests/test_streaming_deepvqe_s.py</code>、<code>test_candidate_models.py</code>、<code>test_deepvqe_prepost_c.py</code>（20 個測試函式：對 hand-composed 路徑 memcmp、TIME/FREQ 一致、陳舊 pool 閘與 carve 版本、skip 靜音並保留加速器寫的 state、凍結 ring、就地 state 且最新一幀非有限寫入歸零、較舊幀不被檢查、state generation、狀態機守衛、state 名稱／rank-4 形狀／descriptor 驗證、layout version 與 C header 對表、descriptor 與實際 graph 相符、export metadata 真的帶著 descriptor）；<code>test_onnx_state_contract_names.py</code>、<code>test_stream_conv_cell.py</code>、<code>test_export_stateless.py</code> 涵蓋匯出端的同位址 state 合約；全樹請執行 <code>python3 -m pytest AIAEC</code>。</li>
 <li>匯出／calibration：<code>AIAEC/DeepVQE_S/export_onnx.py</code>、<code>AIAEC/DeepVQE_S/inference.py calib</code>（BIN/NPZ calibration 放在 <code>AIAEC/DeepVQE_S/calib/</code>；calib 會同 process 一併匯出並 parity-check 對應 graph（預設 <code>&lt;output&gt;.onnx</code>，<code>--onnx</code> 可改））。</li>
 <li>docs：<code>docs/aiaec_streaming_readiness_zh_TW.md</code> §3.3</li>

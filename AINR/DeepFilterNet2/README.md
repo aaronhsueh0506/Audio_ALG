@@ -73,8 +73,11 @@ N-th hop in a build for N frames per call, see
 spectra at the `DFN2_IO_FREQ` boundary are torch.stft normalized=True on this
 48 kHz/1024 grid, so chaining an AIAEC spectrum in is a 32x scale error (the
 header's warning block); the window is borrowed (a `cfg.window` of NULL
-makes the pool carve the sqrt-Hann table once for the analysis and
-synthesis objects); and the two recurrent state
+makes the pool carve the sqrt-Hann table for the analysis object); in
+`DFN2_IO_TIME` the synthesis is the application's audiolib `AcIstft`, built
+from `dfn2_framing_config()` and handed in as `cfg.istft` (the class pushes
+into it and resets it with its own state; with `DFN2_IO_FREQ` the caller
+pushes the spectrum from `post_process_freq` itself); and the two recurrent state
 tensors (`h_gru`, `df_convp_history`) live in the pool at addresses that never
 change. The runtime binds each state output (`gru_hidden_next`,
 `df_convp_window_next`) to the same address as its input, so the output of one

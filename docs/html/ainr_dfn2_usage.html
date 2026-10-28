@@ -60,8 +60,8 @@ th{background:#eef1f5}
 <h2>如何呼叫使用</h2>
 <ol>
 <li><b>準備借用物件</b>：<code>FftHandle</code>（<code>fft_init</code> 於 <code>DFN2_N_FFT</code> = 1024 點，<code>fft_get_mem_size(1024)</code> = 26,352 bytes，本機量測；TIME 模式必填，FREQ 可為 NULL）；<code>erb_fwd.bin</code>／<code>erb_inv.bin</code> 由呼叫端載入成 float 陣列（<code>export_erb_matrix.py --runtime-bins</code> 產生，各 513×32 個 float32 = 65,664 bytes；函式庫從不讀檔，也不複製）。</li>
-<li><code>dfn2_prepost_config_defaults(&amp;cfg, io_mode)</code> 後填 <code>fft</code>／<code>erb_fwd</code>／<code>erb_inv</code>（<code>window</code> 出貨留 NULL）。</li>
-<li><code>dfn2_prepost_get_mem_size(&amp;cfg, &amp;req)</code>：<code>req.bytes</code> 是整個 pool，<code>req.alignment</code> = 16；<code>DFN2_IO_TIME</code> 246,320 bytes、<code>DFN2_IO_FREQ</code> 219,536 bytes（本機量測）。板端把 pool 放進靜態 arena，host 工具可改用 <code>dfn2_prepost_create(&amp;cfg)</code>／<code>_destroy()</code>。</li>
+<li><code>dfn2_prepost_config_defaults(&amp;cfg, io_mode)</code> 後填 <code>fft</code>／<code>istft</code>／<code>erb_fwd</code>／<code>erb_inv</code>（<code>window</code> 出貨留 NULL；<code>istft</code> 是應用端用 <code>dfn2_framing_config()</code> 與 <code>ac_istft_init()</code> 建的 <code>AcIstft</code>，<code>DFN2_IO_TIME</code> 必填，類別在 <code>frame_commit</code> push、<code>reset</code> 時清它；<code>DFN2_IO_FREQ</code> 則由應用端自己對 <code>post_process_freq</code> 的頻譜呼叫 <code>ac_istft_push_planar</code>）。</li>
+<li><code>dfn2_prepost_get_mem_size(&amp;cfg, &amp;req)</code>：<code>req.bytes</code> 是整個 pool，<code>req.alignment</code> = 16；<code>DFN2_IO_TIME</code> 233,936 bytes、<code>DFN2_IO_FREQ</code> 219,536 bytes（本機量測；皆不含應用端的 <code>AcIstft</code>）。板端把 pool 放進靜態 arena，host 工具可改用 <code>dfn2_prepost_create(&amp;cfg)</code>／<code>_destroy()</code>。</li>
 <li><code>dfn2_prepost_init_ex(pool, req.bytes, &amp;cfg, &amp;req)</code>：起始即 reset，<code>state_generation</code> = 1。傳入查詢時的 <code>req</code> 可擋下「別的 build／io_mode 查出來的陳舊 pool 大小」。</li>
 <li>加速器那份定點 state 在啟動時填成量化後的 0；之後每次 <code>state_generation</code> 變了就重填（見時序圖）。</li>
 <li>每個 hop：<code>pre_process</code> → （回 1 才）<code>frame_inputs</code> → 加速器 → <code>frame_commit</code>（或 <code>frame_skip</code>）→ <code>post_process</code>。</li>
@@ -77,7 +77,7 @@ extern void npu_fill_state_with_quantized_zero(void);
 
 /* erb_fwd / erb_inv: 呼叫端從 export_erb_matrix.py --runtime-bins 產生的 .bin 載入 (函式庫不讀檔)。
  * fft: fft_init(..., DFN2_N_FFT) 建好的 handle。回 0 成功, -1 失敗。 */
-int run_dfn2(FftHandle *fft, const float *erb_fwd, const float *erb_inv,
+int run_dfn2(FftHandle *fft, AcIstft *istft, const float *erb_fwd, const float *erb_inv,
              const float *in, float *out, long hops)
 {
     DFN2PrepostConfig cfg;
@@ -85,7 +85,8 @@ int run_dfn2(FftHandle *fft, const float *erb_fwd, const float *erb_inv,
     int rc = 0;
 
     if (dfn2_prepost_config_defaults(&amp;cfg, DFN2_IO_TIME) != 0) return -1;
-    cfg.fft = fft;  cfg.erb_fwd = erb_fwd;  cfg.erb_inv = erb_inv;
+    cfg.fft = fft;  cfg.istft = istft;                 /* istft: dfn2_framing_config(&amp;sc, fft, NULL) + ac_istft_init()，應用端持有 */
+    cfg.erb_fwd = erb_fwd;  cfg.erb_inv = erb_inv;
     cfg.atten_lim_db = 0.0f;                           /* 0 = 不限制衰減量 */
     if (dfn2_prepost_get_mem_size(&amp;cfg, &amp;req) != 0) return -1;
 
@@ -201,8 +202,9 @@ caller                         DFN2Prepost (C)                     NPU runtime
 <h3>外部：第三方可調（公開 API，有範圍檢查）</h3>
 <div class="tbl"><table>
 <tr><th>名稱</th><th>位置</th><th>型別／範圍</th><th>預設</th><th>何時設定</th><th>說明</th></tr>
-<tr><td><code>io_mode</code></td><td><code>DFN2PrepostConfig</code></td><td><code>DFN2_IO_TIME</code>(1)／<code>DFN2_IO_FREQ</code>(0)</td><td><code>config_defaults</code> 的第二個參數</td><td>init 前，之後固定</td><td>決定 pool 大小（TIME 246,320／FREQ 219,536 bytes）與可呼叫的 pre／post 函式</td></tr>
+<tr><td><code>io_mode</code></td><td><code>DFN2PrepostConfig</code></td><td><code>DFN2_IO_TIME</code>(1)／<code>DFN2_IO_FREQ</code>(0)</td><td><code>config_defaults</code> 的第二個參數</td><td>init 前，之後固定</td><td>決定 pool 大小（TIME 233,936／FREQ 219,536 bytes）與可呼叫的 pre／post 函式</td></tr>
 <tr><td><code>fft</code></td><td>同上</td><td><code>FftHandle*</code>，<code>fft_get_n_freqs</code> = 513</td><td>NULL</td><td>init 前</td><td>TIME 必填（borrowed，不由本物件建立或銷毀）；FREQ 可為 NULL</td></tr>
+<tr><td><code>istft</code></td><td>同上</td><td><code>AcIstft*</code>，由 <code>dfn2_framing_config()</code> 描述的物件</td><td>NULL</td><td>init 前</td><td>TIME 必填（borrowed，記憶體歸應用端）；fft 大小、overlap-add 模式、合成尺度或窗表內容與分析不符時 get_mem_size／init 回失敗；FREQ 忽略</td></tr>
 <tr><td><code>window</code></td><td>同上</td><td><code>const float*</code>，<code>DFN2_WIN_LEN</code>(1024) 個值</td><td>NULL</td><td>init 前</td><td>NULL＝pool 內自帶 sqrt-Hann；出貨路徑一律留 NULL；非 NULL 須與物件同壽命且不變</td></tr>
 <tr><td><code>erb_fwd</code>／<code>erb_inv</code></td><td>同上</td><td><code>const float*</code>；fwd bin-major [513][32]、inv band-major [32][513]</td><td>NULL（必填，兩種模式）</td><td>init 前；執行期用 <code>set_erb_matrices</code></td><td>borrowed；<code>erb_inv</code> 須是 partition of unity（skip identity 依賴此性質）；就地改寫內容後須再呼叫 <code>set_erb_matrices</code></td></tr>
 <tr><td><code>atten_lim_db</code></td><td>同上；<code>set_atten_lim</code></td><td>有限 float；以 |dB| 計</td><td>0（關閉）</td><td>init 前，或 hop 之間</td><td>輸出 = noisy×lim + enhanced×(1−lim)，lim = 10^(−|dB|/20)，在最後的複數頻譜上混合；非有限值被拒（-1）</td></tr>
@@ -229,7 +231,7 @@ caller                         DFN2Prepost (C)                     NPU runtime
 <tr><td><code>DFN2_FEATURE_VERSION</code></td><td><code>dfn2_libdf_wnorm_upstream_init_no_eps_v5</code></td><td><code>dfn2_process.h</code></td><td>checkpoint 與前端的共同契約</td></tr>
 <tr><td><code>DFN2_MODEL_IO_LAYOUT_VERSION</code></td><td>8</td><td><code>dfn2_model_io.h</code></td><td>graph 邊界版號；與 <code>export_onnx.py</code> 互鎖，4–7 已退役不可重用</td></tr>
 <tr><td><code>DFN2_MODEL_INPUT_FRAMES</code>／<code>_GRU_ROWS</code>／<code>_GRU_ROW_*</code>／<code>_GRU_HIDDEN</code>／<code>_ENCODER_CHANNELS</code>／<code>_DF_PATHWAY_WINDOW</code></td><td>3／5／0,1,3／256／64／5</td><td><code>dfn2_model_io.h</code></td><td>graph 輸入／state 形狀；<code>DFN2ModelIoDescriptor</code> 逐欄位檢查</td></tr>
-<tr><td><code>DFN2_PREPOST_CARVE_VERSION</code>／<code>_DESCRIPTOR_VERSION</code>／<code>_ALIGNMENT</code></td><td>7／1／16</td><td><code>dfn2_prepost.h</code></td><td>pool 切分順序與 32-byte descriptor 的版本；進 <code>build_flags_hash</code>，由 <code>init_ex</code> 把關</td></tr>
+<tr><td><code>DFN2_PREPOST_CARVE_VERSION</code>／<code>_DESCRIPTOR_VERSION</code>／<code>_ALIGNMENT</code></td><td>8／1／16</td><td><code>dfn2_prepost.h</code></td><td>pool 切分順序與 32-byte descriptor 的版本；進 <code>build_flags_hash</code>，由 <code>init_ex</code> 把關</td></tr>
 <tr><td>cascade 合成（全頻 mask → 低頻 5-tap FIR → alpha 混合）</td><td>固定算式</td><td><code>dfn2_process.c</code></td><td>parameter-free 地重現 <code>model.py compose()</code>；改動等於換模型</td></tr>
 <tr><td>訓練端 <code>config.ini</code> 的 <code>[signal]</code>／<code>[model]</code>／<code>[feature]</code></td><td>見 <code>DeepFilterNet2/config.ini</code></td><td>Python</td><td>寫進 checkpoint contract，<code>inference.py</code>／<code>train.py --resume</code> 逐項比對，不一致即拒絕載入</td></tr>
 </table></div>

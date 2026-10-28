@@ -197,10 +197,7 @@ static float window[AIAEC_N_FFT];
 static AcIstft *make_synthesis(FftHandle *fft) {
     AcStftConfig sc;
     size_t bytes;
-    ac_stft_config_default(&sc, AIAEC_N_FFT);
-    sc.ola = AC_OLA_ENV_NORM;
-    sc.fft = fft;
-    sc.window = window;
+    deepvqe_framing_config(&sc, fft, window);
     bytes = ac_istft_get_mem_size(&sc);
     return bytes ? ac_istft_init(alloc_aligned(16u, bytes), bytes, &sc) : NULL;
 }
@@ -453,6 +450,7 @@ static int case_equiv(FftHandle *fft) {
     CHECK(deepvqe_prepost_config_defaults(&cfg, DEEPVQE_IO_TIME, D) == 0);
     cfg.fft = fft;
     cfg.window = window;
+    cfg.istft = make_synthesis(fft);
     CHECK(deepvqe_prepost_get_mem_size(&cfg, &req) == 0);
     pool = alloc_aligned(req.alignment, (size_t)req.bytes);
     CHECK(pool != NULL);
@@ -493,6 +491,7 @@ static int case_freq(FftHandle *fft) {
     CHECK(deepvqe_prepost_config_defaults(&cfg_time, DEEPVQE_IO_TIME, D) == 0);
     cfg_time.fft = fft;
     cfg_time.window = window;
+    cfg_time.istft = make_synthesis(fft);
     CHECK(deepvqe_prepost_config_defaults(&cfg_freq, DEEPVQE_IO_FREQ, D) == 0);
     CHECK(deepvqe_prepost_get_mem_size(&cfg_time, &req_time) == 0);
     CHECK(deepvqe_prepost_get_mem_size(&cfg_freq, &req_freq) == 0);
@@ -569,15 +568,18 @@ static int case_freqpool(FftHandle *fft) {
     CHECK(deepvqe_prepost_config_defaults(&cfg_time, DEEPVQE_IO_TIME, D) == 0);
     cfg_time.fft = fft;
     cfg_time.window = window;
+    cfg_time.istft = make_synthesis(fft);
     CHECK(deepvqe_prepost_config_defaults(&cfg_freq, DEEPVQE_IO_FREQ, D) == 0);
     CHECK(deepvqe_prepost_config_defaults(&cfg_deep, DEEPVQE_IO_TIME,
                                           2 * D) == 0);
     cfg_deep.fft = fft;
     cfg_deep.window = window;
+    cfg_deep.istft = make_synthesis(fft);
     CHECK(deepvqe_prepost_config_defaults(&cfg_time_default, DEEPVQE_IO_TIME,
                                           DEEPVQE_PREPOST_DEFAULT_D) == 0);
     cfg_time_default.fft = fft;
     cfg_time_default.window = window;
+    cfg_time_default.istft = make_synthesis(fft);
     CHECK(deepvqe_prepost_config_defaults(&cfg_freq_default, DEEPVQE_IO_FREQ,
                                           DEEPVQE_PREPOST_DEFAULT_D) == 0);
     CHECK(deepvqe_prepost_get_mem_size(&cfg_time, &req_time) == 0);
@@ -602,22 +604,19 @@ static int case_freqpool(FftHandle *fft) {
                (double)req_time_default.bytes);
 
     /* IO_FREQ must not pay for the framing machinery it never runs: the
-     * difference is exactly the output hop staging and the three framing
-     * objects, sized here by audiolib with the caller's handle and
-     * window. */
+     * difference is exactly the output hop staging and the two analysis
+     * objects, sized here by audiolib with the caller's handle and window.
+     * The synthesis object is the caller's in both modes, so it is in
+     * neither pool. */
     {
         AcStftConfig sc;
-        size_t a, s;
-        ac_stft_config_default(&sc, AIAEC_N_FFT);
-        sc.ola = AC_OLA_ENV_NORM;
-        sc.fft = fft;
-        sc.window = window;
+        size_t a;
+        deepvqe_framing_config(&sc, fft, window);
         a = ac_stft_get_mem_size(&sc);
-        s = ac_istft_get_mem_size(&sc);
-        CHECK(a != 0 && s != 0);
+        CHECK(a != 0);
 #define A16(x) (((size_t)(x) + 15u) / 16u * 16u)
         CHECK(req_time.bytes - req_freq.bytes ==
-              A16((size_t)AIAEC_HOP * sizeof(float)) + 2u * A16(a) + A16(s));
+              A16((size_t)AIAEC_HOP * sizeof(float)) + 2u * A16(a));
 #undef A16
     }
 
@@ -715,6 +714,7 @@ static int case_lifecycle(FftHandle *fft) {
     CHECK(deepvqe_prepost_config_defaults(&cfg, DEEPVQE_IO_TIME, D) == 0);
     cfg.fft = fft;
     cfg.window = window;
+    cfg.istft = make_synthesis(fft);
 
     heap = deepvqe_prepost_create(&cfg);
     CHECK(heap != NULL);
@@ -789,6 +789,7 @@ static int case_reject(FftHandle *fft) {
     CHECK(deepvqe_prepost_config_defaults(&cfg, DEEPVQE_IO_TIME, D) == 0);
     cfg.fft = fft;
     cfg.window = window;
+    cfg.istft = make_synthesis(fft);
     CHECK(deepvqe_prepost_get_mem_size(&cfg, &req) == 0);
     CHECK(req.bytes > 0u);
 
@@ -812,6 +813,7 @@ static int case_reject(FftHandle *fft) {
     CHECK(deepvqe_prepost_config_defaults(&cfg, DEEPVQE_IO_TIME, D) == 0);
     cfg.fft = fft;
     cfg.window = window;
+    cfg.istft = make_synthesis(fft);
     cfg.delay_depth = DEEPVQE_PREPOST_MIN_D - 1;
     req = guard;
     CHECK(deepvqe_prepost_get_mem_size(&cfg, &req) == -1);
@@ -827,21 +829,68 @@ static int case_reject(FftHandle *fft) {
                                           DEEPVQE_PREPOST_MIN_D) == 0);
     cfg.fft = fft;
     cfg.window = window;
+    cfg.istft = make_synthesis(fft);
     CHECK(deepvqe_prepost_get_mem_size(&cfg, &req) == 0);
     CHECK(deepvqe_prepost_config_defaults(&cfg, DEEPVQE_IO_TIME,
                                           DEEPVQE_PREPOST_MAX_D) == 0);
     cfg.fft = fft;
     cfg.window = window;
+    cfg.istft = make_synthesis(fft);
     CHECK(deepvqe_prepost_get_mem_size(&cfg, &req) == 0);
 
     /* IO_TIME without a usable transform. */
     CHECK(deepvqe_prepost_config_defaults(&cfg, DEEPVQE_IO_TIME, D) == 0);
     cfg.window = window;
+    cfg.istft = make_synthesis(fft);
     cfg.fft = NULL;
     CHECK(deepvqe_prepost_get_mem_size(&cfg, &req) == -1);
     cfg.fft = fft;
     cfg.window = NULL;
     CHECK(deepvqe_prepost_get_mem_size(&cfg, &req) == -1);
+
+    /* IO_TIME takes the caller's synthesis object and refuses one that is not
+     * the model's: missing, the other overlap-add mode, another synthesis
+     * scale, or another window table. */
+    {
+        AcStftConfig sc;
+        static float other_window[AIAEC_N_FFT];
+        AcIstft *other;
+        void *mem;
+        size_t bytes;
+        int i;
+        CHECK(deepvqe_prepost_config_defaults(&cfg, DEEPVQE_IO_TIME, D) == 0);
+        cfg.fft = fft;
+        cfg.window = window;
+        cfg.istft = NULL;
+        CHECK(deepvqe_prepost_get_mem_size(&cfg, &req) == -1);
+        cfg.istft = make_synthesis(fft);
+        CHECK(deepvqe_prepost_get_mem_size(&cfg, &req) == 0);
+
+        deepvqe_framing_config(&sc, fft, window);
+        sc.ola = AC_OLA_ACCUMULATE;
+        bytes = ac_istft_get_mem_size(&sc);
+        mem = alloc_aligned(16u, bytes);
+        CHECK(mem != NULL && (other = ac_istft_init(mem, bytes, &sc)) != NULL);
+        cfg.istft = other;
+        CHECK(deepvqe_prepost_get_mem_size(&cfg, &req) == -1);
+
+        deepvqe_framing_config(&sc, fft, window);
+        sc.ispec_scale = 2.0f;
+        bytes = ac_istft_get_mem_size(&sc);
+        mem = alloc_aligned(16u, bytes);
+        CHECK(mem != NULL && (other = ac_istft_init(mem, bytes, &sc)) != NULL);
+        cfg.istft = other;
+        CHECK(deepvqe_prepost_get_mem_size(&cfg, &req) == -1);
+
+        for (i = 0; i < AIAEC_N_FFT; ++i) other_window[i] = 0.5f * window[i];
+        deepvqe_framing_config(&sc, fft, other_window);
+        bytes = ac_istft_get_mem_size(&sc);
+        mem = alloc_aligned(16u, bytes);
+        CHECK(mem != NULL && (other = ac_istft_init(mem, bytes, &sc)) != NULL);
+        cfg.istft = other;
+        CHECK(deepvqe_prepost_get_mem_size(&cfg, &req) == -1);
+        CHECK(deepvqe_prepost_init(NULL, 0, &cfg) == NULL);
+    }
 
     /* A correctly typed but WRONG-SIZE FftHandle: 129 bins, not 257. */
     wrong_fft = make_fft(AIAEC_N_FFT / 2, &wrong_mem);
@@ -849,6 +898,7 @@ static int case_reject(FftHandle *fft) {
     CHECK(fft_get_n_freqs(wrong_fft) != AIAEC_N_BINS);
     cfg.fft = wrong_fft;
     cfg.window = window;
+    cfg.istft = make_synthesis(fft);
     CHECK(deepvqe_prepost_get_mem_size(&cfg, &req) == -1);
     CHECK(deepvqe_prepost_init(NULL, 0, &cfg) == NULL);
 
@@ -861,6 +911,7 @@ static int case_reject(FftHandle *fft) {
     CHECK(deepvqe_prepost_config_defaults(&cfg, DEEPVQE_IO_TIME, D) == 0);
     cfg.fft = fft;
     cfg.window = window;
+    cfg.istft = make_synthesis(fft);
     CHECK(deepvqe_prepost_get_mem_size(&cfg, &req) == 0);
     pool = alloc_aligned(req.alignment, (size_t)req.bytes + req.alignment);
     CHECK(pool != NULL);
@@ -954,6 +1005,7 @@ static int case_reset(FftHandle *fft) {
     CHECK(deepvqe_prepost_config_defaults(&cfg, DEEPVQE_IO_TIME, D) == 0);
     cfg.fft = fft;
     cfg.window = window;
+    cfg.istft = make_synthesis(fft);
     CHECK(deepvqe_prepost_get_mem_size(&cfg, &req) == 0);
     pool = alloc_aligned(req.alignment, (size_t)req.bytes);
     CHECK(pool != NULL);
@@ -1242,6 +1294,7 @@ static int case_inplace(FftHandle *fft) {
     CHECK(deepvqe_prepost_config_defaults(&cfg_time, DEEPVQE_IO_TIME, D) == 0);
     cfg_time.fft = fft;
     cfg_time.window = window;
+    cfg_time.istft = make_synthesis(fft);
     CHECK(deepvqe_prepost_get_mem_size(&cfg_time, &req_time) == 0);
     pool_time = alloc_aligned(req_time.alignment, (size_t)req_time.bytes);
     CHECK(pool_time != NULL);
@@ -1423,6 +1476,7 @@ static int case_guard(FftHandle *fft) {
     CHECK(deepvqe_prepost_config_defaults(&cfg_time, DEEPVQE_IO_TIME, D) == 0);
     cfg_time.fft = fft;
     cfg_time.window = window;
+    cfg_time.istft = make_synthesis(fft);
     CHECK(deepvqe_prepost_get_mem_size(&cfg_time, &req_time) == 0);
     pool_time = alloc_aligned(req_time.alignment, (size_t)req_time.bytes);
     CHECK(pool_time != NULL);
@@ -2229,7 +2283,7 @@ def test_pool_identity_moved_with_the_full_window_carve(driver):
         carve = int(re.search(
             r'^#define\s+DEEPVQE_PREPOST_CARVE_VERSION\s+(\d+)u',
             stream.read(), re.MULTILINE).group(1))
-    assert (layout, carve) == (4, 5)
+    assert (layout, carve) == (4, 6)
     expected = _fnv1a([16000, 512, layout, carve, 0, 8])
     ptr_bytes = int(re.search(r'ptr_bytes=(\d+)', out).group(1))
     if ptr_bytes == 4:
@@ -2237,3 +2291,4 @@ def test_pool_identity_moved_with_the_full_window_carve(driver):
             expected = ((expected ^ byte) * 16777619) & 0xffffffff
     assert c_hash == expected
     assert c_hash != _fnv1a([16000, 512, 3, 3, 0, 8])
+    assert c_hash != _fnv1a([16000, 512, layout, 5, 0, 8])   # the carve that owned the AcIstft

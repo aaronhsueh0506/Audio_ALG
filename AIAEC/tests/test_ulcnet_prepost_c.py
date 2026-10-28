@@ -317,6 +317,7 @@ static int case_equiv(FftHandle *fft) {
     CHECK(ulcnet_prepost_config_defaults(&cfg, ULCNET_IO_TIME, D) == 0);
     cfg.fft = fft;
     cfg.window = window;
+    cfg.istft = make_synthesis(fft);
     CHECK(ulcnet_prepost_get_mem_size(&cfg, &req) == 0);
     pool = alloc_aligned(req.alignment, (size_t)req.bytes);
     CHECK(pool != NULL);
@@ -355,6 +356,7 @@ static int case_freq(FftHandle *fft) {
     CHECK(ulcnet_prepost_config_defaults(&cfg_time, ULCNET_IO_TIME, D) == 0);
     cfg_time.fft = fft;
     cfg_time.window = window;
+    cfg_time.istft = make_synthesis(fft);
     CHECK(ulcnet_prepost_config_defaults(&cfg_freq, ULCNET_IO_FREQ, D) == 0);
     CHECK(ulcnet_prepost_get_mem_size(&cfg_time, &req_time) == 0);
     CHECK(ulcnet_prepost_get_mem_size(&cfg_freq, &req_freq) == 0);
@@ -427,10 +429,12 @@ static int case_freqpool(FftHandle *fft) {
     CHECK(ulcnet_prepost_config_defaults(&cfg_time, ULCNET_IO_TIME, D) == 0);
     cfg_time.fft = fft;
     cfg_time.window = window;
+    cfg_time.istft = make_synthesis(fft);
     CHECK(ulcnet_prepost_config_defaults(&cfg_freq, ULCNET_IO_FREQ, D) == 0);
     CHECK(ulcnet_prepost_config_defaults(&cfg_deep, ULCNET_IO_TIME, 2 * D) == 0);
     cfg_deep.fft = fft;
     cfg_deep.window = window;
+    cfg_deep.istft = make_synthesis(fft);
     CHECK(ulcnet_prepost_get_mem_size(&cfg_time, &req_time) == 0);
     CHECK(ulcnet_prepost_get_mem_size(&cfg_freq, &req_freq) == 0);
     CHECK(ulcnet_prepost_get_mem_size(&cfg_deep, &req_deep) == 0);
@@ -443,20 +447,20 @@ static int case_freqpool(FftHandle *fft) {
                (double)req_time.bytes);
 
     /* IO_FREQ must not pay for the framing machinery it never runs: the
-     * difference is exactly the output hop staging and the three framing
-     * objects, sized here by audiolib with the caller's handle and
-     * window. */
+     * difference is exactly the output hop staging and the two analysis
+     * objects, sized here by audiolib with the caller's handle and window.
+     * The synthesis object is the caller's in both modes, so it is in
+     * neither pool. */
     CHECK(req_freq.bytes < req_time.bytes);
     {
         AcStftConfig sc;
-        size_t a, s;
+        size_t a;
         ulcnet_framing_config(&sc, fft, window, 0);
         a = ac_stft_get_mem_size(&sc);
-        s = ac_istft_get_mem_size(&sc);
-        CHECK(a != 0 && s != 0);
+        CHECK(a != 0);
 #define A16(x) (((size_t)(x) + 15u) / 16u * 16u)
         CHECK(req_time.bytes - req_freq.bytes ==
-              A16((size_t)ULCNET_HOP * sizeof(float)) + 2u * A16(a) + A16(s));
+              A16((size_t)ULCNET_HOP * sizeof(float)) + 2u * A16(a));
 #undef A16
     }
     CHECK(req_freq.io_mode == (uint32_t)ULCNET_IO_FREQ);
@@ -527,6 +531,7 @@ static int case_lifecycle(FftHandle *fft) {
     CHECK(ulcnet_prepost_config_defaults(&cfg, ULCNET_IO_TIME, D) == 0);
     cfg.fft = fft;
     cfg.window = window;
+    cfg.istft = make_synthesis(fft);
 
     heap = ulcnet_prepost_create(&cfg);
     CHECK(heap != NULL);
@@ -593,6 +598,7 @@ static int case_reject(FftHandle *fft) {
     CHECK(ulcnet_prepost_config_defaults(&cfg, ULCNET_IO_TIME, D) == 0);
     cfg.fft = fft;
     cfg.window = window;
+    cfg.istft = make_synthesis(fft);
     CHECK(ulcnet_prepost_get_mem_size(&cfg, &req) == 0);
     CHECK(req.bytes > 0u);
 
@@ -627,21 +633,68 @@ static int case_reject(FftHandle *fft) {
                                          ULCNET_MODEL_IO_MIN_D) == 0);
     cfg.fft = fft;
     cfg.window = window;
+    cfg.istft = make_synthesis(fft);
     CHECK(ulcnet_prepost_get_mem_size(&cfg, &req) == 0);
     CHECK(ulcnet_prepost_config_defaults(&cfg, ULCNET_IO_TIME,
                                          ULCNET_MODEL_IO_MAX_D) == 0);
     cfg.fft = fft;
     cfg.window = window;
+    cfg.istft = make_synthesis(fft);
     CHECK(ulcnet_prepost_get_mem_size(&cfg, &req) == 0);
 
     /* IO_TIME without a usable transform. */
     CHECK(ulcnet_prepost_config_defaults(&cfg, ULCNET_IO_TIME, D) == 0);
     cfg.window = window;
+    cfg.istft = make_synthesis(fft);
     cfg.fft = NULL;
     CHECK(ulcnet_prepost_get_mem_size(&cfg, &req) == -1);
     cfg.fft = fft;
     cfg.window = NULL;
     CHECK(ulcnet_prepost_get_mem_size(&cfg, &req) == -1);
+
+    /* IO_TIME takes the caller's synthesis object and refuses one that is not
+     * the model's: missing, the other overlap-add mode, another synthesis
+     * scale, or another window table. */
+    {
+        AcStftConfig sc;
+        static float other_window[ULCNET_N_FFT];
+        AcIstft *other;
+        void *mem;
+        size_t bytes;
+        int i;
+        CHECK(ulcnet_prepost_config_defaults(&cfg, ULCNET_IO_TIME, D) == 0);
+        cfg.fft = fft;
+        cfg.window = window;
+        cfg.istft = NULL;
+        CHECK(ulcnet_prepost_get_mem_size(&cfg, &req) == -1);
+        cfg.istft = make_synthesis(fft);
+        CHECK(ulcnet_prepost_get_mem_size(&cfg, &req) == 0);
+
+        ulcnet_framing_config(&sc, fft, window, 0);
+        sc.ola = AC_OLA_ACCUMULATE;
+        bytes = ac_istft_get_mem_size(&sc);
+        mem = alloc_aligned(16u, bytes);
+        CHECK(mem != NULL && (other = ac_istft_init(mem, bytes, &sc)) != NULL);
+        cfg.istft = other;
+        CHECK(ulcnet_prepost_get_mem_size(&cfg, &req) == -1);
+
+        ulcnet_framing_config(&sc, fft, window, 0);
+        sc.ispec_scale = 2.0f;
+        bytes = ac_istft_get_mem_size(&sc);
+        mem = alloc_aligned(16u, bytes);
+        CHECK(mem != NULL && (other = ac_istft_init(mem, bytes, &sc)) != NULL);
+        cfg.istft = other;
+        CHECK(ulcnet_prepost_get_mem_size(&cfg, &req) == -1);
+
+        for (i = 0; i < ULCNET_N_FFT; ++i) other_window[i] = 0.5f * window[i];
+        ulcnet_framing_config(&sc, fft, other_window, 0);
+        bytes = ac_istft_get_mem_size(&sc);
+        mem = alloc_aligned(16u, bytes);
+        CHECK(mem != NULL && (other = ac_istft_init(mem, bytes, &sc)) != NULL);
+        cfg.istft = other;
+        CHECK(ulcnet_prepost_get_mem_size(&cfg, &req) == -1);
+        CHECK(ulcnet_prepost_init(NULL, 0, &cfg) == NULL);
+    }
 
     /* A correctly typed but WRONG-SIZE FftHandle: 129 bins, not 257. */
     wrong_fft = make_fft(ULCNET_N_FFT / 2, &wrong_mem);
@@ -649,6 +702,7 @@ static int case_reject(FftHandle *fft) {
     CHECK(fft_get_n_freqs(wrong_fft) != ULCNET_BINS);
     cfg.fft = wrong_fft;
     cfg.window = window;
+    cfg.istft = make_synthesis(fft);
     CHECK(ulcnet_prepost_get_mem_size(&cfg, &req) == -1);
     CHECK(ulcnet_prepost_init(NULL, 0, &cfg) == NULL);
 
@@ -661,6 +715,7 @@ static int case_reject(FftHandle *fft) {
     CHECK(ulcnet_prepost_config_defaults(&cfg, ULCNET_IO_TIME, D) == 0);
     cfg.fft = fft;
     cfg.window = window;
+    cfg.istft = make_synthesis(fft);
     CHECK(ulcnet_prepost_get_mem_size(&cfg, &req) == 0);
     pool = alloc_aligned(req.alignment, (size_t)req.bytes + req.alignment);
     CHECK(pool != NULL);
@@ -714,6 +769,7 @@ static int case_reset(FftHandle *fft) {
     CHECK(ulcnet_prepost_config_defaults(&cfg, ULCNET_IO_TIME, D) == 0);
     cfg.fft = fft;
     cfg.window = window;
+    cfg.istft = make_synthesis(fft);
     CHECK(ulcnet_prepost_get_mem_size(&cfg, &req) == 0);
     pool = alloc_aligned(req.alignment, (size_t)req.bytes);
     CHECK(pool != NULL);
@@ -908,6 +964,7 @@ static int case_guard(FftHandle *fft) {
     CHECK(ulcnet_prepost_config_defaults(&cfg, ULCNET_IO_TIME, D) == 0);
     cfg.fft = fft;
     cfg.window = window;
+    cfg.istft = make_synthesis(fft);
     CHECK(ulcnet_prepost_get_mem_size(&cfg, &req) == 0);
     pool = alloc_aligned(req.alignment, (size_t)req.bytes);
     CHECK(pool != NULL);
@@ -1025,6 +1082,7 @@ static int case_layout(FftHandle *fft) {
     CHECK(ulcnet_prepost_config_defaults(&cfg, ULCNET_IO_TIME, D) == 0);
     cfg.fft = fft;
     cfg.window = window;
+    cfg.istft = make_synthesis(fft);
     CHECK(cfg.model_layout_version == 0u);
     CHECK(ulcnet_prepost_get_mem_size(&cfg, &base) == 0);
     CHECK(base.layout_version == ULCNET_MODEL_IO_LAYOUT_VERSION);
@@ -1247,7 +1305,7 @@ def test_pool_identity_moved_with_the_full_window_carve(driver):
         carve = int(re.search(
             r'^#define\s+ULCNET_PREPOST_CARVE_VERSION\s+(\d+)u',
             stream.read(), re.MULTILINE).group(1))
-    assert carve == 6
+    assert carve == 7
     # io_mode FREQ == 0, D == 8, grid 16000 / 512 (this driver's build).
     expected = _fnv1a([16000, 512, layout, carve, 0, 8])
     ptr_bytes = int(re.search(r'ptr_bytes=(\d+)', out).group(1))
@@ -1257,3 +1315,4 @@ def test_pool_identity_moved_with_the_full_window_carve(driver):
     previous = _fnv1a([16000, 512, 16, 4, 0, 8])
     assert c_hash == expected
     assert c_hash != previous
+    assert c_hash != _fnv1a([16000, 512, layout, 6, 0, 8])   # the carve that owned the AcIstft

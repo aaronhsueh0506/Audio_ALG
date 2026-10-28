@@ -11,7 +11,23 @@
  * rolling window (AcStft, center 0), one frame per hop. The primary input is the
  * raw microphone with no canceller in front, so frame_skip() fails closed
  * (silence, not pass-through; deepvqe_prepost_skip_policy_name()). Grid: 16 kHz /
- * 512 / 256 only. The FftHandle and window are caller-owned (DEEPVQE_IO_TIME). */
+ * 512 / 256 only. The FftHandle, window and synthesis AcIstft are caller-owned
+ * (DEEPVQE_IO_TIME).
+ *
+ * Inverse FFT and overlap-add are audiolib's AcIstft, never this class's. Two ways
+ * to chain it:
+ *
+ *     // DEEPVQE_IO_TIME: hand the class the caller's AcIstft; commit pushes into it.
+ *     AcStftConfig sc;  deepvqe_framing_config(&sc, fft, window);
+ *     AcIstft *istft = ac_istft_init(mem, ac_istft_get_mem_size(&sc), &sc);
+ *     cfg.istft = istft;                       // ... deepvqe_prepost_init(...)
+ *     deepvqe_prepost_post_process(p, out_hop, &written);   // hop out
+ *
+ *     // DEEPVQE_IO_FREQ: spectrum out, the caller pushes its own AcIstft.
+ *     deepvqe_prepost_post_process_freq(p, re, im);
+ *     ac_istft_push_planar(istft, re, im, out_hop);
+ *
+ * The class resets a borrowed AcIstft together with its own state. */
 
 #ifndef DEEPVQE_PREPOST_H
 #define DEEPVQE_PREPOST_H
@@ -36,7 +52,7 @@ extern "C" {
 #define DEEPVQE_COMPRESSION_EXP 0.3f
 #define DEEPVQE_PREPOST_ALIGNMENT      16u
 /* Folded into build_flags_hash; bumped on any change of pool size, carve order or descriptor. */
-#define DEEPVQE_PREPOST_CARVE_VERSION  5u
+#define DEEPVQE_PREPOST_CARVE_VERSION  6u
 
 /* Alignment search depth D (exporter max_delay_frames); sizes the attention rings. 32 = 0.5 s. */
 #define DEEPVQE_PREPOST_MIN_D      1
@@ -90,11 +106,12 @@ typedef enum DeepVqeStateId {
 #define DEEPVQE_STATE_MAX_RANK 4
 
 /* Which side of the transform the caller works on; fixed at init because it
- * decides the pool size (DEEPVQE_IO_TIME also carves framing states). */
+ * decides the pool size (DEEPVQE_IO_TIME also carves the analysis states). */
 typedef enum DeepVqeIoMode {
     /* Spectrum in, spectrum out; fft/window may be NULL. */
     DEEPVQE_IO_FREQ = 0,
-    /* Hop in, hop out; the class frames, windows and overlap-adds via the caller's FftHandle. */
+    /* Hop in, hop out; the class frames the analysis via the caller's FftHandle and
+     * synthesises through the caller's AcIstft. */
     DEEPVQE_IO_TIME = 1
 } DeepVqeIoMode;
 
@@ -103,6 +120,7 @@ typedef struct DeepVqePrepostConfig {
     int          delay_depth;  /* D; DEEPVQE_PREPOST_MIN/MAX_D              */
     FftHandle   *fft;          /* DEEPVQE_IO_TIME: required, borrowed       */
     const float *window;       /* DEEPVQE_IO_TIME: required, borrowed; AIAEC_N_FFT entries from ac_window_build() */
+    AcIstft     *istft;        /* DEEPVQE_IO_TIME: required, borrowed, built from deepvqe_framing_config() over the same window; ignored in DEEPVQE_IO_FREQ */
 } DeepVqePrepostConfig;
 
 /* The compiled model ABI, for validating a graph's ONNX/JSON metadata. */
@@ -200,8 +218,18 @@ int deepvqe_prepost_descriptor_default(int delay_depth,
 int deepvqe_prepost_descriptor_validate(
     const DeepVqePrepostDescriptor *descriptor);
 
+/* Config of the model's framing objects, for ac_stft/ac_istft get_mem_size and init:
+ * 512-point sqrt-Hann, hop 256, rolling analysis (center 0), envelope-normalised
+ * synthesis, no spectrum scaling. `fft` is an AIAEC_N_FFT handle and `window` an
+ * AIAEC_N_FFT sqrt-Hann table (ac_window_build), each borrowed, or NULL for the
+ * object to carve its own. The synthesis object built from it is what
+ * DeepVqePrepostConfig.istft takes. */
+void deepvqe_framing_config(AcStftConfig *cfg, FftHandle *fft,
+                            const float *window);
+
 /* Exact pool size. Returns -1 (req untouched) on NULL, unknown io_mode, D out of
- * range, or DEEPVQE_IO_TIME without fft/window. */
+ * range, or DEEPVQE_IO_TIME without fft/window/istft (the AcIstft must match
+ * deepvqe_framing_config()). */
 int deepvqe_prepost_get_mem_size(const DeepVqePrepostConfig *cfg,
                                  DeepVqePrepostMemReq *req);
 
@@ -221,7 +249,8 @@ DeepVqePrepost *deepvqe_prepost_create(const DeepVqePrepostConfig *cfg);
 /* Frees only what _create allocated; NULL-safe, a no-op on an _init instance. */
 void deepvqe_prepost_destroy(DeepVqePrepost *p);
 
-/* Zero every state tensor and the CCM ring, drop any open frame, reset framing. */
+/* Zero every state tensor and the CCM ring, drop any open frame, reset framing
+ * (a borrowed AcIstft included). */
 void deepvqe_prepost_reset(DeepVqePrepost *p);
 
 /* Counter of state restarts (reset, or frame_commit refusing a frame); 0 for NULL.

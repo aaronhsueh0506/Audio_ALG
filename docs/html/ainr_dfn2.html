@@ -106,11 +106,12 @@ for (each hop of 512 new samples) {
 <pre>DFN2PrepostConfig cfg;                            /* dfn2_prepost.h */
 dfn2_prepost_config_defaults(&amp;cfg, DFN2_IO_TIME);
 cfg.fft = caller_fft;    /* TIME 必填,borrowed */   cfg.window = NULL;  /* NULL = pool 內自帶 sqrt-Hann; 非 NULL = 借用 */
+cfg.istft = caller_istft; /* TIME 必填,borrowed:應用端用 dfn2_framing_config() 建的 AcIstft,類別只 push 與 reset */
 cfg.erb_fwd = erb_fwd;   /* 兩個模式都必填 */        cfg.erb_inv = erb_inv;
 cfg.atten_lim_db = 0.0f; /* 0 = 關閉 */
 
 DFN2PrepostMemReq req;
-dfn2_prepost_get_mem_size(&amp;cfg, &amp;req);        /* DFN2_IO_TIME: 246,320 bytes */
+dfn2_prepost_get_mem_size(&amp;cfg, &amp;req);        /* DFN2_IO_TIME: 233,936 bytes */
 DFN2Prepost *p = dfn2_prepost_init_ex(pool, req.bytes, &amp;cfg, &amp;expected);
 unsigned seen = 0;                                    /* 上次看到的 state generation */
 
@@ -182,7 +183,7 @@ ERB 特徵又是 EMA 正規化的,mask 仍看起來合理,只有輸出電平是�
 只作用在餵給正規化器的那份拷貝,從不碰 masking/ISTFT 路徑上的頻譜。</p>
 
 <h3>記憶體、callback 邊界與建置</h3>
-<p>pool 大小(出貨 pair:<code>DFN2_IO_TIME</code> 246,320 bytes、<code>DFN2_IO_FREQ</code> 219,536 bytes)與所有權規則、<code>DFN2PrepostMemReq</code>、<code>DFN2_PREPOST_CARVE_VERSION</code>、ERB 非零範圍、<code>DFN2Model</code> callback 與 <code>DFN2ModelIoDescriptor</code>、建置,收在 <a href="ainr_dfn2_detail.html">ainr_dfn2_detail</a>。</p>
+<p>pool 大小(出貨 pair:<code>DFN2_IO_TIME</code> 233,936 bytes、<code>DFN2_IO_FREQ</code> 219,536 bytes;合成的 <code>AcIstft</code> 是應用端的物件,不在 pool 內)與所有權規則、<code>DFN2PrepostMemReq</code>、<code>DFN2_PREPOST_CARVE_VERSION</code>、ERB 非零範圍、<code>DFN2Model</code> callback 與 <code>DFN2ModelIoDescriptor</code>、建置,收在 <a href="ainr_dfn2_detail.html">ainr_dfn2_detail</a>。</p>
 <p class="note"><b>延遲:類別不改變模型自己的 M+D hop lookahead。</b>出貨 pair 1/1 的 identity 路徑(unit mask、alpha 0)實測輸出落後輸入
 <b>3 hops = 1536 samples = 32.0 ms @48 kHz</b>(WOLA 1 hop + 模型 2 hops);見下「延遲與 warm-up」。</p>
 

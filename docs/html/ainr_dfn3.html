@@ -30,7 +30,7 @@ dfn3_prepost_post_process_freq(p, out_re, out_im, &amp;valid);</pre>
        low bins 0..95: DF(raw spectra)
        high bins 96..512: raw target * ERB gain
   -> attenuation limit -> output spectrum
-  -> TIME only: audiolib AcIstft -> one hop</pre>
+  -> TIME only: the application's audiolib AcIstft (cfg.istft) -> one hop</pre>
 <h2>訊號泳道圖</h2>
 <pre>current input frame     0             1                2
 host feature window     [0,0,F0]       [0,F0,F1]        [F0,F1,F2]
@@ -42,7 +42,7 @@ TIME synthesis          silence       first WOLA hop    next WOLA hop</pre>
 <table><tr><th>方向</th><th>名稱</th><th>Shape</th></tr><tr><td>input</td><td>erb</td><td>[1,1,3,32]</td></tr><tr><td>input</td><td>spec</td><td>[1,2,3,96]</td></tr><tr><td>input / output</td><td>h_gru / h_gru_out</td><td>[1,5,1,256]</td></tr><tr><td>input / output</td><td>df_convp_history / df_convp_history_out</td><td>[1,64,5,96]</td></tr><tr><td>output</td><td>erb_mask</td><td>[1,1,1,32]</td></tr><tr><td>output</td><td>df_coefs</td><td>[1,1,96,10]；bin/tap/re-im</td></tr></table>
 <h2>State 表</h2>
 <table><tr><th>跨 hop 狀態</th><th>Shape / 大小</th><th>保存者</th></tr><tr><td>GRU hidden</td><td>1280 floats = 5120 bytes</td><td>host pool；graph input/output 同位址</td></tr><tr><td>DF pathway window</td><td>30720 floats = 122880 bytes</td><td>host pool；graph 內 Slice/Concat 更新</td></tr><tr><td>feature windows</td><td>ERB 96 floats、complex 576 floats</td><td>C host 滑動，runtime 唯讀</td></tr><tr><td>normalizers、raw spectrum rings、framing/OLA</td><td>依 dfn3_process.h / fresh pool query</td><td>C host；不進 graph</td></tr></table>
-<p><code>DFN3_MODEL_IO_LAYOUT_VERSION = 9</code>；DFN2 layout 8 不相容。<code>get_mem_size</code> 實測（本機）：<code>DFN3_IO_TIME</code> 246,256 bytes、<code>DFN3_IO_FREQ</code> 219,472 bytes；<code>sizeof(DFN3State)</code> = 67,344 bytes。單路 C descriptor 不能拿 batch-N graph 代替。init generation 為 1，reset 與被拒的 commit 會清零兩個 recurrent state 並增加 generation；runtime 必須同步重填自己的量化 state。</p>
+<p><code>DFN3_MODEL_IO_LAYOUT_VERSION = 9</code>；DFN2 layout 8 不相容。<code>get_mem_size</code> 實測（本機）：<code>DFN3_IO_TIME</code> 233,872 bytes、<code>DFN3_IO_FREQ</code> 219,472 bytes（皆不含應用端的合成 <code>AcIstft</code>）；<code>sizeof(DFN3State)</code> = 67,344 bytes。單路 C descriptor 不能拿 batch-N graph 代替。init generation 為 1，reset 與被拒的 commit 會清零兩個 recurrent state 並增加 generation；runtime 必須同步重填自己的量化 state。</p>
 <h2>延遲與 warm-up</h2>
 <p>mask／DF lookahead 是 M／D 兩個獨立設定（M 0..2、D 0..4，15 個 pair，規則見 <a href="ainr_dfn2_detail.html">ainr_dfn2_detail</a>），出貨為 1/1；兩條路平行，模型延遲 max(M, D) hops（DFN2 是相加），ring 深度 5 + max(M, D) − D。TIME identity 路徑再加 WOLA，總延遲 1 + max(M, D) hops；出貨 1/1 為 1024 samples = 2 hops = 21.33 ms（不含推論時間或外部排隊）。前 M 個 hop pre_process 回 0（出貨：第一 hop），其後每 hop 回 1；<code>written = 0</code> 的拍數是 max(M, D)；C 端以 <code>-DDFN3_MASK_LOOKAHEAD</code>／<code>-DDFN3_DF_LOOKAHEAD</code> 取 pair，須與 checkpoint 一致，只有 1/1 有訓練好的 checkpoint（其他 pair 音質未量測）。skip 使用 unit 高頻 gain 和 unit current DF tap，維持相同時序。有限 clip 的精確尾端應補模型 feature 的零 padding；持續餵零音訊只是在延續 live stream。</p>
 <h2>相關檔案與測試</h2>

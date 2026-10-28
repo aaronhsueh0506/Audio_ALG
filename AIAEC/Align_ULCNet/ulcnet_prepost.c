@@ -21,8 +21,8 @@ struct UlcnetPrepost {
     int io_mode;
 
     /* ULCNET_IO_TIME only; NULL in ULCNET_IO_FREQ. Rolling (center 0) analyses
-     * and the synthesis state borrow the caller's FftHandle and window and carry
-     * their own transform scratch. */
+     * borrow the caller's FftHandle and window and carry their own transform
+     * scratch; the synthesis state is the caller's AcIstft (cfg->istft). */
     AcStft  *ana_err;
     AcStft  *ana_far;
     AcIstft *synth;
@@ -86,15 +86,26 @@ static uint32_t pp_build_hash(int io_mode, int delay_depth, uint32_t layout) {
     return ac_memreq_abi_hash(h);
 }
 
-/* TIME needs the caller's handle and window in the config so the framing
+/* TIME needs the caller's handle and window in the config so the analysis
  * objects are sized exactly. */
-static int pp_framing_sizes(const UlcnetPrepostConfig *cfg, size_t *stft_bytes,
-                            size_t *istft_bytes) {
+static int pp_framing_size(const UlcnetPrepostConfig *cfg, size_t *stft_bytes) {
     AcStftConfig sc;
     ulcnet_framing_config(&sc, cfg->fft, cfg->window, 0);
     *stft_bytes = ac_stft_get_mem_size(&sc);
-    *istft_bytes = ac_istft_get_mem_size(&sc);
-    return (*stft_bytes != 0 && *istft_bytes != 0) ? 0 : -1;
+    return *stft_bytes != 0 ? 0 : -1;
+}
+
+/* The caller's AcIstft must be the one ulcnet_framing_config() describes (the
+ * model's fft size, envelope-normalised overlap-add, synthesis scale) over the
+ * same window values as the analysis. */
+static int pp_istft_matches(const UlcnetPrepostConfig *cfg) {
+    AcStftConfig want, got;
+    ulcnet_framing_config(&want, NULL, NULL, 0);
+    return cfg->istft != NULL && ac_istft_get_config(cfg->istft, &got) == 0 &&
+           got.fft_size == want.fft_size && got.ola == want.ola &&
+           got.ispec_scale == want.ispec_scale &&
+           memcmp(got.window, cfg->window,
+                  (size_t)ULCNET_N_FFT * sizeof(float)) == 0;
 }
 
 /* Walk the layout once: base==NULL sizes it, otherwise it also carves.
@@ -125,9 +136,9 @@ static int pp_layout(UlcnetPrepost *p, unsigned char *base,
     }
 
     if (cfg->io_mode == ULCNET_IO_TIME) {
-        size_t stft_bytes, istft_bytes;
+        size_t stft_bytes;
         AcStftConfig sc;
-        if (pp_framing_sizes(cfg, &stft_bytes, &istft_bytes) != 0) return -1;
+        if (pp_framing_size(cfg, &stft_bytes) != 0) return -1;
         ulcnet_framing_config(&sc, cfg->fft, cfg->window, 0);
         if (pp_carve(base, &cursor, stft_bytes, &ptr) != 0) return -1;
         if (base && p) {
@@ -139,11 +150,7 @@ static int pp_layout(UlcnetPrepost *p, unsigned char *base,
             p->ana_far = ac_stft_init(ptr, stft_bytes, &sc);
             if (!p->ana_far) return -1;
         }
-        if (pp_carve(base, &cursor, istft_bytes, &ptr) != 0) return -1;
-        if (base && p) {
-            p->synth = ac_istft_init(ptr, istft_bytes, &sc);
-            if (!p->synth) return -1;
-        }
+        if (base && p) p->synth = cfg->istft;
         if (pp_carve(base, &cursor, (size_t)ULCNET_HOP * sizeof(float),
                      &ptr) != 0) return -1;
         if (base && p) p->out_hop = (float *)ptr;
@@ -190,6 +197,7 @@ static int pp_check_config(const UlcnetPrepostConfig *cfg) {
         /* Reject-first: a wrong-size handle would break the feature-time contract. */
         if (!cfg->fft || !cfg->window) return -1;
         if (fft_get_n_freqs(cfg->fft) != ULCNET_BINS) return -1;
+        if (!pp_istft_matches(cfg)) return -1;
     }
     return 0;
 }
@@ -267,6 +275,7 @@ UlcnetPrepost *ulcnet_prepost_init_ex(void *pool, size_t bytes,
                   &total) != 0)
         return NULL;
     if (total != (size_t)req.bytes) return NULL;   /* sizing/carve agreement */
+    if (p->synth) ac_istft_reset(p->synth);   /* a borrowed AcIstft starts like a fresh one */
 
     return p;
 }
@@ -311,7 +320,7 @@ void ulcnet_prepost_reset(UlcnetPrepost *p) {
     ulcnet_model_io_reset(p->io);
     if (p->io_mode == ULCNET_IO_TIME) {
         /* The objects keep their handle and window; reset clears the history
-         * and overlap state. */
+         * and overlap state, the caller's AcIstft included. */
         ac_stft_reset(p->ana_err);
         ac_stft_reset(p->ana_far);
         ac_istft_reset(p->synth);

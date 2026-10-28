@@ -126,6 +126,7 @@ recurrent state）。它組合 <code>ulcnet_process.c</code> ＋ <code>ulcnet_mo
 <pre>UlcnetPrepostConfig cfg;  UlcnetPrepostMemReq req;
 ulcnet_prepost_config_defaults(&amp;cfg, ULCNET_IO_TIME, /*D=*/8);  /* D 須等於 export 的 D */
 cfg.fft = fft;  cfg.window = window;      /* caller-owned 借用；本類別不建也不毀 */
+cfg.istft = istft;   /* TIME 必填：應用端用 ulcnet_framing_config(&amp;sc, fft, window, 0) + ac_istft_init() 建的 AcIstft */
 ulcnet_prepost_get_mem_size(&amp;cfg, &amp;req);
 UlcnetPrepost *p = ulcnet_prepost_init_ex(pool, req.bytes, &amp;cfg, &amp;req);  /* 或 _init / _create */
 每 hop：
@@ -137,8 +138,10 @@ UlcnetPrepost *p = ulcnet_prepost_init_ex(pool, req.bytes, &amp;cfg, &amp;req); 
 其餘：_reset / _destroy / _hop_size / _num_bins / _io_mode / _descriptor / _state_generation</pre>
 <p><b>一 hop 進、一次推論、一 hop 出</b>——從 hop #0 起、兩種模式皆然，呼叫端不必迴圈。
 <code>io_mode</code> 在 init 固定（它決定 pool 大小）：<code>ULCNET_IO_TIME</code> hop 進 hop 出，
-framing／加窗／overlap-add 由類別做、但呼叫的是 <b>caller 的 <code>FftHandle</code> 與 window 表</b>；
-<code>ULCNET_IO_FREQ</code> 頻譜進頻譜出、不做任何 transform，<code>fft</code>/<code>window</code>
+分析 framing 由類別做、呼叫的是 <b>caller 的 <code>FftHandle</code> 與 window 表</b>，合成是<b>應用端持有的
+<code>AcIstft</code></b>（<code>cfg.istft</code>，borrowed；<code>frame_commit</code> 對它 push、<code>reset</code> 一併清它）；
+<code>ULCNET_IO_FREQ</code> 頻譜進頻譜出、不做任何 transform（合成由應用端對 <code>post_process_freq</code> 的頻譜自己呼叫
+<code>ac_istft_push_planar</code>），<code>fft</code>/<code>window</code>/<code>istft</code>
 可為 NULL，這是<b>串接</b>（AEC seam 或 4ch 路徑的 beamformed 頻譜）用的模式。</p>
 <p><b>四個 state 就地綁定</b>：<code>key_history</code>/<code>value_history</code>/<code>logit_history</code>/
 <code>h_gru</code> 在 caller pool 各一份，graph 回每個 state 的完整下一個 window（shape 同輸入，位移在 graph 內），
@@ -254,14 +257,13 @@ tensor，無隱藏 state；四個 state 都由 CPU/DSP caller-owned pool 傳入�
 <tr><td><code>ulcnet_accelerator_adapter</code></td><td>48 kHz</td><td>87,056</td><td>142,864</td><td>254,480</td><td>477,712</td><td>924,176</td></tr>
 </table>
 <p>本機量測。adapter = class FREQ pool + 32 B header（adapter 自己只存三個欄位）。
-<code>ULCNET_IO_TIME</code> 在 FREQ 之上再加一份<b>與 D 無關</b>的 framing（兩個 rolling <code>AcStft</code>、
-一個 <code>AcIstft</code>——各自帶 transform scratch，借用呼叫端的 FFT handle 與視窗表——以及輸出 hop staging）：16 kHz +21,792 B、48 kHz +43,296 B，
-所以 D=8 的 TIME pool 是 97,040 B（16 kHz）／186,128 B（48 kHz）。
+<code>ULCNET_IO_TIME</code> 在 FREQ 之上再加一份<b>與 D 無關</b>的 framing（兩個 rolling <code>AcStft</code>——各自帶 transform scratch，借用呼叫端的 FFT handle 與視窗表——以及輸出 hop staging）：16 kHz +13,504 B、48 kHz +26,816 B，
+所以 D=8 的 TIME pool 是 88,752 B（16 kHz）／169,648 B（48 kHz）。合成的 <code>AcIstft</code>（16 kHz 8,288 B、48 kHz 16,480 B）是應用端的物件，兩個模式的 pool 都不含。
 <code>logit_history</code> 只隨 D 走、不隨 grid 走，所以 48 kHz 的 pool 不是 16 kHz 的
 兩倍——FREQ pool 在 D=8 時是 1.90×，D=64 時是 1.91×。</p>
 <table>
 <tr><th>其他 state</th><th>內容</th><th>保存者</th></tr>
-<tr><td>STFT×2 / ISTFT 狀態</td><td><code>AcStft</code>×2 + <code>AcIstft</code>（<code>ulcnet_framing_config()</code>）</td><td>pool 內物件（<code>audio_stft.h</code>）、借用呼叫端的 FFT handle 與視窗表、zero heap</td></tr>
+<tr><td>STFT×2 / ISTFT 狀態</td><td><code>AcStft</code>×2（<code>ulcnet_framing_config()</code>）＋ 合成 <code>AcIstft</code></td><td><code>AcStft</code> 在 pool 內、借用呼叫端的 FFT handle 與視窗表、zero heap；<code>AcIstft</code> 歸應用端（<code>cfg.istft</code>）</td></tr>
 <tr><td>PBFDKF / delay 對齊</td><td>—</td><td>AEC C 端 static pool</td></tr>
 </table>
 <p>Python reference 把全部 state 存在 <code>create_stream_state()</code> 回傳的 host dict；

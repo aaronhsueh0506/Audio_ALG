@@ -71,17 +71,25 @@ board_free(pool);
 
 ### 3.3 每-hop 處理入口
 
-一般 lockstep AEC：
+一般 lockstep AEC（RES 增益在應用端套用，合成交給應用端持有的 audiolib `AcIstft`）：
 
 ```c
 int hop = aec_hop_size(aec);
-aec_process(aec, mic_hop, ref_hop, out_hop);
+AecResContext ctx;
+
+aec_process_context(aec, mic_hop, ref_hop);        /* 只算頻域 context，不做合成 */
+aec_get_res_context(aec, &ctx);
+if (!ctx.error_spec || !ctx.res_gain) return -1;    /* 本 hop 沒有可用的 context */
+sk_capply_gain_f32(spec, ctx.error_spec, ctx.res_gain, ctx.n_freqs);
+ac_istft_push(istft, spec, out_hop);                /* inverse FFT + sqrt-Hann + overlap-add，一個 hop 輸出 */
 ```
 
-三個 buffer 都至少有 `hop` 個 `float`。`ref_hop` 必須是實際送往 speaker 的 render
-reference，且與 mic 同 sample clock。
+`mic_hop`、`ref_hop`、`out_hop` 都至少有 `hop` 個 `float`；`spec` 是 `ctx.n_freqs` 個 `Complex`
+（`AecConfig` 用 `enable_res = 0`、`return_res_context = 1`，增益由應用端乘上）。`istft` 以
+`ac_stft_config_default(&cfg, fft_size)` 配出大小後 `ac_istft_init()`，歸應用端所有，串流重啟時與 `aec_reset()` 一起
+`ac_istft_reset()`。`ref_hop` 必須是實際送往 speaker 的 render reference，且與 mic 同 sample clock。
 
-若下游只取頻域／linear context，不需要 AEC 自己的時域輸出：
+同一次 `aec_process_context()` 之後也可以取 linear context（formed linear output、aligned far、delay state）：
 
 ```c
 AecResContext ctx;

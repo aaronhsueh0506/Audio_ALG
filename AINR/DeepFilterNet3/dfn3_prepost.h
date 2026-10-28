@@ -24,8 +24,24 @@
  * sqrt-Hann-windowed block times 1/sqrt(DFN3_N_FFT). AIAEC spectra are
  * unnormalised: scale by 1.0f / sqrtf(DFN3_N_FFT) into DFN3 and by
  * sqrtf(DFN3_N_FFT) out of it (a wrong scale is not detectable here).
- * The FftHandle, window and ERB matrices are caller-owned; window == NULL carves
- * a sqrt-Hann table in the pool. */
+ * The FftHandle, window, ERB matrices and (DFN3_IO_TIME) the synthesis AcIstft are
+ * caller-owned; window == NULL carves a sqrt-Hann table in the pool for the
+ * analysis object.
+ *
+ * Inverse FFT and overlap-add are audiolib's AcIstft, never this class's. Two ways
+ * to chain it:
+ *
+ *     // DFN3_IO_TIME: hand the class the caller's AcIstft; commit pushes into it.
+ *     AcStftConfig sc;  dfn3_framing_config(&sc, fft, NULL);
+ *     AcIstft *istft = ac_istft_init(mem, ac_istft_get_mem_size(&sc), &sc);
+ *     cfg.istft = istft;                       // ... dfn3_prepost_init(...)
+ *     dfn3_prepost_post_process(p, out_hop, &written);   // hop out
+ *
+ *     // DFN3_IO_FREQ: spectrum out, the caller pushes its own AcIstft.
+ *     dfn3_prepost_post_process_freq(p, re, im, &valid);
+ *     if (valid) ac_istft_push_planar(istft, re, im, out_hop);
+ *
+ * The class resets a borrowed AcIstft together with its own state. */
 
 #ifndef DFN3_PREPOST_H
 #define DFN3_PREPOST_H
@@ -42,7 +58,7 @@ extern "C" {
 #define DFN3_PREPOST_DESCRIPTOR_VERSION 1u
 /* Folded into build_flags_hash; bumped on any change of pool size, carve order or
  * descriptor content. */
-#define DFN3_PREPOST_CARVE_VERSION      7u
+#define DFN3_PREPOST_CARVE_VERSION      8u
 
 /* One shared alignment for every module (audiolib mem_align.h). */
 #define DFN3_PREPOST_ALIGNMENT 16u
@@ -62,11 +78,12 @@ extern "C" {
 
 /* Which side of the transform the caller works on; fixed at init because it
  * decides the pool size (DFN3_IO_TIME also carves the output staging and the
- * framing objects). */
+ * analysis object). */
 typedef enum DFN3IoMode {
     /* Spectrum in, spectrum out; the caller owns the transform. `fft` may be NULL. */
     DFN3_IO_FREQ = 0,
-    /* Hop in, hop out; the class owns framing and calls the caller's FftHandle. */
+    /* Hop in, hop out; the class owns the analysis framing and calls the caller's
+     * FftHandle, and synthesises through the caller's AcIstft. */
     DFN3_IO_TIME = 1
 } DFN3IoMode;
 
@@ -74,6 +91,7 @@ typedef struct DFN3PrepostConfig {
     int          io_mode;       /* a DFN3IoMode                             */
     FftHandle   *fft;           /* DFN3_IO_TIME: required, borrowed, sized for DFN3_N_FFT */
     const float *window;        /* optional, DFN3_WIN_LEN entries, borrowed (DFN3_IO_TIME); NULL = sqrt-Hann table carved in the pool */
+    AcIstft     *istft;         /* DFN3_IO_TIME: required, borrowed, built from dfn3_framing_config() (same fft size, window values, ola, ispec_scale); ignored in DFN3_IO_FREQ */
     const float *erb_fwd;       /* required, borrowed, bin-major [DFN3_N_BINS][DFN3_N_ERB] */
     const float *erb_inv;       /* required, borrowed, band-major [DFN3_N_ERB][DFN3_N_BINS] */
     float        atten_lim_db;  /* 0 disables the attenuation limit         */
@@ -143,17 +161,18 @@ typedef struct DFN3PrepostOutputs {
 /* ---- config / sizing ------------------------------------------------- */
 
 /* Fill a config with this build's defaults. Returns 0, or -1 on NULL or an
- * unknown io_mode. fft, window, erb_fwd and erb_inv are left NULL;
+ * unknown io_mode. fft, window, istft, erb_fwd and erb_inv are left NULL;
  * atten_lim_db is 0 (disabled). */
 int dfn3_prepost_config_defaults(DFN3PrepostConfig *cfg, int io_mode);
 
 /* Exact pool size. Returns -1 (req untouched) on NULL, unknown io_mode, missing
  * ERB matrices, non-finite atten_lim_db, or DFN3_IO_TIME without an FftHandle
- * sized for DFN3_N_FFT. */
+ * sized for DFN3_N_FFT or without an AcIstft that matches dfn3_framing_config(). */
 int dfn3_prepost_get_mem_size(const DFN3PrepostConfig *cfg,
                               DFN3PrepostMemReq *req);
 
-/* Construct inside caller memory. NULL on a bad config or a misaligned or
+/* Construct inside caller memory. NULL on a bad config (a borrowed AcIstft whose
+ * window differs from the analysis window included) or a misaligned or
  * undersized pool. Starts reset. */
 DFN3Prepost *dfn3_prepost_init(void *pool, size_t bytes,
                                const DFN3PrepostConfig *cfg);
@@ -167,12 +186,13 @@ DFN3Prepost *dfn3_prepost_init_ex(void *pool, size_t bytes,
 DFN3Prepost *dfn3_prepost_create(const DFN3PrepostConfig *cfg);
 
 /* Frees only what _create allocated; NULL-safe, a no-op on an _init instance.
- * Never touches the caller's fft, window or ERB matrices. */
+ * Never frees the caller's fft, window, istft or ERB matrices. */
 void dfn3_prepost_destroy(DFN3Prepost *p);
 
 /* Zero every recurrent/ring/hidden tensor, drop any open frame and reset the
- * framing, normaliser and compose-clock states. Config, borrowed pointers and
- * pool are untouched. Advances the state generation. */
+ * framing (a borrowed AcIstft included), normaliser and compose-clock states.
+ * Config, borrowed pointers and pool are untouched. Advances the state
+ * generation. */
 void dfn3_prepost_reset(DFN3Prepost *p);
 
 /* Generation of the recurrent state: 1 after init, plus one per reset and per

@@ -200,10 +200,22 @@ static float noise(long long hop, int i) {
     return ((float)(x & 0xffffu) / 65535.0f - 0.5f) * 0.2f;
 }
 
+/* The caller-owned synthesis object of DFN2_IO_TIME. */
+static AcIstft *make_istft(FftHandle *fft) {
+    AcStftConfig sc;
+    size_t bytes;
+    void *mem;
+    dfn2_framing_config(&sc, fft, NULL);
+    bytes = ac_istft_get_mem_size(&sc);
+    mem = aligned_alloc(16u, (bytes + 15u) / 16u * 16u);
+    return mem ? ac_istft_init(mem, bytes, &sc) : NULL;
+}
+
 static DFN2Prepost *make(int io_mode, FftHandle *fft) {
     DFN2PrepostConfig cfg;
     if (dfn2_prepost_config_defaults(&cfg, io_mode) != 0) return NULL;
     cfg.fft = io_mode == DFN2_IO_TIME ? fft : NULL;
+    cfg.istft = io_mode == DFN2_IO_TIME ? make_istft(fft) : NULL;
     cfg.erb_fwd = &erb_fwd[0][0];
     cfg.erb_inv = &erb_inv[0][0];
     return dfn2_prepost_create(&cfg);
@@ -365,6 +377,7 @@ static int case_contract(void) {
     /* The class: pre_process readiness, views, latency, first output. */
     CHECK(dfn2_prepost_config_defaults(&cfg, DFN2_IO_TIME) == 0);
     cfg.fft = fft;
+    cfg.istft = make_istft(fft);
     cfg.erb_fwd = &erb_fwd[0][0];
     cfg.erb_inv = &erb_inv[0][0];
     CHECK(dfn2_prepost_get_mem_size(&cfg, &time_req) == 0);

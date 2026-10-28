@@ -495,7 +495,10 @@ sequence shared by every class are described once, in `../README.md`
 center=False rolling window (one frame per hop from hop 0, bit-identical to
 the centered schedule's last frame per hop -- pinned by the class test), and
 `frame_skip` is the pass-through identity because stream 0 is a residual.
-Its gate is `tests/test_ulcnet_prepost_c.py`.
+Its gate is `tests/test_ulcnet_prepost_c.py`. In `ULCNET_IO_TIME` the synthesis is the
+application's audiolib `AcIstft` (`cfg.istft`, built from `ulcnet_framing_config()`; the
+class pushes into it and resets it with its own state); `ULCNET_IO_FREQ` leaves it to the
+caller (`post_process_freq` then `ac_istft_push_planar`).
 
 `ulcnet_accelerator_adapter.c/.h` is the reusable bridge from this explicit
 state ABI to `UlcnetModel`; it drives an `ULCNET_IO_FREQ` instance of the

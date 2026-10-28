@@ -36,10 +36,14 @@ _config_defaults(&cfg, io_mode[, delay_depth])
 ```
 
 - `io_mode` **init-time 固定**，因為它決定 pool 大小：`*_IO_TIME` 是 hop 進 hop 出
-  （類別做 framing/window/OLA，transform 呼叫**呼叫端的** `FftHandle`），
-  `*_IO_FREQ` 是頻譜進頻譜出、完全不做 transform，用來接在 AEC/BF seam 後面串接。
+  （類別做分析端 framing，transform 呼叫**呼叫端的** `FftHandle`；合成是**應用端持有的 audiolib `AcIstft`**，
+  經 `cfg.istft` 借給類別，`frame_commit()` 把每個增強頻譜 push 進去，`_reset()` 一併清它），
+  `*_IO_FREQ` 是頻譜進頻譜出、完全不做 transform，用來接在 AEC/BF seam 後面串接：
+  `_post_process_freq()` 交出頻譜，由應用端自己呼叫 `ac_istft_push_planar()`。
+  inverse FFT 與 overlap-add 一律是 `AcIstft`，模型目錄裡沒有（`make audit-no-transform` 把關）。
 - `_get_mem_size()` 是 reject-first：NULL 引數、未知 `io_mode`、`delay_depth` 超出範圍、
-  TIME 模式沒有可用的 `fft`/`window`（DFN2 另加：缺 ERB 矩陣、非有限的 `atten_lim_db`），
+  TIME 模式沒有可用的 `fft`/`window`/`istft`（`istft` 必須是該模型 `*_framing_config()` 描述的物件：
+  fft 大小、overlap-add 模式、合成尺度相符，窗表內容與分析窗相同；DFN2 另加：缺 ERB 矩陣、非有限的 `atten_lim_db`），
   一律回 `-1` 且 `*req` 一個 byte 都不寫。
 - `_init_ex()` 是 **stale-pool gate**：固定 32-byte 的 `*PrepostMemReq`
   （`descriptor_version`、`layout_version`、`io_mode`、`build_flags_hash`（FNV-1a-32）、
@@ -49,8 +53,10 @@ _config_defaults(&cfg, io_mode[, delay_depth])
   `_destroy()` 只釋放 `_create()` 配置的東西：對 `_init()` 實例它是**可重複呼叫的 no-op**
   （pool 永遠是 caller 的），對 `_create()` 實例呼叫第二次就是 double free。
 - 借用而不擁有：`FftHandle`、window 表、DFN2 的 ERB 矩陣都是 caller-owned，類別從不建立或銷毀。
-  組幀物件（`AcStft`／`AcIstft`）是 `*_IO_TIME` 的 pool 內物件，借用這些表；DFN2 的 `cfg.window` 為 NULL 時，
-  由分析物件在 pool 內自帶 sqrt-Hann 表、合成物件借用同一張。
+  分析用的 `AcStft` 是 `*_IO_TIME` 的 pool 內物件，借用這些表；DFN2／DFN3 的 `cfg.window` 為 NULL 時，
+  由分析物件在 pool 內自帶 sqrt-Hann 表（應用端的 `AcIstft` 用同一個 `ac_window_build()` 產生的表，內容相同即可）。
+  合成用的 `AcIstft` 不在 pool 內：應用端用 `dfn2_framing_config()`／`dfn3_framing_config()`／`ulcnet_framing_config()`／
+  `deepvqe_framing_config()` 取得設定、`ac_istft_get_mem_size()` 配記憶體、`ac_istft_init()` 建好後填進 `cfg.istft`。
 - `_reset()` 清空所有遞迴／ring／狀態、丟掉未結束的 frame、framing 與 clock 回 init 值；
   config、borrowed 指標與 pool 都不動。
 
@@ -172,7 +178,8 @@ int  ulcnet_prepost_post_process_freq(UlcnetPrepost *p, float re[ULCNET_BINS], f
 ```
 
 - `cfg` 欄位：`io_mode`、`delay_depth`（D，範圍 `ULCNET_MODEL_IO_MIN_D`=2 到
-  `ULCNET_MODEL_IO_MAX_D`=64）、`fft`、`window`（後兩者 `ULCNET_IO_TIME` 必填、borrowed，
+  `ULCNET_MODEL_IO_MAX_D`=64）、`fft`、`window`、`istft`（後三者 `ULCNET_IO_TIME` 必填、borrowed，`istft` 為應用端用
+  `ulcnet_framing_config(&sc, fft, window, 0)` 建的 `AcIstft`；
   window 為 `ac_window_build()` 產出的 `ULCNET_N_FFT` 項；`ULCNET_IO_FREQ` 不用）。
 - **error 與 far 必須是同一個輸入 hop**：類別內部不做任何 skew。上游 WOLA 造成的落差由呼叫端先對齊。
 - `ULCNET_IO_FREQ` 收的是模型自己 framing 的未正規化 rfft（center=False，一 hop 一框）——

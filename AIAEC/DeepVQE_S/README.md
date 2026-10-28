@@ -54,8 +54,9 @@ Early stopping is disabled; validation continues to select `*_best.pth`.
 ## C deployment boundary
 
 `deepvqe_prepost.h/.c` is the integrator's entry point: one opaque
-`DeepVqePrepost` composing the shared `aiaec_process.c` STFT/WOLA and the
-`deepvqe_process.c` CCM kernel. The lifecycle and per-hop sequence shared by every
+`DeepVqePrepost` composing the shared `aiaec_process.c` STFT and the
+`deepvqe_process.c` CCM kernel; in `DEEPVQE_IO_TIME` the synthesis is the application's
+audiolib `AcIstft` (`cfg.istft`, built from `deepvqe_framing_config()`). The lifecycle and per-hop sequence shared by every
 class are described once, in `../README.md` ("C pre/post-processing").
 Specific to this one: the accelerator boundary is the exporter's exactly --
 power-law compressed `mic`/`far` in (planar `[1,2,1,F]`, real plane then

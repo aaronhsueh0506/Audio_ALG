@@ -87,8 +87,8 @@ struct DeepVqePrepost {
     DeepVqeCcmState *ccm;
 
     /* DEEPVQE_IO_TIME only; NULL in DEEPVQE_IO_FREQ. Rolling (center 0) analyses
-     * and the synthesis state borrow the caller's FftHandle and window and carry
-     * their own transform scratch. */
+     * borrow the caller's FftHandle and window and carry their own transform
+     * scratch; the synthesis state is the caller's AcIstft (cfg->istft). */
     AcStft         *ana_mic;
     AcStft         *ana_far;
     AcIstft        *synth;
@@ -250,14 +250,26 @@ static uint32_t pp_build_hash(int io_mode, int delay_depth) {
     return ac_memreq_abi_hash(h);
 }
 
-/* Framing objects of the TIME configuration: rolling analyses and the
- * envelope-normalised synthesis on the AIAEC grid. */
-static void pp_framing_config(AcStftConfig *sc,
-                              const DeepVqePrepostConfig *cfg) {
-    ac_stft_config_default(sc, AIAEC_N_FFT);
-    sc->ola = AC_OLA_ENV_NORM;
-    sc->fft = cfg->fft;
-    sc->window = cfg->window;
+void deepvqe_framing_config(AcStftConfig *cfg, FftHandle *fft,
+                            const float *window) {
+    if (!cfg) return;
+    ac_stft_config_default(cfg, AIAEC_N_FFT);
+    cfg->ola = AC_OLA_ENV_NORM;
+    cfg->fft = fft;
+    cfg->window = window;
+}
+
+/* The caller's AcIstft must be the one deepvqe_framing_config() describes (the
+ * model's fft size, envelope-normalised overlap-add, synthesis scale) over the
+ * same window values as the analysis. */
+static int pp_istft_matches(const DeepVqePrepostConfig *cfg) {
+    AcStftConfig want, got;
+    deepvqe_framing_config(&want, NULL, NULL);
+    return cfg->istft != NULL && ac_istft_get_config(cfg->istft, &got) == 0 &&
+           got.fft_size == want.fft_size && got.ola == want.ola &&
+           got.ispec_scale == want.ispec_scale &&
+           memcmp(got.window, cfg->window,
+                  (size_t)AIAEC_N_FFT * sizeof(float)) == 0;
 }
 
 /* Walk the layout once: base==NULL sizes it, otherwise it also carves.
@@ -299,11 +311,10 @@ static int pp_layout(DeepVqePrepost *p, unsigned char *base,
 
     if (cfg->io_mode == DEEPVQE_IO_TIME) {
         AcStftConfig sc;
-        size_t stft_bytes, istft_bytes;
-        pp_framing_config(&sc, cfg);
+        size_t stft_bytes;
+        deepvqe_framing_config(&sc, cfg->fft, cfg->window);
         stft_bytes = ac_stft_get_mem_size(&sc);
-        istft_bytes = ac_istft_get_mem_size(&sc);
-        if (stft_bytes == 0 || istft_bytes == 0) return -1;
+        if (stft_bytes == 0) return -1;
         if (pp_carve(base, &cursor, stft_bytes, &ptr) != 0) return -1;
         if (base && p) {
             p->ana_mic = ac_stft_init(ptr, stft_bytes, &sc);
@@ -314,11 +325,7 @@ static int pp_layout(DeepVqePrepost *p, unsigned char *base,
             p->ana_far = ac_stft_init(ptr, stft_bytes, &sc);
             if (!p->ana_far) return -1;
         }
-        if (pp_carve(base, &cursor, istft_bytes, &ptr) != 0) return -1;
-        if (base && p) {
-            p->synth = ac_istft_init(ptr, istft_bytes, &sc);
-            if (!p->synth) return -1;
-        }
+        if (base && p) p->synth = cfg->istft;
         if (pp_carve(base, &cursor, (size_t)AIAEC_HOP * sizeof(float),
                      &ptr) != 0) return -1;
         if (base && p) p->out_hop = (float *)ptr;
@@ -408,6 +415,7 @@ static int pp_check_config(const DeepVqePrepostConfig *cfg) {
         /* Reject-first: a wrong-size handle would break the feature-time contract. */
         if (!cfg->fft || !cfg->window) return -1;
         if (fft_get_n_freqs(cfg->fft) != AIAEC_N_BINS) return -1;
+        if (!pp_istft_matches(cfg)) return -1;
     }
     return 0;
 }
@@ -468,6 +476,7 @@ DeepVqePrepost *deepvqe_prepost_init_ex(void *pool, size_t bytes,
     if (total != (size_t)req.bytes) return NULL;   /* sizing/carve agreement */
 
     deepvqe_ccm_init(p->ccm);
+    if (p->synth) ac_istft_reset(p->synth);   /* a borrowed AcIstft starts like a fresh one */
     return p;
 }
 
@@ -520,7 +529,7 @@ void deepvqe_prepost_reset(DeepVqePrepost *p) {
     deepvqe_ccm_init(p->ccm);
     if (p->io_mode == DEEPVQE_IO_TIME) {
         /* The objects keep their handle and window; reset clears the history
-         * and overlap state. */
+         * and overlap state, the caller's AcIstft included. */
         ac_stft_reset(p->ana_mic);
         ac_stft_reset(p->ana_far);
         ac_istft_reset(p->synth);

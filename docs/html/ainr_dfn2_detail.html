@@ -54,15 +54,15 @@ th{background:#eef1f5}
 <h3>記憶體與所有權</h3>
 <div class="tbl"><table>
 <tr><th>io_mode</th><th>pool(<code>get_mem_size</code>,出貨 pair)</th><th>說明</th></tr>
-<tr><td><code>DFN2_IO_TIME</code></td><td>246,320 bytes</td><td>hop 進、hop 出;framing/window/OLA 由本類別做(pool 內一個 <code>AcStft</code> 與一個 <code>AcIstft</code>),transform 呼叫<b>呼叫端的</b> FftHandle</td></tr>
+<tr><td><code>DFN2_IO_TIME</code></td><td>233,936 bytes</td><td>hop 進、hop 出;分析 framing 由本類別做(pool 內一個 <code>AcStft</code>),transform 呼叫<b>呼叫端的</b> FftHandle;合成是<b>應用端的 <code>AcIstft</code></b>(<code>cfg.istft</code>,borrowed),<code>frame_commit</code> 對它 push、<code>reset</code> 一併清它</td></tr>
 <tr><td><code>DFN2_IO_FREQ</code></td><td>219,536 bytes</td><td>頻譜進、頻譜出,不做 transform,不 carve 任何 framing 物件;<code>fft</code> 可為 NULL</td></tr>
 </table></div>
 <ul>
-<li><b>FREQ 比 TIME 小 26,784 bytes</b>:<code>DFN2State</code> 不內嵌 analysis/window/synthesis 緩衝
-與 scratch,TIME 的 <code>AcStft</code>（16,480 B,含窗表）與 <code>AcIstft</code>（12,384 B,借用窗表）只在 TIME carve;FREQ 多 carve 雙輸入的第二組 staging
+<li><b>FREQ 比 TIME 小 14,400 bytes</b>:<code>DFN2State</code> 不內嵌 analysis/window/synthesis 緩衝
+與 scratch,TIME 的輸出 hop staging 與 <code>AcStft</code>（16,480 B,含窗表）只在 TIME carve(合成的 <code>AcIstft</code>,出貨 pair 12,384 B,是應用端的物件,兩個模式的 pool 都不含);FREQ 多 carve 雙輸入的第二組 staging
 (<code>app_re</code>/<code>app_im</code>)。io_mode 是 pool 的身分,init-time 固定,由 <code>_init_ex</code> 檢查。</li>
-<li><b><code>DFN2_PREPOST_CARVE_VERSION = 7</code></b>(<code>dfn2_prepost.h</code>):carve 走訪順序的版本,
-摺進 <code>build_flags_hash</code>,所以其他 carve 版本的 pool 會在 <b>hash</b> 被拒。pool 內容：遞迴 state 為 5 列 <code>h_gru</code> 與 5 幀 pathway window(graph layout 8)；STFT／ISTFT 物件借用呼叫端的 <code>FftHandle</code> 與視窗表。任何 pool 大小、切分順序或 descriptor 內容的變更都會 bump 這個版本。</li>
+<li><b><code>DFN2_PREPOST_CARVE_VERSION = 8</code></b>(<code>dfn2_prepost.h</code>):carve 走訪順序的版本,
+摺進 <code>build_flags_hash</code>,所以其他 carve 版本的 pool 會在 <b>hash</b> 被拒。pool 內容：遞迴 state 為 5 列 <code>h_gru</code> 與 5 幀 pathway window(graph layout 8)；STFT 物件借用呼叫端的 <code>FftHandle</code> 與視窗表;ISTFT 物件整個在 pool 之外(應用端的 <code>AcIstft</code>)。任何 pool 大小、切分順序或 descriptor 內容的變更都會 bump 這個版本。</li>
 <li><b>遞迴 state:只有就地綁定</b>:兩個 state tensor(<code>h_gru (1,5,1,256)</code> 與 <code>df_convp_history (1,64,5,96)</code>,
 共 32,000 float = 128,000 bytes)各只有一份 buffer、位址固定;每個 state 的輸入與 <code>*_out</code> 輸出 shape 完全相同並綁到<b>同一個位址</b>,
 下一次呼叫的輸入就是這次的輸出,沒有第二份 buffer 也沒有複製。runtime 必須先讀完所有 state 輸入、才寫同位址的輸出
@@ -74,8 +74,8 @@ th{background:#eef1f5}
 power 全有限時正向和依 <code>erb_fwd_k0/k1</code> 逐 band 算(相鄰四個 band 並行、暫存器累加,band 內仍是 bin 遞增順序,逐位元不變)，任何 power 非有限時退回逐 bin 走法。
 <code>dfn2_state_init()</code> 之後矩陣為 NULL、範圍為完整。<b>就地改寫矩陣內容後必須再呼叫一次 <code>set_erb_matrices</code></b>;
 回歸測試 <code>AINR/tests/test_c_prepost.c</code> 的 <code>test_dfn_erb_spans_exact</code> 逐位元比對稀疏與完整兩種算法(含溢位、NaN、非有限 mask、含 NaN 的矩陣)。</li>
-<li><b>window 是借用的</b>:<code>cfg.window</code> 非 NULL 時,分析與合成物件都借用它(須與物件同壽命、內容不變);
-NULL 時由分析物件在 pool 內自帶 sqrt-Hann 表、合成物件借用同一張。<b>出貨路徑一律留 NULL</b>。</li>
+<li><b>window 是借用的</b>:<code>cfg.window</code> 非 NULL 時,分析物件借用它(須與物件同壽命、內容不變);
+NULL 時由分析物件在 pool 內自帶 sqrt-Hann 表。應用端的 <code>AcIstft</code> 窗表內容必須與分析窗相同(init 時逐值比對,不同就拒絕)。<b>出貨路徑一律留 NULL</b>。</li>
 <li><b>FftHandle 與 ERB 矩陣是借用的</b>,從不建立或銷毀。ERB 矩陣<b>兩個模式都必填</b>,<code>fft</code> 只有 TIME 需要。</li>
 <li>32-byte <code>DFN2PrepostMemReq</code> 七欄:<code>descriptor_version</code>(=1)、<code>layout_version</code>
 (<code>DFN2_MODEL_IO_LAYOUT_VERSION</code>)、<code>io_mode</code>、<code>build_flags_hash</code>
@@ -148,7 +148,7 @@ layout 版本或另一組幾何匯出的圖</b>——那正是 NaN 預填看不�
 <li><b>C host。</b>建置帶 <code>-DDFN2_FRAMES_PER_CALL=&lt;N&gt;</code>(1..64,單純十進位,每個編譯單元;AINR Makefile 變數 <code>DFN2_FRAMES_PER_CALL</code>)。視窗為 N+2 個 frame;第一次呼叫在推入 M+N 個 frame 後就緒,之後每推 N 個一次(<code>pre_process</code> 在第 M+N-1、M+2N-1…拍回 1);<code>dfn2_model_io_frame_slot()</code> 回「最近推入的 frame 完成的是下次呼叫的第幾個 head」(0..N-1;還沒有 head 時 -1)。<code>frame_inputs()</code> 一次發布 N 個 head,<code>frame_commit()</code> 一次把 N 個 frame 合成起來,<code>post_process</code> 仍每次回一個 hop。</li>
 <li><b>延遲多 N-1 hop。</b>輸出落後輸入 <code>1 + M + D + N - 1</code> hops(<code>DFN2_PREPOST_LATENCY_FRAMES</code> = M+D+N-1,<code>dfn2_prepost_model_lookahead_frames()</code> 回這個值;<code>written = 0</code> 的暖機拍數也是這個值)。出貨 pair 配 N=8 為 10 hops = 106.7 ms。flush 要持續推零 hop 並執行加速器,直到最後一個真實 hop 被吐出。commit 被拒時就地歸零一次 state,並把 N 個 frame 都走 identity。</li>
 <li><b>編譯期守衛。</b>N 不在 1..64 是 <code>#error</code>(C11、gnu99、C++ 皆然);不同 N 的目標檔連結失敗(符號 <code>dfn2_frames_per_call&lt;N&gt;</code>);為一個 frame 寫的單元對 N&gt;1 編譯失敗,除非它在包含標頭前定義 <code>DFN2_MULTI_FRAME_HOST</code>。N&gt;1 折進 pool hash(另一個 N 的 pool 被拒);N=1 時 pool 大小與 hash 不變。descriptor 不加欄位、大小維持 72 bytes:N 由 <code>input_frames</code>(= N+2)攜帶,<code>dfn2_model_io_descriptor_validate()</code> 與 <code>dfn2_model_run_frame()</code> 拒絕不同的 N;依一個 frame 的標頭編譯的 adapter(<code>input_frames</code> = 3)可直接用於 N=1 的函式庫,N&gt;1 的函式庫拒絕它。</li>
-<li><b>版號不變。</b><code>DFN2_MODEL_IO_LAYOUT_VERSION</code> 仍是 8(它命名 state tensor,N 不改變它們;N 由 descriptor 的 <code>input_frames</code> 與 metadata 攜帶),<code>DFN2_PREPOST_CARVE_VERSION</code> 仍是 7(N=1 的切分相同,N&gt;1 的 pool 以 hash 區分)。</li>
+<li><b>版號不變。</b><code>DFN2_MODEL_IO_LAYOUT_VERSION</code> 仍是 8(它命名 state tensor,N 不改變它們;N 由 descriptor 的 <code>input_frames</code> 與 metadata 攜帶),<code>DFN2_PREPOST_CARVE_VERSION</code> 仍是 8(N=1 的切分相同,N&gt;1 的 pool 以 hash 區分)。</li>
 <li><b>pipelines 固定 N=1。</b><code>pipelines/dfn</code> 的 stage 與 rate bridge 以及 <code>dfn2_stage.py</code> 都是一個 frame 的單元;對它們帶 <code>-DDFN2_FRAMES_PER_CALL&gt;1</code> 會停在 <code>DFN2_MULTI_FRAME_HOST</code> 的 <code>#error</code>。<code>make -C AINR lib</code> 可為任一 N 建置,<code>test</code>／<code>test-simd</code> 的驅動是一個 frame 的單元,只在 N=1 建置。</li>
 <li><b>尚未量測。</b>目標平台工具鏈對 seq_len&gt;1 的 GRU 的支援、N-frame graph 的量化精度,沒有量過;等價性只用隨機初始化模型與替身加速器證明(N-frame graph 分塊串流等於一個 frame graph 逐 frame 串流,torch 與 ONNX Runtime 數值一致)。N&gt;5 時 <code>c0</code>(餵給下一層卷積)是兩段分別算出的 tensor 的 Concat,量化工具可能給兩個 scale。N&gt;1 時 compose 在 commit 才跑,所以 <code>set_atten_lim</code> 與反向 ERB 矩陣的更換對下一次 commit 的 N 個 frame 一併生效,包含更換之前就已推入的 frame。</li>
 </ul>

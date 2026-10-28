@@ -58,14 +58,14 @@ th{background:#eef1f5}
 <tr><td>identity 路徑輸出落後</td><td>3 hops = 1536 samples</td><td>1 + max(M, D) hops（出貨 2 hops = 1024 samples = 21.33 ms）</td><td><code>dfn3_prepost.h</code></td></tr>
 <tr><td><code>post_process</code> 的 <code>written = 0</code> 拍數</td><td>2</td><td>max(M, D)（出貨 1：只有 hop 0）</td><td><code>dfn3_prepost.h</code></td></tr>
 <tr><td><code>*_MODEL_IO_LAYOUT_VERSION</code></td><td>8</td><td>9（4–8 已退役）</td><td><code>dfn*_model_io.h</code></td></tr>
-<tr><td>pool（<code>get_mem_size</code>，本機量測）</td><td>TIME 246,320／FREQ 219,536</td><td>TIME 246,256／FREQ 219,472</td><td>—</td></tr>
+<tr><td>pool（<code>get_mem_size</code>，本機量測）</td><td>TIME 233,936／FREQ 219,536</td><td>TIME 233,872／FREQ 219,472</td><td>—</td></tr>
 <tr><td><code>sizeof(State)</code>／<code>sizeof(ModelIOState)</code>（本機量測）</td><td>67,368／130,704</td><td>67,344／130,704</td><td>—</td></tr>
 <tr><td><code>skip</code> 的 identity</td><td>unit ERB mask、alpha 0</td><td>高頻 unit ERB gain、低頻 unit 目前框 DF tap</td><td><code>dfn3_prepost.h</code></td></tr>
 </table></div>
 
 <h2>如何呼叫使用</h2>
 <ol>
-<li>借用物件：<code>FftHandle</code>（1024 點，TIME 必填）；<code>erb_fwd.bin</code>／<code>erb_inv.bin</code>（<code>export_erb_matrix.py --runtime-bins</code> 產生，呼叫端載入，兩種模式都必填）。</li>
+<li>借用物件：<code>FftHandle</code>（1024 點，TIME 必填）；合成用的 <code>AcIstft</code>（TIME 必填，應用端以 <code>dfn3_framing_config()</code> 建）；<code>erb_fwd.bin</code>／<code>erb_inv.bin</code>（<code>export_erb_matrix.py --runtime-bins</code> 產生，呼叫端載入，兩種模式都必填）。</li>
 <li><code>dfn3_prepost_config_defaults</code> → 填欄位 → <code>dfn3_prepost_get_mem_size</code>（alignment 16）→ <code>dfn3_prepost_init_ex(pool, req.bytes, &amp;cfg, &amp;req)</code>；host 工具可用 <code>_create</code>／<code>_destroy</code>。</li>
 <li>每個 frame：<code>pre_process[_freq]</code>（前 M 拍回 0，不可呼叫加速器；其後回 1。出貨 M=1：第 0 拍）→ <code>frame_inputs</code> → 加速器 → <code>frame_commit</code>，失敗或被拒就 <code>frame_skip</code> → <code>post_process[_freq]</code>。</li>
 <li>每次 <code>dfn3_prepost_state_generation()</code> 改變（reset 或被拒的 commit），把加速器自己的定點 state 重填成量化後的 0。</li>
@@ -118,7 +118,7 @@ int run_dfn3_freq(const float *erb_fwd, const float *erb_inv,
     free(pool);
     return rc;
 }</pre>
-<p class="note">片語（頻域入口）已在暫存副本以 <code>-std=c11 -Wall -Wextra -Wpedantic -Werror</code> 編譯通過。頻譜為 <code>torch.stft(normalized=True)</code> 尺度（rfft × 1/32）；TIME 入口改呼叫 <code>dfn3_prepost_pre_process</code>／<code>_post_process</code>，並提供 1024 點 FftHandle。錯誤處理（各函式回傳 -1 的條件、commit 被拒時 state 歸零且 frame 仍開）與 DFN2 相同，見 <a href="ainr_dfn2_usage.html">ainr_dfn2_usage</a> 的速查表。</p>
+<p class="note">片語（頻域入口）已在暫存副本以 <code>-std=c11 -Wall -Wextra -Wpedantic -Werror</code> 編譯通過。頻譜為 <code>torch.stft(normalized=True)</code> 尺度（rfft × 1/32）；TIME 入口改呼叫 <code>dfn3_prepost_pre_process</code>／<code>_post_process</code>，並提供 1024 點 FftHandle 與應用端的 <code>AcIstft</code>（<code>cfg.istft</code>）。錯誤處理（各函式回傳 -1 的條件、commit 被拒時 state 歸零且 frame 仍開）與 DFN2 相同，見 <a href="ainr_dfn2_usage.html">ainr_dfn2_usage</a> 的速查表。</p>
 
 <h2>流程時序圖</h2>
 <pre>
@@ -169,6 +169,7 @@ caller                         DFN3Prepost (C)                     NPU runtime
 <tr><th>名稱</th><th>位置</th><th>型別／範圍</th><th>預設</th><th>何時設定</th><th>說明</th></tr>
 <tr><td><code>io_mode</code></td><td><code>DFN3PrepostConfig</code></td><td><code>DFN3_IO_TIME</code>／<code>DFN3_IO_FREQ</code></td><td>參數</td><td>init 前</td><td>決定 pool 大小與可用函式</td></tr>
 <tr><td><code>fft</code></td><td>同上</td><td><code>FftHandle*</code>，513 bins</td><td>NULL</td><td>init 前</td><td>TIME 必填；borrowed</td></tr>
+<tr><td><code>istft</code></td><td>同上</td><td><code>AcIstft*</code>，由 <code>dfn3_framing_config()</code> 描述的物件</td><td>NULL</td><td>init 前</td><td>TIME 必填；borrowed，記憶體歸應用端，類別在 <code>frame_commit</code> push、<code>reset</code> 一併清；與分析設定或窗表不符時被拒；FREQ 忽略（應用端對 <code>post_process_freq</code> 的頻譜自己呼叫 <code>ac_istft_push_planar</code>）</td></tr>
 <tr><td><code>window</code></td><td>同上</td><td>1024 個 float 或 NULL</td><td>NULL</td><td>init 前</td><td>NULL＝pool 內自帶 sqrt-Hann</td></tr>
 <tr><td><code>erb_fwd</code>／<code>erb_inv</code></td><td>同上；<code>set_erb_matrices</code></td><td>bin-major [513][32]／band-major [32][513]</td><td>必填</td><td>init 前；hop 之間可換</td><td>borrowed；<code>erb_inv</code> 須是 partition of unity；frame 開著時 setter 回 -1</td></tr>
 <tr><td><code>atten_lim_db</code></td><td>同上；<code>set_atten_lim</code></td><td>有限 float，以 |dB| 計</td><td>0（關閉）</td><td>init 前或 hop 之間</td><td>在最後的複數頻譜上與 noisy 混合</td></tr>
@@ -183,7 +184,7 @@ caller                         DFN3Prepost (C)                     NPU runtime
 <tr><td><code>DFN3_FEATURE_VERSION</code></td><td><code>dfn2_libdf_wnorm_upstream_init_no_eps_v5</code></td><td><code>dfn3_process.h</code></td><td>與 DFN2 共用特徵契約，名稱沿用 dfn2 是刻意的（DFN3 README）</td></tr>
 <tr><td><code>DFN3_MODEL_IO_LAYOUT_VERSION</code></td><td>9</td><td><code>dfn3_model_io.h</code></td><td>與 <code>export_onnx.py</code> 互鎖；DFN2 的 layout 8 圖會被拒絕</td></tr>
 <tr><td><code>DFN3_MODEL_INPUT_FRAMES</code>／<code>_GRU_ROWS</code>／<code>_GRU_HIDDEN</code>／<code>_ENCODER_CHANNELS</code>／<code>_DF_PATHWAY_WINDOW</code></td><td>3／5／256／64／5</td><td><code>dfn3_model_io.h</code></td><td>graph 輸入／state 形狀</td></tr>
-<tr><td><code>DFN3_PREPOST_CARVE_VERSION</code>／<code>_DESCRIPTOR_VERSION</code>／<code>_ALIGNMENT</code></td><td>7／1／16</td><td><code>dfn3_prepost.h</code></td><td>pool 切分與 descriptor 版本，進 <code>build_flags_hash</code></td></tr>
+<tr><td><code>DFN3_PREPOST_CARVE_VERSION</code>／<code>_DESCRIPTOR_VERSION</code>／<code>_ALIGNMENT</code></td><td>8／1／16</td><td><code>dfn3_prepost.h</code></td><td>pool 切分與 descriptor 版本，進 <code>build_flags_hash</code></td></tr>
 <tr><td>band split 與 DF 算式、<code>state_dict</code> 內不起作用的 alpha 參數</td><td>固定</td><td><code>dfn3_process.c</code>、<code>model.py</code></td><td>保留 alpha 參數只為讓相容的 v5 權重能 strict 載入，不影響推論</td></tr>
 </table></div>
 

@@ -71,6 +71,7 @@ int run_ulcnet(FftHandle *fft, const float *window, int D,
 
     if (ulcnet_prepost_config_defaults(&amp;cfg, ULCNET_IO_TIME, D) != 0) return -1;
     cfg.fft = fft;  cfg.window = window;
+    cfg.istft = istft;          /* ulcnet_framing_config(&amp;sc, fft, window, 0) + ac_istft_init()，應用端持有 */
     if (ulcnet_prepost_get_mem_size(&amp;cfg, &amp;req) != 0) return -1;
     size_t bytes = ((size_t)req.bytes + req.alignment - 1) / req.alignment * req.alignment;
     void *pool = aligned_alloc(req.alignment, bytes);
@@ -175,10 +176,10 @@ caller                         UlcnetPrepost (C)                   NPU runtime
 <tr><td>模型 lookahead</td><td colspan="2">0 hop（同一次 invocation 出同一框）</td><td><a href="aiaec_align_ulcnet.html">aiaec_align_ulcnet</a></td></tr>
 <tr><td>端到端延遲</td><td colspan="2">1 hop（H samples），來自 synthesis 的半窗 trim；hop 0 無輸出，hop p ≥ 1 輸出對應輸入 [(p−1)·H, p·H)</td><td><code>ulcnet_process.h</code></td></tr>
 <tr><td>pool，<code>ULCNET_IO_FREQ</code>，D = 8</td><td>75,248 B</td><td>142,832 B</td><td>本機量測</td></tr>
-<tr><td>pool，<code>ULCNET_IO_TIME</code>，D = 8</td><td>97,040 B</td><td>186,128 B</td><td>本機量測</td></tr>
+<tr><td>pool，<code>ULCNET_IO_TIME</code>，D = 8</td><td>88,752 B</td><td>169,648 B</td><td>本機量測</td></tr>
 <tr><td>adapter pool，D = 8</td><td>75,280 B（FREQ + 32 B header）</td><td>142,864 B</td><td>本機量測</td></tr>
 </table></div>
-<p class="note">其他 D 的 pool 大小（D = 4…64）見 <a href="aiaec_align_ulcnet.html">aiaec_align_ulcnet</a> 的 State 表；pool 隨 D 線性成長，<code>ULCNET_IO_TIME</code> 在 FREQ 之上另加與 D 無關的 framing（16 kHz +21,792 B、48 kHz +43,296 B）。</p>
+<p class="note">其他 D 的 pool 大小（D = 4…64）見 <a href="aiaec_align_ulcnet.html">aiaec_align_ulcnet</a> 的 State 表；pool 隨 D 線性成長，<code>ULCNET_IO_TIME</code> 在 FREQ 之上另加與 D 無關的 framing（16 kHz +13,504 B、48 kHz +26,816 B；合成的 <code>AcIstft</code> 是應用端的物件，不在 pool 內）。</p>
 
 <h2>函式清單：公開 vs 內部</h2>
 <div class="tbl"><table>
@@ -196,6 +197,7 @@ caller                         UlcnetPrepost (C)                   NPU runtime
 <tr><td><code>io_mode</code></td><td><code>UlcnetPrepostConfig</code></td><td><code>ULCNET_IO_TIME</code>(1)／<code>ULCNET_IO_FREQ</code>(0)</td><td>參數</td><td>init 前</td><td>決定 pool 大小；FREQ 不做任何 transform</td></tr>
 <tr><td><code>delay_depth</code>（D）</td><td>同上；<code>UlcnetModelIoDescriptor.delay_depth</code></td><td>整數 2…64</td><td>參數</td><td>init 前；<b>必須等於 export 的 D</b></td><td>決定 K/V／logit window 與 pool 大小；不改權重形狀；跨 grid 不沿用；訓練 <code>config.ini</code> 的 <code>max_delay_frames</code>（出貨 32）與部署 D 可以不同</td></tr>
 <tr><td><code>fft</code>／<code>window</code></td><td>同上</td><td><code>FftHandle*</code>（<code>ULCNET_BINS</code> bins）；<code>ULCNET_N_FFT</code> 個 float</td><td>NULL</td><td>init 前</td><td>TIME 必填；borrowed，須與物件同壽命</td></tr>
+<tr><td><code>istft</code></td><td>同上</td><td><code>AcIstft*</code>，由 <code>ulcnet_framing_config()</code> 描述（ENV_NORM、同一張窗表）</td><td>NULL</td><td>init 前</td><td>TIME 必填；borrowed，記憶體歸應用端，類別在 <code>frame_commit</code> push、<code>reset</code> 一併清；設定或窗表與分析不符時被拒；FREQ 忽略</td></tr>
 <tr><td><code>model_layout_version</code></td><td>同上</td><td>0 或 18</td><td>0（用本 build 的 18）</td><td>init 前</td><td>非 0 時須等於 <code>ULCNET_MODEL_IO_LAYOUT_VERSION</code> 並與 ONNX metadata 一致；用來在載入舊圖時早期拒絕</td></tr>
 <tr><td>grid</td><td>build</td><td>16 kHz／512 或 48 kHz／1024</td><td>16 kHz</td><td>編譯期</td><td>16 kHz checkpoint 不能當 48 kHz 用（頻率軸張量形狀不同），需另訓</td></tr>
 <tr><td><code>--max-delay-frames</code>、<code>--opset</code>(17)、<code>--verify</code></td><td><code>export_onnx.py</code></td><td>D 2…64</td><td>checkpoint 的 D</td><td>匯出</td><td>D 與 PTQ calibration、C 端 descriptor 必須同一個值</td></tr>
@@ -210,7 +212,7 @@ caller                         UlcnetPrepost (C)                   NPU runtime
 <tr><td><code>ULCNET_MODEL_IO_TA_BINS</code>／<code>_HOP</code>／<code>_BINS</code></td><td>⌈BINS/10⌉（26／52）、N_FFT/2、N_FFT/2+1</td><td><code>ulcnet_model_io.h</code></td><td>由 grid 導出，無獨立自由度</td></tr>
 <tr><td><code>ULCNET_MODEL_IO_COMPRESSION_EXP</code></td><td>0.3</td><td><code>ulcnet_model_io.h</code></td><td>host 前後端與訓練 loss 共用；<code>export_onnx.py</code> 拒絕其他指數</td></tr>
 <tr><td><code>ULCNET_FAR_RAW</code>／<code>ULCNET_FAR_ALIGNED</code></td><td>0／1</td><td><code>ulcnet_model_io.h</code></td><td>production descriptor 只驗證 raw；aligned 為診斷模式</td></tr>
-<tr><td><code>ULCNET_PREPOST_CARVE_VERSION</code>／<code>_DESCRIPTOR_VERSION</code>、<code>ULCNET_MODEL_IO_ALIGNMENT</code></td><td>6／1／16</td><td><code>ulcnet_prepost.h</code>、<code>ulcnet_model_io.h</code></td><td>pool 切分與 32-byte descriptor 版本；進 <code>build_flags_hash</code></td></tr>
+<tr><td><code>ULCNET_PREPOST_CARVE_VERSION</code>／<code>_DESCRIPTOR_VERSION</code>、<code>ULCNET_MODEL_IO_ALIGNMENT</code></td><td>7／1／16</td><td><code>ulcnet_prepost.h</code>、<code>ulcnet_model_io.h</code></td><td>pool 切分與 32-byte descriptor 版本；進 <code>build_flags_hash</code></td></tr>
 <tr><td>訓練端 <code>config.ini</code> 的 <code>[model]</code>（<code>gamma</code>、<code>subband_bins</code>、<code>compression_exponent</code>）</td><td>5、2、0.3</td><td><code>Align_ULCNet/config.ini</code></td><td>權重形狀的一部分，寫進 checkpoint contract</td></tr>
 </table></div>
 

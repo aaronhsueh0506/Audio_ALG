@@ -32,6 +32,8 @@
 #   make test                  # build + run the mono chain, board-adapter and stage tests
 #   make NO_STDIO=1 libaudio_pipeline_dfn.a   # stdio-less archive only (no link, so no
 #                              # producer archive is needed)
+#   make audit-no-transform    # PASS/FAIL: no inverse FFT / overlap-add code in the AINR/ and AIAEC/
+#                              # model directories (the synthesis is the application's AcIstft)
 #   make audit-no-stdio        # PASS/FAIL: the NO_STDIO=1 libaudio_pipeline_dfn.a has no
 #                              # fprintf/printf/puts/fputs/stderr refs and a keyed path that
 #                              # differs from the default (stdio) config's
@@ -877,6 +879,14 @@ endif
 .PHONY: test-fp-contract
 test-fp-contract:
 	@scripts/audit_fp_contract.sh $(BACKEND)
+
+# audit-no-transform: source gate over the model directories (AINR/, AIAEC/; non-test .c/.h). The inverse
+# FFT and overlap-add are audiolib's AcIstft, owned by the application; a model directory may configure
+# one (*_framing_config), push into a borrowed one and own an AcStft analysis, but holds no transform code
+# and does not size or construct a synthesis object. Reads source only, builds nothing.
+.PHONY: audit-no-transform
+audit-no-transform:
+	@scripts/audit_no_transform_in_models.sh
 
 # audit-no-stdio: builds libaudio_pipeline_dfn.a with NO_STDIO=1 and asserts, with `nm` over the delivered
 # keyed archive itself, that none of fprintf/printf/puts/fputs/stderr/__stderrp is in it, and that its

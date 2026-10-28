@@ -20,6 +20,8 @@ the independent oracle.
   `aec_only` plan (the latter's `aec_process()` branch was never exercised before). READMEs, `docs/` and the HTML pages that
   said `--aec-only` is `aec_process()` now describe `ctx.linear_hop`.
 
+- `DFN2Prepost`, `DFN3Prepost`, `UlcnetPrepost`, `DeepVqePrepost` in `*_IO_TIME` borrow the application's `AcIstft` (new `istft` field of the config, validated against the model's `*_framing_config()`, reset together with the class; `deepvqe_framing_config()` is new) instead of carving one in their pool, so no model directory sizes or constructs a synthesis object. The pools shrink by one `AcIstft` and `*_PREPOST_CARVE_VERSION` is 8 / 8 / 7 / 6 (stale pools are refused by `_init_ex`); the `*_IO_TIME` output is bit-identical to before (SIMD 1 and 0), the `*_IO_FREQ` pools and outputs do not change. The four board samples that use `*_IO_TIME` build the `AcIstft` themselves. New gates: `make audit-no-transform` (no inverse-FFT / overlap-add code in `AINR/` and `AIAEC/`) and the DFN3 `IO_TIME` vs `IO_FREQ` bitwise test in `test_dfn3_stream.c`.
+
 ### Added (tests)
 - `test_aec_only_output`: the `--aec-only` hop of the rig and of the harness equals `aec_process()` on a second instance of
   the same lane configuration, bit for bit, over 400 hops at 16 kHz/256, 16 kHz/512 and 48 kHz/1024, and the same run

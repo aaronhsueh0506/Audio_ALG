@@ -239,20 +239,16 @@ DUMP_CTX=pipeline_ctx.bin \
 
 ```c
 /* AUDIO_ALG_PIPELINE_EXAMPLE_BEGIN */
-#include <math.h>
 #include <stdint.h>
 #include <stdlib.h>
 #include <string.h>
 
 #include "aec.h"
 #include "aec_res.h"   /* aec_cng_fill */
-#include "fft_wrapper.h"
+#include "audio_stft.h"   /* AcIstft: 唯一的 inverse FFT + overlap-add */
+#include "utility/simd_kernels.h"   /* sk_capply_gain_f32 */
 #include "anr.h"
 #include "anr_types.h"
-
-#ifndef M_PI
-#define M_PI 3.14159265358979323846
-#endif
 
 #define PSD_SCALE                 (32768.0f * 32768.0f)
 
@@ -260,17 +256,14 @@ typedef struct {
     Aec *aec;
     int aec_ready;
     AnrDenoiser *nr;
-    FftHandle *fft;
+    AcIstft *istft;
+    void *istft_mem;
     int hop;
     int frame_size;
     int fft_size;
     int n_freqs;
     int enable_cng;
     uint32_t rng;
-    float *linear;
-    float *window;
-    float *ola;
-    float *ifft_buf;
     float *g_nr;
     float *g_total;
     float *g_aec;
@@ -284,11 +277,7 @@ void audio_alg_destroy(AudioAlgPipeline *p)
     if (p->aec_ready) aec_destroy(p->aec);
     free(p->aec);
     anr_destroy(p->nr);
-    fft_destroy(p->fft);
-    free(p->linear);
-    free(p->window);
-    free(p->ola);
-    free(p->ifft_buf);
+    free(p->istft_mem);
     free(p->g_nr);
     free(p->g_total);
     free(p->g_aec);
@@ -303,7 +292,8 @@ int audio_alg_init(AudioAlgPipeline *p, int sample_rate,
 {
     AecConfig aec_cfg;
     AnrConfig nr_cfg;
-    int k;
+    AcStftConfig synth_cfg;
+    size_t synth_bytes;
 
     if (!p) return -1;
     memset(p, 0, sizeof(*p));
@@ -329,27 +319,26 @@ int audio_alg_init(AudioAlgPipeline *p, int sample_rate,
     nr_cfg = anr_config_for_level_grid(sample_rate, p->fft_size, nr_level);
 
     p->nr = anr_create(&nr_cfg);
-    p->fft = fft_create(p->fft_size);
-    p->linear = (float *)malloc((size_t)p->hop * sizeof(float));
-    p->window = (float *)malloc((size_t)p->frame_size * sizeof(float));
-    p->ola = (float *)calloc((size_t)p->frame_size, sizeof(float));
-    p->ifft_buf = (float *)malloc((size_t)p->fft_size * sizeof(float));
+
+    /* 合成（inverse FFT + sqrt-Hann + overlap-add）是 audiolib 的 AcIstft，由應用端持有；
+     * fft 與窗表由它自己配置（cfg.fft／cfg.window 為 NULL）。 */
+    ac_stft_config_default(&synth_cfg, p->fft_size);
+    synth_bytes = ac_istft_get_mem_size(&synth_cfg);
+    if (synth_bytes == 0) goto fail;
+    p->istft_mem = aligned_alloc(16, (synth_bytes + 15u) / 16u * 16u);
+    if (!p->istft_mem) goto fail;
+    p->istft = ac_istft_init(p->istft_mem, synth_bytes, &synth_cfg);
+
     p->g_nr = (float *)malloc((size_t)p->n_freqs * sizeof(float));
     p->g_total = (float *)malloc((size_t)p->n_freqs * sizeof(float));
     p->g_aec = (float *)malloc((size_t)p->n_freqs * sizeof(float));
     p->extra = (float *)malloc((size_t)p->n_freqs * sizeof(float));
     p->spec = (Complex *)malloc((size_t)p->n_freqs * sizeof(Complex));
 
-    if (!p->nr || !p->fft || !p->linear || !p->window || !p->ola ||
-        !p->ifft_buf || !p->g_nr || !p->g_total || !p->g_aec ||
+    if (!p->nr || !p->istft || !p->g_nr || !p->g_total || !p->g_aec ||
         !p->extra || !p->spec)
         goto fail;
 
-    for (k = 0; k < p->frame_size; ++k) {
-        float hann = 0.5f - 0.5f * cosf(
-            2.0f * (float)M_PI * (float)k / (float)p->frame_size);
-        p->window[k] = sqrtf(hann);
-    }
     return 0;
 
 fail:
@@ -372,7 +361,7 @@ int audio_alg_process(AudioAlgPipeline *p,
     if (!p || !p->aec_ready || !p->nr || !mic || !ref || !out)
         return -1;
 
-    aec_process(p->aec, mic, ref, p->linear);
+    aec_process_context(p->aec, mic, ref);
     aec_get_res_context(p->aec, &ctx);
     if (!ctx.error_spec || !ctx.res_gain || ctx.n_freqs != p->n_freqs)
         return -1;
@@ -393,25 +382,14 @@ int audio_alg_process(AudioAlgPipeline *p,
                       ? p->g_nr[k] : ctx.res_gain[k];
     }
 
-    for (k = 0; k < p->n_freqs; ++k) {
-        p->spec[k].r = ctx.error_spec[k].r * p->g_total[k];
-        p->spec[k].i = ctx.error_spec[k].i * p->g_total[k];
-    }
+    sk_capply_gain_f32(p->spec, ctx.error_spec, p->g_total, p->n_freqs);
 
     if (p->enable_cng && ctx.comfort_noise)   /* 只填 RES 挖掉的 bin，位準乘該 bin 的 NR 增益（下限 -10 dB） */
         aec_cng_fill(&p->rng, p->spec, ctx.comfort_noise, p->g_aec, p->g_nr,
                      0.31622777f, p->n_freqs);
 
-    fft_inverse(p->fft, p->spec, p->ifft_buf);
-    for (k = 0; k < p->frame_size; ++k)
-        p->ola[k] += p->ifft_buf[k] * p->window[k];
-
-    memcpy(out, p->ola, (size_t)p->hop * sizeof(float));
-    memmove(p->ola, p->ola + p->hop,
-            (size_t)(p->frame_size - p->hop) * sizeof(float));
-    memset(p->ola + p->frame_size - p->hop, 0,
-           (size_t)p->hop * sizeof(float));
-    return 0;
+    /* 一個 hop 的輸出：inverse FFT、窗、overlap-add 都在 AcIstft 內。 */
+    return ac_istft_push(p->istft, p->spec, out) == p->hop ? 0 : -1;
 }
 
 void audio_alg_reset(AudioAlgPipeline *p)
@@ -419,7 +397,7 @@ void audio_alg_reset(AudioAlgPipeline *p)
     if (!p || !p->aec_ready || !p->nr) return;
     aec_reset(p->aec);
     anr_reset(p->nr);
-    memset(p->ola, 0, (size_t)p->frame_size * sizeof(float));
+    ac_istft_reset(p->istft);
     p->rng = 0x9e3779b9u;
 }
 /* AUDIO_ALG_PIPELINE_EXAMPLE_END */
@@ -446,7 +424,7 @@ audio_alg_reset(&pipeline);
 audio_alg_destroy(&pipeline);
 ```
 
-這段 wrapper 故意保持在 application 層，沒有宣稱新的 public ABI。若要修改 production constant、CNG RNG 或 failure policy，應在自己的 wrapper 版本化並重新跑品質評測。
+這段 wrapper 故意保持在 application 層，沒有宣稱新的 public ABI。合成由應用端持有的 `AcIstft`（audiolib）負責：RES／降噪增益乘上 `error_spec` 之後交給 `ac_istft_push()`，AEC 本身只送出 `aec_process_context()` 的頻域 context。若要修改 production constant、CNG RNG 或 failure policy，應在自己的 wrapper 版本化並重新跑品質評測。
 
 ## 6. Buffer、尺度與 lifetime
 

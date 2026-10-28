@@ -18,7 +18,7 @@ int  dfn2_prepost_output_frame_index(const DFN2Prepost *p, long long *frame);
 ```
 
 - `cfg` 欄位：`io_mode`、`fft`（`DFN2_IO_TIME` 必填）、`window`（可選，**會被複製**，
-  NULL = 內建 sqrt-Hann，出貨路徑都用 NULL）、`erb_fwd`／`erb_inv`（**兩個模式都必填**，borrowed）、
+  NULL = 內建 sqrt-Hann，出貨路徑都用 NULL）、`istft`（`DFN2_IO_TIME` 必填，應用端持有的 `AcIstft`，borrowed；用 `dfn2_framing_config()` 建）、`erb_fwd`／`erb_inv`（**兩個模式都必填**，borrowed）、
   `atten_lim_db`（0 = 關閉）。
 - **Lookahead pair。** mask lookahead `M`（`DFN2_MASK_LOOKAHEAD`，0..2）與 deep-filter lookahead `D`（`DFN2_DF_LOOKAHEAD`，0..4）
   是建置時決定的一對（共 15 個合法組合，兩者之間沒有大小限制），預設都是 1。匯出的 ONNX graph 不隨這一對改變，隨之改變的是 host 端
@@ -48,22 +48,24 @@ int  dfn2_prepost_output_frame_index(const DFN2Prepost *p, long long *frame);
 
 | 類別 / grid | D | `*_IO_TIME` | `*_IO_FREQ` |
 |---|---:|---:|---:|
-| Align-ULCNet 16 kHz | 4 | 67,856 | 46,064 |
-| Align-ULCNet 16 kHz | 8 | 97,040 | 75,248 |
-| Align-ULCNet 16 kHz | 16 | 155,408 | 133,616 |
-| Align-ULCNet 16 kHz | 32 | 272,144 | 250,352 |
-| Align-ULCNet 16 kHz | 64 | 505,616 | 483,824 |
-| Align-ULCNet 48 kHz | 4 | 130,320 | 87,024 |
-| Align-ULCNet 48 kHz | 8 | 186,128 | 142,832 |
-| Align-ULCNet 48 kHz | 16 | 297,744 | 254,448 |
-| Align-ULCNet 48 kHz | 32 | 520,976 | 477,680 |
-| Align-ULCNet 48 kHz | 64 | 967,440 | 924,144 |
-| DeepVQE-S 16 kHz | 32 | 637,072 | 615,280 |
-| DeepFilterNet2 48 kHz | — | 246,320 | 219,536 |
+| Align-ULCNet 16 kHz | 4 | 59,568 | 46,064 |
+| Align-ULCNet 16 kHz | 8 | 88,752 | 75,248 |
+| Align-ULCNet 16 kHz | 16 | 147,120 | 133,616 |
+| Align-ULCNet 16 kHz | 32 | 263,856 | 250,352 |
+| Align-ULCNet 16 kHz | 64 | 497,328 | 483,824 |
+| Align-ULCNet 48 kHz | 4 | 113,840 | 87,024 |
+| Align-ULCNet 48 kHz | 8 | 169,648 | 142,832 |
+| Align-ULCNet 48 kHz | 16 | 281,264 | 254,448 |
+| Align-ULCNet 48 kHz | 32 | 504,496 | 477,680 |
+| Align-ULCNet 48 kHz | 64 | 950,960 | 924,144 |
+| DeepVQE-S 16 kHz | 32 | 628,784 | 615,280 |
+| DeepFilterNet2 48 kHz | — | 233,936 | 219,536 |
 
-DeepVQE-S 的量體由 16 個 state 張量（每個一份 buffer）主宰。DeepFilterNet2 的 FREQ 比 TIME 小 26,784 bytes：
-`DFN2State` 不內嵌 analysis/window/synthesis 緩衝，TIME 另 carve 分析與合成兩個 audiolib 物件
-（16,480 B 與 12,384 B），FREQ 只多 carve 雙輸入入口的第二組 staging（`apply_re`/`apply_im`）。
+DeepVQE-S 的量體由 16 個 state 張量（每個一份 buffer）主宰。DeepFilterNet2 的 FREQ 比 TIME 小 14,400 bytes：
+`DFN2State` 不內嵌 analysis/window/synthesis 緩衝，TIME 另 carve 輸出 hop staging 與分析用的 `AcStft`
+（16,480 B），FREQ 只多 carve 雙輸入入口的第二組 staging（`apply_re`/`apply_im`）。合成用的 `AcIstft`
+（出貨 1/1 為 12,384 B，借用 FFT handle 與窗表）是應用端的物件，兩個模式的 pool 都不含它；它不隨 D 變，
+所以各列的 TIME 欄都不含 `AcIstft`（Align-ULCNet／DeepVQE-S 的 ENV_NORM 合成：16 kHz grid 8,288 B、48 kHz grid 16,480 B）。
 
 ### 6.8 Framing：一 hop 一框的 analysis
 
@@ -77,7 +79,7 @@ int  ac_stft_push_planar(AcStft *s, const float *hop_in, float *re, float *im);
 center=False，**從第一次 push 起就是一 push 一框**（恆回 1），與 AEC/BF seam 的頻譜同一個慣例，
 所以只有一路頻譜在手的呼叫端可以用它補另一路而兩路保持 hop 對齊。它與 `center` = 1（center=True，
 第一拍 0 框、第二拍 2 框）對同一個 hop 產出的**最後一框 bit-identical**，差別只在 centered 版本多吐一個 reflect-prefix 開頭框。
-DeepVQE-S 在 AIAEC 16 kHz／512 邊界上自建同組態的物件。
+DeepVQE-S 在 AIAEC 16 kHz／512 邊界上用 `deepvqe_framing_config()` 取得同組態（分析與 `AcIstft` 合成共用）。
 
 > **同一個 `AcStft` 不可混用兩種 `center`**：`center` 在建立時固定，兩種排程不共用物件。
 

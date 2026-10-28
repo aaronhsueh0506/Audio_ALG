@@ -193,7 +193,7 @@ vs 上游 4800 Hz）</td><td>編譯期固定；lookahead pair 同 DFN3（出貨 
 <tr><td>DFN rate bridge（原生格點合成 + 48 kHz 分析／合成）</td><td><code>pipelines/dfn/dfn_rate_bridge.c</code>：bridge 自建的兩張表（<code>win_n</code>、<code>win48</code>，<code>ac_window_build()</code>），借給五個 <code>AcStft</code>／<code>AcIstft</code></td></tr>
 <tr><td>ULCNet 兩條範例</td><td><code>pipelines/ulcnet/ulcnet_nn_stage.c</code>：stage 自有的窗表（<code>ac_window_build(s->window, ULCNET_N_FFT)</code>），借給分析與合成物件</td></tr>
 <tr><td>Align-ULCNet／DeepVQE-S 前後處理 class</td><td>呼叫端在 config 給的表（<code>ac_window_build()</code>），分析與合成共用</td></tr>
-<tr><td>DFN2/GTCRN 分析+合成</td><td>呼叫端的 <code>dfn2_framing_config()</code>／<code>gtcrn_framing_config()</code>；窗表由呼叫端借入，或由分析物件自帶、合成物件借用（<code>ac_stft_window()</code>）</td></tr>
+<tr><td>DFN2/GTCRN 分析+合成</td><td>呼叫端的 <code>dfn2_framing_config()</code>／<code>gtcrn_framing_config()</code>；窗表由呼叫端借入，或由分析物件自帶；合成的 <code>AcIstft</code> 一律由呼叫端建立後借給模型（<code>cfg.istft</code>）</td></tr>
 <tr><td>RNNoise-ERB 分析+合成</td>
 <td><code>rnnoise_tables_gen.h</code>（編譯期表；<code>gen_rnnoise_tables.c</code> 呼叫 <code>ac_window_build()</code> 產生，
 <code>test_rnnoise_tables.c</code> 逐 byte drift-guard）</td></tr>
@@ -319,9 +319,9 @@ rolling 排程後兩者天生 hop-locked，不需再靠 centered 排程的 0/2/1
 <td><code>AIAEC/Align_ULCNet/ulcnet_model_io.h</code></td><td>Align-ULCNet 模型 I/O 與 state 排列</td></tr>
 <tr><td><code>DEEPVQE_PREPOST_LAYOUT_VERSION</code> = 4</td>
 <td><code>AIAEC/DeepVQE_S/deepvqe_prepost.h</code></td><td>DeepVQE-S 前後處理 class</td></tr>
-<tr><td><code>DFN2_PREPOST_CARVE_VERSION</code> = 7／<code>DFN3_PREPOST_CARVE_VERSION</code> = 7</td>
+<tr><td><code>DFN2_PREPOST_CARVE_VERSION</code> = 8／<code>DFN3_PREPOST_CARVE_VERSION</code> = 8</td>
 <td><code>AINR/DeepFilterNet2/dfn2_prepost.h</code>、<code>AINR/DeepFilterNet3/dfn3_prepost.h</code></td><td>carve 走訪順序，進 <code>build_flags_hash</code></td></tr>
-<tr><td><code>ULCNET_PREPOST_CARVE_VERSION</code> = 6／<code>DEEPVQE_PREPOST_CARVE_VERSION</code> = 5</td>
+<tr><td><code>ULCNET_PREPOST_CARVE_VERSION</code> = 7／<code>DEEPVQE_PREPOST_CARVE_VERSION</code> = 6</td>
 <td><code>AIAEC/Align_ULCNet/ulcnet_prepost.h</code>、<code>AIAEC/DeepVQE_S/deepvqe_prepost.h</code></td><td>同上</td></tr>
 </table>
 </div>

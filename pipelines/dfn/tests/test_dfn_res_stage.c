@@ -145,23 +145,34 @@ static int capture_via_time_mode(ScaleCapture *cap, FftHandle *fft) {
     static float out_hop[DFN2_HOP_LEN];
     DFN2PrepostConfig cfg;
     DFN2Prepost *p;
+    AcStftConfig synth;
+    void *synth_mem;
+    size_t synth_bytes;
     int hop;
 
     if (dfn2_prepost_config_defaults(&cfg, DFN2_IO_TIME) != 0) return 1;
     cfg.fft = fft;
     cfg.erb_fwd = erb_fwd;
     cfg.erb_inv = erb_inv;
+    /* TIME mode borrows the application's synthesis object. */
+    dfn2_framing_config(&synth, fft, NULL);
+    synth_bytes = ac_istft_get_mem_size(&synth);
+    synth_mem = aligned_alloc(16u, (synth_bytes + 15u) / 16u * 16u);
+    if (!synth_mem) return 2;
+    cfg.istft = ac_istft_init(synth_mem, synth_bytes, &synth);
+    if (!cfg.istft) { free(synth_mem); return 2; }
     p = dfn2_prepost_create(&cfg);
-    if (!p) return 2;
+    if (!p) { free(synth_mem); return 2; }
     for (hop = 0; hop < SCALE_FRAMES; ++hop) {
         DFN2PrepostInputs inputs;
         DFN2PrepostOutputs outputs;
         int valid = -1;
         int need = dfn2_prepost_pre_process(p, g_pcm + (size_t)hop * DFN2_HOP_LEN);
-        if (need < 0) { dfn2_prepost_destroy(p); return 3; }
+        if (need < 0) { dfn2_prepost_destroy(p); free(synth_mem); return 3; }
         if (need == 1) {
             if (dfn2_prepost_frame_inputs(p, &inputs, &outputs) != 0) {
                 dfn2_prepost_destroy(p);
+                free(synth_mem);
                 return 4;
             }
             /* Each recurrent state output is the same buffer as its input. */
@@ -170,20 +181,24 @@ static int capture_via_time_mode(ScaleCapture *cap, FftHandle *fft) {
                 (const void *)inputs.df_convp_window !=
                     (const void *)outputs.df_convp_window_next) {
                 dfn2_prepost_destroy(p);
+                free(synth_mem);
                 return 6;
             }
             if (capturing_infer(cap, &inputs, &outputs) != 0 ||
                 dfn2_prepost_frame_commit(p) != 0) {
                 dfn2_prepost_destroy(p);
+                free(synth_mem);
                 return 4;
             }
         }
         if (dfn2_prepost_post_process(p, out_hop, &valid) != 0) {
             dfn2_prepost_destroy(p);
+            free(synth_mem);
             return 5;
         }
     }
     dfn2_prepost_destroy(p);
+    free(synth_mem);
     return 0;
 }
 

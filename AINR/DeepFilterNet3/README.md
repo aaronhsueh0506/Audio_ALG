@@ -116,7 +116,8 @@ and C descriptors use layout **9**, so the DFN2 layout-8 graph is refused.
 
 - `dfn3_process.c/.h`: independent feature, composition and framing reference.
 - `dfn3_model_io.c/.h`: feature windows, accelerator bindings and state checks.
-- `dfn3_prepost.c/.h`: static-pool/host lifecycle, frequency or time I/O, delayed
+- `dfn3_prepost.c/.h`: static-pool/host lifecycle, frequency or time I/O (time I/O synthesises through the
+  application's `AcIstft`, `cfg.istft`, built from `dfn3_framing_config()`), delayed
   head handoff, reset/skip handling and WOLA using current audiolib APIs.
 
 Use `dfn3_compose_stream()` at the accelerator boundary; `dfn3_compose()` is

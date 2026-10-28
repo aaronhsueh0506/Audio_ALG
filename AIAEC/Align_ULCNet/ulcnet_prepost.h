@@ -11,8 +11,24 @@
  * Analysis is a rolling window over the last ULCNET_N_FFT samples (AcStft with
  * center 0), one frame per hop, the same convention as the AEC spectra.
  *
- * Memory: init() on a caller pool (board) or create() (host). The FftHandle and
- * sqrt-Hann window are caller-owned, required in ULCNET_IO_TIME only. */
+ * Memory: init() on a caller pool (board) or create() (host). The FftHandle,
+ * sqrt-Hann window and synthesis AcIstft are caller-owned, required in
+ * ULCNET_IO_TIME only.
+ *
+ * Inverse FFT and overlap-add are audiolib's AcIstft, never this class's. Two ways
+ * to chain it:
+ *
+ *     // ULCNET_IO_TIME: hand the class the caller's AcIstft; commit pushes into it.
+ *     AcStftConfig sc;  ulcnet_framing_config(&sc, fft, window, 0);
+ *     AcIstft *istft = ac_istft_init(mem, ac_istft_get_mem_size(&sc), &sc);
+ *     cfg.istft = istft;                       // ... ulcnet_prepost_init(...)
+ *     ulcnet_prepost_post_process(p, out_hop, &written);   // hop out
+ *
+ *     // ULCNET_IO_FREQ: spectrum out, the caller pushes its own AcIstft.
+ *     ulcnet_prepost_post_process_freq(p, re, im);
+ *     ac_istft_push_planar(istft, re, im, out_hop);
+ *
+ * The class resets a borrowed AcIstft together with its own state. */
 
 #ifndef ULCNET_PREPOST_H
 #define ULCNET_PREPOST_H
@@ -29,16 +45,16 @@ extern "C" {
 #define ULCNET_PREPOST_DESCRIPTOR_VERSION 1u
 /* Folded into build_flags_hash. Bumped on any change of pool size, carve order
  * or descriptor content, so a pool carved differently is refused by _init_ex. */
-#define ULCNET_PREPOST_CARVE_VERSION 6u
+#define ULCNET_PREPOST_CARVE_VERSION 7u
 
 /* Which side of the transform the caller works on. Fixed at init because it
- * decides the pool size: ULCNET_IO_TIME also carves the analysis and synthesis
- * states and the output hop staging. */
+ * decides the pool size: ULCNET_IO_TIME also carves the analysis states and the
+ * output hop staging. */
 typedef enum UlcnetIoMode {
     /* Spectrum in, spectrum out; the caller owns the transform. fft/window may be NULL. */
     ULCNET_IO_FREQ = 0,
-    /* Hop in, hop out; the class owns framing, windowing and overlap-add and
-     * calls the caller's FftHandle. */
+    /* Hop in, hop out; the class owns the analysis framing and calls the
+     * caller's FftHandle, and synthesises through the caller's AcIstft. */
     ULCNET_IO_TIME = 1
 } UlcnetIoMode;
 
@@ -47,6 +63,7 @@ typedef struct UlcnetPrepostConfig {
     int          delay_depth;  /* D, as exported; ULCNET_MODEL_IO_MIN/MAX_D */
     FftHandle   *fft;          /* ULCNET_IO_TIME: required, borrowed */
     const float *window;       /* ULCNET_IO_TIME: required, borrowed; ULCNET_N_FFT entries from ac_window_build() */
+    AcIstft     *istft;        /* ULCNET_IO_TIME: required, borrowed, built from ulcnet_framing_config() over the same window; ignored in ULCNET_IO_FREQ */
     uint32_t model_layout_version; /* 0 = ULCNET_MODEL_IO_LAYOUT_VERSION; otherwise must equal it and the exported graph metadata */
 } UlcnetPrepostConfig;
 
@@ -72,14 +89,14 @@ _Static_assert(sizeof(UlcnetPrepostMemReq) == 32,
 typedef struct UlcnetPrepost UlcnetPrepost;
 
 /* Fill a config with this build's grid defaults. Returns 0, or -1 on NULL /
- * an io_mode or delay_depth outside its range. `fft`/`window` are left NULL
- * for the caller to set in ULCNET_IO_TIME. */
+ * an io_mode or delay_depth outside its range. `fft`/`window`/`istft` are left
+ * NULL for the caller to set in ULCNET_IO_TIME. */
 int ulcnet_prepost_config_defaults(UlcnetPrepostConfig *cfg,
                                    int io_mode, int delay_depth);
 
 /* Exact pool size. Reject-first: -1 with *req untouched on a NULL argument,
  * an unknown io_mode, a D out of range, or ULCNET_IO_TIME without a usable
- * fft/window. */
+ * fft/window/istft (the AcIstft must match ulcnet_framing_config()). */
 int ulcnet_prepost_get_mem_size(const UlcnetPrepostConfig *cfg,
                                 UlcnetPrepostMemReq *req);
 
@@ -98,11 +115,12 @@ UlcnetPrepost *ulcnet_prepost_init_ex(void *pool, size_t bytes,
 UlcnetPrepost *ulcnet_prepost_create(const UlcnetPrepostConfig *cfg);
 
 /* Frees only what _create allocated; NULL-safe, a no-op on an _init instance.
- * Never touches the caller's fft or window. */
+ * Never frees the caller's fft, window or istft. */
 void ulcnet_prepost_destroy(UlcnetPrepost *p);
 
 /* Zero every recurrent window/hidden tensor, drop any open frame, and reset
- * the framing states. Config and pool are untouched. */
+ * the framing states (a borrowed AcIstft included). Config and pool are
+ * untouched. */
 void ulcnet_prepost_reset(UlcnetPrepost *p);
 
 /* Counter of state restarts: advances on ulcnet_prepost_reset() and when

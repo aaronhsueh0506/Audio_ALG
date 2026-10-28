@@ -71,9 +71,24 @@ static int callback(void *user, const DFN3PrepostInputs *i,
     identity_heads(o);
     return 0;
 }
+/* The caller-owned synthesis object of DFN3_IO_TIME: audiolib's AcIstft from
+ * dfn3_framing_config(), over the shared FFT handle and its own window. */
+static AcIstft *make_istft(FftHandle *fft, const float *window) {
+    AcStftConfig sc;
+    size_t bytes;
+    void *mem;
+    dfn3_framing_config(&sc, fft, window);
+    bytes = ac_istft_get_mem_size(&sc);
+    mem = aligned_alloc(16u, (bytes + 15u) / 16u * 16u);
+    return mem ? ac_istft_init(mem, bytes, &sc) : NULL;
+}
 static int config(DFN3PrepostConfig *cfg, int mode, FftHandle *fft) {
     if (dfn3_prepost_config_defaults(cfg, mode) != 0) return -1;
     cfg->erb_fwd = &fwd[0][0]; cfg->erb_inv = &inv[0][0]; cfg->fft = fft;
+    if (mode == DFN3_IO_TIME) {
+        cfg->istft = make_istft(fft, NULL);
+        if (!cfg->istft) return -1;
+    }
     return 0;
 }
 
@@ -463,6 +478,115 @@ static int time_identity(void) {
     return 0;
 }
 
+/* Heads that depend on the newest feature frame, so the output is neither
+ * silence nor a pass-through. */
+static void input_dependent_heads(const DFN3PrepostInputs *in,
+                                  DFN3PrepostOutputs *o) {
+    const float *erb = in->erb_window[DFN3_MODEL_INPUT_FRAMES - 1];
+    const float *sre = in->spec_window[0][DFN3_MODEL_INPUT_FRAMES - 1];
+    for (int b = 0; b < DFN3_N_ERB; ++b)
+        o->erb_mask[b] = 0.5f + 0.4f * tanhf(0.05f * erb[b]);
+    for (int k = 0; k < DFN3_DF_BINS; ++k)
+        for (int t = 0; t < DFN3_DF_ORDER; ++t) {
+            o->coefs[(k * DFN3_DF_ORDER + t) * 2 + 0] =
+                (t == DFN3_DF_HISTORY ? 0.8f : 0.05f) + 0.02f * tanhf(sre[k]);
+            o->coefs[(k * DFN3_DF_ORDER + t) * 2 + 1] =
+                0.03f * tanhf(sre[k] + (float)t);
+        }
+}
+
+/* DFN3_IO_TIME (the class pushes the caller's AcIstft) against DFN3_IO_FREQ with
+ * a caller-owned AcStft and AcIstft pushed by the caller: the same stand-in heads,
+ * a mid-stream reset, and the output compared bit for bit. A one-sample shifted
+ * compare must differ, so the equality is not an all-zero or constant stream. The
+ * borrowed-synthesis contract is checked too: a mismatching AcIstft is refused. */
+static int time_vs_freq_bitwise(void) {
+    enum { HOPS = 14 + 2 * DFN3_OUTPUT_DELAY, RESET_AT = 9 };
+    static float pcm[HOPS][DFN3_HOP_LEN];
+    static float out_time[HOPS][DFN3_HOP_LEN], out_freq[HOPS][DFN3_HOP_LEN];
+    FftHandle *fft_time = fft_create(DFN3_N_FFT), *fft_freq = fft_create(DFN3_N_FFT);
+    DFN3PrepostConfig ct, cf;
+    DFN3Prepost *pt, *pf;
+    AcStftConfig sc;
+    AcStft *stft;
+    AcIstft *istft;
+    uint32_t seed = 7u;
+    float peak = 0.0f;
+    CHECK(fft_time != NULL && fft_freq != NULL);
+    for (int h = 0; h < HOPS; ++h)
+        for (int n = 0; n < DFN3_HOP_LEN; ++n) {
+            seed = seed * 1664525u + 1013904223u;
+            pcm[h][n] = 0.25f * sinf(0.0123f * (float)(h * DFN3_HOP_LEN + n)) +
+                        0.05f * ((float)((seed >> 8) & 0xffffu) / 32768.0f - 1.0f);
+        }
+    CHECK(config(&ct, DFN3_IO_TIME, fft_time) == 0);
+    CHECK(config(&cf, DFN3_IO_FREQ, NULL) == 0);
+    ct.atten_lim_db = cf.atten_lim_db = -20.0f;
+    pt = dfn3_prepost_create(&ct); CHECK(pt != NULL);
+    pf = dfn3_prepost_create(&cf); CHECK(pf != NULL);
+    dfn3_framing_config(&sc, fft_freq, NULL);
+    stft = ac_stft_init(aligned_alloc(16u, (ac_stft_get_mem_size(&sc) + 15u) / 16u * 16u),
+                        ac_stft_get_mem_size(&sc), &sc);
+    CHECK(stft != NULL);
+    istft = make_istft(fft_freq, ac_stft_window(stft));
+    CHECK(istft != NULL);
+    for (int h = 0; h < HOPS; ++h) {
+        DFN3PrepostInputs in;
+        DFN3PrepostOutputs o;
+        static float sre[DFN3_N_BINS], sim[DFN3_N_BINS], ore[DFN3_N_BINS], oim[DFN3_N_BINS];
+        int n, written = -1, valid = -1;
+        if (h == RESET_AT) {
+            dfn3_prepost_reset(pt); dfn3_prepost_reset(pf);
+            ac_stft_reset(stft); ac_istft_reset(istft);
+        }
+        n = dfn3_prepost_pre_process(pt, pcm[h]);
+        CHECK(n >= 0);
+        if (n) {
+            CHECK(dfn3_prepost_frame_inputs(pt, &in, &o) == 0);
+            input_dependent_heads(&in, &o);
+            CHECK(dfn3_prepost_frame_commit(pt) == 0);
+        }
+        CHECK(dfn3_prepost_post_process(pt, out_time[h], &written) == 0);
+        CHECK(ac_stft_push_planar(stft, pcm[h], sre, sim) == 1);
+        n = dfn3_prepost_pre_process_freq(pf, sre, sim);
+        CHECK(n >= 0);
+        if (n) {
+            CHECK(dfn3_prepost_frame_inputs(pf, &in, &o) == 0);
+            input_dependent_heads(&in, &o);
+            CHECK(dfn3_prepost_frame_commit(pf) == 0);
+        }
+        CHECK(dfn3_prepost_post_process_freq(pf, ore, oim, &valid) == 0);
+        if (valid) CHECK(ac_istft_push_planar(istft, ore, oim, out_freq[h]) == DFN3_HOP_LEN);
+        else memset(out_freq[h], 0, sizeof(out_freq[h]));
+        CHECK((written != 0) == (valid != 0));
+    }
+    for (int h = 0; h < HOPS; ++h)
+        for (int n = 0; n < DFN3_HOP_LEN; ++n)
+            if (fabsf(out_time[h][n]) > peak) peak = fabsf(out_time[h][n]);
+    CHECK(peak > 1e-3f);
+    CHECK(memcmp(out_time, out_freq, sizeof(out_time)) == 0);
+    CHECK(memcmp(&out_time[0][1], &out_freq[0][0], sizeof(out_time) - sizeof(float)) != 0);
+
+    /* The borrowed object is validated, not trusted. */
+    {
+        DFN3PrepostConfig bad = ct;
+        DFN3PrepostMemReq req;
+        AcStftConfig wrong;
+        dfn3_framing_config(&wrong, fft_time, NULL);
+        wrong.ola = AC_OLA_ENV_NORM;
+        bad.istft = ac_istft_init(aligned_alloc(16u, (ac_istft_get_mem_size(&wrong) + 15u) / 16u * 16u),
+                                  ac_istft_get_mem_size(&wrong), &wrong);
+        CHECK(bad.istft != NULL);
+        CHECK(dfn3_prepost_get_mem_size(&bad, &req) == -1);
+        bad.istft = NULL;
+        CHECK(dfn3_prepost_get_mem_size(&bad, &req) == -1);
+        CHECK(dfn3_prepost_get_mem_size(&ct, &req) == 0);
+    }
+    dfn3_prepost_destroy(pt);
+    dfn3_prepost_destroy(pf);
+    return 0;
+}
+
 /* The pool identity carries the lookahead pair. req_dump writes this build's
  * MemReq; req_check hands a dumped one to _init_ex as the expected identity and
  * exits 0 when the outcome is the wanted one: mode 1 = accepted, 0 = refused,
@@ -521,6 +645,7 @@ int main(int argc, char **argv) {
     CHECK(lifecycle_and_transactions() == 0);
     CHECK(dual_input() == 0);
     CHECK(time_identity() == 0);
+    CHECK(time_vs_freq_bitwise() == 0);
     printf("DFN3 %s mask=%d df=%d: raw future taps, layout9, transactions, "
            "reset, dual input, identity delay=%d samples PASS build=%08x "
            "digest=%08x\n",

@@ -36,8 +36,9 @@ struct DFN2Prepost {
     int   io_mode;
     float atten_lim_db;
 
-    /* Framing objects carved from the pool in DFN2_IO_TIME (NULL in DFN2_IO_FREQ);
-     * they borrow the caller's FftHandle and, when given, window. */
+    /* DFN2_IO_TIME only (NULL in DFN2_IO_FREQ). The analysis object is carved
+     * from the pool over the caller's FftHandle and, when given, window; the
+     * synthesis object is the caller's (cfg->istft), borrowed. */
     AcStft      *stft;
     AcIstft     *istft;
 
@@ -162,30 +163,31 @@ static uint32_t pp_build_hash(int io_mode) {
     return ac_memreq_abi_hash(h);
 }
 
-/* Sizing a borrowed table needs only whether the pointer is NULL;
- * ac_stft/ac_istft get_mem_size never read it. */
-static const float pp_sizing_window[1];
-
-/* DFN2_IO_TIME: bytes of the two framing objects, which share the caller's FFT
- * handle and one window table (the caller's, else the one the analysis object
- * carves). */
-static int pp_framing_sizes(const DFN2PrepostConfig *cfg, size_t *stft_bytes,
-                            size_t *istft_bytes) {
+/* DFN2_IO_TIME: bytes of the analysis object, over the caller's FFT handle and
+ * window (NULL = it carves the table). The synthesis object is the caller's. */
+static int pp_framing_size(const DFN2PrepostConfig *cfg, size_t *stft_bytes) {
     AcStftConfig sc;
     dfn2_framing_config(&sc, cfg->fft, cfg->window);
     *stft_bytes = ac_stft_get_mem_size(&sc);
-    dfn2_framing_config(&sc, cfg->fft,
-                        cfg->window ? cfg->window : pp_sizing_window);
-    *istft_bytes = ac_istft_get_mem_size(&sc);
-    return (*stft_bytes != 0 && *istft_bytes != 0) ? 0 : -1;
+    return *stft_bytes != 0 ? 0 : -1;
 }
 
-/* Walk the layout once: base==NULL sizes it, otherwise it also carves (framing
- * blocks returned via stft_block / istft_block, NULL in DFN2_IO_FREQ).
+/* The caller's AcIstft must be the one dfn2_framing_config() describes: the
+ * model's fft size, overlap-add mode and synthesis scale. */
+static int pp_istft_matches(const AcIstft *istft) {
+    AcStftConfig want, got;
+    dfn2_framing_config(&want, NULL, NULL);
+    return istft != NULL && ac_istft_get_config(istft, &got) == 0 &&
+           got.fft_size == want.fft_size && got.ola == want.ola &&
+           got.ispec_scale == want.ispec_scale;
+}
+
+/* Walk the layout once: base==NULL sizes it, otherwise it also carves (the
+ * analysis block returned via stft_block, NULL in DFN2_IO_FREQ).
  * get_mem_size and init share this walk so their order agrees. */
 static int pp_layout(DFN2Prepost *p, unsigned char *base,
                      const DFN2PrepostConfig *cfg, size_t *total,
-                     void **stft_block, void **istft_block) {
+                     void **stft_block) {
     const int io_mode = cfg->io_mode;
     static const size_t float_counts[] = {
         (size_t)PP_FRAMES * DFN2_N_BINS,
@@ -214,18 +216,16 @@ static int pp_layout(DFN2Prepost *p, unsigned char *base,
         return -1;
     if (base && p) p->io = (DFN2ModelIOState *)ptr;
 
-    /* DFN2_IO_TIME only: the output hop staging and the two framing objects. */
+    /* DFN2_IO_TIME only: the output hop staging and the analysis object. */
     if (io_mode == DFN2_IO_TIME) {
-        size_t stft_bytes, istft_bytes;
-        if (pp_framing_sizes(cfg, &stft_bytes, &istft_bytes) != 0) return -1;
+        size_t stft_bytes;
+        if (pp_framing_size(cfg, &stft_bytes) != 0) return -1;
         if (pp_carve(base, &cursor,
                      (size_t)PP_FRAMES * DFN2_HOP_LEN * sizeof(float),
                      &ptr) != 0) return -1;
         if (base && p) p->out_hop = (float *)ptr;
         if (pp_carve(base, &cursor, stft_bytes, &ptr) != 0) return -1;
         if (stft_block) *stft_block = ptr;
-        if (pp_carve(base, &cursor, istft_bytes, &ptr) != 0) return -1;
-        if (istft_block) *istft_block = ptr;
     }
 
     if (p) {
@@ -280,6 +280,7 @@ static int pp_check_config(const DFN2PrepostConfig *cfg) {
         /* Reject-first: a wrong-size handle would break the grid silently. */
         if (!cfg->fft) return -1;
         if (fft_get_n_freqs(cfg->fft) != DFN2_N_BINS) return -1;
+        if (!pp_istft_matches(cfg->istft)) return -1;
     }
     return 0;
 }
@@ -289,7 +290,7 @@ int dfn2_prepost_get_mem_size(const DFN2PrepostConfig *cfg,
     size_t total = 0;
 
     if (!req || pp_check_config(cfg) != 0) return -1;
-    if (pp_layout(NULL, NULL, cfg, &total, NULL, NULL) != 0) return -1;
+    if (pp_layout(NULL, NULL, cfg, &total, NULL) != 0) return -1;
 
     memset(req, 0, sizeof(*req));
     req->descriptor_version = DFN2_PREPOST_DESCRIPTOR_VERSION;
@@ -303,8 +304,8 @@ int dfn2_prepost_get_mem_size(const DFN2PrepostConfig *cfg,
 
 /* ---- lifecycle ------------------------------------------------------- */
 
-/* Bring DFN2State (with the framing objects) and DFN2ModelIOState to their
- * init values and reapply the borrowed ERB matrices. */
+/* Bring DFN2State (with the framing objects, the caller's AcIstft included) and
+ * DFN2ModelIOState to their init values and reapply the borrowed ERB matrices. */
 static void pp_reset_states(DFN2Prepost *p) {
     dfn2_state_init(p->dsp, p->stft, p->istft);
     dfn2_set_erb_matrices(p->dsp, p->erb_fwd, p->erb_inv);
@@ -340,7 +341,6 @@ DFN2Prepost *dfn2_prepost_init_ex(void *pool, size_t bytes,
     DFN2Prepost *p;
     size_t total = 0;
     void *stft_block = NULL;
-    void *istft_block = NULL;
     int i;
 
     if (!pool || dfn2_prepost_get_mem_size(cfg, &req) != 0) return NULL;
@@ -367,22 +367,23 @@ DFN2Prepost *dfn2_prepost_init_ex(void *pool, size_t bytes,
     p->erb_fwd = cfg->erb_fwd;
     p->erb_inv = cfg->erb_inv;
 
-    if (pp_layout(p, (unsigned char *)pool, cfg, &total, &stft_block,
-                  &istft_block) != 0)
+    if (pp_layout(p, (unsigned char *)pool, cfg, &total, &stft_block) != 0)
         return NULL;
     if (total != (size_t)req.bytes) return NULL;   /* sizing/carve agreement */
 
     if (cfg->io_mode == DFN2_IO_TIME) {
-        size_t stft_bytes, istft_bytes;
-        AcStftConfig sc;
-        if (pp_framing_sizes(cfg, &stft_bytes, &istft_bytes) != 0)
-            return NULL;
+        size_t stft_bytes;
+        AcStftConfig sc, synth;
+        if (pp_framing_size(cfg, &stft_bytes) != 0) return NULL;
         dfn2_framing_config(&sc, cfg->fft, cfg->window);
         p->stft = ac_stft_init(stft_block, stft_bytes, &sc);
         if (!p->stft) return NULL;
-        dfn2_framing_config(&sc, cfg->fft, ac_stft_window(p->stft));
-        p->istft = ac_istft_init(istft_block, istft_bytes, &sc);
-        if (!p->istft) return NULL;
+        /* Analysis and synthesis must share one window (sqrt-Hann pair). */
+        if (ac_istft_get_config(cfg->istft, &synth) != 0 ||
+            memcmp(synth.window, ac_stft_window(p->stft),
+                   (size_t)DFN2_WIN_LEN * sizeof(float)) != 0)
+            return NULL;
+        p->istft = cfg->istft;
     }
 
     for (i = 0; i < DFN2_N_ERB; ++i) p->skip_mask[i] = 1.0f;

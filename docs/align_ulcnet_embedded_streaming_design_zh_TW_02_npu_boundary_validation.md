@@ -144,7 +144,7 @@ Concat 的結果同時是 attention 的候選與 `*_out`，沒有任何 state �
   輸出。沒有複製路徑，也沒有 ping-pong；CPU 端沒有
   ring helper。
 - **layout**：`ULCNET_MODEL_IO_LAYOUT_VERSION` = 18，`ULCNET_PREPOST_CARVE_VERSION`
-  = 6；3–17 退役。
+  = 7；3–17 退役。
 - **`prepare()`** 只對 `output` 預填 NaN，state 不預填（它同時是下一幀的輸入）。
 - **`commit()` 不更新 state**：先檢查 `output`（mask）有限、`h_gru` 有限，以及每個
   channel 中 graph 這一幀新寫的那一格（K/V 的 slot 0、logit 的最後一幀）有限。

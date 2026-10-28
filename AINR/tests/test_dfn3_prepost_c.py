@@ -23,6 +23,7 @@ the inverse matrix through the enhanced spectrum.
 """
 import ctypes
 from pathlib import Path
+import struct
 import subprocess
 import sys
 
@@ -62,6 +63,7 @@ class _Config(ctypes.Structure):
     _fields_ = [('io_mode', ctypes.c_int),
                 ('fft', ctypes.c_void_p),
                 ('window', ctypes.c_void_p),
+                ('istft', ctypes.c_void_p),
                 ('erb_fwd', ctypes.c_void_p),
                 ('erb_inv', ctypes.c_void_p),
                 ('atten_lim_db', ctypes.c_float)]
@@ -87,6 +89,26 @@ class _Outputs(ctypes.Structure):
                 ('coefs_elements', ctypes.c_size_t),
                 ('gru_hidden_elements', ctypes.c_size_t),
                 ('df_convp_window_elements', ctypes.c_size_t)]
+
+
+def _make_istft(dll, fft, ola=None):
+    """The caller-owned synthesis object of DFN3_IO_TIME: audiolib's AcIstft
+    built from dfn3_framing_config() over the shared FFT handle.  ``ola``
+    overrides the overlap-add mode (AcStftConfig field 3), to build an object
+    that is not the model's.  Returns the handle and the buffer that backs it
+    (keep both alive)."""
+    config = ctypes.create_string_buffer(128)
+    dll.dfn3_framing_config(config, fft, None)
+    if ola is not None:
+        struct.pack_into('i', config, 8, ola)
+    size = dll.ac_istft_get_mem_size(config)
+    assert size
+    raw = ctypes.create_string_buffer(size + 16)
+    base = ctypes.addressof(raw)
+    block = base + (-base) % 16
+    handle = dll.ac_istft_init(block, size, config)
+    assert handle
+    return handle, raw
 
 
 def _erb_pair(reverse_bands=False):
@@ -146,6 +168,12 @@ def lib(request, tmp_path_factory):
     dll.fft_create.argtypes = [ci]
     dll.fft_create.restype = vp
     dll.fft_destroy.argtypes = [vp]
+    dll.dfn3_framing_config.argtypes = [vp, vp, vp]
+    dll.dfn3_framing_config.restype = None
+    dll.ac_istft_get_mem_size.argtypes = [vp]
+    dll.ac_istft_get_mem_size.restype = ctypes.c_size_t
+    dll.ac_istft_init.argtypes = [vp, ctypes.c_size_t, vp]
+    dll.ac_istft_init.restype = vp
     dll.dfn3_prepost_config_defaults.argtypes = [ctypes.POINTER(_Config), ci]
     dll.dfn3_prepost_config_defaults.restype = ci
     dll.dfn3_prepost_create.argtypes = [ctypes.POINTER(_Config)]
@@ -278,6 +306,7 @@ def test_accessors_report_the_fixed_grid_and_the_configured_mode(lib, pair_a):
     fwd, inv = pair_a
     fft = lib.fft_create(1024)
     assert fft
+    istft, istft_backing = _make_istft(lib, fft)
     try:
         for mode in (IO_FREQ, IO_TIME):
             cfg = _Config()
@@ -286,6 +315,7 @@ def test_accessors_report_the_fixed_grid_and_the_configured_mode(lib, pair_a):
             cfg.erb_inv = ctypes.cast(_fp(inv), ctypes.c_void_p)
             if mode == IO_TIME:
                 cfg.fft = fft
+                cfg.istft = istft
             handle = lib.dfn3_prepost_create(ctypes.byref(cfg))
             assert handle
             try:
@@ -294,6 +324,33 @@ def test_accessors_report_the_fixed_grid_and_the_configured_mode(lib, pair_a):
                 assert lib.dfn3_prepost_io_mode(handle) == mode
             finally:
                 lib.dfn3_prepost_destroy(handle)
+    finally:
+        lib.fft_destroy(fft)
+
+
+def test_time_mode_requires_the_callers_synthesis_object(lib, pair_a):
+    """DFN3_IO_TIME borrows the caller's AcIstft: without one the class is
+    refused, and a synthesis object in the other overlap-add mode is refused
+    too."""
+    fwd, inv = pair_a
+    fft = lib.fft_create(1024)
+    assert fft
+    istft, backing = _make_istft(lib, fft)
+    wrong, wrong_backing = _make_istft(lib, fft, ola=1)
+    try:
+        cfg = _Config()
+        assert lib.dfn3_prepost_config_defaults(
+            ctypes.byref(cfg), IO_TIME) == 0
+        cfg.erb_fwd = ctypes.cast(_fp(fwd), ctypes.c_void_p)
+        cfg.erb_inv = ctypes.cast(_fp(inv), ctypes.c_void_p)
+        cfg.fft = fft
+        assert not lib.dfn3_prepost_create(ctypes.byref(cfg))
+        cfg.istft = wrong
+        assert not lib.dfn3_prepost_create(ctypes.byref(cfg))
+        cfg.istft = istft
+        handle = lib.dfn3_prepost_create(ctypes.byref(cfg))
+        assert handle
+        lib.dfn3_prepost_destroy(handle)
     finally:
         lib.fft_destroy(fft)
 

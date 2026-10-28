@@ -77,12 +77,12 @@
 | `PL` pipelines（common、mono、DFN、4ch、ULCNet 範例）與其 Python 參考 | 325 | 85 | 37 | 48 | 240 | 0 | 30 | 36 |
 | `TP` audiolib (doa/bf/VAD/common/utility) | 65 | 0 | 0 | 0 | 65 | 0 | 0 | 0 |
 | `AC` audiolib | 283 | 39 | 19 | 20 | 244 | 0 | 0 | 12 |
-| `AINR` AINR（DFN2、GTCRN、RNNoise-ERB） | 111 | 55 | 29 | 26 | 56 | 0 | 2 | 20 |
-| `AIAEC` AIAEC（Align-ULCNet、DeepVQE-S、共用 helper） | 112 | 40 | 17 | 23 | 72 | 0 | 0 | 21 |
-| `TOTAL` 合計 | 896 | 219 | 102 | 117 | 677 | 0 | 32 | 89 |
+| `AINR` AINR（DFN2、GTCRN、RNNoise-ERB） | 112 | 55 | 29 | 26 | 57 | 0 | 2 | 20 |
+| `AIAEC` AIAEC（Align-ULCNet、DeepVQE-S、共用 helper） | 114 | 40 | 17 | 23 | 74 | 0 | 0 | 21 |
+| `TOTAL` 合計 | 899 | 219 | 102 | 117 | 680 | 0 | 32 | 89 |
 <!-- map:stats:end -->
 
-讀法：896 個 C 函式中，219 個有 Python 對應（mirror 102、partial 117），其中 89 個的配對是推論；677 個是 C-only；未能判斷 0 個。另有 32 個 Python 符號只在 Python。
+讀法：899 個 C 函式中，219 個有 Python 對應（mirror 102、partial 117），其中 89 個的配對是推論；680 個是 C-only；未能判斷 0 個。另有 32 個 Python 符號只在 Python。
 
 「已對應」是**索引**，不是「已驗證一致」。真正量過數值的只有「對拍工具／測試」欄標（C↔Py）的項目，以及備註內註明為一次性量測的數字；其餘靠「已知落差」欄的編號。
 
@@ -163,7 +163,7 @@
 | `audiolib/common/src/fft_wrapper_ne10.c` | all | 12 |
 | `audiolib/common/src/hpf.c` | all | 8 |
 | `AINR/DeepFilterNet2/dfn2_model_io.c` | all | 13 |
-| `AINR/DeepFilterNet2/dfn2_prepost.c` | all | 42 |
+| `AINR/DeepFilterNet2/dfn2_prepost.c` | all | 43 |
 | `AINR/DeepFilterNet2/dfn2_process.c` | all | 17 |
 | `AINR/GTCRN/gtcrn_process.c` | all | 19 |
 | `AINR/RNNoise-ERB/gen_rnnoise_tables.c` | all | 7 |
@@ -171,9 +171,9 @@
 | `AIAEC/Align_ULCNet/ulcnet_accelerator_adapter.c` | all | 9 |
 | `AIAEC/Align_ULCNet/ulcnet_model_io.c` | all | 27 |
 | `AIAEC/Align_ULCNet/ulcnet_model_io.h` | all | 1 |
-| `AIAEC/Align_ULCNet/ulcnet_prepost.c` | all | 27 |
+| `AIAEC/Align_ULCNet/ulcnet_prepost.c` | all | 28 |
 | `AIAEC/Align_ULCNet/ulcnet_process.c` | all | 2 |
-| `AIAEC/DeepVQE_S/deepvqe_prepost.c` | all | 39 |
+| `AIAEC/DeepVQE_S/deepvqe_prepost.c` | all | 40 |
 | `AIAEC/DeepVQE_S/deepvqe_process.c` | all | 3 |
 | `AIAEC/aiaec_process.c` | all | 4 |
 <!-- map:coverage:end -->
@@ -328,8 +328,8 @@
 | AINR-DFN2-21 | `AINR/DeepFilterNet2/dfn2_prepost.c: dfn2_prepost_hop_size` | `pipelines/dfn/dfn2_stage.py:HOP` | partial | — | — | （推論）C 是存取函式，Python 是常數。 |
 | AINR-DFN2-22 | `AINR/DeepFilterNet2/dfn2_prepost.c: dfn2_prepost_num_bins` | `pipelines/dfn/dfn2_stage.py:N_BINS` | partial | — | — | （推論）C 是存取函式，Python 是常數。 |
 | AINR-DFN2-23 | `AINR/DeepFilterNet2/dfn2_prepost.c: dfn2_model_run_frame` | `pipelines/dfn/dfn2_stage.py:Dfn2Heads.__call__` | partial | — | — | （推論）加速器 callback 邊界；Python 端是 heads 可呼叫物件。 |
-| AINR-DFN2-24 | `AINR/DeepFilterNet2/dfn2_prepost.c: dfn2_prepost_pre_process, dfn2_prepost_post_process` | — | C-only | D-33 | — | TIME 模式（由類別自己擁有 STFT／WOLA）；Python 側由 inference.py 的 torch.stft／istft 取代，見 AINR-DFN2-03、04。 |
-| AINR-DFN2-25 | `AINR/DeepFilterNet2/dfn2_prepost.c: pp_carve, pp_fnv1a_u32, pp_fnv1a_str, pp_build_hash, pp_framing_sizes, pp_layout, dfn2_prepost_config_defaults, pp_check_config, dfn2_prepost_get_mem_size, pp_reset_states, pp_clear_frame, pp_zero_staging, dfn2_prepost_init_ex, dfn2_prepost_init, dfn2_prepost_create, dfn2_prepost_destroy, dfn2_prepost_state_generation, dfn2_prepost_io_mode, dfn2_prepost_layout_version, pp_all_finite, pp_fill_nan` | — | C-only | T-14 | — | 記憶體池佈局、設定檢查、build hash、生命週期、存取函式。 |
+| AINR-DFN2-24 | `AINR/DeepFilterNet2/dfn2_prepost.c: dfn2_prepost_pre_process, dfn2_prepost_post_process` | — | C-only | D-33 | — | TIME 模式（STFT 由類別擁有，合成經應用端的 `AcIstft`（`cfg.istft`））；Python 側由 inference.py 的 torch.stft／istft 取代，見 AINR-DFN2-03、04。 |
+| AINR-DFN2-25 | `AINR/DeepFilterNet2/dfn2_prepost.c: pp_carve, pp_fnv1a_u32, pp_fnv1a_str, pp_build_hash, pp_framing_size, pp_istft_matches, pp_layout, dfn2_prepost_config_defaults, pp_check_config, dfn2_prepost_get_mem_size, pp_reset_states, pp_clear_frame, pp_zero_staging, dfn2_prepost_init_ex, dfn2_prepost_init, dfn2_prepost_create, dfn2_prepost_destroy, dfn2_prepost_state_generation, dfn2_prepost_io_mode, dfn2_prepost_layout_version, pp_all_finite, pp_fill_nan` | — | C-only | T-14 | — | 記憶體池佈局、設定檢查、build hash、生命週期、存取函式。 |
 | AINR-DFN2-26 | `AINR/DeepFilterNet2/dfn2_model_io.c: dfn2_model_io_frame_slot`<br>`AINR/DeepFilterNet2/dfn2_prepost.c: pp_input_slot, pp_deliver_slot, pp_deliver` | `AINR/DeepFilterNet2/export_onnx.py:feature_chunk_windows` | partial | — | `AINR/tests/test_dfn2_frames_per_call_c.py`（C 對 C） | （推論）每次 invocation N 個 frame：最後一個推入 frame 完成的是第幾個 head（`index % N`）、輸入視窗與輸出 head 的槽位，以及一次 commit 後把 N 個 frame 依序合成並逐 hop 交出；Python 側只有匯出端的 N+2 視窗切法，沒有 host 孿生（`dfn2_stage.py` 固定 N=1）。N=1 時槽位恆為 0。 |
 | AINR-GTCRN-01 | `AINR/GTCRN/gtcrn_process.c: gtcrn_model_input` | `AINR/GTCRN/stream_model.py:stream_features` | mirror | — | `AINR/tests/test_python_c_prepost_parity.py`（C↔Py） | 主機側 ERB 前端（mag／re／im）；mag 3.8e-6、re／im 9.5e-7（一次性量測）。 |
 | AINR-GTCRN-02 | `AINR/GTCRN/gtcrn_process.c: gtcrn_model_output` | `AINR/GTCRN/stream_model.py:host_synthesis` | mirror | — | `AINR/tests/test_python_c_prepost_parity.py`（C↔Py） | 複數比值遮罩套用與 ERB 逆展開；200 幀逐位元相同。 |
@@ -362,14 +362,14 @@
 | AIAEC-UL-06 | `AIAEC/Align_ULCNet/ulcnet_prepost.c: ulcnet_prepost_frame_inputs` | `AIAEC/Align_ULCNet/export_onnx.py:stream_features` | partial | T-14 | — | （推論）把一框頻譜送進 model I/O 的 prepare。 |
 | AIAEC-UL-07 | `AIAEC/Align_ULCNet/ulcnet_prepost.c: ulcnet_prepost_frame_commit` | `AIAEC/Align_ULCNet/export_onnx.py:host_back_end` | partial | T-14 | — | （推論）把圖輸出送進 model I/O 的 commit。 |
 | AIAEC-UL-08 | `AIAEC/Align_ULCNet/ulcnet_process.c: ulcnet_framing_config` | `AIAEC/aiaec_streaming.py:StreamSTFT.__init__` | partial | D-34 | `AIAEC/tests/test_ulcnet_process_c.py`（C↔Py） | AcStft／AcIstft 的 ULCNet 設定（窗、hop、正規化模式）。該測試以這個設定驅動 AcStft／AcIstft，逐框對 `StreamSTFT`／`StreamISTFT` 比對（一次性量測：center=0 滾動框第 j 幀對 `StreamSTFT(center=True)` 最大差 9.5e-7）。 |
-| AIAEC-UL-09 | `AIAEC/Align_ULCNet/ulcnet_prepost.c: pp_carve, pp_fnv1a, pp_build_hash, pp_framing_sizes, pp_layout, ulcnet_prepost_config_defaults, pp_check_config, pp_descriptor_for, ulcnet_prepost_get_mem_size, ulcnet_prepost_init_ex, ulcnet_prepost_init, ulcnet_prepost_create, ulcnet_prepost_destroy, ulcnet_prepost_reset, ulcnet_prepost_state_generation, ulcnet_prepost_hop_size, ulcnet_prepost_num_bins, ulcnet_prepost_io_mode, ulcnet_prepost_descriptor, pp_close_frame, ulcnet_prepost_frame_skip`<br>`AIAEC/Align_ULCNet/ulcnet_process.c: ulcnet_frame_is_finite`<br>`AIAEC/Align_ULCNet/ulcnet_model_io.c: checked_add, checked_mul, align_up, add_float_region, add_float_regions, compute_counts, ulcnet_model_io_descriptor_default, ulcnet_model_io_align_up, ulcnet_far_input_mode_name, ulcnet_model_io_descriptor_validate, ulcnet_model_io_get_mem_requirements, carve_float, ulcnet_model_io_init, clear_recurrent_state, ulcnet_model_io_reset, ulcnet_model_io_state_generation, frame_is_finite, ulcnet_model_io_descriptor`<br>`AIAEC/Align_ULCNet/ulcnet_accelerator_adapter.c: adapter_config, adapter_layout, ulcnet_accelerator_adapter_get_mem_size, ulcnet_accelerator_adapter_init, infer, reset, ulcnet_accelerator_adapter_state_generation, ulcnet_accelerator_adapter_descriptor, ulcnet_accelerator_adapter_model` | — | C-only | T-14 | — | 記憶體池佈局、描述子驗證、遞迴狀態環（in-place）、有限性掃描、加速器 adapter 與 callback 步進；沒有 Python 孿生。 |
+| AIAEC-UL-09 | `AIAEC/Align_ULCNet/ulcnet_prepost.c: pp_carve, pp_fnv1a, pp_build_hash, pp_framing_size, pp_istft_matches, pp_layout, ulcnet_prepost_config_defaults, pp_check_config, pp_descriptor_for, ulcnet_prepost_get_mem_size, ulcnet_prepost_init_ex, ulcnet_prepost_init, ulcnet_prepost_create, ulcnet_prepost_destroy, ulcnet_prepost_reset, ulcnet_prepost_state_generation, ulcnet_prepost_hop_size, ulcnet_prepost_num_bins, ulcnet_prepost_io_mode, ulcnet_prepost_descriptor, pp_close_frame, ulcnet_prepost_frame_skip`<br>`AIAEC/Align_ULCNet/ulcnet_process.c: ulcnet_frame_is_finite`<br>`AIAEC/Align_ULCNet/ulcnet_model_io.c: checked_add, checked_mul, align_up, add_float_region, add_float_regions, compute_counts, ulcnet_model_io_descriptor_default, ulcnet_model_io_align_up, ulcnet_far_input_mode_name, ulcnet_model_io_descriptor_validate, ulcnet_model_io_get_mem_requirements, carve_float, ulcnet_model_io_init, clear_recurrent_state, ulcnet_model_io_reset, ulcnet_model_io_state_generation, frame_is_finite, ulcnet_model_io_descriptor`<br>`AIAEC/Align_ULCNet/ulcnet_accelerator_adapter.c: adapter_config, adapter_layout, ulcnet_accelerator_adapter_get_mem_size, ulcnet_accelerator_adapter_init, infer, reset, ulcnet_accelerator_adapter_state_generation, ulcnet_accelerator_adapter_descriptor, ulcnet_accelerator_adapter_model` | — | C-only | T-14 | — | 記憶體池佈局、描述子驗證、遞迴狀態環（in-place）、有限性掃描、加速器 adapter 與 callback 步進；沒有 Python 孿生。 |
 | AIAEC-DV-01 | `AIAEC/DeepVQE_S/deepvqe_prepost.c: compress_planar` | `AIAEC/aiaec_common.py:compressed_ri_feature` | mirror | — | `AIAEC/tests/test_prepost_kernels.py`（NEON 對純量） | 壓縮 mic／far 最大差 4.77e-7（一次性量測）。 |
 | AIAEC-DV-02 | `AIAEC/DeepVQE_S/deepvqe_process.c: deepvqe_ccm_init, deepvqe_ccm_process, ccm_edge_bin` | `AIAEC/DeepVQE_S/model.py:DeepVQES._apply_ccm_frame`<br>`AIAEC/aiaec_common.py:apply_causal_tf_filter`<br>`AIAEC/_export_common.py:COMPOSITION` | mirror | — | `AIAEC/tests/test_ulcnet_process_c.py`（C↔Py） | 複數卷積遮罩（CCM）；最大差 7.63e-6（峰值 95）。兩個邊緣 bin 的越界 tap 略過，與乘零不同。 |
 | AIAEC-DV-03 | `AIAEC/DeepVQE_S/deepvqe_prepost.c: deepvqe_prepost_pre_process, deepvqe_prepost_pre_process_freq, deepvqe_prepost_frame_inputs` | `AIAEC/aiaec_streaming.py:StreamSTFT.push`<br>`AIAEC/aiaec_common.py:compressed_ri_feature` | partial | D-34；T-14 | `AIAEC/tests/test_deepvqe_prepost_c.py`（C 對 C） | （推論）center=0 滾動框加壓縮特徵。 |
 | AIAEC-DV-04 | `AIAEC/DeepVQE_S/deepvqe_prepost.c: deepvqe_prepost_post_process, deepvqe_prepost_post_process_freq, deepvqe_prepost_frame_commit` | `AIAEC/DeepVQE_S/model.py:DeepVQES._apply_ccm_frame`<br>`AIAEC/aiaec_streaming.py:StreamISTFT.push` | partial | D-34；T-14 | `AIAEC/tests/test_deepvqe_prepost_c.py`（C 對 C） | （推論）CCM 輸出頻譜經 WOLA 合成。 |
 | AIAEC-DV-05 | `AIAEC/DeepVQE_S/deepvqe_prepost.c: deepvqe_prepost_state_shape, deepvqe_prepost_state_elements, deepvqe_prepost_state_name, deepvqe_prepost_state_name_out, deepvqe_prepost_skip_policy_name, dv_valid_depth` | `AIAEC/_streaming_export.py:StatelessOneFrameAIAEC.state_names` | partial | T-14 | — | （推論）C 側的狀態張量名稱與形狀逐字對應匯出器的 input_names；契約變動要同時 bump layout 版本。 |
 | AIAEC-DV-06 | `AIAEC/DeepVQE_S/deepvqe_prepost.c: deepvqe_prepost_descriptor_default, deepvqe_prepost_descriptor_validate, deepvqe_prepost_descriptor` | `AIAEC/_streaming_export.py:c_descriptor` | partial | T-14 | — | （推論）描述子對匯出器寫入的 metadata。 |
-| AIAEC-DV-07 | `AIAEC/DeepVQE_S/deepvqe_prepost.c: pp_carve, pp_fnv1a, pp_build_hash, pp_framing_config, pp_layout, deepvqe_prepost_config_defaults, pp_check_config, deepvqe_prepost_get_mem_size, deepvqe_prepost_init_ex, deepvqe_prepost_init, deepvqe_prepost_create, deepvqe_prepost_destroy, zero_state, deepvqe_prepost_reset, deepvqe_prepost_state_generation, deepvqe_prepost_hop_size, deepvqe_prepost_num_bins, deepvqe_prepost_io_mode, fill_nan, all_finite, pp_close_frame, newest_frame_finite, deepvqe_prepost_frame_skip` | — | C-only | T-14 | — | 記憶體池佈局、設定檢查、build hash、生命週期、有限性掃描、NaN 填充；沒有 Python 孿生。 |
+| AIAEC-DV-07 | `AIAEC/DeepVQE_S/deepvqe_prepost.c: pp_carve, pp_fnv1a, pp_build_hash, deepvqe_framing_config, pp_istft_matches, pp_layout, deepvqe_prepost_config_defaults, pp_check_config, deepvqe_prepost_get_mem_size, deepvqe_prepost_init_ex, deepvqe_prepost_init, deepvqe_prepost_create, deepvqe_prepost_destroy, zero_state, deepvqe_prepost_reset, deepvqe_prepost_state_generation, deepvqe_prepost_hop_size, deepvqe_prepost_num_bins, deepvqe_prepost_io_mode, fill_nan, all_finite, pp_close_frame, newest_frame_finite, deepvqe_prepost_frame_skip` | — | C-only | T-14 | — | 記憶體池佈局、設定檢查、build hash、生命週期、有限性掃描、NaN 填充；沒有 Python 孿生。 |
 | AIAEC-MASK-01 | `AIAEC/aiaec_process.c: aiaec_apply_complex_mask` | `AIAEC/aiaec_common.py:complex_mask`<br>`AIAEC/_export_common.py:COMPOSITION` | mirror | — | `AIAEC/tests/test_ulcnet_process_c.py`（C↔Py，逐位元） | CAGCRN 的 host 複數 mask 乘法（`_export_common.COMPOSITION` 表指定）。 |
 | AIAEC-MASK-02 | `AIAEC/aiaec_process.c: aiaec_apply_ulcnet_compressed_mask, aiaec_signed_pow` | `AIAEC/Align_ULCNet/export_onnx.py:host_back_end`<br>`AIAEC/_export_common.py:COMPOSITION` | mirror | D-34 | `AIAEC/tests/test_ulcnet_process_c.py`（C↔Py，<2e-5） | Align-ULCNet 的 host 後處理（`_export_common.COMPOSITION` 表指定），與 AIAEC-UL-02 的 back_end 是同一數學。 |
 | AIAEC-MASK-03 | `AIAEC/aiaec_process.c: aiaec_apply_real_mask` | `AIAEC/Align_CRUSE/model.py:AlignCRUSE.forward`<br>`AIAEC/_export_common.py:COMPOSITION` | partial | D-36 | `AIAEC/tests/test_ulcnet_process_c.py`（C↔Py，逐位元，對內聯 torch 算式） | 實數幅度 mask（Align-CRUSE 的 `enhanced = microphone * mask`）。Align-CRUSE 沒有 C pre/post 類別，C 只提供這個共用 helper。 |

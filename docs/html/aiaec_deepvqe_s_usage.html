@@ -40,9 +40,9 @@ th{background:#eef1f5}
 
 <h2>如何呼叫使用</h2>
 <ol>
-<li>準備 512 點 <code>FftHandle</code> 與 sqrt-Hann 窗表（<code>ac_window_build(w, 512)</code>）；<code>DEEPVQE_IO_TIME</code> 兩者必填，<code>DEEPVQE_IO_FREQ</code> 可為 NULL。皆 borrowed。</li>
+<li>準備 512 點 <code>FftHandle</code>、sqrt-Hann 窗表（<code>ac_window_build(w, 512)</code>）與合成用的 <code>AcIstft</code>（<code>deepvqe_framing_config(&amp;sc, fft, w)</code> 取設定、<code>ac_istft_get_mem_size()</code>／<code>ac_istft_init()</code> 建，歸應用端）；<code>DEEPVQE_IO_TIME</code> 三者必填，<code>DEEPVQE_IO_FREQ</code> 可為 NULL。皆 borrowed。</li>
 <li><code>deepvqe_prepost_config_defaults(&amp;cfg, io_mode, D)</code>：D = alignment 搜尋深度，範圍 <code>DEEPVQE_PREPOST_MIN_D</code>(1)…<code>MAX_D</code>(256)，預設 <code>DEEPVQE_PREPOST_DEFAULT_D</code>(32)（16 kHz 上 0.5 秒）。<b>D 必須等於匯出該 ONNX 時的 D</b>（<code>export_onnx.py --max-delay-frames</code>，未給則用 checkpoint 的 D）。</li>
-<li><code>deepvqe_prepost_get_mem_size(&amp;cfg, &amp;req)</code> → 配置 <code>req.bytes</code>、對齊 <code>req.alignment</code>(16) → <code>deepvqe_prepost_init_ex(pool, req.bytes, &amp;cfg, &amp;req)</code>。D = 32：<code>DEEPVQE_IO_TIME</code> 637,072 B、<code>DEEPVQE_IO_FREQ</code> 615,280 B（本機量測；16 個 state 張量共 579,776 B 是其中最大宗）。</li>
+<li><code>deepvqe_prepost_get_mem_size(&amp;cfg, &amp;req)</code> → 配置 <code>req.bytes</code>、對齊 <code>req.alignment</code>(16) → <code>deepvqe_prepost_init_ex(pool, req.bytes, &amp;cfg, &amp;req)</code>。D = 32：<code>DEEPVQE_IO_TIME</code> 628,784 B、<code>DEEPVQE_IO_FREQ</code> 615,280 B（本機量測，皆不含應用端的 <code>AcIstft</code>；16 個 state 張量共 579,776 B 是其中最大宗）。</li>
 <li>把 <code>graph</code> 的 16 個 state 輸入／輸出綁定好：<code>in.state[id]</code> 與 <code>out.state_out[id]</code> 是<b>同一個指標</b>，id 依 <code>DeepVqeStateId</code> 順序；按名稱綁定時用 <code>deepvqe_prepost_state_name(id)</code>／<code>_state_name_out(id)</code>，形狀用 <code>_state_shape(id, D, dims)</code>。啟動時另以 <code>deepvqe_prepost_descriptor_default()</code> 與 ONNX／JSON 內的 <code>c_descriptor</code> 比對（<code>_descriptor_validate()</code>）。</li>
 <li>每個 hop（從 hop 0 起一次推論）：<code>pre_process(mic_hop, far_hop)</code> 恆回 1 → <code>frame_inputs</code>（host 端做 power-law 壓縮 0.3，<code>mic</code>／<code>far</code> 是壓縮後的 planar <code>[1,2,1,257]</code>；只有 <code>taps</code> 預填 NaN）→ 加速器 → <code>frame_commit</code>（失敗改 <code>frame_skip</code>）→ <code>post_process</code>。</li>
 <li>每次 <code>deepvqe_prepost_state_generation()</code> 改變（<code>reset</code> 或被拒的 commit），把加速器自己的 16 個 state 重填成量化後的 0。新建實例的 generation 為 0。</li>
@@ -63,6 +63,7 @@ int run_deepvqe(FftHandle *fft512, const float *window512, int D,
 
     if (deepvqe_prepost_config_defaults(&amp;cfg, DEEPVQE_IO_TIME, D) != 0) return -1;
     cfg.fft = fft512;  cfg.window = window512;         /* window512 = ac_window_build(w, 512) */
+    cfg.istft = istft;                                 /* deepvqe_framing_config(&amp;sc, fft512, window512) + ac_istft_init()，應用端持有 */
     if (deepvqe_prepost_get_mem_size(&amp;cfg, &amp;req) != 0) return -1;
     size_t bytes = ((size_t)req.bytes + req.alignment - 1) / req.alignment * req.alignment;
     void *pool = aligned_alloc(req.alignment, bytes);
@@ -155,7 +156,8 @@ caller                         DeepVqePrepost (C)                  NPU runtime
 <h3>外部：第三方可調</h3>
 <div class="tbl"><table>
 <tr><th>名稱</th><th>位置</th><th>型別／範圍</th><th>預設</th><th>何時設定</th><th>說明</th></tr>
-<tr><td><code>io_mode</code></td><td><code>DeepVqePrepostConfig</code></td><td><code>DEEPVQE_IO_TIME</code>(1)／<code>DEEPVQE_IO_FREQ</code>(0)</td><td>參數</td><td>init 前</td><td>決定 pool 大小；FREQ 可不給 fft／window</td></tr>
+<tr><td><code>io_mode</code></td><td><code>DeepVqePrepostConfig</code></td><td><code>DEEPVQE_IO_TIME</code>(1)／<code>DEEPVQE_IO_FREQ</code>(0)</td><td>參數</td><td>init 前</td><td>決定 pool 大小；FREQ 可不給 fft／window／istft</td></tr>
+<tr><td><code>istft</code></td><td>同上</td><td><code>AcIstft*</code>，由 <code>deepvqe_framing_config()</code> 描述（ENV_NORM、同一張窗表）</td><td>NULL</td><td>init 前</td><td>TIME 必填；borrowed，記憶體歸應用端，類別在 <code>frame_commit</code> push、<code>reset</code> 一併清；設定或窗表與分析不符時被拒；FREQ 忽略</td></tr>
 <tr><td><code>delay_depth</code>（D）</td><td>同上</td><td>整數 1…256</td><td>32</td><td>init 前；<b>必須等於 export 的 D</b></td><td>attention ring 與 score window 的長度；不改權重形狀；<code>deepvqe_prepost_descriptor_validate</code> 只檢查 D 的範圍，其餘欄位都釘死</td></tr>
 <tr><td><code>fft</code>／<code>window</code></td><td>同上</td><td><code>FftHandle*</code>（512 點）；512 個 float</td><td>NULL</td><td>init 前</td><td>TIME 必填；borrowed，須與物件同壽命</td></tr>
 <tr><td><code>--max-delay-frames</code>、<code>--opset</code>(17)、<code>--verify</code></td><td><code>export_onnx.py</code></td><td>D</td><td>checkpoint 的 D</td><td>匯出</td><td>匯出器量測剛建好的 graph 並寫 <code>c_descriptor</code> 到 ONNX props 與旁邊的 JSON</td></tr>
@@ -172,7 +174,7 @@ caller                         DeepVqePrepost (C)                  NPU runtime
 <tr><td><code>DEEPVQE_TIME_ORDER</code>／<code>DEEPVQE_FREQ_TAPS</code>、<code>DEEPVQE_TAPS_ELEMENTS</code></td><td>3／3、257×3×3×2</td><td><code>deepvqe_process.h</code>、<code>deepvqe_prepost.h</code></td><td>CCM 形狀；taps 末軸 <code>[time][frequency][RI]</code> 與 C 陣列同一塊記憶體</td></tr>
 <tr><td><code>DEEPVQE_CONV_WINDOW</code>／<code>_SCORE_WINDOW</code>／<code>_SIM_CHANNELS</code>／<code>_VALUE_CHANNELS</code>／<code>_GRU_LAYERS</code>／<code>_GRU_HIDDEN</code></td><td>4／5／4／24／1／192</td><td><code>deepvqe_prepost.h</code></td><td>state 形狀，由 checkpoint 拓撲決定</td></tr>
 <tr><td><code>DeepVqeStateId</code> 與 <code>DEEPVQE_STATE_COUNT</code></td><td>16 個，順序固定</td><td><code>deepvqe_prepost.h</code></td><td>就是 graph 在兩個 signal input 之後的 input 順序；按索引綁定的 adapter 依賴它</td></tr>
-<tr><td><code>DEEPVQE_PREPOST_CARVE_VERSION</code>／<code>_DESCRIPTOR_VERSION</code>／<code>_ALIGNMENT</code></td><td>5／1／16</td><td><code>deepvqe_prepost.h</code></td><td>pool 切分與 32-byte descriptor 版本；進 <code>build_flags_hash</code></td></tr>
+<tr><td><code>DEEPVQE_PREPOST_CARVE_VERSION</code>／<code>_DESCRIPTOR_VERSION</code>／<code>_ALIGNMENT</code></td><td>6／1／16</td><td><code>deepvqe_prepost.h</code></td><td>pool 切分與 32-byte descriptor 版本；進 <code>build_flags_hash</code></td></tr>
 <tr><td>fail-closed 的 skip 政策</td><td><code>"mute_fail_closed"</code></td><td><code>deepvqe_prepost.c</code></td><td>由「stream 0 是原始 mic」這個事實決定，不是偏好設定</td></tr>
 </table></div>
 
