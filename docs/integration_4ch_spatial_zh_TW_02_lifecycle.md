@@ -8,7 +8,7 @@
 |---|---|---|---|---|
 | 1 | query | `mcab_get_mem_requirements(&cfg, &req)`；每條 lane `aec_get_mem_size(&lane)`；MATCHED 時 `delay_aec_get_mem_size(dc.sample_rate, dc.hop_size, dc.num_filters)`；helper `mcab_sample_beam_get_mem_size(&cfg, &bp, &bytes)`（`mcab_sample_flow_get_mem_size()` 一次查前三項的合計） | **每次 init 之前**都要重查，不可跨 build / backend / config 快取 | `mcab_get_mem_requirements()` 回 `-1`：`out` 為 NULL；`cfg` 未通過 flow 驗證（[§4.1](integration_4ch_spatial_zh_TW_03_config.md#41-mcabconfigflow-參數與-lane-的-aecconfig)）；編譯 `mcab.c` 時沒帶 `-DAUDIO_PIPELINE_BACKEND_STR="ne10"`。`aec_get_mem_size()`／`delay_aec_get_mem_size()` 回 0 = 設定無效。`mcab_sample_beam_get_mem_size()` 回 `-1`：`cfg` 無效、`bp` 未通過 [§4.2](integration_4ch_spatial_zh_TW_03_config.md#42-陣列幾何4--2-欄)～§4.5 的驗證、SRP 或 BF 回報 size 0，或 `bf_lambda` 依生效 interval retime 後下溢為 0 |
 | 2 | allocate | 你自己的配置器：mcab pool 取得 `req.bytes` 且對齊 `req.alignment`（16）的記憶體；lane、estimator、helper 各自 16-byte 對齊 | 拿到大小之後 | pool **不需要**預先清零（poison pattern 可接受）；`mcab_sample_beam_init()` 自己會把 helper 的整塊 memset 成 0 |
-| 3a | init：lane | `aec_init(mem, bytes, &lane)` ×4，`lane` 來自 `mcab_lane_config(&cfg, &lane)`，或 `aec_config_from_preset()` 加 `mcab_apply_lane_contract(&cfg, &lane)` | 四條必須是不同物件 | `NULL`：config 無效、pool 過小或未對齊 |
+| 3a | init：lane | `aec_init(mem, bytes, &lane)` ×4，`lane` 來自 `mcab_lane_config(&cfg, &lane)`，或 `aec_config_from_level()` 加 `mcab_apply_lane_contract(&cfg, &lane)` | 四條必須是不同物件 | `NULL`：config 無效、pool 過小或未對齊 |
 | 3b | init：estimator | 僅 `mcab_delay_estimator_config(&cfg, &dc)` 的 `dc.required`（MATCHED）：`delay_aec_init(&delay, mem, bytes, dc.sample_rate, dc.hop_size, dc.num_filters)` | 非 MATCHED 不建；`McabLibs.delay` 必須是 NULL | 回非 0 |
 | 3c | init：mcab | `mcab_init_ex(pool, req.bytes, &cfg, &libs, &req)` | lane 與 estimator 建好之後，處理第一個 hop 之前 | 回傳 `NULL`：8 項 descriptor 檢查任一不符、pool 未對齊或太小、config 無效、[§5.7](integration_4ch_spatial_zh_TW_04_errors.md#57-mcab_init_ex-驗證什麼不能驗證什麼) 的物件驗證任一不符。**沒有任何診斷輸出**（見 [§5.4](integration_4ch_spatial_zh_TW_04_errors.md#54-診斷輸出去向)） |
 | 3d | init：helper | `mcab_sample_beam_init(mem, bytes, &cfg, &bp, flow)` | `flow` 建好之後；`cfg` 必須與建 flow 的是同一份（至少 `sample_rate`、`fft_size`、`enable_post` 一致） | 回傳 `NULL`：`bp` 無效、pool 未對齊或太小、flow 的 hop／bin／sample rate／`enable_post` 與 `cfg` 不符、SRP 或 BF init 失敗 |
@@ -94,26 +94,28 @@ mcab 與 helper **沒有**強度 setter 函式，也不持有 `AecRes`：四條 
 你對自己 init 的物件直接呼叫函式庫的 setter（完整契約見 mcab 手冊 [`integration_4ch_core_zh_TW.md`](integration_4ch_core_zh_TW.md) 的執行期強度控制一節）：
 
 ```c
-aec_res_set_preset(res, AEC_PRESET_AGGRESSIVE, 100.0f);   /* res 是你自己的 AecRes；回 0 成功 */
-anr_set_mode(nr, ANR_MODE_MILD);                  /* 函式庫的 setter；nr 是你自己的降噪器 */
+aec_res_set_level(res, AEC_LEVEL_AGGRESSIVE, 100.0f);    /* res 是你自己的 AecRes；回 0 成功 */
+anr_set_level(nr, ANR_LEVEL_MILD);                       /* 函式庫的 setter；nr 是你自己的降噪器 */
 float live, target;                               /* 線性功率 */
 if (aec_res_split_floor(res, &live, &target) == 0 && live == target) {
     /* ramp 已經走完 */
 }
 ```
 
+C 稱 level，Python 稱 preset（NR 為 strength）：**C level == Python preset**，值名與整數相同。舊名 `AecPreset`／`AEC_PRESET_*`、`AnrMode`／`ANR_MODE_*` 仍保留在公開 header（同值），舊函式名已移除。
+
 這裡只重述整合時最容易踩到的一點：
 
-> **不要自己對四條 lane 迴圈呼叫 `aec_set_preset()`。** 四條 lane 都經 `mcab_apply_lane_contract()` 蓋上
+> **不要自己對四條 lane 迴圈呼叫 `aec_set_level()`。** 四條 lane 都經 `mcab_apply_lane_contract()` 蓋上
 > `enable_res = 0`、`return_res_context = 1` 與 `spatial_linear_context`，永遠不會走到自己的 suppression-gain 路徑，
 > 它們的地板什麼都不塑形。真正乘上輸出的 gain 來自你串的**唯一一個**
 > post-beam `AecRes`；同樣地，NR 也只有一個共用實例，不是每條 lane 一個。
 > 上面兩個 setter 針對的就是那兩個共用實例。`mcab_sample_beam_reset()` 不碰它們，
-> 你自己呼叫的 `aec_res_reset()` 不會丟掉用 `aec_res_set_preset()` 設的 preset。
+> 你自己呼叫的 `aec_res_reset()` 不會丟掉用 `aec_res_set_level()` 設的 level。
 
 `ramp_ms == 0` 代表下一個 hop 就套用（**不是錯誤**），`> 0` 則以 dB 為單位線性走
 過去，上限 60 秒。兩個 setter 都不是重啟：AEC、SRP、BF、NR 的狀態全部繼續跑；
-preset 的改動撐得過該 stage 的 reset，ramp 進度不會。**在兩個 hop 之間
+level 的改動撐得過該 stage 的 reset，ramp 進度不會。**在兩個 hop 之間
 呼叫、與 process 序列化；非 thread-safe。**
 
 A/B 量測時：far-active 地板只在 **far-active 且非 double-talk** 的 hop 上生效

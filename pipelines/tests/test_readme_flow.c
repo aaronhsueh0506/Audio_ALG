@@ -47,7 +47,7 @@ static int derive_mono_lane(int sample_rate, int fft_size, AecSignalGrid* grid,
     if (!aec_resolve_signal_grid(sample_rate,
                                  fft_size ? fft_size : aec_default_fft_size(sample_rate), grid))
         return -1;
-    aec_config_from_preset(aec_cfg, AEC_PRESET_BALANCED, sample_rate);
+    aec_config_from_level(aec_cfg, AEC_LEVEL_BALANCED, sample_rate);
     aec_cfg->fft_size = grid->fft_size;
     aec_cfg->delay_mode = AEC_DELAY_MATCHED;
     aec_cfg->delay_num_filters = DA_NUM_FILTERS;
@@ -140,7 +140,7 @@ static size_t chain_build(Chain* c, void* mem, size_t bytes, const AecSignalGrid
                           const AecConfig* aec_cfg, int sample_rate, int bin_hi, float amount) {
     uint8_t* cur = (uint8_t*)mem;
     size_t aec_b = aec_get_mem_size(aec_cfg), nr_b, synth_b, vec, used;
-    AnrConfig nc = anr_config_for_mode_grid(sample_rate, grid->fft_size, ANR_MODE_BALANCED);
+    AnrConfig nc = anr_config_for_level_grid(sample_rate, grid->fft_size, ANR_LEVEL_BALANCED);
     AcStftConfig sc;
     int n = grid->n_freqs;
     ac_stft_config_default(&sc, grid->fft_size);
@@ -165,7 +165,7 @@ static size_t chain_build(Chain* c, void* mem, size_t bytes, const AecSignalGrid
 }
 
 static size_t chain_bytes(const AecSignalGrid* grid, const AecConfig* aec_cfg, int sample_rate) {
-    AnrConfig nc = anr_config_for_mode_grid(sample_rate, grid->fft_size, ANR_MODE_BALANCED);
+    AnrConfig nc = anr_config_for_level_grid(sample_rate, grid->fft_size, ANR_LEVEL_BALANCED);
     AcStftConfig sc;
     int n = grid->n_freqs;
     ac_stft_config_default(&sc, grid->fft_size);
@@ -375,7 +375,7 @@ static int ulc_host_build(UlcHost* u, const UlcnetModel* model) {
     size_t aec_b, stage_b = ulcnet_nn_stage_mem_size(1);
     memset(u, 0, sizeof(*u));
     /* the stage's compiled grid; the lane returns the linear context only */
-    aec_config_from_preset(&aec_cfg, AEC_PRESET_BALANCED, ULCNET_SR);
+    aec_config_from_level(&aec_cfg, AEC_LEVEL_BALANCED, ULCNET_SR);
     aec_cfg.fft_size = ULCNET_N_FFT;
     aec_cfg.delay_mode = AEC_DELAY_MATCHED;
     aec_cfg.delay_num_filters = DA_NUM_FILTERS;

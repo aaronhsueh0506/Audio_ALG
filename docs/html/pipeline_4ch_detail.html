@@ -34,10 +34,10 @@ th{background:#eef0f5}
 <h1>mcab 細節 — 自備 beamformer 的呼叫範例、State 細項、執行期強度控制與逐階段耗時</h1>
 
 <h2>概要</h2>
-<p>本頁收 <a href="pipeline_4ch.html">pipeline_4ch</a> 放不下的細節:(1) 只用 mcab 加自備 beamformer 與 RES 的呼叫範例(含 lane 與 estimator 的顯式 init),(2) State 表的細項,(3) 你自備的 <code>AecRes</code> 與降噪器上 <code>aec_res_set_preset()</code>／<code>anr_set_mode()</code>／<code>aec_res_split_floor()</code> 的執行期強度控制(mcab 與 helper 都沒有強度 setter,RES 由 libaec 管理),(4) <code>mcab_get_last_timing()</code> 的逐階段耗時診斷。flow＋helper 的最小呼叫範例、block diagram、泳道圖、I/O 表、延遲與檔案清單留在原頁;設定欄位的外部／內部分級在 <a href="pipeline_4ch_params.html">pipeline_4ch_params</a>。</p>
+<p>本頁收 <a href="pipeline_4ch.html">pipeline_4ch</a> 放不下的細節:(1) 只用 mcab 加自備 beamformer 與 RES 的呼叫範例(含 lane 與 estimator 的顯式 init),(2) State 表的細項,(3) 你自備的 <code>AecRes</code> 與降噪器上 <code>aec_res_set_level()</code>／<code>anr_set_level()</code>／<code>aec_res_split_floor()</code> 的執行期強度控制(mcab 與 helper 都沒有強度 setter,RES 由 libaec 管理),(4) <code>mcab_get_last_timing()</code> 的逐階段耗時診斷。flow＋helper 的最小呼叫範例、block diagram、泳道圖、I/O 表、延遲與檔案清單留在原頁;設定欄位的外部／內部分級在 <a href="pipeline_4ch_params.html">pipeline_4ch_params</a>。</p>
 
 <h3>mcab + 外部 beamformer + 自備 RES 的呼叫範例</h3>
-<p>產品的波束器在別處時不需要 sample helper:<code>mcab_fuse()</code> 吃呼叫端的權重(和可選的 beamformed 頻譜)。mcab 不算 RES 增益(<code>frame.g_res_ctx</code> 恆為 NULL),RES 由應用用 libaec 的 <code>aec_res_get_mem_size()</code>／<code>aec_res_init()</code> 建(沒有 destroy);<code>aec_config_from_preset()</code> 與 <code>mcab_static.c</code> 用的是同一個建構函式,只要把 <code>fft_size</code> 設成 mcab 解析出的值。lane 與 estimator 由應用建立:四條必須是不同物件、新建的(或已 reset),<code>DelayAec</code> 結構本身要活到 <code>mcab_destroy()</code> 之後。可執行版本:<code>mcab_external_static.c</code>(權重是每個 bin 皆 1/4 的等權佔位,要換成產品波束器的權重);參考鏈:<code>tests/conv_chain_mcab.h</code>。以下範例已在 <code>-Wall -Wextra -Werror</code> 下做過語法檢查(<code>platform_alloc()</code>、<code>stream_next4()</code>、<code>product_beamformer()</code> 是你的平台／I/O／波束器佔位;範例省略了 <code>platform_alloc()</code> 回傳值的檢查與記憶體釋放):</p>
+<p>產品的波束器在別處時不需要 sample helper:<code>mcab_fuse()</code> 吃呼叫端的權重(和可選的 beamformed 頻譜)。mcab 不算 RES 增益(<code>frame.g_res_ctx</code> 恆為 NULL),RES 由應用用 libaec 的 <code>aec_res_get_mem_size()</code>／<code>aec_res_init()</code> 建(沒有 destroy);<code>aec_config_from_level()</code> 與 <code>mcab_static.c</code> 用的是同一個建構函式,只要把 <code>fft_size</code> 設成 mcab 解析出的值。lane 與 estimator 由應用建立:四條必須是不同物件、新建的(或已 reset),<code>DelayAec</code> 結構本身要活到 <code>mcab_destroy()</code> 之後。可執行版本:<code>mcab_external_static.c</code>(權重是每個 bin 皆 1/4 的等權佔位,要換成產品波束器的權重);參考鏈:<code>tests/conv_chain_mcab.h</code>。以下範例已在 <code>-Wall -Wextra -Werror</code> 下做過語法檢查(<code>platform_alloc()</code>、<code>stream_next4()</code>、<code>product_beamformer()</code> 是你的平台／I/O／波束器佔位;範例省略了 <code>platform_alloc()</code> 回傳值的檢查與記憶體釋放):</p>
 <pre>McabConfig cfg = mcab_default_config(16000);              /* MATCHED, enable_post=1, capture_proxy_channel=0 */
 McabLibs libs;  memset(&amp;libs, 0, sizeof(libs));
 AecConfig lane;  McabDelayEstimatorConfig dc;
@@ -60,12 +60,12 @@ Mcab* p = mcab_init_ex(platform_alloc((size_t)req.bytes, req.alignment), (size_t
 if (!p) return -1;                                        /* NULL = 拒絕, 無診斷輸出 */
 int nf = mcab_n_freqs(p), hop = mcab_hop_size(p);
 
-/* mcab 沒有 RES: 應用自備一個 AecRes(libaec), config 用 aec_config_from_preset、fft 取 mcab 的格點 */
-AecConfig res_cfg;  aec_config_from_preset(&amp;res_cfg, AEC_PRESET_BALANCED, cfg.sample_rate);
+/* mcab 沒有 RES: 應用自備一個 AecRes(libaec), config 用 aec_config_from_level、fft 取 mcab 的格點 */
+AecConfig res_cfg;  aec_config_from_level(&amp;res_cfg, AEC_LEVEL_BALANCED, cfg.sample_rate);
 res_cfg.fft_size = mcab_fft_size(p);
 size_t res_b = aec_res_get_mem_size(&amp;res_cfg);            /* 0 = 無效 */
 AecRes* res = aec_res_init(platform_alloc(res_b, 16), res_b, &amp;res_cfg);
-AnrConfig nr_cfg = anr_config_for_mode_grid(cfg.sample_rate, res_cfg.fft_size, ANR_MODE_BALANCED);
+AnrConfig nr_cfg = anr_config_for_level_grid(cfg.sample_rate, res_cfg.fft_size, ANR_LEVEL_BALANCED);
 AcStftConfig syn_cfg;  ac_stft_config_default(&amp;syn_cfg, res_cfg.fft_size);
 AnrDenoiser* nr = anr_init(platform_alloc(anr_get_mem_size(&amp;nr_cfg), 16), anr_get_mem_size(&amp;nr_cfg), &amp;nr_cfg);
 AcIstft* istft = ac_istft_init(platform_alloc(ac_istft_get_mem_size(&amp;syn_cfg), 16), ac_istft_get_mem_size(&amp;syn_cfg), &amp;syn_cfg);
@@ -116,33 +116,34 @@ for (int ch = 0; ch &lt; MCAB_CHANNELS; ++ch) aec_destroy(libs.lanes[ch]);</pre>
 <tr><td>共用 estimator(含 <code>DelayAec</code> 結構)＋ mcab pool</td><td>108,928 B(@16k/256;@48k 262,880 B;@16k/512 116,096 B)</td><td>應用(flow 區塊)</td><td><code>mcab_external_static</code> 的 <code>Front end</code> 列。其中 mcab 自己的 pool:73,504 B(@16k/256,<code>enable_post=1</code>;<code>enable_post=0</code> 為 68,288 B)、80,672 B(@16k/512,<code>test_mcab</code> 的 n=1..5 表)。mcab pool 與 <code>delay_num_filters</code> 無關</td></tr>
 <tr><td>helper pool(SRP＋BF＋暫存)</td><td>792,224 B(@16k/256);1,569,952 B(@16k/512);3,125,408 B(@48k/1024)</td><td>應用(helper 區塊)</td><td><code>mcab_sample_beam_get_mem_size()</code>;<code>num_angles</code>=72 預設(@16k/256 取 360 則為 3,794,336 B);BF 借用 <code>srp-&gt;a_array</code>;BF 的 lambda 0.995 依 hop×adapt_interval retime,mu 0.1。SRP／BF 各自的大小以 <code>srp_get_mem_size()</code>／<code>bf_get_mem_size()</code> 現查</td></tr>
 <tr><td><code>AecRes</code>(×1)</td><td>7,904 B(@16k/256;14,048 B @16k/512;@48k 29,408 B)</td><td>應用(post pool)</td><td>post-beam RES(libaec <code>aec_res.h</code>;<code>aec_res_get_mem_size()</code>;mcab 與 helper 都不含)</td></tr>
-<tr><td><code>AnrDenoiser</code>(×1)</td><td>45,344 B(@16k/256;56,432 B @16k/512;@48k 144,576 B)</td><td>應用(post pool)</td><td>mono NR;函式庫 preset <code>anr_config_for_mode_grid()</code>,大小由 <code>anr_get_mem_size()</code> 取得</td></tr>
+<tr><td><code>AnrDenoiser</code>(×1)</td><td>45,344 B(@16k/256;56,432 B @16k/512;@48k 144,576 B)</td><td>應用(post pool)</td><td>mono NR;函式庫 level <code>anr_config_for_level_grid()</code>,大小由 <code>anr_get_mem_size()</code> 取得</td></tr>
 <tr><td><code>AcIstft</code>(含 <code>FftHandle</code>)</td><td>11,344 B(@16k/256;21,840 B @16k/512;@48k 42,832 B)</td><td>應用(post pool)</td><td>最終合成(<code>ac_istft_push()</code>)</td></tr>
 <tr><td><code>rng</code>、<code>total_gain / extra_noise / spec</code></td><td>uint32;各 [n_freqs](<code>spec</code> 為 Complex);暫存合計 2,096 B(@16k/256)/ 4,144 B(@16k/512)/ 8,240 B(@48k)</td><td>應用</td><td>CNG seed <code>MCAB_SAMPLE_CNG_RNG_SEED</code>=0x9e3779b9</td></tr>
 </table>
 
 <h3>執行期強度控制</h3>
-<pre>int aec_res_set_preset(AecRes* r, AecPreset preset, float ramp_ms);
-int anr_set_mode(AnrDenoiser* nr, AnrMode mode);                     /* nr = 你自己 anr_init() 的物件 */
+<pre>int aec_res_set_level(AecRes* r, AecLevel level, float ramp_ms);
+int anr_set_level(AnrDenoiser* nr, AnrLevel level);                     /* nr = 你自己 anr_init() 的物件 */
 int aec_res_split_floor(const AecRes* r, float* live, float* target);  /* 唯讀 */
 
 /* res = 你的 aec_res_init() 回傳的 AecRes(mcab 與 helper 都不擁有 RES), nr = 你的 anr_init() 回傳的降噪器 */
-aec_res_set_preset(res, AEC_PRESET_AGGRESSIVE, 100.0f);    /* 100 ms 內以 dB 線性走到新地板 */
-anr_set_mode(nr, ANR_MODE_MILD);
+aec_res_set_level(res, AEC_LEVEL_AGGRESSIVE, 100.0f);    /* 100 ms 內以 dB 線性走到新地板 */
+anr_set_level(nr, ANR_LEVEL_MILD);
 
 float live, target;                                        /* 線性功率,不是 dB */
 aec_res_split_floor(res, &amp;live, &amp;target);              /* live == target ⇒ ramp 已走完 */</pre>
-<p class="note"><b>本節最重要的一件事:對四條 lane 重新指定 preset 是無效操作。</b>四條 lane 都經 <code>mcab_apply_lane_contract()</code> 蓋上 <code>enable_res = 0</code>、<code>return_res_context = 1</code> 與 <code>spatial_linear_context</code>,因此<b>沒有任何一條</b>會走到自己的殘留抑制器;它們各自的地板什麼都不塑形。真正乘上本產品輸出、也真正決定 comfort noise 量的那個 gain,來自<b>唯一一個</b>共用的 post-beam 抑制器(應用自備的 <code>AecRes</code>,mcab 與 helper 都不擁有)——上面的 preset setter 針對的就是它,這也是它存在、而不是要呼叫端自己對四條 lane 迴圈呼叫 <code>aec_set_preset()</code> 的原因。同理 NR 也只有一個共用實例(對 beamform 後的訊號跑),不是每條 lane 一個。RES 與降噪器都由應用自己初始化與持有;<code>Mcab</code> 與 <code>McabSampleBeam</code> 都沒有 preset／mode setter 本身。這一點由 <code>tests/test_mcab_sample_beam.c</code>(應用自備 <code>AecRes</code> 的 preset／ramp／<code>split_floor</code> 與 <code>aec_res_reset()</code> 後保留)與 <code>tests/test_mcab_sample_post.c</code>(<code>test_nr_set_mode</code>:<code>anr_set_mode()</code> 對每個 mode)釘住,不是推測。</p>
+<p class="note"><b>本節最重要的一件事:對四條 lane 重新指定 level 是無效操作。</b>四條 lane 都經 <code>mcab_apply_lane_contract()</code> 蓋上 <code>enable_res = 0</code>、<code>return_res_context = 1</code> 與 <code>spatial_linear_context</code>,因此<b>沒有任何一條</b>會走到自己的殘留抑制器;它們各自的地板什麼都不塑形。真正乘上本產品輸出、也真正決定 comfort noise 量的那個 gain,來自<b>唯一一個</b>共用的 post-beam 抑制器(應用自備的 <code>AecRes</code>,mcab 與 helper 都不擁有)——上面的 level setter 針對的就是它,這也是它存在、而不是要呼叫端自己對四條 lane 迴圈呼叫 <code>aec_set_level()</code> 的原因。同理 NR 也只有一個共用實例(對 beamform 後的訊號跑),不是每條 lane 一個。RES 與降噪器都由應用自己初始化與持有;<code>Mcab</code> 與 <code>McabSampleBeam</code> 都沒有 level setter 本身。這一點由 <code>tests/test_mcab_sample_beam.c</code>(應用自備 <code>AecRes</code> 的 level／ramp／<code>split_floor</code> 與 <code>aec_res_reset()</code> 後保留)與 <code>tests/test_mcab_sample_post.c</code>(<code>test_nr_set_level</code>:<code>anr_set_level()</code> 對每個 level)釘住,不是推測。</p>
 <table>
 <tr><th>呼叫</th><th>改／讀什麼</th><th>回 −1 的情況(−1 時什麼都不寫)</th></tr>
-<tr><td><code>aec_res_set_preset()</code></td><td><b>應用自備的共用 post 級抑制器</b>的 far-active split floor(依 <code>ramp_ms</code> 走過去)、DT floor 與 split-floor 開關(立即)</td><td><code>res</code> NULL(例如 <code>aec_res_init()</code> 回 NULL 而沒檢查);<code>preset</code> 超出 enum;<code>ramp_ms</code> 非有限值或超出 [0, 60000]</td></tr>
-<tr><td><code>anr_set_mode()</code></td><td>你持有的<b>那一個</b>降噪器</td><td><code>nr</code> NULL(例如範例沒有建降噪器);<code>mode</code> 超出 enum</td></tr>
+<tr><td><code>aec_res_set_level()</code></td><td><b>應用自備的共用 post 級抑制器</b>的 far-active split floor(依 <code>ramp_ms</code> 走過去)、DT floor 與 split-floor 開關(立即)</td><td><code>res</code> NULL(例如 <code>aec_res_init()</code> 回 NULL 而沒檢查);<code>level</code> 超出 enum;<code>ramp_ms</code> 非有限值或超出 [0, 60000]</td></tr>
+<tr><td><code>anr_set_level()</code></td><td>你持有的<b>那一個</b>降噪器</td><td><code>nr</code> NULL(例如範例沒有建降噪器);<code>level</code> 超出 enum</td></tr>
 <tr><td><code>aec_res_split_floor()</code></td><td>唯讀。<code>live</code>=抑制器<b>當下</b>套用的值,<code>target</code>=撐得過 reset 的已設定值;只有 ramp 走到一半時兩者不同。任一指標可為 NULL</td><td><code>res</code> NULL</td></tr>
 </table>
 <p><code>live</code>/<code>target</code> 這一對是<b>板端唯一值得記錄的強度量</b>:它是真正塑形輸出的東西,兩個值合在一起就回答「我要求的改動落地了沒有」。</p>
-<p><code>ramp_ms == 0</code> 下一個 hop 套用(<b>不是錯誤</b>),落點與「用該 preset 從頭建一個新實例」完全相同;<code>&gt; 0</code> 以 dB 線性走過去,上限 60 s。ramp 途中再呼叫會從當前 live 值重新起走。兩個 setter 都<b>不是重啟</b>:四條 lane 的濾波器、共用延遲鎖定、NR 噪聲底與增益平滑歷史全部繼續跑。preset 改動<b>撐得過</b> 該 stage 的 reset(目標值另存一份,<code>aec_res_reset()</code> 會重新套用),ramp 進度則會被丟掉;<code>mcab_sample_beam_reset()</code>／<code>mcab_reset()</code> 不碰應用的 <code>AecRes</code>,要自己呼叫 <code>aec_res_reset()</code>。<b>在兩個 hop 之間呼叫、與 <code>mcab_process_front()</code> 等處理呼叫序列化;非 thread-safe。</b>Python 對應 <code>PostBeamResidualSuppressor.set_preset(preset, ramp_ms=0.0)</code>(由呼叫端建立,例如 <code>PostBeamResidualSuppressor.from_aec_config(config)</code>;<code>McabPipeline</code> 不擁有它,<code>fuse()</code> 的結果 <code>McabFrame.context.res_gain</code> 為 None,<code>McabFrame.aligned_render</code> 供它使用;沒有 <code>set_aec_preset()</code>)。</p>
-<p class="note">範例的降噪器以 <code>anr_config_for_mode_grid()</code> 建立、沒有覆寫任何欄位,所以 <code>anr_set_mode()</code> 直接換強度。在 preset 之上改過欄位的實例,<code>anr_set_mode()</code> 會把那些覆寫蓋回 preset 值,要自己組好完整 target 再呼叫 <code>anr_reconfigure()</code>。</p>
-<p class="note"><b>A/B 量測時該預期什麼。</b>far-active 地板只在 <b>far-active 且非 double-talk</b> 的 hop 生效:DT 期間套用 DT 地板(mild 與 balanced 相同 −20 dB,aggressive 較深 −30 dB;<code>aec_res_set_preset()</code> 一併套用,且不受 <code>ramp_ms</code> 影響、立即切換;<code>NO_FLOOR</code> 關閉 split floor),far-active latch 觸發前套的是 far-silent 地板。同一個 gain 還決定注入的 comfort noise 量(振幅 ∝ <code>sqrt(1 − G_res²)</code> 再乘該 bin 的 NR gain(下限 −10 dB),見 <a href="pipeline_4ch.html">pipeline_4ch</a> block diagram 的 CNG 步驟——地板越深、CNG 反而越多)。所以<b>整段錄音的平均移動幅度會小於 dB 落差所暗示的量</b>,而且只量 echo/degradation 的 A/B 會把 CNG 的變化錯記到別的機制。請在 echo 對齊或 degradation 對齊的條件下比較,並實際試聽。</p>
+<p><code>ramp_ms == 0</code> 下一個 hop 套用(<b>不是錯誤</b>),落點與「用該 level 從頭建一個新實例」完全相同;<code>&gt; 0</code> 以 dB 線性走過去,上限 60 s。ramp 途中再呼叫會從當前 live 值重新起走。兩個 setter 都<b>不是重啟</b>:四條 lane 的濾波器、共用延遲鎖定、NR 噪聲底與增益平滑歷史全部繼續跑。level 改動<b>撐得過</b> 該 stage 的 reset(目標值另存一份,<code>aec_res_reset()</code> 會重新套用),ramp 進度則會被丟掉;<code>mcab_sample_beam_reset()</code>／<code>mcab_reset()</code> 不碰應用的 <code>AecRes</code>,要自己呼叫 <code>aec_res_reset()</code>。<b>在兩個 hop 之間呼叫、與 <code>mcab_process_front()</code> 等處理呼叫序列化;非 thread-safe。</b>Python 對應 <code>PostBeamResidualSuppressor.set_preset(preset, ramp_ms=0.0)</code>(由呼叫端建立,例如 <code>PostBeamResidualSuppressor.from_aec_config(config)</code>;<code>McabPipeline</code> 不擁有它,<code>fuse()</code> 的結果 <code>McabFrame.context.res_gain</code> 為 None,<code>McabFrame.aligned_render</code> 供它使用;沒有 <code>set_aec_preset()</code>)。</p>
+<p class="note">範例的降噪器以 <code>anr_config_for_level_grid()</code> 建立、沒有覆寫任何欄位,所以 <code>anr_set_level()</code> 直接換強度。在 level 之上改過欄位的實例,<code>anr_set_level()</code> 會把那些覆寫蓋回 level 值,要自己組好完整 target 再呼叫 <code>anr_reconfigure()</code>。</p>
+<p class="note">C 稱 level,Python 稱 preset(NR 為 strength):<b>C level == Python preset</b>,值名與整數相同。舊名 <code>AecPreset</code>／<code>AEC_PRESET_*</code>、<code>AnrMode</code>／<code>ANR_MODE_*</code> 仍保留在公開 header(同值),舊函式名已移除。</p>
+<p class="note"><b>A/B 量測時該預期什麼。</b>far-active 地板只在 <b>far-active 且非 double-talk</b> 的 hop 生效:DT 期間套用 DT 地板(mild 與 balanced 相同 −20 dB,aggressive 較深 −30 dB;<code>aec_res_set_level()</code> 一併套用,且不受 <code>ramp_ms</code> 影響、立即切換;<code>NO_FLOOR</code> 關閉 split floor),far-active latch 觸發前套的是 far-silent 地板。同一個 gain 還決定注入的 comfort noise 量(振幅 ∝ <code>sqrt(1 − G_res²)</code> 再乘該 bin 的 NR gain(下限 −10 dB),見 <a href="pipeline_4ch.html">pipeline_4ch</a> block diagram 的 CNG 步驟——地板越深、CNG 反而越多)。所以<b>整段錄音的平均移動幅度會小於 dB 落差所暗示的量</b>,而且只量 echo/degradation 的 A/B 會把 CNG 的變化錯記到別的機制。請在 echo 對齊或 degradation 對齊的條件下比較,並實際試聽。</p>
 
 <h3>逐階段耗時(診斷用)</h3>
 <pre>typedef struct McabLastTiming {
@@ -163,7 +164,7 @@ void mcab_get_last_timing(const Mcab* p, McabLastTiming* out);</pre>
 <h2>相關檔案與測試路徑</h2>
 <ul>
 <li><code>pipelines/4ch_aec_bf_nr_res/mcab.h / .c</code>(<code>McabLastTiming</code>、<code>mcab_get_last_timing()</code>、<code>MCAB_STAGE_TIMING</code>、<code>MCAB_NOW_US</code>);<code>pipelines/4ch_aec_bf_nr_res/mcab_sample_beam.h / .c</code></li>
-<li><code>pipelines/4ch_aec_bf_nr_res/tests/test_mcab_sample_post.c</code>(<code>anr_set_mode()</code> 強度測試)、<code>tests/test_mcab.c</code>(<code>test_stage_timing</code>)、<code>tests/test_mcab_sample_beam.c</code>;完整清單見 <a href="pipeline_4ch.html">pipeline_4ch</a>。</li>
+<li><code>pipelines/4ch_aec_bf_nr_res/tests/test_mcab_sample_post.c</code>(<code>anr_set_level()</code> 強度測試)、<code>tests/test_mcab.c</code>(<code>test_stage_timing</code>)、<code>tests/test_mcab_sample_beam.c</code>;完整清單見 <a href="pipeline_4ch.html">pipeline_4ch</a>。</li>
 </ul>
 </body>
 </html>

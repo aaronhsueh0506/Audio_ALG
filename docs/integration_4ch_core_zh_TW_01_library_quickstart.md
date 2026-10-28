@@ -140,7 +140,7 @@ int main(void) {
     int ch;
 
     memset(&libs, 0, sizeof(libs));
-    if (mcab_lane_config(&cfg, &lane_cfg) != 0 ||            /* balanced preset + contract */
+    if (mcab_lane_config(&cfg, &lane_cfg) != 0 ||            /* balanced level + contract */
         mcab_delay_estimator_config(&cfg, &dc) != 0 ||
         mcab_get_mem_requirements(&cfg, &req) != 0) return 1;
     lane_bytes = aec_get_mem_size(&lane_cfg);                /* 0 = invalid */
@@ -168,9 +168,9 @@ int main(void) {
     /* 3. The post-beam stages are the application's too: each library sizes and initialises
      *    itself; RES, NR, synthesis and the gain/spectrum buffers share one aligned block. */
     AecConfig res_cfg;
-    aec_config_from_preset(&res_cfg, AEC_PRESET_BALANCED, 16000);
+    aec_config_from_level(&res_cfg, AEC_LEVEL_BALANCED, 16000);
     res_cfg.fft_size = fft;
-    AnrConfig nr_cfg = anr_config_for_mode_grid(16000, fft, ANR_MODE_BALANCED);
+    AnrConfig nr_cfg = anr_config_for_level_grid(16000, fft, ANR_LEVEL_BALANCED);
     AcStftConfig synth_cfg;
     ac_stft_config_default(&synth_cfg, fft);
     size_t res_bytes = aec_res_get_mem_size(&res_cfg);       /* 0 = invalid */
@@ -262,8 +262,8 @@ c++ -o app app.o \
   -lm
 ```
 
-四條 lane 的參數（preset、`filter_length`…）是應用的決定：範例用 `mcab_lane_config()`（balanced preset 加契約）；
-要自己的 lane 就改成 `aec_config_from_preset(&lane_cfg, preset, 16000)`、設好 `filter_length` 等欄位，
+四條 lane 的參數（level、`filter_length`…）是應用的決定：範例用 `mcab_lane_config()`（balanced level 加契約）；
+要自己的 lane 就改成 `aec_config_from_level(&lane_cfg, level, 16000)`、設好 `filter_length` 等欄位，
 再 `mcab_apply_lane_contract(&cfg, &lane_cfg)` 把契約欄位蓋上去（細節見 [§4.1](integration_4ch_core_zh_TW_03_config.md#41-逐欄位)）。
 
 只要回音抑制、不要降噪的產品：不建 `AnrDenoiser`，NR 增益讀 unity 全 1 向量（`sk_min_f32` 涵蓋所有組合）。

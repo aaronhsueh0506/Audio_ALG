@@ -24,7 +24,7 @@ follow the same formula but have no trained checkpoint, so their audio quality i
 ### Memory Budget
 
 Measured with `"$(make -s print-bin-dir)"/aec_nr_pipeline_static --print-mem-size
---sample-rate <sr> [--fft-size <alt>]` (balanced presets). The AEC column is the
+--sample-rate <sr> [--fft-size <alt>]` (balanced levels). The AEC column is the
 composite `aec_get_mem_size()` pool — it already contains HPF, PBFDKF ×2
 (main+shadow), delay estimator, the RES/post context and the AEC-internal FFTs.
 The remaining columns are the example's other stages, each sized by its own query
@@ -51,8 +51,8 @@ there rather than editing it here, and always prefer the values `aec_get_mem_siz
 > filter_length 是 ms-derived（52 ms；≥44.1 kHz 用 64 ms → 48 kHz 為 3072
 > taps、6 partitions at hop=512），加長會等比增加 AEC 記憶體；記憶體吃緊時先縮
 > `filter_length`（外部參數）。NR 的 `L` 是內部欄位且決定 pool 版面：要縮它就得自己組
-> `AnrConfig`（先 `anr_config_for_mode_grid()` 再改 `L`）、重新 `anr_get_mem_size()`，
-> 該實例之後不再等於裸 preset，`anr_set_mode()` 會被拒（見 [call sequence](README.md#call-sequence-publicinternal-functions-parameters-at-a-glance) 一節）。
+> `AnrConfig`（先 `anr_config_for_level_grid()` 再改 `L`）、重新 `anr_get_mem_size()`，
+> 該實例之後不再等於裸 level 組態，`anr_set_level()` 會被拒（見 [call sequence](README.md#call-sequence-publicinternal-functions-parameters-at-a-glance) 一節）。
 > `n_partitions` 由 `filter_length` 與 hop 推導，不建議手填。三個 rate 各自依 grid 的 hop=fft_size/2
 > 規則自動推導 (`aec_derive_dims()`），不是統一的 10 ms 規則；16 kHz 另外還有一個可選的
 > 512/256 grid（見上表）。靜態範例的 AEC、NR 與合成 config 都由同一個
@@ -198,8 +198,8 @@ Nothing allocates inside `process`. Every library is queried and initialised on 
 own; the integrator sums the sizes and cuts the blocks:
 
 ```c
-size_t aec_b   = aec_get_mem_size(&aec_cfg);                       /* aec_cfg: aec_config_from_preset() + the lane's seam fields; 0 = invalid */
-AnrConfig nr_cfg = anr_config_for_mode_grid(sample_rate, grid.fft_size, ANR_MODE_BALANCED);   /* grid from aec_resolve_signal_grid() */
+size_t aec_b   = aec_get_mem_size(&aec_cfg);                       /* aec_cfg: aec_config_from_level() + the lane's seam fields; 0 = invalid */
+AnrConfig nr_cfg = anr_config_for_level_grid(sample_rate, grid.fft_size, ANR_LEVEL_BALANCED);   /* grid from aec_resolve_signal_grid() */
 size_t nr_b    = anr_get_mem_size(&nr_cfg);
 AcStftConfig sy_cfg;  ac_stft_config_default(&sy_cfg, grid.fft_size);
 size_t sy_b    = ac_istft_get_mem_size(&sy_cfg);
@@ -222,7 +222,7 @@ AcIstft* istft = ac_istft_init(pool + ALIGN16(aec_b) + ALIGN16(nr_b), sy_b, &sy_
   `mcab_external_static --print-mem-size` prints lanes 797,632 B and front end (estimator plus the
   mcab pool) 108,928 B at 16 kHz/256 (48 kHz/1024: 2,912,064 B and 262,880 B). The sample beam helper
   (SRP-PHAT, BF, scratch) is one more block. The post-beam stages, the RES included, are separate blocks sized by their own queries
-  (`aec_res_get_mem_size()` on an `AecConfig` from `aec_config_from_preset()` with the flow's `fft_size`,
+  (`aec_res_get_mem_size()` on an `AecConfig` from `aec_config_from_level()` with the flow's `fft_size`,
   `anr_get_mem_size()`, `ac_istft_get_mem_size()`),
   and a neural stage (`ulcnet_nn_stage_mem_size()`, `dfn_rate_bridge_get_mem_requirements()`)
   is one more block.

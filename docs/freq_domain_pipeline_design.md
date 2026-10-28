@@ -56,7 +56,7 @@ with 50% overlap:
 | 48 kHz | 1024 | 512 | 1024 | 513 |
 
 In the mono example `derive_lane()` resolves the rate's grid once with lib/aec's
-`aec_resolve_signal_grid()`; the AEC lane, the denoiser (`anr_config_for_mode_grid()`) and the synthesis
+`aec_resolve_signal_grid()`; the AEC lane, the denoiser (`anr_config_for_level_grid()`) and the synthesis
 (`ac_stft_config_default()`) are all built from that grid's `fft_size`, so they share one set of
 dimensions by construction.
 
@@ -69,7 +69,7 @@ training/checkpoint contract even when a numeric grid happens to match.
 There is no mono pipeline library. The reusable parts are separate libraries, each
 with its own size query and `init`: lib/aec's `Aec` (`aec_process_context()`),
 the denoiser (`anr.h`) and `AcIstft`; the mono RES gain is the `Aec`'s own (`AecResContext.res_gain`,
-read with `aec_get_res_context()`, strength through `aec_set_preset()`). Each example `main`
+read with `aec_get_res_context()`, strength through `aec_set_level()`). Each example `main`
 initialises the libraries it uses and writes the per-hop sequence itself; the example headers
 (`pipelines/common/example_cli.h`, `pipelines/4ch_aec_bf_nr_res/mcab_sample_post.h`) carry no ABI and
 no layout version. The only multi-channel piece is
@@ -84,7 +84,7 @@ is the sample helper `mcab_sample_beam.{h,c}`, which is outside the module. The 
 (`aec_nr_pipeline`, `aec_nr_pipeline_static`, one `main.c` built twice) are
 example programs that compose the libraries.
 
-Low-level details, backend/release rules, memory sizing, presets, and tests are
+Low-level details, backend/release rules, memory sizing, levels, and tests are
 maintained in [`../pipelines/README.md`](../pipelines/README.md).
 
 ## Stage chain

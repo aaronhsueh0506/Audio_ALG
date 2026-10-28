@@ -99,7 +99,7 @@ identical state and may be mixed freely on one instance.
 |--------|---------|--------|----------|
 | AEC | libaec.a | aec.h | PBFDKF adaptive filter + shadow filter |
 | NR | libanr.a | anr.h | MMSE-LSA + MCRA noise est + SPP |
-| RES | libaec.a | aec_res.h (`AecRes`) / aec.h (`AecResContext`) | Mono: inside the AEC (`ctx.res_gain`, strength `aec_set_preset()`). 4-ch: managed by libaec, created by the application with `aec_res_get_mem_size()` / `aec_res_init()`; `Mcab` does not hold one |
+| RES | libaec.a | aec_res.h (`AecRes`) / aec.h (`AecResContext`) | Mono: inside the AEC (`ctx.res_gain`, strength `aec_set_level()`). 4-ch: managed by libaec, created by the application with `aec_res_get_mem_size()` / `aec_res_init()`; `Mcab` does not hold one |
 | Mono | no wrapper module: `Aec` itself | aec.h (`aec_process_context()`, `aec_get_res_context()`) | One-mic AEC with its own RES gain; the application calls `aec_process_context()`, reads the `AecResContext` and chains RES gain / NR / comfort noise / synthesis (the example mains do) |
 | 4-ch flow (`Mcab`) | libaudio_pipeline_mcab.a (`mcab.o` only) | 4ch_aec_bf_nr_res/mcab.h | A flow layer, not a library that owns lib objects: the application initialises four `Aec` lanes (and, MATCHED only, one shared `DelayAec`) and passes pointers; `Mcab` owns only the flow state in its own pool (delay admission state machine, reference ring, aligned far, fuse buffers). Per hop `mcab_process_front()` and `mcab_fuse()`; no beamformer, no RES, no NR inside |
 | DFN2 stage / rate bridge | libaudio_pipeline_dfn.a (`pipelines/` build), libdfn_res_stage.a (4-ch build) | dfn/dfn_res_stage.h, dfn/dfn_rate_bridge.h | The post-RES dual-input DFN2 stage (48 kHz directly, below 48 kHz through the bridge); the hop driver is `dfn/dfn_hop.h`. The model lookahead pair is a build-time choice (default 1/1, see [Build](README_02_build_debug_board.md#build)) |
@@ -107,7 +107,7 @@ identical state and may be mixed freely on one instance.
 
 RES is available as an independent frequency-domain `AecRes` object in
 `aec_res.h`, shipped in `libaec.a`. A four-channel application creates one in its own
-init (`aec_config_from_preset(preset, sample_rate)` with `fft_size` set to the flow's grid
+init (`aec_config_from_level(level, sample_rate)` with `fft_size` set to the flow's grid
 (`mcab_fft_size()`), then `aec_res_get_mem_size()` / `aec_res_init()`; there is no `aec_res_destroy`)
 and calls `aec_res_process()` once per hop on the input `mcab_sample_res_input()` makes from the fused frame; `mcab_fuse()` does not run it
 (`frame.g_res_ctx` stays NULL). NR independently calls `anr_process_gain()` on the
@@ -166,12 +166,12 @@ headers are listed under [Example code](#example-code-copy-and-adapt):
 | 4-ch DFN2 | `dfn/4ch_aec_bf_dfn_res/` | the flow + the sample beam helper (real SRP-PHAT/BF) + `mcab_sample_beam_fuse()` + the application's `AecRes` (P formed in `dfn_form()`) + `dfn_hop` + the dual-input DFN2 stage |
 
 The mono, mono DFN2 and mono ULCNet examples each derive their AEC configuration in their own
-`main.c` (`derive_lane()`: `aec_config_from_preset()`, the grid from `aec_resolve_signal_grid()`
+`main.c` (`derive_lane()`: `aec_config_from_level()`, the grid from `aec_resolve_signal_grid()`
 (ULCNet: its compiled grid), then the lane's seam fields; a delay profile is parsed with `common/example_cli.h`). The 4-channel flow resolves its own grid from
 `McabConfig` (`sample_rate`, `fft_size`) and stamps the lane contract with
 `mcab_apply_lane_contract()`. The NR examples use the NR
-library's own strength preset on the AEC grid (`anr_config_for_mode_grid()`,
-no overrides), so `anr_set_mode()` changes the strength of a running denoiser;
+library's own strength level on the AEC grid (`anr_config_for_level_grid()`,
+no overrides), so `anr_set_level()` changes the strength of a running denoiser;
 the per-hop gain call that folds the AEC residual-echo powers into the noise floor is written in
 each example (`mono_nr_gain()` in `mono_aec_nr_res/main.c`) and, shared by the 4-channel programs,
 `mcab_sample_anr_gain()` in `4ch_aec_bf_nr_res/mcab_sample_post.h`. The numeric options of the DFN2 and ULCNet
@@ -179,10 +179,10 @@ examples and of `mcab_raw`, `mcab_static` and `mcab_external_static` go through 
 `common/example_cli.h` (`example_cli_parse_int()`, `example_cli_parse_float()`): an empty string, leading space,
 trailing characters, an out-of-range value, `inf` or `nan` exit with code 2 (for example
 `--delay-num-filters 3x`, or an empty `--fixed-doa-deg` of `mcab_raw`). `mcab_static` and `mcab_external_static`
-also exit 2 for an option without its value (a token starting with `--` where a value belongs is the next option, not a value) and for an unknown option; `mcab_external_static` also exits 2 for an unknown `--nr-preset` name, an unknown AEC preset and a second positional preset; a number that parses but names no grid
+also exit 2 for an option without its value (a token starting with `--` where a value belongs is the next option, not a value) and for an unknown option; `mcab_external_static` also exits 2 for an unknown `--nr-level` name (earlier spelling `--nr-preset`), an unknown AEC level (positional or `--aec-level`) and a second AEC level (the mono programs exit 2 for a second AEC level too); a number that parses but names no grid
 or channel (`--sample-rate 44100`) is refused when the config is built and still exits 1. Still lenient:
 `mono_aec_nr_res/main.c` (`aec_nr_pipeline`, `aec_nr_pipeline_static`) reads `--sample-rate` and `--fft-size` with
-`atoi()`, ignores an unknown option and falls back to `balanced` for an unknown preset name (it does exit 2 for a missing value, as above); the test and smoke helpers `tests/pyc_parity/pyc_drv.c` and
+`atoi()`, ignores an unknown option and falls back to `balanced` for an unknown level name (it does exit 2 for a missing value, as above, and for a second AEC level); the test and smoke helpers `tests/pyc_parity/pyc_drv.c` and
 `4ch_aec_bf_nr_res/tests/dump_delay_parity.c` also read numbers with `atoi()` / `atof()` / `strtoul()`.
 
 The ULCNet applications use `../AIAEC/Align_ULCNet/ulcnet_accelerator_adapter.*`: CPU memory owns
@@ -206,8 +206,8 @@ version.
 
 ```
 Mono                App        Aec                 AnrDenoiser      AcIstft
- init (once)         |-- aec_resolve_signal_grid; aec_config_from_preset; aec_get_mem_size/aec_init -->|  (derive_lane())
-                     |-- anr_config_for_mode_grid; anr_get_mem_size/anr_init ->|
+ init (once)         |-- aec_resolve_signal_grid; aec_config_from_level; aec_get_mem_size/aec_init -->|  (derive_lane())
+                     |-- anr_config_for_level_grid; anr_get_mem_size/anr_init ->|
                      |-- ac_stft_config_default; ac_istft_get_mem_size/ac_istft_init ------->|
  per hop             |-- aec_process_context(mic,ref) -->|
                      |-- aec_get_res_context --> ctx{error_spec,r2,comfort_noise,res_gain}
@@ -217,10 +217,10 @@ Mono                App        Aec                 AnrDenoiser      AcIstft
  refused hop         |-- aec_reset, anr_reset, ac_istft_reset, rng = CNG_RNG_SEED  (all together)
 
 4-channel           App        Aec x4 + DelayAec    Mcab                 AecRes   AnrDenoiser   AcIstft
- init (once)         |-- mcab_default_config; mcab_lane_config (or aec_config_from_preset + mcab_apply_lane_contract)
+ init (once)         |-- mcab_default_config; mcab_lane_config (or aec_config_from_level + mcab_apply_lane_contract)
                      |-- aec_get_mem_size/aec_init x4; mcab_delay_estimator_config; delay_aec_get_mem_size/delay_aec_init (MATCHED) -->|
                      |-- mcab_get_mem_requirements; mcab_init_ex(mem, bytes, &cfg, &libs, &req) ----------------->|
-                     |-- aec_config_from_preset (fft_size = mcab_fft_size(p)); aec_res_*, anr_*, ac_istft_* : each its own mem_size + init
+                     |-- aec_config_from_level (fft_size = mcab_fft_size(p)); aec_res_*, anr_*, ac_istft_* : each its own mem_size + init
  per hop             |-- mcab_process_front(mics, ref, &front) --> front.linear_spectra[4]
                      |-- your beamformer (or the sample helper's mcab_sample_beam_process_beam) --> W[4][n_freqs] (+ E)
                      |-- mcab_fuse(p, W, E, &frame) --> frame{e,r2,cn,g_res_ctx = NULL}
@@ -246,14 +246,20 @@ through it. Neither `Mcab` nor the helper has a RES: build an `AecRes` yourself 
 | Parameters | External (a third party may tune) | Internal (exists, tunable in code, not recommended to open) |
 |---|---|---|
 | Deployment | sample rate and FFT size (the grids below), `filter_length` (a field of each 4-channel lane's `AecConfig`, set before `aec_get_mem_size()`), delay mode with `delay_num_filters` / `fixed_delay_samples` (`McabConfig` for 4-channel), array geometry and `num_angles` (`McabSampleBeamParams`, sample helper) | `n_partitions` and `delay_buffer_ms` of the lane `AecConfig` |
-| Strength | `AecPreset` (`aec_set_preset()`, `aec_res_set_preset()`), `AnrMode` (`anr_set_mode()`) | the raw `min_gain_floor_*_db` values, the NR `g_min_db` / `q` / `xi_min_db` / `noise_over_subtraction` set one by one |
+| Strength | `AecLevel` (`aec_set_level()`, `aec_res_set_level()`), `AnrLevel` (`anr_set_level()`) | the raw `min_gain_floor_*_db` values, the NR `g_min_db` / `q` / `xi_min_db` / `noise_over_subtraction` set one by one |
 | Switches | the examples' RES / NR / CNG switches; `McabConfig.enable_post` | `spatial_linear_context`, `return_res_context`, the lanes' `enable_res = 0` (stamped by `mcab_apply_lane_contract()`) |
 | Tracking and adaptation | - | AEC step sizes, Kalman Q, detector thresholds, 10 ms-authored time constants; NR trackers, smoothing, scene-change, speech-protection; DOA/BF recursion constants (`bf_lambda`, `bf_mu`, `doa_*` of `McabSampleBeamParams`) |
 
 Field-by-field classification with the header and line of every field: section 0.3 of the three
-manuals. `L` and `num_init_frames` of the denoiser are pool-sizing fields: `anr_set_mode()` and
+manuals. `L` and `num_init_frames` of the denoiser are pool-sizing fields: `anr_set_level()` and
 `anr_reconfigure()` refuse to change them, so a different value means a new `anr_get_mem_size()`
 and `anr_init()`.
+
+C level == Python preset. The C code, its tests and its command lines say *level* (`AecLevel`,
+`AnrLevel`, `--nr-level`); the Python twins in this tree (`pipeline.py`, `set_preset()`, the Python
+`--nr-preset`) keep *preset*. The libraries keep the legacy C names `AecPreset`, `AEC_PRESET_*`,
+`AnrMode` and `ANR_MODE_*` (same values), and the C programs still accept `--nr-preset` as another
+spelling of `--nr-level`.
 
 ## Parameter Alignment
 

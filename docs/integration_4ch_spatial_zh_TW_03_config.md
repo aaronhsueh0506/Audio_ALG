@@ -38,10 +38,10 @@ McabSampleBeamParams bp = mcab_sample_beam_default_params();
 >
 > **產品預設維持 `0`。** 打開之後只是把誤鎖往後推一個窗，不會修正誤鎖本身。
 
-`McabConfig` 沒有 `filter_length`、`aec_preset`、`nr_mode`、`enable_nr`、`enable_cng`、`legacy_amin` 欄位。
-**lane 的參數（preset 值、`filter_length` 等）是應用自己的**：用 `aec_config_from_preset()`（或 `mcab_lane_config()` 的 balanced 預設）組好 `AecConfig`，
+`McabConfig` 沒有 `filter_length`、`aec_level`、`nr_level`、`enable_nr`、`enable_cng`、`legacy_amin` 欄位。
+**lane 的參數（level 值、`filter_length` 等）是應用自己的**：用 `aec_config_from_level()`（或 `mcab_lane_config()` 的 balanced 預設）組好 `AecConfig`，
 再用 `mcab_apply_lane_contract(&cfg, &lane)` 蓋上 flow 的契約欄位，四條 lane 用同一份。
-`AecConfig.filter_length` 合法範圍 `(0, 4096]` 樣本（超出時 `aec_get_mem_size()` 回 0），`aec_config_from_preset()` 填入的預設是 52 ms（取樣率 ≥ 44.1 kHz 為 64 ms），即 16 kHz → 832、48 kHz → 3072 樣本，是記憶體吃緊時最有效的旋鈕。
+`AecConfig.filter_length` 合法範圍 `(0, 4096]` 樣本（超出時 `aec_get_mem_size()` 回 0），`aec_config_from_level()` 填入的預設是 52 ms（取樣率 ≥ 44.1 kHz 為 64 ms），即 16 kHz → 832、48 kHz → 3072 樣本，是記憶體吃緊時最有效的旋鈕。
 RES 不是本層欄位，由你自己的 `AecRes` 持有（[§1.1](integration_4ch_spatial_zh_TW.md#11-這是什麼)、[§2](integration_4ch_spatial_zh_TW_01_quick_start.md#2-quick-start)）。
 
 `mcab_apply_lane_contract()` 蓋上的欄位（其餘欄位保持原值，重複呼叫結果不變；`cfg` 無效或 lane 的 `sample_rate` 不同則回 `-1` 且不動 lane）：

@@ -8,7 +8,7 @@ The deployable C seam is:
   `mcab_delay_estimator_config()`), the lifecycle, the two per-hop calls (`mcab_process_front()`,
   `mcab_fuse()`) and the queries and structural audit accessors. Its config carries only the flow's fields
   (grid, delay policy, `enable_post`); the module has no RES and no beamformer, and the lane parameters
-  (preset, `filter_length`) belong to the application;
+  (level, `filter_length`) belong to the application;
 - [`mcab.c`](mcab.c): the flow over one shared `DelayAec` and four linear `Aec` instances **that the application
   created** (passed in `McabLibs`), and the coherent context projection. The residual suppressor (`AecRes`,
   `aec_res.h`, libaec) is carved and chained by the applications below, behind the flow; so are the
@@ -53,7 +53,7 @@ The deployable C seam is:
   the lanes and the estimator for the tests;
 - [`tests/test_mcab_sample_beam.c`](tests/test_mcab_sample_beam.c): sample beam helper lifecycle, topology, reset,
   split calls and their sequence guards, `enable_post = 0`, finite-output tests, `mcab_sample_beam_fuse()`
-  leaving `g_res_ctx` NULL, the caller-owned RES (reset and preset changes on the chain's `AecRes`), and the
+  leaving `g_res_ctx` NULL, the caller-owned RES (reset and level changes on the chain's `AecRes`), and the
   bit-exact equality of flow + helper + `mcab_sample_beam_fuse()` + the examples' chain with the reference chain;
 - [`tests/test_mcab_sample_post.c`](tests/test_mcab_sample_post.c): the acceptance test of `mcab_sample_post.h`; it
   links no mcab object and is built by `pipelines/Makefile` (`make -C .. test_mcab_sample_post`);
@@ -67,7 +67,7 @@ For side-by-side reading, the mono example and its four-channel counterpart:
 |---|---|
 | lib/aec `Aec` (`aec_get_mem_size`, `aec_init`) | `4ch_aec_bf_nr_res/mcab.h` (the flow over four `Aec` lanes and one `DelayAec`, all application-created) |
 | `aec_get_res_context()` (`AecResContext`) | `mcab_fuse()` / `mcab_sample_beam_fuse()` (`McabFrame`) |
-| `Aec` carries the RES gain (`ctx.res_gain`, strength `aec_set_preset()`) | an `AecRes` the application creates (`aec_res_init()`, strength `aec_res_set_preset()`), `aec_res_process()` over `mcab_sample_res_input()` after `mcab_fuse()`; `frame.g_res_ctx` stays `NULL` |
+| `Aec` carries the RES gain (`ctx.res_gain`, strength `aec_set_level()`) | an `AecRes` the application creates (`aec_res_init()`, strength `aec_res_set_level()`), `aec_res_process()` over `mcab_sample_res_input()` after `mcab_fuse()`; `frame.g_res_ctx` stays `NULL` |
 | `mono_nr_gain()` / `mono_form()` in `mono_aec_nr_res/main.c` | `mcab_sample_anr_gain()` and `post_hop()` in `mcab_external_static.c` |
 | `mono_aec_nr_res/main.c` built as `aec_nr_pipeline_static` | `4ch_aec_bf_nr_res/mcab_external_static.c` |
 | `mono_aec_nr_res/main.c` built as the host runner `aec_nr_pipeline` | `4ch_aec_bf_nr_res/mcab_raw.c` raw host runner |
@@ -96,7 +96,7 @@ DelayAec delay;                       /* the estimator object's own storage; out
 int ch;
 
 memset(&libs, 0, sizeof(libs));
-mcab_lane_config(&cfg, &lane);        /* or aec_config_from_preset(&lane, preset, 16000), your own
+mcab_lane_config(&cfg, &lane);        /* or aec_config_from_level(&lane, level, 16000), your own
                                        * filter_length etc., then mcab_apply_lane_contract(&cfg, &lane) */
 mcab_delay_estimator_config(&cfg, &dc);
 mcab_get_mem_requirements(&cfg, &req);
@@ -146,9 +146,9 @@ for (ch = 0; ch < MCAB_CHANNELS; ++ch) aec_destroy(libs.lanes[ch]);
 anr_destroy(my_nr);
 ```
 
-`my_res` is built as `mcab_external_static.c` builds it: `aec_config_from_preset(&res_cfg, preset,
+`my_res` is built as `mcab_external_static.c` builds it: `aec_config_from_level(&res_cfg, level,
 sample_rate)` with `res_cfg.fft_size` set to the flow's FFT, then `aec_res_get_mem_size()` and
-`aec_res_init()` on a 16-byte-aligned block; `aec_res_set_preset(my_res, preset, ramp_ms)` changes
+`aec_res_init()` on a 16-byte-aligned block; `aec_res_set_level(my_res, level, ramp_ms)` changes
 its strength while it runs. A product that keeps linear AEC, RES, CNG and synthesis but omits
 MMSE-LSA simply never initialises the denoiser and passes the unity vector for `nr` (the example's
 `--no-res` and the unity vector do the same for the RES). The module itself has no RES, NR or
@@ -162,7 +162,7 @@ on the helper builds `my_res` the same way (`res_cfg.fft_size = mcab_fft_size(fl
 `mcab_static.c` does in its post pool, and calls `aec_res_process()` over `mcab_sample_res_input(&frame, &in)` every
 hop; a `NULL` result is a refused hop and the flow and every post stage are reset together
 (`mcab_sample_beam_reset()` does not touch the `AecRes`: call `aec_res_reset()` yourself, which keeps
-the preset set with `aec_res_set_preset()`). A refused `mcab_sample_beam_fuse()` resets the whole
+the level set with `aec_res_set_level()`). A refused `mcab_sample_beam_fuse()` resets the whole
 helper (flow, SRP-PHAT, BF) and is returned, except for a sequence refusal and the helper's own argument refusal
 (NULL arguments, `enable_post = 0`), which change nothing; the application resets its own post stages. Without `my_res` the RES gain is the unity vector and `aec_cng_fill()` is not called
 (comfort noise fills only RES-cut bins). `4ch_alignulcnet` builds the flow with `cfg.enable_post = 0` and has no RES.
@@ -201,9 +201,9 @@ mcab_sample_beam_get_mem_size(&cfg, &bp, &beam_bytes);
 void *beam_pool = platform_alloc(beam_bytes, 16);
 McabSampleBeam *beam = mcab_sample_beam_init(beam_pool, beam_bytes, &cfg, &bp, pipeline);
 
-AecConfig res_cfg;   aec_config_from_preset(&res_cfg, AEC_PRESET_BALANCED, 16000);
+AecConfig res_cfg;   aec_config_from_level(&res_cfg, AEC_LEVEL_BALANCED, 16000);
 res_cfg.fft_size = mcab_fft_size(pipeline);                                          /* the flow's grid */
-AnrConfig nr_cfg = anr_config_for_mode_grid(16000, mcab_fft_size(pipeline), ANR_MODE_BALANCED);
+AnrConfig nr_cfg = anr_config_for_level_grid(16000, mcab_fft_size(pipeline), ANR_LEVEL_BALANCED);
 AcStftConfig sy_cfg;  ac_stft_config_default(&sy_cfg, mcab_fft_size(pipeline));
 size_t res_b = aec_res_get_mem_size(&res_cfg), nr_b = anr_get_mem_size(&nr_cfg), sy_b = ac_istft_get_mem_size(&sy_cfg);
 void *post_pool = platform_alloc(ALIGN16(res_b) + ALIGN16(nr_b) + ALIGN16(sy_b) + gain_buffers, 16);   /* RES, NR, synthesis, buffers */
@@ -216,8 +216,8 @@ AcIstft *istft = ac_istft_init((uint8_t *)post_pool + ALIGN16(res_b) + ALIGN16(n
  * mcab_sample_res_input() + aec_res_process(res, ...), mcab_sample_anr_gain(nr, &frame, ...), sk_min_f32(), sk_capply_gain_f32(),
  * aec_cng_fill(), ac_istft_push() as raw_chain() / static_chain() write them. A refused call:
  * mcab_sample_beam_reset(beam), aec_res_reset(res), anr_reset(nr), ac_istft_reset(istft) and
- * rng = MCAB_SAMPLE_CNG_RNG_SEED together. Strength: aec_res_set_preset(res, preset, ramp_ms),
- * anr_set_mode(nr, mode). */
+ * rng = MCAB_SAMPLE_CNG_RNG_SEED together. Strength: aec_res_set_level(res, level, ramp_ms),
+ * anr_set_level(nr, level). */
 
 mcab_sample_beam_destroy(beam); /* first: it borrows the flow; does not release caller-owned memory */
 mcab_destroy(pipeline);         /* then the flow, then the lanes (aec_destroy) */

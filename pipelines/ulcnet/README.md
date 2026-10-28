@@ -58,7 +58,7 @@ run that example's tests and the board skeleton at n=5 and n=1, and check that m
 ## Dependencies
 
 - `common/`: `example_cli.h` (the strict command-line parsers and delay options). The mono
-  example takes its lane config straight from lib/aec (`aec_config_from_preset()`).
+  example takes its lane config straight from lib/aec (`aec_config_from_level()`).
 - lib/aec (`Aec`), audiolib `audio_common` (STFT/ISTFT) and `AIAEC/Align_ULCNet`
   (`ulcnet_process`, `ulcnet_model_io`, `ulcnet_prepost`, `ulcnet_accelerator_adapter`).
 - The 4-channel example also needs the mcab flow in `4ch_aec_bf_nr_res/` (`mcab.h`, archive

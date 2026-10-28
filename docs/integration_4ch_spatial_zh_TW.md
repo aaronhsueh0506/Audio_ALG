@@ -88,15 +88,15 @@ NN 後濾波的分支（`enable_post = 0`）列在圖後。
  │                       │                       │                       │                  │             │
  │══ 初始化（一次；每次 init 前重查，不快取）═══════════════════════════════════════════════════
  │ mcab_default_config(sr) → cfg（flow 參數；不驗證）；mcab_sample_beam_default_params() → bp（覆寫 geometry、uca_radius_m、num_angles …）
- │ 四條 lane：mcab_lane_config(&cfg,&lane) → aec_get_mem_size → aec_init ×4（lane 的 preset／filter_length 由你決定，見 §4.1）
+ │ 四條 lane：mcab_lane_config(&cfg,&lane) → aec_get_mem_size → aec_init ×4（lane 的 level／filter_length 由你決定，見 §4.1）
  │ MATCHED：mcab_delay_estimator_config(&cfg,&dc) → delay_aec_get_mem_size → delay_aec_init（DelayAec 結構也由你保管）
  │ mcab_get_mem_requirements(&cfg,&req) → 配置 req.bytes（16-byte 對齊）→ mcab_init_ex(pool,req.bytes,&cfg,&libs,&req) ►│ → Mcab*（NULL = 拒絕）
  │   （以上 = mcab_sample_flow_init／_create 的內容）
  │ mcab_sample_beam_get_mem_size(&cfg,&bp,&bytes) → 配置 → mcab_sample_beam_init(mem,bytes,&cfg,&bp,flow) ►│ → helper（NULL = 拒絕）
  │ 後級各自 mem_size + init（位址不在 mcab／helper 的 pool 內）：
- │   aec_config_from_preset(&res_cfg,preset,sr) ＋ res_cfg.fft_size = mcab_fft_size(flow)
+ │   aec_config_from_level(&res_cfg,level,sr) ＋ res_cfg.fft_size = mcab_fft_size(flow)
  │     → aec_res_get_mem_size → aec_res_init ───────────────────────────────►│
- │   anr_config_for_mode_grid(sr, mcab_fft_size(flow), mode) → anr_get_mem_size → anr_init ──────────────►│
+ │   anr_config_for_level_grid(sr, mcab_fft_size(flow), level) → anr_get_mem_size → anr_init ──────────────►│
  │   ac_stft_config_default → ac_istft_get_mem_size → ac_istft_init ───────────────────────────────────►│
  │══ 每個 hop（mics[hop*4] interleaved、far[hop]）══════════════════════════════════════════════
  │ 形式 A：mcab_sample_beam_process_front(b,mics,far,&front) ►│ mcab_process_front：共用 delay + 四條 lane
@@ -114,7 +114,7 @@ NN 後濾波的分支（`enable_post = 0`）列在圖後。
  │ skn_all_finite_f32(out,hop)
  │══ 任一步回非 OK／NULL，或輸出非有限（DSP_ERROR 時 flow 已自己 reset）══════════════════════════
  │ mcab_sample_beam_reset(b); aec_res_reset(res); anr_reset(nr); ac_istft_reset(istft); rng = MCAB_SAMPLE_CNG_RNG_SEED
- │══ 強度（hop 之間）：aec_res_set_preset(res,preset,ramp_ms)；anr_set_mode(nr,mode) ═══
+ │══ 強度（hop 之間）：aec_res_set_level(res,level,ramp_ms)；anr_set_level(nr,level) ═══
  │══ 結束：mcab_sample_beam_destroy(b)；mcab_destroy(flow)；aec_destroy ×4；anr_destroy(nr)；之後才釋放 pool（`AecRes` 沒有 destroy）═══
 ```
 
@@ -146,10 +146,10 @@ SRP-PHAT 與 BF 的 DOA 更新間隔由 `doa_update_interval`（預設每 2 個 
 | 每 hop | `mcab_sample_beam_process_front()` → `_process_beam()`；或 `_process_with_activity()`；或 `_process()` | 三種形式等價於前兩者的組合（§1.1） |
 | 頻域串接 | `mcab_sample_beam_fuse()` | 可選；需要 `enable_post = 1` |
 | 重置／收尾 | `mcab_sample_beam_reset()`、`mcab_sample_beam_destroy()`、`mcab_destroy()`、`mcab_sample_flow_destroy()` | reset 不重置你的後級（[§3.1](integration_4ch_spatial_zh_TW_02_lifecycle.md#31-reset-到底重置了什麼以及失敗時整合者要做什麼)） |
-| 強度（你的後級） | `aec_res_set_preset()`、`aec_res_split_floor()`（作用在你自己的 `AecRes`）；`anr_set_mode()`（作用在你的降噪器） | mcab 與 helper 沒有強度 setter，也不持有 `AecRes` |
+| 強度（你的後級） | `aec_res_set_level()`、`aec_res_split_floor()`（作用在你自己的 `AecRes`）；`anr_set_level()`（作用在你的降噪器） | mcab 與 helper 沒有強度 setter，也不持有 `AecRes` |
 | 形狀與生效值 | `mcab_hop_size()`、`mcab_fft_size()`、`mcab_n_freqs()`、`mcab_sample_rate()`、`mcab_enable_post()`、`mcab_sample_beam_bf_effective_adapt_interval()`、`mcab_sample_beam_bf_lambda()` | 無效 handle 回 `-1`（`_bf_lambda()` 回 NaN） |
 | 診斷（唯讀） | `mcab_get_last_timing()`、`mcab_matched_filter_count()`、`mcab_linear_aec_count()`、`mcab_sample_beam_spatial_backend()` | 時序預設全 0 |
-| 你串的後級 | `aec_config_from_preset()`、`aec_res_get_mem_size()`／`aec_res_init()`、`mcab_sample_res_input()` + `aec_res_process()`、`mcab_sample_anr_gain()`、`sk_min_f32()`、`sk_capply_gain_f32()`、`aec_cng_fill()`、`ac_istft_push()`、`skn_all_finite_f32()` | `fuse` 之後 `frame.g_res_ctx` 恆為 NULL，RES 增益由你的 `AecRes` 經 `aec_res_process()` 算出（輸入由 `mcab_sample_res_input()` 從 frame 填；`mcab_sample_post.h` 是範例碼） |
+| 你串的後級 | `aec_config_from_level()`、`aec_res_get_mem_size()`／`aec_res_init()`、`mcab_sample_res_input()` + `aec_res_process()`、`mcab_sample_anr_gain()`、`sk_min_f32()`、`sk_capply_gain_f32()`、`aec_cng_fill()`、`ac_istft_push()`、`skn_all_finite_f32()` | `fuse` 之後 `frame.g_res_ctx` 恆為 NULL，RES 增益由你的 `AecRes` 經 `aec_res_process()` 算出（輸入由 `mcab_sample_res_input()` 從 frame 填；`mcab_sample_post.h` 是範例碼） |
 
 **內部（不要依賴）**：`mcab_internal.h`（admission 狀態機、duty 診斷 hook、投影 kernel；不交付）與 `mcab.c` 內的 static 函式
 （含 `build_flags_hash` 的計算）；`<audiolib>/{doa,bf,common/utility}` 的所有函式——helper 擁有它們的生命週期，
@@ -165,10 +165,10 @@ flow 參數在 `mcab.h` 的 `McabConfig`（11 欄），陣列與 SRP／BF 參數
 | 欄位 | 位置 | 何時設定 | 作用 |
 |---|---|---|---|
 | `sample_rate`、`fft_size`、`delay_mode`、`delay_num_filters`、`fixed_delay_samples`、`capture_proxy_channel`、`max_delay_ms`、`enable_post` | `McabConfig`（[§4.1](integration_4ch_spatial_zh_TW_03_config.md#41-mcabconfigflow-參數與-lane-的-aecconfig)；分級同 [mcab 手冊](integration_4ch_core_zh_TW.md)） | init 前，不可變 | 格點、對齊方式、是否可 `fuse()` |
-| lane 的 `AecConfig`（`filter_length`、preset 等） | 應用自己組：`aec_config_from_preset()` ＋ `mcab_apply_lane_contract()`，或 `mcab_lane_config()`（balanced 預設） | init 前，不可變 | AEC 長度與記憶體；mcab 只蓋上 flow 的契約欄位，其餘不檢查 |
+| lane 的 `AecConfig`（`filter_length`、level 等） | 應用自己組：`aec_config_from_level()` ＋ `mcab_apply_lane_contract()`，或 `mcab_lane_config()`（balanced 預設） | init 前，不可變 | AEC 長度與記憶體；mcab 只蓋上 flow 的契約欄位，其餘不檢查 |
 | `geometry`、`uca_radius_m` ／ `ula_spacing_m` ／ `microphone_x_m[4]`+`microphone_y_m[4]` | `McabSampleBeamParams`（[§4.2](integration_4ch_spatial_zh_TW_03_config.md#42-陣列幾何4--2-欄)） | init 前 | 麥克風陣列的實體資訊；預設 UCA 半徑 0.035 m 只是讓範例能跑，產品必須設成實測值 |
 | `num_angles` | [§4.3](integration_4ch_spatial_zh_TW_03_config.md#43-direction-findingdoa7-欄) | init 前 | 角度解析度；**helper 最大的記憶體旋鈕**（steering table，[§4.7](integration_4ch_spatial_zh_TW_03_config.md#47-哪些欄位會改變記憶體用量)） |
-| 後級強度 | `aec_res_set_preset()`（你的 `AecRes`）、`anr_set_mode()`（你的降噪器） | hop 之間 | mcab 與 helper 本身沒有 RES 欄位，初始強度由你傳給 `aec_config_from_preset()` 的 preset 決定 |
+| 後級強度 | `aec_res_set_level()`（你的 `AecRes`）、`anr_set_level()`（你的降噪器） | hop 之間 | mcab 與 helper 本身沒有 RES 欄位，初始強度由你傳給 `aec_config_from_level()` 的 level 決定 |
 
 進階外部（有明確使用情境才動，改了要自己重跑驗證）：`bf_enable`（0 = 不 beamform，直接輸出 channel 0）、
 `bf_fixed_mode`＋`bf_fixed_doa_rad`（說話方向已知的部署）、`doa_low_freq_hz`／`doa_high_freq_hz`（定位頻帶，low < 解析後 high < Nyquist）、
@@ -211,9 +211,9 @@ mic hop [hop][4] + ref hop [hop]
 mcab **借用**你建立的共用 delay 估計器與四條線性 AEC lane，並擁有它們之間的 flow 狀態；helper 擁有 SRP-PHAT 與 BF 的生命週期。
 兩者都**不擁有**也不初始化 post-beam 的殘餘回音抑制器（libaec 的 `AecRes`）、降噪器（`AnrDenoiser`）、comfort noise、
 合成（`AcIstft`）或任何 NN stage：每一個都是獨立的函式庫物件，有自己的 `mem_size` 與 `init`，初始化與每 hop 串接是整合者的事。
-要 RES 就自己用 libaec 建一個 `AecRes`：`aec_config_from_preset(preset, sample_rate)`，`fft_size` 設成
+要 RES 就自己用 libaec 建一個 `AecRes`：`aec_config_from_level(level, sample_rate)`，`fft_size` 設成
 `mcab_fft_size(flow)`，再 `aec_res_get_mem_size()`／`aec_res_init()`；每 hop 用 `aec_res_process()` 算增益（輸入由 `mcab_sample_res_input()` 填），
-強度用 `aec_res_set_preset()`（[§3.3](integration_4ch_spatial_zh_TW_02_lifecycle.md#33-執行期強度控制)）。
+強度用 `aec_res_set_level()`（[§3.3](integration_4ch_spatial_zh_TW_02_lifecycle.md#33-執行期強度控制)）。
 
 每 hop 的呼叫有三種形式：
 

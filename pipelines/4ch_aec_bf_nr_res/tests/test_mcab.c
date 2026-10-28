@@ -343,14 +343,14 @@ static void test_weights_gate(void) {
           "weight gate: an empty matrix is refused");
 }
 
-/* The default lane as mcab.h documents it, written out here: lib/aec's balanced preset on the
+/* The default lane as mcab.h documents it, written out here: lib/aec's balanced level on the
  * flow's rate and grid, EXTERNAL_ALIGNED, the linear context returned without a gain of its own,
  * the context level of enable_post and the flow's duty period. -1 for a config the flow refuses. */
 static int lane_config_for(const McabConfig* cfg, AecConfig* out) {
     McabMemBreakdown b;
     if (mcab_get_mem_breakdown(cfg, &b) != 0) return -1;
     memset(out, 0, sizeof(*out));
-    aec_config_from_preset(out, AEC_PRESET_BALANCED, cfg->sample_rate);
+    aec_config_from_level(out, AEC_LEVEL_BALANCED, cfg->sample_rate);
     out->fft_size = b.fft_size;
     out->delay_mode = AEC_DELAY_EXTERNAL_ALIGNED;
     out->delay_num_filters = DA_NUM_FILTERS;
@@ -2121,7 +2121,7 @@ static void test_delay_change_candidate_ttl(void) {
 
 /* ============================================================================
  * Runtime strength control. The lanes run with spatial_linear_context and never reach their
- * own residual suppressor, so a preset change pushed at them is a no-op: the setter must
+ * own residual suppressor, so a level change pushed at them is a no-op: the setter must
  * move the shared post-stage suppressor (the AecRes), and the retargeted floor must survive
  * a reset (test 3 below).
  * ========================================================================== */
@@ -4346,7 +4346,7 @@ static void test_delay_request_rules(void) {
         got_mem = mcab_get_mem_requirements(&cfg, &req) == 0 ? 0 : -1;
         got_lane = mcab_lane_config(&cfg, &lane) == 0 ? 0 : -1;
         memset(&lane, 0, sizeof(lane));
-        aec_config_from_preset(&lane, AEC_PRESET_BALANCED, rows[r].sr);
+        aec_config_from_level(&lane, AEC_LEVEL_BALANCED, rows[r].sr);
         got_contract = mcab_apply_lane_contract(&cfg, &lane) == 0 ? 0 : -1;
         if (mcab_test_libs_create(&host, &objs) == 0 &&
             mcab_get_mem_requirements(&host, &host_req) == 0 &&
@@ -4717,7 +4717,7 @@ static void test_app_composed_lane(void) {
 
     cfg.delay_est_period_s = 0.4f;
     memset(&app, 0, sizeof(app));
-    aec_config_from_preset(&app, AEC_PRESET_AGGRESSIVE, 16000);
+    aec_config_from_level(&app, AEC_LEVEL_AGGRESSIVE, 16000);
     app.filter_length = 1024;
     app.mu = 0.2f;
     stamped = app;
@@ -4734,7 +4734,7 @@ static void test_app_composed_lane(void) {
     CHECK(memcmp(&rest, &app, sizeof(app)) == 0 && stamped.filter_length == 1024 &&
               stamped.mu == 0.2f &&
               stamped.min_gain_floor_far_active_db == app.min_gain_floor_far_active_db,
-          "lane contract: every other field (preset, filter length, step size) is the app's");
+          "lane contract: every other field (level, filter length, step size) is the app's");
     again = stamped;
     CHECK(mcab_apply_lane_contract(&cfg, &again) == 0 && memcmp(&again, &stamped, sizeof(again)) == 0,
           "lane contract: idempotent");
@@ -4750,7 +4750,7 @@ static void test_app_composed_lane(void) {
         McabConfig bad = cfg;
         AecConfig r48, keep;
         memset(&r48, 0, sizeof(r48));
-        aec_config_from_preset(&r48, AEC_PRESET_BALANCED, 48000);
+        aec_config_from_level(&r48, AEC_LEVEL_BALANCED, 48000);
         keep = r48;
         CHECK(mcab_apply_lane_contract(&cfg, &r48) != 0 && memcmp(&r48, &keep, sizeof(r48)) == 0,
               "lane contract: a lane built for another rate is refused, unchanged");
@@ -4763,7 +4763,7 @@ static void test_app_composed_lane(void) {
     }
     CHECK(mcab_lane_config(&cfg, &dflt) == 0 && lane_config_for(&cfg, &again) == 0 &&
               memcmp(&dflt, &again, sizeof(dflt)) == 0,
-          "lane contract: mcab_lane_config() is the balanced preset plus the contract");
+          "lane contract: mcab_lane_config() is the balanced level plus the contract");
 
     /* A flow over the app's lanes runs beside one over the default lanes; the lanes really run
      * the app's parameters (their linear output differs). */

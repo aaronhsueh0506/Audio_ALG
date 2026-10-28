@@ -5,7 +5,7 @@
 
 | # | 步驟 | 呼叫 | 什麼時候呼叫 | 這一步可能怎麼失敗 |
 |---|---|---|---|---|
-| 1 | derive | `aec_resolve_signal_grid(sr, fft_size, &grid)`、`aec_config_from_preset(&aec_cfg, preset, sr)`，再設接縫欄位（範例的 `derive_lane()`，[§4.1](#41-aecconfig-的接縫欄位範例的-derive_lane)） | 每次 init 之前 | `aec_resolve_signal_grid()` 回 `0`：沒有這組 `(sample_rate, fft_size)` 的格點，`grid` 不被寫入（`fft_size = 0` 也是 `0`）；`aec_config_from_preset()` 是 `void` |
+| 1 | derive | `aec_resolve_signal_grid(sr, fft_size, &grid)`、`aec_config_from_level(&aec_cfg, level, sr)`，再設接縫欄位（範例的 `derive_lane()`，[§4.1](#41-aecconfig-的接縫欄位範例的-derive_lane)） | 每次 init 之前 | `aec_resolve_signal_grid()` 回 `0`：沒有這組 `(sample_rate, fft_size)` 的格點，`grid` 不被寫入（`fft_size = 0` 也是 `0`）；`aec_config_from_level()` 是 `void` |
 | 2 | query | `aec_get_mem_size(&aec_cfg)`、`anr_get_mem_size(&nr_cfg)`、`ac_istft_get_mem_size(&synth_cfg)`，加上你自己的增益／頻譜暫存 | **每次 init 之前**都要重查，不可跨 build / backend / config 快取 | 回傳 `0`：config 無效（**注意：這幾個是 0 = 失敗，與 4ch `mcab_get_mem_requirements()` 的 `0` = 成功、`-1` = 失敗慣例不同**） |
 | 3 | allocate | 你自己的配置器，取得各塊 `ALIGN16(...)` 相加且 16-byte 對齊的記憶體 | 拿到大小之後 | 配置失敗由你自己處理。pool **不需要**預先清零（poison pattern 也可以）；但必須在 handle 生命週期內獨佔、不被其他人寫入 |
 | 4 | init | `aec_init(pool, aec_bytes, &aec_cfg)`、`anr_init(pool + ALIGN16(aec_bytes), nr_bytes, &nr_cfg)`、`ac_istft_init(...)`；每一塊的起點都是前一塊加 `ALIGN16(前一塊大小)` | 拿到 pool 之後，處理第一個 hop 之前 | 回傳 `NULL`：pool 未 16-byte 對齊、太小、config 無效、子模組 init 失敗。已建好的那幾個要由你 destroy |
@@ -83,24 +83,26 @@ profile build 與 release build 的 pool 大小與每個 offset 都相同，開�
 兩條強度軸都可以在**運轉中**改，不需要重建、不動 pool：
 
 ```c
-int aec_set_preset(Aec* a, AecPreset preset, float ramp_ms);
-int anr_set_mode(AnrDenoiser* nr, AnrMode mode);   /* nr = 你自己 anr_init() 回來的那一個 */
+int aec_set_level(Aec* a, AecLevel level, float ramp_ms);
+int anr_set_level(AnrDenoiser* nr, AnrLevel level);   /* nr = 你自己 anr_init() 回來的那一個 */
 ```
 
 ```c
 /* 使用者把回音抑制轉到 aggressive、降噪轉到 mild */
-if (aec_set_preset(aec, AEC_PRESET_AGGRESSIVE, 100.0f) != 0)   { /* 引數不合法 */ }
-if (anr_set_mode(nr, ANR_MODE_MILD) != 0)                      { /* 同上 */ }
+if (aec_set_level(aec, AEC_LEVEL_AGGRESSIVE, 100.0f) != 0)   { /* 引數不合法 */ }
+if (anr_set_level(nr, ANR_LEVEL_MILD) != 0)                  { /* 同上 */ }
 
 aec_process_context(aec, mic, ref);   /* 下一個 hop 起生效 */
 ```
 
 | 呼叫 | 改什麼 | 回 `-1` 的情況（`-1` 時**什麼都不寫**） |
 |---|---|---|
-| `aec_set_preset()` | `Aec` 的殘留回音地板（preset 改變 far-active 地板 -20/-28/-38 dB；aggressive 另把 DT 地板設成 -30 dB；NO_FLOOR 關閉 `min_gain_split_floor_enabled`；mono 的 RES 增益 `g_res_ctx` 就是這個 lane 自己算的，所以 mono 的 RES 強度就是這個 setter） | `a` 為 NULL；`preset` 超出 enum；`ramp_ms` 非有限值或超出 `[0, 60000]` |
-| `anr_set_mode()` | 降噪器的強度 preset（`q`、`xi_min_db`、`g_min_db`、`noise_over_subtraction`） | `nr` 為 NULL（含你沒有建降噪器）；`mode` 超出 enum |
+| `aec_set_level()` | `Aec` 的殘留回音地板（level 改變 far-active 地板 -20/-28/-38 dB；aggressive 另把 DT 地板設成 -30 dB；NO_FLOOR 關閉 `min_gain_split_floor_enabled`；mono 的 RES 增益 `g_res_ctx` 就是這個 lane 自己算的，所以 mono 的 RES 強度就是這個 setter） | `a` 為 NULL；`level` 超出 enum；`ramp_ms` 非有限值或超出 `[0, 60000]` |
+| `anr_set_level()` | 降噪器的強度 level（`q`、`xi_min_db`、`g_min_db`、`noise_over_subtraction`） | `nr` 為 NULL（含你沒有建降噪器）；`level` 超出 enum |
 
-`ramp_ms == 0` 代表下一個 hop 就套用，**不是錯誤**，落點與「用該 preset 從頭建一個
+C 稱 level，Python 稱 preset（NR 為 strength）：**C level == Python preset**，值名與整數相同。舊名 `AecPreset`／`AEC_PRESET_*`、`AnrMode`／`ANR_MODE_*` 仍保留在公開 header（同值），舊函式名已移除。
+
+`ramp_ms == 0` 代表下一個 hop 就套用，**不是錯誤**，落點與「用該 level 從頭建一個
 新實例」完全相同；`> 0` 則以 dB 為單位線性走過去，上限 60 秒。mild ↔ aggressive 是
 18 dB 落差、而地板是硬性 clamp，所以互動式旋鈕應該給一個 ramp（100 ms 是合理起點）。
 ramp 進行中再呼叫一次，會從當前的 live 值重新起走。
@@ -109,8 +111,8 @@ ramp 進行中再呼叫一次，會從當前的 live 值重新起走。
 全部繼續跑。要重啟請用 [§3](#3-lifecycle) 第 6 步的整組 reset。**在兩個 hop 之間呼叫、與
 process 序列化；非 thread-safe。**
 
-> 範例的降噪器以 `anr_config_for_mode_grid()` 建立、沒有覆寫任何欄位（最小值追蹤視窗 `L` 用函式庫預設），所以 `anr_set_mode()`
-> 直接換強度。若你在 preset 之上改過欄位，`anr_set_mode()` 會把它們蓋回 preset 值：
+> 範例的降噪器以 `anr_config_for_level_grid()` 建立、沒有覆寫任何欄位（最小值追蹤視窗 `L` 用函式庫預設），所以 `anr_set_level()`
+> 直接換強度。若你在 level 組態之上改過欄位，`anr_set_level()` 會把它們蓋回 level 值：
 > 那種實例請自己組好完整 target 再呼叫 `anr_reconfigure()`。
 
 **A/B 量測時該預期什麼。** far-active 地板只在 **far-active 且非 double-talk** 的
@@ -126,29 +128,29 @@ hop 上生效：double-talk 期間套用的是 DT 地板（mild/balanced 共用 
 ## 4. Config 完整參考
 
 mono 的設定分成兩份：lib/aec 的 `AecConfig`（格點與接縫欄位由範例的 `derive_lane()` 填，其餘欄位的預設來自
-`aec_config_from_preset()`）與範例程式自己的後級選項（RES gain 用不用、NR 開不開與強度、CNG、`use_r2`、合成），
+`aec_config_from_level()`）與範例程式自己的後級選項（RES gain 用不用、NR 開不開與強度、CNG、`use_r2`、合成），
 後者**不是**任何函式庫的 config struct，是 `mono_aec_nr_res/main.c` 的 `PostPlan` 這類程式內部欄位，決定要不要呼叫、
 要不要建對應的函式庫物件。驗證發生在 `aec_resolve_signal_grid()`（回 `0`）與
 `aec_get_mem_size()`／`anr_get_mem_size()`／`ac_istft_get_mem_size()`（回 `0`）。
 
 ### 4.1 `AecConfig` 的接縫欄位（範例的 `derive_lane()`）
 
-`derive_lane(sample_rate, fft_size, preset, &grid, &aec_cfg)`（`mono_aec_nr_res/main.c`）依序做：
+`derive_lane(sample_rate, fft_size, level, &grid, &aec_cfg)`（`mono_aec_nr_res/main.c`）依序做：
 `aec_resolve_signal_grid(sample_rate, fft_size ? fft_size : aec_default_fft_size(sample_rate), &grid)`（回 `0` 即回報失敗）、
-`aec_config_from_preset(&aec_cfg, preset, sample_rate)`，然後設下表的欄位。`aec_get_mem_size()` 與 `aec_init()` 會用 libaec 自己的驗證器
-再檢查整份 `AecConfig`（回 `0`／`NULL`）。`aec_config_from_preset()` 對 8000／16000／48000 以外的取樣率回傳 `fft_size` 與 `filter_length` 皆為 `0` 的不可用設定，`aec_get_mem_size()` 回 `0`、`aec_init()` 回 `NULL`、`aec_create()` 回非 0，函式本身不會溢位。
+`aec_config_from_level(&aec_cfg, level, sample_rate)`，然後設下表的欄位。`aec_get_mem_size()` 與 `aec_init()` 會用 libaec 自己的驗證器
+再檢查整份 `AecConfig`（回 `0`／`NULL`）。`aec_config_from_level()` 對 8000／16000／48000 以外的取樣率回傳 `fft_size` 與 `filter_length` 皆為 `0` 的不可用設定，`aec_get_mem_size()` 回 `0`、`aec_init()` 回 `NULL`、`aec_create()` 回非 0，函式本身不會溢位。
 
 | 欄位 | 型別 | 範例的值 | 合法值（驗證器實際檢查的） | 你該怎麼設 |
 |---|---|---|---|---|
 | `sample_rate` | `int` | 你的取樣率 | `8000` / `16000` / `48000`，其他一律拒絕（例如 `44100`；`aec_is_valid_sample_rate()` 可先查） | 設成你音訊實際的取樣率。這個值同時決定預設 grid |
 | `fft_size` | `int` | `aec_default_fft_size(sample_rate)`（CLI `--fft-size 0` 時） | 8 kHz 只接受 `256`；16 kHz 接受 `256` 或 `512`；48 kHz 只接受 `1024`；`0` 與其他組合拒絕（`aec_resolve_signal_grid()` 回 `0`） | 除非你有明確理由要 16 kHz 的 512 grid，否則取 rate 預設 |
-| `filter_length` | `int` | `aec_config_from_preset()` 的預設（52 ms；≥ 44.1 kHz 為 64 ms） | `[1, 4096]`，範圍外 `aec_get_mem_size()` 回 `0` | PBFDKF taps，init 後不可變；沒有明確需求就不改 |
+| `filter_length` | `int` | `aec_config_from_level()` 的預設（52 ms；≥ 44.1 kHz 為 64 ms） | `[1, 4096]`，範圍外 `aec_get_mem_size()` 回 `0` | PBFDKF taps，init 後不可變；沒有明確需求就不改 |
 | `delay_mode` | `AecDelayMode` | `AEC_DELAY_MATCHED` | `AEC_DELAY_MATCHED` / `AEC_DELAY_FIXED` / `AEC_DELAY_EXTERNAL_ALIGNED` | 語意同 `lib/aec`；記憶體差異見 [§4.5a](#45a-delay_mode-對-16000預設-grid-的影響matched-n5-為-baseline) |
 | `delay_num_filters` | `int` | `DA_NUM_FILTERS`（5） | 一律 `[1, DA_NUM_FILTERS]`；`FIXED` 與 `EXTERNAL_ALIGNED` 要求維持 `DA_NUM_FILTERS` | matched-filter bank 大小，決定 bulk delay 搜尋範圍；init 參數，不是 runtime setter |
 | `fixed_delay_samples` | `int` | `-1` | 僅 `FIXED` 有效（原生取樣點數 ≥ 0，上限為該取樣率下的 120 秒）；其他模式須為 `-1` | 已知固定 delay 時使用 |
 | `enable_delay_est` | `int` | `1` | 與 `delay_mode` 的舊式鏡像（deprecated，見 `aec_config_resolve_delay()`） | 範例固定為 `1`（MATCHED）；改用 `delay_mode` |
 | `enable_res`、`return_res_context` | `int` | `0`、`1` | `{0, 1}` | 接縫：lane 不自己輸出時域音訊，`aec_get_res_context()` 交出 `error_spec`／`res_gain`／`r2`／`comfort_noise`，增益由你的每 hop 串接套用 |
-| `preset`（`aec_config_from_preset()` 的引數） | `AecPreset` | `AEC_PRESET_BALANCED`（= 1） | `AEC_PRESET_MILD`(0) / `AEC_PRESET_BALANCED`(1) / `AEC_PRESET_AGGRESSIVE`(2) / `AEC_PRESET_NO_FLOOR`(3)；列舉以外的整數**退回 balanced**（執行期換強度用 `aec_set_preset()`，它對 enum 外回 `-1`） | 近端保留優先 → `MILD`；回聲抑制優先 → `AGGRESSIVE`；不確定就留預設 |
+| `level`（`aec_config_from_level()` 的引數） | `AecLevel` | `AEC_LEVEL_BALANCED`（= 1） | `AEC_LEVEL_MILD`(0) / `AEC_LEVEL_BALANCED`(1) / `AEC_LEVEL_AGGRESSIVE`(2) / `AEC_LEVEL_NO_FLOOR`(3)；列舉以外的整數**退回 balanced**（執行期換強度用 `aec_set_level()`，它對 enum 外回 `-1`） | 近端保留優先 → `MILD`；回聲抑制優先 → `AGGRESSIVE`；不確定就留預設 |
 
 `spatial_linear_context` 保持預設 `0`（完整 context）：`ctx.res_gain` 才有值；4ch 的 lane 設成 `AEC_CONTEXT_NO_GAIN` 或
 `AEC_CONTEXT_LINEAR_ONLY` 是 `mcab_apply_lane_contract()` 的事，不是 mono 範例的。
@@ -157,11 +159,11 @@ mono 的設定分成兩份：lib/aec 的 `AecConfig`（格點與接縫欄位由�
 
 | 選項 | 範例的預設 | 它決定什麼 |
 |---|---|---|
-| RES gain | 用（`ctx.res_gain`，即 AEC 自己的殘留 gain） | `--no-res`：`G_res` 視為全 1 的 unity 向量，comfort noise 因為沒有被 RES 挖掉的 bin 而不填。強度用 `aec_set_preset()`（[§3.2](#32-執行期強度控制)），沒有獨立的 `AecRes`、也沒有 `res_preset` |
-| NR | 用 | `--no-nr`：不建 `AnrDenoiser`（state 不進 pool），總增益只剩 `G_res`，`anr_set_mode()` 沒有對象 |
-| NR 強度 | `ANR_MODE_BALANCED`（= 2） | `--nr-preset mild\|moderate\|balanced\|aggressive`：交給 `anr_config_for_mode_grid(sr, fft_size, mode)`，四級都可用；最小值追蹤視窗 `L` 為函式庫預設，不覆寫 |
+| RES gain | 用（`ctx.res_gain`，即 AEC 自己的殘留 gain） | `--no-res`：`G_res` 視為全 1 的 unity 向量，comfort noise 因為沒有被 RES 挖掉的 bin 而不填。強度用 `aec_set_level()`（[§3.2](#32-執行期強度控制)），沒有獨立的 `AecRes`、也沒有 `res_level` |
+| NR | 用 | `--no-nr`：不建 `AnrDenoiser`（state 不進 pool），總增益只剩 `G_res`，`anr_set_level()` 沒有對象 |
+| NR 強度 | `ANR_LEVEL_BALANCED`（= 2） | `--nr-level mild\|moderate\|balanced\|aggressive`（舊旗標 `--nr-preset` 為別名）：交給 `anr_config_for_level_grid(sr, fft_size, level)`，四級都可用；最小值追蹤視窗 `L` 為函式庫預設，不覆寫 |
 | `use_r2` | 用 | `--legacy-amin`：`use_r2 = 0`，`mono_nr_gain()` 不把 R² 摺進 noise floor（noise-only NR）。只用於比對，新整合請保持用 R² |
-| CNG | 開，與 `aec_cfg.enable_cng`（AEC preset 自己的值）取 AND | `--no-cng`：不呼叫 `aec_cng_fill()`。位準再乘該 bin 的 NR gain、下限 −10 dB（範例的 `CNG_NR_GAIN_FLOOR`；NR 看不到 comfort noise，在此補套）；沒有 RES gain 時也不填 |
+| CNG | 開，與 `aec_cfg.enable_cng`（AEC level 自己的值）取 AND | `--no-cng`：不呼叫 `aec_cng_fill()`。位準再乘該 bin 的 NR gain、下限 −10 dB（範例的 `CNG_NR_GAIN_FLOOR`；NR 看不到 comfort noise，在此補套）；沒有 RES gain 時也不填 |
 | 合成 | 用 | 範例是 `ac_istft_push()` 之後直接輸出；DFN2 之類後接的 stage 自己合成時就不建 `AcIstft`（見 `dfn/mono_aec_dfn_res`） |
 
 `--aec-only` 不建任何後級、用 `aec_process()`（[§1.2](integration_mono_zh_TW_01_overview_link_quickstart.md#12---aec-only)）。
@@ -190,7 +192,7 @@ mono 的設定分成兩份：lib/aec 的 `AecConfig`（格點與接縫欄位由�
 | `delay_mode` | 會（`MATCHED` 建 matched-filter estimator + 大 ring；`FIXED` 只建剛好夠用的小 ring；`EXTERNAL_ALIGNED` 兩者都不建，見 [§4.5a](#45a-delay_mode-對-16000預設-grid-的影響matched-n5-為-baseline)） |
 | `delay_num_filters` | 僅 `MATCHED` 有效：每少一個固定省 5,728 B（四格點皆同，與 `lib/aec` 一致） |
 | `fixed_delay_samples` | 僅 `FIXED` 有效：ring 大小 = `ALIGN16((fixed_delay_samples+hop)×4)` B |
-| `aec_preset`、`nr_mode` | 實測不變 |
+| `aec_level`、`nr_level` | 實測不變 |
 | 要不要建降噪器（`--no-nr`） | 會（不建就省下整份 MMSE-LSA state） |
 | 要不要建合成 | 會（不建就省下 `AcIstft`） |
 | RES gain、CNG、`use_r2` | 不變（RES 是 `Aec` 內的 gain，不另配記憶體） |
@@ -257,7 +259,7 @@ mono 的設定分成兩份：lib/aec 的 `AecConfig`（格點與接縫欄位由�
 | `skn_all_finite_f32()` | `1` | `0` | 選用：你在採用輸出之前要做的檢查（`example_board_adapter.c` 的 `run_hops()` 就這樣檢查） |
 | `aec_reset()` / `anr_reset()` / `ac_istft_reset()` | `void` | 不會失敗 | 要一起呼叫，並把 comfort-noise RNG 設回起始值（範例的 `CNG_RNG_SEED`） |
 | `aec_destroy()` / `anr_destroy()` | `void` | 不會失敗 | NULL 安全 |
-| `aec_set_preset()` / `anr_set_mode()` | `0` | `-1` | `-1` 時什麼都不寫（[§3.2](#32-執行期強度控制)） |
+| `aec_set_level()` / `anr_set_level()` | `0` | `-1` | `-1` 時什麼都不寫（[§3.2](#32-執行期強度控制)） |
 
 > **注意慣例不一致**：`aec_get_mem_size()` / `anr_get_mem_size()` / `ac_istft_get_mem_size()` /
 > `fft_get_mem_size()` 是 **回傳 0 代表失敗**；4ch 的 `mcab_get_mem_requirements()` 是

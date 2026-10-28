@@ -42,12 +42,12 @@ th{background:#eef2f8}
 <h2>1. 呼叫順序</h2>
 <table>
 <tr><th>階段</th><th>mono(<code>mono_aec_dfn_res</code>)</th><th>4ch(<code>4ch_aec_bf_dfn_res</code>)</th></tr>
-<tr><td>設定</td><td><code>aec_resolve_signal_grid(sr, aec_default_fft_size(sr), &amp;grid)</code>、<code>aec_config_from_preset(&amp;aec_cfg, AEC_PRESET_BALANCED, sr)</code>,再設 <code>delay_*</code>、<code>enable_res = 0</code>、<code>return_res_context = 1</code>(<code>main.c</code> 的 <code>derive_lane()</code>;8 kHz 也可)</td><td><code>mcab_default_config(sr)</code>,改 <code>delay_mode</code>／<code>delay_num_filters</code>／<code>fixed_delay_samples</code>(預設 <code>enable_post=1</code>;<code>McabConfig</code> 只含 flow 參數);<code>mcab_sample_beam_default_params()</code>(陣列幾何、DOA、BF、fallback VAD)。RES:<code>aec_config_from_preset(&amp;res_cfg, AEC_PRESET_BALANCED, sr)</code>,<code>res_cfg.fft_size</code> = flow 格點</td></tr>
+<tr><td>設定</td><td><code>aec_resolve_signal_grid(sr, aec_default_fft_size(sr), &amp;grid)</code>、<code>aec_config_from_level(&amp;aec_cfg, AEC_LEVEL_BALANCED, sr)</code>,再設 <code>delay_*</code>、<code>enable_res = 0</code>、<code>return_res_context = 1</code>(<code>main.c</code> 的 <code>derive_lane()</code>;8 kHz 也可)</td><td><code>mcab_default_config(sr)</code>,改 <code>delay_mode</code>／<code>delay_num_filters</code>／<code>fixed_delay_samples</code>(預設 <code>enable_post=1</code>;<code>McabConfig</code> 只含 flow 參數);<code>mcab_sample_beam_default_params()</code>(陣列幾何、DOA、BF、fallback VAD)。RES:<code>aec_config_from_level(&amp;res_cfg, AEC_LEVEL_BALANCED, sr)</code>,<code>res_cfg.fft_size</code> = flow 格點</td></tr>
 <tr><td>DFN2 設定</td><td><code>dfn2_model_io_descriptor_default()</code>;<code>dfn_rate_bridge_default_config(sr)</code>(8／16 kHz)或 <code>dfn_res_stage_default_config(DFN2_SR)</code>(48 kHz);填 <code>erb_fwd</code>／<code>erb_inv</code>／<code>atten_lim_db</code>／<code>model</code></td><td>同左(經 <code>dfn_hop_pool_plan(&amp;plan, sr, cfg.fft_size)</code>,<code>bridge_cfg.fft_size = cfg.fft_size</code>)</td></tr>
 <tr><td>查大小</td><td><code>aec_get_mem_size()</code>;<code>dfn_rate_bridge_get_mem_requirements()</code>(48 kHz:<code>dfn_res_stage_get_mem_requirements()</code> + <code>ac_istft_get_mem_size()</code>)</td><td><code>mcab_get_mem_requirements()</code>、<code>mcab_get_mem_breakdown()</code>(取 <code>n_freqs</code>／<code>fft_size</code>)、<code>mcab_sample_flow_get_mem_size()</code>、<code>mcab_sample_beam_get_mem_size()</code>、<code>aec_res_get_mem_size()</code>;其餘同左</td></tr>
 <tr><td>init</td><td><code>aec_init()</code>;<code>dfn_rate_bridge_init[_ex]()</code> 或 <code>dfn_res_stage_init[_ex]()</code> + <code>ac_istft_init()</code>;<code>dfn_hop_init_bridge()</code>／<code>dfn_hop_init_stage()</code></td><td><code>mcab_sample_flow_init()</code>(四條 lane、estimator、<code>mcab_init_ex()</code>)、<code>mcab_sample_beam_init(…, flow)</code>、<code>aec_res_init()</code>;其餘同左</td></tr>
 <tr><td>每 hop</td><td><code>aec_process_context()</code>、<code>aec_get_res_context()</code>、P 形成、<code>dfn_hop_process()</code>(或 begin／nn／end)</td><td><code>mcab_sample_beam_process[_with_activity]()</code>、<code>mcab_sample_beam_fuse()</code>(<code>g_res_ctx</code> 為 NULL)、<code>mcab_sample_res_input()</code> 加 <code>aec_res_process(res, &amp;in)</code>、P 形成、<code>dfn_hop_*</code></td></tr>
-<tr><td>hop 之間</td><td><code>aec_set_preset()</code>、<code>dfn_res_stage_set_atten_lim()</code></td><td><code>aec_res_set_preset(res, …)</code>、<code>dfn_res_stage_set_atten_lim()</code></td></tr>
+<tr><td>hop 之間</td><td><code>aec_set_level()</code>、<code>dfn_res_stage_set_atten_lim()</code></td><td><code>aec_res_set_level(res, …)</code>、<code>dfn_res_stage_set_atten_lim()</code></td></tr>
 <tr><td>reset</td><td><code>aec_reset()</code> + <code>rng = CNG_RNG_SEED</code> + <code>dfn_hop_reset()</code></td><td><code>mcab_sample_beam_reset()</code>(連帶 reset flow、lane 與 estimator)+ <code>aec_res_reset()</code> + <code>rng = MCAB_SAMPLE_CNG_RNG_SEED</code> + <code>dfn_hop_reset()</code></td></tr>
 <tr><td>destroy</td><td><code>dfn_rate_bridge_destroy()</code>／<code>dfn_res_stage_destroy()</code>、<code>aec_destroy()</code>;caller 自己釋放 pool</td><td><code>dfn_rate_bridge_destroy()</code>／<code>dfn_res_stage_destroy()</code>、<code>mcab_sample_beam_destroy()</code>、<code>mcab_sample_flow_destroy()</code>(先 <code>mcab_destroy()</code> 再 lane;<code>AecRes</code> 沒有 destroy);caller 自己釋放 pool</td></tr>
 </table>
@@ -78,7 +78,7 @@ int mono_dfn_run(void) {
     const int sample_rate = 16000;
     AecSignalGrid grid;  AecConfig aec_cfg;
     if (!aec_resolve_signal_grid(sample_rate, aec_default_fft_size(sample_rate), &amp;grid)) return -1;
-    aec_config_from_preset(&amp;aec_cfg, AEC_PRESET_BALANCED, sample_rate);
+    aec_config_from_level(&amp;aec_cfg, AEC_LEVEL_BALANCED, sample_rate);
     aec_cfg.fft_size = grid.fft_size;
     aec_cfg.delay_mode = AEC_DELAY_MATCHED;  aec_cfg.delay_num_filters = 5;
     aec_cfg.fixed_delay_samples = -1;  aec_cfg.enable_delay_est = 1;
@@ -131,7 +131,7 @@ int mono_dfn_run(void) {
     }
 
     /* 5. hop 之間才能呼叫的 setter;結束 */
-    aec_set_preset(aec, AEC_PRESET_AGGRESSIVE, 200.0f);
+    aec_set_level(aec, AEC_LEVEL_AGGRESSIVE, 200.0f);
     dfn_res_stage_set_atten_lim(dfn_hop_stage(&amp;hop), 12.0f);
     dfn_rate_bridge_destroy(bridge);  aec_destroy(aec);      /* 都不釋放 caller 的 pool */
     free(pool);
@@ -229,7 +229,7 @@ int four_dfn_run(void) {
         mcab_sample_flow_get_mem_size(&amp;cfg, &amp;flow_b) != 0 ||
         mcab_sample_beam_get_mem_size(&amp;cfg, &amp;bp, &amp;beam_b) != 0 ||
         dfn_hop_pool_plan(&amp;dfn, cfg.sample_rate, cfg.fft_size) != 0) return -1;
-    aec_config_from_preset(&amp;res_cfg, AEC_PRESET_BALANCED, cfg.sample_rate);
+    aec_config_from_level(&amp;res_cfg, AEC_LEVEL_BALANCED, cfg.sample_rate);
     res_cfg.fft_size = grid.fft_size;
     size_t res_b = aec_res_get_mem_size(&amp;res_cfg);                        /* 0 = 無效 */
     if (res_b == 0) return -1;
@@ -276,7 +276,7 @@ int four_dfn_run(void) {
     }
 
     /* 5. hop 之間的 setter;結束(依序:stage／bridge、helper、flow) */
-    aec_res_set_preset(res, AEC_PRESET_AGGRESSIVE, 200.0f);
+    aec_res_set_level(res, AEC_LEVEL_AGGRESSIVE, 200.0f);
     dfn_res_stage_set_atten_lim(dfn_hop_stage(&amp;hop), 12.0f);
     if (bridge) dfn_rate_bridge_destroy(bridge); else dfn_res_stage_destroy(stage);
     mcab_sample_beam_destroy(unit);  mcab_sample_flow_destroy(&amp;objs);   /* AecRes 沒有 destroy */
@@ -297,7 +297,7 @@ int four_dfn_run(void) {
 <tr><td><code>dfn_hop_begin／nn_begin／nn_end／end／process</code></td><td>0;<code>nn_begin</code> 為 1(有幀)或 0</td><td><code>DFN_HOP_INVALID</code>(-1:NULL、E／P 非有限、stage 拒絕)、<code>DFN_HOP_SEQUENCE_ERROR</code>(-2:次序不對)</td><td>全部一起 reset</td></tr>
 <tr><td><code>nn_end(hop, rc)</code> 的 <code>rc != 0</code></td><td>回 0</td><td>不是錯誤:該幀走 identity(輸出未寫或非有限也一樣)</td><td>不用 reset;可記錄次數(<code>dfn_res_stage_get_counters()</code> 的 skips)</td></tr>
 <tr><td><code>dfn_res_stage_set_atten_lim()</code></td><td>0</td><td>-1:NULL 或非有限值</td><td>只能在 hop 之間呼叫</td></tr>
-<tr><td><code>aec_set_preset()</code>／<code>aec_res_set_preset()</code></td><td>0</td><td>-1:NULL、不在 enum 內的 preset、<code>ramp_ms</code> 超出 [0, 60000]</td><td>只能在 hop 之間呼叫</td></tr>
+<tr><td><code>aec_set_level()</code>／<code>aec_res_set_level()</code></td><td>0</td><td>-1:NULL、不在 enum 內的 level、<code>ramp_ms</code> 超出 [0, 60000]</td><td>只能在 hop 之間呼叫</td></tr>
 </table>
 
 <h2>相關檔案</h2>

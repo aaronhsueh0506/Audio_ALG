@@ -4,7 +4,7 @@
  * sequence and its guards, the helper's own pool contract, fuse leaving the residual gain to the
  * caller, the helper followed by the examples' RES / NR / min / comfort noise / synthesis (the
  * RES an AecRes the caller builds with the libaec functions) against the independent oracle
- * (conv_chain_mcab.h), that caller-owned RES across reset and preset changes, and mcab_raw run
+ * (conv_chain_mcab.h), that caller-owned RES across reset and level changes, and mcab_raw run
  * as a black box against that oracle. The flow-only checks are in test_mcab.c.
  * Arguments: the directory of the example binaries and a scratch directory.
  */
@@ -597,7 +597,7 @@ static void* aligned_block(size_t bytes) {
 }
 
 /* The stages the examples carve behind the unit (mcab_static.c): the RES (an
- * AecRes built here from the preset's AecConfig on the unit's grid), NR, synthesis and the
+ * AecRes built here from the level's AecConfig on the unit's grid), NR, synthesis and the
  * gain/spectrum buffers. A missing RES or NR reads as the unity vector. */
 typedef struct ExPost {
     AecRes* res;              /* NULL: no suppressor */
@@ -628,10 +628,10 @@ static void ex_post_free(ExPost* q) {
     memset(q, 0, sizeof(*q));
 }
 
-static int ex_post_init(ExPost* q, int sample_rate, int fft_size, int enable_res, AecPreset preset,
+static int ex_post_init(ExPost* q, int sample_rate, int fft_size, int enable_res, AecLevel level,
                         int enable_nr, int enable_cng) {
     AecConfig rc;
-    AnrConfig nc = anr_config_for_mode_grid(sample_rate, fft_size, ANR_MODE_BALANCED);
+    AnrConfig nc = anr_config_for_level_grid(sample_rate, fft_size, ANR_LEVEL_BALANCED);
     AcStftConfig sc;
     size_t res_b = 0, nr_b, syn_b, vec, cvec;
     unsigned char* cur;
@@ -641,7 +641,7 @@ static int ex_post_init(ExPost* q, int sample_rate, int fft_size, int enable_res
     q->enable_cng = enable_cng;
     ac_stft_config_default(&sc, fft_size);
     if (enable_res) {
-        aec_config_from_preset(&rc, preset, sample_rate);
+        aec_config_from_level(&rc, level, sample_rate);
         rc.fft_size = fft_size;
         res_b = ALIGN16(aec_res_get_mem_size(&rc));
     }
@@ -781,13 +781,13 @@ static int test_fuse_leaves_the_residual_gain_to_the_caller(void) {
 /* With the BF bypassed the beamformed error is lane 0's error spectrum and the effective weights
  * are [1,0,0,0]; the reference chain fed the same two must reproduce unit + fuse + the examples'
  * chain bit for bit, for every combination of the RES, NR and comfort-noise switches and, with
- * the RES on, at every AEC preset. */
+ * the RES on, at every AEC level. */
 static int test_unit_chain_equals_reference_chain(void) {
-    int mode, grid, preset;
+    int mode, grid, level;
     static const int grids[3][2] = {{16000, 256}, {16000, 512}, {48000, 1024}};
     for (grid = 0; grid < 3; ++grid) {
         for (mode = 0; mode < 8; ++mode) {
-         for (preset = 0; preset < 4; ++preset) {
+         for (level = 0; level < 4; ++level) {
             McabTestUnitConfig cfg = mcab_test_unit_default_config(grids[grid][0]);
             ConvChainOptions opt = conv_default_options();
             McabSampleBeam* unit;
@@ -800,10 +800,10 @@ static int test_unit_chain_equals_reference_chain(void) {
             int hop, n, h, i, k, identical = 1, nonzero = 0, ok = 1;
             char label[160];
 
-            if (!((mode >> 1) & 1) && preset != (int)AEC_PRESET_BALANCED) continue;   /* no RES: no preset */
+            if (!((mode >> 1) & 1) && level != (int)AEC_LEVEL_BALANCED) continue;   /* no RES: no level */
             cfg.core.fft_size = grids[grid][1];
             cfg.beam.bf_enable = 0;
-            opt.aec_preset = (AecPreset)preset;
+            opt.aec_level = (AecLevel)level;
             opt.enable_nr = mode & 1;
             opt.enable_res = (mode >> 1) & 1;
             opt.enable_cng = (mode >> 2) & 1;
@@ -813,16 +813,16 @@ static int test_unit_chain_equals_reference_chain(void) {
                  * examples' denoiser, since the short scene below cannot tell the
                  * noise-tracking window apart. */
                 int ghop = grids[grid][1] / 2;
-                AnrConfig oc = conv_nr_config(grids[grid][0], grids[grid][1], ghop, ANR_MODE_BALANCED);
-                AnrConfig ec = anr_config_for_mode_grid(grids[grid][0], grids[grid][1], ANR_MODE_BALANCED);
+                AnrConfig oc = conv_nr_config(grids[grid][0], grids[grid][1], ghop, ANR_LEVEL_BALANCED);
+                AnrConfig ec = anr_config_for_level_grid(grids[grid][0], grids[grid][1], ANR_LEVEL_BALANCED);
                 CHECK(memcmp(&oc, &ec, sizeof oc) == 0,
                       "oracle and example agree on the denoiser configuration");
             }
-            snprintf(label, sizeof(label), "reference chain: %d Hz/%d nr=%d res=%d(preset %d) cng=%d build",
-                     grids[grid][0], grids[grid][1], mode & 1, (mode >> 1) & 1, preset, (mode >> 2) & 1);
+            snprintf(label, sizeof(label), "reference chain: %d Hz/%d nr=%d res=%d(level %d) cng=%d build",
+                     grids[grid][0], grids[grid][1], mode & 1, (mode >> 1) & 1, level, (mode >> 2) & 1);
             CHECK(unit && ref &&
                   ex_post_init(&post, grids[grid][0], grids[grid][1], (mode >> 1) & 1,
-                               (AecPreset)preset, mode & 1, (mode >> 2) & 1) == 0,
+                               (AecLevel)level, mode & 1, (mode >> 2) & 1) == 0,
                   label);
             hop = mcab_hop_size(mcab_test_beam_flow(unit));
             n = mcab_n_freqs(mcab_test_beam_flow(unit));
@@ -848,8 +848,8 @@ static int test_unit_chain_equals_reference_chain(void) {
                 for (i = 0; i < hop; ++i) if (out_r[i] != 0.0f) nonzero = 1;
             }
             snprintf(label, sizeof(label),
-                     "reference chain: %d Hz/%d nr=%d res=%d(preset %d) cng=%d unit + chain output is bit-identical",
-                     grids[grid][0], grids[grid][1], mode & 1, (mode >> 1) & 1, preset, (mode >> 2) & 1);
+                     "reference chain: %d Hz/%d nr=%d res=%d(level %d) cng=%d unit + chain output is bit-identical",
+                     grids[grid][0], grids[grid][1], mode & 1, (mode >> 1) & 1, level, (mode >> 2) & 1);
             CHECK(ok && identical && nonzero, label);
             free(mics); free(far); free(out_w); free(out_r); free(weights);
             mcab_test_beam_destroy(unit);
@@ -868,11 +868,11 @@ typedef struct ResRig {
     ExPost post;
 } ResRig;
 
-static int res_rig_init(ResRig* r, int sample_rate, int fft_size, AecPreset preset) {
+static int res_rig_init(ResRig* r, int sample_rate, int fft_size, AecLevel level) {
     McabTestUnitConfig cfg = mcab_test_unit_default_config(sample_rate);
     cfg.core.fft_size = fft_size;
     r->unit = mcab_test_beam_create(&cfg);
-    return r->unit && ex_post_init(&r->post, sample_rate, fft_size, 1, preset, 0, 0) == 0 ? 0 : -1;
+    return r->unit && ex_post_init(&r->post, sample_rate, fft_size, 1, level, 0, 0) == 0 ? 0 : -1;
 }
 
 static void res_rig_free(ResRig* r) {
@@ -899,20 +899,20 @@ static const float* res_rig_hop(ResRig* r, int h, float* mics, float* far) {
 }
 
 /* The caller-owned RES across reset: a used and reset rig equals a fresh one on the gain, and a
- * preset set with aec_res_set_preset() survives the reset and then equals a rig built at that
- * preset (while the two presets give different gains on this scene). */
-static int test_caller_res_reset_and_preset(void) {
+ * level set with aec_res_set_level() survives the reset and then equals a rig built at that
+ * level (while the two levels give different gains on this scene). */
+static int test_caller_res_reset_and_level(void) {
     static const int grids[3][2] = {{16000, 256}, {16000, 512}, {48000, 1024}};
     int g;
     for (g = 0; g < 3; ++g) {
         ResRig used, fresh, retarget, built;
         float *mics, *far;
-        int h, n, hop, same = 1, same_preset = 1, differs = 0, ok;
+        int h, n, hop, same = 1, same_level = 1, differs = 0, ok;
         char label[160];
-        ok = res_rig_init(&used, grids[g][0], grids[g][1], AEC_PRESET_BALANCED) == 0 &&
-             res_rig_init(&fresh, grids[g][0], grids[g][1], AEC_PRESET_BALANCED) == 0 &&
-             res_rig_init(&retarget, grids[g][0], grids[g][1], AEC_PRESET_BALANCED) == 0 &&
-             res_rig_init(&built, grids[g][0], grids[g][1], AEC_PRESET_AGGRESSIVE) == 0;
+        ok = res_rig_init(&used, grids[g][0], grids[g][1], AEC_LEVEL_BALANCED) == 0 &&
+             res_rig_init(&fresh, grids[g][0], grids[g][1], AEC_LEVEL_BALANCED) == 0 &&
+             res_rig_init(&retarget, grids[g][0], grids[g][1], AEC_LEVEL_BALANCED) == 0 &&
+             res_rig_init(&built, grids[g][0], grids[g][1], AEC_LEVEL_AGGRESSIVE) == 0;
         CHECK(ok, "caller res: rigs build");
         hop = mcab_hop_size(mcab_test_beam_flow(used.unit));
         n = mcab_n_freqs(mcab_test_beam_flow(used.unit));
@@ -923,8 +923,8 @@ static int test_caller_res_reset_and_preset(void) {
             (void)res_rig_hop(&retarget, h + 1000, mics, far);
         }
         res_rig_reset(&used);
-        CHECK(aec_res_set_preset(retarget.post.res, AEC_PRESET_AGGRESSIVE, 0.0f) == 0,
-              "caller res: a preset is accepted");
+        CHECK(aec_res_set_level(retarget.post.res, AEC_LEVEL_AGGRESSIVE, 0.0f) == 0,
+              "caller res: a level is accepted");
         res_rig_reset(&retarget);
         for (h = 0; h < 250; ++h) {
             static float keep_u[513], keep_r[513];
@@ -933,11 +933,11 @@ static int test_caller_res_reset_and_preset(void) {
             memcpy(keep_u, gu, (size_t)n * sizeof(float));
             gf = res_rig_hop(&fresh, h, mics, far);
             gr = res_rig_hop(&retarget, h, mics, far);
-            if (!gr) { same_preset = 0; break; }
+            if (!gr) { same_level = 0; break; }
             memcpy(keep_r, gr, (size_t)n * sizeof(float));
             gb = res_rig_hop(&built, h, mics, far);
             if (!gf || memcmp(keep_u, gf, (size_t)n * sizeof(float)) != 0) same = 0;
-            if (!gb || memcmp(keep_r, gb, (size_t)n * sizeof(float)) != 0) same_preset = 0;
+            if (!gb || memcmp(keep_r, gb, (size_t)n * sizeof(float)) != 0) same_level = 0;
             if (memcmp(keep_u, keep_r, (size_t)n * sizeof(float)) != 0) differs = 1;
         }
         snprintf(label, sizeof label,
@@ -945,9 +945,9 @@ static int test_caller_res_reset_and_preset(void) {
                  grids[g][0], grids[g][1]);
         CHECK(same, label);
         snprintf(label, sizeof label,
-                 "caller res: %d Hz/%d a preset set before reset survives it and equals a rig built "
-                 "at that preset", grids[g][0], grids[g][1]);
-        CHECK(same_preset, label);
+                 "caller res: %d Hz/%d a level set before reset survives it and equals a rig built "
+                 "at that level", grids[g][0], grids[g][1]);
+        CHECK(same_level, label);
         snprintf(label, sizeof label, "caller res: %d Hz/%d balanced and aggressive differ on this scene",
                  grids[g][0], grids[g][1]);
         CHECK(differs, label);
@@ -957,16 +957,16 @@ static int test_caller_res_reset_and_preset(void) {
     return 1;
 }
 
-/* A ramped preset on the caller-owned RES is genuinely in flight, lands, and changes the gain
- * against an untouched twin; bad presets and ramps are refused. */
-static int test_caller_res_ramped_preset(void) {
+/* A ramped level on the caller-owned RES is genuinely in flight, lands, and changes the gain
+ * against an untouched twin; bad levels and ramps are refused. */
+static int test_caller_res_ramped_level(void) {
     ResRig p, q;
     float *mics, *far, keep[513];
     float live0 = 0.0f, target0 = 0.0f, lv = 0.0f, tg = 0.0f;
     int hop, n, h, same_before = 1, differs_after = 0, ramp_seen = 0, landed = 0;
-    CHECK(res_rig_init(&p, 16000, 256, AEC_PRESET_BALANCED) == 0 &&
-              res_rig_init(&q, 16000, 256, AEC_PRESET_BALANCED) == 0,
-          "ramped preset: rigs build");
+    CHECK(res_rig_init(&p, 16000, 256, AEC_LEVEL_BALANCED) == 0 &&
+              res_rig_init(&q, 16000, 256, AEC_LEVEL_BALANCED) == 0,
+          "ramped level: rigs build");
     hop = mcab_hop_size(mcab_test_beam_flow(p.unit));
     n = mcab_n_freqs(mcab_test_beam_flow(p.unit));
     mics = (float*)calloc((size_t)hop * MCAB_CHANNELS, sizeof(float));
@@ -980,10 +980,10 @@ static int test_caller_res_ramped_preset(void) {
         if (!gq || memcmp(keep, gq, (size_t)n * sizeof(float)) != 0) same_before = 0;
     }
     CHECK(aec_res_split_floor(p.post.res, &live0, &target0) == 0 &&
-              aec_res_set_preset(p.post.res, AEC_PRESET_MILD, 100.0f) == 0 &&
-              aec_res_set_preset(p.post.res, (AecPreset)77, 0.0f) == -1 &&
-              aec_res_set_preset(p.post.res, AEC_PRESET_MILD, 60001.0f) == -1,
-          "ramped preset: a ramped preset is accepted, bad ones are refused");
+              aec_res_set_level(p.post.res, AEC_LEVEL_MILD, 100.0f) == 0 &&
+              aec_res_set_level(p.post.res, (AecLevel)77, 0.0f) == -1 &&
+              aec_res_set_level(p.post.res, AEC_LEVEL_MILD, 60001.0f) == -1,
+          "ramped level: a ramped level is accepted, bad ones are refused");
     for (h = 240; h < 640; ++h) {
         const float* gp = res_rig_hop(&p, h, mics, far);
         const float* gq;
@@ -995,9 +995,9 @@ static int test_caller_res_ramped_preset(void) {
         if (h == 241 && lv != tg) ramp_seen = 1;
         if (h == 639 && lv == tg && tg != target0) landed = 1;
     }
-    CHECK(same_before, "ramped preset: untouched twins agree before the change");
-    CHECK(differs_after, "ramped preset: the new preset changes the gain");
-    CHECK(ramp_seen && landed, "ramped preset: the floor ramps, then lands on the new target");
+    CHECK(same_before, "ramped level: untouched twins agree before the change");
+    CHECK(differs_after, "ramped level: the new level changes the gain");
+    CHECK(ramp_seen && landed, "ramped level: the floor ramps, then lands on the new target");
     free(mics); free(far);
     res_rig_free(&p); res_rig_free(&q);
     return 1;
@@ -1035,7 +1035,7 @@ static int chain_rig_init(ChainRig* r, int sample_rate, int fft_size, int in_poo
     }
     ex_post_poison = in_pool ? 0xa5 : -1;
     {
-        int rc = ex_post_init(&r->post, sample_rate, fft_size, 1, AEC_PRESET_BALANCED, 1, 1);
+        int rc = ex_post_init(&r->post, sample_rate, fft_size, 1, AEC_LEVEL_BALANCED, 1, 1);
         ex_post_poison = -1;
         if (rc != 0) return -1;
     }
@@ -1155,12 +1155,12 @@ static int test_chain_heap_equals_pool(void) {
     return 1;
 }
 
-/* aec_res_set_preset(res, preset, ramp_ms) on the application-owned AecRes in an echo scene where
+/* aec_res_set_level(res, level, ramp_ms) on the application-owned AecRes in an echo scene where
  * the RES acts (an echo the linear filters cannot model + double talk, many bins cut, denoiser off so the RES is not
  * masked): the chain output follows an independent oracle (conv_chain_mcab.h: its own front end
  * and AecRes, the same call at the same hop) bit for bit; the run without the call differs from
  * both, so a skipped call is caught. */
-static int test_caller_res_preset_ramp_vs_oracle(void) {
+static int test_caller_res_level_ramp_vs_oracle(void) {
     static const int grids[3][2] = {{16000, 256}, {16000, 512}, {48000, 1024}};
     enum { SET_AT = 200, HOPS = 520 };
     int g;
@@ -1184,9 +1184,9 @@ static int test_caller_res_preset_ramp_vs_oracle(void) {
         u_ref = mcab_test_beam_create(&cfg);
         ref = conv_create(&cfg.core, &opt);
         CHECK(u_set && u_skip && u_ref && ref &&
-                  ex_post_init(&p_set, grids[g][0], grids[g][1], 1, AEC_PRESET_BALANCED, 0, 1) == 0 &&
-                  ex_post_init(&p_skip, grids[g][0], grids[g][1], 1, AEC_PRESET_BALANCED, 0, 1) == 0,
-              "preset ramp: units, oracle and stages build");
+                  ex_post_init(&p_set, grids[g][0], grids[g][1], 1, AEC_LEVEL_BALANCED, 0, 1) == 0 &&
+                  ex_post_init(&p_skip, grids[g][0], grids[g][1], 1, AEC_LEVEL_BALANCED, 0, 1) == 0,
+              "level ramp: units, oracle and stages build");
         hop = mcab_hop_size(mcab_test_beam_flow(u_set));
         n = mcab_n_freqs(mcab_test_beam_flow(u_set));
         mics = (float*)calloc((size_t)hop * MCAB_CHANNELS, sizeof(float));
@@ -1201,8 +1201,8 @@ static int test_caller_res_preset_ramp_vs_oracle(void) {
             McabFrame fs, fk;
             int cut = 0;
             if (h == SET_AT) {
-                if (aec_res_set_preset(p_set.res, AEC_PRESET_AGGRESSIVE, 100.0f) != 0 ||
-                    aec_res_set_preset(ref->res, AEC_PRESET_AGGRESSIVE, 100.0f) != 0) { ok = 0; break; }
+                if (aec_res_set_level(p_set.res, AEC_LEVEL_AGGRESSIVE, 100.0f) != 0 ||
+                    aec_res_set_level(ref->res, AEC_LEVEL_AGGRESSIVE, 100.0f) != 0) { ok = 0; break; }
             }
             res_scene_hard_hop(h, hop, mics, far);
             if (mcab_sample_beam_process(u_set, mics, far, &beam, NULL) != MCAB_OK ||
@@ -1227,15 +1227,15 @@ static int test_caller_res_preset_ramp_vs_oracle(void) {
             for (i = 0; i < hop; ++i) if (o_ref[i] != 0.0f) nonzero = 1;
         }
         snprintf(label, sizeof label,
-                 "preset ramp: %d Hz/%d the RES acts in the scene beyond its initial state (gain "
+                 "level ramp: %d Hz/%d the RES acts in the scene beyond its initial state (gain "
                  "below 0.9 on many bins, before and after the change)", grids[g][0], grids[g][1]);
         CHECK(ok && cut_before > 2L * n && cut_after > 10L * n, label);
         snprintf(label, sizeof label,
-                 "preset ramp: %d Hz/%d output with the ramped preset equals the oracle bit for "
+                 "level ramp: %d Hz/%d output with the ramped level equals the oracle bit for "
                  "bit on every hop", grids[g][0], grids[g][1]);
         CHECK(set_matches && nonzero, label);
         snprintf(label, sizeof label,
-                 "preset ramp: %d Hz/%d the run with the preset call skipped differs from the "
+                 "level ramp: %d Hz/%d the run with the level call skipped differs from the "
                  "oracle", grids[g][0], grids[g][1]);
         CHECK(skip_differs, label);
         free(mics); free(far); free(o_set); free(o_skip); free(o_ref); free(weights);
@@ -2151,10 +2151,10 @@ static int run_all_tests(const char* bin_dir, const char* tmp) {
           "fuse leaves the residual gain to the caller");
     CHECK(test_unit_chain_equals_reference_chain(),
           "unit + fuse + the examples' chain equals the reference chain over the front end");
-    CHECK(test_caller_res_reset_and_preset(), "the caller-owned RES: reset restarts it; a preset survives it");
-    CHECK(test_caller_res_ramped_preset(), "the caller-owned RES: runtime strength");
-    CHECK(test_caller_res_preset_ramp_vs_oracle(),
-          "the caller-owned RES: a ramped preset follows the oracle; skipping it is caught");
+    CHECK(test_caller_res_reset_and_level(), "the caller-owned RES: reset restarts it; a level survives it");
+    CHECK(test_caller_res_ramped_level(), "the caller-owned RES: runtime strength");
+    CHECK(test_caller_res_level_ramp_vs_oracle(),
+          "the caller-owned RES: a ramped level follows the oracle; skipping it is caught");
     CHECK(test_chain_reset_equals_fresh(), "reset-then-rerun equals a fresh chain");
     CHECK(test_chain_heap_equals_pool(), "heap and pool units give the same chain output");
     CHECK(test_raw_runner_black_box(bin_dir, tmp), "mcab_raw against the oracle");

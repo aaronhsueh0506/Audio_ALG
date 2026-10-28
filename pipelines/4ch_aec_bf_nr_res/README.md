@@ -10,7 +10,7 @@ MATCHED mode only, one shared `DelayAec` (each with its own `get_mem_size` / `in
 `McabLibs`; mcab never allocates, resets-by-destroying or frees one of them. It owns only flow state, in its own
 small pool: the shared-delay admission state machine, the alignment ring, the aligned far, the per-lane views and
 the fuse buffers. There is no beamformer inside it and no residual suppressor: RES is managed by libaec. An
-application that wants RES creates the `AecRes` itself in its own init (`aec_config_from_preset()`,
+application that wants RES creates the `AecRes` itself in its own init (`aec_config_from_level()`,
 `aec_res_get_mem_size()`, `aec_res_init()`) and calls `aec_res_process()` over a `mcab_sample_res_input()` each hop; NR, comfort noise,
 synthesis and neural post-filters are likewise separate libraries that the integrator initialises (each with its
 own `mem_size` and `init`) and chains, as each example `main` does.
@@ -140,7 +140,7 @@ of [`integration_4ch_core_zh_TW.md`](../../docs/integration_4ch_core_zh_TW.md) a
 
 ```
 Flow + your beamformer      App   lanes/DelayAec (yours)   Mcab   your BF   AecRes (yours)  AnrDenoiser  AcIstft
- init (once)                 |-- mcab_default_config, mcab_lane_config (or aec_config_from_preset + mcab_apply_lane_contract)
+ init (once)                 |-- mcab_default_config, mcab_lane_config (or aec_config_from_level + mcab_apply_lane_contract)
                              |-- aec_get_mem_size / aec_init x4 ; mcab_delay_estimator_config + delay_aec_get_mem_size / delay_aec_init (MATCHED)
                              |-- mcab_get_mem_requirements / mcab_init_ex(pool, bytes, &cfg, &libs, &req) -->|
                              |-- aec_res_*, anr_*, ac_istft_* : each its own mem_size + init ----------------------->|
@@ -154,7 +154,7 @@ Flow + your beamformer      App   lanes/DelayAec (yours)   Mcab   your BF   AecR
 
 Flow + sample beam helper   App   McabSampleBeam (SRP-PHAT + BF)   AecRes (yours)  AnrDenoiser  AcIstft
  init (once)                 |-- the flow as above, then mcab_sample_beam_get_mem_size / mcab_sample_beam_init(mem, bytes, &cfg, &bp, flow)
-                             |-- aec_config_from_preset (fft_size = mcab_fft_size(flow)), aec_res_*, anr_*, ac_istft_* :
+                             |-- aec_config_from_level (fft_size = mcab_fft_size(flow)), aec_res_*, anr_*, ac_istft_* :
                              |   each its own mem_size + init ----------------------------------------->|
  per hop                     |-- mcab_sample_beam_process_front --> (mask, vad_raw, vad_out) --> mcab_sample_beam_process_beam
                              |       or mcab_sample_beam_process_with_activity, or mcab_sample_beam_process (built-in energy VAD)
@@ -169,9 +169,9 @@ Flow + sample beam helper   App   McabSampleBeam (SRP-PHAT + BF)   AecRes (yours
 | | External (a third party may tune) | Internal (exists, not recommended to open) |
 |---|---|---|
 | Flow (`McabConfig`) | `sample_rate`, `fft_size`, `delay_mode` + `delay_num_filters` / `fixed_delay_samples`, `capture_proxy_channel`, `max_delay_ms`, `enable_post`; opt-in and off by default: `delay_est_period_s` (a compute knob; a non-zero value can change the lag it picks) | `delay_backward_quarantine_enabled` / `_s` (off by default, kept off in products: it only holds an earlier estimate for one window and does not cure a mis-lock), the lanes' contract fields stamped by `mcab_apply_lane_contract()` (`EXTERNAL_ALIGNED`, `enable_delay_est = 0`, `enable_res = 0`, `return_res_context = 1`, `spatial_linear_context`), `DUTY_HOLD_S`, `DA_*`, projection kernels |
-| Lanes (the application's `AecConfig`) | `mcab_lane_config()` = balanced preset plus the contract; anything else (preset values, `filter_length`) via `aec_config_from_preset()` and `mcab_apply_lane_contract()` | the contract fields above |
+| Lanes (the application's `AecConfig`) | `mcab_lane_config()` = balanced level plus the contract; anything else (level values, `filter_length`) via `aec_config_from_level()` and `mcab_apply_lane_contract()` | the contract fields above |
 | Sample beam helper (`McabSampleBeamParams`) | `geometry` with `uca_radius_m` / `ula_spacing_m` / `microphone_x_m` / `microphone_y_m`, `num_angles`; advanced: `bf_enable`, `bf_fixed_mode` + `bf_fixed_doa_rad`, `doa_low_freq_hz` / `doa_high_freq_hz` | `bf_lambda`, `bf_mu`, `bf_adapt_interval`, `bf_fixed_align_notebook` (the set value differs from the effective one), `doa_enable_smoothing`, `doa_switch_consecutive`, `doa_angle_tolerance_rad`, `doa_update_interval`, `speed_of_sound_m_s`, `auto_vad_*` (only the fallback VAD) |
-| Runtime | `aec_res_set_preset()` on your own `AecRes`, `anr_set_mode(nr, mode)` | `aec_set_preset()` on a lane (a no-op by construction) |
+| Runtime | `aec_res_set_level()` on your own `AecRes`, `anr_set_level(nr, level)` | `aec_set_level()` on a lane (a no-op by construction) |
 
 Public header: `mcab.h` (it pulls `aec.h`; `McabFrame` is defined in it). Sample-layer headers (in no archive):
 `mcab_sample_flow.h`, `mcab_sample_beam.h`, `mcab_sample_driver.h`, and the header-only `mcab_sample_post.h`
@@ -185,7 +185,7 @@ The Python twin has the same classes under `Mcab*` names: `McabConfig`, `McabPip
 `McabFrame`, `McabDelayState`, plus `mcab_apply_lane_contract()` and `mcab_lane_config()` in `pipeline.py`.
 `McabPipeline(config=None, beamformer=None, lane_config=None)` takes an optional application-composed lane
 `AecConfig`, stamps the contract onto it, and defaults to `mcab_lane_config()` (a PBFDKF lane with a 52 ms filter at
-16 kHz and 64 ms at 48 kHz; the C default lane is the balanced preset). The Python grid is chosen by
+16 kHz and 64 ms at 48 kHz; the C default lane is the balanced level). The Python grid is chosen by
 `McabConfig.frame_size` / `hop_size`, and the Python shared delay is always the MATCHED estimator.
 The Python `McabConfig` carries the grid, `capture_proxy_channel`, `max_delay_ms` and the backward-quarantine pair; it
 has no `delay_mode`, `delay_num_filters`, `fixed_delay_samples`, `delay_est_period_s` or `enable_post`. The matched-filter
@@ -221,7 +221,7 @@ post = pipeline.fuse(
 # 4. The application's one post-beam RES (the one stateful gain calculator, the C AecRes
 #    behind aec_res_process()): res_gain is set on the returned context.
 context = suppressor.process(post.context, post.aligned_render)
-#    Runtime strength: suppressor.set_preset(...) (C: aec_res_set_preset() on your AecRes).
+#    Runtime strength: suppressor.set_preset(...) (C: aec_res_set_level() on your AecRes).
 #    The existing mono NR+RES seam consumes post.beamformed and the returned context.
 ```
 
@@ -307,8 +307,8 @@ options (`--sample-rate`, `--fft-size`, `--uca-radius-m`, `--fixed-doa-deg`, `--
 strict parsers of `../common/example_cli.h`: the whole string must be one number, so an empty string, a leading
 space, trailing characters (`16000Hz`), a value outside `int`, `inf` and `nan` are command-line errors, and so
 are an option without its value and an unknown option. A token that starts with `--` where a value belongs is
-the next option, so the value is missing: `--nr-preset --no-res` is an error, not the preset `--no-res` (this holds
-for every option that takes a value: numbers, preset names and the file options of `mcab_raw`). A lone `-`, `-1`
+the next option, so the value is missing: `--nr-level --no-res` is an error, not the level `--no-res` (this holds
+for every option that takes a value: numbers, level names and the file options of `mcab_raw`). A lone `-`, `-1`
 and `-x` are values: a negative number is one, and a file option takes the name as given (a file named `--x` is
 written `./--x`). The three programs exit with code 2 and print a message or the
 usage line on stderr. A number that parses but names no grid or channel (`--sample-rate 44100`,
@@ -317,9 +317,9 @@ usage line on stderr. A number that parses but names no grid or channel (`--samp
 runs both static programs through every case, plus the file options of `mcab_raw` and `--erb-fwd`/`--erb-inv` of
 `4ch_aec_bf_dfn_res`, which share their option scan (`make test` runs it), and `tests/test_mcab_sample_driver.c` covers the
 shared parser.
-`mcab_external_static` also refuses an AEC preset or `--nr-preset` name it does not know (`mild|balanced|aggressive|no_floor`
-or `0..3`; `mild|moderate|balanced|aggressive` or `0..3`) and a second AEC preset, with exit 2. Still lenient: a repeated
-option keeps the last value.
+`mcab_external_static` also refuses an AEC level (the positional argument or `--aec-level <level>`, the same setting) or `--nr-level` name it does not know (`mild|balanced|aggressive|no_floor`
+or `0..3`; `mild|moderate|balanced|aggressive` or `0..3`) and a second AEC level (positional or `--aec-level`), with exit 2; `--nr-preset` is the same option as
+`--nr-level` under its earlier name; the mono programs (`aec_nr_pipeline`, `aec_nr_pipeline_static`) apply the same one-AEC-level rule. Still lenient: a repeated option keeps the last value. C level == Python preset.
 
 Reproduce the two recording tests from the `Audio_ALG` directory. The evaluators read the case directories
 `aec_take_turn` and `aec_together` under `--datasets-root` (default: the `datasets` directory beside `Audio_ALG`,

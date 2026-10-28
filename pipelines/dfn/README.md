@@ -92,7 +92,7 @@ build lists no `fix_gain.c` and no `third_party/gain` include path.
 - `common/`: `example_cli.h` (the strict command-line parsers and delay options) and, for the
   4-channel example, `4ch_aec_bf_nr_res/mcab_sample_post.h` (`mcab_sample_res_input()` and the
   comfort-noise constants). The mono example takes the grid and the lane config straight from lib/aec
-  (`aec_resolve_signal_grid()`, `aec_config_from_preset()`).
+  (`aec_resolve_signal_grid()`, `aec_config_from_level()`).
 - lib/aec (`Aec`, `AecRes`), audiolib `audio_common` (resamplers, STFT/ISTFT) and
   `AINR/DeepFilterNet2` (pre/post class, model I/O descriptor, ERB matrices).
 - The 4-channel example also needs the mcab flow in `4ch_aec_bf_nr_res/` (`mcab.h`, archive

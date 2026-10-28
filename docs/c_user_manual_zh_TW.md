@@ -35,7 +35,7 @@
 function、descriptor version、ownership 與錯誤行為，mono 以 lib/aec／lib/nr／audiolib 的標頭、
 四麥克風以 `4ch_aec_bf_nr_res/mcab.h` 為準。
 
-嵌入產品時，各函式庫各自查大小、各自 init，再由整合者串接：mono 是 `aec_resolve_signal_grid()` 與 `aec_config_from_preset()` →
+嵌入產品時，各函式庫各自查大小、各自 init，再由整合者串接：mono 是 `aec_resolve_signal_grid()` 與 `aec_config_from_level()` →
 `aec_get_mem_size()`／`anr_get_mem_size()`／`ac_istft_get_mem_size()` → 對齊配置 → `aec_init()`／`anr_init()`／`ac_istft_init()`
 （桌面也可用 `aec_create()`）；4ch 的 `Mcab` 是應用先建四條 `Aec` lane 與（MATCHED）`DelayAec`，再 `mcab_get_mem_requirements()` → 對齊配置 →
 `mcab_init_ex()`（桌面可用 `mcab_create()`，只配置 mcab 自己的 pool）。見
@@ -52,7 +52,7 @@ function、descriptor version、ownership 與錯誤行為，mono 以 lib/aec／l
 | 16 kHz | 512 | 512 | 256 | 257 | 同上（可選） |
 | 48 kHz | 1024 | 1024 | 512 | 513 | 同上（唯一合法 48 kHz 格點） |
 
-mcab 不配置、不以 destroy 代替 reset、也不釋放任何 lane 或 estimator：應用先以 `mcab_lane_config()`（balanced preset 加 flow 契約；
+mcab 不配置、不以 destroy 代替 reset、也不釋放任何 lane 或 estimator：應用先以 `mcab_lane_config()`（balanced level 加 flow 契約；
 自己組 `AecConfig` 時改用 `mcab_apply_lane_contract()` 蓋上契約欄位）建立四條 `Aec`，MATCHED 時再以
 `mcab_delay_estimator_config()` 查得參數建立一個 `DelayAec`，用 `McabLibs` 交給 `mcab_init_ex()`。交進去的 lane 與 estimator 必須是新建或已 reset 的。
 
@@ -164,11 +164,11 @@ BIN="$(make -s -C pipelines print-bin-dir)"
 # balanced AEC + balanced NR
 "$BIN"/aec_nr_pipeline mic.wav ref.wav out.wav balanced
 
-# 各自指定 preset
+# 各自指定 level
 "$BIN"/aec_nr_pipeline mic.wav ref.wav out.wav mild \
-  --nr-preset mild
+  --nr-level mild
 "$BIN"/aec_nr_pipeline mic.wav ref.wav out.wav aggressive \
-  --nr-preset aggressive
+  --nr-level aggressive
 
 # 只輸出 linear AEC path，不跑 NR／frequency gain combine／final OLA
 "$BIN"/aec_nr_pipeline mic.wav ref.wav out.wav balanced --aec-only
@@ -189,8 +189,8 @@ BIN="$(make -s -C pipelines print-bin-dir)"
 
 | 參數 | 值 | 預設 | 說明 |
 |---|---|---|---|
-| 第 4 個 positional argument | `mild`／`balanced`／`aggressive`／`no_floor`（或 `0`..`3`） | `balanced` | AEC preset；未知字串退回 `balanced` |
-| `--nr-preset` | `mild`／`moderate`／`balanced`／`aggressive` | `balanced` | NR strength |
+| 第 4 個 positional argument | `mild`／`balanced`／`aggressive`／`no_floor`（或 `0`..`3`） | `balanced` | AEC level；未知字串退回 `balanced` |
+| `--nr-level`（別名 `--nr-preset`） | `mild`／`moderate`／`balanced`／`aggressive` | `balanced` | NR level |
 | `--aec-only` | flag | off | 跳過 NR 與最終 gain combine |
 | `--no-nr` | flag | off | 不建降噪器，總增益只剩 RES |
 | `--no-res` | flag | off | RES 增益視為全 1（comfort noise 隨之略過） |
@@ -200,7 +200,7 @@ BIN="$(make -s -C pipelines print-bin-dir)"
 | `--debug` | flag | off | 每秒一行 AEC+NR 狀態（read-only，不影響輸出） |
 | `--timing` | flag | off | 結束時印每個階段的平均耗時；AEC 的列需要 `make PROFILE=1` |
 
-`aec_nr_pipeline_static` 另有 `--print-mem-size [aec-preset] [--nr-preset ...] [--aec-only] [--no-nr] [--no-res]
+`aec_nr_pipeline_static` 另有 `--print-mem-size [aec-level] [--nr-level ...] [--aec-only] [--no-nr] [--no-res]
 [--sample-rate <hz>] [--fft-size <n>]`：印出 pool 預算並真的在那塊 pool 上 init 每個 stage 後結束，不讀 WAV；`aec_nr_pipeline` 沒有這個模式。
 
 `delay_mode`／`delay_num_filters`／`fixed_delay_samples`／`filter_length`
@@ -210,7 +210,7 @@ BIN="$(make -s -C pipelines print-bin-dir)"
 非預設 delay mode 得直接寫 C 改 `AecConfig` 後呼叫 `aec_get_mem_size()`／`aec_init()`
 （或改 CLI 原始碼），見 `pipeline_mono.html` API 節。
 
-目前 `mono_aec_nr_res` parser 對未知 positional preset 與未知 `--nr-preset` 名稱會退回 balanced，且不會為所有未知 dash option 報錯；`--nr-preset`／`--fft-size`（`aec_nr_pipeline_static` 的 `--print-mem-size` 路徑另含 `--sample-rate`）後面直接接另一個 `--` 選項或行尾時視為缺值，exit 2。`mcab_external_static` 則對未知 preset 名稱 exit 2。產品或自動化腳本應只傳上表列出的值，不要依賴 silent fallback。
+目前 `mono_aec_nr_res` parser 對未知 positional level 與未知 `--nr-level`（或別名 `--nr-preset`）名稱會退回 balanced，且不會為所有未知 dash option 報錯；`--nr-level`／`--fft-size`（`aec_nr_pipeline_static` 的 `--print-mem-size` 路徑另含 `--sample-rate`）後面直接接另一個 `--` 選項或行尾時視為缺值，exit 2。`mcab_external_static` 則對未知 level 名稱 exit 2。產品或自動化腳本應只傳上表列出的值，不要依賴 silent fallback。
 只有 mono 的 smoke CLI（`mono_aec_nr_res/main.c`）的 `--fft-size`、`--sample-rate` 以 `atoi()` 轉換、不嚴格檢查（`12x` 當成 12）；DFN2／ULCNet 範例、`mcab_raw`、`mcab_static`、`mcab_external_static` 走 `common/example_cli.h` 的嚴格解析，非法數字 exit 2（見 [`pipelines/README.md`](../pipelines/README.md)）。
 
 ### 4.2 Debug context dump
@@ -298,7 +298,7 @@ void audio_alg_destroy(AudioAlgPipeline *p)
 }
 
 int audio_alg_init(AudioAlgPipeline *p, int sample_rate,
-                   AecPreset aec_preset, AnrMode nr_mode,
+                   AecLevel aec_level, AnrLevel nr_level,
                    int enable_cng)
 {
     AecConfig aec_cfg;
@@ -310,7 +310,7 @@ int audio_alg_init(AudioAlgPipeline *p, int sample_rate,
     p->rng = 0x9e3779b9u;
     p->enable_cng = enable_cng != 0;
 
-    aec_config_from_preset(&aec_cfg, aec_preset, sample_rate);
+    aec_config_from_level(&aec_cfg, aec_level, sample_rate);
     aec_cfg.enable_res = 0;
     aec_cfg.return_res_context = 1;
 
@@ -324,9 +324,9 @@ int audio_alg_init(AudioAlgPipeline *p, int sample_rate,
     p->n_freqs = p->fft_size / 2 + 1;
 
     /* Grid-explicit entry point: NR must resolve the SAME fft_size the AEC just picked
-     * (the 2-arg anr_config_for_mode() uses NR's own per-rate default, e.g. 128 at 8 kHz
+     * (the 2-arg anr_config_for_level() uses NR's own per-rate default, e.g. 128 at 8 kHz
      * where the AEC uses 256). L/alpha_* are already retimed for this grid; do not override. */
-    nr_cfg = anr_config_for_mode_grid(sample_rate, p->fft_size, nr_mode);
+    nr_cfg = anr_config_for_level_grid(sample_rate, p->fft_size, nr_level);
 
     p->nr = anr_create(&nr_cfg);
     p->fft = fft_create(p->fft_size);
@@ -430,8 +430,8 @@ void audio_alg_reset(AudioAlgPipeline *p)
 ```c
 AudioAlgPipeline pipeline;
 if (audio_alg_init(&pipeline, 16000,
-                   AEC_PRESET_BALANCED,
-                   ANR_MODE_BALANCED, 1) != 0)
+                   AEC_LEVEL_BALANCED,
+                   ANR_LEVEL_BALANCED, 1) != 0)
     return -1;
 
 int hop = audio_alg_hop_size(&pipeline);
@@ -469,27 +469,29 @@ Conventional mono pipeline 跟 4-channel/AIAEC 一樣是 zero-padding-free
 
 完整 pipeline 的 final IFFT/OLA 增加約一個 grid hop 延遲；`--aec-only` 走 linear time output，不經這段 final OLA。另需把裝置 I/O buffer、resampler 與 OS scheduling latency 加入產品總預算。
 
-## 7. Preset 與 tuning 原則
+## 7. Level 與 tuning 原則
 
-AEC preset：
+C 稱 level，Python 稱 preset（NR 為 strength）：**C level == Python preset**，值名（mild／moderate／balanced／aggressive／no_floor）與整數（AEC 0..3、預設 1；NR 0..3、預設 2）兩邊相同。舊名 `AecPreset`／`AEC_PRESET_*`、`AnrMode`／`ANR_MODE_*` 仍保留在公開 header（同值），舊函式名已移除；CLI 的舊旗標 `--nr-preset` 保留為 `--nr-level` 的別名。
 
-| Preset | 方向 |
+AEC level：
+
+| Level | 方向 |
 |---|---|
 | mild | 近端保留優先 |
 | balanced | 預設 production operating point |
 | aggressive | 回聲抑制優先 |
 
-NR preset（`--nr-preset`，見 §4.1）：
+NR level（`--nr-level`，見 §4.1）：
 
-| Preset | 方向 |
+| Level | 方向 |
 |---|---|
 | mild | 最保守的背景降噪 |
 | balanced | 預設平衡 |
 | aggressive | 最強背景降噪 |
 
-> `anr_config_for_mode()` 有四級：`mild`／`moderate`／`balanced`／`aggressive`（`moderate` 介於 mild 與 balanced 之間）。`aec_nr_pipeline` 的 `parse_nr_mode()`（`pipelines/mono_aec_nr_res/main.c`）經 `anr_nr_mode_from_name()` 接受這四個名稱（或 `0`..`3`），其餘字串一律 silently 落回 `balanced`，不會報錯。
+> `anr_config_for_level()` 有四級：`mild`／`moderate`／`balanced`／`aggressive`（`moderate` 介於 mild 與 balanced 之間）。`aec_nr_pipeline` 的 `parse_nr_level()`（`pipelines/mono_aec_nr_res/main.c`）經 `anr_nr_level_from_name()` 接受這四個名稱（或 `0`..`3`），其餘字串一律 silently 落回 `balanced`，不會報錯。
 
-Audio_ALG 的範例程式（`pipelines/mono_aec_nr_res/main.c` 等）直接用 NR 函式庫的 preset：`anr_config_for_mode_grid(sample_rate, fft_size, nr_mode)`，不另外覆寫欄位（最小值追蹤視窗 `L` 為函式庫預設，約 512 ms；16 kHz 256/128 為 64 hops），所以 `anr_set_mode()` 可以直接在執行中換強度。
+Audio_ALG 的範例程式（`pipelines/mono_aec_nr_res/main.c` 等）直接用 NR 函式庫的 level：`anr_config_for_level_grid(sample_rate, fft_size, nr_level)`，不另外覆寫欄位（最小值追蹤視窗 `L` 為函式庫預設，約 512 ms；16 kHz 256/128 為 64 hops），所以 `anr_set_level()` 可以直接在執行中換強度。
 
 若要改 CNG 或 gain combine（例如在 `min(G_nr, G_res)` 之外再加任何 floor），這已不是單純 API integration，而是演算法 operating point 變更，應重新跑 far-end-only、near-end-only、double-talk、movement 與 noisy cases。
 
@@ -513,8 +515,8 @@ Audio_ALG 的範例程式（`pipelines/mono_aec_nr_res/main.c` 等）直接用 N
 | build 找不到 library | 未初始化 submodule 或未跑 `make ... libs` | `git submodule update --init --recursive` 後重建 |
 | mic/ref 無法處理 | sample rate 不一致或 WAV format 不支援 | 先轉成同步、同 SR 的 PCM16/float32 mono 測試 |
 | 回聲未消除 | ref routing／delay／AEC 尚未 convergence | 先用 `--aec-only` 隔離 AEC 問題 |
-| AEC-only 正常，完整 pipeline 傷近端 | NR preset 或 RES gain | 先改 mild；再用 `--no-nr` / `--no-res` 隔離是哪個 gain 來源 |
-| 背景噪聲殘留 | NR 還在 init 或 preset 太保守 | 確認開頭噪聲段，逐級試 balanced/aggressive |
+| AEC-only 正常，完整 pipeline 傷近端 | NR level 或 RES gain | 先改 mild；再用 `--no-nr` / `--no-res` 隔離是哪個 gain 來源 |
+| 背景噪聲殘留 | NR 還在 init 或 level 太保守 | 確認開頭噪聲段，逐級試 balanced/aggressive |
 | 輸出有洞或不自然靜音 | CNG 關閉或 gain 過深 | A/B 比較有無 `--no-cng`；CNG 只填 `G_res` 切掉的 bin，位準乘該 bin 的 NR gain（下限 −10 dB） |
 | 不同檔案結果互相影響 | state 未 reset | 每個獨立 stream reset 或重建全部 instance |
 | 尾端樣本變短 | CLI 只處理完整 hop | 上層先 padding，並在輸出後裁回原長度 |

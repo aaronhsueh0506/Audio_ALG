@@ -3,6 +3,78 @@
 `Audio_ALG/pipelines`（含它建置的 `AINR`、`AIAEC` C 程式）的重要改動記錄在此，格式依
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/)。README 只寫現況，改動經過寫在這裡。
 
+## [Unreleased] — 2026-10-28 — C strength setting named level in the examples, tests and READMEs (follows lib/aec and lib/nr)
+
+Pure rename; no DSP, default output or exit code of a valid command line changed. Baseline matrix (725 rows, s1/s0/g48):
+701 rows identical (every run row of the mono, `mcab_*`, DFN2 and ULCNet programs, with produced files); the 22 that differ
+are the 18 known ones from the earlier rounds plus the usage text listed under "Printed text".
+**C level == Python preset.** Python is unchanged and keeps `preset`.
+
+### Changed
+- Callers follow the library rename (`lib/aec`, `lib/nr`); the old function names are gone, so the examples, tests and
+  sample code use only the new ones:
+
+  | Old C name | New C name |
+  |---|---|
+  | `AecPreset`, `AEC_PRESET_{MILD,BALANCED,AGGRESSIVE,NO_FLOOR}` | `AecLevel`, `AEC_LEVEL_*` |
+  | `aec_config_from_preset` / `aec_set_preset` / `aec_res_set_preset` | `aec_config_from_level` / `aec_set_level` / `aec_res_set_level` |
+  | `AnrMode`, `ANR_MODE_{MILD,MODERATE,BALANCED,AGGRESSIVE}` | `AnrLevel`, `ANR_LEVEL_*` |
+  | `anr_set_mode` / `anr_config_for_mode` / `anr_config_for_mode_grid` | `anr_set_level` / `anr_config_for_level` / `anr_config_for_level_grid` |
+  | `anr_nr_mode_is_valid` / `_from_name` / `_name` | `anr_nr_level_is_valid` / `_from_name` / `_name` |
+  | `mono_aec_nr_res/main.c`: `parse_preset`, `preset_name`, `parse_nr_mode`, `nr_mode_name` | `parse_level`, `level_name`, `parse_nr_level`, `nr_level_name`, plus `is_nr_level_option` |
+  | `mcab_external_static.c`: `parse_preset`, `preset_name`, `nr_mode_name` | `parse_level`, `level_name`, `nr_level_name` |
+  | test harness fields `aec_preset` / `nr_mode` (`conv_chain_mono.h`, `conv_chain_mcab.h`, `test_mono_ulcnet.c`) | `aec_level` / `nr_level` |
+  | tests `test_caller_res_reset_and_preset`, `test_caller_res_ramped_preset`, `test_caller_res_preset_ramp_vs_oracle`, `test_nr_set_mode` | `..._level`, `test_nr_set_level` |
+
+  The libraries keep `AecPreset`, `AEC_PRESET_*`, `AnrMode` and `ANR_MODE_*` as legacy names with literal values; nothing
+  in this tree uses them.
+- **Command lines.** `aec_nr_pipeline`, `aec_nr_pipeline_static` and `mcab_external_static` document `--nr-level
+  mild|moderate|balanced|aggressive` (or `0`..`3`); `--nr-preset` is the same option under its earlier name, with the same
+  value parsing, the same fallback (mono) or exit 2 (`mcab_external_static`) for an unknown name, and the same
+  flag-as-value rule (a token starting with `--` is the next option, so the value is missing: exit 2). The same three
+  programs take the AEC level as the positional argument (`mild|balanced|aggressive|no_floor` or `0`..`3`, unchanged, now
+  called `[aec-level]`) or as the new option `--aec-level <level>`; both set the same value and use the same parser. In the
+  mono programs an unknown name falls back to balanced; `mcab_external_static` exits 2 for an unknown name. A second AEC
+  level in any mix of the two forms is a command-line error (exit 2, message `a second AEC level '<x>'; give one`) in
+  all three programs, so the mono programs no longer keep the last one given; their usage text says so. The board samples
+  that take these options (`--aec-level`/`--level` and `--nr-level`, aliases `--aec-preset`/`--preset`/`--nr-mode`) now
+  match a level name or one of the digits `0`..`3` exactly and fall back to balanced for anything else, where
+  `--nr-level` read the value with `atoi()` and turned `moderate` and `aggressive` into mild. The DFN2 and ULCNet programs have no strength
+  option and gain none.
+- READMEs under `pipelines/` say level for the C names and keep Python names (`set_preset()`, `from_preset`, the Python
+  `--nr-preset`, `PostBeamResidualSuppressor(..., preset)`) where they describe Python.
+
+### Printed text
+- Usage text of the mono programs (stdout, no arguments) and of `mcab_external_static` (stderr, unknown option) names
+  `--nr-level` and says `--nr-preset` is the same option. These are the only new matrix differences: `mono_err_noargs_*`
+  (stdout, 4 rows) and `ext_err_unknown_flag` (stderr, 2 rows, which already differed in the exit code).
+- Diagnostics on stderr: `mcab_external_static` now prints `<flag as typed> '<x>' is not an NR level`, `AEC level '<x>' is not
+  a level` and `a second AEC level '<x>'` (they said preset); `pyc_drv` prints `unknown aec level` / `unknown nr level`.
+- Unchanged on purpose: the run banner `AEC preset: <name>   NR preset: <name> ...` of the mono programs and
+  `mcab_external_static` (logs of earlier runs and the baseline matrix compare it), the `pyc_drv` key=value grammar
+  (`aec=`, `nr=`) and the pyc-parity scenario ids.
+
+### Tests
+- `4ch_aec_bf_nr_res/tests/test_cli_strict.sh` 486 -> 751 command lines (the 486 are unchanged and pass): `--aec-level` and
+  `--nr-level` in every missing-value, flag-as-value, bad-name and valid case next to `--nr-preset` and the positional level;
+  second-level cases in every mix of positional and option; the banner names the AEC and NR level in force for each of the
+  4 names and 4 digits through every spelling (so a flag that is parsed but ignored fails); the spellings print the same
+  output; the usage names them and states the one-AEC-level rule.
+- `mono_aec_nr_res/tests/test_mono_chain.c`: the black-box cases run the programs with `--nr-level`, `--nr-preset` and
+  `--aec-level` (names, digits, several on one line, positional and option mixed, the `no_floor` and digit levels) and
+  compare every hop with the oracle; missing-value and `-x` cases for the two new options; the usage names them; ten second-AEC-level command lines per program
+  (and six with `--print-mem-size`) exit 2 and the message names the problem (the earlier last-one-wins black-box case
+  `aggressive --aec-level mild` is gone). Each new check was shown to fail on a
+  mutated program (`--nr-level`, `--nr-preset` or `--aec-level` unknown in the mono programs, `--aec-level` value ignored there, flag
+  guard removed there, `--nr-level` or `--aec-level` unknown or its value ignored in `mcab_external_static`, the
+  second-level check skipped, the second-level latch removed in the mono programs, usage text changed in either).
+
+### Compatibility
+- Link-incompatible for prebuilt objects that call the renamed library functions: recompile and relink.
+- Python unchanged. Stale `preset` wording about C names remains in Python comments at
+  `4ch_aec_bf_nr_res/pipeline.py:599,686`, `4ch_aec_bf_nr_res/tests/test_pipeline.py:637,662` and
+  `tests/pyc_parity/pyc_parity.py:35`.
+
 ## [Unreleased] — 2026-10-28 — Offline research drivers archived out of `pipelines/tools/`
 
 ### Removed

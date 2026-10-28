@@ -111,11 +111,11 @@ I-O 表 / State 表 / 延遲與 warm-up / 相關檔案與測試路徑。全站�
 <code>audiolib/docs/html/</code>（空間鏈：VAD／DOA／BF）。本站以連結方式指向；連結假設 SE 樹 sibling 佈局
 （<code>SE/{AEC,NR,audiolib,Audio_ALG}</code> 同層)。</p>
 <p class="note"><b>RES 的歸屬</b>：mono 的 RES 增益在 <code>aec_process_context()</code> 內算出，經
-<code>aec_get_res_context()</code> 以 <code>AecResContext.res_gain</code> 交出，強度用 <code>aec_set_preset()</code>（mono 是明確例外，
+<code>aec_get_res_context()</code> 以 <code>AecResContext.res_gain</code> 交出，強度用 <code>aec_set_level()</code>（mono 是明確例外，
 範例的 <code>mono_form()</code> 只決定套不套用）。4ch flow <code>Mcab</code>（<code>mcab.h</code>）只做到 <code>mcab_fuse()</code>（<code>g_res_ctx</code> 為 NULL），
 <b>不含 RES</b>；要 RES 的應用在自己的 init 用 libaec 的 <code>aec_res_get_mem_size()</code>／<code>aec_res_init()</code> 建立
 <code>AecRes</code>，每 hop 呼叫 <code>aec_res_process()</code>（輸入由 <code>mcab_sample_res_input()</code> 自 <code>McabFrame</code> 填入），強度用
-<code>aec_res_set_preset()</code>。</p>
+<code>aec_res_set_level()</code>。</p>
 <p class="note"><b>版號</b>（出處為 header，<code>pipelines/tests/test_doc_layout_versions.py</code> 逐頁核對）：
 4ch flow <code>MCAB_LAYOUT_VERSION</code> = 25；
 全表見 <a href="conventions.html">conventions</a>。</p>
@@ -184,7 +184,7 @@ PBFDKF 矩形窗例外、centered vs 串流 framing 等價性、layout／carve �
 <tr><td><a href="../architecture_aec.html">architecture_aec</a></td>
 <td>架構概觀的 AEC 部分（<code>docs/architecture_aec.html</code>）。</td></tr>
 <tr><td><a href="../architecture_detail.html">architecture_detail</a></td>
-<td>架構概觀的效能、preset 與限制（<code>docs/architecture_detail.html</code>）。</td></tr>
+<td>架構概觀的效能、level 與限制（<code>docs/architecture_detail.html</code>）。</td></tr>
 </table>
 
 <h3>C API 使用說明（整合者視角）</h3>
@@ -204,7 +204,7 @@ PBFDKF 矩形窗例外、centered vs 串流 framing 等價性、layout／carve �
 搭配 <code>aec_cng_fill</code> 舒適噪音填補；static memory，抑制器設定與 lane 內的抑制器出自同一個建構函式。</td></tr>
 <tr><td><a href="../../../NR/docs/html/nr_c_api.html">nr_c_api</a></td>
 <td>NR 的頻域 C API：五組合法 grid、<code>process</code> vs <code>process_gain</code>、
-逐欄位參數效果與四級 mode、執行期 reconfigure 契約。</td></tr>
+逐欄位參數效果與四級 level、執行期 reconfigure 契約。</td></tr>
 <tr><td><a href="../../../NR/docs/html/nr_c_api_params.html">nr_c_api_params</a></td>
 <td>NR 的外部／內部參數表與公開／內部函式分界（<code>anr_types.h</code> 逐欄位出處）。</td></tr>
 <tr><td><a href="../../../audiolib/common/docs/html/audio_common_detail.html">audio_common_detail</a>／<a href="../../../audiolib/common/docs/html/audio_common_params.html">audio_common_params</a></td>
@@ -229,10 +229,10 @@ WOLA 在哪的三種答案、4ch front／fuse 協定、接 NN 的做法、整合
 <td><code>lib/aec/c_impl</code>：PBFDKF main/shadow 線性濾波 + AEC3 matched-filter
 delay estimator + AEC3 post（RES/CNG/suppression）；grid 8k/256、16k/256|512、48k/1024。</td></tr>
 <tr><td><a href="../../../AEC/docs/html/aec_detail.html">aec_detail</a></td>
-<td>aec 的 API 細節：delay backward-jump quarantine、記憶體拆解、<code>aec_set_preset()</code> 的 ramp 語意與量測注意事項、逐階段耗時與 debug 狀態。</td></tr>
+<td>aec 的 API 細節：delay backward-jump quarantine、記憶體拆解、<code>aec_set_level()</code> 的 ramp 語意與量測注意事項、逐階段耗時與 debug 狀態。</td></tr>
 <tr><td><a href="../../../NR/docs/html/nr.html">nr</a></td>
 <td><code>lib/nr/c_impl</code>：OM-LSA 核心（MCRA 噪聲估計 + SPP + LSA gain），
-4 檔強度 preset；呼叫端持有 FFT/窗/OLA。</td></tr>
+4 檔強度 level；呼叫端持有 FFT/窗/OLA。</td></tr>
 <tr><td><a href="../../../audiolib/common/docs/html/audio_common.html">audiolib</a></td>
 <td>共用基礎層：<code>fft_wrapper.h</code>（NE10 後端）、SIMD kernels、
 fast_math、WAV I/O、HPF、resampler；三個上層 repo 的唯一 FFT 來源。</td></tr>
@@ -254,9 +254,9 @@ fast_math、WAV I/O、HPF、resampler；三個上層 repo 的唯一 FFT 來源�
 NR 與合成（<code>AnrDenoiser</code>、<code>AcIstft</code>）由 main 自己初始化並明寫逐 hop 串接（min、套 gain、CNG、合成）；
 各函式庫各自 <code>mem_size</code>／<code>init</code>，pool-first 零 heap；grid 8k/256、16k/256|512、48k/1024。頁內含呼叫順序、已編譯檢查的範例與時序圖。</td></tr>
 <tr><td><a href="pipeline_mono_params.html">pipeline_mono_params</a></td>
-<td>mono 的參數與入口分級：外部（命令列旗標、<code>AnrMode</code>、執行期 setter、組成開關、進階 <code>AecConfig</code> 欄位）vs 內部（時間常數、門檻、seam、編譯期常數），公開 vs 內部函式清單。</td></tr>
+<td>mono 的參數與入口分級：外部（命令列旗標、<code>AnrLevel</code>、執行期 setter、組成開關、進階 <code>AecConfig</code> 欄位）vs 內部（時間常數、門檻、seam、編譯期常數），公開 vs 內部函式清單。</td></tr>
 <tr><td><a href="pipeline_mono_detail.html">pipeline_mono_detail</a></td>
-<td>mono 的執行期強度控制（<code>aec_set_preset()</code>／<code>anr_set_mode()</code>）與逐階段耗時診斷。</td></tr>
+<td>mono 的執行期強度控制（<code>aec_set_level()</code>／<code>anr_set_level()</code>）與逐階段耗時診斷。</td></tr>
 <tr><td><a href="pipeline_ulcnet_mono.html">pipeline_ulcnet_mono</a></td>
 <td><code>pipelines/ulcnet/mono_alignulcnet/main.c</code>：<code>Aec</code> 線性誤差 + 範例 stage <code>ulcnet/ulcnet_nn_stage.c</code>（Align-ULCNet
 NN post-filter，per-frame callback）；一個 build 一個編譯期格點（16k/512/256 或
@@ -270,7 +270,7 @@ RES（libaec 的 <code>AecRes</code>）、NR、CNG、合成由各 main 自己建
 <tr><td><a href="pipeline_4ch_params.html">pipeline_4ch_params</a></td>
 <td>4ch mcab 的設定欄位分級（<code>McabConfig</code>、lane 契約欄位、sample helper 參數）、每 hop 輸入、固定常數、公開／內部函式清單、狀態碼與輸出契約。</td></tr>
 <tr><td><a href="pipeline_4ch_detail.html">pipeline_4ch_detail</a></td>
-<td>mcab＋呼叫端 beamformer＋自備 <code>AecRes</code> 的呼叫範例、4ch 應用後級的執行期強度控制（<code>aec_res_set_preset()</code>／<code>anr_set_mode()</code>）與逐階段耗時診斷。</td></tr>
+<td>mcab＋呼叫端 beamformer＋自備 <code>AecRes</code> 的呼叫範例、4ch 應用後級的執行期強度控制（<code>aec_res_set_level()</code>／<code>anr_set_level()</code>）與逐階段耗時診斷。</td></tr>
 <tr><td><a href="pipeline_ulcnet_4ch.html">pipeline_ulcnet_4ch</a></td>
 <td><code>pipelines/ulcnet/4ch_alignulcnet/main.c</code>：mcab（<code>enable_post=0</code>，不建 RES）加 sample beam helper 的 BF 誤差<b>頻譜直送</b>
 Align-ULCNet NN post stage（不重建、不再分析）；新增演算法延遲 1 hop = 16 ms（48 k 為 10.67 ms）。</td></tr>

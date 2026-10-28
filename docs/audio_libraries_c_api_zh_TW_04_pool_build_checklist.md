@@ -16,7 +16,7 @@ config
 
 規則：
 
-- pool 大小必須由**同一份 resolved config**查詢；查完後不可再改 grid/preset/delay 欄位。
+- pool 大小必須由**同一份 resolved config**查詢；查完後不可再改 grid/level/delay 欄位。
 - 不要共用同一塊可寫 pool 給兩個 live instance。
 - `_init()` 回傳 NULL 就停止，不可退回較小尺寸或默默改 config。
 - static path 的 destroy 是 no-op 或只做狀態清理；pool ownership 永遠在 caller。

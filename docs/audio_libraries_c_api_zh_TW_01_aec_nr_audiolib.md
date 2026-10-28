@@ -23,7 +23,7 @@
 
 ```c
 AecConfig cfg;
-aec_config_from_preset(&cfg, AEC_PRESET_BALANCED, 16000);
+aec_config_from_level(&cfg, AEC_LEVEL_BALANCED, 16000);
 cfg.fft_size = 256;  /* 16k/256/128；改成 512 即為 16k/512/256 */
 ```
 
@@ -113,22 +113,25 @@ same-hop/same-reference 前提，通常只應由 4 通道 flow（`pipelines/4ch_
 ### 3.5 執行期改抑制強度
 
 ```c
-int aec_set_preset(Aec *aec, AecPreset preset, float ramp_ms);
+int aec_set_level(Aec *aec, AecLevel level, float ramp_ms);
 ```
 
-preset 改變 far-active 地板 `min_gain_floor_far_active_db`（-20/-28/-38 dB）；aggressive 另把 DT 地板
+level 改變 far-active 地板 `min_gain_floor_far_active_db`（-20/-28/-38 dB）；aggressive 另把 DT 地板
 `min_gain_floor_dt_db` 設成 -30 dB；NO_FLOOR 關閉 `min_gain_split_floor_enabled`。地板是抑制器每 hop 只讀一次的
-單一純量下限，所以換 preset 是重新指定目標值、不是重建：濾波器、延遲鎖定與每一條
+單一純量下限，所以換 level 是重新指定目標值、不是重建：濾波器、延遲鎖定與每一條
 平滑歷史都繼續跑。
+
+> C 稱 level（`AecLevel`，AEC 與 `AecRes` 共用，0..3、預設 `AEC_LEVEL_BALANCED` = 1），Python 稱 preset：**C level == Python preset**，值名與整數相同，
+> 逐項對照見 [C／Python 函式對照表](c_python_function_map.md)。舊名 `AecPreset`、`AEC_PRESET_*` 仍保留在 `aec.h` 末段（同值，因為 Python 端的測試讀這幾行），舊函式名已移除。
 
 ```c
 /* 兩個 hop 之間呼叫；ramp_ms=0 下一個 hop 生效，>0 以 dB 線性走過去（上限 60 s） */
-if (aec_set_preset(aec, AEC_PRESET_AGGRESSIVE, 100.0f) != 0) {
-    /* NULL / preset 超出 enum / ramp_ms 超出 [0, 60000]；此時什麼都沒寫 */
+if (aec_set_level(aec, AEC_LEVEL_AGGRESSIVE, 100.0f) != 0) {
+    /* NULL / level 超出 enum / ramp_ms 超出 [0, 60000]；此時什麼都沒寫 */
 }
 ```
 
-`ramp_ms == 0` 不是錯誤。與 `aec_config_from_preset()` 遇到不認得的值退回 balanced
+`ramp_ms == 0` 不是錯誤。與 `aec_config_from_level()` 遇到不認得的值退回 balanced
 相反，這個 setter **直接拒絕**。ramp 途中再呼叫會從當前 live 值重新起走；
 `aec_reset()` 保留目標值、丟棄 ramp 進度。**在 hop 之間呼叫、與 process 序列化；
 非 thread-safe。**
@@ -139,11 +142,11 @@ if (aec_set_preset(aec, AEC_PRESET_AGGRESSIVE, 100.0f) != 0) {
 ```c
 #include "aec_res.h"
 
-int aec_res_set_preset(AecRes *res, AecPreset preset, float ramp_ms);
+int aec_res_set_level(AecRes *res, AecLevel level, float ramp_ms);
 int aec_res_split_floor(const AecRes *res, float *live, float *target);
 ```
 
-語意與 `aec_set_preset()` 相同：只改 far-active 地板、`ramp_ms` 範圍 `[0, 60000]`、
+語意與 `aec_set_level()` 相同：只改 far-active 地板、`ramp_ms` 範圍 `[0, 60000]`、
 失敗時什麼都不寫；`aec_res_reset()` 保留目標值。地板是與
 `AecConfig.min_gain_floor_far_active_db` 相同的 dB-power 量換成的功率比；`live` 是現行
 值、`target` 是正走向的值。
@@ -155,15 +158,15 @@ int aec_res_split_floor(const AecRes *res, float *live, float *target);
 > echo 對齊或 degradation 對齊的條件下比較，並實際試聽。
 >
 > 4ch 產品另有一條：四條 lane 以 `spatial_linear_context` 建立（`mcab_apply_lane_contract()` 蓋上），從不走到自己的
-> suppression-gain 路徑，對 lane 呼叫 `aec_set_preset()` 依建構方式即為無效操作。
-> 請改用共用的 post-beam `AecRes` 的 `aec_res_set_preset()`：都是對應用自己用 libaec 建的那個 `AecRes` 呼叫。
+> suppression-gain 路徑，對 lane 呼叫 `aec_set_level()` 依建構方式即為無效操作。
+> 請改用共用的 post-beam `AecRes` 的 `aec_res_set_level()`：都是對應用自己用 libaec 建的那個 `AecRes` 呼叫。
 > 它針對的是那個共用的 post 級抑制器；`Mcab` 沒有任何強度 setter。
 > pipeline 層的對應入口見 [4ch 核心整合手冊 §3.2](integration_4ch_core_zh_TW_02_lifecycle.md#32-執行期強度控制)
 > 與 [mono 整合手冊 §3.2](integration_mono_zh_TW_02_lifecycle_config_errors.md#32-執行期強度控制)。
 
 ### 3.6 參數分級：外部與內部
 
-欄位在 `aec.h:59-156`。建議一律以 `aec_config_from_preset(&cfg, preset, sample_rate)` 取得完整設定，再只覆寫外部欄位；
+欄位在 `aec.h:69-166`。建議一律以 `aec_config_from_level(&cfg, level, sample_rate)` 取得完整設定，再只覆寫外部欄位；
 `aec_create()`／`aec_init()` 會複製設定，之後改你手上那份無效。
 
 | 分級 | 欄位／函式 | 範圍與預設 | 何時設定 |
@@ -171,7 +174,7 @@ int aec_res_split_floor(const AecRes *res, float *live, float *target);
 | 外部 | `sample_rate`、`fft_size`（`fft_size = 0` 被拒，要明確值）、`filter_length` | 8000／16000／48000；16 kHz 256 或 512、48 kHz 1024、8 kHz 256；`filter_length` `[1, 4096]`（52 ms，≥44.1 kHz 為 64 ms） | 建立時，不可變 |
 | 外部 | `delay_mode`、`delay_num_filters`、`fixed_delay_samples` | `MATCHED`（預設，bank 1..5）／`FIXED`（≥ 0）／`EXTERNAL_ALIGNED`；其他模式的對應欄位須維持預設 | 建立時，不可變 |
 | 外部 | `enable_res`、`enable_cng` | 0／1，預設 1 | 建立時 |
-| 外部 | `AecPreset` | `MILD`／`BALANCED`（預設）／`AGGRESSIVE`／`NO_FLOOR`；`aec_config_from_preset()` 對 enum 外的值不報錯、靜默退回 balanced，`aec_set_preset()` 則拒絕 | 建立時，或執行期 `aec_set_preset(a, preset, ramp_ms)` |
+| 外部 | `AecLevel` | `MILD`／`BALANCED`（預設）／`AGGRESSIVE`／`NO_FLOOR`；`aec_config_from_level()` 對 enum 外的值不報錯、靜默退回 balanced，`aec_set_level()` 則拒絕 | 建立時，或執行期 `aec_set_level(a, level, ramp_ms)` |
 | 進階外部 | `enable_highpass`、`highpass_cutoff_hz`、`enable_shadow`、`delay_est_period_s` | 開啟高通時截止頻率須 `> 0` 且 `< 0.45 × sample_rate`；`delay_est_period_s` 預設 0（全速），非 0 可能改變選到的 lag | 建立時 |
 | 整合者專用 | `return_res_context`、`spatial_linear_context` | `spatial_linear_context` 非 0 時必須 `enable_res = 0` 且 `return_res_context = 1` | 串鏈拓撲，不是調參 |
 | 內部 | 步進與不確定度（`mu`、`delta`、`kalman_q_*`、`shadow_mu_*`、`epc_mu_floor`）、偵測門檻（`epc_*`、`ne_recent_*`、`saturation_threshold`、`filter_misadjustment_scale_*`）、10 ms 格點撰寫的時間欄位（`warmup_frames` 等）、延遲獲取策略（`delay_acquire_*`、`max_delay_ms`、`delay_buffer_ms`）、DT 政策與 floor（`dt_aware_*`、`min_gain_*`）、預設關閉的實驗（`live_observer_*`、`cng_n2_windowed_psd`）、衍生值（`n_partitions`、`enable_delay_est`） | 驗證器只擋崩壞，不擋音質 | 不建議開放；理由見 [mono 手冊 §0.3](integration_mono_zh_TW_01_overview_link_quickstart.md#03-參數面外部與內部) |
@@ -196,16 +199,16 @@ NR 是 mono frequency-domain MMSE-LSA。呼叫端必須準備正確 WOLA/STFT；
 ### 4.2 Config 與建立
 
 ```c
-AnrConfig cfg = anr_config_for_mode_grid(
-    16000, 256, ANR_MODE_BALANCED);
+AnrConfig cfg = anr_config_for_level_grid(
+    16000, 256, ANR_LEVEL_BALANCED);
 
 if (!anr_validate_config(&cfg)) {
     /* 不支援的 grid 或參數 */
 }
 ```
 
-只傳 sample rate 的 `anr_config_for_mode()` 會選該 rate 的預設 grid；16 kHz 要選
-512/256 時，應明確使用 `_for_mode_grid()`。
+只傳 sample rate 的 `anr_config_for_level()` 會選該 rate 的預設 grid；16 kHz 要選
+512/256 時，應明確使用 `_for_level_grid()`。
 
 Heap 路徑：
 
@@ -266,7 +269,7 @@ AEC 的 `AecResContext.r2` 是 int16-square scale，直接交給 NR 前必須除
 
 ```c
 int anr_reconfigure(AnrDenoiser *nr, const AnrConfig *target);
-int anr_set_mode(AnrDenoiser *nr, AnrMode mode);
+int anr_set_level(AnrDenoiser *nr, AnrLevel level);
 ```
 
 不重新配置任何記憶體，所以 grid（`sample_rate`／`frame_size`／`hop_size`／`fft_size`）
@@ -278,36 +281,38 @@ int anr_set_mode(AnrDenoiser *nr, AnrMode mode);
 全部繼續跑。換強度不是重啟——要重啟請用 `anr_reset()`。
 
 ```c
-/* A. 以 preset 建立的實例（含範例程式的降噪器）：直接換 mode */
-if (anr_set_mode(nr, ANR_MODE_AGGRESSIVE) != 0) { /* 引數不合法或 target 被拒 */ }
+/* A. 以 level 建立的實例（含範例程式的降噪器）：直接換 level */
+if (anr_set_level(nr, ANR_LEVEL_AGGRESSIVE) != 0) { /* 引數不合法或 target 被拒 */ }
 
-/* B. 自己在 preset 之上改了欄位：重組整份組態，逐字交出去 */
-AnrConfig target = anr_config_for_mode_grid(sr, fft_size, ANR_MODE_AGGRESSIVE);
+/* B. 自己在 level 組態之上改了欄位：重組整份組態，逐字交出去 */
+AnrConfig target = anr_config_for_level_grid(sr, fft_size, ANR_LEVEL_AGGRESSIVE);
 target.g_min_db = -30.0f;                                     /* 你的覆寫 */
 if (anr_reconfigure(nr, &target) != 0) { /* grid 不符或 target 無效 */ }
 ```
 
-> **兩者不可互換。** `anr_reconfigure()` 逐字採用 `target`，不做 preset 查表、
-> 不做 overlay 疊加。`anr_set_mode()` 組的是**裸的 canonical preset**：對在 preset
-> 之上改過欄位的實例，它會把那些覆寫蓋回 preset 值（改過 `L` 或 `num_init_frames`
+> **兩者不可互換。** `anr_reconfigure()` 逐字採用 `target`，不做 level 查表、
+> 不做 overlay 疊加。`anr_set_level()` 組的是**裸的 canonical level 組態**：對在 level 組態
+> 之上改過欄位的實例，它會把那些覆寫蓋回 level 值（改過 `L` 或 `num_init_frames`
 > 的實例則直接拒絕），這種實例要用 B。範例程式的降噪器
-> （`mono_aec_nr_res/main.c` 等）就是 `anr_config_for_mode_grid()` 的 preset、沒有覆寫（最小值追蹤視窗 `L` 為函式庫預設），
-> 用 A：`anr_set_mode(nr, mode)`。
+> （`mono_aec_nr_res/main.c` 等）就是 `anr_config_for_level_grid()` 的 level 組態、沒有覆寫（最小值追蹤視窗 `L` 為函式庫預設），
+> 用 A：`anr_set_level(nr, level)`。
+
+> NR 同理：C 稱 level（`AnrLevel`，0..3、預設 `ANR_LEVEL_BALANCED` = 2），Python 稱 strength：**C level == Python strength**。舊名 `AnrMode`、`ANR_MODE_*` 仍保留在 `anr_types.h`（同值），舊函式名已移除。
 
 ### 4.6 參數分級：外部與內部
 
-欄位在 `anr_types.h:56-110`。以 `anr_config_for_mode_grid(sample_rate, fft_size, mode)` 取得完整設定。
+欄位在 `anr_types.h:66-120`。以 `anr_config_for_level_grid(sample_rate, fft_size, level)` 取得完整設定。
 
 | 分級 | 欄位／函式 | 範圍與預設 | 何時設定 |
 |---|---|---|---|
 | 外部 | `sample_rate`、`fft_size`（`frame_size`／`hop_size` 是衍生值，不要獨立設） | 8000／16000／48000；合法格點 8k/128、8k/256、16k/256、16k/512、48k/1024 | 建立時，不可變 |
-| 外部 | `AnrMode` | `MILD`／`MODERATE`／`BALANCED`（預設）／`AGGRESSIVE`；一次調 `g_min_db`、`q`、`xi_min_db`、`noise_over_subtraction` | 建立時，或執行期 `anr_set_mode()` |
-| 進階外部 | 上列四個旋鈕單獨調 | 它們是 preset 聯合調出的操作點；`g_min_db` 在 `speech_protect_floor` 開啟（預設）時須 `<= speech_protect_floor_db`（-15）；改 `q` 會連動幀級語音閘 | 建立時；執行期用 `anr_reconfigure()`（整組逐字取代，不查 preset） |
-| 內部 | 噪聲追蹤器（`alpha_s`、`alpha_d`、`alpha_p`、`delta_db`）、`alpha_xi`、增益平滑（`alpha_attack`、`alpha_decay`）、場景切換（`scene_change_*`、`broadband_threshold`）、低頻語音保護（`speech_protect_*`）、speech-aware 追蹤（`speech_aware_*`、`alpha_d_speech`、`noise_gate_*`）、預設關閉的實驗（`cross_band_*`、`dd_from_gmmse`、`makeup_*`） | 與 preset 聯合調過，四級共用 | 不建議開放 |
-| 內部（決定 pool 版面） | `L`、`num_init_frames` | `anr_reconfigure()` 與 `anr_set_mode()` 不能改，要改就重新查大小並重建 | 建立時 |
-| 內部（無作用） | `alpha_g` | 增益路徑上沒有作用（`anr_types.h:107`），調它不會有任何效果 | — |
+| 外部 | `AnrLevel` | `MILD`／`MODERATE`／`BALANCED`（預設）／`AGGRESSIVE`；一次調 `g_min_db`、`q`、`xi_min_db`、`noise_over_subtraction` | 建立時，或執行期 `anr_set_level()` |
+| 進階外部 | 上列四個旋鈕單獨調 | 它們是 level 聯合調出的操作點；`g_min_db` 在 `speech_protect_floor` 開啟（預設）時須 `<= speech_protect_floor_db`（-15）；改 `q` 會連動幀級語音閘 | 建立時；執行期用 `anr_reconfigure()`（整組逐字取代，不查 level 表） |
+| 內部 | 噪聲追蹤器（`alpha_s`、`alpha_d`、`alpha_p`、`delta_db`）、`alpha_xi`、增益平滑（`alpha_attack`、`alpha_decay`）、場景切換（`scene_change_*`、`broadband_threshold`）、低頻語音保護（`speech_protect_*`）、speech-aware 追蹤（`speech_aware_*`、`alpha_d_speech`、`noise_gate_*`）、預設關閉的實驗（`cross_band_*`、`dd_from_gmmse`、`makeup_*`） | 與 level 聯合調過，四級共用 | 不建議開放 |
+| 內部（決定 pool 版面） | `L`、`num_init_frames` | `anr_reconfigure()` 與 `anr_set_level()` 不能改，要改就重新查大小並重建 | 建立時 |
+| 內部（無作用） | `alpha_g` | 增益路徑上沒有作用（`anr_types.h:117`），調它不會有任何效果 | — |
 
-函式面：公開 = `anr.h` 的函式與 `anr_types.h` 的 `anr_config_for_mode*()`、`anr_nr_mode_*()`；內部 = `noise_estimator.h`、
+函式面：公開 = `anr.h` 的函式與 `anr_types.h` 的 `anr_config_for_level*()`、`anr_nr_level_*()`；內部 = `noise_estimator.h`、
 `spp_estimator.h`、`anr_internal.h`、`anr_apply_*_experiment()`。
 
 ---

@@ -57,7 +57,7 @@ static const int HOST_RATES[] = { 8000, 16000, 48000, 0 };
 static int derive_lane(const DfnExampleArgs *args, AecSignalGrid *grid, AecConfig *aec_cfg) {
     if (!aec_resolve_signal_grid(args->sample_rate, aec_default_fft_size(args->sample_rate), grid))
         return -1;
-    aec_config_from_preset(aec_cfg, AEC_PRESET_BALANCED, args->sample_rate);
+    aec_config_from_level(aec_cfg, AEC_LEVEL_BALANCED, args->sample_rate);
     aec_cfg->fft_size = grid->fft_size;
     aec_cfg->delay_mode = args->delay_mode;
     aec_cfg->delay_num_filters = args->delay_num_filters;

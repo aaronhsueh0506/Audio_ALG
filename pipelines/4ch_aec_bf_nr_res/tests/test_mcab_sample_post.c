@@ -17,16 +17,16 @@
 static int g_fail;
 #define CHECK(c, msg) do { if (!(c)) { printf("FAIL: %s (line %d)\n", msg, __LINE__); ++g_fail; } } while (0)
 
-/* The denoiser configuration the oracles use: the library preset for `mode` with the 512 ms
- * minimum window written out in whole hops rather than taken from the preset. */
-static AnrConfig oracle_nr_config(int sr, int fft, AnrMode mode) {
-    AnrConfig c = anr_config_for_mode_grid(sr, fft, mode);
+/* The denoiser configuration the oracles use: the library level for `level` with the 512 ms
+ * minimum window written out in whole hops rather than taken from the level. */
+static AnrConfig oracle_nr_config(int sr, int fft, AnrLevel level) {
+    AnrConfig c = anr_config_for_level_grid(sr, fft, level);
     int hop = fft / 2;
     c.L = (512 * sr + 1000 * hop - 1) / (1000 * hop);
     return c;
 }
 
-/* The examples' denoiser is the library preset; the scene-reset gate stays off, which keeps the
+/* The examples' denoiser is the library level; the scene-reset gate stays off, which keeps the
  * gain independent of the window length. */
 static void test_nr_config(void) {
     static const struct { int sr, fft, l; } grid[] = {
@@ -35,12 +35,12 @@ static void test_nr_config(void) {
     int m;
     for (i = 0; i < sizeof grid / sizeof grid[0]; ++i) {
         for (m = 0; m < 4; ++m) {
-            AnrConfig canon = anr_config_for_mode_grid(grid[i].sr, grid[i].fft, (AnrMode)m);
-            AnrConfig o = oracle_nr_config(grid[i].sr, grid[i].fft, (AnrMode)m);
-            CHECK(canon.L == grid[i].l, "the preset's minimum window is 512 ms in whole hops");
-            CHECK(canon.alpha_decay == canon.alpha_g, "the preset's alpha_decay equals alpha_g");
+            AnrConfig canon = anr_config_for_level_grid(grid[i].sr, grid[i].fft, (AnrLevel)m);
+            AnrConfig o = oracle_nr_config(grid[i].sr, grid[i].fft, (AnrLevel)m);
+            CHECK(canon.L == grid[i].l, "the level's minimum window is 512 ms in whole hops");
+            CHECK(canon.alpha_decay == canon.alpha_g, "the level's alpha_decay equals alpha_g");
             CHECK(canon.broadband_threshold == 1.0f, "scene-reset gate stays off");
-            CHECK(memcmp(&o, &canon, sizeof o) == 0, "the oracle configuration equals the preset");
+            CHECK(memcmp(&o, &canon, sizeof o) == 0, "the oracle configuration equals the level");
         }
     }
 }
@@ -54,7 +54,7 @@ static void *aligned_pool(size_t bytes) {
 
 static void test_stage(void) {
     const int sr = 16000, fft = 256, n = 129;
-    AnrConfig cfg = anr_config_for_mode_grid(sr, fft, ANR_MODE_BALANCED);
+    AnrConfig cfg = anr_config_for_level_grid(sr, fft, ANR_LEVEL_BALANCED);
     size_t bytes = anr_get_mem_size(&cfg);
     void *pool = aligned_pool(bytes), *pool2 = aligned_pool(bytes), *pool3 = aligned_pool(bytes);
     AnrDenoiser *a, *b, *c;
@@ -77,8 +77,8 @@ static void test_stage(void) {
     CHECK(a && b && c, "stage init");
 
     for (m = 0; m < 4; ++m)
-        CHECK(anr_set_mode(a, (AnrMode)m) == 0, "anr_set_mode accepts every mode on the preset instance");
-    CHECK(anr_set_mode(a, ANR_MODE_BALANCED) == 0, "back to balanced");
+        CHECK(anr_set_level(a, (AnrLevel)m) == 0, "anr_set_level accepts every level on the instance");
+    CHECK(anr_set_level(a, ANR_LEVEL_BALANCED) == 0, "back to balanced");
 
     /* the residual-echo prior reaches the denoiser as r2 / 32768^2 */
     for (frame = 0; frame < 40; ++frame) {
@@ -163,7 +163,7 @@ static void test_stage(void) {
  * so the reference stays a real division. */
 static void test_psd_scale(void) {
     const int sr = 16000, fft = 256, n = 129;
-    AnrConfig cfg = anr_config_for_mode_grid(sr, fft, ANR_MODE_BALANCED);
+    AnrConfig cfg = anr_config_for_level_grid(sr, fft, ANR_LEVEL_BALANCED);
     size_t bytes = anr_get_mem_size(&cfg);
     void *pool = aligned_pool(bytes);
     AnrDenoiser *a = pool ? anr_init(pool, bytes, &cfg) : NULL;
@@ -263,7 +263,7 @@ static void test_res_input(void) {
           in.clock_drift == 0, "res input: a NULL frame zeroes the input");
     mcab_sample_res_input(&f, NULL);   /* a NULL input is a no-op */
 
-    aec_config_from_preset(&cfg, AEC_PRESET_BALANCED, 16000);
+    aec_config_from_level(&cfg, AEC_LEVEL_BALANCED, 16000);
     cfg.fft_size = 256;
     bytes = aec_res_get_mem_size(&cfg);
     pool = bytes ? aligned_pool(bytes) : NULL;
@@ -277,9 +277,9 @@ static void test_res_input(void) {
     free(pool);
 }
 
-/* NR strength at runtime: anr_set_mode() before the first hop makes a denoiser equal, through
- * mcab_sample_anr_gain, to one built in the target mode, on every grid the examples use. */
-static void test_nr_set_mode(void) {
+/* NR strength at runtime: anr_set_level() before the first hop makes a denoiser equal, through
+ * mcab_sample_anr_gain, to one built at the target level, on every grid the examples use. */
+static void test_nr_set_level(void) {
     static const struct { int sr, fft; } grid[] = {{16000, 256}, {16000, 512}, {48000, 1024}, {8000, 256}};
     static Complex spec[513];
     static float r2[513], s_a[513], s_b[513];
@@ -288,9 +288,9 @@ static void test_nr_set_mode(void) {
     for (gi = 0; gi < sizeof grid / sizeof grid[0]; ++gi) {
         int n = grid[gi].fft / 2 + 1;
         for (m = 0; m < 4; ++m) {
-            AnrMode other = m == ANR_MODE_BALANCED ? ANR_MODE_MILD : ANR_MODE_BALANCED;
-            AnrConfig ca = anr_config_for_mode_grid(grid[gi].sr, grid[gi].fft, other);
-            AnrConfig cb = anr_config_for_mode_grid(grid[gi].sr, grid[gi].fft, (AnrMode)m);
+            AnrLevel other = m == ANR_LEVEL_BALANCED ? ANR_LEVEL_MILD : ANR_LEVEL_BALANCED;
+            AnrConfig ca = anr_config_for_level_grid(grid[gi].sr, grid[gi].fft, other);
+            AnrConfig cb = anr_config_for_level_grid(grid[gi].sr, grid[gi].fft, (AnrLevel)m);
             size_t ba = anr_get_mem_size(&ca), bb = anr_get_mem_size(&cb);
             void *pa = aligned_pool(ba), *pb = aligned_pool(bb);
             AnrDenoiser* a = pa ? anr_init(pa, ba, &ca) : NULL;
@@ -301,7 +301,7 @@ static void test_nr_set_mode(void) {
             f.e = spec;
             f.r2 = r2;
             f.usable_linear = 1;
-            if (!a || !b || anr_set_mode(a, (AnrMode)m) != 0) { refused++; free(pa); free(pb); continue; }
+            if (!a || !b || anr_set_level(a, (AnrLevel)m) != 0) { refused++; free(pa); free(pb); continue; }
             for (h = 0; h < 70; ++h) {
                 const float *ga, *gb;
                 for (k = 0; k < n; ++k) {
@@ -320,9 +320,9 @@ static void test_nr_set_mode(void) {
             free(pb);
         }
     }
-    CHECK(refused == 0, "nr mode: anr_set_mode accepts every mode on a preset denoiser");
-    CHECK(bad == 0, "nr mode: switched before the first hop equals a denoiser built in that mode");
-    CHECK(shaped, "nr mode: the denoiser shapes the scripted frames");
+    CHECK(refused == 0, "nr level: anr_set_level accepts every level on a denoiser");
+    CHECK(bad == 0, "nr level: switched before the first hop equals a denoiser built at that level");
+    CHECK(shaped, "nr level: the denoiser shapes the scripted frames");
 }
 
 /* skn_all_finite_f32 (the check the programs run on an emitted hop): every non-finite class is
@@ -354,7 +354,7 @@ int main(void) {
     test_stage();
     test_psd_scale();
     test_res_input();
-    test_nr_set_mode();
+    test_nr_set_level();
     test_hop_is_finite();
     if (g_fail) { printf("%d check(s) FAILED\n", g_fail); return 1; }
     printf("ALL PASS\n");

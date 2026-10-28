@@ -30,7 +30,7 @@ th{background:#eef0f5}
 <h1>4ch mcab 與 sample helper — 參數與入口分級(外部／內部)</h1>
 
 <h2>概要</h2>
-<p>本頁列 <code>McabConfig</code>(<code>mcab.h</code>,flow 參數)與 <code>McabSampleBeamParams</code>(<code>mcab_sample_beam.h</code>,陣列與 SRP／BF 參數)每個欄位的分級,以及四條 lane 的 <code>AecConfig</code> 由誰決定:<b>外部</b> = 第三方依部署環境或產品需求可以調(有界、單調、錯值被 validator 擋下);<b>外部(進階)</b> = 可調但有耦合或副作用,開放時要加夾限與說明;<b>整合者專用</b> = 串接拓樸,不是調參;<b>內部</b> = 存在、可調,但不建議開放(時間常數、門檻、聯合調出來的操作點)。<code>McabConfig</code> 與 helper 的參數<b>都沒有</b> RES／NR／CNG／preset／<code>filter_length</code> 欄位:lane 的 <code>AecConfig</code>(preset 值、<code>filter_length</code>)由應用自己組,再用 <code>mcab_apply_lane_contract()</code> 蓋上 flow 的契約(<code>mcab_lane_config()</code> = balanced preset 加契約),lane 只算線性殘留;RES 由應用用 libaec 自備(見 1.3),NR／CNG 同屬你的後級物件(<a href="pipeline_mono_params.html">pipeline_mono_params</a> 的 <code>AnrMode</code> 等)。所有欄位在建立時決定,pool 佈局相關者(格點、delay、<code>max_delay_ms</code>、<code>enable_post</code>、<code>num_angles</code>…)改了必須重新查大小;<code>mcab_init_ex()</code> 與 <code>mcab_sample_beam_init()</code> 會複製 config。呼叫順序與時序圖見 <a href="pipeline_4ch.html">pipeline_4ch</a>、<a href="integration_sequence.html">整合時序圖</a>。</p>
+<p>本頁列 <code>McabConfig</code>(<code>mcab.h</code>,flow 參數)與 <code>McabSampleBeamParams</code>(<code>mcab_sample_beam.h</code>,陣列與 SRP／BF 參數)每個欄位的分級,以及四條 lane 的 <code>AecConfig</code> 由誰決定:<b>外部</b> = 第三方依部署環境或產品需求可以調(有界、單調、錯值被 validator 擋下);<b>外部(進階)</b> = 可調但有耦合或副作用,開放時要加夾限與說明;<b>整合者專用</b> = 串接拓樸,不是調參;<b>內部</b> = 存在、可調,但不建議開放(時間常數、門檻、聯合調出來的操作點)。<code>McabConfig</code> 與 helper 的參數<b>都沒有</b> RES／NR／CNG／level／<code>filter_length</code> 欄位:lane 的 <code>AecConfig</code>(level 值、<code>filter_length</code>)由應用自己組,再用 <code>mcab_apply_lane_contract()</code> 蓋上 flow 的契約(<code>mcab_lane_config()</code> = balanced level 加契約),lane 只算線性殘留;RES 由應用用 libaec 自備(見 1.3),NR／CNG 同屬你的後級物件(<a href="pipeline_mono_params.html">pipeline_mono_params</a> 的 <code>AnrLevel</code> 等)。所有欄位在建立時決定,pool 佈局相關者(格點、delay、<code>max_delay_ms</code>、<code>enable_post</code>、<code>num_angles</code>…)改了必須重新查大小;<code>mcab_init_ex()</code> 與 <code>mcab_sample_beam_init()</code> 會複製 config。呼叫順序與時序圖見 <a href="pipeline_4ch.html">pipeline_4ch</a>、<a href="integration_sequence.html">整合時序圖</a>。</p>
 
 <h2>1. 設定欄位分級</h2>
 <h3>1.1 格點與 delay(<code>McabConfig</code>,四條 lane 共用同一個決策)</h3>
@@ -70,13 +70,13 @@ th{background:#eef0f5}
 </table>
 
 <h3>1.3 lane 的 <code>AecConfig</code> 與 RES(libaec,應用層;不是 <code>McabConfig</code> 的欄位)</h3>
-<p>四條 lane 的 <code>AecConfig</code> 由應用組:<code>aec_config_from_preset()</code>(或 <code>mcab_lane_config()</code> 的 balanced 預設)加 <code>mcab_apply_lane_contract(&amp;cfg, &amp;lane)</code>。契約蓋上 <code>fft_size</code>(flow 的格點)、<code>delay_mode = EXTERNAL_ALIGNED</code>(<code>delay_num_filters = 5</code>、<code>fixed_delay_samples = -1</code>、<code>enable_delay_est = 0</code>)、<code>enable_res = 0</code>、<code>return_res_context = 1</code>、<code>spatial_linear_context</code>(<code>enable_post=1</code> 為 <code>AEC_CONTEXT_NO_GAIN</code>,否則 <code>LINEAR_ONLY</code>)與 <code>delay_est_period_s</code>;<code>filter_length</code>(預設 52 ms,≥ 44.1 kHz 為 64 ms)與 preset 的其餘值保持原樣、mcab 不檢查,<code>sample_rate</code> 不同的 lane 被拒(−1)。mcab 與 helper 沒有 <code>enable_res</code>／<code>res_preset</code>,<code>fuse()</code> 讓 <code>frame.g_res_ctx</code> 為 NULL。要在 fuse 之後做 RES 的應用在自己的 init 建一個 <code>AecRes</code>:</p>
+<p>四條 lane 的 <code>AecConfig</code> 由應用組:<code>aec_config_from_level()</code>(或 <code>mcab_lane_config()</code> 的 balanced 預設)加 <code>mcab_apply_lane_contract(&amp;cfg, &amp;lane)</code>。契約蓋上 <code>fft_size</code>(flow 的格點)、<code>delay_mode = EXTERNAL_ALIGNED</code>(<code>delay_num_filters = 5</code>、<code>fixed_delay_samples = -1</code>、<code>enable_delay_est = 0</code>)、<code>enable_res = 0</code>、<code>return_res_context = 1</code>、<code>spatial_linear_context</code>(<code>enable_post=1</code> 為 <code>AEC_CONTEXT_NO_GAIN</code>,否則 <code>LINEAR_ONLY</code>)與 <code>delay_est_period_s</code>;<code>filter_length</code>(預設 52 ms,≥ 44.1 kHz 為 64 ms)與 level 的其餘值保持原樣、mcab 不檢查,<code>sample_rate</code> 不同的 lane 被拒(−1)。mcab 與 helper 沒有 <code>enable_res</code>／<code>res_level</code>,<code>fuse()</code> 讓 <code>frame.g_res_ctx</code> 為 NULL。要在 fuse 之後做 RES 的應用在自己的 init 建一個 <code>AecRes</code>:</p>
 <table>
 <tr><th>項目</th><th>分級</th><th>範圍／預設</th><th>說明</th></tr>
-<tr><td>lane 的 <code>filter_length</code></td><td>外部</td><td>(0, 4096] 樣本;<code>aec_config_from_preset()</code> 填預設 52 ms(≥ 44.1 kHz 為 64 ms):16 kHz 832、48 kHz 3072</td><td>每條 lane 的 PBFDKF 長度;調高 → 記憶體與運算上升(四條 lane 用同一份 config);超出範圍時 <code>aec_get_mem_size()</code> 回 0</td></tr>
-<tr><td><code>aec_config_from_preset(&amp;cfg, preset, sample_rate)</code>(RES 用)</td><td>外部</td><td><code>AEC_PRESET_*</code>(範例用 BALANCED);<code>sample_rate</code> = flow 的 <code>sample_rate</code></td><td>RES 地板的起點;執行期改用 <code>aec_res_set_preset(res, preset, ramp_ms)</code></td></tr>
+<tr><td>lane 的 <code>filter_length</code></td><td>外部</td><td>(0, 4096] 樣本;<code>aec_config_from_level()</code> 填預設 52 ms(≥ 44.1 kHz 為 64 ms):16 kHz 832、48 kHz 3072</td><td>每條 lane 的 PBFDKF 長度;調高 → 記憶體與運算上升(四條 lane 用同一份 config);超出範圍時 <code>aec_get_mem_size()</code> 回 0</td></tr>
+<tr><td><code>aec_config_from_level(&amp;cfg, level, sample_rate)</code>(RES 用)</td><td>外部</td><td><code>AEC_LEVEL_*</code>(範例用 BALANCED);<code>sample_rate</code> = flow 的 <code>sample_rate</code></td><td>RES 地板的起點;執行期改用 <code>aec_res_set_level(res, level, ramp_ms)</code></td></tr>
 <tr><td>RES 的 <code>cfg.fft_size</code></td><td>外部</td><td>= <code>mcab_fft_size(flow)</code></td><td>必須與 flow 同一格點;<code>aec_res_get_mem_size()</code> 回 0 = config 無效,<code>aec_res_init()</code> 回 NULL = pool 過小／未對齊／無效</td></tr>
-<tr><td>其餘 <code>AecConfig</code> 欄位</td><td>內部</td><td>preset 建構函式的值</td><td>整合者不改;範例(<code>mcab_static.c</code>、<code>mcab_raw.c</code>、<code>mcab_external_static.c</code>、<code>dfn/4ch_aec_bf_dfn_res/main.c</code>)都只設 <code>fft_size</code></td></tr>
+<tr><td>其餘 <code>AecConfig</code> 欄位</td><td>內部</td><td>level 建構函式的值</td><td>整合者不改;範例(<code>mcab_static.c</code>、<code>mcab_raw.c</code>、<code>mcab_external_static.c</code>、<code>dfn/4ch_aec_bf_dfn_res/main.c</code>)都只設 <code>fft_size</code></td></tr>
 </table>
 
 <h2>2. 每 hop 由應用提供的輸入</h2>
@@ -91,10 +91,10 @@ th{background:#eef0f5}
 <h2>3. 執行期控制與唯讀查詢(外部)</h2>
 <table>
 <tr><th>呼叫</th><th>說明</th></tr>
-<tr><td><code>aec_res_set_preset(res, preset, ramp_ms)</code></td><td>RES 強度(<code>res</code> 是應用自備的 <code>AecRes</code>);<code>ramp_ms</code> ∈ [0, 60000];mcab 與 helper 都沒有自己的 setter,對四條 lane 重新指定 preset 是無效操作。見 <a href="pipeline_4ch_detail.html">pipeline_4ch_detail</a></td></tr>
-<tr><td><code>aec_res_reset(res)</code></td><td>重設應用自備的 RES;經 <code>aec_res_set_preset()</code> 設的 preset 保留</td></tr>
+<tr><td><code>aec_res_set_level(res, level, ramp_ms)</code></td><td>RES 強度(<code>res</code> 是應用自備的 <code>AecRes</code>);<code>ramp_ms</code> ∈ [0, 60000];mcab 與 helper 都沒有自己的 setter,對四條 lane 重新指定 level 是無效操作。見 <a href="pipeline_4ch_detail.html">pipeline_4ch_detail</a></td></tr>
+<tr><td><code>aec_res_reset(res)</code></td><td>重設應用自備的 RES;經 <code>aec_res_set_level()</code> 設的 level 保留</td></tr>
 <tr><td><code>aec_res_split_floor(res, &amp;live, &amp;target)</code></td><td>唯讀(線性功率);<code>live == target</code> ⇒ ramp 走完</td></tr>
-<tr><td><code>anr_set_mode(nr, mode)</code></td><td>你自己 <code>anr_init()</code> 的降噪器</td></tr>
+<tr><td><code>anr_set_level(nr, level)</code></td><td>你自己 <code>anr_init()</code> 的降噪器</td></tr>
 <tr><td><code>mcab_sample_beam_reset(b)</code></td><td>flow(lane＋estimator)、SRP、BF、備援 VAD 一起 reset;應用自己的 RES(<code>aec_res_reset()</code>)與其他後級另外 reset。只用 mcab 時是 <code>mcab_reset(flow)</code></td></tr>
 <tr><td><code>mcab_{hop_size,fft_size,n_freqs,sample_rate,enable_post}(flow)</code></td><td>解析後的格點(NR／合成必須與它一致);NULL 或已 destroy 回 −1</td></tr>
 </table>
@@ -102,7 +102,7 @@ th{background:#eef0f5}
 <h2>4. 固定在程式內的常數(內部)</h2>
 <table>
 <tr><th>項目</th><th>值</th><th>位置／為什麼不開放</th></tr>
-<tr><td>lane 的契約欄位</td><td><code>EXTERNAL_ALIGNED</code>、<code>enable_res=0</code>、<code>return_res_context=1</code>、<code>spatial_linear_context</code></td><td><code>mcab_apply_lane_contract()</code>;lane 不走自己的殘留抑制器,preset 對它的輸出沒有意義(<code>mcab_lane_config()</code> 預設取 <code>AEC_PRESET_BALANCED</code>)</td></tr>
+<tr><td>lane 的契約欄位</td><td><code>EXTERNAL_ALIGNED</code>、<code>enable_res=0</code>、<code>return_res_context=1</code>、<code>spatial_linear_context</code></td><td><code>mcab_apply_lane_contract()</code>;lane 不走自己的殘留抑制器,level 對它的輸出沒有意義(<code>mcab_lane_config()</code> 預設取 <code>AEC_LEVEL_BALANCED</code>)</td></tr>
 <tr><td>delay 接受條件</td><td>估計 ≥ 0、solid、<code>n_updates ≥ 3</code></td><td><code>update_shared_delay()</code>(<code>mcab.c</code>);首次取得對齊立即接受</td></tr>
 <tr><td>delay 變更 admission(Path-B)</td><td>移動 &gt; 32 樣本,且在 16 樣本內再次被提出,候選 TTL 3 hops</td><td><code>mcab_internal.h</code> 的 <code>MCAB_DELAY_CHANGE_*</code>;與 lib/aec 同一條規則</td></tr>
 <tr><td>duty-cycle 常數</td><td>divisor 5;ERLE 崩 6 dB 的看門狗(<code>DUTY_ERLE_COLLAPSE_DB</code>);leak 0.001 dB/hop @10 ms 基準換算</td><td><code>mcab.c</code>。回全速<b>不是立即</b>:被略過的 hop 不發佈新估計,delay 改變／信心流失只能在下一個排定的分析被看見,最壞多等一個 duty 週期(約 96 ms @ <code>delay_est_period_s</code>=0.5,16 kHz/256);看門狗必須先讓 ERLE 峰值超過 6 dB 才會武裝(lane ERLE 壓在 6 dB 之下時永遠不武裝,re-lock 全由 1-in-K 取樣承擔)</td></tr>

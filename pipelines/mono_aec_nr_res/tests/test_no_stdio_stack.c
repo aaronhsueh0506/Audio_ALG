@@ -67,7 +67,7 @@ int main(void) {
     Post q;
 
     if (!aec_resolve_signal_grid(16000, aec_default_fft_size(16000), &grid)) return 1;
-    aec_config_from_preset(&aec_cfg, AEC_PRESET_BALANCED, 16000);
+    aec_config_from_level(&aec_cfg, AEC_LEVEL_BALANCED, 16000);
     aec_cfg.fft_size = grid.fft_size;
     aec_cfg.delay_mode = AEC_DELAY_MATCHED;
     aec_cfg.delay_num_filters = DA_NUM_FILTERS;
@@ -75,7 +75,7 @@ int main(void) {
     aec_cfg.enable_delay_est = 1;
     aec_cfg.enable_res = 0;
     aec_cfg.return_res_context = 1;
-    nr_cfg = anr_config_for_mode_grid(16000, grid.fft_size, ANR_MODE_BALANCED);
+    nr_cfg = anr_config_for_level_grid(16000, grid.fft_size, ANR_LEVEL_BALANCED);
     ac_stft_config_default(&synth_cfg, grid.fft_size);
     aec_bytes = aec_get_mem_size(&aec_cfg);
     nr_bytes = anr_get_mem_size(&nr_cfg);

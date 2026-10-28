@@ -148,7 +148,7 @@ static FourDfn *fdfn_create(int sample_rate, int fft_size, int enable_cng, const
     m->hop_size = mcab_hop_size(mcab_test_beam_flow(m->unit));
     n_freqs = mcab_n_freqs(mcab_test_beam_flow(m->unit));
 
-    aec_config_from_preset(&res_cfg, AEC_PRESET_BALANCED, sample_rate);
+    aec_config_from_level(&res_cfg, AEC_LEVEL_BALANCED, sample_rate);
     res_cfg.fft_size = mcab_fft_size(mcab_test_beam_flow(m->unit));
     res_bytes = aec_res_get_mem_size(&res_cfg);
     if (res_bytes == 0 || posix_memalign(&m->res_mem, 16, res_bytes) != 0) {
@@ -284,7 +284,7 @@ static int run_identity(int enable_cng) {
     if (frames != TEST_FRAMES || commits != 0 || skips != TEST_FRAMES - DFN2_MASK_LOOKAHEAD)
         return 5;                             /* a reset would leave a gap */
     if (aec_res_split_floor(dfn->res, &live0, NULL) != 0 ||
-        aec_res_set_preset(dfn->res, AEC_PRESET_AGGRESSIVE, 0.0f) != 0 ||
+        aec_res_set_level(dfn->res, AEC_LEVEL_AGGRESSIVE, 0.0f) != 0 ||
         aec_res_split_floor(dfn->res, &live1, NULL) != 0 || live1 == live0)
         return 6;
     if (dfn_res_stage_set_atten_lim(dfn->stage, 12.0f) != 0 ||

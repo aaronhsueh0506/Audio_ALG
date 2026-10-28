@@ -122,7 +122,7 @@ dfn_hop_end(&hop, out);                                  /* 合成剛好一個 h
 | 函式庫物件 | 大小查詢 | 16 kHz／256 | 備註 |
 |---|---|---:|---|
 | `Aec`（mono，MATCHED n=5） | `aec_get_mem_size()` | 364,416 | 48 kHz／1024：1,156,544 |
-| `AnrDenoiser`（函式庫 preset） | `anr_get_mem_size()` | 45,344 | 範例程式有 NR 時 |
+| `AnrDenoiser`（函式庫 level） | `anr_get_mem_size()` | 45,344 | 範例程式有 NR 時 |
 | `AcIstft`（合成） | `ac_istft_get_mem_size()` | 11,344 | 範例程式有合成時 |
 | `AecRes`（4ch 後波束 RES） | `aec_res_get_mem_size()` | 7,904 | `Mcab` 的 pool 不含；4ch 的範例自己建一個（48 kHz／1024：29,408） |
 | 增益／頻譜暫存 | 範例程式自己算 | 2,624 | mono 與 `mcab_external_static` 為三個 `n_freqs` float 向量 + 一個複數向量，各自 `ALIGN16`；`mcab_static` 為兩個向量 + 一個複數向量（2,096） |

@@ -1,7 +1,7 @@
 導覽：[索引](integration_4ch_core_zh_TW.md) ｜ [上一部分](integration_4ch_core_zh_TW_02_lifecycle.md) ｜ [下一部分](integration_4ch_core_zh_TW_04_errors_checklist_versions.md) <!-- split-nav -->
 ## 4. Config 完整參考
 
-`McabConfig` 只放 **flow 的參數**（格點、共用 delay 的對齊方式、是否要 fuse）。lane 的參數（preset、`filter_length`…）
+`McabConfig` 只放 **flow 的參數**（格點、共用 delay 的對齊方式、是否要 fuse）。lane 的參數（level、`filter_length`…）
 是應用自己的 `AecConfig`，不在 `McabConfig` 裡，flow 只用 `mcab_apply_lane_contract()` 蓋上契約欄位（見 [§4.1](#41-逐欄位)）。
 取得預設值的唯一正確方式：
 
@@ -30,7 +30,7 @@ McabConfig cfg = mcab_default_config(16000);
 | `delay_est_period_s` | `float` | `0.0` | 有限值，`[0.0, 3600.0]` | 共用 matched-filter 的 duty-cycle 週期：`0.0` = 每 hop 全速分析；正值時估計 solid 且不變 0.3 s（`DUTY_HOLD_S`，固定）後，改為每 round(`delay_est_period_s`/hop 時長) 除以 5（整數除法，最小 1）個 hop 分析一次，省算力但可能鎖到不同的 lag。同一個值也由 `mcab_apply_lane_contract()` 蓋進每條 lane 的 `delay_est_period_s` |
 | `enable_post` | `int`（bool） | `1` | 只接受 `0` 或 `1` | `1` = mcab 的 pool carve fuse 緩衝，可呼叫 `mcab_fuse()`；`0` = front-only（只有 `mcab_process_front()`，`mcab_fuse()` 回 `MCAB_INVALID_ARGUMENT`），給從不 fuse 的應用（例如 ULCNet）。見 4.6b |
 
-**lane 的 `AecConfig`（應用的決定）**：`mcab_apply_lane_contract(&cfg, &lane)` 只蓋下面這些契約欄位，其餘（preset 的數值、`filter_length` …）照你給的，重複呼叫結果相同：
+**lane 的 `AecConfig`（應用的決定）**：`mcab_apply_lane_contract(&cfg, &lane)` 只蓋下面這些契約欄位，其餘（level 的數值、`filter_length` …）照你給的，重複呼叫結果相同：
 
 | `AecConfig` 欄位 | 契約值 |
 |---|---|
@@ -41,14 +41,14 @@ McabConfig cfg = mcab_default_config(16000);
 | `delay_est_period_s` | `cfg.delay_est_period_s` |
 
 回 `-1` 且 lane 不變：`cfg` 無效，或 lane 是為別的取樣率建的。`mcab_lane_config(&cfg, &out)` 是預設 lane：
-`aec_config_from_preset(AEC_PRESET_BALANCED, cfg.sample_rate)` 再蓋契約。`mcab_init_ex()` 驗證不了這些欄位的來源
+`aec_config_from_level(AEC_LEVEL_BALANCED, cfg.sample_rate)` 再蓋契約。`mcab_init_ex()` 驗證不了這些欄位的來源
 （`Aec` 沒有 config getter），所以 lane 的契約欄位只能靠這個函式蓋，不要手寫。
 
-`McabConfig` **沒有** RES、NR、comfort noise 或 preset 的設定欄位：`aec_preset`、`nr_mode`、`enable_res`、`enable_nr`、
+`McabConfig` **沒有** RES、NR、comfort noise 或 level 的設定欄位：`aec_level`、`nr_level`、`enable_res`、`enable_nr`、
 `enable_cng`、`legacy_amin` 都不在其中（lane 一律只算線性殘留）。
-這些屬於你的後級串接（例如 `mcab_external_static.c` 的 `--no-res`、`--nr-preset`、`--no-cng`、`--legacy-amin` 旗標對應的選項；
-它的位置參數 `[aec-preset]` 選的是後級 `AecRes` 的 preset，lane 本身固定 balanced）：
-RES 用 `aec_config_from_preset(&res_cfg, preset, sample_rate)` 配上 `mcab_fft_size()` 解析出的 `fft_size` 建 `AecRes`，NR 用 `anr_config_for_mode_grid()`。
+這些屬於你的後級串接（例如 `mcab_external_static.c` 的 `--no-res`、`--nr-level`、`--no-cng`、`--legacy-amin` 旗標對應的選項；
+它的位置參數 `[aec-level]` 選的是後級 `AecRes` 的 level，lane 本身固定 balanced）：
+RES 用 `aec_config_from_level(&res_cfg, level, sample_rate)` 配上 `mcab_fft_size()` 解析出的 `fft_size` 建 `AecRes`，NR 用 `anr_config_for_level_grid()`。
 
 `McabLibs`（`mcab_init_ex()` 的第四個參數）：`lanes[4]` 是四個不同的 `Aec*`，`delay` 是 MATCHED 時的 `DelayAec*`、其餘模式必須是 `NULL`；
 struct 在 init 時複製，裡面的物件是**借用**，壽命必須涵蓋 `Mcab`。

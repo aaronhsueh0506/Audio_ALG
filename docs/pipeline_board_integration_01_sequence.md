@@ -31,11 +31,11 @@ Firmware         Aec (mono) | Aec x4, DelayAec, Mcab       AnrDenoiser          
 
 | | Public (the firmware calls these) | Internal (do not call or include) |
 |---|---|---|
-| Mono | `aec_resolve_signal_grid()`/`aec_config_from_preset()`, `aec_get_mem_size()`/`aec_init()`, `anr_get_mem_size()`/`anr_init()`, `ac_istft_get_mem_size()`/`ac_istft_init()`, `aec_process_context()`, `aec_get_res_context()`, `anr_process_gain()`/`anr_get_gain()`, `aec_cng_fill()`, `ac_istft_push()`, resets, destroys, `aec_set_preset()`, `anr_set_mode()` | AEC headers other than `aec.h`/`aec_res.h`, NR `noise_estimator.h`/`spp_estimator.h`/`anr_internal.h` |
+| Mono | `aec_resolve_signal_grid()`/`aec_config_from_level()`, `aec_get_mem_size()`/`aec_init()`, `anr_get_mem_size()`/`anr_init()`, `ac_istft_get_mem_size()`/`ac_istft_init()`, `aec_process_context()`, `aec_get_res_context()`, `anr_process_gain()`/`anr_get_gain()`, `aec_cng_fill()`, `ac_istft_push()`, resets, destroys, `aec_set_level()`, `anr_set_level()` | AEC headers other than `aec.h`/`aec_res.h`, NR `noise_estimator.h`/`spp_estimator.h`/`anr_internal.h` |
 | 4-channel | `mcab.h` (`mcab_*`), `aec.h` for the lanes, `delay_aec_get_mem_size()`/`delay_aec_init()` for the estimator, plus the same post libraries | `mcab_internal.h`; `bf.h`/`srp.h` and `audiolib/{doa,bf}` (used by the sample helper `mcab_sample_beam` only) |
 
 Parameters: what a third party may tune (grid and rate, `filter_length`, delay mode and bank size,
-presets and modes, array geometry and `num_angles` of the sample helper) and what stays inside
+AEC and NR levels, array geometry and `num_angles` of the sample helper) and what stays inside
 (time constants, step sizes, detector thresholds, DOA/BF recursion constants, NR tracker constants)
 is classified field by field in section 0.3 of the three manuals above.
 
@@ -77,9 +77,9 @@ aligned (the libraries assert this).
 ```
 1. query    AecSignalGrid grid;  AecConfig aec_cfg;
             if (!aec_resolve_signal_grid(sample_rate, aec_default_fft_size(sample_rate), &grid)) fail;  // 0 = no such grid
-            aec_config_from_preset(&aec_cfg, preset, sample_rate);   // then fft_size = grid.fft_size, enable_res = 0,
+            aec_config_from_level(&aec_cfg, level, sample_rate);    // then fft_size = grid.fft_size, enable_res = 0,
                                                                     // return_res_context = 1 (see mono_aec_nr_res/main.c derive_lane())
-            AnrConfig nr_cfg = anr_config_for_mode_grid(sample_rate, grid.fft_size, mode);
+            AnrConfig nr_cfg = anr_config_for_level_grid(sample_rate, grid.fft_size, level);
             AcStftConfig synth_cfg;  ac_stft_config_default(&synth_cfg, grid.fft_size);
             size_t aec_bytes   = aec_get_mem_size(&aec_cfg);       // 0 = invalid
             size_t nr_bytes    = anr_get_mem_size(&nr_cfg);        // 0 = invalid
@@ -137,8 +137,8 @@ estimator are the application's. Query, init and teardown:
 ```
 1. query    McabConfig cfg = mcab_default_config(sample_rate);
             cfg.delay_mode/delay_num_filters/capture_proxy_channel/enable_post = ...;
-            AecConfig lane;   mcab_lane_config(&cfg, &lane);      // balanced preset + the flow contract;
-                              // or aec_config_from_preset() + your own fields + mcab_apply_lane_contract(&cfg, &lane)
+            AecConfig lane;   mcab_lane_config(&cfg, &lane);      // balanced level + the flow contract;
+                              // or aec_config_from_level() + your own fields + mcab_apply_lane_contract(&cfg, &lane)
             McabDelayEstimatorConfig dc;  mcab_delay_estimator_config(&cfg, &dc);   // dc.required: MATCHED only
             size_t lane_bytes = aec_get_mem_size(&lane);                            // 0 = invalid
             size_t delay_bytes = dc.required ? delay_aec_get_mem_size(dc.sample_rate, dc.hop_size, dc.num_filters) : 0;
@@ -164,7 +164,7 @@ estimator are the application's. Query, init and teardown:
 
    (The beamformer, post-beam RES, NR and synthesis, the neural stage or DFN2 stage and bridge are separate
     objects with their own size queries and inits: the sample helper mcab_sample_beam_get_mem_size /
-    mcab_sample_beam_init (SRP-PHAT, BF), aec_config_from_preset + aec_res_get_mem_size / aec_res_init
+    mcab_sample_beam_init (SRP-PHAT, BF), aec_config_from_level + aec_res_get_mem_size / aec_res_init
     (config fft_size = mcab_fft_size(p); no destroy), anr_get_mem_size / anr_init,
     ac_istft_get_mem_size / ac_istft_init, ulcnet_nn_stage_mem_size / _init,
     dfn_rate_bridge_get_mem_requirements / dfn_rate_bridge_init; mcab holds no RES)

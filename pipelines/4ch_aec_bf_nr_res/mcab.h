@@ -14,8 +14,8 @@
  *
  * Init sequence (every object in caller memory, no heap anywhere):
  *     McabConfig cfg = mcab_default_config(16000);
- *     AecConfig lane;  aec_config_from_preset(&lane, preset, 16000);   // the application's lane:
- *     lane.filter_length = ...;                                        // preset, filter length, ...
+ *     AecConfig lane;  aec_config_from_level(&lane, level, 16000);   // the application's lane:
+ *     lane.filter_length = ...;                                        // level, filter length, ...
  *     mcab_apply_lane_contract(&cfg, &lane);    // (mcab_lane_config(): the balanced default)
  *     McabLibs libs = {0};
  *     for each ch: libs.lanes[ch] = aec_init(mem_ch, aec_get_mem_size(&lane), &lane);
@@ -31,7 +31,7 @@
  * linear context without a gain of its own (enable_res = 0, return_res_context = 1), that its
  * post half matches cfg.enable_post, that it consumes an already aligned far (EXTERNAL_ALIGNED
  * reports a locked zero offset) and that the four are distinct; the estimator's bank size, rate
- * and 48 kHz scratch. Aec has no config getter: the lane parameters (preset, filter length, ...)
+ * and 48 kHz scratch. Aec has no config getter: the lane parameters (level, filter length, ...)
  * are the application's and are not checked, and the contract fields are only as right as the
  * mcab_apply_lane_contract() call that stamped them.
  *
@@ -88,7 +88,7 @@ typedef enum McabStatus {
     MCAB_DSP_ERROR = -3           /* a stage refused the hop; the flow has been reset        */
 } McabStatus;
 
-/** The flow's parameters. The lane parameters (preset, filter length, ...) are not here: the
+/** The flow's parameters. The lane parameters (level, filter length, ...) are not here: the
  * application composes each lane's AecConfig and stamps this flow's contract onto it with
  * mcab_apply_lane_contract(). */
 typedef struct McabConfig {
@@ -217,12 +217,12 @@ McabConfig mcab_default_config(int sample_rate);
  * grid, delay_mode = EXTERNAL_ALIGNED (delay_num_filters = DA_NUM_FILTERS,
  * fixed_delay_samples = -1, enable_delay_est = 0), enable_res = 0, return_res_context = 1,
  * spatial_linear_context = AEC_CONTEXT_NO_GAIN with cfg.enable_post, else
- * AEC_CONTEXT_LINEAR_ONLY, delay_est_period_s = cfg's. Every other field (preset values,
+ * AEC_CONTEXT_LINEAR_ONLY, delay_est_period_s = cfg's. Every other field (level values,
  * filter_length, ...) is left as given; idempotent. -1 (lane unchanged) for an invalid cfg or a
  * lane built for another sample rate. */
 int mcab_apply_lane_contract(const McabConfig* cfg, AecConfig* lane);
 
-/** The default lane: aec_config_from_preset(balanced, cfg rate) + mcab_apply_lane_contract(). */
+/** The default lane: aec_config_from_level(balanced, cfg rate) + mcab_apply_lane_contract(). */
 int mcab_lane_config(const McabConfig* cfg, AecConfig* out);
 
 /** The shared estimator's (sample_rate, hop_size, num_filters); required only in MATCHED. */

@@ -8,7 +8,7 @@
  *
  * The chain follows the rules of the applications: a disabled gain source reads as the unity
  * vector, and the comfort-noise fill runs only with a suppressor and enable_cng. RES strength
- * and the denoiser preset come from ConvChainOptions, not from the front end's config. The
+ * and the denoiser level come from ConvChainOptions, not from the front end's config. The
  * stage objects share one heap block. Test code only: heap, no error recovery beyond the
  * status codes. */
 #ifndef CONV_CHAIN_MCAB_H
@@ -31,8 +31,8 @@
 #define CONV_MCAB_CNG_RNG_SEED 0x9e3779b9u
 
 typedef struct ConvChainOptions {
-    AecPreset aec_preset;      /* RES gain floors */
-    AnrMode nr_mode;
+    AecLevel aec_level;      /* RES gain floors */
+    AnrLevel nr_level;
     int enable_res;            /* 0: G_res is unity and CNG has nothing to fill */
     int enable_nr;
     int enable_cng;
@@ -41,8 +41,8 @@ typedef struct ConvChainOptions {
 
 static inline ConvChainOptions conv_default_options(void) {
     ConvChainOptions o;
-    o.aec_preset = AEC_PRESET_BALANCED;
-    o.nr_mode = ANR_MODE_BALANCED;
+    o.aec_level = AEC_LEVEL_BALANCED;
+    o.nr_level = ANR_LEVEL_BALANCED;
     o.enable_res = 1;
     o.enable_nr = 1;
     o.enable_cng = 1;
@@ -70,11 +70,11 @@ typedef struct ConvChain {
     McabFront front;
 } ConvChain;
 
-/* The denoiser configuration of the conventional chain: the canonical preset for `mode` on a
+/* The denoiser configuration of the conventional chain: the canonical level for `level` on a
  * no-padding 50 % overlap grid, with the 512 ms minimum window written out in whole hops
- * rather than taken from the preset. */
-static inline AnrConfig conv_nr_config(int sample_rate, int fft_size, int hop, AnrMode mode) {
-    AnrConfig nr_cfg = anr_config_for_mode_grid(sample_rate, fft_size, mode);
+ * rather than taken from the level. */
+static inline AnrConfig conv_nr_config(int sample_rate, int fft_size, int hop, AnrLevel level) {
+    AnrConfig nr_cfg = anr_config_for_level_grid(sample_rate, fft_size, level);
     nr_cfg.L = (512 * sample_rate + 1000 * hop - 1) / (1000 * hop);
     return nr_cfg;
 }
@@ -110,9 +110,9 @@ static inline ConvChain* conv_attach(Mcab* core, const McabConfig* cfg,
     c->n_freqs = mcab_n_freqs(c->core);
     c->hop = mcab_hop_size(c->core);
     fft = mcab_fft_size(c->core);
-    aec_config_from_preset(&res_cfg, c->opt.aec_preset, cfg->sample_rate);
+    aec_config_from_level(&res_cfg, c->opt.aec_level, cfg->sample_rate);
     res_cfg.fft_size = fft;
-    nr_cfg = conv_nr_config(cfg->sample_rate, fft, c->hop, c->opt.nr_mode);
+    nr_cfg = conv_nr_config(cfg->sample_rate, fft, c->hop, c->opt.nr_level);
     ac_stft_config_default(&scfg, fft);
     res_b = ALIGN16(aec_res_get_mem_size(&res_cfg));
     nr_b = c->opt.enable_nr ? ALIGN16(anr_get_mem_size(&nr_cfg)) : 0;

@@ -145,8 +145,8 @@ static int dfn_plan(DfnSample *s) {
         mcab_sample_beam_get_mem_size(&s->unit_cfg,&s->unit_bp,&s->beam_bytes) != 0 ||
         !isfinite(s->args.atten_lim_db))
         return -1;
-    /* The RES: the balanced preset's AecConfig on the unit's grid. */
-    aec_config_from_preset(&s->res_cfg,AEC_PRESET_BALANCED,s->args.sample_rate);
+    /* The RES: the balanced level's AecConfig on the unit's grid. */
+    aec_config_from_level(&s->res_cfg,AEC_LEVEL_BALANCED,s->args.sample_rate);
     s->res_cfg.fft_size=s->grid.fft_size;
     s->res_bytes=aec_res_get_mem_size(&s->res_cfg);
     if (s->res_bytes == 0) return -1;

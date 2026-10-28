@@ -48,8 +48,8 @@ th{background:#eef5f0}
 <pre>應用(main)                  Aec(lib/aec)            AnrDenoiser(lib/nr)     AcIstft(audiolib)
    │                              │                          │                       │
    │═ ① 建立(一次;此後 hop 路徑零 heap)═══════════════════════════════════════════
-   │ derive_lane(sr,fft,preset,&amp;grid,&amp;aec_cfg)              main.c 內: 0=ok, -1=拒絕(格點);aec_resolve_signal_grid + aec_config_from_preset
-   │ anr_config_for_mode_grid(sr, grid.fft_size, mode) -&gt; nr_cfg      ac_stft_config_default(&amp;syn_cfg, fft)
+   │ derive_lane(sr,fft,level,&amp;grid,&amp;aec_cfg)              main.c 內: 0=ok, -1=拒絕(格點);aec_resolve_signal_grid + aec_config_from_level
+   │ anr_config_for_level_grid(sr, grid.fft_size, level) -&gt; nr_cfg      ac_stft_config_default(&amp;syn_cfg, fft)
    │── aec_get_mem_size ───────►│  0=無效                  │                       │
    │── anr_get_mem_size ─────────────────────────────────►│  0=無效               │
    │── ac_istft_get_mem_size ───────────────────────────────────────────────────►│  0=無效
@@ -89,7 +89,7 @@ th{background:#eef5f0}
    │                       │  任何失敗一律靜默回 NULL(無診斷輸出)       (以上 = mcab_sample_flow_init)
    │── mcab_sample_beam_get_mem_size → mcab_sample_beam_init(mem,bytes,&amp;cfg,&amp;bp,flow) ►│ carve: self, srp, bf, bf_spectrum, bf_weights;NULL=拒絕
    │ RES / NR / 合成另開一塊 post pool(應用自己的 init):
-   │   aec_config_from_preset(&amp;res_cfg,preset,sr); res_cfg.fft_size = mcab_fft_size(flow)
+   │   aec_config_from_level(&amp;res_cfg,level,sr); res_cfg.fft_size = mcab_fft_size(flow)
    │── aec_res_get_mem_size → aec_res_init(post,...) ►│ 0 / NULL = 無效或 pool 過小;沒有 destroy
    │ anr_init、ac_istft_init(同 mono 的 ①)
    │
@@ -109,15 +109,15 @@ th{background:#eef5f0}
    │
    │═ ③ 錯誤 / 換串流 ═════════════════════════════════════════════════════════════
    │── mcab_sample_beam_reset(b) ►│(flow: 4 lanes＋estimator;SRP, BF, fallback VAD)
-   │── aec_res_reset(res) (preset 保留);  anr_reset(nr);  ac_istft_reset(istft);  rng=MCAB_SAMPLE_CNG_RNG_SEED   ← 應用自己的後級
+   │── aec_res_reset(res) (level 保留);  anr_reset(nr);  ac_istft_reset(istft);  rng=MCAB_SAMPLE_CNG_RNG_SEED   ← 應用自己的後級
    │
    │═ ④ 結束 ═══════════════════════════════════════════════════════════════════════
    │ anr_destroy(nr); mcab_sample_beam_destroy(b); mcab_destroy(flow); aec_destroy ×4; platform_free(post, flow 區塊, helper pool)
    │ (AecRes 沒有 destroy;mcab_destroy 不碰 lane 與 estimator,所以拆除順序是 helper → mcab → lane;mcab_sample_flow_destroy 含後兩步)</pre>
-<p>RES 強度在執行期用 <code>aec_res_set_preset(res, preset, ramp_ms)</code>(<code>res</code> 是應用自備的 <code>AecRes</code>),NR 用 <code>anr_set_mode(nr, mode)</code>,兩者都在兩個 hop 之間呼叫;見 <a href="pipeline_4ch_detail.html">pipeline_4ch_detail</a>。</p>
+<p>RES 強度在執行期用 <code>aec_res_set_level(res, level, ramp_ms)</code>(<code>res</code> 是應用自備的 <code>AecRes</code>),NR 用 <code>anr_set_level(nr, level)</code>,兩者都在兩個 hop 之間呼叫;見 <a href="pipeline_4ch_detail.html">pipeline_4ch_detail</a>。</p>
 
 <h2>3. 4ch:mcab + 外部 beamformer(產品自己的波束器,不用 helper)</h2>
-<p>波束器在別處時不需要 helper:<code>mcab_fuse(p, weights, beamformed_error, frame)</code> 就是外部權重的入口,RES 由應用自備 <code>AecRes</code>(<code>aec_res_get_mem_size()</code>／<code>aec_res_init()</code>,config 由 <code>aec_config_from_preset()</code> 在同一個 fft 上取得)。範例:<code>mcab_external_static.c</code>(權重為每個 bin 皆 1/4 的等權佔位)。</p>
+<p>波束器在別處時不需要 helper:<code>mcab_fuse(p, weights, beamformed_error, frame)</code> 就是外部權重的入口,RES 由應用自備 <code>AecRes</code>(<code>aec_res_get_mem_size()</code>／<code>aec_res_init()</code>,config 由 <code>aec_config_from_level()</code> 在同一個 fft 上取得)。範例:<code>mcab_external_static.c</code>(權重為每個 bin 皆 1/4 的等權佔位)。</p>
 <pre>應用            Mcab(flow)                 外部 BF(產品自己的)        AecRes(應用自備)  AnrDenoiser  AcIstft
  │── mcab_process_front(p,mics,ref,&amp;front) ►│ 共用 delay + 4 lanes
  │   front.linear_spectra[4] / formed_hop[4] / aligned_ref / delay(delay.changed 非零 ⇒ 外部 STFT/OLA 歷史須清)

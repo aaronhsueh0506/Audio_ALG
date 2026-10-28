@@ -17,7 +17,7 @@ BIN="$(make -s print-bin-dir)"
 # Run Version A (split pool: the AEC block and a post-stage block)
 "$BIN"/aec_nr_pipeline mic.wav ref.wav output.wav balanced
 "$BIN"/aec_nr_pipeline mic.wav ref.wav output.wav --aec-only
-"$BIN"/aec_nr_pipeline mic.wav ref.wav output.wav aggressive --nr-preset aggressive
+"$BIN"/aec_nr_pipeline mic.wav ref.wav output.wav aggressive --nr-level aggressive
 
 # Run Version B (one caller pool) — same CLI, plus a mem-size query mode
 "$BIN"/aec_nr_pipeline_static mic.wav ref.wav output.wav balanced
@@ -203,7 +203,7 @@ allocation ever, end to end, not just on the per-hop audio path.
 
 ## Board Integration
 
-沒有 mono 函式庫 TU：板端自己用 `aec_resolve_signal_grid()` 與 `aec_config_from_preset()` 導出 grid 與 `AecConfig`
+沒有 mono 函式庫 TU：板端自己用 `aec_resolve_signal_grid()` 與 `aec_config_from_level()` 導出 grid 與 `AecConfig`
 （再設接縫欄位 `enable_res = 0`、`return_res_context = 1` 等），查
 `aec_get_mem_size()`、`anr_get_mem_size()` 與 `ac_istft_get_mem_size()`，加上每 hop 的
 增益／頻譜緩衝，把各塊切在自己的 pool 裡，再逐個 `init`

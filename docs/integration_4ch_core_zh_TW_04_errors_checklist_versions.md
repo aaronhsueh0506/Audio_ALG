@@ -110,7 +110,7 @@ sample 層檔案（範例碼，**不在** archive 內，沒有 ABI、沒有 layo
 
 | Source | 是什麼 | 為什麼存在 |
 |---|---|---|
-| `pipelines/4ch_aec_bf_nr_res/mcab_external_static.c`（執行檔 `mcab_external_static`） | caller-owned pool 路徑的主機參考程式 | 示範 `aec_config_from_preset`（balanced）＋ `mcab_apply_lane_contract` → `aec_init` ×4 → `delay_aec_init` → `mcab_init_ex`（`flow_plan()`／`flow_init()`）→ `mcab_process_front` → `mcab_fuse` → 明寫的 stage 串接（`post_hop()`，它自己建一個 `AecRes`） → 拆除（`flow_destroy()`）→ release。它在 front/fuse 之間塞的是**固定等權重**，那是決定性的 smoke adapter，**不是** production beamformer |
+| `pipelines/4ch_aec_bf_nr_res/mcab_external_static.c`（執行檔 `mcab_external_static`） | caller-owned pool 路徑的主機參考程式 | 示範 `aec_config_from_level`（balanced）＋ `mcab_apply_lane_contract` → `aec_init` ×4 → `delay_aec_init` → `mcab_init_ex`（`flow_plan()`／`flow_init()`）→ `mcab_process_front` → `mcab_fuse` → 明寫的 stage 串接（`post_hop()`，它自己建一個 `AecRes`） → 拆除（`flow_destroy()`）→ release。它在 front/fuse 之間塞的是**固定等權重**，那是決定性的 smoke adapter，**不是** production beamformer |
 | `pipelines/4ch_aec_bf_nr_res/mcab_static.c`（`mcab_static`） | 同一個 flow 加 sample 層 SRP-PHAT／BF helper、RES（libaec `AecRes`）／NR／合成的 pool 路徑主機參考程式 | 屬於另一份手冊；列在這裡是為了讓目錄內容一目了然 |
 | `pipelines/4ch_aec_bf_nr_res/mcab_raw.c`（`mcab_raw`） | raw-float 錄音驗證 runner（flow 加 helper 加 RES／NR／合成） | 主機一次性工具；四條 lane、estimator、mcab 的 pool 與 helper 放在一塊 `posix_memalign` 配置的記憶體，後級 stage 另一塊 |
 
@@ -145,7 +145,7 @@ sample 層檔案（範例碼，**不在** archive 內，沒有 ABI、沒有 layo
 初始化：
 
 - [ ] 每次 init 之前都重新呼叫 `mcab_get_mem_requirements()`，lane 與 estimator 也各自重查 `get_mem_size`
-- [ ] 四條 lane 是**四個不同**的 `Aec`，config 由 `mcab_lane_config()`（或 `aec_config_from_preset()` ＋ `mcab_apply_lane_contract()`）產生（`aec_config_from_preset()` 對 8000／16000／48000 以外的取樣率回傳 `fft_size`、`filter_length` 皆為 0 的設定，`aec_get_mem_size()` 回 0、`aec_init()` 回 NULL）；MATCHED 時給 `McabLibs.delay`，其他模式給 `NULL`
+- [ ] 四條 lane 是**四個不同**的 `Aec`，config 由 `mcab_lane_config()`（或 `aec_config_from_level()` ＋ `mcab_apply_lane_contract()`）產生（`aec_config_from_level()` 對 8000／16000／48000 以外的取樣率回傳 `fft_size`、`filter_length` 皆為 0 的設定，`aec_get_mem_size()` 回 0、`aec_init()` 回 NULL）；MATCHED 時給 `McabLibs.delay`，其他模式給 `NULL`
 - [ ] lane 與 estimator 是剛建好的，或已經 reset 過（`aec_reset()`／`delay_aec_reset()`，或先前那個 flow 的 `mcab_reset()`）
 - [ ] pool 對齊 16、大小 ≥ `req.bytes`
 - [ ] 用 `mcab_init_ex()` 並把剛查到的 `req` 當 `expected` 傳回去

@@ -104,7 +104,7 @@ static int run_accelerator(void *user,
 
 /* The mono lane on the compiled grid: the linear context only; the stage takes the formed hop. */
 static void derive_lane(const ExampleCliDelayOptions* profile, AecConfig* aec_cfg) {
-    aec_config_from_preset(aec_cfg, AEC_PRESET_BALANCED, ULCNET_SR);
+    aec_config_from_level(aec_cfg, AEC_LEVEL_BALANCED, ULCNET_SR);
     aec_cfg->fft_size = ULCNET_N_FFT;
     aec_cfg->delay_mode = profile->mode;
     aec_cfg->delay_num_filters = profile->num_filters;

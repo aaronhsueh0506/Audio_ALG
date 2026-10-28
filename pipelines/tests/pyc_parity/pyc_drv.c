@@ -21,7 +21,7 @@
  *     stage -> min -> apply -> comfort noise -> synthesis), every hop dumped in the seam format below. Stops at the first non-zero
  *     status of the core or the chain, recording it in the header; the Python side treats that as
  *     a result.
- *     aec=no_floor is accepted like the other presets.
+ *     aec=no_floor is accepted like the other levels.
  *   mono   mic=F ref=F sr=N fft=N out=F [aec=..] [nr=..] [legacy_amin=0|1] [enable_cng=0|1]
  *     Aec + aec_get_res_context + the chain as mono_aec_nr_res/main.c composes them, with the AEC
  *     seam read back after each hop. The chain applies the lane's own RES gain (frame gain).
@@ -75,16 +75,16 @@
 typedef struct Args {
     const char *mic, *ref, *out, *seam, *usable;
     int sr, fft, legacy_amin, enable_nr, enable_res, enable_cng;
-    AecPreset aec;
-    AnrMode nr;
+    AecLevel aec;
+    AnrLevel nr;
 } Args;
 
 static int parse_args(int argc, char** argv, Args* a) {
     int i;
     memset(a, 0, sizeof(*a));
     a->enable_nr = a->enable_res = a->enable_cng = 1;
-    a->aec = AEC_PRESET_BALANCED;
-    a->nr = ANR_MODE_BALANCED;
+    a->aec = AEC_LEVEL_BALANCED;
+    a->nr = ANR_LEVEL_BALANCED;
     for (i = 2; i < argc; ++i) {
         char* eq = strchr(argv[i], '=');
         const char *k = argv[i], *v;
@@ -102,17 +102,17 @@ static int parse_args(int argc, char** argv, Args* a) {
         else if (!strcmp(k, "enable_res")) a->enable_res = atoi(v);
         else if (!strcmp(k, "enable_cng")) a->enable_cng = atoi(v);
         else if (!strcmp(k, "aec")) {
-            a->aec = !strcmp(v, "mild") ? AEC_PRESET_MILD
-                   : !strcmp(v, "aggressive") ? AEC_PRESET_AGGRESSIVE
-                   : !strcmp(v, "no_floor") ? AEC_PRESET_NO_FLOOR : AEC_PRESET_BALANCED;
+            a->aec = !strcmp(v, "mild") ? AEC_LEVEL_MILD
+                   : !strcmp(v, "aggressive") ? AEC_LEVEL_AGGRESSIVE
+                   : !strcmp(v, "no_floor") ? AEC_LEVEL_NO_FLOOR : AEC_LEVEL_BALANCED;
             if (strcmp(v, "mild") && strcmp(v, "aggressive") && strcmp(v, "balanced")
                 && strcmp(v, "no_floor")) {
-                fprintf(stderr, "unknown aec preset %s\n", v); return -1;
+                fprintf(stderr, "unknown aec level %s\n", v); return -1;
             }
         } else if (!strcmp(k, "nr")) {
-            int m = anr_nr_mode_from_name(v);
-            if (m < 0) { fprintf(stderr, "unknown nr preset %s\n", v); return -1; }
-            a->nr = (AnrMode)m;
+            int m = anr_nr_level_from_name(v);
+            if (m < 0) { fprintf(stderr, "unknown nr level %s\n", v); return -1; }
+            a->nr = (AnrLevel)m;
         } else { fprintf(stderr, "unknown key %s\n", k); return -1; }
     }
     return 0;
@@ -154,7 +154,7 @@ static void write_rec(FILE* f, int nf, int hop, const Complex* e, const Complex*
 }
 
 /* The chain behind the front end. The RES gain comes from the frame (POST_RES_FRAME), from a
- * separate AecRes at `preset` on the frame's grid (POST_RES_AECRES) or is the unity vector. */
+ * separate AecRes at `level` on the frame's grid (POST_RES_AECRES) or is the unity vector. */
 enum { POST_RES_OFF = 0, POST_RES_FRAME, POST_RES_AECRES };
 
 typedef struct Post {
@@ -175,8 +175,8 @@ static void post_destroy(Post* q) {
     memset(q, 0, sizeof(*q));
 }
 
-static int post_create(Post* q, int sr, int fft, int res_mode, AecPreset preset, int enable_nr,
-                       AnrMode mode, int use_r2, int enable_cng) {
+static int post_create(Post* q, int sr, int fft, int res_mode, AecLevel level, int enable_nr,
+                       AnrLevel nr_level, int use_r2, int enable_cng) {
     AecConfig rc;
     AnrConfig nc;
     AcStftConfig sc;
@@ -189,12 +189,12 @@ static int post_create(Post* q, int sr, int fft, int res_mode, AecPreset preset,
     q->use_r2 = use_r2;
     q->enable_cng = enable_cng;
     if (res_mode == POST_RES_AECRES) {
-        aec_config_from_preset(&rc, preset, sr);
+        aec_config_from_level(&rc, level, sr);
         rc.fft_size = fft;
         if ((res_b = aec_res_get_mem_size(&rc)) == 0) return -1;
     }
     if (enable_nr) {
-        nc = anr_config_for_mode_grid(sr, fft, mode);
+        nc = anr_config_for_level_grid(sr, fft, nr_level);
         if ((nr_b = anr_get_mem_size(&nc)) == 0) return -1;
     }
     ac_stft_config_default(&sc, fft);
@@ -369,7 +369,7 @@ static int run_chain(const Args* a) {
 static int derive_mono_lane(const Args* a, AecSignalGrid* grid, AecConfig* aec_cfg) {
     if (!aec_resolve_signal_grid(a->sr, a->fft ? a->fft : aec_default_fft_size(a->sr), grid))
         return -1;
-    aec_config_from_preset(aec_cfg, a->aec, a->sr);
+    aec_config_from_level(aec_cfg, a->aec, a->sr);
     aec_cfg->fft_size = grid->fft_size;
     aec_cfg->delay_mode = AEC_DELAY_MATCHED;
     aec_cfg->delay_num_filters = DA_NUM_FILTERS;
@@ -396,7 +396,7 @@ static int run_mono(const Args* a) {
     if (aec_bytes == 0 || posix_memalign(&aec_mem, 16, aec_bytes) != 0) { fprintf(stderr, "alloc failed\n"); return 1; }
     aec = aec_init(aec_mem, aec_bytes, &aec_cfg);
     if (!aec || post_create(&chain, a->sr, grid.fft_size,
-                            a->enable_res ? POST_RES_FRAME : POST_RES_OFF, AEC_PRESET_BALANCED,
+                            a->enable_res ? POST_RES_FRAME : POST_RES_OFF, AEC_LEVEL_BALANCED,
                             a->enable_nr, a->nr, !a->legacy_amin,
                             aec_cfg.enable_cng && a->enable_cng) != 0) {
         fprintf(stderr, "mono rig create failed\n");

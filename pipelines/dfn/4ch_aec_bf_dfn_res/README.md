@@ -9,7 +9,7 @@ shared `DelayAec`, and passes the pointers; mcab owns only its flow state. There
 library either. `main.c` builds the lanes, the estimator and mcab in one block with
 `mcab_sample_flow.h`, adds the sample SRP-PHAT/BF helper (`mcab_sample_beam.h`, not part of the mcab
 archive), initialises the post-beam `AecRes` (libaec: `aec_res_get_mem_size()` / `aec_res_init()`
-on the flow's grid, balanced preset), the gain and spectrum buffers of the RES path (no denoiser)
+on the flow's grid, balanced level), the gain and spectrum buffers of the RES path (no denoiser)
 and the DFN2 stage (or the rate bridge, sized and carved by `dfn/dfn_hop_pool.h`) separately,
 forms P in `dfn_form()`, and `dfn/dfn_hop.h` runs the network between the post-RES spectrum and
 the synthesis:
@@ -33,7 +33,7 @@ The skeleton uses the helper's own SRP-PHAT and BF, so `mcab_sample_beam_fuse()`
 BF's spectrum and weights. An application with its own beamformer calls `mcab_process_front()` and
 `mcab_fuse(p, W, E, &frame)` instead. `dfn_hop_process(&hop, frame.e, P, out)` is the sequence of
 the `dfn_hop_*` calls with the model callback (`dfn_res_stage_infer()` here) as the runner. The RES
-strength is `aec_res_set_preset(res, preset, ramp_ms)` on the example's own `AecRes`. The example
+strength is `aec_res_set_level(res, level, ramp_ms)` on the example's own `AecRes`. The example
 owns its RES, gain scratch and comfort-noise state and the ISTFT in the `DfnHop`: mcab carries none
 of them, and a refused call resets the helper (and with it the flow), the `AecRes`, the
 comfort-noise generator and the `DfnHop` together (`dfn_reset()` in `main.c`). The
@@ -124,7 +124,7 @@ current model-v6/feature-v5.
 App          McabSampleFlow + Mcab   McabSampleBeam   libaec AecRes   DfnHop + DfnResStage | DfnRateBridge   AcIstft (48 kHz only)
  |-- mcab_default_config; mcab_get_mem_requirements / _breakdown; mcab_sample_flow_get_mem_size / _init -->|
  |-- mcab_sample_beam_default_params; mcab_sample_beam_get_mem_size / _init(flow) -->|
- |-- aec_config_from_preset (fft_size = mcab_get_mem_breakdown().fft_size); aec_res_get_mem_size; aec_res_init -->|
+ |-- aec_config_from_level (fft_size = mcab_get_mem_breakdown().fft_size); aec_res_get_mem_size; aec_res_init -->|
  |-- dfn_hop_pool_plan / dfn_hop_pool_build: dfn_res_stage_* (48 kHz) or dfn_rate_bridge_* (16 kHz), dfn_hop_init_*
  |   per hop: mcab_sample_beam_process --> mcab_sample_beam_fuse --> aec_res_process(res, &in) --> P = E * min(1, G_res) (dfn_form())
  |            --> dfn_hop_begin(E, P) --> while (dfn_hop_nn_begin == 1) { model; dfn_hop_nn_end } --> dfn_hop_end --> out
@@ -137,7 +137,7 @@ External parameters: the same board-skeleton flags as the mono variant (`--sampl
 48000, delay profile, `--erb-fwd` / `--erb-inv`, `--atten-lim`, `--cng`), plus the flow's `McabConfig`
 (delay profile, `capture_proxy_channel`, `enable_post`) and the helper's `McabSampleBeamParams`
 (array geometry, `num_angles`; the skeleton uses the default 35 mm UCA, which a
-product replaces with the measured one) and `aec_res_set_preset(res, ...)` on the example's own `AecRes`.
+product replaces with the measured one) and `aec_res_set_level(res, ...)` on the example's own `AecRes`.
 Internal: the helper's BF / DOA / VAD constants (section 0.3 of
 [`../../../docs/integration_4ch_spatial_zh_TW.md`](../../../docs/integration_4ch_spatial_zh_TW.md)), the stage
 grid and scale constants, the bridge FIR and schedule.

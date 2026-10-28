@@ -42,7 +42,7 @@ th{background:#eef2f8}
 <h2>1. 呼叫順序</h2>
 <table>
 <tr><th>階段</th><th>mono(<code>mono_alignulcnet</code>)</th><th>4ch(<code>4ch_alignulcnet</code>)</th></tr>
-<tr><td>設定</td><td><code>aec_config_from_preset(&amp;cfg, AEC_PRESET_BALANCED, ULCNET_SR)</code> 加 <code>fft_size = ULCNET_N_FFT</code>、<code>delay_*</code>、<code>enable_res = 0</code>、<code>return_res_context = 1</code>、<code>spatial_linear_context = AEC_CONTEXT_LINEAR_ONLY</code>(<code>main.c</code> 的 <code>derive_lane()</code>)</td><td><code>mcab_default_config(ULCNET_SR)</code>;<code>fft_size = ULCNET_N_FFT</code>、<code>enable_post = 0</code>、<code>delay_*</code>;helper 參數 <code>mcab_sample_beam_default_params()</code></td></tr>
+<tr><td>設定</td><td><code>aec_config_from_level(&amp;cfg, AEC_LEVEL_BALANCED, ULCNET_SR)</code> 加 <code>fft_size = ULCNET_N_FFT</code>、<code>delay_*</code>、<code>enable_res = 0</code>、<code>return_res_context = 1</code>、<code>spatial_linear_context = AEC_CONTEXT_LINEAR_ONLY</code>(<code>main.c</code> 的 <code>derive_lane()</code>)</td><td><code>mcab_default_config(ULCNET_SR)</code>;<code>fft_size = ULCNET_N_FFT</code>、<code>enable_post = 0</code>、<code>delay_*</code>;helper 參數 <code>mcab_sample_beam_default_params()</code></td></tr>
 <tr><td>模型 descriptor</td><td><code>ulcnet_model_io_descriptor_default(D, &amp;desc)</code>(D 必須等於匯出時的 delay depth)</td><td>同左</td></tr>
 <tr><td>查大小</td><td><code>ulcnet_accelerator_adapter_get_mem_size()</code>、<code>aec_get_mem_size()</code>、<code>ulcnet_nn_stage_mem_size(1)</code></td><td><code>ulcnet_accelerator_adapter_get_mem_size()</code>、<code>mcab_get_mem_requirements()</code>、<code>mcab_sample_flow_get_mem_size()</code>、<code>mcab_sample_beam_get_mem_size()</code>、<code>ulcnet_nn_stage_mem_size(0)</code></td></tr>
 <tr><td>init</td><td><code>ulcnet_accelerator_adapter_init()</code>、<code>aec_init()</code>、<code>ulcnet_nn_stage_init(…, 1)</code></td><td><code>ulcnet_accelerator_adapter_init()</code>、<code>mcab_sample_flow_init()</code>、<code>mcab_sample_beam_init(…, flow)</code>、<code>ulcnet_nn_stage_init(…, 0)</code></td></tr>
@@ -70,7 +70,7 @@ extern void emit_hop(const float *out, int n);
 int mono_ulcnet_run(void) {
     /* 1. 固定格點(編譯期 ULCNET_SR / ULCNET_N_FFT)的 lane,只留線性 context */
     AecConfig aec_cfg;
-    aec_config_from_preset(&amp;aec_cfg, AEC_PRESET_BALANCED, ULCNET_SR);   /* 此鏈不使用其增益 */
+    aec_config_from_level(&amp;aec_cfg, AEC_LEVEL_BALANCED, ULCNET_SR);   /* 此鏈不使用其增益 */
     aec_cfg.fft_size = ULCNET_N_FFT;
     aec_cfg.delay_mode = AEC_DELAY_MATCHED;  aec_cfg.delay_num_filters = 5;
     aec_cfg.fixed_delay_samples = -1;  aec_cfg.enable_delay_est = 1;

@@ -97,7 +97,7 @@ static MonoDfn *mdfn_create(int sample_rate, int fft_size, int enable_cng, const
     if (!aec_resolve_signal_grid(sample_rate,
                                  fft_size ? fft_size : aec_default_fft_size(sample_rate), &grid))
         goto fail;
-    aec_config_from_preset(&lane, AEC_PRESET_BALANCED, sample_rate);
+    aec_config_from_level(&lane, AEC_LEVEL_BALANCED, sample_rate);
     lane.fft_size = grid.fft_size;
     lane.delay_mode = AEC_DELAY_MATCHED;
     lane.delay_num_filters = DA_NUM_FILTERS;
@@ -225,7 +225,7 @@ static int run_identity(int enable_cng) {
     dfn_res_stage_get_counters(dfn->stage, &frames, &commits, &skips);
     if (frames != TEST_FRAMES || commits != 0 || skips != TEST_FRAMES - DFN2_MASK_LOOKAHEAD)
         return 6;                             /* a reset would leave a gap */
-    if (aec_set_preset(dfn->aec, AEC_PRESET_AGGRESSIVE, 0.0f) != 0)
+    if (aec_set_level(dfn->aec, AEC_LEVEL_AGGRESSIVE, 0.0f) != 0)
         return 7;
     if (dfn_res_stage_set_atten_lim(dfn->stage, 12.0f) != 0 ||
         dfn_res_stage_set_atten_lim(dfn->stage, NAN) != -1)

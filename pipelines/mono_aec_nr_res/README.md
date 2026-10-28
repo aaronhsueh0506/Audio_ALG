@@ -5,9 +5,9 @@ There is no mono pipeline library and no mono wrapper module: the example compos
 (`ctx.res_gain`, read with `aec_get_res_context()` into an `AecResContext`), and the example writes the rest of the
 per-hop chain (the denoiser's gain in `mono_nr_gain()`, then `min`, apply, comfort noise, synthesis in
 `mono_form()`). Each library has its own `mem_size` and `init`; the example sums the
-sizes it needs (`aec_get_mem_size()`, `anr_get_mem_size()` with `anr_config_for_mode_grid()` and
+sizes it needs (`aec_get_mem_size()`, `anr_get_mem_size()` with `anr_config_for_level_grid()` and
 the library-default `L`, `ac_istft_get_mem_size()`, plus the gain and spectrum buffers). The grid and the
-`AecConfig` come from `derive_lane()` (`aec_resolve_signal_grid()`, `aec_config_from_preset()`, then the
+`AecConfig` come from `derive_lane()` (`aec_resolve_signal_grid()`, `aec_config_from_level()`, then the
 seam fields `enable_res = 0` and `return_res_context = 1`).
 
 The WAV runner is `main.c`; the same source builds two binaries. `aec_nr_pipeline_static` places
@@ -35,21 +35,21 @@ ac_istft_push(istft, spec, out);
 `CNG_NR_GAIN_FLOOR`, `CNG_RNG_SEED` and `PSD_SCALE_INV` are `#define`s at the top of `main.c` (and of
 `example_board_adapter.c`), not library constants.
 
-Strength: `aec_set_preset(aec, preset, ramp_ms)` for the AEC's RES gain,
-`anr_set_mode(anr, mode)` for the denoiser.
+Strength: `aec_set_level(aec, level, ramp_ms)` for the AEC's RES gain,
+`anr_set_level(anr, level)` for the denoiser.
 
 ## Calling sequence
 
 ```
 App                      Aec                 AnrDenoiser        AcIstft
- |-- aec_resolve_signal_grid + aec_config_from_preset + seam fields   (derive_lane())
+ |-- aec_resolve_signal_grid + aec_config_from_level + seam fields   (derive_lane())
  |-- aec_get_mem_size / aec_init ---->|                          (rig_build())
- |-- anr_config_for_mode_grid; anr_get_mem_size / anr_init ----->|
+ |-- anr_config_for_level_grid; anr_get_mem_size / anr_init ----->|
  |-- ac_stft_config_default; ac_istft_get_mem_size / ac_istft_init ---------->|
  |   per hop: aec_process_context --> aec_get_res_context --> anr_process_gain / anr_get_gain --> sk_min_f32
  |            --> sk_capply_gain_f32 --> aec_cng_fill --> ac_istft_push --> out   (process_hop())
  |   refused hop: aec_reset + anr_reset + ac_istft_reset + rng = CNG_RNG_SEED  (rig_reset())
- |-- aec_set_preset(...) / anr_set_mode(...) between two hops
+ |-- aec_set_level(...) / anr_set_level(...) between two hops
  |-- anr_destroy; aec_destroy; release the block (AcIstft has no destroy)
 ```
 
@@ -62,10 +62,10 @@ Command line of the two binaries built from `main.c` (`example_board_adapter.c` 
 
 | Argument | Meaning | Default |
 |---|---|---|
-| fourth positional (`mild`, `balanced`, `aggressive`, `no_floor`, or `0`..`3`) | AEC preset (`AecPreset`); an unknown word falls back to `balanced` | `balanced` |
-| `--nr-preset mild\|moderate\|balanced\|aggressive` | `AnrMode`; an unknown word falls back to `balanced` | `balanced` |
+| fourth positional (`mild`, `balanced`, `aggressive`, `no_floor`, or `0`..`3`), or `--aec-level <level>` | AEC level (`AecLevel`); an unknown word falls back to `balanced`; the positional and the option are the same setting and one AEC level may be given: a second one (positional or `--aec-level`, even an unknown word) is a command-line error, exit 2 | `balanced` |
+| `--nr-level mild\|moderate\|balanced\|aggressive` (or `0`..`3`; `--nr-preset` is the same option) | `AnrLevel`; an unknown word falls back to `balanced` | `balanced` |
 | `--aec-only` | only the `Aec` (`aec_process()`), no NR, RES gain, comfort noise or synthesis | off |
-| `--print-mem-size [preset] [--nr-preset ...] [--aec-only] [--no-nr] [--no-res]` | `aec_nr_pipeline_static` only: print the pool budget, run a real init of every stage, exit without WAV I/O | - |
+| `--print-mem-size [aec-level \| --aec-level <level>] [--nr-level ...] [--aec-only] [--no-nr] [--no-res]` | `aec_nr_pipeline_static` only: print the pool budget, run a real init of every stage, exit without WAV I/O | - |
 | `--no-nr`, `--no-res`, `--no-cng` | leave out the denoiser, the RES gain, the comfort noise | off |
 | `--legacy-amin` | the denoiser's noise floor without the residual-echo powers (`use_r2 = 0`) | off |
 | `--fft-size 256\|512\|1024` | grid; 0 = the rate's default (also accepted by `--print-mem-size`) | 0 |
@@ -75,12 +75,12 @@ Command line of the two binaries built from `main.c` (`example_board_adapter.c` 
 Public functions an integrator copies from this main: the ones in the sequence above and `aec_debug_status()`,
 `anr_debug_status()`. Internal (not for application code): the AEC and NR headers other than
 `aec.h`, `aec_res.h`, `anr.h`. External parameters: the `AecConfig` fields `sample_rate`, `fft_size`, `filter_length`, `delay_mode`,
-`delay_num_filters`, `fixed_delay_samples` and the AEC preset passed to `aec_config_from_preset()`, `AnrMode`, the three switches above.
+`delay_num_filters`, `fixed_delay_samples` and the AEC level passed to `aec_config_from_level()`, `AnrLevel`, the three switches above.
 Internal: the remaining `AecConfig` and `AnrConfig` fields, including the denoiser's `L` and
 `num_init_frames` (pool-sizing); classification with header lines in section 0.3 of the manual above.
 
 Python twin: `pipeline.py` (from the `Audio_ALG` root: `python -m pipelines.mono_aec_nr_res.pipeline --mic mic.wav --ref ref.wav --output out.wav`,
-presets `mild|balanced|aggressive` only). Tests: `tests/test_mono_chain.c` (`make test`), `tests/test_no_stdio_stack.c`
+presets `mild|balanced|aggressive` only; C level == Python preset). Tests: `tests/test_mono_chain.c` (`make test`), `tests/test_no_stdio_stack.c`
 (`make audit-no-stdio-stack`) and `tests/test_signal_grids.py` (`python -m pytest pipelines/mono_aec_nr_res/tests` from the `Audio_ALG` root).
 
 The top-level `pipelines/Makefile` owns the actual build so all applications

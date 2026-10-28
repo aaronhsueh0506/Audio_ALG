@@ -43,9 +43,9 @@ int main(void) {
     const int n = mcab_n_freqs(flow.flow);
     const int fft = mcab_fft_size(flow.flow);
     AecConfig res_cfg;
-    aec_config_from_preset(&res_cfg, AEC_PRESET_BALANCED, 16000);
+    aec_config_from_level(&res_cfg, AEC_LEVEL_BALANCED, 16000);
     res_cfg.fft_size = fft;                                  /* the flow's grid */
-    AnrConfig nr_cfg = anr_config_for_mode_grid(16000, fft, ANR_MODE_BALANCED);
+    AnrConfig nr_cfg = anr_config_for_level_grid(16000, fft, ANR_LEVEL_BALANCED);
     AcStftConfig synth_cfg;
     ac_stft_config_default(&synth_cfg, fft);
     size_t res_bytes = aec_res_get_mem_size(&res_cfg);       /* 0 = invalid */

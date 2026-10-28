@@ -10,8 +10,10 @@
  * equal weights, a deterministic smoke adapter and not a production beamformer.
  * Build:  make -C pipelines/4ch_aec_bf_nr_res mcab_external_static
  * Usage:
- *   AEC preset: 0=mild, 1=balanced, 2=aggressive, 3=no_floor; names also accepted.
- *   ./mcab_external_static [aec-preset] [--nr-preset mild|moderate|balanced|aggressive]
+ *   AEC level: 0=mild, 1=balanced, 2=aggressive, 3=no_floor; names also accepted. The positional
+ *   [aec-level] and --aec-level <level> are the same setting; give one of them once.
+ *   NR level: mild, moderate, balanced, aggressive or 0..3; --nr-preset is the same option.
+ *   ./mcab_external_static [aec-level | --aec-level <level>] [--nr-level mild|moderate|balanced|aggressive]
  *       [--sample-rate 16000|48000] [--fft-size 256|512|1024]
  *       [--capture-proxy 0|1|2|3] [--legacy-amin] [--no-cng] [--no-res]
  *   ./mcab_external_static --print-mem-size [same options]
@@ -34,29 +36,29 @@
 #include "utility/simd_kernel_nn.h"   /* skn_all_finite_f32 */
 
 /* CLI aliases only; -1 for a name that is none of them. */
-static int parse_preset(const char* s) {
+static int parse_level(const char* s) {
     if (strcmp(s, "mild") == 0 || strcmp(s, "0") == 0)
-        return AEC_PRESET_MILD;
+        return AEC_LEVEL_MILD;
     if (strcmp(s, "balanced") == 0 || strcmp(s, "1") == 0)
-        return AEC_PRESET_BALANCED;
+        return AEC_LEVEL_BALANCED;
     if (strcmp(s, "aggressive") == 0 || strcmp(s, "2") == 0)
-        return AEC_PRESET_AGGRESSIVE;
+        return AEC_LEVEL_AGGRESSIVE;
     if (strcmp(s, "no_floor") == 0 || strcmp(s, "3") == 0)
-        return AEC_PRESET_NO_FLOOR;
+        return AEC_LEVEL_NO_FLOOR;
     return -1;
 }
 
-static const char* preset_name(AecPreset p) {
-    switch (p) {
-        case AEC_PRESET_MILD:       return "mild";
-        case AEC_PRESET_AGGRESSIVE: return "aggressive";
-        case AEC_PRESET_NO_FLOOR:   return "no_floor";
-        default:                    return "balanced";
+static const char* level_name(AecLevel level) {
+    switch (level) {
+        case AEC_LEVEL_MILD:       return "mild";
+        case AEC_LEVEL_AGGRESSIVE: return "aggressive";
+        case AEC_LEVEL_NO_FLOOR:   return "no_floor";
+        default:                   return "balanced";
     }
 }
 
-static const char* nr_mode_name(AnrMode mode) {
-    return anr_nr_mode_name(mode);
+static const char* nr_level_name(AnrLevel level) {
+    return anr_nr_level_name(level);
 }
 
 static const char* backend_id_name(uint32_t backend_id) {
@@ -68,7 +70,7 @@ static const char* backend_id_name(uint32_t backend_id) {
 
 /* The application side of mcab.h, in the order the objects are carved: four lanes, the shared
  * estimator object and its pool (MATCHED only), mcab's pool. The lanes' parameters are this
- * program's (balanced; the CLI preset drives the post-beam RES); mcab stamps its contract. */
+ * program's (balanced; the CLI level drives the post-beam RES); mcab stamps its contract. */
 typedef struct Flow {
     AecConfig lane_cfg;
     McabDelayEstimatorConfig dc;
@@ -83,7 +85,7 @@ typedef struct Flow {
 static int flow_plan(Flow* fl, const McabConfig* cfg) {
     int ch;
     memset(fl, 0, sizeof(*fl));
-    aec_config_from_preset(&fl->lane_cfg, AEC_PRESET_BALANCED, cfg->sample_rate);
+    aec_config_from_level(&fl->lane_cfg, AEC_LEVEL_BALANCED, cfg->sample_rate);
     if (mcab_apply_lane_contract(cfg, &fl->lane_cfg) != 0 ||
         mcab_delay_estimator_config(cfg, &fl->dc) != 0 ||
         mcab_get_mem_requirements(cfg, &fl->req) != 0 ||
@@ -151,17 +153,17 @@ typedef struct Post {
     int n_freqs;
 } Post;
 
-static int post_plan(Post* q, int sample_rate, int fft_size, int with_res, AecPreset preset,
-                     AnrMode nr_mode) {
+static int post_plan(Post* q, int sample_rate, int fft_size, int with_res, AecLevel level,
+                     AnrLevel nr_level) {
     int n_freqs = fft_size / 2 + 1;
     q->res_bytes = 0;
     if (with_res) {
-        aec_config_from_preset(&q->res_cfg, preset, sample_rate);
+        aec_config_from_level(&q->res_cfg, level, sample_rate);
         q->res_cfg.fft_size = fft_size;
         q->res_bytes = aec_res_get_mem_size(&q->res_cfg);
         if (q->res_bytes == 0) return -1;
     }
-    q->nr_cfg = anr_config_for_mode_grid(sample_rate, fft_size, nr_mode);
+    q->nr_cfg = anr_config_for_level_grid(sample_rate, fft_size, nr_level);
     ac_stft_config_default(&q->synth_cfg, fft_size);
     q->nr_bytes = anr_get_mem_size(&q->nr_cfg);
     q->synth_bytes = ac_istft_get_mem_size(&q->synth_cfg);
@@ -291,8 +293,8 @@ static int int_option(int argc, char* argv[], int* i, int* value) {
 }
 
 int main(int argc, char* argv[]) {
-    AecPreset preset = AEC_PRESET_BALANCED;
-    AnrMode nr_mode = ANR_MODE_BALANCED;
+    AecLevel level = AEC_LEVEL_BALANCED;
+    AnrLevel nr_level = ANR_LEVEL_BALANCED;
     int sample_rate = 16000;
     int fft_size = 0;
     int capture_proxy = 0;
@@ -300,7 +302,7 @@ int main(int argc, char* argv[]) {
     int no_cng = 0;
     int no_res = 0;
     int print_only = 0;
-    int have_preset = 0;
+    int have_level = 0;
     int rc = 1;
     int i, ch, k, frame, hop, n_freqs;
     size_t pool_bytes;
@@ -326,38 +328,47 @@ int main(int argc, char* argv[]) {
             if (int_option(argc, argv, &i, &fft_size) != 0) return 2;
         } else if (strcmp(argv[i], "--capture-proxy") == 0) {
             if (int_option(argc, argv, &i, &capture_proxy) != 0) return 2;
-        } else if (strcmp(argv[i], "--nr-preset") == 0) {
+        } else if (strcmp(argv[i], "--nr-level") == 0 || strcmp(argv[i], "--nr-preset") == 0) {
+            const char* name = argv[i];
             const char* text = example_cli_option_value(argc, argv, &i, argv[0]);
-            int mode;
+            int level_id;
             if (!text) return 2;
-            mode = anr_nr_mode_from_name(text);
-            if (mode < 0) {
-                fprintf(stderr, "%s: --nr-preset '%s' is not a preset "
-                        "(accepted: mild|moderate|balanced|aggressive or 0..3)\n", argv[0], text);
+            level_id = anr_nr_level_from_name(text);
+            if (level_id < 0) {
+                fprintf(stderr, "%s: %s '%s' is not an NR level "
+                        "(accepted: mild|moderate|balanced|aggressive or 0..3)\n", argv[0], name, text);
                 return 2;
             }
-            nr_mode = (AnrMode)mode;
-        } else if (argv[i][0] != '-') {
-            int p = parse_preset(argv[i]);
+            nr_level = (AnrLevel)level_id;
+        } else if (strcmp(argv[i], "--aec-level") == 0 || argv[i][0] != '-') {
+            const char* text = argv[i];
+            int p;
+            if (argv[i][0] == '-') {
+                text = example_cli_option_value(argc, argv, &i, argv[0]);
+                if (!text) return 2;
+            }
+            p = parse_level(text);
             if (p < 0) {
-                fprintf(stderr, "%s: AEC preset '%s' is not a preset "
-                        "(accepted: mild|balanced|aggressive|no_floor or 0..3)\n", argv[0], argv[i]);
+                fprintf(stderr, "%s: AEC level '%s' is not a level "
+                        "(accepted: mild|balanced|aggressive|no_floor or 0..3)\n", argv[0], text);
                 return 2;
             }
-            if (have_preset) {
-                fprintf(stderr, "%s: a second AEC preset '%s'; give one\n", argv[0], argv[i]);
+            if (have_level) {
+                fprintf(stderr, "%s: a second AEC level '%s'; give one\n", argv[0], text);
                 return 2;
             }
-            preset = (AecPreset)p;
-            have_preset = 1;
+            level = (AecLevel)p;
+            have_level = 1;
         } else {
             fprintf(
                 stderr,
-                "Usage: %s [aec-preset] [--nr-preset ...] "
+                "Usage: %s [aec-level | --aec-level <level>] [--nr-level ...] "
                 "[--sample-rate 16000|48000] "
                 "[--fft-size 256|512|1024] [--capture-proxy 0|1|2|3] "
                 "[--legacy-amin] [--no-cng] [--no-res] [--print-mem-size]\n"
-                "AEC preset: 0=mild, 1=balanced, 2=aggressive, 3=no_floor; names also accepted.\n",
+                "AEC level: 0=mild, 1=balanced, 2=aggressive, 3=no_floor; names also accepted.\n"
+                "The positional [aec-level] and --aec-level are the same setting; give one of them once.\n"
+                "NR level: mild, moderate, balanced, aggressive or 0..3; --nr-preset is the same option.\n",
                 argv[0]);
             return 2;
         }
@@ -370,8 +381,10 @@ int main(int argc, char* argv[]) {
     printf("4x AEC(linear) -> external beamformer -> NR/RES"
            "  (static memory%s)\n",
            legacy ? ", legacy min-only" : "");
+    /* Wording kept as in earlier releases: tests/test_cli_strict.sh matches this line and the baseline
+     * matrix compares this program's stdout byte for byte. */
     printf("  AEC preset: %s   NR preset: %s   CNG: %s\n",
-           preset_name(preset), nr_mode_name(nr_mode),
+           level_name(level), nr_level_name(nr_level),
            no_cng ? "off" : "on");
     printf("  Beamformer: fixed equal weights (smoke adapter only)\n\n");
 
@@ -383,7 +396,7 @@ int main(int argc, char* argv[]) {
         fprintf(stderr, "Error: invalid 4-channel config\n");
         goto done;
     }
-    if (post_plan(&post, sample_rate, flow.grid.fft_size, !no_res, preset, nr_mode) != 0) {
+    if (post_plan(&post, sample_rate, flow.grid.fft_size, !no_res, level, nr_level) != 0) {
         fprintf(stderr, "Error: invalid config\n");
         goto done;
     }

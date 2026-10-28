@@ -102,10 +102,10 @@ make -C AINR/RNNoise-ERB SIMD=0 test
 # Run the malloc reference executable (binaries land in a config-keyed directory).
 BIN="$(make -s -C pipelines print-bin-dir)"
 "$BIN"/aec_nr_pipeline mic.wav ref.wav out.wav balanced \
-    --nr-preset balanced
+    --nr-level balanced
 ```
 
-For the caller-owned-pool API, backend selection, memory contract, presets,
+For the caller-owned-pool API, backend selection, memory contract, levels,
 tests, and Python reference path, use the
 [pipeline guide](pipelines/README.md). For model training, start from the
 README inside the corresponding model directory.

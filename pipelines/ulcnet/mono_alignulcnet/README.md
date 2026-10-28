@@ -64,7 +64,7 @@ with `ulcnet_nn_stage_mem_size(1)` here because the time-domain error entry need
 
 ```
 App                 Aec           UlcnetNnStage + adapter          accelerator (board)
- |-- aec_resolve_signal_grid; aec_config_from_preset; aec_get_mem_size / aec_init -->|
+ |-- aec_resolve_signal_grid; aec_config_from_level; aec_get_mem_size / aec_init -->|
  |-- ulcnet_nn_stage_mem_size(1) / ulcnet_nn_stage_init; ulcnet_accelerator_adapter_* (K/V, logit, GRU state)
  |   per hop: aec_process_context --> aec_get_res_context / aec_get_linear_context --> delay {changed, solid}
  |            --> ulcnet_nn_stage_begin_time(formed_hop, ref, delay)

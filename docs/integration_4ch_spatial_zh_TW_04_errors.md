@@ -153,7 +153,7 @@ mcab 借用你建立的物件，所以 init 時在寫入 pool 之前先檢查它
 | MATCHED 必須給 estimator、其他模式必須是 NULL | 指標 |
 | estimator 的 bank 大小、rate、48 kHz scratch 夠這個 hop | `DelayAec` 的 `est.matched_filter.num_filters`、`rate_factor`、`resample_cap`、scratch 指標 |
 
-**不能驗證**：`Aec` 沒有 config getter，所以 lane 的參數（preset、`filter_length` 等）是你的，mcab 不檢查，
+**不能驗證**：`Aec` 沒有 config getter，所以 lane 的參數（level、`filter_length` 等）是你的，mcab 不檢查，
 契約欄位也只和你那次 `mcab_apply_lane_contract()` 一樣正確。`EXTERNAL_ALIGNED` 的檢查是必要不充分：
 一條已經跑過音訊、鎖在 0 延遲的 lane 也會回 `LOCKED, 0`——所以 lane 與 estimator 必須是**新建的**或已 reset
 （[§3](integration_4ch_spatial_zh_TW_02_lifecycle.md#3-lifecycle)）。estimator 的 hop 只在 48 kHz 才看得出（16 kHz 沒有依 hop 定大小的 scratch）。

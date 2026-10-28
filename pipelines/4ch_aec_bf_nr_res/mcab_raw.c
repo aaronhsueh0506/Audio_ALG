@@ -128,10 +128,10 @@ typedef struct PostStages {
 
 static int post_plan(int sample_rate, int fft_size, PostStages *ps) {
     int n_freqs = fft_size / 2 + 1;
-    aec_config_from_preset(&ps->res_cfg, AEC_PRESET_BALANCED, sample_rate);
+    aec_config_from_level(&ps->res_cfg, AEC_LEVEL_BALANCED, sample_rate);
     ps->res_cfg.fft_size = fft_size;
     ps->res_bytes = aec_res_get_mem_size(&ps->res_cfg);
-    ps->nr_cfg = anr_config_for_mode_grid(sample_rate, fft_size, ANR_MODE_BALANCED);
+    ps->nr_cfg = anr_config_for_level_grid(sample_rate, fft_size, ANR_LEVEL_BALANCED);
     ac_stft_config_default(&ps->synth_cfg, fft_size);
     ps->nr_bytes = anr_get_mem_size(&ps->nr_cfg);
     ps->synth_bytes = ac_istft_get_mem_size(&ps->synth_cfg);

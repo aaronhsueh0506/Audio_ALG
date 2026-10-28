@@ -14,11 +14,13 @@
  *                           a second one
  * Build:  make -C pipelines            (builds both binaries)
  * Usage:
- *   AEC preset: 0=mild, 1=balanced, 2=aggressive, 3=no_floor; names also accepted.
- *   ./aec_nr_pipeline_static <mic.wav> <ref.wav> <out.wav> [aec-preset]
- *                     [--nr-preset mild|moderate|balanced|aggressive] [--aec-only]
+ *   AEC level: 0=mild, 1=balanced, 2=aggressive, 3=no_floor; names also accepted. The positional
+ *   [aec-level] and --aec-level <level> are the same setting; give one of them once.
+ *   NR level: mild, moderate, balanced, aggressive or 0..3; --nr-preset is the same option.
+ *   ./aec_nr_pipeline_static <mic.wav> <ref.wav> <out.wav> [aec-level | --aec-level <level>]
+ *                     [--nr-level mild|moderate|balanced|aggressive] [--aec-only]
  *                     [--no-nr] [--no-res] [--legacy-amin] [--debug]
- *   ./aec_nr_pipeline_static --print-mem-size [preset] [--nr-preset ...] [--aec-only]
+ *   ./aec_nr_pipeline_static --print-mem-size [aec-level | --aec-level <level>] [--nr-level ...] [--aec-only]
  *                     [--no-nr] [--no-res] [--sample-rate <hz>]
  * --debug: once per second of processed audio, one status line to stderr from aec_debug_status() + anr_debug_status() (read-only). */
 
@@ -51,46 +53,51 @@
 #define PSD_SCALE_INV (1.0f / (32768.0f * 32768.0f))
 
 /* CLI aliases only; unknown names fall back to balanced. */
-static AecPreset parse_preset(const char* s) {
+static AecLevel parse_level(const char* s) {
     if (strcmp(s, "mild") == 0 || strcmp(s, "0") == 0)
-        return AEC_PRESET_MILD;
+        return AEC_LEVEL_MILD;
     if (strcmp(s, "balanced") == 0 || strcmp(s, "1") == 0)
-        return AEC_PRESET_BALANCED;
+        return AEC_LEVEL_BALANCED;
     if (strcmp(s, "aggressive") == 0 || strcmp(s, "2") == 0)
-        return AEC_PRESET_AGGRESSIVE;
+        return AEC_LEVEL_AGGRESSIVE;
     if (strcmp(s, "no_floor") == 0 || strcmp(s, "3") == 0)
-        return AEC_PRESET_NO_FLOOR;
-    return AEC_PRESET_BALANCED;
+        return AEC_LEVEL_NO_FLOOR;
+    return AEC_LEVEL_BALANCED;
 }
 
-static const char* preset_name(AecPreset p) {
-    switch (p) {
-        case AEC_PRESET_MILD:     return "mild";
-        case AEC_PRESET_AGGRESSIVE: return "aggressive";
-        case AEC_PRESET_NO_FLOOR:   return "no_floor";
-        default:                     return "balanced";
+static const char* level_name(AecLevel level) {
+    switch (level) {
+        case AEC_LEVEL_MILD:       return "mild";
+        case AEC_LEVEL_AGGRESSIVE: return "aggressive";
+        case AEC_LEVEL_NO_FLOOR:   return "no_floor";
+        default:                   return "balanced";
     }
 }
 
 /* Name table lives beside the enum (anr_types.h); unknown names fall back to balanced. */
-static AnrMode parse_nr_mode(const char* s) {
-    int m = anr_nr_mode_from_name(s);
-    return m < 0 ? ANR_MODE_BALANCED : (AnrMode)m;
+static AnrLevel parse_nr_level(const char* s) {
+    int level = anr_nr_level_from_name(s);
+    return level < 0 ? ANR_LEVEL_BALANCED : (AnrLevel)level;
 }
 
-static const char* nr_mode_name(AnrMode m) {
-    return anr_nr_mode_name(m);
+static const char* nr_level_name(AnrLevel level) {
+    return anr_nr_level_name(level);
+}
+
+/* --nr-level is the option; --nr-preset is the same option under its earlier name. */
+static int is_nr_level_option(const char* arg) {
+    return strcmp(arg, "--nr-level") == 0 || strcmp(arg, "--nr-preset") == 0;
 }
 
 /* The mono lane: the rate's grid (fft_size 0: the rate's default) and the linear-stage
  * AecConfig. The lane keeps its own gain in the context (enable_res = 0, return_res_context = 1);
  * mono_form() applies it. Returns 0, or -1 for a pair libaec has no grid for. */
-static int derive_lane(int sample_rate, int fft_size, AecPreset preset, AecSignalGrid* grid,
+static int derive_lane(int sample_rate, int fft_size, AecLevel level, AecSignalGrid* grid,
                        AecConfig* aec_cfg) {
     if (!aec_resolve_signal_grid(sample_rate,
                                  fft_size ? fft_size : aec_default_fft_size(sample_rate), grid))
         return -1;
-    aec_config_from_preset(aec_cfg, preset, sample_rate);
+    aec_config_from_level(aec_cfg, level, sample_rate);
     aec_cfg->fft_size = grid->fft_size;
     aec_cfg->delay_mode = AEC_DELAY_MATCHED;
     aec_cfg->delay_num_filters = DA_NUM_FILTERS;
@@ -136,7 +143,7 @@ static void rig_free(Rig* r) {
 
 /* 0, or -1 for a grid or mode a stage refuses. */
 static int post_plan(PostPlan* q, int sample_rate, const AecSignalGrid* grid, const AecConfig* aec_cfg,
-                     AnrMode nr_mode, int no_nr, int no_res, int no_cng, int legacy) {
+                     AnrLevel nr_level, int no_nr, int no_res, int no_cng, int legacy) {
     memset(q, 0, sizeof(*q));
     q->with_res = !no_res;
     q->with_nr = !no_nr;
@@ -145,7 +152,7 @@ static int post_plan(PostPlan* q, int sample_rate, const AecSignalGrid* grid, co
     q->enable_cng = aec_cfg->enable_cng && !no_cng;
     q->n_freqs = grid->n_freqs;
     if (q->with_nr) {
-        q->nr_cfg = anr_config_for_mode_grid(sample_rate, grid->fft_size, nr_mode);
+        q->nr_cfg = anr_config_for_level_grid(sample_rate, grid->fft_size, nr_level);
         q->nr_bytes = anr_get_mem_size(&q->nr_cfg);
         if (q->nr_bytes == 0) return -1;
     }
@@ -398,10 +405,11 @@ int main(int argc, char* argv[]) {
     /* --print-mem-size: report the pool byte budget and run a real init of every stage on
      * it, without WAV I/O. */
     if (argc >= 2 && strcmp(argv[1], "--print-mem-size") == 0) {
-        AecPreset     preset      = AEC_PRESET_BALANCED;
-        AnrMode nr_mode     = ANR_MODE_BALANCED;
+        AecLevel      level       = AEC_LEVEL_BALANCED;
+        AnrLevel      nr_level    = ANR_LEVEL_BALANCED;
         int           aec_only    = 0;
         int           no_nr = 0, no_res = 0, no_cng = 0;
+        int           have_level  = 0;
         int           sample_rate = 16000;
         int           fft_size    = 0;
 
@@ -410,28 +418,40 @@ int main(int argc, char* argv[]) {
             else if (strcmp(argv[i], "--no-nr") == 0) no_nr = 1;
             else if (strcmp(argv[i], "--no-res") == 0) no_res = 1;
             else if (strcmp(argv[i], "--no-cng") == 0) no_cng = 1;
-            else if (strcmp(argv[i], "--nr-preset") == 0 ||
+            else if (is_nr_level_option(argv[i]) ||
                      strcmp(argv[i], "--sample-rate") == 0 ||
                      strcmp(argv[i], "--fft-size") == 0) {
                 const char* name = argv[i];
                 const char* value = example_cli_option_value(argc, argv, &i, argv[0]);
                 if (!value) return 2;
-                if (strcmp(name, "--nr-preset") == 0) nr_mode = parse_nr_mode(value);
+                if (is_nr_level_option(name)) nr_level = parse_nr_level(value);
                 else if (strcmp(name, "--sample-rate") == 0) sample_rate = atoi(value);
                 else fft_size = atoi(value);
             }
-            else if (argv[i][0] != '-')
-                preset = parse_preset(argv[i]);
+            else if (strcmp(argv[i], "--aec-level") == 0 || argv[i][0] != '-') {
+                /* The positional and --aec-level are the same setting: one per command line. */
+                const char* text = argv[i];
+                if (argv[i][0] == '-') {
+                    text = example_cli_option_value(argc, argv, &i, argv[0]);
+                    if (!text) return 2;
+                }
+                if (have_level) {
+                    fprintf(stderr, "%s: a second AEC level '%s'; give one\n", argv[0], text);
+                    return 2;
+                }
+                level = parse_level(text);
+                have_level = 1;
+            }
         }
 
         AecSignalGrid grid;
         AecConfig aec_cfg;
-        if (derive_lane(sample_rate, fft_size, preset, &grid, &aec_cfg) != 0) {
+        if (derive_lane(sample_rate, fft_size, level, &grid, &aec_cfg) != 0) {
             fprintf(stderr, "Error: invalid config (sample_rate=%d?)\n", sample_rate);
             return 1;
         }
         PostPlan plan;
-        if (post_plan(&plan, sample_rate, &grid, &aec_cfg, nr_mode, no_nr, no_res, no_cng, 0) != 0) {
+        if (post_plan(&plan, sample_rate, &grid, &aec_cfg, nr_level, no_nr, no_res, no_cng, 0) != 0) {
             fprintf(stderr, "Error: invalid config (sample_rate=%d?)\n", sample_rate);
             return 1;
         }
@@ -452,13 +472,14 @@ int main(int argc, char* argv[]) {
 #endif
 
     if (argc < 4) {
-        printf("Usage: %s <mic.wav> <ref.wav> <out.wav> [aec-preset] "
-               "[--nr-preset mild|moderate|balanced|aggressive] [--aec-only] [--no-nr] [--no-res] [--legacy-amin] "
+        printf("Usage: %s <mic.wav> <ref.wav> <out.wav> [aec-level | --aec-level <level>] "
+               "[--nr-level mild|moderate|balanced|aggressive] [--aec-only] [--no-nr] [--no-res] [--legacy-amin] "
                "[--fft-size 256|512|1024] [--debug] [--timing]\n"
-               "AEC preset: 0=mild, 1=balanced, 2=aggressive, 3=no_floor; names also accepted.\n",
+               "AEC level: 0=mild, 1=balanced, 2=aggressive, 3=no_floor; names also accepted. The positional [aec-level] and --aec-level are the same setting; give one of them once.\n"
+               "NR level: mild, moderate, balanced, aggressive or 0..3; --nr-preset is the same option.\n",
                argv[0]);
 #if !AEC_NR_POOL_SPLIT
-        printf("       %s --print-mem-size [preset] [--nr-preset ...] [--aec-only] [--no-nr] [--no-res] "
+        printf("       %s --print-mem-size [aec-level | --aec-level <level>] [--nr-level ...] [--aec-only] [--no-nr] [--no-res] "
                "[--sample-rate <hz>] [--fft-size <n>]\n", argv[0]);
 #endif
         return 1;
@@ -468,8 +489,9 @@ int main(int argc, char* argv[]) {
     const char* ref_path = argv[2];
     const char* out_path = argv[3];
 
-    AecPreset     preset   = AEC_PRESET_BALANCED;
-    AnrMode nr_mode  = ANR_MODE_BALANCED;
+    AecLevel      level    = AEC_LEVEL_BALANCED;
+    AnrLevel      nr_level = ANR_LEVEL_BALANCED;
+    int           have_level = 0;
     int           aec_only = 0;
     int           legacy   = 0;   /* --legacy-amin → min-only A_min_pl */
     int           no_nr    = 0;   /* --no-nr → no denoiser, g_total is G_res */
@@ -489,15 +511,26 @@ int main(int argc, char* argv[]) {
         else if (strcmp(argv[i], "--debug") == 0)       debug_status = 1;
         else if (strcmp(argv[i], "--timing") == 0)      show_timing = 1;
         else if (strcmp(argv[i], "--fft-size") == 0 ||
-                 strcmp(argv[i], "--nr-preset") == 0) {
+                 is_nr_level_option(argv[i])) {
             const char* name = argv[i];
             const char* value = example_cli_option_value(argc, argv, &i, argv[0]);
             if (!value) return 2;
             if (strcmp(name, "--fft-size") == 0) fft_size = atoi(value);
-            else nr_mode = parse_nr_mode(value);
+            else nr_level = parse_nr_level(value);
         }
-        else if (argv[i][0] != '-')
-            preset = parse_preset(argv[i]);
+        else if (strcmp(argv[i], "--aec-level") == 0 || argv[i][0] != '-') {
+            const char* text = argv[i];
+            if (argv[i][0] == '-') {
+                text = example_cli_option_value(argc, argv, &i, argv[0]);
+                if (!text) return 2;
+            }
+            if (have_level) {
+                fprintf(stderr, "%s: a second AEC level '%s'; give one\n", argv[0], text);
+                return 2;
+            }
+            level = parse_level(text);
+            have_level = 1;
+        }
     }
 
     /* Open inputs */
@@ -521,13 +554,14 @@ int main(int argc, char* argv[]) {
 
     AecSignalGrid grid;
     AecConfig aec_cfg;
-    int lane_ok = derive_lane(sr, fft_size, preset, &grid, &aec_cfg) == 0;
+    int lane_ok = derive_lane(sr, fft_size, level, &grid, &aec_cfg) == 0;
 
     printf("AEC(linear) -> echo-aware NR -> RES  (%s%s)\n",
            AEC_NR_POOL_SPLIT ? "freq A_min_pl" : "static memory", legacy ? ", legacy min-only" : "");
     printf("  Input:  %s (%.2fs)\n", mic_path, (float)n_samples / sr);
+    /* Wording kept as in earlier releases: the baseline matrix compares this program's stdout byte for byte. */
     printf("  AEC preset: %s   NR preset: %s   NR: %s   RES: %s   CNG: %s\n\n",
-           preset_name(preset), nr_mode_name(nr_mode), !no_nr ? "on" : "off",
+           level_name(level), nr_level_name(nr_level), !no_nr ? "on" : "off",
            !no_res ? "on" : "off", !no_cng ? "on" : "off");
 
     /* Size the pool, then allocate it (a host stand-in for a platform memory block; a board
@@ -537,10 +571,10 @@ int main(int argc, char* argv[]) {
     memset(&plan, 0, sizeof(plan));
 #if AEC_NR_POOL_SPLIT
     if (lane_ok && !aec_only)
-        lane_ok = post_plan(&plan, sr, &grid, &aec_cfg, nr_mode, no_nr, no_res, no_cng, legacy) == 0;
+        lane_ok = post_plan(&plan, sr, &grid, &aec_cfg, nr_level, no_nr, no_res, no_cng, legacy) == 0;
 #else
     if (lane_ok) {
-        lane_ok = post_plan(&plan, sr, &grid, &aec_cfg, nr_mode, no_nr, no_res, no_cng, legacy) == 0;
+        lane_ok = post_plan(&plan, sr, &grid, &aec_cfg, nr_level, no_nr, no_res, no_cng, legacy) == 0;
         if (lane_ok) print_mem_budget(sr, &grid, &aec_cfg, aec_only ? NULL : &plan);
     }
 #endif

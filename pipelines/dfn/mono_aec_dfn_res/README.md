@@ -108,7 +108,7 @@ detectable.
 
 ```
 App                 Aec           DfnHop + DfnResStage | DfnRateBridge      AcIstft (48 kHz only)
- |-- aec_resolve_signal_grid; aec_config_from_preset; aec_get_mem_size / aec_init -->|
+ |-- aec_resolve_signal_grid; aec_config_from_level; aec_get_mem_size / aec_init -->|
  |-- dfn_res_stage_get_mem_requirements / dfn_res_stage_init_ex            (48 kHz host)
  |   or dfn_rate_bridge_get_mem_requirements / dfn_rate_bridge_init_ex     (8 / 16 kHz host)
  |-- dfn_hop_init_stage(...) or dfn_hop_init_bridge(...)
@@ -124,7 +124,7 @@ External parameters (board-skeleton command line, `dfn/dfn_example_args.h`): `--
 `--fixed-delay`, `--erb-fwd` / `--erb-inv` (the exported ERB matrices; without them the skeleton runs a
 fail-open smoke only), `--atten-lim` (dB, 0 = unlimited; `dfn_res_stage_set_atten_lim()` between hops),
 `--cng` (comfort noise, off by default). An option followed by another `--` option, or by the end of the line, has no value and the
-program exits with code 2; a file named `--x` is written `./--x`. Strength of the RES gain: `aec_set_preset()`. Internal: the
+program exits with code 2; a file named `--x` is written `./--x`. Strength of the RES gain: `aec_set_level()`. Internal: the
 stage grid (48 kHz / 1024 / 512 only), the `DFN_RES_STAGE_IN_SCALE` / `_OUT_SCALE` powers of two, the rate
 bridge's FIR resamplers and frame schedule, the AEC and DFN2 model constants. Public functions are the
 `dfn_res_stage_*`, `dfn_rate_bridge_*` of `dfn_res_stage.h` / `dfn_rate_bridge.h` and the

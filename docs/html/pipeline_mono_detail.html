@@ -30,23 +30,24 @@ th{background:#eef3ee}
 <h1>mono 細節 — 執行期強度控制與逐階段耗時</h1>
 
 <h2>概要</h2>
-<p>本頁收 <a href="pipeline_mono.html">pipeline_mono</a> 的兩段會把單頁撐過 30 KB 的細節:(1) <code>aec_set_preset()</code>／<code>anr_set_mode()</code> 的執行期強度控制,(2) <code>aec_get_last_timing()</code> 的逐階段耗時診斷。呼叫順序、時序圖、I/O 與 state 表留在原頁;參數的外部／內部分級在 <a href="pipeline_mono_params.html">pipeline_mono_params</a>。</p>
+<p>本頁收 <a href="pipeline_mono.html">pipeline_mono</a> 的兩段會把單頁撐過 30 KB 的細節:(1) <code>aec_set_level()</code>／<code>anr_set_level()</code> 的執行期強度控制,(2) <code>aec_get_last_timing()</code> 的逐階段耗時診斷。呼叫順序、時序圖、I/O 與 state 表留在原頁;參數的外部／內部分級在 <a href="pipeline_mono_params.html">pipeline_mono_params</a>。</p>
 
 <h3>執行期強度控制</h3>
-<pre>int aec_set_preset(Aec* a, AecPreset preset, float ramp_ms);
-int anr_set_mode(AnrDenoiser* nr, AnrMode mode);           /* nr = 你自己 anr_init() 的物件 */
+<pre>int aec_set_level(Aec* a, AecLevel level, float ramp_ms);
+int anr_set_level(AnrDenoiser* nr, AnrLevel level);           /* nr = 你自己 anr_init() 的物件 */
 
 /* 使用者轉旋鈕:在兩個 hop 之間呼叫,不重建、不動 pool */
-aec_set_preset(aec, AEC_PRESET_AGGRESSIVE, 100.0f);        /* 100 ms 內以 dB 線性走到新地板 */
-anr_set_mode(nr, ANR_MODE_MILD);
+aec_set_level(aec, AEC_LEVEL_AGGRESSIVE, 100.0f);        /* 100 ms 內以 dB 線性走到新地板 */
+anr_set_level(nr, ANR_LEVEL_MILD);
 aec_process_context(aec, mic, ref);                        /* 下一個 hop 起生效 */</pre>
 <table>
 <tr><th>呼叫</th><th>改什麼</th><th>回 −1 的情況(−1 時什麼都不寫)</th></tr>
-<tr><td><code>aec_set_preset()</code></td><td><code>Aec</code> 的 far-active 殘留回音地板(三個 preset 唯一的差異軸之一;mono 的 <code>g_res_ctx</code> 就是這個 lane 算的)與 aggressive 的 DT 地板</td><td><code>a</code> 為 NULL;<code>preset</code> 超出 enum;<code>ramp_ms</code> 非有限值或超出 [0, 60000]</td></tr>
-<tr><td><code>anr_set_mode()</code></td><td>降噪器的強度 preset</td><td><code>nr</code> 為 NULL(例如 <code>--no-nr</code> 沒有建降噪器);<code>mode</code> 超出 enum;<code>L</code>／<code>num_init_frames</code> 與實例不符</td></tr>
+<tr><td><code>aec_set_level()</code></td><td><code>Aec</code> 的 far-active 殘留回音地板(三個 level 唯一的差異軸之一;mono 的 <code>g_res_ctx</code> 就是這個 lane 算的)與 aggressive 的 DT 地板</td><td><code>a</code> 為 NULL;<code>level</code> 超出 enum;<code>ramp_ms</code> 非有限值或超出 [0, 60000]</td></tr>
+<tr><td><code>anr_set_level()</code></td><td>降噪器的強度 level</td><td><code>nr</code> 為 NULL(例如 <code>--no-nr</code> 沒有建降噪器);<code>level</code> 超出 enum;<code>L</code>／<code>num_init_frames</code> 與實例不符</td></tr>
 </table>
-<p><code>ramp_ms == 0</code> 下一個 hop 套用(<b>不是錯誤</b>),落點與「用該 preset 從頭建一個新實例」完全相同;<code>&gt; 0</code> 以 dB 線性走過去,上限 60 s(mild ↔ aggressive 的 far-active 地板差 18 dB、地板又是硬 clamp,互動式旋鈕應給 ramp)。DT 地板與 split-floor 開關(<code>NO_FLOOR</code>)一律立即階躍,不受 ramp 影響。ramp 途中再呼叫會從當前 live 值重新起走。兩個 setter 都<b>不是重啟</b>:AEC 濾波器與延遲鎖定、NR 噪聲底與增益平滑歷史全部繼續跑(要重啟用 <code>aec_reset()</code>、<code>anr_reset()</code>、<code>ac_istft_reset()</code>)。<b>在兩個 hop 之間呼叫、與 process 序列化;非 thread-safe。</b></p>
-<p class="note">範例的降噪器以 <code>anr_config_for_mode_grid()</code> 建立、沒有覆寫任何欄位,所以 <code>anr_set_mode()</code> 直接換強度。在 preset 之上改過欄位的實例,<code>anr_set_mode()</code> 會把那些覆寫蓋回 preset 值,要自己組好完整 target 再呼叫 <code>anr_reconfigure()</code>。</p>
+<p><code>ramp_ms == 0</code> 下一個 hop 套用(<b>不是錯誤</b>),落點與「用該 level 從頭建一個新實例」完全相同;<code>&gt; 0</code> 以 dB 線性走過去,上限 60 s(mild ↔ aggressive 的 far-active 地板差 18 dB、地板又是硬 clamp,互動式旋鈕應給 ramp)。DT 地板與 split-floor 開關(<code>NO_FLOOR</code>)一律立即階躍,不受 ramp 影響。ramp 途中再呼叫會從當前 live 值重新起走。兩個 setter 都<b>不是重啟</b>:AEC 濾波器與延遲鎖定、NR 噪聲底與增益平滑歷史全部繼續跑(要重啟用 <code>aec_reset()</code>、<code>anr_reset()</code>、<code>ac_istft_reset()</code>)。<b>在兩個 hop 之間呼叫、與 process 序列化;非 thread-safe。</b></p>
+<p class="note">範例的降噪器以 <code>anr_config_for_level_grid()</code> 建立、沒有覆寫任何欄位,所以 <code>anr_set_level()</code> 直接換強度。在 level 之上改過欄位的實例,<code>anr_set_level()</code> 會把那些覆寫蓋回 level 值,要自己組好完整 target 再呼叫 <code>anr_reconfigure()</code>。</p>
+<p class="note">C 稱 level,Python 稱 preset(NR 為 strength):<b>C level == Python preset</b>,值名與整數相同。舊名 <code>AecPreset</code>／<code>AEC_PRESET_*</code>、<code>AnrMode</code>／<code>ANR_MODE_*</code> 仍保留在公開 header(同值),舊函式名已移除。</p>
 <p class="note"><b>A/B 量測時該預期什麼。</b>far-active 地板只在 <b>far-active 且非 double-talk</b> 的 hop 生效:DT 期間套的是 DT 地板(mild 與 balanced 相同,aggressive 較深),far-active latch 觸發前套的是 far-silent 地板。同一個 <code>ctx.res_gain</code> 還決定注入的 comfort noise 量(振幅 ∝ <code>sqrt(1 − G_res²)</code> 再乘該 bin 的 NR gain(下限 −10 dB,範例的 <code>CNG_NR_GAIN_FLOOR</code>)——地板越深、CNG 反而越多)。所以<b>整段錄音的平均移動幅度會小於 dB 落差所暗示的量</b>,而且只量 echo／degradation 的 A/B 會把 CNG 的變化錯記到別的機制。請在 echo 對齊或 degradation 對齊的條件下比較,並實際試聽。</p>
 
 <h3>逐階段耗時(診斷用)</h3>
@@ -65,8 +66,8 @@ aec_process_context(aec, mic, ref);                        /* 下一個 hop 起�
 
 <h2>相關檔案與測試路徑</h2>
 <ul>
-<li><code>lib/aec/c_impl/include/aec.h</code>(<code>aec_set_preset()</code>、<code>AecStageTiming</code>、<code>aec_get_last_timing()</code>);<code>lib/nr/c_impl/include/anr.h</code>(<code>anr_set_mode()</code>、<code>anr_reconfigure()</code>)</li>
-<li><code>pipelines/mono_aec_nr_res/main.c</code>(<code>--timing</code>、<code>print_stage_timing()</code>;<code>aec_nr_pipeline</code> 與 <code>aec_nr_pipeline_static</code> 共用);<code>pipelines/4ch_aec_bf_nr_res/tests/test_mcab_sample_post.c</code>(<code>test_nr_set_mode</code>:<code>anr_set_mode()</code> 對每個 mode 的測試)</li>
+<li><code>lib/aec/c_impl/include/aec.h</code>(<code>aec_set_level()</code>、<code>AecStageTiming</code>、<code>aec_get_last_timing()</code>);<code>lib/nr/c_impl/include/anr.h</code>(<code>anr_set_level()</code>、<code>anr_reconfigure()</code>)</li>
+<li><code>pipelines/mono_aec_nr_res/main.c</code>(<code>--timing</code>、<code>print_stage_timing()</code>;<code>aec_nr_pipeline</code> 與 <code>aec_nr_pipeline_static</code> 共用);<code>pipelines/4ch_aec_bf_nr_res/tests/test_mcab_sample_post.c</code>(<code>test_nr_set_level</code>:<code>anr_set_level()</code> 對每個 level 的測試)</li>
 <li>其他頁:<a href="pipeline_mono.html">pipeline_mono</a>、<a href="pipeline_mono_params.html">pipeline_mono_params</a>、<a href="pipeline_4ch_detail.html">pipeline_4ch_detail</a>、<a href="index.html">index</a></li>
 </ul>
 </body>

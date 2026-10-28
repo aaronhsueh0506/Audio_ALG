@@ -134,14 +134,14 @@ Audio_ALG 自有 pipelines/AINR/AIAEC）**：
 ## 歸屬與命名要點（寫頁面前先對照程式碼）
 
 - **RES 歸屬**：mono 的 RES 增益在 `aec_process_context()` 內算出，經 `aec_get_res_context()` 以
-  `AecResContext.res_gain` 交出（強度 `aec_set_preset()`）；4ch flow `Mcab`（mcab.h）只做到 `mcab_fuse()`
+  `AecResContext.res_gain` 交出（強度 `aec_set_level()`）；4ch flow `Mcab`（mcab.h）只做到 `mcab_fuse()`
   （`McabFrame.g_res_ctx` 為 NULL），要 RES 的應用自己用 `aec_res_init()` 建立 `AecRes`、每 hop 對
-  `mcab_sample_res_input()` 填好的 `AecResInput` 呼叫 `aec_res_process()`（強度 `aec_res_set_preset()`）。不要寫成「單元擁有 RES」，也不要把
+  `mcab_sample_res_input()` 填好的 `AecResInput` 呼叫 `aec_res_process()`（強度 `aec_res_set_level()`）。不要寫成「單元擁有 RES」，也不要把
   「所有 stage 分開呼叫」套用到 mono。
 - **4ch 分層**：`mcab`（`pipelines/4ch_aec_bf_nr_res/mcab.h`）是 flow 層、不是函式庫——應用先建立四條 `Aec` lane
   與（MATCHED）一個 `DelayAec`，再以 `McabLibs` 指標交給 `mcab_init_ex()`；mcab 只擁有自己的 pool，內部沒有 beamformer。
   `McabConfig` 只有 flow 參數；lane 的 `AecConfig` 由應用組成，`mcab_apply_lane_contract()` 只蓋契約欄位（`mcab_lane_config()`
-  是 balanced preset 的便利函式）。SRP-PHAT／BF 在 sample 層 helper `mcab_sample_beam_*`（與 `mcab_sample_flow`、
+  是 balanced level 的便利函式）。SRP-PHAT／BF 在 sample 層 helper `mcab_sample_beam_*`（與 `mcab_sample_flow`、
   `mcab_sample_driver`、`mcab_sample_post.h` 一起都不在 `libaudio_pipeline_mcab.a` 內，該 archive 只有 `mcab.o`）。不要寫成
   「單元內部有 SRP/BF」或「mcab 配置／釋放 lane」。DFN2 的程式（含 Python 孿生 `dfn2_stage.py`）在 `pipelines/dfn/`，
   Align-ULCNet 的在 `pipelines/ulcnet/`，mono 的在 `pipelines/mono_aec_nr_res/`，共用的 `example_cli.h`、`cng_aec3.py` 在

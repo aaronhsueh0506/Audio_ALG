@@ -39,7 +39,7 @@ th{background:#eef2f8}
 <h2>1. 初始化(mono;4ch 把 <code>Aec</code> 換成 <code>mcab_sample_flow_init()</code> 加 <code>mcab_sample_beam_init()</code>,stage 用 <code>ulcnet_nn_stage_mem_size(0)</code>)</h2>
 <pre>App(main.c)                 Aec                   UlcnetNnStage                 Adapter                   NPU run()
   |                          |                          |                          |                          |
-  | aec_config_from_preset(&amp;aec_cfg, BALANCED, ULCNET_SR) + fft_size / delay_* / enable_res = 0 / return_res_context = 1 / LINEAR_ONLY(derive_lane())|
+  | aec_config_from_level(&amp;aec_cfg, BALANCED, ULCNET_SR) + fft_size / delay_* / enable_res = 0 / return_res_context = 1 / LINEAR_ONLY(derive_lane())|
   | ulcnet_model_io_descriptor_default(D, &amp;desc)        D 必須等於匯出時的 delay depth                        |
   |-- ulcnet_accelerator_adapter_get_mem_size(&amp;desc, &amp;bytes, &amp;align) -------------&gt;|                          |
   |-- ulcnet_accelerator_adapter_init(pool, bytes, &amp;desc, run, user) -------------&gt;|                          |

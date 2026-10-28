@@ -4,7 +4,7 @@
  *   aec_process_context -> aec_get_res_context -> NR gain (if enabled) -> min with the lane's
  *   RES gain (if enabled) -> apply to E -> comfort noise -> ac_istft_push
  *
- * Independent of the example headers: the AecConfig, the NR configuration (anr_config_for_mode_grid with
+ * Independent of the example headers: the AecConfig, the NR configuration (anr_config_for_level_grid with
  * the 512 ms minimum window written out, r2 scaled by 2^-30 as the residual-echo prior) and the
  * min/apply loops are spelled out here, so a defect in the shared sample code cannot hide behind itself. A disabled
  * gain source reads as the unity vector; the comfort-noise fill runs only with the RES gain and
@@ -33,8 +33,8 @@ typedef struct ConvMonoConfig {
     AecDelayMode delay_mode;
     int delay_num_filters;
     int fixed_delay_samples;
-    AecPreset aec_preset;
-    AnrMode nr_mode;
+    AecLevel aec_level;
+    AnrLevel nr_level;
     int aec_only;                 /* the AEC's own time-domain output */
     int enable_nr, enable_res, enable_cng, legacy_amin;
 } ConvMonoConfig;
@@ -47,8 +47,8 @@ static inline ConvMonoConfig conv_mono_default_config(int sample_rate, int fft_s
     c.delay_mode = AEC_DELAY_MATCHED;
     c.delay_num_filters = DA_NUM_FILTERS;
     c.fixed_delay_samples = -1;
-    c.aec_preset = AEC_PRESET_BALANCED;
-    c.nr_mode = ANR_MODE_BALANCED;
+    c.aec_level = AEC_LEVEL_BALANCED;
+    c.nr_level = ANR_LEVEL_BALANCED;
     c.enable_nr = c.enable_res = c.enable_cng = 1;
     return c;
 }
@@ -76,10 +76,10 @@ static inline void conv_mono_destroy(ConvMono* c) {
     free(c);
 }
 
-/* The lane the applications derive: preset config on the rate's grid, the delay request as
+/* The lane the applications derive: level config on the rate's grid, the delay request as
  * given, RES left to the chain and the context kept (enable_res 0, return_res_context 1). */
 static inline void conv_mono_lane_config(const ConvMonoConfig* cfg, AecConfig* lane) {
-    aec_config_from_preset(lane, cfg->aec_preset, cfg->sample_rate);
+    aec_config_from_level(lane, cfg->aec_level, cfg->sample_rate);
     lane->fft_size = cfg->fft_size ? cfg->fft_size : aec_default_fft_size(cfg->sample_rate);
     lane->delay_mode = cfg->delay_mode;
     lane->delay_num_filters = cfg->delay_num_filters;
@@ -113,8 +113,8 @@ static inline ConvMono* conv_mono_create(const ConvMonoConfig* cfg) {
     ac_stft_config_default(&sc, lane.fft_size);
     synth_b = ALIGN16(ac_istft_get_mem_size(&sc));
     if (cfg->enable_nr) {
-        nc = anr_config_for_mode_grid(cfg->sample_rate, lane.fft_size, cfg->nr_mode);
-        /* minimum window 512 ms in whole hops, written out rather than taken from the preset */
+        nc = anr_config_for_level_grid(cfg->sample_rate, lane.fft_size, cfg->nr_level);
+        /* minimum window 512 ms in whole hops, written out rather than taken from the level */
         nc.L = (512 * cfg->sample_rate + 1000 * c->hop - 1) / (1000 * c->hop);
         nr_b = ALIGN16(anr_get_mem_size(&nc));
     }

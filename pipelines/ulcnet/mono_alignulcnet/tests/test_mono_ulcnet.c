@@ -46,7 +46,7 @@ typedef struct MonoUlcnetConfig {
     int sample_rate, fft_size, filter_length;
     AecDelayMode delay_mode;
     int delay_num_filters, fixed_delay_samples;
-    AecPreset aec_preset;
+    AecLevel aec_level;
     UlcnetModel model;            /* all-zero: identity */
 } MonoUlcnetConfig;
 
@@ -67,20 +67,20 @@ static MonoUlcnetConfig mu_default_config(int sample_rate) {
     cfg.delay_mode = AEC_DELAY_MATCHED;
     cfg.delay_num_filters = 5;
     cfg.fixed_delay_samples = -1;
-    cfg.aec_preset = AEC_PRESET_BALANCED;
+    cfg.aec_level = AEC_LEVEL_BALANCED;
     return cfg;
 }
 
 /* The lane on the compiled grid, linear context only; -1 for a request off that grid or an
- * out-of-enum preset (this harness's policy; libaec refuses the rest when sizing). */
+ * out-of-enum level (this harness's policy; libaec refuses the rest when sizing). */
 static int mu_lane(const MonoUlcnetConfig* cfg, AecConfig* aec_cfg) {
     if (!cfg || cfg->sample_rate != ULCNET_SR ||
         (cfg->fft_size != 0 && cfg->fft_size != ULCNET_N_FFT))
         return -1;
-    if (cfg->aec_preset != AEC_PRESET_MILD && cfg->aec_preset != AEC_PRESET_BALANCED &&
-        cfg->aec_preset != AEC_PRESET_AGGRESSIVE && cfg->aec_preset != AEC_PRESET_NO_FLOOR)
+    if (cfg->aec_level != AEC_LEVEL_MILD && cfg->aec_level != AEC_LEVEL_BALANCED &&
+        cfg->aec_level != AEC_LEVEL_AGGRESSIVE && cfg->aec_level != AEC_LEVEL_NO_FLOOR)
         return -1;
-    aec_config_from_preset(aec_cfg, cfg->aec_preset, ULCNET_SR);
+    aec_config_from_level(aec_cfg, cfg->aec_level, ULCNET_SR);
     aec_cfg->fft_size = ULCNET_N_FFT;
     if (cfg->filter_length != 0) aec_cfg->filter_length = cfg->filter_length;
     aec_cfg->delay_mode = cfg->delay_mode;
@@ -887,10 +887,10 @@ static void test_grid_and_pool_plan(void) {
                       ULCNET_OTHER_N_FFT, ULCNET_N_FFT));
     }
     {
-        MonoUlcnetConfig bad_preset = mu_default_config(ULCNET_SR);
-        bad_preset.aec_preset = (AecPreset)99;
-        CHECK(mu_get_mem_requirements(&bad_preset, &req) == -1,
-              "the lane rejects an out-of-enum aec_preset");
+        MonoUlcnetConfig bad_level = mu_default_config(ULCNET_SR);
+        bad_level.aec_level = (AecLevel)99;
+        CHECK(mu_get_mem_requirements(&bad_level, &req) == -1,
+              "the lane rejects an out-of-enum aec_level");
     }
     {
         MonoUlcnetConfig matched2 = mu_default_config(ULCNET_SR);

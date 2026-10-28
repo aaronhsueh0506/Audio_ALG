@@ -34,7 +34,7 @@ th{background:#eef3ee}
 <h1>mono AEC(linear) → echo-aware NR → RES — <code>Aec</code> + 各 main 自寫的逐 hop 串接</h1>
 
 <h2>概要</h2>
-<p>mono 沒有包起來的模組,也沒有 pipeline 函式庫(沒有 mono archive,也沒有共用的串接 header)。處理鏈由獨立的函式庫物件組成,<b>各有自己的 <code>mem_size</code> 與 <code>init</code></b>,初始化與逐 hop 串接都是整合者(範例 main)的事:lib/aec 的 <code>Aec</code>(線性 AEC,連同它自己的 RES 增益,<code>aec_process_context()</code>)→ <code>aec_get_res_context()</code>(填 <code>AecResContext</code>,RES 增益在 <code>ctx.res_gain</code>)→ <code>anr_process_gain()</code> 與 <code>anr_get_gain()</code>(echo-aware NR 增益;有可用的線性估計時 <code>ctx.r2</code> 先經 <code>sk_scale_f32</code> 摺進噪聲底)→ <code>sk_min_f32</code>(<code>g_total=min(g_nr,g_res)</code>)→ <code>sk_capply_gain_f32</code>(頻譜套 gain)→ <code>aec_cng_fill</code>(CNG,有 RES 增益且設定允許時)→ <code>ac_istft_push</code>(irfft + sqrt-Hann OLA)。NR 的 <code>AnrDenoiser</code> 與合成的 <code>AcIstft</code> 是普通的函式庫物件,由 main 以 <code>anr_get_mem_size()／anr_init()</code>(<code>anr_config_for_mode_grid()</code>,追蹤視窗 <code>L</code> 用函式庫預設)與 <code>ac_istft_get_mem_size()／ac_istft_init()</code> 自己 carve。沒有包起來的鏈物件、沒有 ABI、沒有 layout version、沒有 descriptor。<code>mono_aec_nr_res/main.c</code> 是這個組合的範例,同一份原始碼編成兩支執行檔:<code>aec_nr_pipeline_static</code>(一塊 caller pool,另有 <code>--print-mem-size</code>)與 <code>aec_nr_pipeline</code>(<code>-DAEC_NR_POOL_SPLIT=1</code>:AEC 一塊、後級一塊);pool-first 建構為板端路徑:init→destroy 之間零 heap。</p>
+<p>mono 沒有包起來的模組,也沒有 pipeline 函式庫(沒有 mono archive,也沒有共用的串接 header)。處理鏈由獨立的函式庫物件組成,<b>各有自己的 <code>mem_size</code> 與 <code>init</code></b>,初始化與逐 hop 串接都是整合者(範例 main)的事:lib/aec 的 <code>Aec</code>(線性 AEC,連同它自己的 RES 增益,<code>aec_process_context()</code>)→ <code>aec_get_res_context()</code>(填 <code>AecResContext</code>,RES 增益在 <code>ctx.res_gain</code>)→ <code>anr_process_gain()</code> 與 <code>anr_get_gain()</code>(echo-aware NR 增益;有可用的線性估計時 <code>ctx.r2</code> 先經 <code>sk_scale_f32</code> 摺進噪聲底)→ <code>sk_min_f32</code>(<code>g_total=min(g_nr,g_res)</code>)→ <code>sk_capply_gain_f32</code>(頻譜套 gain)→ <code>aec_cng_fill</code>(CNG,有 RES 增益且設定允許時)→ <code>ac_istft_push</code>(irfft + sqrt-Hann OLA)。NR 的 <code>AnrDenoiser</code> 與合成的 <code>AcIstft</code> 是普通的函式庫物件,由 main 以 <code>anr_get_mem_size()／anr_init()</code>(<code>anr_config_for_level_grid()</code>,追蹤視窗 <code>L</code> 用函式庫預設)與 <code>ac_istft_get_mem_size()／ac_istft_init()</code> 自己 carve。沒有包起來的鏈物件、沒有 ABI、沒有 layout version、沒有 descriptor。<code>mono_aec_nr_res/main.c</code> 是這個組合的範例,同一份原始碼編成兩支執行檔:<code>aec_nr_pipeline_static</code>(一塊 caller pool,另有 <code>--print-mem-size</code>)與 <code>aec_nr_pipeline</code>(<code>-DAEC_NR_POOL_SPLIT=1</code>:AEC 一塊、後級一塊);pool-first 建構為板端路徑:init→destroy 之間零 heap。</p>
 <table>
 <tr><th>訊號格點</th><th>fft/hop/bins</th><th>備註</th></tr>
 <tr><td>8 kHz</td><td>256 / 128 / 129</td><td><code>fft_size=0</code> 的 rate default</td></tr>
@@ -47,8 +47,8 @@ th{background:#eef3ee}
 <h2>如何呼叫使用</h2>
 <p>呼叫順序(每一步的失敗訊號都在括號內):</p>
 <ol>
-<li><code>aec_resolve_signal_grid(sr, fft_size, &amp;grid)</code>(<code>fft_size</code> 取 <code>aec_default_fft_size(sr)</code> 或你指定的值;回 1 = 有這組格點,0 = 沒有,<code>grid</code> 不被寫入),再 <code>aec_config_from_preset(&amp;aec_cfg, preset, sr)</code> 並設接縫欄位(<code>fft_size</code>、<code>delay_mode</code>、<code>enable_res=0</code>、<code>return_res_context=1</code>,範例的 <code>derive_lane()</code>)。<code>filter_length</code> 範圍外、不合法的 delay 組合(例如 <code>delay_num_filters</code> 超出 [1,5]、MATCHED 卻給 <code>fixed_delay_samples</code>)由下一步的 <code>aec_get_mem_size()</code> 回 0 擋下。</li>
-<li>用<b>同一個</b> <code>grid.fft_size</code> 導出 NR 與合成的 config:<code>anr_config_for_mode_grid()</code>、<code>ac_stft_config_default()</code>。</li>
+<li><code>aec_resolve_signal_grid(sr, fft_size, &amp;grid)</code>(<code>fft_size</code> 取 <code>aec_default_fft_size(sr)</code> 或你指定的值;回 1 = 有這組格點,0 = 沒有,<code>grid</code> 不被寫入),再 <code>aec_config_from_level(&amp;aec_cfg, level, sr)</code> 並設接縫欄位(<code>fft_size</code>、<code>delay_mode</code>、<code>enable_res=0</code>、<code>return_res_context=1</code>,範例的 <code>derive_lane()</code>)。<code>filter_length</code> 範圍外、不合法的 delay 組合(例如 <code>delay_num_filters</code> 超出 [1,5]、MATCHED 卻給 <code>fixed_delay_samples</code>)由下一步的 <code>aec_get_mem_size()</code> 回 0 擋下。</li>
+<li>用<b>同一個</b> <code>grid.fft_size</code> 導出 NR 與合成的 config:<code>anr_config_for_level_grid()</code>、<code>ac_stft_config_default()</code>。</li>
 <li>各函式庫查大小:<code>aec_get_mem_size()</code>／<code>anr_get_mem_size()</code>／<code>ac_istft_get_mem_size()</code>(0 = config 無效)。每次 build、每次改 config 都重查,不快取。</li>
 <li>配置 16-byte 對齊的 pool(各子區塊 <code>ALIGN16</code> 後加總,再加暫存向量),依序 carve。</li>
 <li><code>aec_init()</code>／<code>anr_init()</code>／<code>ac_istft_init()</code>(NULL = pool 過小、未對齊或 config 無效)。</li>
@@ -60,13 +60,13 @@ th{background:#eef3ee}
 <pre>const int sample_rate = 16000;
 AecSignalGrid grid;  AecConfig aec_cfg;
 if (!aec_resolve_signal_grid(sample_rate, aec_default_fft_size(sample_rate), &amp;grid)) return -1;   /* 0 = 沒有這組格點 */
-aec_config_from_preset(&amp;aec_cfg, AEC_PRESET_BALANCED, sample_rate);
+aec_config_from_level(&amp;aec_cfg, AEC_LEVEL_BALANCED, sample_rate);
 aec_cfg.fft_size = grid.fft_size;           aec_cfg.delay_mode = AEC_DELAY_MATCHED;
 aec_cfg.delay_num_filters = DA_NUM_FILTERS; aec_cfg.fixed_delay_samples = -1;
 aec_cfg.enable_delay_est = 1;               /* 舊式鏡像, 與 MATCHED 一致 */
 aec_cfg.enable_res = 0;  aec_cfg.return_res_context = 1;               /* 接縫: 增益留在 context 裡 */
 
-AnrConfig nr_cfg = anr_config_for_mode_grid(sample_rate, grid.fft_size, ANR_MODE_BALANCED);
+AnrConfig nr_cfg = anr_config_for_level_grid(sample_rate, grid.fft_size, ANR_LEVEL_BALANCED);
 AcStftConfig syn_cfg;  ac_stft_config_default(&amp;syn_cfg, grid.fft_size);
 size_t aec_b = aec_get_mem_size(&amp;aec_cfg);                         /* 各函式庫各自查大小, 0 = 無效 */
 size_t nr_b  = anr_get_mem_size(&amp;nr_cfg);
@@ -115,13 +115,13 @@ platform_free(pool);
 </pre>
 <p>桌面便利路徑 <code>aec_create()</code>(呼叫端持有 <code>Aec</code> 結構,內部配置)。診斷用唯讀查詢:<code>aec_debug_status()</code>／<code>anr_debug_status()</code>(<code>--debug</code> 旗標每秒印一行)、<code>aec_get_res_context()</code>(<code>DUMP_CTX</code>)。<code>--no-nr</code> 時不建 <code>AnrDenoiser</code>、NR 增益讀 <code>unity</code> 全 1 向量;<code>--no-res</code> 時 RES 增益改讀 <code>unity</code>,且不跑 CNG。逐步的呼叫表、錯誤語意與 config 對照見 <code>docs/integration_mono_zh_TW.md</code>。</p>
 <h3>接進外部後級(<code>aec_get_res_context</code>)</h3>
-<p><code>aec_get_res_context(aec, &amp;ctx)</code>(<code>aec.h</code>)在 <code>aec_process_context()</code> 之後交出 <code>AecResContext</code>:<code>error_spec</code>=線性 AEC 誤差頻譜 E(audio scale)、<code>near_spec</code>=近端頻譜、<code>far_spec</code>=far 頻譜、<code>echo_spec</code>=回音估計、<code>r2</code>=殘餘回音 PSD、<code>comfort_noise</code>=comfort-noise PSD(<code>r2</code>／<code>comfort_noise</code> 為 int16² 尺度)、<code>res_gain</code>=AEC 自己的 G_res,另有 <code>linear_hop</code>／<code>formed_hop</code> 與 <code>usable_linear</code>、<code>far_power</code> 等控制量;全部是借用視圖,指向 AEC 的 per-hop buffer,到下一次處理呼叫或 reset 前有效。lane 必須帶 seam(<code>enable_res=0</code>、<code>return_res_context=1</code>,<code>derive_lane()</code> 這樣建),否則 <code>error_spec</code> 為 NULL。要在鏈上插自己的 stage,就照 <code>mono_aec_nr_res/main.c</code> 的 <code>mono_form()</code> 的順序明寫(<code>pipelines/tests/test_readme_flow.c</code> 編譯並執行這段;該測試與 <code>mono_aec_nr_res/tests/test_mono_chain.c</code> 都以手寫 oracle <code>conv_chain_mono.h</code> 逐位元比對)。沒有函式指標表:每個應用把自己的幾行寫出來。目前的消費者是 <a href="pipeline_dfn_mono.html">pipeline_dfn_mono</a>(不建 NR,P 交給 DFN2 hop)。執行期強度控制(<code>aec_set_preset()</code>／<code>anr_set_mode()</code>)與逐階段耗時診斷見 <a href="pipeline_mono_detail.html">pipeline_mono_detail</a>。</p>
+<p><code>aec_get_res_context(aec, &amp;ctx)</code>(<code>aec.h</code>)在 <code>aec_process_context()</code> 之後交出 <code>AecResContext</code>:<code>error_spec</code>=線性 AEC 誤差頻譜 E(audio scale)、<code>near_spec</code>=近端頻譜、<code>far_spec</code>=far 頻譜、<code>echo_spec</code>=回音估計、<code>r2</code>=殘餘回音 PSD、<code>comfort_noise</code>=comfort-noise PSD(<code>r2</code>／<code>comfort_noise</code> 為 int16² 尺度)、<code>res_gain</code>=AEC 自己的 G_res,另有 <code>linear_hop</code>／<code>formed_hop</code> 與 <code>usable_linear</code>、<code>far_power</code> 等控制量;全部是借用視圖,指向 AEC 的 per-hop buffer,到下一次處理呼叫或 reset 前有效。lane 必須帶 seam(<code>enable_res=0</code>、<code>return_res_context=1</code>,<code>derive_lane()</code> 這樣建),否則 <code>error_spec</code> 為 NULL。要在鏈上插自己的 stage,就照 <code>mono_aec_nr_res/main.c</code> 的 <code>mono_form()</code> 的順序明寫(<code>pipelines/tests/test_readme_flow.c</code> 編譯並執行這段;該測試與 <code>mono_aec_nr_res/tests/test_mono_chain.c</code> 都以手寫 oracle <code>conv_chain_mono.h</code> 逐位元比對)。沒有函式指標表:每個應用把自己的幾行寫出來。目前的消費者是 <a href="pipeline_dfn_mono.html">pipeline_dfn_mono</a>(不建 NR,P 交給 DFN2 hop)。執行期強度控制(<code>aec_set_level()</code>／<code>anr_set_level()</code>)與逐階段耗時診斷見 <a href="pipeline_mono_detail.html">pipeline_mono_detail</a>。</p>
 <p class="note">Descriptor 慣例:mono 沒有 descriptor 也沒有 layout version(<code>Aec</code>(RES 增益在它的 <code>aec_process_context()</code> 內算)、<code>AnrDenoiser</code>、<code>AcIstft</code> 只提供大小查詢,串接寫在各 main 裡),所以每次 build 都要重查大小;init 只擋下過小或未對齊的 pool 與無效 config。需要 descriptor 閘的出貨物件只有 <a href="pipeline_4ch.html">4ch 的 flow 層 <code>Mcab</code></a>(<code>McabMemReq</code>,只涵蓋 mcab 自己的 pool)與 DFN2 的 stage／bridge。<code>AecConfig</code> 的 <code>filter_length</code>、<code>delay_mode</code>、<code>delay_num_filters</code>、<code>fixed_delay_samples</code> 是建立時欄位;<b>兩支 CLI 都沒有 delay 相關旗標</b>(<code>delay_mode</code> 固定 MATCHED、<code>delay_num_filters</code> 為 <code>DA_NUM_FILTERS</code>),要改只能由呼叫端直接寫 <code>AecConfig</code> 欄位(板端 adapter 或測試)。</p>
 
 <h2>流程時序圖</h2>
 <p>lifeline = 應用、<code>Aec</code>、<code>AnrDenoiser</code>、<code>AcIstft</code>;完整版(含 4ch 與錯誤矩陣)見 <a href="integration_sequence.html">整合時序圖</a>。</p>
 <pre>應用(main)                 Aec                  AnrDenoiser          AcIstft
- │ aec_resolve_signal_grid + aec_config_from_preset (derive_lane) / anr_config_for_mode_grid / ac_stft_config_default
+ │ aec_resolve_signal_grid + aec_config_from_level (derive_lane) / anr_config_for_level_grid / ac_stft_config_default
  │─ aec_get_mem_size ───────►│                    │                    │   0=無效
  │─ anr_get_mem_size ──────────────────────────►│                    │   0=無效
  │─ ac_istft_get_mem_size ──────────────────────────────────────────►│   0=無效
@@ -174,8 +174,8 @@ WOLA (C)        out=frame0 前半 out=hop#0 重建   out = hop p-1 的重建
 <p>完整的外部／內部分級、範圍、預設、何時設,與公開／內部函式清單在 <a href="pipeline_mono_params.html">pipeline_mono_params</a>。</p>
 <table>
 <tr><th>類別</th><th>項目</th></tr>
-<tr><td>外部(建立時)</td><td><code>AecConfig</code> 的 <code>sample_rate</code>、<code>fft_size</code>、<code>filter_length</code>、<code>delay_mode</code>、<code>delay_num_filters</code>、<code>fixed_delay_samples</code>(<code>aec_config_from_preset()</code> 的 <code>preset</code> 引數);<code>AnrMode</code>;<code>AecConfig.enable_cng</code></td></tr>
-<tr><td>外部(執行期)</td><td><code>aec_set_preset(aec, preset, ramp_ms)</code>、<code>anr_set_mode(nr, mode)</code>、<code>anr_reconfigure()</code></td></tr>
+<tr><td>外部(建立時)</td><td><code>AecConfig</code> 的 <code>sample_rate</code>、<code>fft_size</code>、<code>filter_length</code>、<code>delay_mode</code>、<code>delay_num_filters</code>、<code>fixed_delay_samples</code>(<code>aec_config_from_level()</code> 的 <code>level</code> 引數);<code>AnrLevel</code>;<code>AecConfig.enable_cng</code></td></tr>
+<tr><td>外部(執行期)</td><td><code>aec_set_level(aec, level, ramp_ms)</code>、<code>anr_set_level(nr, level)</code>、<code>anr_reconfigure()</code></td></tr>
 <tr><td>外部(進階)</td><td><code>enable_highpass</code>、<code>highpass_cutoff_hz</code>、<code>enable_shadow</code>、<code>delay_est_period_s</code></td></tr>
 <tr><td>內部</td><td>其餘 38 個 <code>AecConfig</code> 欄位與編譯期 <code>AECB_*</code>、<code>AnrConfig</code> 的 33 個時間常數／門檻欄位、<code>AcStftConfig</code> 的窗與 OLA 設定、範例的 <code>CNG_*</code>／<code>PSD_SCALE_INV</code> 常數、範例固定的 seam(<code>enable_res=0</code>、<code>return_res_context=1</code>)</td></tr>
 </table>

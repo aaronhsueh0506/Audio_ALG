@@ -76,16 +76,16 @@ Who owns the residual-echo suppressor (RES):
 
 - **mono**: the AEC computes the RES gain inside `aec_process_context()` and hands it over as
   `AecResContext.res_gain` (read with `aec_get_res_context()`); its strength is set with
-  `aec_set_preset()`. The sample (`mono_form()` in `pipelines/mono_aec_nr_res/main.c`) only decides
+  `aec_set_level()`. The sample (`mono_form()` in `pipelines/mono_aec_nr_res/main.c`) only decides
   whether to apply it. A pure-AEC sample may call the full `aec_process()` (RES and the final
   synthesis in one call).
 - **4ch**: the `mcab` flow (`mcab_process_front()` over the shared delay and four lanes, then `mcab_fuse()` with
   the caller's beamformer weights; the sample helper `mcab_sample_beam_*` supplies SRP-PHAT/BF when no
   beamformer of your own is at hand) has no RES; `mcab_fuse()` leaves `frame->g_res_ctx` NULL. An application
   that wants RES creates it in its own init with `aec_res_get_mem_size()` / `aec_res_init()` (config from
-  `aec_config_from_preset()`), calls `aec_res_process()` once per hop over an `AecResInput` filled from the
+  `aec_config_from_level()`), calls `aec_res_process()` once per hop over an `AecResInput` filled from the
   fused `McabFrame` (the sample header `pipelines/4ch_aec_bf_nr_res/mcab_sample_post.h` does this in
-  `mcab_sample_res_input()`), sets strength with `aec_res_set_preset()` and clears it with `aec_res_reset()`. The 4ch Align-ULCNet
+  `mcab_sample_res_input()`), sets strength with `aec_res_set_level()` and clears it with `aec_res_reset()`. The 4ch Align-ULCNet
   application builds the flow with `cfg.enable_post = 0` and has no RES.
 
 Current layout version of the 4-channel flow: `MCAB_LAYOUT_VERSION = 25` (mcab.h; the lanes, the

@@ -35,7 +35,7 @@
 /* board_mem: simulated platform common-memory manager (REFERENCE ONLY).
  * BOARD: replace this whole module with the platform's memory manager; it only needs
  * a capacity check, an alloc and a free. The arena covers the largest supported
- * configuration (48 kHz, balanced presets) plus headroom; BOARD: size the real pool
+ * configuration (48 kHz, balanced levels) plus headroom; BOARD: size the real pool
  * from the configs the product ships, using the size queries of the stages. */
 #define BOARD_ARENA_BYTES ((size_t)2u * 1024u * 1024u)  /* 2 MiB */
 
@@ -123,7 +123,7 @@ static int mono_plan(MonoPlan* plan, int sample_rate) {
     if (!aec_resolve_signal_grid(sample_rate, aec_default_fft_size(sample_rate), &plan->grid))
         return -1;
     /* The lane keeps its own gain in the context; mono_hop() applies it. */
-    aec_config_from_preset(&plan->aec_cfg, AEC_PRESET_BALANCED, sample_rate);
+    aec_config_from_level(&plan->aec_cfg, AEC_LEVEL_BALANCED, sample_rate);
     plan->aec_cfg.fft_size = plan->grid.fft_size;
     plan->aec_cfg.delay_mode = AEC_DELAY_MATCHED;
     plan->aec_cfg.delay_num_filters = DA_NUM_FILTERS;
@@ -131,7 +131,7 @@ static int mono_plan(MonoPlan* plan, int sample_rate) {
     plan->aec_cfg.enable_delay_est = 1;
     plan->aec_cfg.enable_res = 0;
     plan->aec_cfg.return_res_context = 1;
-    plan->nr_cfg = anr_config_for_mode_grid(sample_rate, plan->grid.fft_size, ANR_MODE_BALANCED);
+    plan->nr_cfg = anr_config_for_level_grid(sample_rate, plan->grid.fft_size, ANR_LEVEL_BALANCED);
     ac_stft_config_default(&plan->synth_cfg, plan->grid.fft_size);
     plan->aec_bytes = aec_get_mem_size(&plan->aec_cfg);
     plan->nr_bytes = anr_get_mem_size(&plan->nr_cfg);

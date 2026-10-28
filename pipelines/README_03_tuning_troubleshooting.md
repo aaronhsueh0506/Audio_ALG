@@ -8,7 +8,7 @@ external parameters first and mark the internal constants as such.
 
 ### AEC (`AecConfig`, see `aec.h`)
 
-**Presets**: `AEC_PRESET_MILD` / `AEC_PRESET_BALANCED`（default）/ `AEC_PRESET_AGGRESSIVE` / `AEC_PRESET_NO_FLOOR`
+**Levels**: `AEC_LEVEL_MILD` / `AEC_LEVEL_BALANCED`（default）/ `AEC_LEVEL_AGGRESSIVE` / `AEC_LEVEL_NO_FLOOR`
 
 | Parameter | Default | Description |
 |-----------|---------|-------------|
@@ -17,16 +17,16 @@ external parameters first and mark the internal constants as such.
 | `enable_highpass` | 1 | 高通濾波器（移除 DC + 低頻） |
 | `highpass_cutoff_hz` | 80.0 | HPF 截止頻率 (Hz) |
 
-**RES / preset strength axis**：RES has no standalone `ResConfig` — it lives inside `AecConfig`
+**RES / level strength axis**：RES has no standalone `ResConfig` — it lives inside `AecConfig`
 and the AEC3 post-filter chain (`SuppressionGain`, `ResidualEchoEstimator`, etc.), surfaced
-externally through the `AecResContext` seam (see [`## Modules`](README.md#modules)). The four AEC presets
+externally through the `AecResContext` seam (see [`## Modules`](README.md#modules)). The four AEC levels
 differ in exactly three fields:
 
 | Parameter | Mild | Balanced | Aggressive | No-floor | Description |
 |-----------|------|----------|------------|----------|-------------|
 | `min_gain_floor_far_active_db` | -20 | -28 | -38 | -28（inert） | AEC3 `SuppressionGain` 遠端活躍時的最低增益下限 dB（最大抑制量） |
-| `min_gain_floor_dt_db` | -20 | -20 | -30 | -20（inert） | double-talk 期間套用的地板 dB；mild/balanced 停在 dataclass 共用預設 -20，只有 aggressive 額外下探到 -30（其餘欄位：filter length、Kalman Q、delay buffer、CNG…四個 preset 皆相同） |
-| `min_gain_split_floor_enabled` | true | true | true | **false** | 地板機制本身的開關；`AEC_PRESET_NO_FLOOR` 把它關掉，此時上面兩個 dB 欄位不生效（AEC3 原生 min_gain 不被任何東西往上拉），抑制可以深到 AEC3 自己算出的極限 |
+| `min_gain_floor_dt_db` | -20 | -20 | -30 | -20（inert） | double-talk 期間套用的地板 dB；mild/balanced 停在 dataclass 共用預設 -20，只有 aggressive 額外下探到 -30（其餘欄位：filter length、Kalman Q、delay buffer、CNG…四個 level 皆相同） |
+| `min_gain_split_floor_enabled` | true | true | true | **false** | 地板機制本身的開關；`AEC_LEVEL_NO_FLOOR` 把它關掉，此時上面兩個 dB 欄位不生效（AEC3 原生 min_gain 不被任何東西往上拉），抑制可以深到 AEC3 自己算出的極限 |
 
 ### Runtime strength control（不重建、不動 pool）
 
@@ -36,36 +36,36 @@ differ in exactly three fields:
 
 | Entry point | 目標 |
 |---|---|
-| `aec_set_preset(aec, preset, ramp_ms)` | mono：`Aec` 的 far-active 地板（mono 的 RES 增益 `ctx.res_gain` 就在 AEC 裡，經 `aec_get_res_context()` 讀出） |
-| `aec_res_set_preset(res, preset, ramp_ms)` | 4ch：應用自備的後波束 `AecRes`（`Mcab` 不持有；`res` 為 `NULL` 時回 `-1`） |
+| `aec_set_level(aec, level, ramp_ms)` | mono：`Aec` 的 far-active 地板（mono 的 RES 增益 `ctx.res_gain` 就在 AEC 裡，經 `aec_get_res_context()` 讀出） |
+| `aec_res_set_level(res, level, ramp_ms)` | 4ch：應用自備的後波束 `AecRes`（`Mcab` 不持有；`res` 為 `NULL` 時回 `-1`） |
 | `aec_res_split_floor(res, &live, &target)` | 4ch：唯讀，線性功率。`live == target` 代表 ramp 已走完 |
-| `anr_set_mode(nr, mode)` | 範例自己初始化的**那一個**降噪器（`anr_init()` 回傳的 `AnrDenoiser*`）；`NULL` 回 `-1` |
+| `anr_set_level(nr, level)` | 範例自己初始化的**那一個**降噪器（`anr_init()` 回傳的 `AnrDenoiser*`）；`NULL` 回 `-1` |
 
-4ch 的初始 RES 強度由應用傳給 `aec_config_from_preset()` 的 preset 決定，執行中改強度走上面的
-`aec_res_set_preset()`；`aec_res_reset()` 不會把它改回建構時的 preset。`Mcab`（與取樣用的
+4ch 的初始 RES 強度由應用傳給 `aec_config_from_level()` 的 level 決定，執行中改強度走上面的
+`aec_res_set_level()`；`aec_res_reset()` 不會把它改回建構時的 level。`Mcab`（與取樣用的
 `mcab_sample_beam` helper）沒有強度 setter：它的 lane 只算線性殘留，RES 與 NR 不在裡面。
 
-`ramp_ms == 0` 代表下一個 hop 套用（**不是錯誤**），落點與「用該 preset 從頭建一個新
+`ramp_ms == 0` 代表下一個 hop 套用（**不是錯誤**），落點與「用該 level 從頭建一個新
 實例」完全相同；`> 0` 則以 dB 為單位線性走過去，上限 60 秒（mild ↔ aggressive 是
 18 dB 落差、地板又是硬性 clamp，互動式旋鈕應該給一個 ramp）。ramp 途中再呼叫會從當前
 live 值重新起走。兩者都**不是重啟**：濾波器、延遲鎖定、噪聲底與增益平滑歷史全部繼續
 跑；要重啟請用對應的 `_reset()`。
 
-`AEC_PRESET_NO_FLOOR` 也可以在**已經在跑的** instance 上用同一個 setter 切換，不必重建：
+`AEC_LEVEL_NO_FLOOR` 也可以在**已經在跑的** instance 上用同一個 setter 切換，不必重建：
 `min_gain_split_floor_enabled` 這個 gate 會跟兩個 dB 欄位同一次呼叫一起 retarget（沒有
-ramp，立即生效，跟 DT 地板一樣是硬切），所以不會有一個 hop 是「preset 標籤已經是
-NO_FLOOR，但 gate 還沒跟上」的中間狀態。Python 對應：mono 的 `AEC.set_preset()`；4ch 的
+ramp，立即生效，跟 DT 地板一樣是硬切），所以不會有一個 hop 是「level 標籤已經是
+NO_FLOOR，但 gate 還沒跟上」的中間狀態。C 的 level 就是 Python 的 preset（C 寫 `AecLevel`／`aec_set_level()`，Python 寫 preset／`set_preset()`）。Python 對應：mono 的 `AEC.set_preset()`；4ch 的
 `PostBeamResidualSuppressor.set_preset()`（Python 的 `McabPipeline` 不持有它：應用自己建一個，
 `PostBeamResidualSuppressor.from_aec_config(config)` 或 `PostBeamResidualSuppressor(sr, hop, n_freqs, preset)`，
 每 hop 呼叫 `process(post.context, post.aligned_render)`，`reset()` 自己重置）。
 
-> **4ch：對四條 lane 重新指定 preset 是無效操作。** 四條 lane 都以
+> **4ch：對四條 lane 重新指定 level 是無效操作。** 四條 lane 都以
 > `spatial_linear_context` 建立（`mcab_apply_lane_contract()` 蓋上），從不走到自己的殘留抑制器，它們的地板
 > 什麼都不塑形。真正乘上輸出的 gain 來自應用自備的**唯一一個**後波束 `AecRes`，所以強度要設在它身上
-> （由 `4ch_aec_bf_nr_res/tests/test_mcab_sample_beam.c` 的 `test_caller_res_reset_and_preset` 釘住）。
+> （由 `4ch_aec_bf_nr_res/tests/test_mcab_sample_beam.c` 的 `test_caller_res_reset_and_level` 釘住）。
 
-> **NR：範例的降噪器就是函式庫的 preset。** 它以 `anr_config_for_mode_grid()` 建立、
-> 沒有任何覆寫，所以 `anr_set_mode()` 直接換強度（`4ch_aec_bf_nr_res/tests/test_mcab_sample_post.c` 的 `test_nr_set_mode` 釘住）。要改 preset 以外的欄位時，自己組好
+> **NR：範例的降噪器就是函式庫的 level 組態。** 它以 `anr_config_for_level_grid()` 建立、
+> 沒有任何覆寫，所以 `anr_set_level()` 直接換強度（`4ch_aec_bf_nr_res/tests/test_mcab_sample_post.c` 的 `test_nr_set_level` 釘住）。要改 level 以外的欄位時，自己組好
 > 完整 target 再呼叫 `anr_reconfigure()`（grid、`L`、`num_init_frames` 不可變）。
 
 > **A/B 量測時該預期什麼。** far-active 地板只在 **far-active 且非 double-talk** 的
@@ -83,22 +83,22 @@ mask 塑形）；4ch 變體用的是 `enable_post = 0` 的 flow，抑制器與�
 
 ### NR (`AnrConfig`, see `anr_types.h`)
 
-**Modes**: `ANR_MODE_MILD` / `ANR_MODE_MODERATE` / `ANR_MODE_BALANCED`（default）/ `ANR_MODE_AGGRESSIVE`
+**Levels**: `ANR_LEVEL_MILD` / `ANR_LEVEL_MODERATE` / `ANR_LEVEL_BALANCED`（default）/ `ANR_LEVEL_AGGRESSIVE`
 
-> Both C pipeline CLIs — `mono_aec_nr_res/main.c` (`parse_nr_mode()`) and
+> Both C pipeline CLIs — `mono_aec_nr_res/main.c` (`parse_nr_level()`) and
 > `4ch_aec_bf_nr_res/mcab_external_static.c` — accept
-> `--nr-preset mild|moderate|balanced|aggressive` (or the digits `0`..`3`, through
-> `anr_nr_mode_from_name()`). An unknown name falls back to
-> `ANR_MODE_BALANCED` with no error in `mono_aec_nr_res/main.c` (the same holds for its
-> positional AEC preset, and for `--nr-mode` of the NR library's `example/main.c`);
-> `mcab_external_static` exits with code 2 for an unknown `--nr-preset` name, for an unknown AEC
-> preset and for a second positional preset. In both, a `--nr-preset` followed by another `--` option has no value (exit 2).
+> `--nr-level mild|moderate|balanced|aggressive` (or the digits `0`..`3`, through
+> `anr_nr_level_from_name()`; `--nr-preset` is the same option under its earlier name). An unknown name falls back to
+> `ANR_LEVEL_BALANCED` with no error in `mono_aec_nr_res/main.c` (the same holds for its
+> positional AEC level and `--aec-level`, and for `--nr-level` (earlier name `--nr-mode`) of the NR library's `example/main.c`);
+> `mcab_external_static` exits with code 2 for an unknown `--nr-level` name, for an unknown AEC
+> level and for a second AEC level (positional or `--aec-level`); `mono_aec_nr_res/main.c` exits with code 2 for a second AEC level too, whatever its spelling. In both, a `--nr-level` or `--aec-level` followed by another `--` option has no value (exit 2).
 > The Python `mono_aec_nr_res/pipeline.py` CLI accepts
 > `mild|balanced|aggressive` only.
 
 `g_min_db` is amplitude dB (`g_min = 10^(g_min_db/20)`).
 
-> **Retime basis.** `anr_config_for_mode_grid()` retimes every `alpha_*`, `L`,
+> **Retime basis.** `anr_config_for_level_grid()` retimes every `alpha_*`, `L`,
 > `num_init_frames` and `scene_change_min_frames` from its authored reference
 > duration to the actual hop of the grid (`anr_retime_alpha()`,
 > `anr_retime_alpha_ref()`, `anr_retime_frames()`, `anr_retime_frames_ms()`);
@@ -106,9 +106,9 @@ mask 塑形）；4ch 變體用的是 `enable_post = 0` 的 flow，抑制器與�
 > for `alpha_xi`, `alpha_attack`, `alpha_d_speech` and `L`, and 10 ms/hop for the
 > other `alpha_*` and the frame counts. The tables list the authored constants,
 > not the realized value at a grid; read that back from `anr_default_config()` /
-> `anr_config_for_mode()` (or Python `lib/nr/python/core/nr_strength.py`) instead of scaling by hand.
+> `anr_config_for_level()` (or Python `lib/nr/python/core/nr_strength.py`) instead of scaling by hand.
 
-The strength presets change only these four fields:
+The NR levels change only these four fields:
 
 | Parameter | Mild | Moderate | Balanced | Aggressive | Description |
 |-----------|------|----------|----------|------------|-------------|
@@ -117,7 +117,7 @@ The strength presets change only these four fields:
 | `xi_min_db` | -10 | -10 | -10 | -12 | 先驗 SNR 下限 dB |
 | `noise_over_subtraction` | 1.2 | 1.3 | 1.4 | 1.3 | 噪聲過減係數 |
 
-All modes share these tracker and gain-smoothing constants (internal: jointly tuned, not
+All levels share these tracker and gain-smoothing constants (internal: jointly tuned, not
 recommended to open):
 
 | Parameter | Authored value | Basis | Description |
@@ -132,7 +132,7 @@ recommended to open):
 | `num_init_frames` | 20 frames | 10 ms | 初始化靜默幀數；同一 grid 的實際值為 25（約 200 ms） |
 | `scene_change_threshold_db` | 10.0 | 純 dB 常數 | 場景轉換偵測閾值，不 retime |
 
-> 各範例 `main` 直接用上表的函式庫預設（`anr_config_for_mode_grid()`，
+> 各範例 `main` 直接用上表的函式庫預設（`anr_config_for_level_grid()`，
 > `broadband_threshold = 1.0`），不另外覆寫。
 
 ---
@@ -148,13 +148,13 @@ re-validation.
 
 | 症狀 | 原因 | 調整方式 |
 |------|------|----------|
-| **殘留回聲明顯** | RES 抑制不足 | `aec_set_preset()` 改用 aggressive（給 `ramp_ms`，例如 100） |
+| **殘留回聲明顯** | RES 抑制不足 | `aec_set_level()` 改用 aggressive（給 `ramp_ms`，例如 100） |
 | **殘留回聲 + 遠端持續講話** | Filter 未完全收斂或尾巴不夠長 | 增加 `filter_length`（如 832→1536，init 參數，要重查 pool），確認 mic-ref delay 落在 `delay_mode` 的搜尋範圍 |
-| **近端語音被壓制（DT degradation）** | RES 過度抑制 | `aec_set_preset()` 改用 mild |
-| **輸出底噪不自然（突然靜音）** | CNG 未開啟 | 確認 `enable_cng=1`（preset 預設已開），範例沒有帶 `--no-cng` |
-| **噪聲殘留太多** | 抑制量不夠 | `anr_set_mode()` 往 aggressive 走（`g_min_db` -28 dB、`q` 0.45） |
-| **語音被吃掉** | NR 抑制太激進 | `anr_set_mode()` 往 mild 走（`g_min_db` -20 dB、`q` 0.58） |
-| **回聲消了但底噪變大** | NR 沒開或太保守 | 確認 NR mode 非 MILD，且範例沒有帶 `--no-nr` |
+| **近端語音被壓制（DT degradation）** | RES 過度抑制 | `aec_set_level()` 改用 mild |
+| **輸出底噪不自然（突然靜音）** | CNG 未開啟 | 確認 `enable_cng=1`（預設已開），範例沒有帶 `--no-cng` |
+| **噪聲殘留太多** | 抑制量不夠 | `anr_set_level()` 往 aggressive 走（`g_min_db` -28 dB、`q` 0.45） |
+| **語音被吃掉** | NR 抑制太激進 | `anr_set_level()` 往 mild 走（`g_min_db` -20 dB、`q` 0.58） |
+| **回聲消了但底噪變大** | NR 沒開或太保守 | 確認 NR level 非 MILD，且範例沒有帶 `--no-nr` |
 | **整體語音品質差（悶、失真）** | 多階段過度處理 | AEC 與 NR 都改 MILD，只在必要時加強個別模組；用 `--no-nr` / `--no-res` 隔離是哪個增益來源 |
 | **處理 48kHz 音訊記憶體不足** | 模組記憶體隨 fft_size 增長 | 縮短 `filter_length`（見 [Memory Budget](README_01_latency_call_flow.md#memory-budget) 的說明） |
 | **NR 把回聲當噪聲學進去** | AEC 殘留回聲被 MCRA 當底噪 | 先確保 AEC 收斂良好再調 NR；範例預設把 R² 折入 NR 的噪聲底（不要帶 `--legacy-amin`） |
@@ -168,7 +168,7 @@ re-validation.
 | Echo path 變化後適應慢 | AEC `shadow_mu_nlms`、`shadow_err_alpha`（`aec.h`） | 與 `epc_*` 偵測器聯合調過 |
 | Musical noise | NR `alpha_decay`、`alpha_xi`（`anr_types.h`） | 與增益平滑聯合調過；`alpha_g` 在增益路徑上沒有作用，調它無效 |
 | 語音起始被截斷 | NR `alpha_attack`（`anr_types.h`） | 與 `alpha_decay` 成對 |
-| 噪聲環境切換後適應慢 | NR `L`（pool 版面欄位）、`scene_change_*` | `L` 要重新 `anr_get_mem_size()` 並重建實例；`anr_set_mode()` 不能改它 |
+| 噪聲環境切換後適應慢 | NR `L`（pool 版面欄位）、`scene_change_*` | `L` 要重新 `anr_get_mem_size()` 並重建實例；`anr_set_level()` 不能改它 |
 | 初始化期語音被壓 | NR `num_init_frames` | 開頭那段時間 pass-through，且決定 pool 版面 |
 | 穩態噪聲殘留（風扇聲） | NR `alpha_d`（噪聲更新速率） | MCRA 追蹤核心常數 |
 | 語音段噪聲估計上升 | NR `alpha_xi`（SPP 平滑） | 同上 |

@@ -3,7 +3,7 @@
 <head>
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
-<title>Audio_ALG 架構細節 — 效能、preset 與限制</title>
+<title>Audio_ALG 架構細節 — 效能、level 與限制</title>
 <style>
   :root {
     --bg: #fafafa;
@@ -137,7 +137,7 @@
 <header>
   <div class="container">
     <h1>Audio_ALG 架構細節</h1>
-    <p>mono pipeline 的規格與資源、AEC／NR 強度 preset 與已知限制</p>
+    <p>mono pipeline 的規格與資源、AEC／NR 強度 level 與已知限制</p>
   </div>
 </header>
 
@@ -179,12 +179,12 @@
 <strong>分數不在本頁維護。</strong>AEC 模組的 800-case AECMOS（ours / AEC3 / Speex，官方分段、無 pre-align）見 <a href="../../AEC/README.md">AEC/README.md</a> 的 Status snapshot；整路（AEC+NR）對比需以同一語料重量（不做離線 pre-align，delay 由 AEC 的線上 matched-filter 估計器取得；先前的整路重量工具已移出 repository 歸檔，見清理紀錄），本頁不放舊版數字，現況待量測。AECMOS <strong>不量背景噪音抑制</strong>——那才是 NR 的本職，只看 AECMOS 看不到 NR 的降噪價值。
 </div>
 
-<h3>6.4 AEC Preset — 單一 Pareto 旋鈕</h3>
+<h3>6.4 AEC Level — 單一 Pareto 旋鈕</h3>
 
-<p style="margin: 8px 0 4px;">preset 改動的欄位為 <code>min_gain_floor_far_active_db</code>（far-active 殘響 gain 地板，權衡回音消除 ↔ 近端保留）、<code>min_gain_floor_dt_db</code>（double-talk 地板）與 <code>min_gain_split_floor_enabled</code>（<code>aec_config_from_preset()</code> 實測）：</p>
+<p style="margin: 8px 0 4px;">level 改動的欄位為 <code>min_gain_floor_far_active_db</code>（far-active 殘響 gain 地板，權衡回音消除 ↔ 近端保留）、<code>min_gain_floor_dt_db</code>（double-talk 地板）與 <code>min_gain_split_floor_enabled</code>（<code>aec_config_from_level()</code> 實測）：</p>
 
 <table>
-  <tr><th>Preset</th><th>far-active floor</th><th>DT floor</th><th>split floor</th><th>特性 / 場景</th></tr>
+  <tr><th>Level</th><th>far-active floor</th><th>DT floor</th><th>split floor</th><th>特性 / 場景</th></tr>
   <tr><td><strong>mild</strong></td><td>−20 dB</td><td>−20 dB</td><td>開</td><td>近端優先 — 保留更多近端、回音漏更多</td></tr>
   <tr><td><strong>balanced ★</strong></td><td>−28 dB</td><td>−20 dB</td><td>開</td><td><strong>預設、通用</strong></td></tr>
   <tr><td><strong>aggressive</strong></td><td>−38 dB</td><td>−30 dB</td><td>開</td><td>回音優先 — 壓更深、近端損失較多，高 echo 環境</td></tr>
@@ -192,12 +192,12 @@
 </table>
 
 <p style="font-size: 12px; color: var(--muted); margin-top: 8px;">
-  執行期用 <code>aec_set_preset(aec, preset, ramp_ms)</code> 改（ramp 範圍 [0, 60000] ms；DT floor 與 split floor 一律立即階躍）。完整 ours / AEC3 / Speex 三方對照見 <a href="../../AEC/README.md">AEC/README.md</a>。
+  執行期用 <code>aec_set_level(aec, level, ramp_ms)</code> 改（ramp 範圍 [0, 60000] ms；DT floor 與 split floor 一律立即階躍）。完整 ours / AEC3 / Speex 三方對照見 <a href="../../AEC/README.md">AEC/README.md</a>。
 </p>
 
 <h3>6.5 NR 降噪等級</h3>
 
-<p>NR 的強度 preset 只改 <code>g_min_db</code>（最大抑制量，amplitude dB）、<code>q</code>（語音先驗機率）、<code>xi_min_db</code> 與 <code>noise_over_subtraction</code>；時域平滑 <code>alpha_attack</code>／<code>alpha_decay</code> 各等級相同（<code>alpha_g</code> 在增益路徑上不被讀取）：</p>
+<p>NR 的強度 level 只改 <code>g_min_db</code>（最大抑制量，amplitude dB）、<code>q</code>（語音先驗機率）、<code>xi_min_db</code> 與 <code>noise_over_subtraction</code>；時域平滑 <code>alpha_attack</code>／<code>alpha_decay</code> 各等級相同（<code>alpha_g</code> 在增益路徑上不被讀取）：</p>
 
 <table>
   <tr><th>等級</th><th>g_min_db</th><th>q</th><th>推薦場景</th></tr>

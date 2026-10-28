@@ -328,7 +328,7 @@ int mcab_lane_config(const McabConfig* cfg, AecConfig* out) {
     AecConfig lane;
     if (!cfg || !out) return -1;
     memset(&lane, 0, sizeof(lane));
-    aec_config_from_preset(&lane, AEC_PRESET_BALANCED, cfg->sample_rate);
+    aec_config_from_level(&lane, AEC_LEVEL_BALANCED, cfg->sample_rate);
     if (mcab_apply_lane_contract(cfg, &lane) != 0) return -1;
     *out = lane;
     return 0;

@@ -78,7 +78,7 @@ static float lcg_sample(void) {
 }
 
 /* ---------------------------------------------------------------------------------------
- * The pool plan and hop of the example programs (main.c): the lane composed from the preset,
+ * The pool plan and hop of the example programs (main.c): the lane composed from the level,
  * one block holding the AEC, the denoiser, the synthesis and the gain/spectrum buffers.
  * --------------------------------------------------------------------------------------- */
 
@@ -109,11 +109,11 @@ static int plan_make(Plan* p, const ConvMonoConfig* o) {
                                  &p->grid))
         return -1;
     /* The CLI maps unknown names to balanced; an out-of-enum value is this harness's own refusal
-     * (aec_config_from_preset would fall back to balanced). */
-    if (o->aec_preset != AEC_PRESET_MILD && o->aec_preset != AEC_PRESET_BALANCED &&
-        o->aec_preset != AEC_PRESET_AGGRESSIVE && o->aec_preset != AEC_PRESET_NO_FLOOR)
+     * (aec_config_from_level would fall back to balanced). */
+    if (o->aec_level != AEC_LEVEL_MILD && o->aec_level != AEC_LEVEL_BALANCED &&
+        o->aec_level != AEC_LEVEL_AGGRESSIVE && o->aec_level != AEC_LEVEL_NO_FLOOR)
         return -1;
-    aec_config_from_preset(&p->aec_cfg, o->aec_preset, o->sample_rate);
+    aec_config_from_level(&p->aec_cfg, o->aec_level, o->sample_rate);
     p->aec_cfg.fft_size = p->grid.fft_size;
     p->aec_cfg.delay_mode = o->delay_mode;
     p->aec_cfg.delay_num_filters = o->delay_num_filters;
@@ -126,8 +126,8 @@ static int plan_make(Plan* p, const ConvMonoConfig* o) {
     p->total = ALIGN16(p->aec_bytes);
     if (o->aec_only) return 0;
     if (o->enable_nr) {
-        if (!anr_nr_mode_is_valid(o->nr_mode)) return -1;
-        p->nr_cfg = anr_config_for_mode_grid(o->sample_rate, p->grid.fft_size, o->nr_mode);
+        if (!anr_nr_level_is_valid(o->nr_level)) return -1;
+        p->nr_cfg = anr_config_for_level_grid(o->sample_rate, p->grid.fft_size, o->nr_level);
         p->nr_bytes = anr_get_mem_size(&p->nr_cfg);
         if (p->nr_bytes == 0) return -1;
     }
@@ -295,19 +295,19 @@ static void test_validation(int sr, int fft_size, int check_rate_whitelist) {
            p.grid.n_freqs);
 }
 
-/* Once: out-of-enum preset and NR mode, the 48 kHz grid, and the delay mode and bank size
+/* Once: out-of-enum level and NR level, the 48 kHz grid, and the delay mode and bank size
  * passing into the AEC pool size. */
 static void test_config_validation_rejects(void) {
     Plan p;
     ConvMonoConfig o = grid_opts(16000, 0);
     ConvMonoConfig bad;
 
-    bad = o; bad.aec_preset = (AecPreset)99;
-    CHECK(plan_make(&p, &bad) == -1, "plan rejects an out-of-enum aec_preset");
-    bad = o; bad.nr_mode = (AnrMode)99;
-    CHECK(plan_make(&p, &bad) == -1, "plan rejects an out-of-enum nr_mode");
-    bad = o; bad.enable_nr = 0; bad.nr_mode = (AnrMode)99;
-    CHECK(plan_make(&p, &bad) == 0, "an NR mode is not read without a denoiser");
+    bad = o; bad.aec_level = (AecLevel)99;
+    CHECK(plan_make(&p, &bad) == -1, "plan rejects an out-of-enum aec_level");
+    bad = o; bad.nr_level = (AnrLevel)99;
+    CHECK(plan_make(&p, &bad) == -1, "plan rejects an out-of-enum nr_level");
+    bad = o; bad.enable_nr = 0; bad.nr_level = (AnrLevel)99;
+    CHECK(plan_make(&p, &bad) == 0, "an NR level is not read without a denoiser");
     bad = grid_opts(48000, 512);
     CHECK(plan_make(&p, &bad) == -1, "plan rejects FFT 512 at 48 kHz");
     bad = o; bad.delay_mode = AEC_DELAY_EXTERNAL_ALIGNED; bad.delay_num_filters = 2;
@@ -584,8 +584,8 @@ static void test_nr_res_switches(void) {
           rig_init_pool(&thru, pool_thru, thru_p.total, &thru_p) == 0,
           "all three switch instances build");
     if (!on.with_post || !nr_off.with_post || !thru.with_post) return;
-    CHECK(nr_off.nr == NULL && anr_set_mode(nr_off.nr, ANR_MODE_MILD) == -1,
-          "NR-disabled instance has no denoiser and refuses a mode change");
+    CHECK(nr_off.nr == NULL && anr_set_level(nr_off.nr, ANR_LEVEL_MILD) == -1,
+          "NR-disabled instance has no denoiser and refuses a level change");
     hop = on_p.grid.hop_size;
     frame = 2 * hop;                     /* 50% overlap: FFT == frame == 2 hops */
     init_hops = anr_retime_frames(20, 16000, hop);
@@ -886,7 +886,7 @@ static void test_comfort_noise_follows_nr_gain(void) {
 
 typedef struct SwitchCase { int nr, res, cng, legacy; } SwitchCase;
 
-static int compare_to_oracle(int sr, int fft_size, SwitchCase s, AecPreset preset, int hops,
+static int compare_to_oracle(int sr, int fft_size, SwitchCase s, AecLevel level, int hops,
                              int sabotage_legacy, int* nonzero_out) {
     ConvMonoConfig o = grid_opts(sr, fft_size);
     ConvMonoConfig oracle_o;
@@ -900,7 +900,7 @@ static int compare_to_oracle(int sr, int fft_size, SwitchCase s, AecPreset prese
     int h, i, hop, ok = 1, identical = 1, nonzero = 0;
 
     o.enable_nr = s.nr; o.enable_res = s.res; o.enable_cng = s.cng; o.legacy_amin = s.legacy;
-    o.aec_preset = preset;
+    o.aec_level = level;
     oracle_o = o;
     if (sabotage_legacy) oracle_o.legacy_amin = !o.legacy_amin;
     if (plan_make(&p, &o) != 0) return -1;
@@ -938,7 +938,7 @@ static void test_chain_equals_oracle(void) {
     int combo, g, nonzero, rc, all_ok = 1, all_nonzero = 1, n = 0;
     for (combo = 0; combo < 16; ++combo) {
         SwitchCase s = { 1 - (combo & 1), 1 - ((combo >> 1) & 1), 1 - ((combo >> 2) & 1), (combo >> 3) & 1 };
-        rc = compare_to_oracle(16000, 256, s, AEC_PRESET_BALANCED, 800, 0, &nonzero);
+        rc = compare_to_oracle(16000, 256, s, AEC_LEVEL_BALANCED, 800, 0, &nonzero);
         n++;
         if (rc != 1) { all_ok = 0; printf("  mismatch: nr=%d res=%d cng=%d legacy=%d\n", s.nr, s.res, s.cng, s.legacy); }
         if (!nonzero) all_nonzero = 0;
@@ -954,7 +954,7 @@ static void test_chain_equals_oracle(void) {
         int hops = hop_count_for_rate(GRIDS[g].sample_rate) / 2;
         for (k = 0; k < 4; ++k) {
             rc = compare_to_oracle(GRIDS[g].sample_rate, GRIDS[g].fft_size, picks[k],
-                                   k == 3 ? AEC_PRESET_AGGRESSIVE : AEC_PRESET_BALANCED, hops, 0, &nonzero);
+                                   k == 3 ? AEC_LEVEL_AGGRESSIVE : AEC_LEVEL_BALANCED, hops, 0, &nonzero);
             if (rc != 1 || !nonzero) {
                 all_ok = 0;
                 printf("  mismatch @ %d Hz / %d, pick %d\n", GRIDS[g].sample_rate, GRIDS[g].fft_size, k);
@@ -966,7 +966,7 @@ static void test_chain_equals_oracle(void) {
     /* The comparison can fail: an oracle with the NR prior flipped must differ. */
     {
         SwitchCase s = { 1, 1, 1, 0 };
-        rc = compare_to_oracle(16000, 256, s, AEC_PRESET_BALANCED, 800, 1, &nonzero);
+        rc = compare_to_oracle(16000, 256, s, AEC_LEVEL_BALANCED, 800, 1, &nonzero);
         CHECK(rc == 0, "the oracle comparison detects a flipped residual-echo prior");
     }
 }
@@ -1018,8 +1018,8 @@ static void test_frame_and_chain_args(void) {
 typedef struct BlackBoxCase {
     const char* args;     /* the program's options after the three paths */
     int sr, fft_size;     /* fft_size 0: the rate's default grid */
-    AecPreset preset;
-    AnrMode nr_mode;
+    AecLevel level;
+    AnrLevel nr_level;
     int nr, res, cng, legacy;
 } BlackBoxCase;
 
@@ -1057,8 +1057,8 @@ static int black_box_case(const char* bin, const char* tmp, const BlackBoxCase* 
     snprintf(ref_path, sizeof ref_path, "%s/bb_ref_%d.wav", tmp, bc->sr);
     snprintf(out_path, sizeof out_path, "%s/bb_out.wav", tmp);
     snprintf(dump_path, sizeof dump_path, "%s/bb_ctx.bin", tmp);
-    o.aec_preset = bc->preset;
-    o.nr_mode = bc->nr_mode;
+    o.aec_level = bc->level;
+    o.nr_level = bc->nr_level;
     o.enable_nr = bc->nr; o.enable_res = bc->res; o.enable_cng = bc->cng; o.legacy_amin = bc->legacy;
     c = conv_mono_create(&o);
     if (!c) return -1;
@@ -1105,32 +1105,44 @@ static int black_box_case(const char* bin, const char* tmp, const BlackBoxCase* 
 
 static void test_examples_black_box(const char* bin_dir, const char* tmp) {
     static const BlackBoxCase cases[] = {
-        {"--fft-size 256", 16000, 256, AEC_PRESET_BALANCED, ANR_MODE_BALANCED, 1, 1, 1, 0},
-        {"--fft-size 256 --no-res", 16000, 256, AEC_PRESET_BALANCED, ANR_MODE_BALANCED, 1, 0, 1, 0},
-        {"--fft-size 256 --no-nr", 16000, 256, AEC_PRESET_BALANCED, ANR_MODE_BALANCED, 0, 1, 1, 0},
-        {"--fft-size 256 --no-cng", 16000, 256, AEC_PRESET_BALANCED, ANR_MODE_BALANCED, 1, 1, 0, 0},
-        {"--fft-size 256 --legacy-amin", 16000, 256, AEC_PRESET_BALANCED, ANR_MODE_BALANCED, 1, 1, 1, 1},
-        {"--fft-size 256 --no-nr --no-res", 16000, 256, AEC_PRESET_BALANCED, ANR_MODE_BALANCED, 0, 0, 1, 0},
-        {"--fft-size 256 aggressive --nr-preset aggressive", 16000, 256, AEC_PRESET_AGGRESSIVE,
-         ANR_MODE_AGGRESSIVE, 1, 1, 1, 0},
-        {"--fft-size 512 mild --nr-preset mild", 16000, 512, AEC_PRESET_MILD, ANR_MODE_MILD, 1, 1, 1, 0},
-        {"", 8000, 0, AEC_PRESET_BALANCED, ANR_MODE_MODERATE, 1, 1, 1, 0},
+        {"--fft-size 256", 16000, 256, AEC_LEVEL_BALANCED, ANR_LEVEL_BALANCED, 1, 1, 1, 0},
+        {"--fft-size 256 --no-res", 16000, 256, AEC_LEVEL_BALANCED, ANR_LEVEL_BALANCED, 1, 0, 1, 0},
+        {"--fft-size 256 --no-nr", 16000, 256, AEC_LEVEL_BALANCED, ANR_LEVEL_BALANCED, 0, 1, 1, 0},
+        {"--fft-size 256 --no-cng", 16000, 256, AEC_LEVEL_BALANCED, ANR_LEVEL_BALANCED, 1, 1, 0, 0},
+        {"--fft-size 256 --legacy-amin", 16000, 256, AEC_LEVEL_BALANCED, ANR_LEVEL_BALANCED, 1, 1, 1, 1},
+        {"--fft-size 256 --no-nr --no-res", 16000, 256, AEC_LEVEL_BALANCED, ANR_LEVEL_BALANCED, 0, 0, 1, 0},
+        /* The NR level is --nr-level; --nr-preset is the same option under its earlier name. */
+        {"--fft-size 256 aggressive --nr-level aggressive", 16000, 256, AEC_LEVEL_AGGRESSIVE,
+         ANR_LEVEL_AGGRESSIVE, 1, 1, 1, 0},
+        {"--fft-size 512 mild --nr-level mild", 16000, 512, AEC_LEVEL_MILD, ANR_LEVEL_MILD, 1, 1, 1, 0},
+        {"--fft-size 256 2 --nr-level 3", 16000, 256, AEC_LEVEL_AGGRESSIVE, ANR_LEVEL_AGGRESSIVE, 1, 1, 1, 0},
+        {"--fft-size 256 --nr-preset 0 3", 16000, 256, AEC_LEVEL_NO_FLOOR, ANR_LEVEL_MILD, 1, 1, 1, 0},
+        {"--nr-level moderate", 8000, 0, AEC_LEVEL_BALANCED, ANR_LEVEL_MODERATE, 1, 1, 1, 0},
+        {"--nr-preset aggressive --nr-level mild", 8000, 0, AEC_LEVEL_BALANCED, ANR_LEVEL_MILD, 1, 1, 1, 0},
+        /* The AEC level is the positional argument or --aec-level. */
+        {"--fft-size 256 --aec-level aggressive --nr-level aggressive", 16000, 256, AEC_LEVEL_AGGRESSIVE,
+         ANR_LEVEL_AGGRESSIVE, 1, 1, 1, 0},
+        {"--aec-level 3 --fft-size 256", 16000, 256, AEC_LEVEL_NO_FLOOR, ANR_LEVEL_BALANCED, 1, 1, 1, 0},
+        {"--aec-level mild --fft-size 512 --nr-level mild", 16000, 512, AEC_LEVEL_MILD, ANR_LEVEL_MILD, 1, 1, 1, 0},
+        {"mild --fft-size 256", 16000, 256, AEC_LEVEL_MILD, ANR_LEVEL_BALANCED, 1, 1, 1, 0},
+        {"--aec-level 2", 8000, 0, AEC_LEVEL_AGGRESSIVE, ANR_LEVEL_BALANCED, 1, 1, 1, 0},
+        {"--fft-size 256 aggressive --nr-preset aggressive", 16000, 256, AEC_LEVEL_AGGRESSIVE,
+         ANR_LEVEL_AGGRESSIVE, 1, 1, 1, 0},
+        {"--fft-size 512 mild --nr-preset mild", 16000, 512, AEC_LEVEL_MILD, ANR_LEVEL_MILD, 1, 1, 1, 0},
+        {"--nr-preset moderate", 8000, 0, AEC_LEVEL_BALANCED, ANR_LEVEL_MODERATE, 1, 1, 1, 0},
     };
     static const char* const programs[] = {"aec_nr_pipeline", "aec_nr_pipeline_static"};
     size_t pi, ci;
-    char bin[512], args[256];
+    char bin[512];
     for (pi = 0; pi < 2; ++pi) {
         snprintf(bin, sizeof bin, "%s/%s", bin_dir, programs[pi]);
         for (ci = 0; ci < sizeof cases / sizeof cases[0]; ++ci) {
             BlackBoxCase bc = cases[ci];
             int hops = 0, rc;
-            /* 8 kHz runs the moderate NR preset through the CLI name */
-            snprintf(args, sizeof args, "%s%s", bc.args, bc.sr == 8000 ? "--nr-preset moderate" : "");
-            bc.args = args;
             rc = black_box_case(bin, tmp, &bc, &hops);
             CHECK(rc == 1 && hops >= 390,
                   fmt_msg("black box: %s %s @ %d Hz equals the oracle bit for bit (%d hops)",
-                          programs[pi], args, bc.sr, hops));
+                          programs[pi], bc.args, bc.sr, hops));
         }
     }
 }
@@ -1144,11 +1156,30 @@ static int example_exit_is(const char* bin, const char* args, int want) {
     return system(cmd) == 0;
 }
 
+/* 1 when the program's output (stdout and stderr) for `args` contains `text`. */
+static int example_output_has(const char* bin, const char* args, const char* text) {
+    char cmd[1024];
+    snprintf(cmd, sizeof cmd, "'%s' %s 2>&1 | grep -q -F -e '%s'", bin, args, text);
+    return system(cmd) == 0;
+}
+
 static void test_examples_cli_values(const char* bin_dir) {
     static const char* const programs[] = {"aec_nr_pipeline", "aec_nr_pipeline_static"};
     static const char* const missing[] = {
         "--nr-preset", "--fft-size", "--nr-preset --no-res", "--fft-size --no-cng",
         "--nr-preset --", "--fft-size --nr-preset mild", "mild --nr-preset --no-nr",
+        "--nr-level", "--nr-level --no-res", "--nr-level --", "--fft-size --nr-level mild",
+        "mild --nr-level --no-nr", "--nr-level --nr-preset", "--nr-preset --nr-level",
+        "--nr-level mild --nr-level", "--nr-preset mild --nr-level --no-cng",
+        "--aec-level", "--aec-level --no-res", "--aec-level --", "--fft-size --aec-level 1",
+        "mild --aec-level --no-nr", "--aec-level --nr-level", "--aec-level mild --aec-level",
+    };
+    /* One AEC level per command line: a second one, in any mix of the positional and
+     * --aec-level, is a command-line error (exit 2) even when it is an unknown word. */
+    static const char* const second_level[] = {
+        "1 2", "mild mild", "--aec-level 1 2", "1 --aec-level 2", "--aec-level 1 --aec-level 2",
+        "--aec-level mild --aec-level mild", "1 --no-res 2", "--fft-size 256 1 bogus", "bogus 1",
+        "2 --nr-level mild --aec-level 2",
     };
     size_t pi, ci;
     char bin[512], args[256];
@@ -1159,10 +1190,30 @@ static void test_examples_cli_values(const char* bin_dir) {
             CHECK(example_exit_is(bin, args, 2),
                   fmt_msg("%s %s: the value is missing, exit 2", programs[pi], missing[ci]));
         }
+        for (ci = 0; ci < sizeof second_level / sizeof second_level[0]; ++ci) {
+            snprintf(args, sizeof args, "no_mic.wav no_ref.wav no_out.wav %s", second_level[ci]);
+            CHECK(example_exit_is(bin, args, 2),
+                  fmt_msg("%s %s: a second AEC level, exit 2", programs[pi], second_level[ci]));
+        }
+        CHECK(example_output_has(bin, "no_mic.wav no_ref.wav no_out.wav 1 --aec-level 2", "second AEC level"),
+              fmt_msg("%s a second AEC level names the problem on the output", programs[pi]));
         CHECK(example_exit_is(bin, "no_mic.wav no_ref.wav no_out.wav --nr-preset -x", 1),
               fmt_msg("%s --nr-preset -x: \"-x\" is a value, the run stops at the input", programs[pi]));
         CHECK(example_exit_is(bin, "no_mic.wav no_ref.wav no_out.wav --fft-size 256 --nr-preset mild", 1),
               fmt_msg("%s valid options reach the input check", programs[pi]));
+        CHECK(example_output_has(bin, "", "--nr-level") && example_output_has(bin, "", "--nr-preset") &&
+                  example_output_has(bin, "", "--aec-level"),
+              fmt_msg("%s usage names --aec-level, --nr-level and its earlier spelling --nr-preset", programs[pi]));
+        CHECK(example_output_has(bin, "", "give one of them once"),
+              fmt_msg("%s usage says to give one AEC level", programs[pi]));
+        CHECK(example_exit_is(bin, "no_mic.wav no_ref.wav no_out.wav --aec-level -x", 1),
+              fmt_msg("%s --aec-level -x: \"-x\" is a value, the run stops at the input", programs[pi]));
+        CHECK(example_exit_is(bin, "no_mic.wav no_ref.wav no_out.wav --aec-level 3 --fft-size 256", 1),
+              fmt_msg("%s --aec-level with other options reaches the input check", programs[pi]));
+        CHECK(example_exit_is(bin, "no_mic.wav no_ref.wav no_out.wav --nr-level -x", 1),
+              fmt_msg("%s --nr-level -x: \"-x\" is a value, the run stops at the input", programs[pi]));
+        CHECK(example_exit_is(bin, "no_mic.wav no_ref.wav no_out.wav --fft-size 256 --nr-level mild 2", 1),
+              fmt_msg("%s --nr-level with an AEC level reaches the input check", programs[pi]));
     }
     snprintf(bin, sizeof bin, "%s/aec_nr_pipeline_static", bin_dir);
     CHECK(example_exit_is(bin, "--print-mem-size --nr-preset --no-res", 2),
@@ -1171,6 +1222,32 @@ static void test_examples_cli_values(const char* bin_dir) {
           "aec_nr_pipeline_static --print-mem-size --nr-preset: exit 2");
     CHECK(example_exit_is(bin, "--print-mem-size --nr-preset mild --fft-size 256", 0),
           "aec_nr_pipeline_static --print-mem-size with valid options: exit 0");
+    CHECK(example_exit_is(bin, "--print-mem-size --nr-level --no-res", 2),
+          "aec_nr_pipeline_static --print-mem-size --nr-level --no-res: exit 2");
+    CHECK(example_exit_is(bin, "--print-mem-size --nr-level", 2),
+          "aec_nr_pipeline_static --print-mem-size --nr-level: exit 2");
+    CHECK(example_exit_is(bin, "--print-mem-size --aec-level --no-res", 2),
+          "aec_nr_pipeline_static --print-mem-size --aec-level --no-res: exit 2");
+    CHECK(example_exit_is(bin, "--print-mem-size --aec-level", 2),
+          "aec_nr_pipeline_static --print-mem-size --aec-level: exit 2");
+    CHECK(example_exit_is(bin, "--print-mem-size --aec-level 3 --nr-level aggressive --fft-size 256", 0),
+          "aec_nr_pipeline_static --print-mem-size --aec-level with --nr-level: exit 0");
+    CHECK(example_exit_is(bin, "--print-mem-size 3 --nr-level aggressive --fft-size 256", 0),
+          "aec_nr_pipeline_static --print-mem-size --nr-level with an AEC level: exit 0");
+    CHECK(example_exit_is(bin, "--print-mem-size 1 2", 2),
+          "aec_nr_pipeline_static --print-mem-size 1 2: a second AEC level, exit 2");
+    CHECK(example_exit_is(bin, "--print-mem-size mild mild", 2),
+          "aec_nr_pipeline_static --print-mem-size mild mild: a second AEC level, exit 2");
+    CHECK(example_exit_is(bin, "--print-mem-size --aec-level 1 2", 2),
+          "aec_nr_pipeline_static --print-mem-size --aec-level 1 2: a second AEC level, exit 2");
+    CHECK(example_exit_is(bin, "--print-mem-size 1 --aec-level 2", 2),
+          "aec_nr_pipeline_static --print-mem-size 1 --aec-level 2: a second AEC level, exit 2");
+    CHECK(example_exit_is(bin, "--print-mem-size --aec-level 1 --aec-level 2", 2),
+          "aec_nr_pipeline_static --print-mem-size --aec-level 1 --aec-level 2: a second AEC level, exit 2");
+    CHECK(example_exit_is(bin, "--print-mem-size 1 --no-res bogus", 2),
+          "aec_nr_pipeline_static --print-mem-size 1 --no-res bogus: a second AEC level, exit 2");
+    CHECK(example_exit_is(bin, "--print-mem-size bogus", 0),
+          "aec_nr_pipeline_static --print-mem-size bogus: one unknown level falls back, exit 0");
 }
 
 int main(int argc, char** argv) {

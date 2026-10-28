@@ -3,7 +3,7 @@
 
 | # | 步驟 | 呼叫 | 什麼時候呼叫 | 這一步可能怎麼失敗 |
 |---|---|---|---|---|
-| 1 | config | `mcab_default_config(sr)`，再 `mcab_lane_config(&cfg, &lane)`（或 `aec_config_from_preset()` ＋ `mcab_apply_lane_contract(&cfg, &lane)`）與 `mcab_delay_estimator_config(&cfg, &dc)` | 配置任何記憶體之前 | `mcab_default_config()` 不驗證。其餘回 `-1`：`cfg` 未通過驗證（[§4](integration_4ch_core_zh_TW_03_config.md#4-config-完整參考)）；`mcab_apply_lane_contract()` 另外在 lane 是為別的取樣率建的時候回 `-1`，lane 不變 |
+| 1 | config | `mcab_default_config(sr)`，再 `mcab_lane_config(&cfg, &lane)`（或 `aec_config_from_level()` ＋ `mcab_apply_lane_contract(&cfg, &lane)`）與 `mcab_delay_estimator_config(&cfg, &dc)` | 配置任何記憶體之前 | `mcab_default_config()` 不驗證。其餘回 `-1`：`cfg` 未通過驗證（[§4](integration_4ch_core_zh_TW_03_config.md#4-config-完整參考)）；`mcab_apply_lane_contract()` 另外在 lane 是為別的取樣率建的時候回 `-1`，lane 不變 |
 | 2 | query | `aec_get_mem_size(&lane)`、`delay_aec_get_mem_size(dc.sample_rate, dc.hop_size, dc.num_filters)`（只在 `dc.required`）、`mcab_get_mem_requirements(&cfg, &req)` | **每次 init 之前**都要重查，不可跨 build / backend / config 快取 | `aec_get_mem_size()`／`delay_aec_get_mem_size()` 回 `0` = 無效。`mcab_get_mem_requirements()` 回 `-1`：`out` 為 NULL；`cfg` 未通過驗證；編譯 `mcab.c` 時沒帶 `-DAUDIO_PIPELINE_BACKEND_STR="ne10"` |
 | 3 | allocate | 你自己的配置器：四塊 lane 記憶體、estimator 的 pool 與 `DelayAec` 結構本身、`req.bytes` 且對齊 `req.alignment`（16）的 mcab pool | 拿到各個大小之後 | mcab 的 pool **不需要**預先清零（poison pattern 可接受，已實測）。`mcab_init_ex()` 驗證全部通過後自己把整塊 memset 成 0；被拒時 pool 一個 byte 都不動 |
 | 4 | init lib 物件 | `aec_init(mem, bytes, &lane)` ×4、`delay_aec_init(&delay, mem, bytes, sr, hop, nf)`（只在 MATCHED） | 配置之後、`mcab_init_ex()` 之前 | `aec_init()` 回 `NULL`、`delay_aec_init()` 回非 0：config 無效或 pool 太小／未對齊。四條 lane 必須是**四個不同的物件**，且必須是剛建好的，或已經 `aec_reset()`／`delay_aec_reset()`（或由先前那個 flow 的 `mcab_reset()`）重置過：mcab 看不出物件已經跑過，用過的 estimator 會把舊的 delay 交給新的 flow |
@@ -91,49 +91,51 @@ wall-clock 成本。lane 內部的 `delay_us` 也一併加進上面的 `delay_us
 
 ### 3.2 執行期強度控制
 
-強度面屬於擁有 RES 與 NR 的那一層。flow `Mcab` **沒有** preset／mode setter；
+強度面屬於擁有 RES 與 NR 的那一層。flow `Mcab` **沒有** level setter；
 你自己串後級時，直接對你 carve 的 stage 呼叫：
 
 ```c
-aec_res_set_preset(res, AEC_PRESET_AGGRESSIVE, 100.0f);          /* 回 0 成功 */
-anr_set_mode(nr, ANR_MODE_MILD);
+aec_res_set_level(res, AEC_LEVEL_AGGRESSIVE, 100.0f);          /* 回 0 成功 */
+anr_set_level(nr, ANR_LEVEL_MILD);
 float live, target;
 aec_res_split_floor(res, &live, &target);                        /* 唯讀，線性功率 */
 ```
 
 上式的 `res`、`nr` 就是你自己 `aec_res_init()`／`anr_init()` 回來的那兩個 handle
 （`mcab_external_static.c` 的 `Post` 結構）。sample 層 beamformer helper 同樣不持有 RES，強度也是對你自己建的 `AecRes`
-呼叫 `aec_res_set_preset()`（見 `docs/integration_4ch_spatial_zh_TW_02_lifecycle.md`）。
+呼叫 `aec_res_set_level()`（見 `docs/integration_4ch_spatial_zh_TW_02_lifecycle.md`）。
 
-> **本節最重要的一件事：對四條 lane 重新指定 preset 是無效操作。**
+> **本節最重要的一件事：對四條 lane 重新指定 level 是無效操作。**
 >
 > 四條 AEC lane 都以 `spatial_linear_context` 建立（契約欄位，`mcab_apply_lane_contract()` 蓋上），因此**沒有任何一條**會走到
 > 自己的 suppression-gain 路徑；它們各自的地板什麼都不塑形。真正乘上輸出、
 > 也真正決定 comfort noise 量的那個 gain，來自**唯一一個**共用的 post 級抑制器
-> （`AecRes`；由你的應用擁有）。這也是為什麼 preset setter 要作用在它上面，而不是要你自己
-> 對四條 lane 迴圈呼叫 `aec_set_preset()`。共用 post 級 `AecRes` 的 reset 與 preset 行為由測試釘住
-> （`pipelines/4ch_aec_bf_nr_res/tests/test_mcab_sample_beam.c` 的 `test_caller_res_reset_and_preset`），不是推測。
+> （`AecRes`；由你的應用擁有）。這也是為什麼 level setter 要作用在它上面，而不是要你自己
+> 對四條 lane 迴圈呼叫 `aec_set_level()`。共用 post 級 `AecRes` 的 reset 與 level 行為由測試釘住
+> （`pipelines/4ch_aec_bf_nr_res/tests/test_mcab_sample_beam.c` 的 `test_caller_res_reset_and_level`），不是推測。
 
 | 呼叫 | 改／讀什麼 | 失敗（回 `-1`，**什麼都不寫**） |
 |---|---|---|
-| `aec_res_set_preset(res, preset, ramp_ms)` | **共用 post 級抑制器**的 far-active split floor | `res` 為 NULL；`preset` 超出 enum；`ramp_ms` 非有限值或超出 `[0, 60000]` |
-| `anr_set_mode(nr, mode)` | 你擁有的**那一個**降噪器（NR 是對 beamform 後的訊號跑，不是每條 lane 一個） | `nr` 為 NULL；`mode` 超出 enum；該 preset 的 config 被 `anr_reconfigure()` 拒絕 |
+| `aec_res_set_level(res, level, ramp_ms)` | **共用 post 級抑制器**的 far-active split floor | `res` 為 NULL；`level` 超出 enum；`ramp_ms` 非有限值或超出 `[0, 60000]` |
+| `anr_set_level(nr, level)` | 你擁有的**那一個**降噪器（NR 是對 beamform 後的訊號跑，不是每條 lane 一個） | `nr` 為 NULL；`level` 超出 enum；該 level 的 config 被 `anr_reconfigure()` 拒絕 |
 | `aec_res_split_floor(res, &live, &target)` | 唯讀。`live` = 抑制器**當下**套用的值，`target` = 撐得過 reset 的已設定值；兩者只有在 ramp 走到一半時才不同。任一指標可為 NULL | `res` 為 NULL |
 
 `live` / `target` 這一對是**板端唯一值得記錄的強度量**：它是真正塑形輸出的東西
 （lane 自己的地板什麼都不塑形），而兩個值合在一起就回答了「我要求的改動落地了沒有」。
 
-`ramp_ms == 0` 代表下一個 hop 就套用，**不是錯誤**，落點與「用該 preset 從頭建一個
+C 稱 level，Python 稱 preset（NR 為 strength）：**C level == Python preset**，值名與整數相同。舊名 `AecPreset`／`AEC_PRESET_*`、`AnrMode`／`ANR_MODE_*` 仍保留在公開 header（同值），舊函式名已移除。
+
+`ramp_ms == 0` 代表下一個 hop 就套用，**不是錯誤**，落點與「用該 level 從頭建一個
 新實例」完全相同；`> 0` 則以 dB 為單位線性走過去，上限 60 秒。mild ↔ aggressive 是
 18 dB 落差、地板又是硬性 clamp，所以互動式旋鈕應該給一個 ramp。ramp 進行中再呼叫
 一次，會從當前的 live 值重新起走。
 
 兩個 setter 都**不是重啟**：四條 lane 的濾波器、共用延遲鎖定、NR 的噪聲底與增益
-平滑歷史全部繼續跑。preset 的改動**撐得過**該 stage 的 reset（目標值另存一份，reset 會重新套用），但 ramp 進度會被丟掉。
+平滑歷史全部繼續跑。level 的改動**撐得過**該 stage 的 reset（目標值另存一份，reset 會重新套用），但 ramp 進度會被丟掉。
 **在兩個 hop 之間呼叫、與 `mcab_process_front()`／`mcab_fuse()` 序列化；非 thread-safe。**
 
-> 範例的降噪器以 `anr_config_for_mode_grid()` 建立、沒有覆寫任何欄位（最小值追蹤視窗 `L` 用函式庫預設），所以 `anr_set_mode()`
-> 直接換強度。若你在 preset 之上改過欄位，`anr_set_mode()` 會把它們蓋回 preset 值：
+> 範例的降噪器以 `anr_config_for_level_grid()` 建立、沒有覆寫任何欄位（最小值追蹤視窗 `L` 用函式庫預設），所以 `anr_set_level()`
+> 直接換強度。若你在 level 組態之上改過欄位，`anr_set_level()` 會把它們蓋回 level 值：
 > 那種實例請自己組好完整 target 再呼叫 `anr_reconfigure()`。
 
 **A/B 量測時該預期什麼。** far-active 地板只在 **far-active 且非 double-talk** 的

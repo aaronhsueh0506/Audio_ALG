@@ -81,16 +81,16 @@ flow 沒有 RES：`frame.g_res_ctx` 恆為 NULL，RES 增益由你的 `AecRes` �
  │                 │（你建立並擁有）            │                    │               │             │            │
  │══ 初始化（一次；每次 init 前重查，不快取）════════════════════════════════════════
  │ mcab_default_config(sr)  → cfg（不驗證，只填值；覆寫你要改的欄位）
- │ mcab_lane_config(&cfg,&lane)  或  aec_config_from_preset(&lane,…) ＋ mcab_apply_lane_contract(&cfg,&lane)
+ │ mcab_lane_config(&cfg,&lane)  或  aec_config_from_level(&lane,…) ＋ mcab_apply_lane_contract(&cfg,&lane)
  │ aec_get_mem_size(&lane) → 配置 → aec_init() ×4 ───►│（四個不同的 Aec；新建或已 reset）
  │ mcab_delay_estimator_config(&cfg,&dc)；dc.required（只在 MATCHED）時：
  │   delay_aec_get_mem_size → 配置 → delay_aec_init(&delay,…) ──►│（DelayAec 結構本身也是你的儲存空間）
  │ mcab_get_mem_requirements(&cfg,&req) ───────────────────►│    → req.bytes、req.alignment（0 成功／-1 失敗）
  │ 配置 req.bytes（16-byte 對齊）
  │ mcab_init_ex(pool,req.bytes,&cfg,&libs,&req) ───────────►│    → handle（NULL = descriptor 8 項、config、lane／estimator 檢查之一不符；無診斷輸出）
- │ 後級各自 mem_size + init：aec_config_from_preset(&res_cfg,…) ＋ res_cfg.fft_size = mcab_fft_size(p)
+ │ 後級各自 mem_size + init：aec_config_from_level(&res_cfg,…) ＋ res_cfg.fft_size = mcab_fft_size(p)
  │   aec_res_get_mem_size/aec_res_init ──────────────────────────────────────────►│
- │   anr_config_for_mode_grid/anr_get_mem_size/anr_init ────────────────────────────────────►│
+ │   anr_config_for_level_grid/anr_get_mem_size/anr_init ────────────────────────────────────►│
  │   ac_stft_config_default/ac_istft_get_mem_size/ac_istft_init ────────────────────────────────────────►│
  │══ 每個 hop（mics[hop*4] interleaved、ref[hop]）══════════════════════════
  │ mcab_process_front(p,mics,ref,&front) ───────────────────►│    → MCAB_OK / -1 / -3；front 為借用視圖
@@ -105,7 +105,7 @@ flow 沒有 RES：`frame.g_res_ctx` 恆為 NULL，RES 增益由你的 `AecRes` �
  │ skn_all_finite_f32(out,hop)
  │══ 任一步被拒（-3 時 flow 已自己 reset），或輸出非有限 ══════════════════════════
  │ mcab_reset(p)（含四條 lane 與 estimator 自己的 reset）; aec_res_reset(res); anr_reset(nr); ac_istft_reset(istft); rng = MCAB_SAMPLE_CNG_RNG_SEED
- │══ 強度（hop 之間）：aec_res_set_preset(res,preset,ramp_ms)；anr_set_mode(nr,mode) ═══
+ │══ 強度（hop 之間）：aec_res_set_level(res,level,ramp_ms)；anr_set_level(nr,level) ═══
  │══ 結束：mcab_destroy(p) → aec_destroy(lane) ×4；anr_destroy(nr)；之後才釋放記憶體 ═══
 ```
 
@@ -154,8 +154,8 @@ front → BF → fuse → 後級  處理 in[t] 處理 in[t+1] 處理 in[t+2]   �
 | `capture_proxy_channel` | `[0, 3]`，預設 0 | init 前 | 共用 delay matcher 吃哪一支 mic |
 | `max_delay_ms` | `[0, 4096]`，預設 1024 | init 前 | `MATCHED` 的 reference ring 容量；略大於真實最大延遲即可 |
 | `enable_post` | 0／1，預設 1 | init 前 | 1 = 可呼叫 `mcab_fuse()`；0 = 只有 front（神經後濾波直接吃 BF 頻譜） |
-| 每條 lane 的 `AecConfig`（preset、`filter_length`…） | `mcab_lane_config()` = balanced preset；或應用自己 `aec_config_from_preset()` 後再 `mcab_apply_lane_contract()` | `aec_init()` 前，不可變 | **應用的決定，不在 `McabConfig` 內**：四路 AEC 記憶體最主要的旋鈕是 lane 的 `filter_length` |
-| 後級強度（你串的 stage） | `aec_res_set_preset(res, preset, ramp_ms)`、`anr_set_mode(nr, mode)` | hop 之間 | RES、NR 強度（[§3.2](integration_4ch_core_zh_TW_02_lifecycle.md#32-執行期強度控制)）；flow 本身沒有 preset 欄位 |
+| 每條 lane 的 `AecConfig`（level、`filter_length`…） | `mcab_lane_config()` = balanced level；或應用自己 `aec_config_from_level()` 後再 `mcab_apply_lane_contract()` | `aec_init()` 前，不可變 | **應用的決定，不在 `McabConfig` 內**：四路 AEC 記憶體最主要的旋鈕是 lane 的 `filter_length` |
+| 後級強度（你串的 stage） | `aec_res_set_level(res, level, ramp_ms)`、`anr_set_level(nr, level)` | hop 之間 | RES、NR 強度（[§3.2](integration_4ch_core_zh_TW_02_lifecycle.md#32-執行期強度控制)）；flow 本身沒有 level 欄位 |
 
 進階外部（預設關閉；打開前請閱讀標頭註解）：`delay_est_period_s`（預設 0.0 = 全速；非 0 可能改變選到的 lag，是 opt-in 的算量旋鈕）。
 
@@ -163,7 +163,7 @@ front → BF → fuse → 後級  處理 in[t] 處理 in[t+1] 處理 in[t+2]   �
 
 | 項目 | 位置 | 為什麼不開放 |
 |---|---|---|
-| lane 的契約欄位：`delay_mode = AEC_DELAY_EXTERNAL_ALIGNED`（`delay_num_filters = DA_NUM_FILTERS`、`fixed_delay_samples = -1`、`enable_delay_est = 0`）、`enable_res = 0`、`return_res_context = 1`、`spatial_linear_context`（`enable_post = 1` 為 `AEC_CONTEXT_NO_GAIN`，`0` 為 `AEC_CONTEXT_LINEAR_ONLY`）、`delay_est_period_s` | `mcab.c` 的 `mcab_apply_lane_contract()` | 只能由 `mcab_apply_lane_contract()` 蓋上；`mcab_init_ex()` 只驗得到其中一部分（hop／bin 數、不帶自己的 gain、post 半邊、已對齊的 far），之後自行改欄位等於繞過檢查。四條 lane 的地板什麼都不塑形；對 lane 呼叫 `aec_set_preset()` 是無效操作（[§3.2](integration_4ch_core_zh_TW_02_lifecycle.md#32-執行期強度控制)） |
+| lane 的契約欄位：`delay_mode = AEC_DELAY_EXTERNAL_ALIGNED`（`delay_num_filters = DA_NUM_FILTERS`、`fixed_delay_samples = -1`、`enable_delay_est = 0`）、`enable_res = 0`、`return_res_context = 1`、`spatial_linear_context`（`enable_post = 1` 為 `AEC_CONTEXT_NO_GAIN`，`0` 為 `AEC_CONTEXT_LINEAR_ONLY`）、`delay_est_period_s` | `mcab.c` 的 `mcab_apply_lane_contract()` | 只能由 `mcab_apply_lane_contract()` 蓋上；`mcab_init_ex()` 只驗得到其中一部分（hop／bin 數、不帶自己的 gain、post 半邊、已對齊的 far），之後自行改欄位等於繞過檢查。四條 lane 的地板什麼都不塑形；對 lane 呼叫 `aec_set_level()` 是無效操作（[§3.2](integration_4ch_core_zh_TW_02_lifecycle.md#32-執行期強度控制)） |
 | backward quarantine：`delay_backward_quarantine_enabled`／`delay_backward_quarantine_s`（預設 0／1.0 s） | `McabConfig`（`mcab.h`）；行為在 `mcab.c` 的 `update_shared_delay()` | 研究開關，產品組態維持 0：只把往前的候選延後一個窗，不修正誤鎖，也不是 pre-echo 誤鎖的解藥；欄位在 `enable` 為 0 時仍被驗證（[§4.1](integration_4ch_core_zh_TW_03_config.md#41-逐欄位)） |
 | duty-cycle 的啟動時間 `DUTY_HOLD_S`（0.3 s，固定）與 matched filter 的 `DA_*` 常數 | `mcab.c`、`delay_aec.h` | 估計器聯合調過；duty-cycle 的啟動時間不是旋鈕 |
 | delay admission 的門檻 `MCAB_DELAY_CHANGE_MIN_SAMPLES`（32）、`_CONFIRM_SAMPLES`（16）、`_CANDIDATE_TTL`（3 hops） | `mcab_internal.h` | 與 lib/aec 同一條規則，不是介面 |
