@@ -84,6 +84,7 @@ dfn_hop_begin(&amp;hop, E, P)
  │      [t-(2-M)..t+M] 視窗,app 走 noisy ring)
  └─【8/16 kHz host】dfn_rate_bridge_begin(bridge, E, P)
         ac_istft_push(synth_e, E)、ac_istft_push(synth_p, P)  同款 sqrt-Hann WOLA,各得一個 native hop
+        (AEC 硬重置事件:這一步之前呼叫 dfn_rate_bridge_reset_synthesis(),只清這兩顆的 OLA 尾巴)
         → 兩顆 audio_resampler 各自升到 48 kHz(16 k ×3、8 k ×6)→ 兩條 48 kHz FIFO
 
 while (dfn_hop_nn_begin(&amp;hop, &amp;job) &gt; 0) {            (每 hop 0..2 次)
@@ -143,15 +144,15 @@ out: erb_mask -&gt; erb_mask [32]=32 | df_coefs -&gt; coefs [96][5][2]=960(bin �
 <p>Pool 切分(<code>dfn/mono_aec_dfn_res/main.c</code> 的 <code>make_plan()</code>／<code>rig_build()</code>,每塊 16-byte 對齊):<code>Aec</code> pool → <code>unity</code>／<code>total_gain</code>(各 [n_freqs] float)與 P 緩衝 <code>post</code>([n_freqs] <code>Complex</code>;這裡無 NR、無額外合成)→ 二擇一:48 kHz 是 <code>DfnResStage</code> pool + 呼叫端的 <code>AcIstft</code> + stage 輸出頻譜 [513] <code>Complex</code>,原生格點是<b>整個 <code>DfnRateBridge</code> pool</b>(stage 的 pool 在它裡面)。<code>DfnHop</code> 是 <code>main.c</code> 裡的非擁有指標結構。stage 內部再 carve:stage 控制塊 → <code>DFN2Prepost</code> pool → 一塊 6×513 float 的 slab。</p>
 <table>
 <tr><th>state</th><th>大小</th><th>存放者</th><th>備註</th></tr>
-<tr><td><code>Aec</code> 全狀態(線性濾波器、delay estimator、RES/post)</td><td>364,416 B(16 kHz/256,<code>aec_get_mem_size()</code>)</td><td>pool</td><td>lane 以 <code>enable_res=0</code>/<code>return_res_context=1</code> 建,RES 增益由 <code>Aec</code> 自己算(<code>res_gain</code>);NR 實例<b>完全不存在</b>。合成 <code>AcIstft</code>(OLA／窗表)只有 48 kHz 路徑用到(由 <code>DfnHop</code> 持有),原生格點改由 bridge 合成</td></tr>
-<tr><td>暫存 <code>unity</code> / <code>total_gain</code> / <code>post</code>(P)、comfort-noise RNG</td><td>各 [n_freqs];RNG 為 uint32;三者合計 2,096 B(16 kHz/256:2×528 + 1,040)</td><td>pool(<code>main.c</code> 的 <code>Rig</code>)</td><td><code>unity</code> 是缺席的降噪器讀到的全 1 向量;RNG 種子 <code>CNG_RNG_SEED</code>(<code>main.c</code> 的巨集)(<code>rig_reset()</code> 重設)。CNG 在 <code>rig_process()</code> 裡產生、已包在 P 裡,stage 與 bridge <b>沒有任何 comfort-noise 程式碼</b></td></tr>
+<tr><td><code>Aec</code> 全狀態(線性濾波器、delay estimator、RES/post)</td><td>366,000 B(16 kHz/256,<code>aec_get_mem_size()</code>)</td><td>pool</td><td>lane 以 <code>enable_res=0</code>/<code>return_res_context=1</code> 建,RES 增益由 <code>Aec</code> 自己算(<code>res_gain</code>);NR 實例<b>完全不存在</b>。合成 <code>AcIstft</code>(OLA／窗表)只有 48 kHz 路徑用到(由 <code>DfnHop</code> 持有),原生格點改由 bridge 合成</td></tr>
+<tr><td>暫存 <code>unity</code> / <code>total_gain</code> / <code>post</code>(P)、comfort-noise RNG</td><td>各 [n_freqs];RNG 為 uint32;三者合計 2,096 B(16 kHz/256:2×528 + 1,040)</td><td>pool(<code>main.c</code> 的 <code>Rig</code>)</td><td><code>unity</code> 是缺席的降噪器讀到的全 1 向量;RNG 種子 <code>AEC_CNG_SEED</code>(42,函式庫常數;<code>rig_reset()</code> 與硬重置事件重設)。CNG 在 <code>rig_process()</code> 裡產生、已包在 P 裡,stage 與 bridge <b>沒有任何 comfort-noise 程式碼</b></td></tr>
 <tr><td>相位與 job 狀態(<code>DfnHop</code>:phase、job 旗標、stage 輸出指標)</td><td>純量、指標與 <code>DfnResStageJob</code></td><td>C struct(<code>DfnHop</code>,非擁有)</td><td>phased API 的序列閘:<code>dfn_hop_begin</code> 之後才能 <code>nn_begin</code>,一個 job 開著時不能再 <code>nn_begin</code>;違反回非 0</td></tr>
 <tr><td><code>DFN2Prepost</code> pool(含遞迴狀態)</td><td><code>DFN2_IO_FREQ</code>:219,536 bytes(現查)</td><td>stage pool 內</td><td><code>DFN2State</code>(EMA 正規化器、df/coef/alpha/noisy/hi-delay ring;<code>sizeof</code> = 67,368 B,不內嵌分析/合成緩衝與窗表,FREQ 模式沒有 STFT/ISTFT 物件)+ feature 視窗 + 兩個顯式 state 陣列(<code>h_gru</code>、<code>df_convp_history</code>) + est/app staging(<code>DFN2_PREPOST_CARVE_VERSION = 8</code>)</td></tr>
 <tr><td>stage 暫存 slab + 計數器</td><td>6 × 513 float = 12,312 bytes</td><td>stage pool / struct</td><td>est/app/out 的 re/im,逐 hop 覆寫;<code>frames_in</code>/<code>commits</code>/<code>skips</code>/<code>output_frame</code> 由 <code>dfn_res_stage_get_counters()</code> 讀出,測試用它證明「中途沒有 reset」</td></tr>
-<tr><td colspan="4"><b>以下只在 8/16 kHz host 存在:<code>DfnRateBridge</code> pool(<code>dfn_rate_bridge.c</code>);<code>dfn_rate_bridge_reset()</code> 連同 stage 一起清乾淨並重新預填</b></td></tr>
+<tr><td colspan="4"><b>以下只在 8/16 kHz host 存在:<code>DfnRateBridge</code> pool(<code>dfn_rate_bridge.c</code>);<code>dfn_rate_bridge_reset()</code> 連同 stage 一起清乾淨並重新預填;<code>dfn_rate_bridge_reset_synthesis()</code> 只清兩個原生合成的 OLA 尾巴(AEC 硬重置事件用)</b></td></tr>
 <tr><td>bridge 內部:3 顆 <code>audio_resampler</code>、原生 <code>AcIstft</code> ×2、48 kHz <code>AcStft</code> ×2 與 <code>AcIstft</code> ×1、48 kHz FIFO ×2、原生 out FIFO(<code>OUT_FIFO_CAP</code> = 1024 float,init 預填 <code>prefill</code> 個零)、計數器</td><td><b>bridge pool 小計 349,888 B(ne10)</b>(16 kHz / fft 256 現查,<b>已含 stage 的 pool</b>)</td><td>bridge pool</td><td>逐項大小與語意見 <a href="pipeline_dfn_detail.html">pipeline_dfn_detail</a></td></tr>
 <tr><td>NN 權重</td><td>—</td><td><b>不在本 pool 內</b></td><td>屬板端 runtime;本 pool 只含 host DSP 與前後處理</td></tr>
-<tr><td><b>合計 pool</b></td><td><b>16 kHz 預設:716,400 B(ne10)</b><br>48 kHz:1,443,712 B(ne10)<br>8 kHz:621,024 B(ne10)</td><td>caller 擁有</td><td>matched、n=5、cng=0、atten_lim 0 現查值(<code>mono_aec_dfn_res</code> 骨架印出的 <code>pool</code> 行,為 <code>Aec</code>、暫存與 stage／bridge 各自對齊後的和);換 rate/backend/編譯選項/submodule 一律以各自的大小查詢重查</td></tr>
+<tr><td><b>合計 pool</b></td><td><b>16 kHz 預設:717,984 B(ne10)</b><br>48 kHz:1,449,904 B(ne10)<br>8 kHz:622,608 B(ne10)</td><td>caller 擁有</td><td>matched、n=5、cng=0、atten_lim 0 現查值(<code>mono_aec_dfn_res</code> 骨架印出的 <code>pool</code> 行,為 <code>Aec</code>、暫存與 stage／bridge 各自對齊後的和);換 rate/backend/編譯選項/submodule 一律以各自的大小查詢重查</td></tr>
 </table>
 
 <h2>延遲與 warm-up</h2>

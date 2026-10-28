@@ -99,7 +99,7 @@ DeepVQE-S 在 AIAEC 16 kHz／512 邊界上用 `deepvqe_framing_config()` 取得�
 
 ```c
 /* DFN2：dfn/dfn_hop.h；ULCNet：ulcnet/ulcnet_nn_stage.h（begin 的引數不同） */
-dfn_hop_begin(&hop, frame.e, P);                         /* P = E·G_res 已由範例 main 先形成 */
+dfn_hop_begin(&hop, frame.e, P);                         /* P = B·G_res（B = frame.b）已由範例 main 先形成 */
 while (dfn_hop_nn_begin(&hop, &job) > 0) {               /* 1 = 有一幀；0 = 沒有（warm-up／reprime） */
     dfn_hop_nn_end(&hop, run_npu(&job));                 /* rc != 0 或輸出非有限 ⇒ identity（fail-open） */
 }
@@ -123,18 +123,18 @@ dfn_hop_end(&hop, out);                                  /* 合成剛好一個 h
 
 | 函式庫物件 | 大小查詢 | 16 kHz／256 | 備註 |
 |---|---|---:|---|
-| `Aec`（mono，MATCHED n=5） | `aec_get_mem_size()` | 364,416 | 48 kHz／1024：1,156,544 |
+| `Aec`（mono，MATCHED n=5） | `aec_get_mem_size()` | 366,000 | 48 kHz／1024：1,162,736 |
 | `AnrDenoiser`（函式庫 level） | `anr_get_mem_size()` | 45,344 | 範例程式有 NR 時 |
-| `AcIstft`（合成） | `ac_istft_get_mem_size()` | 11,344 | 範例程式有合成時 |
+| `AcIstft`（合成） | `ac_istft_get_mem_size()` | 11,344 | 範例程式有合成時；mono 範例的合成借用 AEC 的合成窗（`aec_synthesis_window()`），不另帶窗表，為 10,320 |
 | `AecRes`（4ch 後波束 RES） | `aec_res_get_mem_size()` | 7,904 | `Mcab` 的 pool 不含；4ch 的範例自己建一個（48 kHz／1024：29,408） |
 | 增益／頻譜暫存 | 範例程式自己算 | 2,624 | mono 與 `mcab_external_static` 為三個 `n_freqs` float 向量 + 一個複數向量，各自 `ALIGN16`；`mcab_static` 為兩個向量 + 一個複數向量（2,096） |
-| 4ch lane（`Aec` × 4，`mcab_lane_config()`） | `aec_get_mem_size()` 每條 | 797,632（4 × 199,408） | 48 kHz／1024：2,912,064；由應用建立，不在 `Mcab` 的 pool 內 |
-| 4ch flow `Mcab`（含共用 estimator 的 front end） | `mcab_get_mem_requirements()`；estimator 另用 `delay_aec_get_mem_size()` | `Mcab` pool 73,504；front end（estimator + `Mcab` pool）108,928 | `enable_post = 0` 時 `Mcab` pool 為 68,288；front end 48 kHz／1024：262,880（`mcab_external_static --print-mem-size`） |
-| 4ch sample 的 `Unit`（lane + estimator + `Mcab` pool + SRP-PHAT／BF helper） | `mcab_sample_unit_memory()` | 1,698,784 | 48 kHz／1024：6,300,352（`mcab_static --print-mem-size`） |
+| 4ch lane（`Aec` × 4，`mcab_lane_config()`） | `aec_get_mem_size()` 每條 | 803,968（4 × 200,992） | 48 kHz／1024：2,936,832；由應用建立，不在 `Mcab` 的 pool 內 |
+| 4ch flow `Mcab`（含共用 estimator 的 front end） | `mcab_get_mem_requirements()`；estimator 另用 `delay_aec_get_mem_size()` | `Mcab` pool 74,624；front end（estimator + `Mcab` pool）110,048 | `enable_post = 0` 時 `Mcab` pool 為 68,368；front end 48 kHz／1024：267,072（`mcab_external_static --print-mem-size`） |
+| 4ch sample 的 `Unit`（lane + estimator + `Mcab` pool + SRP-PHAT／BF helper） | `mcab_sample_unit_memory()` | 1,706,240 | 48 kHz／1024：6,329,312（`mcab_static --print-mem-size`） |
 | ULCNet stage | `ulcnet_nn_stage_mem_size(0)` | 36,400 | 一個建置一組格點（48 kHz：71,728） |
 | DFN2 stage／rate bridge | `dfn_res_stage_get_mem_requirements()`／`dfn_rate_bridge_get_mem_requirements()` | 231,984／349,888 | bridge 內含 stage；16 kHz 走 bridge，48 kHz 直接用 stage 加呼叫端的 `AcIstft`；數字是出貨的 lookahead 1/1，其他組合的 pool 大小要現查 |
 
-mono 的 16 kHz／256 合計 = `ALIGN16(364,416) + 45,344 + 11,344 + 2,624 = 423,728`（AEC + NR + 合成 + 暫存）；4ch sample 的 `Unit` 加 RES／NR／合成／暫存 = `1,698,784 + (7,904 + 45,344 + 11,344 + 2,096) = 1,765,472`（`mcab_static --sample-rate 16000` 印的 `Total:`）。
+mono 的 16 kHz／256 合計 = `ALIGN16(366,000) + 45,344 + 10,320 + 2,624 = 424,288`（AEC + NR + 合成 + 暫存）；4ch sample 的 `Unit` 加 RES／NR／合成／暫存 = `1,706,240 + (7,904 + 45,344 + 11,344 + 2,096) = 1,772,928`（`mcab_static --sample-rate 16000` 印的 `Total:`）。
 
 **flow 的公開面**（`mcab.h`）：`mcab_default_config`、`mcab_apply_lane_contract`／`mcab_lane_config`／`mcab_delay_estimator_config`、
 `mcab_get_mem_requirements`、`mcab_init`／`mcab_init_ex`／`mcab_create`、`mcab_process_front`、`mcab_fuse`（可選）、`mcab_reset`／`mcab_destroy`、

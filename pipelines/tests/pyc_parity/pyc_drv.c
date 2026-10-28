@@ -22,12 +22,14 @@
  *     status of the core or the chain, recording it in the header; the Python side treats that as
  *     a result.
  *     aec=no_floor is accepted like the other levels.
- *   mono   mic=F ref=F sr=N fft=N out=F [aec=..] [nr=..] [legacy_amin=0|1] [enable_cng=0|1]
+ *   mono   mic=F ref=F sr=N fft=N out=F [aec=..] [nr=..] [legacy_amin=0|1] [enable_cng=0|1] [reset_at=H]
  *     Aec + aec_get_res_context + the chain as mono_aec_nr_res/main.c composes them, with the AEC
- *     seam read back after each hop. The chain applies the lane's own RES gain (frame gain).
+ *     seam read back after each hop. The chain applies the lane's own RES gain (frame gain). The chain
+ *     renders the AEC's rendering base (aec_get_output_base) and follows aec_post_reset_serial() (OLA clear,
+ *     comfort-noise reseed); reset_at=H makes the driver call aec_reset() before hop H.
  *   replay seam=F out=F [aec=..] [nr=..] [legacy_amin=0|1] [enable_cng=0|1] [usable=F]
  *     Open-loop replay of the chain over a recorded seam: RES stage (4-channel only; mono reuses
- *     the recorded G_res), NR stage, min, apply, comfort noise, synthesis. `usable=F` is one
+ *     the recorded G_res), NR stage, min, apply to the recorded B, comfort noise, synthesis. `usable=F` is one
  *     byte per hop that replaces the recorded usable_linear flag (the Python verdict of the same hop).
  *     Output: header (8 x int32) then per hop float32 G_res(nf) G_nr(nf) out(hop).
  *   probe  sr=N fft=N          (mono build) derive the lane for the grid and print "hop n_freqs", or fail
@@ -38,13 +40,16 @@
  * Seam file (all little endian):
  *   int32 hdr[10] = { 0x53435950 'PYCS', 1, kind (0 mono, 1 4ch), sr, fft, n_freqs, hop, n_hops,
  *                     fail_hop (-1 = none), fail_rc }
- *   per hop float32: E(2nf) Y(2nf) R2(nf) CN(nf) Gres(nf) Gnr(nf) far_hop(hop) out(hop) sc[16]
+ *   per hop float32: E(2nf) Y(2nf) B(2nf) R2(nf) CN(nf) Gres(nf) Gnr(nf) far_hop(hop) out(hop) sc[16]
  *   sc: 0 far_power  1 max_dt  2 max_sat  3 all_converged  4 clock_drift  5 usable_linear
  *       6 delay_samples  7 delay_solid  8 delay_changed  9 realign_warm_total  10 realign_soft_total
- *       11 delay_confidence  12..15 unused (0)
- * Complex spectra are interleaved (re, im). Gres/Gnr are the gains the chain applied (unity when the
- * source is disabled). The seam is the data the stages behind the AEC read; scales as in McabFrame
- * (mcab.h): E, Y in audio scale, R2 and CN in int16^2 power scale, gains amplitudes. */
+ *       11 delay_confidence  12 guard (mono: guard_active; 4ch: McabFrame.guard_lanes)
+ *       13 post_reset_serial (mono: aec_post_reset_serial(); 4ch: McabFrame.post_reset_serial)  14..15 unused (0)
+ * Complex spectra are interleaved (re, im). B is the rendering base the chain applied its gain to
+ * (mono: aec_get_output_base(); 4ch: McabFrame.b, which a flag cannot rebuild where only some lanes'
+ * guards fired). Gres/Gnr are the gains the chain applied (unity when the source is disabled). The
+ * seam is the data the stages behind the AEC read; scales as in McabFrame (mcab.h): E, Y, B in audio
+ * scale, R2 and CN in int16^2 power scale, gains amplitudes. */
 #include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -65,7 +70,7 @@
 #else
 /* The constants of mono_aec_nr_res/main.c. */
 #define PYC_CNG_NR_GAIN_FLOOR 0.31622777f
-#define PYC_CNG_RNG_SEED 0x9e3779b9u
+#define PYC_CNG_RNG_SEED AEC_CNG_SEED
 #define PYC_PSD_SCALE_INV (1.0f / (32768.0f * 32768.0f))
 #endif
 
@@ -75,6 +80,7 @@
 typedef struct Args {
     const char *mic, *ref, *out, *seam, *usable;
     int sr, fft, legacy_amin, enable_nr, enable_res, enable_cng;
+    int reset_at;                 /* mono: hop on which the application calls aec_reset() (-1: never) */
     AecLevel aec;
     AnrLevel nr;
 } Args;
@@ -83,6 +89,7 @@ static int parse_args(int argc, char** argv, Args* a) {
     int i;
     memset(a, 0, sizeof(*a));
     a->enable_nr = a->enable_res = a->enable_cng = 1;
+    a->reset_at = -1;
     a->aec = AEC_LEVEL_BALANCED;
     a->nr = ANR_LEVEL_BALANCED;
     for (i = 2; i < argc; ++i) {
@@ -101,6 +108,7 @@ static int parse_args(int argc, char** argv, Args* a) {
         else if (!strcmp(k, "enable_nr")) a->enable_nr = atoi(v);
         else if (!strcmp(k, "enable_res")) a->enable_res = atoi(v);
         else if (!strcmp(k, "enable_cng")) a->enable_cng = atoi(v);
+        else if (!strcmp(k, "reset_at")) a->reset_at = atoi(v);
         else if (!strcmp(k, "aec")) {
             a->aec = !strcmp(v, "mild") ? AEC_LEVEL_MILD
                    : !strcmp(v, "aggressive") ? AEC_LEVEL_AGGRESSIVE
@@ -125,7 +133,7 @@ static long file_len(FILE* f) {
 }
 
 /* floats per seam record: E(2nf) Y(2nf) R2 CN Gres Gnr (4nf) far_hop out (2 hop) sc */
-static size_t seam_rec_floats(int nf, int hop) { return (size_t)(4 * nf + 4 * nf + 2 * hop + PYC_SC); }
+static size_t seam_rec_floats(int nf, int hop) { return (size_t)(6 * nf + 4 * nf + 2 * hop + PYC_SC); }
 
 static void write_hdr(FILE* f, int kind, int sr, int fft, int nf, int hop, int nh, int fail_hop, int fail_rc) {
     int32_t h[10];
@@ -135,15 +143,16 @@ static void write_hdr(FILE* f, int kind, int sr, int fft, int nf, int hop, int n
     fwrite(h, sizeof(h[0]), 10, f);
 }
 
-static void write_rec(FILE* f, int nf, int hop, const Complex* e, const Complex* y, const float* r2,
-                      const float* cn, const float* gres, const float* gnr, const float* far_hop,
-                      const float* out, const float* sc) {
+static void write_rec(FILE* f, int nf, int hop, const Complex* e, const Complex* y, const Complex* b,
+                      const float* r2, const float* cn, const float* gres, const float* gnr,
+                      const float* far_hop, const float* out, const float* sc) {
     static float* zero = NULL;
     static int zero_n = 0;
     int need = 2 * nf > hop ? 2 * nf : hop;
     if (zero_n < need) { free(zero); zero = (float*)calloc((size_t)need, sizeof(float)); zero_n = need; }
     fwrite(e ? (const void*)e : (const void*)zero, sizeof(Complex), (size_t)nf, f);
     fwrite(y ? (const void*)y : (const void*)zero, sizeof(Complex), (size_t)nf, f);
+    fwrite(b ? (const void*)b : (const void*)zero, sizeof(Complex), (size_t)nf, f);
     fwrite(r2 ? r2 : zero, 4, (size_t)nf, f);
     fwrite(cn ? cn : zero, 4, (size_t)nf, f);
     fwrite(gres ? gres : zero, 4, (size_t)nf, f);
@@ -154,7 +163,9 @@ static void write_rec(FILE* f, int nf, int hop, const Complex* e, const Complex*
 }
 
 /* The chain behind the front end. The RES gain comes from the frame (POST_RES_FRAME), from a
- * separate AecRes at `level` on the frame's grid (POST_RES_AECRES) or is the unity vector. */
+ * separate AecRes at `level` on the frame's grid (POST_RES_AECRES) or is the unity vector. The synthesis
+ * borrows the window table of the Aec passed to post_create() (aec_synthesis_window()); NULL: audiolib's
+ * default window (the 4-channel chain). */
 enum { POST_RES_OFF = 0, POST_RES_FRAME, POST_RES_AECRES };
 
 typedef struct Post {
@@ -166,6 +177,9 @@ typedef struct Post {
     Complex* spec;
     uint32_t rng;
     const float *last_res, *last_nr;     /* the gains of the last hop (unity for an absent one) */
+#if !defined(PYC_WITH_4CH)
+    uint32_t mono_serial;                /* the aec_post_reset_serial() value already handled */
+#endif
     void* mem;
 } Post;
 
@@ -176,7 +190,7 @@ static void post_destroy(Post* q) {
 }
 
 static int post_create(Post* q, int sr, int fft, int res_mode, AecLevel level, int enable_nr,
-                       AnrLevel nr_level, int use_r2, int enable_cng) {
+                       AnrLevel nr_level, int use_r2, int enable_cng, const Aec* window_src) {
     AecConfig rc;
     AnrConfig nc;
     AcStftConfig sc;
@@ -198,6 +212,10 @@ static int post_create(Post* q, int sr, int fft, int res_mode, AecLevel level, i
         if ((nr_b = anr_get_mem_size(&nc)) == 0) return -1;
     }
     ac_stft_config_default(&sc, fft);
+    if (window_src) {   /* the mono chain synthesises with the AEC's own window table (main.c) */
+        int win_n = 0;
+        if (aec_synthesis_window(window_src, &sc.window, &win_n) != 0 || win_n != fft) return -1;
+    }
     if ((syn_b = ac_istft_get_mem_size(&sc)) == 0) return -1;
     vec = ALIGN16((size_t)q->nf * sizeof(float));
     cvec = ALIGN16((size_t)q->nf * sizeof(Complex));
@@ -246,26 +264,35 @@ static int post_hop(Post* q, const McabFrame* f, float* out) {
     }
     if (!res || !f->e || f->n_freqs != q->nf) return -1;
     if (q->nr && !(nr = mcab_sample_anr_gain(q->nr, f, q->extra, q->use_r2))) return -1;
-    return post_finish(q, f->e, f->cn, res, nr, out);
+    /* Estimated on E, rendered on the rendering base B (mcab.h). */
+    return post_finish(q, f->b, f->cn, res, nr, out);
 }
 #else
-/* One hop over a lane context into out; `res_in` feeds POST_RES_AECRES. 0, or -1 when a stage
- * refuses. */
-static int post_hop(Post* q, const AecResContext* c, const AecResInput* res_in, float* out) {
+/* One hop over a lane context into out; `res_in` feeds POST_RES_AECRES. `base` is the rendering base
+ * (aec_get_output_base) the gain is estimated on and applied to; `serial` is aec_post_reset_serial()
+ * after this hop's AEC call: a new value clears the OLA tail and reseeds the comfort noise before the
+ * first draw and the push. 0, or -1 when a stage refuses. */
+static int post_hop(Post* q, const AecResContext* c, const AecResInput* res_in, const Complex* base,
+                    uint32_t serial, float* out) {
     const float* res = q->res_mode == POST_RES_FRAME ? c->res_gain
                      : q->res_mode == POST_RES_AECRES ? aec_res_process(q->res, res_in) : q->unity;
     const float* nr = q->unity;
-    if (!res || !c->error_spec || c->n_freqs != q->nf) return -1;
+    if (!res || !c->error_spec || !base || c->n_freqs != q->nf) return -1;
+    if (serial != q->mono_serial) {
+        q->mono_serial = serial;
+        ac_istft_reset(q->istft);
+        q->rng = PYC_CNG_RNG_SEED;
+    }
     if (q->nr) {
         const float* extra = NULL;
         if (q->use_r2 && c->r2 && c->usable_linear) {
             sk_scale_f32(q->extra, c->r2, PYC_PSD_SCALE_INV, q->nf);
             extra = q->extra;
         }
-        if (anr_process_gain(q->nr, c->error_spec, extra, NULL) != 0) return -1;
+        if (anr_process_gain(q->nr, base, extra, NULL) != 0) return -1;
         if (!(nr = anr_get_gain(q->nr, NULL))) return -1;
     }
-    return post_finish(q, c->error_spec, c->comfort_noise, res, nr, out);
+    return post_finish(q, base, c->comfort_noise, res, nr, out);
 }
 #endif
 
@@ -311,7 +338,7 @@ static int run_chain(const Args* a) {
     hop = mcab_hop_size(core); nf = mcab_n_freqs(core);
     if (post_create(&chain, a->sr, mcab_fft_size(core),
                     a->enable_res ? POST_RES_AECRES : POST_RES_OFF, a->aec, a->enable_nr, a->nr,
-                    !a->legacy_amin, a->enable_cng) != 0) {
+                    !a->legacy_amin, a->enable_cng, NULL) != 0) {
         fprintf(stderr, "post-stage init failed\n");
         return 1;
     }
@@ -344,7 +371,8 @@ static int run_chain(const Args* a) {
         sc[9] = (float)mcab_realign_warm_lane_count(core);
         sc[10] = (float)mcab_realign_soft_lane_count(core);
         sc[11] = front.delay.confidence;
-        write_rec(fo, nf, hop, f.e, f.y, f.r2, f.cn, chain.last_res, chain.last_nr, f.far_hop,
+        sc[12] = (float)f.guard_lanes; sc[13] = (float)f.post_reset_serial;
+        write_rec(fo, nf, hop, f.e, f.y, f.b, f.r2, f.cn, chain.last_res, chain.last_nr, f.far_hop,
                   out, sc);
         ++done;
     }
@@ -398,7 +426,7 @@ static int run_mono(const Args* a) {
     if (!aec || post_create(&chain, a->sr, grid.fft_size,
                             a->enable_res ? POST_RES_FRAME : POST_RES_OFF, AEC_LEVEL_BALANCED,
                             a->enable_nr, a->nr, !a->legacy_amin,
-                            aec_cfg.enable_cng && a->enable_cng) != 0) {
+                            aec_cfg.enable_cng && a->enable_cng, aec) != 0) {
         fprintf(stderr, "mono rig create failed\n");
         return 1;
     }
@@ -415,15 +443,20 @@ static int run_mono(const Args* a) {
     for (h = 0; h < nh; ++h) {
         AecResContext c;
         AecLinearContext lin;
+        AecOutputBase ob;
         AnrDenoiser* nr = chain.nr;
         const float* g;
         float sc[PYC_SC];
         if (fread(mic, 4, (size_t)hop, fm) != (size_t)hop ||
             fread(ref, 4, (size_t)hop, fr) != (size_t)hop) { fprintf(stderr, "short read\n"); return 1; }
+        if (h == a->reset_at) aec_reset(aec);       /* the application restarts the AEC: the serial moves */
         aec_process_context(aec, mic, ref);
         aec_get_res_context(aec, &c);
         aec_get_linear_context(aec, &lin);
-        if (!c.error_spec || post_hop(&chain, &c, NULL, out) != 0) {
+        memset(&ob, 0, sizeof(ob));
+        ob.struct_size = sizeof(ob);
+        if (!c.error_spec || aec_get_output_base(aec, &ob) != 0 ||
+            post_hop(&chain, &c, NULL, ob.base_spec, aec_post_reset_serial(aec), out) != 0) {
             fprintf(stderr, "process failed at hop %d\n", h);
             return 1;
         }
@@ -432,7 +465,8 @@ static int run_mono(const Args* a) {
         sc[0] = c.far_power; sc[1] = c.dt_indicator; sc[2] = c.saturation_level;
         sc[3] = (float)c.filter_converged; sc[5] = (float)c.usable_linear;
         sc[6] = (float)lin.delay_samples; sc[11] = lin.delay_confidence;
-        write_rec(fo, nf, hop, c.error_spec, c.near_spec, c.r2, c.comfort_noise, c.res_gain, g,
+        sc[12] = (float)ob.guard_active; sc[13] = (float)aec_post_reset_serial(aec);
+        write_rec(fo, nf, hop, c.error_spec, c.near_spec, ob.base_spec, c.r2, c.comfort_noise, c.res_gain, g,
                   lin.aligned_far_hop, out, sc);
     }
     write_hdr(fo, 0, a->sr, a->fft, nf, hop, nh, -1, 0);
@@ -445,6 +479,32 @@ static int run_mono(const Args* a) {
 }
 #endif /* PYC_WITH_MONO */
 
+#if !defined(PYC_WITH_4CH)
+/* An Aec kept only for its synthesis window table: a replay has no live AEC to borrow it from. */
+typedef struct WindowSrc {
+    Aec* aec;
+    void* mem;
+} WindowSrc;
+
+static int window_src_open(WindowSrc* w, int sr, int fft, AecLevel level) {
+    AecConfig cfg;
+    size_t bytes;
+    memset(w, 0, sizeof(*w));
+    aec_config_from_level(&cfg, level, sr);
+    cfg.fft_size = fft;
+    bytes = aec_get_mem_size(&cfg);
+    if (bytes == 0 || posix_memalign(&w->mem, 16, bytes) != 0) { w->mem = NULL; return -1; }
+    w->aec = aec_init(w->mem, bytes, &cfg);
+    return w->aec ? 0 : -1;
+}
+
+static void window_src_close(WindowSrc* w) {
+    if (w->aec) aec_destroy(w->aec);
+    free(w->mem);
+    memset(w, 0, sizeof(*w));
+}
+#endif
+
 static int run_replay(const Args* a) {
     FILE *fs = fopen(a->seam, "rb"), *fo = NULL, *fu = NULL;
     int32_t h[10];
@@ -453,6 +513,10 @@ static int run_replay(const Args* a) {
     float* buf;
     unsigned char* usable = NULL;
     Post chain;
+    const Aec* window_src = NULL;       /* 4-channel: audiolib's default window */
+#if !defined(PYC_WITH_4CH)
+    WindowSrc ws;
+#endif
     if (!fs) { fprintf(stderr, "cannot open seam\n"); return 1; }
     if (fread(h, 4, 10, fs) != 10 || h[0] != PYC_MAGIC) { fprintf(stderr, "bad seam header\n"); return 1; }
     kind = h[2]; sr = h[3]; fft = h[4]; nf = h[5]; hop = h[6]; nh = h[7];
@@ -466,10 +530,14 @@ static int run_replay(const Args* a) {
         if (!fu || fread(usable, 1, (size_t)nh, fu) != (size_t)nh) { fprintf(stderr, "bad usable file\n"); return 1; }
         fclose(fu);
     }
+#if !defined(PYC_WITH_4CH)
+    if (window_src_open(&ws, sr, fft, a->aec) != 0) { fprintf(stderr, "window source init failed\n"); return 1; }
+    window_src = ws.aec;
+#endif
     /* 4-channel: a separate AecRes at the requested strength; mono: the recorded lane gain. */
     if (post_create(&chain, sr, fft,
                     !a->enable_res ? POST_RES_OFF : kind == 1 ? POST_RES_AECRES : POST_RES_FRAME,
-                    a->aec, a->enable_nr, a->nr, !a->legacy_amin, a->enable_cng) != 0) {
+                    a->aec, a->enable_nr, a->nr, !a->legacy_amin, a->enable_cng, window_src) != 0) {
         fprintf(stderr, "stage init failed\n");
         return 1;
     }
@@ -478,7 +546,7 @@ static int run_replay(const Args* a) {
     { int32_t oh[8] = { PYC_MAGIC, 1, kind, sr, fft, nf, hop, nh }; fwrite(oh, 4, 8, fo); }
     for (t = 0; t < nh; ++t) {
         const float* r = buf + rec * (size_t)t;
-        const float* sc = r + 8 * nf + 2 * hop;
+        const float* sc = r + 10 * nf + 2 * hop;
         float* out = (float*)malloc(sizeof(float) * (size_t)hop);
         int rc;
 #if defined(PYC_WITH_4CH)
@@ -487,13 +555,15 @@ static int run_replay(const Args* a) {
         f.n_freqs = nf; f.hop = hop;
         f.e = (const Complex*)(r);
         f.y = (const Complex*)(r + 2 * nf);
-        f.r2 = r + 4 * nf;
-        f.cn = r + 5 * nf;
-        f.g_res_ctx = r + 6 * nf;                                /* recorded G_res */
-        f.far_hop = r + 8 * nf;
+        f.b = (const Complex*)(r + 4 * nf);                      /* recorded rendering base */
+        f.r2 = r + 6 * nf;
+        f.cn = r + 7 * nf;
+        f.g_res_ctx = r + 8 * nf;                                /* recorded G_res */
+        f.far_hop = r + 10 * nf;
         f.far_power = sc[0]; f.max_dt = sc[1]; f.max_sat = sc[2];
         f.all_converged = (int)sc[3]; f.clock_drift = (int)sc[4];
         f.usable_linear = usable ? usable[t] : (int)sc[5];
+        f.guard_lanes = (int)sc[12]; f.post_reset_serial = (uint32_t)sc[13];
         rc = post_hop(&chain, &f, out);
 #else
         AecResContext c;
@@ -502,9 +572,9 @@ static int run_replay(const Args* a) {
         c.n_freqs = nf; c.hop_size = hop;
         c.error_spec = (const Complex*)(r);
         c.near_spec = (const Complex*)(r + 2 * nf);
-        c.r2 = r + 4 * nf;
-        c.comfort_noise = r + 5 * nf;
-        c.res_gain = r + 6 * nf;                                 /* recorded G_res */
+        c.r2 = r + 6 * nf;
+        c.comfort_noise = r + 7 * nf;
+        c.res_gain = r + 8 * nf;                                 /* recorded G_res */
         c.far_power = sc[0]; c.dt_indicator = sc[1]; c.saturation_level = sc[2];
         c.filter_converged = (int)sc[3];
         c.usable_linear = usable ? usable[t] : (int)sc[5];
@@ -512,12 +582,12 @@ static int run_replay(const Args* a) {
         in.near_spec = c.near_spec;
         in.r2 = c.r2;
         in.comfort_noise = c.comfort_noise;
-        in.render_hop = r + 8 * nf;
+        in.render_hop = r + 10 * nf;
         in.all_converged = c.filter_converged;
         in.max_dt = c.dt_indicator;
         in.max_saturation = c.saturation_level;
         in.clock_drift = (int)sc[4];
-        rc = post_hop(&chain, &c, &in, out);
+        rc = post_hop(&chain, &c, &in, (const Complex*)(r + 4 * nf), (uint32_t)sc[13], out);
 #endif
         if (rc != 0) { fprintf(stderr, "stage refused hop %d\n", t); return 1; }
         fwrite(chain.last_res, 4, (size_t)nf, fo);
@@ -527,6 +597,9 @@ static int run_replay(const Args* a) {
     }
     fclose(fo);
     post_destroy(&chain);
+#if !defined(PYC_WITH_4CH)
+    window_src_close(&ws);
+#endif
     free(buf); free(usable);
     return 0;
 }

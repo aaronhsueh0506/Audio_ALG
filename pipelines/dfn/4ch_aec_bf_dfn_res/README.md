@@ -21,7 +21,7 @@ mics/ref -> mcab_sample_beam_process(unit, mics, far, &beam, NULL)
               E = beamformed error spectrum         -> DFN2 feature input
               frame.g_res_ctx = NULL (mcab has no RES)
          -> G_res = aec_res_process(res, &in)       the example's own AecRes; in filled by mcab_sample_res_input(&frame, &in)
-         -> P = E * min(1, G_res)                   P = E * G_res (+ comfort noise) -> DFN2 applied here
+         -> P = B * min(1, G_res)                   P = B * G_res (+ comfort noise) -> DFN2 applied here
                                                    (dfn_form(): sk_min_f32 + sk_capply_gain_f32 + aec_cng_fill)
          -> dfn_hop_begin(&hop, frame.e, P)
          -> while (dfn_hop_nn_begin(&hop, &job) > 0) { run the model on the job; dfn_hop_nn_end(&hop, rc) }
@@ -126,12 +126,23 @@ App          McabSampleFlow + Mcab   McabSampleBeam   libaec AecRes   DfnHop + D
  |-- mcab_sample_beam_default_params; mcab_sample_beam_get_mem_size / _init(flow) -->|
  |-- aec_config_from_level (fft_size = mcab_get_mem_breakdown().fft_size); aec_res_get_mem_size; aec_res_init -->|
  |-- dfn_hop_pool_plan / dfn_hop_pool_build: dfn_res_stage_* (48 kHz) or dfn_rate_bridge_* (16 kHz), dfn_hop_init_*
- |   per hop: mcab_sample_beam_process --> mcab_sample_beam_fuse --> aec_res_process(res, &in) --> P = E * min(1, G_res) (dfn_form())
+ |   per hop: mcab_sample_beam_process --> mcab_sample_beam_fuse --> aec_res_process(res, &in) (on E)
+ |            --> frame.post_reset_serial moved: dfn_rate_bridge_reset_synthesis (16 kHz) | dfn_hop_reset (48 kHz), rng = MCAB_SAMPLE_CNG_RNG_SEED --> P = B * min(1, G_res) (dfn_form())
  |            --> dfn_hop_begin(E, P) --> while (dfn_hop_nn_begin == 1) { model; dfn_hop_nn_end } --> dfn_hop_end --> out
  |   refused call: mcab_sample_beam_reset + aec_res_reset + comfort-noise rng = MCAB_SAMPLE_CNG_RNG_SEED + dfn_hop_reset   (dfn_reset())
  |   never reset the stage on the shared aligner's delay change
  |-- stage / bridge destroy; mcab_sample_beam_destroy; mcab_sample_flow_destroy; release the blocks
 ```
+
+The model estimates on the analysis beam `E` (`frame.e`) and is applied on `P`, formed over the rendering base
+`B` (`frame.b`, see [the 4ch README](../../4ch_aec_bf_nr_res/README.md), "Analysis and rendering spectra"). `B` is
+`E` except on hops where a contributing lane's output guard fired; there `P` carries that lane's capture while the
+estimate stays on `E`. A lane's post-chain reset reseeds the comfort noise and clears the synthesis. At 16 kHz that is
+`dfn_rate_bridge_reset_synthesis()` on the hop of the event (the bridge synthesises the host-grid spectra at the top of
+its `begin()`; DFN2, the resamplers and the FIFOs keep running, no delay line). At 48 kHz the synthesis follows the stage
+by its lookahead and this example resets the whole hop (the delayed tail clear of `mono_aec_dfn_res` is not ported). In
+this flow the serial moves only with a flow reset (the lanes take an aligned far), which the refused-call path already
+pairs with a hop reset.
 
 External parameters: the same board-skeleton flags as the mono variant (`--sample-rate` 16000 default or
 48000, delay profile, `--erb-fwd` / `--erb-inv`, `--atten-lim`, `--cng`), plus the flow's `McabConfig`
@@ -160,9 +171,9 @@ requires the final int8/fp runtime and board cycle measurement.
 Pool printed by the skeleton (`4ch_aec_bf_dfn_res`, matched delay, five-filter bank, NE10; the
 flow objects (four lanes, shared estimator, mcab pool), the SRP/BF helper, the post-beam `AecRes` carved by the example,
 the P and gain buffers, and the stage or bridge, each 16-byte
-aligned; shipped pair): 2,058,672 bytes at the 16 kHz default (flow plus helper 1,698,784 bytes, plus the rate bridge) and
-6,616,928 bytes at 48 kHz (flow plus helper 6,300,352 bytes). mcab's own pool is 73,504 bytes at
-16 kHz/256 (68,288 bytes front-only); the lanes and the estimator have their own pools.
+aligned; shipped pair): 2,066,128 bytes at the 16 kHz default (flow plus helper 1,706,240 bytes, plus the rate bridge) and
+6,645,888 bytes at 48 kHz (flow plus helper 6,329,312 bytes). mcab's own pool is 74,624 bytes at
+16 kHz/256 (68,368 bytes front-only); the lanes and the estimator have their own pools.
 Model weights and accelerator activation/workspace memory are external;
 adding int8 weights alone brings the known minimum to about 4.0 MiB at
 16 kHz.

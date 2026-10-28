@@ -142,7 +142,7 @@ th{background:#eef0f5}
 <tr><td><code>McabFront.aligned_ref</code></td><td>[hop] 本 hop 實際餵給四條 lane 的 delay-aligned far(ring 未滿時為 raw ref);給外部 NN 後級(Align-ULCNet far branch)用</td><td>同上</td></tr>
 <tr><td><code>McabFrame</code>(<code>mcab_fuse()</code> 填)</td><td><code>e</code>=beamformed 誤差、<code>y</code>=投影近端、<code>x</code>=lane 0 的 far 頻譜、<code>r2／cn</code>=投影後的殘餘回音／舒適噪音 PSD、<code>far_hop</code>、<code>max_dt／max_sat／all_converged／usable_linear</code>(只計對權重有非零響應的 lane)、<code>clock_drift</code>、delay 旗標;<code>g_res_ctx</code> 恆為 NULL(RES 增益由應用的 <code>aec_res_process()</code> 取得)</td><td>借用;<code>e</code> 在傳入 <code>beamformed_error</code> 時別名呼叫端的陣列,否則別名 mcab 內 buffer;有效至下一次 <code>mcab_process_front()</code>／reset／destroy;不得寫入</td></tr>
 </table>
-<p class="note"><b>formed seam 的第三個候選是 capture。</b>四條 lane 都以 <code>enable_res=0</code>／<code>return_res_context=1</code> 建立,<code>lib/aec</code> 的 formed 選擇器只在這個 context-only 模式多開一個候選:上一個 hop 的濾波品質判定尚未認可線性估計、且被選中的殘差在這個 hop 的能量大於同一 hop 的 mic capture 時,該 lane 的時域 hop 與頻譜一起改送 capture(既有的 30-sample crossfade 承接邊界)。外部 beamformer 因此可能在這些 hop 上拿到 mic 原樣而不是誤差——那正是「濾波器在加訊號」時該有的行為。</p>
+<p class="note"><b>分析 seam 與渲染基底是兩個訊號。</b>四條 lane 都以 <code>enable_res=0</code>／<code>return_res_context=1</code> 建立。<code>lib/aec</code> 的 formed 序列與 <code>error_spec</code> 一律是被選中的線性殘差(沒有 capture 候選),輸出守衛不改動它們;外部 beamformer 與各估計器讀的就是這個分析 seam。輸出守衛只決定每條 lane 的渲染基底(<code>McabFront.render_spectra</code>、<code>guard_active</code>),<code>mcab_fuse()</code> 以同一組權重把它們加成 <code>McabFrame.b</code>;範例鏈渲染 <code>b * gain</code>。</p>
 
 <h2>相關檔案與測試路徑</h2>
 <table>

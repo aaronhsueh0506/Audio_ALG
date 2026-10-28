@@ -1,8 +1,15 @@
 /* Test helper: the conventional mono chain written out over lib/aec's Aec, for tests that
  * compare an application against it.
  *
- *   aec_process_context -> aec_get_res_context -> NR gain (if enabled) -> min with the lane's
- *   RES gain (if enabled) -> apply to E -> comfort noise -> ac_istft_push
+ *   aec_process_context -> aec_get_res_context + aec_get_output_base -> follow aec_post_reset_serial
+ *   (clear the OLA tail, reseed the comfort noise) -> NR gain on the rendering base (if enabled) ->
+ *   min with the lane's RES gain (if enabled) -> apply to the base -> comfort noise -> ac_istft_push
+ *
+ * The rendering base is the library's own choice per hop (error spectrum, or error + echo when the
+ * output guard fires); the NR estimator reads it and the gain multiplies it, so the full-mode chain
+ * (RES only, aec_process()) is the special case nr = unity. The synthesis borrows the AEC's window
+ * table unless `default_synth_window` asks for audiolib's default (the DFN stage synthesises with
+ * that one). The NR keeps running across a reset event.
  *
  * Independent of the example headers: the AecConfig, the NR configuration (anr_config_for_level_grid with
  * the 512 ms minimum window written out, r2 scaled by 2^-30 as the residual-echo prior) and the
@@ -23,9 +30,8 @@
 #include "audio_stft.h"
 #include "utility/mem_align.h"
 
-/* The comfort-noise floor and seed of the example programs. */
+/* The comfort-noise floor of the example programs (the seed is AEC_CNG_SEED). */
 #define CONV_MONO_CNG_NR_GAIN_FLOOR 0.31622777f
-#define CONV_MONO_CNG_RNG_SEED 0x9e3779b9u
 
 typedef struct ConvMonoConfig {
     int sample_rate;
@@ -37,6 +43,7 @@ typedef struct ConvMonoConfig {
     AnrLevel nr_level;
     int aec_only;                 /* the AEC's own time-domain hop (ctx.linear_hop) */
     int enable_nr, enable_res, enable_cng, legacy_amin;
+    int default_synth_window;     /* 1: audiolib's default window (as the DFN stage), 0: the AEC's table */
 } ConvMonoConfig;
 
 static inline ConvMonoConfig conv_mono_default_config(int sample_rate, int fft_size) {
@@ -64,6 +71,8 @@ typedef struct ConvMono {
     float* extra_noise;
     Complex* spec;
     uint32_t rng;
+    uint32_t serial;              /* the aec_post_reset_serial() value already handled */
+    long guard_hops, reset_hops;  /* hops on which the guard fired / the serial moved (statistics for tests) */
     int n_freqs;
     int hop;
 } ConvMono;
@@ -111,6 +120,13 @@ static inline ConvMono* conv_mono_create(const ConvMonoConfig* cfg) {
     c->n_freqs = lane.fft_size / 2 + 1;
     if (cfg->aec_only) return c;
     ac_stft_config_default(&sc, lane.fft_size);
+    if (!cfg->default_synth_window) {
+        int win_n = 0;
+        if (aec_synthesis_window(c->aec, &sc.window, &win_n) != 0 || win_n != lane.fft_size) {
+            conv_mono_destroy(c);
+            return NULL;
+        }
+    }
     synth_b = ALIGN16(ac_istft_get_mem_size(&sc));
     if (cfg->enable_nr) {
         nc = anr_config_for_level_grid(cfg->sample_rate, lane.fft_size, cfg->nr_level);
@@ -135,7 +151,8 @@ static inline ConvMono* conv_mono_create(const ConvMonoConfig* cfg) {
     c->extra_noise = (float*)cur; cur += vec;
     c->spec = (Complex*)cur;
     for (k = 0; k < c->n_freqs; ++k) c->unity[k] = 1.0f;
-    c->rng = CONV_MONO_CNG_RNG_SEED;
+    c->rng = AEC_CNG_SEED;
+    c->serial = aec_post_reset_serial(c->aec);
     if ((cfg->enable_nr && !c->nr) || !c->istft) {
         conv_mono_destroy(c);
         return NULL;
@@ -149,12 +166,27 @@ static inline int conv_mono_hop(ConvMono* c, const float* mic, const float* ref,
     const float* res_gain;
     const float* nr_gain;
     AecResContext ctx;
+    AecOutputBase ob;
+    const Complex* base;
+    uint32_t serial;
     int k;
     aec_process_context(c->aec, mic, ref);
     aec_get_res_context(c->aec, &ctx);
     if (c->cfg.aec_only) {
         memcpy(out, ctx.linear_hop, (size_t)c->hop * sizeof(float));
         return 0;
+    }
+    memset(&ob, 0, sizeof(ob));
+    ob.struct_size = sizeof(ob);
+    if (aec_get_output_base(c->aec, &ob) != 0) return -1;
+    base = ob.base_spec;
+    if (ob.guard_active) ++c->guard_hops;
+    serial = aec_post_reset_serial(c->aec);
+    if (serial != c->serial) {
+        c->serial = serial;
+        ++c->reset_hops;
+        ac_istft_reset(c->istft);
+        c->rng = AEC_CNG_SEED;
     }
     res_gain = c->cfg.enable_res ? ctx.res_gain : c->unity;
     nr_gain = c->unity;
@@ -163,15 +195,15 @@ static inline int conv_mono_hop(ConvMono* c, const float* mic, const float* ref,
             for (k = 0; k < c->n_freqs; ++k) c->extra_noise[k] = ctx.r2[k] * 0x1p-30f;
             extra = c->extra_noise;
         }
-        if (anr_process_gain(c->nr, ctx.error_spec, extra, NULL) != 0) return -1;
+        if (anr_process_gain(c->nr, base, extra, NULL) != 0) return -1;
         nr_gain = anr_get_gain(c->nr, NULL);
         if (!nr_gain) return -1;
     }
     for (k = 0; k < c->n_freqs; ++k) {
         float a = nr_gain[k], b = res_gain[k];
         c->total_gain[k] = a < b ? a : b;
-        c->spec[k].r = ctx.error_spec[k].r * c->total_gain[k];
-        c->spec[k].i = ctx.error_spec[k].i * c->total_gain[k];
+        c->spec[k].r = base[k].r * c->total_gain[k];
+        c->spec[k].i = base[k].i * c->total_gain[k];
     }
     if (c->cfg.enable_cng && c->cfg.enable_res && ctx.comfort_noise)
         aec_cng_fill(&c->rng, c->spec, ctx.comfort_noise, ctx.res_gain, nr_gain,

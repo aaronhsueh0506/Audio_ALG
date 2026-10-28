@@ -117,7 +117,7 @@ I-O 表 / State 表 / 延遲與 warm-up / 相關檔案與測試路徑。全站�
 <code>AecRes</code>，每 hop 呼叫 <code>aec_res_process()</code>（輸入由 <code>mcab_sample_res_input()</code> 自 <code>McabFrame</code> 填入），強度用
 <code>aec_res_set_level()</code>。</p>
 <p class="note"><b>版號</b>（出處為 header，<code>pipelines/tests/test_doc_layout_versions.py</code> 逐頁核對）：
-4ch flow <code>MCAB_LAYOUT_VERSION</code> = 25；
+4ch flow <code>MCAB_LAYOUT_VERSION</code> = 26；
 全表見 <a href="conventions.html">conventions</a>。</p>
 
 <h2>Repo 架構總覽</h2>
@@ -266,7 +266,7 @@ NN post-filter，per-frame callback）；一個 build 一個編譯期格點（16
 mcab 只擁有共享 delay 的 admission、對齊環與 fuse 緩衝。每 hop：<code>mcab_process_front()</code> → 呼叫端的 beamformer 權重 → <code>mcab_fuse()</code>（把 E、R²、comfort noise 投影成 <code>McabFrame</code>，<code>g_res_ctx</code> 為 NULL）。
 <b>mcab 不含 RES、不含 beamformer</b>；SRP-PHAT／BF 的 sample 層 helper 是 <code>mcab_sample_beam.{h,c}</code>（不在 archive 內）。
 RES（libaec 的 <code>AecRes</code>）、NR、CNG、合成由各 main 自己建立並串接：
-<code>aec_res_process()</code> → NR gain（<code>mcab_sample_anr_gain()</code>）→ min → CNG → synthesis。頁內含呼叫順序、已編譯檢查的範例與時序圖。版號：<code>MCAB_LAYOUT_VERSION</code> = 25。</td></tr>
+<code>aec_res_process()</code> → NR gain（<code>mcab_sample_anr_gain()</code>）→ min → CNG → synthesis。頁內含呼叫順序、已編譯檢查的範例與時序圖。版號：<code>MCAB_LAYOUT_VERSION</code> = 26。</td></tr>
 <tr><td><a href="pipeline_4ch_params.html">pipeline_4ch_params</a></td>
 <td>4ch mcab 的設定欄位分級（<code>McabConfig</code>、lane 契約欄位、sample helper 參數）、每 hop 輸入、固定常數、公開／內部函式清單、狀態碼與輸出契約。</td></tr>
 <tr><td><a href="pipeline_4ch_detail.html">pipeline_4ch_detail</a></td>

@@ -21,7 +21,8 @@ def _c_lut_literals():
     return np.array(values, dtype=np.float32)
 
 
-# Every C file that starts a comfort-noise generator defines the seed locally; each must define it once.
+# Every C file that starts a comfort-noise generator takes the seed from the AEC library (AEC_CNG_SEED,
+# aec_post.h) -- directly or through a one-line alias -- and defines no seed of its own.
 C_SEED_SITES = [
     '4ch_aec_bf_nr_res/mcab_sample_post.h',
     '4ch_aec_bf_nr_res/tests/conv_chain_mcab.h',
@@ -35,27 +36,35 @@ C_SEED_SITES = [
     'tests/test_readme_flow.c',
     'tests/pyc_parity/pyc_drv.c',
 ]
-C_SEED = re.compile(r'^#define\s+\w*CNG_RNG_SEED\s+0x([0-9a-fA-F]+)u\s*$', re.MULTILINE)
+# A private numeric seed (any `#define ...CNG_RNG_SEED <number>`) anywhere; the retired 0x9e3779b9 literal outside tests.
+C_PRIVATE_SEED = re.compile(r'^#define\s+\w*CNG_RNG_SEED\s+(?:0x[0-9a-fA-F]+|\d+)u?\b', re.MULTILINE)
+RETIRED_SEED = re.compile(r'0x9e3779b9', re.IGNORECASE)
+LIB_SEED = re.compile(r'^#define\s+AEC_CNG_SEED\s+(\d+)u\s*$', re.MULTILINE)
 
 
-def _c_seeds():
-    seeds = {}
-    for rel in C_SEED_SITES:
-        found = C_SEED.findall((ROOT / 'pipelines' / rel).read_text(encoding='utf-8'))
-        assert len(found) == 1, f'{rel}: expected one CNG_RNG_SEED definition, found {len(found)}'
-        seeds[rel] = int(found[0], 16)
-    for path in sorted((ROOT / 'pipelines').rglob('*.[ch]')):
-        if {'obj', 'bin'} & set(path.parts):
-            continue
-        for value in C_SEED.findall(path.read_text(encoding='utf-8', errors='replace')):
-            seeds.setdefault(str(path), int(value, 16))
-    return seeds
+def _lib_seed():
+    header = (ROOT / 'lib' / 'aec' / 'c_impl' / 'include' / 'aec_post.h').read_text(encoding='utf-8')
+    found = LIB_SEED.findall(header)
+    assert len(found) == 1, 'AEC_CNG_SEED must be defined once in aec_post.h'
+    return int(found[0])
 
 
 def test_lut_and_seed_are_the_c_literals():
     assert np.array_equal(LUT, _c_lut_literals())
-    seeds = _c_seeds()
-    assert set(seeds.values()) == {SEED}, seeds
+    assert SEED == _lib_seed()
+
+
+def test_no_c_site_keeps_a_private_seed():
+    for rel in C_SEED_SITES:
+        text = (ROOT / 'pipelines' / rel).read_text(encoding='utf-8')
+        assert 'AEC_CNG_SEED' in text or 'MCAB_SAMPLE_CNG_RNG_SEED' in text, f'{rel}: does not start from AEC_CNG_SEED'
+    for path in sorted((ROOT / 'pipelines').rglob('*.[ch]')):
+        if {'obj', 'bin'} & set(path.parts):
+            continue
+        text = path.read_text(encoding='utf-8', errors='replace')
+        assert not C_PRIVATE_SEED.search(text), f'{path}: defines a private comfort-noise seed'
+        if 'tests' not in path.parts:       # tests plant the retired seed as a negative control
+            assert not RETIRED_SEED.search(text), f'{path}: still carries the retired 0x9e3779b9 seed'
 
 
 def test_vectorised_draw_matches_the_scalar_recurrence():
@@ -70,18 +79,27 @@ def test_vectorised_draw_matches_the_scalar_recurrence():
     assert gen.state == state
 
 
-def test_add_touches_only_interior_bins_with_quarter_turn_imag():
-    gen = Aec3ComfortNoise()
+def test_fill_is_the_c_helper_arithmetic():
+    """fill() is aec_cng_fill: interior bins only, draws in bin order, sqrt(1-g^2) * (sqrt(cn) * lut)."""
     n = 513
+    rs = np.random.RandomState(3)
+    cn = (np.abs(rs.randn(n)) * 1e5).astype(np.float32)
+    g = rs.rand(n).astype(np.float32)
+    gen = Aec3ComfortNoise()
     spec = np.zeros(n, dtype=np.complex64)
-    amplitude = np.full(n, 0.5, dtype=np.float32)
-    gen.add(spec, amplitude)
+    gen.fill(spec, cn, g)
     assert spec[0] == 0 and spec[n - 1] == 0
-    check = Aec3ComfortNoise()
-    ix = check.draw(n - 2)
-    assert np.array_equal(spec[1:n - 1].real, (np.float32(0.5) * LUT[ix]).astype(np.float32))
-    assert np.array_equal(spec[1:n - 1].imag,
-                          (np.float32(0.5) * LUT[(ix + 8) & 31]).astype(np.float32))
+    ix = Aec3ComfortNoise().draw(n - 2)
+    nf = np.sqrt(np.maximum(cn[1:n - 1] / np.float32(32768.0 ** 2), 0.0)).astype(np.float32)
+    ng = np.sqrt(np.maximum(np.float32(1.0) - g[1:n - 1] * g[1:n - 1], 0.0)).astype(np.float32)
+    assert np.array_equal(spec[1:n - 1].real, (ng * (nf * LUT[ix])).astype(np.float32))
+    assert np.array_equal(spec[1:n - 1].imag, (ng * (nf * LUT[(ix + 8) & 31])).astype(np.float32))
+    # a denoiser gain scales the amplitude by max(g_nr, floor)
+    spec2 = np.zeros(n, dtype=np.complex64)
+    gnr = np.full(n, 0.1, np.float32)
+    Aec3ComfortNoise().fill(spec2, cn, g, gnr, 0.25)
+    ng_nr = (ng * np.float32(0.25)).astype(np.float32)
+    assert np.array_equal(spec2.real[1:n - 1], (ng_nr * (nf * LUT[ix])).astype(np.float32))
 
 
 def test_reset_replays_the_same_sequence():

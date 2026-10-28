@@ -125,14 +125,16 @@ application's `ac_istft_push()`); that full path is distinct from the
 four-channel `mcab_process_front()` → beamformer → `mcab_fuse()` → gain stages flow.
 See `lib/aec/c_impl/include/aec.h` and `aec_res.h` for ownership and inputs.
 
-**`error_spec` does not always mean "error."** That configuration —
-`enable_res=0` with `return_res_context=1` — is the one mode where `lib/aec`'s
-formed selector opens a third candidate: on a hop the filtering-quality
-analyzer has not yet cleared, whose selected residual carries more energy than
-the mic capture, `formed_hop` and `error_spec` both become the capture itself,
-faded in over the existing 30-sample transition. NR/RES still run on it as
-usual — this is the steady-state fallback for a filter that is adding signal
-rather than cancelling. `aec_process()`'s own emitted audio is unaffected.
+**Analysis seam and rendering base.** `error_spec` / `formed_hop` are always the selected linear residual (refined or
+coarse, with the existing 30-sample crossfade); the output guard never replaces them, in any API mode. What an
+application renders is the *rendering base* from `aec_get_output_base()`: `error_spec`, or on a hop where the linear
+estimate is unusable and the residual is louder than the capture (`guard_active`), the capture spectrum
+`error_spec + echo_spec`. The same decision, made once per hop, is what `aec_process()` applies internally, so an
+application that renders `base_spec * gain` (+ comfort noise from `aec_cng_fill()`, started and restarted at
+`AEC_CNG_SEED`), clears its overlap-add tail and reseeds when `aec_post_reset_serial()` moves, and synthesises with the
+AEC's window table, reproduces `aec_process()` sample for sample. The base does not pair with `formed_hop` on a guard
+hop. Each example states which spectrum feeds which stage (the mono chain and the DFN2 pair read the base; the
+Align-ULCNet stage reads `formed_hop`).
 
 The four-channel flow is a separate zero-padding-free grid. See [the 4-channel contract](4ch_aec_bf_nr_res/README.md) and
 [`4ch_aec_bf_nr_res/mcab.h`](4ch_aec_bf_nr_res/mcab.h) for its two per-hop calls
@@ -213,10 +215,12 @@ Mono                App        Aec                 AnrDenoiser      AcIstft
                      |-- ac_stft_config_default; ac_istft_get_mem_size/ac_istft_init ------->|
  per hop             |-- aec_process_context(mic,ref) -->|
                      |-- aec_get_res_context --> ctx{error_spec,r2,comfort_noise,res_gain}
-                     |-- anr_process_gain / anr_get_gain ------>| G_nr
-                     |-- sk_min_f32, sk_capply_gain_f32, aec_cng_fill
+                     |-- aec_get_output_base --> B (the rendering base; ctx.error_spec stays the analysis seam)
+                     |-- aec_post_reset_serial moved? --> ac_istft_reset, rng = AEC_CNG_SEED  (before the draw and the push)
+                     |-- anr_process_gain(B) / anr_get_gain ---->| G_nr
+                     |-- sk_min_f32, sk_capply_gain_f32(B), aec_cng_fill
                      |-- ac_istft_push(spec) ------------------------------------>| out (1 hop later)
- refused hop         |-- aec_reset, anr_reset, ac_istft_reset, rng = CNG_RNG_SEED  (all together)
+ refused hop         |-- aec_reset, anr_reset, ac_istft_reset, rng = AEC_CNG_SEED  (all together)
 
 4-channel           App        Aec x4 + DelayAec    Mcab                 AecRes   AnrDenoiser   AcIstft
  init (once)         |-- mcab_default_config; mcab_lane_config (or aec_config_from_level + mcab_apply_lane_contract)

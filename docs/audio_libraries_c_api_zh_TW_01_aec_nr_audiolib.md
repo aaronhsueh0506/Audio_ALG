@@ -115,8 +115,9 @@ same-hop/same-reference 前提，通常只應由 4 通道 flow（`pipelines/4ch_
 | `aec_apply_external_realign()` | 僅 `EXTERNAL_ALIGNED` mode；通知外部 alignment 已改變 |
 
 `AecLinearContext`／`AecResContext` 是 read-only borrowed views，不可保存其 pointer 跨 hop。
-`enable_res=0` 搭 `return_res_context=1` 時 formed seam 多一個 capture 候選，**不保證每個 hop
-都是誤差**，條件與後果見 [AEC C 使用手冊](../lib/aec/docs/c_user_manual_zh_TW.md) §8.1。
+formed seam（`formed_hop`／`error_spec`）在所有 API 模式下都是被選中的線性殘差，輸出守衛不改動它；
+守衛只決定渲染基底 `aec_get_output_base()`（要渲染 `base * gain` 的鏈讀它）。分析 seam 與渲染基底的
+差別與用法見 [AEC C 使用手冊](../lib/aec/docs/c_user_manual_zh_TW.md) §8.1。
 
 ### 3.5 執行期改抑制強度
 

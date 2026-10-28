@@ -113,13 +113,13 @@ aligned (the libraries assert this).
                 //          sk_min_f32; sk_capply_gain_f32; aec_cng_fill; ac_istft_push
                 if (!c.error_spec || !(P = mono_form(&c)) ||
                     ac_istft_push(istft, P, out) != hop || !skn_all_finite_f32(out, hop)) {
-                    aec_reset(aec); anr_reset(nr); ac_istft_reset(istft); rng = CNG_RNG_SEED;
+                    aec_reset(aec); anr_reset(nr); ac_istft_reset(istft); rng = AEC_CNG_SEED;
                     continue;                                       // a refused hop: reset together
                 }
                 write_hop(out, hop);
             }
 
-5. reset?   aec_reset(aec); anr_reset(nr); ac_istft_reset(istft); rng = CNG_RNG_SEED;
+5. reset?   aec_reset(aec); anr_reset(nr); ac_istft_reset(istft); rng = AEC_CNG_SEED;
             // optional: echo-path change, stream switch; re-zeros AEC/NR/synthesis state in place
             // and restarts the comfort-noise generator; no re-validation, no pool re-touch beyond that.
 

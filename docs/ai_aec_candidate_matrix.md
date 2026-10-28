@@ -48,9 +48,9 @@ There is no standalone AEC-only candidate in this project.
 The AIAEC generator renders complete stateful scenario sequences, executes one
 frozen production Python PBFDKF over each sequence on the context seam
 (`enable_res=False`, `return_res_context=True`), appends its `linear_error` as
-the dataset's last channel — usually `mic_postclip - D_hat`, but a hop the
-filtering-quality analyzer has not cleared and whose residual outweighs the
-capture publishes the capture instead — and then
+the dataset's last channel — `mic_postclip - D_hat`, the real selected residual of
+every hop (the analysis seam, which the output guard never replaces and which can
+exceed the capture on a guard hop) — and then
 cuts 10-second chunks. RES+NR trainers read this stored channel directly. File/stream
 inference restores the same PBFDKF contract from the checkpoint and runs the
 frontend continuously before the neural model.

@@ -56,6 +56,17 @@ ulcnet_nn_stage_end(stage, out);                         /* WOLA, one hop */
 /* on any negative return: aec_reset(aec); ulcnet_nn_stage_reset(stage); */
 ```
 
+**Data domain.** The stage reads the AEC's analysis seam, `rctx.formed_hop` (the selected linear residual, the same
+signal in training and in C inference; the AIAEC frontend contract). It does not read the rendering base
+(`aec_get_output_base()`): that spectrum exists for chains that render `base * gain` and does not pair with
+`formed_hop` on a hop where the output guard fires. Consequently the output guard (capture instead of residual when the
+estimate is unusable and the residual is louder) is not part of this chain's audio: on such hops the network sees the
+real linear residual, which may exceed the capture (a characteristic to evaluate with the retrained model, not a
+property fixed here). This program has no comfort noise and no synthesis of its own besides the stage's WOLA, so the
+AEC's hard post-chain reset event (`aec_post_reset_serial()`) has nothing to reseed or clear here; the stage's own
+policy for a changed alignment is the `delay.changed` flag above, and following a reset event in the network state is
+application policy (this program: none beyond that flag, and it never resets the AEC in response).
+
 A frame left open or never fetched is the identity (fail-open); the reprime
 frame after an alignment boundary has no model frame (`nn_begin` returns 0). The stage is built
 with `ulcnet_nn_stage_mem_size(1)` here because the time-domain error entry needs its own STFT.

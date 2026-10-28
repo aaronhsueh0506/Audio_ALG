@@ -17,9 +17,12 @@
  * are not owned; the stage, bridge, synthesis and output spectrum come from the caller's
  * pool. The stage does not reset on an AEC delay change. It adds DFN_RES_STAGE_LOOKAHEAD_FRAMES
  * hops of delay at 48 kHz (2 for the shipped 1/1 pair) and dfn_rate_bridge_added_delay_samples()
- * otherwise; the first output hops are zero. A
- * negative return leaves recovery to the caller: reset the AEC front end, the comfort-noise
- * generator and DfnHop together. */
+ * otherwise; the first output hops are zero. An AEC post-chain reset event (aec_post_reset_serial()
+ * moved) is followed by the caller before the hop: below 48 kHz dfn_rate_bridge_reset_synthesis(bridge)
+ * (the host-grid synthesis is inside the bridge and runs at the top of dfn_hop_begin(): no delay line);
+ * at 48 kHz the caller clears its own AcIstft DFN_RES_STAGE_LOOKAHEAD_FRAMES hops later (see
+ * mono_aec_dfn_res/main.c). A negative return leaves recovery to the caller: reset the AEC front end,
+ * the comfort-noise generator and DfnHop together. */
 #ifndef PIPELINES_DFN_DFN_HOP_H
 #define PIPELINES_DFN_DFN_HOP_H
 

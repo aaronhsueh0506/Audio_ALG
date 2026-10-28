@@ -192,7 +192,7 @@ lane、estimator 和 sample 層 helper 的 pool 不在其中；`aec.h`／`delay_
 | Offset | 欄位 | 型別 | 目前值 |
 |---:|---|---|---|
 | 0 | `descriptor_version` | `uint32_t` | `1` |
-| 4 | `layout_version` | `uint32_t` | `25` |
+| 4 | `layout_version` | `uint32_t` | `26` |
 | 8 | `backend_id` | `uint32_t` | `2` = NE10（目前唯一的 FFT 後端）；永遠不會是 0（`1` 也不會回傳） |
 | 12 | `build_flags_hash` | `uint32_t` | FNV-1a-32，隨 build 變動 |
 | 16 | `alignment` | `uint32_t` | `16` |

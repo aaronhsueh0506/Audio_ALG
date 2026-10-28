@@ -35,6 +35,15 @@ pipeline 沒有 runtime far-mode setter，raw/aligned 比較只留在 sweep 工�
 report 會把 <code>calibration_far_input_mode</code> 與
 <code>deployment_far_input_mode</code>（兩者皆為 <code>raw_far</code>）分開記錄。D 不改權重，但會改 K/V window
 shape 與 host RAM，所以 calibration 的 D 必須和該份 ONNX export 相同。</div>
+<div class="note"><b>訓練前端契約</b>：layout 只描述 tensor/state 邊界，不辨識 checkpoint 是用哪一版前端訓練的。
+<code>export_onnx.py</code> 把 checkpoint 的 <code>linear_aec</code> 契約原樣寫進 ONNX/JSON metadata：
+<code>linear_aec_contract_version</code>、<code>aec_behavior_hash</code>，以及
+<code>error_input_seam</code> = <code>analysis_formed</code>（error 輸入是 AEC 的分析 seam：<code>formed_hop</code>／<code>beam.spectrum</code>，
+不是 rendering base）。整合端在 <code>ulcnet_accelerator_adapter_init()</code> 之前，要把
+<code>linear_aec_contract_version</code> 與 <code>ulcnet_model_io.h</code> 的
+<code>ULCNET_MODEL_IO_FRONTEND_CONTRACT</code>（<code>aiaec-linear-error-v4</code>）比對，不同就拒絕綁定
+（例如從已退役的 v3 checkpoint 匯出的圖）。這個常數不在 descriptor 內，也不是 layout 升版；測試把它釘在
+<code>LINEAR_AEC_CONTRACT_VERSION</code>。沒有 <code>linear_aec</code> 契約的 checkpoint 不能匯出。</div>
 <h2>layout 18</h2>
 <div class="note">model-I/O layout 是 v18
 （<code>ULCNET_MODEL_IO_LAYOUT_VERSION</code> = 18；四個 state 是完整 window，每個 <code>*_out</code> 就地綁定到輸入位址；

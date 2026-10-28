@@ -1,9 +1,19 @@
 """
 AEC + RES + DeepFilterNet2 pipeline (mono Python reference)
 
-Pipeline: AEC(linear) -> P = E * G_res (+ comfort noise when enabled)   (the
+Pipeline: AEC(linear) -> P = B * G_res (+ comfort noise when enabled)   (the
           conventional post-RES spectrum with the denoiser off) -> DFN2
-          estimated on E, applied on P -> WOLA
+          estimated on B, applied on P -> WOLA
+
+B is the AEC's rendering base (``ctx.output_base_spec``): the linear error spectrum E, or
+E + echo on a hop where the output guard fires -- the spectrum ``AEC.process()`` itself would
+multiply by its gain.  ``ctx.error_spec`` is the analysis seam and is not rendered.  A hard
+post-chain reset of the AEC (``ctx.post_reset_serial`` moved) reseeds the comfort noise to
+``AEC_CNG_SEED`` before that hop's first draw; at 48 kHz the host synthesis also drops its
+overlap-add tail when the frame built on that hop reaches it (``Dfn2Stage`` delays every frame by
+its lookahead).  Below 48 kHz the host-grid synthesis lives inside the rate bridge and runs at the top of its
+``push``, so ``Dfn2RateBridge.reset_synthesis()`` before the push of that hop clears it (no delay line; DFN2, the
+resamplers and the FIFOs keep running), as in the C pipeline.
 
 The host runs on the product's own grid (16 kHz by default).  At 48 kHz the
 stage takes E and P directly; at 16 kHz the rate bridge
@@ -47,7 +57,9 @@ if _AEC_PY not in sys.path:
     sys.path.insert(0, _AEC_PY)
 
 from lib.aec.python.aec import AecConfig, AecMode, AecPreset, AecResContext  # noqa: E402
-from pipelines.mono_aec_nr_res.pipeline import _project_grid, run_aec_linear, synth_window  # noqa: E402
+from pipelines.mono_aec_nr_res.pipeline import (  # noqa: E402
+    _project_grid, apply_gain, rendering_base, run_aec_linear, synth_window,
+)
 from pipelines.common.cng_aec3 import Aec3ComfortNoise  # noqa: E402
 from pipelines.dfn.dfn2_rate_adapter import Dfn2RateBridge  # noqa: E402
 from pipelines.dfn.dfn2_stage import (  # noqa: E402
@@ -116,10 +128,12 @@ def run_dfn2_res(aec_contexts: Sequence[AecResContext], config: AecConfig,
                  output_length: Optional[int] = None) -> np.ndarray:
     """Post-RES spectrum, DFN2 cascade and WOLA, frame by frame.
 
-    Per frame: ``P = E * G_res`` plus the comfort-noise fill (``cng_aec3``, the
-    bit-exact twin of the C recipe with the denoiser factor at unity), then the
-    DFN2 heads on P.  ``estimate_source`` selects the spectrum the features come
-    from: ``pre_res`` = E (shipped), ``post_res`` = P, ``mic`` = ``near_spec``
+    Per frame: ``P = B * G_res`` (B = ``ctx.output_base_spec``, the rendering base)
+    plus the comfort-noise fill (``cng_aec3``, the bit-exact twin of the C recipe with
+    the denoiser factor at unity, restarted from ``AEC_CNG_SEED`` when
+    ``ctx.post_reset_serial`` moves), then the DFN2 heads on P.  ``estimate_source``
+    selects the spectrum the features come from: ``pre_res`` = B (shipped),
+    ``post_res`` = P, ``mic`` = ``near_spec``
     (= error_spec + echo_spec).  ``estimate_spectra`` overrides it with one
     spectrum per AEC context (e.g. a raw capture lane of the 4-channel
     evaluator) and never changes S1.  ``realtime_timing=False`` (offline)
@@ -158,9 +172,12 @@ def run_dfn2_res(aec_contexts: Sequence[AecResContext], config: AecConfig,
     native_hops: List[np.ndarray] = []
 
     emitted = 0
+    reset_frames = set()      # AEC frames on which a hard post-chain reset happened
 
     def emit(out_spec: np.ndarray, frame_index: int):
         nonlocal ola, emitted
+        if frame_index in reset_frames:
+            ola[:] = 0.0      # the frame built on the reset hop: drop the previous filter's tail
         spec = np.asarray(out_spec, dtype=np.complex64)
         e_full = np.fft.irfft(spec, n=fft).astype(np.float32)
         ola += e_full[:bs] * synth_win
@@ -175,27 +192,31 @@ def run_dfn2_res(aec_contexts: Sequence[AecResContext], config: AecConfig,
         # The warm-up hops synthesise an empty spectrum, exactly as the C
         # pipeline does, so the delay is a pure delay.
         for _ in range(model_delay):
-            emit(np.zeros(n_freqs, np.complex64), 0)
+            emit(np.zeros(n_freqs, np.complex64), -1)
 
     unity = np.ones(n_freqs, np.float32)
+    serial = 0                # the post_reset_serial already handled
     for context_index, ctx in enumerate(aec_contexts):
         if ctx.error_spec is None or ctx.res_gain is None:
             raise ValueError('AEC built without the RES seam (return_res_context)')
-        e = np.asarray(ctx.error_spec, dtype=np.complex64)
+        if ctx.post_reset_serial != serial:
+            serial = ctx.post_reset_serial
+            cng.reset()                       # before this hop's first draw
+            reset_frames.add(context_index)   # and the synthesis tail, when this frame reaches it
+            if bridge is not None:
+                bridge.reset_synthesis()      # the bridge synthesises at the top of push(): this hop
+        e = rendering_base(ctx)
         g_res = np.asarray(ctx.res_gain, dtype=np.float32) if use_res else unity
         # The conventional post spectrum with the denoiser off: RES gain,
         # then the comfort-noise fill (denoiser factor max(1, floor) = 1),
         # drawn at this frame exactly as the C host draws it.
-        post = (e * g_res).astype(np.complex64)
+        post = apply_gain(e, g_res)
         if enable_cng and use_res and ctx.comfort_noise is not None:
-            comfort = np.asarray(ctx.comfort_noise, dtype=np.float32)
-            n_amp = np.sqrt(np.maximum(comfort / PSD_SCALE, 0.0)).astype(np.float32)
-            noise_gain = np.sqrt(np.maximum(1.0 - g_res * g_res, 0.0)).astype(np.float32)
-            cng.add(post, (noise_gain * n_amp).astype(np.float32))
+            cng.fill(post, ctx.comfort_noise, g_res)
         if estimate_spectra is not None:
             a = np.asarray(estimate_spectra[context_index], dtype=np.complex64)
             if a.shape != e.shape:
-                raise ValueError('external estimate spectrum shape does not match E')
+                raise ValueError('external estimate spectrum shape does not match B')
         elif estimate_source == 'pre_res':
             a = e
         elif estimate_source == 'post_res':

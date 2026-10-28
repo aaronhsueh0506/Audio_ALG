@@ -147,8 +147,9 @@ Flow + your beamformer      App   lanes/DelayAec (yours)   Mcab   your BF   AecR
  per hop                     |-- mcab_process_front(mics, ref, &front) -->|
                              |-- front.linear_spectra --------------------->| weights [4][n_freqs]
                              |-- mcab_fuse(weights, NULL|beamformed_error, &frame) -->|  frame.g_res_ctx = NULL
-                             |-- mcab_sample_res_input ; aec_res_process --> G_res ; mcab_sample_anr_gain --> G_nr ; sk_min_f32 ; sk_capply_gain_f32
-                             |-- aec_cng_fill ; ac_istft_push --> out (1 hop behind the input)
+                             |-- mcab_sample_res_input ; aec_res_process --> G_res ; mcab_sample_anr_gain --> G_nr  (all on frame.e) ; sk_min_f32
+                             |-- frame.post_reset_serial moved: ac_istft_reset, rng = MCAB_SAMPLE_CNG_RNG_SEED (mcab_sample_post_reset_due)
+                             |-- sk_capply_gain_f32 over frame.b ; aec_cng_fill ; ac_istft_push --> out (1 hop behind the input)
  refused / non-finite        |-- mcab_reset (resets the lanes and the estimator through their own reset), aec_res_reset, anr_reset, ac_istft_reset, rng = MCAB_SAMPLE_CNG_RNG_SEED
  teardown                    |-- mcab_destroy, then aec_destroy x4, anr_destroy, then free the memory
 
@@ -159,12 +160,42 @@ Flow + sample beam helper   App   McabSampleBeam (SRP-PHAT + BF)   AecRes (yours
  per hop                     |-- mcab_sample_beam_process_front --> (mask, vad_raw, vad_out) --> mcab_sample_beam_process_beam
                              |       or mcab_sample_beam_process_with_activity, or mcab_sample_beam_process (built-in energy VAD)
                              |-- mcab_sample_beam_fuse(&frame) : frame.g_res_ctx = NULL (no RES inside)
-                             |-- mcab_sample_res_input ; aec_res_process --> G_res ; mcab_sample_anr_gain --> G_nr ; sk_min_f32 ; sk_capply_gain_f32
-                             |-- aec_cng_fill ; ac_istft_push --> out (1 hop behind the input)
- cfg.enable_post = 0         |-- no fuse (INVALID_ARGUMENT), no RES; beam.spectrum --> ulcnet_nn_stage_begin_complex
+                             |-- mcab_sample_res_input ; aec_res_process --> G_res ; mcab_sample_anr_gain --> G_nr  (all on frame.e) ; sk_min_f32
+                             |-- frame.post_reset_serial moved: ac_istft_reset, rng = MCAB_SAMPLE_CNG_RNG_SEED (mcab_sample_post_reset_due)
+                             |-- sk_capply_gain_f32 over frame.b ; aec_cng_fill ; ac_istft_push --> out (1 hop behind the input)
+ cfg.enable_post = 0         |-- no fuse (INVALID_ARGUMENT), no RES; beam.spectrum (the analysis beam) --> ulcnet_nn_stage_begin_complex
  refused / non-finite        |-- mcab_sample_beam_reset, aec_res_reset, anr_reset, ac_istft_reset, rng = MCAB_SAMPLE_CNG_RNG_SEED
  teardown                    |-- mcab_sample_beam_destroy, mcab_destroy, aec_destroy x4, anr_destroy, then free the memory
 ```
+
+### Analysis and rendering spectra, post-chain resets
+
+Each lane's library evaluates its own output guard once per hop (lib/aec `aec_get_output_base()`: when the
+lane's linear estimate is not usable and its windowed residual carries more energy than its capture, the
+lane's rendering base is the capture `E + echo`, else `E`). mcab adds no guard of its own, before or after the
+beam. Which spectrum feeds what:
+
+| Consumer | Reads | Field |
+|---|---|---|
+| SRP-PHAT / BF (advanced once per hop) | the lanes' analysis spectra | `McabFront.linear_spectra` |
+| post-beam RES (`aec_res_process`), NR estimator (`mcab_sample_anr_gain`), the DFN2 estimate | the analysis beam `E` and the projected `Y`, `R^2`, `N^2` | `McabFrame.e`, `.y`, `.r2`, `.cn` |
+| synthesis (`P = B * min(G_nr, G_res)` + comfort noise), the DFN2 `P` | the rendering base `B = sum_ch W_ch * B_ch` with the same hop's weights | `McabFrame.b` |
+| Align-ULCNet on the beam (`enable_post = 0`) | the analysis beam (as a network on one lane reads its error spectrum) | `beam.spectrum` |
+
+`B` is `E` itself (the same pointer) unless a contributing lane's guard fired (`McabFrame.guard_lanes`).
+A lane's guard bounds that lane's residual by its capture; the bound is not carried through the beam (complex
+weights mix the lanes), and `B` is not the transform of any formed time hop. On the blind-set guard subset
+(lanes = one clip delayed 0..3 samples, the sample beam helper's weights) `|B|^2` sits within -0.7..+0.2 dB of
+the projected capture `|Y|^2` over the guard hops, while `|E|^2` (what the chain rendered before) sits
++0.02..+2.4 dB above it; single hops with `|B|^2 > |Y|^2` do occur.
+
+`McabFront/McabFrame.post_reset_serial` is the four lanes' `aec_post_reset_serial()` summed modulo 2^32. The
+one synthesizer of the fused output keeps the value it last followed; when the frame's value differs it clears
+its overlap-add tail and reseeds its comfort noise to `MCAB_SAMPLE_CNG_RNG_SEED` (= `AEC_CNG_SEED`, 42) before
+that hop's comfort-noise draw and inverse transform. mcab never resets a lane in response; whether the denoiser
+or a network follows is the application's policy (the DFN2 example resets its whole hop: the stage keeps its
+synthesis inside). The lanes take an aligned far (`EXTERNAL_ALIGNED`), so in this flow the serial moves only
+with `aec_reset()`, i.e. `mcab_reset()`.
 
 | | External (a third party may tune) | Internal (exists, not recommended to open) |
 |---|---|---|

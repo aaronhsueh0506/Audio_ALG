@@ -64,6 +64,11 @@ typedef struct McabLaneSnapshot {
     const float* r2;
     const float* comfort_noise;
     const float* formed_hop;
+    /* Rendering base (aec_get_output_base()): error_spec, or the capture where the lane's guard
+     * fired; same lifetime as the views above. */
+    const Complex* base_spec;
+    int guard_active;
+    uint32_t reset_serial;
 
     float far_power;
     float dt_indicator;
@@ -110,8 +115,10 @@ struct Mcab {
     Complex* residual_proj;    /* coherent residual vector, then its power in fused_r2 */
     float* fused_r2;
     float* fused_comfort;
+    Complex* render_base;      /* sum_ch W_ch * B_ch on a hop where a contributing lane's guard fired */
 
     int front_valid;           /* a front was processed since the last reset */
+    uint32_t front_post_reset_serial;   /* McabFront.post_reset_serial of that front */
 
     void* owned_heap;
     size_t pool_size;
@@ -238,7 +245,7 @@ static size_t flow_buffer_size(int hop, int n, int delay_ring_size, int enable_p
     int i;
     for (i = 0; i < 2; ++i) total = ck_field_size(total, (size_t)hop, sizeof(float));
     if (enable_post) {
-        for (i = 0; i < 4; ++i) total = ck_field_size(total, (size_t)n, sizeof(Complex));
+        for (i = 0; i < 5; ++i) total = ck_field_size(total, (size_t)n, sizeof(Complex));
         for (i = 0; i < 2; ++i) total = ck_field_size(total, (size_t)n, sizeof(float));
     }
     if (delay_ring_size > 0)
@@ -260,8 +267,9 @@ static int carve_buffers(Mcab* p, PoolCursor* cursor) {
         p->residual_proj = (Complex*)pool_carve(cursor, (size_t)n, sizeof(Complex));
         p->fused_r2 = (float*)pool_carve(cursor, (size_t)n, sizeof(float));
         p->fused_comfort = (float*)pool_carve(cursor, (size_t)n, sizeof(float));
+        p->render_base = (Complex*)pool_carve(cursor, (size_t)n, sizeof(Complex));
         if (!p->fused_error || !p->fused_near || !p->residual_work || !p->residual_proj ||
-            !p->fused_r2 || !p->fused_comfort) return 0;
+            !p->fused_r2 || !p->fused_comfort || !p->render_base) return 0;
     }
     if (p->delay_ring_size > 0) {
         p->delay_ring = (float*)pool_carve(cursor, (size_t)p->delay_ring_size, sizeof(float));
@@ -283,7 +291,7 @@ static uint32_t fnv1a_str(const char* text, uint32_t hash) {
 static uint32_t mcab_build_flags_hash(void) {
     uint32_t hash = 2166136261u;
     hash = fnv1a_str(AUDIO_PIPELINE_BACKEND_STR, hash);
-    hash = fnv1a_str("|carve:mcab(cfg-v1),hop2,fuse?(complex4,float2),lanebind,delayring?", hash);
+    hash = fnv1a_str("|carve:mcab(cfg-v1),hop2,fuse?(complex4,float2,render),lanebind,delayring?", hash);
     hash = fnv1a_str("|align16", hash);
     return ac_memreq_abi_hash(hash);
 }
@@ -380,7 +388,11 @@ int mcab_get_mem_requirements(const McabConfig* cfg, McabMemReq* out) {
 static int lane_matches(const Aec* lane, int hop, int n, int enable_post) {
     AecResContext rc;
     AecLinearContext lc;
+    AecOutputBase ob;
     if (aec_hop_size(lane) != hop) return 0;
+    memset(&ob, 0, sizeof(ob));
+    ob.struct_size = sizeof(ob);
+    if (aec_get_output_base(lane, &ob) != 0 || ob.n_freqs != n || !ob.base_spec) return 0;
     aec_get_res_context(lane, &rc);
     if (rc.hop_size != hop || rc.n_freqs != n) return 0;
     /* The seam pointers exist only with the context returned (enable_res or return_res_context);
@@ -719,10 +731,12 @@ static int align_render(Mcab* p, const float* render, int delay_samples) {
 /* Points dst at src's buffers instead of copying: AecResContext aliases the lane's per-hop
  * buffers, a lane runs again only inside mcab_process_front() or after a reset, and the front
  * view is valid until then. Reset does not clear that memory; fuse refuses a stale view. */
-static int bind_lane_view(McabLaneSnapshot* dst, const AecResContext* src, int n_freqs,
+static int bind_lane_view(McabLaneSnapshot* dst, const AecResContext* src,
+                          const AecOutputBase* base, uint32_t reset_serial, int n_freqs,
                           int residual_half) {
-    if (!dst || !src || src->n_freqs != n_freqs ||
-        !src->error_spec || !src->echo_spec || !src->far_spec || !src->near_spec) return 0;
+    if (!dst || !src || !base || src->n_freqs != n_freqs || base->n_freqs != n_freqs ||
+        !src->error_spec || !src->echo_spec || !src->far_spec || !src->near_spec ||
+        !base->base_spec) return 0;
     if (residual_half && (!src->r2 || !src->comfort_noise)) return 0;
 
     dst->error_spec = src->error_spec;
@@ -732,6 +746,9 @@ static int bind_lane_view(McabLaneSnapshot* dst, const AecResContext* src, int n
     dst->r2 = src->r2;
     dst->comfort_noise = src->comfort_noise;
     dst->formed_hop = src->formed_hop;
+    dst->base_spec = base->base_spec;
+    dst->guard_active = base->guard_active;
+    dst->reset_serial = reset_serial;
 
     dst->far_power = src->far_power;
     dst->dt_indicator = src->dt_indicator;
@@ -842,6 +859,7 @@ int mcab_process_front(Mcab* p, const float* microphones_interleaved,
 
     for (ch = 0; ch < MCAB_CHANNELS; ++ch) {
         AecResContext context;
+        AecOutputBase base;
         if (ch != 0 || p->cfg.capture_proxy_channel != 0) {
             for (i = 0; i < hop; ++i)
                 p->mic_lane[i] = microphones_interleaved[i * MCAB_CHANNELS + ch];
@@ -855,9 +873,13 @@ int mcab_process_front(Mcab* p, const float* microphones_interleaved,
                                                 p->lanes[0]);
         }
         aec_get_res_context(p->lanes[ch], &context);
+        memset(&base, 0, sizeof(base));
+        base.struct_size = sizeof(base);
         if (ch == 0) shared_far_spec = context.far_spec;
-        if (!context.formed_hop ||
-            !bind_lane_view(&p->snapshots[ch], &context, p->n_freqs, p->cfg.enable_post)) {
+        if (!context.formed_hop || aec_get_output_base(p->lanes[ch], &base) != 0 ||
+            !bind_lane_view(&p->snapshots[ch], &context, &base,
+                            aec_post_reset_serial(p->lanes[ch]), p->n_freqs,
+                            p->cfg.enable_post)) {
             mcab_reset(p);
             return MCAB_DSP_ERROR;
         }
@@ -886,10 +908,15 @@ int mcab_process_front(Mcab* p, const float* microphones_interleaved,
     out->hop_size = p->hop_size;
     out->n_channels = MCAB_CHANNELS;
     out->n_freqs = p->n_freqs;
+    out->post_reset_serial = 0u;
     for (ch = 0; ch < MCAB_CHANNELS; ++ch) {
         out->linear_spectra[ch] = p->snapshots[ch].error_spec;
         out->formed_hop[ch] = p->snapshots[ch].formed_hop;
+        out->render_spectra[ch] = p->snapshots[ch].base_spec;
+        out->guard_active[ch] = p->snapshots[ch].guard_active;
+        out->post_reset_serial += p->snapshots[ch].reset_serial;   /* wraps modulo 2^32 */
     }
+    p->front_post_reset_serial = out->post_reset_serial;
     out->aligned_ref = p->aligned_ref;
     return MCAB_OK;
 }
@@ -899,11 +926,42 @@ static int complex_vector_finite(const Complex* values, int count) {
     return skn_all_finite_cf32(values, (size_t)count);
 }
 
+/* A lane zeroed in every bin contributes nothing (bypassed beamformer: [1,0,0,0]). */
+static int lane_contributes(const Complex* lane_weights, int n) {
+    int k;
+    for (k = 0; k < n; ++k)
+        if (lane_weights[k].r != 0.0f || lane_weights[k].i != 0.0f) return 1;
+    return 0;
+}
+
+/* Rendering base of the beam (mcab.h): the beam E itself when no contributing lane's guard fired,
+ * else sum_ch W_ch * B_ch into render_base, lane order 0..3 as the error rebuild. 0 when that
+ * projection is not finite. */
+static int project_render_base(Mcab* p, const Complex* weights, const Complex* analysis,
+                               const Complex** base, int* guard_lanes) {
+    int n = p->n_freqs;
+    int mask = 0;
+    int ch;
+    for (ch = 0; ch < MCAB_CHANNELS; ++ch)
+        if (p->snapshots[ch].guard_active &&
+            lane_contributes(weights + (size_t)ch * (size_t)n, n)) mask |= 1 << ch;
+    *guard_lanes = mask;
+    if (mask == 0) {
+        *base = analysis;
+        return 1;
+    }
+    memset(p->render_base, 0, (size_t)n * sizeof(Complex));
+    for (ch = 0; ch < MCAB_CHANNELS; ++ch)
+        mcab_projection_cmac(p->render_base, weights + (size_t)ch * (size_t)n,
+                             p->snapshots[ch].base_spec, n);
+    *base = p->render_base;
+    return complex_vector_finite(p->render_base, n);
+}
+
 static int fuse_contexts(Mcab* p, const Complex* weights, const Complex* trusted_beamformed_error,
                          int* all_converged, int* usable_linear, float* max_dt,
                          float* max_saturation) {
     int n = p->n_freqs;
-    int k;
     int ch;
     float base_far_power = p->snapshots[0].far_power;
 
@@ -924,19 +982,12 @@ static int fuse_contexts(Mcab* p, const Complex* weights, const Complex* trusted
 
     for (ch = 0; ch < MCAB_CHANNELS; ++ch) {
         const Complex* lane_weights = weights + (size_t)ch * (size_t)n;
-        /* A lane zeroed in every bin contributes nothing, so it must not vote on the scalars that
-         * steer the post stage (bypassed beamformer: [1,0,0,0]). */
-        int lane_contributes = 0;
-        for (k = 0; k < n; ++k) {
-            if (lane_weights[k].r != 0.0f || lane_weights[k].i != 0.0f) {
-                lane_contributes = 1;
-                break;
-            }
-        }
+        /* A lane that contributes nothing must not vote on the scalars that steer the post stage. */
+        int contributes = lane_contributes(lane_weights, n);
         float delta = fabsf(p->snapshots[ch].far_power - base_far_power);
         float scale = 1.0f + fabsf(base_far_power);
         if (delta > 1e-5f * scale) return 0;
-        if (lane_contributes) {
+        if (contributes) {
             if (!p->snapshots[ch].filter_converged) *all_converged = 0;
             if (!p->snapshots[ch].usable_linear) *usable_linear = 0;
             if (p->snapshots[ch].dt_indicator > *max_dt) *max_dt = p->snapshots[ch].dt_indicator;
@@ -974,6 +1025,9 @@ int mcab_fuse(Mcab* p, const Complex* weights, const Complex* beamformed_error,
     int usable_linear;
     float max_dt;
     float max_saturation;
+    const Complex* analysis;
+    const Complex* render;
+    int guard_lanes;
     uint32_t t0;
 
     if (!p || p->destroyed || !weights || !frame || !p->cfg.enable_post)
@@ -984,8 +1038,10 @@ int mcab_fuse(Mcab* p, const Complex* weights, const Complex* beamformed_error,
 
     p->last_timing.fuse_us = 0;
     t0 = mcab_now_us();
+    analysis = beamformed_error ? beamformed_error : p->fused_error;
     if (!fuse_contexts(p, weights, beamformed_error, &all_converged, &usable_linear, &max_dt,
-                       &max_saturation)) {
+                       &max_saturation) ||
+        !project_render_base(p, weights, analysis, &render, &guard_lanes)) {
         mcab_reset(p);
         return MCAB_DSP_ERROR;
     }
@@ -994,7 +1050,10 @@ int mcab_fuse(Mcab* p, const Complex* weights, const Complex* beamformed_error,
     memset(frame, 0, sizeof(*frame));
     frame->n_freqs = p->n_freqs;
     frame->hop = p->hop_size;
-    frame->e = beamformed_error ? beamformed_error : p->fused_error;
+    frame->e = analysis;
+    frame->b = render;
+    frame->guard_lanes = guard_lanes;
+    frame->post_reset_serial = p->front_post_reset_serial;
     frame->y = p->fused_near;
     frame->x = p->snapshots[0].far_spec;
     frame->r2 = p->fused_r2;

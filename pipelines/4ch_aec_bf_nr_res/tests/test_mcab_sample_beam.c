@@ -606,6 +606,7 @@ typedef struct ExPost {
     float *unity, *total, *extra;
     Complex* spec;
     uint32_t rng;
+    uint32_t reset_handled;   /* McabFrame.post_reset_serial the synthesis last followed */
     int n_freqs, enable_cng;
     void* mem;
 } ExPost;
@@ -676,7 +677,11 @@ static int ex_post_hop(ExPost* q, const McabFrame* f, float* out) {
     }
     if (q->nr && !(nr = mcab_sample_anr_gain(q->nr, f, q->extra, 1))) return -1;
     sk_min_f32(q->total, nr, res, q->n_freqs);
-    sk_capply_gain_f32(q->spec, f->e, q->total, q->n_freqs);
+    if (mcab_sample_post_reset_due(&q->reset_handled, f)) {
+        ac_istft_reset(q->istft);
+        q->rng = MCAB_SAMPLE_CNG_RNG_SEED;
+    }
+    sk_capply_gain_f32(q->spec, f->b, q->total, q->n_freqs);
     if (q->enable_cng && q->res && f->cn)
         aec_cng_fill(&q->rng, q->spec, f->cn, res, nr, MCAB_SAMPLE_CNG_NR_GAIN_FLOOR, q->n_freqs);
     (void)ac_istft_push(q->istft, q->spec, out);

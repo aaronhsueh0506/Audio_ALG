@@ -381,6 +381,17 @@ class Dfn2RateBridge:
         self.out_fifo = np.zeros(self.prefill, np.float32)
         self.frames48 = 0
         self.last_hop_frames = 0
+        self.host_hops = None
+
+    def reset_synthesis(self) -> None:
+        """Twin of ``dfn_rate_bridge_reset_synthesis()``: the host's post chain was hard-reset in the
+        hop about to be pushed.  Clears the overlap-add tails of the two native-grid synthesis objects
+        (estimate and apply lane) and nothing else -- the stage, the resamplers, the 48 kHz FIFOs and
+        synthesis, the output FIFO and the counters keep running.  Call it before :meth:`push` of the
+        hop on which ``post_reset_serial`` moved; the synthesis runs at the top of ``push``, so the
+        clear lands on that hop with no delay line."""
+        self.ola_e[:] = 0.0
+        self.ola_p[:] = 0.0
 
     def _synth_native(self, spec: np.ndarray, ola: np.ndarray) -> np.ndarray:
         full = np.fft.irfft(np.asarray(spec, np.complex64), n=self.fft).astype(np.float32)
@@ -397,6 +408,7 @@ class Dfn2RateBridge:
     def push(self, estimate_spec: np.ndarray, apply_spec: np.ndarray) -> np.ndarray:
         e_hop = self._synth_native(estimate_spec, self.ola_e)
         p_hop = self._synth_native(apply_spec, self.ola_p)
+        self.host_hops = (e_hop, p_hop)   # the native-grid hops before the resamplers (C: get_host_hops)
         self.fifo_e = np.concatenate([self.fifo_e, self.up_e.process(e_hop)])
         self.fifo_p = np.concatenate([self.fifo_p, self.up_p.process(p_hop)])
         if len(self.fifo_e) != len(self.fifo_p):

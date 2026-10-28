@@ -75,14 +75,14 @@ BUILD_NAME = {1: 'std-math SIMD=0', 2: 'shipped SIMD=1'}
 def row_ids():
     ids = []
     for g, _, _ in GRIDS:
-        ids += ['a.nr4.%s.%s' % (g, k) for k in ('glue_cflag', 'glue_fold', 'verdict_flag', 'gnr_e2e', 'legacy_amin')]
+        ids += ['a.nr4.%s.%s' % (g, k) for k in ('glue_cflag', 'glue_fold', 'verdict_flag', 'gnr_e2e', 'legacy_amin', 'replay_identity')]
     for g, _, _ in GRIDS:
         ids += ['b.res4.%s.%s' % (g, p) for p in PRESETS_B]
     for g, _, _ in GRIDS:
         ids += ['c.realign4.%s' % g]
     for g, _, _ in GRIDS:
-        ids += ['d.mono.%s.%s' % (g, k) for k in ('nr_glue', 'min_apply_ola', 'cng_glue', 'legacy_amin')]
-    ids += ['d.mono.cng_twin', 'd.mono.cng_lookalike', 'd.mono.8k']
+        ids += ['d.mono.%s.%s' % (g, k) for k in ('nr_glue', 'min_apply_ola', 'cng_glue', 'reset_glue', 'legacy_amin')]
+    ids += ['d.mono.cng_twin', 'd.mono.cng_pipeline', 'd.mono.8k']
     for g, _, _ in GRIDS:
         ids += ['l2.nr4.%s.replay.%s' % (g, k) for k in ('gnr', 'out')]
         ids += ['l2.res4.%s.%s.replay' % (g, p) for p in PRESETS]
@@ -271,7 +271,7 @@ class Seam:
             raise RuntimeError('bad seam header in %s' % path)
         self.kind, self.sr, self.fft, self.nf, self.hop, self.nh, self.fail_hop, self.fail_rc = [int(v) for v in h[2:]]
         nf, hop, nh = self.nf, self.hop, self.nh
-        rec = 8 * nf + 2 * hop + 16
+        rec = 10 * nf + 2 * hop + 16
         d = np.fromfile(path, np.float32, offset=40)[:nh * rec].reshape(nh, rec)
         o = 0
 
@@ -287,6 +287,7 @@ class Seam:
 
         self.E = cplx(take(2 * nf))
         self.Y = cplx(take(2 * nf))
+        self.B = cplx(take(2 * nf))       # the rendering base the chain applied its gain to
         self.R2 = np.ascontiguousarray(take(nf))
         self.CN = np.ascontiguousarray(take(nf))
         self.Gres = np.ascontiguousarray(take(nf))
@@ -302,6 +303,16 @@ class Seam:
     @property
     def max_dt(self):
         return self.sc[:, 1]
+
+    @property
+    def guard(self):
+        """sc[12]: mono guard_active (B is Y = error + echo there, else E); 4ch McabFrame.guard_lanes."""
+        return self.sc[:, 12].astype(np.int64)
+
+    @property
+    def serial(self):
+        """aec_post_reset_serial() after each hop (sc[13])."""
+        return self.sc[:, 13].astype(np.int64)
 
 
 class Replay:
@@ -374,8 +385,13 @@ def quiet():
 
 
 def py_nr(cx, seam, usable, nr_preset='balanced'):
-    """mono_aec_nr_res.pipeline.run_nr_spectrum over a recorded seam, usable_linear from `usable`."""
-    ctxs = [types.SimpleNamespace(error_spec=seam.E[h], r2=seam.R2[h], usable_linear=bool(usable[h]))
+    """mono_aec_nr_res.pipeline.run_nr_spectrum over a recorded seam, usable_linear from `usable`.
+
+    run_nr_spectrum estimates on output_base_spec. The mono chain's denoiser reads the rendering base B; the 4ch
+    denoiser reads the analysis beam E (mcab_sample_anr_gain), so a 4ch seam hands Python E there."""
+    est = seam.B if seam.kind == 0 else seam.E
+    ctxs = [types.SimpleNamespace(error_spec=seam.E[h], output_base_spec=est[h], r2=seam.R2[h],
+                                  usable_linear=bool(usable[h]))
             for h in range(seam.nh)]
     with quiet():
         return cx.P.run_nr_spectrum(ctxs, seam.sr, nr_preset=nr_preset, inject_echo_psd=cx.P.PROD_INJECT_ECHO_PSD)
@@ -547,6 +563,22 @@ def sec_a(cx, g, sr, fft, want):
         rows.append(make_row(pre + 'legacy_amin', 1, 'C internal: legacy_amin 0 vs 1 must give different output',
                              'pyc_drv_4ch chain legacy_amin=0 / 1 / enable_nr=0', gate=gate, metrics=m,
                              tol={'out_max_abs_must_exceed': 0.0}, grid=g, ref='C (self)', note=note))
+    if want(pre + 'replay_identity'):
+        # The open-loop replay must reproduce the closed-loop chain over its own seam (recorded usable flag), so the
+        # replay rows above judge the chain's stages; it can only do so on guard hops if the seam carries B.
+        rep = c_replay(cx, 1, '4ch', seam_path(cx, 1, 'chain_%s_base.bin' % g), 'replay_%s_self.bin' % g)
+        d_out, d_gnr, d_gres = stats(base.out, rep.out), stats(base.Gnr, rep.Gnr), stats(base.Gres, rep.Gres)
+        guard_hops = int(np.count_nonzero(base.guard))
+        b_vs_e = float(np.max(np.abs(base.B - base.E))) if base.nh else 0.0
+        m = {'out_bit_identical': d_out['bit_identical'], 'out_max_abs': d_out['max_abs'],
+             'gnr_bit_identical': d_gnr['bit_identical'], 'gres_bit_identical': d_gres['bit_identical'],
+             'guard_hops': guard_hops, 'max_abs_B_minus_E': b_vs_e}
+        rows.append(make_row(pre + 'replay_identity', 1, 'C internal: replay over the chain\'s seam (recorded usable, recorded B) reproduces the chain bit for bit',
+                             'pyc_drv_4ch replay seam=<L1 chain> vs pyc_drv_4ch chain, same build', grid=g, ref='C (self)',
+                             gate=(d_out['bit_identical'] and d_gnr['bit_identical'] and d_gres['bit_identical'] and guard_hops > 0 and b_vs_e > 0.0),
+                             metrics=m, tol={'out_max_abs': 0.0, 'guard_hops_must_exceed': 0},
+                             note='guard hops (McabFrame.guard_lanes != 0): %d of %d, max |B - E| %.3g; a replay rendering E instead of B differs there'
+                                  % (guard_hops, base.nh, b_vs_e)))
     return rows
 
 
@@ -655,8 +687,11 @@ def sec_c(cx, g, sr, fft, want):
 # --------------------------------------------------------------------------------------------------
 # Section (d): mono glue
 # --------------------------------------------------------------------------------------------------
-def mono_cng_twin_out(cx, seam, cn_floor):
-    """Python min / apply / comfort noise (cng_aec3 twin, the amplitude recipe of aec_cng_fill) / OLA over a C seam."""
+def mono_cng_twin_out(cx, seam, cn_floor, follow_reset=True):
+    """Python reset event / min / apply / comfort noise (cng_aec3 twin of aec_cng_fill) / OLA over a C seam.
+
+    The base is the rendering base of the hop (Y on a guard hop, else E); a new post-reset serial clears the OLA tail and
+    restarts the comfort noise before the hop's first draw, as mono_aec_nr_res/main.c does."""
     from pipelines.common.cng_aec3 import Aec3ComfortNoise
     P = cx.P
     nf, hop = seam.nf, seam.hop
@@ -664,16 +699,17 @@ def mono_cng_twin_out(cx, seam, cn_floor):
     win = P.synth_window(bs)
     ola = np.zeros(bs, np.float32)
     gen = Aec3ComfortNoise()
-    psd = np.float32(32768.0 ** 2)
+    serial = 0
     out = np.zeros(seam.nh * hop, np.float32)
     for h in range(seam.nh):
+        if follow_reset and int(seam.serial[h]) != serial:
+            serial = int(seam.serial[h])
+            ola[:] = 0.0
+            gen.reset()
         gt = P.total_gain(seam.Gnr[h], seam.Gres[h], True, True, 'min', nf)
-        spec = P.apply_gain(seam.E[h], gt)
+        spec = P.apply_gain(seam.B[h], gt)
         if cn_floor is not None:
-            n_amp = np.sqrt(np.maximum(seam.CN[h] / psd, 0.0)).astype(np.float32)
-            ng = np.sqrt(np.maximum(1.0 - seam.Gres[h] * seam.Gres[h], 0.0)).astype(np.float32)
-            nrf = np.maximum(seam.Gnr[h], np.float32(cn_floor)).astype(np.float32)
-            gen.add(spec, ((n_amp * ng).astype(np.float32) * nrf).astype(np.float32))
+            gen.fill(spec, seam.CN[h], seam.Gres[h], seam.Gnr[h], cn_floor)
         out[h * hop:(h + 1) * hop] = P.synthesize_hop(spec, ola, win, bs, bs, hop)
     return out
 
@@ -705,7 +741,23 @@ def sec_d(cx, g, sr, fft, want):
         rows.append(make_row(pre + 'cng_glue', 1, 'mono min / apply / comfort noise / OLA with CNG on: Python glue + cng_aec3 twin over the C seam vs C output',
                              prod + ' enable_cng=1; total_gain/apply_gain + cng_aec3.Aec3ComfortNoise.add/synthesize_hop', gate=m['max_abs'] <= tol_out,
                              metrics=m, tol={'max_abs': tol_out}, grid=g, ref='Python',
-                             note='mono_aec_nr_res.pipeline.comfort_noise_fill is a documented Gaussian look-alike and is not compared here (see d.mono.cng_lookalike)'))
+                             note='the pipeline\'s own comfort_noise_fill is compared against the C fill on its own in d.mono.cng_pipeline'))
+    if want(pre + 'reset_glue'):
+        h_reset = 250                      # inside every grid's input (625 hops at the shortest)
+        rst = c_mono(cx, 1, g, sr, fft, tag='reset', enable_cng=1, reset_at=h_reset)
+        out_py = mono_cng_twin_out(cx, rst, cx.P.CNG_NR_GAIN_FLOOR)
+        out_blind = mono_cng_twin_out(cx, rst, cx.P.CNG_NR_GAIN_FLOOR, follow_reset=False)
+        m = stats(rst.out, out_py)
+        blind = stats(rst.out, out_blind)
+        m['serial_moves'] = int(np.count_nonzero(np.diff(rst.serial)) + (rst.serial[0] != 0))
+        m['guard_hops'] = int(np.count_nonzero(rst.sc[:, 12]))
+        m['blind_python_max_abs'] = blind['max_abs']
+        rows.append(make_row(pre + 'reset_glue', 1, 'mono hard-reset event: Python (OLA clear + comfort-noise reseed on the new serial, rendering base) over the C seam vs C output, aec_reset() mid-stream, CNG on',
+                             prod + ' enable_cng=1 reset_at=%d; base/serial follow + cng_aec3.fill/synthesize_hop' % h_reset,
+                             gate=(m['max_abs'] <= tol_out and m['serial_moves'] >= 1 and blind['max_abs'] > tol_out),
+                             metrics=m, tol={'max_abs': tol_out}, grid=g, ref='Python',
+                             note='guard hops: %d, serial moves: %d; a Python that ignores the serial differs by %.2e (> tolerance, so the row can fail)'
+                                  % (m['guard_hops'], m['serial_moves'], blind['max_abs'])))
     if want(pre + 'legacy_amin'):
         a = c_mono(cx, 1, g, sr, fft, tag='nocng', enable_cng=0)
         b = c_mono(cx, 1, g, sr, fft, tag='leg1', enable_cng=0, legacy_amin=1)
@@ -721,8 +773,8 @@ def sec_d_global(cx, want):
     rows = []
     if want('d.mono.cng_twin'):
         rows.append(cng_twin(cx))
-    if want('d.mono.cng_lookalike'):
-        rows.append(cng_lookalike(cx))
+    if want('d.mono.cng_pipeline'):
+        rows.append(cng_pipeline(cx))
     if want('d.mono.8k'):
         P = cx.P
         try:
@@ -743,7 +795,6 @@ def cng_twin(cx):
     """C aec_cng_fill against cng_aec3.Aec3ComfortNoise, three hops with carried state, 18 cases."""
     from pipelines.common.cng_aec3 import Aec3ComfortNoise, SEED
     rs = np.random.RandomState(1)
-    psd = np.float32(32768.0 ** 2)
     exe = cx.drv(1, 'mono')
     bad = []
     cases = 0
@@ -762,11 +813,7 @@ def cng_twin(cx):
                 rng_c = SEED
                 for _ in range(3):
                     rng_c, sc = run_cng_c(cx, exe, n, rng_c, floor, sc, cn, gr, gn, use_gnr)
-                    n_amp = np.sqrt(np.maximum(cn / psd, 0.0)).astype(np.float32)
-                    ng = np.sqrt(np.maximum(1.0 - gr * gr, 0.0)).astype(np.float32)
-                    nrf = (np.maximum(gn, np.float32(floor)) if use_gnr else
-                           np.maximum(np.ones(n, np.float32), np.float32(floor))).astype(np.float32)
-                    gen.add(py, ((n_amp * ng).astype(np.float32) * nrf).astype(np.float32))
+                    gen.fill(py, cn, gr, gn if use_gnr else None, floor)
                 cases += 1
                 eq = bool(np.array_equal(sc, py)) and rng_c == gen.state
                 max_abs = max(max_abs, float(np.max(np.abs(sc - py))))
@@ -774,8 +821,9 @@ def cng_twin(cx):
                     bad.append('n%d_floor%s_gnr%d' % (n, floor, int(use_gnr)))
     m = {'cases': cases, 'bit_exact_cases': cases - len(bad), 'max_abs': max_abs, 'not_bit_exact': bad}
     return make_row('d.mono.cng_twin', 1, 'comfort noise: C aec_cng_fill vs cng_aec3.Aec3ComfortNoise (3 hops, carried generator state)',
-                    'pyc_drv_mono cng; Aec3ComfortNoise.add', gate=(not bad), metrics=m, tol={'max_abs': TOL1['cng_abs']},
-                    ref='Python', note='bit exact required (the generator is integer arithmetic plus identical float32 products)')
+                    'pyc_drv_mono cng; Aec3ComfortNoise.fill', gate=(not bad), metrics=m, tol={'max_abs': TOL1['cng_abs']},
+                    ref='Python', note='bit exact required (the generator is integer arithmetic plus identical float32 products; '
+                                       'one numeric core, the AEC library\'s modules/cng.py, on both sides)')
 
 
 def run_cng_c(cx, exe, n, rng, floor, spec, cn, gr, gn, use_gnr):
@@ -800,8 +848,8 @@ def run_cng_c(cx, exe, n, rng, floor, spec, cn, gr, gn, use_gnr):
     return rng_out, (s[:, 0] + 1j * s[:, 1]).astype(np.complex64)
 
 
-def cng_lookalike(cx):
-    """mono_aec_nr_res.pipeline.comfort_noise_fill (Gaussian look-alike) against the C fill: noise level only."""
+def cng_pipeline(cx):
+    """mono_aec_nr_res.pipeline.comfort_noise_fill against the C fill, 400 hops with carried generator state."""
     from pipelines.common.cng_aec3 import SEED
     P = cx.P
     rs = np.random.RandomState(1)
@@ -811,20 +859,19 @@ def cng_lookalike(cx):
     gn = np.ones(n, np.float32)
     spec0 = np.zeros(n, np.complex64)
     exe = cx.drv(1, 'mono')
-    tp, tc = [], []
-    rng = np.random.RandomState(0)
     rng_c, sc = SEED, spec0.copy()
+    rng_p = SEED
+    bad, worst = 0, 0.0
     for _ in range(400):
-        tp.append(P.comfort_noise_fill(spec0, cn, gr, np.ones(n, np.float32), rng))
+        sp, rng_p = P.comfort_noise_fill(spec0, cn, gr, gn, rng_p)
         rng_c, sc = run_cng_c(cx, exe, n, rng_c, 0.31622777, spec0, cn, gr, gn, True)
-        tc.append(sc)
-    tp, tc = np.array(tp), np.array(tc)
-    rms = lambda x: float(np.sqrt(np.mean(x[:, 1:-1] ** 2)))             # noqa: E731
-    m = {'rms_re_python': rms(tp.real), 'rms_re_c': rms(tc.real), 'rms_im_python': rms(tp.imag), 'rms_im_c': rms(tc.imag),
-         'rms_ratio_python_over_c': rms(tp.real) / rms(tc.real), 'identical_samples': int(np.count_nonzero(tp == tc)), 'n': int(tp.size)}
-    return make_row('d.mono.cng_lookalike', 1, 'mono comfort-noise fill of mono_aec_nr_res/pipeline.py vs C (noise level; the source differs by design)',
-                    'mono_aec_nr_res.pipeline.comfort_noise_fill vs pyc_drv_mono cng, 400 hops, n=513', gate=None, metrics=m,
-                    ref='Python', note='INFO: documented (D1) Gaussian look-alike of the AEC3 sin-LUT/LCG source; only the level recipe is shared. The exact twin is d.mono.cng_twin')
+        worst = max(worst, float(np.max(np.abs(sp - sc))))
+        bad += int(not np.array_equal(sp, sc))
+    m = {'hops': 400, 'bit_exact_hops': 400 - bad, 'max_abs': worst, 'rng_equal': rng_p == rng_c}
+    return make_row('d.mono.cng_pipeline', 1, 'mono comfort-noise fill of mono_aec_nr_res/pipeline.py vs C aec_cng_fill (bit exact)',
+                    'mono_aec_nr_res.pipeline.comfort_noise_fill vs pyc_drv_mono cng, 400 hops, n=513', gate=(bad == 0 and rng_p == rng_c),
+                    metrics=m, tol={'max_abs': TOL1['cng_abs']}, ref='Python',
+                    note='the pipeline fill is the AEC library\'s own generator (seed AEC_CNG_SEED); no look-alike remains')
 
 
 # --------------------------------------------------------------------------------------------------

@@ -40,7 +40,7 @@ th{background:#eef0f5}
 <li><b>sample helper <code>mcab_sample_beam</code>(<code>mcab_sample_beam.{h,c}</code>;範例碼,不在 archive)</b>:擁有 SRP-PHAT DOA 與 BF(<code>audiolib/doa</code>、<code>audiolib/bf</code>)及保守 energy-VAD fallback,把 <code>doa_step()</code> + <code>bf_process_with_weights()</code> 接在 <code>mcab_process_front()</code> 與 <code>mcab_fuse()</code> 之間,輸出 BF 後誤差頻譜與有效權重(<code>McabSampleBeamResult</code>);<code>mcab_sample_beam_fuse()</code> 是獨立的可選步驟。builder <code>mcab_sample_flow.{h,c}</code> 把應用端 init 順序(4 條 lane、<code>DelayAec</code>、mcab)寫在一處。有自己 beamformer 的產品直接用 mcab,不需要 helper。<b>mcab 與 helper 內都沒有 RES、NR、CNG、合成與神經後濾波。</b>RES 由 libaec 管理:要做 RES 的應用在<b>自己的 init</b> 用 <code>aec_res_get_mem_size()</code>／<code>aec_res_init()</code> 建 <code>AecRes</code>(config 取 <code>aec_config_from_level(level, sample_rate)</code>,<code>fft_size</code> 設成 <code>mcab_fft_size()</code>),每 hop 以 <code>mcab_sample_res_input(&amp;frame, &amp;in)</code> 填 <code>AecResInput</code>、<code>aec_res_process(res, &amp;in)</code> 取增益,強度 <code>aec_res_set_level()</code>,重設 <code>aec_res_reset()</code>(沒有 destroy)。NR(<code>AnrDenoiser</code>)與合成(<code>AcIstft</code>)同為獨立函式庫物件,由應用初始化並明寫逐 hop 串接。mono 是例外:RES 增益在 <code>aec_process_context()</code> 內算(見 <a href="pipeline_mono.html">pipeline_mono</a>)。</li>
 </ul>
 <p>結構稽核值:<code>mcab_matched_filter_count()</code> 在 <code>MATCHED</code> 時 1、其餘 delay_mode 為 0;<code>mcab_linear_aec_count()</code> 恆 4。Lane 0 每 hop 跑真 far-FFT,lane 1–3 經 <code>aec_process_context_shared_far_from()</code> 借用 lane 0 的 far 頻譜(4 次 far-FFT → 1 次,測試以 <code>mcab_far_fft_real_compute_count()</code> 證明)。支援 16 kHz(fft 256 預設 / 512 明示)與 48 kHz(fft 1024)。</p>
-<p>Descriptor 慣例(32-byte 固定 ABI、init_ex 8 點閘)只存在於 mcab 與 DFN stage／bridge;<code>Aec</code>、<code>AnrDenoiser</code>、<code>AcIstft</code> 與 sample helper 只提供大小查詢。4ch flow <code>MCAB_LAYOUT_VERSION=25</code>,descriptor_version 1,只描述 mcab 自己的 pool(lane 與 estimator 由應用建立後注入,SRP/BF 在 sample helper)。欄位分級、固定常數、函式清單、狀態碼與輸出契約收在 <a href="pipeline_4ch_params.html">pipeline_4ch_params</a>。</p>
+<p>Descriptor 慣例(32-byte 固定 ABI、init_ex 8 點閘)只存在於 mcab 與 DFN stage／bridge;<code>Aec</code>、<code>AnrDenoiser</code>、<code>AcIstft</code> 與 sample helper 只提供大小查詢。4ch flow <code>MCAB_LAYOUT_VERSION=26</code>,descriptor_version 1,只描述 mcab 自己的 pool(lane 與 estimator 由應用建立後注入,SRP/BF 在 sample helper)。欄位分級、固定常數、函式清單、狀態碼與輸出契約收在 <a href="pipeline_4ch_params.html">pipeline_4ch_params</a>。</p>
 
 <h2>如何呼叫使用</h2>
 <p>呼叫順序(括號為失敗訊號):<code>mcab_default_config(sr)</code> 與 <code>mcab_sample_beam_default_params()</code> → 視需要改欄位 → 查大小(<code>mcab_sample_flow_get_mem_size()</code> 合計 4 條 lane、estimator 與 mcab,<code>mcab_sample_beam_get_mem_size()</code> 查 helper;−1 = 無效)→ 配置 16-byte 對齊的 pool → <code>mcab_sample_flow_init()</code>(內部依序 <code>aec_init</code> ×4、MATCHED 時 <code>delay_aec_init</code>、<code>mcab_init_ex()</code>;−1 = config 無效、pool 過小／未對齊、任一物件 init 失敗,<b>靜默</b>無診斷)→ <code>mcab_sample_beam_init(mem, bytes, &amp;cfg, &amp;bp, flow)</code>(NULL = 拒絕)→ 應用自己為 RES、NR、合成查大小並 init(另一塊 post pool)→ 每 hop <code>process_front()</code> → <code>process_beam()</code> → <code>fuse()</code> → <code>aec_res_process()</code> → NR 增益 → 後級 → 任一步非 OK、增益為 NULL 或輸出非有限時 <code>mcab_sample_beam_reset()</code> 加上自己的 <code>aec_res_reset()</code>、<code>anr_reset()</code>、<code>ac_istft_reset()</code>、rng 一起重設 → 拆除 helper → <code>mcab_destroy()</code> → <code>aec_destroy()</code> ×4(<code>mcab_sample_flow_destroy()</code> 含後兩步;都不釋放 caller 記憶體)。descriptor 與大小不可跨 build 快取。範例已在 <code>-Wall -Wextra -Werror</code> 下做過語法檢查(<code>platform_alloc()</code>、<code>stream_next4()</code>、<code>product_vad()</code> 是平台／I/O 佔位)。</p>
@@ -89,7 +89,7 @@ while (stream_next4(&amp;mics, &amp;ref, out)) {
         if (!g_nr) rc = MCAB_DSP_ERROR;
         else {
             sk_min_f32(total_gain, g_nr, g_res, frame.n_freqs);
-            sk_capply_gain_f32(spec, frame.e, total_gain, frame.n_freqs);
+            sk_capply_gain_f32(spec, frame.b, total_gain, frame.n_freqs);
             if (frame.cn) aec_cng_fill(&amp;rng, spec, frame.cn, g_res, g_nr, MCAB_SAMPLE_CNG_NR_GAIN_FLOOR, frame.n_freqs);
             ac_istft_push(istft, spec, out);                                  /* 一次 iFFT/OLA */
             if (!skn_all_finite_f32(out, (size_t)hop)) rc = MCAB_DSP_ERROR;
@@ -152,7 +152,7 @@ platform_free(post);  platform_free(beam_mem);  platform_free(flow_mem);</pre>
  │      └─ frame.g_res_ctx = NULL(mcab 不算 RES 增益)
  └─ mcab 之外(各 main 的逐 hop 區段, 例如 mcab_static.c 的 static_chain())
         mcab_sample_res_input(&amp;frame, &amp;in) → aec_res_process(res, &amp;in) → mcab_sample_anr_gain(nr, &amp;frame, extra_noise, 1)   (自備 AecRes + 1 個 mono NR; NULL = 被拒)
-        sk_min_f32 → sk_capply_gain_f32(spec, frame.e, total_gain, n)
+        sk_min_f32 → sk_capply_gain_f32(spec, frame.b, total_gain, n)
         aec_cng_fill(..., MCAB_SAMPLE_CNG_NR_GAIN_FLOOR=0.316, n)  (frame.cn 非 NULL 時; sqrt(1-res²)·sqrt(cn/32768²)·max(nr,0.316) × 隨機相位)
         ac_istft_push(istft, spec, out)   (AcIstft: fft_inverse + sqrt-Hann OLA) → out[hop]</pre>
 <p>範例一律建 RES;換用別的後級(例如 DFN2、ULCNet)就是換掉最後一個方塊裡的幾行,mcab 與 helper 不變。</p>
@@ -196,8 +196,8 @@ fuse+RES+後級 (C)  out=半窗 ramp≈0   out=hop#0 重建    out = hop p-1 的
 <p>三塊 caller 記憶體:(1) 應用端 flow 區塊(各自 16-byte 對齊):4 條 lane、<code>DelayAec</code> 結構與 estimator pool(MATCHED)、mcab 自己的 pool(control block、mic lane、aligned far、fuse 緩衝、對齊環;<code>build_flags_hash</code> 只涵蓋這個 carve);(2) helper pool(control block、SRP 含 steering table、BF、<code>bf_spectrum</code>／<code>bf_weights</code>);(3) 應用的 post pool。mcab 與 helper 的 <code>req.bytes</code> <b>都不含</b> <code>AecRes</code>;RES、NR、合成與三個暫存各有自己的 <code>mem_size</code>。數字為 ne10 實測(<code>mcab_external_static</code>、<code>mcab_static</code> 的 <code>--print-mem-size</code>);換 backend／編譯選項／submodule 即失效,一律現查。</p>
 <table>
 <tr><th>state</th><th>shape / size</th><th>存放者</th><th>備註</th></tr>
-<tr><td>Unit(flow 物件 + SRP/BF helper)合計</td><td>1,698,784 B @16k/256(預設)/ 2,992,416 B @16k/512 / 6,300,352 B @48k/1024</td><td>—</td><td>實測 <code>mcab_sample_unit_memory()</code>(ne10,layout_version=25);不含 RES／NR／合成</td></tr>
-<tr><td>Unit＋RES／NR／合成／暫存</td><td>1,765,472 B @16k/256(預設)/ 3,088,880 B @16k/512 / 6,525,408 B @48k/1024</td><td>—</td><td><code>mcab_static --print-mem-size</code> 的 <code>Unit</code> + <code>RES</code> + <code>NR</code> + <code>Synthesis</code> + <code>Buffers</code> = <code>Total:</code> 行(後四項 66,688 B @16k/256／96,464 B @16k/512／225,056 B @48k)</td></tr>
+<tr><td>Unit(flow 物件 + SRP/BF helper)合計</td><td>1,706,240 B @16k/256(預設)/ 3,007,040 B @16k/512 / 6,329,312 B @48k/1024</td><td>—</td><td>實測 <code>mcab_sample_unit_memory()</code>(ne10,layout_version=26);不含 RES／NR／合成</td></tr>
+<tr><td>Unit＋RES／NR／合成／暫存</td><td>1,772,928 B @16k/256(預設)/ 3,103,504 B @16k/512 / 6,554,368 B @48k/1024</td><td>—</td><td><code>mcab_static --print-mem-size</code> 的 <code>Unit</code> + <code>RES</code> + <code>NR</code> + <code>Synthesis</code> + <code>Buffers</code> = <code>Total:</code> 行(後四項 66,688 B @16k/256／96,464 B @16k/512／225,056 B @48k)</td></tr>
 </table>
 <p>各 state 的細項(4 條 lane、estimator＋mcab pool、helper pool、<code>AecRes</code>、<code>AnrDenoiser</code>、<code>AcIstft</code>、暫存)的大小與存放者見 <a href="pipeline_4ch_detail.html">pipeline_4ch_detail</a> 的 State 表(細項)。</p>
 

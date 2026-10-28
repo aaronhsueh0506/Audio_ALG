@@ -189,7 +189,8 @@ vs 上游 4800 Hz）</td><td>編譯期固定；lookahead pair 同 DFN3（出貨 
 <td><code>pbfdkf.c</code> <code>pbfdaf_fill_windows()</code>（<code>ac_window_build()</code>,denom = block_size）</td></tr>
 <tr><td>AEC3 post 合成窗（16k/512 grid 表格化 = sin(πk/512)）</td>
 <td><code>aec_balanced_config.h</code> <code>AECB_SYNTH_WINDOW[512]</code>（per-rate 表）</td></tr>
-<tr><td>mono / 4ch 範例合成窗</td><td><code>pipelines/mono_aec_nr_res/main.c</code>、<code>pipelines/4ch_aec_bf_nr_res/mcab_static.c</code>：各 main 自己初始化的 <code>AcIstft</code> 自帶的窗表（<code>ac_window_build()</code>，<code>audiolib/common/src/audio_window.c</code>）</td></tr>
+<tr><td>mono 範例合成窗</td><td><code>pipelines/mono_aec_nr_res/main.c</code>：main 自己初始化的 <code>AcIstft</code> 借用 AEC 的窗表（初始化後的 <code>Aec</code> 經 <code>aec_synthesis_window()</code> 取得；<code>AcStftConfig.window</code> 借入，不另切）</td></tr>
+<tr><td>4ch 範例合成窗</td><td><code>pipelines/4ch_aec_bf_nr_res/mcab_static.c</code>：main 自己初始化的 <code>AcIstft</code> 自帶的窗表（<code>ac_window_build()</code>，<code>audiolib/common/src/audio_window.c</code>）</td></tr>
 <tr><td>DFN rate bridge（原生格點合成 + 48 kHz 分析／合成）</td><td><code>pipelines/dfn/dfn_rate_bridge.c</code>：bridge 自建的兩張表（<code>win_n</code>、<code>win48</code>，<code>ac_window_build()</code>），借給五個 <code>AcStft</code>／<code>AcIstft</code></td></tr>
 <tr><td>ULCNet 兩條範例</td><td><code>pipelines/ulcnet/ulcnet_nn_stage.c</code>：stage 自有的窗表（<code>ac_window_build(s->window, ULCNET_N_FFT)</code>），借給分析與合成物件</td></tr>
 <tr><td>Align-ULCNet／DeepVQE-S 前後處理 class</td><td>呼叫端在 config 給的表（<code>ac_window_build()</code>），分析與合成共用</td></tr>
@@ -308,7 +309,7 @@ rolling 排程後兩者天生 hop-locked，不需再靠 centered 排程的 0/2/1
 <div class="tbl">
 <table>
 <tr><th>巨集 = 目前值</th><th>定義處</th><th>意義</th></tr>
-<tr><td><code>MCAB_LAYOUT_VERSION</code> = 25</td>
+<tr><td><code>MCAB_LAYOUT_VERSION</code> = 26</td>
 <td><code>pipelines/4ch_aec_bf_nr_res/mcab.h</code></td>
 <td>4ch flow（共享 delay + 4 lanes + <code>mcab_fuse()</code>；lane 與 estimator 由應用程式建立後注入）自己的 pool 版號；<code>mcab_fuse()</code> 交出的 <code>g_res_ctx</code> 為 NULL；SRP-PHAT/BF 在 sample helper <code>mcab_sample_beam.h</code>，沒有 descriptor</td></tr>
 <tr><td><code>DFN_RES_STAGE_LAYOUT_VERSION</code> = 3</td>

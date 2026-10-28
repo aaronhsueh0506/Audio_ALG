@@ -2,9 +2,9 @@
  * oracle for tests that compare an application against it. It does not include the
  * example headers; every recipe is written out here.
  *
- *   mcab_process_front -> mcab_fuse -> AecRes gain (if enabled)
- *     -> NR gain (if enabled) -> sk_min_f32 -> sk_capply_gain_f32
- *     -> aec_cng_fill -> ac_istft_push
+ *   mcab_process_front -> mcab_fuse -> AecRes gain (if enabled, on E)
+ *     -> NR gain (if enabled, on E) -> sk_min_f32 -> [post-chain reset: ac_istft_reset, reseed]
+ *     -> sk_capply_gain_f32 over the rendering base B -> aec_cng_fill -> ac_istft_push
  *
  * The chain follows the rules of the applications: a disabled gain source reads as the unity
  * vector, and the comfort-noise fill runs only with a suppressor and enable_cng. RES strength
@@ -26,9 +26,9 @@
 #include "utility/mem_align.h"
 #include "utility/simd_kernels.h"
 
-/* The comfort-noise floor and seed of the example programs. */
+/* The comfort-noise floor of the example programs; the seed is the library's. */
 #define CONV_MCAB_CNG_NR_GAIN_FLOOR 0.31622777f
-#define CONV_MCAB_CNG_RNG_SEED 0x9e3779b9u
+#define CONV_MCAB_CNG_RNG_SEED AEC_CNG_SEED
 
 typedef struct ConvChainOptions {
     AecLevel aec_level;      /* RES gain floors */
@@ -63,6 +63,7 @@ typedef struct ConvChain {
     float* extra_noise;
     Complex* spec;
     uint32_t rng;
+    uint32_t reset_handled;  /* McabFrame.post_reset_serial the synthesis last followed */
     int n_freqs;
     int hop;
     /* The last hop's fused frame and front view; the tests read both. */
@@ -191,7 +192,12 @@ static inline int conv_post(ConvChain* c, const Complex* weights, const Complex*
     nr_gain = res_gain ? conv_nr_gain(c) : NULL;
     if (!res_gain || !nr_gain) return MCAB_DSP_ERROR;
     sk_min_f32(c->total_gain, nr_gain, res_gain, c->n_freqs);
-    sk_capply_gain_f32(c->spec, c->frame.e, c->total_gain, c->n_freqs);
+    if (c->frame.post_reset_serial != c->reset_handled) {
+        c->reset_handled = c->frame.post_reset_serial;
+        ac_istft_reset(c->istft);
+        c->rng = CONV_MCAB_CNG_RNG_SEED;
+    }
+    sk_capply_gain_f32(c->spec, c->frame.b, c->total_gain, c->n_freqs);
     if (c->opt.enable_cng && c->res)
         aec_cng_fill(&c->rng, c->spec, c->frame.cn, res_gain, nr_gain,
                      CONV_MCAB_CNG_NR_GAIN_FLOOR, c->n_freqs);

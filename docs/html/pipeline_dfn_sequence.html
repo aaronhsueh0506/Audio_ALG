@@ -61,7 +61,7 @@ th{background:#eef2f8}
   |&lt;------------------------------------------------------|                           |
   |-- ac_istft_init(mem, ib, &amp;scfg)           僅 48 kHz host ------------------------&gt;|
   | dfn_hop_init_bridge(&amp;hop, bridge)   |   dfn_hop_init_stage(&amp;hop, stage, istft, stage_out)
-  | rng = CNG_RNG_SEED(4ch:MCAB_SAMPLE_CNG_RNG_SEED);unity[k] = 1.0f                          |
+  | rng = AEC_CNG_SEED(4ch:MCAB_SAMPLE_CNG_RNG_SEED);unity[k] = 1.0f                          |
   | 4ch 另有:mcab_sample_flow_init(&amp;objs, mem, flow_b, &amp;cfg)(四條 aec_init + MATCHED 的 delay_aec_init + mcab_init_ex;0 | -1)-&gt; mcab_sample_beam_init(mem, beam_b, &amp;cfg, &amp;bp, objs.flow)
   |        aec_config_from_level(&amp;res_cfg, level, sr); res_cfg.fft_size = flow 格點;aec_res_get_mem_size -&gt; aec_res_init(mem, res_b, &amp;res_cfg)(0 / NULL = 無效;沒有 destroy)</pre>
 <h2>2. 穩態 hop:48 kHz host(stage 直接在 host 格點)</h2>
@@ -167,7 +167,7 @@ th{background:#eef2f8}
 -- 任何一步失敗:error_spec 或 res_gain 為 NULL(mono)、mcab_sample_beam_* 回非 MCAB_OK、aec_res_process 回 NULL(4ch)、dfn_hop_* 回負值 --
   | aec_reset(aec)  |  mcab_sample_beam_reset(unit)(連帶 flow、lane、estimator、SRP/BF) + aec_res_reset(res)   |                          |
   |-------------------------&gt;|                          |                          |                          |
-  | rng = 種子(mono CNG_RNG_SEED／4ch MCAB_SAMPLE_CNG_RNG_SEED)|                          |                          |
+  | rng = 種子(mono AEC_CNG_SEED／4ch MCAB_SAMPLE_CNG_RNG_SEED)|                          |                          |
   |-- dfn_hop_reset(&amp;hop) -----------------------------&gt;|                          |                          |
   |                          |                          | dfn_rate_bridge_reset() | dfn_res_stage_reset() + ac_istft_reset() + 清空 stage_out
   |                          |                          |-------------------------&gt;|                          |

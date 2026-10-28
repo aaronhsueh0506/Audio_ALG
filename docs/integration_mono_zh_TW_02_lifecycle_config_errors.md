@@ -10,7 +10,7 @@
 | 3 | allocate | 你自己的配置器，取得各塊 `ALIGN16(...)` 相加且 16-byte 對齊的記憶體 | 拿到大小之後 | 配置失敗由你自己處理。pool **不需要**預先清零（poison pattern 也可以）；但必須在 handle 生命週期內獨佔、不被其他人寫入 |
 | 4 | init | `aec_init(pool, aec_bytes, &aec_cfg)`、`anr_init(pool + ALIGN16(aec_bytes), nr_bytes, &nr_cfg)`、`ac_istft_init(...)`；每一塊的起點都是前一塊加 `ALIGN16(前一塊大小)` | 拿到 pool 之後，處理第一個 hop 之前 | 回傳 `NULL`：pool 未 16-byte 對齊、太小、config 無效、子模組 init 失敗。已建好的那幾個要由你 destroy |
 | 5 | process | `aec_process_context(aec, mic, ref)` → `aec_get_res_context(aec, &ctx)` → 每 hop 串接（[§1.1](integration_mono_zh_TW_01_overview_link_quickstart.md#11-構成每個函式庫各自初始化每個-hop-的串接由你寫)：`ctx.res_gain`、`anr_process_gain()` + `anr_get_gain()`、`sk_min_f32()`、`sk_capply_gain_f32()`、`aec_cng_fill()`）→ `ac_istft_push(istft, spec, out)` | 每收到一個 hop 呼叫一次。`mic`/`ref`/`out` 都必須剛好 `grid.hop_size` 個 float | `aec_process_context()` 與 `aec_get_res_context()` 回傳 `void`；`ctx.error_spec` 或 `ctx.res_gain` 為 NULL（沒有 context）、`anr_process_gain()` 回非 0 或 `anr_get_gain()` 回 `NULL`（降噪器拒絕該 hop）都是你要處理的拒絕；`ac_istft_push()` 的回傳值與輸出有限性（選用 `skn_all_finite_f32()`）要自己檢查。**不會**檢查 buffer 長度 —— 長度錯是你的責任 |
-| 6 | recover | `aec_reset(aec)`、`anr_reset(nr)`、`ac_istft_reset(istft)`，並把你的 comfort-noise RNG 設回起始值（範例的 `CNG_RNG_SEED`） | 任何一步被拒、輸出非有限（若你有檢查）、換回聲路徑（換喇叭、重新 seat）或切換到不相關的另一條串流時 | 不會失敗。必須全部一起 reset：漏掉其中一個就不等於新建的實例（`mono_aec_nr_res/main.c` 的 `rig_reset()` 就是這四件事；`main.c` 在某個 stage 拒絕該 hop 時呼叫它，輸出有限性檢查是 `example_board_adapter.c` 的 `run_hops()` 做的） |
+| 6 | recover | `aec_reset(aec)`、`anr_reset(nr)`、`ac_istft_reset(istft)`，並把你的 comfort-noise RNG 設回起始值（函式庫的 `AEC_CNG_SEED`，42） | 任何一步被拒、輸出非有限（若你有檢查）、換回聲路徑（換喇叭、重新 seat）或切換到不相關的另一條串流時 | 不會失敗。必須全部一起 reset：漏掉其中一個就不等於新建的實例（`mono_aec_nr_res/main.c` 的 `rig_reset()` 就是這四件事；`main.c` 在某個 stage 拒絕該 hop 時呼叫它，輸出有限性檢查是 `example_board_adapter.c` 的 `run_hops()` 做的） |
 | 7 | destroy | `anr_destroy(nr)`、`aec_destroy(aec)` | 不再處理任何 hop 之後、釋放 pool 之前 | 不會失敗。`aec_destroy` NULL 安全、可重複，只放開實例內部的參照，**不**釋放你的 pool；`anr_destroy` 對 pool 實例立即返回，對 `anr_create()` 的 heap 實例才釋放記憶體 |
 | 8 | release | 你自己的釋放器 | **一定要在第 7 步之後** | 順序顛倒 = use-after-free |
 
@@ -214,29 +214,29 @@ mono 的設定分成兩份：lib/aec 的 `AecConfig`（格點與接縫欄位由�
 
 | Config | 總計 | AEC（`aec_get_mem_size`） | 合成 `AcIstft` | `nr_bytes` | 暫存 |
 |---|---:|---:|---:|---:|---:|
-| 8000，預設 | 310,160 | 267,408 | 11,344 | 28,784 | 2,624 |
-| 16000，預設（256/128） | 423,728 | 364,416 | 11,344 | 45,344 | 2,624 |
-| 16000，`fft_size=512` | 575,056 | 491,600 | 21,840 | 56,432 | 5,184 |
-| 48000，預設（1024/512） | 1,354,256 | 1,156,544 | 42,832 | 144,576 | 10,304 |
-| 16000，`--no-nr`（不建降噪器） | 378,384 | 364,416 | 11,344 | 0 | 2,624 |
-| 16000，`--aec-only`（不建後級） | 364,416 | 364,416 | – | – | – |
+| 8000，預設 | 310,720 | 268,992 | 10,320 | 28,784 | 2,624 |
+| 16000，預設（256/128） | 424,288 | 366,000 | 10,320 | 45,344 | 2,624 |
+| 16000，`fft_size=512` | 576,128 | 494,720 | 19,792 | 56,432 | 5,184 |
+| 48000，預設（1024/512） | 1,356,352 | 1,162,736 | 38,736 | 144,576 | 10,304 |
+| 16000，`--no-nr`（不建降噪器） | 378,944 | 366,000 | 10,320 | 0 | 2,624 |
+| 16000，`--aec-only`（不建後級） | 366,000 | 366,000 | – | – | – |
 
-總計 = `ALIGN16(AEC)` + `ALIGN16(nr_bytes)` + `ALIGN16(合成)` + 暫存（各塊對齊後相加）。
+總計 = `ALIGN16(AEC)` + `ALIGN16(nr_bytes)` + `ALIGN16(合成)` + 暫存（各塊對齊後相加）。合成 `AcIstft` 借用 AEC 的合成窗（`aec_synthesis_window()`），所以不帶自己的窗表（比各自帶窗少一個 `fft_size` 長的 float 向量）。
 
 #### 4.5a delay_mode 對 16000/預設 grid 的影響（`MATCHED` n=5 為 baseline）
 
 | `delay_mode` | AEC 加後級合計 | 相對 `MATCHED n=5` |
 |---|---:|---:|
-| `MATCHED` n=5（預設） | 423,728 | — |
-| `MATCHED` n=1 | 400,816 | −22,912 |
-| `FIXED`，`fixed_delay_samples=1600`（100 ms） | 265,632 | −158,096 |
-| `EXTERNAL_ALIGNED` | 258,720 | −165,008 |
+| `MATCHED` n=5（預設） | 424,288 | — |
+| `MATCHED` n=1 | 401,376 | −22,912 |
+| `FIXED`，`fixed_delay_samples=1600`（100 ms） | 266,192 | −158,096 |
+| `EXTERNAL_ALIGNED` | 259,280 | −165,008 |
 
 這四列的差額全部落在 AEC 那一塊（`delay_mode`/`delay_num_filters` 不影響
 後級），數字與 `lib/aec` 自己的 `aec_get_mem_size()` 一致
 （見 `lib/aec/docs/c_user_manual_zh_TW_01_lifecycle.md` §4）。**沒有 CLI 旗標**能測試
 非預設 delay mode——上表用直接呼叫
-`aec_get_mem_size()` 加上同一組後級大小（59,312 B）量得。
+`aec_get_mem_size()` 加上同一組後級大小（58,288 B）量得。
 
 ---
 
@@ -257,7 +257,7 @@ mono 的設定分成兩份：lib/aec 的 `AecConfig`（格點與接縫欄位由�
 | `anr_process_gain()` | `0` | `-1` | NULL 引數或降噪器拒絕該 hop；成功後 `anr_get_gain(nr, NULL)` 回降噪器擁有的 `n_freqs` 個增益 |
 | `ac_istft_push()` | 寫出的樣本數（`hop`；`AC_OLA_ENV_NORM` 的第一個 frame 為 `0`） | – | 不檢查輸出是否有限，要另外查 |
 | `skn_all_finite_f32()` | `1` | `0` | 選用：你在採用輸出之前要做的檢查（`example_board_adapter.c` 的 `run_hops()` 就這樣檢查） |
-| `aec_reset()` / `anr_reset()` / `ac_istft_reset()` | `void` | 不會失敗 | 要一起呼叫，並把 comfort-noise RNG 設回起始值（範例的 `CNG_RNG_SEED`） |
+| `aec_reset()` / `anr_reset()` / `ac_istft_reset()` | `void` | 不會失敗 | 要一起呼叫，並把 comfort-noise RNG 設回起始值（函式庫的 `AEC_CNG_SEED`，42） |
 | `aec_destroy()` / `anr_destroy()` | `void` | 不會失敗 | NULL 安全 |
 | `aec_set_level()` / `anr_set_level()` | `0` | `-1` | `-1` 時什麼都不寫（[§3.2](#32-執行期強度控制)） |
 

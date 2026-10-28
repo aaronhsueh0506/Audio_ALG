@@ -4,9 +4,24 @@
  * dfn/dfn_hop_pool.h). Per hop:
  *
  *     aec_process_context(aec, mic, ref);
- *     aec_get_res_context(aec, &ctx);                     // E, CN and G_res (ctx.res_gain)
- *     P = E * G_res (+ comfort noise);                    // before the DFN hop begins
- *     dfn_hop_process(&hop, ctx.error_spec, P, out);      // or begin / nn_begin / nn_end / end
+ *     follow_post_reset();                                // new aec_post_reset_serial(): reseed the CNG, clear the OLA tail
+ *     aec_get_res_context(aec, &ctx);                     // CN and G_res (ctx.res_gain)
+ *     aec_get_output_base(aec, &base);                    // B: the rendering base (E, or E + echo on a guard hop)
+ *     P = B * G_res (+ comfort noise);                    // before the DFN hop begins
+ *     dfn_hop_process(&hop, B, P, out);                   // or begin / nn_begin / nn_end / end
+ *
+ * The AEC context carries two signals. E (ctx.error_spec, ctx.formed_hop) is the analysis seam, never
+ * altered by the output guard; B is what aec_process() itself would multiply by its gain, E bit for bit
+ * on every hop the guard leaves alone. The DFN2 stage reads the pair (B, P): its estimate and the
+ * spectrum it filters stay the same signal, so a guard hop does not pair a capture-based P with a
+ * residual-based estimate. There is no denoiser in this chain; the stage keeps running through an AEC
+ * reset event (it never resets on one). On a new aec_post_reset_serial() the comfort noise restarts from
+ * AEC_CNG_SEED before that hop's first draw. At 48 kHz the host synthesis also drops its overlap-add
+ * tail, DFN_RES_STAGE_LOOKAHEAD_FRAMES hops later, before the push of the first frame built after the
+ * reset: the stage delays every frame by that many hops, so the event is delayed with it. Below 48 kHz
+ * the host-grid synthesis lives inside dfn_rate_bridge and runs at the top of its begin(): there
+ * dfn_rate_bridge_reset_synthesis() on the hop of the event clears just that overlap-add tail (DFN2,
+ * the resamplers and the FIFOs keep running), with no delay line.
  *
  * 48 kHz hosts drive dfn_res_stage.h and synthesise through an AcIstft; 8/16 kHz hosts run the
  * same stage on its 48 kHz grid inside dfn_rate_bridge.h. The first output hops are zero: the
@@ -49,8 +64,6 @@ static const int HOST_RATES[] = { 8000, 16000, 48000, 0 };
 /* Comfort noise follows the denoiser gain of its bin but never below this amplitude (-10 dB),
  * so the residual echo it masks does not surface. */
 #define CNG_NR_GAIN_FLOOR 0.31622777f
-/* Start state of the comfort-noise generator (aec_cng_fill). */
-#define CNG_RNG_SEED 0x9e3779b9u
 
 /* The mono lane: the rate's default grid and the linear-stage AecConfig keeping its own gain in
  * the context. Returns 0, or -1 for a rate libaec has no grid for. */
@@ -109,7 +122,9 @@ typedef struct Rig {
     Aec *aec;
     float *unity, *total_gain;        /* the RES gain path: min(1, G_res) */
     Complex *post;                    /* P */
-    uint32_t rng;
+    uint32_t rng;                     /* comfort-noise state, AEC_CNG_SEED after every hard post-chain reset */
+    uint32_t reset_serial;            /* the aec_post_reset_serial() value already handled */
+    uint32_t reset_pending;           /* bit k: a hard reset was seen k hops ago (the stage path's delay line) */
     int n_freqs, enable_cng;
     DfnResStage *stage;
     DfnRateBridge *bridge;
@@ -140,7 +155,8 @@ static int rig_build(Rig *r, const Plan *p) {
     r->total_gain = (float *)cur; cur += p->vec_bytes;
     r->post = (Complex *)cur;     cur += p->spec_bytes;
     for (k = 0; k < r->n_freqs; ++k) r->unity[k] = 1.0f;
-    r->rng = CNG_RNG_SEED;
+    r->rng = AEC_CNG_SEED;
+    r->reset_serial = aec_post_reset_serial(r->aec);
     if (dfn_hop_pool_build(&p->dfn, cur, p->grid.n_freqs, p->grid.hop_size, 0, &r->hop,
                            &r->stage, &r->bridge, &r->istft) != 0)
         goto fail;
@@ -153,24 +169,50 @@ fail:
 /* A refused hop: back to the state of a fresh pipeline, every stage together. */
 static void rig_reset(Rig *r) {
     aec_reset(r->aec);
-    r->rng = CNG_RNG_SEED;
+    r->rng = AEC_CNG_SEED;
+    r->reset_serial = aec_post_reset_serial(r->aec);
+    r->reset_pending = 0;
     dfn_hop_reset(&r->hop);
 }
 
-/* One host hop: P = E * min(1, G_res), plus comfort noise on the bins the RES cut when enabled
- * (no denoiser: its gain is the unity vector). Returns 0, or -1 after a refused call (the
- * caller resets). */
+/* The AEC's hard post-chain reset event (aec.h, aec_post_reset_serial): the reset happened inside this
+ * hop's aec_process_context(), before its synthesis. The comfort noise restarts from AEC_CNG_SEED before
+ * this hop's first draw. The stage path (48 kHz) owns its synthesis: its output for the frame built on
+ * this hop appears DFN_RES_STAGE_LOOKAHEAD_FRAMES hops later, so the overlap-add tail is dropped
+ * before the push of that frame. The bridge path synthesises the spectra it is given at the top of
+ * its begin(), so its tail is dropped now, before this hop enters it. Call this before
+ * dfn_hop_process() of every hop. Nothing else follows: the AEC is not reset in response and the
+ * stage keeps running. */
+static void follow_post_reset(Rig *r) {
+    uint32_t serial = aec_post_reset_serial(r->aec);
+    uint32_t moved = serial != r->reset_serial;
+    r->reset_serial = serial;
+    if (moved) r->rng = AEC_CNG_SEED;
+    if (moved && r->bridge) (void)dfn_rate_bridge_reset_synthesis(r->bridge);   /* between hops: cannot refuse */
+    if (!r->istft) return;
+    r->reset_pending = (r->reset_pending << 1) | moved;
+    if ((r->reset_pending >> DFN_RES_STAGE_LOOKAHEAD_FRAMES) & 1u) ac_istft_reset(r->istft);
+}
+
+/* One host hop: P = B * min(1, G_res), B the rendering base, plus comfort noise on the bins the RES
+ * cut when enabled (no denoiser: its gain is the unity vector). The stage's estimate is B too.
+ * Returns 0, or -1 after a refused call (the caller resets). */
 static int rig_process(Rig *r, const float *mic, const float *ref, float *out) {
     AecResContext c;
+    AecOutputBase base;
     aec_process_context(r->aec, mic, ref);
     aec_get_res_context(r->aec, &c);
     if (!c.error_spec || !c.res_gain) return -1;
+    memset(&base, 0, sizeof(base));
+    base.struct_size = sizeof(base);
+    if (aec_get_output_base(r->aec, &base) != 0) return -1;
+    follow_post_reset(r);
     sk_min_f32(r->total_gain, r->unity, c.res_gain, r->n_freqs);
-    sk_capply_gain_f32(r->post, c.error_spec, r->total_gain, r->n_freqs);
+    sk_capply_gain_f32(r->post, base.base_spec, r->total_gain, r->n_freqs);
     if (r->enable_cng && c.comfort_noise)
         aec_cng_fill(&r->rng, r->post, c.comfort_noise, c.res_gain, r->unity, CNG_NR_GAIN_FLOOR,
                      r->n_freqs);
-    return dfn_hop_process(&r->hop, c.error_spec, r->post, out) == 0 ? 0 : -1;
+    return dfn_hop_process(&r->hop, base.base_spec, r->post, out) == 0 ? 0 : -1;
 }
 
 int main(int argc, char **argv) {

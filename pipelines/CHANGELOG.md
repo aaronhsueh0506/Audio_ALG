@@ -3,6 +3,150 @@
 `Audio_ALG/pipelines`（含它建置的 `AINR`、`AIAEC` C 程式）的重要改動記錄在此，格式依
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/)。README 只寫現況，改動經過寫在這裡。
 
+## [Unreleased] — 2026-10-29 — Consumers borrow the AEC synthesis window through `aec_synthesis_window()`
+
+### Changed
+- Every consumer that synthesises with the AEC's window table takes it from the public `aec_synthesis_window()` of its
+  initialised `Aec` instead of the AEC-internal `aec_balanced_config.h` (`aecb_rate_cfg()->synth_window`): `mono_aec_nr_res`
+  (`main.c`, `example_board_adapter.c`, `tests/test_mono_chain.c`, `tests/conv_chain_mono.h`), `tests/test_readme_flow.c`,
+  `dfn/mono_aec_dfn_res/tests/test_mono_dfn.c`, `4ch_aec_bf_nr_res/tests/test_mcab.c`, `tests/pyc_parity/pyc_drv.c`, and the
+  board samples `alg_audio_aec.c` / `alg_audio_aec_nr.c`. The accessor needs the `Aec`, which a pool-sized program creates after
+  sizing; a borrowed window carves nothing, so the pool is sized with a stand-in pointer and the AEC's table is installed at init.
+  Same table, so the outputs are bit-identical; no consumer includes `aec_balanced_config.h` any more.
+
+## [Unreleased] — 2026-10-28 — The examples render the AEC's rendering base and follow its post-chain resets (mono, mono-DFN, mono-ULCNet, four-channel flow, rate bridge)
+
+Follows lib/aec's split of the analysis seam (`error_spec` / `formed_hop`, never guarded) from the rendering base
+(`aec_get_output_base()`), its reset counter (`aec_post_reset_serial()`), its comfort-noise seed (`AEC_CNG_SEED`, 42) and its
+synthesis window (`aec_synthesis_window()`). The ownership rule is the one of option C below: the inverse FFT, the
+overlap-add and the comfort-noise draw stay in the application (audiolib `ac_istft_*`, `aec_cng_fill()`); the library only
+states the facts the application needs (the base, the serial, the seed, the window).
+
+### Reset-serial protocol
+- Every chain that synthesises or draws comfort noise itself keeps its own last-handled serial. When the value read after a
+  processing call differs, then, before the hop's first comfort-noise draw and before its `ac_istft_push()`, it calls
+  `ac_istft_reset()` (the overlap-add tail goes), sets its generator to `AEC_CNG_SEED` and stores the new value. It never
+  resets the AEC in response, and the denoiser keeps running. The counter moves on the hard post-chain resets only
+  (`aec_reset()`, the hard branch of a first acquisition or of a confirmed shift); warm and soft realignments, the bad-relock
+  soft revert and `aec_apply_external_realign()` do not move it.
+- `mono_aec_nr_res` (`follow_post_reset()`), `mono_aec_dfn_res`, the 4ch chains (`mcab_sample_post_reset_due()`), the board
+  adapter `example_board_adapter.c` and the Python reference (`ctx.post_reset_serial`) follow it. `mono_alignulcnet` has no
+  comfort noise and no synthesis of its own, so there is nothing to clear or reseed there, and `4ch_alignulcnet` moves the
+  serial only with a flow reset, which its recovery already pairs with `ulcnet_nn_stage_reset()`.
+
+### Changed
+- `mono_aec_nr_res` (`main.c`, `example_board_adapter.c`, the test chains): the denoiser estimates on the rendering base
+  B and the gain is applied to B (`aec_get_output_base()`; B is `error_spec` bit for bit on every hop the output guard
+  leaves alone, `error_spec + echo_spec` on a guard hop). The synthesis borrows the AEC's window table
+  (`aec_synthesis_window()`) instead of audiolib's default window (they differ in the last float bit), so `--no-nr` with the
+  RES gain on equals `aec_process()` in full mode bit for bit. `DUMP_CTX` writes B in its first field.
+- `mono_aec_dfn_res`: P = B * G_res and the stage's estimate is B. The comfort noise reseeds on the event; at 48 kHz the
+  host synthesis drops its tail when the frame built on the reset hop reaches it (a delay line of
+  `DFN_RES_STAGE_LOOKAHEAD_FRAMES` hops). Below 48 kHz the host-grid synthesis is inside `dfn_rate_bridge`; the bridge call
+  that clears it is described below.
+- `mono_alignulcnet`, `4ch_alignulcnet`: unchanged code; the stage reads the analysis seam (`formed_hop`; in the 4ch flow the
+  beam of the lanes' `error_spec`), documented in `main.c` and the READMEs, together with the fact that these chains have no
+  rendering guard: on a guard hop the network sees the real linear residual, and the identity and fail-open hops emit the
+  unguarded residual.
+- `mcab`: each lane's rendering base and guard flag are bound per hop (`McabFront.render_spectra`, `.guard_active`);
+  `mcab_fuse()` adds `McabFrame.b` (the same weights over the lanes' rendering bases; `e` itself unless a contributing
+  lane's guard fired, then a new fuse buffer), `.guard_lanes` and `.post_reset_serial` (the lanes' counters summed
+  modulo 2^32, also in `McabFront`). No guard of mcab's own, before or after the beam; SRP/BF and every estimator
+  still read the analysis spectra. `MCAB_LAYOUT_VERSION` 25 -> 26 (one more fuse buffer, larger control block;
+  25 is refused like 21..24).
+- 4ch example chains (`mcab_raw`, `mcab_static`, `mcab_external_static`, `4ch_aec_bf_dfn_res`, the test chains): render
+  `P = B * gain`, estimate on `E`; clear the synthesis tail and reseed the comfort noise when `post_reset_serial` moves
+  (`mcab_sample_post_reset_due()`; the DFN2 example resets its whole hop at 48 kHz, see below for the bridge path).
+- Comfort-noise seed: the library's `AEC_CNG_SEED` (42) in every file instead of `0x9e3779b9`
+  (`MCAB_SAMPLE_CNG_RNG_SEED` is its alias). The generator is the library's recipe, `aec_cng_fill()`; in the Python reference
+  `comfort_noise_fill()` calls the AEC library's `cng_fill` (the Gaussian look-alike is gone) and `common/cng_aec3.py` is a
+  stateful wrapper of it (`Aec3ComfortNoise.fill()` replaces `.add()`).
+- Python reference: `run_nr_spectrum()` and `run_res()` read `ctx.output_base_spec` and follow
+  `ctx.post_reset_serial`; `run_dfn2_res()` forms P from B and delays the OLA clear with the stage;
+  `4ch_aec_bf_nr_res/pipeline.py`: the fused context carries `output_base_spec`, `guard_active` and `post_reset_serial` by
+  the same rule.
+- `pyc_parity`: the mono seam records the rendering base flag and the reset serial (`sc[12]`, `sc[13]`); the mono driver
+  renders the base and follows the event; new row `d.mono.<grid>.reset_glue`; `d.mono.cng_lookalike` became
+  `d.mono.cng_pipeline` (bit exact against C). For the 4ch chain the seam record carries B (`McabFrame.b`) after Y and
+  `sc[12]`/`sc[13]` hold `guard_lanes`/`post_reset_serial`; the 4ch replay renders the recorded B (it left `McabFrame.b`
+  NULL and crashed, so `a.nr4.*` and `l2.*` were NOT_RUN). The Python NR of a 4ch seam is estimated on E
+  (`mcab_sample_anr_gain()`), of a mono seam on B. New row `a.nr4.<grid>.replay_identity`: the replay over the chain's
+  own seam equals the chain bit for bit, with guard hops present (a replay rendering E fails it).
+- Board samples (the board-sample directory outside the repository): `alg_audio_aec.c`, `alg_audio_aec_nr.c` and `alg_ai3_aec_dfn.c`
+  add comfort noise only with `--cng` (off by default; `--no-cng` stays accepted in `alg_audio_aec_nr.c` and has no effect). This
+  is a sample setting, not a library change: `aec_config_from_level()` still sets `enable_cng = 1`. `--cng` on and off are each
+  compared against the same configuration. All three render the rendering base
+  (`aec_get_output_base()`); `alg_audio_aec.c` and `alg_audio_aec_nr.c` also borrow the AEC's window; `alg_ai3_aec_dfn.c` calls
+  the bridge reset below.
+
+### Added
+- `dfn_rate_bridge_reset_synthesis()` (C) and `Dfn2RateBridge.reset_synthesis()` (Python). Below 48 kHz the host-grid
+  synthesis (`AcIstft` of the estimate and of the apply lane) lives inside `dfn_rate_bridge`, and the DFN stage doc forbids a
+  DFN reset on an AEC delay change, so a hard post-chain reset could not be followed there: the pre-reset overlap-add tail
+  leaked into the first post-reset hop, and at 16 kHz three blind-set clips differed from the full-mode `aec_process()` chain
+  exactly at their hard-reset hops. The call clears only the overlap-add tail and frame counter of the two native-grid
+  synthesis objects. Kept: the stage (model state, DF history, lookahead delay lines, counters), both resamplers, both
+  48 kHz FIFOs and analysis histories, the 48 kHz synthesis, the output FIFO with its prefill, the diagnostics counters; the
+  added delay is unchanged. The synthesis runs at the top of `begin()` with no lookahead in front of it, so the call goes in
+  on the hop of the event, before `begin()`/`process()`, with no delay line (the 48 kHz path delays its clear by
+  `DFN_RES_STAGE_LOOKAHEAD_FRAMES` hops because its synthesis sits behind the stage). Returns -1 and clears nothing while a
+  hop is in progress. Callers: `mono_aec_dfn_res/main.c` (`follow_post_reset()`), `4ch_aec_bf_dfn_res/main.c` (`dfn_form()`,
+  bridge path only: the 48 kHz path still resets the whole hop), `mono_aec_dfn_res/pipeline.py` (`run_dfn2_res()`, shared by
+  the 4ch Python twin), and the board sample `alg_ai3_aec_dfn.c` (8/16 kHz path). Not changed, and why: `uvc_audio_live2a.c`
+  pairs every serial move (`mcab_reset()`) with `uvc_dfn_reset()`, which resets the whole bridge; `alg_ai3_dfn.c` and
+  `uvc_ai_nr_stream.c` have no AEC and no bridge.
+- `dfn_rate_bridge_get_host_hops()` / `Dfn2RateBridge.host_hops`: the native-grid hops the bridge synthesised from the last
+  hop's spectra (diagnostics; the test tap).
+- `DFN_RATE_BRIDGE_LAYOUT_VERSION` stays 3: two new functions over existing objects, no struct, pool or descriptor change.
+
+### Output and memory
+- CNG-on rows change with the seed (42 instead of `0x9e3779b9`): the noise realisation moves, the amplitude rule and the
+  draw schedule do not. Mono: every CNG-on row of the baseline matrix differs. 4ch: of the 216 rows of the baseline matrix,
+  188 are byte-identical to the previous tree; the 28 that differ are the `mcab_raw` rows (comfort noise on, no switch), and the
+  seed alone (previous tree with seed 42) already changes all 28. CNG-off rows are not touched by the seed.
+- Hops where the guard fires or the filter restarts move to the full-mode family; the analysis seam of the lane no longer
+  takes the library's time-domain capture fallback, so the first differences can start earlier than the first guard hop.
+  In the 4ch flow only hops where a contributing lane's guard fired (and the next hop, through the overlap-add) change.
+  `--aec-only` is unchanged byte for byte.
+- Pool sizes (ne10, `SIMD=1`, MATCHED n=5; `--print-mem-size` or the banner of the program), previous tree -> now. Mono,
+  16k/256 / 16k/512 / 48k/1024: 423,728 -> 424,288, 575,056 -> 576,128, 1,354,256 -> 1,356,352 B (the AEC pool grows by
+  lib/aec, 364,416 -> 366,000 / 491,600 -> 494,720 / 1,156,544 -> 1,162,736 B, and the synthesis shrinks by the borrowed
+  window, 11,344 -> 10,320 / 21,840 -> 19,792 / 42,832 -> 38,736 B). 4ch unit (flow plus helper): 1,698,784 -> 1,706,240,
+  2,992,416 -> 3,007,040, 6,300,352 -> 6,329,312 B; mcab's own pool 73,504 -> 74,624 B and one lane 199,408 -> 200,992 B at
+  16k/256. `mono_aec_dfn_res` at 16 kHz / 48 kHz / 8 kHz: 716,400 -> 717,984, 1,443,712 -> 1,449,904, 621,024 -> 622,608 B;
+  `4ch_aec_bf_dfn_res` at 16 kHz / 48 kHz: 2,058,672 -> 2,066,128, 6,616,928 -> 6,645,888 B; `mono_alignulcnet` at 16 kHz:
+  534,240 -> 537,360 B; `4ch_alignulcnet` unit pool at 16 kHz: 2,982,080 -> 2,994,640 B. The tables in the READMEs and `docs/`
+  carry the new values.
+
+### Added (tests)
+- `test_mono_chain`: `test_full_mode_identity` (rig of `main.c`, hand-written chain and `aec_process()` bit for bit at
+  16k/256, 16k/512 and 48k/1024 on moving-echo, comfort-noise-off, never-usable and `aec_reset` streams; four planted
+  defects detected), `test_nr_keeps_running` (and a planted NR reset), black boxes of both programs (`--no-nr` against
+  `aec_process()`, the full chain against the hand-written chain, across guard hops and reset events).
+  `tests/guard_scene.h` is the shared stream generator.
+- `test_mono_dfn`: P chain against `aec_process()` at 16k/256, 16k/512, 48k/1024; 48 kHz stage identity with the delayed
+  OLA clear; planted defects (no delay line, no clear, error_spec, no reseed). The `keep_ola_on_reset` workaround of the
+  bridge rows is gone (the field of `conv_chain_mono.h` too); the pass-band rows run on streams that carry hard-reset events
+  and reject a missing or late clear; new scene rows at 16k/256, 16k/512 and 8k/256 compare the bridge's apply lane with the
+  hand-written chain bit for bit (guard hops, delay changes, `aec_reset`, never-usable stream; max deviation from
+  `aec_process()` below 1e-7, the window's last bit) and its estimate lane with an independent synthesis of the rendering base.
+- `test_dfn_rate_bridge`: the tap equals an independent audiolib synthesis bit for bit with the clear on the named hop (one
+  hop differs from the uncleared run, no other), a clear one hop late does not, the stage and bridge counters are unchanged,
+  the output difference carries exactly the cleared tail's energy (0.998..1.000; clearing the 48 kHz synthesis or the
+  resamplers as well gives 1.2..2.1) and resumes bit-identical once it has drained; NULL and a hop in progress are refused.
+- `test_4ch_dfn`: flow-reset rows at 16k/256 and 16k/512 (unit and RES restarted, the hop and DFN2 not): both lanes bit for
+  bit, DFN2 frame count without a gap; a missing and a late clear are detected.
+- `test_mcab`: `test_render_base_contract` (three grids, MATCHED and EXTERNAL_ALIGNED; all / some / no lanes firing,
+  five weight shapes, trusted and rebuilt beams, a double reference of the projection, unit weight = the lane's own
+  base, the reset serial across realigns and a reset) and `test_unit_weight_matches_full_mode` (unit weights rendered
+  from `frame.b` with a full-mode twin's gain equal that twin's `aec_process()` bit for bit, guard hops and a reset
+  included; rendering `e`, ignoring the serial and the old seed are each detected).
+- `mono_aec_nr_res/tests/test_full_mode_identity.py`; `test_dfn2_rate_bridge_c_parity.py` (C against Python, with resets);
+  `test_dfn2_pipeline_contract.py` (comfort noise on, reset event; 16 kHz through the bridge, bit-level against the
+  conventional chain; no call and a late call fail); `4ch_aec_bf_nr_res/tests/test_pipeline.py::test_rendering_base_is_the_weighted_lane_bases`
+  (the Python rule).
+- `docs/c_python_function_map.md`: PL-DFN-13.
+
 ## [Unreleased] — 2026-10-28 — The example programs do the inverse FFT and overlap-add through `ac_istft`; `--aec-only` no longer calls `aec_process()`
 
 Rule: the inverse FFT and the overlap-add are one independent function the application calls (audiolib `ac_istft_*`),

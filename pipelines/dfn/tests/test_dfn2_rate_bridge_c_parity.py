@@ -48,6 +48,17 @@ int bridge_parity_added_delay(void *b) {
 int bridge_parity_added_delay_exact(void *b, int *numerator, int *denominator) {
     return dfn_rate_bridge_added_delay_exact((DfnRateBridge *)b, numerator, denominator);
 }
+int bridge_parity_reset_synthesis(void *b) {
+    return dfn_rate_bridge_reset_synthesis((DfnRateBridge *)b);
+}
+int bridge_parity_host_hops(void *b, float *estimate, float *apply) {
+    const float *e, *p;
+    int hop = dfn_rate_bridge_hop_size((DfnRateBridge *)b);
+    if (dfn_rate_bridge_get_host_hops((DfnRateBridge *)b, &e, &p) != 0) return -1;
+    memcpy(estimate, e, (size_t)hop * sizeof(float));
+    memcpy(apply, p, (size_t)hop * sizeof(float));
+    return 0;
+}
 int bridge_parity_process(void *b, const float *est_re, const float *est_im,
                           const float *app_re, const float *app_im, float *out) {
     Complex est[257], app[257];
@@ -96,6 +107,10 @@ def c_lib(pair, tmp_path_factory):
     lib.bridge_parity_added_delay_exact.restype = ctypes.c_int
     lib.bridge_parity_process.argtypes = [ctypes.c_void_p, fp, fp, fp, fp, fp]
     lib.bridge_parity_process.restype = ctypes.c_int
+    lib.bridge_parity_reset_synthesis.argtypes = [ctypes.c_void_p]
+    lib.bridge_parity_reset_synthesis.restype = ctypes.c_int
+    lib.bridge_parity_host_hops.argtypes = [ctypes.c_void_p, fp, fp]
+    lib.bridge_parity_host_hops.restype = ctypes.c_int
     return lib
 
 
@@ -122,8 +137,10 @@ def _multitone(count, sample_rate):
                ).astype(np.float32)
 
 
-def _run_c_and_py(c_lib, assets, sample_rate, fft, e_signal, p_signal):
-    """Both bridges on the same host-analysed signals: (c_out, py_out, python bridge)."""
+def _run_c_and_py(c_lib, assets, sample_rate, fft, e_signal, p_signal, reset_at=(), taps=None):
+    """Both bridges on the same host-analysed signals: (c_out, py_out, python bridge).
+    `reset_at`: hops before which both bridges get their synthesis-only reset; `taps`, a dict, receives
+    the native-grid hops each bridge synthesised ('c_e', 'c_p', 'py_e', 'py_p': one array per hop)."""
     hop = fft // 2
     n = len(p_signal)
     e_spec = _host_spectra(e_signal, fft)
@@ -148,6 +165,9 @@ def _run_c_and_py(c_lib, assets, sample_rate, fft, e_signal, p_signal):
         py_out = np.zeros(n, np.float32)
         for t, (e, p) in enumerate(zip(e_spec, p_spec)):
             out = np.zeros(hop, np.float32)
+            if t in reset_at:
+                assert c_lib.bridge_parity_reset_synthesis(handle) == 0
+                py.reset_synthesis()
             rc = c_lib.bridge_parity_process(
                 handle, _fp(np.ascontiguousarray(e.real, np.float32)),
                 _fp(np.ascontiguousarray(e.imag, np.float32)),
@@ -156,6 +176,11 @@ def _run_c_and_py(c_lib, assets, sample_rate, fft, e_signal, p_signal):
             assert rc == 0
             c_out[t * hop:(t + 1) * hop] = out
             py_out[t * hop:(t + 1) * hop] = py.push(e, p)
+            if taps is not None:
+                te, tp = np.zeros(hop, np.float32), np.zeros(hop, np.float32)
+                assert c_lib.bridge_parity_host_hops(handle, _fp(te), _fp(tp)) == 0
+                for key, value in (('c_e', te), ('c_p', tp), ('py_e', py.host_hops[0]), ('py_p', py.host_hops[1])):
+                    taps.setdefault(key, []).append(np.array(value, np.float32))
     finally:
         c_lib.bridge_parity_destroy(handle)
     return c_out, py_out, py
@@ -194,3 +219,33 @@ def test_an_impulse_lands_at_the_exact_added_delay(c_lib, assets, sample_rate, f
         centroid = float((np.arange(n)[window] * out[window]).sum() / out[window].sum())
         assert abs(centroid - expected) < 0.01, (centroid, expected)
         assert abs(peak - expected) < 0.5
+
+
+@pytest.mark.parametrize('sample_rate,fft', [(16000, 256), (16000, 512), (8000, 256)])
+def test_the_synthesis_only_reset_matches_the_c_bridge(c_lib, assets, sample_rate, fft):
+    """dfn_rate_bridge_reset_synthesis() / Dfn2RateBridge.reset_synthesis() before hops 41 and 77: the native-grid
+    hops and the output agree to float round-off in both bridges, the clear lands on the hop it names (the host
+    hops differ from the uncleared run there and nowhere else), and the Python bridge keeps its frame counters
+    (the reset leaves DFN2, the resamplers and the FIFOs running)."""
+    hop = fft // 2
+    n = 120 * hop
+    resets = (41, 77)
+    p_signal = _multitone(n, sample_rate)
+    e_signal = (0.5 * np.sin(2 * np.pi * 700.0 * np.arange(n) / sample_rate)).astype(np.float32)
+    taps, taps_ref = {}, {}
+    c_out, py_out, py = _run_c_and_py(c_lib, assets, sample_rate, fft, e_signal, p_signal,
+                                      reset_at=resets, taps=taps)
+    c_ref, py_ref, py_unreset = _run_c_and_py(c_lib, assets, sample_rate, fft, e_signal, p_signal,
+                                              taps=taps_ref)
+    np.testing.assert_allclose(py_out, c_out, rtol=2e-4, atol=2e-6)
+    for key in ('e', 'p'):
+        np.testing.assert_allclose(np.concatenate(taps['py_' + key]), np.concatenate(taps['c_' + key]),
+                                   rtol=2e-4, atol=2e-6)
+    for who in ('c', 'py'):
+        for key in ('e', 'p'):
+            changed = [t for t in range(120)
+                       if not np.allclose(taps[f'{who}_{key}'][t], taps_ref[f'{who}_{key}'][t], atol=1e-6)]
+            assert changed == list(resets), (who, key, changed)
+    assert np.max(np.abs(c_out - c_ref)) > 1e-2           # the clear is audible in the output
+    assert (py.frames48, py.last_hop_frames) == (py_unreset.frames48, py_unreset.last_hop_frames)
+    assert py.added_delay_exact == py_unreset.added_delay_exact

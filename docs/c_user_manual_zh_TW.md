@@ -104,7 +104,7 @@ mic/ref
 
 主要設計點：
 
-1. AEC 設 `enable_res=0`，讓 time output 保持 linear residual；同時設 `return_res_context=1`，仍由 AEC3 post block 計算 frequency seam（此組態下 formed seam 另有 capture 候選，`ctx.error_spec` 不保證每個 hop 都是誤差，見 [AEC C 使用手冊](../lib/aec/docs/c_user_manual_zh_TW_04_seam_troubleshooting.md#81-context-only-處理路徑) §8.1）。
+1. AEC 設 `enable_res=0`，讓 time output 保持 linear residual；同時設 `return_res_context=1`，仍由 AEC3 post block 計算 frequency seam（`ctx.error_spec`／`formed_hop` 是分析 seam，輸出守衛不會改動；要渲染的是 `aec_get_output_base()` 的渲染基底，見 [AEC C 使用手冊](../lib/aec/docs/c_user_manual_zh_TW_04_seam_troubleshooting.md#81-context-only-處理路徑) §8.1）。
 2. `R²` 除以 `32768²` 後，作為 NR 的 `extra_noise_psd`，得到 echo-aware `G_nr`。
 3. `G_nr` 與 AEC3 `G_res` 逐 bin 取較小值，不重複跑另一個時域 RES。
 4. `g_total` 直接取 `min(G_nr, G_res)`。post 段沒有 near-end floor，也沒有任何依賴廣帶能量的 lift；一個 bin 是否被保留，完全由 NR 自己的 speech-presence 模型與 AEC3 的 `G_res` 決定，所以環境噪聲大也不會把 NR 壓住或讓噪聲底跟著遠端起伏。
@@ -222,7 +222,7 @@ DUMP_CTX=pipeline_ctx.bin \
 "$BIN"/aec_nr_pipeline mic.wav ref.wav out.wav balanced
 ```
 
-檔案開頭是兩個 `int`：`n_freqs`、`hop`；後續每幀依序包含 `error_spec`、`res_gain`（lane 自己的增益）、`r2`、`comfort_noise`、`far_power`、`g_nr`（沒有降噪器時是 unity 全 1 向量）與 output hop。這是診斷格式，沒有穩定 ABI 保證。
+檔案開頭是兩個 `int`：`n_freqs`、`hop`；後續每幀依序包含渲染基底 B（`aec_get_output_base()`；未觸發守衛的 hop 與 `error_spec` 相同）、`res_gain`（lane 自己的增益）、`r2`、`comfort_noise`、`far_power`、`g_nr`（沒有降噪器時是 unity 全 1 向量）與 output hop。這是診斷格式，沒有穩定 ABI 保證。
 
 ### 4.3 WAV contract
 
@@ -264,6 +264,7 @@ typedef struct {
     int n_freqs;
     int enable_cng;
     uint32_t rng;
+    uint32_t reset_serial;   /* 已處理的 aec_post_reset_serial() */
     float *g_nr;
     float *g_total;
     float *g_aec;
@@ -297,7 +298,8 @@ int audio_alg_init(AudioAlgPipeline *p, int sample_rate,
 
     if (!p) return -1;
     memset(p, 0, sizeof(*p));
-    p->rng = 0x9e3779b9u;
+    p->rng = AEC_CNG_SEED;
+    p->reset_serial = 0u;
     p->enable_cng = enable_cng != 0;
 
     aec_config_from_level(&aec_cfg, aec_level, sample_rate);
@@ -355,7 +357,9 @@ int audio_alg_process(AudioAlgPipeline *p,
                       const float *mic, const float *ref, float *out)
 {
     AecResContext ctx;
+    AecOutputBase base;
     const float *extra = NULL;
+    uint32_t serial;
     int k;
 
     if (!p || !p->aec_ready || !p->nr || !mic || !ref || !out)
@@ -366,6 +370,22 @@ int audio_alg_process(AudioAlgPipeline *p,
     if (!ctx.error_spec || !ctx.res_gain || ctx.n_freqs != p->n_freqs)
         return -1;
 
+    /* 渲染基底 B：未觸發輸出守衛的 hop 與 ctx.error_spec 逐位元相同，守衛觸發時是 error_spec + echo_spec；
+       降噪器的估計與增益都用 B（ctx.error_spec / formed_hop 是分析 seam，不渲染）。 */
+    memset(&base, 0, sizeof(base));
+    base.struct_size = sizeof(base);
+    if (aec_get_output_base(p->aec, &base) != 0)
+        return -1;
+
+    /* AEC 在這個 hop 內做了硬重置：在第一次 CNG 抽樣與 ac_istft_push 之前清 OLA 尾巴、重設 CNG 種子；
+       不要因此重置 AEC，降噪器不動。 */
+    serial = aec_post_reset_serial(p->aec);
+    if (serial != p->reset_serial) {
+        p->reset_serial = serial;
+        ac_istft_reset(p->istft);
+        p->rng = AEC_CNG_SEED;
+    }
+
     /* 與範例 main.c 的 mono_nr_gain() 相同：R^2 只在 usable_linear != 0 時摺進降噪器的 noise floor */
     if (ctx.r2 && ctx.usable_linear) {
         for (k = 0; k < p->n_freqs; ++k)
@@ -373,7 +393,7 @@ int audio_alg_process(AudioAlgPipeline *p,
         extra = p->extra;
     }
 
-    if (anr_process_gain(p->nr, ctx.error_spec, extra, p->g_nr) < 0)
+    if (anr_process_gain(p->nr, base.base_spec, extra, p->g_nr) < 0)
         return -1;
 
     for (k = 0; k < p->n_freqs; ++k) {
@@ -382,7 +402,7 @@ int audio_alg_process(AudioAlgPipeline *p,
                       ? p->g_nr[k] : ctx.res_gain[k];
     }
 
-    sk_capply_gain_f32(p->spec, ctx.error_spec, p->g_total, p->n_freqs);
+    sk_capply_gain_f32(p->spec, base.base_spec, p->g_total, p->n_freqs);
 
     if (p->enable_cng && ctx.comfort_noise)   /* 只填 RES 挖掉的 bin，位準乘該 bin 的 NR 增益（下限 -10 dB） */
         aec_cng_fill(&p->rng, p->spec, ctx.comfort_noise, p->g_aec, p->g_nr,
@@ -398,7 +418,8 @@ void audio_alg_reset(AudioAlgPipeline *p)
     aec_reset(p->aec);
     anr_reset(p->nr);
     ac_istft_reset(p->istft);
-    p->rng = 0x9e3779b9u;
+    p->rng = AEC_CNG_SEED;
+    p->reset_serial = aec_post_reset_serial(p->aec);
 }
 /* AUDIO_ALG_PIPELINE_EXAMPLE_END */
 ```
@@ -424,7 +445,7 @@ audio_alg_reset(&pipeline);
 audio_alg_destroy(&pipeline);
 ```
 
-這段 wrapper 故意保持在 application 層，沒有宣稱新的 public ABI。合成由應用端持有的 `AcIstft`（audiolib）負責：RES／降噪增益乘上 `error_spec` 之後交給 `ac_istft_push()`，AEC 本身只送出 `aec_process_context()` 的頻域 context。若要修改 production constant、CNG RNG 或 failure policy，應在自己的 wrapper 版本化並重新跑品質評測。
+這段 wrapper 故意保持在 application 層，沒有宣稱新的 public ABI。合成由應用端持有的 `AcIstft`（audiolib）負責：RES／降噪增益乘上渲染基底 `aec_get_output_base()` 之後交給 `ac_istft_push()`，AEC 本身只送出 `aec_process_context()` 的頻域 context。若要修改 production constant、CNG RNG 或 failure policy，應在自己的 wrapper 版本化並重新跑品質評測。
 
 ## 6. Buffer、尺度與 lifetime
 

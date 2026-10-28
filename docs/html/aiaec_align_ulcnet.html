@@ -27,7 +27,7 @@ th{background:#eef0f2}
 <p>Shetu et al.（EUSIPCO 2025, arXiv:2410.13620）兩級混合式殘響/殘迴聲 + 噪音抑制器的重建。
 task（<code>dataset_gen/model_views.py</code> 的 <code>MODEL_TASKS</code>）=
 <code>linear_aec_postfilter_res_nr_dereverb</code>：輸入是<b>凍結 PBFDKF linear AEC 的
-error</b>（<code>linear_error = mic_postclip − D_hat</code>，不是 oracle residual；由 context-only frontend 產生，與板端 pipeline 同一條 seam，含 over-output capture guard——被判 unusable 的 hop 送的是 mic 本身，見 <code>AIAEC/dataset_gen/README.md</code>）與
+error</b>（<code>linear_error = mic_postclip − D_hat</code>，不是 oracle residual；由 context-only frontend 產生，與板端 pipeline 同一條 analysis seam（<code>formed_hop</code>），是每個 hop 真實選定的線性殘差；output guard 只選 rendering base、不改這個輸入，guard hop 上它可能大於 capture，見 <code>AIAEC/dataset_gen/README.md</code>）與
 <b>未對齊 far-end</b>（<code>far_render</code>）；target 是共同的
 <code>near_target</code>（去噪、去迴聲、early/dereverb 近端語音）。</p>
 <p><b>兩組編譯期 grid</b>（唯一支援的兩組；<code>export_onnx.py</code> 的
@@ -69,6 +69,7 @@ graph 綁四個特徵輸入 <code>error_mag/far_mag/error_cos/error_sin</code>�
 host（<code>commit()</code>）用 <code>prepare()</code> 留在 state 的<b>壓縮域</b> error 頻譜乘上 mask，
 再逆冪還原。以上是唯一的 boundary（layout 18）。</p>
 <div class="note"><b>far branch 契約</b>:production 固定用 caller 的 raw far,C descriptor 只接受 <code>ULCNET_FAR_RAW</code>,<code>export_onnx.py</code> 分開寫 <code>training_far_input_mode</code> 與 <code>far_input_mode</code>(兩者皆為 <code>raw_far</code>);PTQ calibration 的 D 必須和該份 ONNX export 相同。model-I/O layout 是 v18(<code>ULCNET_MODEL_IO_LAYOUT_VERSION</code> = 18;<code>RETIRED_LAYOUT_VERSIONS</code> = 3–17,不得重用),其他 layout 的 ONNX/JSON descriptor 會在 <code>ulcnet_model_io_descriptor_validate()</code> 卡在 <code>layout_version</code>。三項的完整說明收在 <a href="aiaec_align_ulcnet_detail.html">aiaec_align_ulcnet_detail</a>。</div>
+<div class="note"><b>訓練前端契約</b>:metadata 另帶 <code>linear_aec_contract_version</code>、<code>aec_behavior_hash</code>(取自 checkpoint)與 <code>error_input_seam</code> = <code>analysis_formed</code>;整合端在 <code>ulcnet_accelerator_adapter_init()</code> 之前要拿前者比對 <code>ULCNET_MODEL_IO_FRONTEND_CONTRACT</code>(<code>aiaec-linear-error-v4</code>),不符就不綁定。這不是 layout 升版(仍是 18)。</div>
 
 <h2>ONNX graph boundary（layout 18）</h2>
 <p>boundary 只有一種：四個 host 特徵輸入加四個 rank-4 state，每個 state 都有同 shape 的 <code>*_out</code>。
@@ -151,7 +152,8 @@ runtime 把每個 <code>*_out</code> 綁到 <code>frame_inputs()</code> 回傳�
 （較舊的格子與被丟掉的那一格不重查，殘留的非有限值會在下一幀進到 <code>output</code> 被擋下）；
 遇非有限值無法回滾，四個 state <b>全部歸零</b>、幀維持開啟、回 −1。
 <b><code>frame_skip</code> 在本模型 = identity</b>——error 頻譜原樣通過、state 維持原樣、
-framing 照常前進（stream 0 已是 linear-AEC error，放行安全；DeepVQE-S 必須 mute）。寫一半只有非有限值才偵測得到。</p>
+framing 照常前進（stream 0 已是 linear-AEC error，不需 mute；DeepVQE-S 必須 mute）。這個 error 是<b>未經 guard 的 analysis residual</b>
+（<code>formed_hop</code>／<code>AecResContext.error_spec</code>，每個 hop 都是真實選中的線性殘差），在 lib/aec 渲染 guard 作用的 hop 上可能大於 capture；guard 只決定渲染 base，不改這個輸入。寫一半只有非有限值才偵測得到。</p>
 <p><b>state generation</b>：<code>ulcnet_prepost_state_generation()</code>（adapter 與 model-I/O 層各有同語意的
 <code>*_state_generation()</code>）是 C 端清零 state 的次數計數器：<code>reset</code> 與被拒絕的 commit 各加一，
 新建的實例為 0，成功的 commit、skip 與再次呼叫被拒的 commit 都不動它。定點 accelerator 的 state 緩衝在 C 清零時不會

@@ -177,7 +177,7 @@ Pass conditions:
       samples) and a pass-band tolerance against the conventional NR-off
       output. The native path is a tolerance, NOT a memcmp.
 - [ ] The build produces `libdfn_res_stage.a` (carrying
-      `dfn_rate_bridge.o`); `MCAB_LAYOUT_VERSION` is 25 (the pool of `mcab` alone).
+      `dfn_rate_bridge.o`); `MCAB_LAYOUT_VERSION` is 26 (the pool of `mcab` alone).
 
 ### 9.1 Real four-microphone validation
 

@@ -48,7 +48,7 @@ th{background:#eef2f8}
 <tr><td>init</td><td><code>aec_init()</code>;<code>dfn_rate_bridge_init[_ex]()</code> 或 <code>dfn_res_stage_init[_ex]()</code> + <code>ac_istft_init()</code>;<code>dfn_hop_init_bridge()</code>／<code>dfn_hop_init_stage()</code></td><td><code>mcab_sample_flow_init()</code>(四條 lane、estimator、<code>mcab_init_ex()</code>)、<code>mcab_sample_beam_init(…, flow)</code>、<code>aec_res_init()</code>;其餘同左</td></tr>
 <tr><td>每 hop</td><td><code>aec_process_context()</code>、<code>aec_get_res_context()</code>、P 形成、<code>dfn_hop_process()</code>(或 begin／nn／end)</td><td><code>mcab_sample_beam_process[_with_activity]()</code>、<code>mcab_sample_beam_fuse()</code>(<code>g_res_ctx</code> 為 NULL)、<code>mcab_sample_res_input()</code> 加 <code>aec_res_process(res, &amp;in)</code>、P 形成、<code>dfn_hop_*</code></td></tr>
 <tr><td>hop 之間</td><td><code>aec_set_level()</code>、<code>dfn_res_stage_set_atten_lim()</code></td><td><code>aec_res_set_level(res, …)</code>、<code>dfn_res_stage_set_atten_lim()</code></td></tr>
-<tr><td>reset</td><td><code>aec_reset()</code> + <code>rng = CNG_RNG_SEED</code> + <code>dfn_hop_reset()</code></td><td><code>mcab_sample_beam_reset()</code>(連帶 reset flow、lane 與 estimator)+ <code>aec_res_reset()</code> + <code>rng = MCAB_SAMPLE_CNG_RNG_SEED</code> + <code>dfn_hop_reset()</code></td></tr>
+<tr><td>reset</td><td><code>aec_reset()</code> + <code>rng = AEC_CNG_SEED</code> + <code>dfn_hop_reset()</code></td><td><code>mcab_sample_beam_reset()</code>(連帶 reset flow、lane 與 estimator)+ <code>aec_res_reset()</code> + <code>rng = MCAB_SAMPLE_CNG_RNG_SEED</code> + <code>dfn_hop_reset()</code></td></tr>
 <tr><td>destroy</td><td><code>dfn_rate_bridge_destroy()</code>／<code>dfn_res_stage_destroy()</code>、<code>aec_destroy()</code>;caller 自己釋放 pool</td><td><code>dfn_rate_bridge_destroy()</code>／<code>dfn_res_stage_destroy()</code>、<code>mcab_sample_beam_destroy()</code>、<code>mcab_sample_flow_destroy()</code>(先 <code>mcab_destroy()</code> 再 lane;<code>AecRes</code> 沒有 destroy);caller 自己釋放 pool</td></tr>
 </table>
 
@@ -63,7 +63,7 @@ th{background:#eef2f8}
 #include &lt;string.h&gt;
 
 #define CNG_NR_GAIN_FLOOR 0.31622777f      /* comfort noise 的地板(-10 dB) */
-#define CNG_RNG_SEED 0x9e3779b9u
+/* comfort-noise seed: the library's AEC_CNG_SEED (42), also after every aec_post_reset_serial() change */
 
 /* 板端提供:模型 callback(回 0 = 每個輸出都寫滿)、ERB 矩陣、取 hop 與輸出 */
 extern int  board_run_dfn2_graph(void *user, const DFN2PrepostInputs *in, DFN2PrepostOutputs *out);
@@ -110,24 +110,29 @@ int mono_dfn_run(void) {
     DfnRateBridge *bridge = dfn_rate_bridge_init_ex(cur, (size_t)breq.bytes, &amp;bc, &amp;breq);
     if (!aec || !bridge) { free(pool); return -1; }          /* 失敗的 init 不留東西需要釋放 */
     for (int k = 0; k &lt; grid.n_freqs; ++k) unity[k] = 1.0f;
-    uint32_t rng = CNG_RNG_SEED;
+    uint32_t rng = AEC_CNG_SEED, handled = aec_post_reset_serial(aec);   /* 函式庫的種子;已處理的重置序號 */
     DfnHop hop;  dfn_hop_init_bridge(&amp;hop, bridge);
 
     /* 4. 每個 host hop 一次 */
     float mic[512], ref[512], out[512];                      /* &gt;= grid.hop_size */
     int cng_on = 0;                                          /* 預設關:E 與 P 要同相位 */
     while (next_hop(mic, ref)) {
-        AecResContext c;
+        AecResContext c;  AecOutputBase b = { sizeof(b) };
         aec_process_context(aec, mic, ref);
         aec_get_res_context(aec, &amp;c);
-        if (c.error_spec &amp;&amp; c.res_gain) {
+        if (c.error_spec &amp;&amp; c.res_gain &amp;&amp; aec_get_output_base(aec, &amp;b) == 0) {   /* b.base_spec = 渲染基底 B */
+            if (aec_post_reset_serial(aec) != handled) {               /* 本 hop 內硬重置:CNG 種子在第一次抽樣前重設 */
+                handled = aec_post_reset_serial(aec);                  /* (rate bridge:本 hop 的 begin 之前 dfn_rate_bridge_reset_synthesis(bridge),只清橋內原生合成的 OLA 尾巴;48 kHz 則在該 frame 到達合成時清) */
+                rng = AEC_CNG_SEED;
+                (void)dfn_rate_bridge_reset_synthesis(bridge);         /* 在 dfn_hop_process 之前;DFN2、resampler、FIFO 照常運轉 */
+            }
             sk_min_f32(gain, unity, c.res_gain, grid.n_freqs);
-            sk_capply_gain_f32(post, c.error_spec, gain, grid.n_freqs);   /* P = E * min(1, G_res) */
+            sk_capply_gain_f32(post, b.base_spec, gain, grid.n_freqs);   /* P = B * min(1, G_res) */
             if (cng_on &amp;&amp; c.comfort_noise)
                 aec_cng_fill(&amp;rng, post, c.comfort_noise, c.res_gain, unity, CNG_NR_GAIN_FLOOR, grid.n_freqs);
-            if (dfn_hop_process(&amp;hop, c.error_spec, post, out) == 0) { emit_hop(out, grid.hop_size); continue; }
+            if (dfn_hop_process(&amp;hop, b.base_spec, post, out) == 0) { emit_hop(out, grid.hop_size); continue; }
         }
-        aec_reset(aec);  rng = CNG_RNG_SEED;  dfn_hop_reset(&amp;hop);   /* 任何失敗:三者一起 reset */
+        aec_reset(aec);  rng = AEC_CNG_SEED;  handled = aec_post_reset_serial(aec);  dfn_hop_reset(&amp;hop);   /* 任何失敗:三者一起 reset */
     }
 
     /* 5. hop 之間才能呼叫的 setter;結束 */

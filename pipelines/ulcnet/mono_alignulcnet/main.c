@@ -11,7 +11,12 @@
  *     ulcnet_nn_stage_end(stage, out);
  *
  * Grid: compile-time (ULCNET_* constants), 16 kHz / FFT 512 or 48 kHz / FFT 1024. The model gets
- * the caller's raw `ref` hop. Replace run_accelerator() with the board runtime call. */
+ * the caller's raw `ref` hop. Replace run_accelerator() with the board runtime call.
+ * Data domain: the stage reads the AEC's analysis seam (ctx.formed_hop), the signal the model was trained
+ * on, not the rendering base of aec_get_output_base() (which does not pair with formed_hop on a hop where
+ * the output guard fires). There is no comfort noise and no synthesis of the program's own, so
+ * aec_post_reset_serial() has nothing to clear or reseed here; the stage's alignment policy is the
+ * delay.changed flag below. */
 #include "aec.h"
 #include "common/example_cli.h"
 #include "ulcnet/ulcnet_nn_stage.h"

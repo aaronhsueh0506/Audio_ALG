@@ -88,7 +88,7 @@ Who owns the residual-echo suppressor (RES):
   `mcab_sample_res_input()`), sets strength with `aec_res_set_level()` and clears it with `aec_res_reset()`. The 4ch Align-ULCNet
   application builds the flow with `cfg.enable_post = 0` and has no RES.
 
-Current layout version of the 4-channel flow: `MCAB_LAYOUT_VERSION = 25` (mcab.h; the lanes, the
+Current layout version of the 4-channel flow: `MCAB_LAYOUT_VERSION = 26` (mcab.h; the lanes, the
 shared estimator and the sample SRP/BF helper are separate objects); the full table is in
 `html/conventions.html`.
 

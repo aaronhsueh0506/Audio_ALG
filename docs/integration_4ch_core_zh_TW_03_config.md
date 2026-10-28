@@ -169,37 +169,37 @@ mcab 的 `req.bytes` 只涵蓋 mcab 自己的 pool；lane 與 estimator 各有�
 
 ### 4.6 實測記憶體（僅供量級參考，務必自己重查）
 
-以下是本次 checkout（`layout_version=25`；表中「應用端合計」是四條 lane、共用 estimator 與 mcab 自己的 pool 之和）、`BACKEND=ne10`、`SIMD=1`、
+以下是本次 checkout（`layout_version=26`；表中「應用端合計」是四條 lane、共用 estimator 與 mcab 自己的 pool 之和）、`BACKEND=ne10`、`SIMD=1`、
 `delay_mode=MATCHED`（預設,n=5）、`enable_post=1`（預設）、lane 為 `mcab_lane_config()` 的 balanced 預設下直接呼叫 API
-量到的值（LP64 本機 build；mcab 的控制區塊在其中是 688 B）。換 backend、換編譯選項、更新 submodule 都會變。
+量到的值（LP64 本機 build；mcab 的控制區塊在其中是 768 B）。換 backend、換編譯選項、更新 submodule 都會變。
 mcab 的 `McabMemBreakdown` 的大小欄位只有 `control_bytes`、`buffer_bytes`（mic lane、aligned far、fuse 緩衝、ring）與 `total_bytes`（另帶 `hop_size`、`fft_size`、`n_freqs`），
 不含 lane、estimator、RES／NR／iFFT。
 
 | Config | mcab pool（`req.bytes`） | estimator（`DelayAec` 物件 1,488 B ＋ pool） | 四條 lane 合計 | 應用端合計 |
 |---|---:|---:|---:|---:|
-| 16000，預設（256/128，`max_delay_ms=1024`） | 73,504 | 35,424 | 797,632 | 906,560 |
-| 16000，`fft_size=512` | 80,672 | 35,424 | 1,306,368 | 1,422,464 |
-| 16000，`max_delay_ms=100` | 14,368 | 35,424 | 797,632 | 847,424 |
-| 16000，lane `filter_length=512` | 73,504 | 35,424 | 673,792 | 782,720 |
-| 48000，預設（1024/512） | 226,080 | 36,800 | 2,912,064 | 3,174,944 |
+| 16000，預設（256/128，`max_delay_ms=1024`） | 74,624 | 35,424 | 803,968 | 914,016 |
+| 16000，`fft_size=512` | 82,816 | 35,424 | 1,318,848 | 1,437,088 |
+| 16000，`max_delay_ms=100` | 15,488 | 35,424 | 803,968 | 854,880 |
+| 16000，lane `filter_length=512` | 74,624 | 35,424 | 680,128 | 790,176 |
+| 48000，預設（1024/512） | 230,272 | 36,800 | 2,936,832 | 3,203,904 |
 
 `mcab_get_mem_breakdown()` 的 `total_bytes` 與 `mcab_get_mem_requirements()` 的
-`req.bytes` 在上述每一組都相等；`control_bytes` 已計入 `total_bytes`。四條 lane 合計除以 4 得單路 199,408 B（@16k/256）——
+`req.bytes` 在上述每一組都相等；`control_bytes` 已計入 `total_bytes`。四條 lane 合計除以 4 得單路 200,992 B（@16k/256）——
 就是 `lib/aec` 的 `AEC_DELAY_EXTERNAL_ALIGNED` 單體大小,因為每路內部本來就是
 `EXTERNAL_ALIGNED`（delay 由共用估計器提供,不建自己的 estimator/ring）。
 
 `mcab_external_static` 的 `--print-mem-size` 把「estimator ＋ mcab pool」印成 `Front end:` 一行
-（16k/256：108,928；16k/512：116,096；48k/1024：262,880），`AEC x4:` 是上表的四條 lane 合計。
+（16k/256：110,048；16k/512：118,240；48k/1024：267,072），`AEC x4:` 是上表的四條 lane 合計。
 帶 sample 層 SRP-PHAT／BF helper 的範例（`mcab_static --print-mem-size`）的 `Unit:` 行是 flow 全部物件加 helper 的 pool：
-16k/256 為 1,698,784，16k/512 為 2,992,416，48k/1024 為 6,300,352 B。
+16k/256 為 1,706,240，16k/512 為 3,007,040，48k/1024 為 6,329,312 B。
 
 #### 4.6a delay_mode 對 16000/預設 grid 的影響（`enable_post=1`，`MATCHED n=5` 為 baseline）
 
 | `delay_mode` | mcab pool | estimator | 應用端合計 | 相對 `MATCHED n=5` |
 |---|---:|---:|---:|---:|
-| `MATCHED` n=5（預設） | 73,504 | 35,424 | 906,560 | — |
-| `FIXED`，`fixed_delay_samples=1600`（100 ms） | 13,840 | 無 | 811,472 | −95,088 |
-| `EXTERNAL_ALIGNED` | 6,928 | 無 | 804,560 | −102,000 |
+| `MATCHED` n=5（預設） | 74,624 | 35,424 | 914,016 | — |
+| `FIXED`，`fixed_delay_samples=1600`（100 ms） | 14,960 | 無 | 818,928 | −95,088 |
+| `EXTERNAL_ALIGNED` | 8,048 | 無 | 812,016 | −102,000 |
 
 省下的是**一份共用**的 estimator/ring（四路共用一個 aligner），不是四份各自的——與「單一共用 aligner」的結構一致。
 
@@ -207,12 +207,12 @@ mcab 的 `McabMemBreakdown` 的大小欄位只有 `control_bytes`、`buffer_byte
 
 | Config | mcab pool（`req.bytes`） | 應用端合計 |
 |---|---:|---:|
-| 16000，`enable_post=0` | 68,288 | 901,344 |
-| 16000，`fft_size=512`，`enable_post=0` | 70,336 | 1,412,128 |
-| 48000，`enable_post=0` | 205,504 | 3,154,368 |
+| 16000，`enable_post=0` | 68,368 | 907,760 |
+| 16000，`fft_size=512`，`enable_post=0` | 70,416 | 1,424,688 |
+| 48000，`enable_post=0` | 205,584 | 3,179,216 |
 
 這是 [`pipeline_ulcnet_4ch.html`](html/pipeline_ulcnet_4ch.html) 的 ULCNet 4ch 範例（`4ch_alignulcnet`，`cfg.enable_post = 0`）所用 flow 的大小；
-比同格點 `enable_post=1` 少的是 fuse 緩衝（16 kHz/512：10,336 B，48 kHz：20,576 B）。
+比同格點 `enable_post=1` 少的是 fuse 緩衝（16 kHz/512：12,400 B，48 kHz：24,688 B）。
 **實際配置一律以 `req.bytes` 與各 lib 物件自己的 `get_mem_size` 為準。**
 
 ---

@@ -913,19 +913,20 @@ static void run_static_parity(int sample_rate, int fft_size) {
      * matches and the layout counter is the whole signal. Keep the literals in step with
      * MCAB_LAYOUT_VERSION. */
     stale = req;
-    stale.layout_version = 24u;
+    stale.layout_version = 25u;
     CHECK(mcab_init_ex(
               pool, (size_t)req.bytes, &cfg, &objs.libs, &stale) == NULL,
           "static init_ex rejects a descriptor from the superseded layout "
           "even when its byte count exactly covers the current pool");
-    /* 21..24 belonged to the two predecessor layers (MCAB_LAYOUT_VERSION's comment); 17 and 20
-     * are older unit layouts that a persisted descriptor might still carry. */
-    for (k = 17; k <= 23; ++k) {
+    /* 21..24 belonged to the two predecessor layers and 25 to the layout without the rendering
+     * base (MCAB_LAYOUT_VERSION's comment); 17 and 20 are older unit layouts that a persisted
+     * descriptor might still carry. */
+    for (k = 17; k <= 24; ++k) {
         stale = req;
         stale.layout_version = (uint32_t)k;
         stale.bytes += 4096u;
         CHECK(mcab_init_ex(pool, (size_t)req.bytes, &cfg, &objs.libs, &stale) == NULL,
-              "static init_ex rejects every predecessor layout (17..24), even with larger cached bytes");
+              "static init_ex rejects every predecessor layout (17..25), even with larger cached bytes");
     }
     {
         int untouched = 1;
@@ -933,7 +934,7 @@ static void run_static_parity(int sample_rate, int fft_size) {
         CHECK(untouched, "every refused init left the pool unwritten");
     }
     CHECK(req.layout_version == MCAB_LAYOUT_VERSION &&
-          MCAB_LAYOUT_VERSION == 25u,
+          MCAB_LAYOUT_VERSION == 26u,
           "the queried descriptor publishes the current carve layout");
 
     stat = mcab_init_ex(
@@ -3026,6 +3027,7 @@ static void mixed_hop_run(int sample_rate, int fft_size, int strong_delay,
     Mcab* p = NULL;
     Aec* ref_lane[MCAB_CHANNELS] = {NULL, NULL, NULL, NULL};
     void* ref_pool[MCAB_CHANNELS] = {NULL, NULL, NULL, NULL};
+    /* xorshift states of the synthetic near-end noise per lane (scene input, not a comfort-noise seed) */
     uint32_t noise_rng[MCAB_CHANNELS] = {
         0u, 0u, 0x9e3779b9u, 0x85ebca6bu};
     uint32_t rng = 0x1234567u;
@@ -5036,6 +5038,414 @@ static void test_reinit_after_app_reset(void) {
     free(pool2);
 }
 
+/* ---- rendering base and post-chain resets (mcab.h "Analysis and rendering") -------------------- */
+
+/* Four lanes of one far end through four echo paths whose bulk delay moves at 1/3 and 2/3 of
+ * the stream; lane 3's delay is a quarter of the others'. The first eighth has no echo path at
+ * all (an estimate that is never usable there) and the middle delay is past the lanes' filter, so
+ * the lanes' output guards fire, together and on their own. A double-talk burst follows the
+ * first move. mics: [n][4] interleaved. */
+typedef struct GuardScene {
+    int sr, hop, nh;
+    float* far;
+    float* mics;
+} GuardScene;
+
+static uint32_t g_scene_rng;
+static float scene_rnd(void) {
+    g_scene_rng ^= g_scene_rng << 13;
+    g_scene_rng ^= g_scene_rng >> 17;
+    g_scene_rng ^= g_scene_rng << 5;
+    return (float)(g_scene_rng & 0xFFFFFFu) / (float)0x800000u - 1.0f;
+}
+
+static int guard_scene_make(GuardScene* s, int sr, int hop, int seconds) {
+    int n, i, ch, seg = sr / 4, scale = sr / 16000;
+    float env = 0.2f, lp = 0.0f, nlp[MCAB_CHANNELS] = {0.0f, 0.0f, 0.0f, 0.0f};
+    memset(s, 0, sizeof(*s));
+    s->sr = sr;
+    s->hop = hop;
+    s->nh = seconds * sr / hop;
+    n = s->nh * hop;
+    s->far = (float*)calloc((size_t)n, sizeof(float));
+    s->mics = (float*)calloc((size_t)n * MCAB_CHANNELS, sizeof(float));
+    if (!s->far || !s->mics) return -1;
+    g_scene_rng = 0x2545F491u;
+    for (i = 0; i < n; ++i) {
+        if (i % seg == 0) {
+            float r = scene_rnd();
+            env = r > 0.3f ? 0.35f : (r > -0.4f ? 0.12f : 0.0f);
+        }
+        lp = 0.6f * lp + 0.4f * scene_rnd();
+        s->far[i] = env * lp * 2.0f;
+    }
+    for (i = 0; i < n; ++i) {
+        int d = i < n / 3 ? 480 * scale : (i < 2 * n / 3 ? 1100 * scale : 240 * scale);
+        for (ch = 0; ch < MCAB_CHANNELS; ++ch) {
+            int dc = (ch == 3 ? d / 4 : d) + 5 * ch;
+            float g = 0.45f - 0.06f * (float)ch;
+            float e = 0.0f;
+            nlp[ch] = 0.7f * nlp[ch] + 0.3f * scene_rnd();
+            if (i >= n / 8 && i - dc >= 0) e += g * s->far[i - dc];
+            if (i >= n / 8 && i - dc - 37 >= 0) e += 0.2f * s->far[i - dc - 37];
+            s->mics[(size_t)i * MCAB_CHANNELS + (size_t)ch] =
+                e + ((i > n / 3 && i < n / 3 + n / 6) ? 0.5f : 0.008f) * nlp[ch];
+        }
+    }
+    return 0;
+}
+
+static void guard_scene_free(GuardScene* s) {
+    free(s->far);
+    free(s->mics);
+    memset(s, 0, sizeof(*s));
+}
+
+/* The weight set of hop h, one of five shapes in turn: unit on lane 0, unit on lane 2, equal,
+ * complex per bin and per hop, two complex lanes. */
+static int render_weights(Complex* w, int n, int h) {
+    int mode = (h / 7) % 5, ch, k;
+    memset(w, 0, (size_t)MCAB_CHANNELS * (size_t)n * sizeof(Complex));
+    for (ch = 0; ch < MCAB_CHANNELS; ++ch) {
+        for (k = 0; k < n; ++k) {
+            Complex* c = w + (size_t)ch * (size_t)n + (size_t)k;
+            if (mode == 0) c->r = ch == 0 ? 1.0f : 0.0f;
+            else if (mode == 1) c->r = ch == 2 ? 1.0f : 0.0f;
+            else if (mode == 2) c->r = 0.25f;
+            else if (mode == 3) {
+                c->r = 0.25f + 0.2f * sinf(0.01f * (float)h + (float)ch + 0.003f * (float)k);
+                c->i = 0.15f * cosf(0.02f * (float)h + 2.0f * (float)ch + 0.005f * (float)k);
+            } else if (ch < 2) {
+                c->r = ch == 0 ? 0.6f : 0.0f;
+                c->i = ch == 1 ? 0.4f : 0.0f;
+            }
+        }
+    }
+    return mode;
+}
+
+/* Per-bin bound of the float32 four-term projection against the double reference. */
+static int render_matches_reference(const Complex* b, const Complex* w, const Complex* const* in,
+                                    int n) {
+    int k, ch;
+    for (k = 0; k < n; ++k) {
+        double rr = 0.0, ri = 0.0, mag = 0.0;
+        for (ch = 0; ch < MCAB_CHANNELS; ++ch) {
+            const Complex wc = w[(size_t)ch * (size_t)n + (size_t)k];
+            const Complex x = in[ch][k];
+            rr += (double)wc.r * x.r - (double)wc.i * x.i;
+            ri += (double)wc.r * x.i + (double)wc.i * x.r;
+            mag += sqrt((double)wc.r * wc.r + (double)wc.i * wc.i) *
+                   sqrt((double)x.r * x.r + (double)x.i * x.i);
+        }
+        if (fabs((double)b[k].r - rr) > 8.0 * FLT_EPSILON * mag + 1e-30 ||
+            fabs((double)b[k].i - ri) > 8.0 * FLT_EPSILON * mag + 1e-30) return 0;
+    }
+    return 1;
+}
+
+/* The fuse's rendering base against an independent reference, on a scene where the lanes' guards
+ * fire (all of them, some of them, none), with five weight shapes, trusted and rebuilt beams, a
+ * flow reset mid-stream and, in MATCHED, shared-delay realigns:
+ *   - render_spectra[ch] is linear_spectra[ch] itself when the lane's guard is off and its
+ *     capture spectrum E + echo (bit for bit) when on, never on a usable hop;
+ *   - guard_lanes is the set of contributing lanes that fired; b is e itself when empty, else the
+ *     projection sum(w * render_spectra) within float rounding of a double reference, and a
+ *     unit weight gives the lane's own rendering base exactly (the mono result);
+ *   - the analysis outputs do not see the guard: e is the beam of linear_spectra;
+ *   - post_reset_serial is the sum of the lanes' counters, still across realigns, +4 on reset.
+ * Self-checks: the reference with E in place of the fired lanes' base must be rejected on some
+ * fired hop, and every coverage count must be non-zero. */
+static void test_render_base_contract(int sample_rate, int fft_size, AecDelayMode mode) {
+    McabConfig cfg = mcab_default_config(sample_rate);
+    GuardScene sc;
+    Mcab* p = NULL;
+    const McabSampleFlow* objs;
+    Complex *w = NULL, *beam = NULL;
+    Complex* capture = NULL;
+    int hop, n, h, ch, k;
+    long fired_all = 0, fired_some = 0, fired_none = 0, unit_fired = 0, changed = 0;
+    long bad_lane_base = 0, bad_mask = 0, bad_alias = 0, bad_ref = 0, bad_unit = 0;
+    long bad_serial = 0, bad_e = 0, wrong_ref_rejected = 0, resets_seen = 0, bad_usable = 0;
+    uint32_t last_serial = 0;
+    char label[160];
+
+    cfg.fft_size = fft_size;
+    cfg.delay_mode = mode;
+    if (mode != AEC_DELAY_MATCHED) cfg.delay_num_filters = DA_NUM_FILTERS;
+    p = mcab_test_create(&cfg);
+    if (!p || guard_scene_make(&sc, sample_rate, mcab_hop_size(p), 12) != 0) {
+        CHECK(0, "render base: flow and scene build");
+        mcab_test_destroy(p);
+        guard_scene_free(&sc);
+        return;
+    }
+    objs = mcab_test_objects(p);
+    hop = mcab_hop_size(p);
+    n = mcab_n_freqs(p);
+    w = (Complex*)calloc((size_t)MCAB_CHANNELS * (size_t)n, sizeof(Complex));
+    beam = (Complex*)calloc((size_t)n, sizeof(Complex));
+    capture = (Complex*)calloc((size_t)n, sizeof(Complex));
+    for (h = 0; h < sc.nh && w && beam && capture; ++h) {
+        McabFront front;
+        McabFrame frame;
+        const Complex* e_in[MCAB_CHANNELS];
+        uint32_t lane_sum = 0;
+        int wmode, mask = 0, contrib = 0, trusted = h & 1;
+        if (h == sc.nh / 2) mcab_reset(p);
+        if (mcab_process_front(p, sc.mics + (size_t)h * hop * MCAB_CHANNELS,
+                               sc.far + (size_t)h * hop, &front) != MCAB_OK) {
+            CHECK(0, "render base: every front succeeds");
+            break;
+        }
+        changed += front.delay.changed;
+        for (ch = 0; ch < MCAB_CHANNELS; ++ch) {
+            AecResContext c;
+            lane_sum += aec_post_reset_serial(objs->lanes[ch]);
+            aec_get_res_context(objs->lanes[ch], &c);
+            e_in[ch] = front.linear_spectra[ch];
+            if (!front.guard_active[ch]) {
+                bad_lane_base += front.render_spectra[ch] != front.linear_spectra[ch];
+            } else {
+                for (k = 0; k < n; ++k) {
+                    capture[k].r = c.error_spec[k].r + c.echo_spec[k].r;
+                    capture[k].i = c.error_spec[k].i + c.echo_spec[k].i;
+                }
+                bad_lane_base += memcmp(capture, front.render_spectra[ch],
+                                        (size_t)n * sizeof(Complex)) != 0;
+                bad_usable += c.usable_linear != 0;
+            }
+        }
+        if (h > 0 && front.post_reset_serial != last_serial) {
+            resets_seen++;
+            bad_serial += h != sc.nh / 2 || front.post_reset_serial != last_serial + 4u;
+        }
+        bad_serial += front.post_reset_serial != lane_sum;
+        last_serial = front.post_reset_serial;
+
+        wmode = render_weights(w, n, h);
+        if (trusted) {
+            memset(beam, 0, (size_t)n * sizeof(Complex));
+            for (ch = 0; ch < MCAB_CHANNELS; ++ch)
+                mcab_projection_cmac_scalar(beam, w + (size_t)ch * (size_t)n, e_in[ch], n);
+        }
+        if (mcab_fuse(p, w, trusted ? beam : NULL, &frame) != MCAB_OK) {
+            CHECK(0, "render base: every fuse succeeds");
+            break;
+        }
+        for (ch = 0; ch < MCAB_CHANNELS; ++ch) {
+            int lane_on = 0;
+            for (k = 0; k < n; ++k)
+                lane_on |= w[(size_t)ch * n + k].r != 0.0f || w[(size_t)ch * n + k].i != 0.0f;
+            contrib |= lane_on << ch;
+            if (lane_on && front.guard_active[ch]) mask |= 1 << ch;
+        }
+        bad_mask += frame.guard_lanes != mask || frame.post_reset_serial != front.post_reset_serial;
+        bad_e += trusted ? frame.e != beam : !render_matches_reference(frame.e, w, e_in, n);
+        if (mask == 0) {
+            fired_none++;
+            bad_alias += frame.b != frame.e;
+        } else {
+            fired_all += mask == contrib && contrib == 0xF;
+            fired_some += mask != contrib;
+            bad_ref += !render_matches_reference(frame.b, w, front.render_spectra, n);
+            wrong_ref_rejected += !render_matches_reference(frame.b, w, e_in, n);
+            if (wmode <= 1) {
+                const Complex* own = front.render_spectra[wmode == 0 ? 0 : 2];
+                unit_fired++;
+                for (k = 0; k < n; ++k)
+                    bad_unit += frame.b[k].r != own[k].r || frame.b[k].i != own[k].i;
+            }
+        }
+    }
+    snprintf(label, sizeof label, "render base @ %d Hz/%d %s: ", sample_rate, fft_size,
+             mode == AEC_DELAY_MATCHED ? "matched" : "external");
+#define RCHECK(cond, what) do { char l_[256]; snprintf(l_, sizeof l_, "%s%s", label, what); \
+                                CHECK(cond, l_); } while (0)
+    printf("  %shops %d: all fired %ld, some fired %ld, none %ld, unit-weight fired %ld, "
+           "delay changes %ld\n", label, sc.nh, fired_all, fired_some, fired_none, unit_fired,
+           changed);
+    RCHECK(h == sc.nh, "the stream runs to the end");
+    RCHECK(fired_all > 0 && fired_some > 0 && fired_none > 0 && unit_fired > 0,
+           "the scene covers all / some / no lanes firing and a fired unit-weight hop");
+    RCHECK(mode != AEC_DELAY_MATCHED || changed > 0, "the shared delay realigns (MATCHED)");
+    RCHECK(bad_lane_base == 0 && bad_usable == 0,
+           "render_spectra is E, or E + echo exactly on a guard hop, never on a usable hop");
+    RCHECK(bad_mask == 0, "guard_lanes is the contributing fired set; the frame carries the serial");
+    RCHECK(bad_e == 0, "e is the analysis beam of linear_spectra, untouched by the guard");
+    RCHECK(bad_alias == 0, "with no contributing lane fired, b is e itself");
+    RCHECK(bad_ref == 0, "b is sum(w * render_spectra) within float rounding (double reference)");
+    RCHECK(wrong_ref_rejected > 0,
+           "self-check: the analysis projection fails that reference on fired hops");
+    RCHECK(bad_unit == 0, "a unit weight renders the lane's own base exactly (mono result)");
+    RCHECK(bad_serial == 0 && resets_seen == 1,
+           "post_reset_serial = sum of lane counters, still across realigns, +4 at mcab_reset");
+#undef RCHECK
+    free(w);
+    free(beam);
+    free(capture);
+    guard_scene_free(&sc);
+    mcab_test_destroy(p);
+}
+
+/* The external synthesis of one fused output, as the example chains write it, with knobs that
+ * break one rule each for the mutation rows. */
+typedef struct OracleSynth {
+    AcIstft* is;
+    void* mem;
+    Complex* spec;
+    uint32_t rng, handled;
+    int render_from_e;     /* mutation: render the analysis beam */
+    int ignore_serial;     /* mutation: never follow a post-chain reset */
+    uint32_t seed;         /* AEC_CNG_SEED, or a mutated seed */
+} OracleSynth;
+
+static int oracle_synth_init(OracleSynth* o, const Aec* aec, int fft, uint32_t seed) {
+    AcStftConfig sc;
+    size_t sz;
+    int win_n = 0;
+    memset(o, 0, sizeof(*o));
+    ac_stft_config_default(&sc, fft);
+    /* the library's own synthesis window */
+    if (aec_synthesis_window(aec, &sc.window, &win_n) != 0 || win_n != fft) return -1;
+    sz = ac_istft_get_mem_size(&sc);
+    if (!sz || posix_memalign(&o->mem, 16, sz) != 0) return -1;
+    o->is = ac_istft_init(o->mem, sz, &sc);
+    o->spec = (Complex*)calloc((size_t)(fft / 2 + 1), sizeof(Complex));
+    o->seed = seed;
+    o->rng = seed;
+    return o->is && o->spec ? 0 : -1;
+}
+
+static void oracle_synth_free(OracleSynth* o) {
+    free(o->mem);
+    free(o->spec);
+    memset(o, 0, sizeof(*o));
+}
+
+static void oracle_synth_hop(OracleSynth* o, const McabFrame* f, const float* gain, int cng,
+                             float* out) {
+    if (!o->ignore_serial && f->post_reset_serial != o->handled) {
+        o->handled = f->post_reset_serial;
+        ac_istft_reset(o->is);
+        o->rng = o->seed;
+    }
+    sk_capply_gain_f32(o->spec, o->render_from_e ? f->e : f->b, gain, f->n_freqs);
+    if (cng) aec_cng_fill(&o->rng, o->spec, f->cn, gain, NULL, 0.0f, f->n_freqs);
+    ac_istft_push(o->is, o->spec, out);
+}
+
+/* The mcab rendering against the library's full mode, through public calls only: with the
+ * weights [1, 0, 0, 0] the fused frame is lane 0's context, so rendering frame.b with the gain
+ * of a full-mode twin of lane 0 (same lane config but enable_res = 1, fed the same capture and
+ * the same aligned far, reset with the flow), plus its comfort noise from AEC_CNG_SEED and the
+ * post_reset_serial rule, through an AcIstft with the library's synthesis window must reproduce
+ * the twin's aec_process() output bit for bit on every hop, guard hops and the reset included.
+ * The post-beam RES is not part of this: it is a separate stage with its own gain. Mutations
+ * (rendering e, ignoring the serial, the old seed) must each break the identity. */
+static void test_unit_weight_matches_full_mode(int sample_rate, int fft_size, int cng) {
+    McabConfig cfg = mcab_default_config(sample_rate);
+    GuardScene sc;
+    Mcab* p = NULL;
+    Aec* twin = (Aec*)calloc(1, sizeof(Aec));
+    AecConfig lane;
+    OracleSynth good, m_e, m_serial, m_seed;
+    Complex* w = NULL;
+    float *out_twin = NULL, *out = NULL, *out_m = NULL, *mic0 = NULL;
+    long diff = 0, diff_e = 0, diff_serial = 0, diff_seed = 0, guard_hops = 0, bad_ctx = 0;
+    int hop, n, h, i, twin_ok;
+    char label[200];
+
+    cfg.fft_size = fft_size;
+    cfg.delay_mode = AEC_DELAY_EXTERNAL_ALIGNED;
+    p = mcab_test_create(&cfg);
+    twin_ok = p && twin && mcab_lane_config(&cfg, &lane) == 0;
+    if (twin_ok) {
+        lane.enable_res = 1;
+        lane.return_res_context = 1;
+        lane.spatial_linear_context = 0;
+        lane.enable_cng = cng;
+        twin_ok = aec_create(twin, &lane) == 0;
+    }
+    if (!twin_ok || guard_scene_make(&sc, sample_rate, mcab_hop_size(p), 10) != 0) {
+        CHECK(0, "full-mode twin: flow, twin and scene build");
+        free(twin);
+        mcab_test_destroy(p);
+        guard_scene_free(&sc);
+        return;
+    }
+    hop = mcab_hop_size(p);
+    n = mcab_n_freqs(p);
+    w = (Complex*)calloc((size_t)MCAB_CHANNELS * (size_t)n, sizeof(Complex));
+    out_twin = (float*)calloc((size_t)hop, sizeof(float));
+    out = (float*)calloc((size_t)hop, sizeof(float));
+    out_m = (float*)calloc((size_t)hop, sizeof(float));
+    mic0 = (float*)calloc((size_t)hop, sizeof(float));
+    if (oracle_synth_init(&good, twin, fft_size, AEC_CNG_SEED) ||
+        oracle_synth_init(&m_e, twin, fft_size, AEC_CNG_SEED) ||
+        oracle_synth_init(&m_serial, twin, fft_size, AEC_CNG_SEED) ||
+        /* negative control: the retired comfort-noise seed, planted as a defect */
+        oracle_synth_init(&m_seed, twin, fft_size, 0x9e3779b9u) || !w || !mic0) {
+        CHECK(0, "full-mode twin: synthesizers build");
+        sc.nh = 0;
+    }
+    m_e.render_from_e = 1;
+    m_serial.ignore_serial = 1;
+    for (i = 0; i < n; ++i) w[i].r = 1.0f;
+    for (h = 0; h < sc.nh; ++h) {
+        McabFront front;
+        McabFrame frame;
+        AecResContext tc;
+        const float* mics = sc.mics + (size_t)h * hop * MCAB_CHANNELS;
+        if (h == sc.nh / 2) {
+            mcab_reset(p);
+            aec_reset(twin);
+        }
+        if (mcab_process_front(p, mics, sc.far + (size_t)h * hop, &front) != MCAB_OK ||
+            mcab_fuse(p, w, NULL, &frame) != MCAB_OK) {
+            CHECK(0, "full-mode twin: every hop of the flow succeeds");
+            break;
+        }
+        for (i = 0; i < hop; ++i) mic0[i] = mics[(size_t)i * MCAB_CHANNELS];
+        aec_process(twin, mic0, front.aligned_ref, out_twin);
+        aec_get_res_context(twin, &tc);
+        guard_hops += front.guard_active[0];
+        bad_ctx += memcmp(tc.error_spec, frame.e, (size_t)n * sizeof(Complex)) != 0;
+        oracle_synth_hop(&good, &frame, tc.res_gain, cng, out);
+        diff += memcmp(out, out_twin, (size_t)hop * sizeof(float)) != 0;
+        oracle_synth_hop(&m_e, &frame, tc.res_gain, cng, out_m);
+        diff_e += memcmp(out_m, out_twin, (size_t)hop * sizeof(float)) != 0;
+        oracle_synth_hop(&m_serial, &frame, tc.res_gain, cng, out_m);
+        diff_serial += memcmp(out_m, out_twin, (size_t)hop * sizeof(float)) != 0;
+        oracle_synth_hop(&m_seed, &frame, tc.res_gain, cng, out_m);
+        diff_seed += memcmp(out_m, out_twin, (size_t)hop * sizeof(float)) != 0;
+    }
+    snprintf(label, sizeof label, "full-mode twin @ %d Hz/%d cng=%d", sample_rate, fft_size, cng);
+    printf("  %s: %d hops, %ld guard hops on lane 0, %ld differ (mutations: render e %ld, "
+           "ignore serial %ld, old seed %ld)\n", label, sc.nh, guard_hops, diff, diff_e,
+           diff_serial, diff_seed);
+    CHECK(h == sc.nh && sc.nh > 0 && guard_hops > 0,
+          "full-mode twin: the stream runs to the end and lane 0's guard fires");
+    CHECK(bad_ctx == 0, "full-mode twin: lane 0's analysis E equals the full-mode twin's");
+    CHECK(diff == 0, "full-mode twin: unit-weight rendering of frame.b == aec_process() bit for bit");
+    CHECK(diff_e > 0, "full-mode twin: mutation 'render e' is detected");
+    CHECK(diff_serial > 0, "full-mode twin: mutation 'ignore post_reset_serial' is detected");
+    CHECK(!cng || diff_seed > 0, "full-mode twin: mutation 'old comfort-noise seed' is detected");
+    oracle_synth_free(&good);
+    oracle_synth_free(&m_e);
+    oracle_synth_free(&m_serial);
+    oracle_synth_free(&m_seed);
+    aec_destroy(twin);
+    free(twin);
+    free(w);
+    free(out_twin);
+    free(out);
+    free(out_m);
+    free(mic0);
+    guard_scene_free(&sc);
+    mcab_test_destroy(p);
+}
+
 int main(void) {
     test_counter_boundaries();
     test_proxy_lane_inputs(16000, 256, AEC_DELAY_FIXED);
@@ -5099,6 +5509,16 @@ int main(void) {
     test_unservable_delay_is_dsp_error();
     test_create_heap_path();
     test_reinit_after_app_reset();
+    test_render_base_contract(16000, 256, AEC_DELAY_EXTERNAL_ALIGNED);
+    test_render_base_contract(16000, 512, AEC_DELAY_EXTERNAL_ALIGNED);
+    test_render_base_contract(48000, 1024, AEC_DELAY_EXTERNAL_ALIGNED);
+    test_render_base_contract(16000, 256, AEC_DELAY_MATCHED);
+    test_render_base_contract(16000, 512, AEC_DELAY_MATCHED);
+    test_render_base_contract(48000, 1024, AEC_DELAY_MATCHED);
+    test_unit_weight_matches_full_mode(16000, 256, 1);
+    test_unit_weight_matches_full_mode(16000, 256, 0);
+    test_unit_weight_matches_full_mode(16000, 512, 1);
+    test_unit_weight_matches_full_mode(48000, 1024, 1);
 
     if (failures) {
         printf("%d test(s) failed\n", failures);

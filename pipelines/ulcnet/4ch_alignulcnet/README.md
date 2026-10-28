@@ -54,7 +54,7 @@ nothing else. `ulcnet_nn_stage_end()` emits zeros for hop #0 only; the output of
 The beam hop is not reconstructed by WOLA and re-analysed (that would cost one
 IFFT plus one RFFT and one extra hop of latency per hop), so the pipeline has no
 reconstructed beam hop to hand out. mcab's pool layout version
-(`MCAB_LAYOUT_VERSION`, 25) describes mcab's own pool only; a descriptor
+(`MCAB_LAYOUT_VERSION`, 26) describes mcab's own pool only; a descriptor
 whose layout version differs from the current build is refused by
 `mcab_init_ex()`. The stage is example code: it has no
 descriptor and no layout version.
@@ -92,6 +92,12 @@ ulcnet_nn_stage_end(stage, out);                         /* WOLA, one hop */
 
 A frame left open or never fetched is the identity (fail-open); the reprime
 frame after an alignment boundary has no model frame (`nn_begin` returns 0).
+
+The network input is the analysis beam (`beam.spectrum`, the beam of the lanes' error spectra), as a network on
+one lane reads that lane's error spectrum; the lanes' output-guard rendering bases (`McabFront.render_spectra`)
+are not fed to it. The stage keeps its synthesis inside; the lanes' post-chain reset counter
+(`McabFront.post_reset_serial`) moves only with a flow reset here, which the recovery below already pairs with
+`ulcnet_nn_stage_reset()`.
 
 Recovery is the integrator's: after any refused call (a negative return from the helper or the
 stage) call `mcab_sample_beam_reset(unit)` and `ulcnet_nn_stage_reset(stage)` together;
@@ -149,8 +155,8 @@ sets the measured one through `McabSampleBeamParams`). Internal: the helper's BF
 The matched-filter bank size `n` is a product deployment decision, so it is a
 command-line argument rather than a literal in `main.c`; the resolved profile
 and the pool it costs are printed at start-up — at the default matched/n=5
-profile, that banner reads a 2,982,080 B unit pool (the flow objects plus the helper) plus a
-36,400 B stage pool at 16 kHz and a 6,279,776 B unit pool plus a 71,728 B stage pool at 48 kHz
+profile, that banner reads a 2,994,640 B unit pool (the flow objects plus the helper) plus a
+36,400 B stage pool at 16 kHz and a 6,304,624 B unit pool plus a 71,728 B stage pool at 48 kHz
 (`ULCNET_GRID=48k`). Read it from your
 own build rather than copying it.
 `n` is an init parameter, not a runtime setter —

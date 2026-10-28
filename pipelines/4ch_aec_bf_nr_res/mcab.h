@@ -9,8 +9,30 @@
  * Per hop:
  *     mcab_process_front()  shared delay + four lanes -> McabFront (lane spectra, aligned far)
  *     caller SRP/BF         weights W[4][n_freqs] (and its beamformed spectrum E)
- *     mcab_fuse(p, W, E)    project near / R^2 / comfort noise -> McabFrame
+ *     mcab_fuse(p, W, E)    project near / R^2 / comfort noise / rendering base -> McabFrame
  * With cfg.enable_post = 0 the lanes keep only the linear context and mcab_fuse() is refused.
+ *
+ * Analysis and rendering (lib/aec aec_get_output_base()). Each lane evaluates its own output
+ * guard once per hop inside the library; mcab adds no guard of its own, before or after the
+ * beam. The beamformer advances once per hop on the ANALYSIS spectra (linear_spectra, the
+ * lanes' error spectra); E and the projected Y, R^2 and N^2 are what the RES, the denoiser and
+ * any estimator read. The same hop's weights W project the lanes' RENDERING bases:
+ *     B = sum_ch W_ch * B_ch,  B_ch = render_spectra[ch]  (E_ch, or Y_ch where lane ch's guard fired)
+ * and the synthesis renders B * gain (+ comfort noise). When no contributing lane's guard fired,
+ * B_ch = E_ch on every contributing lane and B is E itself (the same pointer). A guard bounds a
+ * lane's own residual by its capture; that bound is not carried through the beam (complex
+ * weights mix the lanes), and B is not the transform of any formed time hop. With
+ * enable_post = 0 there is no fused frame: a network on the beam reads the analysis beam, as a
+ * network on one lane reads its error spectrum (render_spectra stay available per lane).
+ *
+ * Post-chain resets. A lane's hard post-chain reset (aec_post_reset_serial()) is published as
+ * McabFront/McabFrame.post_reset_serial, the four lane counters summed modulo 2^32, which moves
+ * whenever any lane's moves. The one synthesizer of the fused output keeps the value it last
+ * handled; when the hop's value differs it clears its overlap-add tail and reseeds its comfort
+ * noise to AEC_CNG_SEED before that hop's first comfort-noise draw and inverse transform. mcab
+ * never resets a lane in response; whether a denoiser or a network follows is the application's
+ * policy. In this flow the lanes take an aligned far (EXTERNAL_ALIGNED), so their counters move
+ * on aec_reset() (mcab_reset()) only.
  *
  * Init sequence (every object in caller memory, no heap anywhere):
  *     McabConfig cfg = mcab_default_config(16000);
@@ -53,11 +75,11 @@ extern "C" {
 #define MCAB_CHANNELS 4
 
 #define MCAB_DESCRIPTOR_VERSION 1u
-/* Carve layout of mcab's own pool: control block, mic lane, aligned far, the fuse buffers
- * (enable_post) and the alignment ring (MATCHED/FIXED). Library objects are not in it. 21..24
- * belonged to the predecessor layers and are never reused. Query a fresh descriptor for every
- * build; never persist or synthesize one. */
-#define MCAB_LAYOUT_VERSION 25u
+/* Carve layout of mcab's own pool: control block, mic lane, aligned far, the fuse buffers with the
+ * rendering base (enable_post) and the alignment ring (MATCHED/FIXED). Library objects are not in
+ * it. 21..24 belonged to the predecessor layers and 25 to the layout without a rendering base;
+ * none is reused. Query a fresh descriptor for every build; never persist or synthesize one. */
+#define MCAB_LAYOUT_VERSION 26u
 #define MCAB_BACKEND_NE10 2u          /* backend_id 1 is never returned */
 
 /** Fixed 32-byte descriptor of the caller pool: descriptor_version (ABI, checked first),
@@ -153,6 +175,11 @@ typedef struct McabFront {
     int n_freqs;
     const Complex* linear_spectra[MCAB_CHANNELS];   /* lane error spectra, n_freqs bins      */
     const float* formed_hop[MCAB_CHANNELS];         /* time-domain hop under each spectrum   */
+    /* Each lane's rendering base: linear_spectra[ch] itself, or the lane's capture spectrum
+     * where its output guard fired this hop (guard_active[ch]). Not paired with formed_hop. */
+    const Complex* render_spectra[MCAB_CHANNELS];
+    int guard_active[MCAB_CHANNELS];
+    uint32_t post_reset_serial;                     /* sum of the lanes' reset counters     */
     /* The aligned far fed to every lane: the caller's far shifted by delay.delay_samples once
      * the ring can serve that offset, the raw far hop before (whole-hop switch). */
     const float* aligned_ref;
@@ -164,6 +191,9 @@ typedef struct McabFrame {
     int n_freqs;              /* bins of every spectrum / gain vector            */
     int hop;                  /* time-domain hop of far_hop / formed_hop         */
     const Complex* e;         /* the beamformed linear-AEC error E(f)            */
+    const Complex* b;         /* rendering base B(f): P = B * gain; e when guard_lanes == 0 */
+    int guard_lanes;          /* bit ch: contributing lane ch's output guard fired */
+    uint32_t post_reset_serial; /* McabFront.post_reset_serial of this hop       */
     const Complex* y;         /* capture spectrum matching e                     */
     const Complex* x;         /* far-end spectrum                                */
     const float* r2;          /* residual-echo PSD R^2(f)                        */
@@ -268,7 +298,9 @@ int mcab_process_front(Mcab* p, const float* microphones_interleaved,
 
 /** Projects this hop's lane contexts with the caller's beamformer into *frame:
  * e = beamformed error, y = projected near, x = lane 0's far spectrum, r2/cn = projected
- * residual-echo and comfort-noise PSDs, far_hop = aligned far, max_dt/max_sat/all_converged/
+ * residual-echo and comfort-noise PSDs, b/guard_lanes = the rendering base (B above: e itself
+ * when guard_lanes == 0, else sum(w * render_spectra) in mcab memory), post_reset_serial = the
+ * front's, far_hop = aligned far, max_dt/max_sat/all_converged/
  * usable_linear over lanes with a nonzero weight, clock_drift and the delay flags; g_res_ctx is
  * NULL. weights: channel-major Complex[4][n_freqs], out = sum(w * in), no conjugation.
  * beamformed_error: the spectrum of the same beamformer call (caller-owned, must outlive the

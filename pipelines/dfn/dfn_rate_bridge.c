@@ -408,6 +408,13 @@ void dfn_rate_bridge_reset(DfnRateBridge *b) {
     clear_streams(b);
 }
 
+int dfn_rate_bridge_reset_synthesis(DfnRateBridge *b) {
+    if (!b || b->phase != 0) return -1;
+    ac_istft_reset(b->synth_e);
+    ac_istft_reset(b->synth_p);
+    return 0;
+}
+
 /* Upsamples one native hop into the FIFO's pending region; returns the count
  * produced, or -1. */
 static int push_up(DfnRateBridge *b, AudioResampler *up, const float *hop,
@@ -545,4 +552,12 @@ void dfn_rate_bridge_get_counters(const DfnRateBridge *b,
                                   long long *frames_48k, int *last_hop_frames) {
     if (frames_48k) *frames_48k = b ? b->frames48 : 0;
     if (last_hop_frames) *last_hop_frames = b ? b->last_hop_frames : 0;
+}
+
+int dfn_rate_bridge_get_host_hops(const DfnRateBridge *b, const float **estimate_hop,
+                                  const float **apply_hop) {
+    if (!b) return -1;
+    if (estimate_hop) *estimate_hop = b->e_hop;
+    if (apply_hop) *apply_hop = b->p_hop;
+    return 0;
 }

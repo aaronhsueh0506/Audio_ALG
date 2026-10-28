@@ -25,15 +25,17 @@
  │══ 每個 hop（mic[hop]、ref[hop]；hop = grid.hop_size）════════════════════
  │ aec_process_context(aec,mic,ref) ►│            （void；線性 AEC + AEC 自己的 RES 增益）
  │ aec_get_res_context(aec,&ctx) ◄──│            ctx{error_spec,near_spec,far_spec,r2,comfort_noise,res_gain,...}（void）
+ │ aec_get_output_base(aec,&b) ◄────│            b.base_spec = 渲染基底 B（E；守衛觸發的 hop 為 E+echo）
+ │ aec_post_reset_serial(aec) 變了？  → ac_istft_reset(istft); rng = AEC_CNG_SEED   （在 CNG 抽樣與 push 之前；降噪器不動）
  │ g_res = ctx.res_gain               （ctx.error_spec 或 res_gain 為 NULL = 該 hop 被拒；關 RES 時用 unity 向量）
  │ sk_scale_f32(extra,ctx.r2,PSD_SCALE_INV,n)   （use_r2 且 ctx.usable_linear 時：回聲功率摺進 noise floor）
- │ anr_process_gain(nr,ctx.error_spec,extra,NULL) ──────►│ 0 / -1；anr_get_gain(nr,NULL) → G_nr（NULL = 被拒）
- │ sk_min_f32(total,G_nr,g_res,n); sk_capply_gain_f32(spec,ctx.error_spec,total,n)
+ │ anr_process_gain(nr,b.base_spec,extra,NULL) ─────────►│ 0 / -1；anr_get_gain(nr,NULL) → G_nr（NULL = 被拒）
+ │ sk_min_f32(total,G_nr,g_res,n); sk_capply_gain_f32(spec,b.base_spec,total,n)
  │ aec_cng_fill(&rng,spec,ctx.comfort_noise,g_res,G_nr,CNG_NR_GAIN_FLOOR,n)    （CNG 開、有 RES 增益時）
  │ ac_istft_push(istft,spec,out) ────────────────────────────────────────►│ 寫出 hop 個樣本
  │ skn_all_finite_f32(out,hop)        （選用；板端 adapter 與 §2 範例做，main.c 不做）
  │══ 任一步被拒（或你的輸出檢查失敗）══════════════════════════════════════════
- │ aec_reset(aec); anr_reset(nr); ac_istft_reset(istft); rng = CNG_RNG_SEED     （四件一起做）
+ │ aec_reset(aec); anr_reset(nr); ac_istft_reset(istft); rng = AEC_CNG_SEED     （四件一起做）
  │══ 強度（兩個 hop 之間呼叫，非 thread-safe）═══════════════════════════════
  │ aec_set_level(aec,level,ramp_ms) ►│          anr_set_level(nr,level) ──►│
  │══ 結束 ═══════════════════════════════════════════════════════════════
@@ -143,13 +145,14 @@ mono 的 RES 是明確的例外：它在 `Aec` 的呼叫裡（`aec_process_conte
 
 每個 hop 的串接（`main.c` 的 `mono_form()` 與 `mono_nr_gain()`；兩支執行檔共用）：
 
+0. `aec_post_reset_serial(aec)` 與已處理的值不同（AEC 在這個 hop 內做了硬重置）時，在第一次 CNG 抽樣與 `ac_istft_push()` 之前 `ac_istft_reset(istft)` 並 `rng = AEC_CNG_SEED`；不要因此重置 AEC，降噪器也不動。
 1. `res = ctx.res_gain`（不要 RES 時用全 1 的 unity 向量；`ctx.error_spec` 為 NULL 表示沒有 context、`res_gain` 為 NULL 表示 lane 沒有 gain，都視為拒絕）。
-2. NR 增益：`use_r2` 開著、`ctx.r2` 非 NULL 且 `ctx.usable_linear` 時，先 `sk_scale_f32(extra_noise, ctx.r2, PSD_SCALE_INV, n_freqs)`；再 `anr_process_gain(nr, ctx.error_spec, extra, NULL)`（非 0 = 降噪器拒絕該 hop）與 `anr_get_gain(nr, NULL)`。沒有降噪器時 `nr` 用 unity 向量。
-3. `sk_min_f32(total, nr, res, n_freqs)`，再 `sk_capply_gain_f32(spec, ctx.error_spec, total, n_freqs)`。
+2. NR 增益：`use_r2` 開著、`ctx.r2` 非 NULL 且 `ctx.usable_linear` 時，先 `sk_scale_f32(extra_noise, ctx.r2, PSD_SCALE_INV, n_freqs)`；再 `anr_process_gain(nr, base.base_spec, extra, NULL)`（`base` 是 `aec_get_output_base()` 交出的渲染基底 B，與要套增益的是同一張頻譜）（非 0 = 降噪器拒絕該 hop）與 `anr_get_gain(nr, NULL)`。沒有降噪器時 `nr` 用 unity 向量。
+3. `sk_min_f32(total, nr, res, n_freqs)`，再 `sk_capply_gain_f32(spec, base.base_spec, total, n_freqs)`。`ctx.error_spec`／`ctx.formed_hop` 是分析 seam（永不被輸出守衛改動），不在這裡渲染。
 4. CNG 開著（`aec_cfg.enable_cng` 且沒有 `--no-cng`）、有 RES gain、且 `ctx.comfort_noise` 非 NULL 時 `aec_cng_fill(&rng, spec, ctx.comfort_noise, res, nr, CNG_NR_GAIN_FLOOR, n_freqs)`。
 5. `ac_istft_push(istft, spec, out)` 產生這個 hop 的時域輸出。
 
-`CNG_NR_GAIN_FLOOR`（0.31622777f，即 −10 dB）、`CNG_RNG_SEED`（0x9e3779b9u）與 `PSD_SCALE_INV`（1/32768²，AEC 的功率在 int16² 尺度、降噪器在音訊尺度）是範例檔頭自己的 `#define`，不是函式庫常數。
+`CNG_NR_GAIN_FLOOR`（0.31622777f，即 −10 dB）與 `PSD_SCALE_INV`（1/32768²，AEC 的功率在 int16² 尺度、降噪器在音訊尺度）是範例檔頭自己的 `#define`，不是函式庫常數；comfort noise 的種子是函式庫的 `AEC_CNG_SEED`（42）。
 
 ### 1.2 `--aec-only`
 
@@ -225,7 +228,7 @@ libaudio_common.a
 
 /* Comfort noise follows the denoiser gain of its bin but never below this amplitude (-10 dB). */
 #define CNG_NR_GAIN_FLOOR 0.31622777f
-#define CNG_RNG_SEED 0x9e3779b9u                           /* start state of aec_cng_fill()'s generator */
+/* aec_cng_fill()'s generator starts from the library's AEC_CNG_SEED (42) and restarts from it when aec_post_reset_serial() moves */
 #define PSD_SCALE_INV (1.0f / (32768.0f * 32768.0f))       /* AEC powers are int16^2, the denoiser's audio scale */
 
 int main(void) {
@@ -266,7 +269,8 @@ int main(void) {
     float* total = (float*)cur;       cur += vec;
     float* extra_noise = (float*)cur; cur += vec;
     Complex* spec = (Complex*)cur;
-    uint32_t rng = CNG_RNG_SEED;                                      /* comfort-noise generator */
+    uint32_t rng = AEC_CNG_SEED;                                      /* comfort-noise generator */
+    uint32_t handled = aec_post_reset_serial(aec);                    /* hard post-chain resets already followed */
 
     float mic[512], ref[512], out[512];
     for (int frame = 0; frame < 100; frame++) {
@@ -275,32 +279,39 @@ int main(void) {
             ref[i] = 0.02f * (float)((i % 37) - 18);
         }
         AecResContext c;
+        AecOutputBase b = { sizeof(b) };                      /* b.base_spec: the rendering base B */
         const float* gnr = NULL;
         aec_process_context(aec, mic, ref);                   /* linear AEC, no time-domain emit */
         aec_get_res_context(aec, &c);                         /* E, R2, comfort noise, G_res (c.res_gain) */
-        if (c.error_spec && c.res_gain) {
+        if (c.error_spec && c.res_gain && aec_get_output_base(aec, &b) == 0) {
+            if (aec_post_reset_serial(aec) != handled) {      /* hard reset inside this hop: before the draw and the push */
+                handled = aec_post_reset_serial(aec);
+                ac_istft_reset(istft);
+                rng = AEC_CNG_SEED;
+            }
             const float* extra = NULL;
             if (c.r2 && c.usable_linear) {                    /* echo powers into the noise floor */
                 sk_scale_f32(extra_noise, c.r2, PSD_SCALE_INV, n);
                 extra = extra_noise;
             }
-            if (anr_process_gain(nr, c.error_spec, extra, NULL) == 0)
+            if (anr_process_gain(nr, b.base_spec, extra, NULL) == 0)
                 gnr = anr_get_gain(nr, NULL);                 /* G_nr, owned by the denoiser */
         }
         if (!gnr) {
             aec_reset(aec);                                   /* a refused hop: reset every stage */
             anr_reset(nr);
             ac_istft_reset(istft);
-            rng = CNG_RNG_SEED;
+            rng = AEC_CNG_SEED;
+            handled = aec_post_reset_serial(aec);
             continue;
         }
         sk_min_f32(total, gnr, c.res_gain, n);                /* a < b ? a : b, not fminf */
-        sk_capply_gain_f32(spec, c.error_spec, total, n);
+        sk_capply_gain_f32(spec, b.base_spec, total, n);
         if (aec_cfg.enable_cng && c.comfort_noise)            /* comfort noise on the bins RES cut */
             aec_cng_fill(&rng, spec, c.comfort_noise, c.res_gain, gnr, CNG_NR_GAIN_FLOOR, n);
         (void)ac_istft_push(istft, spec, out);
         if (!skn_all_finite_f32(out, (size_t)grid.hop_size)) {
-            aec_reset(aec); anr_reset(nr); ac_istft_reset(istft); rng = CNG_RNG_SEED;
+            aec_reset(aec); anr_reset(nr); ac_istft_reset(istft); rng = AEC_CNG_SEED; handled = aec_post_reset_serial(aec);
             continue;
         }
         /* consume out: grid.hop_size floats */

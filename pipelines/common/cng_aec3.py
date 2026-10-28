@@ -1,30 +1,32 @@
-"""AEC3 comfort-noise generator, ported bit-for-bit from the C pipelines.
+"""AEC3 comfort-noise generator, the stateful twin of the C ``aec_cng_fill`` helper.
 
-The C gain chain of the mono and the 4-channel example programs fills the
-residual-suppressed bins through
-``aec_cng_fill`` (``lib/aec/c_impl/include/aec_res.h``) with comfort noise drawn
-from one multiplicative-congruential step per bin whose top five bits index
-``AECB_SQRT2_SIN_LUT`` (``lib/aec/c_impl/include/aec_balanced_config.h``), the
-imaginary part reading a quarter turn (+8 of 32) ahead of the real one.  This
-module reproduces that generator exactly so a Python reference can be compared
-with the C output with comfort noise ON.
+The C gain chains of the example programs fill the residual-suppressed bins through
+``aec_cng_fill`` (``lib/aec/c_impl/include/aec_res.h``) with comfort noise drawn from one
+multiplicative-congruential step per bin whose top five bits index ``AECB_SQRT2_SIN_LUT``
+(``lib/aec/c_impl/include/aec_balanced_config.h``), the imaginary part reading a quarter turn
+(+8 of 32) ahead of the real one.  The numeric core (square roots, product order, draw schedule)
+is the AEC library's own Python module ``modules/cng.py`` -- the one the in-chain comfort noise of
+``AEC.process()`` uses -- so a Python reference that renders the context seam itself reproduces the
+C output bit for bit, with comfort noise on.
 
-The generator is advanced only when a caller adds noise to a frame; a stage
-that emits nothing on a hop must not draw, so the draw count stays paired with
-the emitted-frame count on both sides.
+The generator is advanced only when a caller adds noise to a frame; a stage that emits nothing on
+a hop must not draw, so the draw count stays paired with the emitted-frame count on both sides.
+After a hard post-chain reset of the AEC (``post_reset_serial`` of the context changed) the
+consumer calls :meth:`Aec3ComfortNoise.reset` before the first draw of that hop.
 """
 
 from __future__ import annotations
 
 import numpy as np
 
-#: The comfort-noise seed of the C programs (CNG_RNG_SEED in mono_aec_nr_res/main.c,
-#: MCAB_SAMPLE_CNG_RNG_SEED in 4ch_aec_bf_nr_res/mcab_sample_post.h).
-SEED = 0x9E3779B9
+from lib.aec.python.modules.cng import AEC_CNG_SEED, cng_fill
 
-#: The 32 float32 literals of ``AECB_SQRT2_SIN_LUT``: sqrt(2) * sin(2*pi*i/32).
-#: Copied as literals (index 16 is 1.73191212e-16, not 0) so the table is the
-#: same bits the C reads.
+#: The comfort-noise seed of the AEC library and of every consumer: after construction and after every
+#: hard post-chain reset (``AEC_CNG_SEED`` in ``lib/aec/c_impl/include/aec_post.h``).
+SEED = AEC_CNG_SEED
+
+#: The 32 float32 literals of ``AECB_SQRT2_SIN_LUT``: sqrt(2) * sin(2*pi*i/32).  Copied as literals
+#: (index 16 is 1.73191212e-16, not 0) so the table is the same bits the C reads.
 LUT = np.array(
     [0.0, 0.27589938, 0.541196108, 0.785694957, 1.0, 1.17587554,
      1.30656302, 1.3870399, 1.41421354, 1.3870399, 1.30656302, 1.17587554,
@@ -87,16 +89,11 @@ class Aec3ComfortNoise:
         self.state = int(states[-1])
         return (states >> np.uint64(26)).astype(np.uint32)
 
-    def add(self, spec: np.ndarray, amplitude: np.ndarray) -> None:
-        """Add comfort noise to ``spec`` (complex64, in place) on bins 1..n-2.
+    def fill(self, spec: np.ndarray, comfort_noise, g_res, g_nr=None, nr_floor: float = 0.0) -> None:
+        """Add comfort noise to ``spec`` (complex64, in place) on bins 1..n-2: ``aec_cng_fill``.
 
-        ``amplitude[k]`` is the per-bin amplitude already folded from the CNG
-        PSD, the residual gain and the NR factor, exactly as the C computes
-        ``a`` before the LUT lookup.  Bins 0 and n-1 are never touched.
+        ``comfort_noise`` is the context PSD (int16^2), ``g_res`` the RES gain (the amplitude is
+        ``sqrt(1 - g_res^2)``); ``g_nr`` an optional denoiser gain that scales it by
+        ``max(g_nr, nr_floor)``.  Bins 0 and n-1 are never touched and draw nothing.
         """
-        n = spec.shape[0]
-        ix = self.draw(n - 2)
-        re = LUT[ix]
-        im = LUT[(ix + np.uint32(8)) & np.uint32(31)]
-        a = amplitude[1:n - 1].astype(np.float32, copy=False)
-        spec[1:n - 1] += (a * re).astype(np.float32) + 1j * (a * im).astype(np.float32)
+        self.state = cng_fill(self.state, spec, comfort_noise, g_res, g_nr, nr_floor)

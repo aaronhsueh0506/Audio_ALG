@@ -2,10 +2,21 @@
  * (lib/aec) for the linear stage and its own RES gain, AnrDenoiser (lib/nr) and AcIstft (audiolib)
  * initialised here. Per hop:
  *     aec_process_context(aec, mic, ref);
- *     aec_get_res_context(aec, &ctx);                  // E, R2, CN and G_res (ctx.res_gain)
- *     G_nr = anr_process_gain(nr, E, R2 / 32768^2) + anr_get_gain(nr);
- *     P = E * min(G_nr, G_res) + comfort noise;        // mono_form()
+ *     follow_post_reset();                             // new aec_post_reset_serial(): clear the OLA tail, reseed the CNG
+ *     aec_get_res_context(aec, &ctx);                  // R2, CN and G_res (ctx.res_gain)
+ *     aec_get_output_base(aec, &base);                 // B: the rendering base (E, or E + echo on a guard hop)
+ *     G_nr = anr_process_gain(nr, B, R2 / 32768^2) + anr_get_gain(nr);
+ *     P = B * min(G_nr, G_res) + comfort noise;        // mono_form()
  *     ac_istft_push(istft, P, out);
+ * The AEC context carries two things that are not the same signal. E (ctx.error_spec, ctx.formed_hop)
+ * is the analysis seam: the selected linear residual, never altered by the output guard. The rendering
+ * base B is what aec_process() itself would multiply by its gain: E, or the capture spectrum E + echo on
+ * a hop where the linear estimate is unusable and E is louder than the capture. Both the denoiser's
+ * estimator and its gain read B and the gain is applied to B, so the denoiser judges the very spectrum it
+ * filters; B is E bit for bit on every hop the guard leaves alone. A hard post-chain reset of the AEC
+ * moves aec_post_reset_serial(); the denoiser keeps running through it (the library does not touch NR
+ * state and neither does this program). With --no-nr the chain is the AEC's own full output: it equals
+ * aec_process() with enable_res set, bit for bit (the synthesis uses the library's window table).
  * A refused call resets every stage together. The stages are carved in the order AEC, denoiser,
  * synthesis, gain/spectrum buffers with no malloc after the pool allocation. One source, two
  * binaries:
@@ -46,8 +57,6 @@
 /* Comfort noise follows the denoiser gain of its bin but never below this amplitude (-10 dB),
  * so the residual echo it masks does not surface. */
 #define CNG_NR_GAIN_FLOOR 0.31622777f
-/* Start state of the comfort-noise generator (aec_cng_fill). */
-#define CNG_RNG_SEED 0x9e3779b9u
 /* The AEC's residual-echo powers are on the int16^2 scale, the denoiser's on the audio scale;
  * the reciprocal is a power of two, so the multiply is exact. */
 #define PSD_SCALE_INV (1.0f / (32768.0f * 32768.0f))
@@ -108,6 +117,11 @@ static int derive_lane(int sample_rate, int fft_size, AecLevel level, AecSignalG
     return 0;
 }
 
+/* The synthesis borrows the AEC's own window table (aec_synthesis_window()), which exists once the AEC is
+ * initialised, after the pool is sized. A borrowed table carves nothing, so any non-NULL pointer sizes the
+ * synthesis the same; this one stands in until rig_build() installs the AEC's. */
+static const float k_sizing_window[1] = {0.0f};
+
 /* What runs after the AEC, and the pool it needs. */
 typedef struct PostPlan {
     int with_res, with_nr, use_r2, enable_cng;
@@ -129,7 +143,8 @@ typedef struct Rig {
     AcIstft* istft;
     float *unity, *total_gain, *extra_noise;
     Complex* spec;
-    uint32_t rng;
+    uint32_t rng;             /* comfort-noise generator state, AEC_CNG_SEED after every hard post-chain reset */
+    uint32_t reset_serial;    /* the aec_post_reset_serial() value this rig has handled */
     const float* last_nr;     /* the NR gain of the last formed hop (unity without NR) */
 } Rig;
 
@@ -157,6 +172,7 @@ static int post_plan(PostPlan* q, int sample_rate, const AecSignalGrid* grid, co
         if (q->nr_bytes == 0) return -1;
     }
     ac_stft_config_default(&q->synth_cfg, grid->fft_size);
+    q->synth_cfg.window = k_sizing_window;
     q->synth_bytes = ac_istft_get_mem_size(&q->synth_cfg);
     /* unity, total gain, NR prior, output spectrum */
     q->buf_bytes = 3 * ALIGN16((size_t)q->n_freqs * sizeof(float)) +
@@ -182,7 +198,8 @@ static int rig_build(Rig* r, const AecConfig* aec_cfg, const PostPlan* q) {
     size_t aec_bytes = aec_get_mem_size(aec_cfg);
     size_t vec;
     uint8_t* cur;
-    int k;
+    int k, win_n = 0;
+    AcStftConfig synth;
     memset(r, 0, sizeof(*r));
 #if AEC_NR_POOL_SPLIT
     if (aec_bytes == 0 || posix_memalign(&r->pool, 16, aec_bytes) != 0) { r->pool = NULL; return -1; }
@@ -212,7 +229,13 @@ static int rig_build(Rig* r, const AecConfig* aec_cfg, const PostPlan* q) {
         if (!r->nr) { rig_free(r); return -1; }
         cur += ALIGN16(q->nr_bytes);
     }
-    r->istft = ac_istft_init(cur, q->synth_bytes, &q->synth_cfg);
+    /* The AEC's own synthesis window table: with it the chain reproduces aec_process() to the bit. */
+    synth = q->synth_cfg;
+    if (aec_synthesis_window(r->aec, &synth.window, &win_n) != 0 || win_n != synth.fft_size) {
+        rig_free(r);
+        return -1;
+    }
+    r->istft = ac_istft_init(cur, q->synth_bytes, &synth);
     if (!r->istft) { rig_free(r); return -1; }
     cur += ALIGN16(q->synth_bytes);
     vec = ALIGN16((size_t)q->n_freqs * sizeof(float));
@@ -221,7 +244,8 @@ static int rig_build(Rig* r, const AecConfig* aec_cfg, const PostPlan* q) {
     r->extra_noise = (float*)cur; cur += vec;
     r->spec = (Complex*)cur;
     for (k = 0; k < q->n_freqs; ++k) r->unity[k] = 1.0f;
-    r->rng = CNG_RNG_SEED;
+    r->rng = AEC_CNG_SEED;
+    r->reset_serial = aec_post_reset_serial(r->aec);
     return 0;
 }
 
@@ -230,32 +254,48 @@ static void rig_reset(Rig* r) {
     aec_reset(r->aec);
     if (r->nr) anr_reset(r->nr);
     if (r->istft) ac_istft_reset(r->istft);
-    r->rng = CNG_RNG_SEED;
+    r->rng = AEC_CNG_SEED;
+    r->reset_serial = aec_post_reset_serial(r->aec);
     r->last_nr = NULL;
 }
 
-/* The denoiser gain of this hop. With use_r2 and a usable linear estimate the residual-echo
- * powers fold into its noise floor; otherwise plain noise reduction. NULL for a refused hop. */
-static const float* mono_nr_gain(Rig* r, const AecResContext* c) {
+/* The AEC's hard post-chain reset event (aec.h, aec_post_reset_serial): the reset happened inside this
+ * hop's aec_process_context(), before its synthesis. When the serial moved, the synthesis drops the
+ * overlap-add tail of the previous filter and the comfort noise restarts from AEC_CNG_SEED, before the
+ * first draw and before the ac_istft_push of this hop. Nothing else follows: the AEC is not reset in
+ * response and the denoiser keeps its state (following the event there is application policy; this
+ * program keeps the denoiser running). */
+static void follow_post_reset(Rig* r) {
+    uint32_t serial = aec_post_reset_serial(r->aec);
+    if (serial == r->reset_serial) return;
+    r->reset_serial = serial;
+    ac_istft_reset(r->istft);
+    r->rng = AEC_CNG_SEED;
+}
+
+/* The denoiser gain of this hop, estimated on the rendering base (the spectrum it will filter). With
+ * use_r2 and a usable linear estimate the residual-echo powers fold into its noise floor; otherwise
+ * plain noise reduction. NULL for a refused hop. */
+static const float* mono_nr_gain(Rig* r, const AecResContext* c, const Complex* base) {
     const float* extra = NULL;
     if (r->plan.use_r2 && c->r2 && c->usable_linear) {
         sk_scale_f32(r->extra_noise, c->r2, PSD_SCALE_INV, r->plan.n_freqs);
         extra = r->extra_noise;
     }
-    if (anr_process_gain(r->nr, c->error_spec, extra, NULL) != 0) return NULL;
+    if (anr_process_gain(r->nr, base, extra, NULL) != 0) return NULL;
     return anr_get_gain(r->nr, NULL);
 }
 
-/* P = E * min(G_nr, G_res) plus comfort noise on the bins the RES cut; an absent gain is the
- * unity vector. NULL when a stage refuses the hop. */
-static const Complex* mono_form(Rig* r, const AecResContext* c) {
+/* P = B * min(G_nr, G_res) plus comfort noise on the bins the RES cut, B the rendering base; an
+ * absent gain is the unity vector. NULL when a stage refuses the hop. */
+static const Complex* mono_form(Rig* r, const AecResContext* c, const Complex* base) {
     const PostPlan* q = &r->plan;
     const float* res = q->with_res ? c->res_gain : r->unity;
     const float* nr = r->unity;
     if (!res) return NULL;
-    if (r->nr && !(nr = mono_nr_gain(r, c))) return NULL;
+    if (r->nr && !(nr = mono_nr_gain(r, c, base))) return NULL;
     sk_min_f32(r->total_gain, nr, res, q->n_freqs);   /* NaN in the second operand reaches the finite gate; in the first it is replaced */
-    sk_capply_gain_f32(r->spec, c->error_spec, r->total_gain, q->n_freqs);
+    sk_capply_gain_f32(r->spec, base, r->total_gain, q->n_freqs);
     if (q->enable_cng && q->with_res && c->comfort_noise)
         aec_cng_fill(&r->rng, r->spec, c->comfort_noise, res, nr, CNG_NR_GAIN_FLOOR, q->n_freqs);
     r->last_nr = nr;
@@ -348,11 +388,12 @@ static uint32_t timing_now_us(void) {
 }
 
 /* One hop. --aec-only copies the AEC's own time-domain hop (ctx.linear_hop); otherwise the post
- * stages run over the AEC's frame and the synthesis is ac_istft_push(). The clock is read only
- * when `timed`. Returns 0, or -1 after a refused hop (the caller resets). */
+ * stages run over the AEC's rendering base and the synthesis is ac_istft_push(). The clock is read
+ * only when `timed`. Returns 0, or -1 after a refused hop (the caller resets). */
 static int process_hop(Rig* r, const float* mic, const float* ref, float* out, int timed,
                        uint32_t* chain_us, uint32_t* synth_us) {
     AecResContext ctx;
+    AecOutputBase ob;
     const Complex* spec;
     uint32_t t0, t1;
     *chain_us = 0u;
@@ -364,8 +405,12 @@ static int process_hop(Rig* r, const float* mic, const float* ref, float* out, i
         return 0;
     }
     if (!ctx.error_spec) return -1;
+    memset(&ob, 0, sizeof(ob));
+    ob.struct_size = sizeof(ob);
+    if (aec_get_output_base(r->aec, &ob) != 0) return -1;
+    follow_post_reset(r);
     t0 = timed ? timing_now_us() : 0u;
-    spec = mono_form(r, &ctx);
+    spec = mono_form(r, &ctx, ob.base_spec);
     t1 = timed ? timing_now_us() : 0u;
     *chain_us = t1 - t0;
     if (!spec) return -1;
@@ -606,9 +651,11 @@ int main(int argc, char* argv[]) {
     }
 
     /* Optional per-frame context dump (DUMP_CTX=<path>): header [n_freqs, hop]; then per
-     * frame error_spec(2*nf) res_gain(nf) r2(nf) comfort_noise(nf) far_power(1) g_nr(nf)
-     * out_hop(hop), all float32. res_gain is the lane's own gain. g_nr is the NR gain, the
-     * unity vector without a denoiser. Written only for hops whose freq seam was available. */
+     * frame base(2*nf) res_gain(nf) r2(nf) comfort_noise(nf) far_power(1) g_nr(nf)
+     * out_hop(hop), all float32. base is the rendering base (aec_get_output_base: the AEC's error
+     * spectrum, or error + echo on a hop where the output guard fired). res_gain is the lane's own
+     * gain. g_nr is the NR gain, the unity vector without a denoiser. Written only for hops whose
+     * freq seam was available. */
     FILE* dctx = NULL;
     const char* dpath = getenv("DUMP_CTX");
     if (dpath && !aec_only) {
@@ -638,10 +685,13 @@ int main(int argc, char* argv[]) {
 
         if (dctx) {
             AecResContext ctx;
+            AecOutputBase ob;
             aec_get_res_context(rig.aec, &ctx);
+            memset(&ob, 0, sizeof(ob));
+            ob.struct_size = sizeof(ob);
             const float* g_nr = rig.last_nr;
-            if (ctx.error_spec && ctx.res_gain && g_nr) {
-                fwrite(ctx.error_spec, sizeof(Complex), n_freqs, dctx);
+            if (aec_get_output_base(rig.aec, &ob) == 0 && ctx.error_spec && ctx.res_gain && g_nr) {
+                fwrite(ob.base_spec, sizeof(Complex), n_freqs, dctx);
                 fwrite(ctx.res_gain, sizeof(float), n_freqs, dctx);
                 fwrite(ctx.r2, sizeof(float), n_freqs, dctx);
                 fwrite(ctx.comfort_noise, sizeof(float), n_freqs, dctx);

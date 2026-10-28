@@ -55,7 +55,7 @@ th{background:#eef3ee}
 <tr><td><code>aec_set_level(aec, level, ramp_ms)</code></td><td><code>ramp_ms</code> ∈ [0, 60000];0 = 下一 hop 套用;&gt; 0 以 dB 線性走過去</td><td>0 或 −1(NULL、enum 外、<code>ramp_ms</code> 非有限／超出範圍;−1 時什麼都不寫);不是重啟,濾波器與 delay 鎖定繼續</td></tr>
 <tr><td><code>anr_set_level(nr, level)</code></td><td>四個 <code>AnrLevel</code></td><td>0 或 −1;噪聲底與增益平滑歷史保留。在 level 之上改過欄位的實例,會被蓋回 level 值;<code>L</code> 或 <code>num_init_frames</code> 與實例不同則拒絕</td></tr>
 <tr><td><code>anr_reconfigure(nr, &amp;target)</code></td><td>grid、<code>L</code>、<code>num_init_frames</code> 必須與實例相同,且通過 <code>anr_validate_config()</code></td><td>0 或 −1(什麼都不寫);要細調 level 以外的欄位時自己組完整 target</td></tr>
-<tr><td><code>aec_reset()</code>／<code>anr_reset()</code>／<code>ac_istft_reset()</code> + <code>rng = CNG_RNG_SEED</code></td><td>—</td><td>串流邊界或 hop 被拒時<b>一起</b>呼叫;不重驗 alignment／size</td></tr>
+<tr><td><code>aec_reset()</code>／<code>anr_reset()</code>／<code>ac_istft_reset()</code> + <code>rng = AEC_CNG_SEED</code></td><td>—</td><td>串流邊界或 hop 被拒時<b>一起</b>呼叫;不重驗 alignment／size</td></tr>
 </table>
 <p>強度 setter 的 ramp 語意與 A/B 量測注意事項見 <a href="pipeline_mono_detail.html">pipeline_mono_detail</a>。</p>
 
@@ -63,7 +63,7 @@ th{background:#eef3ee}
 <table>
 <tr><th>開關</th><th>範例 CLI</th><th>做法</th></tr>
 <tr><td>只要線性 AEC</td><td><code>--aec-only</code></td><td>只建 <code>Aec</code>,每 hop <code>aec_process_context()</code> 後複製 <code>ctx.linear_hop</code>;NR 與合成連 pool 都不佔</td></tr>
-<tr><td>關 NR</td><td><code>--no-nr</code></td><td>不建 <code>AnrDenoiser</code>,NR 增益讀 <code>unity</code> 全 1 向量(total 378,384 B,vs 423,728 B)</td></tr>
+<tr><td>關 NR</td><td><code>--no-nr</code></td><td>不建 <code>AnrDenoiser</code>,NR 增益讀 <code>unity</code> 全 1 向量(total 378,944 B,vs 424,288 B)</td></tr>
 <tr><td>關 RES</td><td><code>--no-res</code></td><td>RES 增益改讀 <code>unity</code>;不跑 CNG;不改 pool 大小(RES 在 <code>Aec</code> 內)</td></tr>
 <tr><td>關 CNG</td><td><code>--no-cng</code>;<code>AecConfig.enable_cng</code>(level 預設 1)</td><td>範例以 <code>aec_cfg.enable_cng &amp;&amp; !no_cng</code> 決定是否呼叫 <code>aec_cng_fill()</code>;下游已有 CNG 時請關,避免疊兩層</td></tr>
 <tr><td>R² 折進 NR 噪聲底</td><td><code>--legacy-amin</code>(= <code>use_r2=0</code>)</td><td><code>mono_nr_gain()</code> 的條件(<code>PostPlan.use_r2</code>):為 1 且 <code>ctx.r2</code> 非 NULL、<code>ctx.usable_linear</code> 時才折入;預設 1</td></tr>
@@ -75,7 +75,7 @@ th{background:#eef3ee}
 <tr><th>欄位</th><th>預設</th><th>範圍／備註</th></tr>
 <tr><td><code>enable_highpass</code></td><td>1</td><td>mic 路徑高通;上游已有高通可關</td></tr>
 <tr><td><code>highpass_cutoff_hz</code></td><td>80</td><td>開啟時須 &gt; 0 且 &lt; 0.45×sample_rate;調太高會切到語音</td></tr>
-<tr><td><code>enable_shadow</code></td><td>1</td><td>關閉 → <code>aec_get_mem_size()</code> 321,536 B(−42,880 B),但回音路徑突變後恢復變慢;只建議給記憶體極緊的部署</td></tr>
+<tr><td><code>enable_shadow</code></td><td>1</td><td>關閉 → <code>aec_get_mem_size()</code> 323,120 B(−42,880 B),但回音路徑突變後恢復變慢;只建議給記憶體極緊的部署</td></tr>
 <tr><td><code>delay_est_period_s</code></td><td>0(每 hop 分析)</td><td>[0, 3600] s;鎖定後降低 matched filter 分析頻率。非 0 可能改變所選的 lag(不只是慢),是 opt-in 的算量旋鈕</td></tr>
 <tr><td><code>enable_cng</code></td><td>1</td><td>見 1.3</td></tr>
 </table>
@@ -88,7 +88,7 @@ th{background:#eef3ee}
 <tr><td>編譯期常數(不在 config 內)</td><td><code>aec_balanced_config.h</code> 的 <code>AECB_*</code>、<code>SuppressionGainConfig</code>、<code>AecPostConfig</code>、<code>DA_*</code></td><td>runtime 完全改不了,也不該提供接口</td></tr>
 <tr><td><code>AnrConfig</code> 其餘 33 欄(共 41 欄:外部為 <code>sample_rate</code>、<code>fft_size</code> 與 level 改的四個;<code>frame_size</code>／<code>hop_size</code> 是衍生值)</td><td><code>anr_types.h</code></td><td><code>alpha_xi</code>、<code>alpha_s／d／p</code>、<code>L</code>、<code>delta_db</code>、<code>num_init_frames</code>、<code>scene_change_*</code>、<code>noise_gate_*</code>、<code>speech_protect_*</code>、<code>makeup_*</code> 等為時間常數或聯合調過的門檻,以 10 ms／16 ms 為基準 retime;<code>alpha_g</code> 在增益路徑上不被讀取(<code>alpha_attack</code>／<code>alpha_decay</code> 才有作用)</td></tr>
 <tr><td><code>AcStftConfig</code> 其餘欄位</td><td><code>audio_stft.h</code>;範例用 <code>ac_stft_config_default()</code></td><td><code>center=0</code>、<code>ola=AC_OLA_ACCUMULATE</code>、<code>spec_scale=ispec_scale=1.0f</code>、自帶 FFT 與 periodic sqrt-Hann 窗:與 AEC 的分析窗配對(50% overlap COLA),改了會破壞重建</td></tr>
-<tr><td>範例常數</td><td><code>mono_aec_nr_res/main.c</code> 檔頭的 <code>#define</code></td><td><code>CNG_NR_GAIN_FLOOR</code> = 0.31622777f(−10 dB)、<code>CNG_RNG_SEED</code> = 0x9e3779b9、<code>PSD_SCALE_INV</code> = 1/32768²(int16² → audio power);範例碼可整份複製改寫,不是 ABI</td></tr>
+<tr><td>範例常數</td><td><code>mono_aec_nr_res/main.c</code> 檔頭的 <code>#define</code></td><td><code>CNG_NR_GAIN_FLOOR</code> = 0.31622777f(−10 dB)、<code>PSD_SCALE_INV</code> = 1/32768²(int16² → audio power);comfort noise 種子是函式庫的 <code>AEC_CNG_SEED</code>(42);範例碼可整份複製改寫,不是 ABI</td></tr>
 <tr><td>建置旗標</td><td><code>pipelines/Makefile</code></td><td><code>-ffp-contract=off</code> 是必要的;<code>SIMD</code>、<code>NO_STDIO</code>、<code>PROFILE</code>、<code>WERROR</code>、<code>EXTRA_CFLAGS</code> 屬建置者</td></tr>
 </table>
 

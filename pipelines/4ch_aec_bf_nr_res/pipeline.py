@@ -14,7 +14,9 @@ The post-beam residual gain is a separate stage, owned by the caller::
     context = suppressor.process(post.context, post.aligned_render)   # res_gain set
 
 The remaining stages (NR gain, min, apply, comfort noise, synthesis) are the
-functions of pipelines/mono_aec_nr_res/pipeline.py over that context.
+functions of pipelines/mono_aec_nr_res/pipeline.py over that context: the
+gains are estimated on the analysis beam ``error_spec`` and applied to the
+rendering base ``output_base_spec`` (see ``_fuse_contexts``).
 
 The optional ``Beamformer`` object and ``EqualWeightBeamformer`` exist only for
 integration tests and offline fixtures.  Requiring the external stage to return
@@ -437,6 +439,7 @@ def _snapshot_context(context: AecResContext) -> AecResContext:
         res_gain=copied(context.res_gain),
         comfort_noise=copied(context.comfort_noise),
         r2=copied(context.r2),
+        output_base_spec=copied(context.output_base_spec),
     )
 
 
@@ -445,7 +448,7 @@ def _require_context_arrays(contexts: Sequence[AecResContext]) -> int:
         raise ValueError("exactly four contexts are required")
     n_freqs = -1
     for context in contexts:
-        for name in ("error_spec", "res_gain", "r2", "comfort_noise"):
+        for name in ("error_spec", "res_gain", "r2", "comfort_noise", "output_base_spec"):
             value = getattr(context, name)
             if value is None:
                 raise ValueError(f"AEC context is missing {name}")
@@ -467,6 +470,18 @@ def _fuse_contexts(
     This function fuses measurements only. ``res_gain`` is left None: the
     caller's one stateful ``PostBeamResidualSuppressor`` computes it afterward,
     and per-lane gains are intentionally ignored.
+
+    ``error_spec`` / ``near_spec`` / ``echo_spec`` are the ANALYSIS beam (what
+    the RES and NR estimators read).  ``output_base_spec`` is the RENDERING
+    base: the same weights over each lane's own rendering base (its output
+    guard, evaluated once per lane by the library), so the synthesis renders
+    ``output_base_spec * gain``.  When no contributing lane's guard fired it
+    is ``error_spec`` itself.  There is no second guard after the beam, and no
+    per-lane energy bound is claimed for the beam (complex weights mix the
+    lanes).  ``guard_active``: a contributing lane's guard fired.
+    ``post_reset_serial``: the four lanes' hard post-chain reset counters
+    summed modulo 2**32; it moves whenever any lane's moves, and the one
+    synthesizer of the fused output follows it (C: ``McabFrame``).
     """
 
     n_freqs = _require_context_arrays(contexts)
@@ -526,6 +541,9 @@ def _fuse_contexts(
     # genuinely nonzero coefficient cannot disappear through underflow.
     contributes = np.any((weights.real != 0.0) | (weights.imag != 0.0), axis=1)
     contributors = [c for c, active in zip(contexts, contributes) if active]
+    guard_active = any(bool(c.guard_active) for c in contributors)
+    output_base_spec = coherent("output_base_spec") if guard_active else error_spec
+    post_reset_serial = sum(int(c.post_reset_serial) for c in contexts) & 0xFFFFFFFF
     far_powers = np.asarray([c.far_power for c in contexts], dtype=np.float64)
     if not np.allclose(far_powers, far_powers[0], rtol=1e-6, atol=1e-9):
         raise ValueError("linear AEC lanes do not share one far-end power")
@@ -556,6 +574,9 @@ def _fuse_contexts(
         res_gain=None,
         comfort_noise=np.maximum(fused_comfort, 0.0).astype(np.float32),
         r2=np.maximum(fused_r2, 0.0).astype(np.float32),
+        output_base_spec=output_base_spec.astype(np.complex64),
+        guard_active=guard_active,
+        post_reset_serial=post_reset_serial,
     )
 
 

@@ -22,6 +22,7 @@
 #include "utility/simd_kernels.h"
 #include "wav_io.h"
 #include "conv_chain_mono.h"
+#include "guard_scene.h"
 #include "fft_wrapper.h"           /* test-side WOLA reference for the RES/NR bypass */
 #include "audio_window.h"
 
@@ -83,8 +84,12 @@ static float lcg_sample(void) {
  * --------------------------------------------------------------------------------------- */
 
 #define CNG_NR_GAIN_FLOOR 0.31622777f
-#define CNG_RNG_SEED 0x9e3779b9u
 #define PSD_SCALE_INV (1.0f / (32768.0f * 32768.0f))   /* int16^2 -> audio scale, exact */
+
+/* The synthesis borrows the AEC's own window table (aec_synthesis_window()), which exists once the AEC is
+ * initialised, after the pool is sized. A borrowed table carves nothing, so any non-NULL pointer sizes the
+ * synthesis the same; this one stands in until rig_carve_post() installs the AEC's. */
+static const float k_sizing_window[1] = {0.0f};
 
 typedef struct Plan {
     ConvMonoConfig opt;
@@ -132,6 +137,7 @@ static int plan_make(Plan* p, const ConvMonoConfig* o) {
         if (p->nr_bytes == 0) return -1;
     }
     ac_stft_config_default(&p->synth_cfg, p->grid.fft_size);
+    p->synth_cfg.window = k_sizing_window;
     p->synth_bytes = ac_istft_get_mem_size(&p->synth_cfg);
     if (p->synth_bytes == 0) return -1;
     p->buf_bytes = 3 * ALIGN16((size_t)p->grid.n_freqs * sizeof(float)) +
@@ -140,6 +146,12 @@ static int plan_make(Plan* p, const ConvMonoConfig* o) {
     p->total += ALIGN16(p->nr_bytes) + ALIGN16(p->synth_bytes) + p->buf_bytes;
     return 0;
 }
+
+/* The comfort-noise seed the examples used before the library's AEC_CNG_SEED; planted as a defect only. */
+#define RETIRED_CNG_SEED 0x9e3779b9u
+
+/* Deliberate defects the full-mode identity test plants in a copy of the hop to show it can fail. */
+enum { SAB_NO_OLA_CLEAR = 1, SAB_NO_RESEED = 2, SAB_ERROR_SPEC = 4, SAB_OLD_SEED = 8, SAB_RESET_NR = 16 };
 
 typedef struct Rig {
     Aec* aec;
@@ -150,6 +162,9 @@ typedef struct Rig {
     float *unity, *total_gain, *extra_noise;
     Complex* spec;
     uint32_t rng;
+    uint32_t serial;          /* the aec_post_reset_serial() value already handled */
+    long guard_hops, reset_hops;
+    int sabotage;             /* negative controls of the full-mode identity test (SAB_*), 0 in the chain */
     int hop;
     Aec* heap_aec;            /* heap construction only */
     void* heap_post_mem;
@@ -158,7 +173,8 @@ typedef struct Rig {
 /* The post stages carved from `cur` (at least the plan's post bytes). */
 static int rig_carve_post(Rig* r, uint8_t* cur, const Plan* p) {
     size_t vec = ALIGN16((size_t)p->grid.n_freqs * sizeof(float));
-    int k;
+    AcStftConfig synth;
+    int k, win_n = 0;
     r->with_post = 1;
     r->with_res = p->opt.enable_res;
     r->use_r2 = !p->opt.legacy_amin;
@@ -169,7 +185,9 @@ static int rig_carve_post(Rig* r, uint8_t* cur, const Plan* p) {
         if (!r->nr) return -1;
         cur += ALIGN16(p->nr_bytes);
     }
-    r->istft = ac_istft_init(cur, p->synth_bytes, &p->synth_cfg);
+    synth = p->synth_cfg;      /* the AEC's own synthesis window table, as main.c borrows it */
+    if (aec_synthesis_window(r->aec, &synth.window, &win_n) != 0 || win_n != synth.fft_size) return -1;
+    r->istft = ac_istft_init(cur, p->synth_bytes, &synth);
     if (!r->istft) return -1;
     cur += ALIGN16(p->synth_bytes);
     r->unity = (float*)cur;       cur += vec;
@@ -177,7 +195,8 @@ static int rig_carve_post(Rig* r, uint8_t* cur, const Plan* p) {
     r->extra_noise = (float*)cur; cur += vec;
     r->spec = (Complex*)cur;
     for (k = 0; k < r->n_freqs; ++k) r->unity[k] = 1.0f;
-    r->rng = CNG_RNG_SEED;
+    r->rng = AEC_CNG_SEED;
+    r->serial = aec_post_reset_serial(r->aec);
     return 0;
 }
 
@@ -235,8 +254,10 @@ static void rig_destroy_only(Rig* r) {
  * denoiser's or unity; P = E * min(G_nr, G_res) plus comfort noise on the bins the RES cut. */
 static int rig_hop(Rig* r, const float* mic, const float* ref, float* out) {
     AecResContext c;
+    AecOutputBase ob;
     const float* res;
     const float* nr;
+    uint32_t serial;
     aec_process_context(r->aec, mic, ref);
     aec_get_res_context(r->aec, &c);
     if (!r->with_post) {
@@ -244,6 +265,18 @@ static int rig_hop(Rig* r, const float* mic, const float* ref, float* out) {
         return 0;
     }
     if (!c.error_spec) return -1;
+    memset(&ob, 0, sizeof(ob));
+    ob.struct_size = sizeof(ob);
+    if (aec_get_output_base(r->aec, &ob) != 0) return -1;
+    if (ob.guard_active) ++r->guard_hops;
+    serial = aec_post_reset_serial(r->aec);
+    if (serial != r->serial) {      /* before the first CNG draw and the ac_istft_push of this hop */
+        r->serial = serial;
+        ++r->reset_hops;
+        if (!(r->sabotage & SAB_NO_OLA_CLEAR)) ac_istft_reset(r->istft);
+        if (!(r->sabotage & SAB_NO_RESEED)) r->rng = (r->sabotage & SAB_OLD_SEED) ? RETIRED_CNG_SEED : AEC_CNG_SEED;
+        if ((r->sabotage & SAB_RESET_NR) && r->nr) anr_reset(r->nr);
+    }
     res = r->with_res ? c.res_gain : r->unity;
     nr = r->unity;
     if (!res) return -1;
@@ -253,11 +286,11 @@ static int rig_hop(Rig* r, const float* mic, const float* ref, float* out) {
             sk_scale_f32(r->extra_noise, c.r2, PSD_SCALE_INV, r->n_freqs);
             extra = r->extra_noise;
         }
-        if (anr_process_gain(r->nr, c.error_spec, extra, NULL) != 0) return -1;
+        if (anr_process_gain(r->nr, ob.base_spec, extra, NULL) != 0) return -1;
         if (!(nr = anr_get_gain(r->nr, NULL))) return -1;
     }
     sk_min_f32(r->total_gain, nr, res, r->n_freqs);
-    sk_capply_gain_f32(r->spec, c.error_spec, r->total_gain, r->n_freqs);
+    sk_capply_gain_f32(r->spec, (r->sabotage & SAB_ERROR_SPEC) ? c.error_spec : ob.base_spec, r->total_gain, r->n_freqs);
     if (r->enable_cng && r->with_res && c.comfort_noise)
         aec_cng_fill(&r->rng, r->spec, c.comfort_noise, res, nr, CNG_NR_GAIN_FLOOR, r->n_freqs);
     (void)ac_istft_push(r->istft, r->spec, out);
@@ -268,7 +301,8 @@ static void rig_reset(Rig* r) {
     aec_reset(r->aec);
     if (r->nr) anr_reset(r->nr);
     if (r->istft) ac_istft_reset(r->istft);
-    r->rng = CNG_RNG_SEED;
+    r->rng = AEC_CNG_SEED;
+    r->serial = aec_post_reset_serial(r->aec);
 }
 
 static void* aligned_block(size_t bytes, int fill) {
@@ -620,7 +654,13 @@ static void test_nr_res_switches(void) {
             /* Reference: the seam spectrum the thru instance just applied gain 1.0 to,
              * resynthesised with the same window and overlap. */
             aec_get_res_context(thru.aec, &ctx);
-            fft_inverse(fft, ctx.error_spec, ibuf);
+            {   /* the spectrum the instance rendered: the AEC's rendering base */
+                AecOutputBase ob;
+                memset(&ob, 0, sizeof(ob));
+                ob.struct_size = sizeof(ob);
+                if (aec_get_output_base(thru.aec, &ob) != 0) { g_failures++; continue; }
+                fft_inverse(fft, ob.base_spec, ibuf);
+            }
             for (i = 0; i < frame; i++) ola[i] += ibuf[i] * win[i];
             if (h >= 4)
                 for (i = 0; i < hop; i++) {
@@ -1075,6 +1115,202 @@ static void test_aec_only_output(void) {
     }
 }
 
+
+/* ---- the full-mode identity ---------------------------------------------------------------
+ * With the denoiser off the chain is the AEC's own output: RES gain on the rendering base, comfort
+ * noise, synthesis. aec_process() on a second Aec in full mode (enable_res = 1) is the independent
+ * oracle: the rig of main.c, the hand-written chain and the oracle must agree bit for bit on streams
+ * that fire the output guard, move the hard-reset serial (a delay change restarting the filter, an
+ * aec_reset() the application issues), start with silence and never become usable. Deliberate
+ * defects (a missing OLA clear, a missing reseed, rendering from the analysis seam, the old seed)
+ * must each make the comparison fail. */
+
+
+typedef struct FullRun {
+    long hops, guard_hops, reset_hops;
+    long rig_diff_hops, conv_diff_hops, first_rig_diff;
+    int setup_ok;
+} FullRun;
+
+/* NR off, RES on, comfort noise as the scene says. `sabotage` is planted in the rig only. */
+static void run_full_identity(const GuardScene* s, int sabotage, FullRun* out) {
+    ConvMonoConfig o = grid_opts(s->sr, s->fft);
+    Plan p;
+    Rig r;
+    ConvMono* cm;
+    AecConfig oracle_cfg;
+    Aec* oracle = (Aec*)calloc(1, sizeof(Aec));
+    void* pool;
+    float *want, *got_rig, *got_cm;
+    int h, k, hop;
+    memset(out, 0, sizeof(*out));
+    out->first_rig_diff = -1;
+    o.enable_nr = 0;
+    o.enable_res = 1;
+    o.enable_cng = s->enable_cng;
+    if (!oracle || plan_make(&p, &o) != 0) { free(oracle); return; }
+    oracle_cfg = p.aec_cfg;                    /* the lane, with the library's own full output */
+    oracle_cfg.enable_res = 1;
+    oracle_cfg.return_res_context = 0;
+    oracle_cfg.enable_cng = p.enable_cng;
+    pool = aligned_block(p.total, 0xA5);
+    cm = conv_mono_create(&o);
+    if (!pool || !cm || aec_create(oracle, &oracle_cfg) != 0 || rig_init_pool(&r, pool, p.total, &p) != 0) {
+        conv_mono_destroy(cm);
+        free(pool);
+        free(oracle);
+        return;
+    }
+    r.sabotage = sabotage;
+    if (sabotage & SAB_OLD_SEED) r.rng = RETIRED_CNG_SEED;
+    hop = p.grid.hop_size;
+    want = (float*)malloc((size_t)hop * sizeof(float));
+    got_rig = (float*)malloc((size_t)hop * sizeof(float));
+    got_cm = (float*)malloc((size_t)hop * sizeof(float));
+    out->setup_ok = want && got_rig && got_cm;
+    for (h = 0; out->setup_ok && h < s->nh; ++h) {
+        const float* mic = s->mic + (size_t)h * hop;
+        const float* ref = s->far + (size_t)h * hop;
+        for (k = 0; k < 4; ++k)
+            if (s->reset_at[k] == h) {         /* the application restarts the AEC; every instance sees it */
+                aec_reset(oracle);
+                aec_reset(r.aec);
+                aec_reset(cm->aec);
+            }
+        aec_process(oracle, mic, ref, want);
+        if (rig_hop(&r, mic, ref, got_rig) != 0 || conv_mono_hop(cm, mic, ref, got_cm) != 0) {
+            out->setup_ok = 0;
+            break;
+        }
+        if (memcmp(want, got_rig, (size_t)hop * sizeof(float)) != 0) {
+            ++out->rig_diff_hops;
+            if (out->first_rig_diff < 0) out->first_rig_diff = h;
+        }
+        if (memcmp(want, got_cm, (size_t)hop * sizeof(float)) != 0) ++out->conv_diff_hops;
+        ++out->hops;
+    }
+    out->guard_hops = r.guard_hops;
+    out->reset_hops = r.reset_hops;
+    free(want); free(got_rig); free(got_cm);
+    rig_free(&r);
+    conv_mono_destroy(cm);
+    aec_destroy(oracle);
+    free(oracle);
+    free(pool);
+}
+
+static void test_full_mode_identity(void) {
+    static const struct { int sr, fft, seconds; } g[] = { {16000, 256, 14}, {16000, 512, 14}, {48000, 1024, 6} };
+    size_t gi;
+    for (gi = 0; gi < sizeof g / sizeof g[0]; ++gi) {
+        GuardScene sc[4];
+        const char* nm[4] = { "moving echo path with double talk", "moving echo path, comfort noise off",
+                              "silent head, no echo path (never usable)", "aec_reset events and a moving path" };
+        long guard = 0, resets = 0, bad_rig = 0, bad_cm = 0, hops = 0;
+        int i, built = 1;
+        built &= guard_scene_make(&sc[0], nm[0], g[gi].sr, g[gi].fft, g[gi].seconds, 0x2545F491u, 1, 1, 1, 0) == 0;
+        built &= guard_scene_make(&sc[1], nm[1], g[gi].sr, g[gi].fft, g[gi].seconds, 0x2545F491u, 1, 1, 1, 0) == 0;
+        sc[1].enable_cng = 0;
+        built &= guard_scene_make(&sc[2], nm[2], g[gi].sr, g[gi].fft, g[gi].seconds, 0x1234567u, 0, 0, 0, 30) == 0;
+        if (built) {
+            int n = sc[2].nh * sc[2].hop;
+            for (i = 0; i < n; ++i) sc[2].mic[i] += 0.03f * gs_rnd();
+        }
+        built &= guard_scene_make(&sc[3], nm[3], g[gi].sr, g[gi].fft, g[gi].seconds, 0x2545F491u, 1, 1, 1, 0) == 0;
+        if (built) { sc[3].reset_at[0] = sc[3].nh / 4; sc[3].reset_at[1] = sc[3].nh / 2; sc[3].reset_at[2] = 3 * sc[3].nh / 5; }
+        CHECK(built, fmt_msg("full mode @ %d Hz / %d: the four guard scenes build", g[gi].sr, g[gi].fft));
+        for (i = 0; built && i < 4; ++i) {
+            FullRun fr;
+            run_full_identity(&sc[i], 0, &fr);
+            CHECK(fr.setup_ok && fr.hops == sc[i].nh,
+                  fmt_msg("full mode @ %d Hz / %d, %s: all %d hops ran", g[gi].sr, g[gi].fft, nm[i], sc[i].nh));
+            CHECK(fr.rig_diff_hops == 0 && fr.conv_diff_hops == 0,
+                  fmt_msg("full mode @ %d Hz / %d, %s: main.c rig (%ld hops differ) and hand-written chain (%ld) equal aec_process(), "
+                          "NR off, bit for bit", g[gi].sr, g[gi].fft, nm[i], fr.rig_diff_hops, fr.conv_diff_hops));
+            guard += fr.guard_hops; resets += fr.reset_hops; hops += fr.hops;
+            bad_rig += fr.rig_diff_hops; bad_cm += fr.conv_diff_hops;
+        }
+        printf("  full mode @ %d Hz / %d: %ld hops, guard fired on %ld, hard-reset serial moved on %ld\n",
+               g[gi].sr, g[gi].fft, hops, guard, resets);
+        CHECK(guard > 0, fmt_msg("full mode @ %d Hz / %d: the streams fire the output guard", g[gi].sr, g[gi].fft));
+        CHECK(resets > 0, fmt_msg("full mode @ %d Hz / %d: the streams move the hard-reset serial", g[gi].sr, g[gi].fft));
+
+        /* Negative controls on the stream that has both events and comfort noise on. */
+        if (built) {
+            static const struct { int sab; const char* what; } ctl[] = {
+                { SAB_NO_OLA_CLEAR, "no OLA clear on the reset event" },
+                { SAB_NO_RESEED, "no comfort-noise reseed on the reset event" },
+                { SAB_ERROR_SPEC, "rendering from error_spec instead of the rendering base" },
+                { SAB_OLD_SEED, "the old comfort-noise seed" },
+            };
+            size_t c;
+            for (c = 0; c < sizeof ctl / sizeof ctl[0]; ++c) {
+                FullRun fr;
+                run_full_identity(&sc[3], ctl[c].sab, &fr);
+                CHECK(fr.setup_ok && fr.rig_diff_hops > 0,
+                      fmt_msg("full mode @ %d Hz / %d: a planted defect (%s) is detected (%ld hops differ)",
+                              g[gi].sr, g[gi].fft, ctl[c].what, fr.rig_diff_hops));
+            }
+        }
+        (void)bad_rig; (void)bad_cm;
+        for (i = 0; i < 4; ++i) guard_scene_free(&sc[i]);
+    }
+}
+
+
+/* The denoiser keeps running through the AEC's hard post-chain reset: the library does not touch NR state
+ * on that event and the example does not either (following it there is application policy, and this
+ * program's policy is to keep the estimator and its noise floor). Observable: the noise-floor
+ * initialisation flag stays set across every reset hop that happens after the denoiser has
+ * initialised. Returns the number of such hops; `cleared` counts those after which the flag dropped. */
+static long run_nr_policy(const GuardScene* s, int sabotage, long* cleared) {
+    ConvMonoConfig o = grid_opts(s->sr, s->fft);
+    Plan p;
+    Rig r;
+    void* pool;
+    float* out;
+    long events = 0;
+    int h;
+    *cleared = 0;
+    o.enable_cng = 1;
+    if (plan_make(&p, &o) != 0 || !(pool = aligned_block(p.total, 0xA5)) ||
+        rig_init_pool(&r, pool, p.total, &p) != 0)
+        return -1;
+    r.sabotage = sabotage;
+    out = (float*)malloc((size_t)p.grid.hop_size * sizeof(float));
+    for (h = 0; out && h < s->nh; ++h) {
+        AnrDebugStatus before, after;
+        long resets = r.reset_hops;
+        anr_debug_status(r.nr, &before);
+        (void)rig_hop(&r, s->mic + (size_t)h * p.grid.hop_size, s->far + (size_t)h * p.grid.hop_size, out);
+        if (r.reset_hops == resets || !before.initialized) continue;
+        anr_debug_status(r.nr, &after);
+        ++events;
+        if (!after.initialized) ++*cleared;
+    }
+    free(out);
+    rig_free(&r);
+    free(pool);
+    return events;
+}
+
+static void test_nr_keeps_running(void) {
+    GuardScene sc;
+    long cleared = 0, events;
+    if (guard_scene_make(&sc, "nr policy", 16000, 256, 14, 0x2545F491u, 1, 1, 1, 0) != 0) {
+        CHECK(0, "nr policy: the scene builds");
+        return;
+    }
+    events = run_nr_policy(&sc, 0, &cleared);
+    CHECK(events >= 1 && cleared == 0,
+          fmt_msg("nr policy: the denoiser keeps its state across hard post-chain resets "
+                  "(%ld reset hops after its initialisation, flag dropped on %ld)", events, cleared));
+    events = run_nr_policy(&sc, SAB_RESET_NR, &cleared);
+    CHECK(events >= 1 && cleared >= 1,
+          fmt_msg("nr policy: a planted NR reset on the event is detected (flag dropped on %ld of %ld)", cleared, events));
+    guard_scene_free(&sc);
+}
+
 /* ---- the example programs as black boxes ----------------------------------------------
  * aec_nr_pipeline and aec_nr_pipeline_static read a WAV pair and, with DUMP_CTX, write every
  * hop's output samples. The oracle reads the same WAV pair (so it sees the same quantised
@@ -1144,7 +1380,7 @@ static int black_box_case(const char* bin, const char* tmp, const BlackBoxCase* 
     }
     nf = hdr[0];
     hop = hdr[1];
-    /* error_spec(2 nf) res_gain(nf) r2(nf) comfort_noise(nf) far_power(1) g_nr(nf) out(hop) */
+    /* base(2 nf) res_gain(nf) r2(nf) comfort_noise(nf) far_power(1) g_nr(nf) out(hop) */
     rec_floats = (size_t)(6 * nf + 1 + hop);
     mic = (float*)malloc((size_t)hop * sizeof(float));
     ref = (float*)malloc((size_t)hop * sizeof(float));
@@ -1247,6 +1483,218 @@ static void test_examples_aec_only(const char* bin_dir, const char* tmp) {
             CHECK(black_box_aec_only(bin, tmp, cases[ci].sr, cases[ci].fft, cases[ci].args) == 1,
                   fmt_msg("black box: %s %s @ %d Hz equals the aec_process() oracle sample for sample",
                           programs[pi], cases[ci].args, cases[ci].sr));
+    }
+}
+
+
+/* --no-nr: the example programs' chain is the AEC's own full output. The scene fires the output guard
+ * and moves the hard-reset serial; the oracle is aec_process() in full mode on a second instance over
+ * the same quantised WAV pair, and the DUMP_CTX output hops (float, no WAV quantisation) must equal it
+ * bit for bit. The guard and reset counts come from the oracle's own public getters. 1 on equal with
+ * both events seen, 0 on a mismatch or when the scene did not exercise them, -1 on a setup failure. */
+static int black_box_full_mode(const char* bin, const char* tmp, const GuardScene* sc, const char* args,
+                               int cng, long* guard_hops, long* reset_hops) {
+    char mic_path[512], ref_path[512], out_path[512], dump_path[512], cmd[2048];
+    ConvMonoConfig o = grid_opts(sc->sr, sc->fft);
+    AecConfig cfg;
+    Plan p;
+    Aec* oracle = (Aec*)calloc(1, sizeof(Aec));
+    WavWriter *wm, *wr;
+    WavReader *rm, *rr;
+    FILE* fd;
+    int hdr[2], hop, nf, h, ok = 1, serial_seen;
+    float *mic, *ref, *want, *rec;
+    size_t rec_floats;
+    *guard_hops = *reset_hops = 0;
+    snprintf(mic_path, sizeof mic_path, "%s/bbf_mic.wav", tmp);
+    snprintf(ref_path, sizeof ref_path, "%s/bbf_ref.wav", tmp);
+    snprintf(out_path, sizeof out_path, "%s/bbf_out.wav", tmp);
+    snprintf(dump_path, sizeof dump_path, "%s/bbf_ctx.bin", tmp);
+    o.enable_nr = 0; o.enable_res = 1; o.enable_cng = cng;
+    if (!oracle || plan_make(&p, &o) != 0) { free(oracle); return -1; }
+    cfg = p.aec_cfg;
+    cfg.enable_res = 1;
+    cfg.return_res_context = 0;
+    cfg.enable_cng = p.enable_cng;
+    if (aec_create(oracle, &cfg) != 0) { free(oracle); return -1; }
+    hop = p.grid.hop_size;
+    wm = wav_open_write(mic_path, sc->sr, 1);
+    wr = wav_open_write(ref_path, sc->sr, 1);
+    if (!wm || !wr) { ok = -1; }
+    for (h = 0; ok == 1 && h < sc->nh; ++h) {
+        wav_write_float(wm, sc->mic + (size_t)h * hop, hop);
+        wav_write_float(wr, sc->far + (size_t)h * hop, hop);
+    }
+    if (wm) wav_close_write(wm);
+    if (wr) wav_close_write(wr);
+    if (ok != 1) { aec_destroy(oracle); free(oracle); return -1; }
+    remove(dump_path);
+    snprintf(cmd, sizeof cmd, "DUMP_CTX='%s' '%s' '%s' '%s' '%s' %s > '%s/bbf_stdout.txt' 2>&1",
+             dump_path, bin, mic_path, ref_path, out_path, args, tmp);
+    if (system(cmd) != 0) { aec_destroy(oracle); free(oracle); return -1; }
+    fd = fopen(dump_path, "rb");
+    rm = wav_open_read(mic_path);
+    rr = wav_open_read(ref_path);
+    if (!fd || !rm || !rr || fread(hdr, sizeof(int), 2, fd) != 2 || hdr[1] != hop) {
+        if (fd) fclose(fd);
+        if (rm) wav_close_read(rm);
+        if (rr) wav_close_read(rr);
+        aec_destroy(oracle); free(oracle);
+        return -1;
+    }
+    nf = hdr[0];
+    rec_floats = (size_t)(6 * nf + 1 + hop);
+    mic = (float*)malloc((size_t)hop * sizeof(float));
+    ref = (float*)malloc((size_t)hop * sizeof(float));
+    want = (float*)malloc((size_t)hop * sizeof(float));
+    rec = (float*)malloc(rec_floats * sizeof(float));
+    serial_seen = (int)aec_post_reset_serial(oracle);
+    for (h = 0; ok == 1 && h < sc->nh; ++h) {
+        AecOutputBase ob;
+        if (fread(rec, sizeof(float), rec_floats, fd) != rec_floats) { ok = 0; break; }
+        if (wav_read_float(rm, mic, hop) != hop || wav_read_float(rr, ref, hop) != hop) { ok = -1; break; }
+        aec_process(oracle, mic, ref, want);
+        memset(&ob, 0, sizeof ob);
+        ob.struct_size = sizeof ob;
+        if (aec_get_output_base(oracle, &ob) == 0 && ob.guard_active) ++*guard_hops;
+        if ((int)aec_post_reset_serial(oracle) != serial_seen) {
+            serial_seen = (int)aec_post_reset_serial(oracle);
+            ++*reset_hops;
+        }
+        if (memcmp(want, rec + 6 * nf + 1, (size_t)hop * sizeof(float)) != 0) ok = 0;
+    }
+    if (ok == 1 && fread(rec, sizeof(float), 1, fd) != 0) ok = 0;   /* one dumped hop per input hop */
+    fclose(fd);
+    wav_close_read(rm);
+    wav_close_read(rr);
+    free(mic); free(ref); free(want); free(rec);
+    aec_destroy(oracle);
+    free(oracle);
+    if (ok != 1) return ok;
+    return (*guard_hops > 0 && *reset_hops > 0) ? 1 : 0;
+}
+
+static void test_examples_full_mode(const char* bin_dir, const char* tmp) {
+    static const struct { int sr, fft, seconds, cng; const char* args; } cases[] = {
+        {16000, 256, 14, 1, "--fft-size 256 --no-nr"},
+        {16000, 512, 14, 0, "--fft-size 512 --no-nr --no-cng"},
+        {48000, 1024, 6, 1, "--no-nr"},
+    };
+    static const char* const programs[] = {"aec_nr_pipeline", "aec_nr_pipeline_static"};
+    size_t pi, ci;
+    char bin[512];
+    for (ci = 0; ci < sizeof cases / sizeof cases[0]; ++ci) {
+        GuardScene sc;
+        if (guard_scene_make(&sc, "black box", cases[ci].sr, cases[ci].fft, cases[ci].seconds, 0x2545F491u, 1, 1, 1, 0) != 0) {
+            CHECK(0, "black box full mode: the scene builds");
+            continue;
+        }
+        for (pi = 0; pi < 2; ++pi) {
+            long gh = 0, rh = 0;
+            int rc;
+            snprintf(bin, sizeof bin, "%s/%s", bin_dir, programs[pi]);
+            rc = black_box_full_mode(bin, tmp, &sc, cases[ci].args, cases[ci].cng, &gh, &rh);
+            CHECK(rc == 1,
+                  fmt_msg("black box: %s %s @ %d Hz equals aec_process() in full mode bit for bit "
+                          "(guard fired on %ld hops, hard resets %ld)",
+                          programs[pi], cases[ci].args, cases[ci].sr, gh, rh));
+        }
+        guard_scene_free(&sc);
+    }
+}
+
+
+/* The full chain (denoiser on) as a black box on a scene that fires the guard and moves the reset serial: the
+ * DUMP_CTX output hops equal the hand-written chain bit for bit. The hand-written chain follows the event for
+ * the synthesis and the comfort noise only; a program that also reset its denoiser on the event (or that fed it
+ * the analysis seam on a guard hop) would differ. 1 on equal with both events seen, 0 otherwise, -1 on setup. */
+static int black_box_scene_vs_chain(const char* bin, const char* tmp, const GuardScene* sc, const char* args,
+                                    long* guard_hops, long* reset_hops) {
+    char mic_path[512], ref_path[512], out_path[512], dump_path[512], cmd[2048];
+    ConvMonoConfig o = grid_opts(sc->sr, sc->fft);
+    ConvMono* c = conv_mono_create(&o);
+    WavWriter *wm, *wr;
+    WavReader *rm, *rr;
+    FILE* fd;
+    int hdr[2], hop, nf, h, ok = 1;
+    float *mic, *ref, *want, *rec;
+    size_t rec_floats;
+    *guard_hops = *reset_hops = 0;
+    snprintf(mic_path, sizeof mic_path, "%s/bbc_mic.wav", tmp);
+    snprintf(ref_path, sizeof ref_path, "%s/bbc_ref.wav", tmp);
+    snprintf(out_path, sizeof out_path, "%s/bbc_out.wav", tmp);
+    snprintf(dump_path, sizeof dump_path, "%s/bbc_ctx.bin", tmp);
+    if (!c) return -1;
+    hop = c->hop;
+    wm = wav_open_write(mic_path, sc->sr, 1);
+    wr = wav_open_write(ref_path, sc->sr, 1);
+    if (!wm || !wr) ok = -1;
+    for (h = 0; ok == 1 && h < sc->nh; ++h) {
+        wav_write_float(wm, sc->mic + (size_t)h * hop, hop);
+        wav_write_float(wr, sc->far + (size_t)h * hop, hop);
+    }
+    if (wm) wav_close_write(wm);
+    if (wr) wav_close_write(wr);
+    if (ok != 1) { conv_mono_destroy(c); return -1; }
+    remove(dump_path);
+    snprintf(cmd, sizeof cmd, "DUMP_CTX='%s' '%s' '%s' '%s' '%s' %s > '%s/bbc_stdout.txt' 2>&1",
+             dump_path, bin, mic_path, ref_path, out_path, args, tmp);
+    if (system(cmd) != 0) { conv_mono_destroy(c); return -1; }
+    fd = fopen(dump_path, "rb");
+    rm = wav_open_read(mic_path);
+    rr = wav_open_read(ref_path);
+    if (!fd || !rm || !rr || fread(hdr, sizeof(int), 2, fd) != 2 || hdr[1] != hop) {
+        if (fd) fclose(fd);
+        if (rm) wav_close_read(rm);
+        if (rr) wav_close_read(rr);
+        conv_mono_destroy(c);
+        return -1;
+    }
+    nf = hdr[0];
+    rec_floats = (size_t)(6 * nf + 1 + hop);
+    mic = (float*)malloc((size_t)hop * sizeof(float));
+    ref = (float*)malloc((size_t)hop * sizeof(float));
+    want = (float*)malloc((size_t)hop * sizeof(float));
+    rec = (float*)malloc(rec_floats * sizeof(float));
+    for (h = 0; ok == 1 && h < sc->nh; ++h) {
+        if (fread(rec, sizeof(float), rec_floats, fd) != rec_floats) { ok = 0; break; }
+        if (wav_read_float(rm, mic, hop) != hop || wav_read_float(rr, ref, hop) != hop ||
+            conv_mono_hop(c, mic, ref, want) != 0) { ok = -1; break; }
+        if (memcmp(want, rec + 6 * nf + 1, (size_t)hop * sizeof(float)) != 0) ok = 0;
+    }
+    *guard_hops = c->guard_hops;
+    *reset_hops = c->reset_hops;
+    fclose(fd);
+    wav_close_read(rm);
+    wav_close_read(rr);
+    free(mic); free(ref); free(want); free(rec);
+    conv_mono_destroy(c);
+    if (ok != 1) return ok;
+    return (*guard_hops > 0 && *reset_hops > 0) ? 1 : 0;
+}
+
+static void test_examples_full_chain(const char* bin_dir, const char* tmp) {
+    static const struct { int sr, fft, seconds; const char* args; } cases[] = {
+        {16000, 256, 14, "--fft-size 256"},
+        {48000, 1024, 6, ""},
+    };
+    static const char* const programs[] = {"aec_nr_pipeline", "aec_nr_pipeline_static"};
+    size_t pi, ci;
+    char bin[512];
+    for (ci = 0; ci < sizeof cases / sizeof cases[0]; ++ci) {
+        GuardScene sc;
+        if (guard_scene_make(&sc, "black box chain", cases[ci].sr, cases[ci].fft, cases[ci].seconds, 0x2545F491u, 1, 1, 1, 0) != 0) {
+            CHECK(0, "black box full chain: the scene builds");
+            continue;
+        }
+        for (pi = 0; pi < 2; ++pi) {
+            long gh = 0, rh = 0;
+            snprintf(bin, sizeof bin, "%s/%s", bin_dir, programs[pi]);
+            CHECK(black_box_scene_vs_chain(bin, tmp, &sc, cases[ci].args, &gh, &rh) == 1,
+                  fmt_msg("black box: %s %s @ %d Hz, denoiser on, equals the hand-written chain bit for bit across "
+                          "the guard (%ld hops) and the reset event (%ld)", programs[pi], cases[ci].args, cases[ci].sr, gh, rh));
+        }
+        guard_scene_free(&sc);
     }
 }
 
@@ -1432,9 +1880,15 @@ int main(int argc, char** argv) {
     test_frame_and_chain_args();
     test_aec_only_output();
 
+    printf("\n=== the full-mode identity (NR off) ===\n");
+    test_full_mode_identity();
+    test_nr_keeps_running();
+
     printf("\n=== the example programs against the oracle ===\n");
     test_examples_black_box(argv[1], argv[2]);
     test_examples_aec_only(argv[1], argv[2]);
+    test_examples_full_mode(argv[1], argv[2]);
+    test_examples_full_chain(argv[1], argv[2]);
     test_examples_cli_values(argv[1]);
 
     if (g_failures) {

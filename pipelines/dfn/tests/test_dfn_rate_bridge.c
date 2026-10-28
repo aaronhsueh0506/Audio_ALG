@@ -378,6 +378,207 @@ static int run_phased_grid(const Grid *g, int behaviour) {
     return 0;
 }
 
+/* dfn_rate_bridge_reset_synthesis(): the host-grid synthesis of the bridge cleared on the hop a
+ * post-chain reset names, and nothing else.
+ *   tap       the native-grid hops the bridge synthesised (dfn_rate_bridge_get_host_hops) equal, bit
+ *             for bit, an independent audiolib synthesis of the same spectra that clears its tail on
+ *             that hop (both lanes), and a bridge never told differs from it on that hop only;
+ *   timing    the same call one hop late leaves the reset hop uncleared (the tap row fails);
+ *   kept      the stage and bridge counters of the cleared run equal the uncleared run's, the output
+ *             starts to differ no earlier than the reset hop, and resumes bit-identical to the
+ *             uncleared run once the one-hop perturbation has drained (a state reset anywhere else
+ *             would shift the 48 kHz frame alignment or the counters for good);
+ *   contract  NULL and a hop in progress are refused and change nothing.
+ * Mutations the row must see: no call, a late call, and dfn_rate_bridge_reset() in its place. */
+#define RS_HOPS 100
+#define RS_AT 41   /* odd: the 48 kHz FIFO holds leftover samples at the start of this hop on every grid that has them */
+enum { RS_CLEARED, RS_NEVER, RS_LATE, RS_FULL_RESET };
+
+typedef struct RsRun {
+    float out[RS_HOPS * (MAX_FFT / 2)];
+    float tap_e[RS_HOPS * (MAX_FFT / 2)];
+    float tap_p[RS_HOPS * (MAX_FFT / 2)];
+    long long stage_frames, stage_commits, stage_skips, bridge_frames;
+} RsRun;
+
+static Complex rs_spec_e[RS_HOPS][MAX_FFT / 2 + 1];
+static Complex rs_spec_p[RS_HOPS][MAX_FFT / 2 + 1];
+static RsRun rs_run[4];
+static float rs_oracle_cleared_e[RS_HOPS * (MAX_FFT / 2)], rs_oracle_cleared_p[RS_HOPS * (MAX_FFT / 2)];
+static float rs_oracle_never_e[RS_HOPS * (MAX_FFT / 2)], rs_oracle_never_p[RS_HOPS * (MAX_FFT / 2)];
+
+static int rs_drive(const Grid *g, int mode, RsRun *run) {
+    DfnRateBridgeConfig cfg = bridge_config(g->sr, g->fft);
+    DfnRateBridge *b = dfn_rate_bridge_create(&cfg);
+    int hop = g->fft / 2, t;
+    if (!b) return 1;
+    for (t = 0; t < RS_HOPS; ++t) {
+        const float *te, *tp;
+        if (t == RS_AT && mode == RS_CLEARED && dfn_rate_bridge_reset_synthesis(b) != 0) return 2;
+        if (t == RS_AT && mode == RS_FULL_RESET) dfn_rate_bridge_reset(b);
+        if (dfn_rate_bridge_begin(b, rs_spec_e[t], rs_spec_p[t]) != 0) return 3;
+        if (dfn_rate_bridge_get_host_hops(b, &te, &tp) != 0 || !te || !tp) return 4;
+        memcpy(run->tap_e + t * hop, te, (size_t)hop * sizeof(float));
+        memcpy(run->tap_p + t * hop, tp, (size_t)hop * sizeof(float));
+        if (t == RS_AT && mode == RS_CLEARED) {
+            /* a hop in progress: refused, nothing cleared (the tap keeps the hop just synthesised) */
+            if (dfn_rate_bridge_reset_synthesis(b) != -1) return 5;
+            if (dfn_rate_bridge_get_host_hops(b, &te, &tp) != 0 ||
+                memcmp(te, run->tap_e + t * hop, (size_t)hop * sizeof(float)) != 0)
+                return 6;
+        }
+        {
+            DfnResStageJob job;
+            int r;
+            while ((r = dfn_rate_bridge_nn_begin(b, &job)) == 1)
+                if (dfn_rate_bridge_nn_end(b, dfn_res_stage_infer(dfn_rate_bridge_stage(b), &job)) != 0)
+                    return 7;
+            if (r < 0) return 8;
+        }
+        if (dfn_rate_bridge_finish(b, run->out + t * hop) != 0) return 9;
+        if (t == RS_AT && mode == RS_LATE && dfn_rate_bridge_reset_synthesis(b) != 0) return 10;
+    }
+    dfn_res_stage_get_counters(dfn_rate_bridge_stage(b), &run->stage_frames, &run->stage_commits,
+                               &run->stage_skips);
+    {
+        int last;
+        dfn_rate_bridge_get_counters(b, &run->bridge_frames, &last);
+    }
+    dfn_rate_bridge_destroy(b);
+    return 0;
+}
+
+/* The oracle: audiolib's default-window synthesis of the same spectra, cleared before `clear_at`. */
+static int rs_oracle(int fft, const Complex (*spec)[MAX_FFT / 2 + 1], int clear_at, float *out) {
+    AcStftConfig sc;
+    AcIstft *s;
+    void *mem = NULL;
+    int t, hop = fft / 2;
+    size_t bytes;
+    ac_stft_config_default(&sc, fft);
+    bytes = ac_istft_get_mem_size(&sc);
+    if (!bytes || posix_memalign(&mem, 16, bytes) != 0) return 1;
+    s = ac_istft_init(mem, bytes, &sc);
+    if (!s) { free(mem); return 2; }
+    for (t = 0; t < RS_HOPS; ++t) {
+        if (t == clear_at) ac_istft_reset(s);
+        (void)ac_istft_push(s, spec[t], out + t * hop);
+    }
+    free(mem);
+    return 0;
+}
+
+static int run_reset_synthesis(const Grid *g) {
+    int hop = g->fft / 2, t, k, rc;
+    Analyzer ae, ap;
+    DfnRateBridgeConfig cfg = bridge_config(g->sr, g->fft);
+    DfnRateBridge *probe = dfn_rate_bridge_create(&cfg);
+    static float est[RS_HOPS * (MAX_FFT / 2)], app[RS_HOPS * (MAX_FFT / 2)];
+    int added, horizon, first_diff = -1, last_diff = -1, tap_diff_hops = 0;
+    float tap_delta = 0.0f;
+    double out_energy = 0.0, tap_energy = 0.0, energy_ratio;
+    const float *none = NULL;
+
+    if (!probe || analyzer_init(&ae, g->fft) != 0 || analyzer_init(&ap, g->fft) != 0) return 1;
+    added = dfn_rate_bridge_added_delay_samples(probe);
+    if (dfn_rate_bridge_reset_synthesis(NULL) != -1 ||
+        dfn_rate_bridge_get_host_hops(NULL, &none, &none) != -1 ||
+        dfn_rate_bridge_get_host_hops(probe, NULL, NULL) != 0)
+        return 2;
+    dfn_rate_bridge_destroy(probe);
+
+    dfn_fixture_multitone(app, (size_t)RS_HOPS * hop, g->sr);
+    for (k = 0; k < RS_HOPS * hop; ++k)
+        est[k] = 0.5f * sinf(2.0f * (float)M_PI * 700.0f * (float)k / (float)g->sr);
+    for (t = 0; t < RS_HOPS; ++t) {
+        analyzer_push(&ae, est + t * hop, rs_spec_e[t]);
+        analyzer_push(&ap, app + t * hop, rs_spec_p[t]);
+    }
+    fft_destroy(ae.fft);
+    fft_destroy(ap.fft);
+    if (rs_oracle(g->fft, rs_spec_e, RS_AT, rs_oracle_cleared_e) != 0 ||
+        rs_oracle(g->fft, rs_spec_p, RS_AT, rs_oracle_cleared_p) != 0 ||
+        rs_oracle(g->fft, rs_spec_e, -1, rs_oracle_never_e) != 0 ||
+        rs_oracle(g->fft, rs_spec_p, -1, rs_oracle_never_p) != 0)
+        return 3;
+    for (k = 0; k < 4; ++k) {
+        rc = rs_drive(g, k, &rs_run[k]);
+        if (rc) { fprintf(stderr, "  %d/%d: drive %d failed: %d\n", g->sr, g->fft, k, rc); return 4; }
+    }
+
+    /* tap: cleared == oracle that clears on the hop; never == oracle that never clears */
+    if (memcmp(rs_run[RS_CLEARED].tap_p, rs_oracle_cleared_p, (size_t)RS_HOPS * hop * sizeof(float)) != 0 ||
+        memcmp(rs_run[RS_CLEARED].tap_e, rs_oracle_cleared_e, (size_t)RS_HOPS * hop * sizeof(float)) != 0)
+        return 5;
+    if (memcmp(rs_run[RS_NEVER].tap_p, rs_oracle_never_p, (size_t)RS_HOPS * hop * sizeof(float)) != 0 ||
+        memcmp(rs_run[RS_NEVER].tap_e, rs_oracle_never_e, (size_t)RS_HOPS * hop * sizeof(float)) != 0)
+        return 6;
+    /* the two oracles, hence the two runs, differ on the reset hop and on no other hop */
+    for (t = 0; t < RS_HOPS; ++t) {
+        int same = memcmp(rs_run[RS_CLEARED].tap_p + t * hop, rs_run[RS_NEVER].tap_p + t * hop,
+                          (size_t)hop * sizeof(float)) == 0 &&
+                   memcmp(rs_run[RS_CLEARED].tap_e + t * hop, rs_run[RS_NEVER].tap_e + t * hop,
+                          (size_t)hop * sizeof(float)) == 0;
+        if (!same) {
+            ++tap_diff_hops;
+            if (t != RS_AT) return 7;
+            for (k = 0; k < hop; ++k) {
+                float d = fabsf(rs_run[RS_CLEARED].tap_p[t * hop + k] - rs_run[RS_NEVER].tap_p[t * hop + k]);
+                if (d > tap_delta) tap_delta = d;
+            }
+        }
+    }
+    if (tap_diff_hops != 1 || !(tap_delta > 0.01f)) return 8;   /* the stimulus must carry a real tail */
+    /* timing: one hop late the reset hop is not cleared, and the following hop is wrong too */
+    if (memcmp(rs_run[RS_LATE].tap_p + RS_AT * hop, rs_oracle_cleared_p + RS_AT * hop,
+               (size_t)hop * sizeof(float)) == 0)
+        return 9;
+    if (memcmp(rs_run[RS_LATE].tap_p + (RS_AT + 1) * hop, rs_oracle_cleared_p + (RS_AT + 1) * hop,
+               (size_t)hop * sizeof(float)) == 0)
+        return 10;
+
+    /* kept: counters, and the output of the cleared run against the uncleared one */
+    if (rs_run[RS_CLEARED].stage_frames != rs_run[RS_NEVER].stage_frames ||
+        rs_run[RS_CLEARED].stage_commits != rs_run[RS_NEVER].stage_commits ||
+        rs_run[RS_CLEARED].stage_skips != rs_run[RS_NEVER].stage_skips ||
+        rs_run[RS_CLEARED].bridge_frames != rs_run[RS_NEVER].bridge_frames)
+        return 11;
+    if (rs_run[RS_FULL_RESET].stage_frames == rs_run[RS_NEVER].stage_frames &&
+        rs_run[RS_FULL_RESET].stage_skips == rs_run[RS_NEVER].stage_skips)
+        return 12;   /* the counters would not see a stage reset */
+    for (k = 0; k < RS_HOPS * hop; ++k)
+        if (rs_run[RS_CLEARED].out[k] != rs_run[RS_NEVER].out[k]) {
+            if (first_diff < 0) first_diff = k;
+            last_diff = k;
+        }
+    /* The identity bridge is a unit-gain linear path for this band-limited stimulus, so the output
+     * difference carries the energy of the cleared tail and no more: a clear that also drops the
+     * 48 kHz synthesis tail or the resamplers' history adds a second perturbation (ratios 1.2 to 2.1). */
+    for (k = 0; k < RS_HOPS * hop; ++k) {
+        double d = (double)rs_run[RS_CLEARED].out[k] - (double)rs_run[RS_NEVER].out[k];
+        double dt = (double)rs_run[RS_CLEARED].tap_p[k] - (double)rs_run[RS_NEVER].tap_p[k];
+        out_energy += d * d;
+        tap_energy += dt * dt;
+    }
+    energy_ratio = out_energy / tap_energy;
+    if (!(energy_ratio > 0.99 && energy_ratio < 1.01)) {
+        fprintf(stderr, "  %d/%d: output difference carries %.4f of the cleared tail's energy\n", g->sr, g->fft, energy_ratio);
+        return 15;
+    }
+    horizon = RS_AT * hop + added + 4 * g->fft;
+    if (first_diff < RS_AT * hop || last_diff < 0 || last_diff >= horizon) {
+        fprintf(stderr, "  %d/%d: output differs over [%d, %d], expected inside [%d, %d)\n",
+                g->sr, g->fft, first_diff, last_diff, RS_AT * hop, horizon);
+        return 13;
+    }
+    if (horizon + 4 * hop >= RS_HOPS * hop) return 14;   /* a drained tail must be observed */
+    printf("dfn_rate_bridge: %d Hz / fft %d: reset_synthesis on hop %d: host hops bit-exact to the audiolib "
+           "oracle (one hop differs from the uncleared run, max %.3f), output differs over samples [%d, %d] "
+           "(delay %d) with %.4f of the cleared tail's energy, identical after, stage counters unchanged\n",
+           g->sr, g->fft, RS_AT, (double)tap_delta, first_diff, last_diff, added, energy_ratio);
+    return 0;
+}
+
 static int run_phased_sequence(void) {
     DfnRateBridgeConfig cfg = bridge_config(16000, 256);
     DfnRateBridge *b = dfn_rate_bridge_create(&cfg);
@@ -431,6 +632,14 @@ int main(void) {
     }
     rc = run_phased_sequence();
     if (rc) { fprintf(stderr, "rate bridge phased sequence row failed: %d\n", rc); return 1; }
+    for (i = 0; i < N_GRIDS; ++i) {
+        rc = run_reset_synthesis(&GRIDS[i]);
+        if (rc) {
+            fprintf(stderr, "rate bridge reset_synthesis grid %d/%d failed: %d\n",
+                    GRIDS[i].sr, GRIDS[i].fft, rc);
+            return 1;
+        }
+    }
     puts("dfn_rate_bridge: PASS");
     return 0;
 }

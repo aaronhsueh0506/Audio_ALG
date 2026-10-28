@@ -150,6 +150,7 @@ typedef struct Post {
     float *unity, *total_gain, *extra_noise;
     Complex* spec;
     uint32_t rng;
+    uint32_t reset_handled;   /* McabFrame.post_reset_serial the synthesis last followed */
     int n_freqs;
 } Post;
 
@@ -197,11 +198,13 @@ static int post_init(Post* q, void* mem) {
     q->spec = (Complex*)cur;
     for (k = 0; k < q->n_freqs; ++k) q->unity[k] = 1.0f;
     q->rng = MCAB_SAMPLE_CNG_RNG_SEED;
+    q->reset_handled = 0u;
     return 0;
 }
 
-/* One hop after the fuse into out: P = E * min(G_nr, G_res), comfort noise on the bins the RES
- * cut, synthesis. 0, or -1 when a stage refuses the hop. */
+/* One hop after the fuse into out: G_res and G_nr estimated on E, P = B * min(G_nr, G_res) over
+ * the rendering base B, comfort noise on the bins the RES cut, synthesis (cleared and reseeded
+ * first when a lane had a post-chain reset). 0, or -1 when a stage refuses the hop. */
 static int post_hop(Post* q, const McabFrame* f, float* out) {
     const float* res = q->unity;
     const float* nr;
@@ -214,7 +217,11 @@ static int post_hop(Post* q, const McabFrame* f, float* out) {
     nr = mcab_sample_anr_gain(q->nr, f, q->extra_noise, q->use_r2);
     if (!nr) return -1;
     sk_min_f32(q->total_gain, nr, res, q->n_freqs);   /* NaN in the second operand reaches the finite gate; in the first it is replaced */
-    sk_capply_gain_f32(q->spec, f->e, q->total_gain, q->n_freqs);
+    if (mcab_sample_post_reset_due(&q->reset_handled, f)) {
+        ac_istft_reset(q->istft);
+        q->rng = MCAB_SAMPLE_CNG_RNG_SEED;
+    }
+    sk_capply_gain_f32(q->spec, f->b, q->total_gain, q->n_freqs);
     if (q->enable_cng && q->res && f->cn)
         aec_cng_fill(&q->rng, q->spec, f->cn, res, nr, MCAB_SAMPLE_CNG_NR_GAIN_FLOOR, q->n_freqs);
     (void)ac_istft_push(q->istft, q->spec, out);

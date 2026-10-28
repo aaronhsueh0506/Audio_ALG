@@ -1,7 +1,7 @@
 /* tests/test_no_stdio_stack.c -- full-stack no-stdio link gate. A minimal main() runs the
  * delivered stack as the example programs compose it (query -> aec_init + anr_init +
- * ac_istft_init -> one hop of aec_process_context / aec_get_res_context / anr_process_gain / min /
- * apply / comfort noise / ac_istft_push -> reset -> destroy) using no stdio itself; the exit code
+ * ac_istft_init -> one hop of aec_process_context / aec_get_res_context / aec_get_output_base /
+ * anr_process_gain / min / apply / comfort noise / ac_istft_push -> reset -> destroy) using no stdio itself; the exit code
  * is the only output.
  * `make audit-no-stdio-stack` links it against the NO_STDIO=1 archives (libaec.a, libanr.a,
  * libaudio_common.a) and `nm`-gates the executable, so a stdio symbol from any archive fails the
@@ -18,7 +18,6 @@
 #include "utility/simd_kernels.h"
 
 #define CNG_NR_GAIN_FLOOR 0.31622777f
-#define CNG_RNG_SEED 0x9e3779b9u
 #define PSD_SCALE_INV (1.0f / (32768.0f * 32768.0f))   /* int16^2 -> audio scale, exact */
 
 /* Static pool: sized for the 16 kHz configs this gate runs; the runtime check against the
@@ -31,24 +30,36 @@ typedef struct Post {
     float *total, *extra;
     Complex* spec;
     uint32_t rng;
+    uint32_t serial;
 } Post;
 
 /* One hop of the example chain; 0, or -1 when a stage refuses. */
 static int hop(Aec* aec, Post* q, const float* mic, const float* ref, float* out) {
     AecResContext c;
+    AecOutputBase ob;
     const float* extra = NULL;
     const float* nr;
+    uint32_t serial;
     aec_process_context(aec, mic, ref);
     aec_get_res_context(aec, &c);
     if (!c.error_spec || !c.res_gain) return -1;
+    memset(&ob, 0, sizeof(ob));
+    ob.struct_size = sizeof(ob);
+    if (aec_get_output_base(aec, &ob) != 0) return -1;
+    serial = aec_post_reset_serial(aec);
+    if (serial != q->serial) {
+        q->serial = serial;
+        ac_istft_reset(q->istft);
+        q->rng = AEC_CNG_SEED;
+    }
     if (c.r2 && c.usable_linear) {
         sk_scale_f32(q->extra, c.r2, PSD_SCALE_INV, c.n_freqs);
         extra = q->extra;
     }
-    if (anr_process_gain(q->nr, c.error_spec, extra, NULL) != 0) return -1;
+    if (anr_process_gain(q->nr, ob.base_spec, extra, NULL) != 0) return -1;
     if (!(nr = anr_get_gain(q->nr, NULL))) return -1;
     sk_min_f32(q->total, nr, c.res_gain, c.n_freqs);
-    sk_capply_gain_f32(q->spec, c.error_spec, q->total, c.n_freqs);
+    sk_capply_gain_f32(q->spec, ob.base_spec, q->total, c.n_freqs);
     if (c.comfort_noise)
         aec_cng_fill(&q->rng, q->spec, c.comfort_noise, c.res_gain, nr, CNG_NR_GAIN_FLOOR,
                      c.n_freqs);
@@ -97,7 +108,8 @@ int main(void) {
     q.total = (float*)cur;  cur += vec;
     q.extra = (float*)cur;  cur += vec;
     q.spec = (Complex*)cur;
-    q.rng = CNG_RNG_SEED;
+    q.rng = AEC_CNG_SEED;
+    q.serial = aec_post_reset_serial(aec);
 
     /* One hop of silence through the full AEC->NR->RES chain. */
     static float mic[480], ref[480], out[480];
@@ -107,7 +119,8 @@ int main(void) {
     aec_reset(aec);
     anr_reset(q.nr);
     ac_istft_reset(q.istft);
-    q.rng = CNG_RNG_SEED;
+    q.rng = AEC_CNG_SEED;
+    q.serial = aec_post_reset_serial(aec);
     if (hop(aec, &q, mic, ref, out) != 0) return 5;
 
     anr_destroy(q.nr);

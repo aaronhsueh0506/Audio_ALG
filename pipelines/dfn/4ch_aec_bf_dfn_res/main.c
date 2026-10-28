@@ -2,15 +2,24 @@
  * DeepFilterNet2 composed from the library calls. Example code: the four lanes, the shared
  * estimator and the mcab flow (mcab_sample_flow.h builds them in the application's order) with the
  * sample SRP-PHAT/BF helper (mcab_sample_beam.h), the post-beam RES (lib/aec AecRes) initialised
- * here, P = E * G_res (+ comfort noise) formed here, and dfn/dfn_hop.h for the DFN2 hop (sized
- * and carved by dfn/dfn_hop_pool.h). Per hop:
+ * here, P = B * G_res (+ comfort noise) formed here over the rendering base B, and dfn/dfn_hop.h
+ * for the DFN2 hop (sized and carved by dfn/dfn_hop_pool.h). Per hop:
  *
  *     mcab_sample_beam_process(unit, mics, far, &beam, &info);    // delay, lanes, SRP-PHAT, BF
- *     mcab_sample_beam_fuse(unit, &frame);                         // E, R2, CN
+ *     mcab_sample_beam_fuse(unit, &frame);                         // E, B, R2, CN
  *     mcab_sample_res_input(&frame, &in);                          // the RES input of that frame
- *     G_res = aec_res_process(res, &in);
- *     P = E * G_res (+ comfort noise);                              // before the DFN hop begins
- *     dfn_hop_process(&hop, frame.e, P, out);                       // or begin / nn_begin / ...
+ *     G_res = aec_res_process(res, &in);                           // estimated on E
+ *     P = B * G_res (+ comfort noise);                              // before the DFN hop begins
+ *     dfn_hop_process(&hop, frame.e, P, out);                       // estimated on E, applied on P
+ *
+ * B is E except on hops where a contributing lane's output guard fired (mcab.h); there P carries
+ * that lane's capture while the model still estimates on E. A lane's post-chain reset
+ * (frame.post_reset_serial moved) reseeds the comfort noise before P is formed. At 16 kHz the
+ * host-grid synthesis is inside the bridge and runs at the top of its begin(), so
+ * dfn_rate_bridge_reset_synthesis() on that hop clears just its overlap-add tail (DFN2 and the
+ * resamplers keep running, no delay line). At 48 kHz the synthesis follows the stage by its
+ * lookahead and this example resets the whole hop instead. In this flow that serial moves only with
+ * a flow reset, which the refused-call path below already pairs with a hop reset.
  *
  * 48 kHz hosts drive dfn_res_stage.h and synthesise through an AcIstft; 16 kHz hosts run the same
  * stage on its 48 kHz grid inside dfn_rate_bridge.h. The first output hops are zero: the model's
@@ -75,6 +84,7 @@ typedef struct DfnSample {
     float *unity, *total_gain;        /* the RES gain path: min(1, G_res) */
     Complex *post;                    /* P */
     uint32_t rng;
+    uint32_t reset_handled;           /* McabFrame.post_reset_serial last followed */
     int n_freqs;
     DfnResStage *stage;
     DfnRateBridge *bridge;
@@ -267,11 +277,17 @@ static int dfn_setup(void *user, McabSampleHopView *view) {
 static int dfn_read(void *user, McabSampleHopView *view, int frame) {
     (void)user; (void)view; return frame < 8;
 }
-/* P = E * min(1, G_res), plus comfort noise on the bins the RES cut when enabled (no denoiser:
- * its gain is the unity vector). */
+/* P = B * min(1, G_res), plus comfort noise on the bins the RES cut when enabled (no denoiser:
+ * its gain is the unity vector); a lane's post-chain reset first clears the synthesis (the bridge's
+ * host-grid tail at 16 kHz, the whole hop at 48 kHz) and reseeds. Before the hop enters the DFN hop. */
 static void dfn_form(DfnSample *s, const McabFrame *f, const float *g_res) {
+    if (mcab_sample_post_reset_due(&s->reset_handled,f)) {
+        if (s->bridge) (void)dfn_rate_bridge_reset_synthesis(s->bridge);   /* between hops: cannot refuse */
+        else dfn_hop_reset(&s->hop);
+        s->rng=MCAB_SAMPLE_CNG_RNG_SEED;
+    }
     sk_min_f32(s->total_gain,s->unity,g_res,s->n_freqs);
-    sk_capply_gain_f32(s->post,f->e,s->total_gain,s->n_freqs);
+    sk_capply_gain_f32(s->post,f->b,s->total_gain,s->n_freqs);
     if (s->args.enable_cng && f->cn)
         aec_cng_fill(&s->rng,s->post,f->cn,g_res,s->unity,MCAB_SAMPLE_CNG_NR_GAIN_FLOOR,
                      s->n_freqs);

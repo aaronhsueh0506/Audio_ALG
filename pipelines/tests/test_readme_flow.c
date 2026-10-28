@@ -37,7 +37,6 @@ static float lcg(void) {
 }
 
 #define CNG_NR_GAIN_FLOOR 0.31622777f
-#define CNG_RNG_SEED 0x9e3779b9u
 #define PSD_SCALE_INV (1.0f / (32768.0f * 32768.0f))   /* int16^2 -> audio scale, exact */
 
 /* The mono lane every example below starts from: the grid (fft_size 0: the rate's default) and
@@ -99,28 +98,40 @@ typedef struct Chain {
     float *g_nr_scratch, *g_min, *g_total;   /* n_freqs floats each */
     Complex* spec;                           /* n_freqs bins */
     uint32_t rng;
+    uint32_t reset_serial;                   /* the aec_post_reset_serial() value already handled */
     int n_freqs;
 } Chain;
 
 static int chain_hop(Chain* c, const float* mic, const float* ref, float* out) {
     AecResContext f;
+    AecOutputBase base;
     const float* extra = NULL;
     const float* nr_gain;
     const float* tilt;
+    uint32_t serial;
     aec_process_context(c->aec, mic, ref);
     aec_get_res_context(c->aec, &f);
     if (!f.error_spec) return -1;
+    memset(&base, 0, sizeof(base));
+    base.struct_size = sizeof(base);
+    if (aec_get_output_base(c->aec, &base) != 0) return -1;   /* the spectrum the gains are applied to */
+    serial = aec_post_reset_serial(c->aec);
+    if (serial != c->reset_serial) {        /* hard post-chain reset inside this hop: before the CNG draw and the push */
+        c->reset_serial = serial;
+        ac_istft_reset(c->istft);
+        c->rng = AEC_CNG_SEED;
+    }
     if (f.r2 && f.usable_linear) {         /* residual-echo powers into the noise floor */
         sk_scale_f32(c->g_nr_scratch, f.r2, PSD_SCALE_INV, f.n_freqs);
         extra = c->g_nr_scratch;
     }
-    if (anr_process_gain(c->nr, f.error_spec, extra, NULL) != 0) return -1;
+    if (anr_process_gain(c->nr, base.base_spec, extra, NULL) != 0) return -1;
     nr_gain = anr_get_gain(c->nr, NULL);
     if (!nr_gain) return -1;
     tilt = hf_tilt_gain(c->tilt, f.n_freqs);
     sk_min_f32(c->g_min, nr_gain, f.res_gain, f.n_freqs);
     sk_min_f32(c->g_total, c->g_min, tilt, f.n_freqs);
-    sk_capply_gain_f32(c->spec, f.error_spec, c->g_total, f.n_freqs);
+    sk_capply_gain_f32(c->spec, base.base_spec, c->g_total, f.n_freqs);
     aec_cng_fill(&c->rng, c->spec, f.comfort_noise, f.res_gain, nr_gain,
                  CNG_NR_GAIN_FLOOR, f.n_freqs);
     (void)ac_istft_push(c->istft, c->spec, out);
@@ -134,6 +145,11 @@ static double energy_above(const float* x, int n) {
     return e;
 }
 
+/* The synthesis borrows the AEC's own window table (aec_synthesis_window()), which exists once the AEC is
+ * initialised, after the block is sized. A borrowed table carves nothing, so any non-NULL pointer sizes the
+ * synthesis the same; this one stands in until chain_build() installs the AEC's. */
+static const float k_sizing_window[1] = {0.0f};
+
 /* Builds the chain's objects in one caller block at `mem` (returns the bytes used, 0 on
  * failure). `bin_hi`/`amount` configure the new stage. */
 static size_t chain_build(Chain* c, void* mem, size_t bytes, const AecSignalGrid* grid,
@@ -142,8 +158,9 @@ static size_t chain_build(Chain* c, void* mem, size_t bytes, const AecSignalGrid
     size_t aec_b = aec_get_mem_size(aec_cfg), nr_b, synth_b, vec, used;
     AnrConfig nc = anr_config_for_level_grid(sample_rate, grid->fft_size, ANR_LEVEL_BALANCED);
     AcStftConfig sc;
-    int n = grid->n_freqs;
+    int n = grid->n_freqs, win_n = 0;
     ac_stft_config_default(&sc, grid->fft_size);
+    sc.window = k_sizing_window;
     nr_b = anr_get_mem_size(&nc);
     synth_b = ac_istft_get_mem_size(&sc);
     vec = ALIGN16((size_t)n * sizeof(float));
@@ -152,10 +169,14 @@ static size_t chain_build(Chain* c, void* mem, size_t bytes, const AecSignalGrid
     if (bytes < used) return 0;
     memset(c, 0, sizeof(*c));
     c->n_freqs = n;
-    c->rng = CNG_RNG_SEED;
+    c->rng = AEC_CNG_SEED;
     c->aec = aec_init(cur, aec_b, aec_cfg);            cur += ALIGN16(aec_b);
+    c->reset_serial = c->aec ? aec_post_reset_serial(c->aec) : 0u;
     c->nr = anr_init(cur, nr_b, &nc);                  cur += ALIGN16(nr_b);
-    c->istft = ac_istft_init(cur, synth_b, &sc);       cur += ALIGN16(synth_b);
+    /* the AEC's own table: the chain then equals aec_process() */
+    if (c->aec && aec_synthesis_window(c->aec, &sc.window, &win_n) == 0 && win_n == sc.fft_size)
+        c->istft = ac_istft_init(cur, synth_b, &sc);
+    cur += ALIGN16(synth_b);
     c->tilt = hf_tilt_init(cur, n, bin_hi, amount);    cur += hf_tilt_mem_size(n);
     c->g_nr_scratch = (float*)cur;                     cur += vec;
     c->g_min = (float*)cur;                            cur += vec;
@@ -169,6 +190,7 @@ static size_t chain_bytes(const AecSignalGrid* grid, const AecConfig* aec_cfg, i
     AcStftConfig sc;
     int n = grid->n_freqs;
     ac_stft_config_default(&sc, grid->fft_size);
+    sc.window = k_sizing_window;   /* borrowed, as chain_build() */
     return ALIGN16(aec_get_mem_size(aec_cfg)) + ALIGN16(anr_get_mem_size(&nc)) +
            ALIGN16(ac_istft_get_mem_size(&sc)) + hf_tilt_mem_size(n) +
            3 * ALIGN16((size_t)n * sizeof(float)) + ALIGN16((size_t)n * sizeof(Complex));
@@ -300,12 +322,16 @@ static void dfn_host_free(DfnHost* d) {
 /* AEC, RES gain, P; the DFN hop begins on (E, P). */
 static int dfn_host_begin(DfnHost* d, const float* mic, const float* ref) {
     AecResContext f;
+    AecOutputBase base;
     aec_process_context(d->aec, mic, ref);
     aec_get_res_context(d->aec, &f);
     if (!f.error_spec || !f.res_gain) return -1;
+    memset(&base, 0, sizeof(base));
+    base.struct_size = sizeof(base);
+    if (aec_get_output_base(d->aec, &base) != 0) return -1;
     sk_min_f32(d->total, d->unity, f.res_gain, d->n_freqs);
-    sk_capply_gain_f32(d->post, f.error_spec, d->total, d->n_freqs);
-    return dfn_hop_begin(&d->hop, f.error_spec, d->post) == 0 ? 0 : -1;
+    sk_capply_gain_f32(d->post, base.base_spec, d->total, d->n_freqs);
+    return dfn_hop_begin(&d->hop, base.base_spec, d->post) == 0 ? 0 : -1;
 }
 
 static void example_dfn_phased(void) {

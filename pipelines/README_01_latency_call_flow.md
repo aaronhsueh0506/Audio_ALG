@@ -38,15 +38,15 @@ stays explicitly selectable.
 
 | Rate | AEC | Synthesis (`AcIstft`) | NR | Gain/spectrum buffers | **Total** |
 |------|-----|-----------|-----|---------------|-----------|
-| **8 kHz** | 267,408 B | 11,344 B | 28,784 B | 2,624 B | **310,160 B (302.9 KB)** |
-| **16 kHz (default, 256/128)** | 364,416 B | 11,344 B | 45,344 B | 2,624 B | **423,728 B (413.8 KB)** |
-| **16 kHz (alt, 512/256)** | 491,600 B | 21,840 B | 56,432 B | 5,184 B | **575,056 B (561.6 KB)** |
-| **48 kHz** | 1,156,544 B | 42,832 B | 144,576 B | 10,304 B | **1,354,256 B (1,322.5 KB)** |
+| **8 kHz** | 268,992 B | 10,320 B | 28,784 B | 2,624 B | **310,720 B (303.4 KB)** |
+| **16 kHz (default, 256/128)** | 366,000 B | 10,320 B | 45,344 B | 2,624 B | **424,288 B (414.3 KB)** |
+| **16 kHz (alt, 512/256)** | 494,720 B | 19,792 B | 56,432 B | 5,184 B | **576,128 B (562.6 KB)** |
+| **48 kHz** | 1,162,736 B | 38,736 B | 144,576 B | 10,304 B | **1,356,352 B (1,324.6 KB)** |
 
 The AEC column is owned by `lib/aec/docs/c_user_manual_zh_TW_01_lifecycle.md` §4 — re-measure from
 there rather than editing it here, and always prefer the values `aec_get_mem_size()`,
 `anr_get_mem_size()` and `ac_istft_get_mem_size()` return at runtime. `--no-nr` drops the NR column;
-`--aec-only` is the AEC column alone.
+`--aec-only` is the AEC column alone. The synthesis borrows the AEC's synthesis window (`aec_synthesis_window()`), so its column carries no window table.
 
 > filter_length 是 ms-derived（52 ms；≥44.1 kHz 用 64 ms → 48 kHz 為 3072
 > taps、6 partitions at hop=512），加長會等比增加 AEC 記憶體；記憶體吃緊時先縮
@@ -70,6 +70,7 @@ application writes the combination itself; each example `main` shows it (`mono_f
 
 ```
 mono:  mic/ref ─► Aec ─► AecResContext { error_spec, near_spec, far_spec, r2, comfort_noise, res_gain, usable_linear, ... }
+                        └► aec_get_output_base ─► B = rendering base (E, or E + echo on a guard hop); aec_post_reset_serial ─► reset event
 4-ch:  mics/ref ─► mcab_process_front ─► beamformer ─► mcab_fuse ─► McabFrame { e, y, x, r2, cn, g_res_ctx = NULL, far_hop, ... }
                       │
         gain stages   ├─ G_nr: anr_process_gain(nr, E, extra_noise) + anr_get_gain(nr)    (extra_noise = R² / 32768², while the linear estimate is usable)
@@ -104,7 +105,8 @@ function ([`main.c`](mono_aec_nr_res/main.c) `process_hop()` / `mono_form()`,
 programs share two small header-only helpers, [`mcab_sample_post.h`](4ch_aec_bf_nr_res/mcab_sample_post.h)
 (`mcab_sample_res_input()`, `mcab_sample_anr_gain()`, `MCAB_SAMPLE_CNG_NR_GAIN_FLOOR`,
 `MCAB_SAMPLE_CNG_RNG_SEED`; tested by `test_mcab_sample_post`); the mono examples keep their own
-`#define`s (`CNG_NR_GAIN_FLOOR`, `CNG_RNG_SEED`, `PSD_SCALE_INV`) in the file.
+`#define`s (`CNG_NR_GAIN_FLOOR`, `PSD_SCALE_INV`) in the file and start the comfort noise from the library's
+`AEC_CNG_SEED`.
 
 Only the multi-channel shared delay and four-lane flow is one module (`Mcab`, over lanes and an
 estimator the application initialises); every other stage (the beamformer and the 4-ch post-beam RES
@@ -135,21 +137,26 @@ static const float* hf_tilt_gain(HfTilt* s, int n_freqs) {
 
 int chain_hop(Chain* c, const float* mic, const float* ref, float* out) {
     AecResContext f;
+    AecOutputBase b = { sizeof(b) };
     const float* extra = NULL;
     aec_process_context(c->aec, mic, ref);                                        /* the one analysis */
     aec_get_res_context(c->aec, &f);
-    if (!f.error_spec) return -1;
+    if (!f.error_spec || aec_get_output_base(c->aec, &b) != 0) return -1;         /* b.base_spec: the spectrum to render */
+    if (aec_post_reset_serial(c->aec) != c->reset_serial) {                       /* hard post-chain reset in this hop: */
+        c->reset_serial = aec_post_reset_serial(c->aec);                          /* before the CNG draw and the push */
+        ac_istft_reset(c->istft);  c->rng = AEC_CNG_SEED;
+    }
     if (f.r2 && f.usable_linear) {                      /* residual-echo powers into the noise floor */
         sk_scale_f32(c->g_nr_scratch, f.r2, PSD_SCALE_INV, f.n_freqs);
         extra = c->g_nr_scratch;
     }
-    if (anr_process_gain(c->nr, f.error_spec, extra, NULL) != 0) return -1;
+    if (anr_process_gain(c->nr, b.base_spec, extra, NULL) != 0) return -1;
     const float* nr_gain = anr_get_gain(c->nr, NULL);
     if (!nr_gain) return -1;
     const float* tilt = hf_tilt_gain(c->tilt, f.n_freqs);                          /* the new stage */
     sk_min_f32(c->g_min,   nr_gain,  f.res_gain, f.n_freqs);                       /* min of the gains */
     sk_min_f32(c->g_total, c->g_min, tilt,       f.n_freqs);
-    sk_capply_gain_f32(c->spec, f.error_spec, c->g_total, f.n_freqs);              /* S(f) = E(f) . g */
+    sk_capply_gain_f32(c->spec, b.base_spec, c->g_total, f.n_freqs);               /* S(f) = B(f) . g */
     aec_cng_fill(&c->rng, c->spec, f.comfort_noise, f.res_gain, nr_gain,           /* comfort noise on the cut bins */
                  CNG_NR_GAIN_FLOOR, f.n_freqs);
     (void)ac_istft_push(c->istft, c->spec, out);                                   /* the one inverse transform */
@@ -166,8 +173,11 @@ Rules the chain relies on:
 - `aec_cng_fill` is told the AEC's own gain (`g_res`), which alone decides *which*
   bins are filled, and the denoiser gain (floored at `CNG_NR_GAIN_FLOOR`, or
   `MCAB_SAMPLE_CNG_NR_GAIN_FLOOR` in the 4-channel programs), which scales the *level*; it advances the
-  caller's `rng` state, so one RNG word per generator, reset to `CNG_RNG_SEED`
-  (`MCAB_SAMPLE_CNG_RNG_SEED`).
+  caller's `rng` state, so one RNG word per generator, reset to `AEC_CNG_SEED`
+  (`MCAB_SAMPLE_CNG_RNG_SEED`) at construction and whenever `aec_post_reset_serial()` moves.
+- `ctx.error_spec` / `ctx.formed_hop` are the analysis seam and are never rendered; the chain renders the
+  rendering base `aec_get_output_base()` hands out (the same spectrum `aec_process()` multiplies by its gain, `E`
+  bit for bit on every hop the output guard leaves alone) and the denoiser estimates on that same spectrum.
 - A spectrum-type stage (the 4-channel beamformer) is a function that takes the
   lane spectra and returns a spectrum; it replaces the error spectrum (`f.e` of the
   `McabFrame`) in the chain. The sample helper hands the BF spectrum to `mcab_fuse()` inside
@@ -177,7 +187,7 @@ Rules the chain relies on:
   a reset) and is never written through.
 - A refused call (a stage returns NULL or an error, or the emitted hop is not finite) is the
   integrator's to recover: reset the front end and every stage of the chain together
-  (the comfort-noise generator is restarted too: `rng = CNG_RNG_SEED`).
+  (the comfort-noise generator is restarted too: `rng = AEC_CNG_SEED`).
 
 ### Where do I call the inverse transform?
 
@@ -186,7 +196,8 @@ and comfort noise added.
 It performs the inverse FFT, the sqrt-Hann window and the overlap-add, and emits
 exactly one hop; the half-window it holds back is the pipeline's one hop of
 algorithmic latency. The spectrum must sit on the analysis frame of the same hop
-(the AEC's `error_spec` is the exact 50 %-overlap sqrt-Hann STFT); calling it
+(the AEC's `error_spec` is the exact 50 %-overlap sqrt-Hann STFT, and the rendering base is `error_spec` or the
+capture spectrum of the same frame); calling it
 twice in a hop, or skipping a hop, breaks the overlap-add. Applications that end in
 a neural stage call it inside `ulcnet_nn_stage_end()` or `dfn_hop_end()`.
 
@@ -215,12 +226,12 @@ AcIstft* istft = ac_istft_init(pool + ALIGN16(aec_b) + ALIGN16(nr_b), sy_b, &sy_
   the `AecRes`). Gain vectors the chain needs (`g_total`, the NR prior scratch, the
   spectrum buffer) are `n_freqs` floats / bins each, also from the caller's block.
 - `Mcab` owns only the flow state in its own pool (control block, mic lane, aligned far, the fuse
-  buffers with `enable_post`, the alignment ring): 73,504 B at 16 kHz/256 (MATCHED,
-  `enable_post = 1`; 68,288 B with `enable_post = 0`, `test_target_abi`). The four `Aec` lanes
-  (4 x 199,408 B at 16 kHz/256) and, MATCHED only, the shared `DelayAec` are separate objects the
+  buffers with `enable_post`, the alignment ring): 74,624 B at 16 kHz/256 (MATCHED,
+  `enable_post = 1`; 68,368 B with `enable_post = 0`, `test_target_abi`). The four `Aec` lanes
+  (4 x 200,992 B at 16 kHz/256) and, MATCHED only, the shared `DelayAec` are separate objects the
   application sizes and initialises (`aec_get_mem_size()`, `delay_aec_get_mem_size()`);
-  `mcab_external_static --print-mem-size` prints lanes 797,632 B and front end (estimator plus the
-  mcab pool) 108,928 B at 16 kHz/256 (48 kHz/1024: 2,912,064 B and 262,880 B). The sample beam helper
+  `mcab_external_static --print-mem-size` prints lanes 803,968 B and front end (estimator plus the
+  mcab pool) 110,048 B at 16 kHz/256 (48 kHz/1024: 2,936,832 B and 267,072 B). The sample beam helper
   (SRP-PHAT, BF, scratch) is one more block. The post-beam stages, the RES included, are separate blocks sized by their own queries
   (`aec_res_get_mem_size()` on an `AecConfig` from `aec_config_from_level()` with the flow's `fft_size`,
   `anr_get_mem_size()`, `ac_istft_get_mem_size()`),

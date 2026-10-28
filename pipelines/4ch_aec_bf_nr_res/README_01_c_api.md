@@ -28,8 +28,11 @@ The deployable C seam is:
   synthesis are not inside it. An application with its own beamformer calls the two `mcab` functions directly;
 - [`mcab_sample_post.h`](mcab_sample_post.h): header-only sample code (in no archive) between `mcab_fuse()` and the
   libraries behind it -- `mcab_sample_res_input()` fills the libaec `AecResInput` of a fused frame,
-  `mcab_sample_anr_gain()` runs the denoiser on it (folding `r2` into the noise floor when asked), and the
-  constants `MCAB_SAMPLE_CNG_NR_GAIN_FLOOR`, `MCAB_SAMPLE_CNG_RNG_SEED` and `MCAB_SAMPLE_PSD_SCALE_INV`;
+  `mcab_sample_anr_gain()` runs the denoiser on it (folding `r2` into the noise floor when asked),
+  `mcab_sample_post_reset_due()` tells the synthesis to follow a lane's post-chain reset, and the
+  constants `MCAB_SAMPLE_CNG_NR_GAIN_FLOOR`, `MCAB_SAMPLE_CNG_RNG_SEED` (= `AEC_CNG_SEED`, 42) and
+  `MCAB_SAMPLE_PSD_SCALE_INV`; the estimators read `frame.e`, the synthesis renders `frame.b` (README:
+  "Analysis and rendering spectra");
 - [`mcab_sample_driver.h`](mcab_sample_driver.h) and [`mcab_sample_driver.c`](mcab_sample_driver.c): the CLI
   parsing and the lifecycle/hop-loop skeleton shared by the four 4-channel samples (sample code);
 - [`mcab_external_static.c`](mcab_external_static.c): caller-owned-pool example that spells the application-side
@@ -133,11 +136,15 @@ mcab_fuse(pipeline, weights, NULL, &f);           /* NULL: rebuild E from the we
 
 /* The application chains its own stages over f (mcab_external_static.c post_hop() is the
  * example, tests/conv_chain_mcab.h the independent reference): */
-mcab_sample_res_input(&f, &rin);                   /* mcab_sample_post.h */
+mcab_sample_res_input(&f, &rin);                   /* mcab_sample_post.h; estimated on f.e */
 res = aec_res_process(my_res, &rin);               /* my_res: the caller's own AecRes */
-nr  = mcab_sample_anr_gain(my_nr, &f, scratch, 1); /* scratch: f.n_freqs floats */
+nr  = mcab_sample_anr_gain(my_nr, &f, scratch, 1); /* scratch: f.n_freqs floats; on f.e */
 sk_min_f32(total_gain, nr, res, f.n_freqs);
-sk_capply_gain_f32(spec, f.e, total_gain, f.n_freqs);
+if (mcab_sample_post_reset_due(&handled, &f)) {    /* a lane had a post-chain reset */
+    ac_istft_reset(my_istft);
+    rng = MCAB_SAMPLE_CNG_RNG_SEED;                 /* AEC_CNG_SEED */
+}
+sk_capply_gain_f32(spec, f.b, total_gain, f.n_freqs);   /* rendered on the rendering base */
 aec_cng_fill(&rng, spec, f.cn, res, nr, MCAB_SAMPLE_CNG_NR_GAIN_FLOOR, f.n_freqs);
 ac_istft_push(my_istft, spec, mono_output);
 
@@ -213,7 +220,8 @@ AcIstft *istft = ac_istft_init((uint8_t *)post_pool + ALIGN16(res_b) + ALIGN16(n
 
 /* per hop: mcab_sample_beam_process_with_activity() (or mcab_sample_beam_process_front() + mcab_sample_beam_process_beam()),
  * mcab_sample_beam_fuse(beam, &frame)  (frame.g_res_ctx is NULL), then
- * mcab_sample_res_input() + aec_res_process(res, ...), mcab_sample_anr_gain(nr, &frame, ...), sk_min_f32(), sk_capply_gain_f32(),
+ * mcab_sample_res_input() + aec_res_process(res, ...), mcab_sample_anr_gain(nr, &frame, ...) (on frame.e), sk_min_f32(),
+ * mcab_sample_post_reset_due() (ac_istft_reset + reseed when it returns 1), sk_capply_gain_f32() over frame.b,
  * aec_cng_fill(), ac_istft_push() as raw_chain() / static_chain() write them. A refused call:
  * mcab_sample_beam_reset(beam), aec_res_reset(res), anr_reset(nr), ac_istft_reset(istft) and
  * rng = MCAB_SAMPLE_CNG_RNG_SEED together. Strength: aec_res_set_level(res, level, ramp_ms),

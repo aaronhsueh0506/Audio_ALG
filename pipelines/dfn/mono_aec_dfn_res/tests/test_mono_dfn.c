@@ -24,10 +24,10 @@
 #include "utility/simd_kernels.h"
 #include "dfn/tests/dfn_test_fixture.h"
 #include "mono_aec_nr_res/tests/conv_chain_mono.h"
+#include "mono_aec_nr_res/tests/guard_scene.h"
 
 #define TEST_FRAMES 64
 #define CNG_NR_GAIN_FLOOR 0.31622777f
-#define CNG_RNG_SEED 0x9e3779b9u
 #define ECHO_DELAY 384
 
 static float erb_fwd[DFN2_N_BINS * DFN2_N_ERB];
@@ -58,12 +58,21 @@ static void make_hop(float *mic, float *ref, int frame) {
  * The composition under test, built from heap pieces as main.c builds it from one pool.
  * --------------------------------------------------------------------------------------- */
 
+/* Deliberate defects the identity tests plant to show they can fail. */
+enum { MDFN_SAB_NO_DELAY = 1, MDFN_SAB_ERROR_SPEC = 2, MDFN_SAB_NO_RESEED = 4, MDFN_SAB_NO_OLA_CLEAR = 8,
+       MDFN_SAB_LATE_CLEAR = 16 };   /* LATE_CLEAR: the bridge's synthesis clear lands one hop after the event */
+
 typedef struct MonoDfn {
     Aec *aec;
     float *unity, *total;        /* the RES gain path: min(1, G_res) */
     Complex *post;               /* P */
     void *post_mem;
     uint32_t rng;
+    uint32_t reset_serial;       /* the aec_post_reset_serial() value already handled */
+    uint32_t reset_pending;      /* bit k: a hard reset was seen k hops ago (the stage path's delay line) */
+    int bridge_clear_due;        /* LATE_CLEAR only: the event of the previous hop, cleared one hop late */
+    int sabotage;                /* negative controls (MDFN_SAB_*), 0 in the composition */
+    long guard_hops, reset_hops;
     int n_freqs, enable_cng;
     DfnResStage *stage;          /* driven directly at 48 kHz; the bridge's own below 48 kHz */
     DfnRateBridge *bridge;
@@ -121,7 +130,7 @@ static MonoDfn *mdfn_create(int sample_rate, int fft_size, int enable_cng, const
     m->total = (float *)((unsigned char *)m->post_mem + vec);
     m->post = (Complex *)((unsigned char *)m->post_mem + 2 * vec);
     for (k = 0; k < m->n_freqs; ++k) m->unity[k] = 1.0f;
-    m->rng = CNG_RNG_SEED;
+    m->rng = AEC_CNG_SEED;
 
     stage_cfg.erb_fwd = erb_fwd;
     stage_cfg.erb_inv = erb_inv;
@@ -149,24 +158,56 @@ static MonoDfn *mdfn_create(int sample_rate, int fft_size, int enable_cng, const
         if (!m->istft || !m->stage_out) goto fail;
         dfn_hop_init_stage(&m->hop, m->stage, m->istft, m->stage_out);
     }
+    m->reset_serial = aec_post_reset_serial(m->aec);
     return m;
 fail:
     mdfn_destroy(m);
     return NULL;
 }
 
-/* AEC, RES gain, P; the DFN hop begins on (E, P). */
+/* AEC, rendering base, the hard-reset event, RES gain, P; the DFN hop begins on (B, P), as main.c's
+ * rig_process() and follow_post_reset() do. */
 static int mdfn_begin(MonoDfn *m, const float *mic, const float *ref) {
     AecResContext c;
+    AecOutputBase base;
+    uint32_t serial, moved;
+    const Complex *b;
     aec_process_context(m->aec, mic, ref);
     aec_get_res_context(m->aec, &c);
     if (!c.error_spec || !c.res_gain) return -1;
+    memset(&base, 0, sizeof(base));
+    base.struct_size = sizeof(base);
+    if (aec_get_output_base(m->aec, &base) != 0) return -1;
+    b = (m->sabotage & MDFN_SAB_ERROR_SPEC) ? c.error_spec : base.base_spec;
+    if (base.guard_active) ++m->guard_hops;
+    serial = aec_post_reset_serial(m->aec);
+    moved = serial != m->reset_serial;
+    m->reset_serial = serial;
+    if (moved) ++m->reset_hops;
+    if (moved && !(m->sabotage & MDFN_SAB_NO_RESEED)) m->rng = AEC_CNG_SEED;
+    if (m->bridge) {
+        /* The bridge synthesises the host-grid spectra at the top of its begin(): the clear goes in
+         * on the hop of the event, with no delay line (dfn_rate_bridge.h). */
+        int clear = moved;
+        if (m->sabotage & MDFN_SAB_LATE_CLEAR) { clear = m->bridge_clear_due; m->bridge_clear_due = moved; }
+        if (clear && !(m->sabotage & MDFN_SAB_NO_OLA_CLEAR) &&
+            dfn_rate_bridge_reset_synthesis(m->bridge) != 0)
+            return -1;
+    }
+    if (m->istft && !(m->sabotage & MDFN_SAB_NO_OLA_CLEAR)) {
+        if (m->sabotage & MDFN_SAB_NO_DELAY) {
+            if (moved) ac_istft_reset(m->istft);
+        } else {
+            m->reset_pending = (m->reset_pending << 1) | moved;
+            if ((m->reset_pending >> DFN_RES_STAGE_LOOKAHEAD_FRAMES) & 1u) ac_istft_reset(m->istft);
+        }
+    }
     sk_min_f32(m->total, m->unity, c.res_gain, m->n_freqs);
-    sk_capply_gain_f32(m->post, c.error_spec, m->total, m->n_freqs);
+    sk_capply_gain_f32(m->post, b, m->total, m->n_freqs);
     if (m->enable_cng && c.comfort_noise)
         aec_cng_fill(&m->rng, m->post, c.comfort_noise, c.res_gain, m->unity, CNG_NR_GAIN_FLOOR,
                      m->n_freqs);
-    return dfn_hop_begin(&m->hop, c.error_spec, m->post) == 0 ? 0 : -1;
+    return dfn_hop_begin(&m->hop, b, m->post) == 0 ? 0 : -1;
 }
 
 static int mdfn_process(MonoDfn *m, const float *mic, const float *ref, float *out) {
@@ -194,6 +235,7 @@ static int run_identity(int enable_cng) {
     bcfg.enable_nr = 0;
     bcfg.enable_res = 1;
     bcfg.enable_cng = enable_cng;
+    bcfg.default_synth_window = 1;            /* the stage's synthesis is audiolib's default window */
     baseline = conv_mono_create(&bcfg);
     if (!baseline) return 2;
 
@@ -241,7 +283,7 @@ static int run_identity(int enable_cng) {
  * bridge. The hand-written chain's NR-off output delayed by the bridge's
  * added delay must match within the resampler round-trip error; a near-end
  * impulse pins the delay; the 48 kHz frame schedule is the documented one. */
-static int run_native(int sample_rate, int fft_size, int expected_sixths) {
+static int run_native(int sample_rate, int fft_size, int expected_sixths, int sabotage) {
     MonoDfn *dfn = mdfn_create(sample_rate, fft_size, 0, NULL);
     ConvMonoConfig bcfg = conv_mono_default_config(sample_rate, fft_size);
     ConvMono *baseline;
@@ -258,6 +300,7 @@ static int run_native(int sample_rate, int fft_size, int expected_sixths) {
     long long total_frames = 0;
 
     if (!dfn || dfn->bridge == NULL) return 1;
+    dfn->sabotage = sabotage;
     hop = dfn->hop_size;
     added = dfn_rate_bridge_added_delay_samples(dfn->bridge);
     if (dfn_rate_bridge_added_delay_exact(dfn->bridge, &num, &den) != 0 ||
@@ -320,17 +363,387 @@ static int run_native(int sample_rate, int fft_size, int expected_sixths) {
         float a = fabsf(mine[i]);
         if (a > peak_abs) { peak_abs = a; peak = i; }
     }
-    printf("mono_aec_dfn_res: host %d Hz/fft %d: added delay %d + %d/%d, pass-band "
-           "max error %.2e at %d (of %d; impulse at %d; signal peak %.2f), "
-           "impulse peak at +%d\n",
-           sample_rate, fft_size, added, num - added * den, den, (double)max_err, max_err_at, n, imp,
-           (double)max_sig, peak - imp - hop);
+    if (!sabotage)
+        printf("mono_aec_dfn_res: host %d Hz/fft %d: added delay %d + %d/%d, pass-band "
+               "max error %.2e at %d (of %d; impulse at %d; signal peak %.2f), "
+               "impulse peak at +%d, reset hops %ld\n",
+               sample_rate, fft_size, added, num - added * den, den, (double)max_err, max_err_at, n, imp,
+               (double)max_sig, peak - imp - hop, dfn->reset_hops);
     /* The impulse peak is the sample nearest to the exact position imp + hop + num / den. */
     if (abs(den * (peak - imp - hop) - num) * 2 >= den) return 6;
     if (!(max_err < 1e-3f)) return 7;
+    /* the stream must carry hard-reset events, or the row says nothing about the synthesis clear */
+    if (dfn->reset_hops < 1) return 15;
     conv_mono_destroy(baseline);
     mdfn_destroy(dfn);
     return 0;
+}
+
+
+/* ---------------------------------------------------------------------------------------
+ * The rendering base and the hard-reset event, through the stage and through the AEC alone.
+ * --------------------------------------------------------------------------------------- */
+
+typedef struct SceneRun {
+    long hops, diff_hops, guard_hops, reset_hops;
+    int ok;
+} SceneRun;
+
+static int mdfn_finish(MonoDfn *m, float *out) {
+    DfnResStageJob job;
+    int r;
+    while ((r = dfn_hop_nn_begin(&m->hop, &job)) == 1)
+        if (dfn_hop_nn_end(&m->hop, dfn_res_stage_infer(m->stage, &job)) != 0) return -1;
+    if (r < 0) return -1;
+    return dfn_hop_end(&m->hop, out) == 0 ? 0 : -1;
+}
+
+/* 48 kHz stage path with the identity model on a stream that fires the guard and restarts the filter:
+ * the output equals the hand-written chain (NR off, RES on) delayed by DFN_RES_STAGE_LOOKAHEAD_FRAMES
+ * hops, byte for byte. The chain clears its overlap-add tail at the reset hop; the stage path clears
+ * its own when the frame built on that hop reaches the synthesis, so the delay line is part of the
+ * claim (a clear at the reset hop itself must fail). */
+static void run_identity_scene(const GuardScene *sc, int sabotage, SceneRun *out) {
+    MonoDfn *dfn = mdfn_create(sc->sr, sc->fft, sc->enable_cng, NULL);
+    ConvMonoConfig bcfg = conv_mono_default_config(sc->sr, sc->fft);
+    ConvMono *baseline;
+    float *saved, *got;
+    int h, hop = sc->hop, k;
+    memset(out, 0, sizeof(*out));
+    bcfg.enable_nr = 0;
+    bcfg.enable_res = 1;
+    bcfg.enable_cng = sc->enable_cng;
+    bcfg.default_synth_window = 1;
+    baseline = conv_mono_create(&bcfg);
+    saved = (float *)calloc((size_t)sc->nh * hop, sizeof(float));
+    got = (float *)malloc((size_t)hop * sizeof(float));
+    if (!dfn || !baseline || !saved || !got) goto done;
+    dfn->sabotage = sabotage;
+    out->ok = 1;
+    for (h = 0; h < sc->nh; ++h) {
+        const float *mic = sc->mic + (size_t)h * hop, *ref = sc->far + (size_t)h * hop;
+        for (k = 0; k < 4; ++k)
+            if (sc->reset_at[k] == h) {          /* the application restarts the AEC and nothing else */
+                aec_reset(dfn->aec);
+                aec_reset(baseline->aec);
+            }
+        if (mdfn_begin(dfn, mic, ref) != 0 || mdfn_finish(dfn, got) != 0 ||
+            conv_mono_hop(baseline, mic, ref, saved + (size_t)h * hop) != 0) {
+            out->ok = 0;
+            break;
+        }
+        {
+            const float *want = h < DFN_RES_STAGE_LOOKAHEAD_FRAMES ? NULL
+                                : saved + (size_t)(h - DFN_RES_STAGE_LOOKAHEAD_FRAMES) * hop;
+            int i, same = 1;
+            for (i = 0; i < hop; ++i) if (got[i] != (want ? want[i] : 0.0f)) same = 0;
+            if (!same) ++out->diff_hops;
+        }
+        ++out->hops;
+    }
+    out->guard_hops = dfn->guard_hops;
+    out->reset_hops = dfn->reset_hops;
+done:
+    free(saved); free(got);
+    conv_mono_destroy(baseline);
+    mdfn_destroy(dfn);
+}
+
+/* The AEC alone: the post spectrum P of the composition (rendering base, RES gain, comfort noise, the
+ * reseed on the event), pushed through a synthesis of the test's own with the library's window table and
+ * the OLA clear on the same hop, equals aec_process() in full mode bit for bit. This is the
+ * "NR off, AEC only" claim for every host rate, the bridge's below-48 kHz hosts included: the
+ * stage is not involved (the fail-open model leaves P to the stage; P is what is compared). */
+static void run_post_chain(const GuardScene *sc, int sabotage, SceneRun *out) {
+    MonoDfn *dfn = mdfn_create(sc->sr, sc->fft, sc->enable_cng, NULL);
+    AecConfig cfg;
+    Aec *oracle = (Aec *)calloc(1, sizeof(Aec));
+    AcStftConfig scfg;
+    AcIstft *probe = NULL;
+    void *probe_mem = NULL;
+    float *want, *got, *scratch;
+    int h, hop = sc->hop, win_n = 0;
+    memset(out, 0, sizeof(*out));
+    want = (float *)malloc((size_t)hop * sizeof(float));
+    got = (float *)malloc((size_t)hop * sizeof(float));
+    scratch = (float *)malloc((size_t)(hop + 4096) * sizeof(float));
+    if (!dfn || !oracle || !want || !got || !scratch) goto done;
+    aec_config_from_level(&cfg, AEC_LEVEL_BALANCED, sc->sr);
+    cfg.fft_size = sc->fft;
+    cfg.enable_res = 1;
+    cfg.return_res_context = 0;
+    cfg.enable_cng = sc->enable_cng;
+    ac_stft_config_default(&scfg, sc->fft);
+    if (aec_create(oracle, &cfg) != 0 ||
+        aec_synthesis_window(oracle, &scfg.window, &win_n) != 0 || win_n != sc->fft ||
+        posix_memalign(&probe_mem, 16, ac_istft_get_mem_size(&scfg)) != 0)
+        goto done;
+    probe = ac_istft_init(probe_mem, ac_istft_get_mem_size(&scfg), &scfg);
+    if (!probe) goto done;
+    dfn->sabotage = sabotage;
+    out->ok = 1;
+    for (h = 0; h < sc->nh; ++h) {
+        long resets = dfn->reset_hops;
+        if (mdfn_begin(dfn, sc->mic + (size_t)h * hop, sc->far + (size_t)h * hop) != 0 ||
+            mdfn_finish(dfn, scratch) != 0) {
+            out->ok = 0;
+            break;
+        }
+        aec_process(oracle, sc->mic + (size_t)h * hop, sc->far + (size_t)h * hop, want);
+        if (dfn->reset_hops != resets) ac_istft_reset(probe);
+        (void)ac_istft_push(probe, dfn->post, got);
+        if (memcmp(want, got, (size_t)hop * sizeof(float)) != 0) ++out->diff_hops;
+        ++out->hops;
+    }
+    out->guard_hops = dfn->guard_hops;
+    out->reset_hops = dfn->reset_hops;
+done:
+    free(want); free(got); free(scratch);
+    if (oracle) { aec_destroy(oracle); free(oracle); }
+    free(probe_mem);
+    mdfn_destroy(dfn);
+}
+
+static int run_scene_tests(void) {
+    static const struct { int sr, fft, seconds; } g[] = { {16000, 256, 10}, {16000, 512, 10}, {48000, 1024, 5} };
+    size_t gi;
+    int failures = 0;
+    for (gi = 0; gi < sizeof g / sizeof g[0]; ++gi) {
+        GuardScene moving, quiet;
+        SceneRun r;
+        int built = guard_scene_make(&moving, "moving", g[gi].sr, g[gi].fft, g[gi].seconds, 0x2545F491u, 1, 1, 1, 0) == 0;
+        built &= guard_scene_make(&quiet, "never usable", g[gi].sr, g[gi].fft, g[gi].seconds, 0x1234567u, 0, 0, 0, 30) == 0;
+        if (!built) { fprintf(stderr, "scene build failed\n"); return 1; }
+        {   int n = quiet.nh * quiet.hop, i; for (i = 0; i < n; ++i) quiet.mic[i] += 0.03f * gs_rnd(); }
+        moving.reset_at[0] = moving.nh / 2;
+        {
+            const GuardScene *scenes[2] = { &moving, &quiet };
+            int si;
+            long guard = 0, resets = 0;
+            for (si = 0; si < 2; ++si) {
+                run_post_chain(scenes[si], 0, &r);
+                if (!r.ok || r.diff_hops != 0) {
+                    fprintf(stderr, "post chain %d Hz/%d scene %d: %ld hops differ from aec_process()\n",
+                            g[gi].sr, g[gi].fft, si, r.diff_hops);
+                    ++failures;
+                }
+                guard += r.guard_hops; resets += r.reset_hops;
+            }
+            printf("mono_aec_dfn_res: post chain %d Hz/%d equals aec_process() bit for bit (guard hops %ld, resets %ld)\n",
+                   g[gi].sr, g[gi].fft, guard, resets);
+            if (guard == 0 || resets == 0) { fprintf(stderr, "post chain %d Hz/%d: scenes miss guard/reset\n", g[gi].sr, g[gi].fft); ++failures; }
+            /* negative controls: each planted defect must change the output */
+            {
+                static const int sabs[] = { MDFN_SAB_ERROR_SPEC, MDFN_SAB_NO_RESEED };
+                size_t c;
+                for (c = 0; c < sizeof sabs / sizeof sabs[0]; ++c) {
+                    run_post_chain(&moving, sabs[c], &r);
+                    if (!r.ok || r.diff_hops == 0) {
+                        fprintf(stderr, "post chain %d Hz/%d: planted defect %d not detected\n", g[gi].sr, g[gi].fft, sabs[c]);
+                        ++failures;
+                    }
+                }
+            }
+        }
+        if (g[gi].sr == DFN2_SR) {
+            SceneRun a;
+            long guard = 0, resets = 0;
+            run_identity_scene(&moving, 0, &a);
+            guard += a.guard_hops; resets += a.reset_hops;
+            if (!a.ok || a.diff_hops != 0) { fprintf(stderr, "stage identity (moving): %ld hops differ\n", a.diff_hops); ++failures; }
+            run_identity_scene(&quiet, 0, &a);
+            guard += a.guard_hops; resets += a.reset_hops;
+            if (!a.ok || a.diff_hops != 0) { fprintf(stderr, "stage identity (never usable): %ld hops differ\n", a.diff_hops); ++failures; }
+            printf("mono_aec_dfn_res: 48 kHz stage identity with the hard-reset event delayed by %d hops equals the hand-written chain "
+                   "(guard hops %ld, resets %ld)\n", DFN_RES_STAGE_LOOKAHEAD_FRAMES, guard, resets);
+            if (guard == 0 || resets == 0) { fprintf(stderr, "stage identity: scenes miss guard/reset\n"); ++failures; }
+            {
+                /* The delay defect removes DFN_RES_STAGE_LOOKAHEAD_FRAMES hops of delay, so it only exists when that is non-zero. */
+                static const int sabs[] = { MDFN_SAB_NO_OLA_CLEAR, MDFN_SAB_ERROR_SPEC, MDFN_SAB_NO_RESEED, MDFN_SAB_NO_DELAY };
+                size_t c, n_sab = sizeof sabs / sizeof sabs[0];
+                if (DFN_RES_STAGE_LOOKAHEAD_FRAMES == 0) --n_sab;
+                for (c = 0; c < n_sab; ++c) {
+                    run_identity_scene(&moving, sabs[c], &a);
+                    if (!a.ok || a.diff_hops == 0) {
+                        fprintf(stderr, "stage identity: planted defect %d not detected\n", sabs[c]);
+                        ++failures;
+                    }
+                }
+            }
+        }
+        guard_scene_free(&moving);
+        guard_scene_free(&quiet);
+    }
+    return failures;
+}
+
+/* The bridge's host-grid synthesis against the hand-written chain and aec_process(), hop by hop, on
+ * the moving scene (guard hops, delay changes and an application aec_reset) and the never-usable one.
+ * Unity model: P goes through the bridge, whose native-grid synthesis (dfn_rate_bridge_get_host_hops)
+ * is the host synthesis of the protocol. With the clear on the hop of the event
+ *   - the apply lane equals the chain (same window, same protocol, comfort noise on) bit for bit,
+ *   - the estimate lane equals an independent synthesis of the rendering base, bit for bit,
+ *   - the apply lane stays within the window rounding of aec_process() of a full-mode Aec (the bridge
+ *     synthesises with audiolib's default window, the AEC with its own table; they differ in the last
+ *     float bit), reset hops included.
+ * The bridge's downstream (resamplers, stage) is not bit-identical to anything by construction; the
+ * pass-band rows of run_native cover it. */
+typedef struct BridgeSceneRun {
+    long hops, apply_diff_hops, estimate_diff_hops, guard_hops, reset_hops, reset_hops_off;
+    double max_dev, max_dev_reset;   /* apply lane against aec_process(): everywhere / on the reset hops */
+    int ok;
+} BridgeSceneRun;
+
+static void run_bridge_scene(const GuardScene *sc, int sabotage, BridgeSceneRun *out) {
+    MonoDfn *dfn = mdfn_create(sc->sr, sc->fft, sc->enable_cng, NULL);
+    ConvMonoConfig bcfg = conv_mono_default_config(sc->sr, sc->fft);
+    ConvMono *chain;
+    AecConfig cfg;
+    Aec *oracle = (Aec *)calloc(1, sizeof(Aec));
+    AcStftConfig scfg;
+    AcIstft *probe = NULL;
+    void *probe_mem = NULL;
+    float *want, *chain_hop, *probe_hop, *scratch;
+    int h, hop = sc->hop, k;
+    memset(out, 0, sizeof(*out));
+    bcfg.enable_nr = 0;
+    bcfg.enable_res = 1;
+    bcfg.enable_cng = sc->enable_cng;
+    bcfg.default_synth_window = 1;
+    chain = conv_mono_create(&bcfg);
+    want = (float *)malloc((size_t)hop * sizeof(float));
+    chain_hop = (float *)malloc((size_t)hop * sizeof(float));
+    probe_hop = (float *)malloc((size_t)hop * sizeof(float));
+    scratch = (float *)malloc((size_t)hop * sizeof(float));
+    if (!dfn || !dfn->bridge || !chain || !oracle || !want || !chain_hop || !probe_hop || !scratch) goto done;
+    aec_config_from_level(&cfg, AEC_LEVEL_BALANCED, sc->sr);
+    cfg.fft_size = sc->fft;
+    cfg.enable_res = 1;
+    cfg.return_res_context = 0;
+    cfg.enable_cng = sc->enable_cng;
+    ac_stft_config_default(&scfg, sc->fft);
+    if (aec_create(oracle, &cfg) != 0 ||
+        posix_memalign(&probe_mem, 16, ac_istft_get_mem_size(&scfg)) != 0)
+        goto done;
+    probe = ac_istft_init(probe_mem, ac_istft_get_mem_size(&scfg), &scfg);
+    if (!probe) goto done;
+    dfn->sabotage = sabotage;
+    out->ok = 1;
+    for (h = 0; h < sc->nh; ++h) {
+        const float *mic = sc->mic + (size_t)h * hop, *ref = sc->far + (size_t)h * hop;
+        const float *te, *tp;
+        long resets = dfn->reset_hops;
+        int moved, i;
+        AecOutputBase base;
+        for (k = 0; k < 4; ++k)
+            if (sc->reset_at[k] == h) {          /* the application restarts the AEC and nothing else */
+                aec_reset(dfn->aec);
+                aec_reset(chain->aec);
+                aec_reset(oracle);
+            }
+        if (mdfn_begin(dfn, mic, ref) != 0 ||
+            dfn_rate_bridge_get_host_hops(dfn->bridge, &te, &tp) != 0) {
+            out->ok = 0;
+            break;
+        }
+        moved = dfn->reset_hops != resets;
+        memset(&base, 0, sizeof(base));
+        base.struct_size = sizeof(base);
+        if (aec_get_output_base(dfn->aec, &base) != 0) { out->ok = 0; break; }
+        if (conv_mono_hop(chain, mic, ref, chain_hop) != 0) { out->ok = 0; break; }
+        aec_process(oracle, mic, ref, want);
+        if (moved) ac_istft_reset(probe);
+        (void)ac_istft_push(probe, base.base_spec, probe_hop);
+        if (memcmp(tp, chain_hop, (size_t)hop * sizeof(float)) != 0) ++out->apply_diff_hops;
+        if (memcmp(te, probe_hop, (size_t)hop * sizeof(float)) != 0) ++out->estimate_diff_hops;
+        for (i = 0; i < hop; ++i) {
+            double d = fabs((double)tp[i] - (double)want[i]);
+            if (d > out->max_dev) out->max_dev = d;
+            if (moved && d > out->max_dev_reset) out->max_dev_reset = d;
+        }
+        if (mdfn_finish(dfn, scratch) != 0) { out->ok = 0; break; }
+        ++out->hops;
+    }
+    out->guard_hops = dfn->guard_hops;
+    out->reset_hops = dfn->reset_hops;
+done:
+    free(want); free(chain_hop); free(probe_hop); free(scratch);
+    free(probe_mem);
+    if (oracle) { aec_destroy(oracle); free(oracle); }
+    conv_mono_destroy(chain);
+    mdfn_destroy(dfn);
+}
+
+static int run_bridge_scene_tests(void) {
+    static const struct { int sr, fft, seconds; } g[] = { {16000, 256, 10}, {16000, 512, 10}, {8000, 256, 10} };
+    size_t gi;
+    int failures = 0;
+    for (gi = 0; gi < sizeof g / sizeof g[0]; ++gi) {
+        GuardScene moving, quiet;
+        const GuardScene *scenes[2];
+        BridgeSceneRun r;
+        double dev = 0.0, dev_reset = 0.0;
+        long guard = 0, resets = 0, hops = 0;
+        int si, built;
+        built = guard_scene_make(&moving, "moving", g[gi].sr, g[gi].fft, g[gi].seconds, 0x2545F491u, 1, 1, 1, 0) == 0;
+        built &= guard_scene_make(&quiet, "never usable", g[gi].sr, g[gi].fft, g[gi].seconds, 0x1234567u, 0, 0, 0, 30) == 0;
+        if (!built) { fprintf(stderr, "scene build failed\n"); return 1; }
+        {   int n = quiet.nh * quiet.hop, i; for (i = 0; i < n; ++i) quiet.mic[i] += 0.03f * gs_rnd(); }
+        moving.reset_at[0] = moving.nh / 2;
+        scenes[0] = &moving;
+        scenes[1] = &quiet;
+        for (si = 0; si < 2; ++si) {
+            run_bridge_scene(scenes[si], 0, &r);
+            if (!r.ok || r.apply_diff_hops != 0 || r.estimate_diff_hops != 0) {
+                fprintf(stderr, "bridge synthesis %d Hz/%d scene %d: %ld apply / %ld estimate hops differ\n",
+                        g[gi].sr, g[gi].fft, si, r.apply_diff_hops, r.estimate_diff_hops);
+                ++failures;
+            }
+            guard += r.guard_hops; resets += r.reset_hops; hops += r.hops;
+            if (r.max_dev > dev) dev = r.max_dev;
+            if (r.max_dev_reset > dev_reset) dev_reset = r.max_dev_reset;
+        }
+        printf("mono_aec_dfn_res: bridge synthesis %d Hz/%d with the clear on the hop of the event: %ld hops bit-exact to the "
+               "hand-written chain (guard hops %ld, resets %ld), max |apply lane - aec_process()| %.2e (on reset hops %.2e)\n",
+               g[gi].sr, g[gi].fft, hops, guard, resets, dev, dev_reset);
+        if (resets == 0 || (g[gi].sr == 16000 && guard == 0)) {
+            fprintf(stderr, "bridge synthesis %d Hz/%d: scenes miss guard/reset\n", g[gi].sr, g[gi].fft);
+            ++failures;
+        }
+        /* window rounding only (the last float bit); a missing clear is off by the whole overlap-add tail */
+        if (!(dev < 1e-5) || !(dev_reset < 1e-5)) {
+            fprintf(stderr, "bridge synthesis %d Hz/%d: apply lane deviates %.2e from aec_process()\n",
+                    g[gi].sr, g[gi].fft, dev);
+            ++failures;
+        }
+        /* negative controls: each planted defect must change the apply lane (and the estimate lane for the base) */
+        {
+            static const int sabs[] = { MDFN_SAB_NO_OLA_CLEAR, MDFN_SAB_LATE_CLEAR, MDFN_SAB_NO_RESEED, MDFN_SAB_ERROR_SPEC };
+            size_t c;
+            for (c = 0; c < sizeof sabs / sizeof sabs[0]; ++c) {
+                long diff = 0, ediff = 0;
+                double sab_dev_reset = 0.0;
+                for (si = 0; si < 2; ++si) {
+                    run_bridge_scene(scenes[si], sabs[c], &r);
+                    diff += r.apply_diff_hops; ediff += r.estimate_diff_hops;
+                    if (r.max_dev_reset > sab_dev_reset) sab_dev_reset = r.max_dev_reset;
+                }
+                if (diff == 0) {
+                    fprintf(stderr, "bridge synthesis %d Hz/%d: planted defect %d not detected\n", g[gi].sr, g[gi].fft, sabs[c]);
+                    ++failures;
+                }
+                if ((sabs[c] == MDFN_SAB_NO_OLA_CLEAR || sabs[c] == MDFN_SAB_LATE_CLEAR) &&
+                    (ediff == 0 || !(sab_dev_reset > 1e-3))) {
+                    fprintf(stderr, "bridge synthesis %d Hz/%d: defect %d not seen on the estimate lane / aec_process() "
+                            "(estimate hops %ld, deviation %.2e)\n", g[gi].sr, g[gi].fft, sabs[c], ediff, sab_dev_reset);
+                    ++failures;
+                }
+            }
+        }
+        guard_scene_free(&moving);
+        guard_scene_free(&quiet);
+    }
+    return failures;
 }
 
 /* The lane grid the composition starts from (libaec's) refuses what no DFN2 host grid can be. */
@@ -421,12 +834,31 @@ int main(void) {
     if (rc) { fprintf(stderr, "mono DFN identity (cng off) failed: %d\n", rc); return 1; }
     rc = run_identity(1);
     if (rc) { fprintf(stderr, "mono DFN identity (cng on) failed: %d\n", rc); return 1; }
-    rc = run_native(16000, 256, dfn_fixture_bridge_added_delay_sixths(16000, 128));
+    rc = run_scene_tests();
+    if (rc) { fprintf(stderr, "mono DFN guard / reset scenes failed: %d\n", rc); return 1; }
+    rc = run_bridge_scene_tests();
+    if (rc) { fprintf(stderr, "mono DFN bridge synthesis / reset scenes failed: %d\n", rc); return 1; }
+    rc = run_native(16000, 256, dfn_fixture_bridge_added_delay_sixths(16000, 128), 0);
     if (rc) { fprintf(stderr, "mono DFN 16 kHz/256 bridge gate failed: %d\n", rc); return 1; }
-    rc = run_native(16000, 512, dfn_fixture_bridge_added_delay_sixths(16000, 256));
+    rc = run_native(16000, 512, dfn_fixture_bridge_added_delay_sixths(16000, 256), 0);
     if (rc) { fprintf(stderr, "mono DFN 16 kHz/512 bridge gate failed: %d\n", rc); return 1; }
-    rc = run_native(8000, 256, dfn_fixture_bridge_added_delay_sixths(8000, 128));
+    rc = run_native(8000, 256, dfn_fixture_bridge_added_delay_sixths(8000, 128), 0);
     if (rc) { fprintf(stderr, "mono DFN 8 kHz/256 bridge gate failed: %d\n", rc); return 1; }
+    {   /* the pass-band bar must see a bridge that ignores the event, or clears it a hop late (return 7 = the bar) */
+        static const struct { int sr, fft, hop; } nat[] = { {16000, 256, 128}, {16000, 512, 256}, {8000, 256, 128} };
+        static const int sabs[] = { MDFN_SAB_NO_OLA_CLEAR, MDFN_SAB_LATE_CLEAR };
+        size_t gi, c;
+        for (gi = 0; gi < 3; ++gi)
+            for (c = 0; c < 2; ++c) {
+                rc = run_native(nat[gi].sr, nat[gi].fft, dfn_fixture_bridge_added_delay_sixths(nat[gi].sr, nat[gi].hop), sabs[c]);
+                if (rc != 7) {
+                    fprintf(stderr, "mono DFN %d Hz/%d bridge gate: planted defect %d not detected (rc %d)\n",
+                            nat[gi].sr, nat[gi].fft, sabs[c], rc);
+                    return 1;
+                }
+            }
+        puts("mono_aec_dfn_res: pass-band bridge rows reject a missing or late synthesis clear");
+    }
     {
         static const int grids[4][2] = {{48000, 1024}, {16000, 256}, {16000, 512}, {8000, 256}};
         int g, b;

@@ -91,11 +91,14 @@ static void board_mem_free(void* p) {
 /* Comfort noise follows the denoiser gain of its bin but never below this amplitude (-10 dB),
  * so the residual echo it masks does not surface. */
 #define CNG_NR_GAIN_FLOOR 0.31622777f
-/* Start state of the comfort-noise generator (aec_cng_fill). */
-#define CNG_RNG_SEED 0x9e3779b9u
 /* The AEC's residual-echo powers are on the int16^2 scale, the denoiser's on the audio scale;
  * the reciprocal is a power of two, so the multiply is exact. */
 #define PSD_SCALE_INV (1.0f / (32768.0f * 32768.0f))
+
+/* The synthesis borrows the AEC's own window table (aec_synthesis_window()), which exists once the AEC is
+ * initialised, after the pool is sized. A borrowed table carves nothing, so any non-NULL pointer sizes the
+ * synthesis the same; this one stands in until mono_init() installs the AEC's. */
+static const float k_sizing_window[1] = {0.0f};
 
 typedef struct MonoPlan {
     AecSignalGrid grid;
@@ -112,7 +115,8 @@ typedef struct MonoStages {
     AcIstft* istft;
     float *total_gain, *extra_noise;
     Complex* spec;
-    uint32_t rng;
+    uint32_t rng;           /* comfort-noise state; AEC_CNG_SEED after every hard post-chain reset */
+    uint32_t reset_serial;  /* the aec_post_reset_serial() value already handled */
 } MonoStages;
 
 /** Step 1: the lane's grid and AecConfig, the denoiser and synthesis configs, and the pool as
@@ -133,6 +137,7 @@ static int mono_plan(MonoPlan* plan, int sample_rate) {
     plan->aec_cfg.return_res_context = 1;
     plan->nr_cfg = anr_config_for_level_grid(sample_rate, plan->grid.fft_size, ANR_LEVEL_BALANCED);
     ac_stft_config_default(&plan->synth_cfg, plan->grid.fft_size);
+    plan->synth_cfg.window = k_sizing_window;
     plan->aec_bytes = aec_get_mem_size(&plan->aec_cfg);
     plan->nr_bytes = anr_get_mem_size(&plan->nr_cfg);
     plan->synth_bytes = ac_istft_get_mem_size(&plan->synth_cfg);
@@ -154,11 +159,15 @@ static void mono_destroy(MonoStages* s);
  * NULL stages on refusal. */
 static int mono_init(MonoStages* s, void* pool, size_t bytes, const MonoPlan* plan) {
     uint8_t* cur = (uint8_t*)pool;
+    AcStftConfig synth = plan->synth_cfg;
+    int win_n = 0;
     memset(s, 0, sizeof(*s));
     if (!pool || bytes < plan->total) return -1;
     s->aec = aec_init(cur, plan->aec_bytes, &plan->aec_cfg);
     if (s->aec) s->nr = anr_init(cur + plan->nr_offset, plan->nr_bytes, &plan->nr_cfg);
-    if (s->nr) s->istft = ac_istft_init(cur + plan->synth_offset, plan->synth_bytes, &plan->synth_cfg);
+    /* The AEC's own synthesis window table: the chain then equals aec_process() to the bit. */
+    if (s->nr && aec_synthesis_window(s->aec, &synth.window, &win_n) == 0 && win_n == synth.fft_size)
+        s->istft = ac_istft_init(cur + plan->synth_offset, plan->synth_bytes, &synth);
     if (!s->istft) {
         mono_destroy(s);
         memset(s, 0, sizeof(*s));
@@ -168,30 +177,45 @@ static int mono_init(MonoStages* s, void* pool, size_t bytes, const MonoPlan* pl
     s->total_gain = (float*)cur;  cur += plan->vec_bytes;
     s->extra_noise = (float*)cur; cur += plan->vec_bytes;
     s->spec = (Complex*)cur;
-    s->rng = CNG_RNG_SEED;
+    s->rng = AEC_CNG_SEED;
+    s->reset_serial = aec_post_reset_serial(s->aec);
     return 0;
 }
 
-/** One hop: G_res is the AEC's own (ctx.res_gain), G_nr the denoiser's over the same error
- * spectrum with the residual-echo powers folded into its noise floor while the linear estimate
- * is usable; P = E * min(G_nr, G_res) plus comfort noise on the bins the RES cut, then
- * synthesis. */
+/** One hop: G_res is the AEC's own (ctx.res_gain), G_nr the denoiser's over the rendering base
+ * (aec_get_output_base: the error spectrum, or error + echo on a hop where the output guard
+ * fired; the spectrum the gain is applied to) with the residual-echo powers folded into its noise
+ * floor while the linear estimate is usable; P = B * min(G_nr, G_res) plus comfort noise on the
+ * bins the RES cut, then synthesis. When aec_post_reset_serial() moved during the AEC call (a
+ * hard post-chain reset), the overlap-add tail is cleared and the comfort noise reseeded before the
+ * first draw and the push of this hop; the denoiser keeps running. */
 static int mono_hop(MonoStages* s, const float* mic, const float* ref, float* out) {
     AecResContext c;
+    AecOutputBase ob;
     const float* extra = NULL;
     const float* nr;
+    uint32_t serial;
     aec_process_context(s->aec, mic, ref);
     aec_get_res_context(s->aec, &c);
     if (!c.error_spec || !c.res_gain) return -1;
+    memset(&ob, 0, sizeof(ob));
+    ob.struct_size = sizeof(ob);
+    if (aec_get_output_base(s->aec, &ob) != 0) return -1;
+    serial = aec_post_reset_serial(s->aec);
+    if (serial != s->reset_serial) {
+        s->reset_serial = serial;
+        ac_istft_reset(s->istft);
+        s->rng = AEC_CNG_SEED;
+    }
     if (c.r2 && c.usable_linear) {
         sk_scale_f32(s->extra_noise, c.r2, PSD_SCALE_INV, c.n_freqs);
         extra = s->extra_noise;
     }
-    if (anr_process_gain(s->nr, c.error_spec, extra, NULL) != 0) return -1;
+    if (anr_process_gain(s->nr, ob.base_spec, extra, NULL) != 0) return -1;
     nr = anr_get_gain(s->nr, NULL);
     if (!nr) return -1;
     sk_min_f32(s->total_gain, nr, c.res_gain, c.n_freqs);   /* NaN in the second operand reaches the finite gate; in the first it is replaced */
-    sk_capply_gain_f32(s->spec, c.error_spec, s->total_gain, c.n_freqs);
+    sk_capply_gain_f32(s->spec, ob.base_spec, s->total_gain, c.n_freqs);
     if (c.comfort_noise)
         aec_cng_fill(&s->rng, s->spec, c.comfort_noise, c.res_gain, nr, CNG_NR_GAIN_FLOOR,
                      c.n_freqs);
@@ -203,7 +227,8 @@ static void mono_reset(MonoStages* s) {
     aec_reset(s->aec);
     anr_reset(s->nr);
     ac_istft_reset(s->istft);
-    s->rng = CNG_RNG_SEED;
+    s->rng = AEC_CNG_SEED;
+    s->reset_serial = aec_post_reset_serial(s->aec);
 }
 
 /** Step 7: reverse carve order; a no-op per module on a pool-resident instance, but still

@@ -219,22 +219,22 @@ fallback VAD 的噪聲 EMA 係數（0.999／0.95）同樣依 hop retime。
 | `geometry` 與座標 | 不變 |
 
 ne10、`SIMD=1`、`delay_mode=MATCHED`（`delay_num_filters` = 5）預設的實測（`mcab_static` 與 `mcab_external_static` 的 `--print-mem-size` 輸出，
-以及 `mcab_sample_unit_memory()`、`mcab_sample_flow_get_mem_size()`、`mcab_sample_beam_get_mem_size()` 的直接查詢；`layout_version=25`）。
+以及 `mcab_sample_unit_memory()`、`mcab_sample_flow_get_mem_size()`、`mcab_sample_beam_get_mem_size()` 的直接查詢；`layout_version=26`）。
 **Flow 物件** = 四條 lane + 共用 estimator（含 `DelayAec` 結構）+ mcab 自己的 pool；**helper** = `mcab_sample_beam_get_mem_size()`；**Unit** = Flow 物件 + helper（`mcab_static` 的 `Unit:`）；
 **後級** = RES + NR + 合成 + 增益／頻譜暫存（範例程式自己各自查大小後加總）。mcab 與 helper 都**不含**後級，後級另計：
 
 | Config | Flow 物件 | helper | Unit | 後級 | 合計（`Total:`） |
 |---|---:|---:|---:|---:|---:|
-| 16000，全預設（256/128，`num_angles=72`） | 906,560（lane ×4 797,632 + estimator 與 mcab pool 108,928；其中 mcab pool 73,504） | 792,224 | 1,698,784 | 66,688 | 1,765,472 |
-| 16000，`fft_size = 512` | 1,422,464（lane ×4 1,306,368 + estimator 與 mcab pool 116,096；其中 mcab pool 80,672） | 1,569,952 | 2,992,416 | 96,464 | 3,088,880 |
-| 16000，`num_angles = 360` | 906,560 | 3,794,336 | 4,700,896 | 66,688 | 4,767,584 |
-| 48000，全預設（1024/512，`num_angles=72`） | 3,174,944（lane ×4 2,912,064 + estimator 與 mcab pool 262,880；其中 mcab pool 226,080） | 3,125,408 | 6,300,352 | 225,056 | 6,525,408 |
+| 16000，全預設（256/128，`num_angles=72`） | 914,016（lane ×4 803,968 + estimator 與 mcab pool 110,048；其中 mcab pool 74,624） | 792,224 | 1,706,240 | 66,688 | 1,772,928 |
+| 16000，`fft_size = 512` | 1,437,088（lane ×4 1,318,848 + estimator 與 mcab pool 118,240；其中 mcab pool 82,816） | 1,569,952 | 3,007,040 | 96,464 | 3,103,504 |
+| 16000，`num_angles = 360` | 914,016 | 3,794,336 | 4,708,352 | 66,688 | 4,775,040 |
+| 48000，全預設（1024/512，`num_angles=72`） | 3,203,904（lane ×4 2,936,832 + estimator 與 mcab pool 267,072；其中 mcab pool 230,272） | 3,125,408 | 6,329,312 | 225,056 | 6,554,368 |
 
 後級在 16 kHz/256 為 RES 7,904 + NR 45,344 + 合成 11,344 + 暫存 2,096 B，16 kHz/512 為 14,048 + 56,432 + 21,840 + 4,144 B，
 48 kHz/1024 為 29,408 + 144,576 + 42,832 + 8,240 B（`aec_res_get_mem_size()` 等的實測）。`mcab_static` 的 CLI 沒有 `num_angles` 選項，
 `num_angles = 360` 那列是在程式裡設 `bp.num_angles` 後呼叫 `mcab_sample_unit_memory()` 的結果。
-`enable_post = 0`（ULCNet 範例的設定檔，`delay_num_filters = 5`）時 mcab 自己的 pool 較小（16 kHz/256 為 68,288、16 kHz/512 為 70,336、48 kHz/1024 為 205,504），
-Unit 為 1,693,568（16 kHz/256）、2,982,080（16 kHz/512）、6,279,776（48 kHz/1024）。
+`enable_post = 0`（ULCNet 範例的設定檔，`delay_num_filters = 5`）時 mcab 自己的 pool 較小（16 kHz/256 為 68,368、16 kHz/512 為 70,416、48 kHz/1024 為 205,584），
+Unit 為 1,699,984（16 kHz/256）、2,994,640（16 kHz/512）、6,304,624（48 kHz/1024）。
 
 ⚠ 上表是某一次建置的實測輸出，不是契約：這些 byte 數不會隨程式改動自動更新——引用前請自己現查一次。
 

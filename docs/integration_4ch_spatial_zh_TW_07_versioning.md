@@ -7,14 +7,14 @@ lane 與 estimator 各由 libaec 自己的 `*_get_mem_size()` 查大小。
 ### 8.1 `McabMemReq`
 
 固定 32 bytes、每個欄位固定 byte offset（由 header 內的 `_Static_assert` 釘死），
-全部是定寬整數。本次 checkout，`layout_version=25`（`MCAB_LAYOUT_VERSION`；4ch flow 只剩一個 descriptor，見 `mcab.h`），
+全部是定寬整數。本次 checkout，`layout_version=26`（`MCAB_LAYOUT_VERSION`；4ch flow 只剩一個 descriptor，見 `mcab.h`），
 它只描述 **mcab 自己的 pool**（control block、mic lane、aligned far、`enable_post` 時的 fuse 緩衝、MATCHED／FIXED 的對齊環）：
 lane、estimator、SRP、BF 都不在其中。`MCAB_DESCRIPTOR_VERSION` 為 1。
 
 | Offset | 欄位 | 型別 | 目前值 |
 |---:|---|---|---|
 | 0 | `descriptor_version` | `uint32_t` | `1` |
-| 4 | `layout_version` | `uint32_t` | `25` |
+| 4 | `layout_version` | `uint32_t` | `26` |
 | 8 | `backend_id` | `uint32_t` | `2` = NE10（`MCAB_BACKEND_NE10`；目前唯一的 FFT 後端；永遠不會是 0 或 1） |
 | 12 | `build_flags_hash` | `uint32_t` | FNV-1a-32，只涵蓋 carve 結構（`mcab.c` 的 `mcab_build_flags_hash()` 的 carve token），不含可調數值 |
 | 16 | `alignment` | `uint32_t` | `16` |

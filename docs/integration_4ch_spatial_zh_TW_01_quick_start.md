@@ -92,7 +92,7 @@ int main(void) {
             g_nr = mcab_sample_anr_gain(nr, &f, extra_noise, 1);
         if (g_nr) {
             sk_min_f32(total_gain, g_nr, g_res, n);
-            sk_capply_gain_f32(spec, f.e, total_gain, n);
+            sk_capply_gain_f32(spec, f.b, total_gain, n);   /* 估計用 f.e，合成用 f.b */
             if (f.cn) aec_cng_fill(&rng, spec, f.cn, g_res, g_nr, MCAB_SAMPLE_CNG_NR_GAIN_FLOOR, n);
             (void)ac_istft_push(istft, spec, out);
         }

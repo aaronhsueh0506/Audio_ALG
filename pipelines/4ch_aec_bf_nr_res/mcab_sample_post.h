@@ -2,12 +2,16 @@
  * (not part of the mcab module or its archive). Header-only, no ABI: copy and adapt.
  *
  * Per hop, over the McabFrame mcab_fuse() returned:
- *     AecResInput in;  mcab_sample_res_input(&frame, &in);
+ *     AecResInput in;  mcab_sample_res_input(&frame, &in);           // analysis: E, Y, R^2, N^2
  *     G_res = aec_res_process(res, &in);
- *     G_nr  = mcab_sample_anr_gain(nr, &frame, scratch, use_r2);
- *     P = E * min(G_nr, G_res);  aec_cng_fill(&rng, P, frame.cn, G_res, G_nr,
+ *     G_nr  = mcab_sample_anr_gain(nr, &frame, scratch, use_r2);       // estimated on E
+ *     if (mcab_sample_post_reset_due(&handled, &frame)) { ac_istft_reset(istft); rng = MCAB_SAMPLE_CNG_RNG_SEED; }
+ *     P = B * min(G_nr, G_res);  aec_cng_fill(&rng, P, frame.cn, G_res, G_nr,   // B = frame.b
  *                                             MCAB_SAMPLE_CNG_NR_GAIN_FLOOR, n_freqs);
- * with rng started (and restarted on every reset) at MCAB_SAMPLE_CNG_RNG_SEED. */
+ *     ac_istft_push(istft, P, out);
+ * with rng started (and restarted on every reset) at MCAB_SAMPLE_CNG_RNG_SEED and `handled` at 0
+ * (on fresh lanes the first frame matches; otherwise the first hop clears a synthesizer that is
+ * already clear). mcab.h: analysis vs rendering, post-chain resets. */
 #ifndef MCAB_SAMPLE_POST_H
 #define MCAB_SAMPLE_POST_H
 
@@ -16,7 +20,7 @@
 
 #include "aec_res.h"
 #include "anr.h"
-#include "mcab.h"
+#include "mcab.h"               /* aec.h: AEC_CNG_SEED */
 #include "utility/simd_kernels.h"
 
 #ifdef __cplusplus
@@ -27,8 +31,9 @@ extern "C" {
  * so the residual echo it masks does not surface. */
 #define MCAB_SAMPLE_CNG_NR_GAIN_FLOOR 0.31622777f
 
-/* Start state of the comfort-noise generator (aec_cng_fill). */
-#define MCAB_SAMPLE_CNG_RNG_SEED 0x9e3779b9u
+/* Start state of the comfort-noise generator (aec_cng_fill): the library's own seed, so the
+ * comfort noise restarts where the lane's would after a post-chain reset. */
+#define MCAB_SAMPLE_CNG_RNG_SEED AEC_CNG_SEED
 
 /* The residual-echo powers are on the int16^2 scale, the denoiser's input on the audio scale;
  * the reciprocal is a power of two, so the multiply is exact. */
@@ -65,6 +70,16 @@ static inline const float* mcab_sample_anr_gain(AnrDenoiser* nr, const McabFrame
     }
     if (anr_process_gain(nr, f->e, extra, NULL) != 0) return NULL;
     return anr_get_gain(nr, NULL);
+}
+
+/** 1 when the frame's post_reset_serial differs from *handled (a lane had a hard post-chain
+ * reset since the synthesizer's last hop) and stores it; then, before this hop's comfort-noise
+ * draw and inverse transform, the synthesizer clears its overlap-add tail and reseeds its
+ * comfort noise to MCAB_SAMPLE_CNG_RNG_SEED. 0 otherwise or for a NULL argument. */
+static inline int mcab_sample_post_reset_due(uint32_t* handled, const McabFrame* f) {
+    if (!handled || !f || f->post_reset_serial == *handled) return 0;
+    *handled = f->post_reset_serial;
+    return 1;
 }
 
 #ifdef __cplusplus

@@ -98,6 +98,9 @@ static ConvChain *oracle_create(const McabConfig *cfg, int enable_res, int enabl
  * The composition under test, built from heap pieces as main.c builds it from one pool.
  * --------------------------------------------------------------------------------------- */
 
+/* Deliberate defects the flow-reset row plants to show it can fail. */
+enum { FDFN_SAB_NO_CLEAR = 1, FDFN_SAB_LATE_CLEAR = 2 };
+
 typedef struct FourDfn {
     McabSampleBeam *unit;
     McabSampleBeamResult beam;   /* the last hop's beam, for the oracle */
@@ -109,6 +112,11 @@ typedef struct FourDfn {
     Complex *post;
     void *post_mem;
     uint32_t rng;
+    uint32_t reset_handled;   /* McabFrame.post_reset_serial last followed */
+    long reset_hops;          /* hops on which the serial had moved */
+    const Complex *estimate;  /* E of the last hop (mcab memory, until the next hop) */
+    int sabotage;             /* negative controls (FDFN_SAB_*), 0 in the composition */
+    int bridge_clear_due;     /* FDFN_SAB_LATE_CLEAR only: the event of the previous hop */
     int n_freqs, enable_cng;
     DfnResStage *stage;          /* driven directly at 48 kHz; the bridge's own below 48 kHz */
     DfnRateBridge *bridge;
@@ -220,13 +228,28 @@ static void fdfn_reset(FourDfn *m) {
 static int fdfn_begin(FourDfn *m, const float *mics, const float *ref) {
     McabFrame f;
     AecResInput in;
+    int due;
     if (mcab_sample_beam_process(m->unit, mics, ref, &m->beam, &m->info) != MCAB_OK ||
         mcab_sample_beam_fuse(m->unit, &f) != MCAB_OK || f.g_res_ctx != NULL)
         return -1;
     mcab_sample_res_input(&f, &in);
     if (!(m->res_gain = aec_res_process(m->res, &in))) return -1;
+    m->estimate = f.e;
+    due = mcab_sample_post_reset_due(&m->reset_handled, &f);
+    if (due) ++m->reset_hops;
+    if (m->bridge) {
+        /* the bridge synthesises the host-grid spectra at the top of its begin(): the clear goes in on the hop
+         * of the event, with no delay line, and DFN2 keeps running */
+        int clear = due;
+        if (m->sabotage & FDFN_SAB_LATE_CLEAR) { clear = m->bridge_clear_due; m->bridge_clear_due = due; }
+        if (clear && !(m->sabotage & FDFN_SAB_NO_CLEAR) && dfn_rate_bridge_reset_synthesis(m->bridge) != 0)
+            return -1;
+    } else if (due) {
+        dfn_hop_reset(&m->hop);
+    }
+    if (due) m->rng = MCAB_SAMPLE_CNG_RNG_SEED;
     sk_min_f32(m->total, m->unity, m->res_gain, m->n_freqs);
-    sk_capply_gain_f32(m->post, f.e, m->total, m->n_freqs);
+    sk_capply_gain_f32(m->post, f.b, m->total, m->n_freqs);
     if (m->enable_cng && f.cn)
         aec_cng_fill(&m->rng, m->post, f.cn, m->res_gain, m->unity, MCAB_SAMPLE_CNG_NR_GAIN_FLOOR,
                      m->n_freqs);
@@ -410,6 +433,76 @@ static int run_native(int sample_rate, int fft_size, int expected_sixths) {
     return 0;
 }
 
+/* The flow reset at 16 kHz: the application restarts the unit and the RES (a lane's hard post-chain
+ * reset, which moves McabFrame.post_reset_serial) and nothing else; the hop, DFN2 and the bridge keep
+ * running. The bridge's native-grid synthesis (dfn_rate_bridge_get_host_hops) must equal the
+ * hand-written chain (restarted the same way) bit for bit on every hop, the reset hop included, and a
+ * bridge that is not cleared, or cleared one hop late, must not. */
+static int run_flow_reset(int sample_rate, int fft_size, int sabotage, long *diff_hops, long *resets) {
+    FourDfn *dfn = fdfn_create(sample_rate, fft_size, 1, NULL, 1);
+    McabConfig ccfg = core_config(sample_rate, fft_size);
+    ConvChain *conventional;
+    AcStftConfig scfg;
+    AcIstft *probe = NULL;
+    void *probe_mem = NULL;
+    static float probe_hop[512];
+    long long stage_frames = 0, commits, skips;
+    static float mics[512 * MCAB_CHANNELS], ref[512], conv_out[512], out[512];
+    static float tones[160 * 512];
+    int hop, frame, i, ch, e, frames = 160, reset_at = 81;
+    *diff_hops = 0;
+    if (!dfn || !dfn->bridge) return 1;
+    dfn->sabotage = sabotage;
+    conventional = oracle_create(&ccfg, 1, 1);
+    if (!conventional) return 2;
+    hop = dfn->hop_size;
+    /* the estimate lane's reference: audiolib's default-window synthesis of E, cleared on the event */
+    ac_stft_config_default(&scfg, fft_size ? fft_size : 2 * hop);
+    if (posix_memalign(&probe_mem, 16, ac_istft_get_mem_size(&scfg)) != 0) return 6;
+    probe = ac_istft_init(probe_mem, ac_istft_get_mem_size(&scfg), &scfg);
+    if (!probe) return 7;
+    dfn_fixture_multitone(tones, (size_t)frames * hop, sample_rate);
+    e = (ECHO_DELAY * sample_rate) / DFN2_SR;
+    for (frame = 0; frame < frames; ++frame) {
+        const float *tap_e, *tap_p;
+        long resets_before = dfn->reset_hops;
+        DfnResStageJob job;
+        int r;
+        for (i = 0; i < hop; ++i) {
+            int t = frame * hop + i;
+            ref[i] = tones[t];
+            for (ch = 0; ch < MCAB_CHANNELS; ++ch)
+                mics[(size_t)i * MCAB_CHANNELS + (size_t)ch] =
+                    (t >= e ? 0.5f * tones[t - e] : 0.0f) + 0.01f * sinf((float)t * 0.071f + (float)ch);
+        }
+        if (frame == reset_at) {          /* the application restarts the unit and the RES, nothing downstream */
+            mcab_sample_beam_reset(dfn->unit);
+            aec_res_reset(dfn->res);
+            conv_reset(conventional);
+        }
+        if (fdfn_begin(dfn, mics, ref) != 0) return 10 + frame;
+        if (dfn_rate_bridge_get_host_hops(dfn->bridge, &tap_e, &tap_p) != 0) return 3;
+        if (conv_hop(conventional, mics, ref, dfn->beam.weights, dfn->beam.spectrum, conv_out) != 0)
+            return 200 + frame;
+        if (dfn->reset_hops != resets_before) ac_istft_reset(probe);
+        (void)ac_istft_push(probe, dfn->estimate, probe_hop);
+        if (memcmp(tap_p, conv_out, (size_t)hop * sizeof(float)) != 0 ||
+            memcmp(tap_e, probe_hop, (size_t)hop * sizeof(float)) != 0)
+            ++*diff_hops;
+        while ((r = dfn_hop_nn_begin(&dfn->hop, &job)) == 1)
+            if (dfn_hop_nn_end(&dfn->hop, dfn_res_stage_infer(dfn->stage, &job)) != 0) return 4;
+        if (r < 0 || dfn_hop_end(&dfn->hop, out) != 0) return 5;
+    }
+    *resets = dfn->reset_hops;
+    /* DFN2 kept running through the event: its frame count is the whole stream's, with no gap */
+    dfn_res_stage_get_counters(dfn->stage, &stage_frames, &commits, &skips);
+    if (stage_frames != ((long long)frames * hop * DFN2_SR / sample_rate) / DFN2_HOP_LEN) return 8;
+    free(probe_mem);
+    conv_destroy(conventional);
+    fdfn_destroy(dfn);
+    return 0;
+}
+
 /* The unit serves 16 and 48 kHz only: the composition has no 8 kHz or off-grid host. */
 static int run_rejections(void) {
     McabTestUnitConfig cfg = unit_config(8000, 0);
@@ -543,6 +636,31 @@ int main(void) {
     if (rc) { fprintf(stderr, "4ch DFN 16 kHz/256 bridge gate failed: %d\n", rc); return 1; }
     rc = run_native(16000, 512, dfn_fixture_bridge_added_delay_sixths(16000, 256));
     if (rc) { fprintf(stderr, "4ch DFN 16 kHz/512 bridge gate failed: %d\n", rc); return 1; }
+    {
+        static const int grids[2][2] = {{16000, 256}, {16000, 512}};
+        static const int sabs[] = { FDFN_SAB_NO_CLEAR, FDFN_SAB_LATE_CLEAR };
+        int g;
+        size_t c;
+        for (g = 0; g < 2; ++g) {
+            long diff, resets;
+            rc = run_flow_reset(grids[g][0], grids[g][1], 0, &diff, &resets);
+            if (rc || diff != 0 || resets < 1) {
+                fprintf(stderr, "4ch DFN flow reset %d Hz/%d: rc %d, %ld hops differ, %ld reset hop(s)\n",
+                        grids[g][0], grids[g][1], rc, diff, resets);
+                return 1;
+            }
+            printf("4ch_aec_bf_dfn_res: flow reset %d Hz/%d: the bridge's host synthesis, cleared on the hop of the event, equals the "
+                   "hand-written chain bit for bit (%ld reset hop(s))\n", grids[g][0], grids[g][1], resets);
+            for (c = 0; c < sizeof sabs / sizeof sabs[0]; ++c) {
+                rc = run_flow_reset(grids[g][0], grids[g][1], sabs[c], &diff, &resets);
+                if (rc || diff == 0) {
+                    fprintf(stderr, "4ch DFN flow reset %d Hz/%d: planted defect %d not detected (rc %d)\n",
+                            grids[g][0], grids[g][1], sabs[c], rc);
+                    return 1;
+                }
+            }
+        }
+    }
     {
         static const int grids[3][2] = {{48000, 1024}, {16000, 256}, {16000, 512}};
         int g, b;

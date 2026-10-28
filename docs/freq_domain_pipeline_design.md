@@ -103,7 +103,7 @@ res_gain = ctx.res_gain                         mono: the AEC's own gain (inside
 nr_gain  = mono_nr_gain(...)                    gain stages return const float*
            / mcab_sample_anr_gain(nr, frame, scratch, use_r2)
 total    = sk_min_f32(nr_gain, res_gain)        a disabled source reads as the unity vector
-spec     = sk_capply_gain_f32(frame.e, total)
+spec     = sk_capply_gain_f32(frame.b, total)      # estimators read frame.e; render frame.b
 spec    += aec_cng_fill(...)                    comfort noise on the cut bins
 out      = ac_istft_push(spec)                  one iFFT/OLA per hop
 ```

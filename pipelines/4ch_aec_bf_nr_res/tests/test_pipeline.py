@@ -836,3 +836,84 @@ def test_preset_ramp_walks_and_lands():
         assert cur >= target
         prev = cur
     assert _live_floor(suppressor) == target
+
+
+class _RotatingBeamformer:
+    """Unit weight on lane 0, unit on lane 2, equal, complex per bin, in turn."""
+
+    def __init__(self):
+        self.hop = 0
+
+    def process(self, linear_hops, contexts):
+        n_freqs = contexts[0].far_spec.size
+        mode = (self.hop // 5) % 4
+        self.hop += 1
+        weights = np.zeros((4, n_freqs), dtype=np.complex64)
+        if mode == 0:
+            weights[0] = 1.0
+        elif mode == 1:
+            weights[2] = 1.0
+        elif mode == 2:
+            weights[:] = 0.25
+        else:
+            k = np.arange(n_freqs)
+            for ch in range(4):
+                weights[ch] = (0.25 + 0.2 * np.sin(0.003 * k + ch)
+                               + 1j * 0.15 * np.cos(0.005 * k + 2 * ch))
+        return McabBeam(samples=np.asarray(linear_hops[0], dtype=np.float32),
+                        weights=weights)
+
+
+def test_rendering_base_is_the_weighted_lane_bases():
+    """The fused context's rendering base (C: McabFrame.b): ``error_spec`` itself when no
+    contributing lane's output guard fired, else sum(w * lane output_base_spec); a unit weight
+    gives the lane's own base; the analysis fields never see the guard; the reset serial is the
+    lanes' sum and moves by 4 on reset()."""
+    pipeline = _new_pipeline()
+    beamformer = _RotatingBeamformer()
+    rng = np.random.default_rng(11)
+    hop = pipeline.hop_size
+    fired = some = unit_fired = 0
+    serials = []
+    for frame in range(160):
+        if frame == 120:
+            pipeline.reset()
+        render = (0.3 * rng.standard_normal(hop)).astype(np.float32)
+        # No echo path for 80 hops (never usable: the guards fire), then a per-lane echo.
+        echo = 0.0 if frame < 80 else 0.4
+        mics = np.stack([echo * (1.0 - 0.1 * ch) * render
+                         + 0.01 * rng.standard_normal(hop) for ch in range(4)],
+                        axis=1).astype(np.float32)
+        pre = pipeline.process_front(mics, render)
+        beam = beamformer.process(pre.linear_hops, pre.contexts)
+        post = pipeline.fuse(pre, beam)
+        ctx = post.context
+        weights = beam.weights
+        contributes = np.any(weights != 0, axis=1)
+        lane_fired = np.array([bool(c.guard_active) for c in pre.contexts])
+        for c in pre.contexts:
+            if not c.guard_active:
+                np.testing.assert_array_equal(c.output_base_spec, c.error_spec)
+        np.testing.assert_array_equal(
+            ctx.error_spec, np.sum(weights * np.stack([c.error_spec for c in pre.contexts]),
+                                   axis=0, dtype=np.complex64))
+        assert ctx.guard_active == bool(np.any(lane_fired & contributes))
+        if not ctx.guard_active:
+            assert ctx.output_base_spec is not None
+            np.testing.assert_array_equal(ctx.output_base_spec, ctx.error_spec)
+        else:
+            fired += 1
+            some += int(np.any(lane_fired & contributes) and not np.all(lane_fired[contributes]))
+            bases = np.stack([c.output_base_spec for c in pre.contexts])
+            reference = np.sum(weights.astype(np.complex128) * bases, axis=0)
+            np.testing.assert_allclose(ctx.output_base_spec, reference, rtol=0, atol=1e-6)
+            if np.count_nonzero(contributes) == 1:
+                lane = int(np.flatnonzero(contributes)[0])
+                np.testing.assert_array_equal(ctx.output_base_spec,
+                                              pre.contexts[lane].output_base_spec)
+                unit_fired += 1
+        lane_sum = sum(int(c.post_reset_serial) for c in pre.contexts) & 0xFFFFFFFF
+        assert ctx.post_reset_serial == lane_sum
+        serials.append(ctx.post_reset_serial)
+    assert fired > 0 and unit_fired > 0
+    assert len(set(serials[:120])) == 1 and serials[120] == serials[119] + 4

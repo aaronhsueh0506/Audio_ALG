@@ -89,6 +89,129 @@ def test_identity_model_equals_conventional_without_nr(linear, pair_assets):
     assert np.array_equal(dfn[:span], conventional[:span])
 
 
+def _events(contexts):
+    serials = [c.post_reset_serial for c in contexts]
+    return (sum(int(c.guard_active) for c in contexts),
+            sum(1 for a, b in zip([0] + serials[:-1], serials) if a != b))
+
+
+@pytest.fixture(scope='module')
+def linear_cng():
+    """The same scenario with the library's comfort noise on."""
+    mic, ref = _scenario()
+    config = AecConfig.from_preset(
+        AecPreset.BALANCED, sample_rate=SR, frame_size=2 * HOP, hop_size=HOP,
+        mode=AecMode.PBFDKF, mu=0.3, enable_res=True, enable_cng=True)
+    aec_out, contexts = run_aec_linear(mic, ref, config)
+    return mic, config, aec_out, contexts
+
+
+def test_scenario_moves_the_reset_serial(linear_cng):
+    """The identity gates below exercise the hard-reset event (and not only a steady stream)."""
+    _guard, resets = _events(linear_cng[3])
+    assert resets >= 1
+
+
+def test_identity_model_with_comfort_noise_and_reset_event(linear_cng, assets):
+    """P carries the comfort noise from the rendering base through the network; a hard post-chain reset
+    reseeds the generator at its hop and drops the synthesis tail when that frame is synthesised (the stage
+    delays every frame by its lookahead, so the event travels with it): the identity model still equals the
+    conventional chain with NR off, bit for bit.  Planted defects (an ignored event) must not."""
+    mic, config, aec_out, contexts = linear_cng
+    n_frames = len(contexts)
+    tail = np.zeros(len(mic), np.float32)
+    tail[:len(aec_out)] = aec_out
+    conventional = run_res(tail, np.ones((n_frames, HOP + 1), np.float32), contexts,
+                           config, use_nr=False, use_res=True, combine='min')
+    span = n_frames * HOP
+    stage = make_stage(assets, identity=True)
+    dfn = run_dfn2_res(contexts, config, stage, enable_cng=True, output_length=len(mic))
+    assert np.array_equal(dfn[:span], conventional[:span])
+    assert np.any(conventional[:span] != 0)
+    blind = [c.__class__(**{**c.__dict__, 'post_reset_serial': 0}) for c in contexts]
+    stage = make_stage(assets, identity=True)
+    ignored = run_dfn2_res(blind, config, stage, enable_cng=True, output_length=len(mic))
+    assert not np.array_equal(ignored[:span], conventional[:span])
+
+
+SR16 = 16000
+HOP16 = 128
+
+
+@pytest.fixture(scope='module')
+def linear16_cng():
+    """A 16 kHz stream (fft 256) whose echo path jumps half-way, comfort noise on: the AEC hard-resets its post chain."""
+    rng = np.random.RandomState(0)
+    n = int(SR16 * 4.0)
+    far = (rng.randn(n) * 0.2).astype(np.float32)
+    far *= (np.sin(2 * np.pi * 3.0 * np.arange(n) / SR16) > 0).astype(np.float32)
+
+    def rir(delay):
+        r = np.zeros(800, np.float32)
+        r[delay] = 0.6
+        r[delay + 140] = -0.3
+        r[delay + 330:delay + 370] = rng.randn(40) * 0.02
+        return r
+
+    half = n // 2
+    echo = np.zeros(n, np.float32)
+    echo[:half] = np.convolve(far, rir(160))[:half]
+    echo[half:] = np.convolve(far, rir(380))[half:n]
+    mic = (echo + (rng.randn(n) * 0.01)).astype(np.float32)
+    config = AecConfig.from_preset(
+        AecPreset.BALANCED, sample_rate=SR16, frame_size=2 * HOP16, hop_size=HOP16,
+        mode=AecMode.PBFDKF, mu=0.3, enable_res=True, enable_cng=True)
+    aec_out, contexts = run_aec_linear(mic, far, config)
+    return mic, config, aec_out, contexts
+
+
+def _bridge_host_hops(monkeypatch, contexts, config, assets):
+    """run_dfn2_res through the rate bridge with a log of the hops on which reset_synthesis() was called and
+    of the apply-lane native hops the bridge synthesised."""
+    from pipelines.dfn.dfn2_rate_adapter import Dfn2RateBridge
+    log = {'resets': [], 'apply': []}
+    push, reset_synthesis = Dfn2RateBridge.push, Dfn2RateBridge.reset_synthesis
+
+    def logged_push(self, estimate_spec, apply_spec):
+        out = push(self, estimate_spec, apply_spec)
+        log['apply'].append(np.array(self.host_hops[1], np.float32))
+        return out
+
+    def logged_reset(self):
+        log['resets'].append(len(log['apply']))
+        reset_synthesis(self)
+
+    monkeypatch.setattr(Dfn2RateBridge, 'push', logged_push)
+    monkeypatch.setattr(Dfn2RateBridge, 'reset_synthesis', logged_reset)
+    run_dfn2_res(contexts, config, make_stage(assets, identity=True), enable_cng=True,
+                 output_length=len(contexts) * config.hop_size)
+    return log
+
+
+def test_the_rate_bridge_clears_its_synthesis_on_the_hop_of_the_reset_event(linear16_cng, assets, monkeypatch):
+    """Below 48 kHz the host-grid synthesis is the bridge's: its native-grid hops equal the conventional chain
+    (RES on, NR off, comfort noise on, the AEC's window table, so within the window's last-bit rounding) on every
+    hop, the reset hops included, because reset_synthesis() is called on the hop the serial moves, no later.
+    A stream whose events are hidden from the pipeline must not."""
+    mic, config, aec_out, contexts = linear16_cng
+    n_frames = len(contexts)
+    serials = [c.post_reset_serial for c in contexts]
+    moved = [i for i, (a, b) in enumerate(zip([0] + serials[:-1], serials)) if a != b]
+    assert moved, 'the scenario never hard-resets the post chain'
+    tail = np.zeros(len(mic), np.float32)
+    tail[:len(aec_out)] = aec_out
+    conventional = run_res(tail, np.ones((n_frames, HOP16 + 1), np.float32), contexts,
+                           config, use_nr=False, use_res=True, combine='min')[:n_frames * HOP16]
+    log = _bridge_host_hops(monkeypatch, contexts, config, assets)
+    assert log['resets'] == moved
+    host = np.concatenate(log['apply'][:n_frames])
+    assert np.max(np.abs(host - conventional)) < 1e-5
+    blind = [c.__class__(**{**c.__dict__, 'post_reset_serial': 0}) for c in contexts]
+    ignored = _bridge_host_hops(monkeypatch, blind, config, assets)
+    assert ignored['resets'] == []
+    assert np.max(np.abs(np.concatenate(ignored['apply'][:n_frames]) - conventional)) > 1e-3
+
+
 def test_realtime_timing_is_a_pure_lookahead_delay(linear, pair_assets):
     mic, config, _aec_out, contexts = linear
     stage = make_stage(pair_assets, identity=True)

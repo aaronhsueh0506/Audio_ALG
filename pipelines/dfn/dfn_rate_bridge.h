@@ -21,6 +21,13 @@
  * 128: 501 1/3). The resamplers are not an identity (pass-band
  * response applied twice).
  * Fail-open: with no model the stage emits P48 delayed L frames.
+ * Post-chain reset of the host (lib/aec aec_post_reset_serial() moved): the two native-grid
+ * synthesis objects (estimate and apply lane) are the host's overlap-add and run at the top of
+ * dfn_rate_bridge_begin(), with no FIFO or lookahead between the spectra and them, so
+ * dfn_rate_bridge_reset_synthesis() on that hop, before its begin() or process(), lands on the
+ * hop the serial protocol demands (no delay line; the 48 kHz stage path synthesises its output
+ * L hops after the spectra went in and delays the clear by L). Everything downstream of those
+ * two objects is a continuous time-domain stream and is left alone.
  * Memory: static pool with the 32-byte descriptor; the stage and resampler pools
  * are carved inside it. No heap after init, no stdio. */
 
@@ -83,6 +90,17 @@ DfnRateBridge *dfn_rate_bridge_create(const DfnRateBridgeConfig *cfg);
 void dfn_rate_bridge_destroy(DfnRateBridge *b);   /* frees only create()'s heap */
 /* Resets the resamplers, FIFOs, OLAs, the stage and the prefill. */
 void dfn_rate_bridge_reset(DfnRateBridge *b);
+/* Synthesis-only reset: the host's post chain was hard-reset in the hop about to begin (the AEC's
+ * aec_post_reset_serial() moved). Clears the overlap-add tail and frame counter of the two
+ * native-grid synthesis objects (estimate lane, apply lane) and nothing else: the stage (model
+ * state, DF history, lookahead delay lines, frame counters), both resamplers, both 48 kHz FIFOs and
+ * analysis histories, the 48 kHz synthesis, the output FIFO with its prefill and the diagnostics
+ * counters all keep running, so the added delay and the DFN2 state are unchanged. Call it between
+ * hops, before dfn_rate_bridge_begin() / process() of the hop on which the serial moved, and
+ * reseed the comfort noise (AEC_CNG_SEED) next to it; the AEC is not reset in response.
+ * Returns 0, or -1 on NULL or while a hop is in progress (begin() already ran: the clear would
+ * land after that hop's synthesis, so nothing is cleared). */
+int dfn_rate_bridge_reset_synthesis(DfnRateBridge *b);
 
 /* One native hop: the two native spectra in (n_freqs each), one native hop out.
  * Returns 0, or -1 on NULL arguments or a stage contract error (reset required).
@@ -125,6 +143,11 @@ DfnResStage *dfn_rate_bridge_stage(const DfnRateBridge *b);
 /* Frame counters for diagnostics: 48 kHz frames run in total and in the last hop. */
 void dfn_rate_bridge_get_counters(const DfnRateBridge *b,
                                   long long *frames_48k, int *last_hop_frames);
+/* Diagnostics: the native-grid hops the host synthesis produced from the spectra of the last
+ * dfn_rate_bridge_begin() / process() (hop_size floats each, before the resamplers). Valid until
+ * the next begin() or reset; NULL for an output pointer you do not need. Returns 0, or -1 on NULL. */
+int dfn_rate_bridge_get_host_hops(const DfnRateBridge *b, const float **estimate_hop,
+                                  const float **apply_hop);
 
 #ifdef __cplusplus
 }

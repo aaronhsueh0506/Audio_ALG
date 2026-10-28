@@ -2,7 +2,15 @@
 AEC + NR + RES Processing Pipeline
 聲學回聲消除 + 降噪 + 殘留回聲抑制串接管線
 
-Pipeline: AEC(linear) → echo-aware NR(E) → RES  (frequency domain).
+Pipeline: AEC(linear) → echo-aware NR(B) → RES  (frequency domain).
+B is the AEC's rendering base (``ctx.output_base_spec``): the linear error spectrum E, or
+E + echo on a hop where the output guard fires -- what ``AEC.process()`` itself would multiply
+by its gain.  ``ctx.error_spec`` / ``ctx.formed_output`` are the analysis seam and are never
+rendered.  The NR estimates on B and its gain is applied to B; with NR off the chain is the
+AEC's own full output, bit for bit (``AEC.process()`` with ``enable_res``).  A hard post-chain
+reset of the AEC (``ctx.post_reset_serial`` moved) clears the synthesis overlap-add tail and
+restarts the comfort noise from ``AEC_CNG_SEED`` before that hop's first draw; the NR keeps
+running.
 The NR folds the AEC residual-echo PSD R²(f) into its noise floor (ξ=S²/(N²+R²))
 and g_total = min(G_nr, G_res) is applied as computed; pass --legacy-amin for
 the noise-only NR. AEC and NR are each selected by their own preset; the
@@ -31,7 +39,7 @@ sys.path.insert(0, os.path.join(_ROOT, 'lib', 'aec', 'python')) # aec + modules
 sys.path.insert(0, os.path.join(_ROOT, 'lib', 'nr', 'python'))  # NR modules
 
 from lib.aec.python.aec import (
-    AEC, AecConfig, AecMode, AecPreset, AecResContext,
+    AEC, AecConfig, AecMode, AecPreset, AecResContext, AEC_CNG_SEED, cng_fill,
 )
 from lib.nr.python.denoisers import MmseLsaDenoiser
 from lib.nr.python.core.nr_strength import apply_strength
@@ -199,12 +207,24 @@ def run_nr(signal: np.ndarray, sample_rate: int,
     return result
 
 
+def rendering_base(ctx) -> np.ndarray:
+    """The spectrum a hop is rendered from: ``ctx.output_base_spec`` (E, or E + echo on a guard hop).
+
+    Refused when the context has none (an AEC built without the context seam): the analysis seam
+    ``ctx.error_spec`` is not a substitute -- on a guard hop it is not what the AEC itself renders."""
+    base = getattr(ctx, 'output_base_spec', None)
+    if base is None:
+        raise ValueError('AEC context without output_base_spec (build the AEC with return_res_context)')
+    return np.asarray(base, dtype=np.complex64)
+
+
 def run_nr_spectrum(aec_contexts: List[AecResContext], sample_rate: int,
                     nr_preset: str = 'balanced',
                     inject_echo_psd: bool = False) -> np.ndarray:
-    """NR directly on the AEC linear error spectra E(f), with no re-FFT.
+    """NR directly on the AEC rendering base B(f), with no re-FFT.
 
-    Consumes ``ctx.error_spec`` per hop and returns the per-frame gain G_nr(f)
+    Consumes ``ctx.output_base_spec`` per hop (the spectrum the gain is applied to; E on every hop the
+    output guard leaves alone) and returns the per-frame gain G_nr(f)
     (``n_frames, n_freqs``) for the frequency-domain RES.  ``inject_echo_psd``
     (default False) folds the residual-echo PSD R²(f) into the OM-LSA noise
     floor (ξ = S²/(N²+R²)) so the gain also suppresses residual echo (combine
@@ -214,8 +234,7 @@ def run_nr_spectrum(aec_contexts: List[AecResContext], sample_rate: int,
     """
     if not aec_contexts:
         raise ValueError("aec_contexts must not be empty")
-    spectra = np.stack([np.asarray(c.error_spec, dtype=np.complex64)
-                        for c in aec_contexts])          # (n_frames, n_freqs)
+    spectra = np.stack([rendering_base(c) for c in aec_contexts])    # (n_frames, n_freqs)
     magnitude = np.abs(spectra).astype(np.float64)
     phase = np.angle(spectra).astype(np.float64)
     extra = None
@@ -233,7 +252,7 @@ def run_nr_spectrum(aec_contexts: List[AecResContext], sample_rate: int,
     )
     _, _, gains = denoiser.denoise_spectrum(
         magnitude, phase, return_gain=True, extra_noise_psd=extra)
-    print(f"  NR(freq): {gains.shape[0]} frames on E(f), gain shape {gains.shape}"
+    print(f"  NR(freq): {gains.shape[0]} frames on B(f), gain shape {gains.shape}"
           f"{' [echo-aware ξ=S²/(N²+R²)]' if inject_echo_psd else ''}")
     return gains.astype(np.float32)
 
@@ -259,29 +278,32 @@ def total_gain(g_nr, g_res, use_nr: bool, use_res: bool, combine: str,
         else np.ones(n_freqs, dtype=np.float32)
 
 
-def apply_gain(error_spec: np.ndarray, g_total: np.ndarray) -> np.ndarray:
-    """S(f) = E(f) . g_total: the Python twin of ``sk_capply_gain_f32``."""
-    return error_spec.astype(np.complex64) * g_total
+def apply_gain(base_spec: np.ndarray, g_total: np.ndarray) -> np.ndarray:
+    """S(f) = B(f) . g_total: the Python twin of ``sk_capply_gain_f32`` (real and imaginary part each times
+    the real gain, so no complex product touches the signs of zeros)."""
+    base_spec = np.asarray(base_spec, dtype=np.complex64)
+    g = np.asarray(g_total, dtype=np.float32)
+    out = np.empty(base_spec.shape, np.complex64)
+    out.real = base_spec.real * g
+    out.imag = base_spec.imag * g
+    return out
 
 
-def comfort_noise_fill(spec: np.ndarray, comfort_noise: np.ndarray, g_aec, cn_scale,
-                       rng: np.random.RandomState) -> np.ndarray:
-    """Comfort noise on the cut bins: the Python twin of ``aec_cng_fill``.
+def comfort_noise_fill(spec: np.ndarray, comfort_noise: np.ndarray, g_res, g_nr, rng: int):
+    """Comfort noise on the cut bins: the bit-exact Python twin of ``aec_cng_fill``.
 
-    Port of AEC3 RES CNG; the AEC3 sin-LUT/LCG source is approximated with
-    deterministic Gaussian noise at the same per-bin level -- this is a
-    separated-pipeline baseline, not bit-identical to the internal RES.  The
-    level is sqrt(N^2/PSD_SCALE) * sqrt(1 - G_res^2) * cn_scale; which bins it
-    fills is decided by AEC suppression alone, never by g_total.
+    Returns ``(spec, rng)``: ``spec`` plus, on bins ``1 .. n-2``,
+    ``sqrt(1 - G_res^2) * max(G_nr, CNG_NR_GAIN_FLOOR) * (sqrt(N^2 / PSD_SCALE) * LUT)`` with the AEC
+    library's own generator (``lib/aec/python/modules/cng.py``, seed ``AEC_CNG_SEED``); ``g_nr`` None
+    is the AEC-only chain (no denoiser factor).  Which bins it fills is decided by AEC suppression
+    alone, never by g_total.
     """
-    n_freqs = spec.shape[0]
-    psd_scale = 32768.0 ** 2         # int16² scale of ctx.comfort_noise (AEC3)
-    n_amp = np.sqrt(np.maximum(comfort_noise / psd_scale, 0.0)).astype(np.float32)
-    noise_gain = np.sqrt(np.maximum(1.0 - g_aec ** 2, 0.0)).astype(np.float32)
-    cn = np.zeros(n_freqs, dtype=np.complex64)
-    cn[1:-1] = (n_amp[1:-1]
-                * (rng.randn(n_freqs - 2) + 1j * rng.randn(n_freqs - 2)))
-    return spec + noise_gain * cn_scale * cn
+    out = np.array(spec, dtype=np.complex64, copy=True)
+    if g_nr is None:
+        rng = cng_fill(rng, out, comfort_noise, g_res)
+    else:
+        rng = cng_fill(rng, out, comfort_noise, g_res, g_nr, CNG_NR_GAIN_FLOOR)
+    return out, rng
 
 
 def synthesize_hop(spec: np.ndarray, ola: np.ndarray, synth_win: np.ndarray,
@@ -304,13 +326,18 @@ def run_res(nr_output: np.ndarray, nr_gains: np.ndarray,
             combine: str = 'product') -> np.ndarray:
     """Residual-echo suppression AFTER NR, in the frequency domain.
 
-    Per hop, in the order of the C applications, ``total_gain`` ->
-    ``apply_gain`` -> ``comfort_noise_fill`` -> ``synthesize_hop`` (sqrt-Hann
-    OLA, as the AEC's ``_aec3_synth_window``): S(f) = E(f) · G_nr(f) · G_res(f)
-    plus comfort noise on the cut bins, from ``ctx.res_gain`` and
-    ``ctx.error_spec`` (``AecConfig.return_res_context``).  ``nr_gains`` must
-    come from the same spectra (``run_nr_spectrum``); gains from a time-domain
-    NR run are one hop ahead and need a one-frame shift.
+    Per hop, in the order of the C applications, the reset event ->
+    ``total_gain`` -> ``apply_gain`` -> ``comfort_noise_fill`` ->
+    ``synthesize_hop`` (sqrt-Hann OLA, as the AEC's ``_aec3_synth_window``):
+    S(f) = B(f) · G_nr(f) · G_res(f) plus comfort noise on the cut bins, from
+    ``ctx.res_gain`` and the rendering base ``ctx.output_base_spec``
+    (``AecConfig.return_res_context``); B is E on every hop the output guard leaves
+    alone.  When ``ctx.post_reset_serial`` moves, the OLA tail is cleared and the
+    comfort noise reseeded to ``AEC_CNG_SEED`` before that hop's first draw and its
+    synthesis; the NR gains are not touched.  ``nr_gains`` must come from the same
+    spectra (``run_nr_spectrum``); gains from a time-domain NR run are one hop
+    ahead and need a one-frame shift.  With ``use_nr=False`` the output equals
+    ``AEC.process()`` of a full-mode instance bit for bit.
     """
     bs = int(config.frame_size)
     hop = int(config.hop_size)
@@ -327,7 +354,8 @@ def run_res(nr_output: np.ndarray, nr_gains: np.ndarray,
 
     synth_win = synth_window(bs)
     ola = np.zeros(bs, dtype=np.float32)
-    rng = np.random.RandomState(0)   # deterministic comfort noise
+    rng = AEC_CNG_SEED               # comfort-noise generator state
+    serial = 0                       # the post_reset_serial already handled
 
     n_frames = min(len(aec_contexts), nr_gains.shape[0])
     output = np.zeros(len(nr_output), dtype=np.float32)
@@ -343,17 +371,23 @@ def run_res(nr_output: np.ndarray, nr_gains: np.ndarray,
             n_frames = i
             break
 
+        if ctx.post_reset_serial != serial:
+            # Hard post-chain reset of the AEC inside this hop: drop the overlap-add tail and
+            # restart the comfort noise before its first draw and before this hop's synthesis.
+            ola[:] = 0.0
+            rng = AEC_CNG_SEED
+            serial = ctx.post_reset_serial
         g_nr = nr_gains[i].astype(np.float32) if use_nr else 1.0
         g_res = ctx.res_gain.astype(np.float32) if use_res else 1.0
         # Which bins the comfort noise fills is decided by AEC suppression alone
         # (sqrt(1 - G_res^2)), never by g_total; its level is scaled by G_nr
         # (floored at CNG_NR_GAIN_FLOOR) because the denoiser never sees it.
-        g_aec = g_res if isinstance(g_res, np.ndarray) else np.full(n_freqs, g_res, dtype=np.float32)
-        cn_scale = np.maximum(g_nr, CNG_NR_GAIN_FLOOR) if isinstance(g_nr, np.ndarray) else 1.0
+        base = rendering_base(ctx)
         g_total = total_gain(g_nr, g_res, use_nr, use_res, combine, n_freqs)
-        spec = apply_gain(ctx.error_spec, g_total)
-        if config.enable_cng and ctx.comfort_noise is not None:
-            spec = comfort_noise_fill(spec, ctx.comfort_noise, g_aec, cn_scale, rng)
+        spec = apply_gain(base, g_total)
+        if config.enable_cng and use_res and ctx.comfort_noise is not None:
+            spec, rng = comfort_noise_fill(spec, ctx.comfort_noise, g_res,
+                                           g_nr if use_nr else None, rng)
         output[start:end] = synthesize_hop(spec, ola, synth_win, fft, bs, hop)
 
     # Copy tail (frames beyond AEC/NR context)
@@ -361,7 +395,7 @@ def run_res(nr_output: np.ndarray, nr_gains: np.ndarray,
     if tail_start < len(nr_output):
         output[tail_start:] = nr_output[tail_start:]
 
-    print(f"  RES: {n_frames} frames (freq-domain E·G_nr·G_res)")
+    print(f"  RES: {n_frames} frames (freq-domain B·G_nr·G_res)")
     return output
 
 

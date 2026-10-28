@@ -12,19 +12,43 @@ its synthesis and the output spectrum):
 
 ```text
 mic/ref -> aec_process_context(aec, mic, ref)
-           aec_get_res_context(aec, &ctx)          E = ctx.error_spec = linear-AEC error spectrum -> DFN2 feature input
-           P = E * min(1, ctx.res_gain)            P = E * G_res (+ comfort noise) -> DFN2 applied here
+           follow_post_reset()                     new aec_post_reset_serial(): rng = AEC_CNG_SEED (+ the host-synthesis OLA clear, see below)
+           aec_get_res_context(aec, &ctx)          G_res = ctx.res_gain, comfort-noise PSD
+           aec_get_output_base(aec, &base)         B = base.base_spec = the rendering base (E, or E + echo on a guard hop)
+                                                   -> DFN2 feature input
+           P = B * min(1, ctx.res_gain)            P = B * G_res (+ comfort noise) -> DFN2 applied here
                                                    (sk_min_f32 + sk_capply_gain_f32 + aec_cng_fill)
-         -> dfn_hop_begin(&hop, ctx.error_spec, P)
+         -> dfn_hop_begin(&hop, B, P)
          -> while (dfn_hop_nn_begin(&hop, &job) > 0) { run the model on the job; dfn_hop_nn_end(&hop, rc) }
          -> dfn_hop_end(&hop, out)                  -> enhanced P, frame t-L (L = M + D, 2 for the shipped pair),
                                                        sqrt-Hann iFFT / OLA
 ```
 
-`dfn_hop_process(&hop, ctx.error_spec, P, out)` runs the same sequence with the model callback; P must
+`dfn_hop_process(&hop, B, P, out)` runs the same sequence with the model callback; P must
 be formed before `dfn_hop_begin()`. A refused hop is the integrator's to recover: reset the AEC,
-the comfort-noise generator (`rng = CNG_RNG_SEED`, a macro of `main.c`) and the `DfnHop` together
+the comfort-noise generator (`rng = AEC_CNG_SEED`, the library's constant) and the `DfnHop` together
 (`rig_reset()` in `main.c`).
+
+**Two spectra.** `ctx.error_spec` / `ctx.formed_hop` are the AEC's analysis seam: the selected linear residual, never
+altered by the output guard. B (`aec_get_output_base()`) is what `aec_process()` itself would multiply by its gain:
+E, or the capture spectrum E + echo on a hop where the linear estimate is unusable and E is louder than the
+capture. B is E bit for bit on every hop the guard leaves alone. The stage reads the pair (B, P): its feature input
+and the spectrum it filters stay one signal, so a guard hop never pairs a capture-based P with a residual-based
+estimate. There is no denoiser here, so no further estimator reads either spectrum.
+
+**Hard post-chain reset event.** The AEC moves `aec_post_reset_serial()` when its post chain is hard-reset inside a
+processing call (`aec_reset()`, a confirmed delay change that restarts the filter, a first acquisition without warm
+transfer, a bad-relock revert); warm-transfer and soft realignments do not move it. `follow_post_reset()` keeps the
+last handled serial. On a new value the comfort noise restarts from `AEC_CNG_SEED` before that hop's first draw. The
+stage never resets on it and the program never resets the AEC in response. At 48 kHz the program owns the synthesis
+(`AcIstft`) and the stage delays every frame by `DFN_RES_STAGE_LOOKAHEAD_FRAMES` hops, so the overlap-add tail is
+dropped when the frame built on the reset hop reaches the synthesis (a delay line of that many hops, not at the
+reset hop: that would cut the previous filter's last frame out of the output). Below 48 kHz the host-grid synthesis
+lives inside `dfn_rate_bridge` and runs at the top of its `begin()`, with nothing between the spectra and it, so the
+call is `dfn_rate_bridge_reset_synthesis()` on the hop of the event, before the hop enters the bridge: no delay line.
+It clears the overlap-add tail of the two native-grid synthesis objects (estimate and apply lane) and nothing else;
+DFN2 (no reset on an AEC event), both resamplers, the 48 kHz FIFOs, analysis histories and synthesis, and the output
+FIFO with its prefill keep running, so the bridge's delay does not change.
 
 The network estimates from the pre-RES spectrum because it was trained on
 unprocessed noisy speech and must not see the spectral holes RES cuts; it is
@@ -45,10 +69,17 @@ chain with the denoiser off delayed: bit for bit by L = M + D hops at 48 kHz (tw
 lookahead pair; the acceptance gate in `tests/test_mono_dfn.c`, compared with the hand-written chain of
 `pipelines/mono_aec_nr_res/tests/conv_chain_mono.h`, asserted with
 comfort noise off and on, across a real matched-delay re-lock, with the
-suppressor demonstrably active), and through the resampler round trip by
+suppressor demonstrably active, and on streams that fire the output guard and hard-reset the post chain, with
+the reset event delayed by L hops), the post spectrum P itself equals `aec_process()` of a full-mode `Aec`
+after the host's own synthesis with the AEC's window table, bit for bit, at 16 kHz/256, 16 kHz/512 and 48 kHz, and through the resampler round trip by
 the bridge delay on a native grid (the same test pins the delay with a
 near-end impulse, the frame schedule, and, where the delay is a whole number of native samples, the pass-band
-error against the conventional 16/8 kHz output, observed at about 1e-5 against a gate of 1e-3 for the shipped pair).
+error against the conventional 16/8 kHz output, observed at about 1e-5 against a gate of 1e-3 for the shipped pair,
+on streams that carry hard-reset events with the bridge's synthesis cleared on the hop of the event). The bridge's own
+native-grid synthesis (`dfn_rate_bridge_get_host_hops()`) equals the hand-written chain bit for bit at 16 kHz/256,
+16 kHz/512 and 8 kHz/256 on streams that fire the guard and reset the post chain, and stays within the window rounding
+of `aec_process()` (audiolib's default window against the AEC's table; observed below 1e-7); a bridge that ignores
+the event or clears one hop late fails both gates.
 
 The host runs on the product's own grid: 16 kHz (fft 256, hop 128) by
 default, 16 kHz/512 and 8 kHz/256 as the host offers them, or 48 kHz. Only
@@ -112,9 +143,10 @@ App                 Aec           DfnHop + DfnResStage | DfnRateBridge      AcIs
  |-- dfn_res_stage_get_mem_requirements / dfn_res_stage_init_ex            (48 kHz host)
  |   or dfn_rate_bridge_get_mem_requirements / dfn_rate_bridge_init_ex     (8 / 16 kHz host)
  |-- dfn_hop_init_stage(...) or dfn_hop_init_bridge(...)
- |   per hop: aec_process_context --> aec_get_res_context --> P = E * min(1, res_gain) (+ comfort noise, off by default)
- |            --> dfn_hop_begin(E, P) --> while (dfn_hop_nn_begin == 1) { model; dfn_hop_nn_end } --> dfn_hop_end --> out
- |   refused hop: aec_reset + comfort-noise rng = CNG_RNG_SEED + dfn_hop_reset   (rig_reset())
+ |   per hop: aec_process_context --> follow_post_reset --> aec_get_res_context / aec_get_output_base
+ |            --> P = B * min(1, res_gain) (+ comfort noise, off by default)
+ |            --> dfn_hop_begin(B, P) --> while (dfn_hop_nn_begin == 1) { model; dfn_hop_nn_end } --> dfn_hop_end --> out
+ |   refused hop: aec_reset + comfort-noise rng = AEC_CNG_SEED + dfn_hop_reset   (rig_reset())
  |   never reset the stage on an AEC delay change
  |-- aec_destroy; dfn_res_stage_destroy | dfn_rate_bridge_destroy; release the blocks
 ```
@@ -150,10 +182,10 @@ resampler count and must be included in the board measurement.
 
 Pool printed by the skeleton (`mono_aec_dfn_res`, matched delay, five-filter bank, NE10; the sum
 of `aec_get_mem_size()`, the three gain and spectrum buffers of the RES path and the stage or
-bridge requirement, each 16-byte aligned): 716,400 bytes at the 16 kHz default (the AEC and the RES gain path plus the
-rate bridge, whose own pool is 349,888 bytes including the stage), 1,443,712 bytes at 48 kHz (the
+bridge requirement, each 16-byte aligned): 717,984 bytes at the 16 kHz default (the AEC and the RES gain path plus the
+rate bridge, whose own pool is 349,888 bytes including the stage), 1,449,904 bytes at 48 kHz (the
 stage's 231,984 bytes, its synthesis and the AEC; the conventional MMSE-LSA chain on the 48 kHz
-grid needs 1,354,256 bytes) and 621,024 bytes at 8 kHz. Model weights and accelerator activation/
+grid needs 1,356,352 bytes) and 622,608 bytes at 8 kHz. Model weights and accelerator activation/
 workspace memory are external to this descriptor (the DFN2 ring grows beyond the shipped size when M + D
-exceeds 4: the 16 kHz skeleton with pair 2/4 printed 740,496 bytes); adding int8 weights alone
+exceeds 4: the 16 kHz skeleton with pair 2/4 printed 742,080 bytes); adding int8 weights alone
 brings the known minimum to about 2.7 MiB at 16 kHz.

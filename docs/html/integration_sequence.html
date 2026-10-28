@@ -57,7 +57,7 @@ th{background:#eef5f0}
    │── aec_init(pool,...) ─────►│  NULL=過小/未對齊/無效   │                       │
    │── anr_init(pool+a,...) ─────────────────────────────►│  NULL=同左            │
    │── ac_istft_init(pool+a+n,...) ─────────────────────────────────────────────►│  NULL=同左
-   │ unity[k]=1; rng=CNG_RNG_SEED
+   │ unity[k]=1; rng=AEC_CNG_SEED
    │
    │═ ② 每 hop(mic、ref 各 grid.hop_size floats,同 sample rate、同時鐘)═══════════
    │── aec_process_context(aec,mic,ref) ►│ 線性 AEC + delay 估計 + AEC 內部 RES 增益
@@ -70,7 +70,7 @@ th{background:#eef5f0}
    │ skn_all_finite_f32(out,hop)                            ← 輸出守衛,應用自己做(example_board_adapter.c 有做)
    │
    │═ ③ 任一步被拒 / 輸出非有限 / 換串流 ══════════════════════════════════════════
-   │── aec_reset ─────────────►│ ── anr_reset ───────────────►│ ── ac_istft_reset ──►│   rng=CNG_RNG_SEED
+   │── aec_reset ─────────────►│ ── anr_reset ───────────────►│ ── ac_istft_reset ──►│   rng=AEC_CNG_SEED
    │
    │═ ④ 結束 ══════════════════════════════════════════════════════════════════════
    │ anr_destroy(nr); aec_destroy(aec); platform_free(pool)          (destroy 不釋放 caller pool)</pre>

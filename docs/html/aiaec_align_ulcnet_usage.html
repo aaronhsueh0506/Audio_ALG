@@ -126,7 +126,7 @@ UlcnetAcceleratorAdapter *make_adapter(int D, void *runtime, UlcnetModel *model)
     *model = ulcnet_accelerator_adapter_model(a);   /* 交給 pipeline; adapter 與 pool 須活得比 pipeline 久 */
     return a;
 }</pre>
-<p class="note">兩段片語已在暫存副本以 <code>-std=c11 -Wall -Wextra -Wpedantic -Werror</code> 編譯通過（16 kHz grid）；<code>npu_run</code>／<code>run_graph</code>／<code>npu_fill_state_with_quantized_zero</code> 由目標平台提供。<code>UlcnetModel.infer</code> 回非 0 或輸出非有限時，pipeline 會改走 identity（輸出 linear error）；<code>io_descriptor</code> 必須發布，且須比 pipeline 活得久（pipeline 只複製 struct）。</p>
+<p class="note">兩段片語已在暫存副本以 <code>-std=c11 -Wall -Wextra -Wpedantic -Werror</code> 編譯通過（16 kHz grid）；<code>npu_run</code>／<code>run_graph</code>／<code>npu_fill_state_with_quantized_zero</code> 由目標平台提供。<code>UlcnetModel.infer</code> 回非 0 或輸出非有限時，pipeline 會改走 identity（輸出 linear error；這是未經 guard 的 analysis residual，即 <code>formed_hop</code>／<code>error_spec</code>，在 lib/aec 渲染 guard 作用的 hop 上可能大於 capture）；<code>io_descriptor</code> 必須發布，且須比 pipeline 活得久（pipeline 只複製 struct）。</p>
 
 <h3>錯誤處理速查</h3>
 <div class="tbl"><table>
@@ -137,7 +137,7 @@ UlcnetAcceleratorAdapter *make_adapter(int D, void *runtime, UlcnetModel *model)
 <tr><td><code>pre_process*</code></td><td>-1</td><td>NULL、模式不符、上一個 frame 尚未 commit／skip</td></tr>
 <tr><td><code>frame_inputs</code></td><td>-1</td><td>沒有開啟中的 frame</td></tr>
 <tr><td><code>frame_commit</code></td><td>-1</td><td>mask 或 state 有非有限值（或沒先 <code>frame_inputs</code>）：四個 state 全部歸零、generation +1、frame 仍開；呼叫 <code>frame_skip</code> 或重新 <code>frame_inputs</code></td></tr>
-<tr><td><code>frame_skip</code></td><td>-1</td><td>沒有開啟中的 frame；成功＝<b>identity</b>（error 頻譜原樣通過，state 維持加速器寫完的樣子，framing 照常前進）</td></tr>
+<tr><td><code>frame_skip</code></td><td>-1</td><td>沒有開啟中的 frame；成功＝<b>identity</b>（error 頻譜原樣通過，state 維持加速器寫完的樣子，framing 照常前進；這個 error 是未經 guard 的 analysis residual，guard 作用的 hop 上可能大於 capture）</td></tr>
 <tr><td><code>post_process</code></td><td>-1</td><td>NULL、模式不符、frame 還開著；成功時 out_hop 恆寫滿，hop 0 為零且 <code>*written</code> = 0</td></tr>
 </table></div>
 
@@ -170,6 +170,7 @@ caller                         UlcnetPrepost (C)                   NPU runtime
   | frame_skip() ------------------->| identity: error 頻譜原樣通過     |
   |== reset() ----------------------&gt;| state, framing 清空; generation+1 |
 </pre>
+<p class="note">圖中的 error 是未經 guard 的 analysis residual（<code>formed_hop</code>／<code>AecResContext.error_spec</code>），在 lib/aec 渲染 guard 作用的 hop 上可能大於 capture；它不是 <code>aec_get_output_base()</code> 的渲染 base。</p>
 <div class="tbl"><table>
 <tr><th>項目</th><th>16 kHz／512</th><th>48 kHz／1024</th><th>出處</th></tr>
 <tr><td>hop（H）</td><td>256 samples = 16.00 ms</td><td>512 samples = 10.67 ms</td><td><code>ULCNET_HOP</code></td></tr>

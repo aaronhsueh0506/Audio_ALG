@@ -161,6 +161,7 @@ typedef struct StaticSample {
     float *total_gain, *extra_noise;
     Complex *spec;
     uint32_t rng;
+    uint32_t reset_handled;   /* McabFrame.post_reset_serial the synthesis last followed */
     int n_freqs;
     McabSampleBeamResult beam;
     float *mic_buf,*ref_buf,*out_buf;
@@ -254,6 +255,7 @@ static int static_setup(void *user, McabSampleHopView *view) {
         }
         s->n_freqs = mcab_n_freqs(s->unit.flow);
         s->rng = MCAB_SAMPLE_CNG_RNG_SEED;
+        s->reset_handled = 0u;
     }
 
     s->hop = mcab_hop_size(s->unit.flow);
@@ -283,8 +285,9 @@ static int static_read(void *user, McabSampleHopView *view, int frame) {
     fill_hop(s->mic_buf,s->ref_buf,s->hop,s->options.sample_rate,frame);
     return 1;
 }
-/* One hop after the fuse into s->out_buf: G_res, G_nr, P = E * min(G_nr, G_res), comfort noise on
- * the bins the RES cut, synthesis. 0, or -1 when the RES or the denoiser refuses the hop. */
+/* One hop after the fuse into s->out_buf: G_res, G_nr (both estimated on E), P = B * min(G_nr,
+ * G_res) over the rendering base B, comfort noise on the bins the RES cut, synthesis (cleared
+ * and reseeded first when a lane had a post-chain reset). 0, or -1 when the RES or the denoiser refuses the hop. */
 static int static_chain(StaticSample *s, const McabFrame *f) {
     AecResInput in;
     const float *res, *nr;
@@ -293,7 +296,11 @@ static int static_chain(StaticSample *s, const McabFrame *f) {
     nr = res ? mcab_sample_anr_gain(s->nr, f, s->extra_noise, 1) : NULL;
     if (!nr) return -1;
     sk_min_f32(s->total_gain, nr, res, s->n_freqs);   /* NaN in the second operand reaches the finite gate; in the first it is replaced */
-    sk_capply_gain_f32(s->spec, f->e, s->total_gain, s->n_freqs);
+    if (mcab_sample_post_reset_due(&s->reset_handled, f)) {
+        ac_istft_reset(s->istft);
+        s->rng = MCAB_SAMPLE_CNG_RNG_SEED;
+    }
+    sk_capply_gain_f32(s->spec, f->b, s->total_gain, s->n_freqs);
     if (f->cn)
         aec_cng_fill(&s->rng, s->spec, f->cn, res, nr, MCAB_SAMPLE_CNG_NR_GAIN_FLOOR,
                      s->n_freqs);
