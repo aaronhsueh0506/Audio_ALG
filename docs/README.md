@@ -77,8 +77,8 @@ Who owns the residual-echo suppressor (RES):
 - **mono**: the AEC computes the RES gain inside `aec_process_context()` and hands it over as
   `AecResContext.res_gain` (read with `aec_get_res_context()`); its strength is set with
   `aec_set_level()`. The sample (`mono_form()` in `pipelines/mono_aec_nr_res/main.c`) only decides
-  whether to apply it. A pure-AEC sample may call the full `aec_process()` (RES and the final
-  synthesis in one call).
+  whether to apply it. The inverse FFT and overlap-add are `ac_istft_push()`, called by the
+  application; the pure-AEC `--aec-only` hop copies `ctx.linear_hop` and has no synthesis.
 - **4ch**: the `mcab` flow (`mcab_process_front()` over the shared delay and four lanes, then `mcab_fuse()` with
   the caller's beamformer weights; the sample helper `mcab_sample_beam_*` supplies SRP-PHAT/BF when no
   beamformer of your own is at hand) has no RES; `mcab_fuse()` leaves `frame->g_res_ctx` NULL. An application

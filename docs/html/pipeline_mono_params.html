@@ -62,7 +62,7 @@ th{background:#eef3ee}
 <h3>1.3 組成開關(應用的選擇,不是 config 欄位)</h3>
 <table>
 <tr><th>開關</th><th>範例 CLI</th><th>做法</th></tr>
-<tr><td>只要線性 AEC</td><td><code>--aec-only</code></td><td>只建 <code>Aec</code>,每 hop <code>aec_process(aec,mic,ref,out)</code>;NR 與合成連 pool 都不佔</td></tr>
+<tr><td>只要線性 AEC</td><td><code>--aec-only</code></td><td>只建 <code>Aec</code>,每 hop <code>aec_process_context()</code> 後複製 <code>ctx.linear_hop</code>;NR 與合成連 pool 都不佔</td></tr>
 <tr><td>關 NR</td><td><code>--no-nr</code></td><td>不建 <code>AnrDenoiser</code>,NR 增益讀 <code>unity</code> 全 1 向量(total 378,384 B,vs 423,728 B)</td></tr>
 <tr><td>關 RES</td><td><code>--no-res</code></td><td>RES 增益改讀 <code>unity</code>;不跑 CNG;不改 pool 大小(RES 在 <code>Aec</code> 內)</td></tr>
 <tr><td>關 CNG</td><td><code>--no-cng</code>;<code>AecConfig.enable_cng</code>(level 預設 1)</td><td>範例以 <code>aec_cfg.enable_cng &amp;&amp; !no_cng</code> 決定是否呼叫 <code>aec_cng_fill()</code>;下游已有 CNG 時請關,避免疊兩層</td></tr>
@@ -96,7 +96,7 @@ th{background:#eef3ee}
 <table>
 <tr><th>階段</th><th>公開(整合者呼叫)</th></tr>
 <tr><td>建立</td><td><code>aec_resolve_signal_grid()</code>／<code>aec_default_fft_size()</code>／<code>aec_config_from_level()</code>、<code>aec_get_mem_size()</code>／<code>aec_init()</code>、<code>anr_config_for_level_grid()</code>／<code>anr_get_mem_size()</code>／<code>anr_init()</code>、<code>ac_stft_config_default()</code>／<code>ac_istft_get_mem_size()</code>／<code>ac_istft_init()</code>;桌面便利:<code>aec_create()</code>(呼叫端持有 <code>Aec</code> 結構)、<code>anr_create()</code></td></tr>
-<tr><td>每 hop</td><td><code>aec_process_context()</code>、<code>aec_get_res_context()</code>、<code>anr_process_gain()</code>／<code>anr_get_gain()</code>、<code>sk_scale_f32()</code>、<code>sk_min_f32()</code>、<code>sk_capply_gain_f32()</code>、<code>aec_cng_fill()</code>、<code>ac_istft_push()</code>、選用 <code>skn_all_finite_f32()</code>;<code>--aec-only</code> 為 <code>aec_process()</code></td></tr>
+<tr><td>每 hop</td><td><code>aec_process_context()</code>、<code>aec_get_res_context()</code>、<code>anr_process_gain()</code>／<code>anr_get_gain()</code>、<code>sk_scale_f32()</code>、<code>sk_min_f32()</code>、<code>sk_capply_gain_f32()</code>、<code>aec_cng_fill()</code>、<code>ac_istft_push()</code>、選用 <code>skn_all_finite_f32()</code>;<code>--aec-only</code> 只做 <code>aec_process_context()</code> 與 <code>aec_get_res_context()</code>,輸出取 <code>ctx.linear_hop</code></td></tr>
 <tr><td>控制</td><td><code>aec_set_level()</code>、<code>anr_set_level()</code>、<code>anr_reconfigure()</code></td></tr>
 <tr><td>reset／destroy</td><td><code>aec_reset()</code>、<code>anr_reset()</code>、<code>ac_istft_reset()</code>、<code>anr_destroy()</code>、<code>aec_destroy()</code>(對 caller pool 不釋放記憶體)</td></tr>
 <tr><td>診斷(唯讀)</td><td><code>aec_debug_status()</code>、<code>anr_debug_status()</code>、<code>aec_get_res_context()</code>、<code>aec_get_linear_context()</code>、<code>aec_get_last_timing()</code>(<code>PROFILE=1</code> 才有數值)、<code>aec_hop_size()</code>、<code>anr_get_hop_size()</code>／<code>anr_get_n_freqs()</code></td></tr>

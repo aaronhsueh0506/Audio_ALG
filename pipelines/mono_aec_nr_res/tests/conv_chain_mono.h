@@ -35,7 +35,7 @@ typedef struct ConvMonoConfig {
     int fixed_delay_samples;
     AecLevel aec_level;
     AnrLevel nr_level;
-    int aec_only;                 /* the AEC's own time-domain output */
+    int aec_only;                 /* the AEC's own time-domain hop (ctx.linear_hop) */
     int enable_nr, enable_res, enable_cng, legacy_amin;
 } ConvMonoConfig;
 
@@ -150,12 +150,12 @@ static inline int conv_mono_hop(ConvMono* c, const float* mic, const float* ref,
     const float* nr_gain;
     AecResContext ctx;
     int k;
-    if (c->cfg.aec_only) {
-        aec_process(c->aec, mic, ref, out);
-        return 0;
-    }
     aec_process_context(c->aec, mic, ref);
     aec_get_res_context(c->aec, &ctx);
+    if (c->cfg.aec_only) {
+        memcpy(out, ctx.linear_hop, (size_t)c->hop * sizeof(float));
+        return 0;
+    }
     res_gain = c->cfg.enable_res ? ctx.res_gain : c->unity;
     nr_gain = c->unity;
     if (c->nr) {

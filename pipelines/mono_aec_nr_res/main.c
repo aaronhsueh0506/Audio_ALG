@@ -347,9 +347,9 @@ static uint32_t timing_now_us(void) {
                       + (uint64_t)ts.tv_nsec / 1000ull);
 }
 
-/* One hop. --aec-only is the AEC's own time-domain output; otherwise the post stages over the
- * AEC's frame. The clock is read only when `timed`. Returns 0, or -1 after a refused hop (the
- * caller resets). */
+/* One hop. --aec-only copies the AEC's own time-domain hop (ctx.linear_hop); otherwise the post
+ * stages run over the AEC's frame and the synthesis is ac_istft_push(). The clock is read only
+ * when `timed`. Returns 0, or -1 after a refused hop (the caller resets). */
 static int process_hop(Rig* r, const float* mic, const float* ref, float* out, int timed,
                        uint32_t* chain_us, uint32_t* synth_us) {
     AecResContext ctx;
@@ -357,12 +357,12 @@ static int process_hop(Rig* r, const float* mic, const float* ref, float* out, i
     uint32_t t0, t1;
     *chain_us = 0u;
     *synth_us = 0u;
-    if (!r->with_post) {
-        aec_process(r->aec, mic, ref, out);
-        return 0;
-    }
     aec_process_context(r->aec, mic, ref);
     aec_get_res_context(r->aec, &ctx);
+    if (!r->with_post) {
+        memcpy(out, ctx.linear_hop, (size_t)ctx.hop_size * sizeof(float));
+        return 0;
+    }
     if (!ctx.error_spec) return -1;
     t0 = timed ? timing_now_us() : 0u;
     spec = mono_form(r, &ctx);

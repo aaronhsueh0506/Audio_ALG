@@ -166,7 +166,7 @@ mono 的設定分成兩份：lib/aec 的 `AecConfig`（格點與接縫欄位由�
 | CNG | 開，與 `aec_cfg.enable_cng`（AEC level 自己的值）取 AND | `--no-cng`：不呼叫 `aec_cng_fill()`。位準再乘該 bin 的 NR gain、下限 −10 dB（範例的 `CNG_NR_GAIN_FLOOR`；NR 看不到 comfort noise，在此補套）；沒有 RES gain 時也不填 |
 | 合成 | 用 | 範例是 `ac_istft_push()` 之後直接輸出；DFN2 之類後接的 stage 自己合成時就不建 `AcIstft`（見 `dfn/mono_aec_dfn_res`） |
 
-`--aec-only` 不建任何後級、用 `aec_process()`（[§1.2](integration_mono_zh_TW_01_overview_link_quickstart.md#12---aec-only)）。
+`--aec-only` 不建任何後級、輸出取 `ctx.linear_hop`（[§1.2](integration_mono_zh_TW_01_overview_link_quickstart.md#12---aec-only)）。
 
 ### 4.3 Grid（由 `sample_rate` + `fft_size` 唯一決定）
 

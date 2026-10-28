@@ -237,12 +237,12 @@ static int rig_hop(Rig* r, const float* mic, const float* ref, float* out) {
     AecResContext c;
     const float* res;
     const float* nr;
-    if (!r->with_post) {
-        aec_process(r->aec, mic, ref, out);
-        return 0;
-    }
     aec_process_context(r->aec, mic, ref);
     aec_get_res_context(r->aec, &c);
+    if (!r->with_post) {
+        memcpy(out, c.linear_hop, (size_t)c.hop_size * sizeof(float));
+        return 0;
+    }
     if (!c.error_spec) return -1;
     res = r->with_res ? c.res_gain : r->unity;
     nr = r->unity;
@@ -997,7 +997,7 @@ static void test_frame_and_chain_args(void) {
     rig_free(&r);
     free(pool);
 
-    /* --aec-only: the AEC's own time-domain output, no post stage */
+    /* --aec-only: the AEC's own time-domain hop, no post stage and no synthesis */
     o.aec_only = 1;
     if (plan_make(&p, &o) != 0 || !(pool = aligned_block(p.total, 0xA5)) ||
         rig_init_pool(&r, pool, p.total, &p) != 0) {
@@ -1005,9 +1005,74 @@ static void test_frame_and_chain_args(void) {
         return;
     }
     CHECK(!r.with_post && p.total == ALIGN16(p.aec_bytes) && rig_hop(&r, mic, ref, out) == 0,
-          "args: an aec_only plan holds the AEC alone and processes through aec_process");
+          "args: an aec_only plan holds the AEC alone and copies the context's linear hop");
     rig_free(&r);
     free(pool);
+}
+
+/* --aec-only copies ctx.linear_hop out of aec_process_context(). The oracle is the library's
+ * own time-domain entry, aec_process(), on a second instance of the same lane config: it must
+ * return the same hop (the rig, the harness hop and the oracle advance identical state). The
+ * count of hops where the formed hop differs from the linear hop shows the comparison can tell
+ * the two apart. */
+static int aec_only_equals_aec_process(int sr, int fft_size, int hops, int* formed_differs) {
+    enum { HIST = 8192 };
+    ConvMonoConfig o = grid_opts(sr, fft_size);
+    Plan p;
+    Rig r;
+    ConvMono* cm;
+    Aec* oracle = (Aec*)calloc(1, sizeof(Aec));
+    AecResContext c;
+    float *mic, *ref, *want, *got_rig, *got_cm, *hist;
+    unsigned int rng = 0x2468ACEu;
+    int hop, h, ok = 1;
+    o.aec_only = 1;
+    *formed_differs = 0;
+    if (!oracle || plan_make(&p, &o) != 0 || rig_init_heap(&r, &p) != 0 ||
+        aec_create(oracle, &p.aec_cfg) != 0 || !(cm = conv_mono_create(&o))) {
+        free(oracle);
+        return -1;
+    }
+    hop = p.grid.hop_size;
+    mic = (float*)malloc((size_t)hop * sizeof(float));
+    ref = (float*)malloc((size_t)hop * sizeof(float));
+    want = (float*)malloc((size_t)hop * sizeof(float));
+    got_rig = (float*)malloc((size_t)hop * sizeof(float));
+    got_cm = (float*)malloc((size_t)hop * sizeof(float));
+    hist = (float*)calloc(HIST, sizeof(float));
+    for (h = 0; h < hops; ++h) {
+        reset_scene_hop(&rng, mic, ref, hop, h, hist, HIST, 293, 0.5f);
+        aec_process(oracle, mic, ref, want);
+        if (rig_hop(&r, mic, ref, got_rig) != 0 || conv_mono_hop(cm, mic, ref, got_cm) != 0) {
+            ok = 0;
+            break;
+        }
+        aec_get_res_context(r.aec, &c);
+        if (memcmp(c.formed_hop, c.linear_hop, (size_t)hop * sizeof(float)) != 0) ++*formed_differs;
+        if (memcmp(want, got_rig, (size_t)hop * sizeof(float)) != 0 ||
+            memcmp(want, got_cm, (size_t)hop * sizeof(float)) != 0)
+            ok = 0;
+    }
+    free(mic); free(ref); free(want); free(got_rig); free(got_cm); free(hist);
+    conv_mono_destroy(cm);
+    aec_destroy(oracle);
+    free(oracle);
+    rig_free(&r);
+    return ok;
+}
+
+static void test_aec_only_output(void) {
+    static const struct { int sr, fft; } g[] = { {16000, 256}, {16000, 512}, {48000, 1024} };
+    size_t i;
+    for (i = 0; i < sizeof g / sizeof g[0]; ++i) {
+        int formed = 0, rc = aec_only_equals_aec_process(g[i].sr, g[i].fft, 400, &formed);
+        CHECK(rc == 1,
+              fmt_msg("--aec-only hop (main.c rig, harness) == aec_process() oracle @ %d Hz / %d, 400 hops",
+                      g[i].sr, g[i].fft));
+        CHECK(formed > 0,
+              fmt_msg("--aec-only @ %d Hz / %d: the formed hop differs from the linear hop on %d hops, so the comparison separates them",
+                      g[i].sr, g[i].fft, formed));
+    }
 }
 
 /* ---- the example programs as black boxes ----------------------------------------------
@@ -1101,6 +1166,88 @@ static int black_box_case(const char* bin, const char* tmp, const BlackBoxCase* 
     conv_mono_destroy(c);
     *hops_out = n;
     return ok && nonzero ? 1 : 0;
+}
+
+/* --aec-only writes no context dump, so the output WAV is the observable: the oracle runs
+ * aec_process() on a second instance over the same quantised WAV pair, writes its hops through
+ * the same WAV writer and the two files' samples must be equal. 1 on equal, 0 on a mismatch,
+ * -1 on a setup failure. */
+static int black_box_aec_only(const char* bin, const char* tmp, int sr, int fft_size,
+                              const char* args) {
+    enum { HOPS = 400 };
+    char mic_path[512], ref_path[512], out_path[512], ora_path[512], cmd[2048];
+    ConvMonoConfig o = grid_opts(sr, fft_size);
+    Plan p;
+    Aec* oracle = (Aec*)calloc(1, sizeof(Aec));
+    WavReader *rm, *rr, *ro, *rp;
+    WavWriter* wo;
+    float *mic, *ref, *want, *got, *back;
+    int hop, h, ok = 1, nonzero = 0;
+    o.aec_only = 1;
+    snprintf(mic_path, sizeof mic_path, "%s/bba_mic.wav", tmp);
+    snprintf(ref_path, sizeof ref_path, "%s/bba_ref.wav", tmp);
+    snprintf(out_path, sizeof out_path, "%s/bba_out.wav", tmp);
+    snprintf(ora_path, sizeof ora_path, "%s/bba_oracle.wav", tmp);
+    if (!oracle || plan_make(&p, &o) != 0 || aec_create(oracle, &p.aec_cfg) != 0) {
+        free(oracle);
+        return -1;
+    }
+    hop = p.grid.hop_size;
+    if (write_scene_wav(mic_path, ref_path, sr, HOPS, hop) != 0) { aec_destroy(oracle); free(oracle); return -1; }
+    snprintf(cmd, sizeof cmd, "'%s' '%s' '%s' '%s' %s > '%s/bba_stdout.txt' 2>&1",
+             bin, mic_path, ref_path, out_path, args, tmp);
+    if (system(cmd) != 0) { aec_destroy(oracle); free(oracle); return -1; }
+    rm = wav_open_read(mic_path);
+    rr = wav_open_read(ref_path);
+    wo = wav_open_write(ora_path, sr, 1);
+    mic = (float*)malloc((size_t)hop * sizeof(float));
+    ref = (float*)malloc((size_t)hop * sizeof(float));
+    want = (float*)malloc((size_t)hop * sizeof(float));
+    got = (float*)malloc((size_t)hop * sizeof(float));
+    back = (float*)malloc((size_t)hop * sizeof(float));
+    if (!rm || !rr || !wo || !mic || !ref || !want || !got || !back) ok = -1;
+    for (h = 0; ok == 1 && h < HOPS; ++h) {
+        if (wav_read_float(rm, mic, hop) != hop || wav_read_float(rr, ref, hop) != hop) { ok = -1; break; }
+        aec_process(oracle, mic, ref, want);
+        wav_write_float(wo, want, hop);
+    }
+    if (wo) wav_close_write(wo);
+    ro = ok == 1 ? wav_open_read(ora_path) : NULL;
+    rp = ok == 1 ? wav_open_read(out_path) : NULL;
+    if (ok == 1 && (!ro || !rp)) ok = -1;
+    for (h = 0; ok == 1 && h < HOPS; ++h) {
+        int i;
+        if (wav_read_float(ro, back, hop) != hop || wav_read_float(rp, got, hop) != hop) { ok = 0; break; }
+        if (memcmp(back, got, (size_t)hop * sizeof(float)) != 0) ok = 0;
+        for (i = 0; i < hop; ++i) if (got[i] != 0.0f) nonzero = 1;
+    }
+    if (ok == 1 && wav_read_float(rp, got, hop) != 0) ok = 0;   /* no extra hop: no synthesis lag */
+    if (rm) wav_close_read(rm);
+    if (rr) wav_close_read(rr);
+    if (ro) wav_close_read(ro);
+    if (rp) wav_close_read(rp);
+    free(mic); free(ref); free(want); free(got); free(back);
+    aec_destroy(oracle);
+    free(oracle);
+    return ok == 1 ? (nonzero ? 1 : 0) : ok;
+}
+
+static void test_examples_aec_only(const char* bin_dir, const char* tmp) {
+    static const struct { const char* args; int sr, fft; } cases[] = {
+        {"--fft-size 256 --aec-only", 16000, 256},
+        {"--fft-size 512 aggressive --aec-only", 16000, 512},
+        {"--aec-level 3 --aec-only", 8000, 0},
+    };
+    static const char* const programs[] = {"aec_nr_pipeline", "aec_nr_pipeline_static"};
+    size_t pi, ci;
+    char bin[512];
+    for (pi = 0; pi < 2; ++pi) {
+        snprintf(bin, sizeof bin, "%s/%s", bin_dir, programs[pi]);
+        for (ci = 0; ci < sizeof cases / sizeof cases[0]; ++ci)
+            CHECK(black_box_aec_only(bin, tmp, cases[ci].sr, cases[ci].fft, cases[ci].args) == 1,
+                  fmt_msg("black box: %s %s @ %d Hz equals the aec_process() oracle sample for sample",
+                          programs[pi], cases[ci].args, cases[ci].sr));
+    }
 }
 
 static void test_examples_black_box(const char* bin_dir, const char* tmp) {
@@ -1283,9 +1430,11 @@ int main(int argc, char** argv) {
     printf("\n=== chain against the hand-written oracle ===\n");
     test_chain_equals_oracle();
     test_frame_and_chain_args();
+    test_aec_only_output();
 
     printf("\n=== the example programs against the oracle ===\n");
     test_examples_black_box(argv[1], argv[2]);
+    test_examples_aec_only(argv[1], argv[2]);
     test_examples_cli_values(argv[1]);
 
     if (g_failures) {

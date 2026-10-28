@@ -42,7 +42,7 @@ th{background:#eef3ee}
 <tr><td>16 kHz(替代)</td><td>512 / 256 / 257</td><td>需明示 <code>fft_size=512</code></td></tr>
 <tr><td>48 kHz</td><td>1024 / 512 / 513</td><td>rate default</td></tr>
 </table>
-<p><code>--aec-only</code> 時只建 <code>Aec</code>(NR 與合成連 pool 都不佔),直接用 <code>aec_process(aec, mic, ref, out)</code> 輸出線性 AEC 殘差。</p>
+<p><code>--aec-only</code> 時只建 <code>Aec</code>(NR 與合成連 pool 都不佔),每 hop 呼叫 <code>aec_process_context()</code> 後把 <code>ctx.linear_hop</code> 複製到 <code>out</code>,輸出線性 AEC 殘差。</p>
 
 <h2>如何呼叫使用</h2>
 <p>呼叫順序(每一步的失敗訊號都在括號內):</p>
@@ -139,10 +139,12 @@ platform_free(pool);
 <h3>每 hop 程式流(block diagram)</h3>
 <pre>process_hop(): (mono_aec_nr_res/main.c)
  │
- ├─ --aec-only ──► aec_process(aec, mic, ref, out) ──► return        (0-hop lag)
- │
  ├─ aec_process_context(aec, mic, ref)  沒有時域輸出 copy
- ├─ aec_get_res_context(aec, &amp;ctx) → AecResContext;ctx.error_spec 為 NULL 時回 -1(被拒)
+ ├─ aec_get_res_context(aec, &amp;ctx) → AecResContext
+ │
+ ├─ --aec-only ──► memcpy(out, ctx.linear_hop, hop) ──► return      (0-hop lag)
+ │
+ ├─ ctx.error_spec 為 NULL 時回 -1(被拒)
  │      ctx.error_spec / near_spec / far_spec / r2 / comfort_noise / res_gain / usable_linear(借用)
  ├─ mono_form(rig, &amp;ctx)(main.c; 逐 hop 串接寫在 main 內):
  │    ├─ res_gain = with_res ? ctx.res_gain : unity     (NULL 即被拒)
@@ -191,7 +193,7 @@ WOLA (C)        out=frame0 前半 out=hop#0 重建   out = hop p-1 的重建
 <tr><td>NR gain(<code>anr_get_gain()</code> 的回傳,降噪器擁有,到下一次呼叫前有效)</td><td>[n_freqs]</td><td>float32</td><td>1 frame</td><td>—</td></tr>
 </table>
 <p>n_freqs = 129(16k 預設)/ 257(16k alt)/ 513(48k)。<code>mic/ref</code> 只在呼叫期間讀取(AEC 自己再 copy 一層),<code>out</code> 從不讀取。</p>
-<p class="note"><b><code>ctx.error_spec</code> 不保證每個 hop 都是誤差。</b>mono lane 無條件以 <code>enable_res=0</code> / <code>return_res_context=1</code> 建 AEC(<code>derive_lane()</code>),而 <code>lib/aec</code> 的 formed 選擇器<b>只在這個 context-only 模式</b>多開一個 capture 候選:上一個 hop 的濾波品質判定尚未認可線性估計、且被選中的殘差在這個 hop 的能量大於同一 hop 的 mic capture 時,formed 時域 hop 與 <code>ctx.error_spec</code> 一起改送 capture,既有的 30-sample crossfade 承接邊界。換句話說,濾波器在加訊號的 hop 上這條 seam 就是 mic;NR/RES 照常套在它上面。<code>--aec-only</code> 走 <code>aec_process()</code>,輸出仍是 raw 線性殘差,不受影響。</p>
+<p class="note"><b><code>ctx.error_spec</code> 不保證每個 hop 都是誤差。</b>mono lane 無條件以 <code>enable_res=0</code> / <code>return_res_context=1</code> 建 AEC(<code>derive_lane()</code>),而 <code>lib/aec</code> 的 formed 選擇器<b>只在這個 context-only 模式</b>多開一個 capture 候選:上一個 hop 的濾波品質判定尚未認可線性估計、且被選中的殘差在這個 hop 的能量大於同一 hop 的 mic capture 時,formed 時域 hop 與 <code>ctx.error_spec</code> 一起改送 capture,既有的 30-sample crossfade 承接邊界。換句話說,濾波器在加訊號的 hop 上這條 seam 就是 mic;NR/RES 照常套在它上面。<code>--aec-only</code> 輸出 <code>ctx.linear_hop</code>,仍是 raw 線性殘差,不受影響。</p>
 
 <h2>State 表</h2>
 <p>全部 cross-call state 都住在 caller 的 pool(<code>aec_nr_pipeline_static</code> 的一個 16-byte 對齊 block;host 只擁有 pool 記憶體本身)。carve 順序(<code>main.c</code> 的 <code>pool_bytes()</code>／<code>rig_build()</code>)= <code>Aec</code>, <code>nr</code>(<code>AnrDenoiser</code>), <code>istft</code>(含 fft、窗、acc、time、spec 暫存), <code>unity</code>, <code>total_gain</code>, <code>extra_noise</code>, <code>spec</code>;<code>-DAEC_NR_POOL_SPLIT=1</code> 的 <code>aec_nr_pipeline</code> 是兩塊(<code>Aec</code> 一塊、其餘一塊),順序相同。RES 增益在 <code>Aec</code> 內,不另佔 pool(所以 <code>--no-res</code> 不改 pool 大小)。這些是普通的函式庫物件與緩衝,沒有 layout version。</p>

@@ -39,7 +39,7 @@
  │══ 結束 ═══════════════════════════════════════════════════════════════
  │ anr_destroy(nr); aec_destroy(aec); 釋放 pool    （AcIstft 沒有 destroy；先 destroy 再釋放 pool）
  │
- │ --aec-only：只建 Aec，每 hop 改呼叫 aec_process(aec,mic,ref,out)（不經 NR、合成與增益暫存）
+ │ --aec-only：只建 Aec，每 hop 呼叫 aec_process_context() 後把 ctx.linear_hop 複製到 out（不經 NR、合成與增益暫存）
 ```
 
 延遲泳道（橫軸 = hop；`ac_istft_push()` 的 identity 鏈延遲 = 1 hop，見 `audio_stft.h` 檔頭）：
@@ -63,7 +63,7 @@ Aec + RES + NR    處理 m[t] 處理 m[t+1] 處理 m[t+2]     （同一次呼叫
 | 大小查詢 | `aec_get_mem_size()`（`aec.h`）、`anr_get_mem_size()`（`anr.h`）、`ac_istft_get_mem_size()`（`audio_stft.h`） | 回 `0` = config 無效 |
 | 建立 | `aec_init()`、`anr_init()`、`ac_istft_init()`；桌面也可 `aec_create()`、`anr_create()` | pool 路徑回 `NULL` = 失敗 |
 | 每 hop | `aec_process_context()`、`aec_get_res_context()`（`aec.h`）、`anr_process_gain()`、`anr_get_gain()`（`anr.h`）、`sk_scale_f32()`、`sk_min_f32()`、`sk_capply_gain_f32()`（`utility/simd_kernels.h`）、`aec_cng_fill()`（`aec_res.h`）、`ac_istft_push()`；選用 `skn_all_finite_f32()`（`utility/simd_kernel_nn.h`） | 順序見 [§0.1](#01-流程時序圖monoaec-加逐個初始化的函式庫) |
-| 只要線性 AEC | `aec_process()` | 與 `aec_process_context()` 推進相同狀態 |
+| 只要線性 AEC | `aec_process_context()`、`aec_get_res_context()`，輸出取 `ctx.linear_hop` | 範例的 `--aec-only` 這樣做；`aec_process()` 是函式庫的時域便利入口，lane 組態下回傳同一個 hop |
 | 強度 | `aec_set_level()`、`anr_set_level()`（需要整組覆寫時 `anr_reconfigure()`） | [§3.2](integration_mono_zh_TW_02_lifecycle_config_errors.md#32-執行期強度控制) |
 | 重置／收尾 | `aec_reset()`、`anr_reset()`、`ac_istft_reset()`、`aec_destroy()`、`anr_destroy()` | [§3](integration_mono_zh_TW_02_lifecycle_config_errors.md#3-lifecycle)、[§5](integration_mono_zh_TW_02_lifecycle_config_errors.md#5-錯誤處理) |
 | 診斷（唯讀） | `aec_debug_status()`、`anr_debug_status()`、`aec_get_last_timing()` | [§3.1](integration_mono_zh_TW_02_lifecycle_config_errors.md#31-執行期唯讀存取)、[§3.1b](integration_mono_zh_TW_02_lifecycle_config_errors.md#31b-逐階段耗時診斷用) |
@@ -127,7 +127,7 @@ mic hop + ref hop ──► Aec (aec_process_context) ──► aec_get_res_cont
 
 mono 的 RES 是明確的例外：它在 `Aec` 的呼叫裡（`aec_process_context()` 算出殘留 gain，`aec_get_res_context()` 以
 `ctx.res_gain` 交出，強度用 `aec_set_level()`），沒有獨立的 `AecRes` 物件；範例只決定要不要套用這個 gain。
-純 AEC 的範例（`--aec-only`）可改呼叫完整的 `aec_process()`，RES 與最後的合成在同一個呼叫內完成。
+純 AEC 的範例（`--aec-only`）不經過合成：每 hop 一樣呼叫 `aec_process_context()`，輸出取 `ctx.linear_hop`。反向 FFT 與 overlap-add 一律由應用呼叫獨立的 `ac_istft_push()`，不放在演算法函式庫裡。
 
 | 物件 | 來源 | 大小查詢 | 初始化 |
 |---|---|---|---|
@@ -153,9 +153,11 @@ mono 的 RES 是明確的例外：它在 `Aec` 的呼叫裡（`aec_process_conte
 
 ### 1.2 `--aec-only`
 
-只要線性 AEC 的輸出，就不建後級：`aec_process(aec, mic, ref, out)` 直接輸出時域 hop，
+只要線性 AEC 的輸出，就不建後級：`aec_process_context(aec, mic, ref)` 之後 `aec_get_res_context(aec, &ctx)`，
+把 `ctx.linear_hop`（`ctx.hop_size` 個 float，AEC 自己的時域 hop）複製到 `out`。
 不需要降噪器、合成與增益暫存（見 `aec_nr_pipeline_static --print-mem-size --aec-only`：pool 只有 `Aec` 那一塊）。
-`aec_process()` 與 `aec_process_context()` 推進相同的狀態，同一個實例上可以混用。
+`aec_process()` 與 `aec_process_context()` 推進相同的狀態；在範例的 lane 組態（`enable_res=0`、`return_res_context=1`）下
+`aec_process()` 回傳的就是這個 hop，測試用它當獨立的對照。
 
 ### 1.3 Header closure
 

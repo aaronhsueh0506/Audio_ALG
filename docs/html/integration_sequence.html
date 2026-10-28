@@ -74,7 +74,7 @@ th{background:#eef5f0}
    │
    │═ ④ 結束 ══════════════════════════════════════════════════════════════════════
    │ anr_destroy(nr); aec_destroy(aec); platform_free(pool)          (destroy 不釋放 caller pool)</pre>
-<p><code>mono_nr_gain()</code> 只在 <code>use_r2</code>、<code>ctx.r2</code> 非 NULL 且 <code>ctx.usable_linear</code> 非零時才把 <code>r2/32768²</code> 折進噪聲底,否則等於純降噪。<code>--aec-only</code>:只建 <code>Aec</code>,每 hop 一個呼叫 <code>aec_process(aec,mic,ref,out)</code>(直寫 <code>out</code>,0-hop lag)。逐 hop 的 swimlane 與延遲見 <a href="pipeline_mono.html">pipeline_mono</a>。</p>
+<p><code>mono_nr_gain()</code> 只在 <code>use_r2</code>、<code>ctx.r2</code> 非 NULL 且 <code>ctx.usable_linear</code> 非零時才把 <code>r2/32768²</code> 折進噪聲底,否則等於純降噪。<code>--aec-only</code>:只建 <code>Aec</code>,每 hop <code>aec_process_context()</code> 後把 <code>ctx.linear_hop</code> 複製到 <code>out</code>(0-hop lag)。逐 hop 的 swimlane 與延遲見 <a href="pipeline_mono.html">pipeline_mono</a>。</p>
 
 <h2>2. 4ch:mcab flow(共用 delay、4 lane)+ sample helper(SRP-PHAT、BF)+ 應用的 RES</h2>
 <pre>應用(main)       Mcab(flow)                         McabSampleBeam(helper)     AecRes(libaec)  AnrDenoiser  AcIstft

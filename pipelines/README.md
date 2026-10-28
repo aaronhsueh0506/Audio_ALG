@@ -78,7 +78,7 @@ mic/ref → linear AEC (aec_process_context(): context-only, no emit)
                                                        one iFFT/OLA
 
 aec_only mode (no NR/RES stage at all):
-mic/ref → linear AEC (aec_process(): emits into out) → out
+mic/ref → linear AEC (aec_process_context(); out = ctx.linear_hop) → out
 ```
 
 There is no pipeline library behind this diagram: the AEC, the denoiser, the RES object and the
@@ -88,10 +88,11 @@ no independent time-domain RES filter after NR. In the mono flow `G_res` is calc
 inside the AEC3 suppression path (`ctx.res_gain`), exported with the linear residual, fused with
 `G_nr`, and applied once to `E(f)`.
 
-Without `--aec-only` the chain never reads `aec_process()`'s returned audio, so it calls
-`aec_process_context()`: the same linear filter and RES-context computation, minus the copy into an
-`out` buffer. The mono examples pick one entry point at start-up from `--aec-only`; the two advance
-identical state and may be mixed freely on one instance.
+Every mono example hop calls `aec_process_context()`. Without `--aec-only` the post stages read the
+context and `ac_istft_push()` (audiolib) does the inverse FFT and overlap-add, one function the
+application calls; with `--aec-only` the hop copies `ctx.linear_hop`, the AEC's own time-domain
+hop, to `out` (no synthesis, no lag). `aec_process()` stays a library API that returns the same
+hop for this lane configuration, and advances identical state.
 
 ## Modules
 
@@ -119,7 +120,8 @@ The mono application instead takes the AEC-owned `res_gain` from `AecResContext`
 (`aec_get_res_context()`). With `return_res_context=1` and `enable_res=0`,
 `aec_process_context()` advances the linear filter and context calculation without copying
 returned time audio. The `aec_process()` convenience API also emits time audio (with RES enabled it
-applies its own suppression/synthesis internally); that full path is distinct from the
+applies its own suppression/synthesis internally, which the examples do not use: synthesis is the
+application's `ac_istft_push()`); that full path is distinct from the
 four-channel `mcab_process_front()` → beamformer → `mcab_fuse()` → gain stages flow.
 See `lib/aec/c_impl/include/aec.h` and `aec_res.h` for ownership and inputs.
 

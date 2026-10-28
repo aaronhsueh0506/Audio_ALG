@@ -3,6 +3,43 @@
 `Audio_ALG/pipelines`（含它建置的 `AINR`、`AIAEC` C 程式）的重要改動記錄在此，格式依
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/)。README 只寫現況，改動經過寫在這裡。
 
+## [Unreleased] — 2026-10-28 — The example programs do the inverse FFT and overlap-add through `ac_istft`; `--aec-only` no longer calls `aec_process()`
+
+Rule: the inverse FFT and the overlap-add are one independent function the application calls (audiolib `ac_istft_*`),
+not code inside an algorithm library, and the example programs follow it. `aec_process()` stays a public library API
+(unchanged); the example hop and the harness hops of `mono_aec_nr_res` no longer call it, and the tests call it only as
+the independent oracle.
+
+### Changed
+- `mono_aec_nr_res/main.c` (`aec_nr_pipeline`, `aec_nr_pipeline_static`): with `--aec-only` the hop is `aec_process_context()`,
+  `aec_get_res_context()` and a copy of `ctx.linear_hop` into `out`, instead of `aec_process()`. The lane configuration
+  (`enable_res = 0`, `return_res_context = 1`) makes `aec_process()` return exactly that buffer (the PBFDKF overlap-save
+  residual, `raw_output`; no synthesis runs on that path), so the output WAV, the exit code and every printed line are
+  unchanged and there is still no synthesis lag. The default path was already `aec_process_context()` ... `ac_istft_push()`.
+- Tests: `rig_hop()` in `test_mono_chain.c` and `conv_mono_hop()` in `conv_chain_mono.h` take the same path for an
+  `aec_only` plan (the latter's `aec_process()` branch was never exercised before). READMEs, `docs/` and the HTML pages that
+  said `--aec-only` is `aec_process()` now describe `ctx.linear_hop`.
+
+### Added (tests)
+- `test_aec_only_output`: the `--aec-only` hop of the rig and of the harness equals `aec_process()` on a second instance of
+  the same lane configuration, bit for bit, over 400 hops at 16 kHz/256, 16 kHz/512 and 48 kHz/1024, and the same run
+  requires the hops where `ctx.formed_hop` differs from `ctx.linear_hop` to be non-zero (242 / 125 / 299 in the SIMD=1
+  build), so the comparison can tell the selected signal from the linear one.
+- `test_examples_aec_only`: both programs run with `--aec-only` on a 400-hop WAV pair (16 kHz/256, 16 kHz/512 aggressive,
+  8 kHz level 3); their output WAV must equal the oracle's WAV (written through the same WAV writer) sample for sample,
+  with no extra hop at the end.
+- Both were mutated from a saved copy (`ctx.formed_hop` copied instead of `ctx.linear_hop`): all 6 program checks fail with
+  the `main.c` mutation, and the 3 in-process checks fail with the mutation of `rig_hop()` and `conv_mono_hop()`.
+
+### Not changed
+- Stage-owned synthesis: `dfn/dfn_rate_bridge` (any rate other than 48 kHz) and `ulcnet/ulcnet_nn_stage` keep their own
+  `AcIstft`; making the caller own it is an interface change to those example stages and is not part of this entry. At 48 kHz
+  the DFN mains already synthesise with the caller's `AcIstft` through `dfn_hop`.
+- `test_mono_chain.c` (bypass check) and `4ch_aec_bf_nr_res/tests/test_mcab.c` keep a hand-written `fft_inverse` plus
+  overlap-add as an independent reference for `ac_istft`; they are oracles, not example code.
+- Python is not changed. `--aec-only` in the Python pipeline already uses the standalone time output, which is the buffer the
+  C program now copies.
+
 ## [Unreleased] — 2026-10-28 — C strength setting named level in the examples, tests and READMEs (follows lib/aec and lib/nr)
 
 Pure rename; no DSP, default output or exit code of a valid command line changed. Baseline matrix (725 rows, s1/s0/g48):

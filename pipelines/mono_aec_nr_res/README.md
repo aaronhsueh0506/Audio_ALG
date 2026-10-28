@@ -20,7 +20,7 @@ producer libraries (`libaec.a`, `libanr.a`, `libaudio_common.a`) directly.
 Per hop (the code is `process_hop()`, `mono_nr_gain()` and `mono_form()` in `main.c`):
 
 ```c
-aec_process_context(aec, mic, ref);              /* --aec-only: aec_process(aec, mic, ref, out) */
+aec_process_context(aec, mic, ref);              /* --aec-only: out = ctx.linear_hop, then return */
 aec_get_res_context(aec, &ctx);                  /* ctx.res_gain: the AEC's own RES gain */
 /* nr: with use_r2 and ctx.usable_linear, extra = ctx.r2 / 32768^2 (sk_scale_f32), else NULL */
 anr_process_gain(anr, ctx.error_spec, extra, NULL);   /* != 0: the denoiser refused the hop */
@@ -64,7 +64,7 @@ Command line of the two binaries built from `main.c` (`example_board_adapter.c` 
 |---|---|---|
 | fourth positional (`mild`, `balanced`, `aggressive`, `no_floor`, or `0`..`3`), or `--aec-level <level>` | AEC level (`AecLevel`); an unknown word falls back to `balanced`; the positional and the option are the same setting and one AEC level may be given: a second one (positional or `--aec-level`, even an unknown word) is a command-line error, exit 2 | `balanced` |
 | `--nr-level mild\|moderate\|balanced\|aggressive` (or `0`..`3`; `--nr-preset` is the same option) | `AnrLevel`; an unknown word falls back to `balanced` | `balanced` |
-| `--aec-only` | only the `Aec` (`aec_process()`), no NR, RES gain, comfort noise or synthesis | off |
+| `--aec-only` | only the `Aec`; the hop is `ctx.linear_hop` after `aec_process_context()`, no NR, RES gain, comfort noise or synthesis | off |
 | `--print-mem-size [aec-level \| --aec-level <level>] [--nr-level ...] [--aec-only] [--no-nr] [--no-res]` | `aec_nr_pipeline_static` only: print the pool budget, run a real init of every stage, exit without WAV I/O | - |
 | `--no-nr`, `--no-res`, `--no-cng` | leave out the denoiser, the RES gain, the comfort noise | off |
 | `--legacy-amin` | the denoiser's noise floor without the residual-echo powers (`use_r2 = 0`) | off |
