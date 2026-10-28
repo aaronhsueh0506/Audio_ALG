@@ -35,6 +35,7 @@
 #include "utility/mem_align.h"
 #include "utility/simd_kernels.h"
 #include "wav_io.h"
+#include "common/example_cli.h"
 
 #ifndef AEC_NR_POOL_SPLIT
 #define AEC_NR_POOL_SPLIT 0
@@ -409,12 +410,16 @@ int main(int argc, char* argv[]) {
             else if (strcmp(argv[i], "--no-nr") == 0) no_nr = 1;
             else if (strcmp(argv[i], "--no-res") == 0) no_res = 1;
             else if (strcmp(argv[i], "--no-cng") == 0) no_cng = 1;
-            else if (strcmp(argv[i], "--nr-preset") == 0 && i + 1 < argc)
-                nr_mode = parse_nr_mode(argv[++i]);
-            else if (strcmp(argv[i], "--sample-rate") == 0 && i + 1 < argc)
-                sample_rate = atoi(argv[++i]);
-            else if (strcmp(argv[i], "--fft-size") == 0 && i + 1 < argc)
-                fft_size = atoi(argv[++i]);
+            else if (strcmp(argv[i], "--nr-preset") == 0 ||
+                     strcmp(argv[i], "--sample-rate") == 0 ||
+                     strcmp(argv[i], "--fft-size") == 0) {
+                const char* name = argv[i];
+                const char* value = example_cli_option_value(argc, argv, &i, argv[0]);
+                if (!value) return 2;
+                if (strcmp(name, "--nr-preset") == 0) nr_mode = parse_nr_mode(value);
+                else if (strcmp(name, "--sample-rate") == 0) sample_rate = atoi(value);
+                else fft_size = atoi(value);
+            }
             else if (argv[i][0] != '-')
                 preset = parse_preset(argv[i]);
         }
@@ -483,10 +488,14 @@ int main(int argc, char* argv[]) {
         else if (strcmp(argv[i], "--no-cng") == 0)      no_cng = 1;
         else if (strcmp(argv[i], "--debug") == 0)       debug_status = 1;
         else if (strcmp(argv[i], "--timing") == 0)      show_timing = 1;
-        else if (strcmp(argv[i], "--fft-size") == 0 && i+1 < argc)
-            fft_size = atoi(argv[++i]);
-        else if (strcmp(argv[i], "--nr-preset") == 0 && i+1 < argc)
-            nr_mode = parse_nr_mode(argv[++i]);
+        else if (strcmp(argv[i], "--fft-size") == 0 ||
+                 strcmp(argv[i], "--nr-preset") == 0) {
+            const char* name = argv[i];
+            const char* value = example_cli_option_value(argc, argv, &i, argv[0]);
+            if (!value) return 2;
+            if (strcmp(name, "--fft-size") == 0) fft_size = atoi(value);
+            else nr_mode = parse_nr_mode(value);
+        }
         else if (argv[i][0] != '-')
             preset = parse_preset(argv[i]);
     }

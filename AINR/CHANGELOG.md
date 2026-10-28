@@ -17,11 +17,18 @@
   disagrees with its shapes and a one-frame graph that records `frames_per_call`.
 - C: `DFN2_FRAMES_PER_CALL` (1..64, `#error` outside; AINR Makefile variable of the same name, the `-D` flag is added only
   when N != 1). Window of N + 2 frames, first call ready after `M + N` pushed frames and then every N,
-  `dfn2_model_io_frame_slot()`, `DFN2ModelIoDescriptor.frames_per_call` (the struct grows from 72 to 76 bytes) and
-  `input_frames` = N + 2, commit composes the N frames in one burst, `post_process` still returns one hop per call, latency
+  `dfn2_model_io_frame_slot()`, `DFN2ModelIoDescriptor.input_frames` = N + 2 (the struct stays 18 fields / 72 bytes),
+  commit composes the N frames in one burst, `post_process` still returns one hop per call, latency
   `1 + M + D + N - 1` hops (`DFN2_PREPOST_LATENCY_FRAMES`). N > 1 is folded into the pool hash and objects built for
   different N do not link (`dfn2_frames_per_call<N>`). A unit written for one frame per call does not compile for N > 1
   unless it defines `DFN2_MULTI_FRAME_HOST`; the pipelines DFN stage stays at N = 1.
+- DFN2 C descriptor ABI: `DFN2ModelIoDescriptor` is the 18-field, 72-byte struct of 778dfed; there is no `frames_per_call`
+  field and N is `input_frames - 2` (`dfn2_model_io_descriptor_default()` writes `DFN2_FRAMES_PER_CALL + 2`, `_validate()`
+  accepts only that). With a 76-byte struct, an adapter compiled against the previous header and linked with the new library
+  had 4 bytes written past its descriptor by `_default()` and read past it by `_validate()`. Now such an adapter
+  (`input_frames` = 3) works with an N = 1 library and is refused by an N > 1 one. In C11 builds `_Static_assert` pins the
+  size (72 bytes) and the field list (18). `DFN2_MODEL_IO_LAYOUT_VERSION` 8, `DFN2_PREPOST_CARVE_VERSION` 7 and every N = 1
+  output are unchanged. Test: `tests/test_dfn2_frames_per_call_c.py::test_a_descriptor_of_the_one_frame_header_is_safe_for_any_frame_count`.
 - `DFN2_MODEL_IO_LAYOUT_VERSION` stays 8 and `DFN2_PREPOST_CARVE_VERSION` stays 7: the state tensors do not change, and
   with N = 1 the pool size, hash and compile lines are those of a build without the option (rationale in
   `DeepFilterNet2/README.md`, "Multi-frame export").

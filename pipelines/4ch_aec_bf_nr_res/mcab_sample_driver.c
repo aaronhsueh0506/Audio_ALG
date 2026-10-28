@@ -58,7 +58,9 @@ int mcab_sample_scan_cli(int argc, char **argv, const McabSampleCliOption *optio
         size_t j;
         for (j = 0; j < count; ++j)
             if (strcmp(argv[i], options[j].name) == 0) break;
-        if (j == count || (options[j].takes_value && i + 1 >= argc))
+        /* An option name where the value belongs counts as a missing value. */
+        if (j == count || (options[j].takes_value &&
+                           (i + 1 >= argc || example_cli_is_option(argv[i + 1]))))
             return unknown(user, argv[i]);
         const char *name = argv[i];
         const char *value = options[j].takes_value ? argv[++i] : NULL;

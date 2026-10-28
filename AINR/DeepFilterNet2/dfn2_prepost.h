@@ -311,8 +311,8 @@ typedef struct DFN2Model {
  * result or a refused commit takes the frame with frame_skip(), so the clocks
  * advance exactly once. Returns 1 when the heads were committed, 0 when skipped,
  * -1 on a contract error (NULL model or instance, no infer callback, invalid
- * io_descriptor -- NULL, or another graph, lookahead pair or frames_per_call --
- * or no frame open). */
+ * io_descriptor -- NULL, or another graph, lookahead pair or frame count
+ * (input_frames) -- or no frame open). */
 int dfn2_model_run_frame(const DFN2Model *model, DFN2Prepost *p);
 
 #ifdef __cplusplus

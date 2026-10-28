@@ -16,8 +16,8 @@ extern "C" {
  *                      DFN2_MODEL_DF_PATHWAY_WINDOW, DFN2_DF_BINS]; the full
  *                     causal window of the pathway convolution, returned whole
  * Layout versions 4-7 are never reused. The layout version names the state
- * tensors, which DFN2_FRAMES_PER_CALL leaves unchanged; the frame count of the
- * feature windows and heads is the descriptor's frames_per_call. */
+ * tensors, which DFN2_FRAMES_PER_CALL leaves unchanged; the descriptor carries
+ * N as input_frames = N + 2. */
 #define DFN2_MODEL_IO_LAYOUT_VERSION       8
 /* Feature frames behind one head (the input convolution's temporal kernel). */
 #define DFN2_MODEL_INPUT_FRAMES            3
@@ -113,8 +113,8 @@ typedef struct DFN2ModelIoDescriptor {
     int df_order;
     int mask_lookahead;
     int df_lookahead;
-    int input_frames;              /* DFN2_MODEL_WINDOW_FRAMES (metadata
-                                      input_feature_frames)                */
+    int input_frames;              /* DFN2_MODEL_WINDOW_FRAMES = N + 2
+                                      (metadata input_feature_frames)      */
     int encoder_gru_layers;
     int erb_gru_layers;
     int df_gru_layers;
@@ -122,9 +122,16 @@ typedef struct DFN2ModelIoDescriptor {
     int encoder_channels;
     int df_pathway_window;
     int state_tensor_count;        /* 2: h_gru, df_convp_history           */
-    int frames_per_call;           /* DFN2_FRAMES_PER_CALL (metadata
-                                      frames_per_call; 1 when absent)      */
 } DFN2ModelIoDescriptor;
+
+/* 72 bytes in every build: an adapter compiled against one N passes the same
+ * object to a library built for another, which refuses it by input_frames. */
+#ifdef __STDC_VERSION__
+#if __STDC_VERSION__ >= 201112L
+_Static_assert(sizeof(DFN2ModelIoDescriptor) == 72,
+               "DFN2ModelIoDescriptor must stay 72 bytes");
+#endif
+#endif
 
 /* Fill with this build's contract. Returns 0, or -1 on NULL. */
 int dfn2_model_io_descriptor_default(DFN2ModelIoDescriptor *descriptor);

@@ -529,10 +529,10 @@ _cfg_guard:
 # -MD -MP: emits $(OBJ_DIR)/<name>.d per object (header dependency tracking)
 # -- included near the bottom of this file via `-include $(wildcard $(OBJ_DIR)/*.d)`.
 # One source, two binaries: aec_nr_pipeline splits the pool in two (AEC, post stages).
-$(OBJ_DIR)/aec_nr_pipeline.o: mono_aec_nr_res/main.c | _cfg_guard
+$(OBJ_DIR)/aec_nr_pipeline.o: mono_aec_nr_res/main.c common/example_cli.h | _cfg_guard
 	$(CC) $(CFLAGS) -DAEC_NR_POOL_SPLIT=1 -MD -MP -c -o $@ $<
 
-$(OBJ_DIR)/aec_nr_pipeline_static.o: mono_aec_nr_res/main.c | _cfg_guard
+$(OBJ_DIR)/aec_nr_pipeline_static.o: mono_aec_nr_res/main.c common/example_cli.h | _cfg_guard
 	$(CC) $(CFLAGS) -MD -MP -c -o $@ $<
 
 # test_mono_chain: the mono chain over lib/aec's Aec -- pool carve vs heap, reset, switches,
@@ -683,6 +683,9 @@ test: $(BIN_DIR)/test_mono_chain $(BIN_DIR)/aec_nr_pipeline $(BIN_DIR)/aec_nr_pi
 	"$(abspath $(BIN_DIR))/mono_aec_dfn_res" --sample-rate 16000Hz >/dev/null 2>&1; test $$? -eq 2
 	"$(abspath $(BIN_DIR))/mono_aec_dfn_res" --delay-mode fixed --fixed-delay 12x >/dev/null 2>&1; test $$? -eq 2
 	"$(abspath $(BIN_DIR))/mono_aec_dfn_res" --atten-lim 12dB >/dev/null 2>&1; test $$? -eq 2
+# An option followed by another option has no value (exit 2); "-x" is a value, here a file that is missing (exit 1).
+	for a in "--erb-fwd --cng --erb-inv x" "--erb-inv --cng --erb-fwd x" "--erb-fwd" "--atten-lim --cng" "--sample-rate --cng" "--delay-num-filters --cng" "--delay-mode --" "--fixed-delay --"; do "$(abspath $(BIN_DIR))/mono_aec_dfn_res" $$a >/dev/null 2>&1; test $$? -eq 2 || exit 1; done
+	"$(abspath $(BIN_DIR))/mono_aec_dfn_res" --erb-fwd -x --erb-inv -y >/dev/null 2>&1; test $$? -eq 1
 	"$(abspath $(BIN_DIR))/mono_alignulcnet" --delay-num-filters 3x >/dev/null 2>&1; test $$? -eq 2
 	"$(abspath $(BIN_DIR))/mono_alignulcnet" --delay-mode fixed --fixed-delay 12x >/dev/null 2>&1; test $$? -eq 2
 # Empty, leading or trailing garbage and out-of-int-range numbers.

@@ -1135,6 +1135,44 @@ static void test_examples_black_box(const char* bin_dir, const char* tmp) {
     }
 }
 
+/* An option's value is the next token unless that starts with "--": then the value is missing
+ * and the program exits 2 before it opens a file (the three paths below do not exist). A value
+ * such as "-x" is a value; the run then stops at the missing input, exit 1. */
+static int example_exit_is(const char* bin, const char* args, int want) {
+    char cmd[1024];
+    snprintf(cmd, sizeof cmd, "'%s' %s >/dev/null 2>&1; test $? -eq %d", bin, args, want);
+    return system(cmd) == 0;
+}
+
+static void test_examples_cli_values(const char* bin_dir) {
+    static const char* const programs[] = {"aec_nr_pipeline", "aec_nr_pipeline_static"};
+    static const char* const missing[] = {
+        "--nr-preset", "--fft-size", "--nr-preset --no-res", "--fft-size --no-cng",
+        "--nr-preset --", "--fft-size --nr-preset mild", "mild --nr-preset --no-nr",
+    };
+    size_t pi, ci;
+    char bin[512], args[256];
+    for (pi = 0; pi < 2; ++pi) {
+        snprintf(bin, sizeof bin, "%s/%s", bin_dir, programs[pi]);
+        for (ci = 0; ci < sizeof missing / sizeof missing[0]; ++ci) {
+            snprintf(args, sizeof args, "no_mic.wav no_ref.wav no_out.wav %s", missing[ci]);
+            CHECK(example_exit_is(bin, args, 2),
+                  fmt_msg("%s %s: the value is missing, exit 2", programs[pi], missing[ci]));
+        }
+        CHECK(example_exit_is(bin, "no_mic.wav no_ref.wav no_out.wav --nr-preset -x", 1),
+              fmt_msg("%s --nr-preset -x: \"-x\" is a value, the run stops at the input", programs[pi]));
+        CHECK(example_exit_is(bin, "no_mic.wav no_ref.wav no_out.wav --fft-size 256 --nr-preset mild", 1),
+              fmt_msg("%s valid options reach the input check", programs[pi]));
+    }
+    snprintf(bin, sizeof bin, "%s/aec_nr_pipeline_static", bin_dir);
+    CHECK(example_exit_is(bin, "--print-mem-size --nr-preset --no-res", 2),
+          "aec_nr_pipeline_static --print-mem-size --nr-preset --no-res: exit 2");
+    CHECK(example_exit_is(bin, "--print-mem-size --nr-preset", 2),
+          "aec_nr_pipeline_static --print-mem-size --nr-preset: exit 2");
+    CHECK(example_exit_is(bin, "--print-mem-size --nr-preset mild --fft-size 256", 0),
+          "aec_nr_pipeline_static --print-mem-size with valid options: exit 0");
+}
+
 int main(int argc, char** argv) {
     if (argc < 3) {
         fprintf(stderr, "usage: %s <example-bin-dir> <scratch-dir>\n", argv[0]);
@@ -1171,6 +1209,7 @@ int main(int argc, char** argv) {
 
     printf("\n=== the example programs against the oracle ===\n");
     test_examples_black_box(argv[1], argv[2]);
+    test_examples_cli_values(argv[1]);
 
     if (g_failures) {
         fprintf(stderr, "\n%d FAILURE(S)\n", g_failures);

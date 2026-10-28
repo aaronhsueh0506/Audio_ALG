@@ -10,7 +10,8 @@
 typedef struct McabSampleCliOption { const char *name; int takes_value; } McabSampleCliOption;
 typedef int (*McabSampleCliSet)(void *user, const char *name, const char *value);
 typedef int (*McabSampleCliUnknown)(void *user, const char *name);
-/* Setters return 0 to continue, 1 for help, 2 for a rejected argument. */
+/* Setters return 0 to continue, 1 for help, 2 for a rejected argument. A value option at the end
+ * of the line, or followed by a token starting with "--", goes to `unknown` with the option name. */
 int mcab_sample_scan_cli(int argc, char **argv, const McabSampleCliOption *options,
                   size_t count, void *user, McabSampleCliSet set,
                   McabSampleCliUnknown unknown);
@@ -24,7 +25,8 @@ typedef struct McabSampleSpatialOptions {
     int print_mem_size;
 } McabSampleSpatialOptions;
 /* Numbers are parsed whole (example_cli_parse_int / _float): an empty or padded string, trailing
- * characters, a value outside int, inf or nan, and an option without its value return 2. raw=1
+ * characters, a value outside int, inf or nan, and an option without its value (the line ends, or
+ * the next token starts with "--") return 2. raw=1
  * also checks the file options, the radius and the grid here; raw=0 defers those to the setup. */
 int mcab_sample_parse_spatial_cli(int argc, char **argv, int raw,
                            McabSampleSpatialOptions *out);

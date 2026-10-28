@@ -37,8 +37,8 @@ consistency the complex deep filter relies on. Turn it on only for a
 subjective far-end-only / silence A/B; when on it travels through the network like every other component of P
 and `atten_lim_db` bounds how far any bin can be attenuated. The dual-input
 topology with the full deep filter is checked structurally by the C gates;
-its quality against a mask-only compose is evaluated by
-`pipelines/tools/eval_dfn2_variants.py`.
+its quality against a mask-only compose was evaluated by an offline driver
+that is now archived outside the repository (see the cleanup record).
 
 With no model callback (or a failing one) the output is the conventional
 chain with the denoiser off delayed: bit for bit by L = M + D hops at 48 kHz (two for the shipped
@@ -123,7 +123,8 @@ External parameters (board-skeleton command line, `dfn/dfn_example_args.h`): `--
 / 48000), the delay profile `--delay-mode matched|fixed|external` with `--delay-num-filters` (1..5) and
 `--fixed-delay`, `--erb-fwd` / `--erb-inv` (the exported ERB matrices; without them the skeleton runs a
 fail-open smoke only), `--atten-lim` (dB, 0 = unlimited; `dfn_res_stage_set_atten_lim()` between hops),
-`--cng` (comfort noise, off by default). Strength of the RES gain: `aec_set_preset()`. Internal: the
+`--cng` (comfort noise, off by default). An option followed by another `--` option, or by the end of the line, has no value and the
+program exits with code 2; a file named `--x` is written `./--x`. Strength of the RES gain: `aec_set_preset()`. Internal: the
 stage grid (48 kHz / 1024 / 512 only), the `DFN_RES_STAGE_IN_SCALE` / `_OUT_SCALE` powers of two, the rate
 bridge's FIR resamplers and frame schedule, the AEC and DFN2 model constants. Public functions are the
 `dfn_res_stage_*`, `dfn_rate_bridge_*` of `dfn_res_stage.h` / `dfn_rate_bridge.h` and the

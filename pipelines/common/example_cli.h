@@ -50,6 +50,23 @@ static inline const char* example_cli_delay_mode_name(AecDelayMode m) {
     }
 }
 
+/* An option's value is the next token, unless that token starts with "--": it is the next option
+ * and this one has no value. A lone "-" and "-5" or "-x" are values (a negative number, a
+ * file name); a number option still rejects what is not a number. */
+static inline int example_cli_is_option(const char* text) {
+    return text && text[0] == '-' && text[1] == '-';
+}
+
+/* The value of the option at argv[*i], argv[*i + 1], with *i moved onto it; NULL, after
+ * "<prog>: <option> needs a value" on stderr, when the line ends or the next token is an option. */
+static inline const char* example_cli_option_value(int argc, char** argv, int* i, const char* prog) {
+    if (*i + 1 >= argc || example_cli_is_option(argv[*i + 1])) {
+        fprintf(stderr, "%s: %s needs a value\n", prog, argv[*i]);
+        return NULL;
+    }
+    return argv[++*i];
+}
+
 /* Whole-string decimal int, or -1: "", " 12", "12x" and values outside int are rejected. */
 static inline int example_cli_parse_int(const char* text, int* value) {
     char* end = NULL;

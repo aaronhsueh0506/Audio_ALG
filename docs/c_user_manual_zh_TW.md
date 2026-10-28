@@ -210,7 +210,7 @@ BIN="$(make -s -C pipelines print-bin-dir)"
 非預設 delay mode 得直接寫 C 改 `AecConfig` 後呼叫 `aec_get_mem_size()`／`aec_init()`
 （或改 CLI 原始碼），見 `pipeline_mono.html` API 節。
 
-目前 parser 對未知 positional preset 會退回 balanced，且不會為所有未知 dash option 報錯。產品或自動化腳本應只傳上表列出的值，不要依賴 silent fallback。
+目前 `mono_aec_nr_res` parser 對未知 positional preset 與未知 `--nr-preset` 名稱會退回 balanced，且不會為所有未知 dash option 報錯；`--nr-preset`／`--fft-size`（`aec_nr_pipeline_static` 的 `--print-mem-size` 路徑另含 `--sample-rate`）後面直接接另一個 `--` 選項或行尾時視為缺值，exit 2。`mcab_external_static` 則對未知 preset 名稱 exit 2。產品或自動化腳本應只傳上表列出的值，不要依賴 silent fallback。
 只有 mono 的 smoke CLI（`mono_aec_nr_res/main.c`）的 `--fft-size`、`--sample-rate` 以 `atoi()` 轉換、不嚴格檢查（`12x` 當成 12）；DFN2／ULCNet 範例、`mcab_raw`、`mcab_static`、`mcab_external_static` 走 `common/example_cli.h` 的嚴格解析，非法數字 exit 2（見 [`pipelines/README.md`](../pipelines/README.md)）。
 
 ### 4.2 Debug context dump

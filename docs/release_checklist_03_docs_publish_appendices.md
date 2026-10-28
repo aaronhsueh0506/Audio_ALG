@@ -143,7 +143,8 @@ Rules that invalidate a benchmark result if broken.
   not exercise the change. Say which of the two the result is.
 - **Archive per-case scores, the exact baseline→candidate diff, and the
   harness** for any A/B that gates a release decision — a summary line is not
-  reproducible. See `AEC/eval/ab_evidence/` for the expected shape.
+  reproducible. The A/B sets formerly under `AEC/eval/ab_evidence/` (archived outside
+  the repository, see the cleanup record; in AEC git history through `6cf6785`) show the expected shape.
 
 ## Appendix C. Cross-repo mechanics
 

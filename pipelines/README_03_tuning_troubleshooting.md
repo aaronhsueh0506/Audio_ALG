@@ -85,11 +85,15 @@ mask 塑形）；4ch 變體用的是 `enable_post = 0` 的 flow，抑制器與�
 
 **Modes**: `ANR_MODE_MILD` / `ANR_MODE_MODERATE` / `ANR_MODE_BALANCED`（default）/ `ANR_MODE_AGGRESSIVE`
 
-> Both C pipeline CLIs' `parse_nr_mode()` — `mono_aec_nr_res/main.c` and
+> Both C pipeline CLIs — `mono_aec_nr_res/main.c` (`parse_nr_mode()`) and
 > `4ch_aec_bf_nr_res/mcab_external_static.c` — accept
 > `--nr-preset mild|moderate|balanced|aggressive` (or the digits `0`..`3`, through
-> `anr_nr_mode_from_name()`); anything else falls back to
-> `ANR_MODE_BALANCED` with no error. The Python `mono_aec_nr_res/pipeline.py` CLI accepts
+> `anr_nr_mode_from_name()`). An unknown name falls back to
+> `ANR_MODE_BALANCED` with no error in `mono_aec_nr_res/main.c` (the same holds for its
+> positional AEC preset, and for `--nr-mode` of the NR library's `example/main.c`);
+> `mcab_external_static` exits with code 2 for an unknown `--nr-preset` name, for an unknown AEC
+> preset and for a second positional preset. In both, a `--nr-preset` followed by another `--` option has no value (exit 2).
+> The Python `mono_aec_nr_res/pipeline.py` CLI accepts
 > `mild|balanced|aggressive` only.
 
 `g_min_db` is amplitude dB (`g_min = 10^(g_min_db/20)`).

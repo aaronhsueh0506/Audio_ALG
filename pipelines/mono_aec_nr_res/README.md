@@ -63,7 +63,7 @@ Command line of the two binaries built from `main.c` (`example_board_adapter.c` 
 | Argument | Meaning | Default |
 |---|---|---|
 | fourth positional (`mild`, `balanced`, `aggressive`, `no_floor`, or `0`..`3`) | AEC preset (`AecPreset`); an unknown word falls back to `balanced` | `balanced` |
-| `--nr-preset mild\|moderate\|balanced\|aggressive` | `AnrMode` | `balanced` |
+| `--nr-preset mild\|moderate\|balanced\|aggressive` | `AnrMode`; an unknown word falls back to `balanced` | `balanced` |
 | `--aec-only` | only the `Aec` (`aec_process()`), no NR, RES gain, comfort noise or synthesis | off |
 | `--print-mem-size [preset] [--nr-preset ...] [--aec-only] [--no-nr] [--no-res]` | `aec_nr_pipeline_static` only: print the pool budget, run a real init of every stage, exit without WAV I/O | - |
 | `--no-nr`, `--no-res`, `--no-cng` | leave out the denoiser, the RES gain, the comfort noise | off |

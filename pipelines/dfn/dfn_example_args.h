@@ -106,25 +106,32 @@ static int dfn_example_parse_args(int argc, char **argv, const char *name,
         if (!strcmp(arg, "-h") || !strcmp(arg, "--help")) {
             dfn_example_usage(argv[0], rates_text);
             return 1;
-        } else if (!strcmp(arg, "--sample-rate") && i + 1 < argc) {
-            if (example_cli_parse_int(argv[++i], &out->sample_rate) != 0 ||
+        } else if (!strcmp(arg, "--sample-rate")) {
+            const char *value = example_cli_option_value(argc, argv, &i, name);
+            if (!value) return 2;
+            if (example_cli_parse_int(value, &out->sample_rate) != 0 ||
                 !dfn_example_rate_known(rates, out->sample_rate)) {
                 fprintf(stderr, "%s: --sample-rate '%s' is not a host grid of "
-                        "this skeleton (accepted: %s)\n", name, argv[i],
+                        "this skeleton (accepted: %s)\n", name, value,
                         rates_text);
                 return 2;
             }
-        } else if ((!strcmp(arg, "--delay-mode") || !strcmp(arg, "--delay-num-filters") ||
-                    !strcmp(arg, "--fixed-delay")) && i + 1 < argc) {
-            if (example_cli_delay_set_option(&delay, arg, argv[++i], name) != 0) return 2;
-        } else if (!strcmp(arg, "--erb-fwd") && i + 1 < argc) {
-            out->erb_fwd_path = argv[++i];
-        } else if (!strcmp(arg, "--erb-inv") && i + 1 < argc) {
-            out->erb_inv_path = argv[++i];
-        } else if (!strcmp(arg, "--atten-lim") && i + 1 < argc) {
-            if (example_cli_parse_float(argv[++i], &out->atten_lim_db) != 0) {
+        } else if (!strcmp(arg, "--delay-mode") || !strcmp(arg, "--delay-num-filters") ||
+                   !strcmp(arg, "--fixed-delay")) {
+            const char *value = example_cli_option_value(argc, argv, &i, name);
+            if (!value) return 2;
+            if (example_cli_delay_set_option(&delay, arg, value, name) != 0) return 2;
+        } else if (!strcmp(arg, "--erb-fwd") || !strcmp(arg, "--erb-inv")) {
+            const char *value = example_cli_option_value(argc, argv, &i, name);
+            if (!value) return 2;
+            if (!strcmp(arg, "--erb-fwd")) out->erb_fwd_path = value;
+            else out->erb_inv_path = value;
+        } else if (!strcmp(arg, "--atten-lim")) {
+            const char *value = example_cli_option_value(argc, argv, &i, name);
+            if (!value) return 2;
+            if (example_cli_parse_float(value, &out->atten_lim_db) != 0) {
                 fprintf(stderr, "%s: --atten-lim '%s' is not a finite dB "
-                        "value\n", name, argv[i]);
+                        "value\n", name, value);
                 return 2;
             }
         } else if (!strcmp(arg, "--cng")) {

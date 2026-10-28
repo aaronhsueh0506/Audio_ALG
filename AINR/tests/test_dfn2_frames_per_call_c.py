@@ -18,8 +18,11 @@ same arithmetic and must agree BYTE FOR BYTE:
                the state is zeroed and the N frames pass as the identity, the
                same as N one-frame refusals
   contract     readiness (L + N, then every N), the window rows, the
-               descriptor's frames_per_call, the latency accessor, element
-               counts, and a pool of the one-frame build refused
+               descriptor's input_frames (N + 2), the latency accessor,
+               element counts, and a pool of the one-frame build refused
+  abi          the 72-byte descriptor of the one-frame header, filled and
+               checked through the library of either N: nothing written or
+               read past it, a one-frame descriptor refused by N > 1
   build        N outside 1..64 does not compile, a one-frame unit does not
                compile for N > 1, mixed-N objects do not link, and the
                Makefile validates and forwards DFN2_FRAMES_PER_CALL
@@ -325,11 +328,9 @@ static int case_contract(void) {
 
     CHECK(fft != NULL);
     CHECK(dfn2_model_io_descriptor_default(&d) == 0);
-    CHECK(d.frames_per_call == NF && d.input_frames == WF);
+    CHECK(d.input_frames == WF && d.input_frames - 2 == NF);
     CHECK(dfn2_model_io_descriptor_validate(&d) == 0);
-    bad = d; ++bad.frames_per_call;
-    CHECK(dfn2_model_io_descriptor_validate(&bad) == -1);
-    bad = d; bad.frames_per_call = 1 + (NF == 1);
+    bad = d; ++bad.input_frames;
     CHECK(dfn2_model_io_descriptor_validate(&bad) == -1);
     bad = d; bad.input_frames = DFN2_MODEL_INPUT_FRAMES + (NF == 1);
     CHECK(dfn2_model_io_descriptor_validate(&bad) == -1);
@@ -377,7 +378,7 @@ static int case_contract(void) {
     model.infer = stub_infer;
     model.reset = NULL;
     bad = d;
-    bad.frames_per_call = NF == 1 ? 2 : 1;
+    bad.input_frames = DFN2_MODEL_INPUT_FRAMES + (NF == 1);
     for (h = 0; h < LA + DA + 6 * NF + 4; ++h) {
         int rc, want;
         for (b = 0; b < DFN2_HOP_LEN; ++b) in_hop[b] = noise(h, b);
@@ -766,6 +767,105 @@ def test_objects_of_different_frame_counts_do_not_link(tmp_path,
          audio_common_lib, '-lm', '-o', str(tmp_path / 'same')],
         capture_output=True, text=True)
     assert same.returncode == 0, same.stderr
+
+
+# A unit compiled against the one-frame header: the descriptor exactly as that
+# header declared it (18 fields, 72 bytes) with a guard band behind it, passed
+# to the library through the public prototypes only.
+_ABI_DRIVER = r'''
+#include <stddef.h>
+#include <stdio.h>
+#include <string.h>
+
+typedef struct {
+    unsigned int layout_version;
+    int sample_rate;
+    int fft_size;
+    int hop_size;
+    int spectrum_bins;
+    int erb_bands;
+    int df_bins;
+    int df_order;
+    int mask_lookahead;
+    int df_lookahead;
+    int input_frames;
+    int encoder_gru_layers;
+    int erb_gru_layers;
+    int df_gru_layers;
+    int gru_hidden;
+    int encoder_channels;
+    int df_pathway_window;
+    int state_tensor_count;
+} OldDescriptor;
+
+typedef struct DFN2ModelIoDescriptor DFN2ModelIoDescriptor;
+int dfn2_model_io_descriptor_default(DFN2ModelIoDescriptor *descriptor);
+int dfn2_model_io_descriptor_validate(
+    const DFN2ModelIoDescriptor *descriptor);
+
+typedef struct {
+    OldDescriptor d;
+    unsigned char guard[16];
+} Box;
+static Box box;
+
+_Static_assert(sizeof(OldDescriptor) == 72 &&
+                   offsetof(Box, guard) == 72,
+               "the guard band starts right after the old descriptor");
+
+static int guard_intact(void)
+{
+    size_t i;
+    for (i = 0; i < sizeof box.guard; ++i)
+        if (box.guard[i] != 0xA5) return 0;
+    return 1;
+}
+
+int main(void)
+{
+    DFN2ModelIoDescriptor *d = (DFN2ModelIoDescriptor *)&box.d;
+    int written, filled, as_filled, old_frames;
+    memset(&box, 0xA5, sizeof box);
+    filled = dfn2_model_io_descriptor_default(d);
+    written = guard_intact();
+    memset(box.guard, 0xA5, sizeof box.guard);
+    as_filled = dfn2_model_io_descriptor_validate(d);
+    printf("default=%d input_frames=%d guard_after_default=%d "
+           "validate_default=%d", filled, box.d.input_frames, written,
+           as_filled);
+    box.d.input_frames = 3;
+    old_frames = dfn2_model_io_descriptor_validate(d);
+    printf(" validate_three=%d guard_end=%d null=%d,%d\n", old_frames,
+           guard_intact(), dfn2_model_io_descriptor_default(NULL),
+           dfn2_model_io_descriptor_validate(NULL));
+    return 0;
+}
+'''
+
+
+@pytest.mark.parametrize('frames', [1, 3])
+def test_a_descriptor_of_the_one_frame_header_is_safe_for_any_frame_count(
+        tmp_path, audio_common_lib, frames):
+    """default() and validate() touch exactly the 72 bytes of the one-frame
+    header's descriptor; its input_frames of 3 passes an N = 1 library and is
+    refused by an N = 3 one."""
+    source = tmp_path / 'old_adapter.c'
+    source.write_text(_ABI_DRIVER, encoding='utf-8')
+    exe = tmp_path / 'old_adapter'
+    subprocess.run(
+        ['cc', *dfn_pairs.house_cflags(), *_defines((1, 1), frames), str(source),
+         *[str(dfn_pairs.source_path(FAMILY, kind))
+           for kind in ('model_io', 'process')],
+         audio_common_lib, '-lm', '-o', str(exe)],
+        check=True, capture_output=True, text=True)
+    done = subprocess.run([str(exe)], capture_output=True, text=True)
+    assert done.returncode == 0, (done.stdout, done.stderr)
+    fields = dict(item.split('=') for item in done.stdout.split())
+    assert fields == {
+        'default': '0', 'input_frames': str(frames + 2),
+        'guard_after_default': '1', 'validate_default': '0',
+        'validate_three': '0' if frames == 1 else '-1', 'guard_end': '1',
+        'null': '-1,-1'}, done.stdout
 
 
 @pytest.mark.parametrize('value', ['0', '65', '2 3', 'x', '04', '-1'])

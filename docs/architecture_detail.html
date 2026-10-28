@@ -176,7 +176,7 @@
 <h3>6.3 分數</h3>
 
 <div class="note">
-<strong>分數不在本頁維護。</strong>AEC 模組的 800-case AECMOS（ours / AEC3 / Speex，官方分段、無 pre-align）見 <a href="../../AEC/README.md">AEC/README.md</a> 的 Status snapshot；整路（AEC+NR）對比需用 <code>pipelines/tools/rebench_joint.py</code> 以同一語料重量（該腳本不做離線 pre-align，delay 由 AEC 的線上 matched-filter 估計器取得），本頁不放舊版數字，現況待量測。AECMOS <strong>不量背景噪音抑制</strong>——那才是 NR 的本職，只看 AECMOS 看不到 NR 的降噪價值。
+<strong>分數不在本頁維護。</strong>AEC 模組的 800-case AECMOS（ours / AEC3 / Speex，官方分段、無 pre-align）見 <a href="../../AEC/README.md">AEC/README.md</a> 的 Status snapshot；整路（AEC+NR）對比需以同一語料重量（不做離線 pre-align，delay 由 AEC 的線上 matched-filter 估計器取得；先前的整路重量工具已移出 repository 歸檔，見清理紀錄），本頁不放舊版數字，現況待量測。AECMOS <strong>不量背景噪音抑制</strong>——那才是 NR 的本職，只看 AECMOS 看不到 NR 的降噪價值。
 </div>
 
 <h3>6.4 AEC Preset — 單一 Pareto 旋鈕</h3>

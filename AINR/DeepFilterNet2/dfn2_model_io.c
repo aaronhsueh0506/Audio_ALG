@@ -41,8 +41,21 @@ void dfn2_model_io_init(DFN2ModelIOState *state)
     X(gru_hidden, DFN2_MODEL_GRU_HIDDEN)                              \
     X(encoder_channels, DFN2_MODEL_ENCODER_CHANNELS)                  \
     X(df_pathway_window, DFN2_MODEL_DF_PATHWAY_WINDOW)              \
-    X(state_tensor_count, DFN2_MODEL_IO_STATE_TENSORS)                \
-    X(frames_per_call, DFN2_FRAMES_PER_CALL)
+    X(state_tensor_count, DFN2_MODEL_IO_STATE_TENSORS)
+
+/* Every descriptor field is in the list, so validate() checks all of them. */
+#define DFN2_COUNT_FIELD(field, value) + 1
+enum { DFN2_MODEL_IO_DESCRIPTOR_FIELD_COUNT =
+           0 DFN2_MODEL_IO_DESCRIPTOR_FIELDS(DFN2_COUNT_FIELD) };
+#undef DFN2_COUNT_FIELD
+#ifdef __STDC_VERSION__
+#if __STDC_VERSION__ >= 201112L
+_Static_assert(DFN2_MODEL_IO_DESCRIPTOR_FIELD_COUNT == 18 &&
+                   sizeof(DFN2ModelIoDescriptor) ==
+                       DFN2_MODEL_IO_DESCRIPTOR_FIELD_COUNT * sizeof(int),
+               "the field list covers the 18-field descriptor");
+#endif
+#endif
 
 int dfn2_model_io_descriptor_default(DFN2ModelIoDescriptor *descriptor)
 {

@@ -139,7 +139,8 @@ examples is the sample helper [`4ch_aec_bf_nr_res/mcab_sample_beam.h`](4ch_aec_b
 (not part of the archive).
 
 The directory root holds the aggregate build, the documentation, `requirements.txt`, `scripts/`,
-`tools/` (offline scoring and benchmark drivers) and `tests/` (the cross-cutting tests:
+`tools/` (two offline drivers, `eval_dfn2_4ch_inputs.py` and `profile_dfn2_ops.py`; the other research drivers
+are archived outside the repository, see the cleanup record) and `tests/` (the cross-cutting tests:
 `test_c_python_map.py`, `test_doc_layout_versions.py`, `test_readme_flow.c`, `test_target_abi.c`, `pyc_parity*`).
 C sources and the Python twins live with their applications: `common/` (`example_cli.h`, the strict
 command-line parser of the examples; `cng_aec3.py`; `tests/`), `mono_aec_nr_res/` (`main.c`, `pipeline.py`),
@@ -178,10 +179,10 @@ examples and of `mcab_raw`, `mcab_static` and `mcab_external_static` go through 
 `common/example_cli.h` (`example_cli_parse_int()`, `example_cli_parse_float()`): an empty string, leading space,
 trailing characters, an out-of-range value, `inf` or `nan` exit with code 2 (for example
 `--delay-num-filters 3x`, or an empty `--fixed-doa-deg` of `mcab_raw`). `mcab_static` and `mcab_external_static`
-also exit 2 for an option without its value and for an unknown option; a number that parses but names no grid
+also exit 2 for an option without its value (a token starting with `--` where a value belongs is the next option, not a value) and for an unknown option; `mcab_external_static` also exits 2 for an unknown `--nr-preset` name, an unknown AEC preset and a second positional preset; a number that parses but names no grid
 or channel (`--sample-rate 44100`) is refused when the config is built and still exits 1. Still lenient:
 `mono_aec_nr_res/main.c` (`aec_nr_pipeline`, `aec_nr_pipeline_static`) reads `--sample-rate` and `--fft-size` with
-`atoi()` and ignores an unknown option; the test and smoke helpers `tests/pyc_parity/pyc_drv.c` and
+`atoi()`, ignores an unknown option and falls back to `balanced` for an unknown preset name (it does exit 2 for a missing value, as above); the test and smoke helpers `tests/pyc_parity/pyc_drv.c` and
 `4ch_aec_bf_nr_res/tests/dump_delay_parity.c` also read numbers with `atoi()` / `atof()` / `strtoul()`.
 
 The ULCNet applications use `../AIAEC/Align_ULCNet/ulcnet_accelerator_adapter.*`: CPU memory owns

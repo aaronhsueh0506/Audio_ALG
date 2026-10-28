@@ -156,7 +156,7 @@ class AudioResampler:
 class CResampler:
     """The C ``audio_resampler`` itself, through ctypes: same result as
     :class:`AudioResampler` on the scalar kernel, orders of magnitude faster.
-    Used by the tools/ drivers; the pure-Python twin is the readable reference
+    Used by :class:`Dfn2RateBridge`; the pure-Python twin is the readable reference
     the tests compare against."""
 
     _lib = None

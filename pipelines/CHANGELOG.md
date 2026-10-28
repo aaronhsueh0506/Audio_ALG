@@ -3,6 +3,21 @@
 `Audio_ALG/pipelines`（含它建置的 `AINR`、`AIAEC` C 程式）的重要改動記錄在此，格式依
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/)。README 只寫現況，改動經過寫在這裡。
 
+## [Unreleased] — 2026-10-28 — Offline research drivers archived out of `pipelines/tools/`
+
+### Removed
+- `pipelines/tools/` keeps only `eval_dfn2_4ch_inputs.py` and `profile_dfn2_ops.py`. `__init__.py`, `rebench_aec_only.py`,
+  `rebench_joint.py`, `rebench_sep_vs_classic.py`, `bench_dnsmos.py`, `compare_res_vs_nr.py`, `eval_dfn2_ood.py`,
+  `eval_dfn2_variants.py` and `eval_pipeline_blind.py` had no caller in the build, the tests or the gates. They are archived
+  outside the repository and stay in git history through `d4e1230`; the archive is not runnable as is. The two kept
+  drivers run without `__init__.py`.
+
+### Changed
+- `README.md` (the `tools/` folder), `dfn/mono_aec_dfn_res/README.md`, the `CResampler` docstring of
+  `dfn/dfn2_rate_adapter.py`, `docs/architecture_detail.html`, `docs/html/pipeline_dfn_mono.html` and
+  `docs/release_checklist_03_docs_publish_appendices.md` no longer name the archived drivers or `AEC/eval/ab_evidence/`.
+  No code or output change.
+
 ## [Unreleased] — 2026-10-27 — Follow-up to the mcab round: strict CLI numbers in the static examples, per-goal producer scopes of the 4ch Makefile, exact rate-bridge delay, lib/aec rate guard, DFN2 frames per call (AINR)
 
 No DSP changed; for valid input the example programs' outputs are those of the previous entry (the 136 baseline-matrix
@@ -16,11 +31,31 @@ listed under "Behaviour changes" differ). The AEC behaviour hash `aec_python_beh
   `mcab_sample_parse_spatial_cli()` no longer has an `atoi` / `atof` path; its `raw` argument now only selects the option
   set (9 versus 5 options) and the parse-time checks of the grid, the radius and the file options. A number that parses but
   names no grid or channel (`--sample-rate 44100`, `--capture-proxy 4`) is still refused when the config is built and exits
-  1. Still lenient: an unknown AEC preset or `--nr-preset` name falls back to balanced, and a repeated option keeps the
-  last value. Only `mono_aec_nr_res/main.c` still reads its numbers with `atoi()` (and the test helpers `pyc_drv.c` and
-  `dump_delay_parity.c`). New `4ch_aec_bf_nr_res/tests/test_cli_strict.sh <bin_dir>` runs the real binaries over 198 command
+  1. Still lenient: a repeated option keeps the last value (the preset names are strict in `mcab_external_static`, see the
+  next entry). Only `mono_aec_nr_res/main.c` still reads its numbers with `atoi()` (and the test helpers `pyc_drv.c` and
+  `dump_delay_parity.c`). New `4ch_aec_bf_nr_res/tests/test_cli_strict.sh <bin_dir>` runs the real binaries over 486 command
   lines and is part of `make -C 4ch_aec_bf_nr_res test`; `tests/test_mcab_sample_driver.c` covers the shared parser in both
   `raw` modes.
+- **A token that starts with `--` where an option's value belongs is a missing value** (exit 2, message on stderr), not the
+  value. This holds for every value option of `mcab_static`, `mcab_external_static` and `mcab_raw` (the shared
+  `mcab_sample_scan_cli`, which `4ch_aec_bf_dfn_res` and `4ch_alignulcnet` use as well), for `--nr-preset`, `--sample-rate` and
+  `--fft-size` of `aec_nr_pipeline` / `aec_nr_pipeline_static` (including their `--print-mem-size` path) and for every value
+  option of `mono_aec_dfn_res` (`dfn/dfn_example_args.h`: `--sample-rate`, the delay options, `--erb-fwd`, `--erb-inv`,
+  `--atten-lim`). `--nr-preset --no-res` used to take `--no-res` as the preset name and leave RES on; `--erb-fwd --cng` used
+  to take `--cng` as a file name. A lone `-` and negative numbers (`-1`, `-x`) stay values, so a file named `--x` must be
+  written `./--x`. New helpers `example_cli_is_option()` and `example_cli_option_value()` in `common/example_cli.h`; the
+  private copy in `mono_aec_nr_res/main.c` is gone. `mono_alignulcnet` already refused such a token (it is neither a delay mode
+  nor a number) and is unchanged. Valid command lines give the same output. `test_cli_strict.sh` now runs 486 command lines
+  (was 198); the mono rejections are checked by `test_mono_chain` (`test_examples_cli_values`) and the `mono_aec_dfn_res`
+  ones by the `make test` recipe of `pipelines/Makefile` and `dfn/mono_aec_dfn_res/Makefile`.
+- **`mcab_external_static` refuses names it does not know**: an unknown `--nr-preset` name or AEC preset and a second AEC
+  preset exit 2 (they fell back to balanced, and the last preset won). Valid presets and all valid output are unchanged.
+  `mono_aec_nr_res/main.c` (`aec_nr_pipeline`, `aec_nr_pipeline_static`) and the NR library's `example/main.c` still fall back to
+  balanced for an unknown name.
+- **`AINR/DeepFilterNet2`: `DFN2ModelIoDescriptor` is back to 18 fields / 72 bytes** (N = `input_frames` - 2, see
+  `AINR/CHANGELOG.md`), so a board adapter built against the previous header no longer has its descriptor overrun by
+  `dfn2_model_io_descriptor_default()` / `_validate()`. The pipelines DFN stage and rate bridge (N = 1) see no change: pool
+  sizes, hashes and outputs are identical.
 - **The 4ch Makefile resolves, and keys its build directories on, only the producers a goal needs.**
   `libaudio_pipeline_mcab.a` (and `lib`) needs audiolib common and lib/aec only (lib/nr, audiolib's spatial kernels may be
   absent; `mcab.o` is byte-identical in every scope); `test_mcab` adds lib/nr; every other goal, `all` and `test` included,
@@ -58,6 +93,10 @@ listed under "Behaviour changes" differ). The AEC behaviour hash `aec_python_beh
   refused with exit 1. Config refusals (a number that names no grid or channel) still exit 1. The baseline matrix has three
   rows that change, in the exit code only: `static_err_unknown_flag`, `static_err_missing_value` and
   `ext_err_unknown_flag` (136 rows compared, per the strict-parse run's `rowdiff.log`); it has no bad-number rows.
+- Every example that takes a value option now exits 2 when the next token starts with `--` (see the entry above); a script
+  that passed a flag-looking file name must write `./--x`.
+- SDK note: the live2, live2a and live3 board samples now require `gsc_adapt_interval` / `bf_adapt_interval` in
+  1..1048576 (`MCAB_SAMPLE_BEAM_MAX_ADAPT_INTERVAL`); a former 0 must be written as 1.
 - `make -s print-lib-path` in `4ch_aec_bf_nr_res` prints the narrow-scope archive. A script that wants the archive next to
   the binaries of `make all` passes `PRINT_FOR=all`.
 

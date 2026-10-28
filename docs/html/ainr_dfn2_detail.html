@@ -101,11 +101,11 @@ int dfn2_model_run_frame(const DFN2Model *model, DFN2Prepost *p);</pre>
 沒有 <code>infer</code>、或沒有開啟中的 frame)。<b>與 AIAEC 的 identity 政策不同</b>:被 skip 的幀仍然吐出 M+D 拍前的 source frame
 ——identity 是<b>在 cascade 內部</b>套用的,時序從不改變。</p>
 <p><b>有 <code>infer</code> 就必須發布 descriptor。</b><code>DFN2ModelIoDescriptor</code>是
-<b>19 個欄位</b>的圖合約:<code>layout_version</code>、<code>sample_rate</code>、<code>fft_size</code>、<code>hop_size</code>、
+<b>18 個欄位</b>(72 bytes)的圖合約:<code>layout_version</code>、<code>sample_rate</code>、<code>fft_size</code>、<code>hop_size</code>、
 <code>spectrum_bins</code>、<code>erb_bands</code>、<code>df_bins</code>、<code>df_order</code>、<code>mask_lookahead</code>、
 <code>df_lookahead</code>、<code>input_frames</code>、<code>encoder_gru_layers</code>、<code>erb_gru_layers</code>、
 <code>df_gru_layers</code>、<code>gru_hidden</code>、<code>encoder_channels</code>、<code>df_pathway_window</code>(=5)、
-<code>state_tensor_count</code>(=2)、<code>frames_per_call</code>(=<code>DFN2_FRAMES_PER_CALL</code>,出貨 1)。<code>input_frames</code> = <code>DFN2_MODEL_WINDOW_FRAMES</code> = N+2(出貨 3)。<code>_descriptor_default()</code> 填本 build 的值,<code>_descriptor_validate()</code>
+<code>state_tensor_count</code>(=2)。<code>input_frames</code> = <code>DFN2_MODEL_WINDOW_FRAMES</code> = N+2(出貨 3),N 由 <code>input_frames - 2</code> 得出,descriptor 沒有另外的 N 欄位。<code>_descriptor_default()</code> 填本 build 的值,<code>_descriptor_validate()</code>
 <b>逐欄位</b>比對(不是 memcmp,padding 不得參與決定),不合即 -1。欄位全是編譯期常數(沒有 Align-ULCNet
 <code>delay_depth</code> 那種部署自由度),所以 <code>validate(default())==0</code> 恆真,它唯一的工作是<b>擋掉對著另一個
 layout 版本或另一組幾何匯出的圖</b>——那正是 NaN 預填看不見的一類錯誤(抓得到「沒寫」,抓不到「形狀不對」)。</p>
@@ -147,8 +147,8 @@ layout 版本或另一組幾何匯出的圖</b>——那正是 NaN 預填看不�
 <li><b>N=1 與以前同一個 graph。</b>不帶旗標或 <code>--frames-per-call 1</code> 寫出的 ONNX／JSON 與加入此選項前相同(固定同一個 <code>PYTHONHASHSEED</code> 比對過種子 0..3;匯出器的 optimizer pass 順序取自 set,不固定種子時兩次匯出的 ONNX 位元組本來就會不同,這在加入選項前就存在)。<code>inference.py calib --frames-per-call N</code> 讓校正資料的 tensor 形狀對應 N-frame graph(<code>--frames</code> 計 invocation 數)。</li>
 <li><b>C host。</b>建置帶 <code>-DDFN2_FRAMES_PER_CALL=&lt;N&gt;</code>(1..64,單純十進位,每個編譯單元;AINR Makefile 變數 <code>DFN2_FRAMES_PER_CALL</code>)。視窗為 N+2 個 frame;第一次呼叫在推入 M+N 個 frame 後就緒,之後每推 N 個一次(<code>pre_process</code> 在第 M+N-1、M+2N-1…拍回 1);<code>dfn2_model_io_frame_slot()</code> 回「最近推入的 frame 完成的是下次呼叫的第幾個 head」(0..N-1;還沒有 head 時 -1)。<code>frame_inputs()</code> 一次發布 N 個 head,<code>frame_commit()</code> 一次把 N 個 frame 合成起來,<code>post_process</code> 仍每次回一個 hop。</li>
 <li><b>延遲多 N-1 hop。</b>輸出落後輸入 <code>1 + M + D + N - 1</code> hops(<code>DFN2_PREPOST_LATENCY_FRAMES</code> = M+D+N-1,<code>dfn2_prepost_model_lookahead_frames()</code> 回這個值;<code>written = 0</code> 的暖機拍數也是這個值)。出貨 pair 配 N=8 為 10 hops = 106.7 ms。flush 要持續推零 hop 並執行加速器,直到最後一個真實 hop 被吐出。commit 被拒時就地歸零一次 state,並把 N 個 frame 都走 identity。</li>
-<li><b>編譯期守衛。</b>N 不在 1..64 是 <code>#error</code>(C11、gnu99、C++ 皆然);不同 N 的目標檔連結失敗(符號 <code>dfn2_frames_per_call&lt;N&gt;</code>);為一個 frame 寫的單元對 N&gt;1 編譯失敗,除非它在包含標頭前定義 <code>DFN2_MULTI_FRAME_HOST</code>。N&gt;1 折進 pool hash(另一個 N 的 pool 被拒);N=1 時 pool 大小與 hash 不變。descriptor 多一個 <code>frames_per_call</code>,<code>dfn2_model_io_descriptor_validate()</code> 與 <code>dfn2_model_run_frame()</code> 拒絕不同的 N。</li>
-<li><b>版號不變。</b><code>DFN2_MODEL_IO_LAYOUT_VERSION</code> 仍是 8(它命名 state tensor,N 不改變它們;N 由 descriptor 與 metadata 攜帶),<code>DFN2_PREPOST_CARVE_VERSION</code> 仍是 7(N=1 的切分相同,N&gt;1 的 pool 以 hash 區分)。</li>
+<li><b>編譯期守衛。</b>N 不在 1..64 是 <code>#error</code>(C11、gnu99、C++ 皆然);不同 N 的目標檔連結失敗(符號 <code>dfn2_frames_per_call&lt;N&gt;</code>);為一個 frame 寫的單元對 N&gt;1 編譯失敗,除非它在包含標頭前定義 <code>DFN2_MULTI_FRAME_HOST</code>。N&gt;1 折進 pool hash(另一個 N 的 pool 被拒);N=1 時 pool 大小與 hash 不變。descriptor 不加欄位、大小維持 72 bytes:N 由 <code>input_frames</code>(= N+2)攜帶,<code>dfn2_model_io_descriptor_validate()</code> 與 <code>dfn2_model_run_frame()</code> 拒絕不同的 N;依一個 frame 的標頭編譯的 adapter(<code>input_frames</code> = 3)可直接用於 N=1 的函式庫,N&gt;1 的函式庫拒絕它。</li>
+<li><b>版號不變。</b><code>DFN2_MODEL_IO_LAYOUT_VERSION</code> 仍是 8(它命名 state tensor,N 不改變它們;N 由 descriptor 的 <code>input_frames</code> 與 metadata 攜帶),<code>DFN2_PREPOST_CARVE_VERSION</code> 仍是 7(N=1 的切分相同,N&gt;1 的 pool 以 hash 區分)。</li>
 <li><b>pipelines 固定 N=1。</b><code>pipelines/dfn</code> 的 stage 與 rate bridge 以及 <code>dfn2_stage.py</code> 都是一個 frame 的單元;對它們帶 <code>-DDFN2_FRAMES_PER_CALL&gt;1</code> 會停在 <code>DFN2_MULTI_FRAME_HOST</code> 的 <code>#error</code>。<code>make -C AINR lib</code> 可為任一 N 建置,<code>test</code>／<code>test-simd</code> 的驅動是一個 frame 的單元,只在 N=1 建置。</li>
 <li><b>尚未量測。</b>目標平台工具鏈對 seq_len&gt;1 的 GRU 的支援、N-frame graph 的量化精度,沒有量過;等價性只用隨機初始化模型與替身加速器證明(N-frame graph 分塊串流等於一個 frame graph 逐 frame 串流,torch 與 ONNX Runtime 數值一致)。N&gt;5 時 <code>c0</code>(餵給下一層卷積)是兩段分別算出的 tensor 的 Concat,量化工具可能給兩個 scale。N&gt;1 時 compose 在 commit 才跑,所以 <code>set_atten_lim</code> 與反向 ERB 矩陣的更換對下一次 commit 的 N 個 frame 一併生效,包含更換之前就已推入的 frame。</li>
 </ul>

@@ -212,11 +212,14 @@ metadata and shapes disagree. The C host is built with
 `make DFN2_FRAMES_PER_CALL=<N>` (1..64; `-DDFN2_FRAMES_PER_CALL=<N>` on every
 unit): it runs the accelerator every N hops, composes the N frames in one
 burst and still emits one hop per call, so the output trails by N - 1 more
-hops (DFN2 latency `1 + M + D + N - 1` hops). The pool hash, the descriptor
-(`frames_per_call`) and a link-time symbol carry N; a unit written for one
-frame per call does not compile for N > 1, so `make test` / `make test-simd`
+hops (DFN2 latency `1 + M + D + N - 1` hops). The pool hash, the
+descriptor's `input_frames` (N + 2) and a link-time symbol carry N; a unit
+written for one frame per call does not compile for N > 1, so `make test` / `make test-simd`
 (one-frame drivers) and the pipelines DFN stage stay at N = 1 while
-`make lib` builds for any N. Details in
+`make lib` builds for any N. ABI: `DFN2ModelIoDescriptor` is 72 bytes (18
+fields) for every N, pinned by `_Static_assert` (C11 builds); N is carried by
+`input_frames` and the export metadata, so an adapter built against the
+one-frame header neither overruns nor passes an N > 1 library. Details in
 [`DeepFilterNet2/README.md`](DeepFilterNet2/README.md#multi-frame-export).
 
 The DFN C API also performs ERB/complex feature normalization, mask expansion,

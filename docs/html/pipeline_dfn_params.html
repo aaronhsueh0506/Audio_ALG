@@ -57,7 +57,7 @@ th{background:#eef2f8}
 <tr><td><code>DfnResStageConfig.atten_lim_db</code>(bridge:<code>stage.atten_lim_db</code>)</td><td><code>pipelines/dfn/dfn_res_stage.h:35</code></td><td>有限值;預設 0 = 不限制;取絕對值 dB(<code>AINR/DeepFilterNet2/dfn2_process.c:146</code>)</td><td>init 前設初值;hop 之間可用 <code>dfn_res_stage_set_atten_lim()</code>。限制任何一個 bin 最多被壓多少 dB</td></tr>
 <tr><td><code>erb_fwd</code>／<code>erb_inv</code></td><td><code>pipelines/dfn/dfn_res_stage.h:36</code></td><td>float32;erb_fwd bin-major [513][32],erb_inv band-major [32][513];erb_inv 必須是 partition of unity</td><td>init 前,借用(不複製),須活到物件結束。由 <code>export_erb_matrix.py --runtime-bins</code> 產生;沒給時範例用 unit partition,只供 fail-open smoke</td></tr>
 <tr><td><code>DFN2Model{user, infer, reset, io_descriptor}</code></td><td><code>AINR/DeepFilterNet2/dfn2_prepost.h:302</code></td><td>infer 回 0 = 每個輸出寫滿;reset 可為 NULL;有 infer 就必須發布 <code>io_descriptor</code></td><td>init 前(之後不可換)。<code>infer</code> 全零 = identity(無模型)</td></tr>
-<tr><td><code>io_descriptor</code>(<code>DFN2ModelIoDescriptor</code>,19 欄,含 <code>frames_per_call</code>)</td><td><code>AINR/DeepFilterNet2/dfn2_model_io.h:105</code></td><td>必須逐欄等於本 build 的契約(<code>dfn2_model_io_descriptor_validate()</code>)</td><td>板端應從匯出模型的 metadata 填;<code>_default()</code> 只是本 build 編譯進去的幾何,不檢查模型</td></tr>
+<tr><td><code>io_descriptor</code>(<code>DFN2ModelIoDescriptor</code>,18 欄、72 bytes;每次呼叫的 frame 數 N = <code>input_frames</code> - 2)</td><td><code>AINR/DeepFilterNet2/dfn2_model_io.h:105</code></td><td>必須逐欄等於本 build 的契約(<code>dfn2_model_io_descriptor_validate()</code>)</td><td>板端應從匯出模型的 metadata 填;<code>_default()</code> 只是本 build 編譯進去的幾何,不檢查模型</td></tr>
 </table>
 
 <h2>2. 外部參數:執行期入口(hop 之間)</h2>

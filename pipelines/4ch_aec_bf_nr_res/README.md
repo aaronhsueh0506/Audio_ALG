@@ -306,14 +306,20 @@ domain.
 options (`--sample-rate`, `--fft-size`, `--uca-radius-m`, `--fixed-doa-deg`, `--capture-proxy`) with the
 strict parsers of `../common/example_cli.h`: the whole string must be one number, so an empty string, a leading
 space, trailing characters (`16000Hz`), a value outside `int`, `inf` and `nan` are command-line errors, and so
-are an option without its value and an unknown option. All three exit with code 2 and print a message or the
+are an option without its value and an unknown option. A token that starts with `--` where a value belongs is
+the next option, so the value is missing: `--nr-preset --no-res` is an error, not the preset `--no-res` (this holds
+for every option that takes a value: numbers, preset names and the file options of `mcab_raw`). A lone `-`, `-1`
+and `-x` are values: a negative number is one, and a file option takes the name as given (a file named `--x` is
+written `./--x`). The three programs exit with code 2 and print a message or the
 usage line on stderr. A number that parses but names no grid or channel (`--sample-rate 44100`,
 `--capture-proxy 4`) is refused later, when the config is built, and exits 1 in `mcab_static` and
 `mcab_external_static`; `mcab_raw` checks the grid while parsing and exits 2. `tests/test_cli_strict.sh <bin_dir>`
-runs both static programs through every case (`make test` runs it), and `tests/test_mcab_sample_driver.c` covers the
+runs both static programs through every case, plus the file options of `mcab_raw` and `--erb-fwd`/`--erb-inv` of
+`4ch_aec_bf_dfn_res`, which share their option scan (`make test` runs it), and `tests/test_mcab_sample_driver.c` covers the
 shared parser.
-Still lenient in `mcab_external_static`: an unknown AEC preset or `--nr-preset` name falls back to balanced, and
-a repeated option keeps the last value.
+`mcab_external_static` also refuses an AEC preset or `--nr-preset` name it does not know (`mild|balanced|aggressive|no_floor`
+or `0..3`; `mild|moderate|balanced|aggressive` or `0..3`) and a second AEC preset, with exit 2. Still lenient: a repeated
+option keeps the last value.
 
 Reproduce the two recording tests from the `Audio_ALG` directory. The evaluators read the case directories
 `aec_take_turn` and `aec_together` under `--datasets-root` (default: the `datasets` directory beside `Audio_ALG`,

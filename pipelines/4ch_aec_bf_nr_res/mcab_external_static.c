@@ -33,8 +33,8 @@
 #include "utility/simd_kernels.h"
 #include "utility/simd_kernel_nn.h"   /* skn_all_finite_f32 */
 
-/* CLI aliases only; unknown names fall back to balanced. */
-static AecPreset parse_preset(const char* s) {
+/* CLI aliases only; -1 for a name that is none of them. */
+static int parse_preset(const char* s) {
     if (strcmp(s, "mild") == 0 || strcmp(s, "0") == 0)
         return AEC_PRESET_MILD;
     if (strcmp(s, "balanced") == 0 || strcmp(s, "1") == 0)
@@ -43,7 +43,7 @@ static AecPreset parse_preset(const char* s) {
         return AEC_PRESET_AGGRESSIVE;
     if (strcmp(s, "no_floor") == 0 || strcmp(s, "3") == 0)
         return AEC_PRESET_NO_FLOOR;
-    return AEC_PRESET_BALANCED;
+    return -1;
 }
 
 static const char* preset_name(AecPreset p) {
@@ -53,12 +53,6 @@ static const char* preset_name(AecPreset p) {
         case AEC_PRESET_NO_FLOOR:   return "no_floor";
         default:                    return "balanced";
     }
-}
-
-/* Name table lives beside the enum (anr_types.h); unknown names fall back to balanced. */
-static AnrMode parse_nr_mode(const char* s) {
-    int m = anr_nr_mode_from_name(s);
-    return m < 0 ? ANR_MODE_BALANCED : (AnrMode)m;
 }
 
 static const char* nr_mode_name(AnrMode mode) {
@@ -284,18 +278,15 @@ static void fill_hop(float* microphones, float* reference,
 }
 
 /* The whole-number value of argv[*i] (an option name): *i moves onto it. 2, with a message, when
- * the value is missing or is not an int. */
+ * the value is missing (the line ends, or the next token is an option) or is not an int. */
 static int int_option(int argc, char* argv[], int* i, int* value) {
     const char* name = argv[*i];
-    if (*i + 1 >= argc) {
-        fprintf(stderr, "%s: %s needs a value\n", argv[0], name);
+    const char* text = example_cli_option_value(argc, argv, i, argv[0]);
+    if (!text) return 2;
+    if (example_cli_parse_int(text, value) != 0) {
+        fprintf(stderr, "%s: %s '%s' is not an integer\n", argv[0], name, text);
         return 2;
     }
-    if (example_cli_parse_int(argv[*i + 1], value) != 0) {
-        fprintf(stderr, "%s: %s '%s' is not an integer\n", argv[0], name, argv[*i + 1]);
-        return 2;
-    }
-    ++*i;
     return 0;
 }
 
@@ -309,6 +300,7 @@ int main(int argc, char* argv[]) {
     int no_cng = 0;
     int no_res = 0;
     int print_only = 0;
+    int have_preset = 0;
     int rc = 1;
     int i, ch, k, frame, hop, n_freqs;
     size_t pool_bytes;
@@ -335,13 +327,29 @@ int main(int argc, char* argv[]) {
         } else if (strcmp(argv[i], "--capture-proxy") == 0) {
             if (int_option(argc, argv, &i, &capture_proxy) != 0) return 2;
         } else if (strcmp(argv[i], "--nr-preset") == 0) {
-            if (i + 1 >= argc) {
-                fprintf(stderr, "%s: --nr-preset needs a value\n", argv[0]);
+            const char* text = example_cli_option_value(argc, argv, &i, argv[0]);
+            int mode;
+            if (!text) return 2;
+            mode = anr_nr_mode_from_name(text);
+            if (mode < 0) {
+                fprintf(stderr, "%s: --nr-preset '%s' is not a preset "
+                        "(accepted: mild|moderate|balanced|aggressive or 0..3)\n", argv[0], text);
                 return 2;
             }
-            nr_mode = parse_nr_mode(argv[++i]);
+            nr_mode = (AnrMode)mode;
         } else if (argv[i][0] != '-') {
-            preset = parse_preset(argv[i]);
+            int p = parse_preset(argv[i]);
+            if (p < 0) {
+                fprintf(stderr, "%s: AEC preset '%s' is not a preset "
+                        "(accepted: mild|balanced|aggressive|no_floor or 0..3)\n", argv[0], argv[i]);
+                return 2;
+            }
+            if (have_preset) {
+                fprintf(stderr, "%s: a second AEC preset '%s'; give one\n", argv[0], argv[i]);
+                return 2;
+            }
+            preset = (AecPreset)p;
+            have_preset = 1;
         } else {
             fprintf(
                 stderr,

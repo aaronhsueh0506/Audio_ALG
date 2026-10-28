@@ -52,6 +52,11 @@ static int set(void *u,const char *name,const char *value) {
     assert(value && !strcmp(value,"12"));(*seen)++;return 0;
 }
 static int unknown(void *u,const char *name) {(void)u;(void)name;return 2;}
+typedef struct Seen {int calls;char last[8];} Seen;
+static int record(void *u,const char *name,const char *value) {
+    Seen *s=u;(void)name;s->calls++;
+    snprintf(s->last,sizeof(s->last),"%s",value?value:"(none)");return 0;
+}
 static int fake_query(const McabConfig *c,const McabSampleBeamParams *b,McabMemReq *r,
                       unsigned long long *total) {
     (void)c;(void)b;memset(r,0,sizeof(*r));r->bytes=100;r->alignment=16;
@@ -88,6 +93,35 @@ int main(void) {
     assert(mcab_sample_scan_cli(2,missing,opts,2,&seen,set,unknown)==2);
     char *help[]={"probe","--help","--bogus"};
     assert(mcab_sample_scan_cli(3,help,opts,2,&seen,set,unknown)==1);
+    {   /* Only a token starting with "--" is not a value: it makes the option's value missing. */
+        Seen sn={0};
+        char *flag[]={"probe","--value","--help"};
+        char *bare[]={"probe","--value","--"};
+        char *flag_mid[]={"probe","--value","--value","12"};
+        assert(mcab_sample_scan_cli(3,flag,opts,2,&sn,record,unknown)==2 && sn.calls==0);
+        assert(mcab_sample_scan_cli(3,bare,opts,2,&sn,record,unknown)==2 && sn.calls==0);
+        assert(mcab_sample_scan_cli(4,flag_mid,opts,2,&sn,record,unknown)==2 && sn.calls==0);
+        static const char *values[]={"-5","-","-x","","-1.5e3","a--"};
+        size_t k;
+        for(k=0;k<sizeof(values)/sizeof(values[0]);++k){
+            char *v[]={"probe","--value",(char*)values[k],"--help"};
+            sn.calls=0;
+            assert(mcab_sample_scan_cli(3,v,opts,2,&sn,record,unknown)==0);
+            assert(sn.calls==1 && !strcmp(sn.last,values[k]));
+            assert(mcab_sample_scan_cli(4,v,opts,2,&sn,record,unknown)==0);
+            assert(sn.calls==3 && !strcmp(sn.last,"(none)"));   /* --help still parsed after it */
+        }
+    }
+    {   /* The helpers behind it. */
+        char *line[]={"probe","--name","value","--name","--next","--name"};
+        int i=1;
+        assert(!example_cli_is_option(NULL) && !example_cli_is_option("") && !example_cli_is_option("-"));
+        assert(!example_cli_is_option("-5") && !example_cli_is_option("-x") && !example_cli_is_option("a--"));
+        assert(example_cli_is_option("--") && example_cli_is_option("--x") && example_cli_is_option("---"));
+        assert(!strcmp(example_cli_option_value(6,line,&i,"probe"),"value") && i==2);
+        i=3;assert(example_cli_option_value(6,line,&i,"probe")==NULL && i==3);   /* an option follows */
+        i=5;assert(example_cli_option_value(6,line,&i,"probe")==NULL && i==5);   /* the line ends */
+    }
     McabSampleSpatialOptions o;char *trailing[]={"probe","--sample-rate","16000Hz"};
     assert(mcab_sample_parse_spatial_cli(3,trailing,0,&o)==2);
     assert(mcab_sample_parse_spatial_cli(3,trailing,1,&o)==2);
@@ -123,6 +157,40 @@ int main(void) {
                     assert(mcab_sample_parse_spatial_cli(3,argv_int,raw,&o)==2);
                     assert(mcab_sample_parse_spatial_cli(3,argv_float,raw,&o)==2);
                 }
+            }
+        }
+        {   /* An option name where a value belongs is a missing value, for every option and mode. */
+            static const char *flags[]={"--print-mem-size","--sample-rate","--bogus","--"};
+            static const char *file_opts[]={"--mic-raw","--ref-raw","--output-raw","--vad-u8"};
+            size_t f;
+            for(raw=0;raw<2;++raw){
+                for(f=0;f<sizeof(flags)/sizeof(flags[0]);++f){
+                    for(m=0;m<2;++m){
+                        char *ai[]={"probe",(char*)int_opts[m],(char*)flags[f],"--sample-rate","16000"};
+                        char *af[]={"probe",(char*)float_opts[m],(char*)flags[f],"--sample-rate","16000"};
+                        assert(mcab_sample_parse_spatial_cli(5,ai,raw,&o)==2);
+                        assert(mcab_sample_parse_spatial_cli(5,af,raw,&o)==2);
+                    }
+                    for(m=0;m<4;++m){   /* file options: only mcab_raw (raw=1) has them */
+                        char *a0[]={"probe",(char*)file_opts[m],(char*)flags[f],"--mic-raw","a",
+                                    "--ref-raw","b","--output-raw","c","--sample-rate","16000"};
+                        char *a1[]={"probe","--print-mem-size",(char*)file_opts[m],(char*)flags[f]};
+                        assert(mcab_sample_parse_spatial_cli(11,a0,raw,&o)==2);
+                        assert(mcab_sample_parse_spatial_cli(4,a1,raw,&o)==2);
+                    }
+                }
+            }
+            {   /* The flag is not swallowed as a path: it would have cleared --print-mem-size. */
+                char *vad[]={"probe","--vad-u8","--print-mem-size","--mic-raw","a","--ref-raw","b",
+                             "--output-raw","c","--sample-rate","16000"};
+                char *mic[]={"probe","--mic-raw","--print-mem-size","--ref-raw","b","--output-raw","c",
+                             "--sample-rate","16000"};
+                assert(mcab_sample_parse_spatial_cli(11,vad,1,&o)==2);
+                assert(mcab_sample_parse_spatial_cli(9,mic,1,&o)==2);
+                char *dash[]={"probe","--mic-raw","-x","--ref-raw","-","--output-raw","c",
+                              "--vad-u8","-5","--sample-rate","16000"};
+                assert(mcab_sample_parse_spatial_cli(11,dash,1,&o)==0);
+                assert(!strcmp(o.mic_path,"-x") && !strcmp(o.ref_path,"-") && !strcmp(o.vad_path,"-5"));
             }
         }
         {   /* Valid numbers are taken as the conversion gives them; raw=0 defers the grid. */

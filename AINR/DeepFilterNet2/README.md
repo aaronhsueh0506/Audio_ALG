@@ -241,10 +241,12 @@ unit, with the lookahead pair:
   with N = 8). A refused commit zeroes the state once and passes all N frames
   as the identity; flushing means pushing zero hops until the last real one
   has been emitted;
-- `DFN2ModelIoDescriptor` has `frames_per_call` (metadata `frames_per_call`,
-  1 when absent) and `input_frames` = N + 2 (metadata `input_feature_frames`);
-  `dfn2_model_io_descriptor_validate()` and `dfn2_model_run_frame()` refuse
-  another N;
+- `DFN2ModelIoDescriptor` keeps its 18 fields and 72 bytes: N is
+  `input_frames - 2` (`input_frames` = N + 2, metadata `input_feature_frames`),
+  so `dfn2_model_io_descriptor_validate()` and `dfn2_model_run_frame()` refuse
+  another N, and an adapter compiled against the one-frame header
+  (`input_frames` = 3) works with an N = 1 library and is refused by an N > 1
+  one;
 - N > 1 is folded into the pool hash (a pool of another N is refused) and
   objects built for different N do not link (`dfn2_frames_per_call<N>`);
 - N > 1 changes the per-hop contract, so a unit written for one frame per call
@@ -253,16 +255,17 @@ unit, with the lookahead pair:
   its Python twin are one-frame units and stay at N = 1.
 
 `DFN2_MODEL_IO_LAYOUT_VERSION` stays 8: it names the state tensors, which N
-does not change, the window and head shapes carry N through `frames_per_call`
-in the descriptor and the metadata, and a bump would change the one-frame
-graph's metadata. With N = 1 the pool size, the pool hash and every compile
-line are those of a build without the option.
+does not change, the window and head shapes carry N through `input_frames` in
+the descriptor and `frames_per_call` in the metadata, and a bump would change
+the one-frame graph's metadata. With N = 1 the pool size, the pool hash and
+every compile line are those of a build without the option.
 
 Tests: `../tests/test_dfn2_frames_per_call.py` (wrapper and exported graph
 streamed in chunks against the one-frame graph, all pairs; a wrong state carry
 fails; metadata and validator; calibration) and
 `../tests/test_dfn2_frames_per_call_c.py` (the C host against the one-frame
-host, byte for byte, with a stand-in accelerator; reset, refusal, guards).
+host, byte for byte, with a stand-in accelerator; reset, refusal, guards;
+the one-frame header's 72-byte descriptor against libraries of N = 1 and 3).
 
 ## State boundary
 
