@@ -15,7 +15,7 @@ Every generated WAV is a `(5, T)` tensor in `STEM_ORDER`:
 | 1 | `near_speech` | **S** — the near talker through the full room RIR; retained in WAVs for mixing/audit, not copied into packed shards. |
 | 2 | `near_target` | **S_early** — the same near talker and gain through the early/late-suppressed RIR; the common training target. |
 | 3 | `mic_postclip` | **Y** — what a model actually receives, after capture clipping/AGC. |
-| 4 | `linear_error` | **E** — frozen PBFDKF output, `Y - D_hat`. This is not oracle residual echo, and it is not unconditionally the filter's residual: the frontend runs the AEC3 post chain on the context seam, so a hop whose linear estimate the quality analyzer has not declared usable and whose residual carries more energy than the capture publishes the capture instead (`E == Y` there, crossfaded over 30 samples). |
+| 4 | `linear_error` | **E** — frozen PBFDKF output, `Y - D_hat`: the formed (analysis) seam of `lib/aec`, the real selected linear residual of every hop. It is not oracle residual echo, and it is not bounded by the capture: on a hop where the rendering guard of `lib/aec` would publish the capture instead (usable verdict false and residual energy above capture energy) `E` is still the real residual and can exceed `Y`. See "The `linear_error` front-end contract". |
 
 **N** (`local_noise`, ambient noise at the mic) is not a persisted stem: no
 current model task targets echo cancellation without denoising, so it is
@@ -598,6 +598,86 @@ training never read it.
 The four trainers read `packed/all` and create the deterministic random chunk
 split from `[data] val_fraction` and the training seed.
 
+### The `linear_error` front-end contract
+
+`LINEAR_AEC_CONTRACT_VERSION = "aiaec-linear-error-v4"`, `output_seam =
+"formed_output"`.
+
+**The signal.** `LinearAecProcessor` runs the Python PBFDKF of `lib/aec` in its
+frozen configuration (`enable_res=False`, `return_res_context=True`,
+`return_formed_output=True`, balanced level, `delay_num_filters=5`) and stores
+`AEC.get_formed_output()` of every hop as `linear_error`. That is the **analysis
+seam** of `lib/aec`: the refined/shadow-selected, 30-sample crossfaded linear
+residual, in one stream of formed hops. The output guard never touches it; the
+capture is no longer a third candidate of the selection, so AecState, ERLE and
+the PSDs the front end adapts on, and the stored waveform, all see the same real
+residual.
+
+**Training and C inference read the same signal.** The board pipelines feed the
+network the analysis seam, not the rendering base: `mono_alignulcnet` passes
+`AecResContext.formed_hop` to `ulcnet_nn_stage_begin_time()`, which takes its own
+STFT of it, and the Python `LinearAecEngine` returns `get_formed_output()`. The
+rendering base (`aec_get_output_base()` / `output_base_spec`, error or capture
+depending on the guard) exists for consumers that render audio as
+`output_base_spec * gain`; it does not pair with `formed_hop` and must never be
+substituted for it. (The 4-channel unit feeds the network a beamformed spectrum;
+that seam belongs to the 4-channel lane/fusion contract, not to this one.)
+
+**What changed against v3.** A v3 corpus stored the capture on hops where the
+previous hop was not usable and the residual outweighed it (`E == Y`, crossfaded
+over 30 samples), and `D_hat = Y - E` was then zero there. A v4 corpus stores the
+real residual on those hops, so:
+
+- `E` can exceed `Y` on guard hops, and `D_hat = Y - E` can then carry more
+  energy than the echo. 97.7 % of the guard-firing hops at 16 kHz/512 (64,096
+  hops over 800 blind clips, `lib/aec` CHANGELOG) fall before the first usable
+  verdict, and some clips never get one, so the corpus must include
+  never-usable scenes.
+- The rendering guard protects audio rendered as `base * gain`. The network path
+  does not consult it: the model output, or on a failed model call the
+  pass-through of the error spectrum itself, is what is rendered. Evaluate a
+  retrained model on guard hops and on never-usable clips before relying on it.
+
+**Identifiers recorded with the data.** Shards, the `linear_error.done.json`
+ledger and checkpoints all record `linear_aec` (the `LinearAecContract` dict:
+`version`, `output_seam`, `aec_behavior_hash`, `behavior_hash_schema`, ...) and
+`linear_aec_contract_hash` (its `fingerprint()`). v4 is told apart from v3 by
+`version` and by `aec_behavior_hash`; the behaviour hash moved with the
+analysis/rendering split of `lib/aec` (`9fa7a2de...`, `lib/aec` 115e10c, to the
+hash of the build that wrote the data).
+
+**Retired, not migrated.** Nothing connects a v3 / `9fa7a2de...` artifact to v4:
+
+- a v3 shard, ledger or checkpoint is refused on load by `version`, with the
+  rematerialize instruction (`RETIRED_CONTRACT_VERSIONS`);
+- `9fa7a2de...` and every earlier hash are in `RETIRED_BEHAVIOR_HASHES`;
+- the released 16 kHz Align-ULCNet checkpoint pointer
+  (`RELEASED_INFERENCE_BEHAVIOR_HASH_COMPATIBILITY`, recorded `c1b1f543...`, it
+  used to point at `9fa7a2de...`) is retired with them: it is refused for
+  inference as for training and is not re-pointed at the new hash. To run it, use
+  a `lib/aec` checkout at 115e10c; that legacy front end is a build, not an
+  entry of this one;
+- `ACCEPTED_BEHAVIOR_HASH_MIGRATIONS` stays empty.
+
+**What the owner does.** The stored `linear_error` is the only thing that changed,
+so the WAVs of an existing corpus need no re-render (a corpus that needs the
+`[acoustic_tails]` mixture is generated afresh instead):
+
+```bash
+python3 -m AIAEC.dataset_gen.rematerialize_linear_aec \
+    --input data_aec/all --config AIAEC/dataset_gen/config.ini --jobs 8   # NO --resume
+python3 -m AIAEC.dataset_gen.pack_aec_dataset \
+    --config AIAEC/dataset_gen/config.ini \
+    --input data_aec/all --output data_aec/packed/all --overwrite
+# then retrain every AIAEC checkpoint that reads linear_error
+```
+
+Do not pass `--resume` into a corpus written by v3: the ledger it left is a
+different contract and is discarded whole. A model trained on v3 data must be
+retrained, not re-labelled. Guard-only checks (the lib/aec guard-unification
+tests, AECMOS of the AEC output) are not model-quality evidence for a retrained
+network.
+
 The contract records the AEC's identity three ways, and they are used for
 different things:
 
@@ -752,16 +832,19 @@ rationale and the numbers for each admitted entry live in the comment on the
 entry itself. Anything that retunes a *live* mechanism does not qualify:
 rematerialize instead, with the commands above.
 
-#### Released-checkpoint inference exception
+#### Released-checkpoint inference pointer: retired
 
-One released 16-kHz Align-ULCNet checkpoint hash pair
-(`RELEASED_INFERENCE_BEHAVIOR_HASH_COMPATIBILITY`) remains loadable through
-`require_inference_linear_aec_contract`. This is a different allowlist from
-`ACCEPTED_BEHAVIOR_HASH_MIGRATIONS`: that checkpoint's `linear_error` differs
-from the current frontend's, so inference emits a warning that model output may
-differ. Only that exact recorded/current hash pair, at 16 kHz and in the live
-`LinearAecEngine`, is accepted. Dataset packing, rematerialization, training,
-48-kHz use, reverse use and every unlisted hash still fail closed.
+`RELEASED_INFERENCE_BEHAVIOR_HASH_COMPATIBILITY` used to let one released
+16-kHz Align-ULCNet checkpoint load through `require_inference_linear_aec_contract`
+with a "may differ" warning. It is **empty**: the analysis/rendering split of
+`lib/aec` changes `linear_error` itself, so that checkpoint is refused for
+inference, packing, rematerialization and training alike (pinned by
+`tests/test_linear_aec_behavior_migration.py`, which also shows the refusal is
+the table's emptiness). It is not re-pointed at the new hash. A re-introduced
+entry is reported by `released_pointer_bump_guard.py`. To evaluate that
+checkpoint, run it with a `lib/aec` checkout whose behaviour hash is the recorded
+one, or feed it a `materialize_pair` output with `--input-is-linear-error`
+(evaluation only).
 
 `rematerialize_linear_aec.py --resume` skips a sequence only when the CURRENT
 contract already wrote it, per the `linear_error.done.json` ledger beside the

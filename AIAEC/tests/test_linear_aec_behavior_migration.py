@@ -1,11 +1,17 @@
 """No migration connects recorded data to this frontend.
 
-`ACCEPTED_BEHAVIOR_HASH_MIGRATIONS` is empty: the shadow-copy baseline retime
-and the C restart evidence clearing move `linear_error`, so every earlier
-identity pair is retired. A retired entry must not come back: retargeting one
-at a live build would declare an old waveform compatible with a build that does
-not produce it. Retired identities are refused with an instruction to
-rematerialize rather than a bare hash mismatch.
+`ACCEPTED_BEHAVIOR_HASH_MIGRATIONS` is empty: the shadow-copy baseline retime,
+the C restart evidence clearing and the analysis-seam / rendering-base split of
+lib/aec move `linear_error`, so every earlier identity pair is retired. A
+retired entry must not come back: retargeting one at a live build would declare
+an old waveform compatible with a build that does not produce it. Retired
+identities are refused with an instruction to rematerialize rather than a bare
+hash mismatch.
+
+The released inference-only checkpoint pointer is retired with them
+(`RELEASED_INFERENCE_BEHAVIOR_HASH_COMPATIBILITY` is empty): the released
+checkpoint is refused for inference and training alike, never re-pointed at
+this build's hash.
 
 Run:
     python3 -m pytest AIAEC/tests/test_linear_aec_behavior_migration.py
@@ -17,11 +23,16 @@ import dataclasses
 import pytest
 
 from AIAEC.dataset_gen.aec_behavior_hash import aec_python_behavior_hash
+from AIAEC.dataset_gen import linear_aec
 from AIAEC.dataset_gen.linear_aec import (
     ACCEPTED_BEHAVIOR_HASH_MIGRATIONS,
     BEHAVIOR_HASH_SCHEMA,
+    LINEAR_AEC_CONTRACT_VERSION,
     RELEASED_INFERENCE_BEHAVIOR_HASH_COMPATIBILITY,
+    RELEASED_INFERENCE_POINTER_BUMPS,
     RETIRED_BEHAVIOR_HASHES,
+    RETIRED_CONTRACT_VERSIONS,
+    LinearAecContract,
     make_linear_aec_contract,
     require_inference_linear_aec_contract,
     require_linear_aec_contract,
@@ -47,8 +58,14 @@ LAST_MIGRATED_TO_HASH = (
     "19dd4f90f482e15072d535964ac9816cdc21cae2c350b98de12a0e9ab561ff45")
 RELEASED_CHECKPOINT_HASH = (
     "c1b1f5433fa244a2f7369938992bff95f00d1bdc394c4f21a5862f2dc547f786")
+# The frontend (lib/aec 115e10c) before the analysis-seam / rendering-base
+# split. The released checkpoint's pointer used to target it. Its output is NOT
+# this build's, and it must not be registered as a byte-equivalent migration.
+PREVIOUS_FRONTEND_HASH = (
+    "9fa7a2dec85cef8f123cc4dd02e7eb3c5dc0c1b45d7ec0f32b766cf9cda245e5")
 REFUSED_HASHES = (DEPLOYED_OLD_HASH, EARLIER_MIGRATED_HASH, CORPUS_HASH,
-                  LAST_MIGRATED_TO_HASH, RELEASED_CHECKPOINT_HASH)
+                  LAST_MIGRATED_TO_HASH, RELEASED_CHECKPOINT_HASH,
+                  PREVIOUS_FRONTEND_HASH)
 
 
 def _contract_recorded_as(hash_value):
@@ -79,38 +96,114 @@ def test_no_retired_identity_migrates_to_anything():
     assert aec_python_behavior_hash() not in RETIRED_BEHAVIOR_HASHES
 
 
-def test_released_checkpoint_exception_is_separate_and_targets_this_build():
-    assert RELEASED_INFERENCE_BEHAVIOR_HASH_COMPATIBILITY == {
-        RELEASED_CHECKPOINT_HASH: aec_python_behavior_hash(),
-    }
+def test_the_previous_frontend_is_retired_and_not_migrated():
+    assert PREVIOUS_FRONTEND_HASH in RETIRED_BEHAVIOR_HASHES
+    assert PREVIOUS_FRONTEND_HASH not in ACCEPTED_BEHAVIOR_HASH_MIGRATIONS
+    assert PREVIOUS_FRONTEND_HASH not in ACCEPTED_BEHAVIOR_HASH_MIGRATIONS.values()
+    assert aec_python_behavior_hash() != PREVIOUS_FRONTEND_HASH
+
+
+def test_released_checkpoint_pointer_is_retired_not_repointed():
+    """The released checkpoint (recorded at c1b1f5...) used to point at the
+    previous frontend. It must not point at this build, nor at anything."""
+    assert RELEASED_INFERENCE_BEHAVIOR_HASH_COMPATIBILITY == {}
+    assert RELEASED_INFERENCE_POINTER_BUMPS == ()
+    assert linear_aec._RELEASED_INFERENCE_SAMPLE_RATES == {}
     assert RELEASED_CHECKPOINT_HASH in RETIRED_BEHAVIOR_HASHES
     assert RELEASED_CHECKPOINT_HASH not in ACCEPTED_BEHAVIOR_HASH_MIGRATIONS
 
 
-def test_released_checkpoint_exception_is_inference_only_and_warns():
-    current = make_linear_aec_contract(16000, preset="balanced").as_dict()
-    recorded = _contract_recorded_as(RELEASED_CHECKPOINT_HASH)
-    with pytest.warns(RuntimeWarning, match="inference-only.*may differ"):
-        require_inference_linear_aec_contract(
-            current, recorded, context="released checkpoint")
-    with pytest.raises(ValueError, match="rematerialize_linear_aec"):
-        require_linear_aec_contract(
-            current, recorded, context="dataset materialization")
+@pytest.mark.parametrize("sample_rate, frame_size", ((16000, 512), (48000, 1024)))
+@pytest.mark.parametrize(
+    "recorded", (RELEASED_CHECKPOINT_HASH, PREVIOUS_FRONTEND_HASH))
+def test_released_checkpoint_is_refused_for_inference_and_training(
+        recorded, sample_rate, frame_size, recwarn):
+    """Neither the inference gate nor the strict gate admits it, at either
+    rate, and nothing warns that it was admitted."""
+    current = make_linear_aec_contract(
+        sample_rate, preset="balanced", frame_size=frame_size).as_dict()
+    stale = dict(current, aec_behavior_hash=recorded)
+    for gate in (require_inference_linear_aec_contract,
+                 require_linear_aec_contract):
+        with pytest.raises(ValueError, match="rematerialize_linear_aec") as caught:
+            gate(current, stale, context="released checkpoint")
+        assert recorded in str(caught.value)
+    assert not [w for w in recwarn.list if "inference-only" in str(w.message)]
 
 
-def test_released_checkpoint_exception_is_16khz_and_one_way():
-    current_48k = make_linear_aec_contract(
-        48000, preset="balanced", frame_size=1024).as_dict()
-    recorded_48k = dict(current_48k, aec_behavior_hash=RELEASED_CHECKPOINT_HASH)
-    with pytest.raises(ValueError):
-        require_inference_linear_aec_contract(
-            current_48k, recorded_48k, context="48-kHz checkpoint")
-
+def test_released_checkpoint_is_refused_in_the_reverse_direction_too():
     current = make_linear_aec_contract(16000, preset="balanced").as_dict()
     older_build = dict(current, aec_behavior_hash=RELEASED_CHECKPOINT_HASH)
     with pytest.raises(ValueError):
         require_inference_linear_aec_contract(
             older_build, current, context="reverse direction")
+
+
+def test_the_empty_pointer_table_is_what_refuses_the_released_checkpoint(
+        monkeypatch):
+    """Can-fail proof for the retirement tests above. Re-pointing the released
+    checkpoint at this build -- the silent fix this change forbids -- would make
+    inference admit it with a warning; so the refusal is the table's emptiness,
+    not an accident of the gate."""
+    current = make_linear_aec_contract(16000, preset="balanced").as_dict()
+    stale = dict(current, aec_behavior_hash=RELEASED_CHECKPOINT_HASH)
+    monkeypatch.setitem(
+        RELEASED_INFERENCE_BEHAVIOR_HASH_COMPATIBILITY,
+        RELEASED_CHECKPOINT_HASH, aec_python_behavior_hash())
+    monkeypatch.setitem(
+        linear_aec._RELEASED_INFERENCE_SAMPLE_RATES,
+        RELEASED_CHECKPOINT_HASH, frozenset({16000}))
+    with pytest.warns(RuntimeWarning, match="inference-only.*may differ"):
+        require_inference_linear_aec_contract(
+            current, stale, context="re-pointed")
+    # ... and the training gate still refuses the re-pointed pair.
+    with pytest.raises(ValueError, match="rematerialize_linear_aec"):
+        require_linear_aec_contract(current, stale, context="re-pointed")
+
+
+def test_a_new_hash_artifact_is_accepted_silently(recwarn):
+    """The contract a corpus or checkpoint recorded under THIS build's
+    frontend: accepted by both gates, without a migration warning."""
+    current = make_linear_aec_contract(16000, preset="balanced").as_dict()
+    # Provenance (commit, raw-text hash) may differ; behaviour is the same.
+    recorded = dataclasses.replace(
+        make_linear_aec_contract(16000, preset="balanced"),
+        aec_commit="b" * 40, aec_source_hash="0" * 64).as_dict()
+    assert recorded["aec_behavior_hash"] == aec_python_behavior_hash()
+    require_linear_aec_contract(current, recorded, context="new corpus")
+    require_inference_linear_aec_contract(
+        current, recorded, context="new checkpoint")
+    assert not recwarn.list
+
+
+def test_the_current_contract_version_is_not_a_retired_one():
+    assert "aiaec-linear-error-v3" in RETIRED_CONTRACT_VERSIONS
+    assert LINEAR_AEC_CONTRACT_VERSION not in RETIRED_CONTRACT_VERSIONS
+    assert LINEAR_AEC_CONTRACT_VERSION == "aiaec-linear-error-v4"
+
+
+# Spelled out, not read from RETIRED_CONTRACT_VERSIONS: an emptied table would
+# otherwise parametrize this to nothing and pass.
+@pytest.mark.parametrize("retired", ("aiaec-linear-error-v3",))
+def test_a_retired_contract_version_is_refused_with_what_to_do(retired):
+    """A manifest, shard or checkpoint recorded under the previous contract
+    version is refused on load -- before any hash comparison -- and the
+    message says rematerialize, without --resume, repack, retrain."""
+    recorded = dict(make_linear_aec_contract(16000, preset="balanced").as_dict(),
+                    version=retired)
+    with pytest.raises(ValueError) as caught:
+        LinearAecContract.from_dict(recorded)
+    message = str(caught.value)
+    assert retired in message
+    assert "rematerialize_linear_aec" in message
+    assert "--resume" in message and "retrain" in message
+
+
+def test_an_unknown_contract_version_is_still_a_plain_mismatch():
+    recorded = dict(make_linear_aec_contract(16000, preset="balanced").as_dict(),
+                    version="aiaec-linear-error-v0")
+    with pytest.raises(ValueError, match="expected"):
+        LinearAecContract.from_dict(recorded)
 
 
 def test_an_unlisted_identity_is_still_refused():

@@ -41,8 +41,9 @@ __all__ = [
 # wrong slot. ``echo`` (D), ``local_noise`` (N) and ``mic_preclip`` (S+N+D
 # before clipping/AGC) are audit signals only (see ``RenderedSequence.audit``).
 # ``linear_error`` is the real frozen PBFDKF output E=Y-D_hat consumed by the
-# RES+NR candidates, materialized over the COMPLETE parent sequence before
-# chunking, never from oracle D.
+# RES+NR candidates (the formed analysis seam of lib/aec: never the capture),
+# materialized over the COMPLETE parent sequence before chunking, never from
+# oracle D.
 BASE_STEM_ORDER = (
     'far_render',
     'near_speech',

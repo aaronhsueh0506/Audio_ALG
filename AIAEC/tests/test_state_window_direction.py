@@ -25,6 +25,7 @@ from AIAEC.Align_ULCNet.export_onnx import (
 )
 from AIAEC.Align_ULCNet.model import AlignULCNet
 from AIAEC.CAGCRN import CAGCRN
+from AIAEC.dataset_gen.linear_aec import make_linear_aec_contract
 from AIAEC.DeepVQE_S import DeepVQES
 from AIAEC._onnx_contract import validate_inplace_state_contract
 from AIAEC._streaming_export import _build, export_graph
@@ -50,8 +51,9 @@ def _export(name, tmp_path):
     path = tmp_path / (name + '.onnx')
     if name == 'Align_ULCNet':
         model = AlignULCNet(GRID, max_delay_frames=4).eval()
-        torch.save({'contract': {}, 'state_dict': model.state_dict()},
-                   checkpoint)
+        linear = make_linear_aec_contract(GRID.sample_rate)
+        torch.save({'contract': {'linear_aec': linear.as_dict()},
+                    'state_dict': model.state_dict()}, checkpoint)
         export_ulcnet(model, str(checkpoint), str(path))
     else:
         factory = {'Align_CRUSE': AlignCRUSE, 'DeepVQE_S': DeepVQES,

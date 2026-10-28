@@ -2,10 +2,12 @@
 
 Hybrid `linear AEC -> joint RES + NR` reference candidate. Inputs are the
 **frozen production linear-AEC error** and far-end reference. That frontend
-runs on the context-only seam (`enable_res=0`, `return_res_context=1`) — the
-same seam the board pipelines use — so its over-output capture guard is live:
-a hop the filtering-quality analyzer has not cleared and whose residual
-outweighs the capture publishes the capture instead. The target is
+runs on the context-only seam (`enable_res=0`, `return_res_context=1`) and the
+error is its analysis seam (`get_formed_output()`, the C `formed_hop`): the real
+selected linear residual of every hop, which can exceed the capture on a hop
+where the rendering guard of `lib/aec` would publish the capture. The guard
+selects the rendering base only and never alters this input; see
+`dataset_gen/README.md`, "The `linear_error` front-end contract". The target is
 the common denoised, echo-free, early/dereverberated near-end speech. It is
 not a direct neural AEC. This target is the project's comparison contract and
 should not be reported as an upstream checkpoint-equivalent setting.
@@ -451,6 +453,19 @@ them together). Versions 3-17 are retired (`RETIRED_LAYOUT_VERSIONS`): a number
 that once meant one boundary must never also mean another, because state
 element counts can coincide across boundaries and nothing but the version can
 tell them apart.
+
+The layout does not identify the training front end. `export_onnx.py` copies
+`linear_aec_contract_version` and `aec_behavior_hash` from the checkpoint's
+`linear_aec` contract into the JSON and ONNX metadata, together with
+`error_input_seam = analysis_formed` (the error input is the AEC analysis seam,
+`formed_hop` / `beam.spectrum`, never the rendering base). The integrator
+compares `linear_aec_contract_version` with `ULCNET_MODEL_IO_FRONTEND_CONTRACT`
+in `ulcnet_model_io.h` (`aiaec-linear-error-v4`) before
+`ulcnet_accelerator_adapter_init()` and refuses a different value, e.g. a graph
+exported from a retired v3 checkpoint. The constant is not part of the
+descriptor and is not a layout bump; a test pins it to
+`LINEAR_AEC_CONTRACT_VERSION`. Export refuses a checkpoint without a current
+`linear_aec` contract.
 
 The fixed front end never enters the quantized domain: each of the four feature
 inputs keeps its own quantization scale, and `sqrt`/`atan2`/`pow` stay out of

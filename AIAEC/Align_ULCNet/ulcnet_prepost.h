@@ -28,7 +28,14 @@
  *     ulcnet_prepost_post_process_freq(p, re, im);
  *     ac_istft_push_planar(istft, re, im, out_hop);
  *
- * The class resets a borrowed AcIstft together with its own state. */
+ * The class resets a borrowed AcIstft together with its own state.
+ *
+ * Error-input domain: the error stream is the AEC analysis seam, the signal the model is trained on
+ * (aiaec-linear-error-v4). ULCNET_IO_TIME: err_hop is AecResContext.formed_hop. ULCNET_IO_FREQ:
+ * err_re/err_im are AecResContext.error_spec, which pairs with the formed hop on this center-0
+ * sqrt-Hann grid. Never AecOutputBase.base_spec from aec_get_output_base(): on a guard hop it does
+ * not pair with formed_hop and is not the training signal. The class has no rendering base and
+ * applies no output guard (see frame_skip). */
 
 #ifndef ULCNET_PREPOST_H
 #define ULCNET_PREPOST_H
@@ -135,15 +142,16 @@ const UlcnetModelIoDescriptor *ulcnet_prepost_descriptor(const UlcnetPrepost *p)
 
 /* ---- per-hop stages -------------------------------------------------- */
 
-/* ULCNET_IO_TIME. One hop of the linear-AEC error and one of the aligned far,
- * both for the same input hop (no internal skew). Returns 1 (one hop is one
+/* ULCNET_IO_TIME. One hop of the linear-AEC error (the analysis seam, formed_hop) and one
+ * of the aligned far, both for the same input hop (no internal skew). Returns 1 (one hop is one
  * accelerator invocation), or -1 on NULL args, in ULCNET_IO_FREQ, or while the
  * previous frame is still open (neither committed nor skipped). */
 int ulcnet_prepost_pre_process(UlcnetPrepost *p,
                                const float err_hop[ULCNET_HOP],
                                const float far_hop[ULCNET_HOP]);
 
-/* ULCNET_IO_FREQ. One analysed frame per stream: unnormalised rfft of a
+/* ULCNET_IO_FREQ. The error spectrum is AecResContext.error_spec (not base_spec). One
+ * analysed frame per stream: unnormalised rfft of a
  * sqrt-Hann-windowed ULCNET_N_FFT block on the hop grid (center=False). No transform is done. Returns 1; -1 on NULL args,
  * in ULCNET_IO_TIME, or while the previous frame is open. */
 int ulcnet_prepost_pre_process_freq(UlcnetPrepost *p,
@@ -174,7 +182,9 @@ int ulcnet_prepost_frame_commit(UlcnetPrepost *p);
 
 /* Take the identity for the current frame: the error spectrum passes through
  * unenhanced and the framing schedule still advances. Used after a failed
- * accelerator run or an alignment-boundary reprime. Returns 0, or -1. */
+ * accelerator run or an alignment-boundary reprime. The output is the analysis
+ * residual without the AEC output guard: on a guard hop (unusable estimate, residual
+ * louder than the capture) it can exceed the capture. Returns 0, or -1. */
 int ulcnet_prepost_frame_skip(UlcnetPrepost *p);
 
 /* ULCNET_IO_TIME. Emit this hop's output. `out_hop` is always fully

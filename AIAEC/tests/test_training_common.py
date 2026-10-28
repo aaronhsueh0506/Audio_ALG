@@ -280,6 +280,38 @@ def test_checkpoint_contract_rejects_changed_data_split_indices():
         require_checkpoint_contract({'contract': contract}, changed)
 
 
+def test_resume_refuses_a_checkpoint_trained_on_the_previous_frontend():
+    """A checkpoint whose recorded corpus came from the previous frontend
+    (hash 9fa7a2de..., the one the released pointer used to target) cannot
+    resume against a corpus of the current frontend: the data contract
+    differs in `aec_behavior_hash`, and it is never silently equated."""
+    grid = SignalGrid(16000, 512, 512, 256)
+
+    def contract_for(behavior_hash):
+        linear = dataclasses.replace(
+            make_linear_aec_contract(16000, frame_size=512),
+            aec_behavior_hash=behavior_hash)
+        data_contract = {
+            'dataset_fingerprint': 'corpus',
+            'linear_aec': linear.as_dict(),
+            'linear_aec_contract_hash': linear.fingerprint(),
+            'split_kind': 'random_chunk', 'split_seed': 42,
+            'val_fraction': 0.1, 'train_indices': [0, 1], 'val_indices': [2],
+        }
+        return make_checkpoint_contract(
+            model_name='Align_ULCNet', task=MODEL_TASKS['Align_ULCNet'],
+            grid=grid, model_kwargs={}, loss_version='v1',
+            data_contract=data_contract)
+
+    current = contract_for(make_linear_aec_contract(
+        16000, frame_size=512).aec_behavior_hash)
+    previous = contract_for(
+        '9fa7a2dec85cef8f123cc4dd02e7eb3c5dc0c1b45d7ec0f32b766cf9cda245e5')
+    require_checkpoint_contract({'contract': current}, current)
+    with pytest.raises(ValueError, match='aec_behavior_hash'):
+        require_checkpoint_contract({'contract': previous}, current)
+
+
 def test_checkpoint_linear_aec_rejects_hash_and_model_grid_mismatch():
     linear = make_linear_aec_contract(16000, frame_size=512)
     grid = SignalGrid(16000, 512, 512, 256)
@@ -504,14 +536,39 @@ def test_inference_rejects_a_different_linear_aec_build():
         LinearAecEngine(n_lanes=1, sample_rate=16000, contract=contract)
 
 
-def test_inference_loads_the_released_pre_constraint_checkpoint_with_warning():
-    """The product exception is wired into the real inference engine only."""
+@pytest.mark.parametrize(
+    'recorded',
+    (
+        # The released 16-kHz checkpoint and the frontend its pointer used to
+        # target; neither is loadable on the current frontend.
+        'c1b1f5433fa244a2f7369938992bff95f00d1bdc394c4f21a5862f2dc547f786',
+        '9fa7a2dec85cef8f123cc4dd02e7eb3c5dc0c1b45d7ec0f32b766cf9cda245e5',
+    ),
+)
+def test_inference_refuses_a_checkpoint_from_a_retired_frontend(recorded, recwarn):
+    """The released pre-constraint checkpoint pointer is retired: the real
+    inference engine refuses it (and its former target) and tells the user to
+    rematerialize and retrain, instead of loading it with a warning."""
     contract = make_linear_aec_contract(16000, frame_size=512).as_dict()
-    contract['aec_behavior_hash'] = (
-        'c1b1f5433fa244a2f7369938992bff95f00d1bdc394c4f21a5862f2dc547f786'
-    )
-    with pytest.warns(RuntimeWarning, match='inference-only.*may differ'):
+    contract['aec_behavior_hash'] = recorded
+    with pytest.raises(ValueError, match='rematerialize_linear_aec'):
         LinearAecEngine(n_lanes=1, sample_rate=16000, contract=contract)
+    assert not [w for w in recwarn.list if 'inference-only' in str(w.message)]
+
+
+def test_inference_refuses_a_checkpoint_of_the_previous_contract_version():
+    """A v3 checkpoint is refused by version before any hash comparison."""
+    contract = make_linear_aec_contract(16000, frame_size=512).as_dict()
+    contract['version'] = 'aiaec-linear-error-v3'
+    with pytest.raises(ValueError, match='retired.*rematerialize_linear_aec'):
+        LinearAecEngine(n_lanes=1, sample_rate=16000, contract=contract)
+
+
+def test_inference_accepts_a_checkpoint_of_the_current_frontend(recwarn):
+    """The new-hash artifact loads without any compatibility warning."""
+    contract = make_linear_aec_contract(16000, frame_size=512).as_dict()
+    LinearAecEngine(n_lanes=1, sample_rate=16000, contract=contract)
+    assert not [w for w in recwarn.list if issubclass(w.category, RuntimeWarning)]
 
 
 def test_inference_accepts_comment_only_provenance_drift():

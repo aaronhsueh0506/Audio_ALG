@@ -2,10 +2,11 @@
 
 A bump of that dict's single entry must not assume the pointer's prior value
 was the hash immediately before the author's own change, or unvetted drift
-accumulated on the pointer is silently re-admitted;
-``test_released_checkpoint_exception_is_separate_and_targets_this_build``
-(``test_linear_aec_behavior_migration.py``) only asserts the pointer equals the
-LIVE hash.
+accumulated on the pointer is silently re-admitted. The dict is currently
+EMPTY (the released checkpoint is retired, see
+``test_released_checkpoint_pointer_is_retired_not_repointed`` in
+``test_linear_aec_behavior_migration.py``); the guard then checks that the bump
+table is retired with it and that no pointer is (re)introduced against HEAD.
 
 This module tests the two layers of ``released_pointer_bump_guard.py`` and
 proves each can fail:
@@ -26,9 +27,12 @@ from pathlib import Path
 
 from AIAEC.dataset_gen import linear_aec
 from AIAEC.dataset_gen.released_pointer_bump_guard import (
+    bumps_from_source,
     check_bump_against_head,
     check_chain,
     check_file_against_head,
+    check_pointer_introduction,
+    live_pointer_value_from_source,
 )
 
 # AIAEC/dataset_gen/released_pointer_bump_guard.py -> dataset_gen -> AIAEC ->
@@ -48,11 +52,12 @@ assert len(_PLAUSIBLE_WRONG) == 64
 
 
 def _live_pointer_value():
+    """The single value a populated table holds, or None when it is retired."""
     compat = linear_aec.RELEASED_INFERENCE_BEHAVIOR_HASH_COMPATIBILITY
-    assert len(compat) == 1, (
-        "this guard and these tests assume exactly one tracked checkpoint "
+    assert len(compat) <= 1, (
+        "this guard and these tests assume at most one tracked checkpoint "
         "pointer; a second entry needs this file revisited")
-    return next(iter(compat.values()))
+    return next(iter(compat.values()), None)
 
 
 # --- Layer 1: check_chain -- stateless, survives any future commit ---------
@@ -98,9 +103,13 @@ def test_bump_table_chains_to_the_live_pointer_value():
     """The real table in linear_aec.py, checked against the real live dict
     value. This is what makes the guard run forever, not just at bump time:
     any future bump that forgets to append a row, or appends one whose `old`
-    is not literally the previous row's `new`, fails here."""
-    violations = check_chain(
-        linear_aec.RELEASED_INFERENCE_POINTER_BUMPS, _live_pointer_value())
+    is not literally the previous row's `new`, fails here. With the pointer
+    retired the table is empty with it."""
+    live = _live_pointer_value()
+    if live is None:
+        assert linear_aec.RELEASED_INFERENCE_POINTER_BUMPS == ()
+        return
+    violations = check_chain(linear_aec.RELEASED_INFERENCE_POINTER_BUMPS, live)
     assert violations == [], violations
 
 
@@ -144,3 +153,73 @@ def test_live_worktree_bump_is_documented_against_head():
     to add the row described above the table in linear_aec.py."""
     violations = check_file_against_head(_AUDIO_ALG_ROOT, _REL_PATH)
     assert violations == [], violations
+
+
+# --- Retired pointer: no live value, no table, no silent re-introduction ----
+
+_RETIRED_SOURCE = (
+    "RELEASED_INFERENCE_BEHAVIOR_HASH_COMPATIBILITY = {}\n"
+    "RELEASED_INFERENCE_POINTER_BUMPS = ()\n")
+_POPULATED_SOURCE = (
+    "RELEASED_INFERENCE_BEHAVIOR_HASH_COMPATIBILITY = {'%s': '%s'}\n"
+    "RELEASED_INFERENCE_POINTER_BUMPS = ()\n" % (_A, _B))
+
+
+def test_an_empty_pointer_table_has_no_live_value():
+    assert live_pointer_value_from_source(_RETIRED_SOURCE) is None
+    assert bumps_from_source(_RETIRED_SOURCE) == ()
+    assert live_pointer_value_from_source(_POPULATED_SOURCE) == _B
+
+
+def test_introduction_check_rejects_a_pointer_where_head_has_none():
+    """Can-fail proof. A retired pointer coming back (the silent re-point this
+    change forbids) is reported even though no bump row can document a HEAD
+    value that does not exist."""
+    violations = check_pointer_introduction(None, _B)
+    assert violations != [] and _B in violations[0]
+
+
+def test_introduction_check_accepts_retirement_and_the_unchanged_cases():
+    assert check_pointer_introduction(_A, None) == []      # retiring is allowed
+    assert check_pointer_introduction(None, None) == []    # stays retired
+    assert check_pointer_introduction(_A, _B) == []        # a bump: other layer
+
+
+def _git_repo_with(tmp_path, head_source, work_source):
+    import subprocess
+    repo = tmp_path / "repo"
+    path = repo / "AIAEC" / "dataset_gen"
+    path.mkdir(parents=True)
+    target = path / "linear_aec.py"
+    target.write_text(head_source)
+    env = {"GIT_AUTHOR_NAME": "t", "GIT_AUTHOR_EMAIL": "t@t",
+           "GIT_COMMITTER_NAME": "t", "GIT_COMMITTER_EMAIL": "t@t",
+           "PATH": __import__("os").environ["PATH"], "HOME": str(tmp_path)}
+    for cmd in (["init", "-q"], ["add", "."],
+                ["-c", "commit.gpgsign=false", "commit", "-q", "-m", "head"]):
+        subprocess.run(["git", "-C", str(repo)] + cmd, check=True, env=env)
+    target.write_text(work_source)
+    return repo
+
+
+def test_file_check_flags_a_reintroduced_pointer_against_a_retired_head(tmp_path):
+    repo = _git_repo_with(tmp_path, _RETIRED_SOURCE, _POPULATED_SOURCE)
+    violations = check_file_against_head(repo, _REL_PATH)
+    assert any("where HEAD has none" in v for v in violations), violations
+
+
+def test_file_check_allows_retiring_a_pointer_and_staying_retired(tmp_path):
+    retire = _git_repo_with(tmp_path / "a", _POPULATED_SOURCE, _RETIRED_SOURCE)
+    assert check_file_against_head(retire, _REL_PATH) == []
+    stay = _git_repo_with(tmp_path / "b", _RETIRED_SOURCE, _RETIRED_SOURCE)
+    assert check_file_against_head(stay, _REL_PATH) == []
+
+
+def test_file_check_flags_bump_rows_that_outlive_the_pointer(tmp_path):
+    orphan = (
+        "RELEASED_INFERENCE_BEHAVIOR_HASH_COMPATIBILITY = {}\n"
+        "RELEASED_INFERENCE_POINTER_BUMPS = (('2026-10-21', '%s', '%s'),)\n"
+        % (_A, _B))
+    repo = _git_repo_with(tmp_path, _RETIRED_SOURCE, orphan)
+    violations = check_file_against_head(repo, _REL_PATH)
+    assert any("retires together" in v for v in violations), violations

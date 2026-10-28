@@ -105,6 +105,7 @@ from AIAEC._onnx_contract import (
 )
 
 from AIAEC.Align_ULCNet.inference import load_model
+from AIAEC.dataset_gen.linear_aec import LinearAecContract
 from AIAEC.training_common import (
     DEPLOYED_FAR_INPUT_MODE,
     checkpoint_far_input_mode,
@@ -548,6 +549,26 @@ def _schema(names: Iterable[str], values: Iterable[Tensor]) -> Dict[str, list]:
     }
 
 
+# Which spectrum feeds the graph's error input: the analysis seam of lib/aec
+# (formed_hop / beam.spectrum), the real selected linear residual. The
+# rendering base (aec_get_output_base) is never fed to the model.
+ERROR_INPUT_SEAM = 'analysis_formed'
+
+
+def _checkpoint_linear_aec(contract: Dict) -> LinearAecContract:
+    """The front-end contract the checkpoint was trained against.
+
+    Parsed through LinearAecContract.from_dict, so a retired or foreign version
+    is refused here as well, not only in load_model.
+    """
+    if 'linear_aec' not in contract:
+        raise ValueError(
+            'checkpoint contract has no linear_aec: the graph metadata must '
+            'record the front end the weights were trained against'
+        )
+    return LinearAecContract.from_dict(contract['linear_aec'])
+
+
 def _write_metadata(
     output_path: str,
     checkpoint: str,
@@ -564,6 +585,7 @@ def _write_metadata(
             f'{training_far_input_mode!r}, deployment requires '
             f'{deployed_far_input_mode!r}'
         )
+    linear_aec = _checkpoint_linear_aec(contract)
     metadata = {
         'model_family': 'Align_ULCNet',
         'boundary': 'stateless_one_frame_full_state',
@@ -589,6 +611,12 @@ def _write_metadata(
         'far_input_mode_c_value': far_input_mode_c_value(
             deployed_far_input_mode
         ),
+        # Front end the weights were trained on, copied from the checkpoint.
+        # The integrator compares linear_aec_contract_version against
+        # ULCNET_MODEL_IO_FRONTEND_CONTRACT before binding the graph.
+        'linear_aec_contract_version': linear_aec.version,
+        'aec_behavior_hash': linear_aec.aec_behavior_hash,
+        'error_input_seam': ERROR_INPUT_SEAM,
         'accelerator_persistent_state': False,
         'cpu_delta_state_update': False,
         'tensor_dtype': 'float32',

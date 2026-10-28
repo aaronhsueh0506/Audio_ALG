@@ -31,6 +31,18 @@ extern "C" {
  * Runtimes bind by name, so renaming a tensor is a contract change. */
 #define ULCNET_MODEL_IO_LAYOUT_VERSION 18u
 #define ULCNET_MODEL_IO_ALIGNMENT      16u
+
+/* Front end the weights are trained against: the checkpoint's
+ * linear_aec.version, written into the graph metadata (JSON / ONNX props) as
+ * linear_aec_contract_version by export_onnx.py. The layout version above
+ * describes only the tensor/state boundary and stays the same across
+ * retrained checkpoints; this string is what tells an old graph from a current
+ * one. The integrator compares the metadata value against it before
+ * ulcnet_accelerator_adapter_init and refuses a graph that differs. Its
+ * error input is the AEC analysis seam (formed_hop / beam.spectrum), the real
+ * selected linear residual, never the rendering base (aec_get_output_base);
+ * the metadata records this as error_input_seam = analysis_formed. */
+#define ULCNET_MODEL_IO_FRONTEND_CONTRACT "aiaec-linear-error-v4"
 #define ULCNET_MODEL_IO_MIN_D          2
 #define ULCNET_MODEL_IO_MAX_D          64
 

@@ -378,6 +378,7 @@ def test_calibration_deployment_mode_equals_the_ulcnet_exporter_literal():
     """
     from AIAEC.Align_ULCNet.export_onnx import _write_metadata
     from AIAEC.Align_ULCNet.model import AlignULCNet
+    from AIAEC.dataset_gen.linear_aec import make_linear_aec_contract
 
     import tempfile
 
@@ -396,7 +397,10 @@ def test_calibration_deployment_mode_equals_the_ulcnet_exporter_literal():
             outputs = wrapper(*inputs)
         metadata = _write_metadata(
             os.path.join(work, 'model.onnx'), checkpoint, model,
-            {'far_input_mode': 'raw_far'}, inputs, outputs,
+            {'far_input_mode': 'raw_far',
+             'linear_aec': make_linear_aec_contract(
+                 GRID.sample_rate).as_dict()},
+            inputs, outputs,
         )
     exported = metadata['far_input_mode']
     assert exported == DEPLOYED_FAR_INPUT_MODE

@@ -53,12 +53,25 @@ from .aec_behavior_hash import (  # noqa: E402
 )
 
 
-LINEAR_AEC_CONTRACT_VERSION = "aiaec-linear-error-v3"
+LINEAR_AEC_CONTRACT_VERSION = "aiaec-linear-error-v4"
 # The signal is get_formed_output(): the shadow/main-selected, crossfaded,
 # WOLA-formed residual, with RES/CNG disabled and independent of any
-# product-level output dynamics applied after the AEC chain. Compatibility
-# condition: `aec_behavior_hash` (normalized AST, comment/format insensitive);
-# `aec_commit`/`aec_source_hash` are provenance only.
+# product-level output dynamics applied after the AEC chain. It is the ANALYSIS
+# seam of lib/aec: always the real selected linear residual, never replaced by
+# the capture, and it pairs with the C `formed_hop` the board pipelines feed the
+# network. On a hop where lib/aec's rendering guard fires, the residual can carry
+# more energy than the capture; the guard protects the rendered audio, not this
+# signal. Compatibility condition: `aec_behavior_hash` (normalized AST,
+# comment/format insensitive); `aec_commit`/`aec_source_hash` are provenance only.
+
+# Contract versions refused by name, so the refusal says what to do instead of
+# reporting a bare version mismatch. There is no migration from any of them.
+RETIRED_CONTRACT_VERSIONS: Dict[str, str] = {
+    "aiaec-linear-error-v3":
+        "its linear_error was written by a front end that predates the "
+        "analysis-seam / rendering-base split of lib/aec, whose context-only "
+        "formed seam could carry the capture instead of the selected residual",
+}
 
 # The linear-AEC frontend is a frozen, versioned contract: its (frame_size,
 # hop_size) per sample rate is a pinned choice of this dataset, not meant to
@@ -290,6 +303,16 @@ class LinearAecContract:
                 f"linear_aec contract fields differ: missing={missing}, extra={extra}"
             )
         contract = cls(**value)
+        if contract.version in RETIRED_CONTRACT_VERSIONS:
+            raise ValueError(
+                f"linear_aec contract version={contract.version!r} is retired "
+                f"(this build writes {LINEAR_AEC_CONTRACT_VERSION!r}): "
+                f"{RETIRED_CONTRACT_VERSIONS[contract.version]}. There is no "
+                "migration. Recompute the corpus's linear_error channel "
+                "(AIAEC.dataset_gen.rematerialize_linear_aec, without "
+                "--resume), repack, and retrain any checkpoint trained on the "
+                "old data."
+            )
         if contract.version != LINEAR_AEC_CONTRACT_VERSION:
             raise ValueError(
                 f"linear_aec contract version={contract.version!r}, expected "
@@ -338,12 +361,12 @@ def make_linear_aec_config(
         "mode": AecMode.PBFDKF,
         "enable_res": False,
         "enable_cng": False,
-        # The AEC3 post chain has to run for AecState to advance, and the
-        # over-output guard on the formed seam reads its verdict. Without this
-        # the analyzer never updates and the guard sees a permanent "unusable",
-        # degrading to a bare energy comparison. This is also the mode the
-        # shipped C pipeline uses (enable_res=0 with the context seam on), so
-        # the training signal and the deployed one come off the same branch.
+        # The AEC3 post chain has to run for AecState (usable verdict, ERLE,
+        # error and echo PSDs) to advance on the real selected residual. The
+        # output guard only picks the rendering base and never touches the
+        # formed seam read below. This is also the mode the shipped C pipeline
+        # uses (enable_res=0 with the context seam on), so the training signal
+        # and the deployed one come off the same branch.
         "return_res_context": True,
         "enable_shadow": True,
         "enable_delay_est": True,
@@ -473,35 +496,24 @@ ACCEPTED_BEHAVIOR_HASH_MIGRATIONS: Dict[str, str] = {
     # Empty: no pair is admitted.
 }
 
-# A released 16-kHz Align-ULCNet checkpoint was trained on the frontend before
-# the causal-half TD-constraint correction, which moves ``linear_error`` and so
-# MUST NOT enter the table above. The separate gate below accepts that exact
-# one-way pair only in LinearAecEngine, warns that output can differ, and is
-# never called by materialization or packing.
-RELEASED_INFERENCE_BEHAVIOR_HASH_COMPATIBILITY: Dict[str, str] = {
-    # Inference-only pointer for the released checkpoint; every bump is logged
-    # in the guard table below.
-    "c1b1f5433fa244a2f7369938992bff95f00d1bdc394c4f21a5862f2dc547f786":
-        "9fa7a2dec85cef8f123cc4dd02e7eb3c5dc0c1b45d7ec0f32b766cf9cda245e5",
-}
+# Inference-only pointers: recorded-hash -> current-hash pairs for released
+# checkpoints that LinearAecEngine may load with a "may differ" warning. Empty:
+# the released 16-kHz Align-ULCNet checkpoint (recorded at c1b1f543...) used to
+# point at 9fa7a2de..., a frontend that differed only in the TD-constraint
+# window. The analysis/rendering split of lib/aec changes `linear_error` itself
+# and retires 9fa7a2de..., so that checkpoint is retired and is NOT re-pointed
+# at the current hash. A legacy front end is a build identity, not an entry of
+# this build: running it means checking out the lib/aec whose behaviour hash is
+# the recorded one (9fa7a2de... is lib/aec 115e10c). A new entry needs its own
+# evidence and its own refusal and warning tests.
+RELEASED_INFERENCE_BEHAVIOR_HASH_COMPATIBILITY: Dict[str, str] = {}
 
-# --- Staleness guard for the pointer above ----------------------------------
-# Every bump of the entry above appends one row (date, old_value, new_value)
-# here, with `old_value` copied from the preceding row's `new_value` (the first
-# from `git show HEAD:...`), so a bump cannot silently re-admit unvetted drift.
-# Values are literal 64-hex hashes. `test_released_pointer_bump_guard.py`
-# checks that rows chain, the last `new` equals the live entry, and a changed
-# entry carries a row whose `old` is git's HEAD value.
-RELEASED_INFERENCE_POINTER_BUMPS: Tuple[Tuple[str, str, str], ...] = (
-    ("2026-10-21",
-     "5fe64e46480c7e2a75c90718f1b64c09ca29f611d09713ea4ec2a9ef61c813f4",
-     "9fa7a2dec85cef8f123cc4dd02e7eb3c5dc0c1b45d7ec0f32b766cf9cda245e5"),
-)
+# Bump history of the table above, read by released_pointer_bump_guard.py: one
+# row (date, old_value, new_value) per bump while an entry exists, each `old`
+# copied from the previous row's `new`. Empty with the table; git has the rest.
+RELEASED_INFERENCE_POINTER_BUMPS: Tuple[Tuple[str, str, str], ...] = ()
 
-_RELEASED_INFERENCE_SAMPLE_RATES: Dict[str, frozenset] = {
-    "c1b1f5433fa244a2f7369938992bff95f00d1bdc394c4f21a5862f2dc547f786":
-        frozenset({16000}),
-}
+_RELEASED_INFERENCE_SAMPLE_RATES: Dict[str, frozenset] = {}
 
 # A migration pair can be frontend-equivalent at one sample rate and
 # intentionally different at another (e.g. a correction that is a no-op at 16
@@ -571,9 +583,13 @@ RETIRED_BEHAVIOR_HASHES = frozenset({
     "37ed5ad9b75ce42902361d8195fcf04a650b940744ec036a16c8736dec9d5061",
     "19dd4f90f482e15072d535964ac9816cdc21cae2c350b98de12a0e9ab561ff45",
     # The frontend before the causal-half TD-constraint window; its corpus is
-    # retired because the corrected window moves linear_error (the released
-    # 16-kHz checkpoint has a separate inference-only exception).
+    # retired because the corrected window moves linear_error. The released
+    # 16-kHz checkpoint recorded at this hash is retired too.
     "c1b1f5433fa244a2f7369938992bff95f00d1bdc394c4f21a5862f2dc547f786",
+    # The frontend before the analysis/rendering split of lib/aec: `linear_error`
+    # moves because the formed seam no longer carries the capture. Not a
+    # migration source; corpora are rematerialized, checkpoints retrained.
+    "9fa7a2dec85cef8f123cc4dd02e7eb3c5dc0c1b45d7ec0f32b766cf9cda245e5",
 })
 
 
@@ -633,9 +649,12 @@ def require_inference_linear_aec_contract(
     """Inference-only compatibility for an explicitly released checkpoint.
 
     Unlike :func:`require_linear_aec_contract`, this may admit a known
-    output-changing frontend transition. It is intentionally used only by the
-    live ``LinearAecEngine``; dataset generation, packing, rematerialization and
-    training retain the strict gate above and continue to reject the old hash.
+    output-changing frontend transition listed in
+    ``RELEASED_INFERENCE_BEHAVIOR_HASH_COMPATIBILITY``. That table is empty, so
+    today it is the strict gate: a checkpoint recorded under any retired
+    identity, the released pre-constraint one included, is refused. It is
+    intentionally used only by the live ``LinearAecEngine``; dataset
+    generation, packing, rematerialization and training never consult it.
     """
     got = LinearAecContract.from_dict(actual)
     want = LinearAecContract.from_dict(expected)
@@ -804,6 +823,7 @@ __all__ = [
     "RELEASED_INFERENCE_POINTER_BUMPS",
     "MIGRATED_SOURCE_PROVENANCE",
     "RETIRED_BEHAVIOR_HASHES",
+    "RETIRED_CONTRACT_VERSIONS",
     "BEHAVIOR_HASH_SCHEMA",
     "DATASET_DELAY_NUM_FILTERS",
     "DELAY_NUM_FILTERS_RANGE",

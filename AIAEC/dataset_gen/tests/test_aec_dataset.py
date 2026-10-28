@@ -450,6 +450,42 @@ def test_packed_dataset_rejects_legacy_four_channel_shard(tmp_path):
         PackedAecDataset(str(path), verbose=False)
 
 
+def _packed_shard(path, contract):
+    torch.save({
+        'stems': list(PACKED_STEM_ORDER),
+        'data': torch.zeros(1, len(PACKED_STEM_ORDER), 256),
+        'sr': 16000,
+        'meta': [{'sequence_id': 0, 'chunk_index': 0}],
+        'linear_aec': contract.as_dict(),
+        'linear_aec_contract_hash': contract.fingerprint(),
+    }, path)
+
+
+def test_packed_dataset_refuses_a_shard_of_the_previous_contract_version(tmp_path):
+    """Training reads the stored `linear_error` and never runs the frontend, so
+    the shard's recorded contract is the only thing that can stop a corpus
+    written before the analysis-seam / rendering-base split from being trained
+    on. The retired contract version is refused on load, with the rematerialize
+    instruction."""
+    legacy = dataclasses.replace(
+        make_linear_aec_contract(16000, frame_size=512),
+        version='aiaec-linear-error-v3')
+    path = tmp_path / 'shard_00000.pt'
+    _packed_shard(path, legacy)
+    with pytest.raises(ValueError, match='retired') as caught:
+        PackedAecDataset(str(path), verbose=False)
+    assert 'rematerialize_linear_aec' in str(caught.value)
+    assert '--resume' in str(caught.value)
+
+
+def test_packed_dataset_loads_a_shard_of_the_current_contract(tmp_path):
+    current = make_linear_aec_contract(16000, frame_size=512)
+    path = tmp_path / 'shard_00000.pt'
+    _packed_shard(path, current)
+    dataset = PackedAecDataset(str(path), verbose=False)
+    assert dataset.linear_aec_contract == current
+
+
 def test_four_channel_shard_is_loadable_with_mmap(tmp_path):
     contract = make_linear_aec_contract(16000, frame_size=512)
     data = torch.randn(2, len(PACKED_STEM_ORDER), 256)

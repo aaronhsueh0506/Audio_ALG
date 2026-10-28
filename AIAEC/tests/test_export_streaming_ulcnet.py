@@ -1,5 +1,6 @@
 """Explicit full-state export contract for streaming Align-ULCNet."""
 
+import json
 import os
 import re
 import shutil
@@ -45,6 +46,9 @@ from AIAEC.Align_ULCNet.export_onnx import (
 )
 from AIAEC.Align_ULCNet.model import AlignULCNet
 from AIAEC.aiaec_common import SignalGrid
+from AIAEC.Align_ULCNet import export_onnx
+from AIAEC.dataset_gen import linear_aec
+from AIAEC.dataset_gen.linear_aec import make_linear_aec_contract
 from AIAEC.training_common import FAR_INPUT_MODE_C_VALUES
 
 
@@ -54,6 +58,16 @@ GRID = SignalGrid(16000, 512, 512, 256)
 N_FREQS = GRID.n_freqs
 TA_BINS = 26
 D = 8
+
+
+def _checkpoint_contract(**extra):
+    """The part of a checkpoint contract the exporter reads."""
+    linear = make_linear_aec_contract(GRID.sample_rate)
+    return {
+        'linear_aec': linear.as_dict(),
+        'linear_aec_contract_hash': linear.fingerprint(),
+        **extra,
+    }
 
 
 def _complex_frame(generator, n_freqs=GRID.n_freqs):
@@ -272,6 +286,103 @@ def test_c_descriptor_constants_match_export_contract():
     assert float(match.group(1)) == COMPRESSION_EXPONENT
 
 
+def test_c_frontend_contract_equals_the_python_contract_version():
+    """The board-side constant is the string the checkpoints are stamped with."""
+    header = (
+        Path(__file__).resolve().parents[1]
+        / 'Align_ULCNet' / 'ulcnet_model_io.h'
+    ).read_text(encoding='utf-8')
+    match = re.search(
+        r'^#define\s+ULCNET_MODEL_IO_FRONTEND_CONTRACT\s+"([^"]+)"\s*$',
+        header,
+        flags=re.MULTILINE,
+    )
+    assert match is not None
+    assert match.group(1) == linear_aec.LINEAR_AEC_CONTRACT_VERSION
+
+
+def test_exported_metadata_carries_the_checkpoint_frontend(tmp_path):
+    onnx = pytest.importorskip('onnx')
+    model = AlignULCNet(GRID, max_delay_frames=4).eval()
+    contract = _checkpoint_contract()
+    checkpoint = tmp_path / 'ckpt.pth'
+    torch.save({'contract': contract, 'state_dict': model.state_dict()},
+               checkpoint)
+    path = tmp_path / 'frontend.onnx'
+    _wrapper, _inputs, metadata = export_graph(model, str(checkpoint), str(path))
+
+    expected = {
+        'linear_aec_contract_version': contract['linear_aec']['version'],
+        'aec_behavior_hash': contract['linear_aec']['aec_behavior_hash'],
+        'error_input_seam': 'analysis_formed',
+    }
+    assert expected['linear_aec_contract_version'] == (
+        linear_aec.LINEAR_AEC_CONTRACT_VERSION)
+    for key, value in expected.items():
+        assert metadata[key] == value
+    written = json.loads(path.with_suffix('.json').read_text(encoding='utf-8'))
+    props = {p.key: p.value for p in onnx.load(str(path)).metadata_props}
+    for key, value in expected.items():
+        assert written[key] == value
+        assert props[key] == value
+
+
+def test_metadata_frontend_is_copied_from_the_contract_not_hard_coded(tmp_path):
+    model = AlignULCNet(GRID, max_delay_frames=D).eval()
+    checkpoint = tmp_path / 'ckpt.pt'
+    checkpoint.write_bytes(b'not a real checkpoint, only hashed')
+    inputs = dummy_inputs(D, N_FREQS, TA_BINS)
+    outputs = AlignUlcnetStreamingExport(model).eval()(*inputs)
+
+    contract = _checkpoint_contract()
+    contract['linear_aec']['aec_behavior_hash'] = 'ab' * 32
+    metadata = _write_metadata(
+        str(tmp_path / 'patched.onnx'), str(checkpoint), model, contract,
+        inputs, outputs,
+    )
+    assert metadata['aec_behavior_hash'] == 'ab' * 32
+
+    # No recorded front end: nothing to stamp, so no graph.
+    absent = _checkpoint_contract()
+    del absent['linear_aec']
+    with pytest.raises(ValueError, match='linear_aec'):
+        _write_metadata(
+            str(tmp_path / 'absent.onnx'), str(checkpoint), model, absent,
+            inputs, outputs,
+        )
+
+    # A retired contract is refused at the metadata step too, so a graph is
+    # never written for it even when load_model was bypassed.
+    retired = _checkpoint_contract()
+    retired['linear_aec']['version'] = 'aiaec-linear-error-v3'
+    with pytest.raises(ValueError, match='retired'):
+        _write_metadata(
+            str(tmp_path / 'retired.onnx'), str(checkpoint), model, retired,
+            inputs, outputs,
+        )
+    assert not (tmp_path / 'retired.json').exists()
+
+
+def test_v3_checkpoint_still_fails_export_at_load_model(tmp_path):
+    model = AlignULCNet(GRID, max_delay_frames=D).eval()
+    contract = _checkpoint_contract(
+        model_name='Align_ULCNet', task=AlignULCNet.task,
+        sr=GRID.sample_rate, n_fft=GRID.n_fft, win_len=GRID.win_len,
+        hop_len=GRID.hop_len, loss_version='test',
+        ctor_max_delay_frames=D,
+    )
+    ok = tmp_path / 'v4.pth'
+    torch.save({'contract': contract, 'state_dict': model.state_dict()}, ok)
+    export_onnx.load_model(str(ok), 'cpu')
+
+    contract['linear_aec']['version'] = 'aiaec-linear-error-v3'
+    old = tmp_path / 'v3.pth'
+    torch.save({'contract': contract, 'state_dict': model.state_dict()}, old)
+    with pytest.raises(ValueError, match='retired'):
+        export_onnx.load_model(str(old), 'cpu')
+    assert not (tmp_path / 'v3.onnx').exists()
+
+
 def test_export_refuses_foreign_compression_exponent(tmp_path):
     model = AlignULCNet(
         GRID, max_delay_frames=D, compression_exponent=0.5
@@ -292,7 +403,7 @@ def test_metadata_separates_training_provenance_from_deployment(tmp_path):
 
     metadata = _write_metadata(
         str(tmp_path / 'model.onnx'), str(checkpoint), model,
-        {'far_input_mode': 'raw_far'}, inputs, outputs,
+        _checkpoint_contract(far_input_mode='raw_far'), inputs, outputs,
     )
     assert metadata['training_far_input_mode'] == 'raw_far'
     assert metadata['far_input_mode'] == 'raw_far'
@@ -306,8 +417,8 @@ def test_metadata_separates_training_provenance_from_deployment(tmp_path):
     # Checkpoints without the field keep the same raw-far training/deployment
     # contract.
     legacy = _write_metadata(
-        str(tmp_path / 'legacy.onnx'), str(checkpoint), model, {},
-        inputs, outputs,
+        str(tmp_path / 'legacy.onnx'), str(checkpoint), model,
+        _checkpoint_contract(), inputs, outputs,
     )
     assert legacy['training_far_input_mode'] == 'raw_far'
     assert legacy['far_input_mode'] == 'raw_far'
@@ -445,7 +556,8 @@ def test_exported_onnx_state_contract(tmp_path):
     depth = 4
     model = AlignULCNet(GRID, max_delay_frames=depth).eval()
     checkpoint = tmp_path / 'ckpt.pth'
-    torch.save({'contract': {}, 'state_dict': model.state_dict()}, checkpoint)
+    torch.save({'contract': _checkpoint_contract(),
+                'state_dict': model.state_dict()}, checkpoint)
     path = tmp_path / 'rank.onnx'
     export_graph(model, str(checkpoint), str(path))
 
@@ -500,7 +612,8 @@ def test_host_graph_ends_at_the_mask_conv(tmp_path):
     onnx = pytest.importorskip('onnx')
     model = AlignULCNet(GRID, max_delay_frames=4).eval()
     checkpoint = tmp_path / 'ckpt.pth'
-    torch.save({'contract': {}, 'state_dict': model.state_dict()}, checkpoint)
+    torch.save({'contract': _checkpoint_contract(),
+                'state_dict': model.state_dict()}, checkpoint)
     path = tmp_path / 'tail.onnx'
     export_graph(model, str(checkpoint), str(path))
 
@@ -527,7 +640,8 @@ def test_optimized_graph_has_no_conv_pad_op_and_replays_the_wrapper(tmp_path):
     torch.manual_seed(19)
     model = AlignULCNet(GRID, max_delay_frames=depth).eval()
     checkpoint = tmp_path / 'ckpt.pth'
-    torch.save({'contract': {}, 'state_dict': model.state_dict()}, checkpoint)
+    torch.save({'contract': _checkpoint_contract(),
+                'state_dict': model.state_dict()}, checkpoint)
     path = tmp_path / 'pads.onnx'
     wrapper, initial, _meta = export_graph(
         model, str(checkpoint), str(path))

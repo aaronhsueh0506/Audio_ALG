@@ -27,6 +27,11 @@ Two pure layers (no git, no filesystem) plus one git-backed wrapper:
 Only single-hop bumps are modelled: one commit adds exactly one row connecting
 HEAD's value to the working tree's.
 
+The dict may be EMPTY (every pointer retired, as it is now): then there is no
+live value, the bump table must be empty, and a pointer that appears where HEAD
+had none is reported by ``check_pointer_introduction`` instead of being waved
+through as "nothing to compare".
+
 Run standalone (exit 1 on failure):
 
     python3 -m AIAEC.dataset_gen.released_pointer_bump_guard [repo_root] [rel_path]
@@ -119,6 +124,26 @@ def check_bump_against_head(head_value: Optional[str], work_value: str,
     return []
 
 
+def check_pointer_introduction(head_value: Optional[str],
+                               work_value: Optional[str]) -> List[str]:
+    """Verifies a pointer is not (re)introduced where ``HEAD`` has none.
+
+    A retired pointer must not come back as a side effect of an unrelated edit:
+    the retirement tests, not this guard, decide whether a new entry is
+    admissible, so the introduction itself is reported until HEAD carries it.
+    Pure function: no git, no filesystem.
+    """
+    if head_value is None and work_value is not None:
+        return [
+            f"the working tree carries a released-inference pointer to "
+            f"{work_value!r} where HEAD has none. The table is retired on "
+            f"purpose; re-adding an entry needs its own evidence and its own "
+            f"refusal/warning tests (tests/test_linear_aec_behavior_migration.py) "
+            f"before this check is relaxed."
+        ]
+    return []
+
+
 def _extract_module_level_value(tree: ast.Module, name: str):
     """Returns the literal value assigned to module-level ``name``, or
     ``None`` if no such assignment exists. Handles both plain ``Assign`` and
@@ -137,17 +162,17 @@ def _extract_module_level_value(tree: ast.Module, name: str):
 
 def live_pointer_value_from_source(
         source: str, dict_name: str = DEFAULT_DICT_NAME) -> Optional[str]:
-    """The single value held by the ``dict_name`` dict in ``source``.
+    """The single value held by the ``dict_name`` dict in ``source``, or
+    ``None`` when the dict is absent or empty (no pointer).
 
-    Raises ``ValueError`` if the dict exists but does not hold exactly one
-    entry -- this guard models a single tracked checkpoint pointer, matching
+    Raises ``ValueError`` if the dict holds more than one entry -- this guard models a single tracked checkpoint pointer, matching
     the dict's own current shape; a second entry needs this function (and
     the guard's single-row-per-bump assumption) revisited, not silently
     picking one of several values.
     """
     tree = ast.parse(source)
     value = _extract_module_level_value(tree, dict_name)
-    if value is None:
+    if value is None or value == {}:
         return None
     if not isinstance(value, dict) or len(value) != 1:
         raise ValueError(
@@ -199,11 +224,18 @@ def check_file_against_head(
     violations: List[str] = []
     if work_live is not None:
         violations += check_chain(work_bumps, work_live)
+    elif work_bumps:
+        violations.append(
+            f"{table_name} has {len(work_bumps)} row(s) but {dict_name} holds "
+            f"no pointer; the table retires together with its entry")
 
     head_source = read_git_blob(repo_root, rel_path, rev)
-    if head_source is not None and work_live is not None:
+    if head_source is not None:
         head_live = live_pointer_value_from_source(head_source, dict_name)
-        violations += check_bump_against_head(head_live, work_live, work_bumps)
+        violations += check_pointer_introduction(head_live, work_live)
+        if work_live is not None:
+            violations += check_bump_against_head(
+                head_live, work_live, work_bumps)
 
     return violations
 

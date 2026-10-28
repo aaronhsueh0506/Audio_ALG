@@ -400,3 +400,60 @@ def test_a_corpus_from_the_retired_frontend_does_not_pack(tmp_path):
             input=root, config=CONFIG, output=shards,
             shard_clips=512, overwrite=False, dtype="float32"))
     assert not os.path.exists(shards) or not os.listdir(shards)
+
+
+# ── the frontend before the analysis-seam / rendering-base split ────────────
+
+# lib/aec 115e10c. Retired, not migrated: its `linear_error` carries the
+# capture on hops the new frontend publishes the real residual.
+PREVIOUS_FRONTEND_HASH = (
+    "9fa7a2dec85cef8f123cc4dd02e7eb3c5dc0c1b45d7ec0f32b766cf9cda245e5")
+
+
+def test_an_identity_ledger_from_the_previous_frontend_is_refused(tmp_path):
+    root = _corpus(str(tmp_path / "c"))
+    _identity_ledger(
+        root, _source_contract(UNCOVERED_COMMIT, "c" * 64,
+                               behavior=PREVIOUS_FRONTEND_HASH),
+        set(range(N_SEQ)))
+    with pytest.raises(ValueError) as caught:
+        _gate(root)
+    message = str(caught.value)
+    assert PREVIOUS_FRONTEND_HASH[:12] in message
+    assert "different linear_error" in message
+    assert "without --resume" in message
+
+
+def test_an_identity_ledger_of_the_previous_contract_version_is_refused(tmp_path):
+    """A ledger written under the retired contract version is refused by
+    version, naming the rematerialize instruction."""
+    root = _corpus(str(tmp_path / "c"))
+    legacy = dataclasses.replace(
+        _source_contract(UNCOVERED_COMMIT, "c" * 64,
+                         behavior=PREVIOUS_FRONTEND_HASH),
+        version="aiaec-linear-error-v3")
+    _identity_ledger(root, legacy, set(range(N_SEQ)))
+    with pytest.raises(ValueError) as caught:
+        _gate(root)
+    message = str(caught.value)
+    assert "aiaec-linear-error-v3" in message and "retired" in message
+    assert "rematerialize_linear_aec" in message and "--resume" in message
+
+
+def test_a_corpus_from_the_previous_frontend_does_not_pack(tmp_path):
+    """Packing is the training gate: shards stamped with this build's contract
+    over audio from the previous frontend would train a checkpoint on a stem
+    this build does not produce. Refused before any shard is written."""
+    root = _corpus(str(tmp_path / "c"))
+    shards = str(tmp_path / "shards")
+    R.rematerialize(argparse.Namespace(
+        input=root, config=CONFIG, resume=False, wav_encoding="auto", jobs=1))
+    previous = _source_contract(UNCOVERED_COMMIT, "c" * 64,
+                                behavior=PREVIOUS_FRONTEND_HASH)
+    _identity_ledger(root, previous, set(range(N_SEQ)))
+
+    with pytest.raises(ValueError, match="different linear_error"):
+        P.pack(argparse.Namespace(
+            input=root, config=CONFIG, output=shards,
+            shard_clips=512, overwrite=False, dtype="float32"))
+    assert not os.path.exists(shards) or not os.listdir(shards)

@@ -17,7 +17,14 @@
  * heap, no globals). The FftHandle and window table are caller-owned, shared by
  * all objects and must outlive them. Not included: the NPU graph and its states
  * (ulcnet_model_io), the AEC linear-error seam (aec_get_linear_context) and the
- * delay state machine (pipeline layer). */
+ * delay state machine (pipeline layer).
+ *
+ * Error-input domain: the "linear error" is the AEC analysis seam (AecResContext.formed_hop in the
+ * time domain), the signal Align-ULCNet is trained on (aiaec-linear-error-v4). It is never the
+ * rendering base of aec_get_output_base(), which does not pair with formed_hop on a hop where the
+ * AEC output guard fires. Nothing here applies that guard: the identity path and the fail-open path
+ * below return this residual as is, and on a guard hop (unusable estimate, residual louder than the
+ * capture) it can exceed the capture (aec.h, caveats for time-domain seam consumers). */
 
 #ifndef ULCNET_PROCESS_H
 #define ULCNET_PROCESS_H
@@ -67,7 +74,7 @@ void ulcnet_framing_config(AcStftConfig *cfg, FftHandle *fft,
  * frame. The accelerator is stateless: K/V rings, logit history and GRU hidden
  * are CPU-owned (ulcnet_model_io.h). reset runs on a delay change or pipeline
  * reset and clears all of them; it may be NULL. infer returns 0 on success; any
- * other value makes the pipeline fail open to the linear error.
+ * other value makes the pipeline fail open to the linear error (the analysis residual, unguarded).
  *
  * Full-write contract: a return of 0 requires infer to have written all
  * ULCNET_BINS entries of out_re and out_im. The pipelines NaN-fill them before
