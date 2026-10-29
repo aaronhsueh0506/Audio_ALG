@@ -29,11 +29,25 @@ graph path is <output>.onnx, override with --onnx):
         --frames 8192 --max-delay-frames 8 --format bin \\
         --output calib/align_ulcnet_d8
 
+A pre-made --primary-dir must have been produced by this build's front end
+(aiaec-linear-error-v4: the AEC analysis seam) and carry a stamp, either a
+linear_error.contract.json in the directory or a linear_error.done.json
+corpus ledger (with its contract recorded) next to it. The stamp has to equal
+the checkpoint's own linear_aec contract; a retired version or behaviour
+hash, a different contract, or no stamp at all is refused before anything is
+written. --allow-unstamped-linear-error waives only the "no stamp" case and
+the report records the override. The report and manifest carry the stamp
+(linear_aec_contract_version, aec_behavior_hash, linear_aec_contract_hash,
+error_input_seam, linear_error_stamp), and PTQ/calib_analyze.py refuses an
+Align-ULCNet artifact whose stamp is missing, from another contract version,
+or retired.
+
 Calibration straight from RAW microphone recordings: add --primary-is-mic
 and point --primary-dir at the mic WAVs. The checkpoint-matched frozen
 PBFDKF derives the linear-error stems in-process and persists them beside
-the artifact (<output>_linear_error/); the manifest records
-primary_source=raw_mic_via_frozen_pbfdkf:
+the artifact (<output>_linear_error/, with its linear_error.contract.json);
+the manifest records primary_source=raw_mic_via_frozen_pbfdkf. This is the
+self-stamping route:
     python3 inference.py calib --checkpoint checkpoint.pth \\
         --primary-dir /path/to/raw_mic --far-dir /path/to/raw_far \\
         --primary-is-mic --frames 8192 --max-delay-frames 8 --format bin \\
@@ -56,7 +70,8 @@ checkpoint's own contract, and inference refuses a missing or drifted AEC
 contract. ``--input-is-linear-error`` is an evaluation-only bypass for
 published demos that already provide KF residual Z; it does not make an
 external KF equivalent to the frozen PBFDKF used to train this repository's
-checkpoint.
+checkpoint. It also checks no stamp on the supplied WAV (the checkpoint's own
+contract is still validated, retired behaviour hashes included).
 """
 
 from __future__ import annotations

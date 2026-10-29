@@ -91,6 +91,7 @@ from AIAEC.dataset_gen import (  # noqa: E402
 from AIAEC.dataset_gen.linear_aec import (  # noqa: E402
     DATASET_DELAY_NUM_FILTERS,
     LinearAecContract,
+    RETIRED_BEHAVIOR_HASHES,
     check_delay_num_filters,
     engine_delay_num_filters,
     make_linear_aec_config,
@@ -118,6 +119,7 @@ __all__ = [
     'require_checkpoint_contract',
     'require_checkpoint_model_identity',
     'require_checkpoint_linear_aec',
+    'require_not_retired_behavior',
     'scan_non_finite',
     'NonFiniteTraining',
     'GradNormLog',
@@ -516,6 +518,25 @@ def require_checkpoint_model_identity(contract: Dict, model_name: str) -> None:
         )
 
 
+def require_not_retired_behavior(linear: LinearAecContract, context: str) -> None:
+    """Refuse a front end whose AEC behaviour hash is retired.
+
+    ``LinearAecContract.from_dict`` checks only the contract version string, so
+    a checkpoint stamped with the current version but recorded under a retired
+    behaviour hash (a ``linear_error`` that this build no longer reproduces)
+    would otherwise reach export and calibration, which build no AEC engine.
+    """
+    if linear.aec_behavior_hash in RETIRED_BEHAVIOR_HASHES:
+        raise ValueError(
+            f"{context} linear_aec was trained against AEC behaviour "
+            f"{linear.aec_behavior_hash}, which is retired because it "
+            "produced a different linear_error from this build "
+            f"({linear.version!r}). It must not be exported, calibrated or "
+            "run. Regenerate the corpus's linear_error channel, repack and "
+            "retrain."
+        )
+
+
 def require_checkpoint_linear_aec(contract: Dict, grid) -> Dict:
     """Validate and return the materialized PBFDKF contract for inference."""
     if 'linear_aec' not in contract:
@@ -523,6 +544,7 @@ def require_checkpoint_linear_aec(contract: Dict, grid) -> Dict:
     if 'linear_aec_contract_hash' not in contract:
         raise ValueError("checkpoint has no linear_aec_contract_hash")
     linear = LinearAecContract.from_dict(contract['linear_aec'])
+    require_not_retired_behavior(linear, 'checkpoint')
     if contract['linear_aec_contract_hash'] != linear.fingerprint():
         raise ValueError(
             "checkpoint linear_aec_contract_hash does not match linear_aec"

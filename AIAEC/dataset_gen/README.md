@@ -659,6 +659,23 @@ hash of the build that wrote the data).
   entry of this one;
 - `ACCEPTED_BEHAVIOR_HASH_MIGRATIONS` stays empty.
 
+**Deployment gate.** The checks above refuse old data and checkpoints in
+Python; they do not reach the C lane or the board. The C model I/O descriptor
+checks tensor shapes only, so a graph trained on another front end (v3, another
+behaviour hash, another `filter_length`) with the same tensors passes it.
+`AIAEC/tests/test_deployed_frontend_contract.py` (run by `make -C AIAEC test`)
+closes that gap with `Align_ULCNet/frontend_gate.py`: it compiles the deployed
+mono lane (`pipelines/ulcnet/mono_alignulcnet/main.c` `derive_lane`, not a copy)
+on both grids, compares every `LinearAecContract` field plus partitions,
+saturation, delay bank and rate and live observer with the contract, and checks
+that an exported graph's JSON sidecar carries the compiled
+`ULCNET_MODEL_IO_FRONTEND_CONTRACT`, the live `aec_behavior_hash` and the
+`onnx_sha256` of the graph file. The one difference it accepts is the lane's
+inherited `enable_cng = 1`, only on a LINEAR_ONLY lane and only because the test
+measures `formed_hop` byte-identical with CNG off. Run it before generating or
+training on a large corpus. The board sample outside this repository builds its
+own lane and is covered only while its `derive_lane` is the example's.
+
 **What the owner does.** The stored `linear_error` is the only thing that changed,
 so the WAVs of an existing corpus need no re-render (a corpus that needs the
 `[acoustic_tails]` mixture is generated afresh instead):

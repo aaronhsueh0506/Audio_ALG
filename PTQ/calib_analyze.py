@@ -30,7 +30,8 @@ segments when the state resets (all-zero initial state) reveal them.
 Selection caveats: this is a statistic over the recorded INPUT tensors, not
 over the activations inside the graph; frames are streaming snapshots, so a
 pruned set keeps each frame's own recorded state but is no longer one
-continuous stream.  Models that need one contiguous stream are refused.
+continuous stream.  Models that need one contiguous stream are refused, and so
+is an Align-ULCNet artifact whose AEC front-end stamp is missing or retired.
 """
 
 from __future__ import annotations
@@ -100,6 +101,42 @@ def _npz_report(path):
     return legacy if legacy.get('artifact_format') == 'numpy_npz' else {}
 
 
+def require_current_frontend(report, path):
+    """Refuse an Align-ULCNet artifact captured behind another AEC front end.
+
+    The graph inputs of an Align-ULCNet artifact are the unified AEC's analysis
+    seam, so frames recorded behind a retired AEC build hold other statistics
+    and must not drive range selection. ``inference.py calib`` stamps
+    ``linear_aec_contract_version`` and ``aec_behavior_hash`` into the report.
+    Other model families carry no AEC stamp and are not looked at. The AEC
+    modules load only here, which keeps the tool light for DFN / AINR.
+    """
+    if report.get('model_family') != 'Align_ULCNet':
+        return
+    root = os.path.dirname(_HERE)
+    if root not in sys.path:
+        sys.path.insert(0, root)
+    from AIAEC.dataset_gen.linear_aec import (
+        LINEAR_AEC_CONTRACT_VERSION,
+        RETIRED_BEHAVIOR_HASHES,
+    )
+    version = report.get('linear_aec_contract_version')
+    behavior_hash = report.get('aec_behavior_hash')
+    if not version or not behavior_hash:
+        problem = ('carries no AEC front-end stamp (linear_aec_contract_version'
+                   ' / aec_behavior_hash)')
+    elif version != LINEAR_AEC_CONTRACT_VERSION:
+        problem = ('was captured with front-end contract %r, this build uses '
+                   '%r' % (version, LINEAR_AEC_CONTRACT_VERSION))
+    elif behavior_hash in RETIRED_BEHAVIOR_HASHES:
+        problem = 'was captured with retired AEC behaviour hash %s' % (
+            behavior_hash)
+    else:
+        return
+    raise ValueError('%s %s; regenerate it with inference.py calib' % (
+        path, problem))
+
+
 def load_artifact(path):
     path = os.path.abspath(path)
     if os.path.isdir(path):
@@ -107,6 +144,7 @@ def load_artifact(path):
         if 'binary_tensors' not in report:
             raise ValueError('%s has no manifest.json with binary_tensors'
                              % path)
+        require_current_frontend(report, path)
         frames = int(report['frames'])
         width = max(4, len(str(frames - 1)))
         arrays = {}
@@ -127,9 +165,11 @@ def load_artifact(path):
             arrays[name] = out
         return Artifact(path, 'bin', arrays, report)
     if path.endswith('.npz') and os.path.isfile(path):
+        report = _npz_report(path)
+        require_current_frontend(report, path)
         with np.load(path) as data:
             arrays = {name: data[name] for name in data.files}
-        return Artifact(path, 'npz', arrays, _npz_report(path))
+        return Artifact(path, 'npz', arrays, report)
     raise ValueError('expected a .npz file or a BIN directory: %s' % path)
 
 
@@ -742,6 +782,7 @@ def keep_indices(art, spec, analysis_segments=None):
 
 
 def apply_selection(art, keep, output, fmt):
+    require_current_frontend(art.report, art.path)
     if art.contiguous:
         raise SystemExit(
             '%s needs one uninterrupted stream; its cumulative state ranges '

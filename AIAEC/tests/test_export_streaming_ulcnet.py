@@ -383,6 +383,67 @@ def test_v3_checkpoint_still_fails_export_at_load_model(tmp_path):
     assert not (tmp_path / 'v3.onnx').exists()
 
 
+RETIRED_HASH = (
+    '9fa7a2dec85cef8f123cc4dd02e7eb3c5dc0c1b45d7ec0f32b766cf9cda245e5')
+
+
+def _retired_hash_contract(**extra):
+    """Current contract version, retired behaviour hash, valid fingerprint."""
+    contract = _checkpoint_contract(**extra)
+    contract['linear_aec']['aec_behavior_hash'] = RETIRED_HASH
+    contract['linear_aec_contract_hash'] = (
+        linear_aec.LinearAecContract.from_dict(
+            contract['linear_aec']).fingerprint())
+    return contract
+
+
+def test_retired_behavior_hash_writes_no_graph_on_any_export_path(
+        tmp_path, monkeypatch):
+    """The version string alone must not vouch for a checkpoint.
+
+    LinearAecContract.from_dict checks only the version, so a v4-stamped
+    checkpoint recorded under a retired behaviour hash would otherwise export
+    (the exporter builds no AEC engine).
+    """
+    model = AlignULCNet(GRID, max_delay_frames=D).eval()
+    contract = _retired_hash_contract(
+        model_name='Align_ULCNet', task=AlignULCNet.task,
+        sr=GRID.sample_rate, n_fft=GRID.n_fft, win_len=GRID.win_len,
+        hop_len=GRID.hop_len, loss_version='test',
+        ctor_max_delay_frames=D,
+    )
+    checkpoint = tmp_path / 'retired.pth'
+    torch.save({'contract': contract, 'state_dict': model.state_dict()},
+               checkpoint)
+    assert contract['linear_aec']['version'] == (
+        linear_aec.LINEAR_AEC_CONTRACT_VERSION)
+    out = tmp_path / 'out'
+    out.mkdir()
+
+    with pytest.raises(ValueError, match='which is retired because it produced a different linear_error'):
+        export_onnx.load_model(str(checkpoint), 'cpu')
+
+    monkeypatch.setattr(sys, 'argv', [
+        'export_onnx.py', '--checkpoint', str(checkpoint),
+        '--output', str(out / 'graph.onnx'),
+    ])
+    with pytest.raises(ValueError, match='retired'):
+        export_onnx.main()
+
+    # Direct callers that bypass load_model are stopped before the graph is
+    # written, not after torch.onnx.export has put one on disk.
+    with pytest.raises(ValueError, match='retired'):
+        export_graph(model, str(checkpoint), str(out / 'direct.onnx'))
+
+    inputs = dummy_inputs(D, N_FREQS, TA_BINS)
+    outputs = AlignUlcnetStreamingExport(model).eval()(*inputs)
+    with pytest.raises(ValueError, match='retired'):
+        _write_metadata(str(out / 'meta.onnx'), str(checkpoint), model,
+                        contract, inputs, outputs)
+
+    assert list(out.iterdir()) == []
+
+
 def test_export_refuses_foreign_compression_exponent(tmp_path):
     model = AlignULCNet(
         GRID, max_delay_frames=D, compression_exponent=0.5

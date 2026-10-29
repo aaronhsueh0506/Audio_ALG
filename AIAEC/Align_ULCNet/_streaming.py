@@ -107,7 +107,10 @@ def main(args, load_model_fn=None):
                 }))
 
     # Hop-sized chunks: PBFDKF and the neural frontend advance with the same
-    # cadence; LinearAecEngine keeps its state across calls.
+    # cadence; LinearAecEngine keeps its state across calls. The model state is
+    # never reset here: the C stage resets it and primes an identity frame on
+    # alignment events, Python has no event accessor (README, "C/Python
+    # inference parity"; function map D-44).
     for start in range(0, length, grid.hop_len):
         stop = min(start + grid.hop_len, length)
         primary_hop = primary[:, start:stop]

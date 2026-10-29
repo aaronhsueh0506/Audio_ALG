@@ -110,6 +110,7 @@ from AIAEC.training_common import (
     DEPLOYED_FAR_INPUT_MODE,
     checkpoint_far_input_mode,
     far_input_mode_c_value,
+    require_not_retired_behavior,
 )
 
 
@@ -559,14 +560,17 @@ def _checkpoint_linear_aec(contract: Dict) -> LinearAecContract:
     """The front-end contract the checkpoint was trained against.
 
     Parsed through LinearAecContract.from_dict, so a retired or foreign version
-    is refused here as well, not only in load_model.
+    is refused here as well, not only in load_model; a retired behaviour hash
+    under the current version is refused too (from_dict does not look at it).
     """
     if 'linear_aec' not in contract:
         raise ValueError(
             'checkpoint contract has no linear_aec: the graph metadata must '
             'record the front end the weights were trained against'
         )
-    return LinearAecContract.from_dict(contract['linear_aec'])
+    linear_aec = LinearAecContract.from_dict(contract['linear_aec'])
+    require_not_retired_behavior(linear_aec, 'checkpoint contract')
+    return linear_aec
 
 
 def _write_metadata(
@@ -612,8 +616,10 @@ def _write_metadata(
             deployed_far_input_mode
         ),
         # Front end the weights were trained on, copied from the checkpoint.
-        # The integrator compares linear_aec_contract_version against
-        # ULCNET_MODEL_IO_FRONTEND_CONTRACT before binding the graph.
+        # The integrator may compare or log linear_aec_contract_version against
+        # ULCNET_MODEL_IO_FRONTEND_CONTRACT; C init never refuses by front end.
+        # Enforcement is on the Python side (export, inference, calibration)
+        # and in the committed tests.
         'linear_aec_contract_version': linear_aec.version,
         'aec_behavior_hash': linear_aec.aec_behavior_hash,
         'error_input_seam': ERROR_INPUT_SEAM,
@@ -630,11 +636,15 @@ def _write_metadata(
         'c_frontend_postprocess': 'Align_ULCNet/ulcnet_process.c',
         'c_model_io_state': 'Align_ULCNet/ulcnet_model_io.c',
     }
+    _write_sidecar(output_path, metadata)
+    return metadata
+
+
+def _write_sidecar(output_path: str, metadata: Dict) -> None:
     json_path = os.path.splitext(output_path)[0] + '.json'
     with open(json_path, 'w', encoding='utf-8') as stream:
         json.dump(metadata, stream, indent=2, sort_keys=True)
         stream.write('\n')
-    return metadata
 
 
 def _set_onnx_metadata(graph, metadata: Dict) -> None:
@@ -694,6 +704,12 @@ def export_graph(model, checkpoint_path, output_path, opset=17,
             'exponent would deploy silently wrong'
             % (float(model.compression_exponent), COMPRESSION_EXPONENT)
         )
+    checkpoint_data = torch.load(
+        checkpoint_path, map_location='cpu', weights_only=False
+    )
+    # Refused before anything is written: the metadata step below would also
+    # refuse, but only after torch.onnx.export has put a graph on disk.
+    _checkpoint_linear_aec(checkpoint_data['contract'])
     wrapper = AlignUlcnetStreamingExport(model).eval()
     inputs = dummy_inputs(
         wrapper.delay_depth, wrapper.n_freqs, wrapper.ta_bins)
@@ -718,9 +734,6 @@ def export_graph(model, checkpoint_path, output_path, opset=17,
     graph = onnx.shape_inference.infer_shapes(onnx.load(output_path))
     onnx.checker.check_model(graph)
     validate_nctf_no_temporal_padding(graph, require_static=verify)
-    checkpoint_data = torch.load(
-        checkpoint_path, map_location='cpu', weights_only=False
-    )
     metadata = _write_metadata(
         output_path,
         checkpoint_path,
@@ -736,6 +749,12 @@ def export_graph(model, checkpoint_path, output_path, opset=17,
         graph, STATE_NAMES, STATE_OUTPUT_NAMES,
         window_drops=metadata['state_window_drop'])
     onnx.save(graph, output_path)
+    # Identity of the deployed graph bytes, for the deployment gate
+    # (frontend_gate.py). It cannot be one of the graph's own props (writing it
+    # would change the bytes), so only the JSON sidecar carries it, written after
+    # the final save.
+    metadata['onnx_sha256'] = file_sha256(output_path)
+    _write_sidecar(output_path, metadata)
 
     if verify:
         worst = _verify_onnx(output_path, wrapper, inputs)

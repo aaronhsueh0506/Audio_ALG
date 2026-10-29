@@ -4,6 +4,10 @@
 linear-AEC error for RES+NR models.  ``--far-dir`` must have identical relative
 WAV paths.  Inputs are resampled and transformed with the same project helpers
 as inference; no random tensors or zero-only recurrent history are used.
+
+Nothing here checks where linear-error WAVs came from. The Align_ULCNet
+calibration command does that before it reads them
+(``_streaming_calibration.linear_error_provenance``).
 """
 
 from __future__ import annotations

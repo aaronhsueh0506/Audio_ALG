@@ -6,6 +6,8 @@ noise measured on this fixture (pure GEMM-batching noise from running the GRUs
 stepwise).
 """
 
+import sys
+
 import pytest
 import torch
 
@@ -251,6 +253,83 @@ def test_load_model_far_input_mode_default_present_and_rejected(
     torch.save(ckpt, unknown_path)
     with pytest.raises(ValueError, match='far_input_mode'):
         load_model(unknown_path, 'cpu')
+
+
+RETIRED_HASH = (
+    '9fa7a2dec85cef8f123cc4dd02e7eb3c5dc0c1b45d7ec0f32b766cf9cda245e5')
+
+
+def _write_retired_hash_checkpoint(path, model):
+    """Current contract version, retired behaviour hash, consistent fingerprint.
+
+    This is the one shape LinearAecContract.from_dict cannot tell from a good
+    checkpoint: only the behaviour hash is old.
+    """
+    from AIAEC.dataset_gen.linear_aec import LinearAecContract
+
+    _write_synthetic_checkpoint(path, model)
+    ckpt = torch.load(path, map_location='cpu', weights_only=False)
+    linear = dict(ckpt['contract']['linear_aec'],
+                  aec_behavior_hash=RETIRED_HASH)
+    ckpt['contract']['linear_aec'] = linear
+    ckpt['contract']['linear_aec_contract_hash'] = (
+        LinearAecContract.from_dict(linear).fingerprint())
+    torch.save(ckpt, path)
+
+
+def test_retired_behavior_hash_is_refused_by_load_model(model, tmp_path):
+    from AIAEC.Align_ULCNet.inference import load_model
+
+    path = str(tmp_path / 'retired.pth')
+    _write_retired_hash_checkpoint(path, model)
+    with pytest.raises(ValueError, match='which is retired because it produced a different linear_error'):
+        load_model(path, 'cpu')
+
+
+def test_retired_behavior_hash_is_refused_by_inference_linear_error_mode(
+        model, tmp_path):
+    from AIAEC.Align_ULCNet import inference as inference_cli
+
+    path = str(tmp_path / 'retired.pth')
+    _write_retired_hash_checkpoint(path, model)
+    mic_path, far_path, _ = _write_delayed_scene(tmp_path)
+    out_path = tmp_path / 'out.wav'
+    args = inference_cli.build_parser().parse_args([
+        path, mic_path, far_path, str(out_path), '--device', 'cpu',
+        '--input-is-linear-error',
+    ])
+    with pytest.raises(ValueError, match='which is retired because it produced a different linear_error'):
+        inference_cli.main(args)
+    assert not out_path.exists()
+
+
+def test_retired_behavior_hash_is_refused_by_default_calibration(
+        model, tmp_path, monkeypatch):
+    """`inference.py calib` without --primary-is-mic builds no AEC engine."""
+    pytest.importorskip('onnx')
+    import soundfile as sf
+    from AIAEC import _streaming_calibration as calibration
+
+    path = str(tmp_path / 'retired.pth')
+    _write_retired_hash_checkpoint(path, model)
+    primary_dir = tmp_path / 'primary'
+    far_dir = tmp_path / 'far'
+    primary_dir.mkdir()
+    far_dir.mkdir()
+    wave = (0.1 * torch.randn(8192)).numpy()
+    for directory in (primary_dir, far_dir):
+        sf.write(directory / 'a.wav', wave, GRID.sample_rate,
+                 subtype='FLOAT')
+    out_dir = tmp_path / 'calib'
+    out_dir.mkdir()
+    monkeypatch.setattr(sys, 'argv', [
+        'inference.py', '--checkpoint', path,
+        '--primary-dir', str(primary_dir), '--far-dir', str(far_dir),
+        '--output', str(out_dir / 'calibration.npz'), '--frames', '4',
+    ])
+    with pytest.raises(ValueError, match='which is retired because it produced a different linear_error'):
+        calibration.main('Align_ULCNet')
+    assert list(out_dir.iterdir()) == []
 
 
 def test_load_model_max_delay_override(model, tmp_path, capsys):

@@ -23,7 +23,11 @@ from AIAEC._streaming_calibration import (
     input_range_report,
 )
 from AIAEC._streaming_export import state_precision_policy
-from calibration_io import calibration_report_path, write_calibration_artifact
+from calibration_io import (
+    calibration_report_path,
+    sibling_onnx_path,
+    write_calibration_artifact,
+)
 
 
 GRID = SignalGrid(16000, 512, 512, 256)
@@ -47,7 +51,29 @@ def _write_ulcnet_checkpoint(path, model):
     torch.save({'contract': contract, 'state_dict': model.state_dict()}, path)
 
 
-def _write_pair(root, seconds=0.75, seed=5):
+def _write_stamp(directory, contract=None):
+    """A ``linear_error.contract.json`` for ``directory``, written by hand.
+
+    Spelled out here rather than through the recorder's writer, so the gate is
+    tested against the documented file and not against its own producer.
+    ``contract`` may be a retired or foreign ``LinearAecContract``.
+    """
+    from AIAEC.dataset_gen import make_linear_aec_contract
+
+    contract = contract or make_linear_aec_contract(GRID.sample_rate)
+    sidecar = {
+        'schema': 'aiaec-linear-error-stems-v1',
+        'linear_aec_contract_version': contract.version,
+        'aec_behavior_hash': contract.aec_behavior_hash,
+        'linear_aec_contract_hash': contract.fingerprint(),
+        'error_input_seam': 'analysis_formed',
+        'sample_rate': contract.sample_rate,
+        'linear_aec': contract.as_dict(),
+    }
+    (directory / 'linear_error.contract.json').write_text(json.dumps(sidecar))
+
+
+def _write_pair(root, seconds=0.75, seed=5, stamp=True):
     generator = torch.Generator().manual_seed(seed)
     samples = int(seconds * GRID.sample_rate)
     primary_dir = root / 'primary'
@@ -59,6 +85,8 @@ def _write_pair(root, seconds=0.75, seed=5):
              GRID.sample_rate, subtype='FLOAT')
     sf.write(far_dir / 'a.wav', wave.roll(64).numpy(),
              GRID.sample_rate, subtype='FLOAT')
+    if stamp:
+        _write_stamp(primary_dir)
     return primary_dir, far_dir
 
 
@@ -162,6 +190,53 @@ def test_calibration_report_records_both_far_seams(ulcnet_pair):
     assert capture_report['deployment_far_input_mode'] == graph_report[
         'far_input_mode'
     ]
+
+
+@pytest.mark.parametrize('artifact_format', ['npz', 'bin'])
+def test_calibration_report_stamps_the_checkpoint_front_end(
+        tmp_path, artifact_format):
+    """The report names the linear-AEC front end of the error tensors.
+
+    The ranges describe a linear error produced by one specific front end; a
+    report without that identity cannot be told apart from one recorded on a
+    retired corpus. The stamp must equal the checkpoint's own contract, in the
+    NPZ sidecar and in the binary manifest alike.
+    """
+    from AIAEC import _streaming_calibration as calibration
+
+    torch.manual_seed(59)
+    model = AlignULCNet(GRID, max_delay_frames=DEPTH).eval()
+    checkpoint = tmp_path / 'ckpt.pth'
+    _write_ulcnet_checkpoint(str(checkpoint), model)
+    primary_dir, far_dir = _write_pair(tmp_path)
+    capture = tmp_path / ('stamp.npz' if artifact_format == 'npz' else 'stamp')
+    with _argv('inference.py',
+               '--checkpoint', str(checkpoint),
+               '--primary-dir', str(primary_dir),
+               '--far-dir', str(far_dir),
+               '--output', str(capture),
+               '--frames', '8'):
+        calibration.main('Align_ULCNet')
+
+    with open(calibration_report_path(capture, artifact_format)) as stream:
+        report = json.load(stream)
+    contract = torch.load(str(checkpoint), weights_only=False)['contract']
+    linear = contract['linear_aec']
+    assert report['linear_aec_contract_version'] == linear['version']
+    assert report['aec_behavior_hash'] == linear['aec_behavior_hash']
+    assert report['linear_aec_contract_hash'] == contract[
+        'linear_aec_contract_hash']
+    assert report['error_input_seam'] == 'analysis_formed'
+    # Not vacuous: the identity is the live build's, not an empty string.
+    assert report['linear_aec_contract_version'].startswith('aiaec-linear-error-')
+    assert len(report['aec_behavior_hash']) == 64
+    # The graph written beside it is the one the stamp is paired with.
+    with open(os.path.splitext(sibling_onnx_path(capture))[0]
+              + '.json') as stream:
+        graph = json.load(stream)
+    for key in ('linear_aec_contract_version', 'aec_behavior_hash',
+                'error_input_seam'):
+        assert report[key] == graph[key], key
 
 
 def test_unrestricted_tensors_keep_their_recorded_ranges(ulcnet_pair):
@@ -285,3 +360,174 @@ def test_primary_is_mic_derives_and_persists_linear_error(tmp_path):
     import numpy as np
     assert float(np.sqrt((error ** 2).mean())) < float(
         np.sqrt((mic ** 2).mean()))
+
+    # The derived directory describes itself: its sidecar is the checkpoint's
+    # own contract, so the stems can be reused through --primary-dir and
+    # checked against a checkpoint without trusting the directory name.
+    from AIAEC.dataset_gen.linear_aec import LinearAecContract
+    from AIAEC.Align_ULCNet.export_onnx import ERROR_INPUT_SEAM
+
+    sidecar = json.loads((work / 'rawmic_calibration_linear_error'
+                          / 'linear_error.contract.json').read_text())
+    recorded = torch.load(str(checkpoint), map_location='cpu',
+                          weights_only=False)['contract']
+    assert sidecar['linear_aec'] == recorded['linear_aec']
+    assert (sidecar['linear_aec_contract_hash']
+            == recorded['linear_aec_contract_hash']
+            == LinearAecContract.from_dict(sidecar['linear_aec']).fingerprint())
+    assert sidecar['linear_aec_contract_version'] == recorded['linear_aec']['version']
+    assert sidecar['aec_behavior_hash'] == recorded['linear_aec']['aec_behavior_hash']
+    assert sidecar['error_input_seam'] == ERROR_INPUT_SEAM
+    assert sidecar['sample_rate'] == GRID.sample_rate
+
+    # Reuse: the derived directory is itself a valid --primary-dir for a
+    # second run (this is the path the provenance gate must keep open).
+    reuse = work / 'reuse_calibration'
+    with _argv('inference.py',
+               '--checkpoint', str(checkpoint),
+               '--primary-dir', str(work / 'rawmic_calibration_linear_error'),
+               '--far-dir', str(far_dir),
+               '--output', str(reuse),
+               '--frames', '8'):
+        calibration.main('Align_ULCNet')
+    second = json.loads((reuse / 'manifest.json').read_text())
+    assert second['primary_source'] == 'materialized_primary_wavs'
+    assert second['linear_aec_contract_hash'] == sidecar['linear_aec_contract_hash']
+
+
+# ---- provenance of pre-made linear-error stems ------------------------------
+
+RETIRED_HASH = (
+    '9fa7a2dec85cef8f123cc4dd02e7eb3c5dc0c1b45d7ec0f32b766cf9cda245e5')
+
+
+def _calibrate_primary(tmp_path, primary_dir, far_dir, *extra):
+    """Run ``inference.py calib`` on pre-made stems; return the output dir."""
+    from AIAEC import _streaming_calibration as calibration
+
+    torch.manual_seed(59)
+    model = AlignULCNet(GRID, max_delay_frames=DEPTH).eval()
+    checkpoint = tmp_path / 'ckpt.pth'
+    _write_ulcnet_checkpoint(str(checkpoint), model)
+    out_dir = tmp_path / 'out'
+    out_dir.mkdir()
+    with _argv('inference.py',
+               '--checkpoint', str(checkpoint),
+               '--primary-dir', str(primary_dir),
+               '--far-dir', str(far_dir),
+               '--output', str(out_dir / 'cal.npz'),
+               '--frames', '8', *extra):
+        calibration.main('Align_ULCNet')
+    return out_dir
+
+
+def _foreign_contracts():
+    """Stamps the checkpoint (current build) must not accept, with the text
+    each refusal has to carry."""
+    import dataclasses
+
+    from AIAEC.dataset_gen import make_linear_aec_contract
+
+    current = make_linear_aec_contract(GRID.sample_rate)
+    return {
+        'v3_version': (dataclasses.replace(
+            current, version='aiaec-linear-error-v3',
+            aec_behavior_hash=RETIRED_HASH), 'retired'),
+        # Current version string, retired behaviour: from_dict alone accepts it.
+        'retired_hash': (dataclasses.replace(
+            current, aec_behavior_hash=RETIRED_HASH), 'retired'),
+        'foreign_hash': (dataclasses.replace(
+            current, aec_behavior_hash='ab' * 32), 'mismatch'),
+        'other_filter': (dataclasses.replace(
+            current, filter_length=current.filter_length * 2), 'mismatch'),
+    }
+
+
+@pytest.mark.parametrize('case', ['v3_version', 'retired_hash',
+                                  'foreign_hash', 'other_filter'])
+def test_calibration_refuses_a_foreign_or_retired_stamp(tmp_path, case):
+    """Stems stamped with another front end never reach the capture.
+
+    The checkpoint here is the current build's; every stamp below differs from
+    it, two of them by being retired outright. Refused before the graph export,
+    so the output directory stays empty.
+    """
+    pytest.importorskip('onnx')
+    contract, message = _foreign_contracts()[case]
+    primary_dir, far_dir = _write_pair(tmp_path, stamp=False)
+    _write_stamp(primary_dir, contract)
+    out_dir = tmp_path / 'out'
+    with pytest.raises(ValueError, match=message):
+        _calibrate_primary(tmp_path, primary_dir, far_dir)
+    assert list(out_dir.iterdir()) == []
+
+
+def test_calibration_records_where_matching_stems_were_stamped(tmp_path):
+    """A matching stamp passes and the report names its origin."""
+    pytest.importorskip('onnx')
+    primary_dir, far_dir = _write_pair(tmp_path)
+    out_dir = _calibrate_primary(tmp_path, primary_dir, far_dir)
+    with open(calibration_report_path(out_dir / 'cal.npz', 'npz')) as stream:
+        report = json.load(stream)
+    assert report['primary_source'] == 'materialized_primary_wavs'
+    stamp = report['linear_error_stamp']
+    assert stamp['origin'] == 'sidecar'
+    assert stamp['path'] == str(primary_dir.resolve()
+                                / 'linear_error.contract.json')
+    assert stamp['linear_aec_contract_version'] == report[
+        'linear_aec_contract_version']
+    assert stamp['aec_behavior_hash'] == report['aec_behavior_hash']
+
+
+def test_calibration_refuses_unstamped_stems_unless_overridden(tmp_path):
+    """No stamp, no calibration; the override is explicit and on the record."""
+    pytest.importorskip('onnx')
+    primary_dir, far_dir = _write_pair(tmp_path, stamp=False)
+    out_dir = tmp_path / 'out'
+    with pytest.raises(ValueError, match='no front-end stamp'):
+        _calibrate_primary(tmp_path, primary_dir, far_dir)
+    assert list(out_dir.iterdir()) == []
+
+    out_dir.rmdir()
+    with pytest.warns(RuntimeWarning, match='unstamped'):
+        _calibrate_primary(tmp_path, primary_dir, far_dir,
+                           '--allow-unstamped-linear-error')
+    with open(calibration_report_path(out_dir / 'cal.npz', 'npz')) as stream:
+        assert json.load(stream)['linear_error_stamp'] == {
+            'origin': 'unstamped_override', 'path': None}
+
+
+def test_corpus_ledger_stamps_stems_and_refuses_partial_claims(tmp_path):
+    """The ledger beside a corpus vouches for it only if it names the contract
+    AND every chunk sequence present; the sidecar needs no ledger."""
+    import dataclasses
+
+    from AIAEC._streaming_calibration import linear_error_provenance
+    from AIAEC.dataset_gen import make_linear_aec_contract
+    from AIAEC.dataset_gen.linear_error_ledger import save_ledger
+
+    current = make_linear_aec_contract(GRID.sample_rate)
+    seqs = tmp_path / 'seqs'
+    seqs.mkdir()
+    for sequence in (0, 1):
+        (seqs / ('%06d_000.wav' % sequence)).write_bytes(b'')
+
+    with pytest.raises(ValueError, match='no front-end stamp'):
+        linear_error_provenance(seqs, current.as_dict())
+
+    save_ledger(str(seqs), current.fingerprint(), {0}, current.as_dict())
+    with pytest.raises(ValueError, match='part new front end'):
+        linear_error_provenance(seqs, current.as_dict())
+
+    save_ledger(str(seqs), current.fingerprint(), {0, 1}, current.as_dict())
+    stamp = linear_error_provenance(seqs, current.as_dict())
+    assert stamp['origin'] == 'corpus_ledger'
+    assert stamp['aec_behavior_hash'] == current.aec_behavior_hash
+
+    old = dataclasses.replace(current, aec_behavior_hash=RETIRED_HASH)
+    save_ledger(str(seqs), old.fingerprint(), {0, 1}, old.as_dict())
+    with pytest.raises(ValueError, match='retired'):
+        linear_error_provenance(seqs, current.as_dict())
+    # Agreeing with a retired checkpoint is no excuse either.
+    with pytest.raises(ValueError, match='retired'):
+        linear_error_provenance(seqs, old.as_dict())

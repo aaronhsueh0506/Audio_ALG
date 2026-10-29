@@ -37,8 +37,9 @@ extern "C" {
  * linear_aec_contract_version by export_onnx.py. The layout version above
  * describes only the tensor/state boundary and stays the same across
  * retrained checkpoints; this string is what tells an old graph from a current
- * one. The integrator compares the metadata value against it before
- * ulcnet_accelerator_adapter_init and refuses a graph that differs. Its
+ * one. The integrator MAY compare the metadata value against it; the C code
+ * itself never reads it and never refuses a graph by front end (the check is
+ * enforced in export, inference and calibration on the Python side). Its
  * error input is the AEC analysis seam (formed_hop / beam.spectrum), the real
  * selected linear residual, never the rendering base (aec_get_output_base);
  * the metadata records this as error_input_seam = analysis_formed. */

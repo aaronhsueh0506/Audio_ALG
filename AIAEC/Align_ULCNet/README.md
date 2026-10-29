@@ -134,6 +134,46 @@ script converts both to the checkpoint rate. Omit the flag to test the complete
 repository flow (48 kHz mic/lpb -> resample -> frozen PBFDKF -> Align-ULCNet).
 The external KF uses different parameters and is not bit-equivalent to PBFDKF.
 
+## C/Python inference parity and alignment events
+
+The C ULCNet stage (`pipelines/ulcnet/ulcnet_nn_stage.c`, `gate_delay`) and
+Python inference (`inference.py` -> `_streaming.py`) differ at alignment events:
+
+| | C stage | Python inference |
+|---|---|---|
+| event | `delay.changed`, or the first transition to solid after the first hop | not detected: `lib/aec/python` has `get_post_reset_serial` but no equivalent of `AecLinearContext.delay_state` |
+| model state | `model->reset` zeroes every state tensor (attention ring, logit history, recurrent state) | never reset, runs continuously |
+| frames | `ULCNET_NN_STAGE_REPRIME_FRAMES` (1) identity frame | every frame goes through the model |
+
+The reset policy is C-only for now; this is a documented divergence (function
+map D-44, row PL-ULC-01) and predates `aiaec-linear-error-v4`. It does not
+change the front-end contract or the model I/O layout. Asking `lib/aec` for a
+Python event accessor so that Python can mirror the policy is a separate
+decision.
+
+Consequently the C/Python inference comparison of a checkpoint is defined only
+over spans without alignment events:
+
+1. **Event-free by construction (primary).** Python
+   `inference.py --input-is-linear-error` against the C stage fed the same
+   `linear_error` and `far` with `delay = {changed 0, solid 1}` on every hop.
+   Neither side has an AEC, so neither has an event; both start from zeroed
+   state. Compare the whole stream after hop #0.
+2. **AEC in the loop.** Every real clip has at least one event (the lock), so
+   compare only (a) from the stream start up to the frame before the first
+   event hop, and (b) from the last event hop plus the attention depth `D`
+   frames plus a settling margin. The margin has to be measured on the
+   delivered checkpoint (the recurrent state is not guaranteed to forget at a
+   known rate); frames in between are expected to differ and are not a defect.
+   Take the event hops from the C side (the stage's `delay` argument, logged per
+   hop). A change of `applied_delay_samples` in the sweep alignment trace is
+   only a proxy for them.
+
+No committed test drives the stage against Python (function map T-15); until
+the owner's checkpoint exists, either comparison can run only on a synthetic
+checkpoint. The model-level pieces (`ulcnet_model_io`, `ulcnet_prepost`) are
+independent of alignment events and keep their own C tests.
+
 ## Streaming delay-profile sweep
 
 `sweep_delay_depth.py` runs the same checkpoint through the real
@@ -400,7 +440,10 @@ python3 export_onnx.py \
   --verify
 ```
 
-Capture PTQ inputs for the same D with this model's calibration entry point:
+Capture PTQ inputs for the same D with this model's calibration entry point.
+`--primary-dir` holds `linear_error` WAVs that this build's front end
+(`aiaec-linear-error-v4`, the AEC analysis seam) produced and that carry a stamp,
+see "Linear-error provenance and stamps" below:
 
 ```bash
 python3 inference.py calib \
@@ -434,6 +477,56 @@ report records both fields so a disagreement is fail-fast. The
 D value must match the exported graph because it fixes the K/V window tensor
 shapes and CPU state allocation, not because changing D requires retraining.
 
+### Linear-error provenance and stamps
+
+The calibration tensors are recorded behind one specific front end. Stems from
+the retired `aiaec-linear-error-v3` front end (or any other AEC build) hold
+different statistics, so `calib` checks where a pre-made `--primary-dir` came
+from. The directory must carry one of:
+
+- `linear_error.contract.json` inside it (written by a `--primary-is-mic` run),
+- a `linear_error.done.json` corpus ledger next to it that records the
+  contract identity (a fingerprint-only legacy ledger is "unstamped"; a
+  ledger that does not claim every chunk sequence under the directory is
+  refused as a half re-rendered corpus).
+
+The stamp must equal the checkpoint's own `linear_aec` contract. Refused, before
+the ONNX graph or the artifact is written: a retired contract version or AEC
+behaviour hash, a contract that differs from the checkpoint's, an internally
+inconsistent stamp (its fingerprint does not match its contract), a stamp from a
+seam other than `analysis_formed`, and a directory with no stamp at all
+("carry no front-end stamp"). `--allow-unstamped-linear-error` waives only the
+last case: it warns and the report records
+`linear_error_stamp.origin = unstamped_override`. It is rejected together with
+`--primary-is-mic`.
+
+`--primary-is-mic` is the self-stamping route. Pass RAW microphone WAVs as
+`--primary-dir`; the checkpoint-matched frozen PBFDKF derives the stems in
+process, writes them to `<output>_linear_error/` with a
+`linear_error.contract.json` made from the checkpoint's contract (written last,
+so an interrupted run leaves no stamp), and the manifest records
+`primary_source = raw_mic_via_frozen_pbfdkf`:
+
+```bash
+python3 inference.py calib \
+  --checkpoint checkpoint.pth \
+  --primary-dir /path/to/raw_mic --far-dir /path/to/raw_far \
+  --primary-is-mic --frames 8192 --max-delay-frames 8 \
+  --format bin --output calib/align_ulcnet_d8
+```
+
+The calibration report (`manifest.json` for BIN, `<name>.calib.json` for NPZ) is
+stamped with `linear_aec_contract_version`, `aec_behavior_hash`,
+`linear_aec_contract_hash`, `error_input_seam` and `linear_error_stamp`
+(origin `sidecar`, `corpus_ledger`, `derived_in_process` or
+`unstamped_override`). `PTQ/calib_analyze.py` refuses an artifact whose stamp is
+missing, from another contract version, or retired, both on load and when
+writing a pruned selection; regenerate it with `inference.py calib`. Export
+and inference also refuse a checkpoint recorded under a retired behaviour hash.
+`inference.py --input-is-linear-error` is an evaluation-only bypass and does not
+check the supplied WAV's origin. None of these checks lives in C: the C code
+never refuses a model by front-end version.
+
 The exporter writes a sibling JSON descriptor containing the exact grid,
 state layout version, `state_binding`, D, the fixed `raw_far` deployment
 contract, the checkpoint's separate training provenance, and tensor schemas. Only the
@@ -459,13 +552,26 @@ The layout does not identify the training front end. `export_onnx.py` copies
 `linear_aec` contract into the JSON and ONNX metadata, together with
 `error_input_seam = analysis_formed` (the error input is the AEC analysis seam,
 `formed_hop` / `beam.spectrum`, never the rendering base). The integrator
-compares `linear_aec_contract_version` with `ULCNET_MODEL_IO_FRONTEND_CONTRACT`
-in `ulcnet_model_io.h` (`aiaec-linear-error-v4`) before
-`ulcnet_accelerator_adapter_init()` and refuses a different value, e.g. a graph
-exported from a retired v3 checkpoint. The constant is not part of the
-descriptor and is not a layout bump; a test pins it to
-`LINEAR_AEC_CONTRACT_VERSION`. Export refuses a checkpoint without a current
-`linear_aec` contract.
+may compare or log `linear_aec_contract_version` against
+`ULCNET_MODEL_IO_FRONTEND_CONTRACT` in `ulcnet_model_io.h`
+(`aiaec-linear-error-v4`), e.g. to tell a graph exported from a retired v3
+checkpoint. The C code never reads the constant and
+`ulcnet_accelerator_adapter_init()` never refuses by front end. Enforcement is
+on the Python side (export, inference, calibration) and in the committed
+tests. The constant is not part of the descriptor and is not a layout bump; a
+test pins it to `LINEAR_AEC_CONTRACT_VERSION`. Export refuses a checkpoint
+without a current `linear_aec` contract.
+
+Passing `ulcnet_model_io_descriptor_validate()` is not enough: the descriptor
+holds no front-end field, so a same-shape graph from an old or custom front end
+binds. The JSON sidecar also records `onnx_sha256` (the graph file's bytes,
+written after the final save, so it is not one of the ONNX props), and
+`frontend_gate.metadata_mismatches()` compares the sidecar with the compiled
+`ULCNET_MODEL_IO_FRONTEND_CONTRACT`, the live `aec_python_behavior_hash()`, the
+graph and checkpoint files and the lane grid; `frontend_gate.lane_mismatches()`
+compares the deployed lane's AEC configuration with the training contract.
+`tests/test_deployed_frontend_contract.py` runs both against the compiled mono
+lane (see dataset_gen/README.md, "Deployment gate").
 
 The fixed front end never enters the quantized domain: each of the four feature
 inputs keeps its own quantization scale, and `sqrt`/`atan2`/`pow` stay out of
