@@ -14,9 +14,9 @@
  * the caller's raw `ref` hop. Replace run_accelerator() with the board runtime call.
  * Data domain: the stage reads the AEC's analysis seam (ctx.formed_hop), the signal the model was trained
  * on, not the rendering base of aec_get_output_base() (which does not pair with formed_hop on a hop where
- * the output guard fires). There is no comfort noise and no synthesis of the program's own, so
+ * the output guard fires). There is no comfort noise and no synthesis besides the stage's own WOLA, so
  * aec_post_reset_serial() has nothing to clear or reseed here; the stage's alignment policy is the
- * delay.changed flag below. */
+ * delay.changed flag below (an in-call hard reset of the AEC is also a delay.changed hop). */
 #include "aec.h"
 #include "common/example_cli.h"
 #include "ulcnet/ulcnet_nn_stage.h"

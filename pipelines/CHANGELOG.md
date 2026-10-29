@@ -73,7 +73,7 @@ states the facts the application needs (the base, the serial, the seed, the wind
   (`mcab_sample_anr_gain()`), of a mono seam on B. New row `a.nr4.<grid>.replay_identity`: the replay over the chain's
   own seam equals the chain bit for bit, with guard hops present (a replay rendering E fails it).
 - Board samples (the board-sample directory outside the repository): `alg_audio_aec.c`, `alg_audio_aec_nr.c` and `alg_ai3_aec_dfn.c`
-  add comfort noise only with `--cng` (off by default; `--no-cng` stays accepted in `alg_audio_aec_nr.c` and has no effect). This
+  add comfort noise only with `--cng` (off by default; `alg_audio_aec_nr.c` also accepts `--no-cng`, and the last of `--cng` / `--no-cng` wins). This
   is a sample setting, not a library change: `aec_config_from_level()` still sets `enable_cng = 1`. `--cng` on and off are each
   compared against the same configuration. All three render the rendering base
   (`aec_get_output_base()`); `alg_audio_aec.c` and `alg_audio_aec_nr.c` also borrow the AEC's window; `alg_ai3_aec_dfn.c` calls

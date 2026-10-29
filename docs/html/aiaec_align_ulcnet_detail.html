@@ -35,14 +35,32 @@ pipeline 沒有 runtime far-mode setter，raw/aligned 比較只留在 sweep 工�
 report 會把 <code>calibration_far_input_mode</code> 與
 <code>deployment_far_input_mode</code>（兩者皆為 <code>raw_far</code>）分開記錄。D 不改權重，但會改 K/V window
 shape 與 host RAM，所以 calibration 的 D 必須和該份 ONNX export 相同。</div>
+<div class="note"><b>calibration 的 linear_error 來源與 stamp</b>：校正張量是某一版前端（<code>aiaec-linear-error-v4</code>，AEC 分析 seam）的輸出，
+所以 <code>inference.py calib</code> 預設的 <code>--primary-dir</code> linear_error WAV 必須由該前端產生並帶 stamp：
+目錄內的 <code>linear_error.contract.json</code>，或其旁、記有契約本體的 <code>linear_error.done.json</code> corpus ledger
+（只有 fingerprint 的舊 ledger 視為無 stamp；沒有涵蓋目錄內全部 chunk 序列的 ledger＝半新半舊的 corpus，被拒）。
+stamp 必須等於 checkpoint 自己的 <code>linear_aec</code> 契約；退役的版本或 <code>aec_behavior_hash</code>、契約不符、
+stamp 內部不一致、seam 不是 <code>analysis_formed</code>，都在匯出 graph 與寫 artifact 之前被拒。
+完全沒有 stamp 也被拒（訊息含 “carry no front-end stamp”），除非加 <code>--allow-unstamped-linear-error</code>：它只放行這一種情況，
+會警告並在 report 記 <code>linear_error_stamp.origin = unstamped_override</code>，且不能與 <code>--primary-is-mic</code> 併用。
+<code>--primary-is-mic</code> 是自行 stamp 的路徑：<code>--primary-dir</code> 放 RAW mic WAV，由 checkpoint 對應的 frozen PBFDKF
+在同 process 推導，寫入 <code>&lt;output&gt;_linear_error/</code> 並附最後才寫的 <code>linear_error.contract.json</code>，
+manifest 記 <code>primary_source = raw_mic_via_frozen_pbfdkf</code>。
+calibration report（BIN 的 <code>manifest.json</code>、NPZ 的 <code>&lt;name&gt;.calib.json</code>）帶
+<code>linear_aec_contract_version</code>、<code>aec_behavior_hash</code>、<code>linear_aec_contract_hash</code>、<code>error_input_seam</code>
+與 <code>linear_error_stamp</code>（<code>sidecar</code>／<code>corpus_ledger</code>／<code>derived_in_process</code>／<code>unstamped_override</code>）；
+<code>PTQ/calib_analyze.py</code> 在載入與寫出挑選結果時，拒絕 stamp 缺失、契約版本不是目前版本或 hash 已退役的 Align-ULCNet artifact，
+修法是重跑 <code>inference.py calib</code>。<code>inference.py --input-is-linear-error</code> 只供評估，不檢查所給 WAV 的來源。
+這些檢查都在 Python 端與已提交的測試，C 端不會依前端版本拒絕模型。</div>
 <div class="note"><b>訓練前端契約</b>：layout 只描述 tensor/state 邊界，不辨識 checkpoint 是用哪一版前端訓練的。
 <code>export_onnx.py</code> 把 checkpoint 的 <code>linear_aec</code> 契約原樣寫進 ONNX/JSON metadata：
 <code>linear_aec_contract_version</code>、<code>aec_behavior_hash</code>，以及
 <code>error_input_seam</code> = <code>analysis_formed</code>（error 輸入是 AEC 的分析 seam：<code>formed_hop</code>／<code>beam.spectrum</code>，
-不是 rendering base）。整合端在 <code>ulcnet_accelerator_adapter_init()</code> 之前，要把
+不是 rendering base）。整合端可以把
 <code>linear_aec_contract_version</code> 與 <code>ulcnet_model_io.h</code> 的
-<code>ULCNET_MODEL_IO_FRONTEND_CONTRACT</code>（<code>aiaec-linear-error-v4</code>）比對，不同就拒絕綁定
-（例如從已退役的 v3 checkpoint 匯出的圖）。這個常數不在 descriptor 內，也不是 layout 升版；測試把它釘在
+<code>ULCNET_MODEL_IO_FRONTEND_CONTRACT</code>（<code>aiaec-linear-error-v4</code>）比對或記錄
+（例如分辨從已退役的 v3 checkpoint 匯出的圖）；C 端 init 不會依前端拒絕任何圖，
+強制檢查在 Python 端（export、inference、calibration）與已提交的測試。這個常數不在 descriptor 內，也不是 layout 升版；測試把它釘在
 <code>LINEAR_AEC_CONTRACT_VERSION</code>。沒有 <code>linear_aec</code> 契約的 checkpoint 不能匯出。</div>
 <h2>layout 18</h2>
 <div class="note">model-I/O layout 是 v18

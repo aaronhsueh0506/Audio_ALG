@@ -13,6 +13,7 @@
 #include "aec.h"
 #include "ulcnet/ulcnet_nn_stage.h"
 #include "utility/mem_align.h"
+#include "../../../mono_aec_nr_res/tests/guard_scene.h"
 
 #include <stdio.h>
 #include <stdlib.h>
@@ -175,6 +176,10 @@ static void mu_reset(MonoUlcnet* p) {
     ulcnet_nn_stage_reset(p->stage);
 }
 
+/* Planted defect for the guard-hop test only: on a hop where the AEC's output guard fires, feed the
+ * stage the rendering base (aec_get_output_base()) instead of the analysis seam. */
+static int g_mu_feed_base = 0;
+
 /* AEC, then the stage's begin with the lane's formed hop, the raw reference and the alignment
  * events (changed = CHANGED, solid = not UNLOCKED). */
 static int mu_process_begin(MonoUlcnet* p, const float* mic, const float* ref) {
@@ -187,6 +192,13 @@ static int mu_process_begin(MonoUlcnet* p, const float* mic, const float* ref) {
     aec_get_linear_context(p->aec, &lctx);
     delay.changed = lctx.delay_state == AEC_LINEAR_DELAY_CHANGED;
     delay.solid = lctx.delay_state != AEC_LINEAR_DELAY_UNLOCKED;
+    if (g_mu_feed_base) {
+        AecOutputBase ob;
+        memset(&ob, 0, sizeof(ob));
+        ob.struct_size = sizeof(ob);
+        if (aec_get_output_base(p->aec, &ob) == 0 && ob.guard_active && ob.base_spec)
+            return ulcnet_nn_stage_begin_complex(p->stage, ob.base_spec, ref, delay) == 0 ? 0 : -1;
+    }
     return ulcnet_nn_stage_begin_time(p->stage, rctx.formed_hop, ref, delay) == 0 ? 0 : -1;
 }
 
@@ -646,6 +658,75 @@ static void test_relock_same_delay_resets_model(void) {
     CHECK(applied_after_relock >= 10,
           fmt_msg("mono relock: the stream goes on running locked after the relock (%d hops)",
                   applied_after_relock));
+
+    mu_destroy(p);
+}
+
+/* The AEC's hard post-chain reset serial (aec_post_reset_serial()) also advances on the Path A / Path B
+ * hard resets INSIDE a processing call. This program has no comfort noise and no synthesis of its own
+ * beyond the stage, so the serial is not consumed here; the model is still tied to it. Every hop on
+ * which the serial moved inside a processing call must also be a hop on which the stage reset the
+ * model and spent the reprime (no inference that hop). A serial move that the stage did not follow
+ * would leave the network state straddling the AEC's cleared filter state. */
+typedef struct {
+    int hops, serial_moves, followed, delay_changed_moves;
+} SerialFollow;
+
+static void serial_follow_run(MonoUlcnet* p, CountingModelState* st, EchoSim* sim,
+                              int hops, int shift_hop, int shift_delay, SerialFollow* sf) {
+    float mic[HOP], ref[HOP], out[HOP];
+    for (int h = 0; h < hops; h++) {
+        if (h == shift_hop) echo_sim_init(sim, shift_delay, 0xC0FFEEu);
+        uint32_t s0 = aec_post_reset_serial(mu_get_aec(p));
+        int r0 = st->reset_calls, i0 = st->infer_calls;
+        echo_sim_hop(sim, mic, ref);
+        mu_process(p, mic, ref, out);
+        sf->hops++;
+        if (aec_post_reset_serial(mu_get_aec(p)) != s0) {
+            sf->serial_moves++;
+            if (st->reset_calls == r0 + 1 && st->infer_calls == i0) sf->followed++;
+            if (pipeline_delay_state(p) == AEC_LINEAR_DELAY_CHANGED) sf->delay_changed_moves++;
+        }
+    }
+}
+
+static void test_serial_advance_resets_model(void) {
+    const int d0 = 64 * DELAY_RATE_FACTOR, d1 = 160 * DELAY_RATE_FACTOR;
+    CountingModelState st = {0, 0};
+    SerialFollow sf = {0, 0, 0, 0};
+    EchoSim sim;
+
+    MonoUlcnetConfig cfg = mu_default_config(ULCNET_SR);
+    cfg.model.user  = &st;
+    cfg.model.infer = counting_infer;
+    cfg.model.io_descriptor = test_io_descriptor();
+    cfg.model.reset = counting_reset;
+
+    MonoUlcnet* p = mu_create(&cfg);
+    if (!p) { fprintf(stderr, "FAIL: setup (create) for serial-follow test\n"); g_failures++; return; }
+
+    /* First acquisition, then a confirmed shift of the bulk delay mid-stream. */
+    echo_sim_init(&sim, d0, 0xC0FFEEu);
+    serial_follow_run(p, &st, &sim, 90, -1, 0, &sf);
+    int moves_first = sf.serial_moves;
+    serial_follow_run(p, &st, &sim, 150, 0, d1, &sf);
+    CHECK(moves_first >= 1 && sf.serial_moves >= 1,
+          fmt_msg("serial follow: the AEC's in-call hard reset happened (%d on the first "
+                  "acquisition, %d in total over %d hops; not a vacuous pass)",
+                  moves_first, sf.serial_moves, sf.hops));
+    CHECK(sf.followed == sf.serial_moves,
+          fmt_msg("serial follow: every in-call serial advance is the same hop as one model reset "
+                  "and a reprime frame (%d of %d)", sf.followed, sf.serial_moves));
+    CHECK(sf.delay_changed_moves == sf.serial_moves,
+          fmt_msg("serial follow: every such hop is a delay.changed hop (%d of %d)",
+                  sf.delay_changed_moves, sf.serial_moves));
+
+    /* aec_reset() moves the serial by itself; the pipeline reset pairs it with the stage reset. */
+    uint32_t s0 = aec_post_reset_serial(mu_get_aec(p));
+    int r0 = st.reset_calls;
+    mu_reset(p);
+    CHECK(aec_post_reset_serial(mu_get_aec(p)) == s0 + 1u && st.reset_calls == r0 + 1,
+          "serial follow: the pipeline reset advances the serial once and resets the model once");
 
     mu_destroy(p);
 }
@@ -2105,6 +2186,156 @@ static void test_phased_hop(void) {
     mu_destroy(p);
 }
 
+/* =========================================================================
+ * Guard hops. The stage reads the AEC's analysis seam (formed_hop), never the rendering base, so on a
+ * hop where aec_get_output_base().guard_active == 1 the identity output is the unguarded linear
+ * residual and may be louder than the capture. Three guard scenes run with the NULL model (identity):
+ * on every guard hop out[h+1] must equal formed[h] (the stage input is formed_hop, not base_spec), and
+ * base_spec must differ from error_spec on those hops (so the check can tell the two apart). The hops
+ * on which the identity output is louder than the mic hop are counted and printed, not gated: that is
+ * a characteristic of the contract, evaluated with the retrained model. A hop after aec_reset() emits
+ * zeros and is not compared.
+ * ========================================================================= */
+typedef struct {
+    int hops, compared, guard_hops, guard_compared, louder, louder_on_guard;
+    double max_err_guard, max_err_all, max_sep;
+} GuardHopStats;
+
+static double energy_f(const float* x, int n) {
+    double e = 0.0;
+    for (int i = 0; i < n; i++) e += (double)x[i] * (double)x[i];
+    return e;
+}
+
+static int guard_hops_run(const GuardScene* sc, GuardHopStats* gs) {
+    MonoUlcnetConfig cfg = mu_default_config(ULCNET_SR);
+    MonoUlcnet* p = mu_create(&cfg);
+    float formed_prev[HOP], out[HOP], mic_prev[HOP];
+    int guard_prev = 0, prev_ok = 0;
+
+    memset(gs, 0, sizeof(*gs));
+    if (!p) return -1;
+    for (int h = 0; h < sc->nh; h++) {
+        const float* mic = sc->mic + (size_t)h * HOP;
+        const float* far = sc->far + (size_t)h * HOP;
+        AecResContext rctx;
+        AecOutputBase ob;
+        for (int k = 0; k < 4; k++) {
+            if (sc->reset_at[k] == h) { mu_reset(p); prev_ok = 0; }
+        }
+        if (mu_process(p, mic, far, out) != 0) { mu_destroy(p); return -1; }
+        gs->hops++;
+        if (prev_ok) {
+            double err = 0.0;
+            for (int i = 0; i < HOP; i++) {
+                double d = fabs((double)out[i] - (double)formed_prev[i]);
+                if (d > err) err = d;
+            }
+            gs->compared++;
+            if (err > gs->max_err_all) gs->max_err_all = err;
+            if (guard_prev) {
+                gs->guard_compared++;
+                if (err > gs->max_err_guard) gs->max_err_guard = err;
+            }
+            if (energy_f(out, HOP) > energy_f(mic_prev, HOP)) {
+                gs->louder++;
+                if (guard_prev) gs->louder_on_guard++;
+            }
+        }
+        aec_get_res_context(mu_get_aec(p), &rctx);
+        memset(&ob, 0, sizeof(ob));
+        ob.struct_size = sizeof(ob);
+        if (!rctx.error_spec || aec_get_output_base(mu_get_aec(p), &ob) != 0 || !ob.base_spec) {
+            mu_destroy(p);
+            return -1;
+        }
+        guard_prev = ob.guard_active;
+        if (guard_prev) {
+            double num = 0.0, den = 0.0;
+            gs->guard_hops++;
+            for (int k = 0; k < ob.n_freqs; k++) {
+                double dr = (double)ob.base_spec[k].r - (double)rctx.error_spec[k].r;
+                double di = (double)ob.base_spec[k].i - (double)rctx.error_spec[k].i;
+                num += dr * dr + di * di;
+                den += (double)rctx.error_spec[k].r * rctx.error_spec[k].r +
+                       (double)rctx.error_spec[k].i * rctx.error_spec[k].i;
+            }
+            if (den > 0.0 && num / den > gs->max_sep) gs->max_sep = num / den;
+        }
+        memcpy(formed_prev, rctx.formed_hop, sizeof(formed_prev));
+        memcpy(mic_prev, mic, sizeof(mic_prev));
+        prev_ok = 1;
+    }
+    mu_destroy(p);
+    return 0;
+}
+
+static void test_guard_hops_feed_analysis_seam(void) {
+    const int seconds = ULCNET_SR == 16000 ? 14 : 6;
+    const char* nm[3] = { "moving echo path with double talk", "silent head, no echo path (never usable)",
+                          "aec_reset events and a moving path" };
+    GuardScene sc[3];
+    GuardHopStats gs[3];
+    long guard_total = 0, guard_compared = 0, louder_total = 0;
+    double worst_guard_err = 0.0, worst_sep = 0.0;
+    int built = 1, ran = 1;
+
+    built &= guard_scene_make(&sc[0], nm[0], ULCNET_SR, ULCNET_N_FFT, seconds, 0x2545F491u, 1, 1, 1, 0) == 0;
+    built &= guard_scene_make(&sc[1], nm[1], ULCNET_SR, ULCNET_N_FFT, seconds, 0x1234567u, 0, 0, 0, 30) == 0;
+    if (built) {
+        int n = sc[1].nh * sc[1].hop;
+        for (int i = 0; i < n; ++i) sc[1].mic[i] += 0.03f * gs_rnd();
+    }
+    built &= guard_scene_make(&sc[2], nm[2], ULCNET_SR, ULCNET_N_FFT, seconds, 0x2545F491u, 1, 1, 1, 0) == 0;
+    CHECK(built, "guard hops: the three guard scenes build");
+    if (!built) return;
+    sc[2].reset_at[0] = sc[2].nh / 4;
+    sc[2].reset_at[1] = sc[2].nh / 2;
+    sc[2].reset_at[2] = 3 * sc[2].nh / 5;
+
+    for (int i = 0; i < 3; i++) {
+        ran &= guard_hops_run(&sc[i], &gs[i]) == 0;
+        printf("  guard scene '%s': %d hops, guard fired on %d; identity output louder than the mic hop on %d "
+               "of %d compared hops (%d of them guard hops, %d compared)\n",
+               nm[i], gs[i].hops, gs[i].guard_hops, gs[i].louder, gs[i].compared,
+               gs[i].louder_on_guard, gs[i].guard_compared);
+        guard_total += gs[i].guard_hops;
+        guard_compared += gs[i].guard_compared;
+        louder_total += gs[i].louder;
+        if (gs[i].max_err_guard > worst_guard_err) worst_guard_err = gs[i].max_err_guard;
+        if (gs[i].max_sep > worst_sep) worst_sep = gs[i].max_sep;
+        CHECK(gs[i].compared > 0 && gs[i].max_err_all <= 2e-4,
+              fmt_msg("guard hops, %s: identity out[h+1] == formed_hop[h] on all %d compared hops "
+                      "(max err %.3e)", nm[i], gs[i].compared, gs[i].max_err_all));
+    }
+    CHECK(ran, "guard hops: every scene ran");
+    CHECK(guard_total > 0 && guard_compared > 0,
+          fmt_msg("guard hops: the scenes fire the output guard (%ld hops, %ld compared)", guard_total, guard_compared));
+    CHECK(worst_sep > 1e-3,
+          fmt_msg("guard hops: base_spec differs from error_spec on a guard hop (relative distance %.3e), "
+                  "so feeding the rendering base would be detected", worst_sep));
+    CHECK(worst_guard_err <= 2e-4,
+          fmt_msg("guard hops: the stage input on guard hops is formed_hop, not base_spec (max err %.3e)",
+                  worst_guard_err));
+    printf("  characteristic (reported, not gated): identity hops with output energy above the mic energy: "
+           "%ld\n", louder_total);
+
+    /* Negative control: the same scenes with the stage fed the rendering base on guard hops. */
+    {
+        GuardHopStats bad;
+        double worst_bad = 0.0;
+        g_mu_feed_base = 1;
+        for (int i = 0; i < 3; i++) {
+            if (guard_hops_run(&sc[i], &bad) == 0 && bad.max_err_guard > worst_bad) worst_bad = bad.max_err_guard;
+        }
+        g_mu_feed_base = 0;
+        CHECK(worst_bad > 2e-4,
+              fmt_msg("guard hops: a planted defect (the stage fed the rendering base on guard hops) is "
+                      "detected (max err %.3e)", worst_bad));
+    }
+    for (int i = 0; i < 3; i++) guard_scene_free(&sc[i]);
+}
+
 int main(void) {
     printf("=== mono_alignulcnet: identity E2E (one-hop latency) ===\n");
     test_identity_e2e();
@@ -2114,6 +2345,9 @@ int main(void) {
 
     printf("\n=== mono_alignulcnet: same-delay relock resets the model ===\n");
     test_relock_same_delay_resets_model();
+
+    printf("\n=== mono_alignulcnet: AEC post-reset serial advance resets the model ===\n");
+    test_serial_advance_resets_model();
 
     /* Grid-relative (2 * HOP), so it runs everywhere. */
     printf("\n=== mono_alignulcnet: FIXED first alignment resets the model ===\n");
@@ -2153,6 +2387,9 @@ int main(void) {
 
     printf("\n=== mono_alignulcnet: phased hop (begin / nn / end) ===\n");
     test_phased_hop();
+
+    printf("\n=== mono_alignulcnet: guard hops feed the analysis seam ===\n");
+    test_guard_hops_feed_analysis_seam();
 
     printf("\n=== mono_alignulcnet: raw-far descriptor gate ===\n");
     test_raw_descriptor_gate();

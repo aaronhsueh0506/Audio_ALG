@@ -20,6 +20,12 @@
  * calls model->reset and arms ULCNET_NN_STAGE_REPRIME_FRAMES identity frames, because the
  * windows in flight straddle the boundary. reset() also calls model->reset.
  *
+ * Signal: the error is the AEC's analysis seam (formed_hop / error_spec), never the rendering
+ * base of aec_get_output_base(). On a hop where the AEC's output guard fires, and in the identity,
+ * fail-open and reprime frames, the stage therefore emits the unguarded residual, which may be
+ * louder than the capture; the stage adds no energy guard of its own
+ * (mono_alignulcnet/tests/test_mono_ulcnet.c counts such hops).
+ *
  * A negative return leaves recovery to the caller: reset the AEC unit and the stage together.
  * One build serves one grid (16 kHz / fft 512 or 48 kHz / fft 1024, ULCNET_MODEL_IO_SR and
  * ULCNET_MODEL_IO_N_FFT). */

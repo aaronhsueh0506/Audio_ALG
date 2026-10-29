@@ -5,7 +5,8 @@
  * delay changes at 1/3 and 2/3 of the stream (each change that restarts the filter moves
  * aec_post_reset_serial()), an optional near-end burst and an optional silent head with no echo path
  * (the estimate never becomes usable and the guard fires). The application-issued aec_reset() hops of a
- * scene are listed in reset_at (-1 terminated); the test applies them to every instance. */
+ * scene are listed in reset_at (-1 terminated); the test applies them to every instance. Shared by
+ * mono_aec_nr_res/tests/test_mono_chain.c and ulcnet/mono_alignulcnet/tests/test_mono_ulcnet.c. */
 #ifndef GUARD_SCENE_H
 #define GUARD_SCENE_H
 

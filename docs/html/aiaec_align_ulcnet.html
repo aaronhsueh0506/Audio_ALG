@@ -69,7 +69,7 @@ graph 綁四個特徵輸入 <code>error_mag/far_mag/error_cos/error_sin</code>�
 host（<code>commit()</code>）用 <code>prepare()</code> 留在 state 的<b>壓縮域</b> error 頻譜乘上 mask，
 再逆冪還原。以上是唯一的 boundary（layout 18）。</p>
 <div class="note"><b>far branch 契約</b>:production 固定用 caller 的 raw far,C descriptor 只接受 <code>ULCNET_FAR_RAW</code>,<code>export_onnx.py</code> 分開寫 <code>training_far_input_mode</code> 與 <code>far_input_mode</code>(兩者皆為 <code>raw_far</code>);PTQ calibration 的 D 必須和該份 ONNX export 相同。model-I/O layout 是 v18(<code>ULCNET_MODEL_IO_LAYOUT_VERSION</code> = 18;<code>RETIRED_LAYOUT_VERSIONS</code> = 3–17,不得重用),其他 layout 的 ONNX/JSON descriptor 會在 <code>ulcnet_model_io_descriptor_validate()</code> 卡在 <code>layout_version</code>。三項的完整說明收在 <a href="aiaec_align_ulcnet_detail.html">aiaec_align_ulcnet_detail</a>。</div>
-<div class="note"><b>訓練前端契約</b>:metadata 另帶 <code>linear_aec_contract_version</code>、<code>aec_behavior_hash</code>(取自 checkpoint)與 <code>error_input_seam</code> = <code>analysis_formed</code>;整合端在 <code>ulcnet_accelerator_adapter_init()</code> 之前要拿前者比對 <code>ULCNET_MODEL_IO_FRONTEND_CONTRACT</code>(<code>aiaec-linear-error-v4</code>),不符就不綁定。這不是 layout 升版(仍是 18)。</div>
+<div class="note"><b>訓練前端契約</b>:metadata 另帶 <code>linear_aec_contract_version</code>、<code>aec_behavior_hash</code>(取自 checkpoint)與 <code>error_input_seam</code> = <code>analysis_formed</code>;整合端可以拿前者比對或記錄 <code>ULCNET_MODEL_IO_FRONTEND_CONTRACT</code>(<code>aiaec-linear-error-v4</code>);C 端 init 不會依前端拒絕任何圖,強制檢查在 Python 端(export、inference、calibration)與已提交的測試。這不是 layout 升版(仍是 18)。</div>
 
 <h2>ONNX graph boundary（layout 18）</h2>
 <p>boundary 只有一種：四個 host 特徵輸入加四個 rank-4 state，每個 state 都有同 shape 的 <code>*_out</code>。
