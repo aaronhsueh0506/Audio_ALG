@@ -332,3 +332,77 @@ def test_ulcnet_graph_is_exactly_preserved_and_rank_four(tmp_path):
     inputs = dummy_inputs(8, grid.n_freqs, 26)
     _assert_exact_rank_four(
         wrapper, inputs, INPUT_NAMES, OUTPUT_NAMES, tmp_path)
+
+
+def _grouped_linear_over_frames(frames):
+    nodes = [
+        helper.make_node('Reshape', ['x', 's5'], ['a']),       # [1,T,G,1,K]
+        helper.make_node('MatMul', ['a', 'w'], ['m']),         # [1,T,G,1,N]
+        helper.make_node('Reshape', ['m', 's3'], ['y']),
+    ]
+    weights = np.random.default_rng(2).standard_normal((16, 32, 8)).astype(
+        np.float32)
+    return _model(
+        nodes, [('x', [1, frames, 512])], [('y', [1, frames, 128])],
+        [_const('s5', np.asarray([1, frames, 16, 1, 32], np.int64)),
+         _const('s3', np.asarray([1, frames, 128], np.int64)),
+         _const('w', weights)])
+
+
+def test_frames_go_into_the_matmul_rows_not_into_the_batch_axis():
+    """A grouped linear over T frames: dropping the leading unit axis would
+    leave T on axis 0 (the batch for an accelerator). T goes to the row axis."""
+    model = _grouped_linear_over_frames(8)
+    original, report = _optimise(model)
+    assert report['high_rank_left'] == []
+    assert report['batch_axis_left'] == []
+    assert b1.verify_identical(original, model) == 0.0
+    inferred = b1._inferred(model)
+    mat = next(n for n in model.graph.node if n.op_type == 'MatMul')
+    shapes = {v.name: [d.dim_value for d in v.type.tensor_type.shape.dim]
+              for v in inferred.graph.value_info}
+    assert shapes[mat.input[0]] == [1, 16, 8, 32]
+    assert shapes[mat.output[0]] == [1, 16, 8, 8]
+    # Nothing between the Reshapes and the MatMul leaves rank 4 or batch 1:
+    # a rank-3 [T,G,K] intermediate would put T on axis 0 again.
+    created = [v for v in inferred.graph.value_info
+               if v.name.startswith('lo_b1_')]
+    assert created
+    for v in created:
+        dims = [d.dim_value for d in v.type.tensor_type.shape.dim]
+        assert len(dims) == 4 and dims[0] == 1, (v.name, dims)
+
+
+def test_one_frame_keeps_the_plain_lowering():
+    model = _grouped_linear_over_frames(1)
+    original, report = _optimise(model)
+    assert report['batch_axis_left'] == []
+    assert 'Transpose' not in _ops(model)
+    assert b1.verify_identical(original, model) == 0.0
+
+
+def test_the_batch_axis_check_can_fail(monkeypatch):
+    monkeypatch.setattr(b1._Lowering, 'frames_into_rows',
+                        lambda self, node, out_shape, drop: None)
+    model = _grouped_linear_over_frames(8)
+    original, report = _optimise(model)
+    assert report['batch_axis_left'] != []
+
+
+def test_a_rank_three_intermediate_with_t_on_axis_zero_is_reported():
+    """The check covers more than rank 4: tensors this optimizer created."""
+    from onnx import shape_inference
+    model = _grouped_linear_over_frames(8)
+    b1.optimize_batch1(model)
+    assert b1._batch_axis_left(model, 4) == []
+    # A hand-made [T,G,K] view named like an optimizer tensor must be seen.
+    bad = copy.deepcopy(model)
+    bad.graph.node.extend([
+        helper.make_node('Reshape', ['x', 'shape_bad'], ['lo_b1_999']),
+        helper.make_node('Reshape', ['lo_b1_999', 'shape_back'], ['y_bad'])])
+    bad.graph.initializer.extend([
+        _const('shape_bad', np.asarray([8, 16, 32], np.int64)),
+        _const('shape_back', np.asarray([1, 8, 512], np.int64))])
+    bad.graph.output.append(
+        helper.make_tensor_value_info('y_bad', TensorProto.FLOAT, [1, 8, 512]))
+    assert 'lo_b1_999' in b1._batch_axis_left(bad, 4)

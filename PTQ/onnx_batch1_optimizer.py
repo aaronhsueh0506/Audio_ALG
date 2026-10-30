@@ -1,12 +1,14 @@
 #!/usr/bin/env python3
 """Batch-1 graph cleanup for stateless streaming ONNX graphs.
 
-The streaming exporters trace one frame at batch 1, so most tensors carry
-size-1 axes (batch, time, a group of one) that the tracer turns into chains of
-Squeeze/Unsqueeze/Reshape/Transpose and into 5-D and 6-D intermediates. With
-every shape static those axes can be removed, and nothing here changes a
-number: every pass is a pure re-labelling of axes (a view), never a different
-arithmetic.
+The streaming exporters trace at batch 1 with T frames per call (T = 1 for the
+one-frame graphs, T = N for ``--frames-per-call N``), so most tensors carry
+size-1 axes (batch, time when T = 1, a group of one) that the tracer turns into
+chains of Squeeze/Unsqueeze/Reshape/Transpose and into 5-D and 6-D
+intermediates. With every shape static those axes can be removed, and nothing
+here changes a number: every pass is a re-labelling of axes, never a different
+arithmetic. The layout is ``[1, C, T, F]``: batch stays 1 and the frames sit on
+axis 2, as in the Conv paths; the passes must not move T onto axis 0.
 
 Passes, in the order ``optimize_batch1`` runs them:
 
@@ -28,6 +30,15 @@ Passes, in the order ``optimize_batch1`` runs them:
     can then cancel the Reshape pairs. Supported: elementwise ops,
     Transpose, MatMul, ReduceSum/Mean/Max/Min, Softmax. A node it cannot
     lower is left as it is and reported.
+
+    A grouped linear over T frames (``[1,T,G,1,K] @ [G,K,O]``, graphs that
+    emit several frames per call) has no spare unit axis, so dropping the
+    leading one would leave T on axis 0, which an accelerator reads as the
+    batch. There T is moved into the MatMul's row axis instead
+    (``[1,G,T,K] @ [G,K,O]``, a Transpose on the rank-4 tensor before and
+    after, nothing leaves rank 4 or batch 1); the numbers are the same.
+    Tensors that still have an axis 0 other than 1 are listed in the report
+    (``batch_axis_left``).
 
 Graph inputs, outputs, their names and shapes, the opset and the metadata are
 untouched; the result is checked for that before it is returned. Semantic
@@ -411,6 +422,54 @@ class _Lowering(object):
             nodes.append(_reshape(self.namer, self.model, name, out, reduced))
         return out, reduced
 
+    def frames_into_rows(self, node, out_shape, drop):
+        """A grouped linear run over T frames: ``[1,T,G,1,K] @ [G,K,O]``.
+
+        Dropping the leading unit axis would put T on axis 0, which an
+        accelerator reads as the batch. The unit axis in front of K is the
+        MatMul's row axis, so T goes there instead, and every tensor stays
+        rank 4 with axis 0 equal to 1::
+
+            [1,T,G,1,K] -> [1,T,G,K] -> Transpose(0,2,1,3) -> [1,G,T,K]
+            [1,G,T,K] @ [G,K,O] -> [1,G,T,O] -> Transpose(0,2,1,3)
+            -> [1,T,G,O] -> [1,T,G,1,O]
+
+        Returns the nodes, or None when the node is not of this form (the
+        caller then takes the generic path). The numbers are the same: each
+        output element is the same dot product.
+        """
+        from onnx import helper
+        rank = len(out_shape)
+        a = self.info.shape(node.input[0])
+        b = self.info.shape(node.input[1])
+        if (rank != 5 or a is None or b is None or len(a) != 5
+                or len(b) != 3 or list(drop) != [0] or a[0] != 1
+                or a[1] <= 1 or a[3] != 1 or out_shape[3] != 1
+                or tuple(a[2:3]) != tuple(b[:1])
+                or tuple(out_shape[:3]) != tuple(a[:3])
+                or self.info.initializers.get(node.input[1]) is None):
+            return None
+        t, g, k = a[1], a[2], a[4]
+        o = out_shape[4]
+        names = [self.namer.new('lo') for _ in range(4)]
+        mat = copy.deepcopy(node)
+        del mat.input[:]
+        mat.input.extend([names[1], node.input[1]])
+        mat.output[0] = names[2]
+        return [
+            _reshape(self.namer, self.model, node.input[0], names[0],
+                     (1, t, g, k)),
+            helper.make_node('Transpose', [names[0]], [names[1]],
+                             perm=[0, 2, 1, 3],
+                             name=self.namer.new('Transpose')),
+            mat,
+            helper.make_node('Transpose', [names[2]], [names[3]],
+                             perm=[0, 2, 1, 3],
+                             name=self.namer.new('Transpose')),
+            _reshape(self.namer, self.model, names[3], node.output[0],
+                     out_shape),
+        ]
+
     def build(self, node):
         op = node.op_type
         out_shape = self.info.shape(node.output[0])
@@ -451,6 +510,9 @@ class _Lowering(object):
                               keep=(rank - 2, rank - 1))
             if drop is None:
                 return None
+            rows = self.frames_into_rows(node, out_shape, drop)
+            if rows is not None:
+                return rows
             a = self.operand(node.input[0], pre, drop, rank)
             b = self.operand(node.input[1], pre, drop, rank)
             if a is None or b is None or min(len(a[1]), len(b[1])) < 2:
@@ -549,6 +611,26 @@ def _high_rank(model, target_rank):
             if len(v.type.tensor_type.shape.dim) > target_rank]
 
 
+def _batch_axis_left(model, target_rank):
+    """Names of tensors whose axis 0 is not 1: an accelerator reads that axis
+    as the batch. Checked: every rank-``target_rank`` tensor and every tensor
+    of rank 3 or more that this optimizer created (``lo_b1_*``). A GRU's Y
+    output is ``[seq, directions, batch, hidden]``, not a batch axis, and is
+    skipped; the GRU state tensors keep the exporter's own names."""
+    inferred = _inferred(model)
+    skip = {o for node in model.graph.node if node.op_type == 'GRU'
+            for o in node.output}
+    left = []
+    for v in inferred.graph.value_info:
+        dims = v.type.tensor_type.shape.dim
+        if v.name in skip or not dims or dims[0].dim_value == 1:
+            continue
+        if len(dims) == target_rank or (len(dims) >= 3
+                                        and v.name.startswith('lo_b1_')):
+            left.append(v.name)
+    return left
+
+
 def optimize_batch1(model, target_rank=4, verify=False):
     """Run the passes on ``model`` in place; return a report dict.
 
@@ -574,6 +656,7 @@ def optimize_batch1(model, target_rank=4, verify=False):
     del model.graph.value_info[:]
     report['nodes_after'] = len(model.graph.node)
     report['high_rank_left'] = _high_rank(model, target_rank)
+    report['batch_axis_left'] = _batch_axis_left(model, target_rank)
     if (_boundary(model) != boundary
             or [(o.domain, o.version) for o in model.opset_import] != opsets):
         raise RuntimeError('batch-1 optimizer changed the graph boundary')
@@ -639,6 +722,8 @@ def format_report(report):
     lines += ['blocked: %s %s' % item for item in report['blocked']]
     if report['high_rank_left']:
         lines.append('rank above target left: %s' % report['high_rank_left'])
+    if report['batch_axis_left']:
+        lines.append('axis 0 is not 1 on: %s' % report['batch_axis_left'])
     return '\n'.join(lines)
 
 
