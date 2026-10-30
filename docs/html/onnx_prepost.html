@@ -271,7 +271,11 @@ Audio_ALG/PTQ，不屬於任何單一模型；測試在
 等價比對與量化一致檢查都在未整理的圖上完成，最後才對匯出的 .onnx 單獨執行下列指令，產出可上板的圖。它可用在任何靜態形狀的 ONNX：</p>
 <pre>python3 PTQ/onnx_batch1_optimizer.py model.onnx -o model_b1.onnx --verify</pre>
 <p>三道 pass 都只重新標記軸、不改任何算術，因此結果必須與原圖在 onnxruntime 逐位元相同
-（<code>--verify</code> 要求差 0）：</p>
+（<code>--verify</code> 要求差 0）。唯一例外是下面 lower_rank 的多幀分組線性層：算的是同樣的內積，
+但 onnxruntime 對 T 列與 1 列可能選不同的矩陣乘法 kernel，float32 加總順序不同，輸出會差在捨入等級
+（本機差 0，其他機器或 onnxruntime 版本可能不為 0）。含這種 MatMul 的圖改用容許值比對：
+每個輸出的差不得超過 <code>REGROUP_RTOL</code>（1e-4）乘上該輸出的最大絕對值（至少取 1）；
+報告會註明「tolerance」與重排的層數，其餘的圖仍須完全相同。</p>
 <ul>
 <li><b>fold_frequency_pad_into_conv</b>：餵給單一 Conv 的頻率軸零 Pad 折進 Conv 的 <code>pads</code>
 （時間軸不 pad；ConvTranspose 不動）。</li>
@@ -282,7 +286,7 @@ MatMul、ReduceSum/Mean/Max/Min、Softmax；其他 op 會列在 <code>blocked</c
 merge_views 抵消成對的 Reshape。多幀圖（<code>--frames-per-call N</code>）的分組線性層
 <code>[1,T,G,1,K] @ [G,K,O]</code> 沒有多餘的大小為 1 的軸可去，去掉最前面那個會讓 T 落在 axis 0
 （加速器讀成 batch）；此時改把 T 放進 MatMul 的列軸（<code>[1,G,T,K] @ [G,K,O]</code>，前後各一個
-Transpose），全程維持 rank 4、batch 1，數值相同。axis 0 仍不為 1 的 tensor 會列在報告的 <code>batch_axis_left</code>。</li>
+Transpose），全程維持 rank 4、batch 1，每個輸出元素是同一個內積。axis 0 仍不為 1 的 tensor 會列在報告的 <code>batch_axis_left</code>。</li>
 </ul>
 <p>整理前後的節點數與是否仍有 rank &gt; 4 的 tensor 隨模型而定，以 <code>--verify</code> 的輸出為準（各模型的實測數字待量測）。
 這些 op 在目標平台上是否有成本、rank-4 限制是否涵蓋中間 tensor，尚待工具鏈的算子報告確認。

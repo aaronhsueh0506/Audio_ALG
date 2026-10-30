@@ -1,7 +1,10 @@
 """The batch-1 ONNX cleanup: view merging, rank lowering, frequency-pad folding.
 
 Every pass is a re-labelling of axes, so the optimised graph must reproduce the
-original in onnxruntime EXACTLY (difference 0), not approximately.
+original in onnxruntime EXACTLY (difference 0), not approximately. The one
+exception is a grouped linear regrouped over T frames (same dot products, but
+onnxruntime may sum T rows in another float32 order): that graph is compared
+with a tolerance far above rounding and far below any wrong rewrite.
 """
 
 import copy
@@ -356,7 +359,8 @@ def test_frames_go_into_the_matmul_rows_not_into_the_batch_axis():
     original, report = _optimise(model)
     assert report['high_rank_left'] == []
     assert report['batch_axis_left'] == []
-    assert b1.verify_identical(original, model) == 0.0
+    assert report['frames_regrouped'] == 1
+    b1.check_outputs(original, model, tolerant=True)
     inferred = b1._inferred(model)
     mat = next(n for n in model.graph.node if n.op_type == 'MatMul')
     shapes = {v.name: [d.dim_value for d in v.type.tensor_type.shape.dim]
@@ -406,3 +410,40 @@ def test_a_rank_three_intermediate_with_t_on_axis_zero_is_reported():
     bad.graph.output.append(
         helper.make_tensor_value_info('y_bad', TensorProto.FLOAT, [1, 8, 512]))
     assert 'lo_b1_999' in b1._batch_axis_left(bad, 4)
+
+
+def _scaled_weights(model, factor, roll=0):
+    bad = copy.deepcopy(model)
+    init = next(i for i in bad.graph.initializer if i.name == 'w')
+    weights = numpy_helper.to_array(init) * np.float32(factor)
+    init.CopyFrom(numpy_helper.from_array(
+        np.roll(weights, roll, axis=0), name='w'))
+    return bad
+
+
+def test_a_regrouped_graph_is_verified_with_a_tolerance_and_says_so():
+    model = _grouped_linear_over_frames(8)
+    report = b1.optimize_batch1(model, verify=True)
+    assert report['frames_regrouped'] == 1
+    assert report['max_abs_diff'] <= b1.REGROUP_RTOL * 100
+    plain = _grouped_linear_over_frames(1)
+    assert b1.optimize_batch1(plain, verify=True)['frames_regrouped'] == 0
+
+
+def test_rounding_sized_noise_passes_only_the_tolerant_check():
+    """Weights off by 1e-5 relative: far below the tolerance, never zero."""
+    model = _grouped_linear_over_frames(8)
+    original, _ = _optimise(model)
+    noisy = _scaled_weights(model, 1.00001)
+    assert b1.check_outputs(original, noisy, tolerant=True) > 0.0
+    with pytest.raises(RuntimeError, match='changed the outputs'):
+        b1.check_outputs(original, noisy, tolerant=False)
+
+
+def test_the_tolerance_can_fail_a_wrong_group_mapping():
+    """Swapping which group a weight belongs to is not rounding."""
+    model = _grouped_linear_over_frames(8)
+    original, _ = _optimise(model)
+    wrong = _scaled_weights(model, 1.0, roll=1)
+    with pytest.raises(RuntimeError, match='regrouped over frames'):
+        b1.check_outputs(original, wrong, tolerant=True)

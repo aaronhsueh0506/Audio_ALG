@@ -51,6 +51,12 @@ Usage::
 
 ``--verify`` runs the original and the optimised graph in onnxruntime (graph
 optimisation off) on random inputs and requires the outputs to be identical.
+The one exception is a grouped linear regrouped over T frames: it is the same
+dot products, but onnxruntime may pick another matrix-multiply kernel for T
+rows than for one row, which changes the float32 summation order. A graph with
+such a MatMul is compared with a tolerance of ``REGROUP_RTOL`` times its output
+scale (about a thousand times above that rounding, far below any wrong
+rewrite); every other graph still has to match exactly.
 """
 
 from __future__ import annotations
@@ -394,6 +400,7 @@ class _Lowering(object):
         self.info = info
         self.namer = namer
         self.target = target_rank
+        self.regrouped = 0
 
     def operand(self, name, nodes, drop, rank):
         """(name, shape) of an input with the node's axes ``drop`` removed,
@@ -435,8 +442,9 @@ class _Lowering(object):
             -> [1,T,G,O] -> [1,T,G,1,O]
 
         Returns the nodes, or None when the node is not of this form (the
-        caller then takes the generic path). The numbers are the same: each
-        output element is the same dot product.
+        caller then takes the generic path). Each output element is the same
+        dot product; onnxruntime may sum it in another order for T rows, so
+        ``--verify`` compares such a graph with a tolerance.
         """
         from onnx import helper
         rank = len(out_shape)
@@ -451,6 +459,7 @@ class _Lowering(object):
             return None
         t, g, k = a[1], a[2], a[4]
         o = out_shape[4]
+        self.regrouped += 1
         names = [self.namer.new('lo') for _ in range(4)]
         mat = copy.deepcopy(node)
         del mat.input[:]
@@ -567,8 +576,9 @@ class _Lowering(object):
 
 def lower_rank(model, target_rank=4):
     """Bring every tensor above ``target_rank`` down by dropping size-1
-    axes. Returns ``(lowered, blocked)``: the number of nodes
-    rewritten and the ``(op_type, name)`` of those that could not be."""
+    axes. Returns ``(lowered, blocked, regrouped)``: the number of nodes
+    rewritten, the ``(op_type, name)`` of those that could not be, and how
+    many grouped linears were regrouped over T frames."""
     info = _Graph(model)
     lowering = _Lowering(model, info, _Namer(model), target_rank)
     result, blocked, lowered = [], [], 0
@@ -590,7 +600,7 @@ def lower_rank(model, target_rank=4):
             lowered += 1
     _replace(model.graph.node, result)
     _drop_unused_initializers(model)
-    return lowered, blocked
+    return lowered, blocked, lowering.regrouped
 
 
 # ------------------------------------------------------------------ the driver
@@ -651,7 +661,8 @@ def optimize_batch1(model, target_rank=4, verify=False):
     report = {'nodes_before': len(model.graph.node)}
     report['pads_folded'] = fold_frequency_pad_into_conv(model)
     report['views_removed'] = merge_views(model)
-    report['lowered'], report['blocked'] = lower_rank(model, target_rank)
+    (report['lowered'], report['blocked'],
+     report['frames_regrouped']) = lower_rank(model, target_rank)
     report['views_removed'] += merge_views(model)
     del model.graph.value_info[:]
     report['nodes_after'] = len(model.graph.node)
@@ -662,11 +673,8 @@ def optimize_batch1(model, target_rank=4, verify=False):
         raise RuntimeError('batch-1 optimizer changed the graph boundary')
     onnx.checker.check_model(model, full_check=True)
     if verify:
-        report['max_abs_diff'] = verify_identical(original, model)
-        if report['max_abs_diff'] != 0.0:
-            raise RuntimeError(
-                'batch-1 optimizer changed the outputs (max abs diff %g)'
-                % report['max_abs_diff'])
+        report['max_abs_diff'] = check_outputs(
+            original, model, tolerant=report['frames_regrouped'] > 0)
     return report
 
 
@@ -687,9 +695,13 @@ def _random_inputs(model, rng):
     return feeds
 
 
-def verify_identical(original, optimized, runs=3, seed=0):
+REGROUP_RTOL = 1e-4
+
+
+def output_differences(original, optimized, runs=3, seed=0):
     """Run both graphs in onnxruntime (graph optimisation off) on random
-    inputs; return the largest absolute output difference."""
+    inputs; return ``(output name, largest absolute difference, largest
+    absolute value of the original)`` for each output."""
     import onnxruntime as ort
     options = ort.SessionOptions()
     options.graph_optimization_level = ort.GraphOptimizationLevel.ORT_DISABLE_ALL
@@ -699,17 +711,47 @@ def verify_identical(original, optimized, runs=3, seed=0):
                              providers=['CPUExecutionProvider'])
         for m in (original, optimized)]
     rng = np.random.default_rng(seed)
-    worst = 0.0
+    names = [o.name for o in original.graph.output]
+    worst = [0.0] * len(names)
+    scale = [0.0] * len(names)
     for _ in range(runs):
         feeds = _random_inputs(original, rng)
         want = sessions[0].run(None, feeds)
         got = sessions[1].run(None, feeds)
-        for a, b in zip(want, got):
+        for i, (a, b) in enumerate(zip(want, got)):
+            if a.size:
+                with np.errstate(invalid='ignore'):
+                    scale[i] = max(scale[i], float(np.nanmax(np.abs(a)))
+                                   if np.isfinite(a).any() else 0.0)
             if np.array_equal(a, b, equal_nan=True):
                 continue
             diff = np.abs(a.astype(np.float64) - b.astype(np.float64))
-            worst = max(worst, float('inf') if np.isnan(diff).any()
-                        else float(diff.max()))
+            worst[i] = max(worst[i], float('inf') if np.isnan(diff).any()
+                           else float(diff.max()))
+    return list(zip(names, worst, scale))
+
+
+def verify_identical(original, optimized, runs=3, seed=0):
+    """The largest absolute output difference between the two graphs."""
+    return max((d for _, d, _ in output_differences(
+        original, optimized, runs, seed)), default=0.0)
+
+
+def check_outputs(original, optimized, tolerant=False, runs=3, seed=0):
+    """Return the largest output difference; raise when it is not allowed:
+    any difference at all, or with ``tolerant`` more than ``REGROUP_RTOL``
+    times the output scale (at least 1)."""
+    diffs = output_differences(original, optimized, runs, seed)
+    worst = max((d for _, d, _ in diffs), default=0.0)
+    for name, diff, scale in diffs:
+        allowed = REGROUP_RTOL * max(1.0, scale) if tolerant else 0.0
+        if diff > allowed or math.isnan(diff):
+            raise RuntimeError(
+                'batch-1 optimizer changed the outputs (max abs diff %g; '
+                'output %s differs by %g, allowed %g%s)'
+                % (worst, name, diff, allowed,
+                   ' -- tolerance applies because a grouped linear was '
+                   'regrouped over frames' if tolerant else ''))
     return worst
 
 
@@ -760,7 +802,11 @@ def main(argv=None):
                            args.verify)
     print(format_report(report))
     if args.verify:
-        print('max abs diff vs original: %g' % report['max_abs_diff'])
+        print('max abs diff vs original: %g (%s)' % (
+            report['max_abs_diff'],
+            'tolerance: %d grouped linear(s) regrouped over frames'
+            % report['frames_regrouped'] if report['frames_regrouped']
+            else 'exact'))
     return 0
 
 
