@@ -297,7 +297,7 @@ remove the AEC RC marker without this verdict.
 From `NR/`:
 
 ```bash
-python3 -m pytest -q tests
+python3 -m pytest -q
 ```
 
 From `NR/c_impl/`, run both SIMD 0/1 combinations:
@@ -310,7 +310,7 @@ make BACKEND=ne10 SIMD=<0-or-1> WERROR=1 \
 
 Pass conditions:
 
-- [ ] Python/C effective config parity passes for 3 grids x 4 strengths.
+- [ ] Python/C effective config parity passes for 5 grids x 4 strengths.
 - [ ] Defaults are 16k/256/128 and 48k/1024/512.
 - [ ] 16k/512/256 remains a supported explicit alternate.
 - [ ] `FrameProcessor(sample_rate=...)` selects the project default grid.
@@ -326,11 +326,11 @@ Pass conditions:
 Use the current checked-in runner, not an old scratch script:
 
 ```bash
-python tools/run_vctk_benchmark.py \
+python python/tools/run_vctk_benchmark.py \
   --mode full --strength balanced \
   --output results/vctk_candidate.json
 
-python tools/compare_vctk_benchmark.py \
+python python/tools/compare_vctk_benchmark.py \
   results/vctk_baseline.json \
   results/vctk_candidate.json
 ```
@@ -338,8 +338,7 @@ python tools/compare_vctk_benchmark.py \
 Run the full 824-case VCTK+DEMAND set for:
 
 - [ ] 16k/256/128 full mode;
-- [ ] 16k/512/256 full mode;
-- [ ] stationary mode on both supported 16 kHz grids.
+- [ ] 16k/512/256 full mode.
 
 Make one explicit product decision:
 

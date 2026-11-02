@@ -107,6 +107,9 @@ lane 的 `filter_converged` / `usable_linear` / `dt_indicator` / `saturation_lev
 | `n_freqs` | `int` | 這一幀的 bin 數 |
 | `linear_spectra[ch]` | `const Complex*` | 四路 linear AEC 的**頻譜**，就是 `mcab_fuse()` 稍後會用的同一份。讓外部 beamformer 直接沿用既有的分析轉換，不必重做一次 STFT。**這是別名**，直接指向各 lane 自己的 buffer |
 | `formed_hop[ch]` | `const float*` | 各 lane 與 `linear_spectra[ch]` 同一次選擇的**時域** hop（`hop_size` 個 sample）。做自己的 sqrt-Hann 分析的時域 beamformer 要吃這個。**這也是借用的**，沒有 interleaved 拷貝 |
+| `render_spectra[ch]` | `const Complex*` | 各 lane 的 rendering base：平常就是 `linear_spectra[ch]` 本身；該 lane 的輸出守衛在這個 hop 觸發（`guard_active[ch]`）時改為該 lane 的 capture 頻譜。唯讀借用，**不與 `formed_hop[ch]` 成對** |
+| `guard_active[ch]` | `int` | 該 lane 的輸出守衛在這個 hop 是否觸發 |
+| `post_reset_serial` | `uint32_t` | 四條 lane 的 `aec_post_reset_serial()` 加總（模 2^32）；任何一條 lane 做了 post-chain 硬重置它就會動。處理方式見下列 `McabFrame.post_reset_serial` |
 | `aligned_ref` | `const float*` | 這一 hop 實際餵給四條 lane 的對齊後 far（`hop_size` 個 sample）：ring 已存夠樣本、能供應 `delay.delay_samples` 這個偏移之後，是你的 far 位移該值的結果；在那之前是原樣的 far hop（整個 hop 一起切換）；給需要「與線性濾波器吃到同一份 far」的外部 NN 後級用 |
 
 `McabFrame`（`mcab_fuse()` 填，定義在 `mcab.h`）：
@@ -114,7 +117,10 @@ lane 的 `filter_converged` / `usable_linear` / `dt_indicator` / `saturation_lev
 | 欄位 | 內容 |
 |---|---|
 | `n_freqs`, `hop` | 這一幀的 bin 數與 hop |
-| `e` | beamformed 誤差頻譜（pre-RES；RES 與 NR 據以估計，也是增益套用的對象） |
+| `e` | beamformed 誤差頻譜（pre-RES）：**分析 seam**，RES 與 NR 據以估計；**增益不要乘在 `e` 上**，渲染請用 `b` |
+| `b` | rendering base B(f)：輸出為 `P = B × gain`；沒有任何貢獻 lane 的輸出守衛觸發（`guard_lanes == 0`）時就是 `e`（同一個指標） |
+| `guard_lanes` | `int`；bit ch = 貢獻的 lane ch 在這個 hop 的輸出守衛觸發 |
+| `post_reset_serial` | `uint32_t`；同 `McabFront.post_reset_serial`。與你上次處理的值不同時，要在這個 hop 的第一次 comfort-noise 抽樣與 `ac_istft_push()` 之前先 `ac_istft_reset()`、並把 rng 重設為 `MCAB_SAMPLE_CNG_RNG_SEED`（`mcab_sample_post_reset_due()`）；mcab 不會因此 reset lane，降噪器是否跟著重設由應用決定 |
 | `y` | 投影後的近端頻譜 |
 | `x` | lane 0 的 far 頻譜（四條 lane 吃同一份 far；混合 warm/soft realign 的 hop 略過逐 bin 比對，`x` 仍取 lane 0） |
 | `r2` | 投影後的殘餘回音 PSD（int16² 功率尺度；`mcab_sample_anr_gain()` 餵降噪器前乘以 `MCAB_SAMPLE_PSD_SCALE_INV` = 1/32768²） |

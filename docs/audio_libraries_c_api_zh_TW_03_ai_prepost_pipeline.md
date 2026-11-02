@@ -17,8 +17,8 @@ int  dfn2_prepost_post_process_freq(DFN2Prepost *p, float re[DFN2_N_BINS], float
 int  dfn2_prepost_output_frame_index(const DFN2Prepost *p, long long *frame);
 ```
 
-- `cfg` 欄位：`io_mode`、`fft`（`DFN2_IO_TIME` 必填）、`window`（可選，**會被複製**，
-  NULL = 內建 sqrt-Hann，出貨路徑都用 NULL）、`istft`（`DFN2_IO_TIME` 必填，應用端持有的 `AcIstft`，borrowed；用 `dfn2_framing_config()` 建）、`erb_fwd`／`erb_inv`（**兩個模式都必填**，borrowed）、
+- `cfg` 欄位：`io_mode`、`fft`（`DFN2_IO_TIME` 必填）、`window`（可選，borrowed，`DFN2_WIN_LEN` 項，須活得比實例久；
+  NULL = pool 內自帶 sqrt-Hann 表，出貨路徑都用 NULL）、`istft`（`DFN2_IO_TIME` 必填，應用端持有的 `AcIstft`，borrowed；用 `dfn2_framing_config()` 建）、`erb_fwd`／`erb_inv`（**兩個模式都必填**，borrowed）、
   `atten_lim_db`（0 = 關閉）。
 - **Lookahead pair。** mask lookahead `M`（`DFN2_MASK_LOOKAHEAD`，0..2）與 deep-filter lookahead `D`（`DFN2_DF_LOOKAHEAD`，0..4）
   是建置時決定的一對（共 15 個合法組合，兩者之間沒有大小限制），預設都是 1。匯出的 ONNX graph 不隨這一對改變，隨之改變的是 host 端
@@ -125,7 +125,7 @@ dfn_hop_end(&hop, out);                                  /* 合成剛好一個 h
 |---|---|---:|---|
 | `Aec`（mono，MATCHED n=5） | `aec_get_mem_size()` | 366,000 | 48 kHz／1024：1,162,736 |
 | `AnrDenoiser`（函式庫 level） | `anr_get_mem_size()` | 45,344 | 範例程式有 NR 時 |
-| `AcIstft`（合成） | `ac_istft_get_mem_size()` | 11,344 | 範例程式有合成時；mono 範例的合成借用 AEC 的合成窗（`aec_synthesis_window()`），不另帶窗表，為 10,320 |
+| `AcIstft`（合成） | `ac_istft_get_mem_size()` | 11,344 | 範例程式有合成時；此欄 11,344 是 4ch 範例 `mcab_static` 的合成（帶自己的窗表）；mono 範例的合成借用 AEC 的合成窗（`aec_synthesis_window()`），不另帶窗表，為 10,320 |
 | `AecRes`（4ch 後波束 RES） | `aec_res_get_mem_size()` | 7,904 | `Mcab` 的 pool 不含；4ch 的範例自己建一個（48 kHz／1024：29,408） |
 | 增益／頻譜暫存 | 範例程式自己算 | 2,624 | mono 與 `mcab_external_static` 為三個 `n_freqs` float 向量 + 一個複數向量，各自 `ALIGN16`；`mcab_static` 為兩個向量 + 一個複數向量（2,096） |
 | 4ch lane（`Aec` × 4，`mcab_lane_config()`） | `aec_get_mem_size()` 每條 | 803,968（4 × 200,992） | 48 kHz／1024：2,936,832；由應用建立，不在 `Mcab` 的 pool 內 |
@@ -143,7 +143,7 @@ mono 的 16 kHz／256 合計 = `ALIGN16(366,000) + 45,344 + 10,320 + 2,624 = 424
 （範例的 beamformer 是 sample 層 helper `mcab_sample_beam_*`，不在 archive 內）。
 
 **串接順序**（4ch，一 hop）：`mcab_process_front()` → beamformer → `mcab_fuse()`（`frame.g_res_ctx` 為 NULL）→ `mcab_sample_res_input()` + `aec_res_process()` → `mcab_sample_anr_gain()` → `sk_min_f32()` →
-`sk_capply_gain_f32()` → `aec_cng_fill()` → `ac_istft_push()`。**mono**：`aec_process_context()` → `aec_get_res_context()`（`ctx.res_gain` 是 `Aec` 自己的 RES gain）→ `anr_process_gain()`／`anr_get_gain()` → 同上。
+`sk_capply_gain_f32()` → `aec_cng_fill()` → `ac_istft_push()`。**mono**：`aec_process_context()` → `aec_get_res_context()`（`ctx.res_gain` 是 `Aec` 自己的 RES gain）→ `aec_get_output_base()`（渲染底座，NR 估計與增益都乘在它上面）→ `anr_process_gain()`／`anr_get_gain()` → 同上。
 失敗時重置 flow（`mcab_reset()` 連 lane 與 estimator 一起重置；或 mono 的 `Aec`）、4ch 的 `AecRes`、降噪器、合成與 comfort-noise RNG（以及 NN stage）。
 
 ---

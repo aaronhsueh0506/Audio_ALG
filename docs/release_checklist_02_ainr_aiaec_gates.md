@@ -190,9 +190,10 @@ make -C AIAEC SIMD=0 WERROR=1 test             # lib + pytest
 - [ ] The archive is configuration-keyed (`build/simd<N>-<sig>/`, keyed on
       `CC`/`AR`/`CFLAGS`/`CPPFLAGS`/`SIMD`/`WERROR`) and a signature collision
       is refused rather than reinterpreted; resolve it with `print-lib-path`.
-- [ ] No AIAEC translation unit includes `simd_kernels.h`, so the SIMD knob
-      must leave every AIAEC object byte-identical — a difference here means
-      something started depending on the kernels and the claim needs redoing.
+- [ ] The SIMD knob changes every member that includes `utility/simd_kernel_nn.h`
+      (`ulcnet_process`, `ulcnet_model_io`, `deepvqe_process`,
+      `deepvqe_prepost`); never mix a `SIMD=0` archive with a `SIMD=1`
+      application, and resolve the archive with `print-lib-path`.
 - [ ] Each pre/post class (`ulcnet_prepost`, `deepvqe_prepost`) is a THIRD
       translation unit composing two files that stay independently linkable
       for their own parity tests, and its byte-identity tests against the

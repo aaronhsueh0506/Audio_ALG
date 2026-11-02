@@ -118,8 +118,9 @@ files); `AEC` `selftest`, `test-counter-saturation`,
 `test_stft_guard`), `test_audio_utils`, `test_pool`, `test_wav`,
 `test_wav_nr_style`, `test_zero_heap`, `test_ne10_force_c`; `NR/c_impl`
 `test-config`, `test-reconfigure`, `test-noise-restart`, `test-scene-change`,
-`test-config-parity`, `test-bit-exact` (plain `make test` there only runs the
-denoiser when a `test.wav` sits next to it, so it is not a gate).
+`test-config-parity`, `test-bit-exact` (plain `make test` there is itself a gate,
+and `make test-full` is the complete tier; `make run-sample` denoises a
+`test.wav` and is not a check).
 
 ## Appendix B. Benchmark protocol
 

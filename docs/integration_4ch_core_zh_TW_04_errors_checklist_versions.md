@@ -216,8 +216,8 @@ lane、estimator 和 sample 層 helper 的 pool 不在其中；`aec.h`／`delay_
 
 另外，不論有沒有給 `expected`，下列檢查也會讓 `mcab_init_ex()` 回 `NULL`，且 pool 一個 byte 都不寫：pool 未 16-byte 對齊、
 config 無效、`libs` 為 NULL 或其中的 lane／estimator 不符（見 [§3 第 5 步](integration_4ch_core_zh_TW_02_lifecycle.md#3-lifecycle)）。
-`layout_version` 只認 25：較早的版號（17～24；21～24 屬於 mcab 的前身層）一律被拒，即使 `bytes` 剛好夠
-（`tests/test_mcab.c` 的 `run_static_parity` 逐一驗過 17～24）。
+`layout_version` 只認 26：較早的版號（17～25；21～24 屬於 mcab 的前身層，25 是沒有 rendering base 的版面）一律被拒，即使 `bytes` 剛好夠
+（`tests/test_mcab.c` 的 `run_static_parity` 逐一驗過 17～25）。
 
 ### 8.3 序列化
 

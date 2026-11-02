@@ -72,11 +72,16 @@ th{background:#eef2f8}
   |-------------------------&gt;|                          |                          |                          |
   | aec_get_res_context(aec, &amp;c)                        |                          |                          |
   |-------------------------&gt;|                          |                          |                          |
-  | c.error_spec = E、c.comfort_noise、c.res_gain(借用到下一次 process / reset)    |                          |
+  | c.error_spec = E(分析 seam)、c.comfort_noise、c.res_gain(借用到下一次 process / reset)|                   |
   |&lt;-------------------------|                          |                          |                          |
-  | sk_min_f32 + sk_capply_gain_f32 -&gt; P = E*min(1, G_res);cng_on 時 aec_cng_fill  |                          |
-  |-- dfn_hop_begin(&amp;hop, c.error_spec, P) ------------&gt;|                          |                          |
-  |                          |                          | dfn_res_stage_begin(stage, E, P, &amp;job)              |
+  | aec_get_output_base(aec, &amp;b)  ->  b.base_spec = B(渲染基底;守衛未觸發時 = E)  |                          |
+  |-------------------------&gt;|                          |                          |                          |
+  |&lt;-------------------------|                          |                          |                          |
+  | follow_post_reset:aec_post_reset_serial 變動 -> CNG 種子回 AEC_CNG_SEED、清 OLA 尾巴 |                |
+  | (4ch:mcab_sample_post_reset_due(&amp;handled, &amp;frame) -> rng = MCAB_SAMPLE_CNG_RNG_SEED、橋內合成 reset / 48 kHz dfn_hop_reset) |
+  | sk_min_f32 + sk_capply_gain_f32 -&gt; P = B*min(1, G_res);cng_on 時 aec_cng_fill  |                          |
+  |-- dfn_hop_begin(&amp;hop, b.base_spec, P) ------------&gt;|                          |                          |
+  |                          |                          | dfn_res_stage_begin(stage, B, P, &amp;job)              |
   |                          |                          |-------------------------&gt;|                          |
   |                          |                          | 1 = job 已開 | 0 = 前 M 個 hop(沒有模型幀)      |
   |                          |                          |&lt;-------------------------|                          |
@@ -105,19 +110,19 @@ th{background:#eef2f8}
 <h2>3. 穩態 hop:8／16 kHz host(經 <code>DfnRateBridge</code>)</h2>
 <pre>App(main.c)               DfnHop                  DfnRateBridge               DfnResStage                model | NPU
   |                          |                          |                          |                          |
--- 每個 host hop(8 / 16 kHz host);前半同 48 kHz:aec_process_context -&gt; aec_get_res_context -&gt; 形成 P -----------------------
-  | dfn_hop_begin(&amp;hop, E, P)|                          |                          |                          |
+-- 每個 host hop(8 / 16 kHz host);前半同 48 kHz:aec_process_context -&gt; aec_get_res_context -&gt; aec_get_output_base -&gt; 形成 P -----------------------
+  | dfn_hop_begin(&amp;hop, B, P)|                          |                          |                          |
   |-------------------------&gt;|                          |                          |                          |
-  |                          | dfn_rate_bridge_begin(bridge, E, P)                 |                          |
+  |                          | dfn_rate_bridge_begin(bridge, B, P)                 |                          |
   |                          |-------------------------&gt;|                          |                          |
-  |                          |                          | E、P 各自:ac_istft_push(原生 WOLA)-&gt; audio_resampler 升頻(16 kHz x3 / 8 kHz x6)-&gt; 48 kHz FIFO
+  |                          |                          | B、P 各自:ac_istft_push(原生 WOLA)-&gt; audio_resampler 升頻(16 kHz x3 / 8 kHz x6)-&gt; 48 kHz FIFO
 -- 迴圈:每 hop 0..2 次(16 k/hop 128 為 0,1,1,1;16 k/hop 256 與 8 k/hop 128 為 1,2) ---------------------------------------
   | dfn_hop_nn_begin(&amp;hop, &amp;job)                        |                          |                          |
   |-------------------------&gt;|                          |                          |                          |
   |                          | dfn_rate_bridge_nn_begin(bridge, &amp;job)              |                          |
   |                          |-------------------------&gt;|                          |                          |
   |                          |                          | FIFO 每滿 512:ac_stft_push x2(sqrt-Hann 1024/512)   |
-  |                          |                          | dfn_res_stage_begin(E48, P48, &amp;job)                 |
+  |                          |                          | dfn_res_stage_begin(B48, P48, &amp;job)                 |
   |                          |                          |-------------------------&gt;|                          |
   |                          |                          | 1 | 0(warm-up 幀由 bridge 自己 finish)              |
   |                          |                          |&lt;-------------------------|                          |
@@ -152,7 +157,7 @@ th{background:#eef2f8}
   |&lt;-------------------------|                          |                          |                          |
   | mcab_sample_beam_fuse(unit, &amp;f)                     |                          |                          |
   |-------------------------&gt;|                          |                          |                          |
-  |                          | mcab_fuse(flow, beam.weights, beam.spectrum, &amp;f):e / y / r2 / cn(BF 權重投影);f.g_res_ctx = NULL
+  |                          | mcab_fuse(flow, beam.weights, beam.spectrum, &amp;f):e / b / y / r2 / cn(BF 權重投影);f.g_res_ctx = NULL
   |                          |-------------------------&gt;|                          |                          |
   | MCAB_OK | MCAB_SEQUENCE_ERROR(沒有本 hop 的 beam,未改)| 其他拒絕:helper 與 flow 已整個 reset                    |
   |&lt;-------------------------|                          |                          |                          |

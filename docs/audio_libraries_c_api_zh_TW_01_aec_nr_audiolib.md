@@ -74,20 +74,38 @@ board_free(pool);
 一般 lockstep AEC（RES 增益在應用端套用，合成交給應用端持有的 audiolib `AcIstft`）：
 
 ```c
+#if !defined(AEC_OUTPUT_GUARD_API_VERSION) || AEC_OUTPUT_GUARD_API_VERSION < 1
+#error "aec.h 太舊：自行渲染頻譜的應用需要 output guard API"
+#endif
+
 int hop = aec_hop_size(aec);
 AecResContext ctx;
+AecOutputBase ob;
 
 aec_process_context(aec, mic_hop, ref_hop);        /* 只算頻域 context，不做合成 */
 aec_get_res_context(aec, &ctx);
 if (!ctx.error_spec || !ctx.res_gain) return -1;    /* 本 hop 沒有可用的 context */
-sk_capply_gain_f32(spec, ctx.error_spec, ctx.res_gain, ctx.n_freqs);
+memset(&ob, 0, sizeof(ob));
+ob.struct_size = sizeof(ob);
+if (aec_get_output_base(aec, &ob) != 0) return -1;  /* 渲染底座 B；error_spec 只是分析 seam */
+if (aec_post_reset_serial(aec) != last_serial) {    /* hard reset：先於本 hop 的 CNG 與 push */
+    last_serial = aec_post_reset_serial(aec);
+    ac_istft_reset(istft);
+    cng_rng = AEC_CNG_SEED;                         /* 有用 comfort noise 時一併重設其種子 */
+}
+sk_capply_gain_f32(spec, ob.base_spec, ctx.res_gain, ctx.n_freqs);
 ac_istft_push(istft, spec, out_hop);                /* inverse FFT + sqrt-Hann + overlap-add，一個 hop 輸出 */
 ```
 
 `mic_hop`、`ref_hop`、`out_hop` 都至少有 `hop` 個 `float`；`spec` 是 `ctx.n_freqs` 個 `Complex`
 （`AecConfig` 用 `enable_res = 0`、`return_res_context = 1`，增益由應用端乘上）。`istft` 以
-`ac_stft_config_default(&cfg, fft_size)` 配出大小後 `ac_istft_init()`，歸應用端所有，串流重啟時與 `aec_reset()` 一起
-`ac_istft_reset()`。`ref_hop` 必須是實際送往 speaker 的 render reference，且與 mic 同 sample clock。
+`ac_stft_config_default(&cfg, fft_size)` 填好 `cfg` 後，把 `cfg.window` 指向 `aec_synthesis_window()` 借來的表
+（唯讀、與 `Aec` 同壽命；`fft_size` 取它回傳的長度，預設 sqrt-Hann 表與 library 自己的表差最後一個 float bit），再
+`ac_istft_get_mem_size()`／`ac_istft_init()`，歸應用端所有，串流重啟時與 `aec_reset()` 一起
+`ac_istft_reset()`。`aec_post_reset_serial()` 改變（`aec_reset()` 之後，或 process 內部的 hard reset）時，必須在本 hop 第一次 CNG
+抽樣與 `ac_istft_push()` 之前清 OLA 尾巴並把 comfort noise 種子設回 `AEC_CNG_SEED`，但不可因此重置 AEC。
+仍渲染 `ctx.error_spec` 的舊寫法不會報錯，卻會無聲失去輸出守衛；遷移步驟見 [輸出守衛遷移說明](../lib/aec/docs/sdk_migration_output_guard.md)。
+`ref_hop` 必須是實際送往 speaker 的 render reference，且與 mic 同 sample clock。
 
 同一次 `aec_process_context()` 之後也可以取 linear context（formed linear output、aligned far、delay state）：
 
@@ -111,6 +129,9 @@ same-hop/same-reference 前提，通常只應由 4 通道 flow（`pipelines/4ch_
 | `aec_reset()` | stream/session boundary；保留 config，清除 DSP state |
 | `aec_get_linear_context()` | formed linear output、aligned far、delay state/generation |
 | `aec_get_res_context()` | error/near/echo spectrum、R2、RES gain、CNG context |
+| `aec_get_output_base()` | 渲染底座 `base_spec`（守衛 hop 上為 error + echo，其餘等於 `error_spec`）；增益要乘在它上面 |
+| `aec_post_reset_serial()` | hard post-chain reset 計數；變動時應用端清 OLA 尾巴並重設 CNG 種子 |
+| `aec_synthesis_window()` | library 自己的合成窗（`block_size` = `fft_size`）；外部 `AcIstft` 借用它 |
 | `aec_debug_status()` | delay、ERLE、convergence、power、duty-cycle snapshot |
 | `aec_apply_external_realign()` | 僅 `EXTERNAL_ALIGNED` mode；通知外部 alignment 已改變 |
 
@@ -131,7 +152,7 @@ level 改變 far-active 地板 `min_gain_floor_far_active_db`（-20/-28/-38 dB�
 平滑歷史都繼續跑。
 
 > C 稱 level（`AecLevel`，AEC 與 `AecRes` 共用，0..3、預設 `AEC_LEVEL_BALANCED` = 1），Python 稱 preset：**C level == Python preset**，值名與整數相同，
-> 逐項對照見 [C／Python 函式對照表](c_python_function_map.md)。舊名 `AecPreset`、`AEC_PRESET_*` 仍保留在 `aec.h` 末段（同值，因為 Python 端的測試讀這幾行），舊函式名已移除。
+> 逐項對照見 [C／Python 函式對照表](c_python_function_map.md)。舊名 `AecPreset`、`AEC_PRESET_*` 仍保留在 `aec.h` 開頭的 `AecLevel` 定義處（enum 內的 `AEC_PRESET_*` 與 `typedef AecLevel AecPreset`，同值，因為 Python 端的測試讀這幾行），舊函式名已移除。
 
 ```c
 /* 兩個 hop 之間呼叫；ramp_ms=0 下一個 hop 生效，>0 以 dB 線性走過去（上限 60 s） */
@@ -255,7 +276,8 @@ AEC + NR + RES gain fusion 應只算 gain、不先改 spectrum：
 float gain[n_freqs];
 const float *extra_r2 = aec_r2_on_audio_power_scale;
 
-if (anr_process_gain(nr, error_spec, extra_r2, gain) != 0) {
+/* base_spec：aec_get_output_base() 的渲染底座，即 NR 要濾的那個頻譜 */
+if (anr_process_gain(nr, base_spec, extra_r2, gain) != 0) {
     /* error */
 }
 ```

@@ -37,8 +37,8 @@ and the spectrum it filters stay one signal, so a guard hop never pairs a captur
 estimate. There is no denoiser here, so no further estimator reads either spectrum.
 
 **Hard post-chain reset event.** The AEC moves `aec_post_reset_serial()` when its post chain is hard-reset inside a
-processing call (`aec_reset()`, a confirmed delay change that restarts the filter, a first acquisition without warm
-transfer, a bad-relock revert); warm-transfer and soft realignments do not move it. `follow_post_reset()` keeps the
+processing call (a confirmed delay change that restarts the filter, a first acquisition without warm
+transfer) or by `aec_reset()`; warm-transfer and soft realignments and the bad-relock soft revert do not move it. `follow_post_reset()` keeps the
 last handled serial. On a new value the comfort noise restarts from `AEC_CNG_SEED` before that hop's first draw. The
 stage never resets on it and the program never resets the AEC in response. At 48 kHz the program owns the synthesis
 (`AcIstft`) and the stage delays every frame by `DFN_RES_STAGE_LOOKAHEAD_FRAMES` hops, so the overlap-add tail is

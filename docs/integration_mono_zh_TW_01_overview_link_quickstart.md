@@ -18,9 +18,9 @@
  │ aec_config_from_level(&aec_cfg,level,sr); 再設 fft_size、delay_*、enable_res = 0、return_res_context = 1（§4.1）
  │ aec_get_mem_size(&aec_cfg) ─────►│            → bytes（0 = 無效）
  │ anr_config_for_level_grid(sr,fft,level); anr_get_mem_size(&nr_cfg) ──►│   → bytes（0 = 無效）
- │ ac_stft_config_default(&sc,fft); ac_istft_get_mem_size(&sc) ───────────────►│   → bytes（0 = 無效）
+ │ ac_stft_config_default(&sc,fft); sc.window = 任一非 NULL 替身表; ac_istft_get_mem_size(&sc) ──►│   → bytes（0 = 無效）
  │ 配置一塊 16-byte 對齊的 pool = Σ ALIGN16(各塊) + 增益/頻譜暫存
- │ aec_init(mem,bytes,&aec_cfg) ────►│  anr_init(mem,bytes,&nr_cfg) ─►│  ac_istft_init(mem,bytes,&sc) ─►│
+ │ aec_init(mem,bytes,&aec_cfg) ────►│  anr_init(mem,bytes,&nr_cfg) ─►│  aec_synthesis_window(aec,&sc.window,&len) → ac_istft_init(mem,bytes,&sc) ─►│
  │                                  （任一個回 NULL：停止，不要繼續跑）
  │══ 每個 hop（mic[hop]、ref[hop]；hop = grid.hop_size）════════════════════
  │ aec_process_context(aec,mic,ref) ►│            （void；線性 AEC + AEC 自己的 RES 增益）
@@ -123,9 +123,11 @@ mic hop + ref hop ──► Aec (aec_process_context) ──► aec_get_res_cont
                                                                               │
         ┌─────────────────────────────────────────────────────────────────────┘
         ▼   G_res = ctx.res_gain（AEC 自己的殘留 gain；不要 RES 時用 unity）
-   G_nr = anr_process_gain(...) + anr_get_gain(...)  ─►  sk_min_f32(G_nr, G_res)  ─►  sk_capply_gain_f32(E)
+   G_nr = anr_process_gain(...) + anr_get_gain(...)  ─►  sk_min_f32(G_nr, G_res)  ─►  sk_capply_gain_f32(B)
         ─►  aec_cng_fill（CNG 開著、且有 RES gain 時）  ─►  ac_istft_push  ──► out hop
 ```
+
+圖中 B 是 `aec_get_output_base()` 交出的渲染基底 `b.base_spec`（`ctx.error_spec` 只是分析 seam，不拿來渲染）；`aec_post_reset_serial()` 變了時的處理見下方第 0 步。
 
 mono 的 RES 是明確的例外：它在 `Aec` 的呼叫裡（`aec_process_context()` 算出殘留 gain，`aec_get_res_context()` 以
 `ctx.res_gain` 交出，強度用 `aec_set_level()`），沒有獨立的 `AecRes` 物件；範例只決定要不要套用這個 gain。
@@ -135,7 +137,7 @@ mono 的 RES 是明確的例外：它在 `Aec` 的呼叫裡（`aec_process_conte
 |---|---|---|---|
 | `Aec`（線性 AEC，含 AEC3 殘留 gain 的 context；RES gain 就是它自己的 `ctx.res_gain`） | `lib/aec`（`libaec.a`） | `aec_get_mem_size(&aec_cfg)` | `aec_init(mem, bytes, &aec_cfg)` |
 | `AnrDenoiser`（可選） | `lib/nr`（`libanr.a`） | `anr_get_mem_size(&nr_cfg)`（`nr_cfg = anr_config_for_level_grid(sr, fft_size, level)`，最小值追蹤視窗 `L` 用函式庫預設） | `anr_init()` |
-| `AcIstft`（合成） | audiolib（`libaudio_common.a`） | `ac_istft_get_mem_size(&synth_cfg)`（`ac_stft_config_default(&synth_cfg, fft_size)`） | `ac_istft_init()` |
+| `AcIstft`（合成） | audiolib（`libaudio_common.a`） | `ac_istft_get_mem_size(&synth_cfg)`（`ac_stft_config_default(&synth_cfg, fft_size)`；`synth_cfg.window` 先設任一非 NULL 的替身表來定尺寸，`aec_init()` 之後以 `aec_synthesis_window()` 換成 AEC 自己的合成窗，借用的窗不佔 pool） | `ac_istft_init()` |
 | 增益／頻譜暫存（unity、總增益、NR 額外噪聲、輸出頻譜） | 你自己的記憶體 | `3 × ALIGN16(n_freqs × sizeof(float)) + ALIGN16(n_freqs × sizeof(Complex))`（`main.c` 的 `post_plan()`；不要 RES／NR 時的 unity 向量用得到，§2 的最小範例只要 2 個 float 向量） | unity 向量要自己填 1 |
 | 格點與 `AecConfig` | `lib/aec`（`libaec.a`） | – | `aec_resolve_signal_grid()` + `aec_config_from_level()`，接縫欄位自己設（[§4.1](integration_mono_zh_TW_02_lifecycle_config_errors.md#41-aecconfig-的接縫欄位範例的-derive_lane)） |
 
@@ -174,7 +176,7 @@ mono 的 RES 是明確的例外：它在 `Aec` 的呼叫裡（`aec_process_conte
 #include "utility/simd_kernel_nn.h"    /* skn_all_finite_f32()，選用的輸出檢查                    */
 ```
 
-`Complex` 定義在 `<audiolib>/common/include/fft_wrapper.h`，已透過 `aec.h` 帶進來。
+`Complex` 定義在 `<audiolib>/common/include/ac_complex.h`，經 `aec.h` → `fft_wrapper.h` → `ac_complex.h` 帶進來。
 
 ### 1.4 編譯需要的 `-I` 清單（consumer 端最小集合）
 
@@ -230,6 +232,9 @@ libaudio_common.a
 #define CNG_NR_GAIN_FLOOR 0.31622777f
 /* aec_cng_fill()'s generator starts from the library's AEC_CNG_SEED (42) and restarts from it when aec_post_reset_serial() moves */
 #define PSD_SCALE_INV (1.0f / (32768.0f * 32768.0f))       /* AEC powers are int16^2, the denoiser's audio scale */
+/* The synthesis borrows the AEC's window (aec_synthesis_window()), which exists only after aec_init();
+ * a borrowed table carves nothing, so any non-NULL pointer sizes it the same. */
+static const float k_sizing_window[1] = {0.0f};
 
 int main(void) {
     const int sample_rate = 16000;
@@ -251,6 +256,7 @@ int main(void) {
     AnrConfig nr_cfg = anr_config_for_level_grid(sample_rate, grid.fft_size, ANR_LEVEL_BALANCED);
     AcStftConfig synth_cfg;
     ac_stft_config_default(&synth_cfg, grid.fft_size);
+    synth_cfg.window = k_sizing_window;                               /* stand-in until aec_init() */
     size_t aec_bytes = aec_get_mem_size(&aec_cfg);                    /* 0 = invalid */
     size_t nr_bytes = anr_get_mem_size(&nr_cfg);                      /* 0 = invalid */
     size_t synth_bytes = ac_istft_get_mem_size(&synth_cfg);           /* 0 = invalid */
@@ -264,8 +270,11 @@ int main(void) {
     uint8_t* cur = (uint8_t*)pool;
     Aec* aec = aec_init(cur, aec_bytes, &aec_cfg);                    cur += ALIGN16(aec_bytes);
     AnrDenoiser* nr = anr_init(cur, nr_bytes, &nr_cfg);               cur += ALIGN16(nr_bytes);
+    int win_n = 0;
+    if (!aec || aec_synthesis_window(aec, &synth_cfg.window, &win_n) != 0 || win_n != synth_cfg.fft_size)
+        return 1;                                                     /* the AEC's own synthesis window */
     AcIstft* istft = ac_istft_init(cur, synth_bytes, &synth_cfg);     cur += ALIGN16(synth_bytes);
-    if (!aec || !nr || !istft) return 1;
+    if (!nr || !istft) return 1;
     float* total = (float*)cur;       cur += vec;
     float* extra_noise = (float*)cur; cur += vec;
     Complex* spec = (Complex*)cur;

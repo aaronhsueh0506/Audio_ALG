@@ -286,7 +286,7 @@ mask head does not depend on the deep-filter decoder, so the same checkpoint can
 - C: build every unit with `-DDFN2_MASK_ONLY` (see `dfn2_model_io.h`). The state, the accelerator boundary structs and the
   descriptor shrink accordingly, and the output is `noisy * (mask @ erb_inv)` of the head frame, `DFN2_MASK_LOOKAHEAD`
   frames behind the input. The final attenuation-limit mix (`--atten-lim`, `dfn2_prepost_set_atten_lim`) stays and acts on
-  the stage-1 output in Python and in C. `tests/test_dfn2_mask_only_c.py` compares it with numpy.
+  the stage-1 output in Python and in C. `../tests/test_dfn2_mask_only_c.py` compares it with numpy.
 
 No retraining: the quality of stage 1 alone is whatever the jointly trained mask gives (not measured here).
 

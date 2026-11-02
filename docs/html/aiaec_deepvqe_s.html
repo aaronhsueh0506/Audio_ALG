@@ -33,7 +33,7 @@ ratio mask：是 3×3（3 個時間位置 × 3 個頻率位置）的因果複數
 為 <code>None</code>。</p>
 <p>16k grid 下 <code>max_delay_frames = 32</code>（出貨模型以 <code>max_delay_seconds = 0.5</code> 訓練；建構子預設仍是 1.0 s ＝ 63）。參數量實測 <b>632,069</b> trainable
 （16k power-of-two 改編約 0.63 M，README 記載對應論文 0.59 M class）。
-<code>stream_output_delay = 0</code>——四候選中時間軸最乾淨（readiness §3.3）。</p>
+<code>stream_output_delay = 0</code>——串流輸出與 offline 逐幀對齊。</p>
 <p><b>ONNX / NPU graph boundary</b>（已交付：
 <code>AIAEC/DeepVQE_S/export_onnx.py</code>）：
 graph <b>內</b> = causal conv + BatchNorm + ELU 編碼、<code>FrameDelayAttention</code>（<code>softmax</code>
@@ -53,7 +53,7 @@ Slice／Concat，沒有 Sqrt／Pow／Clip）；匯出後單獨執行 <code>onnx_
 輸出是同 shape 的完整下一個 window（輸入端 Slice 加 Concat，沒有 state 輸出由 Slice 產生），
 所以每個 <code>*_out</code> 可綁到同名輸入的位址；
 頻譜 ring 是 host state，不在 NPU graph 內。
-NPU 注意（readiness）：<code>FrameDelayAttention</code> 的 <code>[B,C,T,D,F]</code>
+NPU 注意：<code>FrameDelayAttention</code> 的 <code>[B,C,T,D,F]</code>
 broadcast 必須逐幀化；輸出是 9 complex MAC/bin 的 CCM，不是 ratio mask。</p>
 
 <h2>API 用法</h2>
@@ -284,7 +284,7 @@ kernel 路徑。</li>
 <li><code>AIAEC/DeepVQE_S/deepvqe_prepost.c / .h</code>（pre/post 類別；<code>deepvqe_framing_config()</code> 描述框架設定）、<code>deepvqe_process.c / .h</code>（CCM ring + <code>deepvqe_ccm_process</code>）、<code>AIAEC/aiaec_process.c / .h</code>（16 kHz 邊界常數與複數 mask helper；framing 由 audiolib 的 <code>AcStft</code>／<code>AcIstft</code> 提供，分析在 <code>deepvqe_prepost.c</code> 的 pool 內，合成由應用端建）；<code>AIAEC/Makefile</code> 把它們收進 <code>libaiaec_prepost.a</code>（<code>make -C AIAEC print-lib-path</code>）</li>
 <li>tests：<code>AIAEC/tests/test_streaming_deepvqe_s.py</code>、<code>test_candidate_models.py</code>、<code>test_deepvqe_prepost_c.py</code>（20 個測試函式：對 hand-composed 路徑 memcmp、TIME/FREQ 一致、陳舊 pool 閘與 carve 版本、skip 靜音並保留加速器寫的 state、凍結 ring、就地 state 且最新一幀非有限寫入歸零、較舊幀不被檢查、state generation、狀態機守衛、state 名稱／rank-4 形狀／descriptor 驗證、layout version 與 C header 對表、descriptor 與實際 graph 相符、export metadata 真的帶著 descriptor）；<code>test_onnx_state_contract_names.py</code>、<code>test_stream_conv_cell.py</code>、<code>test_export_stateless.py</code> 涵蓋匯出端的同位址 state 合約；全樹請執行 <code>python3 -m pytest AIAEC</code>。</li>
 <li>匯出／calibration：<code>AIAEC/DeepVQE_S/export_onnx.py</code>、<code>AIAEC/DeepVQE_S/inference.py calib</code>（BIN/NPZ calibration 放在 <code>AIAEC/DeepVQE_S/calib/</code>；calib 會同 process 一併匯出並 parity-check 對應 graph（預設 <code>&lt;output&gt;.onnx</code>，<code>--onnx</code> 可改））。</li>
-<li>docs：<code>docs/aiaec_streaming_readiness_zh_TW.md</code> §3.3</li>
+<li>docs：<code>docs/aiaec_streaming_readiness_zh_TW.md</code></li>
 </ul>
 </body>
 </html>

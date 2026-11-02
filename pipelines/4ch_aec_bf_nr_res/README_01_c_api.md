@@ -50,7 +50,7 @@ The deployable C seam is:
 - [`tests/test_mcab.c`](tests/test_mcab.c): 16/48 kHz grid, lifecycle, sequence rules, invalid-config,
   lane-contract (`mcab_lane_config()` against the documented rules, an application-composed lane), init validation
   of the injected objects, pool-boundary, heap/static byte-parity, weight, delay-machine and finite-output
-  acceptance tests of the flow, and the descriptor gate (the superseded layouts 17-24 are refused);
+  acceptance tests of the flow, and the descriptor gate (the superseded layouts 17-25 are refused);
   [`tests/conv_chain_mcab.h`](tests/conv_chain_mcab.h) writes the post-beam chain over it as the reference the
   application tests compare against, and [`tests/mcab_test_rig.h`](tests/mcab_test_rig.h) builds and tears down
   the lanes and the estimator for the tests;

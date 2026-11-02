@@ -71,7 +71,7 @@ complex mask 由 <code>gtcrn_model_output</code>(ERB 逆矩陣
 <p class="note">論文數據與逐層架構筆記見
 <a href="../../AINR/GTCRN/docs/architecture_notes.md">docs/architecture_notes.md</a> 與
 <a href="../../AINR/GTCRN/README.md">README.md</a>;上游原始 repo(含論文 PDF 與串流參考實作)
-vendored 於 <code>AINR/gtcrn_github/</code>。</p>
+是本機參考 clone <code>AINR/gtcrn_github/</code>,未納入版控(<code>.gitignore</code>),乾淨 checkout 沒有此目錄。</p>
 
 <h2>API 用法</h2>
 <pre>#include "GTCRN/gtcrn_process.h"
@@ -250,7 +250,7 @@ context(conv window 深度 = 歷史 + 新的一幀,即 3、5、11),加上 RNN �
 <li>模型 / 訓練 / 推論:<code>AINR/GTCRN/model.py</code>、<code>train.py</code>、<code>inference.py</code>、<code>config.ini</code>、<code>checkpoint_utils.py</code></li>
 <li>串流 / 匯出:<code>AINR/GTCRN/stream_model.py</code>(<code>StreamGTCRN</code>、<code>initial_inputs</code>)、<code>export_onnx.py</code>、<code>export_erb_matrix.py</code></li>
 <li>文件:<a href="../../AINR/GTCRN/README.md">README.md</a>、<a href="../../AINR/GTCRN/docs/architecture_notes.md">docs/architecture_notes.md</a></li>
-<li>上游 vendored 參考:<code>AINR/gtcrn_github/</code>(offline <code>gtcrn.py</code>、串流 <code>stream/gtcrn_stream.py</code>、論文 PDF)</li>
+<li>上游本機參考 clone(未納入版控):<code>AINR/gtcrn_github/</code>(offline <code>gtcrn.py</code>、串流 <code>stream/gtcrn_stream.py</code>、論文 PDF)</li>
 <li>C 測試:<code>AINR/tests/test_c_prepost.c</code>(<code>test_gtcrn()</code>:回路穩態 unity,誤差門檻 2e-4)—
 <code>make -C AINR test-simd</code> 驗證 scalar/NEON 路徑</li>
 <li>Python 匯出合約測試:<code>AINR/GTCRN/tests/test_gtcrn_export_contract.py</code>:

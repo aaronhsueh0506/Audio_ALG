@@ -167,8 +167,6 @@ output_dir = ./output
 | `[training] lr` | 3e-4 | Learning rate |
 | `[training] device` | cuda | 訓練裝置 (`cuda` 或 `cpu`) |
 | `[training] epoch_size` | 0 | 每 epoch sample 上限；0 表示使用全部資料 |
-| `[audio] segment_sec` | 3.0 | 每筆訓練音檔長度 (秒) |
-| `[rir] p_rir` | 0.5 | 套用 RIR 的機率（共用 dataset config） |
 | `[feature] erb_norm_tau_sec` | 1.0 | ERB per-band mean EMA 時間常數 |
 | `[feature] erb_norm_init_lo_db` | -20 | 最低 ERB band EMA 初值 |
 | `[feature] erb_norm_init_hi_db` | -45 | 最高 ERB band EMA 初值 |

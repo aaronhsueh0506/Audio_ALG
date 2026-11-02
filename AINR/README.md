@@ -223,7 +223,10 @@ one-frame header neither overruns nor passes an N > 1 library. Details in
 [`DeepFilterNet2/README.md`](DeepFilterNet2/README.md#multi-frame-export).
 
 The DFN C API also performs ERB/complex feature normalization, mask expansion,
-deep-filter composition, optional post-filter/attenuation limiting, and WOLA.
+deep-filter composition, and attenuation limiting. In time-domain I/O mode it
+synthesizes through a caller-borrowed audiolib `AcIstft`; inverse FFT and
+overlap-add run inside that object. The post-filter (`mask_pf`) exists only in
+the Python reference.
 `dfn2_compose()` is the aligned/offline arithmetic reference. Hardware
 integrations must use `dfn2_compose_stream()`: it explicitly pairs a delayed
 network head with the spectrum frame it describes and returns the output frame

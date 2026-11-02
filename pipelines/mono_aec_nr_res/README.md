@@ -59,14 +59,14 @@ every hop the guard leaves alone and does not pair with `formed_hop` on a guard 
 
 ### The hard post-chain reset event
 
-A hard reset of the AEC post chain (`aec_reset()`, a confirmed delay change that restarts the filter, the first
-acquisition without a warm transfer, a bad-relock revert) happens inside the `aec_process_context()` call, before that
-hop's synthesis, and moves `aec_post_reset_serial()`. `follow_post_reset()` keeps the last handled serial; when it
+A hard reset of the AEC post chain (a confirmed delay change that restarts the filter, the first acquisition without
+a warm transfer) happens inside the `aec_process_context()` call, before that hop's synthesis, and moves
+`aec_post_reset_serial()`; so does a separate `aec_reset()` call, which the serial already reflects when it returns. `follow_post_reset()` keeps the last handled serial; when it
 differs, the synthesis drops its overlap-add tail and the comfort noise restarts from `AEC_CNG_SEED`, before the
 hop's first draw and before its `ac_istft_push()`. The program never resets the AEC in response. The denoiser is
 not touched by the event (the library does not touch NR state and neither does this program: NR keeps running through
 the reset; following the event in the denoiser would be an application policy and this one is "no"). Warm-transfer and
-soft (double-talk-aware) realignments, `aec_apply_external_realign()` and a change of `AecLinearContext.generation`
+soft (double-talk-aware) realignments, the bad-relock soft revert, `aec_apply_external_realign()` and a change of `AecLinearContext.generation`
 alone do not move the serial.
 
 Strength: `aec_set_level(aec, level, ramp_ms)` for the AEC's RES gain,

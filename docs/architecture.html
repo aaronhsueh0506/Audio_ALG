@@ -248,7 +248,7 @@
   <strong>關鍵點（echo-aware joint 設計）：</strong>
   <ol style="margin: 4px 0 0 20px;">
     <li>HPF <strong>只對 mic path</strong> 做；ref（far-end）<strong>不經 HPF</strong>（far-end HPF 預設 OFF，downstream Saturation / DelayEst 吃原始 ref）</li>
-    <li>AEC 只做線性消除，輸出 <code>E(f)</code> + <code>AecResContext</code>（殘響回音功率 R²、res_gain、CNG、ERLE、DT 指標）</li>
+    <li>AEC 只做線性消除，輸出 <code>E(f)</code>（分析 seam）、渲染底座 <code>B</code>（<code>aec_get_output_base()</code>）+ <code>AecResContext</code>（殘響回音功率 R²、res_gain、CNG、ERLE、DT 指標）</li>
     <li>NR 把 R² 折進雜訊地板：<code>ξ = S²/(N²+R²)</code>，用<strong>一個</strong> MMSE-LSA gain 同時壓雜訊＋殘響回音（無 re-FFT）</li>
     <li>gain fusion <code>g_total = min(G_nr, G_res)</code>：每個 bin 取兩個 gain 的較小者，沒有 near-end floor；comfort noise 只補 RES 切掉的 bin</li>
     <li>分析 STFT 在 AEC 內做一次（periodic sqrt-Hann、50% overlap），合成由應用的 <code>AcIstft</code> 做一次（iFFT + sqrt-Hann OLA）；中間的 NR 與 gain 融合都是頻域 block，可替換（NN seam）</li>
@@ -326,7 +326,7 @@
 <div class="panel">
 <p>NR 處理 AEC 輸出的 error 訊號，移除背景噪音同時保留近端語音。三大組件：MCRA + SPP + MMSE-LSA。</p>
 <div class="note" style="margin-top:0;">
-  <strong>整合 pipeline（joint echo-aware）：</strong>NR 直接吃 AEC 的頻域 <code>E(f)</code>（無 re-FFT），
+  <strong>整合 pipeline（joint echo-aware）：</strong>NR 直接吃 AEC 的頻域渲染底座 <code>B</code>（<code>aec_get_output_base()</code>；守衛未啟動的 hop 上逐位元等於 <code>E(f)</code>，守衛 hop 上為 <code>E + echo</code>；無 re-FFT），
   並把 AEC 估的殘響回音功率 R² 折進先驗 SNR：<code>ξ = S²/(N²+R²)</code>，讓同一個 MMSE-LSA gain
   一次壓掉雜訊＋殘響回音。底下的 MCRA/SPP/MMSE-LSA 是 NR 單獨運作時的演算法本體。
 </div>
@@ -425,7 +425,7 @@ G[k] = G<sub>LSA</sub><sup>p[k]</sup> · g<sub>min</sub><sup>1−p[k]</sup>
 
 <h3>5.1 Gain fusion</h3>
 
-<p><code>g_total = min(G_nr, G_res)</code>，每個 bin 取兩個 gain 的較小者並對 <code>E(f)</code> 套用一次；沒有 near-end floor。NR 把 <code>R²</code> 折進先驗 SNR，因此兩個 gain 不是重複計算同一件事。</p>
+<p><code>g_total = min(G_nr, G_res)</code>，每個 bin 取兩個 gain 的較小者並對渲染底座 <code>B</code>（<code>aec_get_output_base()</code>；守衛未啟動的 hop 上等於 <code>E(f)</code>）套用一次；<code>E(f)</code>（<code>error_spec</code>）只是分析 seam，合成要乘 <code>B</code>；沒有 near-end floor。NR 把 <code>R²</code> 折進先驗 SNR，因此兩個 gain 不是重複計算同一件事。</p>
 
 <h3>5.2 CNG (Comfort Noise Generation)</h3>
 

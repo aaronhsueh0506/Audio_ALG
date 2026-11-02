@@ -44,7 +44,7 @@ GRU(192)、頻率 stride-2 的 <code>ConvTranspose2d(1,3)</code> 解碼、sigmoi
 STFT/ISTFT 與 complex↔RI（Python reference <code>StreamSTFT/StreamISTFT</code>）。
 所有 recurrent state（conv 史、K/V ring、score 積分、GRU h、幀計數）為顯式 state，
 由 runtime 逐次傳入傳回。</p>
-<div class="note"><b>產品風險（readiness §3.2）</b>：<code>causal_running</code> 的 delay
+<div class="note"><b>產品風險</b>：<code>causal_running</code> 的 delay
 score 是<b>無衰減 cumsum 積分器</b>（無限記憶）——長通話下 delay 分佈會凍結、追不上
 echo path 變化；streaming 化本身可行，但長時行為需上板前決策。</div>
 
@@ -145,10 +145,10 @@ T</b> 做 <code>arange(D) &lt; T</code> 的 observable mask，stream 無法預�
 T ≥ D。utterance ≥ 63 hops（1 s @16k）時<b>每一幀</b>（含前 63 幀）精確等價：實測
 T=90 全幀 stream-vs-offline enhanced 4.9e-7 / mask 1.8e-7 / delay 3.3e-7（ATOL 釘 5e-6）。
 整段 &lt; 63 幀的短檔<b>刻意發散</b>：專屬測試 T=30 差 &gt; 1e-3
-（<code>test_short_utterance_below_delay_window_differs</code>；readiness 實測 1.18e-2）。</li>
+（<code>test_short_utterance_below_delay_window_differs</code>）。</li>
 <li><code>paper_global</code> checkpoint 不可串流，必須以 <code>causal_running</code> 重訓。</li>
 <li>startup 前 D 幀的 softmax 含未觀測（score=0）delay 候選——這是 offline 訓練語意
-本身，非 streaming 造成（readiness §3.2）。</li>
+本身，非 streaming 造成（見 <code>AIAEC/aiaec_common.py</code> 的 <code>GlobalDelayAttention</code>）。</li>
 </ul>
 
 <h2>相關檔案與測試路徑</h2>
@@ -157,7 +157,7 @@ T=90 全幀 stream-vs-offline enhanced 4.9e-7 / mask 1.8e-7 / delay 3.3e-7（ATO
 <li><code>AIAEC/Align_CRUSE/inference.py</code>、<code>export_onnx.py</code>、<code>train.py</code>、<code>config.ini</code></li>
 <li>tests：<code>AIAEC/tests/test_streaming_align_cruse.py</code>（等價/can-fail/短檔 caveat/paper_global 拒絕/fresh-state）、<code>test_candidate_models.py</code>；全樹請執行 <code>python3 -m pytest AIAEC</code>。</li>
 <li>匯出／calibration：<code>AIAEC/Align_CRUSE/export_onnx.py</code>、<code>AIAEC/Align_CRUSE/inference.py calib</code>（BIN/NPZ calibration 放在 <code>AIAEC/Align_CRUSE/calib/</code>；calib 會同 process 一併匯出並 parity-check 對應 graph（預設 <code>&lt;output&gt;.onnx</code>，<code>--onnx</code> 可改））。<code>state_align_score_sum</code>=<code>float32_no_ptq</code>、<code>state_align_frame_index</code>=<code>int64_no_ptq</code>；calibration 必須取自單一不中斷錄音。</li>
-<li>docs：<code>docs/aiaec_streaming_readiness_zh_TW.md</code> §3.2</li>
+<li>docs：<code>docs/aiaec_streaming_readiness_zh_TW.md</code></li>
 </ul>
 </body>
 </html>

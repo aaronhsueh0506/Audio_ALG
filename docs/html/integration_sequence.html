@@ -49,22 +49,25 @@ th{background:#eef5f0}
    │                              │                          │                       │
    │═ ① 建立(一次;此後 hop 路徑零 heap)═══════════════════════════════════════════
    │ derive_lane(sr,fft,level,&amp;grid,&amp;aec_cfg)              main.c 內: 0=ok, -1=拒絕(格點);aec_resolve_signal_grid + aec_config_from_level
-   │ anr_config_for_level_grid(sr, grid.fft_size, level) -&gt; nr_cfg      ac_stft_config_default(&amp;syn_cfg, fft)
+   │ anr_config_for_level_grid(sr, grid.fft_size, level) -&gt; nr_cfg      ac_stft_config_default(&amp;syn_cfg, fft)   (window 在 aec_init 之後才借,見 ac_istft_init 列)
    │── aec_get_mem_size ───────►│  0=無效                  │                       │
    │── anr_get_mem_size ─────────────────────────────────►│  0=無效               │
    │── ac_istft_get_mem_size ───────────────────────────────────────────────────►│  0=無效
    │ pool = platform_alloc(Σ ALIGN16(各大小) + 暫存, 16)
    │── aec_init(pool,...) ─────►│  NULL=過小/未對齊/無效   │                       │
    │── anr_init(pool+a,...) ─────────────────────────────►│  NULL=同左            │
+   │ aec_synthesis_window(aec,&amp;syn_cfg.window,&amp;n)  ← aec_init 之後、ac_istft_init 之前;借 AEC 的窗(0=ok,-1=拒絕)
    │── ac_istft_init(pool+a+n,...) ─────────────────────────────────────────────►│  NULL=同左
    │ unity[k]=1; rng=AEC_CNG_SEED
    │
    │═ ② 每 hop(mic、ref 各 grid.hop_size floats,同 sample rate、同時鐘)═══════════
    │── aec_process_context(aec,mic,ref) ►│ 線性 AEC + delay 估計 + AEC 內部 RES 增益
-   │── aec_get_res_context(aec,&amp;ctx) ►│ 借用視圖 ctx: error_spec,r2,comfort_noise,res_gain
-   │── mono_nr_gain: anr_process_gain(nr,ctx.error_spec,extra,NULL) ─►│ r2*PSD_SCALE_INV 折進噪聲底 → anr_get_gain → G_nr
+   │── aec_get_res_context(aec,&amp;ctx) ►│ 借用視圖 ctx: error_spec(分析 seam),r2,comfort_noise,res_gain
+   │── aec_get_output_base(aec,&amp;b) ►│ b.base_spec = 渲染基底 B(守衛未觸發時 = ctx.error_spec)
+   │ follow_post_reset: aec_post_reset_serial 變動 → ac_istft_reset、rng=AEC_CNG_SEED   ← 不 reset AEC 與 NR
+   │── mono_nr_gain: anr_process_gain(nr,B,extra,NULL) ─►│ r2*PSD_SCALE_INV 折進噪聲底 → anr_get_gain → G_nr
    │ sk_min_f32(g_total, G_nr, ctx.res_gain, n)            ← 應用自己呼叫 audiolib kernel
-   │ sk_capply_gain_f32(spec, ctx.error_spec, g_total, n)
+   │ sk_capply_gain_f32(spec, B, g_total, n)               ← 增益乘在 B 上
    │ aec_cng_fill(&amp;rng,spec,ctx.comfort_noise,ctx.res_gain,G_nr,CNG_NR_GAIN_FLOOR,n)   ← 選用(AecConfig.enable_cng)
    │── ac_istft_push(istft,spec,out) ───────────────────────────────────────────►│ iFFT + sqrt-Hann OLA → out[hop]
    │ skn_all_finite_f32(out,hop)                            ← 輸出守衛,應用自己做(example_board_adapter.c 有做)
@@ -101,10 +104,10 @@ th{background:#eef5f0}
    │── mcab_sample_beam_process_beam(b,&amp;front,vad_raw,vad_out,mask,&amp;beam,&amp;info) ►│ doa_step → bf_process_with_weights
    │   beam.{spectrum, weights}(借用)        (一次做完前兩步: process_with_activity / process)
    │── mcab_sample_beam_fuse(b,&amp;frame) ►│ mcab_fuse(weights,spectrum) → frame(E, R2, CN)
-   │   frame.{e,y,x,r2,cn,far_hop,...}(借用;g_res_ctx 恆為 NULL)
+   │   frame.{e,b,y,x,r2,cn,far_hop,post_reset_serial,...}(借用;g_res_ctx 恆為 NULL;b = 渲染基底)
    │── mcab_sample_res_input(&amp;frame,&amp;in); aec_res_process(res,&amp;in) ►│ G_res(NULL = 被拒)
    │── mcab_sample_anr_gain(nr,&amp;frame,extra,1) ───────────────────────────────►│ G_nr
-   │ sk_min_f32 -&gt; sk_capply_gain_f32 -&gt; aec_cng_fill(僅 frame.cn 非 NULL)   (應用自己)
+   │ sk_min_f32 -&gt; (mcab_sample_post_reset_due 為真:ac_istft_reset、重設 CNG 種子) -&gt; sk_capply_gain_f32(spec, frame.b, ...) -&gt; aec_cng_fill(僅 frame.cn 非 NULL)   (應用自己)
    │── ac_istft_push(istft,spec,out) ─────────────────────────────────────────────────────►│ out[hop]
    │
    │═ ③ 錯誤 / 換串流 ═════════════════════════════════════════════════════════════

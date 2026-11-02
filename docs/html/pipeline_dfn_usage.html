@@ -115,7 +115,7 @@ int mono_dfn_run(void) {
 
     /* 4. 每個 host hop 一次 */
     float mic[512], ref[512], out[512];                      /* &gt;= grid.hop_size */
-    int cng_on = 0;                                          /* 預設關:E 與 P 要同相位 */
+    int cng_on = 0;                                          /* 預設關:B 與 P 要同相位 */
     while (next_hop(mic, ref)) {
         AecResContext c;  AecOutputBase b = { sizeof(b) };
         aec_process_context(aec, mic, ref);
@@ -176,11 +176,11 @@ int init_48k(DfnHop *hop, const DfnResStageConfig *base, void **pool_out) {
 
 extern int board_run_dfn2_graph_on_npu(DfnResStageJob *job);   /* 0 = 每個輸出都寫滿 */
 
-/* 前面 aec_process_context / aec_get_res_context / P 的形成同上;模型留給呼叫端在 NPU 上跑 */
-int phased_hop(DfnHop *hop, const AecResContext *c, const Complex *post, float *out) {
+/* 前面 aec_process_context / aec_get_res_context / aec_get_output_base / P 的形成同上;模型留給呼叫端在 NPU 上跑 */
+int phased_hop(DfnHop *hop, const AecOutputBase *b, const Complex *post, float *out) {
     DfnResStageJob job;
     int r;
-    if (dfn_hop_begin(hop, c-&gt;error_spec, post) != 0) return -1;          /* stage / bridge 收下 E 與 P */
+    if (dfn_hop_begin(hop, b-&gt;base_spec, post) != 0) return -1;          /* stage / bridge 收下 B 與 P */
     while ((r = dfn_hop_nn_begin(hop, &amp;job)) &gt; 0) {              /* 每 hop 0..2 次 */
         int rc = board_run_dfn2_graph_on_npu(&amp;job);              /* job.inputs -&gt; 加速器 -&gt; job.outputs */
         if (dfn_hop_nn_end(hop, rc) != 0) return -1;             /* rc != 0:該幀走 identity,不是錯誤 */
@@ -258,7 +258,7 @@ int four_dfn_run(void) {
         mcab_sample_flow_destroy(&amp;objs);  free(pool);  return -1;   /* 範例省略 stage／bridge 部分建成時的 destroy */
     }
     for (int k = 0; k &lt; grid.n_freqs; ++k) unity[k] = 1.0f;
-    uint32_t rng = MCAB_SAMPLE_CNG_RNG_SEED;
+    uint32_t rng = MCAB_SAMPLE_CNG_RNG_SEED, handled = 0;      /* handled:已處理的 f.post_reset_serial(main.c 的 DfnSample.reset_handled) */
 
     /* 4. 每個 hop */
     float mics[4 * 512], ref[512], out[512];
@@ -271,8 +271,13 @@ int four_dfn_run(void) {
             g_res = aec_res_process(res, &amp;in);
         }
         if (g_res) {
+            if (mcab_sample_post_reset_due(&amp;handled, &amp;f)) {            /* 某條 lane 本 hop 硬重置:在 CNG 第一次抽樣之前 */
+                if (bridge) (void)dfn_rate_bridge_reset_synthesis(bridge);   /* 16 kHz:只清橋內原生合成的 OLA 尾巴 */
+                else dfn_hop_reset(&amp;hop);                                   /* 48 kHz:整個 hop 一起 reset */
+                rng = MCAB_SAMPLE_CNG_RNG_SEED;
+            }
             sk_min_f32(gain, unity, g_res, grid.n_freqs);
-            sk_capply_gain_f32(post, f.e, gain, grid.n_freqs);
+            sk_capply_gain_f32(post, f.b, gain, grid.n_freqs);            /* P = B * min(1, G_res),B = f.b;估計輸入仍是 f.e */
             if (cng_on &amp;&amp; f.cn)
                 aec_cng_fill(&amp;rng, post, f.cn, g_res, unity, MCAB_SAMPLE_CNG_NR_GAIN_FLOOR, grid.n_freqs);
             if (dfn_hop_process(&amp;hop, f.e, post, out) == 0) { emit_hop(out, grid.hop_size); continue; }

@@ -94,11 +94,11 @@ query → allocate → init → process → destroy → release 順序。完整 
 ```text
 mic/ref
   -> Linear AEC（PBFDKF + shadow + delay/EPC）
-       -> E(f) + AecResContext { G_res, R², CNG N², far_power }
-  -> echo-aware MMSE-LSA：以 E(f) 與 R² 計算 G_nr
+       -> E(f)（分析 seam）、渲染基底 B(f) + AecResContext { G_res, R², CNG N², far_power }
+  -> echo-aware MMSE-LSA：以 B(f) 與 R² 計算 G_nr
   -> G_total = min(G_nr, G_res)
-  -> S(f) = E(f) * G_total + optional CNG
-  -> iFFT + sqrt-Hann OLA
+  -> S(f) = B(f) * G_total + optional CNG
+  -> iFFT + AEC 的合成窗 OLA
   -> output hop
 ```
 
@@ -144,7 +144,7 @@ make -C pipelines/4ch_aec_bf_nr_res test
 cc -std=gnu99 -O2 -Wall -Wextra \
   -Ilib/aec/c_impl/include -Ilib/aec/c_impl/example \
   -Ilib/nr/c_impl/include \
-  -I../audiolib/common/include \
+  -I../audiolib/common/include -I../audiolib/common \
   -c app.c -o app.o
 # libaudio_common.a 內含一個 C++ TU，最終 link 用 c++ driver；路徑由 audiolib 的 Makefile 回報
 c++ app.o \
@@ -250,6 +250,10 @@ DUMP_CTX=pipeline_ctx.bin \
 #include "anr.h"
 #include "anr_types.h"
 
+#if !defined(AEC_OUTPUT_GUARD_API_VERSION) || AEC_OUTPUT_GUARD_API_VERSION < 1
+#error "aec.h is too old: this wrapper needs the output-guard API (aec_get_output_base, aec_post_reset_serial, aec_synthesis_window)"
+#endif
+
 #define PSD_SCALE                 (32768.0f * 32768.0f)
 
 typedef struct {
@@ -295,6 +299,8 @@ int audio_alg_init(AudioAlgPipeline *p, int sample_rate,
     AnrConfig nr_cfg;
     AcStftConfig synth_cfg;
     size_t synth_bytes;
+    const float *synth_window = NULL;
+    int synth_window_len = 0;
 
     if (!p) return -1;
     memset(p, 0, sizeof(*p));
@@ -322,9 +328,14 @@ int audio_alg_init(AudioAlgPipeline *p, int sample_rate,
 
     p->nr = anr_create(&nr_cfg);
 
-    /* 合成（inverse FFT + sqrt-Hann + overlap-add）是 audiolib 的 AcIstft，由應用端持有；
-     * fft 與窗表由它自己配置（cfg.fft／cfg.window 為 NULL）。 */
+    /* 合成（inverse FFT + 窗 + overlap-add）是 audiolib 的 AcIstft，由應用端持有；fft 由它自己配置。
+     * 窗表向 AEC 借用（aec_synthesis_window()，唯讀、壽命與 Aec 相同，AcIstft 不另配置窗表）：
+     * 要與 aec_process() 逐位元相同就不能用 audiolib 預設的 sqrt-Hann（兩者差最後一個 float bit）。 */
+    if (aec_synthesis_window(p->aec, &synth_window, &synth_window_len) != 0 ||
+        synth_window_len != p->fft_size)
+        goto fail;
     ac_stft_config_default(&synth_cfg, p->fft_size);
+    synth_cfg.window = synth_window;
     synth_bytes = ac_istft_get_mem_size(&synth_cfg);
     if (synth_bytes == 0) goto fail;
     p->istft_mem = aligned_alloc(16, (synth_bytes + 15u) / 16u * 16u);
@@ -521,4 +532,4 @@ Audio_ALG 的範例程式（`pipelines/mono_aec_nr_res/main.c` 等）直接用 N
 | 尾端樣本變短 | CLI 只處理完整 hop | 上層先 padding，並在輸出後裁回原長度 |
 | 想用現成的 mono 整合寫法 | — | 見 `pipelines/mono_aec_nr_res/main.c` + `pipelines/README_02_build_debug_board.md`「Board Integration」；本手冊第 5 節的 wrapper 是直接組合 AEC／NR 的範例 |
 
-定位問題時建議依序比較：`--aec-only`、完整 production、`--no-cng`、`--legacy-amin`，再用 `DUMP_CTX` 檢查 `E(f)`、`G_res`、`R²` 與 `G_nr`。
+定位問題時建議依序比較：`--aec-only`、完整 production、`--no-cng`、`--legacy-amin`，再用 `DUMP_CTX` 檢查渲染基底 `B(f)`、`G_res`、`R²` 與 `G_nr`。

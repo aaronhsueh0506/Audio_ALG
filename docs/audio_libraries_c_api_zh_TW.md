@@ -1,7 +1,7 @@
 # AEC、NR、audiolib C API 整合速查
 
 本文件是給 application／board integration 使用者的**短版入口**，涵蓋 AEC、NR、audiolib
-三個 library，以及三個 AI 模型的 pre/post 類別（[§6](audio_libraries_c_api_zh_TW_02_ai_prepost_models.md#6-ai-模型-prepost-類別)），回答三件事：
+三個 library，以及四個 AI 模型的 pre/post 類別（[§6](audio_libraries_c_api_zh_TW_02_ai_prepost_models.md#6-ai-模型-prepost-類別)），回答三件事：
 
 1. 應該 include 哪些 public header；
 2. init、process、reset、destroy 的正確順序；

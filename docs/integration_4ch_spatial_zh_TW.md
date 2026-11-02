@@ -97,7 +97,7 @@ NN 後濾波的分支（`enable_post = 0`）列在圖後。
  │   aec_config_from_level(&res_cfg,level,sr) ＋ res_cfg.fft_size = mcab_fft_size(flow)
  │     → aec_res_get_mem_size → aec_res_init ───────────────────────────────►│
  │   anr_config_for_level_grid(sr, mcab_fft_size(flow), level) → anr_get_mem_size → anr_init ──────────────►│
- │   ac_stft_config_default → ac_istft_get_mem_size → ac_istft_init ───────────────────────────────────►│
+ │   ac_stft_config_default ＋ synth_cfg.window = aec_synthesis_window(某條 lane) → ac_istft_get_mem_size → ac_istft_init ►│
  │══ 每個 hop（mics[hop*4] interleaved、far[hop]）══════════════════════════════════════════════
  │ 形式 A：mcab_sample_beam_process_front(b,mics,far,&front) ►│ mcab_process_front：共用 delay + 四條 lane
  │          （可選）由 front.linear_spectra 算 mask、vad_raw、vad_out
@@ -108,7 +108,8 @@ NN 後濾波的分支（`enable_post = 0`）列在圖後。
  │ mcab_sample_beam_fuse(b,&frame) ►│ mcab_fuse(flow, beam.weights, beam.spectrum)：投影 near／R²／comfort noise → McabFrame；frame.g_res_ctx = NULL
  │ mcab_sample_res_input(&frame,&in); aec_res_process(res,&in) ──────────────►│ G_res（NULL = 被拒）
  │ mcab_sample_anr_gain(nr,&frame,extra_noise,1) ───────────────────────────►│ G_nr（NULL = 被拒）
- │ sk_min_f32(total,G_nr,G_res,n); sk_capply_gain_f32(spec,frame.e,total,n)
+ │ sk_min_f32(total,G_nr,G_res,n)；mcab_sample_post_reset_due(&handled,&frame) 為 1 時先 ac_istft_reset(istft)、rng = MCAB_SAMPLE_CNG_RNG_SEED
+ │ sk_capply_gain_f32(spec,frame.b,total,n)      （增益乘在渲染底座 frame.b 上；frame.e 只用於估計）
  │ aec_cng_fill(&rng,spec,frame.cn,G_res,G_nr,MCAB_SAMPLE_CNG_NR_GAIN_FLOOR,n)
  │ ac_istft_push(istft,spec,out) ─────────────────────────────────────────────────────────►│ hop 個樣本
  │ skn_all_finite_f32(out,hop)

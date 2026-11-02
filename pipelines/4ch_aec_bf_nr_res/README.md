@@ -108,10 +108,9 @@ sqrt-Hann STFT frames and can be consumed directly without four duplicate FFTs.
 `McabFront.formed_hop[ch]` are the exact selected/crossfaded time-domain hops
 underlying those spectra (borrowed from each lane, not copied) for integrations
 whose beamformer owns its four analysis FFTs. The per-lane candidate set is
-refined, coarse, or -- in this seam's context-only mode -- the lane's own mic
-capture, on a hop the filtering-quality analyzer has not cleared; a beamformer
-computing its own residual-echo estimate from these hops inherits that
-substitution. The Python reference also accepts the external mono hop.
+refined or coarse, so `formed_hop[ch]` is always the selected linear residual; the
+output guard only chooses the rendering base and never replaces it. The Python
+reference also accepts the external mono hop.
 
 `mcab_fuse()` takes the weights and, optionally, the mono spectrum the same
 beamformer call produced. With `beamformed_error == NULL` it rebuilds the error

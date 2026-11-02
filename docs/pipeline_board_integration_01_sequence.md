@@ -17,11 +17,13 @@ Firmware         Aec (mono) | Aec x4, DelayAec, Mcab       AnrDenoiser          
    |-- platform_alloc(Sum ALIGN16(each block), 16)         pool need not be zeroed
    |-- aec_init | aec_init x4, delay_aec_init (MATCHED), mcab_init_ex -->|-- aec_res_init (4ch only) -->|-- anr_init -->|-- ac_istft_init -->|   (NULL = stop)
    |== per hop ================================================================
-   |-- aec_process_context, aec_get_res_context | mcab_process_front, your beamformer, mcab_fuse -->|  mono: ctx{error_spec,r2,comfort_noise,res_gain}; 4ch: frame{e,r2,cn,g_res_ctx}
-   |      (mono: res_gain is the Aec's own RES gain; 4ch: g_res_ctx = NULL)
+   |-- aec_process_context, aec_get_res_context | mcab_process_front, your beamformer, mcab_fuse -->|  mono: ctx{error_spec,r2,comfort_noise,res_gain} + aec_get_output_base() -> base_spec; 4ch: frame{e,b,r2,cn,g_res_ctx}
+   |      (mono: res_gain is the Aec's own RES gain; 4ch: g_res_ctx = NULL; error_spec / frame.e are the analysis seam, the
+   |       gain is applied to base_spec / frame.b)
+   |-- aec_post_reset_serial / frame.post_reset_serial moved: ac_istft_reset, rng = AEC_CNG_SEED (before the CNG draw and the push)
    |-- mcab_sample_res_input + aec_res_process(res, &in) (4ch only) ---->|  G_res from your AecRes
    |-- anr_process_gain + anr_get_gain ---------->|  G_nr   (4ch: mcab_sample_anr_gain)
-   |-- sk_min_f32, sk_capply_gain_f32, aec_cng_fill (firmware code)
+   |-- sk_min_f32, sk_capply_gain_f32 (on base_spec / frame.b), aec_cng_fill (firmware code)
    |-- ac_istft_push ------------------------------------------------>|  out[hop]   (1 hop behind the input)
    |== refused call or non-finite output =======================================
    |-- aec_reset | mcab_reset (also resets the lanes and the estimator), aec_res_reset (4ch only), anr_reset, ac_istft_reset, rng = your comfort-noise seed   (all together)
@@ -54,7 +56,7 @@ size_t synth_sz = ac_istft_get_mem_size(&synth_cfg); /* audiolib; 0 = invalid co
 
 Aec*         aec   = aec_init(mem_aec, aec_sz, &aec_cfg);
 AnrDenoiser* nr    = anr_init(mem_nr, nr_sz, &nr_cfg);
-AcIstft*     istft = ac_istft_init(mem_synth, synth_sz, &synth_cfg);
+AcIstft*     istft = ac_istft_init(mem_synth, synth_sz, &synth_cfg);  /* synth_cfg.window = the table borrowed from aec_synthesis_window(); see the lifecycle below */
 /* destroy() on a static instance never frees the pool. aec_destroy() only drops the
  * instance's internal references and is NULL-safe and repeatable; anr_destroy() returns at
  * once for a pool-resident instance. Call them before releasing the pool. */
@@ -81,6 +83,7 @@ aligned (the libraries assert this).
                                                                     // return_res_context = 1 (see mono_aec_nr_res/main.c derive_lane())
             AnrConfig nr_cfg = anr_config_for_level_grid(sample_rate, grid.fft_size, level);
             AcStftConfig synth_cfg;  ac_stft_config_default(&synth_cfg, grid.fft_size);
+            synth_cfg.window = k_sizing_window;   // static const float k_sizing_window[1]; borrowed tables carve no pool, so any non-NULL stand-in sizes the synthesis; the AEC's own window is borrowed in step 3
             size_t aec_bytes   = aec_get_mem_size(&aec_cfg);       // 0 = invalid
             size_t nr_bytes    = anr_get_mem_size(&nr_cfg);        // 0 = invalid
             size_t synth_bytes = ac_istft_get_mem_size(&synth_cfg);// 0 = invalid
@@ -97,6 +100,7 @@ aligned (the libraries assert this).
 3. init     uint8_t* cur = pool;
             Aec* aec = aec_init(cur, aec_bytes, &aec_cfg);           cur += ALIGN16(aec_bytes);
             AnrDenoiser* nr = anr_init(cur, nr_bytes, &nr_cfg);      cur += ALIGN16(nr_bytes);
+            int win_n;  if (!aec || aec_synthesis_window(aec, &synth_cfg.window, &win_n) != 0) fail;   // borrow the AEC's synthesis window
             AcIstft* istft = ac_istft_init(cur, synth_bytes, &synth_cfg);  cur += ALIGN16(synth_bytes);
             // gain/spectrum buffers follow (unity, total gain, NR prior, output spectrum)
             // NULL on: a misaligned/undersized pool, an invalid config, or a sub-object init
@@ -109,9 +113,13 @@ aligned (the libraries assert this).
                 read_hop(mic, ref, hop);
                 aec_process_context(aec, mic, ref);
                 aec_get_res_context(aec, &c);
-                // per hop: G_res = c.res_gain; nr = anr_process_gain(nr, c.error_spec, extra, NULL) + anr_get_gain(nr, NULL);
-                //          sk_min_f32; sk_capply_gain_f32; aec_cng_fill; ac_istft_push
-                if (!c.error_spec || !(P = mono_form(&c)) ||
+                AecOutputBase b = { sizeof(b) };                   // struct_size is an input; b.base_spec (below) is the rendering base B
+                // per hop: aec_post_reset_serial(aec) != handled -> ac_istft_reset(istft); rng = AEC_CNG_SEED; handled = serial
+                //          (before the CNG draw and the push; the AEC and the denoiser are not reset for it);
+                //          G_res = c.res_gain; nr = anr_process_gain(nr, b.base_spec, extra, NULL) + anr_get_gain(nr, NULL);
+                //          sk_min_f32; sk_capply_gain_f32 over b.base_spec; aec_cng_fill; ac_istft_push
+                //          (c.error_spec is the analysis seam, not the rendering base)
+                if (!c.error_spec || aec_get_output_base(aec, &b) != 0 || !(P = mono_form(&c, b.base_spec)) ||
                     ac_istft_push(istft, P, out) != hop || !skn_all_finite_f32(out, hop)) {
                     aec_reset(aec); anr_reset(nr); ac_istft_reset(istft); rng = AEC_CNG_SEED;
                     continue;                                       // a refused hop: reset together
@@ -166,7 +174,8 @@ estimator are the application's. Query, init and teardown:
     objects with their own size queries and inits: the sample helper mcab_sample_beam_get_mem_size /
     mcab_sample_beam_init (SRP-PHAT, BF), aec_config_from_level + aec_res_get_mem_size / aec_res_init
     (config fft_size = mcab_fft_size(p); no destroy), anr_get_mem_size / anr_init,
-    ac_istft_get_mem_size / ac_istft_init, ulcnet_nn_stage_mem_size / _init,
+    ac_istft_get_mem_size / ac_istft_init (the mcab_static sample synthesis carries its own window table; optionally borrow a lane's aec_synthesis_window() as in mono),
+    ulcnet_nn_stage_mem_size / _init,
     dfn_rate_bridge_get_mem_requirements / dfn_rate_bridge_init; mcab holds no RES)
 
 4. process  mcab_process_front(p, mics, far, &front);              // shared delay + 4 lanes
@@ -175,7 +184,9 @@ estimator are the application's. Query, init and teardown:
             mcab_fuse(p, W, E, &frame);                            // optional (cfg.enable_post = 1)
             // frame.g_res_ctx = NULL (mcab has no RES); then
             // mcab_sample_res_input(&frame, &in) + aec_res_process(res, &in) -> mcab_sample_anr_gain -> sk_min_f32
-            // -> sk_capply_gain_f32 -> aec_cng_fill -> ac_istft_push
+            // -> sk_capply_gain_f32 over frame.b (frame.e is the analysis seam) -> aec_cng_fill -> ac_istft_push
+            // before the CNG draw and the push: mcab_sample_post_reset_due(&handled, &frame) -> ac_istft_reset(istft);
+            // rng = MCAB_SAMPLE_CNG_RNG_SEED
             // or the helper's process_front() / process_beam() with your own mask and VAD in between
 
 5. reset?   mcab_reset(p);  aec_res_reset(res);  anr_reset(nr);  ac_istft_reset(istft);  rng = MCAB_SAMPLE_CNG_RNG_SEED;  [ulcnet_nn_stage_reset(stage);]

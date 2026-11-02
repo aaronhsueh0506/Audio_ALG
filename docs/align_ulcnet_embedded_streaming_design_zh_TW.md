@@ -129,8 +129,8 @@ C 端用 `make ULCNET_GRID=16k|48k` 選 grid（底層就是那兩個 `-D`），�
    `mask_fc1`/`mask_fc2` 的 `out_features` 與 attention 的 `ta_bins`，是不同的
    weight shape，必須各自訓練。
 
-`AIAEC/aiaec_process.h` 這條**共用候選模型 API 仍固定為 16 kHz**，並以
-`#if ULCNET_SR != AIAEC_SR` 的 `#error` 擋住用 48 kHz 的 Align-ULCNet 去別名它。
+`AIAEC/aiaec_process.h` 這條**共用候選模型 API 仍固定為 16 kHz**
+（`AIAEC_SR` 為 16000，獨立於 `ULCNET_*` 建置參數，沒有 `#error` 守衛）。
 48 kHz 目前只有 Align-ULCNet 自己的 C pipeline 支援。
 
 ## 2. 現況查證

@@ -21,8 +21,8 @@ lane、estimator、SRP、BF 都不在其中。`MCAB_DESCRIPTOR_VERSION` 為 1。
 | 20 | `reserved` | `uint32_t` | `0`（必須為 0，`mcab_init_ex()` 會驗證） |
 | 24 | `bytes` | `uint64_t` | mcab pool 總需求（不含 lane、estimator、helper，也不含 RES／NR／合成等後級 stage） |
 
-被取代的舊 layout（21～24 屬於前身的兩層；17 與 20 是更早的 unit layout）永遠不會再使用。`tests/test_mcab.c` 的 `run_static_parity` 對 17～24 逐一檢查：
-帶這些版號的 descriptor 一律被拒絕（17～23 另外把快取的 bytes 加大 4096，24 帶目前的 bytes，版號是唯一差異），被拒時 pool 一個 byte 都不會被寫。
+被取代的舊 layout（21～24 屬於前身的兩層；25 是沒有 rendering base 的版面；17 與 20 是更早的 unit layout）永遠不會再使用。`tests/test_mcab.c` 的 `run_static_parity` 對 17～25 逐一檢查：
+帶這些版號的 descriptor 一律被拒絕（17～24 另外把快取的 bytes 加大 4096，25 帶目前的 bytes，版號是唯一差異），被拒時 pool 一個 byte 都不會被寫。
 
 ### 8.2 `mcab_init_ex()` 的 8 項檢查
 

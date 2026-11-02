@@ -231,7 +231,7 @@ is rejected at parse time:
 
 ```
 $ make EXTRA_CFLAGS=-ffast-math
-Makefile:387: *** FP policy conflict: CFLAGS/CXXFLAGS/CPPFLAGS/EXTRA_CFLAGS contains -ffast-math; this repo pins -ffp-contract=off; remove -ffast-math from CFLAGS/CXXFLAGS/CPPFLAGS/EXTRA_CFLAGS.  Stop.
+Makefile:389: *** FP policy conflict: CFLAGS/CXXFLAGS/CPPFLAGS/EXTRA_CFLAGS contains -ffast-math; this repo pins -ffp-contract=off; remove -ffast-math from CFLAGS/CXXFLAGS/CPPFLAGS/EXTRA_CFLAGS.  Stop.
 ```
 
 `../../audiolib/common/scripts/audit_fp_contract.sh` is the disassembly-level

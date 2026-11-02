@@ -99,7 +99,8 @@ flow 沒有 RES：`frame.g_res_ctx` 恆為 NULL，RES 增益由你的 `AecRes` �
  │ mcab_fuse(p,weights,beamformed_error|NULL,&frame) ───────►│    → 0 / -1 / -2 / -3；frame.g_res_ctx = NULL
  │ mcab_sample_res_input(&frame,&in); aec_res_process(res,&in) ───────────────────►│ G_res（NULL = 輸入指標為 NULL）
  │ mcab_sample_anr_gain(nr,&frame,extra_noise,1) ──────────────────────────────────────────►│ G_nr（NULL = 被拒）
- │ sk_min_f32(total,G_nr,G_res,n); sk_capply_gain_f32(spec,frame.e,total,n)
+ │ mcab_sample_post_reset_due(&handled,&frame) 為真 ⇒ ac_istft_reset(istft)；rng = MCAB_SAMPLE_CNG_RNG_SEED（先於本 hop 的 CNG 與合成）
+ │ sk_min_f32(total,G_nr,G_res,n); sk_capply_gain_f32(spec,frame.b,total,n)（estimate 用 frame.e；增益乘在 rendering base frame.b）
  │ aec_cng_fill(&rng,spec,frame.cn,G_res,G_nr,MCAB_SAMPLE_CNG_NR_GAIN_FLOOR,n)
  │ ac_istft_push(istft,spec,out) ─────────────────────────────────────────────────────────────►│ hop 個樣本
  │ skn_all_finite_f32(out,hop)

@@ -25,7 +25,7 @@ McabSampleBeamParams bp = mcab_sample_beam_default_params();
 | `delay_num_filters` | `int` | `DA_NUM_FILTERS`（5） | MATCHED：`[1, DA_NUM_FILTERS]`；其他模式必須等於 `DA_NUM_FILTERS` | 記憶體旋鈕（只影響共用 estimator，不影響 mcab pool 與 lane） |
 | `fixed_delay_samples` | `int` | `-1` | FIXED：`[0, 120 × sample_rate]`（原生取樣點）；其他模式必須 `-1` | FIXED 的量測系統延遲 |
 | `capture_proxy_channel` | `int` | `0` | `[0, 3]` | 共用 delay matcher 用哪一支麥克風 |
-| `delay_backward_quarantine_enabled` | `int`（bool） | `0` | `0` 或 `1` | 預設關閉。開啟後只隔離**一種**共用估計：比現行 accepted delay **更早**（backward／pre-echo 方向）、且 **`capture_proxy_channel` 那一條 lane**（不是任一條——那正是餵給共用 estimator 的那支 mic，也是唯一能對這個估計提供證據的 lane）在目前對齊上仍明顯在消除回音（`aec_linear_is_cancelling()`）。**往後跳（delay 變大）永不隔離**，**首次取得對齊不受影響**。隔離**有上限**（見下一列），到期就採用；消除能力崩掉時則立即採用，但這是 hard replacement 常見而非所有真實路徑變化必然具備的現象。**它不是 pre-echo 誤鎖的解藥**：那個誤鎖已在估計器端根治（aggregator 改為回報 dominant peak，見 `AEC/docs/aec_methods.md`），這個機制擋的是真實路徑往前移動時的候選變動，仍然只是延後一個窗。`FIXED` / `EXTERNAL_ALIGNED` 不重新決定對齊，此旗標對它們無作用 |
+| `delay_backward_quarantine_enabled` | `int`（bool） | `0` | `0` 或 `1` | 預設關閉。開啟後只隔離**一種**共用估計：比現行 accepted delay **更早**（backward／pre-echo 方向）、且 **`capture_proxy_channel` 那一條 lane**（不是任一條——那正是餵給共用 estimator 的那支 mic，也是唯一能對這個估計提供證據的 lane）在目前對齊上仍明顯在消除回音（`aec_linear_is_cancelling()`）。**往後跳（delay 變大）永不隔離**，**首次取得對齊不受影響**。隔離**有上限**（見下一列），到期就採用；消除能力崩掉時則立即採用，但這是 hard replacement 常見而非所有真實路徑變化必然具備的現象。**它不是 pre-echo 誤鎖的解藥**：那個誤鎖已在估計器端根治（aggregator 改為回報 dominant peak，見 `AEC/docs/aec_methods_01_front_end.md` §2.3），這個機制擋的是真實路徑往前移動時的候選變動，仍然只是延後一個窗。`FIXED` / `EXTERNAL_ALIGNED` 不重新決定對齊，此旗標對它們無作用 |
 | `delay_backward_quarantine_s` | `float` | `1.0` | 有限值，`[0.0, 3600.0]` | 上一列的隔離窗長（秒），在 `mcab_init_ex()` 時按解析後的 hop／取樣率換算成 hop 數（`lrintf(秒數 / hop 秒數)`，最小 1；16 kHz、hop 256 下 1.0 s = 62 hops；要關閉請用上一列的 enable）。enable 為 0 時無作用，但仍會被驗證——設定檔今天就要是「翻一個旗標也不會壞」的狀態 |
 | `delay_est_period_s` | `float` | `0.0` | 有限值，`[0.0, 3600.0]` | estimator duty cycle：估計 solid 且 0.3 s 沒有變動後，分析降為每 `round(period / hop 秒數) / 5`（最小 1）個 hop 一次；`0.0` = 全速。非 0 可能改變所選的 lag，是 opt-in 的算量旋鈕。同一個值會由 `mcab_apply_lane_contract()` 蓋到每條 lane 的 `AecConfig.delay_est_period_s` |
 | `max_delay_ms` | `float` | `1024.0f` | 有限值，`[0.0, 4096.0]` | 僅 MATCHED：對齊環的容量 = `ceil(ms × sr / 1000) + 2 × hop + 1`。設成略大於系統真實最大 mic↔ref 延遲；設太大只是白吃記憶體 |
@@ -230,7 +230,7 @@ ne10、`SIMD=1`、`delay_mode=MATCHED`（`delay_num_filters` = 5）預設的實�
 | 16000，`num_angles = 360` | 914,016 | 3,794,336 | 4,708,352 | 66,688 | 4,775,040 |
 | 48000，全預設（1024/512，`num_angles=72`） | 3,203,904（lane ×4 2,936,832 + estimator 與 mcab pool 267,072；其中 mcab pool 230,272） | 3,125,408 | 6,329,312 | 225,056 | 6,554,368 |
 
-後級在 16 kHz/256 為 RES 7,904 + NR 45,344 + 合成 11,344 + 暫存 2,096 B，16 kHz/512 為 14,048 + 56,432 + 21,840 + 4,144 B，
+後級在 16 kHz/256 為 RES 7,904 + NR 45,344 + 合成 11,344（`mcab_static` 的合成帶自己的窗表；改借 `aec_synthesis_window()` 的窗則不另帶窗表，16 kHz/256 為 10,320）+ 暫存 2,096 B，16 kHz/512 為 14,048 + 56,432 + 21,840 + 4,144 B，
 48 kHz/1024 為 29,408 + 144,576 + 42,832 + 8,240 B（`aec_res_get_mem_size()` 等的實測）。`mcab_static` 的 CLI 沒有 `num_angles` 選項，
 `num_angles = 360` 那列是在程式裡設 `bp.num_angles` 後呼叫 `mcab_sample_unit_memory()` 的結果。
 `enable_post = 0`（ULCNet 範例的設定檔，`delay_num_filters = 5`）時 mcab 自己的 pool 較小（16 kHz/256 為 68,368、16 kHz/512 為 70,416、48 kHz/1024 為 205,584），

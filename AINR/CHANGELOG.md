@@ -23,6 +23,12 @@
   Not covered: the pipelines' DFN unit tests (their stand-in accelerator writes coefficient heads) and the Python pipeline mirror
   build the full model only.
 
+### Prepost borrows the application's AcIstft
+
+- The DFN2/DFN3 prepost classes (TIME path) take a borrowed `AcIstft` built from `dfn2_framing_config()` /
+  `dfn3_framing_config()`; inverse FFT and overlap-add stay with the application, the FREQ path is unchanged. The TIME pools
+  shrink by the `AcIstft`, so `DFN2_PREPOST_CARVE_VERSION` and `DFN3_PREPOST_CARVE_VERSION` go 7 -> 8 (outputs bit-identical).
+
 ### DFN2 multi-frame export: N frames per invocation
 
 - `DeepFilterNet2/export_onnx.py --frames-per-call N` (default 1) and `inference.py calib --frames-per-call N`: the graph
@@ -48,9 +54,9 @@
   accepts only that). With a 76-byte struct, an adapter compiled against the previous header and linked with the new library
   had 4 bytes written past its descriptor by `_default()` and read past it by `_validate()`. Now such an adapter
   (`input_frames` = 3) works with an N = 1 library and is refused by an N > 1 one. In C11 builds `_Static_assert` pins the
-  size (72 bytes) and the field list (18). `DFN2_MODEL_IO_LAYOUT_VERSION` 8, `DFN2_PREPOST_CARVE_VERSION` 7 and every N = 1
+  size (72 bytes) and the field list (18). `DFN2_MODEL_IO_LAYOUT_VERSION` 8, `DFN2_PREPOST_CARVE_VERSION` 8 and every N = 1
   output are unchanged. Test: `tests/test_dfn2_frames_per_call_c.py::test_a_descriptor_of_the_one_frame_header_is_safe_for_any_frame_count`.
-- `DFN2_MODEL_IO_LAYOUT_VERSION` stays 8 and `DFN2_PREPOST_CARVE_VERSION` stays 7: the state tensors do not change, and
+- `DFN2_MODEL_IO_LAYOUT_VERSION` stays 8 and `DFN2_PREPOST_CARVE_VERSION` stays 8: the state tensors do not change, and
   with N = 1 the pool size, hash and compile lines are those of a build without the option (rationale in
   `DeepFilterNet2/README.md`, "Multi-frame export").
 - Tests `tests/test_dfn2_frames_per_call.py` and `tests/test_dfn2_frames_per_call_c.py`, added to `make test-pairs`.
@@ -97,11 +103,6 @@
   `test_dfn2_lookahead_pairs.py`; the DFN3 stream driver gained a pool-identity
   check across pairs. C builds run for the six pairs with `D <= M` plus (0,1),
   (1,3), (2,4).
-
-### Known gap (AIAEC)
-- `AIAEC/dataset_gen/linear_aec.py` registers the AEC Python behaviour-hash step 5fe64e46 -> 428aa9b7 as a
-  compatible migration without a measurement that the frozen front end is unchanged over that step; a mismatch only
-  warns. Re-materialised corpora use the current hash.
 
 ### Source comments condensed
 

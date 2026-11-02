@@ -224,6 +224,6 @@ const DeepVqePrepostDescriptor *deepvqe_prepost_descriptor(const DeepVqePrepost 
   只有 `delay_depth` 是 export-time 部署參數、僅做範圍檢查；`DEEPVQE_PREPOST_LAYOUT_VERSION` = 4。
 - D 範圍 `DEEPVQE_PREPOST_MIN_D`=1 到 `DEEPVQE_PREPOST_MAX_D`=256，出貨值
   `DEEPVQE_PREPOST_DEFAULT_D`=32（16 kHz 上的半秒搜尋範圍；D 是 export 期參數，圖 shape 與 C 傳入的 `delay_depth` 必須相同，descriptor 只檢查範圍，抓不到不一致）。
-- grid 只有 16 kHz/512/256：`aiaec_process.h` 帶 `#error` 守衛，grid 換掉是編譯失敗而不是默默重新解讀張量。
+- grid 固定為 16 kHz/512/256：`aiaec_process.h` 的 `AIAEC_SR`／`AIAEC_N_FFT`／`AIAEC_HOP` 是常數，沒有 build 參數可換；`descriptor_validate()` 在執行期比對 `sample_rate`／`fft_size`，不符就拒絕。
 
 [索引](audio_libraries_c_api_zh_TW.md) ｜ [上一份](audio_libraries_c_api_zh_TW_01_aec_nr_audiolib.md) ｜ [下一份](audio_libraries_c_api_zh_TW_03_ai_prepost_pipeline.md) <!-- split-nav -->

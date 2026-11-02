@@ -57,7 +57,7 @@ Concat 的結果就是輸出，沒有 state 輸出由 Slice 產生。兩顆 GRU 
 window 與 ring 之後：state 19 個、graph inputs <b>21</b>（<code>mic</code>/<code>far</code> ＋ 19 個 state）。
 <code>export_graph</code> 以 <code>validate_inplace_state_contract</code> 驗證寫出的檔案，metadata 帶
 <code>state_binding = in_place_same_address</code>；沒有 C runtime 綁定這個模型（沒有 C 類別）。</p>
-<div class="note"><b>NPU 風險（readiness §3.4，四候選中 op 面最重）</b>：CATA 的
+<div class="note"><b>NPU 風險（四候選中 op 面最重）</b>：CATA 的
 <code>q.unsqueeze(3)*delayed</code> 逐幀仍是 <code>[B,24,1,63,49]</code>（≈74k 元素）broadcast；
 decoder 的 <code>ConvTranspose2d</code> 用動態 <code>output_size</code>，export 前必須固定。</div>
 
@@ -169,7 +169,7 @@ samples。</li>
 <li><code>AIAEC/CAGCRN/inference.py</code>、<code>export_onnx.py</code>、<code>train.py</code>、<code>config.ini</code></li>
 <li>tests：<code>AIAEC/tests/test_streaming_cagcrn.py</code>、<code>test_candidate_models.py</code>（含 <code>test_cagcrn_soft_window_has_gradient</code>）、<code>test_export_stateless.py</code>（外部 state 往返對 <code>forward_stream</code> 的 <code>rtol=1e-5, atol=2e-6</code>；<code>test_every_state_is_rank_four_and_returns_in_full</code>：每個 state rank 4、<code>*_out</code> 與輸入同 shape／dtype；<code>test_exported_graph_satisfies_the_in_place_state_contract</code>：寫出的檔案通過 <code>validate_inplace_state_contract</code>、window 的輸出由 Concat 產生；<code>test_cagcrn_hiddens_stack_on_dim_one_in_slot_order</code>：<code>h_gru</code> 兩個 slot 逐元素等於 <code>forward_stream</code> 的兩顆 hidden）、<code>test_onnx_state_contract_names.py</code>（validator 的違規案例）；全樹請執行 <code>python3 -m pytest AIAEC</code>。</li>
 <li>匯出／calibration：<code>AIAEC/CAGCRN/export_onnx.py</code>、<code>AIAEC/CAGCRN/inference.py calib</code>（BIN/NPZ calibration 放在 <code>AIAEC/CAGCRN/calib/</code>；calib 會同 process 一併匯出並 parity-check 對應 graph（預設 <code>&lt;output&gt;.onnx</code>，<code>--onnx</code> 可改））。</li>
-<li>docs：<code>docs/aiaec_streaming_readiness_zh_TW.md</code> §3.4</li>
+<li>docs：<code>docs/aiaec_streaming_readiness_zh_TW.md</code></li>
 </ul>
 </body>
 </html>
