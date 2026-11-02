@@ -157,8 +157,7 @@ static int capture_via_time_mode(ScaleCapture *cap, FftHandle *fft) {
     /* TIME mode borrows the application's synthesis object. */
     dfn2_framing_config(&synth, fft, NULL);
     synth_bytes = ac_istft_get_mem_size(&synth);
-    synth_mem = aligned_alloc(16u, (synth_bytes + 15u) / 16u * 16u);
-    if (!synth_mem) return 2;
+    if (posix_memalign(&synth_mem, 16u, synth_bytes) != 0) return 2;
     cfg.istft = ac_istft_init(synth_mem, synth_bytes, &synth);
     if (!cfg.istft) { free(synth_mem); return 2; }
     p = dfn2_prepost_create(&cfg);

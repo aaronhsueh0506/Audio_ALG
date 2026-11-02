@@ -89,7 +89,8 @@ def test_offline_inference_runs_for_every_legal_pair(
     output = tmp_path / 'enhanced.wav'
     inference.denoise_single(SimpleNamespace(
         config=str(config), model=str(checkpoint),
-        input=str(wavs / 'noise.wav'), output=str(output), atten_lim=None))
+        input=str(wavs / 'noise.wav'), output=str(output), atten_lim=None,
+        mask_only=False))
     enhanced, _ = soundfile.read(str(output), dtype='float32')
     source, _ = soundfile.read(str(wavs / 'noise.wav'), dtype='float32')
     assert enhanced.shape == source.shape

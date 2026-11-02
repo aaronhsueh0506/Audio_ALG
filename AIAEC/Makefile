@@ -1,6 +1,9 @@
 CC ?= cc
 AR ?= ar
-CFLAGS ?= -O2 -std=c11 -Wall -Wextra -Wpedantic -ffp-contract=off -fno-math-errno
+CFLAGS ?= -O2 -std=c11 -Wall -Wextra -Wpedantic
+# The floating-point contract is an invariant of the C/Python parity boundary:
+# keep it when a board build overrides CFLAGS on the command line.
+override CFLAGS += -ffp-contract=off -fno-math-errno
 SIMD ?= 1
 override SIMD := $(strip $(SIMD))
 
