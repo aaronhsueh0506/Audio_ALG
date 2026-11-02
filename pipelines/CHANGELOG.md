@@ -3,6 +3,30 @@
 `Audio_ALG/pipelines`（含它建置的 `AINR`、`AIAEC` C 程式）的重要改動記錄在此，格式依
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/)。README 只寫現況，改動經過寫在這裡。
 
+## [Unreleased] — 2026-11-02 — NEON model kernels also run on 32-bit ARM
+
+### Changed
+- The NEON model pre/post kernels of `AINR`, `AIAEC` and the pipelines are keyed on the shared `SK_HAVE_NEON`, which is now true on
+  32-bit ARM with NEON plus fused FMA (`-mcpu=cortex-a32/a53/a55/a73`, `-mfpu=neon-vfpv4`); other ARM32 targets and `SIMD=0` stay
+  scalar. The backend labels come from `SK_NEON_BACKEND_NAME` (`aarch32-neon` on 32-bit ARM).
+- `AIAEC/Makefile` appends `-ffp-contract=off -fno-math-errno` with `override`, as `AINR/Makefile` does, so a `CFLAGS=` on the
+  command line no longer drops the floating-point contract.
+
+- `AINR/RNNoise-ERB/process.c`: `hidden_finite` takes the flat `const float *` block instead of a `const float [3][128]` parameter. Passing
+  `state->hidden` (a `float [3][128]`) to it was a `-Wpedantic` error under gcc before C23 ("pointers to arrays with different qualifiers");
+  the check itself is unchanged.
+- gcc on 32-bit ARM warned `-Waggressive-loop-optimizations` on the scalar tail after the NEON loop of `df_common_features`
+  (`dfn2_process.c`, `dfn3_process.c`) and of `sk_ema_f32`, an error under `WERROR=1`; the warning is silenced around those
+  functions only (gcc; the pragma is a diagnostic, it changes no code). The tails are unchanged and correct for every size.
+
+### Tests
+- `dfn/tests/test_dfn_res_stage.c` allocates the synthesis block with `posix_memalign` (as the same file already does elsewhere) instead of
+  `aligned_alloc`, which glibc does not declare under the build's `-std=gnu99`: the call was an implicit declaration (a
+  `-Wimplicit-function-declaration` warning, and a truncated pointer on a 64-bit target).
+- `AINR/tests/test_nn_kernels.c` and `AIAEC/tests/test_prepost_kernels.c` returned `EXIT_SUCCESS` from `main` through their `CHECK`
+  macro when a sub-test failed; they now return `EXIT_FAILURE`. `AIAEC/tests/test_prepost_kernels.c` defines `_POSIX_C_SOURCE` for
+  `posix_memalign` under `-std=c11`. Tests that compare NEON with scalar call `SK_MATCH_SCALAR_TO_VECTOR_MODE()` first.
+
 ## [Unreleased] — 2026-10-29 — Consumers borrow the AEC synthesis window through `aec_synthesis_window()`
 
 ### Changed

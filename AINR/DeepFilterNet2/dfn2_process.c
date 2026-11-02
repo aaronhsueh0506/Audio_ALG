@@ -31,6 +31,12 @@ static const float df_zero_row[DFN2_DF_BINS];
 
 /* erb_fwd: caller-loaded matrix, raw float32, bin-major [n_bins][n_bands]
  * (export_erb_matrix.py --runtime-bins). The library never derives a filterbank. */
+#if defined(__GNUC__) && !defined(__clang__)
+/* gcc on 32-bit ARM warns that the scalar tail after the NEON loop cannot reach iteration 2^30 (an error under -Werror);
+ * the tail is correct for every df_bins. */
+#pragma GCC diagnostic push
+#pragma GCC diagnostic ignored "-Waggressive-loop-optimizations"
+#endif
 static inline void df_common_features(
     const float *spec_re, const float *spec_im,
     const float *erb_fwd, const uint16_t *fwd_lo, const uint16_t *fwd_hi,
@@ -98,6 +104,9 @@ static inline void df_common_features(
         }
     }
 }
+#if defined(__GNUC__) && !defined(__clang__)
+#pragma GCC diagnostic pop
+#endif
 
 /* Scalar twin of a NEON kernel; it is the whole kernel in a SIMD=0 build. */
 #define DFN2_TWIN static inline __attribute__((unused))
@@ -506,5 +515,5 @@ void dfn2_synthesis(DFN2State* st,
 
 const char* dfn2_simd_backend(void)
 {
-    return DF_COMMON_HAVE_NEON ? "aarch64-neon" : "scalar";
+    return SK_NEON_BACKEND_NAME;
 }

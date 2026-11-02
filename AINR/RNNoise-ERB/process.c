@@ -70,21 +70,19 @@ void rnnoise_model_state_init(RNNoiseModelState *state) {
     if (state != NULL) memset(state, 0, sizeof(*state));
 }
 
-static int hidden_finite(
-    const float hidden[RNNOISE_MODEL_GRU_COUNT][RNNOISE_MODEL_GRU_SIZE]) {
-    int layer;
+/* hidden is the flat [RNNOISE_MODEL_GRU_COUNT][RNNOISE_MODEL_GRU_SIZE] block: a float (*)[N] argument does not convert to
+ * const float (*)[N] before C23 (-Wpedantic), so the block is passed as &block[0][0]. */
+static int hidden_finite(const float *hidden) {
     int index;
-    for (layer = 0; layer < RNNOISE_MODEL_GRU_COUNT; ++layer) {
-        for (index = 0; index < RNNOISE_MODEL_GRU_SIZE; ++index) {
-            if (!isfinite(hidden[layer][index])) return 0;
-        }
+    for (index = 0; index < RNNOISE_MODEL_GRU_COUNT * RNNOISE_MODEL_GRU_SIZE; ++index) {
+        if (!isfinite(hidden[index])) return 0;
     }
     return 1;
 }
 
 int rnnoise_model_state_validate(RNNoiseModelState *state) {
     if (state == NULL) return -1;
-    if (!hidden_finite(state->hidden)) {
+    if (!hidden_finite(&state->hidden[0][0])) {
         rnnoise_model_state_init(state);
         return -1;
     }
@@ -97,7 +95,7 @@ int rnnoise_model_state_inherit(
     if (state == NULL || hidden_out == NULL) return -1;
     /* The runtime wrote the whole block in place: nothing to check or copy. */
     if (&hidden_out[0][0] == &state->hidden[0][0]) return 0;
-    if (!hidden_finite(hidden_out)) return -1;
+    if (!hidden_finite(&hidden_out[0][0])) return -1;
     memcpy(state->hidden, hidden_out, sizeof(state->hidden));
     return 0;
 }
@@ -321,9 +319,5 @@ int rnnoise_synthesis(RNNoiseState *st,
 }
 
 const char *rnnoise_simd_backend(void) {
-#if SK_HAVE_NEON
-    return "aarch64-neon";
-#else
-    return "scalar";
-#endif
+    return SK_NEON_BACKEND_NAME;
 }

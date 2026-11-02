@@ -13,6 +13,7 @@
 #include "aec_res.h"
 #include "4ch_aec_bf_nr_res/mcab_sample_post.h"
 #include "utility/simd_kernel_nn.h"
+#include "utility/simd_test_mode.h"
 
 static int g_fail;
 #define CHECK(c, msg) do { if (!(c)) { printf("FAIL: %s (line %d)\n", msg, __LINE__); ++g_fail; } } while (0)
@@ -350,6 +351,7 @@ static void test_hop_is_finite(void) {
 }
 
 int main(void) {
+    SK_MATCH_SCALAR_TO_VECTOR_MODE();
     test_nr_config();
     test_stage();
     test_psd_scale();

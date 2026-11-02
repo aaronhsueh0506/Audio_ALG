@@ -8,6 +8,7 @@
 #include <stdlib.h>
 #include <string.h>
 
+#include "utility/simd_test_mode.h"
 #include "DeepFilterNet2/dfn2_process.c"
 #include "GTCRN/gtcrn_process.c"
 
@@ -311,8 +312,9 @@ static int test_dfn2_expand_mask(void)
 
 int main(void)
 {
-    CHECK(test_dfn2_expand_mask(), "DFN2 kernels");
-    CHECK(test_gtcrn_kernels(), "GTCRN kernels");
+    SK_MATCH_SCALAR_TO_VECTOR_MODE();
+    if (!test_dfn2_expand_mask()) return EXIT_FAILURE;
+    if (!test_gtcrn_kernels()) return EXIT_FAILURE;
     printf("nn kernels: backend=%s/%s ok\n", dfn2_simd_backend(),
            gtcrn_simd_backend());
     return EXIT_SUCCESS;

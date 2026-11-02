@@ -4,11 +4,15 @@
  * kernels are static, so this file includes their translation units.
  * KERNEL_TEST_ULCNET selects ulcnet_model_io.c, KERNEL_TEST_DEEPVQE selects
  * deepvqe_prepost.c. */
+/* posix_memalign is declared only with this under -std=c11 on glibc. */
+#define _POSIX_C_SOURCE 200112L
 #include <math.h>
 #include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+
+#include "utility/simd_test_mode.h"
 
 #if defined(KERNEL_TEST_ULCNET)
 #include "ulcnet_model_io.c"
@@ -344,14 +348,15 @@ static int test_deepvqe_newest_frame(void)
 
 int main(void)
 {
-    CHECK(test_rows_all_finite(), "finite predicate over rows");
+    SK_MATCH_SCALAR_TO_VECTOR_MODE();
+    if (!test_rows_all_finite()) return EXIT_FAILURE;
 #if defined(KERNEL_TEST_ULCNET)
-    CHECK(test_ulcnet_kernels(), "Align-ULCNet front and back end");
-    CHECK(test_ulcnet_frame_finite(), "Align-ULCNet frame finite");
+    if (!test_ulcnet_kernels()) return EXIT_FAILURE;
+    if (!test_ulcnet_frame_finite()) return EXIT_FAILURE;
 #else
-    CHECK(test_deepvqe_kernels(), "DeepVQE-S compression");
-    CHECK(test_deepvqe_newest_frame(), "DeepVQE-S newest frame");
+    if (!test_deepvqe_kernels()) return EXIT_FAILURE;
+    if (!test_deepvqe_newest_frame()) return EXIT_FAILURE;
 #endif
-    printf("prepost kernels: backend=%s ok\n", SK_HAVE_NEON ? "aarch64-neon" : "scalar");
+    printf("prepost kernels: backend=%s ok\n", SK_NEON_BACKEND_NAME);
     return EXIT_SUCCESS;
 }

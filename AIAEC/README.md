@@ -3,8 +3,10 @@
 ## ARM target selection
 
 C deployment supports both ARM EABI32 and AArch64 builds. The target compiler's
-predefined macros select the path: AArch64 uses the guarded NEON model kernels;
-ARM32 uses their existing scalar implementations. `SIMD=0` still forces scalar.
+predefined macros select the path: AArch64 and 32-bit ARM with NEON plus fused FMA
+(`-mcpu=cortex-a32/a53/a55/a73`, `-mfpu=neon-vfpv4`, `-mfpu=neon-fp-armv8`) use the
+guarded NEON model kernels (`SK_HAVE_NEON`); other ARM32 targets use their scalar
+implementations. `SIMD=0` still forces scalar.
 The shared FFT independently selects its available target implementation; select
 the board compiler and ABI flags rather than editing source guards. Signal grids,
 model state tensors and latency do not change with pointer width.

@@ -271,5 +271,5 @@ void gtcrn_synthesis(GTCRNProcessState* state,
 
 const char* gtcrn_simd_backend(void)
 {
-    return DF_COMMON_HAVE_NEON ? "aarch64-neon" : "scalar";
+    return SK_NEON_BACKEND_NAME;
 }

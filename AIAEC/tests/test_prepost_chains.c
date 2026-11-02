@@ -20,6 +20,8 @@
 #include <stdlib.h>
 #include <string.h>
 
+#include "utility/simd_test_mode.h"
+
 #if defined(CHAIN_ULCNET)
 #include "ulcnet_prepost.h"
 #elif defined(CHAIN_DEEPVQE)
@@ -343,6 +345,7 @@ static uint64_t run_chain(int depth)
 int main(void)
 {
     uint64_t got[2];
+    SK_MATCH_SCALAR_TO_VECTOR_MODE();
     for (int i = 0; i < 2; ++i) {
         got[i] = run_chain(kDepths[i]);
         if (run_chain(kDepths[i]) != got[i]) {
