@@ -77,12 +77,12 @@
 | `PL` pipelines（common、mono、DFN、4ch、ULCNet 範例）與其 Python 參考 | 332 | 90 | 42 | 48 | 242 | 0 | 30 | 36 |
 | `TP` audiolib (doa/bf/VAD/common/utility) | 65 | 0 | 0 | 0 | 65 | 0 | 0 | 0 |
 | `AC` audiolib | 283 | 39 | 19 | 20 | 244 | 0 | 0 | 12 |
-| `AINR` AINR（DFN2、GTCRN、RNNoise-ERB） | 112 | 55 | 29 | 26 | 57 | 0 | 2 | 20 |
+| `AINR` AINR（DFN2、GTCRN、RNNoise-ERB） | 113 | 56 | 30 | 26 | 57 | 0 | 2 | 20 |
 | `AIAEC` AIAEC（Align-ULCNet、DeepVQE-S、共用 helper） | 114 | 40 | 17 | 23 | 74 | 0 | 0 | 21 |
-| `TOTAL` 合計 | 906 | 224 | 107 | 117 | 682 | 0 | 32 | 89 |
+| `TOTAL` 合計 | 907 | 225 | 108 | 117 | 682 | 0 | 32 | 89 |
 <!-- map:stats:end -->
 
-讀法：906 個 C 函式中，224 個有 Python 對應（mirror 107、partial 117），其中 89 個的配對是推論；682 個是 C-only；未能判斷 0 個。另有 32 個 Python 符號只在 Python。
+讀法：907 個 C 函式中，225 個有 Python 對應（mirror 108、partial 117），其中 89 個的配對是推論；682 個是 C-only；未能判斷 0 個。另有 32 個 Python 符號只在 Python。
 
 「已對應」是**索引**，不是「已驗證一致」。真正量過數值的只有「對拍工具／測試」欄標（C↔Py）的項目，以及備註內註明為一次性量測的數字；其餘靠「已知落差」欄的編號。
 
@@ -164,7 +164,7 @@
 | `audiolib/common/src/hpf.c` | all | 8 |
 | `AINR/DeepFilterNet2/dfn2_model_io.c` | all | 13 |
 | `AINR/DeepFilterNet2/dfn2_prepost.c` | all | 43 |
-| `AINR/DeepFilterNet2/dfn2_process.c` | all | 17 |
+| `AINR/DeepFilterNet2/dfn2_process.c` | all | 18 |
 | `AINR/GTCRN/gtcrn_process.c` | all | 19 |
 | `AINR/RNNoise-ERB/gen_rnnoise_tables.c` | all | 7 |
 | `AINR/RNNoise-ERB/process.c` | all | 12 |
@@ -312,7 +312,7 @@
 | AINR-DFN2-02 | `audiolib/common/utility/simd_kernel_nn.h: skn_erb_forward_banded_f32` | `AINR/DeepFilterNet2/train.py:erb_band_db` | partial | — | `AINR/tests/test_python_c_prepost_parity.py`（C↔Py） | （推論）帶狀 ERB 前向矩陣乘；dB 轉換在 `df_common_features`。核心是共用標頭的 `skn_erb_forward_banded_f32`；DFN3 呼叫同一個函式，呼叫點在 `dfn3_process.c`（該檔不在本表的涵蓋清單內，故無對應列）。 |
 | AINR-DFN2-03 | `AINR/DeepFilterNet2/dfn2_process.c: dfn2_analysis` | `AINR/DeepFilterNet2/inference.py:process_file` | partial | D-33 | — | center=False 串流 STFT 對 torch.stft(center=True) 的第 k 幀（k>=1）最大差 1.9e-6；第 0 幀（零歷史對 reflect）不同。 |
 | AINR-DFN2-04 | `AINR/DeepFilterNet2/dfn2_process.c: dfn2_synthesis` | `AINR/DeepFilterNet2/inference.py:process_file` | partial | D-33 | — | （推論）對 torch.istft(center=True) 內部區最大差 4.8e-7。 |
-| AINR-DFN2-05 | `AINR/DeepFilterNet2/dfn2_process.c: df_common_expand_mask, df_common_expand_mask_scalar, df_common_expand_mask_neon` | `pipelines/dfn/dfn2_stage.py:expand_erb_mask`<br>`AINR/DeepFilterNet2/model.py:DeepFilterNet2.compose` | mirror | S-21 | `AINR/DeepFilterNet2/tests/test_dfn2_contract.py`（Py 契約） | ERB mask 以 band-major 逆矩陣展開到 bin；矩陣版面是契約（`--output-dir` 匯出包的 inverse 版面不同）。 |
+| AINR-DFN2-05 | `AINR/DeepFilterNet2/dfn2_process.c: df_common_expand_mask, df_common_expand_mask_scalar, df_common_expand_mask_neon, df_mask_spectrum` | `pipelines/dfn/dfn2_stage.py:expand_erb_mask`<br>`AINR/DeepFilterNet2/model.py:DeepFilterNet2.compose`<br>`AINR/DeepFilterNet2/model.py:DeepFilterNet2.apply_erb_mask` | mirror | S-21 | `AINR/DeepFilterNet2/tests/test_dfn2_contract.py`（Py 契約） | ERB mask 以 band-major 逆矩陣展開到 bin；矩陣版面是契約（`--output-dir` 匯出包的 inverse 版面不同）。`df_mask_spectrum` 只在 `-DDFN2_MASK_ONLY` 建置存在（= `apply_erb_mask`，由 `AINR/tests/test_dfn2_mask_only_c.py` 對 numpy 對拍）。 |
 | AINR-DFN2-06 | `AINR/DeepFilterNet2/dfn2_process.c: df_common_deep_filter` | `AINR/DeepFilterNet2/model.py:deep_filter_apply` | mirror | — | `AINR/tests/test_python_c_prepost_parity.py`（C↔Py） | 深度濾波器的複數 FIR；compose 整體對 model.compose 最大差 2.98e-8。 |
 | AINR-DFN2-07 | `AINR/DeepFilterNet2/dfn2_process.c: dfn2_compose` | `AINR/DeepFilterNet2/model.py:DeepFilterNet2.compose` | mirror | — | `AINR/tests/test_python_c_prepost_parity.py`（C↔Py） | — |
 | AINR-DFN2-08 | `AINR/DeepFilterNet2/dfn2_process.c: dfn2_compose_stream` | `pipelines/dfn/dfn2_stage.py:Dfn2Stage._compose` | mirror | D-42 | `pipelines/dfn/tests/test_dfn2_stage_c_parity.py`（C↔Py） | 每個 emitted frame 逐位元相同。 |

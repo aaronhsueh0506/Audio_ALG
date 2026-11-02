@@ -19,7 +19,11 @@ void dfn2_model_io_init(DFN2ModelIOState *state)
     state->state_generation = 1u;
 }
 
+#ifdef DFN2_MASK_ONLY
+#define DFN2_MODEL_IO_STATE_TENSORS 1
+#else
 #define DFN2_MODEL_IO_STATE_TENSORS 2
+#endif
 
 /* One list of (field, contract value) drives both the default and the validator,
  * so they cannot diverge. */
@@ -107,6 +111,19 @@ static int all_finite(const float *values, size_t count)
     return skn_all_finite_f32(values, count);
 }
 
+#ifdef DFN2_MASK_ONLY
+int dfn2_model_io_validate_arrays(
+    float gru_hidden[DFN2_MODEL_GRU_ROWS][DFN2_MODEL_GRU_HIDDEN])
+{
+    const size_t gru_count = (size_t)DFN2_MODEL_GRU_ROWS *
+                             DFN2_MODEL_GRU_HIDDEN;
+    if (gru_hidden == NULL) return -1;
+    if (all_finite(&gru_hidden[0][0], gru_count)) return 0;
+    /* Zero is the only state a stream can restart from after an in-place overwrite. */
+    memset(gru_hidden, 0, gru_count * sizeof(float));
+    return -1;
+}
+#else
 int dfn2_model_io_validate_arrays(
     float gru_hidden[DFN2_MODEL_GRU_ROWS][DFN2_MODEL_GRU_HIDDEN],
     float df_convp_window[DFN2_MODEL_ENCODER_CHANNELS]
@@ -125,6 +142,7 @@ int dfn2_model_io_validate_arrays(
     memset(df_convp_window, 0, convp_count * sizeof(float));
     return -1;
 }
+#endif
 
 int dfn2_model_io_push_features(DFN2ModelIOState *state,
                                 const float erb[DFN2_N_ERB],
@@ -156,9 +174,13 @@ int dfn2_model_io_frame_slot(const DFN2ModelIOState *state)
 int dfn2_model_io_validate_state(DFN2ModelIOState *state)
 {
     if (state == NULL) return -1;
+#ifdef DFN2_MASK_ONLY
+    if (dfn2_model_io_validate_arrays(state->gru_hidden) == 0) return 0;
+#else
     if (dfn2_model_io_validate_arrays(state->gru_hidden,
                                       state->df_convp_window) == 0)
         return 0;
+#endif
     ++state->state_generation;
     return -1;
 }
@@ -176,7 +198,9 @@ void dfn2_model_io_zero_recurrent(DFN2ModelIOState *state)
 {
     if (state == NULL) return;
     memset(state->gru_hidden, 0, sizeof(state->gru_hidden));
+#ifndef DFN2_MASK_ONLY
     memset(state->df_convp_window, 0, sizeof(state->df_convp_window));
+#endif
     ++state->state_generation;
 }
 

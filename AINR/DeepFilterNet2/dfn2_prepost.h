@@ -81,13 +81,17 @@ extern "C" {
     (2 * DFN2_MODEL_WINDOW_FRAMES * DFN2_DF_BINS)
 #define DFN2_PREPOST_GRU_HIDDEN_ELEMENTS \
     (DFN2_MODEL_GRU_ROWS * DFN2_MODEL_GRU_HIDDEN)
+#define DFN2_PREPOST_ERB_MASK_ELEMENTS   (DFN2_FRAMES_PER_CALL * DFN2_N_ERB)
+/* DFN2_MASK_ONLY (dfn2_model_io.h) has no deep filter: no coefficient or alpha
+ * head and no pathway window, in the sizes and in the two structs below. */
+#ifndef DFN2_MASK_ONLY
 #define DFN2_PREPOST_CONVP_WINDOW_ELEMENTS \
     (DFN2_MODEL_ENCODER_CHANNELS * DFN2_MODEL_DF_PATHWAY_WINDOW * \
      DFN2_DF_BINS)
-#define DFN2_PREPOST_ERB_MASK_ELEMENTS   (DFN2_FRAMES_PER_CALL * DFN2_N_ERB)
 #define DFN2_PREPOST_COEFS_ELEMENTS \
     (DFN2_FRAMES_PER_CALL * DFN2_DF_BINS * DFN2_DF_ORDER * 2)
 #define DFN2_PREPOST_ALPHA_ELEMENTS      DFN2_FRAMES_PER_CALL
+#endif
 
 /* Which side of the transform the caller works on; fixed at init because it
  * decides the pool size (DFN2_IO_TIME also carves the output staging and the
@@ -143,15 +147,19 @@ typedef struct DFN2PrepostInputs {
     /* 'h_gru' (1,DFN2_MODEL_GRU_ROWS,1,DFN2_MODEL_GRU_HIDDEN); rows start at
      * DFN2_MODEL_GRU_ROW_ENCODER / _ERB / _DF */
     const float (*gru_hidden)[DFN2_MODEL_GRU_HIDDEN];
+#ifndef DFN2_MASK_ONLY
     /* 'df_convp_history'
      * (1,DFN2_MODEL_ENCODER_CHANNELS,DFN2_MODEL_DF_PATHWAY_WINDOW,
      *  DFN2_DF_BINS) */
     const float (*df_convp_window)[DFN2_MODEL_DF_PATHWAY_WINDOW]
                                   [DFN2_DF_BINS];
+#endif
     size_t erb_window_elements;
     size_t spec_window_elements;
     size_t gru_hidden_elements;
+#ifndef DFN2_MASK_ONLY
     size_t df_convp_window_elements;
+#endif
 } DFN2PrepostInputs;
 
 /* Accelerator-writable outputs: the three heads and the two next-state tensors.
@@ -163,16 +171,24 @@ typedef struct DFN2PrepostInputs {
  * (1,N,bins,order*2), 'df_alpha' (1,N,1)). */
 typedef struct DFN2PrepostOutputs {
     float *erb_mask;                /* 'erb_mask'  [N][DFN2_N_ERB]          */
+#ifndef DFN2_MASK_ONLY
     float *coefs;                   /* 'df_coefs'  [N][bins][order][2]      */
     float *alpha;                   /* 'df_alpha'  [N]                      */
+#endif
     float (*gru_hidden_next)[DFN2_MODEL_GRU_HIDDEN];          /* h_gru_out */
+#ifndef DFN2_MASK_ONLY
     float (*df_convp_window_next)[DFN2_MODEL_DF_PATHWAY_WINDOW]
                                  [DFN2_DF_BINS];  /* df_convp_history_out  */
+#endif
     size_t erb_mask_elements;
+#ifndef DFN2_MASK_ONLY
     size_t coefs_elements;
     size_t alpha_elements;
+#endif
     size_t gru_hidden_elements;
+#ifndef DFN2_MASK_ONLY
     size_t df_convp_window_elements;
+#endif
 } DFN2PrepostOutputs;
 
 /* ---- config / sizing ------------------------------------------------- */

@@ -26,8 +26,10 @@
 #define PP_MODEL_LOOKAHEAD DFN2_PREPOST_LATENCY_FRAMES
 
 #define PP_FRAMES       DFN2_FRAMES_PER_CALL
+#ifndef DFN2_MASK_ONLY
 /* One frame's deep-filter coefficients. */
 #define PP_FRAME_COEFS  (DFN2_DF_BINS * DFN2_DF_ORDER * 2)
+#endif
 
 struct DFN2Prepost {
     DFN2State        *dsp;
@@ -64,19 +66,24 @@ struct DFN2Prepost {
     float *enh_im;
     float *out_hop;     /* [PP_FRAMES][DFN2_HOP_LEN], DFN2_IO_TIME only     */
 
-    /* Accelerator-writable boundary: the three heads. The recurrent state is
+    /* Accelerator-writable boundary: the heads (three; the ERB mask alone with
+     * DFN2_MASK_ONLY). The recurrent state is
      * DFN2ModelIOState's own two arrays at fixed addresses; a runtime writes its
      * state outputs to the same addresses as the inputs. */
     float *head_erb_mask;   /* [DFN2_PREPOST_ERB_MASK_ELEMENTS]             */
+#ifndef DFN2_MASK_ONLY
     float *head_coefs;      /* [DFN2_PREPOST_COEFS_ELEMENTS]                */
     float *head_alpha;      /* [DFN2_PREPOST_ALPHA_ELEMENTS]                */
+#endif
 
     /* Identity heads for frame_skip: unit band mask, zero coefficients, one
      * frame, used for every frame of the call. Written once at init;
      * dfn2_compose_stream refuses NULL heads, so pass-through is expressed as
      * heads. */
     float *skip_mask;       /* [DFN2_N_ERB], all 1.0f                       */
+#ifndef DFN2_MASK_ONLY
     float *skip_coefs;      /* [PP_FRAME_COEFS], all 0.0f                   */
+#endif
 
     int       frame_open;    /* a frame awaits commit or skip               */
     int       prepared;      /* frame_inputs() armed the accelerator transaction for the open frame */
@@ -197,10 +204,14 @@ static int pp_layout(DFN2Prepost *p, unsigned char *base,
         (size_t)PP_FRAMES * DFN2_N_BINS,
         (size_t)PP_FRAMES * DFN2_N_BINS,
         DFN2_PREPOST_ERB_MASK_ELEMENTS,
+#ifndef DFN2_MASK_ONLY
         DFN2_PREPOST_COEFS_ELEMENTS,
         DFN2_PREPOST_ALPHA_ELEMENTS,
-        DFN2_N_ERB,
-        PP_FRAME_COEFS
+#endif
+        DFN2_N_ERB
+#ifndef DFN2_MASK_ONLY
+        , PP_FRAME_COEFS
+#endif
     };
     const size_t n_float_regions =
         sizeof(float_counts) / sizeof(float_counts[0]);
@@ -232,9 +243,14 @@ static int pp_layout(DFN2Prepost *p, unsigned char *base,
         slots[0]  = &p->spec_re;       slots[1]  = &p->spec_im;
         slots[2]  = &p->feat_erb;      slots[3]  = &p->feat_spec;
         slots[4]  = &p->enh_re;        slots[5]  = &p->enh_im;
-        slots[6]  = &p->head_erb_mask; slots[7]  = &p->head_coefs;
+        slots[6]  = &p->head_erb_mask;
+#ifdef DFN2_MASK_ONLY
+        slots[7]  = &p->skip_mask;
+#else
+        slots[7]  = &p->head_coefs;
         slots[8]  = &p->head_alpha;    slots[9]  = &p->skip_mask;
         slots[10] = &p->skip_coefs;
+#endif
     }
     for (i = 0; i < n_float_regions; ++i) {
         if (pp_carve(base, &cursor, float_counts[i] * sizeof(float),
@@ -387,7 +403,9 @@ DFN2Prepost *dfn2_prepost_init_ex(void *pool, size_t bytes,
     }
 
     for (i = 0; i < DFN2_N_ERB; ++i) p->skip_mask[i] = 1.0f;
+#ifndef DFN2_MASK_ONLY
     memset(p->skip_coefs, 0, (size_t)PP_FRAME_COEFS * sizeof(float));
+#endif
 
     pp_reset_states(p);   /* staging is already zero from the pool memset */
     pp_clear_frame(p);
@@ -636,38 +654,46 @@ int dfn2_prepost_frame_inputs(DFN2Prepost *p, DFN2PrepostInputs *inputs,
             p->io->spec_window;
     inputs->gru_hidden =
         (const float (*)[DFN2_MODEL_GRU_HIDDEN])p->io->gru_hidden;
+#ifndef DFN2_MASK_ONLY
     inputs->df_convp_window =
         (const float (*)[DFN2_MODEL_DF_PATHWAY_WINDOW][DFN2_DF_BINS])
             p->io->df_convp_window;
+    inputs->df_convp_window_elements = DFN2_PREPOST_CONVP_WINDOW_ELEMENTS;
+#endif
     inputs->erb_window_elements = DFN2_PREPOST_ERB_WINDOW_ELEMENTS;
     inputs->spec_window_elements = DFN2_PREPOST_SPEC_WINDOW_ELEMENTS;
     inputs->gru_hidden_elements = DFN2_PREPOST_GRU_HIDDEN_ELEMENTS;
-    inputs->df_convp_window_elements = DFN2_PREPOST_CONVP_WINDOW_ELEMENTS;
 
-    /* NaN-fill the three heads so a repeated request gets a clean boundary and a
+    /* NaN-fill the heads so a repeated request gets a clean boundary and a
      * partial accelerator write fails commit. The recurrent state is the
      * accelerator's input too and is left as is. */
     pp_fill_nan(p->head_erb_mask, DFN2_PREPOST_ERB_MASK_ELEMENTS);
+#ifndef DFN2_MASK_ONLY
     pp_fill_nan(p->head_coefs, DFN2_PREPOST_COEFS_ELEMENTS);
     pp_fill_nan(p->head_alpha, DFN2_PREPOST_ALPHA_ELEMENTS);
+#endif
 
     memset(outputs, 0, sizeof(*outputs));
     outputs->erb_mask = p->head_erb_mask;
+    outputs->gru_hidden_next = p->io->gru_hidden;
+    outputs->erb_mask_elements = DFN2_PREPOST_ERB_MASK_ELEMENTS;
+    outputs->gru_hidden_elements = DFN2_PREPOST_GRU_HIDDEN_ELEMENTS;
+#ifndef DFN2_MASK_ONLY
     outputs->coefs = p->head_coefs;
     outputs->alpha = p->head_alpha;
-    outputs->gru_hidden_next = p->io->gru_hidden;
     outputs->df_convp_window_next = p->io->df_convp_window;
-    outputs->erb_mask_elements = DFN2_PREPOST_ERB_MASK_ELEMENTS;
     outputs->coefs_elements = DFN2_PREPOST_COEFS_ELEMENTS;
     outputs->alpha_elements = DFN2_PREPOST_ALPHA_ELEMENTS;
-    outputs->gru_hidden_elements = DFN2_PREPOST_GRU_HIDDEN_ELEMENTS;
     outputs->df_convp_window_elements = DFN2_PREPOST_CONVP_WINDOW_ELEMENTS;
+#endif
     p->prepared = 1;
     return 0;
 }
 
+#ifndef DFN2_MASK_ONLY
 /* Alpha of the identity heads. */
 static const float pp_skip_alpha[1];
+#endif
 
 /* Run the compose stage with the given heads and, in DFN2_IO_TIME, the
  * synthesis, for each frame of the call in order: frame i reads its heads at
@@ -679,6 +705,10 @@ static int pp_close_frame(DFN2Prepost *p, const float *erb_mask,
                           int stride) {
     int i;
 
+#ifdef DFN2_MASK_ONLY
+    (void)coefs;   /* no deep filter: only the ERB mask head exists */
+    (void)alpha;
+#endif
     for (i = 0; i < PP_FRAMES; ++i) {
         const size_t head = (size_t)i * (size_t)stride;
         float *enh_re = p->enh_re + (size_t)i * DFN2_N_BINS;
@@ -691,12 +721,20 @@ static int pp_close_frame(DFN2Prepost *p, const float *erb_mask,
          * untouched and the frame open for frame_skip(). The heads were
          * finite-checked before this loop and every frame of a call is past
          * the warm-up, so only the first frame can return -1. */
+#ifdef DFN2_MASK_ONLY
+        emitted = dfn2_compose_stream(p->dsp, p->compose_re[i],
+                                      p->compose_im[i], 1,
+                                      erb_mask + head * DFN2_N_ERB, NULL,
+                                      0.0f, p->atten_lim_db, enh_re,
+                                      enh_im, &frame);
+#else
         emitted = dfn2_compose_stream(p->dsp, p->compose_re[i],
                                       p->compose_im[i], 1,
                                       erb_mask + head * DFN2_N_ERB,
                                       coefs + head * PP_FRAME_COEFS,
                                       alpha[head], p->atten_lim_db, enh_re,
                                       enh_im, &frame);
+#endif
         if (emitted < 0) return -1;
         /* One synthesis push per emitted frame and none on warm-up frames. */
         if (emitted && p->io_mode == DFN2_IO_TIME)
@@ -729,9 +767,13 @@ int dfn2_prepost_frame_commit(DFN2Prepost *p) {
      * frame_skip() or a fresh frame_inputs(). Windows, compose state and clocks are
      * untouched. */
     heads_finite =
+#ifdef DFN2_MASK_ONLY
+        pp_all_finite(p->head_erb_mask, DFN2_PREPOST_ERB_MASK_ELEMENTS);
+#else
         pp_all_finite(p->head_erb_mask, DFN2_PREPOST_ERB_MASK_ELEMENTS) &&
         pp_all_finite(p->head_coefs, DFN2_PREPOST_COEFS_ELEMENTS) &&
         pp_all_finite(p->head_alpha, DFN2_PREPOST_ALPHA_ELEMENTS);
+#endif
     state_finite = dfn2_model_io_validate_state(p->io) == 0;
     if (!state_finite || !heads_finite) {
         /* validate_state already zeroed and counted a bad state; a bad head with a
@@ -743,8 +785,12 @@ int dfn2_prepost_frame_commit(DFN2Prepost *p) {
 
     /* The compose stage advances its clock and closes the frame: the one step
      * with no undo, placed where nothing can fail after it. */
+#ifdef DFN2_MASK_ONLY
+    return pp_close_frame(p, p->head_erb_mask, NULL, NULL, 1);
+#else
     return pp_close_frame(p, p->head_erb_mask, p->head_coefs, p->head_alpha,
                           1);
+#endif
 }
 
 int dfn2_prepost_frame_skip(DFN2Prepost *p) {
@@ -753,7 +799,11 @@ int dfn2_prepost_frame_skip(DFN2Prepost *p) {
      * partition-of-unity erb_inv, and alpha 0 selects the masked residual, so the
      * noisy spectrum passes through. The recurrent state is untouched; the
      * deep-filter and compose clocks still advance. */
+#ifdef DFN2_MASK_ONLY
+    return pp_close_frame(p, p->skip_mask, NULL, NULL, 0);
+#else
     return pp_close_frame(p, p->skip_mask, p->skip_coefs, pp_skip_alpha, 0);
+#endif
 }
 
 int dfn2_prepost_post_process(DFN2Prepost *p, float out_hop[DFN2_HOP_LEN],

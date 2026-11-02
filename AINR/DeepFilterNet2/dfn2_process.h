@@ -58,8 +58,21 @@
  * different pairs do not link (see DFN2_REQUIRE_LOOKAHEAD_PAIR_LINK below).
  * Valid pairs are 0 <= MASK <= 2 (the mask path reads a three-frame window) and
  * 0 <= DF < DF_ORDER, independent of each other. */
+/* -DDFN2_MASK_ONLY builds stage 1 alone (ERB mask, no deep filter), the model
+ * `export_onnx.py --mask-only` writes. Every translation unit of the build
+ * passes it. There is no deep filter to look ahead for, so the lookahead is 0
+ * (leave DFN2_DF_LOOKAHEAD undefined or define it as 0); the deep-filter rings,
+ * the coefficient/alpha heads and the pathway window do not exist, and
+ * dfn2_compose*() take the masked noisy spectrum as the output. */
 #ifndef DFN2_DF_LOOKAHEAD
+#ifndef DFN2_MASK_ONLY
 #define DFN2_DF_LOOKAHEAD   1     /* future taps */
+#else
+#define DFN2_DF_LOOKAHEAD   0     /* stage 1 alone: no deep filter */
+#endif
+#endif
+#if defined(DFN2_MASK_ONLY) && DFN2_DF_LOOKAHEAD != 0
+#error "DFN2_MASK_ONLY has no deep filter: DFN2_DF_LOOKAHEAD must be 0"
 #endif
 #ifndef DFN2_MASK_LOOKAHEAD
 #define DFN2_MASK_LOOKAHEAD 1     /* future frames of the input window */
@@ -89,8 +102,12 @@
  * so the ring is the larger of the first two: 5 up to MASK + DF = 4, 7 for 2/4. */
 #define DFN2_DF_HISTORY     (DFN2_DF_ORDER - DFN2_DF_LOOKAHEAD - 1)
 #define DFN2_DF_RING_NOISY  (DFN2_MASK_LOOKAHEAD + DFN2_DF_LOOKAHEAD + 1)
+#ifdef DFN2_MASK_ONLY
+#define DFN2_DF_RING        DFN2_DF_RING_NOISY   /* only the noisy ring is kept */
+#else
 #define DFN2_DF_RING \
     (DFN2_DF_ORDER > DFN2_DF_RING_NOISY ? DFN2_DF_ORDER : DFN2_DF_RING_NOISY)
+#endif
 
 /* Link-time pair check. dfn2_process.c defines a one-byte symbol named after
  * the pair it was built for (dfn2_lookahead_mask1_df1 for the shipped 1/1);
@@ -109,12 +126,21 @@
 #ifdef __cplusplus
 extern "C" {
 #endif
+/* The deep-filter variant is part of the link too: -DDFN2_MASK_ONLY changes the
+ * state and boundary structs, so a unit built the other way must not link. */
+#ifdef DFN2_MASK_ONLY
+#define DFN2_VARIANT_SYMBOL dfn2_variant_mask_only
+#else
+#define DFN2_VARIANT_SYMBOL dfn2_variant_full
+#endif
 extern const unsigned char DFN2_LOOKAHEAD_PAIR_SYMBOL;
+extern const unsigned char DFN2_VARIANT_SYMBOL;
 #ifdef __cplusplus
 }
 #endif
 #define DFN2_REQUIRE_LOOKAHEAD_PAIR_LINK() \
-    ((void)*(const volatile unsigned char *)&DFN2_LOOKAHEAD_PAIR_SYMBOL)
+    ((void)*(const volatile unsigned char *)&DFN2_LOOKAHEAD_PAIR_SYMBOL, \
+     (void)*(const volatile unsigned char *)&DFN2_VARIANT_SYMBOL)
 
 /* ---- Feature normalisation (= config.ini [feature]) ----
  * FEATURE_VERSION must equal train.py's, otherwise the checkpoint and this front
@@ -165,26 +191,32 @@ typedef struct {
     /* per-bin complex-magnitude EMA (DF bins only) */
     float spec_norm_state[DFN2_DF_BINS];
 
+#ifndef DFN2_MASK_ONLY
     /* Deep-filter rings hold the lowest DF_BINS bins after the ERB mask; the
      * unmasked spectrum must not be pushed here (cascade). */
     float df_ring_re[DFN2_DF_RING][DFN2_DF_BINS];
     float df_ring_im[DFN2_DF_RING][DFN2_DF_BINS];
     float coef_ring[DFN2_DF_RING][DFN2_DF_BINS][DFN2_DF_ORDER][2];
     float alpha_ring[DFN2_DF_RING];
+#endif
     float noisy_ring_re[DFN2_DF_RING][DFN2_N_BINS];
     float noisy_ring_im[DFN2_DF_RING][DFN2_N_BINS];
+#ifndef DFN2_MASK_ONLY
     int   df_ring_idx;     /* next write position */
     int   df_ring_count;   /* frames accumulated; warm-up ends when full */
+#endif
 
     /* Streaming accelerator handoff: dfn2_compose_stream() numbers each pushed
      * spectrum and the returned heads must describe current_frame-MASK_LOOKAHEAD.
      * Do not mix the aligned and streaming compose APIs without dfn2_state_init(). */
     long long stream_frame_index;
 
+#ifndef DFN2_MASK_ONLY
     /* The high band (bin >= DF_BINS) is delayed by the same number of frames so
      * both halves of the band split come from the same instant. */
     float hi_delay_re[DFN2_DF_RING][DFN2_N_BINS - DFN2_DF_BINS];
     float hi_delay_im[DFN2_DF_RING][DFN2_N_BINS - DFN2_DF_BINS];
+#endif
 
     /* scratch: not state, fully overwritten before each use */
     float scratch_power[DFN2_N_BINS];
@@ -246,7 +278,9 @@ void dfn2_apply_atten_lim(const float *noisy_re, const float *noisy_im,
                           float *enh_re, float *enh_im,
                           float atten_lim_db);
 
-/* Network outputs -> enhanced spectrum (C twin of model.py compose()).
+/* Network outputs -> enhanced spectrum (C twin of model.py compose()). With
+ * DFN2_MASK_ONLY it is compose_mask_only(): out = noisy * full-band mask, with no
+ * delay and no warm-up; `coefs` and `alpha` are ignored (pass NULL and 0).
  *   erb_mask: [N_ERB], sigmoid output in [0,1]
  *   coefs   : [DF_BINS * DF_ORDER * 2], model.py's (df_bins, df_order, 2) layout
  *   alpha   : one sigmoid blend weight; 0 = masked residual, 1 = deep filter
@@ -260,6 +294,9 @@ int dfn2_compose(DFN2State *st,
                  float *out_re, float *out_im);
 
 /* Streaming/hardware handoff: each call pushes one CURRENT spectrum. With
+ * DFN2_MASK_ONLY the output is the masked noisy spectrum of head_frame
+ * (current - MASK_LOOKAHEAD), `coefs` and `alpha` are ignored, and the latency
+ * is MASK_LOOKAHEAD frames. With
  * heads_valid=1, erb_mask/coefs/alpha must be the heads the accelerator returned
  * for current_frame-MASK_LOOKAHEAD; heads_valid=0 is for the left warm-up only
  * (the first MASK_LOOKAHEAD frames, none when it is 0) and the three head

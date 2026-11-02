@@ -62,6 +62,7 @@ from export_onnx import (  # noqa: E402
     INPUT_NAMES,
     OUTPUT_NAMES,
     PATHWAY_STATE_NAME,
+    MASK_ONLY_STATE_LAYOUT_VERSION,
     RETIRED_LAYOUT_VERSIONS,
     STATE_BINDING,
     STATE_HANDOFF,
@@ -505,15 +506,20 @@ def test_state_layout_version_is_pinned_to_the_c_header(tmp_path):
         model.df_lookahead,
     )
     header_version = c_macro(model_io_header(),
-                             'DFN2_MODEL_IO_LAYOUT_VERSION')
+                             'DFN2_MODEL_IO_LAYOUT_VERSION_FULL')
     assert metadata['state_layout_version'] == header_version
+    # -DDFN2_MASK_ONLY selects its own number; the mask-only graph carries it.
+    assert c_macro(model_io_header(),
+                   'DFN2_MODEL_IO_LAYOUT_VERSION_MASK_ONLY') == \
+        MASK_ONLY_STATE_LAYOUT_VERSION != header_version
+    assert MASK_ONLY_STATE_LAYOUT_VERSION not in RETIRED_LAYOUT_VERSIONS
     assert STATE_LAYOUT_VERSION == metadata['state_layout_version']
     # Retired numbers are never reused: a C-side bump onto one must fail here
     # rather than ship a header that means two different things to two
     # different graphs.
     assert RETIRED_LAYOUT_VERSIONS == frozenset({4, 5, 6, 7})
     assert header_version not in RETIRED_LAYOUT_VERSIONS, (
-        'DFN2_MODEL_IO_LAYOUT_VERSION %d collides with a retired layout'
+        'DFN2_MODEL_IO_LAYOUT_VERSION_FULL %d collides with a retired layout'
         % header_version
     )
     assert header_version == 8

@@ -657,17 +657,25 @@ class DeepFilterNet2(nn.Module):
         coefs, alpha = self.df_dec(emb, c0)
         return self.erb_dec(emb, e3, e2, e1, e0), coefs, alpha
 
+    def apply_erb_mask(self, spec, erb_mask):
+        """DFN2 cascade, stage 1: expand the ERB mask over all bins and mask the
+        full spectrum; the deep filter consumes this masked result."""
+        bin_mask = erb_mask.squeeze(1).matmul(self.erb_inv)
+        bin_mask = bin_mask.permute(0, 2, 1)           # (B, n_bins, T) — NOT .T
+        return spec * bin_mask
+
+    def compose_mask_only(self, spec, erb_mask):
+        """Stage 1 alone: the masked spectrum, no deep filter (``alpha`` = 0 in
+        ``compose``). Same checkpoint; only the ERB mask head is read."""
+        return self.post_filter(spec, self.apply_erb_mask(spec, erb_mask))
+
     def compose(self, spec, erb_mask, coefs, alpha):
         """Turn the three predicted heads into an enhanced spectrum.
 
         Parameter-free by construction: this is the arithmetic the C port
         reproduces. Anything learned belongs in ``heads``.
         """
-        # DFN2 cascade, stage 1: expand the ERB mask over all bins and mask the
-        # full spectrum; the deep filter consumes this masked result.
-        bin_mask = erb_mask.squeeze(1).matmul(self.erb_inv)
-        bin_mask = bin_mask.permute(0, 2, 1)           # (B, n_bins, T) — NOT .T
-        spec_m = spec * bin_mask
+        spec_m = self.apply_erb_mask(spec, erb_mask)
 
         # DFN2 cascade, stage 2: deep-filter the masked low bins, then residual-mix
         # with the masked input by the learned alpha; high bins keep the stage-1

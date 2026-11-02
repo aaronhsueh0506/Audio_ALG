@@ -270,6 +270,26 @@ fails; metadata and validator; calibration) and
 host, byte for byte, with a stand-in accelerator; reset, refusal, guards;
 the one-frame header's 72-byte descriptor against libraries of N = 1 and 3).
 
+## Mask-only (stage 1)
+
+The cascade is stage 1 (ERB mask over the full band) then stage 2 (deep filter on the low bins, blended by `alpha`). The
+mask head does not depend on the deep-filter decoder, so the same checkpoint can run stage 1 alone:
+
+- `python3 inference.py --model ... --input a.wav --output out.wav --mask-only` writes `out.wav` (full) and
+  `out_mask_only.wav` (stage 1, `model.compose_mask_only`). `--input-dir/--output-dir` does the same per file.
+- `python3 export_onnx.py --model ... --output m.onnx --mask-only` and `inference.py calib ... --mask-only` write the
+  stage-1 graph: inputs `erb`, `spec`, `h_gru` `(1, 3, 1, 256)`; outputs `erb_mask`, `h_gru_out`. The deep-filter decoder
+  (two GRU layers, `df_skip`, `df_out`, `df_fc_a`, `df_convp`) and `df_convp_history` are gone: 5 GRU nodes become 3. The
+  encoder keeps `df_conv0`, `df_conv1` and `df_fc_emb` (their output feeds the embedding the ERB decoder reads), so the
+  grouped linear of `df_fc_emb` stays in the graph. Metadata: `variant: mask_only`, `state_layout_version` 9,
+  `df_lookahead` 0.
+- C: build every unit with `-DDFN2_MASK_ONLY` (see `dfn2_model_io.h`). The state, the accelerator boundary structs and the
+  descriptor shrink accordingly, and the output is `noisy * (mask @ erb_inv)` of the head frame, `DFN2_MASK_LOOKAHEAD`
+  frames behind the input. The final attenuation-limit mix (`--atten-lim`, `dfn2_prepost_set_atten_lim`) stays and acts on
+  the stage-1 output in Python and in C. `tests/test_dfn2_mask_only_c.py` compares it with numpy.
+
+No retraining: the quality of stage 1 alone is whatever the jointly trained mask gives (not measured here).
+
 ## State boundary
 
 State layout version 8. Both state tensors are rank 4 with the same shape at

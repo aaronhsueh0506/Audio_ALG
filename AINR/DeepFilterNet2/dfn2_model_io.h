@@ -17,8 +17,19 @@ extern "C" {
  *                     causal window of the pathway convolution, returned whole
  * Layout versions 4-7 are never reused. The layout version names the state
  * tensors, which DFN2_FRAMES_PER_CALL leaves unchanged; the descriptor carries
- * N as input_frames = N + 2. */
-#define DFN2_MODEL_IO_LAYOUT_VERSION       8
+ * N as input_frames = N + 2.
+ *
+ * -DDFN2_MASK_ONLY (every translation unit) is the model of
+ * `export_onnx.py --mask-only`: stage 1 alone. Its state is h_gru with the
+ * encoder and ERB rows only (DFN2_MODEL_GRU_ROWS 3) and no df_convp_history;
+ * it has its own layout version, so a graph of the other kind is refused. */
+#define DFN2_MODEL_IO_LAYOUT_VERSION_FULL        8
+#define DFN2_MODEL_IO_LAYOUT_VERSION_MASK_ONLY   9
+#ifndef DFN2_MASK_ONLY
+#define DFN2_MODEL_IO_LAYOUT_VERSION       DFN2_MODEL_IO_LAYOUT_VERSION_FULL
+#else
+#define DFN2_MODEL_IO_LAYOUT_VERSION       DFN2_MODEL_IO_LAYOUT_VERSION_MASK_ONLY
+#endif
 /* Feature frames behind one head (the input convolution's temporal kernel). */
 #define DFN2_MODEL_INPUT_FRAMES            3
 
@@ -61,14 +72,22 @@ extern const unsigned char DFN2_FRAMES_PER_CALL_SYMBOL;
 
 #define DFN2_MODEL_ENCODER_GRU_LAYERS      1
 #define DFN2_MODEL_ERB_GRU_LAYERS          2
+#ifndef DFN2_MASK_ONLY
 #define DFN2_MODEL_DF_GRU_LAYERS           2
 #define DFN2_MODEL_GRU_ROWS                5   /* 1 + 2 + 2                */
+#define DFN2_MODEL_DF_PATHWAY_WINDOW        5
+#else
+#define DFN2_MODEL_DF_GRU_LAYERS           0
+#define DFN2_MODEL_GRU_ROWS                3   /* 1 + 2 (no DF decoder)    */
+#define DFN2_MODEL_DF_PATHWAY_WINDOW       0
+#endif
 #define DFN2_MODEL_GRU_ROW_ENCODER         0
 #define DFN2_MODEL_GRU_ROW_ERB             1
-#define DFN2_MODEL_GRU_ROW_DF              3
+#ifndef DFN2_MASK_ONLY
+#define DFN2_MODEL_GRU_ROW_DF              3   /* no such row in a mask-only build */
+#endif
 #define DFN2_MODEL_GRU_HIDDEN               256
 #define DFN2_MODEL_ENCODER_CHANNELS         64
-#define DFN2_MODEL_DF_PATHWAY_WINDOW        5
 /* The window that yields heads[t] is frames [t-(2-L) .. t+L] for
  * L = DFN2_MASK_LOOKAHEAD: it is complete once frame t+L has been pushed, so the
  * first heads (t = 0) need L + 1 pushed frames. Frames before the stream start
@@ -92,10 +111,13 @@ _Static_assert(DFN2_MODEL_GRU_ROWS == DFN2_MODEL_ENCODER_GRU_LAYERS +
                    DFN2_MODEL_ERB_GRU_LAYERS + DFN2_MODEL_DF_GRU_LAYERS,
                "h_gru rows are the sum of the three GRU stacks");
 _Static_assert(DFN2_MODEL_GRU_ROW_ERB == DFN2_MODEL_GRU_ROW_ENCODER +
-                   DFN2_MODEL_ENCODER_GRU_LAYERS &&
-               DFN2_MODEL_GRU_ROW_DF == DFN2_MODEL_GRU_ROW_ERB +
+                   DFN2_MODEL_ENCODER_GRU_LAYERS,
+               "row offsets follow the stack order");
+#ifndef DFN2_MASK_ONLY
+_Static_assert(DFN2_MODEL_GRU_ROW_DF == DFN2_MODEL_GRU_ROW_ERB +
                    DFN2_MODEL_ERB_GRU_LAYERS,
                "row offsets follow the stack order");
+#endif
 #endif
 #endif
 
@@ -121,7 +143,8 @@ typedef struct DFN2ModelIoDescriptor {
     int gru_hidden;
     int encoder_channels;
     int df_pathway_window;
-    int state_tensor_count;        /* 2: h_gru, df_convp_history           */
+    int state_tensor_count;        /* 2: h_gru, df_convp_history (1 with
+                                      DFN2_MASK_ONLY: h_gru)               */
 } DFN2ModelIoDescriptor;
 
 /* 72 bytes in every build: an adapter compiled against one N passes the same
@@ -150,9 +173,11 @@ typedef struct {
     float erb_window[DFN2_MODEL_WINDOW_FRAMES][DFN2_N_ERB];
     float spec_window[2][DFN2_MODEL_WINDOW_FRAMES][DFN2_DF_BINS];
     float gru_hidden[DFN2_MODEL_GRU_ROWS][DFN2_MODEL_GRU_HIDDEN];
+#ifndef DFN2_MASK_ONLY
     float df_convp_window[DFN2_MODEL_ENCODER_CHANNELS]
                          [DFN2_MODEL_DF_PATHWAY_WINDOW]
                          [DFN2_DF_BINS];
+#endif
     unsigned long long feature_frames_seen;
     unsigned int state_generation;
 } DFN2ModelIOState;
@@ -174,15 +199,21 @@ void dfn2_model_io_push_spec_window(
     float window[2][DFN2_MODEL_WINDOW_FRAMES][DFN2_DF_BINS],
     const float frame[2][DFN2_DF_BINS]);
 
-/* Validate the two recurrent arrays after the accelerator wrote them in place.
- * Returns 0 when all elements are finite; otherwise zeroes both arrays and
+/* Validate the recurrent arrays (two; one with DFN2_MASK_ONLY) after the
+ * accelerator wrote them in place.
+ * Returns 0 when all elements are finite; otherwise zeroes the arrays and
  * returns -1 (the previous values cannot be restored). NULL returns -1 and
- * touches nothing. */
+ * touches nothing. With DFN2_MASK_ONLY there is only the h_gru array. */
+#ifdef DFN2_MASK_ONLY
+int dfn2_model_io_validate_arrays(
+    float gru_hidden[DFN2_MODEL_GRU_ROWS][DFN2_MODEL_GRU_HIDDEN]);
+#else
 int dfn2_model_io_validate_arrays(
     float gru_hidden[DFN2_MODEL_GRU_ROWS][DFN2_MODEL_GRU_HIDDEN],
     float df_convp_window[DFN2_MODEL_ENCODER_CHANNELS]
                          [DFN2_MODEL_DF_PATHWAY_WINDOW]
                          [DFN2_DF_BINS]);
+#endif
 
 /* Push one newly computed feature frame f. Returns 1 when the window
  * [t-(2-L) .. t+L] of t = f - L is available and the graph may emit heads[t],

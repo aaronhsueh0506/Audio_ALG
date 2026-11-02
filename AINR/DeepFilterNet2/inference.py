@@ -127,7 +127,17 @@ def apply_atten_lim(noisy_spec, enhanced_spec, atten_lim_db):
     return noisy_spec * lim + enhanced_spec * (1 - lim)
 
 
-def process_file(input_path, output_path, model, params, atten_lim_db=None):
+def mask_only_path(output_path):
+    """Where ``--mask-only`` writes the stage-1-only result: ``out.wav`` ->
+    ``out_mask_only.wav``."""
+    stem, ext = os.path.splitext(output_path)
+    return stem + '_mask_only' + ext
+
+
+def process_file(input_path, output_path, model, params, atten_lim_db=None,
+                 mask_only=False):
+    """Enhance one file into ``output_path``. With ``mask_only`` the stage-1-only
+    result (ERB mask, no deep filter) is also written, to ``mask_only_path``."""
     SR      = params['SR']
     N_FFT   = params['N_FFT']
     WIN_LEN = params['WIN_LEN']
@@ -152,23 +162,34 @@ def process_file(input_path, output_path, model, params, atten_lim_db=None):
             spec_c, model.erb_fb, DF_BINS,
             feature_cfg=feature_cfg,
         )
-        enhanced_spec, _ = model(spec_c, feat_erb, feat_spec)
-        enhanced_spec = apply_atten_lim(spec_c, enhanced_spec, atten_lim_db)
-
-    enhanced_wav = torch.istft(
-        enhanced_spec, N_FFT, HOP_LEN, WIN_LEN, window=window, length=T, normalized=True,
-    )
+        enhanced_spec, erb_mask = model(spec_c, feat_erb, feat_spec)
+        results = [(output_path,
+                    apply_atten_lim(spec_c, enhanced_spec, atten_lim_db))]
+        if mask_only:
+            results.append((
+                mask_only_path(output_path),
+                apply_atten_lim(spec_c,
+                                model.compose_mask_only(spec_c, erb_mask),
+                                atten_lim_db)))
 
     os.makedirs(os.path.dirname(output_path) or '.', exist_ok=True)
-    # istft keeps the batch dimension: (1, T), already the 2-D
-    # (channels, time) layout required by torchaudio.save.
-    torchaudio.save(output_path, enhanced_wav, SR)
+    for path, spec in results:
+        wav = torch.istft(
+            spec, N_FFT, HOP_LEN, WIN_LEN, window=window, length=T,
+            normalized=True,
+        )
+        # istft keeps the batch dimension: (1, T), already the 2-D
+        # (channels, time) layout required by torchaudio.save.
+        torchaudio.save(path, wav, SR)
 
 
 def denoise_single(args):
     model, params = load_model(args)
-    process_file(args.input, args.output, model, params, atten_lim_db=args.atten_lim)
+    process_file(args.input, args.output, model, params,
+                 atten_lim_db=args.atten_lim, mask_only=args.mask_only)
     print(f"降噪完成: {args.output}")
+    if args.mask_only:
+        print(f"mask only: {mask_only_path(args.output)}")
 
 
 def denoise_batch(args):
@@ -184,9 +205,15 @@ def denoise_batch(args):
     for input_path in tqdm.tqdm(wav_files):
         rel = os.path.relpath(input_path, args.input_dir)
         output_path = os.path.join(args.output_dir, rel)
+        if args.mask_only and os.path.splitext(rel)[0].endswith('_mask_only'):
+            # its own output would be written over the stage-1 file of a sibling
+            failed.append((rel, 'name ends with _mask_only: collides with the '
+                                '--mask-only output name'))
+            continue
         try:
             process_file(input_path, output_path, model, params,
-                        atten_lim_db=args.atten_lim)
+                        atten_lim_db=args.atten_lim,
+                        mask_only=args.mask_only)
         except Exception as e:
             failed.append((rel, str(e)))
 
@@ -215,7 +242,6 @@ def calibration_main():
     try:
         from .export_onnx import (
             GRU_STATE_NAME,
-            HEAD_OUTPUT_NAMES,
             MAX_FRAMES_PER_CALL,
             StatelessDFN2Heads,
             export_graph,
@@ -225,7 +251,6 @@ def calibration_main():
     except ImportError:
         from export_onnx import (
             GRU_STATE_NAME,
-            HEAD_OUTPUT_NAMES,
             MAX_FRAMES_PER_CALL,
             StatelessDFN2Heads,
             export_graph,
@@ -250,6 +275,11 @@ def calibration_main():
     parser.add_argument('--frames-per-call', type=int, default=1,
                         help='heads per invocation of the graph (export_onnx.py '
                              '--frames-per-call); --frames counts invocations')
+    parser.add_argument('--mask-only', '--mask_only', dest='mask_only',
+                        action='store_true',
+                        help='calibrate the stage-1-only graph (export_onnx.py '
+                             '--mask-only): erb, spec and h_gru, no '
+                             'df_convp_history')
     args = parser.parse_args()
     if args.frames <= 0:
         parser.error('--frames must be positive')
@@ -274,7 +304,8 @@ def calibration_main():
         config=args.config, model=args.model
     ))
     wrapper = StatelessDFN2Heads(
-        model, frames_per_call=args.frames_per_call).eval()
+        model, frames_per_call=args.frames_per_call,
+        mask_only=args.mask_only).eval()
     # The graph is exported (and parity-checked) in the same process, from the
     # same model instance the tensors below are recorded against, so the two
     # deployment artifacts cannot drift apart.
@@ -322,7 +353,7 @@ def calibration_main():
                 inputs = (erb_window, spec_window) + state
                 capture_calibration_inputs(captured, input_names, inputs)
                 outputs = wrapper(*inputs)
-                state = tuple(outputs[len(HEAD_OUTPUT_NAMES):])
+                state = tuple(outputs[len(wrapper.head_output_names):])
                 used = True
                 if len(captured['erb']) >= args.frames:
                     break
@@ -374,6 +405,8 @@ def calibration_main():
     }
     if args.frames_per_call != 1:
         report['frames_per_call'] = args.frames_per_call
+    if args.mask_only:
+        report['variant'] = 'mask_only'
     report['gru_state_slices'] = gru_state_slice_report(
         arrays[GRU_STATE_NAME], _stats, wrapper.gru_state_slices,
     )
@@ -406,6 +439,12 @@ def cli():
                              "Rikorose/DeepFilterNet enhance.py's --atten-lim: e.g. "
                              '12 only suppresses noise by up to 12dB and keeps the '
                              'rest. None/0 disables it (default, max suppression).')
+    parser.add_argument('--mask-only', '--mask_only', dest='mask_only',
+                        action='store_true',
+                        help='Also write the stage-1-only result (ERB mask, no '
+                             'deep filter, same checkpoint) beside each output as '
+                             '<name>_mask_only.wav. The normal output is still '
+                             'the full model.')
     args = parser.parse_args()
 
     if args.input_dir and args.output_dir:

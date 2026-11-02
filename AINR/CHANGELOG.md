@@ -2,6 +2,27 @@
 
 ## Unreleased
 
+### DFN2 stage 1 alone: `--mask-only` / `-DDFN2_MASK_ONLY`
+
+- `inference.py --mask-only` (alias `--mask_only`): also writes the stage-1-only result (ERB mask, no deep filter, same
+  checkpoint) beside each output as `<name>_mask_only.wav`; the normal output is still the full model. `model.py` gains
+  `apply_erb_mask()` (the stage-1 mask expansion `compose()` already used) and `compose_mask_only()` (= `compose()` with
+  alpha 0, checked bitwise).
+- `export_onnx.py --mask-only` and `inference.py calib --mask-only` write the stage-1 graph: inputs `erb`, `spec`, `h_gru`
+  (three rows: encoder + ERB decoder, no deep-filter decoder), outputs `erb_mask`, `h_gru_out`; no `df_convp_history`. It has
+  its own `state_layout_version` 9 (the full graph stays 8), `variant: mask_only` and `df_lookahead` 0 in the metadata. Five
+  GRU nodes become three; with `--frames-per-call N` the `df_conv0` split for the pathway tail is not needed. The mask head
+  is the full model's (same numbers). The encoder's spec-side convolutions and `df_fc_emb` stay (they feed the embedding), so
+  the saving is the deep-filter decoder only; no latency or size figure has been measured.
+- C: `-DDFN2_MASK_ONLY` on every translation unit builds the same model: layout 9 (`DFN2_MODEL_IO_LAYOUT_VERSION_MASK_ONLY`;
+  the full one is `_FULL`, 8), `DFN2_MODEL_GRU_ROWS` 3, no deep-filter rings, coefficient/alpha heads or pathway window (the
+  `DFN2PrepostInputs/Outputs` fields and the `dfn2_model_io_validate_arrays` pathway argument do not exist), `DFN2_DF_LOOKAHEAD`
+  fixed at 0 (`#error` otherwise), so the latency is `DFN2_MASK_LOOKAHEAD` frames. `dfn2_compose*()` keep their signatures and
+  ignore `coefs`/`alpha`; the final attenuation-limit mix (`--atten-lim` in Python, `atten_lim_db` /
+  `dfn2_prepost_set_atten_lim` in C) is kept and applies to the stage-1 output. Without the define nothing changes (`make test` digests identical before and after).
+  Not covered: the pipelines' DFN unit tests (their stand-in accelerator writes coefficient heads) and the Python pipeline mirror
+  build the full model only.
+
 ### DFN2 multi-frame export: N frames per invocation
 
 - `DeepFilterNet2/export_onnx.py --frames-per-call N` (default 1) and `inference.py calib --frames-per-call N`: the graph

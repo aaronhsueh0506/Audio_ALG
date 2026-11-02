@@ -140,6 +140,23 @@ STATE_HANDOFF = dict(zip(STATE_NAMES, OUTPUT_NAMES[len(HEAD_OUTPUT_NAMES):]))
 # Both state tensors are read and written at one address.
 STATE_BINDING = 'in_place_same_address'
 
+# --mask-only: stage 1 alone (ERB mask, no deep filter). The graph keeps the
+# encoder and the ERB decoder and drops the deep-filter decoder with its two
+# GRU rows and the pathway window, so its state is h_gru with the encoder and
+# ERB rows only. The C host builds it with -DDFN2_MASK_ONLY, which selects this
+# layout number in dfn2_model_io.h (tests/test_dfn2_contract.py pins the two).
+MASK_ONLY_STATE_LAYOUT_VERSION = 9
+MASK_ONLY_HEAD_OUTPUT_NAMES = HEAD_OUTPUT_NAMES[:1]
+MASK_ONLY_STATE_NAMES = (GRU_STATE_NAME,)
+MASK_ONLY_INPUT_NAMES = CONTENT_INPUT_NAMES + MASK_ONLY_STATE_NAMES
+MASK_ONLY_OUTPUT_NAMES = MASK_ONLY_HEAD_OUTPUT_NAMES + tuple(
+    name + '_out' for name in MASK_ONLY_STATE_NAMES)
+MASK_ONLY_HEAD_OUTPUT_TIME_AXES = {
+    name: HEAD_OUTPUT_TIME_AXES[name] for name in MASK_ONLY_HEAD_OUTPUT_NAMES}
+MASK_ONLY_STATE_HANDOFF = dict(zip(
+    MASK_ONLY_STATE_NAMES,
+    MASK_ONLY_OUTPUT_NAMES[len(MASK_ONLY_HEAD_OUTPUT_NAMES):]))
+
 # How each state input is consumed inside the graph (see the module
 # docstring); the post-quantization check reads this back from the metadata.
 # A window drops its first (oldest) frame and the new frame is appended.
@@ -147,6 +164,7 @@ STATE_SLICING = {
     GRU_STATE_NAME: {'kind': 'rows', 'axis': 1},
     PATHWAY_STATE_NAME: {'kind': 'window', 'axis': 2, 'drop': 'first'},
 }
+MASK_ONLY_STATE_SLICING = {GRU_STATE_NAME: STATE_SLICING[GRU_STATE_NAME]}
 
 
 def _schema(names, tensors):
@@ -432,9 +450,11 @@ class StatelessDFN2Heads(nn.Module):
     one-frame graph fed frame by frame.
     """
 
-    def __init__(self, model, batch_size=1, frames_per_call=1):
+    def __init__(self, model, batch_size=1, frames_per_call=1,
+                 mask_only=False):
         super().__init__()
         self.model = model
+        self.mask_only = bool(mask_only)
         if isinstance(batch_size, bool) or not isinstance(batch_size, int):
             raise TypeError('batch_size must be an integer')
         if batch_size <= 0:
@@ -459,22 +479,34 @@ class StatelessDFN2Heads(nn.Module):
                 )
         if model.erb_dec.emb_gru.gru.num_layers != 2:
             raise ValueError('this exporter requires two ERB decoder GRU layers')
-        if model.df_dec.df_gru.gru.num_layers != 2:
+        if not self.mask_only and model.df_dec.df_gru.gru.num_layers != 2:
             raise ValueError('this exporter requires two DF decoder GRU layers')
-        self.gru_state_slices = gru_state_slices(model)
-        self.gru_state_shape = gru_state_shape(model, self.batch_size)
+        self.gru_state_slices = gru_state_slices(model, self.mask_only)
+        self.gru_state_shape = gru_state_shape(model, self.batch_size,
+                                               self.mask_only)
 
     @property
     def input_names(self):
-        return INPUT_NAMES
+        return MASK_ONLY_INPUT_NAMES if self.mask_only else INPUT_NAMES
 
     @property
     def output_names(self):
-        return OUTPUT_NAMES
+        return MASK_ONLY_OUTPUT_NAMES if self.mask_only else OUTPUT_NAMES
+
+    @property
+    def head_output_names(self):
+        return (MASK_ONLY_HEAD_OUTPUT_NAMES if self.mask_only
+                else HEAD_OUTPUT_NAMES)
+
+    @property
+    def head_output_time_axes(self):
+        return (MASK_ONLY_HEAD_OUTPUT_TIME_AXES if self.mask_only
+                else HEAD_OUTPUT_TIME_AXES)
 
     @property
     def state_layout_version(self):
-        return STATE_LAYOUT_VERSION
+        return (MASK_ONLY_STATE_LAYOUT_VERSION if self.mask_only
+                else STATE_LAYOUT_VERSION)
 
     @property
     def mask_lookahead(self):
@@ -482,7 +514,8 @@ class StatelessDFN2Heads(nn.Module):
 
     @property
     def df_lookahead(self):
-        return self.model.df_lookahead
+        """0 for ``mask_only``: there is no deep filter to look ahead for."""
+        return 0 if self.mask_only else self.model.df_lookahead
 
     @property
     def input_frames(self):
@@ -492,23 +525,23 @@ class StatelessDFN2Heads(nn.Module):
     def initial_inputs(self):
         """This instance's dummy inputs."""
         return initial_inputs(self.model, batch_size=self.batch_size,
-                              frames_per_call=self.frames_per_call)
+                              frames_per_call=self.frames_per_call,
+                              mask_only=self.mask_only)
 
     def forward(self, feat_erb_window, feat_spec_window, gru_state,
-                df_convp_history):
+                df_convp_history=None):
+        if df_convp_history is None and not self.mask_only:
+            raise ValueError('df_convp_history is required unless mask_only')
         # One Slice per GRU off the shared rank-4 input, on dim 1 (the layer
         # axis), then the layer rows become nn.GRU's own (layers, batch,
         # hidden). A profiling graph with B>1 carries the lanes on dim 0.
         if self.batch_size == 1:
-            encoder_gru_hidden, erb_gru_hidden, df_gru_hidden = (
-                gru_state[:, start:stop].squeeze(0)
-                for _name, start, stop in self.gru_state_slices
-            )
+            hidden = [gru_state[:, start:stop].squeeze(0)
+                      for _name, start, stop in self.gru_state_slices]
         else:
-            encoder_gru_hidden, erb_gru_hidden, df_gru_hidden = (
-                gru_state[:, start:stop].squeeze(2).permute(1, 0, 2)
-                for _name, start, stop in self.gru_state_slices
-            )
+            hidden = [gru_state[:, start:stop].squeeze(2).permute(1, 0, 2)
+                      for _name, start, stop in self.gru_state_slices]
+        encoder_gru_hidden, erb_gru_hidden = hidden[:2]
         model = self.model
         enc = model.encoder
         frames = self.frames_per_call
@@ -519,7 +552,7 @@ class StatelessDFN2Heads(nn.Module):
         e2 = enc.erb_conv2(e1)
         e3 = enc.erb_conv3(e2)
         c0_tail = None
-        if frames > pathway:
+        if frames > pathway and not self.mask_only:
             # The last `pathway` frames of c0 are the next pathway window;
             # they are convolved from their own window slice (the same
             # products as one convolution over the whole window).
@@ -557,10 +590,13 @@ class StatelessDFN2Heads(nn.Module):
         erb_value = erb.convt2(erb.conv2p(e2) + erb_value)
         erb_value = erb.convt1(erb.conv1p(e1) + erb_value)
         erb_mask = erb.conv0_out(erb.conv0p(e0) + erb_value)
+        if self.mask_only:
+            return erb_mask, self._pack_state(
+                (encoder_hidden_next, erb_hidden_next))
 
         decoder = model.df_dec
         df_value, df_hidden_next = _squeezed_gru(
-            decoder.df_gru, embedding, df_gru_hidden
+            decoder.df_gru, embedding, hidden[2]
         )
         if decoder.df_skip is not None:
             df_value = df_value + decoder.df_skip(embedding)
@@ -575,30 +611,33 @@ class StatelessDFN2Heads(nn.Module):
         coefficients = coefficients + c0_residual
         heads = (erb_mask, coefficients, alpha)
         hidden_next = (encoder_hidden_next, erb_hidden_next, df_hidden_next)
-        # Concatenated in the order the input was sliced, which is also
-        # DFN2ModelIOState's memory order.
+        return heads + (self._pack_state(hidden_next), pathway_window_next)
+
+    def _pack_state(self, hidden_next):
+        """Concatenated in the order the input was sliced, which is also
+        DFN2ModelIOState's memory order."""
         if self.batch_size == 1:
-            gru_state_next = torch.cat(
+            return torch.cat(
                 [hidden.unsqueeze(0) for hidden in hidden_next], dim=1
             )
-        else:
-            gru_state_next = torch.cat(
-                [hidden.permute(1, 0, 2).unsqueeze(2)
-                 for hidden in hidden_next], dim=1
-            )
-        return heads + (gru_state_next, pathway_window_next)
+        return torch.cat(
+            [hidden.permute(1, 0, 2).unsqueeze(2) for hidden in hidden_next],
+            dim=1
+        )
 
 
-def _state_grus(model):
-    """The stateful GRUs, in GRU_STATE_NAMES order."""
-    return (
+def _state_grus(model, mask_only=False):
+    """The stateful GRUs, in GRU_STATE_NAMES order (the deep-filter decoder's
+    is not part of a ``mask_only`` graph)."""
+    grus = (
         model.encoder.emb_gru.gru,
         model.erb_dec.emb_gru.gru,
         model.df_dec.df_gru.gru,
     )
+    return grus[:2] if mask_only else grus
 
 
-def gru_state_slices(model):
+def gru_state_slices(model, mask_only=False):
     """``(name, start, stop)`` per GRU along the combined state's layer axis.
 
     Read off the module tree rather than written down, and shared by the
@@ -607,20 +646,20 @@ def gru_state_slices(model):
     """
     slices = []
     at = 0
-    for name, gru in zip(GRU_STATE_NAMES, _state_grus(model)):
+    for name, gru in zip(GRU_STATE_NAMES, _state_grus(model, mask_only)):
         slices.append((name, at, at + gru.num_layers))
         at += gru.num_layers
     return tuple(slices)
 
 
-def gru_state_shape(model, batch_size=1):
+def gru_state_shape(model, batch_size=1, mask_only=False):
     """Shape of the combined recurrent state: ``(B, layers, 1, hidden)``.
 
     With one lane this is ``(1, layers, gru_batch, hidden)`` read the other
     way round, so the batch-one tensor is nn.GRU's own hidden stack with a
     leading singleton.
     """
-    grus = _state_grus(model)
+    grus = _state_grus(model, mask_only)
     widths = {gru.hidden_size for gru in grus}
     if len(widths) != 1:
         raise ValueError(
@@ -631,22 +670,23 @@ def gru_state_shape(model, batch_size=1):
             widths.pop())
 
 
-def initial_inputs(model, batch_size=1, frames_per_call=1):
+def initial_inputs(model, batch_size=1, frames_per_call=1, mask_only=False):
     if isinstance(batch_size, bool) or not isinstance(batch_size, int):
         raise TypeError('batch_size must be an integer')
     if batch_size <= 0:
         raise ValueError('batch_size must be positive')
     input_frames = chunk_input_frames(frames_per_call)
-    enc_ch = model.encoder.erb_conv0[1].out_channels
-    pathway_window = model.df_dec.df_convp.conv.kernel_size[0]
-    return (
+    inputs = [
         torch.randn(batch_size, 1, input_frames, model.n_erb),
         torch.randn(batch_size, 2, input_frames, model.df_bins),
-        torch.zeros(gru_state_shape(model, batch_size)),
-        torch.zeros(
-            batch_size, enc_ch, pathway_window, model.df_bins
-        ),
-    )
+        torch.zeros(gru_state_shape(model, batch_size, mask_only)),
+    ]
+    if not mask_only:
+        enc_ch = model.encoder.erb_conv0[1].out_channels
+        pathway_window = model.df_dec.df_convp.conv.kernel_size[0]
+        inputs.append(torch.zeros(
+            batch_size, enc_ch, pathway_window, model.df_bins))
+    return tuple(inputs)
 
 
 def gru_state_slice_report(combined, stats, slices):
@@ -688,13 +728,15 @@ def gru_state_slice_report(combined, stats, slices):
 
 
 def build_metadata(checkpoint_path, params, inputs, outputs, mask_lookahead,
-                   df_lookahead, frames_per_call=1):
+                   df_lookahead, frames_per_call=1, mask_only=False):
     """The exported graph's metadata.
 
     Separate from ``main`` so the contract test can compare
     ``state_layout_version`` against dfn2_model_io.h without an ONNX export.
     A graph for one frame per call carries no ``frames_per_call`` key, so its
-    metadata is the same as before the option existed.
+    metadata is the same as before the option existed. A ``mask_only`` graph
+    adds ``variant``, carries its own ``state_layout_version`` and reports
+    ``df_lookahead`` 0: there is no deep filter to look ahead for.
     """
     metadata = {
         'model_family': 'DeepFilterNet2',
@@ -724,6 +766,13 @@ def build_metadata(checkpoint_path, params, inputs, outputs, mask_lookahead,
         'input_schema': _schema(INPUT_NAMES, inputs),
         'output_schema': _schema(OUTPUT_NAMES, outputs),
     }
+    if mask_only:
+        metadata['state_layout_version'] = MASK_ONLY_STATE_LAYOUT_VERSION
+        metadata['variant'] = 'mask_only'
+        metadata['state_handoff'] = MASK_ONLY_STATE_HANDOFF
+        metadata['state_slicing'] = MASK_ONLY_STATE_SLICING
+        metadata['input_schema'] = _schema(MASK_ONLY_INPUT_NAMES, inputs)
+        metadata['output_schema'] = _schema(MASK_ONLY_OUTPUT_NAMES, outputs)
     if frames_per_call != 1:
         metadata['input_feature_frames'] = chunk_input_frames(frames_per_call)
         metadata['output_frames_per_invocation'] = int(frames_per_call)
@@ -741,8 +790,8 @@ def export_graph(wrapper, params, checkpoint_path, output_path,
     tensors and the graph they bind to always come from the same model
     instance in the same process.
     """
-    input_names = INPUT_NAMES
-    output_names = OUTPUT_NAMES
+    input_names = wrapper.input_names
+    output_names = wrapper.output_names
     inputs = wrapper.initial_inputs()
     with torch.no_grad():
         outputs = wrapper(*inputs)
@@ -764,13 +813,13 @@ def export_graph(wrapper, params, checkpoint_path, output_path,
     validate_nctf_no_temporal_padding(graph, require_static=verify)
     metadata = build_metadata(checkpoint_path, params, inputs, outputs,
                               wrapper.mask_lookahead, wrapper.df_lookahead,
-                              wrapper.frames_per_call)
+                              wrapper.frames_per_call, wrapper.mask_only)
     set_onnx_metadata(graph, metadata)
     _pin_static_output_shapes(graph, output_names, outputs)
     graph = _resolve_internal_shapes(graph)
     validate_inplace_state_from_metadata(graph)
     validate_frames_per_call(graph, WINDOW_INPUT_TIME_AXES,
-                             HEAD_OUTPUT_TIME_AXES, INPUT_FRAMES)
+                             wrapper.head_output_time_axes, INPUT_FRAMES)
     onnx.save(graph, output_path)
     with open(os.path.splitext(output_path)[0] + '.json', 'w',
               encoding='utf-8') as stream:
@@ -810,6 +859,13 @@ def main():
                         help='heads emitted per invocation (N); the graph '
                              'takes N + 2 feature frames. 1 writes the '
                              'one-frame graph')
+    parser.add_argument('--mask-only', '--mask_only', dest='mask_only',
+                        action='store_true',
+                        help='export stage 1 alone: the graph emits erb_mask '
+                             'and h_gru_out only (no deep-filter decoder, '
+                             'no df_convp_history). Same checkpoint; the C '
+                             'host consumes it when built with '
+                             '-DDFN2_MASK_ONLY (dfn2_model_io.h)')
     args = parser.parse_args()
     if not 1 <= args.frames_per_call <= MAX_FRAMES_PER_CALL:
         parser.error('--frames-per-call must be in [1, %d]'
@@ -823,7 +879,8 @@ def main():
         config=args.config, model=args.model
     ))
     wrapper = StatelessDFN2Heads(
-        model, frames_per_call=args.frames_per_call).eval()
+        model, frames_per_call=args.frames_per_call,
+        mask_only=args.mask_only).eval()
     export_graph(wrapper, params, args.model, args.output,
                  opset=args.opset, verify=args.verify)
     print(args.output)

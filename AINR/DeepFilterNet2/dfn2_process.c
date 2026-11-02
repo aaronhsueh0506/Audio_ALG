@@ -22,9 +22,12 @@
 /* The pair this object was built for, read by dfn2_model_io.c and
  * dfn2_prepost.c (dfn2_process.h): objects of another pair fail to link. */
 const unsigned char DFN2_LOOKAHEAD_PAIR_SYMBOL = 0;
+const unsigned char DFN2_VARIANT_SYMBOL = 0;
 
 /* The deep filter's taps before the stream start read this row. */
+#ifndef DFN2_MASK_ONLY
 static const float df_zero_row[DFN2_DF_BINS];
+#endif
 
 /* erb_fwd: caller-loaded matrix, raw float32, bin-major [n_bins][n_bands]
  * (export_erb_matrix.py --runtime-bins). The library never derives a filterbank. */
@@ -155,6 +158,7 @@ static inline void df_common_atten_lim(const float *noisy_re,
     sk_ema_f32(enh_im, noisy_im, mix, lim, bins);
 }
 
+#ifndef DFN2_MASK_ONLY
 /* One frame of the deep filter on bins [0, DFN2_DF_BINS): each bin sums
  * DFN2_DF_ORDER complex taps over the source rows (one per tap, oldest
  * first), then mixes the filtered value with the unfiltered `mix` frame by
@@ -170,6 +174,7 @@ static inline void df_common_deep_filter(
     sk_ema_f32(out_re, mix_re, alpha, beta, DFN2_DF_BINS);
     sk_ema_f32(out_im, mix_im, alpha, beta, DFN2_DF_BINS);
 }
+#endif
 
 /* Nonzero span of each of `lines` matrix lines: line i holds
  * m[i*line_step + j*elem_step] for j < len; the span is the first nonzero j to one
@@ -275,11 +280,32 @@ void dfn2_apply_atten_lim(const float* noisy_re, const float* noisy_im,
                         DFN2_N_BINS, atten_lim_db);
 }
 
+#ifdef DFN2_MASK_ONLY
+/* Stage 1: out = in * (mask expanded over the full band). */
+static void df_mask_spectrum(DFN2State *st, const float *erb_mask,
+                             const float *in_re, const float *in_im,
+                             float *out_re, float *out_im) {
+    df_common_expand_mask(erb_mask, st->erb_inv, st->erb_inv_lo,
+                          st->erb_inv_hi, DFN2_N_BINS, DFN2_N_ERB,
+                          st->scratch_bin_gain);
+    skn_mul_f32(out_re, in_re, st->scratch_bin_gain, DFN2_N_BINS);
+    skn_mul_f32(out_im, in_im, st->scratch_bin_gain, DFN2_N_BINS);
+}
+#endif
+
 int dfn2_compose(DFN2State* st,
                  const float* spec_re, const float* spec_im,
                  const float* erb_mask, const float* coefs, float alpha,
                  float* out_re, float* out_im)
 {
+#ifdef DFN2_MASK_ONLY
+    (void)coefs;
+    (void)alpha;
+    if (!st || !spec_re || !spec_im || !erb_mask || !out_re || !out_im)
+        return 0;
+    df_mask_spectrum(st, erb_mask, spec_re, spec_im, out_re, out_im);
+    return 1;
+#else
     int slot;
     int target;
     const float *src_re[DFN2_DF_ORDER];
@@ -332,6 +358,7 @@ int dfn2_compose(DFN2State* st,
         out_im[k] = st->hi_delay_im[target][high];
     }
     return 1;
+#endif
 }
 
 int dfn2_compose_stream(DFN2State* st,
@@ -346,6 +373,40 @@ int dfn2_compose_stream(DFN2State* st,
                         float* out_im,
                         long long* output_frame_index)
 {
+#ifdef DFN2_MASK_ONLY
+    long long current;
+    long long head_frame;
+    int current_slot;
+    int head_slot;
+
+    (void)coefs;
+    (void)alpha;
+    if (!st || !current_spec_re || !current_spec_im || !out_re || !out_im)
+        return -1;
+    current = st->stream_frame_index;
+    if (current < DFN2_MASK_LOOKAHEAD) {
+        if (heads_valid) return -1;
+    } else if (!heads_valid || !erb_mask || !isfinite(atten_lim_db)) {
+        return -1;
+    }
+    ++st->stream_frame_index;
+    current_slot = (int)(current % DFN2_DF_RING);
+    memcpy(st->noisy_ring_re[current_slot], current_spec_re,
+           sizeof(st->noisy_ring_re[current_slot]));
+    memcpy(st->noisy_ring_im[current_slot], current_spec_im,
+           sizeof(st->noisy_ring_im[current_slot]));
+    if (current < DFN2_MASK_LOOKAHEAD) return 0;
+
+    head_frame = current - DFN2_MASK_LOOKAHEAD;
+    head_slot = (int)(head_frame % DFN2_DF_RING);
+    df_mask_spectrum(st, erb_mask, st->noisy_ring_re[head_slot],
+                     st->noisy_ring_im[head_slot], out_re, out_im);
+    dfn2_apply_atten_lim(st->noisy_ring_re[head_slot],
+                         st->noisy_ring_im[head_slot],
+                         out_re, out_im, atten_lim_db);
+    if (output_frame_index) *output_frame_index = head_frame;
+    return 1;
+#else
     long long current;
     long long head_frame;
     long long target_frame;
@@ -432,6 +493,7 @@ int dfn2_compose_stream(DFN2State* st,
                          out_re, out_im, atten_lim_db);
     if (output_frame_index) *output_frame_index = target_frame;
     return 1;
+#endif
 }
 
 void dfn2_synthesis(DFN2State* st,
