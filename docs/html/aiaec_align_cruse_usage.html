@@ -68,7 +68,7 @@ with torch.no_grad():
             res = model.forward_stream(m.unsqueeze(1), f.unsqueeze(1), state)
             pieces.append(synth.push(res.enhanced[:, 0]))   # 輸出頭一個 hop 為 0 個樣本
 sf.write("out.wav", torch.cat(pieces, dim=1)[0].numpy(), sr)</pre>
-<p class="note">片語已用隨機權重的模型代入 <code>load_model</code> 實際跑過（1 秒、16 kHz 輸入得到 15,616 個輸出樣本＝少第一個 hop）。命令列等價形式：<code>python3 AIAEC/Align_CRUSE/inference.py checkpoint.pth mic.wav far.wav out.wav [--device cpu] [--verify]</code>，或目錄模式 <code>--mic-dir D [--ref-dir D2] --out-dir D3</code>（沒給 <code>--ref-dir</code> 則 reference 為靜音，等同純降噪）。取樣率不同的 WAV 會先重取樣到 checkpoint 的 rate；兩路必須描述同一條時間軸。<code>--verify</code> 只列印差異、不改變結束碼。</p>
+<p class="note">片語已用隨機權重的模型代入 <code>load_model</code> 實際跑過（1 秒、16 kHz 輸入得到 15,616 個輸出樣本＝少第一個 hop）。命令列等價形式：<code>python3 AIAEC/Align_CRUSE/inference.py checkpoint.pth mic.wav far.wav out.wav [--device cpu] [--verify]</code>，或目錄模式 <code>--mic-dir D [--ref-dir D2] --out-dir D3</code>（沒給 <code>--ref-dir</code> 則 reference 為靜音，等同純降噪）；輸出沿用輸入樹，<code>*_mic.wav</code> 寫成 <code>*_ours.wav</code>。取樣率不同的 WAV 會先重取樣到 checkpoint 的 rate；兩路必須描述同一條時間軸。<code>--verify</code> 只列印差異、不改變結束碼。</p>
 <h3>B. 匯出與 PTQ 校正（給目標平台工具鏈）</h3>
 <pre>python3 AIAEC/Align_CRUSE/export_onnx.py --checkpoint checkpoint.pth \
     --output output/align_cruse.onnx [--max-delay-frames D] [--opset 17] --verify

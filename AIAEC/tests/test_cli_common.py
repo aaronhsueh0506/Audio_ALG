@@ -304,9 +304,23 @@ def test_directory_jobs_resolve_before_the_first_file_runs(tmp_path):
     for mic, ref, out in jobs:
         assert os.path.basename(ref) == \
             os.path.basename(mic).replace("mic", "lpb")
-        # The output tree mirrors the input tree and keeps the mic's name.
+        # The output tree mirrors the input tree; *_mic.wav is written as
+        # *_ours.wav.
         assert os.path.relpath(out, str(tmp_path / "out")) == \
-            os.path.relpath(mic, str(tmp_path / "mic"))
+            os.path.relpath(mic, str(tmp_path / "mic")).replace(
+                "_mic.wav", "_ours.wav")
+
+
+def test_only_the_mic_suffix_is_renamed_and_a_clash_is_refused(tmp_path):
+    _tree(tmp_path, ["a69_mic.wav", "mic_notes.wav"])
+    outs = sorted(os.path.basename(out) for _m, _r, out in
+                  resolve_directory_jobs(_job_args(tmp_path)))
+    assert outs == ["a69_ours.wav", "mic_notes.wav"], (
+        "only a trailing _mic.wav is renamed; a 'mic' elsewhere is kept"
+    )
+    _tree(tmp_path, ["a69_ours.wav"])
+    with pytest.raises(ValueError, match="same output"):
+        resolve_directory_jobs(_job_args(tmp_path))
 
 
 def test_without_ref_dir_every_job_carries_no_reference(tmp_path):

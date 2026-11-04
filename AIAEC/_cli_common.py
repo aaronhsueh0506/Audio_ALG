@@ -64,10 +64,21 @@ REF_DIR_HELP = (
     "unpaired on either side is an error, never a silent fallback" %
     MIC_TO_REFERENCE
 )
+MIC_SUFFIX = '_mic.wav'
+OURS_SUFFIX = '_ours.wav'
+
 OUT_DIR_HELP = (
-    'where --mic-dir results are written, mirroring the input tree and '
-    "keeping each microphone file's own name"
+    'where --mic-dir results are written, mirroring the input tree; a '
+    "microphone file named '*%s' is written as '*%s', any other name is "
+    'kept as is' % (MIC_SUFFIX, OURS_SUFFIX)
 )
+
+
+def _output_name(name):
+    """The enhanced file's name for the microphone file ``name``."""
+    if name.endswith(MIC_SUFFIX):
+        return name[:-len(MIC_SUFFIX)] + OURS_SUFFIX
+    return name
 
 
 def _same_or_descendant(parent, candidate):
@@ -120,9 +131,18 @@ def resolve_directory_jobs(args):
     else:
         found = [(name, path, None)
                  for name, path in sorted(wav_inventory(mic_dir).items())]
-    return [(str(mic), None if ref is None else str(ref),
-             os.path.join(out_dir, *name.split('/')))
+    jobs = [(str(mic), None if ref is None else str(ref),
+             os.path.join(out_dir, *_output_name(name).split('/')))
             for name, mic, ref in found]
+    seen = {}
+    for mic, _ref, out in jobs:
+        if out in seen:
+            raise ValueError(
+                'two microphone files would write the same output %s: %s and '
+                '%s (a *%s name is written as *%s)' % (
+                    out, seen[out], mic, MIC_SUFFIX, OURS_SUFFIX))
+        seen[out] = mic
+    return jobs
 
 
 def run_directory(args, run_one) -> None:
