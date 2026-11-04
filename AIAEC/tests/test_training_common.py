@@ -1070,9 +1070,8 @@ def test_shipped_loss_and_delay_overrides_are_explicit():
 
     ulcnet = configs['Align_ULCNet']
     assert ulcnet.getint('model', 'max_delay_frames') == 32
-    assert ulcnet.getfloat('loss', 'compression') == pytest.approx(0.3)
 
-    for name in ('Align_CRUSE', 'DeepVQE_S'):
+    for name in ('Align_ULCNet', 'Align_CRUSE', 'DeepVQE_S'):
         cfg = configs[name]
         assert cfg.getfloat('loss', 'compression') == pytest.approx(0.3)
         assert cfg.getfloat('loss', 'complex_weight') == pytest.approx(0.7)
@@ -1257,7 +1256,6 @@ def test_the_checkpoint_contract_records_the_training_recipe(
     if model_name in {'Align_ULCNet', 'Align_CRUSE', 'DeepVQE_S'}:
         assert recorded['loss_compression'] == pytest.approx(
             cfg.getfloat('loss', 'compression'))
-    if model_name in {'Align_CRUSE', 'DeepVQE_S'}:
         assert recorded['loss_complex_weight'] == pytest.approx(
             cfg.getfloat('loss', 'complex_weight'))
         assert recorded['loss_stft_consistency'] == cfg.getboolean(
@@ -1454,6 +1452,86 @@ def test_align_ulcnet_step_schedule_advances_per_batch(
         f"the schedule advanced {calls['n']} times over an epoch of "
         f"{batches['n']} batches; it must advance once per optimizer step, "
         'not once per epoch')
+
+
+@pytest.mark.parametrize('enabled', [True, False])
+def test_align_ulcnet_trains_on_plcpa_of_the_stft_consistent_estimate(
+        enabled, monkeypatch, tmp_path):
+    """The shipped ``[loss]`` section has to reach the loss, not only the contract.
+
+    The recorded contract fields and the config strings survive a mutant that
+    swaps the loss function, drops the projection, or hard-codes the exponent or
+    weight in ``run_epoch``. So this runs one real epoch with an exponent and a
+    weight that differ from both the shipped config and the function defaults,
+    and records what the loss was called with: the PLCPA function, those two
+    values, and -- when the projection is on -- the very tensor the projection
+    returned.
+    """
+    trainer = importlib.import_module('AIAEC.Align_ULCNet.train')
+    shipped = (pathlib.Path(training_common.__file__).parent
+               / 'Align_ULCNet' / 'config.ini')
+    cfg = configparser.ConfigParser()
+    assert cfg.read(shipped), shipped
+    cfg.set('loss', 'stft_consistency', 'true' if enabled else 'false')
+    cfg.set('loss', 'compression', '0.4')
+    cfg.set('loss', 'complex_weight', '0.6')
+    cfg.set('training', 'max_epochs', '1')
+    cfg.set('training', 'warmup_epochs', '1')
+    cfg.set('data', 'batch_size', '4')
+    cfg.set('data', 'num_workers', '0')
+    cfg.set('model', 'max_delay_frames', '2')
+    override = tmp_path / 'one_epoch.ini'
+    with io.open(override, 'w', encoding='utf-8') as handle:
+        cfg.write(handle)
+
+    linear = make_linear_aec_contract(16000, frame_size=512)
+
+    class FakePackedDataset:
+        def __init__(self, path, expected_sr=None, mmap=False):
+            self.linear_aec_contract = linear
+            self.linear_aec_contract_hash = linear.fingerprint()
+
+        def __len__(self):
+            return 40
+
+        def __getitem__(self, index):
+            return torch.zeros(len(PACKED_STEM_ORDER), 8192), {}
+
+        def fingerprint(self):
+            return 'fake-corpus'
+
+    projected = []
+    real_projection = trainer.stft_consistent_spectrum
+
+    def recording_projection(*args, **kwargs):
+        result = real_projection(*args, **kwargs)
+        projected.append(result)
+        return result
+
+    calls = []
+    real_loss = trainer.power_compressed_complex_mse_loss
+
+    def recording_loss(estimate, target, **kwargs):
+        calls.append((any(estimate is spec for spec in projected), kwargs))
+        return real_loss(estimate, target, **kwargs)
+
+    monkeypatch.setattr(training_common, 'PackedAecDataset', FakePackedDataset)
+    monkeypatch.setattr(
+        trainer, 'stft_consistent_spectrum', recording_projection)
+    monkeypatch.setattr(
+        trainer, 'power_compressed_complex_mse_loss', recording_loss)
+    monkeypatch.chdir(tmp_path)
+    args = trainer.build_parser().parse_args(
+        ['--config', str(override), '--packed-dir', 'fake', '--device', 'cpu']
+    )
+    trainer.main(args)
+
+    assert len(calls) > 1
+    for on_projected_estimate, kwargs in calls:
+        assert on_projected_estimate is enabled
+        assert kwargs['compression'] == pytest.approx(0.4)
+        assert kwargs['complex_weight'] == pytest.approx(0.6)
+    assert bool(projected) is enabled
 
 
 @pytest.mark.parametrize('model_name', ['DeepVQE_S', 'Align_CRUSE', 'CAGCRN'])
@@ -1663,7 +1741,9 @@ def test_align_ulcnet_resume_restores_early_stop_counter(
         'early_stop_patience = 15\n'
         'grad_clip = 1.0\n'
         '[loss]\n'
-        'compression = 0.3\n',
+        'compression = 0.3\n'
+        'complex_weight = 0.7\n'
+        'stft_consistency = true\n',
         encoding='utf-8',
     )
 

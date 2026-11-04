@@ -20,8 +20,10 @@ Provided here:
 * ``make_optimizer``                          -- fallback optimizer selector
 * ``make_scheduler`` / ``fast_forward_scheduler`` -- the common warmup/cosine recipe
 * ``compressed_spectral_loss``                -- fallback objective
-* ``component_compressed_mse_loss``           -- Align-ULCNet/ULCNet objective
-* ``power_compressed_complex_mse_loss``       -- Align-CRUSE PLCPA objective
+* ``component_compressed_mse_loss``           -- ULCNet's component-wise compressed MSE
+                                                 (no shipped trainer uses it)
+* ``power_compressed_complex_mse_loss``       -- PLCPA objective (Align-CRUSE,
+                                                 DeepVQE-S, Align-ULCNet)
 * ``si_snr_loss``                             -- waveform SI-SNR term used by CAGCRN
 * ``stft_consistent_spectrum`` / ``spectrum_to_waveform`` -- differentiable
   shared synthesis boundaries for objectives defined after iSTFT
@@ -637,10 +639,13 @@ def component_compressed_mse_loss(estimate: Tensor, target: Tensor, *,
 def power_compressed_complex_mse_loss(
         estimate: Tensor, target: Tensor, *, compression: float = 0.3,
         complex_weight: float = 0.7, eps: float = 1e-12) -> Tensor:
-    """Align-CRUSE power-compressed magnitude/complex MSE (PLCPA).
+    """Power-compressed magnitude/complex MSE (PLCPA): Align-CRUSE, DeepVQE-S,
+    Align-ULCNet.
 
-    ``complex_weight`` is the paper's beta: beta weights the phase-aware
-    complex error and ``1-beta`` weights the compressed magnitude error.
+    ``complex_weight`` is beta in the blend: beta weights the phase-preserving
+    complex error and ``1-beta`` the compressed magnitude error. Align-CRUSE
+    states beta = 0.7 without an equation; the blend is the one CRUSE
+    (arXiv:2101.09249) writes, which puts its weight (0.3) on the complex term.
     """
     if estimate.shape != target.shape:
         raise ValueError(

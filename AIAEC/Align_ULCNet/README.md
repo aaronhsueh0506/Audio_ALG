@@ -111,8 +111,19 @@ rather than one driven by validation noise.
 Early stopping is disabled (`early_stop_patience=0`). Validation still selects
 `*_best.pth`.
 
-The loss is ULCNet's component-wise signed power compression followed by
-frequency-domain MSE (`c=0.3`).
+The loss is the project's PLCPA objective, the one DeepVQE-S and Align-CRUSE
+train with: `(1 - beta) * mean((|S^|^c - |S|^c)^2) + beta * mean(| |S^|^c
+e^(j*phi^) - |S|^c e^(j*phi) |^2)` with `c=0.3` and `beta = [loss]
+complex_weight = 0.7`, evaluated on the estimate after an iSTFT->STFT round trip
+(`[loss] stft_consistency = true`; it must not run on MPS, see `config.ini`).
+arXiv:2410.13620 states no loss; its base model (arXiv:2408.15746) names the
+frequency-domain MSE defined in ULCNet (arXiv:2312.08132), which defers to its
+ref. [6] and describes the MSE in words only. The shared objective is therefore
+a project choice, not a published Align-ULCNet formula. It keeps the loss out of
+the differences between the three PLCPA candidates (optimizer, learning rate and
+batch size still differ). `LOSS_VERSION` is
+`align_ulcnet_plcpa_c03_beta07_consistent_v1`; a checkpoint trained with an
+earlier loss is rejected on resume.
 
 The primary source is arXiv:2410.13620. It explicitly publishes Adam, `4e-3`,
 D=64, batch 64, 3-second examples, a 20,000-step epoch, and the `0.1` plateau

@@ -93,25 +93,27 @@ model; PBFDKF is not precomputed over the whole WAV.
 Generic safety machinery is shared through `AIAEC/training_common.py`:
 non-finite evidence dumps, finite gradient clipping, the per-tensor
 vanished-weight guard, data loading, and checkpoint contracts. Optimizer and
-objective remain **model-specific**. The shipped schedule is deliberately
-common: three epochs of linear warmup followed by per-step cosine decay.
+the optimizer remain **model-specific**; Align-ULCNet, Align-CRUSE and DeepVQE-S
+share the PLCPA objective and CAGCRN keeps its own. The shipped schedule is
+deliberately common: three epochs of linear warmup followed by per-step cosine decay.
 
 | model | optimizer / LR | schedule | objective | shipped batch / epochs |
 |---|---|---|---|---|
-| Align-ULCNet | Adam / 4e-3 | 3-epoch warmup + cosine to 1e-6 | component-compressed frequency MSE, c=0.3 | 16 / 50 |
+| Align-ULCNet | Adam / 4e-3 | 3-epoch warmup + cosine to 1e-6 | STFT-consistent PLCPA, c=0.3, beta=0.7 on complex term (the papers state no formula) | 16 / 50 |
 | Align-CRUSE | Adam / 1.5e-4, decay 5e-6 | 3-epoch warmup + cosine to 1e-6 | STFT-consistent PLCPA, c=0.3, beta=0.7 on complex term | 16 / 50 |
 | DeepVQE-S | AdamW / 1.2e-3, decay 5e-7 | 3-epoch warmup + cosine to 1e-6 | inherited Align-CRUSE PLCPA; the DeepVQE paper does not state its loss | 8 / 50 |
 | CAGCRN | AdamW / 1.2e-3, decay 5e-7 | 3-epoch warmup + cosine to 1e-6 | MSE + SI-SNR + normalized parameter L1 | 32 / 50 |
 
 ### What a four-way comparison can and cannot conclude
 
-The four candidates do not share an optimizer or a loss, so a
+The four candidates do not share an optimizer, and CAGCRN has its own loss, so a
 ranking of their final numbers is not a ranking of their architectures. Two
 independent reasons, both measurable from this directory:
 
-**The losses are different functions.** Component-compressed frequency MSE,
-PLCPA, and MSE+SI-SNR+L1 do not share a scale or a zero. Cross-model loss
-values are not comparable at all -- only a common external metric is.
+**The losses are different functions.** PLCPA (Align-ULCNet, Align-CRUSE,
+DeepVQE-S) and MSE+SI-SNR+L1 (CAGCRN) do not share a scale or a zero. Loss
+values across that boundary are not comparable at all -- only a common
+external metric is.
 
 **The optimisation budgets differ.** Batch sizes, epoch definitions, peak
 learning rates and published training durations differ. Sharing the shape of
@@ -119,7 +121,8 @@ the schedule does not equalise update count or audio exposure, so a win by one
 model is not attributable to architecture alone.
 
 This is a deliberate trade: per-paper fidelity is chosen over a shared
-protocol, and the two cannot both hold. Whichever is
+protocol, and the two cannot both hold (Align-ULCNet's loss is the exception:
+its paper states none, so it uses the shared PLCPA objective). Whichever is
 wanted, it should be an explicit decision rather than an artefact:
 
 - **To rank architectures**, put all four on one optimiser, one schedule and

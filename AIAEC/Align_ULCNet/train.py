@@ -7,6 +7,7 @@
     python3 train.py --config config.ini --resume output/align_ulcnet_e5.pth
     python3 train.py --config config.ini --resume output/align_ulcnet_e5.pth --reset-optimizer
     python3 train.py --config config.ini --seed 123
+    ([loss] stft_consistency = true refuses MPS: pass --device cpu or a CUDA device)
 
 config.ini sections (see the shipped config.ini for every knob, documented):
     [signal]     sample rate + FFT grid. Paper defaults are 16 kHz/512/512/256;
@@ -17,7 +18,8 @@ config.ini sections (see the shipped config.ini for every knob, documented):
                  per-chunk val_fraction
     [model]      every AlignULCNet constructor keyword (see model.py)
     [training]   optimizer, seed, epoch budget, checkpoint/log locations
-    [loss]       ULCNet component-compressed frequency-domain MSE
+    [loss]       PLCPA on the iSTFT->STFT-consistent estimate, as DeepVQE_S
+                 and Align_CRUSE train
 
 dataset:
     AIAEC/dataset_gen renders each complete parent sequence, runs one stateful
@@ -64,23 +66,24 @@ from AIAEC.training_common import (
     build_arg_parser,
     build_plain_loaders,
     auto_device,
-    component_compressed_mse_loss,
     fast_forward_scheduler,
     halt_on_non_finite,
     make_scheduler,
     make_checkpoint_contract,
+    power_compressed_complex_mse_loss,
     read_grids,
     read_model_kwargs,
     require_checkpoint_contract,
     scan_non_finite,
     set_seed,
+    stft_consistent_spectrum,
     training_progress,
 )
 
 
 MODEL_NAME = 'Align_ULCNet'
 TASK = MODEL_TASKS[MODEL_NAME]
-LOSS_VERSION = 'align_ulcnet_component_mse_c03_v1'
+LOSS_VERSION = 'align_ulcnet_plcpa_c03_beta07_consistent_v1'
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -118,9 +121,13 @@ def run_epoch(model, loader, aec_grid, device, loss_cfg, optimizer=None, *,
             output, spectral = forward_batch(
                 model, stems_batch, aec_grid, device
             )
-            loss = component_compressed_mse_loss(
-                output.enhanced, spectral.target,
+            estimate = output.enhanced
+            if loss_cfg.getboolean('stft_consistency'):
+                estimate = stft_consistent_spectrum(estimate, aec_grid)
+            loss = power_compressed_complex_mse_loss(
+                estimate, spectral.target,
                 compression=loss_cfg.getfloat('compression'),
+                complex_weight=loss_cfg.getfloat('complex_weight'),
             )
 
         if training:
@@ -218,7 +225,9 @@ def main(args):
         'grad_clip': cfg.getfloat('training', 'grad_clip', fallback=1.0),
         'early_stop_patience': cfg.getint(
             'training', 'early_stop_patience', fallback=0),
-        'loss_compression': cfg.getfloat('loss', 'compression', fallback=0.3),
+        'loss_compression': cfg.getfloat('loss', 'compression'),
+        'loss_complex_weight': cfg.getfloat('loss', 'complex_weight'),
+        'loss_stft_consistency': cfg.getboolean('loss', 'stft_consistency'),
     }
     if recipe['schedule'] == 'warmup_cosine':
         # These two values and the denominator above define the entire step LR
@@ -322,8 +331,7 @@ def main(args):
               f"{' (fresh optimizer)' if args.reset_optimizer else ''}"
               f", lr={resumed_lr:.4e}")
 
-    loss_cfg = cfg['loss'] if cfg.has_section('loss') else {
-        'compression': '0.3'}
+    loss_cfg = cfg['loss']
     patience = recipe['early_stop_patience']
     grad_clip = recipe['grad_clip']
     grad_log = GradNormLog(os.path.join(output_dir, 'grad_norm.csv'), aec_grid.sr)
