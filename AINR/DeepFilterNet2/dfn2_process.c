@@ -227,8 +227,8 @@ void dfn2_framing_config(AcStftConfig* cfg, FftHandle* fft,
 {
     if (!cfg) return;
     ac_stft_config_default(cfg, DFN2_N_FFT);
-    cfg->spec_scale = 1.0f / sqrtf((float)DFN2_N_FFT);
-    cfg->ispec_scale = sqrtf((float)DFN2_N_FFT);
+    cfg->spec_scale = DFN2_NORMALIZED_STFT_SCALE;
+    cfg->ispec_scale = DFN2_NORMALIZED_STFT_UNSCALE;
     cfg->fft = fft;
     cfg->window = window;
 }

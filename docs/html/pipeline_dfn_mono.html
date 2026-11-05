@@ -45,9 +45,9 @@ th{background:#eef2f8}
 <h3>格點、尺度與版本</h3>
 <table>
 <tr><th>項目</th><th>值</th><th>出處</th></tr>
-<tr><td>格點</td><td><b>stage:48 kHz / FFT 1024 / hop 512 / 513 bins</b>(periodic sqrt-Hann、50% overlap;stage 自己其他取樣率一律 reject)。<b>host:8 k/256、16 k/256(預設)、16 k/512、48 k/1024</b>,即 <code>aec_resolve_signal_grid()</code> 的清單(<code>derive_lane()</code> 取 <code>aec_default_fft_size()</code>),範例預設 16 kHz</td><td><code>dfn2_process.h</code>;<code>dfn_res_stage.c</code>;<code>dfn/mono_aec_dfn_res/main.c</code>;<code>dfn_rate_bridge.c</code></td></tr>
+<tr><td>格點</td><td><b>stage:48 kHz / FFT 1024 / hop 512 / 513 bins</b>(periodic sqrt-Hann、50% overlap;此為出貨 grid,stage 只收 build 的 DFN2 grid,其餘取樣率一律 reject)。<b>host:8 k/256、16 k/256(預設)、16 k/512、48 k/1024</b>,即 <code>aec_resolve_signal_grid()</code> 的清單(<code>derive_lane()</code> 取 <code>aec_default_fft_size()</code>),範例預設 16 kHz</td><td><code>dfn2_process.h</code>;<code>dfn_res_stage.c</code>;<code>dfn/mono_aec_dfn_res/main.c</code>;<code>dfn_rate_bridge.c</code></td></tr>
 <tr><td>兩個格點怎麼接</td><td>48 kHz host 的格點與窗<b>就是</b> DFN2 的格點與窗,B(stage 的 E 參數)直接是合法的 DFN2 分析幀,不需第二次 transform。8/16 kHz 由 <code>DfnRateBridge</code> 承擔(範例的 <code>use_bridge</code>,48 kHz 不建):原生 WOLA → 升頻 → 48 kHz 上另做一次同款 sqrt-Hann 1024/512 分析 → stage → 48 kHz WOLA → 降頻。升頻器兩顆(E、P 各一)、降頻器一顆,都是 audiolib 的 <code>audio_resampler</code>(16 kHz ×3、8 kHz ×6),輸出因此是通帶容差等值而<b>非</b>逐位元等值</td><td><code>dfn_res_stage.h</code>;<code>dfn_rate_bridge.h</code>;<code>dfn_rate_bridge.c</code>;<code>dfn/dfn_hop.h</code></td></tr>
-<tr><td>邊界尺度</td><td>入 <code>2^-5</code>、出 <code>2^5</code>(hex-float <code>0x1p-5f</code>/<code>0x1p5f</code>,精確的 2 的次方):pipeline 頻譜是 audio-scale 未正規化 STFT,DFN2 邊界要 <code>torch.stft(normalized=True)</code>(=1/32)</td><td><code>dfn_res_stage.h</code>;<code>dfn_res_stage.c</code></td></tr>
+<tr><td>邊界尺度</td><td>入 <code>DFN_RES_STAGE_IN_SCALE</code>、出 <code>DFN_RES_STAGE_OUT_SCALE</code>(= 1/sqrt(n_fft) 與其反數,float32;出貨 grid 為 <code>2^-5</code>/<code>2^5</code>,精確的 2 的次方;n_fft 非 4 的冪時是正確捨入的 float):pipeline 頻譜是 audio-scale 未正規化 STFT,DFN2 邊界要 <code>torch.stft(normalized=True)</code>(出貨 =1/32)</td><td><code>dfn_res_stage.h</code>;<code>dfn_res_stage.c</code></td></tr>
 <tr><td>版本</td><td><code>DFN_RES_STAGE_LAYOUT_VERSION = 3</code>、<code>DFN_RATE_BRIDGE_LAYOUT_VERSION = 3</code>;兩者 <code>descriptor_version</code> 皆 1。規則:pool 大小、carve 順序或 descriptor 內容任一改變,該模組的版本加一。<code>dfn_hop</code> 是範例碼,沒有 layout version 或 descriptor;mono 的 <code>Aec</code> 沒有 descriptor</td><td><code>dfn_res_stage.h</code>、<code>dfn_rate_bridge.h</code></td></tr>
 </table>
 <p class="note"><b>Fail-open = 傳統鏈的等值(延後)。</b>沒有模型(<code>model.infer == NULL</code>)、<code>infer()</code> 回非 0、或輸出有未寫/非有限值時,該幀走 <code>dfn2_prepost_frame_skip()</code>:unit ERB mask 經 partition-of-unity 的 <code>erb_inv</code> 展開成 unit bin gain、zero taps、alpha 0,是<b>精確</b>的 identity;遞迴 state 維持加速器寫完的樣子,輸出非有限時已歸零(commit 讓 state generation 加 1)(<code>dfn_res_stage.h</code>、<code>.c</code>)。48 kHz 輸出就是「手寫傳統鏈(<code>pipelines/mono_aec_nr_res/tests/conv_chain_mono.h</code>,降噪器關)延後 L = M + D 個 hop」(CNG 也一樣;出貨 pair 1/1 的 L = 2),由 C 測試逐 byte 釘死;8/16 kHz 因為多了 resampler 往返,gate 改為「延後 added delay 後的通帶容差」。</p>
@@ -84,7 +84,7 @@ dfn_hop_process(&amp;hop, b.base_spec, post, out);                        /* (a)
 
 dfn_hop_begin(&amp;hop, E, P)          ← mono 範例的 E 參數傳入 B(b.base_spec)
  ├─【48 kHz host】dfn_res_stage_begin(stage, E, P, &amp;job)   回 1 = job 已開(前 M 個 hop 回 0,出貨 M=1 即第 0 個 hop;輸出頻譜到第 L 個 hop 才有)
- │      est = E*0x1p-5f, app = P*0x1p-5f → pre_process_freq_dual()(est 走特徵/
+ │      est = E*DFN_RES_STAGE_IN_SCALE, app = P*DFN_RES_STAGE_IN_SCALE → pre_process_freq_dual()(est 走特徵/
  │      [t-(2-M)..t+M] 視窗,app 走 noisy ring)
  └─【8/16 kHz host】dfn_rate_bridge_begin(bridge, E, P)
         ac_istft_push(synth_e, E)、ac_istft_push(synth_p, P)  同款 sqrt-Hann WOLA,各得一個 native hop
@@ -97,7 +97,7 @@ while (dfn_hop_nn_begin(&amp;hop, &amp;job) &gt; 0) {            (每 hop 0..2 �
 }   【48 kHz】dfn_res_stage_end(stage, rc, stage_output):
         rc≠0／輸出未寫／非有限 → dfn2_prepost_frame_skip() ← fail-open
         → post_process_freq()(ERB mask → deep filter → alpha → atten limit)
-        → valid ? Y * 0x1p5f(source frame t-L) : 全零
+        → valid ? Y * DFN_RES_STAGE_OUT_SCALE(source frame t-L) : 全零
     【8/16 kHz】bridge:FIFO 每滿 512,ac_stft_push(stft_e)、ac_stft_push(stft_p)
         sqrt-Hann 1024/512、center=0(歷史在 AcStft 內)開一個 job;nn_end 之後 stage_end
         → ac_istft_push(synth48) 48 kHz iFFT + WOLA → 降頻回原生 → 原生 out FIFO

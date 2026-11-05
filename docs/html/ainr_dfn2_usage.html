@@ -38,6 +38,7 @@ th{background:#eef1f5}
 <a href="ainr_dfn2.html">DFN2</a>
 <a href="ainr_dfn2_detail.html">DFN2 細節</a>
 <a href="ainr_dfn2_usage.html"><b>DFN2 使用</b></a>
+<a href="ainr_dfn2_grids.html">DFN2 grid</a>
 <a href="ainr_dfn3.html">DFN3</a>
 <a href="ainr_dfn3_usage.html">DFN3 使用</a>
 <a href="ainr_gtcrn.html">GTCRN</a>
@@ -59,9 +60,9 @@ th{background:#eef1f5}
 
 <h2>如何呼叫使用</h2>
 <ol>
-<li><b>準備借用物件</b>：<code>FftHandle</code>（<code>fft_init</code> 於 <code>DFN2_N_FFT</code> = 1024 點，<code>fft_get_mem_size(1024)</code> = 26,352 bytes，本機量測；TIME 模式必填，FREQ 可為 NULL）；<code>erb_fwd.bin</code>／<code>erb_inv.bin</code> 由呼叫端載入成 float 陣列（<code>export_erb_matrix.py --runtime-bins</code> 產生，各 513×32 個 float32 = 65,664 bytes；函式庫從不讀檔，也不複製）。</li>
+<li><b>準備借用物件</b>：<code>FftHandle</code>（<code>fft_init</code> 於 <code>DFN2_N_FFT</code> 點（出貨 grid 1024，<code>fft_get_mem_size(1024)</code> = 26,352 bytes，本機量測）；TIME 模式必填，FREQ 可為 NULL）；<code>erb_fwd.bin</code>／<code>erb_inv.bin</code> 由呼叫端載入成 float 陣列（<code>export_erb_matrix.py --runtime-bins</code> 產生，各 <code>DFN2_N_BINS</code>×<code>DFN2_N_ERB</code> 個 float32（出貨 513×32 = 65,664 bytes）；函式庫從不讀檔，也不複製）。</li>
 <li><code>dfn2_prepost_config_defaults(&amp;cfg, io_mode)</code> 後填 <code>fft</code>／<code>istft</code>／<code>erb_fwd</code>／<code>erb_inv</code>（<code>window</code> 出貨留 NULL；<code>istft</code> 是應用端用 <code>dfn2_framing_config()</code> 與 <code>ac_istft_init()</code> 建的 <code>AcIstft</code>，<code>DFN2_IO_TIME</code> 必填，類別在 <code>frame_commit</code> push、<code>reset</code> 時清它；<code>DFN2_IO_FREQ</code> 則由應用端自己對 <code>post_process_freq</code> 的頻譜呼叫 <code>ac_istft_push_planar</code>）。</li>
-<li><code>dfn2_prepost_get_mem_size(&amp;cfg, &amp;req)</code>：<code>req.bytes</code> 是整個 pool，<code>req.alignment</code> = 16；<code>DFN2_IO_TIME</code> 233,936 bytes、<code>DFN2_IO_FREQ</code> 219,536 bytes（本機量測；皆不含應用端的 <code>AcIstft</code>）。板端把 pool 放進靜態 arena，host 工具可改用 <code>dfn2_prepost_create(&amp;cfg)</code>／<code>_destroy()</code>。</li>
+<li><code>dfn2_prepost_get_mem_size(&amp;cfg, &amp;req)</code>：<code>req.bytes</code> 是整個 pool，<code>req.alignment</code> = 16；出貨 grid 的 <code>DFN2_IO_TIME</code> 233,936 bytes、<code>DFN2_IO_FREQ</code> 219,536 bytes（本機量測；皆不含應用端的 <code>AcIstft</code>；其他 grid 見 <a href="ainr_dfn2_grids.html">ainr_dfn2_grids</a>）。板端把 pool 放進靜態 arena，host 工具可改用 <code>dfn2_prepost_create(&amp;cfg)</code>／<code>_destroy()</code>。</li>
 <li><code>dfn2_prepost_init_ex(pool, req.bytes, &amp;cfg, &amp;req)</code>：起始即 reset，<code>state_generation</code> = 1。傳入查詢時的 <code>req</code> 可擋下「別的 build／io_mode 查出來的陳舊 pool 大小」。</li>
 <li>加速器那份定點 state 在啟動時填成量化後的 0；之後每次 <code>state_generation</code> 變了就重填（見時序圖）。</li>
 <li>每個 hop：<code>pre_process</code> → （回 1 才）<code>frame_inputs</code> → 加速器 → <code>frame_commit</code>（或 <code>frame_skip</code>）→ <code>post_process</code>。</li>
@@ -125,7 +126,7 @@ int run_dfn2(FftHandle *fft, AcIstft *istft, const float *erb_fwd, const float *
 <h3>錯誤處理速查</h3>
 <div class="tbl"><table>
 <tr><th>呼叫</th><th>失敗回傳</th><th>原因</th><th>處置</th></tr>
-<tr><td><code>get_mem_size</code></td><td>-1，<code>*req</code> 不動</td><td>NULL、未知 io_mode、缺 ERB 矩陣、<code>atten_lim_db</code> 非有限、TIME 缺 <code>fft</code> 或其 bin 數不是 513</td><td>修正 config</td></tr>
+<tr><td><code>get_mem_size</code></td><td>-1，<code>*req</code> 不動</td><td>NULL、未知 io_mode、缺 ERB 矩陣、<code>atten_lim_db</code> 非有限、TIME 缺 <code>fft</code> 或其 bin 數不是 <code>DFN2_N_BINS</code>（出貨 513）</td><td>修正 config</td></tr>
 <tr><td><code>init</code>／<code>init_ex</code></td><td>NULL</td><td>config 同上；pool 為 NULL、未對齊 16、太小；<code>expected</code> 與本 build 的 descriptor 不符</td><td>重新查大小、重新配置</td></tr>
 <tr><td><code>pre_process*</code></td><td>-1</td><td>NULL 參數、io_mode 不符、上一個 frame 還開著（沒 commit 也沒 skip）</td><td>先 <code>frame_commit</code>／<code>frame_skip</code></td></tr>
 <tr><td><code>frame_inputs</code></td><td>-1</td><td>沒有開啟中的 frame（例如前 M 拍 <code>pre_process</code> 回 0 之後）</td><td>只在 <code>pre_process</code> 回 1 後呼叫</td></tr>
@@ -179,7 +180,7 @@ caller                         DFN2Prepost (C)                     NPU runtime
 <h3>時間軸（延遲）</h3>
 <div class="tbl"><table>
 <tr><th>項目</th><th>值</th><th>出處</th></tr>
-<tr><td>hop</td><td>512 samples = 10.67 ms @48 kHz</td><td><code>DFN2_HOP_LEN</code></td></tr>
+<tr><td>hop（出貨 grid）</td><td>512 samples = 10.67 ms @48 kHz</td><td><code>DFN2_HOP_LEN</code></td></tr>
 <tr><td><code>pre_process</code> 回 0 的拍數</td><td>M（出貨 1：hop 0）</td><td><code>dfn2_prepost.h</code></td></tr>
 <tr><td><code>post_process</code> 的 <code>written = 0</code> 拍數</td><td>M+D（出貨 2：hop 0、1），第 M+D 拍起 512</td><td><code>dfn2_prepost.h</code></td></tr>
 <tr><td>identity 路徑輸出落後輸入</td><td>1 + M + D hops（出貨 3 hops = 1536 samples = 32 ms：framing 1 + 模型 2）</td><td><code>dfn2_prepost.h</code>；<code>dfn2_prepost_model_lookahead_frames()</code> 回 M+D（N=1；每次 invocation N 個 frame 時為 M+D+N-1，見下一列）</td></tr>
@@ -202,11 +203,11 @@ caller                         DFN2Prepost (C)                     NPU runtime
 <h3>外部：第三方可調（公開 API，有範圍檢查）</h3>
 <div class="tbl"><table>
 <tr><th>名稱</th><th>位置</th><th>型別／範圍</th><th>預設</th><th>何時設定</th><th>說明</th></tr>
-<tr><td><code>io_mode</code></td><td><code>DFN2PrepostConfig</code></td><td><code>DFN2_IO_TIME</code>(1)／<code>DFN2_IO_FREQ</code>(0)</td><td><code>config_defaults</code> 的第二個參數</td><td>init 前，之後固定</td><td>決定 pool 大小（TIME 233,936／FREQ 219,536 bytes）與可呼叫的 pre／post 函式</td></tr>
-<tr><td><code>fft</code></td><td>同上</td><td><code>FftHandle*</code>，<code>fft_get_n_freqs</code> = 513</td><td>NULL</td><td>init 前</td><td>TIME 必填（borrowed，不由本物件建立或銷毀）；FREQ 可為 NULL</td></tr>
+<tr><td><code>io_mode</code></td><td><code>DFN2PrepostConfig</code></td><td><code>DFN2_IO_TIME</code>(1)／<code>DFN2_IO_FREQ</code>(0)</td><td><code>config_defaults</code> 的第二個參數</td><td>init 前，之後固定</td><td>決定 pool 大小（出貨 grid：TIME 233,936／FREQ 219,536 bytes）與可呼叫的 pre／post 函式</td></tr>
+<tr><td><code>fft</code></td><td>同上</td><td><code>FftHandle*</code>，<code>fft_get_n_freqs</code> = <code>DFN2_N_BINS</code>（出貨 513）</td><td>NULL</td><td>init 前</td><td>TIME 必填（borrowed，不由本物件建立或銷毀）；FREQ 可為 NULL</td></tr>
 <tr><td><code>istft</code></td><td>同上</td><td><code>AcIstft*</code>，由 <code>dfn2_framing_config()</code> 描述的物件</td><td>NULL</td><td>init 前</td><td>TIME 必填（borrowed，記憶體歸應用端）；fft 大小、overlap-add 模式、合成尺度或窗表內容與分析不符時 get_mem_size／init 回失敗；FREQ 忽略</td></tr>
-<tr><td><code>window</code></td><td>同上</td><td><code>const float*</code>，<code>DFN2_WIN_LEN</code>(1024) 個值</td><td>NULL</td><td>init 前</td><td>NULL＝pool 內自帶 sqrt-Hann；出貨路徑一律留 NULL；非 NULL 須與物件同壽命且不變</td></tr>
-<tr><td><code>erb_fwd</code>／<code>erb_inv</code></td><td>同上</td><td><code>const float*</code>；fwd bin-major [513][32]、inv band-major [32][513]</td><td>NULL（必填，兩種模式）</td><td>init 前；執行期用 <code>set_erb_matrices</code></td><td>borrowed；<code>erb_inv</code> 須是 partition of unity（skip identity 依賴此性質）；就地改寫內容後須再呼叫 <code>set_erb_matrices</code></td></tr>
+<tr><td><code>window</code></td><td>同上</td><td><code>const float*</code>，<code>DFN2_WIN_LEN</code>（出貨 1024）個值</td><td>NULL</td><td>init 前</td><td>NULL＝pool 內自帶 sqrt-Hann；出貨路徑一律留 NULL；非 NULL 須與物件同壽命且不變</td></tr>
+<tr><td><code>erb_fwd</code>／<code>erb_inv</code></td><td>同上</td><td><code>const float*</code>；fwd bin-major [N_BINS][N_ERB]、inv band-major [N_ERB][N_BINS]（出貨 513／32）</td><td>NULL（必填，兩種模式）</td><td>init 前；執行期用 <code>set_erb_matrices</code></td><td>borrowed；<code>erb_inv</code> 須是 partition of unity（skip identity 依賴此性質）；就地改寫內容後須再呼叫 <code>set_erb_matrices</code></td></tr>
 <tr><td><code>atten_lim_db</code></td><td>同上；<code>set_atten_lim</code></td><td>有限 float；以 |dB| 計</td><td>0（關閉）</td><td>init 前，或 hop 之間</td><td>輸出 = noisy×lim + enhanced×(1−lim)，lim = 10^(−|dB|/20)，在最後的複數頻譜上混合；非有限值被拒（-1）</td></tr>
 <tr><td><code>set_erb_matrices(p, fwd, inv)</code></td><td>函式</td><td>兩個指標皆非 NULL</td><td>—</td><td>hop 之間（frame 開著回 -1）</td><td>換 .bin 不需重編譯；保證 per-hop 原子性，不保證 per-source-frame 一致（要一致就先 <code>reset</code>）</td></tr>
 <tr><td><code>--atten-lim</code>、<code>--input</code>／<code>--output</code>、<code>--input-dir</code>／<code>--output-dir</code></td><td><code>DeepFilterNet2/inference.py</code></td><td>float；路徑</td><td><code>--atten-lim</code> 預設 None（關）</td><td>離線推論</td><td>Python 參考；與 C 的 <code>atten_lim_db</code> 同義</td></tr>
@@ -222,13 +223,14 @@ caller                         DFN2Prepost (C)                     NPU runtime
 <p>下列都是 checkpoint／graph 契約的一部分：改任何一項都等於換一個模型，需重訓、重匯出，並讓 layout 版號或 feature 版本跟著變；開放給第三方只會得到「形狀合法但數值錯誤」的結果。</p>
 <div class="tbl"><table>
 <tr><th>名稱</th><th>值</th><th>位置</th><th>不開放的原因</th></tr>
-<tr><td><code>DFN2_SR</code>／<code>DFN2_N_FFT</code>／<code>DFN2_N_BINS</code>／<code>DFN2_WIN_LEN</code>／<code>DFN2_HOP_LEN</code></td><td>48000／1024／513／1024／512</td><td><code>dfn2_process.h</code></td><td>與 checkpoint 的 signal contract、ERB 矩陣尺寸、所有 ring 大小綁定；只支援這一組 grid</td></tr>
-<tr><td><code>DFN2_N_ERB</code>／<code>DFN2_DF_BINS</code>／<code>DFN2_DF_ORDER</code></td><td>32／96／5</td><td><code>dfn2_process.h</code></td><td>網路 head 的輸出形狀；<code>df_bins=96</code> 對應 0..4.5 kHz</td></tr>
+<tr><td><code>DFN2_SR</code>／<code>DFN2_N_FFT</code>／<code>DFN2_N_BINS</code>／<code>DFN2_WIN_LEN</code>／<code>DFN2_HOP_LEN</code></td><td>出貨 48000／1024／513／1024／512</td><td><code>dfn2_grid.h</code></td><td>與 checkpoint 的 signal contract、ERB 矩陣尺寸、所有 ring 大小綁定；grid 在建置時選（<code>-DDFN2_GRID_KHZ</code> 或外部定義），不是執行期參數，見 <a href="ainr_dfn2_grids.html">ainr_dfn2_grids</a></td></tr>
+<tr><td><code>DFN2_N_ERB</code>／<code>DFN2_DF_BINS</code></td><td>出貨 32／96</td><td><code>dfn2_grid.h</code></td><td>網路 head 的輸出形狀；<code>df_bins=96</code> 在出貨 grid 對應 0..4.5 kHz</td></tr>
+<tr><td><code>DFN2_DF_ORDER</code></td><td>5（固定，不可定義）</td><td><code>dfn2_process.h</code></td><td>graph 的 pathway window 與狀態版面都為 5 個 tap 建立</td></tr>
 <tr><td><code>DFN2_MASK_LOOKAHEAD</code>／<code>DFN2_DF_LOOKAHEAD</code></td><td>M 0..2、D 0..4，預設 1／1（cascade 串聯，模型延遲 M+D hops；15 個 pair）</td><td><code>dfn2_process.h</code></td><td>訓練時的因果結構，是 checkpoint 的一部分；改了延遲與對齊邏輯都變，需重訓。建置面是每個單元的 <code>-DDFN2_MASK_LOOKAHEAD</code>／<code>-DDFN2_DF_LOOKAHEAD</code>（pair 不同的目標檔連結失敗），見 <a href="ainr_dfn2_detail.html">ainr_dfn2_detail</a></td></tr>
-<tr><td><code>DFN2_ERB_NORM_ALPHA</code>／<code>DFN2_SPEC_NORM_ALPHA</code></td><td>0.989／0.989（tau = 1.0 s）</td><td><code>dfn2_process.h</code></td><td>由 sr、hop、tau 推導；feature version 的一部分，須與 <code>train.py</code> 相同</td></tr>
+<tr><td><code>DFN2_ERB_NORM_ALPHA</code>／<code>DFN2_SPEC_NORM_ALPHA</code></td><td>出貨 0.989／0.989（tau = 1.0 s；16／32 kHz preset 為 0.992）</td><td><code>dfn2_grid.h</code></td><td>由 sr、hop、tau 推導；feature version 的一部分，須與 <code>train.py</code> 相同</td></tr>
 <tr><td><code>DFN2_ERB_NORM_INIT_LO_DB</code>／<code>_HI_DB</code>、<code>DFN2_ERB_NORM_SCALE_DB</code>、<code>DFN2_ERB_LOG_FLOOR</code></td><td>−60／−90 dB、40、1e-10</td><td><code>dfn2_process.h</code></td><td>三者互相一致（|log floor − init_lo| = scale_db），須一起改</td></tr>
 <tr><td><code>DFN2_SPEC_NORM_INIT_LO</code>／<code>_HI</code>、<code>DFN2_SPEC_NORM_EPS</code></td><td>0.001／0.0001、1e-12</td><td><code>dfn2_process.h</code></td><td>libDF 初值；eps 防止 flush-to-zero 後 x/√0 產生 NaN</td></tr>
-<tr><td><code>DFN2_ANALYSIS_SCALE</code></td><td>0.03125</td><td><code>dfn2_process.h</code></td><td>只作用在餵給正規化器的拷貝；<b>不是</b>頻譜進出的 1/32 換算</td></tr>
+<tr><td><code>DFN2_ANALYSIS_SCALE</code></td><td>出貨 0.03125（1／√n_fft，由 n_fft 推導）</td><td><code>dfn2_grid.h</code></td><td>只作用在餵給正規化器的拷貝；<b>不是</b>頻譜進出的換算（出貨 grid 的 1/32）</td></tr>
 <tr><td><code>DFN2_FEATURE_VERSION</code></td><td><code>dfn2_libdf_wnorm_upstream_init_no_eps_v5</code></td><td><code>dfn2_process.h</code></td><td>checkpoint 與前端的共同契約</td></tr>
 <tr><td><code>DFN2_MODEL_IO_LAYOUT_VERSION</code></td><td>8</td><td><code>dfn2_model_io.h</code></td><td>graph 邊界版號；與 <code>export_onnx.py</code> 互鎖，4–7 已退役不可重用</td></tr>
 <tr><td><code>DFN2_MODEL_INPUT_FRAMES</code>／<code>_GRU_ROWS</code>／<code>_GRU_ROW_*</code>／<code>_GRU_HIDDEN</code>／<code>_ENCODER_CHANNELS</code>／<code>_DF_PATHWAY_WINDOW</code></td><td>3／5／0,1,3／256／64／5</td><td><code>dfn2_model_io.h</code></td><td>graph 輸入／state 形狀；<code>DFN2ModelIoDescriptor</code> 逐欄位檢查</td></tr>
@@ -239,8 +241,8 @@ caller                         DFN2Prepost (C)                     NPU runtime
 
 <h2>相關檔案與測試路徑</h2>
 <ul>
-<li><code>AINR/DeepFilterNet2/dfn2_prepost.c</code> / <code>.h</code>、<code>dfn2_process.c</code> / <code>.h</code>、<code>dfn2_model_io.c</code> / <code>.h</code></li>
-<li>行為閘門：<code>AINR/tests/test_dfn2_prepost_c.py</code>；串流對齊與 ERB 稀疏範圍：<code>AINR/tests/test_c_prepost.c</code></li>
+<li><code>AINR/DeepFilterNet2/dfn2_prepost.c</code> / <code>.h</code>、<code>dfn2_process.c</code> / <code>.h</code>、<code>dfn2_model_io.c</code> / <code>.h</code>、<code>dfn2_grid.h</code>（grid 常數）</li>
+<li>行為閘門：<code>AINR/tests/test_dfn2_prepost_c.py</code>；串流對齊與 ERB 稀疏範圍：<code>AINR/tests/test_c_prepost.c</code>；grid：<code>AINR/tests/test_dfn2_grid.py</code></li>
 <li>host 消費者：<code>pipelines/dfn/dfn_res_stage.c</code>（<a href="pipeline_dfn_mono.html">pipeline_dfn_mono</a>、<a href="pipeline_dfn_4ch.html">pipeline_dfn_4ch</a>）</li>
 <li>同類頁面：<a href="ainr_dfn2.html">ainr_dfn2</a>、<a href="ainr_dfn2_detail.html">ainr_dfn2_detail</a>、<a href="ainr_dfn3_usage.html">ainr_dfn3_usage</a>、<a href="onnx_prepost.html">onnx_prepost</a>、<a href="conventions.html">conventions</a>、<a href="index.html">index</a></li>
 <li>文件：<a href="../../AINR/DeepFilterNet2/README.md">README.md</a>、<a href="../../AINR/README.md">AINR/README.md</a></li>

@@ -79,6 +79,7 @@ code{font-family:ui-monospace,Menlo,monospace;font-size:.92em}
 <a href="ainr_dfn2.html">DFN2</a> ·
 <a href="ainr_dfn2_detail.html">DFN2 細節</a> ·
 <a href="ainr_dfn2_usage.html">DFN2 使用</a> ·
+<a href="ainr_dfn2_grids.html">DFN2 grid</a> ·
 <a href="ainr_dfn3.html">DFN3</a> ·
 <a href="ainr_dfn3_usage.html">DFN3 使用</a> ·
 <a href="ainr_gtcrn.html">GTCRN</a> ·
@@ -301,11 +302,13 @@ Align-ULCNet NN post stage（不重建、不再分析）；新增演算法延遲
 <table>
 <tr><th>頁面</th><th>一行描述</th></tr>
 <tr><td><a href="ainr_dfn2.html">ainr_dfn2</a></td>
-<td>DeepFilterNet2：48k、1024/512（非上游 960/480）；stateless ONNX exporter + C 前後處理
+<td>DeepFilterNet2：出貨 48k、1024/512（非上游 960/480），其他 grid 於建置時選；stateless ONNX exporter + C 前後處理
 <code>dfn2_process.c</code>（STFT/ERB+complex 特徵/EMA 正規化/compose/ISTFT），
 graph 只含 heads。</td></tr>
 <tr><td><a href="ainr_dfn2_detail.html">ainr_dfn2_detail</a></td>
 <td>DFN2 prepost 類別的 pool 大小與所有權、<code>DFN2Model</code> callback 與 descriptor、<code>libainr_prepost.a</code> 建置、skip identity 的 partition-of-unity 檢查。</td></tr>
+<tr><td><a href="ainr_dfn2_grids.html">ainr_dfn2_grids</a></td>
+<td>DFN2 的 grid 於建置時選擇：16／32／48 kHz preset、外部定義 grid、連結符號與 pool hash、各 grid 的 pool 大小。</td></tr>
 <tr><td><a href="ainr_dfn3.html">ainr_dfn3</a></td>
 <td>48 kHz DFN3 raw-low DF / masked-high split；兩個 heads、layout 9、TIME/FREQ 靜態 pool API，lookahead pair 預設 1/1（15 組合法 pair，建置期選定），1/1 的 identity 音訊位移 2 hops。</td></tr>
 <tr><td><a href="ainr_gtcrn.html">ainr_gtcrn</a></td>

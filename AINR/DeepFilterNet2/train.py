@@ -283,10 +283,13 @@ def validate_signal_config(n_fft, win_len, hop_len, n_erb, df_bins, df_order,
         raise ValueError('df_bins exceeds the available STFT bins')
     # ⚠ THE divisibility guard for this port -- model.py carries no equivalent
     # assert, so do not delete it assuming otherwise.  The two stride-2 stages
-    # only need % 4, but upstream asserts % 8 and this port follows it: 20 and 36
-    # pass a % 4 check and are rejected upstream.
-    if n_erb <= 0 or n_erb % 8:
-        raise ValueError('n_erb must be positive and divisible by eight')
+    # (erb_conv1/erb_conv2, mirrored by the decoder's transposed convolutions)
+    # need n_erb % 4 and nothing more: 20, 24, 28, 32 and 36 build and run, 30
+    # does not broadcast.  Upstream's stricter % 8 is not kept, so a grid whose
+    # band count is a multiple of four but not of eight (28 at 32 kHz) can be
+    # trained.  The C library asks for the same % 4 (dfn2_grid.h).
+    if n_erb <= 0 or n_erb % 4:
+        raise ValueError('n_erb must be positive and divisible by four')
     if not 0 <= mask_lookahead <= 2:
         raise ValueError('mask_lookahead must be in [0, 2]')
     if not 0 <= df_lookahead < df_order:

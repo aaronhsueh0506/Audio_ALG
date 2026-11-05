@@ -26,7 +26,7 @@ pairs and do not include the AIAEC echo-stem contract.
 |---|---|---|---|
 | `RNNoise-ERB` | 16 kHz, 512/512/256 | compact ERB recurrent suppressor | audiolib AcStft/AcIstft |
 | `GTCRN` | 16 kHz, 512/512/256 | GTCRN baseline | model-specific |
-| `DeepFilterNet2` | 48 kHz, 1024/1024/512 | DFN2 cascade + learned alpha | `MODEL_VERSION` v6 |
+| `DeepFilterNet2` | 48 kHz, 1024/1024/512 (shipped grid; others are chosen at build time, see [DFN2 grid](#dfn2-grid)) | DFN2 cascade + learned alpha | `MODEL_VERSION` v6 |
 | `DeepFilterNet3` | 48 kHz, 1024/1024/512 | DFN3 raw-low DF / high ERB split | `MODEL_VERSION` v5, feature v5 |
 
 `DeepFilterNet2`'s final composition is a cascade:
@@ -45,7 +45,7 @@ comparison even when many parameter names happen to match.
 `dataset_gen/` is the single noisy/clean augmentation implementation:
 
 - run at 16 kHz for RNNoise-ERB and GTCRN;
-- run at 48 kHz for DeepFilterNet2 and DeepFilterNet3;
+- run at 48 kHz for DeepFilterNet3 and for the shipped DeepFilterNet2 grid (a DFN2 built for another grid takes that grid's sample rate);
 - keep separate output directories for separate sample-rate runs.
 
 The generator applies the same waveform transformation to noisy and target
@@ -61,9 +61,10 @@ composition, target/loss behavior, normalization state, and low-frequency
 training coverage before attributing the result to the shared dataset.
 
 `DeepFilterNet3` restores the independent band-split comparison branch. Both
-DFN configs share the signal grid, feature arithmetic, training recipe and
-dataset seed/split. With mask/DF lookahead 1/1, DFN2 waits two hops and DFN3
-one hop; including identity-path WOLA the measured shifts are 1536 and 1024
+shipped DFN configs share the signal grid, feature arithmetic, training recipe and
+dataset seed/split (DFN2 can also be built for another grid, see [DFN2 grid](#dfn2-grid);
+DFN3 stays at 48 kHz). With mask/DF lookahead 1/1, DFN2 waits two hops and DFN3
+one hop; including identity-path WOLA the measured shifts on the shipped grid are 1536 and 1024
 samples respectively. See `tests/test_dfn_comparison.py` and the DFN3 README.
 Keep outputs in each model's own directory.
 
@@ -200,6 +201,30 @@ pairs, the shipped pair and the compile flags the tests use come from
 `tests/dfn_pairs.py` (constructor, `config.ini`, `make print-cflags`). No
 checkpoint trained for a pair other than the shipped one exists here, so the
 audio quality of the others is unmeasured.
+
+### DFN2 grid
+
+DeepFilterNet2 only. The signal grid (sample rate, FFT size) and the model geometry (ERB bands, deep-filter bins, the two
+EMA coefficients) are build-time constants in `DeepFilterNet2/dfn2_grid.h`, a contract between the C library, the
+trained model and its ERB matrices. **The shipped grid is 48 kHz**; nothing needs to be passed to get it, and its objects
+are bit-identical to those built before the header existed (machine code, constants and symbols; FREQ pool 219,536
+bytes, hash `d2d3bc45`). Another grid is chosen on the build line, with the same flags on every unit of the library and of
+the application:
+
+| `-DDFN2_GRID_KHZ=` | sr | n_fft / hop | bins | n_erb | df_bins | alpha | state |
+|---|---|---|---|---|---|---|---|
+| `48` (default) | 48000 | 1024 / 512 | 513 | 32 | 96 | 0.989 | shipped |
+| `32` | 32000 | 512 / 256 | 257 | 28 | 96 | 0.992 | provisional, no model trained yet (28 is a multiple of 4, which `train.py` and the C library both ask for) |
+| `16` | 16000 | 256 / 128 | 129 | 24 | 96 | 0.992 | quality unmeasured |
+
+A grid nothing here knows is defined outside the library: `DFN2_SR`, `DFN2_N_FFT`, `DFN2_N_ERB`, `DFN2_DF_BINS`,
+`DFN2_ERB_NORM_ALPHA` and `DFN2_SPEC_NORM_ALPHA` are all required (a missing one is a `#error` naming it; nothing is
+defaulted, so a value of another grid cannot slip in), or `-DDFN2_GRID_HEADER='"my_grid.h"'` names a header that defines
+them. Objects built for different grids do not link, and a pool of another grid is refused (with the limit noted in the
+DFN2 README). The rules, the origin of the constants (`make_norm_alpha`, `analysis_scale`), the sizes per grid and the
+limits are in [`DeepFilterNet2/README.md`](DeepFilterNet2/README.md#choosing-the-grid); the test is
+`tests/test_dfn2_grid.py`. The rate bridge of `pipelines/dfn` is written for the 48 kHz model and refuses any other
+(`resolve()` returns -1).
 
 ### Multi-frame export
 

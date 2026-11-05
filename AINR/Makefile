@@ -91,6 +91,7 @@ SOURCES := tests/test_c_prepost.c \
 	DeepFilterNet3/dfn3_prepost.c \
 	GTCRN/gtcrn_process.c
 HEADERS := \
+	DeepFilterNet2/dfn2_grid.h \
 	DeepFilterNet2/dfn2_process.h \
 	DeepFilterNet2/dfn2_model_io.h \
 	DeepFilterNet2/dfn2_prepost.h \

@@ -99,6 +99,15 @@ def model_io_header():
     return (ROOT_PATH / 'dfn2_model_io.h').read_text(encoding='utf-8')
 
 
+def shipped_grid_header():
+    """The 48 kHz preset block of dfn2_grid.h: the shipped grid's definitions."""
+    text = (ROOT_PATH / 'dfn2_grid.h').read_text(encoding='utf-8')
+    block = re.search(r'^#if DFN2_GRID_KHZ == 48$(.*?)^#elif', text,
+                      flags=re.MULTILINE | re.DOTALL)
+    assert block is not None
+    return block.group(1)
+
+
 def load_config():
     cfg = configparser.ConfigParser()
     cfg.read(os.path.join(ROOT, 'config.ini'))
@@ -368,11 +377,11 @@ def test_c_model_io_layout_constants_match_the_shipped_export_shapes():
     export and only a board would find out.
     """
     header = model_io_header()
-    process = (ROOT_PATH / 'dfn2_process.h').read_text(encoding='utf-8')
+    grid = shipped_grid_header()
     frames = c_macro(header, 'DFN2_MODEL_INPUT_FRAMES')
     hidden = c_macro(header, 'DFN2_MODEL_GRU_HIDDEN')
-    n_erb = c_macro(process, 'DFN2_N_ERB')
-    df_bins = c_macro(process, 'DFN2_DF_BINS')
+    n_erb = c_macro(grid, 'DFN2_N_ERB')
+    df_bins = c_macro(grid, 'DFN2_DF_BINS')
     assert frames == INPUT_FRAMES, (
         'the C window depth and the exporter window depth are one contract'
     )
@@ -836,24 +845,40 @@ def test_enc_concat_true_still_emits_a_single_width_bus():
     assert torch.isfinite(erb_mask).all()
 
 
-def test_n_erb_divisibility_follows_upstreams_stricter_rule():
-    """Upstream asserts nb_erb % 8; the two stride-2 stages only need % 4.
+def test_n_erb_divisibility_is_the_architectures_own_rule():
+    """The two stride-2 stages need n_erb % 4 and nothing more; upstream's
+    stricter % 8 is not kept.
 
-    ⚠ Calls the real validator.  A test that only asserted `32 % 8 == 0`
-    locally would pass whichever rule train.py enforced; reverting the guard to
-    % 4 fails this one.
+    ⚠ Calls the real validator and the real model.  A test that only asserted
+    `28 % 4 == 0` locally would pass whichever rule train.py enforced, and a
+    validator that accepted a width the model cannot build would pass its own
+    check: the accepted widths are built and run here, the refused ones fail.
     """
     shipped = dict(n_fft=1024, win_len=1024, hop_len=512, n_erb=32, df_bins=96,
                    df_order=5, mask_lookahead=1, df_lookahead=1)
     validate_signal_config(**shipped)          # must not raise
 
-    # 20 and 36 are the interesting cases: legal under %4, illegal under %8.
-    for bad in (20, 36):
-        assert bad % 4 == 0 and bad % 8 != 0
-        with pytest.raises(ValueError, match='divisible by eight'):
+    # Multiples of four, not of eight: accepted, and the model really runs.
+    for good in (20, 28, 36):
+        assert good % 4 == 0 and good % 8 != 0
+        validate_signal_config(**{**shipped, 'n_erb': good})
+        model = DeepFilterNet2(n_fft=512, sr=32000, n_erb=good, df_bins=96,
+                               enc_ch=8, emb_size=32, df_hidden=32,
+                               lin_groups=4, enc_lin_groups=4).eval()
+        with torch.no_grad():
+            mask, _coefs, _alpha = model.heads(
+                torch.randn(1, 1, 4, good), torch.randn(1, 2, 4, 96))
+        assert mask.shape == (1, 1, 4, good)
+
+    # Not a multiple of four: refused, and the model could not run it either.
+    for bad in (30, 22, 0, -4):
+        with pytest.raises(ValueError, match='divisible by four'):
             validate_signal_config(**{**shipped, 'n_erb': bad})
-    with pytest.raises(ValueError, match='divisible by eight'):
-        validate_signal_config(**{**shipped, 'n_erb': 0})
+    with pytest.raises(RuntimeError):
+        model = DeepFilterNet2(n_fft=512, sr=32000, n_erb=30, df_bins=96,
+                               enc_ch=8, emb_size=32, df_hidden=32,
+                               lin_groups=4, enc_lin_groups=4).eval()
+        model.heads(torch.randn(1, 1, 4, 30), torch.randn(1, 2, 4, 96))
 
 
 def test_analysis_scale_fold_is_bit_exact():

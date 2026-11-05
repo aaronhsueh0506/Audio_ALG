@@ -80,6 +80,7 @@ code{font-family:ui-monospace,Menlo,monospace;font-size:.92em}
 <a href="ainr_dfn2.html">DFN2</a> ·
 <a href="ainr_dfn2_detail.html">DFN2 細節</a> ·
 <a href="ainr_dfn2_usage.html">DFN2 使用</a> ·
+<a href="ainr_dfn2_grids.html">DFN2 grid</a> ·
 <a href="ainr_dfn3.html">DFN3</a> ·
 <a href="ainr_dfn3_usage.html">DFN3 使用</a> ·
 <a href="ainr_gtcrn.html">GTCRN</a> ·
@@ -143,7 +144,7 @@ HOP/BINS/TA_BINS 由 N_FFT 導出）、<code>ulcnet_process.h</code>（四個別
 <code>pipelines/ulcnet/ulcnet_nn_stage.h</code></td></tr>
 <tr><td>48 k</td><td><b>1024 / 512（513）</b>；ta_bins 52</td></tr>
 <tr><td rowspan="3">DFN2 變體（mono + 4ch）<br>
-<span class="note">共用 <code>pipelines/dfn/dfn_res_stage.{h,c}</code>；<code>2^-5</code> 進 / <code>2^5</code> 出的尺度邊界</span></td>
+<span class="note">共用 <code>pipelines/dfn/dfn_res_stage.{h,c}</code>；1/√n_fft 進 / √n_fft 出的尺度邊界（出貨 grid 為 <code>2^-5</code> / <code>2^5</code>）</span></td>
 <td>host：mono 8/16/48 k、4ch 16/48 k</td>
 <td>host 自己的格點清單（mono 8k/256、16k/256 預設、16k/512、48k/1024；4ch 無 8 k）</td>
 <td rowspan="3"><b>host 留在產品取樣率，只有 DFN2 stage 在 48 k</b>：48 k host 直接餵 stage，
@@ -155,12 +156,12 @@ HOP/BINS/TA_BINS 由 N_FFT 導出）、<code>ulcnet_process.h</code>（四個別
 <code>pipelines/dfn/dfn_hop.h</code>、
 <code>pipelines/dfn/mono_aec_dfn_res/main.c</code>、
 <code>pipelines/dfn/4ch_aec_bf_dfn_res/main.c</code></td></tr>
-<tr><td>stage：48 k</td><td><b>1024 / 512（513）唯一格點</b></td></tr>
+<tr><td>stage：出貨 48 k</td><td><b>1024 / 512（513）</b>；stage 只收該 build 的 <code>DFN2_SR</code>／<code>DFN2_N_FFT</code>，rate bridge 只收 48 k／1024 的模型（其他回 -1）</td></tr>
 <tr><td>其他</td><td>拒絕（<code>get_mem_requirements()</code> 回 -1）</td></tr>
-<tr><td>AINR DFN2</td><td>48 k</td>
-<td>1024 / 512（513）；<b>非上游 960/480</b>（2 的次方限制；DF 截止 4500 Hz
-vs 上游 4800 Hz）</td><td>編譯期固定；lookahead pair 同 DFN3（出貨 1/1）</td>
-<td><code>dfn2_process.h</code></td></tr>
+<tr><td><a href="ainr_dfn2_grids.html">AINR DFN2</a></td><td>出貨 48 k；16 k／32 k preset 與外部定義的 grid 於建置時選</td>
+<td>出貨 1024 / 512（513）；<b>非上游 960/480</b>（2 的次方限制；DF 截止 4500 Hz
+vs 上游 4800 Hz）</td><td>編譯期選定（<code>-DDFN2_GRID_KHZ=16|32|48</code> 或外部定義，預設 48）；lookahead pair 同 DFN3（出貨 1/1）</td>
+<td><code>dfn2_grid.h</code>、<code>dfn2_process.h</code></td></tr>
 <tr><td><a href="ainr_dfn3.html">AINR DFN3</a></td><td>48 k</td><td>1024 / 512（513）；32 ERB bands、96 DF bins</td><td>編譯期固定；mask／DF lookahead pair 在建置期選定（15 組合法 pair，出貨 1/1）</td><td><code>dfn3_process.h</code></td></tr>
 <tr><td>AINR GTCRN</td><td>16 k</td><td>512 / 256（257）</td><td>編譯期固定</td>
 <td><code>gtcrn_process.h</code></td></tr>
@@ -212,8 +213,8 @@ vs 上游 4800 Hz）</td><td>編譯期固定；lookahead pair 同 DFN3（出貨 
 <p>上表所有呼叫點都經 audiolib 的 <code>AcStft</code>／<code>AcIstft</code>；差別只在兩個旋鈕：
 分析的 <code>center</code>（0 = 每次 push 恰一幀、零歷史起算；1 = torch <code>center=True</code>、reflect 前綴）與合成的
 <code>ola</code> 模式（<code>AC_OLA_ACCUMULATE</code> = acc += ifft×w、每幀吐一個 hop；<code>AC_OLA_ENV_NORM</code> =
-另累加 w×w、除以包絡、第一幀不吐）。頻譜縮放由 DFN2/DFN3 用（<code>spec_scale</code> = 1/32、<code>ispec_scale</code> = 32，皆 2 的冪，
-乘法不進位）；縮放恰為 1.0f 時略過乘法。</p>
+另累加 w×w、除以包絡、第一幀不吐）。頻譜縮放由 DFN2/DFN3 用（出貨 grid 的 <code>spec_scale</code> = 1/32、<code>ispec_scale</code> = 32，皆 2 的冪，
+乘法不進位；DFN2 的其他 grid 為 1/√n_fft 與 √n_fft，不一定是 2 的冪）；縮放恰為 1.0f 時略過乘法。</p>
 <div class="tbl">
 <table>
 <tr><th>家族</th><th>呼叫點</th><th>分析</th><th>合成</th><th>FFT／窗</th></tr>

@@ -2,6 +2,52 @@
 
 ## Unreleased
 
+### DFN2 grid chosen at build time (`dfn2_grid.h`)
+
+- `DeepFilterNet2/train.py` `validate_signal_config` now asks for `n_erb % 4` instead of `% 8` (shared by the trainer and `inference.py`).
+  The encoder's two stride-2 stages need only `% 4`: 20, 24, 28, 32 and 36 bands build and run, 30 does not; upstream DeepFilterNet's
+  stricter `% 8` is no longer kept, so a grid with 28 bands (the 32 kHz preset) can be trained. `UPSTREAM_ALIGNMENT.md` and the
+  contract test follow (`test_n_erb_divisibility_is_the_architectures_own_rule` builds and runs the accepted widths).
+- Mask-only on the board sample: `alg_ai3_dfn.c` (outside this repo) runs the `--mask-only` graph (inputs `erb, spec, h_gru`, outputs
+  `erb_mask, h_gru_out`, I/O layout 9) when it is built with `-DDFN2_MASK_ONLY` together with the library, and reads `dfn2_lite/` and
+  writes `DFN2_LITE/`; no source file of its own, and the library needs none (`-DDFN2_MASK_ONLY` on every unit, as before). The mask-only
+  and the full units of one grid do not link (`test_mask_only_and_full_units_of_one_grid_do_not_link`).
+- New `DeepFilterNet2/dfn2_grid.h`, included by `dfn2_process.h` and listed in the AINR Makefile `HEADERS`, holds the signal grid and
+  model geometry that `dfn2_process.h` used to write out: `DFN2_SR`, `DFN2_N_FFT`, `DFN2_N_ERB`, `DFN2_DF_BINS`,
+  `DFN2_ERB_NORM_ALPHA` and `DFN2_SPEC_NORM_ALPHA`. `DFN2_N_BINS`, `_WIN_LEN`, `_HOP_LEN` and `_OVL_LEN` are derived from n_fft, and so
+  are `DFN2_NORMALIZED_STFT_SCALE` / `_UNSCALE` (float32 of 1/sqrt(n_fft) and sqrt(n_fft), what `dfn2_framing_config` used to compute
+  itself) and `DFN2_ANALYSIS_SCALE` (the same value), so a new grid needs no table entry.
+- Presets, `-DDFN2_GRID_KHZ=<k>` on every unit: `48` (default, shipped: 48000 Hz, n_fft 1024, 32 ERB bands, 96 DF bins, alpha 0.989),
+  `32` (32000 Hz, 512, 28, 96, alpha 0.992; provisional, nothing is trained for it yet),
+  `16` (16000 Hz, 256, 24, 96, alpha 0.992). Both alphas are `train.py` `make_norm_alpha(sr, hop, tau)` with tau = 1.0 s, written as
+  literals; the analysis scale is `train.py` `analysis_scale()`, which is 1/sqrt(n_fft) for win = n_fft and hop = n_fft/2.
+- A grid defined outside the library: `DFN2_SR`, `DFN2_N_FFT`, `DFN2_N_ERB`, `DFN2_DF_BINS`, `DFN2_ERB_NORM_ALPHA` and
+  `DFN2_SPEC_NORM_ALPHA` are all required on the build line (a missing one is a `#error` naming it; nothing is defaulted, so no value of
+  another grid is applied silently), or `-DDFN2_GRID_HEADER='"my_grid.h"'` names a header that defines them. `DFN2_DF_ORDER` is fixed at 5 (the graph's pathway window and the state layout are built for it); an
+  external definition of it is a `#error`. A preset and an external definition cannot be mixed, and a preset cannot be
+  overridden in part. `#error` guards: n_fft a power of two in [16, 8192]; n_erb a positive multiple of 4 (the C ERB kernel and the
+  encoder's two stride-2 stages need only `% 4`, and `train.py` `validate_signal_config` asks for the same `% 4`, so 28 bands can be trained);
+  `2 * n_erb <= n_bins`; df_bins in [2, n_bins], and below n_bins for the full variant.
+- Link symbols and pool identity: the variant symbol keeps `dfn2_variant_full` / `dfn2_variant_mask_only` on the shipped grid
+  (the 48 kHz preset) and appends `_s<sr>_f<n_fft>_e<n_erb>_d<df_bins>` on any other, so objects of different grids do not link,
+  and neither does an application built for another grid than the library (it runs `DFN2_REQUIRE_LOOKAHEAD_PAIR_LINK()` in `main()`).
+  `pp_build_hash` folds seven more floats (both alphas, the five normaliser starting points) in off the shipped grid only.
+  "Shipped" is the 48 kHz preset itself with the normaliser starting points left at libDF's values: a build that overrides one, and a
+  grid defined on the build line even with the shipped integers, are never shipped, so they get their own symbol name and pool hash.
+- The shipped 48 kHz grid does not change: the six objects of a default build (full and `-DDFN2_MASK_ONLY`, three each) have the same
+  machine code, constant sections and symbols as before; the `DFN2_IO_FREQ` pool is still 219,536 bytes with hash `d2d3bc45`;
+  `DFN2_MODEL_IO_LAYOUT_VERSION` and `DFN2_PREPOST_CARVE_VERSION` stay; `make test`, `test-simd` and `test-pairs` pass with the digests
+  unchanged.
+- Measured on a 64-bit host: `DFN2_IO_FREQ` pool 189,680 B at 32 kHz and 174,672 B at 16 kHz (mask-only 14,528 B), `sizeof(DFN2State)`
+  43,752 B and 31,912 B (shipped: 219,536 B, 67,368 B).
+- New `tests/test_dfn2_grid.py`, for 48, 32, 16 kHz and a test-only external 24 kHz grid: constants against `train.py`
+  (alpha and analysis scale bit for bit), C features and compose against Python (also with `SIMD=0`), the C stream against the offline
+  model, the `#error` messages of invalid grids, link failure between objects of different grids in both directions and between an
+  application and a library of different grids, pool identity following the grid and the alphas.
+  `DeepFilterNet2/tests/test_dfn2_contract.py` now reads N_ERB / DF_BINS from `dfn2_grid.h` (the first `#define`, the 48 kHz branch).
+- Documentation: the DFN2 and AINR READMEs gain a grid section, and the HTML site a page `ainr_dfn2_grids.html`.
+  The 48 kHz-only wording in the `dfn2_prepost.h` header comment is tagged as the shipped grid.
+
 ### DFN2 stage 1 alone: `--mask-only` / `-DDFN2_MASK_ONLY`
 
 - `inference.py --mask-only` (alias `--mask_only`): also writes the stage-1-only result (ERB mask, no deep filter, same

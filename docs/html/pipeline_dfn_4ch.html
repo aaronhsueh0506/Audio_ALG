@@ -46,7 +46,7 @@ th{background:#eef7f1}
 <tr><th>項目</th><th>值</th><th>出處</th></tr>
 <tr><td>格點</td><td><b>stage:48 kHz / FFT 1024 / hop 512 / 513 bins</b>,periodic sqrt-Hann、50% overlap。<b>核心:16k/256(預設)、16k/512、48k/1024</b> 三個格點都可以當 host,<b>無 8 kHz</b>(mcab 自己就沒有);<code>mcab_default_config(sample_rate)</code>,<code>fft_size</code> 0 = 該取樣率預設。骨架沒有 fft 旗標,16k/512 由 <code>test_4ch_dfn</code> 涵蓋</td><td><code>dfn/4ch_aec_bf_dfn_res/main.c</code>;<code>dfn2_process.h</code></td></tr>
 <tr><td>兩個格點怎麼接</td><td>48 kHz 核心:各 lane 以同一張窗、同一個 overlap 分析,beamformer 只是逐 bin 加權,E 直接就是合法的 DFN2 分析幀。16 kHz 核心:<code>DfnRateBridge</code> 做原生 WOLA → 升頻 ×3 → 48 kHz 分析 → stage → 48 kHz WOLA → 降頻;輸出是通帶內的容差等值,不是逐位元等值</td><td><code>dfn_res_stage.h</code>;<code>dfn_rate_bridge.h</code></td></tr>
-<tr><td>邊界尺度</td><td>入 <code>2^-5</code>、出 <code>2^5</code>(<code>0x1p-5f</code>/<code>0x1p5f</code>,精確的 2 的次方):pipeline 頻譜是 audio-scale 未正規化 STFT,DFN2 邊界要 <code>torch.stft(normalized=True)</code></td><td><code>pipelines/dfn/dfn_res_stage.h</code></td></tr>
+<tr><td>邊界尺度</td><td>入 <code>DFN_RES_STAGE_IN_SCALE</code>、出 <code>DFN_RES_STAGE_OUT_SCALE</code>(= 1/sqrt(n_fft) 與其反數;出貨 grid 為 <code>2^-5</code>/<code>2^5</code>,精確的 2 的次方):pipeline 頻譜是 audio-scale 未正規化 STFT,DFN2 邊界要 <code>torch.stft(normalized=True)</code></td><td><code>pipelines/dfn/dfn_res_stage.h</code></td></tr>
 <tr><td>版本</td><td><code>DFN_RES_STAGE_LAYOUT_VERSION = 3</code>、<code>DFN_RATE_BRIDGE_LAYOUT_VERSION = 3</code>,<code>descriptor_version</code> 皆 1。pool 大小、carve 順序或 descriptor 內容任一改變,該模組的版本加一。4ch flow 的 <code>MCAB_LAYOUT_VERSION = 26</code>(只描述 mcab 自己的 pool)。<code>dfn_hop</code> 是範例碼,沒有 layout version 或 descriptor</td><td><code>dfn_res_stage.h</code>、<code>dfn_rate_bridge.h</code>、<code>mcab.h</code></td></tr>
 </table>
 <p class="note"><b>Fail-open = 傳統核心的等值(延後)。</b>沒有模型、<code>infer()</code> 回非 0 或輸出未寫/非有限時,該幀走 <code>dfn2_prepost_frame_skip()</code>(identity),輸出即「手寫傳統鏈(<code>conv_chain_mcab.h</code>,降噪器關)延後 L = M + D 個 hop」(出貨 pair 1/1 的 L = 2);48 kHz 由 C 測試逐 byte 釘死,16 kHz 為通帶容差(見 <a href="pipeline_dfn_detail.html">pipeline_dfn_detail</a>)。</p>
@@ -92,7 +92,7 @@ P 的形成(main.c 的 dfn_form(),自寫):
 
 dfn_hop_begin(&amp;hop, E, P)                                    (phase 0 → 1)
  ├─【48 kHz】dfn_res_stage_begin(stage, E, P, &amp;job)       ← 與 mono 同一份
- │      inputs_valid(E,P);A = E*0x1p-5f, B = P*0x1p-5f → pre_process_freq_dual()
+ │      inputs_valid(E,P);A = E*DFN_RES_STAGE_IN_SCALE, B = P*DFN_RES_STAGE_IN_SCALE → pre_process_freq_dual()
  │      回 1 = job 已開(前 M 個 hop 回 0,出貨 M=1 即第 0 個 hop;輸出頻譜到第 L 個 hop 才有)
  └─【16 kHz】dfn_rate_bridge_begin(bridge, E, P)
         原生 AcIstft(E、P 各一個)→ 兩顆 audio_resampler 升到 48 kHz(×3)→ 48 kHz FIFO
@@ -105,7 +105,7 @@ while (dfn_hop_nn_begin(&amp;hop, &amp;job) &gt; 0) {            (phase 1 → 2;
 
 dfn_hop_end(&amp;hop, out)                                       (phase → 0)
  ├─【48 kHz】沒被取走的 job 走 identity;ac_istft_push(istft, stage_output, out)
- │       stage_output = valid ? Y*0x1p5f(frame t-L) : 全零
+ │       stage_output = valid ? Y*DFN_RES_STAGE_OUT_SCALE(frame t-L) : 全零
  └─【16 kHz】dfn_rate_bridge_finish(bridge, out):從 out FIFO(init 預填 prefill 個零)取剛好一個 native hop
 
 dfn_hop_process(&amp;hop, E, P, out) = 上面四個呼叫的序列,模型由 model.infer(經 dfn_res_stage_infer)執行

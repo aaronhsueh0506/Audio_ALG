@@ -28,7 +28,7 @@ extern "C" {
 typedef struct DfnHopPoolPlan {
     DfnResStageConfig stage_cfg;      /* filled by the caller before dfn_hop_pool_plan() */
     DfnRateBridgeConfig bridge_cfg;
-    int use_bridge;                   /* host below 48 kHz */
+    int use_bridge;                   /* host rate differs from the model grid (DFN2_SR) */
     size_t stage_bytes, istft_bytes;
 } DfnHopPoolPlan;
 

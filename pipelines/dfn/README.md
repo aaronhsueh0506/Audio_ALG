@@ -7,8 +7,8 @@ adapt).
 
 | File | What it is |
 |---|---|
-| `dfn_res_stage.{h,c}` | The 48 kHz post-RES DFN2 stage. The network estimates from E (the linear-AEC error) and is applied to P (E after the RES gain, plus comfort noise when enabled). `DFN_RES_STAGE_LAYOUT_VERSION`. |
-| `dfn_rate_bridge.{h,c}` | The rate bridge for hosts below 48 kHz: native WOLA, resampling to the stage's 48 kHz 1024/512 grid and back; adds a fixed delay. `DFN_RATE_BRIDGE_LAYOUT_VERSION`. |
+| `dfn_res_stage.{h,c}` | The post-RES DFN2 stage, on the build's DFN2 grid (48 kHz as shipped). The network estimates from E (the linear-AEC error) and is applied to P (E after the RES gain, plus comfort noise when enabled). `DFN_RES_STAGE_LAYOUT_VERSION`. |
+| `dfn_rate_bridge.{h,c}` | The rate bridge for hosts below 48 kHz: native WOLA, resampling to the stage's 48 kHz 1024/512 grid and back; adds a fixed delay. Written for the shipped 48 kHz / 1024 model only: a build on another DFN2 grid makes it refuse (-1). `DFN_RATE_BRIDGE_LAYOUT_VERSION`. |
 | `dfn_hop.h` | Example: one DFN2 hop (`DfnHop`) over the stage, with a caller-owned synthesis, or over the bridge; the phased begin / model / end calls. |
 | `dfn_hop_pool.h` | Example: sizes and carves the DFN tail of an example's pool (the stage or the bridge, its synthesis and the output spectrum). |
 | `dfn_example_args.h` | Example: the command line shared by the two board skeletons (`--sample-rate`, `--erb-fwd`, `--erb-inv`, `--atten-lim`, `--cng`); the delay options come from `common/example_cli.h`. |
@@ -22,14 +22,14 @@ adapt).
 
 | Header | Sequence (app-side order) | Return values |
 |---|---|---|
-| `dfn_hop.h` | `dfn_hop_init_stage()` (48 kHz, caller-owned `AcIstft`) or `dfn_hop_init_bridge()`; per hop `dfn_hop_begin(E, P)` -> `while (dfn_hop_nn_begin() == 1) dfn_hop_nn_end(rc)` -> `dfn_hop_end(out)`; `dfn_hop_reset()` on a refusal | `DFN_HOP_INVALID` (-1), `DFN_HOP_SEQUENCE_ERROR` (-2) |
+| `dfn_hop.h` | `dfn_hop_init_stage()` (host on the build's DFN2 grid, 48 kHz as shipped; caller-owned `AcIstft`) or `dfn_hop_init_bridge()`; per hop `dfn_hop_begin(E, P)` -> `while (dfn_hop_nn_begin() == 1) dfn_hop_nn_end(rc)` -> `dfn_hop_end(out)`; `dfn_hop_reset()` on a refusal | `DFN_HOP_INVALID` (-1), `DFN_HOP_SEQUENCE_ERROR` (-2) |
 | `dfn_hop_pool.h` | `dfn_hop_pool_plan()` -> `dfn_hop_pool_bytes()` -> `dfn_hop_pool_build()` | 0, or -1 for a configuration no stage accepts |
 
 The host forms E and P itself before the hop begins; the two example mains show it (`rig_process()`
 in `mono_aec_dfn_res/main.c`, `dfn_form()` in `4ch_aec_bf_dfn_res/main.c`). External parameters are
 the arguments shown (`atten_lim_db`, the ERB matrices, the model callback and its I/O descriptor,
-the host rate); the stage constants (`DFN_RES_STAGE_IN_SCALE` / `_OUT_SCALE`, the bridge FIFO sizes)
-are internal.
+the host rate); the stage constants (`DFN_RES_STAGE_IN_SCALE` / `_OUT_SCALE`, which follow the build's DFN2
+grid -- 2^-5 / 2^5 on the shipped 48 kHz grid -- and the bridge FIFO sizes) are internal.
 
 ## Build and test
 

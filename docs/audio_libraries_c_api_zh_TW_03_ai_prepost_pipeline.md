@@ -35,10 +35,16 @@ int  dfn2_prepost_output_frame_index(const DFN2Prepost *p, long long *frame);
 - 暖機：`_pre_process()` 的前 `M` 拍回 0（不要跑加速器）；輸出前 `M + D` 拍（出貨 1/1 為兩拍）是暖機：`_post_process()` 的 `*written` = 0
   （`out_hop` 仍然寫滿零），`_post_process_freq()` 的 `*valid` = 0。收尾 flush 要用全零 hop 再跑 `M + D` 拍，**加速器那幾拍也要照跑**。
   DFN2 以 `-DDFN2_FRAMES_PER_CALL=N`（N > 1，需要 `export_onnx.py --frames-per-call N` 匯出的 graph）建置時，`_pre_process()` 每 N 拍回 1 一次、暖機與 flush 都多 `N - 1` 拍；pipelines 固定 N = 1（見 [ainr_dfn2_detail](html/ainr_dfn2_detail.html)）。
-- **`DFN2_IO_FREQ` 的頻譜是 `torch.stft(normalized=True)` 尺度**（乘了 1/√`DFN2_N_FFT` = 1/32），
-  AIAEC 兩個模型交出的則是**未正規化**的 rfft。直接串接會剛好差 32 倍（過驅動或欠驅動），
+- **Grid。** 取樣率、FFT 大小、ERB 帶數與 deep filter 的 bin 數是建置時決定的一組（`AINR/DeepFilterNet2/dfn2_grid.h`）：不帶旗標是出貨的
+  48 kHz／1024／512／32 個 ERB band／96 個 DF bin；`-DDFN2_GRID_KHZ=16|32|48` 選內建 preset，或在建置參數定義 `DFN2_SR`、`DFN2_N_FFT`、
+  `DFN2_N_ERB`、`DFN2_DF_BINS`、`DFN2_ERB_NORM_ALPHA`、`DFN2_SPEC_NORM_ALPHA`（缺一即 `#error` 並點名）。庫與應用的每個編譯單元要用同一組旗標，
+  不同 grid 的 object 無法連結；非出貨 grid（含覆寫正規化起點的建置）的 pool hash 另折入 alpha 與正規化起點共 7 個 float。需搭配該 grid 訓練的模型與 ERB 矩陣。
+  規則與各 grid 的大小見 [ainr_dfn2_grids](html/ainr_dfn2_grids.html)。
+- **`DFN2_IO_FREQ` 的頻譜是 `torch.stft(normalized=True)` 尺度**（乘了 1/√`DFN2_N_FFT`；出貨 grid 為 1/32，換算常數是
+  `DFN2_NORMALIZED_STFT_SCALE`／`_UNSCALE`），AIAEC 兩個模型交出的則是**未正規化**的 rfft。直接串接會剛好差 √`DFN2_N_FFT` 倍
+  （出貨 grid 為 32 倍；過驅動或欠驅動），
   而且兩邊都偵測不到——都是量綱合法的 float 頻譜，ERB 特徵又是 EMA 正規化的。
-  兩者也不同 grid（48 kHz/1024/512 對 16 kHz/512），中間本來就有 resampler，換算就放在那一層。
+  兩者也不同 grid（出貨的 48 kHz/1024/512 對 16 kHz/512），中間本來就有 resampler，換算就放在那一層。
   `DFN2_ANALYSIS_SCALE` **不是**這個因子（它只作用在特徵分支的拷貝上）。
 
 ### 6.7 Pool 大小
@@ -59,12 +65,14 @@ int  dfn2_prepost_output_frame_index(const DFN2Prepost *p, long long *frame);
 | Align-ULCNet 48 kHz | 32 | 504,496 | 477,680 |
 | Align-ULCNet 48 kHz | 64 | 950,960 | 924,144 |
 | DeepVQE-S 16 kHz | 32 | 628,784 | 615,280 |
-| DeepFilterNet2 48 kHz | — | 233,936 | 219,536 |
+| DeepFilterNet2 48 kHz（出貨 grid） | — | 233,936 | 219,536 |
+| DeepFilterNet2 32 kHz（`-DDFN2_GRID_KHZ=32`，28 個 ERB band） | — | 196,912 | 189,680 |
+| DeepFilterNet2 16 kHz（`-DDFN2_GRID_KHZ=16`，24 個 ERB band） | — | 178,320 | 174,672 |
 
-DeepVQE-S 的量體由 16 個 state 張量（每個一份 buffer）主宰。DeepFilterNet2 的 FREQ 比 TIME 小 14,400 bytes：
+DeepVQE-S 的量體由 16 個 state 張量（每個一份 buffer）主宰。DeepFilterNet2 的 FREQ 比 TIME 小（出貨 grid 為 14,400 bytes，32 kHz 為 7,232，16 kHz 為 3,648）：
 `DFN2State` 不內嵌 analysis/window/synthesis 緩衝，TIME 另 carve 輸出 hop staging 與分析用的 `AcStft`
-（16,480 B），FREQ 只多 carve 雙輸入入口的第二組 staging（`apply_re`/`apply_im`）。合成用的 `AcIstft`
-（出貨 1/1 為 12,384 B，借用 FFT handle 與窗表）是應用端的物件，兩個模式的 pool 都不含它；它不隨 D 變，
+（出貨 grid 16,480 B），FREQ 只多 carve 雙輸入入口的第二組 staging（`apply_re`/`apply_im`）。合成用的 `AcIstft`
+（出貨 1/1 與出貨 grid 為 12,384 B，32 kHz grid 6,240 B，16 kHz grid 3,168 B，借用 FFT handle 與窗表）是應用端的物件，兩個模式的 pool 都不含它；它不隨 D 變，
 所以各列的 TIME 欄都不含 `AcIstft`（Align-ULCNet／DeepVQE-S 的 ENV_NORM 合成：16 kHz grid 8,288 B、48 kHz grid 16,480 B）。
 
 ### 6.8 Framing：一 hop 一框的 analysis

@@ -38,6 +38,7 @@ th{background:#eef1f5}
 <a href="ainr_dfn2.html">DFN2</a>
 <a href="ainr_dfn2_detail.html"><b>DFN2 細節</b></a>
 <a href="ainr_dfn2_usage.html">DFN2 使用</a>
+<a href="ainr_dfn2_grids.html">DFN2 grid</a>
 <a href="ainr_dfn3.html">DFN3</a>
 <a href="ainr_dfn3_usage.html">DFN3 使用</a>
 <a href="ainr_gtcrn.html">GTCRN</a>
@@ -53,13 +54,13 @@ th{background:#eef1f5}
 
 <h3>記憶體與所有權</h3>
 <div class="tbl"><table>
-<tr><th>io_mode</th><th>pool(<code>get_mem_size</code>,出貨 pair)</th><th>說明</th></tr>
+<tr><th>io_mode</th><th>pool(<code>get_mem_size</code>,出貨 grid 與 pair)</th><th>說明</th></tr>
 <tr><td><code>DFN2_IO_TIME</code></td><td>233,936 bytes</td><td>hop 進、hop 出;分析 framing 由本類別做(pool 內一個 <code>AcStft</code>),transform 呼叫<b>呼叫端的</b> FftHandle;合成是<b>應用端的 <code>AcIstft</code></b>(<code>cfg.istft</code>,borrowed),<code>frame_commit</code> 對它 push、<code>reset</code> 一併清它</td></tr>
 <tr><td><code>DFN2_IO_FREQ</code></td><td>219,536 bytes</td><td>頻譜進、頻譜出,不做 transform,不 carve 任何 framing 物件;<code>fft</code> 可為 NULL</td></tr>
 </table></div>
 <ul>
-<li><b>FREQ 比 TIME 小 14,400 bytes</b>:<code>DFN2State</code> 不內嵌 analysis/window/synthesis 緩衝
-與 scratch,TIME 的輸出 hop staging 與 <code>AcStft</code>（16,480 B,含窗表）只在 TIME carve(合成的 <code>AcIstft</code>,出貨 pair 12,384 B,是應用端的物件,兩個模式的 pool 都不含);FREQ 多 carve 雙輸入的第二組 staging
+<li><b>FREQ 比 TIME 小 14,400 bytes</b>(出貨 grid):<code>DFN2State</code> 不內嵌 analysis/window/synthesis 緩衝
+與 scratch,TIME 的輸出 hop staging 與 <code>AcStft</code>（16,480 B,含窗表）只在 TIME carve(合成的 <code>AcIstft</code>,出貨 grid 12,384 B,是應用端的物件,兩個模式的 pool 都不含);FREQ 多 carve 雙輸入的第二組 staging
 (<code>app_re</code>/<code>app_im</code>)。io_mode 是 pool 的身分,init-time 固定,由 <code>_init_ex</code> 檢查。</li>
 <li><b><code>DFN2_PREPOST_CARVE_VERSION = 8</code></b>(<code>dfn2_prepost.h</code>):carve 走訪順序的版本,
 摺進 <code>build_flags_hash</code>,所以其他 carve 版本的 pool 會在 <b>hash</b> 被拒。pool 內容：遞迴 state 為 5 列 <code>h_gru</code> 與 5 幀 pathway window(graph layout 8)；STFT 物件借用呼叫端的 <code>FftHandle</code> 與視窗表;ISTFT 物件整個在 pool 之外(應用端的 <code>AcIstft</code>)。任何 pool 大小、切分順序或 descriptor 內容的變更都會 bump 這個版本。</li>
@@ -79,7 +80,7 @@ NULL 時由分析物件在 pool 內自帶 sqrt-Hann 表。應用端的 <code>AcI
 <li><b>FftHandle 與 ERB 矩陣是借用的</b>,從不建立或銷毀。ERB 矩陣<b>兩個模式都必填</b>,<code>fft</code> 只有 TIME 需要。</li>
 <li>32-byte <code>DFN2PrepostMemReq</code> 七欄:<code>descriptor_version</code>(=1)、<code>layout_version</code>
 (<code>DFN2_MODEL_IO_LAYOUT_VERSION</code>)、<code>io_mode</code>、<code>build_flags_hash</code>
-(FNV-1a-32 蓋 grid + geometry + feature version + io_mode)、<code>alignment</code>(16)、<code>reserved</code>、<code>bytes</code>。</li>
+(FNV-1a-32 蓋 grid + geometry + feature version + io_mode;非出貨 grid 另折入兩個 alpha 與五個正規化起點共 7 個 float,出貨 grid 的 hash 不變)、<code>alignment</code>(16)、<code>reserved</code>、<code>bytes</code>。</li>
 </ul>
 
 <h3>加速器 callback 邊界:<code>DFN2Model</code></h3>
@@ -163,6 +164,7 @@ make -C AINR -s print-lib-path   # 印出本組態的 archive 絕對路徑</pre>
 <li>成員 = <code>dfn2_process.o</code>、<code>dfn2_model_io.o</code>、<code>dfn2_prepost.o</code>、
 <code>dfn3_process.o</code>、<code>dfn3_model_io.o</code>、<code>dfn3_prepost.o</code>、<code>gtcrn_process.o</code>。<b>RNNoise-ERB 不在裡面</b>(它有自己的 Makefile、沒有 archive)。
 <code>WERROR=1</code> 會傳到 compiler 並進組態簽章。對應的 AIAEC archive 是 <code>libaiaec_prepost.a</code>。</li>
+<li><b>grid</b>:不帶旗標是出貨 grid(48 kHz／1024)。其他 grid 以 <code>-DDFN2_GRID_KHZ=16|32|48</code> 或外部定義的巨集(<code>DFN2_SR</code>、<code>DFN2_N_FFT</code>、<code>DFN2_N_ERB</code>、<code>DFN2_DF_BINS</code>、兩個 alpha)選擇,與 pair 一樣要加在<b>每一個</b>編譯單元;不同 grid 的目標檔連結失敗(variant 符號附 <code>_s&lt;sr&gt;_f&lt;n_fft&gt;_e&lt;n_erb&gt;_d&lt;df_bins&gt;</code>)。完整規則、各 grid 的大小與限制見 <a href="ainr_dfn2_grids.html">ainr_dfn2_grids</a>。</li>
 <li>兩支 DFN2 pipeline<b>不</b>連這個 archive:<code>pipelines/Makefile</code> 直接把三個 DFN2 TU 編進
 <code>libaudio_pipeline_dfn.a</code>（<code>pipelines/</code> 建置）或 <code>libdfn_res_stage.a</code>（<code>4ch_aec_bf_nr_res/</code> 建置）。</li>
 </ul>
@@ -182,7 +184,7 @@ make -C AINR -s print-lib-path   # 印出本組態的 archive 絕對路徑</pre>
 <ul>
 <li>C 前後處理類別:<code>AINR/DeepFilterNet2/dfn2_prepost.c</code> / <code>.h</code>、<code>AINR/DeepFilterNet2/dfn2_model_io.c</code> / <code>.h</code>;完整清單見 <a href="ainr_dfn2.html">ainr_dfn2</a>。</li>
 <li>host 消費者:<code>pipelines/dfn/dfn_res_stage.c</code>、<code>pipelines/Makefile</code></li>
-<li>C 測試:<code>AINR/tests/test_c_prepost.c</code>(<code>test_dfn_erb_spans_exact</code>)</li>
+<li>C 測試:<code>AINR/tests/test_c_prepost.c</code>(<code>test_dfn_erb_spans_exact</code>);grid:<code>AINR/tests/test_dfn2_grid.py</code></li>
 </ul>
 </body>
 </html>

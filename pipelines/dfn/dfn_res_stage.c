@@ -1,5 +1,5 @@
 /* Post-RES DeepFilterNet2 stage; see dfn_res_stage.h for the signal/timing
- * contract. Both inputs are spectra on DFN2's 48 kHz / 1024 / 512 grid; the
+ * contract. Both inputs are spectra on DFN2's grid (dfn2_grid.h); the
  * hosting pipeline owns synthesis. */
 
 #include <math.h>

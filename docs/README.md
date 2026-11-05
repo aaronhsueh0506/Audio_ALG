@@ -58,13 +58,14 @@ per-stage timing detail in `pipeline_4ch_detail.html`), `pipeline_ulcnet_mono.ht
 variants (shared entry-point, rate-bridge and test detail in
 `pipeline_dfn_detail.html`, with `pipeline_dfn_usage.html`, `pipeline_dfn_sequence.html` and
 `pipeline_dfn_params.html`; the host runs at the product rate -- mono 8/16/48 kHz, 4ch 16/48 kHz,
-16 kHz by default -- and only the DFN2 stage runs at 48 kHz / 1024 / 512,
+16 kHz by default -- and, as shipped, only the DFN2 stage runs at 48 kHz / 1024 / 512
+(the DFN2 grid is a build setting, see `ainr_dfn2_grids.html`),
 reached through `pipelines/dfn/dfn_rate_bridge.{h,c}`; the shared post-RES stage
 `pipelines/dfn/dfn_res_stage.{h,c}` estimates the model from the pre-RES spectrum
 and applies it to the post-RES one; the stage is built for one DFN2 lookahead pair, `DFN2_MASK_LOOKAHEAD` /
 `DFN2_DF_LOOKAHEAD` make variables with default 1/1, and every delay figure on these pages is for that
 shipped pair). Model pages: `ainr_dfn2.html` (pool, callback and build detail in
-`ainr_dfn2_detail.html`), `ainr_dfn3.html`, `ainr_gtcrn.html`, `ainr_rnnoise_erb.html`, each with a
+`ainr_dfn2_detail.html`; the build-time grid choice and its limits in `ainr_dfn2_grids.html`), `ainr_dfn3.html`, `ainr_gtcrn.html`, `ainr_rnnoise_erb.html`, each with a
 usage page (`ainr_dfn2_usage.html`, `ainr_dfn3_usage.html`, `ainr_gtcrn_usage.html`,
 `ainr_rnnoise_erb_usage.html`), and the four AIAEC pages `aiaec_align_ulcnet.html`,
 `aiaec_align_cruse.html`, `aiaec_deepvqe_s.html` and `aiaec_cagcrn.html`, each with a usage page

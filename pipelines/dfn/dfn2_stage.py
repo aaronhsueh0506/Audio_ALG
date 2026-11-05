@@ -57,7 +57,7 @@ _ROOT = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__
 _AINR_DIR = os.path.join(_ROOT, 'AINR')
 _DFN2_DIR = os.path.join(_AINR_DIR, 'DeepFilterNet2')
 
-# Grid and geometry pinned by the model contract (config.ini / dfn2_process.h).
+# Grid and geometry pinned by the model contract (config.ini / dfn2_grid.h).
 SAMPLE_RATE = 48000
 N_FFT = 1024
 HOP = 512

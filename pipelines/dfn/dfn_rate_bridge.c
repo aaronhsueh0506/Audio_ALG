@@ -116,6 +116,10 @@ static int resolve(const DfnRateBridgeConfig *cfg, Resolved *r) {
     size_t value;
     /* added_delay depends on the lookahead pair, which must be dfn2_process.o's. */
     DFN2_REQUIRE_LOOKAHEAD_PAIR_LINK();
+    /* The resampling ratios, the per-hop inference schedule, the prefill calibration and the
+     * delay arithmetic are written for a stage on DFN2's shipped 48 kHz grid. A build whose
+     * model is on another grid refuses instead of running them against it. */
+    if (DFN2_SR != 48000 || DFN2_N_FFT != 1024) return -1;
     if (!cfg || !r || grid_dims(cfg->sample_rate, cfg->fft_size,
                                 &r->fft_n, &r->hop_n) != 0)
         return -1;

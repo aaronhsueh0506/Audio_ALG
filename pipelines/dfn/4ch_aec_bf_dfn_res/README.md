@@ -121,7 +121,7 @@ current model-v6/feature-v5.
 ## Calling sequence and parameters
 
 ```
-App          McabSampleFlow + Mcab   McabSampleBeam   libaec AecRes   DfnHop + DfnResStage | DfnRateBridge   AcIstft (48 kHz only)
+App          McabSampleFlow + Mcab   McabSampleBeam   libaec AecRes   DfnHop + DfnResStage | DfnRateBridge   AcIstft (DFN2 grid rate; 48 kHz as shipped)
  |-- mcab_default_config; mcab_get_mem_requirements / _breakdown; mcab_sample_flow_get_mem_size / _init -->|
  |-- mcab_sample_beam_default_params; mcab_sample_beam_get_mem_size / _init(flow) -->|
  |-- aec_config_from_level (fft_size = mcab_get_mem_breakdown().fft_size); aec_res_get_mem_size; aec_res_init -->|

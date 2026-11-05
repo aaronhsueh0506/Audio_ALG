@@ -11,8 +11,8 @@
  * With L = DFN2_MASK_LOOKAHEAD and D = DFN2_DF_LOOKAHEAD, pre_process returns 0
  * on the first L hops (the graph window [t-(2-L) .. t+L] is not complete yet;
  * do not run the accelerator) and 1 afterwards. Latency is 1 + L + D hops: one
- * of framing plus L + D of model lookahead (3 hops, 1536 samples, 32 ms at
- * 48 kHz for the shipped L = D = 1); post_process reports written = 0 for the
+ * of framing plus L + D of model lookahead (3 hops, 1536 samples, 32 ms on the
+ * shipped 48 kHz grid for L = D = 1); post_process reports written = 0 for the
  * first L + D hops. Flush the tail with L + D more zero hops and run the
  * accelerator on them. L and D are build-time constants (dfn2_process.h) and
  * must equal the pair the graph was trained and exported for.

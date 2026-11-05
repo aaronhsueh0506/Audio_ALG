@@ -82,8 +82,8 @@ of `aec_process()` (audiolib's default window against the AEC's table; observed 
 the event or clears one hop late fails both gates.
 
 The host runs on the product's own grid: 16 kHz (fft 256, hop 128) by
-default, 16 kHz/512 and 8 kHz/256 as the host offers them, or 48 kHz. Only
-the DFN2 stage runs at 48 kHz. At 48 kHz the host's spectra are DFN2's grid
+default, 16 kHz/512 and 8 kHz/256 as the host offers them, or 48 kHz. As shipped, only
+the DFN2 stage runs at 48 kHz (the DFN2 grid is a build setting, see "DFN2 grid" below). At 48 kHz the host's spectra are DFN2's grid
 and the stage is applied directly (algorithmic latency L + 1 hops: L model
 lookahead hops plus one synthesis-WOLA hop; three hops, 32 ms, for the shipped pair). Below 48 kHz the rate
 bridge (`pipelines/dfn/dfn_rate_bridge.h`) synthesises E and P on the native
@@ -100,6 +100,16 @@ schedule (16 kHz/hop 128: 0,1,1,1 frames; 16 kHz/hop 256 and 8 kHz: 1,2), so
 two inferences in one hop is a real per-hop compute fact. The Python reference
 `pipelines/dfn/mono_aec_dfn_res/pipeline.py` mirrors both paths (16 and 48 kHz
 hosts); its stage reads the pair from the model.
+
+DFN2 grid. The signal grid of DFN2 itself (rate / FFT / hop) is chosen when the library is built
+(`-DDFN2_GRID_KHZ=16|32|48`, default and shipped 48; see [`AINR/DeepFilterNet2/README.md`](../../../AINR/DeepFilterNet2/README.md)).
+The stage takes its rate and FFT size from that build (`DFN2_SR` / `DFN2_N_FFT`) and its input and output scales
+(`DFN_RES_STAGE_IN_SCALE` / `_OUT_SCALE`, 1/sqrt(n_fft) and its inverse) from it too. A host at the DFN2 rate needs no
+bridge: built with `-DDFN2_GRID_KHZ=16`, a 16 kHz host runs straight through the stage (hop 128, algorithmic latency 384
+samples, pool 558,384 B), against 800 samples and 717,984 B for the shipped 48 kHz build with the same 16 kHz host
+through the bridge. The bridge exists only for the shipped 48 kHz / 1024 model (its `resolve()` returns -1 on any other
+grid) and its hosts stay 8 kHz and 16 kHz, so the 16 kHz build refuses hosts of 8000 and 48000. This directory's tests and
+the Python reference cover the shipped grid only.
 
 Lookahead pair. The DFN2 mask and deep-filter lookaheads M (0..2) and D (0..4) are a build setting of this
 example (`DFN2_MASK_LOOKAHEAD` / `DFN2_DF_LOOKAHEAD`, default 1/1) and must equal the pair the model was
@@ -138,9 +148,9 @@ detectable.
 ## Calling sequence and parameters
 
 ```
-App                 Aec           DfnHop + DfnResStage | DfnRateBridge      AcIstft (48 kHz only)
+App                 Aec           DfnHop + DfnResStage | DfnRateBridge      AcIstft (DFN2 grid rate; 48 kHz as shipped)
  |-- aec_resolve_signal_grid; aec_config_from_level; aec_get_mem_size / aec_init -->|
- |-- dfn_res_stage_get_mem_requirements / dfn_res_stage_init_ex            (48 kHz host)
+ |-- dfn_res_stage_get_mem_requirements / dfn_res_stage_init_ex            (host at the DFN2 rate: 48 kHz as shipped)
  |   or dfn_rate_bridge_get_mem_requirements / dfn_rate_bridge_init_ex     (8 / 16 kHz host)
  |-- dfn_hop_init_stage(...) or dfn_hop_init_bridge(...)
  |   per hop: aec_process_context --> follow_post_reset --> aec_get_res_context / aec_get_output_base
@@ -157,7 +167,7 @@ External parameters (board-skeleton command line, `dfn/dfn_example_args.h`): `--
 fail-open smoke only), `--atten-lim` (dB, 0 = unlimited; `dfn_res_stage_set_atten_lim()` between hops),
 `--cng` (comfort noise, off by default). An option followed by another `--` option, or by the end of the line, has no value and the
 program exits with code 2; a file named `--x` is written `./--x`. Strength of the RES gain: `aec_set_level()`. Internal: the
-stage grid (48 kHz / 1024 / 512 only), the `DFN_RES_STAGE_IN_SCALE` / `_OUT_SCALE` powers of two, the rate
+stage grid (the build's DFN2 grid; 48 kHz / 1024 / 512 as shipped), the `DFN_RES_STAGE_IN_SCALE` / `_OUT_SCALE` scales (2^-5 / 2^5 on the shipped grid), the rate
 bridge's FIR resamplers and frame schedule, the AEC and DFN2 model constants. Public functions are the
 `dfn_res_stage_*`, `dfn_rate_bridge_*` of `dfn_res_stage.h` / `dfn_rate_bridge.h` and the
 `dfn_hop_*` of `dfn/dfn_hop.h`; the stage and the bridge carry 32-byte descriptors

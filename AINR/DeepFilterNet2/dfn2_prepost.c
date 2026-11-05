@@ -163,6 +163,24 @@ static uint32_t pp_build_hash(int io_mode) {
     h = pp_fnv1a_u32(h, (uint32_t)DFN2_MODEL_DF_PATHWAY_WINDOW);
     h = pp_fnv1a_str(h, DFN2_FEATURE_VERSION);
     h = pp_fnv1a_u32(h, (uint32_t)io_mode);
+#if !DFN2_GRID_IS_SHIPPED
+    {
+        /* Folded for every grid but the shipped one, so that one's pool identity is
+         * unchanged: models on the same integers that differ in tau or in the
+         * normaliser starting points are not interchangeable. */
+        const float tuning[] = {
+            DFN2_ERB_NORM_ALPHA, DFN2_SPEC_NORM_ALPHA,
+            DFN2_ERB_NORM_INIT_LO_DB, DFN2_ERB_NORM_INIT_HI_DB, DFN2_ERB_NORM_SCALE_DB,
+            DFN2_SPEC_NORM_INIT_LO, DFN2_SPEC_NORM_INIT_HI,
+        };
+        size_t i;
+        for (i = 0; i < sizeof tuning / sizeof tuning[0]; ++i) {
+            uint32_t bits;
+            memcpy(&bits, &tuning[i], sizeof bits);
+            h = pp_fnv1a_u32(h, bits);
+        }
+    }
+#endif
 #if PP_FRAMES != 1
     /* Folded only for N > 1, so the one-frame pool identity is unchanged. */
     h = pp_fnv1a_u32(h, (uint32_t)PP_FRAMES);

@@ -1,7 +1,7 @@
-/* Post-RES DeepFilterNet2 stage shared by the mono and 4-channel "AEC + RES + DFN2" pipelines. One hop in, one spectrum out: A = E * 2^-5 (E: pre-RES spectrum the RES gain was estimated from), B = P * 2^-5 (P: post-RES spectrum, E * G_res + comfort noise), heads = DFN2(estimated on A), Y = compose(heads, applied on B), out = Y * 2^5. The model estimates from the pre-RES spectrum and applies to the post-RES one; with the comfort-noise fill off E and P share phase, so the deep-filter taps fitted on A apply to B (the hosting pipelines keep the fill off by default).
+/* Post-RES DeepFilterNet2 stage shared by the mono and 4-channel "AEC + RES + DFN2" pipelines. One hop in, one spectrum out: A = E * DFN_RES_STAGE_IN_SCALE (E: pre-RES spectrum the RES gain was estimated from), B = P * DFN_RES_STAGE_IN_SCALE (P: post-RES spectrum, E * G_res + comfort noise), heads = DFN2(estimated on A), Y = compose(heads, applied on B), out = Y * DFN_RES_STAGE_OUT_SCALE. The model estimates from the pre-RES spectrum and applies to the post-RES one; with the comfort-noise fill off E and P share phase, so the deep-filter taps fitted on A apply to B (the hosting pipelines keep the fill off by default).
  * Timing: the emitted spectrum belongs to source frame t - L, L = DFN_RES_STAGE_LOOKAHEAD_FRAMES (DFN2_MASK_LOOKAHEAD + DFN2_DF_LOOKAHEAD, 2 for the shipped 1/1 pair); the first L hops return 0 with an all-zero spectrum, so the caller synthesises unconditionally.
  * Fail-open: no model (model.infer == NULL), a nonzero infer() result or an unwritten/non-finite output takes the frame as an identity through the cascade (clocks advance, recurrent state unchanged); the output is P delayed by L hops.
- * Reset: whole-pipeline resets only; an AEC delay change must not reset the stage. Grid: 48 kHz / 1024 / 512 only. Memory: static pool with the 32-byte descriptor; the DFN2 class pool and its hash are folded in; no heap after init, no stdio. */
+ * Reset: whole-pipeline resets only; an AEC delay change must not reset the stage. Grid: the build's DFN2 grid only (dfn2_grid.h; the shipped one is 48 kHz / 1024 / 512). Memory: static pool with the 32-byte descriptor; the DFN2 class pool and its hash are folded in; no heap after init, no stdio. */
 
 #ifndef DFN_RES_STAGE_H
 #define DFN_RES_STAGE_H
@@ -22,16 +22,18 @@ extern "C" {
 #define DFN_RES_STAGE_LAYOUT_VERSION     3u
 #define DFN_RES_STAGE_BACKEND_NE10       2u   /* id 1 is never returned */
 
-/* Audio-scale spectra <-> DFN2 normalized=True spectra (exact powers of two). */
-#define DFN_RES_STAGE_IN_SCALE  0x1p-5f
-#define DFN_RES_STAGE_OUT_SCALE 0x1p5f
+/* Audio-scale spectra <-> DFN2 normalized=True spectra: 1/sqrt(n_fft) and its inverse
+ * (dfn2_grid.h). Exact powers of two where n_fft is a power of four (256, 1024, 4096), correctly
+ * rounded floats elsewhere (512). */
+#define DFN_RES_STAGE_IN_SCALE  DFN2_NORMALIZED_STFT_SCALE
+#define DFN_RES_STAGE_OUT_SCALE DFN2_NORMALIZED_STFT_UNSCALE
 
 /* Frames the emitted spectrum trails the newest input by (the DFN2 cascade of the build's lookahead pair). */
 #define DFN_RES_STAGE_LOOKAHEAD_FRAMES (DFN2_MASK_LOOKAHEAD + DFN2_DF_LOOKAHEAD)
 
 typedef struct DfnResStageConfig {
-    int          sample_rate;   /* 48000 only                                */
-    int          fft_size;      /* 0 or 1024                                 */
+    int          sample_rate;   /* DFN2_SR only                              */
+    int          fft_size;      /* 0 or DFN2_N_FFT                           */
     float        atten_lim_db;  /* DFN2 attenuation limit; 0 = unlimited     */
     const float *erb_fwd;       /* borrowed, bin-major [DFN2_N_BINS][DFN2_N_ERB] */
     const float *erb_inv;       /* borrowed, band-major, partition of unity  */
@@ -53,10 +55,10 @@ _Static_assert(sizeof(DfnResStageMemReq) == 32,
 
 typedef struct DfnResStage DfnResStage;
 
-/* Defaults: 48 kHz, fft 1024, no attenuation limit, no matrices, identity model. */
+/* Defaults: the build's rate and fft, no attenuation limit, no matrices, identity model. */
 DfnResStageConfig dfn_res_stage_default_config(int sample_rate);
 
-/* Returns -1 on NULL, a rate other than 48000, an fft_size other than 0/1024, a missing ERB matrix, an erb_inv whose unit band mask does not expand to exactly 1.0f in every bin, a non-finite attenuation limit, a model that infers without a valid descriptor (dfn2_model_io_descriptor_validate()), or a build outside pipelines/Makefile. */
+/* Returns -1 on NULL, a rate other than DFN2_SR, an fft_size other than 0/DFN2_N_FFT, a missing ERB matrix, an erb_inv whose unit band mask does not expand to exactly 1.0f in every bin, a non-finite attenuation limit, a model that infers without a valid descriptor (dfn2_model_io_descriptor_validate()), or a build outside pipelines/Makefile. */
 int dfn_res_stage_get_mem_requirements(const DfnResStageConfig *cfg,
                                        DfnResStageMemReq *out);
 

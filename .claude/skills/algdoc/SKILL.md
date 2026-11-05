@@ -121,7 +121,8 @@ Audio_ALG 自有 pipelines/AINR/AIAEC）**：
   `pipeline_dfn_detail.html`（入口語意、rate bridge 與測試內容）、
   `pipeline_dfn_usage.html`、`pipeline_dfn_sequence.html`、`pipeline_dfn_params.html`
 - AINR：`ainr_dfn2.html`、`ainr_dfn2_detail.html`（pool、callback 邊界、建置）、
-  `ainr_dfn2_usage.html`、`ainr_dfn3.html`、`ainr_dfn3_usage.html`、`ainr_gtcrn.html`、
+  `ainr_dfn2_usage.html`、`ainr_dfn2_grids.html`（建置時選 DFN2 grid、各 grid 的 pool 與限制）、
+  `ainr_dfn3.html`、`ainr_dfn3_usage.html`、`ainr_gtcrn.html`、
   `ainr_gtcrn_usage.html`、`ainr_rnnoise_erb.html`、`ainr_rnnoise_erb_usage.html`
 - AIAEC：`aiaec_align_ulcnet.html`、`aiaec_align_ulcnet_detail.html`（far branch、PTQ、
   layout 重匯出）、`aiaec_align_ulcnet_usage.html`、`aiaec_align_cruse.html`、

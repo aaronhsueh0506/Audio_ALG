@@ -36,7 +36,7 @@ serialised into every checkpoint (`make_checkpoint_contract`) and gated by
 | `seed` | 43 | 42 | all standalone NR trainers share one seed so their train/validation split stays stable (`tests/test_bakeoff_protocol.py::test_seed_defaults_match`) |
 | `mask_pf`, `pf_beta` | post-filter shipped off | DFN3's post-filter on the final complex spectrum after both stages, mask `\|spec_e\|/\|spec\|`, beta from config, not gated on `training`; off by default | the DFN2 form (an ERB-mask post-filter with a hardcoded beta) is not interchangeable |
 | `df_gru_skip = identity` assert | compares `emb_hidden_dim == df_hidden_dim` | compares `emb_in_dim == df_hidden` | upstream's guard passes and then fails to broadcast |
-| `n_erb` divisibility | asserts `% 8` | `validate_signal_config` checks `% 8` (the stride-2 stages would only need `% 4`) | one guard shared by the trainer and `inference.py` |
+| `n_erb` divisibility | asserts `% 8` | `validate_signal_config` checks `% 4`, what the two stride-2 stages need (20, 24, 28, 32, 36 build and run; 30 does not) | one guard shared by the trainer and `inference.py`; lets 28 bands serve a 32 kHz grid; the C library asks for the same `% 4` |
 | Streaming stage gating | the lsnr head lets the runtime skip the ERB/DF stages on clean or lightly-noisy frames | no head | a C/streaming port cannot reproduce that per-frame skipping |
 
 Added on top of upstream: a non-finite guard that halts on the first NaN/inf
@@ -114,9 +114,9 @@ Each item is a deliberate, verified divergence.
     `conv_kernel` (not `convt_kernel`) applies to them.
 13. **No lsnr head, no `[localsnrloss]`.** The 2,135,484 − 513 = 2,134,971
     reconciliation depends on its absence.
-14. **`validate_signal_config` is the one divisibility guard** (`n_erb % 8`);
+14. **`validate_signal_config` is the one divisibility guard** (`n_erb % 4`);
     `model.py` carries no equivalent assert. Enforced by
-    `test_n_erb_divisibility_follows_upstreams_stricter_rule`.
+    `test_n_erb_divisibility_is_the_architectures_own_rule`.
 
 ### Loss
 

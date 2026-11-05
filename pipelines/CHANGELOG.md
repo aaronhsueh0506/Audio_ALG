@@ -3,6 +3,25 @@
 `Audio_ALG/pipelines`（含它建置的 `AINR`、`AIAEC` C 程式）的重要改動記錄在此，格式依
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/)。README 只寫現況，改動經過寫在這裡。
 
+## [Unreleased] — 2026-11-05 — DFN2 stage scaling follows the build's grid; the rate bridge refuses a non-48 kHz model
+
+### Changed
+- `dfn/dfn_res_stage.h`: `DFN_RES_STAGE_IN_SCALE` / `_OUT_SCALE` are `DFN2_NORMALIZED_STFT_SCALE` / `DFN2_NORMALIZED_STFT_UNSCALE`
+  (AINR `dfn2_grid.h`: float32 of 1/sqrt(n_fft) and sqrt(n_fft)) instead of the literals `0x1p-5f` / `0x1p5f`. On the shipped
+  48 kHz / 1024 grid the values are the same (2^-5, 2^5), so the stage output does not change. The header comments now call the
+  grid "the build's DFN2 grid" (the shipped one is 48 kHz / 1024 / 512) and describe `sample_rate` / `fft_size` as `DFN2_SR` /
+  `DFN2_N_FFT`, which is what `dfn_res_stage.c` already compared against.
+- `dfn/dfn_rate_bridge.c`: `resolve()` returns -1 when `DFN2_SR != 48000` or `DFN2_N_FFT != 1024`. The resampling ratios, the per-hop
+  inference schedule, the prefill calibration and the delay arithmetic are written for a stage on the shipped 48 kHz grid, so a
+  bridge built against a DFN2 of another grid refuses instead of running them. The host side of the bridge is unchanged (8 kHz / fft
+  256, 16 kHz / fft 256, 16 kHz / fft 512).
+- The pipelines' tests and the Python twin (`dfn2_stage.py`) exercise the shipped grid only; a DFN2 built for another grid
+  (`-DDFN2_GRID_KHZ=16|32` or an external definition, see `AINR/CHANGELOG.md`) is not verified inside a pipeline.
+
+### Tests
+- No test added here; the grid itself is covered by `AINR/tests/test_dfn2_grid.py`. `make test`, `make test-pairs` and
+  `dfn/tests` pass unchanged.
+
 ## [Unreleased] — 2026-11-02 — NEON model kernels also run on 32-bit ARM
 
 ### Changed

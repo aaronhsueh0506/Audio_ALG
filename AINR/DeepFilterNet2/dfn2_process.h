@@ -32,20 +32,20 @@
 #include <stddef.h>
 #include <stdint.h>
 
-/* ---- Signal grid (= config.ini [signal]) ---- */
-#define DFN2_SR             48000
-#define DFN2_N_FFT          1024
-#define DFN2_N_BINS         513   /* N_FFT/2 + 1 */
-#define DFN2_WIN_LEN        1024  /* analysis window length (= N_FFT) */
-#define DFN2_HOP_LEN        512   /* hop (= WIN_LEN/2, COLA) */
-#define DFN2_OVL_LEN        (DFN2_WIN_LEN - DFN2_HOP_LEN)
+/* ---- Signal grid and model geometry (= config.ini [signal] / [model]) ----
+ * DFN2_SR, DFN2_N_FFT, DFN2_N_BINS, DFN2_WIN_LEN, DFN2_HOP_LEN, DFN2_OVL_LEN,
+ * DFN2_N_ERB, DFN2_DF_BINS, the two norm alphas and the analysis scale come from
+ * dfn2_grid.h: a built-in preset (-DDFN2_GRID_KHZ=16|32|48, 48 when nothing is
+ * chosen) or a grid defined by the build. The shipped 48 kHz grid is 1024/512, not
+ * 960/480 (960 is not a power of two), so its DF cutoff is 4500 Hz instead of
+ * 4800 Hz. */
+#include "dfn2_grid.h"
 
-/* The grid is 1024/512, not 960/480: 960 is not a power of two. The DF cutoff is
- * therefore 4500 Hz instead of 4800 Hz (config.ini [model] df_bins). */
-
-/* ---- Model geometry (= config.ini [model]) ---- */
-#define DFN2_N_ERB          32
-#define DFN2_DF_BINS        96    /* bins owned by the deep filter (0..95) */
+/* The deep filter has five taps: the graph's pathway window, the state layout and
+ * every ring depth are built for it, so it is not a build choice. */
+#ifdef DFN2_DF_ORDER
+#error "DFN2_DF_ORDER is fixed at 5 (the graph's pathway window and the state layout); it is not a grid choice"
+#endif
 #define DFN2_DF_ORDER       5     /* FIR taps */
 
 /* The lookahead pair is a model contract: it must equal config.ini [model]
@@ -127,11 +127,28 @@
 extern "C" {
 #endif
 /* The deep-filter variant is part of the link too: -DDFN2_MASK_ONLY changes the
- * state and boundary structs, so a unit built the other way must not link. */
+ * state and boundary structs, so a unit built the other way must not link. So is
+ * the grid: sizes, rings and tensors follow sr, n_fft, n_erb and df_bins, so a unit
+ * built for another grid than dfn2_process.c fails to link as well. The shipped
+ * grid (the 48 kHz preset of dfn2_grid.h) keeps the plain variant name; every other
+ * grid, a grid defined on the build line with the shipped integers included,
+ * appends _s<sr>_f<n_fft>_e<n_erb>_d<df_bins>. This needs the four to be plain
+ * decimal integers. Only the integers are in the symbol; the floats (alphas,
+ * normaliser starting points) are in the pre/post pool hash, which a pool of
+ * another grid fails to match. */
 #ifdef DFN2_MASK_ONLY
-#define DFN2_VARIANT_SYMBOL dfn2_variant_mask_only
+#define DFN2_VARIANT_NAME_ dfn2_variant_mask_only
 #else
-#define DFN2_VARIANT_SYMBOL dfn2_variant_full
+#define DFN2_VARIANT_NAME_ dfn2_variant_full
+#endif
+#define DFN2_GRID_SYMBOL_JOIN_(base, sr, fft, erb, df) base##_s##sr##_f##fft##_e##erb##_d##df
+#define DFN2_GRID_SYMBOL_JOIN(base, sr, fft, erb, df) \
+    DFN2_GRID_SYMBOL_JOIN_(base, sr, fft, erb, df)
+#if DFN2_GRID_IS_SHIPPED
+#define DFN2_VARIANT_SYMBOL DFN2_VARIANT_NAME_
+#else
+#define DFN2_VARIANT_SYMBOL DFN2_GRID_SYMBOL_JOIN(DFN2_VARIANT_NAME_, \
+    DFN2_SR, DFN2_N_FFT, DFN2_N_ERB, DFN2_DF_BINS)
 #endif
 extern const unsigned char DFN2_LOOKAHEAD_PAIR_SYMBOL;
 extern const unsigned char DFN2_VARIANT_SYMBOL;
@@ -147,31 +164,33 @@ extern const unsigned char DFN2_VARIANT_SYMBOL;
  * end are different contracts. */
 #define DFN2_FEATURE_VERSION  "dfn2_libdf_wnorm_upstream_init_no_eps_v5"
 
-/* alpha is derived, not configured: exp(-(hop/sr)/tau) rounded to 3 decimals
- * (train.py make_norm_alpha), tau = 1.0 s, hop 512 @ 48 kHz -> 0.989 (effective
- * tau 0.9644 s). Re-derive it if sr or hop change. */
-#define DFN2_ERB_NORM_ALPHA         0.989f
+/* The two EMA coefficients (DFN2_ERB_NORM_ALPHA, DFN2_SPEC_NORM_ALPHA) and the
+ * analysis scale (DFN2_ANALYSIS_SCALE) belong to the grid and are in dfn2_grid.h.
+ * The normaliser starting points below are libDF's own literals and are the same
+ * for every grid; a model trained with others defines them on the build line, and
+ * that build is not the shipped grid (dfn2_grid.h). */
+#ifndef DFN2_ERB_NORM_INIT_LO_DB
 #define DFN2_ERB_NORM_INIT_LO_DB  (-60.0f)   /* = libDF MEAN_NORM_INIT */
+#endif
+#ifndef DFN2_ERB_NORM_INIT_HI_DB
 #define DFN2_ERB_NORM_INIT_HI_DB  (-90.0f)
+#endif
+#ifndef DFN2_ERB_NORM_SCALE_DB
 #define DFN2_ERB_NORM_SCALE_DB      40.0f
+#endif
 #define DFN2_ERB_LOG_FLOOR          1e-10f   /* = libDF lib.rs literal */
 
 /* scale_db = |log floor - init_lo| (10*log10(1e-10) = -100 dB, |-100 - (-60)| =
  * 40), so numerically silent bands are bounded at exactly -1.00. The three
  * constants are mutually consistent; change them together. */
 
-#define DFN2_SPEC_NORM_ALPHA        0.989f
+#ifndef DFN2_SPEC_NORM_INIT_LO
 #define DFN2_SPEC_NORM_INIT_LO      0.001f   /* = libDF UNIT_NORM_INIT */
+#endif
+#ifndef DFN2_SPEC_NORM_INIT_HI
 #define DFN2_SPEC_NORM_INIT_HI      0.0001f
+#endif
 #define DFN2_SPEC_NORM_EPS          1e-12f   /* guards x/sqrt(0) where denormals flush to zero */
-
-/* libDF analysis scale: the reference multiplies the spectrum by
- * wnorm = 2*hop/win^2 (1/1024) while torch.stft(normalized=True) applies
- * 1/sqrt(n_fft) (1/32), leaving a residual of 1/32. It matters on the DF path
- * (band_unit_norm is x/sqrt(EMA|x|), so an input scale persists as sqrt(c)).
- * Applied only to the copy feeding the normalisers; the spectrum used for
- * masking and ISTFT keeps its scale. */
-#define DFN2_ANALYSIS_SCALE   0.03125f       /* = 2*512/1024^2 * sqrt(1024) */
 
 /* ---- State (caller-allocated, persists across frames) ---- */
 typedef struct {
@@ -240,7 +259,7 @@ typedef struct {
 } DFN2State;
 
 /* Config of the two framing objects, for ac_stft/ac_istft get_mem_size and init:
- * 1024-point sqrt-Hann, hop 512, no centering, torch normalized=True scaling
+ * DFN2_N_FFT-point sqrt-Hann, hop DFN2_HOP_LEN, no centering, torch normalized=True scaling
  * (analysis x N_FFT^-0.5, synthesis x N_FFT^+0.5). `fft` is a DFN2_N_FFT handle
  * shared by both objects; `window` is a shared DFN2_WIN_LEN table, or NULL for the
  * analysis object to carve one that the synthesis object borrows. Borrowed tables
@@ -303,7 +322,7 @@ int dfn2_compose(DFN2State *st,
  * pointers may be NULL.
  *
  * Because of the cascade, a valid output corresponds to
- * current_frame - MASK_LOOKAHEAD - DF_LOOKAHEAD (2 hops = 21.33 ms at 48 kHz for
+ * current_frame - MASK_LOOKAHEAD - DF_LOOKAHEAD (2 hops = 21.33 ms at the shipped 48 kHz grid for
  * the shipped 1/1, plus the STFT framing). output_frame_index may be NULL;
  * otherwise it reports the frame id of out.
  *
