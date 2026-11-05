@@ -105,7 +105,7 @@ framing、特徵前後端、recurrent ring／state buffer。整合者不需自�
 四個類別的 API 形狀相同，只是前綴 <code>&lt;pfx&gt;</code> 不同（<code>ulcnet</code> /
 <code>deepvqe</code> / <code>dfn2</code> / <code>dfn3</code>）：</p>
 
-<pre>&lt;pfx&gt;_config_defaults(&amp;cfg, io_mode[, delay_depth]);   /* 本 build 的 grid 預設值 */
+<pre>&lt;pfx&gt;_config_defaults(&amp;cfg, io_mode[, delay_depth]);   /* 本 build 的 grid 預設值；DFN2 另收 &amp;grid（執行期給定） */
 &lt;pfx&gt;_get_mem_size(&amp;cfg, &amp;req);                       /* reject-first：壞參數時 req 不動 */
 &lt;pfx&gt;_init(pool, bytes, &amp;cfg) | _init_ex(pool, bytes, &amp;cfg, &amp;expected) | _create(&amp;cfg)
 每 hop：

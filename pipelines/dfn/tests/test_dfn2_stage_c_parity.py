@@ -38,12 +38,17 @@ DFN = ROOT / 'AINR' / 'DeepFilterNet2'
 
 _SHIM = r'''
 #include <stdlib.h>
-#include "dfn2_process.h"
+#include "dfn_test_grid.h"
 
+/* The grid is the test scaffolding's (dfn/tests/dfn_test_grid.h): the pair comes from the -D
+ * overrides the build gives, the rest is the shipped 48 kHz grid. */
 void *stage_parity_create(const float *fwd, const float *inv) {
     DFN2State *state = (DFN2State *)calloc(1, sizeof(*state));
     if (!state) return NULL;
-    dfn2_state_init(state, NULL, NULL);
+    if (dfn2_state_init(state, dfn_test_grid(), NULL, NULL) != 0) {
+        free(state);
+        return NULL;
+    }
     dfn2_set_erb_matrices(state, fwd, inv);
     return state;
 }
@@ -82,7 +87,8 @@ def assets(pair, tmp_path_factory):
 @pytest.fixture(scope='module')
 def c_lib(pair, tmp_path_factory):
     lib = build_shim(tmp_path_factory.mktemp('dfn2_stage_c_parity'), 'shim', _SHIM,
-                     extra_sources=[DFN / 'dfn2_process.c'], extra_includes=[DFN],
+                     extra_sources=[DFN / 'dfn2_process.c'],
+                     extra_includes=[DFN, ROOT / 'pipelines' / 'dfn' / 'tests'],
                      defines=pair_defines(pair))
     fp = ctypes.POINTER(ctypes.c_float)
     lib.stage_parity_create.argtypes = [fp, fp]

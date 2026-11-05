@@ -4,7 +4,7 @@
  * wired as dfn/4ch_aec_bf_dfn_res/main.c wires them.
  * 48 kHz: with the identity model the composition equals the hand-written conventional chain with
  * the denoiser off (tests/conv_chain_mcab.h, its own front end and AecRes, fed the unit's beam
- * weights and beamformed spectrum), delayed by exactly DFN_RES_STAGE_LOOKAHEAD_FRAMES hops (two for
+ * weights and beamformed spectrum), delayed by exactly DFN_TEST_LOOKAHEAD_FRAMES hops (two for
  * the shipped 1/1 pair), byte for byte, with comfort noise
  * OFF and ON.
  * The stimulus is a 384-sample echo under the shared matched delay estimator; the test asserts
@@ -39,7 +39,7 @@ static float far_tones[TEST_FRAMES * 4 * 256];
 static float conventional_out[TEST_FRAMES][DFN2_HOP_LEN];
 
 static void make_partition(void) {
-    dfn_unit_partition(erb_fwd, erb_inv);
+    dfn_unit_partition(erb_fwd, erb_inv, dfn_test_grid());
 }
 
 static void make_far(void) {
@@ -145,7 +145,7 @@ static FourDfn *fdfn_create(int sample_rate, int fft_size, int enable_cng, const
                             int bf_enable) {
     FourDfn *m = (FourDfn *)calloc(1, sizeof(*m));
     McabTestUnitConfig ucfg = unit_config(sample_rate, fft_size);
-    DfnResStageConfig stage_cfg = dfn_res_stage_default_config(DFN2_SR);
+    DfnResStageConfig stage_cfg = dfn_res_stage_default_config(dfn_test_grid());
     AecConfig res_cfg;
     size_t vec, res_bytes;
     int n_freqs, k;
@@ -184,7 +184,7 @@ static FourDfn *fdfn_create(int sample_rate, int fft_size, int enable_cng, const
     stage_cfg.erb_inv = erb_inv;
     if (model) stage_cfg.model = *model;
     if (sample_rate != DFN2_SR) {
-        DfnRateBridgeConfig bc = dfn_rate_bridge_default_config(sample_rate);
+        DfnRateBridgeConfig bc = dfn_rate_bridge_default_config(sample_rate, dfn_test_grid());
         bc.fft_size = fft_size;
         bc.stage = stage_cfg;
         m->bridge = dfn_rate_bridge_create(&bc);
@@ -293,10 +293,10 @@ static int run_identity(int enable_cng) {
                      conventional_out[frame]) != 0)
             return 200 + frame;
         for (i = 0; i < DFN2_HOP_LEN; ++i) {
-            float expected = frame < DFN_RES_STAGE_LOOKAHEAD_FRAMES
-                ? 0.0f : conventional_out[frame - DFN_RES_STAGE_LOOKAHEAD_FRAMES][i];
+            float expected = frame < DFN_TEST_LOOKAHEAD_FRAMES
+                ? 0.0f : conventional_out[frame - DFN_TEST_LOOKAHEAD_FRAMES][i];
             if (dfn_out[i] != expected) return 300 + frame;
-            if (frame >= DFN_RES_STAGE_LOOKAHEAD_FRAMES && expected != 0.0f) any = 1;
+            if (frame >= DFN_TEST_LOOKAHEAD_FRAMES && expected != 0.0f) any = 1;
         }
         nonzero_hops += any;
     }
@@ -571,7 +571,7 @@ static int run_phased(int sample_rate, int fft_size, int behaviour) {
     DfnResStageJob job;
     int hop, frame, i, ch, r, nonzero = 0, ran = 0, frames = 80;
 
-    if (dfn2_model_io_descriptor_default(&descriptor) != 0) return 1;
+    if (dfn2_model_io_descriptor_default(dfn_test_grid(), &descriptor) != 0) return 1;
     memset(&cb_model, 0, sizeof(cb_model));
     if (behaviour == BP_RUN) {
         cb_model.infer = dfn_fixture_half_mask_infer;
@@ -618,7 +618,7 @@ static int run_phased(int sample_rate, int fft_size, int behaviour) {
 
 int main(void) {
     int rc, cng;
-    DFN2_REQUIRE_LOOKAHEAD_PAIR_LINK();   /* this unit's lookahead pair is the archive's */
+    DFN2_REQUIRE_VARIANT_LINK();   /* this unit's DFN2 capacities are the archive's */
     make_partition();
     make_far();
     rc = run_rejections();

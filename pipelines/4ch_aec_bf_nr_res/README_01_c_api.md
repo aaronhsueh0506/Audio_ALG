@@ -256,7 +256,7 @@ make test_mcab_sample_beam # build only the sample beam helper test
 make test_4ch_dfn test_4ch_ulcnet   # the DFN2 / Align-ULCNet compositions
 make 4ch_alignulcnet       # the Align-ULCNet board skeleton
 make 4ch_aec_bf_dfn_res    # the DFN2 composition example
-make 4ch_aec_bf_dfn_res DFN2_MASK_LOOKAHEAD=2 DFN2_DF_LOOKAHEAD=4   # another DFN2 lookahead pair
+make test_4ch_dfn DFN2_MASK_LOOKAHEAD=2 DFN2_DF_LOOKAHEAD=4   # the DFN2 composition test at another lookahead pair
 make test                  # audiolib's tests, then the 4ch tests and example smoke runs (see the Makefile)
 make NO_STDIO=1 audit-no-stdio
 
@@ -269,9 +269,11 @@ make NO_STDIO=1 audit-no-stdio
 "$(make -s print-bin-dir)/mcab_static" --print-mem-size --sample-rate 48000
 ```
 
-`DFN2_MASK_LOOKAHEAD` (0..2) and `DFN2_DF_LOOKAHEAD` (0..4) default to the shipped pair 1/1; a different pair is passed
-as `-D` flags to every unit this Makefile compiles and is part of the build signature, so pairs never share an object
-directory. Only the 1/1 pair has a trained checkpoint, and the audio quality of the other pairs is not measured.
+`DFN2_MASK_LOOKAHEAD` (0..2) and `DFN2_DF_LOOKAHEAD` (0..4) default to the shipped pair 1/1. The DFN2 stage, the bridge and the
+example main hold no pair (the application puts a `DFN2Grid` in `DfnResStageConfig.grid`; the main reads it from `--ai-sample-rate` /
+`--ai-fft-size`), so a different pair is passed as `-D` flags to the test unit `test_4ch_dfn` alone, and only `-DDFN2_MAX_DF_RING=<ring>`
+for a state ring deeper than 5 (1/4, 2/3, 2/4) goes to every unit. The pair is part of the build signature, so pairs never share an
+object directory. Only the 1/1 pair has a trained checkpoint, and the audio quality of the other pairs is not measured.
 
 `libaudio_pipeline_mcab.a` contains `mcab.o` (the flow) only. The sample objects (`mcab_sample_flow.o`,
 `mcab_sample_beam.o`, `mcab_sample_driver.o`), the example chain headers and the ULCNet stage object

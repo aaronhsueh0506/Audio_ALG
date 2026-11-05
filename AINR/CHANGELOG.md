@@ -2,51 +2,87 @@
 
 ## Unreleased
 
-### DFN2 grid chosen at build time (`dfn2_grid.h`)
+### DFN2 grid is a run-time value (`DFN2Grid`, `dfn2_grid.h`)
 
+- The DFN2 C library holds no grid. `DeepFilterNet2/dfn2_grid.h` defines `DFN2Grid` (`sample_rate n_fft hop n_bins n_erb df_bins
+  mask_lookahead df_lookahead df_history ring erb_norm_alpha spec_norm_alpha stft_scale stft_unscale`) and
+  `dfn2_grid_make(&grid, sr, n_fft, n_erb, df_bins, mask_lookahead, df_lookahead)`: the application builds the grid from the six
+  values its trained model fixes and passes it to every object it creates, so one binary runs any grid within the compile-time
+  capacities. Also new: `dfn2_grid_validate()`, `dfn2_norm_alpha(sr, hop, tau)` and `dfn2_grid_status_text()`.
+- The macros the library used to carry are gone: `DFN2_SR`, `_N_FFT`, `_N_BINS`, `_WIN_LEN`, `_HOP_LEN`, `_OVL_LEN`, `_N_ERB`,
+  `_DF_BINS`, `_ERB_NORM_ALPHA`, `_SPEC_NORM_ALPHA`, `_ANALYSIS_SCALE`, `_NORMALIZED_STFT_SCALE` / `_UNSCALE`, `_MASK_LOOKAHEAD`,
+  `_DF_LOOKAHEAD`, `_DF_RING*`, `_DF_HISTORY`, `_GRID_KHZ`, `_GRID_IS_SHIPPED`, `_GRID_HEADER`. They are fields of `DFN2Grid`. Product
+  code (the library, the pipeline objects, the example mains, the board samples) has no build-time way to choose a grid: it takes the
+  `DFN2Grid` from its caller or builds one with `dfn2_grid_make()`. The presets (`-DDFN2_GRID_KHZ=16|32|48`) and the explicit selectors
+  live only in the two test headers (`AINR/tests/dfn2_test_grid.h`, `pipelines/dfn/tests/dfn_test_grid.h`), which give the test programs
+  the macros for their fixed arrays and a `const DFN2Grid *`.
+- Derived by formula: `hop` = n_fft/2, `n_bins` = n_fft/2 + 1, `stft_scale` / `stft_unscale` = float32 1/sqrt(n_fft) and sqrt(n_fft),
+  both alphas = `train.py` `make_norm_alpha(sr, hop, tau = 1.0)` (a model trained with another tau overwrites the two fields),
+  `df_history` = `DF_ORDER` - df_lookahead - 1, `ring` = max(`DF_ORDER`, mask + df + 1) (mask-only mask + 1). Validity: sr > 0; n_fft a
+  power of two in [16, 8192]; n_erb a positive multiple of 4 with `2 * n_erb <= n_bins` (checked without overflow: `n_erb` 1 << 30 and
+  0x7ffffffc are refused cleanly, UBSan included); df_bins in [2, n_bins) (up to n_bins mask-only); mask_lookahead in [0, 2];
+  df_lookahead in [0, `DF_ORDER` - 1] (0 mask-only); sizes within the capacities. A sample rate whose norm alpha is not strictly between
+  0 and 1 is refused with `DFN2_GRID_ERR_SAMPLE_RATE`, so what `dfn2_grid_make()` accepts `dfn2_grid_validate()` accepts. Status codes
+  `DFN2_GRID_ERR_{NULL,SAMPLE_RATE,N_FFT,N_ERB,DF_BINS,MASK_LOOKAHEAD,DF_LOOKAHEAD,CAPACITY,INCONSISTENT}`.
+- Capacities (compile time, one `-D` on every unit raises them): `DFN2_MAX_N_FFT` 1024, `DFN2_MAX_N_ERB` 32, `DFN2_MAX_DF_BINS` 96,
+  `DFN2_MAX_DF_RING` 5 (mask-only 2). A grid above one is refused with `DFN2_GRID_ERR_CAPACITY`; a pair with ring > 5 (2/4 -> 7)
+  needs `-DDFN2_MAX_DF_RING=7` (`tests/dfn_pairs.py` `defines()` adds it). Still compile time: `DFN2_DF_ORDER` 5, `DFN2_MASK_ONLY`,
+  `DFN2_FRAMES_PER_CALL`, the graph geometry, `DFN2_FEATURE_VERSION`, the normaliser starting points. Ring 5 holds every pair with
+  mask + df <= 4; 1/4 and 2/3 need 6, 2/4 needs 7.
+- API: `dfn2_framing_config(cfg, grid, fft, window)` (zeroes `cfg` on an invalid grid, so `ac_stft_get_mem_size()` /
+  `ac_istft_get_mem_size()` of it are 0); `int dfn2_state_init(st, grid, stft, istft)` (-1 on an invalid grid);
+  `dfn2_apply_atten_lim(n_bins, ...)`; `int dfn2_model_io_init(state, grid)`; `dfn2_model_io_descriptor_default/_validate(grid, d)`;
+  `dfn2_prepost_config_defaults(cfg, mode, grid)` and `DFN2PrepostConfig.grid`; `dfn2_prepost_grid(p)`. `DFN2_MODEL_READY_FRAMES`,
+  `DFN2_PREPOST_LATENCY_FRAMES` and the `DFN2_PREPOST_*_ELEMENTS` size macros become `dfn2_model_io_ready_frames(state)`,
+  `dfn2_prepost_latency_frames(grid)` and the inline `dfn2_prepost_{erb_window,spec_window,erb_mask,convp_window,coefs}_elements(grid)`.
+  `DFN2_REQUIRE_LOOKAHEAD_PAIR_LINK()` and the pair symbol (`dfn2_lookahead_mask<M>_df<D>`, "DFN2 / DFN3 lookahead pairs" below) are
+  gone: a pair mismatch is refused at run time by the descriptor, the pool hash and the grid check. `DFN2_DF_ORDER` stays fixed at 5:
+  defining it on the build line is a `#error` in `dfn2_grid.h`.
+- Accelerator boundary: `DFN2ModelIOState.erb_window`, `.spec_window` and `.df_convp_window` are flat capacity-sized arrays used
+  packed at the grid's stride (`erb_window[f * n_erb + b]`, ...), the push helpers take `(float *window, const float *frame, n_erb |
+  df_bins)`, `dfn2_model_io_validate_arrays(gru, convp, df_bins)`, `dfn2_model_io_push_features(state, erb, spec)`, and the
+  `DFN2PrepostInputs/Outputs` tensor pointers are flat `const float *` / `float *` with unchanged `*_elements` counts. `DFN2State`
+  holds a `DFN2Grid grid` first and capacity-sized arrays; `df_ring_re/im` and `hi_delay_re/im` are one full-band pair
+  `masked_re/masked_im[ring][DFN2_MAX_N_BINS]`.
+- Link symbol: `DFN2_REQUIRE_VARIANT_LINK()` references `dfn2_variant_{full|mask_only}_n<MAX_N_FFT>_e<MAX_N_ERB>_d<MAX_DF_BINS>_r<MAX_DF_RING>`
+  (for example `dfn2_variant_full_n1024_e32_d96_r5`): objects built with a different variant or capacities do not link; the grid and the
+  pair are not in it. `dfn2_frames_per_call<N>` is unchanged.
+- Pool identity: `DFN2_PREPOST_CARVE_VERSION` goes 8 -> 9 (the state grew by `sizeof(DFN2Grid)` and holds capacity-sized arrays), and
+  the pool hash now folds the whole grid for every grid (lookahead pair, both alphas, normaliser starts), so pool sizes and hashes
+  changed and a `DFN2PrepostMemReq` recorded by an earlier build (carve 8) is refused by `_init_ex`. The normaliser starting points the
+  hash reads are `dfn2_norm_starts[]`, exported by `dfn2_process.c` (the unit that initialises the state); units built with other
+  starting points still link, and the hash is `dfn2_process.c`'s. Capacities are not in the hash; they change `bytes` and the link symbol. Measured on a 64-bit host with the default capacities: `sizeof(DFN2State)`
+  67,424 B (mask-only 15,360), `sizeof(DFN2ModelIOState)` 130,712 B (5,784), `sizeof(DFN2Grid)` 56; `DFN2_IO_FREQ` / `DFN2_IO_TIME` pools
+  210,336 / 213,984 B at 16 kHz (pair 0/0), 213,456 / 220,688 B at 32 kHz (0/0), 219,648 / 234,048 B at 48 kHz (1/1); mask-only
+  25,632 / 29,280, 28,752 / 35,984 and 34,944 / 49,344 B (48 kHz 1/0). A smaller grid does not shrink the state: `-DDFN2_MAX_N_FFT=256
+  -DDFN2_MAX_N_ERB=24` brings the 16 kHz pool to 174,784 / 178,432 B.
+- The 48 kHz 1/1 chain is unchanged. Outputs of the run-time library were compared with the former build-time library through a
+  stand-in accelerator (whole-chain digests, `DFN2_IO_FREQ` and `DFN2_IO_TIME`, tiny / huge / non-finite heads and state, skipped and
+  unwritten frames) for 15 grid, lookahead pair and mask-only combinations (16, 32 and 48 kHz; full pairs 0/0, 0/1, 1/1, 1/3, 2/0, 2/4, mask-only masks 0..2) in
+  NEON and scalar builds: all identical. The comparison used a scratch harness that is not in the repo.
+- Board samples (outside this repo) own the (sample rate, FFT size) -> n_erb, df_bins, mask / df lookahead table (16000/256 -> 24, 96,
+  0/0; 32000/512 -> 28, 96, 0/0, provisional, no model trained; 48000/1024 -> 32, 96, 1/1), build the grid with `dfn2_grid_make()` and
+  pass it down. `alg_ai3_dfn.c` and `alg_ai3_dfn_lite.c` (mask-only, library units built with `-DDFN2_MASK_ONLY`, object directories
+  apart, `df_lookahead` 0 in every row) take `--sample-rate` and `--fft-size` (default 48000 and 1024) and refuse a misspelt token that
+  begins `--sample` or `--fft` (usage, exit 2). `alg_ai3_aec_dfn.c` takes `--ai-sample-rate` and `--ai-fft-size` for the model grid and
+  keeps `--sr` as the host rate: the stage directly when the rates are equal, otherwise the rate bridge, which needs the 48 kHz / 1024
+  model and refuses anything else with a message. `uvc_ai_nr_stream.c` and `uvc_audio_live2a.c` stay 48 kHz only with no flags and build
+  the grid from their own one-row constants. Every DFN2 sample reads the ERB matrices from `/mnt/sd/dfn2_blobs/fb_<sr>_<n_erb>.bin`, the
+  exporter's `erb_matrix.bin` (`int32 n_bins`, `int32 n_bands`, `float32 erb_fb[]`, `float32 erb_inv[]`, both bin-major) renamed for
+  its grid; this replaces the single `erb_matrix.bin` name the two UVC samples and `alg_ai3_aec_dfn.c` used. Not run on a board from here.
 - `DeepFilterNet2/train.py` `validate_signal_config` now asks for `n_erb % 4` instead of `% 8` (shared by the trainer and `inference.py`).
   The encoder's two stride-2 stages need only `% 4`: 20, 24, 28, 32 and 36 bands build and run, 30 does not; upstream DeepFilterNet's
-  stricter `% 8` is no longer kept, so a grid with 28 bands (the 32 kHz preset) can be trained. `UPSTREAM_ALIGNMENT.md` and the
+  stricter `% 8` is no longer kept, so a grid with 28 bands (32 kHz) can be trained. `UPSTREAM_ALIGNMENT.md` and the
   contract test follow (`test_n_erb_divisibility_is_the_architectures_own_rule` builds and runs the accepted widths).
-- Mask-only on the board sample: `alg_ai3_dfn.c` (outside this repo) runs the `--mask-only` graph (inputs `erb, spec, h_gru`, outputs
-  `erb_mask, h_gru_out`, I/O layout 9) when it is built with `-DDFN2_MASK_ONLY` together with the library, and reads `dfn2_lite/` and
-  writes `DFN2_LITE/`; no source file of its own, and the library needs none (`-DDFN2_MASK_ONLY` on every unit, as before). The mask-only
-  and the full units of one grid do not link (`test_mask_only_and_full_units_of_one_grid_do_not_link`).
-- New `DeepFilterNet2/dfn2_grid.h`, included by `dfn2_process.h` and listed in the AINR Makefile `HEADERS`, holds the signal grid and
-  model geometry that `dfn2_process.h` used to write out: `DFN2_SR`, `DFN2_N_FFT`, `DFN2_N_ERB`, `DFN2_DF_BINS`,
-  `DFN2_ERB_NORM_ALPHA` and `DFN2_SPEC_NORM_ALPHA`. `DFN2_N_BINS`, `_WIN_LEN`, `_HOP_LEN` and `_OVL_LEN` are derived from n_fft, and so
-  are `DFN2_NORMALIZED_STFT_SCALE` / `_UNSCALE` (float32 of 1/sqrt(n_fft) and sqrt(n_fft), what `dfn2_framing_config` used to compute
-  itself) and `DFN2_ANALYSIS_SCALE` (the same value), so a new grid needs no table entry.
-- Presets, `-DDFN2_GRID_KHZ=<k>` on every unit: `48` (default, shipped: 48000 Hz, n_fft 1024, 32 ERB bands, 96 DF bins, alpha 0.989),
-  `32` (32000 Hz, 512, 28, 96, alpha 0.992; provisional, nothing is trained for it yet),
-  `16` (16000 Hz, 256, 24, 96, alpha 0.992). Both alphas are `train.py` `make_norm_alpha(sr, hop, tau)` with tau = 1.0 s, written as
-  literals; the analysis scale is `train.py` `analysis_scale()`, which is 1/sqrt(n_fft) for win = n_fft and hop = n_fft/2.
-- A grid defined outside the library: `DFN2_SR`, `DFN2_N_FFT`, `DFN2_N_ERB`, `DFN2_DF_BINS`, `DFN2_ERB_NORM_ALPHA` and
-  `DFN2_SPEC_NORM_ALPHA` are all required on the build line (a missing one is a `#error` naming it; nothing is defaulted, so no value of
-  another grid is applied silently), or `-DDFN2_GRID_HEADER='"my_grid.h"'` names a header that defines them. `DFN2_DF_ORDER` is fixed at 5 (the graph's pathway window and the state layout are built for it); an
-  external definition of it is a `#error`. A preset and an external definition cannot be mixed, and a preset cannot be
-  overridden in part. `#error` guards: n_fft a power of two in [16, 8192]; n_erb a positive multiple of 4 (the C ERB kernel and the
-  encoder's two stride-2 stages need only `% 4`, and `train.py` `validate_signal_config` asks for the same `% 4`, so 28 bands can be trained);
-  `2 * n_erb <= n_bins`; df_bins in [2, n_bins], and below n_bins for the full variant.
-- Link symbols and pool identity: the variant symbol keeps `dfn2_variant_full` / `dfn2_variant_mask_only` on the shipped grid
-  (the 48 kHz preset) and appends `_s<sr>_f<n_fft>_e<n_erb>_d<df_bins>` on any other, so objects of different grids do not link,
-  and neither does an application built for another grid than the library (it runs `DFN2_REQUIRE_LOOKAHEAD_PAIR_LINK()` in `main()`).
-  `pp_build_hash` folds seven more floats (both alphas, the five normaliser starting points) in off the shipped grid only.
-  "Shipped" is the 48 kHz preset itself with the normaliser starting points left at libDF's values: a build that overrides one, and a
-  grid defined on the build line even with the shipped integers, are never shipped, so they get their own symbol name and pool hash.
-- The shipped 48 kHz grid does not change: the six objects of a default build (full and `-DDFN2_MASK_ONLY`, three each) have the same
-  machine code, constant sections and symbols as before; the `DFN2_IO_FREQ` pool is still 219,536 bytes with hash `d2d3bc45`;
-  `DFN2_MODEL_IO_LAYOUT_VERSION` and `DFN2_PREPOST_CARVE_VERSION` stay; `make test`, `test-simd` and `test-pairs` pass with the digests
-  unchanged.
-- Measured on a 64-bit host: `DFN2_IO_FREQ` pool 189,680 B at 32 kHz and 174,672 B at 16 kHz (mask-only 14,528 B), `sizeof(DFN2State)`
-  43,752 B and 31,912 B (shipped: 219,536 B, 67,368 B).
-- New `tests/test_dfn2_grid.py`, for 48, 32, 16 kHz and a test-only external 24 kHz grid: constants against `train.py`
-  (alpha and analysis scale bit for bit), C features and compose against Python (also with `SIMD=0`), the C stream against the offline
-  model, the `#error` messages of invalid grids, link failure between objects of different grids in both directions and between an
-  application and a library of different grids, pool identity following the grid and the alphas.
-  `DeepFilterNet2/tests/test_dfn2_contract.py` now reads N_ERB / DF_BINS from `dfn2_grid.h` (the first `#define`, the 48 kHz branch).
-- Documentation: the DFN2 and AINR READMEs gain a grid section, and the HTML site a page `ainr_dfn2_grids.html`.
-  The 48 kHz-only wording in the `dfn2_prepost.h` header comment is tagged as the shipped grid.
+- Tests: `tests/test_dfn2_grid.py` (every refusal and status code, the derived fields, `make` agreeing with `validate` over a sweep of
+  sample rates, the `n_erb` overflow cases under UBSan, `dfn2_framing_config` on a refused grid, the `DFN2_DF_ORDER` `#error` in C11 and
+  gnu99, `dfn2_norm_alpha` against `train.py` bit for bit, C against Python from one binary on every grid) and
+  `tests/test_dfn2_runtime_grid.py` (capacity independence, pool identity, the normaliser starting points of `dfn2_process.c` (this
+  replaces the former "mixed objects must not link" gate), no grid in the library, the variant link symbol, the standalone test header);
+  `tests/test_dfn2_lookahead_pairs.py` builds the C suites for the shipped pair and 2/4 on the 48, 32 and 16 kHz grids. The other DFN2
+  tests build their grid through `tests/dfn2_test_grid.h`, which also holds the one `dfn2_test_band_borders()`; `tests/dfn_pairs.py`
+  holds the shared `dfn2_grid_config()` and `dfn2_write_stream_input()`. Documentation: the DFN2 and AINR READMEs ("Choosing the
+  grid", "Calling the library", "DFN2 grid") and the HTML pages `ainr_dfn2_grids.html` and `ainr_dfn2_usage.html`.
 
 ### DFN2 stage 1 alone: `--mask-only` / `-DDFN2_MASK_ONLY`
 
@@ -62,10 +98,12 @@
   the saving is the deep-filter decoder only; no latency or size figure has been measured.
 - C: `-DDFN2_MASK_ONLY` on every translation unit builds the same model: layout 9 (`DFN2_MODEL_IO_LAYOUT_VERSION_MASK_ONLY`;
   the full one is `_FULL`, 8), `DFN2_MODEL_GRU_ROWS` 3, no deep-filter rings, coefficient/alpha heads or pathway window (the
-  `DFN2PrepostInputs/Outputs` fields and the `dfn2_model_io_validate_arrays` pathway argument do not exist), `DFN2_DF_LOOKAHEAD`
-  fixed at 0 (`#error` otherwise), so the latency is `DFN2_MASK_LOOKAHEAD` frames. `dfn2_compose*()` keep their signatures and
+  `DFN2PrepostInputs/Outputs` fields and the `dfn2_model_io_validate_arrays` pathway argument do not exist), the grid's
+  `df_lookahead` must be 0 (`dfn2_grid_make()` returns `DFN2_GRID_ERR_DF_LOOKAHEAD` otherwise) and `df_bins` may reach `n_bins`, so the
+  latency is the grid's `mask_lookahead` frames. The ring capacity of a mask-only build is 2 (mask lookahead 2 needs
+  `-DDFN2_MAX_DF_RING=3`). `dfn2_compose*()` keep their signatures and
   ignore `coefs`/`alpha`; the final attenuation-limit mix (`--atten-lim` in Python, `atten_lim_db` /
-  `dfn2_prepost_set_atten_lim` in C) is kept and applies to the stage-1 output. Without the define nothing changes (`make test` digests identical before and after).
+  `dfn2_prepost_set_atten_lim` in C) is kept and applies to the stage-1 output. Without the define nothing changes (`make test` digests identical before and after the stage-1 change itself).
   Not covered: the pipelines' DFN unit tests (their stand-in accelerator writes coefficient heads) and the Python pipeline mirror
   build the full model only.
 
@@ -73,7 +111,8 @@
 
 - The DFN2/DFN3 prepost classes (TIME path) take a borrowed `AcIstft` built from `dfn2_framing_config()` /
   `dfn3_framing_config()`; inverse FFT and overlap-add stay with the application, the FREQ path is unchanged. The TIME pools
-  shrink by the `AcIstft`, so `DFN2_PREPOST_CARVE_VERSION` and `DFN3_PREPOST_CARVE_VERSION` go 7 -> 8 (outputs bit-identical).
+  shrink by the `AcIstft`, so `DFN2_PREPOST_CARVE_VERSION` and `DFN3_PREPOST_CARVE_VERSION` go 7 -> 8 (outputs bit-identical); the DFN2
+  one goes on to 9 with the run-time grid above.
 
 ### DFN2 multi-frame export: N frames per invocation
 
@@ -92,7 +131,7 @@
   when N != 1). Window of N + 2 frames, first call ready after `M + N` pushed frames and then every N,
   `dfn2_model_io_frame_slot()`, `DFN2ModelIoDescriptor.input_frames` = N + 2 (the struct stays 18 fields / 72 bytes),
   commit composes the N frames in one burst, `post_process` still returns one hop per call, latency
-  `1 + M + D + N - 1` hops (`DFN2_PREPOST_LATENCY_FRAMES`). N > 1 is folded into the pool hash and objects built for
+  `1 + M + D + N - 1` hops (`dfn2_prepost_latency_frames(grid)` + 1). N > 1 is folded into the pool hash and objects built for
   different N do not link (`dfn2_frames_per_call<N>`). A unit written for one frame per call does not compile for N > 1
   unless it defines `DFN2_MULTI_FRAME_HOST`; the pipelines DFN stage stays at N = 1.
 - DFN2 C descriptor ABI: `DFN2ModelIoDescriptor` is the 18-field, 72-byte struct of 778dfed; there is no `frames_per_call`
@@ -100,10 +139,10 @@
   accepts only that). With a 76-byte struct, an adapter compiled against the previous header and linked with the new library
   had 4 bytes written past its descriptor by `_default()` and read past it by `_validate()`. Now such an adapter
   (`input_frames` = 3) works with an N = 1 library and is refused by an N > 1 one. In C11 builds `_Static_assert` pins the
-  size (72 bytes) and the field list (18). `DFN2_MODEL_IO_LAYOUT_VERSION` 8, `DFN2_PREPOST_CARVE_VERSION` 8 and every N = 1
-  output are unchanged. Test: `tests/test_dfn2_frames_per_call_c.py::test_a_descriptor_of_the_one_frame_header_is_safe_for_any_frame_count`.
-- `DFN2_MODEL_IO_LAYOUT_VERSION` stays 8 and `DFN2_PREPOST_CARVE_VERSION` stays 8: the state tensors do not change, and
-  with N = 1 the pool size, hash and compile lines are those of a build without the option (rationale in
+  size (72 bytes) and the field list (18). `DFN2_MODEL_IO_LAYOUT_VERSION` 8 and every N = 1
+  output are unchanged by the option. Test: `tests/test_dfn2_frames_per_call_c.py::test_a_descriptor_of_the_one_frame_header_is_safe_for_any_frame_count`.
+- `DFN2_MODEL_IO_LAYOUT_VERSION` stays 8 and the option does not move `DFN2_PREPOST_CARVE_VERSION`: the state tensors do not
+  change, and with N = 1 the pool size, hash and compile lines are those of a build without the option (rationale in
   `DeepFilterNet2/README.md`, "Multi-frame export").
 - Tests `tests/test_dfn2_frames_per_call.py` and `tests/test_dfn2_frames_per_call_c.py`, added to `make test-pairs`.
 - Not measured: a target toolchain, GRU support for a sequence longer than one, quantized accuracy of an N-frame graph (all
@@ -131,12 +170,14 @@
   `df_lookahead` and a derived `input_window_alignment` (unchanged string for 1);
   the calibration reports (`inference.py calib`, `inference_batch.py calib`) name
   the pair.
-- C: `DFN2_MASK_LOOKAHEAD` / `DFN2_DF_LOOKAHEAD` and the DFN3 twins are build
+- C: `DFN3_MASK_LOOKAHEAD` / `DFN3_DF_LOOKAHEAD` are build
   constants (defaults 1/1) range-checked by preprocessor `#error` in every
   language mode; objects built for different pairs fail to link (a one-byte
   symbol named after the pair, no code or allocation); model-io readiness is
-  `MASK + 1` frames. DFN2 (cascade) delays `M + D` frames with a ring of
-  `max(DF_ORDER, M + D + 1)`; DFN3 (parallel) delays `max(M, D)` frames with a
+  `MASK + 1` frames. DFN2's pair is two fields of the `DFN2Grid` (see "DFN2 grid is a
+  run-time value" above, which supersedes this for DFN2: no build constants, no pair
+  symbol, `dfn2_model_io_ready_frames()`, range checks in `dfn2_grid_make()`). DFN2 (cascade) delays
+  `M + D` frames with a ring of `max(DF_ORDER, M + D + 1)` (`grid.ring`); DFN3 (parallel) delays `max(M, D)` frames with a
   ring of `DF_ORDER + max(M, D) - D`, and keeps the heads in the ring when
   `D > M` (`DFN3_HEAD_QUEUE`). For the shipped pair the code, state sizes, pool
   hash and test digests are unchanged. `dfn3_compose()` documents its

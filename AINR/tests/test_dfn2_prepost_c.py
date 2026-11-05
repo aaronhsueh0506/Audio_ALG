@@ -18,7 +18,11 @@ are compiled once for the module):
   freqpool  the FREQ pool is smaller; the stale-pool gate accepts the matching
             MemReq and refuses a perturbed one
   lifecycle _create/_destroy against _init on a caller pool
-  reject    _get_mem_size / _init / stage-call reject-first validation
+  reject    _get_mem_size / _init / stage-call reject-first validation, and the
+            run-time refusals of a grid: dfn2_grid_make() status per failing
+            value (capacity included), a grid built by hand with a derived
+            field edited, and every object that takes a grid (the framing
+            config of a refused grid comes back all zero)
   reset     _reset really clears state (a re-run reproduces the first run)
   skip      _frame_skip is the exact identity, never steps the state itself and
             leaves it as the accelerator wrote it
@@ -37,12 +41,22 @@ are compiled once for the module):
 The accelerator stand-in is deterministic and input-dependent, so a class that
 dropped a state advance would diverge rather than agree.
 
+The library holds no grid: the driver takes its grid from ``tests/dfn2_test_grid.h``
+(the 48 kHz grid, whose ERB border table it carries), builds it once with
+``dfn2_grid_make()`` and hands that ``DFN2Grid`` to every object it creates.
+The header's macros only size the driver's own buffers; main() checks them
+against the grid and against the library's ``dfn2_prepost_*_elements()``.
+
 The driver is built for the shipped (mask, df) lookahead pair with no override
 and, in the last tests, for every other pair in ``dfn_pairs.c_build_pairs`` with
--DDFN2_MASK_LOOKAHEAD / -DDFN2_DF_LOOKAHEAD: every warm-up length, readiness
-count and delay-line length in it follows the compiled constants. The pool
-identity (build_flags_hash) is checked to differ between pairs, and a pool of
-another pair is refused by _init_ex.
+-DDFN2_MASK_LOOKAHEAD / -DDFN2_DF_LOOKAHEAD (a ring deeper than the library's
+default capacity also takes -DDFN2_MAX_DF_RING): every warm-up length,
+readiness count and delay-line length in it follows the pair in the grid. The
+pool identity (build_flags_hash) is checked to differ between pairs, and a pool
+of another pair is refused by _init_ex. Inside one binary the same refusal is
+checked for grids that differ in any single value (frequency, frame size, band
+count, deep-filter bins, either lookahead, either EMA coefficient), for the pool
+identity and for the graph descriptor.
 """
 
 import re
@@ -61,7 +75,7 @@ _DRIVER = r'''
 #include <stdlib.h>
 #include <string.h>
 
-#include "DeepFilterNet2/dfn2_prepost.h"
+#include "tests/dfn2_test_grid.h"   /* the grid this program runs, and the library header */
 #include "utility/mem_align.h"
 
 #define CHECK(x) do { if (!(x)) { \
@@ -72,6 +86,18 @@ _DRIVER = r'''
 #define HOPS        400
 #define SHORT_HOPS  40
 #define LOOKAHEAD   (DFN2_MASK_LOOKAHEAD + DFN2_DF_LOOKAHEAD)
+
+/* Flat element counts of the accelerator tensors. The library gives them as functions of
+ * the grid; the arrays below need them as constants, so they are written out here from
+ * the test grid's macros and main() checks each one against
+ * dfn2_prepost_*_elements(dfn2_test_grid()). */
+#define TEST_ERB_WINDOW_ELEMENTS  (DFN2_MODEL_WINDOW_FRAMES * DFN2_N_ERB)
+#define TEST_SPEC_WINDOW_ELEMENTS (2 * DFN2_MODEL_WINDOW_FRAMES * DFN2_DF_BINS)
+#define TEST_ERB_MASK_ELEMENTS    (DFN2_FRAMES_PER_CALL * DFN2_N_ERB)
+#define TEST_CONVP_WINDOW_ELEMENTS \
+    (DFN2_MODEL_ENCODER_CHANNELS * DFN2_MODEL_DF_PATHWAY_WINDOW * DFN2_DF_BINS)
+#define TEST_COEFS_ELEMENTS \
+    (DFN2_FRAMES_PER_CALL * DFN2_DF_BINS * DFN2_DF_ORDER * 2)
 
 /* What pre_process returns on stream hop t of a cold instance: the accelerator
  * has nothing to run until the window of heads[0] is complete, which takes
@@ -91,22 +117,21 @@ _DRIVER = r'''
 #define N_OUT_TENSORS 5
 
 /* ---- synthetic ERB matrices ------------------------------------------
- * Built exactly the way tests/test_c_prepost.c's dfn_test_build_erb() does,
- * from the shipped 48 kHz / 1024 / 32 border table.  erb_inv is a partition
- * of unity per bin, which is what makes frame_skip an EXACT identity rather
- * than an approximate one -- main() asserts that property before any case
- * runs, in the same accumulation order df_common_expand_mask() uses. */
-static const int erb_borders[DFN2_N_ERB] = {
-    0, 2, 4, 6, 8, 10, 12, 14, 16, 18, 20, 22, 25, 30, 36, 42,
-    50, 59, 69, 81, 94, 110, 129, 151, 176, 205, 239, 279,
-    325, 378, 440, 513
-};
+ * Built exactly the way tests/test_c_prepost.c's dfn_test_build_erb() does, over the band
+ * border table of dfn2_test_band_borders() (dfn2_test_grid.h; the shipped 48 kHz / 1024 / 32
+ * table on this driver's grid).  erb_inv is a partition of unity per bin, which is what makes
+ * frame_skip an EXACT identity rather than an approximate one -- main() asserts that property
+ * before any case runs, in the same accumulation order df_common_expand_mask() uses. */
+_Static_assert(DFN2_N_FFT == 1024 && DFN2_N_ERB == 32,
+               "this driver is built for the shipped grid and only varies the lookahead pair");
+static int erb_borders[DFN2_N_ERB];
 static float erb_fwd[DFN2_N_BINS][DFN2_N_ERB];
 static float erb_inv[DFN2_N_ERB][DFN2_N_BINS];
 
 static void build_erb(void) {
     int segment = 0;
     int k;
+    dfn2_test_band_borders(erb_borders);
     memset(erb_fwd, 0, sizeof erb_fwd);
     memset(erb_inv, 0, sizeof erb_inv);
     for (k = 0; k < DFN2_N_BINS; ++k) {
@@ -150,62 +175,64 @@ static int erb_inv_is_partition_of_unity(void) {
  * advance shows up as a divergence rather than as agreement. */
 static double fake_acc(const float *erb_window, const float *spec_window,
                        const float *gru_hidden, const float *convp) {
+    const DFN2Grid *grid = dfn2_test_grid();
     double acc = 0.0;
     size_t i;
-    for (i = 0; i < (size_t)DFN2_PREPOST_ERB_WINDOW_ELEMENTS; ++i)
+    for (i = 0; i < dfn2_prepost_erb_window_elements(grid); ++i)
         acc += erb_window[i];
-    for (i = 0; i < (size_t)DFN2_PREPOST_SPEC_WINDOW_ELEMENTS; ++i)
+    for (i = 0; i < dfn2_prepost_spec_window_elements(grid); ++i)
         acc += 0.5 * spec_window[i];
     for (i = 0; i < (size_t)DFN2_PREPOST_GRU_HIDDEN_ELEMENTS; ++i)
         acc += 1e-3 * gru_hidden[i];
-    for (i = 0; i < (size_t)DFN2_PREPOST_CONVP_WINDOW_ELEMENTS; ++i)
+    for (i = 0; i < dfn2_prepost_convp_window_elements(grid); ++i)
         acc += 1e-4 * convp[i];
     return acc;
 }
 
 static void fake_fill(double acc, float *erb_mask, float *coefs, float *alpha,
                       float *gru_next, float *convp_next) {
+    const DFN2Grid *grid = dfn2_test_grid();
     size_t i;
     /* Kept inside (0,1) so it is a plausible sigmoid mask, not a value the
      * compose stage would clamp. */
-    for (i = 0; i < (size_t)DFN2_PREPOST_ERB_MASK_ELEMENTS; ++i)
+    for (i = 0; i < dfn2_prepost_erb_mask_elements(grid); ++i)
         erb_mask[i] = (float)(0.5 + 0.4 * sin(acc + (double)i));
-    for (i = 0; i < (size_t)DFN2_PREPOST_COEFS_ELEMENTS; ++i)
+    for (i = 0; i < dfn2_prepost_coefs_elements(grid); ++i)
         coefs[i] = (float)(0.05 * cos(acc + 1.0 + (double)i));
     for (i = 0; i < (size_t)DFN2_PREPOST_ALPHA_ELEMENTS; ++i)
         alpha[i] = (float)(0.5 + 0.3 * sin(acc + 2.0));
     for (i = 0; i < (size_t)DFN2_PREPOST_GRU_HIDDEN_ELEMENTS; ++i)
         gru_next[i] = (float)(0.5 * sin(acc + 3.0 + (double)i));
-    for (i = 0; i < (size_t)DFN2_PREPOST_CONVP_WINDOW_ELEMENTS; ++i)
+    for (i = 0; i < dfn2_prepost_convp_window_elements(grid); ++i)
         convp_next[i] = (float)(0.1 * cos(acc + 5.0 + (double)i));
 }
 
 static void fake_run(const DFN2PrepostInputs *in, DFN2PrepostOutputs *out) {
-    double acc = fake_acc(&in->erb_window[0][0],
-                          &in->spec_window[0][0][0],
+    double acc = fake_acc(in->erb_window,
+                          in->spec_window,
                           &in->gru_hidden[0][0],
-                          &in->df_convp_window[0][0][0]);
+                          in->df_convp_window);
     fake_fill(acc, out->erb_mask, out->coefs, out->alpha,
               &out->gru_hidden_next[0][0],
-              &out->df_convp_window_next[0][0][0]);
+              out->df_convp_window_next);
 }
 
 /* The three heads, laid out for the hand-composed reference path. */
 typedef struct {
-    float erb_mask[DFN2_PREPOST_ERB_MASK_ELEMENTS];
-    float coefs[DFN2_PREPOST_COEFS_ELEMENTS];
+    float erb_mask[TEST_ERB_MASK_ELEMENTS];
+    float coefs[TEST_COEFS_ELEMENTS];
     float alpha[DFN2_PREPOST_ALPHA_ELEMENTS];
 } RefHeads;
 
 /* The reference accelerator writes the recurrent state in place too: fake_acc
  * reads every state input before fake_fill overwrites any of them. */
 static void fake_run_reference(DFN2ModelIOState *io, RefHeads *heads) {
-    double acc = fake_acc(&io->erb_window[0][0],
-                          &io->spec_window[0][0][0],
+    double acc = fake_acc(io->erb_window,
+                          io->spec_window,
                           &io->gru_hidden[0][0],
-                          &io->df_convp_window[0][0][0]);
+                          io->df_convp_window);
     fake_fill(acc, heads->erb_mask, heads->coefs, heads->alpha,
-              &io->gru_hidden[0][0], &io->df_convp_window[0][0][0]);
+              &io->gru_hidden[0][0], io->df_convp_window);
 }
 
 /* ---- small helpers ---------------------------------------------------- */
@@ -249,7 +276,7 @@ static int state_aliased(const DFN2PrepostInputs *in,
 
 static int state_all_zero(const DFN2PrepostInputs *in) {
     return all_zero(&in->gru_hidden[0][0], in->gru_hidden_elements) &&
-           all_zero(&in->df_convp_window[0][0][0],
+           all_zero(in->df_convp_window,
                     in->df_convp_window_elements);
 }
 
@@ -263,7 +290,7 @@ static float *output_tensor(DFN2PrepostOutputs *out, int which,
     case 3: *count = out->gru_hidden_elements;
             return &out->gru_hidden_next[0][0];
     default: *count = out->df_convp_window_elements;
-            return &out->df_convp_window_next[0][0][0];
+            return out->df_convp_window_next;
     }
 }
 
@@ -311,12 +338,12 @@ static int make_framing(FftHandle *fft, AcStft **stft, AcIstft **istft) {
     AcStftConfig cfg;
     size_t bytes;
     void *mem;
-    dfn2_framing_config(&cfg, fft, NULL);
+    dfn2_framing_config(&cfg, dfn2_test_grid(), fft, NULL);
     bytes = ac_stft_get_mem_size(&cfg);
     mem = alloc_aligned(16u, bytes);
     *stft = mem ? ac_stft_init(mem, bytes, &cfg) : NULL;
     if (!*stft) return -1;
-    dfn2_framing_config(&cfg, fft, ac_stft_window(*stft));
+    dfn2_framing_config(&cfg, dfn2_test_grid(), fft, ac_stft_window(*stft));
     bytes = ac_istft_get_mem_size(&cfg);
     mem = alloc_aligned(16u, bytes);
     *istft = mem ? ac_istft_init(mem, bytes, &cfg) : NULL;
@@ -329,14 +356,15 @@ static AcIstft *make_istft(FftHandle *fft, const float *window) {
     AcStftConfig cfg;
     size_t bytes;
     void *mem;
-    dfn2_framing_config(&cfg, fft, window);
+    dfn2_framing_config(&cfg, dfn2_test_grid(), fft, window);
     bytes = ac_istft_get_mem_size(&cfg);
     mem = alloc_aligned(16u, bytes);
     return mem ? ac_istft_init(mem, bytes, &cfg) : NULL;
 }
 
 static void config_time(DFN2PrepostConfig *cfg, FftHandle *fft) {
-    (void)dfn2_prepost_config_defaults(cfg, DFN2_IO_TIME);
+    if (dfn2_prepost_config_defaults(cfg, DFN2_IO_TIME, dfn2_test_grid()) != 0)
+        abort();
     cfg->fft = fft;
     cfg->istft = make_istft(fft, NULL);
     cfg->erb_fwd = &erb_fwd[0][0];
@@ -344,7 +372,8 @@ static void config_time(DFN2PrepostConfig *cfg, FftHandle *fft) {
 }
 
 static void config_freq(DFN2PrepostConfig *cfg) {
-    (void)dfn2_prepost_config_defaults(cfg, DFN2_IO_FREQ);
+    if (dfn2_prepost_config_defaults(cfg, DFN2_IO_FREQ, dfn2_test_grid()) != 0)
+        abort();
     cfg->erb_fwd = &erb_fwd[0][0];
     cfg->erb_inv = &erb_inv[0][0];
 }
@@ -436,17 +465,16 @@ static int equiv_once(FftHandle *fft, float atten_lim_db) {
      * stage and the synthesis, wired by hand from the two TUs the class
      * merely orchestrates.  dfn2_prepost.c is deliberately not involved. */
     CHECK(make_framing(fft, &ref_stft, &ref_istft) == 0);
-    dfn2_state_init(&ref_st, ref_stft, ref_istft);
+    CHECK(dfn2_state_init(&ref_st, dfn2_test_grid(), ref_stft, ref_istft) == 0);
     dfn2_set_erb_matrices(&ref_st, &erb_fwd[0][0], &erb_inv[0][0]);
-    dfn2_model_io_init(&ref_io);
+    CHECK(dfn2_model_io_init(&ref_io, dfn2_test_grid()) == 0);
     for (hop = 0; hop < HOPS; ++hop) {
         float *slot = out_a + (size_t)hop * DFN2_HOP_LEN;
         int needed, emitted;
         dfn2_analysis(&ref_st, pcm_in + (size_t)hop * DFN2_HOP_LEN,
                       spec_re, spec_im);
         dfn2_compute_features(&ref_st, spec_re, spec_im, feat_erb, feat_spec);
-        needed = dfn2_model_io_push_features(
-            &ref_io, feat_erb, (const float (*)[DFN2_DF_BINS])feat_spec);
+        needed = dfn2_model_io_push_features(&ref_io, feat_erb, feat_spec);
         CHECK(needed >= 0);
         if (needed == 0) {
             /* Left warm-up: the graph has no right-hand neighbour yet, so
@@ -481,6 +509,8 @@ static int equiv_once(FftHandle *fft, float atten_lim_db) {
     CHECK(dfn2_prepost_io_mode(p) == DFN2_IO_TIME);
     CHECK(dfn2_prepost_hop_size(p) == DFN2_HOP_LEN);
     CHECK(dfn2_prepost_num_bins(p) == DFN2_N_BINS);
+    CHECK(dfn2_prepost_grid(p) != NULL);
+    CHECK(memcmp(dfn2_prepost_grid(p), dfn2_test_grid(), sizeof(DFN2Grid)) == 0);
     CHECK(dfn2_prepost_layout_version(p) == DFN2_MODEL_IO_LAYOUT_VERSION);
     CHECK(dfn2_prepost_model_lookahead_frames(p) == LOOKAHEAD);
     CHECK(drive_time_ex(p, pcm_in, out_b, HOPS, 1,
@@ -554,7 +584,8 @@ static int case_freq(FftHandle *fft) {
      * dfn2_analysis per hop into the class, one dfn2_synthesis per emitted
      * frame out of it, on the same DFN2State the class would have used. */
     CHECK(make_framing(fft, &caller_stft, &caller_istft) == 0);
-    dfn2_state_init(&caller_st, caller_stft, caller_istft);
+    CHECK(dfn2_state_init(&caller_st, dfn2_test_grid(), caller_stft,
+                          caller_istft) == 0);
     dfn2_set_erb_matrices(&caller_st, &erb_fwd[0][0], &erb_inv[0][0]);
     for (hop = 0; hop < HOPS; ++hop) {
         DFN2PrepostInputs inputs;
@@ -603,7 +634,99 @@ static int case_freq(FftHandle *fft) {
     return 0;
 }
 
+/* ---- grid variants ---------------------------------------------------- */
+
+/* The library holds no grid, so a different grid is a different VALUE, not a different
+ * build: these are valid grids that differ from the test grid in exactly one value, made
+ * with dfn2_grid_make() inside the same binary (the two alphas are overwritten the way a
+ * model trained with another tau does). They stand for what used to be a host built for
+ * another grid, and every object that records the grid must tell them apart. */
+enum {
+    VARIANT_SAMPLE_RATE, VARIANT_N_FFT, VARIANT_N_ERB, VARIANT_DF_BINS,
+    VARIANT_MASK_LOOKAHEAD, VARIANT_DF_LOOKAHEAD, VARIANT_ERB_ALPHA,
+    VARIANT_SPEC_ALPHA, N_VARIANTS
+};
+
+static int make_variant(DFN2Grid *grid, int which) {
+    const DFN2Grid *base = dfn2_test_grid();
+    int sample_rate = base->sample_rate, n_fft = base->n_fft;
+    int n_erb = base->n_erb, df_bins = base->df_bins;
+    int mask = base->mask_lookahead, df = base->df_lookahead;
+    switch (which) {
+    case VARIANT_SAMPLE_RATE:    sample_rate += 1000; break;
+    case VARIANT_N_FFT:          n_fft /= 2; break;
+    case VARIANT_N_ERB:          n_erb -= 4; break;
+    case VARIANT_DF_BINS:        df_bins -= 4; break;
+    case VARIANT_MASK_LOOKAHEAD: mask = mask > 0 ? mask - 1 : 1; break;
+    case VARIANT_DF_LOOKAHEAD:   df = df > 0 ? df - 1 : 1; break;
+    default: break;
+    }
+    if (dfn2_grid_make(grid, sample_rate, n_fft, n_erb, df_bins, mask, df) !=
+        DFN2_GRID_OK) return -1;
+    if (which < VARIANT_ERB_ALPHA) {
+        /* dfn2_grid_make() derives the alphas from the sample rate and the hop; keep
+         * the test grid's so that only the one value differs and a gap in a check
+         * cannot be covered by the alpha. */
+        grid->erb_norm_alpha = base->erb_norm_alpha;
+        grid->spec_norm_alpha = base->spec_norm_alpha;
+    }
+    if (which == VARIANT_ERB_ALPHA)
+        grid->erb_norm_alpha = dfn2_norm_alpha(grid->sample_rate, grid->hop, 2.0);
+    if (which == VARIANT_SPEC_ALPHA)
+        grid->spec_norm_alpha = dfn2_norm_alpha(grid->sample_rate, grid->hop, 2.0);
+    return memcmp(grid, base, sizeof *grid) != 0 &&
+           dfn2_grid_validate(grid) == DFN2_GRID_OK ? 0 : -1;
+}
+
 /* ---- freqpool: pool saving + the stale-pool gate --------------------- */
+
+/* The pool identity records the whole grid, and the grid arrives at run time: a
+ * MemReq sized for a grid that differs in any one value is refused by init_ex() in this
+ * very binary, by identity alone (size and alignment forged equal), while each one is
+ * accepted for its own grid. A value dropped from the hash makes the matching variant
+ * pass here. */
+static int freqpool_grid_identity(const DFN2PrepostConfig *cfg_freq,
+                                  const DFN2PrepostMemReq *req_freq) {
+    DFN2PrepostConfig cfg_v;
+    DFN2PrepostMemReq req_v[N_VARIANTS], forged;
+    uint64_t most = req_freq->bytes;
+    void *pool;
+    int v, w;
+
+    for (v = 0; v < N_VARIANTS; ++v) {
+        DFN2Grid grid;
+        CHECK(make_variant(&grid, v) == 0);
+        CHECK(dfn2_prepost_config_defaults(&cfg_v, DFN2_IO_FREQ, &grid) == 0);
+        cfg_v.erb_fwd = cfg_freq->erb_fwd;
+        cfg_v.erb_inv = cfg_freq->erb_inv;
+        CHECK(dfn2_prepost_get_mem_size(&cfg_v, &req_v[v]) == 0);
+        CHECK(req_v[v].build_flags_hash != req_freq->build_flags_hash);
+        for (w = 0; w < v; ++w)
+            CHECK(req_v[v].build_flags_hash != req_v[w].build_flags_hash);
+        if (req_v[v].bytes > most) most = req_v[v].bytes;
+    }
+    pool = alloc_aligned(req_freq->alignment, (size_t)most);
+    CHECK(pool != NULL);
+    for (v = 0; v < N_VARIANTS; ++v) {
+        DFN2Grid grid;
+        CHECK(make_variant(&grid, v) == 0);
+        CHECK(dfn2_prepost_config_defaults(&cfg_v, DFN2_IO_FREQ, &grid) == 0);
+        cfg_v.erb_fwd = cfg_freq->erb_fwd;
+        cfg_v.erb_inv = cfg_freq->erb_inv;
+        /* accepted for its own grid... */
+        CHECK(dfn2_prepost_init_ex(pool, (size_t)most, &cfg_v, &req_v[v]) != NULL);
+        /* ...refused for the test grid, and the other way round... */
+        CHECK(dfn2_prepost_init_ex(pool, (size_t)most, cfg_freq, &req_v[v]) == NULL);
+        CHECK(dfn2_prepost_init_ex(pool, (size_t)most, &cfg_v, req_freq) == NULL);
+        /* ...also when the request is given the test grid's size and alignment */
+        forged = req_v[v];
+        forged.bytes = req_freq->bytes;
+        forged.alignment = req_freq->alignment;
+        CHECK(dfn2_prepost_init_ex(pool, (size_t)most, cfg_freq, &forged) == NULL);
+    }
+    free(pool);
+    return 0;
+}
 
 static int case_freqpool(FftHandle *fft) {
     DFN2PrepostConfig cfg_time, cfg_freq;
@@ -630,7 +753,7 @@ static int case_freqpool(FftHandle *fft) {
     {
         AcStftConfig sc;
         size_t stft_bytes;
-        dfn2_framing_config(&sc, fft, NULL);
+        dfn2_framing_config(&sc, dfn2_test_grid(), fft, NULL);
         stft_bytes = ac_stft_get_mem_size(&sc);
         CHECK(stft_bytes != 0);
         CHECK(req_freq.bytes ==
@@ -685,6 +808,7 @@ static int case_freqpool(FftHandle *fft) {
         CHECK(dfn2_prepost_init_ex(pool_time, (size_t)req_time.bytes,
                                    &cfg_time, &stale) == NULL);
     }
+    CHECK(freqpool_grid_identity(&cfg_freq, &req_freq) == 0);
     free(pool_time);
     free(pool_freq);
     return 0;
@@ -831,7 +955,7 @@ static int case_dual_guards(FftHandle *fft) {
     DFN2Prepost *pt, *pf;
     void *pool_t, *pool_f;
 
-    CHECK(DFN2_PREPOST_CARVE_VERSION == 8u);
+    CHECK(DFN2_PREPOST_CARVE_VERSION == 9u);
 
     config_time(&cfg_time, fft);
     config_freq(&cfg_freq);
@@ -904,8 +1028,8 @@ static void snapshot_state(DFN2Prepost *p, float *gru, float *convp) {
     (void)dfn2_prepost_frame_inputs(p, &in, &out);
     memcpy(gru, &in.gru_hidden[0][0],
            (size_t)DFN2_PREPOST_GRU_HIDDEN_ELEMENTS * sizeof(float));
-    memcpy(convp, &in.df_convp_window[0][0][0],
-           (size_t)DFN2_PREPOST_CONVP_WINDOW_ELEMENTS * sizeof(float));
+    memcpy(convp, in.df_convp_window,
+           (size_t)TEST_CONVP_WINDOW_ELEMENTS * sizeof(float));
 }
 
 static int case_model_run(void) {
@@ -914,9 +1038,9 @@ static int case_model_run(void) {
     static float got_re[DFN2_N_BINS], got_im[DFN2_N_BINS];
     static float ref_re[DFN2_N_BINS], ref_im[DFN2_N_BINS];
     static float gru0[DFN2_PREPOST_GRU_HIDDEN_ELEMENTS];
-    static float convp0[DFN2_PREPOST_CONVP_WINDOW_ELEMENTS];
+    static float convp0[TEST_CONVP_WINDOW_ELEMENTS];
     static float gru1[DFN2_PREPOST_GRU_HIDDEN_ELEMENTS];
-    static float convp1[DFN2_PREPOST_CONVP_WINDOW_ELEMENTS];
+    static float convp1[TEST_CONVP_WINDOW_ELEMENTS];
     DFN2PrepostConfig cfg;
     DFN2PrepostMemReq req;
     DFN2Prepost *p, *q;
@@ -925,7 +1049,7 @@ static int case_model_run(void) {
     DFN2Model model;
     DFN2Model bad;
     DFN2ModelIoDescriptor descriptor;
-    int t, valid = -1, calls;
+    int t, v, valid = -1, calls;
 
     config_freq(&cfg);
     CHECK(dfn2_prepost_get_mem_size(&cfg, &req) == 0);
@@ -940,7 +1064,7 @@ static int case_model_run(void) {
     model.user = &stub;
     model.infer = stub_infer;
     model.reset = stub_reset;
-    CHECK(dfn2_model_io_descriptor_default(&descriptor) == 0);
+    CHECK(dfn2_model_io_descriptor_default(dfn2_test_grid(), &descriptor) == 0);
     model.io_descriptor = &descriptor;
 
     /* Contract errors: no frame open, NULL model, no infer callback. */
@@ -965,6 +1089,23 @@ static int case_model_run(void) {
     descriptor.df_lookahead ^= 1;
     CHECK(dfn2_model_run_frame(&model, p) == -1);
     descriptor.df_lookahead ^= 1;
+    /* The instance holds its grid as a run-time value: a descriptor made for a
+     * valid grid that differs in any one value is refused the same way, and a
+     * descriptor of the instance's own grid is what lets it through. */
+    for (v = 0; v < N_VARIANTS; ++v) {
+        DFN2Grid grid;
+        DFN2ModelIoDescriptor other;
+        CHECK(make_variant(&grid, v) == 0);
+        CHECK(dfn2_model_io_descriptor_default(&grid, &other) == 0);
+        bad = model;
+        bad.io_descriptor = &other;
+        /* the two alphas are not part of the graph contract: only the other
+         * six values can make the descriptor differ */
+        if (v == VARIANT_ERB_ALPHA || v == VARIANT_SPEC_ALPHA)
+            CHECK(memcmp(&other, &descriptor, sizeof other) == 0);
+        else
+            CHECK(dfn2_model_run_frame(&bad, p) == -1);
+    }
     CHECK(stub.calls == 0);
     /* A full write commits and steps the recurrent state. */
     snapshot_state(p, gru0, convp0);
@@ -995,7 +1136,7 @@ static int case_model_run(void) {
     CHECK(dfn2_prepost_pre_process_freq(p, in_re[t], in_im[t]) == 1);
     snapshot_state(p, gru0, convp0);
     CHECK(identical(gru0, gru1, DFN2_PREPOST_GRU_HIDDEN_ELEMENTS));
-    CHECK(identical(convp0, convp1, DFN2_PREPOST_CONVP_WINDOW_ELEMENTS));
+    CHECK(identical(convp0, convp1, TEST_CONVP_WINDOW_ELEMENTS));
     /* A partial write (one head left unwritten) is refused by commit and
      * taken as the identity the same way -- but the accelerator already wrote
      * the state in place, so the refusal zeroes both recurrent tensors. */
@@ -1009,7 +1150,7 @@ static int case_model_run(void) {
     CHECK(dfn2_prepost_pre_process_freq(p, in_re[t], in_im[t]) == 1);
     snapshot_state(p, gru0, convp0);
     CHECK(all_zero(gru0, DFN2_PREPOST_GRU_HIDDEN_ELEMENTS));
-    CHECK(all_zero(convp0, DFN2_PREPOST_CONVP_WINDOW_ELEMENTS));
+    CHECK(all_zero(convp0, TEST_CONVP_WINDOW_ELEMENTS));
     CHECK(!identical(gru0, gru1, DFN2_PREPOST_GRU_HIDDEN_ELEMENTS));
     CHECK(dfn2_prepost_frame_skip(p) == 0);
 
@@ -1043,14 +1184,17 @@ static int case_model_run(void) {
 /* ---- descriptor: the graph contract value ----------------------------- */
 
 static int case_descriptor(void) {
+    const DFN2Grid *grid = dfn2_test_grid();
     DFN2ModelIoDescriptor base, d;
     int *fields[17];
     int i;
 
-    CHECK(dfn2_model_io_descriptor_default(NULL) == -1);
-    CHECK(dfn2_model_io_descriptor_validate(NULL) == -1);
-    CHECK(dfn2_model_io_descriptor_default(&base) == 0);
-    CHECK(dfn2_model_io_descriptor_validate(&base) == 0);
+    CHECK(dfn2_model_io_descriptor_default(grid, NULL) == -1);
+    CHECK(dfn2_model_io_descriptor_default(NULL, &base) == -1);
+    CHECK(dfn2_model_io_descriptor_validate(grid, NULL) == -1);
+    CHECK(dfn2_model_io_descriptor_default(grid, &base) == 0);
+    CHECK(dfn2_model_io_descriptor_validate(NULL, &base) == -1);
+    CHECK(dfn2_model_io_descriptor_validate(grid, &base) == 0);
     CHECK(base.layout_version == (unsigned int)DFN2_MODEL_IO_LAYOUT_VERSION);
     CHECK(base.sample_rate == DFN2_SR && base.fft_size == DFN2_N_FFT &&
           base.hop_size == DFN2_HOP_LEN && base.spectrum_bins == DFN2_N_BINS);
@@ -1063,7 +1207,7 @@ static int case_descriptor(void) {
 
     d = base;
     ++d.layout_version;
-    CHECK(dfn2_model_io_descriptor_validate(&d) == -1);
+    CHECK(dfn2_model_io_descriptor_validate(grid, &d) == -1);
     fields[0] = &d.sample_rate;        fields[1] = &d.fft_size;
     fields[2] = &d.hop_size;           fields[3] = &d.spectrum_bins;
     fields[4] = &d.erb_bands;          fields[5] = &d.df_bins;
@@ -1076,10 +1220,40 @@ static int case_descriptor(void) {
     for (i = 0; i < 17; ++i) {
         d = base;
         *fields[i] += 1;
-        CHECK(dfn2_model_io_descriptor_validate(&d) == -1);
+        CHECK(dfn2_model_io_descriptor_validate(grid, &d) == -1);
     }
     d = base;
-    CHECK(dfn2_model_io_descriptor_validate(&d) == 0);
+    CHECK(dfn2_model_io_descriptor_validate(grid, &d) == 0);
+
+    /* The descriptor is a function of the grid the application hands in: for every
+     * valid grid that differs in one value it is the descriptor of THAT grid, and
+     * the pair of grid and descriptor must agree. A grid value left out of the
+     * descriptor leaves the two descriptors equal and the cross check below
+     * passing where it must be refused. */
+    for (i = 0; i < N_VARIANTS; ++i) {
+        DFN2Grid other;
+        DFN2ModelIoDescriptor other_descriptor;
+        CHECK(make_variant(&other, i) == 0);
+        CHECK(dfn2_model_io_descriptor_default(&other, &other_descriptor) == 0);
+        CHECK(dfn2_model_io_descriptor_validate(&other, &other_descriptor) == 0);
+        if (i == VARIANT_ERB_ALPHA || i == VARIANT_SPEC_ALPHA) {
+            /* the EMA coefficients are not part of the graph contract */
+            CHECK(memcmp(&other_descriptor, &base, sizeof base) == 0);
+            continue;
+        }
+        CHECK(memcmp(&other_descriptor, &base, sizeof base) != 0);
+        CHECK(dfn2_model_io_descriptor_validate(grid, &other_descriptor) == -1);
+        CHECK(dfn2_model_io_descriptor_validate(&other, &base) == -1);
+    }
+
+    /* A grid the library refuses has no descriptor, and a descriptor is not
+     * validated against one. */
+    {
+        DFN2Grid broken = *grid;
+        ++broken.hop;                       /* derived field no longer matches */
+        CHECK(dfn2_model_io_descriptor_default(&broken, &d) == -1);
+        CHECK(dfn2_model_io_descriptor_validate(&broken, &base) == -1);
+    }
     return 0;
 }
 
@@ -1098,6 +1272,10 @@ static int case_lifecycle(FftHandle *fft) {
     CHECK(dfn2_prepost_io_mode(heap) == DFN2_IO_TIME);
     CHECK(dfn2_prepost_hop_size(heap) == DFN2_HOP_LEN);
     CHECK(dfn2_prepost_num_bins(heap) == DFN2_N_BINS);
+    /* The instance reports the grid it was configured with, by value. */
+    CHECK(dfn2_prepost_grid(heap) != NULL);
+    CHECK(dfn2_prepost_grid(heap) != dfn2_test_grid());
+    CHECK(memcmp(dfn2_prepost_grid(heap), dfn2_test_grid(), sizeof(DFN2Grid)) == 0);
     CHECK(dfn2_prepost_layout_version(heap) == DFN2_MODEL_IO_LAYOUT_VERSION);
     CHECK(dfn2_prepost_model_lookahead_frames(heap) == LOOKAHEAD);
     CHECK(drive_time(heap, pcm_in, out_a, SHORT_HOPS) == 0);
@@ -1151,7 +1329,7 @@ static int case_lifecycle(FftHandle *fft) {
     /* _create refuses exactly what _get_mem_size refuses, and allocates
      * nothing when it does. */
     CHECK(dfn2_prepost_create(NULL) == NULL);
-    CHECK(dfn2_prepost_config_defaults(&bad, DFN2_IO_TIME) == 0);
+    CHECK(dfn2_prepost_config_defaults(&bad, DFN2_IO_TIME, dfn2_test_grid()) == 0);
     CHECK(dfn2_prepost_create(&bad) == NULL);      /* no fft, no ERB       */
     bad.erb_fwd = &erb_fwd[0][0];
     bad.erb_inv = &erb_inv[0][0];
@@ -1175,12 +1353,197 @@ static int case_lifecycle(FftHandle *fft) {
     CHECK(dfn2_prepost_io_mode(NULL) == -1);
     CHECK(dfn2_prepost_model_lookahead_frames(NULL) == -1);
     CHECK(dfn2_prepost_layout_version(NULL) == -1);
+    CHECK(dfn2_prepost_grid(NULL) == NULL);
     CHECK(dfn2_prepost_output_frame_index(NULL, &frame) == -1);
     dfn2_prepost_reset(NULL);
     return 0;
 }
 
 /* ---- reject: reject-first validation --------------------------------- */
+
+/* The grid is a run-time value, so everything the build used to refuse (a lookahead pair
+ * whose ring does not fit, a size the arrays cannot hold, a hand-edited derived field) is
+ * now refused by the library when the value arrives: by dfn2_grid_make() with the status of
+ * the first failing check, by dfn2_grid_validate() for a grid built by hand, and by every
+ * object that takes a grid. */
+typedef struct {
+    int sample_rate, n_fft, n_erb, df_bins, mask, df;
+    int want;
+} GridCase;
+
+/* The status for a value the capacity decides: the shipped build holds the defaults of
+ * dfn2_grid.h, a build that raised one of them accepts what it was raised for. */
+#define CAPACITY_STATUS(over) ((over) ? DFN2_GRID_ERR_CAPACITY : DFN2_GRID_OK)
+
+static void tamper_grid(DFN2Grid *grid, int which) {
+    *grid = *dfn2_test_grid();
+    switch (which) {
+    case 0: ++grid->hop; break;
+    case 1: ++grid->n_bins; break;
+    case 2: ++grid->df_history; break;
+    case 3: ++grid->ring; break;
+    case 4: grid->stft_scale *= 2.0f; break;
+    case 5: grid->stft_unscale *= 2.0f; break;
+    case 6: grid->erb_norm_alpha = 1.0f; break;
+    case 7: grid->spec_norm_alpha = (float)NAN; break;
+    default: grid->erb_norm_alpha = 0.0f; break;
+    }
+}
+#define N_TAMPERS 9
+
+static int check_grid_refusals(FftHandle *fft) {
+    static DFN2State state;
+    static DFN2ModelIOState io;
+    static float erb_row[DFN2_N_ERB], spec_row[2 * DFN2_DF_BINS];
+    const DFN2Grid *grid = dfn2_test_grid();
+    const int sr = DFN2_SR, nf = DFN2_N_FFT, ne = DFN2_N_ERB, db = DFN2_DF_BINS;
+    const int m = DFN2_MASK_LOOKAHEAD, d = DFN2_DF_LOOKAHEAD;
+    const GridCase cases[] = {
+        {0,  nf, ne, db, m, d, DFN2_GRID_ERR_SAMPLE_RATE},
+        {-1, nf, ne, db, m, d, DFN2_GRID_ERR_SAMPLE_RATE},
+        {sr, 960,   ne, db, m, d, DFN2_GRID_ERR_N_FFT},      /* not a power of two */
+        {sr, 8,     ne, db, m, d, DFN2_GRID_ERR_N_FFT},
+        {sr, 16384, ne, db, m, d, DFN2_GRID_ERR_N_FFT},      /* above audiolib's limit */
+        {sr, nf, 30, db, m, d, DFN2_GRID_ERR_N_ERB},         /* not a multiple of 4 */
+        {sr, nf, 0,  db, m, d, DFN2_GRID_ERR_N_ERB},
+        {sr, 64, 20, db, m, d, DFN2_GRID_ERR_N_ERB},         /* a band under two bins */
+        {sr, nf, ne, 1,  m, d, DFN2_GRID_ERR_DF_BINS},
+        {sr, nf, ne, nf / 2 + 1, m, d, DFN2_GRID_ERR_DF_BINS}, /* no bin left to mask */
+        {sr, nf, ne, db, 3,  d, DFN2_GRID_ERR_MASK_LOOKAHEAD},
+        {sr, nf, ne, db, -1, d, DFN2_GRID_ERR_MASK_LOOKAHEAD},
+        {sr, nf, ne, db, m, 5,  DFN2_GRID_ERR_DF_LOOKAHEAD},
+        {sr, nf, ne, db, m, -1, DFN2_GRID_ERR_DF_LOOKAHEAD},
+        /* capacity: the arrays of this build hold DFN2_MAX_* and no more */
+        {sr, 2048, ne, db,  m, d, CAPACITY_STATUS(2048 > DFN2_MAX_N_FFT)},
+        {sr, nf, 36, db,        m, d, CAPACITY_STATUS(36 > DFN2_MAX_N_ERB)},
+        {sr, nf, ne, 100,       m, d, CAPACITY_STATUS(100 > DFN2_MAX_DF_BINS)},
+        {sr, nf, ne, db, 2, 4, CAPACITY_STATUS(7 > DFN2_MAX_DF_RING)},  /* ring 7 */
+        {sr, nf, ne, db, 2, 3, CAPACITY_STATUS(6 > DFN2_MAX_DF_RING)},  /* ring 6 */
+        {sr, nf, ne, db, 2, 2, CAPACITY_STATUS(5 > DFN2_MAX_DF_RING)},  /* ring 5 */
+    };
+    DFN2Grid out, untouched;
+    DFN2PrepostConfig cfg;
+    DFN2PrepostMemReq req, guard;
+    size_t i;
+    int t;
+
+    memset(&untouched, 0xa5, sizeof untouched);
+    for (i = 0; i < sizeof cases / sizeof cases[0]; ++i) {
+        out = untouched;
+        if (dfn2_grid_make(&out, cases[i].sample_rate, cases[i].n_fft,
+                           cases[i].n_erb, cases[i].df_bins, cases[i].mask,
+                           cases[i].df) != cases[i].want) {
+            fprintf(stderr, "grid case %zu: wrong status\n", i);
+            return 1;
+        }
+        /* a refusal writes nothing; an accepted value is a valid grid */
+        if (cases[i].want != DFN2_GRID_OK)
+            CHECK(memcmp(&out, &untouched, sizeof out) == 0);
+        else
+            CHECK(dfn2_grid_validate(&out) == DFN2_GRID_OK);
+    }
+    CHECK(dfn2_grid_make(NULL, sr, nf, ne, db, m, d) == DFN2_GRID_ERR_NULL);
+    CHECK(dfn2_grid_validate(NULL) == DFN2_GRID_ERR_NULL);
+    CHECK(dfn2_grid_validate(grid) == DFN2_GRID_OK);
+
+    /* A grid built by hand beyond the arrays is refused as a capacity error, not
+     * accepted for its consistent-looking derived fields: it is the check that
+     * keeps a state of this build from being indexed past its end. */
+    out = *grid;
+    out.n_fft = 2 * DFN2_MAX_N_FFT;
+    out.hop = out.n_fft / 2;
+    out.n_bins = out.n_fft / 2 + 1;
+    out.stft_scale = 1.0f / sqrtf((float)out.n_fft);
+    out.stft_unscale = sqrtf((float)out.n_fft);
+    CHECK(dfn2_grid_validate(&out) == DFN2_GRID_ERR_CAPACITY);
+    CHECK(dfn2_state_init(&state, &out, NULL, NULL) == -1);
+    CHECK(dfn2_model_io_init(&io, &out) == -1);
+    config_time(&cfg, fft);
+    cfg.grid = out;
+    memset(&guard, 0xa5, sizeof guard);
+    req = guard;
+    CHECK(dfn2_prepost_get_mem_size(&cfg, &req) == -1);
+    CHECK(memcmp(&req, &guard, sizeof req) == 0);
+
+    /* Each hand-edited derived field (and an alpha outside (0, 1)) is
+     * INCONSISTENT, and no consumer takes the grid. */
+    memset(erb_row, 0, sizeof erb_row);
+    memset(spec_row, 0, sizeof spec_row);
+    for (t = 0; t < N_TAMPERS; ++t) {
+        DFN2Grid bad;
+        AcStftConfig sc, sc_zero;
+        void *pool;
+        tamper_grid(&bad, t);
+        CHECK(memcmp(&bad, grid, sizeof bad) != 0);
+        CHECK(dfn2_grid_validate(&bad) == DFN2_GRID_ERR_INCONSISTENT);
+
+        CHECK(dfn2_prepost_config_defaults(&cfg, DFN2_IO_FREQ, &bad) == -1);
+        config_freq(&cfg);
+        cfg.grid = bad;
+        req = guard;
+        CHECK(dfn2_prepost_get_mem_size(&cfg, &req) == -1);
+        CHECK(memcmp(&req, &guard, sizeof req) == 0);
+        CHECK(dfn2_prepost_create(&cfg) == NULL);
+        config_freq(&cfg);
+        CHECK(dfn2_prepost_get_mem_size(&cfg, &req) == 0);
+        pool = alloc_aligned(req.alignment, (size_t)req.bytes);
+        CHECK(pool != NULL);
+        cfg.grid = bad;
+        CHECK(dfn2_prepost_init(pool, (size_t)req.bytes, &cfg) == NULL);
+        free(pool);
+
+        CHECK(dfn2_state_init(&state, &bad, NULL, NULL) == -1);
+        CHECK(dfn2_model_io_init(&io, &bad) == -1);
+        /* a state that has no grid runs nothing */
+        CHECK(dfn2_model_io_ready_frames(&io) == 0u);
+        CHECK(dfn2_model_io_push_features(&io, erb_row, spec_row) == -1);
+
+        /* The framing of a refused grid is the zero config, over whatever the caller's
+         * config held: no framing object can be built from it (0 bytes), and the
+         * caller's FFT handle is not taken over. */
+        memset(&sc, 0x5a, sizeof sc);
+        memset(&sc_zero, 0, sizeof sc_zero);
+        dfn2_framing_config(&sc, &bad, fft, NULL);
+        CHECK(memcmp(&sc, &sc_zero, sizeof sc) == 0);
+        CHECK(ac_stft_get_mem_size(&sc) == 0u);
+        CHECK(ac_istft_get_mem_size(&sc) == 0u);
+    }
+    /* ...and the same calls accept the test grid, or the refusals above prove
+     * nothing. */
+    CHECK(dfn2_state_init(&state, grid, NULL, NULL) == 0);
+    CHECK(dfn2_model_io_init(&io, grid) == 0);
+    CHECK(dfn2_model_io_ready_frames(&io) ==
+          (unsigned)(DFN2_MASK_LOOKAHEAD + DFN2_FRAMES_PER_CALL));
+    CHECK(dfn2_model_io_ready_frames(NULL) == 0u);
+    CHECK(dfn2_state_init(NULL, grid, NULL, NULL) == -1);
+    CHECK(dfn2_model_io_init(NULL, grid) == -1);
+    {
+        AcStftConfig sc, sc_guard;
+        memset(&sc, 0x5a, sizeof sc);
+        sc_guard = sc;
+        dfn2_framing_config(&sc, grid, fft, NULL);
+        CHECK(memcmp(&sc, &sc_guard, sizeof sc) != 0);
+        CHECK(sc.fft_size == DFN2_N_FFT);
+        CHECK(sc.spec_scale == grid->stft_scale);
+        CHECK(sc.ispec_scale == grid->stft_unscale);
+    }
+
+    /* The grid in the config and the transform the caller hands over must agree:
+     * a valid grid of another frame size is refused against this FFT handle, one
+     * that only changes the sample rate is not (the transform does not depend on
+     * it). */
+    {
+        DFN2Grid other;
+        config_time(&cfg, fft);
+        CHECK(make_variant(&other, VARIANT_N_FFT) == 0);
+        cfg.grid = other;
+        CHECK(dfn2_prepost_get_mem_size(&cfg, &req) == -1);
+        CHECK(make_variant(&other, VARIANT_SAMPLE_RATE) == 0);
+        cfg.grid = other;
+        CHECK(dfn2_prepost_get_mem_size(&cfg, &req) == 0);
+    }
+    return 0;
+}
 
 static int case_reject(FftHandle *fft) {
     DFN2PrepostConfig cfg;
@@ -1194,9 +1557,11 @@ static int case_reject(FftHandle *fft) {
     CHECK(dfn2_prepost_get_mem_size(&cfg, &req) == 0);
     CHECK(req.bytes > 0u);
 
-    CHECK(dfn2_prepost_config_defaults(NULL, DFN2_IO_TIME) == -1);
-    CHECK(dfn2_prepost_config_defaults(&cfg, 2) == -1);
-    CHECK(dfn2_prepost_config_defaults(&cfg, -1) == -1);
+    CHECK(check_grid_refusals(fft) == 0);
+    CHECK(dfn2_prepost_config_defaults(NULL, DFN2_IO_TIME, dfn2_test_grid()) == -1);
+    CHECK(dfn2_prepost_config_defaults(&cfg, 2, dfn2_test_grid()) == -1);
+    CHECK(dfn2_prepost_config_defaults(&cfg, -1, dfn2_test_grid()) == -1);
+    CHECK(dfn2_prepost_config_defaults(&cfg, DFN2_IO_TIME, NULL) == -1);
 
     /* *req is left untouched on every refusal, not half-filled. */
     memset(&guard, 0xa5, sizeof guard);
@@ -1276,7 +1641,7 @@ static int case_reject(FftHandle *fft) {
         CHECK(memcmp(&req, &guard, sizeof req) == 0);
         CHECK(dfn2_prepost_create(&cfg) == NULL);
 
-        dfn2_framing_config(&sc, fft, NULL);
+        dfn2_framing_config(&sc, dfn2_test_grid(), fft, NULL);
         sc.ola = AC_OLA_ENV_NORM;                         /* wrong mode  */
         bytes = ac_istft_get_mem_size(&sc);
         mem = alloc_aligned(16u, bytes);
@@ -1285,7 +1650,7 @@ static int case_reject(FftHandle *fft) {
         cfg.istft = other;
         CHECK(dfn2_prepost_get_mem_size(&cfg, &req) == -1);
 
-        dfn2_framing_config(&sc, fft, NULL);
+        dfn2_framing_config(&sc, dfn2_test_grid(), fft, NULL);
         sc.ispec_scale = 1.0f;                            /* wrong scale */
         bytes = ac_istft_get_mem_size(&sc);
         mem = alloc_aligned(16u, bytes);
@@ -1293,7 +1658,7 @@ static int case_reject(FftHandle *fft) {
         cfg.istft = other;
         CHECK(dfn2_prepost_get_mem_size(&cfg, &req) == -1);
 
-        dfn2_framing_config(&sc, NULL, NULL);             /* wrong size  */
+        dfn2_framing_config(&sc, dfn2_test_grid(), NULL, NULL); /* wrong size */
         sc.fft_size = DFN2_N_FFT / 2;
         bytes = ac_istft_get_mem_size(&sc);
         mem = alloc_aligned(16u, bytes);
@@ -1450,11 +1815,11 @@ static int case_skip(void) {
     static float in_im[SKIP_TOTAL][DFN2_N_BINS];
     static float got_re[DFN2_N_BINS], got_im[DFN2_N_BINS];
     static float snap_gru[DFN2_PREPOST_GRU_HIDDEN_ELEMENTS];
-    static float snap_convp[DFN2_PREPOST_CONVP_WINDOW_ELEMENTS];
-    static float snap_erb_window[DFN2_PREPOST_ERB_WINDOW_ELEMENTS];
-    static float snap_spec_window[DFN2_PREPOST_SPEC_WINDOW_ELEMENTS];
+    static float snap_convp[TEST_CONVP_WINDOW_ELEMENTS];
+    static float snap_erb_window[TEST_ERB_WINDOW_ELEMENTS];
+    static float snap_spec_window[TEST_SPEC_WINDOW_ELEMENTS];
     static float wrote_gru[DFN2_PREPOST_GRU_HIDDEN_ELEMENTS];
-    static float wrote_convp[DFN2_PREPOST_CONVP_WINDOW_ELEMENTS];
+    static float wrote_convp[TEST_CONVP_WINDOW_ELEMENTS];
     DFN2PrepostConfig cfg;
     DFN2PrepostMemReq req;
     DFN2PrepostInputs inputs;
@@ -1523,20 +1888,20 @@ static int case_skip(void) {
     CHECK(dfn2_prepost_pre_process_freq(p, in_re[t], in_im[t]) == 1);
     CHECK(dfn2_prepost_frame_inputs(p, &inputs, &outputs) == 0);
     memcpy(snap_gru, &inputs.gru_hidden[0][0], sizeof snap_gru);
-    memcpy(snap_convp, &inputs.df_convp_window[0][0][0], sizeof snap_convp);
-    memcpy(snap_erb_window, &inputs.erb_window[0][0], sizeof snap_erb_window);
-    memcpy(snap_spec_window, &inputs.spec_window[0][0][0],
+    memcpy(snap_convp, inputs.df_convp_window, sizeof snap_convp);
+    memcpy(snap_erb_window, inputs.erb_window, sizeof snap_erb_window);
+    memcpy(snap_spec_window, inputs.spec_window,
            sizeof snap_spec_window);
     CHECK(any_nonzero(snap_gru, DFN2_PREPOST_GRU_HIDDEN_ELEMENTS));
-    CHECK(any_nonzero(snap_convp, DFN2_PREPOST_CONVP_WINDOW_ELEMENTS));
+    CHECK(any_nonzero(snap_convp, TEST_CONVP_WINDOW_ELEMENTS));
     fake_run(&inputs, &outputs);
     CHECK(state_aliased(&inputs, &outputs));
     memcpy(wrote_gru, &inputs.gru_hidden[0][0], sizeof wrote_gru);
-    memcpy(wrote_convp, &inputs.df_convp_window[0][0][0], sizeof wrote_convp);
+    memcpy(wrote_convp, inputs.df_convp_window, sizeof wrote_convp);
     /* The in-place write moved every state tensor off the snapshot. */
     CHECK(!identical(wrote_gru, snap_gru, DFN2_PREPOST_GRU_HIDDEN_ELEMENTS));
     CHECK(!identical(wrote_convp, snap_convp,
-                     DFN2_PREPOST_CONVP_WINDOW_ELEMENTS));
+                     TEST_CONVP_WINDOW_ELEMENTS));
     CHECK(dfn2_prepost_frame_skip(p) == 0);
     CHECK(dfn2_prepost_post_process_freq(p, got_re, got_im, NULL) == 0);
     /* Whether this hop's emission is the identity follows the same rule, and
@@ -1555,15 +1920,15 @@ static int case_skip(void) {
     CHECK(dfn2_prepost_frame_inputs(p, &inputs, &outputs) == 0);
     CHECK(identical(&inputs.gru_hidden[0][0], wrote_gru,
                     inputs.gru_hidden_elements));
-    CHECK(identical(&inputs.df_convp_window[0][0][0], wrote_convp,
+    CHECK(identical(inputs.df_convp_window, wrote_convp,
                     inputs.df_convp_window_elements));
     CHECK(!identical(&inputs.gru_hidden[0][0], snap_gru,
                      inputs.gru_hidden_elements));
-    CHECK(!identical(&inputs.df_convp_window[0][0][0], snap_convp,
+    CHECK(!identical(inputs.df_convp_window, snap_convp,
                      inputs.df_convp_window_elements));
-    CHECK(!identical(&inputs.erb_window[0][0], snap_erb_window,
+    CHECK(!identical(inputs.erb_window, snap_erb_window,
                      inputs.erb_window_elements));
-    CHECK(!identical(&inputs.spec_window[0][0][0], snap_spec_window,
+    CHECK(!identical(inputs.spec_window, snap_spec_window,
                      inputs.spec_window_elements));
 
     /* A skip over a frame on which the accelerator never ran writes nothing,
@@ -1577,7 +1942,7 @@ static int case_skip(void) {
     CHECK(dfn2_prepost_frame_inputs(p, &inputs, &outputs) == 0);
     CHECK(identical(&inputs.gru_hidden[0][0], wrote_gru,
                     inputs.gru_hidden_elements));
-    CHECK(identical(&inputs.df_convp_window[0][0][0], wrote_convp,
+    CHECK(identical(inputs.df_convp_window, wrote_convp,
                     inputs.df_convp_window_elements));
 
     /* ...and a commit here DOES move them, so the freeze above is not
@@ -1592,7 +1957,7 @@ static int case_skip(void) {
     CHECK(dfn2_prepost_frame_inputs(p, &inputs, &outputs) == 0);
     CHECK(!identical(&inputs.gru_hidden[0][0], wrote_gru,
                      inputs.gru_hidden_elements));
-    CHECK(!identical(&inputs.df_convp_window[0][0][0], wrote_convp,
+    CHECK(!identical(inputs.df_convp_window, wrote_convp,
                      inputs.df_convp_window_elements));
     CHECK(dfn2_prepost_frame_skip(p) == 0);
 
@@ -1683,7 +2048,7 @@ static int case_guard(FftHandle *fft) {
          * committable again.  Retrying while the NaN is still in place
          * would be refused by the finiteness preflight whether or not the
          * transaction was disarmed, and would prove nothing. */
-        const size_t poison = DFN2_PREPOST_COEFS_ELEMENTS / 2;
+        const size_t poison = TEST_COEFS_ELEMENTS / 2;
         float good = outputs.coefs[poison];
         CHECK(isfinite(good));
         outputs.coefs[poison] = (float)NAN;
@@ -1739,7 +2104,7 @@ static int txn_reference(DFN2Prepost *p, float *out, int mode) {
                     fake_run(&inputs, &outputs);
                     memset(&outputs.gru_hidden_next[0][0], 0,
                            outputs.gru_hidden_elements * sizeof(float));
-                    memset(&outputs.df_convp_window_next[0][0][0], 0,
+                    memset(outputs.df_convp_window_next, 0,
                            outputs.df_convp_window_elements * sizeof(float));
                 }
                 if (dfn2_prepost_frame_skip(p) != 0) return -1;
@@ -1757,8 +2122,8 @@ static int txn_reference(DFN2Prepost *p, float *out, int mode) {
 }
 
 static int txn_poisoned(DFN2Prepost *p, float *out, int tensor, size_t index) {
-    static float snap_erb_window[DFN2_PREPOST_ERB_WINDOW_ELEMENTS];
-    static float snap_spec_window[DFN2_PREPOST_SPEC_WINDOW_ELEMENTS];
+    static float snap_erb_window[TEST_ERB_WINDOW_ELEMENTS];
+    static float snap_spec_window[TEST_SPEC_WINDOW_ELEMENTS];
     static float hop_scratch[DFN2_HOP_LEN];
     int hop;
 
@@ -1772,9 +2137,9 @@ static int txn_poisoned(DFN2Prepost *p, float *out, int tensor, size_t index) {
             float *target;
             size_t count = 0;
             CHECK(dfn2_prepost_frame_inputs(p, &inputs, &outputs) == 0);
-            memcpy(snap_erb_window, &inputs.erb_window[0][0],
+            memcpy(snap_erb_window, inputs.erb_window,
                    sizeof snap_erb_window);
-            memcpy(snap_spec_window, &inputs.spec_window[0][0][0],
+            memcpy(snap_spec_window, inputs.spec_window,
                    sizeof snap_spec_window);
             fake_run(&inputs, &outputs);
             target = output_tensor(&outputs, tensor, &count);
@@ -1793,9 +2158,9 @@ static int txn_poisoned(DFN2Prepost *p, float *out, int tensor, size_t index) {
             CHECK(dfn2_prepost_frame_inputs(p, &inputs, &outputs) == 0);
             CHECK(state_aliased(&inputs, &outputs));
             CHECK(state_all_zero(&inputs));
-            CHECK(identical(&inputs.erb_window[0][0], snap_erb_window,
+            CHECK(identical(inputs.erb_window, snap_erb_window,
                             inputs.erb_window_elements));
-            CHECK(identical(&inputs.spec_window[0][0][0], snap_spec_window,
+            CHECK(identical(inputs.spec_window, snap_spec_window,
                             inputs.spec_window_elements));
             /* (c) the documented recovery: take the identity. */
             CHECK(dfn2_prepost_frame_skip(p) == 0);
@@ -1894,7 +2259,7 @@ static int case_state_inplace(void) {
     CHECK(p != NULL);
     CHECK(open_first_frame_freq(p, re, im) >= 0);
     CHECK(dfn2_prepost_frame_inputs(p, &in, &out) == 0);
-    a = &in.df_convp_window[0][0][0];
+    a = in.df_convp_window;
     CHECK(state_aliased(&in, &out));
     CHECK(in.df_convp_window_elements == out.df_convp_window_elements);
     CHECK(state_all_zero(&in));
@@ -1908,8 +2273,8 @@ static int case_state_inplace(void) {
     for (frame = 0; frame < 3; ++frame) {
         CHECK(dfn2_prepost_pre_process_freq(p, re, im) == 1);
         CHECK(dfn2_prepost_frame_inputs(p, &in, &out) == 0);
-        CHECK(&in.df_convp_window[0][0][0] == a);
-        CHECK(&out.df_convp_window_next[0][0][0] == a);
+        CHECK(in.df_convp_window == a);
+        CHECK(out.df_convp_window_next == a);
         CHECK(state_aliased(&in, &out));
         if (frame == 0) {
             /* A refused commit zeroes the state in place; no address moves. */
@@ -1926,7 +2291,7 @@ static int case_state_inplace(void) {
     dfn2_prepost_reset(p);
     CHECK(open_first_frame_freq(p, re, im) >= 0);
     CHECK(dfn2_prepost_frame_inputs(p, &in, &out) == 0);
-    CHECK(&in.df_convp_window[0][0][0] == a);
+    CHECK(in.df_convp_window == a);
     CHECK(state_aliased(&in, &out));
     CHECK(state_all_zero(&in));
     dfn2_prepost_destroy(p);
@@ -1967,11 +2332,17 @@ static int case_inplace_nan(void) {
                 break;
         case 2: poison = &out.gru_hidden_next[DFN2_MODEL_GRU_ROW_DF + 1][0];
                 break;
-        default: poison = &out.df_convp_window_next
-                       [DFN2_MODEL_ENCODER_CHANNELS - 1]
-                       [DFN2_MODEL_DF_PATHWAY_WINDOW - 1]
-                       [DFN2_DF_BINS - 1];
-                 break;
+        default: {
+            /* the last element of the packed [channels][window][df_bins] run */
+            const size_t last =
+                (((size_t)DFN2_MODEL_ENCODER_CHANNELS - 1u) *
+                     DFN2_MODEL_DF_PATHWAY_WINDOW +
+                 (DFN2_MODEL_DF_PATHWAY_WINDOW - 1u)) * DFN2_DF_BINS +
+                (DFN2_DF_BINS - 1u);
+            CHECK(last + 1u == out.df_convp_window_elements);
+            poison = &out.df_convp_window_next[last];
+            break;
+        }
         }
         CHECK(isfinite(*poison));
         *poison = (float)NAN;
@@ -2123,6 +2494,31 @@ int main(int argc, char **argv) {
                 argv[0]);
         return 2;
     }
+    /* The arrays of this driver are sized by the test grid's macros; the library
+     * derives the same numbers from the grid it is handed. They must agree, or a
+     * tensor would overrun a buffer here without any case noticing. */
+    {
+        const DFN2Grid *grid = dfn2_test_grid();
+        CHECK(dfn2_grid_validate(grid) == DFN2_GRID_OK);
+        CHECK(grid->sample_rate == DFN2_SR && grid->n_fft == DFN2_N_FFT);
+        CHECK(grid->hop == DFN2_HOP_LEN && grid->n_bins == DFN2_N_BINS);
+        CHECK(grid->n_erb == DFN2_N_ERB && grid->df_bins == DFN2_DF_BINS);
+        CHECK(grid->mask_lookahead == DFN2_MASK_LOOKAHEAD);
+        CHECK(grid->df_lookahead == DFN2_DF_LOOKAHEAD);
+        CHECK(grid->df_history == DFN2_DF_HISTORY && grid->ring == DFN2_DF_RING);
+        CHECK(grid->stft_scale == DFN2_NORMALIZED_STFT_SCALE);
+        CHECK(grid->stft_unscale == DFN2_NORMALIZED_STFT_UNSCALE);
+        CHECK(dfn2_prepost_erb_window_elements(grid) ==
+              (size_t)TEST_ERB_WINDOW_ELEMENTS);
+        CHECK(dfn2_prepost_spec_window_elements(grid) ==
+              (size_t)TEST_SPEC_WINDOW_ELEMENTS);
+        CHECK(dfn2_prepost_erb_mask_elements(grid) ==
+              (size_t)TEST_ERB_MASK_ELEMENTS);
+        CHECK(dfn2_prepost_convp_window_elements(grid) ==
+              (size_t)TEST_CONVP_WINDOW_ELEMENTS);
+        CHECK(dfn2_prepost_coefs_elements(grid) == (size_t)TEST_COEFS_ELEMENTS);
+        CHECK(dfn2_prepost_latency_frames(grid) == LOOKAHEAD);
+    }
     build_erb();
     /* frame_skip's identity is exact only because a unit band mask expands
      * to a unit bin gain.  Pin that here, in the same accumulation order
@@ -2175,9 +2571,12 @@ def audio_common_lib():
 
 
 # Every (DFN2_MASK_LOOKAHEAD, DFN2_DF_LOOKAHEAD) pair built here is one the model
-# accepts. The shipped pair is the header default and is built with no override;
-# the others are built with -D overrides, which is how a board build selects a
-# checkpoint trained for another pair.
+# accepts. The shipped pair is the default of tests/dfn2_test_grid.h and is built with
+# no override; the others are built with -DDFN2_MASK_LOOKAHEAD / -DDFN2_DF_LOOKAHEAD,
+# which only that test header reads (a pair whose ring is deeper than 5 also needs
+# -DDFN2_MAX_DF_RING). The library reads neither macro: it takes the pair from the
+# DFN2Grid its caller builds, and a board sample builds that grid with dfn2_grid_make()
+# from its own table.
 _LOOKAHEAD_PAIRS = dfn_pairs.c_build_pairs(FAMILY)
 _SHIPPED_PAIR = dfn_pairs.shipped_pair(FAMILY)
 # The argument-free cases the driver dispatches on argv[1]; every case the
@@ -2192,7 +2591,7 @@ assert set(_CASES) == (
 def _build_driver(tmp_path_factory, audio_common_lib, pair=None):
     """One executable for every case: the class plus the two TUs it composes,
     compiled at the house flags with -Werror. `pair` overrides the lookahead
-    constants; None builds the header defaults."""
+    macros of the test grid header; None builds that header's defaults."""
     work = tmp_path_factory.mktemp('dfn2_prepost_c')
     source = work / 'driver.c'
     source.write_text(_DRIVER, encoding='utf-8')
@@ -2256,9 +2655,11 @@ def test_freq_mode_matches_time_mode(driver):
 def test_freq_pool_is_smaller_and_stale_pool_gate_holds(driver):
     """DFN2_IO_FREQ must not carve the output hop staging or the framing
     objects it never uses, the
-    MemReq must carry this build's identity, and _init_ex must accept the
+    MemReq must carry the instance's identity, and _init_ex must accept the
     matching descriptor while refusing the other mode's and any single-field
-    perturbation of its own."""
+    perturbation of its own. The identity folds in the whole grid: a request
+    sized for a grid that differs in any one value (with size and alignment
+    forged equal) is refused in the same binary."""
     stdout = _run(driver, 'freqpool')
     assert 'pool FREQ' in stdout
 
@@ -2275,9 +2676,13 @@ def test_create_destroy_roundtrip_and_pool_init_agree(driver):
 def test_reject_first_validation(driver):
     """_get_mem_size leaves *req untouched when it refuses (NULL args, an
     unknown io_mode, a missing ERB matrix in either mode, a non-finite
-    attenuation limit, DFN2_IO_TIME without or with a wrong-size FftHandle);
-    _init refuses a NULL, undersized or misaligned pool; and the stage calls
-    refuse NULLs and out-of-order use."""
+    attenuation limit, DFN2_IO_TIME without or with a wrong-size FftHandle,
+    a grid that is NULL, hand-edited or above the capacity); _init refuses a
+    NULL, undersized or misaligned pool; and the stage calls refuse NULLs and
+    out-of-order use. The grid refusals are the run-time form of what a build
+    used to reject: dfn2_grid_make() returns the status of the first failing
+    value (the capacity ones follow the build's DFN2_MAX_*), and no object takes
+    a grid dfn2_grid_validate() refuses."""
     _run(driver, 'reject')
 
 
@@ -2345,14 +2750,15 @@ def test_dual_entry_guards_and_gain_accessor(driver):
     """The dual entry is refused in DFN2_IO_TIME (without opening a frame),
     on any NULL argument and with a frame open; the head bin gain is NULL
     with a frame open and before the first hop that carried heads, and is
-    the unit gain after a frame_skip; the carve version is 6."""
+    the unit gain after a frame_skip; the carve version is 9."""
     _run(driver, 'dual_guards')
 
 
 def test_model_run_frame_commits_or_takes_the_identity(driver):
     """dfn2_model_run_frame: contract errors (-1) for no open frame, a NULL
     model/instance, no infer callback, a NULL io_descriptor or one whose
-    mask_lookahead or df_lookahead differs from the build; a full write returns 1 and steps the
+    mask_lookahead or df_lookahead differs from the instance's grid, or one
+    made for a grid that differs in any other value; a full write returns 1 and steps the
     recurrent state; a refused inference (nothing written) returns 0, leaves
     every recurrent tensor byte-identical and still emits; a partial write
     (state written in place, one head unwritten) returns 0 with both
@@ -2362,9 +2768,10 @@ def test_model_run_frame_commits_or_takes_the_identity(driver):
 
 
 def test_model_io_descriptor_default_validates_and_every_field_is_checked(driver):
-    """validate(default()) == 0 and a +1 perturbation of every one of the 18
-    fields is refused, so a field added to the struct but omitted from
-    validate cannot pass."""
+    """validate(grid, default(grid)) == 0 and a +1 perturbation of every one of
+    the 18 fields is refused, so a field added to the struct but omitted from
+    validate cannot pass; the descriptor of a grid that differs in one value is
+    refused against this grid, and a refused grid has no descriptor."""
     _run(driver, 'descriptor')
 
 
@@ -2400,10 +2807,10 @@ def test_every_case_holds_for_every_other_lookahead_pair(pair_driver, case):
 
 def test_a_pool_identity_from_another_lookahead_pair_is_refused(
         tmp_path, driver, other_pair_drivers):
-    """The build identity folds in both lookahead constants: a host built for
-    one trained pair refuses a pool (and so a graph description) sized by a
-    build for another: refused outright, and still refused when the dumped
-    request is given this build's size and alignment (identity alone)."""
+    """The pool identity folds in the grid's lookahead pair: a host whose grid
+    names one trained pair refuses a pool (and so a graph description) sized for
+    another: refused outright, and still refused when the dumped request is
+    given this host's size and alignment (identity alone)."""
     builds = {_SHIPPED_PAIR: driver, **other_pair_drivers}
     dumps, hashes = {}, set()
     for pair, exe in builds.items():

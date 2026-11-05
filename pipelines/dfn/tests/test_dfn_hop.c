@@ -29,7 +29,7 @@ static float unit(void) {
 }
 
 static DfnResStageConfig stage_config(void) {
-    DfnResStageConfig cfg = dfn_res_stage_default_config(DFN2_SR);
+    DfnResStageConfig cfg = dfn_res_stage_default_config(dfn_test_grid());
     cfg.erb_fwd = g_erb_fwd;
     cfg.erb_inv = g_erb_inv;
     cfg.model.infer = dfn_fixture_identity_infer;
@@ -37,7 +37,8 @@ static DfnResStageConfig stage_config(void) {
     return cfg;
 }
 
-/* One grid under test: 48 kHz drives the stage, 16 kHz/256 the bridge. */
+/* One grid under test: the test grid (48 kHz as shipped) drives the stage, 16 kHz/256 the bridge
+ * (which needs the 48 kHz / 1024 model). */
 typedef struct Rig {
     int bridge_mode, n, hop;
     DfnHop h;
@@ -52,7 +53,7 @@ static int rig_init(Rig* r, int bridge_mode) {
     memset(r, 0, sizeof *r);
     r->bridge_mode = bridge_mode;
     if (bridge_mode) {
-        DfnRateBridgeConfig bc = dfn_rate_bridge_default_config(16000);
+        DfnRateBridgeConfig bc = dfn_rate_bridge_default_config(16000, dfn_test_grid());
         bc.stage = stage_config();
         r->bridge = dfn_rate_bridge_create(&bc);
         if (!r->bridge) return -1;
@@ -230,13 +231,15 @@ static void test_path(int bridge_mode) {
 }
 
 int main(void) {
-    dfn_unit_partition(g_erb_fwd, g_erb_inv);
-    if (dfn2_model_io_descriptor_default(&g_descriptor) != 0) {
+    dfn_unit_partition(g_erb_fwd, g_erb_inv, dfn_test_grid());
+    if (dfn2_model_io_descriptor_default(dfn_test_grid(), &g_descriptor) != 0) {
         printf("FAIL: model descriptor\n");
         return 1;
     }
+    dfn_test_report_pair("dfn_hop", -1);
     test_path(0);
-    test_path(1);
+    if (DFN2_SR == 48000 && DFN2_N_FFT == 1024) test_path(1);
+    else printf("dfn_hop: the test grid is not 48 kHz / 1024, so the bridge path (which needs it) is skipped\n");
     if (g_fail) { printf("%d check(s) FAILED\n", g_fail); return 1; }
     printf("ALL PASS\n");
     return 0;

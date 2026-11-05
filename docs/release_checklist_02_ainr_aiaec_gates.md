@@ -94,6 +94,12 @@ make -C AINR test-pairs   # DeepFilterNet2/3 lookahead pairs other than the ship
       pairs the tests list (the six pairs with `D <= M`, and (0,1), (1,3),
       (2,4)); a pair outside that list is not claimed as tested in C, and the
       audio quality of any pair other than 1/1 is unmeasured (no checkpoint).
+- [ ] DeepFilterNet2 grid is a run-time value (`DFN2Grid`, `dfn2_grid_make()`; the library holds no grid, preset or default, and
+      the application owns the (sample rate, FFT size) table): `tests/test_dfn2_grid.py` (every refusal, `make` agreeing with
+      `validate`, the `n_erb` overflow cases under UBSan, the `DFN2_DF_ORDER` `#error`) and `tests/test_dfn2_runtime_grid.py`
+      (capacity independence, pool identity with the normaliser starting points of `dfn2_process.c`, the variant link symbol) pass;
+      `tests/test_dfn2_lookahead_pairs.py` builds the C suites on the 48, 32 and 16 kHz test grids for the shipped pair and 2/4; a
+      pool or `MemReq` recorded before `DFN2_PREPOST_CARVE_VERSION` 9 is refused.
 - [ ] DeepFilterNet2 frames per call (`export_onnx.py --frames-per-call N`, `make -C AINR DFN2_FRAMES_PER_CALL=<N>`, N in
       1..64): N = 1 writes the one-frame graph byte for byte and builds with the same compile lines; for N > 1 the
       chunked stream equals the one-frame stream (`tests/test_dfn2_frames_per_call.py`,

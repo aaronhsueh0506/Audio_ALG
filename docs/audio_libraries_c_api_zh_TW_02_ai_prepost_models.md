@@ -22,12 +22,13 @@ DFN3 的兩個 heads、layout 9、state 綁定、lookahead 與 API 範例見
 [DFN3 模型頁](html/ainr_dfn3.html)；下面原有的 DFN2 專節仍描述其 cascade/alpha。
 
 DFN2／DFN3 的 lookahead 是 M（`mask_lookahead`，0..2）與 D（`df_lookahead`，0..4）兩個獨立設定，共 15 個 pair，出貨為 1/1。
-pair 是模型合約，C 端在建置時以 `-DDFN2_MASK_LOOKAHEAD=<M> -DDFN2_DF_LOOKAHEAD=<D>`（DFN3 為 `DFN3_*`）加在每個編譯單元上，
-須與 checkpoint 一致；不同 pair 的目標檔連結失敗。模型延遲 DFN2（cascade）為 M+D hops，DFN3（平行）為 max(M, D) hops；
+pair 是模型合約，須與 checkpoint 一致。DFN2 的 pair 是 `DFN2Grid` 的兩個欄位，應用端以 `dfn2_grid_make()` 在執行期給定，不符由 descriptor 與
+pool hash 在執行期擋下（ring 超過 5 的 pair 另需 `-DDFN2_MAX_DF_RING=<ring>`）；DFN3 仍在建置時以 `-DDFN3_MASK_LOOKAHEAD=<M> -DDFN3_DF_LOOKAHEAD=<D>`
+加在每個編譯單元上，不同 pair 的目標檔連結失敗。模型延遲 DFN2（cascade）為 M+D hops，DFN3（平行）為 max(M, D) hops；
 `pre_process` 在前 M 拍回 0。DFN2 另可每次 invocation 跑 N 個 frame（`export_onnx.py --frames-per-call N` 加 `-DDFN2_FRAMES_PER_CALL=N`，預設 1；`pre_process` 每 N 拍回 1 一次，延遲多 N-1 hop，pipelines 固定 N=1）。規則見 [DFN2 細節頁](html/ainr_dfn2_detail.html)。
 
 ```text
-_config_defaults(&cfg, io_mode[, delay_depth])
+_config_defaults(&cfg, io_mode[, delay_depth])      （DFN2 另收 grid：dfn2_prepost_config_defaults(&cfg, io_mode, grid)）
   -> _get_mem_size(&cfg, &req)
   -> _init(pool, req.bytes, &cfg)  或  _init_ex(pool, bytes, &cfg, &expected)
   -> 每-hop 序列（6.2）
@@ -43,7 +44,7 @@ _config_defaults(&cfg, io_mode[, delay_depth])
   inverse FFT 與 overlap-add 一律是 `AcIstft`，模型目錄裡沒有（`make audit-no-transform` 把關）。
 - `_get_mem_size()` 是 reject-first：NULL 引數、未知 `io_mode`、`delay_depth` 超出範圍、
   TIME 模式沒有可用的 `fft`/`window`/`istft`（`istft` 必須是該模型 `*_framing_config()` 描述的物件：
-  fft 大小、overlap-add 模式、合成尺度相符，窗表內容與分析窗相同；DFN2 另加：缺 ERB 矩陣、非有限的 `atten_lim_db`），
+  fft 大小、overlap-add 模式、合成尺度相符，窗表內容與分析窗相同；DFN2 另加：缺 ERB 矩陣、非有限的 `atten_lim_db`、無效的 grid），
   一律回 `-1` 且 `*req` 一個 byte 都不寫。
 - `_init_ex()` 是 **stale-pool gate**：固定 32-byte 的 `*PrepostMemReq`
   （`descriptor_version`、`layout_version`、`io_mode`、`build_flags_hash`（FNV-1a-32）、
@@ -55,7 +56,7 @@ _config_defaults(&cfg, io_mode[, delay_depth])
 - 借用而不擁有：`FftHandle`、window 表、DFN2 的 ERB 矩陣都是 caller-owned，類別從不建立或銷毀。
   分析用的 `AcStft` 是 `*_IO_TIME` 的 pool 內物件，借用這些表；DFN2／DFN3 的 `cfg.window` 為 NULL 時，
   由分析物件在 pool 內自帶 sqrt-Hann 表（應用端的 `AcIstft` 用同一個 `ac_window_build()` 產生的表，內容相同即可）。
-  合成用的 `AcIstft` 不在 pool 內：應用端用 `dfn2_framing_config()`／`dfn3_framing_config()`／`ulcnet_framing_config()`／
+  合成用的 `AcIstft` 不在 pool 內：應用端用 `dfn2_framing_config(&cfg, grid, fft, window)`／`dfn3_framing_config()`／`ulcnet_framing_config()`／
   `deepvqe_framing_config()` 取得設定、`ac_istft_get_mem_size()` 配記憶體、`ac_istft_init()` 建好後填進 `cfg.istft`。
 - `_reset()` 清空所有遞迴／ring／狀態、丟掉未結束的 frame、framing 與 clock 回 init 值；
   config、borrowed 指標與 pool 都不動。

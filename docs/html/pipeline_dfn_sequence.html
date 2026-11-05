@@ -41,8 +41,9 @@ th{background:#eef2f8}
 <pre>App(main.c)                  Aec                   Stage | Bridge              AcIstft(48 kHz)
   |                           |                           |                           |
   | aec_resolve_signal_grid(sr, aec_default_fft_size(sr), &amp;grid) -&gt; 1 | 0;aec_config_from_level + 欄位(derive_lane())|
-  | dfn2_model_io_descriptor_default(&amp;desc)         板端應改填匯出的 metadata         |
-  | dfn_rate_bridge_default_config(sr) | dfn_res_stage_default_config(DFN2_SR);填 erb_fwd / erb_inv / model
+  | dfn2_grid_make(&amp;mg, 48000, 1024, 32, 96, 1, 1)   模型的 grid(範例 main:--ai-sample-rate / --ai-fft-size 選表的一列) |
+  | dfn2_model_io_descriptor_default(&amp;mg, &amp;desc)   板端應改填匯出的 metadata |
+  | dfn_rate_bridge_default_config(sr, &amp;mg) | dfn_res_stage_default_config(&amp;mg);填 erb_fwd / erb_inv / model
   | aec_get_mem_size(&amp;aec_cfg)|                           |                           |
   |--------------------------&gt;|                           |                           |
   |&lt;- bytes(0 = 設定被拒) ----|                           |                           |
@@ -106,7 +107,7 @@ th{background:#eef2f8}
   |                          |                          | 沒被取走的 job 走 identity;ac_istft_push(istft, stage_out, out) -&gt; 剛好一個 hop
   | 0 | DFN_HOP_INVALID(-1)| DFN_HOP_SEQUENCE_ERROR(-2) |                          |                          |
   |&lt;----------------------------------------------------|                          |                          |</pre>
-<p>48 kHz 時前 M 幀(<code>DFN2_MASK_LOOKAHEAD</code>)還沒有右鄰居(graph 視窗為 <code>[t-(2-M)..t+M]</code>),<code>dfn_res_stage_begin()</code> 回 0 而不叫模型;前 L = M + D 個 hop 輸出全零頻譜,之後第 p 個 hop 輸出「傳統鏈的 hop#(p-L)」。出貨 pair 1/1(M = 1、L = 2):只有第 0 個 hop 回 0,合計 3 hop = 1536 samples 的純延遲;其他 pair 見 <a href="pipeline_dfn_detail.html">pipeline_dfn_detail</a>。</p>
+<p>48 kHz 時前 M 幀(<code>grid.mask_lookahead</code>)還沒有右鄰居(graph 視窗為 <code>[t-(2-M)..t+M]</code>),<code>dfn_res_stage_begin()</code> 回 0 而不叫模型;前 L = M + D 個 hop 輸出全零頻譜,之後第 p 個 hop 輸出「傳統鏈的 hop#(p-L)」。出貨 pair 1/1(M = 1、L = 2):只有第 0 個 hop 回 0,合計 3 hop = 1536 samples 的純延遲;其他 pair 見 <a href="pipeline_dfn_detail.html">pipeline_dfn_detail</a>。</p>
 <h2>3. 穩態 hop:8／16 kHz host(經 <code>DfnRateBridge</code>)</h2>
 <pre>App(main.c)               DfnHop                  DfnRateBridge               DfnResStage                model | NPU
   |                          |                          |                          |                          |

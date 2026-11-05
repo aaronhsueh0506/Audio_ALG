@@ -31,10 +31,13 @@ PIPELINES = ROOT / 'pipelines'
 _SHIM = r'''
 #include <string.h>
 #include "dfn/dfn_rate_bridge.h"
+#include "dfn/tests/dfn_test_grid.h"
 
+/* The model grid is the test scaffolding's (dfn_test_grid.h): the pair comes from the -D overrides
+ * the build gives, the rest is the shipped 48 kHz grid. */
 void *bridge_parity_create(int sample_rate, int fft_size, const float *fwd,
                            const float *inv) {
-    DfnRateBridgeConfig cfg = dfn_rate_bridge_default_config(sample_rate);
+    DfnRateBridgeConfig cfg = dfn_rate_bridge_default_config(sample_rate, dfn_test_grid());
     cfg.fft_size = fft_size;
     cfg.stage.erb_fwd = fwd;
     cfg.stage.erb_inv = inv;

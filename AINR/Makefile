@@ -90,7 +90,11 @@ SOURCES := tests/test_c_prepost.c \
 	DeepFilterNet3/dfn3_model_io.c \
 	DeepFilterNet3/dfn3_prepost.c \
 	GTCRN/gtcrn_process.c
+# tests/dfn2_test_grid.h is the grid the DeepFilterNet2 test programs run (the
+# library holds none); it is read by tests/test_c_prepost.c,
+# tests/test_nn_chains.c and tests/test_nn_kernels.c.
 HEADERS := \
+	tests/dfn2_test_grid.h \
 	DeepFilterNet2/dfn2_grid.h \
 	DeepFilterNet2/dfn2_process.h \
 	DeepFilterNet2/dfn2_model_io.h \
@@ -248,9 +252,13 @@ test-simd: $(TEST_BIN) $(SCALAR_BIN) $(KERNEL_TEST_BIN) $(KERNEL_TEST_SCALAR_BIN
 	}
 
 # The DeepFilterNet2/3 lookahead pairs the trainer accepts: `make test` and
-# `make test-simd` build the shipped pair only; these pytest files rebuild the
-# C hosts for every other pair (-DDFN2_/DFN3_MASK_LOOKAHEAD, _DF_LOOKAHEAD) and
-# check the link-time and compile-time pair guards. The two frames_per_call
+# `make test-simd` build the shipped pair on the shipped 48 kHz grid only; these
+# pytest files rebuild the C hosts for every other pair (-DDFN2_/DFN3_MASK_LOOKAHEAD,
+# _DF_LOOKAHEAD: DFN2's test programs build their grid from them, the library takes
+# the grid from its caller; DFN3 takes them as library flags) and, for the shipped
+# pair and 2/4, on the 32 and 16 kHz grids (-DDFN2_GRID_KHZ, read by
+# tests/dfn2_test_grid.h only), and check the pair guards (run-time refusals for
+# DFN2, link-time and compile-time for DFN3). The two frames_per_call
 # files do the same for DFN2_FRAMES_PER_CALL against the one-frame graph and
 # host, per pair.
 PYTHON ?= python3

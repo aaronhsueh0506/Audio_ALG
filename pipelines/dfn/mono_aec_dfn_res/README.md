@@ -41,7 +41,7 @@ processing call (a confirmed delay change that restarts the filter, a first acqu
 transfer) or by `aec_reset()`; warm-transfer and soft realignments and the bad-relock soft revert do not move it. `follow_post_reset()` keeps the
 last handled serial. On a new value the comfort noise restarts from `AEC_CNG_SEED` before that hop's first draw. The
 stage never resets on it and the program never resets the AEC in response. At 48 kHz the program owns the synthesis
-(`AcIstft`) and the stage delays every frame by `DFN_RES_STAGE_LOOKAHEAD_FRAMES` hops, so the overlap-add tail is
+(`AcIstft`) and the stage delays every frame by `dfn_res_stage_lookahead_frames()` hops, so the overlap-add tail is
 dropped when the frame built on the reset hop reaches the synthesis (a delay line of that many hops, not at the
 reset hop: that would cut the previous filter's last frame out of the output). Below 48 kHz the host-grid synthesis
 lives inside `dfn_rate_bridge` and runs at the top of its `begin()`, with nothing between the spectra and it, so the
@@ -83,7 +83,7 @@ the event or clears one hop late fails both gates.
 
 The host runs on the product's own grid: 16 kHz (fft 256, hop 128) by
 default, 16 kHz/512 and 8 kHz/256 as the host offers them, or 48 kHz. As shipped, only
-the DFN2 stage runs at 48 kHz (the DFN2 grid is a build setting, see "DFN2 grid" below). At 48 kHz the host's spectra are DFN2's grid
+the DFN2 stage runs at 48 kHz (the model grid is chosen at run time with `--ai-sample-rate` / `--ai-fft-size`, see "DFN2 grid" below). At 48 kHz the host's spectra are DFN2's grid
 and the stage is applied directly (algorithmic latency L + 1 hops: L model
 lookahead hops plus one synthesis-WOLA hop; three hops, 32 ms, for the shipped pair). Below 48 kHz the rate
 bridge (`pipelines/dfn/dfn_rate_bridge.h`) synthesises E and P on the native
@@ -101,20 +101,25 @@ two inferences in one hop is a real per-hop compute fact. The Python reference
 `pipelines/dfn/mono_aec_dfn_res/pipeline.py` mirrors both paths (16 and 48 kHz
 hosts); its stage reads the pair from the model.
 
-DFN2 grid. The signal grid of DFN2 itself (rate / FFT / hop) is chosen when the library is built
-(`-DDFN2_GRID_KHZ=16|32|48`, default and shipped 48; see [`AINR/DeepFilterNet2/README.md`](../../../AINR/DeepFilterNet2/README.md)).
-The stage takes its rate and FFT size from that build (`DFN2_SR` / `DFN2_N_FFT`) and its input and output scales
-(`DFN_RES_STAGE_IN_SCALE` / `_OUT_SCALE`, 1/sqrt(n_fft) and its inverse) from it too. A host at the DFN2 rate needs no
-bridge: built with `-DDFN2_GRID_KHZ=16`, a 16 kHz host runs straight through the stage (hop 128, algorithmic latency 384
-samples, pool 558,384 B), against 800 samples and 717,984 B for the shipped 48 kHz build with the same 16 kHz host
-through the bridge. The bridge exists only for the shipped 48 kHz / 1024 model (its `resolve()` returns -1 on any other
-grid) and its hosts stay 8 kHz and 16 kHz, so the 16 kHz build refuses hosts of 8000 and 48000. This directory's tests and
-the Python reference cover the shipped grid only.
+DFN2 grid. Neither the DFN2 library nor the pipeline units hold a grid (see [`AINR/DeepFilterNet2/README.md`](../../../AINR/DeepFilterNet2/README.md),
+"Choosing the grid"): `main.c` builds the model grid at run time from `--ai-sample-rate <Hz>` / `--ai-fft-size <n>`
+(default 48000 / 1024) with `dfn2_grid_make()`, using the three-row table of `dfn/dfn_example_args.h`
+(16000/256 -> n_erb 24, df_bins 96, lookahead 0/0; 32000/512 -> 28, 96, 0/0, provisional; 48000/1024 -> 32, 96, 1/1; any other
+pair is refused with the list, exit 2) and hands it to `DfnResStageConfig.grid`. The stage takes its rate, FFT size and its input and
+output scales (1/sqrt(n_fft) and its inverse) from that grid. A host at the model's rate needs no bridge:
+`--ai-sample-rate 16000 --ai-fft-size 256` with the 16 kHz host runs straight through the stage (hop 128, algorithmic latency 128
+samples for the 0/0 row, pool 594,048 B: the library's state is sized for its capacity, not for the grid), against 800 samples and
+718,096 B for the shipped 48 kHz model with the same 16 kHz host through the bridge. The bridge exists only for the shipped
+48 kHz / 1024 model (`resolve()` returns -1 on any other stage grid) and its hosts stay 8 kHz and 16 kHz, so a 16 or 32 kHz model
+refuses a host of another rate ("pool query rejected", exit 1), and the 48 kHz host needs the 48 kHz model. The banner prints the model
+grid and whether the stage or the bridge runs. `tests/test_mono_dfn.c` and the Python reference cover the shipped grid; the stage test
+(`dfn/tests/test_dfn_res_stage.c`) runs all three table grids.
 
-Lookahead pair. The DFN2 mask and deep-filter lookaheads M (0..2) and D (0..4) are a build setting of this
-example (`DFN2_MASK_LOOKAHEAD` / `DFN2_DF_LOOKAHEAD`, default 1/1) and must equal the pair the model was
-trained for; `DFN_RES_STAGE_LOOKAHEAD_FRAMES` = M + D. The rules, the make variables and `make test-pairs` are in
-[`../README.md`](../README.md). Only the shipped 1/1 pair has a trained checkpoint, and the numbers in this
+Lookahead pair. The DFN2 mask and deep-filter lookaheads M (0..2) and D (0..4) are two fields of the model grid
+(a row of the table above, not a build setting) and must equal the pair the model was trained for;
+`dfn_res_stage_lookahead_frames(grid)` = M + D. The make variables `DFN2_MASK_LOOKAHEAD` / `DFN2_DF_LOOKAHEAD` choose only the pair
+the test programs run (and, for a ring deeper than 5, the library's ring capacity), never the pair `main.c` runs. The rules and
+`make test-pairs` are in [`../README.md`](../README.md). Only the shipped 1/1 pair has a trained checkpoint, and the numbers in this
 file are for it unless a pair is named.
 
 Build and test from `pipelines/` (the Makefile that owns the rules):
@@ -128,7 +133,7 @@ make WERROR=1 test        # includes test_dfn_res_stage, test_dfn_rate_bridge,
 The `Makefile` in this directory is a thin forwarder: `make -C pipelines/dfn/mono_aec_dfn_res test`
 builds and runs `test_dfn_res_stage`, `test_dfn_rate_bridge` and `test_mono_dfn`, then the
 skeleton (default, `--delay-num-filters 1 --cng --atten-lim 12`, `--sample-rate 48000`,
-`--sample-rate 8000`) and checks that malformed numbers such as `16000Hz` and `12dB` exit with 2.
+`--sample-rate 8000`, `--ai-sample-rate 16000 --ai-fft-size 256`) and checks that malformed numbers such as `16000Hz` and `12dB`, and a model grid outside the table, exit with 2, and that a model grid the bridge cannot serve is a rejected pool query (exit 1).
 
 `libaudio_pipeline_dfn.a` holds the shared stage, the rate bridge and the DFN2
 host pre/post objects. The example links it with `libaec` and
@@ -136,7 +141,7 @@ host pre/post objects. The example links it with `libaec` and
 (`DFN2Model`) and the exported ERB matrices (`erb_fwd.bin` / `erb_inv.bin`
 from `AINR/DeepFilterNet2/export_erb_matrix.py`). `main.c` is the board
 skeleton: delay-profile flags in the `aec_wav` spelling, `--erb-fwd` /
-`--erb-inv`, `--sample-rate` (default 16000), `--atten-lim`, `--cng`, and a fail-open `run_accelerator()`
+`--erb-inv`, `--sample-rate` (default 16000), `--ai-sample-rate` / `--ai-fft-size` (the model grid, default 48000 / 1024), `--atten-lim`, `--cng`, and a fail-open `run_accelerator()`
 stub to replace with the runtime call. Numbers are parsed by `common/example_cli.h`
 (`example_cli_parse_int` / `example_cli_parse_float`): empty strings, leading spaces, trailing characters,
 out-of-range values, inf and nan are rejected with exit code 2; plain decimals and a leading `+`
@@ -162,12 +167,12 @@ App                 Aec           DfnHop + DfnResStage | DfnRateBridge      AcIs
 ```
 
 External parameters (board-skeleton command line, `dfn/dfn_example_args.h`): `--sample-rate` (8000 / 16000 default
-/ 48000), the delay profile `--delay-mode matched|fixed|external` with `--delay-num-filters` (1..5) and
+/ 48000), `--ai-sample-rate` / `--ai-fft-size` (the DFN2 model grid, default 48000 / 1024), the delay profile `--delay-mode matched|fixed|external` with `--delay-num-filters` (1..5) and
 `--fixed-delay`, `--erb-fwd` / `--erb-inv` (the exported ERB matrices; without them the skeleton runs a
 fail-open smoke only), `--atten-lim` (dB, 0 = unlimited; `dfn_res_stage_set_atten_lim()` between hops),
 `--cng` (comfort noise, off by default). An option followed by another `--` option, or by the end of the line, has no value and the
 program exits with code 2; a file named `--x` is written `./--x`. Strength of the RES gain: `aec_set_level()`. Internal: the
-stage grid (the build's DFN2 grid; 48 kHz / 1024 / 512 as shipped), the `DFN_RES_STAGE_IN_SCALE` / `_OUT_SCALE` scales (2^-5 / 2^5 on the shipped grid), the rate
+stage grid (the model grid of the config; 48 kHz / 1024 / 512 as shipped), the grid's `stft_scale` / `stft_unscale` scales (2^-5 / 2^5 on the shipped grid), the rate
 bridge's FIR resamplers and frame schedule, the AEC and DFN2 model constants. Public functions are the
 `dfn_res_stage_*`, `dfn_rate_bridge_*` of `dfn_res_stage.h` / `dfn_rate_bridge.h` and the
 `dfn_hop_*` of `dfn/dfn_hop.h`; the stage and the bridge carry 32-byte descriptors
@@ -192,10 +197,11 @@ resampler count and must be included in the board measurement.
 
 Pool printed by the skeleton (`mono_aec_dfn_res`, matched delay, five-filter bank, NE10; the sum
 of `aec_get_mem_size()`, the three gain and spectrum buffers of the RES path and the stage or
-bridge requirement, each 16-byte aligned): 717,984 bytes at the 16 kHz default (the AEC and the RES gain path plus the
-rate bridge, whose own pool is 349,888 bytes including the stage), 1,449,904 bytes at 48 kHz (the
-stage's 231,984 bytes, its synthesis and the AEC; the conventional MMSE-LSA chain on the 48 kHz
-grid needs 1,356,352 bytes) and 622,608 bytes at 8 kHz. Model weights and accelerator activation/
-workspace memory are external to this descriptor (the DFN2 ring grows beyond the shipped size when M + D
-exceeds 4: the 16 kHz skeleton with pair 2/4 printed 742,080 bytes); adding int8 weights alone
+bridge requirement, each 16-byte aligned): 718,096 bytes at the 16 kHz default (the AEC and the RES gain path plus the
+rate bridge, whose own pool is 350,000 bytes including the stage), 1,450,016 bytes at 48 kHz (the
+stage's 232,096 bytes, its synthesis and the AEC; the conventional MMSE-LSA chain on the 48 kHz
+grid needs 1,356,352 bytes) and 622,720 bytes at 8 kHz. Model weights and accelerator activation/
+workspace memory are external to this descriptor (the library's state is sized for its ring capacity: a build with the
+capacity 7 that pair 2/4 needs, `make DFN2_MASK_LOOKAHEAD=2 DFN2_DF_LOOKAHEAD=4`, prints 742,208 bytes at the 16 kHz default
+although the skeleton still runs the table's pair); adding int8 weights alone
 brings the known minimum to about 2.7 MiB at 16 kHz.

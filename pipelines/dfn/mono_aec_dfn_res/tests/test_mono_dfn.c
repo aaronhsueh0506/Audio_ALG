@@ -2,8 +2,8 @@
  * P = E * min(1, G_res) (+ comfort noise) and the DFN2 hop (dfn/dfn_hop.h), wired as
  * dfn/mono_aec_dfn_res/main.c wires them.
  * 48 kHz: with the identity model the composition equals the hand-written mono chain
- * (tests/conv_chain_mono.h with enable_nr=0), delayed by exactly DFN_RES_STAGE_LOOKAHEAD_FRAMES
- * hops (two for the shipped 1/1 pair), byte for byte,
+ * (tests/conv_chain_mono.h with enable_nr=0), delayed by exactly the test grid's lookahead
+ * (mask + df, DFN_TEST_LOOKAHEAD_FRAMES: two hops for the shipped 1/1 pair), byte for byte,
  * comfort noise OFF and ON. The echo (384-sample delay, matched estimator) must make the
  * estimator report a delay change (the "no reset on a delay change" contract) and the RES cut
  * (min G_res < 0.9).
@@ -37,7 +37,7 @@ static float far_tones[TEST_FRAMES * 4 * 256];
 static float saved[TEST_FRAMES][DFN2_HOP_LEN];
 
 static void make_partition(void) {
-    dfn_unit_partition(erb_fwd, erb_inv);
+    dfn_unit_partition(erb_fwd, erb_inv, dfn_test_grid());
 }
 
 static void make_far(void) {
@@ -99,7 +99,7 @@ static MonoDfn *mdfn_create(int sample_rate, int fft_size, int enable_cng, const
     MonoDfn *m = (MonoDfn *)calloc(1, sizeof(*m));
     AecSignalGrid grid;
     AecConfig lane;
-    DfnResStageConfig stage_cfg = dfn_res_stage_default_config(DFN2_SR);
+    DfnResStageConfig stage_cfg = dfn_res_stage_default_config(dfn_test_grid());
     size_t vec;
     int k;
     if (!m) return NULL;
@@ -136,7 +136,7 @@ static MonoDfn *mdfn_create(int sample_rate, int fft_size, int enable_cng, const
     stage_cfg.erb_inv = erb_inv;
     if (model) stage_cfg.model = *model;
     if (sample_rate != DFN2_SR) {
-        DfnRateBridgeConfig bc = dfn_rate_bridge_default_config(sample_rate);
+        DfnRateBridgeConfig bc = dfn_rate_bridge_default_config(sample_rate, dfn_test_grid());
         bc.fft_size = fft_size;
         bc.stage = stage_cfg;
         m->bridge = dfn_rate_bridge_create(&bc);
@@ -199,7 +199,7 @@ static int mdfn_begin(MonoDfn *m, const float *mic, const float *ref) {
             if (moved) ac_istft_reset(m->istft);
         } else {
             m->reset_pending = (m->reset_pending << 1) | moved;
-            if ((m->reset_pending >> DFN_RES_STAGE_LOOKAHEAD_FRAMES) & 1u) ac_istft_reset(m->istft);
+            if ((m->reset_pending >> DFN_TEST_LOOKAHEAD_FRAMES) & 1u) ac_istft_reset(m->istft);
         }
     }
     sk_min_f32(m->total, m->unity, c.res_gain, m->n_freqs);
@@ -220,7 +220,25 @@ static int mdfn_process(MonoDfn *m, const float *mic, const float *ref, float *o
     return dfn_hop_end(&m->hop, out) == 0 ? 0 : -1;
 }
 
+/* The delay, in hops, between the hand-written chain's output and the composition's: the smallest
+ * s with got[f] == 0 for f < s and got[f] == chain[f - s] bit for bit for every later hop, or -1. */
+static int measure_shift(float got[][DFN2_HOP_LEN], float chain[][DFN2_HOP_LEN]) {
+    int s, f, i;
+    for (s = 0; s < 8; ++s) {
+        int ok = 1;
+        for (f = 0; f < TEST_FRAMES && ok; ++f) {
+            for (i = 0; i < DFN2_HOP_LEN && ok; ++i) {
+                float want = f < s ? 0.0f : chain[f - s][i];
+                if (got[f][i] != want) ok = 0;
+            }
+        }
+        if (ok) return s;
+    }
+    return -1;
+}
+
 static int run_identity(int enable_cng) {
+    static float got[TEST_FRAMES][DFN2_HOP_LEN];
     MonoDfn *dfn = mdfn_create(DFN2_SR, DFN2_N_FFT, enable_cng, NULL);
     ConvMonoConfig bcfg = conv_mono_default_config(DFN2_SR, DFN2_N_FFT);
     ConvMono *baseline;
@@ -253,11 +271,12 @@ static int run_identity(int enable_cng) {
         if (ctx.res_gain)
             for (k = 0; k < ctx.n_freqs; ++k)
                 if (ctx.res_gain[k] < min_res) min_res = ctx.res_gain[k];
+        memcpy(got[frame], out, sizeof(got[frame]));
         for (i = 0; i < DFN2_HOP_LEN; ++i) {
-            float expected = frame < DFN_RES_STAGE_LOOKAHEAD_FRAMES
-                ? 0.0f : saved[frame - DFN_RES_STAGE_LOOKAHEAD_FRAMES][i];
+            float expected = frame < DFN_TEST_LOOKAHEAD_FRAMES
+                ? 0.0f : saved[frame - DFN_TEST_LOOKAHEAD_FRAMES][i];
             if (out[i] != expected) return 100 + frame;
-            if (frame >= DFN_RES_STAGE_LOOKAHEAD_FRAMES && expected != 0.0f) any = 1;
+            if (frame >= DFN_TEST_LOOKAHEAD_FRAMES && expected != 0.0f) any = 1;
         }
         nonzero_hops += any;
     }
@@ -274,6 +293,11 @@ static int run_identity(int enable_cng) {
         return 8;
     printf("mono_aec_dfn_res: cng=%d identity over %d hops, %d delay change(s), "
            "min G_res %.3f\n", enable_cng, TEST_FRAMES, delay_changes, min_res);
+    {   /* the delay the composition really has, not the one the macros say (make test-pairs reads it) */
+        int shift = measure_shift(got, saved);
+        if (shift < 0) return 9;
+        if (!enable_cng) dfn_test_report_pair("mono_aec_dfn_res", shift);
+    }
     conv_mono_destroy(baseline);
     mdfn_destroy(dfn);
     return 0;
@@ -399,7 +423,7 @@ static int mdfn_finish(MonoDfn *m, float *out) {
 }
 
 /* 48 kHz stage path with the identity model on a stream that fires the guard and restarts the filter:
- * the output equals the hand-written chain (NR off, RES on) delayed by DFN_RES_STAGE_LOOKAHEAD_FRAMES
+ * the output equals the hand-written chain (NR off, RES on) delayed by DFN_TEST_LOOKAHEAD_FRAMES
  * hops, byte for byte. The chain clears its overlap-add tail at the reset hop; the stage path clears
  * its own when the frame built on that hop reaches the synthesis, so the delay line is part of the
  * claim (a clear at the reset hop itself must fail). */
@@ -433,8 +457,8 @@ static void run_identity_scene(const GuardScene *sc, int sabotage, SceneRun *out
             break;
         }
         {
-            const float *want = h < DFN_RES_STAGE_LOOKAHEAD_FRAMES ? NULL
-                                : saved + (size_t)(h - DFN_RES_STAGE_LOOKAHEAD_FRAMES) * hop;
+            const float *want = h < DFN_TEST_LOOKAHEAD_FRAMES ? NULL
+                                : saved + (size_t)(h - DFN_TEST_LOOKAHEAD_FRAMES) * hop;
             int i, same = 1;
             for (i = 0; i < hop; ++i) if (got[i] != (want ? want[i] : 0.0f)) same = 0;
             if (!same) ++out->diff_hops;
@@ -555,13 +579,13 @@ static int run_scene_tests(void) {
             guard += a.guard_hops; resets += a.reset_hops;
             if (!a.ok || a.diff_hops != 0) { fprintf(stderr, "stage identity (never usable): %ld hops differ\n", a.diff_hops); ++failures; }
             printf("mono_aec_dfn_res: 48 kHz stage identity with the hard-reset event delayed by %d hops equals the hand-written chain "
-                   "(guard hops %ld, resets %ld)\n", DFN_RES_STAGE_LOOKAHEAD_FRAMES, guard, resets);
+                   "(guard hops %ld, resets %ld)\n", DFN_TEST_LOOKAHEAD_FRAMES, guard, resets);
             if (guard == 0 || resets == 0) { fprintf(stderr, "stage identity: scenes miss guard/reset\n"); ++failures; }
             {
-                /* The delay defect removes DFN_RES_STAGE_LOOKAHEAD_FRAMES hops of delay, so it only exists when that is non-zero. */
+                /* The delay defect removes DFN_TEST_LOOKAHEAD_FRAMES hops of delay, so it only exists when that is non-zero. */
                 static const int sabs[] = { MDFN_SAB_NO_OLA_CLEAR, MDFN_SAB_ERROR_SPEC, MDFN_SAB_NO_RESEED, MDFN_SAB_NO_DELAY };
                 size_t c, n_sab = sizeof sabs / sizeof sabs[0];
-                if (DFN_RES_STAGE_LOOKAHEAD_FRAMES == 0) --n_sab;
+                if (DFN_TEST_LOOKAHEAD_FRAMES == 0) --n_sab;
                 for (c = 0; c < n_sab; ++c) {
                     run_identity_scene(&moving, sabs[c], &a);
                     if (!a.ok || a.diff_hops == 0) {
@@ -758,7 +782,7 @@ static int run_rejections(void) {
         grid.fft_size != DFN2_N_FFT)
         return 3;
     /* a bridge is for hosts below 48 kHz and needs the partition through its stage config */
-    bc = dfn_rate_bridge_default_config(16000);
+    bc = dfn_rate_bridge_default_config(16000, dfn_test_grid());
     bc.stage.erb_fwd = erb_fwd;
     bc.stage.erb_inv = erb_inv;
     if (dfn_rate_bridge_get_mem_requirements(&bc, &bridge_req) != 0) return 4;
@@ -781,7 +805,7 @@ static int run_phased(int sample_rate, int fft_size, int behaviour) {
     DfnResStageJob job;
     int hop, frame, i, r, nonzero = 0, ran = 0, frames = 80;
 
-    if (dfn2_model_io_descriptor_default(&descriptor) != 0) return 1;
+    if (dfn2_model_io_descriptor_default(dfn_test_grid(), &descriptor) != 0) return 1;
     memset(&cb_model, 0, sizeof(cb_model));
     if (behaviour == BP_RUN) {
         cb_model.infer = dfn_fixture_half_mask_infer;
@@ -825,7 +849,7 @@ static int run_phased(int sample_rate, int fft_size, int behaviour) {
 
 int main(void) {
     int rc;
-    DFN2_REQUIRE_LOOKAHEAD_PAIR_LINK();   /* this unit's lookahead pair is the archive's */
+    DFN2_REQUIRE_VARIANT_LINK();   /* this unit's DFN2 capacities are the archive's */
     make_partition();
     make_far();
     rc = run_rejections();

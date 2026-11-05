@@ -13,6 +13,7 @@
 #include <string.h>
 
 #include "mcab.h"
+#include "dfn/tests/dfn_test_grid.h"
 #include "dfn/dfn_res_stage.h"
 #include "dfn/dfn_rate_bridge.h"
 #include "dfn2_prepost.h"
@@ -94,8 +95,8 @@ int main(int argc, char **argv) {
     DFN3PrepostConfig dfn3;
     UlcnetPrepostConfig ulc;
     DeepVqePrepostConfig deep;
-    DfnResStageConfig stage = dfn_res_stage_default_config(DFN2_SR);
-    DfnRateBridgeConfig bridge = dfn_rate_bridge_default_config(16000);
+    DfnResStageConfig stage = dfn_res_stage_default_config(dfn_test_grid());
+    DfnRateBridgeConfig bridge = dfn_rate_bridge_default_config(16000, dfn_test_grid());
 
     if (argc == 3 && strcmp(argv[1], "--write") == 0) {
         write_file = fopen(argv[2], "wb");
@@ -111,8 +112,8 @@ int main(int argc, char **argv) {
         assert(argc == 1);
     }
 
-    dfn_unit_partition(erb_fwd, erb_inv);
-    assert(dfn2_prepost_config_defaults(&dfn2, DFN2_IO_FREQ) == 0);
+    dfn_unit_partition(erb_fwd, erb_inv, dfn_test_grid());
+    assert(dfn2_prepost_config_defaults(&dfn2, DFN2_IO_FREQ, dfn_test_grid()) == 0);
     assert(dfn3_prepost_config_defaults(&dfn3, DFN3_IO_FREQ) == 0);
     assert(ulcnet_prepost_config_defaults(&ulc, ULCNET_IO_FREQ, 8) == 0);
     assert(deepvqe_prepost_config_defaults(&deep, DEEPVQE_IO_FREQ, 8) == 0);

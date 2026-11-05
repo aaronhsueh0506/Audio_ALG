@@ -59,8 +59,8 @@ th{background:#eef1f5}
 <tr><td>identity 路徑輸出落後</td><td>3 hops = 1536 samples</td><td>1 + max(M, D) hops（出貨 2 hops = 1024 samples = 21.33 ms）</td><td><code>dfn3_prepost.h</code></td></tr>
 <tr><td><code>post_process</code> 的 <code>written = 0</code> 拍數</td><td>2</td><td>max(M, D)（出貨 1：只有 hop 0）</td><td><code>dfn3_prepost.h</code></td></tr>
 <tr><td><code>*_MODEL_IO_LAYOUT_VERSION</code></td><td>8</td><td>9（4–8 已退役）</td><td><code>dfn*_model_io.h</code></td></tr>
-<tr><td>pool（<code>get_mem_size</code>，本機量測）</td><td>TIME 233,936／FREQ 219,536</td><td>TIME 233,872／FREQ 219,472</td><td>—</td></tr>
-<tr><td><code>sizeof(State)</code>／<code>sizeof(ModelIOState)</code>（本機量測）</td><td>67,368／130,704</td><td>67,344／130,704</td><td>—</td></tr>
+<tr><td>pool（<code>get_mem_size</code>，本機量測）</td><td>TIME 234,048／FREQ 219,648</td><td>TIME 233,872／FREQ 219,472</td><td>—</td></tr>
+<tr><td><code>sizeof(State)</code>／<code>sizeof(ModelIOState)</code>（本機量測）</td><td>67,424／130,712</td><td>67,344／130,704</td><td>—</td></tr>
 <tr><td><code>skip</code> 的 identity</td><td>unit ERB mask、alpha 0</td><td>高頻 unit ERB gain、低頻 unit 目前框 DF tap</td><td><code>dfn3_prepost.h</code></td></tr>
 </table></div>
 

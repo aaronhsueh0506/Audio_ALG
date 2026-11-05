@@ -2,29 +2,32 @@
 ### 6.6 DeepFilterNet2：`dfn2_prepost.h`
 
 生命週期與每-hop 函式同樣對應（前綴 `dfn2_prepost_`，單路訊號 `in_hop`／`spec_re,spec_im`，
-長度 `DFN2_HOP_LEN`／`DFN2_N_BINS`，`_config_defaults(cfg, io_mode)` **沒有** `delay_depth`）。
-額外 API：
+長度是 grid 的 `hop`／`n_bins`，`dfn2_prepost_config_defaults(&cfg, io_mode, grid)` 多收一個 `const DFN2Grid *grid`
+（見下方 **Grid**）、**沒有** `delay_depth`）。額外 API：
 
 ```c
-int  dfn2_prepost_model_lookahead_frames(const DFN2Prepost *p);  /* = DFN2_MASK_LOOKAHEAD + DFN2_DF_LOOKAHEAD + DFN2_FRAMES_PER_CALL - 1（出貨 1/1、每次 1 個 frame 為 2） */
+const DFN2Grid *dfn2_prepost_grid(const DFN2Prepost *p);          /* 實例跑的 grid；NULL = NULL */
+int  dfn2_prepost_model_lookahead_frames(const DFN2Prepost *p);  /* = mask_lookahead + df_lookahead + DFN2_FRAMES_PER_CALL - 1（出貨 1/1、每次 1 個 frame 為 2） */
 int  dfn2_prepost_layout_version(const DFN2Prepost *p);
 unsigned int dfn2_prepost_state_generation(const DFN2Prepost *p);  /* init 後 1；每次 _reset 與被拒的 commit 加 1 */
 int  dfn2_prepost_set_erb_matrices(DFN2Prepost *p, const float *erb_fwd, const float *erb_inv);
 int  dfn2_prepost_set_atten_lim(DFN2Prepost *p, float atten_lim_db);
-int  dfn2_prepost_post_process(DFN2Prepost *p, float out_hop[DFN2_HOP_LEN], int *written);
-int  dfn2_prepost_post_process_freq(DFN2Prepost *p, float re[DFN2_N_BINS], float im[DFN2_N_BINS],
-                                    int *valid);
+int  dfn2_prepost_post_process(DFN2Prepost *p, float *out_hop, int *written);        /* out_hop：grid.hop 個 float */
+int  dfn2_prepost_post_process_freq(DFN2Prepost *p, float *re, float *im, int *valid);  /* 各 grid.n_bins 個 float */
 int  dfn2_prepost_output_frame_index(const DFN2Prepost *p, long long *frame);
 ```
 
-- `cfg` 欄位：`io_mode`、`fft`（`DFN2_IO_TIME` 必填）、`window`（可選，borrowed，`DFN2_WIN_LEN` 項，須活得比實例久；
-  NULL = pool 內自帶 sqrt-Hann 表，出貨路徑都用 NULL）、`istft`（`DFN2_IO_TIME` 必填，應用端持有的 `AcIstft`，borrowed；用 `dfn2_framing_config()` 建）、`erb_fwd`／`erb_inv`（**兩個模式都必填**，borrowed）、
+- `cfg` 欄位：`io_mode`、`grid`（`_config_defaults` 填入，按值複製）、`fft`（`DFN2_IO_TIME` 必填）、`window`（可選，borrowed，`grid.n_fft` 項，須活得比實例久；
+  NULL = pool 內自帶 sqrt-Hann 表，出貨路徑都用 NULL）、`istft`（`DFN2_IO_TIME` 必填，應用端持有的 `AcIstft`，borrowed；用 `dfn2_framing_config(&cfg, grid, fft, window)` 建）、`erb_fwd`／`erb_inv`（**兩個模式都必填**，borrowed）、
   `atten_lim_db`（0 = 關閉）。
-- **Lookahead pair。** mask lookahead `M`（`DFN2_MASK_LOOKAHEAD`，0..2）與 deep-filter lookahead `D`（`DFN2_DF_LOOKAHEAD`，0..4）
-  是建置時決定的一對（共 15 個合法組合，兩者之間沒有大小限制），預設都是 1。匯出的 ONNX graph 不隨這一對改變，隨之改變的是 host 端
+- **Lookahead pair。** mask lookahead `M`（grid 的 `mask_lookahead`，0..2）與 deep-filter lookahead `D`（`df_lookahead`，0..4）
+  是 `DFN2Grid` 的兩個欄位，由應用端在**執行期**交給 `dfn2_grid_make()`（共 15 個合法組合，兩者之間沒有大小限制）；函式庫沒有預設值，
+  也沒有建置期的 pair 旗標或連結期的 pair 符號。匯出的 ONNX graph 不隨這一對改變，隨之改變的是 host 端
   的視窗（`heads[t]` 用 source frame `[t-(2-M) .. t+M]`）與就緒條件（看過 `M+1` 個 frame 才開始呼叫加速器）；checkpoint 與它訓練時的那一對綁定，
-  目前只有出貨的 1/1 有 checkpoint，其他組合的音質沒有量測。C 端以 `-DDFN2_MASK_LOOKAHEAD=<M> -DDFN2_DF_LOOKAHEAD=<D>` 套到每個編譯單元
-  （`pipelines/Makefile` 的同名變數會轉成這兩個旗標）；不同組合的 object 無法連結。細節見 `AINR/README.md` 的 "Lookahead pairs"。
+  與 grid 不符的 graph 或 pool 由 descriptor（`dfn2_model_run_frame()`）與 pool hash 在執行期擋下。目前只有出貨的 1/1 有 checkpoint，其他組合的音質沒有量測。
+  ring 深度 `max(5, M+D+1)` 超過容量 `DFN2_MAX_DF_RING`（預設 5）的組合（1/4、2/3 為 6，2/4 為 7）會被 `dfn2_grid_make()` 以 `DFN2_GRID_ERR_CAPACITY` 拒絕，
+  要在每個編譯單元加 `-DDFN2_MAX_DF_RING=<ring>`。`pipelines/Makefile` 的 `DFN2_MASK_LOOKAHEAD`／`DFN2_DF_LOOKAHEAD` 變數只決定**測試程式**跑哪一對
+  （經 `pipelines/dfn/tests/dfn_test_grid.h`），pipeline 的單元與範例 main 不含 pair，不是函式庫的選擇器。細節見 `AINR/README.md` 的 "Lookahead pairs"。
 - 兩個 setter **只能在 hop 之間**呼叫，frame 開著時回 `-1`。要精確理解它買到什麼：
   這是 **per-hop atomicity，不是 per-source-frame consistency**——hop *t* 展開的 mask 屬於 source frame *t*−*M*，
   而圖的特徵視窗橫跨三拍（出貨 1/1：`[t-1, t, t+1]`），
@@ -35,17 +38,23 @@ int  dfn2_prepost_output_frame_index(const DFN2Prepost *p, long long *frame);
 - 暖機：`_pre_process()` 的前 `M` 拍回 0（不要跑加速器）；輸出前 `M + D` 拍（出貨 1/1 為兩拍）是暖機：`_post_process()` 的 `*written` = 0
   （`out_hop` 仍然寫滿零），`_post_process_freq()` 的 `*valid` = 0。收尾 flush 要用全零 hop 再跑 `M + D` 拍，**加速器那幾拍也要照跑**。
   DFN2 以 `-DDFN2_FRAMES_PER_CALL=N`（N > 1，需要 `export_onnx.py --frames-per-call N` 匯出的 graph）建置時，`_pre_process()` 每 N 拍回 1 一次、暖機與 flush 都多 `N - 1` 拍；pipelines 固定 N = 1（見 [ainr_dfn2_detail](html/ainr_dfn2_detail.html)）。
-- **Grid。** 取樣率、FFT 大小、ERB 帶數與 deep filter 的 bin 數是建置時決定的一組（`AINR/DeepFilterNet2/dfn2_grid.h`）：不帶旗標是出貨的
-  48 kHz／1024／512／32 個 ERB band／96 個 DF bin；`-DDFN2_GRID_KHZ=16|32|48` 選內建 preset，或在建置參數定義 `DFN2_SR`、`DFN2_N_FFT`、
-  `DFN2_N_ERB`、`DFN2_DF_BINS`、`DFN2_ERB_NORM_ALPHA`、`DFN2_SPEC_NORM_ALPHA`（缺一即 `#error` 並點名）。庫與應用的每個編譯單元要用同一組旗標，
-  不同 grid 的 object 無法連結；非出貨 grid（含覆寫正規化起點的建置）的 pool hash 另折入 alpha 與正規化起點共 7 個 float。需搭配該 grid 訓練的模型與 ERB 矩陣。
-  規則與各 grid 的大小見 [ainr_dfn2_grids](html/ainr_dfn2_grids.html)。
-- **`DFN2_IO_FREQ` 的頻譜是 `torch.stft(normalized=True)` 尺度**（乘了 1/√`DFN2_N_FFT`；出貨 grid 為 1/32，換算常數是
-  `DFN2_NORMALIZED_STFT_SCALE`／`_UNSCALE`），AIAEC 兩個模型交出的則是**未正規化**的 rfft。直接串接會剛好差 √`DFN2_N_FFT` 倍
+- **Grid。** 取樣率、FFT 大小、ERB 帶數、deep filter 的 bin 數與 lookahead pair 是一個 `DFN2Grid`（`AINR/DeepFilterNet2/dfn2_grid.h`），
+  函式庫**沒有預設值也沒有 preset**：應用端依模型的 `config.ini` 呼叫 `dfn2_grid_make(&grid, sr, n_fft, n_erb, df_bins, mask_la, df_la)`，
+  把同一個 `&grid` 交給 `dfn2_framing_config()`、`dfn2_state_init()`、`dfn2_model_io_init()`、`dfn2_model_io_descriptor_default()`／`_validate()`
+  與 `dfn2_prepost_config_defaults()`；hop、n_bins、兩個 EMA alpha 與 `stft_scale` 由公式推導。出貨 checkpoint 是
+  48 kHz／1024／512／32 個 ERB band／96 個 DF bin／1/1。(sample rate, FFT size) 對應 n_erb、df_bins 與 pair 的表是模型的性質，由應用端持有
+  （板端 sample 與 pipelines 的兩個範例 main 各有同一張三列的表；只有測試的兩個標頭 `AINR/tests/dfn2_test_grid.h` 與
+  `pipelines/dfn/tests/dfn_test_grid.h` 以 `-DDFN2_GRID_KHZ=16|32|48` 等在建置時選 grid，函式庫與 pipeline 的單元都不讀它們；
+  pipeline 的 grid 放在 `DfnResStageConfig.grid`）。編譯期仍固定的只有容量（`DFN2_MAX_N_FFT` 1024、`DFN2_MAX_N_ERB` 32、
+  `DFN2_MAX_DF_BINS` 96、`DFN2_MAX_DF_RING` 5）：一個 binary 服務容量以內的所有 grid，超過的被 `DFN2_GRID_ERR_CAPACITY` 拒絕，提高容量要在每個編譯單元定義，
+  且每個 grid 都付那份 RAM。連結符號只剩 variant 加容量（`dfn2_variant_{full|mask_only}_n<N>_e<E>_d<D>_r<R>`），grid 與 pair 不在其中；
+  pool hash 對每個 grid 折入整個 grid。需搭配該 grid 訓練的模型與 ERB 矩陣。規則與各 grid 的大小見 [ainr_dfn2_grids](html/ainr_dfn2_grids.html)。
+- **`DFN2_IO_FREQ` 的頻譜是 `torch.stft(normalized=True)` 尺度**（乘了 1/√n_fft；出貨 grid 為 1/32，換算常數是 grid 的
+  `stft_scale`／`stft_unscale`），AIAEC 兩個模型交出的則是**未正規化**的 rfft。直接串接會剛好差 √n_fft 倍
   （出貨 grid 為 32 倍；過驅動或欠驅動），
   而且兩邊都偵測不到——都是量綱合法的 float 頻譜，ERB 特徵又是 EMA 正規化的。
   兩者也不同 grid（出貨的 48 kHz/1024/512 對 16 kHz/512），中間本來就有 resampler，換算就放在那一層。
-  `DFN2_ANALYSIS_SCALE` **不是**這個因子（它只作用在特徵分支的拷貝上）。
+  特徵分支內部另有 train.py 的 analysis scale，數值相同但**只**作用在餵給正規化器的拷貝上，不是頻譜進出時要乘的換算。
 
 ### 6.7 Pool 大小
 
@@ -65,11 +74,13 @@ int  dfn2_prepost_output_frame_index(const DFN2Prepost *p, long long *frame);
 | Align-ULCNet 48 kHz | 32 | 504,496 | 477,680 |
 | Align-ULCNet 48 kHz | 64 | 950,960 | 924,144 |
 | DeepVQE-S 16 kHz | 32 | 628,784 | 615,280 |
-| DeepFilterNet2 48 kHz（出貨 grid） | — | 233,936 | 219,536 |
-| DeepFilterNet2 32 kHz（`-DDFN2_GRID_KHZ=32`，28 個 ERB band） | — | 196,912 | 189,680 |
-| DeepFilterNet2 16 kHz（`-DDFN2_GRID_KHZ=16`，24 個 ERB band） | — | 178,320 | 174,672 |
+| DeepFilterNet2 48 kHz／1024（出貨 grid，32 個 ERB band） | — | 234,048 | 219,648 |
+| DeepFilterNet2 32 kHz／512（28 個 ERB band） | — | 220,688 | 213,456 |
+| DeepFilterNet2 16 kHz／256（24 個 ERB band） | — | 213,984 | 210,336 |
 
-DeepVQE-S 的量體由 16 個 state 張量（每個一份 buffer）主宰。DeepFilterNet2 的 FREQ 比 TIME 小（出貨 grid 為 14,400 bytes，32 kHz 為 7,232，16 kHz 為 3,648）：
+DeepVQE-S 的量體由 16 個 state 張量（每個一份 buffer）主宰。DeepFilterNet2 的 state 按編譯期容量（預設 1024／32／96／5）配置、grid 只用其中一段，
+所以 16／32 kHz 的 pool 只比出貨 grid 小一點（FFT handle、`AcStft` 與 staging 隨 grid 縮，state 不縮），pool 大小與 lookahead pair 無關；
+把容量降到該 grid（`-DDFN2_MAX_N_FFT=256 -DDFN2_MAX_N_ERB=24`）才拿回差額，見 [ainr_dfn2_grids](html/ainr_dfn2_grids.html)。DeepFilterNet2 的 FREQ 比 TIME 小（出貨 grid 為 14,400 bytes，32 kHz 為 7,232，16 kHz 為 3,648）：
 `DFN2State` 不內嵌 analysis/window/synthesis 緩衝，TIME 另 carve 輸出 hop staging 與分析用的 `AcStft`
 （出貨 grid 16,480 B），FREQ 只多 carve 雙輸入入口的第二組 staging（`apply_re`/`apply_im`）。合成用的 `AcIstft`
 （出貨 1/1 與出貨 grid 為 12,384 B，32 kHz grid 6,240 B，16 kHz grid 3,168 B，借用 FFT handle 與窗表）是應用端的物件，兩個模式的 pool 都不含它；它不隨 D 變，
@@ -140,7 +151,7 @@ dfn_hop_end(&hop, out);                                  /* 合成剛好一個 h
 | 4ch flow `Mcab`（含共用 estimator 的 front end） | `mcab_get_mem_requirements()`；estimator 另用 `delay_aec_get_mem_size()` | `Mcab` pool 74,624；front end（estimator + `Mcab` pool）110,048 | `enable_post = 0` 時 `Mcab` pool 為 68,368；front end 48 kHz／1024：267,072（`mcab_external_static --print-mem-size`） |
 | 4ch sample 的 `Unit`（lane + estimator + `Mcab` pool + SRP-PHAT／BF helper） | `mcab_sample_unit_memory()` | 1,706,240 | 48 kHz／1024：6,329,312（`mcab_static --print-mem-size`） |
 | ULCNet stage | `ulcnet_nn_stage_mem_size(0)` | 36,400 | 一個建置一組格點（48 kHz：71,728） |
-| DFN2 stage／rate bridge | `dfn_res_stage_get_mem_requirements()`／`dfn_rate_bridge_get_mem_requirements()` | 231,984／349,888 | bridge 內含 stage；16 kHz 走 bridge，48 kHz 直接用 stage 加呼叫端的 `AcIstft`；數字是出貨的 lookahead 1/1，其他組合的 pool 大小要現查 |
+| DFN2 stage／rate bridge | `dfn_res_stage_get_mem_requirements()`／`dfn_rate_bridge_get_mem_requirements()` | 232,096／350,000 | bridge 內含 stage；16 kHz 走 bridge，48 kHz 直接用 stage 加呼叫端的 `AcIstft`；數字是出貨的 48 kHz／1024 grid、lookahead 1/1（兩支範例 main 的預設），其他 grid 或 pair（ring 超過 5 要先提高容量）的 pool 大小要現查 |
 
 mono 的 16 kHz／256 合計 = `ALIGN16(366,000) + 45,344 + 10,320 + 2,624 = 424,288`（AEC + NR + 合成 + 暫存）；4ch sample 的 `Unit` 加 RES／NR／合成／暫存 = `1,706,240 + (7,904 + 45,344 + 11,344 + 2,096) = 1,772,928`（`mcab_static --sample-rate 16000` 印的 `Total:`）。
 

@@ -1,5 +1,11 @@
 #define _POSIX_C_SOURCE 200809L
-/* C pre/post-processing contract test. */
+/* C pre/post-processing contract test.
+ *
+ * The DeepFilterNet2 grid and lookahead pair this program runs are chosen when it
+ * is built (dfn2_test_grid.h: -DDFN2_GRID_KHZ=16|32|48, -DDFN2_MASK_LOOKAHEAD,
+ * -DDFN2_DF_LOOKAHEAD); the library is handed the same grid at run time. The
+ * digest printed for the shipped 48 kHz 1/1 grid is a recorded value; the other
+ * grids print their own. */
 #include <math.h>
 #include <stddef.h>
 #include <stdint.h>
@@ -10,6 +16,7 @@
 #include "DeepFilterNet2/dfn2_process.h"
 #include "DeepFilterNet2/dfn2_model_io.h"
 #include "GTCRN/gtcrn_process.h"
+#include "dfn2_test_grid.h"
 
 #ifndef M_PI
 #define M_PI 3.14159265358979323846
@@ -39,10 +46,11 @@ static int dfn2_framing(AcStft** stft, AcIstft** istft)
     size_t bytes;
     FftHandle* fft = fft_create(DFN2_N_FFT);
     if (!fft) return 0;
-    dfn2_framing_config(&cfg, fft, NULL);
+    dfn2_framing_config(&cfg, dfn2_test_grid(), fft, NULL);
     bytes = ac_stft_get_mem_size(&cfg);
     *stft = ac_stft_init(aligned_block(bytes), bytes, &cfg);
-    dfn2_framing_config(&cfg, fft, *stft ? ac_stft_window(*stft) : NULL);
+    dfn2_framing_config(&cfg, dfn2_test_grid(), fft,
+                        *stft ? ac_stft_window(*stft) : NULL);
     bytes = ac_istft_get_mem_size(&cfg);
     *istft = ac_istft_init(aligned_block(bytes), bytes, &cfg);
     return *stft != NULL && *istft != NULL;
@@ -114,43 +122,141 @@ static float stream_tap(int tap)
     return taps[tap];
 }
 
-/* Reference ERB matrices for the DFN tests, built from the shipped
- * 48-kHz/1024/32 border table with the exact triangular construction.
+/* Reference ERB matrices for the DFN tests, built with the exact triangular
+ * construction over a band border table (dfn2_test_band_borders(), dfn2_test_grid.h):
+ * the shipped table on the 48 kHz / 1024 / 32 grid, a generated one on any other grid.
  * The runtime consumes only caller-loaded matrices (erb_fwd.bin/erb_inv.bin);
  * the tests build them here and hand them in through the same pointers,
  * so each golden value is reproduced from the table, not from a stored
  * copy of the matrices. */
-static const int dfn_test_borders[32] = {
-    0, 2, 4, 6, 8, 10, 12, 14, 16, 18, 20, 22, 25, 30, 36, 42,
-    50, 59, 69, 81, 94, 110, 129, 151, 176, 205, 239, 279,
-    325, 378, 440, 513
-};
-static float dfn_test_fwd[513][32];
-static float dfn_test_inv[32][513];
+
+static float dfn_test_fwd[DFN2_N_BINS][DFN2_N_ERB];
+static float dfn_test_inv[DFN2_N_ERB][DFN2_N_BINS];
 static void dfn_test_build_erb(void)
 {
+    const int last = DFN2_N_ERB - 1;
+    int borders[DFN2_N_ERB];
     int segment = 0;
+    dfn2_test_band_borders(borders);
+    if (borders[0] != 0 || borders[last] != DFN2_N_BINS) exit(2);
+    for (int b = 0; b < last; ++b)
+        if (borders[b + 1] - borders[b] < 2) exit(2);
     memset(dfn_test_fwd, 0, sizeof(dfn_test_fwd));
     memset(dfn_test_inv, 0, sizeof(dfn_test_inv));
-    for (int k = 0; k < 513; ++k) {
+    for (int k = 0; k < DFN2_N_BINS; ++k) {
         int lo, hi, width, offset;
         float right, left, fleft, fright;
-        while (segment + 1 < 31 && k >= dfn_test_borders[segment + 1])
+        while (segment + 1 < last && k >= borders[segment + 1])
             ++segment;
-        lo = dfn_test_borders[segment];
-        hi = dfn_test_borders[segment + 1];
+        lo = borders[segment];
+        hi = borders[segment + 1];
         width = hi - lo;
         offset = k - lo;
         right = (float)offset / (float)width;
         left = 1.0f - right;
         fleft = left; fright = right;
         if (segment == 0) fleft *= 2.0f;
-        if (segment + 1 == 31) fright *= 2.0f;
+        if (segment + 1 == last) fright *= 2.0f;
         dfn_test_fwd[k][segment] = fleft;
         dfn_test_fwd[k][segment + 1] = fright;
         dfn_test_inv[segment][k] = left;
         dfn_test_inv[segment + 1][k] = right;
     }
+}
+
+/* The buffers of this program are sized by the DFN2_* macros of dfn2_test_grid.h
+ * while the library runs on the DFN2Grid built from the same values: the two must
+ * agree, or a buffer is smaller than what the library reads or writes. Then the
+ * run-time refusals that stand where the grid and the lookahead pair used to be
+ * compile-time constants: an invalid grid never starts an object, and a
+ * descriptor or a pair of another grid is refused. */
+static int test_dfn2_grid_contract(void)
+{
+    const DFN2Grid* g = dfn2_test_grid();
+    static DFN2State state;
+    static DFN2ModelIOState model_io;
+    float erb[DFN2_N_ERB] = {0};
+    float spec[2 * DFN2_DF_BINS] = {0};
+    DFN2ModelIoDescriptor descriptor;
+    DFN2Grid other, bad;
+    /* Pairs that differ from the test grid's in one lookahead and stay within
+     * the ring capacity (the other lookahead is 0 or 1 at most). */
+    const int other_mask = DFN2_MASK_LOOKAHEAD == 0 ? 1 : 0;
+    const int other_df = DFN2_DF_LOOKAHEAD == 0 ? 1 : 0;
+
+    CHECK(dfn2_grid_validate(g) == DFN2_GRID_OK, "DFN2 test grid validates");
+    CHECK(g->sample_rate == DFN2_SR && g->n_fft == DFN2_N_FFT &&
+          g->hop == DFN2_HOP_LEN && g->n_bins == DFN2_N_BINS &&
+          g->n_erb == DFN2_N_ERB && g->df_bins == DFN2_DF_BINS,
+          "DFN2 test grid has the signal grid the buffers are sized for");
+    CHECK(g->mask_lookahead == DFN2_MASK_LOOKAHEAD &&
+          g->df_lookahead == DFN2_DF_LOOKAHEAD &&
+          g->df_history == DFN2_DF_HISTORY && g->ring == DFN2_DF_RING,
+          "DFN2 test grid has the lookahead pair and ring the test expects");
+    CHECK(g->stft_scale == DFN2_NORMALIZED_STFT_SCALE &&
+          g->stft_unscale == DFN2_NORMALIZED_STFT_UNSCALE,
+          "DFN2 test grid has the analysis and synthesis scale of the framing");
+#ifdef DFN2_GRID_KHZ
+    /* train.py make_norm_alpha(sr, hop, 1.0): the literals a model trained on
+     * these grids carries (config.ini [feature]). */
+    CHECK(g->erb_norm_alpha == (DFN2_GRID_KHZ == 48 ? 0.989f : 0.992f) &&
+          g->spec_norm_alpha == g->erb_norm_alpha,
+          "DFN2 test grid has the normaliser coefficient of its model");
+#endif
+
+    /* An invalid or missing grid never starts an object. */
+    bad = *g;
+    bad.hop += 1;
+    CHECK(dfn2_grid_validate(&bad) == DFN2_GRID_ERR_INCONSISTENT &&
+          dfn2_state_init(&state, &bad, NULL, NULL) == -1 &&
+          dfn2_state_init(&state, NULL, NULL, NULL) == -1,
+          "DFN2 objects refuse a hand-edited or missing grid");
+    CHECK(dfn2_model_io_init(&model_io, &bad) == -1 &&
+          dfn2_model_io_ready_frames(&model_io) == 0u &&
+          dfn2_model_io_push_features(&model_io, erb, spec) == -1,
+          "DFN2 a model I/O state without a grid fails every call");
+    CHECK(dfn2_model_io_init(NULL, g) == -1, "DFN2 model I/O init refuses NULL");
+
+    /* The capacities and the lookahead range are refused by dfn2_grid_make. */
+    CHECK(dfn2_grid_make(&other, DFN2_SR, DFN2_N_FFT, DFN2_N_ERB + 1,
+                         DFN2_DF_BINS, DFN2_MASK_LOOKAHEAD,
+                         DFN2_DF_LOOKAHEAD) == DFN2_GRID_ERR_N_ERB &&
+          dfn2_grid_make(&other, DFN2_SR, DFN2_N_FFT, DFN2_N_ERB, DFN2_DF_BINS,
+                         DFN2_MAX_MASK_LOOKAHEAD + 1,
+                         DFN2_DF_LOOKAHEAD) == DFN2_GRID_ERR_MASK_LOOKAHEAD &&
+          dfn2_grid_make(&other, DFN2_SR, DFN2_N_FFT, DFN2_N_ERB, DFN2_DF_BINS,
+                         DFN2_MASK_LOOKAHEAD,
+                         DFN2_MAX_DF_LOOKAHEAD + 1) == DFN2_GRID_ERR_DF_LOOKAHEAD,
+          "DFN2 grid refuses a band count or a lookahead the graph cannot take");
+    if (DFN2_N_BINS > DFN2_MAX_DF_BINS + 1)
+        CHECK(dfn2_grid_make(&other, DFN2_SR, DFN2_N_FFT, DFN2_N_ERB,
+                             DFN2_MAX_DF_BINS + 1, DFN2_MASK_LOOKAHEAD,
+                             DFN2_DF_LOOKAHEAD) == DFN2_GRID_ERR_CAPACITY,
+              "DFN2 grid refuses more deep-filter bins than the capacity");
+
+    /* The descriptor is the graph contract for this grid and no other. */
+    CHECK(dfn2_model_io_descriptor_default(g, &descriptor) == 0 &&
+          dfn2_model_io_descriptor_validate(g, &descriptor) == 0,
+          "DFN2 the default descriptor validates against its own grid");
+    CHECK(dfn2_grid_make(&other, DFN2_SR, DFN2_N_FFT, DFN2_N_ERB, DFN2_DF_BINS,
+                         other_mask, 0) == DFN2_GRID_OK &&
+          dfn2_model_io_descriptor_validate(&other, &descriptor) == -1,
+          "DFN2 a descriptor of another mask lookahead is refused");
+    CHECK(dfn2_grid_make(&other, DFN2_SR, DFN2_N_FFT, DFN2_N_ERB, DFN2_DF_BINS,
+                         DFN2_MASK_LOOKAHEAD, other_df) == DFN2_GRID_OK &&
+          dfn2_model_io_descriptor_validate(&other, &descriptor) == -1,
+          "DFN2 a descriptor of another deep-filter lookahead is refused");
+    descriptor.erb_bands += 4;
+    CHECK(dfn2_model_io_descriptor_validate(g, &descriptor) == -1,
+          "DFN2 a descriptor with another band count is refused");
+    descriptor.erb_bands -= 4;
+    descriptor.sample_rate += 1;
+    CHECK(dfn2_model_io_descriptor_validate(g, &descriptor) == -1,
+          "DFN2 a descriptor with another sample rate is refused");
+    CHECK(dfn2_model_io_descriptor_validate(&bad, &descriptor) == -1 &&
+          dfn2_model_io_descriptor_default(&bad, &descriptor) == -1,
+          "DFN2 a descriptor is neither made nor validated for an invalid grid");
+    return 1;
 }
 
 static int test_dfn_stream_alignment(void)
@@ -163,7 +269,8 @@ static int test_dfn_stream_alignment(void)
     long long output_frame = -1;
 
     dfn_test_build_erb();
-    dfn2_state_init(&dfn2, NULL, NULL);
+    CHECK(dfn2_state_init(&dfn2, dfn2_test_grid(), NULL, NULL) == 0,
+          "DFN2 state starts for the test grid");
     dfn2_set_erb_matrices(&dfn2, &dfn_test_fwd[0][0], &dfn_test_inv[0][0]);
     for (int k = 0; k < DFN2_DF_BINS; ++k)
         for (int tap = 0; tap < DFN2_DF_ORDER; ++tap)
@@ -248,12 +355,24 @@ static int all_zero(const float* values, size_t count)
 
 static int test_dfn2_model_io(void)
 {
+    /* The three windows are flat runs packed at the grid's stride inside
+     * capacity-sized storage: erb_window[frame][n_erb], spec_window[channel]
+     * [frame][df_bins] and df_convp_window[channel][tap][df_bins]. */
+    enum { WF = DFN2_MODEL_WINDOW_FRAMES };
+    const DFN2Grid* grid = dfn2_test_grid();
+    const size_t convp_n = (size_t)DFN2_MODEL_ENCODER_CHANNELS *
+                           DFN2_MODEL_DF_PATHWAY_WINDOW * DFN2_DF_BINS;
     static DFN2ModelIOState state;
     static DFN2ModelIOState healthy;
     float erb[DFN2_N_ERB];
     float spec[2][DFN2_DF_BINS];
 
-    dfn2_model_io_init(&state);
+    CHECK(dfn2_model_io_init(&state, grid) == 0,
+          "DFN2 model I/O state starts for the test grid");
+    CHECK(dfn2_model_io_ready_frames(&state) ==
+              (unsigned)(DFN2_MASK_LOOKAHEAD + DFN2_FRAMES_PER_CALL) &&
+          dfn2_model_io_ready_frames(NULL) == 0u,
+          "DFN2 the first call needs mask lookahead + frames-per-call frames");
     for (int frame = 0; frame < 3; ++frame) {
         for (int band = 0; band < DFN2_N_ERB; ++band)
             erb[band] = (float)(100 * frame + band);
@@ -261,28 +380,36 @@ static int test_dfn2_model_io(void)
             for (int bin = 0; bin < DFN2_DF_BINS; ++bin)
                 spec[channel][bin] =
                     (float)(1000 * frame + 100 * channel + bin);
-        CHECK(dfn2_model_io_push_features(&state, erb, (const float (*)[DFN2_DF_BINS])spec) ==
+        CHECK(dfn2_model_io_push_features(&state, erb, &spec[0][0]) ==
                   (frame >= DFN2_MASK_LOOKAHEAD),
               "DFN2 model window warms up for the mask lookahead frames");
     }
-    CHECK(state.erb_window[0][7] == 7.0f &&
-          state.erb_window[1][7] == 107.0f &&
-          state.erb_window[2][7] == 207.0f,
+    CHECK(state.erb_window[0 * DFN2_N_ERB + 7] == 7.0f &&
+          state.erb_window[1 * DFN2_N_ERB + 7] == 107.0f &&
+          state.erb_window[2 * DFN2_N_ERB + 7] == 207.0f,
           "DFN2 ERB model window keeps the last three pushed frames");
-    CHECK(state.spec_window[1][0][9] == 109.0f &&
-          state.spec_window[1][2][9] == 2109.0f,
+    CHECK(state.spec_window[(1 * WF + 0) * DFN2_DF_BINS + 9] == 109.0f &&
+          state.spec_window[(1 * WF + 2) * DFN2_DF_BINS + 9] == 2109.0f,
           "DFN2 complex model window preserves channel-major layout");
+    CHECK(all_zero(state.erb_window + WF * DFN2_N_ERB,
+                   sizeof(state.erb_window) / sizeof(float) -
+                       (size_t)WF * DFN2_N_ERB) &&
+          all_zero(state.spec_window + 2 * WF * DFN2_DF_BINS,
+                   sizeof(state.spec_window) / sizeof(float) -
+                       (size_t)2 * WF * DFN2_DF_BINS),
+          "DFN2 feature windows leave the storage past the grid's extent zero");
 
     /* The first complete window is [t-(2-L) .. t+L] for t = 0, L the mask
      * lookahead: frames before the stream start read as zero, whatever L is. */
-    dfn2_model_io_init(&state);
+    CHECK(dfn2_model_io_init(&state, grid) == 0,
+          "DFN2 model I/O state starts again for the test grid");
     for (int frame = 0; frame <= DFN2_MASK_LOOKAHEAD; ++frame) {
         for (int band = 0; band < DFN2_N_ERB; ++band)
             erb[band] = (float)(10 + frame);
         for (int channel = 0; channel < 2; ++channel)
             for (int bin = 0; bin < DFN2_DF_BINS; ++bin)
                 spec[channel][bin] = (float)(20 + frame);
-        CHECK(dfn2_model_io_push_features(&state, erb, (const float (*)[DFN2_DF_BINS])spec) ==
+        CHECK(dfn2_model_io_push_features(&state, erb, &spec[0][0]) ==
                   (frame == DFN2_MASK_LOOKAHEAD),
               "DFN2 heads[0] is ready exactly when frame L has been pushed");
     }
@@ -290,9 +417,9 @@ static int test_dfn2_model_io(void)
         int source = slot - (DFN2_MODEL_INPUT_FRAMES - 1 - DFN2_MASK_LOOKAHEAD);
         float want_erb = source >= 0 ? (float)(10 + source) : 0.0f;
         float want_spec = source >= 0 ? (float)(20 + source) : 0.0f;
-        CHECK(state.erb_window[slot][3] == want_erb &&
-              state.spec_window[0][slot][5] == want_spec &&
-              state.spec_window[1][slot][5] == want_spec,
+        CHECK(state.erb_window[slot * DFN2_N_ERB + 3] == want_erb &&
+              state.spec_window[(0 * WF + slot) * DFN2_DF_BINS + 5] == want_spec &&
+              state.spec_window[(1 * WF + slot) * DFN2_DF_BINS + 5] == want_spec,
               "DFN2 first window is [t-(2-L)..t+L] with zeros before the start");
     }
 
@@ -309,9 +436,8 @@ static int test_dfn2_model_io(void)
               (size_t)DFN2_MODEL_GRU_ROWS * DFN2_MODEL_GRU_HIDDEN *
                   sizeof(float),
           "DFN2 h_gru rows tile the three stacks in order");
-    CHECK(sizeof(state.df_convp_window) ==
-              (size_t)DFN2_MODEL_ENCODER_CHANNELS *
-                  DFN2_MODEL_DF_PATHWAY_WINDOW * DFN2_DF_BINS * sizeof(float),
+    CHECK(dfn2_prepost_convp_window_elements(grid) == convp_n &&
+          sizeof(state.df_convp_window) >= convp_n * sizeof(float),
           "DFN2 pathway window is the full kernel depth");
 
     /* The accelerator writes the two recurrent arrays in place. */
@@ -328,9 +454,7 @@ static int test_dfn2_model_io(void)
           "DFN2 validate checks the second ERB stack layer");
     CHECK(all_zero(&state.gru_hidden[0][0],
                    (size_t)DFN2_MODEL_GRU_ROWS * DFN2_MODEL_GRU_HIDDEN) &&
-          all_zero(&state.df_convp_window[0][0][0],
-                   (size_t)DFN2_MODEL_ENCODER_CHANNELS *
-                       DFN2_MODEL_DF_PATHWAY_WINDOW * DFN2_DF_BINS),
+          all_zero(state.df_convp_window, convp_n),
           "DFN2 non-finite state zeroes both recurrent arrays");
     CHECK(memcmp(state.erb_window, healthy.erb_window,
                  sizeof(state.erb_window)) == 0 &&
@@ -343,9 +467,7 @@ static int test_dfn2_model_io(void)
           "DFN2 a refused validation advances the state generation once");
 
     state = healthy;
-    state.df_convp_window[DFN2_MODEL_ENCODER_CHANNELS - 1]
-                         [DFN2_MODEL_DF_PATHWAY_WINDOW - 1]
-                         [DFN2_DF_BINS - 1] = INFINITY;
+    state.df_convp_window[convp_n - 1] = INFINITY;   /* last element of the packed run */
     CHECK(dfn2_model_io_validate_state(&state) != 0 &&
           all_zero(&state.gru_hidden[0][0],
                    (size_t)DFN2_MODEL_GRU_ROWS * DFN2_MODEL_GRU_HIDDEN),
@@ -354,12 +476,15 @@ static int test_dfn2_model_io(void)
     CHECK(dfn2_model_io_validate_state(NULL) != 0,
           "DFN2 validate refuses a null state");
     state = healthy;
-    CHECK(dfn2_model_io_validate_arrays(NULL, state.df_convp_window) != 0 &&
-          dfn2_model_io_validate_arrays(state.gru_hidden, NULL) != 0 &&
+    CHECK(dfn2_model_io_validate_arrays(NULL, state.df_convp_window,
+                                        DFN2_DF_BINS) != 0 &&
+          dfn2_model_io_validate_arrays(state.gru_hidden, NULL,
+                                        DFN2_DF_BINS) != 0 &&
           memcmp(&state, &healthy, sizeof(state)) == 0,
           "DFN2 validate_arrays refuses a null array and touches nothing");
     CHECK(dfn2_model_io_validate_arrays(state.gru_hidden,
-                                        state.df_convp_window) == 0,
+                                        state.df_convp_window,
+                                        DFN2_DF_BINS) == 0,
           "DFN2 validate_arrays accepts finite arrays");
 
     /* reset and zero_recurrent each advance the generation exactly once. */
@@ -373,11 +498,15 @@ static int test_dfn2_model_io(void)
           "DFN2 zero_recurrent clears the recurrent arrays and counts");
     state = healthy;
     dfn2_model_io_reset(&state);
-    CHECK(all_zero(&state.erb_window[0][0],
-                   (size_t)DFN2_MODEL_INPUT_FRAMES * DFN2_N_ERB) &&
+    CHECK(all_zero(state.erb_window, sizeof(state.erb_window) / sizeof(float)) &&
           state.feature_frames_seen == 0u &&
           state.state_generation == healthy.state_generation + 1u,
           "DFN2 reset returns to init values and counts");
+    CHECK(state.n_erb == DFN2_N_ERB && state.df_bins == DFN2_DF_BINS &&
+          state.mask_lookahead == DFN2_MASK_LOOKAHEAD &&
+          dfn2_model_io_ready_frames(&state) ==
+              (unsigned)(DFN2_MASK_LOOKAHEAD + DFN2_FRAMES_PER_CALL),
+          "DFN2 reset keeps the grid dimensions of the state");
     dfn2_model_io_reset(NULL);
     dfn2_model_io_zero_recurrent(NULL);
 
@@ -420,7 +549,8 @@ static int test_dfn2(uint64_t* digest)
         AcStft* stft;
         AcIstft* istft;
         CHECK(dfn2_framing(&stft, &istft), "DFN2 framing objects");
-        dfn2_state_init(&state, stft, istft);
+        CHECK(dfn2_state_init(&state, dfn2_test_grid(), stft, istft) == 0,
+              "DFN2 state starts for the test grid");
     }
     dfn2_set_erb_matrices(&state, &dfn_test_fwd[0][0], &dfn_test_inv[0][0]);
     for (int b = 0; b < DFN2_N_ERB; ++b) mask[b] = 1.0f;
@@ -457,7 +587,7 @@ static int test_dfn2(uint64_t* digest)
                 if (er > max_spectral_error) max_spectral_error = er;
                 if (ei > max_spectral_error) max_spectral_error = ei;
             }
-            dfn2_apply_atten_lim(previous_re, previous_im,
+            dfn2_apply_atten_lim(DFN2_N_BINS, previous_re, previous_im,
                                  enhanced_re, enhanced_im, -100.0f);
             dfn2_synthesis(&state, enhanced_re, enhanced_im, output);
             CHECK(all_finite(output, DFN2_HOP_LEN), "DFN2 finite WOLA output");
@@ -706,8 +836,9 @@ static int test_dfn_dual_state_disjoint(void)
     int features_differed = 0;
 
     dfn_test_build_erb();
-    dfn2_state_init(&st_a, NULL, NULL);
-    dfn2_state_init(&st_b, NULL, NULL);
+    CHECK(dfn2_state_init(&st_a, dfn2_test_grid(), NULL, NULL) == 0 &&
+          dfn2_state_init(&st_b, dfn2_test_grid(), NULL, NULL) == 0,
+          "DFN2 states start for the test grid");
     dfn2_set_erb_matrices(&st_a, &dfn_test_fwd[0][0], &dfn_test_inv[0][0]);
     dfn2_set_erb_matrices(&st_b, &dfn_test_fwd[0][0], &dfn_test_inv[0][0]);
     for (int k = 0; k < DFN2_DF_BINS; ++k)
@@ -754,8 +885,9 @@ static int test_dfn_dual_state_disjoint(void)
 
     /* Same estimated spectrum, different applied spectra: the features must
      * agree byte for byte. */
-    dfn2_state_init(&st_a, NULL, NULL);
-    dfn2_state_init(&st_b, NULL, NULL);
+    CHECK(dfn2_state_init(&st_a, dfn2_test_grid(), NULL, NULL) == 0 &&
+          dfn2_state_init(&st_b, dfn2_test_grid(), NULL, NULL) == 0,
+          "DFN2 states start again for the test grid");
     dfn2_set_erb_matrices(&st_a, &dfn_test_fwd[0][0], &dfn_test_inv[0][0]);
     dfn2_set_erb_matrices(&st_b, &dfn_test_fwd[0][0], &dfn_test_inv[0][0]);
     for (int wall = 0; wall < 14; ++wall) {
@@ -796,11 +928,20 @@ static int test_dfn_dual_state_disjoint(void)
  * NaN/Inf entries, an all-zero row and zero holes inside a span. */
 static int test_dfn_erb_spans_exact(void)
 {
+    enum { BINS = DFN2_N_BINS, BANDS = DFN2_N_ERB };
+#if DFN2_N_ERB < 24 || DFN2_N_BINS < 129
+#error "test_dfn_erb_spans_exact addresses fixed bands (up to 20) and bins (up to 58): it needs n_erb >= 24 and n_bins >= 129"
+#endif
+    /* Bin positions of the shipped 513-bin grid, scaled to this grid's width
+     * (unchanged on the 48 kHz grid). */
+#define BIN_AT(k513) ((k513) * BINS / 513)
     static DFN2State st;
-    static float fwd[513][32], inv[32][513], coefs[DFN2_DF_BINS * DFN2_DF_ORDER * 2];
-    float re[513], im[513], fe[32], fs[2 * DFN2_DF_BINS], mask[32];
-    float out_re[513], out_im[513], ref_state[32], erb[32], ref_gain[513];
-    const float scale2 = DFN2_ANALYSIS_SCALE * DFN2_ANALYSIS_SCALE;
+    static float fwd[BINS][BANDS], inv[BANDS][BINS], coefs[DFN2_DF_BINS * DFN2_DF_ORDER * 2];
+    float re[BINS], im[BINS], fe[BANDS], fs[2 * DFN2_DF_BINS], mask[BANDS];
+    float out_re[BINS], out_im[BINS], ref_state[BANDS], erb[BANDS], ref_gain[BINS];
+    const DFN2Grid* grid = dfn2_test_grid();
+    const float scale2 = grid->stft_scale * grid->stft_scale;
+    const float alpha = grid->erb_norm_alpha;
     uint32_t lcg = 12345u;
 
     dfn_test_build_erb();
@@ -810,60 +951,61 @@ static int test_dfn_erb_spans_exact(void)
         memcpy(inv, dfn_test_inv, sizeof(inv));
         if (variant == 1) {
             fwd[10][5] = NAN;
-            fwd[300][0] = INFINITY;
+            fwd[BIN_AT(300)][0] = INFINITY;
             memset(fwd[7], 0, sizeof(fwd[7]));
-            for (int k = 0; k < 513; ++k) fwd[k][12] = 0.0f;   /* an empty band */
-            fwd[200][20] = 0.0f;       /* a hole inside a span */
+            for (int k = 0; k < BINS; ++k) fwd[k][12] = 0.0f;   /* an empty band */
+            fwd[BIN_AT(200)][20] = 0.0f;       /* a hole inside a span */
             inv[3][40] = -0.0f;
             inv[20][0] = 0.5f;         /* a far outlier widens the span */
         } else if (variant == 2) {
-            for (int k = 0; k < 513; ++k) fwd[k][(k * 7) % 32] += 0.125f;
-            for (int k = 0; k < 513; ++k) fwd[k][3] = 0.0f;
-            fwd[512][3] = 0.5f;        /* a band fed by the last bin only */
-            inv[31][3] = 0.25f;
+            for (int k = 0; k < BINS; ++k) fwd[k][(k * 7) % BANDS] += 0.125f;
+            for (int k = 0; k < BINS; ++k) fwd[k][3] = 0.0f;
+            fwd[BINS - 1][3] = 0.5f;   /* a band fed by the last bin only */
+            inv[BANDS - 1][3] = 0.25f;
         }
-        dfn2_state_init(&st, NULL, NULL);
+        CHECK(dfn2_state_init(&st, grid, NULL, NULL) == 0,
+              "DFN2 state starts for the test grid");
         dfn2_set_erb_matrices(&st, &fwd[0][0], &inv[0][0]);
         memcpy(ref_state, st.erb_norm_state, sizeof(ref_state));
         for (int frame = 0; frame < 24; ++frame) {
-            for (int k = 0; k < 513; ++k) {
+            for (int k = 0; k < BINS; ++k) {
                 lcg = lcg * 1664525u + 1013904223u;
                 re[k] = (float)(int32_t)lcg * 4.6566e-10f;
                 lcg = lcg * 1664525u + 1013904223u;
                 im[k] = (float)(int32_t)lcg * 4.6566e-10f;
             }
             if (frame % 4 == 1) re[37 + frame] = 1e30f;   /* power -> Inf */
-            if (frame % 6 == 3) im[250] = NAN;
-            if (frame % 5 == 2) re[512] = -INFINITY;
+            if (frame % 6 == 3) im[BINS / 2 - 6] = NAN;
+            if (frame % 5 == 2) re[BINS - 1] = -INFINITY;
 
             dfn2_compute_features(&st, re, im, fe, fs);
             memset(erb, 0, sizeof(erb));
-            for (int k = 0; k < 513; ++k) {
+            for (int k = 0; k < BINS; ++k) {
                 float p = (re[k] * re[k] + im[k] * im[k]) * scale2;
-                for (int b = 0; b < 32; ++b) erb[b] += p * fwd[k][b];
+                for (int b = 0; b < BANDS; ++b) erb[b] += p * fwd[k][b];
             }
-            for (int b = 0; b < 32; ++b) {
+            for (int b = 0; b < BANDS; ++b) {
                 float db = 10.0f * log10f(erb[b] + DFN2_ERB_LOG_FLOOR);
-                float mean = DFN2_ERB_NORM_ALPHA * ref_state[b] +
-                             (1.0f - DFN2_ERB_NORM_ALPHA) * db;
+                float mean = alpha * ref_state[b] + (1.0f - alpha) * db;
                 float ref = (db - mean) / DFN2_ERB_NORM_SCALE_DB;
                 ref_state[b] = mean;
                 CHECK(memcmp(&fe[b], &ref, sizeof(ref)) == 0,
                       "DFN2 ERB features over the nonzero spans equal the dense sum");
             }
 
-            for (int b = 0; b < 32; ++b) mask[b] = 0.3f + 0.02f * (float)b;
-            if (frame % 3 == 0) mask[frame % 32] = (frame & 1) ? INFINITY : NAN;
+            for (int b = 0; b < BANDS; ++b) mask[b] = 0.3f + 0.02f * (float)b;
+            if (frame % 3 == 0) mask[frame % BANDS] = (frame & 1) ? INFINITY : NAN;
             if (frame % 7 == 2) mask[0] = -INFINITY;
-            if (frame % 10 == 9) mask[31] = -0.0f;
+            if (frame % 10 == 9) mask[BANDS - 1] = -0.0f;
             (void)dfn2_compose(&st, re, im, mask, coefs, 0.5f, out_re, out_im);
             memset(ref_gain, 0, sizeof(ref_gain));
-            for (int b = 0; b < 32; ++b)
-                for (int k = 0; k < 513; ++k) ref_gain[k] += inv[b][k] * mask[b];
+            for (int b = 0; b < BANDS; ++b)
+                for (int k = 0; k < BINS; ++k) ref_gain[k] += inv[b][k] * mask[b];
             CHECK(memcmp(st.scratch_bin_gain, ref_gain, sizeof(ref_gain)) == 0,
                   "DFN2 mask expansion over the nonzero spans equals the dense sum");
         }
     }
+#undef BIN_AT
     return 1;
 }
 
@@ -907,6 +1049,8 @@ static int test_dfn2_state_evolution(uint64_t* digest)
         CH = DFN2_MODEL_ENCODER_CHANNELS, K = DFN2_MODEL_DF_PATHWAY_WINDOW,
         BINS = DFN2_DF_BINS, HOPS = 14
     };
+    /* The pathway window is the packed run [CH][K][BINS] at the start of the
+     * state's storage. */
     static DFN2ModelIOState state;
     static float ref_gru[ROWS * HIDDEN];
     static float ref_win[CH * K * BINS];
@@ -914,9 +1058,12 @@ static int test_dfn2_state_evolution(uint64_t* digest)
     unsigned int generation;
     int zeroings = 0;
 
-    dfn2_model_io_init(&state);
+    CHECK(dfn2_model_io_init(&state, dfn2_test_grid()) == 0,
+          "DFN2 model I/O state starts for the test grid");
     CHECK(sizeof(state.gru_hidden) == sizeof(ref_gru) &&
-          sizeof(state.df_convp_window) == sizeof(ref_win),
+          sizeof(state.df_convp_window) >= sizeof(ref_win) &&
+          dfn2_prepost_convp_window_elements(dfn2_test_grid()) ==
+              sizeof(ref_win) / sizeof(float),
           "DFN2 state arrays hold exactly the graph tensors");
     generation = dfn2_model_io_state_generation(&state);
     for (int hop = 0; hop < HOPS; ++hop) {
@@ -928,13 +1075,12 @@ static int test_dfn2_state_evolution(uint64_t* digest)
                 state.gru_hidden[row][j] =
                     standin_row(previous[row][j], hop, row, j);
         for (int c = 0; c < CH; ++c) {
+            float* channel = state.df_convp_window + (size_t)c * K * BINS;
             for (int t = 0; t + 1 < K; ++t)
-                memcpy(state.df_convp_window[c][t],
-                       state.df_convp_window[c][t + 1],
-                       sizeof(state.df_convp_window[c][t]));
+                memcpy(channel + (size_t)t * BINS, channel + (size_t)(t + 1) * BINS,
+                       BINS * sizeof(float));
             for (int b = 0; b < BINS; ++b)
-                state.df_convp_window[c][K - 1][b] =
-                    standin_frame(hop, 0, c, b);
+                channel[(size_t)(K - 1) * BINS + b] = standin_frame(hop, 0, c, b);
         }
         for (int row = 0; row < ROWS; ++row)
             for (int j = 0; j < HIDDEN; ++j)
@@ -943,7 +1089,7 @@ static int test_dfn2_state_evolution(uint64_t* digest)
         reference_window(ref_win, CH, K, BINS, hop, 0);
 
         if (hop == 6) {
-            state.df_convp_window[CH - 1][K - 1][BINS - 1] = (float)NAN;
+            state.df_convp_window[(size_t)CH * K * BINS - 1] = (float)NAN;
             expect_refusal = 1;
         }
         if (hop == 9) {
@@ -966,16 +1112,14 @@ static int test_dfn2_state_evolution(uint64_t* digest)
         }
         CHECK(memcmp(&state.gru_hidden[0][0], ref_gru, sizeof(ref_gru)) == 0,
               "DFN2 h_gru equals the flat reference after the hop");
-        CHECK(memcmp(&state.df_convp_window[0][0][0], ref_win,
-                     sizeof(ref_win)) == 0,
+        CHECK(memcmp(state.df_convp_window, ref_win, sizeof(ref_win)) == 0,
               "DFN2 pathway window equals the flat reference after the hop");
         CHECK(dfn2_model_io_state_generation(&state) ==
                   generation + (unsigned)zeroings,
               "DFN2 generation counts the zeroings");
         *digest = hash_bytes(*digest, state.gru_hidden,
                              sizeof(state.gru_hidden));
-        *digest = hash_bytes(*digest, state.df_convp_window,
-                             sizeof(state.df_convp_window));
+        *digest = hash_bytes(*digest, state.df_convp_window, sizeof(ref_win));
     }
     /* The row offsets address the rows the exporter slices: encoder GRU at
      * row 0, the two ERB decoder layers from row 1, the two DF decoder layers
@@ -1130,6 +1274,7 @@ static int test_gtcrn_state_evolution(uint64_t* digest)
 static int run_all_tests(void)
 {
     uint64_t digest = UINT64_C(1469598103934665603);
+    CHECK(test_dfn2_grid_contract(), "DFN2 test grid contract");
     CHECK(test_dfn_erb_spans_exact(),
           "DFN2 ERB nonzero spans are exact");
     CHECK(test_dfn2_model_io(), "DFN2 stateless model I/O");

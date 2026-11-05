@@ -4,6 +4,12 @@ The accelerator owns only learned operators. These tests cross the actual
 host boundary: DFN2 features and composition, plus GTCRN ERB features and CRM
 synthesis. The existing C executable remains responsible for lifecycle,
 state-commit, WOLA, and SIMD/scalar checks.
+
+The DFN2 library holds no grid: the wrapper below builds a ``DFN2Grid`` from the
+numbers Python hands it, so the same compiled library is compared with the
+Python reference on the shipped grid (``config.ini``), on the 32 kHz and 16 kHz
+grids, and on several lookahead pairs (the library is built with a ring deep
+enough for all of them).
 """
 
 import configparser
@@ -18,6 +24,8 @@ import sys
 import numpy as np
 import pytest
 import torch
+
+import dfn_pairs
 
 
 AINR = Path(__file__).resolve().parents[1]
@@ -57,10 +65,22 @@ _WRAPPER = r'''
 #include "dfn2_process.h"
 #include "gtcrn_process.h"
 
-void *parity_dfn_create(const float *fwd, const float *inv) {
-    DFN2State *state = (DFN2State *)calloc(1, sizeof(*state));
+/* The grid is an argument: the library holds none. NULL when the library
+ * refuses it (dfn2_grid_make or dfn2_state_init). */
+void *parity_dfn_create(const float *fwd, const float *inv, int sample_rate,
+                        int n_fft, int n_erb, int df_bins, int mask_lookahead,
+                        int df_lookahead) {
+    DFN2Grid grid;
+    DFN2State *state;
+    if (dfn2_grid_make(&grid, sample_rate, n_fft, n_erb, df_bins,
+                       mask_lookahead, df_lookahead) != DFN2_GRID_OK)
+        return NULL;
+    state = (DFN2State *)calloc(1, sizeof(*state));
     if (!state) return NULL;
-    dfn2_state_init(state, NULL, NULL);
+    if (dfn2_state_init(state, &grid, NULL, NULL) != 0) {
+        free(state);
+        return NULL;
+    }
     dfn2_set_erb_matrices(state, fwd, inv);
     return state;
 }
@@ -110,6 +130,9 @@ def c_prepost(tmp_path_factory):
     shared_flag = '-dynamiclib' if sys.platform == 'darwin' else '-shared'
     subprocess.run(
         [cc, shared_flag, '-fPIC', '-O2', '-std=c11', '-ffp-contract=off',
+         # ring 7 = the deepest pair (mask 2, df 4); the library refuses a pair
+         # whose ring exceeds this capacity.
+         '-DDFN2_MAX_DF_RING=7',
          '-I', str(DFN), '-I', str(GT), '-I', str(AC / 'include'), '-I', str(AC),
          str(wrapper), str(DFN / 'dfn2_process.c'),
          str(GT / 'gtcrn_process.c'), archive, '-lm', '-o', str(library)],
@@ -117,7 +140,7 @@ def c_prepost(tmp_path_factory):
     )
     lib = ctypes.CDLL(str(library))
     fp = ctypes.POINTER(ctypes.c_float)
-    lib.parity_dfn_create.argtypes = [fp, fp]
+    lib.parity_dfn_create.argtypes = [fp, fp] + [ctypes.c_int] * 6
     lib.parity_dfn_create.restype = ctypes.c_void_p
     lib.parity_dfn_destroy.argtypes = [ctypes.c_void_p]
     lib.parity_dfn_features.argtypes = [ctypes.c_void_p, fp, fp, fp, fp]
@@ -133,29 +156,65 @@ def _fp(array):
     return array.ctypes.data_as(ctypes.POINTER(ctypes.c_float))
 
 
-def test_dfn2_features_and_compose_match_python(c_prepost):
-    dfn_model, dfn_train = _load_dfn_modules()
+def _shipped_config():
     cfg = configparser.ConfigParser()
     cfg.read(DFN / 'config.ini')
-    feature_cfg = dfn_train.read_feature_config(cfg, 48000, 512)
-    erb_fb, erb_inv = dfn_model._build_erb_fb(1024, 48000, 32)
+    return cfg
+
+
+def _shipped_grid():
+    """The grid config.ini says: (sr, n_fft, n_erb, df_bins, pair)."""
+    cfg = _shipped_config()
+    return (cfg.getint('signal', 'sr'), cfg.getint('signal', 'n_fft'),
+            cfg.getint('model', 'n_erb'), cfg.getint('model', 'df_bins'),
+            (cfg.getint('model', 'mask_lookahead'),
+             cfg.getint('model', 'df_lookahead')))
+
+
+# (sr, n_fft, n_erb, df_bins, (mask_lookahead, df_lookahead)): the shipped grid
+# from config.ini, the 32 kHz and 16 kHz grids of the test grid presets
+# (tests/dfn2_test_grid.h), and lookahead pairs on the shipped grid that move the
+# deep-filter window (df_lookahead 0, 2, 4; the pair (2, 4) needs ring 7).
+_SHIPPED = _shipped_grid()
+DFN2_CASES = [
+    pytest.param(*_SHIPPED, id='shipped'),
+    pytest.param(32000, 512, 28, 96, (1, 1), id='32k'),
+    pytest.param(16000, 256, 24, 96, (1, 1), id='16k'),
+    pytest.param(*_SHIPPED[:4], (0, 0), id='48k-pair0_0'),
+    pytest.param(*_SHIPPED[:4], (2, 4), id='48k-pair2_4'),
+    pytest.param(16000, 256, 24, 96, (1, 2), id='16k-pair1_2'),
+]
+
+
+@pytest.mark.parametrize('sr,n_fft,n_erb,df_bins,pair', DFN2_CASES)
+def test_dfn2_features_and_compose_match_python(c_prepost, sr, n_fft, n_erb,
+                                                df_bins, pair):
+    dfn_model, dfn_train = _load_dfn_modules()
+    cfg = dfn_pairs.dfn2_grid_config(sr, n_fft, n_erb, df_bins, pair)
+    n_bins = n_fft // 2 + 1
+    feature_cfg = dfn_train.read_feature_config(cfg, sr, n_fft // 2)
+    erb_fb, erb_inv = dfn_model._build_erb_fb(n_fft, sr, n_erb)
     fwd = np.ascontiguousarray(erb_fb.T.numpy(), dtype=np.float32)
     inv = np.ascontiguousarray(erb_inv.numpy(), dtype=np.float32)
 
+    def create():
+        return c_prepost.parity_dfn_create(
+            _fp(fwd), _fp(inv), sr, n_fft, n_erb, df_bins, *pair)
+
     rng = np.random.default_rng(41)
     frames = 9
-    real = rng.normal(0, 0.15, (frames, 513)).astype(np.float32)
-    imag = rng.normal(0, 0.15, (frames, 513)).astype(np.float32)
+    real = rng.normal(0, 0.15, (frames, n_bins)).astype(np.float32)
+    imag = rng.normal(0, 0.15, (frames, n_bins)).astype(np.float32)
     spectrum = torch.complex(torch.from_numpy(real.T)[None],
                              torch.from_numpy(imag.T)[None])
     _, py_erb, py_spec, _ = dfn_train.extract_dfn2_features(
-        spectrum, erb_fb, 96, feature_cfg)
+        spectrum, erb_fb, df_bins, feature_cfg)
 
-    state = c_prepost.parity_dfn_create(_fp(fwd), _fp(inv))
+    state = create()
     assert state
     try:
-        c_erb = np.empty((frames, 32), np.float32)
-        c_spec = np.empty((frames, 192), np.float32)
+        c_erb = np.empty((frames, n_erb), np.float32)
+        c_spec = np.empty((frames, 2 * df_bins), np.float32)
         for frame in range(frames):
             c_prepost.parity_dfn_features(
                 state, _fp(real[frame]), _fp(imag[frame]),
@@ -165,25 +224,26 @@ def test_dfn2_features_and_compose_match_python(c_prepost):
 
     np.testing.assert_allclose(c_erb, py_erb[0, 0].numpy(),
                                rtol=2e-5, atol=3e-6)
-    expected_spec = py_spec[0].permute(1, 0, 2).reshape(frames, 192).numpy()
+    expected_spec = py_spec[0].permute(1, 0, 2).reshape(
+        frames, 2 * df_bins).numpy()
     np.testing.assert_allclose(c_spec, expected_spec,
                                rtol=2e-5, atol=3e-6)
 
     model = dfn_model.DeepFilterNet2(
         **dfn_train.read_model_config(cfg)).eval()
-    mask = torch.sigmoid(torch.randn(1, 1, frames, 32))
-    coefs = torch.randn(1, frames, 96, 10) * 0.1
+    mask = torch.sigmoid(torch.randn(1, 1, frames, n_erb))
+    coefs = torch.randn(1, frames, df_bins, 10) * 0.1
     alpha = torch.sigmoid(torch.randn(1, frames, 1))
     with torch.no_grad():
         expected = model.compose(spectrum, mask, coefs, alpha)[0]
 
-    state = c_prepost.parity_dfn_create(_fp(fwd), _fp(inv))
+    state = create()
     assert state
     c_out = []
     try:
         for frame in range(frames):
-            out_re = np.empty(513, np.float32)
-            out_im = np.empty(513, np.float32)
+            out_re = np.empty(n_bins, np.float32)
+            out_im = np.empty(n_bins, np.float32)
             valid = c_prepost.parity_dfn_compose(
                 state, _fp(real[frame]), _fp(imag[frame]),
                 _fp(np.ascontiguousarray(mask[0, 0, frame].numpy())),
@@ -199,6 +259,36 @@ def test_dfn2_features_and_compose_match_python(c_prepost):
     np.testing.assert_allclose(
         got, expected[:, :frames - model.df_lookahead].numpy(),
         rtol=4e-5, atol=8e-6)
+
+
+def test_dfn2_library_refuses_a_grid_it_cannot_run(c_prepost):
+    """The grid is run-time data, so a bad one is refused by the library
+    (dfn2_grid_make) rather than by the build. The same call with a valid grid
+    succeeds, so the refusals are not an artefact of the wrapper."""
+    sr, n_fft, n_erb, df_bins, pair = _SHIPPED
+    n_bins = n_fft // 2 + 1
+    fwd = np.zeros((n_bins, n_erb), np.float32)
+    inv = np.zeros((n_erb, n_bins), np.float32)
+
+    def create(**changes):
+        grid = dict(sr=sr, n_fft=n_fft, n_erb=n_erb, df_bins=df_bins,
+                    mask=pair[0], df=pair[1])
+        grid.update(changes)
+        state = c_prepost.parity_dfn_create(
+            _fp(fwd), _fp(inv), grid['sr'], grid['n_fft'], grid['n_erb'],
+            grid['df_bins'], grid['mask'], grid['df'])
+        if state:
+            c_prepost.parity_dfn_destroy(state)
+        return bool(state)
+
+    assert create()
+    assert not create(n_erb=n_erb + 2)             # not a multiple of four
+    assert not create(n_fft=n_fft + 2)             # not a power of two
+    assert not create(n_erb=36)                    # above the ERB capacity
+    assert not create(df_bins=n_bins)              # the deep filter owns every bin
+    assert not create(mask=3)
+    assert not create(df=5)                        # deep-filter order is 5
+    assert not create(sr=0)
 
 
 def test_gtcrn_host_boundary_matches_python(c_prepost):

@@ -284,7 +284,7 @@ typedef struct DfnHost {
 static int dfn_host_build(DfnHost* d, const DFN2Model* model) {
     AecSignalGrid grid;
     AecConfig aec_cfg;
-    DfnRateBridgeConfig bc = dfn_rate_bridge_default_config(16000);
+    DfnRateBridgeConfig bc = dfn_rate_bridge_default_config(16000, dfn_test_grid());
     DfnRateBridgeMemReq breq;
     size_t aec_b, vec, cvec;
     uint8_t* cur;
@@ -342,8 +342,8 @@ static void example_dfn_phased(void) {
     DfnResStageJob job;
     int hop, h, i, identical = 1, frames = 0;
 
-    dfn_unit_partition(g_erb_fwd, g_erb_inv);
-    dfn2_model_io_descriptor_default(&descriptor);
+    dfn_unit_partition(g_erb_fwd, g_erb_inv, dfn_test_grid());
+    dfn2_model_io_descriptor_default(dfn_test_grid(), &descriptor);
     memset(&none, 0, sizeof(none));            /* no model attached: the board runs the NPU */
     cb_model = none;
     cb_model.infer = npu_callback;             /* the callback-driven twin */
@@ -473,6 +473,7 @@ static void example_ulcnet_phased(void) {
 }
 
 int main(void) {
+    dfn_test_report_pair("test_readme_flow", -1);
     example_chain_new_stage();
     example_dfn_phased();
     example_ulcnet_phased();

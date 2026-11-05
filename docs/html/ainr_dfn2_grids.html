@@ -3,7 +3,7 @@
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
-<title>AINR DFN2 grid 選擇</title>
+<title>AINR DFN2 grid（執行期）</title>
 <style>
 body{font-family:-apple-system,"Segoe UI",Roboto,"Noto Sans TC",sans-serif;max-width:62rem;margin:0 auto;padding:1rem 1.25rem 3rem;line-height:1.55;color:#1a222c;background:#fff}
 nav{font-size:.9rem;border-bottom:1px solid #ccd3dc;padding-bottom:.5rem;margin-bottom:1rem}
@@ -47,108 +47,156 @@ th{background:#eef1f5}
 <a href="ainr_rnnoise_erb_usage.html">RNNoise-ERB 使用</a>
 </nav>
 
-<h1>AINR DeepFilterNet2：grid 於建置時選擇</h1>
+<h1>AINR DeepFilterNet2：grid 由應用端於執行期給定</h1>
 
 <h2>概要</h2>
-<p>DFN2 的訊號 grid（取樣率、FFT 大小、ERB 帶數、deep filter 的 bin 數、兩個 EMA 係數）是<b>建置期契約</b>：C 函式庫、訓練好的模型、它的 ERB 矩陣三者必須屬於同一個 grid。<b>出貨 grid 是 48 kHz、FFT／win／hop = 1024／1024／512、32 個 ERB band、<code>df_bins</code> 96</b>，不帶任何旗標就是它；其他 grid 在建置時選擇。常數集中在 <code>AINR/DeepFilterNet2/dfn2_grid.h</code>（由 <code>dfn2_process.h</code> 引入），不再散落各檔。</p>
-<p>出貨 grid 的行為不變：預設建置的六個物件（完整版與 <code>-DDFN2_MASK_ONLY</code> 各三個）的機器碼、常數段與符號和加入此標頭之前逐位元相同，<code>DFN2_IO_FREQ</code> pool 仍是 219,536 bytes、hash <code>d2d3bc45</code>，layout 與 carve 版號都不變。模型本身（cascade、I/O、State）見 <a href="ainr_dfn2.html">ainr_dfn2</a>，呼叫順序見 <a href="ainr_dfn2_usage.html">ainr_dfn2_usage</a>。</p>
-<p class="note">本頁的大小為本機（64 位元主機、<code>-ffp-contract=off</code>）以對應旗標編譯後量測；非出貨 grid 的音質與板端行為<b>待量測</b>。lookahead pair、<code>DFN2_MASK_ONLY</code>、<code>DFN2_FRAMES_PER_CALL</code> 是獨立的建置選擇，與 grid 無關。</p>
+<p><b>DFN2 函式庫不持有任何 grid</b>：取樣率、FFT 大小、ERB 帶數、deep filter 的 bin 數、兩個 EMA 係數、lookahead pair 都不是函式庫的常數，沒有 preset、沒有預設值。應用端用 <code>dfn2_grid_make()</code> 建一個 <code>DFN2Grid</code>，傳給它建立的每一個物件（framing、<code>DFN2State</code>、<code>DFN2ModelIOState</code>、model-I/O descriptor、<code>DFN2Prepost</code>）；<b>同一個 binary 在編譯期容量（capacity）以內跑任何 grid</b>。grid、訓練好的模型、它的 ERB 矩陣三者必須屬於同一組；出貨 checkpoint 的 grid 是 48 kHz、FFT 1024、32 個 ERB band、<code>df_bins</code> 96、lookahead 1／1。</p>
+<p>(sample rate, FFT size) 對應 n_erb、df_bins 與 lookahead pair 的表是<b>模型的性質</b>，由應用端持有（板端 sample 有自己的表，見下）；函式庫只驗證應用端傳入的值。模型本身（cascade、I/O、State）見 <a href="ainr_dfn2.html">ainr_dfn2</a>，呼叫順序見 <a href="ainr_dfn2_usage.html">ainr_dfn2_usage</a>。</p>
+<p class="note">本頁的大小為本機（64 位元主機、<code>-ffp-contract=off</code>）量測；非出貨 grid 的音質與板端行為<b>待量測</b>。DFN2 的 grid 與 pool 版號的詳細規則另見 <code>AINR/DeepFilterNet2/README.md</code> 的 "Choosing the grid"。</p>
 
-<h2>選 grid：兩種方式</h2>
-<h3>A. 內建 preset：<code>-DDFN2_GRID_KHZ=16|32|48</code></h3>
+<h2>API 用法</h2>
+<ol>
+<li>應用端依模型的 <code>config.ini</code>（<code>[signal] sr／n_fft</code>、<code>[model] n_erb／df_bins／mask_lookahead／df_lookahead</code>）呼叫 <code>dfn2_grid_make()</code>；回傳 <code>DFN2_GRID_OK</code>（grid 已寫入）或第一個失敗的檢查（grid 不動）。<code>dfn2_grid_status_text()</code> 給 log 用的短字串。</li>
+<li>把 <code>&amp;grid</code> 交給 <code>dfn2_framing_config()</code>、<code>dfn2_state_init()</code>、<code>dfn2_model_io_init()</code>、<code>dfn2_model_io_descriptor_default()</code>／<code>_validate()</code>、<code>dfn2_prepost_config_defaults()</code>；<code>DFN2PrepostConfig</code> 按值持有一份，<code>dfn2_prepost_grid(p)</code> 回傳實例的那份。</li>
+<li>每個收 grid 的入口先跑 <code>dfn2_grid_validate()</code>，無效的 grid 回 -1（<code>dfn2_framing_config()</code> 沒有回傳值，改把輸出組態清零：<code>fft_size</code> 為 0，<code>ac_stft_get_mem_size()</code>／<code>ac_istft_get_mem_size()</code> 回 0，框架物件拒絕它）；手改過的衍生欄位（hop、ring、scale）也會被擋（<code>DFN2_GRID_ERR_INCONSISTENT</code>）。</li>
+</ol>
+<pre>DFN2Grid grid;                 /* sample_rate n_fft n_erb df_bins mask_la df_la */
+int status = dfn2_grid_make(&amp;grid, 48000, 1024, 32, 96, 1, 1);
+if (status != DFN2_GRID_OK) { fprintf(stderr, "%s\n", dfn2_grid_status_text(status)); return -1; }
+
+AcStftConfig sc;
+dfn2_framing_config(&amp;sc, &amp;grid, fft, NULL);              /* AcStft / AcIstft 的組態 */
+DFN2PrepostConfig cfg;
+dfn2_prepost_config_defaults(&amp;cfg, DFN2_IO_TIME, &amp;grid);  /* 按值複製 grid */
+cfg.fft = fft;  cfg.istft = istft;  cfg.erb_fwd = erb_fwd;  cfg.erb_inv = erb_inv;
+DFN2PrepostMemReq req;
+dfn2_prepost_get_mem_size(&amp;cfg, &amp;req);                   /* 48 kHz 1/1：234,048 bytes */</pre>
+
+<h2>Block diagram</h2>
+<pre>
+應用端（板端 sample 與 pipeline 範例 main 的表；測試另有 dfn2_test_grid.h／dfn_test_grid.h）
+   |  (sr, n_fft) -> n_erb, df_bins, mask_la, df_la        模型決定，不是函式庫
+   v
+dfn2_grid_make(&amp;grid, sr, n_fft, n_erb, df_bins, mask_la, df_la)      dfn2_process.c
+   |  檢查 -> DFN2_GRID_OK／DFN2_GRID_ERR_*
+   |  推導 hop, n_bins, stft_scale/unscale, 兩個 alpha, df_history, ring
+   v
+DFN2Grid grid
+   |-- dfn2_framing_config(&amp;sc, &amp;grid, fft, win)      -> AcStft / AcIstft
+   |-- dfn2_state_init(&amp;st, &amp;grid, stft, istft)       DFN2State 首欄記下 grid
+   |-- dfn2_model_io_init(&amp;io, &amp;grid)                 n_erb／df_bins／mask_lookahead
+   |-- dfn2_model_io_descriptor_default(&amp;grid, &amp;d)    sr／fft／hop／bins／erb／df／兩個 lookahead
+   `-- dfn2_prepost_config_defaults(&amp;cfg, mode, &amp;grid) -> get_mem_size -> init_ex
+         pool 大小、build_flags_hash、descriptor 都帶著這個 grid；
+         dfn2_model_run_frame() 以 instance 的 grid 驗證模型的 descriptor
+</pre>
+
+<h2>給定量與推導量</h2>
+<p>六個給定值是訓練好的模型所固定的：<code>sample_rate</code>、<code>n_fft</code>、<code>n_erb</code>、<code>df_bins</code>、<code>mask_lookahead</code>、<code>df_lookahead</code>。其餘由公式推導（<code>dfn2_grid.h</code>）：</p>
 <div class="tbl"><table>
-<tr><th>旗標</th><th>sr</th><th>n_fft／hop</th><th>bins</th><th>n_erb</th><th>df_bins</th><th>DF 截止</th><th>alpha（兩者同值）</th><th><code>DFN2_ANALYSIS_SCALE</code></th><th>狀態</th></tr>
-<tr><td>48（預設）</td><td>48000</td><td>1024／512</td><td>513</td><td>32</td><td>96</td><td>4500 Hz</td><td>0.989（<code>0x3f7d2f1b</code>）</td><td>0.03125</td><td><b>出貨</b></td></tr>
-<tr><td>32</td><td>32000</td><td>512／256</td><td>257</td><td>28</td><td>96</td><td>6000 Hz</td><td>0.992（<code>0x3f7df3b6</code>）</td><td>0.044194173</td><td>暫定，尚未訓練（28 是 4 的倍數，C 端與 <code>train.py</code> 都收）</td></tr>
-<tr><td>16</td><td>16000</td><td>256／128</td><td>129</td><td>24</td><td>96</td><td>6000 Hz</td><td>0.992（<code>0x3f7df3b6</code>）</td><td>0.0625</td><td>與 <code>train.py</code> 推導值逐位元對拍；音質待量測</td></tr>
+<tr><th>欄位</th><th>公式</th></tr>
+<tr><td><code>hop</code>、<code>n_bins</code></td><td>n_fft／2、n_fft／2 + 1（組幀固定為 50 % overlap、sqrt-Hann、不補零，audiolib <code>audio_stft.h</code>）</td></tr>
+<tr><td><code>stft_scale</code>、<code>stft_unscale</code></td><td>float32 的 1／√n_fft 與 √n_fft（<code>torch.stft(normalized=True)</code> 的尺度與其反向；float32 的除法與開根號是正確捨入，各編譯器結果相同）。<code>train.py</code> 的 <code>analysis_scale()</code> = 2·hop／win²·√n_fft，win = n_fft、hop = n_fft／2 時恰為同一值，它作用在餵給正規化器的拷貝；頻譜進出 <code>DFN2_IO_FREQ</code> 的換算用 <code>stft_scale</code>／<code>stft_unscale</code></td></tr>
+<tr><td><code>erb_norm_alpha</code>、<code>spec_norm_alpha</code></td><td><code>dfn2_norm_alpha(sample_rate, hop, 1.0)</code> = <code>train.py</code> 的 <code>make_norm_alpha</code>：exp(−(hop／sr)／tau) 取到小數第三位（若進位到 1.0 就多一位），tau = 1.0 s。hop 512 @ 48 kHz 得 0.989（<code>0x3f7d2f1b</code>）；hop 128 @ 16 kHz 與 hop 256 @ 32 kHz 的 hop／sr 都是 8 ms，得 0.992（<code>0x3f7df3b6</code>）。用了其他 tau 的模型，把這兩個欄位覆寫成 <code>dfn2_norm_alpha()</code> 算出的值；兩者須在 (0, 1)</td></tr>
+<tr><td><code>df_history</code>、<code>ring</code></td><td><code>DFN2_DF_ORDER</code> − df_lookahead − 1 個過去 tap；ring 深度 max(<code>DFN2_DF_ORDER</code>, mask + df + 1)，mask-only 為 mask + 1</td></tr>
 </table></div>
-<p class="note">DF 截止 = df_bins × sr／n_fft（<code>df_bins</code> 在三組都是 96，所以截止頻率隨 bin 間距變）。<code>DFN2_GRID_KHZ</code> 不是 16、32、48 即 <code>#error</code>。preset 是完整的一組：只定義其中一個值（例如 <code>-DDFN2_GRID_KHZ=16 -DDFN2_N_ERB=20</code>）會 <code>#error</code>，要改請改用下一節的外部定義。</p>
 
-<h3>B. 外部定義的 grid</h3>
-<p>為另一個 grid 訓練的模型，在建置參數定義下列巨集（或用 <code>-DDFN2_GRID_HEADER='"my_grid.h"'</code> 指定一個定義它們的標頭，標頭先於檢查被引入）。外部定義時<b>不給任何預設</b>（<code>DF_ORDER</code> 固定為 5，不在此列），避免悄悄套用別的 grid 的值：缺任何一個必填巨集，<code>#error</code> 會點名它。</p>
+<h2>合法性規則與狀態碼</h2>
 <div class="tbl"><table>
-<tr><th>巨集</th><th>意義與規則</th><th>訓練端對應</th><th></th></tr>
-<tr><td><code>DFN2_SR</code></td><td>取樣率 Hz，須為正；<b>它存在就代表走外部定義</b>，不可再帶 <code>DFN2_GRID_KHZ</code></td><td><code>config.ini [signal] sr</code></td><td>必填</td></tr>
-<tr><td><code>DFN2_N_FFT</code></td><td>2 的次方，16..8192</td><td><code>[signal] n_fft</code></td><td>必填</td></tr>
-<tr><td><code>DFN2_N_ERB</code></td><td>ERB band 數，正且為 4 的倍數</td><td><code>[model] n_erb</code></td><td>必填</td></tr>
-<tr><td><code>DFN2_DF_BINS</code></td><td>deep filter 負責的 bin 數，[2, n_bins]；完整版須 &lt; n_bins</td><td><code>[model] df_bins</code></td><td>必填</td></tr>
-<tr><td><code>DFN2_ERB_NORM_ALPHA</code></td><td>ERB 特徵 EMA 係數（float 字面值，如 <code>0.992f</code>）</td><td><code>make_norm_alpha(sr, hop, tau)</code></td><td>必填</td></tr>
-<tr><td><code>DFN2_SPEC_NORM_ALPHA</code></td><td>複數特徵 EMA 係數</td><td>同上</td><td>必填</td></tr>
-<tr><td><code>DFN2_DF_ORDER</code></td><td>deep filter 的 tap 數，固定 5（graph 的 pathway window 與狀態版面都為 5 建立）；外部定義它會 <code>#error</code></td><td><code>[model] df_order</code></td><td>固定，不可定義</td></tr>
+<tr><th>狀態碼</th><th>規則</th></tr>
+<tr><td><code>DFN2_GRID_ERR_NULL</code></td><td>指標為 NULL</td></tr>
+<tr><td><code>DFN2_GRID_ERR_SAMPLE_RATE</code></td><td>sample_rate &gt; 0，且它給出的 norm alpha（<code>dfn2_norm_alpha(sample_rate, hop, 1.0)</code>，float32）嚴格在 0 與 1 之間：取樣率低或高到 alpha 取整後到 0 或 1 的被拒絕，所以 <code>dfn2_grid_make()</code> 接受的 grid，<code>dfn2_grid_validate()</code> 一定接受</td></tr>
+<tr><td><code>DFN2_GRID_ERR_N_FFT</code></td><td>2 的次方，且在 [16, 8192]（audiolib 組幀範圍）</td></tr>
+<tr><td><code>DFN2_GRID_ERR_N_ERB</code></td><td>正且為 4 的倍數（ERB kernel 四個 band 一組、encoder 的 band 軸兩次 stride-2 只需要 %4；<code>train.py</code> 的 <code>validate_signal_config</code> 也只要求 %4），且每個 band 至少兩個 bin：2 × n_erb ≤ n_bins（檢查不會溢位：<code>n_erb</code> = 1&lt;&lt;30、0x7ffffffc 乾淨地回這個狀態碼，UBSan 下也是）</td></tr>
+<tr><td><code>DFN2_GRID_ERR_DF_BINS</code></td><td>[2, n_bins)；<code>-DDFN2_MASK_ONLY</code> 可到 n_bins（高於 deep filter 的 bin 保留 masked 頻譜，所以完整版至少留一個；df_bins = 1 會讓正規化器起點的 linspace 除以零）</td></tr>
+<tr><td><code>DFN2_GRID_ERR_MASK_LOOKAHEAD</code></td><td>[0, 2]</td></tr>
+<tr><td><code>DFN2_GRID_ERR_DF_LOOKAHEAD</code></td><td>[0, <code>DFN2_DF_ORDER</code> − 1]；mask-only 必須為 0（沒有 deep filter 可以 look ahead）</td></tr>
+<tr><td><code>DFN2_GRID_ERR_CAPACITY</code></td><td>n_fft、n_erb、df_bins 或 ring 超過下一節的容量</td></tr>
+<tr><td><code>DFN2_GRID_ERR_INCONSISTENT</code></td><td>（<code>dfn2_grid_validate()</code>）衍生欄位與 <code>dfn2_grid_make()</code> 推導的不同，或 alpha 不在 (0, 1)</td></tr>
 </table></div>
-<pre># 例：24 kHz、n_fft 512、24 個 ERB band（測試用的外部 grid，不是出貨 grid）
-GRID='-DDFN2_SR=24000 -DDFN2_N_FFT=512 -DDFN2_N_ERB=24 -DDFN2_DF_BINS=96 -DDFN2_ERB_NORM_ALPHA=0.989f -DDFN2_SPEC_NORM_ALPHA=0.989f'
-make -C AINR lib CFLAGS="-O2 -std=c11 $GRID"
-# preset 同理：CFLAGS 帶 -DDFN2_GRID_KHZ=16。CFLAGS 進組態簽章，不同 grid 的 archive 各落在自己的 build 資料夾</pre>
+<p class="note">n_erb 36、df_bins 100、n_fft 2048 或 2／4 這組 pair（ring 7）在預設容量下都回 <code>DFN2_GRID_ERR_CAPACITY</code>（本機以 <code>dfn2_grid_status_text()</code> 驗證）；n_erb 30 回 <code>DFN2_GRID_ERR_N_ERB</code>。</p>
 
-<h2>#error 守門（編譯期）</h2>
+<h2>編譯期容量與仍在編譯期的東西</h2>
 <div class="tbl"><table>
-<tr><th>條件</th><th>原因</th></tr>
-<tr><td>缺 <code>DFN2_N_FFT</code>／<code>_N_ERB</code>／<code>_DF_BINS</code>／<code>_ERB_NORM_ALPHA</code>／<code>_SPEC_NORM_ALPHA</code>（已定義 <code>DFN2_SR</code>）</td><td>外部 grid 無預設，訊息點名缺的巨集</td></tr>
-<tr><td><code>DFN2_GRID_KHZ</code> 與 <code>DFN2_SR</code> 同時定義；preset 之外又定義 <code>DFN2_N_FFT</code>／<code>_N_ERB</code>／<code>_DF_BINS</code>／alpha</td><td>preset 與外部定義不可混用</td></tr>
-<tr><td>n_fft 不是 2 的次方或不在 [16, 8192]</td><td>audiolib <code>audio_stft.h</code> 的組幀範圍</td></tr>
-<tr><td>n_erb &le; 0 或不是 4 的倍數</td><td>C 的 ERB kernel 四個 band 一組，encoder 的 band 軸兩次 stride-2 只需要 %4；<code>train.py</code> 的 <code>validate_signal_config</code> 也只要求 %4（不再沿用上游 DeepFilterNet 的 %8）</td></tr>
-<tr><td>2 × n_erb &gt; n_bins</td><td>每個 ERB band 至少兩個 bin</td></tr>
-<tr><td>df_bins &lt; 2 或 &gt; n_bins；完整版 df_bins &ge; n_bins</td><td>df_bins = 1 會讓正規化器起點的 linspace 除以零；高於 deep filter 的 bin 保留 masked 頻譜，所以完整版至少留一個 bin（<code>-DDFN2_MASK_ONLY</code> 不受後一條限制）</td></tr>
-<tr><td><code>DFN2_SR</code> &le; 0</td><td>取樣率須為正</td></tr>
-<tr><td>外部定義 <code>DFN2_DF_ORDER</code></td><td>graph 的 pathway window 與狀態版面都為 5 個 tap 建立，所以不是 grid 的選項</td></tr>
+<tr><th>巨集</th><th>預設</th><th>意義</th></tr>
+<tr><td><code>DFN2_MAX_N_FFT</code></td><td>1024</td><td>最大 n_fft（<code>DFN2_MAX_N_BINS</code> 隨之）</td></tr>
+<tr><td><code>DFN2_MAX_N_ERB</code></td><td>32</td><td>最多的 ERB band 數</td></tr>
+<tr><td><code>DFN2_MAX_DF_BINS</code></td><td>96</td><td>最多的 deep filter bin 數</td></tr>
+<tr><td><code>DFN2_MAX_DF_RING</code></td><td>5（mask-only 2）</td><td>最深的 ring：M + D ≤ 4 的 pair（ring 5）；mask-only 到 mask 1</td></tr>
 </table></div>
-
-<h2>推導量與常數來源</h2>
 <ul>
-<li><b>由 n_fft 推導，不是設定值</b>：<code>DFN2_N_BINS</code> = n_fft／2 + 1、<code>DFN2_WIN_LEN</code> = n_fft、<code>DFN2_HOP_LEN</code> = n_fft／2、<code>DFN2_OVL_LEN</code> = WIN − HOP（組幀固定為 50 % overlap、sqrt-Hann、不補零）。</li>
-<li><b><code>DFN2_NORMALIZED_STFT_SCALE</code>／<code>_UNSCALE</code></b> = float32 的 1／√n_fft 與 √n_fft（<code>torch.stft(normalized=True)</code> 的尺度與其反向）。由 n_fft 計算（float32 的除法與開根號是正確捨入，各編譯器結果相同），新 grid 不必補表：1024 為 0.03125／32，512 為 0.044194173／22.627417，256 為 0.0625／16。頻譜進出 <code>DFN2_IO_FREQ</code> 的換算用它（出貨 grid 是 1／32 與 32）。</li>
-<li><b><code>DFN2_ANALYSIS_SCALE</code></b>：<code>train.py</code> 的 <code>analysis_scale()</code> = 2·hop／win²·√n_fft；win = n_fft、hop = n_fft／2 時恰為 1／√n_fft，所以它直接定義為上一項的 SCALE，不能另外覆寫。兩者數值相同、意義不同：它只作用在餵給正規化器的那份拷貝，不是頻譜進出的換算。</li>
-<li><b>兩個 alpha</b> = <code>make_norm_alpha(sr, hop, tau)</code>：exp(−(hop／sr)／tau) 取到小數第三位（若進位到 1.0 就多一位），tau = 1.0 s（<code>[feature] erb_norm_tau_sec</code>／<code>spec_norm_tau_sec</code>）。hop 512 @ 48 kHz 得 0.989；hop 128 @ 16 kHz 與 hop 256 @ 32 kHz 的 hop／sr 都是 8 ms，得 0.992。它們寫成字面常數、不由編譯器計算；與 <code>train.py</code> 的對拍在 <code>AINR/tests/test_dfn2_grid.py</code>。改 tau 就要重算並同步改這裡與 checkpoint。</li>
-<li>正規化器的起點（<code>DFN2_ERB_NORM_INIT_LO_DB</code>／<code>_HI_DB</code>／<code>DFN2_ERB_NORM_SCALE_DB</code>、<code>DFN2_SPEC_NORM_INIT_LO</code>／<code>_HI</code>）是 libDF 的常數、與 grid 無關，仍在 <code>dfn2_process.h</code>，但可由建置參數覆寫（<code>#ifndef</code>）；用了其他起點的模型要在建置參數定義，該建置即使在 48k preset 上也不再是出貨 grid。</li>
+<li>超過容量的 grid 被 <code>DFN2_GRID_ERR_CAPACITY</code> 拒絕；要服務它，在<b>每一個</b>編譯單元用一個 <code>-D</code> 提高，例如 pair 2／4（ring 7）加 <code>-DDFN2_MAX_DF_RING=7</code>，mask-only 的 mask 2 加 <code>-DDFN2_MAX_DF_RING=3</code>（<code>AINR/tests/dfn_pairs.py</code> 的 <code>defines()</code> 替測試加上）。容量是上限，不是程式跑的那個 grid。</li>
+<li><b>仍在編譯期</b>：<code>DFN2_DF_ORDER</code>（5，定義它是 <code>#error</code>）、上述容量、<code>DFN2_MASK_ONLY</code>、<code>DFN2_FRAMES_PER_CALL</code>、graph 幾何（<code>DFN2_MODEL_*</code>：GRU hidden 256、64 個 encoder channel、三個輸入 frame）、<code>DFN2_FEATURE_VERSION</code>，以及正規化器的起點（<code>DFN2_ERB_NORM_INIT_LO_DB</code> 等，libDF 的常數、與 grid 無關；用了其他起點的模型在建置參數定義，須加在每個單元；pool hash 讀的是 <code>dfn2_process.c</code> 編進去的值，即 <code>dfn2_norm_starts[]</code>，因為初始化 state 的是它）。</li>
+<li><b>lookahead 是 grid 的欄位</b>（ring 深度、graph 視窗、延遲、descriptor、pool hash 都由它決定），不再有編譯期的 pair 常數，也沒有連結期的 pair 符號。</li>
 </ul>
+
+<h2>State 表：容量決定大小</h2>
+<p>各 tensor 的 I/O 表見 <a href="ainr_dfn2.html">ainr_dfn2</a>。<code>DFN2State</code> 與 <code>DFN2ModelIOState</code> 的陣列按容量配置，grid 只用其中前面的一段（<code>DFN2ModelIOState</code> 的三個有 grid 維度的陣列在容量大小的儲存內按 grid 的步幅緊密排列，加速器讀的是連續的一段）。所以<b>較小的 grid 浪費差額</b>：</p>
+<div class="tbl"><table>
+<tr><th>項目</th><th>預設容量（1024／32／96／5）</th><th>mask-only（1024／32／96／2）</th></tr>
+<tr><td><code>sizeof(DFN2State)</code></td><td>67,424</td><td>15,360</td></tr>
+<tr><td><code>sizeof(DFN2ModelIOState)</code></td><td>130,712</td><td>5,784</td></tr>
+<tr><td><code>sizeof(DFN2Grid)</code></td><td colspan="2">56</td></tr>
+<tr><td>容量降到 256／24（<code>-DDFN2_MAX_N_FFT=256 -DDFN2_MAX_N_ERB=24</code>）的 <code>sizeof(DFN2State)</code></td><td>31,968</td><td>4,480</td></tr>
+</table></div>
+<div class="tbl"><table>
+<tr><th>grid（板端表的 pair）</th><th>FREQ pool</th><th>TIME pool</th><th>mask-only FREQ</th><th>mask-only TIME</th><th>FREQ／TIME hash</th></tr>
+<tr><td>16 kHz、256、erb 24、0／0</td><td>210,336</td><td>213,984</td><td>25,632</td><td>29,280</td><td><code>3655a46b</code>／<code>1bb2ea3e</code></td></tr>
+<tr><td>32 kHz、512、erb 28、0／0</td><td>213,456</td><td>220,688</td><td>28,752</td><td>35,984</td><td><code>18104ee0</code>／<code>68b1df35</code></td></tr>
+<tr><td>48 kHz、1024、erb 32、1／1（mask-only 1／0）</td><td>219,648</td><td>234,048</td><td>34,944</td><td>49,344</td><td><code>5a69e185</code>／<code>f6a49ec8</code></td></tr>
+</table></div>
+<p class="note">單位 bytes，本機量測（<code>dfn2_prepost_get_mem_size</code>）；FFT handle 與應用端的 <code>AcIstft</code> 不在 pool 內（FFT handle：16 kHz 7,152、32 kHz 13,552、48 kHz 26,352；<code>AcIstft</code>：3,168、6,240、12,384；TIME pool 內的 <code>AcStft</code>：4,192、8,288、16,480）。同一個 grid 換 pair（例如 16 kHz 用 1／1）pool 大小相同、hash 不同。<b>只服務較小 grid 的 build 把容量降到那個 grid</b>就拿回大小：<code>-DDFN2_MAX_N_FFT=256 -DDFN2_MAX_N_ERB=24</code> 讓 16 kHz 的 FREQ／TIME pool 變 174,784／178,432（少 35,552）；<code>-DDFN2_MAX_N_FFT=512 -DDFN2_MAX_N_ERB=28</code> 讓 32 kHz 變 189,792／197,024；16 kHz 的 mask-only 用前一組旗標為 14,656／18,304。降低後的 build 以 <code>DFN2_GRID_ERR_CAPACITY</code> 拒絕較大的 grid。</p>
 
 <h2>連結符號與 pool 身分</h2>
 <ul>
-<li><b>連結符號</b>：<code>dfn2_process.c</code> 定義一個 variant 符號，<code>dfn2_model_io.c</code>、<code>dfn2_prepost.c</code> 與任何執行 <code>DFN2_REQUIRE_LOOKAHEAD_PAIR_LINK()</code> 的應用單元引用它。出貨 grid（內建的 48k preset）維持原名 <code>dfn2_variant_full</code>／<code>dfn2_variant_mask_only</code>；其他 grid 附加 <code>_s&lt;sr&gt;_f&lt;n_fft&gt;_e&lt;n_erb&gt;_d&lt;df_bins&gt;</code>，例如 <code>dfn2_variant_full_s16000_f256_e24_d96</code>，所以不同 grid 的物件無法連結（雙向都驗過）。四個值須是單純十進位整數。</li>
-<li><b>應用端與庫不同 grid 也連不起來</b>：只在應用自己的檔案裡寫 <code>-D</code> 不會影響已編好的庫物件；應用在 <code>main()</code> 呼叫 <code>DFN2_REQUIRE_LOOKAHEAD_PAIR_LINK()</code>，不一致就變成連結錯誤。<b>切 grid 時庫與應用的每個編譯單元要用同一組旗標</b>。只引用常數、沒執行該巨集的單元不會被擋。在 <code>.c</code> → <code>.o</code> 規則下，不同旗標（另一個 grid、lookahead pair 或 variant）編出的物件同名：每組旗標用自己的物件資料夾，或在切換之間清除；殘留的舊物件會以 <code>dfn2_variant_*</code> 或 <code>dfn2_lookahead_*</code> 未定義而連結失敗。<code>make -C AINR lib</code> 本來就一組旗標一個資料夾。</li>
-<li><b>pool 身分</b>：<code>build_flags_hash</code> 本來就蓋 sr、n_fft、hop、n_erb、df_bins、df_order、pair 與 layout／carve 版號；非出貨 grid 另外折入 7 個 float 的 bit（兩個 alpha、五個正規化起點），所以同樣的整數但 tau 或起點不同的兩個模型，pool 也不互換。出貨 grid 不折入這 7 個值，hash 與以前相同。</li>
-<li class="note">「出貨 grid」指內建的 48k preset 本身，且建置參數沒有覆寫任何正規化起點。覆寫了起點的建置，以及在建置參數定義的 grid（即使整數與出貨相同），都不是出貨 grid：alpha 與起點由定義者決定，所以有自己的符號名與 pool hash（<code>test_dfn2_grid.py</code> 驗證）。</li>
+<li><b>連結符號只有 variant 加容量</b>：<code>dfn2_process.c</code> 定義 <code>dfn2_variant_{full|mask_only}_n&lt;MAX_N_FFT&gt;_e&lt;MAX_N_ERB&gt;_d&lt;MAX_DF_BINS&gt;_r&lt;MAX_DF_RING&gt;</code>（預設為 <code>dfn2_variant_full_n1024_e32_d96_r5</code>，mask-only 預設為 <code>dfn2_variant_mask_only_n1024_e32_d96_r2</code>），<code>dfn2_model_io.c</code>、<code>dfn2_prepost.c</code> 與任何執行 <code>DFN2_REQUIRE_VARIANT_LINK()</code> 的應用單元引用它。一部分單元帶 <code>-DDFN2_MASK_ONLY</code>、或容量不同的物件連結失敗；<b>grid 與 pair 不在符號裡</b>——一個 build 服務所有 grid，grid 或 pair 不符由執行期的 descriptor、pool hash 與 grid 檢查拒絕。容量值須是單純十進位整數。<code>dfn2_frames_per_call&lt;N&gt;</code> 是另一個連結符號。</li>
+<li>在 <code>.c</code> → <code>.o</code> 規則下，不同旗標（mask-only、容量、<code>DFN2_FRAMES_PER_CALL</code>）編出的物件同名：每組旗標用自己的物件資料夾，或在切換之間清除；殘留的舊物件會以 <code>dfn2_variant_*</code> 未定義而連結失敗。<code>make -C AINR lib</code> 本來就一組旗標一個資料夾。dfn 與 dfn-lite 兩個板端 sample 也是如此。</li>
+<li><b>pool 身分</b>：<code>DFN2_PREPOST_CARVE_VERSION</code> = 9（前一版 8）；<code>build_flags_hash</code>（FNV-1a-32）對<b>每一個</b> grid 都折入整個 grid：sr、n_fft、hop、n_erb、df_bins、<code>DF_ORDER</code>、兩個 lookahead、兩個 alpha、五個正規化起點（取自 <code>dfn2_process.c</code> 匯出的 <code>dfn2_norm_starts[]</code>），加上 layout 與 carve 版號、graph 幾何、feature 版本、io_mode，N &gt; 1 時再加 N。<b>carve 8 時查到的 pool 大小或 <code>DFN2PrepostMemReq</code> 會被 <code>dfn2_prepost_init_ex()</code> 拒絕</b>，請重新查詢。容量不在 hash 裡，它改變 <code>bytes</code>（<code>_init_ex</code> 比對）與連結符號。</li>
 </ul>
 
-<h2>各 grid 的大小與延遲</h2>
+<h2>延遲與 warm-up（每個 grid）</h2>
 <div class="tbl"><table>
-<tr><th>grid</th><th><code>sizeof(DFN2State)</code></th><th><code>sizeof(DFN2ModelIOState)</code></th><th>FREQ pool</th><th>TIME pool</th><th>mask-only FREQ pool</th><th>FREQ pool hash</th></tr>
-<tr><td>48 kHz（出貨）</td><td>67,368</td><td>130,704</td><td>219,536</td><td>233,936</td><td>34,816</td><td><code>d2d3bc45</code></td></tr>
-<tr><td>32 kHz（erb 28）</td><td>43,752</td><td>130,656</td><td>189,680</td><td>196,912</td><td>21,344</td><td><code>9cb599e8</code></td></tr>
-<tr><td>16 kHz（erb 24）</td><td>31,912</td><td>130,608</td><td>174,672</td><td>178,320</td><td>14,528</td><td><code>f171a721</code></td></tr>
-<tr><td>外部 24 kHz／512／erb 24</td><td>43,688</td><td>130,608</td><td>189,520</td><td>196,752</td><td>—</td><td><code>3394ae3c</code></td></tr>
+<tr><th>grid（板端表的 pair）</th><th>hop</th><th>窗</th><th>模型 lookahead（M+D）</th><th>identity 路徑延遲（1+M+D hops）</th><th><code>pre_process</code> 回 0／<code>written</code> = 0 的拍數</th></tr>
+<tr><td>48 kHz、1／1</td><td>512 = 10.67 ms</td><td>21.33 ms</td><td>2 hops = 21.33 ms</td><td>3 hops = 1536 samples = 32 ms</td><td>1／2</td></tr>
+<tr><td>32 kHz、0／0</td><td>256 = 8 ms</td><td>16 ms</td><td>0</td><td>1 hop = 256 samples = 8 ms</td><td>0／0</td></tr>
+<tr><td>16 kHz、0／0</td><td>128 = 8 ms</td><td>16 ms</td><td>0</td><td>1 hop = 128 samples = 8 ms</td><td>0／0</td></tr>
+</table></div>
+<p class="note">延遲 = (1 + M + D) × hop（<code>dfn2_prepost_latency_frames(grid)</code> + 1，N = 1）；其他 pair 照公式換算，音質待量測。第一次加速器呼叫需要 <code>dfn2_model_io_ready_frames()</code> = mask_lookahead + <code>DFN2_FRAMES_PER_CALL</code> 個 feature frame。</p>
+
+<h2>板端 sample 與測試／pipeline 的 grid</h2>
+<p>板端 sample（<code>audio_sample/</code>，不在本 repo）與 pipeline 的兩支範例 main 各持有同一張 (sample rate, FFT size) → n_erb、df_bins、mask／df lookahead 的表，沒有 n_erb 或 df_bins 旗標，預設 48000 與 1024，表外的組合列出可用的列後被拒：</p>
+<div class="tbl"><table>
+<tr><th>模型取樣率</th><th>FFT 大小</th><th>n_erb</th><th>df_bins</th><th>mask／df lookahead</th><th>狀態</th></tr>
+<tr><td>16000</td><td>256</td><td>24</td><td>96</td><td>0／0</td><td>音質待量測</td></tr>
+<tr><td>32000</td><td>512</td><td>28</td><td>96</td><td>0／0</td><td>暫定，尚未訓練模型（28 是 4 的倍數，C 端與 <code>train.py</code> 都收）</td></tr>
+<tr><td>48000</td><td>1024</td><td>32</td><td>96</td><td>1／1</td><td><b>出貨</b></td></tr>
 </table></div>
 <div class="tbl"><table>
-<tr><th>grid</th><th>應用端借用：FFT handle</th><th><code>AcStft</code>（在 TIME pool 內，含窗表）</th><th>應用端的 <code>AcIstft</code></th><th>hop</th><th>窗</th><th>模型 lookahead（M+D = 2 hops）</th><th>identity 路徑延遲（1+M+D = 3 hops）</th></tr>
-<tr><td>48 kHz</td><td>26,352</td><td>16,480</td><td>12,384</td><td>512 = 10.67 ms</td><td>21.33 ms</td><td>21.33 ms</td><td>1536 samples = 32 ms</td></tr>
-<tr><td>32 kHz</td><td>13,552</td><td>8,288</td><td>6,240</td><td>256 = 8 ms</td><td>16 ms</td><td>16 ms</td><td>768 samples = 24 ms</td></tr>
-<tr><td>16 kHz</td><td>7,152</td><td>4,192</td><td>3,168</td><td>128 = 8 ms</td><td>16 ms</td><td>16 ms</td><td>384 samples = 24 ms</td></tr>
-<tr><td>外部 24 kHz／512</td><td>13,552</td><td>8,288</td><td>6,240</td><td>256 = 10.67 ms</td><td>21.33 ms</td><td>21.33 ms</td><td>768 samples = 32 ms</td></tr>
+<tr><th>程式</th><th>怎麼選模型 grid</th></tr>
+<tr><td><code>alg_ai3_dfn.c</code></td><td><code>--sample-rate</code>、<code>--fft-size</code>（輸入串流的取樣率就是模型的）。以 <code>--sample</code> 或 <code>--fft</code> 開頭卻不是這兩個旗標的字串（<code>--sample-rate=16000</code>、<code>--samplerate</code>）印出用法並結束碼 2，不會靜默跑預設 grid</td></tr>
+<tr><td><code>alg_ai3_dfn_lite.c</code></td><td>同樣的旗標與規則，表是 mask-only 的：每一列 df_lookahead 都是 0（48000／1024 為 1／0）。完整模型與 mask-only 是<b>兩支 sample</b>：lite 是 mask-only（I/O layout 9，模型放 <code>dfn2_lite/</code>、輸出到 <code>DFN2_LITE/</code>），函式庫單元以 <code>-DDFN2_MASK_ONLY</code> 建置，兩種 build 的物件資料夾分開</td></tr>
+<tr><td><code>alg_ai3_aec_dfn.c</code></td><td><code>--ai-sample-rate</code>、<code>--ai-fft-size</code> 選模型 grid；<code>--sr</code> 仍是 host 的取樣率（沒給時跟模型的取樣率）。host 取樣率等於模型的：<code>DfnResStage</code> 直接跑；否則走 <code>DfnRateBridge</code>，它只收 48000／1024 的模型與 8000／16000 的 host，其他組合在動 NPU 之前就以訊息拒絕（結束碼 1）。它的 AEC 沒有 32 kHz 格點，所以 32000／512 在這裡被拒。以 <code>--ai</code> 開頭卻不是這兩個旗標的字串結束碼 2</td></tr>
+<tr><td><code>uvc_ai_nr_stream.c</code></td><td>只有 48 kHz（USB 音訊是 48 kHz；原生 16 kHz 的 UVC 不在範圍內），沒有旗標：用自己的一列常數呼叫 <code>dfn2_grid_make(48000, 1024, 32, 96, 1, 1)</code> 建 grid，直接驅動 <code>DFN2Prepost</code>（<code>DFN2_IO_FREQ</code>）：grid 傳給 <code>dfn2_framing_config()</code>、<code>dfn2_prepost_config_defaults()</code>、tensor 表與 ERB 檔名；原本擋非 48 kHz 的建置期檢查變成對這些常數的編譯期檢查</td></tr>
+<tr><td><code>uvc_audio_live2a.c</code></td><td>同樣只有 48 kHz、沒有旗標、同一列 <code>dfn2_grid_make()</code>；grid 放進 <code>DfnResStage</code>／<code>DfnRateBridge</code> 的 config、model-I/O descriptor 與 tensor 表（host 在模型的取樣率，或經 bridge）</td></tr>
+<tr><td>pipeline 範例 main（<code>mono_aec_dfn_res</code>、<code>4ch_aec_bf_dfn_res</code>）</td><td><code>--ai-sample-rate</code>、<code>--ai-fft-size</code>（<code>--sample-rate</code> 是 host 的）；grid 放進 <code>DfnResStageConfig.grid</code>，輸出「model grid …」一行。規則同 <code>alg_ai3_aec_dfn.c</code>，bridge 不能服務時 pool 查詢被拒、結束碼 1</td></tr>
 </table></div>
-<p class="note">單位 bytes，皆為本機量測、出貨 lookahead pair 1／1；hash 是本次建置的值（carve／layout 版號或 pair 變動時會變，不由測試核對）；hop = n_fft／2，延遲 = (1 + M + D) × hop，其他 pair 照公式換算（音質待量測）。FFT handle 與 <code>AcIstft</code> 是應用端的物件，不在 pool 內。<code>DFN2ModelIOState</code> 幾乎不隨 grid 變：主體是兩個遞迴 state tensor（<code>h_gru</code>、<code>df_convp_history</code>，共 128,000 bytes），只有 ERB 特徵視窗隨 n_erb 變。mask-only 的 <code>sizeof(DFN2State)</code> 在 16 kHz 為 4,424 bytes。</p>
-
-<h2>切 grid 的流程與板端 sample</h2>
-<ol>
-<li>訓練端：<code>config.ini [signal]</code> 的 <code>sr</code>／<code>n_fft</code>／<code>win_len</code>／<code>hop_len</code> 與 <code>[model]</code> 的 <code>n_erb</code>／<code>df_bins</code> 改成該 grid（<code>hop_len</code> = n_fft／2；<code>n_erb</code> 為 4 的倍數）；alpha 與 analysis scale 由 <code>train.py</code> 推導，不是設定值。</li>
-<li>匯出：<code>export_onnx.py</code> 與 <code>export_erb_matrix.py --runtime-bins DIR</code>；<code>erb_fwd.bin</code>／<code>erb_inv.bin</code> 各 n_bins × n_erb 個 float32（48 kHz 是 513 × 32 = 65,664 bytes，16 kHz 是 129 × 24 = 12,384 bytes）。</li>
-<li>建置：函式庫與應用用<b>同一組</b> grid 旗標編譯；板端 sample 部署的 <code>model.bin</code> 與 <code>erb_matrix.bin</code> 也要換成該 grid 的。<code>DFN2ModelIoDescriptor</code>（sample_rate、fft_size、hop_size、spectrum_bins、erb_bands、df_bins、df_order）在執行期仍會擋掉對著另一組幾何匯出的圖。</li>
-</ol>
-<p>板端 sample <code>alg_ai3_dfn.c</code>（<code>audio_sample/</code>，不在本 repo）不再重述 48 kHz 的常數：<code>HOP_SIZE</code>、<code>FFT_SIZE</code>、<code>N_ERB</code>、<code>SAMPLE_RATE</code> 等都是 <code>DFN2_*</code> 的別名，所以輸入 PCM 的取樣率就是該 build 的 <code>DFN2_SR</code>；<code>main()</code> 呼叫 <code>DFN2_REQUIRE_LOOKAHEAD_PAIR_LINK()</code> 並印出 grid（sr、fft、hop、bins、ERB 數、deep filter bins × taps、lookahead），<code>--help</code> 註明 grid 在建置時決定。切 16 kHz：庫物件與該 sample 都加 <code>-DDFN2_GRID_KHZ=16</code>，並換成 16 kHz 的 model 與 ERB 檔；板端實跑待量測。</p>
-
-<h2>pipelines 與其他限制</h2>
+<p>所有 DFN2 板端 sample 的 ERB 矩陣都讀 <code>/mnt/sd/dfn2_blobs/fb_&lt;sr&gt;_&lt;n_erb&gt;.bin</code>（例如 <code>fb_48000_32.bin</code>；<code>&lt;sr&gt;</code> 是模型 grid 的取樣率，不是 host 的），一套部署檔共用。這個檔就是匯出器的 <code>erb_matrix.bin</code>（<code>export_erb_matrix.py --output-dir DIR --format bin</code>，<code>--format all</code> 也會寫）依 grid 改名：<code>int32 n_bins</code>、<code>int32 n_bands</code>、<code>float32 erb_fb[n_bins*n_bands]</code>、<code>float32 erb_inv[n_bins*n_bands]</code>，兩個矩陣都是 bin-major。它<b>不是</b> <code>--runtime-bins</code> 寫的 <code>erb_fwd.bin</code>（bin-major）與 <code>erb_inv.bin</code>（band-major，函式庫要的版面）那一對；板端 sample 先核對標頭與 grid 的 n_bins、n_erb，再把 <code>erb_inv</code> 轉置成 band-major。板端實跑待量測。</p>
 <ul>
-<li><code>pipelines/dfn/dfn_res_stage.h</code> 的 <code>DFN_RES_STAGE_IN_SCALE</code>／<code>_OUT_SCALE</code> 現在是 <code>DFN2_NORMALIZED_STFT_SCALE</code>／<code>_UNSCALE</code>（出貨 grid 仍是 2<sup>-5</sup>／2<sup>5</sup>，數值不變）；stage 的 <code>sample_rate</code> 只收 <code>DFN2_SR</code>、<code>fft_size</code> 只收 0 或 <code>DFN2_N_FFT</code>。</li>
-<li><code>pipelines/dfn/dfn_rate_bridge.c</code> 的 <code>resolve()</code> 在 <code>DFN2_SR != 48000</code> 或 <code>DFN2_N_FFT != 1024</code> 時回 -1：bridge 的重取樣倍率、每 hop 推論排程、prefill 校準與延遲算式都是為 48 kHz 模型寫的，非 48 kHz 模型明確拒絕，不會悄悄用錯。bridge 的 host 端只有 8k／fft256、16k／fft256、16k／fft512。</li>
-<li>兩支 DFN2 pipeline 與 <code>dfn2_stage.py</code> 只以出貨 grid 驗證，非出貨 grid 的 pipeline 組合未驗證。</li>
-<li>32 kHz preset 是暫定值：尚無 32 kHz 模型；28 個 band 在 C 端與 <code>train.py</code> 都合法。</li>
-<li>mask-only（stage 1）用同一支板端 sample <code>alg_ai3_dfn.c</code>（<code>audio_sample/</code>，不在本 repo）：sample 與函式庫的每個編譯單元都加 <code>-DDFN2_MASK_ONLY</code>，就綁 I/O layout 9（輸入 <code>erb, spec, h_gru</code>、輸出 <code>erb_mask, h_gru_out</code>），模型放 <code>dfn2_lite/</code>，輸出到 <code>DFN2_LITE/</code>，同樣吃 build 的 grid；不需要額外的 .c／.h。與完整版的物件互相連不起來（<code>dfn2_variant_mask_only</code>）；兩種 build 要各用自己的物件資料夾（見「連結符號與 pool 身分」一節）。</li>
+<li><b>測試在建置時用自己的標頭選 grid，不經函式庫；pipeline 與範例 main 不用</b>：<code>AINR/tests/dfn2_test_grid.h</code> 與 <code>pipelines/dfn/tests/dfn_test_grid.h</code>（<code>-DDFN2_GRID_KHZ=16|32|48</code>，或 <code>-DDFN2_SR</code>／<code>-DDFN2_N_FFT</code>／<code>-DDFN2_N_ERB</code>／<code>-DDFN2_DF_BINS</code>，加上 <code>-DDFN2_MASK_LOOKAHEAD</code>／<code>-DDFN2_DF_LOOKAHEAD</code>；<code>dfn2_test_grid()</code>／<code>dfn_test_grid()</code> 回傳 <code>DFN2Grid</code>）。它們提供測試自己的固定陣列用的 <code>DFN2_*</code> 大小巨集並掃 grid 與 pair；preset 預設的 pair 是 1／1，不是上表 16、32 kHz 的 0／0，所以它們證明程式在那個 grid 上跑得對，不是在驗上表的某一列。</li>
+<li>pipeline 的 <code>dfn_res_stage</code>、<code>dfn_rate_bridge</code>、<code>dfn_hop</code> 沒有建置期的 grid：<code>DfnResStageConfig.grid</code> 由應用端給（<code>dfn_res_stage_default_config(&amp;grid)</code>），stage 的尺度取 <code>grid.stft_scale</code>／<code>stft_unscale</code>（出貨 grid 為 2<sup>-5</sup>／2<sup>5</sup>），延遲取 <code>dfn_res_stage_lookahead_frames(&amp;grid)</code>。<code>dfn_rate_bridge_default_config(sample_rate, &amp;model_grid)</code> 的 <code>resolve()</code> 在 stage 的 grid 不是 48000／1024 時回 -1：bridge 的重取樣倍率、每 hop 推論排程、prefill 校準與延遲算式都是為 48 kHz 模型寫的。兩支 DFN2 pipeline 與 <code>dfn2_stage.py</code> 只以出貨 grid 驗證；stage、bridge、hop 的 C 測試另在 16、32 kHz 的測試 grid 上跑（<code>make test-dfn-grids</code>）。</li>
 </ul>
+
+<h2>切 grid 的流程</h2>
+<ol>
+<li>訓練端：<code>config.ini [signal]</code> 的 <code>sr</code>／<code>n_fft</code>／<code>win_len</code>／<code>hop_len</code> 與 <code>[model]</code> 的 <code>n_erb</code>／<code>df_bins</code>／兩個 lookahead 改成該 grid（<code>hop_len</code> = n_fft／2；<code>n_erb</code> 為 4 的倍數）；alpha 與 analysis scale 由 <code>train.py</code> 推導，不是設定值。</li>
+<li>匯出：<code>export_onnx.py</code> 與 <code>export_erb_matrix.py</code>。pipeline 範例讀 <code>--runtime-bins DIR</code> 的 <code>erb_fwd.bin</code>／<code>erb_inv.bin</code>（各 n_bins × n_erb 個 float32；48 kHz 是 513 × 32 = 65,664 bytes，16 kHz 是 129 × 24 = 12,384 bytes）；板端 sample 讀改名後的 <code>erb_matrix.bin</code>（上一節）。</li>
+<li>應用端：用同一組值呼叫 <code>dfn2_grid_make()</code>，載入該 grid 的 model 與 ERB 矩陣。<code>DFN2ModelIoDescriptor</code> 的 grid 欄位（sample_rate、fft_size、hop_size、spectrum_bins、erb_bands、df_bins、兩個 lookahead）取自傳入的 grid，執行期擋掉對著另一組幾何匯出的圖。</li>
+</ol>
 
 <h2>相關檔案與測試路徑</h2>
 <ul>
-<li><code>AINR/DeepFilterNet2/dfn2_grid.h</code>（preset、外部定義規則、<code>#error</code>）、<code>dfn2_process.h</code>（<code>DFN2_VARIANT_SYMBOL</code>、<code>DFN2_GRID_IS_SHIPPED</code>）、<code>dfn2_prepost.c</code>（<code>pp_build_hash</code>）；<code>AINR/Makefile</code> 的 <code>HEADERS</code> 含 <code>dfn2_grid.h</code>。</li>
-<li>測試 <code>AINR/tests/test_dfn2_grid.py</code>：對 48／32／16 kHz 與測試用的外部 24 kHz，驗證常數對 <code>train.py</code>（alpha 與 analysis scale 逐位元）、C 特徵與 compose 對 Python（含 <code>SIMD=0</code>）、C 串流對離線模型、非法 grid 的 <code>#error</code> 訊息、跨 grid 連結必須失敗（雙向與「應用端與庫不同」）、pool 身分隨 grid 與 alpha 改變。<code>AINR/DeepFilterNet2/tests/test_dfn2_contract.py</code> 的 N_ERB／DF_BINS 解析改讀 <code>dfn2_grid.h</code>（第一個 <code>#define</code> = 48 kHz 分支）。</li>
+<li><code>AINR/DeepFilterNet2/dfn2_grid.h</code>（<code>DFN2Grid</code>、容量、狀態碼）、<code>dfn2_process.c</code>（<code>dfn2_grid_make</code>、<code>dfn2_grid_validate</code>、<code>dfn2_norm_alpha</code>、<code>dfn2_grid_status_text</code>）、<code>dfn2_process.h</code>（<code>DFN2_REQUIRE_VARIANT_LINK</code>）、<code>dfn2_prepost.c</code>（<code>pp_build_hash</code>）；<code>AINR/Makefile</code> 的 <code>HEADERS</code> 含 <code>dfn2_grid.h</code>。</li>
+<li>測試：<code>AINR/tests/test_dfn2_grid.py</code>（每個拒絕與狀態碼、<code>make</code> 與 <code>validate</code> 在取樣率掃描上一致、<code>n_erb</code> 溢位在 UBSan 下乾淨、<code>DFN2_DF_ORDER</code> 的 <code>#error</code>、衍生欄位、alpha 對 <code>train.py</code> 逐位元、同一個 binary 跑各 grid 的 C 對 Python）、<code>test_dfn2_runtime_grid.py</code>（容量獨立、pool 身分與 <code>dfn2_process.c</code> 的正規化起點、函式庫內沒有 grid、variant 連結符號）、<code>test_dfn2_lookahead_pairs.py</code>（出貨 pair 與 2／4 在 48、32、16 kHz 測試 grid 上的 C 套件）、<code>test_dfn2_prepost_c.py</code>、<code>test_c_prepost.c</code>、<code>test_nn_chains.c</code>。</li>
 <li>同類頁面：<a href="ainr_dfn2.html">ainr_dfn2</a>、<a href="ainr_dfn2_detail.html">ainr_dfn2_detail</a>、<a href="ainr_dfn2_usage.html">ainr_dfn2_usage</a>、<a href="conventions.html">conventions</a>、<a href="index.html">index</a>。文件：<a href="../../AINR/DeepFilterNet2/README.md">DeepFilterNet2/README.md</a>。</li>
 </ul>
 </body>

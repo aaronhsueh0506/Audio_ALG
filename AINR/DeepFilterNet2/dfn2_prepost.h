@@ -1,5 +1,5 @@
 /* DeepFilterNet2 pre/post-processing class: one object owning everything between
- * the caller's audio and the accelerator's tensors.
+ * the caller's audio and the accelerator's tensors, for the DFN2Grid in its config.
  *
  *     if (dfn2_prepost_pre_process(p, in_hop) == 1) {
  *         dfn2_prepost_frame_inputs(p, &in, &out);   // views into the pool
@@ -8,28 +8,28 @@
  *     }
  *     dfn2_prepost_post_process(p, out_hop, &written);
  *
- * With L = DFN2_MASK_LOOKAHEAD and D = DFN2_DF_LOOKAHEAD, pre_process returns 0
+ * With L = the grid's mask_lookahead and D = its df_lookahead, pre_process returns 0
  * on the first L hops (the graph window [t-(2-L) .. t+L] is not complete yet;
  * do not run the accelerator) and 1 afterwards. Latency is 1 + L + D hops: one
  * of framing plus L + D of model lookahead (3 hops, 1536 samples, 32 ms on the
- * shipped 48 kHz grid for L = D = 1); post_process reports written = 0 for the
+ * 48 kHz grid for L = D = 1); post_process reports written = 0 for the
  * first L + D hops. Flush the tail with L + D more zero hops and run the
- * accelerator on them. L and D are build-time constants (dfn2_process.h) and
- * must equal the pair the graph was trained and exported for.
+ * accelerator on them. L and D are part of the grid and must equal the pair the graph
+ * was trained and exported for.
  *
  * With N = DFN2_FRAMES_PER_CALL > 1 (a graph exported with --frames-per-call N)
  * pre_process returns 1 on hops L + N - 1, L + 2N - 1, ... and 0 on the others;
  * frame_inputs() publishes the N + 2 frame window and N heads, and commit
  * composes the N frames in one burst. post_process still returns one hop per
  * call, from the burst, so the output trails the input by N - 1 more hops:
- * latency 1 + L + D + N - 1 hops (DFN2_PREPOST_LATENCY_FRAMES + 1), and the
+ * latency 1 + L + D + N - 1 hops (dfn2_prepost_latency_frames() + 1), and the
  * first L + D + N - 1 hops report written = 0. To flush, keep pushing zero hops
  * and running the accelerator until the last real hop has been emitted.
  *
  * DFN2_IO_FREQ spectra are torch.stft(normalized=True): the rfft of the
- * sqrt-Hann-windowed block times 1/sqrt(DFN2_N_FFT). AIAEC spectra are
- * unnormalised: scale by 1.0f / sqrtf(DFN2_N_FFT) into DFN2 and by
- * sqrtf(DFN2_N_FFT) out of it (a wrong scale is not detectable here).
+ * sqrt-Hann-windowed block times 1/sqrt(n_fft). AIAEC spectra are
+ * unnormalised: scale by grid.stft_scale into DFN2 and by grid.stft_unscale out of it
+ * (a wrong scale is not detectable here).
  * The FftHandle, window, ERB matrices and (DFN2_IO_TIME) the synthesis AcIstft are
  * caller-owned; window == NULL carves a sqrt-Hann table in the pool for the
  * analysis object.
@@ -38,7 +38,7 @@
  * to chain it:
  *
  *     // DFN2_IO_TIME: hand the class the caller's AcIstft; commit pushes into it.
- *     AcStftConfig sc;  dfn2_framing_config(&sc, fft, NULL);
+ *     AcStftConfig sc;  dfn2_framing_config(&sc, &grid, fft, NULL);
  *     AcIstft *istft = ac_istft_init(mem, ac_istft_get_mem_size(&sc), &sc);
  *     cfg.istft = istft;                       // ... dfn2_prepost_init(...)
  *     dfn2_prepost_post_process(p, out_hop, &written);   // hop out
@@ -64,32 +64,47 @@ extern "C" {
 #define DFN2_PREPOST_DESCRIPTOR_VERSION 1u
 /* Folded into build_flags_hash; bumped on any change of pool size, carve order or
  * descriptor content. */
-#define DFN2_PREPOST_CARVE_VERSION      8u
-
-/* Hops the output trails the input by on top of the framing. */
-#define DFN2_PREPOST_LATENCY_FRAMES \
-    (DFN2_MASK_LOOKAHEAD + DFN2_DF_LOOKAHEAD + DFN2_FRAMES_PER_CALL - 1)
+#define DFN2_PREPOST_CARVE_VERSION      9u
 
 /* One shared alignment for every module (audiolib mem_align.h). */
 #define DFN2_PREPOST_ALIGNMENT 16u
 
-/* Flat element counts at the accelerator boundary, for binding tensors by count.
- * The heads hold DFN2_FRAMES_PER_CALL frames, oldest first. */
-#define DFN2_PREPOST_ERB_WINDOW_ELEMENTS \
-    (DFN2_MODEL_WINDOW_FRAMES * DFN2_N_ERB)
-#define DFN2_PREPOST_SPEC_WINDOW_ELEMENTS \
-    (2 * DFN2_MODEL_WINDOW_FRAMES * DFN2_DF_BINS)
+/* Hops the output trails the input by on top of the framing: the grid's two lookaheads
+ * plus the frames per call after the first. */
+static inline int dfn2_prepost_latency_frames(const DFN2Grid *grid)
+{
+    return grid->mask_lookahead + grid->df_lookahead + DFN2_FRAMES_PER_CALL - 1;
+}
+
+/* Flat element counts at the accelerator boundary, for binding tensors by count. The
+ * heads hold DFN2_FRAMES_PER_CALL frames, oldest first. The grid-free ones are macros. */
+static inline size_t dfn2_prepost_erb_window_elements(const DFN2Grid *grid)
+{
+    return (size_t)DFN2_MODEL_WINDOW_FRAMES * (size_t)grid->n_erb;
+}
+static inline size_t dfn2_prepost_spec_window_elements(const DFN2Grid *grid)
+{
+    return (size_t)2 * DFN2_MODEL_WINDOW_FRAMES * (size_t)grid->df_bins;
+}
+static inline size_t dfn2_prepost_erb_mask_elements(const DFN2Grid *grid)
+{
+    return (size_t)DFN2_FRAMES_PER_CALL * (size_t)grid->n_erb;
+}
 #define DFN2_PREPOST_GRU_HIDDEN_ELEMENTS \
     (DFN2_MODEL_GRU_ROWS * DFN2_MODEL_GRU_HIDDEN)
-#define DFN2_PREPOST_ERB_MASK_ELEMENTS   (DFN2_FRAMES_PER_CALL * DFN2_N_ERB)
 /* DFN2_MASK_ONLY (dfn2_model_io.h) has no deep filter: no coefficient or alpha
  * head and no pathway window, in the sizes and in the two structs below. */
 #ifndef DFN2_MASK_ONLY
-#define DFN2_PREPOST_CONVP_WINDOW_ELEMENTS \
-    (DFN2_MODEL_ENCODER_CHANNELS * DFN2_MODEL_DF_PATHWAY_WINDOW * \
-     DFN2_DF_BINS)
-#define DFN2_PREPOST_COEFS_ELEMENTS \
-    (DFN2_FRAMES_PER_CALL * DFN2_DF_BINS * DFN2_DF_ORDER * 2)
+static inline size_t dfn2_prepost_convp_window_elements(const DFN2Grid *grid)
+{
+    return (size_t)DFN2_MODEL_ENCODER_CHANNELS * DFN2_MODEL_DF_PATHWAY_WINDOW *
+           (size_t)grid->df_bins;
+}
+static inline size_t dfn2_prepost_coefs_elements(const DFN2Grid *grid)
+{
+    return (size_t)DFN2_FRAMES_PER_CALL * (size_t)grid->df_bins *
+           DFN2_DF_ORDER * 2;
+}
 #define DFN2_PREPOST_ALPHA_ELEMENTS      DFN2_FRAMES_PER_CALL
 #endif
 
@@ -106,11 +121,12 @@ typedef enum DFN2IoMode {
 
 typedef struct DFN2PrepostConfig {
     int          io_mode;       /* a DFN2IoMode                             */
-    FftHandle   *fft;           /* DFN2_IO_TIME: required, borrowed, sized for DFN2_N_FFT */
-    const float *window;        /* optional, DFN2_WIN_LEN entries, borrowed (DFN2_IO_TIME); NULL = sqrt-Hann table carved in the pool */
+    DFN2Grid     grid;          /* the grid the instance runs (dfn2_grid_make); copied at init */
+    FftHandle   *fft;           /* DFN2_IO_TIME: required, borrowed, sized for grid.n_fft */
+    const float *window;        /* optional, grid.n_fft entries, borrowed (DFN2_IO_TIME); NULL = sqrt-Hann table carved in the pool */
     AcIstft     *istft;         /* DFN2_IO_TIME: required, borrowed, built from dfn2_framing_config() (same fft size, window values, ola, ispec_scale); ignored in DFN2_IO_FREQ */
-    const float *erb_fwd;       /* required, borrowed, bin-major [DFN2_N_BINS][DFN2_N_ERB] */
-    const float *erb_inv;       /* required, borrowed, band-major [DFN2_N_ERB][DFN2_N_BINS] */
+    const float *erb_fwd;       /* required, borrowed, bin-major [n_bins][n_erb] */
+    const float *erb_inv;       /* required, borrowed, band-major [n_erb][n_bins] */
     float        atten_lim_db;  /* 0 disables the attenuation limit         */
 } DFN2PrepostConfig;
 
@@ -120,7 +136,7 @@ typedef struct DFN2PrepostMemReq {
     uint32_t descriptor_version;  /* DFN2_PREPOST_DESCRIPTOR_VERSION        */
     uint32_t layout_version;      /* DFN2_MODEL_IO_LAYOUT_VERSION           */
     uint32_t io_mode;             /* the resolved DFN2IoMode                */
-    uint32_t build_flags_hash;    /* FNV-1a-32 over grid, geometry, feature version, io_mode */
+    uint32_t build_flags_hash;    /* FNV-1a-32 over grid (lookahead pair included), geometry, feature version, io_mode */
     uint32_t alignment;
     uint32_t reserved;            /* 0 */
     uint64_t bytes;
@@ -138,21 +154,21 @@ typedef struct DFN2Prepost DFN2Prepost;
 /* Accelerator inputs, pointing into the pool for the life of the instance. The
  * state tensors never change address and the matching `*_next` outputs alias them
  * (read every state input before writing any state output). The feature windows
- * are read-only. Graph input names are given for binding by name. */
+ * are read-only. Graph input names are given for binding by name. The tensors with a
+ * grid dimension are flat float runs packed at the grid's stride, `*_elements` long
+ * (dfn2_prepost_*_elements(grid)); the leading dimensions are as in the comments. */
 typedef struct DFN2PrepostInputs {
-    /* 'erb'  (1,1,DFN2_MODEL_WINDOW_FRAMES,DFN2_N_ERB) */
-    const float (*erb_window)[DFN2_N_ERB];
-    /* 'spec' (1,2,DFN2_MODEL_WINDOW_FRAMES,DFN2_DF_BINS) */
-    const float (*spec_window)[DFN2_MODEL_WINDOW_FRAMES][DFN2_DF_BINS];
+    /* 'erb'  (1,1,DFN2_MODEL_WINDOW_FRAMES,n_erb) */
+    const float *erb_window;
+    /* 'spec' (1,2,DFN2_MODEL_WINDOW_FRAMES,df_bins) */
+    const float *spec_window;
     /* 'h_gru' (1,DFN2_MODEL_GRU_ROWS,1,DFN2_MODEL_GRU_HIDDEN); rows start at
      * DFN2_MODEL_GRU_ROW_ENCODER / _ERB / _DF */
     const float (*gru_hidden)[DFN2_MODEL_GRU_HIDDEN];
 #ifndef DFN2_MASK_ONLY
     /* 'df_convp_history'
-     * (1,DFN2_MODEL_ENCODER_CHANNELS,DFN2_MODEL_DF_PATHWAY_WINDOW,
-     *  DFN2_DF_BINS) */
-    const float (*df_convp_window)[DFN2_MODEL_DF_PATHWAY_WINDOW]
-                                  [DFN2_DF_BINS];
+     * (1,DFN2_MODEL_ENCODER_CHANNELS,DFN2_MODEL_DF_PATHWAY_WINDOW,df_bins) */
+    const float *df_convp_window;
 #endif
     size_t erb_window_elements;
     size_t spec_window_elements;
@@ -165,20 +181,19 @@ typedef struct DFN2PrepostInputs {
 /* Accelerator-writable outputs: the three heads and the two next-state tensors.
  * frame_inputs() NaN-fills the heads so frame_commit() detects a partial write.
  * The next-state tensors alias the inputs' state (nothing copied, not prefilled).
- * `coefs` is (DFN2_DF_BINS, DFN2_DF_ORDER, 2): bin, tap, re/im. `alpha` is a
+ * `coefs` is (df_bins, DFN2_DF_ORDER, 2): bin, tap, re/im. `alpha` is a
  * one-element tensor. With N frames per call each head holds N such frames,
- * frame-major and oldest first ('erb_mask' (1,1,N,DFN2_N_ERB), 'df_coefs'
+ * frame-major and oldest first ('erb_mask' (1,1,N,n_erb), 'df_coefs'
  * (1,N,bins,order*2), 'df_alpha' (1,N,1)). */
 typedef struct DFN2PrepostOutputs {
-    float *erb_mask;                /* 'erb_mask'  [N][DFN2_N_ERB]          */
+    float *erb_mask;                /* 'erb_mask'  [N][n_erb]               */
 #ifndef DFN2_MASK_ONLY
     float *coefs;                   /* 'df_coefs'  [N][bins][order][2]      */
     float *alpha;                   /* 'df_alpha'  [N]                      */
 #endif
     float (*gru_hidden_next)[DFN2_MODEL_GRU_HIDDEN];          /* h_gru_out */
 #ifndef DFN2_MASK_ONLY
-    float (*df_convp_window_next)[DFN2_MODEL_DF_PATHWAY_WINDOW]
-                                 [DFN2_DF_BINS];  /* df_convp_history_out  */
+    float *df_convp_window_next;    /* df_convp_history_out (packed as the input) */
 #endif
     size_t erb_mask_elements;
 #ifndef DFN2_MASK_ONLY
@@ -193,14 +208,15 @@ typedef struct DFN2PrepostOutputs {
 
 /* ---- config / sizing ------------------------------------------------- */
 
-/* Fill a config with this build's defaults. Returns 0, or -1 on NULL or an
- * unknown io_mode. fft, window, istft, erb_fwd and erb_inv are left NULL;
- * atten_lim_db is 0 (disabled). */
-int dfn2_prepost_config_defaults(DFN2PrepostConfig *cfg, int io_mode);
+/* Fill a config for `grid` (copied). Returns 0, or -1 on NULL, an invalid grid
+ * (dfn2_grid_validate) or an unknown io_mode. fft, window, istft, erb_fwd and erb_inv are
+ * left NULL; atten_lim_db is 0 (disabled). */
+int dfn2_prepost_config_defaults(DFN2PrepostConfig *cfg, int io_mode,
+                                 const DFN2Grid *grid);
 
 /* Exact pool size. Returns -1 (req untouched) on NULL, unknown io_mode, missing
- * ERB matrices, non-finite atten_lim_db, or DFN2_IO_TIME without an FftHandle
- * sized for DFN2_N_FFT or without an AcIstft that matches dfn2_framing_config(). */
+ * ERB matrices, non-finite atten_lim_db, an invalid grid, or DFN2_IO_TIME without an FftHandle
+ * sized for the grid's n_fft or without an AcIstft that matches dfn2_framing_config(). */
 int dfn2_prepost_get_mem_size(const DFN2PrepostConfig *cfg,
                               DFN2PrepostMemReq *req);
 
@@ -238,9 +254,11 @@ unsigned int dfn2_prepost_state_generation(const DFN2Prepost *p);
 int dfn2_prepost_hop_size(const DFN2Prepost *p);   /* or -1 */
 int dfn2_prepost_num_bins(const DFN2Prepost *p);   /* or -1 */
 int dfn2_prepost_io_mode(const DFN2Prepost *p);    /* or -1 */
+/* The grid the instance runs; NULL for NULL. */
+const DFN2Grid *dfn2_prepost_grid(const DFN2Prepost *p);
 /* Frames of end-to-end lookahead the model costs on top of the framing:
- * DFN2_MASK_LOOKAHEAD + DFN2_DF_LOOKAHEAD, plus DFN2_FRAMES_PER_CALL - 1
- * (DFN2_PREPOST_LATENCY_FRAMES). -1 on NULL. */
+ * mask_lookahead + df_lookahead, plus DFN2_FRAMES_PER_CALL - 1
+ * (dfn2_prepost_latency_frames()). -1 on NULL. */
 int dfn2_prepost_model_lookahead_frames(const DFN2Prepost *p);
 /* The graph contract this build binds. -1 on NULL. */
 int dfn2_prepost_layout_version(const DFN2Prepost *p);
@@ -261,35 +279,33 @@ int dfn2_prepost_set_atten_lim(DFN2Prepost *p, float atten_lim_db);
 
 /* ---- per-hop stages -------------------------------------------------- */
 
-/* DFN2_IO_TIME. One hop of noisy input (DFN2 is single-stream): runs the
- * analysis and feature front end, slides the graph window and advances the
+/* DFN2_IO_TIME. One hop (grid.hop samples) of noisy input (DFN2 is single-stream): runs
+ * the analysis and feature front end, slides the graph window and advances the
  * compose clock. Returns the number of accelerator invocations this hop needs (0
- * on the first DFN2_MASK_LOOKAHEAD hops, 1 after; with N frames per call 1 on
+ * on the first mask_lookahead hops, 1 after; with N frames per call 1 on
  * every N-th hop from hop L + N - 1), or -1 on NULL args, in DFN2_IO_FREQ, or
  * with a frame open. */
-int dfn2_prepost_pre_process(DFN2Prepost *p, const float in_hop[DFN2_HOP_LEN]);
+int dfn2_prepost_pre_process(DFN2Prepost *p, const float *in_hop);
 
-/* DFN2_IO_FREQ. One analysed frame at normalized=True scale: rfft of a
- * sqrt-Hann-windowed DFN2_N_FFT block on the DFN2_HOP_LEN grid. No transform is
- * done. Returns 0 on the first DFN2_MASK_LOOKAHEAD frames, 1 after (with N
+/* DFN2_IO_FREQ. One analysed frame (n_bins bins) at normalized=True scale: rfft of a
+ * sqrt-Hann-windowed n_fft block on the hop grid. No transform is
+ * done. Returns 0 on the first mask_lookahead frames, 1 after (with N
  * frames per call, on the same hops as pre_process), or -1. */
-int dfn2_prepost_pre_process_freq(DFN2Prepost *p,
-                                  const float spec_re[DFN2_N_BINS],
-                                  const float spec_im[DFN2_N_BINS]);
+int dfn2_prepost_pre_process_freq(DFN2Prepost *p, const float *spec_re,
+                                  const float *spec_im);
 
 /* DFN2_IO_FREQ, dual input. `est` feeds the estimation branch (features, graph
  * window, heads); `app` feeds the application branch (the noisy ring that the
  * mask, deep filter and attenuation limit act on). Same frame clock and scale;
  * est == app equals dfn2_prepost_pre_process_freq(). Returns 0 on the first
- * DFN2_MASK_LOOKAHEAD frames, 1 after (with N frames per call, on the same hops
+ * mask_lookahead frames, 1 after (with N frames per call, on the same hops
  * as pre_process), or -1 on NULL args, in DFN2_IO_TIME, or with a frame open.
  * The entry may change from hop to hop; each frame keeps the spectrum its own
  * hop supplied. */
-int dfn2_prepost_pre_process_freq_dual(DFN2Prepost *p,
-                                       const float est_re[DFN2_N_BINS],
-                                       const float est_im[DFN2_N_BINS],
-                                       const float app_re[DFN2_N_BINS],
-                                       const float app_im[DFN2_N_BINS]);
+int dfn2_prepost_pre_process_freq_dual(DFN2Prepost *p, const float *est_re,
+                                       const float *est_im,
+                                       const float *app_re,
+                                       const float *app_im);
 
 /* Publish the current frame's accelerator boundary. The three heads are
  * NaN-prefilled so an unwritten head is caught by frame_commit; the recurrent
@@ -312,17 +328,16 @@ int dfn2_prepost_frame_commit(DFN2Prepost *p);
  * Used after a failed accelerator run. Returns 0, or -1 if no frame is open. */
 int dfn2_prepost_frame_skip(DFN2Prepost *p);
 
-/* DFN2_IO_TIME. Emit this hop's output: DFN2_HOP_LEN samples, zero-filled during
- * the first DFN2_PREPOST_LATENCY_FRAMES warm-up hops; `*written` (may be NULL)
- * reports 0 or DFN2_HOP_LEN. Returns 0, or -1. */
-int dfn2_prepost_post_process(DFN2Prepost *p, float out_hop[DFN2_HOP_LEN],
-                              int *written);
+/* DFN2_IO_TIME. Emit this hop's output: grid.hop samples, zero-filled during
+ * the first dfn2_prepost_latency_frames() warm-up hops; `*written` (may be NULL)
+ * reports 0 or grid.hop. Returns 0, or -1. */
+int dfn2_prepost_post_process(DFN2Prepost *p, float *out_hop, int *written);
 
-/* DFN2_IO_FREQ. The enhanced spectrum of the frame just emitted, at the input's
- * normalized=True scale. Zeros during the DFN2_PREPOST_LATENCY_FRAMES warm-up
+/* DFN2_IO_FREQ. The enhanced spectrum (n_bins bins) of the frame just emitted, at the
+ * input's normalized=True scale. Zeros during the dfn2_prepost_latency_frames() warm-up
  * frames, where `*valid` (may be NULL) reports 0. Returns 0, or -1. */
-int dfn2_prepost_post_process_freq(DFN2Prepost *p, float re[DFN2_N_BINS],
-                                   float im[DFN2_N_BINS], int *valid);
+int dfn2_prepost_post_process_freq(DFN2Prepost *p, float *re, float *im,
+                                   int *valid);
 
 /* Source frame (counted from 0) of the last emitted output: returns 0 and writes
  * *frame once an output has been emitted since reset; -1 on NULL or before the
@@ -347,8 +362,9 @@ typedef struct DFN2Model {
  * result or a refused commit takes the frame with frame_skip(), so the clocks
  * advance exactly once. Returns 1 when the heads were committed, 0 when skipped,
  * -1 on a contract error (NULL model or instance, no infer callback, invalid
- * io_descriptor -- NULL, or another graph, lookahead pair or frame count
- * (input_frames) -- or no frame open). */
+ * io_descriptor -- NULL, or another graph, grid, lookahead pair or frame count
+ * (input_frames) -- or no frame open). The descriptor is checked against the
+ * instance's grid. */
 int dfn2_model_run_frame(const DFN2Model *model, DFN2Prepost *p);
 
 #ifdef __cplusplus

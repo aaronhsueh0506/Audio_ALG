@@ -149,7 +149,7 @@ SE/                                (同層四個 repo)
       │     │                         （mcab_sample_flow／_beam／_driver）＋ 範例 mcab_raw、mcab_static、
       │     │                         mcab_external_static；RES（libaec AecRes）／NR／CNG／合成由各 main 串接
       │     │                         （header-only 的 mcab_sample_post.h 收 RES 輸入、NR 增益與 CNG 常數）
-      │     ├── dfn/                  dfn_res_stage、dfn_rate_bridge、dfn_hop 等 DFN2 共用碼（lookahead pair 以 make 變數選，預設 1/1）
+      │     ├── dfn/                  dfn_res_stage、dfn_rate_bridge、dfn_hop 等 DFN2 共用碼（grid 與 pair 在 config 的 DFN2Grid；make 變數只選測試的 pair，預設 1/1）
       │     │     ├── mono_aec_dfn_res/     mono AEC（RES 在 AEC 內）+ DFN2
       │     │     └── 4ch_aec_bf_dfn_res/   mcab + main 自建的 libaec AecRes + DFN2
       │     └── ulcnet/               ulcnet_nn_stage（Align-ULCNet NN stage 範例）
@@ -282,7 +282,7 @@ Align-ULCNet NN post stage（不重建、不再分析）；新增演算法延遲
 <tr><td><a href="pipeline_dfn_mono.html">pipeline_dfn_mono</a></td>
 <td><code>pipelines/dfn/mono_aec_dfn_res/main.c</code>：<code>Aec</code> ＋ main 自寫的 P 形成（只取 AEC 自己的 RES 增益，不建 NR，取自 <code>aec_get_res_context()</code>）＋ <code>dfn/dfn_hop.h</code>，
 以 DeepFilterNet2 取代 MMSE-LSA——估計用 pre-RES 頻譜 E、套用在 post-RES 頻譜 P。host 跑產品自己的取樣率
-（8/16/48 k，預設 16 k），只有 DFN2 stage 在 48 k，由 <code>dfn/dfn_rate_bridge.c</code> 來回；演算法延遲（lookahead 1/1）
+（8/16/48 k，預設 16 k），只有 DFN2 stage 在 48 k（出貨模型），由 <code>dfn/dfn_rate_bridge.c</code> 來回；演算法延遲（lookahead 1/1）
 16 k/256 為 800 samples = 50 ms、48 k 為 3 hop = 32 ms。</td></tr>
 <tr><td><a href="pipeline_dfn_4ch.html">pipeline_dfn_4ch</a></td>
 <td><code>pipelines/dfn/4ch_aec_bf_dfn_res/main.c</code>：同一個 DFN2 stage 接在四聲道 mcab
@@ -302,13 +302,13 @@ Align-ULCNet NN post stage（不重建、不再分析）；新增演算法延遲
 <table>
 <tr><th>頁面</th><th>一行描述</th></tr>
 <tr><td><a href="ainr_dfn2.html">ainr_dfn2</a></td>
-<td>DeepFilterNet2：出貨 48k、1024/512（非上游 960/480），其他 grid 於建置時選；stateless ONNX exporter + C 前後處理
+<td>DeepFilterNet2：出貨 48k、1024/512（非上游 960/480），grid 於執行期給定；stateless ONNX exporter + C 前後處理
 <code>dfn2_process.c</code>（STFT/ERB+complex 特徵/EMA 正規化/compose/ISTFT），
 graph 只含 heads。</td></tr>
 <tr><td><a href="ainr_dfn2_detail.html">ainr_dfn2_detail</a></td>
 <td>DFN2 prepost 類別的 pool 大小與所有權、<code>DFN2Model</code> callback 與 descriptor、<code>libainr_prepost.a</code> 建置、skip identity 的 partition-of-unity 檢查。</td></tr>
 <tr><td><a href="ainr_dfn2_grids.html">ainr_dfn2_grids</a></td>
-<td>DFN2 的 grid 於建置時選擇：16／32／48 kHz preset、外部定義 grid、連結符號與 pool hash、各 grid 的 pool 大小。</td></tr>
+<td>DFN2 的 grid 由應用端於執行期給定：合法性規則、編譯期容量、連結符號與 pool hash、各 grid 的 pool 大小，以及各 sample 怎麼選 grid 與 ERB 檔名。</td></tr>
 <tr><td><a href="ainr_dfn3.html">ainr_dfn3</a></td>
 <td>48 kHz DFN3 raw-low DF / masked-high split；兩個 heads、layout 9、TIME/FREQ 靜態 pool API，lookahead pair 預設 1/1（15 組合法 pair，建置期選定），1/1 的 identity 音訊位移 2 hops。</td></tr>
 <tr><td><a href="ainr_gtcrn.html">ainr_gtcrn</a></td>

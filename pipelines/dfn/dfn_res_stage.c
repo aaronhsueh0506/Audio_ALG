@@ -1,5 +1,5 @@
 /* Post-RES DeepFilterNet2 stage; see dfn_res_stage.h for the signal/timing
- * contract. Both inputs are spectra on DFN2's grid (dfn2_grid.h); the
+ * contract. Both inputs are spectra on the DFN2 grid of the config; the
  * hosting pipeline owns synthesis. */
 
 #include <math.h>
@@ -76,27 +76,28 @@ static uint32_t backend_id(void) {
     return 0u;
 }
 
-static int model_valid(const DFN2Model *model) {
+static int model_valid(const DFN2Model *model, const DFN2Grid *grid) {
     if (!model) return 0;
     if (!model->infer)
         return model->reset == NULL && model->io_descriptor == NULL;
     return model->io_descriptor != NULL &&
-           dfn2_model_io_descriptor_validate(model->io_descriptor) == 0;
+           dfn2_model_io_descriptor_validate(grid, model->io_descriptor) == 0;
 }
 
 /* The fail-open identity is exact only when the unit band mask expands to exactly
  * 1.0f in every bin; walk the band-major matrix in the DFN2 expansion order
- * (bands outer, bins inner) so the sums match the model path. */
-static int erb_inv_is_partition_of_unity(const float *erb_inv) {
-    float bin_gain[DFN2_N_BINS];
+ * (bands outer, bins inner) so the sums match the model path. The grid is valid, so its
+ * n_bins is within the library's capacity. */
+static int erb_inv_is_partition_of_unity(const float *erb_inv, const DFN2Grid *grid) {
+    float bin_gain[DFN2_MAX_N_BINS];
     int b, k;
     memset(bin_gain, 0, sizeof(bin_gain));
-    for (b = 0; b < DFN2_N_ERB; ++b) {
-        const float *row = erb_inv + (size_t)b * DFN2_N_BINS;
-        for (k = 0; k < DFN2_N_BINS; ++k)
+    for (b = 0; b < grid->n_erb; ++b) {
+        const float *row = erb_inv + (size_t)b * (size_t)grid->n_bins;
+        for (k = 0; k < grid->n_bins; ++k)
             bin_gain[k] += row[k] * 1.0f;
     }
-    for (k = 0; k < DFN2_N_BINS; ++k)
+    for (k = 0; k < grid->n_bins; ++k)
         if (bin_gain[k] != 1.0f) return 0;
     return 1;
 }
@@ -110,18 +111,18 @@ typedef struct Resolved {
 } Resolved;
 
 static int resolve(const DfnResStageConfig *cfg, Resolved *r) {
-    size_t one = (size_t)DFN2_N_BINS * sizeof(float);
+    size_t one;
     size_t total;
-    /* This object's lookahead pair must be dfn2_process.o's: link-time check. */
-    DFN2_REQUIRE_LOOKAHEAD_PAIR_LINK();
+    /* This object's DFN2 capacities must be the library objects': link-time check. */
+    DFN2_REQUIRE_VARIANT_LINK();
     if (!cfg || !r) return -1;
-    if (cfg->sample_rate != DFN2_SR) return -1;
-    if (cfg->fft_size != 0 && cfg->fft_size != DFN2_N_FFT) return -1;
+    if (dfn2_grid_validate(&cfg->grid) != DFN2_GRID_OK) return -1;
+    one = (size_t)cfg->grid.n_bins * sizeof(float);
     if (!isfinite(cfg->atten_lim_db) || !cfg->erb_fwd || !cfg->erb_inv)
         return -1;
-    if (!erb_inv_is_partition_of_unity(cfg->erb_inv)) return -1;
-    if (!model_valid(&cfg->model) || backend_id() == 0u) return -1;
-    if (dfn2_prepost_config_defaults(&r->pcfg, DFN2_IO_FREQ) != 0) return -1;
+    if (!erb_inv_is_partition_of_unity(cfg->erb_inv, &cfg->grid)) return -1;
+    if (!model_valid(&cfg->model, &cfg->grid) || backend_id() == 0u) return -1;
+    if (dfn2_prepost_config_defaults(&r->pcfg, DFN2_IO_FREQ, &cfg->grid) != 0) return -1;
     r->pcfg.erb_fwd = cfg->erb_fwd;
     r->pcfg.erb_inv = cfg->erb_inv;
     r->pcfg.atten_lim_db = cfg->atten_lim_db;
@@ -153,11 +154,10 @@ static void fill_descriptor(const Resolved *r, DfnResStageMemReq *out) {
     out->bytes = (uint64_t)r->bytes;
 }
 
-DfnResStageConfig dfn_res_stage_default_config(int sample_rate) {
+DfnResStageConfig dfn_res_stage_default_config(const DFN2Grid *grid) {
     DfnResStageConfig cfg;
     memset(&cfg, 0, sizeof(cfg));
-    cfg.sample_rate = sample_rate;
-    cfg.fft_size = DFN2_N_FFT;
+    if (grid) cfg.grid = *grid;
     return cfg;
 }
 
@@ -188,8 +188,11 @@ DfnResStage *dfn_res_stage_init_ex(void *mem, size_t bytes,
     StageCursor cur;
     DfnResStage *s;
     void *region;
-    size_t one = (size_t)DFN2_N_BINS * sizeof(float);
+    size_t one;
+    int n_bins;
     if (!mem || resolve(cfg, &r) != 0) return NULL;
+    n_bins = cfg->grid.n_bins;
+    one = (size_t)n_bins * sizeof(float);
     fill_descriptor(&r, &req);
     if (bytes < r.bytes || (uintptr_t)mem % (uintptr_t)STAGE_ALIGN != 0u)
         return NULL;
@@ -210,11 +213,11 @@ DfnResStage *dfn_res_stage_init_ex(void *mem, size_t bytes,
     /* One aligned slab for the six spectra; only the slab base is part of the pool ABI. */
     if (carve(&cur, one * 6u, &region) != 0) return NULL;
     s->est_re = (float *)region;
-    s->est_im = s->est_re + DFN2_N_BINS;
-    s->app_re = s->est_im + DFN2_N_BINS;
-    s->app_im = s->app_re + DFN2_N_BINS;
-    s->out_re = s->app_im + DFN2_N_BINS;
-    s->out_im = s->out_re + DFN2_N_BINS;
+    s->est_im = s->est_re + n_bins;
+    s->app_re = s->est_im + n_bins;
+    s->app_im = s->app_re + n_bins;
+    s->out_re = s->app_im + n_bins;
+    s->out_im = s->out_re + n_bins;
     return s;
 }
 
@@ -260,6 +263,10 @@ int dfn_res_stage_set_atten_lim(DfnResStage *s, float atten_lim_db) {
     return dfn2_prepost_set_atten_lim(s->prepost, atten_lim_db);
 }
 
+const DFN2Grid *dfn_res_stage_grid(const DfnResStage *s) {
+    return s ? dfn2_prepost_grid(s->prepost) : NULL;
+}
+
 int dfn_res_stage_output_frame_index(const DfnResStage *s, long long *frame) {
     return s ? dfn2_prepost_output_frame_index(s->prepost, frame) : -1;
 }
@@ -272,10 +279,10 @@ void dfn_res_stage_get_counters(const DfnResStage *s, long long *frames_in,
 }
 
 /* Scans both spectra for finite values before they reach the recurrent state. */
-static int inputs_valid(const Complex *estimate, const Complex *apply) {
+static int inputs_valid(const Complex *estimate, const Complex *apply, int n_bins) {
     if (!estimate || !apply) return 0;
-    return skn_all_finite_cf32(estimate, DFN2_N_BINS) &&
-           skn_all_finite_cf32(apply, DFN2_N_BINS);
+    return skn_all_finite_cf32(estimate, n_bins) &&
+           skn_all_finite_cf32(apply, n_bins);
 }
 
 int dfn_res_stage_begin(DfnResStage *s,
@@ -283,13 +290,15 @@ int dfn_res_stage_begin(DfnResStage *s,
                         const Complex *apply_spec,
                         DfnResStageJob *job) {
     int need_heads;
-    if (!s || !job || s->phase != 0 || !inputs_valid(estimate_spec, apply_spec))
-        return -1;
+    const DFN2Grid *grid;
+    if (!s || !job || s->phase != 0) return -1;
+    grid = dfn2_prepost_grid(s->prepost);
+    if (!grid || !inputs_valid(estimate_spec, apply_spec, grid->n_bins)) return -1;
 
     skn_deinterleave_scale_cf32(estimate_spec, s->est_re, s->est_im,
-                                DFN2_N_BINS, DFN_RES_STAGE_IN_SCALE);
+                                grid->n_bins, grid->stft_scale);
     skn_deinterleave_scale_cf32(apply_spec, s->app_re, s->app_im,
-                                DFN2_N_BINS, DFN_RES_STAGE_IN_SCALE);
+                                grid->n_bins, grid->stft_scale);
 
     need_heads = dfn2_prepost_pre_process_freq_dual(
         s->prepost, s->est_re, s->est_im, s->app_re, s->app_im);
@@ -303,7 +312,9 @@ int dfn_res_stage_begin(DfnResStage *s,
 
 int dfn_res_stage_end(DfnResStage *s, int model_rc, Complex *out_spec) {
     int valid = 0;
+    const DFN2Grid *grid;
     if (!s || !out_spec || s->phase == 0) return -1;
+    grid = dfn2_prepost_grid(s->prepost);
     if (s->phase == 2) {
         /* A failed run or an unwritten/non-finite output takes the frame as the identity;
          * the clocks advance once. */
@@ -323,11 +334,11 @@ int dfn_res_stage_end(DfnResStage *s, int model_rc, Complex *out_spec) {
         return -1;
     ++s->frames_in;
     if (!valid) {
-        memset(out_spec, 0, (size_t)DFN2_N_BINS * sizeof(Complex));
+        memset(out_spec, 0, (size_t)grid->n_bins * sizeof(Complex));
         return 0;
     }
-    skn_interleave_scale_cf32(s->out_re, s->out_im, out_spec, DFN2_N_BINS,
-                              DFN_RES_STAGE_OUT_SCALE);
+    skn_interleave_scale_cf32(s->out_re, s->out_im, out_spec, grid->n_bins,
+                              grid->stft_unscale);
     return 1;
 }
 

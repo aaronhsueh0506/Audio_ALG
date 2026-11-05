@@ -51,10 +51,12 @@ make example-adapter
 make NO_STDIO=1 libaudio_pipeline_dfn.a
 make audit-no-stdio
 
-# A DeepFilterNet2 lookahead pair other than the default 1/1 (see "DFN lookahead pair" below),
-# and the DFN C tests rebuilt and run per pair:
+# A DeepFilterNet2 lookahead pair other than the default 1/1 selects what the test programs run (and,
+# for 2/4, the library's state-ring capacity; the pipeline units hold no pair, see "DFN lookahead pair"
+# below). The DFN C tests rebuilt and run per pair, and at the 16 and 32 kHz test grids:
 make DFN2_MASK_LOOKAHEAD=2 DFN2_DF_LOOKAHEAD=4 libaudio_pipeline_dfn.a mono_aec_dfn_res
 make test-pairs DFN_TEST_PAIRS="0/0 2/4"
+make test-dfn-grids
 
 # Python twin (module paths are relative to the Audio_ALG root):
 (cd .. && python3 -m pipelines.mono_aec_nr_res.pipeline --mic mic.wav --ref ref.wav --output out.wav --nr-preset balanced)
@@ -75,18 +77,31 @@ The Python twins sit beside their applications: `mono_aec_nr_res/pipeline.py`, `
 differences S-02 (AEC live observer guard) and S-13 (NR make-up prior) exist only when those default-off features are enabled,
 so do not read the twins as identical for every setting (`docs/c_python_function_map.md`, `make pyc-parity`; the two differences are defined in `lib/aec/c_impl/test/pyc_parity/pyc_parity.py` and `lib/nr/docs/c_python_function_map.md`).
 
-**DFN lookahead pair.** The DeepFilterNet2/3 model lookahead is a build-time pair: mask `M` in 0..2 and deep-filter
+**DFN lookahead pair.** The DeepFilterNet2/3 model lookahead is a pair: mask `M` in 0..2 and deep-filter
 `D` in 0..4 (15 legal pairs, no ordering rule between them; `AINR/README.md`, "Lookahead pairs"). The exported graph does
 not depend on the pair, but a checkpoint is tied to the pair it was trained for, and only the shipped 1/1 has one: the
 audio quality of every other pair is unmeasured. `Makefile` takes `DFN2_MASK_LOOKAHEAD` and `DFN2_DF_LOOKAHEAD` (and
-`DFN3_MASK_LOOKAHEAD`, `DFN3_DF_LOOKAHEAD`), default 1/1, each a single decimal in range. A pair other than 1/1 is
-forwarded as `-DDFN2_MASK_LOOKAHEAD=<M> -DDFN2_DF_LOOKAHEAD=<D>` to every unit and is part of the build signature: it gets
-its own `bin/` and `obj/` directories, and units built for different pairs fail to link (pair symbol
-`dfn2_lookahead_mask<M>_df<D>`). `4ch_aec_bf_nr_res/Makefile` takes the same two DFN2 variables. The DFN2 stage delays its
+`DFN3_MASK_LOOKAHEAD`, `DFN3_DF_LOOKAHEAD`), default 1/1, each a single decimal in range, and `DFN2_TEST_GRID_KHZ` (16, 32 or 48,
+default 48). For DFN2 the pipeline units (`dfn_res_stage.c`, `dfn_rate_bridge.c`, the example mains) hold no grid and no pair: the
+application builds a `DFN2Grid` with `dfn2_grid_make()` and puts it in `DfnResStageConfig.grid`, and the example mains read it from
+`--ai-sample-rate` / `--ai-fft-size`. So the DFN2 variables select only what the **test programs** run:
+`-DDFN2_GRID_KHZ=<n>` (when `DFN2_TEST_GRID_KHZ` is not 48) and `-DDFN2_MASK_LOOKAHEAD=<M> -DDFN2_DF_LOOKAHEAD=<D>` (when the pair is
+not 1/1) reach the test units alone (`DFN_TEST_CFLAGS`, through `dfn/tests/dfn_test_grid.h`), and both are part of the build
+signature: a different test grid or pair gets its own `bin/` and `obj/` directories. A model or pool of another pair is refused at
+run time (descriptor, pool hash) and there is no link-time pair symbol. The one thing a pair still asks of every unit is the
+library's state-ring capacity: a pair whose ring `max(5, M + D + 1)` is deeper than the default 5 (1/4 and 2/3: 6, 2/4: 7) also gets
+`-DDFN2_MAX_DF_RING=<ring>` on every unit, which the Makefile adds. The DFN3 sources compiled for the target-ABI test still take the
+pair as macros on every unit (units built for different DFN3 pairs fail to link).
+`4ch_aec_bf_nr_res/Makefile` takes the same two DFN2 pair variables (for `test_4ch_dfn` alone, plus the ring capacity). The DFN2 stage delays its
 output by `M + D` frames of 48 kHz; the rate bridge adds `dfn_rate_bridge_added_delay_samples()` native samples (the floor; `dfn_rate_bridge_added_delay_exact()` returns the exact value as a multiple of 1/3 sample), which grow
 with `M + D` (shipped pair: 672, 629 and 330 samples at 16 kHz hop 128, 16 kHz hop 256 and 8 kHz hop 128). `make test-pairs`
-rebuilds and runs the DFN C tests and the mono DFN2 program for each pair of `DFN_TEST_PAIRS` (default `0/0 0/1 2/0 2/4`); the
-other pairs are not exercised by it.
+rebuilds and runs the DFN C tests for each pair of `DFN_TEST_PAIRS` (default `0/0 0/1 2/0 2/4`); the mono DFN2 example is rebuilt and run with them too, but it takes no pair (see the Makefile comment), so that leg only shows it links against the archive of the pair's ring capacity. Each
+test prints the pair it was built with and (the stage test, the mono composition) the stage latency it measured;
+`dfn/tests/check_pair_report.sh` compares them with the pair asked for and with `(M + D + 1) * hop`, so a pair flag that never
+reached a test build is red, and the archive is checked for the `dfn2_variant_full_n*_e*_d*_r<ring>` symbol of the ring the pair
+needs. The other pairs are not exercised by it. `make test-dfn-grids` builds the stage, bridge and hop tests for the 16 and 32 kHz
+test grids (with the test header's pair 1/1, not the 0/0 of those rows in the example table: it runs the same stage code at another
+grid, it does not test a table row).
 
 `make` builds the mono executables and the DFN2 stage archive. There is no mono
 library archive: the mono examples link the producer libraries (`libaec.a`, `libanr.a`,

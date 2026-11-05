@@ -43,7 +43,7 @@ th{background:#eef2f8}
 <table>
 <tr><th>階段</th><th>mono(<code>mono_aec_dfn_res</code>)</th><th>4ch(<code>4ch_aec_bf_dfn_res</code>)</th></tr>
 <tr><td>設定</td><td><code>aec_resolve_signal_grid(sr, aec_default_fft_size(sr), &amp;grid)</code>、<code>aec_config_from_level(&amp;aec_cfg, AEC_LEVEL_BALANCED, sr)</code>,再設 <code>delay_*</code>、<code>enable_res = 0</code>、<code>return_res_context = 1</code>(<code>main.c</code> 的 <code>derive_lane()</code>;8 kHz 也可)</td><td><code>mcab_default_config(sr)</code>,改 <code>delay_mode</code>／<code>delay_num_filters</code>／<code>fixed_delay_samples</code>(預設 <code>enable_post=1</code>;<code>McabConfig</code> 只含 flow 參數);<code>mcab_sample_beam_default_params()</code>(陣列幾何、DOA、BF、fallback VAD)。RES:<code>aec_config_from_level(&amp;res_cfg, AEC_LEVEL_BALANCED, sr)</code>,<code>res_cfg.fft_size</code> = flow 格點</td></tr>
-<tr><td>DFN2 設定</td><td><code>dfn2_model_io_descriptor_default()</code>;<code>dfn_rate_bridge_default_config(sr)</code>(8／16 kHz)或 <code>dfn_res_stage_default_config(DFN2_SR)</code>(48 kHz);填 <code>erb_fwd</code>／<code>erb_inv</code>／<code>atten_lim_db</code>／<code>model</code></td><td>同左(經 <code>dfn_hop_pool_plan(&amp;plan, sr, cfg.fft_size)</code>,<code>bridge_cfg.fft_size = cfg.fft_size</code>)</td></tr>
+<tr><td>DFN2 設定</td><td><code>dfn2_grid_make(&amp;mg, 48000, 1024, 32, 96, 1, 1)</code>(模型的 grid,值來自應用端的表;範例 main 由 <code>--ai-sample-rate</code>／<code>--ai-fft-size</code> 選);<code>dfn2_model_io_descriptor_default(&amp;mg, &amp;desc)</code>;<code>dfn_rate_bridge_default_config(sr, &amp;mg)</code>(8／16 kHz,只收 48 kHz／1024 的模型)或 <code>dfn_res_stage_default_config(&amp;mg)</code>(host 在模型自己的取樣率);填 <code>erb_fwd</code>／<code>erb_inv</code>／<code>atten_lim_db</code>／<code>model</code></td><td>同左(經 <code>dfn_hop_pool_plan(&amp;plan, sr, cfg.fft_size)</code>,<code>bridge_cfg.fft_size = cfg.fft_size</code>)</td></tr>
 <tr><td>查大小</td><td><code>aec_get_mem_size()</code>;<code>dfn_rate_bridge_get_mem_requirements()</code>(48 kHz:<code>dfn_res_stage_get_mem_requirements()</code> + <code>ac_istft_get_mem_size()</code>)</td><td><code>mcab_get_mem_requirements()</code>、<code>mcab_get_mem_breakdown()</code>(取 <code>n_freqs</code>／<code>fft_size</code>)、<code>mcab_sample_flow_get_mem_size()</code>、<code>mcab_sample_beam_get_mem_size()</code>、<code>aec_res_get_mem_size()</code>;其餘同左</td></tr>
 <tr><td>init</td><td><code>aec_init()</code>;<code>dfn_rate_bridge_init[_ex]()</code> 或 <code>dfn_res_stage_init[_ex]()</code> + <code>ac_istft_init()</code>;<code>dfn_hop_init_bridge()</code>／<code>dfn_hop_init_stage()</code></td><td><code>mcab_sample_flow_init()</code>(四條 lane、estimator、<code>mcab_init_ex()</code>)、<code>mcab_sample_beam_init(…, flow)</code>、<code>aec_res_init()</code>;其餘同左</td></tr>
 <tr><td>每 hop</td><td><code>aec_process_context()</code>、<code>aec_get_res_context()</code>、P 形成、<code>dfn_hop_process()</code>(或 begin／nn／end)</td><td><code>mcab_sample_beam_process[_with_activity]()</code>、<code>mcab_sample_beam_fuse()</code>(<code>g_res_ctx</code> 為 NULL)、<code>mcab_sample_res_input()</code> 加 <code>aec_res_process(res, &amp;in)</code>、P 形成、<code>dfn_hop_*</code></td></tr>
@@ -51,6 +51,7 @@ th{background:#eef2f8}
 <tr><td>reset</td><td><code>aec_reset()</code> + <code>rng = AEC_CNG_SEED</code> + <code>dfn_hop_reset()</code></td><td><code>mcab_sample_beam_reset()</code>(連帶 reset flow、lane 與 estimator)+ <code>aec_res_reset()</code> + <code>rng = MCAB_SAMPLE_CNG_RNG_SEED</code> + <code>dfn_hop_reset()</code></td></tr>
 <tr><td>destroy</td><td><code>dfn_rate_bridge_destroy()</code>／<code>dfn_res_stage_destroy()</code>、<code>aec_destroy()</code>;caller 自己釋放 pool</td><td><code>dfn_rate_bridge_destroy()</code>／<code>dfn_res_stage_destroy()</code>、<code>mcab_sample_beam_destroy()</code>、<code>mcab_sample_flow_destroy()</code>(先 <code>mcab_destroy()</code> 再 lane;<code>AecRes</code> 沒有 destroy);caller 自己釋放 pool</td></tr>
 </table>
+<p class="note"><b>模型 grid 的選擇</b>:函式庫與 pipeline 單元不含 grid。範例 main(<code>dfn_example_args.h</code>)有三列的表(16000/256 → n_erb 24、df_bins 96、lookahead 0/0;32000/512 → 28、96、0/0,暫定;48000/1024 → 32、96、1/1),以 <code>--ai-sample-rate</code>／<code>--ai-fft-size</code>(預設 48000／1024)選一列、用 <code>dfn2_grid_make()</code> 建出後放進 <code>DfnResStageConfig.grid</code>;<code>--sample-rate</code> 仍是 host 的取樣率。host 取樣率等於模型取樣率時 stage 直接跑,否則走 bridge(只收 48 kHz／1024 的模型,其他組合的 pool 查詢被拒,exit 1);表外的組合 exit 2。</p>
 
 <h2>2. mono 範例(16 kHz host,經 rate bridge)</h2>
 <p>下面是一個完整函式:格點、pool 切分、init、每 hop、hop 之間的 setter、destroy。<code>board_*</code>、<code>next_hop()</code>、<code>emit_hop()</code> 由板端提供。P 的三塊暫存(<code>unity</code>、<code>gain</code> 各 [n_freqs] float,<code>post</code> [n_freqs] <code>Complex</code>)接在 <code>Aec</code> 之後、bridge 之前。</p>
@@ -68,8 +69,8 @@ th{background:#eef2f8}
 /* 板端提供:模型 callback(回 0 = 每個輸出都寫滿)、ERB 矩陣、取 hop 與輸出 */
 extern int  board_run_dfn2_graph(void *user, const DFN2PrepostInputs *in, DFN2PrepostOutputs *out);
 extern void board_reset_runtime(void *user);
-extern const float g_erb_fwd[DFN2_N_BINS * DFN2_N_ERB];   /* bin-major [513][32] */
-extern const float g_erb_inv[DFN2_N_ERB * DFN2_N_BINS];   /* band-major [32][513],partition of unity */
+extern const float g_erb_fwd[];   /* bin-major [n_bins][n_erb],出貨 grid 為 [513][32] */
+extern const float g_erb_inv[];   /* band-major [n_erb][n_bins],partition of unity,[32][513] */
 extern int  next_hop(float *mic, float *ref);             /* 1 = 還有資料 */
 extern void emit_hop(const float *out, int n);
 
@@ -84,10 +85,12 @@ int mono_dfn_run(void) {
     aec_cfg.fixed_delay_samples = -1;  aec_cfg.enable_delay_est = 1;
     aec_cfg.enable_res = 0;  aec_cfg.return_res_context = 1;
 
-    /* 2. DFN2:16 kHz host 走 rate bridge(48 kHz host 改用 stage,見下) */
+    /* 2. DFN2:模型的 grid 由應用端建(值是模型的性質);16 kHz host 走 rate bridge(48 kHz host 改用 stage,見下) */
+    DFN2Grid mg;
+    if (dfn2_grid_make(&amp;mg, 48000, 1024, 32, 96, 1, 1) != DFN2_GRID_OK) return -1;   /* 出貨的 48 kHz／1024／1/1 */
     DFN2ModelIoDescriptor desc;
-    dfn2_model_io_descriptor_default(&amp;desc);       /* 板端應改從匯出的模型 metadata 填 */
-    DfnRateBridgeConfig bc = dfn_rate_bridge_default_config(sample_rate);
+    dfn2_model_io_descriptor_default(&amp;mg, &amp;desc);   /* 板端應改從匯出的模型 metadata 填 */
+    DfnRateBridgeConfig bc = dfn_rate_bridge_default_config(sample_rate, &amp;mg);   /* bridge 只收 48000／1024 的 mg */
     bc.stage.erb_fwd = g_erb_fwd;  bc.stage.erb_inv = g_erb_inv;
     bc.stage.atten_lim_db = 0.0f;                  /* 0 = 不限制 */
     bc.stage.model.infer = board_run_dfn2_graph;
@@ -150,20 +153,20 @@ int mono_dfn_run(void) {
 
 /* 48 kHz host:沒有 bridge,stage 直接吃 host 頻譜,合成用呼叫端的 AcIstft */
 int init_48k(DfnHop *hop, const DfnResStageConfig *base, void **pool_out) {
-    DfnResStageConfig sc = *base;                                /* default_config(DFN2_SR) + 矩陣 + model */
+    DfnResStageConfig sc = *base;                                /* default_config(&amp;mg) + 矩陣 + model;grid 在 sc.grid */
     DfnResStageMemReq sreq;
     AcStftConfig scfg;
     if (dfn_res_stage_get_mem_requirements(&amp;sc, &amp;sreq) != 0) return -1;
-    ac_stft_config_default(&amp;scfg, DFN2_N_FFT);
+    ac_stft_config_default(&amp;scfg, sc.grid.n_fft);
     size_t ib = ac_istft_get_mem_size(&amp;scfg);
-    size_t total = ALIGN16((size_t)sreq.bytes) + ALIGN16(ib) + ALIGN16(DFN2_N_BINS * sizeof(Complex));
+    size_t total = ALIGN16((size_t)sreq.bytes) + ALIGN16(ib) + ALIGN16((size_t)sc.grid.n_bins * sizeof(Complex));
     unsigned char *mem = NULL;
     if (ib == 0 || posix_memalign((void **)&amp;mem, sreq.alignment, total) != 0) return -1;
     DfnResStage *stage = dfn_res_stage_init(mem, (size_t)sreq.bytes, &amp;sc);
     AcIstft *istft = ac_istft_init(mem + ALIGN16((size_t)sreq.bytes), ib, &amp;scfg);
     Complex *stage_out = (Complex *)(mem + ALIGN16((size_t)sreq.bytes) + ALIGN16(ib));
     if (!stage || !istft) { free(mem); return -1; }
-    memset(stage_out, 0, DFN2_N_BINS * sizeof(Complex));
+    memset(stage_out, 0, (size_t)sc.grid.n_bins * sizeof(Complex));
     dfn_hop_init_stage(hop, stage, istft, stage_out);
     hop-&gt;check_finite = 1;                                       /* 可選:拒絕非有限的 stage 輸出 */
     *pool_out = mem;
@@ -205,8 +208,8 @@ int phased_hop(DfnHop *hop, const AecOutputBase *b, const Complex *post, float *
 
 extern int  board_run_dfn2_graph(void *user, const DFN2PrepostInputs *in, DFN2PrepostOutputs *out);
 extern void board_reset_runtime(void *user);
-extern const float g_erb_fwd[DFN2_N_BINS * DFN2_N_ERB];
-extern const float g_erb_inv[DFN2_N_ERB * DFN2_N_BINS];
+extern const float g_erb_fwd[];    /* bin-major [n_bins][n_erb] */
+extern const float g_erb_inv[];    /* band-major [n_erb][n_bins] */
 extern int  next_hop4(float *mics_interleaved, float *ref, int *vad);   /* mics: [hop][4] */
 extern void emit_hop(const float *out, int n);
 
@@ -217,11 +220,13 @@ int four_dfn_run(void) {
     cfg.delay_mode = AEC_DELAY_MATCHED;  cfg.delay_num_filters = 5;  cfg.fixed_delay_samples = -1;
 
     /* 2. DFN2:stage 設定先填好,dfn_hop_pool_plan() 依取樣率選 bridge 或 stage + AcIstft */
+    DFN2Grid mg;
     DFN2ModelIoDescriptor desc;
     DfnHopPoolPlan dfn;
-    dfn2_model_io_descriptor_default(&amp;desc);
+    if (dfn2_grid_make(&amp;mg, 48000, 1024, 32, 96, 1, 1) != DFN2_GRID_OK) return -1;   /* 出貨的 48 kHz／1024／1/1 */
+    dfn2_model_io_descriptor_default(&amp;mg, &amp;desc);
     memset(&amp;dfn, 0, sizeof(dfn));
-    dfn.stage_cfg = dfn_res_stage_default_config(DFN2_SR);
+    dfn.stage_cfg = dfn_res_stage_default_config(&amp;mg);
     dfn.stage_cfg.erb_fwd = g_erb_fwd;  dfn.stage_cfg.erb_inv = g_erb_inv;
     dfn.stage_cfg.model.infer = board_run_dfn2_graph;
     dfn.stage_cfg.model.reset = board_reset_runtime;
@@ -293,7 +298,7 @@ int four_dfn_run(void) {
     free(pool);
     return 0;
 }</pre>
-<p>48 kHz 核心(<code>sample_rate = 48000</code>):同一段程式不用改,<code>dfn_hop_pool_plan()</code> 在 host 為 48 kHz 時改選 stage 加 <code>AcIstft</code>(此時 <code>cfg.fft_size</code> 須為 0 或 1024)。要接自家 beamformer 時,把步驟 3 的 helper 去掉,每 hop 改為 <code>mcab_process_front()</code> → 自己的 SRP/BF(讀 <code>front.linear_spectra</code>)→ <code>mcab_fuse(flow, W, E, &amp;frame)</code>;lane 與 estimator 的建法見 <code>mcab.h</code> 開頭的 init 序列(<code>mcab_apply_lane_contract()</code> 只蓋 contract 欄位)。</p>
+<p>48 kHz 核心(<code>sample_rate = 48000</code>):同一段程式不用改,<code>dfn_hop_pool_plan()</code> 在 host 為 48 kHz 時改選 stage 加 <code>AcIstft</code>(此時 <code>cfg.fft_size</code> 須為 0 或模型 grid 的 <code>n_fft</code>,出貨 1024)。要接自家 beamformer 時,把步驟 3 的 helper 去掉,每 hop 改為 <code>mcab_process_front()</code> → 自己的 SRP/BF(讀 <code>front.linear_spectra</code>)→ <code>mcab_fuse(flow, W, E, &amp;frame)</code>;lane 與 estimator 的建法見 <code>mcab.h</code> 開頭的 init 序列(<code>mcab_apply_lane_contract()</code> 只蓋 contract 欄位)。</p>
 
 <h2>4. 回傳值與錯誤處理</h2>
 <table>

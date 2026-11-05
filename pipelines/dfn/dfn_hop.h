@@ -3,10 +3,10 @@
  *
  * The host forms E (the linear-AEC error) and P (E after the RES gain, plus comfort noise when
  * enabled; the DFN example mains show it) before the hop begins. DFN2 then runs on (E, P):
- *   48 kHz       the stage (dfn_res_stage.h) on the host grid; DfnHop synthesises its output
- *                through the caller's AcIstft
- *   other rates  dfn_rate_bridge.h runs the same stage on its 48 kHz grid and synthesises
- *                the host hop itself
+ *   host rate == the model grid's rate   the stage (dfn_res_stage.h) on the host grid; DfnHop
+ *                                        synthesises its output through the caller's AcIstft
+ *   other host rates                     dfn_rate_bridge.h runs the same stage on its 48 kHz grid
+ *                                        and synthesises the host hop itself
  *
  *     dfn_hop_begin(&h, E, P);
  *     while (dfn_hop_nn_begin(&h, &job) == 1)       // a model frame is open (0, 1 or 2 per hop)
@@ -15,14 +15,15 @@
  *
  * dfn_hop_process() does the same with the stage's configured model callback. The pointers
  * are not owned; the stage, bridge, synthesis and output spectrum come from the caller's
- * pool. The stage does not reset on an AEC delay change. It adds DFN_RES_STAGE_LOOKAHEAD_FRAMES
- * hops of delay at 48 kHz (2 for the shipped 1/1 pair) and dfn_rate_bridge_added_delay_samples()
- * otherwise; the first output hops are zero. An AEC post-chain reset event (aec_post_reset_serial()
- * moved) is followed by the caller before the hop: below 48 kHz dfn_rate_bridge_reset_synthesis(bridge)
- * (the host-grid synthesis is inside the bridge and runs at the top of dfn_hop_begin(): no delay line);
- * at 48 kHz the caller clears its own AcIstft DFN_RES_STAGE_LOOKAHEAD_FRAMES hops later (see
- * mono_aec_dfn_res/main.c). A negative return leaves recovery to the caller: reset the AEC front end,
- * the comfort-noise generator and DfnHop together. */
+ * pool. The stage does not reset on an AEC delay change. It adds dfn_res_stage_lookahead_frames()
+ * hops of delay on the model's own grid (2 for the shipped 1/1 pair at 48 kHz) and
+ * dfn_rate_bridge_added_delay_samples() through the bridge; the first output hops are zero. An
+ * AEC post-chain reset event (aec_post_reset_serial() moved) is followed by the caller before the
+ * hop: through the bridge dfn_rate_bridge_reset_synthesis(bridge) (the host-grid synthesis is
+ * inside the bridge and runs at the top of dfn_hop_begin(): no delay line); with the stage driven
+ * directly the caller clears its own AcIstft dfn_res_stage_lookahead_frames() hops later (see
+ * mono_aec_dfn_res/main.c). A negative return leaves recovery to the caller: reset the AEC front
+ * end, the comfort-noise generator and DfnHop together. */
 #ifndef PIPELINES_DFN_DFN_HOP_H
 #define PIPELINES_DFN_DFN_HOP_H
 
@@ -43,10 +44,12 @@ enum {
 };
 
 typedef struct DfnHop {
-    DfnResStage* stage;           /* 48 kHz: driven directly (bridge == NULL) */
+    DfnResStage* stage;           /* host on the model grid: driven directly (bridge == NULL) */
     DfnRateBridge* bridge;        /* other rates: the stage inside the bridge */
     AcIstft* istft;               /* stage path: synthesis of stage_out */
-    Complex* stage_out;           /* stage path: DFN2_N_BINS bins */
+    Complex* stage_out;           /* stage path: n_bins bins */
+    int n_bins;                   /* stage path: the stage grid's bins */
+    int hop_size;                 /* stage path: the stage grid's hop */
     int check_finite;             /* stage path: refuse a non-finite stage_out or hop at end */
 
     int phase;                    /* 0 idle, 1 hop begun, 2 model frame open */
@@ -55,16 +58,19 @@ typedef struct DfnHop {
     int stage_ended;              /* stage path: the stage frame is closed */
 } DfnHop;
 
-/* 48 kHz host. `stage_out` holds DFN2_N_BINS bins. */
+/* Host on the stage's grid. `stage_out` holds the grid's n_bins bins. */
 static inline void dfn_hop_init_stage(DfnHop* h, DfnResStage* stage, AcIstft* istft,
                                       Complex* stage_out) {
+    const DFN2Grid* grid = dfn_res_stage_grid(stage);
     memset(h, 0, sizeof(*h));
     h->stage = stage;
     h->istft = istft;
     h->stage_out = stage_out;
+    h->n_bins = grid ? grid->n_bins : 0;
+    h->hop_size = grid ? grid->hop : 0;
 }
 
-/* Host below 48 kHz. */
+/* Host rate differs from the stage grid (bridge path). */
 static inline void dfn_hop_init_bridge(DfnHop* h, DfnRateBridge* bridge) {
     memset(h, 0, sizeof(*h));
     h->bridge = bridge;
@@ -83,7 +89,7 @@ static inline void dfn_hop_reset(DfnHop* h) {
     }
     dfn_res_stage_reset(h->stage);
     if (h->istft) ac_istft_reset(h->istft);
-    memset(h->stage_out, 0, (size_t)DFN2_N_BINS * sizeof(Complex));
+    memset(h->stage_out, 0, (size_t)h->n_bins * sizeof(Complex));
 }
 
 /* Starts a hop on the host-grid spectra E and P (borrowed for this call only). */
@@ -158,13 +164,13 @@ static inline int dfn_hop_end(DfnHop* h, float* out) {
     h->phase = 0;
     h->job_pending = 0;
     if (h->check_finite) {
-        for (k = 0; k < DFN2_N_BINS; ++k)
+        for (k = 0; k < h->n_bins; ++k)
             if (!isfinite(h->stage_out[k].r) || !isfinite(h->stage_out[k].i))
                 return DFN_HOP_INVALID;
     }
     (void)ac_istft_push(h->istft, h->stage_out, out);
     if (h->check_finite) {
-        for (k = 0; k < DFN2_HOP_LEN; ++k)
+        for (k = 0; k < h->hop_size; ++k)
             if (!isfinite(out[k])) return DFN_HOP_INVALID;
     }
     return 0;

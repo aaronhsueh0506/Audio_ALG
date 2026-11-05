@@ -17,9 +17,11 @@ same arithmetic and must agree BYTE FOR BYTE:
   refuse       a call whose head or state comes back non-finite is refused,
                the state is zeroed and the N frames pass as the identity, the
                same as N one-frame refusals
-  contract     readiness (L + N, then every N), the window rows, the
-               descriptor's input_frames (N + 2), the latency accessor,
-               element counts, and a pool of the one-frame build refused
+  contract     readiness (L + N, then every N), the window rows at the grid's
+               stride, the descriptor's input_frames (N + 2), the latency
+               accessor, element counts, a descriptor made for another grid
+               refused before infer() runs, and a pool of the one-frame build
+               or of another grid refused
   abi          the 72-byte descriptor of the one-frame header, filled and
                checked through the library of either N: nothing written or
                read past it, a one-frame descriptor refused by N > 1
@@ -29,6 +31,12 @@ same arithmetic and must agree BYTE FOR BYTE:
 
 A stand-in reading the wrong window slice fails the comparison, so it is not
 vacuous.
+
+The library holds no grid: the driver runs the grid of ``dfn2_test_grid.h``
+(the shipped 48 kHz grid unless ``-DDFN2_GRID_KHZ`` says otherwise) and passes it
+to every call. The 48 kHz grid fills the capacity arrays exactly (32 bands, 96
+deep-filter bins), so the 16 kHz and 32 kHz grids, whose windows are packed at a
+smaller stride, are run as well.
 """
 
 import subprocess
@@ -42,6 +50,18 @@ FAMILY = 'DeepFilterNet2'
 _SOURCES = ('prepost', 'process', 'model_io')
 PAIRS = ((1, 1), (0, 0), (2, 4), (0, 1), (2, 0))
 FRAMES = (2, 3, 5, 10)
+# Grids other than the shipped 48 kHz one: the 16 and 32 kHz presets of
+# dfn2_test_grid.h and a custom grid (-DDFN2_SR and the three others) whose band
+# count AND deep-filter bin count are both below the capacity, so every window
+# is packed at a stride that is not the capacity's.
+_GRID_FLAGS = {
+    48: [],
+    32: ['-DDFN2_GRID_KHZ=32'],
+    16: ['-DDFN2_GRID_KHZ=16'],
+    'custom': ['-DDFN2_SR=16000', '-DDFN2_N_FFT=256', '-DDFN2_N_ERB=20',
+               '-DDFN2_DF_BINS=64'],
+}
+OTHER_GRIDS = (16, 32, 'custom')
 REAL_HOPS = 37
 _pair_id = dfn_pairs.pair_id
 
@@ -53,7 +73,7 @@ _DRIVER = r'''
 #include <stdlib.h>
 #include <string.h>
 
-#include "DeepFilterNet2/dfn2_prepost.h"
+#include "dfn2_test_grid.h"
 
 #define CHECK(x) do { if (!(x)) { \
     fprintf(stderr, "CHECK failed at line %d: %s\n", __LINE__, #x); \
@@ -75,17 +95,25 @@ _DRIVER = r'''
 #define STUB_SLICE_OFFSET 0
 #endif
 
-/* ---- ERB matrices: the shipped border table, erb_inv a partition of unity */
-static const int erb_borders[E] = {
-    0, 2, 4, 6, 8, 10, 12, 14, 16, 18, 20, 22, 25, 30, 36, 42,
-    50, 59, 69, 81, 94, 110, 129, 151, 176, 205, 239, 279,
-    325, 378, 440, 513
-};
+/* ---- ERB matrices: erb_inv a partition of unity. The shipped 48 kHz grid has
+ * its border table; any other grid gets evenly spaced borders. */
+static int erb_borders[E];
 static float erb_fwd[DFN2_N_BINS][E];
 static float erb_inv[E][DFN2_N_BINS];
 
 static void build_erb(void) {
     int segment = 0, k;
+#if DFN2_N_FFT == 1024 && DFN2_N_ERB == 32
+    static const int shipped[E] = {
+        0, 2, 4, 6, 8, 10, 12, 14, 16, 18, 20, 22, 25, 30, 36, 42,
+        50, 59, 69, 81, 94, 110, 129, 151, 176, 205, 239, 279,
+        325, 378, 440, 513
+    };
+    memcpy(erb_borders, shipped, sizeof shipped);
+#else
+    for (k = 0; k < E; ++k)
+        erb_borders[k] = (int)((long)k * DFN2_N_BINS / (E - 1));
+#endif
     for (k = 0; k < DFN2_N_BINS; ++k) {
         int lo, hi;
         float right, left;
@@ -117,35 +145,40 @@ static void rec(char tag, int a, int b, long long c, const float *v, int n) {
  * the state, updated in place (each element is read before it is written).
  * Every head depends on the slice and on both state tensors, and the pathway
  * window on all five of its frames. */
-static void stub_frame(const float (*erb)[E], const float (*spec0)[F],
-                       const float (*spec1)[F], float (*gru)[HID],
-                       float (*hist)[PW][F], float *mask, float *coefs,
-                       float *alpha) {
+static void stub_frame(const float *erb, const float *spec0,
+                       const float *spec1, float (*gru)[HID], float *hist,
+                       float *mask, float *coefs, float *alpha) {
+    /* erb: [3][E], spec0/spec1: [3][F], hist: [CH][PW][F], all packed at the
+     * grid's stride */
+#define HIST(ch, w, k) hist[(((size_t)(ch)) * PW + (w)) * F + (k)]
     float e = 0.0f, sp = 0.0f;
     int t, b, r, j, ch, k;
     for (t = 0; t < 3; ++t)
         for (b = 0; b < E; ++b)
-            e += erb[t][b] * (0.01f * (float)(t + 1) + 0.001f * (float)b);
+            e += erb[t * E + b] * (0.01f * (float)(t + 1) + 0.001f * (float)b);
     for (t = 0; t < 3; ++t)
         for (k = 0; k < F; ++k)
-            sp += spec0[t][k] * 0.002f * (float)(t + 1) - spec1[t][k] * 0.001f;
+            sp += spec0[t * F + k] * 0.002f * (float)(t + 1) -
+                  spec1[t * F + k] * 0.001f;
     for (r = 0; r < ROWS; ++r)
         for (j = 0; j < HID; ++j)
             gru[r][j] = tanhf(0.9f * gru[r][j] + 0.05f * e +
                               0.03f * (float)(r + 1) * sp + 0.001f * (float)j);
     for (ch = 0; ch < CH; ++ch) {
-        memmove(hist[ch][0], hist[ch][1], (PW - 1) * sizeof(hist[ch][0]));
+        memmove(&HIST(ch, 0, 0), &HIST(ch, 1, 0),
+                (PW - 1) * (size_t)F * sizeof(float));
         for (k = 0; k < F; ++k)
-            hist[ch][PW - 1][k] = tanhf(
-                0.1f * spec0[1][k] * (float)(ch + 1) / (float)CH +
-                0.5f * gru[ch % ROWS][k] + 0.2f * hist[ch][0][k]);
+            HIST(ch, PW - 1, k) = tanhf(
+                0.1f * spec0[1 * F + k] * (float)(ch + 1) / (float)CH +
+                0.5f * gru[ch % ROWS][k] + 0.2f * HIST(ch, 0, k));
     }
     for (b = 0; b < E; ++b)
-        mask[b] = 1.0f / (1.0f + expf(-(erb[1][b] + gru[1][b])));
+        mask[b] = 1.0f / (1.0f + expf(-(erb[1 * E + b] + gru[1][b])));
     for (j = 0; j < COEF1; ++j)
-        coefs[j] = 0.1f * tanhf(hist[j % CH][(j / CH) % PW][j % F] +
+        coefs[j] = 0.1f * tanhf(HIST(j % CH, (j / CH) % PW, j % F) +
                                 gru[3][j % HID]);
     *alpha = 1.0f / (1.0f + expf(-gru[4][0]));
+#undef HIST
 }
 
 typedef struct {
@@ -166,18 +199,18 @@ static int stub_infer(void *user, const DFN2PrepostInputs *in,
         out->erb_mask_elements != (size_t)NF * E ||
         out->coefs_elements != (size_t)NF * COEF1 ||
         out->alpha_elements != (size_t)NF ||
+        in->df_convp_window_elements != (size_t)CH * PW * F ||
         (const float *)in->gru_hidden != &out->gru_hidden_next[0][0] ||
-        (const float *)in->df_convp_window !=
-            &out->df_convp_window_next[0][0][0]) {
+        in->df_convp_window != out->df_convp_window_next) {
         ++s->bad_views;
         return -1;
     }
     for (i = 0; i < NF; ++i) {
         const int at = (i + STUB_SLICE_OFFSET) % NF;
         long long head = s->next_head + i;
-        stub_frame(in->erb_window + at,
-                   (const float (*)[F])in->spec_window[0][at],
-                   (const float (*)[F])in->spec_window[1][at],
+        stub_frame(in->erb_window + (size_t)at * E,
+                   in->spec_window + ((size_t)0 * WF + at) * F,
+                   in->spec_window + ((size_t)1 * WF + at) * F,
                    out->gru_hidden_next, out->df_convp_window_next,
                    out->erb_mask + (size_t)i * E,
                    out->coefs + (size_t)i * COEF1, out->alpha + i);
@@ -205,7 +238,7 @@ static AcIstft *make_istft(FftHandle *fft) {
     AcStftConfig sc;
     size_t bytes;
     void *mem;
-    dfn2_framing_config(&sc, fft, NULL);
+    dfn2_framing_config(&sc, dfn2_test_grid(), fft, NULL);
     bytes = ac_istft_get_mem_size(&sc);
     mem = aligned_alloc(16u, (bytes + 15u) / 16u * 16u);
     return mem ? ac_istft_init(mem, bytes, &sc) : NULL;
@@ -213,7 +246,8 @@ static AcIstft *make_istft(FftHandle *fft) {
 
 static DFN2Prepost *make(int io_mode, FftHandle *fft) {
     DFN2PrepostConfig cfg;
-    if (dfn2_prepost_config_defaults(&cfg, io_mode) != 0) return NULL;
+    if (dfn2_prepost_config_defaults(&cfg, io_mode, dfn2_test_grid()) != 0)
+        return NULL;
     cfg.fft = io_mode == DFN2_IO_TIME ? fft : NULL;
     cfg.istft = io_mode == DFN2_IO_TIME ? make_istft(fft) : NULL;
     cfg.erb_fwd = &erb_fwd[0][0];
@@ -242,7 +276,7 @@ static int run_stream(const char *mode, int real, int hops, int reset_hop,
     CHECK(fft != NULL);
     p = make(freq ? DFN2_IO_FREQ : DFN2_IO_TIME, fft);
     CHECK(p != NULL);
-    CHECK(dfn2_model_io_descriptor_default(&descriptor) == 0);
+    CHECK(dfn2_model_io_descriptor_default(dfn2_test_grid(), &descriptor) == 0);
     memset(&stub, 0, sizeof stub);
     stub.poison_lo = plo;
     stub.poison_hi = phi;
@@ -315,7 +349,7 @@ static int run_stream(const char *mode, int real, int hops, int reset_hop,
         CHECK(dfn2_prepost_frame_inputs(p, &views_in, &views_out) == 0);
         rec('S', 0, 0, 0, &views_in.gru_hidden[0][0],
             (int)views_in.gru_hidden_elements);
-        rec('W', 0, 0, 0, &views_in.df_convp_window[0][0][0],
+        rec('W', 0, 0, 0, views_in.df_convp_window,
             (int)views_in.df_convp_window_elements);
     }
     rec('G', (int)dfn2_prepost_state_generation(p), 0, 0, NULL, 0);
@@ -328,7 +362,9 @@ static int run_stream(const char *mode, int real, int hops, int reset_hop,
 
 static int case_contract(void) {
     FftHandle *fft = fft_create(DFN2_N_FFT);
-    DFN2ModelIoDescriptor d, bad;
+    const DFN2Grid *grid = dfn2_test_grid();
+    DFN2Grid other;
+    DFN2ModelIoDescriptor d, bad, other_d;
     DFN2ModelIOState io;
     DFN2PrepostMemReq time_req, freq_req;
     DFN2PrepostConfig cfg;
@@ -339,16 +375,26 @@ static int case_contract(void) {
     int f, s, b, h, written, first_written = -1;
 
     CHECK(fft != NULL);
-    CHECK(dfn2_model_io_descriptor_default(&d) == 0);
+    CHECK(dfn2_model_io_descriptor_default(grid, &d) == 0);
     CHECK(d.input_frames == WF && d.input_frames - 2 == NF);
-    CHECK(dfn2_model_io_descriptor_validate(&d) == 0);
+    CHECK(dfn2_model_io_descriptor_validate(grid, &d) == 0);
     bad = d; ++bad.input_frames;
-    CHECK(dfn2_model_io_descriptor_validate(&bad) == -1);
+    CHECK(dfn2_model_io_descriptor_validate(grid, &bad) == -1);
     bad = d; bad.input_frames = DFN2_MODEL_INPUT_FRAMES + (NF == 1);
-    CHECK(dfn2_model_io_descriptor_validate(&bad) == -1);
+    CHECK(dfn2_model_io_descriptor_validate(grid, &bad) == -1);
+    /* The grid is part of the contract: a descriptor made for another grid
+     * (fewer ERB bands) is not this one. */
+    CHECK(dfn2_grid_make(&other, DFN2_SR, DFN2_N_FFT, DFN2_N_ERB - 4,
+                         DFN2_DF_BINS, LA, DA) == DFN2_GRID_OK);
+    CHECK(dfn2_model_io_descriptor_default(&other, &other_d) == 0);
+    CHECK(other_d.erb_bands == DFN2_N_ERB - 4);
+    CHECK(dfn2_model_io_descriptor_validate(grid, &other_d) == -1);
+    CHECK(dfn2_model_io_descriptor_validate(&other, &d) == -1);
 
     /* Readiness, slots and the window rows, frame by frame. */
-    dfn2_model_io_init(&io);
+    CHECK(dfn2_model_io_ready_frames(NULL) == 0);
+    CHECK(dfn2_model_io_init(&io, grid) == 0);
+    CHECK(dfn2_model_io_ready_frames(&io) == (unsigned int)(LA + NF));
     CHECK(dfn2_model_io_frame_slot(&io) == -1);
     CHECK(dfn2_model_io_frame_slot(NULL) == -1);
     for (f = 0; f < LA + 6 * NF + 3; ++f) {
@@ -358,24 +404,24 @@ static int case_contract(void) {
             spec[0][b] = (float)(1000 * (f + 1) + b) + 0.25f;
             spec[1][b] = -(float)(1000 * (f + 1) + b);
         }
-        ready = dfn2_model_io_push_features(&io, erb, (const float (*)[F])spec);
+        ready = dfn2_model_io_push_features(&io, erb, &spec[0][0]);
         want = f + 1 >= LA + NF && (f + 1 - LA) % NF == 0;
         CHECK(ready == want);
         CHECK(dfn2_model_io_frame_slot(&io) == (f < LA ? -1 : (f - LA) % NF));
         for (s = 0; s < WF; ++s) {
             const int frame = f - (WF - 1) + s;
             for (b = 0; b < E; ++b)
-                CHECK(io.erb_window[s][b] ==
+                CHECK(io.erb_window[s * E + b] ==
                       (frame < 0 ? 0.0f : (float)(1000 * (frame + 1) + b)));
-            CHECK(io.spec_window[0][s][3] ==
+            CHECK(io.spec_window[(0 * WF + s) * F + 3] ==
                   (frame < 0 ? 0.0f : (float)(1000 * (frame + 1) + 3) + 0.25f));
-            CHECK(io.spec_window[1][s][F - 1] ==
+            CHECK(io.spec_window[(1 * WF + s) * F + F - 1] ==
                   (frame < 0 ? 0.0f : -(float)(1000 * (frame + 1) + F - 1)));
         }
     }
 
     /* The class: pre_process readiness, views, latency, first output. */
-    CHECK(dfn2_prepost_config_defaults(&cfg, DFN2_IO_TIME) == 0);
+    CHECK(dfn2_prepost_config_defaults(&cfg, DFN2_IO_TIME, grid) == 0);
     cfg.fft = fft;
     cfg.istft = make_istft(fft);
     cfg.erb_fwd = &erb_fwd[0][0];
@@ -384,7 +430,9 @@ static int case_contract(void) {
     p = dfn2_prepost_create(&cfg);
     CHECK(p != NULL);
     CHECK(dfn2_prepost_model_lookahead_frames(p) == LA + DA + NF - 1);
-    CHECK(DFN2_PREPOST_LATENCY_FRAMES == LA + DA + NF - 1);
+    CHECK(dfn2_prepost_latency_frames(grid) == LA + DA + NF - 1);
+    CHECK(dfn2_prepost_grid(p) != NULL && dfn2_prepost_grid(p)->n_erb == E &&
+          dfn2_prepost_grid(p)->df_bins == F);
     memset(&stub, 0, sizeof stub);
     stub.poison_lo = stub.poison_hi = -1;
     model.user = &stub;
@@ -404,11 +452,18 @@ static int case_contract(void) {
             model.io_descriptor = &bad;
             CHECK(dfn2_model_run_frame(&model, p) == -1);
             CHECK(stub.calls == calls);
+            /* ... and so is one made for another grid. */
+            model.io_descriptor = &other_d;
+            CHECK(dfn2_model_run_frame(&model, p) == -1);
+            CHECK(stub.calls == calls);
             CHECK(dfn2_prepost_frame_inputs(p, &views_in, &views_out) == 0);
             CHECK(views_in.erb_window_elements ==
-                  (size_t)DFN2_PREPOST_ERB_WINDOW_ELEMENTS);
-            CHECK(DFN2_PREPOST_ERB_WINDOW_ELEMENTS == WF * E);
-            CHECK(DFN2_PREPOST_SPEC_WINDOW_ELEMENTS == 2 * WF * F);
+                  dfn2_prepost_erb_window_elements(grid));
+            CHECK(dfn2_prepost_erb_window_elements(grid) == (size_t)WF * E);
+            CHECK(dfn2_prepost_spec_window_elements(grid) == (size_t)2 * WF * F);
+            CHECK(dfn2_prepost_erb_mask_elements(grid) == (size_t)NF * E);
+            CHECK(dfn2_prepost_coefs_elements(grid) == (size_t)NF * COEF1);
+            CHECK(dfn2_prepost_convp_window_elements(grid) == (size_t)CH * PW * F);
             CHECK(views_out.alpha_elements == (size_t)NF);
             CHECK(isnan(views_out.alpha[NF - 1]));
             model.io_descriptor = &d;
@@ -421,7 +476,7 @@ static int case_contract(void) {
     CHECK(first_written == LA + DA + NF - 1);
     dfn2_prepost_destroy(p);
 
-    CHECK(dfn2_prepost_config_defaults(&cfg, DFN2_IO_FREQ) == 0);
+    CHECK(dfn2_prepost_config_defaults(&cfg, DFN2_IO_FREQ, grid) == 0);
     cfg.erb_fwd = &erb_fwd[0][0];
     cfg.erb_inv = &erb_inv[0][0];
     CHECK(dfn2_prepost_get_mem_size(&cfg, &freq_req) == 0);
@@ -441,7 +496,7 @@ static int case_req_check(unsigned long long bytes, unsigned hash) {
     DFN2PrepostMemReq req, other;
     size_t room;
     void *pool;
-    CHECK(dfn2_prepost_config_defaults(&cfg, DFN2_IO_FREQ) == 0);
+    CHECK(dfn2_prepost_config_defaults(&cfg, DFN2_IO_FREQ, dfn2_test_grid()) == 0);
     cfg.erb_fwd = &erb_fwd[0][0];
     cfg.erb_inv = &erb_inv[0][0];
     CHECK(dfn2_prepost_get_mem_size(&cfg, &req) == 0);
@@ -482,20 +537,20 @@ _REC = np.dtype([('tag', '<i4'), ('a', '<i4'), ('b', '<i4'),
                  ('count', '<i4'), ('c', '<i8')])
 
 
-def _defines(pair, frames, extra=()):
-    flags = list(dfn_pairs.defines(FAMILY, pair))
+def _defines(pair, frames, extra=(), khz=48):
+    flags = list(dfn_pairs.defines(FAMILY, pair)) + _GRID_FLAGS[khz]
     if frames != 1:
         flags.append('-DDFN2_FRAMES_PER_CALL=%d' % frames)
     return flags + list(extra)
 
 
-def _build(work, audio_common_lib, pair, frames, extra=()):
+def _build(work, audio_common_lib, pair, frames, extra=(), khz=48):
     source = work / 'driver.c'
     source.write_text(_DRIVER, encoding='utf-8')
     exe = work / 'driver'
     subprocess.run(
-        ['cc', *dfn_pairs.house_cflags(), *_defines(pair, frames, extra),
-         str(source),
+        ['cc', *dfn_pairs.house_cflags(), *_defines(pair, frames, extra, khz),
+         '-I', str(dfn_pairs.AINR / 'tests'), str(source),
          *[str(dfn_pairs.source_path(FAMILY, kind)) for kind in _SOURCES],
          audio_common_lib, '-lm', '-o', str(exe)],
         check=True, capture_output=True, text=True)
@@ -514,12 +569,13 @@ def audio_common_lib():
 def drivers(tmp_path_factory, audio_common_lib):
     built = {}
 
-    def get(pair, frames, extra=()):
-        key = (pair, frames, tuple(extra))
+    def get(pair, frames, extra=(), khz=48):
+        key = (pair, frames, tuple(extra), khz)
         if key not in built:
             work = tmp_path_factory.mktemp(
-                'dfn2_n%d_%s' % (frames, _pair_id(pair)))
-            built[key] = _build(work, audio_common_lib, pair, frames, extra)
+                'dfn2_%s_n%d_%s' % (khz, frames, _pair_id(pair)))
+            built[key] = _build(work, audio_common_lib, pair, frames, extra,
+                                khz)
         return built[key]
     return get
 
@@ -615,6 +671,32 @@ def test_chunk_host_equals_the_frame_host(drivers, tmp_path, pair, frames,
     assert len({entry[2] for entry in emitted}) > REAL_HOPS // 2
 
 
+@pytest.mark.parametrize('mode', ['time', 'freq'])
+@pytest.mark.parametrize('frames', [3, 5])
+@pytest.mark.parametrize('khz', OTHER_GRIDS)
+def test_chunk_host_equals_the_frame_host_on_other_grids(drivers, tmp_path,
+                                                         khz, frames, mode):
+    """The windows are packed at the grid's stride (24, 28 or 20 bands and, for
+    the custom grid, 64 bins, not the capacity's 32 and 96): the N-frame host
+    still equals the one-frame host byte for byte, and the stand-in reads the
+    same slices from the packed windows."""
+    pair = (1, 1)
+    hops = _hops(pair, frames)
+    one, _ = _stream(drivers(pair, 1, khz=khz), tmp_path, mode, hops,
+                     name='one')
+    many, out = _stream(drivers(pair, frames, khz=khz), tmp_path, mode, hops,
+                        name='many')
+    one, many = _segments(one)[0], _segments(many)[0]
+    count = _compare(one, many, frames)
+    assert count == hops - pair[0] == len(one['heads'])
+    assert many['final'] == one['final']
+    assert 'calls=%d ' % (count // frames) in out
+    emitted = [entry for entry in many['out'] if entry[0]]
+    assert [entry[1] for entry in emitted][:REAL_HOPS] == list(
+        range(REAL_HOPS))
+    assert len({entry[2] for entry in emitted}) > REAL_HOPS // 2
+
+
 @pytest.mark.parametrize('frames', [3, 5])
 @pytest.mark.parametrize('pair', [(1, 1), (2, 4), (0, 1)], ids=_pair_id)
 def test_a_reset_in_the_middle_of_a_call(drivers, tmp_path, pair, frames):
@@ -703,6 +785,12 @@ def test_contract_readiness_window_descriptor_and_latency(drivers, pair,
     _contract(drivers(pair, frames))
 
 
+@pytest.mark.parametrize('frames', (1, 3, 5))
+@pytest.mark.parametrize('khz', OTHER_GRIDS)
+def test_contract_on_other_grids(drivers, khz, frames):
+    _contract(drivers((1, 1), frames, khz=khz))
+
+
 @pytest.mark.parametrize('frames', FRAMES)
 def test_the_pool_of_another_frame_count_is_refused(drivers, frames):
     pair = (1, 1)
@@ -714,6 +802,30 @@ def test_the_pool_of_another_frame_count_is_refused(drivers, frames):
     bytes_, hash_ = single['freq']
     done = subprocess.run(
         [str(drivers(pair, frames)), 'req_check', str(bytes_), hash_],
+        capture_output=True, text=True)
+    assert done.returncode == 0, (done.stdout, done.stderr)
+
+
+@pytest.mark.parametrize('frames', (1, 3))
+@pytest.mark.parametrize('khz', OTHER_GRIDS)
+def test_the_pool_of_another_grid_is_refused(drivers, khz, frames):
+    """The grid is folded into the pool descriptor: the 48 kHz host refuses
+    the descriptor (size and hash) a host of another grid computed, and
+    accepts its own."""
+    pair = (1, 1)
+    shipped = _contract(drivers(pair, frames))
+    other = _contract(drivers(pair, frames, khz=khz))
+    for mode in ('time', 'freq'):
+        assert other[mode][1] != shipped[mode][1]
+    # the hash alone is enough to refuse it: same size, other hash
+    bytes_, hash_ = shipped['freq']
+    done = subprocess.run(
+        [str(drivers(pair, frames)), 'req_check', str(bytes_), other['freq'][1]],
+        capture_output=True, text=True)
+    assert done.returncode == 0, (done.stdout, done.stderr)
+    # and the size alone: the other grid's pool size with this grid's hash
+    done = subprocess.run(
+        [str(drivers(pair, frames)), 'req_check', str(other['freq'][0]), hash_],
         capture_output=True, text=True)
     assert done.returncode == 0, (done.stdout, done.stderr)
 
@@ -784,11 +896,14 @@ def test_objects_of_different_frame_counts_do_not_link(tmp_path,
 
 # A unit compiled against the one-frame header: the descriptor exactly as that
 # header declared it (18 fields, 72 bytes) with a guard band behind it, passed
-# to the library through the public prototypes only.
+# to the library through the public prototypes only. The grid comes from
+# dfn2_grid.h, which carries no frames-per-call and no model-I/O declarations.
 _ABI_DRIVER = r'''
 #include <stddef.h>
 #include <stdio.h>
 #include <string.h>
+
+#include "DeepFilterNet2/dfn2_grid.h"
 
 typedef struct {
     unsigned int layout_version;
@@ -812,9 +927,10 @@ typedef struct {
 } OldDescriptor;
 
 typedef struct DFN2ModelIoDescriptor DFN2ModelIoDescriptor;
-int dfn2_model_io_descriptor_default(DFN2ModelIoDescriptor *descriptor);
+int dfn2_model_io_descriptor_default(const DFN2Grid *grid,
+                                     DFN2ModelIoDescriptor *descriptor);
 int dfn2_model_io_descriptor_validate(
-    const DFN2ModelIoDescriptor *descriptor);
+    const DFN2Grid *grid, const DFN2ModelIoDescriptor *descriptor);
 
 typedef struct {
     OldDescriptor d;
@@ -837,20 +953,29 @@ static int guard_intact(void)
 int main(void)
 {
     DFN2ModelIoDescriptor *d = (DFN2ModelIoDescriptor *)&box.d;
-    int written, filled, as_filled, old_frames;
+    DFN2Grid grid;
+    int written, filled, as_filled, old_frames, made;
+    made = dfn2_grid_make(&grid, 48000, 1024, 32, 96, 1, 1);
     memset(&box, 0xA5, sizeof box);
-    filled = dfn2_model_io_descriptor_default(d);
+    filled = dfn2_model_io_descriptor_default(&grid, d);
     written = guard_intact();
     memset(box.guard, 0xA5, sizeof box.guard);
-    as_filled = dfn2_model_io_descriptor_validate(d);
-    printf("default=%d input_frames=%d guard_after_default=%d "
-           "validate_default=%d", filled, box.d.input_frames, written,
+    as_filled = dfn2_model_io_descriptor_validate(&grid, d);
+    printf("grid=%d default=%d input_frames=%d guard_after_default=%d "
+           "validate_default=%d", made, filled, box.d.input_frames, written,
            as_filled);
     box.d.input_frames = 3;
-    old_frames = dfn2_model_io_descriptor_validate(d);
-    printf(" validate_three=%d guard_end=%d null=%d,%d\n", old_frames,
-           guard_intact(), dfn2_model_io_descriptor_default(NULL),
-           dfn2_model_io_descriptor_validate(NULL));
+    old_frames = dfn2_model_io_descriptor_validate(&grid, d);
+    printf(" validate_three=%d guard_end=%d null=%d,%d", old_frames,
+           guard_intact(), dfn2_model_io_descriptor_default(&grid, NULL),
+           dfn2_model_io_descriptor_validate(&grid, NULL));
+    /* No grid: refused, nothing is written past the descriptor, and what is
+     * left in it is not a descriptor any grid accepts. */
+    memset(&box, 0xA5, sizeof box);
+    printf(" no_grid=%d,%d", dfn2_model_io_descriptor_default(NULL, d),
+           dfn2_model_io_descriptor_validate(NULL, d));
+    printf(" guard_no_grid=%d leftover=%d\n", guard_intact(),
+           dfn2_model_io_descriptor_validate(&grid, d));
     return 0;
 }
 '''
@@ -861,7 +986,8 @@ def test_a_descriptor_of_the_one_frame_header_is_safe_for_any_frame_count(
         tmp_path, audio_common_lib, frames):
     """default() and validate() touch exactly the 72 bytes of the one-frame
     header's descriptor; its input_frames of 3 passes an N = 1 library and is
-    refused by an N = 3 one."""
+    refused by an N = 3 one. A missing grid is refused and writes nothing past
+    the descriptor."""
     source = tmp_path / 'old_adapter.c'
     source.write_text(_ABI_DRIVER, encoding='utf-8')
     exe = tmp_path / 'old_adapter'
@@ -875,10 +1001,11 @@ def test_a_descriptor_of_the_one_frame_header_is_safe_for_any_frame_count(
     assert done.returncode == 0, (done.stdout, done.stderr)
     fields = dict(item.split('=') for item in done.stdout.split())
     assert fields == {
-        'default': '0', 'input_frames': str(frames + 2),
+        'grid': '0', 'default': '0', 'input_frames': str(frames + 2),
         'guard_after_default': '1', 'validate_default': '0',
         'validate_three': '0' if frames == 1 else '-1', 'guard_end': '1',
-        'null': '-1,-1'}, done.stdout
+        'null': '-1,-1', 'no_grid': '-1,-1', 'guard_no_grid': '1',
+        'leftover': '-1'}, done.stdout
 
 
 @pytest.mark.parametrize('value', ['0', '65', '2 3', 'x', '04', '-1'])

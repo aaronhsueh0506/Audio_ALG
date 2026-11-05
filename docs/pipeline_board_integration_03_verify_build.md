@@ -193,11 +193,17 @@ Guard rails (all four repos):
 **Board sample build notes.** The board samples live outside this repository and are built from the same
 library sources. Their build lists drop `fix_gain.c` and the `third_party/gain` include path (the
 samples apply their input gain with a small `InputGain` helper over `sk_scale_f32()` and `sk_clip_f32()`).
-A DeepFilterNet2 lookahead pair other than 1/1 is passed as `-DDFN2_MASK_LOOKAHEAD=<M> -DDFN2_DF_LOOKAHEAD=<D>` to
-**every** unit that includes the DFN2 headers (the `AINR/DeepFilterNet2` sources, `dfn_res_stage.c`,
-`dfn_rate_bridge.c` and the sample's own units); units built for different pairs fail to link, and the
-checkpoint must be the one trained for that pair. `alg_ai3_dfn.c` and `uvc_ai_nr_stream.c` hard-code mask and
-deep-filter lookahead 1 with a static assert, so they build only with the default pair.
+The DeepFilterNet2 library holds no grid: the application builds a `DFN2Grid` with `dfn2_grid_make()` (sample rate, FFT size,
+ERB bands, deep-filter bins, lookahead pair) and passes it to every DFN2 object, so one binary runs any grid within the library's
+capacities, and a model or pool built for another grid or pair is refused at run time. The pipeline units
+(`dfn_res_stage.c`, `dfn_rate_bridge.c`) hold no grid and no pair: the application puts its `DFN2Grid` in
+`DfnResStageConfig.grid`, so a pair other than 1/1 needs no pair flag on any product unit. Only a pair whose state ring
+`max(5, M + D + 1)` exceeds 5 (1/4, 2/3, 2/4) also needs `-DDFN2_MAX_DF_RING=<ring>` on every DFN2 unit. The board samples take their
+grid from their own three-row (sample rate, FFT size) table: `alg_ai3_dfn.c` and `alg_ai3_dfn_lite.c` from `--sample-rate` /
+`--fft-size`, `alg_ai3_aec_dfn.c` from `--ai-sample-rate` / `--ai-fft-size` (its `--sr` is the host rate), and the two UVC samples
+(`uvc_ai_nr_stream.c`, `uvc_audio_live2a.c`) are 48 kHz only with the shipped row built into the sample. Every DFN2 sample reads its
+ERB matrices from `/mnt/sd/dfn2_blobs/fb_<sr>_<n_erb>.bin` (for example `fb_48000_32.bin`), the exporter's `erb_matrix.bin` renamed
+for its grid. The checkpoint, the ERB file and the `model.bin` must be the ones trained for the chosen grid and pair.
 
 ## Compile flags (`EXTRA_CFLAGS`)
 

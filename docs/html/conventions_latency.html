@@ -163,20 +163,20 @@ stream emits zeros」；輸出 hop p ≙ 輸入 hop p−1</td></tr>
 <td>+0 hop</td><td>同 hop 交出兩個頻譜：<code>error_spec</code>/<code>beamformed_error</code>（E，pre-RES，即 <code>dfn_res_stage_begin()</code> 的 <code>estimate_spec</code>）與
 post-RES 頻譜（P = E·G_res，開啟 CNG 時再加 comfort noise；DFN2 變體預設關；即 <code>apply_spec</code>）</td></tr>
 <tr><td><code>dfn_res_stage</code> 的尺度換算</td><td>+0 hop</td>
-<td>入 <code>DFN_RES_STAGE_IN_SCALE</code>、出 <code>DFN_RES_STAGE_OUT_SCALE</code>（= 1/sqrt(n_fft) 與其反數；出貨 grid 為 <code>2^-5</code>／<code>2^5</code>）：pipeline 頻譜是 audio-scale
+<td>入 <code>grid.stft_scale</code>、出 <code>grid.stft_unscale</code>（= 1/sqrt(n_fft) 與其反數；出貨 grid 為 <code>2^-5</code>／<code>2^5</code>）：pipeline 頻譜是 audio-scale
 未正規化 STFT，DFN2 邊界要 <code>torch.stft(normalized=True)</code>。出貨 grid 下兩者是精確的 2 的次方，
 往返在 float32 下逐位元可逆（<code>pipelines/dfn/dfn_res_stage.h</code>）</td></tr>
 <tr><td>DFN2 模型 lookahead（48 k host）</td><td>+L hop，L = M + D（出貨 pair 1/1：+2 hop = 1024 samples = 21.33 ms）</td>
-<td><code>DFN2_MASK_LOOKAHEAD + DFN2_DF_LOOKAHEAD</code>，cascade 串聯<b>相加</b>而非取 max；M 為 0..2、D 為 0..4，共 15 個 pair，建置時以 make 變數選定（<a href="pipeline_dfn_detail.html">pipeline_dfn_detail</a>）；
+<td>grid 的 <code>mask_lookahead + df_lookahead</code>，cascade 串聯<b>相加</b>而非取 max；M 為 0..2、D 為 0..4，共 15 個 pair；函式庫與 pipeline 單元都在執行期從 <code>DFN2Grid</code> 取得（<code>dfn_res_stage_lookahead_frames(grid)</code>；範例 main 的表的一列，make 變數只決定測試程式跑哪一對，見 <a href="pipeline_dfn_detail.html">pipeline_dfn_detail</a>）；
 前 L 個 hop 的 stage 輸出是全零頻譜（寫滿，故延遲是純延遲）。DFN3（平行）的模型延遲為 max(M, D)（<a href="ainr_dfn2_detail.html">ainr_dfn2_detail</a>）</td></tr>
 <tr><td>host／應用的 sqrt-Hann WOLA（48 k：各 main 的 <code>ac_istft_push()</code> 或 <code>dfn_hop_end()</code> 內的 <code>ac_istft_push()</code>）</td><td>+1 hop（512 samples = 10.67 ms）</td>
 <td>OLA 狀態屬於收尾的那個 <code>AcIstft</code>；同一個物件上混用兩種收尾方式仍連續</td></tr>
 <tr><td><b>合計（48 k host）</b></td><td><b>L + 1 hop；出貨 pair：3 hop = 1536 samples = 32.0 ms</b></td>
-<td>兩個範例 <code>main.c</code> 印出的延遲（48 k：<code>hop * (DFN_RES_STAGE_LOOKAHEAD_FRAMES + 1)</code>；原生格點：<code>hop + dfn_rate_bridge_added_delay_samples()</code>）；
+<td>兩個範例 <code>main.c</code> 印出的延遲（48 k：<code>hop * (dfn_res_stage_lookahead_frames(grid) + 1)</code>；原生格點：<code>hop + dfn_rate_bridge_added_delay_samples()</code>）；
 兩支 C 測試（<code>test_mono_dfn.c</code>、<code>test_4ch_dfn.c</code>）釘住 added delay 與 48 k 的 L+1 hop（出貨 3）</td></tr>
 <tr><td><code>dfn_rate_bridge</code>（host 在 8/16 k 時取代上面兩列的 lookahead + WOLA）</td>
 <td>host 的 1 hop WOLA + added delay</td>
-<td>added delay = <code>prefill + lat_up + (DFN_RES_STAGE_LOOKAHEAD_FRAMES+1)×512×sr/48000 + lat_down×sr/48000</code> 個原生樣本
+<td>added delay = <code>prefill + lat_up + (L+1)×512×sr/48000 + lat_down×sr/48000</code> 個原生樣本
 （<code>dfn/dfn_rate_bridge.c</code>；prefill 由 init 用真正的 resampler 量出，<code>lat_up</code>／<code>lat_down</code> 是升/降頻 resampler 的 <code>audio_resampler_latency_input_frames()</code>）。
 出貨 pair：<b>16 k/hop 128 → 672（42.0 ms），總延遲 800 = 50.0 ms</b>；
 16 k/hop 256 → 629（39.3 ms），總 885 = 55.3 ms；

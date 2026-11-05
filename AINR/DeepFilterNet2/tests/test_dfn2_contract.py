@@ -6,6 +6,7 @@ import math
 import os
 import pathlib
 import re
+import subprocess
 import sys
 
 import numpy as np
@@ -97,15 +98,6 @@ def c_macro(header_text, name):
 
 def model_io_header():
     return (ROOT_PATH / 'dfn2_model_io.h').read_text(encoding='utf-8')
-
-
-def shipped_grid_header():
-    """The 48 kHz preset block of dfn2_grid.h: the shipped grid's definitions."""
-    text = (ROOT_PATH / 'dfn2_grid.h').read_text(encoding='utf-8')
-    block = re.search(r'^#if DFN2_GRID_KHZ == 48$(.*?)^#elif', text,
-                      flags=re.MULTILINE | re.DOTALL)
-    assert block is not None
-    return block.group(1)
 
 
 def load_config():
@@ -370,18 +362,21 @@ def test_stateless_export_df_pathway_cache_is_live():
 def test_c_model_io_layout_constants_match_the_shipped_export_shapes():
     """dfn2_model_io.h's struct dimensions ARE the graph's state shapes.
 
-    The header hard-codes every tensor extent the accelerator hands back.
-    Nothing else compares them to the model the exporter actually builds from
-    the shipped config, so an emb_hidden_dim or enc_ch edit would silently
-    leave the C side allocating the wrong buffers -- the graph would still
-    export and only a board would find out.
+    The header hard-codes every tensor extent the accelerator hands back that
+    does not depend on the grid (window depth, GRU rows and width, encoder
+    channels, pathway window). Nothing else compares them to the model the
+    exporter actually builds from the shipped config, so an emb_hidden_dim or
+    enc_ch edit would silently leave the C side allocating the wrong buffers --
+    the graph would still export and only a board would find out. The two grid
+    extents (bands, deep-filter bins) are the application's, not the library's:
+    the shipped values are the ones config.ini says.
     """
     header = model_io_header()
-    grid = shipped_grid_header()
+    cfg = load_config()
     frames = c_macro(header, 'DFN2_MODEL_INPUT_FRAMES')
     hidden = c_macro(header, 'DFN2_MODEL_GRU_HIDDEN')
-    n_erb = c_macro(grid, 'DFN2_N_ERB')
-    df_bins = c_macro(grid, 'DFN2_DF_BINS')
+    n_erb = cfg.getint('model', 'n_erb')
+    df_bins = cfg.getint('model', 'df_bins')
     assert frames == INPUT_FRAMES, (
         'the C window depth and the exporter window depth are one contract'
     )
@@ -625,17 +620,225 @@ def test_export_metadata_publishes_the_lookahead_pair(
     assert metadata['input_feature_frames'] == INPUT_FRAMES
 
 
-def test_config_lookahead_pair_is_pinned_to_the_c_header_defaults():
-    """config.ini names the pair a checkpoint is trained for; the C build's
-    default constants must be the same pair, or the shipped host and the
-    shipped training config describe different models. A build for another
-    pair overrides the macros (-DDFN2_MASK_LOOKAHEAD=..) and is a deliberate
-    act; the defaults are what ships."""
-    model_cfg = read_model_config(load_config())
-    process = (ROOT_PATH / 'dfn2_process.h').read_text(encoding='utf-8')
-    assert model_cfg['mask_lookahead'] == c_macro(
-        process, 'DFN2_MASK_LOOKAHEAD')
-    assert model_cfg['df_lookahead'] == c_macro(process, 'DFN2_DF_LOOKAHEAD')
+# ---------------------------------------------------------------------------
+# The run-time grid of the C library
+#
+# The library holds no grid (dfn2_grid.h): the application builds a DFN2Grid
+# with dfn2_grid_make() from the numbers its trained model fixes. What the C
+# side can still be pinned to is (a) the grid every C test program runs when no
+# override is given (tests/dfn2_test_grid.h), which must be the grid and the
+# lookahead pair config.ini names, (b) the library's compile-time bounds, which
+# must cover config.ini and the legal pairs of the model, and (c) the grid
+# constructor itself, which must accept exactly the pairs the model accepts.
+# Each is read by building and running a small C program, not by matching text
+# in a header.
+# ---------------------------------------------------------------------------
+
+_REPORT_PROBE = r"""
+#include <stdio.h>
+
+#include "dfn2_test_grid.h"
+
+int main(void) {
+    const DFN2Grid *g = dfn2_test_grid();
+    printf("macro_sr=%d macro_n_fft=%d macro_n_erb=%d macro_df_bins=%d "
+           "macro_mask=%d macro_df=%d\n", DFN2_SR, DFN2_N_FFT, DFN2_N_ERB,
+           DFN2_DF_BINS, DFN2_MASK_LOOKAHEAD, DFN2_DF_LOOKAHEAD);
+    printf("sr=%d n_fft=%d hop=%d n_bins=%d n_erb=%d df_bins=%d mask=%d "
+           "df=%d history=%d ring=%d\n", g->sample_rate, g->n_fft, g->hop,
+           g->n_bins, g->n_erb, g->df_bins, g->mask_lookahead,
+           g->df_lookahead, g->df_history, g->ring);
+    printf("erb_alpha=%.9g spec_alpha=%.9g stft_scale=%.9g "
+           "stft_unscale=%.9g\n", (double)g->erb_norm_alpha,
+           (double)g->spec_norm_alpha, (double)g->stft_scale,
+           (double)g->stft_unscale);
+    printf("df_order=%d max_n_fft=%d max_n_erb=%d max_df_bins=%d "
+           "max_df_ring=%d max_mask=%d max_df=%d\n", DFN2_DF_ORDER,
+           DFN2_MAX_N_FFT, DFN2_MAX_N_ERB, DFN2_MAX_DF_BINS, DFN2_MAX_DF_RING,
+           DFN2_MAX_MASK_LOOKAHEAD, DFN2_MAX_DF_LOOKAHEAD);
+    return 0;
+}
+"""
+
+# argv: sample_rate n_fft n_erb df_bins. One line per (mask, df) probed: the
+# pair and the status dfn2_grid_make returns for it; the first line names the
+# two statuses the tests compare against.
+_PAIR_PROBE = r"""
+#include <stdio.h>
+#include <stdlib.h>
+
+#include "DeepFilterNet2/dfn2_grid.h"
+
+int main(int argc, char **argv) {
+    DFN2Grid g;
+    int mask, df;
+    if (argc != 5) return 2;
+    printf("OK=%d CAPACITY=%d\n", DFN2_GRID_OK, DFN2_GRID_ERR_CAPACITY);
+    for (mask = -1; mask <= 3; ++mask)
+        for (df = -1; df <= 5; ++df)
+            printf("%d %d %d\n", mask, df,
+                   dfn2_grid_make(&g, atoi(argv[1]), atoi(argv[2]),
+                                  atoi(argv[3]), atoi(argv[4]), mask, df));
+    return 0;
+}
+"""
+
+
+@pytest.fixture(scope='module')
+def c_probe(tmp_path_factory):
+    """``run(name, source, flags, args)`` -> stdout of the program built from
+    ``source`` (the process unit and audiolib linked in) with ``flags``."""
+    reason = dfn_pairs.require_toolchain()
+    if reason:
+        pytest.skip(reason)
+    lib = dfn_pairs.audio_common_lib()
+    work = tmp_path_factory.mktemp('dfn2_contract_probe')
+    built = {}
+
+    def run(name, source, flags=(), args=()):
+        key = (name, tuple(flags))
+        if key not in built:
+            src = work / ('%s.c' % name)
+            src.write_text(source, encoding='utf-8')
+            exe = work / ('%s_%d' % (name, len(built)))
+            subprocess.run(
+                ['cc', *dfn_pairs.house_cflags(), *flags,
+                 '-I', str(dfn_pairs.AINR / 'tests'), str(src),
+                 str(dfn_pairs.source_path('DeepFilterNet2', 'process')),
+                 lib, '-lm', '-o', str(exe)],
+                check=True, capture_output=True, text=True)
+            built[key] = exe
+        done = subprocess.run([str(built[key]), *[str(a) for a in args]],
+                              check=True, capture_output=True, text=True)
+        return done.stdout
+    return run
+
+
+def _report(c_probe, *flags):
+    fields = {}
+    for token in c_probe('report', _REPORT_PROBE, flags).split():
+        key, value = token.split('=')
+        fields[key] = float(value)
+    return fields
+
+
+def _config_grid():
+    cfg = load_config()
+    sr = cfg.getint('signal', 'sr')
+    hop = cfg.getint('signal', 'hop_len')
+    return cfg, sr, hop
+
+
+def test_the_default_test_grid_is_the_grid_and_pair_config_ini_names(c_probe):
+    """The C test programs run the grid ``tests/dfn2_test_grid.h`` gives them
+    when no ``-D`` override is passed, and ``dfn_pairs.defines()`` returns no
+    override for the pair config.ini names. So that default build must BE the
+    shipped model: sample rate, frame size, bands, deep-filter bins and
+    lookahead pair of config.ini, with the derived fields (hop, bins, the two
+    normaliser coefficients, the analysis scale) the ones the trainer derives
+    from them. A build for another grid or pair overrides the macros on
+    purpose; this default is what ships."""
+    cfg, sr, hop = _config_grid()
+    model_cfg = read_model_config(cfg)
+    feature_cfg = read_feature_config(cfg, sr, hop)
+    n_fft = cfg.getint('signal', 'n_fft')
+    df_order = model_cfg['df_order']
+    mask, df = model_cfg['mask_lookahead'], model_cfg['df_lookahead']
+    got = _report(c_probe)
+    assert (got['macro_sr'], got['macro_n_fft'], got['macro_n_erb'],
+            got['macro_df_bins'], got['macro_mask'], got['macro_df']) == (
+        sr, n_fft, model_cfg['n_erb'], model_cfg['df_bins'], mask, df)
+    assert (got['sr'], got['n_fft'], got['hop'], got['n_bins'], got['n_erb'],
+            got['df_bins'], got['mask'], got['df']) == (
+        sr, n_fft, hop, n_fft // 2 + 1, model_cfg['n_erb'],
+        model_cfg['df_bins'], mask, df)
+    assert got['history'] == df_order - df - 1
+    assert got['ring'] == max(df_order, mask + df + 1)
+    assert got['df_order'] == df_order
+    assert np.float32(got['erb_alpha']) == np.float32(feature_cfg['erb_alpha'])
+    assert np.float32(got['spec_alpha']) == np.float32(
+        feature_cfg['spec_alpha'])
+    assert np.float32(got['stft_scale']) == np.float32(
+        feature_cfg['analysis_scale'])
+    assert np.float32(got['stft_unscale']) == np.float32(math.sqrt(n_fft))
+    assert dfn_pairs.shipped_pair('DeepFilterNet2') == (mask, df)
+
+
+def test_the_default_test_grid_follows_its_overrides(c_probe):
+    """The pin above is not vacuous: the same program built for the pair
+    (2, 0) or the 16 kHz preset reports that grid instead."""
+    shipped = _report(c_probe)
+    other_pair = _report(c_probe, '-DDFN2_MASK_LOOKAHEAD=2',
+                         '-DDFN2_DF_LOOKAHEAD=0')
+    assert (other_pair['mask'], other_pair['df']) == (2, 0)
+    assert (other_pair['mask'], other_pair['df']) != (shipped['mask'],
+                                                       shipped['df'])
+    preset = _report(c_probe, '-DDFN2_GRID_KHZ=16')
+    assert (preset['sr'], preset['n_fft']) == (16000, 256)
+    assert preset['sr'] != shipped['sr']
+
+
+def test_the_library_capacities_cover_config_and_the_model_pair_bounds(
+        c_probe):
+    """The compile-time bounds of the library (``dfn2_grid.h``) are not a
+    grid, but the shipped model has to fit inside them with the default
+    build, and the lookahead bounds are the model's own legal range."""
+    cfg, sr, hop = _config_grid()
+    model_cfg = read_model_config(cfg)
+    got = _report(c_probe)
+    assert got['max_n_fft'] >= cfg.getint('signal', 'n_fft')
+    assert got['max_n_erb'] >= model_cfg['n_erb']
+    assert got['max_df_bins'] >= model_cfg['df_bins']
+    # the default ring holds the shipped pair
+    assert got['max_df_ring'] >= got['ring']
+    # the bounds ARE the legal range the model constructor accepts
+    assert got['max_mask'] == max(m for m, _ in LOOKAHEAD_PAIRS)
+    assert got['max_df'] == max(d for _, d in LOOKAHEAD_PAIRS)
+    assert got['max_df'] == model_cfg['df_order'] - 1
+
+
+def _accepted_pairs(c_probe, flags=()):
+    cfg, sr, hop = _config_grid()
+    model_cfg = read_model_config(cfg)
+    lines = c_probe(
+        'pairs', _PAIR_PROBE, flags,
+        (sr, cfg.getint('signal', 'n_fft'), model_cfg['n_erb'],
+         model_cfg['df_bins'])).splitlines()
+    names = dict(item.split('=') for item in lines[0].split())
+    ok, capacity = int(names['OK']), int(names['CAPACITY'])
+    accepted, over_capacity = [], []
+    for line in lines[1:]:
+        mask, df, status = map(int, line.split())
+        if status == ok:
+            accepted.append((mask, df))
+        elif status == capacity:
+            over_capacity.append((mask, df))
+    return accepted, over_capacity
+
+
+def test_the_grid_constructor_accepts_exactly_the_models_legal_pairs(c_probe):
+    """``dfn2_grid_make`` and ``DeepFilterNet2.__init__`` state the same rule
+    (mask in [0, 2], df in [0, df_order - 1], independent). With the ring
+    capacity raised to the deepest pair's (mask 2 + df 4 + 1 = 7) the library
+    accepts all 15 pairs and nothing else; the default build refuses, as a
+    capacity error, exactly the pairs whose ring max(df_order, mask + df + 1)
+    exceeds the capacity (five frames by default)."""
+    deepest = max(m + d + 1 for m, d in LOOKAHEAD_PAIRS)
+    assert deepest == 7
+    accepted, over_capacity = _accepted_pairs(
+        c_probe, ('-DDFN2_MAX_DF_RING=%d' % deepest,))
+    assert sorted(accepted) == sorted(LOOKAHEAD_PAIRS)
+    assert over_capacity == []
+
+    df_order = read_model_config(load_config())['df_order']
+    ring_capacity = int(_report(c_probe)['max_df_ring'])
+    accepted, over_capacity = _accepted_pairs(c_probe)
+    fits = [pair for pair in LOOKAHEAD_PAIRS
+            if max(df_order, pair[0] + pair[1] + 1) <= ring_capacity]
+    assert sorted(accepted) == sorted(fits)
+    assert sorted(over_capacity) == sorted(set(LOOKAHEAD_PAIRS) - set(fits))
+    assert 0 < len(over_capacity) < len(LOOKAHEAD_PAIRS)
+    assert dfn_pairs.shipped_pair('DeepFilterNet2') in accepted
 
 
 def test_changing_the_lookahead_pair_of_a_checkpoint_asks_for_retraining():

@@ -28,7 +28,7 @@ pipeline.
 |---|---|---|
 | `RNNoise-ERB` | 16 kHz / 512 / 512 / 256 | ERB-band recurrent mask |
 | `GTCRN` | 16 kHz / 512 / 512 / 256 | GTCRN complex enhancement |
-| `DeepFilterNet2` | 48 kHz / 1024 / 1024 / 512 (shipped; other grids are chosen at build time, see [`AINR/DeepFilterNet2/README.md`](AINR/DeepFilterNet2/README.md)) | full-band ERB mask → low-band DF → learned-alpha residual mix |
+| `DeepFilterNet2` | 48 kHz / 1024 / 1024 / 512 (shipped; the application hands the library any other grid at run time as a `DFN2Grid`, see [`AINR/DeepFilterNet2/README.md`](AINR/DeepFilterNet2/README.md)) | full-band ERB mask → low-band DF → learned-alpha residual mix |
 | `DeepFilterNet3` | 48 kHz / 1024 / 1024 / 512 | raw low-band DF + high-band ERB mask → concatenate |
 
 Each model carries its own feature contract and `MODEL_VERSION`; checkpoints

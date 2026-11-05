@@ -69,10 +69,14 @@ latency is that plus the host's WOLA hop (16 kHz, hop 128: 800 samples,
 (pair 0/1: 501 / 458 samples). The stage schedule per native hop is 0,1,1,1 frames at hop 128 and
 1,2 at hop 256.
 
-Lookahead pair. The DFN2 mask and deep-filter lookaheads M (0..2) and D (0..4) are a build setting
-(`DFN2_MASK_LOOKAHEAD` / `DFN2_DF_LOOKAHEAD`, default 1/1; this folder's Makefile forwards to
-`4ch_aec_bf_nr_res/Makefile`, which takes both variables, folds them into its build signature and has no
-`test-pairs` target). They must equal the pair the model was trained for. The rules, the pipelines make
+DFN2 grid and lookahead pair. The model grid is a run-time choice of `main.c`: `--ai-sample-rate <Hz>` / `--ai-fft-size <n>`
+(default 48000 / 1024, a row of the three-row table in `dfn/dfn_example_args.h`) built with `dfn2_grid_make()` and handed to
+`DfnResStageConfig.grid`; the mask and deep-filter lookaheads M (0..2) and D (0..4) are fields of that grid and must equal the
+pair the model was trained for. A host on the model's own rate (`--ai-sample-rate 16000 --ai-fft-size 256` with the 16 kHz core) runs
+the stage directly; any other host rate needs the bridge, which accepts the 48 kHz / 1024 model only (otherwise "pool query rejected",
+exit 1). The `DFN2_MASK_LOOKAHEAD` / `DFN2_DF_LOOKAHEAD` make variables (default 1/1; this folder's Makefile forwards to
+`4ch_aec_bf_nr_res/Makefile`, which takes both, folds them into its build signature and has no `test-pairs` target) reach the test
+program `test_4ch_dfn` only. The rules, the pipelines make
 variables and `make -C pipelines test-pairs` are in [`../README.md`](../README.md). Only the shipped 1/1 pair has a
 trained checkpoint; the numbers in this file are for it unless a pair is named.
 
@@ -85,8 +89,8 @@ make WERROR=1 test        # includes test_4ch_dfn and the skeleton
 
 The `Makefile` in this directory is a thin forwarder: `make -C pipelines/dfn/4ch_aec_bf_dfn_res test`
 builds and runs `test_4ch_dfn`, then the skeleton (default, `--delay-num-filters 1 --cng --atten-lim 12`,
-`--sample-rate 48000`) and checks that `--sample-rate 16000Hz`, `--sample-rate 8000` and
-`--atten-lim 12dB` exit with 2.
+`--sample-rate 48000`, `--ai-sample-rate 16000 --ai-fft-size 256`) and checks that `--sample-rate 16000Hz`, `--sample-rate 8000` and
+`--atten-lim 12dB` exit with 2 and that a 32 kHz model grid (which the bridge cannot serve) is a rejected pool query (exit 1).
 
 `libdfn_res_stage.a` holds the shared stage, the rate bridge and the DFN2 host
 pre/post objects; link it ahead of the flow's archives (`libaudio_pipeline_mcab.a`, which holds
@@ -94,8 +98,8 @@ pre/post objects; link it ahead of the flow's archives (`libaudio_pipeline_mcab.
 sample objects `mcab_sample_flow.o`, `mcab_sample_beam.o` and `mcab_sample_driver.o` are linked into
 the program, not archived. The board supplies the stateless model
 callback (`DFN2Model`) and the exported ERB matrices. `main.c` is the board
-skeleton (delay-profile flags, `--sample-rate` (16000 default or 48000), `--erb-fwd`
-/ `--erb-inv`, `--atten-lim`, `--cng`; the helper's default array geometry stands in for
+skeleton (delay-profile flags, `--sample-rate` (16000 default or 48000), `--ai-sample-rate` / `--ai-fft-size`,
+`--erb-fwd` / `--erb-inv`, `--atten-lim`, `--cng`; the helper's default array geometry stands in for
 the product's measured one; numbers are parsed strictly by `common/example_cli.h`, so values such as
 `16000Hz` exit with 2; it
 publishes the compiled-in model I/O descriptor, which a product replaces with
@@ -145,7 +149,7 @@ this flow the serial moves only with a flow reset (the lanes take an aligned far
 pairs with a hop reset.
 
 External parameters: the same board-skeleton flags as the mono variant (`--sample-rate` 16000 default or
-48000, delay profile, `--erb-fwd` / `--erb-inv`, `--atten-lim`, `--cng`), plus the flow's `McabConfig`
+48000, `--ai-sample-rate` / `--ai-fft-size`, delay profile, `--erb-fwd` / `--erb-inv`, `--atten-lim`, `--cng`), plus the flow's `McabConfig`
 (delay profile, `capture_proxy_channel`, `enable_post`) and the helper's `McabSampleBeamParams`
 (array geometry, `num_angles`; the skeleton uses the default 35 mm UCA, which a
 product replaces with the measured one) and `aec_res_set_level(res, ...)` on the example's own `AecRes`.
@@ -171,8 +175,8 @@ requires the final int8/fp runtime and board cycle measurement.
 Pool printed by the skeleton (`4ch_aec_bf_dfn_res`, matched delay, five-filter bank, NE10; the
 flow objects (four lanes, shared estimator, mcab pool), the SRP/BF helper, the post-beam `AecRes` carved by the example,
 the P and gain buffers, and the stage or bridge, each 16-byte
-aligned; shipped pair): 2,066,128 bytes at the 16 kHz default (flow plus helper 1,706,240 bytes, plus the rate bridge) and
-6,645,888 bytes at 48 kHz (flow plus helper 6,329,312 bytes). mcab's own pool is 74,624 bytes at
+aligned; shipped pair): 2,066,240 bytes at the 16 kHz default (flow plus helper 1,706,240 bytes, plus the rate bridge) and
+6,646,000 bytes at 48 kHz (flow plus helper 6,329,312 bytes). mcab's own pool is 74,624 bytes at
 16 kHz/256 (68,368 bytes front-only); the lanes and the estimator have their own pools.
 Model weights and accelerator activation/workspace memory are external;
 adding int8 weights alone brings the known minimum to about 4.0 MiB at

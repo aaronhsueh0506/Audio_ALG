@@ -13,9 +13,12 @@
 #include "audio_stft.h"
 
 #define BRIDGE_ALIGN 16u
-#define B48_FFT  DFN2_N_FFT
-#define B48_HOP  DFN2_HOP_LEN
-#define B48_BINS DFN2_N_BINS
+/* The bridge's own contract: the model runs on the shipped 48 kHz / 1024 / hop 512 / 513-bin grid
+ * (dfn_rate_bridge.h); a stage on any other grid is refused. */
+#define B48_RATE 48000
+#define B48_FFT  1024
+#define B48_HOP  512
+#define B48_BINS 513
 /* FIFO capacities: 511 leftover samples plus one upsampled native hop (<= 768);
  * the output FIFO holds the prefill, one hop of surplus and two downsampled frames. */
 #define FIFO48_CAP   1536
@@ -114,18 +117,18 @@ static size_t borrowed_bytes(size_t own_bytes, int fft_size) {
 
 static int resolve(const DfnRateBridgeConfig *cfg, Resolved *r) {
     size_t value;
-    /* added_delay depends on the lookahead pair, which must be dfn2_process.o's. */
-    DFN2_REQUIRE_LOOKAHEAD_PAIR_LINK();
-    /* The resampling ratios, the per-hop inference schedule, the prefill calibration and the
-     * delay arithmetic are written for a stage on DFN2's shipped 48 kHz grid. A build whose
-     * model is on another grid refuses instead of running them against it. */
-    if (DFN2_SR != 48000 || DFN2_N_FFT != 1024) return -1;
+    /* This object's DFN2 capacities must be the library objects': link-time check. */
+    DFN2_REQUIRE_VARIANT_LINK();
     if (!cfg || !r || grid_dims(cfg->sample_rate, cfg->fft_size,
                                 &r->fft_n, &r->hop_n) != 0)
         return -1;
-    if (cfg->stage.sample_rate != DFN2_SR ||
-        dfn_res_stage_get_mem_requirements(&cfg->stage, &r->stage_req) != 0)
-        return -1;
+    /* The resampling ratios, the per-hop inference schedule, the prefill calibration and the
+     * delay arithmetic are written for a stage on DFN2's shipped 48 kHz grid; a model on another
+     * grid is refused instead of running them against it. The lookahead pair the added delay
+     * depends on is the stage grid's; a model of another pair is refused by the stage's
+     * descriptor check below. */
+    if (cfg->stage.grid.sample_rate != B48_RATE || cfg->stage.grid.n_fft != B48_FFT) return -1;
+    if (dfn_res_stage_get_mem_requirements(&cfg->stage, &r->stage_req) != 0) return -1;
     r->fft_n_bytes = fft_get_mem_size(r->fft_n);
     r->fft48_bytes = fft_get_mem_size(B48_FFT);
     {
@@ -136,8 +139,8 @@ static int resolve(const DfnRateBridgeConfig *cfg, Resolved *r) {
         r->synth48_bytes = borrowed_bytes(ac_istft_get_mem_size(&sc), B48_FFT);
         r->stft48_bytes = borrowed_bytes(ac_stft_get_mem_size(&sc), B48_FFT);
     }
-    r->up_bytes = audio_resampler_get_mem_size(cfg->sample_rate, DFN2_SR, 1);
-    r->down_bytes = audio_resampler_get_mem_size(DFN2_SR, cfg->sample_rate, 1);
+    r->up_bytes = audio_resampler_get_mem_size(cfg->sample_rate, B48_RATE, 1);
+    r->down_bytes = audio_resampler_get_mem_size(B48_RATE, cfg->sample_rate, 1);
     if (!r->fft_n_bytes || !r->fft48_bytes || !r->synth_n_bytes ||
         !r->synth48_bytes || !r->stft48_bytes || !r->up_bytes ||
         !r->down_bytes)
@@ -198,12 +201,13 @@ static void fill_descriptor(const DfnRateBridgeConfig *cfg, const Resolved *r,
     out->bytes = (uint64_t)r->bytes;
 }
 
-DfnRateBridgeConfig dfn_rate_bridge_default_config(int sample_rate) {
+DfnRateBridgeConfig dfn_rate_bridge_default_config(int sample_rate,
+                                                   const DFN2Grid *model_grid) {
     DfnRateBridgeConfig cfg;
     memset(&cfg, 0, sizeof(cfg));
     cfg.sample_rate = sample_rate;
     cfg.fft_size = 0;
-    cfg.stage = dfn_res_stage_default_config(DFN2_SR);
+    cfg.stage = dfn_res_stage_default_config(model_grid);
     return cfg;
 }
 
@@ -309,12 +313,12 @@ DfnRateBridge *dfn_rate_bridge_init_ex(void *mem, size_t bytes,
                                      &cfg->stage, &r.stage_req);
     cursor += align_up((size_t)r.stage_req.bytes);
     b->up_e = audio_resampler_init(cursor, r.up_bytes, cfg->sample_rate,
-                                   DFN2_SR, 1);
+                                   B48_RATE, 1);
     cursor += align_up(r.up_bytes);
     b->up_p = audio_resampler_init(cursor, r.up_bytes, cfg->sample_rate,
-                                   DFN2_SR, 1);
+                                   B48_RATE, 1);
     cursor += align_up(r.up_bytes);
-    b->down = audio_resampler_init(cursor, r.down_bytes, DFN2_SR,
+    b->down = audio_resampler_init(cursor, r.down_bytes, B48_RATE,
                                    cfg->sample_rate, 1);
     cursor += align_up(r.down_bytes);
     if (!b->fft_n_handle || !b->fft48 || !b->stage || !b->up_e || !b->up_p ||
@@ -367,7 +371,7 @@ DfnRateBridge *dfn_rate_bridge_init_ex(void *mem, size_t bytes,
      * 48 kHz frames, and sample_rate is a multiple of 8000, so frames * sample_rate / 8000
      * is their native-sample value in sixths. */
     sixths = ((long long)b->prefill + lat_up) * DFN_RATE_BRIDGE_DELAY_DENOMINATOR +
-             ((long long)(DFN_RES_STAGE_LOOKAHEAD_FRAMES + 1) * B48_HOP + lat_down) *
+             ((long long)(dfn_res_stage_lookahead_frames(&cfg->stage.grid) + 1) * B48_HOP + lat_down) *
                  cfg->sample_rate / 8000;
     if (sixths > INT_MAX) return NULL;
     b->added_delay_sixths = (int)sixths;

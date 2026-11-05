@@ -74,15 +74,15 @@
 <!-- map:stats:begin -->
 | 範圍 | C 函式總數 | 已對應 | 其中 mirror | 其中 partial | C-only | 未能判斷 | Python-only 符號 | 已對應中的推論 |
 |---|---|---|---|---|---|---|---|---|
-| `PL` pipelines（common、mono、DFN、4ch、ULCNet 範例）與其 Python 參考 | 332 | 90 | 42 | 48 | 242 | 0 | 30 | 36 |
+| `PL` pipelines（common、mono、DFN、4ch、ULCNet 範例）與其 Python 參考 | 336 | 90 | 42 | 48 | 246 | 0 | 30 | 36 |
 | `TP` audiolib (doa/bf/VAD/common/utility) | 65 | 0 | 0 | 0 | 65 | 0 | 0 | 0 |
 | `AC` audiolib | 297 | 39 | 19 | 20 | 258 | 0 | 0 | 12 |
-| `AINR` AINR（DFN2、GTCRN、RNNoise-ERB） | 113 | 56 | 30 | 26 | 57 | 0 | 2 | 20 |
+| `AINR` AINR（DFN2、GTCRN、RNNoise-ERB） | 129 | 60 | 31 | 29 | 69 | 0 | 2 | 23 |
 | `AIAEC` AIAEC（Align-ULCNet、DeepVQE-S、共用 helper） | 114 | 40 | 17 | 23 | 74 | 0 | 0 | 21 |
-| `TOTAL` 合計 | 921 | 225 | 108 | 117 | 696 | 0 | 32 | 89 |
+| `TOTAL` 合計 | 941 | 229 | 109 | 120 | 712 | 0 | 32 | 92 |
 <!-- map:stats:end -->
 
-讀法：921 個 C 函式中，225 個有 Python 對應（mirror 108、partial 117），其中 89 個的配對是推論；696 個是 C-only；未能判斷 0 個。另有 32 個 Python 符號只在 Python。
+讀法：941 個 C 函式中，229 個有 Python 對應（mirror 109、partial 120），其中 92 個的配對是推論；712 個是 C-only；未能判斷 0 個。另有 32 個 Python 符號只在 Python。
 
 「已對應」是**索引**，不是「已驗證一致」。真正量過數值的只有「對拍工具／測試」欄標（C↔Py）的項目，以及備註內註明為一次性量測的數字；其餘靠「已知落差」欄的編號。
 
@@ -124,9 +124,9 @@
 | `pipelines/common/example_cli.h` | all | 8 |
 | `pipelines/mono_aec_nr_res/example_board_adapter.c` | all | 12 |
 | `pipelines/mono_aec_nr_res/main.c` | all | 23 |
-| `pipelines/dfn/dfn_example_args.h` | all | 6 |
+| `pipelines/dfn/dfn_example_args.h` | all | 9 |
 | `pipelines/dfn/dfn_rate_bridge.c` | all | 31 |
-| `pipelines/dfn/dfn_res_stage.c` | all | 24 |
+| `pipelines/dfn/dfn_res_stage.c` | all | 25 |
 | `pipelines/dfn/dfn_unit_partition.h` | all | 1 |
 | `pipelines/dfn/mono_aec_dfn_res/main.c` | all | 9 |
 | `pipelines/4ch_aec_bf_nr_res/mcab.c` | all | 56 |
@@ -162,9 +162,10 @@
 | `audiolib/common/src/audio_window.c` | all | 1 |
 | `audiolib/common/src/fft_wrapper_ne10.c` | all | 12 |
 | `audiolib/common/src/hpf.c` | all | 8 |
-| `AINR/DeepFilterNet2/dfn2_model_io.c` | all | 13 |
-| `AINR/DeepFilterNet2/dfn2_prepost.c` | all | 43 |
-| `AINR/DeepFilterNet2/dfn2_process.c` | all | 18 |
+| `AINR/DeepFilterNet2/dfn2_model_io.c` | all | 14 |
+| `AINR/DeepFilterNet2/dfn2_prepost.c` | all | 45 |
+| `AINR/DeepFilterNet2/dfn2_prepost.h` | all | 6 |
+| `AINR/DeepFilterNet2/dfn2_process.c` | all | 25 |
 | `AINR/GTCRN/gtcrn_process.c` | all | 19 |
 | `AINR/RNNoise-ERB/gen_rnnoise_tables.c` | all | 7 |
 | `AINR/RNNoise-ERB/process.c` | all | 12 |
@@ -198,7 +199,7 @@
 | PL-DFN-03 | `pipelines/dfn/dfn_res_stage.c: dfn_res_stage_set_atten_lim` | `pipelines/dfn/dfn2_stage.py:Dfn2Stage.set_atten_lim` | mirror | — | — | — |
 | PL-DFN-04 | `pipelines/dfn/dfn_res_stage.c: erb_inv_is_partition_of_unity` | `pipelines/dfn/dfn2_stage.py:erb_inv_is_partition_of_unity`<br>`AINR/DeepFilterNet2/export_erb_matrix.py:require_partition_of_unity` | mirror | S-21 | `AINR/DeepFilterNet2/tests/test_dfn2_contract.py`（Py 契約） | identity（fail-open）路徑的前提：單位 band mask 展開後每個 bin 恰為 1.0。 |
 | PL-DFN-05 | `pipelines/dfn/dfn_res_stage.c: dfn_res_stage_output_frame_index` | `pipelines/dfn/dfn2_stage.py:StageOutput.frame_index` | partial | — | — | （推論）C 是存取函式，Python 把來源 frame 序號放在 `StageOutput` 欄位。 |
-| PL-DFN-06 | `pipelines/dfn/dfn_res_stage.c: align_up, carve, fnv1a_u32, backend_id, model_valid, resolve, fill_descriptor, dfn_res_stage_default_config, dfn_res_stage_get_mem_requirements, descriptor_matches, dfn_res_stage_init_ex, dfn_res_stage_init, dfn_res_stage_create, dfn_res_stage_destroy, dfn_res_stage_get_counters, inputs_valid` | — | C-only | — | — | 描述子、記憶體池、counters；`inputs_valid` 在 begin 前掃兩個輸入頻譜是否有限，Python 的 `Dfn2Stage.push` 只檢查 heads 輸出端（fail-open 的觸發條件），沒有輸入端掃描。 |
+| PL-DFN-06 | `pipelines/dfn/dfn_res_stage.c: align_up, carve, fnv1a_u32, backend_id, model_valid, resolve, fill_descriptor, dfn_res_stage_default_config, dfn_res_stage_get_mem_requirements, descriptor_matches, dfn_res_stage_init_ex, dfn_res_stage_init, dfn_res_stage_create, dfn_res_stage_destroy, dfn_res_stage_get_counters, dfn_res_stage_grid, inputs_valid` | — | C-only | — | — | 描述子、記憶體池、counters；`inputs_valid` 在 begin 前掃兩個輸入頻譜是否有限，Python 的 `Dfn2Stage.push` 只檢查 heads 輸出端（fail-open 的觸發條件），沒有輸入端掃描。 |
 | PL-DFN-07 | `pipelines/dfn/dfn_rate_bridge.c: dfn_rate_bridge_process, dfn_rate_bridge_begin, dfn_rate_bridge_nn_begin, dfn_rate_bridge_nn_end, dfn_rate_bridge_finish, push_up, finish_frame` | `pipelines/dfn/dfn2_rate_adapter.py:Dfn2RateBridge.push` | mirror | D-24 | `pipelines/dfn/tests/test_dfn2_rate_bridge_c_parity.py`（C↔Py） | 兩邊用同一個 C resampler 核心，只剩 FFT 後端差；容差 float32 round-off，prefill／added delay 為相同整數。 |
 | PL-DFN-08 | `pipelines/dfn/dfn_rate_bridge.c: calibrate_prefill` | `pipelines/dfn/dfn2_rate_adapter.py:Dfn2RateBridge._calibrate_prefill` | mirror | — | `pipelines/dfn/tests/test_dfn2_rate_bridge_c_parity.py`（C↔Py） | — |
 | PL-DFN-09 | `pipelines/dfn/dfn_rate_bridge.c: dfn_rate_bridge_reset, clear_streams` | `pipelines/dfn/dfn2_rate_adapter.py:Dfn2RateBridge.reset` | mirror | — | — | — |
@@ -206,7 +207,7 @@
 | PL-DFN-10 | `pipelines/dfn/dfn_rate_bridge.c: grid_dims, resolve, dfn_rate_bridge_added_delay_samples, dfn_rate_bridge_added_delay_exact` | `pipelines/dfn/dfn2_rate_adapter.py:Dfn2RateBridge.__init__` | partial | — | `pipelines/dfn/tests/test_dfn2_rate_bridge_c_parity.py`（C↔Py） | （推論）grid 能力閘與 added delay（取整後 16k/128: 672、16k/256: 629、8k/128: 330；精確值為 `dfn_rate_bridge_added_delay_exact` 回傳的分子除以 6 個原生 sample，例如 pair 0/1 在 16k/128 為 501 1/3）；Python 在建構時計算 `added_delay` 與 `added_delay_exact` 並對拍。 |
 | PL-DFN-11 | `pipelines/dfn/dfn_rate_bridge.c: align_up, fnv_u32, borrowed_bytes, fill_descriptor, dfn_rate_bridge_default_config, dfn_rate_bridge_get_mem_requirements, descriptor_matches, dfn_rate_bridge_init_ex, dfn_rate_bridge_init, dfn_rate_bridge_create, dfn_rate_bridge_destroy, dfn_rate_bridge_hop_size, dfn_rate_bridge_n_freqs, dfn_rate_bridge_stage, dfn_rate_bridge_get_counters, dfn_rate_bridge_get_host_hops` | — | C-only | — | — | 描述子、記憶體池、counters、存取函式；`dfn_rate_bridge_get_host_hops` 是診斷用的 tap（原生格點的 E／P 合成 hop，Python 孿生以 `Dfn2RateBridge.host_hops` 屬性暴露）。 |
 | PL-DFN-12 | `pipelines/dfn/mono_aec_dfn_res/main.c: rig_process, follow_post_reset`<br>`pipelines/dfn/dfn_hop.h: dfn_hop_begin, dfn_hop_nn_begin, dfn_hop_nn_end, dfn_hop_end, dfn_hop_process` | `pipelines/dfn/mono_aec_dfn_res/pipeline.py:run_dfn2_res` | mirror | D-43；T-15 | `pipelines/dfn/mono_aec_dfn_res/tests/test_dfn2_pipeline_contract.py`（Py 對 Py，identity 模型） | Python 是這條 C 組合的孿生（`dfn/mono_aec_dfn_res/pipeline.py` 檔頭明載）：`Aec` → `aec_get_res_context` → `rig_process` 內聯的 `sk_min_f32`（min(1, G_res)）、`sk_capply_gain_f32` 與 `aec_cng_fill`（RES 增益加 comfort noise，不跑 NR、不合成）→ DFN2 hop。identity 模型下 Python 吃 C seam 對 C 輸出最大差 1.2e-7（A6，一次性量測）。Python 另有 C 沒有的實驗開關（--dfn-estimate-source、--dfn-compose）。 |
-| PL-DFN-16 | `pipelines/dfn/mono_aec_dfn_res/main.c: run_accelerator, derive_lane, make_plan, rig_free, rig_build, rig_reset, main`<br>`pipelines/dfn/dfn_unit_partition.h: dfn_unit_partition`<br>`pipelines/dfn/dfn_example_args.h: dfn_example_rate_known, dfn_example_rates_text, dfn_example_usage, dfn_example_parse_args, dfn_example_read_matrix, dfn_example_load_matrices` | — | C-only | — | — | 板端範例的 CLI、參數解析、記憶體計畫與單位 ERB 矩陣；`run_accelerator` 是替換成板端 runtime 的樁。 |
+| PL-DFN-16 | `pipelines/dfn/mono_aec_dfn_res/main.c: run_accelerator, derive_lane, make_plan, rig_free, rig_build, rig_reset, main`<br>`pipelines/dfn/dfn_unit_partition.h: dfn_unit_partition`<br>`pipelines/dfn/dfn_example_args.h: dfn_example_rate_known, dfn_example_rates_text, dfn_example_model_rows_text, dfn_example_model_row, dfn_example_usage, dfn_example_resolve_model_grid, dfn_example_parse_args, dfn_example_read_matrix, dfn_example_load_matrices` | — | C-only | — | — | 板端範例的 CLI、參數解析、記憶體計畫與單位 ERB 矩陣；`run_accelerator` 是替換成板端 runtime 的樁。 |
 | PL-DFN-17 | `pipelines/dfn/dfn_hop.h: dfn_hop_init_stage, dfn_hop_init_bridge, dfn_hop_reset, dfn_hop_stage` | — | C-only | — | — | `DfnHop` 的接線（48 kHz 走 stage 加呼叫端的 `AcIstft`，其餘走 rate bridge）、重置與存取；非擁有指標，沒有 Python 對應。 |
 | PL-DFN-18 | `pipelines/dfn/dfn_hop_pool.h: dfn_hop_pool_plan, dfn_hop_pool_bytes, dfn_hop_pool_build` | — | C-only | — | — | 兩個 DFN2 範例 main 共用的 pool 尾段：48 kHz 為 stage、48 kHz 合成與 stage 輸出頻譜，其他取樣率為 rate bridge；依序切出並接上 `DfnHop`（4ch 版開 stage 路徑的 finite 檢查）。沒有 Python 版。 |
 | PL-MCAB-01 | `pipelines/4ch_aec_bf_nr_res/mcab.c: update_shared_delay` | `pipelines/4ch_aec_bf_nr_res/pipeline.py:SharedMatchedDelayEstimator.accumulate` | mirror | D-39 | `pipelines/4ch_aec_bf_nr_res/tests/test_delay_parity.py`（C↔Py）；`pipelines/4ch_aec_bf_nr_res/tests/dump_delay_parity.c`（C 側驅動） | delay_samples／solid／changed 逐 hop 相同（16k/256 1250/1250、16k/512 625/625、48k 937/937）；matched-filter 的 duty-cycle 排程、FIXED 與 EXTERNAL_ALIGNED 模式是 C-only（對拍時 pin 全速）。共用 estimator（`DelayAec`）由應用程式建立後注入。 |
@@ -322,19 +323,23 @@
 | AINR-DFN2-11 | `AINR/DeepFilterNet2/dfn2_process.c: dfn2_set_erb_matrices`<br>`AINR/DeepFilterNet2/dfn2_prepost.c: dfn2_prepost_set_erb_matrices` | `AINR/DeepFilterNet2/export_erb_matrix.py:write_runtime_bins` | partial | S-21 | `AINR/DeepFilterNet2/tests/test_dfn2_contract.py`（Py 契約） | C 載入呼叫端提供的 ERB 矩陣（bin-major forward、band-major inverse）；寫出端是 `--runtime-bins` 路徑。 |
 | AINR-DFN2-12 | `AINR/DeepFilterNet2/dfn2_process.c: erb_spans, dfn2_framing_config, dfn2_state_init, dfn2_simd_backend` | — | C-only | — | — | band 範圍計算、framing 設定、狀態初始化、SIMD 後端查詢。 |
 | AINR-DFN2-13 | `AINR/DeepFilterNet2/dfn2_model_io.c: dfn2_model_io_push_erb_window, dfn2_model_io_push_spec_window, dfn2_model_io_push_features` | `AINR/DeepFilterNet2/export_onnx.py:feature_windows`<br>`pipelines/dfn/dfn2_stage.py:Dfn2Stage._push_window` | mirror | T-14 | — | [t-1, t, t+1] 圖輸入視窗滑動；40 窗含零 flush 逐位元相同（一次性量測）。每次 invocation N 個 frame（`DFN2_FRAMES_PER_CALL`）時視窗為 N+2 個 frame，第一次呼叫在推入 M+N 個 frame 後就緒、之後每 N 個一次；Python 孿生是 `export_onnx.py:feature_chunk_windows`（見 AINR-DFN2-26）。 |
-| AINR-DFN2-14 | `AINR/DeepFilterNet2/dfn2_model_io.c: dfn2_model_io_init, dfn2_model_io_descriptor_default, dfn2_model_io_descriptor_validate, all_finite, dfn2_model_io_validate_arrays, dfn2_model_io_validate_state, dfn2_model_io_reset, dfn2_model_io_zero_recurrent, dfn2_model_io_state_generation` | — | C-only | T-14 | — | 描述子驗證、遞迴狀態的有限性檢查與歸零、state generation；只有 C 對 C 或錄製 digest 的測試。 |
+| AINR-DFN2-14 | `AINR/DeepFilterNet2/dfn2_model_io.c: dfn2_model_io_init, dfn2_model_io_ready_frames, dfn2_model_io_descriptor_default, dfn2_model_io_descriptor_validate, all_finite, dfn2_model_io_validate_arrays, dfn2_model_io_validate_state, dfn2_model_io_reset, dfn2_model_io_zero_recurrent, dfn2_model_io_state_generation` | — | C-only | T-14 | — | 描述子驗證（描述子的 grid 欄位取自呼叫端傳入的 `DFN2Grid`）、第一次加速器呼叫需要的 feature frame 數（`dfn2_model_io_ready_frames()` = `mask_lookahead` + `DFN2_FRAMES_PER_CALL`）、遞迴狀態的有限性檢查與歸零、state generation；只有 C 對 C 或錄製 digest 的測試。 |
 | AINR-DFN2-15 | `AINR/DeepFilterNet2/dfn2_prepost.c: dfn2_prepost_pre_process_freq, dfn2_prepost_pre_process_freq_dual, dfn2_prepost_frame_inputs, dfn2_prepost_frame_commit, dfn2_prepost_post_process_freq, pp_begin_frame, pp_close_frame` | `pipelines/dfn/dfn2_stage.py:Dfn2Stage.push` | partial | D-42 | `pipelines/dfn/tests/test_dfn2_stage.py`（Py 契約） | FREQ 模式；Python 的孿生是雙輸入版（估計頻譜 A、應用頻譜 B），C 類別的單一暫存對在孿生中拆成兩個。 |
 | AINR-DFN2-16 | `AINR/DeepFilterNet2/dfn2_prepost.c: dfn2_prepost_frame_skip` | `pipelines/dfn/dfn2_stage.py:Dfn2Stage.push` | partial | D-42 | — | fail-open：單位 mask、零 tap、alpha 0。C 在 commit 被拒時就地歸零遞迴狀態，Python 不步進狀態。 |
 | AINR-DFN2-17 | `AINR/DeepFilterNet2/dfn2_prepost.c: dfn2_prepost_reset` | `pipelines/dfn/dfn2_stage.py:Dfn2Stage.reset` | partial | D-42 | — | （推論）重置類別與其 DFN2State；Python 重置自己的環與狀態，fail-open 後的狀態語意見 D-42。 |
 | AINR-DFN2-18 | `AINR/DeepFilterNet2/dfn2_prepost.c: dfn2_prepost_set_atten_lim` | `pipelines/dfn/dfn2_stage.py:Dfn2Stage.set_atten_lim` | mirror | — | — | — |
 | AINR-DFN2-19 | `AINR/DeepFilterNet2/dfn2_prepost.c: dfn2_prepost_output_frame_index` | `pipelines/dfn/dfn2_stage.py:StageOutput.frame_index` | partial | — | — | （推論）C 是存取函式，Python 把來源 frame 序號放在 `StageOutput.frame_index`。 |
-| AINR-DFN2-20 | `AINR/DeepFilterNet2/dfn2_prepost.c: dfn2_prepost_model_lookahead_frames` | `pipelines/dfn/dfn2_stage.py:MODEL_LOOKAHEAD` | partial | — | — | （推論）C 是存取函式，Python 是常數。N 個 frame 每次 invocation 時 C 回 M+D+N-1（`DFN2_PREPOST_LATENCY_FRAMES`），`dfn2_stage.py` 的 `MODEL_LOOKAHEAD` 仍是 M+D，因為 pipelines 固定 N=1。 |
+| AINR-DFN2-20 | `AINR/DeepFilterNet2/dfn2_prepost.c: dfn2_prepost_model_lookahead_frames`<br>`AINR/DeepFilterNet2/dfn2_prepost.h: dfn2_prepost_latency_frames` | `pipelines/dfn/dfn2_stage.py:MODEL_LOOKAHEAD` | partial | — | — | （推論）C 是存取函式，Python 是常數。N 個 frame 每次 invocation 時 C 回 M+D+N-1（`dfn2_prepost_latency_frames(grid)`，標頭內的 inline 函式，取 grid 的兩個 lookahead），`dfn2_stage.py` 的 `MODEL_LOOKAHEAD` 仍是 M+D，因為 pipelines 固定 N=1。 |
 | AINR-DFN2-21 | `AINR/DeepFilterNet2/dfn2_prepost.c: dfn2_prepost_hop_size` | `pipelines/dfn/dfn2_stage.py:HOP` | partial | — | — | （推論）C 是存取函式，Python 是常數。 |
 | AINR-DFN2-22 | `AINR/DeepFilterNet2/dfn2_prepost.c: dfn2_prepost_num_bins` | `pipelines/dfn/dfn2_stage.py:N_BINS` | partial | — | — | （推論）C 是存取函式，Python 是常數。 |
 | AINR-DFN2-23 | `AINR/DeepFilterNet2/dfn2_prepost.c: dfn2_model_run_frame` | `pipelines/dfn/dfn2_stage.py:Dfn2Heads.__call__` | partial | — | — | （推論）加速器 callback 邊界；Python 端是 heads 可呼叫物件。 |
 | AINR-DFN2-24 | `AINR/DeepFilterNet2/dfn2_prepost.c: dfn2_prepost_pre_process, dfn2_prepost_post_process` | — | C-only | D-33 | — | TIME 模式（STFT 由類別擁有，合成經應用端的 `AcIstft`（`cfg.istft`））；Python 側由 inference.py 的 torch.stft／istft 取代，見 AINR-DFN2-03、04。 |
-| AINR-DFN2-25 | `AINR/DeepFilterNet2/dfn2_prepost.c: pp_carve, pp_fnv1a_u32, pp_fnv1a_str, pp_build_hash, pp_framing_size, pp_istft_matches, pp_layout, dfn2_prepost_config_defaults, pp_check_config, dfn2_prepost_get_mem_size, pp_reset_states, pp_clear_frame, pp_zero_staging, dfn2_prepost_init_ex, dfn2_prepost_init, dfn2_prepost_create, dfn2_prepost_destroy, dfn2_prepost_state_generation, dfn2_prepost_io_mode, dfn2_prepost_layout_version, pp_all_finite, pp_fill_nan` | — | C-only | T-14 | — | 記憶體池佈局、設定檢查、build hash、生命週期、存取函式。 |
+| AINR-DFN2-25 | `AINR/DeepFilterNet2/dfn2_prepost.c: pp_carve, pp_fnv1a_u32, pp_fnv1a_str, pp_build_hash, pp_framing_size, pp_istft_matches, pp_layout, dfn2_prepost_config_defaults, pp_check_config, dfn2_prepost_get_mem_size, pp_reset_dsp, pp_reset_states, pp_clear_frame, pp_zero_staging, dfn2_prepost_init_ex, dfn2_prepost_init, dfn2_prepost_create, dfn2_prepost_destroy, dfn2_prepost_state_generation, dfn2_prepost_io_mode, dfn2_prepost_grid, dfn2_prepost_layout_version, pp_all_finite, pp_fill_nan` | — | C-only | T-14 | — | 記憶體池佈局、設定檢查、build hash（折入整個 grid，含 lookahead pair、兩個 alpha 與正規化器起點）、生命週期、存取函式（`dfn2_prepost_grid()` 回傳實例持有的 grid）。 |
 | AINR-DFN2-26 | `AINR/DeepFilterNet2/dfn2_model_io.c: dfn2_model_io_frame_slot`<br>`AINR/DeepFilterNet2/dfn2_prepost.c: pp_input_slot, pp_deliver_slot, pp_deliver` | `AINR/DeepFilterNet2/export_onnx.py:feature_chunk_windows` | partial | — | `AINR/tests/test_dfn2_frames_per_call_c.py`（C 對 C） | （推論）每次 invocation N 個 frame：最後一個推入 frame 完成的是第幾個 head（`index % N`）、輸入視窗與輸出 head 的槽位，以及一次 commit 後把 N 個 frame 依序合成並逐 hop 交出；Python 側只有匯出端的 N+2 視窗切法，沒有 host 孿生（`dfn2_stage.py` 固定 N=1）。N=1 時槽位恆為 0。 |
+| AINR-DFN2-27 | `AINR/DeepFilterNet2/dfn2_process.c: dfn2_norm_alpha` | `AINR/DeepFilterNet2/train.py:make_norm_alpha` | mirror | — | `AINR/tests/test_dfn2_grid.py`（C↔Py） | 兩個 EMA 係數 = exp(−(hop／sr)／tau) 取三位小數、進位到 1.0 就多一位。C 以 `fma` 對確切的二進位值取捨並平手取偶數，重現 Python `round()`（輔助函式 `round_decimals`，Python 內建函式，表中無對應符號）。grid 內固定 tau = 1.0 s。 |
+| AINR-DFN2-28 | `AINR/DeepFilterNet2/dfn2_process.c: dfn2_grid_make, dfn2_grid_validate` | `AINR/DeepFilterNet2/train.py:validate_signal_config`<br>`AINR/DeepFilterNet2/train.py:analysis_scale` | partial | — | `AINR/tests/test_dfn2_grid.py`（C↔Py） | （推論）由六個模型給定值（sr、n_fft、n_erb、df_bins、兩個 lookahead）推導 hop、bins、尺度、ring 與兩個 alpha，並拒絕非法 grid。Python 的 `validate_signal_config` 檢查同一批規則（n_erb 為 4 的倍數、df_bins 範圍、lookahead 範圍），但 `win_len`／`hop_len` 可另設；C 固定 hop = n_fft／2，另外只有 C 檢查 n_fft 為 2 的次方、每個 band 至少兩個 bin、容量上限（`DFN2_GRID_ERR_CAPACITY`）與推導欄位一致性。`analysis_scale` = 1／√n_fft 對應 grid 的 `stft_scale`。 |
+| AINR-DFN2-29 | `AINR/DeepFilterNet2/dfn2_process.c: is_power_of_two, round_decimals, state_ready, dfn2_grid_status_text` | — | C-only | — | — | grid 檢查的輔助函式、Python `round()` 的 C 重現、state 是否已記錄 grid 的判斷、狀態碼的文字（記錄用）。 |
+| AINR-DFN2-30 | `AINR/DeepFilterNet2/dfn2_prepost.h: dfn2_prepost_erb_window_elements, dfn2_prepost_spec_window_elements, dfn2_prepost_erb_mask_elements, dfn2_prepost_convp_window_elements, dfn2_prepost_coefs_elements` | — | C-only | — | — | 加速器邊界各張量的 float 個數（隨 grid 的 n_erb、df_bins 與 `DFN2_FRAMES_PER_CALL`）；Python 端的形狀在匯出的 `input_schema`／`output_schema`。標頭內的 inline 函式，`dfn2_prepost_latency_frames` 見 AINR-DFN2-20。 |
 | AINR-GTCRN-01 | `AINR/GTCRN/gtcrn_process.c: gtcrn_model_input` | `AINR/GTCRN/stream_model.py:stream_features` | mirror | — | `AINR/tests/test_python_c_prepost_parity.py`（C↔Py） | 主機側 ERB 前端（mag／re／im）；mag 3.8e-6、re／im 9.5e-7（一次性量測）。 |
 | AINR-GTCRN-02 | `AINR/GTCRN/gtcrn_process.c: gtcrn_model_output` | `AINR/GTCRN/stream_model.py:host_synthesis` | mirror | — | `AINR/tests/test_python_c_prepost_parity.py`（C↔Py） | 複數比值遮罩套用與 ERB 逆展開；200 幀逐位元相同。 |
 | AINR-GTCRN-03 | `AINR/GTCRN/gtcrn_process.c: erb_band_channel_scalar, erb_band3, erb_band3_neon` | `AINR/GTCRN/model.py:ERB.bm` | mirror | S-33 | — | （推論）低頻 bin 直通、高頻 192 個 bin 折成 64 個 band（band merge）。C 用匯出的前向表，Python 用 nn.Linear 權重；表由 export_erb_matrix.py 的 runtime-bins 路徑匯出。 |

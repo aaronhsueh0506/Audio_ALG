@@ -16,16 +16,20 @@
  * spectrum it filters stay the same signal, so a guard hop does not pair a capture-based P with a
  * residual-based estimate. There is no denoiser in this chain; the stage keeps running through an AEC
  * reset event (it never resets on one). On a new aec_post_reset_serial() the comfort noise restarts from
- * AEC_CNG_SEED before that hop's first draw. At 48 kHz the host synthesis also drops its overlap-add
- * tail, DFN_RES_STAGE_LOOKAHEAD_FRAMES hops later, before the push of the first frame built after the
- * reset: the stage delays every frame by that many hops, so the event is delayed with it. Below 48 kHz
- * the host-grid synthesis lives inside dfn_rate_bridge and runs at the top of its begin(): there
+ * AEC_CNG_SEED before that hop's first draw. On the stage path (host rate equals the model grid's) the
+ * host synthesis also drops its overlap-add tail, dfn_res_stage_lookahead_frames() hops later (0 for
+ * the 16 and 32 kHz rows), before the push of the first frame built after the reset: the stage delays
+ * every frame by that many hops, so the event is delayed with it. On the bridge path the host-grid
+ * synthesis lives inside dfn_rate_bridge and runs at the top of its begin(): there
  * dfn_rate_bridge_reset_synthesis() on the hop of the event clears just that overlap-add tail (DFN2,
  * the resamplers and the FIFOs keep running), with no delay line.
  *
- * 48 kHz hosts drive dfn_res_stage.h and synthesise through an AcIstft; 8/16 kHz hosts run the
- * same stage on its 48 kHz grid inside dfn_rate_bridge.h. The first output hops are zero: the
- * model's DFN_RES_STAGE_LOOKAHEAD_FRAMES hops at 48 kHz (two for the shipped 1/1 lookahead pair),
+ * A host on the model's own rate (--ai-sample-rate, default 48 kHz) drives dfn_res_stage.h and
+ * synthesises through an AcIstft; any other host rate runs the same stage on its 48 kHz grid inside
+ * dfn_rate_bridge.h, which needs the 48 kHz / 1024 model. The model grid is built from the
+ * --ai-sample-rate / --ai-fft-size pair (dfn_example_args.h) with dfn2_grid_make() and handed to
+ * every object; nothing here is fixed at build time. The first output hops are zero: the model's
+ * dfn_res_stage_lookahead_frames() hops on the stage path (two for the shipped 1/1 lookahead pair),
  * the bridge's added delay otherwise (printed below).
  *
  * The program builds the pool from the command-line delay profile and ERB matrices, installs a
@@ -44,8 +48,11 @@
 #include <stdlib.h>
 #include <string.h>
 
-static float g_erb_fwd[DFN2_N_BINS * DFN2_N_ERB];
-static float g_erb_inv[DFN2_N_ERB * DFN2_N_BINS];
+/* Capacity of the ERB matrices (the library's largest grid) and of the host hop buffers (48 kHz,
+ * FFT 1024: the largest host grid HOST_RATES offers). */
+#define HOST_MAX_HOP 512
+static float g_erb_fwd[DFN2_MAX_N_BINS * DFN2_MAX_N_ERB];
+static float g_erb_inv[DFN2_MAX_N_ERB * DFN2_MAX_N_BINS];
 
 /* Replace with the board runtime call. `inputs` carries the feature windows and the
  * CPU-owned recurrent state; fill every tensor in `outputs` and return 0. A nonzero
@@ -101,7 +108,7 @@ static int make_plan(const DfnExampleArgs *args, const DFN2Model *model, Plan *p
     p->vec_bytes = ALIGN16((size_t)p->grid.n_freqs * sizeof(float));
     p->spec_bytes = ALIGN16((size_t)p->grid.n_freqs * sizeof(Complex));
 
-    p->dfn.stage_cfg = dfn_res_stage_default_config(DFN2_SR);
+    p->dfn.stage_cfg = dfn_res_stage_default_config(&args->model_grid);
     p->dfn.stage_cfg.atten_lim_db = args->atten_lim_db;
     p->dfn.stage_cfg.erb_fwd = g_erb_fwd;
     p->dfn.stage_cfg.erb_inv = g_erb_inv;
@@ -126,6 +133,7 @@ typedef struct Rig {
     uint32_t reset_serial;            /* the aec_post_reset_serial() value already handled */
     uint32_t reset_pending;           /* bit k: a hard reset was seen k hops ago (the stage path's delay line) */
     int n_freqs, enable_cng;
+    int reset_delay;                  /* hops the stage path delays a frame by (the model's lookahead) */
     DfnResStage *stage;
     DfnRateBridge *bridge;
     AcIstft *istft;
@@ -151,6 +159,7 @@ static int rig_build(Rig *r, const Plan *p) {
     if (!r->aec) goto fail;
     r->n_freqs = p->grid.n_freqs;
     r->enable_cng = p->enable_cng;
+    r->reset_delay = dfn_res_stage_lookahead_frames(&p->dfn.stage_cfg.grid);
     r->unity = (float *)cur;      cur += p->vec_bytes;
     r->total_gain = (float *)cur; cur += p->vec_bytes;
     r->post = (Complex *)cur;     cur += p->spec_bytes;
@@ -177,8 +186,8 @@ static void rig_reset(Rig *r) {
 
 /* The AEC's hard post-chain reset event (aec.h, aec_post_reset_serial): the reset happened inside this
  * hop's aec_process_context(), before its synthesis. The comfort noise restarts from AEC_CNG_SEED before
- * this hop's first draw. The stage path (48 kHz) owns its synthesis: its output for the frame built on
- * this hop appears DFN_RES_STAGE_LOOKAHEAD_FRAMES hops later, so the overlap-add tail is dropped
+ * this hop's first draw. The stage path (host rate equals the model grid's) owns its synthesis: its output for the frame built on
+ * this hop appears dfn_res_stage_lookahead_frames() hops later, so the overlap-add tail is dropped
  * before the push of that frame. The bridge path synthesises the spectra it is given at the top of
  * its begin(), so its tail is dropped now, before this hop enters it. Call this before
  * dfn_hop_process() of every hop. Nothing else follows: the AEC is not reset in response and the
@@ -191,7 +200,7 @@ static void follow_post_reset(Rig *r) {
     if (moved && r->bridge) (void)dfn_rate_bridge_reset_synthesis(r->bridge);   /* between hops: cannot refuse */
     if (!r->istft) return;
     r->reset_pending = (r->reset_pending << 1) | moved;
-    if ((r->reset_pending >> DFN_RES_STAGE_LOOKAHEAD_FRAMES) & 1u) ac_istft_reset(r->istft);
+    if ((r->reset_pending >> r->reset_delay) & 1u) ac_istft_reset(r->istft);
 }
 
 /* One host hop: P = B * min(1, G_res), B the rendering base, plus comfort noise on the bins the RES
@@ -222,9 +231,9 @@ int main(int argc, char **argv) {
     DFN2ModelIoDescriptor descriptor;
     Plan plan;
     Rig rig;
-    static float mic[DFN2_HOP_LEN];
-    static float far[DFN2_HOP_LEN];
-    static float output[DFN2_HOP_LEN];
+    static float mic[HOST_MAX_HOP];
+    static float far[HOST_MAX_HOP];
+    static float output[HOST_MAX_HOP];
     int hop, index, rc, hop_size, latency;
 
     rc = dfn_example_parse_args(argc, argv, name, HOST_RATES, &args);
@@ -232,10 +241,10 @@ int main(int argc, char **argv) {
     if (dfn_example_load_matrices(&args, g_erb_fwd, g_erb_inv, name) != 0)
         return 1;
 
-    /* dfn2_model_io_descriptor_default() describes the geometry this build was compiled
-     * for and does not inspect the model; a product fills the descriptor from its
-     * model's exported metadata. */
-    if (dfn2_model_io_descriptor_default(&descriptor) != 0) return 1;
+    /* dfn2_model_io_descriptor_default() describes the model grid (args.model_grid) and the
+     * graph geometry this build runs and does not inspect the model; a product fills the
+     * descriptor from its model's exported metadata. */
+    if (dfn2_model_io_descriptor_default(&args.model_grid, &descriptor) != 0) return 1;
     memset(&model, 0, sizeof(model));
     model.user = NULL;
     model.infer = run_accelerator;
@@ -244,8 +253,9 @@ int main(int argc, char **argv) {
 
     if (make_plan(&args, &model, &plan) != 0) {
         fprintf(stderr, "%s: pool query rejected the configuration "
-                "(host %d Hz, mode=%s n=%d fixed_delay=%d)\n", name,
-                args.sample_rate, example_cli_delay_mode_name(args.delay_mode),
+                "(host %d Hz, model grid %d Hz / FFT %d, mode=%s n=%d fixed_delay=%d)\n", name,
+                args.sample_rate, args.model_grid.sample_rate, args.model_grid.n_fft,
+                example_cli_delay_mode_name(args.delay_mode),
                 args.delay_num_filters, args.fixed_delay_samples);
         return 1;
     }
@@ -256,6 +266,10 @@ int main(int argc, char **argv) {
            args.delay_num_filters, args.fixed_delay_samples, args.enable_cng,
            (double)args.atten_lim_db, (unsigned long long)plan.total,
            16ul, (unsigned)descriptor.layout_version);
+    printf("%s: model grid %d Hz / FFT %d (n_erb %d, df_bins %d, lookahead %d/%d), %s\n", name,
+           args.model_grid.sample_rate, args.model_grid.n_fft, args.model_grid.n_erb,
+           args.model_grid.df_bins, args.model_grid.mask_lookahead, args.model_grid.df_lookahead,
+           plan.dfn.use_bridge ? "through the rate bridge" : "the stage on the host grid");
 
     if (rig_build(&rig, &plan) != 0) {
         fprintf(stderr, "%s: pipeline init failed\n", name);
@@ -263,11 +277,11 @@ int main(int argc, char **argv) {
     }
     hop_size = plan.grid.hop_size;
     /* Host WOLA hop plus the bridge's added delay, or the model's lookahead hops plus the
-     * host hop at 48 kHz. */
-    DFN2_REQUIRE_LOOKAHEAD_PAIR_LINK();   /* the pair printed is the archive's */
+     * host hop on the stage path. */
+    DFN2_REQUIRE_VARIANT_LINK();   /* this unit's DFN2 capacities are the archive's */
     latency = plan.dfn.use_bridge
         ? hop_size + dfn_rate_bridge_added_delay_samples(rig.bridge)
-        : (DFN_RES_STAGE_LOOKAHEAD_FRAMES + 1) * DFN2_HOP_LEN;
+        : (dfn_res_stage_lookahead_frames(&args.model_grid) + 1) * args.model_grid.hop;
     printf("%s: hop %d samples, algorithmic latency %d samples\n", name, hop_size, latency);
     /* Host smoke path: a product calls the hop once per host hop; the first hops
      * (the latency) come out silent. */

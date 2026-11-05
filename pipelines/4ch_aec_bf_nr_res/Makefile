@@ -59,9 +59,13 @@ else
 $(error ULCNET_GRID must be 16k or 48k, got '$(ULCNET_GRID)')
 endif
 
-# DeepFilterNet2 lookahead pair, same knobs and rules as pipelines/Makefile: a pair other than the
-# headers' default 1/1 becomes -D flags on every unit compiled here, the shipped pair adds none,
-# and the pair is folded into CFG_SIG_PAYLOAD. (No DFN3 unit is compiled here.)
+# DeepFilterNet2 lookahead pair, same knobs and rules as pipelines/Makefile. The DFN2 stage, the
+# bridge and the example main take their grid at run time (the config carries a DFN2Grid), so the
+# pair only selects what the test program runs: -DDFN2_MASK_LOOKAHEAD / -DDFN2_DF_LOOKAHEAD for the
+# test unit alone (DFN_TEST_CFLAGS, folded into CFG_SIG_PAYLOAD). A pair whose state ring
+# max(5, mask + df + 1) is deeper than the library's default capacity of 5 frames (1/4 and 2/3: 6,
+# 2/4: 7) also gets -DDFN2_MAX_DF_RING=<ring> on every unit compiled here, because the library takes
+# a capacity on every translation unit (dfn2_grid.h). (No DFN3 unit is compiled here.)
 DFN2_MASK_LOOKAHEAD ?= 1
 DFN2_DF_LOOKAHEAD ?= 1
 $(if $(filter-out 1,$(words $(DFN2_MASK_LOOKAHEAD)))$(filter-out 0 1 2,$(DFN2_MASK_LOOKAHEAD)),\
@@ -69,8 +73,13 @@ $(if $(filter-out 1,$(words $(DFN2_MASK_LOOKAHEAD)))$(filter-out 0 1 2,$(DFN2_MA
 $(if $(filter-out 1,$(words $(DFN2_DF_LOOKAHEAD)))$(filter-out 0 1 2 3 4,$(DFN2_DF_LOOKAHEAD)),\
   $(error DFN2_DF_LOOKAHEAD must be 0..4 (DF_ORDER - 1), got '$(DFN2_DF_LOOKAHEAD)'))
 DFN_PAIR_CFLAGS :=
+DFN2_PAIR_RING := $(if $(filter 2/4,$(DFN2_MASK_LOOKAHEAD)/$(DFN2_DF_LOOKAHEAD)),7,$(if $(filter 1/4 2/3,$(DFN2_MASK_LOOKAHEAD)/$(DFN2_DF_LOOKAHEAD)),6))
+ifneq ($(DFN2_PAIR_RING),)
+DFN_PAIR_CFLAGS += -DDFN2_MAX_DF_RING=$(DFN2_PAIR_RING)
+endif
+DFN_TEST_CFLAGS :=
 ifneq ($(DFN2_MASK_LOOKAHEAD)/$(DFN2_DF_LOOKAHEAD),1/1)
-DFN_PAIR_CFLAGS += -DDFN2_MASK_LOOKAHEAD=$(DFN2_MASK_LOOKAHEAD) -DDFN2_DF_LOOKAHEAD=$(DFN2_DF_LOOKAHEAD)
+DFN_TEST_CFLAGS += -DDFN2_MASK_LOOKAHEAD=$(DFN2_MASK_LOOKAHEAD) -DDFN2_DF_LOOKAHEAD=$(DFN2_DF_LOOKAHEAD)
 endif
 
 BACKEND = ne10
@@ -300,7 +309,7 @@ SRCS := mcab.c mcab_sample_flow.c mcab_sample_beam.c \
 # The same CC command can select a different SDK through PATH.
 # Include effective pointer/FP/ISA predefines to avoid cross-ABI cache reuse.
 override CC_TARGET_SIG := $(shell sh $(COMMON_DIR)/scripts/target_abi_signature.sh $(CC) $(CPPFLAGS) $(CFLAGS))
-CFG_SIG_PAYLOAD := CC_TARGET_SIG=$(CC_TARGET_SIG) ULCNET_GRID=$(ULCNET_GRID) DFN2_LOOKAHEAD=$(DFN2_MASK_LOOKAHEAD)/$(DFN2_DF_LOOKAHEAD) CC=$(CC) CXX=$(CXX) AR=$(AR) RANLIB=$(RANLIB) LINK=$(LINK) CFLAGS=$(CFLAGS) CXXFLAGS=$(CXXFLAGS) LDFLAGS=$(LDLIBS) BACKEND=$(BACKEND) SIMD=$(SIMD) WERROR=$(WERROR) NO_STDIO=$(NO_STDIO) DEBUG=$(DEBUG) TOOLCHAIN_CHECK=$(TOOLCHAIN_CHECK) $(PRODUCER_SIGS) SRCS=$(sort $(SRCS))
+CFG_SIG_PAYLOAD := CC_TARGET_SIG=$(CC_TARGET_SIG) ULCNET_GRID=$(ULCNET_GRID) DFN2_LOOKAHEAD=$(DFN2_MASK_LOOKAHEAD)/$(DFN2_DF_LOOKAHEAD) DFN_TEST_CFLAGS=$(DFN_TEST_CFLAGS) CC=$(CC) CXX=$(CXX) AR=$(AR) RANLIB=$(RANLIB) LINK=$(LINK) CFLAGS=$(CFLAGS) CXXFLAGS=$(CXXFLAGS) LDFLAGS=$(LDLIBS) BACKEND=$(BACKEND) SIMD=$(SIMD) WERROR=$(WERROR) NO_STDIO=$(NO_STDIO) DEBUG=$(DEBUG) TOOLCHAIN_CHECK=$(TOOLCHAIN_CHECK) $(PRODUCER_SIGS) SRCS=$(sort $(SRCS))
 CFG_SIG := $(shell printf '%s' "$(CFG_SIG_PAYLOAD)" | cksum | cut -d' ' -f1)
 
 OBJ_ROOT ?= obj
@@ -373,8 +382,8 @@ $(OBJ_DIR)/dfn2_prepost.o: $(DFN2_DIR)/dfn2_prepost.c $(DFN2_DIR)/dfn2_prepost.h
 
 # ../dfn/4ch_aec_bf_dfn_res/main.c and its tests/test_4ch_dfn.c compose the unit with
 # ../dfn/dfn_hop.h.
-$(OBJ_DIR)/test_4ch_dfn.o: ../dfn/4ch_aec_bf_dfn_res/tests/test_4ch_dfn.c mcab.h mcab_sample_flow.h mcab_sample_beam.h mcab_sample_post.h tests/conv_chain_mcab.h tests/mcab_test_rig.h ../dfn/dfn_hop.h ../dfn/tests/dfn_test_fixture.h | _cfg_guard
-	$(CC) $(CFLAGS) -MD -MP -c -o $@ $<
+$(OBJ_DIR)/test_4ch_dfn.o: ../dfn/4ch_aec_bf_dfn_res/tests/test_4ch_dfn.c mcab.h mcab_sample_flow.h mcab_sample_beam.h mcab_sample_post.h tests/conv_chain_mcab.h tests/mcab_test_rig.h ../dfn/dfn_hop.h ../dfn/tests/dfn_test_fixture.h ../dfn/tests/dfn_test_grid.h | _cfg_guard
+	$(CC) $(CFLAGS) $(DFN_TEST_CFLAGS) -MD -MP -c -o $@ $<
 
 $(OBJ_DIR)/4ch_aec_bf_dfn_res_main.o: ../dfn/4ch_aec_bf_dfn_res/main.c mcab_sample_driver.h mcab.h mcab_sample_flow.h mcab_sample_beam.h mcab_sample_post.h ../dfn/dfn_hop.h ../dfn/dfn_example_args.h ../dfn/dfn_unit_partition.h ../common/example_cli.h ../dfn/dfn_hop_pool.h | _cfg_guard
 	$(CC) $(CFLAGS) -MD -MP -c -o $@ $<
@@ -477,6 +486,13 @@ test: test-third-party test-mcab-sample-driver \
 	"$(abspath $(BIN_DIR))/4ch_aec_bf_dfn_res"
 	"$(abspath $(BIN_DIR))/4ch_aec_bf_dfn_res" --delay-num-filters 1 --cng --atten-lim 12
 	"$(abspath $(BIN_DIR))/4ch_aec_bf_dfn_res" --sample-rate 48000
+# The DFN2 model grid is a run-time choice (--ai-sample-rate / --ai-fft-size, see dfn/dfn_example_args.h):
+# the host on the model's own rate runs the stage directly at that grid, any other host rate needs the
+# bridge (48 kHz / 1024 model only: pool query rejected, exit 1), a pair outside the table is exit 2.
+	out="$$("$(abspath $(BIN_DIR))/4ch_aec_bf_dfn_res" --ai-sample-rate 16000 --ai-fft-size 256)" && printf '%s\n' "$$out" | grep -q "model grid 16000 Hz / FFT 256 (n_erb 24, df_bins 96, lookahead 0/0), the stage on the host grid"
+	"$(abspath $(BIN_DIR))/4ch_aec_bf_dfn_res" --ai-sample-rate 32000 --ai-fft-size 512 >/dev/null 2>&1; test $$? -eq 1
+	"$(abspath $(BIN_DIR))/4ch_aec_bf_dfn_res" --ai-sample-rate 16000 --ai-fft-size 256 --sample-rate 48000 >/dev/null 2>&1; test $$? -eq 1
+	for a in "--ai-sample-rate 44100" "--ai-sample-rate 16000" "--ai-fft-size 512" "--ai-fft-size 256x" "--ai-sample-rate --cng"; do "$(abspath $(BIN_DIR))/4ch_aec_bf_dfn_res" $$a >/dev/null 2>&1; test $$? -eq 2 || exit 1; done
 # Malformed numbers, and the 8 kHz grid the core does not offer, are refused
 # at parse time with the documented exit code 2 (the ULCNet example too).
 	"$(abspath $(BIN_DIR))/4ch_aec_bf_dfn_res" --sample-rate 16000Hz >/dev/null 2>&1; test $$? -eq 2

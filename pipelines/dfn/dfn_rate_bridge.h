@@ -12,7 +12,7 @@
  * The native output FIFO is prefilled with `prefill` zeros (init derives it from the
  * resamplers' tick counts).
  * Delay added to the hosting pipeline's own output: prefill + up group delay +
- * (L + 1)*512*sr/48000 + down group delay native samples, L = DFN_RES_STAGE_LOOKAHEAD_FRAMES;
+ * (L + 1)*512*sr/48000 + down group delay native samples, L = dfn_res_stage_lookahead_frames() of the stage's grid;
  * for the shipped 1/1 pair 16 kHz/hop 128 -> 672 (42.0 ms), 16 kHz/hop 256 -> 629 (39.3 ms),
  * 8 kHz/hop 128 -> 330 (41.3 ms), as returned by dfn_rate_bridge_added_delay_samples(), which
  * floors the sum. The stage term is a whole number of native samples only when L + 1 is a
@@ -45,16 +45,18 @@ extern "C" {
 
 #define DFN_RATE_BRIDGE_DESCRIPTOR_VERSION 1u
 /* Carve layout version; bumped on any change of pool size, carve order or descriptor. */
-#define DFN_RATE_BRIDGE_LAYOUT_VERSION     3u
+#define DFN_RATE_BRIDGE_LAYOUT_VERSION     4u
 /* Denominator of dfn_rate_bridge_added_delay_exact(): sixths of a native sample. */
 #define DFN_RATE_BRIDGE_DELAY_DENOMINATOR  6
 
 /* Grid contract: hop = fft_size / 2 (50 % overlap). Supported native grids are
- * 8 kHz/256, 16 kHz/256 and 16 kHz/512 only. */
+ * 8 kHz/256, 16 kHz/256 and 16 kHz/512 only, and the model (stage.grid) must be the 48 kHz /
+ * 1024 grid: the resampling ratios, the per-hop inference schedule, the prefill calibration and
+ * the FIFO capacities are written for it, so a bridge over another model grid is refused (-1). */
 typedef struct DfnRateBridgeConfig {
     int sample_rate;            /* 8000 or 16000 (48000 uses the stage directly) */
     int fft_size;               /* 0 = rate default (256); 16 kHz also 512     */
-    DfnResStageConfig stage;    /* 48 kHz stage config: matrices, model, limit */
+    DfnResStageConfig stage;    /* the stage config: model grid (48 kHz / 1024), matrices, model, limit */
 } DfnRateBridgeConfig;
 
 typedef struct {
@@ -72,12 +74,12 @@ _Static_assert(sizeof(DfnRateBridgeMemReq) == 32,
 
 typedef struct DfnRateBridge DfnRateBridge;
 
-/* Native grid `sample_rate` with the rate-default fft and the stage defaults
- * (48 kHz, no limit, no matrices, identity model). */
-DfnRateBridgeConfig dfn_rate_bridge_default_config(int sample_rate);
+/* Native grid `sample_rate` with the rate-default fft and the stage defaults for the model grid
+ * `model_grid` (copied; no limit, no matrices, identity model). */
+DfnRateBridgeConfig dfn_rate_bridge_default_config(int sample_rate, const DFN2Grid *model_grid);
 
-/* Returns -1 on NULL, a rate other than 8000/16000, an fft_size the rate does not
- * offer, or any stage rejection (dfn_res_stage.h). */
+/* Returns -1 on NULL, a rate other than 8000/16000, an fft_size the rate does not offer, a model
+ * grid (stage.grid) that is not 48 kHz / 1024, or any stage rejection (dfn_res_stage.h). */
 int dfn_rate_bridge_get_mem_requirements(const DfnRateBridgeConfig *cfg,
                                          DfnRateBridgeMemReq *out);
 DfnRateBridge *dfn_rate_bridge_init(void *mem, size_t bytes,

@@ -3,24 +3,67 @@
 `Audio_ALG/pipelines`（含它建置的 `AINR`、`AIAEC` C 程式）的重要改動記錄在此，格式依
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/)。README 只寫現況，改動經過寫在這裡。
 
-## [Unreleased] — 2026-11-05 — DFN2 stage scaling follows the build's grid; the rate bridge refuses a non-48 kHz model
+## [Unreleased] — 2026-11-05 — The DFN2 pipelines take their grid in the config; the rate bridge refuses a non-48 kHz model
+
+The DFN2 library (`AINR/DeepFilterNet2`) holds no grid any more (`DFN2Grid`, `dfn2_grid_make()`; see `AINR/CHANGELOG.md`), and neither
+do the pipeline units: the application builds a `DFN2Grid` and passes it in the stage config. No pipeline object, example main or
+board sample chooses a grid at build time; only the test programs do.
 
 ### Changed
-- `dfn/dfn_res_stage.h`: `DFN_RES_STAGE_IN_SCALE` / `_OUT_SCALE` are `DFN2_NORMALIZED_STFT_SCALE` / `DFN2_NORMALIZED_STFT_UNSCALE`
-  (AINR `dfn2_grid.h`: float32 of 1/sqrt(n_fft) and sqrt(n_fft)) instead of the literals `0x1p-5f` / `0x1p5f`. On the shipped
-  48 kHz / 1024 grid the values are the same (2^-5, 2^5), so the stage output does not change. The header comments now call the
-  grid "the build's DFN2 grid" (the shipped one is 48 kHz / 1024 / 512) and describe `sample_rate` / `fft_size` as `DFN2_SR` /
-  `DFN2_N_FFT`, which is what `dfn_res_stage.c` already compared against.
-- `dfn/dfn_rate_bridge.c`: `resolve()` returns -1 when `DFN2_SR != 48000` or `DFN2_N_FFT != 1024`. The resampling ratios, the per-hop
-  inference schedule, the prefill calibration and the delay arithmetic are written for a stage on the shipped 48 kHz grid, so a
-  bridge built against a DFN2 of another grid refuses instead of running them. The host side of the bridge is unchanged (8 kHz / fft
-  256, 16 kHz / fft 256, 16 kHz / fft 512).
-- The pipelines' tests and the Python twin (`dfn2_stage.py`) exercise the shipped grid only; a DFN2 built for another grid
-  (`-DDFN2_GRID_KHZ=16|32` or an external definition, see `AINR/CHANGELOG.md`) is not verified inside a pipeline.
+- `dfn/dfn_res_stage.{h,c}`: `DfnResStageConfig` drops `sample_rate` / `fft_size` and carries `DFN2Grid grid`;
+  `dfn_res_stage_default_config(const DFN2Grid *)` copies the grid in. `get_mem_requirements()` refuses a grid the library refuses
+  (`dfn2_grid_validate()`: NULL, zeroed, a hand-edited field) and a model whose I/O descriptor is for another grid, lookahead pair or
+  frame count, at run time. `DFN_RES_STAGE_IN_SCALE` / `_OUT_SCALE` / `_LOOKAHEAD_FRAMES` are gone: the stage scales with the grid's
+  `stft_scale` / `stft_unscale` (exact 2^-5 and 2^5 on the shipped 48 kHz / 1024 grid, so its output does not change) and the latency
+  is the inline `dfn_res_stage_lookahead_frames(grid)` = mask + df lookahead; `dfn_res_stage_grid(stage)` returns the grid it runs.
+  `DFN2_REQUIRE_LOOKAHEAD_PAIR_LINK()` is replaced by `DFN2_REQUIRE_VARIANT_LINK()` (the DFN2 capacities of this object must be the
+  library objects'); there is no link-time pair symbol any more. The same stage code runs the 16, 32 and 48 kHz grids of the
+  example table.
+- `dfn/dfn_rate_bridge.{h,c}`: `dfn_rate_bridge_default_config(sample_rate, const DFN2Grid *model_grid)`. The bridge keeps its own
+  constants (48000 Hz, FFT 1024, hop 512, 513 bins) as its contract and refuses (-1) a stage grid that is not 48000 / 1024: the
+  resampling ratios, the per-hop inference schedule, the prefill calibration and the FIFO sizes are written for it. The delay formulas
+  use the stage grid's lookahead. The host side is unchanged (8 kHz / fft 256, 16 kHz / fft 256, 16 kHz / fft 512).
+- `dfn/dfn_hop.h`, `dfn_hop_pool.h`, `dfn_unit_partition.h`: read the grid from the stage config or the arguments;
+  `dfn_hop_pool_plan()` sets `use_bridge` when the host rate differs from the grid's rate; `dfn_unit_partition(fwd, inv, grid)`.
+- `dfn/dfn_example_args.h` and the two example mains (`mono_aec_dfn_res`, `4ch_aec_bf_dfn_res`): new `--ai-sample-rate` and
+  `--ai-fft-size` (default 48000 and 1024; `--sample-rate` stays the host rate), a three-row table (16000/256 -> n_erb 24, df_bins 96,
+  lookahead 0/0; 32000/512 -> 28, 96, 0/0, provisional; 48000/1024 -> 32, 96, 1/1) shared with the board sample `alg_ai3_aec_dfn.c`, and
+  a `model grid ...` banner line. A pair outside the table prints the accepted ones and exits 2; a host rate the bridge cannot serve
+  with that model (anything but the 48 kHz / 1024 model with an 8 or 16 kHz host) is a rejected pool query, exit 1. A host on the
+  model's own rate runs the stage directly.
+- No `dfn/dfn_grid.h`: the build-time selector (`-DDFN2_GRID_KHZ=16|32|48`, or `-DDFN2_SR` / `-DDFN2_N_FFT` / `-DDFN2_N_ERB` /
+  `-DDFN2_DF_BINS`, with `-DDFN2_MASK_LOOKAHEAD` / `-DDFN2_DF_LOOKAHEAD`) lives only in the new test header
+  `dfn/tests/dfn_test_grid.h`, which gives test programs the `DFN2_*` size macros for their arrays and `dfn_test_grid()`; product code
+  never includes it.
+- `pipelines/Makefile` and `4ch_aec_bf_nr_res/Makefile`: `DFN_TEST_CFLAGS` (the grid preset and the DFN2 pair) reaches the test units
+  alone and is part of the build signature; new `DFN2_TEST_GRID_KHZ` (16, 32, 48) and `make test-dfn-grids` (stage, bridge and hop tests
+  at the 16 and 32 kHz test grids, with the test header's pair 1/1). A pair whose state ring `max(5, mask + df + 1)` is deeper than
+  the library's default capacity of 5 (1/4 and 2/3: 6, 2/4: 7) still forwards `-DDFN2_MAX_DF_RING=<ring>` to every unit.
+- `make test-pairs`: the old archive check for `dfn2_lookahead_mask<M>_df<D>` is gone with the symbol, and ring 5 is the same for most
+  pairs, so the gate now has two parts. Each pair test prints the pair it was built with and (stage test, mono composition) the
+  stage latency it measured; `dfn/tests/check_pair_report.sh` compares them with the pair asked for and with `(M + D + 1) * hop`,
+  so a pair flag that never reached the test build prints 1/1 and fails. The archive must also carry the
+  `dfn2_variant_full_n*_e*_d*_r<ring>` symbol of the ring the pair needs.
+- `DFN_RES_STAGE_LAYOUT_VERSION` and `DFN_RATE_BRIDGE_LAYOUT_VERSION` 3 -> 4: every DFN pool grew by 112 bytes, because the grid is
+  now a value in the DFN2 state and in the pre/post class (`sizeof(DFN2Grid)` is 56 bytes) that the stage pool carves, and the
+  pre/post pool hash folds the whole grid. Measured with `get_mem_requirements()` on the shipped 48 kHz / 1/1 grid (ne10): stage
+  231,984 -> 232,096 B, 16 kHz rate bridge 349,888 -> 350,000 B, the DFN2 pre/post FREQ pool inside them 219,536 -> 219,648 B
+  (`DFN2_PREPOST_CARVE_VERSION` 8 -> 9, see `AINR/CHANGELOG.md`). A `MemReq` queried before this change is refused by `init_ex()`;
+  query again. At the shipped grid every digest and checksum the stage, bridge, hop, mono and 4ch tests printed before is unchanged
+  (the stage and bridge outputs of a probe over identity, random heads and an attenuation limit are bit-identical).
+- The Python twin (`dfn2_stage.py`) and the pipelines' C-parity tests still verify the shipped grid; the other grids are exercised
+  by the stage, bridge and hop tests (`make test-dfn-grids`) and are not verified inside a full pipeline.
 
 ### Tests
-- No test added here; the grid itself is covered by `AINR/tests/test_dfn2_grid.py`. `make test`, `make test-pairs` and
-  `dfn/tests` pass unchanged.
+- `dfn/tests/dfn_test_fixture.h` gains `dfn_fixture_foreign_descriptor()`: the I/O descriptor of a model for another mask lookahead,
+  another deep-filter lookahead or another grid. `test_dfn_res_stage.c` and `test_dfn_rate_bridge.c` check that the stage and the
+  bridge refuse it (and accept the test grid's own descriptor), the run-time replacement for the link-time pair check, and refuse a
+  zeroed, NULL or hand-edited grid. `test_dfn_res_stage.c` also runs a table of all three grids (16, 32 and 48 kHz) at run time with a
+  stand-in model (finite output, latency equal to the grid's lookahead) and the cross-grid refusals; `test_dfn_rate_bridge.c` refuses
+  every non-48 kHz / 1024 stage grid in every build.
+- The example mains' new flags are checked by `make test` in both Makefiles (the stage on the host grid at 16000/256, exit 1 for a
+  model the bridge cannot serve, exit 2 for a pair outside the table or a malformed value).
+- The grid itself is covered by `AINR/tests/test_dfn2_grid.py`.
 
 ## [Unreleased] — 2026-11-02 — NEON model kernels also run on 32-bit ARM
 
@@ -499,8 +542,9 @@ user can notice are listed under "Behaviour changes".
   error; `pipelines/Makefile` also takes `DFN3_MASK_LOOKAHEAD` / `DFN3_DF_LOOKAHEAD` for the DFN3 sources it compiles
   for the target-ABI test, `4ch_aec_bf_nr_res/Makefile` only the DFN2 pair). A pair other than 1/1 is forwarded as
   `-DDFN2_MASK_LOOKAHEAD=<M> -DDFN2_DF_LOOKAHEAD=<D>` to every unit and is part of the build signature, so it gets
-  its own `obj`/`bin` directories; objects built for different pairs fail to link (symbol
-  `dfn2_lookahead_mask<M>_df<D>`), an out-of-range pair is a compile error. `DFN_RES_STAGE_LOOKAHEAD_FRAMES` =
+  its own `obj`/`bin` directories; an out-of-range pair is a compile error. (Superseded by the 2026-11-05 entry above: the library
+  has no pair symbol, a model or pool of another pair is refused at run time, and a pair with a ring deeper than 5 also needs
+  `-DDFN2_MAX_DF_RING`.) `DFN_RES_STAGE_LOOKAHEAD_FRAMES` =
   `DFN2_MASK_LOOKAHEAD + DFN2_DF_LOOKAHEAD` = L (the DFN2 cascade adds the two): the spectrum emitted on hop t belongs
   to source frame t - L and the first L hops emit zeros. The rate bridge adds `prefill + up and down resampler group delays (16 + 16 native samples) +
   (L + 1) * 512 * sr / 48000` native samples (`dfn_rate_bridge_added_delay_samples()`; integer arithmetic, floored, so a
@@ -586,7 +630,10 @@ Board code: create the four lanes with `aec_init()` over `mcab_lane_config()` (o
 the lanes. Board build notes: drop `fix_gain.c` and the `third_party/gain` include path (an input gain is
 `sk_scale_f32()` plus `sk_clip_f32()`); when the DFN2 lookahead pair is not 1/1, pass the same
 `-DDFN2_MASK_LOOKAHEAD` / `-DDFN2_DF_LOOKAHEAD` flags to every DFN2 unit and install a model exported for that pair.
-`alg_ai3_dfn.c` and `uvc_ai_nr_stream.c` hard-code mask and DF lookahead 1 with a static assert.
+`alg_ai3_dfn.c` and `uvc_ai_nr_stream.c` hard-code mask and DF lookahead 1 with a static assert. (Superseded by the 2026-11-05
+entry above: the pair is a field of the `DFN2Grid` the application passes, so no pair flag is needed on a product unit and only a
+ring deeper than 5 needs `-DDFN2_MAX_DF_RING` on every DFN2 unit; `alg_ai3_dfn.c` takes its grid and pair from its own table, and
+`uvc_ai_nr_stream.c` builds its shipped 48 kHz 1/1 grid with `dfn2_grid_make()`.)
 
 ## [Unreleased] — 2026-10-24 — The 4-channel unit no longer carries the post-beam RES: applications create the AecRes with libaec
 

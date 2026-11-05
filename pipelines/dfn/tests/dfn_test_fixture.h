@@ -1,6 +1,6 @@
-/* Fixtures shared by the DFN2 pipeline tests and the board skeletons: the
- * unit ERB partition that makes the fail-open path an exact identity, a
- * deterministic far-end, and an identity model callback. stdio-free. */
+/* Fixtures shared by the DFN2 pipeline tests: the unit ERB partition that makes the fail-open
+ * path an exact identity, a deterministic far-end, and an identity model callback. Test
+ * scaffolding: it includes the tests' grid header (dfn_test_grid.h). */
 #ifndef DFN_TEST_FIXTURE_H
 #define DFN_TEST_FIXTURE_H
 
@@ -9,6 +9,7 @@
 #include <string.h>
 
 #include "dfn2_prepost.h"
+#include "dfn/tests/dfn_test_grid.h"
 #include "dfn/dfn_unit_partition.h"
 #include "audio_window.h"
 
@@ -115,14 +116,48 @@ static inline int dfn_fixture_half_mask_infer(void *user, const DFN2PrepostInput
     return 0;
 }
 
+/* The model-I/O descriptor of a model built for a grid other than `base`: which = 0 another mask
+ * lookahead, 1 another deep-filter lookahead (the nearest one whose state ring the library's
+ * capacity holds), 2 the other sample rate and fft (16 kHz where `base` is 48 kHz, 48 kHz
+ * otherwise). A stage or bridge refuses such a model at run time from its descriptor
+ * (dfn2_model_io_descriptor_validate against its own grid); the pair and the grid are not link-time
+ * properties. Returns 0 (*d is the foreign descriptor), 1 when no such grid fits the library's
+ * capacity (the pair 0/4 has no other mask lookahead within the default ring), or -1 when the
+ * library does not make the grid. */
+static inline int dfn_fixture_foreign_descriptor(const DFN2Grid *base, DFN2ModelIoDescriptor *d,
+                                                 int which) {
+    DFN2Grid g;
+    int delta;
+    if (which == 2) {
+        int status = base->sample_rate == 48000
+            ? dfn2_grid_make(&g, 16000, 256, 24, 96, base->mask_lookahead, base->df_lookahead)
+            : dfn2_grid_make(&g, 48000, 1024, 32, 96, base->mask_lookahead, base->df_lookahead);
+        return status == DFN2_GRID_OK && dfn2_model_io_descriptor_default(&g, d) == 0 ? 0 : -1;
+    }
+    for (delta = 1; delta <= 4; ++delta) {
+        int sign;
+        for (sign = 1; sign >= -1; sign -= 2) {
+            int mask = base->mask_lookahead + (which == 0 ? sign * delta : 0);
+            int df = base->df_lookahead + (which == 1 ? sign * delta : 0);
+            if (mask < 0 || mask > DFN2_MAX_MASK_LOOKAHEAD || df < 0 || df > DFN2_MAX_DF_LOOKAHEAD)
+                continue;
+            if (dfn2_grid_make(&g, base->sample_rate, base->n_fft, base->n_erb, base->df_bins,
+                               mask, df) == DFN2_GRID_OK)
+                return dfn2_model_io_descriptor_default(&g, d) == 0 ? 0 : -1;
+        }
+    }
+    return 1;
+}
+
 /* What a phased-hop test does with an open model frame: run the model, report a failure, leave
  * the frame open, or never fetch it. */
 enum { BP_RUN, BP_FAIL, BP_OPEN, BP_UNFETCHED };
 
-/* The stage's output delay at 48 kHz, (L + 1) * 512 samples with L = mask + df lookahead. In
- * native samples at `sr` (8 or 16 kHz) it is a whole number only when L + 1 is a multiple of 3
- * (the shipped 1/1 pair); otherwise the rate bridge's exact delay carries a third of a sample. */
-#define DFN_FIXTURE_STAGE_DELAY_48K ((DFN2_MASK_LOOKAHEAD + DFN2_DF_LOOKAHEAD + 1) * DFN2_HOP_LEN)
+/* The stage's output delay at 48 kHz (the bridge's model grid, hop 512), (L + 1) * 512 samples with
+ * L = the test grid's mask + df lookahead. In native samples at `sr` (8 or 16 kHz) it is a whole
+ * number only when L + 1 is a multiple of 3 (the shipped 1/1 pair); otherwise the rate bridge's
+ * exact delay carries a third of a sample. */
+#define DFN_FIXTURE_STAGE_DELAY_48K ((DFN2_MASK_LOOKAHEAD + DFN2_DF_LOOKAHEAD + 1) * 512)
 
 /* Native samples, in sixths, the rate bridge adds at `sr` / `hop`: the prefill of the grid's
  * schedule, the 16-sample group delay of each resampler and the stage's delay (shipped pair at

@@ -1,10 +1,11 @@
 /* dfn_res_stage acceptance test (no AEC, no synthesis): the L-hop identity
- * (L = DFN_RES_STAGE_LOOKAHEAD_FRAMES, from the build's lookahead pair)
- * through the cascade with distinct estimate/apply inputs, the absolute scale
- * at the model boundary, the fail-open path, reset parity, the reject-first
- * configuration rows and the stale-pool gate. The two inputs differ in every
- * frame, so an estimate/apply swap inside the stage would fail the identity
- * rows. */
+ * (L = mask + df lookahead of the test grid's pair, dfn_test_grid.h) through the cascade with
+ * distinct estimate/apply inputs, the absolute scale at the model boundary, the fail-open path,
+ * reset parity, the reject-first configuration rows (an invalid grid, a model of another grid or
+ * pair) and the stale-pool gate. The two inputs differ in every frame, so an estimate/apply swap
+ * inside the stage would fail the identity rows. The stage takes its grid at run time: the last
+ * rows build the three grids of the board samples' table with dfn2_grid_make() and run each one
+ * through the same stage code, whatever grid this program was built for. */
 #include <math.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -15,7 +16,7 @@
 #include "dfn/tests/dfn_test_fixture.h"
 
 #define FRAMES 6
-#define L_FRAMES DFN_RES_STAGE_LOOKAHEAD_FRAMES   /* output delay of the build's pair */
+#define L_FRAMES DFN_TEST_LOOKAHEAD_FRAMES        /* output delay of the test grid's pair */
 #define M_FRAMES DFN2_MASK_LOOKAHEAD              /* frames before the first model frame */
 #define SCALE_FRAMES 8
 #define CAP_ERB  (DFN2_MODEL_INPUT_FRAMES * DFN2_N_ERB)
@@ -24,8 +25,17 @@
 static float erb_fwd[DFN2_N_BINS * DFN2_N_ERB];
 static float erb_inv[DFN2_N_ERB * DFN2_N_BINS];
 
+/* The identity paths scale a spectrum by the grid's stft_scale on the way in and stft_unscale on the
+ * way out. Where n_fft is a power of four (256, 1024, 4096) both are powers of two and the round trip
+ * is exact; elsewhere (512) they are correctly rounded floats and the round trip is within two float
+ * ulps. */
+static int scaled_equal(float got, float want, int n_fft) {
+    int exact = n_fft == 256 || n_fft == 1024 || n_fft == 4096;
+    return exact ? got == want : fabsf(got - want) <= 2.4e-7f * fabsf(want);
+}
+
 static void make_partition(void) {
-    dfn_unit_partition(erb_fwd, erb_inv);
+    dfn_unit_partition(erb_fwd, erb_inv, dfn_test_grid());
 }
 
 static int failing_infer(void *user, const DFN2PrepostInputs *in,
@@ -46,8 +56,9 @@ static void fill_frame(Complex *estimate, Complex *apply, int frame) {
 }
 
 /* ---- absolute scale at the model boundary --------------------------------
- * The stage hands DFN2 the host's audio-scale spectrum times 2^-5. The fail-open and
- * identity paths reproduce their input at any scale (IN_SCALE * OUT_SCALE == 1), so only
+ * The stage hands DFN2 the host's audio-scale spectrum times the grid's stft_scale (2^-5 on the
+ * 48 kHz grid). The fail-open and identity paths reproduce their input at any scale
+ * (stft_scale * stft_unscale == 1), so only
  * this row sees a wrong factor: it drives one signal down the product path and DFN2's own
  * C TIME-mode analysis and compares the ERB and complex feature windows the model
  * receives. That pins the scale factor, the analysis window and the frame assembly
@@ -100,7 +111,7 @@ static int capturing_infer(void *user, const DFN2PrepostInputs *in,
 }
 
 static DfnResStageConfig base_config(void) {
-    DfnResStageConfig cfg = dfn_res_stage_default_config(DFN2_SR);
+    DfnResStageConfig cfg = dfn_res_stage_default_config(dfn_test_grid());
     cfg.erb_fwd = erb_fwd;
     cfg.erb_inv = erb_inv;
     return cfg;
@@ -115,7 +126,7 @@ static int capture_via_stage(ScaleCapture *cap, FftHandle *fft) {
     DfnResStage *s;
     int hop, k;
 
-    if (dfn2_model_io_descriptor_default(&descriptor) != 0) return 1;
+    if (dfn2_model_io_descriptor_default(dfn_test_grid(), &descriptor) != 0) return 1;
     cfg.model.infer = capturing_infer;
     cfg.model.user = cap;
     cfg.model.io_descriptor = &descriptor;
@@ -150,12 +161,12 @@ static int capture_via_time_mode(ScaleCapture *cap, FftHandle *fft) {
     size_t synth_bytes;
     int hop;
 
-    if (dfn2_prepost_config_defaults(&cfg, DFN2_IO_TIME) != 0) return 1;
+    if (dfn2_prepost_config_defaults(&cfg, DFN2_IO_TIME, dfn_test_grid()) != 0) return 1;
     cfg.fft = fft;
     cfg.erb_fwd = erb_fwd;
     cfg.erb_inv = erb_inv;
     /* TIME mode borrows the application's synthesis object. */
-    dfn2_framing_config(&synth, fft, NULL);
+    dfn2_framing_config(&synth, dfn_test_grid(), fft, NULL);
     synth_bytes = ac_istft_get_mem_size(&synth);
     if (posix_memalign(&synth_mem, 16u, synth_bytes) != 0) return 2;
     cfg.istft = ac_istft_init(synth_mem, synth_bytes, &synth);
@@ -261,7 +272,7 @@ static int run_identity_case(int callback_kind) {
     int frame, k, rc;
 
     if (callback_kind != 0) {
-        if (dfn2_model_io_descriptor_default(&descriptor) != 0) return 1;
+        if (dfn2_model_io_descriptor_default(dfn_test_grid(), &descriptor) != 0) return 1;
         cfg.model.infer = callback_kind == 1 ? dfn_fixture_identity_infer : failing_infer;
         cfg.model.io_descriptor = &descriptor;
     }
@@ -280,7 +291,8 @@ static int run_identity_case(int callback_kind) {
         } else {
             int src = frame - L_FRAMES;
             for (k = 0; k < DFN2_N_BINS; ++k)
-                if (out[k].r != saved[src][k].r || out[k].i != saved[src][k].i)
+                if (!scaled_equal(out[k].r, saved[src][k].r, DFN2_N_FFT) ||
+                    !scaled_equal(out[k].i, saved[src][k].i, DFN2_N_FFT))
                     return 30 + frame;
             if (dfn_res_stage_output_frame_index(stage, &source) != 0 ||
                 source != src) return 40 + frame;
@@ -338,10 +350,27 @@ static int run_rejections(void) {
     float saved;
     int k;
 
-    cfg = base_config(); cfg.sample_rate = 16000;
+    /* The grid is part of the config and the library validates it: a zeroed grid (what a NULL
+     * grid leaves), a hand-edited derived field, a band count the model cannot have, a
+     * non-finite alpha. */
+    cfg = base_config(); memset(&cfg.grid, 0, sizeof(cfg.grid));
     if (!rejects(&cfg)) return 1;
-    cfg = base_config(); cfg.fft_size = 512;
+    cfg = base_config(); cfg.grid.hop += 1;
     if (!rejects(&cfg)) return 2;
+    cfg = dfn_res_stage_default_config(NULL); cfg.erb_fwd = erb_fwd; cfg.erb_inv = erb_inv;
+    if (!rejects(&cfg)) return 12;
+    cfg = base_config(); cfg.grid.n_erb += 1;
+    if (!rejects(&cfg)) return 13;
+    cfg = base_config(); cfg.grid.n_fft *= 2;
+    if (!rejects(&cfg)) return 14;
+    cfg = base_config(); cfg.grid.erb_norm_alpha = (float)NAN;
+    if (!rejects(&cfg)) return 15;
+    /* A bin or band count far above the library's capacity must be refused before the stage reads
+     * a matrix or fills a stack buffer of its own with it (a missing check overruns, not refuses). */
+    cfg = base_config(); cfg.grid.n_bins = 1 << 20;
+    if (!rejects(&cfg)) return 16;
+    cfg = base_config(); cfg.grid.n_erb = 1 << 20;
+    if (!rejects(&cfg)) return 17;
     cfg = base_config(); cfg.erb_inv = NULL;
     if (!rejects(&cfg)) return 3;
     cfg = base_config(); cfg.erb_fwd = NULL;
@@ -350,8 +379,26 @@ static int run_rejections(void) {
     if (!rejects(&cfg)) return 5;
     cfg = base_config(); cfg.model.infer = dfn_fixture_identity_infer;   /* no descriptor */
     if (!rejects(&cfg)) return 6;
+    /* A model built for another lookahead pair or grid is refused from its descriptor at run
+     * time (the pair and the grid are not link-time properties). The control row, the test
+     * grid's own descriptor, is accepted, so the rows above refuse on the grid and nothing else. */
+    {
+        int which;
+        for (which = 0; which < 3; ++which) {
+            int made = dfn_fixture_foreign_descriptor(dfn_test_grid(), &descriptor, which);
+            if (made < 0) return 20 + which;
+            if (made > 0) continue;   /* no such grid within the library's capacity */
+            cfg = base_config();
+            cfg.model.infer = dfn_fixture_identity_infer; cfg.model.io_descriptor = &descriptor;
+            if (!rejects(&cfg)) return 30 + which;
+        }
+        cfg = base_config();
+        if (dfn2_model_io_descriptor_default(dfn_test_grid(), &descriptor) != 0) return 40;
+        cfg.model.infer = dfn_fixture_identity_infer; cfg.model.io_descriptor = &descriptor;
+        if (rejects(&cfg)) return 41;
+    }
     cfg = base_config();
-    if (dfn2_model_io_descriptor_default(&descriptor) != 0) return 7;
+    if (dfn2_model_io_descriptor_default(dfn_test_grid(), &descriptor) != 0) return 7;
     descriptor.layout_version += 1u;
     cfg.model.infer = dfn_fixture_identity_infer; cfg.model.io_descriptor = &descriptor;
     if (!rejects(&cfg)) return 8;
@@ -370,6 +417,166 @@ static int run_rejections(void) {
     make_partition();
     for (k = 0; k < DFN2_N_BINS; ++k)
         if (erb_inv[k] != 1.0f) return 11;
+    return 0;
+}
+
+/* ---- the stage at run time: the three grids of the board samples' table, whatever grid this
+ * program was built for ------------------------------------------------------------------------
+ * Each row builds its grid with dfn2_grid_make(), a unit partition of its own size, the model
+ * descriptor of that grid and an identity model, and runs hops of its own bin count through the
+ * same stage code. The output is the apply spectrum delayed by exactly the grid's lookahead
+ * (mask + df), finite, with the warm-up hops all zero; the emitted frame index and the measured
+ * first-output hop say the same; the grid the stage reports is the one it was given. Across rows a
+ * model descriptor of one grid is refused by a stage of another, and a pool recorded for one grid
+ * is refused by a stage of another on the hash alone. */
+typedef struct TableRow { int sr, fft, n_erb, df_bins, mask, df; } TableRow;
+static const TableRow TABLE[] = {
+    { 16000,  256, 24, 96, 0, 0 },
+    { 32000,  512, 28, 96, 0, 0 },   /* provisional: nothing is trained for it */
+    { 48000, 1024, 32, 96, 1, 1 },
+};
+#define TABLE_ROWS ((int)(sizeof(TABLE) / sizeof(TABLE[0])))
+#define TG_HOPS 12
+
+static float tg_fwd[DFN2_MAX_N_BINS * DFN2_MAX_N_ERB];
+static float tg_inv[DFN2_MAX_N_ERB * DFN2_MAX_N_BINS];
+static Complex tg_est[DFN2_MAX_N_BINS], tg_app[DFN2_MAX_N_BINS], tg_out[DFN2_MAX_N_BINS];
+static Complex tg_apply_saved[TG_HOPS][DFN2_MAX_N_BINS];
+
+/* Frame-dependent, mutually distinct estimate and apply spectra of n_bins bins. */
+static void tg_fill(int n_bins, int frame) {
+    int k;
+    for (k = 0; k < n_bins; ++k) {
+        tg_est[k].r = (float)(frame * 1000 + k) * 0.125f;
+        tg_est[k].i = (float)(frame * 1000 - k) * 0.0625f;
+        tg_app[k].r = (float)(frame * 2000 + k) * 0.25f;
+        tg_app[k].i = (float)(frame * 2000 - k) * 0.125f;
+    }
+}
+
+/* Runs `grid` through a stage with the identity model. Returns 0 and the measured stage latency in
+ * hops (first emitted hop, minus the source frame it carries) in *measured, or a nonzero code. */
+static int run_stage_on_grid(const DFN2Grid *grid, int expect_lookahead, int *measured,
+                             DfnResStageMemReq *req_out) {
+    DFN2ModelIoDescriptor d;
+    DfnResStageConfig cfg = dfn_res_stage_default_config(grid);
+    DfnResStageMemReq req;
+    DfnResStage *s;
+    long long source = -1, frames = 0, commits = 0, skips = 0;
+    int hop, k, first = -1, first_source = -1;
+    const int n = grid->n_bins;
+
+    dfn_unit_partition(tg_fwd, tg_inv, grid);
+    if (dfn2_model_io_descriptor_default(grid, &d) != 0) return 1;
+    cfg.erb_fwd = tg_fwd;
+    cfg.erb_inv = tg_inv;
+    cfg.model.infer = dfn_fixture_identity_infer;
+    cfg.model.io_descriptor = &d;
+    if (dfn_res_stage_get_mem_requirements(&cfg, &req) != 0) return 2;
+    s = dfn_res_stage_create(&cfg);
+    if (!s) return 3;
+    if (!dfn_res_stage_grid(s) || memcmp(dfn_res_stage_grid(s), grid, sizeof(*grid)) != 0) return 4;
+    if (dfn_res_stage_lookahead_frames(grid) != expect_lookahead) return 5;
+    for (hop = 0; hop < TG_HOPS; ++hop) {
+        int rc;
+        tg_fill(n, hop);
+        memcpy(tg_apply_saved[hop], tg_app, (size_t)n * sizeof(Complex));
+        for (k = 0; k < n; ++k) { tg_out[k].r = 7.0f; tg_out[k].i = -7.0f; }
+        rc = dfn_res_stage_process(s, tg_est, tg_app, tg_out);
+        if (rc != (hop < expect_lookahead ? 0 : 1)) return 10 + hop;
+        for (k = 0; k < n; ++k) {
+            if (!isfinite(tg_out[k].r) || !isfinite(tg_out[k].i)) return 30;
+            if (hop < expect_lookahead) {
+                if (tg_out[k].r != 0.0f || tg_out[k].i != 0.0f) return 31;
+            } else {
+                const Complex want = tg_apply_saved[hop - expect_lookahead][k];
+                if (!scaled_equal(tg_out[k].r, want.r, grid->n_fft) ||
+                    !scaled_equal(tg_out[k].i, want.i, grid->n_fft))
+                    return 32;
+            }
+        }
+        if (rc == 1) {
+            if (dfn_res_stage_output_frame_index(s, &source) != 0 ||
+                source != hop - expect_lookahead)
+                return 40;
+            if (first < 0) { first = hop; first_source = (int)source; }
+        }
+    }
+    dfn_res_stage_get_counters(s, &frames, &commits, &skips);
+    if (frames != TG_HOPS || commits != TG_HOPS - grid->mask_lookahead || skips != 0) return 41;
+    if (first < 0) return 42;
+    *measured = first - first_source;
+    if (req_out) *req_out = req;
+    dfn_res_stage_destroy(s);
+    return 0;
+}
+
+static int run_table_grids(void) {
+    DFN2Grid grid[TABLE_ROWS];
+    DfnResStageMemReq req[TABLE_ROWS];
+    int row, other, pair_m, pair_d, rc, measured;
+
+    for (row = 0; row < TABLE_ROWS; ++row) {
+        const TableRow *t = &TABLE[row];
+        if (dfn2_grid_make(&grid[row], t->sr, t->fft, t->n_erb, t->df_bins, t->mask, t->df) !=
+                DFN2_GRID_OK)
+            return 1;
+        rc = run_stage_on_grid(&grid[row], t->mask + t->df, &measured, &req[row]);
+        if (rc) { fprintf(stderr, "  table grid %d/%d: stage row %d\n", t->sr, t->fft, rc); return 100 + row; }
+        if (measured != t->mask + t->df) return 110 + row;
+        printf("dfn_res_stage: grid %d Hz / FFT %d (n_erb %d, df_bins %d, lookahead %d/%d): pool %llu "
+               "bytes, hash %08x, output = apply delayed %d hops, all finite\n", t->sr, t->fft,
+               t->n_erb, t->df_bins, t->mask, t->df, (unsigned long long)req[row].bytes,
+               req[row].build_flags_hash, measured);
+    }
+    /* A model of one grid on a stage of another, and a pool recorded for another grid. */
+    for (row = 0; row < TABLE_ROWS; ++row) {
+        for (other = 0; other < TABLE_ROWS; ++other) {
+            DFN2ModelIoDescriptor foreign;
+            DfnResStageConfig cfg = dfn_res_stage_default_config(&grid[row]);
+            DfnResStageMemReq claimed = req[other];
+            void *mem = NULL;
+            if (row == other) continue;
+            dfn_unit_partition(tg_fwd, tg_inv, &grid[row]);
+            cfg.erb_fwd = tg_fwd;
+            cfg.erb_inv = tg_inv;
+            if (dfn2_model_io_descriptor_default(&grid[other], &foreign) != 0) return 120;
+            cfg.model.infer = dfn_fixture_identity_infer;
+            cfg.model.io_descriptor = &foreign;
+            if (!rejects(&cfg)) return 121;
+            cfg.model.infer = NULL;
+            cfg.model.io_descriptor = NULL;
+            if (req[row].build_flags_hash == req[other].build_flags_hash) return 122;
+            claimed.bytes = req[row].bytes;   /* only the hash differs */
+            if (posix_memalign(&mem, (size_t)req[row].alignment, (size_t)req[row].bytes) != 0)
+                return 123;
+            if (dfn_res_stage_init_ex(mem, (size_t)req[row].bytes, &cfg, &claimed)) {
+                free(mem);
+                return 124;
+            }
+            free(mem);
+        }
+    }
+    /* The lookahead pair is a run-time value too: every pair the library's default capacity holds
+     * (ring max(5, mask + df + 1) <= DFN2_MAX_DF_RING) runs on the 48 kHz grid with its own latency
+     * in one binary. A pair whose ring is deeper is refused by dfn2_grid_make(), not run. */
+    for (pair_m = 0; pair_m <= DFN2_MAX_MASK_LOOKAHEAD; ++pair_m) {
+        for (pair_d = 0; pair_d <= DFN2_MAX_DF_LOOKAHEAD; ++pair_d) {
+            DFN2Grid g;
+            int status = dfn2_grid_make(&g, 48000, 1024, 32, 96, pair_m, pair_d);
+            int ring = pair_m + pair_d + 1 > DFN2_DF_ORDER ? pair_m + pair_d + 1 : DFN2_DF_ORDER;
+            if (ring > DFN2_MAX_DF_RING) {
+                if (status != DFN2_GRID_ERR_CAPACITY) return 130;
+                continue;
+            }
+            if (status != DFN2_GRID_OK) return 131;
+            rc = run_stage_on_grid(&g, pair_m + pair_d, &measured, NULL);
+            if (rc) { fprintf(stderr, "  pair %d/%d: stage row %d\n", pair_m, pair_d, rc); return 132; }
+            if (measured != pair_m + pair_d) return 133;
+        }
+    }
+    puts("dfn_res_stage: every table grid and every lookahead pair within the ring capacity runs "
+         "at run time; a model or pool of another grid is refused");
     return 0;
 }
 
@@ -466,7 +673,7 @@ static int run_phased_case(int mode) {
     long long fa, ca, sa, fb, cb_commits, sb;
     int frame, differs = 0, any = 0;
 
-    if (dfn2_model_io_descriptor_default(&descriptor) != 0) return 1;
+    if (dfn2_model_io_descriptor_default(dfn_test_grid(), &descriptor) != 0) return 1;
     cb_cfg.model.io_descriptor = &descriptor;
     cb_cfg.model.infer = mode == 0 ? dfn_fixture_half_mask_infer
                        : mode == 1 ? failing_infer
@@ -552,7 +759,7 @@ static int run_phased_sequence(void) {
 
 int main(void) {
     int rc;
-    DFN2_REQUIRE_LOOKAHEAD_PAIR_LINK();   /* this unit's lookahead pair is the archive's */
+    DFN2_REQUIRE_VARIANT_LINK();   /* this unit's DFN2 capacities are the archive's */
     make_partition();
     rc = run_identity_case(0);
     if (rc) { fprintf(stderr, "NULL-model identity failed: %d\n", rc); return 1; }
@@ -566,6 +773,8 @@ int main(void) {
     if (rc) { fprintf(stderr, "reset parity failed: %d\n", rc); return 1; }
     rc = run_rejections();
     if (rc) { fprintf(stderr, "rejection row failed: %d\n", rc); return 1; }
+    rc = run_table_grids();
+    if (rc) { fprintf(stderr, "run-time table grid row failed: %d\n", rc); return 1; }
     rc = run_stale_pool();
     if (rc) { fprintf(stderr, "stale-pool gate failed: %d\n", rc); return 1; }
     rc = run_non_finite_input();
@@ -576,6 +785,12 @@ int main(void) {
     }
     rc = run_phased_sequence();
     if (rc) { fprintf(stderr, "phased sequence row failed: %d\n", rc); return 1; }
+    {   /* the pair this program was built with, as the stage measures it (make test-pairs reads it) */
+        int measured = -1;
+        rc = run_stage_on_grid(dfn_test_grid(), DFN_TEST_LOOKAHEAD_FRAMES, &measured, NULL);
+        if (rc) { fprintf(stderr, "test grid latency row failed: %d\n", rc); return 1; }
+        dfn_test_report_pair("dfn_res_stage", measured);
+    }
     puts("dfn_res_stage: PASS");
     return 0;
 }

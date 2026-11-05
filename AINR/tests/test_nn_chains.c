@@ -7,7 +7,13 @@
  * every output spectrum are hashed bit by bit (a NaN is one value). The
  * program prints one digest per chain; the NEON and forced-scalar builds must
  * match (`make test-simd`), and a second run in the process must reproduce its
- * own digest, which catches state read before it is written. */
+ * own digest, which catches state read before it is written.
+ *
+ * The DeepFilterNet2 grid and lookahead pair are chosen when the program is
+ * built (dfn2_test_grid.h: -DDFN2_GRID_KHZ=16|32|48, -DDFN2_MASK_LOOKAHEAD,
+ * -DDFN2_DF_LOOKAHEAD) and the library is handed the same grid at run time.
+ * The digest printed for the shipped 48 kHz 1/1 grid is a recorded value; the
+ * other grids print their own. */
 #include <math.h>
 #include <stdint.h>
 #include <stdio.h>
@@ -16,6 +22,7 @@
 
 #include "DeepFilterNet2/dfn2_prepost.h"
 #include "GTCRN/gtcrn_process.h"
+#include "dfn2_test_grid.h"
 
 #define HOPS 640
 
@@ -138,25 +145,28 @@ static float dfn_inv_a[DFN2_N_ERB * DFN2_N_BINS];
 static float dfn_fwd_b[DFN2_N_BINS * DFN2_N_ERB];
 static float dfn_inv_b[DFN2_N_ERB * DFN2_N_BINS];
 
-/* Triangular interpolation over the shipped border table. */
+/* Triangular interpolation over the band border table (dfn2_test_band_borders(),
+ * dfn2_test_grid.h). */
 static void dfn_tables_triangular(float* fwd, float* inv)
 {
-    static const int borders[32] = {
-        0, 2, 4, 6, 8, 10, 12, 14, 16, 18, 20, 22, 25, 30, 36, 42,
-        50, 59, 69, 81, 94, 110, 129, 151, 176, 205, 239, 279,
-        325, 378, 440, 513 };
+    int borders[DFN2_N_ERB];
+    const int last = DFN2_N_ERB - 1;
     int segment = 0;
+    dfn2_test_band_borders(borders);
+    if (borders[0] != 0 || borders[last] != DFN2_N_BINS) exit(2);
+    for (int b = 0; b < last; ++b)
+        if (borders[b + 1] - borders[b] < 2) exit(2);
     for (int k = 0; k < DFN2_N_BINS; ++k) {
         int lo, width;
         float right, left;
-        while (segment + 1 < 31 && k >= borders[segment + 1]) ++segment;
+        while (segment + 1 < last && k >= borders[segment + 1]) ++segment;
         lo = borders[segment];
         width = borders[segment + 1] - lo;
         right = (float)(k - lo) / (float)width;
         left = 1.0f - right;
         fwd[k * DFN2_N_ERB + segment] = left * (segment == 0 ? 2.0f : 1.0f);
         fwd[k * DFN2_N_ERB + segment + 1] =
-            right * (segment + 1 == 31 ? 2.0f : 1.0f);
+            right * (segment + 1 == last ? 2.0f : 1.0f);
         inv[segment * DFN2_N_BINS + k] = left;
         inv[(segment + 1) * DFN2_N_BINS + k] = right;
     }
@@ -165,8 +175,9 @@ static void dfn_tables_triangular(float* fwd, float* inv)
 /* Irregular spans of 1 to 40 bins at any offset, some weights exactly zero. */
 static void dfn_tables_irregular(float* fwd, float* inv)
 {
+    const unsigned max_width = DFN2_N_BINS / 2 < 40 ? DFN2_N_BINS / 2 : 40;
     for (int b = 0; b < DFN2_N_ERB; ++b) {
-        int width = 1 + (int)(rng() % 40);
+        int width = 1 + (int)(rng() % max_width);
         int lo = (int)(rng() % (unsigned)(DFN2_N_BINS - width));
         for (int k = lo; k < lo + width; ++k)
             inv[b * DFN2_N_BINS + k] = (k % 7 == 3) ? 0.0f : 0.5f + 0.5f * uniform();
@@ -192,6 +203,7 @@ static uint64_t run_dfn2(void)
 {
     static float re[DFN2_N_BINS], im[DFN2_N_BINS], app_re[DFN2_N_BINS],
         app_im[DFN2_N_BINS], out_re[DFN2_N_BINS], out_im[DFN2_N_BINS];
+    const DFN2Grid* grid = dfn2_test_grid();
     DFN2PrepostConfig cfg;
     DFN2Prepost* p;
     Digest d;
@@ -199,11 +211,13 @@ static uint64_t run_dfn2(void)
     digest_init(&d);
     dfn_tables_triangular(dfn_fwd_a, dfn_inv_a);
     dfn_tables_irregular(dfn_fwd_b, dfn_inv_b);
-    if (dfn2_prepost_config_defaults(&cfg, DFN2_IO_FREQ) != 0) exit(2);
+    if (dfn2_prepost_config_defaults(&cfg, DFN2_IO_FREQ, grid) != 0) exit(2);
     cfg.erb_fwd = dfn_fwd_a;
     cfg.erb_inv = dfn_inv_a;
     p = dfn2_prepost_create(&cfg);
     if (!p) exit(2);
+    if (dfn2_prepost_hop_size(p) != DFN2_HOP_LEN ||
+        dfn2_prepost_num_bins(p) != DFN2_N_BINS) exit(2);
     for (int h = 0; h < HOPS; ++h) {
         int v, valid = 0, kind = hop_kind(h);
         if (h == HOPS / 3)
@@ -227,13 +241,18 @@ static uint64_t run_dfn2(void)
             float* convp;
             int rc, skipped = 0;
             if (dfn2_prepost_frame_inputs(p, &in, &out) != 0) exit(2);
-            hash_f32(&d.in, &in.erb_window[0][0], in.erb_window_elements);
-            hash_f32(&d.in, &in.spec_window[0][0][0], in.spec_window_elements);
+            if (in.erb_window_elements != dfn2_prepost_erb_window_elements(grid) ||
+                in.spec_window_elements != dfn2_prepost_spec_window_elements(grid) ||
+                in.df_convp_window_elements !=
+                    dfn2_prepost_convp_window_elements(grid) ||
+                out.erb_mask_elements != dfn2_prepost_erb_mask_elements(grid) ||
+                out.coefs_elements != dfn2_prepost_coefs_elements(grid)) exit(2);
+            hash_f32(&d.in, in.erb_window, in.erb_window_elements);
+            hash_f32(&d.in, in.spec_window, in.spec_window_elements);
             hash_f32(&d.in, &in.gru_hidden[0][0], in.gru_hidden_elements);
-            hash_f32(&d.in, &in.df_convp_window[0][0][0],
-                     in.df_convp_window_elements);
+            hash_f32(&d.in, in.df_convp_window, in.df_convp_window_elements);
             gru = &out.gru_hidden_next[0][0];
-            convp = &out.df_convp_window_next[0][0][0];
+            convp = out.df_convp_window_next;
             if (kind != K_SKIP && kind != K_UNWRITTEN) {
                 dfn_write_heads(&out, kind);
                 fill(gru, out.gru_hidden_elements, kind_scale(kind));

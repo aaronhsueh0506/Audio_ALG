@@ -68,7 +68,7 @@ static void analyzer_push(Analyzer *a, const float *hop, Complex *spec) {
 }
 
 static DfnRateBridgeConfig bridge_config(int sr, int fft) {
-    DfnRateBridgeConfig cfg = dfn_rate_bridge_default_config(sr);
+    DfnRateBridgeConfig cfg = dfn_rate_bridge_default_config(sr, dfn_test_grid());
     cfg.fft_size = fft;
     cfg.stage.erb_fwd = erb_fwd;
     cfg.stage.erb_inv = erb_inv;
@@ -225,6 +225,7 @@ static int run_rejections(void) {
     DfnRateBridgeMemReq req, bad;
     void *mem = NULL;
     DfnRateBridge *b;
+    int k;
     cfg = bridge_config(48000, 1024);
     if (dfn_rate_bridge_get_mem_requirements(&cfg, &req) == 0) return 1;
     cfg = bridge_config(44100, 0);
@@ -235,8 +236,31 @@ static int run_rejections(void) {
     if (dfn_rate_bridge_get_mem_requirements(&cfg, &req) == 0) return 4;
     cfg = bridge_config(16000, 0); cfg.stage.erb_inv = NULL;
     if (dfn_rate_bridge_get_mem_requirements(&cfg, &req) == 0) return 5;
-    cfg = bridge_config(16000, 0); cfg.stage.sample_rate = 16000;
-    if (dfn_rate_bridge_get_mem_requirements(&cfg, &req) == 0) return 6;
+    /* The model must be the 48 kHz / 1024 grid: a stage on another grid is refused whatever
+     * matrices it carries (rows 6 and 15 give it matrices of its own size, so the grid is the
+     * only reason; run_other_grid_refusal() has the full set). */
+    {
+        static float other_fwd[DFN2_MAX_N_BINS * DFN2_MAX_N_ERB];
+        static float other_inv[DFN2_MAX_N_ERB * DFN2_MAX_N_BINS];
+        DFN2Grid g16, g48_512;
+        if (dfn2_grid_make(&g16, 16000, 256, 24, 96, 0, 0) != DFN2_GRID_OK) return 42;
+        dfn_unit_partition(other_fwd, other_inv, &g16);
+        cfg = bridge_config(16000, 0);
+        cfg.stage.grid = g16;
+        cfg.stage.erb_fwd = other_fwd;
+        cfg.stage.erb_inv = other_inv;
+        if (dfn_rate_bridge_get_mem_requirements(&cfg, &req) == 0) return 6;
+        /* the same stage config is a valid stage on its own grid */
+        if (dfn_res_stage_get_mem_requirements(&cfg.stage, &(DfnResStageMemReq){0}) != 0) return 43;
+        if (dfn2_grid_make(&g48_512, 48000, 512, 28, 96, 1, 1) != DFN2_GRID_OK) return 44;
+        dfn_unit_partition(other_fwd, other_inv, &g48_512);
+        cfg = bridge_config(16000, 0);
+        cfg.stage.grid = g48_512;
+        cfg.stage.erb_fwd = other_fwd;
+        cfg.stage.erb_inv = other_inv;
+        if (dfn_rate_bridge_get_mem_requirements(&cfg, &req) == 0) return 15;
+        if (dfn_res_stage_get_mem_requirements(&cfg.stage, &(DfnResStageMemReq){0}) != 0) return 45;
+    }
     /* Below-set fft sizes, even where a host might one day offer them: the
      * gate is the bridge's own (rows 13-14). Row 15 passes that gate and is
      * refused by the stage's (1024 only), reached through the bridge. */
@@ -244,8 +268,33 @@ static int run_rejections(void) {
     if (dfn_rate_bridge_get_mem_requirements(&cfg, &req) == 0) return 13;
     cfg = bridge_config(8000, 128);
     if (dfn_rate_bridge_get_mem_requirements(&cfg, &req) == 0) return 14;
-    cfg = bridge_config(16000, 0); cfg.stage.fft_size = 512;
-    if (dfn_rate_bridge_get_mem_requirements(&cfg, &req) == 0) return 15;
+    cfg = bridge_config(16000, 0); memset(&cfg.stage.grid, 0, sizeof(cfg.stage.grid));
+    if (dfn_rate_bridge_get_mem_requirements(&cfg, &req) == 0) return 16;   /* a zeroed model grid */
+    cfg = bridge_config(16000, 0); cfg.stage.grid.hop += 1;
+    if (dfn_rate_bridge_get_mem_requirements(&cfg, &req) == 0) return 17;   /* a hand-edited one */
+    cfg = dfn_rate_bridge_default_config(16000, NULL);
+    cfg.stage.erb_fwd = erb_fwd; cfg.stage.erb_inv = erb_inv;
+    if (dfn_rate_bridge_get_mem_requirements(&cfg, &req) == 0) return 18;   /* no model grid at all */
+    /* A model built for another lookahead pair or grid is refused through the bridge's stage
+     * (run time, from its descriptor); the test grid's own descriptor is the accepted control. */
+    for (k = 0; k < 3; ++k) {
+        DFN2ModelIoDescriptor foreign;
+        int made = dfn_fixture_foreign_descriptor(dfn_test_grid(), &foreign, k);
+        if (made < 0) return 20 + k;
+        if (made > 0) continue;   /* no such grid within the library's capacity */
+        cfg = bridge_config(16000, 0);
+        cfg.stage.model.infer = dfn_fixture_identity_infer;
+        cfg.stage.model.io_descriptor = &foreign;
+        if (dfn_rate_bridge_get_mem_requirements(&cfg, &req) == 0) return 30 + k;
+    }
+    {
+        DFN2ModelIoDescriptor own;
+        cfg = bridge_config(16000, 0);
+        if (dfn2_model_io_descriptor_default(dfn_test_grid(), &own) != 0) return 40;
+        cfg.stage.model.infer = dfn_fixture_identity_infer;
+        cfg.stage.model.io_descriptor = &own;
+        if (dfn_rate_bridge_get_mem_requirements(&cfg, &req) != 0) return 41;
+    }
 
     cfg = bridge_config(16000, 0);
     if (dfn_rate_bridge_get_mem_requirements(&cfg, &req) != 0) return 7;
@@ -260,6 +309,7 @@ static int run_rejections(void) {
     if (dfn_rate_bridge_init(mem, (size_t)req.bytes - 16u, &cfg)) { free(mem); return 12; }
     printf("dfn_rate_bridge: 16 kHz / fft 256 pool %llu bytes (model weights external)\n",
            (unsigned long long)req.bytes);
+    printf("dfn_rate_bridge: 16 kHz / fft 256 pool descriptor hash %08x\n", req.build_flags_hash);
     free(mem);
     return 0;
 }
@@ -336,7 +386,7 @@ static int run_phased_grid(const Grid *g, int behaviour) {
     int hop = g->fft / 2, hops = 120, t, k, max_frames = 0, nonzero = 0;
     DfnResStageJob job;
 
-    if (dfn2_model_io_descriptor_default(&descriptor) != 0) return 1;
+    if (dfn2_model_io_descriptor_default(dfn_test_grid(), &descriptor) != 0) return 1;
     if (behaviour == BP_RUN) {
         cb_cfg.stage.model.infer = dfn_fixture_half_mask_infer;
         cb_cfg.stage.model.io_descriptor = &descriptor;
@@ -603,10 +653,63 @@ static int run_phased_sequence(void) {
     return 0;
 }
 
+/* A model grid that is not 48 kHz / 1024 -- the test grid's own when this program was built for
+ * -DDFN2_GRID_KHZ=16|32 (dfn_test_grid.h), and the 16 and 32 kHz rows of the board samples'
+ * table whatever the test grid: every bridge configuration is refused at run time, the same stage
+ * config is accepted on its own, and no bridge is created. */
+static int run_other_grid_refusal(const DFN2Grid *model) {
+    static float other_fwd[DFN2_MAX_N_BINS * DFN2_MAX_N_ERB];
+    static float other_inv[DFN2_MAX_N_ERB * DFN2_MAX_N_BINS];
+    DfnRateBridgeConfig cfg;
+    DfnRateBridgeMemReq req;
+    DfnResStageConfig stage;
+    DfnResStageMemReq stage_req;
+    static const int rates[] = { 8000, 16000 };
+    int i;
+    dfn_unit_partition(other_fwd, other_inv, model);
+    for (i = 0; i < 2; ++i) {
+        cfg = dfn_rate_bridge_default_config(rates[i], model);
+        cfg.stage.erb_fwd = other_fwd;
+        cfg.stage.erb_inv = other_inv;
+        if (dfn_rate_bridge_get_mem_requirements(&cfg, &req) == 0) return 1;
+        if (dfn_rate_bridge_create(&cfg) != NULL) return 2;
+    }
+    stage = dfn_res_stage_default_config(model);
+    stage.erb_fwd = other_fwd;
+    stage.erb_inv = other_inv;
+    if (dfn_res_stage_get_mem_requirements(&stage, &stage_req) != 0) return 3;
+    return 0;
+}
+
 int main(void) {
     int rc, i;
-    DFN2_REQUIRE_LOOKAHEAD_PAIR_LINK();   /* this unit's lookahead pair is the archive's */
-    dfn_unit_partition(erb_fwd, erb_inv);
+    DFN2_REQUIRE_VARIANT_LINK();   /* this unit's DFN2 capacities are the archive's */
+    dfn_unit_partition(erb_fwd, erb_inv, dfn_test_grid());
+    dfn_test_report_pair("dfn_rate_bridge", -1);
+    {   /* the table's non-48 kHz model grids: refused by the bridge, run at run time by the stage */
+        static const int table[][2] = { {16000, 256}, {32000, 512} };
+        static const int erb[] = { 24, 28 };
+        for (i = 0; i < 2; ++i) {
+            DFN2Grid g;
+            if (dfn2_grid_make(&g, table[i][0], table[i][1], erb[i], 96, 0, 0) != DFN2_GRID_OK)
+                return 1;
+            rc = run_other_grid_refusal(&g);
+            if (rc) {
+                fprintf(stderr, "other-grid refusal row (%d Hz / %d) failed: %d\n", table[i][0],
+                        table[i][1], rc);
+                return 1;
+            }
+        }
+        puts("dfn_rate_bridge: a 16 kHz or 32 kHz model grid is refused (the bridge needs 48 kHz / 1024)");
+    }
+    if (DFN2_SR != 48000 || DFN2_N_FFT != 1024) {
+        /* built for another test grid (-DDFN2_GRID_KHZ=16|32 or an external grid): its own
+         * grid is refused too, and the rows below (written for the 48 kHz model) do not apply */
+        rc = run_other_grid_refusal(dfn_test_grid());
+        if (rc) { fprintf(stderr, "other-grid refusal row failed: %d\n", rc); return 1; }
+        puts("dfn_rate_bridge: PASS (this program's test grid is not 48 kHz / 1024: the bridge refuses it)");
+        return 0;
+    }
     rc = run_borrowed_sizes();
     if (rc) { fprintf(stderr, "borrowed STFT/ISTFT sizing row failed: %d\n", rc); return 1; }
     rc = run_rejections();

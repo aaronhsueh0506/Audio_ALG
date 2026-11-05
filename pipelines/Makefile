@@ -30,6 +30,8 @@
 #   make EXTRA_CFLAGS="..."    # forwarded to the producers and this compile
 #   make WERROR=1              # -Werror for this file's own TUs
 #   make test                  # build + run the mono chain, board-adapter and stage tests
+#   make test-pairs            # the DFN tests rebuilt for other lookahead pairs (DFN_TEST_PAIRS="0/0 2/4")
+#   make test-dfn-grids        # the DFN stage, bridge and hop tests built for the 16 and 32 kHz test grids
 #   make NO_STDIO=1 libaudio_pipeline_dfn.a   # stdio-less archive only (no link, so no
 #                              # producer archive is needed)
 #   make audit-no-transform    # PASS/FAIL: no inverse FFT / overlap-add code in the AINR/ and AIAEC/
@@ -91,11 +93,19 @@ $(error ULCNET_GRID must be 16k or 48k, got '$(ULCNET_GRID)')
 endif
 
 # DeepFilterNet2/3 lookahead pair (AINR/README.md "Lookahead pairs"): mask 0..2, deep filter
-# 0..DF_ORDER-1 (4), plain decimals. A pair other than the headers' default 1/1 becomes -D flags
-# on every unit this Makefile compiles (the DFN2/DFN3 sources and everything including their
-# headers), so the shipped pair adds no flag and a default build's compile lines are unchanged.
-# The pair is folded into CFG_SIG_PAYLOAD: another pair gets its own obj/bin directories, and
-# objects of different pairs cannot link (the AINR link guard).
+# 0..DF_ORDER-1 (4), plain decimals.
+#   DFN3 is still a build-time pair: a pair other than the default 1/1 becomes -D flags on every
+#   unit this Makefile compiles, so the shipped pair adds no flag and a default build's compile
+#   lines are unchanged.
+#   DFN2 takes its grid at run time: dfn_res_stage, dfn_rate_bridge and the example mains hold no
+#   grid and no pair (the config carries a DFN2Grid), so the pair make variables below only select
+#   what the TEST programs run (DFN_TEST_CFLAGS, applied to the test units alone). The one thing a
+#   pair still asks of every unit is the library's state-ring capacity: a pair whose ring
+#   max(5, mask + df + 1) is deeper than the default capacity of 5 frames (1/4 and 2/3: 6, 2/4: 7)
+#   gets -DDFN2_MAX_DF_RING=<ring> in DFN_PAIR_CFLAGS, because the library takes a capacity on
+#   every translation unit (dfn2_grid.h; objects of different capacities do not link).
+# Both are folded into CFG_SIG_PAYLOAD (CFLAGS carries DFN_PAIR_CFLAGS, the payload names
+# DFN_TEST_CFLAGS): another pair gets its own obj/bin directories.
 DFN2_MASK_LOOKAHEAD ?= 1
 DFN2_DF_LOOKAHEAD ?= 1
 DFN3_MASK_LOOKAHEAD ?= 1
@@ -107,11 +117,30 @@ $(foreach v,DFN2_DF_LOOKAHEAD DFN3_DF_LOOKAHEAD,\
   $(if $(filter-out 1,$(words $($(v))))$(filter-out 0 1 2 3 4,$($(v))),\
     $(error $(v) must be 0..4 (DF_ORDER - 1), got '$($(v))')))
 DFN_PAIR_CFLAGS :=
-ifneq ($(DFN2_MASK_LOOKAHEAD)/$(DFN2_DF_LOOKAHEAD),1/1)
-DFN_PAIR_CFLAGS += -DDFN2_MASK_LOOKAHEAD=$(DFN2_MASK_LOOKAHEAD) -DDFN2_DF_LOOKAHEAD=$(DFN2_DF_LOOKAHEAD)
+DFN2_PAIR_RING := $(if $(filter 2/4,$(DFN2_MASK_LOOKAHEAD)/$(DFN2_DF_LOOKAHEAD)),7,$(if $(filter 1/4 2/3,$(DFN2_MASK_LOOKAHEAD)/$(DFN2_DF_LOOKAHEAD)),6))
+ifneq ($(DFN2_PAIR_RING),)
+DFN_PAIR_CFLAGS += -DDFN2_MAX_DF_RING=$(DFN2_PAIR_RING)
 endif
 ifneq ($(DFN3_MASK_LOOKAHEAD)/$(DFN3_DF_LOOKAHEAD),1/1)
 DFN_PAIR_CFLAGS += -DDFN3_MASK_LOOKAHEAD=$(DFN3_MASK_LOOKAHEAD) -DDFN3_DF_LOOKAHEAD=$(DFN3_DF_LOOKAHEAD)
+endif
+
+# The DFN2 grid and pair the test programs run (test scaffolding only: dfn/tests/dfn_test_grid.h
+# turns these -D flags into the macros that size the tests' buffers and the DFN2Grid they hand to
+# the stage and the bridge). DFN2_TEST_GRID_KHZ selects the grid preset (16, 32 or 48; 48 adds no
+# flag), DFN2_MASK_LOOKAHEAD / DFN2_DF_LOOKAHEAD the pair. Applied to the test units only -- never to
+# dfn_res_stage.c, dfn_rate_bridge.c, the example mains or the producers (EXTRA_CFLAGS would reach
+# those too). `make test-dfn-grids` runs the stage, bridge and hop tests at 16 and 32 kHz.
+DFN2_TEST_GRID_KHZ ?= 48
+ifeq ($(filter $(DFN2_TEST_GRID_KHZ),16 32 48),)
+$(error DFN2_TEST_GRID_KHZ must be 16, 32 or 48, got '$(DFN2_TEST_GRID_KHZ)')
+endif
+DFN_TEST_CFLAGS :=
+ifneq ($(DFN2_TEST_GRID_KHZ),48)
+DFN_TEST_CFLAGS += -DDFN2_GRID_KHZ=$(DFN2_TEST_GRID_KHZ)
+endif
+ifneq ($(DFN2_MASK_LOOKAHEAD)/$(DFN2_DF_LOOKAHEAD),1/1)
+DFN_TEST_CFLAGS += -DDFN2_MASK_LOOKAHEAD=$(DFN2_MASK_LOOKAHEAD) -DDFN2_DF_LOOKAHEAD=$(DFN2_DF_LOOKAHEAD)
 endif
 
 # audiolib sits two levels up from pipelines/ (SE/Audio_ALG/pipelines -> SE/audiolib/common).
@@ -477,7 +506,7 @@ TARGET_ABI_INCLUDES := -I4ch_aec_bf_nr_res \
 # The same CC command can select a different SDK through PATH.
 # Include effective pointer/FP/ISA predefines to avoid cross-ABI cache reuse.
 override CC_TARGET_SIG := $(shell sh $(COMMON_DIR)/scripts/target_abi_signature.sh $(CC) $(CPPFLAGS) $(CFLAGS))
-CFG_SIG_PAYLOAD := CC_TARGET_SIG=$(CC_TARGET_SIG) ULCNET_GRID=$(ULCNET_GRID) DFN2_LOOKAHEAD=$(DFN2_MASK_LOOKAHEAD)/$(DFN2_DF_LOOKAHEAD) DFN3_LOOKAHEAD=$(DFN3_MASK_LOOKAHEAD)/$(DFN3_DF_LOOKAHEAD) CC=$(CC) CXX=$(CXX) AR=$(AR) RANLIB=$(RANLIB) LINK=$(LINK) CFLAGS=$(CFLAGS) CXXFLAGS=$(CXXFLAGS) CPPFLAGS=$(CPPFLAGS) LDFLAGS=$(LDFLAGS) EXTRA_CFLAGS=$(EXTRA_CFLAGS) EXTRA_LDFLAGS=$(EXTRA_LDFLAGS) BACKEND=$(BACKEND) SIMD=$(SIMD) PROFILE=$(PROFILE) WERROR=$(WERROR) NO_STDIO=$(NO_STDIO) DEBUG=$(DEBUG) TOOLCHAIN_CHECK=$(TOOLCHAIN_CHECK) COMMON_PRODUCER_SIG=$(COMMON_PRODUCER_SIG) AEC_PRODUCER_SIG=$(AEC_PRODUCER_SIG) NR_PRODUCER_SIG=$(NR_PRODUCER_SIG) SRCS=$(sort mono_aec_nr_res/main.c mono_aec_nr_res/tests/test_mono_chain.c mono_aec_nr_res/tests/test_no_stdio_stack.c mono_aec_nr_res/example_board_adapter.c ulcnet/ulcnet_nn_stage.c ulcnet/mono_alignulcnet/tests/test_mono_ulcnet.c $(ULCNET_DIR)/ulcnet_accelerator_adapter.c $(ULCNET_DIR)/ulcnet_prepost.c $(ULCNET_DIR)/ulcnet_process.c $(ULCNET_DIR)/ulcnet_model_io.c $(AIAEC_DIR)/tests/test_ulcnet_accelerator_adapter.c ulcnet/mono_alignulcnet/main.c dfn/dfn_res_stage.c dfn/dfn_rate_bridge.c dfn/tests/test_dfn_res_stage.c dfn/tests/test_dfn_rate_bridge.c 4ch_aec_bf_nr_res/tests/test_mcab_sample_post.c tests/test_readme_flow.c dfn/mono_aec_dfn_res/tests/test_mono_dfn.c dfn/mono_aec_dfn_res/main.c dfn/tests/test_dfn_hop.c ulcnet/tests/test_ulcnet_nn_stage.c $(DFN2_DIR)/dfn2_process.c $(DFN2_DIR)/dfn2_model_io.c $(DFN2_DIR)/dfn2_prepost.c $(TARGET_ABI_SRCS))
+CFG_SIG_PAYLOAD := CC_TARGET_SIG=$(CC_TARGET_SIG) ULCNET_GRID=$(ULCNET_GRID) DFN2_LOOKAHEAD=$(DFN2_MASK_LOOKAHEAD)/$(DFN2_DF_LOOKAHEAD) DFN2_TEST_GRID_KHZ=$(DFN2_TEST_GRID_KHZ) DFN_TEST_CFLAGS=$(DFN_TEST_CFLAGS) DFN3_LOOKAHEAD=$(DFN3_MASK_LOOKAHEAD)/$(DFN3_DF_LOOKAHEAD) CC=$(CC) CXX=$(CXX) AR=$(AR) RANLIB=$(RANLIB) LINK=$(LINK) CFLAGS=$(CFLAGS) CXXFLAGS=$(CXXFLAGS) CPPFLAGS=$(CPPFLAGS) LDFLAGS=$(LDFLAGS) EXTRA_CFLAGS=$(EXTRA_CFLAGS) EXTRA_LDFLAGS=$(EXTRA_LDFLAGS) BACKEND=$(BACKEND) SIMD=$(SIMD) PROFILE=$(PROFILE) WERROR=$(WERROR) NO_STDIO=$(NO_STDIO) DEBUG=$(DEBUG) TOOLCHAIN_CHECK=$(TOOLCHAIN_CHECK) COMMON_PRODUCER_SIG=$(COMMON_PRODUCER_SIG) AEC_PRODUCER_SIG=$(AEC_PRODUCER_SIG) NR_PRODUCER_SIG=$(NR_PRODUCER_SIG) SRCS=$(sort mono_aec_nr_res/main.c mono_aec_nr_res/tests/test_mono_chain.c mono_aec_nr_res/tests/test_no_stdio_stack.c mono_aec_nr_res/example_board_adapter.c ulcnet/ulcnet_nn_stage.c ulcnet/mono_alignulcnet/tests/test_mono_ulcnet.c $(ULCNET_DIR)/ulcnet_accelerator_adapter.c $(ULCNET_DIR)/ulcnet_prepost.c $(ULCNET_DIR)/ulcnet_process.c $(ULCNET_DIR)/ulcnet_model_io.c $(AIAEC_DIR)/tests/test_ulcnet_accelerator_adapter.c ulcnet/mono_alignulcnet/main.c dfn/dfn_res_stage.c dfn/dfn_rate_bridge.c dfn/tests/test_dfn_res_stage.c dfn/tests/test_dfn_rate_bridge.c 4ch_aec_bf_nr_res/tests/test_mcab_sample_post.c tests/test_readme_flow.c dfn/mono_aec_dfn_res/tests/test_mono_dfn.c dfn/mono_aec_dfn_res/main.c dfn/tests/test_dfn_hop.c ulcnet/tests/test_ulcnet_nn_stage.c $(DFN2_DIR)/dfn2_process.c $(DFN2_DIR)/dfn2_model_io.c $(DFN2_DIR)/dfn2_prepost.c $(TARGET_ABI_SRCS))
 CFG_SIG := $(shell printf '%s' "$(CFG_SIG_PAYLOAD)" | cksum | cut -d' ' -f1)
 
 # OBJ_ROOT / BIN_ROOT: where this repo's keyed obj/bin trees live (default obj/ and bin/ here). A
@@ -603,27 +632,27 @@ $(OBJ_DIR)/dfn_res_stage.o: dfn/dfn_res_stage.c dfn/dfn_res_stage.h $(DFN2_DIR)/
 $(OBJ_DIR)/test_mcab_sample_post.o: 4ch_aec_bf_nr_res/tests/test_mcab_sample_post.c 4ch_aec_bf_nr_res/mcab_sample_post.h 4ch_aec_bf_nr_res/mcab.h | _cfg_guard
 	$(CC) $(CFLAGS) -MD -MP -c -o $@ $<
 
-$(OBJ_DIR)/test_readme_flow.o: tests/test_readme_flow.c dfn/dfn_hop.h ulcnet/ulcnet_nn_stage.h mono_aec_nr_res/tests/conv_chain_mono.h dfn/tests/dfn_test_fixture.h | _cfg_guard
-	$(CC) $(CFLAGS) -I$(ULCNET_DIR) $(ULCNET_GRID_CFLAGS) -MD -MP -c -o $@ $<
+$(OBJ_DIR)/test_readme_flow.o: tests/test_readme_flow.c dfn/dfn_hop.h ulcnet/ulcnet_nn_stage.h mono_aec_nr_res/tests/conv_chain_mono.h dfn/tests/dfn_test_fixture.h dfn/tests/dfn_test_grid.h | _cfg_guard
+	$(CC) $(CFLAGS) $(DFN_TEST_CFLAGS) -I$(ULCNET_DIR) $(ULCNET_GRID_CFLAGS) -MD -MP -c -o $@ $<
 
 $(OBJ_DIR)/test_dfn_res_stage.o: dfn/tests/test_dfn_res_stage.c dfn/dfn_res_stage.h dfn/tests/dfn_test_fixture.h dfn/dfn_unit_partition.h | _cfg_guard
-	$(CC) $(CFLAGS) -I$(DFN2_DIR) -MD -MP -c -o $@ $<
+	$(CC) $(CFLAGS) $(DFN_TEST_CFLAGS) -I$(DFN2_DIR) -MD -MP -c -o $@ $<
 
 $(OBJ_DIR)/dfn_rate_bridge.o: dfn/dfn_rate_bridge.c dfn/dfn_rate_bridge.h dfn/dfn_res_stage.h | _cfg_guard
 	$(CC) $(CFLAGS) -I$(DFN2_DIR) -MD -MP -c -o $@ $<
 
 $(OBJ_DIR)/test_dfn_rate_bridge.o: dfn/tests/test_dfn_rate_bridge.c dfn/dfn_rate_bridge.h dfn/tests/dfn_test_fixture.h | _cfg_guard
-	$(CC) $(CFLAGS) -I$(DFN2_DIR) -MD -MP -c -o $@ $<
+	$(CC) $(CFLAGS) $(DFN_TEST_CFLAGS) -I$(DFN2_DIR) -MD -MP -c -o $@ $<
 
 $(OBJ_DIR)/test_mono_dfn.o: dfn/mono_aec_dfn_res/tests/test_mono_dfn.c mono_aec_nr_res/tests/conv_chain_mono.h dfn/dfn_hop.h dfn/dfn_res_stage.h dfn/dfn_rate_bridge.h dfn/tests/dfn_test_fixture.h | _cfg_guard
-	$(CC) $(CFLAGS) -MD -MP -c -o $@ $<
+	$(CC) $(CFLAGS) $(DFN_TEST_CFLAGS) -MD -MP -c -o $@ $<
 
 $(OBJ_DIR)/mono_aec_dfn_res_main.o: dfn/mono_aec_dfn_res/main.c dfn/dfn_hop.h dfn/dfn_res_stage.h dfn/dfn_rate_bridge.h dfn/dfn_example_args.h dfn/dfn_unit_partition.h common/example_cli.h dfn/dfn_hop_pool.h | _cfg_guard
 	$(CC) $(CFLAGS) -MD -MP -c -o $@ $<
 
 # test_dfn_hop: the DfnHop paths against direct calls of a twin stage.
 $(OBJ_DIR)/test_dfn_hop.o: dfn/tests/test_dfn_hop.c dfn/dfn_hop.h dfn/dfn_res_stage.h dfn/dfn_rate_bridge.h dfn/dfn_unit_partition.h dfn/tests/dfn_test_fixture.h | _cfg_guard
-	$(CC) $(CFLAGS) -I$(DFN2_DIR) -MD -MP -c -o $@ $<
+	$(CC) $(CFLAGS) $(DFN_TEST_CFLAGS) -I$(DFN2_DIR) -MD -MP -c -o $@ $<
 
 # example_board_adapter: REFERENCE ONLY host simulation of a board-side
 # common-memory-manager integration -- see that
@@ -680,6 +709,16 @@ test: $(BIN_DIR)/test_mono_chain $(BIN_DIR)/aec_nr_pipeline $(BIN_DIR)/aec_nr_pi
 	"$(abspath $(BIN_DIR))/mono_aec_dfn_res" --sample-rate 48000
 	"$(abspath $(BIN_DIR))/mono_aec_dfn_res" --sample-rate 8000
 	"$(abspath $(BIN_DIR))/mono_aec_dfn_res" --delay-mode fixed --fixed-delay 64
+# The DFN2 model grid is a run-time choice of the program (--ai-sample-rate / --ai-fft-size, one of the
+# three rows of dfn/dfn_example_args.h): a host on the model's own rate runs the stage directly at
+# that grid (the banner names it), any other host rate needs the bridge, which accepts the 48 kHz /
+# 1024 model only (pool query rejected, exit 1); a pair outside the table is a rejected argument (2).
+	out="$$("$(abspath $(BIN_DIR))/mono_aec_dfn_res" --ai-sample-rate 16000 --ai-fft-size 256)" && printf '%s\n' "$$out" | grep -q "model grid 16000 Hz / FFT 256 (n_erb 24, df_bins 96, lookahead 0/0), the stage on the host grid"
+	out="$$("$(abspath $(BIN_DIR))/mono_aec_dfn_res" --ai-sample-rate 48000 --ai-fft-size 1024 --sample-rate 48000)" && printf '%s\n' "$$out" | grep -q "model grid 48000 Hz / FFT 1024 (n_erb 32, df_bins 96, lookahead 1/1), the stage on the host grid"
+	"$(abspath $(BIN_DIR))/mono_aec_dfn_res" --ai-sample-rate 32000 --ai-fft-size 512 >/dev/null 2>&1; test $$? -eq 1
+	"$(abspath $(BIN_DIR))/mono_aec_dfn_res" --ai-sample-rate 16000 --ai-fft-size 256 --sample-rate 8000 >/dev/null 2>&1; test $$? -eq 1
+	"$(abspath $(BIN_DIR))/mono_aec_dfn_res" --ai-sample-rate 16000 --ai-fft-size 256 --sample-rate 48000 >/dev/null 2>&1; test $$? -eq 1
+	for a in "--ai-sample-rate 44100" "--ai-sample-rate 16000" "--ai-fft-size 512" "--ai-fft-size 256x" "--ai-sample-rate --cng" "--ai-fft-size --cng"; do "$(abspath $(BIN_DIR))/mono_aec_dfn_res" $$a >/dev/null 2>&1; test $$? -eq 2 || exit 1; done
 # Malformed numbers (DFN2 and ULCNet examples) are refused at parse time with the documented exit code 2,
 # not merely "some failure" (a crash or a later pool rejection is nonzero too).
 	"$(abspath $(BIN_DIR))/mono_aec_dfn_res" --sample-rate 16000Hz >/dev/null 2>&1; test $$? -eq 2
@@ -722,7 +761,8 @@ $(BIN_DIR)/test_target_abi: $(TARGET_ABI_SRCS) $(COMMON_LIB) $(AEC_LIB) $(NR_LIB
 	@rm -f "$(OBJ_DIR)/target_abi/"*.o
 	@for source in $(TARGET_ABI_SRCS); do \
 	  object="$(OBJ_DIR)/target_abi/$$(basename "$$source" .c).o"; \
-	  $(CC) $(CFLAGS) $(ULCNET_GRID_CFLAGS) $(TARGET_ABI_INCLUDES) -MD -MP \
+	  case "$$source" in tests/*) test_flags="$(DFN_TEST_CFLAGS)" ;; *) test_flags= ;; esac; \
+	  $(CC) $(CFLAGS) $$test_flags $(ULCNET_GRID_CFLAGS) $(TARGET_ABI_INCLUDES) -MD -MP \
 	    -c "$$source" -o "$$object" || exit $$?; \
 	done
 	$(LINK) -o $@ $(OBJ_DIR)/target_abi/*.o $(AEC_LIB) $(NR_LIB) $(COMMON_LIB) $(LDFLAGS)
@@ -1342,13 +1382,22 @@ test-grids:
 	$(MAKE) ULCNET_GRID=16k test
 	$(MAKE) ULCNET_GRID=48k test
 
-# test-pairs: the DFN C tests and the mono DFN2 program rebuilt and run for other lookahead pairs
+# test-pairs: the DFN C tests (DFN_PAIR_TESTS) rebuilt and run for other lookahead pairs
 # (DFN_TEST_PAIRS, mask/df), each pair in its own CFG_SIG directories; `make test` is the shipped
-# pair. The Python stage and its C-parity shims run their pairs under pytest (dfn/tests). The
-# 4-channel DFN units take the same DFN2_MASK_LOOKAHEAD / DFN2_DF_LOOKAHEAD in their Makefile.
+# pair. The example program mono_aec_dfn_res is rebuilt and run too, but it takes no pair (its grid
+# and lookahead come from --ai-sample-rate / --ai-fft-size, covered by `make test`): that leg only
+# shows it builds, links and runs against the archive of the pair's state-ring capacity. The pair reaches the test programs alone (DFN_TEST_CFLAGS), the pipeline objects hold no
+# pair, so the gate has two parts. Each pair test prints the pair it was built with and, for
+# DFN_PAIR_MEASURED, the stage latency it measured (dfn/tests/check_pair_report.sh compares them with
+# the pair asked for and with (mask + df + 1) * hop: a pair flag that never reached the test build
+# prints 1/1 and fails here). And the archive is checked for what the build does carry: the variant
+# symbol of the state-ring capacity the pair needs (7 for 2/4, see DFN2_PAIR_RING). The Python stage
+# and its C-parity shims run their pairs under pytest (dfn/tests). The 4-channel DFN test takes the
+# same DFN2_MASK_LOOKAHEAD / DFN2_DF_LOOKAHEAD in its Makefile.
 DFN_LEGAL_PAIRS := $(foreach m,0 1 2,$(foreach d,0 1 2 3 4,$(m)/$(d)))
 DFN_TEST_PAIRS ?= 0/0 0/1 2/0 2/4
 DFN_PAIR_TESTS := test_dfn_res_stage test_dfn_rate_bridge test_dfn_hop test_mono_dfn test_readme_flow
+DFN_PAIR_MEASURED := test_dfn_res_stage test_mono_dfn
 .PHONY: test-pairs
 test-pairs:
 	$(if $(strip $(DFN_TEST_PAIRS)),,$(error DFN_TEST_PAIRS is empty: name at least one mask/df pair))
@@ -1377,12 +1426,41 @@ _test_pairs_run:
 	  $(MAKE) --no-print-directory DFN2_MASK_LOOKAHEAD=$$m DFN2_DF_LOOKAHEAD=$$d \
 	    libaudio_pipeline_dfn.a $(DFN_PAIR_TESTS) mono_aec_dfn_res >/dev/null || exit 1; \
 	  bd="$$($(MAKE) -s --no-print-directory DFN2_MASK_LOOKAHEAD=$$m DFN2_DF_LOOKAHEAD=$$d print-bin-dir)"; \
-	  nm "$$bd/libaudio_pipeline_dfn.a" | grep -q "dfn2_lookahead_mask$${m}_df$${d}$$" || \
-	    { echo "FAIL: libaudio_pipeline_dfn.a was not built for lookahead pair $$p"; exit 1; }; \
+	  ring=5; [ $$((m + d + 1)) -gt 5 ] && ring=$$((m + d + 1)); \
+	  nm "$$bd/libaudio_pipeline_dfn.a" | awk -v re="^_?dfn2_variant_full_n[0-9]+_e[0-9]+_d[0-9]+_r$${ring}$$" 'NF >= 2 && $$(NF - 1) != "U" && $$NF ~ re { found = 1 } END { exit !found }' || \
+	    { echo "FAIL: libaudio_pipeline_dfn.a was not built with the state ring $$ring lookahead pair $$p needs"; exit 1; }; \
 	  for t in $(DFN_PAIR_TESTS) mono_aec_dfn_res; do \
-	    "$$bd/$$t" >/dev/null || { echo "FAIL: $$t for lookahead pair $$p"; exit 1; }; \
+	    out="$$("$$bd/$$t")" || { echo "FAIL: $$t for lookahead pair $$p"; exit 1; }; \
+	    case " $(DFN_PAIR_TESTS) " in *" $$t "*) \
+	      need=0; case " $(DFN_PAIR_MEASURED) " in *" $$t "*) need=1 ;; esac; \
+	      printf '%s\n' "$$out" | sh dfn/tests/check_pair_report.sh $$t $$m $$d $$need || exit 1 ;; \
+	    esac; \
 	  done; \
 	  echo "lookahead pair $$p: DFN C tests PASS"; \
+	done
+
+# test-dfn-grids: the stage, bridge and hop tests built for the other grids of the board samples' table
+# through the test header (DFN2_TEST_GRID_KHZ=16 and 32; `make test` is the 48 kHz grid): the same stage
+# code at another grid and the bridge refusing it, in their own CFG_SIG directories. Each test prints
+# the grid it was built with (dfn_test_report_pair) and the loop requires the grid it asked for: a
+# DFN2_TEST_GRID_KHZ that never reached the test build runs the 48 kHz grid and fails here.
+DFN_GRID_TESTS := test_dfn_res_stage test_dfn_rate_bridge test_dfn_hop
+.PHONY: test-dfn-grids
+test-dfn-grids:
+	+@for w in $(MAKEFLAGS); do \
+	  case "$$w" in --) break ;; --*|*=*) continue ;; -n|-q|-t) ;; -*) continue ;; esac; \
+	  case "$$w" in *n*|*q*|*t*) echo "test-dfn-grids: -n/-q/-t builds and runs nothing"; exit 0 ;; esac; \
+	done; \
+	for g in 16 32; do \
+	  case $$g in 16) want="grid 16000 Hz / 256" ;; 32) want="grid 32000 Hz / 512" ;; esac; \
+	  $(MAKE) --no-print-directory DFN2_TEST_GRID_KHZ=$$g $(DFN_GRID_TESTS) >/dev/null || exit 1; \
+	  bd="$$($(MAKE) -s --no-print-directory DFN2_TEST_GRID_KHZ=$$g print-bin-dir)"; \
+	  for t in $(DFN_GRID_TESTS); do \
+	    out="$$("$$bd/$$t")" || { echo "FAIL: $$t for the $$g kHz test grid"; exit 1; }; \
+	    printf '%s\n' "$$out" | grep -q "$$want\$$" || \
+	      { echo "FAIL: $$t did not report '$$want' (the $$g kHz test grid never reached the build)"; exit 1; }; \
+	  done; \
+	  echo "test grid $$g kHz: DFN stage, bridge and hop tests PASS"; \
 	done
 
 # pyc-parity: Python <-> C parity of the pipelines glue (mono and 4-channel NR gain, post-beam RES

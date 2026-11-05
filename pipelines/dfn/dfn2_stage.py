@@ -25,7 +25,7 @@ cascade, not a maximum), so the first ``M + D`` frames emit nothing; after the
 last real frame the caller pushes ``M + D`` all-zero frames (``flush``) to drain
 the last source frames, with the heads still being evaluated on them -- the
 same tail discipline the C class documents.  The ring and the deep-filter
-history follow ``dfn2_process.h``: ``max(DF_ORDER, M + D + 1)`` slots and
+history follow ``dfn2_grid.h``: ``max(DF_ORDER, M + D + 1)`` slots and
 ``DF_ORDER - D - 1`` past taps.
 
 Fail-open: a heads callable that raises, or returns a non-finite value in any
@@ -57,7 +57,9 @@ _ROOT = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__
 _AINR_DIR = os.path.join(_ROOT, 'AINR')
 _DFN2_DIR = os.path.join(_AINR_DIR, 'DeepFilterNet2')
 
-# Grid and geometry pinned by the model contract (config.ini / dfn2_grid.h).
+# Grid and geometry pinned by the model contract (config.ini). The C library takes the same grid
+# at run time (dfn2_grid_make(), AINR/DeepFilterNet2/dfn2_grid.h); the pipelines take it in their
+# configs (DfnResStageConfig.grid).
 SAMPLE_RATE = 48000
 N_FFT = 1024
 HOP = 512
@@ -70,7 +72,7 @@ INPUT_FRAMES = 3
 
 def pair_geometry(mask_lookahead: int, df_lookahead: int) -> Tuple[int, int, int]:
     """``(DF_HISTORY, DF_RING, MODEL_LOOKAHEAD)`` of a lookahead pair, derived
-    as ``dfn2_process.h`` derives them."""
+    as ``dfn2_grid_make()`` derives them."""
     history = DF_ORDER - df_lookahead - 1
     ring = max(DF_ORDER, mask_lookahead + df_lookahead + 1)
     return history, ring, mask_lookahead + df_lookahead

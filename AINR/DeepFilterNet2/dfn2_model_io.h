@@ -13,7 +13,7 @@ extern "C" {
  *                     encoder GRU, ERB decoder GRU (2), DF decoder GRU (2), at
  *                     the DFN2_MODEL_GRU_ROW_* offsets
  *   df_convp_history  [1, DFN2_MODEL_ENCODER_CHANNELS,
- *                      DFN2_MODEL_DF_PATHWAY_WINDOW, DFN2_DF_BINS]; the full
+ *                      DFN2_MODEL_DF_PATHWAY_WINDOW, grid df_bins]; the full
  *                     causal window of the pathway convolution, returned whole
  * Layout versions 4-7 are never reused. The layout version names the state
  * tensors, which DFN2_FRAMES_PER_CALL leaves unchanged; the descriptor carries
@@ -37,7 +37,7 @@ extern "C" {
  * export_onnx.py --frames-per-call N reads N + 2 feature frames and returns the
  * heads of N consecutive frames with the state after the last one. A build
  * for N > 1 passes -DDFN2_FRAMES_PER_CALL=<N> (plain decimal) on every
- * translation unit, like the lookahead pair; objects built for different N do
+ * translation unit; objects built for different N do
  * not link (DFN2_REQUIRE_FRAMES_PER_CALL_LINK below). N > 1 changes the
  * per-hop contract (readiness every N hops, N heads per commit, N - 1 more
  * hops of latency), so a unit written for one frame per call must not compile
@@ -59,7 +59,7 @@ extern "C" {
 #define DFN2_MODEL_WINDOW_FRAMES \
     (DFN2_MODEL_INPUT_FRAMES - 1 + DFN2_FRAMES_PER_CALL)
 
-/* Link-time N check, like DFN2_REQUIRE_LOOKAHEAD_PAIR_LINK: dfn2_model_io.c
+/* Link-time N check, like DFN2_REQUIRE_VARIANT_LINK: dfn2_model_io.c
  * defines dfn2_frames_per_call<N> and dfn2_prepost.c references it. */
 #define DFN2_FRAMES_PER_CALL_SYMBOL_JOIN_(frames) dfn2_frames_per_call##frames
 #define DFN2_FRAMES_PER_CALL_SYMBOL_JOIN(frames) \
@@ -89,7 +89,7 @@ extern const unsigned char DFN2_FRAMES_PER_CALL_SYMBOL;
 #define DFN2_MODEL_GRU_HIDDEN               256
 #define DFN2_MODEL_ENCODER_CHANNELS         64
 /* The window that yields heads[t] is frames [t-(2-L) .. t+L] for
- * L = DFN2_MASK_LOOKAHEAD: it is complete once frame t+L has been pushed, so the
+ * L = the grid's mask_lookahead: it is complete once frame t+L has been pushed, so the
  * first heads (t = 0) need L + 1 pushed frames. Frames before the stream start
  * read as zero (the window is zeroed at init); at the end of a stream, L zero
  * frames flush the last L heads.
@@ -97,13 +97,9 @@ extern const unsigned char DFN2_FRAMES_PER_CALL_SYMBOL;
  * [t-(2-L) .. t+N-1+L] and yields heads[t .. t+N-1], head i from the three
  * frames starting at slot i. The first call (t = 0) needs L + N pushed frames
  * and every later one N more; to flush, push zero frames until the call that
- * holds the last head has run (L more, plus enough to complete that call). */
-#define DFN2_MODEL_READY_FRAMES \
-    (DFN2_MASK_LOOKAHEAD + 0U + DFN2_FRAMES_PER_CALL)
-
-#if DFN2_MODEL_READY_FRAMES > DFN2_MODEL_WINDOW_FRAMES
-#error "the first window must fit in the model input"
-#endif
+ * holds the last head has run (L more, plus enough to complete that call). The frames
+ * the first call needs are L + N, which dfn2_model_io_ready_frames() returns. L <= 2 keeps
+ * that within the N + 2 frame window. */
 
 #ifdef __STDC_VERSION__
 #if __STDC_VERSION__ >= 201112L
@@ -121,9 +117,9 @@ _Static_assert(DFN2_MODEL_GRU_ROW_DF == DFN2_MODEL_GRU_ROW_ERB +
 #endif
 #endif
 
-/* The graph contract a runtime was built against, compared field by field. Every
- * field is a compiled constant, so a mismatch means a graph exported against
- * another layout version or geometry. */
+/* The graph contract a runtime was built against, compared field by field. The grid
+ * fields come from the DFN2Grid the instance runs, the rest are compiled constants, so a
+ * mismatch means a graph exported against another layout version or grid. */
 typedef struct DFN2ModelIoDescriptor {
     unsigned int layout_version;
     int sample_rate;
@@ -156,11 +152,14 @@ _Static_assert(sizeof(DFN2ModelIoDescriptor) == 72,
 #endif
 #endif
 
-/* Fill with this build's contract. Returns 0, or -1 on NULL. */
-int dfn2_model_io_descriptor_default(DFN2ModelIoDescriptor *descriptor);
-/* 0 when every field equals this build's contract, -1 otherwise (NULL included). */
+/* Fill with this build's contract for `grid`. Returns 0, or -1 on NULL or an invalid
+ * grid (dfn2_grid_validate). */
+int dfn2_model_io_descriptor_default(const DFN2Grid *grid,
+                                     DFN2ModelIoDescriptor *descriptor);
+/* 0 when every field equals this build's contract for `grid`, -1 otherwise (NULL and an
+ * invalid grid included). */
 int dfn2_model_io_descriptor_validate(
-    const DFN2ModelIoDescriptor *descriptor);
+    const DFN2Grid *grid, const DFN2ModelIoDescriptor *descriptor);
 
 /* Caller-owned state for a stateless accelerator. The graph reads the two state
  * arrays and writes the updated ones to outputs bound to the same addresses
@@ -168,67 +167,80 @@ int dfn2_model_io_descriptor_validate(
  * and feature_frames_seen are CPU-owned and read-only to the accelerator.
  * state_generation advances whenever the recurrent arrays are zeroed (reset or
  * refused validation); a runtime holding a fixed-point copy of the state refills
- * it with quantized zeros when dfn2_model_io_state_generation() changes. */
+ * it with quantized zeros when dfn2_model_io_state_generation() changes.
+ *
+ * The three arrays that carry a grid dimension cross the accelerator boundary as flat
+ * float runs, so they are stored packed at the grid's stride inside capacity-sized
+ * storage (dfn2_grid.h): erb_window is [DFN2_MODEL_WINDOW_FRAMES][n_erb],
+ * spec_window [2][DFN2_MODEL_WINDOW_FRAMES][df_bins] and df_convp_window
+ * [DFN2_MODEL_ENCODER_CHANNELS][DFN2_MODEL_DF_PATHWAY_WINDOW][df_bins], each a
+ * contiguous run from element 0. The rest of the storage is zero and not read. */
 typedef struct {
-    float erb_window[DFN2_MODEL_WINDOW_FRAMES][DFN2_N_ERB];
-    float spec_window[2][DFN2_MODEL_WINDOW_FRAMES][DFN2_DF_BINS];
+    float erb_window[DFN2_MODEL_WINDOW_FRAMES * DFN2_MAX_N_ERB];
+    float spec_window[2 * DFN2_MODEL_WINDOW_FRAMES * DFN2_MAX_DF_BINS];
     float gru_hidden[DFN2_MODEL_GRU_ROWS][DFN2_MODEL_GRU_HIDDEN];
 #ifndef DFN2_MASK_ONLY
-    float df_convp_window[DFN2_MODEL_ENCODER_CHANNELS]
-                         [DFN2_MODEL_DF_PATHWAY_WINDOW]
-                         [DFN2_DF_BINS];
+    float df_convp_window[DFN2_MODEL_ENCODER_CHANNELS *
+                          DFN2_MODEL_DF_PATHWAY_WINDOW * DFN2_MAX_DF_BINS];
 #endif
     unsigned long long feature_frames_seen;
     unsigned int state_generation;
+    /* From the grid given to dfn2_model_io_init(); 0 before it. */
+    int n_erb;
+    int df_bins;
+    int mask_lookahead;
 } DFN2ModelIOState;
 
-/* First construction: zero the object and start the generation at 1. A state in
- * use goes through dfn2_model_io_reset(). The caller zeroes the accelerator
- * state once afterwards. */
-void dfn2_model_io_init(DFN2ModelIOState *state);
+/* First construction: zero the object, record the grid's dimensions and start the
+ * generation at 1. A state in use goes through dfn2_model_io_reset(). The caller zeroes
+ * the accelerator state once afterwards. Returns 0, or -1 on NULL or an invalid grid
+ * (the state is then zeroed with no grid and every other call on it fails). */
+int dfn2_model_io_init(DFN2ModelIOState *state, const DFN2Grid *grid);
+
+/* Feature frames the first accelerator call needs: mask_lookahead + DFN2_FRAMES_PER_CALL.
+ * 0 for NULL or a state without a grid. */
+unsigned int dfn2_model_io_ready_frames(const DFN2ModelIOState *state);
 
 /* Slide a feature window by one frame and write the newest frame into the last
  * slot. Slot 2 holds frame f, slot 1 f-1, slot 0 f-2: with f = t + L that is
  * [t-(2-L) .. t+L], the alignment export_onnx.py publishes as
  * input_window_alignment. With N frames per call the window holds the last
- * N + 2 frames the same way (chunk_window_alignment). */
-void dfn2_model_io_push_erb_window(
-    float window[DFN2_MODEL_WINDOW_FRAMES][DFN2_N_ERB],
-    const float frame[DFN2_N_ERB]);
-void dfn2_model_io_push_spec_window(
-    float window[2][DFN2_MODEL_WINDOW_FRAMES][DFN2_DF_BINS],
-    const float frame[2][DFN2_DF_BINS]);
+ * N + 2 frames the same way (chunk_window_alignment). `window` is the packed
+ * [DFN2_MODEL_WINDOW_FRAMES][n_erb] run, or [2][DFN2_MODEL_WINDOW_FRAMES][df_bins] with
+ * frame[2][df_bins]. */
+void dfn2_model_io_push_erb_window(float *window, const float *frame, int n_erb);
+void dfn2_model_io_push_spec_window(float *window, const float *frame,
+                                    int df_bins);
 
 /* Validate the recurrent arrays (two; one with DFN2_MASK_ONLY) after the
  * accelerator wrote them in place.
  * Returns 0 when all elements are finite; otherwise zeroes the arrays and
  * returns -1 (the previous values cannot be restored). NULL returns -1 and
- * touches nothing. With DFN2_MASK_ONLY there is only the h_gru array. */
+ * touches nothing. With DFN2_MASK_ONLY there is only the h_gru array. df_bins is the
+ * grid's, the extent of the packed df_convp_window. */
 #ifdef DFN2_MASK_ONLY
 int dfn2_model_io_validate_arrays(
     float gru_hidden[DFN2_MODEL_GRU_ROWS][DFN2_MODEL_GRU_HIDDEN]);
 #else
 int dfn2_model_io_validate_arrays(
     float gru_hidden[DFN2_MODEL_GRU_ROWS][DFN2_MODEL_GRU_HIDDEN],
-    float df_convp_window[DFN2_MODEL_ENCODER_CHANNELS]
-                         [DFN2_MODEL_DF_PATHWAY_WINDOW]
-                         [DFN2_DF_BINS]);
+    float *df_convp_window, int df_bins);
 #endif
 
-/* Push one newly computed feature frame f. Returns 1 when the window
- * [t-(2-L) .. t+L] of t = f - L is available and the graph may emit heads[t],
- * or 0 for the first DFN2_MASK_LOOKAHEAD frames (nothing to run yet). To flush
- * the final heads, push DFN2_MASK_LOOKAHEAD all-zero feature frames.
+/* Push one newly computed feature frame f: erb[n_erb] and spec[2][df_bins] (re, then
+ * im). Returns 1 when the window [t-(2-L) .. t+L] of t = f - L is available and the graph
+ * may emit heads[t], or 0 for the first L frames (nothing to run yet), L = the grid's
+ * mask_lookahead. To flush the final heads, push L all-zero feature frames.
  * With N frames per call it returns 1 when the window of heads[f-L-N+1 .. f-L]
- * is complete (pushes L + N, L + 2N, ...) and 0 otherwise. */
-int dfn2_model_io_push_features(DFN2ModelIOState *state,
-                                const float erb[DFN2_N_ERB],
-                                const float spec[2][DFN2_DF_BINS]);
+ * is complete (pushes L + N, L + 2N, ...) and 0 otherwise. -1 on NULL or a state without
+ * a grid. */
+int dfn2_model_io_push_features(DFN2ModelIOState *state, const float *erb,
+                                const float *spec);
 
 /* Position, among the N heads of the next call, of the head the most recently
  * pushed frame completes: 0 .. DFN2_FRAMES_PER_CALL - 1 (N - 1 exactly when
  * push_features returned 1), or -1 while that frame was one of the first
- * DFN2_MASK_LOOKAHEAD (no head yet), before any push, and for NULL. Always 0
+ * mask_lookahead (no head yet), before any push, and for NULL. Always 0
  * after the warm-up when N = 1. */
 int dfn2_model_io_frame_slot(const DFN2ModelIOState *state);
 

@@ -39,28 +39,40 @@ make -C pipelines BACKEND=ne10 SIMD=<0-or-1> WERROR=1 test
 # adds: test_dfn_res_stage, test_dfn_rate_bridge, test_mono_dfn, test_dfn_hop,
 #       test_mcab_sample_post, mono_aec_dfn_res (board skeleton at its 16 kHz default,
 #       also run with --delay-num-filters 1 --cng --atten-lim 12, and with
-#       --sample-rate 48000 and 8000)
+#       --sample-rate 48000 and 8000, and with --ai-sample-rate 16000
+#       --ai-fft-size 256, the model grid the stage drives directly)
 make -C pipelines/dfn/mono_aec_dfn_res test   # scoped: test_dfn_res_stage,
 #       test_dfn_rate_bridge, test_mono_dfn and the skeleton runs (16 kHz,
-#       48 kHz, 8 kHz, the malformed-number refusals); the top-level target
+#       48 kHz, 8 kHz, the model-grid flags, the malformed-number and
+#       model-grid refusals); the top-level target
 #       above is the one that gates a release (it also runs test_dfn_hop,
 #       test_mcab_sample_post and the rest of the pipelines/ set).
 ```
 
-The stage is built for one DeepFilterNet2 lookahead pair (`DFN2_MASK_LOOKAHEAD`
-/ `DFN2_DF_LOOKAHEAD` make variables, default 1/1, 15 legal pairs); the delays
-quoted in the pass conditions below are for the shipped 1/1 pair. Other pairs:
+The stage runs the DeepFilterNet2 grid its config carries, lookahead pair included (a row of
+the example's table, `--ai-sample-rate` / `--ai-fft-size`, default 48 kHz / 1024 / 1/1; 15 legal
+pairs); the `DFN2_MASK_LOOKAHEAD` / `DFN2_DF_LOOKAHEAD` make variables (default 1/1) choose only
+the pair the test programs run. The delays quoted in the pass conditions below are for the
+shipped 1/1 pair. Other pairs, and the stage tests at the 16 and 32 kHz grids:
 
 ```bash
 make -C pipelines BACKEND=ne10 SIMD=<0-or-1> WERROR=1 test-pairs
 #       default DFN_TEST_PAIRS="0/0 0/1 2/0 2/4"; override with
 #       DFN_TEST_PAIRS="0/1 2/4" (mask/df pairs from 0..2/0..4); an empty list is an
 #       error, and make -n / -q / -t only print the plan
+make -C pipelines BACKEND=ne10 SIMD=<0-or-1> WERROR=1 test-dfn-grids
+#       test_dfn_res_stage, test_dfn_rate_bridge and test_dfn_hop built for the
+#       16 and 32 kHz test grids (DFN2_TEST_GRID_KHZ), with the test header's
+#       pair 1/1 -- not the 0/0 of those rows in the example table
 ```
 
 `test-pairs` rebuilds and runs `test_dfn_res_stage`, `test_dfn_rate_bridge`,
 `test_dfn_hop`, `test_mono_dfn`, `test_readme_flow` and `mono_aec_dfn_res` for
-each listed pair only; the other pairs are not built or run by this target
+each listed pair only. Every one of them prints the pair it was built with and, for the stage test and
+the mono composition, the stage latency it measured, and `dfn/tests/check_pair_report.sh` fails the
+target when the pair or the latency (`mask + df` hops, `(mask + df + 1) * hop` samples) is not the one
+asked for -- a pair flag that never reached the test build prints 1/1 and is red; the archive must also
+carry the state-ring symbol the pair needs. The other pairs are not built or run by this target
 (the AINR C hosts have their own pair tests, section 11.4), and no checkpoint
 trained for a pair other than 1/1 exists here, so their audio quality is
 unmeasured.
@@ -146,13 +158,13 @@ the example creates itself; no denoiser, no synthesis; `dfn/dfn_hop.h`):
 make -C pipelines/4ch_aec_bf_nr_res BACKEND=ne10 SIMD=<0-or-1> WERROR=1 test
 # adds: test_4ch_dfn, 4ch_aec_bf_dfn_res (board skeleton at its 16 kHz
 #       default, also run with --delay-num-filters 1 --cng --atten-lim 12,
-#       and with --sample-rate 48000)
+#       with --sample-rate 48000 and with --ai-sample-rate 16000 --ai-fft-size 256)
 make -C pipelines/dfn/4ch_aec_bf_dfn_res test   # scoped: test_4ch_dfn and the
-#       skeleton runs (16 kHz, 48 kHz, the malformed-number and 8 kHz
-#       refusals); the rate bridge's own unit test lives under the mono target
+#       skeleton runs (16 kHz, 48 kHz, the model-grid flags, the malformed-number,
+#       8 kHz and model-grid refusals); the rate bridge's own unit test lives under the mono target
 #       (`make -C pipelines test`, section 8.1). Run both before a release.
 #       The 4-channel Makefile takes the same DFN2_MASK_LOOKAHEAD /
-#       DFN2_DF_LOOKAHEAD variables and has no test-pairs target.
+#       DFN2_DF_LOOKAHEAD variables (for test_4ch_dfn alone) and has no test-pairs target.
 ```
 
 Pass conditions:
