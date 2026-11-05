@@ -43,7 +43,7 @@ int  dfn2_prepost_output_frame_index(const DFN2Prepost *p, long long *frame);
   把同一個 `&grid` 交給 `dfn2_framing_config()`、`dfn2_state_init()`、`dfn2_model_io_init()`、`dfn2_model_io_descriptor_default()`／`_validate()`
   與 `dfn2_prepost_config_defaults()`；hop、n_bins、兩個 EMA alpha 與 `stft_scale` 由公式推導。出貨 checkpoint 是
   48 kHz／1024／512／32 個 ERB band／96 個 DF bin／1/1。(sample rate, FFT size) 對應 n_erb、df_bins 與 pair 的表是模型的性質，由應用端持有
-  （板端 sample 與 pipelines 的兩個範例 main 各有同一張三列的表；只有測試的兩個標頭 `AINR/tests/dfn2_test_grid.h` 與
+  （板端 sample 與 pipelines 的兩個範例 main 各有自己的表，含 AEC 的 `alg_ai3_aec_dfn.c` 與兩個範例 main 沒有 32000／512 那一列（AEC 沒有 32 kHz 格點）；只有測試的兩個標頭 `AINR/tests/dfn2_test_grid.h` 與
   `pipelines/dfn/tests/dfn_test_grid.h` 以 `-DDFN2_GRID_KHZ=16|32|48` 等在建置時選 grid，函式庫與 pipeline 的單元都不讀它們；
   pipeline 的 grid 放在 `DfnResStageConfig.grid`）。編譯期仍固定的只有容量（`DFN2_MAX_N_FFT` 1024、`DFN2_MAX_N_ERB` 32、
   `DFN2_MAX_DF_BINS` 96、`DFN2_MAX_DF_RING` 5）：一個 binary 服務容量以內的所有 grid，超過的被 `DFN2_GRID_ERR_CAPACITY` 拒絕，提高容量要在每個編譯單元定義，

@@ -18,7 +18,7 @@
  * reset event (it never resets on one). On a new aec_post_reset_serial() the comfort noise restarts from
  * AEC_CNG_SEED before that hop's first draw. On the stage path (host rate equals the model grid's) the
  * host synthesis also drops its overlap-add tail, dfn_res_stage_lookahead_frames() hops later (0 for
- * the 16 and 32 kHz rows), before the push of the first frame built after the reset: the stage delays
+ * the 16 kHz row), before the push of the first frame built after the reset: the stage delays
  * every frame by that many hops, so the event is delayed with it. On the bridge path the host-grid
  * synthesis lives inside dfn_rate_bridge and runs at the top of its begin(): there
  * dfn_rate_bridge_reset_synthesis() on the hop of the event clears just that overlap-add tail (DFN2,

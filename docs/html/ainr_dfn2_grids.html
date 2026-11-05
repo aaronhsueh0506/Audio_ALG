@@ -164,7 +164,7 @@ DFN2Grid grid
 <p class="note">延遲 = (1 + M + D) × hop（<code>dfn2_prepost_latency_frames(grid)</code> + 1，N = 1）；其他 pair 照公式換算，音質待量測。第一次加速器呼叫需要 <code>dfn2_model_io_ready_frames()</code> = mask_lookahead + <code>DFN2_FRAMES_PER_CALL</code> 個 feature frame。</p>
 
 <h2>板端 sample 與測試／pipeline 的 grid</h2>
-<p>板端 sample（<code>audio_sample/</code>，不在本 repo）與 pipeline 的兩支範例 main 各持有同一張 (sample rate, FFT size) → n_erb、df_bins、mask／df lookahead 的表，沒有 n_erb 或 df_bins 旗標，預設 48000 與 1024，表外的組合列出可用的列後被拒：</p>
+<p>板端 sample（<code>audio_sample/</code>，不在本 repo）與 pipeline 的兩支範例 main 各持有一張 (sample rate, FFT size) → n_erb、df_bins、mask／df lookahead 的表（含 AEC 的 <code>alg_ai3_aec_dfn.c</code> 與兩支範例 main 沒有 32000／512 那一列，AEC 沒有 32 kHz 格點），沒有 n_erb 或 df_bins 旗標，預設 48000 與 1024，表外的組合列出可用的列後被拒：</p>
 <div class="tbl"><table>
 <tr><th>模型取樣率</th><th>FFT 大小</th><th>n_erb</th><th>df_bins</th><th>mask／df lookahead</th><th>狀態</th></tr>
 <tr><td>16000</td><td>256</td><td>24</td><td>96</td><td>0／0</td><td>音質待量測</td></tr>
@@ -175,7 +175,7 @@ DFN2Grid grid
 <tr><th>程式</th><th>怎麼選模型 grid</th></tr>
 <tr><td><code>alg_ai3_dfn.c</code></td><td><code>--sample-rate</code>、<code>--fft-size</code>（輸入串流的取樣率就是模型的）。以 <code>--sample</code> 或 <code>--fft</code> 開頭卻不是這兩個旗標的字串（<code>--sample-rate=16000</code>、<code>--samplerate</code>）印出用法並結束碼 2，不會靜默跑預設 grid</td></tr>
 <tr><td><code>alg_ai3_dfn_lite.c</code></td><td>同樣的旗標與規則，表是 mask-only 的：每一列 df_lookahead 都是 0（48000／1024 為 1／0）。完整模型與 mask-only 是<b>兩支 sample</b>：lite 是 mask-only（I/O layout 9，模型放 <code>dfn2_lite/</code>、輸出到 <code>DFN2_LITE/</code>），函式庫單元以 <code>-DDFN2_MASK_ONLY</code> 建置，兩種 build 的物件資料夾分開</td></tr>
-<tr><td><code>alg_ai3_aec_dfn.c</code></td><td><code>--ai-sample-rate</code>、<code>--ai-fft-size</code> 選模型 grid；<code>--sr</code> 仍是 host 的取樣率（沒給時跟模型的取樣率）。host 取樣率等於模型的：<code>DfnResStage</code> 直接跑；否則走 <code>DfnRateBridge</code>，它只收 48000／1024 的模型與 8000／16000 的 host，其他組合在動 NPU 之前就以訊息拒絕（結束碼 1）。它的 AEC 沒有 32 kHz 格點，所以 32000／512 在這裡被拒。以 <code>--ai</code> 開頭卻不是這兩個旗標的字串結束碼 2</td></tr>
+<tr><td><code>alg_ai3_aec_dfn.c</code></td><td><code>--ai-sample-rate</code>、<code>--ai-fft-size</code> 選模型 grid；<code>--sr</code> 仍是 host 的取樣率（沒給時跟模型的取樣率）。host 取樣率等於模型的：<code>DfnResStage</code> 直接跑；否則走 <code>DfnRateBridge</code>，它只收 48000／1024 的模型與 8000／16000 的 host，其他組合在動 NPU 之前就以訊息拒絕（結束碼 1）。它的表沒有 32000／512 這一列（AEC 沒有 32 kHz 格點），該組合當表外組合處理、結束碼 2。以 <code>--ai</code> 開頭卻不是這兩個旗標的字串結束碼 2</td></tr>
 <tr><td><code>uvc_ai_nr_stream.c</code></td><td>只有 48 kHz（USB 音訊是 48 kHz；原生 16 kHz 的 UVC 不在範圍內），沒有旗標：用自己的一列常數呼叫 <code>dfn2_grid_make(48000, 1024, 32, 96, 1, 1)</code> 建 grid，直接驅動 <code>DFN2Prepost</code>（<code>DFN2_IO_FREQ</code>）：grid 傳給 <code>dfn2_framing_config()</code>、<code>dfn2_prepost_config_defaults()</code>、tensor 表與 ERB 檔名；原本擋非 48 kHz 的建置期檢查變成對這些常數的編譯期檢查</td></tr>
 <tr><td><code>uvc_audio_live2a.c</code></td><td>同樣只有 48 kHz、沒有旗標、同一列 <code>dfn2_grid_make()</code>；grid 放進 <code>DfnResStage</code>／<code>DfnRateBridge</code> 的 config、model-I/O descriptor 與 tensor 表（host 在模型的取樣率，或經 bridge）</td></tr>
 <tr><td>pipeline 範例 main（<code>mono_aec_dfn_res</code>、<code>4ch_aec_bf_dfn_res</code>）</td><td><code>--ai-sample-rate</code>、<code>--ai-fft-size</code>（<code>--sample-rate</code> 是 host 的）；grid 放進 <code>DfnResStageConfig.grid</code>，輸出「model grid …」一行。規則同 <code>alg_ai3_aec_dfn.c</code>，bridge 不能服務時 pool 查詢被拒、結束碼 1</td></tr>

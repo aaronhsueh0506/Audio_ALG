@@ -490,7 +490,7 @@ test: test-third-party test-mcab-sample-driver \
 # the host on the model's own rate runs the stage directly at that grid, any other host rate needs the
 # bridge (48 kHz / 1024 model only: pool query rejected, exit 1), a pair outside the table is exit 2.
 	out="$$("$(abspath $(BIN_DIR))/4ch_aec_bf_dfn_res" --ai-sample-rate 16000 --ai-fft-size 256)" && printf '%s\n' "$$out" | grep -q "model grid 16000 Hz / FFT 256 (n_erb 24, df_bins 96, lookahead 0/0), the stage on the host grid"
-	"$(abspath $(BIN_DIR))/4ch_aec_bf_dfn_res" --ai-sample-rate 32000 --ai-fft-size 512 >/dev/null 2>&1; test $$? -eq 1
+	"$(abspath $(BIN_DIR))/4ch_aec_bf_dfn_res" --ai-sample-rate 32000 --ai-fft-size 512 >/dev/null 2>&1; test $$? -eq 2
 	"$(abspath $(BIN_DIR))/4ch_aec_bf_dfn_res" --ai-sample-rate 16000 --ai-fft-size 256 --sample-rate 48000 >/dev/null 2>&1; test $$? -eq 1
 	for a in "--ai-sample-rate 44100" "--ai-sample-rate 16000" "--ai-fft-size 512" "--ai-fft-size 256x" "--ai-sample-rate --cng"; do "$(abspath $(BIN_DIR))/4ch_aec_bf_dfn_res" $$a >/dev/null 2>&1; test $$? -eq 2 || exit 1; done
 # Malformed numbers, and the 8 kHz grid the core does not offer, are refused

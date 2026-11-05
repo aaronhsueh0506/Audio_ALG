@@ -199,7 +199,7 @@ capacities, and a model or pool built for another grid or pair is refused at run
 (`dfn_res_stage.c`, `dfn_rate_bridge.c`) hold no grid and no pair: the application puts its `DFN2Grid` in
 `DfnResStageConfig.grid`, so a pair other than 1/1 needs no pair flag on any product unit. Only a pair whose state ring
 `max(5, M + D + 1)` exceeds 5 (1/4, 2/3, 2/4) also needs `-DDFN2_MAX_DF_RING=<ring>` on every DFN2 unit. The board samples take their
-grid from their own three-row (sample rate, FFT size) table: `alg_ai3_dfn.c` and `alg_ai3_dfn_lite.c` from `--sample-rate` /
+grid from their own (sample rate, FFT size) table (three rows; two in `alg_ai3_aec_dfn.c` and the example mains, whose AEC has no 32 kHz grid): `alg_ai3_dfn.c` and `alg_ai3_dfn_lite.c` from `--sample-rate` /
 `--fft-size`, `alg_ai3_aec_dfn.c` from `--ai-sample-rate` / `--ai-fft-size` (its `--sr` is the host rate), and the two UVC samples
 (`uvc_ai_nr_stream.c`, `uvc_audio_live2a.c`) are 48 kHz only with the shipped row built into the sample. Every DFN2 sample reads its
 ERB matrices from `/mnt/sd/dfn2_blobs/fb_<sr>_<n_erb>.bin` (for example `fb_48000_32.bin`), the exporter's `erb_matrix.bin` renamed

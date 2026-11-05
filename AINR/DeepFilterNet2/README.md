@@ -231,8 +231,9 @@ literals; a model trained with others defines them on the build line, on every u
   48 kHz 1/1 `5a69e185` / `f6a49ec8`; the same grid with another pair has another hash.
 
 **Board samples.** The board samples (`audio_sample/`, outside this repo) own the table from (sample rate, FFT size) to the model
-geometry; the library only validates what they pass. The three rows below are the same in every DFN2 sample and in the pipeline
-example mains (`pipelines/dfn/dfn_example_args.h`); only the mask-only sample differs, in its df lookahead (see its row in the second table):
+geometry; the library only validates what they pass. The three rows below are the table of the standalone samples; `alg_ai3_aec_dfn.c` and the pipeline
+example mains (`pipelines/dfn/dfn_example_args.h`) keep two of them, without 32000 / 512, because the AEC in front of the model has
+no 32 kHz grid; the mask-only sample differs, in its df lookahead (see its row in the second table):
 
 | model sample rate | FFT size | n_erb | df_bins | mask / df lookahead | state |
 |---|---|---|---|---|---|
@@ -247,7 +248,7 @@ Each sample builds its `DFN2Grid` with `dfn2_grid_make()` from a row and passes 
 |---|---|
 | `alg_ai3_dfn.c` | `--sample-rate <Hz>` and `--fft-size <n>`: the stream's rate is the model's rate. A token that begins `--sample` or `--fft` and is not one of these (`--sample-rate=16000`, `--samplerate`) prints the usage and exits 2 instead of running the default grid |
 | `alg_ai3_dfn_lite.c` | the same flags and the same rule, with the mask-only table: `df_lookahead` is 0 in every row (48000 / 1024 is 1 / 0). The full model and the mask-only model are two separate samples; the lite one builds every library unit with `-DDFN2_MASK_ONLY`, in an object directory of its own |
-| `alg_ai3_aec_dfn.c` | `--ai-sample-rate <Hz>` and `--ai-fft-size <n>` choose the model grid; `--sr` stays the host rate (when absent it follows the model's rate). Host rate equal to the model's: `DfnResStage` drives the model directly. Any other rate goes through `DfnRateBridge`, which needs the 48000 / 1024 model and a host at 8000 or 16000, and is otherwise refused with a message before the NPU is set up (exit 1). Its AEC has no 32 kHz grid, so the 32000 / 512 row is refused there. A misspelt token that begins `--ai` exits 2 |
+| `alg_ai3_aec_dfn.c` | `--ai-sample-rate <Hz>` and `--ai-fft-size <n>` choose the model grid; `--sr` stays the host rate (when absent it follows the model's rate). Host rate equal to the model's: `DfnResStage` drives the model directly. Any other rate goes through `DfnRateBridge`, which needs the 48000 / 1024 model and a host at 8000 or 16000, and is otherwise refused with a message before the NPU is set up (exit 1). Its table has no 32000 / 512 row (its AEC has no 32 kHz grid), so that pair is refused with the accepted list (exit 2). A misspelt token that begins `--ai` exits 2 |
 | `uvc_ai_nr_stream.c` | 48 kHz only (USB audio is 48 kHz; a native 16 kHz UVC path is out of scope) and no flags. It builds its grid with `dfn2_grid_make(48000, 1024, 32, 96, 1, 1)` from its own one-row constants and drives the `DFN2Prepost` class (`DFN2_IO_FREQ`) directly: the grid goes to `dfn2_framing_config()`, `dfn2_prepost_config_defaults()`, the tensor tables and the ERB file name; the build-time guard on the sample rate is now compile-time checks of those constants |
 | `uvc_audio_live2a.c` | 48 kHz only, no flags, the same one-row grid built with `dfn2_grid_make()`; it goes into the `DfnResStage` / `DfnRateBridge` configs, the model-I/O descriptor and the tensor tables (the host rate is the model's or goes through the bridge) |
 

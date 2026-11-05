@@ -18,15 +18,15 @@
 
 /* The model grids the skeletons offer: which (sample rate, fft size) pair maps to which n_erb,
  * df_bins and lookahead pair is a property of the trained model, so it is this program's table
- * (the same three rows as the board sample alg_ai3_aec_dfn.c); hop, bins and the scales follow
- * from the formula in dfn2_grid_make(). The 32 kHz row is provisional: nothing is trained for it. */
+ * (the same two rows as the board sample alg_ai3_aec_dfn.c); hop, bins and the scales follow
+ * from the formula in dfn2_grid_make(). There is no 32 kHz row: the AEC in front of the stage has no
+ * 32 kHz grid, so no host could run that model. */
 typedef struct DfnExampleModelRow {
     int sample_rate, n_fft, n_erb, df_bins, mask_lookahead, df_lookahead;
 } DfnExampleModelRow;
 
 static const DfnExampleModelRow DFN_EXAMPLE_MODEL_ROWS[] = {
     { 16000,  256, 24, 96, 0, 0 },
-    { 32000,  512, 28, 96, 0, 0 },
     { 48000, 1024, 32, 96, 1, 1 },
 };
 #define DFN_EXAMPLE_MODEL_ROW_COUNT \
@@ -76,7 +76,7 @@ static const char *dfn_example_rates_text(const int *rates, char *buf, size_t ca
     return buf;
 }
 
-/* "16000/256, 32000/512, 48000/1024". */
+/* "16000/256, 48000/1024". */
 static const char *dfn_example_model_rows_text(char *buf, size_t cap) {
     size_t used = 0;
     int i;

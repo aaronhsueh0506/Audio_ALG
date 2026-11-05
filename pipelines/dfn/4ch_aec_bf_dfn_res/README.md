@@ -70,7 +70,7 @@ latency is that plus the host's WOLA hop (16 kHz, hop 128: 800 samples,
 1,2 at hop 256.
 
 DFN2 grid and lookahead pair. The model grid is a run-time choice of `main.c`: `--ai-sample-rate <Hz>` / `--ai-fft-size <n>`
-(default 48000 / 1024, a row of the three-row table in `dfn/dfn_example_args.h`) built with `dfn2_grid_make()` and handed to
+(default 48000 / 1024, a row of the two-row table in `dfn/dfn_example_args.h`) built with `dfn2_grid_make()` and handed to
 `DfnResStageConfig.grid`; the mask and deep-filter lookaheads M (0..2) and D (0..4) are fields of that grid and must equal the
 pair the model was trained for. A host on the model's own rate (`--ai-sample-rate 16000 --ai-fft-size 256` with the 16 kHz core) runs
 the stage directly; any other host rate needs the bridge, which accepts the 48 kHz / 1024 model only (otherwise "pool query rejected",
@@ -90,7 +90,7 @@ make WERROR=1 test        # includes test_4ch_dfn and the skeleton
 The `Makefile` in this directory is a thin forwarder: `make -C pipelines/dfn/4ch_aec_bf_dfn_res test`
 builds and runs `test_4ch_dfn`, then the skeleton (default, `--delay-num-filters 1 --cng --atten-lim 12`,
 `--sample-rate 48000`, `--ai-sample-rate 16000 --ai-fft-size 256`) and checks that `--sample-rate 16000Hz`, `--sample-rate 8000` and
-`--atten-lim 12dB` exit with 2 and that a 32 kHz model grid (which the bridge cannot serve) is a rejected pool query (exit 1).
+`--atten-lim 12dB` exit with 2 and that a 32 kHz model grid (not in the table: the AEC has no 32 kHz grid) is a rejected argument (exit 2).
 
 `libdfn_res_stage.a` holds the shared stage, the rate bridge and the DFN2 host
 pre/post objects; link it ahead of the flow's archives (`libaudio_pipeline_mcab.a`, which holds

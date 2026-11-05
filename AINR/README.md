@@ -222,8 +222,8 @@ formula. What stays compile time: `DFN2_DF_ORDER` (5), the capacities, `-DDFN2_M
 `DFN2_FEATURE_VERSION` and the normaliser starting points.
 
 The board samples own the table from (sample rate, FFT size) to the model geometry. `alg_ai3_dfn.c` and `alg_ai3_dfn_lite.c` take
-`--sample-rate` and `--fft-size`, `alg_ai3_aec_dfn.c` and the two pipeline example mains `--ai-sample-rate` and `--ai-fft-size` (their
-`--sr` / `--sample-rate` is the host's rate), the two UVC samples are 48 kHz only with the shipped row hard-wired, and all of them read
+`--sample-rate` and `--fft-size`, `alg_ai3_aec_dfn.c` and the two pipeline example mains `--ai-sample-rate` and `--ai-fft-size`, from the table without its 32000 row
+(their AEC has no 32 kHz grid; their `--sr` / `--sample-rate` is the host's rate), the two UVC samples are 48 kHz only with the shipped row hard-wired, and all of them read
 the ERB matrices from `fb_<sr>_<n_erb>.bin` (details in [`DeepFilterNet2/README.md`](DeepFilterNet2/README.md#choosing-the-grid)):
 
 | model sample rate | FFT size | n_erb | df_bins | mask / df lookahead | state |

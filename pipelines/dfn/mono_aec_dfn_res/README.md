@@ -103,14 +103,14 @@ hosts); its stage reads the pair from the model.
 
 DFN2 grid. Neither the DFN2 library nor the pipeline units hold a grid (see [`AINR/DeepFilterNet2/README.md`](../../../AINR/DeepFilterNet2/README.md),
 "Choosing the grid"): `main.c` builds the model grid at run time from `--ai-sample-rate <Hz>` / `--ai-fft-size <n>`
-(default 48000 / 1024) with `dfn2_grid_make()`, using the three-row table of `dfn/dfn_example_args.h`
-(16000/256 -> n_erb 24, df_bins 96, lookahead 0/0; 32000/512 -> 28, 96, 0/0, provisional; 48000/1024 -> 32, 96, 1/1; any other
+(default 48000 / 1024) with `dfn2_grid_make()`, using the two-row table of `dfn/dfn_example_args.h`
+(16000/256 -> n_erb 24, df_bins 96, lookahead 0/0; 48000/1024 -> 32, 96, 1/1; no 32 kHz row, the AEC has none; any other
 pair is refused with the list, exit 2) and hands it to `DfnResStageConfig.grid`. The stage takes its rate, FFT size and its input and
 output scales (1/sqrt(n_fft) and its inverse) from that grid. A host at the model's rate needs no bridge:
 `--ai-sample-rate 16000 --ai-fft-size 256` with the 16 kHz host runs straight through the stage (hop 128, algorithmic latency 128
 samples for the 0/0 row, pool 594,048 B: the library's state is sized for its capacity, not for the grid), against 800 samples and
 718,096 B for the shipped 48 kHz model with the same 16 kHz host through the bridge. The bridge exists only for the shipped
-48 kHz / 1024 model (`resolve()` returns -1 on any other stage grid) and its hosts stay 8 kHz and 16 kHz, so a 16 or 32 kHz model
+48 kHz / 1024 model (`resolve()` returns -1 on any other stage grid) and its hosts stay 8 kHz and 16 kHz, so a 16 kHz model
 refuses a host of another rate ("pool query rejected", exit 1), and the 48 kHz host needs the 48 kHz model. The banner prints the model
 grid and whether the stage or the bridge runs. `tests/test_mono_dfn.c` and the Python reference cover the shipped grid; the stage test
 (`dfn/tests/test_dfn_res_stage.c`) runs all three table grids.

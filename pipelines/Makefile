@@ -710,12 +710,12 @@ test: $(BIN_DIR)/test_mono_chain $(BIN_DIR)/aec_nr_pipeline $(BIN_DIR)/aec_nr_pi
 	"$(abspath $(BIN_DIR))/mono_aec_dfn_res" --sample-rate 8000
 	"$(abspath $(BIN_DIR))/mono_aec_dfn_res" --delay-mode fixed --fixed-delay 64
 # The DFN2 model grid is a run-time choice of the program (--ai-sample-rate / --ai-fft-size, one of the
-# three rows of dfn/dfn_example_args.h): a host on the model's own rate runs the stage directly at
+# two rows of dfn/dfn_example_args.h): a host on the model's own rate runs the stage directly at
 # that grid (the banner names it), any other host rate needs the bridge, which accepts the 48 kHz /
 # 1024 model only (pool query rejected, exit 1); a pair outside the table is a rejected argument (2).
 	out="$$("$(abspath $(BIN_DIR))/mono_aec_dfn_res" --ai-sample-rate 16000 --ai-fft-size 256)" && printf '%s\n' "$$out" | grep -q "model grid 16000 Hz / FFT 256 (n_erb 24, df_bins 96, lookahead 0/0), the stage on the host grid"
 	out="$$("$(abspath $(BIN_DIR))/mono_aec_dfn_res" --ai-sample-rate 48000 --ai-fft-size 1024 --sample-rate 48000)" && printf '%s\n' "$$out" | grep -q "model grid 48000 Hz / FFT 1024 (n_erb 32, df_bins 96, lookahead 1/1), the stage on the host grid"
-	"$(abspath $(BIN_DIR))/mono_aec_dfn_res" --ai-sample-rate 32000 --ai-fft-size 512 >/dev/null 2>&1; test $$? -eq 1
+	"$(abspath $(BIN_DIR))/mono_aec_dfn_res" --ai-sample-rate 32000 --ai-fft-size 512 >/dev/null 2>&1; test $$? -eq 2
 	"$(abspath $(BIN_DIR))/mono_aec_dfn_res" --ai-sample-rate 16000 --ai-fft-size 256 --sample-rate 8000 >/dev/null 2>&1; test $$? -eq 1
 	"$(abspath $(BIN_DIR))/mono_aec_dfn_res" --ai-sample-rate 16000 --ai-fft-size 256 --sample-rate 48000 >/dev/null 2>&1; test $$? -eq 1
 	for a in "--ai-sample-rate 44100" "--ai-sample-rate 16000" "--ai-fft-size 512" "--ai-fft-size 256x" "--ai-sample-rate --cng" "--ai-fft-size --cng"; do "$(abspath $(BIN_DIR))/mono_aec_dfn_res" $$a >/dev/null 2>&1; test $$? -eq 2 || exit 1; done

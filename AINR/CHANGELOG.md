@@ -62,7 +62,7 @@
   NEON and scalar builds: all identical. The comparison used a scratch harness that is not in the repo.
 - Board samples (outside this repo) own the (sample rate, FFT size) -> n_erb, df_bins, mask / df lookahead table (16000/256 -> 24, 96,
   0/0; 32000/512 -> 28, 96, 0/0, provisional, no model trained; 48000/1024 -> 32, 96, 1/1), build the grid with `dfn2_grid_make()` and
-  pass it down. `alg_ai3_dfn.c` and `alg_ai3_dfn_lite.c` (mask-only, library units built with `-DDFN2_MASK_ONLY`, object directories
+  pass it down (`alg_ai3_aec_dfn.c` and the pipeline example mains leave out the 32000/512 row: their AEC has no 32 kHz grid). `alg_ai3_dfn.c` and `alg_ai3_dfn_lite.c` (mask-only, library units built with `-DDFN2_MASK_ONLY`, object directories
   apart, `df_lookahead` 0 in every row) take `--sample-rate` and `--fft-size` (default 48000 and 1024) and refuse a misspelt token that
   begins `--sample` or `--fft` (usage, exit 2). `alg_ai3_aec_dfn.c` takes `--ai-sample-rate` and `--ai-fft-size` for the model grid and
   keeps `--sr` as the host rate: the stage directly when the rates are equal, otherwise the rate bridge, which needs the 48 kHz / 1024

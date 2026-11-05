@@ -26,8 +26,8 @@ board sample chooses a grid at build time; only the test programs do.
 - `dfn/dfn_hop.h`, `dfn_hop_pool.h`, `dfn_unit_partition.h`: read the grid from the stage config or the arguments;
   `dfn_hop_pool_plan()` sets `use_bridge` when the host rate differs from the grid's rate; `dfn_unit_partition(fwd, inv, grid)`.
 - `dfn/dfn_example_args.h` and the two example mains (`mono_aec_dfn_res`, `4ch_aec_bf_dfn_res`): new `--ai-sample-rate` and
-  `--ai-fft-size` (default 48000 and 1024; `--sample-rate` stays the host rate), a three-row table (16000/256 -> n_erb 24, df_bins 96,
-  lookahead 0/0; 32000/512 -> 28, 96, 0/0, provisional; 48000/1024 -> 32, 96, 1/1) shared with the board sample `alg_ai3_aec_dfn.c`, and
+  `--ai-fft-size` (default 48000 and 1024; `--sample-rate` stays the host rate), a two-row table (16000/256 -> n_erb 24, df_bins 96,
+  lookahead 0/0; 48000/1024 -> 32, 96, 1/1; no 32 kHz row, the AEC has no 32 kHz grid) shared with the board sample `alg_ai3_aec_dfn.c`, and
   a `model grid ...` banner line. A pair outside the table prints the accepted ones and exits 2; a host rate the bridge cannot serve
   with that model (anything but the 48 kHz / 1024 model with an 8 or 16 kHz host) is a rejected pool query, exit 1. A host on the
   model's own rate runs the stage directly.
