@@ -215,6 +215,7 @@ int dfn2_stream_descriptor_matches(const DFN2StreamMemReq *expected, const DFN2S
            expected->reserved0 == req->reserved0 &&
            expected->build_flags_hash == req->build_flags_hash &&
            expected->alignment == req->alignment &&
+           expected->reserved == req->reserved &&
            expected->bytes == req->bytes;
 }
 
