@@ -1,14 +1,17 @@
-"""Parity gate for the Align-ULCNet C pre/post-processing.
+"""Parity gate for the Align-ULCNet framing contract and the mask helpers.
 
-Compiles AIAEC/Align_ULCNet/ulcnet_process.c with a tiny file-driven test main
-(written to a temp dir, never to the repo) that drives audiolib's AcStft /
-AcIstft in the ulcnet configuration (centered analysis, envelope-normalised
-synthesis) on random audio and compares, frame by frame, against the Python
-reference (aiaec_streaming.StreamSTFT/StreamISTFT, the bit-exact twin of
-torch.stft/istft(center=True)). The fixture first builds audiolib's NE10 static
-lib the way the AEC C tests document it. The driver shares ONE FftHandle across
+The framing is the application's, built from audiolib directly (the contract
+the weights are trained against is stated in ulcnet_process.h). A tiny
+file-driven test main (written to a temp dir, never to the repo) drives
+audiolib's AcStft / AcIstft in that configuration (sqrt-Hann, centered
+analysis, envelope-normalised synthesis) on random audio and compares, frame by
+frame, against the Python reference (aiaec_streaming.StreamSTFT/StreamISTFT,
+the bit-exact twin of torch.stft/istft(center=True)). One program serves both
+grids: n_fft is an argument. The fixture first builds audiolib's NE10 static lib
+the way the AEC C tests document it. The driver shares ONE FftHandle across
 analysis and synthesis (strictly sequential), the sharing contract the pipeline
-variants rely on.
+variants rely on. The mask helpers (aiaec_process.c) and the DeepVQE-S CCM
+kernel are checked against their Python statements at the same widths.
 
 Agreement is float-ULP class, not bit-exact (the C side uses the f32 NE10 FFT,
 torch double twiddles): tolerances sit at ~10x the ~2e-5 absolute error on
@@ -39,10 +42,13 @@ N_FFT, HOP, BINS = 512, 256, 257
 _DRIVER = r'''
 #include <stdio.h>
 #include <stdlib.h>
-#include "ulcnet_process.h"
+#include "audio_stft.h"
 
-/* argv: mode in.f32 out.f32
- * mode "analysis":  in = raw samples -> out = frames (re[257] im[257] each)
+#define N_FFT_MAX 1024
+#define BINS_MAX 513
+
+/* argv: mode in.f32 out.f32 n_fft
+ * mode "analysis":  in = raw samples -> out = frames (re[bins] im[bins] each)
  * mode "roundtrip": in = raw samples -> out = analysis->synthesis samples
  * One shared FftHandle and window table drive BOTH the centered analysis
  * and the synthesis (their use is strictly sequential), matching the
@@ -54,15 +60,22 @@ static void *block(size_t bytes) {
 }
 
 int main(int argc, char **argv) {
-    if (argc != 4) return 2;
+    if (argc != 5) return 2;
     FILE *fi = fopen(argv[2], "rb"), *fo = fopen(argv[3], "wb");
     if (!fi || !fo) return 3;
-    FftHandle *fft = fft_create(ULCNET_N_FFT);  /* heap OK in a test driver */
-    static float win[ULCNET_N_FFT];
+    const int n_fft = atoi(argv[4]);
+    const int n_hop = n_fft / 2, n_bins = n_fft / 2 + 1;
+    if (n_fft < 16 || n_fft > N_FFT_MAX) return 2;
+    FftHandle *fft = fft_create(n_fft);  /* heap OK in a test driver */
+    static float win[N_FFT_MAX];
     AcStftConfig cfg;
     if (!fft) return 4;
-    ac_window_build(win, ULCNET_N_FFT);
-    ulcnet_framing_config(&cfg, fft, win, 1);
+    ac_window_build(win, n_fft);
+    ac_stft_config_default(&cfg, n_fft);
+    cfg.center = 1;
+    cfg.ola = AC_OLA_ENV_NORM;
+    cfg.fft = fft;
+    cfg.window = win;
     size_t an_bytes = ac_stft_get_mem_size(&cfg);
     size_t sy_bytes = ac_istft_get_mem_size(&cfg);
     if (an_bytes == 0 || sy_bytes == 0) return 5;
@@ -70,19 +83,19 @@ int main(int argc, char **argv) {
     AcIstft *sy = ac_istft_init(block(sy_bytes), sy_bytes, &cfg);
     if (!an || !sy) return 5;
     int roundtrip = argv[1][0] == 'r';
-    float hop[ULCNET_HOP];
-    float fre[2 * ULCNET_BINS], fim[2 * ULCNET_BINS];
-    float out[ULCNET_N_FFT];
-    while (fread(hop, sizeof(float), ULCNET_HOP, fi) == ULCNET_HOP) {
+    float hop[N_FFT_MAX / 2];
+    float fre[2 * BINS_MAX], fim[2 * BINS_MAX];
+    float out[N_FFT_MAX];
+    while (fread(hop, sizeof(float), (size_t)n_hop, fi) == (size_t)n_hop) {
         int n = ac_stft_push_planar(an, hop, fre, fim);
         for (int f = 0; f < n; ++f) {
-            const float *re = fre + f * ULCNET_BINS, *im = fim + f * ULCNET_BINS;
+            const float *re = fre + f * n_bins, *im = fim + f * n_bins;
             if (roundtrip) {
                 int m = ac_istft_push_planar(sy, re, im, out);
                 fwrite(out, sizeof(float), (size_t)m, fo);
             } else {
-                fwrite(re, sizeof(float), ULCNET_BINS, fo);
-                fwrite(im, sizeof(float), ULCNET_BINS, fo);
+                fwrite(re, sizeof(float), (size_t)n_bins, fo);
+                fwrite(im, sizeof(float), (size_t)n_bins, fo);
             }
         }
     }
@@ -91,8 +104,8 @@ int main(int argc, char **argv) {
             int m = ac_istft_push_planar(sy, fre, fim, out);
             fwrite(out, sizeof(float), (size_t)m, fo);
         } else {
-            fwrite(fre, sizeof(float), ULCNET_BINS, fo);
-            fwrite(fim, sizeof(float), ULCNET_BINS, fo);
+            fwrite(fre, sizeof(float), (size_t)n_bins, fo);
+            fwrite(fim, sizeof(float), (size_t)n_bins, fo);
         }
     }
     if (roundtrip) {
@@ -126,45 +139,32 @@ def audio_common_lib():
     return lib
 
 
-def _build_driver(tmp_path_factory, audio_common_lib, name, defines=()):
-    """Compile the pre/post driver, optionally for a non-default grid."""
+@pytest.fixture(scope='module')
+def driver(tmp_path_factory, audio_common_lib):
+    """The framing driver: one program for every grid (n_fft is an argument)."""
     cc = shutil.which('cc') or shutil.which('gcc') or shutil.which('clang')
     if cc is None:
         pytest.skip('no C compiler available')
-    work = tmp_path_factory.mktemp(name)
+    work = tmp_path_factory.mktemp('ulcnet_c')
     main_c = work / 'driver.c'
     main_c.write_text(_DRIVER)
     exe = work / 'driver'
     subprocess.run(
-        [cc, '-O2', '-std=c99', '-ffp-contract=off', *defines,
+        [cc, '-O2', '-std=c99', '-ffp-contract=off',
          '-I', _ULCNET_DIR, '-I', _AC_INCLUDE, '-I', _AC_DIR,
-         str(main_c), os.path.join(_ULCNET_DIR, 'ulcnet_process.c'),
-         audio_common_lib, '-lm', '-o', str(exe)],
+         str(main_c), audio_common_lib, '-lm', '-o', str(exe)],
         check=True, capture_output=True,
     )
     return work, exe
 
 
-@pytest.fixture(scope='module')
-def driver(tmp_path_factory, audio_common_lib):
-    return _build_driver(tmp_path_factory, audio_common_lib, 'ulcnet_c')
-
-
-@pytest.fixture(scope='module')
-def driver48(tmp_path_factory, audio_common_lib):
-    """The same pre/post driver compiled for the 48 kHz / 1024 grid."""
-    return _build_driver(
-        tmp_path_factory, audio_common_lib, 'ulcnet_c_48k',
-        ('-DULCNET_MODEL_IO_SR=48000', '-DULCNET_MODEL_IO_N_FFT=1024'),
-    )
-
-
-def _run(driver_fx, mode, samples):
+def _run(driver_fx, mode, samples, n_fft=N_FFT):
     work, exe = driver_fx
     fin = work / 'in.f32'
     fout = work / 'out.f32'
     samples.astype(np.float32).tofile(fin)
-    subprocess.run([str(exe), mode, str(fin), str(fout)], check=True)
+    subprocess.run([str(exe), mode, str(fin), str(fout), str(n_fft)],
+                   check=True)
     return np.fromfile(fout, dtype=np.float32)
 
 
@@ -177,8 +177,8 @@ def _python_frames(x, n_fft=N_FFT, hop=HOP):
     return torch.stack(frames, dim=1)[0]          # [T, n_fft/2+1] complex
 
 
-def test_48k_analysis_and_roundtrip_match_python(driver48):
-    """Numerical parity for the complete C STFT/WOLA path at 48 kHz.
+def test_48k_analysis_and_roundtrip_match_python(driver):
+    """Numerical parity for the complete STFT/WOLA framing contract at 48 kHz.
 
     The pipeline build smoke catches dimensions and linking; this test also
     catches a correct-sized but incorrectly framed 513-bin implementation.
@@ -189,7 +189,7 @@ def test_48k_analysis_and_roundtrip_match_python(driver48):
     x = torch.randn(hop * 24)
     ref_frames = _python_frames(x, n_fft, hop)
 
-    raw = _run(driver48, 'analysis', x.numpy())
+    raw = _run(driver, 'analysis', x.numpy(), n_fft)
     got = raw.reshape(-1, 2, bins)
     assert got.shape[0] == ref_frames.shape[0]
     got_complex = torch.complex(
@@ -197,7 +197,7 @@ def test_48k_analysis_and_roundtrip_match_python(driver48):
     assert (got_complex - ref_frames).abs().max().item() < 4e-4
 
     roundtrip = torch.from_numpy(
-        _run(driver48, 'roundtrip', x.numpy())[:x.numel()])
+        _run(driver, 'roundtrip', x.numpy(), n_fft)[:x.numel()])
     assert roundtrip.shape == x.shape
     assert (roundtrip - x).abs().max().item() < 4e-4
 
@@ -267,18 +267,24 @@ def test_ulcnet_compressed_mask_helper_matches_python(driver, audio_common_lib):
     source = work / 'ulc_mask.c'
     source.write_text(r'''
 #include <stdio.h>
+#include <stdlib.h>
 #include "aiaec_process.h"
+#define BINS_MAX 513
 int main(int argc, char **argv) {
-    float in[4][AIAEC_N_BINS], out[2][AIAEC_N_BINS];
+    static float in[4][BINS_MAX], out[2][BINS_MAX];
     FILE *fi, *fo;
-    if (argc != 3) return 2;
+    int n_bins;
+    if (argc != 4) return 2;
+    n_bins = atoi(argv[3]);
+    if (n_bins < 1 || n_bins > BINS_MAX) return 2;
     fi = fopen(argv[1], "rb"); fo = fopen(argv[2], "wb");
     if (!fi || !fo) return 3;
-    if (fread(in, sizeof(float), 4 * AIAEC_N_BINS, fi) !=
-        4 * AIAEC_N_BINS) return 4;
+    for (int row = 0; row < 4; ++row)
+        if (fread(in[row], sizeof(float), (size_t)n_bins, fi) != (size_t)n_bins) return 4;
     aiaec_apply_ulcnet_compressed_mask(
-        in[0], in[1], in[2], in[3], out[0], out[1]);
-    fwrite(out, sizeof(float), 2 * AIAEC_N_BINS, fo);
+        in[0], in[1], in[2], in[3], out[0], out[1], n_bins);
+    for (int row = 0; row < 2; ++row)
+        fwrite(out[row], sizeof(float), (size_t)n_bins, fo);
     fclose(fi); fclose(fo); return 0;
 }
 ''')
@@ -295,8 +301,8 @@ int main(int argc, char **argv) {
     input_path = work / 'ulc_mask_in.f32'
     output_path = work / 'ulc_mask_out.f32'
     values.numpy().astype(np.float32).tofile(input_path)
-    subprocess.run([str(executable), str(input_path), str(output_path)],
-                   check=True)
+    subprocess.run([str(executable), str(input_path), str(output_path),
+                    str(BINS)], check=True)
     got = torch.from_numpy(np.fromfile(output_path, dtype=np.float32)).reshape(2, BINS)
     exponent = 0.3
     compressed = values[:2].sign() * values[:2].abs().pow(exponent)
@@ -315,18 +321,24 @@ def test_shared_real_and_complex_masks_match_python(driver, audio_common_lib):
     source = work / 'shared_masks.c'
     source.write_text(r'''
 #include <stdio.h>
+#include <stdlib.h>
 #include "aiaec_process.h"
+#define BINS_MAX 513
 int main(int argc, char **argv) {
-    float in[5][AIAEC_N_BINS], out[4][AIAEC_N_BINS];
+    static float in[5][BINS_MAX], out[4][BINS_MAX];
     FILE *fi, *fo;
-    if (argc != 3) return 2;
+    int n_bins;
+    if (argc != 4) return 2;
+    n_bins = atoi(argv[3]);
+    if (n_bins < 1 || n_bins > BINS_MAX) return 2;
     fi = fopen(argv[1], "rb"); fo = fopen(argv[2], "wb");
     if (!fi || !fo) return 3;
-    if (fread(in, sizeof(float), 5 * AIAEC_N_BINS, fi) !=
-        5 * AIAEC_N_BINS) return 4;
-    aiaec_apply_real_mask(in[0], in[1], in[2], out[0], out[1]);
-    aiaec_apply_complex_mask(in[0], in[1], in[3], in[4], out[2], out[3]);
-    fwrite(out, sizeof(float), 4 * AIAEC_N_BINS, fo);
+    for (int row = 0; row < 5; ++row)
+        if (fread(in[row], sizeof(float), (size_t)n_bins, fi) != (size_t)n_bins) return 4;
+    aiaec_apply_real_mask(in[0], in[1], in[2], out[0], out[1], n_bins);
+    aiaec_apply_complex_mask(in[0], in[1], in[3], in[4], out[2], out[3], n_bins);
+    for (int row = 0; row < 4; ++row)
+        fwrite(out[row], sizeof(float), (size_t)n_bins, fo);
     fclose(fi); fclose(fo); return 0;
 }
 ''')
@@ -344,8 +356,8 @@ int main(int argc, char **argv) {
     input_path = work / 'shared_masks_in.f32'
     output_path = work / 'shared_masks_out.f32'
     values.numpy().tofile(input_path)
-    subprocess.run([str(executable), str(input_path), str(output_path)],
-                   check=True)
+    subprocess.run([str(executable), str(input_path), str(output_path),
+                    str(BINS)], check=True)
     got = torch.from_numpy(
         np.fromfile(output_path, dtype=np.float32)).reshape(4, BINS)
     real_expected = torch.stack((values[0] * values[2],
@@ -369,24 +381,30 @@ def test_deepvqe_ccm_helper_matches_python(tmp_path):
 #include <stdio.h>
 #include <stdlib.h>
 #include "deepvqe_process.h"
+#define BINS_MAX 513
+/* The spectrum rings are the caller's: TIME_ORDER spectra each. */
 int main(int argc, char **argv) {
     DeepVqeCcmState state;
-    float re[AIAEC_N_BINS], im[AIAEC_N_BINS];
-    float taps[AIAEC_N_BINS][DEEPVQE_TIME_ORDER][DEEPVQE_FREQ_TAPS][2];
-    float out_re[AIAEC_N_BINS], out_im[AIAEC_N_BINS];
+    static float ring_re[DEEPVQE_TIME_ORDER * BINS_MAX], ring_im[DEEPVQE_TIME_ORDER * BINS_MAX];
+    static float re[BINS_MAX], im[BINS_MAX];
+    static float taps[BINS_MAX][DEEPVQE_TIME_ORDER][DEEPVQE_FREQ_TAPS][2];
+    static float out_re[BINS_MAX], out_im[BINS_MAX];
     FILE *fi, *fo;
-    if (argc != 4) return 2;
+    int n_bins;
+    if (argc != 5) return 2;
+    n_bins = atoi(argv[4]);
+    if (n_bins < 3 || n_bins > BINS_MAX) return 2;
     fi = fopen(argv[1], "rb"); fo = fopen(argv[2], "wb");
     if (!fi || !fo) return 3;
-    deepvqe_ccm_init(&state);
+    if (deepvqe_ccm_init(&state, n_bins, ring_re, ring_im) != 0) return 5;
     for (int frame = 0; frame < atoi(argv[3]); ++frame) {
-        if (fread(re, sizeof(float), AIAEC_N_BINS, fi) != AIAEC_N_BINS) return 4;
-        if (fread(im, sizeof(float), AIAEC_N_BINS, fi) != AIAEC_N_BINS) return 4;
-        if (fread(taps, sizeof(float), AIAEC_N_BINS * 3 * 3 * 2, fi) !=
-            AIAEC_N_BINS * 3 * 3 * 2) return 4;
-        deepvqe_ccm_process(&state, re, im, taps, out_re, out_im);
-        fwrite(out_re, sizeof(float), AIAEC_N_BINS, fo);
-        fwrite(out_im, sizeof(float), AIAEC_N_BINS, fo);
+        const size_t n = (size_t)n_bins;
+        if (fread(re, sizeof(float), n, fi) != n) return 4;
+        if (fread(im, sizeof(float), n, fi) != n) return 4;
+        if (fread(taps, sizeof(float), n * 3 * 3 * 2, fi) != n * 3 * 3 * 2) return 4;
+        deepvqe_ccm_process(&state, re, im, (const float *)taps, out_re, out_im);
+        fwrite(out_re, sizeof(float), n, fo);
+        fwrite(out_im, sizeof(float), n, fo);
     }
     fclose(fi); fclose(fo); return 0;
 }
@@ -412,8 +430,8 @@ int main(int argc, char **argv) {
     input_path = tmp_path / 'ccm_in.f32'
     output_path = tmp_path / 'ccm_out.f32'
     np.concatenate(raw).astype(np.float32).tofile(input_path)
-    subprocess.run([str(executable), str(input_path), str(output_path), str(frames)],
-                   check=True)
+    subprocess.run([str(executable), str(input_path), str(output_path),
+                    str(frames), str(BINS)], check=True)
     got = torch.from_numpy(np.fromfile(output_path, dtype=np.float32)).reshape(
         frames, 2, BINS)
     got = torch.complex(got[:, 0], got[:, 1])

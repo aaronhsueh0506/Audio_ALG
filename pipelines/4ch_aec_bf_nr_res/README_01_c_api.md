@@ -271,9 +271,8 @@ make NO_STDIO=1 audit-no-stdio
 
 `DFN2_MASK_LOOKAHEAD` (0..2) and `DFN2_DF_LOOKAHEAD` (0..4) default to the shipped pair 1/1. The DFN2 stage, the bridge and the
 example main hold no pair (the application puts a `DFN2Grid` in `DfnResStageConfig.grid`; the main reads it from `--ai-sample-rate` /
-`--ai-fft-size`), so a different pair is passed as `-D` flags to the test unit `test_4ch_dfn` alone, and only `-DDFN2_MAX_DF_RING=<ring>`
-for a state ring deeper than 5 (1/4, 2/3, 2/4) goes to every unit. The pair is part of the build signature, so pairs never share an
-object directory. Only the 1/1 pair has a trained checkpoint, and the audio quality of the other pairs is not measured.
+`--ai-fft-size`), so a different pair is passed as `-D` flags to the test unit `test_4ch_dfn` alone. The pair is part of the build
+signature, so pairs never share an object directory. Only the 1/1 pair has a trained checkpoint, and the audio quality of the other pairs is not measured.
 
 `libaudio_pipeline_mcab.a` contains `mcab.o` (the flow) only. The sample objects (`mcab_sample_flow.o`,
 `mcab_sample_beam.o`, `mcab_sample_driver.o`), the example chain headers and the ULCNet stage object

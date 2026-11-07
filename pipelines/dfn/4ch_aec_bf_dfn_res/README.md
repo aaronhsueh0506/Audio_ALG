@@ -90,26 +90,29 @@ make WERROR=1 test        # includes test_4ch_dfn and the skeleton
 The `Makefile` in this directory is a thin forwarder: `make -C pipelines/dfn/4ch_aec_bf_dfn_res test`
 builds and runs `test_4ch_dfn`, then the skeleton (default, `--delay-num-filters 1 --cng --atten-lim 12`,
 `--sample-rate 48000`, `--ai-sample-rate 16000 --ai-fft-size 256`) and checks that `--sample-rate 16000Hz`, `--sample-rate 8000` and
-`--atten-lim 12dB` exit with 2 and that a 32 kHz model grid (not in the table: the AEC has no 32 kHz grid) is a rejected argument (exit 2).
+`--atten-lim 12dB` exit with 2, and that a 32 kHz model grid (not in the table: the AEC has no 32 kHz grid) is a rejected argument (exit 2).
 
 `libdfn_res_stage.a` holds the shared stage, the rate bridge and the DFN2 host
 pre/post objects; link it ahead of the flow's archives (`libaudio_pipeline_mcab.a`, which holds
 `mcab.o` only, the SRP/BF archives of audiolib, `libaec`, `libanr` and `libaudio_common`). The
 sample objects `mcab_sample_flow.o`, `mcab_sample_beam.o` and `mcab_sample_driver.o` are linked into
 the program, not archived. The board supplies the stateless model
-callback (`DFN2Model`) and the exported ERB matrices. `main.c` is the board
+callback (`DFN2Model`; its recurrent state is the accelerator's, reloaded with quantized zeros when
+`dfn_res_stage_state_generation()`, through the bridge `dfn_rate_bridge_state_generation()`, changes: a reset, each warm-up frame or a
+refused commit) and the ERB matrices (`erb_fwd.bin` / `erb_inv.bin`
+from `AINR/DeepFilterNet2/export_erb_matrix.py`; layout in [`../README.md`](../README.md), "Build and test"). `main.c` is the board
 skeleton (delay-profile flags, `--sample-rate` (16000 default or 48000), `--ai-sample-rate` / `--ai-fft-size`,
 `--erb-fwd` / `--erb-inv`, `--atten-lim`, `--cng`; the helper's default array geometry stands in for
 the product's measured one; numbers are parsed strictly by `common/example_cli.h`, so values such as
 `16000Hz` exit with 2; it
-publishes the compiled-in model I/O descriptor, which a product replaces with
+publishes the model I/O descriptor of the model grid, which a product replaces with
 the one from its model's exported metadata).
 
 The Python evaluator compares the original NR+RES tail, RES-only and the DFN
 feature-source experiments on the same fused contexts. The C example uses
 the beamformed-error source only; a raw-capture or single-lane estimate is
 not phase-consistent with the post-beam spectrum, so those arms are
-meaningful with the mask-only compose and stay experiments:
+meaningful with a mask-only model (no deep filter) and stay experiments:
 
 ```sh
 python pipelines/tools/eval_dfn2_4ch_inputs.py \
@@ -126,6 +129,7 @@ current model-v6/feature-v5.
 
 ```
 App          McabSampleFlow + Mcab   McabSampleBeam   libaec AecRes   DfnHop + DfnResStage | DfnRateBridge   AcIstft (DFN2 grid rate; 48 kHz as shipped)
+ |-- dfn2_grid_make (row of --ai-sample-rate / --ai-fft-size); load erb_fwd.bin / erb_inv.bin (--erb-fwd / --erb-inv)
  |-- mcab_default_config; mcab_get_mem_requirements / _breakdown; mcab_sample_flow_get_mem_size / _init -->|
  |-- mcab_sample_beam_default_params; mcab_sample_beam_get_mem_size / _init(flow) -->|
  |-- aec_config_from_level (fft_size = mcab_get_mem_breakdown().fft_size); aec_res_get_mem_size; aec_res_init -->|
@@ -175,9 +179,9 @@ requires the final int8/fp runtime and board cycle measurement.
 Pool printed by the skeleton (`4ch_aec_bf_dfn_res`, matched delay, five-filter bank, NE10; the
 flow objects (four lanes, shared estimator, mcab pool), the SRP/BF helper, the post-beam `AecRes` carved by the example,
 the P and gain buffers, and the stage or bridge, each 16-byte
-aligned; shipped pair): 2,066,240 bytes at the 16 kHz default (flow plus helper 1,706,240 bytes, plus the rate bridge) and
-6,646,000 bytes at 48 kHz (flow plus helper 6,329,312 bytes). mcab's own pool is 74,624 bytes at
+aligned; shipped pair): 1,939,200 bytes at the 16 kHz default (flow plus helper 1,706,240 bytes, plus the rate bridge) and
+6,518,960 bytes at 48 kHz (flow plus helper 6,329,312 bytes). mcab's own pool is 74,624 bytes at
 16 kHz/256 (68,368 bytes front-only); the lanes and the estimator have their own pools.
-Model weights and accelerator activation/workspace memory are external;
-adding int8 weights alone brings the known minimum to about 4.0 MiB at
+Model weights, accelerator activation/workspace memory and the recurrent state are external;
+adding int8 weights alone brings the pool plus weights to about 3.9 MiB at
 16 kHz.

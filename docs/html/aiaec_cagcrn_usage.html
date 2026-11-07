@@ -81,7 +81,7 @@ python3 AIAEC/CAGCRN/export_erb_matrix.py --checkpoint checkpoint.pth \
 <ol>
 <li>graph 輸入 21 個：<code>mic</code>、<code>far</code>（各 <code>[1,1,257,2]</code>，未正規化 RI 頻譜）加 19 個 state；輸出：<code>output</code>（<code>[1,1,257,2]</code> 的 CRM，最後一軸為 re／im）與 19 個 <code>*_out</code>，每個與同名輸入同 shape，綁在同一個位址。兩顆 GRU hidden 疊成單一 <code>h_gru (1,2,25,24)</code>（far 在前）。</li>
 <li>ERB merge／split 與 Tanh mask 都在圖內；C 端不載入任何 ERB 矩陣。</li>
-<li>host 後端：把 <code>output</code> 拆成 mask_re／mask_im，呼叫 <code>aiaec_apply_complex_mask(mic_re, mic_im, mask_re, mask_im, out_re, out_im)</code>，再經 <code>AcIstft</code> 合成。</li>
+<li>host 後端：把 <code>output</code> 拆成 mask_re／mask_im，呼叫 <code>aiaec_apply_complex_mask(mic_re, mic_im, mask_re, mask_im, out_re, out_im, n_bins)</code>，再經 <code>AcIstft</code> 合成。</li>
 <li>匯出 metadata 沒有 <code>state_layout_version</code> 與 <code>c_descriptor</code>（缺席＝C 端沒有綁定這個模型）；<code>state_binding</code> 為 <code>in_place_same_address</code>。</li>
 </ol>
 

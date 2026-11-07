@@ -8,19 +8,19 @@
  *   -DDFN2_SR=.. -DDFN2_N_FFT=.. -DDFN2_N_ERB=.. -DDFN2_DF_BINS=..
  *                                         a grid of another model (all four, no preset)
  *   -DDFN2_MASK_LOOKAHEAD=m -DDFN2_DF_LOOKAHEAD=d
- *                                         the lookahead pair (1/1 full, 1/0 mask-only);
- *                                         a pair with ring > 5 also needs
- *                                         -DDFN2_MAX_DF_RING=<ring> on every unit
+ *                                         the lookahead pair (1/1 full, 1/0 mask-only)
  *
  *      preset   sr      n_fft  hop   bins  n_erb  df_bins
  *      48       48000   1024   512   513   32     96
  *      32       32000   512    256   257   28     96     (not trained yet)
  *      16       16000   256    128   129   24     96
  *
- * This is the test side of the contract: dfn2_test_grid() hands the library the same grid
- * as a DFN2Grid, built by dfn2_grid_make(), and the DFN2_* macros below size the test's own
- * buffers. Nothing here is read by the library. The values of a preset are what
- * AINR/DeepFilterNet2/config.ini and the board samples' tables say for that sample rate. */
+ * dfn2_test_grid() hands the library this grid as a DFN2Grid and the DFN2_* macros size the
+ * test's own buffers; nothing here is read by the library. The order, the normaliser
+ * settings and the recurrent-state shapes are the shipped model's (config.ini [model],
+ * [feature]; export_onnx.py), pinned by tests/test_dfn2_contract.py. The recurrent state
+ * belongs to the application: a float host registers DFN2_TEST_GRU_ELEMENTS and
+ * DFN2_TEST_CONVP_ELEMENTS floats per instance. Framing is the test's own: ainr_test_hop.h. */
 
 #ifndef DFN2_TEST_GRID_H
 #define DFN2_TEST_GRID_H
@@ -89,6 +89,37 @@
 #define DFN2_DF_LOOKAHEAD   1
 #endif
 #endif
+/* config.ini [model] df_order and [feature]: the shipped model's values, a test table that
+ * tests/test_dfn2_contract.py pins to the files. */
+#define DFN2_DF_ORDER                  5
+#define DFN2_TEST_ERB_NORM_TAU_SEC     1.0f
+#define DFN2_TEST_ERB_NORM_INIT_LO_DB  (-60.0f)
+#define DFN2_TEST_ERB_NORM_INIT_HI_DB  (-90.0f)
+#define DFN2_TEST_ERB_NORM_SCALE_DB    40.0f
+#define DFN2_TEST_SPEC_NORM_TAU_SEC    1.0f
+#define DFN2_TEST_SPEC_NORM_INIT_LO    0.001f
+#define DFN2_TEST_SPEC_NORM_INIT_HI    0.0001f
+
+/* Shapes of the exported graph's recurrent state (export_onnx.py): h_gru is
+ * [1, GRU_ROWS, 1, GRU_HIDDEN] (encoder row 0, ERB rows from 1, DF rows from 3) and
+ * df_convp_history is [1, CONVP_CHANNELS, CONVP_WINDOW, df_bins]; the mask-only graph has
+ * the first three rows and no pathway window. */
+#define DFN2_TEST_GRU_ROW_ENCODER      0
+#define DFN2_TEST_GRU_ROW_ERB          1
+#define DFN2_TEST_GRU_HIDDEN           256
+#define DFN2_TEST_CONVP_CHANNELS       64
+#ifdef DFN2_MASK_ONLY
+#define DFN2_TEST_GRU_ROWS             3
+#define DFN2_TEST_CONVP_WINDOW         0
+#else
+#define DFN2_TEST_GRU_ROW_DF           3
+#define DFN2_TEST_GRU_ROWS             5
+#define DFN2_TEST_CONVP_WINDOW         5
+#endif
+#define DFN2_TEST_GRU_ELEMENTS         ((size_t)DFN2_TEST_GRU_ROWS * DFN2_TEST_GRU_HIDDEN)
+#define DFN2_TEST_CONVP_ELEMENTS \
+    ((size_t)DFN2_TEST_CONVP_CHANNELS * DFN2_TEST_CONVP_WINDOW * (DFN2_DF_BINS))
+
 #define DFN2_DF_HISTORY     (DFN2_DF_ORDER - DFN2_DF_LOOKAHEAD - 1)
 #define DFN2_DF_RING_NOISY  (DFN2_MASK_LOOKAHEAD + DFN2_DF_LOOKAHEAD + 1)
 #ifdef DFN2_MASK_ONLY
@@ -103,9 +134,29 @@
 #define DFN2_NORMALIZED_STFT_UNSCALE  sqrtf((float)(DFN2_N_FFT))
 #define DFN2_ANALYSIS_SCALE           DFN2_NORMALIZED_STFT_SCALE
 
-#if DFN2_DF_RING > DFN2_MAX_DF_RING
-#error "this lookahead pair needs a deeper ring than the library capacity: pass -DDFN2_MAX_DF_RING=<DFN2_DF_RING> on every translation unit"
-#endif
+/* The spec of this program's grid, one frame per call; a test that varies a field edits the
+ * copy before dfn2_grid_make(). */
+static inline DFN2GridSpec dfn2_test_grid_spec(void)
+{
+    DFN2GridSpec spec = {
+        .sample_rate = DFN2_SR,
+        .n_fft = DFN2_N_FFT,
+        .n_erb = DFN2_N_ERB,
+        .df_bins = DFN2_DF_BINS,
+        .df_order = DFN2_DF_ORDER,
+        .mask_lookahead = DFN2_MASK_LOOKAHEAD,
+        .df_lookahead = DFN2_DF_LOOKAHEAD,
+        .frames_per_call = 1,
+        .erb_norm_tau_sec = DFN2_TEST_ERB_NORM_TAU_SEC,
+        .erb_norm_init_lo_db = DFN2_TEST_ERB_NORM_INIT_LO_DB,
+        .erb_norm_init_hi_db = DFN2_TEST_ERB_NORM_INIT_HI_DB,
+        .erb_norm_scale_db = DFN2_TEST_ERB_NORM_SCALE_DB,
+        .spec_norm_tau_sec = DFN2_TEST_SPEC_NORM_TAU_SEC,
+        .spec_norm_init_lo = DFN2_TEST_SPEC_NORM_INIT_LO,
+        .spec_norm_init_hi = DFN2_TEST_SPEC_NORM_INIT_HI,
+    };
+    return spec;
+}
 
 /* The grid of this program as the library's value; built once, aborts on a grid the library
  * refuses (the test would be running something else). */
@@ -114,9 +165,8 @@ static inline const DFN2Grid *dfn2_test_grid(void)
     static DFN2Grid grid;
     static int ready;
     if (!ready) {
-        int status = dfn2_grid_make(&grid, DFN2_SR, DFN2_N_FFT, DFN2_N_ERB,
-                                    DFN2_DF_BINS, DFN2_MASK_LOOKAHEAD,
-                                    DFN2_DF_LOOKAHEAD);
+        const DFN2GridSpec spec = dfn2_test_grid_spec();
+        int status = dfn2_grid_make(&grid, &spec);
         if (status != DFN2_GRID_OK) {
             fprintf(stderr, "dfn2_test_grid: %s\n", dfn2_grid_status_text(status));
             exit(2);

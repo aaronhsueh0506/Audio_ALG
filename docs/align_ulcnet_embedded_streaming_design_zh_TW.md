@@ -1,10 +1,12 @@
 # PBFDKF + Align-ULCNet Embedded Streaming 設計
 
 狀態：設計與實作對照。單幀 ONNX boundary（`AIAEC/Align_ULCNet/export_onnx.py`）、
-CPU external-state helper（`ulcnet_model_io.c/h`、`ulcnet_accelerator_adapter.c/h`）、
-C STFT/WOLA（`ulcnet_process.c/h`）與 delay 狀態機／fail-open 邏輯（[§8](align_ulcnet_embedded_streaming_design_zh_TW_01_state_wola_delay.md#8-delay-狀態機與-fallback)）都已實作，
+model I/O 與 pre/post class（`ulcnet_model_io.c/h`、`ulcnet_prepost.c/h`）、
+accelerator adapter（`ulcnet_accelerator_adapter.c/h`）與 delay 狀態機／fail-open 邏輯（[§8](align_ulcnet_embedded_streaming_design_zh_TW_01_state_wola_delay.md#8-delay-狀態機與-fallback)）都已實作，
 並接入 `pipelines/ulcnet/mono_alignulcnet/` 與 `pipelines/ulcnet/4ch_alignulcnet/` 兩個 ULCNet
-pipeline。state 邊界是 layout 18（`ULCNET_MODEL_IO_LAYOUT_VERSION`）：四個 rank-4
+pipeline。函式庫只處理頻譜：成幀、FFT、window 與逆 FFT 由應用端用 audiolib 的
+`AcStft`／`AcIstft` 做（契約寫在 `ulcnet_process.h` 檔頭），遞迴 state 屬於應用端
+（float host 註冊 buffer，板端由加速器保存）。state 邊界是 layout 18（`ULCNET_MODEL_IO_LAYOUT_VERSION`）：四個 rank-4
 state 以完整 window 進出，每個 `*_out` 就地綁定到同名輸入的位址（[§10.2](align_ulcnet_embedded_streaming_design_zh_TW_02_npu_boundary_validation.md#102-onnx-inputoutput-contract)）。
 
 production 的 far branch 固定讀 caller 的 raw far（與訓練及論文一致）；PBFDKF 的
@@ -14,8 +16,11 @@ checkpoint 訓練 provenance 與部署契約都是 raw far。board/NPU driver �
 `main.c` 的 `run_accelerator()` 是回 -1 的 board TODO 佔位。
 
 **layout 18 的契約**：K/V window 是 `[1,32,D,TA]`、logit window 是 `[1,32,5,D]`，兩顆
-GRU hidden 併成單一 `h_gru [1,4,1,128]`；`output` 的元素數是 2·K；
-`descriptor_validate()` 另外比對 `score_window_frames`。**版本號是唯一能攔下舊板綁新圖
+GRU hidden 併成單一 `h_gru [1,4,1,128]`；`output` 的元素數是 2·K。函式庫不知道這些 state
+的形狀（descriptor 的 `ta_channels`…`gru_hidden` 五個內部欄位恆為 0、不讀不驗），形狀是
+exporter 與應用端的約定；`ulcnet_model_io_descriptor_validate(grid, d)` 比對
+`layout_version`、`sample_rate`、`fft_size`、`hop_size`、`spectrum_bins`、`far_input_mode`
+（只收 raw far）與 D 的範圍（2–64）。**版本號是唯一能攔下舊板綁新圖
 的閘門**：其他 layout 產出的 descriptor 在 `ulcnet_model_io_descriptor_validate()` 會卡在
 `layout_version`，`ulcnet_accelerator_adapter_init()` 直接回 NULL。mask 是量化目標
 （`complex_mask` 1×1 Conv 無 activation，range 由 calibration 決定）。
@@ -95,9 +100,13 @@ reprime 的職責，也沒有原則上的上限（照那個邏輯每個 IIR 尾�
 
 ### 1.3 48 kHz grid
 
-支援的 grid 恰好兩組，且是**編譯期**選擇：C struct 內嵌 STFT/WOLA 與 scratch
-buffer，一個 binary 固定一組 grid。`export_onnx.py` 的 `SUPPORTED_GRIDS` 拒絕
-其他組合，`ulcnet_model_io.h` 對其他組合直接 `#error`。
+grid 是**執行期值**：應用端把模型的 export grid 填進 `UlcnetGridSpec`（`sample_rate`、
+`n_fft`、`delay_depth`），用 `ulcnet_grid_make()` 得到 `UlcnetGrid`（`hop` = `n_fft/2`、
+`n_bins` = `n_fft/2+1`），再交給每個 config 與 descriptor。C 端接受 audiolib 建得起來的
+`n_fft`（其餘回 `ULCNET_GRID_ERR_N_FFT`）；只出貨兩組的限制在 exporter：`export_onnx.py` 的
+`SUPPORTED_GRIDS` 拒絕其他組合。同一個 binary 可以同時跑兩組 grid：
+`pipelines/ulcnet/mono_alignulcnet/tests/test_mono_ulcnet.c` 的 grid 表有 16000/512 與
+48000/1024 兩列；兩個範例 main 以 `--sample-rate 16000|48000` 選 grid。
 
 | | 16 kHz | 48 kHz |
 |---|---:|---:|
@@ -109,11 +118,7 @@ buffer，一個 binary 固定一組 grid。`export_onnx.py` 的 `SUPPORTED_GRIDS
 | joint2 之後頻率寬 | 7 | 13 |
 | subband split | (4, 3) | (7, 6) |
 
-C 端用 `make ULCNET_GRID=16k|48k` 選 grid（底層就是那兩個 `-D`），其餘
-（`HOP`/`BINS`/`TA_BINS`）全部由 `n_fft` 導出，沒有第二處需要改。`ULCNET_GRID`
-只套到 ULCNet 的 TU，並折進 pipeline 的 `CFG_SIG`，所以兩個 grid 不共用 object
-目錄，AEC/NR/audiolib/common 這些不含 ULCNet 程式碼的 producer 也不會跟著重建。
-`make test-grids` 一次建置並測試兩個 grid。
+pool 大小隨 grid（`n_bins`）走、不隨 D 走（[§6.2](align_ulcnet_embedded_streaming_design_zh_TW_01_state_wola_delay.md#62-state-ram-粗估)）。
 
 三件跨 grid 時會咬人的事：
 
@@ -129,9 +134,7 @@ C 端用 `make ULCNET_GRID=16k|48k` 選 grid（底層就是那兩個 `-D`），�
    `mask_fc1`/`mask_fc2` 的 `out_features` 與 attention 的 `ta_bins`，是不同的
    weight shape，必須各自訓練。
 
-`AIAEC/aiaec_process.h` 這條**共用候選模型 API 仍固定為 16 kHz**
-（`AIAEC_SR` 為 16000，獨立於 `ULCNET_*` 建置參數，沒有 `#error` 守衛）。
-48 kHz 目前只有 Align-ULCNet 自己的 C pipeline 支援。
+`AIAEC/aiaec_process.h` 的三個 mask 函式（complex、real、ULCNet 壓縮域）不含 grid 常數，頻寬由呼叫端的 `n_bins` 給。
 
 ## 2. 現況查證
 
@@ -226,22 +229,22 @@ flowchart LR
         DS["Delay status<br/>delay / confidence / changed"]
     end
 
-    subgraph PRE["NN C frontend / static state"]
-        ES["Error sqrt-Hann STFT<br/>512/256"]
-        FS["Raw-far sqrt-Hann STFT<br/>512/256"]
-        RI["Complex spectrum to RI tensors"]
+    subgraph PRE["Application AcStft + NN C pre-process"]
+        ES["Error AcStft sqrt-Hann<br/>512/256"]
+        FS["Raw-far AcStft sqrt-Hann<br/>512/256"]
+        RI["pre_process_freq + frame_open<br/>compressed-domain feature tensors"]
     end
 
     subgraph NPU["NPU/DSP model"]
-        FE["Power compression + C-SamFR"]
+        FE["C-SamFR"]
         EN["Error/far encoders"]
         TA["TA: D-frame attention"]
         NN["FGRU + temporal GRU + mask"]
     end
 
-    subgraph POST["NN C postprocess / static state"]
-        CX["RI tensor to complex spectrum"]
-        IS["sqrt-Hann ISTFT/WOLA"]
+    subgraph POST["NN C post-process + application AcIstft"]
+        CX["frame_finish + post_process_freq<br/>mask x error, inverse power"]
+        IS["AcIstft sqrt-Hann WOLA"]
         OUT["256 output samples"]
     end
 
@@ -264,9 +267,12 @@ flowchart LR
 3. 現有 matched filter 按目前 state/duty policy 更新 delay；
 4. 由現有 ring 讀出該 hop 的 `aligned_far[256]`（只給 PBFDKF）；
 5. PBFDKF 使用 `aligned_far`，產生 `linear_error[256]`；
-6. `linear_error` 與 raw far 分別進入自己的 stateful sqrt-Hann STFT；
-7. 一個新 spectral frame 與 persistent NN states 送入 NPU；
-8. enhanced spectrum 經 stateful ISTFT/WOLA；
+6. `linear_error` 與 raw far 分別進入應用端自己的 stateful sqrt-Hann `AcStft`
+   （`ulcnet_nn_stage` 範例代做這一步）；
+7. `ulcnet_prepost_pre_process_freq()`／`frame_open()` 備好特徵，一個新 spectral frame
+   與 persistent NN states 送入 NPU；
+8. `frame_finish()` 驗證並套用 mask（失敗改 `frame_bypass()`），`post_process_freq()` 取出
+   enhanced spectrum，經應用端 stateful `AcIstft`（ISTFT/WOLA）；
 9. 輸出 256 samples。
 
 ## 4. Delay 分工
@@ -346,5 +352,5 @@ reset，不閘控模型。
 `AecResContext.far_spec` 是 PBFDKF frontend 的頻譜，NN frontend 的 contract 是
 periodic sqrt-Hann、512/256、50% overlap。兩者不同：`far_spec` 是無 analysis window
 的矩形 overlap-save rFFT，sqrt-Hann 只用在 near/error 側。窗形不同，不可直接共用；
-模型的 far 分支對 raw far 做自己的 stateful STFT。
+應用端對 raw far 另做自己的 stateful `AcStft`。
 

@@ -12,7 +12,8 @@
 #
 # Usage:  scripts/audit_fp_contract.sh [BACKEND ...]      (default: ne10, the only backend)
 #         SIMD=0|1 (default 1) and WERROR are honoured and forwarded.
-# Exit 0 if every audited object disassembles free of fma-class instructions.
+# Exit 0 if every audited object disassembles free of fma-class instructions, apart from the
+# functions named in EXEMPT_FNS.
 
 set -eu
 
@@ -31,19 +32,56 @@ FMA_RE="$FP_CONTRACT_FMA_RE"
 disas() { fp_contract_disas "$1"; }
 
 # One row per TU: "make-dir:build-goal:object:note". These either run WOLA, implement the
-# DFN spectrum/compose path or do per-bin spectral arithmetic that the C/Python parity gate
+# DFN spectrum path or do per-bin spectral arithmetic that the C/Python parity gate
 # compares, and must stay fma-free so the scalar/NEON and C/Python multiply-then-add
 # contracts remain comparable. The per-hop gain chain the example programs write out only calls
 # kernels audited elsewhere.
 ENTRIES='
-.:libaudio_pipeline_dfn.a:dfn_res_stage.o:shared DFN post-RES stage -- 2^-5/2^5 boundary scaling
+.:libaudio_pipeline_dfn.a:dfn_res_stage.o:shared DFN post-RES stage -- boundary scaling by the grid stft_scale / stft_unscale
 .:libaudio_pipeline_dfn.a:dfn_rate_bridge.o:DFN rate bridge -- native and 48 kHz WOLA, analysis windows
-.:libaudio_pipeline_dfn.a:dfn2_process.o:DFN feature and streaming compose kernels
+.:libaudio_pipeline_dfn.a:dfn2_process.o:DFN feature and streaming enhance-spectrum kernels
 .:mono_alignulcnet:ulcnet_nn_stage.o:Align-ULCNet stage (mono build) -- far-end analysis and enhanced-spectrum synthesis
 4ch_aec_bf_nr_res:libs:mcab.o:4-channel flow -- lane-spectrum projection and the fused PSD views
 4ch_aec_bf_nr_res:libs:mcab_sample_beam.o:4-channel sample beamformer helper -- SRP-PHAT and beamformer glue
 4ch_aec_bf_nr_res:4ch_alignulcnet:ulcnet_nn_stage.o:Align-ULCNet stage (4-channel build) -- far-end analysis and enhanced-spectrum synthesis
 '
+
+# An explicit fma() call is deterministic by definition, not a contraction of a*b+c, so a function
+# that rounds a value exactly on purpose is not audited for fma-class instructions: dfn2_norm_alpha
+# (and its helper round_decimals, which a compiler may inline) rounds the EMA coefficient to decimals
+# once at init. One row per object, "object:function ...". The match is on the function's own
+# disassembly block, never on the object: every other function of the object stays fma-free.
+EXEMPT_FNS='
+dfn2_process.o:dfn2_norm_alpha round_decimals
+'
+
+# fma_split <object> <function names>: prints "<fma-class lines outside the named functions>
+# <fma-class lines inside them>". The disassembly is cut at its function labels (objdump's
+# "ADDR <name>:", otool's "name:"; a leading underscore and a compiler suffix such as .constprop.0
+# are ignored). A Mach-O objdump labels the first function of the text section with the assembler
+# temporary "ltmp0" instead of its name, so for a label of that form only, the start addresses of
+# the named symbols (nm) are matched too. A named label is never matched by address: with
+# -ffunction-sections every function starts at section offset 0 and an address match would exempt
+# them all.
+fma_split() {
+    addrs=$(nm "$1" 2>/dev/null | awk -v names=" $2 " '
+        $2 ~ /^[TtWw]$/ { n = $3; sub(/^_/, "", n); sub(/\..*$/, "", n)
+                          if (index(names, " " n " ")) { a = tolower($1); sub(/^0+/, "", a); print (a == "" ? "0" : a) } }')
+    disas "$1" | awk -v re="$FMA_RE" -v names=" $2 " -v addrs=" $(echo $addrs) " '
+        function exempt_block(label, addr,   n, hit) {
+            n = label; sub(/^_/, "", n); sub(/\..*$/, "", n)
+            hit = n != "" && index(names, " " n " ") > 0
+            if (addr != "" && label ~ /^ltmp[0-9]+$/) {
+                sub(/^0+/, "", addr); if (addr == "") addr = "0"
+                hit = hit || index(addrs, " " tolower(addr) " ") > 0
+            }
+            return hit
+        }
+        /^[0-9a-fA-F]+ <[^>]+>:$/ { l = $2; sub(/^</, "", l); sub(/>:$/, "", l); in_ex = exempt_block(l, $1); next }
+        /^[^ \t]+:$/ { l = $1; sub(/:$/, "", l); in_ex = exempt_block(l, ""); next }
+        tolower($0) ~ re { if (in_ex) inside++; else outside++ }
+        END { printf "%d %d\n", outside, inside }'
+}
 
 fail=0
 audited=0
@@ -64,9 +102,11 @@ for be in $BACKENDS; do
             echo "        build used -- see this script's header)" >&2
             exit 1
         fi
-        n=$(disas "$path" | grep -icE "$FMA_RE" || true)
+        exempt=$(printf '%s\n' "$EXEMPT_FNS" | awk -F: -v o="$obj" '$1 == o { print $2 }')
+        set -- $(fma_split "$path" "$exempt")
+        n=$1
         if [ "$n" -eq 0 ]; then
-            printf '%-6s %-6s %-34s %-5s %s\n' "$be" "$SIMD" "$obj" "$n" PASS
+            printf '%-6s %-6s %-34s %-5s %s\n' "$be" "$SIMD" "$obj" "$n" "PASS${exempt:+ ($2 explicit fma() in $exempt)}"
         else
             printf '%-6s %-6s %-34s %-5s %s\n' "$be" "$SIMD" "$obj" "$n" FAIL
             echo "     -- $note" >&2

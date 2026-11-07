@@ -2,6 +2,84 @@
 
 ## Unreleased
 
+### AI model libraries: run-time grid, caller memory, frequency domain only, application-owned state and ERB matrices
+
+- Run-time grid for all four libraries. `dfn2_grid_make(&grid, const DFN2GridSpec *spec)` replaces the six-value form; the spec also
+  carries `df_order` (1..16), `frames_per_call` (1..64) and the seven normaliser settings of `config.ini [feature]`
+  (`erb_norm_tau_sec`, `erb_norm_init_lo_db`, `erb_norm_init_hi_db`, `erb_norm_scale_db`, `spec_norm_tau_sec`, `spec_norm_init_lo`,
+  `spec_norm_init_hi`); `dfn2_norm_alpha()` takes the tau as a float. New status codes `DFN2_GRID_ERR_DF_ORDER` (-10),
+  `_FRAMES_PER_CALL` (-11), `_ERB_NORM` (-12), `_SPEC_NORM` (-13); `DFN2_GRID_ERR_CAPACITY` and every `DFN2_MAX_*` capacity are gone (-8
+  stays unassigned), and so are `DFN2_DF_ORDER`, `DFN2_FRAMES_PER_CALL` (make knob, link symbol, `DFN2_MULTI_FRAME_HOST`), the
+  normaliser macros and `dfn2_norm_starts[]`, the `DFN2_MODEL_GRU_*`, `DFN2_MODEL_*_GRU_LAYERS`, `_ENCODER_CHANNELS` and `_DF_PATHWAY_WINDOW` state shapes and the ring-suffixed variant symbol
+  (`DFN2_REQUIRE_VARIANT_LINK()` stays and checks `-DDFN2_MASK_ONLY` only). DFN3 gets the same object (`DFN3GridSpec`, `DFN3Grid`,
+  `dfn3_grid_make()`, `dfn3_norm_alpha()`) in place of the `DFN3_*` geometry macros; its lookahead pair is now two spec fields, so
+  the `DFN3_MASK_LOOKAHEAD` / `DFN3_DF_LOOKAHEAD` make variables, the `dfn3_lookahead_mask<M>_df<D>` link symbol and
+  `DFN_PAIR_CFLAGS` are gone (a pair of another model is refused at run time; the only compile-time DFN3 pair is the test preset in
+  `tests/test_dfn3_stream.c`). GTCRN (`GTCRNGridSpec`: `n_fft`, `erb_low_bins`, `erb_high_bands`) and RNNoise-ERB (`RNNoiseGridSpec`)
+  get theirs; the `GTCRN_*` / `RNNOISE_*` geometry and normaliser macros are fields of the grid (GTCRN's sample rate is not one:
+  it is a 16 kHz model).
+- Caller memory for all four: `*_get_mem_size(cfg, &req)` -> memory -> `*_init()` / `_init_ex()`. GTCRN is now a pool-based class
+  (`GTCRNProcess`, `gtcrn_process_config_defaults()`, 32-byte `GTCRNProcessMemReq`), RNNoise-ERB too (`rnnoise_init()`, 24-byte
+  `RNNoiseMemReq`); `dfn2_state_init()`, `dfn3_state_init()` and the model-I/O `_init()` take a block and its size. The class pools no
+  longer carry the framing, FFT, window or recurrent state: the DFN2 pool at the shipped 48 kHz test grid, pair 1/1 (64-bit host)
+  goes 219,648 -> 92,608 bytes and the DFN3 pool 219,472 -> 90,384; GTCRN is 3,328 and RNNoise-ERB (16000/512, 22 bands) 5,600.
+  `DFN2_PREPOST_CARVE_VERSION` 9 -> 11, `DFN3_PREPOST_CARVE_VERSION` 8 -> 9, new `GTCRN_PROCESS_CARVE_VERSION` 1 and
+  `RNNOISE_CARVE_VERSION` 1; the layout versions (DFN2 8 / 9, DFN3 9, GTCRN 8, RNNoise 1) are unchanged.
+- Frequency domain only. The time-domain entries and modes (`DFN2_IO_TIME` / `_IO_FREQ`, `io_mode`, `dfn2_prepost_pre_process()` /
+  `post_process()` and the DFN3 twins), `*_framing_config()`, `*_analysis()` / `*_synthesis()` and the `fft` / `window` / `istft`
+  config fields are removed; `rnnoise_synthesis()` becomes `rnnoise_apply_gains()` (the gain and the `sqrt(n_fft)` scale in place, no
+  inverse FFT). The application runs audiolib's `AcStft` / `AcIstft` with the framing each header states (DFN2/DFN3 and RNNoise-ERB:
+  `spec_scale = grid.stft_scale`; DFN2/DFN3 `ispec_scale = grid.stft_unscale`; GTCRN scales 1.0).
+- Recurrent state belongs to the application. `GTCRNModelState`, `RNNoiseModelState` and their `*_state_*` functions are removed. A
+  float host registers (pointer, element count) pairs in the config (`gru_hidden` / `df_convp_history`, `state[8]` by `GTCRNStateId`,
+  `h1` / `h2` / `h3`); the library zeroes and finite-checks them. A board registers nothing and keeps the state in its accelerator;
+  the state generation (`dfn2_prepost_state_generation()`, `dfn3_prepost_state_generation()`, `gtcrn_process_state_generation()`,
+  `rnnoise_state_generation()`) tells it when to reload quantized zeros.
+- Renames: `dfn2_prepost_frame_inputs()` / `_commit()` / `_skip()` -> `_frame_open()` / `_frame_finish()` / `_frame_bypass()` (DFN3
+  likewise); `dfn2_compose()` / `dfn2_compose_stream()` -> `dfn2_enhance_spectrum()` / `dfn2_enhance_spectrum_stream()` (DFN3
+  likewise). The same renames apply to the Align-ULCNet and DeepVQE-S classes of AIAEC.
+- ERB matrices belong to the application. DFN2, DFN3, GTCRN and RNNoise-ERB take them as two borrowed `const float *` (forward
+  bin-major `[n_bins][n_erb]`, inverse band-major `[n_erb][n_bins]`, float32; GTCRN: the high-band part, `[erb_high_bins][erb_high_bands]`
+  and its transpose) in the config, and DFN2, DFN3 and GTCRN also through `*_set_erb_matrices()`; no library reads a file and the
+  application keeps the matrices alive while they are used. RNNoise-ERB's compiled-in tables are removed (`rnnoise_tables_gen.h`,
+  `gen_rnnoise_tables.c`, `-DRNN_TABLES_PORTABLE`, the two-layer drift guard); its config takes `erb_fwd` / `erb_inv`, and
+  `make -C AINR/RNNoise-ERB test-tables` checks the matrices against an independent recomputation in C.
+- The spec normaliser's start values (`spec_norm_init_lo` .. `spec_norm_init_hi`; DFN2, DFN3, RNNoise-ERB) are held between the two
+  configured ends: with a span wide enough to cancel in float (1.0 to 1e-8) the last bin used to start at 0. The values of the shipped
+  endpoint pairs are unchanged bit for bit (checked for 2 .. 4096 bins); the C tests build both orderings of a wide span and read the
+  seeds after init and after reset.
+- Integration examples (`GTCRN/README.md`, `RNNoise-ERB/README.md` and their usage pages): the GTCRN accelerator callback receives the
+  registered state buffer; the RNNoise example synthesises the spectra that precede the first feature window with unit gains, so the first
+  output hop has its overlap term.
+- Tests: the DFN2 and GTCRN chain digests (`make -C AINR test-simd`) equal the ones before the change, NEON and scalar alike; the
+  DFN3 shipped stream digest is `5b831894`; `make -C AINR test-pairs` runs 915 tests. Cases of retired modes (time mode, capacities,
+  link variants, build-time pairs) are retired or replaced; pool bytes and hash are pinned against an independent Python layout
+  mirror. Not run: a board, an ARM32 build, ASan.
+
+### DFN2Prepost / DFN3Prepost: one flow on every hop (warm-up frames)
+
+- With `frames_per_call` 1 and `mask_lookahead` M >= 1 (DFN3: its `mask_lookahead`), `*_prepost_pre_process_freq()` / `_dual()` returns 1
+  on every hop, where it returned 0 on the first M hops after init or reset. The application runs the same flow on each hop:
+  `pre_process_freq`, `frame_open`, the accelerator, `frame_finish` (`frame_bypass` on failure), `post_process_freq`, the synthesis
+  push; no `ready` variable and no `valid` branch. The first M hops are warm-up frames: `frame_open()` publishes the window as it is
+  (zero-filled at the start) with NaN heads; `frame_finish()` and `frame_bypass()` do not read the heads, advance the frame clock,
+  zero the registered state, advance the state generation by exactly one (also when nothing is registered) and return 0.
+  `dfn2_model_run_frame()` / `dfn3_model_run_frame()` return 1 on a warm-up frame whose `infer()` succeeded, although its heads are
+  discarded. A refused `frame_finish()` of a real frame keeps its old meaning; `*_prepost_reset()` restarts the warm-up.
+- The audio is bit-identical for every grid and every M / D pair: the first real frame still starts from zero state (the zeroing after
+  each warm-up frame replaces the old "no run"). Changed on purpose: the return code of `pre_process_freq` and `frame_open` on those
+  hops, one extra accelerator run per warm-up frame once per stream start (a board's `state_generation_sync` reloads quantized zeros
+  after each, M times in all), and the state generation (1 after init, plus one per reset, per warm-up frame and per refused commit).
+  The post stage is unchanged: `valid` is 0 and the spectrum all zero for the first M + D hops, so with an `AcIstft` in
+  `AC_OLA_ACCUMULATE` mode (the default) the application may push the synthesis on every hop without looking at `valid`; flushing the DFN2
+  tail takes M + D + 1 zero audio hops (DFN3: `output_delay` zero spectra plus the overlap-add hop), the accelerator running on all of them.
+- Unchanged: `frames_per_call` > 1 (the earlier hops still return 0, then one call every N frames, and no frame is a warm-up frame) and M = 0 (no warm-up frame);
+  no symbol, struct size or `DFN2_PREPOST_CARVE_VERSION` (11) / `DFN3_PREPOST_CARVE_VERSION` (9) change. The words "compose" and "composed" are gone from the DFN2 / DFN3
+  public headers and READMEs (the Python `compose()` and `--dfn-compose` identifiers stay); the board samples call `fetch_heads`.
+- Tests: the warm-up frame is open, the heads are discarded even when NaN or garbage, the registered state is zero after it, the
+  generation advances by exactly one, and the next real frame sees the inputs it saw before; the chain digests and the DFN3 stream digest
+  (`5b831894`) are unchanged. The pipelines side is in `pipelines/CHANGELOG.md`.
+
 ### DFN2 grid is a run-time value (`DFN2Grid`, `dfn2_grid.h`)
 
 - The DFN2 C library holds no grid. `DeepFilterNet2/dfn2_grid.h` defines `DFN2Grid` (`sample_rate n_fft hop n_bins n_erb df_bins

@@ -1,34 +1,34 @@
 """DFN2Grid (dfn2_grid.h): a grid is a run-time value the application builds.
 
-The library holds no grid. ``dfn2_grid_make()`` takes the six values a trained model fixes
-(sample rate, fft size, ERB bands, deep-filter bins, the lookahead pair) and derives the rest;
-``dfn2_grid_validate()`` re-derives and compares; ``dfn2_norm_alpha()`` is train.py's
-``make_norm_alpha`` in C. These tests pin:
+The library holds no grid. ``dfn2_grid_make()`` takes what a trained model fixes (sample rate,
+fft size, ERB bands, deep-filter bins and order, the lookahead pair, the frames per call and the
+seven feature-normaliser settings) and derives the rest; ``dfn2_grid_validate()`` re-derives and
+compares; ``dfn2_norm_alpha()`` is train.py's ``make_norm_alpha`` in C. These tests pin:
 
   make / validate  every refusal, in the order the checks run, the grid left untouched by a
                    refusal; the derived fields of the 16, 32 and 48 kHz rows and of two
-                   grids no preset knows; validate refusing a hand-edited derived field
-  capacity         a grid above a build capacity is refused (ERR_CAPACITY) and the same
-                   arguments are accepted once the capacity is raised: the refusal is a
-                   capacity check, not a limit of the arithmetic
-  mask-only        df_bins up to n_bins, no deep-filter lookahead, ring = mask + 1
+                   grids no preset knows; validate refusing a hand-edited derived field, an
+                   alpha included
+  no capacity      sizes no capacity bounds (n_fft 2048 and 8192, 36 bands, 97 and 128
+                   deep-filter bins, a ring of 6 or 7) are accepted; the n_fft rule is
+                   audiolib's
+  mask-only        df_bins up to n_bins, no deep-filter lookahead, ring = mask + 1, any order
+                   stored as 0
   make = validate  what make accepts, validate accepts, over a sweep of sample rates (1 to INT_MAX):
-                   a rate whose norm alpha, as float32, is not inside (0, 1) is ERR_SAMPLE_RATE
+                   a rate whose norm alpha, as float32, is not inside (0, 1) is a normaliser
+                   refusal
   extremes         n_erb of 1 << 30 and 0x7ffffffc (and the largest and smallest ints in every
                    field) are refused with no signed overflow, under -fsanitize=undefined; the
                    gate is shown to fail on the old `2 * n_erb > n_bins`
-  framing          dfn2_framing_config leaves an all-zero config for a refused grid, and the
-                   framing objects ask for 0 bytes for it
-  tap count        -DDFN2_DF_ORDER=<anything> stops the compile of dfn2_grid.h (C11, gnu99)
   alpha            ``dfn2_norm_alpha(sr, hop, tau)`` equals ``make_norm_alpha`` of train.py as
-                   float32, bit for bit, over a sweep of sample rates, hops and taus,
-                   including taus placed one ulp either side of a rounding boundary; the
-                   three shipped alphas are the literals the build-time grid carried
+                   float32, bit for bit, over a sweep of sample rates, hops and taus (the float32
+                   tau the library holds), including taus placed within an ulp of a rounding
+                   boundary; the three shipped alphas are 0.989 / 0.992 / 0.992
   parity           the C features / compose / stream host equal the Python model on every
                    grid, from ONE binary that takes the grid from its arguments
 
-The C programs are built a few at a time and memoised: the probe once per capacity variant,
-the parity wrapper and the stream driver once per SIMD mode.
+The C programs are built a few at a time and memoised: the probe once per variant, the parity
+wrapper and the stream driver once per SIMD mode.
 """
 
 import concurrent.futures
@@ -86,6 +86,57 @@ _PROBE = r'''
 static uint32_t bits_of(float v) { uint32_t u; memcpy(&u, &v, sizeof u); return u; }
 static float float_of(uint32_t u) { float v; memcpy(&v, &u, sizeof v); return v; }
 
+/* The model's order and normaliser settings (config.ini), the spec's fields besides the six
+ * integers of a command. */
+static DFN2GridSpec shipped_spec(void) {
+    DFN2GridSpec spec;
+    memset(&spec, 0, sizeof spec);
+    spec.df_order = @ORDER@;
+    spec.frames_per_call = 1;
+    spec.erb_norm_tau_sec = @ERB_TAU@;
+    spec.erb_norm_init_lo_db = @ERB_LO@;
+    spec.erb_norm_init_hi_db = @ERB_HI@;
+    spec.erb_norm_scale_db = @ERB_SCALE@;
+    spec.spec_norm_tau_sec = @SPEC_TAU@;
+    spec.spec_norm_init_lo = @SPEC_LO@;
+    spec.spec_norm_init_hi = @SPEC_HI@;
+    return spec;
+}
+
+/* "a b c d e f [key=value ...]": the six integers and optional spec fields, floats as hex bit
+ * patterns (so a NaN or an exact tau is expressible). Returns the number of characters used, or
+ * -1. */
+static int parse_spec(const char *text, DFN2GridSpec *spec) {
+    int a, b, c, d, e, f, n = 0;
+    char key[32], value[32];
+    if (sscanf(text, "%d %d %d %d %d %d%n", &a, &b, &c, &d, &e, &f, &n) != 6) return -1;
+    *spec = shipped_spec();
+    spec->sample_rate = a;
+    spec->n_fft = b;
+    spec->n_erb = c;
+    spec->df_bins = d;
+    spec->mask_lookahead = e;
+    spec->df_lookahead = f;
+    for (;;) {
+        int m = 0;
+        float v;
+        if (sscanf(text + n, " %31[a-z_]=%31s%n", key, value, &m) != 2) break;
+        n += m;
+        v = float_of((uint32_t)strtoul(value, NULL, 16));
+        if (!strcmp(key, "order")) spec->df_order = (int)strtol(value, NULL, 10);
+        else if (!strcmp(key, "frames")) spec->frames_per_call = (int)strtol(value, NULL, 10);
+        else if (!strcmp(key, "erb_tau")) spec->erb_norm_tau_sec = v;
+        else if (!strcmp(key, "erb_lo")) spec->erb_norm_init_lo_db = v;
+        else if (!strcmp(key, "erb_hi")) spec->erb_norm_init_hi_db = v;
+        else if (!strcmp(key, "erb_scale")) spec->erb_norm_scale_db = v;
+        else if (!strcmp(key, "spec_tau")) spec->spec_norm_tau_sec = v;
+        else if (!strcmp(key, "spec_lo")) spec->spec_norm_init_lo = v;
+        else if (!strcmp(key, "spec_hi")) spec->spec_norm_init_hi = v;
+        else return -1;
+    }
+    return n;
+}
+
 /* Set one field of a grid: integer fields from a decimal, float fields from a hex bit pattern. */
 static int set_field(DFN2Grid *g, const char *name, const char *value) {
     long iv = strtol(value, NULL, 10);
@@ -96,10 +147,20 @@ static int set_field(DFN2Grid *g, const char *name, const char *value) {
     else if (!strcmp(name, "n_bins")) g->n_bins = (int)iv;
     else if (!strcmp(name, "n_erb")) g->n_erb = (int)iv;
     else if (!strcmp(name, "df_bins")) g->df_bins = (int)iv;
+    else if (!strcmp(name, "df_order")) g->df_order = (int)iv;
     else if (!strcmp(name, "mask_lookahead")) g->mask_lookahead = (int)iv;
     else if (!strcmp(name, "df_lookahead")) g->df_lookahead = (int)iv;
     else if (!strcmp(name, "df_history")) g->df_history = (int)iv;
     else if (!strcmp(name, "ring")) g->ring = (int)iv;
+    else if (!strcmp(name, "frames_per_call")) g->frames_per_call = (int)iv;
+    else if (!strcmp(name, "input_frames")) g->input_frames = (int)iv;
+    else if (!strcmp(name, "erb_norm_tau_sec")) g->erb_norm_tau_sec = float_of(fv);
+    else if (!strcmp(name, "spec_norm_tau_sec")) g->spec_norm_tau_sec = float_of(fv);
+    else if (!strcmp(name, "erb_norm_init_lo_db")) g->erb_norm_init_lo_db = float_of(fv);
+    else if (!strcmp(name, "erb_norm_init_hi_db")) g->erb_norm_init_hi_db = float_of(fv);
+    else if (!strcmp(name, "erb_norm_scale_db")) g->erb_norm_scale_db = float_of(fv);
+    else if (!strcmp(name, "spec_norm_init_lo")) g->spec_norm_init_lo = float_of(fv);
+    else if (!strcmp(name, "spec_norm_init_hi")) g->spec_norm_init_hi = float_of(fv);
     else if (!strcmp(name, "erb_norm_alpha")) g->erb_norm_alpha = float_of(fv);
     else if (!strcmp(name, "spec_norm_alpha")) g->spec_norm_alpha = float_of(fv);
     else if (!strcmp(name, "stft_scale")) g->stft_scale = float_of(fv);
@@ -112,36 +173,43 @@ int main(void) {
     char line[512];
     while (fgets(line, sizeof line, stdin)) {
         char verb[16] = "";
-        int a, b, c, d, e, f;
+        int a;
+        DFN2GridSpec spec;
+        int used;
         if (sscanf(line, "%15s", verb) != 1) continue;
         if (!strcmp(verb, "make")) {
             DFN2Grid g, before;
             int st, vst = 0, untouched = -1;
-            if (sscanf(line, "%*s %d %d %d %d %d %d", &a, &b, &c, &d, &e, &f) != 6) return 2;
+            if (parse_spec(line + 5, &spec) < 0) return 2;
             memset(&g, 0xA5, sizeof g);
             before = g;
-            st = dfn2_grid_make(&g, a, b, c, d, e, f);
+            st = dfn2_grid_make(&g, &spec);
             if (st != 0) untouched = memcmp(&g, &before, sizeof g) == 0;
             else vst = dfn2_grid_validate(&g);
             if (st != 0) memset(&g, 0, sizeof g);
-            printf("make %d %d %d %d %d %d %d %08x %08x %08x %08x %d\n", st, vst, g.hop,
+            printf("make %d %d %d %d %d %d %d %08x %08x %08x %08x %d %d %d\n", st, vst, g.hop,
                    g.n_bins, g.df_history, g.ring, g.n_erb == 0 ? 0 : 1,
                    bits_of(g.erb_norm_alpha), bits_of(g.spec_norm_alpha),
-                   bits_of(g.stft_scale), bits_of(g.stft_unscale), untouched);
+                   bits_of(g.stft_scale), bits_of(g.stft_unscale), untouched, g.df_order,
+                   g.input_frames);
         } else if (!strcmp(verb, "edit")) {
             DFN2Grid g;
             char field[32], value[32];
             int st;
-            if (sscanf(line, "%*s %d %d %d %d %d %d %31s %31s", &a, &b, &c, &d, &e, &f, field,
-                       value) != 8) return 2;
-            st = dfn2_grid_make(&g, a, b, c, d, e, f);
+            used = parse_spec(line + 5, &spec);
+            if (used < 0 || sscanf(line + 5 + used, "%31s %31s", field, value) != 2) return 2;
+            st = dfn2_grid_make(&g, &spec);
             if (st != 0 || set_field(&g, field, value) != 0) {
                 printf("edit %d -99\n", st);
             } else {
                 printf("edit 0 %d\n", dfn2_grid_validate(&g));
             }
         } else if (!strcmp(verb, "null")) {
-            printf("null %d %d\n", dfn2_grid_make(NULL, 16000, 256, 24, 96, 1, 1),
+            DFN2Grid g;
+            spec = shipped_spec();
+            spec.sample_rate = 16000; spec.n_fft = 256; spec.n_erb = 24; spec.df_bins = 96;
+            spec.mask_lookahead = 1; spec.df_lookahead = 1;
+            printf("null %d %d %d\n", dfn2_grid_make(NULL, &spec), dfn2_grid_make(&g, NULL),
                    dfn2_grid_validate(NULL));
         } else if (!strcmp(verb, "text")) {
             const char *t;
@@ -152,51 +220,35 @@ int main(void) {
             int sr, hop;
             double tau;
             if (sscanf(line, "%*s %d %d %lf", &sr, &hop, &tau) != 3) return 2;
-            printf("alpha %08x\n", bits_of(dfn2_norm_alpha(sr, hop, tau)));
-        } else if (!strcmp(verb, "framing")) {
-            /* framing <mode>: dfn2_framing_config() on a config that holds 0xA5 bytes, for a
-             * 16 kHz grid that is valid (valid, borrowed) or invalid in one way. Prints: the
-             * config is all zero bytes, the bytes ac_stft/ac_istft_get_mem_size ask for it
-             * (-1: not asked), fft_size, the two scales, and whether fft / window were taken
-             * over. The pointers handed in are never dereferenced: they stand for objects the
-             * caller owns, and only a valid grid may store them. */
-            char mode[32];
-            DFN2Grid g, *grid = &g;
-            AcStftConfig cfg;
-            FftHandle *fft = (FftHandle *)(uintptr_t)64;
-            const float *window = (const float *)(uintptr_t)64;
-            const unsigned char *raw = (const unsigned char *)&cfg;
-            size_t i, stft_bytes = (size_t)-1, istft_bytes = (size_t)-1;
-            int zero = 1;
-            if (sscanf(line, "%*s %31s", mode) != 1) return 2;
-            if (dfn2_grid_make(&g, 16000, 256, 24, 96, 1, 1) != 0) return 2;
-            if (!strcmp(mode, "null")) grid = NULL;
-            else if (!strcmp(mode, "garbage")) memset(&g, 0xA5, sizeof g);
-            else if (!strcmp(mode, "zeroed")) memset(&g, 0, sizeof g);
-            else if (!strcmp(mode, "ring")) g.ring += 1;
-            else if (!strcmp(mode, "hop")) g.hop += 1;
-            else if (!strcmp(mode, "scale")) g.stft_scale *= 2.0f;
-            else if (!strcmp(mode, "rate")) g.sample_rate = 0;
-            else if (!strcmp(mode, "fft")) g.n_fft = 960;
-            else if (!strcmp(mode, "alpha")) g.erb_norm_alpha = 1.0f;
-            else if (!strcmp(mode, "valid")) { fft = NULL; window = NULL; }
-            else if (strcmp(mode, "borrowed")) return 2;
-            memset(&cfg, 0xA5, sizeof cfg);
-            dfn2_framing_config(&cfg, grid, fft, window);
-            for (i = 0; i < sizeof cfg; ++i) zero &= raw[i] == 0;
-            if (strcmp(mode, "borrowed")) {
-                stft_bytes = ac_stft_get_mem_size(&cfg);
-                istft_bytes = ac_istft_get_mem_size(&cfg);
-            }
-            printf("framing %d %lld %lld %d %08x %08x %d %d\n", zero, (long long)stft_bytes,
-                   (long long)istft_bytes, cfg.fft_size, bits_of(cfg.spec_scale),
-                   bits_of(cfg.ispec_scale), cfg.fft == fft && fft != NULL,
-                   cfg.window == window && window != NULL);
+            printf("alpha %08x\n", bits_of(dfn2_norm_alpha(sr, hop, (float)tau)));
         }
     }
     return 0;
 }
 '''
+
+
+def _probe_source():
+    values = dfn_pairs.dfn2_spec_values()
+    text = _PROBE
+    for token, key in (('ERB_TAU', 'erb_norm_tau_sec'), ('ERB_LO', 'erb_norm_init_lo_db'),
+                       ('ERB_HI', 'erb_norm_init_hi_db'), ('ERB_SCALE', 'erb_norm_scale_db'),
+                       ('SPEC_TAU', 'spec_norm_tau_sec'), ('SPEC_LO', 'spec_norm_init_lo'),
+                       ('SPEC_HI', 'spec_norm_init_hi')):
+        text = text.replace('@%s@' % token, repr(values[key]) + 'f')
+    return text.replace('@ORDER@', str(values['df_order']))
+
+
+def _spec_options(options):
+    """Spec fields of a probe command as ``key=value`` tokens: integers in decimal, floats as the
+    hex bit pattern of the float32 (so a NaN or an exact tau is expressible)."""
+    tokens = []
+    for key, value in (options or {}).items():
+        if key in ('order', 'frames'):
+            tokens.append('%s=%d' % (key, value))
+        else:
+            tokens.append('%s=%08x' % (key, _f32_bits(value)))
+    return ' '.join(tokens)
 
 
 class _Probe:
@@ -213,30 +265,37 @@ class _Probe:
         assert len(out) == len(lines), (len(out), len(lines))
         return out
 
-    def make(self, grid, mask_lookahead, df_lookahead):
-        """dfn2_grid_make(sr, n_fft, n_erb, df_bins, mask, df) -> dict."""
-        return self.make_all([(*grid, mask_lookahead, df_lookahead)])[0]
+    def make(self, grid, mask_lookahead, df_lookahead, **options):
+        """dfn2_grid_make(sr, n_fft, n_erb, df_bins, mask, df, options) -> dict."""
+        return self.make_all([(*grid, mask_lookahead, df_lookahead, options)])[0]
 
     def make_all(self, cases):
+        """Each case: six ints, optionally followed by a dict of spec options (order, frames,
+        erb_tau, erb_lo, erb_hi, erb_scale, spec_tau, spec_lo, spec_hi)."""
         rows = []
-        for line in self.run(['make %d %d %d %d %d %d' % tuple(c)
-                              for c in cases]):
+        lines = []
+        for case in cases:
+            options = case[6] if len(case) > 6 else None
+            lines.append(('make %d %d %d %d %d %d ' % tuple(case[:6])) + _spec_options(options))
+        for line in self.run(lines):
             fields = line.split()
             assert fields[0] == 'make', line
             (status, vstatus, hop, n_bins, df_history, ring, _built,
-             erb_alpha, spec_alpha, scale, unscale, untouched) = fields[1:]
+             erb_alpha, spec_alpha, scale, unscale, untouched, order,
+             input_frames) = fields[1:]
             rows.append(dict(
                 status=int(status), validate=int(vstatus), hop=int(hop),
                 n_bins=int(n_bins), df_history=int(df_history), ring=int(ring),
                 erb_alpha=int(erb_alpha, 16), spec_alpha=int(spec_alpha, 16),
                 scale=int(scale, 16), unscale=int(unscale, 16),
-                untouched=int(untouched)))
+                untouched=int(untouched), order=int(order),
+                input_frames=int(input_frames)))
         return rows
 
     def edit_all(self, edits):
         """[(case, field, value)] -> [(make status, validate status)]."""
         out = []
-        for line in self.run(['edit %d %d %d %d %d %d %s %s' % (*case, field, value)
+        for line in self.run(['edit %d %d %d %d %d %d %s %s' % (*case[:6], field, value)
                               for case, field, value in edits]):
             _verb, make_status, validate_status = line.split()
             out.append((int(make_status), int(validate_status)))
@@ -288,28 +347,23 @@ def builds(tmp_path_factory):
     return _Builds(tmp_path_factory.mktemp('dfn2_grid_builds'))
 
 
-# Capacity variants of the probe. 'wide' raises every capacity the default grids can reach.
-_WIDE = ['-DDFN2_MAX_N_FFT=8192', '-DDFN2_MAX_N_ERB=48', '-DDFN2_MAX_DF_BINS=129',
-         '-DDFN2_MAX_DF_RING=7']
+# The two variants of the probe: the full model and the mask-only one.
 _VARIANTS = {
     'full': [],
-    'full_wide': _WIDE,
     'mask': ['-DDFN2_MASK_ONLY'],
-    'mask_wide': ['-DDFN2_MASK_ONLY', '-DDFN2_MAX_N_FFT=8192', '-DDFN2_MAX_N_ERB=48',
-                  '-DDFN2_MAX_DF_BINS=129', '-DDFN2_MAX_DF_RING=3'],
 }
 
 
 @pytest.fixture(scope='module')
 def probes(builds):
-    specs = [('probe_' + name, _PROBE, flags, 1, ('process',))
+    specs = [('probe_' + name, _probe_source(), flags, 1, ('process',))
              for name, flags in _VARIANTS.items()]
     return dict(zip(_VARIANTS, map(_Probe, builds.programs(specs))))
 
 
-# Status codes (dfn2_grid.h).
-OK, ERR_NULL, ERR_SR, ERR_FFT, ERR_ERB, ERR_DF, ERR_MASK, ERR_DFLA, ERR_CAP, ERR_INC = (
-    0, -1, -2, -3, -4, -5, -6, -7, -8, -9)
+# Status codes (dfn2_grid.h; -8 is unassigned).
+(OK, ERR_NULL, ERR_SR, ERR_FFT, ERR_ERB, ERR_DF, ERR_MASK, ERR_DFLA, ERR_INC, ERR_ORDER,
+ ERR_FRAMES, ERR_ERB_NORM, ERR_SPEC_NORM) = (0, -1, -2, -3, -4, -5, -6, -7, -9, -10, -11, -12, -13)
 
 # name -> (sample rate, n_fft, n_erb, df_bins): the three shipped rows and two grids no
 # preset knows (a 24 kHz model, a 16 kHz model with a narrower deep filter).
@@ -349,6 +403,7 @@ def test_make_derives_the_grid(probes, dfn_py, name, pair):
     scale, unscale = _scales(n_fft)
     assert got['status'] == OK and got['validate'] == OK, got
     assert (got['hop'], got['n_bins']) == (hop, n_fft // 2 + 1)
+    assert (got['order'], got['input_frames']) == (DF_ORDER, 3)
     assert got['df_history'] == DF_ORDER - pair[1] - 1
     assert got['ring'] == max(DF_ORDER, pair[0] + pair[1] + 1)
     assert got['erb_alpha'] == alpha and got['spec_alpha'] == alpha, (
@@ -359,8 +414,8 @@ def test_make_derives_the_grid(probes, dfn_py, name, pair):
     assert got['scale'] == _expect_f32(train.analysis_scale(n_fft, n_fft, hop))
 
 
-def test_the_shipped_rows_carry_the_literals_of_the_build_time_grid(probes):
-    """The 48 / 32 / 16 kHz rows used to be 0.989f / 0.992f / 0.992f in the header."""
+def test_the_shipped_rows_carry_the_alphas_of_their_models(probes):
+    """The 48 / 32 / 16 kHz rows of the shipped normaliser (tau 1 s) are 0.989 / 0.992 / 0.992."""
     want = {'48k': 0.989, '32k': 0.992, '16k': 0.992}
     for name, literal in want.items():
         got = probes['full'].make(GRIDS[name], 1, 1)
@@ -371,13 +426,8 @@ def test_the_shipped_rows_carry_the_literals_of_the_build_time_grid(probes):
 
 
 def test_scales_are_exact_float32_for_every_legal_fft_size(probes):
-    cases = [(16000, n, 4, 2, 0, 0) for n in (16, 32, 64, 128, 256, 512, 1024)]
+    cases = [(16000, n, 4, 2, 0, 0) for n in (16, 32, 64, 128, 256, 512, 1024, 2048, 4096, 8192)]
     for case, got in zip(cases, probes['full'].make_all(cases)):
-        assert got['status'] == OK, (case, got)
-        assert (got['scale'], got['unscale']) == _scales(case[1]), case
-    # Beyond the default capacity: the wide build covers 2048 .. 8192.
-    cases = [(16000, n, 4, 2, 0, 0) for n in (2048, 4096, 8192)]
-    for case, got in zip(cases, probes['full_wide'].make_all(cases)):
         assert got['status'] == OK, (case, got)
         assert (got['scale'], got['unscale']) == _scales(case[1]), case
 
@@ -386,7 +436,7 @@ def test_scales_are_exact_float32_for_every_legal_fft_size(probes):
 # every refusal
 # ---------------------------------------------------------------------------
 
-# (case, expected status), full variant with the default capacities.
+# (case, expected status), full variant. n_fft is audiolib's rule: a power of two in [16, 8192].
 _REFUSALS = [
     # sample rate
     ((0, 256, 24, 96, 1, 1), ERR_SR),
@@ -413,6 +463,7 @@ _REFUSALS = [
     ((16000, 256, 68, 96, 1, 1), ERR_ERB),       # 2 * 68 > 129 bins
     ((16000, 64, 20, 4, 0, 0), ERR_ERB),         # 2 * 20 > 33 bins
     ((16000, 16, 8, 4, 0, 0), ERR_ERB),          # 2 * 8 > 9 bins
+    ((48000, 1024, 33, 96, 1, 1), ERR_ERB),      # one band more than a multiple of four
     # so large that 2 * n_erb does not fit an int: a refusal, not undefined behaviour
     ((16000, 256, 1 << 30, 96, 1, 1), ERR_ERB),
     ((16000, 256, 0x7ffffffc, 96, 1, 1), ERR_ERB),    # the largest multiple of four
@@ -425,20 +476,11 @@ _REFUSALS = [
     ((16000, 256, 24, 129, 1, 1), ERR_DF),       # df_bins == n_bins: nothing left for the mask
     ((16000, 256, 24, 130, 1, 1), ERR_DF),
     ((16000, 64, 16, 33, 1, 1), ERR_DF),
-    # lookahead pair
+    # lookahead pair (the order is 5: df_lookahead in [0, 4])
     ((16000, 256, 24, 96, -1, 1), ERR_MASK),
     ((16000, 256, 24, 96, 3, 1), ERR_MASK),
     ((16000, 256, 24, 96, 1, -1), ERR_DFLA),
     ((16000, 256, 24, 96, 1, 5), ERR_DFLA),
-    # capacity (the default build: 1024 / 32 / 96 / ring 5)
-    ((48000, 2048, 32, 96, 1, 1), ERR_CAP),
-    ((48000, 8192, 32, 96, 1, 1), ERR_CAP),
-    ((48000, 1024, 36, 96, 1, 1), ERR_CAP),
-    ((48000, 1024, 32, 97, 1, 1), ERR_CAP),
-    ((48000, 1024, 32, 128, 1, 1), ERR_CAP),     # df_bins < n_bins but above the capacity
-    ((48000, 1024, 32, 96, 2, 3), ERR_CAP),      # ring 6
-    ((48000, 1024, 32, 96, 2, 4), ERR_CAP),      # ring 7
-    ((48000, 1024, 32, 96, 1, 4), ERR_CAP),      # ring 6
     # the order of the checks: the first failing one is reported
     ((0, 3, 3, 1, 9, 9), ERR_SR),
     ((16000, 3, 3, 1, 9, 9), ERR_FFT),
@@ -446,20 +488,68 @@ _REFUSALS = [
     ((16000, 256, 24, 1, 9, 9), ERR_DF),
     ((16000, 256, 24, 96, 9, 9), ERR_MASK),
     ((16000, 256, 24, 96, 1, 9), ERR_DFLA),
-    ((48000, 4096, 32, 96, 1, 9), ERR_DFLA),     # a bad lookahead before the capacity
-    ((48000, 4096, 32, 96, 1, 1), ERR_CAP),
+    ((48000, 4096, 32, 96, 1, 9), ERR_DFLA),
+]
+
+# (case with options, expected status): the fields the model config fixes besides the six
+# integers. Everything is checked after the six, in the order order, mask, df lookahead, frames,
+# ERB normaliser, spec normaliser.
+_NAN = float('nan')
+_INF = float('inf')
+_SPEC_REFUSALS = [
+    ((16000, 256, 24, 96, 1, 1, {'order': 0}), ERR_ORDER),
+    ((16000, 256, 24, 96, 1, 1, {'order': -1}), ERR_ORDER),
+    ((16000, 256, 24, 96, 1, 1, {'order': 17}), ERR_ORDER),
+    ((16000, 256, 24, 96, 1, 1, {'order': 2}), OK),           # df_lookahead 1 < 2
+    ((16000, 256, 24, 96, 1, 2, {'order': 2}), ERR_DFLA),     # df_lookahead must stay below it
+    ((16000, 256, 24, 96, 1, 1, {'order': 16}), OK),
+    ((16000, 256, 24, 96, 1, 1, {'frames': 0}), ERR_FRAMES),
+    ((16000, 256, 24, 96, 1, 1, {'frames': -1}), ERR_FRAMES),
+    ((16000, 256, 24, 96, 1, 1, {'frames': 65}), ERR_FRAMES),
+    ((16000, 256, 24, 96, 1, 1, {'frames': 64}), OK),
+    ((16000, 256, 24, 96, 1, 1, {'erb_tau': 0.0}), ERR_ERB_NORM),
+    ((16000, 256, 24, 96, 1, 1, {'erb_tau': -1.0}), ERR_ERB_NORM),
+    ((16000, 256, 24, 96, 1, 1, {'erb_tau': _NAN}), ERR_ERB_NORM),
+    ((16000, 256, 24, 96, 1, 1, {'erb_tau': _INF}), ERR_ERB_NORM),
+    ((16000, 256, 24, 96, 1, 1, {'erb_tau': 1e-9}), ERR_ERB_NORM),    # alpha rounds to 0
+    ((16000, 256, 24, 96, 1, 1, {'erb_tau': 1e9}), ERR_ERB_NORM),     # alpha rounds to 1
+    ((16000, 256, 24, 96, 1, 1, {'erb_lo': _NAN}), ERR_ERB_NORM),
+    ((16000, 256, 24, 96, 1, 1, {'erb_hi': -_INF}), ERR_ERB_NORM),
+    ((16000, 256, 24, 96, 1, 1, {'erb_scale': 0.0}), ERR_ERB_NORM),
+    ((16000, 256, 24, 96, 1, 1, {'erb_scale': -40.0}), ERR_ERB_NORM),
+    ((16000, 256, 24, 96, 1, 1, {'erb_scale': _NAN}), ERR_ERB_NORM),
+    ((16000, 256, 24, 96, 1, 1, {'erb_lo': 5.0, 'erb_hi': -5.0}), OK),   # no ordering rule
+    ((16000, 256, 24, 96, 1, 1, {'spec_tau': 0.0}), ERR_SPEC_NORM),
+    ((16000, 256, 24, 96, 1, 1, {'spec_tau': _NAN}), ERR_SPEC_NORM),
+    ((16000, 256, 24, 96, 1, 1, {'spec_tau': 1e9}), ERR_SPEC_NORM),
+    ((16000, 256, 24, 96, 1, 1, {'spec_lo': 0.0}), ERR_SPEC_NORM),
+    ((16000, 256, 24, 96, 1, 1, {'spec_lo': -0.001}), ERR_SPEC_NORM),
+    ((16000, 256, 24, 96, 1, 1, {'spec_lo': _NAN}), ERR_SPEC_NORM),
+    ((16000, 256, 24, 96, 1, 1, {'spec_hi': 0.0}), ERR_SPEC_NORM),
+    ((16000, 256, 24, 96, 1, 1, {'spec_hi': _INF}), ERR_SPEC_NORM),
+    # the order of the checks: order, then mask, then df lookahead, then frames, then the ERB
+    # normaliser, then the spectrum one
+    ((16000, 256, 24, 96, 9, 9, {'order': 0, 'frames': 0}), ERR_ORDER),
+    ((16000, 256, 24, 96, 9, 1, {'frames': 0, 'erb_tau': 0.0}), ERR_MASK),
+    ((16000, 256, 24, 96, 1, 9, {'frames': 0}), ERR_DFLA),
+    ((16000, 256, 24, 96, 1, 1, {'frames': 0, 'erb_tau': 0.0}), ERR_FRAMES),
+    ((16000, 256, 24, 96, 1, 1, {'erb_tau': 0.0, 'spec_tau': 0.0}), ERR_ERB_NORM),
 ]
 
 
 def test_every_refusal_reports_its_status_and_leaves_the_grid_alone(probes):
-    cases = [case for case, _status in _REFUSALS]
-    for (case, want), got in zip(_REFUSALS, probes['full'].make_all(cases)):
+    cases = [case for case, _status in _REFUSALS + _SPEC_REFUSALS]
+    for (case, want), got in zip(_REFUSALS + _SPEC_REFUSALS, probes['full'].make_all(cases)):
         assert got['status'] == want, (case, got)
-        assert got['untouched'] == 1, ('a refused grid was written', case)
+        if want != OK:
+            assert got['untouched'] == 1, ('a refused grid was written', case)
+        else:
+            assert got['validate'] == OK, ('make accepted a grid validate refuses', case, got)
 
 
 def test_the_refusals_are_not_vacuous(probes):
-    """One step inside each boundary, and the boundary itself, are accepted."""
+    """One step inside each boundary, and the boundary itself, are accepted; so is every size a
+    capacity bounds."""
     accepted = [
         (16000, 16, 4, 2, 0, 0),       # smallest legal frame, band count, df_bins
         (16000, 16, 4, 8, 0, 0),       # df_bins = n_bins - 1
@@ -468,27 +558,26 @@ def test_the_refusals_are_not_vacuous(probes):
         (16000, 256, 24, 96, 0, 0),
         (16000, 256, 24, 96, 2, 0),
         (16000, 256, 24, 96, 0, 4),
-        (48000, 1024, 32, 96, 2, 2),   # ring 5, every capacity exactly met
+        (48000, 1024, 32, 96, 2, 2),
         (16000, 256, 16, 96, 1, 1),
+        # no capacity: larger frames, more bands, more deep-filter bins, deeper rings
+        (48000, 2048, 32, 96, 1, 1),
+        (48000, 8192, 32, 96, 1, 1),
+        (48000, 1024, 36, 96, 1, 1),
+        (48000, 1024, 32, 97, 1, 1),
+        (48000, 1024, 32, 128, 1, 1),
+        (48000, 1024, 32, 96, 2, 3),   # ring 6
+        (48000, 1024, 32, 96, 2, 4),   # ring 7
+        (48000, 1024, 32, 96, 1, 4),   # ring 6
     ]
     for case, got in zip(accepted, probes['full'].make_all(accepted)):
         assert got['status'] == OK and got['validate'] == OK, (case, got)
-    # The refused capacity cases are accepted once the capacity is raised: the grids are
-    # fine, the build was not sized for them.
-    raised = [case for case, status in _REFUSALS if status == ERR_CAP]
-    assert len(raised) == 9
-    for case, got in zip(raised, probes['full_wide'].make_all(raised)):
-        assert got['status'] == OK and got['validate'] == OK, (case, got)
-    # ... and the wide build still refuses what is not a capacity matter.
-    for case, want in _REFUSALS:
-        if want not in (ERR_CAP,):
-            got = probes['full_wide'].make(case[:4], *case[4:])
-            assert got['status'] == want, (case, got)
+    assert [g['ring'] for g in probes['full'].make_all(accepted[-3:])] == [6, 7, 6]
 
 
 def test_a_null_grid_is_refused(probes):
     (line,) = probes['full'].run(['null'])
-    assert line == 'null %d %d' % (ERR_NULL, ERR_NULL)
+    assert line == 'null %d %d %d' % (ERR_NULL, ERR_NULL, ERR_NULL)
 
 
 # ---------------------------------------------------------------------------
@@ -514,22 +603,22 @@ def _sweep_rates():
 
 
 def _alpha_status(train, sample_rate, n_fft):
-    """What dfn2_grid_make must return for an otherwise legal grid: the sample rate is refused
+    """What dfn2_grid_make must return for an otherwise legal grid: the normaliser is refused
     exactly when the trainer's make_norm_alpha, as float32, is not strictly inside (0, 1)."""
     alpha = np.float32(train.make_norm_alpha(sample_rate, n_fft // 2, 1.0))
-    return OK if 0.0 < alpha < 1.0 else ERR_SR
+    return OK if 0.0 < alpha < 1.0 else ERR_ERB_NORM
 
 
 def test_make_ok_implies_validate_ok_over_a_sweep_of_sample_rates(probes, dfn_py):
-    """The review finding: dfn2_grid_make derived an alpha of 0 or 1 and returned OK for a grid
-    that dfn2_grid_validate (and so every entry point) then refuses. Now make refuses it with
-    ERR_SAMPLE_RATE, and the two agree on every rate: OK from make is OK from validate, and a
-    refusal is exactly an alpha outside (0, 1) as the trainer computes it, in float32."""
+    """dfn2_grid_make must not return OK for a grid whose alpha is 0 or 1, which
+    dfn2_grid_validate (and so every entry point) refuses. The two agree on every rate: OK from
+    make is OK from validate, and a refusal is exactly an alpha outside (0, 1) as the trainer
+    computes it, in float32."""
     _model, train, _export = dfn_py
     cases = [(sr, n_fft, *_RATE_SWEEP_GRIDS[n_fft], 1, 1)
              for sr in _sweep_rates() for n_fft in _RATE_SWEEP_GRIDS]
     assert len(cases) > 700
-    outcomes = {OK: 0, ERR_SR: 0}
+    outcomes = {OK: 0, ERR_ERB_NORM: 0}
     for case, got in zip(cases, probes['full'].make_all(cases)):
         want = _alpha_status(train, case[0], case[1])
         assert got['status'] == want, (case, got, want)
@@ -539,19 +628,19 @@ def test_make_ok_implies_validate_ok_over_a_sweep_of_sample_rates(probes, dfn_py
             assert got['untouched'] == 1, ('a refused grid was written', case)
         outcomes[want] += 1
     # Not vacuous: both outcomes occur (low rates at a large hop and the top of the range).
-    assert outcomes[OK] > 400 and outcomes[ERR_SR] > 20, outcomes
+    assert outcomes[OK] > 400 and outcomes[ERR_ERB_NORM] > 20, outcomes
 
 
 def test_the_rates_the_review_named_are_decided_by_the_alpha(probes, dfn_py):
-    """sr 1, 16, 67 and INT_MAX at n_fft 16 / 256 / 1024: refused (ERR_SAMPLE_RATE) where the
+    """sr 1, 16, 67 and INT_MAX at n_fft 16 / 256 / 1024: refused (the normaliser) where the
     rounded alpha is 0 (a rate far below the hop rate) or reaches 1.0f (INT_MAX with a short
     hop), accepted otherwise. The expectation is written out, not only derived."""
     _model, train, _export = dfn_py
     want = {
-        (1, 16): ERR_SR, (1, 256): ERR_SR, (1, 1024): ERR_SR,           # exp(-hop) rounds to 0
-        (16, 16): OK, (16, 256): ERR_SR, (16, 1024): ERR_SR,
-        (67, 16): OK, (67, 256): OK, (67, 1024): ERR_SR,                # exp(-512/67) < 5e-4
-        (INT_MAX, 16): ERR_SR,                                          # 0.99999999627 -> 1.0f
+        (1, 16): ERR_ERB_NORM, (1, 256): ERR_ERB_NORM, (1, 1024): ERR_ERB_NORM,   # exp(-hop) -> 0
+        (16, 16): OK, (16, 256): ERR_ERB_NORM, (16, 1024): ERR_ERB_NORM,
+        (67, 16): OK, (67, 256): OK, (67, 1024): ERR_ERB_NORM,          # exp(-512/67) < 5e-4
+        (INT_MAX, 16): ERR_ERB_NORM,                                    # 0.99999999627 -> 1.0f
         (INT_MAX, 256): OK, (INT_MAX, 1024): OK,
     }
     cases = [(sr, n_fft, *_RATE_SWEEP_GRIDS[n_fft], 1, 1) for sr, n_fft in want]
@@ -601,7 +690,7 @@ def ubsan_probe(builds):
     why = _ubsan_unusable(builds.work)
     if why:
         pytest.skip('UBSan unusable on this host: ' + why)
-    return _Probe(builds.program('probe_ubsan', _PROBE, _UBSAN, 1, ('process',)))
+    return _Probe(builds.program('probe_ubsan', _probe_source(), _UBSAN, 1, ('process',)))
 
 
 def test_the_extremes_of_make_and_validate_run_clean_under_ubsan(ubsan_probe, probes, dfn_py):
@@ -609,8 +698,8 @@ def test_the_extremes_of_make_and_validate_run_clean_under_ubsan(ubsan_probe, pr
     sweep and the largest and smallest ints in every field) give their status, with no signed
     overflow: `2 * n_erb > n_bins` overflowed for n_erb >= 2^30."""
     _model, train, _export = dfn_py
-    cases = [case for case, _status in _REFUSALS]
-    wants = [status for _case, status in _REFUSALS]
+    cases = [case for case, _status in _REFUSALS + _SPEC_REFUSALS]
+    wants = [status for _case, status in _REFUSALS + _SPEC_REFUSALS]
     for n_erb in (1 << 30, 0x7ffffffc, INT_MAX, -(1 << 31), 0x7ffffff8):
         for n_fft in (16, 256, 1024, 8192, INT_MAX):
             cases.append((16000, n_fft, n_erb, 96, 1, 1))
@@ -622,6 +711,11 @@ def test_the_extremes_of_make_and_validate_run_clean_under_ubsan(ubsan_probe, pr
             case[field] = extreme
             cases.append(tuple(case))
             wants.append(probes['full'].make(case[:4], *case[4:])['status'])
+    for key in ('order', 'frames'):
+        for extreme in (INT_MAX, -(1 << 31), 0):
+            case = (16000, 256, 24, 96, 1, 1, {key: extreme})
+            cases.append(case)
+            wants.append(ERR_ORDER if key == 'order' else ERR_FRAMES)
     cases += [(sr, n_fft, *_RATE_SWEEP_GRIDS[n_fft], 1, 1)
               for sr in _sweep_rates() for n_fft in _RATE_SWEEP_GRIDS]
     wants += [_alpha_status(train, c[0], c[1]) for c in cases[len(wants):]]
@@ -634,13 +728,13 @@ def test_the_extremes_of_make_and_validate_run_clean_under_ubsan(ubsan_probe, pr
                            'df_lookahead')
              for value in (1 << 30, 0x7ffffffc, INT_MAX, -(1 << 31))]
     edits += [(case, field, value)
-              for field in ('hop', 'n_bins', 'df_history', 'ring')
+              for field in ('hop', 'n_bins', 'df_history', 'ring', 'input_frames', 'df_order',
+                            'frames_per_call')
               for value in (INT_MAX, -(1 << 31))]
     for (_case, field, value), got, ref in zip(edits, ubsan_probe.edit_all(edits),
                                                probes['full'].edit_all(edits)):
         assert got == ref and got[0] == OK, (field, value, got, ref)
-        if field != 'sample_rate':       # (a rate edited on a made grid can stay valid: the
-            assert got[1] != OK, (field, value, got)         # alphas are the model's)
+        assert got[1] != OK, (field, value, got)
     # the alpha helper on awkward arguments: zero, infinity, subnormal and huge taus
     lines = ubsan_probe.run(['alpha %d %d %r' % c for c in [
         (16000, 128, 1e-300), (16000, 128, 1e300), (16000, 128, float('inf')),
@@ -653,12 +747,12 @@ def test_the_ubsan_gate_can_fail(builds, ubsan_probe, tmp_path):
     """The same cases against a copy of dfn2_process.c with the old `2 * n_erb > n_bins`
     abort under the sanitizer, naming the signed overflow; the shipped file does not."""
     source = (DFN2 / 'dfn2_process.c').read_text(encoding='utf-8')
-    fixed = 'n_erb > n_bins / 2'
+    fixed = 'spec->n_erb > n_bins / 2'
     assert source.count(fixed) == 1, 'the overflow-free form is gone: update this mutation'
     mutated = tmp_path / 'dfn2_process.c'
-    mutated.write_text(source.replace(fixed, '2 * n_erb > n_bins'), encoding='utf-8')
+    mutated.write_text(source.replace(fixed, '2 * spec->n_erb > n_bins'), encoding='utf-8')
     probe_source = tmp_path / 'probe.c'
-    probe_source.write_text(_PROBE, encoding='utf-8')
+    probe_source.write_text(_probe_source(), encoding='utf-8')
     exe = tmp_path / 'probe_mutated'
     done = _cc([*dfn_pairs.house_cflags(1), *_UBSAN, '-I', str(DFN2), str(probe_source),
                 str(mutated), dfn_pairs.audio_common_lib(1), '-lm', '-o', str(exe)])
@@ -670,87 +764,6 @@ def test_the_ubsan_gate_can_fail(builds, ubsan_probe, tmp_path):
         clean = subprocess.run([str(ubsan_probe.exe)], input=case + '\n', capture_output=True,
                                text=True)
         assert clean.returncode == 0 and clean.stdout.split()[1] == str(ERR_ERB), (case, clean)
-
-
-# ---------------------------------------------------------------------------
-# dfn2_framing_config: a grid the library refuses gives no framing
-# ---------------------------------------------------------------------------
-
-_FRAMING_REFUSED = ['null', 'garbage', 'zeroed', 'ring', 'hop', 'scale', 'rate', 'fft', 'alpha']
-
-
-def _framing(probe, modes):
-    rows = {}
-    for mode, line in zip(modes, probe.run(['framing ' + m for m in modes])):
-        verb, *fields = line.split()
-        assert verb == 'framing', line
-        zero, stft, istft, fft_size, spec, ispec, fft_taken, window_taken = fields
-        rows[mode] = dict(zero=int(zero), stft=int(stft), istft=int(istft),
-                          fft_size=int(fft_size), spec=int(spec, 16), ispec=int(ispec, 16),
-                          fft=int(fft_taken), window=int(window_taken))
-    return rows
-
-
-def test_framing_config_of_a_refused_grid_is_zero_and_sizes_nothing(probes):
-    """A NULL grid, an uninitialised one and a made grid with one derived field edited
-    (ring, hop, scale), one given field gone bad (rate, frame size) or an alpha outside (0, 1)
-    all leave an all-zero AcStftConfig behind -- even over a config that held other bytes, and
-    without taking over the FFT handle or window passed in -- and the framing objects ask for
-    0 bytes for it, so a caller that ignores the missing status cannot build them."""
-    rows = _framing(probes['full'], _FRAMING_REFUSED)
-    for mode, row in rows.items():
-        assert row == dict(zero=1, stft=0, istft=0, fft_size=0, spec=0, ispec=0, fft=0,
-                           window=0), (mode, row)
-
-
-def test_framing_config_of_a_valid_grid_describes_its_framing(probes):
-    """The control of the test above: the 16 kHz grid gives a 256-point config with the grid's
-    two scales, takes over the FFT handle and window it is given, and sizes both objects."""
-    rows = _framing(probes['full'], ['valid', 'borrowed'])
-    scale, unscale = _scales(256)
-    valid, borrowed = rows['valid'], rows['borrowed']
-    assert (valid['zero'], valid['fft_size'], valid['spec'], valid['ispec']) == (
-        0, 256, scale, unscale), valid
-    assert valid['stft'] > 0 and valid['istft'] > 0, valid
-    assert (valid['fft'], valid['window']) == (0, 0)             # NULL: the objects carve their own
-    assert (borrowed['zero'], borrowed['fft_size'], borrowed['spec'], borrowed['ispec']) == (
-        0, 256, scale, unscale), borrowed
-    assert (borrowed['fft'], borrowed['window']) == (1, 1)       # the caller's, taken over
-
-
-# ---------------------------------------------------------------------------
-# the tap count is not a grid choice
-# ---------------------------------------------------------------------------
-
-_ORDER_TU = '#include "dfn2_grid.h"\n'
-_ORDER_MESSAGE = 'DFN2_DF_ORDER is fixed at 5'
-
-
-@pytest.mark.parametrize('std', ['c11', 'gnu99'])
-@pytest.mark.parametrize('order', [3, 4, 5, 7])
-def test_defining_the_deep_filter_order_stops_the_compile(tmp_path, std, order):
-    """The graph's pathway window, the state layout and every ring depth are built for five
-    taps, so dfn2_grid.h refuses any definition of DFN2_DF_ORDER -- another order, and the shipped
-    value too, because the guard is `#ifdef`, not a comparison -- in C11 and in gnu99 (the
-    integration build). A translation unit that only includes the header is enough."""
-    source = tmp_path / 'order.c'
-    source.write_text(_ORDER_TU, encoding='utf-8')
-    done = _cc(['-std=' + std, '-fsyntax-only', '-I', str(DFN2), '-DDFN2_DF_ORDER=%d' % order,
-                str(source)])
-    assert done.returncode != 0, 'DFN2_DF_ORDER=%d was accepted' % order
-    assert _ORDER_MESSAGE in done.stderr, done.stderr
-
-
-@pytest.mark.parametrize('std', ['c11', 'gnu99'])
-def test_the_deep_filter_order_guard_is_not_vacuous(tmp_path, std):
-    """The same translation unit without the definition compiles, under -Wall -Wextra
-    -Wpedantic -Werror, and the library's order is five."""
-    source = tmp_path / 'order.c'
-    source.write_text(_ORDER_TU + 'typedef char order_is_five[DFN2_DF_ORDER == 5 ? 1 : -1];\n',
-                      encoding='utf-8')
-    done = _cc(['-std=' + std, '-fsyntax-only', '-Wall', '-Wextra', '-Wpedantic', '-Werror',
-                '-I', str(DFN2), str(source)])
-    assert done.returncode == 0, done.stderr
 
 
 # ---------------------------------------------------------------------------
@@ -779,7 +792,12 @@ def test_validate_refuses_a_hand_edited_derived_field(probes):
                 ('stft_unscale', _hex(unscale + 1)), ('stft_unscale', _hex(unscale - 1)),
                 ('stft_unscale', _hex(scale)), ('stft_unscale', '7f800000'),
                 ('stft_unscale', '00000000'),
-                # the alphas: finite and strictly inside (0, 1)
+                ('input_frames', 2), ('input_frames', 4), ('input_frames', 0),
+                ('df_order', 4), ('df_order', 6),
+                # the alphas are derived from the taus: any other value is refused
+                ('erb_norm_alpha', _hex(_f32_bits(float(np.float32(0.5))))),
+                ('spec_norm_alpha', _hex(_f32_bits(float(np.float32(0.979))))),
+                ('erb_norm_alpha', '3f7fffff'), ('spec_norm_alpha', '00000001'),
                 ('erb_norm_alpha', '00000000'), ('spec_norm_alpha', '00000000'),
                 ('erb_norm_alpha', _hex(_f32_bits(1.0))),
                 ('spec_norm_alpha', _hex(_f32_bits(1.0))),
@@ -802,38 +820,50 @@ def test_validate_refuses_a_hand_edited_derived_field(probes):
         (case16, 'n_erb', 30, ERR_ERB), (case16, 'df_bins', 1, ERR_DF),
         (case16, 'df_bins', 129, ERR_DF), (case16, 'mask_lookahead', 3, ERR_MASK),
         (case16, 'df_lookahead', 5, ERR_DFLA), (case16, 'df_lookahead', -1, ERR_DFLA),
-        (case48, 'n_fft', 2048, ERR_CAP), (case48, 'n_erb', 36, ERR_CAP),
+        (case16, 'frames_per_call', 0, ERR_FRAMES), (case16, 'frames_per_call', 65, ERR_FRAMES),
+        (case16, 'erb_norm_tau_sec', '00000000', ERR_ERB_NORM),
+        (case16, 'erb_norm_init_hi_db', '7fc00000', ERR_ERB_NORM),
+        (case16, 'erb_norm_scale_db', '00000000', ERR_ERB_NORM),
+        (case16, 'spec_norm_tau_sec', '80000000', ERR_SPEC_NORM),
+        (case16, 'spec_norm_init_lo', '00000000', ERR_SPEC_NORM),
+        (case16, 'spec_norm_init_hi', '7f800000', ERR_SPEC_NORM),
         # A legal fft size on a grid derived for another one: the derived fields are stale.
-        (case48, 'n_fft', 512, ERR_INC), (case16, 'n_fft', 512, ERR_INC),
-        (case16, 'n_fft', 128, ERR_DF),          # 96 bins no longer fit below 65
+        (case48, 'n_fft', 2048, ERR_INC), (case48, 'n_fft', 512, ERR_INC),
+        (case16, 'n_fft', 512, ERR_INC),
+        (case16, 'n_fft', 128, ERR_DF),          # 96 bins do not fit below 65
     ]
     for (case, field, value, want), (make_status, status) in zip(
             refused, probes['full'].edit_all([r[:3] for r in refused])):
         assert (make_status, status) == (OK, want), (case, field, value, status)
 
 
-def test_validate_accepts_a_retuned_alpha_and_other_valid_edits(probes):
-    """The alphas are the model's: a tau other than 1.0 is a legal grid. A given field moved
-    to another legal value is consistent as long as the derived fields still follow."""
+def test_validate_accepts_the_given_fields_moved_to_other_legal_values(probes):
+    """A given field moved to another legal value is consistent as long as the derived fields
+    still follow: the bands, the deep-filter bins, the lookahead within the ring, the
+    normaliser starts and scale. The alphas are not the model's to edit (they follow the taus
+    and the sample rate), so a retuned tau or rate on a made grid leaves a stale alpha."""
     case = (*GRIDS['48k'], 1, 1)
-    ok_alphas = [_hex(_f32_bits(float(np.float32(a))))
-                 for a in (0.5, 0.979, 0.989, 0.999, 0.9999999)]
-    ok_alphas += ['3f7fffff', '00000001', '00800000']   # just below 1.0; denormal; smallest normal
-    edits = []
-    for alpha in ok_alphas:
-        edits += [(case, 'erb_norm_alpha', alpha), (case, 'spec_norm_alpha', alpha)]
-    edits += [(case, 'n_erb', 28), (case, 'df_bins', 64), (case, 'df_bins', 2),
-              (case, 'mask_lookahead', 0), (case, 'mask_lookahead', 2),
-              (case, 'sample_rate', 44100)]
+    edits = [(case, 'n_erb', 28), (case, 'n_erb', 36), (case, 'df_bins', 64),
+             (case, 'df_bins', 97), (case, 'df_bins', 2), (case, 'mask_lookahead', 0),
+             (case, 'mask_lookahead', 2),
+             (case, 'erb_norm_init_lo_db', _hex(_f32_bits(-70.0))),
+             (case, 'erb_norm_scale_db', _hex(_f32_bits(30.0))),
+             (case, 'spec_norm_init_lo', _hex(_f32_bits(0.002))),
+             (case, 'spec_norm_init_hi', _hex(_f32_bits(0.0002)))]
     for (_case, field, value), (make_status, status) in zip(
             edits, probes['full'].edit_all(edits)):
         assert (make_status, status) == (OK, OK), (field, value, status)
+    stale = [(case, 'sample_rate', 44100),
+             (case, 'erb_norm_tau_sec', _hex(_f32_bits(0.5))),
+             (case, 'spec_norm_tau_sec', _hex(_f32_bits(0.5)))]
+    for (_case, field, value), (make_status, status) in zip(
+            stale, probes['full'].edit_all(stale)):
+        assert (make_status, status) == (OK, ERR_INC), (field, value, status)
     # A lookahead edited on a grid whose derived fields were made for the other one.
     (_make, status), = probes['full'].edit_all([((*GRIDS['16k'], 0, 2), 'df_lookahead', 1)])
-    assert status == ERR_INC             # df_history 2 was left behind (3 now)
-    # ... and one that deepens the ring (a build whose ring capacity allows it).
-    (_make, status), = probes['full_wide'].edit_all(
-        [((*GRIDS['16k'], 2, 2), 'df_lookahead', 3)])
+    assert status == ERR_INC             # df_history 2 was left behind (3 for this lookahead)
+    # ... and one that deepens the ring.
+    (_make, status), = probes['full'].edit_all([((*GRIDS['16k'], 2, 2), 'df_lookahead', 3)])
     assert status == ERR_INC             # ring 5 and df_history 2 were left behind
 
 
@@ -853,20 +883,22 @@ def test_mask_only_grid_rules(probes):
         ((16000, 256, 24, 96, 1, 1), ERR_DFLA, None),   # nothing to look ahead for
         ((16000, 256, 24, 96, 0, 4), ERR_DFLA, None),
         ((16000, 256, 24, 96, 3, 0), ERR_MASK, None),
-        ((16000, 256, 24, 129, 1, 0), ERR_CAP, None),   # df_bins <= n_bins, above the capacity
-        ((16000, 256, 24, 96, 2, 0), ERR_CAP, None),    # ring 3 over the mask-only capacity 2
+        ((16000, 256, 24, 129, 1, 0), OK, 2),           # df_bins == n_bins = 129
+        ((16000, 256, 24, 96, 2, 0), OK, 3),            # ring 3
         ((16000, 256, 22, 96, 1, 0), ERR_ERB, None),
     ]
     for (case, want, ring), got in zip(cases, mask.make_all([c for c, _s, _r in cases])):
         assert got['status'] == want, (case, got)
         if want == OK:
             assert got['validate'] == OK and got['ring'] == ring, (case, got)
-            # df_history is still DF_ORDER - df_lookahead - 1: all five taps are past.
-            assert got['df_history'] == DF_ORDER - 1
-    # With the capacities raised the refused capacity cases are fine.
-    for case in [(16000, 256, 24, 129, 1, 0), (16000, 256, 24, 96, 2, 0)]:
-        got = probes['mask_wide'].make(case[:4], *case[4:])
-        assert got['status'] == OK and got['validate'] == OK, (case, got)
+            # No deep filter: the order is stored as 0 and there are no taps in the past.
+            assert (got['order'], got['df_history']) == (0, 0), (case, got)
+    # df_order is ignored: any value in [0, 16] gives the same grid, one beyond is refused.
+    base = mask.make((16000, 256, 24, 96), 1, 0)
+    for order in (0, 1, 5, 16):
+        assert mask.make((16000, 256, 24, 96), 1, 0, order=order) == base, order
+    for order in (-1, 17):
+        assert mask.make((16000, 256, 24, 96), 1, 0, order=order)['status'] == ERR_ORDER
     # df_bins == n_bins is no grid for the full build (and the mask-only build accepts what
     # the full one refuses for that reason alone).
     assert probes['full'].make((16000, 64, 16, 33), 1, 0)['status'] == ERR_DF
@@ -880,24 +912,27 @@ def test_mask_only_grid_rules(probes):
 # ---------------------------------------------------------------------------
 
 def test_status_text_names_each_status(probes):
-    lines = probes['full'].run(['text %d' % s for s in range(1, -12, -1)])
+    lines = probes['full'].run(['text %d' % s for s in range(1, -16, -1)])
     texts = {}
     for line in lines:
         _verb, status, text = line.split(' ', 2)
         texts[int(status)] = text
-    for status in range(OK, ERR_INC - 1, -1):
+    assigned = [s for s in range(OK, ERR_SPEC_NORM - 1, -1) if s != -8]
+    for status in assigned:
         assert texts[status] and texts[status] != '(null)', status
-    assert len({texts[s] for s in range(OK, ERR_INC - 1, -1)}) == 10, 'texts must differ'
+    assert len({texts[s] for s in assigned}) == len(assigned) == 13, 'texts must differ'
     for status, word in [(OK, 'ok'), (ERR_NULL, 'null'), (ERR_SR, 'sample rate'),
                          (ERR_FFT, 'n_fft'), (ERR_ERB, 'n_erb'), (ERR_DF, 'df_bins'),
-                         (ERR_MASK, 'mask_lookahead'), (ERR_DFLA, 'df_lookahead'),
-                         (ERR_CAP, 'capacity'), (ERR_INC, 'derived')]:
+                         (ERR_ORDER, 'df_order'), (ERR_MASK, 'mask_lookahead'),
+                         (ERR_DFLA, 'df_lookahead'), (ERR_FRAMES, 'frames_per_call'),
+                         (ERR_ERB_NORM, 'erb normaliser'), (ERR_SPEC_NORM, 'spec normaliser'),
+                         (ERR_INC, 'derived')]:
         assert word in texts[status].lower(), (status, texts[status])
-    # a rate is refused for its alpha as well as for being non-positive
-    assert 'alpha' in texts[ERR_SR].lower(), texts[ERR_SR]
-    for status in (1, -10, -11):                 # unknown: still a non-NULL string
+    # an alpha outside (0, 1) is a normaliser refusal
+    assert 'alpha' in texts[ERR_ERB_NORM].lower(), texts[ERR_ERB_NORM]
+    for status in (1, -8, -14, -15):             # unassigned: still a non-NULL string
         assert texts[status] and texts[status] != '(null)'
-        assert texts[status] not in {texts[s] for s in range(OK, ERR_INC - 1, -1)}
+        assert texts[status] not in {texts[s] for s in assigned}
 
 
 # ---------------------------------------------------------------------------
@@ -910,21 +945,22 @@ _SHIPPED = [(48000, 512), (32000, 256), (16000, 128)]
 
 
 def _tau_boundary_cases():
-    """taus placed so that exp(-(hop / sr) / tau) falls within three ulp of a rounding
-    boundary (k + 1/2) / 10**digits, for the three- and four-digit rounding the trainer
-    uses: the half-to-even tie handling decides these."""
+    """float32 taus placed so that exp(-(hop / sr) / tau) falls within three float32 ulp of a
+    rounding boundary (k + 1/2) / 10**digits, for the three- and four-digit rounding the trainer
+    uses: the half-to-even tie handling decides these. The library holds the tau as float32, so
+    the cases are float32 values and the neighbours are float32 neighbours."""
     cases = []
     for sr, hop in _SHIPPED + [(96000, 8), (44100, 441)]:
         for digits, ks in ((3, range(900, 1000)), (4, range(9990, 10000)),
                            (5, range(99990, 100000, 2))):
             for k in ks:
                 target = (k + 0.5) / 10 ** digits
-                tau = -(hop / sr) / math.log(target)
+                tau = np.float32(-(hop / sr) / math.log(target))
                 lo = hi = tau
-                cases.append((sr, hop, tau))
+                cases.append((sr, hop, float(tau)))
                 for _ in range(3):
-                    lo, hi = math.nextafter(lo, 0.0), math.nextafter(hi, 1e9)
-                    cases += [(sr, hop, lo), (sr, hop, hi)]
+                    lo, hi = np.nextafter(lo, np.float32(0.0)), np.nextafter(hi, np.float32(1e9))
+                    cases += [(sr, hop, float(lo)), (sr, hop, float(hi))]
     return cases
 
 
@@ -938,7 +974,14 @@ def _alpha_cases():
     return cases
 
 
+def _tau32(tau):
+    """The tau the library holds: the float32 nearest to the decimal."""
+    return float(np.float32(tau))
+
+
 def test_norm_alpha_equals_the_trainers_make_norm_alpha_bit_for_bit(probes, dfn_py):
+    """Bit for bit against make_norm_alpha evaluated at the float32 tau the library holds (a
+    decimal that is not a float32, 0.3, enters as its float32 value)."""
     _model, train, _export = dfn_py
     cases = _alpha_cases()
     assert len(cases) > 9000
@@ -946,36 +989,38 @@ def test_norm_alpha_equals_the_trainers_make_norm_alpha_bit_for_bit(probes, dfn_
     bad = []
     for (sr, hop, tau), line in zip(cases, lines):
         got = int(line.split()[1], 16)
-        want = _f32_bits(train.make_norm_alpha(sr, hop, tau))
+        want = _f32_bits(train.make_norm_alpha(sr, hop, _tau32(tau)))
         if got != want:
             bad.append((sr, hop, tau, '%08x' % got, '%08x' % want,
-                        train.make_norm_alpha(sr, hop, tau)))
+                        train.make_norm_alpha(sr, hop, _tau32(tau))))
     assert not bad, '%d of %d differ, first: %r' % (len(bad), len(cases), bad[:8])
 
 
-def _naive_make_norm_alpha(sr, hop, tau):
-    """make_norm_alpha with the rounding done in double arithmetic (floor(x * 10**d + 1/2)):
-    the shortcut a C port is tempted by."""
-    exact = math.exp(-(hop / sr) / tau)
+def _single_precision_make_norm_alpha(sr, hop, tau):
+    """make_norm_alpha with the exponential evaluated in float32: the shortcut a C port is
+    tempted by (the library works on a float32 tau but must round the double result)."""
+    exact = float(np.exp(np.float32(-(hop / sr) / tau)))
     digits, alpha = 3, 1.0
     while alpha >= 1.0:
-        alpha = math.floor(exact * 10 ** digits + 0.5) / 10 ** digits
+        alpha = round(exact, digits)
         digits += 1
     return alpha
 
 
 def test_norm_alpha_sweep_is_not_vacuous(probes, dfn_py):
     """The sweep reaches the 4- and 5-digit branch, and its boundary taus are the cases where
-    a rounding done in double arithmetic goes wrong: a naive port would be caught."""
+    an exponential evaluated in single precision goes wrong: a port with that shortcut would be
+    caught."""
     _model, train, _export = dfn_py
     values = {train.make_norm_alpha(sr, hop, 1.0) for sr in _SAMPLE_RATES for hop in _HOPS}
     digits = {len(repr(v).split('.')[1]) for v in values}
     assert max(digits) >= 5 and min(digits) <= 3, digits
     boundary = _tau_boundary_cases()
     assert len({train.make_norm_alpha(sr, hop, tau) for sr, hop, tau in boundary}) > 100
-    naive_wrong = sum(_naive_make_norm_alpha(sr, hop, tau) != train.make_norm_alpha(sr, hop, tau)
-                      for sr, hop, tau in boundary)
-    assert naive_wrong > 0, 'the boundary taus do not tell a naive rounding apart'
+    shortcut_wrong = sum(
+        _single_precision_make_norm_alpha(sr, hop, tau) != train.make_norm_alpha(sr, hop, tau)
+        for sr, hop, tau in boundary)
+    assert shortcut_wrong > 0, 'the boundary taus do not tell a single-precision exponential apart'
     got = probes['full'].run(['alpha 48000 512 1.0', 'alpha 0 512 1.0', 'alpha 48000 0 1.0',
                               'alpha 48000 512 0.0', 'alpha 48000 512 -1.0'])
     assert int(got[0].split()[1], 16) == _f32_bits(float(np.float32(0.989)))
@@ -993,32 +1038,52 @@ _WRAPPER = r'''
 #include <stdlib.h>
 #include "dfn2_process.h"
 
+typedef struct { DFN2State state; void *block; } ParityDfn;
+
 /* The grid comes from the caller: one library serves every grid. */
 void *parity_dfn_create(int sr, int n_fft, int n_erb, int df_bins, int mask_lookahead,
-                        int df_lookahead, const float *fwd, const float *inv) {
+                        int df_lookahead, int df_order, float erb_tau, float erb_lo,
+                        float erb_hi, float erb_scale, float spec_tau, float spec_lo,
+                        float spec_hi, const float *fwd, const float *inv) {
+    DFN2GridSpec spec = {
+        .sample_rate = sr, .n_fft = n_fft, .n_erb = n_erb, .df_bins = df_bins,
+        .df_order = df_order, .mask_lookahead = mask_lookahead,
+        .df_lookahead = df_lookahead, .frames_per_call = 1,
+        .erb_norm_tau_sec = erb_tau, .erb_norm_init_lo_db = erb_lo,
+        .erb_norm_init_hi_db = erb_hi, .erb_norm_scale_db = erb_scale,
+        .spec_norm_tau_sec = spec_tau, .spec_norm_init_lo = spec_lo,
+        .spec_norm_init_hi = spec_hi,
+    };
     DFN2Grid grid;
-    DFN2State *state;
-    if (dfn2_grid_make(&grid, sr, n_fft, n_erb, df_bins, mask_lookahead, df_lookahead) != 0)
-        return NULL;
-    state = (DFN2State *)calloc(1, sizeof(*state));
-    if (!state) return NULL;
-    if (dfn2_state_init(state, &grid, NULL, NULL) != 0) {
-        free(state);
+    ParityDfn *host;
+    size_t bytes;
+    if (dfn2_grid_make(&grid, &spec) != 0) return NULL;
+    host = (ParityDfn *)calloc(1, sizeof(*host));
+    if (!host) return NULL;
+    bytes = dfn2_state_mem_size(&grid);
+    host->block = aligned_alloc(16, bytes);
+    if (!host->block || dfn2_state_init(&host->state, host->block, bytes, &grid) != 0) {
+        free(host->block);
+        free(host);
         return NULL;
     }
-    dfn2_set_erb_matrices(state, fwd, inv);
-    return state;
+    dfn2_set_erb_matrices(&host->state, fwd, inv);
+    return host;
 }
-void parity_dfn_destroy(void *state) { free(state); }
-void parity_dfn_features(void *state, const float *re, const float *im,
+void parity_dfn_destroy(void *host) {
+    if (!host) return;
+    free(((ParityDfn *)host)->block);
+    free(host);
+}
+void parity_dfn_features(void *host, const float *re, const float *im,
                          float *erb, float *spec) {
-    dfn2_compute_features((DFN2State *)state, re, im, erb, spec);
+    dfn2_compute_features(&((ParityDfn *)host)->state, re, im, erb, spec);
 }
-int parity_dfn_compose(void *state, const float *re, const float *im,
+int parity_dfn_compose(void *host, const float *re, const float *im,
                        const float *mask, const float *coefs, float alpha,
                        float *out_re, float *out_im) {
-    return dfn2_compose((DFN2State *)state, re, im, mask, coefs, alpha,
-                        out_re, out_im);
+    return dfn2_enhance_spectrum(&((ParityDfn *)host)->state, re, im, mask, coefs, alpha,
+                                 out_re, out_im);
 }
 '''
 
@@ -1052,22 +1117,40 @@ int main(int argc, char **argv) {
     float *zero_erb, *zero_spec, *zero_bins, *unit_mask, *zero_coefs, *out_re, *out_im;
     static DFN2State st;
     static DFN2ModelIOState io;
+    DFN2GridSpec spec;
     DFN2Grid grid;
-    int total, c, ready_bad = 0, window_bad = 0, pad_bad = 0, windows = 0, emitted = 0;
-    int first_ready = -1, n_erb, df_bins, n_bins, coefs_n, mask_la, df_la;
+    void *state_block, *io_block;
+    size_t state_bytes, io_bytes;
+    int total, c, ready_bad = 0, window_bad = 0, windows = 0, emitted = 0;
+    int first_ready = -1, n_erb, df_bins, n_bins, coefs_n, mask_la, df_la, wf;
     float atten_lim_db;
 
-    if (argc != 10) return 2;
-    if (dfn2_grid_make(&grid, atoi(argv[4]), atoi(argv[5]), atoi(argv[6]), atoi(argv[7]),
-                       atoi(argv[8]), atoi(argv[9])) != 0)
-        return 2;
+    if (argc != 18) return 2;
+    memset(&spec, 0, sizeof spec);
+    spec.sample_rate = atoi(argv[4]);
+    spec.n_fft = atoi(argv[5]);
+    spec.n_erb = atoi(argv[6]);
+    spec.df_bins = atoi(argv[7]);
+    spec.mask_lookahead = atoi(argv[8]);
+    spec.df_lookahead = atoi(argv[9]);
+    spec.df_order = atoi(argv[10]);
+    spec.frames_per_call = 1;
+    spec.erb_norm_tau_sec = (float)atof(argv[11]);
+    spec.erb_norm_init_lo_db = (float)atof(argv[12]);
+    spec.erb_norm_init_hi_db = (float)atof(argv[13]);
+    spec.erb_norm_scale_db = (float)atof(argv[14]);
+    spec.spec_norm_tau_sec = (float)atof(argv[15]);
+    spec.spec_norm_init_lo = (float)atof(argv[16]);
+    spec.spec_norm_init_hi = (float)atof(argv[17]);
+    if (dfn2_grid_make(&grid, &spec) != 0) return 2;
     atten_lim_db = (float)atof(argv[3]);
+    wf = grid.input_frames;
     n_erb = grid.n_erb;
     df_bins = grid.df_bins;
     n_bins = grid.n_bins;
     mask_la = grid.mask_lookahead;
     df_la = grid.df_lookahead;
-    coefs_n = df_bins * DFN2_DF_ORDER * 2;
+    coefs_n = df_bins * grid.df_order * 2;
 
     in = fopen(argv[1], "rb");
     if (!in) return 2;
@@ -1088,8 +1171,8 @@ int main(int argc, char **argv) {
     head_mask = take(&cursor, (size_t)frames * n_erb);
     head_coefs = take(&cursor, (size_t)frames * coefs_n);
     head_alpha = take(&cursor, (size_t)frames);
-    win_erb = take(&cursor, (size_t)frames * DFN2_MODEL_WINDOW_FRAMES * n_erb);
-    win_spec = take(&cursor, (size_t)frames * 2 * DFN2_MODEL_WINDOW_FRAMES * df_bins);
+    win_erb = take(&cursor, (size_t)frames * wf * n_erb);
+    win_spec = take(&cursor, (size_t)frames * 2 * wf * df_bins);
     zero_erb = (float *)calloc((size_t)n_erb, sizeof(float));
     zero_spec = (float *)calloc((size_t)2 * df_bins, sizeof(float));
     zero_bins = (float *)calloc((size_t)n_bins, sizeof(float));
@@ -1099,9 +1182,14 @@ int main(int argc, char **argv) {
     out_im = (float *)calloc((size_t)n_bins, sizeof(float));
     for (c = 0; c < n_erb; ++c) unit_mask[c] = 1.0f;
 
-    if (dfn2_state_init(&st, &grid, NULL, NULL) != 0) return 2;
+    state_bytes = dfn2_state_mem_size(&grid);
+    io_bytes = dfn2_model_io_mem_size(&grid);
+    state_block = aligned_alloc(16, state_bytes);
+    io_block = aligned_alloc(16, io_bytes);
+    if (!state_block || !io_block) return 2;
+    if (dfn2_state_init(&st, state_block, state_bytes, &grid) != 0) return 2;
     dfn2_set_erb_matrices(&st, erb_fwd, erb_inv);
-    if (dfn2_model_io_init(&io, &grid) != 0) return 2;
+    if (dfn2_model_io_init(&io, io_block, io_bytes, &grid, NULL, 0, NULL, 0) != 0) return 2;
     out = fopen(argv[2], "wb");
     if (!out) return 2;
 
@@ -1123,27 +1211,21 @@ int main(int argc, char **argv) {
             const int has = t < frames;
             if (first_ready < 0) first_ready = c;
             if (has) {
-                const size_t erb_n = (size_t)DFN2_MODEL_WINDOW_FRAMES * n_erb;
-                const size_t spec_n = (size_t)2 * DFN2_MODEL_WINDOW_FRAMES * df_bins;
-                size_t i;
+                const size_t erb_n = (size_t)wf * n_erb;
+                const size_t spec_n = (size_t)2 * wf * df_bins;
                 ++windows;
                 if (memcmp(win_erb + (size_t)t * erb_n, io.erb_window,
                            erb_n * sizeof(float)) != 0 ||
                     memcmp(win_spec + (size_t)t * spec_n, io.spec_window,
                            spec_n * sizeof(float)) != 0)
                     ++window_bad;
-                /* The packed run is all the state has: the rest of the storage stays zero. */
-                for (i = erb_n; i < sizeof io.erb_window / sizeof(float); ++i)
-                    if (io.erb_window[i] != 0.0f) ++pad_bad;
-                for (i = spec_n; i < sizeof io.spec_window / sizeof(float); ++i)
-                    if (io.spec_window[i] != 0.0f) ++pad_bad;
             }
-            valid = dfn2_compose_stream(
+            valid = dfn2_enhance_spectrum_stream(
                 &st, re, im, 1, has ? head_mask + (size_t)t * n_erb : unit_mask,
                 has ? head_coefs + (size_t)t * coefs_n : zero_coefs,
                 has ? head_alpha[t] : 0.0f, atten_lim_db, out_re, out_im, &frame);
         } else {
-            valid = dfn2_compose_stream(&st, re, im, 0, NULL, NULL, 0.0f, atten_lim_db,
+            valid = dfn2_enhance_spectrum_stream(&st, re, im, 0, NULL, NULL, 0.0f, atten_lim_db,
                                         out_re, out_im, &frame);
         }
         if (valid < 0) return 3;
@@ -1156,15 +1238,25 @@ int main(int argc, char **argv) {
         }
     }
     fclose(out);
-    printf("first_ready=%d windows=%d window_bad=%d ready_bad=%d pad_bad=%d emitted=%d\n",
-           first_ready, windows, window_bad, ready_bad, pad_bad, emitted);
-    return (ready_bad || window_bad || pad_bad) ? 1 : 0;
+    printf("first_ready=%d windows=%d window_bad=%d ready_bad=%d emitted=%d\n",
+           first_ready, windows, window_bad, ready_bad, emitted);
+    return (ready_bad || window_bad) ? 1 : 0;
 }
 '''
 
 
 def _fp(array):
     return array.ctypes.data_as(ctypes.POINTER(ctypes.c_float))
+
+
+def _spec_tail(cfg):
+    """df_order and the seven normaliser settings the C side takes from the model config."""
+    values = dfn_pairs.dfn2_spec_values(cfg)
+    return (values['df_order'], *[values[key] for key in _NORM_KEYS])
+
+
+_NORM_KEYS = ('erb_norm_tau_sec', 'erb_norm_init_lo_db', 'erb_norm_init_hi_db',
+              'erb_norm_scale_db', 'spec_norm_tau_sec', 'spec_norm_init_lo', 'spec_norm_init_hi')
 
 
 @pytest.fixture(scope='module', params=SIMD_MODES, ids=['simd%d' % s for s in SIMD_MODES])
@@ -1182,7 +1274,7 @@ def grid_lib(request, tmp_path_factory):
     assert built.returncode == 0, built.stderr
     lib = ctypes.CDLL(str(library))
     fp = ctypes.POINTER(ctypes.c_float)
-    lib.parity_dfn_create.argtypes = [ctypes.c_int] * 6 + [fp, fp]
+    lib.parity_dfn_create.argtypes = [ctypes.c_int] * 7 + [ctypes.c_float] * 7 + [fp, fp]
     lib.parity_dfn_create.restype = ctypes.c_void_p
     lib.parity_dfn_destroy.argtypes = [ctypes.c_void_p]
     lib.parity_dfn_features.argtypes = [ctypes.c_void_p, fp, fp, fp, fp]
@@ -1214,7 +1306,8 @@ def test_c_features_and_compose_match_python(grid_lib, dfn_py, name):
         spectrum, erb_fb, df_bins, feature_cfg)
 
     def create():
-        state = lib.parity_dfn_create(sr, n_fft, n_erb, df_bins, *PAIR, _fp(fwd), _fp(inv))
+        state = lib.parity_dfn_create(sr, n_fft, n_erb, df_bins, *PAIR, *_spec_tail(cfg),
+                                      _fp(fwd), _fp(inv))
         assert state
         return state
 
@@ -1263,8 +1356,9 @@ def test_the_wrapper_refuses_a_grid_the_library_refuses(grid_lib):
     """create() builds the grid from its arguments: a refused grid gives no state."""
     fp = ctypes.POINTER(ctypes.c_float)
     none = ctypes.cast(None, fp)
-    assert grid_lib.parity_dfn_create(16000, 960, 24, 96, 1, 1, none, none) is None
-    state = grid_lib.parity_dfn_create(16000, 256, 24, 96, 1, 1, none, none)
+    tail = _spec_tail(dfn_pairs.dfn2_grid_config(16000, 256, 24, 96))
+    assert grid_lib.parity_dfn_create(16000, 960, 24, 96, 1, 1, *tail, none, none) is None
+    state = grid_lib.parity_dfn_create(16000, 256, 24, 96, 1, 1, *tail, none, none)
     assert state is not None
     grid_lib.parity_dfn_destroy(state)
 
@@ -1329,13 +1423,14 @@ def test_c_host_stream_reproduces_the_offline_model(stream_driver, stream_case, 
     frames, n_bins = case['frames'], case['n_bins']
     result = case['work'] / ('stream_out_%s_%g.bin' % (Path(stream_driver).name,
                                                           atten_lim))
+    tail = _spec_tail(dfn_pairs.dfn2_grid_config(sr, n_fft, n_erb, df_bins))
     done = subprocess.run(
         [str(stream_driver), str(case['source']), str(result), str(atten_lim),
          str(sr), str(n_fft), str(n_erb), str(df_bins), str(case['pair'][0]),
-         str(case['pair'][1])], capture_output=True, text=True)
+         str(case['pair'][1]), *map(repr, tail)], capture_output=True, text=True)
     assert done.returncode == 0, (done.stdout, done.stderr)
     assert 'first_ready=%d ' % case['pair'][0] in done.stdout, done.stdout
-    assert 'window_bad=0 ready_bad=0 pad_bad=0 emitted=%d' % frames in done.stdout, done.stdout
+    assert 'window_bad=0 ready_bad=0 emitted=%d' % frames in done.stdout, done.stdout
 
     record = 4 + 2 * 4 * n_bins
     raw = result.read_bytes()
@@ -1356,7 +1451,9 @@ def test_c_host_stream_reproduces_the_offline_model(stream_driver, stream_case, 
 
 def test_the_stream_driver_refuses_a_grid_the_library_refuses(builds, stream_case):
     exe = builds.program('stream', _STREAM_DRIVER, simd=1, units=('process', 'model_io'))
+    tail = _spec_tail(dfn_pairs.dfn2_grid_config(16000, 256, 24, 96))
     done = subprocess.run([str(exe), str(stream_case['source']),
                            str(stream_case['work'] / 'unused.bin'), '0', '16000', '960',
-                           '24', '96', '1', '1'], capture_output=True, text=True)
+                           '24', '96', '1', '1', *map(repr, tail)],
+                          capture_output=True, text=True)
     assert done.returncode == 2

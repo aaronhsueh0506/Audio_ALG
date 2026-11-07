@@ -1,5 +1,6 @@
 """The GTCRN export metadata and gtcrn_process.h are one state contract."""
 
+import configparser
 import json
 import os
 import pathlib
@@ -86,7 +87,7 @@ def _metadata(tmp_path):
 
 def test_state_layout_version_is_pinned_to_the_c_header(tmp_path):
     """A board reads this out of the graph to decide whether its
-    ``GTCRNModelState`` still matches. Asserting the Python constant alone
+    ``GTCRN_MODEL_LAYOUT_VERSION`` still matches. Asserting the Python constant alone
     would not catch the metadata key being dropped, so this goes through the
     same builder ``main`` uses.
     """
@@ -108,46 +109,70 @@ def test_state_layout_version_is_pinned_to_the_c_header(tmp_path):
     assert metadata['state_handoff'] == STATE_HANDOFF
 
 
-def test_input_schema_shapes_match_the_c_cache_struct(tmp_path):
-    """The schema must come from the real tensors, not a typed-in string.
+def _state_ids():
+    """The GTCRNStateId enum of gtcrn_process.h in order, as the exporter's state names."""
+    header = (ROOT_PATH / 'gtcrn_process.h').read_text(encoding='utf-8')
+    body = re.search(r'typedef enum GTCRNStateId \{(.*?)\} GTCRNStateId;', header, re.S)
+    assert body is not None
+    code = re.sub(r'/\*.*?\*/', '', body.group(1), flags=re.S)
+    names = re.findall(r'^\s*GTCRN_STATE_(\w+?)\s*(?:=\s*\d+)?\s*,?\s*$', code, re.M)
+    assert names[-1] == 'COUNT'
+    return [name.lower() for name in names[:-1]]
 
-    gtcrn_process.h sizes its state from these extents. With a hand-written
-    literal, a stream-model cache-shape change would leave the metadata
-    describing the old graph and nothing would disagree.
+
+def _test_table():
+    """``tests/gtcrn_test_grid.h``: the grid and the state shapes the C test programs register
+    (the library holds none of them)."""
+    text = (ROOT_PATH.parent / 'tests' / 'gtcrn_test_grid.h').read_text(encoding='utf-8')
+
+    def macro(name):
+        found = re.search(r'^#define\s+GTCRN_TEST_%s\s+(\d+)u?\s*(?:/\*.*)?$' % name,
+                          text, re.M)
+        assert found is not None, name
+        return int(found.group(1))
+
+    windows = re.search(r'gtcrn_test_conv_window\[6\]\s*=\s*\{([^}]*)\}', text)
+    assert windows is not None
+    return macro, [int(value) for value in windows.group(1).split(',')]
+
+
+def test_the_state_ids_of_the_c_header_are_the_exported_state_names():
+    """GTCRNStateId indexes the state buffers a host registers: its names and order are the
+    graph's state inputs (conv windows, then the two GRU states)."""
+    assert _state_ids() == list(CONV_STATE_NAMES) + list(GRU_STATE_NAMES)
+    assert len(_state_ids()) == 8
+
+
+def test_input_schema_shapes_match_the_c_test_table(tmp_path):
+    """The schema must come from the real tensors, not a typed-in string, and the test
+    programs' table of state shapes (``tests/gtcrn_test_grid.h``) must be those tensors.
+
+    The library knows no shape: a float host registers one buffer per GTCRNStateId and its
+    element count. With a hand-written table, a stream-model cache-shape change would leave the
+    C tests running other buffers and nothing would disagree.
     """
     metadata = _metadata(tmp_path)
     schema = metadata['input_schema']
     assert set(schema) == set(INPUT_NAMES)
+    macro, windows = _test_table()
     conv = list(CONV_STATE_NAMES)
     assert conv == [
         'conv_enc0', 'conv_enc1', 'conv_enc2',
         'conv_dec0', 'conv_dec1', 'conv_dec2',
     ]
-    windows = [
-        c_macro('GTCRN_MODEL_CONV_WINDOW_0'),
-        c_macro('GTCRN_MODEL_CONV_WINDOW_1'),
-        c_macro('GTCRN_MODEL_CONV_WINDOW_2'),
-    ]
-    for index, name in enumerate(conv[:3]):
+    assert windows == [3, 5, 11, 11, 5, 3]
+    for index, name in enumerate(conv):
         assert schema[name] == [
-            1, c_macro('GTCRN_MODEL_CONV_CHANNELS'), windows[index],
-            c_macro('GTCRN_MODEL_CONV_FREQ'),
-        ], name
-    for index, name in enumerate(conv[3:]):
-        assert schema[name] == [
-            1, c_macro('GTCRN_MODEL_CONV_CHANNELS'), windows[2 - index],
-            c_macro('GTCRN_MODEL_CONV_FREQ'),
+            1, macro('CONV_CHANNELS'), windows[index], macro('CONV_FREQ'),
         ], name
     assert list(GRU_STATE_NAMES) == ['h_tra', 'h_dpgrnn']
-    assert schema['h_tra'] == [
-        1, c_macro('GTCRN_MODEL_TRA_GRUS'), 1,
-        c_macro('GTCRN_MODEL_TRA_HIDDEN'),
-    ]
+    assert schema['h_tra'] == [1, macro('TRA_GRUS'), 1, macro('TRA_HIDDEN')]
     assert schema['h_dpgrnn'] == [
-        1, c_macro('GTCRN_MODEL_DPGRNN_GRUS'),
-        c_macro('GTCRN_MODEL_DPGRNN_FREQ'),
-        c_macro('GTCRN_MODEL_DPGRNN_HIDDEN'),
+        1, macro('DPGRNN_GRUS'), macro('DPGRNN_FREQ'), macro('DPGRNN_HIDDEN'),
     ]
+    # the element counts the test programs register, in GTCRNStateId order, tile the flat array
+    counts = [int(np.prod(schema[name])) for name in _state_ids()]
+    assert sum(counts) == macro('STATE_FLOATS')
 
     # Every state output must hand back exactly the shape its input slot
     # expects, or the caller cannot copy one into the other.
@@ -156,6 +181,20 @@ def test_input_schema_shapes_match_the_c_cache_struct(tmp_path):
     for state_in, state_out in metadata['state_handoff'].items():
         assert output_schema[state_out] == schema[state_in]
         assert len(schema[state_in]) == 4, state_in
+
+
+def test_the_test_grid_is_the_grid_config_ini_names():
+    """The grid the C test programs run (``tests/gtcrn_test_grid.h``) is the model's:
+    frame size and the ERB split of config.ini, and the sizes derived from them."""
+    macro, _windows = _test_table()
+    cfg = configparser.ConfigParser()
+    cfg.read(os.path.join(ROOT, 'config.ini'))
+    n_fft = cfg.getint('signal', 'n_fft')
+    low, high = cfg.getint('model', 'erb_subband_1'), cfg.getint('model', 'erb_subband_2')
+    assert (macro('N_FFT'), macro('ERB_LOW_BINS'), macro('ERB_HIGH_BANDS')) == (n_fft, low, high)
+    assert macro('HOP_LEN') == n_fft // 2 and macro('N_BINS') == n_fft // 2 + 1
+    assert macro('ERB_BANDS') == low + high
+    assert macro('ERB_HIGH_BINS') == n_fft // 2 + 1 - low
 
 
 def test_calibration_frame_shapes_equal_the_exported_graph_inputs(tmp_path):

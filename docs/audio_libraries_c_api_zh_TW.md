@@ -1,7 +1,7 @@
 # AEC、NR、audiolib C API 整合速查
 
 本文件是給 application／board integration 使用者的**短版入口**，涵蓋 AEC、NR、audiolib
-三個 library，以及四個 AI 模型的 pre/post 類別（[§6](audio_libraries_c_api_zh_TW_02_ai_prepost_models.md#6-ai-模型-prepost-類別)），回答三件事：
+三個 library，以及六個 AI 模型函式庫（DeepFilterNet2／3、GTCRN、RNNoise-ERB、Align-ULCNet、DeepVQE-S）的頻域 pre/post 介面（[§6](audio_libraries_c_api_zh_TW_02_ai_prepost_models.md#6-ai-模型-prepost-類別)），回答三件事：
 
 1. 應該 include 哪些 public header；
 2. init、process、reset、destroy 的正確順序；
@@ -43,12 +43,12 @@
 - [6. AI 模型 pre/post 類別](audio_libraries_c_api_zh_TW_02_ai_prepost_models.md#6-ai-模型-prepost-類別) <!-- split-toc -->
   - [6.1 共通生命週期](audio_libraries_c_api_zh_TW_02_ai_prepost_models.md#61-共通生命週期) <!-- split-toc -->
   - [6.2 每-hop 序列與回傳值合約](audio_libraries_c_api_zh_TW_02_ai_prepost_models.md#62-每-hop-序列與回傳值合約) <!-- split-toc -->
-  - [6.3 skip 政策：三個模型不一樣](audio_libraries_c_api_zh_TW_02_ai_prepost_models.md#63-skip-政策三個模型不一樣) <!-- split-toc -->
+  - [6.3 bypass 政策：各模型不一樣](audio_libraries_c_api_zh_TW_02_ai_prepost_models.md#63-bypass-政策各模型不一樣) <!-- split-toc -->
   - [6.4 Align-ULCNet：`ulcnet_prepost.h`](audio_libraries_c_api_zh_TW_02_ai_prepost_models.md#64-align-ulcnetulcnet_preposth) <!-- split-toc -->
   - [6.5 DeepVQE-S：`deepvqe_prepost.h`](audio_libraries_c_api_zh_TW_02_ai_prepost_models.md#65-deepvqe-sdeepvqe_preposth) <!-- split-toc -->
-  - [6.6 DeepFilterNet2：`dfn2_prepost.h`](audio_libraries_c_api_zh_TW_03_ai_prepost_pipeline.md#66-deepfilternet2dfn2_preposth) <!-- split-toc -->
+  - [6.6 DeepFilterNet2、DeepFilterNet3、GTCRN、RNNoise-ERB](audio_libraries_c_api_zh_TW_03_ai_prepost_pipeline.md#66-deepfilternet2deepfilternet3gtcrnrnnoise-erb) <!-- split-toc -->
   - [6.7 Pool 大小](audio_libraries_c_api_zh_TW_03_ai_prepost_pipeline.md#67-pool-大小) <!-- split-toc -->
-  - [6.8 Framing：一 hop 一框的 analysis](audio_libraries_c_api_zh_TW_03_ai_prepost_pipeline.md#68-framing一-hop-一框的-analysis) <!-- split-toc -->
+  - [6.8 Framing：應用端用 audiolib 分析與合成](audio_libraries_c_api_zh_TW_03_ai_prepost_pipeline.md#68-framing應用端用-audiolib-分析與合成) <!-- split-toc -->
   - [6.9 Pipeline 層：頻域 stage 串接與 NN 的 begin / nn_begin / nn_end / end](audio_libraries_c_api_zh_TW_03_ai_prepost_pipeline.md#69-pipeline-層頻域-stage-串接與-nn-的-begin--nn_begin--nn_end--end) <!-- split-toc -->
   - [6.10 各函式庫各自初始化：記憶體加總與 flow 的公開面](audio_libraries_c_api_zh_TW_03_ai_prepost_pipeline.md#610-各函式庫各自初始化記憶體加總與-flow-的公開面) <!-- split-toc -->
 - [7. Static-pool 共通規則](audio_libraries_c_api_zh_TW_04_pool_build_checklist.md#7-static-pool-共通規則) <!-- split-toc -->
@@ -67,10 +67,12 @@
 | 只做單路 AEC，或自行組合 NN／其他 post-filter | `aec.h` |
 | 已有 STFT/WOLA，只需要頻域 NR | `anr.h` |
 | 只需要 FFT、resample、HPF | `audiolib/common/include/*.h` |
-| Align-ULCNet 加速器 handoff（hop 或頻譜） | `AIAEC/Align_ULCNet/ulcnet_prepost.h` |
-| DeepVQE-S 加速器 handoff | `AIAEC/DeepVQE_S/deepvqe_prepost.h` |
-| DeepFilterNet2 加速器 handoff | `AINR/DeepFilterNet2/dfn2_prepost.h` |
-| DeepFilterNet3 加速器 handoff | `AINR/DeepFilterNet3/dfn3_prepost.h` |
+| Align-ULCNet 加速器 handoff（頻譜） | `AIAEC/Align_ULCNet/ulcnet_prepost.h` |
+| DeepVQE-S 加速器 handoff（頻譜） | `AIAEC/DeepVQE_S/deepvqe_prepost.h` |
+| DeepFilterNet2 加速器 handoff（頻譜） | `AINR/DeepFilterNet2/dfn2_prepost.h` |
+| DeepFilterNet3 加速器 handoff（頻譜） | `AINR/DeepFilterNet3/dfn3_prepost.h` |
+| GTCRN 前後處理（頻譜） | `AINR/GTCRN/gtcrn_process.h` |
+| RNNoise-ERB 前後處理（頻譜） | `AINR/RNNoise-ERB/process.h` |
 
 只有「多聲道線性 AEC 的 flow」被包成一個模組（`Mcab`；`mcab_fuse()` 之後 `frame->g_res_ctx` 為 NULL，mcab 不持有 `AecRes`、也不含 beamformer）。
 它是 flow 層而不是函式庫：四條 `Aec` lane 與（MATCHED）共用的 `DelayAec` 由應用用 lib/aec 自己的 `*_get_mem_size`／`*_init` 建立，以指標交給 `mcab_init_ex()`；mcab 只擁有自己 pool 裡的 flow 狀態。
@@ -101,11 +103,14 @@ AEC 與 NR 另支援 8 kHz grid（非產品主 grid），4ch 的 `Mcab` 不接�
 `sample_rate` 後讓底層猜 FFT；16 kHz 有兩個合法值，建立實例前必須 resolve 成明確的
 `fft_size`。
 
+AI 模型函式庫的 grid 不在此表：它由各模型的匯出設定決定，應用端以各自的 `*_grid_make()` 在執行期給定（[§6.1](audio_libraries_c_api_zh_TW_02_ai_prepost_models.md#61-共通生命週期)）。
+
 ### 2.2 PCM、window 與 block
 
 - PCM 使用 mono/interleaved `float32`，標稱範圍 `[-1, 1]`。
 - AEC 每次固定吃一個 hop；函式沒有長度參數，傳錯長度不會替你報錯。
-- NR C library 只吃 `Complex[n_freqs]`，不做 framing、window、FFT、IFFT 或 OLA。
+- NR C library 只吃 `Complex[n_freqs]`，不做 framing、window、FFT、IFFT 或 OLA。AI 模型函式庫同樣只吃頻譜；
+  analysis、synthesis 與 window 由應用端用 audiolib 的 `AcStft`／`AcIstft` 做（[§6.8](audio_libraries_c_api_zh_TW_03_ai_prepost_pipeline.md#68-framing應用端用-audiolib-分析與合成)）。
 - 時域 NR wrapper 使用 periodic sqrt-Hann analysis/synthesis window、50% overlap、
   `frame_size == fft_size`，不補零。
 - AEC 不做最終 peak limiter。若產品需要 limiter／AGC／DRC，放在整條

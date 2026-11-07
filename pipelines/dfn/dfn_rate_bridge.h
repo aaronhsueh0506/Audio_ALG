@@ -45,14 +45,16 @@ extern "C" {
 
 #define DFN_RATE_BRIDGE_DESCRIPTOR_VERSION 1u
 /* Carve layout version; bumped on any change of pool size, carve order or descriptor. */
-#define DFN_RATE_BRIDGE_LAYOUT_VERSION     4u
+#define DFN_RATE_BRIDGE_LAYOUT_VERSION     5u
 /* Denominator of dfn_rate_bridge_added_delay_exact(): sixths of a native sample. */
 #define DFN_RATE_BRIDGE_DELAY_DENOMINATOR  6
 
 /* Grid contract: hop = fft_size / 2 (50 % overlap). Supported native grids are
  * 8 kHz/256, 16 kHz/256 and 16 kHz/512 only, and the model (stage.grid) must be the 48 kHz /
- * 1024 grid: the resampling ratios, the per-hop inference schedule, the prefill calibration and
- * the FIFO capacities are written for it, so a bridge over another model grid is refused (-1). */
+ * 1024 grid with one frame per call: the resampling ratios, the per-hop inference schedule, the
+ * prefill calibration and the FIFO capacities are written for it, so a bridge over another model
+ * grid is refused (-1). Its 48 kHz AcStft / AcIstft run at audiolib's default scales: the stage
+ * applies the grid's stft_scale / stft_unscale. */
 typedef struct DfnRateBridgeConfig {
     int sample_rate;            /* 8000 or 16000 (48000 uses the stage directly) */
     int fft_size;               /* 0 = rate default (256); 16 kHz also 512     */
@@ -79,7 +81,8 @@ typedef struct DfnRateBridge DfnRateBridge;
 DfnRateBridgeConfig dfn_rate_bridge_default_config(int sample_rate, const DFN2Grid *model_grid);
 
 /* Returns -1 on NULL, a rate other than 8000/16000, an fft_size the rate does not offer, a model
- * grid (stage.grid) that is not 48 kHz / 1024, or any stage rejection (dfn_res_stage.h). */
+ * grid (stage.grid) that is not 48 kHz / 1024 with one frame per call, or any stage rejection
+ * (dfn_res_stage.h). */
 int dfn_rate_bridge_get_mem_requirements(const DfnRateBridgeConfig *cfg,
                                          DfnRateBridgeMemReq *out);
 DfnRateBridge *dfn_rate_bridge_init(void *mem, size_t bytes,
@@ -107,7 +110,8 @@ int dfn_rate_bridge_reset_synthesis(DfnRateBridge *b);
 /* One native hop: the two native spectra in (n_freqs each), one native hop out.
  * Returns 0, or -1 on NULL arguments or a stage contract error (reset required).
  * Phased use, for a caller that runs the model itself (a hop carries 0, 1 or 2
- * stage frames):
+ * stage frames; the first mask_lookahead model frames are warm-up frames, run like any other
+ * and discarded):
  *     dfn_rate_bridge_begin(b, E, P);                  // WOLA + resample up
  *     while (dfn_rate_bridge_nn_begin(b, &job) > 0) {  // 48 kHz frame open
  *         rc = run_model(&job);                        // 0 = every output written
@@ -142,6 +146,9 @@ int dfn_rate_bridge_added_delay_samples(const DfnRateBridge *b);   /* floor of t
 int dfn_rate_bridge_added_delay_exact(const DfnRateBridge *b, int *numerator,
                                       int *denominator);
 DfnResStage *dfn_rate_bridge_stage(const DfnRateBridge *b);
+/* The stage's state generation (dfn_res_stage_state_generation(): resets, warm-up frames and refused
+ * commits advance it); 0 for NULL. */
+unsigned int dfn_rate_bridge_state_generation(const DfnRateBridge *b);
 /* Frame counters for diagnostics: 48 kHz frames run in total and in the last hop. */
 void dfn_rate_bridge_get_counters(const DfnRateBridge *b,
                                   long long *frames_48k, int *last_hop_frames);

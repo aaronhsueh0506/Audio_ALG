@@ -375,16 +375,23 @@ static void example_dfn_phased(void) {
     dfn_host_free(&cb);
 }
 
+/* The shipped Align-ULCNet grid (hop 256) and its export delay depth: the grid the stage, the lane and the
+ * model descriptor below are built for. */
+static const UlcnetGridSpec k_ulcnet_spec = { .sample_rate = 16000, .n_fft = 512, .delay_depth = 8 };
+enum { ULC_HOP_MAX = 256 };
+static UlcnetGrid g_ulc_grid;
+
 static int half_infer(void* user, const float* er, const float* ei, const float* fr,
                       const float* fi, float* or_, float* oi) {
+    const UlcnetGrid* grid = (const UlcnetGrid*)user;
     int k;
-    (void)user; (void)fr; (void)fi;
-    for (k = 0; k < ULCNET_BINS; ++k) { or_[k] = 0.5f * er[k]; oi[k] = 0.5f * ei[k]; }
+    (void)fr; (void)fi;
+    for (k = 0; k < grid->n_bins; ++k) { or_[k] = 0.5f * er[k]; oi[k] = 0.5f * ei[k]; }
     return 0;
 }
 
 static int run_ulcnet_npu(const UlcnetNnJob* job) {
-    return half_infer(NULL, job->err_re, job->err_im, job->far_re, job->far_im,
+    return half_infer(&g_ulc_grid, job->err_re, job->err_im, job->far_re, job->far_im,
                       job->out_re, job->out_im);
 }
 
@@ -398,11 +405,11 @@ typedef struct UlcHost {
 
 static int ulc_host_build(UlcHost* u, const UlcnetModel* model) {
     AecConfig aec_cfg;
-    size_t aec_b, stage_b = ulcnet_nn_stage_mem_size(1);
+    size_t aec_b, stage_b = ulcnet_nn_stage_mem_size(&g_ulc_grid, 1);
     memset(u, 0, sizeof(*u));
-    /* the stage's compiled grid; the lane returns the linear context only */
-    aec_config_from_level(&aec_cfg, AEC_LEVEL_BALANCED, ULCNET_SR);
-    aec_cfg.fft_size = ULCNET_N_FFT;
+    /* the stage's grid; the lane returns the linear context only */
+    aec_config_from_level(&aec_cfg, AEC_LEVEL_BALANCED, g_ulc_grid.sample_rate);
+    aec_cfg.fft_size = g_ulc_grid.n_fft;
     aec_cfg.delay_mode = AEC_DELAY_MATCHED;
     aec_cfg.delay_num_filters = DA_NUM_FILTERS;
     aec_cfg.fixed_delay_samples = -1;
@@ -413,7 +420,7 @@ static int ulc_host_build(UlcHost* u, const UlcnetModel* model) {
     aec_b = aec_get_mem_size(&aec_cfg);
     if (posix_memalign((void**)&u->mem, 16, ALIGN16(aec_b) + ALIGN16(stage_b)) != 0) return -1;
     u->aec = aec_init(u->mem, aec_b, &aec_cfg);
-    u->stage = ulcnet_nn_stage_init(u->mem + ALIGN16(aec_b), stage_b, 1);
+    u->stage = ulcnet_nn_stage_init(u->mem + ALIGN16(aec_b), stage_b, &g_ulc_grid, 1);
     if (!u->aec || !u->stage || ulcnet_nn_stage_set_model(u->stage, model) != 0) return -1;
     return 0;
 }
@@ -440,20 +447,25 @@ static void example_ulcnet_phased(void) {
     UlcnetModelIoDescriptor d;
     UlcnetModel none, cb_model;
     UlcHost p, cb;
-    float mic[ULCNET_HOP], ref[ULCNET_HOP], out[ULCNET_HOP], out_cb[ULCNET_HOP];
+    float mic[ULC_HOP_MAX], ref[ULC_HOP_MAX], out[ULC_HOP_MAX], out_cb[ULC_HOP_MAX];
     UlcnetNnJob job;
-    int h, i, identical = 1, ran = 0;
+    int hop, h, i, identical = 1, ran = 0;
 
-    ulcnet_model_io_descriptor_default(8, &d);
+    CHECK(ulcnet_grid_make(&g_ulc_grid, &k_ulcnet_spec) == ULCNET_GRID_OK &&
+          g_ulc_grid.hop == ULC_HOP_MAX && ulcnet_model_io_descriptor_default(&g_ulc_grid, &d) == 0,
+          "readme/ulcnet: the grid and its descriptor");
+    if (g_ulc_grid.hop != ULC_HOP_MAX) return;
+    hop = g_ulc_grid.hop;
     memset(&none, 0, sizeof(none));            /* no infer callback: the board runs the network */
     cb_model = none;
     cb_model.infer = half_infer;
+    cb_model.user = &g_ulc_grid;
     cb_model.io_descriptor = &d;
     CHECK(ulc_host_build(&p, &none) == 0 && ulc_host_build(&cb, &cb_model) == 0,
           "readme/ulcnet: both hosts build");
     if (!p.stage || !cb.stage) return;
     for (h = 0; h < 60; ++h) {
-        for (i = 0; i < ULCNET_HOP; ++i) { ref[i] = lcg(); mic[i] = 0.3f * ref[i] + 0.05f * lcg(); }
+        for (i = 0; i < hop; ++i) { ref[i] = lcg(); mic[i] = 0.3f * ref[i] + 0.05f * lcg(); }
 
         ulc_host_begin(&p, mic, ref);                                /* AEC, both analyses        */
         if (ulcnet_nn_stage_nn_begin(p.stage, &job) > 0) {           /* a frame to run            */
@@ -464,7 +476,7 @@ static void example_ulcnet_phased(void) {
 
         ulc_host_begin(&cb, mic, ref);
         ulcnet_nn_stage_process(cb.stage, out_cb);                   /* the callback-driven hop   */
-        if (memcmp(out, out_cb, sizeof(out)) != 0) identical = 0;
+        if (memcmp(out, out_cb, (size_t)hop * sizeof(float)) != 0) identical = 0;
     }
     CHECK(ran > 0 && identical,
           "readme/ulcnet: begin / nn_begin / nn_end / end equals the callback-driven hop");

@@ -74,14 +74,16 @@ Do not claim trained-model quality without a trained checkpoint.
 ### 11.4 C pre/post archive
 
 `AINR/Makefile` builds `libainr_prepost.a` — `dfn2_process`, `dfn2_model_io`,
-`dfn2_prepost`, `dfn3_process`, `dfn3_model_io`, `dfn3_prepost` and `gtcrn_process`.
-RNNoise-ERB is deliberately NOT a member: it has its own Makefile and no archive.
+`dfn2_prepost`, `dfn3_process`, `dfn3_model_io`, `dfn3_prepost`, `gtcrn_process` and
+RNNoise-ERB's `process.c` (member `rnnoise_process.o`; RNNoise-ERB's own Makefile builds its
+tests). The members call audiolib, so a link of the archive takes audiolib's archive too.
 
 ```bash
 make -C AINR SIMD=1 WERROR=1 lib
 make -C AINR SIMD=1 WERROR=1 print-lib-path   # absolute path of THIS config
 make -C AINR SIMD=0 WERROR=1 test
 make -C AINR test-pairs   # DeepFilterNet2/3 lookahead pairs other than the shipped 1/1
+make -C AINR/RNNoise-ERB test   # ERB table, feature contract, features, framing contract, SIMD/scalar
 ```
 
 - [ ] Objects, test binaries and the archive are configuration-keyed
@@ -89,29 +91,42 @@ make -C AINR test-pairs   # DeepFilterNet2/3 lookahead pairs other than the ship
       `SIMD=1` archive; resolve the archive with `print-lib-path`, never by
       spelling the directory.
 - [ ] DeepFilterNet2 and DeepFilterNet3 lookahead pairs (`mask_lookahead` 0..2,
-      `df_lookahead` 0..4, 15 pairs, shipped 1/1): the Python parts pass for all
-      pairs, and `make -C AINR test-pairs` rebuilds the C hosts only for the
-      pairs the tests list (the six pairs with `D <= M`, and (0,1), (1,3),
-      (2,4)); a pair outside that list is not claimed as tested in C, and the
-      audio quality of any pair other than 1/1 is unmeasured (no checkpoint).
-- [ ] DeepFilterNet2 grid is a run-time value (`DFN2Grid`, `dfn2_grid_make()`; the library holds no grid, preset or default, and
-      the application owns the (sample rate, FFT size) table): `tests/test_dfn2_grid.py` (every refusal, `make` agreeing with
-      `validate`, the `n_erb` overflow cases under UBSan, the `DFN2_DF_ORDER` `#error`) and `tests/test_dfn2_runtime_grid.py`
-      (capacity independence, pool identity with the normaliser starting points of `dfn2_process.c`, the variant link symbol) pass;
-      `tests/test_dfn2_lookahead_pairs.py` builds the C suites on the 48, 32 and 16 kHz test grids for the shipped pair and 2/4; a
-      pool or `MemReq` recorded before `DFN2_PREPOST_CARVE_VERSION` 9 is refused.
-- [ ] DeepFilterNet2 frames per call (`export_onnx.py --frames-per-call N`, `make -C AINR DFN2_FRAMES_PER_CALL=<N>`, N in
-      1..64): N = 1 writes the one-frame graph byte for byte and builds with the same compile lines; for N > 1 the
-      chunked stream equals the one-frame stream (`tests/test_dfn2_frames_per_call.py`,
-      `tests/test_dfn2_frames_per_call_c.py`, both in `make -C AINR test-pairs`); `make test` and the pipelines stay at
-      N = 1 and an N > 1 build of a one-frame unit stops at the `DFN2_MULTI_FRAME_HOST` `#error`. The accelerator
-      toolchain's support for a GRU with a sequence longer than one and the quantized accuracy of an N-frame graph are
-      not measured.
+      `df_lookahead` 0..4, 15 pairs, shipped 1/1; the pair is a field of the
+      run-time spec): the Python parts pass for all pairs,
+      `tests/test_dfn3_prepost_c.py` runs all 15 against one library build, and
+      `make -C AINR test-pairs` rebuilds the DFN2 C hosts and the DFN3 stream host
+      only for the pairs the tests list (the six pairs with `D <= M`, and (0,1),
+      (1,3), (2,4)); a pair outside that list is not claimed as tested in those
+      hosts, and the audio quality of any pair other than 1/1 is unmeasured (no
+      checkpoint).
+- [ ] The recurrent state of the AINR classes (DeepFilterNet2, DeepFilterNet3, GTCRN, RNNoise-ERB) belongs to the application:
+      registration is all-or-none (a pointer with a count of 0, or a count with a NULL pointer, is refused), the state
+      generation is 1 after init and advances on a reset, on every DeepFilterNet2 / DeepFilterNet3 warm-up frame (the first
+      `mask_lookahead` hops, one flow on every hop, heads discarded, audio unchanged) and on a refused finish or validation, and a
+      refusal zeroes any registered state (`tests/test_c_prepost.c` for DeepFilterNet2 and GTCRN, `tests/test_dfn3_stream.c` for DeepFilterNet3,
+      `RNNoise-ERB/test/test_rnnoise_features.c` for RNNoise-ERB, and `tests/test_dfn2_prepost_c.py::
+      test_state_generation_counts_every_zeroing_and_nothing_else`) pass.
+- [ ] The DeepFilterNet2 grid is a run-time value (`DFN2GridSpec` -> `dfn2_grid_make()`; the library holds no grid, preset or
+      default, and the application owns the (sample rate, FFT size) table): `tests/test_dfn2_grid.py` (every refusal in check
+      order, `make` agreeing with `validate`, the `n_erb` overflow cases under UBSan, `dfn2_norm_alpha()` equal to
+      `make_norm_alpha` of `train.py`) and `tests/test_dfn2_runtime_grid.py` (the whole chain on every grid and pair, pool bytes
+      and hash equal to an independent Python layout mirror, a foreign pool refused, the variant link symbol) pass;
+      `tests/test_dfn2_lookahead_pairs.py` builds the C suites on the 48, 32 and 16 kHz test grids for the shipped pair and 2/4;
+      a pool or `MemReq` recorded under another carve version (`DFN2_PREPOST_CARVE_VERSION` = 11) is refused. DeepFilterNet3
+      is the same (`DFN3GridSpec` -> `dfn3_grid_make()`; its pair refusals are in `tests/test_dfn3_stream_c.py`).
+- [ ] DeepFilterNet2 frames per call (`export_onnx.py --frames-per-call N`, N in 1..64; the C side takes it as
+      `DFN2GridSpec.frames_per_call`): N = 1 is the one-frame graph byte for byte; for N > 1 the chunked stream equals
+      the one-frame stream (`tests/test_dfn2_frames_per_call.py`, and `tests/test_dfn2_frames_per_call_c.py` for the C host,
+      both in `make -C AINR test-pairs`); `make test` and the pipelines stay at N = 1 (the pipeline stage and rate bridge
+      refuse any other value). The accelerator toolchain's support for a GRU with a sequence longer than one and the
+      quantized accuracy of an N-frame graph are not measured.
+- [ ] No model library (AINR, AIAEC) holds framing, FFT or window code and no Makefile passes a dead `-D` flag:
+      `make -C pipelines audit-no-transform` and `make -C pipelines audit-dead-defines` pass.
 - [ ] `WERROR=1` actually reaches the compiler.
 - [ ] The SIMD knob changes every member that includes `utility/simd_kernel_nn.h`
-      (dfn2/dfn3 `process`, `model_io`, `prepost` and `gtcrn_process`: all seven
-      members); never mix a `SIMD=0` archive with a `SIMD=1` application, and
-      resolve the archive with `print-lib-path`.
+      (dfn2/dfn3 `process`, `model_io`, `prepost`, `gtcrn_process` and `rnnoise_process`:
+      all eight members); never mix a `SIMD=0` archive with a `SIMD=1`
+      application, and resolve the archive with `print-lib-path`.
 
 ## 12. AIAEC framework gate
 
@@ -200,9 +215,17 @@ make -C AIAEC SIMD=0 WERROR=1 test             # lib + pytest
       (`ulcnet_process`, `ulcnet_model_io`, `deepvqe_process`,
       `deepvqe_prepost`); never mix a `SIMD=0` archive with a `SIMD=1`
       application, and resolve the archive with `print-lib-path`.
-- [ ] Each pre/post class (`ulcnet_prepost`, `deepvqe_prepost`) is a THIRD
-      translation unit composing two files that stay independently linkable
-      for their own parity tests, and its byte-identity tests against the
-      hand-composed path pass.
+- [ ] Each pre/post class (`ulcnet_prepost`, `deepvqe_prepost`) is a translation
+      unit of its own that uses `ulcnet_model_io` / `deepvqe_process`, which stay
+      independently linkable for their own parity tests, and its byte-identity
+      tests against the hand-composed path pass.
+- [ ] The grid is a run-time value (`UlcnetGridSpec` -> `ulcnet_grid_make()`,
+      `DeepVqeGridSpec` -> `deepvqe_grid_make()`): both classes run 16000/512 and
+      48000/1024 from one build (`test_class_matches_the_hand_composed_path` with `grid=16000,512` and `grid=48000,1024`),
+      a pool recorded for another grid or delay depth is refused by `init_ex`
+      (`test_stale_pool_gate_holds_and_the_pool_follows_the_grid`), and a refused
+      `frame_finish` advances the state generation and zeroes any registered state
+      (DeepVQE-S: `test_state_generation_counts_restarts`; Align-ULCNet: `test_reset_clears_state` and
+      `test_frame_state_machine_guards`; 0 after init for both classes).
 
 [Index](release_checklist.md) | [Previous](release_checklist_01_pipeline_gates.md) | [Next](release_checklist_03_docs_publish_appendices.md) <!-- split-nav -->

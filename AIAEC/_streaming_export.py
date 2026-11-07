@@ -853,7 +853,7 @@ def host_signal_inputs(model_name: str, model, signals):
     ``[1,1,F,2]``.
 
     DeepVQE_S's power-law compression runs on the host (C:
-    deepvqe_prepost_frame_inputs), so its graph starts at the first
+    deepvqe_prepost_frame_open), so its graph starts at the first
     convolution and binds ``[1,2,1,F]`` planar tensors (real plane, then
     imaginary plane). The other models bind the raw spectra unchanged.
     """

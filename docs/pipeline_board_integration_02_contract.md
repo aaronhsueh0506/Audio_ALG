@@ -39,7 +39,9 @@
   their own reset functions) or `Aec`, the 4-channel `AecRes`, the denoiser, the synthesis (and the comfort-noise
   generator) and any neural stage together
   (`mcab_reset()` / `aec_reset()`, `aec_res_reset()`, `anr_reset()`, `ac_istft_reset()`, `ulcnet_nn_stage_reset()`).
-  A `MCAB_DSP_ERROR` has already reset the flow itself. The DFN2 stage is not reset by an AEC delay change.
+  A `MCAB_DSP_ERROR` has already reset the flow itself. The DFN2 stage is not reset by an AEC delay change. A model
+  that keeps its own recurrent state (the DFN2 stage and rate bridge register none) follows the state generation (a reset, each DFN2 warm-up frame and a refused commit advance it), see
+  ["Running the model on the NPU"](pipeline_board_integration_01_sequence.md#running-the-model-on-the-npu-nn-applications).
 
 ## Descriptor semantics (`McabMemReq`)
 

@@ -33,7 +33,7 @@ def test_both_exporters_derive_the_same_window_and_word_the_refusal_alike():
     assert messages[0] == messages[1]
     assert 'model contract' in messages[0]
     assert 'fresh training run' in messages[0]
-    assert 'C host built with the same pair' in messages[0]
+    assert 'C host given the same pair' in messages[0]
 
 
 @pytest.mark.parametrize('bad', [True, 1.0, None, '1', -1, 3])

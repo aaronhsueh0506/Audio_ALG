@@ -1,45 +1,28 @@
-/* Shared 16 kHz AIAEC boundary: 512-point FFT, 256 hop, sqrt-Hann
- * framing (audiolib AcStft/AcIstft, AC_OLA_ENV_NORM). Each model's pre/post
- * class owns its own STFT objects. Recurrent, conv and attention state tensors
- * are caller-owned and passed to the stateless accelerator on every call. */
+/* Mask application shared by the AIAEC models: the spectra hold n_bins values (the caller's
+ * grid); a NULL pointer makes a call a no-op. Python mirrors: aiaec_common.complex_mask,
+ * Align_ULCNet/export_onnx.host_back_end, Align_CRUSE/model.py (AlignCRUSE.forward). */
 #ifndef AIAEC_PROCESS_H
 #define AIAEC_PROCESS_H
-
-#include "audio_stft.h"
-#include "Align_ULCNet/ulcnet_process.h"
 
 #ifdef __cplusplus
 extern "C" {
 #endif
 
-/* Fixed framing of this boundary; independent of the ULCNET_* build parameters. */
-#define AIAEC_SR       16000
-#define AIAEC_N_FFT    512
-#define AIAEC_HOP      (AIAEC_N_FFT / 2)
-#define AIAEC_N_BINS   (AIAEC_N_FFT / 2 + 1)
-
 /* Complex ratio mask: output = input * mask (CAGCRN). */
-void aiaec_apply_complex_mask(const float input_re[AIAEC_N_BINS],
-                              const float input_im[AIAEC_N_BINS],
-                              const float mask_re[AIAEC_N_BINS],
-                              const float mask_im[AIAEC_N_BINS],
-                              float output_re[AIAEC_N_BINS],
-                              float output_im[AIAEC_N_BINS]);
-void aiaec_apply_real_mask(const float input_re[AIAEC_N_BINS],
-                           const float input_im[AIAEC_N_BINS],
-                           const float mask[AIAEC_N_BINS],
-                           float output_re[AIAEC_N_BINS],
-                           float output_im[AIAEC_N_BINS]);
+void aiaec_apply_complex_mask(const float *input_re, const float *input_im,
+                              const float *mask_re, const float *mask_im,
+                              float *output_re, float *output_im, int n_bins);
+/* Real mask (Align-CRUSE): output = input * mask. */
+void aiaec_apply_real_mask(const float *input_re, const float *input_im,
+                           const float *mask,
+                           float *output_re, float *output_im, int n_bins);
 
-/* Align-ULCNet mask: signed |x|^0.3 compression, mask multiply, signed
- * |x|^(1/0.3) expansion. */
+/* Align-ULCNet mask: signed |x|^e compression (e = ULCNET_MODEL_IO_COMPRESSION_EXP), mask
+ * multiply, signed |x|^(1/e) expansion. */
 void aiaec_apply_ulcnet_compressed_mask(
-    const float input_re[AIAEC_N_BINS],
-    const float input_im[AIAEC_N_BINS],
-    const float mask_re[AIAEC_N_BINS],
-    const float mask_im[AIAEC_N_BINS],
-    float output_re[AIAEC_N_BINS],
-    float output_im[AIAEC_N_BINS]);
+    const float *input_re, const float *input_im,
+    const float *mask_re, const float *mask_im,
+    float *output_re, float *output_im, int n_bins);
 
 #ifdef __cplusplus
 }

@@ -72,7 +72,7 @@ ends at the ``complex_mask`` 1x1 Conv and returns the learned mask itself,
 ``output`` = ``[1, 2, 1, n_freqs]`` (plane 0 real, plane 1 imaginary); the
 fixed back end (complex multiply of the compressed error by that mask, then
 the inverse power) runs on the host (``host_back_end``; C:
-``ulcnet_model_io_commit``).
+``ulcnet_model_io_enhance_spectrum``).
 
 ``export_graph`` validates the written file with
 ``validate_inplace_state_contract`` and records ``state_binding`` and
@@ -417,7 +417,7 @@ class AlignUlcnetStreamingExport(nn.Module):
         ))
         # The graph ends at the mask Conv: the host multiplies the compressed
         # error by it and applies the inverse signed power (host_back_end; C:
-        # ulcnet_model_io_commit).
+        # ulcnet_model_io_enhance_spectrum).
         output = model.complex_mask(stage2)
 
         # Concatenated in the order it was sliced, which is also the order
@@ -430,10 +430,10 @@ def ta_bins_for(model) -> int:
     """The K/V feature width the encoder emits.
 
     NOT a constant: it follows n_freqs (26 on the 16 kHz grid, 52 on the 48 kHz
-    one), so it is read off the encoder. The C side derives it from its
-    compiled grid as (BINS + 9) / 10 (pinned by
-    test_c_ta_bins_matches_the_python_derivation). ⚠ Not model.reorient.width,
-    which is 52 at 16 kHz.
+    one), so it is read off the encoder. The C library holds no such shape: the
+    application's state table uses (BINS + 9) / 10, which
+    test_ta_bins_follows_the_grid pins to this function. ⚠ Not
+    model.reorient.width, which is 52 at 16 kHz.
     """
     return model.encoded_width
 
@@ -497,7 +497,7 @@ def host_output(model, compressed_ri: Tensor) -> Tensor:
 
 def host_back_end(model, error_ri: Tensor, mask: Tensor) -> Tensor:
     """Host-side fixed back end: mask multiply, then inverse signed power
-    (C: ulcnet_model_io_commit)."""
+    (C: ulcnet_model_io_enhance_spectrum)."""
     return host_output(model, apply_mask_ri(error_ri, mask))
 
 

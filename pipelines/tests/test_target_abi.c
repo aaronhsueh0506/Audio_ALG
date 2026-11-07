@@ -1,5 +1,6 @@
 /* Run on each ABI, then exchange --write files with --reject. The foreign
- * byte budget is normalized so rejection specifically exercises the hash. */
+ * byte budget is normalized so rejection specifically exercises the hash.
+ * Files are exchanged between builds with the same DFN2_TEST_GRID_KHZ and lookahead pair. */
 #ifndef _POSIX_C_SOURCE
 #define _POSIX_C_SOURCE 200809L
 #endif
@@ -81,6 +82,39 @@ static void build_mcab_libs(const McabConfig *cfg) {
     g_mcab_libs.delay = &delay;
 }
 
+/* The grids the descriptors are taken for: the DFN3 class at the DFN2 test grid's numbers (the same
+ * config.ini [feature] values), the AIAEC models at their shipped grid with delay depth 8. */
+static void dfn3_target_grid(DFN3Grid *grid) {
+    const DFN2Grid *g = dfn_test_grid();
+    const DFN3GridSpec spec = {
+        .sample_rate          = g->sample_rate,
+        .n_fft                = g->n_fft,
+        .n_erb                = g->n_erb,
+        .df_bins              = g->df_bins,
+        .df_order             = g->df_order,
+        .mask_lookahead       = g->mask_lookahead,
+        .df_lookahead         = g->df_lookahead,
+        .erb_norm_tau_sec     = g->erb_norm_tau_sec,
+        .erb_norm_init_lo_db  = g->erb_norm_init_lo_db,
+        .erb_norm_init_hi_db  = g->erb_norm_init_hi_db,
+        .erb_norm_scale_db    = g->erb_norm_scale_db,
+        .spec_norm_tau_sec    = g->spec_norm_tau_sec,
+        .spec_norm_init_lo    = g->spec_norm_init_lo,
+        .spec_norm_init_hi    = g->spec_norm_init_hi,
+    };
+    assert(dfn3_grid_make(grid, &spec) == DFN3_GRID_OK);
+}
+
+static void ulcnet_target_grid(UlcnetGrid *grid) {
+    const UlcnetGridSpec spec = { .sample_rate = 16000, .n_fft = 512, .delay_depth = 8 };
+    assert(ulcnet_grid_make(grid, &spec) == ULCNET_GRID_OK);
+}
+
+static void deepvqe_target_grid(DeepVqeGrid *grid) {
+    const DeepVqeGridSpec spec = { .sample_rate = 16000, .n_fft = 512, .delay_depth = 8 };
+    assert(deepvqe_grid_make(grid, &spec) == DEEPVQE_GRID_OK);
+}
+
 /* The pre/post APIs call their descriptor query get_mem_size. */
 #define dfn2_prepost_get_mem_requirements dfn2_prepost_get_mem_size
 #define dfn3_prepost_get_mem_requirements dfn3_prepost_get_mem_size
@@ -95,6 +129,9 @@ int main(int argc, char **argv) {
     DFN3PrepostConfig dfn3;
     UlcnetPrepostConfig ulc;
     DeepVqePrepostConfig deep;
+    DFN3Grid dfn3_grid;
+    UlcnetGrid ulc_grid;
+    DeepVqeGrid deep_grid;
     DfnResStageConfig stage = dfn_res_stage_default_config(dfn_test_grid());
     DfnRateBridgeConfig bridge = dfn_rate_bridge_default_config(16000, dfn_test_grid());
 
@@ -112,11 +149,14 @@ int main(int argc, char **argv) {
         assert(argc == 1);
     }
 
+    dfn3_target_grid(&dfn3_grid);
+    ulcnet_target_grid(&ulc_grid);
+    deepvqe_target_grid(&deep_grid);
     dfn_unit_partition(erb_fwd, erb_inv, dfn_test_grid());
-    assert(dfn2_prepost_config_defaults(&dfn2, DFN2_IO_FREQ, dfn_test_grid()) == 0);
-    assert(dfn3_prepost_config_defaults(&dfn3, DFN3_IO_FREQ) == 0);
-    assert(ulcnet_prepost_config_defaults(&ulc, ULCNET_IO_FREQ, 8) == 0);
-    assert(deepvqe_prepost_config_defaults(&deep, DEEPVQE_IO_FREQ, 8) == 0);
+    assert(dfn2_prepost_config_defaults(&dfn2, dfn_test_grid()) == 0);
+    assert(dfn3_prepost_config_defaults(&dfn3, &dfn3_grid) == 0);
+    assert(ulcnet_prepost_config_defaults(&ulc, &ulc_grid) == 0);
+    assert(deepvqe_prepost_config_defaults(&deep, &deep_grid) == 0);
     dfn2.erb_fwd = dfn3.erb_fwd = erb_fwd;
     dfn2.erb_inv = dfn3.erb_inv = erb_inv;
     stage.erb_fwd = bridge.stage.erb_fwd = erb_fwd;

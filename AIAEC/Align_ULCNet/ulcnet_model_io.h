@@ -1,9 +1,7 @@
-/* Align-ULCNet stateless-accelerator model I/O state. The accelerator owns no
- * persistent state: this helper carves the K/V windows, the score-convolution
- * window and the temporal-GRU hidden tensor from one caller-provided pool. The
- * graph takes each state tensor as a full window and returns its next value as
- * *_out, bound to the address of its input (the runtime reads all state inputs
- * before writing any state output). No accelerator call and no STFT/WOLA here. */
+/* Align-ULCNet stateless-accelerator model I/O: carves the feature tensors and mask staging from a caller pool, hands
+ * out the frame's tensor views, checks and applies the graph's mask. The recurrent state is the application's: the
+ * state tensors belong to the application (on a board, the accelerator's own buffers, loaded with quantized zeros at
+ * start and whenever ulcnet_model_io_state_generation() changes) and the library knows none of their shapes. */
 #ifndef ULCNET_MODEL_IO_H
 #define ULCNET_MODEL_IO_H
 
@@ -15,81 +13,75 @@
 extern "C" {
 #endif
 
-/* Deployed boundary version; equals LAYOUT_VERSION in export_onnx.py and is the
- * only guard against binding a different boundary with identical tensor names
- * and counts. Version numbers are never reused.
- * Boundary layout (row-major ONNX order, shapes listed without batch/time):
- *   - inputs: error_mag, far_mag, error_cos, error_sin (each [1,1,BINS], from
- *     prepare()) and the state tensors
- *       key_history   [1,32,D,TA_BINS]  newest frame first
- *       value_history [1,32,D,TA_BINS]  newest frame first
- *       logit_history [1,32,5,D]        oldest frame first
- *       h_gru         [1,4,1,128]       subband-0 layers, then subband-1;
- *   - outputs: `output`, the complex mask, planar [1,2,1,BINS] (real, then
- *     imaginary), and the full next value of each state tensor as *_out;
- *   - the graph ends at the complex_mask 1x1 Conv; commit() applies the mask.
- * Runtimes bind by name, so renaming a tensor is a contract change. */
+/* Deployed boundary version; equals LAYOUT_VERSION in export_onnx.py and is the only guard against binding a
+ * different boundary with identical tensor names and counts; never reused. Row-major ONNX order, shapes without
+ * batch/time, BINS the grid's n_bins; runtimes bind by name, so renaming a tensor is a contract change.
+ *   inputs   error_mag, far_mag, error_cos, error_sin [1,1,BINS]; then, in this order and under these names, the
+ *            state tensors key_history, value_history [1,C,D,K] (newest frame first), logit_history [1,C,W,D] (oldest
+ *            first), h_gru [1,L,1,H] (subband-0 layers, then subband-1); D the delay depth, C K W L H the model's
+ *   outputs  `output`, the complex mask planar [1,2,1,BINS] (real, then imaginary), and each state tensor's full next
+ *            value as *_out; enhance_spectrum() applies the mask */
 #define ULCNET_MODEL_IO_LAYOUT_VERSION 18u
 #define ULCNET_MODEL_IO_ALIGNMENT      16u
 
-/* Front end the weights are trained against: the checkpoint's
- * linear_aec.version, written into the graph metadata (JSON / ONNX props) as
- * linear_aec_contract_version by export_onnx.py. The layout version above
- * describes only the tensor/state boundary and stays the same across
- * retrained checkpoints; this string is what tells an old graph from a current
- * one. The integrator MAY compare the metadata value against it; the C code
- * itself never reads it and never refuses a graph by front end (the check is
- * enforced in export, inference and calibration on the Python side). Its
- * error input is the AEC analysis seam (formed_hop / beam.spectrum), the real
- * selected linear residual, never the rendering base (aec_get_output_base);
- * the metadata records this as error_input_seam = analysis_formed. */
+/* The checkpoint's linear_aec.version (metadata linear_aec_contract_version): the front end the weights are trained
+ * against, error input the AEC analysis seam (metadata error_input_seam = analysis_formed); the layout version does
+ * not carry it. The integrator MAY compare it; C never reads it or refuses a graph by front end (Python enforces). */
 #define ULCNET_MODEL_IO_FRONTEND_CONTRACT "aiaec-linear-error-v4"
+
+/* Delay-depth bounds of the exporter, a sanity check only: D sizes nothing here. */
 #define ULCNET_MODEL_IO_MIN_D          2
 #define ULCNET_MODEL_IO_MAX_D          64
 
-/* Deployment grid (build parameter): one build serves one grid. Override with
- * -DULCNET_MODEL_IO_SR / -DULCNET_MODEL_IO_N_FFT (48000 / 1024 for the other
- * grid). HOP, BINS and TA_BINS = ceil(BINS/10), the temporal-attention K/V
- * width (26 at 16 kHz, 52 at 48 kHz), are derived. */
-#ifndef ULCNET_MODEL_IO_SR
-#define ULCNET_MODEL_IO_SR             16000
-#endif
-#ifndef ULCNET_MODEL_IO_N_FFT
-#define ULCNET_MODEL_IO_N_FFT          512
-#endif
-#if !((ULCNET_MODEL_IO_SR == 16000 && ULCNET_MODEL_IO_N_FFT == 512) || \
-      (ULCNET_MODEL_IO_SR == 48000 && ULCNET_MODEL_IO_N_FFT == 1024))
-#error "Align-ULCNet supports only 16000/512 or 48000/1024"
-#endif
-#define ULCNET_MODEL_IO_HOP            (ULCNET_MODEL_IO_N_FFT / 2)
-#define ULCNET_MODEL_IO_BINS           (ULCNET_MODEL_IO_N_FFT / 2 + 1)
-#define ULCNET_MODEL_IO_TA_BINS        ((ULCNET_MODEL_IO_BINS + 9) / 10)
+/* The grid and delay depth an instance runs, a run-time value: fill a UlcnetGridSpec with the model's export grid and
+ * build the UlcnetGrid with ulcnet_grid_make(): hop = n_fft / 2, n_bins = n_fft / 2 + 1 (audiolib's rule). */
+typedef struct UlcnetGridSpec {
+    int sample_rate;
+    int n_fft;
+    int delay_depth;   /* D, as exported */
+} UlcnetGridSpec;
 
-#define ULCNET_MODEL_IO_TA_CHANNELS    32
-#define ULCNET_MODEL_IO_SCORE_WINDOW   5
-/* Two subband GRUs of GRU_LAYERS layers share h_gru [1, GRU_SUBBANDS * GRU_LAYERS, 1, GRU_HIDDEN]. */
-#define ULCNET_MODEL_IO_GRU_SUBBANDS   2
-#define ULCNET_MODEL_IO_GRU_LAYERS     2
-#define ULCNET_MODEL_IO_GRU_HIDDEN     128
+typedef struct UlcnetGrid {
+    int sample_rate;
+    int n_fft;
+    int hop;
+    int n_bins;
+    int delay_depth;
+} UlcnetGrid;
 
-/* Power-law compression exponent (model.py compression_exponent). Every tool
- * touching compressed-domain tensors must use it; export_onnx.py refuses other
- * exponents. */
+enum {
+    ULCNET_GRID_OK = 0,
+    ULCNET_GRID_ERR_NULL = -1,
+    ULCNET_GRID_ERR_SAMPLE_RATE = -2,
+    ULCNET_GRID_ERR_N_FFT = -3,
+    ULCNET_GRID_ERR_DELAY_DEPTH = -4,
+    ULCNET_GRID_ERR_INCONSISTENT = -5
+};
+
+/* Derive a grid from the spec: ULCNET_GRID_OK (grid written), or the first failing check (grid untouched):
+ * sample_rate > 0; n_fft a size audiolib's framing builds (ac_stft_get_mem_size() of the default configuration is
+ * not 0); delay_depth within [ULCNET_MODEL_IO_MIN_D, ULCNET_MODEL_IO_MAX_D]. */
+int ulcnet_grid_make(UlcnetGrid *grid, const UlcnetGridSpec *spec);
+
+/* ULCNET_GRID_OK or the failing check: those of ulcnet_grid_make(), plus hop and n_bins equal to what it derives. */
+int ulcnet_grid_validate(const UlcnetGrid *grid);
+
+/* Power-law compression exponent (model.py compression_exponent); every tool on compressed-domain tensors uses it. */
 #define ULCNET_MODEL_IO_COMPRESSION_EXP 0.3f
 
-/* sign(x) * |x|^e (model.py _signed_power). */
 static inline float ulcnet_model_io_signed_pow(float value, float exponent) {
     return copysignf(powf(fabsf(value), exponent), value);
 }
 
-/* Far-input modes. Production descriptors validate only ULCNET_FAR_RAW. */
 typedef enum UlcnetFarInputMode {
     ULCNET_FAR_RAW     = 0,
     ULCNET_FAR_ALIGNED = 1
 } UlcnetFarInputMode;
 
-/* far_input_mode is a plain int so out-of-range values from ONNX/JSON metadata
- * can be rejected by descriptor_validate(). */
+/* The external contract of a graph. far_input_mode is an int so descriptor_validate() can reject out-of-range
+ * metadata. The five model-interior fields (ta_channels .. gru_hidden) are the model's: every descriptor the library
+ * builds has them 0, and it never reads, validates or sizes from them; ulcnet_model_io_init() keeps a direct caller's
+ * descriptor as passed. Check a graph's descriptor with descriptor_validate(), never with memcmp(). */
 typedef struct UlcnetModelIoDescriptor {
     uint32_t layout_version;
     int delay_depth;
@@ -97,22 +89,42 @@ typedef struct UlcnetModelIoDescriptor {
     int fft_size;
     int hop_size;
     int spectrum_bins;
-    int ta_channels;
-    int ta_bins;
-    int score_window_frames;
-    int gru_layers;
-    int gru_hidden;
-    int far_input_mode;   /* a UlcnetFarInputMode value */
+    int ta_channels;          /* model interior, never read here */
+    int ta_bins;              /* model interior, never read here */
+    int score_window_frames;  /* model interior, never read here */
+    int gru_layers;           /* model interior, never read here */
+    int gru_hidden;           /* model interior, never read here */
+    int far_input_mode;       /* a UlcnetFarInputMode value */
 } UlcnetModelIoDescriptor;
+
+#ifdef __STDC_VERSION__
+#if __STDC_VERSION__ >= 201112L
+_Static_assert(sizeof(UlcnetModelIoDescriptor) == 48,
+               "UlcnetModelIoDescriptor must stay 48 bytes");
+#endif
+#endif
 
 typedef struct UlcnetModelIoMemReq {
     size_t bytes;
     size_t alignment;
 } UlcnetModelIoMemReq;
 
-/* Pointers are flat; the *_elements counts give the tensor sizes. */
+/* Optional registration of the application's recurrent state: borrowed float buffers (never allocated, freed or
+ * resized here; they must outlive the instance) with element counts, not bytes. Either every pair is set or all are
+ * NULL/0 (nothing registered); a pointer with a count of 0, or a count with a NULL pointer, is refused. */
+typedef struct UlcnetModelIoStateBuffers {
+    float *key_history;
+    size_t key_history_elements;
+    float *value_history;
+    size_t value_history_elements;
+    float *logit_history;
+    size_t logit_history_elements;
+    float *h_gru;
+    size_t gru_hidden_elements;
+} UlcnetModelIoStateBuffers;
+
+/* Flat pointers, sizes in *_elements. The state views are the registered buffers: NULL and 0 elements when none. */
 typedef struct UlcnetModelIoInputs {
-    /* Feature tensors computed by prepare(), each [1,1,BINS]. */
     const float *error_mag;
     const float *far_mag;
     const float *error_cos;
@@ -128,12 +140,10 @@ typedef struct UlcnetModelIoInputs {
     size_t gru_hidden_elements;
 } UlcnetModelIoInputs;
 
-/* The graph's mask and the next value of every state tensor. `output` is
- * planar: BINS real then BINS imaginary values. Each *_out has the address of
- * the input it continues and is fixed for the life of the state. prepare()
- * NaN-fills `output`, so an unwritten mask is refused at commit. A refused
- * commit zeroes all four state tensors, increments
- * ulcnet_model_io_state_generation() and discards the frame. */
+/* `output` is planar: BINS real, then BINS imaginary. Each state *_out has the address of the input it continues
+ * (NULL and 0 elements when none), fixed for the life of the state: the runtime reads all state inputs before writing
+ * any state output. prepare() NaN-fills `output`, so an unwritten mask is refused by enhance_spectrum(); a refused
+ * frame zeroes the registered state, advances the generation and is discarded. */
 typedef struct UlcnetModelIoOutputs {
     float *output;
     float *key_history_out;
@@ -149,67 +159,67 @@ typedef struct UlcnetModelIoOutputs {
 
 typedef struct UlcnetModelIoState UlcnetModelIoState;
 
-/* Fill the compiled model ABI for the export-time delay depth D. The far branch
- * is always ULCNET_FAR_RAW. Returns 0, or -1 for an unsupported D or NULL output. */
-int ulcnet_model_io_descriptor_default(int delay_depth,
+/* Fill the external fields for `grid` (interior fields 0, far input raw). 0, or -1 on NULL or an invalid grid. */
+int ulcnet_model_io_descriptor_default(const UlcnetGrid *grid,
                                        UlcnetModelIoDescriptor *descriptor);
 
-/* Validate a descriptor loaded from ONNX/JSON metadata against this ABI;
- * far_input_mode must be ULCNET_FAR_RAW. Returns 0 if valid. */
+/* Validate a descriptor against `grid`: layout version, sample_rate, fft_size, hop_size and spectrum_bins equal to
+ * the grid's, far_input_mode == ULCNET_FAR_RAW, delay_depth within the exporter's bounds (not compared with
+ * grid->delay_depth: the export depth is the application's); interior fields not read. 0 if valid, -1 otherwise. */
 int ulcnet_model_io_descriptor_validate(
-    const UlcnetModelIoDescriptor *descriptor);
+    const UlcnetGrid *grid, const UlcnetModelIoDescriptor *descriptor);
 
-/* Metadata string of a far-input mode: "raw_far", "aligned_far" or "unknown".
- * Static string literal. */
+/* Derive the grid from a descriptor: 0 and *grid written if it validates against that grid, else -1 (untouched). */
+int ulcnet_model_io_descriptor_grid(const UlcnetModelIoDescriptor *descriptor,
+                                    UlcnetGrid *grid);
+
+/* Metadata string of a far-input mode ("raw_far", "aligned_far" or "unknown"); a static literal. */
 const char *ulcnet_far_input_mode_name(int mode);
 
-/* Checked align-up: rounds `value` up to a multiple of `alignment`; returns
- * nonzero on overflow or zero alignment. */
-int ulcnet_model_io_align_up(size_t value, size_t alignment, size_t *out);
+/* 0 for a valid registration (NULL counts as nothing registered), -1 otherwise. */
+int ulcnet_model_io_state_buffers_validate(
+    const UlcnetModelIoStateBuffers *buffers);
 
-/* Exact caller-pool size. The pool address passed to init() must be aligned to
- * req.alignment. RAM scales with D. */
+/* Exact caller-pool size: the state header, the feature tensors and the mask staging, each 16-byte aligned; a
+ * function of the grid, not of D. The pool address given to init() must be aligned to req.alignment. */
 int ulcnet_model_io_get_mem_requirements(
     const UlcnetModelIoDescriptor *descriptor,
     UlcnetModelIoMemReq *requirements);
 
-/* Construct inside caller memory. Returns NULL for a bad descriptor, an
- * unaligned or undersized pool, or overflow. The state starts reset (zeroed). */
+/* Construct inside caller memory; `state` registers the application's recurrent state (NULL registers nothing) and
+ * the registered buffers are zeroed. NULL for a bad descriptor or registration, an unaligned or undersized pool,
+ * or overflow; a refused call touches neither the pool nor the buffers. The generation starts at 0. */
 UlcnetModelIoState *ulcnet_model_io_init(
     void *pool,
     size_t pool_bytes,
-    const UlcnetModelIoDescriptor *descriptor);
+    const UlcnetModelIoDescriptor *descriptor,
+    const UlcnetModelIoStateBuffers *state);
 
+/* Zero the registered state tensors (none registered: nothing to zero), drop the open transaction and advance the
+ * generation. The pool, the registration and every pointer stay. NULL is ignored. */
 void ulcnet_model_io_reset(UlcnetModelIoState *state);
 
-/* Run the fixed front end (signed-power compression, magnitudes, phase cos/sin)
- * on the separate real/imag spectra, return the input views and NaN-prefill the
- * `output` mask. Call once immediately before every inference. */
+/* Run the fixed front end (signed-power compression, magnitudes, phase cos/sin) on the real/imag spectra
+ * (spectrum_bins each), return the input views, NaN-prefill `output`. Call once right before every inference. */
 int ulcnet_model_io_prepare(UlcnetModelIoState *state,
-                            const float error_re[ULCNET_MODEL_IO_BINS],
-                            const float error_im[ULCNET_MODEL_IO_BINS],
-                            const float far_re[ULCNET_MODEL_IO_BINS],
-                            const float far_im[ULCNET_MODEL_IO_BINS],
+                            const float *error_re, const float *error_im,
+                            const float *far_re, const float *far_im,
                             UlcnetModelIoInputs *inputs,
                             UlcnetModelIoOutputs *outputs);
 
-/* Validate that prepare() started a transaction and that the accelerator wrote
- * a finite mask and state (only the newest frame of each window plus the GRU
- * hidden are checked), apply the mask and inverse signed power, and write the
- * enhanced real/imag arrays. One prepare permits one commit. On a non-finite
- * value all state tensors are zeroed, the state generation advances, the
- * caller's outputs are untouched and -1 is returned. */
-int ulcnet_model_io_commit(UlcnetModelIoState *state,
-                           float enhanced_re[ULCNET_MODEL_IO_BINS],
-                           float enhanced_im[ULCNET_MODEL_IO_BINS]);
+/* Call after a successful inference; one prepare() permits one call. Checks that the accelerator wrote a finite mask
+ * and, when state is registered, finite state (every registered buffer scanned whole), then applies the mask and the
+ * inverse signed power into the enhanced arrays. On a non-finite value the registered state is zeroed, the generation
+ * advances, the caller's outputs stay untouched and -1 is returned. */
+int ulcnet_model_io_enhance_spectrum(UlcnetModelIoState *state,
+                                     float *enhanced_re, float *enhanced_im);
 
 const UlcnetModelIoDescriptor *ulcnet_model_io_descriptor(
     const UlcnetModelIoState *state);
 
-/* Counter of state restarts: increments on ulcnet_model_io_reset() and when
- * commit() refuses a frame; 0 for a fresh state. A fixed-point accelerator
- * refills its state with quantized zeros when it changes. 0 for a NULL state;
- * wraps at 2^32. */
+/* Counter of state restarts: advances on reset and when enhance_spectrum() refuses a frame, registered state or not;
+ * 0 for a fresh or NULL state; wraps at 2^32. A fixed-point accelerator (or any runtime holding the state itself)
+ * loads quantized zeros into its state at start and on every change. */
 uint32_t ulcnet_model_io_state_generation(const UlcnetModelIoState *state);
 
 #ifdef __cplusplus

@@ -175,8 +175,11 @@ estimator are the application's. Query, init and teardown:
     mcab_sample_beam_init (SRP-PHAT, BF), aec_config_from_level + aec_res_get_mem_size / aec_res_init
     (config fft_size = mcab_fft_size(p); no destroy), anr_get_mem_size / anr_init,
     ac_istft_get_mem_size / ac_istft_init (the mcab_static sample synthesis carries its own window table; optionally borrow a lane's aec_synthesis_window() as in mono),
-    ulcnet_nn_stage_mem_size / _init,
-    dfn_rate_bridge_get_mem_requirements / dfn_rate_bridge_init; mcab holds no RES)
+    ulcnet_nn_stage_mem_size(&grid, 0) / ulcnet_nn_stage_init(mem, bytes, &grid, 0) (grid from ulcnet_grid_make),
+    dfn_rate_bridge_default_config(host_rate, &model_grid) / dfn_rate_bridge_get_mem_requirements / dfn_rate_bridge_init
+    (or dfn_res_stage_default_config(&model_grid) / dfn_res_stage_get_mem_requirements / dfn_res_stage_init when the
+    host rate equals the model grid's; model_grid from dfn2_grid_make; cfg.stage.erb_fwd / erb_inv (cfg.erb_fwd / erb_inv
+    on the stage path) point into the application's ERB data); mcab holds no RES)
 
 4. process  mcab_process_front(p, mics, far, &front);              // shared delay + 4 lanes
             // your beamformer on front.linear_spectra -> weights W (+ its spectrum E); or the helper:
@@ -202,8 +205,14 @@ estimator are the application's. Query, init and teardown:
 
 The ULCNet and DFN2 examples split the hop around the model call so the
 accelerator runs between `nn_begin` and `nn_end` (the model config then needs
-no `infer` callback; a `reset` callback is still called on an alignment
-boundary and by the stage's `reset`):
+no `infer` callback). Both stages are fed the error (or beam) spectrum; the Align-ULCNet
+stage also takes the raw far hop as samples and, built with `err_analysis = 1`, can take
+the error hop as samples through its own STFT; both emit one hop of samples. The model
+libraries behind them hold no framing, FFT or window (audiolib's `AcStft` / `AcIstft` do that).
+The ULCNet stage calls the model's `reset` callback on its own reset and on an alignment
+event (a delay change, or the first transition to a solid alignment after the first hop);
+the DFN2 stage and bridge call `model.reset` (when present) on their own reset only, and an
+AEC delay change does not reset them:
 
 ```
 // ULCNet (ulcnet/ulcnet_nn_stage.h)
@@ -228,6 +237,16 @@ mask and a VAD from the lane spectra of the same hop: `mcab_sample_beam_process_
 may be NULL). `info` returns the DOA (radians, NaN when none), the BF adaptation flag and the
 alignment state (`info.delay`). `mcab_sample_beam_process_with_activity(b, mics, far, v, v, NULL, &beam, &info)` is `process_front` plus
 `process_beam(front, v, v, NULL)`.
+
+The recurrent state is the application's, not the library's. On a board the accelerator keeps it and nothing is registered with the
+library; the model callback reloads quantized zeros into the accelerator's state inputs at start and whenever the generation of the object
+that owns the restart count changes: `dfn_res_stage_state_generation()` (direct stage), `dfn_rate_bridge_state_generation()` (bridge),
+and for Align-ULCNet the generation of the pre/post class or adapter the callback drives (`ulcnet_prepost_state_generation()`,
+`ulcnet_accelerator_adapter_state_generation()`). The counter advances on a reset, on every DFN2 warm-up frame (the first `mask_lookahead` hops after a start or reset: the model runs,
+its heads are discarded and the state restarts, so the callback reloads quantized zeros after each, M times in all) and on a refused
+commit (a non-finite head) of a real frame; a model failure on a real frame and a committed frame leave it alone. It starts at 1 for the DFN2 objects and at 0 for the Align-ULCNet ones:
+compare it, never assume the value. A float host that drives a pre/post class registers its own state buffers in that class's config
+instead, and the library zeroes and checks them; the DFN2 stage and bridge register none.
 
 A frame that is never fetched, or left open at `end`, takes the
 identity, so latency does not depend on the model. Every library's pool is

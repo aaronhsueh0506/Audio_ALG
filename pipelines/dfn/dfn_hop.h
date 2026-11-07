@@ -9,9 +9,12 @@
  *                                        and synthesises the host hop itself
  *
  *     dfn_hop_begin(&h, E, P);
- *     while (dfn_hop_nn_begin(&h, &job) == 1)       // a model frame is open (0, 1 or 2 per hop)
+ *     while (dfn_hop_nn_begin(&h, &job) == 1)       // a model frame is open
  *         dfn_hop_nn_end(&h, run_model(&job));      // 0 = every output written
  *     dfn_hop_end(&h, out);                         // one host hop
+ *
+ * The stage path opens exactly one model frame per hop (the first mask_lookahead are warm-up
+ * frames: the model runs, its heads are discarded), the bridge path 0, 1 or 2 by its schedule.
  *
  * dfn_hop_process() does the same with the stage's configured model callback. The pointers
  * are not owned; the stage, bridge, synthesis and output spectrum come from the caller's
@@ -104,7 +107,7 @@ static inline int dfn_hop_begin(DfnHop* h, const Complex* e, const Complex* p) {
     } else {
         r = dfn_res_stage_begin(h->stage, e, p, &h->job);
         if (r < 0) return DFN_HOP_INVALID;
-        h->job_pending = r == 1;
+        h->job_pending = 1;
     }
     h->phase = 1;
     return 0;
@@ -154,12 +157,9 @@ static inline int dfn_hop_end(DfnHop* h, float* out) {
         h->phase = 0;
         return dfn_rate_bridge_finish(h->bridge, out) != 0 ? DFN_HOP_INVALID : 0;
     }
-    if (!h->stage_ended) {
-        int open = h->job_pending || h->phase == 2;
-        if (dfn_res_stage_end(h->stage, open ? -1 : 0, h->stage_out) < 0) {
-            h->phase = 0;
-            return DFN_HOP_INVALID;
-        }
+    if (!h->stage_ended && dfn_res_stage_end(h->stage, -1, h->stage_out) < 0) {
+        h->phase = 0;
+        return DFN_HOP_INVALID;
     }
     h->phase = 0;
     h->job_pending = 0;

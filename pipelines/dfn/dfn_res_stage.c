@@ -31,7 +31,7 @@ struct DfnResStage {
     long long frames_in;
     long long commits;
     long long skips;
-    int phase;                /* 0 idle, 1 hop begun (no model frame), 2 model frame open */
+    int phase;                /* 0 idle, 2 model frame open */
     void *owned_heap;
 };
 
@@ -84,21 +84,18 @@ static int model_valid(const DFN2Model *model, const DFN2Grid *grid) {
            dfn2_model_io_descriptor_validate(grid, model->io_descriptor) == 0;
 }
 
-/* The fail-open identity is exact only when the unit band mask expands to exactly
- * 1.0f in every bin; walk the band-major matrix in the DFN2 expansion order
- * (bands outer, bins inner) so the sums match the model path. The grid is valid, so its
- * n_bins is within the library's capacity. */
+/* The fail-open identity is exact only when the unit band mask expands to exactly 1.0f in
+ * every bin. Each bin sums its bands ascending, the order of the model path's expansion, so
+ * the sums match it bit for bit. */
 static int erb_inv_is_partition_of_unity(const float *erb_inv, const DFN2Grid *grid) {
-    float bin_gain[DFN2_MAX_N_BINS];
+    const size_t n_bins = (size_t)grid->n_bins;
     int b, k;
-    memset(bin_gain, 0, sizeof(bin_gain));
-    for (b = 0; b < grid->n_erb; ++b) {
-        const float *row = erb_inv + (size_t)b * (size_t)grid->n_bins;
-        for (k = 0; k < grid->n_bins; ++k)
-            bin_gain[k] += row[k] * 1.0f;
+    for (k = 0; k < grid->n_bins; ++k) {
+        float gain = 0.0f;
+        for (b = 0; b < grid->n_erb; ++b)
+            gain += erb_inv[(size_t)b * n_bins + (size_t)k] * 1.0f;
+        if (gain != 1.0f) return 0;
     }
-    for (k = 0; k < grid->n_bins; ++k)
-        if (bin_gain[k] != 1.0f) return 0;
     return 1;
 }
 
@@ -113,16 +110,18 @@ typedef struct Resolved {
 static int resolve(const DfnResStageConfig *cfg, Resolved *r) {
     size_t one;
     size_t total;
-    /* This object's DFN2 capacities must be the library objects': link-time check. */
+    /* Link-time check: this object's DFN2 variant (full or mask-only) is the library's. */
     DFN2_REQUIRE_VARIANT_LINK();
     if (!cfg || !r) return -1;
     if (dfn2_grid_validate(&cfg->grid) != DFN2_GRID_OK) return -1;
+    /* dfn_res_stage_lookahead_frames() is exact for one frame per call only. */
+    if (cfg->grid.frames_per_call != 1) return -1;
     one = (size_t)cfg->grid.n_bins * sizeof(float);
     if (!isfinite(cfg->atten_lim_db) || !cfg->erb_fwd || !cfg->erb_inv)
         return -1;
     if (!erb_inv_is_partition_of_unity(cfg->erb_inv, &cfg->grid)) return -1;
     if (!model_valid(&cfg->model, &cfg->grid) || backend_id() == 0u) return -1;
-    if (dfn2_prepost_config_defaults(&r->pcfg, DFN2_IO_FREQ, &cfg->grid) != 0) return -1;
+    if (dfn2_prepost_config_defaults(&r->pcfg, &cfg->grid) != 0) return -1;
     r->pcfg.erb_fwd = cfg->erb_fwd;
     r->pcfg.erb_inv = cfg->erb_inv;
     r->pcfg.atten_lim_db = cfg->atten_lim_db;
@@ -267,6 +266,10 @@ const DFN2Grid *dfn_res_stage_grid(const DfnResStage *s) {
     return s ? dfn2_prepost_grid(s->prepost) : NULL;
 }
 
+unsigned int dfn_res_stage_state_generation(const DfnResStage *s) {
+    return s ? dfn2_prepost_state_generation(s->prepost) : 0u;
+}
+
 int dfn_res_stage_output_frame_index(const DfnResStage *s, long long *frame) {
     return s ? dfn2_prepost_output_frame_index(s->prepost, frame) : -1;
 }
@@ -302,28 +305,28 @@ int dfn_res_stage_begin(DfnResStage *s,
 
     need_heads = dfn2_prepost_pre_process_freq_dual(
         s->prepost, s->est_re, s->est_im, s->app_re, s->app_im);
-    if (need_heads < 0) return -1;
-    if (need_heads &&
-        dfn2_prepost_frame_inputs(s->prepost, &job->inputs, &job->outputs) != 0)
+    if (need_heads != 1 ||
+        dfn2_prepost_frame_open(s->prepost, &job->inputs, &job->outputs) != 0)
         return -1;
-    s->phase = need_heads ? 2 : 1;
-    return need_heads ? 1 : 0;
+    s->phase = 2;
+    return 1;
 }
 
 int dfn_res_stage_end(DfnResStage *s, int model_rc, Complex *out_spec) {
     int valid = 0;
+    int committed;
     const DFN2Grid *grid;
-    if (!s || !out_spec || s->phase == 0) return -1;
+    if (!s || !out_spec || s->phase != 2) return -1;
     grid = dfn2_prepost_grid(s->prepost);
-    if (s->phase == 2) {
-        /* A failed run or an unwritten/non-finite output takes the frame as the identity;
-         * the clocks advance once. */
-        int committed = model_rc == 0 &&
-                        dfn2_prepost_frame_commit(s->prepost) == 0;
-        if (!committed && dfn2_prepost_frame_skip(s->prepost) != 0) {
-            s->phase = 0;
-            return -1;
-        }
+    /* A warm-up frame (the first mask_lookahead hops) discards its heads and is not counted. A
+     * failed run or an unwritten/non-finite output takes the frame as the identity; the clocks
+     * advance once. */
+    committed = model_rc == 0 && dfn2_prepost_frame_finish(s->prepost) == 0;
+    if (!committed && dfn2_prepost_frame_bypass(s->prepost) != 0) {
+        s->phase = 0;
+        return -1;
+    }
+    if (s->frames_in >= (long long)grid->mask_lookahead) {
         if (committed) ++s->commits;
         else ++s->skips;
     }
@@ -352,10 +355,8 @@ int dfn_res_stage_process(DfnResStage *s,
                           const Complex *apply_spec,
                           Complex *out_spec) {
     DfnResStageJob job;
-    int rc;
-    if (!out_spec) return -1;
-    rc = dfn_res_stage_begin(s, estimate_spec, apply_spec, &job);
-    if (rc < 0) return -1;
-    return dfn_res_stage_end(s, rc == 1 ? dfn_res_stage_infer(s, &job) : 0,
-                             out_spec);
+    if (!out_spec ||
+        dfn_res_stage_begin(s, estimate_spec, apply_spec, &job) != 1)
+        return -1;
+    return dfn_res_stage_end(s, dfn_res_stage_infer(s, &job), out_spec);
 }

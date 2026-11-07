@@ -1,5 +1,11 @@
 /* Whole-chain digests of the DeepFilterNet2 and GTCRN pre/post chains.
  *
+ * DeepFilterNet2 returns 1 from pre_process_freq on every hop; its first mask_lookahead hops are warm-up
+ * frames whose heads are discarded. The DFN2 chain below drives each as a discarded frame (garbage over the
+ * state, heads left NaN, finish must return 0, state zero, generation +1 exactly), draws no random number
+ * for it and hashes none of it (pre_process result 0, generation less the warm-up steps), so its digests
+ * are those of a stream without warm-up frames.
+ *
  * Each chain runs HOPS hops through its public frequency-domain API with a
  * seeded generator: spectra in, stand-in model outputs back (plausible values
  * plus tiny, huge and non-finite heads, non-finite state, a skipped and an
@@ -8,6 +14,11 @@
  * program prints one digest per chain; the NEON and forced-scalar builds must
  * match (`make test-simd`), and a second run in the process must reproduce its
  * own digest, which catches state read before it is written.
+ *
+ * The recurrent state is the host's: float buffers registered in the DFN2 config
+ * and the eight GTCRN tensors as slices of one array. Each chain checks the
+ * registered element counts first, so a forgotten registration cannot hash zero
+ * elements and still agree between builds.
  *
  * The DeepFilterNet2 grid and lookahead pair are chosen when the program is
  * built (dfn2_test_grid.h: -DDFN2_GRID_KHZ=16|32|48, -DDFN2_MASK_LOOKAHEAD,
@@ -23,6 +34,7 @@
 #include "DeepFilterNet2/dfn2_prepost.h"
 #include "GTCRN/gtcrn_process.h"
 #include "dfn2_test_grid.h"
+#include "gtcrn_test_grid.h"
 
 #define HOPS 640
 
@@ -140,6 +152,8 @@ static int is_bad_state(int kind)
 
 /* ---- DeepFilterNet2 ---------------------------------------------------- */
 
+static float dfn_gru[DFN2_TEST_GRU_ELEMENTS];
+static float dfn_convp[DFN2_TEST_CONVP_ELEMENTS];
 static float dfn_fwd_a[DFN2_N_BINS * DFN2_N_ERB];
 static float dfn_inv_a[DFN2_N_ERB * DFN2_N_BINS];
 static float dfn_fwd_b[DFN2_N_BINS * DFN2_N_ERB];
@@ -211,15 +225,20 @@ static uint64_t run_dfn2(void)
     digest_init(&d);
     dfn_tables_triangular(dfn_fwd_a, dfn_inv_a);
     dfn_tables_irregular(dfn_fwd_b, dfn_inv_b);
-    if (dfn2_prepost_config_defaults(&cfg, DFN2_IO_FREQ, grid) != 0) exit(2);
+    if (dfn2_prepost_config_defaults(&cfg, grid) != 0) exit(2);
     cfg.erb_fwd = dfn_fwd_a;
     cfg.erb_inv = dfn_inv_a;
+    cfg.gru_hidden = dfn_gru;
+    cfg.gru_hidden_elements = DFN2_TEST_GRU_ELEMENTS;
+    cfg.df_convp_history = dfn_convp;
+    cfg.df_convp_history_elements = DFN2_TEST_CONVP_ELEMENTS;
     p = dfn2_prepost_create(&cfg);
     if (!p) exit(2);
     if (dfn2_prepost_hop_size(p) != DFN2_HOP_LEN ||
         dfn2_prepost_num_bins(p) != DFN2_N_BINS) exit(2);
     for (int h = 0; h < HOPS; ++h) {
         int v, valid = 0, kind = hop_kind(h);
+        const int warm = h < grid->mask_lookahead;
         if (h == HOPS / 3)
             hash_u32(&d.status, (uint32_t)dfn2_prepost_set_atten_lim(p, 12.0f));
         if (h == HOPS / 2)
@@ -233,25 +252,43 @@ static uint64_t run_dfn2(void)
         } else {
             v = dfn2_prepost_pre_process_freq(p, re, im);
         }
-        hash_u32(&d.status, (uint32_t)v);
-        if (v == 1) {
+        if (warm && v != 1) exit(2);
+        hash_u32(&d.status, warm ? 0u : (uint32_t)v);
+        if (warm) {
+            DFN2PrepostInputs in;
+            DFN2PrepostOutputs out;
+            const unsigned generation = dfn2_prepost_state_generation(p);
+            if (dfn2_prepost_frame_open(p, &in, &out) != 0) exit(2);
+            for (size_t i = 0; i < DFN2_TEST_GRU_ELEMENTS; ++i) dfn_gru[i] = 99.0f;
+            for (size_t i = 0; i < DFN2_TEST_CONVP_ELEMENTS; ++i) dfn_convp[i] = -99.0f;
+            if (dfn2_prepost_frame_finish(p) != 0 ||
+                dfn2_prepost_state_generation(p) != generation + 1u) exit(2);
+            for (size_t i = 0; i < DFN2_TEST_GRU_ELEMENTS; ++i)
+                if (dfn_gru[i] != 0.0f) exit(2);
+            for (size_t i = 0; i < DFN2_TEST_CONVP_ELEMENTS; ++i)
+                if (dfn_convp[i] != 0.0f) exit(2);
+        } else if (v == 1) {
             DFN2PrepostInputs in;
             DFN2PrepostOutputs out;
             float* gru;
             float* convp;
             int rc, skipped = 0;
-            if (dfn2_prepost_frame_inputs(p, &in, &out) != 0) exit(2);
+            if (dfn2_prepost_frame_open(p, &in, &out) != 0) exit(2);
             if (in.erb_window_elements != dfn2_prepost_erb_window_elements(grid) ||
                 in.spec_window_elements != dfn2_prepost_spec_window_elements(grid) ||
-                in.df_convp_window_elements !=
-                    dfn2_prepost_convp_window_elements(grid) ||
+                in.gru_hidden != dfn_gru ||
+                in.gru_hidden_elements != DFN2_TEST_GRU_ELEMENTS ||
+                in.df_convp_window != dfn_convp ||
+                in.df_convp_window_elements != DFN2_TEST_CONVP_ELEMENTS ||
+                out.gru_hidden_next != dfn_gru ||
+                out.df_convp_window_next != dfn_convp ||
                 out.erb_mask_elements != dfn2_prepost_erb_mask_elements(grid) ||
                 out.coefs_elements != dfn2_prepost_coefs_elements(grid)) exit(2);
             hash_f32(&d.in, in.erb_window, in.erb_window_elements);
             hash_f32(&d.in, in.spec_window, in.spec_window_elements);
-            hash_f32(&d.in, &in.gru_hidden[0][0], in.gru_hidden_elements);
+            hash_f32(&d.in, in.gru_hidden, in.gru_hidden_elements);
             hash_f32(&d.in, in.df_convp_window, in.df_convp_window_elements);
-            gru = &out.gru_hidden_next[0][0];
+            gru = out.gru_hidden_next;
             convp = out.df_convp_window_next;
             if (kind != K_SKIP && kind != K_UNWRITTEN) {
                 dfn_write_heads(&out, kind);
@@ -267,12 +304,13 @@ static uint64_t run_dfn2(void)
                                 poison_where(kind), h);
                 }
             }
-            rc = kind == K_SKIP ? dfn2_prepost_frame_skip(p)
-                                : dfn2_prepost_frame_commit(p);
-            if (rc != 0 && kind != K_SKIP) skipped = dfn2_prepost_frame_skip(p);
+            rc = kind == K_SKIP ? dfn2_prepost_frame_bypass(p)
+                                : dfn2_prepost_frame_finish(p);
+            if (rc != 0 && kind != K_SKIP) skipped = dfn2_prepost_frame_bypass(p);
             hash_u32(&d.status, (uint32_t)rc);
             hash_u32(&d.status, (uint32_t)skipped);
-            hash_u32(&d.status, dfn2_prepost_state_generation(p));
+            hash_u32(&d.status, dfn2_prepost_state_generation(p) -
+                                    (unsigned)grid->mask_lookahead);
             hash_f32(&d.state, gru, in.gru_hidden_elements);
             hash_f32(&d.state, convp, in.df_convp_window_elements);
         }
@@ -290,10 +328,11 @@ static uint64_t run_dfn2(void)
 
 /* ---- GTCRN ------------------------------------------------------------- */
 
-#define GT_HIGH_BINS GTCRN_MODEL_ERB_HIGH_BINS
-#define GT_HIGH_BANDS GTCRN_MODEL_ERB_HIGH_BANDS
-#define GT_STATE_FLOATS \
-    (offsetof(GTCRNModelState, state_generation) / sizeof(float))
+#define GT_N_BINS GTCRN_TEST_N_BINS
+#define GT_BANDS GTCRN_TEST_ERB_BANDS
+#define GT_HIGH_BINS GTCRN_TEST_ERB_HIGH_BINS
+#define GT_HIGH_BANDS GTCRN_TEST_ERB_HIGH_BANDS
+#define GT_STATE_FLOATS GTCRN_TEST_STATE_FLOATS
 
 static float gt_fwd_a[GT_HIGH_BINS * GT_HIGH_BANDS];
 static float gt_inv_a[GT_HIGH_BANDS * GT_HIGH_BINS];
@@ -326,54 +365,72 @@ static void gt_tables_dense(float* fwd, float* inv)
 
 static uint64_t run_gtcrn(void)
 {
-    static GTCRNModelState state;
-    static float spec[GTCRN_N_BINS][2], enh[GTCRN_N_BINS][2];
-    static float re[GTCRN_N_BINS], im[GTCRN_N_BINS];
-    float mag[GTCRN_MODEL_ERB_BANDS], rp[GTCRN_MODEL_ERB_BANDS],
-        ip[GTCRN_MODEL_ERB_BANDS], mask[GTCRN_MODEL_ERB_BANDS][2];
-    float* state_f = (float*)&state;
+    static float state_f[GT_STATE_FLOATS];
+    static float spec[GT_N_BINS * 2], enh[GT_N_BINS * 2];
+    static float re[GT_N_BINS], im[GT_N_BINS];
+    float mag[GT_BANDS], rp[GT_BANDS], ip[GT_BANDS], mask[GT_BANDS * 2];
+    GTCRNProcessConfig cfg;
+    GTCRNProcessMemReq req;
+    GTCRNProcess* p;
+    void* pool;
     Digest d;
     rng_state = RNG_SEED;
-    memset(&state, 0, sizeof(state));
+    memset(state_f, 0, sizeof(state_f));
     digest_init(&d);
     gt_tables_sparse(gt_fwd_a, gt_inv_a);
     gt_tables_dense(gt_fwd_b, gt_inv_b);
-    gtcrn_model_state_init(&state);
+    if (gtcrn_process_config_defaults(&cfg, gtcrn_test_grid()) != 0) exit(2);
+    cfg.erb_fwd = gt_fwd_a;
+    cfg.erb_inv = gt_inv_a;
+    gtcrn_test_register(&cfg, state_f);
+    {
+        size_t total = 0;
+        for (int i = 0; i < GTCRN_STATE_COUNT; ++i) {
+            if (cfg.state[i] == NULL ||
+                cfg.state_elements[i] != gtcrn_test_state_elements[i]) exit(2);
+            total += cfg.state_elements[i];
+        }
+        if (total != GT_STATE_FLOATS) exit(2);
+    }
+    if (gtcrn_process_get_mem_size(&cfg, &req) != 0) exit(2);
+    pool = aligned_alloc(16, ((size_t)req.bytes + 15u) & ~(size_t)15u);
+    p = pool ? gtcrn_process_init(pool, (size_t)req.bytes, &cfg) : NULL;
+    if (!p) exit(2);
     for (int h = 0; h < HOPS; ++h) {
         int kind = hop_kind(h);
-        const float* fwd = h < HOPS / 2 ? gt_fwd_a : gt_fwd_b;
-        const float* inv = h < HOPS / 2 ? gt_inv_a : gt_inv_b;
-        make_spectrum(h, GTCRN_N_BINS, re, im);
-        for (int k = 0; k < GTCRN_N_BINS; ++k) {
-            spec[k][0] = re[k];
-            spec[k][1] = im[k];
+        if (h == HOPS / 2 &&
+            gtcrn_process_set_erb_matrices(p, gt_fwd_b, gt_inv_b) != 0) exit(2);
+        make_spectrum(h, GT_N_BINS, re, im);
+        for (int k = 0; k < GT_N_BINS; ++k) {
+            spec[2 * k] = re[k];
+            spec[2 * k + 1] = im[k];
         }
-        gtcrn_model_input((const float (*)[2])spec, fwd, mag, rp, ip);
-        hash_f32(&d.in, mag, GTCRN_MODEL_ERB_BANDS);
-        hash_f32(&d.in, rp, GTCRN_MODEL_ERB_BANDS);
-        hash_f32(&d.in, ip, GTCRN_MODEL_ERB_BANDS);
+        gtcrn_model_input(p, spec, mag, rp, ip);
+        hash_f32(&d.in, mag, GT_BANDS);
+        hash_f32(&d.in, rp, GT_BANDS);
+        hash_f32(&d.in, ip, GT_BANDS);
         hash_f32(&d.in, state_f, GT_STATE_FLOATS);
         if (kind == K_SKIP || kind == K_UNWRITTEN) {
-            for (int i = 0; i < GTCRN_MODEL_ERB_BANDS; ++i) {
-                mask[i][0] = 1.0f;
-                mask[i][1] = 0.0f;
+            for (int i = 0; i < GT_BANDS; ++i) {
+                mask[2 * i] = 1.0f;
+                mask[2 * i + 1] = 0.0f;
             }
         } else {
-            fill(&mask[0][0], 2 * GTCRN_MODEL_ERB_BANDS, 0.5f * kind_scale(kind));
+            fill(mask, 2 * GT_BANDS, 0.5f * kind_scale(kind));
             fill(state_f, GT_STATE_FLOATS, kind_scale(kind));
-            if (kind == K_BAD_HEAD) mask[(h * 37) % GTCRN_MODEL_ERB_BANDS][h & 1] = NAN;
+            if (kind == K_BAD_HEAD) mask[2 * ((h * 37) % GT_BANDS) + (h & 1)] = NAN;
             if (kind == K_BAD_HEAD_INF)
-                mask[(h * 37) % GTCRN_MODEL_ERB_BANDS][h & 1] = INFINITY;
+                mask[2 * ((h * 37) % GT_BANDS) + (h & 1)] = INFINITY;
             if (is_bad_state(kind))
                 poison(state_f, GT_STATE_FLOATS, poison_where(kind), h);
         }
-        hash_u32(&d.status, (uint32_t)gtcrn_model_state_validate(&state));
-        hash_u32(&d.status, gtcrn_model_state_generation(&state));
+        hash_u32(&d.status, (uint32_t)gtcrn_process_state_validate(p));
+        hash_u32(&d.status, gtcrn_process_state_generation(p));
         hash_f32(&d.state, state_f, GT_STATE_FLOATS);
-        gtcrn_model_output((const float (*)[2])mask, inv,
-                           (const float (*)[2])spec, enh);
-        hash_f32(&d.post, &enh[0][0], 2 * GTCRN_N_BINS);
+        gtcrn_model_output(p, mask, spec, enh);
+        hash_f32(&d.post, enh, 2 * GT_N_BINS);
     }
+    free(pool);
     printf("  gtcrn  in=%016llx state=%016llx post=%016llx status=%016llx\n",
            (unsigned long long)d.in, (unsigned long long)d.state,
            (unsigned long long)d.post, (unsigned long long)d.status);

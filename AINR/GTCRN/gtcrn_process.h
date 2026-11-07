@@ -1,148 +1,166 @@
+/* GTCRN pre/post-processing around the graph, for the GTCRNGrid in its config. Per hop:
+ * model_input, graph, mask_validate, state_validate, model_output (pass the spectrum through on
+ * -1). Spectra in, spectrum out: the STFT / ISTFT are audiolib's (AcStft / AcIstft), configured
+ * by ac_stft_config_default(&sc, grid.n_fft) to GTCRN's training framing: periodic
+ * sqrt-Hann, center 0, hop = grid.hop = n_fft / 2, spec_scale = ispec_scale = 1.0f
+ * (unnormalised, not torch normalized=True), ola = AC_OLA_ACCUMULATE. One frame per graph call
+ * (its history is in the state tensors): do not pad it to several frames. */
+
 #ifndef GTCRN_PROCESS_H
 #define GTCRN_PROCESS_H
+
+#include <stddef.h>
+#include <stdint.h>
 
 #ifdef __cplusplus
 extern "C" {
 #endif
 
-#include "audio_stft.h"
-
-#define GTCRN_SR       16000
-#define GTCRN_N_FFT    512
-#define GTCRN_N_BINS   257
-#define GTCRN_WIN_LEN  512
-#define GTCRN_HOP_LEN  256
-
-/* Explicit model-state tensors (export_onnx.py). The accelerator retains nothing
- * between invocations: GTCRNModelState is the state buffer. Bind each graph state
- * input and its matching *_out output to the same struct field (read every state
- * input before writing any state output) and call gtcrn_model_state_validate()
- * after each invocation. Every tensor is rank 4 with the same shape at input and
- * output:
- *   conv_enc0 / conv_enc0_out ... conv_dec2 / conv_dec2_out
- *       [1, 16, window, 33]   -> &state->conv_enc0 ... &state->conv_dec2
- *   h_tra / h_tra_out         [1, 6, 1, 16]   -> &state->h_tra
- *   h_dpgrnn / h_dpgrnn_out   [1, 4, 33, 8]   -> &state->h_dpgrnn
- * Each conv tensor is the full causal window of one depthwise convolution. h_tra
- * rows are the six TRA attention GRUs (encoder 0-2, decoder 0-2); h_dpgrnn rows
- * are h_dpgrnn1_0, h_dpgrnn1_1, h_dpgrnn2_0, h_dpgrnn2_1, with the frequency axis
- * as the GRU batch. Layout versions 3-7 are never reused. */
+/* Layout of the graph's state tensors (export_onnx.py). Layout versions 3-7 are never reused. */
 #define GTCRN_MODEL_LAYOUT_VERSION 8
-#define GTCRN_MODEL_ERB_KEPT       65   /* low bins passed through          */
-#define GTCRN_MODEL_ERB_HIGH_BANDS 64   /* compressed high bands            */
-#define GTCRN_MODEL_ERB_BANDS      129  /* KEPT + HIGH_BANDS = E            */
-#define GTCRN_MODEL_ERB_HIGH_BINS  192  /* N_BINS - KEPT                    */
-#define GTCRN_MODEL_CONV_STATES    6
-#define GTCRN_MODEL_CONV_CHANNELS  16
-#define GTCRN_MODEL_CONV_WINDOW_0  3
-#define GTCRN_MODEL_CONV_WINDOW_1  5
-#define GTCRN_MODEL_CONV_WINDOW_2  11
-#define GTCRN_MODEL_CONV_FREQ      33
-#define GTCRN_MODEL_TRA_GRUS       6
-#define GTCRN_MODEL_TRA_HIDDEN     16
-#define GTCRN_MODEL_DPGRNN_GRUS    4
-#define GTCRN_MODEL_DPGRNN_FREQ    33
-#define GTCRN_MODEL_DPGRNN_HIDDEN  8
 
-/* state_generation advances whenever this library zeroes the state (reset, or a
- * refused validation); a runtime holding a fixed-point copy refills it with
- * quantized zeros when gtcrn_model_state_generation() changes. */
-typedef struct {
-    /* conv_enc0..2 then conv_dec0..2; decoder windows reverse the encoder's
-     * [3,5,11]. The leading batch extent is one and occupies no C dimension. */
-    float conv_enc0[GTCRN_MODEL_CONV_CHANNELS]
-                   [GTCRN_MODEL_CONV_WINDOW_0][GTCRN_MODEL_CONV_FREQ];
-    float conv_enc1[GTCRN_MODEL_CONV_CHANNELS]
-                   [GTCRN_MODEL_CONV_WINDOW_1][GTCRN_MODEL_CONV_FREQ];
-    float conv_enc2[GTCRN_MODEL_CONV_CHANNELS]
-                   [GTCRN_MODEL_CONV_WINDOW_2][GTCRN_MODEL_CONV_FREQ];
-    float conv_dec0[GTCRN_MODEL_CONV_CHANNELS]
-                   [GTCRN_MODEL_CONV_WINDOW_2][GTCRN_MODEL_CONV_FREQ];
-    float conv_dec1[GTCRN_MODEL_CONV_CHANNELS]
-                   [GTCRN_MODEL_CONV_WINDOW_1][GTCRN_MODEL_CONV_FREQ];
-    float conv_dec2[GTCRN_MODEL_CONV_CHANNELS]
-                   [GTCRN_MODEL_CONV_WINDOW_0][GTCRN_MODEL_CONV_FREQ];
-    /* ONNX h_tra [1,6,1,16]. */
-    float h_tra[GTCRN_MODEL_TRA_GRUS][1][GTCRN_MODEL_TRA_HIDDEN];
-    /* ONNX h_dpgrnn [1,4,33,8]: two real GRUs per grouped inter-RNN, frequency
-     * lanes as batch. */
-    float h_dpgrnn[GTCRN_MODEL_DPGRNN_GRUS][GTCRN_MODEL_DPGRNN_FREQ]
-                  [GTCRN_MODEL_DPGRNN_HIDDEN];
-    unsigned int state_generation;
-} GTCRNModelState;
+/* Bumped on any change of pool size, carve order or MemReq content; CARVE enters the hash. */
+#define GTCRN_PROCESS_DESCRIPTOR_VERSION 1u
+#define GTCRN_PROCESS_CARVE_VERSION      1u
 
-/* Framing objects, caller-owned and borrowed; the loader owns every resource. */
-typedef struct {
-    AcStft*  stft;
-    AcIstft* istft;
-} GTCRNProcessState;
+#define GTCRN_PROCESS_ALIGNMENT 16u
 
-/* Config of the two framing objects, for ac_stft/ac_istft get_mem_size and init:
- * 512-point sqrt-Hann, hop 256, no centering, unscaled spectra. `fft` is a
- * GTCRN_N_FFT handle shared by both objects; `window` is a shared GTCRN_WIN_LEN
- * table, or NULL for the analysis object to carve one that the synthesis object
- * borrows. Borrowed tables stay alive and unchanged as long as the objects. */
-void gtcrn_framing_config(AcStftConfig* cfg, FftHandle* fft,
-                          const float* window);
+/* The eight state tensors belong to the application: each state input and its *_out output
+ * (same shape) are bound to one buffer (read every state input before writing any state output),
+ * zero-loaded (quantised) at start and whenever gtcrn_process_state_generation() changes. */
+typedef enum GTCRNStateId {   /* graph order */
+    GTCRN_STATE_CONV_ENC0 = 0,
+    GTCRN_STATE_CONV_ENC1,
+    GTCRN_STATE_CONV_ENC2,
+    GTCRN_STATE_CONV_DEC0,
+    GTCRN_STATE_CONV_DEC1,
+    GTCRN_STATE_CONV_DEC2,
+    GTCRN_STATE_H_TRA,
+    GTCRN_STATE_H_DPGRNN,
+    GTCRN_STATE_COUNT     /* the graph's tensor count, not a capacity */
+} GTCRNStateId;
 
-/* Bind the objects (either may be NULL where only the other direction is
- * used) and reset them. */
-void gtcrn_process_init(GTCRNProcessState* state, AcStft* stft,
-                        AcIstft* istft);
+typedef struct GTCRNGridSpec {   /* what an exported model fixes (config.ini) */
+    int n_fft;            /* frame size = window length                                   */
+    int erb_low_bins;     /* erb_subband_1: the lowest bins, passed through unbanded       */
+    int erb_high_bands;   /* erb_subband_2: the ERB bands the remaining bins compress into */
+} GTCRNGridSpec;
 
-/* First construction: zero the state and start the generation at 1. A state in
- * use goes through gtcrn_model_state_reset(). The caller zeroes the accelerator
- * state once afterwards. */
-void gtcrn_model_state_init(GTCRNModelState* state);
+typedef struct GTCRNGrid {
+    int n_fft;
+    int hop;              /* n_fft / 2                                   */
+    int n_bins;           /* n_fft / 2 + 1                               */
+    int erb_low_bins;
+    int erb_high_bands;
+    int erb_bands;        /* erb_low_bins + erb_high_bands: the model's F */
+    int erb_high_bins;    /* n_bins - erb_low_bins                       */
+} GTCRNGrid;
 
-/* Zero every state tensor and advance the generation. NULL is ignored. */
-void gtcrn_model_state_reset(GTCRNModelState* state);
+enum {
+    GTCRN_GRID_OK = 0,
+    GTCRN_GRID_ERR_NULL = -1,
+    GTCRN_GRID_ERR_N_FFT = -2,
+    GTCRN_GRID_ERR_ERB_LOW_BINS = -3,
+    GTCRN_GRID_ERR_ERB_HIGH_BANDS = -4,
+    GTCRN_GRID_ERR_INCONSISTENT = -5
+};
 
-/* The generation: 1 after init, plus one for each reset and each refused
- * validation, modulo 2^32. 0 for NULL. */
-unsigned int gtcrn_model_state_generation(const GTCRNModelState* state);
+/* Derive a grid: GTCRN_GRID_OK (written) or the first failing check (grid untouched): n_fft
+ * accepted by audiolib, erb_low_bins in [0, n_bins - 1], erb_high_bands in [1, erb_high_bins]. */
+int gtcrn_grid_make(GTCRNGrid* grid, const GTCRNGridSpec* spec);
 
-/* The three model-input frames from one analysis frame: [sqrt(re^2 + im^2 +
- * 1e-12), re, im], each banded through the exported ERB forward matrix (low bins
- * pass through, high bins compress to bands). All fixed compute runs here in
- * fp32; the quantized graph holds learned compute only.
- *
- * erb_fwd is the caller-loaded erb_fwd.bin from export_erb_matrix.py: raw float32
- * little-endian, bin-major [GTCRN_MODEL_ERB_HIGH_BINS][GTCRN_MODEL_ERB_HIGH_BANDS].
- * The library never touches the filesystem. */
-void gtcrn_model_input(const float spectrum[GTCRN_N_BINS][2],
-                       const float* erb_fwd,
-                       float mag[GTCRN_MODEL_ERB_BANDS],
-                       float real_part[GTCRN_MODEL_ERB_BANDS],
-                       float imag_part[GTCRN_MODEL_ERB_BANDS]);
+int gtcrn_grid_validate(const GTCRNGrid* grid);   /* make's checks, derived fields included */
 
-/* The fixed back end: expand the graph's ERB-domain complex mask through the
- * caller-loaded erb_inv.bin (raw float32 little-endian, band-major
- * [GTCRN_MODEL_ERB_HIGH_BANDS][GTCRN_MODEL_ERB_HIGH_BINS]) and apply the complex
- * ratio mask to the same analysis frame the inputs came from. */
-void gtcrn_model_output(const float mask_erb[GTCRN_MODEL_ERB_BANDS][2],
-                        const float* erb_inv,
-                        const float spectrum[GTCRN_N_BINS][2],
-                        float enhanced[GTCRN_N_BINS][2]);
+const char* gtcrn_grid_status_text(int status);   /* for a log line; never NULL */
 
-/* Finite-check the state in place after an invocation (the *_out outputs are
- * bound to the same fields as the inputs, so nothing is copied). Returns 0 when
- * every element of the conv windows, h_tra and h_dpgrnn is finite, -1 on a NULL
- * argument. A NaN or Inf anywhere zeroes the whole state, advances the generation
- * and returns -1. A finite partial write is not detectable. */
-int gtcrn_model_state_validate(GTCRNModelState* state);
+typedef struct GTCRNProcessConfig {
+    GTCRNGrid    grid;          /* gtcrn_grid_make(); copied at init                         */
+    /* Required, borrowed, never copied; the library never touches the filesystem. */
+    const float* erb_fwd;       /* bin-major  [erb_high_bins][erb_high_bands] */
+    const float* erb_inv;       /* band-major [erb_high_bands][erb_high_bins] */
+    /* Optional, for a host working on float copies: borrowed (pointer, element count) pairs by
+     * GTCRNStateId. Either all eight pairs are set or none; a pointer with a count of 0 and a
+     * count with a NULL pointer are refused. Not part of the pool size or the hash. */
+    float*       state[GTCRN_STATE_COUNT];
+    size_t       state_elements[GTCRN_STATE_COUNT];   /* elements, not bytes */
+} GTCRNProcessConfig;
 
-/* HOP_LEN new samples -> one unnormalised complex RFFT frame. The network
- * input layout is bin-major [re,im], matching model.py's [F,T,2]. */
-void gtcrn_analysis(GTCRNProcessState* state, const float* input,
-                    float output[GTCRN_N_BINS][2]);
+typedef struct GTCRNProcessMemReq {
+    uint32_t descriptor_version;  /* GTCRN_PROCESS_DESCRIPTOR_VERSION                         */
+    uint32_t layout_version;      /* GTCRN_MODEL_LAYOUT_VERSION                               */
+    uint32_t reserved0;           /* 0                                                        */
+    uint32_t build_flags_hash;    /* FNV-1a-32 over the whole grid, layout and carve versions */
+    uint32_t alignment;
+    uint32_t reserved1;           /* 0                                                        */
+    uint64_t bytes;
+} GTCRNProcessMemReq;
 
-/* One enhanced [F,2] network-output frame -> HOP_LEN WOLA samples. */
-void gtcrn_synthesis(GTCRNProcessState* state,
-                     const float input[GTCRN_N_BINS][2],
-                     float* output);
+#ifdef __STDC_VERSION__
+#if __STDC_VERSION__ >= 201112L
+_Static_assert(sizeof(GTCRNProcessMemReq) == 32,
+               "GTCRNProcessMemReq must stay 32 bytes");
+#endif
+#endif
 
-const char* gtcrn_simd_backend(void);
+/* Not reentrant: one instance per stream, and model_input / model_output of one instance share
+ * its scratch. */
+typedef struct GTCRNProcess GTCRNProcess;
+
+/* Config for `grid` (copied), matrices and state NULL / 0. Returns 0, or -1 on NULL or bad grid. */
+int gtcrn_process_config_defaults(GTCRNProcessConfig* cfg, const GTCRNGrid* grid);
+
+/* Exact pool size; -1 (req untouched) on NULL, a bad grid, a missing matrix or bad registration. */
+int gtcrn_process_get_mem_size(const GTCRNProcessConfig* cfg, GTCRNProcessMemReq* req);
+
+/* Construct in `pool` (16-byte aligned, `bytes` >= req.bytes); NULL, nothing written, on a bad
+ * config or pool. Zeroes the pool and registered state and starts the generation at 1; an
+ * instance in use goes through gtcrn_process_reset(). The caller zeroes the accelerator's state
+ * once. */
+GTCRNProcess* gtcrn_process_init(void* pool, size_t bytes, const GTCRNProcessConfig* cfg);
+
+/* As _init; NULL when a non-NULL `expected` differs from the config's own requirement. */
+GTCRNProcess* gtcrn_process_init_ex(void* pool, size_t bytes, const GTCRNProcessConfig* cfg,
+                                    const GTCRNProcessMemReq* expected);
+
+/* Zero the registered state and advance the generation; config and pool untouched. NULL ignored. */
+void gtcrn_process_reset(GTCRNProcess* p);
+
+/* State generation: 1 after init, +1 per reset and per refused validation (mod 2^32); 0 for NULL.
+ * The generation is kept whether or not a state is registered. */
+unsigned int gtcrn_process_state_generation(const GTCRNProcess* p);
+
+const GTCRNGrid* gtcrn_process_grid(const GTCRNProcess* p);   /* lives as long as the instance */
+
+/* Replace the ERB matrices (same layouts as the config), borrowed. Returns 0, or -1 on NULL. */
+int gtcrn_process_set_erb_matrices(GTCRNProcess* p, const float* erb_fwd, const float* erb_inv);
+
+/* [sqrt(re^2 + im^2 + 1e-12), re, im] of one analysis frame, each banded through the forward
+ * matrix (low bins pass through). `spectrum` is interleaved [n_bins][2]; mag, real_part and
+ * imag_part are erb_bands floats each, not overlapping it. A NULL argument is a no-op. */
+void gtcrn_model_input(GTCRNProcess* p, const float* spectrum, float* mag, float* real_part,
+                       float* imag_part);
+
+/* Expand the graph's ERB-domain complex mask (interleaved [erb_bands][2]) through the inverse
+ * matrix and apply it to the frame the inputs came from. `enhanced` is interleaved [n_bins][2]
+ * and may be the spectrum itself. The mask is checked by mask_validate, not here. A NULL
+ * argument is a no-op. */
+void gtcrn_model_output(GTCRNProcess* p, const float* mask_erb, const float* spectrum,
+                        float* enhanced);
+
+/* Finite-check all eight registered buffers in place after an invocation. Returns 0 when all
+ * are finite or nothing is registered, -1 on NULL. A NaN or Inf anywhere zeroes all eight
+ * buffers, advances the generation and returns -1; a runtime that holds the state itself
+ * refills it when the generation changes. A finite partial write is not detectable. */
+int gtcrn_process_state_validate(GTCRNProcess* p);
+
+/* Finite-check the ERB-domain mask (interleaved [erb_bands][2]) after an invocation, state
+ * registered or not. A NaN or Inf refuses as state_validate does (-1: pass the spectrum through
+ * instead of gtcrn_model_output()); finite: 0; NULL: -1. Call it before
+ * gtcrn_process_state_validate() (the pair then advances the generation at most once). To detect
+ * a mask the accelerator did not write, fill it with NaN first. */
+int gtcrn_process_mask_validate(GTCRNProcess* p, const float* mask_erb);
+
+const char* gtcrn_simd_backend(void);   /* kernel backend name, for a log line */
 
 #ifdef __cplusplus
 }

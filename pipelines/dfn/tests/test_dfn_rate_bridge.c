@@ -1,9 +1,11 @@
 /* dfn_rate_bridge acceptance test (no AEC): the count schedule and its
  * prefill, the added-delay constant pinned by an impulse, the tolerance
- * identity through the resampler round trip, the estimate/apply split, and
- * reset parity, on every supported native grid. Spectra are produced by the
- * same sqrt-Hann 50%-overlap analysis the hosting pipelines perform, so the
- * bridge sees exactly the frames it will see in product. */
+ * identity through the resampler round trip, the estimate/apply split, reset
+ * parity and the state generation, on every supported native grid, and the
+ * reject-first configuration rows (a model grid other than 48 kHz / 1024 with
+ * one frame per call, a foreign model). Spectra are produced by the same
+ * sqrt-Hann 50%-overlap analysis the hosting pipelines perform, so the bridge
+ * sees exactly the frames it will see in product. */
 #include <math.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -23,6 +25,7 @@
 
 #define MAX_FFT 512
 #define MAX_HOPS 200
+#define M_FRAMES DFN2_MASK_LOOKAHEAD   /* warm-up stage frames after a start or reset */
 
 static float erb_fwd[DFN2_N_BINS * DFN2_N_ERB];
 static float erb_inv[DFN2_N_ERB * DFN2_N_BINS];
@@ -223,6 +226,7 @@ static int run_grid(const Grid *g) {
 static int run_rejections(void) {
     DfnRateBridgeConfig cfg;
     DfnRateBridgeMemReq req, bad;
+    unsigned char *snapshot;
     void *mem = NULL;
     DfnRateBridge *b;
     int k;
@@ -236,14 +240,17 @@ static int run_rejections(void) {
     if (dfn_rate_bridge_get_mem_requirements(&cfg, &req) == 0) return 4;
     cfg = bridge_config(16000, 0); cfg.stage.erb_inv = NULL;
     if (dfn_rate_bridge_get_mem_requirements(&cfg, &req) == 0) return 5;
-    /* The model must be the 48 kHz / 1024 grid: a stage on another grid is refused whatever
-     * matrices it carries (rows 6 and 15 give it matrices of its own size, so the grid is the
-     * only reason; run_other_grid_refusal() has the full set). */
+    /* The model must be the 48 kHz / 1024 grid with one frame per call: a stage on another grid is
+     * refused whatever matrices it carries (rows 6 and 15 give it matrices of its own size, so the
+     * grid is the only reason; run_other_grid_refusal() has the full set). */
     {
-        static float other_fwd[DFN2_MAX_N_BINS * DFN2_MAX_N_ERB];
-        static float other_inv[DFN2_MAX_N_ERB * DFN2_MAX_N_BINS];
-        DFN2Grid g16, g48_512;
-        if (dfn2_grid_make(&g16, 16000, 256, 24, 96, 0, 0) != DFN2_GRID_OK) return 42;
+        static float other_fwd[DFN_TEST_TABLE_MAX_BINS * DFN_TEST_TABLE_MAX_ERB];
+        static float other_inv[DFN_TEST_TABLE_MAX_ERB * DFN_TEST_TABLE_MAX_BINS];
+        DFN2Grid g16, g48_512, g48_two;
+        DFN2GridSpec spec16 = dfn_test_spec(16000, 256, 24, 96, 0, 0);
+        DFN2GridSpec spec512 = dfn_test_spec(48000, 512, 28, 96, 1, 1);
+        DFN2GridSpec spec_two = dfn_test_spec(48000, 1024, 32, 96, 1, 1);
+        if (dfn2_grid_make(&g16, &spec16) != DFN2_GRID_OK) return 42;
         dfn_unit_partition(other_fwd, other_inv, &g16);
         cfg = bridge_config(16000, 0);
         cfg.stage.grid = g16;
@@ -252,7 +259,7 @@ static int run_rejections(void) {
         if (dfn_rate_bridge_get_mem_requirements(&cfg, &req) == 0) return 6;
         /* the same stage config is a valid stage on its own grid */
         if (dfn_res_stage_get_mem_requirements(&cfg.stage, &(DfnResStageMemReq){0}) != 0) return 43;
-        if (dfn2_grid_make(&g48_512, 48000, 512, 28, 96, 1, 1) != DFN2_GRID_OK) return 44;
+        if (dfn2_grid_make(&g48_512, &spec512) != DFN2_GRID_OK) return 44;
         dfn_unit_partition(other_fwd, other_inv, &g48_512);
         cfg = bridge_config(16000, 0);
         cfg.stage.grid = g48_512;
@@ -260,6 +267,26 @@ static int run_rejections(void) {
         cfg.stage.erb_inv = other_inv;
         if (dfn_rate_bridge_get_mem_requirements(&cfg, &req) == 0) return 15;
         if (dfn_res_stage_get_mem_requirements(&cfg.stage, &(DfnResStageMemReq){0}) != 0) return 45;
+        /* 48 kHz / 1024 with two frames per call: the library makes the grid, the stage refuses it,
+         * and so do the bridge's size query and create (the rate-default config of each native grid). */
+        spec_two.frames_per_call = 2;
+        if (dfn2_grid_make(&g48_two, &spec_two) != DFN2_GRID_OK) return 46;
+        dfn_unit_partition(other_fwd, other_inv, &g48_two);
+        {
+            static const Grid native[] = { {16000, 0}, {16000, 512}, {8000, 0} };
+            size_t n;
+            for (n = 0; n < sizeof(native) / sizeof(native[0]); ++n) {
+                cfg = bridge_config(native[n].sr, native[n].fft);
+                cfg.stage.grid = g48_two;
+                cfg.stage.erb_fwd = other_fwd;
+                cfg.stage.erb_inv = other_inv;
+                if (dfn_rate_bridge_get_mem_requirements(&cfg, &req) == 0) return 47;
+                if (dfn_rate_bridge_create(&cfg) != NULL) return 48;
+                if (dfn_res_stage_get_mem_requirements(&cfg.stage, &(DfnResStageMemReq){0}) == 0) return 49;
+                cfg.stage.grid = *dfn_test_grid();   /* the control: one frame per call, accepted */
+                if (dfn_rate_bridge_get_mem_requirements(&cfg, &req) != 0) return 50;
+            }
+        }
     }
     /* Below-set fft sizes, even where a host might one day offer them: the
      * gate is the bridge's own (rows 13-14). Row 15 passes that gate and is
@@ -275,13 +302,12 @@ static int run_rejections(void) {
     cfg = dfn_rate_bridge_default_config(16000, NULL);
     cfg.stage.erb_fwd = erb_fwd; cfg.stage.erb_inv = erb_inv;
     if (dfn_rate_bridge_get_mem_requirements(&cfg, &req) == 0) return 18;   /* no model grid at all */
-    /* A model built for another lookahead pair or grid is refused through the bridge's stage
-     * (run time, from its descriptor); the test grid's own descriptor is the accepted control. */
-    for (k = 0; k < 3; ++k) {
+    /* A model built for another lookahead pair, grid, frame count or deep-filter order is refused
+     * through the bridge's stage (run time, from its descriptor); the test grid's own descriptor is
+     * the accepted control. */
+    for (k = 0; k < 5; ++k) {
         DFN2ModelIoDescriptor foreign;
-        int made = dfn_fixture_foreign_descriptor(dfn_test_grid(), &foreign, k);
-        if (made < 0) return 20 + k;
-        if (made > 0) continue;   /* no such grid within the library's capacity */
+        if (dfn_fixture_foreign_descriptor(dfn_test_grid(), &foreign, k) != 0) return 20 + k;
         cfg = bridge_config(16000, 0);
         cfg.stage.model.infer = dfn_fixture_identity_infer;
         cfg.stage.model.io_descriptor = &foreign;
@@ -299,14 +325,21 @@ static int run_rejections(void) {
     cfg = bridge_config(16000, 0);
     if (dfn_rate_bridge_get_mem_requirements(&cfg, &req) != 0) return 7;
     if (posix_memalign(&mem, req.alignment, (size_t)req.bytes) != 0) return 8;
+    snapshot = (unsigned char *)malloc((size_t)req.bytes);
+    if (!snapshot) { free(mem); return 8; }
     b = dfn_rate_bridge_init_ex(mem, (size_t)req.bytes, &cfg, &req);
-    if (!b) { free(mem); return 9; }
+    if (!b) { free(snapshot); free(mem); return 9; }
     dfn_rate_bridge_destroy(b);
+    /* A refused init leaves the caller's pool bytes as they were. */
+    memset(mem, 0xA5, (size_t)req.bytes);
+    memcpy(snapshot, mem, (size_t)req.bytes);
     bad = req; bad.build_flags_hash ^= 1u;
-    if (dfn_rate_bridge_init_ex(mem, (size_t)req.bytes, &cfg, &bad)) { free(mem); return 10; }
+    if (dfn_rate_bridge_init_ex(mem, (size_t)req.bytes, &cfg, &bad)) { free(snapshot); free(mem); return 10; }
     bad = req; bad.layout_version += 1u;
-    if (dfn_rate_bridge_init_ex(mem, (size_t)req.bytes, &cfg, &bad)) { free(mem); return 11; }
-    if (dfn_rate_bridge_init(mem, (size_t)req.bytes - 16u, &cfg)) { free(mem); return 12; }
+    if (dfn_rate_bridge_init_ex(mem, (size_t)req.bytes, &cfg, &bad)) { free(snapshot); free(mem); return 11; }
+    if (dfn_rate_bridge_init(mem, (size_t)req.bytes - 16u, &cfg)) { free(snapshot); free(mem); return 12; }
+    if (memcmp(snapshot, mem, (size_t)req.bytes) != 0) { free(snapshot); free(mem); return 51; }
+    free(snapshot);
     printf("dfn_rate_bridge: 16 kHz / fft 256 pool %llu bytes (model weights external)\n",
            (unsigned long long)req.bytes);
     printf("dfn_rate_bridge: 16 kHz / fft 256 pool descriptor hash %08x\n", req.build_flags_hash);
@@ -425,6 +458,8 @@ static int run_phased_grid(const Grid *g, int behaviour) {
     if (behaviour == BP_RUN && max_frames < 1) return 9;
     dfn_rate_bridge_destroy(ph);
     dfn_rate_bridge_destroy(cb);
+    fft_destroy(ae.fft);
+    fft_destroy(ap.fft);
     return 0;
 }
 
@@ -650,7 +685,111 @@ static int run_phased_sequence(void) {
     if (dfn_rate_bridge_finish(b, out) != 0 || dfn_rate_bridge_finish(b, out) != -1)
         return 6;
     dfn_rate_bridge_destroy(b);
+    fft_destroy(ae.fft);
+    fft_destroy(ap.fft);
     return 0;
+}
+
+/* The bridge reports its stage's state generation: 1 after create, plus one per reset, one per
+ * warm-up frame (the first mask_lookahead stage frames, whatever the model wrote) and one per refused
+ * commit of a real frame (a head the commit finds non-finite, closed through nn_end); a model that
+ * reports failure leaves it alone. A caller that holds the model's state refills it when the value
+ * changes. */
+static int run_state_generation(void) {
+    DfnRateBridgeConfig cfg = bridge_config(16000, 256);
+    DfnRateBridge *b = dfn_rate_bridge_create(&cfg);
+    Analyzer ae, ap;
+    static Complex se[129], sa[129];
+    static float hopbuf[128], out[128];
+    DfnResStageJob job;
+    unsigned int expect = 1u;
+    int pass, t, refused = 0, warm = 0, seen = 0, r;
+
+    if (dfn_rate_bridge_state_generation(NULL) != 0u) return 1;
+    if (!b || analyzer_init(&ae, 256) != 0 || analyzer_init(&ap, 256) != 0) return 2;
+    memset(hopbuf, 0, sizeof(hopbuf));
+    if (dfn_rate_bridge_state_generation(b) != expect) return 3;
+    for (pass = 0; pass < 2; ++pass) {   /* 0: heads with a NaN (refused commit), 1: failed model runs */
+        for (t = 0; t < 12; ++t) {
+            analyzer_push(&ae, hopbuf, se);
+            analyzer_push(&ap, hopbuf, sa);
+            if (dfn_rate_bridge_begin(b, se, sa) != 0) return 4;
+            while ((r = dfn_rate_bridge_nn_begin(b, &job)) == 1) {
+                int rc = -1;
+                if (pass == 0) {
+                    dfn_fixture_half_mask_infer(NULL, &job.inputs, &job.outputs);
+                    job.outputs.erb_mask[3] = (float)NAN;
+                    rc = 0;
+                    ++expect;                          /* a warm-up frame discards its heads: +1 */
+                    if (seen < M_FRAMES) ++warm;       /* a real frame refuses them: +1 */
+                    else ++refused;
+                }
+                ++seen;
+                if (dfn_rate_bridge_nn_end(b, rc) != 0) return 5;
+                if (dfn_rate_bridge_state_generation(b) != expect) return 6 + pass;
+            }
+            if (r < 0 || dfn_rate_bridge_finish(b, out) != 0) return 8;
+            if (dfn_rate_bridge_state_generation(b) !=
+                dfn_res_stage_state_generation(dfn_rate_bridge_stage(b))) return 9;
+        }
+    }
+    if (refused < 1) return 10;   /* the NaN pass must have refused commits of real frames */
+    if (warm != M_FRAMES || expect != 1u + (unsigned int)M_FRAMES + (unsigned int)refused) return 12;
+    dfn_rate_bridge_reset(b);
+    if (dfn_rate_bridge_state_generation(b) != expect + 1u) return 11;
+    dfn_rate_bridge_destroy(b);
+    fft_destroy(ae.fft);
+    fft_destroy(ap.fft);
+    return 0;
+}
+
+/* One model call per stage frame, warm-up frames included: the calls of each host hop equal the
+ * hop's stage frames (the schedule 0,1,1,1 at 16 kHz / 128 and 1,2 elsewhere), their total the
+ * 48 kHz frame count, and the generation is 1 + calls while the first mask_lookahead calls go by,
+ * 1 + mask_lookahead after. The added delay does not depend on any of it. */
+static int counting_calls(void *user, const DFN2PrepostInputs *in, DFN2PrepostOutputs *out) {
+    ++*(int *)user;
+    return dfn_fixture_identity_infer(NULL, in, out);
+}
+
+static int run_model_calls(const Grid *g, int pinned_delay) {
+    DFN2ModelIoDescriptor descriptor;
+    DfnRateBridgeConfig cfg = bridge_config(g->sr, g->fft);
+    DfnRateBridge *b;
+    Analyzer ae, ap;
+    static Complex se[MAX_FFT / 2 + 1], sa[MAX_FFT / 2 + 1];
+    static float hopbuf[MAX_FFT / 2], out[MAX_FFT / 2];
+    long long frames = 0;
+    int calls = 0, t, last = 0, first_call_hop = -1, rc = 0;
+
+    if (dfn2_model_io_descriptor_default(dfn_test_grid(), &descriptor) != 0) return 1;
+    cfg.stage.model.infer = counting_calls;
+    cfg.stage.model.user = &calls;
+    cfg.stage.model.io_descriptor = &descriptor;
+    b = dfn_rate_bridge_create(&cfg);
+    if (!b || analyzer_init(&ae, g->fft) != 0 || analyzer_init(&ap, g->fft) != 0) return 2;
+    memset(hopbuf, 0, sizeof(hopbuf));
+    if (pinned_delay >= 0 && dfn_rate_bridge_added_delay_samples(b) != pinned_delay) rc = 3;
+    for (t = 0; !rc && t < 24; ++t) {
+        const int before = calls;
+        unsigned int want_generation;
+        analyzer_push(&ae, hopbuf, se);
+        analyzer_push(&ap, hopbuf, sa);
+        if (dfn_rate_bridge_process(b, se, sa, out) != 0) { rc = 4; break; }
+        dfn_rate_bridge_get_counters(b, &frames, &last);
+        if (calls - before != last) rc = 5;
+        else if (last != (g->sr == 16000 && g->fft == 256 ? (t % 4 == 0 ? 0 : 1) : (t % 2 == 0 ? 1 : 2)))
+            rc = 6;
+        if (calls > 0 && first_call_hop < 0) first_call_hop = t;
+        want_generation = 1u + (unsigned int)(calls < M_FRAMES ? calls : M_FRAMES);
+        if (dfn_rate_bridge_state_generation(b) != want_generation) rc = 7;
+        if (calls != frames) rc = 8;
+    }
+    if (!rc && first_call_hop != (g->sr == 16000 && g->fft == 256 ? 1 : 0)) rc = 9;
+    dfn_rate_bridge_destroy(b);
+    fft_destroy(ae.fft);
+    fft_destroy(ap.fft);
+    return rc;
 }
 
 /* A model grid that is not 48 kHz / 1024 -- the test grid's own when this program was built for
@@ -658,14 +797,15 @@ static int run_phased_sequence(void) {
  * table whatever the test grid: every bridge configuration is refused at run time, the same stage
  * config is accepted on its own, and no bridge is created. */
 static int run_other_grid_refusal(const DFN2Grid *model) {
-    static float other_fwd[DFN2_MAX_N_BINS * DFN2_MAX_N_ERB];
-    static float other_inv[DFN2_MAX_N_ERB * DFN2_MAX_N_BINS];
+    static float other_fwd[DFN_TEST_TABLE_MAX_BINS * DFN_TEST_TABLE_MAX_ERB];
+    static float other_inv[DFN_TEST_TABLE_MAX_ERB * DFN_TEST_TABLE_MAX_BINS];
     DfnRateBridgeConfig cfg;
     DfnRateBridgeMemReq req;
     DfnResStageConfig stage;
     DfnResStageMemReq stage_req;
     static const int rates[] = { 8000, 16000 };
     int i;
+    if (!dfn_test_table_fits(model)) return 4;
     dfn_unit_partition(other_fwd, other_inv, model);
     for (i = 0; i < 2; ++i) {
         cfg = dfn_rate_bridge_default_config(rates[i], model);
@@ -683,20 +823,40 @@ static int run_other_grid_refusal(const DFN2Grid *model) {
 
 int main(void) {
     int rc, i;
-    DFN2_REQUIRE_VARIANT_LINK();   /* this unit's DFN2 capacities are the archive's */
+    DFN2_REQUIRE_VARIANT_LINK();   /* does not link against an archive of the other DFN2 variant */
     dfn_unit_partition(erb_fwd, erb_inv, dfn_test_grid());
     dfn_test_report_pair("dfn_rate_bridge", -1);
     {   /* the table's non-48 kHz model grids: refused by the bridge, run at run time by the stage */
-        static const int table[][2] = { {16000, 256}, {32000, 512} };
-        static const int erb[] = { 24, 28 };
+        static const DFN2GridSpec table[] = {
+            { .sample_rate = 16000, .n_fft = 256, .n_erb = 24, .df_bins = 96,
+              .df_order = DFN_TEST_DF_ORDER, .mask_lookahead = 0, .df_lookahead = 0,
+              .frames_per_call = DFN_TEST_FRAMES_PER_CALL,
+              .erb_norm_tau_sec = DFN_TEST_ERB_NORM_TAU_SEC,
+              .erb_norm_init_lo_db = DFN_TEST_ERB_NORM_INIT_LO_DB,
+              .erb_norm_init_hi_db = DFN_TEST_ERB_NORM_INIT_HI_DB,
+              .erb_norm_scale_db = DFN_TEST_ERB_NORM_SCALE_DB,
+              .spec_norm_tau_sec = DFN_TEST_SPEC_NORM_TAU_SEC,
+              .spec_norm_init_lo = DFN_TEST_SPEC_NORM_INIT_LO,
+              .spec_norm_init_hi = DFN_TEST_SPEC_NORM_INIT_HI },
+            { .sample_rate = 32000, .n_fft = 512, .n_erb = 28, .df_bins = 96,
+              .df_order = DFN_TEST_DF_ORDER, .mask_lookahead = 0, .df_lookahead = 0,
+              .frames_per_call = DFN_TEST_FRAMES_PER_CALL,
+              .erb_norm_tau_sec = DFN_TEST_ERB_NORM_TAU_SEC,
+              .erb_norm_init_lo_db = DFN_TEST_ERB_NORM_INIT_LO_DB,
+              .erb_norm_init_hi_db = DFN_TEST_ERB_NORM_INIT_HI_DB,
+              .erb_norm_scale_db = DFN_TEST_ERB_NORM_SCALE_DB,
+              .spec_norm_tau_sec = DFN_TEST_SPEC_NORM_TAU_SEC,
+              .spec_norm_init_lo = DFN_TEST_SPEC_NORM_INIT_LO,
+              .spec_norm_init_hi = DFN_TEST_SPEC_NORM_INIT_HI },
+        };
         for (i = 0; i < 2; ++i) {
             DFN2Grid g;
-            if (dfn2_grid_make(&g, table[i][0], table[i][1], erb[i], 96, 0, 0) != DFN2_GRID_OK)
+            if (dfn2_grid_make(&g, &table[i]) != DFN2_GRID_OK)
                 return 1;
             rc = run_other_grid_refusal(&g);
             if (rc) {
-                fprintf(stderr, "other-grid refusal row (%d Hz / %d) failed: %d\n", table[i][0],
-                        table[i][1], rc);
+                fprintf(stderr, "other-grid refusal row (%d Hz / %d) failed: %d\n",
+                        table[i].sample_rate, table[i].n_fft, rc);
                 return 1;
             }
         }
@@ -735,6 +895,16 @@ int main(void) {
     }
     rc = run_phased_sequence();
     if (rc) { fprintf(stderr, "rate bridge phased sequence row failed: %d\n", rc); return 1; }
+    rc = run_state_generation();
+    if (rc) { fprintf(stderr, "rate bridge state generation row failed: %d\n", rc); return 1; }
+    for (i = 0; i < N_GRIDS; ++i) {
+        static const int shipped_delay[N_GRIDS] = { 672, 629, 330 };   /* the 1/1 pair, in native samples */
+        rc = run_model_calls(&GRIDS[i], DFN2_MASK_LOOKAHEAD == 1 && DFN2_DF_LOOKAHEAD == 1 ? shipped_delay[i] : -1);
+        if (rc) {
+            fprintf(stderr, "rate bridge model-call row grid %d/%d failed: %d\n", GRIDS[i].sr, GRIDS[i].fft, rc);
+            return 1;
+        }
+    }
     for (i = 0; i < N_GRIDS; ++i) {
         rc = run_reset_synthesis(&GRIDS[i]);
         if (rc) {

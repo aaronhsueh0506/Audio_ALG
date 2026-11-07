@@ -28,11 +28,19 @@ static float unit(void) {
     return (float)(g_lcg >> 8) / 16777216.0f - 0.5f;
 }
 
+/* The identity model, counting its runs: with one stage frame per hop (the first mask_lookahead
+ * being warm-up frames) its count equals the stage's frames_in, through the bridge the 48 kHz frames. */
+static long long g_model_calls;
+static int counting_identity_infer(void* user, const DFN2PrepostInputs* in, DFN2PrepostOutputs* out) {
+    ++g_model_calls;
+    return dfn_fixture_identity_infer(user, in, out);
+}
+
 static DfnResStageConfig stage_config(void) {
     DfnResStageConfig cfg = dfn_res_stage_default_config(dfn_test_grid());
     cfg.erb_fwd = g_erb_fwd;
     cfg.erb_inv = g_erb_inv;
-    cfg.model.infer = dfn_fixture_identity_infer;
+    cfg.model.infer = counting_identity_infer;
     cfg.model.io_descriptor = &g_descriptor;
     return cfg;
 }
@@ -147,18 +155,21 @@ static void test_path(int bridge_mode) {
     /* the four phased behaviours produce the same hops on the unit partition */
     {
         static float seq[4][N][MAXB];
-        long long fin[4], commits[4], skips[4];
-        int bi;
+        long long fin[4], commits[4], skips[4], run_calls = -1;
+        int bi, first_hop_frames = -1;
         for (bi = 0; bi < 4; ++bi) {
             Rig r;
             CHECK(rig_init(&r, bridge_mode) == 0, "behaviour rig");
             g_lcg = 99u;
+            g_model_calls = 0;
             for (h = 0; h < N; ++h) {
                 make_frame(e, p, r.n);
                 frames = 0;
                 if (phased(&r, e, p, (Behaviour)bi, seq[bi][h], &frames) != 0) bad_phased++;
                 if (frames > max_frames) max_frames = frames;
+                if (bi == B_RUN && h == 0) first_hop_frames = frames;
             }
+            if (bi == B_RUN) run_calls = g_model_calls;
             if (bridge_mode) {
                 int last;
                 dfn_rate_bridge_get_counters(r.bridge, &fin[bi], &last);
@@ -177,7 +188,11 @@ static void test_path(int bridge_mode) {
               "only the run behaviour commits model frames");
         CHECK(max_frames >= 1 && max_frames <= (bridge_mode ? 2 : 1),
               "a hop carries at most one frame (two through the bridge)");
-        (void)fin; (void)skips;
+        /* the stage path opens a model frame on every hop, the first (a warm-up frame) included */
+        CHECK(bridge_mode || (first_hop_frames == 1 && max_frames == 1),
+              "stage path: exactly one model frame per hop, from the first hop");
+        CHECK(run_calls == fin[B_RUN], "the model runs once per stage frame, warm-up frames included");
+        (void)skips;
     }
 
     /* sequence guards */

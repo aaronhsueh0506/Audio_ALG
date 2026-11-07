@@ -1,4 +1,4 @@
-"""C contract tests for Align-ULCNet in-place full-window state storage."""
+"""C contract tests for Align-ULCNet model I/O over the application's in-place full-window state."""
 
 import os
 import shutil
@@ -26,13 +26,65 @@ _DRIVER = r'''
     return 1; \
 } } while (0)
 
+/* State table of the shipped graph (pinned to the exporter by
+ * test_export_streaming_ulcnet.py): the library holds none of it, the host does. */
+#define STATE_CHANNELS 32
+#define STATE_SCORE_FRAMES 5
+#define STATE_GRU_ROWS 4
+#define STATE_GRU_HIDDEN 128
+#define STATE_TA_BINS(n_bins) (((n_bins) + 9) / 10)
+
 #define DEPTH 8u
-#define FEATURE ((size_t)ULCNET_MODEL_IO_TA_BINS)
-#define CHANNELS 32u
-#define SCORE 5u
-#define MAX_HOPS 64u
+#define CHANNELS ((size_t)STATE_CHANNELS)
+#define SCORE ((size_t)STATE_SCORE_FRAMES)
+#define BINS_MAX 513u
+#define TA_MAX 52u
+
+/* The grid under test (run-time): argument grid=<sample rate>,<n_fft>. */
+static UlcnetGrid grid;
+#define BINS ((size_t)grid.n_bins)
+#define FEATURE ((size_t)STATE_TA_BINS(grid.n_bins))
 
 _Alignas(16) static unsigned char pool[1024 * 1024];
+
+static UlcnetGrid grid_with_depth(int depth) {
+    const UlcnetGridSpec spec = { .sample_rate = grid.sample_rate,
+                                  .n_fft = grid.n_fft, .delay_depth = depth };
+    UlcnetGrid made;
+    if (ulcnet_grid_make(&made, &spec) != ULCNET_GRID_OK) made.n_fft = 0;
+    return made;
+}
+
+/* The application's recurrent state: four buffers filled with NaN, so a pool
+ * init that did not zero what it was handed shows up as a non-zero window. */
+typedef struct HostState {
+    float key[CHANNELS * DEPTH * TA_MAX];
+    float value[CHANNELS * DEPTH * TA_MAX];
+    float logit[CHANNELS * STATE_SCORE_FRAMES * DEPTH];
+    float gru[STATE_GRU_ROWS * STATE_GRU_HIDDEN];
+    UlcnetModelIoStateBuffers buffers;
+} HostState;
+
+static HostState host;
+
+static void host_make(void) {
+    const size_t kv = CHANNELS * DEPTH * FEATURE;
+    size_t i;
+    for (i = 0; i < sizeof host.key / sizeof host.key[0]; ++i) {
+        host.key[i] = NAN;
+        host.value[i] = NAN;
+    }
+    for (i = 0; i < sizeof host.logit / sizeof host.logit[0]; ++i) host.logit[i] = NAN;
+    for (i = 0; i < sizeof host.gru / sizeof host.gru[0]; ++i) host.gru[i] = NAN;
+    host.buffers = (UlcnetModelIoStateBuffers){
+        .key_history = host.key, .key_history_elements = kv,
+        .value_history = host.value, .value_history_elements = kv,
+        .logit_history = host.logit,
+        .logit_history_elements = CHANNELS * SCORE * DEPTH,
+        .h_gru = host.gru,
+        .gru_hidden_elements = STATE_GRU_ROWS * STATE_GRU_HIDDEN,
+    };
+}
 
 /* Independent formulation of model.py's _signed_power (deliberately NOT
  * copysignf like the implementation, so agreement is a real check). The
@@ -86,8 +138,8 @@ static float hidden_value(float base, size_t index) {
  * The expectation below does not use this shift code; see expected_*(). */
 static void fake_run(const UlcnetModelIoInputs *in,
                      const UlcnetModelIoOutputs *out, float base) {
-    static float key_in[CHANNELS * DEPTH * 52u];
-    static float value_in[CHANNELS * DEPTH * 52u];
+    static float key_in[CHANNELS * DEPTH * TA_MAX];
+    static float value_in[CHANNELS * DEPTH * TA_MAX];
     static float logit_in[CHANNELS * SCORE * DEPTH];
     size_t channel, slot, bin, index;
 
@@ -97,9 +149,9 @@ static void fake_run(const UlcnetModelIoInputs *in,
     memcpy(logit_in, in->logit_history,
            in->logit_history_elements * sizeof(float));
 
-    for (index = 0; index < ULCNET_MODEL_IO_BINS; ++index) {
+    for (index = 0; index < BINS; ++index) {
         out->output[index] = mask_re(base, index);
-        out->output[ULCNET_MODEL_IO_BINS + index] = mask_im(base, index);
+        out->output[BINS + index] = mask_im(base, index);
     }
     for (channel = 0; channel < CHANNELS; ++channel) {
         float *key = out->key_history_out + channel * DEPTH * FEATURE;
@@ -165,22 +217,36 @@ static int windows_match_after(const UlcnetModelIoInputs *in, size_t hop) {
                      : in->h_gru[0] == hidden_value((float)hop, 0u);
 }
 
-int main(void) {
+int main(int argc, char **argv) {
     UlcnetModelIoDescriptor d4, d8, d64, invalid;
     UlcnetModelIoMemReq r4, r8, r64, r8b;
     UlcnetModelIoState *state;
     UlcnetModelIoInputs inputs;
     UlcnetModelIoOutputs outputs;
-    float error_re[ULCNET_MODEL_IO_BINS], error_im[ULCNET_MODEL_IO_BINS];
-    float far_re[ULCNET_MODEL_IO_BINS], far_im[ULCNET_MODEL_IO_BINS];
-    float enhanced_re[ULCNET_MODEL_IO_BINS];
-    float enhanced_im[ULCNET_MODEL_IO_BINS];
+    UlcnetGrid g4, g8, g64, bad_grid;
+    float error_re[BINS_MAX], error_im[BINS_MAX];
+    float far_re[BINS_MAX], far_im[BINS_MAX];
+    float enhanced_re[BINS_MAX];
+    float enhanced_im[BINS_MAX];
     const float *key_address, *value_address, *logit_address, *gru_address;
     size_t index;
     size_t hop;
     uint32_t generation;
+    int sample_rate = 0, n_fft = 0;
 
-    for (index = 0; index < ULCNET_MODEL_IO_BINS; ++index) {
+    if (argc != 2 || sscanf(argv[1], "grid=%d,%d", &sample_rate, &n_fft) != 2) return 2;
+    {
+        const UlcnetGridSpec spec = { .sample_rate = sample_rate, .n_fft = n_fft,
+                                      .delay_depth = 8 };
+        CHECK(ulcnet_grid_make(&grid, &spec) == ULCNET_GRID_OK);
+    }
+    CHECK(BINS <= BINS_MAX && FEATURE <= TA_MAX);
+    g4 = grid_with_depth(4);
+    g8 = grid_with_depth(8);
+    g64 = grid_with_depth(64);
+    CHECK(g4.n_fft != 0 && g8.n_fft != 0 && g64.n_fft != 0);
+
+    for (index = 0; index < BINS; ++index) {
         error_re[index] = (float)index;
         error_im[index] = -(float)index;
         far_re[index] = 1000.0f + (float)index;
@@ -189,33 +255,54 @@ int main(void) {
         enhanced_im[index] = -8.0f;
     }
 
-    CHECK(ulcnet_model_io_descriptor_default(4, &d4) == 0);
-    CHECK(ulcnet_model_io_descriptor_default(8, &d8) == 0);
-    CHECK(ulcnet_model_io_descriptor_default(64, &d64) == 0);
-    CHECK(ulcnet_model_io_descriptor_default(1, &invalid) != 0);
-    CHECK(ulcnet_model_io_descriptor_default(65, &invalid) != 0);
+    CHECK(ulcnet_model_io_descriptor_default(&g4, &d4) == 0);
+    CHECK(ulcnet_model_io_descriptor_default(&g8, &d8) == 0);
+    CHECK(ulcnet_model_io_descriptor_default(&g64, &d64) == 0);
+    /* D outside the exporter's bounds builds no grid, and an invalid grid builds no descriptor. */
+    CHECK(grid_with_depth(1).n_fft == 0);
+    CHECK(grid_with_depth(65).n_fft == 0);
+    bad_grid = g8;
+    bad_grid.delay_depth = 1;
+    CHECK(ulcnet_model_io_descriptor_default(&bad_grid, &invalid) != 0);
+    bad_grid = g8;
+    bad_grid.n_bins += 1;
+    CHECK(ulcnet_model_io_descriptor_default(&bad_grid, &invalid) != 0);
+    CHECK(ulcnet_model_io_descriptor_default(NULL, &invalid) != 0);
     CHECK(ulcnet_model_io_get_mem_requirements(&d4, &r4) == 0);
     CHECK(ulcnet_model_io_get_mem_requirements(&d8, &r8) == 0);
     CHECK(ulcnet_model_io_get_mem_requirements(&d64, &r64) == 0);
-    CHECK(r4.bytes < r8.bytes && r8.bytes < r64.bytes);
+    /* The pool holds the feature tensors and the mask staging only: it follows the
+     * grid, not D. */
+    CHECK(r4.bytes == r8.bytes && r8.bytes == r64.bytes);
     CHECK(r8.alignment == ULCNET_MODEL_IO_ALIGNMENT);
     CHECK(d8.layout_version == 18u);
-    CHECK(d8.sample_rate == ULCNET_MODEL_IO_SR);
-    CHECK(d8.fft_size == ULCNET_MODEL_IO_N_FFT);
-    CHECK(d8.hop_size == ULCNET_MODEL_IO_HOP);
-    CHECK(d8.spectrum_bins == ULCNET_MODEL_IO_BINS);
-    CHECK(d8.ta_bins == ULCNET_MODEL_IO_TA_BINS);
-    CHECK(d8.score_window_frames == 5);
+    CHECK(d8.sample_rate == grid.sample_rate);
+    CHECK(d8.fft_size == grid.n_fft);
+    CHECK(d8.hop_size == grid.hop);
+    CHECK(d8.spectrum_bins == grid.n_bins);
+    CHECK(d8.delay_depth == 8);
+    /* The five model-interior fields are the model's: zero here, never read. */
+    CHECK(d8.ta_channels == 0 && d8.ta_bins == 0 && d8.score_window_frames == 0 &&
+          d8.gru_layers == 0 && d8.gru_hidden == 0);
 
+    CHECK(ulcnet_model_io_descriptor_validate(&grid, &d8) == 0);
     invalid = d8;
     ++invalid.layout_version;
-    CHECK(ulcnet_model_io_descriptor_validate(&invalid) != 0);
+    CHECK(ulcnet_model_io_descriptor_validate(&grid, &invalid) != 0);
     invalid = d8;
-    ++invalid.ta_bins;
-    CHECK(ulcnet_model_io_descriptor_validate(&invalid) != 0);
+    ++invalid.spectrum_bins;
+    CHECK(ulcnet_model_io_descriptor_validate(&grid, &invalid) != 0);
     invalid = d8;
-    --invalid.score_window_frames;
-    CHECK(ulcnet_model_io_descriptor_validate(&invalid) != 0);
+    invalid.sample_rate += 1;
+    CHECK(ulcnet_model_io_descriptor_validate(&grid, &invalid) != 0);
+    /* Interior fields are not validated: a graph's own values pass. */
+    invalid = d8;
+    invalid.ta_bins = 26;
+    invalid.score_window_frames = 5;
+    invalid.ta_channels = 32;
+    invalid.gru_layers = 2;
+    invalid.gru_hidden = 128;
+    CHECK(ulcnet_model_io_descriptor_validate(&grid, &invalid) == 0);
 
     /* Production descriptors are fixed to the raw far used for training. */
     CHECK(d4.far_input_mode == ULCNET_FAR_RAW);
@@ -223,17 +310,18 @@ int main(void) {
     CHECK(d64.far_input_mode == ULCNET_FAR_RAW);
     invalid = d8;
     invalid.far_input_mode = ULCNET_FAR_ALIGNED;
-    CHECK(ulcnet_model_io_descriptor_validate(&invalid) != 0);
+    CHECK(ulcnet_model_io_descriptor_validate(&grid, &invalid) != 0);
     /* The mode does not change the state size -- it selects which far
      * stream the caller feeds, not how much history is stored. */
     CHECK(ulcnet_model_io_get_mem_requirements(&d8, &r8b) == 0);
     CHECK(r8b.bytes == r8.bytes);
     invalid.far_input_mode = 2;
-    CHECK(ulcnet_model_io_descriptor_validate(&invalid) != 0);
+    CHECK(ulcnet_model_io_descriptor_validate(&grid, &invalid) != 0);
     invalid.far_input_mode = -1;
-    CHECK(ulcnet_model_io_descriptor_validate(&invalid) != 0);
+    CHECK(ulcnet_model_io_descriptor_validate(&grid, &invalid) != 0);
     CHECK(ulcnet_model_io_get_mem_requirements(&invalid, &r8b) != 0);
-    CHECK(ulcnet_model_io_init(pool, sizeof(pool), &invalid) == NULL);
+    host_make();
+    CHECK(ulcnet_model_io_init(pool, sizeof(pool), &invalid, &host.buffers) == NULL);
 
     /* The names are exactly the exporter's metadata strings. */
     CHECK(strcmp(ulcnet_far_input_mode_name(ULCNET_FAR_RAW),
@@ -243,12 +331,13 @@ int main(void) {
     CHECK(strcmp(ulcnet_far_input_mode_name(2), "unknown") == 0);
     CHECK(strcmp(ulcnet_far_input_mode_name(-1), "unknown") == 0);
 
-    CHECK(ulcnet_model_io_init(pool + 1, sizeof(pool) - 1, &d8) == NULL);
-    CHECK(ulcnet_model_io_init(pool, r8.bytes - 1, &d8) == NULL);
-    state = ulcnet_model_io_init(pool, r8.bytes, &d8);
+    host_make();
+    CHECK(ulcnet_model_io_init(pool + 1, sizeof(pool) - 1, &d8, &host.buffers) == NULL);
+    CHECK(ulcnet_model_io_init(pool, r8.bytes - 1, &d8, &host.buffers) == NULL);
+    state = ulcnet_model_io_init(pool, r8.bytes, &d8, &host.buffers);
     CHECK(state != NULL);
     CHECK(ulcnet_model_io_descriptor(state)->delay_depth == 8);
-    CHECK(ulcnet_model_io_commit(state, enhanced_re, enhanced_im) != 0);
+    CHECK(ulcnet_model_io_enhance_spectrum(state, enhanced_re, enhanced_im) != 0);
 
     /* A fresh state has restarted nothing. */
     CHECK(ulcnet_model_io_state_generation(state) == 0u);
@@ -256,8 +345,8 @@ int main(void) {
 
     CHECK(ulcnet_model_io_prepare(state, error_re, error_im, far_re, far_im,
                                   &inputs, &outputs) == 0);
-    CHECK(inputs.spectrum_bins_elements == ULCNET_MODEL_IO_BINS);
-    CHECK(outputs.spectrum_ri_elements == 2u * ULCNET_MODEL_IO_BINS);
+    CHECK(inputs.spectrum_bins_elements == BINS);
+    CHECK(outputs.spectrum_ri_elements == 2u * BINS);
     {
         /* prepare() runs the fixed front end: the same fp32 expressions are
          * evaluated here so the values are pinned exactly. */
@@ -285,7 +374,11 @@ int main(void) {
         CHECK(inputs.error_cos[0] == 1.0f);
         CHECK(inputs.error_sin[0] == 0.0f);
     }
-    /* Full windows: D frames of K/V, 5 of logit, and ONE hidden tensor. */
+    /* The state views are the registered buffers, whole windows: D frames of K/V,
+     * 5 of logit, and ONE hidden tensor. Registration is asserted, so a view that
+     * came back NULL cannot pass for an empty window. */
+    CHECK(inputs.key_history == host.key && inputs.value_history == host.value);
+    CHECK(inputs.logit_history == host.logit && inputs.h_gru == host.gru);
     CHECK(inputs.key_history_elements == CHANNELS * DEPTH * FEATURE);
     CHECK(inputs.value_history_elements == CHANNELS * DEPTH * FEATURE);
     CHECK(inputs.logit_history_elements == CHANNELS * SCORE * DEPTH);
@@ -294,6 +387,7 @@ int main(void) {
     CHECK(outputs.value_history_elements == inputs.value_history_elements);
     CHECK(outputs.logit_history_elements == inputs.logit_history_elements);
     CHECK(outputs.gru_hidden_elements == inputs.gru_hidden_elements);
+    /* init zeroed the NaN-filled buffers it was handed. */
     CHECK(windows_match_after(&inputs, 0u));
     CHECK(isnan(outputs.output[0]));
     /* Every state tensor is in-place: each output IS its input, at an
@@ -317,14 +411,14 @@ int main(void) {
         CHECK(windows_match_after(&inputs, hop - 1u));
         fake_run(&inputs, &outputs, base);
         enhanced_re[0] = -7.0f;
-        CHECK(ulcnet_model_io_commit(state, enhanced_re, enhanced_im) == 0);
+        CHECK(ulcnet_model_io_enhance_spectrum(state, enhanced_re, enhanced_im) == 0);
         /* The compressed error is not handed to the graph; prepare() keeps
          * it for commit(), which multiplies it by the planar mask, then
          * applies the inverse signed power. The reference spells the complex
          * multiply out with unfused fp32 products, as
          * export_onnx.apply_mask_ri does, so every bin must match bit for
          * bit. */
-        for (index = 0; index < ULCNET_MODEL_IO_BINS; ++index) {
+        for (index = 0; index < BINS; ++index) {
             const float c_re = signed_power_ref(
                 error_re[index], ULCNET_MODEL_IO_COMPRESSION_EXP);
             const float c_im = signed_power_ref(
@@ -362,12 +456,12 @@ int main(void) {
     outputs.output[0] = 7.0f;
     enhanced_re[0] = -7.0f;
     enhanced_im[0] = -8.0f;
-    CHECK(ulcnet_model_io_commit(state, enhanced_re, enhanced_im) != 0);
+    CHECK(ulcnet_model_io_enhance_spectrum(state, enhanced_re, enhanced_im) != 0);
     CHECK(enhanced_re[0] == -7.0f && enhanced_im[0] == -8.0f);
     CHECK(ulcnet_model_io_state_generation(state) == 1u);
     /* One prepare permits one commit attempt; the refused retry does not
      * count as another restart. */
-    CHECK(ulcnet_model_io_commit(state, enhanced_re, enhanced_im) != 0);
+    CHECK(ulcnet_model_io_enhance_spectrum(state, enhanced_re, enhanced_im) != 0);
     CHECK(ulcnet_model_io_state_generation(state) == 1u);
     CHECK(ulcnet_model_io_prepare(state, error_re, error_im, far_re, far_im,
                                   &inputs, &outputs) == 0);
@@ -406,7 +500,7 @@ int main(void) {
             enhanced_re[0] = -7.0f;
             enhanced_im[0] = -8.0f;
             generation = ulcnet_model_io_state_generation(state);
-            CHECK(ulcnet_model_io_commit(state, enhanced_re, enhanced_im) != 0);
+            CHECK(ulcnet_model_io_enhance_spectrum(state, enhanced_re, enhanced_im) != 0);
             CHECK(enhanced_re[0] == -7.0f && enhanced_im[0] == -8.0f);
             CHECK(ulcnet_model_io_state_generation(state) == generation + 1u);
             CHECK(ulcnet_model_io_prepare(state, error_re, error_im, far_re,
@@ -419,7 +513,7 @@ int main(void) {
             CHECK(all_zero(inputs.h_gru, inputs.gru_hidden_elements));
             /* The state keeps working after a refusal. */
             fake_run(&inputs, &outputs, 5.0f);
-            CHECK(ulcnet_model_io_commit(state, enhanced_re,
+            CHECK(ulcnet_model_io_enhance_spectrum(state, enhanced_re,
                                          enhanced_im) == 0);
             CHECK(ulcnet_model_io_state_generation(state) == generation + 1u);
         }
@@ -429,17 +523,36 @@ int main(void) {
     CHECK(inputs.key_history[0] == key_now(5.0f, 0u, 0u));
     CHECK(inputs.h_gru[0] == hidden_value(5.0f, 0u));
 
-    /* Only the frame the graph just wrote is checked at commit. A
-     * non-finite value in an OLDER slot or in the slot the window drops is
-     * not seen here; it reaches the mask on a later frame, where it is
-     * refused. */
+    /* The whole of every registered window is checked at commit, not only the
+     * frame the graph just wrote: a non-finite value in an OLDER slot, in the
+     * slot the window drops or in an older logit frame is refused like one in
+     * the newest, and takes the rest of the state with it. */
+    {
+        int which;
+        for (which = 0; which < 4; ++which) {
+            fake_run(&inputs, &outputs, 6.0f);
+            switch (which) {
+            case 0: outputs.key_history_out[3u * FEATURE] = NAN; break;
+            case 1: outputs.value_history_out[(DEPTH - 1u) * FEATURE] = NAN;
+                    break;
+            case 2: outputs.logit_history_out[0] = NAN; break;
+            default: outputs.logit_history_out[SCORE * DEPTH - DEPTH - 1u] = NAN;
+                     break;
+            }
+            generation = ulcnet_model_io_state_generation(state);
+            CHECK(ulcnet_model_io_enhance_spectrum(state, enhanced_re, enhanced_im) != 0);
+            CHECK(ulcnet_model_io_state_generation(state) == generation + 1u);
+            CHECK(ulcnet_model_io_prepare(state, error_re, error_im, far_re,
+                                          far_im, &inputs, &outputs) == 0);
+            CHECK(all_zero(inputs.key_history, inputs.key_history_elements));
+            CHECK(all_zero(inputs.value_history, inputs.value_history_elements));
+            CHECK(all_zero(inputs.logit_history, inputs.logit_history_elements));
+            CHECK(all_zero(inputs.h_gru, inputs.gru_hidden_elements));
+        }
+    }
     fake_run(&inputs, &outputs, 6.0f);
-    outputs.key_history_out[3u * FEATURE] = NAN;
-    outputs.key_history_out[(DEPTH - 1u) * FEATURE] = NAN;
-    outputs.logit_history_out[0] = NAN;
-    outputs.logit_history_out[SCORE * DEPTH - DEPTH - 1u] = NAN;
     generation = ulcnet_model_io_state_generation(state);
-    CHECK(ulcnet_model_io_commit(state, enhanced_re, enhanced_im) == 0);
+    CHECK(ulcnet_model_io_enhance_spectrum(state, enhanced_re, enhanced_im) == 0);
     CHECK(ulcnet_model_io_state_generation(state) == generation);
 
     /* reset() zeroes the state and advances the generation, whether or not a
@@ -458,9 +571,24 @@ int main(void) {
 '''
 
 
+@pytest.fixture(scope='module')
+def audio_common_lib():
+    """audiolib's NE10 static lib: the grid rule (n_fft) is audiolib's."""
+    if shutil.which('make') is None:
+        pytest.skip('no make available')
+    subprocess.run(['make', '-s', '-C', _AC_DIR, 'BACKEND=ne10', 'lib'],
+                   check=True, capture_output=True)
+    out = subprocess.run(
+        ['make', '-s', '-C', _AC_DIR, 'BACKEND=ne10', 'print-lib-path'],
+        check=True, capture_output=True, text=True)
+    lib = out.stdout.strip().splitlines()[-1]
+    assert os.path.isfile(lib), lib
+    return lib
+
+
 @pytest.mark.parametrize('sample_rate,n_fft', [(16000, 512), (48000, 1024)])
 def test_ulcnet_model_io_external_state_contract(
-        tmp_path, sample_rate, n_fft):
+        tmp_path, audio_common_lib, sample_rate, n_fft):
     compiler = shutil.which('cc') or shutil.which('gcc') or shutil.which('clang')
     if compiler is None:
         pytest.skip('no C compiler available')
@@ -471,10 +599,10 @@ def test_ulcnet_model_io_external_state_contract(
         compiler,
         '-O2', '-ffp-contract=off', '-std=c11',
         '-Wall', '-Wextra', '-Wpedantic', '-Werror',
-        '-DULCNET_MODEL_IO_SR=%d' % sample_rate,
-        '-DULCNET_MODEL_IO_N_FFT=%d' % n_fft,
         '-I', _ULCNET_DIR, '-I', _AC_INCLUDE, '-I', _AC_DIR,
         str(driver), os.path.join(_ULCNET_DIR, 'ulcnet_model_io.c'),
-        '-lm', '-o', str(executable),
+        audio_common_lib, '-lm', '-o', str(executable),
     ], check=True, capture_output=True)
-    subprocess.run([str(executable)], check=True, capture_output=True)
+    done = subprocess.run([str(executable), 'grid=%d,%d' % (sample_rate, n_fft)],
+                          capture_output=True, text=True)
+    assert done.returncode == 0, done.stderr

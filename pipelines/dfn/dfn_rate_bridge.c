@@ -14,7 +14,7 @@
 
 #define BRIDGE_ALIGN 16u
 /* The bridge's own contract: the model runs on the shipped 48 kHz / 1024 / hop 512 / 513-bin grid
- * (dfn_rate_bridge.h); a stage on any other grid is refused. */
+ * with one frame per call (dfn_rate_bridge.h); a stage on any other grid is refused. */
 #define B48_RATE 48000
 #define B48_FFT  1024
 #define B48_HOP  512
@@ -117,7 +117,7 @@ static size_t borrowed_bytes(size_t own_bytes, int fft_size) {
 
 static int resolve(const DfnRateBridgeConfig *cfg, Resolved *r) {
     size_t value;
-    /* This object's DFN2 capacities must be the library objects': link-time check. */
+    /* Link-time check: this object's DFN2 variant (full or mask-only) is the library's. */
     DFN2_REQUIRE_VARIANT_LINK();
     if (!cfg || !r || grid_dims(cfg->sample_rate, cfg->fft_size,
                                 &r->fft_n, &r->hop_n) != 0)
@@ -126,7 +126,7 @@ static int resolve(const DfnRateBridgeConfig *cfg, Resolved *r) {
      * delay arithmetic are written for a stage on DFN2's shipped 48 kHz grid; a model on another
      * grid is refused instead of running them against it. The lookahead pair the added delay
      * depends on is the stage grid's; a model of another pair is refused by the stage's
-     * descriptor check below. */
+     * descriptor check below, and the stage itself refuses more than one frame per call. */
     if (cfg->stage.grid.sample_rate != B48_RATE || cfg->stage.grid.n_fft != B48_FFT) return -1;
     if (dfn_res_stage_get_mem_requirements(&cfg->stage, &r->stage_req) != 0) return -1;
     r->fft_n_bytes = fft_get_mem_size(r->fft_n);
@@ -334,7 +334,7 @@ DfnRateBridge *dfn_rate_bridge_init_ex(void *mem, size_t bytes,
         ac_stft_config_default(&nc, r.fft_n);
         nc.fft = b->fft_n_handle;
         nc.window = b->win_n;
-        ac_stft_config_default(&wc, B48_FFT);
+        ac_stft_config_default(&wc, B48_FFT);   /* scales stay 1: the stage applies the grid's */
         wc.fft = b->fft48;
         wc.window = b->win48;
         TAKE(region, void *, r.synth_n_bytes);
@@ -452,7 +452,7 @@ int dfn_rate_bridge_begin(DfnRateBridge *b,
     return 0;
 }
 
-/* Closes the open (or warm-up) stage frame: stage output -> 48 kHz WOLA -> resample
+/* Closes the open stage frame: stage output -> 48 kHz WOLA -> resample
  * down into the native FIFO. */
 static int finish_frame(DfnRateBridge *b, int model_rc) {
     int consumed, produced;
@@ -472,8 +472,7 @@ static int finish_frame(DfnRateBridge *b, int model_rc) {
 
 int dfn_rate_bridge_nn_begin(DfnRateBridge *b, DfnResStageJob *job) {
     if (!b || !job || b->phase != 1) return -1;
-    while (b->fill >= B48_HOP) {
-        int r;
+    if (b->fill >= B48_HOP) {
         /* 48 kHz sqrt-Hann 1024/512 analysis; each STFT object keeps its lane's history. */
         ac_stft_push(b->stft_e, b->fifo_e, b->spec_e48);
         ac_stft_push(b->stft_p, b->fifo_p, b->spec_p48);
@@ -482,13 +481,9 @@ int dfn_rate_bridge_nn_begin(DfnRateBridge *b, DfnResStageJob *job) {
                 (size_t)b->fill * sizeof(float));
         memmove(b->fifo_p, b->fifo_p + B48_HOP,
                 (size_t)b->fill * sizeof(float));
-        r = dfn_res_stage_begin(b->stage, b->spec_e48, b->spec_p48, job);
-        if (r < 0) return -1;
-        if (r == 1) {
-            b->phase = 2;
-            return 1;
-        }
-        if (finish_frame(b, 0) != 0) return -1;   /* warm-up: nothing to run */
+        if (dfn_res_stage_begin(b->stage, b->spec_e48, b->spec_p48, job) != 1) return -1;
+        b->phase = 2;
+        return 1;
     }
     return 0;
 }
@@ -554,6 +549,10 @@ int dfn_rate_bridge_added_delay_exact(const DfnRateBridge *b, int *numerator,
 
 DfnResStage *dfn_rate_bridge_stage(const DfnRateBridge *b) {
     return b ? b->stage : NULL;
+}
+
+unsigned int dfn_rate_bridge_state_generation(const DfnRateBridge *b) {
+    return b ? dfn_res_stage_state_generation(b->stage) : 0u;
 }
 
 void dfn_rate_bridge_get_counters(const DfnRateBridge *b,

@@ -42,28 +42,6 @@ ifeq ($(SIMD),0)
 SIMD_CPPFLAGS += -DSIMD_KERNELS_FORCE_SCALAR
 endif
 
-# DeepFilterNet2 heads per accelerator invocation (README "Multi-frame
-# export"): a plain decimal in 1..64, the --frames-per-call of the exported
-# graph. Anything else is -DDFN2_FRAMES_PER_CALL=<N> on every unit, so the
-# default adds no flag and keeps its compile lines and build signature; N lands
-# in CFLAGS and therefore in CFG_SIG_PAYLOAD. The contract and chain binaries
-# are one-frame drivers and do not compile for N > 1 (dfn2_model_io.h);
-# `make lib` and tests/test_dfn2_frames_per_call_c.py do.
-DFN2_FRAMES_PER_CALL ?= 1
-override DFN2_FRAMES_PER_CALL := $(strip $(DFN2_FRAMES_PER_CALL))
-DFN2_FRAMES_PER_CALL_VALUES := 1 2 3 4 5 6 7 8 9 10 11 12 13 14 15 16 17 18 19 \
-	20 21 22 23 24 25 26 27 28 29 30 31 32 33 34 35 36 37 38 39 40 41 42 43 \
-	44 45 46 47 48 49 50 51 52 53 54 55 56 57 58 59 60 61 62 63 64
-ifneq ($(words $(DFN2_FRAMES_PER_CALL)),1)
-$(error DFN2_FRAMES_PER_CALL must be one plain decimal in 1..64, got '$(DFN2_FRAMES_PER_CALL)')
-endif
-ifeq ($(filter $(DFN2_FRAMES_PER_CALL),$(DFN2_FRAMES_PER_CALL_VALUES)),)
-$(error DFN2_FRAMES_PER_CALL must be one plain decimal in 1..64, got '$(DFN2_FRAMES_PER_CALL)')
-endif
-ifneq ($(DFN2_FRAMES_PER_CALL),1)
-override CFLAGS += -DDFN2_FRAMES_PER_CALL=$(DFN2_FRAMES_PER_CALL)
-endif
-
 # --- Configuration-keyed outputs --------------------------------------------
 # Every knob that changes what a binary or object contains is folded into a
 # signature, and everything this file builds lives under build/simd<N>-<sig>/.
@@ -90,17 +68,19 @@ SOURCES := tests/test_c_prepost.c \
 	DeepFilterNet3/dfn3_model_io.c \
 	DeepFilterNet3/dfn3_prepost.c \
 	GTCRN/gtcrn_process.c
-# tests/dfn2_test_grid.h is the grid the DeepFilterNet2 test programs run (the
-# library holds none); it is read by tests/test_c_prepost.c,
-# tests/test_nn_chains.c and tests/test_nn_kernels.c.
+# The test headers hold the grids the test programs run (the libraries hold none),
+# the hop framing and the page-guarded allocator; the wildcard keeps a header added
+# there in the prerequisites of every test binary.
 HEADERS := \
-	tests/dfn2_test_grid.h \
+	$(wildcard tests/*.h) \
 	DeepFilterNet2/dfn2_grid.h \
 	DeepFilterNet2/dfn2_process.h \
 	DeepFilterNet2/dfn2_model_io.h \
+	DeepFilterNet2/dfn2_model_io_priv.h \
 	DeepFilterNet2/dfn2_prepost.h \
 	DeepFilterNet3/dfn3_process.h \
 	DeepFilterNet3/dfn3_model_io.h \
+	DeepFilterNet3/dfn3_model_io_priv.h \
 	DeepFilterNet3/dfn3_prepost.h \
 	GTCRN/gtcrn_process.h
 TEST_BIN := $(OBJ_DIR)/test_c_prepost
@@ -121,11 +101,11 @@ DFN3_STREAM_BIN := $(OBJ_DIR)/test_dfn3_stream
 DFN3_STREAM_SCALAR_BIN := $(OBJ_DIR)/test_dfn3_stream_scalar
 
 # The AINR release archive, the counterpart of AIAEC's libaiaec_prepost.a:
-# DeepFilterNet2, DeepFilterNet3 (including their pre/post classes) and GTCRN. RNNoise-ERB is
-# NOT in it -- it has its own Makefile under RNNoise-ERB/ and no archive of
-# its own (its process.c is compiled directly), so a board using it adds that
-# source to its build. The contract binaries above compile the same sources
-# whole-program rather than linking this.
+# DeepFilterNet2, DeepFilterNet3 (including their pre/post classes), GTCRN and
+# RNNoise-ERB's process.c (member rnnoise_process.o; the RNNoise-ERB/Makefile
+# builds its own tests). The members call audiolib (the n_fft check, the skn
+# kernels), so a link of the archive takes audiolib's archive too. The contract
+# binaries above compile the same sources whole-program rather than linking this.
 LIB := $(OBJ_DIR)/libainr_prepost.a
 LIB_OBJECTS := $(OBJ_DIR)/dfn2_process.o \
 	$(OBJ_DIR)/dfn2_model_io.o \
@@ -133,7 +113,8 @@ LIB_OBJECTS := $(OBJ_DIR)/dfn2_process.o \
 	$(OBJ_DIR)/dfn3_process.o \
 	$(OBJ_DIR)/dfn3_model_io.o \
 	$(OBJ_DIR)/dfn3_prepost.o \
-	$(OBJ_DIR)/gtcrn_process.o
+	$(OBJ_DIR)/gtcrn_process.o \
+	$(OBJ_DIR)/rnnoise_process.o
 VPATH := DeepFilterNet2:DeepFilterNet3:GTCRN
 
 .PHONY: all lib print-lib-path print-cflags print-sources test test-simd test-pairs clean _cfg_guard
@@ -174,6 +155,10 @@ _cfg_guard:
 	printf '%s\n' "$(CFG_SIG_PAYLOAD)" > "$$m"
 
 $(OBJ_DIR)/%.o: %.c | _cfg_guard
+	$(CC) $(CFLAGS) $(SIMD_CPPFLAGS) -MMD -MP -c -o "$@" "$<"
+
+# The member name carries the family: RNNoise-ERB's source is a bare process.c.
+$(OBJ_DIR)/rnnoise_process.o: RNNoise-ERB/process.c | _cfg_guard
 	$(CC) $(CFLAGS) $(SIMD_CPPFLAGS) -MMD -MP -c -o "$@" "$<"
 
 -include $(LIB_OBJECTS:.o=.d)
@@ -253,14 +238,13 @@ test-simd: $(TEST_BIN) $(SCALAR_BIN) $(KERNEL_TEST_BIN) $(KERNEL_TEST_SCALAR_BIN
 
 # The DeepFilterNet2/3 lookahead pairs the trainer accepts: `make test` and
 # `make test-simd` build the shipped pair on the shipped 48 kHz grid only; these
-# pytest files rebuild the C hosts for every other pair (-DDFN2_/DFN3_MASK_LOOKAHEAD,
-# _DF_LOOKAHEAD: DFN2's test programs build their grid from them, the library takes
-# the grid from its caller; DFN3 takes them as library flags) and, for the shipped
-# pair and 2/4, on the 32 and 16 kHz grids (-DDFN2_GRID_KHZ, read by
-# tests/dfn2_test_grid.h only), and check the pair guards (run-time refusals for
-# DFN2, link-time and compile-time for DFN3). The two frames_per_call
-# files do the same for DFN2_FRAMES_PER_CALL against the one-frame graph and
-# host, per pair.
+# pytest files rebuild the C hosts for every other pair (-DDFN2_MASK_LOOKAHEAD,
+# -DDFN2_DF_LOOKAHEAD: DFN2's test programs build their grid from them, the
+# libraries take the grid from their caller; DFN3's tests pass the pair in the
+# spec) and, for the shipped pair and 2/4, on the 32 and 16 kHz grids
+# (-DDFN2_GRID_KHZ, read by tests/dfn2_test_grid.h only), and check the pair
+# guards (run-time refusals of dfn2_grid_make and dfn3_grid_make). The
+# frames-per-call files run N as an argument of one driver.
 PYTHON ?= python3
 PAIR_TESTS := tests/test_dfn2_lookahead_pairs.py tests/test_dfn2_prepost_c.py \
 	tests/test_dfn3_prepost_c.py tests/test_dfn3_stream_c.py \

@@ -34,7 +34,7 @@ pipeline.
 Each model carries its own feature contract and `MODEL_VERSION`; checkpoints
 are not interchangeable between them. `DeepFilterNet2` and `DeepFilterNet3`
 additionally have a mask/deep-filter lookahead pair (15 legal pairs, shipped
-1/1) that is part of the checkpoint contract and is chosen at build time for the C hosts; see
+1/1) that is part of the checkpoint contract and is a run-time grid field for the C hosts; see
 [`AINR/README.md`](AINR/README.md).
 
 ### Neural AEC candidates

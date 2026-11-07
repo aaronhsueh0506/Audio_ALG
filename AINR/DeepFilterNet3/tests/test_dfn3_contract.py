@@ -813,16 +813,28 @@ def test_fixed_batch_dfn3_replays_independent_streaming_lanes():
 
 
 def c_macro(header_text, name):
-    """Read a plain integer ``#define`` out of a shipped C header."""
+    """Read a plain integer ``#define`` out of a C header or source."""
     match = re.search(r'^#define\s+' + name + r'\s+(\d+)u?\b',
                       header_text, flags=re.MULTILINE)
     assert match, name
     return int(match.group(1))
 
 
+def c_float_macro(text, name):
+    """Read a float literal ``#define`` (``-60.0f``) out of a C source."""
+    match = re.search(r'^#define\s+' + name + r'\s+(-?\d+(?:\.\d+)?)f\b',
+                      text, flags=re.MULTILINE)
+    assert match, name
+    return float(match.group(1))
+
+
+# The shipped model the C stream test builds its grid and state buffers from.
+STREAM_TEST = ROOT_PATH.parent / 'tests' / 'test_dfn3_stream.c'
+
+
 def test_dfn3_export_state_layout_and_c_dimensions_match(tmp_path):
     header = (ROOT_PATH / 'dfn3_model_io.h').read_text()
-    process = (ROOT_PATH / 'dfn3_process.h').read_text()
+    stream_test = STREAM_TEST.read_text()
 
     macro = c_macro
     model = build_shipped_model(load_config()).eval()
@@ -842,15 +854,18 @@ def test_dfn3_export_state_layout_and_c_dimensions_match(tmp_path):
     assert tuple(metadata['output_schema']) == OUTPUT_NAMES
     assert metadata['state_handoff'] == {
         'h_gru': 'h_gru_out', 'df_convp_history': 'df_convp_history_out'}
+    # The library holds none of the grid or the recurrent state's shape; the C
+    # stream test's own constants (its float host's state buffers) are what the
+    # exported graph's tensors are pinned to.
     frames = macro(header, 'DFN3_MODEL_INPUT_FRAMES')
-    bins = macro(process, 'DFN3_DF_BINS')
+    bins = macro(stream_test, 'DFN3_TEST_DF_BINS')
     assert [tuple(value.shape) for value in inputs] == [
-        (1, 1, frames, macro(process, 'DFN3_N_ERB')),
+        (1, 1, frames, macro(stream_test, 'DFN3_TEST_N_ERB')),
         (1, 2, frames, bins),
-        (1, macro(header, 'DFN3_MODEL_GRU_ROWS'), 1,
-         macro(header, 'DFN3_MODEL_GRU_HIDDEN')),
-        (1, macro(header, 'DFN3_MODEL_ENCODER_CHANNELS'),
-         macro(header, 'DFN3_MODEL_DF_PATHWAY_WINDOW'), bins),
+        (1, macro(stream_test, 'DFN3_TEST_GRU_ROWS'), 1,
+         macro(stream_test, 'DFN3_TEST_GRU_HIDDEN')),
+        (1, macro(stream_test, 'DFN3_TEST_ENCODER_CHANNELS'),
+         macro(stream_test, 'DFN3_TEST_DF_PATHWAY_WINDOW'), bins),
     ]
 
 
@@ -1013,16 +1028,34 @@ def test_dfn3_wrapper_rejects_a_model_padded_for_another_window():
         StatelessDFN3Heads(model)
 
 
-def test_config_lookaheads_equal_c_header_constants():
-    """config.ini [model] holds the trained pair and dfn3_process.h the pair the
-    host is built for by default; the export metadata does not tie them, so a
-    one-sided edit would only change latency and tap alignment on the device."""
+def test_config_equals_the_stream_test_model_constants():
+    """config.ini holds the trained model and the C stream test the grid it builds
+    (the default lookahead pair, the signal and model sizes, the seven feature
+    numbers); the export metadata does not tie them, so a one-sided edit would
+    only change latency, tap alignment or the normalisers on the device."""
     cfg = load_config()
-    header = (ROOT_PATH / 'dfn3_process.h').read_text()
-    pair = (c_macro(header, 'DFN3_MASK_LOOKAHEAD'),
-            c_macro(header, 'DFN3_DF_LOOKAHEAD'))
+    text = STREAM_TEST.read_text()
+    pair = (c_macro(text, 'DFN3_MASK_LOOKAHEAD'),
+            c_macro(text, 'DFN3_DF_LOOKAHEAD'))
     assert pair == (cfg.getint('model', 'mask_lookahead'),
                     cfg.getint('model', 'df_lookahead')) == SHIPPED_PAIR
+    for macro, section, key in (
+            ('DFN3_TEST_SAMPLE_RATE', 'signal', 'sr'),
+            ('DFN3_TEST_N_FFT', 'signal', 'n_fft'),
+            ('DFN3_TEST_N_ERB', 'model', 'n_erb'),
+            ('DFN3_TEST_DF_BINS', 'model', 'df_bins'),
+            ('DFN3_TEST_DF_ORDER', 'model', 'df_order')):
+        assert c_macro(text, macro) == cfg.getint(section, key), macro
+    for macro, key in (
+            ('DFN3_TEST_ERB_NORM_TAU_SEC', 'erb_norm_tau_sec'),
+            ('DFN3_TEST_ERB_NORM_INIT_LO_DB', 'erb_norm_init_lo_db'),
+            ('DFN3_TEST_ERB_NORM_INIT_HI_DB', 'erb_norm_init_hi_db'),
+            ('DFN3_TEST_ERB_NORM_SCALE_DB', 'erb_norm_scale_db'),
+            ('DFN3_TEST_SPEC_NORM_TAU_SEC', 'spec_norm_tau_sec'),
+            ('DFN3_TEST_SPEC_NORM_INIT_LO', 'spec_norm_init_lo'),
+            ('DFN3_TEST_SPEC_NORM_INIT_HI', 'spec_norm_init_hi')):
+        assert (np.float32(c_float_macro(text, macro)) ==
+                np.float32(cfg.getfloat('feature', key))), macro
 
 
 @pytest.mark.parametrize('trained, runtime, key', [

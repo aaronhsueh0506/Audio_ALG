@@ -11,7 +11,7 @@ The shared FFT independently selects its available target implementation; select
 the board compiler and ABI flags rather than editing source guards. Signal grids,
 model state tensors and latency do not change with pointer width.
 
-Public memory descriptors remain 32 bytes. Their build hashes add an ILP32 token
+Public memory descriptors are 32 bytes (DFN2, DFN3, GTCRN; RNNoise-ERB's `RNNoiseMemReq` is 24). Their build hashes add an ILP32 token
 on 32-bit targets and preserve the existing hashes on 64-bit targets. Re-query
 requirements for the target build; `_init_ex` rejects a descriptor from the other
 ABI before touching the supplied pool.
@@ -63,7 +63,7 @@ training coverage before attributing the result to the shared dataset.
 `DeepFilterNet3` restores the independent band-split comparison branch. Both
 shipped DFN configs share the signal grid, feature arithmetic, training recipe and
 dataset seed/split (DFN2 can also run another grid, see [DFN2 grid](#dfn2-grid);
-DFN3 stays at 48 kHz). With mask/DF lookahead 1/1, DFN2 waits two hops and DFN3
+DFN3 also takes its grid at run time but has only the 48 kHz / 1024 model and test grid). With mask/DF lookahead 1/1, DFN2 waits two hops and DFN3
 one hop; including identity-path WOLA the measured shifts on the shipped grid are 1536 and 1024
 samples respectively. See `tests/test_dfn_comparison.py` and the DFN3 README.
 Keep outputs in each model's own directory.
@@ -145,24 +145,28 @@ baseline starts from the loaded weights.
 
 ## C pre/post-processing
 
-RNNoise-ERB, GTCRN, DeepFilterNet2 and DeepFilterNet3 provide streaming C analysis/synthesis
-code; the neural inference between those two boundaries is left to the target
-accelerator. The production default enables NEON where `SK_HAVE_NEON` holds (AArch64, and 32-bit ARM with NEON plus fused FMA).
+RNNoise-ERB, GTCRN, DeepFilterNet2 and DeepFilterNet3 provide the streaming C code around
+the network, in the frequency domain only: the application frames with audiolib (`AcStft` /
+`AcIstft`; each model header states the window, scale and overlap-add mode it was trained with),
+passes one spectrum per hop and takes one enhanced spectrum back; the neural inference between
+those two boundaries is left to the target accelerator. Every library takes its grid at run time
+and its memory from the caller (`get_mem_size` -> caller memory -> `init`), reads no file (the ERB
+matrices are data the application loads and passes in) and holds none of the network's recurrent state.
+The production default enables NEON where `SK_HAVE_NEON` holds (AArch64, and 32-bit ARM with NEON plus fused FMA).
 Use the same switch as the conventional stack to build the scalar reference:
 
 ```bash
-make lib                # libainr_prepost.a: DeepFilterNet2 + DeepFilterNet3 + GTCRN
-                        # (RNNoise-ERB is built from RNNoise-ERB/ directly, no
-                        # archive); outputs are keyed by configuration --
-                        # `make print-lib-path` prints the absolute path
+make lib                # libainr_prepost.a: DeepFilterNet2 + DeepFilterNet3 + GTCRN +
+                        # RNNoise-ERB (member rnnoise_process.o); outputs are keyed by
+                        # configuration -- `make print-lib-path` prints the absolute path
 make test-simd          # NEON and forced-scalar digest must match, the
                         # model-local NEON kernels equal their scalar twins,
                         # and the DFN2/GTCRN chains print identical digests in
                         # both builds (tests/test_nn_chains.c)
 make SIMD=0 test        # scalar-only build, including DFN3 streaming
 python3 -m pytest DeepFilterNet2/tests DeepFilterNet3/tests tests -q
-make test-pairs         # only the lookahead-pair pytest files (rebuilds the DFN2/DFN3
-                        # C hosts per pair)
+make test-pairs         # only the lookahead-pair pytest files (rebuilds the test
+                        # programs that take the pair at build time)
 make -C RNNoise-ERB SIMD=0 test
 ```
 
@@ -174,57 +178,51 @@ trained for one pair is refused under another. The ONNX graph does not depend on
 them; they decide what the host does:
 
 - the window for `heads[t]` is frames `[t-(2-M) .. t+M]` (zero before the
-  stream start), the first heads are ready once frame M has been pushed, and
+  stream start), the first heads are ready once frame M has been pushed (with one frame per call the host runs the
+  accelerator on the M frames before that as warm-up frames and discards their heads), and
   `export_onnx.feature_windows(feature, mask_lookahead)`, the calibration
   captures and the export metadata (`mask_lookahead`, `df_lookahead`,
   `input_window_alignment`) all use it; the calibration report names the pair;
-- the DFN3 C host takes the pair as `-DDFN3_MASK_LOOKAHEAD=<M> -DDFN3_DF_LOOKAHEAD=<D>`
-  (plain decimals, defaults = `config.ini`) on every translation unit of the build. An
-  out-of-range pair does not compile (preprocessor `#error`, so also under
-  gnu99 and C++); objects built for different pairs do not link (each unit that
-  depends on the pair references a symbol named after its pair that
-  `dfn3_process.c` defines); a graph description or pool of another pair is
-  refused at run time (descriptor validation, pool hash). The DFN2 C host has no
-  build setting for the pair: it is two fields of the `DFN2Grid` the application passes
-  (`dfn2_grid_make()` refuses an out-of-range pair with `DFN2_GRID_ERR_MASK_LOOKAHEAD` /
-  `DFN2_GRID_ERR_DF_LOOKAHEAD`, and a ring deeper than `DFN2_MAX_DF_RING` with
-  `DFN2_GRID_ERR_CAPACITY`), there is no link-time pair symbol, and a graph description or pool of
-  another pair is refused at run time (descriptor validation, pool hash). The only build-time
-  pair of DFN2 is the test programs' (`tests/dfn2_test_grid.h`, `pipelines/dfn/tests/dfn_test_grid.h`),
-  which size fixed arrays; a pair whose ring `max(5, M + D + 1)` is deeper than 5 (1/4 and 2/3: 6, 2/4: 7)
-  also needs `-DDFN2_MAX_DF_RING=<ring>` on every unit, because the library state is sized for a capacity;
+- in C the pair is two run-time fields of the spec the application gives
+  `dfn2_grid_make()` / `dfn3_grid_make()` (`DFN2GridSpec` / `DFN3GridSpec`); nothing is
+  selected at build time and there is no link-time pair symbol. The makers refuse an
+  out-of-range pair (`DFN2_GRID_ERR_MASK_LOOKAHEAD` / `_DF_LOOKAHEAD`, `DFN3_GRID_ERR_*` likewise),
+  and a graph description or pool of another pair is refused at run time (descriptor
+  validation, pool hash). Each library carves the rings of its pair at init. The only
+  build-time pairs are the test programs' (`tests/dfn2_test_grid.h`,
+  `pipelines/dfn/tests/dfn_test_grid.h`, the preset at the top of `tests/test_dfn3_stream.c`);
 - latency: DFN2 (cascade) `1 + M + D` hops, DFN3 (parallel) `1 + max(M, D)`.
 
 The C hosts are exercised for the shipped pair by `make test` / `make test-simd`
-and for every other pair by pytest, which rebuilds them per pair
-(`make test-pairs`: `tests/test_dfn2_lookahead_pairs.py`,
-`test_dfn2_prepost_c.py`, `test_dfn3_stream_c.py`, `test_dfn3_prepost_c.py`,
-`test_dfn_lookahead_link.py`, `test_dfn_lookahead_calibration.py`, and the
-multi-frame files `test_dfn2_frames_per_call.py`,
-`test_dfn2_frames_per_call_c.py`). The Python
-parts (export, replay, calibration, offline inference) run for all 15 pairs;
-the C builds for the six pairs with `D <= M` and (0,1), (1,3), (2,4). The
-pairs, the shipped pair and the compile flags the tests use come from
-`tests/dfn_pairs.py` (constructor, `config.ini`, `make print-cflags`). No
+and for every other pair by pytest (`make test-pairs`:
+`tests/test_dfn2_lookahead_pairs.py`, `test_dfn2_prepost_c.py`,
+`test_dfn3_stream_c.py`, `test_dfn3_prepost_c.py`, `test_dfn_lookahead_link.py`,
+`test_dfn_lookahead_calibration.py`, and the multi-frame files
+`test_dfn2_frames_per_call.py`, `test_dfn2_frames_per_call_c.py`). The Python
+parts (export, replay, calibration, offline inference) and `test_dfn3_prepost_c.py`
+(one binary, the pair in the grid) run all 15 pairs; the C programs that take
+the pair at build time are rebuilt for the six pairs with `D <= M` and (0,1),
+(1,3), (2,4). The pairs, the shipped pair and the compile flags the tests use come
+from `tests/dfn_pairs.py` (constructor, `config.ini`, `make print-cflags`). No
 checkpoint trained for a pair other than the shipped one exists here, so the
 audio quality of the others is unmeasured.
 
 ### DFN2 grid
 
-DeepFilterNet2 only. **The C library holds no grid.** The signal grid (sample rate, FFT size), the model geometry (ERB bands,
-deep-filter bins) and the lookahead pair are a `DFN2Grid` (`DeepFilterNet2/dfn2_grid.h`) that the application builds with
-`dfn2_grid_make(&grid, sample_rate, n_fft, n_erb, df_bins, mask_lookahead, df_lookahead)` and passes to every object it creates;
-the same binary runs any grid within the compile-time capacities (`DFN2_MAX_N_FFT` 1024, `DFN2_MAX_N_ERB` 32,
-`DFN2_MAX_DF_BINS` 96, `DFN2_MAX_DF_RING` 5, mask-only 2; a grid above one is refused with `DFN2_GRID_ERR_CAPACITY`, and one `-D`
-on every unit raises it). The grid, the trained model and its ERB matrices must belong together. `hop`, `n_bins`, the two scales,
-the two EMA coefficients (`train.py` `make_norm_alpha`, tau 1.0 s), the deep-filter history and the ring depth are derived by
-formula. What stays compile time: `DFN2_DF_ORDER` (5), the capacities, `-DDFN2_MASK_ONLY`, `DFN2_FRAMES_PER_CALL`, the graph geometry,
-`DFN2_FEATURE_VERSION` and the normaliser starting points.
+DeepFilterNet2 (the board table below is its). **The C library holds no grid.** What the exported model fixes (sample rate, FFT size, ERB bands,
+deep-filter bins and order, the lookahead pair, the frames per call and the normaliser settings of `config.ini [feature]`) is a
+`DFN2GridSpec` (`DeepFilterNet2/dfn2_grid.h`) that the application fills and turns into a `DFN2Grid` with
+`dfn2_grid_make(&grid, &spec)`; the grid goes to every object the application creates, and one binary runs any grid the maker
+accepts. There is no compile-time capacity: the pool is sized from the grid at run time by `dfn2_prepost_get_mem_size()`. The grid,
+the trained model and its ERB matrices must belong together. `hop`, `n_bins`, the two scales, the two EMA coefficients (`train.py`
+`make_norm_alpha`), the deep-filter history, the ring depth and `input_frames` are derived by formula. What stays compile time:
+`-DDFN2_MASK_ONLY` and `DFN2_FEATURE_VERSION`. DeepFilterNet3 takes its grid at run time the same way (`DFN3GridSpec` /
+`dfn3_grid_make()`), but no trained model or test program uses a grid other than 48000 / 1024.
 
 The board samples own the table from (sample rate, FFT size) to the model geometry. `alg_ai3_dfn.c` and `alg_ai3_dfn_lite.c` take
 `--sample-rate` and `--fft-size`, `alg_ai3_aec_dfn.c` and the two pipeline example mains `--ai-sample-rate` and `--ai-fft-size`, from the table without its 32000 row
-(their AEC has no 32 kHz grid; their `--sr` / `--sample-rate` is the host's rate), the two UVC samples are 48 kHz only with the shipped row hard-wired, and all of them read
-the ERB matrices from `fb_<sr>_<n_erb>.bin` (details in [`DeepFilterNet2/README.md`](DeepFilterNet2/README.md#choosing-the-grid)):
+(their AEC has no 32 kHz grid; their `--sr` / `--sample-rate` is the host's rate), the two UVC samples are 48 kHz only with the shipped row hard-wired. The samples read the ERB
+matrices from `fb_<sr>_<n_erb>.bin` (the exporter's `erb_matrix.bin` renamed for its grid), the example mains from `--erb-fwd FILE` and `--erb-inv FILE` (details in [`DeepFilterNet2/README.md`](DeepFilterNet2/README.md#choosing-the-grid)):
 
 | model sample rate | FFT size | n_erb | df_bins | mask / df lookahead | state |
 |---|---|---|---|---|---|
@@ -232,14 +230,13 @@ the ERB matrices from `fb_<sr>_<n_erb>.bin` (details in [`DeepFilterNet2/README.
 | 32000 | 512 | 28 | 96 | 0 / 0 | provisional, no model trained (28 is a multiple of 4, which `train.py` and the C library both ask for) |
 | 48000 | 1024 | 32 | 96 | 1 / 1 | shipped |
 
-The state and the model-I/O arrays are sized for the capacities, so a smaller grid wastes the difference: measured pools
-(`DFN2_IO_FREQ` / `DFN2_IO_TIME`, 64-bit host, default capacities) are 210,336 / 213,984 bytes at 16 kHz 0/0, 213,456 / 220,688
-at 32 kHz 0/0 and 219,648 / 234,048 at 48 kHz 1/1; lowering the capacities to the grid (`-DDFN2_MAX_N_FFT=256 -DDFN2_MAX_N_ERB=24`)
-brings the 16 kHz pool to 174,784 / 178,432. `DFN2_PREPOST_CARVE_VERSION` is 9 and the pool hash folds the whole grid, so a pool
-size or `DFN2PrepostMemReq` recorded by an earlier build is refused. Only the tests choose a grid when they are built, through their
+Pools (`dfn2_prepost_get_mem_size()`, 64-bit host, bytes; the application's `AcStft` / `AcIstft`, the ERB matrices and the registered
+recurrent state are not in them) follow the grid: 47,744 at 16 kHz 0/0, 62,784 at 32 kHz 0/0 and 92,608 at 48 kHz 1/1, 104,640 and 116,672
+at 48 kHz 2/3 and 2/4 (a deeper ring). `DFN2_PREPOST_CARVE_VERSION` is 11 and the pool hash folds the whole grid, so a pool size or
+`DFN2PrepostMemReq` recorded by an earlier build is refused. Only the tests choose a grid when they are built, through their
 own header (`tests/dfn2_test_grid.h`, `pipelines/dfn/tests/dfn_test_grid.h`); the library and the pipeline objects take the
-`DFN2Grid` from their caller (`DfnResStageConfig.grid` in `pipelines/dfn`). The rules, the derived fields, the status codes, the link
-symbol, the sizes and the call order (a C skeleton under "Calling the library") are in
+`DFN2Grid` from their caller (`DfnResStageConfig.grid` in `pipelines/dfn`). The rules, the derived fields, the status codes, the
+sizes and the call order (a C skeleton under "Calling the library") are in
 [`DeepFilterNet2/README.md`](DeepFilterNet2/README.md#choosing-the-grid); the tests are `tests/test_dfn2_grid.py` and
 `tests/test_dfn2_runtime_grid.py`. The rate bridge of `pipelines/dfn` is written for the 48 kHz model and refuses any other.
 
@@ -252,40 +249,40 @@ their shapes. N = 1 writes exactly the one-frame graph and JSON. The metadata of
 an N-frame graph records `frames_per_call` and `chunk_window_alignment`
 (`input_feature_frames` = N + 2, `output_frames_per_invocation` = N), and
 `onnx_streaming_contract.validate_frames_per_call` refuses a graph whose
-metadata and shapes disagree. The C host is built with
-`make DFN2_FRAMES_PER_CALL=<N>` (1..64; `-DDFN2_FRAMES_PER_CALL=<N>` on every
-unit): it runs the accelerator every N hops, composes the N frames in one
-burst and still emits one hop per call, so the output trails by N - 1 more
-hops (DFN2 latency `1 + M + D + N - 1` hops). The pool hash, the
-descriptor's `input_frames` (N + 2) and a link-time symbol carry N; a unit
-written for one frame per call does not compile for N > 1, so `make test` / `make test-simd`
-(one-frame drivers) and the pipelines DFN stage stay at N = 1 while
-`make lib` builds for any N. ABI: `DFN2ModelIoDescriptor` is 72 bytes (18
-fields) for every N, pinned by `_Static_assert` (C11 builds); N is carried by
-`input_frames` and the export metadata, so an adapter built against the
-one-frame header neither overruns nor passes an N > 1 library. Details in
+metadata and shapes disagree. The C host takes N as
+`DFN2GridSpec.frames_per_call` (1..64, a run-time field): it runs the accelerator
+every N hops, builds the N enhanced frames in one burst and still emits one hop per call,
+so the output trails by N - 1 more hops (DFN2 latency `1 + M + D + N - 1` hops).
+The pool hash and the descriptor's `input_frames` (N + 2) carry N; the pipelines DFN
+stage (and the rate bridge built on it) refuse N > 1, and `make test` / `make test-simd` drive N = 1. Only N = 1 has the
+one-flow-per-hop behaviour described below (warm-up frames); N > 1 keeps its older return values.
+ABI: `DFN2ModelIoDescriptor` is 72 bytes (18 fields) for every N, pinned by
+`_Static_assert` (C11 builds); N is carried by `input_frames` and the export
+metadata, so a descriptor made for the one-frame graph (`input_frames` 3) is refused
+by a grid of N > 1. Details in
 [`DeepFilterNet2/README.md`](DeepFilterNet2/README.md#multi-frame-export).
 
 The DFN C API also performs ERB/complex feature normalization, mask expansion,
-deep-filter composition, and attenuation limiting. In time-domain I/O mode it
-synthesizes through a caller-borrowed audiolib `AcIstft`; inverse FFT and
-overlap-add run inside that object. The post-filter (`mask_pf`) exists only in
+the deep filter, and attenuation limiting, on spectra: the application runs
+audiolib's `AcStft` / `AcIstft` around it. The post-filter (`mask_pf`) exists only in
 the Python reference.
-`dfn2_compose()` is the aligned/offline arithmetic reference. Hardware
-integrations must use `dfn2_compose_stream()`: it explicitly pairs a delayed
+`dfn2_enhance_spectrum()` is the aligned/offline arithmetic reference. Hardware
+integrations must use `dfn2_enhance_spectrum_stream()`: it explicitly pairs a delayed
 network head with the spectrum frame it describes and returns the output frame
 index. DFN2's cascade costs two hops because the future DF source first needs
-its own lookahead mask. The API returns zero during warm-up; callers must not
-send an invalid warm-up frame to synthesis. DFN3 uses its independent
-`dfn3_compose_stream()`/`dfn3_prepost` APIs; its raw-low branch and high-band
+its own lookahead mask. With one frame per call the first `mask_lookahead` hops are warm-up frames: the application runs the
+same flow on every hop (`pre_process_freq` returns 1, `frame_open`, the accelerator, `frame_finish`, `post_process_freq`), the
+heads of a warm-up frame are discarded, the registered state is zeroed and the state generation advances by one, so the audio is
+unchanged. The output spectrum is zero while `valid` is 0 (the first `M + D` hops), so the application may push the synthesis on
+every hop when its `AcIstft` is in `AC_OLA_ACCUMULATE` mode (the default; `AC_OLA_ENV_NORM` does not apply). DFN3 uses its independent
+`dfn3_enhance_spectrum_stream()`/`dfn3_prepost` APIs; its raw-low branch and high-band
 mask need one hop of lookahead, and are aligned to the same output frame. GTCRN uses the configured
 unnormalised complex `[F,2]` network boundary. DeepFilterNet2, DeepFilterNet3
 and GTCRN use zero-padded streaming warm-up (`center=False` semantics), while
 their offline PyTorch whole-utterance inference uses centered STFT framing at
-clip boundaries. RNNoise-ERB uses `center=False` in both Python and C; its C
-analysis reads a full caller-supplied 512-sample frame rather than a hop.
-Its FFT/IFFT/overlap state belongs to caller-owned audiolib `AcStft`/`AcIstft`
-objects, bound with pre/post API layout 2; its GRU/ONNX state layout stays 1.
+clip boundaries. RNNoise-ERB uses `center=False` in both Python and C; its FFT,
+inverse FFT and overlap-add belong to the application's audiolib `AcStft` /
+`AcIstft`, and its pre/post API layout is 2 (GRU/ONNX state layout 1).
 See the model README for initialization and memory requirements.
 
 DeepFilterNet2, DeepFilterNet3 and GTCRN also provide `export_onnx.py`,
@@ -317,7 +314,9 @@ The active deployment exports are stateless accelerator graphs:
 | GTCRN | 1 complex STFT frame | 6 conv windows (1,16,3\|5\|11,33) + `h_tra` (1,6,1,16) + `h_dpgrnn` (1,4,33,8) |
 
 “Stateless” describes the accelerator, not the algorithm. Each state tensor has
-one host buffer owned by the caller.
+one host buffer owned by the application: a float host registers (pointer, element count)
+pairs in the model's config and the library zeroes and finite-checks them; a board registers
+nothing, its accelerator holds the state, and the library only counts restarts.
 
 DeepFilterNet2, DeepFilterNet3 and GTCRN state is rank 4 and has the same shape at the graph
 input and at its `*_out` output; the runtime binds both to the same address, so
@@ -331,31 +330,31 @@ and joined with one Concat. `onnx_streaming_contract.py`
 (`validate_inplace_state_graph`) checks this at export time and
 `check_state_quantization.py` repeats it on an exported graph and on a
 quantization report. The runtime must finish reading every state input before
-it writes the output at that address, and the `*_validate` helpers
-(`gtcrn_model_state_validate()`, `dfn2_model_io_validate_state()`) finite-check
-the state and zero it on a non-finite value, because the previous state no
-longer exists. The accelerator's fixed-point copy of the state is not reached by
-a reset or by that zeroing, so `dfn2_prepost_state_generation()`,
-`dfn2_model_io_state_generation()` and `gtcrn_model_state_generation()` count
-them (1 after init, plus one per event): a runtime that sees a new value refills
-its state tensors with quantized zeros.
-
-RNNoise-ERB takes the ordinary runtime's own output tensors with
-`rnnoise_model_state_inherit()` (finite-check, then copy), or is bound in place
-and validated with `rnnoise_model_state_validate()`.
+it writes the output at that address. The registered state is finite-checked whole
+after each invocation (`gtcrn_process_state_validate()`, `dfn2_prepost_frame_finish()`
+and `dfn2_model_io_validate_state()`, `rnnoise_frame_finish()`) and zeroed on a
+non-finite value, because the previous state no longer exists. The accelerator's
+fixed-point copy of the state is not reached by a reset or by that zeroing, so
+`dfn2_prepost_state_generation()`, `dfn2_model_io_state_generation()`,
+`dfn3_prepost_state_generation()`, `gtcrn_process_state_generation()` and
+`rnnoise_state_generation()` count them (1 after init, plus one per event; for DFN2 and DFN3 a warm-up frame is one): a runtime
+that sees a new value refills its state tensors with quantized zeros. Registration is
+all pairs or none (DFN2/DFN3: `h_gru` and `df_convp_history`, mask-only DFN2: `h_gru`; GTCRN: the eight tensors
+in `GTCRNStateId` order; RNNoise-ERB: `h1`, `h2`, `h3`); a pointer with a count of 0 and
+a count with a NULL pointer are refused, and the registered buffers are in no pool size or hash.
 
 DeepFilterNet2 additionally publishes the host-side callback boundary a
 pipeline binds a runtime to -- `DFN2Model` / `dfn2_model_run_frame()` in
 `DeepFilterNet2/dfn2_prepost.h`, with `DFN2ModelIoDescriptor` in
 `dfn2_model_io.h` as the graph contract a runtime must present;
 `dfn2_model_run_frame()` returns -1 without calling `infer` for a NULL or invalid
-descriptor. There is no
+descriptor (DFN3 has the same pair, `DFN3Model` / `dfn3_model_run_frame()`). There is no
 separate accelerator adapter for DFN2, unlike Align-ULCNet: the feature
-windows and both recurrent state tensors already live inside the `DFN2Prepost`
-pool, so the class itself is the adapter. The FREQ mode also offers
-`dfn2_prepost_pre_process_freq_dual()`, which estimates the heads from one
-spectrum and applies them to another on the same frame clock; the two
-branches touch disjoint state inside `dfn2_process.c`.
+windows live inside the `DFN2Prepost` pool and the recurrent state is the
+application's, so the class itself is the adapter. DFN2 and DFN3 also offer
+`dfn2_prepost_pre_process_freq_dual()` / `dfn3_prepost_pre_process_freq_dual()`, which
+estimate the heads from one spectrum and apply them to another on the same frame
+clock; the two branches touch disjoint state inside `dfn2_process.c` / `dfn3_process.c`.
 
 Per-model call order (with error handling), sequence diagrams and the external/internal
 parameter tables are in the HTML site, one page per model:

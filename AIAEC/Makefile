@@ -50,11 +50,9 @@ CFG_SIG_PAYLOAD := CC_TARGET_SIG=$(CC_TARGET_SIG) CC=$(CC) AR=$(AR) CFLAGS=$(CFL
 CFG_SIG := $(shell printf '%s' "$(CFG_SIG_PAYLOAD)" | cksum | cut -d' ' -f1)
 OBJ_DIR := $(BUILD_DIR)/simd$(SIMD)-$(CFG_SIG)
 LIB := $(OBJ_DIR)/libaiaec_prepost.a
-# ulcnet_prepost.o and deepvqe_prepost.o are the pre/post classes, each a
-# THIRD TU on purpose: the files a class composes (ulcnet_process.c +
-# ulcnet_model_io.c; deepvqe_process.c) stay independently linkable for their
-# own parity tests. The accelerator adapter drives the
-# Align-ULCNet class.
+# ulcnet_prepost.o and deepvqe_prepost.o are the pre/post classes, each a TU of
+# its own: they use ulcnet_model_io.o and deepvqe_process.o, which stay
+# independently linkable. The accelerator adapter drives the Align-ULCNet class.
 OBJECTS := $(OBJ_DIR)/ulcnet_process.o \
 	$(OBJ_DIR)/ulcnet_model_io.o \
 	$(OBJ_DIR)/ulcnet_prepost.o \

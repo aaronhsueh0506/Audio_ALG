@@ -99,70 +99,155 @@ def test_ta_bins_follows_the_grid():
     assert state_shapes(D, ta_bins_for(m48))['key_history'][-1] == 52
 
 
-def test_c_header_enumerates_the_same_grids_as_the_exporter():
-    """The legal-grid set is stated in both languages; pin them together.
-
-    export_onnx refuses a foreign grid in Python and ulcnet_model_io.h
-    #errors on one in C. Nothing compared the two sets, so a grid could be
-    added to one side alone and the mismatch would only surface as a build
-    that the exporter is happy to feed and the C cannot accept.
-    """
-    header = (
-        Path(__file__).resolve().parents[1]
-        / 'Align_ULCNet' / 'ulcnet_model_io.h'
-    ).read_text(encoding='utf-8')
-    pairs = re.findall(
-        r'ULCNET_MODEL_IO_SR\s*==\s*(\d+)\s*&&\s*'
-        r'ULCNET_MODEL_IO_N_FFT\s*==\s*(\d+)',
-        header,
-    )
-    assert pairs, 'no grid pairs found in the header guard'
-    assert {(int(sr), int(fft)) for sr, fft in pairs} == set(SUPPORTED_GRIDS)
-
-
-_TA_BINS_PROBE = """
+_GRID_PROBE = """
 #include <stdio.h>
 #include "ulcnet_model_io.h"
-int main(void) {
-    printf("%d %d\\n", ULCNET_MODEL_IO_BINS, ULCNET_MODEL_IO_TA_BINS);
+int main(int argc, char **argv) {
+    UlcnetGridSpec spec = { .sample_rate = 0, .n_fft = 0, .delay_depth = 8 };
+    UlcnetGrid grid;
+    UlcnetModelIoDescriptor descriptor;
+    if (argc != 3 || sscanf(argv[1], "%d", &spec.sample_rate) != 1 ||
+        sscanf(argv[2], "%d", &spec.n_fft) != 1) return 2;
+    if (ulcnet_grid_make(&grid, &spec) != ULCNET_GRID_OK) return 3;
+    if (ulcnet_model_io_descriptor_default(&grid, &descriptor) != 0) return 4;
+    printf("%d %d %d %d\\n", grid.sample_rate, grid.n_fft, grid.hop, grid.n_bins);
     return 0;
 }
 """
 
 
-@pytest.mark.parametrize('sample_rate,n_fft', SUPPORTED_GRIDS)
-def test_c_ta_bins_matches_the_python_derivation(tmp_path, sample_rate, n_fft):
-    """The C macro and the Python derivation are independent encodings.
+@pytest.fixture(scope='module')
+def audio_common_lib():
+    """audiolib's NE10 static lib: the n_fft rule of the grid is audiolib's."""
+    if shutil.which('make') is None:
+        pytest.skip('no make available')
+    ac_dir = Path(__file__).resolve().parents[3] / 'audiolib' / 'common'
+    subprocess.run(['make', '-s', '-C', str(ac_dir), 'BACKEND=ne10', 'lib'],
+                   check=True, capture_output=True)
+    out = subprocess.run(
+        ['make', '-s', '-C', str(ac_dir), 'BACKEND=ne10', 'print-lib-path'],
+        check=True, capture_output=True, text=True)
+    lib = out.stdout.strip().splitlines()[-1]
+    assert os.path.isfile(lib), lib
+    return lib
 
-    Nothing else compares them: the C driver checks the descriptor against
-    the same macro it was built from, which is an identity, and a text match
-    on the header survives a changed divisor. Only evaluating the macro and
-    comparing it to the model's own width closes that gap -- change the 10 in
-    ULCNET_MODEL_IO_TA_BINS to an 11 and this is the test that goes red.
+
+@pytest.mark.parametrize('sample_rate,n_fft', SUPPORTED_GRIDS)
+def test_c_grid_accepts_every_exporter_grid(
+        tmp_path, audio_common_lib, sample_rate, n_fft):
+    """Every grid the exporter supports builds a C grid with the framing the
+    exporter's SignalGrid has.
+
+    export_onnx refuses a foreign grid in Python; the C grid rule is audiolib's
+    (any n_fft its framing builds), so the sets are not equal. What must hold is
+    that no exporter grid is one the C side cannot build, and that hop and bin
+    count agree.
     """
     compiler = shutil.which('cc') or shutil.which('gcc') or shutil.which('clang')
     if compiler is None:
         pytest.skip('no C compiler available')
     ulcnet_dir = Path(__file__).resolve().parents[1] / 'Align_ULCNet'
+    ac_dir = Path(__file__).resolve().parents[3] / 'audiolib' / 'common'
     probe = tmp_path / 'probe.c'
-    probe.write_text(_TA_BINS_PROBE, encoding='utf-8')
+    probe.write_text(_GRID_PROBE, encoding='utf-8')
     executable = tmp_path / 'probe'
     subprocess.run([
         compiler, '-std=c99', '-Wall', '-Werror',
-        '-DULCNET_MODEL_IO_SR=%d' % sample_rate,
-        '-DULCNET_MODEL_IO_N_FFT=%d' % n_fft,
-        '-I', str(ulcnet_dir), str(probe), '-o', str(executable),
+        '-I', str(ulcnet_dir), '-I', str(ac_dir / 'include'), '-I', str(ac_dir),
+        str(probe), str(ulcnet_dir / 'ulcnet_model_io.c'), audio_common_lib,
+        '-lm', '-o', str(executable),
     ], check=True, capture_output=True)
-    c_bins, c_ta_bins = (
+    c_rate, c_fft, c_hop, c_bins = (
         int(value) for value in
-        subprocess.run([str(executable)], check=True, capture_output=True)
+        subprocess.run([str(executable), str(sample_rate), str(n_fft)],
+                       check=True, capture_output=True, text=True)
         .stdout.split()
     )
-
     grid = SignalGrid(sample_rate, n_fft, n_fft, n_fft // 2)
-    model = AlignULCNet(grid, max_delay_frames=D)
+    assert (c_rate, c_fft) == (sample_rate, n_fft)
+    assert c_hop == grid.hop_len
     assert c_bins == grid.n_freqs
+
+
+# The C test programs that run the model over registered state hold the shipped graph's state
+# table themselves (the library knows none of it). Each defines the same STATE_* block; this
+# test pins every copy to the exporter.
+_TESTS_DIR = Path(__file__).resolve().parent
+_STATE_TABLE_SOURCES = (
+    'test_ulcnet_model_io_c.py',
+    'test_ulcnet_prepost_c.py',
+    'test_prepost_chains.c',
+    'test_prepost_kernels.c',
+    'test_ulcnet_accelerator_adapter.c',
+)
+_STATE_TABLE_NAMES = ('CHANNELS', 'SCORE_FRAMES', 'GRU_ROWS', 'GRU_HIDDEN')
+
+
+def _state_table(name):
+    text = (_TESTS_DIR / name).read_text(encoding='utf-8')
+    table = {}
+    for field in _STATE_TABLE_NAMES:
+        match = re.search(r'^#define\s+STATE_%s\s+(\d+)\s*$' % field, text,
+                          flags=re.MULTILINE)
+        assert match is not None, (name, field)
+        table[field] = int(match.group(1))
+    macro = re.search(r'^#define\s+(STATE_TA_BINS\(n_bins\)\s+.+?)\s*$', text,
+                      flags=re.MULTILINE)
+    assert macro is not None, (name, 'STATE_TA_BINS')
+    table['TA_BINS'] = macro.group(1)
+    return table
+
+
+def test_c_state_tables_are_one_table_and_match_the_exporter():
+    """No C test copy of the state table can drift from the exporter's."""
+    # A new file with a table must be listed, or it would escape this test.
+    for path in sorted(_TESTS_DIR.iterdir()):
+        if (path.suffix in ('.c', '.py') and path.name != Path(__file__).name
+                and 'STATE_TA_BINS' in path.read_text(encoding='utf-8')):
+            assert path.name in _STATE_TABLE_SOURCES, path.name
+    tables = {name: _state_table(name) for name in _STATE_TABLE_SOURCES}
+    reference = tables[_STATE_TABLE_SOURCES[0]]
+    for name, table in tables.items():
+        assert table == reference, name
+    assert reference['CHANNELS'] == TA_CHANNELS
+    assert reference['SCORE_FRAMES'] == SCORE_WINDOW_FRAMES
+    assert reference['GRU_ROWS'] == GRU_SUBBANDS * GRU_LAYERS
+    assert reference['GRU_HIDDEN'] == GRU_HIDDEN
+
+
+@pytest.mark.parametrize('sample_rate,n_fft', SUPPORTED_GRIDS)
+def test_c_state_table_ta_bins_matches_the_python_derivation(
+        tmp_path, sample_rate, n_fft):
+    """The C test tables and the exporter are independent encodings of the K/V width.
+
+    Nothing else compares them: a text match on the macro survives a changed
+    divisor. Only evaluating it and comparing it to the model's own width closes
+    that gap -- change the 10 in STATE_TA_BINS to an 11 and this is the test that
+    goes red.
+    """
+    compiler = shutil.which('cc') or shutil.which('gcc') or shutil.which('clang')
+    if compiler is None:
+        pytest.skip('no C compiler available')
+    macro = _state_table(_STATE_TABLE_SOURCES[0])['TA_BINS']
+    grid = SignalGrid(sample_rate, n_fft, n_fft, n_fft // 2)
+    probe = tmp_path / 'probe.c'
+    probe.write_text(
+        '#include <stdio.h>\n#define %s\n'
+        'int main(void) { printf("%%d\\n", (int)STATE_TA_BINS(%d)); return 0; }\n'
+        % (macro, grid.n_freqs), encoding='utf-8')
+    executable = tmp_path / 'probe'
+    subprocess.run([compiler, '-std=c99', '-Wall', '-Werror', str(probe),
+                    '-o', str(executable)], check=True, capture_output=True)
+    c_ta_bins = int(subprocess.run([str(executable)], check=True,
+                                   capture_output=True, text=True).stdout)
+    model = AlignULCNet(grid, max_delay_frames=D)
     assert c_ta_bins == ta_bins_for(model)
+    shapes = state_shapes(D, ta_bins_for(model))
+    table = _state_table(_STATE_TABLE_SOURCES[0])
+    assert shapes['key_history'] == (1, table['CHANNELS'], D, c_ta_bins)
+    assert shapes['logit_history'] == (1, table['CHANNELS'],
+                                       table['SCORE_FRAMES'], D)
+    assert shapes['h_gru'] == (1, table['GRU_ROWS'], 1, table['GRU_HIDDEN'])
 
 
 def test_streaming_export_shapes_are_fixed_and_full_window():
@@ -236,11 +321,6 @@ def test_c_descriptor_constants_match_export_contract():
         'ULCNET_MODEL_IO_LAYOUT_VERSION': STATE_LAYOUT_VERSION,
         'ULCNET_MODEL_IO_MIN_D': MIN_DELAY_DEPTH,
         'ULCNET_MODEL_IO_MAX_D': MAX_DELAY_DEPTH,
-        'ULCNET_MODEL_IO_TA_CHANNELS': TA_CHANNELS,
-        'ULCNET_MODEL_IO_SCORE_WINDOW': SCORE_WINDOW_FRAMES,
-        'ULCNET_MODEL_IO_GRU_SUBBANDS': GRU_SUBBANDS,
-        'ULCNET_MODEL_IO_GRU_LAYERS': GRU_LAYERS,
-        'ULCNET_MODEL_IO_GRU_HIDDEN': GRU_HIDDEN,
     }
     for name, value in expected.items():
         match = re.search(
@@ -251,11 +331,9 @@ def test_c_descriptor_constants_match_export_contract():
         assert match is not None, name
         assert int(match.group(1)) == value
 
-    # TA_BINS is derived from the compiled grid rather than transcribed, so
-    # it cannot be pinned by value here. Matching the header TEXT would not
-    # pin it either -- a changed divisor keeps the same text. The evaluated
-    # comparison lives in test_c_ta_bins_matches_the_python_derivation.
-    assert '#define ULCNET_MODEL_IO_TA_BINS' in header
+    # The model-interior shapes (channels, K/V width, score window, GRU) are the
+    # model's, not the library's; the C test programs that need them carry a
+    # table, pinned by test_c_state_tables_are_one_table_and_match_the_exporter.
 
     # The far-input enumeration is a two-sided contract: the exporter writes
     # the numeric value into the metadata, the descriptor carries the same

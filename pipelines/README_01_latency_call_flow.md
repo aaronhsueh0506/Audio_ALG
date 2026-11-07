@@ -199,7 +199,9 @@ algorithmic latency. The spectrum must sit on the analysis frame of the same hop
 (the AEC's `error_spec` is the exact 50 %-overlap sqrt-Hann STFT, and the rendering base is `error_spec` or the
 capture spectrum of the same frame); calling it
 twice in a hop, or skipping a hop, breaks the overlap-add. Applications that end in
-a neural stage call it inside `ulcnet_nn_stage_end()` or `dfn_hop_end()`.
+a neural stage call it inside `ulcnet_nn_stage_end()` or `dfn_hop_end()`. The neural libraries
+(`AINR`, `AIAEC`) are frequency domain only: they take and return spectra, and the framing, FFT and
+window come from audiolib in the application (here, in the stage).
 
 ### What memory do I provide?
 
@@ -235,8 +237,9 @@ AcIstft* istft = ac_istft_init(pool + ALIGN16(aec_b) + ALIGN16(nr_b), sy_b, &sy_
   (SRP-PHAT, BF, scratch) is one more block. The post-beam stages, the RES included, are separate blocks sized by their own queries
   (`aec_res_get_mem_size()` on an `AecConfig` from `aec_config_from_level()` with the flow's `fft_size`,
   `anr_get_mem_size()`, `ac_istft_get_mem_size()`),
-  and a neural stage (`ulcnet_nn_stage_mem_size()`, `dfn_rate_bridge_get_mem_requirements()`)
-  is one more block.
+  and a neural stage (`ulcnet_nn_stage_mem_size(&grid, ...)`, `dfn_rate_bridge_get_mem_requirements()`)
+  is one more block. The recurrent state of the network is in none of these pools: a float host registers
+  its own buffers, a board's accelerator holds it.
 - Re-query the descriptor after any library, backend, build-option or config
   change; `mcab_init_ex()` refuses a stale one. Only `Mcab` (`McabMemReq`, its own pool) and the
   DFN stage and bridge carry descriptors; the example headers do not.
@@ -281,8 +284,13 @@ mask), the framing and the clocks advance exactly once, and the latency never
 changes. `ulcnet_nn_stage_process()` and `dfn_hop_process()` are this same
 sequence driven by the model callback installed on the stage, so a board with no
 callback and a host with one produce identical bytes. The model's `reset` callback
-(if set) is still called on an alignment boundary and by the stage's `reset()`, so the
-board keeps its recurrent state in step.
+(if set) is still called on an alignment boundary and by the stage's `reset()`. A board that
+registers no state keeps it in the accelerator and reloads quantized zeros at start and whenever the
+state generation changes (`dfn_res_stage_state_generation()` or `dfn_rate_bridge_state_generation()`
+for DFN2, `ulcnet_accelerator_adapter_state_generation()` for ULCNet); a refused commit (a
+non-finite output) advances the counter as a reset does. DFN2's first `mask_lookahead` hops are warm-up frames: the model runs, the stage
+drops its heads, and each one advances the counter (a failing model on such a frame is a bypass that does the same); on a real frame a
+nonzero model result does not advance it.
 
 ### How do the 4-channel applications split the hop?
 

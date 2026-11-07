@@ -268,39 +268,97 @@ and deepvqe_prepost, one object each.
 
 | Model | Accelerator output | Host composition |
 |---|---|---|
-| Align-ULCNet | complex mask (planar) + full next state windows (written in place) | `ulcnet_prepost` class (ulcnet_model_io_commit() multiplies the compressed error by the mask and inverts the power, then WOLA) |
+| Align-ULCNet | complex mask (planar) + full next state windows (written in place) | `ulcnet_prepost` class (ulcnet_model_io_enhance_spectrum() multiplies the compressed error by the mask and inverts the power; the application's `AcIstft` follows) |
 | Align-CRUSE | real mask | aiaec_apply_real_mask() |
 | DeepVQE-S | 3x3 complex CCM taps | `deepvqe_prepost` class (deepvqe_ccm_process()) |
 | CAGCRN | complex mask | aiaec_apply_complex_mask() |
 
 Align-ULCNet and DeepVQE-S each ship a pre/post *class*
 (`Align_ULCNet/ulcnet_prepost.h`, `DeepVQE_S/deepvqe_prepost.h`) that owns
-everything between the caller's audio and the accelerator's tensors behind
-one opaque object: `_get_mem_size`/`_init` on a caller pool or
-`_create`/`_destroy` on the heap, then per hop `pre_process` ->
-`frame_inputs` -> (accelerator, with every state output bound to the address of
-its input) -> `frame_commit` or `frame_skip` -> `post_process`. Both classes
-also expose `*_state_generation()`, which counts the times the C side zeroed the
-state (reset, refused commit) so a board with fixed-point accelerator state can
-refill it with quantized zeros. Each is compiled once with the io mode fixed at init: TIME
-(hop in, hop out; the class runs the framing on the caller's `FftHandle`) or
-FREQ (spectrum in, spectrum out; for chaining behind the AEC analysis seam, i.e. `AecResContext.error_spec` (never `aec_get_output_base().base_spec`, the rendering base), or the 4-channel path (the sample beam
-helper's beamformed spectrum from `mcab_sample_beam_process()`, or the frame `mcab_fuse()` returns), whose
-spectra are already in this center=False framing). Both AIAEC classes are one
-inference per hop from the first hop. The classes are a third TU on top of
-the two parity-tested files each composes, so those keep their own
-standalone parity tests; the class gates are
-`tests/test_ulcnet_prepost_c.py` and `tests/test_deepvqe_prepost_c.py`.
-DeepFilterNet2's class, `../AINR/DeepFilterNet2/dfn2_prepost.h`, has the same
-shape with two differences an integrator must know: its first hop returns 0
-(the graph needs its right-hand neighbour before it can run), and its
-spectra are torch.stft normalized=True on a 48 kHz/1024 grid, so chaining an
-AIAEC spectrum into it is a 32x scale error on a different grid -- see that
-header's warning block.
+everything between the caller's spectra and the accelerator's tensors behind
+one opaque object. The classes are frequency domain only: the application
+frames with audiolib (an `AcStft` per input stream, one `AcIstft` for the
+output, with the framing each model was trained on, stated in
+`ulcnet_process.h` and `deepvqe_prepost.h`), and the library holds no window,
+FFT or STFT object. The lifecycle:
 
-Align-ULCNet state ownership (caller-owned pool, four state tensors bound in place,
-commit that validates and applies the mask) is documented in Align_ULCNet/README.md and
-implemented by ulcnet_model_io.c/.h.
+1. The grid is a run-time value. Fill a `UlcnetGridSpec` / `DeepVqeGridSpec`
+   (`sample_rate`, `n_fft`, `delay_depth`) with what the graph was exported for
+   and call `ulcnet_grid_make()` / `deepvqe_grid_make()`; one binary serves 16
+   and 48 kHz.
+2. `*_prepost_config_defaults()` copies the grid into the config. The recurrent
+   state belongs to the application: a float host registers its buffers
+   (borrowed, element counts, all or none: four for Align-ULCNet, the sixteen
+   `DeepVqeStateId` entries for DeepVQE-S), a board registers nothing and its
+   accelerator holds the state.
+3. `_get_mem_size`/`_init` on a caller pool (16-byte aligned) or
+   `_create`/`_destroy` on the heap. The pool holds no recurrent state, and a
+   registered buffer is in neither its size nor its hash; `_init_ex` refuses a
+   pool recorded for another grid, D or build.
+4. Per hop `pre_process_freq` -> `frame_open` -> (accelerator, with every state
+   output bound to the address of its input) -> `frame_finish` or
+   `frame_bypass` -> `post_process_freq`.
+
+```c
+UlcnetGridSpec spec = { .sample_rate = 16000, .n_fft = 512, .delay_depth = 8 };
+UlcnetGrid grid;
+UlcnetPrepostConfig cfg;
+UlcnetPrepostMemReq req;
+UlcnetPrepost *p;
+UlcnetModelIoInputs in;
+UlcnetModelIoOutputs out;
+AcStftConfig sc;
+AcStft *stft_err, *stft_far;
+AcIstft *istft;
+
+ulcnet_grid_make(&grid, &spec);                 /* what the graph was exported for */
+ulcnet_prepost_config_defaults(&cfg, &grid);
+cfg.key_history = key;     cfg.key_history_elements = key_n;      /* float host: all four buffers, */
+cfg.value_history = value; cfg.value_history_elements = value_n;  /* a board leaves them NULL/0    */
+cfg.logit_history = logit; cfg.logit_history_elements = logit_n;
+cfg.h_gru = gru;           cfg.gru_hidden_elements = gru_n;
+ulcnet_prepost_get_mem_size(&cfg, &req);
+p = ulcnet_prepost_init(pool, req.bytes, &cfg); /* pool: 16-byte aligned, req.bytes */
+
+ac_stft_config_default(&sc, grid.n_fft);        /* sqrt-Hann, center 0, scales 1 */
+stft_err = ac_stft_init(mem_a, ac_stft_get_mem_size(&sc), &sc);
+stft_far = ac_stft_init(mem_b, ac_stft_get_mem_size(&sc), &sc);
+sc.ola = AC_OLA_ENV_NORM;
+istft = ac_istft_init(mem_s, ac_istft_get_mem_size(&sc), &sc);
+
+/* per hop */
+ac_stft_push_planar(stft_err, err_hop, err_re, err_im);
+ac_stft_push_planar(stft_far, far_hop, far_re, far_im);
+ulcnet_prepost_pre_process_freq(p, err_re, err_im, far_re, far_im);
+ulcnet_prepost_frame_open(p, &in, &out);
+if (run_accelerator(&in, &out) != 0 ||          /* each state *_out has its input's address */
+    ulcnet_prepost_frame_finish(p) != 0)
+    ulcnet_prepost_frame_bypass(p);             /* fail open; DeepVQE-S mutes */
+ulcnet_prepost_post_process_freq(p, out_re, out_im);
+ac_istft_push_planar(istft, out_re, out_im, hop_out);
+```
+
+Both classes also expose `*_state_generation()`, which counts the times the C
+side restarted the state (reset, refused `frame_finish`; 0 after init, whether
+or not state is registered): a board with fixed-point accelerator state loads
+quantized zeros at start and whenever the value differs from the one it last
+saw. Both are one inference per hop from the first hop. The Align-ULCNet error
+spectrum is `AecResContext.error_spec` (the analysis seam, never
+`aec_get_output_base().base_spec`, the rendering base) or, on the 4-channel
+path, the sample beam helper's beamformed spectrum from
+`mcab_sample_beam_process()` or the frame `mcab_fuse()` returns; those spectra
+are already in this center-0 framing. `ulcnet_prepost.c` builds on
+`ulcnet_model_io.c` (state and mask handling: Align_ULCNet/README.md) and
+`deepvqe_prepost.c` on `deepvqe_process.c`; those keep their own standalone
+parity tests, and the class gates are `tests/test_ulcnet_prepost_c.py` and
+`tests/test_deepvqe_prepost_c.py`.
+DeepFilterNet2's class, `../AINR/DeepFilterNet2/dfn2_prepost.h`, has the same
+shape with two differences an integrator must know: its first `mask_lookahead`
+hops return 0 (the graph needs its right-hand neighbours before it can run; none
+for a grid with no lookahead), and its spectra are torch.stft normalized=True
+(the application scales by `grid.stft_scale` = 1/sqrt(n_fft) in and
+`grid.stft_unscale` out, see `dfn2_process.h`), so an AIAEC spectrum
+(unnormalised, on the AIAEC grid) cannot be chained into it as it is.
 
 Per-model call order (with error handling), sequence diagrams and the external/internal
 parameter tables are in the HTML site, one page per model:

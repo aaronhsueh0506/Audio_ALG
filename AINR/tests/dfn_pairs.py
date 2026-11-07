@@ -11,23 +11,24 @@ that depends on it asks this module instead of keeping its own list:
   ``SMOKE_PAIRS``, three pairs whose deep filter looks further ahead than the
   mask path. The remaining legal pairs are not built as C hosts here.
 * ``shipped_pair(family)`` is ``config.ini [model]``, the pair a retrained
-  default would change. ``tests/test_dfn_lookahead_link.py`` pins the C header
-  defaults to it (DFN3: ``dfn3_process.h``; DFN2: the pair that
-  ``tests/dfn2_test_grid.h`` and ``pipelines/dfn/tests/dfn_test_grid.h`` -- the test
-  programs' own grid headers, never read by the library -- use when no flag is
-  given), so the build that takes no ``-D`` override is that pair.
-* DFN2 has no pair in its library: the pair is a field of the ``DFN2Grid`` an
-  application builds with ``dfn2_grid_make``. ``build_dfn2_grid_probe`` and
-  ``run_dfn2_grid_probe`` build and run a small program that sweeps
-  ``(mask, df)`` through that function, so the tests can check its refusals
-  from C, in C11, gnu99 and C++; ``dfn2_status_codes``, ``dfn2_ring`` and
-  ``dfn2_capacities`` give them the library's own enum, ring rule and
-  capacities.
-* ``dfn2_grid_config`` and ``dfn2_write_stream_input`` are the two helpers the
-  DFN2 grid tests share: config.ini with another signal grid (so the Python
-  reference is built for it as the trainer would), and the file the stream
-  drivers read (matrices, features, heads and windows of the exported-graph
-  wrapper).
+  default would change. ``tests/test_dfn_lookahead_link.py`` pins the pair that
+  ``tests/dfn2_test_grid.h`` and ``pipelines/dfn/tests/dfn_test_grid.h`` -- the
+  test programs' own grid headers, never read by the library -- use when no flag
+  is given to it, so the build that takes no ``-D`` override is that pair.
+* Neither library holds a pair: it is a field of the ``DFN2Grid`` /
+  ``DFN3Grid`` an application builds with ``dfn2_grid_make`` /
+  ``dfn3_grid_make``. ``build_dfn2_grid_probe`` and ``run_dfn2_grid_probe``
+  build and run a small program that sweeps ``(mask, df)`` through the DFN2
+  maker, so the tests can check its refusals from C, in C11, gnu99 and C++;
+  ``dfn2_status_codes`` and ``dfn2_ring`` give them the library's own enum and
+  ring rule. ``defines`` selects a pair in the DFN2 test programs, which read
+  it from the build; DFN3 test programs pass it in the spec.
+* ``dfn2_grid_config``, ``dfn2_spec_values`` and ``dfn2_write_stream_input``
+  are the helpers the DFN2 grid tests share: config.ini with another signal
+  grid (so the Python reference is built for it as the trainer would), the
+  order and normaliser fields of the spec a C host builds from such a config,
+  and the file the stream drivers read (matrices, features, heads and windows
+  of the exported-graph wrapper).
 * ``house_cflags`` and ``audio_common_lib`` are the Makefile's own flags and
   archive, so a pytest compile cannot drift from ``make``.
 
@@ -54,7 +55,7 @@ _MACRO_PREFIX = {'DeepFilterNet2': 'DFN2', 'DeepFilterNet3': 'DFN3'}
 _SOURCE_PREFIX = {'DeepFilterNet2': 'dfn2', 'DeepFilterNet3': 'dfn3'}
 
 # Pairs with df_lookahead > mask_lookahead that the C builds cover: a head
-# queue in DFN3, a ring of 6 or 7 slots in DFN2.
+# queue in DFN3, a ring deeper than the order in DFN2.
 SMOKE_PAIRS = ((0, 1), (1, 3), (2, 4))
 
 # A grid wider than any rule the constructor could plausibly have, used to
@@ -123,118 +124,136 @@ def c_build_pairs(family):
                  if pair[1] <= pair[0] or pair in SMOKE_PAIRS)
 
 
-# DFN2's state rings hold DFN2_MAX_DF_RING frames (dfn2_grid.h): ring =
-# max(DF_ORDER, mask + df + 1) for a pair, so a pair deeper than this needs the
-# capacity raised on every translation unit of the build.
-_DFN2_DEFAULT_RING = 5
-
-
 def defines(family, pair):
-    """``-D`` overrides selecting ``pair``; none for the shipped pair, which is
-    the build with no override. For DFN2 a pair that needs a deeper ring than
-    the library's default capacity also raises it (the test programs read the
-    pair, the library takes it from the grid they build)."""
-    if tuple(pair) == shipped_pair(family):
+    """``-D`` overrides selecting ``pair`` in a DFN2 test program; none for the
+    shipped pair, which is the build with no override. DFN3 reads its pair from
+    the grid spec, so it has no flag."""
+    if family != 'DeepFilterNet2' or tuple(pair) == shipped_pair(family):
         return []
-    prefix = macro_prefix(family)
-    flags = ['-D%s_MASK_LOOKAHEAD=%d' % (prefix, pair[0]),
-             '-D%s_DF_LOOKAHEAD=%d' % (prefix, pair[1])]
-    if family == 'DeepFilterNet2':
-        ring = max(_DFN2_DEFAULT_RING, pair[0] + pair[1] + 1)
-        if ring > _DFN2_DEFAULT_RING:
-            flags.append('-DDFN2_MAX_DF_RING=%d' % ring)
-    return flags
+    return ['-DDFN2_MASK_LOOKAHEAD=%d' % pair[0],
+            '-DDFN2_DF_LOOKAHEAD=%d' % pair[1]]
 
 
 DFN2_DF_ORDER = 5
 
 
-def dfn2_ring(pair, mask_only=False):
-    """Frames the DFN2 state rings need for ``pair`` (dfn2_grid.h): the noisy
+def dfn2_ring(pair, mask_only=False, df_order=DFN2_DF_ORDER):
+    """Frames the DFN2 state rings need for ``pair`` (dfn2_process.h): the noisy
     ring holds mask + df + 1 frames and, with a deep filter, the masked ring
-    holds DF_ORDER, so the ring is the larger of the two. A mask-only build
+    holds ``df_order``, so the ring is the larger of the two. A mask-only build
     keeps the noisy ring alone."""
     noisy = pair[0] + pair[1] + 1
-    return noisy if mask_only else max(DFN2_DF_ORDER, noisy)
+    return noisy if mask_only else max(df_order, noisy)
 
 
-def dfn2_status_codes():
-    """``{'OK': 0, 'ERR_MASK_LOOKAHEAD': -6, ...}`` read from the library's
-    own ``DFN2_GRID_*`` enum, so a test names a refusal instead of a number."""
-    text = (family_dir('DeepFilterNet2') / 'dfn2_grid.h').read_text()
+_GRID_HEADER = {'DeepFilterNet2': 'dfn2_grid.h', 'DeepFilterNet3': 'dfn3_process.h'}
+
+
+def grid_status_codes(family):
+    """``{'OK': 0, 'ERR_MASK_LOOKAHEAD': ..., ...}`` read from the family's own
+    ``DFN<n>_GRID_*`` enum, so a test names a refusal instead of a number."""
+    text = (family_dir(family) / _GRID_HEADER[family]).read_text()
     codes = {name: int(value) for name, value in re.findall(
-        r'DFN2_GRID_(\w+)\s*=\s*(-?\d+)', text)}
-    assert 'OK' in codes and 'ERR_CAPACITY' in codes, codes
+        r'%s_GRID_(\w+)\s*=\s*(-?\d+)' % macro_prefix(family), text)}
+    assert 'OK' in codes and 'ERR_MASK_LOOKAHEAD' in codes, codes
     return codes
 
 
-def dfn2_capacities(flags=()):
-    """The ``DFN2_MAX_*`` capacities (and ``DFN2_MASK_ONLY``) a DFN2 build with
-    ``flags`` sees, as the preprocessor resolves them from ``dfn2_grid.h``."""
-    out = subprocess.run(
-        ['cc', '-E', '-dM', '-x', 'c', '-I', str(family_dir('DeepFilterNet2')),
-         *flags, '-'],
-        input='#include "dfn2_grid.h"\n', check=True, capture_output=True,
-        text=True).stdout
-    macros = dict(re.findall(r'^#define\s+(\w+)\s+(\S+)\s*$', out, re.M))
-    return {'n_fft': int(macros['DFN2_MAX_N_FFT']),
-            'n_erb': int(macros['DFN2_MAX_N_ERB']),
-            'df_bins': int(macros['DFN2_MAX_DF_BINS']),
-            'ring': int(macros['DFN2_MAX_DF_RING']),
-            'mask_only': 'DFN2_MASK_ONLY' in macros}
+def dfn2_status_codes():
+    codes = grid_status_codes('DeepFilterNet2')
+    assert 'ERR_FRAMES_PER_CALL' in codes, codes
+    return codes
 
 
-# A program valid as C and as C++ that sweeps dfn2_grid_make over every
-# (mask_lookahead, df_lookahead) of the probe range at one signal grid.
-_DFN2_GRID_PROBE = r'''
+def dfn2_spec_values(cfg=None, family='DeepFilterNet2'):
+    """The spec fields a C host takes from the model config besides the signal
+    grid and the pair: ``df_order``, DFN2's ``frames_per_call`` (1: the one-frame
+    graph) and the seven ``[feature]`` normaliser settings, as the trainer reads
+    them. ``cfg`` is a ``dfn2_grid_config`` result; default is the shipped file of
+    ``family``."""
+    if cfg is None:
+        cfg = configparser.ConfigParser()
+        cfg.read(family_dir(family) / 'config.ini')
+    values = {'df_order': cfg.getint('model', 'df_order')}
+    if family == 'DeepFilterNet2':
+        values['frames_per_call'] = 1
+    for key in ('erb_norm_tau_sec', 'erb_norm_init_lo_db', 'erb_norm_init_hi_db',
+                'erb_norm_scale_db', 'spec_norm_tau_sec', 'spec_norm_init_lo',
+                'spec_norm_init_hi'):
+        values[key] = cfg.getfloat('feature', key)
+    return values
+
+
+# A program valid as C and as C++ that sweeps dfn<n>_grid_make over every
+# (mask_lookahead, df_lookahead) of the probe range at one signal grid. The spec
+# is filled field by field (a designated initialiser is not C++11); every field
+# is set, so a zero frames_per_call cannot slip through.
+_GRID_PROBE = r"""
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 
-#include "DeepFilterNet2/dfn2_prepost.h"
+#include "DeepFilterNet@N@/dfn@N@_prepost.h"
 
 int main(int argc, char **argv)
 {
-    int sr, n_fft, n_erb, df_bins, mask, df;
-    if (argc != 5) return 2;
-    sr = atoi(argv[1]);
-    n_fft = atoi(argv[2]);
-    n_erb = atoi(argv[3]);
-    df_bins = atoi(argv[4]);
+    DFN@N@GridSpec spec;
+    int mask, df;
+    if (argc != 13) return 2;
+    memset(&spec, 0, sizeof spec);
+    spec.sample_rate = atoi(argv[1]);
+    spec.n_fft = atoi(argv[2]);
+    spec.n_erb = atoi(argv[3]);
+    spec.df_bins = atoi(argv[4]);
+    spec.df_order = atoi(argv[5]);
+@FRAMES@    spec.erb_norm_tau_sec = (float)atof(argv[6]);
+    spec.erb_norm_init_lo_db = (float)atof(argv[7]);
+    spec.erb_norm_init_hi_db = (float)atof(argv[8]);
+    spec.erb_norm_scale_db = (float)atof(argv[9]);
+    spec.spec_norm_tau_sec = (float)atof(argv[10]);
+    spec.spec_norm_init_lo = (float)atof(argv[11]);
+    spec.spec_norm_init_hi = (float)atof(argv[12]);
     for (mask = -1; mask <= 3; ++mask) {
         for (df = -1; df <= 5; ++df) {
-            DFN2Grid grid, before;
+            DFN@N@Grid grid, before;
             int status, ring = 0, valid = -99, untouched;
+            spec.mask_lookahead = mask;
+            spec.df_lookahead = df;
             memset(&grid, 0x5a, sizeof grid);
             before = grid;
-            status = dfn2_grid_make(&grid, sr, n_fft, n_erb, df_bins, mask, df);
+            status = dfn@N@_grid_make(&grid, &spec);
             untouched = memcmp(&grid, &before, sizeof grid) == 0;
-            if (status == DFN2_GRID_OK) {
+            if (status == DFN@N@_GRID_OK) {
                 ring = grid.ring;
-                valid = dfn2_grid_validate(&grid);
+                valid = dfn@N@_grid_validate(&grid);
                 untouched = 1;
             }
             printf("%d %d %d %d %d %d %s\n", mask, df, status, ring, valid,
-                   untouched, dfn2_grid_status_text(status));
+                   untouched, dfn@N@_grid_status_text(status));
         }
     }
     return 0;
 }
-'''
+"""
 
 
-def build_dfn2_grid_probe(workdir, std='c11', flags=(), cxx=False):
-    """Compile the probe against ``dfn2_process.c`` (where ``dfn2_grid_make``
+def _grid_probe_source(family):
+    number = family[-1]
+    frames = '    spec.frames_per_call = 1;\n' if family == 'DeepFilterNet2' else ''
+    return (_GRID_PROBE.replace('@N@', number).replace('@FRAMES@', frames))
+
+
+def build_grid_probe(workdir, std='c11', flags=(), cxx=False, family='DeepFilterNet2'):
+    """Compile the probe against ``dfn<n>_process.c`` (where ``dfn<n>_grid_make``
     lives) under ``-std=<std>`` (or C++11 for ``cxx``), with ``flags`` after the
     house flags. Returns the executable."""
     workdir = Path(workdir)
     source = workdir / 'grid_probe.c'
-    source.write_text(_DFN2_GRID_PROBE)
+    source.write_text(_grid_probe_source(family))
     base = [flag for flag in house_cflags() if not flag.startswith('-std=')]
     flags = base + ['-std=' + ('c11' if cxx else std), *flags]
     library = workdir / 'grid_probe_process.o'
-    subprocess.run(['cc', *flags, '-c', str(source_path('DeepFilterNet2',
-                                                        'process')),
+    subprocess.run(['cc', *flags, '-c', str(source_path(family, 'process')),
                     '-o', str(library)], check=True, capture_output=True)
     exe = workdir / 'grid_probe'
     if cxx:
@@ -251,11 +270,25 @@ def build_dfn2_grid_probe(workdir, std='c11', flags=(), cxx=False):
     return exe
 
 
-def run_dfn2_grid_probe(exe, grid=(48000, 1024, 32, 96)):
+def build_dfn2_grid_probe(workdir, std='c11', flags=(), cxx=False):
+    return build_grid_probe(workdir, std, flags, cxx, 'DeepFilterNet2')
+
+
+_SHIPPED_GRID = (48000, 1024, 32, 96)
+
+
+def run_grid_probe(exe, grid=_SHIPPED_GRID, cfg=None, family='DeepFilterNet2'):
     """``{(mask, df): (status, ring, validate, untouched, text)}`` over the
-    probe range for the signal ``grid`` (sample rate, n_fft, n_erb, df_bins)."""
-    done = subprocess.run([str(exe), *map(str, grid)], capture_output=True,
-                          text=True)
+    probe range for the signal ``grid`` (sample rate, n_fft, n_erb, df_bins),
+    with the order and normalisers of ``cfg`` (default: the family's shipped
+    config)."""
+    values = dfn2_spec_values(cfg, family)
+    spec = [values['df_order'], *[repr(values[key]) for key in (
+        'erb_norm_tau_sec', 'erb_norm_init_lo_db', 'erb_norm_init_hi_db',
+        'erb_norm_scale_db', 'spec_norm_tau_sec', 'spec_norm_init_lo',
+        'spec_norm_init_hi')]]
+    done = subprocess.run([str(exe), *map(str, grid), *map(str, spec)],
+                          capture_output=True, text=True)
     assert done.returncode == 0, (done.stdout, done.stderr)
     result = {}
     for line in done.stdout.splitlines():
@@ -264,6 +297,10 @@ def run_dfn2_grid_probe(exe, grid=(48000, 1024, 32, 96)):
                                         bool(int(untouched)), text)
     assert len(result) == len(_PROBE_MASK) * len(_PROBE_DF), result
     return result
+
+
+def run_dfn2_grid_probe(exe, grid=_SHIPPED_GRID, cfg=None):
+    return run_grid_probe(exe, grid, cfg, 'DeepFilterNet2')
 
 
 def dfn2_grid_config(sr, n_fft, n_erb, df_bins, pair=None):
@@ -319,26 +356,6 @@ def dfn2_write_stream_input(path, model, frames, erb, spec_feat, spec, heads,
         .astype('<f4').tobytes(),
     ]
     Path(path).write_bytes(b''.join(chunks))
-
-
-def header_compiles(family, pair, std, workdir, extra=()):
-    """Whether ``<family>_model_io.h`` compiles (syntax only) for ``pair`` under
-    ``-std=<std>`` (``c++11`` selects the C++ compiler), with ``extra`` flags
-    after the pair's; returns the finished process so a caller can read the
-    diagnostic."""
-    prefix = macro_prefix(family)
-    cxx = std.startswith('c++')
-    source = Path(workdir) / ('header_%s.%s' % (_SOURCE_PREFIX[family],
-                                                'cpp' if cxx else 'c'))
-    source.write_text('#include "%s_model_io.h"\nint main(void) { return 0; }\n'
-                      % _SOURCE_PREFIX[family])
-    return subprocess.run(
-        ['c++' if cxx else 'cc', '-std=' + std, '-fsyntax-only',
-         '-I', str(family_dir(family)),
-         '-I', str(AUDIO_COMMON / 'include'), '-I', str(AUDIO_COMMON),
-         '-D%s_MASK_LOOKAHEAD=%d' % (prefix, pair[0]),
-         '-D%s_DF_LOOKAHEAD=%d' % (prefix, pair[1]), *extra, str(source)],
-        capture_output=True, text=True)
 
 
 def require_toolchain():

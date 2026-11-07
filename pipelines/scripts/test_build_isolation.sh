@@ -6,7 +6,7 @@
 # pipelines/Makefile is a three-producer consumer (audiolib's libaudio_common.a, lib/aec's libaec.a, lib/nr's
 # libanr.a), each resolved via the two-phase recursive-make dispatch described in that Makefile's header. This
 # script exercises the scenarios specific to that design, plus this repo's own audit-no-stdio and publish gates
-# and the RNNoise-ERB table drift-gate.
+# and the RNNoise-ERB ERB matrix drift-gate.
 #
 # Contract:
 #   - OBJ_ROOT=/BIN_ROOT= placement knobs (pipelines' Makefile and the two PRIMARY producer repos AEC/c_impl and
@@ -53,7 +53,7 @@
 #   SP-S11:  pipelines publish (content-addressed release + ATTEST): attest field/naming assertions, no sleep
 #            (the <NNN> suffix disambiguates a same-second republish)
 #   SP-S12:  BACKEND=ne10 CC/CXX toolchain-coherence guard through the dispatch
-#   SP-S13:  RNNoise-ERB table drift-gate
+#   SP-S13:  RNNoise-ERB ERB matrix drift-gate
 #   SP-S14:  make -n/-q/-t publish zero side effects on three Makefiles (pipelines in place, $AEC_R6_DIR,
 #            $NR_R6_DIR); SP-S14b: combined dry-run flags against a deliberately backdated scratch artifact of
 #            the pipelines Makefile only
@@ -1310,19 +1310,32 @@ echo "############################################################"
 echo "# SP-S11: pipelines publish v4 (content-addressed release + ATTEST v2)"
 own_untracked_flag() {
   local dir="$1" paths
-  paths="$(git -C "$dir" ls-files --others --exclude-standard | grep -vE '^AINR/(GTCRN|gtcrn_github)/' || true)"
+  paths="$(git -C "$dir" ls-files --others --exclude-standard | grep -vE '^AINR/gtcrn_github/' || true)"
   if [ -n "$paths" ]; then printf '1\n'; else printf '0\n'; fi
 }
-sp11_expected_self_untracked="$(own_untracked_flag "$PIPE_DIR")"
-# Exercise both expectations without staging anything in the real checkout.
-mkdir -p "$SCRATCH_ROOT/sp11-untracked-policy/AINR/GTCRN"
-git -C "$SCRATCH_ROOT/sp11-untracked-policy" init -q
-printf 'manual content\n' > "$SCRATCH_ROOT/sp11-untracked-policy/AINR/GTCRN/probe.txt"
-[ "$(own_untracked_flag "$SCRATCH_ROOT/sp11-untracked-policy")" = 0 ] \
+sp11_expected_self_untracked="$(own_untracked_flag "$AUDIO_ALG_ROOT")"
+# Exercise the expectations without staging anything in the real checkout. The fixture is a repo with the
+# Audio_ALG layout: publish lists untracked files from the repo root, not from pipelines/, and only the
+# embedded gtcrn_github checkout is whitelisted.
+SP11_FIX="$SCRATCH_ROOT/sp11-untracked-policy"
+mkdir -p "$SP11_FIX/AINR/gtcrn_github" "$SP11_FIX/AINR/GTCRN" "$SP11_FIX/pipelines"
+git -C "$SP11_FIX" init -q
+printf 'manual content\n' > "$SP11_FIX/AINR/gtcrn_github/probe.txt"
+[ "$(own_untracked_flag "$SP11_FIX")" = 0 ] \
   && pass "SP-S11: whitelist-only fixture has expected own untracked=0" \
   || fail "SP-S11: whitelist-only fixture wrongly reports own untracked files"
-printf 'int probe;\n' > "$SCRATCH_ROOT/sp11-untracked-policy/probe.c"
-[ "$(own_untracked_flag "$SCRATCH_ROOT/sp11-untracked-policy")" = 1 ] \
+[ -z "$(make -s -C "$PIPE_DIR" ALG_ROOT="$SP11_FIX" print-untracked)" ] \
+  && pass "SP-S11: the Makefile's untracked list is empty for the whitelist-only fixture" \
+  || fail "SP-S11: the Makefile's untracked list reports a whitelisted file"
+printf 'manual content\n' > "$SP11_FIX/AINR/GTCRN/probe.txt"
+[ "$(own_untracked_flag "$SP11_FIX")" = 1 ] \
+  && [ "$(make -s -C "$PIPE_DIR" ALG_ROOT="$SP11_FIX" print-untracked)" = "AINR/GTCRN/probe.txt" ] \
+  && pass "SP-S11: an untracked file outside pipelines/ (a tracked library directory) is listed from the repo root" \
+  || fail "SP-S11: an untracked file outside pipelines/ is not listed (the list is scoped to the working directory, or GTCRN is whitelisted)"
+rm -f "$SP11_FIX/AINR/GTCRN/probe.txt"
+printf 'int probe;\n' > "$SP11_FIX/probe.c"
+[ "$(own_untracked_flag "$SP11_FIX")" = 1 ] \
+  && [ "$(make -s -C "$PIPE_DIR" ALG_ROOT="$SP11_FIX" print-untracked)" = "probe.c" ] \
   && pass "SP-S11: new source fixture has expected own untracked=1" \
   || fail "SP-S11: new source fixture hides own untracked files"
 
@@ -1477,9 +1490,9 @@ else
   fail "SP-S13: 'make test-tables' FAILED"
   cat "$SP13_LOG" >&2
 fi
-sp13_pass_count="$(grep -c '^PASS' "$SP13_LOG" || true)"
-[ "${sp13_pass_count:-0}" -eq 2 ] && pass "SP-S13: 'make test-tables' output has both PASS layers (canonical + portable)" \
-  || fail "SP-S13: expected 2 PASS lines from 'make test-tables', found ${sp13_pass_count:-0}"
+sp13_pass_count="$(grep -c '^PASS: ERB matrix files match the independent recompute' "$SP13_LOG" || true)"
+[ "${sp13_pass_count:-0}" -eq 1 ] && pass "SP-S13: 'make test-tables' prints the PASS line of the ERB matrix drift guard" \
+  || fail "SP-S13: expected 1 drift-guard PASS line from 'make test-tables', found ${sp13_pass_count:-0}"
 
 SP13_LOG2="$SCRATCH_ROOT/sp13/log2"
 if make -C "$RNN_DIR" CC=false test-tables >"$SP13_LOG2" 2>&1; then

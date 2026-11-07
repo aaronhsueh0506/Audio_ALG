@@ -15,7 +15,8 @@
  *   7. NaN guard   8. full-write contract             9. identity-reprime straddle derivation
  *   10. identity-reprime behaviour                    11. fixed deployment contract
  *   12. phased hop                                    13. recovery by paired reset equals a fresh pair
- * Build and run: `make test_4ch_ulcnet` in 4ch_aec_bf_nr_res/.
+ * One binary runs every grid of k_grids. Build and run: `make test_4ch_ulcnet` in
+ * 4ch_aec_bf_nr_res/.
  */
 
 #define MCAB_TEST_RIG_WITH_BEAM 1
@@ -29,10 +30,31 @@
 #include <stdlib.h>
 #include <string.h>
 
-/* The unit on the compiled grid, linear context only: what ulcnet/4ch_alignulcnet/main.c builds. */
+/* Largest row of the grid table: 48 kHz / fft 1024. */
+enum { HOP_MAX = 512, BINS_MAX = 513 };
+
+static const UlcnetGridSpec k_grids[] = {
+    { .sample_rate = 16000, .n_fft = 512,  .delay_depth = 8 },
+    { .sample_rate = 48000, .n_fft = 1024, .delay_depth = 8 },
+};
+
+static UlcnetGrid g_grid;   /* the grid under test: the stage's, and the unit's by the example config */
+#define HOP (g_grid.hop)
+#define BINS (g_grid.n_bins)
+
+/* The table row that is not the grid under test. */
+static UlcnetGrid other_grid(void) {
+    UlcnetGrid other;
+    memset(&other, 0, sizeof(other));
+    for (size_t i = 0; i < sizeof(k_grids) / sizeof(k_grids[0]); ++i)
+        if (k_grids[i].n_fft != g_grid.n_fft) (void)ulcnet_grid_make(&other, &k_grids[i]);
+    return other;
+}
+
+/* The unit on the stage's grid, linear context only: what ulcnet/4ch_alignulcnet/main.c builds. */
 static McabTestUnitConfig ulcnet_example_unit_config(void) {
-    McabTestUnitConfig cfg = mcab_test_unit_default_config(ULCNET_SR);
-    cfg.core.fft_size = ULCNET_N_FFT;
+    McabTestUnitConfig cfg = mcab_test_unit_default_config(g_grid.sample_rate);
+    cfg.core.fft_size = g_grid.n_fft;
     cfg.core.enable_post = 0;
     return cfg;
 }
@@ -51,20 +73,22 @@ typedef struct Ul4 {
     McabDelayState last_delay;   /* alignment of the most recent successful hop */
 } Ul4;
 
-/* The stage takes ULCNET_BINS bins per hop, so a unit of another grid cannot feed it. */
-static int unit_matches_stage(const McabSampleBeam* unit) {
-    return mcab_hop_size(mcab_test_beam_flow(unit)) == ULCNET_HOP &&
-           mcab_n_freqs(mcab_test_beam_flow(unit)) == ULCNET_BINS &&
-           mcab_fft_size(mcab_test_beam_flow(unit)) == ULCNET_N_FFT;
+/* The stage takes grid.n_bins bins per hop, so a unit of another grid cannot feed it. */
+static int unit_matches_stage(const McabSampleBeam* unit, const UlcnetGrid* grid) {
+    return mcab_hop_size(mcab_test_beam_flow(unit)) == grid->hop &&
+           mcab_n_freqs(mcab_test_beam_flow(unit)) == grid->n_bins &&
+           mcab_fft_size(mcab_test_beam_flow(unit)) == grid->n_fft &&
+           mcab_sample_rate(mcab_test_beam_flow(unit)) == grid->sample_rate;
 }
 
-static Ul4* ul4_wrap(McabSampleBeam* unit, void* stage_mem, size_t stage_bytes) {
+static Ul4* ul4_wrap(McabSampleBeam* unit, void* stage_mem, size_t stage_bytes,
+                     const UlcnetGrid* grid) {
     Ul4* p = (Ul4*)calloc(1, sizeof(*p));
     if (!p) return NULL;
     p->unit = unit;
     p->stage_mem = stage_mem;
-    if (unit && stage_mem && unit_matches_stage(unit))
-        p->stage = ulcnet_nn_stage_init(stage_mem, stage_bytes, 0);
+    if (unit && stage_mem && unit_matches_stage(unit, grid))
+        p->stage = ulcnet_nn_stage_init(stage_mem, stage_bytes, grid, 0);
     if (!p->stage) {
         if (unit) mcab_test_beam_destroy(unit);
         free(stage_mem);
@@ -74,15 +98,18 @@ static Ul4* ul4_wrap(McabSampleBeam* unit, void* stage_mem, size_t stage_bytes) 
     return p;
 }
 
-/* A fresh instance from separate heap allocations; the stage block starts stale. */
-static Ul4* ul4_create(const McabTestUnitConfig* cfg) {
-    size_t stage_bytes = ulcnet_nn_stage_mem_size(0);
+/* A fresh instance from separate heap allocations; the stage block starts stale. NULL when the
+ * unit's grid is not the stage's. */
+static Ul4* ul4_create_for(const McabTestUnitConfig* cfg, const UlcnetGrid* grid) {
+    size_t stage_bytes = ulcnet_nn_stage_mem_size(grid, 0);
     void* stage_mem = NULL;
     if (!cfg || stage_bytes == 0 || posix_memalign(&stage_mem, 16, stage_bytes) != 0)
         return NULL;
     memset(stage_mem, 0x5A, stage_bytes);
-    return ul4_wrap(mcab_test_beam_create(cfg), stage_mem, stage_bytes);
+    return ul4_wrap(mcab_test_beam_create(cfg), stage_mem, stage_bytes, grid);
 }
+
+static Ul4* ul4_create(const McabTestUnitConfig* cfg) { return ul4_create_for(cfg, &g_grid); }
 
 static void ul4_destroy(Ul4* p) {
     if (!p) return;
@@ -168,26 +195,20 @@ static int ul4_process_with_activity(Ul4* p, const float* mic, const float* far,
     return ulcnet_nn_stage_process(p->stage, out);
 }
 
-/* Every test model that actually infers must publish a descriptor: the
- * stage refuses infer-without-descriptor, because a shape disagreement
- * between the graph and the host-side rings is undetectable downstream (the
- * finite guard catches an unwritten output, never a wrong-shaped one). One
- * shared descriptor for the whole file; D is the example default. */
+/* Every test model that actually infers must publish a descriptor: the stage refuses
+ * infer-without-descriptor, because a shape disagreement between the graph and the stage's
+ * grid is undetectable downstream (the finite guard catches an unwritten output, never a
+ * wrong-shaped one). The descriptor of the grid under test. */
 static const UlcnetModelIoDescriptor* test_io_descriptor(void) {
     static UlcnetModelIoDescriptor d;
-    static int ready = 0;
-    if (!ready) {
-        if (ulcnet_model_io_descriptor_default(8, &d) != 0) return NULL;
-        ready = 1;
-    }
-    return &d;
+    return ulcnet_model_io_descriptor_default(&g_grid, &d) == 0 ? &d : NULL;
 }
 
 
 /* DelayAec searches a 16 kHz-equivalent sidechain and scales the selected
  * delay back to native samples. Echo-delay stimuli therefore scale by
  * exactly three on the 48 kHz product grid. */
-#define DELAY_RATE_FACTOR (ULCNET_SR / 16000)
+#define DELAY_RATE_FACTOR (g_grid.sample_rate / 16000)
 
 #define CHECK(condition, message)                                      \
     do {                                                               \
@@ -248,8 +269,8 @@ static int reprime_take(int* armed, int frames) {
  * ========================================================================== */
 
 typedef struct CaptureModel {
-    float re[ULCNET_BINS];
-    float im[ULCNET_BINS];
+    float re[BINS_MAX];
+    float im[BINS_MAX];
     long calls;
     long resets;
 } CaptureModel;
@@ -262,10 +283,10 @@ static int capture_infer(
     CaptureModel* m = (CaptureModel*)user;
     (void)far_re;
     (void)far_im;
-    memcpy(m->re, err_re, ULCNET_BINS * sizeof(float));
-    memcpy(m->im, err_im, ULCNET_BINS * sizeof(float));
-    memcpy(out_re, err_re, ULCNET_BINS * sizeof(float));
-    memcpy(out_im, err_im, ULCNET_BINS * sizeof(float));
+    memcpy(m->re, err_re, BINS * sizeof(float));
+    memcpy(m->im, err_im, BINS * sizeof(float));
+    memcpy(out_re, err_re, BINS * sizeof(float));
+    memcpy(out_im, err_im, BINS * sizeof(float));
     m->calls += 1;
     return 0;
 }
@@ -289,9 +310,9 @@ static int test_identity_e2e(void) {
     int identical_hops = 0;
     int hop;
 
-    CHECK(cfg.core.sample_rate == ULCNET_SR &&
-          cfg.core.fft_size == ULCNET_N_FFT,
-          "default config matches the compiled ULCNet deployment grid");
+    CHECK(cfg.core.sample_rate == g_grid.sample_rate &&
+          cfg.core.fft_size == g_grid.n_fft,
+          "default config matches the stage's grid");
     cfg.beam.bf_fixed_mode = 1;
     cfg.beam.bf_fixed_doa_rad = 0.4f;
     cfg.beam.bf_mu = 0.02f;
@@ -301,11 +322,12 @@ static int test_identity_e2e(void) {
     p = ul4_create(&cfg);
     CHECK(p != NULL, "create ULCNet 4ch pipeline");
     hop = ul4_hop_size(p);
-    CHECK(hop == ULCNET_HOP, "hop matches the ULCNet compile-time hop");
-    CHECK(ul4_fft_size(p) == ULCNET_N_FFT &&
-          ul4_n_freqs(p) == ULCNET_BINS &&
-          ul4_sample_rate(p) == ULCNET_SR,
-          "runtime dimensions match the compiled ULCNet deployment grid");
+    CHECK(hop == HOP && ulcnet_nn_stage_grid(p->stage)->hop == hop,
+          "hop matches the stage's grid");
+    CHECK(ul4_fft_size(p) == g_grid.n_fft &&
+          ul4_n_freqs(p) == BINS &&
+          ul4_sample_rate(p) == g_grid.sample_rate,
+          "runtime dimensions match the stage's grid");
 
     memset(&m, 0, sizeof(m));
     memset(&model, 0, sizeof(model));
@@ -320,7 +342,8 @@ static int test_identity_e2e(void) {
     {
         AcStftConfig sc;
         size_t ref_bytes;
-        ulcnet_framing_config(&sc, NULL, NULL, 0);
+        ac_stft_config_default(&sc, g_grid.n_fft);
+        sc.ola = AC_OLA_ENV_NORM;
         ref_bytes = ac_istft_get_mem_size(&sc);
         CHECK(ref_bytes != 0 && posix_memalign(&ref_mem, 16, ref_bytes) == 0,
               "allocate reference synthesis");
@@ -344,7 +367,7 @@ static int test_identity_e2e(void) {
         for (int i = 0; i < hop; ++i) {
             int64_t absolute = (int64_t)frame * hop + i;
             float phase = 2.0f * (float)M_PI * 700.0f *
-                          (float)absolute / (float)ULCNET_SR;
+                          (float)absolute / (float)g_grid.sample_rate;
             /* frame 0 silent so the 1-hop preamble is provably zero. */
             float echo = frame >= 1 ? 0.08f * sinf(phase) : 0.0f;
             float near = frame >= 30
@@ -454,7 +477,7 @@ static int counting_infer(
     (void)far_re;
     (void)far_im;
     m->infer_calls += 1;
-    for (int k = 0; k < ULCNET_BINS; ++k) {
+    for (int k = 0; k < BINS; ++k) {
         out_re[k] = m->scale * err_re[k];
         out_im[k] = m->scale * err_im[k];
     }
@@ -641,15 +664,16 @@ static int test_counting_model_policy(void) {
  * that boundary, and skip inference for exactly the straddling frames the
  * identity reprime covers -- no more. */
 static int test_fixed_first_alignment_resets_model(void) {
-    enum { FIXED_DELAY = 2 * ULCNET_HOP, N = 8 };
+    enum { N = 8 };
+    const int FIXED_DELAY = 2 * HOP;
     McabTestUnitConfig cfg = ulcnet_example_unit_config();
     Ul4* p;
     CountingModel m;
     UlcnetModel model;
     McabDelayState delay;
-    float microphones[MCAB_CHANNELS * ULCNET_HOP] = {0};
-    float far[ULCNET_HOP] = {0};
-    float out[ULCNET_HOP];
+    float microphones[MCAB_CHANNELS * HOP_MAX] = {0};
+    float far[HOP_MAX] = {0};
+    float out[HOP_MAX];
     int first_solid = -1;
     int changed = 0;
 
@@ -703,8 +727,8 @@ static int test_fixed_first_alignment_resets_model(void) {
  * ========================================================================== */
 
 /* This case exercises the 4ch CORE's FIXED seam, so it pins the core's own
- * 16 kHz / FFT 512 grid rather than the compiled ULCNet grid. Delays handed
- * to it must therefore be expressed in FIXED_SEAM_HOP, not in ULCNET_HOP:
+ * 16 kHz / FFT 512 grid rather than the stage's grid. Delays handed
+ * to it must therefore be expressed in FIXED_SEAM_HOP, not in HOP:
  * the switch hop is ceil(fixed / FIXED_SEAM_HOP). */
 #define FIXED_SEAM_SR   16000
 #define FIXED_SEAM_FFT  512
@@ -1016,8 +1040,8 @@ static int passthrough_far_infer(
     (void)user;
     (void)err_re;
     (void)err_im;
-    memcpy(out_re, far_re, ULCNET_BINS * sizeof(float));
-    memcpy(out_im, far_im, ULCNET_BINS * sizeof(float));
+    memcpy(out_re, far_re, BINS * sizeof(float));
+    memcpy(out_im, far_im, BINS * sizeof(float));
     return 0;
 }
 
@@ -1113,7 +1137,7 @@ static int test_raw_far_timestamp_after_fixed_delay_lock(void) {
     cfg.beam.bf_fixed_doa_rad = 0.4f;
     cfg.beam.bf_mu = 0.02f;
     cfg.core.delay_mode = AEC_DELAY_FIXED;
-    cfg.core.fixed_delay_samples = 2 * ULCNET_HOP;
+    cfg.core.fixed_delay_samples = 2 * HOP;
     memset(&model, 0, sizeof(model));
     model.infer = passthrough_far_infer;
     model.io_descriptor = test_io_descriptor();
@@ -1305,7 +1329,7 @@ static int nan_infer(
     NanModel* m = (NanModel*)user;
     (void)far_re;
     (void)far_im;
-    for (int k = 0; k < ULCNET_BINS; ++k) {
+    for (int k = 0; k < BINS; ++k) {
         out_re[k] = 0.5f * err_re[k];
         out_im[k] = 0.5f * err_im[k];
     }
@@ -1453,7 +1477,7 @@ static int partial_write_infer(
     const float* far_re, const float* far_im,
     float* out_re, float* out_im) {
     PartialModel* m = (PartialModel*)user;
-    int n = m->partial ? 100 : ULCNET_BINS;
+    int n = m->partial ? 100 : BINS;
     (void)far_re;
     (void)far_im;
     for (int k = 0; k < n; ++k) {
@@ -1587,11 +1611,11 @@ static int test_partial_write_guard(void) {
 enum {
     RP_T        = 8,             /* boundary hop under test                */
     RP_MARK_HOP = RP_T - 1,      /* last input hop before the boundary     */
-    RP_MARK_POS = ULCNET_HOP / 2,
     RP_RUN      = 14,
     RP_WINDOW   = 4,             /* hops examined from RP_T on             */
     RP_MAXCALL  = 32
 };
+#define RP_MARK_POS (HOP / 2)   /* impulse position inside the marked hop */
 /* A windowed unit impulse reaches every bin at |w| = 0.707; what a
  * marker-free frame can still carry (mic-HPF ring plus the fixed
  * beamformer's own sinc tails on the error branch, plain zero on the far
@@ -1611,7 +1635,7 @@ typedef struct ProbeModel {
 
 static float spec_peak(const float* re, const float* im) {
     float m = 0.0f;
-    for (int k = 0; k < ULCNET_BINS; ++k) {
+    for (int k = 0; k < BINS; ++k) {
         float a = fabsf(re[k]);
         if (a > m) m = a;
         a = fabsf(im[k]);
@@ -1634,23 +1658,23 @@ static int probe_infer(
     } else {
         st->overflow = 1;
     }
-    memcpy(out_re, err_re, ULCNET_BINS * sizeof(float));
-    memcpy(out_im, err_im, ULCNET_BINS * sizeof(float));
+    memcpy(out_re, err_re, BINS * sizeof(float));
+    memcpy(out_im, err_im, BINS * sizeof(float));
     return 0;
 }
 
 static void probe_reset(void* user) { ((ProbeModel*)user)->resets += 1; }
 
 /* One probe run. fixed_delay == 0 is the boundary-free control;
- * fixed_delay == RP_T*ULCNET_HOP puts the FIXED raw->aligned switch on hop
+ * fixed_delay == RP_T*HOP puts the FIXED raw->aligned switch on hop
  * RP_T. mark_far selects which branch carries the impulse. */
 static int reprime_probe_run(int fixed_delay, int mark_far, ProbeModel* st) {
     McabTestUnitConfig cfg = ulcnet_example_unit_config();
     Ul4* p;
     UlcnetModel model;
-    float microphones[MCAB_CHANNELS * ULCNET_HOP];
-    float far[ULCNET_HOP];
-    float out[ULCNET_HOP];
+    float microphones[MCAB_CHANNELS * HOP_MAX];
+    float far[HOP_MAX];
+    float out[HOP_MAX];
 
     memset(st, 0, sizeof(*st));
     /* Frozen fixed beamformer (mu 0 and vad_external 1 both freeze BF
@@ -1675,8 +1699,8 @@ static int reprime_probe_run(int fixed_delay, int mark_far, ProbeModel* st) {
     }
 
     for (int frame = 0; frame < RP_RUN; ++frame) {
-        memset(microphones, 0, sizeof(microphones));
-        memset(far, 0, sizeof(far));
+        memset(microphones, 0, (size_t)MCAB_CHANNELS * HOP * sizeof(float));
+        memset(far, 0, (size_t)HOP * sizeof(float));
         if (frame == RP_MARK_HOP) {
             if (mark_far) {
                 far[RP_MARK_POS] = 1.0f;
@@ -1736,9 +1760,9 @@ static int test_reprime_straddle_derivation(void) {
 
     CHECK(reprime_probe_run(0, 0, &err_ctl), "run error-branch control probe");
     CHECK(reprime_probe_run(0, 1, &far_ctl), "run far-branch control probe");
-    CHECK(reprime_probe_run(RP_T * ULCNET_HOP, 0, &err_bnd),
+    CHECK(reprime_probe_run(RP_T * HOP, 0, &err_bnd),
           "run error-branch boundary probe");
-    CHECK(reprime_probe_run(RP_T * ULCNET_HOP, 1, &far_bnd),
+    CHECK(reprime_probe_run(RP_T * HOP, 1, &far_bnd),
           "run far-branch boundary probe");
 
     /* The control runs really are boundary-free and reprime-free. */
@@ -1936,9 +1960,9 @@ static int test_reprime_behavior(void) {
         Ul4* fp;
         CountingModel fm;
         UlcnetModel fmodel;
-        float mics[MCAB_CHANNELS * ULCNET_HOP];
-        float ffar[ULCNET_HOP];
-        float fout[ULCNET_HOP];
+        float mics[MCAB_CHANNELS * HOP_MAX];
+        float ffar[HOP_MAX];
+        float fout[HOP_MAX];
         int fixed_boundary = -1;
         int calls_at_boundary = -1;
         int calls_after_reprime = -1;
@@ -1946,7 +1970,7 @@ static int test_reprime_behavior(void) {
         int farmed = 0;
 
         fcfg.core.delay_mode = AEC_DELAY_FIXED;
-        fcfg.core.fixed_delay_samples = FIXED_HOPS * ULCNET_HOP;
+        fcfg.core.fixed_delay_samples = FIXED_HOPS * HOP;
         fp = ul4_create(&fcfg);
         CHECK(fp != NULL, "create FIXED reprime-behaviour pipeline");
         memset(&fm, 0, sizeof(fm));
@@ -1959,7 +1983,7 @@ static int test_reprime_behavior(void) {
         CHECK(ul4_set_model(fp, &fmodel) == 0,
               "install counting model (FIXED reprime behaviour)");
 
-        memset(mics, 0, sizeof(mics));
+        memset(mics, 0, (size_t)MCAB_CHANNELS * HOP * sizeof(float));
         for (int frame = 0; frame < 20; ++frame) {
             McabDelayState fdelay;
             const int frames = 1;   /* one frame per hop, from hop #0 */
@@ -1971,7 +1995,7 @@ static int test_reprime_behavior(void) {
             CHECK(ul4_last_delay(fp, &fdelay) == 0,
                   "FIXED reprime: delay accessor works before the hop");
             solid_before = fdelay.solid;
-            for (int i = 0; i < ULCNET_HOP; ++i) ffar[i] = 0.25f * frand();
+            for (int i = 0; i < HOP; ++i) ffar[i] = 0.25f * frand();
             CHECK(ul4_process_with_activity(
                       fp, mics, ffar, 0, fout) == MCAB_OK,
                   "FIXED reprime frame processes");
@@ -2017,12 +2041,12 @@ static int test_reprime_behavior(void) {
  * ========================================================================== */
 static int gate_infer_identity(
     void* user,
-    const float err_re[ULCNET_BINS], const float err_im[ULCNET_BINS],
-    const float far_re[ULCNET_BINS], const float far_im[ULCNET_BINS],
-    float out_re[ULCNET_BINS], float out_im[ULCNET_BINS]) {
+    const float* err_re, const float* err_im,
+    const float* far_re, const float* far_im,
+    float* out_re, float* out_im) {
     (void)user; (void)far_re; (void)far_im;
-    memcpy(out_re, err_re, sizeof(float) * ULCNET_BINS);
-    memcpy(out_im, err_im, sizeof(float) * ULCNET_BINS);
+    memcpy(out_re, err_re, sizeof(float) * BINS);
+    memcpy(out_im, err_im, sizeof(float) * BINS);
     return 0;
 }
 
@@ -2035,8 +2059,8 @@ static int test_raw_descriptor_gate(void) {
     UlcnetModel aligned_model;
     UlcnetModel undescribed_model;
 
-    CHECK(ulcnet_model_io_descriptor_default(8, &raw_desc) == 0 &&
-          ulcnet_model_io_descriptor_default(8, &aligned_desc) == 0,
+    CHECK(ulcnet_model_io_descriptor_default(&g_grid, &raw_desc) == 0 &&
+          ulcnet_model_io_descriptor_default(&g_grid, &aligned_desc) == 0,
           "build model-I/O descriptors");
     aligned_desc.far_input_mode = ULCNET_FAR_ALIGNED;
     CHECK(raw_desc.far_input_mode == ULCNET_FAR_RAW,
@@ -2085,12 +2109,12 @@ static int test_raw_descriptor_gate(void) {
 enum { PH_RUN, PH_FAIL, PH_NAN, PH_OPEN, PH_UNFETCHED };
 
 static int phased_half_infer(void* user,
-                             const float err_re[ULCNET_BINS], const float err_im[ULCNET_BINS],
-                             const float far_re[ULCNET_BINS], const float far_im[ULCNET_BINS],
-                             float out_re[ULCNET_BINS], float out_im[ULCNET_BINS]) {
+                             const float* err_re, const float* err_im,
+                             const float* far_re, const float* far_im,
+                             float* out_re, float* out_im) {
     int poison = user != NULL;
     (void)far_re; (void)far_im;
-    for (int k = 0; k < ULCNET_BINS; ++k) {
+    for (int k = 0; k < BINS; ++k) {
         out_re[k] = 0.5f * err_re[k];
         out_im[k] = 0.5f * err_im[k];
     }
@@ -2099,11 +2123,11 @@ static int phased_half_infer(void* user,
 }
 
 static int phased_fail_infer(void* user,
-                             const float err_re[ULCNET_BINS], const float err_im[ULCNET_BINS],
-                             const float far_re[ULCNET_BINS], const float far_im[ULCNET_BINS],
-                             float out_re[ULCNET_BINS], float out_im[ULCNET_BINS]) {
+                             const float* err_re, const float* err_im,
+                             const float* far_re, const float* far_im,
+                             float* out_re, float* out_im) {
     (void)user; (void)far_re; (void)far_im;
-    for (int k = 0; k < ULCNET_BINS; ++k) { out_re[k] = 2.0f * err_re[k]; out_im[k] = 2.0f * err_im[k]; }
+    for (int k = 0; k < BINS; ++k) { out_re[k] = 2.0f * err_re[k]; out_im[k] = 2.0f * err_im[k]; }
     return 1;   /* garbage written, failure reported: the pipeline must discard it */
 }
 
@@ -2181,38 +2205,42 @@ static int test_phased_hop(void) {
 }
 
 /* ============================================================================
- * 0. The example unit config is the stage's grid: the compiled ULCNet rate and FFT, linear
- *    context only (fuse is the post-beam stages' entry and is refused). A unit of the other
- *    grid builds, but the stage's bin count does not fit it, which is what the example's grid
- *    guard (unit_matches_stage) catches.
+ * 0. The example unit config is the stage's grid: its rate and FFT, linear context only
+ *    (fuse is the post-beam stages' entry and is refused). A unit of the other grid builds,
+ *    but the stage's bin count does not fit it, which is what the example's grid guard
+ *    (unit_matches_stage) catches.
  * ========================================================================== */
 
 static int test_example_unit_config_grid(void) {
     McabTestUnitConfig cfg = ulcnet_example_unit_config();
-    McabTestUnitConfig other = mcab_test_unit_default_config(ULCNET_OTHER_SR);
+    const UlcnetGrid og = other_grid();
+    McabTestUnitConfig other = mcab_test_unit_default_config(og.sample_rate);
     McabSampleBeam* unit;
     McabFrame frame;
 
-    CHECK(cfg.core.sample_rate == ULCNET_SR && cfg.core.fft_size == ULCNET_N_FFT &&
+    CHECK(og.n_fft != 0 && og.n_fft != g_grid.n_fft, "the grid table has a second row");
+    CHECK(cfg.core.sample_rate == g_grid.sample_rate && cfg.core.fft_size == g_grid.n_fft &&
           cfg.core.enable_post == 0,
-          "example unit config: compiled ULCNet grid, enable_post = 0");
+          "example unit config: the stage's grid, enable_post = 0");
     unit = mcab_test_beam_create(&cfg);
-    CHECK(unit != NULL && unit_matches_stage(unit),
-          "example unit: hop, bins and FFT size are the stage's");
-    CHECK(mcab_sample_rate(mcab_test_beam_flow(unit)) == ULCNET_SR,
-          "example unit: sample rate is the compiled one");
+    CHECK(unit != NULL && unit_matches_stage(unit, &g_grid),
+          "example unit: hop, bins, FFT size and rate are the stage's");
+    CHECK(mcab_sample_rate(mcab_test_beam_flow(unit)) == g_grid.sample_rate,
+          "example unit: sample rate is the stage's");
     CHECK(mcab_sample_beam_fuse(unit, &frame) == MCAB_INVALID_ARGUMENT,
           "example unit: fuse is refused without the post lanes (enable_post = 0)");
     mcab_test_beam_destroy(unit);
 
-    other.core.fft_size = ULCNET_OTHER_N_FFT;
+    other.core.fft_size = og.n_fft;
     other.core.enable_post = 0;
     unit = mcab_test_beam_create(&other);
     CHECK(unit != NULL, "a unit of the other grid builds");
-    CHECK(unit != NULL && !unit_matches_stage(unit),
+    CHECK(unit != NULL && !unit_matches_stage(unit, &g_grid),
           "the other grid's unit does not fit the stage");
     mcab_test_beam_destroy(unit);
-    CHECK(ul4_create(&other) == NULL, "the composition refuses the other grid");
+    CHECK(ul4_create(&other) == NULL, "the composition refuses a unit of the other grid");
+    CHECK(ul4_create_for(&cfg, &og) == NULL,
+          "the composition refuses a stage of the other grid");
     return 1;
 }
 
@@ -2230,7 +2258,7 @@ static Ul4* ul4_in_pools(void* unit_pool, size_t unit_bytes, const McabTestUnitC
     if (!p) return NULL;
     (void)req;
     p->unit = mcab_test_beam_init(unit_pool, unit_bytes, cfg);
-    p->stage = ulcnet_nn_stage_init(stage_pool, stage_bytes, 0);
+    p->stage = ulcnet_nn_stage_init(stage_pool, stage_bytes, &g_grid, 0);
     if (!p->unit || !p->stage) {
         free(p);
         return NULL;
@@ -2245,7 +2273,7 @@ static int test_create_vs_pool_parity(void) {
     UlcnetModel model;
     Ul4 *heap, *pooled;
     unsigned char *unit_pool = NULL, *stage_pool = NULL;
-    size_t stage_bytes = ulcnet_nn_stage_mem_size(0);
+    size_t stage_bytes = ulcnet_nn_stage_mem_size(&g_grid, 0);
     float *mics, *far, *far_hist, *oh, *op;
     size_t k;
     int hop;
@@ -2327,7 +2355,7 @@ static int stateful_infer(
     (void)far_im;
     m->infer_calls += 1;
     m->calls_since_reset += 1;
-    for (int k = 0; k < ULCNET_BINS; ++k) {
+    for (int k = 0; k < BINS; ++k) {
         out_re[k] = g * err_re[k];
         out_im[k] = g * err_im[k];
     }
@@ -2478,10 +2506,20 @@ static int run_all_tests(void) {
     CHECK(test_phased_hop(), "phased hop (begin / nn / end)");
     CHECK(test_recovery_equals_fresh_pair(),
           "recovery: the paired reset restarts the stream as a fresh pair");
-    printf("All 4ch_ulcnet tests passed\n");
     return 1;
 }
 
 int main(void) {
-    return run_all_tests() ? 0 : 1;
+    for (size_t g = 0; g < sizeof(k_grids) / sizeof(k_grids[0]); ++g) {
+        if (ulcnet_grid_make(&g_grid, &k_grids[g]) != ULCNET_GRID_OK ||
+            g_grid.hop > HOP_MAX || g_grid.n_bins > BINS_MAX) {
+            fprintf(stderr, "FAIL: grid row %zu does not build or exceeds the test buffers\n", g);
+            return 1;
+        }
+        printf("4ch_alignulcnet tests on grid %d Hz / fft %d / hop %d\n", g_grid.sample_rate,
+               g_grid.n_fft, g_grid.hop);
+        if (!run_all_tests()) return 1;
+    }
+    printf("All 4ch_ulcnet tests passed\n");
+    return 0;
 }

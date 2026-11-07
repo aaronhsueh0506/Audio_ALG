@@ -26,7 +26,7 @@ import numbers
 LOOKAHEAD_CONTRACT_NOTE = (
     'mask_lookahead and df_lookahead are part of the model contract (they fix '
     'the feature-window alignment and the end-to-end latency): another value '
-    'needs a fresh training run and a C host built with the same pair, not an '
+    'needs a fresh training run and a C host given the same pair, not an '
     'edit of config.ini.'
 )
 

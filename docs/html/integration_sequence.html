@@ -155,6 +155,16 @@ th{background:#eef5f0}
  │── board_run_npu(job.*) ───────────────────────────────────────────────►│ out 已預填 NaN,必須寫滿
  │── ulcnet_nn_stage_nn_end(stage,rc) ►│ rc≠0 或輸出非有限 ⇒ identity(fail-open)
  │── ulcnet_nn_stage_end(stage,out) ►│ ac_istft_push_planar → out[hop]</pre>
+<p>不經 stage、直接用 <code>&lt;pfx&gt;_prepost</code> 類別時（板端 sample 的寫法），framing 由應用端用 audiolib 做，類別只收發頻譜；遞迴 state 由應用端登錄（float host）或留在加速器（板端）。各類別的引數差異見 <a href="onnx_prepost.html">onnx_prepost</a>。</p>
+<pre>應用            AcStft/AcIstft(audiolib)   prepost 類別(頻域)         加速器
+ │── ac_stft_push_planar(stft,hop_in,re,im) ►│
+ │── pre_process_freq(p,re,im…) ───────────────────────►│ 1 = 這一 hop 要推論(DFN2 N=1 與 DFN3 每 hop 都是 1,前 M 幀是暖機幀)
+ │── frame_open(p,&amp;in,&amp;out) ───────────────────────────►│ view:特徵視窗 + 登錄的 state(板端 NULL);heads 預填 NaN
+ │── 推論(in,out) ─────────────────────────────────────────────────────►│ 每個 state 輸出寫回同名輸入的位址
+ │── frame_finish(p) ──────────────────────────────────►│ 0 = 提交(暖機幀:丟棄 heads、state 歸零、generation+1);−1 = 登錄 state 歸零、generation+1、幀維持開啟 → frame_bypass(p)
+ │── post_process_freq(p,out_re,out_im…) ──────────────►│ 增強後頻譜(DFN2/DFN3:valid = 0 時為零頻譜,可每 hop 照 push)
+ │── ac_istft_push_planar(istft,out_re,out_im,hop_out) ►│ hop_out[hop]
+ │ state_generation 與上次不同(reset、DFN2/DFN3 的暖機幀、被拒的 frame_finish)⇒ 板端以量化後的零重填加速器的 state 輸入</pre>
 
 <h2>相關檔案與測試路徑</h2>
 <table>
@@ -163,7 +173,7 @@ th{background:#eef5f0}
 <tr><td><code>pipelines/4ch_aec_bf_nr_res/mcab_static.c</code>、<code>mcab_raw.c</code>、<code>mcab_external_static.c</code></td><td>4ch flow＋helper(static／raw)與 mcab＋外部權重的參考寫法</td></tr>
 <tr><td><code>lib/aec/c_impl/include/aec.h</code>、<code>aec_res.h</code>；<code>pipelines/4ch_aec_bf_nr_res/mcab.h</code>、<code>mcab_sample_post.h</code></td><td>mono:<code>AecResContext</code>、<code>aec_get_res_context()</code>;4ch:<code>McabFrame</code>、<code>mcab_sample_res_input()</code>、<code>aec_res_process()</code>、<code>mcab_sample_anr_gain()</code></td></tr>
 <tr><td><code>pipelines/tests/test_readme_flow.c</code>、<code>mono_aec_nr_res/tests/test_mono_chain.c</code>、<code>4ch_aec_bf_nr_res/tests/test_mcab_sample_beam.c</code>、<code>tests/test_mcab.c</code></td><td>呼叫流程、reset 等於新建、sequence 守衛的測試</td></tr>
-<tr><td>其他頁</td><td><a href="integration_example.html">integration_example</a>、<a href="pipeline_mono.html">pipeline_mono</a>、<a href="pipeline_4ch.html">pipeline_4ch</a>、<a href="pipeline_mono_params.html">pipeline_mono_params</a>、<a href="pipeline_4ch_params.html">pipeline_4ch_params</a>、<a href="index.html">index</a></td></tr>
+<tr><td>其他頁</td><td><a href="integration_example.html">integration_example</a>、<a href="pipeline_mono.html">pipeline_mono</a>、<a href="pipeline_4ch.html">pipeline_4ch</a>、<a href="pipeline_mono_params.html">pipeline_mono_params</a>、<a href="pipeline_4ch_params.html">pipeline_4ch_params</a>、<a href="onnx_prepost.html">onnx_prepost</a>、<a href="index.html">index</a></td></tr>
 </table>
 </body>
 </html>

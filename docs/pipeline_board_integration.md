@@ -8,7 +8,7 @@ flow module, the board build, and the on-target verification checklist.
 
 What is delivered, and how it is initialised:
 
-- Only the multi-channel linear AEC flow is a module with a descriptor: `Mcab`
+- Among the flow modules only the multi-channel linear AEC flow has a descriptor: `Mcab`
   (`../pipelines/4ch_aec_bf_nr_res/mcab.h`: the shared-delay admission state machine, the
   reference ring, the aligned far and the `mcab_fuse()` projection). It is a flow layer, not a
   library that owns lib objects. The application creates the four `Aec` lanes
@@ -32,6 +32,11 @@ What is delivered, and how it is initialised:
   `libaudio_pipeline_mcab.a`), and `mcab_sample_flow.{h,c}` shows the application-side init of lanes,
   estimator and `Mcab` in one pool. A product with its own beamformer calls `mcab_process_front()`
   and `mcab_fuse()` directly.
+- The neural stages sit on the AINR / AIAEC model libraries (the pipelines build compiles the DFN2 sources into
+  `libaudio_pipeline_dfn.a`, and the Align-ULCNet sources into its example objects): frequency domain only, the grid a
+  run-time spec the application passes, the pool sized by `*_get_mem_size()`, the recurrent state owned by the
+  application (registered by a float host, kept by the accelerator on a board). See
+  [Running the model on the NPU](pipeline_board_integration_01_sequence.md#running-the-model-on-the-npu-nn-applications).
 - Each example `main` initialises the libraries it uses and writes the per-hop chaining itself
   (res gain, `anr_process_gain()`, `sk_min_f32()`, `sk_capply_gain_f32()`, `aec_cng_fill()`,
   `ac_istft_push()`). The shared example code is `../pipelines/4ch_aec_bf_nr_res/mcab_sample_post.h`,

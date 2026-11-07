@@ -43,6 +43,20 @@ expect() {      # expect <exit code> <program> <args...>
     fi
 }
 
+expect_msg() {  # expect_msg <exit code> <stderr text> <program> <args...>
+    local want=$1 text=$2 prog=$3 got err
+    shift 3
+    err=$("$prog" "$@" 2>&1 >/dev/null)
+    got=$?
+    total=$((total + 1))
+    if [ "$got" -ne "$want" ] || [[ "$err" != *"$text"* ]]; then
+        printf 'FAIL: %s' "$(basename "$prog")"
+        printf " '%s'" "$@"
+        printf ' -> exit %s, expected %s with "%s"\n' "$got" "$want" "$text"
+        failures=$((failures + 1))
+    fi
+}
+
 for v in "${BAD_INT[@]}"; do
     for opt in --sample-rate --fft-size; do
         expect 2 "$STATIC" "$opt" "$v"
@@ -98,6 +112,17 @@ done
 expect 2 "$RAW" --vad-u8 --print-mem-size --mic-raw a --ref-raw b --output-raw /dev/null --sample-rate 16000
 expect 2 "$RAW" --mic-raw --print-mem-size --ref-raw b --output-raw /dev/null --sample-rate 16000
 expect 2 "$DFN4" --erb-fwd --cng --erb-inv x
+# One ERB matrix file alone is a command-line error; a file that cannot be opened, or holds fewer or
+# more float32 values than the default model grid needs (513 bins x 32 bands), fails the run (exit 1).
+expect 2 "$DFN4" --erb-fwd x
+expect 2 "$DFN4" --erb-inv x
+ERB_TMP=$(mktemp -d)
+trap 'rm -rf "$ERB_TMP"' EXIT
+head -c 65660 /dev/zero > "$ERB_TMP/fewer.bin"
+head -c 65668 /dev/zero > "$ERB_TMP/more.bin"
+expect_msg 1 "cannot open" "$DFN4" --erb-fwd "$ERB_TMP/absent_fwd.bin" --erb-inv "$ERB_TMP/absent_inv.bin"
+expect_msg 1 "holds fewer than" "$DFN4" --erb-fwd "$ERB_TMP/fewer.bin" --erb-inv "$ERB_TMP/fewer.bin"
+expect_msg 1 "holds more than" "$DFN4" --erb-fwd "$ERB_TMP/more.bin" --erb-inv "$ERB_TMP/more.bin"
 
 expect 2 "$STATIC" --bogus
 expect 2 "$STATIC" 16000

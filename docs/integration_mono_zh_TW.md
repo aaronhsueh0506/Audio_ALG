@@ -120,7 +120,8 @@ pipelines 不提供 mono 的函式庫、object 或 header：mono 的整合只連
 
 mono 沒有 descriptor，也沒有 layout version：`Aec`、`AnrDenoiser`、`AecRes`、`AcIstft` 只提供大小查詢，
 各範例程式是範例碼。需要 descriptor 閘的出貨物件只有 4ch 的 flow 層 `Mcab`
-（`McabMemReq`，`MCAB_LAYOUT_VERSION`，只涵蓋 mcab 自己的 pool）與 DFN2 的 stage／bridge，
+（`McabMemReq`，`MCAB_LAYOUT_VERSION`，只涵蓋 mcab 自己的 pool）與 DFN2 的 stage／bridge
+（DFN2 stage 背後的 DFN2 pre/post class、Align-ULCNet／DeepVQE-S 的 pre/post class 也各自帶 `MemReq` 與 `init_ex` 閘），
 見 [`integration_4ch_core_zh_TW.md`](integration_4ch_core_zh_TW.md) 與
 [`pipeline_board_integration.md`](pipeline_board_integration.md)。
 

@@ -1,12 +1,18 @@
 # RNNoise-ERB test wiring.
 #
-#   make test-tables    build + run BOTH layers and fail on any FAIL:
-#                         1. canonical (default mode): byte-exact memcmp of
-#                            rnnoise_tables_gen.h against an independent
-#                            recompute.
-#                         2. portable (-DRNN_TABLES_PORTABLE): mathematical-
-#                            contract checks plus ULP bounds (256 ULP
-#                            recompute-vs-table, 4096 ULP Hann mirror pair).
+#   make test           the C checks below plus the feature contract
+#   make test-tables    ERB matrix files against an independent recompute (library-free)
+#   make test-features  feature reference; registered state, non-finite input, attenuation limit
+#                       and pool descriptor contracts
+#   make test-framing   the framing contract of process.h on several grids
+#   make test-simd      the pre/post chain digest of the SIMD and scalar builds must be equal
+#
+# ERB_FWD and ERB_INV are the two headerless float32 files the C tests read (forward
+# [n_bins][n_erb], inverse [n_erb][n_bins]). The defaults are written by tests/erb_fixture.py
+# (standard-library Python, no torch or numpy), so `make test` needs only a C compiler and
+# python3; ERB_FWD=FILE ERB_INV=FILE reads other files instead.
+# test-erb-python (part of test-python, training environment) pins the fixture to train.py
+# and to export_erb_matrix.py.
 #
 # Build policy:
 #   - CFLAGS/FP_POLICY cannot be overridden from the command line or by
@@ -102,7 +108,7 @@ CFG_SIG := $(shell printf '%s' "$(CFG_SIG_PAYLOAD)" | cksum | cut -d' ' -f1)
 BUILD_DIR = build/$(CFG_SIG)
 PY_TEST_DIR = tests
 
-.PHONY: test test-tables test-features test-simd test-feature-contract test-feature-python test-loss-python test-framing clean _cfg_guard FORCE
+.PHONY: test test-tables test-features test-simd test-feature-contract test-feature-python test-loss-python test-erb-python test-framing clean _cfg_guard FORCE
 _cfg_guard:
 	@test -n "$(CC_TARGET_SIG)" && test "$(CC_TARGET_SIG)" != unavailable || { \
 	  echo "FATAL: cannot determine compiler target; CC preprocessing with the configured flags must succeed." >&2; \
@@ -121,72 +127,79 @@ _cfg_guard:
 	  tmp="$$m.tmp.$$$$"; printf '%s\n' "$(CFG_SIG_PAYLOAD)" > "$$tmp"; mv -f "$$tmp" "$$m"; \
 	fi
 
-test-tables: $(BUILD_DIR)/test_rnnoise_tables $(BUILD_DIR)/test_rnnoise_tables_portable
-	@echo "== rnnoise tables drift-guard: layer 1 (canonical, byte-exact) =="
-	"$(abspath $(BUILD_DIR))/test_rnnoise_tables"
-	@echo "== rnnoise tables drift-guard: layer 2 (portable, math contracts) =="
-	"$(abspath $(BUILD_DIR))/test_rnnoise_tables_portable"
+PYTHON ?= python3
+ERB_FWD ?= $(BUILD_DIR)/erb_fwd.bin
+ERB_INV ?= $(BUILD_DIR)/erb_inv.bin
 
-test: test-tables test-feature-contract test-features test-simd test-framing
+test: test-tables test-feature-contract test-features test-framing test-simd
+
+test-tables: $(BUILD_DIR)/test_rnnoise_tables $(ERB_FWD) $(ERB_INV)
+	@echo "== rnnoise ERB matrix drift guard =="
+	"$(abspath $(BUILD_DIR))/test_rnnoise_tables" "$(abspath $(ERB_FWD))" "$(abspath $(ERB_INV))"
 
 test-feature-contract:
 	@echo "== rnnoise config/Python/C feature contract =="
-	$(PYTHON) $(PY_TEST_DIR)/test_feature_contract.py
+	COMMON_DIR="$(abspath $(COMMON_DIR))" RNNOISE_TEST_SIMD=$(SIMD) $(PYTHON) -B $(PY_TEST_DIR)/test_feature_contract.py
 
-test-features: $(BUILD_DIR)/test_rnnoise_features
+test-features: $(BUILD_DIR)/test_rnnoise_features $(ERB_FWD) $(ERB_INV)
 	@echo "== rnnoise feature-state contract =="
-	"$(abspath $(BUILD_DIR))/test_rnnoise_features"
+	"$(abspath $(BUILD_DIR))/test_rnnoise_features" "$(abspath $(ERB_FWD))" "$(abspath $(ERB_INV))"
 
 test-framing: $(BUILD_DIR)/test_rnnoise_framing
 	"$(abspath $(BUILD_DIR))/test_rnnoise_framing"
 
-test-simd: $(BUILD_DIR)/test_rnnoise_simd_auto $(BUILD_DIR)/test_rnnoise_simd_scalar
-	@auto="$$( "$(abspath $(BUILD_DIR))/test_rnnoise_simd_auto" )"; \
-	 scalar="$$( "$(abspath $(BUILD_DIR))/test_rnnoise_simd_scalar" )"; \
-	 test "$$auto" = "$$scalar" || { \
-	   echo "FAIL: RNNoise SIMD/scalar digest mismatch: $$auto != $$scalar" >&2; \
+test-simd: $(BUILD_DIR)/test_rnnoise_simd_auto $(BUILD_DIR)/test_rnnoise_simd_scalar $(ERB_FWD) $(ERB_INV)
+	@auto="$$( "$(abspath $(BUILD_DIR))/test_rnnoise_simd_auto" "$(abspath $(ERB_FWD))" "$(abspath $(ERB_INV))" )" || exit 1; \
+	 scalar="$$( "$(abspath $(BUILD_DIR))/test_rnnoise_simd_scalar" "$(abspath $(ERB_FWD))" "$(abspath $(ERB_INV))" )" || exit 1; \
+	 test -n "$$auto" && test "$$auto" = "$$scalar" || { \
+	   echo "FAIL: RNNoise SIMD/scalar digest mismatch: '$$auto' != '$$scalar'" >&2; \
 	   exit 1; \
 	 }; \
 	 echo "PASS: RNNoise SIMD/scalar local DSP (shared FFT fixed) digest $$auto"
 
-# Requires the training Python environment (torch + numpy); kept out of
-# `make test` so the C checks run on hosts without PyTorch.
+# test-python needs the training Python environment (torch + numpy); `make test` does not.
 #
 # PYTHON is overridable so the project's virtualenv can be used:
 #   make test-python PYTHON=../../.venv/bin/python3
-PYTHON ?= python3
-
-test-python: test-feature-python test-loss-python test-calibration
+test-python: test-feature-python test-loss-python test-calibration test-erb-python
 
 test-feature-python:
-	$(PYTHON) $(PY_TEST_DIR)/test_feature_norm.py
-	COMMON_DIR="$(abspath $(COMMON_DIR))" RNNOISE_TEST_SIMD=$(SIMD) $(PYTHON) $(PY_TEST_DIR)/test_python_c_features.py
+	$(PYTHON) -B $(PY_TEST_DIR)/test_feature_norm.py
+	COMMON_DIR="$(abspath $(COMMON_DIR))" RNNOISE_TEST_SIMD=$(SIMD) $(PYTHON) -B $(PY_TEST_DIR)/test_python_c_features.py
+
+test-erb-python:
+	$(PYTHON) -B $(PY_TEST_DIR)/test_erb_fixture.py
 
 test-loss-python:
-	$(PYTHON) $(PY_TEST_DIR)/test_loss.py
+	$(PYTHON) -B $(PY_TEST_DIR)/test_loss.py
 
 # The ramp fit is shared with DeepFilterNet2 (dataset_gen/calibration.py), so
 # its test lives at AINR/tests/ rather than under this project.
 test-calibration:
 	@echo "== normaliser-init calibration method (shared) =="
-	$(PYTHON) ../tests/test_norm_init_calibration.py
+	$(PYTHON) -B ../tests/test_norm_init_calibration.py
 
-$(BUILD_DIR)/test_rnnoise_tables: test/test_rnnoise_tables.c rnnoise_tables_gen.h process.h | _cfg_guard
-	$(CC) $(CFLAGS) $(COMMON_INCLUDES) -o $@ test/test_rnnoise_tables.c -lm
+$(BUILD_DIR)/erb_fwd.bin: $(PY_TEST_DIR)/erb_fixture.py config.ini | _cfg_guard
+	$(PYTHON) -B $(PY_TEST_DIR)/erb_fixture.py --config config.ini --fwd $@
 
-$(BUILD_DIR)/test_rnnoise_tables_portable: test/test_rnnoise_tables.c rnnoise_tables_gen.h process.h | _cfg_guard
-	$(CC) $(CFLAGS) $(COMMON_INCLUDES) -DRNN_TABLES_PORTABLE -o $@ test/test_rnnoise_tables.c -lm
+$(BUILD_DIR)/erb_inv.bin: $(PY_TEST_DIR)/erb_fixture.py config.ini | _cfg_guard
+	$(PYTHON) -B $(PY_TEST_DIR)/erb_fixture.py --config config.ini --inv $@
 
-$(BUILD_DIR)/test_rnnoise_features: test/test_rnnoise_features.c process.c process.h rnnoise_tables_gen.h test/rnnoise_test_framing.h $(COMMON_LIB) | _cfg_guard
+$(BUILD_DIR)/test_rnnoise_tables: test/test_rnnoise_tables.c test/rnnoise_test_erb.h | _cfg_guard
+	$(CC) $(CFLAGS) -o $@ test/test_rnnoise_tables.c -lm
+
+RN_TEST_DEPS = process.c process.h test/rnnoise_test_support.h test/rnnoise_test_erb.h $(COMMON_LIB)
+
+$(BUILD_DIR)/test_rnnoise_features: test/test_rnnoise_features.c $(RN_TEST_DEPS) | _cfg_guard
 	$(CC) $(CFLAGS) $(COMMON_INCLUDES) -o $@ test/test_rnnoise_features.c process.c $(COMMON_LIB) -lm
 
-$(BUILD_DIR)/test_rnnoise_simd_auto: test/test_rnnoise_simd.c process.c process.h rnnoise_tables_gen.h test/rnnoise_test_framing.h $(COMMON_LIB) | _cfg_guard
+$(BUILD_DIR)/test_rnnoise_simd_auto: test/test_rnnoise_simd.c $(RN_TEST_DEPS) | _cfg_guard
 	$(CC) $(CFLAGS) $(COMMON_INCLUDES) -o $@ test/test_rnnoise_simd.c process.c $(COMMON_LIB) -lm
 
-$(BUILD_DIR)/test_rnnoise_simd_scalar: test/test_rnnoise_simd.c process.c process.h rnnoise_tables_gen.h test/rnnoise_test_framing.h $(COMMON_LIB) | _cfg_guard
+$(BUILD_DIR)/test_rnnoise_simd_scalar: test/test_rnnoise_simd.c $(RN_TEST_DEPS) | _cfg_guard
 	$(CC) $(CFLAGS) $(COMMON_INCLUDES) -DSIMD_KERNELS_FORCE_SCALAR -o $@ test/test_rnnoise_simd.c process.c $(COMMON_LIB) -lm
 
-$(BUILD_DIR)/test_rnnoise_framing: test/test_rnnoise_framing.c process.c process.h rnnoise_tables_gen.h test/rnnoise_test_framing.h $(COMMON_LIB) | _cfg_guard
+$(BUILD_DIR)/test_rnnoise_framing: test/test_rnnoise_framing.c $(RN_TEST_DEPS) | _cfg_guard
 	$(CC) $(CFLAGS) $(COMMON_INCLUDES) -o $@ test/test_rnnoise_framing.c process.c $(COMMON_LIB) -lm
 
 $(COMMON_LIB): FORCE

@@ -7,18 +7,24 @@ executable links the stage object, the Align-ULCNet C pre/post-processing object
 AEC/audiolib/common libraries. The AEC and the stage are initialised separately
 (`aec_get_mem_size()`, `ulcnet_nn_stage_mem_size()`); the example prints both pool sizes.
 
-`main.c` shows the board boundary. CPU memory owns the K/V windows, logit
-window and GRU hidden state through `ulcnet_accelerator_adapter`; only the
-stateless tensor invocation in `run_accelerator()` remains a board TODO. The
-runtime binds each `*_out` to the address of the state input of the same name
-(the graph shifts the windows itself, so nothing is copied) and reads every state
-input before it writes any state output.
+`main.c` shows the board boundary. The K/V windows, logit window and GRU hidden state belong
+to the application; on a board they live in the accelerator's own buffers, so the example
+registers none (`ulcnet_accelerator_adapter_init(..., NULL, ...)`) and only the stateless
+tensor invocation in `run_accelerator()` remains a board TODO. The runtime binds each `*_out`
+to the buffer of the state input of the same name (the graph shifts the windows itself, so
+nothing is copied) and reads every state input before it writes any state output. A fixed-point
+accelerator loads quantized zeros at start and whenever `ulcnet_accelerator_adapter_state_generation()`
+changes (a reset, or a frame whose output was refused).
 Returning an error is intentionally fail-open and emits the linear error.
 
 The exported graph fixes `D`. The example constructs a `D=8` descriptor;
 production board code loads the descriptor exported with its graph. Changing
-D means exporting another graph/descriptor and rebuilding its state pool, but
-does not require retraining the weights.
+D means exporting another graph and descriptor, but does not require retraining
+the weights.
+
+The grid is a run-time `UlcnetGrid`: `--sample-rate 16000` (fft 512, default) or `48000`
+(fft 1024) builds the one that sizes the lane, the stage and the adapter. A model descriptor of
+another grid is refused by `ulcnet_nn_stage_set_model()`.
 
 The production far branch is fixed: it always consumes the caller's raw
 reference, matching training and the paper. PBFDKF uses its aligned copy only
@@ -69,14 +75,14 @@ application policy (this program: none beyond that flag, and it never resets the
 
 A frame left open or never fetched is the identity (fail-open); the reprime
 frame after an alignment boundary has no model frame (`nn_begin` returns 0). The stage is built
-with `ulcnet_nn_stage_mem_size(1)` here because the time-domain error entry needs its own STFT.
+with `ulcnet_nn_stage_mem_size(&grid, 1)` here because the time-domain error entry needs its own STFT.
 
 ## Calling sequence and parameters
 
 ```
 App                 Aec           UlcnetNnStage + adapter          accelerator (board)
- |-- aec_resolve_signal_grid; aec_config_from_level; aec_get_mem_size / aec_init -->|
- |-- ulcnet_nn_stage_mem_size(1) / ulcnet_nn_stage_init; ulcnet_accelerator_adapter_* (K/V, logit, GRU state)
+ |-- ulcnet_grid_make(--sample-rate); aec_config_from_level; aec_get_mem_size / aec_init -->|
+ |-- ulcnet_nn_stage_mem_size(&grid, 1) / ulcnet_nn_stage_init; ulcnet_accelerator_adapter_* (state: the accelerator's)
  |   per hop: aec_process_context --> aec_get_res_context / aec_get_linear_context --> delay {changed, solid}
  |            --> ulcnet_nn_stage_begin_time(formed_hop, ref, delay)
  |            --> ulcnet_nn_stage_nn_begin == 1 --> run_accelerator(job) --> ulcnet_nn_stage_nn_end(rc)
@@ -86,7 +92,7 @@ App                 Aec           UlcnetNnStage + adapter          accelerator (
 ```
 
 External parameters: the delay profile below (`--delay-mode`, `--delay-num-filters` 1..5, `--fixed-delay`), the
-grid of the build (`ULCNET_GRID=16k|48k`) and `D` of the exported graph (the example builds a `D=8`
+grid (`--sample-rate 16000|48000`) and `D` of the exported graph (the example builds a `D=8`
 descriptor; production loads the descriptor exported with its graph). There is no strength setter on
 purpose: the strength is a property of the model. Internal: `ULCNET_NN_STAGE_REPRIME_FRAMES` (a constant
 asserted by the test, not a knob), the AEC lane constants, the model's pre/post constants.
@@ -99,15 +105,17 @@ and the pool it costs are printed at start-up. `n` is an init parameter, not
 a runtime setter — changing it means re-querying the pool and re-initializing.
 
 ```sh
-./mono_alignulcnet                              # matched, n=5 (default)
+./mono_alignulcnet                              # 16 kHz, matched, n=5 (default)
+./mono_alignulcnet --sample-rate 48000          # the 48 kHz / fft 1024 grid
 ./mono_alignulcnet --delay-num-filters 3        # smaller bank, smaller pool
 ./mono_alignulcnet --delay-mode fixed --fixed-delay 1600
 ./mono_alignulcnet --delay-mode external        # caller pre-aligns the far
 ```
 
 Numbers are parsed by `common/example_cli.h` (`example_cli_parse_int`): `--delay-num-filters 3x`,
-`--fixed-delay 12x`, an empty string, a leading space or a value outside `int` exit with 2; plain
-decimals and a leading `+` are accepted.
+`--fixed-delay 12x`, `--sample-rate 16000x`, an empty string, a leading space or a value outside
+`int` exit with 2, as does a `--sample-rate` that is not 16000 or 48000; plain decimals and a
+leading `+` are accepted.
 
 Choose `n` from the SKU's measured bulk far-to-mic delay distribution. The
 reliable search ceiling per bank is ~125 / 221 / 317 / 413 / 509 ms for
@@ -125,9 +133,8 @@ directory forwards to it). From this directory:
 ```sh
 make SIMD=0 test
 make SIMD=1 test
-make ULCNET_GRID=48k test   # the other compiled grid (16k is the default)
 ```
 
-`test` runs `test_mono_ulcnet` and `test_ulcnet_accelerator_adapter`, the skeleton at n=5 and n=1,
-and the malformed-number checks above. The stage on its own (`ulcnet/tests/test_ulcnet_nn_stage.c`)
+`test` runs `test_mono_ulcnet` (both grids from one binary) and `test_ulcnet_accelerator_adapter`,
+the skeleton at n=5 and n=1 on both grids, and the malformed-number checks above. The stage on its own (`ulcnet/tests/test_ulcnet_nn_stage.c`)
 runs in `make -C pipelines test`.

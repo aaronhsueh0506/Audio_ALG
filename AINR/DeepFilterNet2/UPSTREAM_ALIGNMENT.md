@@ -1,6 +1,6 @@
 # DeepFilterNet2 cascade/alpha — upstream alignment
 
-This folder composes its output as full-band ERB mask → low-band deep filter on
+This folder builds its output as full-band ERB mask → low-band deep filter on
 the masked spectrum → learned sigmoid-alpha residual blend. `MODEL_VERSION` v6
 identifies cascade/alpha checkpoints and rejects band-split ones. The rest of
 the network (encoder/decoder widths, frequency-major flattening, pathway-add
@@ -66,7 +66,8 @@ in float32 the worst case (unbounded exact-zero input) settles at 6.31e-44, so
 `x/sqrt(mu)` is always `0/positive`, never `0/0`. The argument assumes IEEE
 round-to-nearest with subnormals enabled: under AMP/bf16/fp16, or on a C/DSP/NEON
 target with FTZ or denormals-are-zero, `mu` can reach exactly 0. Guard that in the
-C port, not by diverging the trainer.
+C port (`DFN2_SPEC_NORM_EPS`, added under the
+square root of the C feature path), not by diverging the trainer.
 
 ## Do-not-touch list
 
@@ -90,9 +91,12 @@ Each item is a deliberate, verified divergence.
    `spec_norm_init = 0.001/0.0001`.** A recalibrated pair (`-15/-60`,
    `0.06/0.012`) is not used; it is tied to `normalized=True`, the triangular sum
    bank and the corpus level regime, so do not port it to another rate, bank or
-   corpus.
+   corpus. In C the four starting points are `DFN2GridSpec` fields
+   (`erb_norm_init_lo_db`, `erb_norm_init_hi_db`, `spec_norm_init_lo`,
+   `spec_norm_init_hi`) that the application passes, not macros.
 5. **`erb_norm_tau_sec` / `spec_norm_tau_sec = 1.0`:** keep τ in seconds and
-   re-derive α for the grid; do not hardcode upstream's α.
+   re-derive α for the grid; do not hardcode upstream's α. In C the spec carries τ
+   (`erb_norm_tau_sec`, `spec_norm_tau_sec`) and `dfn2_norm_alpha()` derives α.
 6. **The triangular, overlapping, energy-SUM forward ERB bank** (`mode=0`).
 7. **`erb_inv` needs no row normalisation.** All 513 row sums are exactly 1.0
    (partition of unity), so `gain=1 → bin_gain=1`; upstream's inverse is a plain

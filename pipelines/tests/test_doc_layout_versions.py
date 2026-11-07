@@ -138,13 +138,15 @@ def test_the_scan_actually_reaches_the_pages_that_publish_versions():
         'pipeline_4ch 兩頁應該有，比對式可能失效了' % hits)
 
 
-# Carve versions live with the pre/post classes they version.  A pool carved
+# Carve versions live with the headers whose pool they version.  A pool carved
 # by another walk is refused on the build-flags hash, so a doc that quotes a
 # stale carve version sends integrators looking for a mismatch that is not
 # there.
 _CARVE_SOURCES = {
     'DFN2_PREPOST_CARVE_VERSION': 'AINR/DeepFilterNet2/dfn2_prepost.h',
     'DFN3_PREPOST_CARVE_VERSION': 'AINR/DeepFilterNet3/dfn3_prepost.h',
+    'GTCRN_PROCESS_CARVE_VERSION': 'AINR/GTCRN/gtcrn_process.h',
+    'RNNOISE_CARVE_VERSION': 'AINR/RNNoise-ERB/process.h',
     'ULCNET_PREPOST_CARVE_VERSION': 'AIAEC/Align_ULCNet/ulcnet_prepost.h',
     'DEEPVQE_PREPOST_CARVE_VERSION': 'AIAEC/DeepVQE_S/deepvqe_prepost.h',
 }

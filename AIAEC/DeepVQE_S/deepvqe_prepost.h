@@ -1,33 +1,16 @@
-/* DeepVQE-S pre/post-processing class: one object owning everything between the
- * caller's audio and the accelerator's tensors.
+/* DeepVQE-S pre/post class: everything between the caller's spectra and the accelerator's
+ * tensors, frequency domain only; one frame in, one inference, one frame out.
  *
- *     deepvqe_prepost_pre_process(p, mic_hop, far_hop);
- *     deepvqe_prepost_frame_inputs(p, &in, &out);   // views into the pool
+ *     deepvqe_prepost_pre_process_freq(p, mic_re, mic_im, far_re, far_im);
+ *     deepvqe_prepost_frame_open(p, &in, &out);   // views into the pool
  *     my_npu_run(&in, &out);                        // NPU fills `out`
- *     deepvqe_prepost_frame_commit(p);              // or _frame_skip()
- *     deepvqe_prepost_post_process(p, out_hop, &written);
- *
- * One hop in, one inference, one hop out, in both I/O modes. Analysis is a
- * rolling window (AcStft, center 0), one frame per hop. The primary input is the
- * raw microphone with no canceller in front, so frame_skip() fails closed
- * (silence, not pass-through; deepvqe_prepost_skip_policy_name()). Grid: 16 kHz /
- * 512 / 256 only. The FftHandle, window and synthesis AcIstft are caller-owned
- * (DEEPVQE_IO_TIME).
- *
- * Inverse FFT and overlap-add are audiolib's AcIstft, never this class's. Two ways
- * to chain it:
- *
- *     // DEEPVQE_IO_TIME: hand the class the caller's AcIstft; commit pushes into it.
- *     AcStftConfig sc;  deepvqe_framing_config(&sc, fft, window);
- *     AcIstft *istft = ac_istft_init(mem, ac_istft_get_mem_size(&sc), &sc);
- *     cfg.istft = istft;                       // ... deepvqe_prepost_init(...)
- *     deepvqe_prepost_post_process(p, out_hop, &written);   // hop out
- *
- *     // DEEPVQE_IO_FREQ: spectrum out, the caller pushes its own AcIstft.
+ *     deepvqe_prepost_frame_finish(p);              // after every run; or _frame_bypass()
  *     deepvqe_prepost_post_process_freq(p, re, im);
- *     ac_istft_push_planar(istft, re, im, out_hop);
  *
- * The class resets a borrowed AcIstft together with its own state. */
+ * Framing: one AcStft per stream and one AcIstft for the output, all from
+ * ac_stft_config_default(&sc, n_fft) (sqrt-Hann, center 0, hop n_fft / 2, spec_scale =
+ * ispec_scale = 1) with sc.ola = AC_OLA_ENV_NORM (analysis ignores ola); one frame per hop from
+ * the first hop, no latency beyond it. The class holds no window and no FFT handle. */
 
 #ifndef DEEPVQE_PREPOST_H
 #define DEEPVQE_PREPOST_H
@@ -35,7 +18,7 @@
 #include <stddef.h>
 #include <stdint.h>
 
-#include "deepvqe_process.h"   /* DeepVqeCcmState, DEEPVQE_TIME_ORDER, DEEPVQE_FREQ_TAPS, aiaec_process.h */
+#include "deepvqe_process.h"   /* DeepVqeCcmState, DEEPVQE_TIME_ORDER, DEEPVQE_FREQ_TAPS */
 
 #ifdef __cplusplus
 extern "C" {
@@ -43,45 +26,60 @@ extern "C" {
 
 #define DEEPVQE_PREPOST_DESCRIPTOR_VERSION 1u
 
-/* Accelerator boundary version (two planar signal inputs, the CCM-tap head, the
- * sixteen rank-4 state tensors of _streaming_export.py, each returned in full).
- * Any rename, reshape, reorder or added/removed tensor bumps it. */
+/* Accelerator boundary version (two signal inputs, the CCM-tap head, sixteen rank-4 state tensors,
+ * each returned in full); any rename, reshape, reorder or change of the tensor count bumps it. */
 #define DEEPVQE_PREPOST_LAYOUT_VERSION 4u
 
 /* Input compression exponent (model.compression_exponent); the exporter refuses others. */
 #define DEEPVQE_COMPRESSION_EXP 0.3f
 #define DEEPVQE_PREPOST_ALIGNMENT      16u
 /* Folded into build_flags_hash; bumped on any change of pool size, carve order or descriptor. */
-#define DEEPVQE_PREPOST_CARVE_VERSION  6u
+#define DEEPVQE_PREPOST_CARVE_VERSION  8u
 
-/* Alignment search depth D (exporter max_delay_frames); sizes the attention rings. 32 = 0.5 s. */
-#define DEEPVQE_PREPOST_MIN_D      1
-#define DEEPVQE_PREPOST_MAX_D      256
-#define DEEPVQE_PREPOST_DEFAULT_D  32
+/* Sanity bounds for the delay depth D (exporter max_delay_frames). D has no default: the
+ * application supplies the value its model is exported with; it sizes nothing here. */
+#define DEEPVQE_PREPOST_MIN_D  1
+#define DEEPVQE_PREPOST_MAX_D  256
 
-/* ---- DeepVQE-S topology constants (mirror DeepVQE_S/model.py) ----
- * Fixed by the checkpoint; the state shapes are built from them. */
-#define DEEPVQE_HALF_(n)        (((n) + 1) / 2)
-#define DEEPVQE_F0              AIAEC_N_BINS              /* 257 */
-#define DEEPVQE_F1              DEEPVQE_HALF_(DEEPVQE_F0) /* 129 */
-#define DEEPVQE_F2              DEEPVQE_HALF_(DEEPVQE_F1) /*  65 */
-#define DEEPVQE_F3              DEEPVQE_HALF_(DEEPVQE_F2) /*  33 */
-#define DEEPVQE_F4              DEEPVQE_HALF_(DEEPVQE_F3) /*  17 */
+typedef struct DeepVqeGridSpec {
+    int sample_rate;
+    int n_fft;
+    int delay_depth;   /* D, as exported */
+} DeepVqeGridSpec;
 
-/* Causal conv window 4; the score conv (5,3) kernel gives window 5. Oldest frame first. */
-#define DEEPVQE_CONV_WINDOW     4
-#define DEEPVQE_SCORE_WINDOW    5
-#define DEEPVQE_SIM_CHANNELS    4     /* FrameDelayAttention similarity */
-#define DEEPVQE_VALUE_CHANNELS  24    /* FrameDelayAttention value */
-#define DEEPVQE_GRU_LAYERS      1
-#define DEEPVQE_GRU_HIDDEN      192
+typedef struct DeepVqeGrid {
+    int sample_rate;
+    int n_fft;
+    int hop;
+    int n_bins;
+    int delay_depth;
+} DeepVqeGrid;
 
-/* Head output: CCM taps [1,1,BINS,TIME_ORDER*FREQ_TAPS*2], last axis [time][frequency][RI]. */
-#define DEEPVQE_TAPS_ELEMENTS \
-    ((size_t)AIAEC_N_BINS * DEEPVQE_TIME_ORDER * DEEPVQE_FREQ_TAPS * 2u)
+enum {
+    DEEPVQE_GRID_OK = 0,
+    DEEPVQE_GRID_ERR_NULL = -1,
+    DEEPVQE_GRID_ERR_SAMPLE_RATE = -2,
+    DEEPVQE_GRID_ERR_N_FFT = -3,
+    DEEPVQE_GRID_ERR_DELAY_DEPTH = -4,
+    DEEPVQE_GRID_ERR_INCONSISTENT = -5
+};
 
-/* ---- Explicit state boundary ----
- * Graph input order after the two signal inputs (outputs: after the head). */
+/* Build the run-time grid from a spec filled with what the model is exported for (hop = n_fft / 2,
+ * n_bins = n_fft / 2 + 1). Returns DEEPVQE_GRID_OK (grid written), or the first failing check
+ * (grid untouched): sample_rate > 0; n_fft a size audiolib's framing builds (ac_stft_get_mem_size()
+ * of the default config is not 0); delay_depth within [DEEPVQE_PREPOST_MIN_D, MAX_D]. */
+int deepvqe_grid_make(DeepVqeGrid *grid, const DeepVqeGridSpec *spec);
+
+/* _make's checks plus consistent hop and n_bins. Returns DEEPVQE_GRID_OK or the failing check. */
+int deepvqe_grid_validate(const DeepVqeGrid *grid);
+
+/* CCM taps [1,1,BINS,TIME_ORDER*FREQ_TAPS*2], last axis [time][frequency][RI]. */
+static inline size_t deepvqe_prepost_taps_elements(const DeepVqeGrid *grid)
+{
+    return (size_t)grid->n_bins * DEEPVQE_TIME_ORDER * DEEPVQE_FREQ_TAPS * 2u;
+}
+
+/* Graph input order after the two signal inputs (outputs: after the head). */
 typedef enum DeepVqeStateId {
     DEEPVQE_STATE_ALIGN_KEY_RING = 0,
     DEEPVQE_STATE_ALIGN_VALUE_RING,
@@ -102,28 +100,21 @@ typedef enum DeepVqeStateId {
     DEEPVQE_STATE_COUNT
 } DeepVqeStateId;
 
-/* Rank of every state tensor (NCHW). */
-#define DEEPVQE_STATE_MAX_RANK 4
-
-/* Which side of the transform the caller works on; fixed at init because it
- * decides the pool size (DEEPVQE_IO_TIME also carves the analysis states). */
-typedef enum DeepVqeIoMode {
-    /* Spectrum in, spectrum out; fft/window may be NULL. */
-    DEEPVQE_IO_FREQ = 0,
-    /* Hop in, hop out; the class frames the analysis via the caller's FftHandle and
-     * synthesises through the caller's AcIstft. */
-    DEEPVQE_IO_TIME = 1
-} DeepVqeIoMode;
-
 typedef struct DeepVqePrepostConfig {
-    int          io_mode;      /* a DeepVqeIoMode                           */
-    int          delay_depth;  /* D; DEEPVQE_PREPOST_MIN/MAX_D              */
-    FftHandle   *fft;          /* DEEPVQE_IO_TIME: required, borrowed       */
-    const float *window;       /* DEEPVQE_IO_TIME: required, borrowed; AIAEC_N_FFT entries from ac_window_build() */
-    AcIstft     *istft;        /* DEEPVQE_IO_TIME: required, borrowed, built from deepvqe_framing_config() over the same window; ignored in DEEPVQE_IO_FREQ */
+    DeepVqeGrid grid;    /* deepvqe_grid_make(); copied at init */
+    /* The application's recurrent state by DeepVqeStateId: borrowed, must outlive the instance;
+     * shapes are the application's, only element counts are given. A float host registers its
+     * sixteen buffers (zeroed at init and reset, finite-checked whole at every frame_finish); a
+     * board whose accelerator owns the state registers nothing and binds each state input and
+     * its `_out` to one accelerator buffer. All or none: every pointer non-NULL with a nonzero
+     * count, or all NULL/0, else refused. Not in the pool size or hash. */
+    float *state[DEEPVQE_STATE_COUNT];
+    size_t state_elements[DEEPVQE_STATE_COUNT];
 } DeepVqePrepostConfig;
 
-/* The compiled model ABI, for validating a graph's ONNX/JSON metadata. */
+/* The model ABI for validating a graph's ONNX/JSON metadata. The library owns layout_version,
+ * delay_depth (range-checked only), the grid, time_order, freq_taps and state_tensor_count; the
+ * conv/score window and GRU fields are the model's: zero from _descriptor_default(), never used. */
 typedef struct DeepVqePrepostDescriptor {
     uint32_t layout_version;
     int delay_depth;
@@ -140,14 +131,14 @@ typedef struct DeepVqePrepostDescriptor {
     int state_tensor_count;
 } DeepVqePrepostDescriptor;
 
-/* Fixed 32-byte descriptor; a pool sized for another io_mode, D or build is refused by _init_ex. */
+/* Fixed 32-byte descriptor; a pool sized for another grid, D or build is refused by _init_ex. */
 typedef struct DeepVqePrepostMemReq {
     uint32_t descriptor_version;  /* DEEPVQE_PREPOST_DESCRIPTOR_VERSION     */
     uint32_t layout_version;      /* DEEPVQE_PREPOST_LAYOUT_VERSION         */
-    uint32_t io_mode;             /* the resolved DeepVqeIoMode             */
-    uint32_t build_flags_hash;    /* FNV-1a-32 over grid + io_mode + D      */
+    uint32_t reserved0;           /* 0 */
+    uint32_t build_flags_hash;    /* FNV-1a-32 over sample rate, n_fft, D and versions */
     uint32_t alignment;
-    uint32_t reserved;            /* 0 */
+    uint32_t reserved1;           /* 0 */
     uint64_t bytes;
 } DeepVqePrepostMemReq;
 
@@ -160,9 +151,9 @@ _Static_assert(sizeof(DeepVqePrepostMemReq) == 32,
 
 typedef struct DeepVqePrepost DeepVqePrepost;
 
-/* Read-only accelerator views. `mic`/`far` are the compressed spectra, planar
- * [1,2,1,BINS] (real plane, then imaginary). `state[]` is indexed by
- * DeepVqeStateId. Pointers are into the pool and valid for the instance's life. */
+/* Read-only accelerator views: `mic`/`far` are the compressed planar spectra (real plane, then
+ * imaginary; BINS = grid.n_bins); `state[]` is the registered buffers by DeepVqeStateId, NULL
+ * with 0 elements when none. The pointers are constant for the instance's life. */
 typedef struct DeepVqePrepostInputs {
     const float *mic;                            /* [1,2,1,BINS] */
     const float *far;                            /* [1,2,1,BINS] */
@@ -171,10 +162,10 @@ typedef struct DeepVqePrepostInputs {
     size_t       state_elements[DEEPVQE_STATE_COUNT];
 } DeepVqePrepostInputs;
 
-/* Accelerator-writable outputs; the graph returns the full next value of every
- * state tensor. `state_out[id]` has the same address as `inputs.state[id]`, so
- * the output of frame t is the input of frame t+1; read all state inputs before
- * writing any state output. Only `taps` is NaN-prefilled. */
+/* Accelerator-writable outputs; the graph returns the full next value of every state tensor.
+ * `state_out[id]` has the address of `inputs.state[id]` (both NULL when nothing is registered;
+ * a board binds each pair to one accelerator buffer): read every state input before writing any
+ * state output. Only `taps` is NaN-prefilled. */
 typedef struct DeepVqePrepostOutputs {
     float *taps;   /* [1,1,BINS,TIME_ORDER*FREQ_TAPS*2], packed CCM taps */
     size_t taps_elements;
@@ -182,59 +173,35 @@ typedef struct DeepVqePrepostOutputs {
     size_t state_elements[DEEPVQE_STATE_COUNT];
 } DeepVqePrepostOutputs;
 
-/* ---- boundary naming ------------------------------------------------- */
-
 /* Exact graph tensor names; static literals, NULL for an unknown id. */
 const char *deepvqe_prepost_state_name(int state_id);      /* graph input  */
 const char *deepvqe_prepost_state_name_out(int state_id);  /* graph output */
 
-/* Graph name of the head output. */
-#define DEEPVQE_PREPOST_OUTPUT_NAME "output"
+#define DEEPVQE_PREPOST_OUTPUT_NAME "output"   /* graph name of the head output */
 
-/* Row-major shape of one state tensor into `dims`; returns the rank (4), or -1 on
- * NULL, unknown id or D out of range. */
-int deepvqe_prepost_state_shape(int state_id, int delay_depth,
-                                int dims[DEEPVQE_STATE_MAX_RANK]);
+const char *deepvqe_prepost_skip_policy_name(void);   /* "mute_fail_closed" (frame_bypass()) */
 
-/* Element count of one state tensor, or 0 on a bad id / D. */
-size_t deepvqe_prepost_state_elements(int state_id, int delay_depth);
+/* Fill a config for `grid` (copied), nothing registered. Returns 0, or -1 on NULL/invalid grid. */
+int deepvqe_prepost_config_defaults(DeepVqePrepostConfig *cfg, const DeepVqeGrid *grid);
 
-/* "mute_fail_closed": the policy frame_skip() implements. */
-const char *deepvqe_prepost_skip_policy_name(void);
-
-/* ---- lifecycle ------------------------------------------------------- */
-
-/* Fill a config with this build's defaults. Returns 0, or -1 on NULL or
- * out-of-range io_mode/delay_depth. */
-int deepvqe_prepost_config_defaults(DeepVqePrepostConfig *cfg,
-                                    int io_mode, int delay_depth);
-
-/* Fill the compiled deployment ABI for `delay_depth`. Returns 0, or -1. */
-int deepvqe_prepost_descriptor_default(int delay_depth,
+/* Fill the external fields of the model ABI for `grid`; the interior ones are 0. Returns 0, or
+ * -1 on NULL or an invalid grid. */
+int deepvqe_prepost_descriptor_default(const DeepVqeGrid *grid,
                                        DeepVqePrepostDescriptor *descriptor);
 
-/* Validate a descriptor loaded from ONNX/JSON metadata: every field except
- * delay_depth (range-checked only) must equal this build's. Returns 0 on match. */
+/* Every external field except delay_depth (range-checked only) must equal the contract for `grid`.
+ * Returns 0 on match, -1 otherwise (NULL and an invalid grid included). */
 int deepvqe_prepost_descriptor_validate(
-    const DeepVqePrepostDescriptor *descriptor);
+    const DeepVqeGrid *grid, const DeepVqePrepostDescriptor *descriptor);
 
-/* Config of the model's framing objects, for ac_stft/ac_istft get_mem_size and init:
- * 512-point sqrt-Hann, hop 256, rolling analysis (center 0), envelope-normalised
- * synthesis, no spectrum scaling. `fft` is an AIAEC_N_FFT handle and `window` an
- * AIAEC_N_FFT sqrt-Hann table (ac_window_build), each borrowed, or NULL for the
- * object to carve its own. The synthesis object built from it is what
- * DeepVqePrepostConfig.istft takes. */
-void deepvqe_framing_config(AcStftConfig *cfg, FftHandle *fft,
-                            const float *window);
-
-/* Exact pool size. Returns -1 (req untouched) on NULL, unknown io_mode, D out of
- * range, or DEEPVQE_IO_TIME without fft/window/istft (the AcIstft must match
- * deepvqe_framing_config()). */
+/* Exact pool size: a function of n_bins, not of D. The caller supplies the pool and _init
+ * carves it. Returns -1 (req untouched) on NULL, an invalid grid, or an inconsistent state
+ * registration. */
 int deepvqe_prepost_get_mem_size(const DeepVqePrepostConfig *cfg,
                                  DeepVqePrepostMemReq *req);
 
-/* Construct inside caller memory. NULL on a bad config, misaligned or undersized
- * pool, or wrong-size FftHandle. Starts reset. */
+/* Construct inside caller memory; starts reset (the registered state, if any, is zeroed).
+ * NULL on a bad config, misaligned or undersized pool. */
 DeepVqePrepost *deepvqe_prepost_init(void *pool, size_t bytes,
                                      const DeepVqePrepostConfig *cfg);
 
@@ -246,68 +213,50 @@ DeepVqePrepost *deepvqe_prepost_init_ex(void *pool, size_t bytes,
 /* get_mem_size + aligned allocation + init (host path). */
 DeepVqePrepost *deepvqe_prepost_create(const DeepVqePrepostConfig *cfg);
 
-/* Frees only what _create allocated; NULL-safe, a no-op on an _init instance. */
+/* Frees only what _create allocated, never the registered state. NULL-safe; no-op for _init. */
 void deepvqe_prepost_destroy(DeepVqePrepost *p);
 
-/* Zero every state tensor and the CCM ring, drop any open frame, reset framing
- * (a borrowed AcIstft included). */
+/* Zero the registered state and the CCM ring, drop any open frame; config, every pointer and the
+ * pool stay. Advances the state generation. NULL is ignored. */
 void deepvqe_prepost_reset(DeepVqePrepost *p);
 
-/* Counter of state restarts (reset, or frame_commit refusing a frame); 0 for NULL.
- * A fixed-point accelerator refills its state with quantized zeros when it changes. */
+/* Counter of state restarts (reset, or frame_finish refusing a frame); 0 after init and for NULL;
+ * kept whether or not a state is registered. A fixed-point accelerator loads quantized zeros
+ * into its own copy of the state at start and on every change. */
 uint32_t deepvqe_prepost_state_generation(const DeepVqePrepost *p);
 
 int deepvqe_prepost_hop_size(const DeepVqePrepost *p);   /* or -1 */
 int deepvqe_prepost_num_bins(const DeepVqePrepost *p);   /* or -1 */
-int deepvqe_prepost_io_mode(const DeepVqePrepost *p);    /* or -1 */
 const DeepVqePrepostDescriptor *deepvqe_prepost_descriptor(
     const DeepVqePrepost *p);
 
-/* ---- per-hop stages -------------------------------------------------- */
-
-/* DEEPVQE_IO_TIME. One hop of the raw microphone and one of the far-end
- * reference, both for the same input hop (no internal skew). Returns 1, or -1 on
- * NULL args, in DEEPVQE_IO_FREQ, or while the previous frame is still open. */
-int deepvqe_prepost_pre_process(DeepVqePrepost *p,
-                                const float mic_hop[AIAEC_HOP],
-                                const float far_hop[AIAEC_HOP]);
-
-/* DEEPVQE_IO_FREQ. One analysed frame per stream: unnormalised rfft of a
- * sqrt-Hann-windowed AIAEC_N_FFT block (center=False). Returns 1; -1 on NULL
- * args, in DEEPVQE_IO_TIME, or while the previous frame is open. */
+/* One analysed frame per stream (n_bins bins each). Returns 1; -1 on NULL args or an open frame. */
 int deepvqe_prepost_pre_process_freq(DeepVqePrepost *p,
-                                     const float mic_re[AIAEC_N_BINS],
-                                     const float mic_im[AIAEC_N_BINS],
-                                     const float far_re[AIAEC_N_BINS],
-                                     const float far_im[AIAEC_N_BINS]);
+                                     const float *mic_re, const float *mic_im,
+                                     const float *far_re, const float *far_im);
 
-/* Publish the current frame's accelerator boundary; `taps` is NaN-prefilled so a
- * partial write is caught by frame_commit. Returns 0, or -1 if no frame is open. */
-int deepvqe_prepost_frame_inputs(DeepVqePrepost *p,
+/* Publish the current frame's accelerator boundary; `taps` is NaN-prefilled so a partial write
+ * is caught by frame_finish. Returns 0, or -1 if no frame is open. */
+int deepvqe_prepost_frame_open(DeepVqePrepost *p,
                                  DeepVqePrepostInputs *inputs,
                                  DeepVqePrepostOutputs *outputs);
 
-/* Validate the outputs and advance the CCM ring. Every tap and h_gru must be
- * finite (of each window only the newest frame is checked); the taps are then
- * applied to the raw microphone ring and fed to the synthesis (DEEPVQE_IO_TIME)
- * or staged for post_process_freq. Requires a frame published by frame_inputs().
- * On a non-finite value all state tensors are zeroed, the state generation
- * advances, the frame stays open and -1 is returned; call frame_skip() or re-run. */
-int deepvqe_prepost_frame_commit(DeepVqePrepost *p);
+/* Call after every accelerator run; needs a frame published by frame_open(), else -1. Every tap
+ * and every element of every registered state buffer (whole buffers, older frames of a history
+ * window included) must be finite. Then the taps are applied to the CCM ring (the last
+ * TIME_ORDER raw microphone spectra, advanced only here) and the enhanced spectrum is staged
+ * for post_process_freq. On a non-finite value the registered buffers are zeroed (nothing
+ * registered: only the taps are checked), the state generation advances, the ring is not pushed,
+ * the frame stays open and -1 is returned: call frame_bypass() or re-run. */
+int deepvqe_prepost_frame_finish(DeepVqePrepost *p);
 
-/* Fail closed: emit silence for the current frame, leave the CCM ring and state
- * as they are, advance only the framing schedule. Returns 0, or -1. */
-int deepvqe_prepost_frame_skip(DeepVqePrepost *p);
+/* Fail closed: the primary input is the raw microphone with no canceller in front, so emit
+ * silence (not pass-through) for the current frame; the CCM ring and state stay as they are.
+ * Returns 0, or -1. */
+int deepvqe_prepost_frame_bypass(DeepVqePrepost *p);
 
-/* DEEPVQE_IO_TIME. Emit this hop's output: AIAEC_HOP samples, zero-filled during
- * warm-up; `*written` (may be NULL) reports how many are meaningful. Returns 0, or -1. */
-int deepvqe_prepost_post_process(DeepVqePrepost *p,
-                                 float out_hop[AIAEC_HOP], int *written);
-
-/* DEEPVQE_IO_FREQ. The enhanced spectrum of the frame just committed or skipped. Returns 0, or -1. */
-int deepvqe_prepost_post_process_freq(DeepVqePrepost *p,
-                                      float re[AIAEC_N_BINS],
-                                      float im[AIAEC_N_BINS]);
+/* The enhanced spectrum (n_bins bins) of the frame just finished or bypassed. Returns 0, or -1. */
+int deepvqe_prepost_post_process_freq(DeepVqePrepost *p, float *re, float *im);
 
 #ifdef __cplusplus
 }

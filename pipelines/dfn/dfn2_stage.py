@@ -7,7 +7,7 @@ staging pair split in two:
 * the ESTIMATION spectrum ``A`` feeds ``dfn2_compute_features`` (the ERB and
   complex-feature EMA normalisers, the three-frame graph window
   ``[t-(2-M) .. t+M]``);
-* the APPLICATION spectrum ``B`` feeds ``dfn2_compose_stream`` (the noisy ring,
+* the APPLICATION spectrum ``B`` feeds ``dfn2_enhance_spectrum_stream`` (the noisy ring,
   the ERB mask, the deep-filter FIR, the alpha blend, the attenuation limit).
 
 The two touch disjoint state, exactly as the C separates them.  Both spectra
@@ -29,12 +29,13 @@ history follow ``dfn2_grid.h``: ``max(DF_ORDER, M + D + 1)`` slots and
 ``DF_ORDER - D - 1`` past taps.
 
 Fail-open: a heads callable that raises, or returns a non-finite value in any
-head or next-state tensor, takes the compose path of ``dfn2_prepost_frame_skip``:
+head or next-state tensor, takes the compose path of ``dfn2_prepost_frame_bypass``:
 unit ERB mask, zero taps, alpha 0 (an exact identity through the cascade,
 because ``erb_inv`` is a partition of unity), framing and compose clocks
 advanced.  The recurrent state is NOT stepped here.  In the C class a refused
-commit zeroes the state in place, which this reference, with its separate state
-input and output, does not reproduce.
+commit advances the state generation and zeroes a registered state in place
+(the stage registers none: the model callback owns it); this reference, with
+its separate state input and output, does not reproduce that.
 
 The compose arithmetic keeps real and imaginary parts as separate float32
 arrays and performs every multiply and add as its own numpy operation, so the
@@ -204,7 +205,7 @@ HeadsResult = Tuple[np.ndarray, np.ndarray, float]
 
 
 class IdentityHeads:
-    """``frame_skip``'s heads: unit mask, zero taps, alpha 0.  No state."""
+    """``frame_bypass``'s heads: unit mask, zero taps, alpha 0.  No state."""
 
     def __call__(self, erb_window: np.ndarray, spec_window: np.ndarray) -> HeadsResult:
         return (np.ones(N_ERB, np.float32),
@@ -222,7 +223,7 @@ class Dfn2Heads:
     ``df_convp_history``.  A call commits the next state only when every head and every next-state
     tensor is finite; otherwise it raises and leaves the state untouched, so
     the stage's fail-open path sees the same compose-path refusal as
-    ``frame_commit``.
+    ``frame_finish``.
     """
 
     def __init__(self, model: torch.nn.Module):
@@ -269,7 +270,7 @@ class Dfn2Stage:
                  atten_lim_db: float = 0.0):
         if not erb_inv_is_partition_of_unity(assets.erb_inv):
             raise ValueError('erb_inv is not a partition of unity; the identity '
-                             'frame_skip would not be exact')
+                             'frame_bypass would not be exact')
         self.assets = assets
         self.mask_lookahead = int(assets.mask_lookahead)
         self.df_lookahead = int(assets.df_lookahead)
@@ -335,7 +336,7 @@ class Dfn2Stage:
     def _compose(self, b_re: np.ndarray, b_im: np.ndarray, heads_valid: bool,
                  mask: Optional[np.ndarray], coefs: Optional[np.ndarray],
                  alpha: float) -> Tuple[bool, Optional[np.ndarray], Optional[np.ndarray], int]:
-        """``dfn2_compose_stream`` on planar float32 arrays."""
+        """``dfn2_enhance_spectrum_stream`` on planar float32 arrays."""
         current = self.stream_frame_index
         ring = self.df_ring
         if current < self.mask_lookahead:
@@ -426,7 +427,7 @@ class Dfn2Stage:
                         or not np.all(np.isfinite(coefs))):
                     raise FloatingPointError('malformed heads')
             except Exception:
-                # frame_skip: exact identity for this frame, state untouched.
+                # frame_bypass: exact identity for this frame, state untouched.
                 self.skips += 1
                 mask, coefs, alpha = IdentityHeads()(self.erb_window, self.spec_window)
         emitted, out_re, out_im, target = self._compose(

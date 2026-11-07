@@ -11,8 +11,12 @@
 #   4. Exact-token conflict check: a bare -Ofast / -ffast-math / -ffp-contract=<x>
 #      is rejected, a value that merely contains "-Ofast" is accepted, and the
 #      check variables cannot be overridden from the command line or by `-e`.
+#   5. ERB_FWD / ERB_INV wiring: the default matrix files are written under every BUILD_DIR
+#      by standard-library Python alone, the SIMD comparison fails on an unreadable matrix
+#      file instead of comparing two empty digests, and a missing file is a make error.
 # Every case runs in a scratch copy of the component (without build/); the
-# checkout is never modified.
+# checkout is never modified. ERB_FWD and ERB_INV are unset so the Makefile's default rules
+# (tests/erb_fixture.py) write the two matrix files each case reads.
 #
 # Usage: ./test/run_makefile_build_safety_test.sh
 # Exit 0 with "run_makefile_build_safety_test: ALL PASS" means every case passed.
@@ -32,6 +36,7 @@ FEATURE_VERSION="$(sed -n 's/^#define RNNOISE_FEATURE_VERSION[[:space:]]*"\([^"]
     exit 1
 }
 FEATURES_PASS_RE="^PASS: $FEATURE_VERSION matches independent reference"
+TABLES_PASS_RE="^PASS: ERB matrix files match the independent recompute"
 
 # Explicit template: a bare `mktemp -d` ignores $TMPDIR on some hosts.
 SCRATCH="$(mktemp -d "${TMPDIR:-/tmp}/rnnoise-erb-makefile-safety.XXXXXX")" || {
@@ -56,6 +61,7 @@ if ! rsync -a --exclude='/build' "$REPO_ROOT/" "$WORKDIR/"; then
     echo "FATAL: rsync of $REPO_ROOT into scratch workdir $WORKDIR failed -- aborting before any test runs (real checkout untouched)" >&2
     exit 1
 fi
+unset ERB_FWD ERB_INV
 cd "$WORKDIR" || { echo "FATAL: cd into scratch workdir $WORKDIR failed -- aborting" >&2; exit 1; }
 RELATIVE_BUILD_DIR=".rnnoise_erb_test_relative_build_scratch"
 
@@ -127,10 +133,10 @@ fi
 # Case 2, real run: build AND run (not a dry run) with an absolute BUILD_DIR.
 LOG5="$SCRATCH/log_real_absdir"
 if "$MAKE_BIN" BUILD_DIR="$ABS_BUILD_DIR" test-tables >"$LOG5" 2>&1; then
-    if grep -q "PASS: rnnoise_tables_gen.h byte-identical" "$LOG5" && grep -q "PASS (portable)" "$LOG5"; then
-        pass "2b: make BUILD_DIR=$ABS_BUILD_DIR test-tables (real execution) succeeds and both layers report PASS"
+    if grep -qE "$TABLES_PASS_RE" "$LOG5"; then
+        pass "2b: make BUILD_DIR=$ABS_BUILD_DIR test-tables (real execution) succeeds and reports PASS"
     else
-        fail "2b: make BUILD_DIR=$ABS_BUILD_DIR test-tables (real execution) exited 0 but did not report both expected PASS lines"
+        fail "2b: make BUILD_DIR=$ABS_BUILD_DIR test-tables (real execution) exited 0 but did not report the expected PASS line"
         cat "$LOG5" >&2
     fi
 else
@@ -138,12 +144,19 @@ else
     cat "$LOG5" >&2
 fi
 
+# The default matrix file is written under the absolute BUILD_DIR.
+if [ -s "$ABS_BUILD_DIR/erb_fwd.bin" ] && [ -s "$ABS_BUILD_DIR/erb_inv.bin" ]; then
+    pass "2c2: the default matrix files exist under the absolute BUILD_DIR"
+else
+    fail "2c2: the default matrix files are missing under the absolute BUILD_DIR ($ABS_BUILD_DIR/erb_fwd.bin, erb_inv.bin)"
+fi
+
 # The binary lives at the absolute path, and no cwd-relative mirror directory
 # was created.
-if [ -x "$ABS_BUILD_DIR/test_rnnoise_tables" ] && [ -x "$ABS_BUILD_DIR/test_rnnoise_tables_portable" ]; then
-    pass "2c: both built binaries actually exist, executable, at the absolute BUILD_DIR path"
+if [ -x "$ABS_BUILD_DIR/test_rnnoise_tables" ]; then
+    pass "2c: the built binary actually exists, executable, at the absolute BUILD_DIR path"
 else
-    fail "2c: built binaries are missing at the absolute BUILD_DIR path ($ABS_BUILD_DIR)"
+    fail "2c: the built binary is missing at the absolute BUILD_DIR path ($ABS_BUILD_DIR)"
 fi
 BOGUS_RELATIVE_DIR="./${ABS_BUILD_DIR#/}"
 if [ -e "$BOGUS_RELATIVE_DIR" ]; then
@@ -169,12 +182,17 @@ fi
 rm -rf "$RELATIVE_BUILD_DIR"
 LOG7="$SCRATCH/log_real_relativedir"
 if "$MAKE_BIN" BUILD_DIR="$RELATIVE_BUILD_DIR" test-tables >"$LOG7" 2>&1; then
-    grep -q "PASS: rnnoise_tables_gen.h byte-identical" "$LOG7" && grep -q "PASS (portable)" "$LOG7" \
+    grep -qE "$TABLES_PASS_RE" "$LOG7" \
         && pass "2f: make BUILD_DIR=$RELATIVE_BUILD_DIR (relative) test-tables still succeeds after the abspath rewrite" \
-        || { fail "2f: make BUILD_DIR=$RELATIVE_BUILD_DIR (relative) test-tables exited 0 but did not report both expected PASS lines"; cat "$LOG7" >&2; }
+        || { fail "2f: make BUILD_DIR=$RELATIVE_BUILD_DIR (relative) test-tables exited 0 but did not report the expected PASS line"; cat "$LOG7" >&2; }
 else
     fail "2f: make BUILD_DIR=$RELATIVE_BUILD_DIR (relative) test-tables unexpectedly FAILED"
     cat "$LOG7" >&2
+fi
+if [ -s "$RELATIVE_BUILD_DIR/erb_fwd.bin" ] && [ -s "$RELATIVE_BUILD_DIR/erb_inv.bin" ]; then
+    pass "2f2: the default matrix files exist under the relative BUILD_DIR"
+else
+    fail "2f2: the default matrix files are missing under the relative BUILD_DIR ($RELATIVE_BUILD_DIR/erb_fwd.bin, erb_inv.bin)"
 fi
 
 # Plain, unmodified invocation (no BUILD_DIR override at all) must work -- uses
@@ -183,9 +201,9 @@ fi
 # checkout's own build/ directory.
 LOG8="$SCRATCH/log_plain_test_tables"
 if "$MAKE_BIN" test-tables >"$LOG8" 2>&1; then
-    grep -q "PASS: rnnoise_tables_gen.h byte-identical" "$LOG8" && grep -q "PASS (portable)" "$LOG8" \
+    grep -qE "$TABLES_PASS_RE" "$LOG8" \
         && pass "2g: plain 'make test-tables' (no BUILD_DIR override) still succeeds" \
-        || { fail "2g: plain 'make test-tables' exited 0 but did not report both expected PASS lines"; cat "$LOG8" >&2; }
+        || { fail "2g: plain 'make test-tables' exited 0 but did not report the expected PASS line"; cat "$LOG8" >&2; }
 else
     fail "2g: plain 'make test-tables' unexpectedly FAILED"
     cat "$LOG8" >&2
@@ -342,6 +360,68 @@ check_real_conflict_rejected "fp-contract"    "-ffp-contract=fast"
 # conflict check while a real -Ofast still reaches the compiler.
 check_override_rejected "FP_CONFLICT_FLAGS" "" "-Ofast" cmdline
 check_override_rejected "FP_CONFLICT_FLAGS" "" "-Ofast" dashe
+
+echo "=== Section 5: ERB_FWD / ERB_INV wiring ==="
+
+# The SIMD comparison runs both builds on the matrix file: it reports the digest, and it fails
+# (rather than comparing two empty digests) when the file cannot be read.
+LOG12="$SCRATCH/log_simd"
+if "$MAKE_BIN" test-simd >"$LOG12" 2>&1; then
+    grep -qE "^PASS: RNNoise SIMD/scalar local DSP \(shared FFT fixed\) digest [0-9a-f]{16}$" "$LOG12" \
+        && pass "5a: make test-simd succeeds and reports the common digest" \
+        || { fail "5a: make test-simd exited 0 but did not report the digest line"; cat "$LOG12" >&2; }
+else
+    fail "5a: make test-simd unexpectedly FAILED"
+    cat "$LOG12" >&2
+fi
+
+EMPTY_ERB="$SCRATCH/empty_erb_inv.bin"
+: > "$EMPTY_ERB"
+LOG13="$SCRATCH/log_simd_empty_matrix"
+if ERB_INV="$EMPTY_ERB" "$MAKE_BIN" test-simd >"$LOG13" 2>&1; then
+    fail "5b: make test-simd with an empty ERB_INV file unexpectedly SUCCEEDED (two empty digests compared equal)"
+    cat "$LOG13" >&2
+else
+    grep -q "^PASS" "$LOG13" \
+        && { fail "5b: make test-simd with an empty ERB_INV file failed but still printed PASS"; cat "$LOG13" >&2; } \
+        || pass "5b: make test-simd with an empty ERB_INV file FAILS without a PASS line"
+fi
+
+LOG14="$SCRATCH/log_missing_matrix"
+if ERB_FWD="$SCRATCH/no_such_erb_fwd.bin" "$MAKE_BIN" test-tables >"$LOG14" 2>&1; then
+    fail "5c: make test-tables with a missing ERB_FWD file unexpectedly SUCCEEDED"
+    cat "$LOG14" >&2
+else
+    pass "5c: make test-tables with a missing ERB_FWD file FAILS"
+fi
+
+LOG15="$SCRATCH/log_framing"
+if "$MAKE_BIN" test-framing >"$LOG15" 2>&1; then
+    grep -q "^PASS: framing contract" "$LOG15" \
+        && pass "5d: make test-framing succeeds and reports PASS" \
+        || { fail "5d: make test-framing exited 0 but did not report PASS"; cat "$LOG15" >&2; }
+else
+    fail "5d: make test-framing unexpectedly FAILED"
+    cat "$LOG15" >&2
+fi
+
+# The default matrix files and the C checks need no third-party Python package: with site-packages
+# disabled (-S) the drift guard still passes.
+NOSITE_PY="${PYTHON:-python3} -S"
+if $NOSITE_PY -c 'import numpy' >/dev/null 2>&1; then
+    fail "5e: '$NOSITE_PY' still imports numpy, so this case cannot show the checks are standard-library only"
+else
+    LOG16="$SCRATCH/log_stdlib_only"
+    if "$MAKE_BIN" PYTHON="$NOSITE_PY" BUILD_DIR="$SCRATCH/nosite_build" test-tables test-feature-contract \
+            >"$LOG16" 2>&1; then
+        grep -qE "$TABLES_PASS_RE" "$LOG16" && grep -q "^PASS: config.ini, train.py, process.h and the C tests agree" "$LOG16" \
+            && pass "5e: test-tables and test-feature-contract pass with a standard-library-only Python ($NOSITE_PY)" \
+            || { fail "5e: standard-library-only run exited 0 but did not report both PASS lines"; cat "$LOG16" >&2; }
+    else
+        fail "5e: test-tables and test-feature-contract FAIL with a standard-library-only Python ($NOSITE_PY)"
+        cat "$LOG16" >&2
+    fi
+fi
 
 echo
 echo "TOTAL: $((PASS_COUNT + FAIL_COUNT))  PASS: $PASS_COUNT  FAIL: $FAIL_COUNT"

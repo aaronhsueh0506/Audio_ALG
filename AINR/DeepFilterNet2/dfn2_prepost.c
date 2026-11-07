@@ -1,14 +1,9 @@
-/* DeepFilterNet2 pre/post class (contract: dfn2_prepost.h). Composes
- * dfn2_process.c (ERB and complex features, mask expansion, deep filter,
- * attenuation limit; the center=False sqrt-Hann framing is audiolib's
- * AcStft/AcIstft) and dfn2_model_io.c (graph feature windows, recurrent caches),
- * and adds the lifecycle, pool carve and per-hop frame state machine.
+/* DeepFilterNet2 pre/post class (contract: dfn2_prepost.h): combines dfn2_process.c and
+ * dfn2_model_io.c and adds the lifecycle, the pool carve and the per-frame state machine.
  * Requires -ffp-contract=off. No heap in _init, no globals, no stdio. */
 
-#ifndef DFN2_MULTI_FRAME_HOST
-#define DFN2_MULTI_FRAME_HOST 1
-#endif
 #include "dfn2_prepost.h"
+#include "dfn2_model_io_priv.h"
 
 #include "utility/mem_align.h"
 #include "utility/simd_kernel_nn.h"
@@ -19,86 +14,69 @@
 
 #define PP_ALIGN ((size_t)DFN2_PREPOST_ALIGNMENT)
 
-#define PP_FRAMES       DFN2_FRAMES_PER_CALL
 #ifndef DFN2_MASK_ONLY
-/* One frame's deep-filter coefficients. */
-#define PP_FRAME_COEFS(grid)  ((size_t)(grid)->df_bins * DFN2_DF_ORDER * 2)
+#define PP_FRAME_COEFS(grid)  ((size_t)(grid)->df_bins * (size_t)(grid)->df_order * 2u)
 #endif
+
+/* The open frame is one of the first mask_lookahead frames after init or reset: its heads belong to a
+ * frame before the stream start and are never used (N == 1 only; stable from pre_process to finish). */
+#define PP_IN_WARMUP(p) \
+    ((p)->grid.frames_per_call == 1 && dfn2_model_io_frame_slot((p)->io) < 0)
 
 struct DFN2Prepost {
     DFN2State        *dsp;
     DFN2ModelIOState *io;
     DFN2Grid          grid;
 
-    int   io_mode;
     float atten_lim_db;
 
-    /* DFN2_IO_TIME only (NULL in DFN2_IO_FREQ). The analysis object is carved
-     * from the pool over the caller's FftHandle and, when given, window; the
-     * synthesis object is the caller's (cfg->istft), borrowed. */
-    AcStft      *stft;
-    AcIstft     *istft;
-
-    /* Borrowed, never created or destroyed here. */
-    const float *erb_fwd;
+    const float *erb_fwd;   /* borrowed, never created or destroyed here */
     const float *erb_inv;
 
-    /* Per-hop staging, one slot per frame of the call (PP_FRAMES; one slot
-     * with one frame per call). A hop writes the slot of its frame,
-     * dfn2_model_io_frame_slot() after its push. */
-    float *spec_re;     /* [PP_FRAMES][n_bins]  frames, original scale */
+    /* Per-frame staging, one slot per frame of the call; a frame writes the slot
+     * dfn2_model_io_frame_slot() gives after its push. */
+    float *spec_re;     /* [N][n_bins]  frames, original scale */
     float *spec_im;
-    /* DFN2_IO_FREQ only: application spectrum of the dual entry point.
-     * compose_re/compose_im select what the compose stage reads for each frame
-     * (spec_* on single-input entries, apply_* on the dual one). */
-    float *apply_re;    /* [PP_FRAMES][n_bins]                              */
+    /* apply_*: the dual entry point's application spectrum; enhanced_* point at what the enhance stage reads */
+    float *apply_re;    /* [N][n_bins]                                      */
     float *apply_im;
-    const float *compose_re[PP_FRAMES];
-    const float *compose_im[PP_FRAMES];
+    const float **enhanced_re;   /* [N]                                      */
+    const float **enhanced_im;
     float *feat_erb;    /* [n_erb]                                          */
     float *feat_spec;   /* [2][df_bins], two contiguous segments            */
-    float *enh_re;      /* [PP_FRAMES][n_bins]  compose output              */
+    float *enh_re;      /* [N][n_bins]  enhanced spectrum                   */
     float *enh_im;
-    float *out_hop;     /* [PP_FRAMES][hop], DFN2_IO_TIME only              */
 
-    /* Accelerator-writable boundary: the heads (three; the ERB mask alone with
-     * DFN2_MASK_ONLY). The recurrent state is
-     * DFN2ModelIOState's own two arrays at fixed addresses; a runtime writes its
-     * state outputs to the same addresses as the inputs. */
-    float *head_erb_mask;   /* [PP_FRAMES][n_erb]                           */
+    /* accelerator-writable heads (the ERB mask alone with DFN2_MASK_ONLY) */
+    float *head_erb_mask;   /* [N][n_erb]                                   */
 #ifndef DFN2_MASK_ONLY
-    float *head_coefs;      /* [PP_FRAMES][df_bins][DFN2_DF_ORDER][2]       */
-    float *head_alpha;      /* [DFN2_PREPOST_ALPHA_ELEMENTS]                */
+    float *head_coefs;      /* [N][df_bins][df_order][2]                    */
+    float *head_alpha;      /* [N]                                          */
 #endif
 
-    /* Identity heads for frame_skip: unit band mask, zero coefficients, one
-     * frame, used for every frame of the call. Written once at init;
-     * dfn2_compose_stream refuses NULL heads, so pass-through is expressed as
-     * heads. */
+    /* Identity heads for frame_bypass (unit band mask, zero coefficients; one frame, used for
+     * every frame of the call), written once at init: the enhance stage refuses NULL heads. */
     float *skip_mask;       /* [n_erb], all 1.0f                            */
 #ifndef DFN2_MASK_ONLY
-    float *skip_coefs;      /* [df_bins * DFN2_DF_ORDER * 2], all 0.0f      */
+    float *skip_coefs;      /* [df_bins * df_order * 2], all 0.0f           */
 #endif
 
-    int       frame_open;    /* a frame awaits commit or skip               */
-    int       prepared;      /* frame_inputs() armed the accelerator transaction for the open frame */
-    int       have_output;   /* this hop emits a frame                      */
-    long long output_frame;  /* source frame of the last emission, -1 none  */
-#if PP_FRAMES > 1
-    /* The last call's N composed frames are emitted one per hop: slot
-     * `deliver` on this hop, 0 on the hop of the commit. */
+    /* The last call's N enhanced frames are emitted one per frame: slot `deliver`, 0 on the
+     * frame of the commit. */
     int       deliver;
-    int       slot_emitted[PP_FRAMES];
-    long long slot_frame[PP_FRAMES];
-#endif
+    int      *slot_emitted;   /* [N] */
+    long long *slot_frame;    /* [N] */
+
+    long long output_frame;  /* source frame of the last emission, -1 none  */
+    int       frame_open;    /* a frame awaits commit or skip               */
+    int       prepared;      /* frame_open() armed the accelerator transaction for the open frame */
+    int       have_output;   /* this frame emits a spectrum                 */
 
     /* _create bookkeeping; 0 for an _init instance. */
     void *heap_base;
 };
 
-/* ---- pool arithmetic ----
- * audiolib's saturating helpers (mem_align.h): overflow pins the cursor to
- * SIZE_MAX, which MEM_SIZE_INVALID catches. */
+/* ---- pool arithmetic: audiolib's saturating helpers (overflow pins the cursor to SIZE_MAX) ---- */
 
 #ifdef __STDC_VERSION__
 #if __STDC_VERSION__ >= 201112L
@@ -107,11 +85,11 @@ _Static_assert(DFN2_PREPOST_ALIGNMENT == 16u,
 #endif
 #endif
 
-/* Reserve `bytes` at *cursor, aligned. Pass base==NULL to size only. */
-static int pp_carve(unsigned char *base, size_t *cursor, size_t bytes,
+/* Reserve `count` elements of `elem` bytes at *cursor, aligned; base==NULL sizes only. */
+static int pp_carve(unsigned char *base, size_t *cursor, size_t count, size_t elem,
                     void **out) {
     size_t aligned = ck_align16_size(*cursor);
-    size_t next = ck_add_size(aligned, bytes);
+    size_t next = ck_add_size(aligned, ck_mul_size(count, elem));
     if (MEM_SIZE_INVALID(next)) return -1;
     if (base && out) *out = base + aligned;
     *cursor = next;
@@ -135,76 +113,64 @@ static uint32_t pp_fnv1a_str(uint32_t h, const char *s) {
     return h;
 }
 
-/* Build identity a pool is valid for: the whole grid (the lookahead pair, the alphas and
- * the scales included), the model geometry, the normaliser starting points, io_mode and the
- * feature version, so a pool handed across a grid, mode or checkpoint-contract change is
- * refused. */
-static uint32_t pp_build_hash(const DFN2Grid *grid, int io_mode) {
+/* Build identity a pool is valid for: the whole grid, the variant, the layout, carve and
+ * feature versions, so a pool handed across a grid or checkpoint-contract change is refused.
+ * The state registration is not in it: borrowed buffers change no pool byte. */
+static uint32_t pp_build_hash(const DFN2Grid *grid) {
     uint32_t h = 2166136261u;
-    float tuning[2 + DFN2_NORM_STARTS];
+    const float tuning[] = {
+        grid->erb_norm_tau_sec, grid->spec_norm_tau_sec,
+        grid->erb_norm_alpha, grid->spec_norm_alpha, grid->stft_scale, grid->stft_unscale,
+        grid->erb_norm_init_lo_db, grid->erb_norm_init_hi_db, grid->erb_norm_scale_db,
+        grid->spec_norm_init_lo, grid->spec_norm_init_hi,
+    };
     size_t i;
     DFN2_REQUIRE_VARIANT_LINK();
-    DFN2_REQUIRE_FRAMES_PER_CALL_LINK();
-    tuning[0] = grid->erb_norm_alpha;
-    tuning[1] = grid->spec_norm_alpha;
-    for (i = 0; i < DFN2_NORM_STARTS; ++i) tuning[2 + i] = dfn2_norm_starts[i];
     h = pp_fnv1a_u32(h, (uint32_t)grid->sample_rate);
     h = pp_fnv1a_u32(h, (uint32_t)grid->n_fft);
     h = pp_fnv1a_u32(h, (uint32_t)grid->hop);
+    h = pp_fnv1a_u32(h, (uint32_t)grid->n_bins);
     h = pp_fnv1a_u32(h, (uint32_t)grid->n_erb);
     h = pp_fnv1a_u32(h, (uint32_t)grid->df_bins);
-    h = pp_fnv1a_u32(h, (uint32_t)DFN2_DF_ORDER);
+    h = pp_fnv1a_u32(h, (uint32_t)grid->df_order);
     h = pp_fnv1a_u32(h, (uint32_t)grid->mask_lookahead);
     h = pp_fnv1a_u32(h, (uint32_t)grid->df_lookahead);
+    h = pp_fnv1a_u32(h, (uint32_t)grid->df_history);
+    h = pp_fnv1a_u32(h, (uint32_t)grid->ring);
+    h = pp_fnv1a_u32(h, (uint32_t)grid->frames_per_call);
+    h = pp_fnv1a_u32(h, (uint32_t)grid->input_frames);
+#ifdef DFN2_MASK_ONLY
+    h = pp_fnv1a_u32(h, 1u);
+#else
+    h = pp_fnv1a_u32(h, 0u);
+#endif
     h = pp_fnv1a_u32(h, (uint32_t)DFN2_MODEL_IO_LAYOUT_VERSION);
     h = pp_fnv1a_u32(h, (uint32_t)DFN2_PREPOST_CARVE_VERSION);
     h = pp_fnv1a_u32(h, (uint32_t)DFN2_MODEL_INPUT_FRAMES);
-    h = pp_fnv1a_u32(h, (uint32_t)DFN2_MODEL_GRU_HIDDEN);
-    h = pp_fnv1a_u32(h, (uint32_t)DFN2_MODEL_ENCODER_CHANNELS);
-    h = pp_fnv1a_u32(h, (uint32_t)DFN2_MODEL_GRU_ROWS);
-    h = pp_fnv1a_u32(h, (uint32_t)DFN2_MODEL_DF_PATHWAY_WINDOW);
     h = pp_fnv1a_str(h, DFN2_FEATURE_VERSION);
-    h = pp_fnv1a_u32(h, (uint32_t)io_mode);
     for (i = 0; i < sizeof tuning / sizeof tuning[0]; ++i) {
         uint32_t bits;
         memcpy(&bits, &tuning[i], sizeof bits);
         h = pp_fnv1a_u32(h, bits);
     }
-#if PP_FRAMES != 1
-    /* Folded only for N > 1, so the one-frame pool identity is unchanged. */
-    h = pp_fnv1a_u32(h, (uint32_t)PP_FRAMES);
-#endif
     return ac_memreq_abi_hash(h);
 }
 
-/* DFN2_IO_TIME: bytes of the analysis object, over the caller's FFT handle and
- * window (NULL = it carves the table). The synthesis object is the caller's. */
-static int pp_framing_size(const DFN2PrepostConfig *cfg, size_t *stft_bytes) {
-    AcStftConfig sc;
-    dfn2_framing_config(&sc, &cfg->grid, cfg->fft, cfg->window);
-    *stft_bytes = ac_stft_get_mem_size(&sc);
-    return *stft_bytes != 0 ? 0 : -1;
-}
+typedef struct PpBlocks {
+    void  *state;        /* DFN2State arrays */
+    size_t state_bytes;
+    void  *io;           /* DFN2ModelIOState windows */
+    size_t io_bytes;
+} PpBlocks;
 
-/* The caller's AcIstft must be the one dfn2_framing_config() describes: the
- * model's fft size, overlap-add mode and synthesis scale. */
-static int pp_istft_matches(const DFN2Grid *grid, const AcIstft *istft) {
-    AcStftConfig want, got;
-    dfn2_framing_config(&want, grid, NULL, NULL);
-    return istft != NULL && ac_istft_get_config(istft, &got) == 0 &&
-           got.fft_size == want.fft_size && got.ola == want.ola &&
-           got.ispec_scale == want.ispec_scale;
-}
-
-/* Walk the layout once: base==NULL sizes it, otherwise it also carves (the
- * analysis block returned via stft_block, NULL in DFN2_IO_FREQ).
- * get_mem_size and init share this walk so their order agrees. */
+/* The layout walk shared by get_mem_size and init so their order agrees: base==NULL sizes
+ * it, otherwise it also carves (sub-blocks returned via blocks). */
 static int pp_layout(DFN2Prepost *p, unsigned char *base,
                      const DFN2PrepostConfig *cfg, size_t *total,
-                     void **stft_block) {
-    const int io_mode = cfg->io_mode;
+                     PpBlocks *blocks) {
     const DFN2Grid *g = &cfg->grid;
-    const size_t frame_bins = (size_t)PP_FRAMES * (size_t)g->n_bins;
+    const size_t frames = (size_t)g->frames_per_call;
+    const size_t frame_bins = frames * (size_t)g->n_bins;
     const size_t float_counts[] = {
         frame_bins,
         frame_bins,
@@ -215,7 +181,7 @@ static int pp_layout(DFN2Prepost *p, unsigned char *base,
         dfn2_prepost_erb_mask_elements(g),
 #ifndef DFN2_MASK_ONLY
         dfn2_prepost_coefs_elements(g),
-        DFN2_PREPOST_ALPHA_ELEMENTS,
+        dfn2_prepost_alpha_elements(g),
 #endif
         (size_t)g->n_erb
 #ifndef DFN2_MASK_ONLY
@@ -228,24 +194,19 @@ static int pp_layout(DFN2Prepost *p, unsigned char *base,
     const size_t n_float_regions = sizeof float_counts / sizeof float_counts[0];
     float **slots[sizeof float_counts / sizeof float_counts[0]];
 
-    if (pp_carve(base, &cursor, sizeof(DFN2Prepost), &ptr) != 0) return -1;
-    if (pp_carve(base, &cursor, sizeof(DFN2State), &ptr) != 0) return -1;
-    if (base && p) p->dsp = (DFN2State *)ptr;
-    if (pp_carve(base, &cursor, sizeof(DFN2ModelIOState), &ptr) != 0)
-        return -1;
-    if (base && p) p->io = (DFN2ModelIOState *)ptr;
+    blocks->state_bytes = dfn2_state_mem_size(g);
+    blocks->io_bytes = dfn2_model_io_mem_size(g);
+    if (blocks->state_bytes == 0u || blocks->io_bytes == 0u) return -1;
 
-    /* DFN2_IO_TIME only: the output hop staging and the analysis object. */
-    if (io_mode == DFN2_IO_TIME) {
-        size_t stft_bytes;
-        if (pp_framing_size(cfg, &stft_bytes) != 0) return -1;
-        if (pp_carve(base, &cursor,
-                     (size_t)PP_FRAMES * (size_t)g->hop * sizeof(float),
-                     &ptr) != 0) return -1;
-        if (base && p) p->out_hop = (float *)ptr;
-        if (pp_carve(base, &cursor, stft_bytes, &ptr) != 0) return -1;
-        if (stft_block) *stft_block = ptr;
-    }
+    if (pp_carve(base, &cursor, 1u, sizeof(DFN2Prepost), &ptr) != 0) return -1;
+    if (pp_carve(base, &cursor, 1u, sizeof(DFN2State), &ptr) != 0) return -1;
+    if (base && p) p->dsp = (DFN2State *)ptr;
+    if (pp_carve(base, &cursor, blocks->state_bytes, 1u, &ptr) != 0) return -1;
+    blocks->state = ptr;
+    if (pp_carve(base, &cursor, 1u, sizeof(DFN2ModelIOState), &ptr) != 0) return -1;
+    if (base && p) p->io = (DFN2ModelIOState *)ptr;
+    if (pp_carve(base, &cursor, blocks->io_bytes, 1u, &ptr) != 0) return -1;
+    blocks->io = ptr;
 
     if (p) {
         slots[0]  = &p->spec_re;       slots[1]  = &p->spec_im;
@@ -261,34 +222,33 @@ static int pp_layout(DFN2Prepost *p, unsigned char *base,
 #endif
     }
     for (i = 0; i < n_float_regions; ++i) {
-        if (pp_carve(base, &cursor, float_counts[i] * sizeof(float),
-                     &ptr) != 0) return -1;
+        if (pp_carve(base, &cursor, float_counts[i], sizeof(float), &ptr) != 0)
+            return -1;
         if (base && p) *slots[i] = (float *)ptr;
     }
 
-    /* DFN2_IO_FREQ only: the dual entry point's application spectrum, appended
-     * last so other regions' offsets do not depend on io_mode. */
-    if (io_mode == DFN2_IO_FREQ) {
-        const size_t apply_bytes = frame_bins * sizeof(float);
-        if (pp_carve(base, &cursor, apply_bytes, &ptr) != 0) return -1;
-        if (base && p) p->apply_re = (float *)ptr;
-        if (pp_carve(base, &cursor, apply_bytes, &ptr) != 0) return -1;
-        if (base && p) p->apply_im = (float *)ptr;
-    }
+    if (pp_carve(base, &cursor, frames, sizeof(const float *), &ptr) != 0) return -1;
+    if (base && p) p->enhanced_re = (const float **)ptr;
+    if (pp_carve(base, &cursor, frames, sizeof(const float *), &ptr) != 0) return -1;
+    if (base && p) p->enhanced_im = (const float **)ptr;
+    if (pp_carve(base, &cursor, frames, sizeof(int), &ptr) != 0) return -1;
+    if (base && p) p->slot_emitted = (int *)ptr;
+    if (pp_carve(base, &cursor, frames, sizeof(long long), &ptr) != 0) return -1;
+    if (base && p) p->slot_frame = (long long *)ptr;
+
+    if (pp_carve(base, &cursor, frame_bins, sizeof(float), &ptr) != 0) return -1;
+    if (base && p) p->apply_re = (float *)ptr;
+    if (pp_carve(base, &cursor, frame_bins, sizeof(float), &ptr) != 0) return -1;
+    if (base && p) p->apply_im = (float *)ptr;
 
     *total = ck_align16_size(cursor);
     return MEM_SIZE_INVALID(*total) ? -1 : 0;
 }
 
-/* ---- config / sizing ------------------------------------------------- */
-
-int dfn2_prepost_config_defaults(DFN2PrepostConfig *cfg, int io_mode,
-                                 const DFN2Grid *grid) {
+int dfn2_prepost_config_defaults(DFN2PrepostConfig *cfg, const DFN2Grid *grid) {
     if (!cfg) return -1;
-    if (io_mode != DFN2_IO_TIME && io_mode != DFN2_IO_FREQ) return -1;
     if (dfn2_grid_validate(grid) != DFN2_GRID_OK) return -1;
     memset(cfg, 0, sizeof(*cfg));
-    cfg->io_mode = io_mode;
     cfg->grid = *grid;
     cfg->atten_lim_db = 0.0f;
     return 0;
@@ -296,57 +256,43 @@ int dfn2_prepost_config_defaults(DFN2PrepostConfig *cfg, int io_mode,
 
 static int pp_check_config(const DFN2PrepostConfig *cfg) {
     if (!cfg) return -1;
-    if (cfg->io_mode != DFN2_IO_TIME && cfg->io_mode != DFN2_IO_FREQ)
-        return -1;
     if (dfn2_grid_validate(&cfg->grid) != DFN2_GRID_OK) return -1;
-    /* Required in both modes: mask expansion and the ERB feature branch run on
-     * the spectrum side. */
+    /* Mask expansion and the ERB feature branch run on the spectrum side. */
     if (!cfg->erb_fwd || !cfg->erb_inv) return -1;
     if (!isfinite(cfg->atten_lim_db)) return -1;
-    if (cfg->io_mode == DFN2_IO_TIME) {
-        /* Reject-first: a wrong-size handle would break the grid silently. */
-        if (!cfg->fft) return -1;
-        if (fft_get_n_freqs(cfg->fft) != cfg->grid.n_bins) return -1;
-        if (!pp_istft_matches(&cfg->grid, cfg->istft)) return -1;
-    }
+    if (dfn2_registration_check(cfg->gru_hidden, cfg->gru_hidden_elements,
+                                cfg->df_convp_history,
+                                cfg->df_convp_history_elements) != 0)
+        return -1;
     return 0;
 }
 
 int dfn2_prepost_get_mem_size(const DFN2PrepostConfig *cfg,
                               DFN2PrepostMemReq *req) {
     size_t total = 0;
+    PpBlocks blocks;
 
     if (!req || pp_check_config(cfg) != 0) return -1;
-    if (pp_layout(NULL, NULL, cfg, &total, NULL) != 0) return -1;
+    if (pp_layout(NULL, NULL, cfg, &total, &blocks) != 0) return -1;
 
     memset(req, 0, sizeof(*req));
     req->descriptor_version = DFN2_PREPOST_DESCRIPTOR_VERSION;
     req->layout_version = (uint32_t)DFN2_MODEL_IO_LAYOUT_VERSION;
-    req->io_mode = (uint32_t)cfg->io_mode;
-    req->build_flags_hash = pp_build_hash(&cfg->grid, cfg->io_mode);
+    req->build_flags_hash = pp_build_hash(&cfg->grid);
     req->alignment = (uint32_t)PP_ALIGN;
     req->bytes = (uint64_t)total;
     return 0;
 }
 
-/* ---- lifecycle ------------------------------------------------------- */
-
-/* Bring DFN2State (with the framing objects, the caller's AcIstft included) and
- * DFN2ModelIOState to their init values and reapply the borrowed ERB matrices. */
-static int pp_reset_dsp(DFN2Prepost *p) {
-    if (dfn2_state_init(p->dsp, &p->grid, p->stft, p->istft) != 0) return -1;
-    dfn2_set_erb_matrices(p->dsp, p->erb_fwd, p->erb_inv);
-    return 0;
-}
-
+/* DFN2State and DFN2ModelIOState (with the registered recurrent state) back to their init
+ * values; the DSP state keeps the borrowed ERB matrices. */
 static void pp_reset_states(DFN2Prepost *p) {
-    (void)pp_reset_dsp(p);   /* the grid was validated at init */
+    dfn2_state_reset(p->dsp);
     dfn2_model_io_reset(p->io);
 }
 
-/* Per-hop bookkeeping only. The staging buffers are zero from init/reset, the
- * compose stage returns before writing them on the warm-up hops, and every
- * later hop writes them wholesale, so they are not cleared here. */
+/* Bookkeeping only: the staging buffers are zero from init/reset, the warm-up frames return
+ * before writing them and every later frame writes them wholesale. */
 static void pp_clear_frame(DFN2Prepost *p) {
     p->frame_open = 0;
     p->prepared = 0;
@@ -354,17 +300,13 @@ static void pp_clear_frame(DFN2Prepost *p) {
 }
 
 static void pp_zero_staging(DFN2Prepost *p) {
-    const size_t frame_bins = (size_t)PP_FRAMES * (size_t)p->grid.n_bins;
+    const size_t frames = (size_t)p->grid.frames_per_call;
+    const size_t frame_bins = frames * (size_t)p->grid.n_bins;
     memset(p->enh_re, 0, frame_bins * sizeof(float));
     memset(p->enh_im, 0, frame_bins * sizeof(float));
-    if (p->io_mode == DFN2_IO_TIME)
-        memset(p->out_hop, 0,
-               (size_t)PP_FRAMES * (size_t)p->grid.hop * sizeof(float));
-#if PP_FRAMES > 1
     p->deliver = 0;
-    memset(p->slot_emitted, 0, sizeof(p->slot_emitted));
-    memset(p->slot_frame, 0, sizeof(p->slot_frame));
-#endif
+    memset(p->slot_emitted, 0, frames * sizeof(int));
+    memset(p->slot_frame, 0, frames * sizeof(long long));
 }
 
 DFN2Prepost *dfn2_prepost_init_ex(void *pool, size_t bytes,
@@ -373,17 +315,17 @@ DFN2Prepost *dfn2_prepost_init_ex(void *pool, size_t bytes,
     DFN2PrepostMemReq req;
     DFN2Prepost *p;
     size_t total = 0;
-    void *stft_block = NULL;
+    PpBlocks blocks;
     int i;
 
     if (!pool || dfn2_prepost_get_mem_size(cfg, &req) != 0) return NULL;
     if (bytes < (size_t)req.bytes) return NULL;
     if (((uintptr_t)pool % (uintptr_t)req.alignment) != 0u) return NULL;
     if (expected) {
-        /* Stale-pool gate: a pool sized by another build or io_mode is refused. */
+        /* Stale-pool gate: a pool sized by another build or grid is refused. */
         if (expected->descriptor_version != req.descriptor_version ||
             expected->layout_version != req.layout_version ||
-            expected->io_mode != req.io_mode ||
+            expected->reserved0 != req.reserved0 ||
             expected->build_flags_hash != req.build_flags_hash ||
             expected->alignment != req.alignment ||
             expected->bytes != req.bytes) {
@@ -391,43 +333,29 @@ DFN2Prepost *dfn2_prepost_init_ex(void *pool, size_t bytes,
         }
     }
 
-    /* Zero the whole control region first so a poisoned pool initialises like a
-     * zeroed one. */
+    /* Zero the whole pool first, the control region included. */
     memset(pool, 0, (size_t)req.bytes);
     p = (DFN2Prepost *)pool;
     p->grid = cfg->grid;
-    p->io_mode = cfg->io_mode;
     p->atten_lim_db = cfg->atten_lim_db;
     p->erb_fwd = cfg->erb_fwd;
     p->erb_inv = cfg->erb_inv;
 
-    if (pp_layout(p, (unsigned char *)pool, cfg, &total, &stft_block) != 0)
+    if (pp_layout(p, (unsigned char *)pool, cfg, &total, &blocks) != 0)
         return NULL;
     if (total != (size_t)req.bytes) return NULL;   /* sizing/carve agreement */
-
-    if (cfg->io_mode == DFN2_IO_TIME) {
-        size_t stft_bytes;
-        AcStftConfig sc, synth;
-        if (pp_framing_size(cfg, &stft_bytes) != 0) return NULL;
-        dfn2_framing_config(&sc, &cfg->grid, cfg->fft, cfg->window);
-        p->stft = ac_stft_init(stft_block, stft_bytes, &sc);
-        if (!p->stft) return NULL;
-        /* Analysis and synthesis must share one window (sqrt-Hann pair). */
-        if (ac_istft_get_config(cfg->istft, &synth) != 0 ||
-            memcmp(synth.window, ac_stft_window(p->stft),
-                   (size_t)cfg->grid.n_fft * sizeof(float)) != 0)
-            return NULL;
-        p->istft = cfg->istft;
-    }
 
     for (i = 0; i < cfg->grid.n_erb; ++i) p->skip_mask[i] = 1.0f;
 #ifndef DFN2_MASK_ONLY
     memset(p->skip_coefs, 0, PP_FRAME_COEFS(&cfg->grid) * sizeof(float));
 #endif
 
-    /* The model-I/O state starts its generation at 1 here; reset() advances it. */
-    if (dfn2_model_io_init(p->io, &p->grid) != 0 || pp_reset_dsp(p) != 0)
+    if (dfn2_state_init(p->dsp, blocks.state, blocks.state_bytes, &p->grid) != 0 ||
+        dfn2_model_io_init(p->io, blocks.io, blocks.io_bytes, &p->grid, cfg->gru_hidden,
+                           cfg->gru_hidden_elements, cfg->df_convp_history,
+                           cfg->df_convp_history_elements) != 0)
         return NULL;       /* staging is already zero from the pool memset */
+    dfn2_set_erb_matrices(p->dsp, p->erb_fwd, p->erb_inv);
     pp_clear_frame(p);
     p->output_frame = -1;
     return p;
@@ -480,8 +408,6 @@ unsigned int dfn2_prepost_state_generation(const DFN2Prepost *p) {
     return p ? dfn2_model_io_state_generation(p->io) : 0u;
 }
 
-/* ---- accessors ------------------------------------------------------- */
-
 int dfn2_prepost_hop_size(const DFN2Prepost *p) {
     return p ? p->grid.hop : -1;
 }
@@ -492,10 +418,6 @@ int dfn2_prepost_num_bins(const DFN2Prepost *p) {
 
 const DFN2Grid *dfn2_prepost_grid(const DFN2Prepost *p) {
     return p ? &p->grid : NULL;
-}
-
-int dfn2_prepost_io_mode(const DFN2Prepost *p) {
-    return p ? p->io_mode : -1;
 }
 
 int dfn2_prepost_model_lookahead_frames(const DFN2Prepost *p) {
@@ -509,8 +431,7 @@ int dfn2_prepost_layout_version(const DFN2Prepost *p) {
 int dfn2_prepost_set_erb_matrices(DFN2Prepost *p, const float *erb_fwd,
                                   const float *erb_inv) {
     if (!p || !erb_fwd || !erb_inv) return -1;
-    /* Between hops only: a swap must not land inside an open transaction
-     * (atomicity per hop; see dfn2_prepost.h). */
+    /* between hops only: a swap must not land inside an open transaction */
     if (p->frame_open) return -1;
     p->erb_fwd = erb_fwd;
     p->erb_inv = erb_inv;
@@ -520,7 +441,7 @@ int dfn2_prepost_set_erb_matrices(DFN2Prepost *p, const float *erb_fwd,
 
 int dfn2_prepost_set_atten_lim(DFN2Prepost *p, float atten_lim_db) {
     if (!p || !isfinite(atten_lim_db)) return -1;
-    if (p->frame_open) return -1;   /* between hops only, like the ERB pair */
+    if (p->frame_open) return -1;   /* between hops only */
     p->atten_lim_db = atten_lim_db;
     return 0;
 }
@@ -531,7 +452,7 @@ int dfn2_prepost_output_frame_index(const DFN2Prepost *p, long long *frame) {
     return 0;
 }
 
-/* ---- per-hop stages -------------------------------------------------- */
+/* ---- per-frame stages ------------------------------------------------ */
 
 static int pp_all_finite(const float *values, size_t count) {
     return skn_all_finite_f32(values, count);
@@ -541,33 +462,25 @@ static void pp_fill_nan(float *values, size_t count) {
     skn_fill_f32(values, count, (float)NAN);
 }
 
-/* Slot of the frame the next push fills (see the staging fields). */
+/* Slot the next push fills. */
 static int pp_input_slot(const DFN2Prepost *p) {
-    return (dfn2_model_io_frame_slot(p->io) + 1) % PP_FRAMES;
+    return (dfn2_model_io_frame_slot(p->io) + 1) % p->grid.frames_per_call;
 }
 
-/* The composed frame this hop emits. */
 static int pp_deliver_slot(const DFN2Prepost *p) {
-#if PP_FRAMES > 1
     return p->deliver;
-#else
-    (void)p;
-    return 0;
-#endif
 }
 
-#if PP_FRAMES > 1
 static void pp_deliver(DFN2Prepost *p, int slot) {
     p->deliver = slot;
     p->have_output = p->slot_emitted[slot];
     if (p->have_output) p->output_frame = p->slot_frame[slot];
 }
-#endif
 
-/* Features, graph window and compose clock, shared by every pre_process entry
- * point. `est_*` is read only inside this call; the hop's compose source is
- * already in compose_re/compose_im[slot]. Returns the number of accelerator
- * invocations this hop needs (0 or 1). */
+/* Features and graph window, shared by every pre_process entry point; with N > 1 the first
+ * L frames also advance the enhance clock here. `est_*` is read only inside this call; the hop's
+ * source is already in enhanced_*[slot]. Returns the accelerator invocations this hop needs
+ * (0 or 1; N == 1: always 1, the first L frames are warm-up frames). */
 static int pp_begin_frame(DFN2Prepost *p, const float *est_re,
                           const float *est_im, int slot) {
     int heads_needed;
@@ -578,45 +491,24 @@ static int pp_begin_frame(DFN2Prepost *p, const float *est_re,
     heads_needed = dfn2_model_io_push_features(p->io, p->feat_erb, p->feat_spec);
     if (heads_needed < 0) return -1;
 
-    if (heads_needed == 0 && dfn2_model_io_frame_slot(p->io) < 0) {
-        /* Warm-up: the first head's window is not complete, so the compose
-         * clock advances with heads_valid=0. dfn2_compose_stream() accepts this
-         * exactly while current < mask_lookahead; a disagreement returns -1
-         * and is surfaced. */
-        if (dfn2_compose_stream(p->dsp, p->compose_re[slot],
-                                p->compose_im[slot], 0, NULL, NULL, 0.0f,
-                                p->atten_lim_db, p->enh_re, p->enh_im,
-                                NULL) != 0) {
-            return -1;
+    if (heads_needed == 0 && p->grid.frames_per_call > 1) {
+        if (dfn2_model_io_frame_slot(p->io) < 0) {
+            /* N > 1 warm-up: the clock advances with heads_valid=0, which
+             * dfn2_enhance_spectrum_stream() accepts exactly while current < mask_lookahead. */
+            if (dfn2_enhance_spectrum_stream(p->dsp, p->enhanced_re[slot],
+                                    p->enhanced_im[slot], 0, NULL, NULL, 0.0f,
+                                    p->atten_lim_db, p->enh_re, p->enh_im,
+                                    NULL) != 0) {
+                return -1;
+            }
+            return 0;
         }
-        return 0;
-    }
-#if PP_FRAMES > 1
-    if (heads_needed == 0) {
-        /* The frame waits in its slot for the call that completes; this hop
-         * emits the next frame of the previous call. */
+        /* the frame waits in its slot; this call emits the next frame of the previous call */
         pp_deliver(p, slot + 1);
         return 0;
     }
-#endif
     p->frame_open = 1;
     return 1;
-}
-
-int dfn2_prepost_pre_process(DFN2Prepost *p, const float *in_hop) {
-    int slot;
-    float *re;
-    float *im;
-    if (!p || !in_hop) return -1;
-    if (p->io_mode != DFN2_IO_TIME) return -1;
-    if (p->frame_open) return -1;   /* previous frame never closed */
-    slot = pp_input_slot(p);
-    re = p->spec_re + (size_t)slot * (size_t)p->grid.n_bins;
-    im = p->spec_im + (size_t)slot * (size_t)p->grid.n_bins;
-    dfn2_analysis(p->dsp, in_hop, re, im);
-    p->compose_re[slot] = re;
-    p->compose_im[slot] = im;
-    return pp_begin_frame(p, re, im, slot);
 }
 
 int dfn2_prepost_pre_process_freq(DFN2Prepost *p, const float *spec_re,
@@ -626,7 +518,6 @@ int dfn2_prepost_pre_process_freq(DFN2Prepost *p, const float *spec_re,
     float *im;
     size_t bins;
     if (!p || !spec_re || !spec_im) return -1;
-    if (p->io_mode != DFN2_IO_FREQ) return -1;
     if (p->frame_open) return -1;
     bins = (size_t)p->grid.n_bins * sizeof(float);
     slot = pp_input_slot(p);
@@ -634,8 +525,8 @@ int dfn2_prepost_pre_process_freq(DFN2Prepost *p, const float *spec_re,
     im = p->spec_im + (size_t)slot * (size_t)p->grid.n_bins;
     memcpy(re, spec_re, bins);
     memcpy(im, spec_im, bins);
-    p->compose_re[slot] = re;
-    p->compose_im[slot] = im;
+    p->enhanced_re[slot] = re;
+    p->enhanced_im[slot] = im;
     return pp_begin_frame(p, re, im, slot);
 }
 
@@ -648,75 +539,68 @@ int dfn2_prepost_pre_process_freq_dual(DFN2Prepost *p, const float *est_re,
     float *im;
     size_t bins;
     if (!p || !est_re || !est_im || !app_re || !app_im) return -1;
-    if (p->io_mode != DFN2_IO_FREQ) return -1;
     if (p->frame_open) return -1;
     bins = (size_t)p->grid.n_bins * sizeof(float);
-    /* The application spectrum is read again at commit, so it is copied; the
-     * estimate feeds only this hop's features. */
+    /* the application spectrum is read again at commit, so it is copied */
     slot = pp_input_slot(p);
     re = p->apply_re + (size_t)slot * (size_t)p->grid.n_bins;
     im = p->apply_im + (size_t)slot * (size_t)p->grid.n_bins;
     memcpy(re, app_re, bins);
     memcpy(im, app_im, bins);
-    p->compose_re[slot] = re;
-    p->compose_im[slot] = im;
+    p->enhanced_re[slot] = re;
+    p->enhanced_im[slot] = im;
     return pp_begin_frame(p, est_re, est_im, slot);
 }
 
-int dfn2_prepost_frame_inputs(DFN2Prepost *p, DFN2PrepostInputs *inputs,
+int dfn2_prepost_frame_open(DFN2Prepost *p, DFN2PrepostInputs *inputs,
                               DFN2PrepostOutputs *outputs) {
     if (!p || !inputs || !outputs || !p->frame_open) return -1;
 
     memset(inputs, 0, sizeof(*inputs));
     inputs->erb_window = p->io->erb_window;
     inputs->spec_window = p->io->spec_window;
-    inputs->gru_hidden = (const float (*)[DFN2_MODEL_GRU_HIDDEN])p->io->gru_hidden;
+    inputs->gru_hidden = p->io->gru_hidden;
+    inputs->gru_hidden_elements = p->io->gru_hidden_elements;
 #ifndef DFN2_MASK_ONLY
     inputs->df_convp_window = p->io->df_convp_window;
-    inputs->df_convp_window_elements =
-        dfn2_prepost_convp_window_elements(&p->grid);
+    inputs->df_convp_window_elements = p->io->df_convp_window_elements;
 #endif
     inputs->erb_window_elements = dfn2_prepost_erb_window_elements(&p->grid);
     inputs->spec_window_elements = dfn2_prepost_spec_window_elements(&p->grid);
-    inputs->gru_hidden_elements = DFN2_PREPOST_GRU_HIDDEN_ELEMENTS;
 
-    /* NaN-fill the heads so a repeated request gets a clean boundary and a
-     * partial accelerator write fails commit. The recurrent state is the
-     * accelerator's input too and is left as is. */
+    /* NaN-fill the heads so a partial accelerator write fails commit; the recurrent state is
+     * the accelerator's input too and is left as is. */
     pp_fill_nan(p->head_erb_mask, dfn2_prepost_erb_mask_elements(&p->grid));
 #ifndef DFN2_MASK_ONLY
     pp_fill_nan(p->head_coefs, dfn2_prepost_coefs_elements(&p->grid));
-    pp_fill_nan(p->head_alpha, DFN2_PREPOST_ALPHA_ELEMENTS);
+    pp_fill_nan(p->head_alpha, dfn2_prepost_alpha_elements(&p->grid));
 #endif
 
     memset(outputs, 0, sizeof(*outputs));
     outputs->erb_mask = p->head_erb_mask;
     outputs->gru_hidden_next = p->io->gru_hidden;
     outputs->erb_mask_elements = dfn2_prepost_erb_mask_elements(&p->grid);
-    outputs->gru_hidden_elements = DFN2_PREPOST_GRU_HIDDEN_ELEMENTS;
+    outputs->gru_hidden_elements = p->io->gru_hidden_elements;
 #ifndef DFN2_MASK_ONLY
     outputs->coefs = p->head_coefs;
     outputs->alpha = p->head_alpha;
     outputs->df_convp_window_next = p->io->df_convp_window;
     outputs->coefs_elements = dfn2_prepost_coefs_elements(&p->grid);
-    outputs->alpha_elements = DFN2_PREPOST_ALPHA_ELEMENTS;
-    outputs->df_convp_window_elements =
-        dfn2_prepost_convp_window_elements(&p->grid);
+    outputs->alpha_elements = dfn2_prepost_alpha_elements(&p->grid);
+    outputs->df_convp_window_elements = p->io->df_convp_window_elements;
 #endif
     p->prepared = 1;
     return 0;
 }
 
 #ifndef DFN2_MASK_ONLY
-/* Alpha of the identity heads. */
 static const float pp_skip_alpha[1];
 #endif
 
-/* Run the compose stage with the given heads and, in DFN2_IO_TIME, the
- * synthesis, for each frame of the call in order: frame i reads its heads at
- * i * stride frames into the arrays (stride 0 repeats one frame's heads).
- * Closes the frame on success only; the compose clock advances once per hop,
- * here or in the warm-up branch of pp_begin_frame. */
+/* Run the enhance stage per frame of the call in order: frame i reads its heads at i * stride
+ * frames into the arrays (stride 0 repeats one frame's heads). Closes the frame on success only;
+ * the clock advances once per frame, here or (N > 1 warm-up) in pp_begin_frame. A warm-up frame
+ * (N == 1) advances the clock without heads, zeroes the registered state and emits nothing. */
 static int pp_close_frame(DFN2Prepost *p, const float *erb_mask,
                           const float *coefs, const float *alpha,
                           int stride) {
@@ -726,63 +610,59 @@ static int pp_close_frame(DFN2Prepost *p, const float *erb_mask,
     (void)coefs;   /* no deep filter: only the ERB mask head exists */
     (void)alpha;
 #endif
-    for (i = 0; i < PP_FRAMES; ++i) {
+    if (PP_IN_WARMUP(p)) {
+        if (dfn2_enhance_spectrum_stream(p->dsp, p->enhanced_re[0], p->enhanced_im[0], 0,
+                                         NULL, NULL, 0.0f, p->atten_lim_db, p->enh_re,
+                                         p->enh_im, NULL) != 0)
+            return -1;
+        dfn2_model_io_zero_recurrent(p->io);
+        p->frame_open = 0;   /* have_output stays 0 from pp_begin_frame, output_frame untouched */
+        p->prepared = 0;
+        return 0;
+    }
+    for (i = 0; i < p->grid.frames_per_call; ++i) {
         const size_t head = (size_t)i * (size_t)stride;
         float *enh_re = p->enh_re + (size_t)i * (size_t)p->grid.n_bins;
         float *enh_im = p->enh_im + (size_t)i * (size_t)p->grid.n_bins;
         long long frame = 0;
         int emitted;
 
-        /* The compose stage validates pointers, head finiteness and clock
-         * alignment before its first write, so -1 leaves the compose state
-         * untouched and the frame open for frame_skip(). The heads were
-         * finite-checked before this loop and every frame of a call is past
-         * the warm-up, so only the first frame can return -1. */
+        /* The enhance stage validates pointers, head finiteness and clock alignment before its
+         * first write, so -1 leaves its state untouched and the frame open for frame_bypass();
+         * only the first frame can return -1. */
 #ifdef DFN2_MASK_ONLY
-        emitted = dfn2_compose_stream(p->dsp, p->compose_re[i],
-                                      p->compose_im[i], 1,
+        emitted = dfn2_enhance_spectrum_stream(p->dsp, p->enhanced_re[i],
+                                      p->enhanced_im[i], 1,
                                       erb_mask + head * (size_t)p->grid.n_erb, NULL,
                                       0.0f, p->atten_lim_db, enh_re,
                                       enh_im, &frame);
 #else
-        emitted = dfn2_compose_stream(p->dsp, p->compose_re[i],
-                                      p->compose_im[i], 1,
+        emitted = dfn2_enhance_spectrum_stream(p->dsp, p->enhanced_re[i],
+                                      p->enhanced_im[i], 1,
                                       erb_mask + head * (size_t)p->grid.n_erb,
                                       coefs + head * PP_FRAME_COEFS(&p->grid),
                                       alpha[head], p->atten_lim_db, enh_re,
                                       enh_im, &frame);
 #endif
         if (emitted < 0) return -1;
-        /* One synthesis push per emitted frame and none on warm-up frames. */
-        if (emitted && p->io_mode == DFN2_IO_TIME)
-            dfn2_synthesis(p->dsp, enh_re, enh_im,
-                           p->out_hop + (size_t)i * (size_t)p->grid.hop);
-#if PP_FRAMES > 1
-        p->slot_emitted[i] = emitted;
+        p->slot_emitted[i] = emitted;   /* 0: still inside the lookahead warm-up */
         p->slot_frame[i] = frame;
-#else
-        p->have_output = emitted;   /* still inside the lookahead warm-up if 0 */
-        if (emitted) p->output_frame = frame;
-#endif
     }
     p->frame_open = 0;
     p->prepared = 0;
-#if PP_FRAMES > 1
     pp_deliver(p, 0);
-#endif
     return 0;
 }
 
-int dfn2_prepost_frame_commit(DFN2Prepost *p) {
+int dfn2_prepost_frame_finish(DFN2Prepost *p) {
     int heads_finite;
     int state_finite;
     if (!p || !p->prepared) return -1;   /* prepared implies frame_open */
+    if (PP_IN_WARMUP(p)) return dfn2_prepost_frame_bypass(p);   /* heads never read */
 
-    /* The accelerator overwrote the recurrent state in place, so a non-finite head
-     * or state element zeroes both recurrent tensors, advances the state
-     * generation, disarms the transaction and leaves the frame open for
-     * frame_skip() or a fresh frame_inputs(). Windows, compose state and clocks are
-     * untouched. */
+    /* The accelerator overwrote the recurrent state in place: a non-finite head or state element
+     * zeroes both registered tensors, advances the state generation and disarms the transaction;
+     * the frame stays open. */
     heads_finite =
 #ifdef DFN2_MASK_ONLY
         pp_all_finite(p->head_erb_mask,
@@ -791,19 +671,17 @@ int dfn2_prepost_frame_commit(DFN2Prepost *p) {
         pp_all_finite(p->head_erb_mask,
                       dfn2_prepost_erb_mask_elements(&p->grid)) &&
         pp_all_finite(p->head_coefs, dfn2_prepost_coefs_elements(&p->grid)) &&
-        pp_all_finite(p->head_alpha, DFN2_PREPOST_ALPHA_ELEMENTS);
+        pp_all_finite(p->head_alpha, dfn2_prepost_alpha_elements(&p->grid));
 #endif
     state_finite = dfn2_model_io_validate_state(p->io) == 0;
     if (!state_finite || !heads_finite) {
-        /* validate_state already zeroed and counted a bad state; a bad head with a
-         * finite state still restarts the recurrent state. */
+        /* validate_state already zeroed a bad state; a bad head still restarts it */
         if (state_finite) dfn2_model_io_zero_recurrent(p->io);
         p->prepared = 0;
         return -1;
     }
 
-    /* The compose stage advances its clock and closes the frame: the one step
-     * with no undo, placed where nothing can fail after it. */
+    /* the one step with no undo: nothing can fail after it */
 #ifdef DFN2_MASK_ONLY
     return pp_close_frame(p, p->head_erb_mask, NULL, NULL, 1);
 #else
@@ -812,12 +690,10 @@ int dfn2_prepost_frame_commit(DFN2Prepost *p) {
 #endif
 }
 
-int dfn2_prepost_frame_skip(DFN2Prepost *p) {
+int dfn2_prepost_frame_bypass(DFN2Prepost *p) {
     if (!p || !p->frame_open) return -1;
-    /* Identity: a unit band mask expands to unit bin gain through the
-     * partition-of-unity erb_inv, and alpha 0 selects the masked residual, so the
-     * noisy spectrum passes through. The recurrent state is untouched; the
-     * deep-filter and compose clocks still advance. */
+    /* Identity: a unit band mask expands to unit bin gain through the partition-of-unity
+     * erb_inv and alpha 0 selects the masked residual; the clocks still advance. */
 #ifdef DFN2_MASK_ONLY
     return pp_close_frame(p, p->skip_mask, NULL, NULL, 0);
 #else
@@ -825,25 +701,11 @@ int dfn2_prepost_frame_skip(DFN2Prepost *p) {
 #endif
 }
 
-int dfn2_prepost_post_process(DFN2Prepost *p, float *out_hop, int *written) {
-    if (!p || !out_hop) return -1;
-    if (p->io_mode != DFN2_IO_TIME) return -1;
-    if (p->frame_open) return -1;   /* a frame still awaits the model */
-    /* Always a full defined hop: out_hop is zero from init/reset and written
-     * wholesale by the synthesis, so warm-up hops yield silence. */
-    memcpy(out_hop,
-           p->out_hop + (size_t)pp_deliver_slot(p) * (size_t)p->grid.hop,
-           (size_t)p->grid.hop * sizeof(float));
-    if (written) *written = p->have_output ? p->grid.hop : 0;
-    return 0;
-}
-
 int dfn2_prepost_post_process_freq(DFN2Prepost *p, float *re, float *im,
                                    int *valid) {
     size_t bins;
     size_t at;
     if (!p || !re || !im) return -1;
-    if (p->io_mode != DFN2_IO_FREQ) return -1;
     if (p->frame_open) return -1;
     bins = (size_t)p->grid.n_bins * sizeof(float);
     at = (size_t)pp_deliver_slot(p) * (size_t)p->grid.n_bins;
@@ -853,22 +715,19 @@ int dfn2_prepost_post_process_freq(DFN2Prepost *p, float *re, float *im,
     return 0;
 }
 
-/* ---- the accelerator callback boundary ------------------------------ */
-
 int dfn2_model_run_frame(const DFN2Model *model, DFN2Prepost *p) {
     DFN2PrepostInputs inputs;
     DFN2PrepostOutputs outputs;
     if (!model || !model->infer || !p || !p->frame_open ||
         dfn2_model_io_descriptor_validate(&p->grid, model->io_descriptor) != 0)
         return -1;
-    if (dfn2_prepost_frame_inputs(p, &inputs, &outputs) != 0) return -1;
+    if (dfn2_prepost_frame_open(p, &inputs, &outputs) != 0) return -1;
     if (model->infer(model->user, &inputs, &outputs) != 0) {
-        return dfn2_prepost_frame_skip(p) == 0 ? 0 : -1;
+        return dfn2_prepost_frame_bypass(p) == 0 ? 0 : -1;
     }
-    if (dfn2_prepost_frame_commit(p) != 0) {
-        /* A refused commit leaves the frame open with the state zeroed; take it as
-         * the identity so the clocks advance once. */
-        return dfn2_prepost_frame_skip(p) == 0 ? 0 : -1;
+    if (dfn2_prepost_frame_finish(p) != 0) {
+        /* refused commit: take the frame as the identity so the clocks advance once */
+        return dfn2_prepost_frame_bypass(p) == 0 ? 0 : -1;
     }
     return 1;
 }

@@ -1,28 +1,26 @@
 /* The DeepFilterNet2 grid a pipeline test program runs.
  *
  * The library and the pipeline objects (dfn_res_stage, dfn_rate_bridge, dfn_hop) hold no grid:
- * they take a DFN2Grid built by the application with dfn2_grid_make(). A test program has to
- * decide one, and it is chosen when the program is built so that one test source covers every
- * grid and lookahead pair and its buffers can be plain arrays:
+ * they take a DFN2Grid built by the application with dfn2_grid_make(). A test program decides one
+ * when it is built, so that one test source covers every grid and lookahead pair and its buffers
+ * can be plain arrays:
  *
  *   -DDFN2_GRID_KHZ=16 | 32 | 48          a preset below (48 when nothing is chosen)
  *   -DDFN2_SR=.. -DDFN2_N_FFT=.. -DDFN2_N_ERB=.. -DDFN2_DF_BINS=..
  *                                         a grid of another model (all four, no preset)
  *   -DDFN2_MASK_LOOKAHEAD=m -DDFN2_DF_LOOKAHEAD=d
- *                                         the lookahead pair (1/1 full, 1/0 mask-only);
- *                                         a pair with ring > 5 also needs
- *                                         -DDFN2_MAX_DF_RING=<ring> on every unit
+ *                                         the lookahead pair (default 1/1)
  *
  *      preset   sr      n_fft  hop   bins  n_erb  df_bins
  *      48       48000   1024   512   513   32     96
  *      32       32000   512    256   257   28     96     (not trained yet)
  *      16       16000   256    128   129   24     96
  *
- * This is test scaffolding only. dfn_test_grid() hands the stage, the bridge and the library the
- * same grid as a DFN2Grid, built by dfn2_grid_make(), and the DFN2_* macros below size the test's
- * own buffers. Product code (the pipeline objects, the example mains) never includes this header:
- * it takes its grid from its caller or its arguments. pipelines/Makefile applies the selectors to
- * the test programs only (DFN2_TEST_GRID_KHZ, DFN2_MASK_LOOKAHEAD / DFN2_DF_LOOKAHEAD). */
+ * The df_order, frames_per_call and normaliser numbers are the shipped checkpoint's
+ * (AINR/DeepFilterNet2/config.ini [model], [feature]); test_dfn_test_grid_pin.py compares them.
+ * Test scaffolding only: product code takes its grid from its caller or its arguments.
+ * pipelines/Makefile applies the selectors to the test programs only (DFN2_TEST_GRID_KHZ,
+ * DFN2_MASK_LOOKAHEAD / DFN2_DF_LOOKAHEAD). */
 
 #ifndef DFN_TEST_GRID_H
 #define DFN_TEST_GRID_H
@@ -31,6 +29,10 @@
 #include <stdlib.h>
 
 #include "dfn2_prepost.h"
+
+#ifdef DFN2_MASK_ONLY
+#error "the pipeline tests run the full DFN2 variant: mask-only is not driven through the pipelines"
+#endif
 
 #ifdef DFN2_SR
 #ifdef DFN2_GRID_KHZ
@@ -67,35 +69,86 @@
 #endif
 
 #define DFN2_N_BINS         ((DFN2_N_FFT) / 2 + 1)
-#define DFN2_WIN_LEN        (DFN2_N_FFT)
 #define DFN2_HOP_LEN        ((DFN2_N_FFT) / 2)
-#define DFN2_OVL_LEN        (DFN2_WIN_LEN - DFN2_HOP_LEN)
 
 #ifndef DFN2_MASK_LOOKAHEAD
 #define DFN2_MASK_LOOKAHEAD 1
 #endif
 #ifndef DFN2_DF_LOOKAHEAD
-#ifdef DFN2_MASK_ONLY
-#define DFN2_DF_LOOKAHEAD   0
-#else
 #define DFN2_DF_LOOKAHEAD   1
 #endif
-#endif
-#define DFN2_DF_HISTORY     (DFN2_DF_ORDER - DFN2_DF_LOOKAHEAD - 1)
-#define DFN2_DF_RING_NOISY  (DFN2_MASK_LOOKAHEAD + DFN2_DF_LOOKAHEAD + 1)
-#ifdef DFN2_MASK_ONLY
-#define DFN2_DF_RING        DFN2_DF_RING_NOISY
-#else
-#define DFN2_DF_RING \
-    (DFN2_DF_ORDER > DFN2_DF_RING_NOISY ? DFN2_DF_ORDER : DFN2_DF_RING_NOISY)
-#endif
+
+/* Model numbers every row of the test tables carries. */
+#define DFN_TEST_DF_ORDER             5
+#define DFN_TEST_FRAMES_PER_CALL      1
+#define DFN_TEST_ERB_NORM_TAU_SEC     1.0f
+#define DFN_TEST_ERB_NORM_INIT_LO_DB  (-60.0f)
+#define DFN_TEST_ERB_NORM_INIT_HI_DB  (-90.0f)
+#define DFN_TEST_ERB_NORM_SCALE_DB    40.0f
+#define DFN_TEST_SPEC_NORM_TAU_SEC    1.0f
+#define DFN_TEST_SPEC_NORM_INIT_LO    0.001f
+#define DFN_TEST_SPEC_NORM_INIT_HI    0.0001f
+
+/* Largest row of the test tables (48 kHz / 1024): the static matrices and spectra of the table
+ * rows are sized from it, and dfn_test_table_fits() refuses a row beyond it. */
+#define DFN_TEST_TABLE_MAX_BINS       513
+#define DFN_TEST_TABLE_MAX_ERB        32
 
 /* Frames the stage's output trails its input by: the cascade of the test grid's lookahead pair. */
 #define DFN_TEST_LOOKAHEAD_FRAMES (DFN2_MASK_LOOKAHEAD + DFN2_DF_LOOKAHEAD)
 
-#if DFN2_DF_RING > DFN2_MAX_DF_RING
-#error "this lookahead pair needs a deeper ring than the library capacity: pass -DDFN2_MAX_DF_RING=<DFN2_DF_RING> on every translation unit"
-#endif
+/* A complete spec for one table row: every field is named, so none can stay zero. */
+static inline DFN2GridSpec dfn_test_spec(int sample_rate, int n_fft, int n_erb, int df_bins,
+                                         int mask_lookahead, int df_lookahead)
+{
+    DFN2GridSpec spec = {
+        .sample_rate          = sample_rate,
+        .n_fft                = n_fft,
+        .n_erb                = n_erb,
+        .df_bins              = df_bins,
+        .df_order             = DFN_TEST_DF_ORDER,
+        .mask_lookahead       = mask_lookahead,
+        .df_lookahead         = df_lookahead,
+        .frames_per_call      = DFN_TEST_FRAMES_PER_CALL,
+        .erb_norm_tau_sec     = DFN_TEST_ERB_NORM_TAU_SEC,
+        .erb_norm_init_lo_db  = DFN_TEST_ERB_NORM_INIT_LO_DB,
+        .erb_norm_init_hi_db  = DFN_TEST_ERB_NORM_INIT_HI_DB,
+        .erb_norm_scale_db    = DFN_TEST_ERB_NORM_SCALE_DB,
+        .spec_norm_tau_sec    = DFN_TEST_SPEC_NORM_TAU_SEC,
+        .spec_norm_init_lo    = DFN_TEST_SPEC_NORM_INIT_LO,
+        .spec_norm_init_hi    = DFN_TEST_SPEC_NORM_INIT_HI,
+    };
+    return spec;
+}
+
+/* The spec that makes `grid` again, every field copied from it. */
+static inline DFN2GridSpec dfn_test_spec_of(const DFN2Grid *grid)
+{
+    DFN2GridSpec spec = {
+        .sample_rate          = grid->sample_rate,
+        .n_fft                = grid->n_fft,
+        .n_erb                = grid->n_erb,
+        .df_bins              = grid->df_bins,
+        .df_order             = grid->df_order,
+        .mask_lookahead       = grid->mask_lookahead,
+        .df_lookahead         = grid->df_lookahead,
+        .frames_per_call      = grid->frames_per_call,
+        .erb_norm_tau_sec     = grid->erb_norm_tau_sec,
+        .erb_norm_init_lo_db  = grid->erb_norm_init_lo_db,
+        .erb_norm_init_hi_db  = grid->erb_norm_init_hi_db,
+        .erb_norm_scale_db    = grid->erb_norm_scale_db,
+        .spec_norm_tau_sec    = grid->spec_norm_tau_sec,
+        .spec_norm_init_lo    = grid->spec_norm_init_lo,
+        .spec_norm_init_hi    = grid->spec_norm_init_hi,
+    };
+    return spec;
+}
+
+/* 1 when the table's static buffers hold `grid`'s spectra and matrices. */
+static inline int dfn_test_table_fits(const DFN2Grid *grid)
+{
+    return grid->n_bins <= DFN_TEST_TABLE_MAX_BINS && grid->n_erb <= DFN_TEST_TABLE_MAX_ERB;
+}
 
 /* The grid of this program as the library's value; built once, aborts on a grid the library
  * refuses (the test would be running something else). */
@@ -104,8 +157,9 @@ static inline const DFN2Grid *dfn_test_grid(void)
     static DFN2Grid grid;
     static int ready;
     if (!ready) {
-        int status = dfn2_grid_make(&grid, DFN2_SR, DFN2_N_FFT, DFN2_N_ERB, DFN2_DF_BINS,
-                                    DFN2_MASK_LOOKAHEAD, DFN2_DF_LOOKAHEAD);
+        DFN2GridSpec spec = dfn_test_spec(DFN2_SR, DFN2_N_FFT, DFN2_N_ERB, DFN2_DF_BINS,
+                                          DFN2_MASK_LOOKAHEAD, DFN2_DF_LOOKAHEAD);
+        int status = dfn2_grid_make(&grid, &spec);
         if (status != DFN2_GRID_OK) {
             fprintf(stderr, "dfn_test_grid: %s\n", dfn2_grid_status_text(status));
             exit(2);

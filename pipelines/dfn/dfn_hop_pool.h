@@ -88,7 +88,7 @@ static inline int dfn_hop_pool_build(const DfnHopPoolPlan* p, unsigned char* cur
         *stage = dfn_res_stage_init(cur, p->stage_bytes, &p->stage_cfg);
         cur += ALIGN16(p->stage_bytes);
         if (!*stage) return -1;
-        ac_stft_config_default(&scfg, grid->n_fft);
+        ac_stft_config_default(&scfg, grid->n_fft);   /* scales stay 1: the stage applies the grid's */
         *istft = ac_istft_init(cur, p->istft_bytes, &scfg);
         cur += ALIGN16(p->istft_bytes);
         if (!*istft) return -1;

@@ -36,21 +36,10 @@ def pair_config(directory, pair):
     return str(path)
 
 
-#: State-ring depth the DFN2 library holds by default (``DFN2_MAX_DF_RING``,
-#: ``dfn2_grid.h``); a pair whose ring is deeper raises it on every unit.
-DEFAULT_RING = 5
-
-
 def pair_defines(pair):
     """``-D`` overrides selecting `pair`; none for the shipped pair, so its
     build is the default one.  The shims read the pair from the test header
-    ``dfn/tests/dfn_test_grid.h`` and hand it to the library as a run-time grid;
-    a pair whose state ring (``pair_geometry``) is deeper than the library's
-    default capacity also raises ``DFN2_MAX_DF_RING``."""
+    ``dfn/tests/dfn_test_grid.h`` and hand it to the library as a run-time grid."""
     if tuple(pair) == SHIPPED:
         return []
-    defines = ['DFN2_MASK_LOOKAHEAD=%d' % pair[0], 'DFN2_DF_LOOKAHEAD=%d' % pair[1]]
-    ring = dfn2_stage.pair_geometry(*pair)[1]
-    if ring > DEFAULT_RING:
-        defines.append('DFN2_MAX_DF_RING=%d' % ring)
-    return defines
+    return ['DFN2_MASK_LOOKAHEAD=%d' % pair[0], 'DFN2_DF_LOOKAHEAD=%d' % pair[1]]

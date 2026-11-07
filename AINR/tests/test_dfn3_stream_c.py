@@ -1,16 +1,17 @@
-"""DFN3 restored C public lifecycle and Python feature/compose parity.
+"""DFN3 C public lifecycle and Python feature/compose parity.
 
-Each test runs for both scalar and SIMD builds and for every (mask_lookahead,
-df_lookahead) pair in ``dfn_pairs.c_build_pairs``: the pair is a build-time
-constant of the C host, so each one is its own compile (-DDFN3_MASK_LOOKAHEAD,
--DDFN3_DF_LOOKAHEAD; the shipped pair is the build with no override). The
-shared library (process + model I/O) proves the DSP remains independently
-linkable; the separate executable exercises its public pool/accelerator
-boundary and shared audiolib framing. Compiler flags are the Makefile's.
+Each test runs for both scalar and SIMD builds. The lookahead pair is a run-time
+field of the grid, so one shared library (process + model I/O behind a thin
+wrapper) serves every pair per SIMD setting, and its grid is built from
+``config.ini`` here. The stream driver ``test_dfn3_stream.c`` takes the pair as a
+compile-time preset (-DDFN3_MASK_LOOKAHEAD, -DDFN3_DF_LOOKAHEAD; the shipped pair is
+also its default), so it is one compile per pair in ``dfn_pairs.c_build_pairs``: it
+exercises the public pool/accelerator boundary and audiolib framing. Compiler flags
+are the Makefile's.
 """
 import configparser
 import ctypes
-from pathlib import Path
+import re
 import subprocess
 import sys
 
@@ -35,48 +36,169 @@ from AINR.DeepFilterNet3 import train as dfn_train  # noqa: E402
 _WRAPPER = r'''
 #include <stdlib.h>
 #include <string.h>
-#include "DeepFilterNet3/dfn3_model_io.h"
-void *parity_create(const float *fwd, const float *inv) {
-    DFN3State *s = calloc(1, sizeof(*s));
-    if (!s) return NULL;
-    dfn3_state_init(s, NULL, NULL);
-    dfn3_set_erb_matrices(s, fwd, inv);
+#include "DeepFilterNet3/dfn3_prepost.h"
+
+typedef struct { DFN3Grid grid; DFN3State state; void *block; } ParityState;
+typedef struct { DFN3Grid grid; DFN3ModelIOState io; void *block; } ParityIo;
+
+size_t parity_sizeof_spec(void) { return sizeof(DFN3GridSpec); }
+int parity_grid_status(const DFN3GridSpec *spec) {
+    DFN3Grid grid;
+    return dfn3_grid_make(&grid, spec);
+}
+void *parity_create(const DFN3GridSpec *spec, const float *fwd, const float *inv) {
+    ParityState *s = calloc(1, sizeof(*s));
+    size_t bytes;
+    if (!s || dfn3_grid_make(&s->grid, spec) != DFN3_GRID_OK) { free(s); return NULL; }
+    bytes = dfn3_state_mem_size(&s->grid);
+    s->block = aligned_alloc(16u, bytes);
+    if (!s->block || dfn3_state_init(&s->state, s->block, bytes, &s->grid) != 0) {
+        free(s->block); free(s); return NULL;
+    }
+    dfn3_set_erb_matrices(&s->state, fwd, inv);
     return s;
 }
-void parity_destroy(void *s) { free(s); }
-void parity_features(void *s, const float *re, const float *im,
-                     float *erb, float *spec) {
-    dfn3_compute_features(s, re, im, erb, spec);
+void parity_destroy(void *p) {
+    ParityState *s = p;
+    if (s) { free(s->block); free(s); }
 }
-int parity_compose(void *s, const float *re, const float *im,
+void parity_features(void *p, const float *re, const float *im,
+                     float *erb, float *spec) {
+    dfn3_compute_features(&((ParityState *)p)->state, re, im, erb, spec);
+}
+int parity_compose(void *p, const float *re, const float *im,
                    const float *mask, const float *coefs,
                    float *out_re, float *out_im) {
-    return dfn3_compose(s, re, im, mask, coefs, out_re, out_im);
+    return dfn3_enhance_spectrum(&((ParityState *)p)->state, re, im, mask, coefs, out_re, out_im);
 }
-void *parity_io_create(void) {
-    DFN3ModelIOState *io = calloc(1, sizeof(*io));
-    if (io) dfn3_model_io_reset(io);
-    return io;
+void *parity_io_create(const DFN3GridSpec *spec) {
+    ParityIo *s = calloc(1, sizeof(*s));
+    size_t bytes;
+    if (!s || dfn3_grid_make(&s->grid, spec) != DFN3_GRID_OK) { free(s); return NULL; }
+    bytes = dfn3_model_io_mem_size(&s->grid);
+    s->block = aligned_alloc(16u, bytes);
+    if (!s->block || dfn3_model_io_init(&s->io, s->block, bytes, &s->grid,
+                                        NULL, 0, NULL, 0) != 0) {
+        free(s->block); free(s); return NULL;
+    }
+    return s;
 }
-int parity_io_push(void *io, const float *erb, const float *spec) {
-    return dfn3_model_io_push_features(io, erb, (const float (*)[DFN3_DF_BINS])spec);
+void parity_io_destroy(void *p) {
+    ParityIo *s = p;
+    if (s) { free(s->block); free(s); }
 }
-void parity_io_window(void *io, float *erb_window, float *spec_window) {
-    DFN3ModelIOState *state = io;
-    memcpy(erb_window, state->erb_window, sizeof(state->erb_window));
-    memcpy(spec_window, state->spec_window, sizeof(state->spec_window));
+int parity_io_push(void *p, const float *erb, const float *spec) {
+    return dfn3_model_io_push_features(&((ParityIo *)p)->io, erb, spec);
 }
-int parity_stream(void *s, const float *re, const float *im, int valid,
+void parity_io_window(void *p, float *erb_window, float *spec_window) {
+    ParityIo *s = p;
+    memcpy(erb_window, s->io.erb_window,
+           dfn3_prepost_erb_window_elements(&s->grid) * sizeof(float));
+    memcpy(spec_window, s->io.spec_window,
+           dfn3_prepost_spec_window_elements(&s->grid) * sizeof(float));
+}
+int parity_stream(void *p, const float *re, const float *im, int valid,
                   const float *mask, const float *coefs, float limit,
                   float *out_re, float *out_im, long long *index) {
-    return dfn3_compose_stream(s, re, im, valid, mask, coefs, limit,
-                               out_re, out_im, index);
+    return dfn3_enhance_spectrum_stream(&((ParityState *)p)->state, re, im, valid, mask, coefs,
+                                        limit, out_re, out_im, index);
 }
 '''
 
 
+class _GridSpec(ctypes.Structure):
+    """DFN3GridSpec, field for field."""
+    _fields_ = [('sample_rate', ctypes.c_int), ('n_fft', ctypes.c_int),
+                ('n_erb', ctypes.c_int), ('df_bins', ctypes.c_int),
+                ('df_order', ctypes.c_int), ('mask_lookahead', ctypes.c_int),
+                ('df_lookahead', ctypes.c_int),
+                ('erb_norm_tau_sec', ctypes.c_float),
+                ('erb_norm_init_lo_db', ctypes.c_float),
+                ('erb_norm_init_hi_db', ctypes.c_float),
+                ('erb_norm_scale_db', ctypes.c_float),
+                ('spec_norm_tau_sec', ctypes.c_float),
+                ('spec_norm_init_lo', ctypes.c_float),
+                ('spec_norm_init_hi', ctypes.c_float)]
+
+
+def _grid_spec(pair):
+    """The shipped model's grid from config.ini, with ``pair`` as its lookahead."""
+    cfg = configparser.ConfigParser()
+    cfg.read(DFN / 'config.ini')
+    sr = cfg.getint('signal', 'sr')
+    model = dfn_train.read_model_config(cfg)
+    feature = dfn_train.read_feature_config(cfg, sr, cfg.getint('signal', 'hop_len'))
+    # The tests below size their arrays for this grid.
+    assert (cfg.getint('signal', 'n_fft'), model['n_erb'], model['df_bins'],
+            model['df_order']) == (1024, 32, 96, 5)
+    return _GridSpec(
+        sample_rate=sr, n_fft=cfg.getint('signal', 'n_fft'),
+        n_erb=model['n_erb'], df_bins=model['df_bins'],
+        df_order=model['df_order'], mask_lookahead=pair[0],
+        df_lookahead=pair[1], erb_norm_tau_sec=feature['erb_tau_sec'],
+        erb_norm_init_lo_db=feature['erb_init_lo_db'],
+        erb_norm_init_hi_db=feature['erb_init_hi_db'],
+        erb_norm_scale_db=feature['erb_scale_db'],
+        spec_norm_tau_sec=feature['spec_tau_sec'],
+        spec_norm_init_lo=feature['spec_init_lo'],
+        spec_norm_init_hi=feature['spec_init_hi'])
+
+
 def _fp(array):
     return array.ctypes.data_as(ctypes.POINTER(ctypes.c_float))
+
+
+def _pair_flags(pair):
+    """The compile-time lookahead preset of test_dfn3_stream.c."""
+    return [f'-DDFN3_MASK_LOOKAHEAD={pair[0]}', f'-DDFN3_DF_LOOKAHEAD={pair[1]}']
+
+
+_LIBRARIES = {}
+
+
+def _wrapper_library(simd, tmp_path_factory):
+    """The wrapper library, built once per SIMD setting: the pair is an argument
+    of its grid, not of the build."""
+    if simd in _LIBRARIES:
+        return _LIBRARIES[simd]
+    archive = dfn_pairs.audio_common_lib(simd)
+    work = tmp_path_factory.mktemp(f'dfn3_wrapper_{simd}')
+    wrapper = work / 'wrapper.c'
+    wrapper.write_text(_WRAPPER)
+    library = work / ('dfn3.dylib' if sys.platform == 'darwin' else 'dfn3.so')
+    subprocess.run(['cc', *dfn_pairs.house_cflags(simd),
+                    '-dynamiclib' if sys.platform == 'darwin' else '-shared',
+                    '-fPIC', str(wrapper), str(DFN / 'dfn3_process.c'),
+                    str(DFN / 'dfn3_model_io.c'), archive, '-lm',
+                    '-o', str(library)],
+                   check=True, capture_output=True)
+    lib = ctypes.CDLL(str(library))
+    fp = ctypes.POINTER(ctypes.c_float)
+    spec = ctypes.POINTER(_GridSpec)
+    vp = ctypes.c_void_p
+    lib.parity_sizeof_spec.restype = ctypes.c_size_t
+    lib.parity_grid_status.argtypes = [spec]
+    lib.parity_grid_status.restype = ctypes.c_int
+    lib.parity_create.argtypes = [spec, fp, fp]
+    lib.parity_create.restype = vp
+    lib.parity_destroy.argtypes = [vp]
+    lib.parity_features.argtypes = [vp, fp, fp, fp, fp]
+    lib.parity_compose.argtypes = [vp, fp, fp, fp, fp, fp, fp]
+    lib.parity_compose.restype = ctypes.c_int
+    lib.parity_stream.argtypes = [vp, fp, fp, ctypes.c_int, fp, fp,
+                                  ctypes.c_float, fp, fp,
+                                  ctypes.POINTER(ctypes.c_longlong)]
+    lib.parity_stream.restype = ctypes.c_int
+    lib.parity_io_create.argtypes = [spec]
+    lib.parity_io_create.restype = vp
+    lib.parity_io_destroy.argtypes = [vp]
+    lib.parity_io_push.argtypes = [vp, fp, fp]
+    lib.parity_io_push.restype = ctypes.c_int
+    lib.parity_io_window.argtypes = [vp, fp, fp]
+    # A field-order slip in the ctypes mirror would be silent undefined behaviour.
+    assert ctypes.sizeof(_GridSpec) == lib.parity_sizeof_spec()
+    _LIBRARIES[simd] = lib
+    return lib
 
 
 @pytest.fixture(scope='module', params=[
@@ -90,37 +212,14 @@ def c_dfn3(request, tmp_path_factory):
     simd, pair = request.param
     archive = dfn_pairs.audio_common_lib(simd)
     work = tmp_path_factory.mktemp(f'dfn3_c_{simd}_{pair[0]}{pair[1]}')
-    flags = ['cc', *dfn_pairs.house_cflags(simd), *dfn_pairs.defines(FAMILY, pair)]
+    flags = ['cc', *dfn_pairs.house_cflags(simd), *_pair_flags(pair)]
     driver = work / 'dfn3_stream'
     subprocess.run(flags + [str(AINR / 'tests/test_dfn3_stream.c')]
                    + [str(dfn_pairs.source_path(FAMILY, kind)) for kind in
                       ('process', 'model_io', 'prepost')]
                    + [archive, '-lm', '-o', str(driver)],
                    check=True, capture_output=True)
-    wrapper = work / 'wrapper.c'
-    wrapper.write_text(_WRAPPER)
-    library = work / ('dfn3.dylib' if sys.platform == 'darwin' else 'dfn3.so')
-    subprocess.run(flags + ['-dynamiclib' if sys.platform == 'darwin' else '-shared',
-                            '-fPIC', str(wrapper), str(DFN / 'dfn3_process.c'),
-                            str(DFN / 'dfn3_model_io.c'), archive, '-lm', '-o', str(library)],
-                   check=True, capture_output=True)
-    lib = ctypes.CDLL(str(library))
-    fp = ctypes.POINTER(ctypes.c_float)
-    lib.parity_create.argtypes = [fp, fp]
-    lib.parity_create.restype = ctypes.c_void_p
-    lib.parity_destroy.argtypes = [ctypes.c_void_p]
-    lib.parity_features.argtypes = [ctypes.c_void_p, fp, fp, fp, fp]
-    lib.parity_compose.argtypes = [ctypes.c_void_p, fp, fp, fp, fp, fp, fp]
-    lib.parity_compose.restype = ctypes.c_int
-    lib.parity_stream.argtypes = [ctypes.c_void_p, fp, fp, ctypes.c_int,
-                                  fp, fp, ctypes.c_float, fp, fp,
-                                  ctypes.POINTER(ctypes.c_longlong)]
-    lib.parity_stream.restype = ctypes.c_int
-    lib.parity_io_create.restype = ctypes.c_void_p
-    lib.parity_io_push.argtypes = [ctypes.c_void_p, fp, fp]
-    lib.parity_io_push.restype = ctypes.c_int
-    lib.parity_io_window.argtypes = [ctypes.c_void_p, fp, fp]
-    return lib, driver, pair
+    return _wrapper_library(simd, tmp_path_factory), driver, pair
 
 
 def test_dfn3_c_public_stream_contract(c_dfn3):
@@ -148,7 +247,7 @@ def test_c_feature_windows_equal_the_exporters_windows(c_dfn3):
     wanted = list(zip(
         dfn_export.feature_windows(torch.from_numpy(erb), mask),
         dfn_export.feature_windows(torch.from_numpy(spec), mask)))
-    io = lib.parity_io_create()
+    io = lib.parity_io_create(ctypes.byref(_grid_spec(c_dfn3[2])))
     assert io
     try:
         seen = []
@@ -164,26 +263,37 @@ def test_c_feature_windows_equal_the_exporters_windows(c_dfn3):
                 lib.parity_io_window(io, _fp(got_erb), _fp(got_spec))
                 seen.append((got_erb, got_spec))
     finally:
-        lib.parity_destroy(io)
+        lib.parity_io_destroy(io)
     assert len(seen) == len(wanted) == frames
     for t, ((got_erb, got_spec), (want_erb, want_spec)) in enumerate(zip(seen, wanted)):
         assert np.array_equal(got_erb, want_erb[0, 0].numpy()), t
         assert np.array_equal(got_spec, want_spec[0].numpy()), t
 
 
-@pytest.mark.parametrize('std', ['c11', 'gnu99'])
-@pytest.mark.parametrize('pair', [(3, 0), (3, 3), (-1, 0), (0, -1), (1, 5),
-                                  (2, 5)])
-def test_dfn3_header_refuses_pairs_the_trainer_would_not_accept(
-        tmp_path, pair, std):
+def _grid_status_codes():
+    """``{'OK': 0, 'ERR_MASK_LOOKAHEAD': -7, ...}`` read from the library's own
+    ``DFN3_GRID_*`` enum, so a test names a refusal instead of a number."""
+    text = (DFN / 'dfn3_process.h').read_text()
+    codes = {name: int(value) for name, value in re.findall(
+        r'DFN3_GRID_(\w+)\s*=\s*(-?\d+)', text)}
+    assert {'OK', 'ERR_MASK_LOOKAHEAD', 'ERR_DF_LOOKAHEAD'} <= set(codes), codes
+    return codes
+
+
+@pytest.mark.parametrize('pair, reason', [
+    ((3, 0), 'ERR_MASK_LOOKAHEAD'), ((3, 3), 'ERR_MASK_LOOKAHEAD'),
+    ((-1, 0), 'ERR_MASK_LOOKAHEAD'), ((0, -1), 'ERR_DF_LOOKAHEAD'),
+    ((1, 5), 'ERR_DF_LOOKAHEAD'), ((2, 5), 'ERR_DF_LOOKAHEAD')])
+def test_dfn3_grid_refuses_pairs_the_trainer_would_not_accept(
+        tmp_path_factory, pair, reason):
     if dfn_pairs.require_toolchain():
         pytest.skip('C compiler unavailable')
-    refused = dfn_pairs.header_compiles(FAMILY, pair, std, tmp_path)
-    assert refused.returncode != 0
-    assert 'DFN3_' in refused.stderr and 'LOOKAHEAD must be' in refused.stderr
-    # The same translation unit accepts the shipped pair.
-    assert dfn_pairs.header_compiles(
-        FAMILY, SHIPPED_PAIR, std, tmp_path).returncode == 0
+    lib = _wrapper_library(1, tmp_path_factory)
+    codes = _grid_status_codes()
+    assert lib.parity_grid_status(ctypes.byref(_grid_spec(pair))) == codes[reason]
+    # The same grid accepts the shipped pair.
+    assert lib.parity_grid_status(
+        ctypes.byref(_grid_spec(SHIPPED_PAIR))) == codes['OK']
 
 
 @pytest.mark.parametrize('atten_lim', [0.0, -20.0])
@@ -204,7 +314,8 @@ def test_dfn3_features_and_stream_compose_match_python(c_dfn3, atten_lim):
                              torch.from_numpy(imag.T)[None])
     _, py_erb, py_spec, _ = dfn_train.extract_dfn3_features(
         spectrum, erb_fb, 96, feature_cfg)
-    state = lib.parity_create(_fp(fwd), _fp(inv))
+    spec = _grid_spec(c_dfn3[2])
+    state = lib.parity_create(ctypes.byref(spec), _fp(fwd), _fp(inv))
     assert state
     try:
         c_erb = np.empty((frames, 32), np.float32)
@@ -234,7 +345,7 @@ def test_dfn3_features_and_stream_compose_match_python(c_dfn3, atten_lim):
             expected = spectrum[0] * mix + expected * (1 - mix)
     masks = masks[0, 0].numpy().copy()
     coefficients = coefficients[0].numpy().copy()
-    state = lib.parity_create(_fp(fwd), _fp(inv))
+    state = lib.parity_create(ctypes.byref(spec), _fp(fwd), _fp(inv))
     assert state
     zero = np.zeros(513, np.float32)
     flush_mask = np.ones(32, np.float32)
@@ -291,7 +402,8 @@ def test_dfn3_aligned_compose_matches_python(c_dfn3):
                                  torch.from_numpy(coefficients)[None])[0]
     fwd = np.ascontiguousarray(model.erb_fb.T.numpy())
     inv = np.ascontiguousarray(model.erb_inv.numpy())
-    state = lib.parity_create(_fp(fwd), _fp(inv))
+    state = lib.parity_create(ctypes.byref(_grid_spec(c_dfn3[2])), _fp(fwd), _fp(inv))
+    assert state
     output = []
     try:
         for t in range(frames):
@@ -324,7 +436,7 @@ def pool_drivers(tmp_path_factory):
         driver = work / 'dfn3_stream'
         subprocess.run(
             ['cc', *dfn_pairs.house_cflags(1),
-             *dfn_pairs.defines(FAMILY, pair),
+             *_pair_flags(pair),
              str(AINR / 'tests/test_dfn3_stream.c'),
              *[str(dfn_pairs.source_path(FAMILY, kind))
                for kind in ('process', 'model_io', 'prepost')],

@@ -43,40 +43,17 @@ COMMON_DIR ?= ../../../audiolib/common
 ULCNET_DIR ?= $(ALG_DIR)/AIAEC/Align_ULCNet
 DFN2_DIR ?= $(ALG_DIR)/AINR/DeepFilterNet2
 
-# Align-ULCNet deployment grid, same knob and same values as pipelines/
-# Makefile. One binary serves one grid (the C structs embed the STFT/WOLA
-# tables and scratch), so it is a build parameter. Kept out of EXTRA_CFLAGS
-# on purpose: that is forwarded verbatim to the AEC/NR/common/spatial
-# producer sub-makes, none of which contain ULCNet code, and would split
-# their object caches for nothing. Applied only to the ULCNet TUs below and
-# folded into CFG_SIG_PAYLOAD so the two grids never share an object dir.
-ULCNET_GRID ?= 16k
-ifeq ($(ULCNET_GRID),16k)
-ULCNET_GRID_CFLAGS = -DULCNET_MODEL_IO_SR=16000 -DULCNET_MODEL_IO_N_FFT=512
-else ifeq ($(ULCNET_GRID),48k)
-ULCNET_GRID_CFLAGS = -DULCNET_MODEL_IO_SR=48000 -DULCNET_MODEL_IO_N_FFT=1024
-else
-$(error ULCNET_GRID must be 16k or 48k, got '$(ULCNET_GRID)')
-endif
-
 # DeepFilterNet2 lookahead pair, same knobs and rules as pipelines/Makefile. The DFN2 stage, the
-# bridge and the example main take their grid at run time (the config carries a DFN2Grid), so the
-# pair only selects what the test program runs: -DDFN2_MASK_LOOKAHEAD / -DDFN2_DF_LOOKAHEAD for the
-# test unit alone (DFN_TEST_CFLAGS, folded into CFG_SIG_PAYLOAD). A pair whose state ring
-# max(5, mask + df + 1) is deeper than the library's default capacity of 5 frames (1/4 and 2/3: 6,
-# 2/4: 7) also gets -DDFN2_MAX_DF_RING=<ring> on every unit compiled here, because the library takes
-# a capacity on every translation unit (dfn2_grid.h). (No DFN3 unit is compiled here.)
+# bridge and the example main take their grid and pair at run time (the config carries a DFN2Grid),
+# so the pair only selects what the test program runs: -DDFN2_MASK_LOOKAHEAD / -DDFN2_DF_LOOKAHEAD
+# for the test unit alone (DFN_TEST_CFLAGS, folded into CFG_SIG_PAYLOAD). No DFN3 unit is compiled
+# here.
 DFN2_MASK_LOOKAHEAD ?= 1
 DFN2_DF_LOOKAHEAD ?= 1
 $(if $(filter-out 1,$(words $(DFN2_MASK_LOOKAHEAD)))$(filter-out 0 1 2,$(DFN2_MASK_LOOKAHEAD)),\
   $(error DFN2_MASK_LOOKAHEAD must be 0, 1 or 2, got '$(DFN2_MASK_LOOKAHEAD)'))
 $(if $(filter-out 1,$(words $(DFN2_DF_LOOKAHEAD)))$(filter-out 0 1 2 3 4,$(DFN2_DF_LOOKAHEAD)),\
-  $(error DFN2_DF_LOOKAHEAD must be 0..4 (DF_ORDER - 1), got '$(DFN2_DF_LOOKAHEAD)'))
-DFN_PAIR_CFLAGS :=
-DFN2_PAIR_RING := $(if $(filter 2/4,$(DFN2_MASK_LOOKAHEAD)/$(DFN2_DF_LOOKAHEAD)),7,$(if $(filter 1/4 2/3,$(DFN2_MASK_LOOKAHEAD)/$(DFN2_DF_LOOKAHEAD)),6))
-ifneq ($(DFN2_PAIR_RING),)
-DFN_PAIR_CFLAGS += -DDFN2_MAX_DF_RING=$(DFN2_PAIR_RING)
-endif
+  $(error DFN2_DF_LOOKAHEAD must be 0..4 (the deep filter has 5 taps), got '$(DFN2_DF_LOOKAHEAD)'))
 DFN_TEST_CFLAGS :=
 ifneq ($(DFN2_MASK_LOOKAHEAD)/$(DFN2_DF_LOOKAHEAD),1/1)
 DFN_TEST_CFLAGS += -DDFN2_MASK_LOOKAHEAD=$(DFN2_MASK_LOOKAHEAD) -DDFN2_DF_LOOKAHEAD=$(DFN2_DF_LOOKAHEAD)
@@ -189,9 +166,6 @@ override CFLAGS := -Wall -Wextra $(OPT_CFLAGS) -std=gnu99 \
           $(CPPFLAGS) $(EXTRA_CFLAGS) $(SIMD_CFLAGS) $(PROFILE_CFLAGS) \
           -DAUDIO_PIPELINE_BACKEND_STR=\"$(BACKEND)\" \
           $(WERROR_CFLAGS) -ffp-contract=off -fno-math-errno
-ifneq ($(DFN_PAIR_CFLAGS),)
-override CFLAGS += $(DFN_PAIR_CFLAGS)
-endif
 LIB_CFLAGS := $(CFLAGS)
 
 LINK := $(CXX)
@@ -309,7 +283,7 @@ SRCS := mcab.c mcab_sample_flow.c mcab_sample_beam.c \
 # The same CC command can select a different SDK through PATH.
 # Include effective pointer/FP/ISA predefines to avoid cross-ABI cache reuse.
 override CC_TARGET_SIG := $(shell sh $(COMMON_DIR)/scripts/target_abi_signature.sh $(CC) $(CPPFLAGS) $(CFLAGS))
-CFG_SIG_PAYLOAD := CC_TARGET_SIG=$(CC_TARGET_SIG) ULCNET_GRID=$(ULCNET_GRID) DFN2_LOOKAHEAD=$(DFN2_MASK_LOOKAHEAD)/$(DFN2_DF_LOOKAHEAD) DFN_TEST_CFLAGS=$(DFN_TEST_CFLAGS) CC=$(CC) CXX=$(CXX) AR=$(AR) RANLIB=$(RANLIB) LINK=$(LINK) CFLAGS=$(CFLAGS) CXXFLAGS=$(CXXFLAGS) LDFLAGS=$(LDLIBS) BACKEND=$(BACKEND) SIMD=$(SIMD) WERROR=$(WERROR) NO_STDIO=$(NO_STDIO) DEBUG=$(DEBUG) TOOLCHAIN_CHECK=$(TOOLCHAIN_CHECK) $(PRODUCER_SIGS) SRCS=$(sort $(SRCS))
+CFG_SIG_PAYLOAD := CC_TARGET_SIG=$(CC_TARGET_SIG) DFN2_LOOKAHEAD=$(DFN2_MASK_LOOKAHEAD)/$(DFN2_DF_LOOKAHEAD) DFN_TEST_CFLAGS=$(DFN_TEST_CFLAGS) CC=$(CC) CXX=$(CXX) AR=$(AR) RANLIB=$(RANLIB) LINK=$(LINK) CFLAGS=$(CFLAGS) CXXFLAGS=$(CXXFLAGS) LDFLAGS=$(LDLIBS) BACKEND=$(BACKEND) SIMD=$(SIMD) WERROR=$(WERROR) NO_STDIO=$(NO_STDIO) DEBUG=$(DEBUG) TOOLCHAIN_CHECK=$(TOOLCHAIN_CHECK) $(PRODUCER_SIGS) SRCS=$(sort $(SRCS))
 CFG_SIG := $(shell printf '%s' "$(CFG_SIG_PAYLOAD)" | cksum | cut -d' ' -f1)
 
 OBJ_ROOT ?= obj
@@ -391,28 +365,28 @@ $(OBJ_DIR)/4ch_aec_bf_dfn_res_main.o: ../dfn/4ch_aec_bf_dfn_res/main.c mcab_samp
 # ../ulcnet/4ch_alignulcnet/main.c and its tests/test_4ch_ulcnet.c compose the unit with the
 # ULCNet NN stage example.
 $(OBJ_DIR)/ulcnet_nn_stage.o: ../ulcnet/ulcnet_nn_stage.c ../ulcnet/ulcnet_nn_stage.h $(ULCNET_DIR)/ulcnet_process.h | _cfg_guard
-	$(CC) $(CFLAGS) -I$(ULCNET_DIR) $(ULCNET_GRID_CFLAGS) -MD -MP -c -o $@ $<
+	$(CC) $(CFLAGS) -I$(ULCNET_DIR) -MD -MP -c -o $@ $<
 
 $(OBJ_DIR)/ulcnet_process.o: $(ULCNET_DIR)/ulcnet_process.c $(ULCNET_DIR)/ulcnet_process.h | _cfg_guard
-	$(CC) $(LIB_CFLAGS) -I$(ULCNET_DIR) $(ULCNET_GRID_CFLAGS) -MD -MP -c -o $@ $<
+	$(CC) $(LIB_CFLAGS) -I$(ULCNET_DIR) -MD -MP -c -o $@ $<
 
 $(OBJ_DIR)/ulcnet_model_io.o: $(ULCNET_DIR)/ulcnet_model_io.c $(ULCNET_DIR)/ulcnet_model_io.h | _cfg_guard
-	$(CC) $(LIB_CFLAGS) -I$(ULCNET_DIR) $(ULCNET_GRID_CFLAGS) -MD -MP -c -o $@ $<
+	$(CC) $(LIB_CFLAGS) -I$(ULCNET_DIR) -MD -MP -c -o $@ $<
 
 # ulcnet_prepost.o: the AIAEC-owned pre/post class the accelerator adapter
 # drives (the same third TU pipelines/Makefile links for the mono
 # application). Anything linking the adapter links this with it.
 $(OBJ_DIR)/ulcnet_prepost.o: $(ULCNET_DIR)/ulcnet_prepost.c $(ULCNET_DIR)/ulcnet_prepost.h $(ULCNET_DIR)/ulcnet_process.h $(ULCNET_DIR)/ulcnet_model_io.h | _cfg_guard
-	$(CC) $(LIB_CFLAGS) -I$(ULCNET_DIR) $(ULCNET_GRID_CFLAGS) -MD -MP -c -o $@ $<
+	$(CC) $(LIB_CFLAGS) -I$(ULCNET_DIR) -MD -MP -c -o $@ $<
 
 $(OBJ_DIR)/ulcnet_accelerator_adapter.o: $(ULCNET_DIR)/ulcnet_accelerator_adapter.c $(ULCNET_DIR)/ulcnet_accelerator_adapter.h $(ULCNET_DIR)/ulcnet_prepost.h $(ULCNET_DIR)/ulcnet_model_io.h $(ULCNET_DIR)/ulcnet_process.h | _cfg_guard
-	$(CC) $(LIB_CFLAGS) -I$(ULCNET_DIR) $(ULCNET_GRID_CFLAGS) -MD -MP -c -o $@ $<
+	$(CC) $(LIB_CFLAGS) -I$(ULCNET_DIR) -MD -MP -c -o $@ $<
 
 $(OBJ_DIR)/4ch_alignulcnet_main.o: ../ulcnet/4ch_alignulcnet/main.c mcab_sample_driver.h mcab.h mcab_sample_flow.h mcab_sample_beam.h ../ulcnet/ulcnet_nn_stage.h ../common/example_cli.h $(ULCNET_DIR)/ulcnet_accelerator_adapter.h | _cfg_guard
-	$(CC) $(CFLAGS) -I$(ULCNET_DIR) $(ULCNET_GRID_CFLAGS) -MD -MP -c -o $@ $<
+	$(CC) $(CFLAGS) -I$(ULCNET_DIR) -MD -MP -c -o $@ $<
 
 $(OBJ_DIR)/test_4ch_ulcnet.o: ../ulcnet/4ch_alignulcnet/tests/test_4ch_ulcnet.c mcab.h mcab_sample_flow.h mcab_sample_beam.h ../ulcnet/ulcnet_nn_stage.h $(ULCNET_DIR)/ulcnet_process.h | _cfg_guard
-	$(CC) $(CFLAGS) -I$(ULCNET_DIR) $(ULCNET_GRID_CFLAGS) -MD -MP -c -o $@ $<
+	$(CC) $(CFLAGS) -I$(ULCNET_DIR) -MD -MP -c -o $@ $<
 
 $(OBJ_DIR)/mcab_raw.o: mcab_raw.c mcab.h mcab_sample_flow.h mcab_sample_beam.h mcab_sample_driver.h mcab_sample_post.h | _cfg_guard
 	$(CC) $(CFLAGS) -MD -MP -c -o $@ $<
@@ -483,6 +457,7 @@ test: test-third-party test-mcab-sample-driver \
 	bash tests/test_cli_strict.sh "$(abspath $(BIN_DIR))"
 	"$(abspath $(BIN_DIR))/4ch_alignulcnet"
 	"$(abspath $(BIN_DIR))/4ch_alignulcnet" --delay-num-filters 1
+	"$(abspath $(BIN_DIR))/4ch_alignulcnet" --sample-rate 48000
 	"$(abspath $(BIN_DIR))/4ch_aec_bf_dfn_res"
 	"$(abspath $(BIN_DIR))/4ch_aec_bf_dfn_res" --delay-num-filters 1 --cng --atten-lim 12
 	"$(abspath $(BIN_DIR))/4ch_aec_bf_dfn_res" --sample-rate 48000
@@ -658,12 +633,3 @@ clean-all: clean
 	$(MAKE) -C $(COMMON_DIR) clean
 
 -include $(wildcard $(OBJ_DIR)/*.d)
-
-# test-grids: runs both Align-ULCNet deployment grids in one command (`test` only exercises the grid
-# ULCNET_GRID selects). ULCNET_GRID is in CFG_SIG, so each grid has its own obj/bin directory.
-# Defined outside the COMMON_LIB bootstrap conditionals: it needs no producer archive itself and each
-# recursive `test` bootstraps its own.
-.PHONY: test-grids
-test-grids:
-	$(MAKE) ULCNET_GRID=16k test
-	$(MAKE) ULCNET_GRID=48k test

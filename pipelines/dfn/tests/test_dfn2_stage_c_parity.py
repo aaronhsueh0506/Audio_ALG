@@ -1,10 +1,12 @@
 """The Python stage's compose and feature branches against the C they mirror.
 
 ``dfn2_stage.Dfn2Stage`` claims to be ``dfn2_compute_features`` (on A) plus
-``dfn2_compose_stream`` (on B) with the C's rounding sequence.  This drives the
+``dfn2_enhance_spectrum_stream`` (on B) with the C's rounding sequence.  This drives the
 real C functions from ``AINR/DeepFilterNet2/dfn2_process.c`` through a tiny
 shim and compares frame by frame with stand-in heads, so the comparison is
-about the arithmetic, not about a network.
+about the arithmetic, not about a network.  The shim builds its grid from the model numbers
+Python read out of ``config.ini`` (df_order and the [feature] values, passed in), so the
+test also shows the C derives the same normaliser alphas from them.
 
 * compose: bit-exact (``np.array_equal``) on every emitted frame -- the stage
   performs each multiply and add as its own float32 operation, in the C order;
@@ -40,19 +42,45 @@ _SHIM = r'''
 #include <stdlib.h>
 #include "dfn_test_grid.h"
 
-/* The grid is the test scaffolding's (dfn/tests/dfn_test_grid.h): the pair comes from the -D
- * overrides the build gives, the rest is the shipped 48 kHz grid. */
-void *stage_parity_create(const float *fwd, const float *inv) {
-    DFN2State *state = (DFN2State *)calloc(1, sizeof(*state));
-    if (!state) return NULL;
-    if (dfn2_state_init(state, dfn_test_grid(), NULL, NULL) != 0) {
+/* The grid is the test scaffolding's (dfn/tests/dfn_test_grid.h) for the signal geometry and the
+ * lookahead pair (the -D overrides the build gives); df_order and the seven normaliser values
+ * come from the caller, i.e. from config.ini. */
+void *stage_parity_create(const float *fwd, const float *inv, int df_order, const float *norm) {
+    DFN2GridSpec spec = dfn_test_spec(DFN2_SR, DFN2_N_FFT, DFN2_N_ERB, DFN2_DF_BINS,
+                                      DFN2_MASK_LOOKAHEAD, DFN2_DF_LOOKAHEAD);
+    DFN2Grid grid;
+    DFN2State *state;
+    void *block;
+    size_t bytes;
+    spec.df_order = df_order;
+    spec.erb_norm_tau_sec = norm[0];
+    spec.erb_norm_init_lo_db = norm[1];
+    spec.erb_norm_init_hi_db = norm[2];
+    spec.erb_norm_scale_db = norm[3];
+    spec.spec_norm_tau_sec = norm[4];
+    spec.spec_norm_init_lo = norm[5];
+    spec.spec_norm_init_hi = norm[6];
+    if (dfn2_grid_make(&grid, &spec) != DFN2_GRID_OK) return NULL;
+    bytes = dfn2_state_mem_size(&grid);
+    block = bytes ? aligned_alloc(16, bytes) : NULL;
+    state = (DFN2State *)calloc(1, sizeof(*state));
+    if (!block || !state || dfn2_state_init(state, block, bytes, &grid) != 0) {
+        free(block);
         free(state);
         return NULL;
     }
     dfn2_set_erb_matrices(state, fwd, inv);
     return state;
 }
-void stage_parity_destroy(void *state) { free(state); }
+void stage_parity_destroy(void *state) {
+    if (!state) return;
+    free(((DFN2State *)state)->block);
+    free(state);
+}
+void stage_parity_alphas(const void *state, float *erb, float *spec) {
+    *erb = ((const DFN2State *)state)->grid.erb_norm_alpha;
+    *spec = ((const DFN2State *)state)->grid.spec_norm_alpha;
+}
 void stage_parity_features(void *state, const float *re, const float *im,
                            float *erb, float *spec) {
     dfn2_compute_features((DFN2State *)state, re, im, erb, spec);
@@ -62,7 +90,7 @@ int stage_parity_compose_stream(void *state, const float *re, const float *im,
                                 const float *coefs, float alpha,
                                 float atten_lim_db, float *out_re,
                                 float *out_im, long long *frame) {
-    return dfn2_compose_stream((DFN2State *)state, re, im, heads_valid,
+    return dfn2_enhance_spectrum_stream((DFN2State *)state, re, im, heads_valid,
                                heads_valid ? mask : NULL,
                                heads_valid ? coefs : NULL, alpha,
                                atten_lim_db, out_re, out_im, frame);
@@ -91,9 +119,10 @@ def c_lib(pair, tmp_path_factory):
                      extra_includes=[DFN, ROOT / 'pipelines' / 'dfn' / 'tests'],
                      defines=pair_defines(pair))
     fp = ctypes.POINTER(ctypes.c_float)
-    lib.stage_parity_create.argtypes = [fp, fp]
+    lib.stage_parity_create.argtypes = [fp, fp, ctypes.c_int, fp]
     lib.stage_parity_create.restype = ctypes.c_void_p
     lib.stage_parity_destroy.argtypes = [ctypes.c_void_p]
+    lib.stage_parity_alphas.argtypes = [ctypes.c_void_p, fp, fp]
     lib.stage_parity_features.argtypes = [ctypes.c_void_p, fp, fp, fp, fp]
     lib.stage_parity_compose_stream.argtypes = [
         ctypes.c_void_p, fp, fp, ctypes.c_int, fp, fp, ctypes.c_float,
@@ -121,6 +150,21 @@ class ScriptedHeads:
         return mask, coefs, alpha
 
 
+def _create_state(c_lib, assets):
+    """(C state, ERB matrices) for the model numbers Python read from config.ini: df_order and the
+    [feature] values (time constants in seconds, linspace starts, ERB scale).  The state borrows
+    the matrices: the caller keeps them alive as long as the state."""
+    cfg = assets.feature_cfg
+    norm = np.array([cfg['erb_tau_sec'], cfg['erb_init_lo_db'], cfg['erb_init_hi_db'],
+                     cfg['erb_scale_db'], cfg['spec_tau_sec'], cfg['spec_init_lo'],
+                     cfg['spec_init_hi']], np.float32)
+    erb_fwd = np.ascontiguousarray(assets.erb_fb.numpy().T, np.float32)  # [bins][bands]
+    erb_inv = np.ascontiguousarray(assets.erb_inv, np.float32)           # [bands][bins]
+    state = c_lib.stage_parity_create(_fp(erb_fwd), _fp(erb_inv), DF_ORDER, _fp(norm))
+    assert state
+    return state, (erb_fwd, erb_inv)
+
+
 def _spectra(count, seed, scale):
     rng = np.random.RandomState(seed)
     re = (rng.randn(count, N_BINS) * scale).astype(np.float32)
@@ -132,10 +176,7 @@ def _spectra(count, seed, scale):
 
 @pytest.mark.parametrize('atten_lim_db', [0.0, 20.0])
 def test_compose_stream_is_bit_exact_against_c(c_lib, assets, pair, atten_lim_db):
-    erb_fwd = np.ascontiguousarray(assets.erb_fb.numpy().T, np.float32)  # [bins][bands]
-    erb_inv = np.ascontiguousarray(assets.erb_inv, np.float32)           # [bands][bins]
-    state = c_lib.stage_parity_create(_fp(erb_fwd), _fp(erb_inv))
-    assert state
+    state, matrices = _create_state(c_lib, assets)
     frames = 40
     a_re, a_im = _spectra(frames, seed=21, scale=0.7)
     b_re, b_im = _spectra(frames, seed=22, scale=0.2)
@@ -186,13 +227,24 @@ def test_compose_stream_is_bit_exact_against_c(c_lib, assets, pair, atten_lim_db
     assert py_heads.calls == c_heads.calls == frames - mask_lookahead
 
 
+def test_c_derives_the_normaliser_alphas_python_derives(c_lib, assets):
+    """config.ini's time constants reach the C grid and give the alphas train.py's
+    make_norm_alpha gives (a wrong tau, hop or rounding shows as a different float32)."""
+    state, matrices = _create_state(c_lib, assets)
+    try:
+        erb, spec = ctypes.c_float(0.0), ctypes.c_float(0.0)
+        c_lib.stage_parity_alphas(state, ctypes.byref(erb), ctypes.byref(spec))
+    finally:
+        c_lib.stage_parity_destroy(state)
+    assert erb.value == np.float32(assets.feature_cfg['erb_alpha'])
+    assert spec.value == np.float32(assets.feature_cfg['spec_alpha'])
+    assert 0.0 < erb.value < 1.0 and 0.0 < spec.value < 1.0
+
+
 def test_features_match_c_within_the_ainr_parity_band(c_lib, assets, pair):
     if pair != SHIPPED:
         pytest.skip('the feature branch does not depend on the lookahead pair')
-    erb_fwd = np.ascontiguousarray(assets.erb_fb.numpy().T, np.float32)
-    erb_inv = np.ascontiguousarray(assets.erb_inv, np.float32)
-    state = c_lib.stage_parity_create(_fp(erb_fwd), _fp(erb_inv))
-    assert state
+    state, matrices = _create_state(c_lib, assets)
     frames = 30
     a_re, a_im = _spectra(frames, seed=31, scale=0.5)
     stage = Dfn2Stage(assets, heads=ScriptedHeads(seed=9))

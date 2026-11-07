@@ -65,7 +65,7 @@ ABI before touching the supplied pool.
 carves, eight cases) with the same target compiler/producer settings; `make test_target_abi`
 builds it without running. The keyed `test_target_abi` binary accepts `--write descriptor.bin` and
 `--reject descriptor.bin`. Exchange files between 32/64-bit builds with the same
-model/grid settings: rejection must leave caller memory unchanged even after the
+model/grid settings (the same `DFN2_TEST_GRID_KHZ` and lookahead pair): rejection must leave caller memory unchanged even after the
 foreign byte budget is normalized to the current requirement.
 
 
@@ -106,7 +106,7 @@ hop for this lane configuration, and advances identical state.
 | RES | libaec.a | aec_res.h (`AecRes`) / aec.h (`AecResContext`) | Mono: inside the AEC (`ctx.res_gain`, strength `aec_set_level()`). 4-ch: managed by libaec, created by the application with `aec_res_get_mem_size()` / `aec_res_init()`; `Mcab` does not hold one |
 | Mono | no wrapper module: `Aec` itself | aec.h (`aec_process_context()`, `aec_get_res_context()`) | One-mic AEC with its own RES gain; the application calls `aec_process_context()`, reads the `AecResContext` and chains RES gain / NR / comfort noise / synthesis (the example mains do) |
 | 4-ch flow (`Mcab`) | libaudio_pipeline_mcab.a (`mcab.o` only) | 4ch_aec_bf_nr_res/mcab.h | A flow layer, not a library that owns lib objects: the application initialises four `Aec` lanes (and, MATCHED only, one shared `DelayAec`) and passes pointers; `Mcab` owns only the flow state in its own pool (delay admission state machine, reference ring, aligned far, fuse buffers). Per hop `mcab_process_front()` and `mcab_fuse()`; no beamformer, no RES, no NR inside |
-| DFN2 stage / rate bridge | libaudio_pipeline_dfn.a (`pipelines/` build), libdfn_res_stage.a (4-ch build) | dfn/dfn_res_stage.h, dfn/dfn_rate_bridge.h | The post-RES dual-input DFN2 stage (on the model's own rate directly, below 48 kHz through the bridge); the hop driver is `dfn/dfn_hop.h`. The model grid (rate, FFT size, ERB bands, deep-filter bins and the lookahead pair, shipped 48 kHz / 1024 / 1/1) is not built into these units: the application puts a `DFN2Grid` (`dfn2_grid_make()`) in `DfnResStageConfig.grid`, and the example mains choose it with `--ai-sample-rate` / `--ai-fft-size` (see [Build](README_02_build_debug_board.md#build)) |
+| DFN2 stage / rate bridge | libaudio_pipeline_dfn.a (`pipelines/` build), libdfn_res_stage.a (4-ch build) | dfn/dfn_res_stage.h, dfn/dfn_rate_bridge.h | The post-RES dual-input DFN2 stage (on the model's own rate directly, below 48 kHz through the bridge); the hop driver is `dfn/dfn_hop.h`. The model grid (rate, FFT size, ERB bands, deep-filter bins and the lookahead pair, shipped 48 kHz / 1024 / 1/1) is not built into these units: the application puts a `DFN2Grid` (`dfn2_grid_make()`) in `DfnResStageConfig.grid`, and the example mains choose it with `--ai-sample-rate` / `--ai-fft-size` (see [Build](README_02_build_debug_board.md#build)); the ERB matrices are two borrowed pointers (forward bin-major, inverse band-major) the application loads (`--erb-fwd` / `--erb-inv` in the mains) |
 | Example code | not a library: headers and objects of the examples | common/example_cli.h, dfn/dfn_hop.h, ulcnet/ulcnet_nn_stage.{h,c}, 4ch_aec_bf_nr_res/mcab_sample_* | No ABI, no layout version, in no archive (see [Example code](#example-code-copy-and-adapt)) |
 
 RES is available as an independent frequency-domain `AecRes` object in
@@ -174,7 +174,7 @@ headers are listed under [Example code](#example-code-copy-and-adapt):
 
 The mono, mono DFN2 and mono ULCNet examples each derive their AEC configuration in their own
 `main.c` (`derive_lane()`: `aec_config_from_level()`, the grid from `aec_resolve_signal_grid()`
-(ULCNet: its compiled grid), then the lane's seam fields; a delay profile is parsed with `common/example_cli.h`). The 4-channel flow resolves its own grid from
+(ULCNet: the `UlcnetGrid` of `--sample-rate`), then the lane's seam fields; a delay profile is parsed with `common/example_cli.h`). The 4-channel flow resolves its own grid from
 `McabConfig` (`sample_rate`, `fft_size`) and stamps the lane contract with
 `mcab_apply_lane_contract()`. The NR examples use the NR
 library's own strength level on the AEC grid (`anr_config_for_level_grid()`,
@@ -192,11 +192,13 @@ or channel (`--sample-rate 44100`) is refused when the config is built and still
 `atoi()`, ignores an unknown option and falls back to `balanced` for an unknown level name (it does exit 2 for a missing value, as above, and for a second AEC level); the test and smoke helpers `tests/pyc_parity/pyc_drv.c` and
 `4ch_aec_bf_nr_res/tests/dump_delay_parity.c` also read numbers with `atoi()` / `atof()` / `strtoul()`.
 
-The ULCNet applications use `../AIAEC/Align_ULCNet/ulcnet_accelerator_adapter.*`: CPU memory owns
-K/V, logit and GRU state, while the board implements one stateless tensor
-invocation callback. An absent/failing accelerator is fail-open. The adapter
-drives an `ULCNET_IO_FREQ` instance of the `ulcnet_prepost` pre/post class
-(spectrum in, spectrum out, no transform of its own), so both application
+The ULCNet applications use `../AIAEC/Align_ULCNet/ulcnet_accelerator_adapter.*`: the K/V, logit and GRU
+state belongs to the application (a float host registers its buffers; on a board the accelerator holds
+them and the examples register none), while the board implements one stateless tensor
+invocation callback and reloads quantized zeros whenever
+`ulcnet_accelerator_adapter_state_generation()` changes. An absent/failing accelerator is fail-open. The
+adapter drives an `ulcnet_prepost` pre/post instance (spectrum in, spectrum out: the class is
+frequency domain only, and the stage frames with audiolib), so both application
 Makefiles link `ulcnet_prepost.o` wherever the adapter is linked — see
 `ULCNET_ADAPTER_OBJS` in [`Makefile`](Makefile) and
 [`4ch_aec_bf_nr_res/Makefile`](4ch_aec_bf_nr_res/Makefile).
@@ -295,16 +297,16 @@ the libraries it uses and writes the per-hop sequence itself, for instance `mono
 |---|---|---|---|
 | `4ch_aec_bf_nr_res/mcab_sample_post.h` | The glue between `mcab_fuse()` and the libraries behind it: the libaec RES input of a fused frame (`mcab_sample_res_input`), and the NR gain call that folds the residual-echo powers into the denoiser's noise floor (`mcab_sample_anr_gain`). | per hop `mcab_sample_res_input(&frame, &in)` -> `aec_res_process(res, &in)`; `mcab_sample_anr_gain(nr, &frame, scratch, use_r2)`; on a refusal `anr_reset()` | gains owned by the library objects, valid until their next call; `NULL` = a NULL argument or a refused hop |
 | `dfn/dfn_hop.h` | One DeepFilterNet2 hop: the 48 kHz stage with a caller-owned synthesis, or the rate bridge below 48 kHz; the phased begin / model / end calls. | `dfn_hop_init_stage()` (48 kHz, caller-owned `AcIstft`) or `dfn_hop_init_bridge()`; per hop `dfn_hop_begin(E, P)` -> `while (dfn_hop_nn_begin() == 1) dfn_hop_nn_end(rc)` -> `dfn_hop_end(out)`; `dfn_hop_reset()` on a refusal | `DFN_HOP_INVALID` (-1), `DFN_HOP_SEQUENCE_ERROR` (-2) |
-| `ulcnet/ulcnet_nn_stage.{h,c}` | The Align-ULCNet post-filter stage behind a linear AEC: far-end STFT, model call policy (reprime, alignment events, fail-open), WOLA. | `ulcnet_nn_stage_mem_size()` -> `_init()` -> `_set_model()`; per hop `_begin()` (re/im arrays), `_begin_time()` or `_begin_complex()` -> `_nn_begin()` -> `_nn_end(rc)` -> `_end(out)`; `_reset()` on a refusal | `nn_begin` 1 = a frame to run, 0 = none (warm-up or reprime) |
+| `ulcnet/ulcnet_nn_stage.{h,c}` | The Align-ULCNet post-filter stage behind a linear AEC: far-end STFT, model call policy (reprime, alignment events, fail-open), WOLA. | `ulcnet_grid_make()` -> `ulcnet_nn_stage_mem_size()` -> `_init()` -> `_set_model()`; per hop `_begin()` (re/im arrays), `_begin_time()` or `_begin_complex()` -> `_nn_begin()` -> `_nn_end(rc)` -> `_end(out)`; `_reset()` on a refusal | `nn_begin` 1 = a frame to run, 0 = none (warm-up or reprime) |
 | `4ch_aec_bf_nr_res/mcab_sample_flow.{h,c}` | The application-side init of one mcab flow in one pool: four lanes (`mcab_lane_config()` + `aec_init()`), the shared estimator (MATCHED only) and `mcab_init_ex()`. | `mcab_sample_flow_get_mem_size()` -> `mcab_sample_flow_init()` (or `_create()`); `mcab_sample_flow_destroy()` | 0 / -1 |
 | `4ch_aec_bf_nr_res/mcab_sample_beam.{h,c}` | SRP-PHAT, BF and the fallback VAD glue between `mcab_process_front()` and `mcab_fuse()`. | `mcab_sample_beam_get_mem_size()` -> `mcab_sample_beam_init()`; per hop `_process_front()` -> `_process_beam()` (or `_process_with_activity()` / `_process()`) -> `_fuse()`; `mcab_sample_beam_destroy()` first, then `mcab_destroy()` and the lanes | `MCAB_OK`, `MCAB_INVALID_ARGUMENT`, `MCAB_SEQUENCE_ERROR`, `MCAB_DSP_ERROR` |
 
 The stage constants (`MCAB_SAMPLE_PSD_SCALE_INV`, `ULCNET_NN_STAGE_REPRIME_FRAMES`, the DFN scale powers of two) are internal.
 `make test_mcab_sample_post` builds the test of `mcab_sample_post.h`.
 
-`ulcnet_nn_stage_mem_size(1)` sizes a stage that also owns an STFT for `_begin_time()`. A 4-channel caller passes `{ front.delay.changed, front.delay.solid }` to `_begin_complex()`; a mono lane maps `AecLinearContext.delay_state` to `{ state == CHANGED, state != UNLOCKED }` and may pass `formed_hop` to `ulcnet_nn_stage_begin_time()` on a stage built with an error
-analysis. One build serves one grid: `ULCNET_GRID=16k` (16 kHz / fft 512, default) or `48k`
-(48 kHz / fft 1024). The tests of the example code are `dfn/tests/test_dfn_hop.c` and
+`ulcnet_nn_stage_mem_size(&grid, 1)` sizes a stage that also owns an STFT for `_begin_time()`. A 4-channel caller passes `{ front.delay.changed, front.delay.solid }` to `_begin_complex()`; a mono lane maps `AecLinearContext.delay_state` to `{ state == CHANGED, state != UNLOCKED }` and may pass `formed_hop` to `ulcnet_nn_stage_begin_time()` on a stage built with an error
+analysis. The grid is a run-time `UlcnetGrid` (`ulcnet_grid_make()`): the mains take `--sample-rate 16000`
+(fft 512, default) or `48000` (fft 1024), and one binary serves both. The tests of the example code are `dfn/tests/test_dfn_hop.c` and
 `ulcnet/tests/test_ulcnet_nn_stage.c`: `make test_dfn_hop` and `make test_ulcnet_nn_stage` build
 them, `make test` builds and runs both.
 
@@ -320,7 +322,7 @@ is linked into these executables, not into any delivered archive. `mcab_external
 |---|---|
 | `mcab_raw` | Complete interleaved float32 raw hops, optional per-hop VAD; the flow and sample beam helper in one aligned pool, the post-beam stages in a second one; trailing incomplete hops are ignored. |
 | `mcab_static` | 48 generated tone hops and an explicit VAD schedule; the same two-pool layout, lanes and estimator initialised by the sample, then `mcab_get_mem_requirements()` and `mcab_init_ex()`. |
-| `4ch_aec_bf_dfn_res` | Eight silent fail-open model hops; DFN2 matrix, delay-profile and descriptor setup stays local. |
+| `4ch_aec_bf_dfn_res` | Eight silent fail-open model hops; the ERB matrices (`--erb-fwd` / `--erb-inv`), delay-profile and descriptor setup stay local. |
 | `4ch_alignulcnet` | Four silent fail-open model hops; descriptor/accelerator pool and model installation stay local. |
 
 Model samples report success after resource destruction; the shared hop loop allocates nothing.

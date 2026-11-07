@@ -5,7 +5,7 @@
  * policy on real framing. A contract test, not a DSP-quality test. The stage alone (synthetic
  * alignment events) is tested in ulcnet/tests/test_ulcnet_nn_stage.c; what needs the real AEC
  * (FIXED and MATCHED delay states, the framing straddle derivation, acquisition of a known
- * delay) stays here.
+ * delay) stays here. One binary runs every grid of k_grids.
  * Stimuli: a zero-delay echo (the delay state stays UNLOCKED) and a bulk-delay echo
  * (ECHO_DELAY is beyond the filter reach, so the matched filter locks and a model is
  * applied). Each test banner states its case. Build and run: `make test` in pipelines/.
@@ -23,19 +23,26 @@
 #include <time.h>
 #include <math.h>
 
-/* Every test model that actually infers must publish a descriptor: the
- * pipeline refuses infer-without-descriptor, because a shape disagreement
- * between the graph and the host-side rings is undetectable downstream (the
- * finite guard catches an unwritten output, never a wrong-shaped one). One
- * shared descriptor for the whole file; D is the example default. */
+/* Largest row of the grid table: 48 kHz / fft 1024. */
+enum { HOP_MAX = 512, BINS_MAX = 513 };
+
+static const UlcnetGridSpec k_grids[] = {
+    { .sample_rate = 16000, .n_fft = 512,  .delay_depth = 8 },
+    { .sample_rate = 48000, .n_fft = 1024, .delay_depth = 8 },
+};
+
+static UlcnetGrid g_grid;   /* the grid under test */
+#define HOP (g_grid.hop)
+#define BINS (g_grid.n_bins)
+#define HOP_BYTES ((size_t)HOP * sizeof(float))
+
+/* Every test model that actually infers must publish a descriptor: the pipeline refuses
+ * infer-without-descriptor, because a shape disagreement between the graph and the stage's
+ * grid is undetectable downstream (the finite guard catches an unwritten output, never a
+ * wrong-shaped one). The descriptor of the grid under test. */
 static const UlcnetModelIoDescriptor* test_io_descriptor(void) {
     static UlcnetModelIoDescriptor d;
-    static int ready = 0;
-    if (!ready) {
-        if (ulcnet_model_io_descriptor_default(8, &d) != 0) return NULL;
-        ready = 1;
-    }
-    return &d;
+    return ulcnet_model_io_descriptor_default(&g_grid, &d) == 0 ? &d : NULL;
 }
 
 /* ---------------------------------------------------------------------------------------
@@ -44,7 +51,8 @@ static const UlcnetModelIoDescriptor* test_io_descriptor(void) {
  * --------------------------------------------------------------------------------------- */
 
 typedef struct MonoUlcnetConfig {
-    int sample_rate, fft_size, filter_length;
+    UlcnetGrid grid;              /* the stage's grid */
+    int sample_rate, fft_size, filter_length;   /* the lane's */
     AecDelayMode delay_mode;
     int delay_num_filters, fixed_delay_samples;
     AecLevel aec_level;
@@ -63,8 +71,9 @@ typedef struct MonoUlcnet {
 static MonoUlcnetConfig mu_default_config(int sample_rate) {
     MonoUlcnetConfig cfg;
     memset(&cfg, 0, sizeof(cfg));
+    cfg.grid = g_grid;
     cfg.sample_rate = sample_rate;
-    cfg.fft_size = ULCNET_N_FFT;           /* compiled checkpoint grid */
+    cfg.fft_size = g_grid.n_fft;
     cfg.delay_mode = AEC_DELAY_MATCHED;
     cfg.delay_num_filters = 5;
     cfg.fixed_delay_samples = -1;
@@ -72,17 +81,19 @@ static MonoUlcnetConfig mu_default_config(int sample_rate) {
     return cfg;
 }
 
-/* The lane on the compiled grid, linear context only; -1 for a request off that grid or an
- * out-of-enum level (this harness's policy; libaec refuses the rest when sizing). */
+/* The lane on the stage's grid, linear context only; -1 for a lane whose rate or fft differs
+ * from the grid (fft_size 0 takes the grid's), a bad grid or an out-of-enum level (this
+ * harness's policy; libaec refuses the rest when sizing). */
 static int mu_lane(const MonoUlcnetConfig* cfg, AecConfig* aec_cfg) {
-    if (!cfg || cfg->sample_rate != ULCNET_SR ||
-        (cfg->fft_size != 0 && cfg->fft_size != ULCNET_N_FFT))
+    if (!cfg || ulcnet_grid_validate(&cfg->grid) != ULCNET_GRID_OK ||
+        cfg->sample_rate != cfg->grid.sample_rate ||
+        (cfg->fft_size != 0 && cfg->fft_size != cfg->grid.n_fft))
         return -1;
     if (cfg->aec_level != AEC_LEVEL_MILD && cfg->aec_level != AEC_LEVEL_BALANCED &&
         cfg->aec_level != AEC_LEVEL_AGGRESSIVE && cfg->aec_level != AEC_LEVEL_NO_FLOOR)
         return -1;
-    aec_config_from_level(aec_cfg, cfg->aec_level, ULCNET_SR);
-    aec_cfg->fft_size = ULCNET_N_FFT;
+    aec_config_from_level(aec_cfg, cfg->aec_level, cfg->grid.sample_rate);
+    aec_cfg->fft_size = cfg->grid.n_fft;
     if (cfg->filter_length != 0) aec_cfg->filter_length = cfg->filter_length;
     aec_cfg->delay_mode = cfg->delay_mode;
     aec_cfg->delay_num_filters = cfg->delay_num_filters;
@@ -97,8 +108,9 @@ static int mu_lane(const MonoUlcnetConfig* cfg, AecConfig* aec_cfg) {
 /* Pool bytes of the AEC and the stage (with its error analysis), 0 for a refused config. */
 static int mu_get_mem_requirements(const MonoUlcnetConfig* cfg, MonoUlcnetMemReq* req) {
     AecConfig aec_cfg;
-    size_t aec_bytes, stage_bytes = ulcnet_nn_stage_mem_size(1);
+    size_t aec_bytes, stage_bytes;
     if (!req || mu_lane(cfg, &aec_cfg) != 0) return -1;
+    stage_bytes = ulcnet_nn_stage_mem_size(&cfg->grid, 1);
     aec_bytes = aec_get_mem_size(&aec_cfg);
     if (aec_bytes == 0 || stage_bytes == 0) return -1;
     req->bytes = (uint64_t)(ALIGN16(aec_bytes) + ALIGN16(stage_bytes));
@@ -108,7 +120,7 @@ static int mu_get_mem_requirements(const MonoUlcnetConfig* cfg, MonoUlcnetMemReq
 static MonoUlcnet* mu_wrap(Aec* aec, void* stage_mem, size_t stage_bytes, const MonoUlcnetConfig* cfg,
                            MonoUlcnet* p) {
     p->aec = aec;
-    p->stage = aec ? ulcnet_nn_stage_init(stage_mem, stage_bytes, 1) : NULL;
+    p->stage = aec ? ulcnet_nn_stage_init(stage_mem, stage_bytes, &cfg->grid, 1) : NULL;
     if (!p->stage || ulcnet_nn_stage_set_model(p->stage, &cfg->model) != 0) return NULL;
     return p;
 }
@@ -125,7 +137,7 @@ static MonoUlcnet* mu_init(void* pool, size_t bytes, const MonoUlcnetConfig* cfg
     p = (MonoUlcnet*)calloc(1, sizeof(*p));
     if (!p) return NULL;
     if (!mu_wrap(aec_init(pool, aec_bytes, &aec_cfg), (uint8_t*)pool + ALIGN16(aec_bytes),
-                 ulcnet_nn_stage_mem_size(1), cfg, p)) {
+                 ulcnet_nn_stage_mem_size(&cfg->grid, 1), cfg, p)) {
         free(p);
         return NULL;
     }
@@ -136,8 +148,9 @@ static MonoUlcnet* mu_init(void* pool, size_t bytes, const MonoUlcnetConfig* cfg
 static MonoUlcnet* mu_create(const MonoUlcnetConfig* cfg) {
     AecConfig aec_cfg;
     MonoUlcnet* p;
-    size_t stage_bytes = ulcnet_nn_stage_mem_size(1);
+    size_t stage_bytes;
     if (mu_lane(cfg, &aec_cfg) != 0) return NULL;
+    stage_bytes = ulcnet_nn_stage_mem_size(&cfg->grid, 1);
     p = (MonoUlcnet*)calloc(1, sizeof(*p));
     if (!p) return NULL;
     p->heap_aec = (Aec*)calloc(1, sizeof(Aec));
@@ -167,7 +180,9 @@ static void mu_destroy(MonoUlcnet* p) {
     free(p);
 }
 
-static int mu_hop_size(const MonoUlcnet* p) { return p ? ULCNET_HOP : -1; }
+static int mu_hop_size(const MonoUlcnet* p) {
+    return p && p->stage ? ulcnet_nn_stage_grid(p->stage)->hop : -1;
+}
 static Aec* mu_get_aec(const MonoUlcnet* p) { return p ? p->aec : NULL; }
 
 static void mu_reset(MonoUlcnet* p) {
@@ -225,7 +240,6 @@ static int mu_process(MonoUlcnet* p, const float* mic, const float* ref, float* 
 }
 
 
-#define HOP            ULCNET_HOP     /* pinned by the compiled grid        */
 #define ECHO_DELAY     2000           /* samples; > 832-tap filter reach    */
 #define MAX_LOCK_HOPS  150            /* acquisition bound (measured: ~15)  */
 
@@ -247,7 +261,7 @@ static const char* fmt_msg(const char* fmt, ...) {
 /* DelayAec searches a 16 kHz-equivalent sidechain and scales the selected
  * delay back to native samples. Test stimuli and bounds therefore scale by
  * exactly three on the 48 kHz product grid. */
-#define DELAY_RATE_FACTOR (ULCNET_SR / 16000)
+#define DELAY_RATE_FACTOR (g_grid.sample_rate / 16000)
 
 /* ---- LCG synthetic generator (as the other mono tests) ---- */
 static uint32_t lcg_state;
@@ -314,15 +328,15 @@ static int reprime_take(int* armed, int frames) {
  * ========================================================================= */
 static void test_identity_e2e(void) {
     enum { N = 100 };
-    MonoUlcnetConfig cfg = mu_default_config(ULCNET_SR);
+    MonoUlcnetConfig cfg = mu_default_config(g_grid.sample_rate);
     MonoUlcnet* p = mu_create(&cfg);
     if (!p) { fprintf(stderr, "FAIL: setup (create) for identity E2E test\n"); g_failures++; return; }
 
     CHECK(mu_hop_size(p) == HOP,
-          fmt_msg("hop_size accessor reports the compiled ULCNet hop (%d)", HOP));
+          fmt_msg("hop_size accessor reports the stage grid's hop (%d)", HOP));
 
-    float mic[HOP], ref[HOP];
-    static float out_hist[N][HOP], formed_hist[N][HOP];
+    float mic[HOP_MAX], ref[HOP_MAX];
+    static float out_hist[N][HOP_MAX], formed_hist[N][HOP_MAX];
     EchoSim sim;
     echo_sim_init(&sim, 0, 0xC0FFEEu);
 
@@ -333,7 +347,7 @@ static void test_identity_e2e(void) {
          * pointers alias AEC-internal buffers valid until then. */
         AecResContext rctx;
         aec_get_res_context(mu_get_aec(p), &rctx);
-        memcpy(formed_hist[h], rctx.formed_hop, sizeof(formed_hist[h]));
+        memcpy(formed_hist[h], rctx.formed_hop, HOP_BYTES);
     }
 
     int hop0_zero = 1;
@@ -371,14 +385,14 @@ typedef struct {
 } CountingModelState;
 
 static int counting_infer(void* user,
-                          const float err_re[ULCNET_BINS], const float err_im[ULCNET_BINS],
-                          const float far_re[ULCNET_BINS], const float far_im[ULCNET_BINS],
-                          float out_re[ULCNET_BINS], float out_im[ULCNET_BINS]) {
+                          const float* err_re, const float* err_im,
+                          const float* far_re, const float* far_im,
+                          float* out_re, float* out_im) {
     CountingModelState* st = (CountingModelState*)user;
     (void)far_re; (void)far_im;
     st->infer_calls++;
-    memcpy(out_re, err_re, ULCNET_BINS * sizeof(float));
-    memcpy(out_im, err_im, ULCNET_BINS * sizeof(float));
+    memcpy(out_re, err_re, BINS * sizeof(float));
+    memcpy(out_im, err_im, BINS * sizeof(float));
     return 0;
 }
 
@@ -390,7 +404,7 @@ static void test_counting_model(void) {
     enum { N = 200 };
     CountingModelState st = {0, 0};
 
-    MonoUlcnetConfig cfg = mu_default_config(ULCNET_SR);
+    MonoUlcnetConfig cfg = mu_default_config(g_grid.sample_rate);
     cfg.model.user  = &st;
     cfg.model.infer = counting_infer;
     cfg.model.io_descriptor = test_io_descriptor();
@@ -399,7 +413,7 @@ static void test_counting_model(void) {
     MonoUlcnet* p = mu_create(&cfg);
     if (!p) { fprintf(stderr, "FAIL: setup (create) for counting-model test\n"); g_failures++; return; }
 
-    float mic[HOP], ref[HOP], out[HOP];
+    float mic[HOP_MAX], ref[HOP_MAX], out[HOP_MAX];
     EchoSim sim;
     echo_sim_init(&sim, ECHO_DELAY, 0xC0FFEEu);
 
@@ -471,15 +485,16 @@ static void test_counting_model(void) {
  * byte-exactly against the caller's far history on every fill hop, and the shifted
  * content the same way from the first LOCKED hop on. */
 static void test_fixed_first_alignment_resets_model(void) {
-    enum { FIXED_DELAY = 2 * HOP, N = 8 };
+    enum { N = 8 };
+    const int FIXED_DELAY = 2 * HOP;
     MonoUlcnetConfig cfg =
-        mu_default_config(ULCNET_SR);
+        mu_default_config(g_grid.sample_rate);
     CountingModelState st = {0, 0};
     MonoUlcnet* p;
-    float mic[HOP] = {0};
-    float ref[HOP];
-    float out[HOP];
-    static float ref_hist[N][HOP];
+    float mic[HOP_MAX] = {0};
+    float ref[HOP_MAX];
+    float out[HOP_MAX];
+    static float ref_hist[N][HOP_MAX];
     int first_locked = -1;
     int changed = 0;
     int raw_hops = 0;
@@ -505,7 +520,7 @@ static void test_fixed_first_alignment_resets_model(void) {
         AecLinearDelayState state;
         AecLinearContext lctx;
         for (int i = 0; i < HOP; ++i) ref[i] = lcg_sample();
-        memcpy(ref_hist[h], ref, sizeof(ref));
+        memcpy(ref_hist[h], ref, HOP_BYTES);
         CHECK(mu_process(p, mic, ref, out) == 0,
               "FIXED transition frame processes");
         state = pipeline_delay_state(p);
@@ -518,12 +533,12 @@ static void test_fixed_first_alignment_resets_model(void) {
         if (state == AEC_LINEAR_DELAY_LOCKED) {
             /* FIXED_DELAY is exactly 2 hops, so the shifted content is the
              * far hop from 2 hops back -- an independently held reference. */
-            if (memcmp(lctx.aligned_far_hop, ref_hist[h - 2], sizeof(ref)) != 0
+            if (memcmp(lctx.aligned_far_hop, ref_hist[h - 2], HOP_BYTES) != 0
                 && shifted_mismatch < 0)
                 shifted_mismatch = h;
             shifted_hops++;
         } else {
-            if (memcmp(lctx.aligned_far_hop, ref_hist[h], sizeof(ref)) != 0
+            if (memcmp(lctx.aligned_far_hop, ref_hist[h], HOP_BYTES) != 0
                 && raw_mismatch < 0)
                 raw_mismatch = h;
             raw_hops++;
@@ -576,7 +591,7 @@ static void test_relock_same_delay_resets_model(void) {
     const int bulk_delay = 64 * DELAY_RATE_FACTOR;
     CountingModelState st = {0, 0};
 
-    MonoUlcnetConfig cfg = mu_default_config(ULCNET_SR);
+    MonoUlcnetConfig cfg = mu_default_config(g_grid.sample_rate);
     cfg.model.user  = &st;
     cfg.model.infer = counting_infer;
     cfg.model.io_descriptor = test_io_descriptor();
@@ -585,7 +600,7 @@ static void test_relock_same_delay_resets_model(void) {
     MonoUlcnet* p = mu_create(&cfg);
     if (!p) { fprintf(stderr, "FAIL: setup (create) for mono relock test\n"); g_failures++; return; }
 
-    float mic[HOP], ref[HOP], out[HOP];
+    float mic[HOP_MAX], ref[HOP_MAX], out[HOP_MAX];
     EchoSim sim;
     int acquire_hop = -1, relock_hop = -1;
     int acquire_delay = -1, relock_delay = -2;
@@ -674,7 +689,7 @@ typedef struct {
 
 static void serial_follow_run(MonoUlcnet* p, CountingModelState* st, EchoSim* sim,
                               int hops, int shift_hop, int shift_delay, SerialFollow* sf) {
-    float mic[HOP], ref[HOP], out[HOP];
+    float mic[HOP_MAX], ref[HOP_MAX], out[HOP_MAX];
     for (int h = 0; h < hops; h++) {
         if (h == shift_hop) echo_sim_init(sim, shift_delay, 0xC0FFEEu);
         uint32_t s0 = aec_post_reset_serial(mu_get_aec(p));
@@ -696,7 +711,7 @@ static void test_serial_advance_resets_model(void) {
     SerialFollow sf = {0, 0, 0, 0};
     EchoSim sim;
 
-    MonoUlcnetConfig cfg = mu_default_config(ULCNET_SR);
+    MonoUlcnetConfig cfg = mu_default_config(g_grid.sample_rate);
     cfg.model.user  = &st;
     cfg.model.infer = counting_infer;
     cfg.model.io_descriptor = test_io_descriptor();
@@ -742,13 +757,13 @@ typedef struct {
 } FailModelState;
 
 static int failing_infer(void* user,
-                         const float err_re[ULCNET_BINS], const float err_im[ULCNET_BINS],
-                         const float far_re[ULCNET_BINS], const float far_im[ULCNET_BINS],
-                         float out_re[ULCNET_BINS], float out_im[ULCNET_BINS]) {
+                         const float* err_re, const float* err_im,
+                         const float* far_re, const float* far_im,
+                         float* out_re, float* out_im) {
     FailModelState* st = (FailModelState*)user;
     (void)far_re; (void)far_im;
     float scale = st->fail_now ? 2.0f : 0.5f;
-    for (int k = 0; k < ULCNET_BINS; k++) {
+    for (int k = 0; k < BINS; k++) {
         out_re[k] = scale * err_re[k];
         out_im[k] = scale * err_im[k];
     }
@@ -762,11 +777,11 @@ static void test_fail_open_and_delay_gating(void) {
     enum { N = 200, FAIL_LEN = 8, FAIL_GAP = 10 };
     FailModelState st = {0};
 
-    MonoUlcnetConfig cfg_a = mu_default_config(ULCNET_SR);
+    MonoUlcnetConfig cfg_a = mu_default_config(g_grid.sample_rate);
     cfg_a.model.user  = &st;
     cfg_a.model.infer = failing_infer;
     cfg_a.model.io_descriptor = test_io_descriptor();
-    MonoUlcnetConfig cfg_b = mu_default_config(ULCNET_SR); /* NULL model */
+    MonoUlcnetConfig cfg_b = mu_default_config(g_grid.sample_rate); /* NULL model */
 
     MonoUlcnet* pa = mu_create(&cfg_a);
     MonoUlcnet* pb = mu_create(&cfg_b);
@@ -778,7 +793,7 @@ static void test_fail_open_and_delay_gating(void) {
         return;
     }
 
-    float mic[HOP], ref[HOP], out_a[HOP], out_b[HOP];
+    float mic[HOP_MAX], ref[HOP_MAX], out_a[HOP_MAX], out_b[HOP_MAX];
     EchoSim sim;
     echo_sim_init(&sim, ECHO_DELAY, 0xC0FFEEu);
 
@@ -826,7 +841,7 @@ static void test_fail_open_and_delay_gating(void) {
         if (h == 0)      equal_expected = 1;
         else             equal_expected = ident[h - 1] && ident[h];
 
-        int bitwise_equal = memcmp(out_a, out_b, sizeof(out_a)) == 0;
+        int bitwise_equal = memcmp(out_a, out_b, HOP_BYTES) == 0;
         if (equal_expected) {
             n_equal_hops++;
             if (!bitwise_equal && equal_ok) { equal_ok = 0; first_bad_equal = h; }
@@ -865,12 +880,12 @@ static void test_fail_open_and_delay_gating(void) {
  * every construction path of the composition.
  * ========================================================================= */
 static int gate_infer_identity(void* user,
-                               const float er[ULCNET_BINS], const float ei[ULCNET_BINS],
-                               const float fr[ULCNET_BINS], const float fi[ULCNET_BINS],
-                               float or_[ULCNET_BINS], float oi[ULCNET_BINS]) {
+                               const float* er, const float* ei,
+                               const float* fr, const float* fi,
+                               float* or_, float* oi) {
     (void)user; (void)fr; (void)fi;
-    memcpy(or_, er, sizeof(float) * ULCNET_BINS);
-    memcpy(oi, ei, sizeof(float) * ULCNET_BINS);
+    memcpy(or_, er, sizeof(float) * BINS);
+    memcpy(oi, ei, sizeof(float) * BINS);
     return 0;
 }
 
@@ -880,8 +895,8 @@ static void test_raw_descriptor_gate(void) {
     void* pool = NULL;
     MonoUlcnet* p;
 
-    if (ulcnet_model_io_descriptor_default(8, &raw_desc) != 0 ||
-        ulcnet_model_io_descriptor_default(8, &aligned_desc) != 0) {
+    if (ulcnet_model_io_descriptor_default(&g_grid, &raw_desc) != 0 ||
+        ulcnet_model_io_descriptor_default(&g_grid, &aligned_desc) != 0) {
         fprintf(stderr, "FAIL: setup (descriptor_default) for far-mode gate test\n");
         g_failures++;
         return;
@@ -891,15 +906,15 @@ static void test_raw_descriptor_gate(void) {
           "descriptor_default publishes the fixed raw-far contract");
 
     /* An undescribed model remains valid for the identity/test boundary. */
-    MonoUlcnetConfig undescribed = mu_default_config(ULCNET_SR);
+    MonoUlcnetConfig undescribed = mu_default_config(g_grid.sample_rate);
     undescribed.model.user = NULL;
     undescribed.model.infer = gate_infer_identity;
     undescribed.model.reset = NULL;
     undescribed.model.io_descriptor = NULL;
-    /* An INFERRING model must publish a descriptor: its delay depth and
-     * history shapes are what the host-side rings are carved from, and a
-     * disagreement with the graph is undetectable downstream. An identity
-     * model -- no infer callback -- has no shapes to agree about. */
+    /* An INFERRING model must publish a descriptor: the stage pins the external contract
+     * (layout, grid, raw far, D range) against it, and a disagreement with the graph is
+     * undetectable downstream. An identity model -- no infer callback -- has nothing to
+     * agree about. */
     p = mu_create(&undescribed);
     CHECK(p == NULL, "an INFERRING model with io_descriptor == NULL is refused");
     mu_destroy(p);
@@ -941,40 +956,64 @@ static void test_raw_descriptor_gate(void) {
     free(pool);
 }
 
+/* The table row that is not the grid under test. */
+static UlcnetGrid other_grid(void) {
+    UlcnetGrid other;
+    memset(&other, 0, sizeof(other));
+    for (size_t i = 0; i < sizeof(k_grids) / sizeof(k_grids[0]); i++)
+        if (k_grids[i].n_fft != g_grid.n_fft) (void)ulcnet_grid_make(&other, &k_grids[i]);
+    return other;
+}
+
 /* =========================================================================
- * The grid and the pool plan of the composition: the lane refuses what is not the compiled grid, the delay request reaches the
- * AEC pool size, and the stage and AEC blocks are refused when misaligned or short.
+ * The grid and the pool plan of the composition: the lane refuses what is not the stage's
+ * grid, the delay request reaches the AEC pool size, and the stage and AEC blocks are
+ * refused when misaligned or short.
  * ========================================================================= */
 static void test_grid_and_pool_plan(void) {
     MonoUlcnetMemReq req;
-    MonoUlcnetConfig good = mu_default_config(ULCNET_SR);
-    static const int bad_rates[] = {8000, 44100, ULCNET_OTHER_SR};
+    MonoUlcnetConfig good = mu_default_config(g_grid.sample_rate);
+    const UlcnetGrid other = other_grid();
+    const int bad_rates[] = {8000, 44100, other.sample_rate};
 
-    CHECK(good.sample_rate == ULCNET_SR && good.fft_size == ULCNET_N_FFT,
-          fmt_msg("default config is the compiled %d Hz / frame-FFT %d / hop %d grid",
-                  ULCNET_SR, ULCNET_N_FFT, ULCNET_HOP));
+    CHECK(other.n_fft != 0 && other.n_fft != g_grid.n_fft, "the grid table has a second row");
+    CHECK(good.sample_rate == g_grid.sample_rate && good.fft_size == g_grid.n_fft,
+          fmt_msg("default config is the %d Hz / frame-FFT %d / hop %d grid",
+                  g_grid.sample_rate, g_grid.n_fft, HOP));
     CHECK(mu_get_mem_requirements(NULL, &req) == -1 && mu_get_mem_requirements(&good, NULL) == -1,
           "the plan rejects NULL arguments");
     for (int i = 0; i < 3; i++) {
         MonoUlcnetConfig c = mu_default_config(bad_rates[i]);
         CHECK(mu_get_mem_requirements(&c, &req) == -1,
-              fmt_msg("the lane rejects sample_rate=%d (compiled ULCNet rate differs)", bad_rates[i]));
+              fmt_msg("the lane rejects sample_rate=%d (the stage grid is %d Hz)", bad_rates[i],
+                      g_grid.sample_rate));
     }
     {
-        MonoUlcnetConfig bad_fft = mu_default_config(ULCNET_SR);
-        bad_fft.fft_size = ULCNET_OTHER_N_FFT;   /* legal elsewhere -- NOT on this grid */
+        MonoUlcnetConfig bad_fft = mu_default_config(g_grid.sample_rate);
+        bad_fft.fft_size = other.n_fft;   /* legal elsewhere -- NOT on this grid */
         CHECK(mu_get_mem_requirements(&bad_fft, &req) == -1,
-              fmt_msg("the lane rejects fft_size=%d (compiled ULCNet grid is %d)",
-                      ULCNET_OTHER_N_FFT, ULCNET_N_FFT));
+              fmt_msg("the lane rejects fft_size=%d (the stage grid is %d)",
+                      other.n_fft, g_grid.n_fft));
     }
     {
-        MonoUlcnetConfig bad_level = mu_default_config(ULCNET_SR);
+        MonoUlcnetConfig other_stage = mu_default_config(g_grid.sample_rate);
+        MonoUlcnetConfig bad_stage = good;
+        other_stage.grid = other;   /* a stage grid the lane does not run */
+        CHECK(mu_get_mem_requirements(&other_stage, &req) == -1,
+              "a stage grid that differs from the lane's rate and fft is refused");
+        bad_stage.grid.n_fft = 500;
+        bad_stage.fft_size = 500;
+        CHECK(mu_get_mem_requirements(&bad_stage, &req) == -1,
+              "an invalid stage grid is refused");
+    }
+    {
+        MonoUlcnetConfig bad_level = mu_default_config(g_grid.sample_rate);
         bad_level.aec_level = (AecLevel)99;
         CHECK(mu_get_mem_requirements(&bad_level, &req) == -1,
               "the lane rejects an out-of-enum aec_level");
     }
     {
-        MonoUlcnetConfig matched2 = mu_default_config(ULCNET_SR);
+        MonoUlcnetConfig matched2 = mu_default_config(g_grid.sample_rate);
         MonoUlcnetConfig external = matched2;
         MonoUlcnetMemReq matched_req, external_req;
         matched2.delay_num_filters = 2;
@@ -987,12 +1026,12 @@ static void test_grid_and_pool_plan(void) {
     }
     {
         MonoUlcnetMemReq req0, req_explicit;
-        MonoUlcnetConfig c0 = mu_default_config(ULCNET_SR);
-        c0.fft_size = 0;  /* 0 resolves to the compiled grid */
+        MonoUlcnetConfig c0 = mu_default_config(g_grid.sample_rate);
+        c0.fft_size = 0;  /* 0 resolves to the stage's grid */
         CHECK(mu_get_mem_requirements(&c0, &req0) == 0 &&
               mu_get_mem_requirements(&good, &req_explicit) == 0 &&
               req0.bytes == req_explicit.bytes && req0.bytes > 0,
-              fmt_msg("fft_size=0 resolves to the same pool as the explicit %d", ULCNET_N_FFT));
+              fmt_msg("fft_size=0 resolves to the same pool as the explicit %d", g_grid.n_fft));
     }
 
     /* Pool plan: a misaligned or short block is refused, the exact block accepted, and the
@@ -1004,11 +1043,16 @@ static void test_grid_and_pool_plan(void) {
               posix_memalign(&pool, 16, (size_t)req.bytes + 16) == 0 && pool,
               "pool plan: the block allocates");
         if (pool) {
+            void* snap = malloc((size_t)req.bytes + 16);
             memset(pool, 0xA5, (size_t)req.bytes + 16);
+            if (snap) memcpy(snap, pool, (size_t)req.bytes + 16);
             CHECK(mu_init((uint8_t*)pool + 1, (size_t)req.bytes, &good) == NULL,
                   "init rejects a misaligned (base+1) pool");
             CHECK(mu_init(pool, (size_t)req.bytes - 1, &good) == NULL,
                   "init rejects an undersized (bytes-1) pool");
+            CHECK(snap && memcmp(snap, pool, (size_t)req.bytes + 16) == 0,
+                  "the refused inits leave the pool bytes unchanged");
+            free(snap);
             p = mu_init(pool, (size_t)req.bytes, &good);
             CHECK(p != NULL, "init accepts a correctly aligned/sized pool");
             mu_destroy(p);
@@ -1024,7 +1068,7 @@ static void test_grid_and_pool_plan(void) {
  * ========================================================================= */
 static void test_create_vs_init_parity(void) {
     enum { N = 300 };
-    MonoUlcnetConfig cfg = mu_default_config(ULCNET_SR);
+    MonoUlcnetConfig cfg = mu_default_config(g_grid.sample_rate);
     MonoUlcnetMemReq req;
     if (mu_get_mem_requirements(&cfg, &req) != 0) {
         fprintf(stderr, "FAIL: setup for create-vs-init parity test\n");
@@ -1050,8 +1094,8 @@ static void test_create_vs_init_parity(void) {
         return;
     }
 
-    float mic[HOP], ref[HOP];
-    static float out_heap[N][HOP], out_pool[N][HOP];
+    float mic[HOP_MAX], ref[HOP_MAX];
+    static float out_heap[N][HOP_MAX], out_pool[N][HOP_MAX];
     EchoSim sim;
 
     echo_sim_init(&sim, ECHO_DELAY, 0xC0FFEEu);
@@ -1065,8 +1109,13 @@ static void test_create_vs_init_parity(void) {
         mu_process(p_pool, mic, ref, out_pool[h]);
     }
 
-    CHECK(memcmp(out_heap, out_pool, sizeof(out_heap)) == 0,
-          fmt_msg("create (heap) == init (0xA5-poisoned pool), %d hops, byte-for-byte", N));
+    {
+        int same = 1;
+        for (int h = 0; h < N; h++)
+            if (memcmp(out_heap[h], out_pool[h], HOP_BYTES) != 0) same = 0;
+        CHECK(same,
+              fmt_msg("create (heap) == init (0xA5-poisoned pool), %d hops, byte-for-byte", N));
+    }
 
     int finite = 1;
     for (int h = 0; h < N && finite; h++)
@@ -1088,8 +1137,8 @@ static void test_null_model_equals_identity_model(void) {
     enum { N = 200 };
     CountingModelState st = {0, 0};
 
-    MonoUlcnetConfig cfg_null = mu_default_config(ULCNET_SR);
-    MonoUlcnetConfig cfg_id   = mu_default_config(ULCNET_SR);
+    MonoUlcnetConfig cfg_null = mu_default_config(g_grid.sample_rate);
+    MonoUlcnetConfig cfg_id   = mu_default_config(g_grid.sample_rate);
     cfg_id.model.user  = &st;
     cfg_id.model.infer = counting_infer;   /* copies err -> out, returns 0 */
     cfg_id.model.io_descriptor = test_io_descriptor();
@@ -1105,7 +1154,7 @@ static void test_null_model_equals_identity_model(void) {
         return;
     }
 
-    float mic[HOP], ref[HOP], out_n[HOP], out_i[HOP];
+    float mic[HOP_MAX], ref[HOP_MAX], out_n[HOP_MAX], out_i[HOP_MAX];
     EchoSim sim;
     echo_sim_init(&sim, ECHO_DELAY, 0xC0FFEEu);
 
@@ -1114,7 +1163,7 @@ static void test_null_model_equals_identity_model(void) {
         echo_sim_hop(&sim, mic, ref);
         mu_process(pn, mic, ref, out_n);
         mu_process(pi, mic, ref, out_i);
-        if (memcmp(out_n, out_i, sizeof(out_n)) != 0 && equal) { equal = 0; first_bad = h; }
+        if (memcmp(out_n, out_i, HOP_BYTES) != 0 && equal) { equal = 0; first_bad = h; }
         if (pipeline_delay_state(pi) != AEC_LINEAR_DELAY_UNLOCKED) saw_locked = 1;
         if (pipeline_delay_state(pi) == AEC_LINEAR_DELAY_CHANGED) n_changed++;
     }
@@ -1144,21 +1193,22 @@ static void test_null_model_equals_identity_model(void) {
  *    FIXED_DELAY.
  * ========================================================================= */
 static int passthrough_far_infer(void* user,
-                                 const float err_re[ULCNET_BINS], const float err_im[ULCNET_BINS],
-                                 const float far_re[ULCNET_BINS], const float far_im[ULCNET_BINS],
-                                 float out_re[ULCNET_BINS], float out_im[ULCNET_BINS]) {
+                                 const float* err_re, const float* err_im,
+                                 const float* far_re, const float* far_im,
+                                 float* out_re, float* out_im) {
     (void)user; (void)err_re; (void)err_im;
-    memcpy(out_re, far_re, ULCNET_BINS * sizeof(float));
-    memcpy(out_im, far_im, ULCNET_BINS * sizeof(float));
+    memcpy(out_re, far_re, BINS * sizeof(float));
+    memcpy(out_im, far_im, BINS * sizeof(float));
     return 0;
 }
 
 static void test_raw_far_timestamp_after_fixed_delay_lock(void) {
-    enum { N = 40, IMP_HOP = 8, IMP_OFF = 37, FIXED_DELAY = 2 * HOP };
+    enum { N = 40, IMP_HOP = 8, IMP_OFF = 37 };
+    const int FIXED_DELAY = 2 * HOP;
     const int imp_index = IMP_HOP * HOP + IMP_OFF;
     const int expect_index = imp_index + HOP;   /* same-hop far tap + 1-hop chain */
 
-    MonoUlcnetConfig cfg = mu_default_config(ULCNET_SR);
+    MonoUlcnetConfig cfg = mu_default_config(g_grid.sample_rate);
     cfg.delay_mode = AEC_DELAY_FIXED;
     cfg.fixed_delay_samples = FIXED_DELAY;
     cfg.model.infer = passthrough_far_infer;
@@ -1166,11 +1216,11 @@ static void test_raw_far_timestamp_after_fixed_delay_lock(void) {
     MonoUlcnet* p = mu_create(&cfg);
     if (!p) { fprintf(stderr, "FAIL: setup (create) for far-timestamp test\n"); g_failures++; return; }
 
-    float mic[HOP], ref[HOP];
-    static float out_hist[N][HOP];
+    float mic[HOP_MAX], ref[HOP_MAX];
+    static float out_hist[N][HOP_MAX];
     for (int h = 0; h < N; h++) {
-        memset(mic, 0, sizeof(mic));
-        memset(ref, 0, sizeof(ref));
+        memset(mic, 0, HOP_BYTES);
+        memset(ref, 0, HOP_BYTES);
         if (h == IMP_HOP) ref[IMP_OFF] = 1.0f;
         mu_process(p, mic, ref, out_hist[h]);
     }
@@ -1202,11 +1252,11 @@ static void test_raw_far_timestamp_after_fixed_delay_lock(void) {
  *    noise makes the error nonzero from the start).
  * ========================================================================= */
 static int halving_infer(void* user,
-                         const float err_re[ULCNET_BINS], const float err_im[ULCNET_BINS],
-                         const float far_re[ULCNET_BINS], const float far_im[ULCNET_BINS],
-                         float out_re[ULCNET_BINS], float out_im[ULCNET_BINS]) {
+                         const float* err_re, const float* err_im,
+                         const float* far_re, const float* far_im,
+                         float* out_re, float* out_im) {
     (void)user; (void)far_re; (void)far_im;
-    for (int k = 0; k < ULCNET_BINS; k++) {
+    for (int k = 0; k < BINS; k++) {
         out_re[k] = 0.5f * err_re[k];
         out_im[k] = 0.5f * err_im[k];
     }
@@ -1215,10 +1265,10 @@ static int halving_infer(void* user,
 
 static void test_model_applies_unlocked(void) {
     enum { N = 30 };
-    MonoUlcnetConfig cfg_raw = mu_default_config(ULCNET_SR);
+    MonoUlcnetConfig cfg_raw = mu_default_config(g_grid.sample_rate);
     cfg_raw.model.infer = halving_infer;
     cfg_raw.model.io_descriptor = test_io_descriptor();
-    MonoUlcnetConfig cfg_null = mu_default_config(ULCNET_SR);
+    MonoUlcnetConfig cfg_null = mu_default_config(g_grid.sample_rate);
 
     MonoUlcnet* pr = mu_create(&cfg_raw);
     MonoUlcnet* pn = mu_create(&cfg_null);
@@ -1230,7 +1280,7 @@ static void test_model_applies_unlocked(void) {
         return;
     }
 
-    float mic[HOP], ref[HOP], out_r[HOP], out_n[HOP];
+    float mic[HOP_MAX], ref[HOP_MAX], out_r[HOP_MAX], out_n[HOP_MAX];
     EchoSim sim;
     echo_sim_init(&sim, ECHO_DELAY, 0xC0FFEEu);
 
@@ -1243,7 +1293,7 @@ static void test_model_applies_unlocked(void) {
             int zero = 1;
             for (int i = 0; i < HOP; i++) if (out_r[i] != 0.0f) zero = 0;
             CHECK(zero, "hop #0 still emits zeros (timing preamble unchanged)");
-        } else if (memcmp(out_r, out_n, sizeof(out_r)) == 0 && applied_from_hop1) {
+        } else if (memcmp(out_r, out_n, HOP_BYTES) == 0 && applied_from_hop1) {
             applied_from_hop1 = 0;
             first_equal_hop = h;
         }
@@ -1275,12 +1325,12 @@ typedef struct {
 } NanModelState;
 
 static int nan_infer(void* user,
-                     const float err_re[ULCNET_BINS], const float err_im[ULCNET_BINS],
-                     const float far_re[ULCNET_BINS], const float far_im[ULCNET_BINS],
-                     float out_re[ULCNET_BINS], float out_im[ULCNET_BINS]) {
+                     const float* err_re, const float* err_im,
+                     const float* far_re, const float* far_im,
+                     float* out_re, float* out_im) {
     NanModelState* st = (NanModelState*)user;
     (void)far_re; (void)far_im;
-    for (int k = 0; k < ULCNET_BINS; k++) {
+    for (int k = 0; k < BINS; k++) {
         out_re[k] = 0.5f * err_re[k];
         out_im[k] = 0.5f * err_im[k];
     }
@@ -1297,11 +1347,11 @@ static void test_nan_guard(void) {
     enum { N = 60 };
     NanModelState st = {0};
 
-    MonoUlcnetConfig cfg_a = mu_default_config(ULCNET_SR);
+    MonoUlcnetConfig cfg_a = mu_default_config(g_grid.sample_rate);
     cfg_a.model.user  = &st;
     cfg_a.model.infer = nan_infer;
     cfg_a.model.io_descriptor = test_io_descriptor();
-    MonoUlcnetConfig cfg_b = mu_default_config(ULCNET_SR);
+    MonoUlcnetConfig cfg_b = mu_default_config(g_grid.sample_rate);
 
     MonoUlcnet* pa = mu_create(&cfg_a);
     MonoUlcnet* pb = mu_create(&cfg_b);
@@ -1313,7 +1363,7 @@ static void test_nan_guard(void) {
         return;
     }
 
-    float mic[HOP], ref[HOP], out_a[HOP], out_b[HOP];
+    float mic[HOP_MAX], ref[HOP_MAX], out_a[HOP_MAX], out_b[HOP_MAX];
     EchoSim sim;
     echo_sim_init(&sim, 0, 0xC0FFEEu);   /* zero-delay: error nonzero from hop 0 */
 
@@ -1339,7 +1389,7 @@ static void test_nan_guard(void) {
         if (h == 0)      equal_expected = 1;               /* both all-zero */
         else             equal_expected = poisoned[h - 1] && poisoned[h];
 
-        int bitwise_equal = memcmp(out_a, out_b, sizeof(out_a)) == 0;
+        int bitwise_equal = memcmp(out_a, out_b, HOP_BYTES) == 0;
         if (equal_expected) {
             n_equal++;
             if (!bitwise_equal && equal_ok) { equal_ok = 0; first_bad_equal = h; }
@@ -1385,18 +1435,18 @@ typedef struct {
 } PartialModelState;
 
 static int partial_write_infer(void* user,
-                               const float err_re[ULCNET_BINS], const float err_im[ULCNET_BINS],
-                               const float far_re[ULCNET_BINS], const float far_im[ULCNET_BINS],
-                               float out_re[ULCNET_BINS], float out_im[ULCNET_BINS]) {
+                               const float* err_re, const float* err_im,
+                               const float* far_re, const float* far_im,
+                               float* out_re, float* out_im) {
     PartialModelState* st = (PartialModelState*)user;
     (void)far_re; (void)far_im;
-    int n = st->partial_now ? 100 : ULCNET_BINS;
+    int n = st->partial_now ? 100 : BINS;
     for (int k = 0; k < n; k++) {
         out_re[k] = 0.5f * err_re[k];
         out_im[k] = 0.5f * err_im[k];
     }
     /* rc stays 0 even for the partial write: only the pipeline's NaN
-     * pre-fill + finite guard can catch the 157 unwritten bins. */
+     * pre-fill + finite guard can catch the unwritten bins. */
     return 0;
 }
 
@@ -1404,11 +1454,11 @@ static void test_partial_write_guard(void) {
     enum { N = 60 };
     PartialModelState st = {0};
 
-    MonoUlcnetConfig cfg_a = mu_default_config(ULCNET_SR);
+    MonoUlcnetConfig cfg_a = mu_default_config(g_grid.sample_rate);
     cfg_a.model.user  = &st;
     cfg_a.model.infer = partial_write_infer;
     cfg_a.model.io_descriptor = test_io_descriptor();
-    MonoUlcnetConfig cfg_b = mu_default_config(ULCNET_SR);
+    MonoUlcnetConfig cfg_b = mu_default_config(g_grid.sample_rate);
 
     MonoUlcnet* pa = mu_create(&cfg_a);
     MonoUlcnet* pb = mu_create(&cfg_b);
@@ -1420,7 +1470,7 @@ static void test_partial_write_guard(void) {
         return;
     }
 
-    float mic[HOP], ref[HOP], out_a[HOP], out_b[HOP];
+    float mic[HOP_MAX], ref[HOP_MAX], out_a[HOP_MAX], out_b[HOP_MAX];
     EchoSim sim;
     echo_sim_init(&sim, 0, 0xC0FFEEu);   /* zero-delay: error nonzero from hop 0 */
 
@@ -1446,7 +1496,7 @@ static void test_partial_write_guard(void) {
         if (h == 0)      equal_expected = 1;               /* both all-zero */
         else             equal_expected = partial[h - 1] && partial[h];
 
-        int bitwise_equal = memcmp(out_a, out_b, sizeof(out_a)) == 0;
+        int bitwise_equal = memcmp(out_a, out_b, HOP_BYTES) == 0;
         if (equal_expected) {
             n_equal++;
             if (!bitwise_equal && equal_ok) { equal_ok = 0; first_bad_equal = h; }
@@ -1489,11 +1539,11 @@ static void test_partial_write_guard(void) {
 enum {
     RP_T        = 8,            /* boundary hop under test                 */
     RP_MARK_HOP = RP_T - 1,     /* last hop pushed before the boundary     */
-    RP_MARK_POS = HOP / 2,      /* impulse position inside that hop        */
     RP_RUN      = 14,           /* hops per probe run                      */
     RP_WINDOW   = 4,            /* hops examined from RP_T on              */
     RP_MAXCALL  = 32
 };
+#define RP_MARK_POS (HOP / 2)   /* impulse position inside that hop */
 /* A windowed unit impulse reaches every bin at |w| = 0.707; the residue a
  * marker-free frame can still carry (mic-HPF ring on the error branch, plain
  * zero on the far branch) is orders below. The margin is asserted, so this
@@ -1512,7 +1562,7 @@ typedef struct {
 
 static float spec_peak(const float* re, const float* im) {
     float m = 0.0f;
-    for (int k = 0; k < ULCNET_BINS; k++) {
+    for (int k = 0; k < BINS; k++) {
         float a = fabsf(re[k]);
         if (a > m) m = a;
         a = fabsf(im[k]);
@@ -1522,9 +1572,9 @@ static float spec_peak(const float* re, const float* im) {
 }
 
 static int probe_infer(void* user,
-                       const float err_re[ULCNET_BINS], const float err_im[ULCNET_BINS],
-                       const float far_re[ULCNET_BINS], const float far_im[ULCNET_BINS],
-                       float out_re[ULCNET_BINS], float out_im[ULCNET_BINS]) {
+                       const float* err_re, const float* err_im,
+                       const float* far_re, const float* far_im,
+                       float* out_re, float* out_im) {
     ProbeModelState* st = (ProbeModelState*)user;
     if (st->calls < RP_MAXCALL) {
         st->call_hop[st->calls] = st->hop;
@@ -1534,8 +1584,8 @@ static int probe_infer(void* user,
     } else {
         st->overflow = 1;
     }
-    memcpy(out_re, err_re, ULCNET_BINS * sizeof(float));
-    memcpy(out_im, err_im, ULCNET_BINS * sizeof(float));
+    memcpy(out_re, err_re, BINS * sizeof(float));
+    memcpy(out_im, err_im, BINS * sizeof(float));
     return 0;
 }
 
@@ -1545,9 +1595,9 @@ static void probe_reset(void* user) { ((ProbeModelState*)user)->resets++; }
  * fixed_delay == RP_T*HOP puts the FIXED raw->aligned switch on hop RP_T.
  * mark_far selects which branch carries the impulse. */
 static int reprime_probe_run(int fixed_delay, int mark_far, ProbeModelState* st) {
-    MonoUlcnetConfig cfg = mu_default_config(ULCNET_SR);
+    MonoUlcnetConfig cfg = mu_default_config(g_grid.sample_rate);
     MonoUlcnet* p;
-    float mic[HOP], ref[HOP], out[HOP];
+    float mic[HOP_MAX], ref[HOP_MAX], out[HOP_MAX];
 
     memset(st, 0, sizeof(*st));
     cfg.delay_mode = AEC_DELAY_FIXED;
@@ -1560,8 +1610,8 @@ static int reprime_probe_run(int fixed_delay, int mark_far, ProbeModelState* st)
     if (!p) return -1;
 
     for (int h = 0; h < RP_RUN; h++) {
-        memset(mic, 0, sizeof(mic));
-        memset(ref, 0, sizeof(ref));
+        memset(mic, 0, HOP_BYTES);
+        memset(ref, 0, HOP_BYTES);
         if (h == RP_MARK_HOP) {
             if (mark_far) ref[RP_MARK_POS] = 1.0f;
             else          mic[RP_MARK_POS] = 1.0f;
@@ -1725,9 +1775,9 @@ static void test_reprime_straddle_derivation(void) {
 static void test_reprime_behavior(void) {
     enum { N = 60, FIXED_HOPS = 8 };
     CountingModelState st = {0, 0};
-    MonoUlcnetConfig cfg = mu_default_config(ULCNET_SR);
+    MonoUlcnetConfig cfg = mu_default_config(g_grid.sample_rate);
     MonoUlcnet* p;
-    float mic[HOP], ref[HOP], out[HOP];
+    float mic[HOP_MAX], ref[HOP_MAX], out[HOP_MAX];
     EchoSim sim;
     int armed = 0, n_changed = 0, skipped_total = 0;
     int pattern_ok = 1, first_bad_hop = -1;
@@ -1790,7 +1840,7 @@ static void test_reprime_behavior(void) {
     /* ---- (b) FIXED ring-fill completion ---- */
     {
         CountingModelState fst = {0, 0};
-        MonoUlcnetConfig fcfg = mu_default_config(ULCNET_SR);
+        MonoUlcnetConfig fcfg = mu_default_config(g_grid.sample_rate);
         int fixed_calls_at_boundary = -1, fixed_calls_after = -1;
         int fixed_boundary = -1;
 
@@ -1811,7 +1861,7 @@ static void test_reprime_behavior(void) {
         for (int h = 0; h < N; h++) {
             AecLinearDelayState prev = pipeline_delay_state(p);
             calls_before = fst.infer_calls;
-            memset(mic, 0, sizeof(mic));
+            memset(mic, 0, HOP_BYTES);
             for (int i = 0; i < HOP; i++) ref[i] = lcg_sample();
             mu_process(p, mic, ref, out);
             if (h != 0 && prev == AEC_LINEAR_DELAY_UNLOCKED &&
@@ -1876,7 +1926,7 @@ static void test_reprime_behavior(void) {
 #define KD_MAX_UNDERSHOOT (128 * DELAY_RATE_FACTOR)
 /* 960 ms acquisition budget in wall-clock time on any grid. */
 #define KD_MAX_LOCK_HOPS \
-    ((960 * ULCNET_SR + 1000 * HOP - 1) / (1000 * HOP))
+    ((960 * g_grid.sample_rate + 1000 * HOP - 1) / (1000 * HOP))
 
 typedef struct {
     int locked;
@@ -1893,10 +1943,10 @@ static void mono_known_delay_run(int num_filters, int hops,
                                  int early_delay, float early_gain,
                                  MonoKnownDelayRun* out) {
     const int kd_pad = 16384 * DELAY_RATE_FACTOR;
-    MonoUlcnetConfig cfg = mu_default_config(ULCNET_SR);
+    MonoUlcnetConfig cfg = mu_default_config(g_grid.sample_rate);
     MonoUlcnet* p;
     float* far_hist;
-    float mic[HOP], ref[HOP], outbuf[HOP];
+    float mic[HOP_MAX], ref[HOP_MAX], outbuf[HOP_MAX];
     clock_t t0, t1;
     int hop, i;
 
@@ -1953,12 +2003,12 @@ static void test_known_delay_profile(void) {
     int mislock_error;
 
     printf("known-delay acquisition (mono, %d Hz, hop %d, synthetic echo):\n",
-           ULCNET_SR, HOP);
+           g_grid.sample_rate, HOP);
     for (n = 1; n <= 5; n++) {
         MonoKnownDelayRun in_range, out_of_range;
-        int inside = inside_ms[n] * ULCNET_SR / 1000;
+        int inside = inside_ms[n] * g_grid.sample_rate / 1000;
         int outside = (n == 5) ? 9271 * DELAY_RATE_FACTOR
-                               : inside_ms[n + 1] * ULCNET_SR / 1000;
+                               : inside_ms[n + 1] * g_grid.sample_rate / 1000;
 
         mono_known_delay_run(n, 200, inside, 0.6f, inside, 0.0f, &in_range);
         mono_known_delay_run(n, 200, outside, 0.6f, outside, 0.0f, &out_of_range);
@@ -1966,10 +2016,10 @@ static void test_known_delay_profile(void) {
         printf("  n=%d ceiling %d samples (%.2f ms): in-range %d ms -> lock hop %d "
                "applied %d (short by %d); out-of-range %d ms -> %s\n",
                n, KD_RELIABLE_SAMPLES(n),
-               KD_RELIABLE_SAMPLES(n) * 1000.0 / ULCNET_SR,
+               KD_RELIABLE_SAMPLES(n) * 1000.0 / g_grid.sample_rate,
                inside_ms[n], in_range.lock_hop, in_range.applied_delay,
                in_range.locked ? inside - in_range.applied_delay : -1,
-               outside * 1000 / ULCNET_SR,
+               outside * 1000 / g_grid.sample_rate,
                out_of_range.locked ? "LOCKED" : "no lock");
 
         CHECK(in_range.locked && in_range.lock_hop >= 0 &&
@@ -1977,7 +2027,7 @@ static void test_known_delay_profile(void) {
               fmt_msg("mono n=%d acquires a %d ms bulk delay within %d hops "
                       "(lock hop %d, inside its %.2f ms ceiling)",
                       n, inside_ms[n], KD_MAX_LOCK_HOPS, in_range.lock_hop,
-                      KD_RELIABLE_SAMPLES(n) * 1000.0 / ULCNET_SR));
+                      KD_RELIABLE_SAMPLES(n) * 1000.0 / g_grid.sample_rate));
         CHECK(in_range.locked &&
               inside - in_range.applied_delay >= 0 &&
               inside - in_range.applied_delay <= KD_MAX_UNDERSHOOT,
@@ -1989,8 +2039,8 @@ static void test_known_delay_profile(void) {
                       "static delay (%d)", n, in_range.changed_hops));
         CHECK(outside > KD_RELIABLE_SAMPLES(n) && !out_of_range.locked,
               fmt_msg("mono n=%d does NOT acquire a %d ms bulk delay (beyond its "
-                      "%.2f ms ceiling)", n, outside * 1000 / ULCNET_SR,
-                      KD_RELIABLE_SAMPLES(n) * 1000.0 / ULCNET_SR));
+                      "%.2f ms ceiling)", n, outside * 1000 / g_grid.sample_rate,
+                      KD_RELIABLE_SAMPLES(n) * 1000.0 / g_grid.sample_rate));
     }
 
     /* Mislock detectability: an out-of-range dominant path plus an in-range early
@@ -2006,15 +2056,15 @@ static void test_known_delay_profile(void) {
            "(32.00 ms) -> lock hop %d applied %d (%.2f ms), wrong by %d samples "
            "(%.2f ms)\n",
            mislock.lock_hop, mislock.applied_delay,
-           mislock.applied_delay * 1000.0 / ULCNET_SR,
-           mislock_error, mislock_error * 1000.0 / ULCNET_SR);
+           mislock.applied_delay * 1000.0 / g_grid.sample_rate,
+           mislock_error, mislock_error * 1000.0 / g_grid.sample_rate);
     CHECK(mislock.locked,
           "mono: an in-range early path makes an out-of-range bulk delay lock anyway");
     CHECK(mislock.locked && mislock_error > KD_MAX_UNDERSHOOT,
           fmt_msg("mono: ground-truth comparison FLAGS the mislock (applied short "
                   "by %d samples = %.2f ms, far past the %d-sample alignment "
                   "contract); the LOCKED seam state alone cannot",
-                  mislock_error, mislock_error * 1000.0 / ULCNET_SR,
+                  mislock_error, mislock_error * 1000.0 / g_grid.sample_rate,
                   KD_MAX_UNDERSHOOT));
     CHECK(control.locked &&
           3536 * DELAY_RATE_FACTOR - control.applied_delay >= 0 &&
@@ -2027,7 +2077,7 @@ static void test_known_delay_profile(void) {
 
     /* RAM: the per-filter pool cost lands in this single AEC instance. */
     for (n = 1; n <= 5; n++) {
-        MonoUlcnetConfig cfg = mu_default_config(ULCNET_SR);
+        MonoUlcnetConfig cfg = mu_default_config(g_grid.sample_rate);
         cfg.delay_num_filters = n;
         if (mu_get_mem_requirements(&cfg, &req[n]) != 0)
             mem_ok = 0;
@@ -2035,7 +2085,7 @@ static void test_known_delay_profile(void) {
     CHECK(mem_ok, "mono pool query answers for every n=1..5");
     if (mem_ok) {
         printf("mono pool vs matched-filter bank size (%d Hz, fft %d):\n",
-               ULCNET_SR, ULCNET_N_FFT);
+               g_grid.sample_rate, g_grid.n_fft);
         for (n = 1; n <= 5; n++) {
             printf("  n=%d  total %llu", n, (unsigned long long)req[n].bytes);
             if (n > 1)
@@ -2057,9 +2107,9 @@ static void test_known_delay_profile(void) {
     }
 
     /* Rough per-hop CPU, recorded rather than tuned. The budget is the wall
-     * time one hop of audio occupies on the compiled grid, so it retimes with
+     * time one hop of audio occupies on the grid under test, so it retimes with
      * the grid instead of assuming 16 ms. Host measurement, liveness guard. */
-    const double hop_budget_us = (double)HOP * 1e6 / (double)ULCNET_SR;
+    const double hop_budget_us = (double)HOP * 1e6 / (double)g_grid.sample_rate;
     mono_known_delay_run(5, 400, 3536 * DELAY_RATE_FACTOR, 0.6f,
                          3536 * DELAY_RATE_FACTOR, 0.0f, &cost);
     printf("known-delay cost (mono, n=5): %.1f us/hop, %.4f x real time "
@@ -2082,13 +2132,13 @@ static void test_known_delay_profile(void) {
 enum { PH_RUN, PH_FAIL, PH_NAN, PH_OPEN, PH_UNFETCHED };
 
 static int phased_twin_matches(int mode, int hops) {
-    MonoUlcnetConfig cfg = mu_default_config(ULCNET_SR);
+    MonoUlcnetConfig cfg = mu_default_config(g_grid.sample_rate);
     MonoUlcnetConfig cb_cfg = cfg;
     NanModelState nan_state;
     FailModelState fail_state;
     MonoUlcnet *ph, *cb;
     EchoSim sim;
-    float mic[ULCNET_HOP], ref[ULCNET_HOP], a[ULCNET_HOP], b[ULCNET_HOP];
+    float mic[HOP_MAX], ref[HOP_MAX], a[HOP_MAX], b[HOP_MAX];
     UlcnetNnJob job;
     int h, ok = 1, nonzero = 0, ran = 0;
 
@@ -2137,8 +2187,8 @@ static int phased_twin_matches(int mode, int hops) {
         }
         ok = ok && mu_process_end(ph, a) == 0;
         if (!ok) break;
-        if (memcmp(a, b, sizeof(a)) != 0) ok = 0;
-        for (int i = 0; i < ULCNET_HOP; ++i) if (a[i] != 0.0f) nonzero = 1;
+        if (memcmp(a, b, HOP_BYTES) != 0) ok = 0;
+        for (int i = 0; i < HOP; ++i) if (a[i] != 0.0f) nonzero = 1;
     }
     mu_destroy(ph);
     mu_destroy(cb);
@@ -2148,10 +2198,10 @@ static int phased_twin_matches(int mode, int hops) {
 }
 
 static void test_phased_hop(void) {
-    MonoUlcnetConfig cfg = mu_default_config(ULCNET_SR);
+    MonoUlcnetConfig cfg = mu_default_config(g_grid.sample_rate);
     MonoUlcnet* p = mu_create(&cfg);
     UlcnetNnJob job;
-    float mic[ULCNET_HOP] = {0}, ref[ULCNET_HOP] = {0}, out[ULCNET_HOP];
+    float mic[HOP_MAX] = {0}, ref[HOP_MAX] = {0}, out[HOP_MAX];
 
     CHECK(phased_twin_matches(PH_RUN, 120),
           "phased hop with the caller's network equals the callback-driven pipeline byte for byte");
@@ -2208,9 +2258,9 @@ static double energy_f(const float* x, int n) {
 }
 
 static int guard_hops_run(const GuardScene* sc, GuardHopStats* gs) {
-    MonoUlcnetConfig cfg = mu_default_config(ULCNET_SR);
+    MonoUlcnetConfig cfg = mu_default_config(g_grid.sample_rate);
     MonoUlcnet* p = mu_create(&cfg);
-    float formed_prev[HOP], out[HOP], mic_prev[HOP];
+    float formed_prev[HOP_MAX], out[HOP_MAX], mic_prev[HOP_MAX];
     int guard_prev = 0, prev_ok = 0;
 
     memset(gs, 0, sizeof(*gs));
@@ -2262,8 +2312,8 @@ static int guard_hops_run(const GuardScene* sc, GuardHopStats* gs) {
             }
             if (den > 0.0 && num / den > gs->max_sep) gs->max_sep = num / den;
         }
-        memcpy(formed_prev, rctx.formed_hop, sizeof(formed_prev));
-        memcpy(mic_prev, mic, sizeof(mic_prev));
+        memcpy(formed_prev, rctx.formed_hop, HOP_BYTES);
+        memcpy(mic_prev, mic, HOP_BYTES);
         prev_ok = 1;
     }
     mu_destroy(p);
@@ -2271,7 +2321,7 @@ static int guard_hops_run(const GuardScene* sc, GuardHopStats* gs) {
 }
 
 static void test_guard_hops_feed_analysis_seam(void) {
-    const int seconds = ULCNET_SR == 16000 ? 14 : 6;
+    const int seconds = g_grid.sample_rate == 16000 ? 14 : 6;
     const char* nm[3] = { "moving echo path with double talk", "silent head, no echo path (never usable)",
                           "aec_reset events and a moving path" };
     GuardScene sc[3];
@@ -2280,13 +2330,13 @@ static void test_guard_hops_feed_analysis_seam(void) {
     double worst_guard_err = 0.0, worst_sep = 0.0;
     int built = 1, ran = 1;
 
-    built &= guard_scene_make(&sc[0], nm[0], ULCNET_SR, ULCNET_N_FFT, seconds, 0x2545F491u, 1, 1, 1, 0) == 0;
-    built &= guard_scene_make(&sc[1], nm[1], ULCNET_SR, ULCNET_N_FFT, seconds, 0x1234567u, 0, 0, 0, 30) == 0;
+    built &= guard_scene_make(&sc[0], nm[0], g_grid.sample_rate, g_grid.n_fft, seconds, 0x2545F491u, 1, 1, 1, 0) == 0;
+    built &= guard_scene_make(&sc[1], nm[1], g_grid.sample_rate, g_grid.n_fft, seconds, 0x1234567u, 0, 0, 0, 30) == 0;
     if (built) {
         int n = sc[1].nh * sc[1].hop;
         for (int i = 0; i < n; ++i) sc[1].mic[i] += 0.03f * gs_rnd();
     }
-    built &= guard_scene_make(&sc[2], nm[2], ULCNET_SR, ULCNET_N_FFT, seconds, 0x2545F491u, 1, 1, 1, 0) == 0;
+    built &= guard_scene_make(&sc[2], nm[2], g_grid.sample_rate, g_grid.n_fft, seconds, 0x2545F491u, 1, 1, 1, 0) == 0;
     CHECK(built, "guard hops: the three guard scenes build");
     if (!built) return;
     sc[2].reset_at[0] = sc[2].nh / 4;
@@ -2336,7 +2386,8 @@ static void test_guard_hops_feed_analysis_seam(void) {
     for (int i = 0; i < 3; i++) guard_scene_free(&sc[i]);
 }
 
-int main(void) {
+/* Every test on the grid in g_grid. */
+static void run_grid(void) {
     printf("=== mono_alignulcnet: identity E2E (one-hop latency) ===\n");
     test_identity_e2e();
 
@@ -2396,7 +2447,19 @@ int main(void) {
 
     printf("\n=== mono_alignulcnet: known-delay profile (acquisition/coverage/mislock/cost) ===\n");
     test_known_delay_profile();
+}
 
+int main(void) {
+    for (size_t g = 0; g < sizeof(k_grids) / sizeof(k_grids[0]); g++) {
+        if (ulcnet_grid_make(&g_grid, &k_grids[g]) != ULCNET_GRID_OK ||
+            g_grid.hop > HOP_MAX || g_grid.n_bins > BINS_MAX) {
+            fprintf(stderr, "FAIL: grid row %zu does not build or exceeds the test buffers\n", g);
+            return 1;
+        }
+        printf("\n##### mono_alignulcnet on grid %d Hz / fft %d / hop %d #####\n",
+               g_grid.sample_rate, g_grid.n_fft, g_grid.hop);
+        run_grid();
+    }
     if (g_failures) {
         fprintf(stderr, "\n%d FAILURE(S)\n", g_failures);
         return 1;

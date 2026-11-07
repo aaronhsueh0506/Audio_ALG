@@ -35,23 +35,24 @@ th{background:#eef2f8}
 
 <h1>Align-ULCNet pipeline 流程時序圖(mono / 4ch)</h1>
 <h2>概要</h2>
-<p>本頁是 <a href="pipeline_ulcnet_usage.html">pipeline_ulcnet_usage</a> 的時序圖:初始化、穩態 hop(mono 與 4ch,含 adapter 與 NPU)、拆開的 front／beam 形式、失敗與 reset。箭頭標的是實際函式名,順序就是呼叫順序;「|」是生命線,箭頭太短放不下的標籤寫在箭頭上一行。端到端延遲是 1 個編譯期格點 hop(16 kHz 為 256 samples = 16 ms,48 kHz 為 512 samples = 10.67 ms),來源是 synthesis 的半窗 trim;hop #0 輸出全零,hop p 輸出對應輸入 hop p-1(各頁的 hop 泳道圖見 <a href="pipeline_ulcnet_mono.html">mono</a>、<a href="pipeline_ulcnet_4ch.html">4ch</a>)。</p>
-<h2>1. 初始化(mono;4ch 把 <code>Aec</code> 換成 <code>mcab_sample_flow_init()</code> 加 <code>mcab_sample_beam_init()</code>,stage 用 <code>ulcnet_nn_stage_mem_size(0)</code>)</h2>
+<p>本頁是 <a href="pipeline_ulcnet_usage.html">pipeline_ulcnet_usage</a> 的時序圖:初始化、穩態 hop(mono 與 4ch,含 adapter 與 NPU)、拆開的 front／beam 形式、失敗與 reset。箭頭標的是實際函式名,順序就是呼叫順序;「|」是生命線,箭頭太短放不下的標籤寫在箭頭上一行。端到端延遲是 1 個 grid hop(16 kHz 為 256 samples = 16 ms,48 kHz 為 512 samples = 10.67 ms),來源是 synthesis 的半窗 trim;hop #0 輸出全零,hop p 輸出對應輸入 hop p-1(各頁的 hop 泳道圖見 <a href="pipeline_ulcnet_mono.html">mono</a>、<a href="pipeline_ulcnet_4ch.html">4ch</a>)。</p>
+<h2>1. 初始化(mono;4ch 把 <code>Aec</code> 換成 <code>mcab_sample_flow_init()</code> 加 <code>mcab_sample_beam_init()</code>,stage 用 <code>ulcnet_nn_stage_mem_size(&amp;grid, 0)</code>)</h2>
 <pre>App(main.c)                 Aec                   UlcnetNnStage                 Adapter                   NPU run()
   |                          |                          |                          |                          |
-  | aec_config_from_level(&amp;aec_cfg, BALANCED, ULCNET_SR) + fft_size / delay_* / enable_res = 0 / return_res_context = 1 / LINEAR_ONLY(derive_lane())|
-  | ulcnet_model_io_descriptor_default(D, &amp;desc)        D 必須等於匯出時的 delay depth                        |
+  | ulcnet_grid_make(&amp;grid, &amp;spec)   spec = {sample_rate, n_fft, delay_depth};delay_depth 必須等於匯出時的 D(範例 main:--sample-rate 選表的一列) |
+  | aec_config_from_level(&amp;aec_cfg, BALANCED, grid.sample_rate) + fft_size = grid.n_fft / delay_* / enable_res = 0 / return_res_context = 1 / LINEAR_ONLY(derive_lane())|
+  | ulcnet_model_io_descriptor_default(&amp;grid, &amp;desc)        取回該 grid 的契約(內部欄位為 0)                        |
   |-- ulcnet_accelerator_adapter_get_mem_size(&amp;desc, &amp;bytes, &amp;align) -------------&gt;|                          |
-  |-- ulcnet_accelerator_adapter_init(pool, bytes, &amp;desc, run, user) -------------&gt;|                          |
-  |                          |                          |                          | ulcnet_prepost_init_ex(FREQ 模式)-&gt; 四個 state tensor 在 caller pool;NULL = 未對齊／太小／descriptor 被拒
+  |-- ulcnet_accelerator_adapter_init(pool, bytes, &amp;desc, NULL, run, user) -------------&gt;|                          |   (NULL = 板端不登錄 state)
+  |                          |                          |                          | ulcnet_prepost_init_ex -&gt; state 屬於應用端,不在 pool;NULL = 未對齊／太小／descriptor 或 state 登錄被拒
   | aec_get_mem_size(&amp;aec_cfg)                          |                          |                          |
   |-------------------------&gt;|                          |                          |                          |
-  | ulcnet_nn_stage_mem_size(1)           mono:1 = 另帶時域 error 分析用的 STFT;4ch:0                         |
+  | ulcnet_nn_stage_mem_size(&amp;grid, 1)           mono:1 = 另帶時域 error 分析用的 STFT;4ch:0                         |
   |----------------------------------------------------&gt;|                          |                          |
   | aec_init(pool, aec_b, &amp;aec_cfg)                     |                          |                          |
   |-------------------------&gt;|                          |                          |                          |
-  |-- ulcnet_nn_stage_init(mem, stage_b, 1) -----------&gt;|                          |                          |
-  |                          |                          | fft_init -&gt; ac_window_build -&gt; ac_stft_init(far[, err]) -&gt; ac_istft_init;model 起始為 identity
+  |-- ulcnet_nn_stage_init(mem, stage_b, &amp;grid, 1) -----------&gt;|                          |                          |
+  |                          |                          | ac_stft_init(far,持有 FftHandle 與視窗表) -&gt; [ac_stft_init(err)] -&gt; ac_istft_init;model 起始為 identity
   |-- ulcnet_accelerator_adapter_model(adapter) ----------------------------------&gt;|                          |
   |&lt;- UlcnetModel{user = adapter, infer, reset, io_descriptor} --------------------|                          |
   |-- ulcnet_nn_stage_set_model(stage, &amp;model) --------&gt;|                          |                          |
@@ -60,7 +61,7 @@ th{background:#eef2f8}
 <h2>2. 穩態 hop:mono</h2>
 <pre>App(main.c)                 Aec                   UlcnetNnStage          Adapter(model.infer)             NPU run()
   |                          |                          |                          |                          |
--- 每個 hop(mic / ref / out 各 ULCNET_HOP 個 float) ----------------------------------------------------------------------
+-- 每個 hop(mic / ref / out 各 grid.hop 個 float) ----------------------------------------------------------------------
   | aec_process_context(aec, mic, ref)                  |                          |                          |
   |-------------------------&gt;|                          |                          |                          |
   | aec_get_res_context(aec, &amp;rctx);  aec_get_linear_context(aec, &amp;lctx)           |                          |
@@ -75,12 +76,12 @@ th{background:#eef2f8}
   |-- ulcnet_nn_stage_process(stage, out) -------------&gt;|                          |                          |
   |                          |                          | model.infer(user, err_re, err_im, far_re, far_im, out_re, out_im)
   |                          |                          |-------------------------&gt;|                          |
-  |                          |                          |                          | ulcnet_prepost_pre_process_freq -&gt; frame_inputs(K/V、logit、h_gru 視圖;output 預填 NaN)
-  |                          |                          |                          | run(run_user, &amp;inputs, &amp;outputs)
+  |                          |                          |                          | ulcnet_prepost_pre_process_freq -&gt; frame_open(K/V、logit、h_gru 視圖;output 預填 NaN)
+  |                          |                          |                          | run(run_user, &amp;inputs, &amp;outputs)    板端:跑前比對 state generation,變了就重載量化 0
   |                          |                          |                          |-------------------------&gt;|
   |                          |                          |                          | 0 = output 與四個 *_out 寫入原位址 | 非 0
   |                          |                          |                          |&lt;-------------------------|
-  |                          |                          |                          | rc != 0 -&gt; frame_skip,回 -1;commit 驗證有限(失敗:四個 state 歸零、generation +1、frame_skip、回 -1);成功 -&gt; post_process_freq
+  |                          |                          |                          | rc != 0 -&gt; frame_bypass,回 -1;frame_finish 驗證有限(失敗:已登錄的 state 歸零、generation +1、frame_bypass、回 -1);成功 -&gt; post_process_freq
   |                          |                          |&lt;- 0 | -1 ----------------|                          |
 -- 路徑 B:phased,呼叫端自己跑加速器(可以呼叫 adapter 的 model.infer,或自己的 NPU 程式) -----------------------------------
   | ulcnet_nn_stage_nn_begin(stage, &amp;job)  -&gt;  1 | 0(reprime 幀)| &lt; 0              |                          |
@@ -97,7 +98,7 @@ th{background:#eef2f8}
 <h2>3. 穩態 hop:4ch(直送路徑)</h2>
 <pre>App(main.c)          McabSampleBeam            Mcab(flow)              UlcnetNnStage          Adapter → NPU
   |                          |                          |                          |                          |
--- 每個 hop(mics = [ULCNET_HOP][4] interleaved,far / out 各 ULCNET_HOP 個 float) -----------------------------------------
+-- 每個 hop(mics = [grid.hop][4] interleaved,far / out 各 grid.hop 個 float) -----------------------------------------
   | mcab_sample_beam_process_with_activity(unit, mics, far, vad, vad, NULL, &amp;beam, &amp;info)                       |
   |-------------------------&gt;|                          |                          |                          |
   |                          | mcab_process_front(flow, mics, far, &amp;front):共用 delay aligner -&gt; 4 條線性 AEC lane |
@@ -130,11 +131,11 @@ th{background:#eef2f8}
   |-- ulcnet_nn_stage_reset(stage) --------------------&gt;|                          |                          |
   |                          |                          | ac_stft_reset(far[, err]);ac_istft_reset;last_delay、frame_index、phase、reprime_frames 清零;安裝的模型保留
   |                          |                          |-- model.reset(user) ----&gt;|                          |
-  |                          |                          |                          | ulcnet_prepost_reset:四個 state tensor 歸零,ulcnet_accelerator_adapter_state_generation() +1
+  |                          |                          |                          | ulcnet_prepost_reset:已登錄的 state 歸零(板端未登錄:無),ulcnet_accelerator_adapter_state_generation() +1
   |                          |                          |                          | 定點加速器自己的 state 緩衝:generation 變了就填量化後的 0(板端 run() 內做)
   |                          |                          |                          |-------------------------&gt;|
 -- 不是錯誤、不要 reset --------------------------------------------------------------------------------------------------
-  | nn_end(rc != 0)或輸出有非有限 bin:該幀 identity;adapter 的 commit 拒絕則自己把 state 歸零                 |
+  | nn_end(rc != 0)或輸出有非有限 bin:該幀 identity;adapter 的 frame_finish 拒絕時 state generation +1(已登錄的 state 歸零)                 |
   | alignment 邊界(CHANGED／首次 solid):stage 在 begin 內自己 model.reset + reprime,不需要 App 動作           |</pre>
 <p>alignment 邊界(<code>CHANGED</code>，或 FIXED 首次 <code>UNLOCKED → LOCKED</code>)之後有 <code>ULCNET_NN_STAGE_REPRIME_FRAMES</code>(= 1)個發射幀走 identity 且不呼叫模型;推導與兩個 grid 的實測見 <a href="pipeline_ulcnet_detail.html">pipeline_ulcnet_detail</a>。</p>
 

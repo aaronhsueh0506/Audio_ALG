@@ -3,7 +3,7 @@
  * every special value (NaN, signed zero, infinity, subnormal, extremes). The
  * kernels are static, so this file includes their translation units.
  * KERNEL_TEST_ULCNET selects ulcnet_model_io.c, KERNEL_TEST_DEEPVQE selects
- * deepvqe_prepost.c. */
+ * deepvqe_prepost.c. The grid is the argument grid=<sample rate>,<n_fft>. */
 /* posix_memalign is declared only with this under -std=c11 on glibc. */
 #define _POSIX_C_SOURCE 200112L
 #include <math.h>
@@ -21,6 +21,14 @@
 #else
 #error "define KERNEL_TEST_ULCNET or KERNEL_TEST_DEEPVQE"
 #endif
+
+#define BINS_MAX 513
+
+/* The grid under test (run-time). */
+static int g_sample_rate = 16000;
+static int g_n_fft = 512;
+static int g_bins = 257;
+#define BINS g_bins
 
 #define CHECK(condition, message) do {                                      \
     if (!(condition)) {                                                     \
@@ -103,17 +111,42 @@ static int test_rows_all_finite(void)
 }
 
 #if defined(KERNEL_TEST_ULCNET)
-#define BINS ULCNET_MODEL_IO_BINS
+/* State table of the shipped graph (pinned to the exporter by
+ * test_export_streaming_ulcnet.py). */
+#define STATE_CHANNELS 32
+#define STATE_SCORE_FRAMES 5
+#define STATE_GRU_ROWS 4
+#define STATE_GRU_HIDDEN 128
+#define STATE_TA_BINS(n_bins) (((n_bins) + 9) / 10)
+#define STATE_DEPTH 12
 
+/* A state over the grid under test with the application's four recurrent buffers
+ * registered: the window checks below need real windows. */
 static UlcnetModelIoState* make_state(void)
 {
+    const UlcnetGridSpec spec = {
+        .sample_rate = g_sample_rate, .n_fft = g_n_fft, .delay_depth = STATE_DEPTH };
+    const size_t kv = (size_t)STATE_CHANNELS * STATE_DEPTH * (size_t)STATE_TA_BINS(g_bins);
+    const size_t logit = (size_t)STATE_CHANNELS * STATE_SCORE_FRAMES * STATE_DEPTH;
+    const size_t gru = (size_t)STATE_GRU_ROWS * STATE_GRU_HIDDEN;
+    UlcnetModelIoStateBuffers buffers;
     UlcnetModelIoDescriptor d;
     UlcnetModelIoMemReq req;
+    UlcnetGrid grid;
     void* pool;
-    if (ulcnet_model_io_descriptor_default(12, &d) != 0) return NULL;
+    if (ulcnet_grid_make(&grid, &spec) != ULCNET_GRID_OK) return NULL;
+    if (ulcnet_model_io_descriptor_default(&grid, &d) != 0) return NULL;
     if (ulcnet_model_io_get_mem_requirements(&d, &req) != 0) return NULL;
     if (posix_memalign(&pool, req.alignment, req.bytes) != 0) return NULL;
-    return ulcnet_model_io_init(pool, req.bytes, &d);
+    buffers = (UlcnetModelIoStateBuffers){
+        .key_history = (float*)malloc(kv * sizeof(float)), .key_history_elements = kv,
+        .value_history = (float*)malloc(kv * sizeof(float)), .value_history_elements = kv,
+        .logit_history = (float*)malloc(logit * sizeof(float)), .logit_history_elements = logit,
+        .h_gru = (float*)malloc(gru * sizeof(float)), .gru_hidden_elements = gru,
+    };
+    if (!buffers.key_history || !buffers.value_history || !buffers.logit_history ||
+        !buffers.h_gru) return NULL;
+    return ulcnet_model_io_init(pool, req.bytes, &d, &buffers);
 }
 
 #if SK_HAVE_NEON
@@ -153,9 +186,10 @@ static int test_ulcnet_kernels(void)
     UlcnetModelIoState* a = make_state();
     UlcnetModelIoState* b = make_state();
     UlcnetModelIoState* c = make_state();
-    static float er[BINS], ei[BINS], fr[BINS], fi[BINS];
-    static float w_mag[BINS], w_far[BINS], w_cos[BINS], w_sin[BINS], w_ri[2 * BINS];
-    static float enh_a[2][BINS], enh_b[2][BINS], enh_c[2][BINS];
+    static float er[BINS_MAX], ei[BINS_MAX], fr[BINS_MAX], fi[BINS_MAX];
+    static float w_mag[BINS_MAX], w_far[BINS_MAX], w_cos[BINS_MAX], w_sin[BINS_MAX],
+        w_ri[2 * BINS_MAX];
+    static float enh_a[2][BINS_MAX], enh_b[2][BINS_MAX], enh_c[2][BINS_MAX];
     UlcnetModelIoInputs in;
     UlcnetModelIoOutputs out;
     CHECK(a && b && c, "state allocation");
@@ -199,7 +233,7 @@ static int test_ulcnet_kernels(void)
         memcpy(b->error_ri, a->error_ri, 2 * BINS * sizeof(float));
         back_end_scalar(b, enh_b[0], enh_b[1]);
         back_end(a, enh_a[0], enh_a[1]);
-        CHECK(same_bits(&enh_a[0][0], &enh_b[0][0], 2 * BINS),
+        CHECK(same_bits(enh_a[0], enh_b[0], BINS) && same_bits(enh_a[1], enh_b[1], BINS),
               "back end equals its scalar twin");
         for (int i = 0; i < BINS; ++i) {
             float er_ = a->error_ri[2 * i], ei_ = a->error_ri[2 * i + 1];
@@ -209,28 +243,37 @@ static int test_ulcnet_kernels(void)
             enh_c[0][i] = copysignf(powf(fabsf(re), 1.0f / 0.3f), re);
             enh_c[1][i] = copysignf(powf(fabsf(im), 1.0f / 0.3f), im);
         }
-        CHECK(same_bits(&enh_c[0][0], &enh_b[0][0], 2 * BINS),
+        CHECK(same_bits(enh_c[0], enh_b[0], BINS) && same_bits(enh_c[1], enh_b[1], BINS),
               "back end scalar twin equals the plain contract");
 #if SK_HAVE_NEON
         back_end_neon(a, enh_a[0], enh_a[1]);
-        CHECK(same_bits(&enh_a[0][0], &enh_b[0][0], 2 * BINS),
+        CHECK(same_bits(enh_a[0], enh_b[0], BINS) && same_bits(enh_a[1], enh_b[1], BINS),
               "back end NEON kernel equals its scalar twin");
 #endif
     }
     return 1;
 }
 
-/* frame_is_finite reads exactly the tensors and slots one frame writes. */
+/* frame_is_finite reads the mask and the whole of every registered window: a
+ * non-finite value in any slot, the oldest and the dropped one included, is seen. */
 static int test_ulcnet_frame_finite(void)
 {
     UlcnetModelIoState* s = make_state();
-    const size_t channels = ULCNET_MODEL_IO_TA_CHANNELS;
-    const size_t key_stride = s->key_history_elements / channels;
-    const size_t logit_stride = s->logit_history_elements / channels;
-    const size_t depth = logit_stride / ULCNET_MODEL_IO_SCORE_WINDOW;
-    const size_t newest_logit = logit_stride - depth;
+    const size_t channels = STATE_CHANNELS;
+    const size_t ta_bins = (size_t)STATE_TA_BINS(g_bins);
     float bad = INFINITY;
+    size_t key_stride, logit_stride, depth, newest_logit;
     CHECK(s != NULL, "state allocation");
+    /* The window views are the registered buffers: a missing registration must
+     * not turn the scans below into empty loops. */
+    CHECK(s->key_history != NULL && s->value_history != NULL &&
+          s->logit_history != NULL && s->h_gru != NULL, "state registration");
+    key_stride = s->key_history_elements / channels;
+    logit_stride = s->logit_history_elements / channels;
+    depth = logit_stride / STATE_SCORE_FRAMES;
+    newest_logit = logit_stride - depth;
+    CHECK(key_stride == (size_t)STATE_DEPTH * ta_bins && depth == (size_t)STATE_DEPTH,
+          "registered element counts follow the table");
     fill(s->output, s->spectrum_ri_elements, 1.0f, 0);
     fill(s->h_gru, s->gru_hidden_elements, 1.0f, 0);
     fill(s->key_history, s->key_history_elements, 1.0f, 0);
@@ -238,7 +281,7 @@ static int test_ulcnet_frame_finite(void)
     fill(s->logit_history, s->logit_history_elements, 1.0f, 0);
     CHECK(frame_is_finite(s) == 1, "a finite frame is accepted");
     for (size_t ch = 0; ch < channels; ch += 5) {
-        for (size_t t = 0; t < ULCNET_MODEL_IO_TA_BINS; t += 7) {
+        for (size_t t = 0; t < ta_bins; t += 7) {
             float* slot = &s->key_history[ch * key_stride + t];
             float keep = *slot;
             *slot = bad;
@@ -257,12 +300,28 @@ static int test_ulcnet_frame_finite(void)
             CHECK(frame_is_finite(s) == 0, "a non-finite newest logit is refused");
             *slot = keep;
         }
-        /* an older frame is not read */
-        s->key_history[ch * key_stride + ULCNET_MODEL_IO_TA_BINS] = NAN;
-        s->logit_history[ch * logit_stride] = NAN;
-        CHECK(frame_is_finite(s) == 1, "older frames are not read");
-        s->key_history[ch * key_stride + ULCNET_MODEL_IO_TA_BINS] = 0.5f;
-        s->logit_history[ch * logit_stride] = 0.5f;
+        /* an older frame is read as well */
+        {
+            float* old_key = &s->key_history[ch * key_stride + ta_bins];
+            float* oldest_key = &s->key_history[ch * key_stride + key_stride - 1];
+            float* old_value = &s->value_history[ch * key_stride + key_stride - 1];
+            float* old_logit = &s->logit_history[ch * logit_stride];
+            float keep_key = *old_key, keep_oldest = *oldest_key;
+            float keep_value = *old_value, keep_logit = *old_logit;
+            *old_key = NAN;
+            CHECK(frame_is_finite(s) == 0, "a non-finite older key slot is refused");
+            *old_key = keep_key;
+            *oldest_key = NAN;
+            CHECK(frame_is_finite(s) == 0, "a non-finite oldest key slot is refused");
+            *oldest_key = keep_oldest;
+            *old_value = INFINITY;
+            CHECK(frame_is_finite(s) == 0, "a non-finite oldest value slot is refused");
+            *old_value = keep_value;
+            *old_logit = NAN;
+            CHECK(frame_is_finite(s) == 0, "a non-finite older logit frame is refused");
+            *old_logit = keep_logit;
+        }
+        CHECK(frame_is_finite(s) == 1, "a restored window is accepted again");
     }
     s->h_gru[s->gru_hidden_elements - 1] = NAN;
     CHECK(frame_is_finite(s) == 0, "a non-finite hidden state is refused");
@@ -273,89 +332,44 @@ static int test_ulcnet_frame_finite(void)
 #if defined(KERNEL_TEST_DEEPVQE)
 static int test_deepvqe_kernels(void)
 {
-    static float re[AIAEC_N_BINS], im[AIAEC_N_BINS], got[2 * AIAEC_N_BINS],
-        want[2 * AIAEC_N_BINS];
+    static float re[BINS_MAX], im[BINS_MAX], got[2 * BINS_MAX], want[2 * BINS_MAX];
     const float exponent = DEEPVQE_COMPRESSION_EXP - 1.0f;
     for (int round = 0; round < 60; ++round) {
         int k = round % KCASES;
-        fill(re, AIAEC_N_BINS, kScales[k], kRates[k]);
-        fill(im, AIAEC_N_BINS, kScales[k], kRates[k]);
-        compress_planar(re, im, got);
-        for (int i = 0; i < AIAEC_N_BINS; ++i) {
+        fill(re, BINS, kScales[k], kRates[k]);
+        fill(im, BINS, kScales[k], kRates[k]);
+        compress_planar(re, im, got, BINS);
+        for (int i = 0; i < BINS; ++i) {
             float a = re[i] * re[i], b = im[i] * im[i];
             float scale = powf(sqrtf(a + b + 1e-12f), exponent);
             want[i] = re[i] * scale;
-            want[AIAEC_N_BINS + i] = im[i] * scale;
+            want[BINS + i] = im[i] * scale;
         }
-        CHECK(same_bits(got, want, 2 * AIAEC_N_BINS),
+        CHECK(same_bits(got, want, 2 * BINS),
               "compress_planar equals the plain contract");
     }
     return 1;
 }
-
-/* newest_frame_finite against a plain per-channel loop. */
-static int test_deepvqe_newest_frame(void)
-{
-    DeepVqePrepostConfig cfg;
-    DeepVqePrepost* p;
-    deepvqe_prepost_config_defaults(&cfg, DEEPVQE_IO_FREQ,
-                                    DEEPVQE_PREPOST_DEFAULT_D);
-    p = deepvqe_prepost_create(&cfg);
-    CHECK(p != NULL, "prepost allocation");
-    for (int id = 0; id < DEEPVQE_STATE_COUNT; ++id) {
-        float* state = (float*)p->state[id];
-        int dims[DEEPVQE_STATE_MAX_RANK];
-        size_t channels, frames, width, newest;
-        fill(state, p->state_elements[id], 1.0f, 0);
-        CHECK(newest_frame_finite(p, id) == 1, "a finite state is accepted");
-        if (id == DEEPVQE_STATE_H_GRU) {
-            state[p->state_elements[id] - 1] = NAN;
-            CHECK(newest_frame_finite(p, id) == 0, "a bad hidden state is refused");
-            continue;
-        }
-        CHECK(deepvqe_prepost_state_shape(id, p->descriptor.delay_depth, dims) > 0,
-              "state shape");
-        channels = (size_t)dims[1];
-        frames = (size_t)dims[2];
-        width = (size_t)dims[3];
-        newest = (id == DEEPVQE_STATE_ALIGN_KEY_RING ||
-                  id == DEEPVQE_STATE_ALIGN_VALUE_RING) ? 0u : frames - 1u;
-        for (size_t ch = 0; ch < channels; ++ch) {
-            for (size_t i = 0; i < width; i += (width > 33 ? 5 : 1)) {
-                float* slot = &state[(ch * frames + newest) * width + i];
-                float keep = *slot;
-                *slot = special();
-                {
-                    int want = isfinite(*slot) ? 1 : 0;
-                    CHECK(newest_frame_finite(p, id) == want,
-                          "the newest frame decides");
-                }
-                *slot = keep;
-            }
-            if (frames > 1) {  /* an older frame is not read */
-                size_t older = (newest == 0u) ? 1u : 0u;
-                float* slot = &state[(ch * frames + older) * width];
-                *slot = NAN;
-                CHECK(newest_frame_finite(p, id) == 1, "older frames are not read");
-                *slot = 0.25f;
-            }
-        }
-    }
-    deepvqe_prepost_destroy(p);
-    return 1;
-}
 #endif
 
-int main(void)
+int main(int argc, char** argv)
 {
     SK_MATCH_SCALAR_TO_VECTOR_MODE();
+    for (int i = 1; i < argc; ++i) {
+        if (strncmp(argv[i], "grid=", 5) != 0 ||
+            sscanf(argv[i] + 5, "%d,%d", &g_sample_rate, &g_n_fft) != 2) {
+            fprintf(stderr, "usage: %s [grid=<sample rate>,<n_fft>]\n", argv[0]);
+            return EXIT_FAILURE;
+        }
+        g_bins = g_n_fft / 2 + 1;
+        if (g_bins > BINS_MAX) return EXIT_FAILURE;
+    }
     if (!test_rows_all_finite()) return EXIT_FAILURE;
 #if defined(KERNEL_TEST_ULCNET)
     if (!test_ulcnet_kernels()) return EXIT_FAILURE;
     if (!test_ulcnet_frame_finite()) return EXIT_FAILURE;
 #else
     if (!test_deepvqe_kernels()) return EXIT_FAILURE;
-    if (!test_deepvqe_newest_frame()) return EXIT_FAILURE;
 #endif
     printf("prepost kernels: backend=%s ok\n", SK_NEON_BACKEND_NAME);
     return EXIT_SUCCESS;

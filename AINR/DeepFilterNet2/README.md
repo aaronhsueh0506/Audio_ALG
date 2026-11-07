@@ -60,54 +60,54 @@ Use `AINR/dataset_gen` to produce or pack the noisy/clean pairs at the grid's sa
 
 ## C deployment boundary
 
-`dfn2_process.h/.c` owns the streaming STFT, ERB/complex normalization,
-parameter-free cascade/alpha composition, attenuation limit, and WOLA. The
-accelerator only needs to emit `(erb_mask, coefs, alpha)`. Run
-`make -C .. test-simd` to compare the default NEON path against the scalar
-reference; `make -C .. SIMD=0 test` forces the latter.
+The library is frequency domain only and holds no transform, window or grid. The application frames with audiolib (`AcStft` /
+`AcIstft`, `ac_stft_push_planar()` / `ac_istft_push_planar()`) and passes one spectrum per hop, framed as in training:
+audiolib's default periodic sqrt-Hann window, center 0, hop `n_fft / 2`, plain overlap-add (`AC_OLA_ACCUMULATE`),
+`spec_scale = grid.stft_scale` (1/sqrt(n_fft)) and `ispec_scale = grid.stft_unscale` (sqrt(n_fft)). A wrong window or scale is not
+detectable inside the library. Against the training graph's `center=True` padding only the first frame of a clip differs.
 
-`dfn2_prepost.h/.c` is the integrator's entry point: one opaque object that
-composes `dfn2_process.c` and `dfn2_model_io.c` behind the same lifecycle and per-hop
-shape as the AIAEC classes, described once in `../../AIAEC/README.md`
-("C pre/post-processing"). Specific to this one: the `DFN2Grid` in its config
-decides everything that depends on the signal grid or the lookahead pair;
-`pre_process` returns 0 on the first `mask_lookahead` hops (the graph needs its
-right-hand neighbours) and 1 after (every N-th hop in a build for N frames per
-call, see [Multi-frame export](#multi-frame-export)); the
-spectra at the `DFN2_IO_FREQ` boundary are torch.stft normalized=True on the
-instance's grid (`grid.stft_scale` = 1/sqrt(n_fft); 1024 points on the shipped 48 kHz grid), so chaining
-an AIAEC spectrum in is a sqrt(n_fft) scale error (`grid.stft_unscale`, 32x on the shipped grid; the
-header's warning block); the window is borrowed (a `cfg.window` of NULL
-makes the pool carve the sqrt-Hann table for the analysis object); in
-`DFN2_IO_TIME` the synthesis is the application's audiolib `AcIstft`, built
-from `dfn2_framing_config()` and handed in as `cfg.istft` (the class pushes
-into it and resets it with its own state; with `DFN2_IO_FREQ` the caller
-pushes the spectrum from `post_process_freq` itself); and the two recurrent state
-tensors (`h_gru`, `df_convp_history`) live in the pool at addresses that never
-change. The runtime binds each state output (`gru_hidden_next`,
-`df_convp_window_next`) to the same address as its input, so the output of one
-invocation is the input of the next with no copy; it must read all state inputs
-before it writes any state output there. A commit that finds a non-finite head
-or state value zeroes the two recurrent tensors, because the previous state was
-overwritten and cannot be restored. `dfn2_prepost_state_generation()` is 1 after
-init and advances on every `dfn2_prepost_reset()` and every refused commit
-(modulo 2^32): the accelerator's fixed-point copy of the state is not reached
-by either event, so a runtime that sees a different value than at the previous
-frame refills its state tensors with quantized zeros. Its gate is
-`../tests/test_dfn2_prepost_c.py`; `make -C .. lib` ships it in
-`libainr_prepost.a` (`make -C .. print-lib-path` prints the configuration-keyed
-location).
+`dfn2_process.h/.c` owns the ERB/complex normalization, parameter-free cascade/alpha composition and the attenuation limit. The
+accelerator only needs to emit `(erb_mask, coefs, alpha)`. Run `make -C .. test-simd` to compare the default NEON path against the
+scalar reference; `make -C .. SIMD=0 test` forces the latter.
 
-Use `dfn2_compose_stream()` for the accelerator boundary, not the aligned
-`dfn2_compose()` reference. At wall frame `n`, the returned head describes
-`n-mask_lookahead`; the cascade can emit only after that head has also masked
-the future DF source. Therefore the shipped `mask_lookahead=1` and
-`df_lookahead=1` have a total streaming delay of **two hops** (21.33 ms on the
-shipped 48 kHz grid), even though each individual knob is one. The
-`DFN2PrepostConfig` carries the `DFN2Grid` by value, `dfn2_prepost_grid()` returns the
-instance's copy and `dfn2_prepost_latency_frames(grid)` the model's delay in hops. The C test uses changing
-masks and nontrivial future taps so an off-by-one head/spectrum pairing cannot
-pass as a merely finite output.
+`dfn2_prepost.h/.c` is the integrator's entry point: one opaque object that wraps `dfn2_process.c` and `dfn2_model_io.c` behind
+the same lifecycle and per-hop shape as the AIAEC classes, described once in `../../AIAEC/README.md` ("C pre/post-processing").
+Specific to this one:
+
+- the `DFN2Grid` in its config decides everything that depends on the signal grid or the lookahead pair;
+- with `frames_per_call` 1, `pre_process_freq` returns 1 on every hop. The first `mask_lookahead` hops (M) are warm-up frames (the graph's
+  right-hand neighbours are not there yet): the accelerator runs on them, `frame_finish()` / `frame_bypass()` discard their heads,
+  zero the registered state, advance the state generation by one and return 0, so the first real frame starts from zero state and
+  the audio is as if the accelerator had not run. `dfn2_model_run_frame()` still returns 1 for a warm-up frame whose `infer()`
+  succeeded. For N > 1 frames per call it keeps the older flow, see [Multi-frame export](#multi-frame-export); with M = 0 there is no
+  warm-up frame;
+- the spectra are `torch.stft(normalized=True)` on the instance's grid (`grid.stft_scale` = 1/sqrt(n_fft); 1024 points on the shipped
+  48 kHz grid), so chaining an AIAEC spectrum in is a sqrt(n_fft) scale error (`grid.stft_unscale`, 32x on the shipped grid; see
+  `dfn2_prepost.h`);
+- the pool is the caller's (`dfn2_prepost_get_mem_size()`, memory, `dfn2_prepost_init_ex()`) and holds the feature windows, rings,
+  normaliser state and output staging, not the recurrent state;
+- the two recurrent state tensors (`h_gru`, `df_convp_history`) belong to the application. A float host registers a (pointer, element
+  count) pair for each in `DFN2PrepostConfig` (all pairs or none): the instance zeroes them at init and reset, finite-checks them at
+  every commit and hands out those very addresses, so the runtime binds each state output (`gru_hidden_next`,
+  `df_convp_window_next`) to the same address as its input and the output of one invocation is the input of the next with no copy;
+  it must read all state inputs before it writes any state output. A board registers nothing (NULL and 0 in the views): its
+  accelerator holds the state;
+- a commit that finds a non-finite head or state value zeroes the registered tensors, advances the state generation and returns -1
+  with the frame still open; `dfn2_prepost_frame_bypass()` then passes the noisy spectrum through;
+- `dfn2_prepost_state_generation()` is 1 after init and advances on every `dfn2_prepost_reset()`, every warm-up frame and every refused
+  commit of a real frame (modulo 2^32), whether or not state is registered: the accelerator's fixed-point copy of the state is not reached by either event, so a
+  runtime that sees a different value than at the previous frame refills its state tensors with quantized zeros.
+
+Its gate is `../tests/test_dfn2_prepost_c.py`; `make -C .. lib` ships it in `libainr_prepost.a` (`make -C .. print-lib-path` prints
+the configuration-keyed location).
+
+Use `dfn2_enhance_spectrum_stream()` for the accelerator boundary, not the aligned `dfn2_enhance_spectrum()` reference. At wall frame
+`n`, the returned head describes `n-mask_lookahead`; the cascade can emit only after that head has also masked the future DF source.
+Therefore the shipped `mask_lookahead=1` and `df_lookahead=1` have a total streaming delay of **two hops** (21.33 ms on the shipped
+48 kHz grid), even though each individual knob is one. The `DFN2PrepostConfig` carries the `DFN2Grid` by value,
+`dfn2_prepost_grid()` returns the instance's copy and `dfn2_prepost_latency_frames(grid)` (`mask_lookahead + df_lookahead +
+frames_per_call - 1`) the model's delay in hops. The C test uses changing masks and nontrivial future taps so an off-by-one
+head/spectrum pairing cannot pass as a merely finite output.
 
 ## Lookahead pairs
 
@@ -118,122 +118,100 @@ is the shipped one. The shared rules (window, guards, tests) are in
 [`../README.md`](../README.md#lookahead-pairs-deepfilternet2-and-deepfilternet3).
 Specific to DFN2:
 
-- In C the pair is two fields of the `DFN2Grid` (`mask_lookahead`, `df_lookahead`), set when the application calls
+- In C the pair is two fields of `DFN2GridSpec` (`mask_lookahead`, `df_lookahead`), set when the application calls
   `dfn2_grid_make()`. Nothing is selected at build time and there is no link-time pair symbol: a graph description
-  of another pair is refused by the model-I/O descriptor, a pool of another pair by the pool hash, and a grid whose pair does
-  not fit the capacities by `DFN2_GRID_ERR_CAPACITY`.
+  of another pair is refused by the model-I/O descriptor, a pool of another pair by the pool hash, and a pair outside the
+  ranges by `DFN2_GRID_ERR_MASK_LOOKAHEAD` / `DFN2_GRID_ERR_DF_LOOKAHEAD`.
 - DFN2 is a cascade: the deep filter reads the ERB-masked spectrum, so the
   output is `M + D` frames behind the input and the end-to-end latency is
-  `1 + M + D` hops (three for the shipped pair). The first M hops only fill the
-  window; the following D hops run the accelerator but emit nothing.
-- The rings hold `grid.ring = max(DF_ORDER, M + D + 1)` frames: five up to
-  `M + D = 4`, six for `M + D = 5`, seven for `M + D = 6` (2/4). The state is sized for the capacity
-  `DFN2_MAX_DF_RING` (5 by default), so a pair that needs more (ring 6 or 7) is refused until the build raises it
-  (`-DDFN2_MAX_DF_RING=7` on every unit; `tests/dfn_pairs.py` `defines()` adds it for the tests). Mask-only
-  keeps only the noisy ring, `M + 1` frames, and its capacity is 2.
+  `1 + M + D` hops (three for the shipped pair). The first M hops are warm-up
+  frames (the accelerator runs, its heads are discarded and the state restarts); the first M + D hops emit nothing (`valid` 0).
+- The rings hold `grid.ring = max(df_order, M + D + 1)` frames: five up to
+  `M + D = 4`, six for `M + D = 5` (1/4, 2/3), seven for `M + D = 6` (2/4). The state is carved to that ring at init, so a
+  deeper pair only makes the pool larger (92,608 bytes at 1/1, 104,640 at 2/3, 116,672 at 2/4 on the 48 kHz grid; 64-bit host).
+  Mask-only keeps only the noisy ring, `M + 1` frames.
 
 ## Choosing the grid
 
-**The library holds no grid.** The application builds a `DFN2Grid` with `dfn2_grid_make()` and passes it to every
-object it creates (`dfn2_state_init`, `dfn2_model_io_init`, `dfn2_prepost_config_defaults`, the model-I/O descriptor,
-`dfn2_framing_config`). The same binary runs any grid within the compile-time capacities below. The grid, the trained
-model and its ERB matrices must belong together: the grid is the model's `config.ini [signal]` and `[model]`.
+**The library holds no grid.** What a trained model fixes is a `DFN2GridSpec`; the application builds the `DFN2Grid` with
+`dfn2_grid_make()` and passes it to every object it creates (`dfn2_state_init`, `dfn2_model_io_init`,
+`dfn2_prepost_config_defaults`, the model-I/O descriptor). The same binary runs any grid the maker accepts: there is no
+compile-time capacity, the pool is sized from the grid at run time. The grid, the trained model and its ERB matrices must
+belong together.
 
-```c
-DFN2Grid grid;                                   /* sample_rate n_fft n_erb df_bins mask_la df_la */
-int status = dfn2_grid_make(&grid, 48000, 1024, 32, 96, 1, 1);
-if (status != DFN2_GRID_OK) { fprintf(stderr, "%s\n", dfn2_grid_status_text(status)); return -1; }
+The shipped model's spec is the `SHIPPED` initializer of the example under [Calling the library](#calling-the-library);
+`dfn2_grid_make(&grid, &spec)` returns `DFN2_GRID_OK` or the first failing status (`dfn2_grid_status_text()` names it).
 
-DFN2PrepostConfig cfg;
-dfn2_prepost_config_defaults(&cfg, DFN2_IO_TIME, &grid);       /* copies the grid */
-AcStftConfig sc;
-dfn2_framing_config(&sc, &grid, fft, NULL);                    /* for the AcStft / AcIstft */
-```
+**Given and derived.** The spec holds what a trained model fixes; the rest follows by formula (`dfn2_grid.h`):
 
-**Given and derived.** The six given values are what a trained model fixes. The rest follows by formula
-(`dfn2_grid.h`):
+| spec field | source |
+|---|---|
+| `sample_rate`, `n_fft`, `n_erb`, `df_bins`, `df_order`, `mask_lookahead`, `df_lookahead` | `config.ini` `[signal]` (`sr`, `n_fft`) and `[model]` (the same names) |
+| `frames_per_call` | heads per accelerator call (`export_onnx.py --frames-per-call`, 1 for the shipped graph) |
+| `erb_norm_tau_sec`, `erb_norm_init_lo_db`, `erb_norm_init_hi_db`, `erb_norm_scale_db`, `spec_norm_tau_sec`, `spec_norm_init_lo`, `spec_norm_init_hi` | `config.ini` `[feature]` (the same names); `calibrate_norm_init.py` estimates them for another grid; they must equal the training values |
 
-| field | value |
+| derived field | value |
 |---|---|
 | `hop`, `n_bins` | `n_fft / 2`, `n_fft / 2 + 1` (audiolib 50 % overlap sqrt-Hann framing) |
+| `input_frames` | `frames_per_call + 2` (`DFN2_MODEL_INPUT_FRAMES` is 3) |
 | `stft_scale`, `stft_unscale` | float32 `1 / sqrt(n_fft)` and `sqrt(n_fft)`: the `torch.stft(normalized=True)` factor, also `train.py`'s `analysis_scale()` for win = n_fft, hop = n_fft / 2 |
-| `erb_norm_alpha`, `spec_norm_alpha` | `dfn2_norm_alpha(sample_rate, hop, 1.0)` = `train.py` `make_norm_alpha`: `exp(-(hop / sr) / tau)` rounded to three decimals, one more digit while that reaches 1.0, tau = 1.0 s. 0.989 for hop 512 at 48 kHz, 0.992 for hop 128 at 16 kHz and hop 256 at 32 kHz. A model trained with another tau overwrites the two fields (`dfn2_norm_alpha()` computes them) |
-| `df_history`, `ring` | `DF_ORDER - df_lookahead - 1` past deep-filter taps; ring depth `max(DF_ORDER, mask + df + 1)` (mask-only `mask + 1`) |
+| `erb_norm_alpha`, `spec_norm_alpha` | `dfn2_norm_alpha(sample_rate, hop, tau_sec)` = `train.py` `make_norm_alpha`: `exp(-(hop / sr) / tau)` rounded to three decimals, one more digit while that reaches 1.0. 0.989 for hop 512 at 48 kHz, 0.992 for hop 128 at 16 kHz and hop 256 at 32 kHz (tau 1.0 s). Derived, never given |
+| `df_history`, `ring` | `df_order - df_lookahead - 1` past deep-filter taps; ring depth `max(df_order, mask + df + 1)` (mask-only `mask + 1`) |
 
-**Validity** (`dfn2_grid_make()` returns the first failing check and leaves the grid untouched;
+**Validity** (`dfn2_grid_make()` returns the first failing check, in this order, and leaves the grid untouched;
 `dfn2_grid_validate()` runs the same checks on an existing grid and also refuses a hand-edited derived field):
 
 | status | rule |
 |---|---|
 | `DFN2_GRID_ERR_NULL` | NULL pointer |
-| `DFN2_GRID_ERR_SAMPLE_RATE` | `sample_rate > 0`, and the norm alpha it gives (`dfn2_norm_alpha(sample_rate, hop, 1.0)`) strictly between 0 and 1 as float32: a rate so low or so high that the rounded alpha reaches 0 or 1 is refused |
-| `DFN2_GRID_ERR_N_FFT` | a power of two in [16, 8192] (audiolib `audio_stft.h`) |
+| `DFN2_GRID_ERR_SAMPLE_RATE` | `sample_rate > 0` |
+| `DFN2_GRID_ERR_N_FFT` | a size audiolib's framing builds (`ac_stft_get_mem_size()` is not 0: a power of two in [16, 8192]) with `n_bins <= 65535` (16-bit ERB spans) |
 | `DFN2_GRID_ERR_N_ERB` | a positive multiple of 4 (the ERB kernel runs bands in fours and the encoder halves the band axis twice; `train.py` asks for the same), every band at least two bins: `2 * n_erb <= n_bins` |
 | `DFN2_GRID_ERR_DF_BINS` | in [2, n_bins), up to n_bins with `-DDFN2_MASK_ONLY` (bins above the deep filter keep the masked spectrum) |
-| `DFN2_GRID_ERR_MASK_LOOKAHEAD` | in [0, 2] |
-| `DFN2_GRID_ERR_DF_LOOKAHEAD` | in [0, `DF_ORDER` - 1]; 0 with `-DDFN2_MASK_ONLY` |
-| `DFN2_GRID_ERR_CAPACITY` | `n_fft`, `n_erb`, `df_bins` or the ring above the capacities below |
+| `DFN2_GRID_ERR_DF_ORDER` | in [1, `DFN2_GRID_DF_ORDER_MAX` = 16]; with `-DDFN2_MASK_ONLY` any value in [0, 16], stored as 0 |
+| `DFN2_GRID_ERR_MASK_LOOKAHEAD` | in [0, `DFN2_GRID_MASK_LOOKAHEAD_MAX` = 2] |
+| `DFN2_GRID_ERR_DF_LOOKAHEAD` | in [0, `df_order` - 1]; 0 with `-DDFN2_MASK_ONLY` |
+| `DFN2_GRID_ERR_FRAMES_PER_CALL` | in [1, `DFN2_MODEL_MAX_FRAMES_PER_CALL` = 64] |
+| `DFN2_GRID_ERR_ERB_NORM`, `DFN2_GRID_ERR_SPEC_NORM` | tau finite and > 0, starts finite (spec starts and the ERB scale > 0), and the alpha it gives strictly between 0 and 1 as float32: a rate or tau that rounds the alpha to 0 or 1 is refused |
 | `DFN2_GRID_ERR_INCONSISTENT` | (`dfn2_grid_validate()`) a derived field differs from what `dfn2_grid_make()` derives, or an alpha is not in (0, 1) |
 
-Every library entry point that takes a grid runs `dfn2_grid_validate()` and refuses an invalid one (-1). `dfn2_framing_config()` returns nothing, so it zeroes the config it was given (`fft_size` 0): `ac_stft_get_mem_size()` and `ac_istft_get_mem_size()` of it are 0 and the framing objects refuse it, and the error surfaces at the next call that needs the objects.
+Status -8 is unassigned and is never reused. Every library entry point that takes a grid runs `dfn2_grid_validate()` and refuses
+an invalid one (-1 or NULL).
 
-**Capacities (compile time).** The state and the model-I/O arrays are plain structs sized for the largest grid the
-build serves; a grid runs in the first part of each array (`DFN2ModelIOState` arrays are packed at the grid's stride:
-`erb_window[f * n_erb + b]`, `spec_window[(c * WF + f) * df_bins + k]`, `df_convp_window[(ch * 5 + w) * df_bins + k]`).
+**RAM.** The pool follows the grid and the pair (`dfn2_prepost_get_mem_size()`, 64-bit host, bytes). The application's `AcStft` /
+`AcIstft`, the ERB matrices and the registered recurrent state are not in the pool:
 
-| macro | default | meaning |
+| grid (board table pair) | full | mask-only |
 |---|---|---|
-| `DFN2_MAX_N_FFT` | 1024 | largest `n_fft` (`DFN2_MAX_N_BINS` follows) |
-| `DFN2_MAX_N_ERB` | 32 | most ERB bands |
-| `DFN2_MAX_DF_BINS` | 96 | most deep-filter bins |
-| `DFN2_MAX_DF_RING` | 5 (mask-only 2) | deepest ring: every pair with M + D <= 4 (ring 5); mask-only mask lookahead up to 1 |
+| 16 kHz, n_fft 256, n_erb 24, pair 0/0 | 47,744 | 10,912 |
+| 32 kHz, n_fft 512, n_erb 28, pair 0/0 | 62,784 | 16,736 |
+| 48 kHz, n_fft 1024, n_erb 32, pair 1/1 (mask-only 1/0) | 92,608 | 32,224 |
 
-A grid above one is refused (`DFN2_GRID_ERR_CAPACITY`). Raise a capacity with one `-D` on **every** translation unit of the
-build, e.g. `-DDFN2_MAX_DF_RING=7` for the pair 2/4 or `-DDFN2_MAX_DF_RING=3` for mask-only with mask lookahead 2. They are
-capacities, never the grid a program runs.
+On the 48 kHz grid a deeper ring grows the full pool: 104,640 bytes at 2/3 (ring 6) and 116,672 at 2/4 (ring 7); `frames_per_call` 4
+gives 144,112. The recurrent state the shipped graph needs is 1,280 + 30,720 floats (`h_gru` and `df_convp_history`), the application's.
 
-**RAM.** Because the arrays are sized for the capacity, a smaller grid wastes the difference. Measured on this host (64-bit,
-`dfn2_prepost_get_mem_size`, default capacities 1024 / 32 / 96 / 5; bytes; the application's FFT handle and `AcIstft` are not in the pool):
-
-| grid (board table pair) | `DFN2_IO_FREQ` | `DFN2_IO_TIME` | mask-only `DFN2_IO_FREQ` | mask-only `DFN2_IO_TIME` |
-|---|---|---|---|---|
-| 16 kHz, n_fft 256, n_erb 24, pair 0/0 | 210,336 | 213,984 | 25,632 | 29,280 |
-| 32 kHz, n_fft 512, n_erb 28, pair 0/0 | 213,456 | 220,688 | 28,752 | 35,984 |
-| 48 kHz, n_fft 1024, n_erb 32, pair 1/1 (mask-only 1/0) | 219,648 | 234,048 | 34,944 | 49,344 |
-
-`sizeof(DFN2State)` is 67,424 bytes and `sizeof(DFN2ModelIOState)` 130,712 for every grid of the default build (15,360 and
-5,784 mask-only); `sizeof(DFN2Grid)` is 56. A build that only serves a smaller grid lowers the capacities and gets that grid's size
-back: `-DDFN2_MAX_N_FFT=256 -DDFN2_MAX_N_ERB=24` makes the 16 kHz pool 174,784 / 178,432 (FREQ / TIME, 35,552 bytes less) and
-`-DDFN2_MAX_N_FFT=512 -DDFN2_MAX_N_ERB=28` the 32 kHz pool 189,792 / 197,024; mask-only at 16 kHz with the first pair of flags
-14,656 / 18,304. A lowered build refuses the larger grids with `DFN2_GRID_ERR_CAPACITY`.
-
-**What stays compile time**: `DFN2_DF_ORDER` (5; defining it is a `#error`), the capacities above, `-DDFN2_MASK_ONLY`,
-`DFN2_FRAMES_PER_CALL`, the graph geometry (`DFN2_MODEL_*`: GRU hidden 256, 64 encoder channels, three input frames),
-`DFN2_FEATURE_VERSION` and the normaliser starting points (`DFN2_ERB_NORM_INIT_LO_DB` and the others in `dfn2_process.h`, libDF's
-literals; a model trained with others defines them on the build line, on every unit). The pool hash reads the values compiled into
-`dfn2_process.c` (`dfn2_norm_starts[]`), the unit that initialises the state, so a unit built with other values does not change the hash.
+**What stays compile time**: `-DDFN2_MASK_ONLY` (every translation unit; the variant of the state and of the accelerator boundary
+structs) and `DFN2_FEATURE_VERSION`. The graph geometry (GRU rows and width, encoder channels, pathway window) is not in the
+library: it is what the application registers or the board's accelerator holds, and the descriptor's six interior fields are
+zero from `dfn2_model_io_descriptor_default()` and never read.
 
 **Link symbol and pool identity.**
 
 - `dfn2_process.c` defines one symbol and the other units reference it through `DFN2_REQUIRE_VARIANT_LINK()`:
-  `dfn2_variant_{full|mask_only}_n<MAX_N_FFT>_e<MAX_N_ERB>_d<MAX_DF_BINS>_r<MAX_DF_RING>`, for example
-  `dfn2_variant_full_n1024_e32_d96_r5`. Objects built with a different variant (`-DDFN2_MASK_ONLY` on some units only) or different
-  capacities do not link; the grid and the pair are not in it. Under a `.c` -> `.o` rule objects of other flags share names:
-  keep one object directory per flag set (`make -C AINR lib` does), or clean between builds. `dfn2_frames_per_call<N>` is
-  the other link symbol (see [Multi-frame export](#multi-frame-export)).
-- `DFN2_PREPOST_CARVE_VERSION` is 9 (previously 8): the pool holds capacity-sized state and the state records the grid. The
-  pool hash (`build_flags_hash`, FNV-1a-32) folds the whole grid for every grid: sample rate, n_fft, hop, n_erb, df_bins, `DF_ORDER`,
-  both lookaheads, both alphas and the five normaliser starting points (from `dfn2_norm_starts[]` of `dfn2_process.c`), plus the
-  layout and carve versions, the graph geometry, the feature version, the io_mode and, for N > 1, N. A `DFN2PrepostMemReq` recorded
-  with carve 8 is refused by `dfn2_prepost_init_ex`; query the size again. The capacities are not in the hash: they change the pool
-  size (`bytes`, compared by `_init_ex`) and the link symbol.
-- Hashes of the board table (FREQ / TIME): 16 kHz 0/0 `3655a46b` / `1bb2ea3e`, 32 kHz 0/0 `18104ee0` / `68b1df35`,
-  48 kHz 1/1 `5a69e185` / `f6a49ec8`; the same grid with another pair has another hash.
+  `dfn2_variant_full` or `dfn2_variant_mask_only`. Objects built with a different variant (`-DDFN2_MASK_ONLY` on some units only)
+  do not link; the grid and the pair are not in it. Under a `.c` -> `.o` rule objects of other flags share names: keep one object
+  directory per flag set (`make -C AINR lib` does), or clean between builds.
+- `DFN2_PREPOST_CARVE_VERSION` is 11. The pool hash (`build_flags_hash`, FNV-1a-32) folds the whole grid: sample rate, n_fft, hop,
+  n_bins, n_erb, df_bins, `df_order`, both lookaheads, history, ring, `frames_per_call`, `input_frames`, both time constants and
+  alphas, the two scales and the five normaliser starting points, plus the variant, the layout and carve versions and the feature
+  version. A `DFN2PrepostMemReq` recorded by another grid or build is refused by `dfn2_prepost_init_ex`; query the size again.
 
-**Board samples.** The board samples (`audio_sample/`, outside this repo) own the table from (sample rate, FFT size) to the model
-geometry; the library only validates what they pass. The three rows below are the table of the standalone samples; `alg_ai3_aec_dfn.c` and the pipeline
-example mains (`pipelines/dfn/dfn_example_args.h`) keep two of them, without 32000 / 512, because the AEC in front of the model has
-no 32 kHz grid; the mask-only sample differs, in its df lookahead (see its row in the second table):
+**Board samples.** The board samples (`audio_sample/`, outside this repo) own the table from (sample rate, FFT size) to a
+`DFN2GridSpec` row, designated initialisers passed to `dfn2_grid_make()`; a row carries the model's numbers (`df_order`,
+`frames_per_call` 1 and the seven normaliser values). The library only validates what they pass. The three rows below are the table of
+the standalone samples; `alg_ai3_aec_dfn.c` and the pipeline example mains (`pipelines/dfn/dfn_example_args.h`) keep two of them,
+without 32000 / 512, because the AEC in front of the model has no 32 kHz grid; the mask-only sample differs, in its df lookahead (see
+its row in the second table):
 
 | model sample rate | FFT size | n_erb | df_bins | mask / df lookahead | state |
 |---|---|---|---|---|---|
@@ -241,70 +219,101 @@ no 32 kHz grid; the mask-only sample differs, in its df lookahead (see its row i
 | 32000 | 512 | 28 | 96 | 0 / 0 | provisional, no model trained |
 | 48000 | 1024 | 32 | 96 | 1 / 1 | shipped |
 
-Each sample builds its `DFN2Grid` with `dfn2_grid_make()` from a row and passes it down. `--n-erb` and `--df-bins` are never flags
-(the row gives them), and a pair outside the table is refused with the list of accepted ones. Defaults are 48000 and 1024.
+`--n-erb` and `--df-bins` are never flags (the row gives them), and a pair outside the table is refused with the list of accepted
+ones. Defaults are 48000 and 1024.
 
 | sample | how the grid is chosen |
 |---|---|
 | `alg_ai3_dfn.c` | `--sample-rate <Hz>` and `--fft-size <n>`: the stream's rate is the model's rate. A token that begins `--sample` or `--fft` and is not one of these (`--sample-rate=16000`, `--samplerate`) prints the usage and exits 2 instead of running the default grid |
-| `alg_ai3_dfn_lite.c` | the same flags and the same rule, with the mask-only table: `df_lookahead` is 0 in every row (48000 / 1024 is 1 / 0). The full model and the mask-only model are two separate samples; the lite one builds every library unit with `-DDFN2_MASK_ONLY`, in an object directory of its own |
+| `alg_ai3_dfn_lite.c` | the same flags and the same rule, with the mask-only table: `df_order` is 0 and `df_lookahead` is 0 in every row (48000 / 1024 is 1 / 0). The full model and the mask-only model are two separate samples; the lite one builds every library unit with `-DDFN2_MASK_ONLY`, in an object directory of its own |
 | `alg_ai3_aec_dfn.c` | `--ai-sample-rate <Hz>` and `--ai-fft-size <n>` choose the model grid; `--sr` stays the host rate (when absent it follows the model's rate). Host rate equal to the model's: `DfnResStage` drives the model directly. Any other rate goes through `DfnRateBridge`, which needs the 48000 / 1024 model and a host at 8000 or 16000, and is otherwise refused with a message before the NPU is set up (exit 1). Its table has no 32000 / 512 row (its AEC has no 32 kHz grid), so that pair is refused with the accepted list (exit 2). A misspelt token that begins `--ai` exits 2 |
-| `uvc_ai_nr_stream.c` | 48 kHz only (USB audio is 48 kHz; a native 16 kHz UVC path is out of scope) and no flags. It builds its grid with `dfn2_grid_make(48000, 1024, 32, 96, 1, 1)` from its own one-row constants and drives the `DFN2Prepost` class (`DFN2_IO_FREQ`) directly: the grid goes to `dfn2_framing_config()`, `dfn2_prepost_config_defaults()`, the tensor tables and the ERB file name; the build-time guard on the sample rate is now compile-time checks of those constants |
+| `uvc_ai_nr_stream.c` | 48 kHz only (USB audio is 48 kHz; a native 16 kHz UVC path is out of scope) and no flags. It builds its grid with `dfn2_grid_make()` from its own one-row constants (48000, 1024, 32, 96, 1 / 1) and drives the `DFN2Prepost` class directly: the grid goes to `dfn2_prepost_config_defaults()`, the tensor tables and the ERB file name, and its static per-hop buffers are checked against `grid.hop` and `grid.n_bins` at run time |
 | `uvc_audio_live2a.c` | 48 kHz only, no flags, the same one-row grid built with `dfn2_grid_make()`; it goes into the `DfnResStage` / `DfnRateBridge` configs, the model-I/O descriptor and the tensor tables (the host rate is the model's or goes through the bridge) |
 
-**The ERB file.** Every DFN2 sample reads the ERB matrices from `/mnt/sd/dfn2_blobs/fb_<sr>_<n_erb>.bin` (for example
-`fb_48000_32.bin`; `<sr>` is the model grid's rate, not the host's), one deployment set for all of them. The file is the exporter's
-`erb_matrix.bin` renamed for its grid (`export_erb_matrix.py --output-dir DIR --format bin`, which `--format all` also writes; the
-grid comes from the model's `config.ini`). Its layout: `int32 n_bins`, `int32 n_bands`, `float32 erb_fb[n_bins * n_bands]`,
-`float32 erb_inv[n_bins * n_bands]`, both bin-major. It is not the `--runtime-bins` pair: `erb_fwd.bin` (bin-major) and `erb_inv.bin`
-(band-major, the layout the library takes). A sample therefore checks the header against the grid's `n_bins` and `n_erb` and
-transposes `erb_inv` to band-major once at init. None of these samples was run on a board from this repo.
+The samples own the recurrent-state shapes (constants of the sample, the library knows none): `h_gru` `[1,5,1,256]` (mask-only
+`[1,3,1,256]`) and `df_convp_history` `[1,64,5,df_bins]`. They register nothing: the accelerator holds the state, each state input
+and its `*_out` output are bound to one buffer. Before every accelerator run a sample compares the library's state generation
+(`dfn2_prepost_state_generation()`; `dfn_rate_bridge_state_generation()` or `dfn_res_stage_state_generation()` when a stage or
+bridge hosts the model) with the last value it saw and, when it differs, reloads quantized zeros into the state input buffers. A
+sample refuses to start when the element count the loaded model reports for a state tensor differs from its own table.
+
+**The ERB matrices.** The library reads no file. It borrows two `const float` pointers, forward bin-major `[n_bins][n_erb]` and
+inverse band-major `[n_erb][n_bins]` (raw float32, `n_bins * n_erb * 4` bytes each: 65,664 on the 48000 / 1024 / 32 grid), which the
+application loads, owns and keeps alive while an object uses them; the inverse is a partition of unity. The producer is
+`export_erb_matrix.py`:
+
+| output | content |
+|---|---|
+| `--runtime-bins DIR` | `erb_fwd.bin` (bin-major) and `erb_inv.bin` (band-major), raw little-endian float32 without a header, plus `erb_matrices.json`: the two layouts the library takes |
+| `--output-dir DIR --format bin` (also written by `--format all`) | `erb_matrix.bin`: `int32 n_bins`, `int32 n_bands`, `float32` forward `[n_bins][n_bands]`, `float32` inverse `[n_bins][n_bands]`, little-endian, 8 + 2 * 65,664 bytes on the 48000 / 1024 / 32 grid; both matrices are bin-major, so a loader transposes the inverse to band-major |
+
+The pipeline example mains take the `--runtime-bins` pair as `--erb-fwd FILE` and `--erb-inv FILE` (both or neither; each file holds exactly
+`n_bins * n_erb` floats; without them a unit ERB partition runs, which serves the fail-open smoke run only, and the main prints a notice).
+Every DFN2 board sample reads `/mnt/sd/dfn2_blobs/fb_<sr>_<n_erb>.bin` (for example `fb_48000_32.bin`; `<sr>` is the model grid's rate,
+not the host's), one deployment set for all of them: the exporter's `erb_matrix.bin` renamed for its grid. A sample checks the header
+against the grid's `n_bins` and `n_erb` and transposes the inverse to band-major once at init. This repo holds no board run of these
+samples.
 
 **Tests and pipelines.** The tests choose their grid when they are built, through a header of their own, not through the library:
-`AINR/tests/dfn2_test_grid.h` and `pipelines/dfn/tests/dfn_test_grid.h` (`-DDFN2_GRID_KHZ=16|32|48`, or `-DDFN2_SR` / `-DDFN2_N_FFT` /
-`-DDFN2_N_ERB` / `-DDFN2_DF_BINS`, with `-DDFN2_MASK_LOOKAHEAD` / `-DDFN2_DF_LOOKAHEAD`; `dfn2_test_grid()` and `dfn_test_grid()` return the
-`DFN2Grid`). They give the `DFN2_*` size macros that the tests' fixed arrays use and sweep grids and pairs; they are test scaffolding
-only, and the pair they default to is 1/1 for every preset, which is not the board table's 0 / 0 for 16 and 32 kHz. The pipeline
-objects (`dfn_res_stage`, `dfn_rate_bridge`, `dfn_hop`) and the example mains hold no build-time grid: the `DFN2Grid` travels in
-`DfnResStageConfig.grid`, and the example mains build it from `--ai-sample-rate` / `--ai-fft-size` and the table above.
+`AINR/tests/dfn2_test_grid.h` and `pipelines/dfn/tests/dfn_test_grid.h` (`-DDFN2_GRID_KHZ=16|32|48`, with `-DDFN2_MASK_LOOKAHEAD` /
+`-DDFN2_DF_LOOKAHEAD`; `dfn2_test_grid()` and `dfn_test_grid()` return the `DFN2Grid`). They give the macros that size the tests'
+fixed arrays and sweep grids and pairs; they are test scaffolding only, and the pair they default to is 1/1 for every preset, which is
+not the board table's 0 / 0 for 16 and 32 kHz. The pipeline objects (`dfn_res_stage`, `dfn_rate_bridge`, `dfn_hop`) and the example
+mains hold no build-time grid: the `DFN2Grid` travels in `DfnResStageConfig.grid`, and the example mains build it from
+`--ai-sample-rate` / `--ai-fft-size` and the table above.
 
 **Limits.** The rate bridge (`pipelines/dfn/dfn_rate_bridge.c`) is written for the 48 kHz model and refuses another (see
 `pipelines/dfn/README.md`); the pipelines and their Python twin are verified on the shipped grid only. Shapes quoted elsewhere in
 this README (`(1,1,3,32)` and so on) are the shipped grid's. Tests: `../tests/test_dfn2_grid.py` (every refusal and status code, the
 derived fields, `make` agreeing with `validate` over a sweep of sample rates, `dfn2_norm_alpha` against `train.py` bit for bit, the
-overflow-free `n_erb` check under UBSan, the `#error` on `DFN2_DF_ORDER`, C against Python from one binary on every grid),
-`../tests/test_dfn2_runtime_grid.py` (capacity independence, pool identity, the normaliser starting points, no grid in the library,
-the variant link symbol), `../tests/test_dfn2_prepost_c.py`, `../tests/test_c_prepost.c`, `../tests/test_nn_chains.c`.
+overflow-free `n_erb` check under UBSan, C against Python from one binary on every grid), `../tests/test_dfn2_runtime_grid.py` (the
+whole chain on every grid and pair, pool identity against an independent Python mirror of the layout, the normaliser fields, no
+grid in the library, the variant link symbol), `../tests/test_dfn2_prepost_c.py`, `../tests/test_c_prepost.c`,
+`../tests/test_nn_chains.c`.
 
 ## Calling the library
 
-The order, for one mono stream in `DFN2_IO_TIME` (hop in, hop out). Nothing in the library knows a grid until the application
-gives it one, so step 1 comes first and its `DFN2Grid` goes to every later call.
+The order, for one mono stream (hop in, hop out; the application frames with audiolib). Nothing in the library knows a grid until
+the application gives it one, so step 1 comes first and its `DFN2Grid` goes to every later call.
 
 1. `dfn2_grid_make()` from the application's table row (or `dfn2_grid_validate()` on a grid it already holds).
-2. Load the ERB matrices of that model (the file is described under [Choosing the grid](#choosing-the-grid); the library never reads files).
-3. `fft_create(grid.n_fft)`, `dfn2_framing_config(&sc, &grid, fft, NULL)`, then `ac_istft_get_mem_size()` / `ac_istft_init()`: the
-   synthesis object the class pushes into (in `DFN2_IO_FREQ` there is none and the application runs its own transforms).
-4. `dfn2_prepost_config_defaults(&cfg, mode, &grid)`, set `fft`, `istft`, `erb_fwd`, `erb_inv` (and `window`, `atten_lim_db` when
-   wanted), `dfn2_prepost_get_mem_size()`, a 16-byte aligned pool of `req.bytes`, `dfn2_prepost_init_ex()` (a stale `req` is refused).
+2. Load the ERB matrices of that model (the layouts are described under [Choosing the grid](#choosing-the-grid); the library never
+   reads files and borrows the pointers).
+3. The framing: `ac_stft_config_default(&sc, grid.n_fft)` with `sc.spec_scale = grid.stft_scale` and `sc.ispec_scale =
+   grid.stft_unscale`, then `ac_stft_get_mem_size()` / `ac_stft_init()` and `ac_istft_get_mem_size()` / `ac_istft_init()`.
+4. `dfn2_prepost_config_defaults(&cfg, &grid)`, set `erb_fwd`, `erb_inv` (and `atten_lim_db` when wanted) and, on a float host, the
+   state registration; `dfn2_prepost_get_mem_size()`, a 16-byte aligned pool of `req.bytes`, `dfn2_prepost_init_ex()` (a stale `req`
+   is refused).
 5. `dfn2_model_io_descriptor_default(&grid, &d)`: the graph contract of this build for the grid, to compare with what the accelerator
    runtime reports (`dfn2_model_io_descriptor_validate(&grid, &d)`); a model exported for another grid or lookahead pair fails it.
-6. Per hop: `dfn2_prepost_pre_process()`; when it returns 1, `dfn2_prepost_frame_inputs()`, the model, `dfn2_prepost_frame_commit()`
-   (`dfn2_prepost_frame_skip()` when the model failed or the commit was refused); then `dfn2_prepost_post_process()`.
-   `dfn2_model_run_frame(&model, p)` does the middle three for a `DFN2Model` that carries the descriptor.
+6. Per hop, the same flow on every hop (`frames_per_call` 1): `ac_stft_push_planar()`, `dfn2_prepost_pre_process_freq()` (returns 1),
+   `dfn2_prepost_frame_open()`, the model, `dfn2_prepost_frame_finish()` (`dfn2_prepost_frame_bypass()` when the model failed or the
+   commit was refused); then `dfn2_prepost_post_process_freq()` and `ac_istft_push_planar()`; `valid` is informational (the spectrum
+   is all zero while it is 0) and the argument may be NULL. `dfn2_model_run_frame(&model, p)` does the middle three for a `DFN2Model`
+   that carries the descriptor. With `frames_per_call` > 1 the flow is the older one, see [Multi-frame export](#multi-frame-export).
+7. Flush: push `M + D + 1` zero audio hops (`M + D` zero spectra, one more for the overlap-add) with the accelerator running on all of them.
 
 ```c
+#include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
+#include "audio_stft.h"
 #include "dfn2_prepost.h"
 
-/* The application's table: (sample rate, FFT size) -> what the trained model fixes. */
-typedef struct { int sr, n_fft, n_erb, df_bins, mask_la, df_la; } GridRow;
-static const GridRow TABLE[] = {
-    { 16000,  256, 24, 96, 0, 0 },
-    { 32000,  512, 28, 96, 0, 0 },    /* provisional: no model trained */
-    { 48000, 1024, 32, 96, 1, 1 },    /* shipped */
+/* The shipped model: config.ini [signal] [model] [feature]. */
+static const DFN2GridSpec SHIPPED = {
+    .sample_rate = 48000, .n_fft = 1024, .n_erb = 32, .df_bins = 96, .df_order = 5,
+    .mask_lookahead = 1, .df_lookahead = 1, .frames_per_call = 1,
+    .erb_norm_tau_sec = 1.0f, .erb_norm_init_lo_db = -60.0f, .erb_norm_init_hi_db = -90.0f,
+    .erb_norm_scale_db = 40.0f, .spec_norm_tau_sec = 1.0f,
+    .spec_norm_init_lo = 0.001f, .spec_norm_init_hi = 0.0001f,
 };
+
+/* State shapes belong to the application: the exported graph's h_gru [1,5,1,256] and
+ * df_convp_history [1,64,5,df_bins]. */
+enum { GRU_ELEMENTS = 5 * 256, CONVP_CHANNELS = 64, CONVP_WINDOW = 5 };
+
+static void *alloc16(size_t bytes) { return aligned_alloc(16, (bytes + 15) & ~(size_t)15); }
 
 /* fb_<sr>_<n_erb>.bin = the exporter's erb_matrix.bin: int32 n_bins, int32 n_bands, float32
  * fwd[n_bins][n_bands], float32 inv[n_bins][n_bands] (both bin-major). The library wants the
@@ -326,111 +335,111 @@ static int load_erb(const char *path, const DFN2Grid *g, float *fwd, float *inv_
     return ok ? 0 : -1;
 }
 
-/* The accelerator: reads the windows in `in`, fills out->erb_mask / coefs / alpha and writes the
- * two next-state tensors. The state outputs alias the state inputs (one address each), so read
- * every state input before writing any state output. 0 when everything was written. */
+/* The accelerator: reads the windows in `in`, fills out->erb_mask / coefs / alpha and updates the
+ * two state tensors in place (the state outputs alias the state inputs: read every state input
+ * before writing any state output). 0 when everything was written. */
 typedef int (*RunModel)(const DFN2PrepostInputs *in, DFN2PrepostOutputs *out);
 
 /* One mono stream, `hops` hops of grid.hop samples from `in` to `out`. Returns 0, or -1. */
-static int run_dfn2(int sr, int n_fft, const char *erb_path, RunModel run_model,
-                    const float *in, float *out, long hops)
+static int run_dfn2(const char *erb_path, RunModel run_model, const float *in, float *out, long hops)
 {
-    DFN2_REQUIRE_VARIANT_LINK();        /* units built with other flags or capacities do not link */
+    DFN2_REQUIRE_VARIANT_LINK();           /* units built with another -DDFN2_MASK_ONLY do not link */
 
-    const GridRow *row = NULL;
-    for (size_t i = 0; i < sizeof TABLE / sizeof TABLE[0]; ++i)
-        if (TABLE[i].sr == sr && TABLE[i].n_fft == n_fft) row = &TABLE[i];
-    if (!row) return -1;
-
-    /* 1. the grid: the six values the table gives, the rest derived and validated */
+    /* 1. the grid: what the model fixes, the rest derived and validated */
     DFN2Grid grid;
-    int status = dfn2_grid_make(&grid, row->sr, row->n_fft, row->n_erb, row->df_bins,
-                                row->mask_la, row->df_la);
+    int status = dfn2_grid_make(&grid, &SHIPPED);
     if (status != DFN2_GRID_OK) {
         fprintf(stderr, "grid refused: %s\n", dfn2_grid_status_text(status));
         return -1;
     }
 
     int rc = -1;
-    size_t n = (size_t)grid.n_bins * (size_t)grid.n_erb;
-    float *erb_fwd = malloc(n * sizeof(float)), *erb_inv = malloc(n * sizeof(float));
-    FftHandle *fft = NULL;
-    void *istft_mem = NULL, *pool = NULL;
+    size_t erb_n = (size_t)grid.n_bins * (size_t)grid.n_erb;
+    size_t convp_elements = (size_t)CONVP_CHANNELS * CONVP_WINDOW * grid.df_bins;
+    float *erb_fwd = malloc(erb_n * sizeof *erb_fwd), *erb_inv = malloc(erb_n * sizeof *erb_inv);
+    float *gru = calloc(GRU_ELEMENTS, sizeof *gru);                      /* the application's state */
+    float *convp = calloc(convp_elements, sizeof *convp);
+    float *re = malloc(4 * (size_t)grid.n_bins * sizeof *re);            /* spectra of one hop */
+    float *im = re + grid.n_bins, *out_re = im + grid.n_bins, *out_im = out_re + grid.n_bins;
+    void *stft_mem = NULL, *istft_mem = NULL, *pool = NULL;
+    AcStft *stft = NULL;
+    AcIstft *istft = NULL;
     DFN2Prepost *p = NULL;
+    if (!erb_fwd || !erb_inv || !gru || !convp || !re) goto done;
+    if (load_erb(erb_path, &grid, erb_fwd, erb_inv) != 0) goto done;   /* 2. the ERB matrices (caller-owned, borrowed) */
 
-    /* 2. the ERB matrices of that model (caller-owned; the class borrows them) */
-    if (!erb_fwd || !erb_inv || load_erb(erb_path, &grid, erb_fwd, erb_inv) != 0) goto done;
-
-    /* 3. the framing: one FFT handle and the synthesis AcIstft (DFN2_IO_TIME) */
+    /* 3. the framing: audiolib, the scales from the grid */
     AcStftConfig sc;
-    fft = fft_create(grid.n_fft);
-    dfn2_framing_config(&sc, &grid, fft, NULL);       /* sqrt-Hann, hop, torch normalized scaling */
-    size_t istft_bytes = ac_istft_get_mem_size(&sc);
-    istft_mem = aligned_alloc(16, (istft_bytes + 15) & ~(size_t)15);
-    AcIstft *istft = istft_mem ? ac_istft_init(istft_mem, istft_bytes, &sc) : NULL;
-    if (!fft || !istft) goto done;
+    ac_stft_config_default(&sc, grid.n_fft);
+    sc.spec_scale = grid.stft_scale;
+    sc.ispec_scale = grid.stft_unscale;
+    size_t stft_bytes = ac_stft_get_mem_size(&sc), istft_bytes = ac_istft_get_mem_size(&sc);
+    stft_mem = alloc16(stft_bytes);
+    istft_mem = alloc16(istft_bytes);
+    if (!stft_mem || !istft_mem) goto done;
+    stft = ac_stft_init(stft_mem, stft_bytes, &sc);
+    istft = ac_istft_init(istft_mem, istft_bytes, &sc);
+    if (!stft || !istft) goto done;
 
     /* 4. config (copies the grid), exact pool size, init inside caller memory */
     DFN2PrepostConfig cfg;
     DFN2PrepostMemReq req;
-    if (dfn2_prepost_config_defaults(&cfg, DFN2_IO_TIME, &grid) != 0) goto done;
-    cfg.fft = fft;
-    cfg.istft = istft;
+    if (dfn2_prepost_config_defaults(&cfg, &grid) != 0) goto done;
     cfg.erb_fwd = erb_fwd;
     cfg.erb_inv = erb_inv;
-    cfg.atten_lim_db = 0.0f;                          /* 0 = no attenuation limit */
+    cfg.atten_lim_db = 0.0f;               /* 0 = no attenuation limit */
+    cfg.gru_hidden = gru;                  /* a float host registers its state; a board registers nothing */
+    cfg.gru_hidden_elements = GRU_ELEMENTS;
+    cfg.df_convp_history = convp;
+    cfg.df_convp_history_elements = convp_elements;
     if (dfn2_prepost_get_mem_size(&cfg, &req) != 0) goto done;
-    pool = aligned_alloc(req.alignment, ((size_t)req.bytes + 15) & ~(size_t)15);
+    pool = alloc16(req.bytes);
     p = pool ? dfn2_prepost_init_ex(pool, (size_t)req.bytes, &cfg, &req) : NULL;
     if (!p) goto done;
 
     /* 5. the graph the accelerator runtime was built against. A board fills it from the exported
-     *    model's metadata; dfn2_model_io_descriptor_default(&grid, &d) is this build's contract
-     *    for the grid, and validate refuses a description of another grid, pair or frame count. */
+     *    model's metadata; _default() is this build's contract for the grid, and _validate()
+     *    refuses a description of another grid, pair or frame count. */
     DFN2ModelIoDescriptor desc;
     if (dfn2_model_io_descriptor_default(&grid, &desc) != 0 ||
         dfn2_model_io_descriptor_validate(&grid, &desc) != 0) goto done;
 
-    /* 6. per hop: pre_process, then (when it returns 1) frame_inputs -> model -> frame_commit,
-     *    then post_process. dfn2_model_run_frame() does the middle three with a DFN2Model. */
+    /* 6. the same flow on every hop (N == 1): analysis, pre_process_freq, frame_open -> model ->
+     *    frame_finish, post_process_freq, synthesis. The first mask_lookahead hops are warm-up frames:
+     *    the model runs, its heads are discarded, the state restarts. dfn2_model_run_frame() does the
+     *    middle three for a DFN2Model that carries the descriptor. */
     rc = 0;
     for (long h = 0; h < hops && rc == 0; ++h) {
-        int calls = dfn2_prepost_pre_process(p, in + h * grid.hop);
-        if (calls < 0) { rc = -1; break; }
-        if (calls == 1) {                             /* 0 on the first mask_lookahead hops */
-            DFN2PrepostInputs xin;
-            DFN2PrepostOutputs xout;
-            if (dfn2_prepost_frame_inputs(p, &xin, &xout) != 0) { rc = -1; break; }
-            /* dfn2_prepost_state_generation(p) changed since the last frame (a reset or a
-             * refused commit zeroed the state): refill the accelerator's own copy first. */
-            if (run_model(&xin, &xout) != 0 || dfn2_prepost_frame_commit(p) != 0)
-                dfn2_prepost_frame_skip(p);           /* identity for this frame, clocks advance */
-        }
-        int written = 0;                              /* 0 for the first mask + df hops: zeros out */
-        if (dfn2_prepost_post_process(p, out + h * grid.hop, &written) != 0) rc = -1;
+        ac_stft_push_planar(stft, in + h * grid.hop, re, im);
+        if (dfn2_prepost_pre_process_freq(p, re, im) != 1) { rc = -1; break; }   /* 1 on every hop */
+        DFN2PrepostInputs xin;
+        DFN2PrepostOutputs xout;
+        if (dfn2_prepost_frame_open(p, &xin, &xout) != 0) { rc = -1; break; }
+        /* dfn2_prepost_state_generation(p) changed since the last frame (a reset, a warm-up frame or a
+         * refused commit zeroed the state): an accelerator with its own state copy refills it first. */
+        if (run_model(&xin, &xout) != 0 || dfn2_prepost_frame_finish(p) != 0)
+            dfn2_prepost_frame_bypass(p);              /* the noisy spectrum, clocks advance */
+        if (dfn2_prepost_post_process_freq(p, out_re, out_im, NULL) != 0) { rc = -1; break; }   /* zeros for the first M + D hops */
+        ac_istft_push_planar(istft, out_re, out_im, out + h * grid.hop);                         /* every hop: AC_OLA_ACCUMULATE */
     }
 done:
-    free(pool);
-    free(istft_mem);
-    if (fft) fft_destroy(fft);
-    free(erb_inv);
-    free(erb_fwd);
+    free(pool); free(istft_mem); free(stft_mem); free(re); free(convp); free(gru); free(erb_inv); free(erb_fwd);
     return rc;
 }
 ```
 
-In `DFN2_IO_FREQ` step 3 is dropped (the application runs its own transforms), `pre_process_freq()` / `post_process_freq()` replace
-the hop calls, and the spectra are `torch.stft(normalized=True)` scaled: an unnormalised spectrum is multiplied by `grid.stft_scale`
-on the way in and by `grid.stft_unscale` on the way out. Build every unit that includes the DFN2 headers with the same
-`-DDFN2_MASK_ONLY` / `-DDFN2_MAX_*` / `-DDFN2_FRAMES_PER_CALL` flags as the library; `DFN2_REQUIRE_VARIANT_LINK()` turns a mismatch
-into a link error. With the shipped 1/1 pair `written` is 0 for the first two hops (the output is zeros) and the end-to-end delay is
-three hops; the other pairs are in [Lookahead pairs](#lookahead-pairs).
+The spectra are `torch.stft(normalized=True)` scaled: the `AcStft` / `AcIstft` of step 3 carry `grid.stft_scale` and
+`grid.stft_unscale`, so the application passes audio-scale samples. Build every unit that includes the DFN2 headers with the same
+`-DDFN2_MASK_ONLY` setting as the library; `DFN2_REQUIRE_VARIANT_LINK()` turns a mismatch into a link error. With the shipped 1/1
+pair `valid` is 0 for the first two hops (the output is zeros) and the end-to-end delay is three hops. The example assumes
+`frames_per_call` 1 (the table row above); the other pairs are in
+[Lookahead pairs](#lookahead-pairs).
 
 ## ONNX, ERB tables and calibration
 
 Install the optional export dependencies from `../requirements-export.txt`.
-The ONNX graph contains only the learned heads; STFT, feature normalization,
-head composition and WOLA remain in `dfn2_process.c/.h`.
+The ONNX graph contains only the learned heads; STFT and WOLA are the application's audiolib framing, feature
+normalization and building the enhanced spectrum from the heads remain in `dfn2_process.c/.h`.
 
 ```bash
 python3 export_onnx.py --model output/dfn2_best.pth \
@@ -442,11 +451,11 @@ python3 inference.py calib --model output/dfn2_best.pth \
   --output calib/dfn2
 ```
 
-The library (`dfn2_set_erb_matrices`, `dfn2_prepost_set_erb_matrices`) and the pipeline example mains
-take the files written by `export_erb_matrix.py --runtime-bins DIR` (`erb_fwd.bin` bin-major,
-`erb_inv.bin` band-major). The board samples read the headered `erb_matrix.bin` of
-`--output-dir DIR --format bin`, renamed `fb_<sr>_<n_erb>.bin` (see "The ERB file"); the other
-`--output-dir` formats are for toolchain validation.
+The library (the config's `erb_fwd` / `erb_inv`, `dfn2_set_erb_matrices`, `dfn2_prepost_set_erb_matrices`) takes pointers to the
+two matrices and reads no file: forward bin-major, inverse band-major, the layouts of `export_erb_matrix.py --runtime-bins DIR`
+(`erb_fwd.bin`, `erb_inv.bin`), which the pipeline example mains read through `--erb-fwd` and `--erb-inv`. The board samples read the
+headered `erb_matrix.bin` of `--output-dir DIR --format bin`, renamed `fb_<sr>_<n_erb>.bin` (see "The ERB matrices" under
+[Choosing the grid](#choosing-the-grid)); the other `--output-dir` formats are for toolchain validation.
 
 The graph is stateless from the accelerator's perspective. Each invocation
 receives exactly three feature frames `[t-(2-M) .. t+M]` (`[t-1,t,t+1]` for the
@@ -454,22 +463,21 @@ shipped `mask_lookahead` M = 1), emits the heads for frame `t`, and returns
 two state tensors: `h_gru_out` `(1,5,1,256)` and `df_convp_history_out`
 `(1,64,5,96)`. Each state input and its output have the
 same shape and are bound to one address. `h_gru` holds the five GRU hidden
-rows in `DFN2ModelIOState` memory order -- encoder (row 0), ERB decoder (rows
-1-2), DF decoder (rows 3-4; `DFN2_MODEL_GRU_ROW_*`). `df_convp_history` is the
+rows in graph order -- encoder (row 0), ERB decoder (rows
+1-2), DF decoder (rows 3-4). `df_convp_history` is the
 whole causal window of the five-frame DF residual path: the graph drops the
 oldest frame with a Slice on the input, appends the new frame and returns the
 whole concatenation. That window is required because the input kernel sees
 three frames while the DF residual path has a causal five-frame kernel;
 omitting it would silently reduce the trained receptive field. CPU-side
-window/state storage is defined by
-`dfn2_model_io.c/.h` (the three arrays with a grid dimension are packed at the grid's stride inside
-capacity-sized storage), which also exports the window-slide and state-validate
-helpers so an external dual-input consumer with its own state struct reuses
+feature-window storage is defined by
+`dfn2_model_io.c/.h` (the windows are carved from the caller's block at the grid's stride, `dfn2_model_io_mem_size(grid)` bytes);
+the recurrent state is not: `dfn2_model_io_init()` registers the application's buffers, or none. The header also exports the
+window-slide and state-validate helpers so an external dual-input consumer with its own state struct reuses
 this window/validate discipline instead of inlining a second copy of the
-memmove/memcpy pair. `dfn2_model_io_validate_state()` and
-`dfn2_model_io_validate_arrays()` take `gru_hidden[DFN2_MODEL_GRU_ROWS]
-[DFN2_MODEL_GRU_HIDDEN]` and the packed `float *df_convp_window` of the grid's
-`df_bins` (`64 * 5 * df_bins` floats, the graph tensor element for element). Validation is a finite
+memmove/memcpy pair. `dfn2_model_io_validate_arrays(gru_hidden, gru_count, df_convp_history, convp_count)` takes the flat buffers
+and their element counts (`df_convp_history` count 0 = absent; `64 * 5 * df_bins` floats, the graph tensor element for element) and
+`dfn2_model_io_validate_state()` the registered ones. Validation is a finite
 check over the state itself: a null argument returns `-1`, and a non-finite
 element zeroes the two arrays and returns `-1` (`dfn2_model_io_validate_state()`
 also advances `dfn2_model_io_state_generation()`). A finite but partial or mixed
@@ -478,8 +486,8 @@ accelerator write is not detectable. The exported metadata carries
 in that header, so an integrator can refuse a graph whose state layout no longer
 matches the struct it allocated. `inference.py calib --frames N` captures `N`
 streaming invocations with real non-zero state. `calibrate_norm_init.py` is a
-different tool: it estimates the feature EMA initialization constants used by
-the C frontend.
+different tool: it estimates the feature EMA initialization constants that
+become the `erb_norm_init_*` and `spec_norm_init_*` fields of `DFN2GridSpec`.
 Use `--format npz --output calib/dfn2.npz` when a NumPy archive is needed.
 
 ### Fixed-batch NPU profiling
@@ -539,46 +547,40 @@ with its window and head shapes, and a one-frame graph that records one.
 its invocations (`--frames` counts invocations, the report records
 `frames_per_call`).
 
-The C host takes N as `-DDFN2_FRAMES_PER_CALL=<N>` (1..64, plain decimal; the
-AINR Makefile variable `DFN2_FRAMES_PER_CALL` adds it) on every translation
-unit, with the lookahead pair:
+The C host takes N as `DFN2GridSpec.frames_per_call` (1..64, a run-time field; `DFN2_GRID_ERR_FRAMES_PER_CALL` otherwise),
+with the lookahead pair:
 
 - the window holds `N + 2` frames; the first call is ready after `M + N`
-  pushed frames, every later one after N more (`pre_process` returns 1 on hops
+  pushed frames, every later one after N more (`pre_process_freq` returns 1 on hops
   `M+N-1`, `M+2N-1`, ...); `dfn2_model_io_frame_slot()` names the slot of the
-  last pushed frame;
-- `frame_inputs()` publishes N heads per tensor, commit composes the N frames
-  in one burst, and `post_process` returns one hop per call from that burst,
+  last pushed frame. With N > 1 nothing of the one-flow-per-hop behaviour applies: the earlier hops return 0, there are no warm-up
+  frames, and `frame_open()` is called only after a 1 (as are the model and `frame_finish()`);
+- `frame_open()` publishes N heads per tensor, `frame_finish()` builds the N enhanced frames
+  in one burst, and `post_process_freq` returns one hop per call from that burst,
   so the output trails by N - 1 more hops: latency `1 + M + D + N - 1` hops
   (`dfn2_prepost_latency_frames(grid)` + 1; 10 hops, 106.7 ms, at the shipped pair
-  with N = 8). A refused commit zeroes the state once and passes all N frames
-  as the identity; flushing means pushing zero hops until the last real one
-  has been emitted;
+  with N = 8). A refused commit zeroes the registered state and advances the
+  generation, and `frame_bypass()` passes all N frames as the noisy spectrum;
+  flushing means pushing zero hops until the last real one has been emitted (`M + D + N` of them);
 - `DFN2ModelIoDescriptor` keeps its 18 fields and 72 bytes: N is
   `input_frames - 2` (`input_frames` = N + 2, metadata `input_feature_frames`),
   so `dfn2_model_io_descriptor_validate()` and `dfn2_model_run_frame()` refuse
-  another N, and an adapter compiled against the one-frame header
-  (`input_frames` = 3) works with an N = 1 library and is refused by an N > 1
-  one;
-- N > 1 is folded into the pool hash (a pool of another N is refused) and
-  objects built for different N do not link (`dfn2_frames_per_call<N>`);
-- N > 1 changes the per-hop contract, so a unit written for one frame per call
-  does not compile against it (`#error` in `dfn2_model_io.h`); a unit that
-  drives N frames defines `DFN2_MULTI_FRAME_HOST`. The pipelines DFN stage and
-  its Python twin are one-frame units and stay at N = 1.
+  another N, and a descriptor made for the one-frame graph (`input_frames` = 3)
+  is refused by a grid of N > 1;
+- N is folded into the pool hash (a pool of another N is refused) and into the pool
+  size (144,112 bytes at N = 4 on the shipped grid against 92,608 at N = 1; 64-bit host). The pipelines DFN stage and its Python twin are
+  one-frame units, and the stage refuses N > 1.
 
 `DFN2_MODEL_IO_LAYOUT_VERSION` stays 8: it names the state tensors, which N
-does not change, the window and head shapes carry N through `input_frames` in
-the descriptor and `frames_per_call` in the metadata, and a bump would change
-the one-frame graph's metadata. With N = 1 the pool size, the pool hash and
-every compile line are those of a build without the option.
+does not change, and the window and head shapes carry N through `input_frames` in
+the descriptor and `frames_per_call` in the metadata.
 
 Tests: `../tests/test_dfn2_frames_per_call.py` (wrapper and exported graph
 streamed in chunks against the one-frame graph, all pairs; a wrong state carry
 fails; metadata and validator; calibration) and
-`../tests/test_dfn2_frames_per_call_c.py` (the C host against the one-frame
-host, byte for byte, with a stand-in accelerator; reset, refusal, guards;
-the one-frame header's 72-byte descriptor against libraries of N = 1 and 3).
+`../tests/test_dfn2_frames_per_call_c.py` (the N-frame host against the
+one-frame host, byte for byte, with a stand-in accelerator; reset, refusal, contract;
+the 72-byte descriptor through a grid of either N).
 
 ## Mask-only (stage 1)
 
@@ -595,11 +597,11 @@ mask head does not depend on the deep-filter decoder, so the same checkpoint can
   `df_lookahead` 0.
 - C: build every unit with `-DDFN2_MASK_ONLY` (see `dfn2_model_io.h`). The state, the accelerator boundary structs and the
   descriptor shrink accordingly, and the output is `noisy * (mask @ erb_inv)` of the head frame, `grid.mask_lookahead`
-  frames behind the input. The grid's `df_lookahead` must be 0 (`DFN2_GRID_ERR_DF_LOOKAHEAD` otherwise), and `df_bins` may reach `n_bins`. The final attenuation-limit mix (`--atten-lim`, `dfn2_prepost_set_atten_lim`) stays and acts on
+  frames behind the input. The grid's `df_lookahead` must be 0 (`DFN2_GRID_ERR_DF_LOOKAHEAD` otherwise), `df_order` is stored as 0, and `df_bins` may reach `n_bins`. The final attenuation-limit mix (`--atten-lim`, `dfn2_prepost_set_atten_lim`) stays and acts on
   the stage-1 output in Python and in C. `../tests/test_dfn2_mask_only_c.py` compares it with numpy.
 - Board sample: `alg_ai3_dfn_lite.c` (`audio_sample/`, outside this repo) is the sample for this graph, separate from the
   full model's `alg_ai3_dfn.c`. Build it and every library unit with `-DDFN2_MASK_ONLY`, in an object directory of its own
-  (objects of the other variant do not link: the link symbol starts `dfn2_variant_mask_only_`). It binds I/O layout 9: inputs
+  (objects of the other variant do not link: the link symbol is `dfn2_variant_mask_only`). It binds I/O layout 9: inputs
   `erb, spec, h_gru` (h_gru is `(1, 3, 1, 256)`), outputs `erb_mask, h_gru_out`. The model is read from
   `/mnt/sd/audio_model/<quant>/dfn2_lite/` and the output goes to `/mnt/sd/audio/output/DFN2_LITE/`. Its grid comes from
   `--sample-rate` and `--fft-size` through the sample's table (see [Choosing the grid](#choosing-the-grid)); not run on a board from this repo.
@@ -618,6 +620,9 @@ test asserts `DFN2_MODEL_IO_LAYOUT_VERSION` is not one of them.
 | --- | --- | --- |
 | `h_gru` | `(1,5,1,256)` | encoder row 0, ERB decoder rows 1-2, DF decoder rows 3-4 |
 | `df_convp_history` | `(1,64,5,96)` | full causal window of the DF residual convolution |
+
+The library knows none of these shapes. The application registers buffers of these element counts (1,280 and 30,720 floats on the
+shipped grid) or, on a board, its accelerator holds the state (see [C deployment boundary](#c-deployment-boundary)).
 
 Each GRU reads its rows through a Slice of the graph input on dim 1 followed by
 a squeeze, and the next `h_gru` is one Concat on dim 1. ONNX has no stacked GRU
@@ -643,7 +648,7 @@ Check these in order:
 3. compare speech-only, noise-only, and steady low-frequency-noise cohorts;
 4. verify error/far or clip-to-clip EMA state is not shared or leaked.
 
-If the ERB-masked low band is healthy but the alpha-composed output collapses,
+If the ERB-masked low band is healthy but the alpha-blended output collapses,
 the issue is in the DF/alpha path rather than the shared dataset. If the
 ERB-masked low band is already collapsed, audit low-frequency corpus coverage,
 speech-only sampling, SNR distribution, and target contamination.

@@ -119,7 +119,7 @@ hop-lag：端到端 256 samples（16 ms）＝ centered 半窗 lookahead；NN 本
 
 <h2>State 表</h2>
 <p><code>state_report</code> 實測（B=1 fp32，total <b>559.2 KB</b>；conv window 是完整 window,含新的一幀）。graph boundary 上每個 state 都是 rank 4：<code>score_sum</code> 為 <code>(1,1,1,63)</code>、<code>frame_index</code> 為 <code>(1,1,1,1)</code> int64、<code>h_gru</code> 為 <code>(1,1,1,192)</code>。部署契約：顯式
-state I/O，由 host caller 保存；STFT/ISTFT 狀態屬 C struct 層：</p>
+state I/O，由 host caller 保存；STFT/ISTFT 狀態屬應用端以 audiolib 建立的 <code>AcStft</code>／<code>AcIstft</code>：</p>
 <table>
 <tr><th>state</th><th>shape</th><th>size</th><th>保存者（部署契約）</th></tr>
 <tr><td>align.key_ring</td><td>(1, 64, 63, 1)</td><td>15.8 KB</td><td>host caller（顯式 graph I/O）</td></tr>
@@ -134,7 +134,7 @@ state I/O，由 host caller 保存；STFT/ISTFT 狀態屬 C struct 層：</p>
 <tr><td>far2.window</td><td>(1, 8, 4, 129)</td><td>16.1 KB</td><td>host caller（顯式 graph I/O）</td></tr>
 <tr><td>h_gru（gru.hidden）</td><td>(1, 1, 192)</td><td>0.8 KB</td><td>host caller（顯式 graph I/O）</td></tr>
 <tr><td><b>NN 合計</b></td><td></td><td><b>559.2 KB</b></td><td></td></tr>
-<tr><td>STFT×2 / ISTFT 狀態</td><td>—</td><td>—</td><td>C struct（Python reference：host）</td></tr>
+<tr><td>STFT×2 / ISTFT 狀態</td><td>—</td><td>—</td><td>應用端的 <code>AcStft</code>×2／<code>AcIstft</code>（Python reference：host）</td></tr>
 </table>
 
 <h2>延遲與 warm-up</h2>

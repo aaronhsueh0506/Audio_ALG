@@ -18,8 +18,8 @@ frames the host puts in that window for the heads of frame ``t``:
 ``[t-(2-L), ..., t+L]`` (``[t-2,t-1,t]``, ``[t-1,t,t+1]``, ``[t,t+1,t+2]``),
 the receptive field ``LookaheadConv2d`` gives the same frame offline. L and
 ``df_lookahead`` are part of the trained contract; the metadata records both
-and the host (``DFN3_MASK_LOOKAHEAD`` / ``DFN3_DF_LOOKAHEAD`` in
-``dfn3_process.h``) must be built with the same pair.
+and the host (``DFN3GridSpec.mask_lookahead`` / ``df_lookahead`` in
+``dfn3_process.h``) must be given the same pair.
 
 State boundary
 --------------
@@ -596,7 +596,7 @@ def build_metadata(checkpoint_path, params, inputs, outputs,
     Separate from ``main`` so the contract test can compare
     ``state_layout_version`` against dfn3_model_io.h without an ONNX export.
     ``mask_lookahead`` and ``df_lookahead`` are the pair the checkpoint was
-    trained for; the host is built with the same pair.
+    trained for; the host is given the same pair.
     """
     return {
         'model_family': 'DeepFilterNet3',

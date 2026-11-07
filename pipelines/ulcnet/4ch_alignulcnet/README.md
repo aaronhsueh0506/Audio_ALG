@@ -6,17 +6,22 @@ the example stage `ulcnet/ulcnet_nn_stage.{h,c}` and the Align-ULCNet C pre/post
 existing component libraries. mcab is a flow layer: the application initialises the four libaec
 `Aec` lanes and the shared `DelayAec` and passes the pointers (`main.c` does it through
 `mcab_sample_flow.h`), and mcab owns only its flow state. The flow is initialized with
-`enable_post = 0` (`ulcnet_example_unit_config()` in `main.c`: `mcab_default_config(ULCNET_SR)` with
-`fft_size` = `ULCNET_N_FFT`), so the fuse buffers of the conventional post path are not allocated,
+`enable_post = 0` (`ulcnet_example_unit_config()` in `main.c`: `mcab_default_config(grid.sample_rate)`
+with `fft_size` = `grid.n_fft`; the grid is built with `ulcnet_grid_make()` from the `--sample-rate 16000|48000` row of the example's
+`UlcnetGridSpec` table), so the fuse buffers of the conventional post path are not allocated,
 there is no RES (mcab holds none; this application creates no `AecRes`) and `mcab_fuse()` /
 `mcab_sample_beam_fuse()` are unavailable (`MCAB_INVALID_ARGUMENT`). The flow plus helper and the
 stage are two pools: `main.c` queries `mcab_sample_flow_get_mem_size()`,
-`mcab_sample_beam_get_mem_size()` and `ulcnet_nn_stage_mem_size(0)`, cuts both blocks (the stage's
+`mcab_sample_beam_get_mem_size()` and `ulcnet_nn_stage_mem_size(&grid, 0)`, cuts both blocks (the stage's
 block 16-byte aligned) and prints the two sizes.
 
 The model accelerator is intentionally left as the TODO in
-`run_accelerator()`. CPU memory owns every K/V, logit and GRU state tensor.
-The runtime binds each `*_out` to the address of the state input of the same name; the graph shifts the windows itself, so the CPU neither copies nor shifts them.
+`run_accelerator()`. The K/V, logit and GRU state tensors belong to the application; on a board
+they live in the accelerator's own buffers, so the example registers none
+(`ulcnet_accelerator_adapter_init(..., NULL, ...)`).
+The runtime binds each `*_out` to the buffer of the state input of the same name; the graph shifts the windows itself, so the CPU neither copies nor shifts them.
+A fixed-point accelerator loads quantized zeros at start and whenever
+`ulcnet_accelerator_adapter_state_generation()` changes.
 The default callback failure demonstrates the production fail-open path.
 
 The production far branch is fixed to the caller's raw reference, matching
@@ -42,7 +47,7 @@ it is already the sqrt-Hann, 50%-overlap, one-frame-per-hop analysis frame
 the Align-ULCNet chain would otherwise compute, so nothing is reconstructed
 or re-analysed in between. The far branch pushes the SAME hop's raw far samples (the
 caller's reference, never the flow's aligned copy) through a rolling `AcStft`
-(`ulcnet_framing_config`, `ulcnet_process.h`; `center` 0, exactly one frame per push from the first push). Both branches
+(the framing contract of `ulcnet_process.h`; `center` 0, exactly one frame per push from the first push). Both branches
 therefore carry input hop t at pipeline hop t with no delay buffer on either
 side, and every hop from hop #0 is exactly one inference.
 
@@ -135,7 +140,7 @@ no state to the helper: the pool sizes and the layout version are unchanged.
 App       McabSampleFlow + Mcab (enable_post = 0)   McabSampleBeam      UlcnetNnStage + adapter       accelerator (board)
  |-- mcab_default_config (ulcnet_example_unit_config()); mcab_sample_flow_get_mem_size / _init -->|
  |-- mcab_sample_beam_default_params; mcab_sample_beam_get_mem_size / _init(flow) -->|
- |-- ulcnet_nn_stage_mem_size(0) / ulcnet_nn_stage_init; adapter state pools
+ |-- ulcnet_grid_make(--sample-rate); ulcnet_nn_stage_mem_size(&grid, 0) / ulcnet_nn_stage_init; adapter pool
  |   per hop: mcab_sample_beam_process_with_activity(mics, far, vad, vad, NULL, &beam, &info)   [or _process_front + mask/VAD + _process_beam]
  |            --> ulcnet_nn_stage_begin_complex(beam.spectrum, far, {info.delay.changed, info.delay.solid})
  |            --> nn_begin == 1 --> run_accelerator(job) --> nn_end(rc) --> ulcnet_nn_stage_end(out)
@@ -144,7 +149,7 @@ App       McabSampleFlow + Mcab (enable_post = 0)   McabSampleBeam      UlcnetNn
  |-- mcab_sample_beam_destroy; mcab_sample_flow_destroy; release the blocks
 ```
 
-External parameters: the delay profile below, the grid of the build (`ULCNET_GRID`), `D` of the exported
+External parameters: the delay profile below, the grid (`--sample-rate 16000|48000`), `D` of the exported
 graph, and the helper's array geometry and `num_angles` (the example uses the default 35 mm UCA; a product
 sets the measured one through `McabSampleBeamParams`). Internal: the helper's BF / DOA / VAD constants (section 0.3 of
 [`../../../docs/integration_4ch_spatial_zh_TW.md`](../../../docs/integration_4ch_spatial_zh_TW.md)),
@@ -156,22 +161,25 @@ The matched-filter bank size `n` is a product deployment decision, so it is a
 command-line argument rather than a literal in `main.c`; the resolved profile
 and the pool it costs are printed at start-up — at the default matched/n=5
 profile, that banner reads a 2,994,640 B unit pool (the flow objects plus the helper) plus a
-36,400 B stage pool at 16 kHz and a 6,304,624 B unit pool plus a 71,728 B stage pool at 48 kHz
-(`ULCNET_GRID=48k`). Read it from your
+36,464 B stage pool at 16 kHz and a 6,304,624 B unit pool plus a 71,792 B stage pool at 48 kHz
+(`--sample-rate 48000`); the adapter pool follows on its own line (14,816 B at 16 kHz,
+29,152 B at 48 kHz; it follows the grid, not `D`). Read it from your
 own build rather than copying it.
 `n` is an init parameter, not a runtime setter —
 changing it means re-querying the pool and re-initializing.
 
 ```sh
-./4ch_alignulcnet                              # matched, n=5 (default)
+./4ch_alignulcnet                              # 16 kHz, matched, n=5 (default)
+./4ch_alignulcnet --sample-rate 48000          # the 48 kHz / fft 1024 grid
 ./4ch_alignulcnet --delay-num-filters 3        # smaller bank, smaller pool
 ./4ch_alignulcnet --delay-mode fixed --fixed-delay 1600
 ./4ch_alignulcnet --delay-mode external        # caller pre-aligns the far
 ```
 
 Numbers are parsed by `common/example_cli.h` (`example_cli_parse_int`): `--delay-num-filters 3x`,
-`--fixed-delay 12x`, an empty string, a leading space or a value outside `int` exit with 2; plain
-decimals and a leading `+` are accepted.
+`--fixed-delay 12x`, `--sample-rate 16000x`, an empty string, a leading space or a value outside
+`int` exit with 2, as does a `--sample-rate` that is not 16000 or 48000; plain decimals and a
+leading `+` are accepted.
 
 There is exactly ONE matched bank here: the shared estimator that the application hands to mcab.
 The four lane AECs run `EXTERNAL_ALIGNED` off its single aligned reference, so
@@ -193,9 +201,9 @@ The rules live in `pipelines/4ch_aec_bf_nr_res/Makefile` (targets `4ch_alignulcn
 ```sh
 make SIMD=0 test
 make SIMD=1 test
-make ULCNET_GRID=48k test   # the other compiled grid (16k is the default)
 ```
 
-`test` runs `test_4ch_ulcnet`, the skeleton at n=5 and n=1 and the malformed-number checks above.
+`test` runs `test_4ch_ulcnet` (both grids from one binary), the skeleton at n=5 and n=1 on both
+grids and the malformed-number checks above.
 The archive `libaudio_pipeline_mcab.a` holds `mcab.o` only; the helper and flow objects, the stage
 and the ULCNet pre/post objects are linked into the program.

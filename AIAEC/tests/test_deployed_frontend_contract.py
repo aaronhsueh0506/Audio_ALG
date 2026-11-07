@@ -110,17 +110,17 @@ def lanes(tmp_path_factory, producer_libs):
                 _ULCNET_DIR, os.path.join(_AEC_C_DIR, 'include'),
                 os.path.join(_AEC_C_DIR, 'example'),
                 os.path.join(_AC_DIR, 'include'), _AC_DIR]
+    # One program: the grid is the example's own --sample-rate option.
+    exe = tmp_path_factory.mktemp('lane') / 'dump'
+    subprocess.run(
+        [cc, '-O2', '-std=gnu99', '-ffp-contract=off', *_extra_cflags(),
+         *('-I' + path for path in includes), *sources, *producer_libs,
+         '-lm', '-o', str(exe)],
+        check=True, capture_output=True)
     dumps = {}
-    for sample_rate, n_fft in GRIDS.items():
-        exe = tmp_path_factory.mktemp('lane%d' % sample_rate) / 'dump'
-        subprocess.run(
-            [cc, '-O2', '-std=gnu99', '-ffp-contract=off', *_extra_cflags(),
-             '-DULCNET_MODEL_IO_SR=%d' % sample_rate,
-             '-DULCNET_MODEL_IO_N_FFT=%d' % n_fft,
-             *('-I' + path for path in includes), *sources, *producer_libs,
-             '-lm', '-o', str(exe)],
-            check=True, capture_output=True)
-        run = subprocess.run([str(exe)], capture_output=True, text=True)
+    for sample_rate in GRIDS:
+        run = subprocess.run([str(exe), '--sample-rate', str(sample_rate)],
+                             capture_output=True, text=True)
         assert run.returncode == 0, run.stderr
         dumps[sample_rate] = parse_lane_dump(run.stdout)
     return dumps

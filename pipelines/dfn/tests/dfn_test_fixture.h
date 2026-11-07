@@ -99,7 +99,7 @@ static inline int dfn_fixture_identity_infer(void *user, const DFN2PrepostInputs
     (void)in;
     for (i = 0; i < out->erb_mask_elements; ++i) out->erb_mask[i] = 1.0f;
     memset(out->coefs, 0, out->coefs_elements * sizeof(float));
-    out->alpha[0] = 0.0f;
+    memset(out->alpha, 0, out->alpha_elements * sizeof(float));
     return 0;
 }
 
@@ -112,41 +112,41 @@ static inline int dfn_fixture_half_mask_infer(void *user, const DFN2PrepostInput
     (void)in;
     for (i = 0; i < out->erb_mask_elements; ++i) out->erb_mask[i] = 0.5f;
     memset(out->coefs, 0, out->coefs_elements * sizeof(float));
-    out->alpha[0] = 0.0f;
+    memset(out->alpha, 0, out->alpha_elements * sizeof(float));
     return 0;
 }
 
-/* The model-I/O descriptor of a model built for a grid other than `base`: which = 0 another mask
- * lookahead, 1 another deep-filter lookahead (the nearest one whose state ring the library's
- * capacity holds), 2 the other sample rate and fft (16 kHz where `base` is 48 kHz, 48 kHz
- * otherwise). A stage or bridge refuses such a model at run time from its descriptor
- * (dfn2_model_io_descriptor_validate against its own grid); the pair and the grid are not link-time
- * properties. Returns 0 (*d is the foreign descriptor), 1 when no such grid fits the library's
- * capacity (the pair 0/4 has no other mask lookahead within the default ring), or -1 when the
- * library does not make the grid. */
+/* The model-I/O descriptor of a model built for a grid that differs from `base` in one external
+ * field: which = 0 the mask lookahead, 1 the deep-filter lookahead, 2 the sample rate and fft
+ * (16 kHz where `base` is 48 kHz, 48 kHz otherwise), 3 the frames per call, 4 the deep-filter
+ * order. A stage or bridge refuses such a model at run time from its descriptor
+ * (dfn2_model_io_descriptor_validate against its own grid). Returns 0 (*d is the foreign
+ * descriptor), or -1 when the library does not make the grid. */
 static inline int dfn_fixture_foreign_descriptor(const DFN2Grid *base, DFN2ModelIoDescriptor *d,
                                                  int which) {
+    DFN2GridSpec spec = dfn_test_spec_of(base);
     DFN2Grid g;
-    int delta;
-    if (which == 2) {
-        int status = base->sample_rate == 48000
-            ? dfn2_grid_make(&g, 16000, 256, 24, 96, base->mask_lookahead, base->df_lookahead)
-            : dfn2_grid_make(&g, 48000, 1024, 32, 96, base->mask_lookahead, base->df_lookahead);
-        return status == DFN2_GRID_OK && dfn2_model_io_descriptor_default(&g, d) == 0 ? 0 : -1;
+    switch (which) {
+    case 0:
+        spec.mask_lookahead += base->mask_lookahead < DFN2_GRID_MASK_LOOKAHEAD_MAX ? 1 : -1;
+        break;
+    case 1:
+        spec.df_lookahead += base->df_lookahead < base->df_order - 1 ? 1 : -1;
+        break;
+    case 2:
+        spec = base->sample_rate == 48000
+            ? dfn_test_spec(16000, 256, 24, 96, base->mask_lookahead, base->df_lookahead)
+            : dfn_test_spec(48000, 1024, 32, 96, base->mask_lookahead, base->df_lookahead);
+        break;
+    case 3:
+        spec.frames_per_call = base->frames_per_call + 1;
+        break;
+    default:
+        spec.df_order = base->df_order + 1;
+        break;
     }
-    for (delta = 1; delta <= 4; ++delta) {
-        int sign;
-        for (sign = 1; sign >= -1; sign -= 2) {
-            int mask = base->mask_lookahead + (which == 0 ? sign * delta : 0);
-            int df = base->df_lookahead + (which == 1 ? sign * delta : 0);
-            if (mask < 0 || mask > DFN2_MAX_MASK_LOOKAHEAD || df < 0 || df > DFN2_MAX_DF_LOOKAHEAD)
-                continue;
-            if (dfn2_grid_make(&g, base->sample_rate, base->n_fft, base->n_erb, base->df_bins,
-                               mask, df) == DFN2_GRID_OK)
-                return dfn2_model_io_descriptor_default(&g, d) == 0 ? 0 : -1;
-        }
-    }
-    return 1;
+    return dfn2_grid_make(&g, &spec) == DFN2_GRID_OK &&
+           dfn2_model_io_descriptor_default(&g, d) == 0 ? 0 : -1;
 }
 
 /* What a phased-hop test does with an open model frame: run the model, report a failure, leave

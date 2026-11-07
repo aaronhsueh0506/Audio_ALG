@@ -84,7 +84,9 @@ The traditional signal contract is:
 
 AINR and AIAEC retain model-specific grids. A model must validate its own
 sample-rate/frame/hop/checkpoint contract and must not silently inherit the
-traditional pipeline default.
+traditional pipeline default: each model library takes its grid from the
+application as a run-time spec (`<Lib>GridSpec`, built with `<lib>_grid_make()`)
+and refuses a pool or descriptor made for another grid.
 
 ### 1.1 Traps an integrator will hit
 

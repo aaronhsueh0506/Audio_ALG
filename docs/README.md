@@ -66,7 +66,7 @@ reached through `pipelines/dfn/dfn_rate_bridge.{h,c}` (48 kHz / 1024 model only)
 and applies it to the post-RES one; the DFN2 lookahead pair is a field of that grid (the `DFN2_MASK_LOOKAHEAD` /
 `DFN2_DF_LOOKAHEAD` make variables, default 1/1, select only the pair the test programs run), and every delay figure on
 these pages is for the shipped 1/1 pair). Model pages: `ainr_dfn2.html` (pool, callback and build detail in
-`ainr_dfn2_detail.html`; the run-time grid, its capacities and limits in `ainr_dfn2_grids.html`), `ainr_dfn3.html`, `ainr_gtcrn.html`, `ainr_rnnoise_erb.html`, each with a
+`ainr_dfn2_detail.html`; the run-time grid and its validity rules in `ainr_dfn2_grids.html`), `ainr_dfn3.html`, `ainr_gtcrn.html`, `ainr_rnnoise_erb.html`, each with a
 usage page (`ainr_dfn2_usage.html`, `ainr_dfn3_usage.html`, `ainr_gtcrn_usage.html`,
 `ainr_rnnoise_erb_usage.html`), and the four AIAEC pages `aiaec_align_ulcnet.html`,
 `aiaec_align_cruse.html`, `aiaec_deepvqe_s.html` and `aiaec_cagcrn.html`, each with a usage page

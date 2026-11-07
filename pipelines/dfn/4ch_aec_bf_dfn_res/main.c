@@ -51,11 +51,8 @@
 #include <stdlib.h>
 #include <string.h>
 
-/* Capacity of the ERB matrices (the library's largest grid) and of the host hop buffers (48 kHz,
- * FFT 1024: the largest host grid HOST_RATES offers). */
+/* Host hop buffers: the largest host hop HOST_RATES offers (48 kHz, FFT 1024). */
 #define HOST_MAX_HOP 512
-static float g_erb_fwd[DFN2_MAX_N_BINS * DFN2_MAX_N_ERB];
-static float g_erb_inv[DFN2_MAX_N_ERB * DFN2_MAX_N_BINS];
 
 /* Replace with the board runtime call (see mono_aec_dfn_res). */
 static int run_accelerator(void *user, const DFN2PrepostInputs *inputs,
@@ -82,6 +79,7 @@ typedef struct DfnSample {
     size_t flow_bytes, beam_bytes;    /* lanes + estimator + mcab pool; SRP/BF helper */
     McabSampleFlow objs;
     DfnHopPoolPlan dfn;               /* the stage (or bridge), its synthesis and output */
+    DfnExampleErb erb;                /* the stage borrows these matrices until it is destroyed */
     DFN2ModelIoDescriptor descriptor;
     AecConfig res_cfg;
     size_t vec_bytes, spec_bytes, res_bytes, total;
@@ -167,7 +165,7 @@ static int dfn_plan(DfnSample *s) {
         mcab_get_mem_breakdown(&s->unit_cfg,&s->grid) != 0 ||
         mcab_sample_flow_get_mem_size(&s->unit_cfg,&s->flow_bytes) != 0 ||
         mcab_sample_beam_get_mem_size(&s->unit_cfg,&s->unit_bp,&s->beam_bytes) != 0 ||
-        !isfinite(s->args.atten_lim_db))
+        s->grid.fft_size/2 > HOST_MAX_HOP || !isfinite(s->args.atten_lim_db))
         return -1;
     /* The RES: the balanced level's AecConfig on the unit's grid. */
     aec_config_from_level(&s->res_cfg,AEC_LEVEL_BALANCED,s->args.sample_rate);
@@ -180,8 +178,8 @@ static int dfn_plan(DfnSample *s) {
 
     s->dfn.stage_cfg=dfn_res_stage_default_config(&s->args.model_grid);
     s->dfn.stage_cfg.atten_lim_db=s->args.atten_lim_db;
-    s->dfn.stage_cfg.erb_fwd=g_erb_fwd;
-    s->dfn.stage_cfg.erb_inv=g_erb_inv;
+    s->dfn.stage_cfg.erb_fwd=s->erb.fwd;
+    s->dfn.stage_cfg.erb_inv=s->erb.inv;
     s->dfn.stage_cfg.model.user=NULL;
     s->dfn.stage_cfg.model.infer=run_accelerator;
     s->dfn.stage_cfg.model.reset=NULL;
@@ -209,6 +207,7 @@ static void dfn_cleanup(void *user) {
     mcab_sample_flow_destroy(&s->objs);
     free(s->pool);
     s->pool=NULL;
+    dfn_example_erb_free(&s->erb);
     s->bridge=NULL; s->stage=NULL; s->unit=NULL; s->res=NULL; s->istft=NULL;
 }
 
@@ -241,7 +240,7 @@ static int dfn_build(DfnSample *s) {
 static int dfn_setup(void *user, McabSampleHopView *view) {
     DfnSample *s=user;
     int hop_size, latency;
-    if (dfn_example_load_matrices(&s->args, g_erb_fwd, g_erb_inv, name) != 0)
+    if (dfn_example_load_matrices(&s->args, &s->erb, name) != 0)
         return 1;
 
     /* The RES (balanced, built in dfn_plan) is always on; the comfort-noise fill is the program's
@@ -252,8 +251,7 @@ static int dfn_setup(void *user, McabSampleHopView *view) {
     s->unit_cfg.delay_mode = s->args.delay_mode;
     s->unit_cfg.delay_num_filters = s->args.delay_num_filters;
     s->unit_cfg.fixed_delay_samples = s->args.fixed_delay_samples;
-    /* The model grid and the graph geometry this build runs, not the model's metadata (see
-     * mono_aec_dfn_res). */
+    /* The external fields for the model grid, not the model's metadata (see mono_aec_dfn_res). */
     if (dfn2_model_io_descriptor_default(&s->args.model_grid, &s->descriptor) != 0) return 1;
 
     if (dfn_plan(s) != 0) {
@@ -286,7 +284,7 @@ static int dfn_setup(void *user, McabSampleHopView *view) {
     hop_size = mcab_hop_size(s->objs.flow);
     /* Core WOLA hop plus the bridge's added delay, or the model's lookahead hops plus the
      * core hop on the stage path. */
-    DFN2_REQUIRE_VARIANT_LINK();   /* this unit's DFN2 capacities are the archive's */
+    DFN2_REQUIRE_VARIANT_LINK();   /* this unit's DFN2 variant is the archive's */
     latency = s->dfn.use_bridge
         ? hop_size + dfn_rate_bridge_added_delay_samples(s->bridge)
         : hop_size * (dfn_res_stage_lookahead_frames(&s->args.model_grid) + 1);

@@ -849,7 +849,7 @@ static int run_phased(int sample_rate, int fft_size, int behaviour) {
 
 int main(void) {
     int rc;
-    DFN2_REQUIRE_VARIANT_LINK();   /* this unit's DFN2 capacities are the archive's */
+    DFN2_REQUIRE_VARIANT_LINK();   /* does not link against an archive of the other DFN2 variant */
     make_partition();
     make_far();
     rc = run_rejections();

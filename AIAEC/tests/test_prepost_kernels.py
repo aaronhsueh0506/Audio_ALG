@@ -1,10 +1,11 @@
 """Bit-exactness gate for the model-local NEON kernels of Align-ULCNet and
 DeepVQE-S: the front and back end of ulcnet_model_io.c, the finite predicate
-over strided state rows, and DeepVQE-S's compression. test_prepost_kernels.c
-compares each kernel with its scalar twin and with a plain statement of the
-contract on random and special values; this module builds it for the native
-and the forced-scalar configuration (and for the 48 kHz Align-ULCNet grid) and
-runs it.
+over strided rows, the whole-window finite scan of the Align-ULCNet frame and
+DeepVQE-S's compression. test_prepost_kernels.c compares each kernel with its
+scalar twin and with a plain statement of the contract on random and special
+values; this module builds it for the native and the forced-scalar
+configuration and runs it on the 16 kHz grid and, for Align-ULCNet, the 48 kHz
+grid (an argument of the one program).
 """
 
 import os
@@ -23,23 +24,22 @@ _AC_DIR = os.path.abspath(
 _AC_INCLUDE = os.path.join(_AC_DIR, 'include')
 _TEST_SOURCE = os.path.join(_THIS_DIR, 'test_prepost_kernels.c')
 
-_DEEPVQE_SOURCES = (
-    os.path.join(_DEEPVQE_DIR, 'deepvqe_process.c'),
-    os.path.join(_AIAEC_DIR, 'aiaec_process.c'),
-    os.path.join(_ULCNET_DIR, 'ulcnet_process.c'),
-)
+_DEEPVQE_SOURCES = (os.path.join(_DEEPVQE_DIR, 'deepvqe_process.c'),)
 
-_GRID_48K = ('-DULCNET_MODEL_IO_SR=48000', '-DULCNET_MODEL_IO_N_FFT=1024')
+_GRID_16K = 'grid=16000,512'
+_GRID_48K = 'grid=48000,1024'
 
+# case -> (compile defines, extra sources, grid argument)
 _CASES = {
-    'ulcnet': (('-DKERNEL_TEST_ULCNET',), ()),
-    'ulcnet_scalar': (('-DKERNEL_TEST_ULCNET', '-DSIMD_KERNELS_FORCE_SCALAR'), ()),
-    'ulcnet_48k': (('-DKERNEL_TEST_ULCNET',) + _GRID_48K, ()),
-    'ulcnet_48k_scalar': (('-DKERNEL_TEST_ULCNET', '-DSIMD_KERNELS_FORCE_SCALAR')
-                          + _GRID_48K, ()),
-    'deepvqe': (('-DKERNEL_TEST_DEEPVQE',), _DEEPVQE_SOURCES),
+    'ulcnet': (('-DKERNEL_TEST_ULCNET',), (), _GRID_16K),
+    'ulcnet_scalar': (('-DKERNEL_TEST_ULCNET', '-DSIMD_KERNELS_FORCE_SCALAR'),
+                      (), _GRID_16K),
+    'ulcnet_48k': (('-DKERNEL_TEST_ULCNET',), (), _GRID_48K),
+    'ulcnet_48k_scalar': (('-DKERNEL_TEST_ULCNET', '-DSIMD_KERNELS_FORCE_SCALAR'),
+                          (), _GRID_48K),
+    'deepvqe': (('-DKERNEL_TEST_DEEPVQE',), _DEEPVQE_SOURCES, _GRID_16K),
     'deepvqe_scalar': (('-DKERNEL_TEST_DEEPVQE', '-DSIMD_KERNELS_FORCE_SCALAR'),
-                       _DEEPVQE_SOURCES),
+                       _DEEPVQE_SOURCES, _GRID_16K),
 }
 
 
@@ -63,7 +63,7 @@ def test_kernels_match_their_twins_and_the_contract(
     cc = shutil.which('cc') or shutil.which('gcc') or shutil.which('clang')
     if cc is None:
         pytest.skip('no C compiler available')
-    defines, extra_sources = _CASES[case]
+    defines, extra_sources, grid = _CASES[case]
     executable = tmp_path / case
     subprocess.run(
         [cc, '-O2', '-std=c11', '-Wall', '-Wextra', '-Wpedantic', '-Werror',
@@ -72,6 +72,6 @@ def test_kernels_match_their_twins_and_the_contract(
          '-I', _AC_INCLUDE, '-I', _AC_DIR, _TEST_SOURCE, *extra_sources,
          audio_common_lib, '-lm', '-o', str(executable)],
         check=True, capture_output=True)
-    done = subprocess.run([str(executable)], capture_output=True, text=True)
+    done = subprocess.run([str(executable), grid], capture_output=True, text=True)
     assert done.returncode == 0, done.stderr
     assert 'ok' in done.stdout

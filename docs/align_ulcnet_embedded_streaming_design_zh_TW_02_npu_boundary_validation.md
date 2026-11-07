@@ -1,9 +1,10 @@
 [索引](align_ulcnet_embedded_streaming_design_zh_TW.md) | [上一份](align_ulcnet_embedded_streaming_design_zh_TW_01_state_wola_delay.md) <!-- split-nav -->
 ## 10. NPU Model Boundary
 
-產品邊界假設加速器完全 **stateless**：加速器不保存 K/V ring、
-score history 或 GRU hidden。這些都是 CPU 管理的 caller-owned
-static memory，每幀以普通 tensor input/output 傳給 graph。「NPU runtime
+產品邊界假設加速器完全 **stateless**：graph 不保存 K/V ring、
+score history 或 GRU hidden，每幀以普通 tensor input/output 傳入傳出。這些 state 屬於
+**應用端**：float host 把自己的 buffer 註冊進 class（借用，不進 pool），板端由 driver
+持有加速器的 state buffer，並把每個 `*_out` 綁到同名輸入的位址。「NPU runtime
 保存 state」在本文一律是指 CPU/driver context 保存，不表示模型
 或加速器有隱藏 persistent state。
 
@@ -20,18 +21,18 @@ flowchart LR
         AEC["Matched filter + PBFDKF"]
         ERR["linear_error PCM"]
         AFAR["raw far PCM"]
-        ESTFT["sqrt-Hann STFT<br/>512 / 256"]
-        FSTFT["sqrt-Hann STFT<br/>512 / 256"]
+        ESTFT["應用端 AcStft<br/>sqrt-Hann 512 / 256"]
+        FSTFT["應用端 AcStft<br/>sqrt-Hann 512 / 256"]
         FEAT["固定前端 fp32<br/>signed pow(0.3) + magnitude<br/>+ 壓縮域相位 cos/sin"]
         ERRI["error_mag / error_cos / error_sin<br/>各 [1,1,K]<br/>壓縮域 error RI 留在 model_io state"]
         FARRI["far_mag<br/>[1,1,K]"]
-        KH["key_history<br/>[1,32,D,TA]<br/>caller pool；*_out 就地綁定"]
-        VH["value_history<br/>[1,32,D,TA]<br/>caller pool；*_out 就地綁定"]
-        LH["logit_history<br/>[1,32,5,D]<br/>caller pool；*_out 就地綁定"]
-        GH["h_gru<br/>[1,4,1,128]<br/>caller pool；*_out 就地綁定"]
-        CHECK["commit()：驗證 state"]
-        INV["commit()：壓縮域 error × mask<br/>＋逆冪 fp32"]
-        WOLA["WOLA / IFFT"]
+        KH["key_history<br/>[1,32,D,TA]<br/>應用端 state；*_out 就地綁定"]
+        VH["value_history<br/>[1,32,D,TA]<br/>應用端 state；*_out 就地綁定"]
+        LH["logit_history<br/>[1,32,5,D]<br/>應用端 state；*_out 就地綁定"]
+        GH["h_gru<br/>[1,4,1,128]<br/>應用端 state；*_out 就地綁定"]
+        CHECK["frame_finish()：驗證 mask 與 state"]
+        INV["frame_finish()：壓縮域 error × mask<br/>＋逆冪 fp32"]
+        WOLA["應用端 AcIstft<br/>IFFT / WOLA"]
         PCM["enhanced PCM hop"]
 
         MIC --> AEC
@@ -72,9 +73,8 @@ flowchart LR
 ```
 
 每個 256-sample hop 產生一個 model frame，且每 hop 至多一次 inference。
-rolling 分析（`AcStft`，`center` 0；mono 範例、4ch direct path、pre/post
-class 的 TIME 模式全走這個）從第一次推入起就固定一幀一次 inference，沒有
-priming 例外。centered 分析（`center` 1，0/2/1 幀發射，priming 期間的
+rolling 分析（`AcStft`，`center` 0；mono 範例與 4ch direct path 全走這個）
+從第一次推入起就固定一幀一次 inference，沒有 priming 例外。centered 分析（`center` 1，0/2/1 幀發射，priming 期間的
 第二次 push 會連續產生兩幀）不再有出貨 pipeline 呼叫，只剩
 Python parity gate 使用。model graph 不收 PCM、不包 STFT/WOLA、不包 PBFDKF
 或 delay state machine。
@@ -90,7 +90,7 @@ portable model-I/O ABI 限制 `2 <= D <= 64`；D=1 會讓 Slice 保留零幀，�
 magnitude、壓縮域相位 cos/sin 由 `ulcnet_model_io_prepare()` 內算，並把壓縮域
 error 頻譜留在 model_io state；graph 只綁四個特徵輸入，各自持 PTQ scale，止於
 `complex_mask` 1×1 Conv、輸出學到的 mask。壓縮域 error 乘 mask 與逆冪由
-`ulcnet_model_io_commit()` 內做（fp32 乘積不融合，`-ffp-contract=off`；Python
+`ulcnet_model_io_enhance_spectrum()` 內做（fp32 乘積不融合，`-ffp-contract=off`；Python
 對照 `export_onnx.host_back_end`）。
 
 boundary 只有一種（layout 18）：四個 host 特徵輸入加四個 rank-4 state，每個
@@ -119,7 +119,7 @@ Outputs：
 
 | tensor | float32 shape | CPU 操作 |
 |---|---:|---|
-| `output` | `[1,2,1,K]` | 學到的複數 mask，planar（plane 0 實部、plane 1 虛部）；host 以壓縮域 error 頻譜乘上它、逆冪還原後送 WOLA/IFFT（`ulcnet_model_io_commit()`） |
+| `output` | `[1,2,1,K]` | 學到的複數 mask，planar（plane 0 實部、plane 1 虛部）；host 以壓縮域 error 頻譜乘上它、逆冪還原後送 WOLA/IFFT（`ulcnet_model_io_enhance_spectrum()`） |
 | `key_history_out` | `[1,32,D,TA]` | 與 `key_history` 同一位址（就地綁定），下一幀的輸入 |
 | `value_history_out` | `[1,32,D,TA]` | 與 `value_history` 同一位址 |
 | `logit_history_out` | `[1,32,5,D]` | 與 `logit_history` 同一位址 |
@@ -138,24 +138,29 @@ Concat 的結果同時是 attention 的候選與 `*_out`，沒有任何 state �
 `state_binding: in_place_same_address`、`cpu_delta_state_update: false`。
 
 - **四個 state 就地綁定**：`key_history`、`value_history`、`logit_history`、
-  `h_gru` 在 caller pool 內各一份、位址在實例壽命內固定
-  （`ulcnet_model_io_prepare()` 把 `outputs->*_out` 指到同一個 pool 位置）。runtime
+  `h_gru` 各一份、位址在實例壽命內固定，由應用端持有。float host 把四塊 buffer 註冊進
+  `UlcnetPrepostConfig`（或傳給 `ulcnet_accelerator_adapter_init()` 的
+  `UlcnetModelIoStateBuffers`），`frame_open()` 的 `outputs->*_out` 指到同一塊；板端不註冊，
+  view 為 NULL、元素數 0，state 在加速器的 buffer 內。runtime
   把每個 `*_out` 綁到同名輸入的位址，必須先讀完**所有** state 輸入、才寫任何 state
   輸出。沒有複製路徑，也沒有 ping-pong；CPU 端沒有
-  ring helper。
+  ring helper。註冊是全有或全無，指標與元素數必須成對（四個 buffer 全設或全 NULL／0）。
 - **layout**：`ULCNET_MODEL_IO_LAYOUT_VERSION` = 18，`ULCNET_PREPOST_CARVE_VERSION`
-  = 7；3–17 退役。
+  = 8；3–17 退役。
 - **`prepare()`** 只對 `output` 預填 NaN，state 不預填（它同時是下一幀的輸入）。
-- **`commit()` 不更新 state**：先檢查 `output`（mask）有限、`h_gru` 有限，以及每個
-  channel 中 graph 這一幀新寫的那一格（K/V 的 slot 0、logit 的最後一幀）有限。
-  任何一處非有限值時 state 已被覆寫、無法回滾，所以四個 state 全部歸零（冷啟動）、
-  state generation 加一、transaction 丟棄、呼叫端的輸出不動、回 -1。較舊的格子與被丟掉
-  的那一格不重查：留在那裡的非有限值會在下一幀進到 `output` 而被擋下。「寫一半」只能以非有限值偵測。
-- **`frame_skip`** 不動任何 state（視同回報失敗的 runtime 沒寫）。
+- **`frame_finish()`（底層 `ulcnet_model_io_enhance_spectrum()`）不更新 state**：先檢查
+  `output`（mask）有限；有註冊 state 時，再整塊掃描每個註冊的 buffer（K/V、logit、`h_gru`
+  的每一格，不只這一幀新寫的那一格）。通過才用壓縮域 error 乘 mask、做逆冪並寫出
+  enhanced 頻譜。任何一處非有限值時 state 已被覆寫、無法回滾，所以註冊的 state 全部歸零
+  （冷啟動；沒有註冊就沒有東西可歸零）、state generation 加一、transaction 丟棄、呼叫端的
+  輸出不動、回 -1，frame 仍開著，接著 `frame_bypass()`。沒有註冊 state（板端）時只能檢查
+  mask，加速器的 state 由 generation 的變化提醒重載。「寫一半」只能以非有限值偵測。
+- **`frame_bypass`** 不動任何 state（視同回報失敗的 runtime 沒寫）。
 - **state generation**：`ulcnet_model_io_state_generation()`／`ulcnet_prepost_state_generation()`／
   `ulcnet_accelerator_adapter_state_generation()` 數 C 端把 state 清零的次數
-  （`reset` 與被拒絕的 commit 各加一，新建實例為 0）。定點 accelerator 的 state 緩衝在 C 清零時
-  不會跟著變，板端 sample 比較這個值，變了就用量化後的 0 重填 state 輸入。第一個 hop 的
+  （`reset` 與被拒絕的 `frame_finish()`／`enhance_spectrum()` 各加一，新建實例為 0，有沒有
+  註冊 state 都一樣）。定點 accelerator 的 state 緩衝不在 C 的手上（沒有註冊），C 清零時不會跟著變，
+  板端 sample 比較這個值，變了就用量化後的 0 重填 state 輸入。第一個 hop 的
   state 為 reset 值 0；定點 runtime 的 0 是否等於量化後的 0 由量化工具鏈確認，尚未驗證。
 - **Python reference**：`export_onnx.py` 的 `next_state(outputs)` 只是輸出的尾段。
 
@@ -180,16 +185,19 @@ identity reprime。
 
 本專案交付：
 
-- `ulcnet_process.c/.h`：`ulcnet_framing_config()` 描述 audiolib 的 sqrt-Hann `AcStft`／`AcIstft`
-  （RI frame）。兩種 analysis 排程：`center` 1（centered、0/2/1 出幀排程，
-  不再有出貨 pipeline 呼叫，只剩 Python parity gate 使用）與
+- `ulcnet_process.h`（`ulcnet_process.c` 只有 `ulcnet_frame_is_finite()`）：`UlcnetModel`／
+  `UlcnetNnJob` 型別，以及應用端成幀的契約（檔頭註解）；函式庫不提供成幀函式，應用端用
+  audiolib 的 sqrt-Hann `AcStft`／`AcIstft`。兩種 analysis 排程：`center` 1（centered、
+  0/2/1 出幀排程，不再有出貨 pipeline 呼叫，只剩 Python parity gate 使用）與
   `center` 0（rolling、每次推入固定出一幀，與同一 hop 的 centered
-  最後一幀逐 bit 相同；mono 範例的兩路、4ch direct path 的 far 路，以及兩個 AIAEC
-  pre/post class 的 TIME 模式都在用）。同一個 `AcStft` 不可混用兩種 `center`。
-- model-I/O/state `c/.h`：caller-owned memory requirement/init/reset、四個
-  state tensor 的保存、commit（驗證 state、壓縮域 error × mask、逆冪；不更新 state）、
-  state generation、descriptor/layout validation。沒有 CPU ring update，也沒有複製路徑。
-  RAM 必須隨 D 縮小。
+  最後一幀逐 bit 相同；mono 範例的兩路與 4ch direct path 的 far 路都在用）。同一個 `AcStft`
+  不可混用兩種 `center`。
+- `ulcnet_model_io.c/.h`、`ulcnet_prepost.c/.h`：caller-owned memory requirement／init／reset
+  （pool 只含特徵 tensor、mask 暫存與 frame scratch，隨 grid 走、不隨 D）、四個 state tensor
+  的註冊（float host）或不註冊（板端）、`frame_finish()`／`enhance_spectrum()`（驗證 mask
+  與 state、壓縮域 error × mask、逆冪；不更新 state）、state generation、descriptor/layout
+  validation。沒有 CPU ring update，也沒有複製路徑。state 的 RAM 在應用端並隨 D 縮小，
+  函式庫的 pool 不隨 D 變。
 - streaming ONNX exporter：單幀 stateless graph，explicit state inputs
   （完整 window）+ 同 shape 的 full-window outputs，同時生成
   machine-readable descriptor，並以 `validate_inplace_state_contract` 驗證寫出的檔案。
@@ -200,13 +208,13 @@ identity reprime。
 
 - 板端 NPU driver/runtime implementation。
 - 加速器內部 persistent state（不存在）。
-- 特定產品的狀態機與板端 accelerator 呼叫。共用 CPU state adapter 與
+- 特定產品的狀態機與板端 accelerator 呼叫。共用 accelerator adapter 與
   mono/4ch fail-open wiring 在 `pipelines/ulcnet/`，其中板端 callback 保留為
   board TODO。
 - PBFDKF/matched-filter 演算法改動。
 
 外層 `UlcnetModel.infer(user, error, far, enhanced)` 仍可保留；`user`
-指向 CPU 的 accelerator context + external state buffers。pipeline 不需看到
+指向 CPU 的 accelerator context（state 由應用端註冊的 buffer 或加速器持有）。pipeline 不需看到
 K/V/GRU 細節，`reset(user)` 負責清空外部 state。
 
 出貨 graph 內、需要 runtime 支援的 operator inventory：
@@ -219,7 +227,7 @@ K/V/GRU 細節，`reset(user)` 負責清空外部 state。
 - PReLU/ELU/BatchNorm folding。
 
 signed `pow(0.3)`／inverse power 與 `atan2/cos/sin` **不在出貨 graph 內**：
-由 `ulcnet_model_io_prepare()`/`ulcnet_model_io_commit()` 以 host fp32
+由 `ulcnet_model_io_prepare()`/`ulcnet_model_io_enhance_spectrum()` 以 host fp32
 執行，graph 內沒有這些算子。
 不要在 operator scan 前任意改數學式，否則 checkpoint parity 不明。
 
@@ -262,8 +270,8 @@ signed `pow(0.3)`／inverse power 與 `atan2/cos/sin` **不在出貨 graph 內**
 ### 11.4 板端整合確認
 
 1. NPU 是否支援 graph 的所有算子與 explicit-state I/O？
-2. Board adapter 是否從 exporter descriptor 取得 D/tensor shapes，而非手寫？
-3. CPU 是否在每次 invoke 後驗證全部 model outputs finite，再 commit state？
+2. 板端的 D 與 state 形狀常數是否取自 exporter descriptor，而非手寫（函式庫不知道這些形狀）？
+3. CPU 是否在每次 invoke 後驗證全部 model outputs finite，再呼叫 `frame_finish()`（失敗改 `frame_bypass()`）？
 4. MATCHED/FIXED alignment transition 是否在同一 hop 清除 K/V/logit/GRU state？
 5. route delay 超出 n 的可靠範圍時，產品如何記錄、告警與選擇 fallback？
 6. board profiler 下 D=4/8/16 的 state RAM、NPU time 與整體 hop margin 為何？

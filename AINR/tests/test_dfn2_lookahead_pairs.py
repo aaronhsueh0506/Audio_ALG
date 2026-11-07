@@ -24,16 +24,15 @@ the deep-filter taps shift with df_lookahead. These tests pin that end to end:
                      on the 32 kHz and 16 kHz grids too (the non-48 kHz branches of
                      both programs: generated band borders, scaled bin addresses)
   run time          the library holds no pair: ``dfn2_grid_make`` refuses a
-                     pair outside the accepted set (and a ring above the
-                     capacity), checked from C compiled as C11 and gnu99; the
-                     other run-time gates (pool hash, model-I/O descriptor,
-                     hand-edited grid) are in test_dfn_lookahead_link.py
+                     pair outside the accepted set, checked from C compiled as
+                     C11 and gnu99; the other run-time gates (pool hash,
+                     model-I/O descriptor, hand-edited grid) are in
+                     test_dfn_lookahead_link.py
 
 The pair of the build that takes no override is config.ini's (the default of
-``dfn2_test_grid.h``); the others are builds with the two macros overridden,
-and a pair that needs a deeper ring than the library's default capacity also
-raises ``DFN2_MAX_DF_RING`` (``dfn_pairs.defines``). The pre/post class is
-covered per pair in test_dfn2_prepost_c.py.
+``dfn2_test_grid.h``); the others are builds with the two macros overridden
+(``dfn_pairs.defines``). The pre/post class is covered per pair in
+test_dfn2_prepost_c.py.
 """
 
 import configparser
@@ -186,6 +185,7 @@ int main(int argc, char **argv) {
     float *head_mask, *head_coefs, *head_alpha, *win_erb, *win_spec;
     static DFN2State st;
     static DFN2ModelIOState io;
+    void *state_block, *io_block;
     static float zero_erb[DFN2_N_ERB];
     static float zero_spec[2 * DFN2_DF_BINS];
     static float zero_bins[DFN2_N_BINS];
@@ -195,6 +195,8 @@ int main(int argc, char **argv) {
     int total, c, ready_bad = 0, window_bad = 0, windows = 0, emitted = 0;
     int first_ready = -1;
     const DFN2Grid *grid = dfn2_test_grid();
+    const size_t state_bytes = dfn2_state_mem_size(grid);
+    const size_t io_bytes = dfn2_model_io_mem_size(grid);
     const size_t erb_window_bytes = (size_t)DFN2_MODEL_INPUT_FRAMES *
                                     DFN2_N_ERB * sizeof(float);
     const size_t spec_window_bytes = (size_t)2 * DFN2_MODEL_INPUT_FRAMES *
@@ -229,9 +231,12 @@ int main(int argc, char **argv) {
                                  DFN2_DF_BINS);
     for (c = 0; c < DFN2_N_ERB; ++c) unit_mask[c] = 1.0f;
 
-    if (dfn2_state_init(&st, grid, NULL, NULL) != 0) return 2;
+    state_block = aligned_alloc(16, state_bytes);
+    io_block = aligned_alloc(16, io_bytes);
+    if (!state_block || !io_block) return 2;
+    if (dfn2_state_init(&st, state_block, state_bytes, grid) != 0) return 2;
     dfn2_set_erb_matrices(&st, erb_fwd, erb_inv);
-    if (dfn2_model_io_init(&io, grid) != 0) return 2;
+    if (dfn2_model_io_init(&io, io_block, io_bytes, grid, NULL, 0, NULL, 0) != 0) return 2;
     out = fopen(argv[2], "wb");
     if (!out) return 2;
 
@@ -260,20 +265,19 @@ int main(int argc, char **argv) {
                 const float *ws = win_spec + (size_t)t * 2 *
                                   DFN2_MODEL_INPUT_FRAMES * DFN2_DF_BINS;
                 ++windows;
-                /* The windows are packed at the grid's stride inside
-                 * capacity-sized storage: compare the packed run. */
+                /* The windows are packed at the grid's stride: compare the run. */
                 if (memcmp(we, io.erb_window, erb_window_bytes) != 0 ||
                     memcmp(ws, io.spec_window, spec_window_bytes) != 0)
                     ++window_bad;
             }
-            valid = dfn2_compose_stream(
+            valid = dfn2_enhance_spectrum_stream(
                 &st, re, im, 1,
                 has ? head_mask + (size_t)t * DFN2_N_ERB : unit_mask,
                 has ? head_coefs + (size_t)t * COEFS : zero_coefs,
                 has ? head_alpha[t] : 0.0f, atten_lim_db, out_re, out_im,
                 &frame);
         } else {
-            valid = dfn2_compose_stream(&st, re, im, 0, NULL, NULL, 0.0f,
+            valid = dfn2_enhance_spectrum_stream(&st, re, im, 0, NULL, NULL, 0.0f,
                                         atten_lim_db, out_re, out_im, &frame);
         }
         if (valid < 0) return 3;
@@ -443,8 +447,7 @@ def test_c_host_stream_reproduces_the_offline_model_on_another_grid(
     (20 bands, 48 deep-filter bins). The library holds no grid: the frame size,
     band count and the stride of the packed feature windows come from the
     DFN2Grid the program builds, so a window packed at the wrong stride (the
-    shipped grid's, or the capacity) fails here. The deepest ring (2/4) is
-    included."""
+    shipped grid's) fails here. The deepest ring (2/4) is included."""
     _check_c_stream(tmp_path, dfn2_modules, other_grid_drivers[(grid, pair)],
                     pair, atten_lim, grid)
 
@@ -523,7 +526,7 @@ def test_the_grid_flag_reaches_the_suite(suite_runs, pair, suite):
                                   (2, 5)])
 def test_dfn2_grid_refuses_pairs_the_trainer_would_not_accept(
         tmp_path, audio_common_lib, pair, std):
-    """The library no longer carries the pair, so the range check is
+    """The library carries no pair, so the range check is
     ``dfn2_grid_make``'s, at run time, and it holds in every language mode (the
     integration build is gnu99): a mask lookahead outside 0..2 is
     ERR_MASK_LOOKAHEAD, a deep-filter lookahead outside 0..4 is

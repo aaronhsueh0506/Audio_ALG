@@ -193,17 +193,36 @@ Guard rails (all four repos):
 **Board sample build notes.** The board samples live outside this repository and are built from the same
 library sources. Their build lists drop `fix_gain.c` and the `third_party/gain` include path (the
 samples apply their input gain with a small `InputGain` helper over `sk_scale_f32()` and `sk_clip_f32()`).
-The DeepFilterNet2 library holds no grid: the application builds a `DFN2Grid` with `dfn2_grid_make()` (sample rate, FFT size,
-ERB bands, deep-filter bins, lookahead pair) and passes it to every DFN2 object, so one binary runs any grid within the library's
-capacities, and a model or pool built for another grid or pair is refused at run time. The pipeline units
-(`dfn_res_stage.c`, `dfn_rate_bridge.c`) hold no grid and no pair: the application puts its `DFN2Grid` in
-`DfnResStageConfig.grid`, so a pair other than 1/1 needs no pair flag on any product unit. Only a pair whose state ring
-`max(5, M + D + 1)` exceeds 5 (1/4, 2/3, 2/4) also needs `-DDFN2_MAX_DF_RING=<ring>` on every DFN2 unit. The board samples take their
-grid from their own (sample rate, FFT size) table (three rows; two in `alg_ai3_aec_dfn.c` and the example mains, whose AEC has no 32 kHz grid): `alg_ai3_dfn.c` and `alg_ai3_dfn_lite.c` from `--sample-rate` /
-`--fft-size`, `alg_ai3_aec_dfn.c` from `--ai-sample-rate` / `--ai-fft-size` (its `--sr` is the host rate), and the two UVC samples
-(`uvc_ai_nr_stream.c`, `uvc_audio_live2a.c`) are 48 kHz only with the shipped row built into the sample. Every DFN2 sample reads its
-ERB matrices from `/mnt/sd/dfn2_blobs/fb_<sr>_<n_erb>.bin` (for example `fb_48000_32.bin`), the exporter's `erb_matrix.bin` renamed
-for its grid. The checkpoint, the ERB file and the `model.bin` must be the ones trained for the chosen grid and pair.
+The DeepFilterNet2, Align-ULCNet and DeepVQE-S libraries are frequency domain only: the sample builds its own `AcStft` / `AcIstft`
+(audiolib's framing, so the board build list must include `audio_stft.c` and `audio_window.c`) and hands spectra to the library. No
+grid or lookahead pair is a build setting, so no model-grid `-D` flag belongs on a compile line. Each grid is a run-time spec filled from the sample's own table (`DFN2GridSpec` -> `dfn2_grid_make()`, `UlcnetGridSpec` ->
+`ulcnet_grid_make()`, `DeepVqeGridSpec` -> `deepvqe_grid_make()`), the pool comes from the library's `*_get_mem_size()` for that grid, and
+a model or pool built for another grid or pair is refused at run time. The one DFN2 variant flag is `-DDFN2_MASK_ONLY`; every DFN2 unit
+of a build must share it (mixed units do not link). The pipeline units (`dfn_res_stage.c`, `dfn_rate_bridge.c`) hold no grid and no pair
+either: the application puts its `DFN2Grid` in `DfnResStageConfig.grid`. The analysis and synthesis scales and the overlap-add mode
+are part of each library's framing contract (see its header or README): the DFN2 samples that call the pre/post class directly set
+`spec_scale = grid.stft_scale` and `ispec_scale = grid.stft_unscale`, the stage-hosted samples keep both at 1, and the Align-ULCNet and
+DeepVQE-S samples use `AC_OLA_ENV_NORM`; the default `AcStftConfig` gives the wrong feature scale for DFN2.
+
+A DFN2 grid row carries the model's `df_order`, lookahead pair, `frames_per_call` and the normaliser values of `config.ini`. The
+samples take the row from their own (sample rate, FFT size) table (three rows, the 32 kHz one provisional because no 32 kHz model is
+trained; two in `alg_ai3_aec_dfn.c` and the example mains, whose AEC has no 32 kHz grid): `alg_ai3_dfn.c` and `alg_ai3_dfn_lite.c` from
+`--sample-rate` / `--fft-size`, `alg_ai3_aec_dfn.c` from `--ai-sample-rate` / `--ai-fft-size` (its `--sr` is the host rate), and the two
+UVC samples (`uvc_ai_nr_stream.c`, `uvc_audio_live2a.c`) are 48 kHz only with the shipped row built into the sample.
+
+The board registers no recurrent state (the DFN2 `gru_hidden` / `df_convp_history` pairs and the Align-ULCNet and DeepVQE-S state views
+stay NULL / 0): the accelerator keeps it. A sample therefore reads the library's state generation before every accelerator run
+(`dfn2_prepost_state_generation()`; `dfn_res_stage_state_generation()` or `dfn_rate_bridge_state_generation()` when a stage or bridge
+hosts the model; `ulcnet_prepost_state_generation()`; `deepvqe_prepost_state_generation()`) and, when it differs from the last value it
+saw, reloads quantized zeros into the accelerator's state input buffers (DFN2 with `mask_lookahead` M >= 1: once more after each of the first M
+warm-up frames, so a stream start makes M extra NPU runs whose heads are discarded). The start value differs per library (1 for DFN2 and the
+stage / bridge, 0 for Align-ULCNet and DeepVQE-S), so compare, never assume.
+
+Every DFN2 sample reads its ERB matrices from `/mnt/sd/dfn2_blobs/fb_<sr>_<n_erb>.bin` (for example `fb_48000_32.bin`; `<sr>` is the model
+grid's rate). The file has the layout of the DFN2 exporter's `erb_matrix.bin`: int32 `n_bins`, int32 `n_bands`, the forward matrix, the inverse
+matrix (float32; both `[n_bins][n_erb]`, bin-major). The sample refuses a header that disagrees with the grid or a short read, transposes the inverse to
+band-major `[n_erb][n_bins]` itself once at init, and passes the two pointers as `erb_fwd` / `erb_inv` (the buffers outlive every DFN2
+object). The checkpoint, the ERB file and the `model.bin` must be the ones trained for the chosen grid and pair.
 
 ## Compile flags (`EXTRA_CFLAGS`)
 
@@ -237,7 +256,7 @@ is rejected at parse time:
 
 ```
 $ make EXTRA_CFLAGS=-ffast-math
-Makefile:389: *** FP policy conflict: CFLAGS/CXXFLAGS/CPPFLAGS/EXTRA_CFLAGS contains -ffast-math; this repo pins -ffp-contract=off; remove -ffast-math from CFLAGS/CXXFLAGS/CPPFLAGS/EXTRA_CFLAGS.  Stop.
+Makefile:NNN: *** FP policy conflict: CFLAGS/CXXFLAGS/CPPFLAGS/EXTRA_CFLAGS contains -ffast-math; this repo pins -ffp-contract=off; remove -ffast-math from CFLAGS/CXXFLAGS/CPPFLAGS/EXTRA_CFLAGS.  Stop.
 ```
 
 `../../audiolib/common/scripts/audit_fp_contract.sh` is the disassembly-level

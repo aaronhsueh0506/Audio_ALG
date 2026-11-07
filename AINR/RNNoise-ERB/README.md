@@ -40,57 +40,154 @@ complex feature 約放大 `sqrt(a)` 倍。只有啟用 complex 分支時，模�
 忠實移植，沒有額外的安全界線。
 公式來源：[Rikorose/DeepFilterNet `libDF/src/lib.rs`](https://github.com/Rikorose/DeepFilterNet/blob/main/libDF/src/lib.rs)。
 
-Feature 常數在 `config.ini [feature]`，C 部署常數固定於 `process.h`。
-修改後需同步兩邊並重訓。
+Feature 常數在 `config.ini [feature]`；C 端沒有編譯期常數，由應用端把同名值填入
+`RNNoiseGridSpec`，再以 `rnnoise_grid_make()` 建成 `RNNoiseGrid`。修改後需同步 spec 並重訓。
 
 ## C 串流整合
 
-`process.c` 只維護模型特徵與 gain 處理；FFT、IFFT、窗與 overlap-add 由
-`audiolib/common` 的 `AcStft`／`AcIstft` 執行。呼叫端持有 FFT handle、兩個 framing
-物件及其 16-byte aligned 記憶體，並負責生命週期；處理途中沒有配置記憶體。
-分析與合成依序執行時，可以共用一個 FFT handle。傳入 `fft=NULL` 時，common 會在
-各物件的 caller pool 內各自建立 plan；記憶體需求須重新查詢。`cfg=NULL` 時設定
-helper 不做任何操作。
+`process.c` 只處理頻譜、維護模型特徵與 gain 處理；FFT、IFFT、窗與 overlap-add 由
+`audiolib/common` 的 `AcStft`／`AcIstft` 執行，由應用端建立、持有與重置。函式庫不配置記憶體
+（`rnnoise_get_mem_size()` → 呼叫端記憶體 → `rnnoise_init_ex()`）、不讀檔、也不持有 GRU state：
+ERB 矩陣是應用端讀入後以指標交入的資料，float host 在 config 註冊三個 GRU 張量，板端不註冊。
+
+Framing 契約（`process.h` 的標頭註解；函式庫不包裝它）：`ac_stft_config_default(&sc, grid.n_fft)`，
+`sc.spec_scale = grid.stft_scale`（`1/sqrt(n_fft)`），每個 hop 一個完整 `n_fft` frame（hop = `n_fft / 2`），
+其餘維持預設：center 0、兩側 periodic sqrt-Hann、`AC_OLA_ACCUMULATE`（不除窗包絡，與 Python `train.istft` 相同）、
+`ispec_scale = 1.0f`。
 
 ```c
-AcStftConfig cfg;
-rnnoise_framing_config(&cfg, fft);  /* fft: caller-owned 512-point FFT */
-AcStft *analysis = ac_stft_init(analysis_mem, analysis_bytes, &cfg);
-AcIstft *synthesis = ac_istft_init(synthesis_mem, synthesis_bytes, &cfg);
-if (rnnoise_state_init(&state, analysis, synthesis) != 0) return -1;
+#include <math.h>
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include "audio_stft.h"
+#include "process.h"
+
+enum { GRU_HIDDEN = 128 };    /* the exported graph's h1, h2, h3 are [1,1,128] each: the application's shapes */
+
+static void *alloc16(size_t bytes) { return aligned_alloc(16, (bytes + 15) & ~(size_t)15); }
+
+/* The accelerator: erb[3][n_bands], spec[3][2][spec_bins], h1..h3 -> band_gains[n_bands]; the
+ * hidden outputs are written to the same buffers as the inputs. */
+typedef int (*RunModel)(const float *erb, const float *spec, float *h1, float *h2, float *h3,
+                        float *band_gains);
+
+/* erb_fwd: bin-major [n_bins][n_bands]; erb_inv: band-major [n_bands][n_bins]. The application loads
+ * both and keeps them alive; the library borrows the pointers. */
+static int run_rnnoise(const float *erb_fwd, const float *erb_inv, RunModel run_model,
+                       const float *in, float *out, long hops)
+{
+    const RNNoiseGridSpec spec = {            /* the shipped model: config.ini [signal] [feature] */
+        .sample_rate = 16000, .n_fft = 512, .n_bands = 22, .min_bins_per_band = 2,
+        .lookahead_frames = 1, .spec_max_hz = 4000,
+        .erb_norm_tau_sec = 1.0, .erb_norm_init_lo_db = -20.0f, .erb_norm_init_hi_db = -45.0f,
+        .erb_norm_scale_db = 40.0f, .spec_norm_tau_sec = 1.0,
+        .spec_norm_init_lo = 0.04f, .spec_norm_init_hi = 0.008f, .spec_norm_eps = 1e-12f,
+    };
+    RNNoiseGrid grid;
+    int status = rnnoise_grid_make(&grid, &spec);
+    if (status != RNNOISE_GRID_OK) {
+        fprintf(stderr, "grid refused: %s\n", rnnoise_grid_status_text(status));
+        return -1;
+    }
+
+    int rc = -1;
+    const size_t nb = (size_t)grid.n_bins, erb_n = rnnoise_erb_window_elements(&grid);
+    float *h = calloc(3 * GRU_HIDDEN, sizeof *h);                          /* h1, h2, h3 */
+    float *buf = malloc(sizeof *buf * (9 * nb + grid.n_bands + erb_n + rnnoise_spec_window_elements(&grid)));
+    float *hist_re = buf, *hist_im = hist_re + 3 * nb;                     /* the last three spectra */
+    float *cur_re = hist_im + 3 * nb, *cur_im = cur_re + nb, *bin_gains = cur_im + nb;
+    float *band_gains = bin_gains + nb, *erb = band_gains + grid.n_bands, *spec_win = erb + erb_n;
+    void *stft_mem = NULL, *istft_mem = NULL, *pool = NULL;
+    AcStft *stft = NULL;
+    AcIstft *istft = NULL;
+    RNNoiseState *st = NULL;
+    if (!h || !buf) goto done;
+
+    AcStftConfig sc;                          /* the framing: audiolib */
+    ac_stft_config_default(&sc, grid.n_fft);
+    sc.spec_scale = grid.stft_scale;          /* ispec_scale stays 1.0f: rnnoise_apply_gains() scales */
+    size_t stft_bytes = ac_stft_get_mem_size(&sc), istft_bytes = ac_istft_get_mem_size(&sc);
+    stft_mem = alloc16(stft_bytes);
+    istft_mem = alloc16(istft_bytes);
+    if (!stft_mem || !istft_mem) goto done;
+    stft = ac_stft_init(stft_mem, stft_bytes, &sc);
+    istft = ac_istft_init(istft_mem, istft_bytes, &sc);
+    if (!stft || !istft) goto done;
+
+    RNNoiseConfig cfg;
+    RNNoiseMemReq req;
+    if (rnnoise_config_defaults(&cfg, &grid) != 0) goto done;
+    cfg.erb_fwd = erb_fwd;
+    cfg.erb_inv = erb_inv;
+    cfg.h1 = h;                  cfg.h1_elements = GRU_HIDDEN;    /* float host: register the state, */
+    cfg.h2 = h + GRU_HIDDEN;     cfg.h2_elements = GRU_HIDDEN;    /* all three or none; a board registers nothing */
+    cfg.h3 = h + 2 * GRU_HIDDEN; cfg.h3_elements = GRU_HIDDEN;
+    if (rnnoise_get_mem_size(&cfg, &req) != 0) goto done;
+    pool = alloc16(req.bytes);
+    st = pool ? rnnoise_init_ex(pool, (size_t)req.bytes, &cfg, &req) : NULL;
+    if (!st) goto done;
+
+    rc = 0;
+    for (long t = 0; t < hops; ++t) {
+        float *slot_re = hist_re + (size_t)(t % 3) * nb, *slot_im = hist_im + (size_t)(t % 3) * nb;
+        float *hop_out = out + t * grid.hop;
+        ac_stft_push_planar(stft, in + t * grid.hop, slot_re, slot_im);
+        int ready = rnnoise_compute_features(st, slot_re, slot_im, erb, spec_win);
+        if (ready < 0) { rc = -1; break; }
+        for (int b = 0; b < grid.n_bands; ++b) band_gains[b] = 1.0f;          /* no 3-frame window yet: unit gains */
+        if (ready) {
+            for (int b = 0; b < grid.n_bands; ++b) band_gains[b] = NAN;       /* an unwritten output is refused */
+            if (run_model(erb, spec_win, h, h + GRU_HIDDEN, h + 2 * GRU_HIDDEN, band_gains) != 0 ||
+                rnnoise_frame_finish(st, band_gains) != 0)
+                for (int b = 0; b < grid.n_bands; ++b) band_gains[b] = 1.0f;   /* refused: unit gains */
+            rnnoise_apply_atten_lim(st, band_gains, 0.0f);                     /* optional; <= 0 disables */
+        }
+        rnnoise_expand_gains(st, band_gains, bin_gains);
+        /* the gains of the window [t-2, t-1, t] belong to spectrum t - lookahead_frames; the spectra before the
+         * first window are synthesised too (unit gains), or their overlap would be missing from the first output */
+        long s = t - grid.lookahead_frames;
+        if (s < 0) { memset(hop_out, 0, sizeof *hop_out * grid.hop); continue; }   /* no spectrum to emit yet */
+        memcpy(cur_re, hist_re + (size_t)(s % 3) * nb, sizeof *cur_re * nb);
+        memcpy(cur_im, hist_im + (size_t)(s % 3) * nb, sizeof *cur_im * nb);
+        rnnoise_apply_gains(st, cur_re, cur_im, bin_gains);                    /* x stft_unscale inside */
+        ac_istft_push_planar(istft, cur_re, cur_im, hop_out);
+    }
+done:
+    free(pool); free(istft_mem); free(stft_mem); free(buf); free(h);
+    return rc;
+}
 ```
 
-記憶體大小分別以 `fft_get_mem_size(512)`、`ac_stft_get_mem_size(&cfg)`、
-`ac_istft_get_mem_size(&cfg)` 查詢。`rnnoise_state_init` 檢查實際物件的 FFT 大小、
-center、縮放、窗與合成模式；錯誤組合回傳 `-1`，不綁定物件。保留 helper 借用的
-immutable model window：512 個窗值必須與模型表逐位元相同。若另把 `cfg.window` 設為
-`NULL`，common 會自行建窗；只有產生的位元完全相同時才接受綁定，不能把這當作跨
-工具鏈保證的替代方式。重新初始化同時重置
-特徵 EMA 與 framing 狀態。呼叫端不可在綁定後重用或覆寫這些物件的記憶體。
-
-- C 部署固定為 16 kHz、FFT/window 512、hop 256、periodic root-Hann、center=0。
-  Python 設定允許 `win_len < n_fft`，但此 C 部署並不支援該模式；不能只改巨集。
-- `rnnoise_analysis` 每次讀取完整 **512 samples**，不把它當作 256-sample hop。
-  呼叫端以 256 samples 步進準備相鄰 frame，正向輸出乘 `512^-0.5`。
-- 合成保留 `spec *= gain * sqrt(512)` 的運算順序與輸入頻譜修改契約；共用 ISTFT
-  的 `ispec_scale=1`，不可再縮放一次。`AC_OLA_ACCUMULATE` 自第一幀輸出 256 samples，
-  不除窗包絡，與 Python `train.istft` 相同。
-- 最新特徵 window `[t-2,t-1,t]` 的 gain 套到 spectrum `t-1`；呼叫端仍須延遲對應頻譜。
-- `RNNOISE_PREPOST_LAYOUT_VERSION=2`：state 借用 framing，`rnnoise_state_init`
-  取 analysis／synthesis 參數並回傳 `0` 或 `-1`。GRU 張量的
+- 出貨模型是 16 kHz、FFT/window 512、hop 256、22 bands、lookahead 1（上面的 `RNNoiseGridSpec`）。grid 不是編譯期常數：
+  `rnnoise_grid_make()` 依 `RNNoiseGridSpec` 檢查並推導 `hop`、`n_bins`、`spec_bins`、`conv_delay`、兩個 EMA 係數與兩個縮放；
+  `test/test_rnnoise_framing.c` 另以 16000/256、48000/1024、8000/128 三組 grid 驗證 framing 契約（泛化驗證用，只有 16000/512 有出貨模型）。
+  Python 設定允許 `win_len < n_fft`，C 端不支援該模式。
+- `rnnoise_compute_features()` 每次收一個 spectrum（`n_bins` 個 bin；`ac_stft_push_planar()` 內部保留前一個 hop，零歷史起算），
+  累積 3 個 frame 後回傳 1，輸出 `out_erb[3][n_bands]` 與 `out_spec[3][2][spec_bins]`。
+- `rnnoise_apply_gains()` 原地執行 `spec[k] *= bin_gains[k] * grid.stft_unscale`（gain 與 `sqrt(n_fft)` 合為一次乘法，沒有反 FFT）；
+  共用 ISTFT 的 `ispec_scale` 必須維持 1，不可再縮放一次。
+- 最新特徵 window `[t-2,t-1,t]` 的 gain 屬於 spectrum `t - grid.lookahead_frames`（window 槽位 `grid.conv_delay`，出貨值 1）；
+  呼叫端須保存並延遲對應頻譜。單位增益時，輸出為輸入延遲 `1 + lookahead_frames` 個 hop（1 hop 的 OLA 加 lookahead）。
+- ERB 矩陣由應用端提供：`RNNoiseConfig.erb_fwd` 與 `erb_inv` 是兩個 `const float *`，函式庫只借用、不讀檔、不複製，
+  應用端須在使用期間保持有效。`erb_fwd` 是 `train.py` 的 mode 0、bin-major `[n_bins][n_bands]`；`erb_inv` 是 mode 1、
+  band-major `[n_bands][n_bins]`，為 partition of unity（單位 band gain 展開後 bin gain 為 1）；兩者皆 `float32`，各
+  `n_bins * n_bands * 4` bytes（16000/512/22 為 22,616）。`export_erb_matrix.py` 沒有輸出這個 band-major inverse，見「ERB 矩陣匯出」。
+- `RNNOISE_PREPOST_LAYOUT_VERSION` 為 2、`RNNOISE_CARVE_VERSION` 為 1（皆進 pool hash）；GRU 張量的
   `RNNOISE_MODEL_IO_LAYOUT_VERSION` 與 ONNX state layout 為 **1**。
 
 建置時加入 `audiolib/common/include`、`audiolib/common` include paths，連結同一組
 `SIMD=0/1` 的 common archive；此目錄的 Makefile 已處理這些依賴。
 
 更換 FFT 實作保留數學定義，但 butterfly 的浮點捨入會改變結果，不能宣稱逐位元
-相同；低能量 band 的 log 會放大微小頻譜誤差。測試涵蓋 Python/C 容差、完整 frame、
-頻譜修改、合成長度、首 hop、重置與固定係數網路輸出；本機沒有已訓練 RNNoise 權重，
+相同；低能量 band 的 log 會放大微小頻譜誤差。測試涵蓋 Python/C 容差、
+頻譜修改、framing 契約（單位增益下輸出為輸入延遲一個 hop）、首 hop、重置與固定係數網路輸出；本機沒有已訓練 RNNoise 權重，
 **尚未量測真實模型的感知品質**，固定係數測試不能替代這項評估。
 
-在目前 AArch64 host，獨立配置的總 static memory 為 **31,136 bytes**；其中 RNNoiseState 5,104、FFT 13,552、analysis 6,240、synthesis 6,240。
-只有呼叫端原本就持有可共用 FFT 時，新增的 RNNoise/framing 部分才是 17,584 bytes。
-這些是目前實作的量測，整合端仍應依 size-query 配置。
+在目前 AArch64 host，`rnnoise_get_mem_size()` 為 **5,600 bytes**（16000/512、22 bands）；pool 不含 `AcStft`／`AcIstft`、
+ERB 矩陣與註冊的 GRU state。應用端另持有：framing 物件（預設各自帶 FFT plan 與窗時，`ac_stft_get_mem_size()` 與
+`ac_istft_get_mem_size()` 在 512 點各為 21,840 bytes；共用 FFT handle 與窗表時的大小待量測）、兩個 ERB 矩陣共 45,232 bytes（各 22,616），
+以及 float host 的 GRU state（3 × 128 floats = 1,536 bytes）。這些是目前實作的量測，整合端仍應依 size-query 配置。
 
 ## 環境安裝
 
@@ -174,7 +271,7 @@ output_dir = ./output
 | `[feature] spec_max_hz` | 4000 | complex branch 頻率上限 |
 | `[feature] spec_norm_tau_sec` | 1.0 | complex per-bin magnitude EMA 時間常數 |
 
-改動任何 feature 常數都需要同步修改 `process.h` 並重新訓練。Checkpoint 會保存
+改動任何 feature 常數都需要同步修改應用端的 `RNNoiseGridSpec` 並重新訓練。Checkpoint 會保存
 `feature_version` 與所有 normalization 常數；train resume、denoise 和 ONNX export
 都會拒絕缺少版本的舊 checkpoint，或拒絕與 runtime config 不一致的 checkpoint。
 匯出的 ONNX model metadata 也會帶上相同 feature contract，供部署端檢查。
@@ -306,24 +403,20 @@ python3 export_onnx.py --config config.ini --model output/rnnoise_best.pth \
 ```
 
 Streaming ONNX 輸入為 `erb_input[1,3,22]`、`spec_input[1,3,2,129]`
-與三組 GRU hidden state；輸出中心 frame 的 gains 與更新後 hidden state。
-加速器本身不保存 state：`RNNoiseModelState` 就是 state buffer，有兩種餵法。
-一般路徑：runtime 把 `h1_out/h2_out/h3_out` 寫進自己的輸出 tensor（疊成
-`hidden[3][128]`），再呼叫 `rnnoise_model_state_inherit(state, hidden_out)`
-複製進 struct；它會先檢查整塊是否 finite，全部 finite 才複製並回傳 `0`，
-參數為 NULL 或任何元素為 NaN/Inf 則回傳 `-1`、不複製且 state 維持原狀，
-呼叫端應把該 frame 視為失敗；若 `hidden_out` 已等於 `state->hidden`
-（runtime 已就地寫入）則為 no-op 回傳 `0`。最佳化路徑（省一次複製）：板端把圖的
-`h1_in/h2_in/h3_in` 輸入與 `h1_out/h2_out/h3_out` 輸出綁到同一欄位
-（`&state->hidden[0..2]`），CPU 不複製。runtime 須先讀完所有 state 輸入、
-才可寫同位址的 state 輸出。三個 feature frames
+與三組 GRU hidden state（`h1_in`／`h2_in`／`h3_in`，各 `[1,1,128]`）；輸出中心 frame 的 gains 與更新後 hidden state。
+加速器本身不保存 state，三個 hidden 張量屬於應用端：板端把圖的 `h*_in` 輸入與 `h*_out` 輸出綁到同一個 buffer，CPU 不複製；
+runtime 須先讀完所有 state 輸入、才可寫同位址的 state 輸出。三個 feature frames
 是輸入 temporal kernel 的完整可視範圍，不代表一次輸出三個 frames。
-就地路徑的 `rnnoise_model_state_validate()` 是選用的就地 finite 檢查：全部 finite
-回傳 `0`；參數為 NULL 或任何元素為 NaN/Inf 則回傳 `-1`，且因前一個 state 已不存在，
-會將整個 state 歸零（從零重新開始）。仍為 finite 的部分寫入或混合寫入無法偵測。
-匯出的 metadata 帶 `state_layout_version`，數值與 `process.h` 的
+
+float host 在 `RNNoiseConfig` 註冊 `h1`／`h2`／`h3`（指標加元素數，各 128；三組全給或全不給，指標配元素數 0 或
+元素數配 NULL 指標都會被拒絕）：`rnnoise_init()` 與 `rnnoise_reset()` 歸零，每次 `rnnoise_frame_finish(st, band_gains)`
+檢查 `band_gains` 與整塊註冊的 state 是否 finite；任一為 NaN/Inf 時，註冊的張量歸零、state generation 加一、回傳 `-1`
+（呼叫端改用單位增益）。仍為 finite 的部分寫入或混合寫入無法偵測。板端不註冊任何 state：加速器自己的定點副本不會被
+reset 或歸零動到，所以 `rnnoise_state_generation()` 在 init 後為 1，每次 `rnnoise_reset()` 與每次被拒的
+`rnnoise_frame_finish()` 加一（modulo 2^32，註冊與否都計），runtime 看到與上一 frame 不同的值就把自己的 state 張量重填
+quantized zero。匯出的 metadata 帶 `state_layout_version`，數值與 `process.h` 的
 `RNNOISE_MODEL_IO_LAYOUT_VERSION` 相同，整合端可據此拒絕 state layout
-已經對不上自己配置的 struct 的圖。
+已經對不上自己配置的圖。
 
 PTQ calibration 可直接使用：
 
@@ -343,9 +436,14 @@ calib/rnnoise_erb.npz` 可改輸出 NumPy archive。兩種格式都保存實際�
 匯出 ERB 轉換矩陣（C 部署用）：
 
 ```bash
-# 匯出所有格式 (npy + C header)
+# 匯出所有格式 (bin + npy + C header)
 python3 export_erb_matrix.py --config config.ini --format all
 ```
+
+`--format bin` 的 `erb_matrix.bin`（little-endian）依序是 `int32 n_bins`、`int32 n_bands`、`float32` forward `[n_bins][n_bands]`、
+`float32` inverse `[n_bins][n_bands]`（forward 與 inverse 都是 bin-major），尾端接 `int32 nfftborder[n_bands]`；`--format npy`
+的 `erb_fwd.npy`／`erb_inv.npy` 同為 `(n_bins, n_bands)`。函式庫的 `erb_inv` 是 band-major `[n_bands][n_bins]`（見上面
+「C 串流整合」）：樹內沒有 exporter 輸出這個 layout，應用端須把 inverse 轉置後再交入。
 
 ## 檔案說明
 
@@ -354,34 +452,31 @@ python3 export_erb_matrix.py --config config.ini --format all
 | `train.py` | 模型定義與 packed raw-WAV tensor 訓練迴圈 |
 | `inference.py` | 推論與 calibration 入口 |
 | `export_onnx.py` | ONNX 匯出（streaming 推論格式） |
-| `export_erb_matrix.py` | ERB 矩陣匯出（npy / C header） |
+| `export_erb_matrix.py` | ERB 矩陣匯出（bin / npy / C header） |
 | `config.ini` | 所有超參數設定 |
-| `process.c` / `process.h` | C 前後處理實作（嵌入式部署用） |
+| `process.c` / `process.h` | C 前後處理實作（頻譜域，嵌入式部署用） |
 | `tests/` | Python feature、loss、checkpoint 與 Python/C parity tests |
 | `../dataset_gen/` | 共用 augmentation、WAV generation、resample、packing 與 packed loader |
 | `requirements.txt` | Python 依賴套件 |
 
-## 表格 drift-guard(C 部署表格的兩層契約)
+## ERB 矩陣 drift-guard
 
-`rnnoise_tables_gen.h` 的編譯期常數表(ERB fwd/inv、nfftborder、Hann window)
-有兩層 drift 契約(已接進 `make test-tables`):
+C 端沒有編譯期 ERB 表；矩陣是應用端提供的資料。`make test-tables` 把測試讀入的矩陣與獨立重算的三角 ERB filterbank 比對，
+並檢查矩陣契約（例如 partition of unity）。測試讀的是兩個無標頭 float32 檔 `$(BUILD_DIR)/erb_fwd.bin`（bin-major）與
+`$(BUILD_DIR)/erb_inv.bin`（band-major），由 `tests/erb_fixture.py`（只用標準函式庫）依 `train.py` 的公式寫出；以
+`ERB_FWD=FILE ERB_INV=FILE` 可改讀其他檔。`make test-erb-python`（訓練環境）再把這個 fixture 釘到 `train.py` 與
+`export_erb_matrix.py`。
 
 ```bash
-make test-tables   # 兩層都建置+執行,任一 FAIL 即非零退出
+make test-tables
 ```
 
-- **Layer 1(canonical,預設)**:獨立重算 vs header 逐 byte `memcmp`——
-  本機/pinned CI 工具鏈的 bit-exact 契約。
-- **Layer 2(portable,`-DRNN_TABLES_PORTABLE`)**:數學性質檢查(有限值、
-  nfftborder 單調且端點釘死、erb_inv partition-of-unity、erb_fwd 端帶 2x
-  關係、Hann 落在 [0,1] 且滿足公式對稱)+ 實測定界的 ULP 門檻——
-  **recompute-vs-table 為 256 ULP、Hann 鏡像對稱為 4096 ULP(實測 434)**,
-  兩者是不同檢查的不同門檻,皆為 garbage-detector 而非位元契約。
+重算用的常數（SR、N_FFT、N_BANDS、MIN_BINS_PER_BAND）刻意不讀 `process.h` 或 `config.ini`，兩者之一改動時這裡會失敗。
 
 ## Feature tests
 
 ```bash
-make test                 # tables + constants + feature state + local SIMD + framing rejection
+make test                 # tables + feature contract + feature state + framing + SIMD/scalar digest
 make test-feature-python  # 需 torch training environment
 ```
 

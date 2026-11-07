@@ -11,6 +11,10 @@ test: all
 	  "$$bin/test_ulcnet_accelerator_adapter"; \
 	  "$$bin/mono_alignulcnet"; \
 	  "$$bin/mono_alignulcnet" --delay-num-filters 1; \
+	  "$$bin/mono_alignulcnet" --sample-rate 48000; \
+	  "$$bin/mono_alignulcnet" --sample-rate 48000 --delay-num-filters 1; \
+	  rc=0; "$$bin/mono_alignulcnet" --sample-rate 44100 >/dev/null 2>&1 || rc=$$?; test "$$rc" -eq 2; \
+	  rc=0; "$$bin/mono_alignulcnet" --sample-rate 16000x >/dev/null 2>&1 || rc=$$?; test "$$rc" -eq 2; \
 	  rc=0; "$$bin/mono_alignulcnet" --delay-num-filters 3x >/dev/null 2>&1 || rc=$$?; test "$$rc" -eq 2; \
 	  rc=0; "$$bin/mono_alignulcnet" --delay-mode fixed --fixed-delay 12x >/dev/null 2>&1 || rc=$$?; test "$$rc" -eq 2
 

@@ -1,7 +1,27 @@
-/* Post-RES DeepFilterNet2 stage shared by the mono and 4-channel "AEC + RES + DFN2" pipelines. One hop in, one spectrum out: A = E * grid.stft_scale (E: pre-RES spectrum the RES gain was estimated from), B = P * grid.stft_scale (P: post-RES spectrum, E * G_res + comfort noise), heads = DFN2(estimated on A), Y = compose(heads, applied on B), out = Y * grid.stft_unscale. The model estimates from the pre-RES spectrum and applies to the post-RES one; with the comfort-noise fill off E and P share phase, so the deep-filter taps fitted on A apply to B (the hosting pipelines keep the fill off by default).
- * Timing: the emitted spectrum belongs to source frame t - L, L = dfn_res_stage_lookahead_frames() (grid.mask_lookahead + grid.df_lookahead, 2 for the shipped 1/1 pair); the first L hops return 0 with an all-zero spectrum, so the caller synthesises unconditionally.
- * Fail-open: no model (model.infer == NULL), a nonzero infer() result or an unwritten/non-finite output takes the frame as an identity through the cascade (clocks advance, recurrent state unchanged); the output is P delayed by L hops.
- * Reset: whole-pipeline resets only; an AEC delay change must not reset the stage. Grid: the DFN2Grid in the config (dfn2_grid_make(); the shipped one is 48 kHz / 1024 / 512, hop 512, 513 bins), handed to the library as it is; a model built for another grid or lookahead pair is refused by its descriptor at run time. Memory: static pool with the 32-byte descriptor; the DFN2 class pool and its hash are folded in; no heap after init, no stdio. */
+/* Post-RES DeepFilterNet2 stage shared by the mono and 4-channel "AEC + RES + DFN2" pipelines. One
+ * hop in, one spectrum out: A = E * grid.stft_scale (E: pre-RES spectrum the RES gain was estimated
+ * from), B = P * grid.stft_scale (P: post-RES spectrum, E * G_res + comfort noise), heads =
+ * DFN2(estimated on A), Y = heads applied on B, out = Y * grid.stft_unscale. The model estimates from
+ * the pre-RES spectrum and applies to the post-RES one; with the comfort-noise fill off E and P share
+ * phase, so the deep-filter taps fitted on A apply to B (the hosting pipelines keep the fill off by
+ * default).
+ *
+ * Timing: the emitted spectrum belongs to source frame t - L, L = dfn_res_stage_lookahead_frames()
+ * (grid.mask_lookahead + grid.df_lookahead, 2 for the shipped 1/1 pair); the first L hops return 0
+ * with an all-zero spectrum, so the caller synthesises unconditionally. Every hop runs the same
+ * begin, model, end flow: the first grid.mask_lookahead hops are warm-up frames (the model runs, its
+ * heads are discarded, its state restarts), so the audio equals a stream whose model starts at its
+ * first real frame.
+ *
+ * Fail-open: no model (model.infer == NULL), a nonzero infer() result or an unwritten/non-finite
+ * output takes the frame as an identity through the cascade (clocks advance, recurrent state
+ * unchanged); the output is P delayed by L hops.
+ *
+ * Reset: whole-pipeline resets only; an AEC delay change must not reset the stage. Grid: the
+ * DFN2Grid in the config (dfn2_grid_make(); the shipped one is 48 kHz / 1024 / 512, hop 512, 513
+ * bins) with one frame per call, handed to the library as it is; a model built for another grid or
+ * lookahead pair is refused by its descriptor at run time. Memory: static pool with the 32-byte
+ * descriptor; the DFN2 class pool and its hash are folded in; no heap after init, no stdio. */
 
 #ifndef DFN_RES_STAGE_H
 #define DFN_RES_STAGE_H
@@ -18,15 +38,16 @@ extern "C" {
 
 #define DFN_RES_STAGE_DESCRIPTOR_VERSION 1u
 /* Carve layout version; bumped on any change of pool size, carve order or
- * descriptor content, including the composed DFN2 pre/post pool. */
-#define DFN_RES_STAGE_LAYOUT_VERSION     4u
+ * descriptor content, the DFN2 pre/post pool included. */
+#define DFN_RES_STAGE_LAYOUT_VERSION     5u
 #define DFN_RES_STAGE_BACKEND_NE10       2u   /* id 1 is never returned */
 
-/* Frames the emitted spectrum trails the newest input by: the DFN2 cascade of the grid's lookahead
- * pair. The audio-scale spectra the stage takes and returns are scaled to and from DFN2's
- * normalized=True spectra by the grid's stft_scale (1/sqrt(n_fft)) and stft_unscale (sqrt(n_fft)):
- * exact powers of two where n_fft is a power of four (256, 1024, 4096), correctly rounded floats
- * elsewhere (512). */
+/* Frames the emitted spectrum trails the newest input by: the DFN2 cascade of the grid's
+ * lookahead pair (the stage runs one frame per call). The audio-scale spectra the stage takes
+ * and returns are scaled to and from DFN2's normalized=True spectra by the grid's stft_scale
+ * (1/sqrt(n_fft)) and stft_unscale (sqrt(n_fft)): exact powers of two where n_fft is a power of
+ * four (256, 1024, 4096), correctly rounded floats elsewhere (512). The caller's AcStft and
+ * AcIstft keep audiolib's default spec_scale / ispec_scale of 1: the stage applies the grid's. */
 static inline int dfn_res_stage_lookahead_frames(const DFN2Grid *grid)
 {
     return grid ? grid->mask_lookahead + grid->df_lookahead : 0;
@@ -59,7 +80,11 @@ typedef struct DfnResStage DfnResStage;
  * attenuation limit, no matrices, identity model. */
 DfnResStageConfig dfn_res_stage_default_config(const DFN2Grid *grid);
 
-/* Returns -1 on NULL, a grid the library refuses (dfn2_grid_validate(): a zeroed or hand-edited one included), a missing ERB matrix, an erb_inv whose unit band mask does not expand to exactly 1.0f in every bin, a non-finite attenuation limit, a model that infers without a descriptor valid for the config's grid (dfn2_model_io_descriptor_validate(): another grid, lookahead pair or frame count is refused here), or a build outside pipelines/Makefile. */
+/* Returns -1 on NULL, a grid the library refuses (dfn2_grid_validate(): a zeroed or hand-edited one
+ * included), grid.frames_per_call other than 1, a missing ERB matrix, an erb_inv whose unit band mask
+ * does not expand to exactly 1.0f in every bin, a non-finite attenuation limit, a model that infers
+ * without a descriptor valid for the config's grid (dfn2_model_io_descriptor_validate(): another
+ * grid, lookahead pair or frame count is refused here), or a build outside pipelines/Makefile. */
 int dfn_res_stage_get_mem_requirements(const DfnResStageConfig *cfg,
                                        DfnResStageMemReq *out);
 
@@ -84,10 +109,17 @@ int dfn_res_stage_set_atten_lim(DfnResStage *s, float atten_lim_db);
 /* The grid the stage runs (the config's, as the library holds it); NULL for NULL. */
 const DFN2Grid *dfn_res_stage_grid(const DfnResStage *s);
 
+/* Generation of the model's recurrent state: 1 after init, plus one per reset, per warm-up frame and
+ * per refused commit; 0 for NULL. The stage registers no state (it belongs to the model callback),
+ * so a callback that holds it refills it with quantized zeros whenever this value changes, a warm-up
+ * frame's included. */
+unsigned int dfn_res_stage_state_generation(const DfnResStage *s);
+
 /* Source frame of the last emitted spectrum; -1 before the first emission. */
 int dfn_res_stage_output_frame_index(const DfnResStage *s, long long *frame);
 
-/* Hop counters: frames pushed, head evaluations committed, frames taken as identity. */
+/* Hop counters: frames pushed, head evaluations committed, frames taken as identity; the warm-up
+ * frames count in frames_in only. */
 void dfn_res_stage_get_counters(const DfnResStage *s, long long *frames_in,
                                 long long *commits, long long *skips);
 
@@ -98,7 +130,7 @@ typedef struct DfnResStageJob {
     DFN2PrepostOutputs outputs;
 } DfnResStageJob;
 
-/* One hop in two calls around the model. `estimate_spec` is the pre-RES spectrum (E), `apply_spec` the post-RES spectrum (P); both are borrowed for the begin call only. begin returns 1 when the model has a frame to run (*job holds its views; run the model, then call end), 0 during the first grid.mask_lookahead hops (end still produces the output), -1 on a contract error (NULL or non-finite arguments, a hop already begun, a frame the DFN2 class refuses). end closes the hop: model_rc is the model's result (0 = every output written); anything else, or an unwritten or non-finite output, takes the frame as the identity (ignored when begin returned 0). `out_spec` is always fully written (zeros during warm-up). Returns 1 when out_spec carries an emitted frame, 0 during warm-up, -1 on a contract error. */
+/* One hop in two calls around the model. `estimate_spec` is the pre-RES spectrum (E), `apply_spec` the post-RES spectrum (P); both are borrowed for the begin call only. begin returns 1 with the open frame's views in *job (run the model, then call end), or -1 on a contract error (NULL or non-finite arguments, a hop already begun, a frame the DFN2 class refuses). end closes the hop: model_rc is the model's result (0 = every output written); anything else, or an unwritten or non-finite output, takes the frame as the identity. `out_spec` is always fully written (zeros while no spectrum is due). end returns 1 when out_spec carries an emitted frame, 0 when none is due yet (the first L hops), -1 on a contract error. One frame per call: frames_per_call > 1 is refused; with mask_lookahead 0 there is no warm-up frame. */
 int dfn_res_stage_begin(DfnResStage *s,
                         const Complex *estimate_spec,
                         const Complex *apply_spec,

@@ -6,14 +6,19 @@ forward 切成多個互相獨立的 N-frame chunks。
 
 ```mermaid
 flowchart TB
-    S["AlignULCNetStreamState"]
-    S --> E["Error STFT overlap"]
-    S --> F["Far STFT overlap"]
+    S["Align-ULCNet streaming state (概念集合，皆為應用端持有)"]
+    S --> E["Error AcStft overlap"]
+    S --> F["Far AcStft overlap"]
     S --> K["Encoded far key/value ring: D frames"]
     S --> L["Attention-logit history: 4 frames"]
     S --> G["Two temporal-GRU hidden states"]
-    S --> O["ISTFT/WOLA overlap"]
+    S --> O["AcIstft WOLA overlap"]
 ```
+
+K/V、logit 與 `h_gru` 四個 tensor 是應用端的 state：float host 把四塊 buffer 註冊進
+`UlcnetPrepostConfig`（函式庫在 init／reset 時歸零、`frame_finish()` 時整塊檢查）；板端不註冊，
+state 在加速器的 buffer 內，應用端在 `ulcnet_prepost_state_generation()` 改變時以量化後的 0
+重載。STFT／WOLA 的重疊緩衝在應用端的 `AcStft`／`AcIstft`。
 
 目前層級的時間狀態判定：
 
@@ -53,10 +58,10 @@ flowchart TB
 | encoded far value window | 26.0 KiB（8 幀） |
 | attention-logit window（5 frames） | 5.0 KiB |
 | 兩顆 2-layer temporal-GRU hidden（合併的 `h_gru`） | 2.0 KiB |
-| STFT/WOLA overlap | 數 KiB |
 
 NN persistent state 約 59.0 KiB（四個 state tensor 各一份 buffer，每個 `*_out`
-就地綁定到輸入位址）；另加 STFT/WOLA 數 KiB。
+就地綁定到輸入位址），全在應用端，不在函式庫的任何 pool；STFT/WOLA 的重疊緩衝另在應用端的
+`AcStft`／`AcIstft`。
 GRU hidden = 2 blocks × 2 layers × 128 × 4 B = 2.0 KiB，GRU 無
 cell state。上述不含 model weights、NPU activation scratch 與 backend alignment。
 D=4 可再降低 key/value ring 與 logit window；最終數字必須由 export
@@ -65,28 +70,22 @@ D=4 可再降低 key/value ring 與 logit window；最終數字必須由 export
 48 kHz 的 `ta_bins` 加倍（26 → 52），key/value window 跟著加倍，但
 logit window 只隨 D 走、不隨 grid 走，所以整體不是兩倍。
 
-adapter 驅動的是 `ulcnet_prepost` class 的一個 `ULCNET_IO_FREQ` 實例（頻譜進、
-頻譜出、不做 transform），所以 adapter pool ＝ class 的 FREQ pool ＋ 32 B 的
-adapter 自身結構，比只包 model_io 的 pool 多一個 class 前後處理 scratch。實測
-`ulcnet_accelerator_adapter_get_mem_size()`（四個 state、特徵輸入與 `output`
-staging、工作區）：
+函式庫的 pool 只含特徵 tensor、mask 暫存與 class 的 frame scratch，大小隨 grid（`n_bins`）走、
+**與 D 無關**。實測（64 位元 host，LP64；`ulcnet_model_io_get_mem_requirements()`、
+`ulcnet_prepost_get_mem_size()`、`ulcnet_accelerator_adapter_get_mem_size()`，D = 4／8／16／32／64
+的位元組數都相同）：
 
-| adapter pool | D=4 | D=8 | D=16 | D=32 | D=64 |
-|---|---:|---:|---:|---:|---:|
-| 16 kHz（TA=26） | 46,096 B | 75,280 B | 133,648 B | 250,384 B | 483,856 B |
-| 48 kHz（TA=52） | 87,056 B | 142,864 B | 254,480 B | 477,712 B | 924,176 B |
+| pool | 16 kHz（TA=26） | 48 kHz（TA=52） |
+|---|---:|---:|
+| `ulcnet_model_io`（特徵 tensor 與 mask 暫存） | 8,464 B | 16,656 B |
+| `ulcnet_prepost` class | 14,784 B | 29,120 B |
+| accelerator adapter | 14,816 B | 29,152 B |
 
-只要 model_io 的 K/V／logit／GRU state（`ulcnet_model_io_get_mem_requirements()`，
-不含 class 的前後處理 scratch）：
+adapter pool ＝ class pool ＋ 32 B 的 adapter 自身結構；class 與 model_io 的差額（16 kHz：
+6,320 B）是 class 的 instance header 與 frame scratch。D 只進 `build_flags_hash`（16 kHz：D=4 為 `0905893f`、
+D=64 為 `bd44c8bb`），所以 `ulcnet_prepost_init_ex()` 會拒絕為另一個 D 記錄的 pool。
 
-| model_io pool | D=4 | D=8 | D=16 | D=32 | D=64 |
-|---|---:|---:|---:|---:|---:|
-| 16 kHz（TA=26） | 39,696 B | 68,880 B | 127,248 B | 243,984 B | 477,456 B |
-| 48 kHz（TA=52） | 74,512 B | 130,320 B | 241,936 B | 465,168 B | 911,632 B |
-
-adapter 與 model_io 的差額（16 kHz D=8：6,416 B）是 class 的前後處理 scratch。
-
-過邊界的 persistent tensor 小計（不含特徵輸入／`output` staging 與工作區）：16 kHz D=8 為
+過邊界的 persistent tensor 小計（應用端持有；不含特徵輸入／`output` staging 與工作區）：16 kHz D=8 為
 59.00 KiB、48 kHz D=8 為 111.00 KiB；D=64 則是 458.00 KiB 與 874.00 KiB。
 
 ### 6.3 Attention MAC 粗估
@@ -108,11 +107,13 @@ D=64 : 約 8.6 M MAC/s
 ## 7. STFT/WOLA 與 Latency Contract
 
 Python offline feature path 使用 `center=True`。Embedded streaming 不可每個 chunk
-各自呼叫 centered STFT；C 端建立持續的 analysis/synthesis buffers（audiolib 的
-`AcStft`／`AcIstft`，`center` 0 的 rolling 分析）：
+各自呼叫 centered STFT；應用端用 audiolib 的 `AcStft`／`AcIstft` 建立持續的
+analysis/synthesis buffers（`ac_stft_config_default(&sc, grid.n_fft)`，`center` 0 的
+rolling 分析，`spec_scale`／`ispec_scale` 皆 1.0，synthesis 的 `ola` 為 `AC_OLA_ENV_NORM`；
+函式庫不持有任何 FFT、window 或 STFT 物件）：
 
 - periodic sqrt-Hann；
-- FFT/window/hop = 512/512/256；
+- FFT/window/hop = 512/512/256（16 kHz；48 kHz 為 1024/1024/512）；
 - error 與 far 使用同一 frame timestamp；
 - synthesis 為對應的 50% overlap WOLA；
 - 對外 latency 以 samples 實測記錄，不只由公式推測。
@@ -140,8 +141,8 @@ one-hop 補償 buffer；唯一的延遲來源就是本節的 ULCNet synthesis WO
 
 - UNLOCKED：模型照常步進並套用成功輸出（far 本來就是 raw far）；
 - delay_state 變為 CHANGED，或 FIXED 首次 UNLOCKED→LOCKED：`model->reset` 清除 far
-  key/value ring、attention-logit history 與兩組 temporal GRU hidden，並 arm
-  identity reprime；
+  key/value ring、attention-logit history 與兩組 temporal GRU hidden（adapter 的 reset：float host
+  把註冊的 buffer 歸零，兩種部署都使 state generation 加一），並 arm identity reprime；
 - infer 失敗或輸出含非有限值（NaN/Inf）：該 frame 走 identity，永不進 WOLA；
 - out-of-range 偵測不存在：超出可靠搜尋上界時狀態停在 UNLOCKED，與冷啟動不可區分。
 
@@ -184,7 +185,7 @@ export descriptor 固定記 RAW，`ulcnet_model_io.c` 的 validate 拒絕其他�
 | 16 | 0--15 frames | 240 ms |
 | 64 | 0--63 frames | 1008 ms |
 
-縮小 D 不改 weight shape，但 export graph 的 shape 與 state pool 必須重產；
+縮小 D 不改 weight shape，但 export graph 的 shape 與應用端的 state buffer 必須重產；
 inference/export contract 必須記錄實際 D，不可靜默覆寫。
 
 [索引](align_ulcnet_embedded_streaming_design_zh_TW.md) | [上一份](align_ulcnet_embedded_streaming_design_zh_TW.md) | [下一份](align_ulcnet_embedded_streaming_design_zh_TW_02_npu_boundary_validation.md) <!-- split-nav -->

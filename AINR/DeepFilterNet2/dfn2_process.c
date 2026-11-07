@@ -1,17 +1,16 @@
+/* DeepFilterNet2 signal path outside the network (contract: dfn2_process.h): the grid, the ERB
+ * and complex features, mask expansion, the deep filter and the attenuation limit, on spectra.
+ * The framing is audiolib's, built by the application. */
+
 #include "dfn2_process.h"
 
 #include <math.h>
-#include <string.h>
-
-
-/* Model-local DSP kernels (features / mask expansion / attenuation limit).
- * The STFT and ISTFT framing is audiolib's AcStft and
- * AcIstft, owned by the caller and bound with dfn2_state_init(). */
-
-#include <math.h>
 #include <stddef.h>
+#include <stdint.h>
 #include <string.h>
 
+#include "audio_stft.h"            /* ac_stft_get_mem_size(): the n_fft rule is audiolib's */
+#include "utility/mem_align.h"
 #include "utility/simd_kernel_nn.h"
 
 #if SK_HAVE_NEON
@@ -19,20 +18,14 @@
 #endif
 #define DF_COMMON_HAVE_NEON SK_HAVE_NEON
 
-/* The variant and capacities this object was built for, read by dfn2_model_io.c and
- * dfn2_prepost.c (dfn2_process.h): objects of another layout fail to link. */
+/* The variant symbol the other objects reference (dfn2_process.h). */
 const unsigned char DFN2_VARIANT_SYMBOL = 0;
 
-/* The deep filter's taps before the stream start read this row. */
-#ifndef DFN2_MASK_ONLY
-static const float df_zero_row[DFN2_MAX_DF_BINS];
-#endif
-
-/* erb_fwd: caller-loaded matrix, raw float32, bin-major [n_bins][n_bands]
- * (export_erb_matrix.py --runtime-bins). The library never derives a filterbank. */
+/* ERB and complex features of one spectrum. erb_fwd: caller-loaded matrix, raw float32,
+ * bin-major [n_bins][n_bands]. */
 #if defined(__GNUC__) && !defined(__clang__)
-/* gcc on 32-bit ARM warns that the scalar tail after the NEON loop cannot reach iteration 2^30 (an error under -Werror);
- * the tail is correct for every df_bins. */
+/* gcc on 32-bit ARM warns that the scalar tail after the NEON loop cannot reach iteration
+ * 2^30 (an error under -Werror); the tail is correct for every df_bins. */
 #pragma GCC diagnostic push
 #pragma GCC diagnostic ignored "-Waggressive-loop-optimizations"
 #endif
@@ -167,17 +160,16 @@ static inline void df_common_atten_lim(const float *noisy_re,
 }
 
 #ifndef DFN2_MASK_ONLY
-/* One frame of the deep filter on bins [0, df_bins): each bin sums
- * DFN2_DF_ORDER complex taps over the source rows (one per tap, oldest
- * first), then mixes the filtered value with the unfiltered `mix` frame by
- * alpha. out_* must not alias a source row or the coefficients. */
+/* One frame of the deep filter on bins [0, df_bins): each bin sums `taps` complex taps over the
+ * source rows (one per tap, oldest first), then mixes with the unfiltered `mix` frame by alpha.
+ * out_* must not alias a source row or the coefficients. */
 static inline void df_common_deep_filter(
-    const float *const *src_re, const float *const *src_im,
+    const float *const *src_re, const float *const *src_im, int taps,
     const float *coefs, float alpha,
     const float *mix_re, const float *mix_im,
     float *out_re, float *out_im, int df_bins) {
     const float beta = 1.0f - alpha;
-    skn_ctaps_mac_f32(out_re, out_im, (size_t)df_bins, DFN2_DF_ORDER,
+    skn_ctaps_mac_f32(out_re, out_im, (size_t)df_bins, (size_t)taps,
                       src_re, src_im, coefs);
     sk_ema_f32(out_re, mix_re, alpha, beta, df_bins);
     sk_ema_f32(out_im, mix_im, alpha, beta, df_bins);
@@ -206,19 +198,7 @@ static void erb_spans(const float *m, int lines, int len, int line_step,
     }
 }
 
-/* The normaliser starting points this object was compiled with, for the pre/post pool hash
- * (dfn2_prepost.c reads them from here so the hash describes what dfn2_state_init() uses). */
-const float dfn2_norm_starts[DFN2_NORM_STARTS] = {
-    DFN2_ERB_NORM_INIT_LO_DB, DFN2_ERB_NORM_INIT_HI_DB, DFN2_ERB_NORM_SCALE_DB,
-    DFN2_SPEC_NORM_INIT_LO, DFN2_SPEC_NORM_INIT_HI,
-};
-
 /* ---- Grid ---- */
-
-static int is_power_of_two(int v)
-{
-    return v > 0 && (v & (v - 1)) == 0;
-}
 
 /* Python's round(x, digits) for 0 < x < 1: the decimal with `digits` places nearest the
  * exact binary value of x, a tie going to the even last digit, as the nearest double of
@@ -238,96 +218,145 @@ static double round_decimals(double x, int digits)
     return t / scale;
 }
 
-float dfn2_norm_alpha(int sample_rate, int hop, double tau_sec)
+float dfn2_norm_alpha(int sample_rate, int hop, float tau_sec)
 {
     /* train.py make_norm_alpha: three decimals, one more while the result reaches 1.0.
      * The loop is bounded: a hop of a few samples at a high rate never gets there. */
     double exact;
     double alpha = 1.0;
-    if (sample_rate <= 0 || hop <= 0 || !(tau_sec > 0.0)) return 0.0f;
-    exact = exp(-((double)hop / (double)sample_rate) / tau_sec);
+    if (sample_rate <= 0 || hop <= 0 || !(tau_sec > 0.0f)) return 0.0f;
+    exact = exp(-((double)hop / (double)sample_rate) / (double)tau_sec);
     for (int digits = 3; alpha >= 1.0 && digits <= 17; ++digits)
         alpha = round_decimals(exact, digits);
     return (float)alpha;
 }
 
-int dfn2_grid_make(DFN2Grid* grid, int sample_rate, int n_fft, int n_erb,
-                   int df_bins, int mask_lookahead, int df_lookahead)
+/* An EMA coefficient of 0 or 1 is a tau (or a rate) the filter cannot run. */
+static int norm_alpha_ok(float alpha)
+{
+    return alpha > 0.0f && alpha < 1.0f;
+}
+
+int dfn2_grid_make(DFN2Grid* grid, const DFN2GridSpec* spec)
 {
     DFN2Grid g;
+    AcStftConfig framing;
     int n_bins;
     int noisy_ring;
-    if (!grid) return DFN2_GRID_ERR_NULL;
-    if (sample_rate <= 0) return DFN2_GRID_ERR_SAMPLE_RATE;
-    if (n_fft < 16 || n_fft > 8192 || !is_power_of_two(n_fft))
-        return DFN2_GRID_ERR_N_FFT;
-    n_bins = n_fft / 2 + 1;
-    if (n_erb <= 0 || n_erb % 4 != 0 || n_erb > n_bins / 2)   /* 2 * n_erb <= n_bins */
+    int df_order;
+    if (!grid || !spec) return DFN2_GRID_ERR_NULL;
+    if (spec->sample_rate <= 0) return DFN2_GRID_ERR_SAMPLE_RATE;
+    /* a size the framing cannot build has no memory size; the state's ERB spans are 16-bit */
+    ac_stft_config_default(&framing, spec->n_fft);
+    if (ac_stft_get_mem_size(&framing) == 0u) return DFN2_GRID_ERR_N_FFT;
+    n_bins = spec->n_fft / 2 + 1;
+    if (n_bins > UINT16_MAX) return DFN2_GRID_ERR_N_FFT;
+    if (spec->n_erb <= 0 || spec->n_erb % 4 != 0 ||
+        spec->n_erb > n_bins / 2)   /* 2 * n_erb <= n_bins */
         return DFN2_GRID_ERR_N_ERB;
 #ifdef DFN2_MASK_ONLY
-    if (df_bins < 2 || df_bins > n_bins) return DFN2_GRID_ERR_DF_BINS;
+    if (spec->df_bins < 2 || spec->df_bins > n_bins) return DFN2_GRID_ERR_DF_BINS;
+    if (spec->df_order < 0 || spec->df_order > DFN2_GRID_DF_ORDER_MAX)
+        return DFN2_GRID_ERR_DF_ORDER;
+    df_order = 0;   /* no deep filter to size */
 #else
-    if (df_bins < 2 || df_bins >= n_bins) return DFN2_GRID_ERR_DF_BINS;
+    if (spec->df_bins < 2 || spec->df_bins >= n_bins) return DFN2_GRID_ERR_DF_BINS;
+    if (spec->df_order < 1 || spec->df_order > DFN2_GRID_DF_ORDER_MAX)
+        return DFN2_GRID_ERR_DF_ORDER;
+    df_order = spec->df_order;
 #endif
-    if (mask_lookahead < 0 || mask_lookahead > DFN2_MAX_MASK_LOOKAHEAD)
+    if (spec->mask_lookahead < 0 || spec->mask_lookahead > DFN2_GRID_MASK_LOOKAHEAD_MAX)
         return DFN2_GRID_ERR_MASK_LOOKAHEAD;
 #ifdef DFN2_MASK_ONLY
-    if (df_lookahead != 0) return DFN2_GRID_ERR_DF_LOOKAHEAD;
+    if (spec->df_lookahead != 0) return DFN2_GRID_ERR_DF_LOOKAHEAD;
 #else
-    if (df_lookahead < 0 || df_lookahead > DFN2_MAX_DF_LOOKAHEAD)
+    if (spec->df_lookahead < 0 || spec->df_lookahead > df_order - 1)
         return DFN2_GRID_ERR_DF_LOOKAHEAD;
 #endif
+    if (spec->frames_per_call < 1 ||
+        spec->frames_per_call > DFN2_MODEL_MAX_FRAMES_PER_CALL)
+        return DFN2_GRID_ERR_FRAMES_PER_CALL;
 
     memset(&g, 0, sizeof(g));
-    g.sample_rate = sample_rate;
-    g.n_fft = n_fft;
-    g.hop = n_fft / 2;
+    g.sample_rate = spec->sample_rate;
+    g.n_fft = spec->n_fft;
+    g.hop = spec->n_fft / 2;
     g.n_bins = n_bins;
-    g.n_erb = n_erb;
-    g.df_bins = df_bins;
-    g.mask_lookahead = mask_lookahead;
-    g.df_lookahead = df_lookahead;
-    g.df_history = DFN2_DF_ORDER - df_lookahead - 1;
-    noisy_ring = mask_lookahead + df_lookahead + 1;
+    g.n_erb = spec->n_erb;
+    g.df_bins = spec->df_bins;
+    g.df_order = df_order;
+    g.mask_lookahead = spec->mask_lookahead;
+    g.df_lookahead = spec->df_lookahead;
+    g.frames_per_call = spec->frames_per_call;
+    g.input_frames = DFN2_MODEL_INPUT_FRAMES - 1 + spec->frames_per_call;
+    noisy_ring = spec->mask_lookahead + spec->df_lookahead + 1;
 #ifdef DFN2_MASK_ONLY
+    g.df_history = 0;
     g.ring = noisy_ring;   /* only the noisy ring is kept */
 #else
-    g.ring = DFN2_DF_ORDER > noisy_ring ? DFN2_DF_ORDER : noisy_ring;
+    g.df_history = df_order - spec->df_lookahead - 1;
+    g.ring = df_order > noisy_ring ? df_order : noisy_ring;
 #endif
-    if (n_fft > DFN2_MAX_N_FFT || n_erb > DFN2_MAX_N_ERB ||
-        df_bins > DFN2_MAX_DF_BINS || g.ring > DFN2_MAX_DF_RING)
-        return DFN2_GRID_ERR_CAPACITY;
-    g.erb_norm_alpha = dfn2_norm_alpha(sample_rate, g.hop, 1.0);
-    g.spec_norm_alpha = g.erb_norm_alpha;
-    /* An EMA coefficient of 0 or 1 means a rate the framing cannot run (a hop that is far
-     * below or above one sample at this rate); dfn2_grid_validate() refuses it too. */
-    if (!(g.erb_norm_alpha > 0.0f && g.erb_norm_alpha < 1.0f))
-        return DFN2_GRID_ERR_SAMPLE_RATE;
-    /* float32 division and square root are correctly rounded, so these are the float32
-     * values of 1/sqrt(n_fft) and sqrt(n_fft) on every compiler (exact powers of two at
-     * 16, 64, 256, 1024, 4096). */
-    g.stft_scale = 1.0f / sqrtf((float)n_fft);
-    g.stft_unscale = sqrtf((float)n_fft);
+
+    /* The alphas are derived, never given. */
+    if (!isfinite(spec->erb_norm_tau_sec) || !(spec->erb_norm_tau_sec > 0.0f) ||
+        !isfinite(spec->erb_norm_init_lo_db) || !isfinite(spec->erb_norm_init_hi_db) ||
+        !isfinite(spec->erb_norm_scale_db) || !(spec->erb_norm_scale_db > 0.0f))
+        return DFN2_GRID_ERR_ERB_NORM;
+    g.erb_norm_tau_sec = spec->erb_norm_tau_sec;
+    g.erb_norm_init_lo_db = spec->erb_norm_init_lo_db;
+    g.erb_norm_init_hi_db = spec->erb_norm_init_hi_db;
+    g.erb_norm_scale_db = spec->erb_norm_scale_db;
+    g.erb_norm_alpha = dfn2_norm_alpha(spec->sample_rate, g.hop, spec->erb_norm_tau_sec);
+    if (!norm_alpha_ok(g.erb_norm_alpha)) return DFN2_GRID_ERR_ERB_NORM;
+    if (!isfinite(spec->spec_norm_tau_sec) || !(spec->spec_norm_tau_sec > 0.0f) ||
+        !(spec->spec_norm_init_lo > 0.0f) || !isfinite(spec->spec_norm_init_lo) ||
+        !(spec->spec_norm_init_hi > 0.0f) || !isfinite(spec->spec_norm_init_hi))
+        return DFN2_GRID_ERR_SPEC_NORM;
+    g.spec_norm_tau_sec = spec->spec_norm_tau_sec;
+    g.spec_norm_init_lo = spec->spec_norm_init_lo;
+    g.spec_norm_init_hi = spec->spec_norm_init_hi;
+    g.spec_norm_alpha = dfn2_norm_alpha(spec->sample_rate, g.hop, spec->spec_norm_tau_sec);
+    if (!norm_alpha_ok(g.spec_norm_alpha)) return DFN2_GRID_ERR_SPEC_NORM;
+
+    /* correctly rounded float32 division and square root: the same values on every compiler */
+    g.stft_scale = 1.0f / sqrtf((float)spec->n_fft);
+    g.stft_unscale = sqrtf((float)spec->n_fft);
     *grid = g;
     return DFN2_GRID_OK;
 }
 
 int dfn2_grid_validate(const DFN2Grid* grid)
 {
+    DFN2GridSpec spec;
     DFN2Grid want;
     int status;
     if (!grid) return DFN2_GRID_ERR_NULL;
-    status = dfn2_grid_make(&want, grid->sample_rate, grid->n_fft, grid->n_erb,
-                            grid->df_bins, grid->mask_lookahead,
-                            grid->df_lookahead);
+    spec.sample_rate = grid->sample_rate;
+    spec.n_fft = grid->n_fft;
+    spec.n_erb = grid->n_erb;
+    spec.df_bins = grid->df_bins;
+    spec.df_order = grid->df_order;
+    spec.mask_lookahead = grid->mask_lookahead;
+    spec.df_lookahead = grid->df_lookahead;
+    spec.frames_per_call = grid->frames_per_call;
+    spec.erb_norm_tau_sec = grid->erb_norm_tau_sec;
+    spec.erb_norm_init_lo_db = grid->erb_norm_init_lo_db;
+    spec.erb_norm_init_hi_db = grid->erb_norm_init_hi_db;
+    spec.erb_norm_scale_db = grid->erb_norm_scale_db;
+    spec.spec_norm_tau_sec = grid->spec_norm_tau_sec;
+    spec.spec_norm_init_lo = grid->spec_norm_init_lo;
+    spec.spec_norm_init_hi = grid->spec_norm_init_hi;
+    status = dfn2_grid_make(&want, &spec);
     if (status != DFN2_GRID_OK) return status;
     if (grid->hop != want.hop || grid->n_bins != want.n_bins ||
+        grid->df_order != want.df_order ||
         grid->df_history != want.df_history || grid->ring != want.ring ||
+        grid->input_frames != want.input_frames ||
+        grid->erb_norm_alpha != want.erb_norm_alpha ||
+        grid->spec_norm_alpha != want.spec_norm_alpha ||
         grid->stft_scale != want.stft_scale ||
-        grid->stft_unscale != want.stft_unscale ||
-        /* The alphas are the model's (a tau other than 1.0 sets them): finite, in (0, 1). */
-        !(grid->erb_norm_alpha > 0.0f && grid->erb_norm_alpha < 1.0f) ||
-        !(grid->spec_norm_alpha > 0.0f && grid->spec_norm_alpha < 1.0f))
+        grid->stft_unscale != want.stft_unscale)
         return DFN2_GRID_ERR_INCONSISTENT;
     return DFN2_GRID_OK;
 }
@@ -337,13 +366,16 @@ const char* dfn2_grid_status_text(int status)
     switch (status) {
     case DFN2_GRID_OK:                  return "ok";
     case DFN2_GRID_ERR_NULL:            return "null pointer";
-    case DFN2_GRID_ERR_SAMPLE_RATE:     return "sample rate must be positive and give a norm alpha in (0, 1)";
-    case DFN2_GRID_ERR_N_FFT:           return "n_fft must be a power of two in [16, 8192]";
+    case DFN2_GRID_ERR_SAMPLE_RATE:     return "sample rate must be positive";
+    case DFN2_GRID_ERR_N_FFT:           return "n_fft is not a size the audiolib framing builds (or has too many bins for the 16-bit ERB spans)";
     case DFN2_GRID_ERR_N_ERB:           return "n_erb must be a positive multiple of 4 with at least two bins per band";
     case DFN2_GRID_ERR_DF_BINS:         return "df_bins must be in [2, n_fft/2 + 1) (up to n_fft/2 + 1 when mask-only)";
+    case DFN2_GRID_ERR_DF_ORDER:        return "df_order must be in [1, 16] (any value in [0, 16] when mask-only)";
     case DFN2_GRID_ERR_MASK_LOOKAHEAD:  return "mask_lookahead must be in [0, 2]";
-    case DFN2_GRID_ERR_DF_LOOKAHEAD:    return "df_lookahead must be in [0, 4] (0 when mask-only)";
-    case DFN2_GRID_ERR_CAPACITY:        return "grid exceeds the library capacity (DFN2_MAX_N_FFT / N_ERB / DF_BINS / DF_RING)";
+    case DFN2_GRID_ERR_DF_LOOKAHEAD:    return "df_lookahead must be in [0, df_order - 1] (0 when mask-only)";
+    case DFN2_GRID_ERR_FRAMES_PER_CALL: return "frames_per_call must be in [1, 64]";
+    case DFN2_GRID_ERR_ERB_NORM:        return "erb normaliser: tau must be finite and > 0 with an alpha in (0, 1), starts finite, scale finite and > 0";
+    case DFN2_GRID_ERR_SPEC_NORM:       return "spec normaliser: tau must be finite and > 0 with an alpha in (0, 1), starts finite and > 0";
     case DFN2_GRID_ERR_INCONSISTENT:    return "derived grid fields do not match the given ones";
     default:                            return "unknown status";
     }
@@ -355,6 +387,71 @@ const char* dfn2_grid_status_text(int status)
 static int state_ready(const DFN2State* st)
 {
     return st && st->grid.n_bins > 0;
+}
+
+/* Reserve `count` elements of `elem` bytes at *cursor, 16-byte aligned, saturating on overflow;
+ * base==NULL sizes only. */
+static int state_carve(unsigned char* base, size_t* cursor, size_t count,
+                       size_t elem, void** out)
+{
+    size_t aligned = ck_align16_size(*cursor);
+    size_t next = ck_add_size(aligned, ck_mul_size(count, elem));
+    if (MEM_SIZE_INVALID(next)) return -1;
+    if (base && out) *out = base + aligned;
+    *cursor = next;
+    return 0;
+}
+
+/* The block's one walk: dfn2_state_mem_size() runs it with base==NULL, dfn2_state_init()
+ * with the block and the header, so size and carve cannot disagree. */
+static int state_layout(DFN2State* st, unsigned char* base, const DFN2Grid* g,
+                        size_t* total)
+{
+    const size_t n_bins = (size_t)g->n_bins;
+    const size_t n_erb = (size_t)g->n_erb;
+    const size_t ring_bins = (size_t)g->ring * n_bins;
+    size_t cursor = 0;
+    void* ptr = NULL;
+#define STATE_CARVE(field, count, type)                                        \
+    do {                                                                       \
+        if (state_carve(base, &cursor, (count), sizeof(type), &ptr) != 0)     \
+            return -1;                                                         \
+        if (st) st->field = ptr;                                               \
+    } while (0)
+    STATE_CARVE(erb_norm_state, n_erb, float);
+    STATE_CARVE(spec_norm_state, (size_t)g->df_bins, float);
+#ifndef DFN2_MASK_ONLY
+    STATE_CARVE(masked_re, ring_bins, float);
+    STATE_CARVE(masked_im, ring_bins, float);
+    STATE_CARVE(coef_ring, (size_t)g->ring * (size_t)g->df_bins *
+                               (size_t)g->df_order * 2u, float);
+    STATE_CARVE(alpha_ring, (size_t)g->ring, float);
+    STATE_CARVE(df_zero_row, (size_t)g->df_bins, float);
+    STATE_CARVE(src_re, (size_t)g->df_order, const float*);
+    STATE_CARVE(src_im, (size_t)g->df_order, const float*);
+#endif
+    STATE_CARVE(noisy_ring_re, ring_bins, float);
+    STATE_CARVE(noisy_ring_im, ring_bins, float);
+    STATE_CARVE(scratch_power, n_bins, float);
+    STATE_CARVE(scratch_erb_db, n_erb, float);
+    STATE_CARVE(scratch_bin_gain, n_bins, float);
+    STATE_CARVE(erb_fwd_lo, n_bins, uint16_t);
+    STATE_CARVE(erb_fwd_hi, n_bins, uint16_t);
+    STATE_CARVE(erb_fwd_k0, n_erb, uint16_t);
+    STATE_CARVE(erb_fwd_k1, n_erb, uint16_t);
+    STATE_CARVE(erb_inv_lo, n_erb, uint16_t);
+    STATE_CARVE(erb_inv_hi, n_erb, uint16_t);
+#undef STATE_CARVE
+    *total = ck_align16_size(cursor);
+    return MEM_SIZE_INVALID(*total) ? -1 : 0;
+}
+
+size_t dfn2_state_mem_size(const DFN2Grid* grid)
+{
+    size_t total = 0;
+    if (dfn2_grid_validate(grid) != DFN2_GRID_OK) return 0;
+    if (state_layout(NULL, NULL, grid, &total) != 0) return 0;
+    return total;
 }
 
 void dfn2_set_erb_matrices(DFN2State* st,
@@ -376,53 +473,62 @@ void dfn2_set_erb_matrices(DFN2State* st,
               st->erb_inv_lo, st->erb_inv_hi);
 }
 
-void dfn2_framing_config(AcStftConfig* cfg, const DFN2Grid* grid,
-                         FftHandle* fft, const float* window)
+/* The linspace seed of one bin: a line from lo to hi held between the two ends, so a span wide enough to
+ * cancel in float (lo + (hi - lo) rounding to 0) cannot drop the last bin below its configured end. */
+static float norm_seed_linear(float lo, float hi, float position)
 {
-    if (!cfg) return;
-    if (dfn2_grid_validate(grid) != DFN2_GRID_OK) {
-        memset(cfg, 0, sizeof(*cfg));   /* fft_size 0: the framing objects refuse it */
-        return;
-    }
-    ac_stft_config_default(cfg, grid->n_fft);
-    cfg->spec_scale = grid->stft_scale;
-    cfg->ispec_scale = grid->stft_unscale;
-    cfg->fft = fft;
-    cfg->window = window;
+    float v = lo + position * (hi - lo);
+    float vmin = lo < hi ? lo : hi, vmax = lo < hi ? hi : lo;
+    return v < vmin ? vmin : (v > vmax ? vmax : v);
 }
 
-int dfn2_state_init(DFN2State* st, const DFN2Grid* grid, AcStft* stft,
-                    AcIstft* istft)
+/* The state at its start: normalisers at their linspace initial values, ERB spans derived from
+ * the matrices the state holds (none after init: spans full; a reset keeps the pointers). */
+static void state_begin(DFN2State* st)
 {
-    if (!st) return -1;
-    memset(st, 0, sizeof(*st));
-    if (dfn2_grid_validate(grid) != DFN2_GRID_OK) return -1;
-    st->grid = *grid;
-    st->stft = stft;
-    st->istft = istft;
-    ac_stft_reset(stft);
-    ac_istft_reset(istft);
-    /* ERB matrices arrive via dfn2_set_erb_matrices(); until then they are NULL
-     * and their spans full. */
-    dfn2_set_erb_matrices(st, NULL, NULL);
+    const DFN2Grid* grid = &st->grid;
+    dfn2_set_erb_matrices(st, st->erb_fwd, st->erb_inv);
     for (int b = 0; b < grid->n_erb; ++b) {
         float position = (float)b / (float)(grid->n_erb - 1);
-        st->erb_norm_state[b] = DFN2_ERB_NORM_INIT_LO_DB + position *
-            (DFN2_ERB_NORM_INIT_HI_DB - DFN2_ERB_NORM_INIT_LO_DB);
+        st->erb_norm_state[b] = grid->erb_norm_init_lo_db + position *
+            (grid->erb_norm_init_hi_db - grid->erb_norm_init_lo_db);
     }
     for (int k = 0; k < grid->df_bins; ++k) {
         float position = (float)k / (float)(grid->df_bins - 1);
-        st->spec_norm_state[k] = DFN2_SPEC_NORM_INIT_LO + position *
-            (DFN2_SPEC_NORM_INIT_HI - DFN2_SPEC_NORM_INIT_LO);
+        st->spec_norm_state[k] = norm_seed_linear(grid->spec_norm_init_lo, grid->spec_norm_init_hi, position);
     }
+}
+
+int dfn2_state_init(DFN2State* st, void* block, size_t bytes, const DFN2Grid* grid)
+{
+    size_t need;
+    size_t total = 0;
+    if (!st) return -1;
+    memset(st, 0, sizeof(*st));
+    need = dfn2_state_mem_size(grid);
+    if (need == 0 || !block || bytes < need || !MEM_IS_ALIGNED16(block)) return -1;
+    memset(block, 0, need);
+    st->grid = *grid;
+    if (state_layout(st, (unsigned char*)block, grid, &total) != 0 || total != need) {
+        memset(st, 0, sizeof(*st));
+        return -1;
+    }
+    st->block = block;
+    st->block_bytes = need;
+    state_begin(st);
     return 0;
 }
 
-void dfn2_analysis(DFN2State* st, const float* frame,
-                   float* out_re, float* out_im)
+void dfn2_state_reset(DFN2State* st)
 {
-    if (!state_ready(st) || !st->stft || !frame || !out_re || !out_im) return;
-    ac_stft_push_planar(st->stft, frame, out_re, out_im);
+    if (!state_ready(st)) return;
+    memset(st->block, 0, st->block_bytes);
+    st->stream_frame_index = 0;
+#ifndef DFN2_MASK_ONLY
+    st->df_ring_idx = 0;
+    st->df_ring_count = 0;
+#endif
+    state_begin(st);
 }
 
 void dfn2_compute_features(DFN2State* st,
@@ -436,7 +542,7 @@ void dfn2_compute_features(DFN2State* st,
         st->erb_fwd_k0, st->erb_fwd_k1, st->grid.n_bins, st->grid.n_erb,
         st->grid.df_bins,
         st->grid.stft_scale, DFN2_ERB_LOG_FLOOR,
-        st->grid.erb_norm_alpha, DFN2_ERB_NORM_SCALE_DB,
+        st->grid.erb_norm_alpha, st->grid.erb_norm_scale_db,
         st->erb_norm_state,
         st->grid.spec_norm_alpha, DFN2_SPEC_NORM_EPS,
         st->spec_norm_state,
@@ -468,7 +574,7 @@ static void df_mask_spectrum(DFN2State *st, const float *erb_mask,
 }
 #endif
 
-int dfn2_compose(DFN2State* st,
+int dfn2_enhance_spectrum(DFN2State* st,
                  const float* spec_re, const float* spec_im,
                  const float* erb_mask, const float* coefs, float alpha,
                  float* out_re, float* out_im)
@@ -484,26 +590,31 @@ int dfn2_compose(DFN2State* st,
 #else
     int slot;
     int target;
-    const float *src_re[DFN2_DF_ORDER];
-    const float *src_im[DFN2_DF_ORDER];
     if (!state_ready(st) || !spec_re || !spec_im || !erb_mask || !coefs ||
         !out_re || !out_im || !isfinite(alpha)) return 0;
     const int n_bins = st->grid.n_bins;
     const int df_bins = st->grid.df_bins;
+    const int df_order = st->grid.df_order;
     const int ring = st->grid.ring;
+    const size_t row = (size_t)n_bins;
+    const size_t frame_coefs = (size_t)df_bins * (size_t)df_order * 2u;
     df_common_expand_mask(erb_mask, st->erb_inv,
                           st->erb_inv_lo, st->erb_inv_hi,
                           n_bins, st->grid.n_erb,
                           st->scratch_bin_gain);
     slot = st->df_ring_idx;
-    for (int k = 0; k < n_bins; ++k) {
-        st->masked_re[slot][k] = spec_re[k] * st->scratch_bin_gain[k];
-        st->masked_im[slot][k] = spec_im[k] * st->scratch_bin_gain[k];
+    {
+        float *masked_re = st->masked_re + (size_t)slot * row;
+        float *masked_im = st->masked_im + (size_t)slot * row;
+        for (int k = 0; k < n_bins; ++k) {
+            masked_re[k] = spec_re[k] * st->scratch_bin_gain[k];
+            masked_im[k] = spec_im[k] * st->scratch_bin_gain[k];
+        }
     }
-    memcpy(st->coef_ring[slot], coefs,
-           (size_t)df_bins * DFN2_DF_ORDER * 2 * sizeof(float));
-    memcpy(st->noisy_ring_re[slot], spec_re, (size_t)n_bins * sizeof(float));
-    memcpy(st->noisy_ring_im[slot], spec_im, (size_t)n_bins * sizeof(float));
+    memcpy(st->coef_ring + (size_t)slot * frame_coefs, coefs,
+           frame_coefs * sizeof(float));
+    memcpy(st->noisy_ring_re + (size_t)slot * row, spec_re, row * sizeof(float));
+    memcpy(st->noisy_ring_im + (size_t)slot * row, spec_im, row * sizeof(float));
     st->alpha_ring[slot] = alpha;
     st->df_ring_idx = (slot + 1) % ring;
     if (st->df_ring_count < ring) ++st->df_ring_count;
@@ -513,23 +624,27 @@ int dfn2_compose(DFN2State* st,
     alpha = st->alpha_ring[target];
     if (alpha < 0.0f) alpha = 0.0f;
     if (alpha > 1.0f) alpha = 1.0f;
-    for (int tap = 0; tap < DFN2_DF_ORDER; ++tap) {
-        int source = (slot + tap - (DFN2_DF_ORDER - 1) + ring) % ring;
-        src_re[tap] = st->masked_re[source];
-        src_im[tap] = st->masked_im[source];
+    for (int tap = 0; tap < df_order; ++tap) {
+        int source = (slot + tap - (df_order - 1) + ring) % ring;
+        st->src_re[tap] = st->masked_re + (size_t)source * row;
+        st->src_im[tap] = st->masked_im + (size_t)source * row;
     }
-    df_common_deep_filter(src_re, src_im, &st->coef_ring[target][0][0][0],
-                          alpha, st->masked_re[target],
-                          st->masked_im[target], out_re, out_im, df_bins);
-    for (int k = df_bins; k < n_bins; ++k) {
-        out_re[k] = st->masked_re[target][k];
-        out_im[k] = st->masked_im[target][k];
+    {
+        const float *target_re = st->masked_re + (size_t)target * row;
+        const float *target_im = st->masked_im + (size_t)target * row;
+        df_common_deep_filter(st->src_re, st->src_im, df_order,
+                              st->coef_ring + (size_t)target * frame_coefs,
+                              alpha, target_re, target_im, out_re, out_im, df_bins);
+        for (int k = df_bins; k < n_bins; ++k) {
+            out_re[k] = target_re[k];
+            out_im[k] = target_im[k];
+        }
     }
     return 1;
 #endif
 }
 
-int dfn2_compose_stream(DFN2State* st,
+int dfn2_enhance_spectrum_stream(DFN2State* st,
                         const float* current_spec_re,
                         const float* current_spec_im,
                         int heads_valid,
@@ -552,6 +667,7 @@ int dfn2_compose_stream(DFN2State* st,
     const int n_bins = st->grid.n_bins;
     const int ring = st->grid.ring;
     const int mask_lookahead = st->grid.mask_lookahead;
+    const size_t row = (size_t)n_bins;
 #ifdef DFN2_MASK_ONLY
     (void)coefs;
     (void)alpha;
@@ -563,18 +679,18 @@ int dfn2_compose_stream(DFN2State* st,
     }
     ++st->stream_frame_index;
     current_slot = (int)(current % ring);
-    memcpy(st->noisy_ring_re[current_slot], current_spec_re,
-           (size_t)n_bins * sizeof(float));
-    memcpy(st->noisy_ring_im[current_slot], current_spec_im,
-           (size_t)n_bins * sizeof(float));
+    memcpy(st->noisy_ring_re + (size_t)current_slot * row, current_spec_re,
+           row * sizeof(float));
+    memcpy(st->noisy_ring_im + (size_t)current_slot * row, current_spec_im,
+           row * sizeof(float));
     if (current < mask_lookahead) return 0;
 
     head_frame = current - mask_lookahead;
     head_slot = (int)(head_frame % ring);
-    df_mask_spectrum(st, erb_mask, st->noisy_ring_re[head_slot],
-                     st->noisy_ring_im[head_slot], out_re, out_im);
-    dfn2_apply_atten_lim(n_bins, st->noisy_ring_re[head_slot],
-                         st->noisy_ring_im[head_slot],
+    df_mask_spectrum(st, erb_mask, st->noisy_ring_re + (size_t)head_slot * row,
+                     st->noisy_ring_im + (size_t)head_slot * row, out_re, out_im);
+    dfn2_apply_atten_lim(n_bins, st->noisy_ring_re + (size_t)head_slot * row,
+                         st->noisy_ring_im + (size_t)head_slot * row,
                          out_re, out_im, atten_lim_db);
     if (output_frame_index) *output_frame_index = head_frame;
     return 1;
@@ -582,10 +698,10 @@ int dfn2_compose_stream(DFN2State* st,
     long long target_frame;
     int target_slot;
     const int df_bins = st->grid.df_bins;
+    const int df_order = st->grid.df_order;
     const int df_lookahead = st->grid.df_lookahead;
     const int df_history = st->grid.df_history;
-    const float *src_re[DFN2_DF_ORDER];
-    const float *src_im[DFN2_DF_ORDER];
+    const size_t frame_coefs = (size_t)df_bins * (size_t)df_order * 2u;
 
     current = st->stream_frame_index;
     if (current < mask_lookahead) {
@@ -596,14 +712,13 @@ int dfn2_compose_stream(DFN2State* st,
     }
     ++st->stream_frame_index;
     current_slot = (int)(current % ring);
-    memcpy(st->noisy_ring_re[current_slot], current_spec_re,
-           (size_t)n_bins * sizeof(float));
-    memcpy(st->noisy_ring_im[current_slot], current_spec_im,
-           (size_t)n_bins * sizeof(float));
+    memcpy(st->noisy_ring_re + (size_t)current_slot * row, current_spec_re,
+           row * sizeof(float));
+    memcpy(st->noisy_ring_im + (size_t)current_slot * row, current_spec_im,
+           row * sizeof(float));
 
-    /* A lookahead network cannot return frame 0's heads before input frame
-     * mask_lookahead has arrived. This alignment is enforced because a misaligned
-     * mask is audible but finite and passes NaN/smoke checks. */
+    /* The heads of frame 0 cannot arrive before input frame mask_lookahead; a misaligned mask is
+     * audible but finite, so the alignment is enforced. */
     if (current < mask_lookahead) {
         return 0;
     }
@@ -614,16 +729,17 @@ int dfn2_compose_stream(DFN2State* st,
                           st->erb_inv_lo, st->erb_inv_hi,
                           n_bins, st->grid.n_erb,
                           st->scratch_bin_gain);
-    skn_mul_f32(st->masked_re[head_slot], st->noisy_ring_re[head_slot],
+    skn_mul_f32(st->masked_re + (size_t)head_slot * row,
+                st->noisy_ring_re + (size_t)head_slot * row,
                 st->scratch_bin_gain, (size_t)n_bins);
-    skn_mul_f32(st->masked_im[head_slot], st->noisy_ring_im[head_slot],
+    skn_mul_f32(st->masked_im + (size_t)head_slot * row,
+                st->noisy_ring_im + (size_t)head_slot * row,
                 st->scratch_bin_gain, (size_t)n_bins);
-    memcpy(st->coef_ring[head_slot], coefs,
-           (size_t)df_bins * DFN2_DF_ORDER * 2 * sizeof(float));
+    memcpy(st->coef_ring + (size_t)head_slot * frame_coefs, coefs,
+           frame_coefs * sizeof(float));
     st->alpha_ring[head_slot] = alpha;
 
-    /* In a cascade the newest usable masked source is head_frame, so the output
-     * target is one DF lookahead behind it. */
+    /* cascade: the newest masked source is head_frame, the output target is df_lookahead behind */
     target_frame = head_frame - df_lookahead;
     if (target_frame < 0) return 0;
     target_slot = (int)(target_frame % ring);
@@ -631,37 +747,32 @@ int dfn2_compose_stream(DFN2State* st,
     if (alpha < 0.0f) alpha = 0.0f;
     if (alpha > 1.0f) alpha = 1.0f;
 
-    /* The taps' source rows are per frame, not per bin: resolve them once. A
-     * source frame before the stream start is a row of 0.0f. */
-    for (int tap = 0; tap < DFN2_DF_ORDER; ++tap) {
+    /* the taps' source rows are per frame: resolve once; before the stream start a row of 0.0f */
+    for (int tap = 0; tap < df_order; ++tap) {
         long long source_frame = target_frame - df_history + tap;
         int slot = source_frame >= 0 ? (int)(source_frame % ring) : -1;
-        src_re[tap] = slot >= 0 ? st->masked_re[slot] : df_zero_row;
-        src_im[tap] = slot >= 0 ? st->masked_im[slot] : df_zero_row;
+        st->src_re[tap] = slot >= 0 ? st->masked_re + (size_t)slot * row
+                                    : st->df_zero_row;
+        st->src_im[tap] = slot >= 0 ? st->masked_im + (size_t)slot * row
+                                    : st->df_zero_row;
     }
-    df_common_deep_filter(src_re, src_im,
-                          &st->coef_ring[target_slot][0][0][0], alpha,
-                          st->masked_re[target_slot],
-                          st->masked_im[target_slot], out_re, out_im, df_bins);
-    for (int k = df_bins; k < n_bins; ++k) {
-        out_re[k] = st->masked_re[target_slot][k];
-        out_im[k] = st->masked_im[target_slot][k];
+    {
+        const float *target_re = st->masked_re + (size_t)target_slot * row;
+        const float *target_im = st->masked_im + (size_t)target_slot * row;
+        df_common_deep_filter(st->src_re, st->src_im, df_order,
+                              st->coef_ring + (size_t)target_slot * frame_coefs,
+                              alpha, target_re, target_im, out_re, out_im, df_bins);
+        for (int k = df_bins; k < n_bins; ++k) {
+            out_re[k] = target_re[k];
+            out_im[k] = target_im[k];
+        }
     }
-    dfn2_apply_atten_lim(n_bins, st->noisy_ring_re[target_slot],
-                         st->noisy_ring_im[target_slot],
+    dfn2_apply_atten_lim(n_bins, st->noisy_ring_re + (size_t)target_slot * row,
+                         st->noisy_ring_im + (size_t)target_slot * row,
                          out_re, out_im, atten_lim_db);
     if (output_frame_index) *output_frame_index = target_frame;
     return 1;
 #endif
-}
-
-void dfn2_synthesis(DFN2State* st,
-                    const float* spec_re, const float* spec_im,
-                    float* out_frame)
-{
-    if (!state_ready(st) || !st->istft || !spec_re || !spec_im || !out_frame)
-        return;
-    ac_istft_push_planar(st->istft, spec_re, spec_im, out_frame);
 }
 
 const char* dfn2_simd_backend(void)

@@ -121,7 +121,7 @@ Audio_ALG 自有 pipelines/AINR/AIAEC）**：
   `pipeline_dfn_detail.html`（入口語意、rate bridge 與測試內容）、
   `pipeline_dfn_usage.html`、`pipeline_dfn_sequence.html`、`pipeline_dfn_params.html`
 - AINR：`ainr_dfn2.html`、`ainr_dfn2_detail.html`（pool、callback 邊界、建置）、
-  `ainr_dfn2_usage.html`、`ainr_dfn2_grids.html`（DFN2 grid 由應用端於執行期給定：給定值與推導量、合法性與狀態碼、編譯期容量、各 grid 的 pool 與限制）、
+  `ainr_dfn2_usage.html`、`ainr_dfn2_grids.html`（DFN2 grid 由應用端於執行期給定：給定值與推導量、合法性與狀態碼、各 grid 的 pool 與限制）、
   `ainr_dfn3.html`、`ainr_dfn3_usage.html`、`ainr_gtcrn.html`、
   `ainr_gtcrn_usage.html`、`ainr_rnnoise_erb.html`、`ainr_rnnoise_erb_usage.html`
 - AIAEC：`aiaec_align_ulcnet.html`、`aiaec_align_ulcnet_detail.html`（far branch、PTQ、
@@ -148,8 +148,8 @@ Audio_ALG 自有 pipelines/AINR/AIAEC）**：
   Align-ULCNet 的在 `pipelines/ulcnet/`，mono 的在 `pipelines/mono_aec_nr_res/`，共用的 `example_cli.h`、`cng_aec3.py` 在
   `pipelines/common/`；各資料夾的測試放在自己的 `tests/`，`pipelines/tests/` 只留跨資料夾的測試。
 - **DFN lookahead**：DeepFilterNet2／3 的 mask／DF lookahead pair 是 checkpoint 的契約，共 15 組合法 pair，出貨只有 1/1 有
-  checkpoint。DFN3 的 pair 是建置期（`DFN3_*` make 變數，各為單一十進位數）；DFN2 的 pair 是 `DFN2Grid` 的兩個欄位（應用端以
-  `dfn2_grid_make()` 給定，函式庫沒有 pair 常數、沒有 pair 連結符號）；pipelines 的單元與範例 main 也不含 grid 或 pair（grid 在
+  checkpoint。DFN3 的 pair 是 `DFN3Grid` 的兩個欄位（應用端以 `dfn3_grid_make()` 給定）；DFN2 的 pair 是 `DFN2Grid` 的兩個欄位（應用端以
+  `dfn2_grid_make()` 給定）；兩個函式庫都沒有 pair 常數、沒有 pair 連結符號；pipelines 的單元與範例 main 也不含 grid 或 pair（grid 在
   `DfnResStageConfig.grid`，範例 main 由 `--ai-sample-rate`／`--ai-fft-size` 建），只有測試程式在建置時用 `DFN2_MASK_LOOKAHEAD`／
   `DFN2_DF_LOOKAHEAD`／`DFN2_GRID_KHZ` 選（`pipelines/dfn/tests/dfn_test_grid.h`、`AINR/tests/dfn2_test_grid.h`）。不要寫成
   「pipelines 在建置時選 grid」或「函式庫讀 `DFN2_N_BINS` 一類巨集」。任何延遲、ring 或 delay 數字都要寫明是哪一組

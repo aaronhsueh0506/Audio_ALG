@@ -3,6 +3,108 @@
 `Audio_ALG/pipelines`（含它建置的 `AINR`、`AIAEC` C 程式）的重要改動記錄在此，格式依
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/)。README 只寫現況，改動經過寫在這裡。
 
+## [Unreleased] — 2026-11-06 — The AI model libraries are frequency domain only, take run-time grids and caller memory; the pipelines follow
+
+The model libraries (`AINR`, `AIAEC`) lose everything that is not the model's own pre/post arithmetic, and the DFN and ULCNet pipeline
+units, example mains and tests follow. Library-side detail: `AINR/CHANGELOG.md`.
+
+### Changed
+- Frequency domain only. `*_IO_TIME`, `*_prepost_pre_process` / `_post_process`, `io_mode`, `*_framing_config`, `*_analysis`,
+  `*_synthesis` and every FFT, window, `AcStft` and `AcIstft` member of the classes are gone. The application frames with audiolib
+  (`ac_stft_push_planar`, `ac_istft_push_planar`) and calls `*_pre_process_freq` / `*_post_process_freq`. The scales belong to the
+  application's `AcStftConfig`: DFN2 driven directly uses `spec_scale = grid.stft_scale` and `ispec_scale = grid.stft_unscale`, while
+  the stage and the bridge keep 1 and apply the grid's scales themselves.
+  `scripts/audit_no_transform_in_models.sh` now forbids the analysis side too (`AcStft`, `ac_stft_*`, `fft_forward*`, `spec_scale`,
+  `ispec_scale`); only `ac_stft_config_default`, `ac_stft_get_mem_size` and `AcStftConfig` (the `n_fft` check) may appear in a
+  model directory (33 sources checked).
+- Run-time grid specs. `DFN2GridSpec` (15 fields, with `df_order`, `frames_per_call` and the seven normaliser values),
+  `DFN3GridSpec`, `UlcnetGridSpec` and `DeepVqeGridSpec` turn into a grid value with `<lib>_grid_make()` that goes into every
+  config. Gone with the compile-time geometry: the capacity macros (`DFN2_MAX_*`,
+  `DFN2_GRID_ERR_CAPACITY`), `DFN2_DF_ORDER`, `DFN2_FRAMES_PER_CALL`, the `DFN3_*` geometry and lookahead macros and their link
+  symbol, `ULCNET_*` / `AIAEC_*` grid macros, the `-D` normaliser starts, and the ring-suffixed `dfn2_variant_full_*_r<ring>`
+  symbol (`DFN2_VARIANT_SYMBOL` stays, so units built with and without `-DDFN2_MASK_ONLY` still do not link together).
+- One caller block per class: `<lib>_get_mem_size(cfg)` -> caller memory (16-byte aligned) -> `<lib>_init`. Carve versions:
+  `DFN2_PREPOST_CARVE_VERSION` 9 -> 11, `DFN3_PREPOST_CARVE_VERSION` 8 -> 9, `ULCNET_PREPOST_CARVE_VERSION` 7 -> 8,
+  `DEEPVQE_PREPOST_CARVE_VERSION` 6 -> 8; the model I/O layout versions are unchanged. A `MemReq` queried before this change is
+  refused by `init_ex()`; query again.
+- Recurrent state belongs to the application. A float host registers (pointer, element count) pairs in the prepost config; a board
+  registers nothing and its accelerator holds the state; a state generation counter (`*_state_generation()`) tells the board when
+  to reload quantized zeros. The registered state is in no pool size and no hash. `dfn_res_stage_state_generation()` and
+  `dfn_rate_bridge_state_generation()` are new (the stage registers no state; the bridge forwards the stage's value; 0 for NULL):
+  the value is 1 after init, plus one per reset, per warm-up frame and per refused commit of a real frame, unchanged when the model callback returns nonzero.
+- One flow on every hop. `dfn_res_stage_begin()` returns 1 on every hop (it returned 0 on the first `grid.mask_lookahead` hops): the first
+  M hops are warm-up frames, the model callback runs on them, `dfn_res_stage_end()` discards the heads and the library restarts the
+  model state (generation + 1 per warm-up frame, so a callback that holds state reloads quantized zeros after each). Audio is bit-identical
+  to the old flow. `end()` still returns 0 with an all-zero `out_spec` for the first L hops. `dfn_res_stage_get_counters()`: the warm-up
+  frames count in `frames_in` only, never in `commits` or `skips`. Through `dfn_rate_bridge`, `nn_begin()` returns 1 on those frames too
+  (the schedule, the prefill, the FIFO sizes and the added delay of 672 / 629 / 330 samples are unchanged: they count 48 kHz frames, not
+  model calls), so the first 48 kHz-frame host hop (hop 1 at 16 kHz / 128, hop 0 at 16 kHz / 256 and 8 kHz / 128) makes one more model
+  call, M calls once per start or reset; a host hop still carries at most two stage frames. `dfn_hop.h` and the example mains change in
+  comments only, apart from three dead conditions removed: `job_pending` is set unconditionally in `dfn_hop_begin()`, the identity result
+  is passed unconditionally in `dfn_hop_end()` (an unclosed stage frame is always open), and `dfn_res_stage_process()` always calls
+  `infer`. One frame per call only: a grid with `frames_per_call` > 1 is refused as before; with M = 0 there is
+  no warm-up frame. The Python twin is unchanged (it never mirrored the return value or the generation; the C stage evaluates the heads M
+  more times per stream and Python's `heads_calls` / `skips` count real frames only).
+- Renames: `<lib>_prepost_frame_inputs` / `_commit` / `_skip` -> `_frame_open` / `_finish` / `_bypass`, `dfn2_compose[_stream]` and
+  `dfn3_compose[_stream]` -> `dfn2_enhance_spectrum[_stream]` and `dfn3_enhance_spectrum[_stream]`, `ulcnet_model_io_commit` ->
+  `ulcnet_model_io_enhance_spectrum`.
+- `dfn/dfn_example_args.h`: `DFN_EXAMPLE_MODEL_ROWS` are `DFN2GridSpec` rows (each carries `df_order`, `frames_per_call` and the normaliser values).
+- `DFN_RES_STAGE_LAYOUT_VERSION` and `DFN_RATE_BRIDGE_LAYOUT_VERSION` 4 -> 5. The pools shrink because the classes no longer carry the
+  transform objects or the recurrent state; measured with the `test_target_abi` rows (48 kHz test grid, pair 1/1, ULCNet and DeepVQE-S
+  16 kHz / 512, D 8, bridge host 16 kHz): `dfn2_prepost` 219,648 -> 92,608 B, `dfn3_prepost` 219,472 -> 90,384, `ulcnet_prepost`
+  75,248 -> 14,784, `deepvqe_prepost` 438,640 -> 35,504, `dfn_res_stage` 232,096 -> 105,056, `dfn_rate_bridge` 350,000 -> 222,960.
+  Unit banners: `mono_aec_dfn_res` 718,096 -> 591,056 B (host 16 kHz), 1,450,016 -> 1,322,976 (48 kHz), 622,720 -> 495,680 (8 kHz),
+  594,048 -> 431,456 (16 kHz host and 16000 / 256 model); `4ch_aec_bf_dfn_res` 2,066,240 -> 1,939,200 (core 16 kHz), 6,646,000 ->
+  6,518,960 (48 kHz), 1,942,192 -> 1,779,600 (16 kHz and 16000 / 256 model). The 48 kHz-model rows all shrink by 127,040 B; the shipped
+  graph's state is 32,000 float32 values (128,000 B), and the 960 B difference is not decomposed. `mcab` is unchanged.
+- `ulcnet/ulcnet_nn_stage.{h,c}`: `ulcnet_nn_stage_mem_size(const UlcnetGrid *, err_analysis)`,
+  `ulcnet_nn_stage_init(mem, bytes, const UlcnetGrid *, err_analysis)` and new `ulcnet_nn_stage_grid()`; spectra have `grid.n_bins`
+  bins, hops `grid.hop` samples. `ulcnet_accelerator_adapter_init()` takes the state registration (NULL in the examples) and has
+  `ulcnet_accelerator_adapter_state_generation()`.
+- `mono_alignulcnet` and `4ch_alignulcnet`: new `--sample-rate 16000|48000` (default 16000; anything else exits 2), so one binary serves both
+  grids. The `ULCNET_GRID` make variable (`ULCNET_GRID_CFLAGS`, `-DULCNET_MODEL_IO_SR` / `-DULCNET_MODEL_IO_N_FFT`) and the `test-grids`
+  targets of `pipelines/Makefile` and `4ch_aec_bf_nr_res/Makefile` are removed; both `test` recipes gain a `--sample-rate 48000` run.
+  Pools at 16 kHz / 512: `mono_alignulcnet` 537,360 -> 537,424 B; `4ch_alignulcnet` unit pool 2,994,640 B unchanged, stage pool
+  36,400 -> 36,464 B, adapter pool 75,280 -> 14,816 B (the +64 B are not decomposed). At 48 kHz / 1024 (the old build could not hold both
+  grids in one binary): `mono_alignulcnet` 1,246,912 B; `4ch_alignulcnet` unit pool 6,304,624 B, stage pool 71,792 B, adapter pool
+  29,152 B. The adapter pool follows the grid, not `D`.
+- Makefiles: besides the variables above, `DFN3_MASK_LOOKAHEAD` / `DFN3_DF_LOOKAHEAD`, `DFN_PAIR_CFLAGS` and `DFN2_PAIR_RING` (so
+  `-DDFN2_MAX_DF_RING` is never forwarded) are removed; a retired knob on make's command
+  line is silently ignored, not an error. `DFN2_MASK_LOOKAHEAD`, `DFN2_DF_LOOKAHEAD` and `DFN2_TEST_GRID_KHZ` stay for the test
+  programs. `make test-pairs` keeps the `check_pair_report.sh` gate; its archive-symbol check went with the ring-suffixed symbol. New
+  `make audit-dead-defines` (`scripts/audit_dead_defines.sh`: every `-D` flag of a Makefile under `AINR/`, `AIAEC/` and `pipelines/`
+  must be read by a C source) and `make print-untracked`, with the variables `ALG_ROOT`, `UNTRACKED_FILES_CMD` and `DEAD_DEFINES_ARGS`.
+  `scripts/audit_fp_contract.sh` exempts `dfn2_norm_alpha` (four explicit `fma()` calls, by function block).
+- `dfn/tests/dfn_test_grid.h` loses `DFN2_WIN_LEN`, `DFN2_OVL_LEN`, `DFN2_DF_ORDER`, `DFN2_DF_HISTORY`, `DFN2_DF_RING`,
+  `DFN2_DF_RING_NOISY`; it gains the `DFN_TEST_*` model numbers (`DFN_TEST_DF_ORDER` 5, `DFN_TEST_FRAMES_PER_CALL` 1, the normaliser
+  values), `dfn_test_spec()`, `dfn_test_spec_of()` and `dfn_test_table_fits()`, and stops at an `#error` under `-DDFN2_MASK_ONLY`.
+- Python twin `dfn2_stage.py`: names in comments and one error message only; the arithmetic is unchanged.
+
+### Tests
+- Re-run for this change on a copy of the working tree (host, default NEON build): `make -C pipelines test` and
+  `make -C pipelines/4ch_aec_bf_nr_res test` exit 0; `test_cli_strict.sh` reports 756 command lines PASS, five of them new
+  (`--erb-fwd` alone and `--erb-inv` alone exit 2; an unopenable file, a file with fewer floats and a file with more floats than
+  513 bins x 32 bands exit 1, each with its message);
+  `make -C pipelines target-abi-test` passes its 8 descriptor rows; `make -C pipelines test-pairs` (default 4 pairs) and
+  `test-dfn-grids` exit 0; `audit-dead-defines` passes (22 `-D` flags, each read by a source), `audit-no-transform` passes.
+- pytest: `test_dfn_test_grid_pin.py` (new, compares the test header's model numbers with `AINR/DeepFilterNet2/config.ini`) 2,
+  `test_dfn2_stage_c_parity.py` 10 passed and 2 skipped, `test_dfn2_rate_bridge_c_parity.py` 27 (allclose, rtol 2e-4 / atol 2e-6: the Python
+  and C FFT backends differ), `test_dfn2_stage.py` 37, `test_dfn2_rate_adapter.py` 21, the mono contract 19, the 4ch contract 3,
+  `test_no_transform_in_models.py` 68.
+- Warm-up frames: `test_dfn_res_stage.c` expects begin == 1 on the first hop, generation 1 + M after the test grid's hops (every pair),
+  the capture of the model windows on all eight hops with hop 0 showing the zero-initialised window, a counting model (one call per hop,
+  counters untouched during warm-up) and a stateful mock model run three ways (reload on every generation change equals a model that
+  never saw a warm-up frame bit for bit, also with NaN and 1e30 heads on the warm-up calls and across a reset; reload only at start
+  differs when M > 0). `test_dfn_rate_bridge.c` separates the warm-up +1 from the refused-commit +1 and checks model calls per host hop
+  against the schedule, generation 1 + min(calls, M) and the added delays; `test_dfn_hop.c` checks one stage frame per hop from the first
+  hop and model calls == stage `frames_in`.
+- `test_dfn_res_stage.c` drops the capacity branch and gains `frames_per_call` 2 refused, state-generation rows and byte snapshots of
+  refused calls; `test_target_abi.c` and `test_readme_flow.c` are ported with the same case count. `test_ulcnet_nn_stage.c` runs every
+  grid of its table and checks the grid and pool plan (refusals leave the block bytes unchanged); `test_mono_ulcnet.c` and
+  `test_4ch_ulcnet.c` run both grids from one binary.
+- Not run: any board; an ARM32 or target-toolchain build; ASan (its runtime does not start on the host, UBSan was used); the audio quality of any lookahead pair other than 1/1. The 32-bit pool sizes of the new classes are predicted
+  by a layout mirror only, and none exists for the stage, the bridge or the units.
+
 ## [Unreleased] — 2026-11-05 — The DFN2 pipelines take their grid in the config; the rate bridge refuses a non-48 kHz model
 
 The DFN2 library (`AINR/DeepFilterNet2`) holds no grid any more (`DFN2Grid`, `dfn2_grid_make()`; see `AINR/CHANGELOG.md`), and neither

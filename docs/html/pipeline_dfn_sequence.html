@@ -41,7 +41,8 @@ th{background:#eef2f8}
 <pre>App(main.c)                  Aec                   Stage | Bridge              AcIstft(48 kHz)
   |                           |                           |                           |
   | aec_resolve_signal_grid(sr, aec_default_fft_size(sr), &amp;grid) -&gt; 1 | 0;aec_config_from_level + 欄位(derive_lane())|
-  | dfn2_grid_make(&amp;mg, 48000, 1024, 32, 96, 1, 1)   模型的 grid(範例 main:--ai-sample-rate / --ai-fft-size 選表的一列) |
+  | dfn2_grid_make(&amp;mg, &amp;spec)   模型的 grid(spec 是應用端表的一列;範例 main:--ai-sample-rate / --ai-fft-size 選列) |
+  | ERB 矩陣:erb_fwd(bin-major)與 erb_inv(band-major)兩個 raw float32 檔讀進應用端的緩衝區(範例 main:--erb-fwd / --erb-inv) |
   | dfn2_model_io_descriptor_default(&amp;mg, &amp;desc)   板端應改填匯出的 metadata |
   | dfn_rate_bridge_default_config(sr, &amp;mg) | dfn_res_stage_default_config(&amp;mg);填 erb_fwd / erb_inv / model
   | aec_get_mem_size(&amp;aec_cfg)|                           |                           |
@@ -84,7 +85,7 @@ th{background:#eef2f8}
   |-- dfn_hop_begin(&amp;hop, b.base_spec, P) ------------&gt;|                          |                          |
   |                          |                          | dfn_res_stage_begin(stage, B, P, &amp;job)              |
   |                          |                          |-------------------------&gt;|                          |
-  |                          |                          | 1 = job 已開 | 0 = 前 M 個 hop(沒有模型幀)      |
+  |                          |                          | 1 = job 已開(每個 hop;前 M 個是暖機幀)         |
   |                          |                          |&lt;-------------------------|                          |
 -- 路徑 A:dfn_hop_process = begin + 迴圈{ nn_begin; nn_end(dfn_res_stage_infer(job)) } + end -----------------------------
   |                          |                          | dfn_res_stage_infer(stage, &amp;job)                    |
@@ -96,18 +97,19 @@ th{background:#eef2f8}
 -- 路徑 B:phased,呼叫端自己跑加速器 --------------------------------------------------------------------------------------
   | dfn_hop_nn_begin(&amp;hop, &amp;job)  -&gt;  1(job 借用到 nn_end)| 0(沒有幀)| &lt; 0         |                          |
   |----------------------------------------------------&gt;|                          |                          |
+  | dfn_res_stage_state_generation(dfn_hop_stage(&amp;hop)) 與上次不同 -&gt; 板端把 state 輸入重載成量化後的零,記下新值 |
   |-- job.inputs -&gt; 加速器 -&gt; job.outputs(輸出預填 NaN,要寫滿) ----------------------------------------------&gt;|
   |&lt;- rc -----------------------------------------------------------------------------------------------------|
   |-- dfn_hop_nn_end(&amp;hop, rc) ------------------------&gt;|                          |                          |
   |                          |                          | dfn_res_stage_end(stage, rc, stage_out)             |
   |                          |                          |-------------------------&gt;|                          |
-  |                          |                          |                          | rc != 0、輸出未寫或非有限 -&gt; dfn2_prepost_frame_skip()(identity,時鐘照走)
+  |                          |                          |                          | rc != 0 -&gt; dfn2_prepost_frame_bypass()(identity,時鐘照走);輸出未寫或非有限 -&gt; frame_finish 被拒(state generation +1)-&gt; frame_bypass();暖機幀:丟棄 heads、generation +1
 -- 收尾(兩條路徑相同) ----------------------------------------------------------------------------------------------------
   |-- dfn_hop_end(&amp;hop, out) --------------------------&gt;|                          |                          |
   |                          |                          | 沒被取走的 job 走 identity;ac_istft_push(istft, stage_out, out) -&gt; 剛好一個 hop
   | 0 | DFN_HOP_INVALID(-1)| DFN_HOP_SEQUENCE_ERROR(-2) |                          |                          |
   |&lt;----------------------------------------------------|                          |                          |</pre>
-<p>48 kHz 時前 M 幀(<code>grid.mask_lookahead</code>)還沒有右鄰居(graph 視窗為 <code>[t-(2-M)..t+M]</code>),<code>dfn_res_stage_begin()</code> 回 0 而不叫模型;前 L = M + D 個 hop 輸出全零頻譜,之後第 p 個 hop 輸出「傳統鏈的 hop#(p-L)」。出貨 pair 1/1(M = 1、L = 2):只有第 0 個 hop 回 0,合計 3 hop = 1536 samples 的純延遲;其他 pair 見 <a href="pipeline_dfn_detail.html">pipeline_dfn_detail</a>。</p>
+<p>48 kHz 時前 M 幀(<code>grid.mask_lookahead</code>)還沒有右鄰居(graph 視窗為 <code>[t-(2-M)..t+M]</code>),是暖機幀:<code>dfn_res_stage_begin()</code> 照回 1、模型照跑,<code>end()</code> 丟棄 heads、state generation 加 1(板端重載量化零);前 L = M + D 個 hop 輸出全零頻譜,之後第 p 個 hop 輸出「傳統鏈的 hop#(p-L)」。出貨 pair 1/1(M = 1、L = 2):只有第 0 個 hop 是暖機幀,合計 3 hop = 1536 samples 的純延遲;其他 pair 見 <a href="pipeline_dfn_detail.html">pipeline_dfn_detail</a>。</p>
 <h2>3. 穩態 hop:8／16 kHz host(經 <code>DfnRateBridge</code>)</h2>
 <pre>App(main.c)               DfnHop                  DfnRateBridge               DfnResStage                model | NPU
   |                          |                          |                          |                          |
@@ -125,7 +127,7 @@ th{background:#eef2f8}
   |                          |                          | FIFO 每滿 512:ac_stft_push x2(sqrt-Hann 1024/512)   |
   |                          |                          | dfn_res_stage_begin(B48, P48, &amp;job)                 |
   |                          |                          |-------------------------&gt;|                          |
-  |                          |                          | 1 | 0(warm-up 幀由 bridge 自己 finish)              |
+  |                          |                          | 1(前 M 個 48 kHz 幀是暖機幀,模型照跑)           |
   |                          |                          |&lt;-------------------------|                          |
   |&lt;- 1 = job 已開 | 0 = 本 hop 沒有幀 | -1 ------------|                          |                          |
   |-- job.inputs -&gt; 加速器 -&gt; job.outputs -------------------------------------------------------------------&gt;|
@@ -175,7 +177,7 @@ th{background:#eef2f8}
   |-------------------------&gt;|                          |                          |                          |
   | rng = 種子(mono AEC_CNG_SEED／4ch MCAB_SAMPLE_CNG_RNG_SEED)|                          |                          |
   |-- dfn_hop_reset(&amp;hop) -----------------------------&gt;|                          |                          |
-  |                          |                          | dfn_rate_bridge_reset() | dfn_res_stage_reset() + ac_istft_reset() + 清空 stage_out
+  |                          |                          | dfn_rate_bridge_reset() | dfn_res_stage_reset() + ac_istft_reset() + 清空 stage_out(state generation +1)
   |                          |                          |-------------------------&gt;|                          |
   |                          |                          |                          | model.reset(user)(有設才呼叫)
   |                          |                          |                          |-------------------------&gt;|

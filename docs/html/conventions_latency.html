@@ -116,11 +116,10 @@ code{font-family:ui-monospace,Menlo,monospace;font-size:.92em}
 <td>+0 hop</td><td>線性誤差與輸入同 hop 交付（<code>AecResContext.formed_hop</code>）</td></tr>
 <tr><td>Align-ULCNet 鏈（rolling center=False STFT ×2 → NN callback → WOLA）</td>
 <td>+1 hop（16 k: 256 smp = 16 ms；48 k: 512 smp = 10.67 ms）</td>
-<td><code>ulcnet_process.h</code>：hop#0 無輸出（pipeline 補零）、hop#p 輸出
-對應輸入 [（p−1)·HOP, p·HOP)</td></tr>
+<td><code>ulcnet_process.h</code>：第一幀無輸出（pipeline 補零）、hop#p 輸出
+對應輸入 [（p−1)·<code>grid.hop</code>, p·<code>grid.hop</code>)</td></tr>
 <tr><td><b>合計</b></td><td><b>1 hop（16 k: 16 ms；48 k: 10.67 ms）</b></td>
-<td><code>ulcnet/ulcnet_nn_stage.h</code>：「Timing: one hop of added latency; hop #0 of the
-stream emits zeros」；輸出 hop p ≙ 輸入 hop p−1</td></tr>
+<td><code>ulcnet/ulcnet_nn_stage.h</code>：「Latency is one hop; hop #0 emits zeros」；輸出 hop p ≙ 輸入 hop p−1</td></tr>
 </table>
 </div>
 
@@ -146,14 +145,14 @@ stream emits zeros」；輸出 hop p ≙ 輸入 hop p−1</td></tr>
 <td><code>ulcnet/ulcnet_nn_stage.h</code> 的 timing 契約：<b>僅 hop#0</b> 輸出零；
 輸出 hop p（p≥1）≙ 輸入 hop p−1 的 beamformed 線性誤差。
 測試以 far 單位脈衝釘住：16 k far[2085]→out[2341]（= 脈衝位置 + 1 hop = 256 samples，offset +0）；
-48 k：far[4133]→out[4645]（= 脈衝位置 + 1 hop = 512 samples，offset +0），<code>make -C pipelines/4ch_aec_bf_nr_res test-grids</code> 兩個格點各跑一次</td></tr>
+48 k：far[4133]→out[4645]（= 脈衝位置 + 1 hop = 512 samples，offset +0），<code>make -C pipelines/4ch_aec_bf_nr_res test</code> 的 <code>test_4ch_ulcnet</code> 在同一支 binary 內兩個格點各跑一次</td></tr>
 </table>
 </div>
 <p class="note">NN 模型本身：Align-ULCNet 演算法 lookahead = 0
 （readiness 總覽矩陣）；上表已含其 framing 的半窗 lookahead。</p>
 
 <h3>DFN2 變體（<a href="pipeline_dfn_mono.html">mono</a> 與 <a href="pipeline_dfn_4ch.html">4ch</a>）</h3>
-<p class="note">DFN2 stage 永遠在 48 k / 1024 / 512；host 則跑產品自己的取樣率。下表先列 48 k host，再列原生格點多付的 rate-bridge 延遲。</p>
+<p class="note">DFN2 stage 出貨在 48 k / 1024 / 512；host 則跑產品自己的取樣率。下表先列 48 k host，再列原生格點多付的 rate-bridge 延遲。</p>
 <div class="tbl">
 <table>
 <tr><th>階段</th><th>新增延遲</th><th>說明</th></tr>

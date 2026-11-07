@@ -31,7 +31,8 @@ Pass conditions:
 `make -C pipelines test` also builds and runs the shared post-RES DFN2
 stage, the rate bridge that takes that stage to its 48 kHz grid from a
 product-rate host, and the mono example that composes lib/aec's `Aec` (its own RES
-gain, formed into P in the example's `rig_process`, no denoiser, no synthesis) and
+gain, formed into P in the example's `rig_process`; no denoiser; the host synthesis is
+the example's `AcIstft` on the stage path and the bridge's own otherwise) and
 `dfn/dfn_hop.h`:
 
 ```bash
@@ -71,8 +72,7 @@ make -C pipelines BACKEND=ne10 SIMD=<0-or-1> WERROR=1 test-dfn-grids
 each listed pair only. Every one of them prints the pair it was built with and, for the stage test and
 the mono composition, the stage latency it measured, and `dfn/tests/check_pair_report.sh` fails the
 target when the pair or the latency (`mask + df` hops, `(mask + df + 1) * hop` samples) is not the one
-asked for -- a pair flag that never reached the test build prints 1/1 and is red; the archive must also
-carry the state-ring symbol the pair needs. The other pairs are not built or run by this target
+asked for -- a pair flag that never reached the test build prints 1/1 and is red. The other pairs are not built or run by this target
 (the AINR C hosts have their own pair tests, section 11.4), and no checkpoint
 trained for a pair other than 1/1 exists here, so their audio quality is
 unmeasured.
@@ -91,6 +91,10 @@ Pass conditions:
       for the shipped 1/1 pair).
 - [ ] `erb_inv` that is not a bitwise partition of unity is refused at
       `get_mem_requirements()`.
+- [ ] `--erb-fwd FILE` and `--erb-inv FILE` take the two raw float32 ERB matrices of the
+      model grid (exactly `n_bins * n_erb` floats each): a missing value or only one of the
+      two exits 2, an unreadable file or a wrong float count exits 1; with neither option a
+      unit partition serves the fail-open smoke run only.
 - [ ] Native-grid gates pass for 16 kHz/fft 256, 16 kHz/fft 512 and
       8 kHz/fft 256: the documented per-hop 48 kHz frame schedule (0,1,1,1 at
       16 kHz/hop 128; 1,2 on the other two), the cumulative frame count, the
@@ -152,7 +156,8 @@ Pass conditions:
 
 `make -C pipelines/4ch_aec_bf_nr_res test` also builds and runs the DFN2
 example over `mcab` plus the sample beam helper (real SRP-PHAT/BF; the post-beam RES is an `AecRes`
-the example creates itself; no denoiser, no synthesis; `dfn/dfn_hop.h`):
+the example creates itself; no denoiser; the host synthesis is the example's `AcIstft` on the
+stage path and the bridge's own otherwise; `dfn/dfn_hop.h`):
 
 ```bash
 make -C pipelines/4ch_aec_bf_nr_res BACKEND=ne10 SIMD=<0-or-1> WERROR=1 test

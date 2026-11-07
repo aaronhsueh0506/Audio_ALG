@@ -74,8 +74,8 @@ D 不改權重；checkpoint 與 dataset 不因 layout 而需要重新訓練或�
 但 calibration 資料與量化結果要對應該份 graph，加速器程式要對應該份 descriptor。</div>
 
 <h2>rolling 分析與 center 0</h2>
-<p><b>rolling 分析</b> <code>AcStft</code> 的 <code>center</code> 0（<code>ulcnet_framing_config()</code> 的 <code>center</code> 參數，
-<code>ulcnet_process.h</code>；DeepVQE-S 自建同組態的物件）：center=False，
+<p><b>rolling 分析</b> <code>AcStft</code> 的 <code>center</code> 0（應用端以 <code>ac_stft_config_default(&amp;sc, grid.n_fft)</code> 建立，
+組態寫在 <code>ulcnet_process.h</code>；DeepVQE-S 用同一組態）：center=False，
 <b>第一次 push 起每次恰一幀</b>（首幀前半段是歸零的歷史），與 centered
 <code>center</code> 1 的 <code>AcStft</code> 對同一個 hop 吐出的<b>最後一幀位元相同</b>——這個幾何下
 （win = n_fft、hop = n_fft/2、共用同一張 sqrt-Hann 表）centered 第 k 幀與 non-centered 第 k−1 幀

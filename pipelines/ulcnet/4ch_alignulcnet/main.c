@@ -12,7 +12,8 @@
  *
  * The model gets the caller's raw `far` hop, never the unit's aligned copy. Any refused call
  * takes the unit and the stage down together (mcab_sample_beam_reset + ulcnet_nn_stage_reset).
- * Grid: compile-time (ULCNET_* constants), 16 kHz / FFT 512 or 48 kHz / FFT 1024. */
+ * Grid: --sample-rate 16000 (FFT 512, default) or 48000 (FFT 1024); the UlcnetGrid built from it
+ * sizes the unit, the stage and the adapter. */
 #include "4ch_aec_bf_nr_res/mcab.h"
 #include "4ch_aec_bf_nr_res/mcab_sample_beam.h"
 #include "4ch_aec_bf_nr_res/mcab_sample_flow.h"
@@ -27,17 +28,23 @@
 #include <stdlib.h>
 #include <string.h>
 
-/* Delay depth D for this smoke example only. D is a runtime descriptor field; this
- * macro is the example's compile-time default (override with
- * -DULCNET_EXAMPLE_DELAY_FRAMES=N). It must equal the D the model was exported
- * with: the descriptor validator only bounds-checks the range, so a mismatch is
- * silent. The shipped checkpoints are not all D=8. */
+/* Delay depth D of the grid table below for this smoke example (override with
+ * -DULCNET_EXAMPLE_DELAY_FRAMES=N). It must equal the D the model was exported with: the
+ * descriptor validator only bounds-checks the range, so a mismatch is silent. The shipped
+ * checkpoints are not all D=8. */
 #ifndef ULCNET_EXAMPLE_DELAY_FRAMES
 #define ULCNET_EXAMPLE_DELAY_FRAMES 8
 #endif
 _Static_assert(ULCNET_EXAMPLE_DELAY_FRAMES >= ULCNET_MODEL_IO_MIN_D &&
                ULCNET_EXAMPLE_DELAY_FRAMES <= ULCNET_MODEL_IO_MAX_D,
                "ULCNET_EXAMPLE_DELAY_FRAMES outside the descriptor's range");
+
+/* The shipped grids: one row per sample rate. */
+static const UlcnetGridSpec k_grids[] = {
+    { .sample_rate = 16000, .n_fft = 512,  .delay_depth = ULCNET_EXAMPLE_DELAY_FRAMES },
+    { .sample_rate = 48000, .n_fft = 1024, .delay_depth = ULCNET_EXAMPLE_DELAY_FRAMES },
+};
+enum { K_GRIDS = (int)(sizeof k_grids / sizeof k_grids[0]) };
 
 /* Delay profile is a deployment decision: `n` (matched-filter bank size) sets the bulk-delay search range and comes from the command line (--delay-mode / --delay-num-filters / --fixed-delay, as lib/aec's aec_wav); the resolved profile is printed. Reliable range per bank: n=1 ~125 ms, 2 ~221 ms, 3 ~317 ms, 4 ~413 ms, 5 ~509 ms. DA_NUM_FILTERS is the bank-size cap and the value non-MATCHED modes require. */
 
@@ -52,6 +59,7 @@ _Static_assert(ULCNET_EXAMPLE_DELAY_NUM_FILTERS >= 1 &&
 static void usage(const char* prog) {
     fprintf(stderr,
         "Usage: %s [options]\n"
+        "  --sample-rate {16000|48000} grid of the stage and the unit (default 16000)\n"
         "  --delay-mode {matched|fixed|external}\n"
         "                              far alignment policy (default: matched)\n"
         "  --delay-num-filters <1..5>  MATCHED matched-filter bank size for the\n"
@@ -65,10 +73,11 @@ static void usage(const char* prog) {
         prog, ULCNET_EXAMPLE_DELAY_NUM_FILTERS);
 }
 
-/* Replace with the product's stateless accelerator invocation: bind each *_out of
- * the graph to the address of the state input of the same name (the pointers in
- * `outputs`), write `outputs->output`, read every state input before writing any
- * state output, and return 0 (or -1 on a failed run). See ulcnet_model_io.h. */
+/* Replace with the product's stateless accelerator invocation. The four state tensors live in
+ * the accelerator's own buffers, so the state views in `inputs` are NULL: bind each *_out of
+ * the graph to the buffer of the state input of the same name, write `outputs->output`, read
+ * every state input before writing any state output, and return 0 (or -1 on a failed run).
+ * See ulcnet_model_io.h. */
 static int run_accelerator(void *user,
                            const UlcnetModelIoInputs *inputs,
                            UlcnetModelIoOutputs *outputs) {
@@ -78,16 +87,18 @@ static int run_accelerator(void *user,
     return -1; /* BOARD: write every output tensor, then return 0. */
 }
 
-/* The unit on the compiled grid, linear context only (the stage takes the beamformed
- * spectrum); the stage takes ULCNET_BINS bins per hop, so the grids must agree. */
-static McabConfig ulcnet_example_unit_config(void) {
-    McabConfig cfg = mcab_default_config(ULCNET_SR);
-    cfg.fft_size = ULCNET_N_FFT;
+/* The unit on the stage's grid, linear context only (the stage takes the beamformed
+ * spectrum); the stage takes grid.n_bins bins per hop, so the grids must agree. */
+static McabConfig ulcnet_example_unit_config(const UlcnetGrid* grid) {
+    McabConfig cfg = mcab_default_config(grid->sample_rate);
+    cfg.fft_size = grid->n_fft;
     cfg.enable_post = 0;
     return cfg;
 }
 
 typedef struct UlcSample {
+    UlcnetGrid grid;
+    int grid_index;
     McabConfig cfg;
     McabSampleBeamParams bp;
     ExampleCliDelayOptions profile;
@@ -101,7 +112,7 @@ typedef struct UlcSample {
     size_t adapter_bytes,adapter_alignment,stage_bytes;
     size_t flow_bytes, beam_bytes;   /* the unit pool: flow objects, then the helper */
     McabMemReq req;                  /* mcab's own descriptor: the pool alignment */
-    float microphones[ULCNET_HOP*4],far[ULCNET_HOP],output[ULCNET_HOP];
+    float *microphones, *far, *output;   /* grid.hop frames; the microphones interleaved */
     const char *program;
 } UlcSample;
 static int ulc_unknown(void *user, const char *arg) {
@@ -109,20 +120,38 @@ static int ulc_unknown(void *user, const char *arg) {
     fprintf(stderr,"4ch_alignulcnet: unknown argument '%s'\n",arg);
     usage(s->program); return 2;
 }
+/* The row of k_grids for `rate`, or -1. */
+static int grid_row(int rate) {
+    int row;
+    for (row = 0; row < K_GRIDS; ++row)
+        if (k_grids[row].sample_rate == rate) return row;
+    return -1;
+}
 static int ulc_set(void *user, const char *arg, const char *value) {
     UlcSample *s=user;
     if (!strcmp(arg,"-h") || !strcmp(arg,"--help")) {
         usage(s->program); return 1;
+    }
+    if (!strcmp(arg,"--sample-rate")) {
+        int rate;
+        if (example_cli_parse_int(value,&rate) != 0 || grid_row(rate) < 0) {
+            fprintf(stderr,"4ch_alignulcnet: --sample-rate '%s' is not a shipped grid "
+                    "(accepted: 16000|48000)\n",value);
+            return 2;
+        }
+        s->grid_index=grid_row(rate);
+        return 0;
     }
     return example_cli_delay_set_option(&s->profile,arg,value,"4ch_alignulcnet");
 }
 static int ulc_parse(void *user, int argc, char **argv) {
     UlcSample *s=user;
     static const McabSampleCliOption options[]={
-        {"-h",0},{"--help",0},{"--delay-mode",1},
+        {"-h",0},{"--help",0},{"--sample-rate",1},{"--delay-mode",1},
         {"--delay-num-filters",1},{"--fixed-delay",1}
     };
     s->program=argv[0];
+    s->grid_index=0;
     example_cli_delay_options_default(&s->profile,ULCNET_EXAMPLE_DELAY_NUM_FILTERS);
     int rc=mcab_sample_scan_cli(argc,argv,options,sizeof(options)/sizeof(options[0]),
                           s,ulc_set,ulc_unknown);
@@ -130,7 +159,8 @@ static int ulc_parse(void *user, int argc, char **argv) {
 }
 static int ulc_setup(void *user, McabSampleHopView *view) {
     UlcSample *s=user;
-    s->cfg = ulcnet_example_unit_config();
+    if (ulcnet_grid_make(&s->grid, &k_grids[s->grid_index]) != ULCNET_GRID_OK) return 1;
+    s->cfg = ulcnet_example_unit_config(&s->grid);
     s->bp = mcab_sample_beam_default_params();
     s->cfg.delay_mode = s->profile.mode;
     s->cfg.delay_num_filters = s->profile.num_filters;
@@ -138,7 +168,7 @@ static int ulc_setup(void *user, McabSampleHopView *view) {
 
     /* Print the resolved profile with the pools the same config costs; query and init
      * must agree on one (sample_rate, hop, n). */
-    s->stage_bytes = ulcnet_nn_stage_mem_size(0);
+    s->stage_bytes = ulcnet_nn_stage_mem_size(&s->grid, 0);
     if (mcab_get_mem_requirements(&s->cfg, &s->req) != 0 ||
         mcab_sample_flow_get_mem_size(&s->cfg, &s->flow_bytes) != 0 ||
         mcab_sample_beam_get_mem_size(&s->cfg, &s->bp, &s->beam_bytes) != 0 ||
@@ -150,6 +180,8 @@ static int ulc_setup(void *user, McabSampleHopView *view) {
                 s->profile.fixed_samples);
         return 1;
     }
+    printf("4ch_alignulcnet: grid %d Hz / fft %d / hop %d\n", s->grid.sample_rate,
+           s->grid.n_fft, s->grid.hop);
     printf("4ch_alignulcnet: delay profile mode=%s n=%d fixed_delay=%d "
            "(one shared estimator) -> unit pool %llu bytes (align %lu) + stage pool %zu bytes\n",
            example_cli_delay_mode_name(s->profile.mode), s->profile.num_filters,
@@ -158,18 +190,18 @@ static int ulc_setup(void *user, McabSampleHopView *view) {
            (unsigned long)s->req.alignment, s->stage_bytes);
 
     /* The board loads this descriptor from the exported model metadata. */
-    if (ulcnet_model_io_descriptor_default(
-            ULCNET_EXAMPLE_DELAY_FRAMES, &s->model_descriptor) != 0 ||
+    if (ulcnet_model_io_descriptor_default(&s->grid, &s->model_descriptor) != 0 ||
         ulcnet_accelerator_adapter_get_mem_size(
             &s->model_descriptor, &s->adapter_bytes, &s->adapter_alignment) != 0 ||
         posix_memalign(&s->adapter_pool, s->adapter_alignment, s->adapter_bytes) != 0) {
         return 1;
     }
     printf("%s: model I/O D=%d -> accelerator adapter pool %zu bytes (align %zu)\n",
-           view->program, ULCNET_EXAMPLE_DELAY_FRAMES, s->adapter_bytes,
+           view->program, s->grid.delay_depth, s->adapter_bytes,
            s->adapter_alignment);
+    /* NULL state: a board's accelerator holds the recurrent state. */
     s->adapter = ulcnet_accelerator_adapter_init(
-        s->adapter_pool, s->adapter_bytes, &s->model_descriptor,
+        s->adapter_pool, s->adapter_bytes, &s->model_descriptor, NULL,
         run_accelerator, NULL);
     if (!s->adapter) return 1;
 
@@ -184,10 +216,10 @@ static int ulc_setup(void *user, McabSampleHopView *view) {
                                 s->beam_bytes, &s->cfg, &s->bp, s->objs.flow)
         : NULL;
     s->stage = s->stage_pool
-        ? ulcnet_nn_stage_init(s->stage_pool, s->stage_bytes, 0) : NULL;
+        ? ulcnet_nn_stage_init(s->stage_pool, s->stage_bytes, &s->grid, 0) : NULL;
     if (!s->unit || !s->stage ||
-        mcab_hop_size(s->objs.flow) != ULCNET_HOP ||
-        mcab_n_freqs(s->objs.flow) != ULCNET_BINS) {
+        mcab_hop_size(s->objs.flow) != s->grid.hop ||
+        mcab_n_freqs(s->objs.flow) != s->grid.n_bins) {
         return 1;
     }
 
@@ -197,7 +229,11 @@ static int ulc_setup(void *user, McabSampleHopView *view) {
         return 1;
     }
 
-    view->hop=ULCNET_HOP; view->microphones=s->microphones;
+    s->microphones = calloc((size_t)s->grid.hop * MCAB_CHANNELS, sizeof(float));
+    s->far = calloc((size_t)s->grid.hop, sizeof(float));
+    s->output = calloc((size_t)s->grid.hop, sizeof(float));
+    if (!s->microphones || !s->far || !s->output) return 1;
+    view->hop=s->grid.hop; view->microphones=s->microphones;
     view->reference=s->far; view->output=s->output; view->check_finite=1;
     return 0;
 }
@@ -236,6 +272,7 @@ static void ulc_cleanup(void *user) {
     mcab_sample_beam_destroy(s->unit);
     mcab_sample_flow_destroy(&s->objs);
     free(s->unit_pool); free(s->stage_pool); free(s->adapter_pool);
+    free(s->microphones); free(s->far); free(s->output);
 }
 int main(int argc, char **argv) {
     UlcSample sample={0};

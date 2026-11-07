@@ -54,46 +54,63 @@ Early stopping is disabled; validation continues to select `*_best.pth`.
 ## C deployment boundary
 
 `deepvqe_prepost.h/.c` is the integrator's entry point: one opaque
-`DeepVqePrepost` composing the shared `aiaec_process.c` STFT and the
-`deepvqe_process.c` CCM kernel; in `DEEPVQE_IO_TIME` the synthesis is the application's
-audiolib `AcIstft` (`cfg.istft`, built from `deepvqe_framing_config()`). The lifecycle and per-hop sequence shared by every
-class are described once, in `../README.md` ("C pre/post-processing").
+`DeepVqePrepost` that takes the microphone and far spectra and composes the
+`deepvqe_process.c` CCM kernel. It is frequency domain only. The application
+frames with audiolib: one `AcStft` per stream and one `AcIstft` for the output,
+all from `ac_stft_config_default(&sc, grid.n_fft)` (sqrt-Hann, center 0,
+`spec_scale` = `ispec_scale` = 1) with `ola = AC_OLA_ENV_NORM`; one frame per hop
+from the first hop, no latency beyond it. The grid is a run-time value: a
+`DeepVqeGridSpec` (`sample_rate`, `n_fft`, `delay_depth`) goes through
+`deepvqe_grid_make()`. D has no default: the application passes the D its model
+was exported with (accepted 1..256, a sanity range only; the pool size does not
+depend on it). The lifecycle and per-hop sequence shared by every class are
+described once, in `../README.md` ("C pre/post-processing").
 Specific to this one: the accelerator boundary is the exporter's exactly --
 power-law compressed `mic`/`far` in (planar `[1,2,1,F]`, real plane then
 imaginary plane), packed CCM taps `[1,1,F,18]` out, and the sixteen explicit
 rank-4 state tensors in `DeepVqeStateId` order (conv windows of 4 frames, the
 alignment score window of 5, attention rings of D, `h_gru` `[1,1,1,192]`). The compression
 (`x * |x|^(0.3-1)`, `|x| = sqrt(re^2 + im^2 + 1e-12)`) runs on the host in
-`deepvqe_prepost_frame_inputs()`, so the graph starts at its first convolution;
+`deepvqe_prepost_frame_open()`, so the graph starts at its first convolution;
 the class keeps the raw microphone spectrum separately for the CCM ring. The
 exponent is compiled into the host (`DEEPVQE_COMPRESSION_EXP`) and the
 exporter refuses a checkpoint whose `compression_exponent` differs. The taps'
 last axis preserves `[time][frequency][RI]` row-major order, so C consumes it
-without a transpose or copy. The pool holds one host buffer per state tensor.
+without a transpose or copy.
+The sixteen state tensors belong to the application and the library knows none
+of their shapes. A float host registers a buffer and an element count for each
+(`DeepVqePrepostConfig.state[]` / `state_elements[]`, all sixteen or none; zeroed
+at init and reset); a board registers nothing and its accelerator holds them.
 Every state comes back from the graph as a full window with its input's shape
 (a Slice on the input window drops one frame and the new frame is
 concatenated, so no state output is produced by a Slice), and the runtime
-binds each `*_out` output to the pointer `frame_inputs` returned for its state
-input; the host copies and swaps nothing, and the runtime must finish reading
-every state input before it writes any state output at that address.
-`frame_commit` validates (every tap, `h_gru`, and the newest frame of every
-window: slot 0 of an attention ring, the last frame of a conv or score window)
-and advances the CCM ring; on a non-finite value it zeroes all sixteen state
-tensors, since the write cannot be rolled back, and
+binds each `*_out` output to the address of its state input, which
+`frame_open` returns (NULL and 0 elements when nothing is registered); the host
+copies and swaps nothing, and the runtime must finish reading every state input
+before it writes any state output at that address.
+`frame_finish` validates every tap and, when state is registered, every element
+of every registered buffer, older frames of a window included, and advances the
+CCM ring; on a non-finite value it zeroes the registered buffers, since the
+write cannot be rolled back, the ring is not pushed, and
 `deepvqe_prepost_state_generation()` advances (it also advances on
-`deepvqe_prepost_reset`) so a board with fixed-point accelerator state can
-refill it with quantized zeros. `frame_skip` leaves the state as the
+`deepvqe_prepost_reset`, and is 0 after init). A board with fixed-point
+accelerator state loads quantized zeros at start and whenever the value differs
+from the one it last saw. `frame_bypass` leaves the state as the
 accelerator wrote it and FAILS CLOSED (mutes the frame): stream 0 is the raw
 microphone, so the pass-through identity a post-filter can take would emit the
 uncancelled echo here.
 
 The exporter writes `state_layout_version` (`DEEPVQE_PREPOST_LAYOUT_VERSION`,
-currently 4; the exporter's `DEEPVQE_C_LAYOUT_VERSION` is the same number) and
-a `c_descriptor` block measured from the built graph into the ONNX
-metadata and the sidecar JSON; a board feeds that block to
-`deepvqe_prepost_descriptor_validate()` before binding. The class gate is
-`../tests/test_deepvqe_prepost_c.py`, which also pins the header, the exporter
-table and the graph's state shapes to each other.
+currently 4; the exporter's `DEEPVQE_C_LAYOUT_VERSION` in
+`AIAEC/_streaming_export.py` is the same number) and a `c_descriptor` block
+measured from the built graph into the ONNX metadata and the sidecar JSON; a
+board feeds that block to `deepvqe_prepost_descriptor_validate(&grid, &descriptor)`
+before binding. Every external field except `delay_depth` (range-checked only)
+must equal the contract for the application's grid; the window and GRU fields
+are the model's and the library never uses them. The class gate is
+`../tests/test_deepvqe_prepost_c.py`, which also pins the header's layout
+version and state names to the exporter, and the graph's state shapes to the
+test driver's state table.
 
 ## ONNX and calibration
 

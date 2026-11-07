@@ -79,8 +79,8 @@ python3 AIAEC/Align_CRUSE/inference.py calib --checkpoint checkpoint.pth \
 <h3>C. 部署契約（以現有零件組成；沒有對應的 C 類別與測試）</h3>
 <ol>
 <li>graph 輸入：<code>mic</code>、<code>far</code>（各 <code>[1,1,257,2]</code>，未正規化 RI 頻譜）加 11 個 state；輸出：<code>output</code>（<code>[1,1,257]</code> mask）與 11 個 <code>*_out</code>，每個與同名輸入同 shape，由 runtime 綁在同一個位址。</li>
-<li>host 前端：audiolib 的 sqrt-Hann STFT（512/512/256）把 mic 與 far 轉成頻譜，排成 <code>[bin][re,im]</code> 餵圖；<b>圖內自己做 log-power</b>，C 端不做壓縮。</li>
-<li>host 後端：<code>aiaec_apply_real_mask(mic_re, mic_im, mask, out_re, out_im)</code>，再經 <code>AcIstft</code> 合成。</li>
+<li>host 前端：應用端以 audiolib 建立的 <code>AcStft</code>（sqrt-Hann，512/512/256）把 mic 與 far 轉成頻譜，排成 <code>[bin][re,im]</code> 餵圖；<b>圖內自己做 log-power</b>，C 端不做壓縮。</li>
+<li>host 後端：<code>aiaec_apply_real_mask(mic_re, mic_im, mask, out_re, out_im, n_bins)</code>，再經 <code>AcIstft</code> 合成。</li>
 <li>匯出 metadata 沒有 <code>state_layout_version</code> 與 <code>c_descriptor</code>（缺席就是「C 端沒有綁定這個模型」）；<code>state_binding</code> 為 <code>in_place_same_address</code>。</li>
 </ol>
 

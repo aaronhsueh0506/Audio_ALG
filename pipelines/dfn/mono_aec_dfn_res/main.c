@@ -48,15 +48,15 @@
 #include <stdlib.h>
 #include <string.h>
 
-/* Capacity of the ERB matrices (the library's largest grid) and of the host hop buffers (48 kHz,
- * FFT 1024: the largest host grid HOST_RATES offers). */
+/* Host hop buffers: the largest host hop HOST_RATES offers (48 kHz, FFT 1024). */
 #define HOST_MAX_HOP 512
-static float g_erb_fwd[DFN2_MAX_N_BINS * DFN2_MAX_N_ERB];
-static float g_erb_inv[DFN2_MAX_N_ERB * DFN2_MAX_N_BINS];
 
-/* Replace with the board runtime call. `inputs` carries the feature windows and the
- * CPU-owned recurrent state; fill every tensor in `outputs` and return 0. A nonzero
- * return takes the frame as the identity (dfn_res_stage.h). */
+/* Replace with the board runtime call. `inputs` carries the feature windows; the recurrent state
+ * is the accelerator's own (its views are NULL/0 here), bound input to output in place and
+ * refilled with quantized zeros whenever dfn_res_stage_state_generation() (through the bridge,
+ * dfn_rate_bridge_state_generation()) changes, which includes the end of each warm-up frame (the
+ * first mask_lookahead hops run the model like any other; their heads are discarded). Fill the heads
+ * in `outputs` and return 0. A nonzero return takes the frame as the identity (dfn_res_stage.h). */
 static int run_accelerator(void *user, const DFN2PrepostInputs *inputs,
                            DFN2PrepostOutputs *outputs) {
     (void)user;
@@ -98,9 +98,11 @@ typedef struct Plan {
     size_t total;
 } Plan;
 
-static int make_plan(const DfnExampleArgs *args, const DFN2Model *model, Plan *p) {
+static int make_plan(const DfnExampleArgs *args, const DfnExampleErb *erb,
+                     const DFN2Model *model, Plan *p) {
     memset(p, 0, sizeof(*p));
-    if (derive_lane(args, &p->grid, &p->aec_cfg) != 0) return -1;
+    if (derive_lane(args, &p->grid, &p->aec_cfg) != 0 || p->grid.hop_size > HOST_MAX_HOP)
+        return -1;
 
     /* No denoiser, RES gain only; the comfort-noise fill is the program's switch. E and P must
      * share a phase for the DFN2 stage, so it is off unless asked for. */
@@ -110,8 +112,8 @@ static int make_plan(const DfnExampleArgs *args, const DFN2Model *model, Plan *p
 
     p->dfn.stage_cfg = dfn_res_stage_default_config(&args->model_grid);
     p->dfn.stage_cfg.atten_lim_db = args->atten_lim_db;
-    p->dfn.stage_cfg.erb_fwd = g_erb_fwd;
-    p->dfn.stage_cfg.erb_inv = g_erb_inv;
+    p->dfn.stage_cfg.erb_fwd = erb->fwd;
+    p->dfn.stage_cfg.erb_inv = erb->inv;
     p->dfn.stage_cfg.model = *model;
 
     p->aec_bytes = aec_get_mem_size(&p->aec_cfg);
@@ -227,6 +229,7 @@ static int rig_process(Rig *r, const float *mic, const float *ref, float *out) {
 int main(int argc, char **argv) {
     static const char *name = "mono_aec_dfn_res";
     DfnExampleArgs args;
+    DfnExampleErb erb;
     DFN2Model model;
     DFN2ModelIoDescriptor descriptor;
     Plan plan;
@@ -234,30 +237,30 @@ int main(int argc, char **argv) {
     static float mic[HOST_MAX_HOP];
     static float far[HOST_MAX_HOP];
     static float output[HOST_MAX_HOP];
-    int hop, index, rc, hop_size, latency;
+    int hop, index, rc, hop_size, latency, status = 1;
 
     rc = dfn_example_parse_args(argc, argv, name, HOST_RATES, &args);
     if (rc != 0) return rc == 1 ? 0 : rc;
-    if (dfn_example_load_matrices(&args, g_erb_fwd, g_erb_inv, name) != 0)
+    if (dfn_example_load_matrices(&args, &erb, name) != 0)
         return 1;
 
-    /* dfn2_model_io_descriptor_default() describes the model grid (args.model_grid) and the
-     * graph geometry this build runs and does not inspect the model; a product fills the
-     * descriptor from its model's exported metadata. */
-    if (dfn2_model_io_descriptor_default(&args.model_grid, &descriptor) != 0) return 1;
+    /* dfn2_model_io_descriptor_default() fills the external fields for the model grid
+     * (args.model_grid) and does not inspect the model; the interior fields stay 0 and are never
+     * read. A product fills the descriptor from its model's exported metadata. */
+    if (dfn2_model_io_descriptor_default(&args.model_grid, &descriptor) != 0) goto done;
     memset(&model, 0, sizeof(model));
     model.user = NULL;
     model.infer = run_accelerator;
     model.reset = NULL;
     model.io_descriptor = &descriptor;
 
-    if (make_plan(&args, &model, &plan) != 0) {
+    if (make_plan(&args, &erb, &model, &plan) != 0) {
         fprintf(stderr, "%s: pool query rejected the configuration "
                 "(host %d Hz, model grid %d Hz / FFT %d, mode=%s n=%d fixed_delay=%d)\n", name,
                 args.sample_rate, args.model_grid.sample_rate, args.model_grid.n_fft,
                 example_cli_delay_mode_name(args.delay_mode),
                 args.delay_num_filters, args.fixed_delay_samples);
-        return 1;
+        goto done;
     }
     printf("%s: host %d Hz, delay profile mode=%s n=%d fixed_delay=%d cng=%d "
            "atten_lim=%.1f dB -> pool %llu bytes (align %lu), model weights "
@@ -273,12 +276,12 @@ int main(int argc, char **argv) {
 
     if (rig_build(&rig, &plan) != 0) {
         fprintf(stderr, "%s: pipeline init failed\n", name);
-        return 1;
+        goto done;
     }
     hop_size = plan.grid.hop_size;
     /* Host WOLA hop plus the bridge's added delay, or the model's lookahead hops plus the
      * host hop on the stage path. */
-    DFN2_REQUIRE_VARIANT_LINK();   /* this unit's DFN2 capacities are the archive's */
+    DFN2_REQUIRE_VARIANT_LINK();   /* this unit's DFN2 variant is the archive's */
     latency = plan.dfn.use_bridge
         ? hop_size + dfn_rate_bridge_added_delay_samples(rig.bridge)
         : (dfn_res_stage_lookahead_frames(&args.model_grid) + 1) * args.model_grid.hop;
@@ -289,16 +292,19 @@ int main(int argc, char **argv) {
         if (rig_process(&rig, mic, far, output) != 0) {
             rig_reset(&rig);
             rig_free(&rig);
-            return 1;
+            goto done;
         }
         for (index = 0; index < hop_size; ++index) {
             if (!isfinite(output[index])) {
                 rig_free(&rig);
-                return 1;
+                goto done;
             }
         }
     }
     rig_free(&rig);
     printf("%s: fail-open board skeleton PASS\n", name);
-    return 0;
+    status = 0;
+done:
+    dfn_example_erb_free(&erb);
+    return status;
 }

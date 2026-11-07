@@ -1,26 +1,40 @@
-/* DeepVQE-S CCM post-processing on the AIAEC grid (aiaec_process.h). */
+/* DeepVQE-S CCM post-processing: the head's complex taps applied to a ring of the last
+ * DEEPVQE_TIME_ORDER raw microphone spectra; the spectra hold n_bins values (the caller's grid). */
 #ifndef DEEPVQE_PROCESS_H
 #define DEEPVQE_PROCESS_H
 
-#include "aiaec_process.h"
+#ifdef __cplusplus
+extern "C" {
+#endif
 
 #define DEEPVQE_TIME_ORDER 3
 #define DEEPVQE_FREQ_TAPS  3
 
+/* The two rings are borrowed (they must outlive the state), DEEPVQE_TIME_ORDER * n_bins floats
+ * each (real, imaginary), newest spectrum first. */
 typedef struct DeepVqeCcmState {
-    float spectrum_re[DEEPVQE_TIME_ORDER][AIAEC_N_BINS];
-    float spectrum_im[DEEPVQE_TIME_ORDER][AIAEC_N_BINS];
+    int    n_bins;
+    float *spectrum_re;
+    float *spectrum_im;
 } DeepVqeCcmState;
 
-void deepvqe_ccm_init(DeepVqeCcmState *state);
+/* Bind the rings and zero them. Returns 0, or -1 on NULL or n_bins < 3. */
+int deepvqe_ccm_init(DeepVqeCcmState *state, int n_bins,
+                     float *spectrum_re, float *spectrum_im);
 
-/* taps layout: [bin][time_order current-to-past][freq -1,0,+1][re,im]. */
-void deepvqe_ccm_process(
-    DeepVqeCcmState *state,
-    const float input_re[AIAEC_N_BINS],
-    const float input_im[AIAEC_N_BINS],
-    const float taps[AIAEC_N_BINS][DEEPVQE_TIME_ORDER][DEEPVQE_FREQ_TAPS][2],
-    float output_re[AIAEC_N_BINS],
-    float output_im[AIAEC_N_BINS]);
+/* Zero both rings; n_bins and the pointers stay. NULL or an unbound state is ignored. */
+void deepvqe_ccm_reset(DeepVqeCcmState *state);
+
+/* Push the input spectrum into the ring and write the convolved spectrum. `taps` is
+ * [bin][time_order current-to-past][freq -1,0,+1][re,im], flat; the outputs must not alias
+ * the ring, the input or the taps. A NULL argument or an unbound state is ignored. */
+void deepvqe_ccm_process(DeepVqeCcmState *state,
+                         const float *input_re, const float *input_im,
+                         const float *taps,
+                         float *output_re, float *output_im);
+
+#ifdef __cplusplus
+}
+#endif
 
 #endif

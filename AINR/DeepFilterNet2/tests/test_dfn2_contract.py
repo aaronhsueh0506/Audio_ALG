@@ -359,62 +359,69 @@ def test_stateless_export_df_pathway_cache_is_live():
     assert (proper - broken).abs().max().item() > 1e-6
 
 
-def test_c_model_io_layout_constants_match_the_shipped_export_shapes():
-    """dfn2_model_io.h's struct dimensions ARE the graph's state shapes.
+def grid_header_macros(*flags):
+    """The integer macros of ``tests/dfn2_test_grid.h`` as the preprocessor resolves them: the
+    test programs' table of the shipped model (order, normalisers, state shapes), which the
+    library does not hold."""
+    out = subprocess.run(
+        ['cc', '-E', '-dM', '-x', 'c', '-I', str(ROOT_PATH.parent), '-I', str(ROOT_PATH),
+         '-I', str(dfn_pairs.AUDIO_COMMON / 'include'), '-I', str(dfn_pairs.AUDIO_COMMON),
+         *flags, str(ROOT_PATH.parent / 'tests' / 'dfn2_test_grid.h')],
+        check=True, capture_output=True, text=True).stdout
+    macros = {}
+    for name, value in re.findall(r'^#define\s+(DFN2_\w+)\s+(.+?)\s*$', out, re.M):
+        try:
+            macros[name] = int(value.strip('()'))
+        except ValueError:
+            pass
+    return macros
 
-    The header hard-codes every tensor extent the accelerator hands back that
-    does not depend on the grid (window depth, GRU rows and width, encoder
-    channels, pathway window). Nothing else compares them to the model the
-    exporter actually builds from the shipped config, so an emb_hidden_dim or
-    enc_ch edit would silently leave the C side allocating the wrong buffers --
-    the graph would still export and only a board would find out. The two grid
-    extents (bands, deep-filter bins) are the application's, not the library's:
-    the shipped values are the ones config.ini says.
-    """
-    header = model_io_header()
+
+def test_the_test_table_of_state_shapes_matches_the_shipped_export_shapes():
+    """The recurrent-state shapes the C test programs register (``tests/dfn2_test_grid.h``:
+    GRU rows and width, pathway channels and window) ARE the graph's state shapes.
+
+    The library knows none of them (the application registers element counts), so the
+    table is the test programs' own. Nothing else compares it to the model the exporter
+    actually builds from the shipped config, so an emb_hidden_dim or enc_ch edit would
+    silently leave the C tests running other buffers -- the graph would still export and
+    only a board would find out. The two grid extents (bands, deep-filter bins) are the
+    application's too: the shipped values are the ones config.ini says. The mask-only
+    table is the encoder and ERB rows only and has no pathway window."""
+    macros = grid_header_macros()
     cfg = load_config()
-    frames = c_macro(header, 'DFN2_MODEL_INPUT_FRAMES')
-    hidden = c_macro(header, 'DFN2_MODEL_GRU_HIDDEN')
+    frames = c_macro((ROOT_PATH / 'dfn2_grid.h').read_text(encoding='utf-8'),
+                     'DFN2_MODEL_INPUT_FRAMES')
     n_erb = cfg.getint('model', 'n_erb')
     df_bins = cfg.getint('model', 'df_bins')
     assert frames == INPUT_FRAMES, (
         'the C window depth and the exporter window depth are one contract'
     )
-    layers = (c_macro(header, 'DFN2_MODEL_ENCODER_GRU_LAYERS'),
-              c_macro(header, 'DFN2_MODEL_ERB_GRU_LAYERS'),
-              c_macro(header, 'DFN2_MODEL_DF_GRU_LAYERS'))
-    assert layers == (1, 2, 2)
-    rows = c_macro(header, 'DFN2_MODEL_GRU_ROWS')
-    assert rows == sum(layers)
-    assert (c_macro(header, 'DFN2_MODEL_GRU_ROW_ENCODER'),
-            c_macro(header, 'DFN2_MODEL_GRU_ROW_ERB'),
-            c_macro(header, 'DFN2_MODEL_GRU_ROW_DF')) == (
-        0, layers[0], layers[0] + layers[1]), (
+    model = build_shipped_model(load_config()).eval()
+    wrapper = StatelessDFN2Heads(model)
+    slices = tuple((name, start, stop) for name, start, stop in wrapper.gru_state_slices)
+    rows = slices[-1][2]
+    assert [name for name, _s, _e in slices] == ['h_encoder', 'h_erb', 'h_df']
+    assert macros['DFN2_TEST_GRU_ROWS'] == rows
+    assert (macros['DFN2_TEST_GRU_ROW_ENCODER'], macros['DFN2_TEST_GRU_ROW_ERB'],
+            macros['DFN2_TEST_GRU_ROW_DF']) == tuple(start for _n, start, _s in slices), (
         'row offsets are the exporter slice starts')
 
-    model = build_shipped_model(load_config()).eval()
     expected = (
         (1, 1, frames, n_erb),
         (1, 2, frames, df_bins),
-        (1, rows, 1, hidden),
-        (1, c_macro(header, 'DFN2_MODEL_ENCODER_CHANNELS'),
-         c_macro(header, 'DFN2_MODEL_DF_PATHWAY_WINDOW'), df_bins),
+        (1, rows, 1, macros['DFN2_TEST_GRU_HIDDEN']),
+        (1, macros['DFN2_TEST_CONVP_CHANNELS'], macros['DFN2_TEST_CONVP_WINDOW'], df_bins),
     )
     actual = tuple(
         tuple(int(size) for size in value.shape)
         for value in streaming_export_inputs(model)
     )
     assert actual == expected
-    wrapper = StatelessDFN2Heads(model)
-    assert tuple(
-        (name, start, stop) for name, start, stop in wrapper.gru_state_slices
-    ) == (
-        ('h_encoder', c_macro(header, 'DFN2_MODEL_GRU_ROW_ENCODER'),
-         c_macro(header, 'DFN2_MODEL_GRU_ROW_ERB')),
-        ('h_erb', c_macro(header, 'DFN2_MODEL_GRU_ROW_ERB'),
-         c_macro(header, 'DFN2_MODEL_GRU_ROW_DF')),
-        ('h_df', c_macro(header, 'DFN2_MODEL_GRU_ROW_DF'), rows),
-    )
+
+    mask_only = grid_header_macros('-DDFN2_MASK_ONLY')
+    assert mask_only['DFN2_TEST_GRU_ROWS'] == macros['DFN2_TEST_GRU_ROW_DF']
+    assert mask_only['DFN2_TEST_CONVP_WINDOW'] == 0
 
 
 def _small_dfn2(mask_lookahead=1, df_lookahead=1):
@@ -652,33 +659,42 @@ int main(void) {
            "stft_unscale=%.9g\n", (double)g->erb_norm_alpha,
            (double)g->spec_norm_alpha, (double)g->stft_scale,
            (double)g->stft_unscale);
-    printf("df_order=%d max_n_fft=%d max_n_erb=%d max_df_bins=%d "
-           "max_df_ring=%d max_mask=%d max_df=%d\n", DFN2_DF_ORDER,
-           DFN2_MAX_N_FFT, DFN2_MAX_N_ERB, DFN2_MAX_DF_BINS, DFN2_MAX_DF_RING,
-           DFN2_MAX_MASK_LOOKAHEAD, DFN2_MAX_DF_LOOKAHEAD);
+    printf("df_order=%d frames=%d erb_tau=%.9g erb_lo=%.9g erb_hi=%.9g "
+           "erb_scale=%.9g spec_tau=%.9g spec_lo=%.9g spec_hi=%.9g\n",
+           g->df_order, g->frames_per_call, (double)g->erb_norm_tau_sec,
+           (double)g->erb_norm_init_lo_db, (double)g->erb_norm_init_hi_db,
+           (double)g->erb_norm_scale_db, (double)g->spec_norm_tau_sec,
+           (double)g->spec_norm_init_lo, (double)g->spec_norm_init_hi);
     return 0;
 }
 """
 
 # argv: sample_rate n_fft n_erb df_bins. One line per (mask, df) probed: the
 # pair and the status dfn2_grid_make returns for it; the first line names the
-# two statuses the tests compare against.
+# OK status the tests compare against. The order and normalisers are the
+# shipped model's, the test table of tests/dfn2_test_grid.h.
 _PAIR_PROBE = r"""
 #include <stdio.h>
 #include <stdlib.h>
 
-#include "DeepFilterNet2/dfn2_grid.h"
+#include "dfn2_test_grid.h"
 
 int main(int argc, char **argv) {
+    DFN2GridSpec spec = dfn2_test_grid_spec();
     DFN2Grid g;
     int mask, df;
     if (argc != 5) return 2;
-    printf("OK=%d CAPACITY=%d\n", DFN2_GRID_OK, DFN2_GRID_ERR_CAPACITY);
+    spec.sample_rate = atoi(argv[1]);
+    spec.n_fft = atoi(argv[2]);
+    spec.n_erb = atoi(argv[3]);
+    spec.df_bins = atoi(argv[4]);
+    printf("OK=%d\n", DFN2_GRID_OK);
     for (mask = -1; mask <= 3; ++mask)
-        for (df = -1; df <= 5; ++df)
-            printf("%d %d %d\n", mask, df,
-                   dfn2_grid_make(&g, atoi(argv[1]), atoi(argv[2]),
-                                  atoi(argv[3]), atoi(argv[4]), mask, df));
+        for (df = -1; df <= 5; ++df) {
+            spec.mask_lookahead = mask;
+            spec.df_lookahead = df;
+            printf("%d %d %d\n", mask, df, dfn2_grid_make(&g, &spec));
+        }
     return 0;
 }
 """
@@ -754,7 +770,13 @@ def test_the_default_test_grid_is_the_grid_and_pair_config_ini_names(c_probe):
         model_cfg['df_bins'], mask, df)
     assert got['history'] == df_order - df - 1
     assert got['ring'] == max(df_order, mask + df + 1)
-    assert got['df_order'] == df_order
+    assert got['df_order'] == df_order and got['frames'] == 1
+    # the seven normaliser settings of the test table are config.ini [feature]
+    assert tuple(np.float32(got[key]) for key in (
+        'erb_tau', 'erb_lo', 'erb_hi', 'erb_scale', 'spec_tau', 'spec_lo', 'spec_hi')) == tuple(
+        np.float32(feature_cfg[key]) for key in (
+            'erb_tau_sec', 'erb_init_lo_db', 'erb_init_hi_db', 'erb_scale_db',
+            'spec_tau_sec', 'spec_init_lo', 'spec_init_hi'))
     assert np.float32(got['erb_alpha']) == np.float32(feature_cfg['erb_alpha'])
     assert np.float32(got['spec_alpha']) == np.float32(
         feature_cfg['spec_alpha'])
@@ -778,25 +800,6 @@ def test_the_default_test_grid_follows_its_overrides(c_probe):
     assert preset['sr'] != shipped['sr']
 
 
-def test_the_library_capacities_cover_config_and_the_model_pair_bounds(
-        c_probe):
-    """The compile-time bounds of the library (``dfn2_grid.h``) are not a
-    grid, but the shipped model has to fit inside them with the default
-    build, and the lookahead bounds are the model's own legal range."""
-    cfg, sr, hop = _config_grid()
-    model_cfg = read_model_config(cfg)
-    got = _report(c_probe)
-    assert got['max_n_fft'] >= cfg.getint('signal', 'n_fft')
-    assert got['max_n_erb'] >= model_cfg['n_erb']
-    assert got['max_df_bins'] >= model_cfg['df_bins']
-    # the default ring holds the shipped pair
-    assert got['max_df_ring'] >= got['ring']
-    # the bounds ARE the legal range the model constructor accepts
-    assert got['max_mask'] == max(m for m, _ in LOOKAHEAD_PAIRS)
-    assert got['max_df'] == max(d for _, d in LOOKAHEAD_PAIRS)
-    assert got['max_df'] == model_cfg['df_order'] - 1
-
-
 def _accepted_pairs(c_probe, flags=()):
     cfg, sr, hop = _config_grid()
     model_cfg = read_model_config(cfg)
@@ -805,40 +808,22 @@ def _accepted_pairs(c_probe, flags=()):
         (sr, cfg.getint('signal', 'n_fft'), model_cfg['n_erb'],
          model_cfg['df_bins'])).splitlines()
     names = dict(item.split('=') for item in lines[0].split())
-    ok, capacity = int(names['OK']), int(names['CAPACITY'])
-    accepted, over_capacity = [], []
+    ok = int(names['OK'])
+    accepted, refused = [], []
     for line in lines[1:]:
         mask, df, status = map(int, line.split())
-        if status == ok:
-            accepted.append((mask, df))
-        elif status == capacity:
-            over_capacity.append((mask, df))
-    return accepted, over_capacity
+        (accepted if status == ok else refused).append((mask, df))
+    return accepted, refused
 
 
 def test_the_grid_constructor_accepts_exactly_the_models_legal_pairs(c_probe):
     """``dfn2_grid_make`` and ``DeepFilterNet2.__init__`` state the same rule
-    (mask in [0, 2], df in [0, df_order - 1], independent). With the ring
-    capacity raised to the deepest pair's (mask 2 + df 4 + 1 = 7) the library
-    accepts all 15 pairs and nothing else; the default build refuses, as a
-    capacity error, exactly the pairs whose ring max(df_order, mask + df + 1)
-    exceeds the capacity (five frames by default)."""
-    deepest = max(m + d + 1 for m, d in LOOKAHEAD_PAIRS)
-    assert deepest == 7
-    accepted, over_capacity = _accepted_pairs(
-        c_probe, ('-DDFN2_MAX_DF_RING=%d' % deepest,))
+    (mask in [0, 2], df in [0, df_order - 1], independent): the library accepts all
+    15 pairs and nothing else, with no bound on the ring."""
+    accepted, refused = _accepted_pairs(c_probe)
     assert sorted(accepted) == sorted(LOOKAHEAD_PAIRS)
-    assert over_capacity == []
-
-    df_order = read_model_config(load_config())['df_order']
-    ring_capacity = int(_report(c_probe)['max_df_ring'])
-    accepted, over_capacity = _accepted_pairs(c_probe)
-    fits = [pair for pair in LOOKAHEAD_PAIRS
-            if max(df_order, pair[0] + pair[1] + 1) <= ring_capacity]
-    assert sorted(accepted) == sorted(fits)
-    assert sorted(over_capacity) == sorted(set(LOOKAHEAD_PAIRS) - set(fits))
-    assert 0 < len(over_capacity) < len(LOOKAHEAD_PAIRS)
-    assert dfn_pairs.shipped_pair('DeepFilterNet2') in accepted
+    assert len(LOOKAHEAD_PAIRS) == 15
+    assert len(refused) == 7 * 5 - 15
 
 
 def test_changing_the_lookahead_pair_of_a_checkpoint_asks_for_retraining():
@@ -1609,7 +1594,7 @@ def test_fixed_batch_bin_contains_every_lane(tmp_path):
 def test_runtime_erb_bins_are_a_bitwise_partition_of_unity(tmp_path):
     """The erb_inv.bin the C host loads must expand a unit band mask to
     exactly 1.0f per bin in df_common_expand_mask's accumulation order --
-    dfn2_prepost_frame_skip's identity, and every host identity gate built
+    dfn2_prepost_frame_bypass's identity, and every host identity gate built
     on it, is exact only under that property. The runtime exporter refuses
     to write a matrix that breaks it, and the check itself must be able to
     fail."""

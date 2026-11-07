@@ -132,7 +132,7 @@ hop-lag：端到端 256 samples（16 ms）＝ centered 半窗 lookahead；NN 本
 
 <h2>State 表</h2>
 <p><code>state_report</code> 實測（B=1 fp32，total <b>469.9 KB</b>；conv 與 CATA 時間卷積的 window 是完整 window,含新的一幀）。部署契約：顯式
-state I/O，由 host caller 保存；STFT/ISTFT 屬 C struct 層：</p>
+state I/O，由 host caller 保存；STFT/ISTFT 屬應用端以 audiolib 建立的 <code>AcStft</code>／<code>AcIstft</code>：</p>
 <table>
 <tr><th>state</th><th>shape</th><th>size</th><th>保存者（部署契約）</th></tr>
 <tr><td>cata_ring.ring（延遲 far 特徵）</td><td>(1, 24, 63, 49)</td><td>289.4 KB</td><td>host caller（顯式 graph I/O）</td></tr>
@@ -144,7 +144,7 @@ state I/O，由 host caller 保存；STFT/ISTFT 屬 C struct 層：</p>
 <tr><td>tfag_time1 / tfag_time2 .window</td><td>(1,12,5,25) / (1,12,9,25)</td><td>5.9 / 10.5 KB</td><td>host caller（顯式 graph I/O）</td></tr>
 <tr><td>dec0..3_group.window</td><td>(1,24,9,25) / (1,12,5,25) / (1,12,3,49) / (1,12,3,97)</td><td>21.1 / 5.9 / 6.9 / 13.6 KB</td><td>host caller（顯式 graph I/O）</td></tr>
 <tr><td><b>NN 合計</b></td><td></td><td><b>469.9 KB</b></td><td></td></tr>
-<tr><td>STFT×2 / ISTFT 狀態</td><td>—</td><td>—</td><td>C struct（Python reference：host）</td></tr>
+<tr><td>STFT×2 / ISTFT 狀態</td><td>—</td><td>—</td><td>應用端的 <code>AcStft</code>×2／<code>AcIstft</code>（Python reference：host）</td></tr>
 </table>
 <p>LayerNorm ×4 只作用在 channel 軸（無跨時間統計）；可學 delay window
 （<code>raw_window</code>）在推論期為常數，已在 <code>create_stream_state()</code> 內以

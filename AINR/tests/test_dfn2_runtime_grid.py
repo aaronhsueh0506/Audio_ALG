@@ -1,30 +1,29 @@
 """The DFN2 library holds no grid: the run-time grid, proved end to end.
 
-One build of the library serves every grid whose size fits its capacities
-(``DFN2_MAX_N_FFT`` / ``_N_ERB`` / ``_DF_BINS`` / ``_DF_RING``, dfn2_grid.h); the grid is an
-argument. The tests here pin the property that makes that safe, and the identities that keep
-two grids from being mixed up:
+The grid is an argument of every object; one build of the library serves any grid its
+checks accept. The tests here pin the identities that keep two grids from being mixed up
+and the property that the library holds no grid of its own:
 
-  capacity independence  the whole pre/post chain (``dfn2_runtime_grid_chain.c``: DFN2_IO_FREQ
-                         and DFN2_IO_TIME, a stand-in accelerator, refused heads and state,
-                         skipped and unwritten frames) prints the same digests whether the
-                         state is sized for the 48 kHz capacity or tight for the grid under
-                         test, NEON and scalar, full and mask-only. A stride that reads the
-                         capacity instead of the grid breaks it; three such strides are put
-                         into a copy of the library and the comparison goes red.
+  chain                  the whole pre/post chain (``dfn2_runtime_grid_chain.c``: a float host
+                         with registered recurrent state, a stand-in accelerator, refused heads
+                         and state, skipped and unwritten frames) runs on every grid and
+                         lookahead pair, NEON and scalar, full and mask-only, and every one
+                         prints its own digest.
   pool identity          get_mem_size differs between grids, lookahead pairs, full and
-                         mask-only, and either alpha; init_ex refuses a MemReq of another
-                         grid or pair; a descriptor of one grid is refused by the host of
-                         another. The pool size and hash of the shipped 48 kHz 1/1 grid are
-                         pinned.
-  normaliser starts      the pool hash reads dfn2_norm_starts[] of dfn2_process.c, the array
-                         dfn2_state_init() starts the normalisers from: units built with other
-                         starts link and cannot change the hash; process.c alone decides it
+                         mask-only and each normaliser field; init_ex refuses a MemReq of
+                         another grid or pair; a descriptor of one grid is refused by the host
+                         of another. Pool bytes and hash equal an independent Python mirror of
+                         the layout rules (``_PoolMirror``), not a recorded constant.
+  normaliser fields      the seven normaliser settings of the spec are in the pool hash alone
+                         and reach the state ``dfn2_state_init()`` starts
+  registered state       the all-or-none registration rule, the board form (nothing registered:
+                         generation moves as documented, no foreign buffer touched) and the stale
+                         pool gate (a refused init_ex leaves the pool and the state unchanged)
   no grid in the library no dfn2_*.c / .h defines or uses a grid macro (those are the consumer
                          headers' business); the test grid header stands alone and its band-border
                          generator, shared by the C suites, holds on every grid
-  variant link symbol    objects built for mask-only and full, or with other capacities, do not
-                         link; the grid and the pair are not in the symbol
+  variant link symbol    objects built for mask-only and full do not link; the grid and the
+                         pair are not in the symbol
 
 The digests of the shipped grids are printed for the record; they are not pinned, because the
 chain runs log10f / powf of the C library it is linked with.
@@ -32,6 +31,7 @@ chain runs log10f / powf of the C library it is linked with.
 
 import concurrent.futures
 import itertools
+import math
 import re
 import shutil
 import struct
@@ -56,30 +56,8 @@ pytestmark = pytest.mark.skipif(
 
 _MASK = '-DDFN2_MASK_ONLY'
 
-
-def _caps(fft, erb, df, ring):
-    return ['-DDFN2_MAX_N_FFT=%d' % fft, '-DDFN2_MAX_N_ERB=%d' % erb,
-            '-DDFN2_MAX_DF_BINS=%d' % df, '-DDFN2_MAX_DF_RING=%d' % ring]
-
-
-# Library builds of the capacity matrix. 'W' is the default build: sized for the 48 kHz grid
-# (1024 / 32 / 96, ring 5). The 'T' builds are tight for one grid; the 'R7' ones hold the
-# lookahead pairs with a ring of 6 or 7.
-FULL_CONFIGS = {
-    'W': [],
-    'W7': ['-DDFN2_MAX_DF_RING=7'],
-    'T32': _caps(512, 28, 96, 5),
-    'T16': _caps(256, 24, 96, 5),
-    'T16R7': _caps(256, 24, 96, 7),
-    'T16D': _caps(256, 24, 64, 5),
-}
-MASK_CONFIGS = {
-    'MD': [_MASK],
-    'MW': [_MASK, '-DDFN2_MAX_DF_RING=3'],
-    'MT32': [_MASK, *_caps(512, 28, 96, 3)],
-    'MT16': [_MASK, *_caps(256, 24, 96, 3)],
-}
-CONFIGS = {**FULL_CONFIGS, **MASK_CONFIGS}
+# The two library builds: the full model and the mask-only one.
+CONFIGS = {'full': [], 'mask': [_MASK]}
 
 # name -> (sample rate, n_fft, n_erb, df_bins)
 GRIDS = {
@@ -93,35 +71,13 @@ FULL_PAIRS = [(1, 1), (0, 0), (2, 0), (0, 1), (2, 2), (1, 3), (0, 4), (2, 3), (2
 MASK_PAIRS = [(1, 0), (0, 0), (2, 0)]
 
 
-def _capacity(flags):
-    cap = {'N_FFT': 1024, 'N_ERB': 32, 'DF_BINS': 96,
-           'DF_RING': 2 if _MASK in flags else 5}
-    for flag in flags:
-        match = re.fullmatch(r'-DDFN2_MAX_(N_FFT|N_ERB|DF_BINS|DF_RING)=(\d+)', flag)
-        if match:
-            cap[match.group(1)] = int(match.group(2))
-    return cap
-
-
-def _ring(pair, mask_only):
-    noisy = pair[0] + pair[1] + 1
-    return noisy if mask_only else max(5, noisy)
-
-
-def _fits(flags, grid, pair):
-    cap = _capacity(flags)
-    mask_only = _MASK in flags
-    return (grid[1] <= cap['N_FFT'] and grid[2] <= cap['N_ERB'] and grid[3] <= cap['DF_BINS']
-            and _ring(pair, mask_only) <= cap['DF_RING'])
-
-
 def _cc(args, **kwargs):
     return subprocess.run(['cc', *args], capture_output=True, text=True, **kwargs)
 
 
 class _Builds:
     """Everything the tests compile, in one directory and memoised: the three library units per
-    (library directory, flags, SIMD mode), and the programs linked against them."""
+    (flags, SIMD mode), and the programs linked against them."""
 
     def __init__(self, work):
         self.work = work
@@ -130,63 +86,57 @@ class _Builds:
         self._exes = {}
         self._runs = {}
 
-    def _key(self, lib, flags, simd):
-        return (str(lib), tuple(flags), simd)
-
-    def _compile_unit(self, lib, unit, flags, simd):
+    def _compile_unit(self, unit, flags, simd):
         stem = 'unit%d_%s' % (next(self._counter), unit)
         obj = self.work / (stem + '.o')
-        source = Path(lib) / ('dfn2_%s.c' % unit)
-        done = _cc([*dfn_pairs.house_cflags(simd), *flags, '-I', str(lib), '-c', str(source),
+        source = DFN2 / ('dfn2_%s.c' % unit)
+        done = _cc([*dfn_pairs.house_cflags(simd), *flags, '-I', str(DFN2), '-c', str(source),
                     '-o', str(obj)])
         assert done.returncode == 0, done.stderr
         return obj
 
     def prebuild(self, specs, chains=True):
-        """Compile the units of every (lib, flags, simd) in `specs` and, with `chains`, link
-        the chain driver against them, a few at a time."""
+        """Compile the units of every (flags, simd) in `specs` and, with `chains`, link the
+        chain driver against them, a few at a time."""
         dfn_pairs.house_cflags(1), dfn_pairs.house_cflags(0)   # resolved before the threads
         dfn_pairs.audio_common_lib(1), dfn_pairs.audio_common_lib(0)
         keys = []
-        for lib, flags, simd in specs:
-            key = self._key(lib, flags, simd)
+        for flags, simd in specs:
+            key = (tuple(flags), simd)
             if key not in keys and key not in self._objects:
                 keys.append(key)
         jobs = [(key, unit) for key in keys for unit in UNITS]
         with concurrent.futures.ThreadPoolExecutor(4) as pool:
             built = list(pool.map(
-                lambda job: self._compile_unit(job[0][0], job[1], job[0][1], job[0][2]), jobs))
+                lambda job: self._compile_unit(job[1], job[0][0], job[0][1]), jobs))
         for index, key in enumerate(keys):
             self._objects[key] = built[index * len(UNITS):(index + 1) * len(UNITS)]
         if chains:
-            todo = []
-            for lib, flags, simd in specs:
-                if ('chain', *self._key(lib, flags, simd)) not in self._exes:
-                    todo.append((lib, flags, simd))
-            todo = list(dict.fromkeys((str(l), tuple(f), s) for l, f, s in todo))
+            todo = list(dict.fromkeys((tuple(f), s) for f, s in specs
+                                      if ('chain', tuple(f), s) not in self._exes))
             with concurrent.futures.ThreadPoolExecutor(4) as pool:
                 exes = list(pool.map(lambda t: self._link_chain(*t), todo))
             for spec, exe in zip(todo, exes):
                 self._exes[('chain', *spec)] = exe
 
-    def objects(self, flags, simd=1, lib=DFN2):
-        key = self._key(lib, flags, simd)
+    def objects(self, flags, simd=1):
+        key = (tuple(flags), simd)
         if key not in self._objects:
-            self.prebuild([(lib, flags, simd)], chains=False)
+            self.prebuild([(flags, simd)], chains=False)
         return list(self._objects[key])
 
-    def _link_chain(self, lib, flags, simd):
-        objs = self._objects[self._key(lib, flags, simd)]
+    def _link_chain(self, flags, simd):
+        objs = self._objects[(tuple(flags), simd)]
         exe = self.work / ('chain%d' % next(self._counter))
-        done = _cc([*dfn_pairs.house_cflags(simd), *flags, '-I', str(lib), str(CHAIN_SOURCE),
+        done = _cc([*dfn_pairs.house_cflags(simd), *flags, '-I', str(DFN2), str(CHAIN_SOURCE),
                     *map(str, objs), dfn_pairs.audio_common_lib(simd), '-lm', '-o', str(exe)])
         assert done.returncode == 0, done.stderr
         return exe
 
-    def chain(self, flags, simd=1, lib=DFN2):
-        key = ('chain', *self._key(lib, flags, simd))
+    def chain(self, flags, simd=1):
+        key = ('chain', tuple(flags), simd)
         if key not in self._exes:
-            self.prebuild([(lib, flags, simd)])
+            self.prebuild([(flags, simd)])
         return self._exes[key]
 
     def link(self, main_source, objs, label, flags=(), simd=1):
@@ -200,22 +150,22 @@ class _Builds:
                     *map(str, objs), dfn_pairs.audio_common_lib(simd), '-lm', '-o', str(exe)])
         return done, exe
 
-    def run_chain(self, config, simd, grid, pair, lib=DFN2):
+    def run_chain(self, config, simd, grid, pair, *options):
         """The output of the chain driver of library build `config` on a grid and a pair."""
-        key = (str(lib), config, simd, grid, pair)
+        key = (config, simd, grid, pair, options)
         if key not in self._runs:
-            exe = self.chain(CONFIGS[config], simd, lib)
-            done = subprocess.run([str(exe), *map(str, grid), *map(str, pair)],
+            exe = self.chain(CONFIGS[config], simd)
+            done = subprocess.run([str(exe), *map(str, grid), *map(str, pair), *options],
                                   capture_output=True, text=True)
             assert done.returncode == 0, (config, grid, pair, done.stdout, done.stderr)
             self._runs[key] = done.stdout
         return self._runs[key]
 
 
-def _digests(output):
-    match = re.search(r'chain digest=([0-9a-f]{16}):([0-9a-f]{16})', output)
+def _digest(output):
+    match = re.search(r'chain digest=([0-9a-f]{16})', output)
     assert match, output
-    return match.groups()
+    return match.group(1)
 
 
 @pytest.fixture(scope='module')
@@ -225,194 +175,136 @@ def builds(tmp_path_factory):
 
 @pytest.fixture(scope='module')
 def matrix(builds):
-    """Every library build of the capacity matrix, both SIMD modes, with the chain driver."""
-    builds.prebuild([(DFN2, flags, simd) for flags in CONFIGS.values() for simd in SIMD_MODES])
+    """Both library builds, both SIMD modes, with the chain driver."""
+    builds.prebuild([(flags, simd) for flags in CONFIGS.values() for simd in SIMD_MODES])
     return builds
 
 
 # ---------------------------------------------------------------------------
-# capacity independence
+# the chain
 # ---------------------------------------------------------------------------
-
-def _compare_builds(builds, configs, grid_name, pairs, simd, lib=DFN2):
-    """For every pair, the outputs of the builds that fit the grid; returns
-    (number of comparisons, [mismatch descriptions])."""
-    grid = GRIDS[grid_name]
-    compared, bad = 0, []
-    for pair in pairs:
-        fit = [name for name, flags in configs.items() if _fits(flags, grid, pair)]
-        if len(fit) < 2:
-            continue
-        outputs = {name: builds.run_chain(name, simd, grid, pair, lib) for name in fit}
-        reference = outputs[fit[0]]
-        compared += 1
-        for name in fit[1:]:
-            if outputs[name] != reference:
-                bad.append('%s %s: %s %s vs %s %s' % (
-                    grid_name, pair, fit[0], _digests(reference), name, _digests(outputs[name])))
-    return compared, bad
-
-
-@pytest.mark.parametrize('simd', SIMD_MODES, ids=['neon', 'scalar'])
-@pytest.mark.parametrize('grid_name', list(GRIDS))
-def test_full_chain_is_the_same_whatever_the_capacity(matrix, grid_name, simd):
-    """The state sized for the 48 kHz capacity and the state tight for the grid give the same
-    digest (FREQ and TIME): every stride reads the grid, never the capacity."""
-    compared, bad = _compare_builds(matrix, FULL_CONFIGS, grid_name, FULL_PAIRS, simd)
-    assert compared >= 7, 'too few pairs fit two builds: %d' % compared
-    assert not bad, bad
-
-
-@pytest.mark.parametrize('simd', SIMD_MODES, ids=['neon', 'scalar'])
-@pytest.mark.parametrize('grid_name', list(GRIDS))
-def test_mask_only_chain_is_the_same_whatever_the_capacity(matrix, grid_name, simd):
-    compared, bad = _compare_builds(matrix, MASK_CONFIGS, grid_name, MASK_PAIRS, simd)
-    assert compared >= 2, compared
-    assert not bad, bad
-
 
 @pytest.mark.parametrize('simd', SIMD_MODES, ids=['neon', 'scalar'])
 def test_the_chain_tells_grids_and_pairs_apart(matrix, simd):
-    """Not a vacuous comparison: every grid and every lookahead pair gives its own digest, and
-    the mask-only chain is not the full one."""
+    """Not a vacuous run: every grid and every lookahead pair gives its own digest, and the
+    mask-only chain is not the full one."""
     seen = {}
     for grid_name, grid in GRIDS.items():
         for pair in FULL_PAIRS:
-            if _fits(CONFIGS['W7'], grid, pair):
-                digest = _digests(matrix.run_chain('W7', simd, grid, pair))
-                assert digest not in seen, (grid_name, pair, seen[digest])
-                seen[digest] = (grid_name, pair)
+            digest = _digest(matrix.run_chain('full', simd, grid, pair))
+            assert digest not in seen, (grid_name, pair, seen[digest])
+            seen[digest] = (grid_name, pair)
         for pair in MASK_PAIRS:
-            if _fits(CONFIGS['MW'], grid, pair):
-                digest = _digests(matrix.run_chain('MW', simd, grid, pair))
-                assert digest not in seen, (grid_name, pair, seen[digest])
-                seen[digest] = ('mask-only ' + grid_name, pair)
+            digest = _digest(matrix.run_chain('mask', simd, grid, pair))
+            assert digest not in seen, (grid_name, pair, seen[digest])
+            seen[digest] = ('mask-only ' + grid_name, pair)
     assert len(seen) == len(GRIDS) * (len(FULL_PAIRS) + len(MASK_PAIRS))
 
 
 @pytest.mark.parametrize('simd', SIMD_MODES, ids=['neon', 'scalar'])
-def test_a_build_too_small_for_the_grid_refuses_it(matrix, simd):
-    """A grid above the capacity is not run in a smaller state: dfn2_grid_make() refuses it
-    (the chain driver prints the status text and exits 3)."""
-    for config, grid_name, pair in [('T16', 'g48', (1, 1)), ('T16', 'g32', (1, 1)),
-                                    ('T32', 'g48', (1, 1)), ('T16D', 'g16', (1, 1)),
-                                    ('T16', 'g16', (2, 4)), ('W', 'g16', (2, 4)),
-                                    ('MD', 'g16', (2, 0))]:
-        exe = matrix.chain(CONFIGS[config], simd)
-        done = subprocess.run([str(exe), *map(str, GRIDS[grid_name]), *map(str, pair)],
-                              capture_output=True, text=True)
-        assert done.returncode == 3 and 'capacity' in done.stdout, (
-            config, grid_name, pair, done.returncode, done.stdout)
+def test_the_chain_reads_every_spec_field(matrix, simd):
+    """The optional spec fields of the driver (order, taus, starts, scale) reach the chain:
+    each one alone changes the digest of the shipped grid."""
+    grid, pair = GRIDS['g16'], (1, 1)
+    base = _digest(matrix.run_chain('full', simd, grid, pair))
+    changed = {}
+    for option in ('order=4', 'order=7', 'erb_tau=0.5', 'erb_lo=-70', 'erb_hi=-80',
+                   'erb_scale=30', 'spec_tau=0.5', 'spec_lo=0.002', 'spec_hi=0.0002'):
+        digest = _digest(matrix.run_chain('full', simd, grid, pair, option))
+        assert digest != base, option
+        changed[option] = digest
+    assert len(set(changed.values())) == len(changed), changed
 
 
 def test_the_chain_driver_rejects_bad_arguments(matrix):
-    exe = matrix.chain(CONFIGS['W'], 1)
+    exe = matrix.chain(CONFIGS['full'], 1)
     for args in ([], ['1', '2', '3'], ['16000', '256', '24', '96', '1', 'x'],
-                 ['16000', '256', '24', '96', '1']):
+                 ['16000', '256', '24', '96', '1'],
+                 ['16000', '256', '24', '96', '1', '1', 'bogus=1'],
+                 ['16000', '256', '24', '96', '1', '1', 'order=x'],
+                 ['16000', '256', '24', '96', '1', '1', 'frames=2']):
         assert subprocess.run([str(exe), *args], capture_output=True,
                               text=True).returncode == 2, args
     done = subprocess.run([str(exe), '16000', '960', '24', '96', '1', '1'],
                           capture_output=True, text=True)
-    assert done.returncode == 3 and 'power of two' in done.stdout
+    assert done.returncode == 3 and 'audiolib' in done.stdout, done.stdout
+    done = subprocess.run([str(exe), '16000', '256', '24', '96', '1', '1', 'erb_tau=0'],
+                          capture_output=True, text=True)
+    assert done.returncode == 3 and 'grid refused' in done.stdout, done.stdout
 
 
 def test_the_digests_of_the_shipped_grids_are_printed_for_the_record(matrix, capsys):
-    """Not pinned: the chain runs log10f / powf of the C library it is linked with. The lines
-    are the ones to compare with a build of the compile-time grid."""
-    rows = [('g48_1_1', 'W', 'g48', (1, 1)), ('g16_0_0', 'W', 'g16', (0, 0)),
-            ('g32_0_0', 'W', 'g32', (0, 0)), ('m48_1_0', 'MD', 'g48', (1, 0))]
+    """Not pinned: the chain runs log10f / powf of the C library it is linked with."""
+    rows = [('g48_1_1', 'full', 'g48', (1, 1)), ('g16_0_0', 'full', 'g16', (0, 0)),
+            ('g32_0_0', 'full', 'g32', (0, 0)), ('m48_1_0', 'mask', 'g48', (1, 0))]
     with capsys.disabled():
         print()
         for label, config, grid_name, pair in rows:
             for simd in SIMD_MODES:
                 out = matrix.run_chain(config, simd, GRIDS[grid_name], pair)
-                freq, time = _digests(out)
                 backend = re.search(r'backend=(\S+)', out).group(1)
-                print('  chain digest %-8s %-6s freq %s time %s  (%s)' % (
-                    label, 'neon' if simd else 'scalar', freq, time, backend))
-
-
-# ---------------------------------------------------------------------------
-# the gate can fail: a stride that reads the capacity is caught
-# ---------------------------------------------------------------------------
-
-# (name, file, text, replacement, grid, tight config, wide config): each puts the capacity where
-# the grid's value belongs; the comparison is made between a build whose capacity equals the grid
-# (the mutated code is then right) and the wide one (where it is wrong).
-_MUTATIONS = [
-    ('erb window shifted by the capacity', 'dfn2_model_io.c',
-     'memmove(window, window + n_erb,', 'memmove(window, window + DFN2_MAX_N_ERB,',
-     'g16', 'T16', 'W'),
-    ('erb normaliser ramp over the capacity', 'dfn2_process.c',
-     'float position = (float)b / (float)(grid->n_erb - 1);',
-     'float position = (float)b / (float)(DFN2_MAX_N_ERB - 1);', 'g16', 'T16', 'W'),
-    ('spec window shifted by the capacity', 'dfn2_model_io.c',
-     'memmove(plane, plane + df_bins,', 'memmove(plane, plane + DFN2_MAX_DF_BINS,',
-     'g16d64', 'T16D', 'W'),
-]
-
-
-def _mutated_library(work, name, filename, text, replacement):
-    """A copy of the library sources with one text replaced; the text must be there exactly once
-    (a mutation that no longer applies must not pass as a green gate)."""
-    lib = work / ('lib_' + re.sub(r'\W+', '_', name))
-    lib.mkdir()
-    for path in DFN2.glob('dfn2_*.[ch]'):
-        shutil.copy(path, lib / path.name)
-    source = (lib / filename).read_text(encoding='utf-8')
-    assert source.count(text) == 1, ('the mutation no longer applies', name, source.count(text))
-    (lib / filename).write_text(source.replace(text, replacement), encoding='utf-8')
-    return lib
-
-
-def test_a_copy_of_the_library_passes_the_capacity_comparison(builds, tmp_path):
-    """The control of the mutations below: the same copy, not mutated, compares equal."""
-    lib = tmp_path / 'lib_copy'
-    lib.mkdir()
-    for path in DFN2.glob('dfn2_*.[ch]'):
-        shutil.copy(path, lib / path.name)
-    for grid_name, tight in (('g16', 'T16'), ('g16d64', 'T16D')):
-        grid = GRIDS[grid_name]
-        wide = builds.run_chain('W', 1, grid, (1, 1), lib)
-        assert builds.run_chain(tight, 1, grid, (1, 1), lib) == wide
-        assert wide == builds.run_chain('W', 1, grid, (1, 1)), 'a copy builds the same chain'
-
-
-@pytest.mark.parametrize('mutation', _MUTATIONS, ids=[m[0] for m in _MUTATIONS])
-def test_the_capacity_comparison_goes_red_for_a_stride_that_reads_the_capacity(
-        builds, tmp_path, mutation):
-    name, filename, text, replacement, grid_name, tight, wide = mutation
-    lib = _mutated_library(tmp_path, name, filename, text, replacement)
-    grid = GRIDS[grid_name]
-    red = [builds.run_chain(tight, 1, grid, pair, lib) != builds.run_chain(wide, 1, grid, pair, lib)
-           for pair in [(1, 1), (0, 0), (2, 0)]]
-    assert any(red), 'the comparison did not notice: %s' % name
+                print('  chain digest %-8s %-6s %s  (%s)' % (
+                    label, 'neon' if simd else 'scalar', _digest(out), backend))
 
 
 # ---------------------------------------------------------------------------
 # the pool identity, the descriptor and the host's grid check
 # ---------------------------------------------------------------------------
 
-_POOL_MAIN = r'''
+_POOL_MAIN = r"""
 #include <stdint.h>
+#include <math.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 #include "dfn2_prepost.h"
 
 #define MAX_BINS 513
-#define MAX_ERB 32
+#define MAX_ERB 40
 static float fwd[MAX_BINS * MAX_ERB], inv[MAX_BINS * MAX_ERB];
 static float zeros[MAX_BINS];
 static int infer_calls;
 
-static float float_of(uint32_t u) { float v; memcpy(&v, &u, sizeof v); return v; }
+/* The seven normaliser settings and the order of the shipped model (config.ini), the spec's
+ * other fields for every grid; "[order tau lo hi scale tau lo hi]" after a grid overrides them. */
+static const float defaults[8] = { @ORDER@, @ERB_TAU@, @ERB_LO@, @ERB_HI@, @ERB_SCALE@,
+                                   @SPEC_TAU@, @SPEC_LO@, @SPEC_HI@ };
 
 static int read_grid(const char *text, DFN2Grid *g, int *used) {
-    int a, b, c, d, e, f, n = 0;
+    DFN2GridSpec spec;
+    float v[8];
+    int a, b, c, d, e, f, n = 0, m = 0, k;
     if (sscanf(text, "%d %d %d %d %d %d%n", &a, &b, &c, &d, &e, &f, &n) != 6) return -2;
+    for (k = 0; k < 8; ++k) v[k] = defaults[k];
+    while (text[n] == ' ') ++n;
+    if (text[n] == '[') {
+        float t[8];
+        if (sscanf(text + n + 1, "%f %f %f %f %f %f %f %f%n", &t[0], &t[1], &t[2], &t[3], &t[4],
+                   &t[5], &t[6], &t[7], &m) != 8) return -2;
+        for (k = 0; k < 8; ++k) v[k] = t[k];
+        n += 1 + m;
+        while (text[n] == ' ') ++n;
+        if (text[n] != ']') return -2;
+        ++n;
+    }
+    memset(&spec, 0, sizeof spec);
+    spec.sample_rate = a;
+    spec.n_fft = b;
+    spec.n_erb = c;
+    spec.df_bins = d;
+    spec.df_order = (int)v[0];
+    spec.mask_lookahead = e;
+    spec.df_lookahead = f;
+    spec.frames_per_call = 1;
+    spec.erb_norm_tau_sec = v[1];
+    spec.erb_norm_init_lo_db = v[2];
+    spec.erb_norm_init_hi_db = v[3];
+    spec.erb_norm_scale_db = v[4];
+    spec.spec_norm_tau_sec = v[5];
+    spec.spec_norm_init_lo = v[6];
+    spec.spec_norm_init_hi = v[7];
     *used = n;
-    return dfn2_grid_make(g, a, b, c, d, e, f);
+    return dfn2_grid_make(g, &spec);
 }
 
 static void fill_tables(const DFN2Grid *g) {
@@ -421,7 +313,7 @@ static void fill_tables(const DFN2Grid *g) {
 }
 
 static int config_for(const DFN2Grid *g, DFN2PrepostConfig *cfg) {
-    if (dfn2_prepost_config_defaults(cfg, DFN2_IO_FREQ, g) != 0) return -1;
+    if (dfn2_prepost_config_defaults(cfg, g) != 0) return -1;
     fill_tables(g);
     cfg->erb_fwd = fwd;
     cfg->erb_inv = inv;
@@ -446,6 +338,114 @@ static int infer_ok(void *user, const DFN2PrepostInputs *in, DFN2PrepostOutputs 
     return 0;
 }
 
+
+/* The recurrent state of the checks below: buffers of the program's own. The library takes their element counts
+ * as given and only zeroes and scans them, so small counts stand for the graph's tensors. */
+#define GRU_N 40u
+#define CONVP_N 60u
+static float s_gru[GRU_N], s_convp[CONVP_N];
+
+static void state_fill(float v) {
+    size_t i;
+    for (i = 0; i < GRU_N; ++i) s_gru[i] = v;
+    for (i = 0; i < CONVP_N; ++i) s_convp[i] = v;
+}
+static int gru_is(float v) {
+    size_t i;
+    for (i = 0; i < GRU_N; ++i) if (s_gru[i] != v) return 0;
+    return 1;
+}
+static int convp_is(float v) {
+    size_t i;
+    for (i = 0; i < CONVP_N; ++i) if (s_convp[i] != v) return 0;
+    return 1;
+}
+static int state_all(float v) { return gru_is(v) && convp_is(v); }
+/* Zero in every tensor the build registers (the mask-only build has no pathway window). */
+static int registered_zero(void) {
+#ifndef DFN2_MASK_ONLY
+    return gru_is(0.0f) && convp_is(0.0f);
+#else
+    return gru_is(0.0f);
+#endif
+}
+/* The state a float host registers: h_gru, and with the full model the pathway window. */
+static void register_state(DFN2PrepostConfig *cfg) {
+    cfg->gru_hidden = s_gru;
+    cfg->gru_hidden_elements = GRU_N;
+#ifndef DFN2_MASK_ONLY
+    cfg->df_convp_history = s_convp;
+    cfg->df_convp_history_elements = CONVP_N;
+#endif
+}
+static int infer_fail(void *user, const DFN2PrepostInputs *in, DFN2PrepostOutputs *out) {
+    (void)user;
+    (void)in;
+    (void)out;
+    return -1;
+}
+static int infer_nan(void *user, const DFN2PrepostInputs *in, DFN2PrepostOutputs *out) {
+    infer_ok(user, in, out);
+    out->erb_mask[0] = NAN;
+    return 0;
+}
+
+/* One analysed frame of zeros; every hop is closed with post_process, as the call order says. */
+static int hop_in(DFN2Prepost *p) { return dfn2_prepost_pre_process_freq(p, zeros, zeros); }
+static int hop_out(DFN2Prepost *p) {
+    float re[MAX_BINS], im[MAX_BINS];
+    return dfn2_prepost_post_process_freq(p, re, im, NULL);
+}
+/* The state views of an open frame, every registered element set to `v` (NULL views: nothing to set). */
+static void scribble_state(const DFN2PrepostInputs *in, const DFN2PrepostOutputs *out, float v) {
+    size_t i;
+    (void)in;
+    for (i = 0; out->gru_hidden_next != NULL && i < out->gru_hidden_elements; ++i) out->gru_hidden_next[i] = v;
+#ifndef DFN2_MASK_ONLY
+    for (i = 0; out->df_convp_window_next != NULL && i < out->df_convp_window_elements; ++i)
+        out->df_convp_window_next[i] = v;
+#endif
+}
+static int views_zero(const DFN2PrepostInputs *in) {
+    size_t i;
+    for (i = 0; in->gru_hidden != NULL && i < in->gru_hidden_elements; ++i) if (in->gru_hidden[i] != 0.0f) return 0;
+#ifndef DFN2_MASK_ONLY
+    for (i = 0; in->df_convp_window != NULL && i < in->df_convp_window_elements; ++i)
+        if (in->df_convp_window[i] != 0.0f) return 0;
+#endif
+    return 1;
+}
+/* Hops of a cold or reset instance until the heads of a real frame are due: the first mask_lookahead hops are
+ * warm-up frames (pre 1, open, the stand-in writes heads and scribbles on the registered state, finish discards
+ * them and leaves that state zero, the hop closes); the last hop's pre_process result (1) is returned, else -1. */
+static int to_ready(DFN2Prepost *p) {
+    int i;
+    for (i = 0; i < dfn2_prepost_grid(p)->mask_lookahead; ++i) {
+        DFN2PrepostInputs in;
+        DFN2PrepostOutputs out;
+        if (hop_in(p) != 1 || dfn2_prepost_frame_open(p, &in, &out) != 0) return -1;
+        infer_ok(NULL, &in, &out);
+        scribble_state(&in, &out, 9.0f);
+        if (dfn2_prepost_frame_finish(p) != 0 || !views_zero(&in) || hop_out(p) != 0) return -1;
+    }
+    return hop_in(p);
+}
+/* A ready frame through the accelerator stand-in: 1 when the views are the given buffers (NULL: none), the frame
+ * commits and the hop closes. */
+static int frame_commits(DFN2Prepost *p, const float *gru, const float *convp) {
+    DFN2PrepostInputs in;
+    DFN2PrepostOutputs out;
+    if (to_ready(p) != 1 || dfn2_prepost_frame_open(p, &in, &out) != 0) return 0;
+    if (in.gru_hidden != gru || out.gru_hidden_next != gru) return 0;
+#ifndef DFN2_MASK_ONLY
+    if (in.df_convp_window != convp || out.df_convp_window_next != convp) return 0;
+#else
+    (void)convp;
+#endif
+    infer_ok(NULL, &in, &out);
+    return dfn2_prepost_frame_finish(p) == 0 && hop_out(p) == 0;
+}
+
 int main(void) {
     char line[512], verb[16];
     while (fgets(line, sizeof line, stdin)) {
@@ -457,15 +457,10 @@ int main(void) {
         st = read_grid(line + strlen(verb) + 1, &a, &used);
         if (st != 0) { printf("%s badgrid %d\n", verb, st); continue; }
         if (!strcmp(verb, "req")) {
-            /* req <grid> [erb_alpha_bits spec_alpha_bits]: get_mem_size of the FREQ config */
-            unsigned eb, sb;
+            /* req <grid>: get_mem_size of the config (no state registered) */
             DFN2PrepostConfig cfg;
             DFN2PrepostMemReq r;
             memset(&r, 0, sizeof r);
-            if (sscanf(line + strlen(verb) + 1 + used, "%x %x", &eb, &sb) == 2) {
-                a.erb_norm_alpha = float_of(eb);
-                a.spec_norm_alpha = float_of(sb);
-            }
             if (config_for(&a, &cfg) != 0) { printf("req nocfg\n"); continue; }
             st = dfn2_prepost_get_mem_size(&cfg, &r);
             printf("req %d %llu %08x\n", st, (unsigned long long)r.bytes,
@@ -494,7 +489,7 @@ int main(void) {
             /* every field of the MemReq is compared: a copy with one field changed is refused */
             bad = rb; bad.build_flags_hash ^= 1u; tampered += !accepted(pool, bytes, &cb, &bad);
             bad = rb; bad.bytes += 16u; tampered += !accepted(pool, bytes + 16u, &cb, &bad);
-            bad = rb; bad.io_mode ^= 1u; tampered += !accepted(pool, bytes, &cb, &bad);
+            bad = rb; bad.reserved0 ^= 1u; tampered += !accepted(pool, bytes, &cb, &bad);
             bad = rb; bad.layout_version += 1u; tampered += !accepted(pool, bytes, &cb, &bad);
             bad = rb; bad.descriptor_version += 1u; tampered += !accepted(pool, bytes, &cb, &bad);
             bad = rb; bad.alignment *= 2u; tampered += !accepted(pool, bytes, &cb, &bad);
@@ -507,15 +502,14 @@ int main(void) {
             DFN2ModelIoDescriptor desc;
             DFN2Model model;
             DFN2Prepost *p;
-            int i, rc, ready = 0;
+            int rc, ready;
             if (read_grid(line + strlen(verb) + 1 + used, &b, &used2) != 0 ||
                 config_for(&b, &cb) != 0) {
                 printf("%s badgrid2\n", verb);
                 continue;
             }
             p = dfn2_prepost_create(&cb);
-            for (i = 0; i < 4 && !ready; ++i)
-                ready = dfn2_prepost_pre_process_freq(p, zeros, zeros);
+            ready = to_ready(p);   /* past the warm-up frames: a real frame is open */
             if (dfn2_model_io_descriptor_default(&a, &desc) != 0) {
                 printf("%s nodesc\n", verb);
                 continue;
@@ -539,7 +533,8 @@ int main(void) {
             printf("desc %d %d %d\n", rc, dfn2_model_io_descriptor_validate(&a, &d),
                    dfn2_model_io_descriptor_validate(&b, &d));
         } else if (!strcmp(verb, "descfield")) {
-            /* descfield <grid>: every one of the 18 int fields changed by one is refused */
+            /* descfield <grid>: every one of the 18 int fields changed by one; the 12 external
+             * ones are refused, the 6 interior ones (caller-filled bookkeeping) are not read */
             DFN2ModelIoDescriptor d;
             int words[sizeof(DFN2ModelIoDescriptor) / sizeof(int)], k, refused = 0;
             dfn2_model_io_descriptor_default(&a, &d);
@@ -553,57 +548,265 @@ int main(void) {
             printf("descfield %d %d %d\n", (int)(sizeof words / sizeof words[0]), refused,
                    dfn2_model_io_descriptor_validate(&a, &d));
         } else if (!strcmp(verb, "starts")) {
-            /* starts <grid>: the normaliser starting points as compiled into dfn2_process.c
-             * (dfn2_norm_starts) and what dfn2_state_init() puts into the two normalisers: the
-             * first and last band of the ERB one, the first and last bin of the spectrum one */
+            /* starts <grid>: what dfn2_state_init() puts into the two normalisers: the first and
+             * last band of the ERB one, the first and last bin of the spectrum one */
             static DFN2State dsp;
-            int i;
-            if (dfn2_state_init(&dsp, &a, NULL, NULL) != 0) {
+            size_t bytes = dfn2_state_mem_size(&a);
+            void *block = aligned_alloc(16, bytes);
+            if (!block || dfn2_state_init(&dsp, block, bytes, &a) != 0) {
                 printf("starts noinit\n");
+                free(block);
                 continue;
             }
-            printf("starts");
-            for (i = 0; i < DFN2_NORM_STARTS; ++i) printf(" %.9g", (double)dfn2_norm_starts[i]);
-            printf(" | %.9g %.9g %.9g %.9g\n", (double)dsp.erb_norm_state[0],
+            printf("starts %.9g %.9g %.9g %.9g\n", (double)dsp.erb_norm_state[0],
                    (double)dsp.erb_norm_state[a.n_erb - 1], (double)dsp.spec_norm_state[0],
                    (double)dsp.spec_norm_state[a.df_bins - 1]);
+            free(block);
         } else if (!strcmp(verb, "nullcalls")) {
             DFN2ModelIoDescriptor d;
             DFN2PrepostConfig cfg;
             printf("nullcalls %d %d %d %d\n", dfn2_model_io_descriptor_default(NULL, &d),
                    dfn2_model_io_descriptor_validate(NULL, &d),
                    dfn2_model_io_descriptor_validate(&a, NULL),
-                   dfn2_prepost_config_defaults(&cfg, DFN2_IO_FREQ, NULL));
+                   dfn2_prepost_config_defaults(&cfg, NULL));
         } else if (!strcmp(verb, "badgrid")) {
-            /* a grid edited by hand is refused by every entry point that takes one */
+            /* a grid edited by hand is refused by every entry point that takes one; the blocks
+             * are the right size for the unedited grid, so the grid is what is refused */
             DFN2PrepostConfig cfg;
             DFN2ModelIoDescriptor d;
             DFN2ModelIOState io;
             DFN2State dsp;
             DFN2Grid edited = a;
+            size_t state_bytes = dfn2_state_mem_size(&a), io_bytes = dfn2_model_io_mem_size(&a);
+            void *state_block = aligned_alloc(16, state_bytes);
+            void *io_block = aligned_alloc(16, io_bytes);
             edited.ring += 1;
             printf("badgrid %d %d %d %d\n",
-                   dfn2_prepost_config_defaults(&cfg, DFN2_IO_FREQ, &edited),
+                   dfn2_prepost_config_defaults(&cfg, &edited),
                    dfn2_model_io_descriptor_default(&edited, &d),
-                   dfn2_model_io_init(&io, &edited),
-                   dfn2_state_init(&dsp, &edited, NULL, NULL));
+                   dfn2_model_io_init(&io, io_block, io_bytes, &edited, NULL, 0, NULL, 0),
+                   dfn2_state_init(&dsp, state_block, state_bytes, &edited));
+            free(state_block);
+            free(io_block);
+        } else if (!strcmp(verb, "reg")) {
+            /* reg <grid>  <bits>: bit 0 = h_gru pointer, 1 = h_gru count, 2 = pathway pointer, 3 = pathway count.
+             * Prints: the get_mem_size status, init, create, clean (a refusal changed neither the request,
+             * the pool nor the state; an acceptance kept the pool size and identity), works (generation 1, each
+             * tensor zeroed exactly when registered, the views, a frame that commits). */
+            DFN2PrepostConfig good, cfg;
+            DFN2PrepostMemReq base, req, untouched;
+            DFN2Prepost *p, *made;
+            unsigned int bits = 0;
+            int status, clean, works = 0;
+            size_t bytes;
+            unsigned char *pool, *copy;
+            if (sscanf(line + strlen(verb) + 1 + used, "%u", &bits) != 1 || bits > 15u ||
+                config_for(&a, &good) != 0 || dfn2_prepost_get_mem_size(&good, &base) != 0) {
+                printf("reg badargs\n");
+                continue;
+            }
+            bytes = (size_t)base.bytes;
+            pool = aligned_alloc(16, (bytes + 15u) / 16u * 16u);
+            copy = malloc(bytes);
+            cfg = good;
+            cfg.gru_hidden = (bits & 1u) ? s_gru : NULL;
+            cfg.gru_hidden_elements = (bits & 2u) ? GRU_N : 0u;
+            cfg.df_convp_history = (bits & 4u) ? s_convp : NULL;
+            cfg.df_convp_history_elements = (bits & 8u) ? CONVP_N : 0u;
+            memset(&untouched, 0xa5, sizeof untouched);
+            req = untouched;
+            state_fill(7.0f);
+            memset(pool, 0xa5, bytes);
+            memcpy(copy, pool, bytes);
+            status = dfn2_prepost_get_mem_size(&cfg, &req);
+            p = dfn2_prepost_init(pool, bytes, &cfg);
+            if (p) {
+                const int gru_in = (bits & 3u) == 3u, convp_in = (bits >> 2) == 3u;
+                clean = status == 0 && req.bytes == base.bytes && req.build_flags_hash == base.build_flags_hash;
+                works = dfn2_prepost_state_generation(p) == 1u && gru_is(gru_in ? 0.0f : 7.0f) &&
+                       convp_is(convp_in ? 0.0f : 7.0f) &&
+                       frame_commits(p, gru_in ? s_gru : NULL, convp_in ? s_convp : NULL);
+            } else {
+                clean = status == -1 && memcmp(&req, &untouched, sizeof req) == 0 &&
+                        memcmp(pool, copy, bytes) == 0 && state_all(7.0f);
+            }
+            made = dfn2_prepost_create(&cfg);
+            printf("reg %u %d %d %d %d %d\n", bits, status, p != NULL, made != NULL, clean, works);
+            dfn2_prepost_destroy(made);
+            free(pool);
+            free(copy);
+        } else if (!strcmp(verb, "board")) {
+            /* board <grid>: nothing registered, on a pool that an earlier instance used with registered state.
+             * Prints the generation after init, whether the views are empty, the generation after a committed
+             * frame, a bypassed one, a refused one, a second finish, the bypass, a reset and then three
+             * model_run_frame calls (infer fails, a NaN head, commits), whether every status was the documented
+             * one, and whether every buffer the library was not handed (a guarded foreign one and the earlier
+             * instance's state) is intact. */
+            static struct {
+                unsigned char head[32];
+                float gru[GRU_N], convp[CONVP_N];
+                unsigned char tail[32];
+            } foreign, foreign_ref;
+            DFN2PrepostConfig board, reg;
+            DFN2PrepostMemReq req;
+            DFN2PrepostInputs in;
+            DFN2PrepostOutputs out;
+            DFN2ModelIoDescriptor desc;
+            DFN2Model model;
+            DFN2Prepost *p;
+            unsigned int g[10];
+            int views, statuses, guard, commit_rc, bypass_rc, refuse_rc, again_rc, bypass2_rc, fail_rc, nan_rc, good_rc;
+            void *pool;
+            memset(&board, 0xa5, sizeof board);
+            if (dfn2_prepost_config_defaults(&board, &a) != 0 ||
+                dfn2_model_io_descriptor_default(&a, &desc) != 0) {
+                printf("board nodefaults\n");
+                continue;
+            }
+            fill_tables(&a);
+            board.erb_fwd = fwd;
+            board.erb_inv = inv;
+            reg = board;
+            register_state(&reg);
+            if (dfn2_prepost_get_mem_size(&board, &req) != 0 || !(pool = aligned_alloc(16, (size_t)req.bytes))) {
+                printf("board nosize\n");
+                continue;
+            }
+            dfn2_prepost_init(pool, (size_t)req.bytes, &reg);
+            state_fill(5.0f);
+            memset(&foreign, 0x5a, sizeof foreign);
+            memset(foreign.head, 0xa5, sizeof foreign.head);
+            memset(foreign.tail, 0xa5, sizeof foreign.tail);
+            memcpy(&foreign_ref, &foreign, sizeof foreign);
+            p = dfn2_prepost_init(pool, (size_t)req.bytes, &board);
+            g[0] = dfn2_prepost_state_generation(p);
+            to_ready(p);
+            dfn2_prepost_frame_open(p, &in, &out);
+            views = in.gru_hidden == NULL && in.gru_hidden_elements == 0u && out.gru_hidden_next == NULL &&
+                    out.gru_hidden_elements == 0u;
+#ifndef DFN2_MASK_ONLY
+            views = views && in.df_convp_window == NULL && in.df_convp_window_elements == 0u &&
+                    out.df_convp_window_next == NULL && out.df_convp_window_elements == 0u;
+#endif
+            infer_ok(NULL, &in, &out);
+            commit_rc = dfn2_prepost_frame_finish(p);
+            hop_out(p);
+            g[1] = dfn2_prepost_state_generation(p);
+            hop_in(p);
+            dfn2_prepost_frame_open(p, &in, &out);
+            bypass_rc = dfn2_prepost_frame_bypass(p);
+            hop_out(p);
+            g[2] = dfn2_prepost_state_generation(p);
+            hop_in(p);
+            dfn2_prepost_frame_open(p, &in, &out);                   /* the heads stay NaN: refused */
+            refuse_rc = dfn2_prepost_frame_finish(p);
+            g[3] = dfn2_prepost_state_generation(p);
+            again_rc = dfn2_prepost_frame_finish(p);
+            g[4] = dfn2_prepost_state_generation(p);
+            bypass2_rc = dfn2_prepost_frame_bypass(p);
+            hop_out(p);
+            g[5] = dfn2_prepost_state_generation(p);
+            dfn2_prepost_reset(p);
+            g[6] = dfn2_prepost_state_generation(p);
+            model.user = NULL;
+            model.reset = NULL;
+            model.io_descriptor = &desc;
+            model.infer = infer_fail;
+            to_ready(p);
+            fail_rc = dfn2_model_run_frame(&model, p);
+            hop_out(p);
+            g[7] = dfn2_prepost_state_generation(p);
+            model.infer = infer_nan;
+            hop_in(p);
+            nan_rc = dfn2_model_run_frame(&model, p);
+            hop_out(p);
+            g[8] = dfn2_prepost_state_generation(p);
+            model.infer = infer_ok;
+            hop_in(p);
+            good_rc = dfn2_model_run_frame(&model, p);
+            hop_out(p);
+            g[9] = dfn2_prepost_state_generation(p);
+            statuses = commit_rc == 0 && bypass_rc == 0 && refuse_rc == -1 && again_rc == -1 && bypass2_rc == 0 &&
+                       fail_rc == 0 && nan_rc == 0 && good_rc == 1;
+            guard = memcmp(&foreign, &foreign_ref, sizeof foreign) == 0 && state_all(5.0f);
+            printf("board %u %d %u %u %u %u %u %u %u %u %u %d %d\n", g[0], views, g[1], g[2], g[3], g[4], g[5],
+                   g[6], g[7], g[8], g[9], statuses, guard);
+            free(pool);
+        } else if (!strcmp(verb, "stale")) {
+            /* stale <grid A>  <grid B>: a live instance of B holds the pool; A's config is offered B's MemReq, a
+             * forged copy of it (A's size and alignment, so the identity alone differs), B's config is offered A's,
+             * and A's config is offered A's own MemReq with each compared field changed. Prints the refusals out
+             * of 9, whether the pool and the registered state are byte-identical afterwards, whether the B
+             * instance still reports its grid, and whether A's own MemReq then starts an instance that commits. */
+            DFN2PrepostConfig ca, cb;
+            DFN2PrepostMemReq ra, rb, bad;
+            DFN2Prepost *live;
+            size_t most;
+            unsigned char *pool, *copy;
+            int refused = 0, untouched, alive, field, control;
+            if (read_grid(line + strlen(verb) + 1 + used, &b, &used2) != 0 || config_for(&a, &ca) != 0 ||
+                config_for(&b, &cb) != 0 || dfn2_prepost_get_mem_size(&ca, &ra) != 0 ||
+                dfn2_prepost_get_mem_size(&cb, &rb) != 0) {
+                printf("stale nosize\n");
+                continue;
+            }
+            register_state(&ca);
+            register_state(&cb);
+            most = (size_t)(ra.bytes > rb.bytes ? ra.bytes : rb.bytes);
+            most = (most + 15u) / 16u * 16u;
+            pool = aligned_alloc(16, most);
+            copy = malloc(most);
+            memset(pool, 0xa5, most);
+            live = dfn2_prepost_init_ex(pool, most, &cb, &rb);
+            state_fill(7.0f);
+            memcpy(copy, pool, most);
+            refused += !accepted(pool, most, &ca, &rb);
+            bad = rb;
+            bad.bytes = ra.bytes;
+            bad.alignment = ra.alignment;
+            refused += !accepted(pool, most, &ca, &bad);
+            refused += !accepted(pool, most, &cb, &ra);
+            for (field = 0; field < 6; ++field) {
+                bad = ra;
+                switch (field) {
+                case 0: bad.descriptor_version += 1u; break;
+                case 1: bad.layout_version += 1u; break;
+                case 2: bad.reserved0 = 1u; break;
+                case 3: bad.build_flags_hash ^= 1u; break;
+                case 4: bad.alignment *= 2u; break;
+                default: bad.bytes += 1u; break;
+                }
+                refused += !accepted(pool, most, &ca, &bad);
+            }
+            untouched = memcmp(pool, copy, most) == 0 && state_all(7.0f);
+            alive = live != NULL && dfn2_prepost_hop_size(live) == b.hop && dfn2_prepost_num_bins(live) == b.n_bins;
+            live = dfn2_prepost_init_ex(pool, most, &ca, &ra);
+            control = live != NULL && registered_zero() && frame_commits(live, s_gru, s_convp);
+            printf("stale %d %d %d %d\n", refused, untouched, alive, control);
+            free(pool);
+            free(copy);
         }
     }
     return 0;
 }
-'''
+"""
+
+
+def _pool_main():
+    values = dfn_pairs.dfn2_spec_values()
+    text = _POOL_MAIN
+    for token, key in (('ERB_TAU', 'erb_norm_tau_sec'), ('ERB_LO', 'erb_norm_init_lo_db'),
+                       ('ERB_HI', 'erb_norm_init_hi_db'), ('ERB_SCALE', 'erb_norm_scale_db'),
+                       ('SPEC_TAU', 'spec_norm_tau_sec'), ('SPEC_LO', 'spec_norm_init_lo'),
+                       ('SPEC_HI', 'spec_norm_init_hi')):
+        text = text.replace('@%s@' % token, repr(values[key]) + 'f')
+    return text.replace('@ORDER@', '%d.0f' % values['df_order'])
+
 
 _PARSE_REQ = re.compile(r'req (-?\d+) (\d+) ([0-9a-f]{8})')
 
 # The shipped grid: 48 kHz, 1024-point frames, 32 ERB bands, 96 deep-filter bins, lookahead 1/1.
 _SHIPPED = (48000, 1024, 32, 96, 1, 1)
-
-# The pool of the shipped grid in DFN2_IO_FREQ, as the pre/post unit sizes it for a 64-bit host
-# (the state holds pointers, so a 32-bit host has another size; neither number depends on libm).
-# CARVE_VERSION 9: DFN2State and DFN2Prepost each hold a DFN2Grid (2 x 56 bytes), 219536 -> 219648,
-# and the hash folds the whole grid, the lookahead pair and both alphas.
-_SHIPPED_POOL_BYTES = 219648
-_SHIPPED_POOL_HASH = '5a69e185'
 
 
 class _Pool:
@@ -620,36 +823,43 @@ class _Pool:
         assert len(out) == len(lines), (out, lines)
         return out
 
-    def req(self, grid, alphas=None):
-        line = 'req %d %d %d %d %d %d' % grid
-        if alphas:
-            line += ' %08x %08x' % alphas
-        status, size, digest = _PARSE_REQ.fullmatch(self.run([line])[0]).groups()
+    @staticmethod
+    def grid_text(grid, overrides=None):
+        """'sr fft erb df mask dfla' and, with `overrides` (a dict of the spec fields of
+        dfn2_spec_values), the bracketed order and normaliser values."""
+        text = '%d %d %d %d %d %d' % grid
+        if overrides:
+            values = {**dfn_pairs.dfn2_spec_values(), **overrides}
+            text += ' [%d %s]' % (values['df_order'], ' '.join(repr(values[k]) for k in _NORM_KEYS))
+        return text
+
+    def req(self, grid, overrides=None):
+        status, size, digest = _PARSE_REQ.fullmatch(
+            self.run(['req ' + self.grid_text(grid, overrides)])[0]).groups()
         assert status == '0', (grid, status)
         return int(size), digest
 
-    def starts(self, grid):
-        """([the five dfn2_norm_starts], [erb first, erb last, spec first, spec last] as
-        dfn2_state_init() set them), as float32 values."""
-        verb, *fields = self.run(['starts %d %d %d %d %d %d' % grid])[0].split()
-        assert verb == 'starts' and fields[5] == '|', fields
-        values = [float(np.float32(f)) for f in fields[:5] + fields[6:]]
-        return values[:5], values[5:]
+    def starts(self, grid, overrides=None):
+        """[erb first, erb last, spec first, spec last] as dfn2_state_init() set them, float32."""
+        verb, *fields = self.run(['starts ' + self.grid_text(grid, overrides)])[0].split()
+        assert verb == 'starts' and len(fields) == 4, fields
+        return [float(np.float32(f)) for f in fields]
+
+
+_NORM_KEYS = ('erb_norm_tau_sec', 'erb_norm_init_lo_db', 'erb_norm_init_hi_db', 'erb_norm_scale_db',
+              'spec_norm_tau_sec', 'spec_norm_init_lo', 'spec_norm_init_hi')
 
 
 @pytest.fixture(scope='module')
 def pools(builds):
+    main = _pool_main()
     full = builds.objects([])
     mask = builds.objects([_MASK])
-    return {name: _Pool(builds.link(_POOL_MAIN, objs, 'pool_' + name, flags)[1])
+    return {name: _Pool(builds.link(main, objs, 'pool_' + name, flags)[1])
             for name, objs, flags in (('full', full, []), ('mask', mask, [_MASK]))}
 
 
-def _f32_bits(value):
-    return struct.unpack('<I', struct.pack('<f', value))[0]
-
-
-def test_pool_identity_follows_the_grid_the_pair_the_variant_and_the_alphas(pools):
+def test_pool_identity_follows_the_grid_the_pair_the_variant_and_the_taus(pools):
     full, mask = pools['full'], pools['mask']
     shipped = full.req(_SHIPPED)
     assert full.req(_SHIPPED) == shipped, 'get_mem_size is a pure function of the config'
@@ -673,112 +883,237 @@ def test_pool_identity_follows_the_grid_the_pair_the_variant_and_the_alphas(pool
     full_48, mask_48 = full.req((48000, 1024, 32, 96, 1, 0)), mask.req((48000, 1024, 32, 96, 1, 0))
     assert mask_48[0] < full_48[0] and mask_48[1] != full_48[1]
     assert mask.req((16000, 256, 24, 96, 1, 0)) == mask_16 != mask.req((16000, 256, 24, 96, 0, 0))
-    # Either alpha alone is in the hash (a model trained with another tau).
-    base = full.req((16000, 256, 24, 96, 1, 1))
-    a_def = _f32_bits(0.992)
-    a_new = _f32_bits(0.979)
-    assert full.req((16000, 256, 24, 96, 1, 1), (a_def, a_def)) == base, 'the default alpha'
-    erb_only = full.req((16000, 256, 24, 96, 1, 1), (a_new, a_def))
-    spec_only = full.req((16000, 256, 24, 96, 1, 1), (a_def, a_new))
-    both = full.req((16000, 256, 24, 96, 1, 1), (a_new, a_new))
-    assert len({base[1], erb_only[1], spec_only[1], both[1]}) == 4
-    assert erb_only[0] == spec_only[0] == both[0] == base[0], 'an alpha changes the hash only'
+    # Either tau alone is in the hash (a model trained with another time constant), and so is
+    # the order.
+    base_grid = (16000, 256, 24, 96, 1, 1)
+    base = full.req(base_grid)
+    assert full.req(base_grid, {}) == base
+    erb_only = full.req(base_grid, {'erb_norm_tau_sec': 0.5})
+    spec_only = full.req(base_grid, {'spec_norm_tau_sec': 0.5})
+    both = full.req(base_grid, {'erb_norm_tau_sec': 0.5, 'spec_norm_tau_sec': 0.5})
+    order = full.req(base_grid, {'df_order': 6})
+    assert len({base[1], erb_only[1], spec_only[1], both[1], order[1]}) == 5
+    assert erb_only[0] == spec_only[0] == both[0] == base[0], 'a tau changes the hash only'
+    assert order[0] > base[0], 'a longer filter needs a bigger pool'
 
 
-# The normaliser starting points are libDF's own literals, the same for every grid; a model
-# trained with others defines them on the build line (every translation unit). dfn2_process.c
-# holds the five it was built with (dfn2_norm_starts[]) and dfn2_state_init() starts the
-# normalisers from them; the pool hash reads the same array, so it describes the state that is
-# actually initialised. Each entry: build flag, index in dfn2_norm_starts, the value it sets.
-_NORMALISER_STARTS = [
-    ('-DDFN2_ERB_NORM_INIT_LO_DB=-70.0f', 0, -70.0),
-    ('-DDFN2_ERB_NORM_INIT_HI_DB=-80.0f', 1, -80.0),
-    ('-DDFN2_ERB_NORM_SCALE_DB=30.0f', 2, 30.0),
-    ('-DDFN2_SPEC_NORM_INIT_LO=0.002f', 3, 0.002),
-    ('-DDFN2_SPEC_NORM_INIT_HI=0.0002f', 4, 0.0002),
+# The normaliser settings of the spec besides the taus: each is in the pool hash and none of
+# them changes the pool size. Each entry: the spec field, the slot of the state
+# dfn2_state_init() fills with it (erb first/last, spec first/last; None for the scale, which
+# scales the feature and starts nothing), the value tried.
+_NORMALISER_FIELDS = [
+    ('erb_norm_init_lo_db', 0, -70.0),
+    ('erb_norm_init_hi_db', 1, -80.0),
+    ('erb_norm_scale_db', None, 30.0),
+    ('spec_norm_init_lo', 2, 0.002),
+    ('spec_norm_init_hi', 3, 0.0002),
 ]
-# what dfn2_state_init() makes of each start: (index in the state read-out, shipped grid) -- the
-# ERB scale is not a starting point of the state, it scales the feature
-_STATE_SLOT = {0: 0, 1: 1, 3: 2, 4: 3}
-_START_IDS = [flag[2:].split('=')[0] for flag, _i, _v in _NORMALISER_STARTS]
-_START_DEFAULTS = [-60.0, -90.0, 40.0, 0.001, 0.0001]
 
 
-def _f32(value):
-    return float(np.float32(value))
-
-
-def _link_pool(builds, objs, label):
-    """The pool program linked from `objs` (process, model_io, prepost, in any build mix)."""
-    done, exe = builds.link(_POOL_MAIN, objs, label)
-    assert done.returncode == 0, ('the mix does not link', label, done.stderr)
-    return _Pool(exe)
-
-
-@pytest.mark.parametrize('flag,index,value', _NORMALISER_STARTS, ids=_START_IDS)
-def test_the_pool_hash_reads_the_normaliser_starts_of_the_process_unit(
-        builds, pools, flag, index, value):
-    """Replaces the HEAD gate that objects built with different normaliser starts do not link:
-    the link symbol no longer carries the starts (one build serves every grid), the starts have
-    one owner instead. Units of mixed builds LINK, and the pool hash is dfn2_process.c's:
-      prepost.c / model_io.c built with other starts than process.c   -> the hash of the default
-      process.c built with another start                              -> another hash, the
-        same bytes, the same hash as a build with every unit changed
-    and the state that dfn2_state_init() starts is the one the hash describes."""
-    default, flagged = builds.objects([]), builds.objects([flag])
-    base = pools['full'].req(_SHIPPED)
-    all_flagged = _link_pool(builds, flagged, 'starts_all')
-    process_only = _link_pool(builds, [flagged[0], *default[1:]], 'starts_process')
-    prepost_only = _link_pool(builds, [*default[:2], flagged[2]], 'starts_prepost')
-    model_io_only = _link_pool(builds, [default[0], flagged[1], default[2]], 'starts_model_io')
-
-    assert prepost_only.req(_SHIPPED) == base, 'prepost.c decided the hash'
-    assert model_io_only.req(_SHIPPED) == base
-    changed = process_only.req(_SHIPPED)
-    assert changed[1] != base[1], 'the start is not in the hash'
-    assert changed[0] == base[0], 'a normaliser start changes the hash only'
-    assert all_flagged.req(_SHIPPED) == changed, 'only process.c decides'
-
-    # The array and the state: process.c's values, whatever the other units were built with.
-    expected = list(_START_DEFAULTS)
-    expected[index] = _f32(value)
-    default_starts = [_f32(v) for v in _START_DEFAULTS]
-    assert process_only.starts(_SHIPPED)[0] == [_f32(v) for v in expected]
-    assert prepost_only.starts(_SHIPPED)[0] == default_starts
-    state = process_only.starts(_SHIPPED)[1]
-    default_state = prepost_only.starts(_SHIPPED)[1]
-    if index in _STATE_SLOT:
-        # (the last band / bin is lo + 1.0 * (hi - lo) in float32: equal to hi within an ulp)
-        assert state[_STATE_SLOT[index]] == pytest.approx(_f32(value), rel=1e-6), state
-        assert state != default_state
-    else:
+@pytest.mark.parametrize('field,slot,value', _NORMALISER_FIELDS,
+                         ids=[f for f, _s, _v in _NORMALISER_FIELDS])
+def test_the_pool_hash_reads_each_normaliser_field_and_the_state_starts_from_it(
+        pools, field, slot, value):
+    """A normaliser setting changes the pool hash and nothing else about the pool, and the state
+    dfn2_state_init() starts is the one the hash describes."""
+    full = pools['full']
+    base = full.req(_SHIPPED)
+    changed = full.req(_SHIPPED, {field: value})
+    assert changed[1] != base[1], 'the setting is not in the hash'
+    assert changed[0] == base[0], 'a normaliser setting changes the hash only'
+    default_state = full.starts(_SHIPPED)
+    state = full.starts(_SHIPPED, {field: value})
+    if slot is None:
         assert state == default_state, 'the scale is not part of the state'
+    else:
+        # (the last band / bin is lo + 1.0 * (hi - lo) in float32: equal to hi within an ulp)
+        assert state[slot] == pytest.approx(float(np.float32(value)), rel=1e-6), state
+        assert state != default_state
 
 
-def test_the_normaliser_starts_gate_can_fail(builds, pools, tmp_path):
-    """The gate above is not vacuous: a prepost.c that took the starts from its own build line
-    (the five macros) instead of dfn2_norm_starts[] puts the start into the hash of a mixed
-    build, and the equality with the default hash is lost."""
-    flag = _NORMALISER_STARTS[0][0]
-    lib = _mutated_library(
-        tmp_path, 'prepost_own_starts', 'dfn2_prepost.c',
-        'for (i = 0; i < DFN2_NORM_STARTS; ++i) tuning[2 + i] = dfn2_norm_starts[i];',
-        'tuning[2] = DFN2_ERB_NORM_INIT_LO_DB; tuning[3] = DFN2_ERB_NORM_INIT_HI_DB; '
-        'tuning[4] = DFN2_ERB_NORM_SCALE_DB; tuning[5] = DFN2_SPEC_NORM_INIT_LO; '
-        'tuning[6] = DFN2_SPEC_NORM_INIT_HI; (void)i;')
-    default, flagged = builds.objects([], lib=lib), builds.objects([flag], lib=lib)
-    base = _link_pool(builds, default, 'mut_starts_default').req(_SHIPPED)
-    assert base == pools['full'].req(_SHIPPED), 'the control: the mutated copy hashes as shipped'
-    mixed = _link_pool(builds, [*default[:2], flagged[2]], 'mut_starts_mixed').req(_SHIPPED)
-    assert mixed[1] != base[1], 'the mix still hashes as the default: the gate cannot fail'
+class _PoolMirror:
+    """An independent Python mirror of the pool of the pre/post unit (dfn2_prepost_get_mem_size):
+    the byte count and the build-flags hash, derived from the layout rules alone -- the field
+    lists of the four header structs under the platform's alignment rules, every array carved at
+    a 16-byte offset, FNV-1a-32 over the fields the library's header comment names -- as a
+    function of the grid, the normaliser settings and the variant. It reads nothing from the
+    sources; the tests compare it with the C program on every row they use, so a change of the
+    layout or of the hash walk is made on purpose, in both places."""
+
+    LAYOUT_VERSION = {False: 8, True: 9}
+    CARVE_VERSION = 11
+    MODEL_INPUT_FRAMES = 3
+    FEATURE_VERSION = 'dfn2_libdf_wnorm_upstream_init_no_eps_v5'
+
+    def __init__(self, pointer_bytes=None):
+        self.P = pointer_bytes or struct.calcsize('P')
+
+    @staticmethod
+    def _a16(x):
+        return (x + 15) // 16 * 16
+
+    def _struct_size(self, fields):
+        sizes = {'ptr': (self.P, self.P), 'sizet': (self.P, self.P), 'int': (4, 4),
+                 'float': (4, 4), 'uint': (4, 4), 'll': (8, 8), 'ull': (8, 8)}
+        offset, align = 0, 1
+        for field in fields:
+            size, al = field if isinstance(field, tuple) else sizes[field]
+            offset = (offset + al - 1) // al * al + size
+            align = max(align, al)
+        return (offset + align - 1) // align * align, align
+
+    def _grid(self):
+        # DFN2Grid: two float taus, 13 ints (sample_rate .. input_frames), 9 floats
+        return self._struct_size(['float'] * 2 + ['int'] * 13 + ['float'] * 9)
+
+    def _state_header(self, mask):
+        fields = [self._grid()] + ['ptr'] * 2 + ['ptr'] * 2
+        if not mask:
+            fields += ['ptr'] * 7
+        fields += ['ptr'] * 2 + ['ptr'] * 3 + ['ptr'] * 6 + ['ptr', 'sizet', 'll']
+        if not mask:
+            fields += ['int', 'int']
+        return self._struct_size(fields)[0]
+
+    def _io_header(self, mask):
+        fields = ['ptr', 'ptr', 'ptr', 'sizet']
+        if not mask:
+            fields += ['ptr', 'sizet']
+        fields += ['ptr', 'sizet', 'ull', 'uint'] + ['int'] * 5
+        return self._struct_size(fields)[0]
+
+    def _prepost_header(self, mask):
+        fields = ['ptr', 'ptr', self._grid(), 'float', 'ptr', 'ptr'] + ['ptr'] * 4 + ['ptr'] * 2
+        fields += ['ptr'] * 4 + ['ptr']
+        if not mask:
+            fields += ['ptr', 'ptr']
+        fields += ['ptr']
+        if not mask:
+            fields += ['ptr']
+        fields += ['int', 'ptr', 'ptr', 'll', 'int', 'int', 'int', 'ptr']
+        return self._struct_size(fields)[0]
+
+    def _carve(self, sizes):
+        cursor = 0
+        for nbytes in sizes:
+            cursor = self._a16(cursor) + nbytes
+        return self._a16(cursor)
+
+    @staticmethod
+    def derive(sample_rate, n_fft, n_erb, df_bins, mask_la, df_la, mask, order=5, frames=1):
+        n_bins = n_fft // 2 + 1
+        if mask:
+            order, df_la = 0, 0
+        noisy = mask_la + df_la + 1
+        return dict(sample_rate=sample_rate, n_fft=n_fft, hop=n_fft // 2, n_bins=n_bins,
+                    n_erb=n_erb, df_bins=df_bins, df_order=order, mask_lookahead=mask_la,
+                    df_lookahead=df_la, frames=frames, input_frames=frames + 2,
+                    ring=noisy if mask else max(order, noisy), mask=mask)
+
+    def pool_bytes(self, g):
+        P, mask = self.P, g['mask']
+        n, nb, ne, db, order, ring = (g['frames'], g['n_bins'], g['n_erb'], g['df_bins'],
+                                      g['df_order'], g['ring'])
+        state = [4 * ne, 4 * db]
+        if not mask:
+            state += [4 * ring * nb, 4 * ring * nb, 4 * ring * db * order * 2, 4 * ring, 4 * db,
+                      P * order, P * order]
+        state += [4 * ring * nb, 4 * ring * nb, 4 * nb, 4 * ne, 4 * nb]
+        state += [2 * x for x in (nb, nb, ne, ne, ne, ne)]
+        io = [4 * g['input_frames'] * ne, 4 * 2 * g['input_frames'] * db]
+        sizes = [self._prepost_header(mask), self._state_header(mask), self._carve(state),
+                 self._io_header(mask), self._carve(io),
+                 4 * n * nb, 4 * n * nb, 4 * ne, 4 * 2 * db, 4 * n * nb, 4 * n * nb, 4 * n * ne]
+        if not mask:
+            sizes += [4 * n * db * order * 2, 4 * n]
+        sizes += [4 * ne]
+        if not mask:
+            sizes += [4 * db * order * 2]
+        sizes += [P * n, P * n, 4 * n, 8 * n, 4 * n * nb, 4 * n * nb]
+        return self._carve(sizes)
+
+    @staticmethod
+    def _f32(value):
+        return np.float32(value)
+
+    @classmethod
+    def _bits(cls, value):
+        return struct.unpack('<I', struct.pack('<f', float(cls._f32(value))))[0]
+
+    @staticmethod
+    def _fnv(h, value):
+        for i in range(4):
+            h ^= (value >> (8 * i)) & 0xFF
+            h = (h * 16777619) & 0xFFFFFFFF
+        return h
+
+    @staticmethod
+    def norm_alpha(sample_rate, hop, tau):
+        """train.py make_norm_alpha: three decimals, one more digit while the value reaches 1.0
+        (Python's round() on the exact double), as float32; the tau is the float32 the C library
+        holds."""
+        exact = math.exp(-(hop / sample_rate) / float(np.float32(tau)))
+        precision, alpha = 3, 1.0
+        while alpha >= 1.0:
+            alpha = round(exact, precision)
+            precision += 1
+        return np.float32(alpha)
+
+    def build_hash(self, g, norm):
+        """`norm` = (erb tau, lo, hi, scale, spec tau, lo, hi)."""
+        mask = g['mask']
+        et, elo, ehi, esc, st, slo, shi = norm
+        erb_a = self.norm_alpha(g['sample_rate'], g['hop'], et)
+        spec_a = self.norm_alpha(g['sample_rate'], g['hop'], st)
+        scale = np.float32(1.0) / np.sqrt(np.float32(g['n_fft']))
+        unscale = np.sqrt(np.float32(g['n_fft']))
+        history = 0 if mask else g['df_order'] - g['df_lookahead'] - 1
+        h = 2166136261
+        for v in (g['sample_rate'], g['n_fft'], g['hop'], g['n_bins'], g['n_erb'], g['df_bins'],
+                  g['df_order'], g['mask_lookahead'], g['df_lookahead'], history, g['ring'],
+                  g['frames'], g['input_frames'], 1 if mask else 0, self.LAYOUT_VERSION[mask],
+                  self.CARVE_VERSION, self.MODEL_INPUT_FRAMES):
+            h = self._fnv(h, v & 0xFFFFFFFF)
+        for ch in self.FEATURE_VERSION.encode():
+            h ^= ch
+            h = (h * 16777619) & 0xFFFFFFFF
+        for v in (et, st, erb_a, spec_a, scale, unscale, elo, ehi, esc, slo, shi):
+            h = self._fnv(h, self._bits(v))
+        if self.P == 4:                       # audiolib's ABI token on an ILP32 build
+            for ch in b'|abi:ilp32':
+                h ^= ch
+                h = (h * 16777619) & 0xFFFFFFFF
+        return h
 
 
-@pytest.mark.skipif(struct.calcsize('P') != 8, reason='pool bytes are pinned for 64-bit hosts')
-def test_pool_of_the_shipped_grid_is_pinned(pools):
-    """CARVE_VERSION 9. A change here is a change of the pool layout or of what its hash covers,
-    and is made on purpose."""
-    size, digest = pools['full'].req(_SHIPPED)
-    assert (size, digest) == (_SHIPPED_POOL_BYTES, _SHIPPED_POOL_HASH), (size, digest)
+_MIRROR_ROWS = [
+    ((48000, 1024, 32, 96, 1, 1), {}), ((16000, 256, 24, 96, 0, 0), {}),
+    ((16000, 256, 24, 96, 1, 1), {}), ((32000, 512, 28, 96, 2, 4), {}),
+    ((24000, 512, 24, 64, 1, 2), {}), ((16000, 256, 24, 96, 1, 1), {'df_order': 7}),
+    ((16000, 256, 24, 96, 1, 1), {'erb_norm_tau_sec': 0.3, 'spec_norm_tau_sec': 2.0}),
+    ((16000, 256, 24, 96, 1, 1), {'erb_norm_init_lo_db': -70.0, 'erb_norm_scale_db': 30.0,
+                                  'spec_norm_init_hi': 0.0005}),
+    ((8000, 128, 16, 40, 1, 1), {'df_order': 3}),
+]
+
+
+@pytest.mark.skipif(struct.calcsize('P') != 8, reason='the mirror is compared on 64-bit hosts')
+@pytest.mark.parametrize('pool_name', ['full', 'mask'])
+def test_pool_equals_the_independent_mirror(pools, pool_name):
+    """The pool bytes and the build-flags hash of the C library equal the Python mirror of the
+    layout rules, for the shipped grid and others, orders and normaliser settings. The mirror
+    holds the formula, so a deliberate layout change is made here as well as in the library."""
+    mask = pool_name == 'mask'
+    pool = pools[pool_name]
+    mirror = _PoolMirror(8)
+    for grid, overrides in _MIRROR_ROWS:
+        grid = (*grid[:5], 0) if mask else grid
+        values = {**dfn_pairs.dfn2_spec_values(), **overrides}
+        g = _PoolMirror.derive(*grid, mask, order=values['df_order'])
+        norm = tuple(values[k] for k in _NORM_KEYS)
+        size, digest = pool.req(grid, overrides)
+        assert (size, digest) == (mirror.pool_bytes(g), '%08x' % mirror.build_hash(g, norm)), (
+            pool_name, grid, overrides, size, digest)
 
 
 @pytest.mark.parametrize('pool_name', ['full', 'mask'])
@@ -805,6 +1140,15 @@ def test_init_ex_refuses_a_memreq_of_another_grid_or_pair(pools, pool_name):
     for other, line in zip(others + others, results[1:]):
         own, cross, tampered = map(int, line.split()[1:])
         assert (own, cross, tampered) == (1, 0, 6), (other, line)
+    # A MemReq of another tau or order is refused as well.
+    tau = ['initex %s  %s' % (_Pool.grid_text(base, {'erb_norm_tau_sec': 0.5}),
+                              _Pool.grid_text(base)),
+           'initex %s  %s' % (_Pool.grid_text(base, {'df_order': 6}), _Pool.grid_text(base))]
+    if mask:
+        tau = tau[:1]   # the order is not part of the mask-only model
+    for line in pool.run(tau):
+        own, cross, tampered = map(int, line.split()[1:])
+        assert (own, cross, tampered) == (1, 0, 6), line
 
 
 @pytest.mark.parametrize('pool_name', ['full', 'mask'])
@@ -825,12 +1169,118 @@ def test_a_descriptor_of_one_grid_is_refused_by_the_host_of_another(pools, pool_
     lines += ['runframe %d %d %d %d %d %d  %d %d %d %d %d %d' % (*other, *base)
               for other in others]
     results = pool.run(lines)
-    # The control: the host's own descriptor drives the accelerator and the frame is committed.
+    # The control: past the warm-up frames the host's own descriptor drives the accelerator and the frame is
+    # committed.
     assert results[0].split() == ['runframe', '1', '1', '1'], results[0]
     # No descriptor at all is refused as well.
     assert results[1].split() == ['runnull', '1', '-1', '0'], results[1]
     for other, line in zip(others, results[2:]):
         assert line.split() == ['runframe', '1', '-1', '0'], (other, line)
+
+
+# ---------------------------------------------------------------------------
+# the registered state, the board form and the stale-pool gate (full and mask-only, NEON and scalar)
+# ---------------------------------------------------------------------------
+
+_STATE_KEYS = [(name, simd) for name in ('full', 'mask') for simd in SIMD_MODES]
+
+
+@pytest.fixture(scope='module')
+def state_pools(builds):
+    """The pool program of both library builds in both SIMD modes."""
+    main = _pool_main()
+    programs = {}
+    for name, flags in (('full', []), ('mask', [_MASK])):
+        for simd in SIMD_MODES:
+            done, exe = builds.link(main, builds.objects(flags, simd), 'state_%s_%d' % (name, simd),
+                                    flags, simd)
+            assert done.returncode == 0, done.stderr
+            programs[(name, simd)] = _Pool(exe)
+    return programs
+
+
+@pytest.fixture(params=_STATE_KEYS, ids=['%s-%s' % (n, 'neon' if s else 'scalar') for n, s in _STATE_KEYS])
+def state_pool(request, state_pools):
+    return request.param[0], state_pools[request.param]
+
+
+def _registration_is_valid(variant, bits):
+    """The registration rule, restated from the header: bit 0 = h_gru pointer, 1 = h_gru count, 2 = pathway
+    pointer, 3 = pathway count. Both pairs set or all four NULL/0; with mask-only the pathway pair must be absent."""
+    gru, convp = bits & 3, bits >> 2
+    if variant == 'mask':
+        return convp == 0 and gru in (0, 3)
+    return (gru, convp) in ((0, 0), (3, 3))
+
+
+def test_registration_is_all_or_none(state_pool):
+    """Of the 16 combinations of the four registration values only the documented ones are accepted: a
+    refusal leaves the request, the pool and the registered buffers as they were (and create refuses too); an
+    acceptance keeps the pool size and identity, zeroes the registered tensors, starts the generation at 1,
+    hands the registered buffers to the accelerator and runs a frame."""
+    variant, pool = state_pool
+    grid = _Pool.grid_text((16000, 256, 24, 96, 1, 0 if variant == 'mask' else 1))
+    results = pool.run(['reg %s  %d' % (grid, bits) for bits in range(16)])
+    accepted = []
+    for bits, line in enumerate(results):
+        verb, index, status, init, create, clean, works = line.split()
+        want = int(_registration_is_valid(variant, bits))
+        assert (verb, int(index)) == ('reg', bits), line
+        assert (int(status), int(init), int(create)) == (0 if want else -1, want, want), (variant, bits, line)
+        assert (int(clean), int(works)) == (1, want), (variant, bits, line)
+        if want:
+            accepted.append(bits)
+    assert accepted == ([0, 3] if variant == 'mask' else [0, 15])
+
+
+def test_board_form_moves_the_generation_as_documented(state_pool):
+    """Nothing registered, on a pool an earlier instance used with registered state: the views hold NULL and
+    0, the generation is 1 after init and moves by one per reset, per warm-up frame and per refused finish only
+    (not on a commit, a bypass, a second finish of a refused frame or a failing model), every status is the
+    documented one, and no buffer the library was not handed is touched. Every lookahead pair of the build, and
+    the shipped grid."""
+    variant, pool = state_pool
+    pairs = MASK_PAIRS if variant == 'mask' else FULL_PAIRS
+    grids = [(16000, 256, 24, 96, *pair) for pair in pairs] + [(48000, 1024, 32, 96, *pairs[0])]
+    # generation after init, empty views, then after: commit, bypass, refusal, second finish, bypass, reset,
+    # failing model, NaN head, committing model; all statuses right; no foreign byte changed. With
+    # m = mask_lookahead, each warm-up frame is one step (also with nothing registered), twice: after init
+    # and after the reset; the real frames move it as before:
+    #   init 1 | warm-up m -> 1+m | commit 1+m | bypass 1+m | refused finish 2+m | second finish 2+m |
+    #   bypass 2+m | reset 3+m | warm-up m + failing model 3+2m | NaN head 4+2m | commit 4+2m
+    for grid, line in zip(grids, pool.run(['board %s' % _Pool.grid_text(g) for g in grids])):
+        m = grid[4]
+        steps = (1, 1, 1 + m, 1 + m, 2 + m, 2 + m, 2 + m, 3 + m, 3 + 2 * m, 4 + 2 * m, 4 + 2 * m, 1, 1)
+        want = ['board'] + [str(n) for n in steps]
+        assert line.split() == want, (variant, grid, line)
+
+
+def _stale_neighbours(mask):
+    """Grids that differ from the 16 kHz base in one value (and the mask-only / full pairs), as spec text."""
+    pair = (1, 0) if mask else (1, 1)
+    base = (16000, 256, 24, 96, *pair)
+    others = [(32000, 512, 28, 96, *pair), (16000, 256, 24, 64, *pair), (16000, 256, 28, 96, *pair),
+              (24000, 256, 24, 96, *pair), (16100, 256, 24, 96, *pair), (16000, 256, 24, 96, 0, pair[1]),
+              (48000, 1024, 32, 96, *pair)]
+    if not mask:
+        others += [(16000, 256, 24, 96, 1, 0), (16000, 256, 24, 96, 2, 2), (16000, 256, 24, 96, 0, 1)]
+    texts = [_Pool.grid_text(other) for other in others]
+    texts.append(_Pool.grid_text(base, {'erb_norm_tau_sec': 0.5}))
+    if not mask:
+        texts.append(_Pool.grid_text(base, {'df_order': 6}))
+    return _Pool.grid_text(base), texts
+
+
+def test_a_refused_stale_pool_changes_nothing(state_pool):
+    """init_ex() refuses a pool made for another grid, pair or order, or described by a MemReq that differs in
+    any compared field, before it writes anything: the pool (a live instance of the other grid) and the
+    registered buffers are byte-identical afterwards, the other instance still reports its grid, and the
+    matching MemReq then starts an instance that runs a frame."""
+    variant, pool = state_pool
+    base, others = _stale_neighbours(variant == 'mask')
+    results = pool.run(['stale %s  %s' % (base, other) for other in others])
+    for other, line in zip(others, results):
+        assert line.split() == ['stale', '9', '1', '1', '1'], (variant, other, line)
 
 
 @pytest.mark.parametrize('pool_name', ['full', 'mask'])
@@ -851,10 +1301,12 @@ def test_the_default_descriptor_round_trips_through_its_own_grid_only(pools, poo
             rc, same, other = map(int, next(results).split()[1:])
             assert rc == 0 and same == 0, (a, rc, same)
             assert other == (0 if a == b else -1), (a, b, other)
-    # Every one of the 18 fields is compared: a descriptor changed in one is refused.
+    # The 12 external fields of the 18 are compared: a descriptor changed in one is refused. The
+    # other 6 (GRU layers and width, encoder channels, pathway window) are caller-filled
+    # bookkeeping the library does not read.
     for line in pool.run(['descfield %d %d %d %d %d %d' % g for g in grids]):
         count, refused, plain = map(int, line.split()[1:])
-        assert (count, refused, plain) == (18, 18, 0), line
+        assert (count, refused, plain) == (18, 12, 0), line
 
 
 @pytest.mark.parametrize('pool_name', ['full', 'mask'])
@@ -871,12 +1323,12 @@ def test_entry_points_refuse_a_null_or_hand_edited_grid(pools, pool_name):
 # the library holds no grid
 # ---------------------------------------------------------------------------
 
-# The grid macros of the former build-time library. They are the test headers' alone
+# The grid macros of a build-time grid. They are the test headers' alone
 # (tests/dfn2_test_grid.h, pipelines/dfn/tests/dfn_test_grid.h: test scaffolding that sizes fixed
 # arrays and sweeps grids), never the library's and never a product's.
 GRID_MACROS = [
     'DFN2_GRID_KHZ', 'DFN2_SR', 'DFN2_N_FFT', 'DFN2_N_ERB', 'DFN2_DF_BINS',
-    'DFN2_MASK_LOOKAHEAD', 'DFN2_DF_LOOKAHEAD',
+    'DFN2_MASK_LOOKAHEAD', 'DFN2_DF_LOOKAHEAD', 'DFN2_DF_ORDER',
     # the rest of what the build-time grid derived
     'DFN2_N_BINS', 'DFN2_WIN_LEN', 'DFN2_HOP_LEN', 'DFN2_OVL_LEN', 'DFN2_ERB_NORM_ALPHA',
     'DFN2_SPEC_NORM_ALPHA', 'DFN2_ANALYSIS_SCALE', 'DFN2_NORMALIZED_STFT_SCALE',
@@ -928,8 +1380,8 @@ def _grid_macro_uses(directory):
 
 def test_the_library_defines_and_uses_no_grid_macro():
     assert sorted(p.name for p in DFN2.glob('dfn2_*.[ch]')) == [
-        'dfn2_grid.h', 'dfn2_model_io.c', 'dfn2_model_io.h', 'dfn2_prepost.c',
-        'dfn2_prepost.h', 'dfn2_process.c', 'dfn2_process.h']
+        'dfn2_grid.h', 'dfn2_model_io.c', 'dfn2_model_io.h', 'dfn2_model_io_priv.h',
+        'dfn2_prepost.c', 'dfn2_prepost.h', 'dfn2_process.c', 'dfn2_process.h']
     assert _grid_macro_uses(DFN2) == []
 
 
@@ -981,7 +1433,7 @@ def test_the_product_scan_flags_a_macro_and_a_test_header_include(tmp_path):
         '  #  include "../../AINR/tests/dfn2_test_grid.h"\n':
             ['include #  include "../../AINR/tests/dfn2_test_grid.h"'],
         '/* DFN2_SR */ const char *s = "DFN2_N_ERB"; /* dfn_test_grid.h */\n': [],
-        'int y = DFN2_MAX_N_FFT;\n': [],
+        'int y = DFN2_N_FFT_EXTRA + DFN2_TEST_GRU_ELEMENTS;\n': [],
     }.items():
         probe.write_text(source, encoding='utf-8')
         assert [w for _f, _l, w in _product_grid_uses([probe])] == want, source
@@ -989,7 +1441,7 @@ def test_the_product_scan_flags_a_macro_and_a_test_header_include(tmp_path):
 
 def test_the_scan_sees_what_it_is_meant_to_see(tmp_path):
     """The scan is not vacuous: each shape of definition or use is found, a mention in a comment,
-    a string, a longer identifier (DFN2_MAX_N_FFT) or the consumer macro of another family
+    a string, a longer identifier (DFN2_N_FFT_EXTRA) or the consumer macro of another family
     (DFN3_SR) is not, and a real library file with one macro added is flagged."""
     shapes = {
         '#define DFN2_N_FFT 1024\n': ['DFN2_N_FFT'],
@@ -1004,7 +1456,7 @@ def test_the_scan_sees_what_it_is_meant_to_see(tmp_path):
         '/* multi\n   line DFN2_N_ERB */\nint a;\n': [],
         'const char *s = "DFN2_DF_BINS";\n': [],
         '#error "DFN2_SR is the application\'s"\n': [],
-        'int a = DFN2_MAX_N_FFT + DFN2_MAX_N_ERB + DFN2_MAX_DF_BINS + DFN3_SR;\n': [],
+        'int a = DFN2_N_FFT_EXTRA + DFN2_TEST_ERB_NORM_TAU_SEC + DFN3_SR;\n': [],
         "char c = '\"'; int z = DFN2_SR;\n": ['DFN2_SR'],
     }
     for source, want in shapes.items():
@@ -1025,7 +1477,7 @@ def test_the_consumer_header_is_where_the_grid_macros_live():
     """The macro list is what the tests' own header defines (so the scan above looks for the
     right names)."""
     code = _code_only((TESTS_DIR / 'dfn2_test_grid.h').read_text(encoding='utf-8'))
-    for macro in GRID_MACROS[:7]:
+    for macro in GRID_MACROS[:8]:
         assert re.search(r'\b%s\b' % macro, code), macro
 
 
@@ -1124,40 +1576,42 @@ def test_the_band_borders_the_c_suites_share_cover_every_grid(builds, grid):
 
 
 # ---------------------------------------------------------------------------
+
+# ---------------------------------------------------------------------------
 # the variant link symbol
 # ---------------------------------------------------------------------------
 
-_LINK_MAIN = r'''
+_LINK_MAIN = r"""
 #include "dfn2_prepost.h"
 int main(void) {
+    DFN2GridSpec spec = {
+        .sample_rate = 16000, .n_fft = 256, .n_erb = 24, .df_bins = 96, .df_order = 5,
+        .mask_lookahead = 1, .df_lookahead = 0, .frames_per_call = 1,
+        .erb_norm_tau_sec = 1.0f, .erb_norm_init_lo_db = -60.0f, .erb_norm_init_hi_db = -90.0f,
+        .erb_norm_scale_db = 40.0f, .spec_norm_tau_sec = 1.0f, .spec_norm_init_lo = 0.001f,
+        .spec_norm_init_hi = 0.0001f,
+    };
     DFN2Grid grid;
     DFN2PrepostConfig cfg;
     DFN2PrepostMemReq req;
-    if (dfn2_grid_make(&grid, 16000, 256, 24, 96, 1, 0) != 0) return 1;
-    if (dfn2_prepost_config_defaults(&cfg, DFN2_IO_FREQ, &grid) != 0) return 1;
+    if (dfn2_grid_make(&grid, &spec) != 0) return 1;
+    if (dfn2_prepost_config_defaults(&cfg, &grid) != 0) return 1;
     return dfn2_prepost_get_mem_size(&cfg, &req);
 }
-'''
+"""
 
-_APP_MAIN = r'''
+_APP_MAIN = r"""
 #include "dfn2_process.h"
 int main(void) {
     DFN2_REQUIRE_VARIANT_LINK();   /* what an application calls in main() */
     return 0;
 }
-'''
+"""
 
 # link-test variants: name -> (flags, symbol the units reference)
 _VARIANTS = {
-    'full': ([], 'dfn2_variant_full_n1024_e32_d96_r5'),
-    'mask': ([_MASK], 'dfn2_variant_mask_only_n1024_e32_d96_r2'),
-    'fft2048': (['-DDFN2_MAX_N_FFT=2048'], 'dfn2_variant_full_n2048_e32_d96_r5'),
-    'erb36': (['-DDFN2_MAX_N_ERB=36'], 'dfn2_variant_full_n1024_e36_d96_r5'),
-    'df128': (['-DDFN2_MAX_DF_BINS=128'], 'dfn2_variant_full_n1024_e32_d128_r5'),
-    'ring7': (['-DDFN2_MAX_DF_RING=7'], 'dfn2_variant_full_n1024_e32_d96_r7'),
-    'mask_ring3': ([_MASK, '-DDFN2_MAX_DF_RING=3'], 'dfn2_variant_mask_only_n1024_e32_d96_r3'),
-    # Mask-only with every capacity equal to the full default: the variant alone tells them apart.
-    'mask_ring5': ([_MASK, '-DDFN2_MAX_DF_RING=5'], 'dfn2_variant_mask_only_n1024_e32_d96_r5'),
+    'full': ([], 'dfn2_variant_full'),
+    'mask': ([_MASK], 'dfn2_variant_mask_only'),
 }
 
 
@@ -1169,7 +1623,7 @@ def _assert_no_link(done, symbol):
 
 @pytest.fixture(scope='module')
 def variants(builds):
-    builds.prebuild([(DFN2, flags, 1) for flags, _s in _VARIANTS.values()], chains=False)
+    builds.prebuild([(flags, 1) for flags, _s in _VARIANTS.values()], chains=False)
     return {name: builds.objects(flags) for name, (flags, _s) in _VARIANTS.items()}
 
 
@@ -1179,27 +1633,23 @@ def test_units_of_one_variant_link(builds, variants):
         assert done.returncode == 0, (name, done.stderr)
 
 
-@pytest.mark.parametrize('other', [n for n in _VARIANTS if n != 'full'])
-def test_units_of_different_variants_do_not_link(builds, variants, other):
-    """A mask-only unit or one built with another capacity names a symbol the full default
-    process unit does not define, and the other way round; two prepost units of different
-    builds under one process unit fail too."""
-    base, odd = variants['full'], variants[other]
-    done, _exe = builds.link(_LINK_MAIN, [odd[0], *base[1:]], 'mix_a_' + other)
+def test_units_of_different_variants_do_not_link(builds, variants):
+    """A mask-only unit names a symbol the full process unit does not define, and the other way
+    round; two prepost units of different builds under one process unit fail too."""
+    base, odd = variants['full'], variants['mask']
+    done, _exe = builds.link(_LINK_MAIN, [odd[0], *base[1:]], 'mix_a')
     _assert_no_link(done, _VARIANTS['full'][1])
-    done, _exe = builds.link(_LINK_MAIN, [base[0], *odd[1:]], 'mix_b_' + other, _VARIANTS[other][0])
-    _assert_no_link(done, _VARIANTS[other][1])
-    done, _exe = builds.link(_LINK_MAIN, [base[0], base[1], odd[2]], 'mix_c_' + other,
-                             _VARIANTS[other][0])
-    _assert_no_link(done, _VARIANTS[other][1])
-    done, _exe = builds.link(_LINK_MAIN, [base[0], odd[1], base[2]], 'mix_d_' + other,
-                             _VARIANTS[other][0])
-    _assert_no_link(done, _VARIANTS[other][1])
+    done, _exe = builds.link(_LINK_MAIN, [base[0], *odd[1:]], 'mix_b', _VARIANTS['mask'][0])
+    _assert_no_link(done, _VARIANTS['mask'][1])
+    done, _exe = builds.link(_LINK_MAIN, [base[0], base[1], odd[2]], 'mix_c', _VARIANTS['mask'][0])
+    _assert_no_link(done, _VARIANTS['mask'][1])
+    done, _exe = builds.link(_LINK_MAIN, [base[0], odd[1], base[2]], 'mix_d', _VARIANTS['mask'][0])
+    _assert_no_link(done, _VARIANTS['mask'][1])
 
 
-def test_the_symbol_carries_the_variant_and_the_capacities_but_not_the_grid(builds, variants):
-    """Every variant defines exactly its own symbol; the grid and the lookahead pair are in no
-    symbol (one build serves every grid)."""
+def test_the_symbol_carries_the_variant_but_not_the_grid(builds, variants):
+    """Every variant defines exactly its own symbol; the grid, the lookahead pair and any size
+    are in no symbol (one build serves every grid)."""
     if shutil.which('nm') is None:
         pytest.skip('nm unavailable')
     for name, objs in variants.items():
@@ -1213,9 +1663,8 @@ def test_an_application_built_for_another_variant_than_the_library_does_not_link
         builds, variants):
     done, _exe = builds.link(_APP_MAIN, variants['full'], 'app_full')
     assert done.returncode == 0, done.stderr                            # the control
-    for other in ('mask', 'fft2048', 'ring7'):
-        flags, symbol = _VARIANTS[other]
-        done, _exe = builds.link(_APP_MAIN, variants['full'], 'app_' + other, flags)
-        _assert_no_link(done, symbol)
-        done, _exe = builds.link(_APP_MAIN, variants[other], 'app_full_on_' + other)
-        _assert_no_link(done, _VARIANTS['full'][1])
+    flags, symbol = _VARIANTS['mask']
+    done, _exe = builds.link(_APP_MAIN, variants['full'], 'app_mask', flags)
+    _assert_no_link(done, symbol)
+    done, _exe = builds.link(_APP_MAIN, variants['mask'], 'app_full_on_mask')
+    _assert_no_link(done, _VARIANTS['full'][1])

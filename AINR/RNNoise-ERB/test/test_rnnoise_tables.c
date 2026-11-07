@@ -1,28 +1,24 @@
-/* ============================================================
- * rnnoise_tables_gen.h 的 drift-guard, 兩層:
- *
- * 第一層 (預設): 用獨立寫出的 ERB/window 算法 (不呼叫 gen_rnnoise_tables.c) 在
- * 執行期重算四張表, 與 header 內的 `static const` 表格逐 byte memcmp。
- *
- * 第二層 (-DRNN_TABLES_PORTABLE): 不同 libm/工具鏈不保證逐 byte 相同, 改檢查數學
- * 性質: 值皆有限; nfftborder 嚴格遞增且端點為 0 與 257; erb_inv 每列總和為 1;
- * erb_fwd 除頭尾兩個 band 為 erb_inv 的兩倍外與之相同; hann window 落在 [0,1]、
- * w[0]==0 且 w[i] 與 w[WIN_LEN-i] 的 ULP 差在界內; 另有 recompute-vs-table 的
- * max-ULP 門檻 (256 ULP), 只抓整體算式錯誤, 不是位元契約。
- *
- * 建置並執行 (兩個模式都須 PASS): 在 RNNoise-ERB/ 下 `make test-tables`。
- * ============================================================ */
+#define _POSIX_C_SOURCE 200809L
+/* ERB drift guard: the matrices of the two raw float32 files (tests/erb_fixture.py by default,
+ * or the application's own) against an independent recompute of the triangular ERB filterbank,
+ * byte for byte, plus the matrix contracts and the reader's refusals. Library-free.
+ * Usage: test_rnnoise_tables ERB_FWD_FILE ERB_INV_FILE */
 
-#include "process.h"
-#include "rnnoise_tables_gen.h"
+#include "rnnoise_test_erb.h"
+
 #include <math.h>
-#include <stdio.h>
-#include <string.h>
-#include <stdint.h>
 
-#ifndef M_PI
-#define M_PI 3.14159265358979323846
-#endif
+/* Second source: these constants are deliberately not read from process.h or config.ini, so a
+ * change of either shows up here. */
+#define SR 16000
+#define N_FFT 512
+#define N_BANDS 22
+#define MIN_BINS_PER_BAND 2
+#define N_BINS (N_FFT / 2 + 1)
+
+static int g_fail;
+#define CHECK(name, cond) do { if (!(cond)) { ++g_fail; \
+    printf("FAIL [%s] line %d: %s\n", (name), __LINE__, #cond); } } while (0)
 
 static double freq2erb(double f) {
     return 9.265 * log(1.0 + f / (24.7 * 9.265));
@@ -31,303 +27,190 @@ static double erb2freq(double e) {
     return 24.7 * 9.265 * (exp(e / 9.265) - 1.0);
 }
 
-static int   ref_nfftborder[RNNOISE_N_BANDS];
-static float ref_erb_fwd[RNNOISE_N_BINS][RNNOISE_N_BANDS];
-static float ref_erb_inv[RNNOISE_N_BINS][RNNOISE_N_BANDS];
-static float ref_hann_win[RNNOISE_WIN_LEN];
+static int   ref_border[N_BANDS];
+static float ref_fwd[N_BINS][N_BANDS];   /* bin-major */
+static float ref_inv[N_BANDS][N_BINS];   /* band-major */
 
-/* ERB filterbank 的獨立複本 (與 gen_rnnoise_tables.c 的算式分開寫)。 */
-static void ref_compute_erb_tables(void) {
-    const int    N  = RNNOISE_N_BANDS;
-    const double sr = (double)RNNOISE_SR;
-    const double high_lim = sr / 2.0;
-    const double bw = high_lim / ((double)RNNOISE_N_FFT / 2.0);
+static void ref_compute_erb_matrices(void) {
+    const int    N  = N_BANDS;
+    const double high_lim = (double)SR / 2.0;
+    const double bw = high_lim / ((double)N_FFT / 2.0);
+    double e_lo = freq2erb(0.0), e_hi = freq2erb(high_lim);
+    double ideal[N_BANDS];
+    double nb0 = 0.0;
 
-    {
-        /* DELIBERATE SECOND SOURCE — do not replace with
-         * RNNOISE_MIN_BINS_PER_BAND.  This file re-derives the tables
-         * independently so that a change to the shared constant shows up as a
-         * test failure rather than silently propagating.  Wiring it to the
-         * header would make the check compare the generator against itself. */
-#define MIN_BINS_PER_BAND 2
-        double e_lo = freq2erb(0.0), e_hi = freq2erb(high_lim);
-        double ideal[RNNOISE_N_BANDS];
-        for (int i = 0; i < N; i++) {
-            double e = e_lo + (e_hi - e_lo) * i / (N - 1);
-            double cutoff = erb2freq(e);
-            ideal[i] = floor((cutoff + bw / 2.0) / bw + 0.5);
-        }
-        double nb0 = 0.0;
-        ref_nfftborder[0] = 0;
-        for (int i = 1; i < N; i++) {
-            double nxt = ideal[i];
-            if (nxt < nb0 + MIN_BINS_PER_BAND) nxt = nb0 + MIN_BINS_PER_BAND;
-            if (nxt > (double)(RNNOISE_N_FFT / 2 + 1)) nxt = (double)(RNNOISE_N_FFT / 2 + 1);
-            ref_nfftborder[i] = (int)nxt;
-            nb0 = nxt;
-        }
-        ref_nfftborder[N - 1] = RNNOISE_N_FFT / 2 + 1;
-#undef MIN_BINS_PER_BAND
+    for (int i = 0; i < N; i++) {
+        double e = e_lo + (e_hi - e_lo) * i / (N - 1);
+        ideal[i] = floor((erb2freq(e) + bw / 2.0) / bw + 0.5);
     }
+    ref_border[0] = 0;
+    for (int i = 1; i < N; i++) {
+        double nxt = ideal[i];
+        if (nxt < nb0 + MIN_BINS_PER_BAND) nxt = nb0 + MIN_BINS_PER_BAND;
+        if (nxt > (double)N_BINS) nxt = (double)N_BINS;
+        ref_border[i] = (int)nxt;
+        nb0 = nxt;
+    }
+    ref_border[N - 1] = N_BINS;
 
-    memset(ref_erb_fwd, 0, sizeof(ref_erb_fwd));
-    memset(ref_erb_inv, 0, sizeof(ref_erb_inv));
+    memset(ref_fwd, 0, sizeof(ref_fwd));
+    memset(ref_inv, 0, sizeof(ref_inv));
     for (int i = 0; i < N - 1; i++) {
-        int lo = ref_nfftborder[i];
-        int hi = ref_nfftborder[i + 1];
-        int bs = hi - lo;
+        int lo = ref_border[i];
+        int bs = ref_border[i + 1] - lo;
         for (int j = 0; j < bs; j++) {
             float down = (float)(1.0 - (double)j / (double)bs);
             float up   = (float)((double)j / (double)bs);
-            ref_erb_inv[lo + j][i]     = down;
-            ref_erb_inv[lo + j][i + 1] = up;
-            ref_erb_fwd[lo + j][i]     = down;
-            ref_erb_fwd[lo + j][i + 1] = up;
+            ref_inv[i][lo + j]     = down;
+            ref_inv[i + 1][lo + j] = up;
+            ref_fwd[lo + j][i]     = down;
+            ref_fwd[lo + j][i + 1] = up;
         }
     }
-    for (int k = 0; k < RNNOISE_N_BINS; k++) {
-        ref_erb_fwd[k][0]     *= 2.0f;
-        ref_erb_fwd[k][N - 1] *= 2.0f;
+    for (int k = 0; k < N_BINS; k++) {
+        ref_fwd[k][0]     *= 2.0f;
+        ref_fwd[k][N - 1] *= 2.0f;
     }
 }
 
-/* root-Hann window 的獨立複本。 */
-static void ref_compute_window_table(void) {
-    for (int i = 0; i < RNNOISE_WIN_LEN; i++) {
-        ref_hann_win[i] = sqrtf(0.5f * (1.0f - cosf(2.0f * (float)M_PI * i / RNNOISE_WIN_LEN)));
-    }
-}
-
-#ifdef RNN_TABLES_PORTABLE
-
-/* ───────────────────────── Layer 2 helpers (portable mode) ───────────────────────── */
-
-/* ULP distance via the standard "sign-and-magnitude to biased" total-order
- * mapping (same technique googletest's internal::FloatingPoint uses): maps
- * each float's raw bit pattern to a monotonically-ordered unsigned integer
- * so the ordinary unsigned difference between two such mapped values is
- * exactly their ULP distance, including across the +/-0 and sign boundary. */
-static uint32_t float_bits_u32(float f) {
-    uint32_t u;
-    memcpy(&u, &f, sizeof(u));
-    return u;
-}
-
-static uint32_t sam_to_biased(uint32_t sam) {
-    if (sam & 0x80000000u) {
-        return (uint32_t)(~sam + 1u);
-    }
-    return 0x80000000u | sam;
-}
-
-static uint32_t ulp_distance(float a, float b) {
-    uint32_t ba = sam_to_biased(float_bits_u32(a));
-    uint32_t bb = sam_to_biased(float_bits_u32(b));
-    return (ba >= bb) ? (ba - bb) : (bb - ba);
-}
-
-static int check_all_finite(void) {
-    int ok = 1;
-    for (int k = 0; k < RNNOISE_N_BINS; k++) {
-        for (int b = 0; b < RNNOISE_N_BANDS; b++) {
-            if (!isfinite(rnn_erb_fwd[k][b])) {
-                printf("FAIL: rnn_erb_fwd[%d][%d]=%.9g not finite\n", k, b, (double)rnn_erb_fwd[k][b]);
-                ok = 0;
-            }
-            if (!isfinite(rnn_erb_inv[k][b])) {
-                printf("FAIL: rnn_erb_inv[%d][%d]=%.9g not finite\n", k, b, (double)rnn_erb_inv[k][b]);
-                ok = 0;
-            }
+/* Mismatching elements of two float arrays compared by bit pattern. */
+static size_t count_diff(const float *a, const float *b, size_t n, size_t *first) {
+    size_t diff = 0;
+    for (size_t i = 0; i < n; i++) {
+        if (memcmp(&a[i], &b[i], sizeof(float)) != 0) {
+            if (diff == 0) *first = i;
+            diff++;
         }
     }
-    for (int i = 0; i < RNNOISE_WIN_LEN; i++) {
-        if (!isfinite(rnn_hann_win[i])) {
-            printf("FAIL: rnn_hann_win[%d]=%.9g not finite\n", i, (double)rnn_hann_win[i]);
-            ok = 0;
-        }
-    }
-    return ok;
+    return diff;
 }
 
-static int check_nfftborder_monotone_pinned(void) {
-    int ok = 1;
-    const int expect_last = RNNOISE_N_FFT / 2 + 1;  /* 257 */
-
-    if (rnn_nfftborder[0] != 0) {
-        printf("FAIL: rnn_nfftborder[0]=%d, expected pinned endpoint 0\n", rnn_nfftborder[0]);
-        ok = 0;
+static void check_equal(const char *name, const float *file, const float *ref, size_t n) {
+    size_t first = 0;
+    size_t diff = count_diff(file, ref, n, &first);
+    if (diff != 0) {
+        ++g_fail;
+        printf("FAIL [%s] %zu of %zu elements differ, first at %zu: file=%.9g recompute=%.9g\n",
+               name, diff, n, first, (double)file[first], (double)ref[first]);
     }
-    if (rnn_nfftborder[RNNOISE_N_BANDS - 1] != expect_last) {
-        printf("FAIL: rnn_nfftborder[%d]=%d, expected pinned endpoint %d\n",
-               RNNOISE_N_BANDS - 1, rnn_nfftborder[RNNOISE_N_BANDS - 1], expect_last);
-        ok = 0;
-    }
-    for (int i = 0; i < RNNOISE_N_BANDS - 1; i++) {
-        if (!(rnn_nfftborder[i] < rnn_nfftborder[i + 1])) {
-            printf("FAIL: rnn_nfftborder not strictly monotone at i=%d (%d >= %d)\n",
-                   i, rnn_nfftborder[i], rnn_nfftborder[i + 1]);
-            ok = 0;
-        }
-    }
-    return ok;
 }
 
-/* Every frequency bin's row across rnn_erb_inv must sum to 1.0 -- each bin
- * falls in exactly one (band, band+1) crossfade segment whose down/up
- * weights are complementary by construction ((1-j/bs)+(j/bs)==1), so this
- * is a real partition-of-unity property of the table, not a loose
- * approximation. `tol` absorbs float summation rounding only. */
-static int check_erb_inv_partition_of_unity(double tol) {
-    int ok = 1;
-    for (int k = 0; k < RNNOISE_N_BINS; k++) {
+static void check_contracts(const float *fwd, const float *inv) {
+    for (size_t i = 0; i < (size_t)N_BINS * N_BANDS; i++) {
+        CHECK("finite.forward", isfinite(fwd[i]));
+        CHECK("finite.inverse", isfinite(inv[i]));
+    }
+    /* Each bin is one crossfade whose weights add to 1: the partition of unity. */
+    for (int k = 0; k < N_BINS; k++) {
         double sum = 0.0;
-        for (int b = 0; b < RNNOISE_N_BANDS; b++) sum += (double)rnn_erb_inv[k][b];
-        if (fabs(sum - 1.0) > tol) {
-            printf("FAIL: rnn_erb_inv row (bin) %d sums to %.9f, expected 1.0 +/- %.3g\n", k, sum, tol);
-            ok = 0;
+        for (int b = 0; b < N_BANDS; b++) sum += (double)inv[(size_t)b * N_BINS + k];
+        if (fabs(sum - 1.0) > 1e-5) {
+            ++g_fail;
+            printf("FAIL [partition_of_unity] bin %d sums to %.9f\n", k, sum);
         }
     }
-    return ok;
-}
-
-/* rnn_erb_fwd is rnn_erb_inv with the two end bands (index 0 and N-1)
- * doubled -- an EXACT relation (multiplying a finite float already in
- * [0,1] by 2.0f is exact, no rounding), so this uses `!=`, not a tolerance. */
-static int check_erb_fwd_matches_inv_except_ends(void) {
-    int ok = 1;
-    const int last = RNNOISE_N_BANDS - 1;
-    for (int k = 0; k < RNNOISE_N_BINS; k++) {
-        for (int b = 0; b < RNNOISE_N_BANDS; b++) {
-            float inv = rnn_erb_inv[k][b];
-            float fwd = rnn_erb_fwd[k][b];
-            int is_end = (b == 0 || b == last);
-            float expect = is_end ? 2.0f * inv : inv;
-            if (fwd != expect) {
-                printf("FAIL: rnn_erb_fwd[%d][%d]=%.9g, expected %.9g (%s rnn_erb_inv)\n",
-                       k, b, (double)fwd, (double)expect, is_end ? "2x" : "same as");
-                ok = 0;
+    /* Forward is the inverse with the two end bands doubled (exact: a power-of-two scale). */
+    for (int k = 0; k < N_BINS; k++) {
+        for (int b = 0; b < N_BANDS; b++) {
+            float inv_kb = inv[(size_t)b * N_BINS + k];
+            float want = (b == 0 || b == N_BANDS - 1) ? 2.0f * inv_kb : inv_kb;
+            if (fwd[(size_t)k * N_BANDS + b] != want) {
+                ++g_fail;
+                printf("FAIL [forward_vs_inverse] bin %d band %d: %.9g, expected %.9g\n",
+                       k, b, (double)fwd[(size_t)k * N_BANDS + b], (double)want);
+                return;
             }
         }
     }
-    return ok;
 }
 
-/* [0,1] 範圍、w[0]==0, 以及週期性隱含的對稱 w[i]~w[WIN_LEN-i]。兩側角度
- * `2.0f*(float)M_PI*i/WIN_LEN` 與 `2.0f*(float)M_PI*(WIN_LEN-i)/WIN_LEN` 是不同的
- * float 運算式 (各自捨入), 所以只用寬鬆的 ULP 上界檢查; 鏡像 index 是 WIN_LEN-i
- * (不是 WIN_LEN-1-i)。 */
-#define RNN_HANN_SYMMETRY_MAX_ULP 4096u
-static int check_hann_window_contract(void) {
-    int ok = 1;
-    if (rnn_hann_win[0] != 0.0f) {
-        printf("FAIL: rnn_hann_win[0]=%.9g, expected exactly 0.0f\n", (double)rnn_hann_win[0]);
-        ok = 0;
+/* The reader accepts the pair and refuses a short, a long, an empty or a missing file. */
+static int read_variant(const unsigned char *fwd_raw, size_t fwd_bytes,
+                        const unsigned char *inv_raw, size_t inv_bytes, int n_bins, int n_erb) {
+    FILE *ff = tmpfile();
+    FILE *fi = tmpfile();
+    RnnErb erb;
+    int status = RNN_ERB_ERR_IO;
+    if (ff && fi &&
+        (fwd_bytes == 0 || fwrite(fwd_raw, 1u, fwd_bytes, ff) == fwd_bytes) &&
+        (inv_bytes == 0 || fwrite(inv_raw, 1u, inv_bytes, fi) == inv_bytes)) {
+        rewind(ff);
+        rewind(fi);
+        status = rnn_erb_read(ff, fi, n_bins, n_erb, &erb);
+        if (status == RNN_ERB_OK) rnn_erb_free(&erb);
     }
-    for (int i = 0; i < RNNOISE_WIN_LEN; i++) {
-        if (rnn_hann_win[i] < 0.0f || rnn_hann_win[i] > 1.0f) {
-            printf("FAIL: rnn_hann_win[%d]=%.9g out of [0,1]\n", i, (double)rnn_hann_win[i]);
-            ok = 0;
-        }
-    }
-    uint32_t worst_sym_ulp = 0;
-    for (int i = 1; i < RNNOISE_WIN_LEN; i++) {
-        int mirror = RNNOISE_WIN_LEN - i;
-        uint32_t d = ulp_distance(rnn_hann_win[i], rnn_hann_win[mirror]);
-        if (d > worst_sym_ulp) worst_sym_ulp = d;
-        if (d > RNN_HANN_SYMMETRY_MAX_ULP) {
-            printf("FAIL: rnn_hann_win[%d]=%.9g vs rnn_hann_win[%d]=%.9g: %u ULP apart "
-                   "(formula symmetry bound %u)\n",
-                   i, (double)rnn_hann_win[i], mirror, (double)rnn_hann_win[mirror],
-                   d, (unsigned)RNN_HANN_SYMMETRY_MAX_ULP);
-            ok = 0;
-        }
-    }
-    if (ok) {
-        printf("INFO: measured max hann-window mirror-pair ULP distance = %u\n", worst_sym_ulp);
-    }
-    return ok;
+    if (ff) fclose(ff);
+    if (fi) fclose(fi);
+    return status;
 }
 
-/* ── recompute-vs-table max-ULP report (garbage-detector, NOT a bit contract) ── */
-static uint32_t max_ulp_over_tables(void) {
-    uint32_t worst = 0;
-    for (int k = 0; k < RNNOISE_N_BINS; k++) {
-        for (int b = 0; b < RNNOISE_N_BANDS; b++) {
-            uint32_t d1 = ulp_distance(ref_erb_fwd[k][b], rnn_erb_fwd[k][b]);
-            uint32_t d2 = ulp_distance(ref_erb_inv[k][b], rnn_erb_inv[k][b]);
-            if (d1 > worst) worst = d1;
-            if (d2 > worst) worst = d2;
-        }
-    }
-    for (int i = 0; i < RNNOISE_WIN_LEN; i++) {
-        uint32_t d = ulp_distance(ref_hann_win[i], rnn_hann_win[i]);
-        if (d > worst) worst = d;
-    }
-    return worst;
+static unsigned char *slurp(const char *path, size_t bytes) {
+    unsigned char *raw = (unsigned char *)malloc(bytes + 2u);
+    FILE *f = fopen(path, "rb");
+    size_t got = (f && raw) ? fread(raw, 1u, bytes + 1u, f) : 0u;
+    if (f) fclose(f);
+    if (!raw || got != bytes) { free(raw); return NULL; }
+    return raw;
 }
 
-/* recompute-vs-table 的門檻刻意寬鬆: 不同 libm/編譯器/目標對 log/exp/cos/sqrt 的
- * 捨入可以不同而仍然正確。256 ULP 仍能抓出整個算式錯誤、表格對調或 regen 損毀。 */
-#define RNN_TABLES_PORTABLE_MAX_ULP 256u
+static void check_reader(const char *fwd_path, const char *inv_path) {
+    const size_t bytes = (size_t)N_BINS * N_BANDS * sizeof(float);
+    unsigned char *fwd = slurp(fwd_path, bytes);
+    unsigned char *inv = slurp(inv_path, bytes);
+    RnnErb erb;
+    CHECK("reader.file_size", fwd && inv);
+    if (!fwd || !inv) { free(fwd); free(inv); return; }
+    fwd[bytes] = inv[bytes] = 0u;   /* the byte a long file would carry */
 
-#endif /* RNN_TABLES_PORTABLE */
+    CHECK("reader.ok", read_variant(fwd, bytes, inv, bytes, N_BINS, N_BANDS) == RNN_ERB_OK);
+    CHECK("reader.path_missing", rnn_erb_read_paths("/nonexistent/erb_fwd.bin", inv_path,
+          N_BINS, N_BANDS, &erb) == RNN_ERB_ERR_IO);
+    CHECK("reader.inv_path_missing", rnn_erb_read_paths(fwd_path, "/nonexistent/erb_inv.bin",
+          N_BINS, N_BANDS, &erb) == RNN_ERB_ERR_IO);
+    CHECK("reader.fwd_empty", read_variant(fwd, 0u, inv, bytes, N_BINS, N_BANDS) == RNN_ERB_ERR_SIZE);
+    CHECK("reader.inv_empty", read_variant(fwd, bytes, inv, 0u, N_BINS, N_BANDS) == RNN_ERB_ERR_SIZE);
+    CHECK("reader.fwd_one_short", read_variant(fwd, bytes - 1u, inv, bytes, N_BINS, N_BANDS) ==
+          RNN_ERB_ERR_SIZE);
+    CHECK("reader.inv_one_short", read_variant(fwd, bytes, inv, bytes - 1u, N_BINS, N_BANDS) ==
+          RNN_ERB_ERR_SIZE);
+    CHECK("reader.fwd_one_float_short", read_variant(fwd, bytes - 4u, inv, bytes, N_BINS, N_BANDS) ==
+          RNN_ERB_ERR_SIZE);
+    CHECK("reader.fwd_one_long", read_variant(fwd, bytes + 1u, inv, bytes, N_BINS, N_BANDS) ==
+          RNN_ERB_ERR_SIZE);
+    CHECK("reader.inv_one_long", read_variant(fwd, bytes, inv, bytes + 1u, N_BINS, N_BANDS) ==
+          RNN_ERB_ERR_SIZE);
+    CHECK("reader.grid_larger", read_variant(fwd, bytes, inv, bytes, N_BINS, N_BANDS + 1) ==
+          RNN_ERB_ERR_SIZE);
+    CHECK("reader.grid_smaller", read_variant(fwd, bytes, inv, bytes, N_BINS, N_BANDS - 1) ==
+          RNN_ERB_ERR_SIZE);
+    free(fwd);
+    free(inv);
+}
 
-int main(void) {
-    ref_compute_erb_tables();
-    ref_compute_window_table();
+int main(int argc, char **argv) {
+    RnnErb erb;
+    int status;
 
-    int ok = 1;
-
-#ifndef RNN_TABLES_PORTABLE
-    /* ── Layer 1 (DEFAULT): canonical-toolchain bit-exact memcmp ── */
-    if (memcmp(ref_nfftborder, rnn_nfftborder, sizeof(ref_nfftborder)) != 0) {
-        printf("FAIL: rnn_nfftborder mismatch\n");
-        ok = 0;
+    if (argc != 3) {
+        fprintf(stderr, "usage: %s ERB_FWD_FILE ERB_INV_FILE\n", argv[0]);
+        return 2;
     }
-    if (memcmp(ref_erb_fwd, rnn_erb_fwd, sizeof(ref_erb_fwd)) != 0) {
-        printf("FAIL: rnn_erb_fwd mismatch\n");
-        ok = 0;
+    status = rnn_erb_read_paths(argv[1], argv[2], N_BINS, N_BANDS, &erb);
+    if (status != RNN_ERB_OK) {
+        printf("FAIL: %s and %s are not matching raw float32 files (status %d)\n",
+               argv[1], argv[2], status);
+        return 1;
     }
-    if (memcmp(ref_erb_inv, rnn_erb_inv, sizeof(ref_erb_inv)) != 0) {
-        printf("FAIL: rnn_erb_inv mismatch\n");
-        ok = 0;
-    }
-    if (memcmp(ref_hann_win, rnn_hann_win, sizeof(ref_hann_win)) != 0) {
-        printf("FAIL: rnn_hann_win mismatch\n");
-        ok = 0;
-    }
+    ref_compute_erb_matrices();
+    check_equal("forward", erb.fwd, &ref_fwd[0][0], (size_t)N_BINS * N_BANDS);
+    check_equal("inverse", erb.inv, &ref_inv[0][0], (size_t)N_BANDS * N_BINS);
+    check_contracts(erb.fwd, erb.inv);
+    check_reader(argv[1], argv[2]);
+    rnn_erb_free(&erb);
 
-    if (ok) {
-        printf("PASS: rnnoise_tables_gen.h byte-identical to reference algorithm "
-               "(nfftborder[%d], erb_fwd[%d][%d], erb_inv[%d][%d], hann_win[%d])\n",
-               RNNOISE_N_BANDS, RNNOISE_N_BINS, RNNOISE_N_BANDS,
-               RNNOISE_N_BINS, RNNOISE_N_BANDS, RNNOISE_WIN_LEN);
-    }
-#else
-    /* ── Layer 2 (-DRNN_TABLES_PORTABLE): mathematical-contract checks ── */
-    if (!check_all_finite())                        ok = 0;
-    if (!check_nfftborder_monotone_pinned())         ok = 0;
-    if (!check_erb_inv_partition_of_unity(1e-5))     ok = 0;
-    if (!check_erb_fwd_matches_inv_except_ends())    ok = 0;
-    if (!check_hann_window_contract())               ok = 0;
-
-    uint32_t worst_ulp = max_ulp_over_tables();
-    printf("INFO: measured max ULP (recompute vs table, this host) = %u\n", worst_ulp);
-    if (worst_ulp > RNN_TABLES_PORTABLE_MAX_ULP) {
-        printf("FAIL: measured max ULP %u exceeds garbage-detector bound %u\n",
-               worst_ulp, (unsigned)RNN_TABLES_PORTABLE_MAX_ULP);
-        ok = 0;
-    }
-
-    if (ok) {
-        printf("PASS (portable): rnnoise_tables_gen.h satisfies the mathematical "
-               "table contracts (finite; nfftborder monotone+pinned [0,%d]; "
-               "erb_inv partition-of-unity; erb_fwd = 2x*erb_inv at end bands "
-               "else equal; hann window in [0,1] with formula symmetry), "
-               "max ULP vs recompute = %u\n",
-               RNNOISE_N_FFT / 2 + 1, worst_ulp);
-    }
-#endif
-
-    return ok ? 0 : 1;
+    if (g_fail != 0) return 1;
+    printf("PASS: ERB matrix files match the independent recompute (forward [%d][%d] bin-major, "
+           "inverse [%d][%d] band-major); matrix contracts and reader refusals hold\n",
+           N_BINS, N_BANDS, N_BANDS, N_BINS);
+    return 0;
 }

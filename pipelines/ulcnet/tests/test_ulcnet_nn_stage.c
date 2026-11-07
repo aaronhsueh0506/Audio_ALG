@@ -1,7 +1,8 @@
 /* Stage-level tests of ulcnet/ulcnet_nn_stage.h: the hop order, the identity paths, the
- * model-call policy (reprime, alignment events, fail-open) and the descriptor gate, driven by
- * synthetic alignment events and deterministic models. Expected outputs come from an
- * independently built STFT/WOLA chain. Build and run: `make test` in pipelines/. */
+ * model-call policy (reprime, alignment events, fail-open), the grid and pool plan and the
+ * descriptor gate, driven by synthetic alignment events and deterministic models. Expected
+ * outputs come from an independently built STFT/WOLA chain. One binary runs every grid of the
+ * table below. Build and run: `make test` in pipelines/. */
 #include <math.h>
 #include <stdint.h>
 #include <stdio.h>
@@ -11,8 +12,17 @@
 #include "ulcnet/ulcnet_nn_stage.h"
 #include "utility/mem_align.h"
 
-#define HOP ULCNET_HOP
-#define BINS ULCNET_BINS
+/* Largest row of the grid table: 48 kHz / fft 1024. */
+enum { HOP_MAX = 512, BINS_MAX = 513 };
+
+static const UlcnetGridSpec k_grids[] = {
+    { .sample_rate = 16000, .n_fft = 512,  .delay_depth = 8 },
+    { .sample_rate = 48000, .n_fft = 1024, .delay_depth = 8 },
+};
+
+static UlcnetGrid g_grid;   /* the grid under test */
+#define HOP (g_grid.hop)
+#define BINS (g_grid.n_bins)
 
 static int g_fail;
 #define CHECK(c, msg) do { if (!(c)) { printf("FAIL: %s (line %d)\n", msg, __LINE__); ++g_fail; } } while (0)
@@ -32,9 +42,7 @@ static void* pool_of(size_t bytes, int fill) {
 
 static const UlcnetModelIoDescriptor* io_descriptor(void) {
     static UlcnetModelIoDescriptor d;
-    static int ready;
-    if (!ready && ulcnet_model_io_descriptor_default(8, &d) == 0) ready = 1;
-    return ready ? &d : NULL;
+    return ulcnet_model_io_descriptor_default(&g_grid, &d) == 0 ? &d : NULL;
 }
 
 /* ---- models ---- */
@@ -49,8 +57,8 @@ typedef struct ModelState {
 typedef enum { M_COPY, M_FAIL, M_HALF_WRITE, M_NAN, M_SCALE } ModelKind;
 static ModelKind g_kind;
 
-static int model_infer(void* user, const float er[BINS], const float ei[BINS],
-                       const float fr[BINS], const float fi[BINS], float orr[BINS], float oi[BINS]) {
+static int model_infer(void* user, const float* er, const float* ei,
+                       const float* fr, const float* fi, float* orr, float* oi) {
     ModelState* st = (ModelState*)user;
     int k, all_nan = 1;
     st->infer_calls++;
@@ -60,7 +68,9 @@ static int model_infer(void* user, const float er[BINS], const float ei[BINS],
                             memcmp(fi, st->want_far_im, sizeof(float) * BINS) != 0))
         st->saw_far_mismatch = 1;
     switch (g_kind) {
-        case M_FAIL: return -1;
+        case M_FAIL:   /* finite garbage written, failure reported: the stage must discard it */
+            for (k = 0; k < BINS; ++k) { orr[k] = 2.0f * er[k]; oi[k] = 2.0f * ei[k]; }
+            return -1;
         case M_HALF_WRITE:
             memcpy(orr, er, sizeof(float) * (BINS / 2));
             memcpy(oi, ei, sizeof(float) * (BINS / 2));
@@ -103,7 +113,8 @@ typedef struct Ref {
 static int ref_init(Ref* r) {
     AcStftConfig sc;
     size_t b1, b2;
-    ulcnet_framing_config(&sc, NULL, NULL, 0);
+    ac_stft_config_default(&sc, g_grid.n_fft);
+    sc.ola = AC_OLA_ENV_NORM;
     b1 = ac_stft_get_mem_size(&sc);
     b2 = ac_istft_get_mem_size(&sc);
     r->m1 = pool_of(b1, 0);
@@ -117,9 +128,9 @@ static void ref_free(Ref* r) { free(r->m1); free(r->m2); }
 
 /* A stage and the hops it is fed. */
 static UlcnetNnStage* make_stage(int err_analysis, void** pool_out, int fill) {
-    size_t bytes = ulcnet_nn_stage_mem_size(err_analysis);
+    size_t bytes = ulcnet_nn_stage_mem_size(&g_grid, err_analysis);
     void* pool = pool_of(bytes, fill);
-    UlcnetNnStage* s = pool ? ulcnet_nn_stage_init(pool, bytes, err_analysis) : NULL;
+    UlcnetNnStage* s = pool ? ulcnet_nn_stage_init(pool, bytes, &g_grid, err_analysis) : NULL;
     *pool_out = pool;
     return s;
 }
@@ -158,10 +169,11 @@ static void test_identity_all_entries(void) {
     UlcnetNnStage *planar = make_stage(0, &p1, 0xCD), *cplx = make_stage(0, &p2, 0xCD),
                   *timed = make_stage(1, &p3, 0xCD);
     Ref ref;
-    float err[HOP], far[HOP], re[BINS], im[BINS], want[HOP];
-    float o1[HOP], o2[HOP], o3[HOP];
-    Complex c[BINS];
+    float err[HOP_MAX], far[HOP_MAX], re[BINS_MAX], im[BINS_MAX], want[HOP_MAX];
+    float o1[HOP_MAX], o2[HOP_MAX], o3[HOP_MAX];
+    Complex c[BINS_MAX];
     int h, i, bad_planar = 0, bad_complex = 0, bad_timed = 0, hop0_zero = 1;
+    size_t hop_bytes = (size_t)HOP * sizeof(float);
     double energy = 0.0;
     CHECK(planar && cplx && timed && ref_init(&ref) == 0, "identity: setup");
     if (!planar || !cplx || !timed) { free(p1); free(p2); free(p3); return; }
@@ -174,7 +186,7 @@ static void test_identity_all_entries(void) {
         /* with no model the frame is the identity: the expected hop is the reference WOLA */
         {
             int w = ac_istft_push_planar(ref.istft, re, im, want);
-            if (w == 0) memset(want, 0, sizeof want);
+            if (w == 0) memset(want, 0, hop_bytes);
         }
         if (ulcnet_nn_stage_begin(planar, re, im, far, ev(0, 0)) != 0 ||
             ulcnet_nn_stage_process(planar, o1) != 0) bad_planar++;
@@ -182,9 +194,9 @@ static void test_identity_all_entries(void) {
             ulcnet_nn_stage_process(cplx, o2) != 0) bad_complex++;
         if (ulcnet_nn_stage_begin_time(timed, err, far, ev(0, 0)) != 0 ||
             ulcnet_nn_stage_process(timed, o3) != 0) bad_timed++;
-        if (memcmp(o1, want, sizeof want) != 0) bad_planar++;
-        if (memcmp(o2, want, sizeof want) != 0) bad_complex++;
-        if (memcmp(o3, want, sizeof want) != 0) bad_timed++;
+        if (memcmp(o1, want, hop_bytes) != 0) bad_planar++;
+        if (memcmp(o2, want, hop_bytes) != 0) bad_complex++;
+        if (memcmp(o3, want, hop_bytes) != 0) bad_timed++;
         if (h == 0) for (i = 0; i < HOP; ++i) if (o1[i] != 0.0f || o2[i] != 0.0f || o3[i] != 0.0f) hop0_zero = 0;
         if (h > 0) for (i = 0; i < HOP; ++i) energy += fabs((double)o1[i]);
     }
@@ -212,7 +224,7 @@ static int run_schedule(const Sched* sc, int n, ModelKind kind, ModelState* st, 
     void* pool;
     UlcnetNnStage* s = make_stage(0, &pool, 0);
     UlcnetModel m = make_model(st);
-    float err_re[BINS], err_im[BINS], far[HOP], out[HOP];
+    float err_re[BINS_MAX], err_im[BINS_MAX], far[HOP_MAX], out[HOP_MAX];
     int h;
     if (!s) { free(pool); return -1; }
     g_kind = kind;
@@ -229,7 +241,7 @@ static int run_schedule(const Sched* sc, int n, ModelKind kind, ModelState* st, 
             free(pool);
             return -1;
         }
-        if (outs) memcpy(outs + (size_t)h * HOP, out, sizeof out);
+        if (outs) memcpy(outs + (size_t)h * HOP, out, (size_t)HOP * sizeof(float));
     }
     free(pool);
     return 0;
@@ -286,7 +298,8 @@ static void test_counting_and_events(void) {
 
 static void test_model_policy(void) {
     enum { N = 50 };
-    static float ident[N * HOP], mod[N * HOP];
+    static float ident[N * HOP_MAX], mod[N * HOP_MAX];
+    size_t run_bytes = (size_t)N * (size_t)HOP * sizeof(float);
     ModelState st;
     Sched sc;
     int k, h, differs;
@@ -299,29 +312,30 @@ static void test_model_policy(void) {
     {   /* the identity reference: no model at all */
         void* pool;
         UlcnetNnStage* s = make_stage(0, &pool, 0);
-        float err_re[BINS], err_im[BINS], far[HOP], out[HOP];
+        float err_re[BINS_MAX], err_im[BINS_MAX], far[HOP_MAX], out[HOP_MAX];
         int bad = 0;
         g_lcg = 5u;
         for (h = 0; h < N; ++h) {
             for (k = 0; k < BINS; ++k) { err_re[k] = lcg_unit(); err_im[k] = lcg_unit(); }
             fill_hop(far, HOP);
             if (ulcnet_nn_stage_begin(s, err_re, err_im, far, sched_event(&sc, h)) != 0 ||
-                ulcnet_nn_stage_process(s, out) != 0 || memcmp(out, ident + (size_t)h * HOP, sizeof out) != 0)
+                ulcnet_nn_stage_process(s, out) != 0 ||
+                memcmp(out, ident + (size_t)h * HOP, (size_t)HOP * sizeof(float)) != 0)
                 bad++;
         }
         CHECK(bad == 0, "policy: a model that copies its input is the identity (equals no model)");
         free(pool);
     }
-    CHECK(run_schedule(&sc, N, M_FAIL, &st, mod) == 0 && memcmp(mod, ident, sizeof mod) == 0,
+    CHECK(run_schedule(&sc, N, M_FAIL, &st, mod) == 0 && memcmp(mod, ident, run_bytes) == 0,
           "policy: a failing model falls open to the identity");
-    CHECK(run_schedule(&sc, N, M_HALF_WRITE, &st, mod) == 0 && memcmp(mod, ident, sizeof mod) == 0,
+    CHECK(run_schedule(&sc, N, M_HALF_WRITE, &st, mod) == 0 && memcmp(mod, ident, run_bytes) == 0,
           "policy: a model that leaves bins unwritten (NaN staging) falls open");
-    CHECK(run_schedule(&sc, N, M_NAN, &st, mod) == 0 && memcmp(mod, ident, sizeof mod) == 0,
+    CHECK(run_schedule(&sc, N, M_NAN, &st, mod) == 0 && memcmp(mod, ident, run_bytes) == 0,
           "policy: a non-finite output bin falls open");
     CHECK(run_schedule(&sc, N, M_SCALE, &st, mod) == 0 && st.saw_nan_prefill, "policy: scale model run; out staging was NaN-filled");
     differs = 0;
     for (h = 2; h < N; ++h)
-        if (memcmp(mod + (size_t)h * HOP, ident + (size_t)h * HOP, HOP * sizeof(float)) != 0) differs = 1;
+        if (memcmp(mod + (size_t)h * HOP, ident + (size_t)h * HOP, (size_t)HOP * sizeof(float)) != 0) differs = 1;
     CHECK(differs, "policy: an accepted model output reaches the synthesis");
 }
 
@@ -332,7 +346,7 @@ static void test_model_sees_the_hop(void) {
     ModelState st;
     UlcnetModel m = make_model(&st);
     Ref far_ref;
-    float err_re[BINS], err_im[BINS], far[HOP], fre[BINS], fim[BINS], out[HOP];
+    float err_re[BINS_MAX], err_im[BINS_MAX], far[HOP_MAX], fre[BINS_MAX], fim[BINS_MAX], out[HOP_MAX];
     int h, k, bad_far = 0;
     CHECK(s && ref_init(&far_ref) == 0, "inputs: setup");
     if (!s) { free(pool); return; }
@@ -360,19 +374,22 @@ static void test_model_sees_the_hop(void) {
 static void test_reset_and_sequence(void) {
     void* pool;
     UlcnetNnStage* s = make_stage(0, &pool, 0);
+    size_t pool_bytes = ulcnet_nn_stage_mem_size(&g_grid, 0);
+    void* before = pool_of(pool_bytes, 0);
     ModelState st;
     UlcnetModel m = make_model(&st);
-    float re[BINS], im[BINS], far[HOP], out[HOP], first[HOP];
+    float re[BINS_MAX], im[BINS_MAX], far[HOP_MAX], out[HOP_MAX], first[HOP_MAX];
     UlcnetNnJob job;
     int h, k;
-    CHECK(s != NULL, "sequence: setup");
-    if (!s) { free(pool); return; }
+    CHECK(s != NULL && before != NULL, "sequence: setup");
+    if (!s || !before) { free(pool); free(before); return; }
     memset(&st, 0, sizeof st);
     g_kind = M_COPY;
     CHECK(ulcnet_nn_stage_set_model(s, &m) == 0, "sequence: model installed");
     for (k = 0; k < BINS; ++k) { re[k] = 0.01f * (float)k; im[k] = -0.02f * (float)k; }
     fill_hop(far, HOP);
 
+    memcpy(before, pool, pool_bytes);
     CHECK(ulcnet_nn_stage_nn_begin(s, &job) == ULCNET_NN_STAGE_SEQUENCE_ERROR, "sequence: nn_begin before begin");
     CHECK(ulcnet_nn_stage_nn_end(s, 0) == ULCNET_NN_STAGE_SEQUENCE_ERROR, "sequence: nn_end without an open frame");
     CHECK(ulcnet_nn_stage_end(s, out) == ULCNET_NN_STAGE_SEQUENCE_ERROR, "sequence: end before begin");
@@ -384,6 +401,7 @@ static void test_reset_and_sequence(void) {
     CHECK(ulcnet_nn_stage_begin_time(s, far, far, ev(0, 0)) == ULCNET_NN_STAGE_INVALID_ARGUMENT,
           "sequence: the time-domain entry needs a stage built with err_analysis");
     CHECK(st.reset_calls == 0 && st.infer_calls == 0, "sequence: refused calls touch nothing");
+    CHECK(memcmp(before, pool, pool_bytes) == 0, "sequence: refused calls leave the stage block bytes unchanged");
 
     CHECK(ulcnet_nn_stage_begin(s, re, im, far, ev(0, 0)) == 0, "sequence: begin");
     CHECK(ulcnet_nn_stage_begin(s, re, im, far, ev(0, 0)) == ULCNET_NN_STAGE_SEQUENCE_ERROR,
@@ -417,6 +435,7 @@ static void test_reset_and_sequence(void) {
     CHECK(k == HOP, "reset: the next hop is hop #0 (zeros)");
     ulcnet_nn_stage_reset(NULL);
     free(pool);
+    free(before);
 }
 
 static void test_phased_twin_and_pools(void) {
@@ -425,7 +444,8 @@ static void test_phased_twin_and_pools(void) {
     UlcnetNnStage *a = make_stage(0, &pa, 0), *b = make_stage(0, &pb, 0xCD), *c = make_stage(0, &pc, 0);
     ModelState sa, sb, sc_;
     UlcnetModel ma = make_model(&sa), mb = make_model(&sb), mc = make_model(&sc_);
-    float re[BINS], im[BINS], far[HOP], oa[HOP], ob[HOP], oc[HOP];
+    float re[BINS_MAX], im[BINS_MAX], far[HOP_MAX], oa[HOP_MAX], ob[HOP_MAX], oc[HOP_MAX];
+    size_t hop_bytes = (size_t)HOP * sizeof(float);
     int h, k, bad_twin = 0, bad_pool = 0;
     CHECK(a && b && c, "twin: setup");
     if (!a || !b || !c) { free(pa); free(pb); free(pc); return; }
@@ -441,22 +461,108 @@ static void test_phased_twin_and_pools(void) {
         if (ulcnet_nn_stage_begin(a, re, im, far, d) != 0 || ulcnet_nn_stage_process(a, oa) != 0) bad_twin++;
         if (ulcnet_nn_stage_begin(b, re, im, far, d) != 0 || phased_hop(b, &mb, ob) != 0) bad_twin++;
         if (ulcnet_nn_stage_begin(c, re, im, far, d) != 0 || ulcnet_nn_stage_process(c, oc) != 0) bad_pool++;
-        if (memcmp(oa, ob, sizeof oa) != 0) bad_twin++;
-        if (memcmp(oa, oc, sizeof oa) != 0) bad_pool++;
+        if (memcmp(oa, ob, hop_bytes) != 0) bad_twin++;
+        if (memcmp(oa, oc, hop_bytes) != 0) bad_pool++;
     }
     CHECK(bad_twin == 0 && sa.infer_calls == sb.infer_calls && sa.reset_calls == sb.reset_calls,
           "twin: process() and the phased calls agree bit for bit, calls and resets included");
     CHECK(bad_pool == 0, "pools: a stale (0xCD) pool initialises like a zeroed one");
-    {
-        void* tiny = pool_of(ulcnet_nn_stage_mem_size(0), 0);
-        size_t full = ulcnet_nn_stage_mem_size(0);
-        CHECK(full > 0 && ulcnet_nn_stage_mem_size(1) > full, "pools: the error STFT adds bytes");
-        CHECK(tiny && ulcnet_nn_stage_init(tiny, full - 16, 0) == NULL, "pools: short pool refused");
-        CHECK(tiny && ulcnet_nn_stage_init((uint8_t*)tiny + 8, full, 0) == NULL, "pools: misaligned pool refused");
-        CHECK(ulcnet_nn_stage_init(NULL, full, 0) == NULL, "pools: NULL pool refused");
-        free(tiny);
-    }
     free(pa); free(pb); free(pc);
+}
+
+/* The grid and the pool plan: what the stage refuses, that a refusal leaves the block bytes
+ * alone, and that the plan is exactly what init carves. */
+static void test_grid_and_pool_plan(void) {
+    size_t full = ulcnet_nn_stage_mem_size(&g_grid, 0);
+    size_t full_err = ulcnet_nn_stage_mem_size(&g_grid, 1);
+    size_t pass;
+    UlcnetGrid bad;
+    UlcnetNnStage* s;
+    int variant;
+
+    printf("  stage pool %zu bytes, with the error analysis %zu bytes (%d Hz / fft %d)\n",
+           full, full_err, g_grid.sample_rate, g_grid.n_fft);
+    CHECK(full > 0 && full_err > full, "pools: the error STFT adds bytes");
+    CHECK(full % 16 == 0 && full_err % 16 == 0, "pools: the plan is a multiple of 16 bytes");
+
+    /* invalid grids are sized 0 and refused by init */
+    CHECK(ulcnet_nn_stage_mem_size(NULL, 0) == 0, "grid: NULL grid has no pool");
+    bad = g_grid; bad.sample_rate = 0;
+    CHECK(ulcnet_nn_stage_mem_size(&bad, 0) == 0, "grid: sample_rate 0 has no pool");
+    bad = g_grid; bad.n_fft = 500;
+    CHECK(ulcnet_nn_stage_mem_size(&bad, 0) == 0, "grid: an n_fft that is not a power of two has no pool");
+    bad = g_grid; bad.hop = g_grid.hop + 1;
+    CHECK(ulcnet_nn_stage_mem_size(&bad, 0) == 0, "grid: an inconsistent hop has no pool");
+    bad = g_grid; bad.n_bins = g_grid.n_bins - 1;
+    CHECK(ulcnet_nn_stage_mem_size(&bad, 0) == 0, "grid: an inconsistent n_bins has no pool");
+    bad = g_grid; bad.delay_depth = ULCNET_MODEL_IO_MAX_D + 1;
+    CHECK(ulcnet_nn_stage_mem_size(&bad, 0) == 0, "grid: a delay depth out of range has no pool");
+
+    /* a refused init leaves the block bytes exactly as they were */
+    for (variant = 0; variant < 6; ++variant) {
+        void* raw = pool_of(full + 32, 0xCD);
+        void* snap = pool_of(full + 32, 0);
+        uint8_t* base = (uint8_t*)raw;
+        const UlcnetGrid* grid = &g_grid;
+        size_t bytes = full;
+        UlcnetNnStage* r;
+        if (!raw || !snap) { CHECK(0, "pools: refusal setup"); free(raw); free(snap); continue; }
+        memcpy(snap, raw, full + 32);
+        if (variant == 0) bytes = full - 16;
+        if (variant == 1) base += 8;
+        if (variant == 2) grid = NULL;
+        if (variant == 3) { bad = g_grid; bad.n_fft = 500; grid = &bad; }
+        if (variant == 4) base = NULL;
+        if (variant == 5) { bad = g_grid; bad.delay_depth = 1; grid = &bad; }
+        r = ulcnet_nn_stage_init(base, bytes, grid, 0);
+        CHECK(r == NULL, "pools: short, misaligned, NULL and invalid-grid init is refused");
+        CHECK(memcmp(snap, raw, full + 32) == 0, "pools: a refused init leaves the block bytes unchanged");
+        free(raw); free(snap);
+    }
+
+    /* the plan is exact: a stage placed at the end of a poisoned block never writes past it,
+     * and the last bytes of the plan are written */
+    for (pass = 0; pass < 2; ++pass) {
+        size_t bytes = pass ? full_err : full;
+        uint8_t* raw = (uint8_t*)pool_of(bytes + 64, 0xA5);
+        size_t hw = 0, i;
+        float re[BINS_MAX], im[BINS_MAX], far[HOP_MAX], out[HOP_MAX], err[HOP_MAX];
+        if (!raw) { CHECK(0, "pools: exactness setup"); continue; }
+        s = ulcnet_nn_stage_init(raw, bytes, &g_grid, (int)pass);
+        CHECK(s != NULL, "pools: the exact block initialises");
+        if (s) {
+            int h;
+            g_lcg = 99u;
+            for (h = 0; h < 6; ++h) {
+                int k;
+                for (k = 0; k < BINS; ++k) { re[k] = lcg_unit(); im[k] = lcg_unit(); }
+                fill_hop(far, HOP);
+                fill_hop(err, HOP);
+                if (pass) (void)ulcnet_nn_stage_begin_time(s, err, far, ev(0, 0));
+                else (void)ulcnet_nn_stage_begin(s, re, im, far, ev(0, 0));
+                (void)ulcnet_nn_stage_process(s, out);
+            }
+        }
+        for (i = 0; i < bytes; ++i) if (raw[i] != 0xA5) hw = i + 1;
+        for (i = bytes; i < bytes + 64; ++i) if (raw[i] != 0xA5) break;
+        CHECK(i == bytes + 64, "pools: nothing past the planned bytes is written");
+        CHECK(hw + 16 > bytes, "pools: the plan has no unused tail (within one 16-byte slot)");
+        free(raw);
+    }
+
+    /* the stage keeps its own copy of the grid */
+    {
+        void* pool;
+        UlcnetGrid copy = g_grid;
+        size_t bytes = ulcnet_nn_stage_mem_size(&copy, 0);
+        pool = pool_of(bytes, 0);
+        s = pool ? ulcnet_nn_stage_init(pool, bytes, &copy, 0) : NULL;
+        copy.n_fft = 0;
+        CHECK(s && ulcnet_nn_stage_grid(s) && memcmp(ulcnet_nn_stage_grid(s), &g_grid, sizeof g_grid) == 0,
+              "grid: the stage keeps its own copy of the grid");
+        CHECK(ulcnet_nn_stage_grid(NULL) == NULL, "grid: NULL stage has no grid");
+        free(pool);
+    }
 }
 
 static void test_model_gate(void) {
@@ -466,7 +572,7 @@ static void test_model_gate(void) {
     UlcnetModel m = make_model(&st);
     UlcnetModelIoDescriptor aligned;
     UlcnetModel bad;
-    float re[BINS], im[BINS], far[HOP], out[HOP];
+    float re[BINS_MAX], im[BINS_MAX], far[HOP_MAX], out[HOP_MAX];
     int k;
     CHECK(s && io_descriptor(), "gate: setup");
     if (!s) { free(pool); return; }
@@ -486,6 +592,33 @@ static void test_model_gate(void) {
     aligned.delay_depth = 1;
     bad.io_descriptor = &aligned;
     CHECK(ulcnet_nn_stage_set_model(s, &bad) == -1, "gate: a descriptor with D out of range is refused");
+    {   /* a descriptor of another grid is refused, field by field */
+        UlcnetModelIoDescriptor other;
+        UlcnetGrid og;
+        UlcnetGridSpec spec = k_grids[0];
+        if (g_grid.n_fft == k_grids[0].n_fft) spec = k_grids[1];
+        CHECK(ulcnet_grid_make(&og, &spec) == ULCNET_GRID_OK &&
+              ulcnet_model_io_descriptor_default(&og, &other) == 0, "gate: the other grid's descriptor builds");
+        bad = m;
+        bad.io_descriptor = &other;
+        CHECK(ulcnet_nn_stage_set_model(s, &bad) == -1, "gate: a descriptor of the other grid is refused");
+        aligned = *io_descriptor();
+        aligned.sample_rate = other.sample_rate;
+        bad.io_descriptor = &aligned;
+        CHECK(ulcnet_nn_stage_set_model(s, &bad) == -1, "gate: a descriptor with another sample rate is refused");
+        aligned = *io_descriptor();
+        aligned.fft_size = other.fft_size;
+        bad.io_descriptor = &aligned;
+        CHECK(ulcnet_nn_stage_set_model(s, &bad) == -1, "gate: a descriptor with another fft size is refused");
+        aligned = *io_descriptor();
+        aligned.hop_size += 1;
+        bad.io_descriptor = &aligned;
+        CHECK(ulcnet_nn_stage_set_model(s, &bad) == -1, "gate: a descriptor with another hop is refused");
+        aligned = *io_descriptor();
+        aligned.spectrum_bins += 1;
+        bad.io_descriptor = &aligned;
+        CHECK(ulcnet_nn_stage_set_model(s, &bad) == -1, "gate: a descriptor with another bin count is refused");
+    }
     /* the refused models left the installed one in place */
     for (k = 0; k < BINS; ++k) { re[k] = 0.5f; im[k] = 0.25f; }
     fill_hop(far, HOP);
@@ -503,13 +636,24 @@ static void test_model_gate(void) {
 }
 
 int main(void) {
-    test_identity_all_entries();
-    test_counting_and_events();
-    test_model_policy();
-    test_model_sees_the_hop();
-    test_reset_and_sequence();
-    test_phased_twin_and_pools();
-    test_model_gate();
+    size_t g;
+    for (g = 0; g < sizeof k_grids / sizeof k_grids[0]; ++g) {
+        if (ulcnet_grid_make(&g_grid, &k_grids[g]) != ULCNET_GRID_OK) {
+            printf("FAIL: grid %zu does not build\n", g);
+            return 1;
+        }
+        CHECK(g_grid.hop <= HOP_MAX && g_grid.n_bins <= BINS_MAX, "the table row fits the test buffers");
+        printf("grid %d Hz / fft %d / hop %d / %d bins\n", g_grid.sample_rate, g_grid.n_fft,
+               g_grid.hop, g_grid.n_bins);
+        test_identity_all_entries();
+        test_counting_and_events();
+        test_model_policy();
+        test_model_sees_the_hop();
+        test_reset_and_sequence();
+        test_phased_twin_and_pools();
+        test_grid_and_pool_plan();
+        test_model_gate();
+    }
     if (g_fail) { printf("%d check(s) FAILED\n", g_fail); return 1; }
     printf("ALL PASS\n");
     return 0;

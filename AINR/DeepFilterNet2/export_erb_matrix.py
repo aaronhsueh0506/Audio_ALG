@@ -27,7 +27,7 @@ _SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
 def require_partition_of_unity(inverse_band_major):
     """Refuse an inverse matrix a unit band mask does not expand to exactly
     1.0f per bin through, accumulated band by band in float32 the way
-    ``df_common_expand_mask`` does it.  ``dfn2_prepost_frame_skip``'s identity
+    ``df_common_expand_mask`` does it.  ``dfn2_prepost_frame_bypass``'s identity
     (and every host-side identity gate built on it) is exact only under this
     property, so it is checked bitwise, not within a tolerance."""
     inverse = np.asarray(inverse_band_major, dtype=np.float32)

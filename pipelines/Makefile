@@ -34,8 +34,9 @@
 #   make test-dfn-grids        # the DFN stage, bridge and hop tests built for the 16 and 32 kHz test grids
 #   make NO_STDIO=1 libaudio_pipeline_dfn.a   # stdio-less archive only (no link, so no
 #                              # producer archive is needed)
-#   make audit-no-transform    # PASS/FAIL: no inverse FFT / overlap-add code in the AINR/ and AIAEC/
-#                              # model directories (the synthesis is the application's AcIstft)
+#   make audit-no-transform    # PASS/FAIL: no framing code (analysis or synthesis) in the AINR/ and
+#                              # AIAEC/ model directories; the application's AcStft/AcIstft do it
+#   make audit-dead-defines    # PASS/FAIL: every -D a Makefile passes is read by a C source or header
 #   make audit-no-stdio        # PASS/FAIL: the NO_STDIO=1 libaudio_pipeline_dfn.a has no
 #                              # fprintf/printf/puts/fputs/stderr refs and a keyed path that
 #                              # differs from the default (stdio) config's
@@ -65,72 +66,33 @@ endif
 AEC_DIR = ../lib/aec/c_impl
 NR_DIR  = ../lib/nr/c_impl
 
-# Align-ULCNet C pre/post (STFT/WOLA + UlcnetModel callback boundary) --
-# consumed by the mono Align-ULCNet example and ulcnet/ulcnet_nn_stage.c below. Header-only
-# include path plus one TU (ulcnet_process.c) compiled by THIS Makefile (that file
-# is not in any producer archive). Not part of CFG_SIG's caller-varying
-# axes: a fixed repo-relative constant, like AEC_DIR/NR_DIR above.
+# Align-ULCNet sources (AIAEC/Align_ULCNet): the model-callback output check, the model I/O
+# descriptor, the pre/post class and the accelerator adapter, compiled by the rules below (none
+# is in a producer archive). Fixed repo-relative constants, not part of CFG_SIG's caller-varying
+# axes, like AEC_DIR/NR_DIR above. The Align-ULCNet grid is a run-time value of the programs
+# (--sample-rate) and of the tests; no object here holds one.
 AIAEC_DIR = ../AIAEC
 ULCNET_DIR = $(AIAEC_DIR)/Align_ULCNet
 AINR_DIR = ../AINR
 DFN2_DIR = $(AINR_DIR)/DeepFilterNet2
 
-# Align-ULCNet deployment grid. One binary serves one grid: the C structs
-# embed the STFT/WOLA tables and scratch, so the grid is a build parameter,
-# not a runtime field. Selected by name here rather than by hand-writing the
-# two -D flags into EXTRA_CFLAGS, because EXTRA_CFLAGS is forwarded verbatim
-# to the AEC/NR/audiolib/common producer sub-makes -- none of which contain any
-# ULCNet code -- and would split their object caches for no reason.
-# Applied ONLY to the ULCNet TUs below, and folded into CFG_SIG_PAYLOAD so
-# the two grids never share an object directory.
-ULCNET_GRID ?= 16k
-ifeq ($(ULCNET_GRID),16k)
-ULCNET_GRID_CFLAGS = -DULCNET_MODEL_IO_SR=16000 -DULCNET_MODEL_IO_N_FFT=512
-else ifeq ($(ULCNET_GRID),48k)
-ULCNET_GRID_CFLAGS = -DULCNET_MODEL_IO_SR=48000 -DULCNET_MODEL_IO_N_FFT=1024
-else
-$(error ULCNET_GRID must be 16k or 48k, got '$(ULCNET_GRID)')
-endif
-
-# DeepFilterNet2/3 lookahead pair (AINR/README.md "Lookahead pairs"): mask 0..2, deep filter
-# 0..DF_ORDER-1 (4), plain decimals.
-#   DFN3 is still a build-time pair: a pair other than the default 1/1 becomes -D flags on every
-#   unit this Makefile compiles, so the shipped pair adds no flag and a default build's compile
-#   lines are unchanged.
-#   DFN2 takes its grid at run time: dfn_res_stage, dfn_rate_bridge and the example mains hold no
-#   grid and no pair (the config carries a DFN2Grid), so the pair make variables below only select
-#   what the TEST programs run (DFN_TEST_CFLAGS, applied to the test units alone). The one thing a
-#   pair still asks of every unit is the library's state-ring capacity: a pair whose ring
-#   max(5, mask + df + 1) is deeper than the default capacity of 5 frames (1/4 and 2/3: 6, 2/4: 7)
-#   gets -DDFN2_MAX_DF_RING=<ring> in DFN_PAIR_CFLAGS, because the library takes a capacity on
-#   every translation unit (dfn2_grid.h; objects of different capacities do not link).
-# Both are folded into CFG_SIG_PAYLOAD (CFLAGS carries DFN_PAIR_CFLAGS, the payload names
-# DFN_TEST_CFLAGS): another pair gets its own obj/bin directories.
+# DeepFilterNet2 lookahead pair the test programs run: mask 0..2, deep filter 0..4 (the shipped
+# deep filter has 5 taps), plain decimals. The stage, the rate bridge and the example mains hold
+# neither grid nor pair (the config carries a DFN2Grid).
 DFN2_MASK_LOOKAHEAD ?= 1
 DFN2_DF_LOOKAHEAD ?= 1
-DFN3_MASK_LOOKAHEAD ?= 1
-DFN3_DF_LOOKAHEAD ?= 1
-$(foreach v,DFN2_MASK_LOOKAHEAD DFN3_MASK_LOOKAHEAD,\
-  $(if $(filter-out 1,$(words $($(v))))$(filter-out 0 1 2,$($(v))),\
-    $(error $(v) must be 0, 1 or 2, got '$($(v))')))
-$(foreach v,DFN2_DF_LOOKAHEAD DFN3_DF_LOOKAHEAD,\
-  $(if $(filter-out 1,$(words $($(v))))$(filter-out 0 1 2 3 4,$($(v))),\
-    $(error $(v) must be 0..4 (DF_ORDER - 1), got '$($(v))')))
-DFN_PAIR_CFLAGS :=
-DFN2_PAIR_RING := $(if $(filter 2/4,$(DFN2_MASK_LOOKAHEAD)/$(DFN2_DF_LOOKAHEAD)),7,$(if $(filter 1/4 2/3,$(DFN2_MASK_LOOKAHEAD)/$(DFN2_DF_LOOKAHEAD)),6))
-ifneq ($(DFN2_PAIR_RING),)
-DFN_PAIR_CFLAGS += -DDFN2_MAX_DF_RING=$(DFN2_PAIR_RING)
-endif
-ifneq ($(DFN3_MASK_LOOKAHEAD)/$(DFN3_DF_LOOKAHEAD),1/1)
-DFN_PAIR_CFLAGS += -DDFN3_MASK_LOOKAHEAD=$(DFN3_MASK_LOOKAHEAD) -DDFN3_DF_LOOKAHEAD=$(DFN3_DF_LOOKAHEAD)
-endif
+$(if $(filter-out 1,$(words $(DFN2_MASK_LOOKAHEAD)))$(filter-out 0 1 2,$(DFN2_MASK_LOOKAHEAD)),\
+  $(error DFN2_MASK_LOOKAHEAD must be 0, 1 or 2, got '$(DFN2_MASK_LOOKAHEAD)'))
+$(if $(filter-out 1,$(words $(DFN2_DF_LOOKAHEAD)))$(filter-out 0 1 2 3 4,$(DFN2_DF_LOOKAHEAD)),\
+  $(error DFN2_DF_LOOKAHEAD must be 0..4 (the deep filter has 5 taps), got '$(DFN2_DF_LOOKAHEAD)'))
 
 # The DFN2 grid and pair the test programs run (test scaffolding only: dfn/tests/dfn_test_grid.h
 # turns these -D flags into the macros that size the tests' buffers and the DFN2Grid they hand to
 # the stage and the bridge). DFN2_TEST_GRID_KHZ selects the grid preset (16, 32 or 48; 48 adds no
 # flag), DFN2_MASK_LOOKAHEAD / DFN2_DF_LOOKAHEAD the pair. Applied to the test units only -- never to
 # dfn_res_stage.c, dfn_rate_bridge.c, the example mains or the producers (EXTRA_CFLAGS would reach
-# those too). `make test-dfn-grids` runs the stage, bridge and hop tests at 16 and 32 kHz.
+# those too) -- through DFN_TEST_CFLAGS, which CFG_SIG_PAYLOAD names, so another grid or pair gets its
+# own obj/bin directories. `make test-dfn-grids` runs the stage, bridge and hop tests at 16 and 32 kHz.
 DFN2_TEST_GRID_KHZ ?= 48
 ifeq ($(filter $(DFN2_TEST_GRID_KHZ),16 32 48),)
 $(error DFN2_TEST_GRID_KHZ must be 16, 32 or 48, got '$(DFN2_TEST_GRID_KHZ)')
@@ -151,6 +113,7 @@ COMMON_DIR ?= ../../audiolib/common
 # audiolib repo root (COMMON_DIR's parent): check-pins reports the whole
 # audiolib repo's HEAD, not just the common/ subdirectory's.
 AUDIOLIB_DIR ?= ../../audiolib
+
 # ne10 is the only FFT backend. BACKEND stays a variable because it names the
 # keyed obj/bin directories and is forwarded to the producers.
 BACKEND ?= ne10
@@ -218,21 +181,22 @@ TOOLCHAIN_CHECK ?= 1
 # publishes: the attestation records it with a sha256 of each dirty repo's `git diff --binary HEAD`.
 # It covers tracked changes only.
 
-# ALLOW_UNTRACKED_PUBLISH: publish also refuses by default when this repo (outside the whitelist
-# below) or any producer has an untracked, non-ignored file (`git ls-files --others
-# --exclude-standard`), since such a source can change the artifact without a trace in the tracked
-# diff. =1 is the separate escape hatch: it records untracked_tree_sha256 per repo with untracked=1,
+# ALLOW_UNTRACKED_PUBLISH: publish also refuses by default when this repo (the whole Audio_ALG tree,
+# outside the whitelist below) or any producer has an untracked, non-ignored file (`git ls-files
+# --others --exclude-standard`), since such a source can change the artifact without a trace in the
+# tracked diff. =1 is the separate escape hatch: it records untracked_tree_sha256 per repo with untracked=1,
 # computed by hash_untracked() at the top of _publish_impl over sorted fixed-field records ("L
 # <sha256(path)> <sha256(readlink)>" for a symlink, "F <mode> <sha256(path)> <sha256(content)>" for
 # a regular file; every variable-length value is hashed so records concatenate unambiguously). A
 # path that is neither, or whose stat/readlink/shasum fails, is always refused, naming path and repo.
 
-# This repo's untracked list is whitelisted by the prefix `^AINR/(GTCRN|gtcrn_github)/`: those
-# directories are user-owned and never staged, and would otherwise refuse (or, under
-# ALLOW_UNTRACKED_PUBLISH=1, perturb the provenance hash of) an otherwise identical publish.
-# `gtcrn_github/` is an embedded git checkout that shows as one opaque line in
-# `git ls-files --others`, which is also the unhashable case above. The producers get no
-# whitelist. Neither knob is in CFG_SIG: they only decide whether publish proceeds.
+# This repo's untracked list is whitelisted by the prefix `^AINR/gtcrn_github/`: an embedded git
+# checkout (ignored today) that would show as one opaque line in `git ls-files --others`, the
+# unhashable case above, and would refuse (or, under ALLOW_UNTRACKED_PUBLISH=1, perturb the
+# provenance hash of) an otherwise identical publish. The producers get no whitelist. Neither knob
+# is in CFG_SIG: they only decide whether publish proceeds.
+# UNTRACKED_FILES_CMD is that list; `make print-untracked` prints it.
+UNTRACKED_FILES_CMD = git ls-files --others --exclude-standard 2>/dev/null | grep -vE '^AINR/gtcrn_github/' || true
 
 # ATTEST_STAMP (test only): overrides the UTC timestamp in the attestation filename so the
 # isolation tests can force same-second collisions and exercise the no-clobber retry. Attestations
@@ -302,9 +266,6 @@ CFLAGS = -Wall -Wextra -O2 -std=gnu99 \
 # rate-bridge descriptors (backend_id); it matches the libaudio_common.a variant this build links
 # (BACKEND= above), so the descriptor never needs the backend told separately.
 CFLAGS += -DAUDIO_PIPELINE_BACKEND_STR=\"$(BACKEND)\"
-ifneq ($(DFN_PAIR_CFLAGS),)
-CFLAGS += $(DFN_PAIR_CFLAGS)
-endif
 CFLAGS += $(EXTRA_CFLAGS)
 CFLAGS += $(SIMD_CFLAGS)
 CFLAGS += $(PROFILE_CFLAGS)
@@ -506,7 +467,7 @@ TARGET_ABI_INCLUDES := -I4ch_aec_bf_nr_res \
 # The same CC command can select a different SDK through PATH.
 # Include effective pointer/FP/ISA predefines to avoid cross-ABI cache reuse.
 override CC_TARGET_SIG := $(shell sh $(COMMON_DIR)/scripts/target_abi_signature.sh $(CC) $(CPPFLAGS) $(CFLAGS))
-CFG_SIG_PAYLOAD := CC_TARGET_SIG=$(CC_TARGET_SIG) ULCNET_GRID=$(ULCNET_GRID) DFN2_LOOKAHEAD=$(DFN2_MASK_LOOKAHEAD)/$(DFN2_DF_LOOKAHEAD) DFN2_TEST_GRID_KHZ=$(DFN2_TEST_GRID_KHZ) DFN_TEST_CFLAGS=$(DFN_TEST_CFLAGS) DFN3_LOOKAHEAD=$(DFN3_MASK_LOOKAHEAD)/$(DFN3_DF_LOOKAHEAD) CC=$(CC) CXX=$(CXX) AR=$(AR) RANLIB=$(RANLIB) LINK=$(LINK) CFLAGS=$(CFLAGS) CXXFLAGS=$(CXXFLAGS) CPPFLAGS=$(CPPFLAGS) LDFLAGS=$(LDFLAGS) EXTRA_CFLAGS=$(EXTRA_CFLAGS) EXTRA_LDFLAGS=$(EXTRA_LDFLAGS) BACKEND=$(BACKEND) SIMD=$(SIMD) PROFILE=$(PROFILE) WERROR=$(WERROR) NO_STDIO=$(NO_STDIO) DEBUG=$(DEBUG) TOOLCHAIN_CHECK=$(TOOLCHAIN_CHECK) COMMON_PRODUCER_SIG=$(COMMON_PRODUCER_SIG) AEC_PRODUCER_SIG=$(AEC_PRODUCER_SIG) NR_PRODUCER_SIG=$(NR_PRODUCER_SIG) SRCS=$(sort mono_aec_nr_res/main.c mono_aec_nr_res/tests/test_mono_chain.c mono_aec_nr_res/tests/test_no_stdio_stack.c mono_aec_nr_res/example_board_adapter.c ulcnet/ulcnet_nn_stage.c ulcnet/mono_alignulcnet/tests/test_mono_ulcnet.c $(ULCNET_DIR)/ulcnet_accelerator_adapter.c $(ULCNET_DIR)/ulcnet_prepost.c $(ULCNET_DIR)/ulcnet_process.c $(ULCNET_DIR)/ulcnet_model_io.c $(AIAEC_DIR)/tests/test_ulcnet_accelerator_adapter.c ulcnet/mono_alignulcnet/main.c dfn/dfn_res_stage.c dfn/dfn_rate_bridge.c dfn/tests/test_dfn_res_stage.c dfn/tests/test_dfn_rate_bridge.c 4ch_aec_bf_nr_res/tests/test_mcab_sample_post.c tests/test_readme_flow.c dfn/mono_aec_dfn_res/tests/test_mono_dfn.c dfn/mono_aec_dfn_res/main.c dfn/tests/test_dfn_hop.c ulcnet/tests/test_ulcnet_nn_stage.c $(DFN2_DIR)/dfn2_process.c $(DFN2_DIR)/dfn2_model_io.c $(DFN2_DIR)/dfn2_prepost.c $(TARGET_ABI_SRCS))
+CFG_SIG_PAYLOAD := CC_TARGET_SIG=$(CC_TARGET_SIG) DFN2_LOOKAHEAD=$(DFN2_MASK_LOOKAHEAD)/$(DFN2_DF_LOOKAHEAD) DFN2_TEST_GRID_KHZ=$(DFN2_TEST_GRID_KHZ) DFN_TEST_CFLAGS=$(DFN_TEST_CFLAGS) CC=$(CC) CXX=$(CXX) AR=$(AR) RANLIB=$(RANLIB) LINK=$(LINK) CFLAGS=$(CFLAGS) CXXFLAGS=$(CXXFLAGS) CPPFLAGS=$(CPPFLAGS) LDFLAGS=$(LDFLAGS) EXTRA_CFLAGS=$(EXTRA_CFLAGS) EXTRA_LDFLAGS=$(EXTRA_LDFLAGS) BACKEND=$(BACKEND) SIMD=$(SIMD) PROFILE=$(PROFILE) WERROR=$(WERROR) NO_STDIO=$(NO_STDIO) DEBUG=$(DEBUG) TOOLCHAIN_CHECK=$(TOOLCHAIN_CHECK) COMMON_PRODUCER_SIG=$(COMMON_PRODUCER_SIG) AEC_PRODUCER_SIG=$(AEC_PRODUCER_SIG) NR_PRODUCER_SIG=$(NR_PRODUCER_SIG) SRCS=$(sort mono_aec_nr_res/main.c mono_aec_nr_res/tests/test_mono_chain.c mono_aec_nr_res/tests/test_no_stdio_stack.c mono_aec_nr_res/example_board_adapter.c ulcnet/ulcnet_nn_stage.c ulcnet/mono_alignulcnet/tests/test_mono_ulcnet.c $(ULCNET_DIR)/ulcnet_accelerator_adapter.c $(ULCNET_DIR)/ulcnet_prepost.c $(ULCNET_DIR)/ulcnet_process.c $(ULCNET_DIR)/ulcnet_model_io.c $(AIAEC_DIR)/tests/test_ulcnet_accelerator_adapter.c ulcnet/mono_alignulcnet/main.c dfn/dfn_res_stage.c dfn/dfn_rate_bridge.c dfn/tests/test_dfn_res_stage.c dfn/tests/test_dfn_rate_bridge.c 4ch_aec_bf_nr_res/tests/test_mcab_sample_post.c tests/test_readme_flow.c dfn/mono_aec_dfn_res/tests/test_mono_dfn.c dfn/mono_aec_dfn_res/main.c dfn/tests/test_dfn_hop.c ulcnet/tests/test_ulcnet_nn_stage.c $(DFN2_DIR)/dfn2_process.c $(DFN2_DIR)/dfn2_model_io.c $(DFN2_DIR)/dfn2_prepost.c $(TARGET_ABI_SRCS))
 CFG_SIG := $(shell printf '%s' "$(CFG_SIG_PAYLOAD)" | cksum | cut -d' ' -f1)
 
 # OBJ_ROOT / BIN_ROOT: where this repo's keyed obj/bin trees live (default obj/ and bin/ here). A
@@ -572,49 +533,43 @@ $(OBJ_DIR)/aec_nr_pipeline_static.o: mono_aec_nr_res/main.c common/example_cli.h
 $(OBJ_DIR)/test_mono_chain.o: mono_aec_nr_res/tests/test_mono_chain.c mono_aec_nr_res/tests/conv_chain_mono.h | _cfg_guard
 	$(CC) $(CFLAGS) -MD -MP -c -o $@ $<
 
-# Align-ULCNet objects. ulcnet_process.o compiles the
-# AIAEC-owned C pre/post TU (centered sqrt-Hann STFT / WOLA / model
-# boundary) -- read-only from this Makefile's perspective, never edited
-# here. It transforms through audiolib's fft_wrapper; the -I$(COMMON_DIR)/
-# include already in $(CFLAGS) resolves that header, and -I$(ULCNET_DIR)
-# resolves its own. The stage TU and the programs and tests built on it also need the ULCNET
-# include path for ulcnet_process.h.
+# Align-ULCNet objects (AIAEC-owned sources, compiled here and never edited here): ulcnet_process.o
+# is the model-callback output check, ulcnet_model_io.o the grid and descriptor. The stage TU and
+# the programs and tests built on it also need -I$(ULCNET_DIR) for ulcnet_process.h.
 $(OBJ_DIR)/ulcnet_process.o: $(ULCNET_DIR)/ulcnet_process.c $(ULCNET_DIR)/ulcnet_process.h | _cfg_guard
-	$(CC) $(CFLAGS) -I$(ULCNET_DIR) $(ULCNET_GRID_CFLAGS) -MD -MP -c -o $@ $<
+	$(CC) $(CFLAGS) -I$(ULCNET_DIR) -MD -MP -c -o $@ $<
 
 $(OBJ_DIR)/ulcnet_model_io.o: $(ULCNET_DIR)/ulcnet_model_io.c $(ULCNET_DIR)/ulcnet_model_io.h | _cfg_guard
-	$(CC) $(CFLAGS) -I$(ULCNET_DIR) $(ULCNET_GRID_CFLAGS) -MD -MP -c -o $@ $<
+	$(CC) $(CFLAGS) -I$(ULCNET_DIR) -MD -MP -c -o $@ $<
 
-# ulcnet_prepost.o: the AIAEC-owned pre/post class -- one object owning the
-# framing states, the feature front end and the per-frame accelerator
-# transaction. A THIRD TU on purpose: ulcnet_process.c and ulcnet_model_io.c
-# stay independently linkable (each has a parity test that compiles it
-# without the other), so the file that composes them cannot be either one.
+# ulcnet_prepost.o: the pre/post class -- one object owning the feature front end and the
+# per-frame accelerator transaction, frequency domain only (the application frames with audiolib).
+# A TU of its own, so that ulcnet_model_io.c stays independently linkable.
 $(OBJ_DIR)/ulcnet_prepost.o: $(ULCNET_DIR)/ulcnet_prepost.c $(ULCNET_DIR)/ulcnet_prepost.h $(ULCNET_DIR)/ulcnet_process.h $(ULCNET_DIR)/ulcnet_model_io.h | _cfg_guard
-	$(CC) $(CFLAGS) -I$(ULCNET_DIR) $(ULCNET_GRID_CFLAGS) -MD -MP -c -o $@ $<
+	$(CC) $(CFLAGS) -I$(ULCNET_DIR) -MD -MP -c -o $@ $<
 
 $(OBJ_DIR)/ulcnet_accelerator_adapter.o: $(ULCNET_DIR)/ulcnet_accelerator_adapter.c $(ULCNET_DIR)/ulcnet_accelerator_adapter.h $(ULCNET_DIR)/ulcnet_prepost.h $(ULCNET_DIR)/ulcnet_model_io.h $(ULCNET_DIR)/ulcnet_process.h | _cfg_guard
-	$(CC) $(CFLAGS) -I$(ULCNET_DIR) $(ULCNET_GRID_CFLAGS) -MD -MP -c -o $@ $<
+	$(CC) $(CFLAGS) -I$(ULCNET_DIR) -MD -MP -c -o $@ $<
 
 $(OBJ_DIR)/mono_alignulcnet_main.o: ulcnet/mono_alignulcnet/main.c ulcnet/ulcnet_nn_stage.h common/example_cli.h $(ULCNET_DIR)/ulcnet_accelerator_adapter.h | _cfg_guard
-	$(CC) $(CFLAGS) -I$(ULCNET_DIR) $(ULCNET_GRID_CFLAGS) -MD -MP -c -o $@ $<
+	$(CC) $(CFLAGS) -I$(ULCNET_DIR) -MD -MP -c -o $@ $<
 
 $(OBJ_DIR)/test_ulcnet_accelerator_adapter.o: $(AIAEC_DIR)/tests/test_ulcnet_accelerator_adapter.c $(ULCNET_DIR)/ulcnet_accelerator_adapter.h | _cfg_guard
-	$(CC) $(CFLAGS) -I$(ULCNET_DIR) $(ULCNET_GRID_CFLAGS) -MD -MP -c -o $@ $<
+	$(CC) $(CFLAGS) -I$(ULCNET_DIR) -MD -MP -c -o $@ $<
 
 # ulcnet_nn_stage.o: the Align-ULCNet post-filter stage (ulcnet/ulcnet_nn_stage.h), example
 # code linked by the programs and tests that use it. Not a member of any archive.
 $(OBJ_DIR)/ulcnet_nn_stage.o: ulcnet/ulcnet_nn_stage.c ulcnet/ulcnet_nn_stage.h $(ULCNET_DIR)/ulcnet_process.h | _cfg_guard
-	$(CC) $(CFLAGS) -I$(ULCNET_DIR) $(ULCNET_GRID_CFLAGS) -MD -MP -c -o $@ $<
+	$(CC) $(CFLAGS) -I$(ULCNET_DIR) -MD -MP -c -o $@ $<
 
 # test_mono_ulcnet: the mono linear AEC feeding the stage (identity end to end, alignment
 # events from the real delay state, reprime, model policy on real framing).
 $(OBJ_DIR)/test_mono_ulcnet.o: ulcnet/mono_alignulcnet/tests/test_mono_ulcnet.c ulcnet/ulcnet_nn_stage.h | _cfg_guard
-	$(CC) $(CFLAGS) -I$(ULCNET_DIR) $(ULCNET_GRID_CFLAGS) -MD -MP -c -o $@ $<
+	$(CC) $(CFLAGS) -I$(ULCNET_DIR) -MD -MP -c -o $@ $<
 
-# test_ulcnet_nn_stage: the stage alone (framing, model policy, WOLA) on the compiled grid.
+# test_ulcnet_nn_stage: the stage alone (framing, model policy, WOLA) on every grid of its table.
 $(OBJ_DIR)/test_ulcnet_nn_stage.o: ulcnet/tests/test_ulcnet_nn_stage.c ulcnet/ulcnet_nn_stage.h | _cfg_guard
-	$(CC) $(CFLAGS) -I$(ULCNET_DIR) $(ULCNET_GRID_CFLAGS) -MD -MP -c -o $@ $<
+	$(CC) $(CFLAGS) -I$(ULCNET_DIR) -MD -MP -c -o $@ $<
 
 $(OBJ_DIR)/dfn2_process.o: $(DFN2_DIR)/dfn2_process.c $(DFN2_DIR)/dfn2_process.h | _cfg_guard
 	$(CC) $(CFLAGS) -I$(DFN2_DIR) -MD -MP -c -o $@ $<
@@ -633,7 +588,7 @@ $(OBJ_DIR)/test_mcab_sample_post.o: 4ch_aec_bf_nr_res/tests/test_mcab_sample_pos
 	$(CC) $(CFLAGS) -MD -MP -c -o $@ $<
 
 $(OBJ_DIR)/test_readme_flow.o: tests/test_readme_flow.c dfn/dfn_hop.h ulcnet/ulcnet_nn_stage.h mono_aec_nr_res/tests/conv_chain_mono.h dfn/tests/dfn_test_fixture.h dfn/tests/dfn_test_grid.h | _cfg_guard
-	$(CC) $(CFLAGS) $(DFN_TEST_CFLAGS) -I$(ULCNET_DIR) $(ULCNET_GRID_CFLAGS) -MD -MP -c -o $@ $<
+	$(CC) $(CFLAGS) $(DFN_TEST_CFLAGS) -I$(ULCNET_DIR) -MD -MP -c -o $@ $<
 
 $(OBJ_DIR)/test_dfn_res_stage.o: dfn/tests/test_dfn_res_stage.c dfn/dfn_res_stage.h dfn/tests/dfn_test_fixture.h dfn/dfn_unit_partition.h | _cfg_guard
 	$(CC) $(CFLAGS) $(DFN_TEST_CFLAGS) -I$(DFN2_DIR) -MD -MP -c -o $@ $<
@@ -704,6 +659,7 @@ test: $(BIN_DIR)/test_mono_chain $(BIN_DIR)/aec_nr_pipeline $(BIN_DIR)/aec_nr_pi
 	"$(abspath $(BIN_DIR))/test_dfn_hop"
 	"$(abspath $(BIN_DIR))/mono_alignulcnet"
 	"$(abspath $(BIN_DIR))/mono_alignulcnet" --delay-num-filters 1
+	"$(abspath $(BIN_DIR))/mono_alignulcnet" --sample-rate 48000
 	"$(abspath $(BIN_DIR))/mono_aec_dfn_res"
 	"$(abspath $(BIN_DIR))/mono_aec_dfn_res" --delay-num-filters 1 --cng --atten-lim 12
 	"$(abspath $(BIN_DIR))/mono_aec_dfn_res" --sample-rate 48000
@@ -762,7 +718,7 @@ $(BIN_DIR)/test_target_abi: $(TARGET_ABI_SRCS) $(COMMON_LIB) $(AEC_LIB) $(NR_LIB
 	@for source in $(TARGET_ABI_SRCS); do \
 	  object="$(OBJ_DIR)/target_abi/$$(basename "$$source" .c).o"; \
 	  case "$$source" in tests/*) test_flags="$(DFN_TEST_CFLAGS)" ;; *) test_flags= ;; esac; \
-	  $(CC) $(CFLAGS) $$test_flags $(ULCNET_GRID_CFLAGS) $(TARGET_ABI_INCLUDES) -MD -MP \
+	  $(CC) $(CFLAGS) $$test_flags $(TARGET_ABI_INCLUDES) -MD -MP \
 	    -c "$$source" -o "$$object" || exit $$?; \
 	done
 	$(LINK) -o $@ $(OBJ_DIR)/target_abi/*.o $(AEC_LIB) $(NR_LIB) $(COMMON_LIB) $(LDFLAGS)
@@ -830,12 +786,8 @@ $(BIN_DIR)/test_mono_ulcnet: $(OBJ_DIR)/test_mono_ulcnet.o $(ULCNET_PIPELINE_OBJ
 	$(LINK) -o $@ $(OBJ_DIR)/test_mono_ulcnet.o $(ULCNET_PIPELINE_OBJS) $(OBJ_DIR)/ulcnet_model_io.o $(AEC_LIB) $(COMMON_LIB) $(LDFLAGS)
 	@echo "test_mono_ulcnet [$(BACKEND)] -> $@"
 
-# The adapter drives the pre/post class, so anything linking the adapter
-# links ulcnet_prepost.o with it. The class in turn references
-# ulcnet_process.c's analysis/synthesis entry points unconditionally -- the
-# ULCNET_IO_FREQ instances the adapter builds never CALL them, but the symbols
-# still have to resolve -- which is why the adapter test links ulcnet_process.o
-# and, through it, audiolib's FFT wrapper.
+# The adapter drives the pre/post class, so anything linking the adapter links ulcnet_prepost.o
+# and ulcnet_model_io.o with it. The adapter test also links ulcnet_process.o.
 ULCNET_ADAPTER_OBJS = $(OBJ_DIR)/ulcnet_accelerator_adapter.o \
                       $(OBJ_DIR)/ulcnet_prepost.o \
                       $(OBJ_DIR)/ulcnet_model_io.o
@@ -910,6 +862,11 @@ print-obj-dir:
 	@echo $(abspath $(OBJ_DIR))
 endif
 
+# print-untracked: the untracked files publish refuses (UNTRACKED_FILES_CMD); needs no producer.
+.PHONY: print-untracked
+print-untracked:
+	@$(UNTRACKED_FILES_CMD)
+
 # test-fp-contract: disassemble the pipeline objects that run windowed
 # overlap-add and assert they emitted no fma-class instruction. Part of the
 # release gate: -ffp-contract=off is a compile flag, fma-free is a property of
@@ -920,13 +877,25 @@ endif
 test-fp-contract:
 	@scripts/audit_fp_contract.sh $(BACKEND)
 
-# audit-no-transform: source gate over the model directories (AINR/, AIAEC/; non-test .c/.h). The inverse
-# FFT and overlap-add are audiolib's AcIstft, owned by the application; a model directory may configure
-# one (*_framing_config), push into a borrowed one and own an AcStft analysis, but holds no transform code
-# and does not size or construct a synthesis object. Reads source only, builds nothing.
+# audit-no-transform: source gate over the model directories (AINR/, AIAEC/; non-test .c/.h). Framing
+# (AcStft analysis, AcIstft inverse FFT and overlap-add) is the application's, built with audiolib; a
+# model directory holds no transform code and builds, sizes or runs neither an analysis nor a synthesis
+# object. The one audiolib framing use allowed is the n_fft check: ac_stft_config_default() and
+# ac_stft_get_mem_size(). Reads source only, builds nothing.
 .PHONY: audit-no-transform
 audit-no-transform:
 	@scripts/audit_no_transform_in_models.sh
+
+# audit-dead-defines: source gate over the build files (every Makefile under AINR/, AIAEC/ and
+# pipelines/). A -DNAME that no C source or header reads is accepted by cc without a word, so a
+# knob whose reader is gone keeps building the same objects. The script first proves on a scratch
+# tree that it can report a dead flag. DEAD_DEFINES_ARGS reaches the scan, e.g. `--py` adds the
+# -D flags the Python tests pass to the compiler, or a list of build files. Reads source only.
+DEAD_DEFINES_ARGS ?=
+.PHONY: audit-dead-defines
+audit-dead-defines:
+	@scripts/audit_dead_defines.sh --self-test
+	@scripts/audit_dead_defines.sh $(DEAD_DEFINES_ARGS)
 
 # audit-no-stdio: builds libaudio_pipeline_dfn.a with NO_STDIO=1 and asserts, with `nm` over the delivered
 # keyed archive itself, that none of fprintf/printf/puts/fputs/stderr/__stderrp is in it, and that its
@@ -1014,8 +983,8 @@ audit-no-stdio-stack:
 
 # - Per repo, an unknown identity is checked first and refused unconditionally (no commit OID, no
 #   provenance). Only when all four repos have a commit are TRACKED-dirty (`git status --porcelain
-#   -uno`) and UNTRACKED (`git ls-files --others --exclude-standard`; this repo's list has the
-#   AINR/GTCRN/ and AINR/gtcrn_github/ prefixes whitelisted) computed. Gate-then-hash: the dirty gate
+#   -uno`) and UNTRACKED (`git ls-files --others --exclude-standard`, this repo's from its root with
+#   the AINR/gtcrn_github/ prefix whitelisted) computed. Gate-then-hash: the dirty gate
 #   runs for all four repos, then the untracked gate, and only then is anything hashed. The escape
 #   hatches ALLOW_DIRTY_PUBLISH / ALLOW_UNTRACKED_PUBLISH stay separate and record dirty_diff_sha256 /
 #   untracked_tree_sha256 (via hash_untracked(), see _publish_impl).
@@ -1148,7 +1117,7 @@ _publish_impl: $(PUBLISH_ARTIFACTS)
 	  exit 1; \
 	fi; \
 	dirty=0; [ -n "$$(git status --porcelain -uno 2>/dev/null)" ] && dirty=1; \
-	unt_list="$$(git ls-files --others --exclude-standard 2>/dev/null | grep -vE '^AINR/(GTCRN|gtcrn_github)/' || true)"; \
+	unt_list="$$($(UNTRACKED_FILES_CMD))"; \
 	untracked=0; [ -n "$$unt_list" ] && untracked=1; \
 	if [ -z "$(COMMON_DIR)" ] || [ ! -d "$(COMMON_DIR)" ]; then \
 	  echo "FATAL: publish refused -- audiolib has no git identity (not a git checkout, or COMMON_DIR=$(COMMON_DIR) not present); no escape hatch admits this." >&2; \
@@ -1203,7 +1172,7 @@ _publish_impl: $(PUBLISH_ARTIFACTS)
 	if [ "$$aup" != "1" ]; then \
 	  bad=0; \
 	  if [ "$$untracked" = "1" ]; then \
-	    echo "FATAL: publish refused -- pipelines (this repo) contains UNTRACKED files outside the AINR/GTCRN|gtcrn_github whitelist:" >&2; \
+	    echo "FATAL: publish refused -- pipelines (this repo) contains UNTRACKED files outside the AINR/gtcrn_github whitelist:" >&2; \
 	    printf '%s\n' "$$unt_list" | head -5 | sed 's/^/    /' >&2; \
 	    bad=1; \
 	  fi; \
@@ -1371,29 +1340,17 @@ clean-libs: clean-all
 # CFG_SIG.
 -include $(wildcard $(OBJ_DIR)/*.d)
 
-# ---------------------------------------------------------------------------
-# test-grids: runs both Align-ULCNet deployment grids in one command (`test` only exercises the grid
-# ULCNET_GRID selects). ULCNET_GRID is in CFG_SIG, so each grid has its own obj/bin directory. Defined
-# outside the COMMON_LIB conditionals: it needs no producer archive itself and each recursive `test`
-# bootstraps its own.
-# ---------------------------------------------------------------------------
-.PHONY: test-grids
-test-grids:
-	$(MAKE) ULCNET_GRID=16k test
-	$(MAKE) ULCNET_GRID=48k test
-
 # test-pairs: the DFN C tests (DFN_PAIR_TESTS) rebuilt and run for other lookahead pairs
 # (DFN_TEST_PAIRS, mask/df), each pair in its own CFG_SIG directories; `make test` is the shipped
 # pair. The example program mono_aec_dfn_res is rebuilt and run too, but it takes no pair (its grid
 # and lookahead come from --ai-sample-rate / --ai-fft-size, covered by `make test`): that leg only
-# shows it builds, links and runs against the archive of the pair's state-ring capacity. The pair reaches the test programs alone (DFN_TEST_CFLAGS), the pipeline objects hold no
-# pair, so the gate has two parts. Each pair test prints the pair it was built with and, for
-# DFN_PAIR_MEASURED, the stage latency it measured (dfn/tests/check_pair_report.sh compares them with
-# the pair asked for and with (mask + df + 1) * hop: a pair flag that never reached the test build
-# prints 1/1 and fails here). And the archive is checked for what the build does carry: the variant
-# symbol of the state-ring capacity the pair needs (7 for 2/4, see DFN2_PAIR_RING). The Python stage
-# and its C-parity shims run their pairs under pytest (dfn/tests). The 4-channel DFN test takes the
-# same DFN2_MASK_LOOKAHEAD / DFN2_DF_LOOKAHEAD in its Makefile.
+# shows it builds, links and runs beside the pair's test programs. The pair reaches the test
+# programs alone (DFN_TEST_CFLAGS); the pipeline objects hold no pair. Each pair test prints the
+# pair of its build and, for DFN_PAIR_MEASURED, the stage latency it measured
+# (dfn/tests/check_pair_report.sh compares them with the pair asked for and with
+# (mask + df + 1) * hop: a pair flag that never reached the test build prints 1/1 and fails here).
+# The Python stage and its C-parity shims run their pairs under pytest (dfn/tests). The 4-channel
+# DFN test takes the same DFN2_MASK_LOOKAHEAD / DFN2_DF_LOOKAHEAD in its Makefile.
 DFN_LEGAL_PAIRS := $(foreach m,0 1 2,$(foreach d,0 1 2 3 4,$(m)/$(d)))
 DFN_TEST_PAIRS ?= 0/0 0/1 2/0 2/4
 DFN_PAIR_TESTS := test_dfn_res_stage test_dfn_rate_bridge test_dfn_hop test_mono_dfn test_readme_flow
@@ -1426,9 +1383,6 @@ _test_pairs_run:
 	  $(MAKE) --no-print-directory DFN2_MASK_LOOKAHEAD=$$m DFN2_DF_LOOKAHEAD=$$d \
 	    libaudio_pipeline_dfn.a $(DFN_PAIR_TESTS) mono_aec_dfn_res >/dev/null || exit 1; \
 	  bd="$$($(MAKE) -s --no-print-directory DFN2_MASK_LOOKAHEAD=$$m DFN2_DF_LOOKAHEAD=$$d print-bin-dir)"; \
-	  ring=5; [ $$((m + d + 1)) -gt 5 ] && ring=$$((m + d + 1)); \
-	  nm "$$bd/libaudio_pipeline_dfn.a" | awk -v re="^_?dfn2_variant_full_n[0-9]+_e[0-9]+_d[0-9]+_r$${ring}$$" 'NF >= 2 && $$(NF - 1) != "U" && $$NF ~ re { found = 1 } END { exit !found }' || \
-	    { echo "FAIL: libaudio_pipeline_dfn.a was not built with the state ring $$ring lookahead pair $$p needs"; exit 1; }; \
 	  for t in $(DFN_PAIR_TESTS) mono_aec_dfn_res; do \
 	    out="$$("$$bd/$$t")" || { echo "FAIL: $$t for lookahead pair $$p"; exit 1; }; \
 	    case " $(DFN_PAIR_TESTS) " in *" $$t "*) \
