@@ -732,14 +732,18 @@ else
   fail "SP-S24: two scopes share a keyed directory (flow archive $sp21_t0_bin, test_mcab $sp21_t1_bin, all $sp21_t2_bin)"
 fi
 # The narrower payloads are the full payload minus the producers they do not use (identity fields and the
-# lib/nr include path), nothing else. test_mcab is built once more against the default audiolib so its
-# payload carries the same paths as the full one.
+# lib/nr include path, wherever NR_DIR actually resolved -- lib/deps.mk's default is a sibling
+# checkout, not the lib/nr/c_impl submodule path this script's own $NR_DIR var points at), nothing
+# else. test_mcab is built once more against the default audiolib so its payload carries the same
+# paths as the full one.
 make -s "${SP21_ARGS[@]}" test_mcab >"$SCRATCH_ROOT/sp21/t1_default.log" 2>&1 \
   || { fail "SP-S24: test_mcab (default audiolib) failed"; tail -20 "$SCRATCH_ROOT/sp21/t1_default.log" >&2; }
 sp21_t1_default_bin="$(make -s "${SP21_ARGS[@]}" print-bin-dir PRINT_FOR=test_mcab | tail -1)" || true
 sp21_t1_default_man="$(cat "$sp21_t1_default_bin/config.manifest" 2>/dev/null || true)"
+sp21_default_nr_dir="$(make -s "${SP21_ARGS[@]}" print-deps-sh | sed -n 's/^NR_DIR=//p')"
+sp21_nr_inc_esc="$(printf '%s' "$sp21_default_nr_dir/include" | sed -e 's/[.[\*^$/]/\\&/g')"
 sp21_t2_wo_spatial="$(printf '%s' "$sp21_t2_man" | sed -e 's# SPATIAL_PRODUCER_SIG=[^ ]*##' | tr -s ' ')"
-sp21_t2_wo_nr="$(printf '%s' "$sp21_t2_man" | sed -e 's# -I[^ ]*/lib/nr/c_impl/include##' -e 's# SPATIAL_PRODUCER_SIG=[^ ]*##' -e 's# NR_PRODUCER_SIG=[^ ]*##' | tr -s ' ')"
+sp21_t2_wo_nr="$(printf '%s' "$sp21_t2_man" | sed -e "s# -I$sp21_nr_inc_esc##" -e 's# SPATIAL_PRODUCER_SIG=[^ ]*##' -e 's# NR_PRODUCER_SIG=[^ ]*##' | tr -s ' ')"
 sp21_t1_norm="$(printf '%s' "$sp21_t1_default_man" | tr -s ' ')"
 sp21_t0_norm="$(printf '%s' "$sp21_t0_man" | tr -s ' ')"
 [ "$sp21_t0_norm" = "$sp21_t2_wo_nr" ] \

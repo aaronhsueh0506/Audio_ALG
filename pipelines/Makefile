@@ -63,17 +63,19 @@ ifneq ($(findstring $(AUDIO_PIPELINE_SPACE),$(CURDIR)),)
 $(error this build root path contains whitespace ('$(CURDIR)'), which is not supported -- re-run from a path with no spaces. (Whitespace build-root paths are a known, pre-existing limitation shared by all four repos in this stack -- audiolib, lib/aec, lib/nr, and this repo -- not something this pass fixes; this check only fails fast and clearly, here, instead of a cryptic "No such file or directory" deep inside an unrelated sub-invocation.))
 endif
 
-# The Audio_ALG git root (this directory's parent): check-pins and publish query it, so they see
-# the whole tree and not just pipelines/.
-ALG_ROOT = ..
-
 # AEC_DIR / NR_DIR / AUDIOLIB_DIR / COMMON_DIR, and each producer's pinned commit (AEC_COMMIT /
 # NR_COMMIT / AUDIOLIB_COMMIT, read by check-pins below), come from the one shared lib/deps.mk
 # (see lib/aec.pin, lib/nr.pin, lib/audiolib.pin) instead of being hardcoded here. Every one of
 # them stays a caller-overridable `?=` inside deps.mk, so `make AEC_DIR=...` still works exactly
 # as before; only the default changed, from the lib/aec submodule checkout to the sibling AEC dev
-# checkout (see deps.mk's own header for why).
-include $(ALG_ROOT)/lib/deps.mk
+# checkout (see deps.mk's own header for why). Included by its own fixed location, not through
+# ALG_ROOT below -- a caller overriding ALG_ROOT to point check-pins/publish's git queries at a
+# fixture tree (see SP-S11) must not also relocate which deps.mk this Makefile itself reads.
+include ../lib/deps.mk
+
+# The Audio_ALG git root (this directory's parent): check-pins and publish query it, so they see
+# the whole tree and not just pipelines/.
+ALG_ROOT = ..
 
 # Align-ULCNet sources (AIAEC/Align_ULCNet): the model-callback output check, the model I/O
 # descriptor, the pre/post class and the accelerator adapter, compiled by the rules below (none
@@ -1444,18 +1446,27 @@ check-pins: _check_pins_impl
 
 _check_pins_impl:
 	@have="$$(git -C "$(AUDIOLIB_DIR)" rev-parse HEAD 2>/dev/null || echo unknown)"; \
+	 if [ "$$have" = unknown ]; then \
+	   echo "check-pins: FAIL audiolib at $(AUDIOLIB_DIR) has no git identity (not a git checkout, or AUDIOLIB_DIR not present)" >&2; exit 1; \
+	 fi; \
 	 if [ "$$have" != "$(AUDIOLIB_COMMIT)" ]; then \
 	   echo "check-pins: FAIL audiolib at $(AUDIOLIB_DIR) is $$have, lib/audiolib.pin expects $(AUDIOLIB_COMMIT)" >&2; exit 1; \
 	 fi; \
 	 note=""; [ -n "$$(git -C "$(AUDIOLIB_DIR)" status --porcelain -uno 2>/dev/null)" ] && note=" (tracked changes present)"; \
 	 echo "check-pins: audiolib ($(AUDIOLIB_DIR)) $$have matches lib/audiolib.pin$$note"; \
 	 aec_have="$$(git -C "$(AEC_DIR)" rev-parse HEAD 2>/dev/null || echo unknown)"; \
+	 if [ "$$aec_have" = unknown ]; then \
+	   echo "check-pins: FAIL lib/aec at $(AEC_DIR) has no git identity (not a git checkout, or AEC_DIR not present)" >&2; exit 1; \
+	 fi; \
 	 if [ "$$aec_have" != "$(AEC_COMMIT)" ]; then \
 	   echo "check-pins: FAIL AEC at $(AEC_DIR) is $$aec_have, lib/aec.pin expects $(AEC_COMMIT)" >&2; exit 1; \
 	 fi; \
 	 note=""; [ -n "$$(git -C "$(AEC_DIR)" status --porcelain -uno 2>/dev/null)" ] && note=" (tracked changes present)"; \
 	 echo "check-pins: AEC ($(AEC_DIR)) $$aec_have matches lib/aec.pin$$note"; \
 	 nr_have="$$(git -C "$(NR_DIR)" rev-parse HEAD 2>/dev/null || echo unknown)"; \
+	 if [ "$$nr_have" = unknown ]; then \
+	   echo "check-pins: FAIL lib/nr at $(NR_DIR) has no git identity (not a git checkout, or NR_DIR not present)" >&2; exit 1; \
+	 fi; \
 	 if [ "$$nr_have" != "$(NR_COMMIT)" ]; then \
 	   echo "check-pins: FAIL NR at $(NR_DIR) is $$nr_have, lib/nr.pin expects $(NR_COMMIT)" >&2; exit 1; \
 	 fi; \

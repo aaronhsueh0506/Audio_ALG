@@ -49,7 +49,11 @@ AUDIOLIB_DIR  ?= $(abspath $(AUDIO_ALG_ROOT)/../audiolib)
 
 AEC_DIR     ?= $(AEC_REPO_DIR)/c_impl
 NR_DIR      ?= $(NR_REPO_DIR)/c_impl
-COMMON_DIR  ?= $(AUDIOLIB_DIR)/common
+# Not $(AUDIOLIB_DIR)/common: some callers (pipelines/4ch_aec_bf_nr_res/Makefile's SP-S21/SP-S23
+# isolation tests) override AUDIOLIB_DIR alone to simulate the spatial (doa/bf) libs being
+# unavailable while the common FFT archive must still resolve -- deriving one from the other would
+# make that override silently take COMMON_DIR down with it.
+COMMON_DIR  ?= $(abspath $(AUDIO_ALG_ROOT)/../audiolib/common)
 
 .PHONY: print-deps-sh bootstrap-deps check-deps-pins
 

@@ -39,7 +39,9 @@ ALG_DIR := ../..
 # AEC_DIR / NR_DIR / AUDIOLIB_DIR / COMMON_DIR come from the one shared lib/deps.mk (see
 # lib/aec.pin, lib/nr.pin, lib/audiolib.pin): the sibling AEC/NR/audiolib dev checkouts by
 # default, still a caller-overridable `?=` (deps.mk's own, not this line's -- same effect).
-include $(ALG_DIR)/lib/deps.mk
+# Included by its own fixed location, not through ALG_DIR: a caller overriding ALG_DIR must not
+# also relocate which deps.mk this Makefile reads.
+include ../../lib/deps.mk
 ULCNET_DIR ?= $(ALG_DIR)/AIAEC/Align_ULCNet
 DFN2_DIR ?= $(ALG_DIR)/AINR/DeepFilterNet2
 
