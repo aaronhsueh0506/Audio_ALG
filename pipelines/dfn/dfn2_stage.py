@@ -1,7 +1,7 @@
 """Dual-input streaming twin of DeepFilterNet2's ``dfn2_prepost`` class.
 
 One frame in, at most one head evaluation, one (delayed) frame out -- the
-FREQ-mode contract of ``AINR/DeepFilterNet2/dfn2_prepost.c`` with the single
+FREQ-mode contract of ``lib/ainr/dfn2/dfn2_prepost.c`` with the single
 staging pair split in two:
 
 * the ESTIMATION spectrum ``A`` feeds ``dfn2_compute_features`` (the ERB and
@@ -59,7 +59,7 @@ _AINR_DIR = os.path.join(_ROOT, 'AINR')
 _DFN2_DIR = os.path.join(_AINR_DIR, 'DeepFilterNet2')
 
 # Grid and geometry pinned by the model contract (config.ini). The C library takes the same grid
-# at run time (dfn2_grid_make(), AINR/DeepFilterNet2/dfn2_grid.h); the pipelines take it in their
+# at run time (dfn2_grid_make(), lib/ainr/dfn2/dfn2_grid.h); the pipelines take it in their
 # configs (DfnResStageConfig.grid).
 SAMPLE_RATE = 48000
 N_FFT = 1024

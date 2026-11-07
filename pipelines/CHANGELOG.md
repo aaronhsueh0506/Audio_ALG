@@ -3,6 +3,65 @@
 `Audio_ALG/pipelines`（含它建置的 `AINR`、`AIAEC` C 程式）的重要改動記錄在此，格式依
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/)。README 只寫現況，改動經過寫在這裡。
 
+## [Unreleased] — 2026-11-08 — Single-model release stage 2-4: model cores move to lib/, a PCM stream SDK for DFN2/DeepVQE-S/Align-ULCNet
+
+Stages 2-4 of the 6-stage split-into-`lib/{ainr,aiaec}`+`stream/` plan (stage 0-1, the dependency-path
+convergence, is the entry above). Five commits: `70c4be4` (move), `6ec6892`/`00b7a72` (DFN2 stream),
+`6e6adf7` (DeepVQE-S stream), `9fe3acc` (Align-ULCNet stream).
+
+### Added
+- `lib/ainr/{dfn2,dfn3,gtcrn,rnnoise_erb}/`, `lib/aiaec/{ulcnet,deepvqe_s,cagcrn,align_cruse}/`: all
+  8 models' C cores, moved out of `AINR/<Model>/`/`AIAEC/<Model>/` so a single model can be built and
+  shipped without the rest of its family (confirmed: each of the 8 compiles standalone against only
+  its own directory + audiolib's `common/include`, zero cross-model symbol references). `AIAEC/`'s
+  shared `aiaec_process.{c,h}` split back into the model it serves
+  (`lib/aiaec/{cagcrn,align_cruse}/*_process.{c,h}`, `lib/aiaec/ulcnet/ulcnet_mask_process.{c,h}`);
+  `AIAEC/aiaec_process.h` is now a 3-line forwarding shim. One-line forwarding headers left at every
+  old public-header path for out-of-tree consumers (board samples) whose own build still points `-I`
+  there.
+- `stream/ainr/dfn2/dfn2_stream.h` (+ `.c`, the ERB-matrix file loader in its own stdio-only TU,
+  Makefile, tests): `dfn2_stream_init[_from_erb_file][_ex]`/`_reset`/`_pre_process`/`_post_process`
+  wrap `lib/ainr/dfn2`'s `frame_open`/`_finish`/`_bypass` per-hop lifecycle, the analysis/synthesis
+  STFT (`AC_OLA_ACCUMULATE`) and an optional input HPF around int16 PCM, one hop per call,
+  `frames_per_call == 1` only. No stdio/heap outside the file loader (links into `NO_STDIO`
+  targets). Builds full and `-DDFN2_MASK_ONLY`, reusing the existing `DFN2_VARIANT_SYMBOL` link-time
+  check.
+- `stream/aiaec/deepvqe_s/deepvqe_stream.h`: same shape, two PCM inputs (`mic_in`/`far_in`), no HPF,
+  no file-loader, `AC_OLA_ENV_NORM` (the first push after init/reset emits nothing, surfaced as
+  `post_process`'s own distinct `0` return). Bypass fails **closed** — silence, never a passthrough
+  of the raw mic (there is no canceller in front of this model).
+- `stream/aiaec/ulcnet/ulcnet_stream.h`: two PCM inputs, the linear-AEC's own `err_in` and raw
+  `far_in` — never raw mic — plus the alignment-driven reset+one-hop-reprime bookkeeping the board
+  sample does itself, re-implemented at the `lib/aiaec/ulcnet/ulcnet_prepost.h` level (not by
+  wrapping `pipelines/ulcnet/ulcnet_nn_stage.{c,h}`, a different, higher-level component for a
+  different caller — see the header's own comment for why). Bypass fails **open** — the linear-error
+  spectrum passes through unguarded — the opposite of DeepVQE-S's.
+- Every stream module: verified against an independent re-implementation of its board sample's own
+  per-hop loop under a shared deterministic fake accelerator (feature-array and full per-hop trace
+  comparison, zero mismatches), with the comparison itself proven capable of failing
+  (`--inject-shift`, and model-specific injections: DeepVQE-S's `--ola-matters`, ULCNet's
+  fail-open/reprime/solid-transition/explicit-reset rows). Host-only, fake accelerator — not
+  board-verified, not real-graph-verified.
+
+### Fixed
+- `dfn2_stream`/`deepvqe_stream`/`ulcnet_stream`'s `descriptor_matches()` compared every
+  `*StreamMemReq` field except the second `reserved` one (latent, since every writer zeroes it).
+- `ulcnet_stream_reset()` didn't clear `had_hop`/`prev_solid`, so an explicit caller-driven reset
+  left stale alignment-tracking state that could spuriously re-trigger a second reset+reprime on the
+  very next hop.
+
+### Not done this pass (deliberate, per the plan / standing scope)
+- Board multi-frame (`frames_per_call > 1`, stage 3b): deferred, DFN2's own C already supports N>1 at
+  the `lib/ainr/dfn2` level, only the board SDK wrapper is out of scope here.
+- CAGCRN, Align-CRUSE: `lib/`-only (stage 2's move, confirmed standalone-buildable); no `stream/` or
+  graph-binding work for these two.
+- `pipelines/ulcnet/ulcnet_nn_stage.{c,h}` and `pipelines/dfn/{dfn_res_stage,dfn_rate_bridge}.{c,h}`:
+  untouched, intentionally — different, higher-level components for different existing callers
+  (the 4-channel pipeline's synchronous model-callback consumer; the AEC+DFN2 dual-spectrum stage),
+  not superseded by the new `stream/` SDKs.
+- `docs/html/*`, `docs/audio_libraries_c_api_zh_TW*.md`: still carry some pre-move header paths;
+  routed to the `algdoc` pass, not hand-edited here.
+
 ## [Unreleased] — 2026-11-07 — Dependency path convergence, stage 0-1: one lib/deps.mk, three lib/*.pin
 
 Stages 0-1 of a 6-stage split-into-lib/{ainr,aiaec}+stream/ plan (stage 2, the actual file move, is

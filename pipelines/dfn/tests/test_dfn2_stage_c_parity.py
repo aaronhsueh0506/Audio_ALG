@@ -2,7 +2,7 @@
 
 ``dfn2_stage.Dfn2Stage`` claims to be ``dfn2_compute_features`` (on A) plus
 ``dfn2_enhance_spectrum_stream`` (on B) with the C's rounding sequence.  This drives the
-real C functions from ``AINR/DeepFilterNet2/dfn2_process.c`` through a tiny
+real C functions from ``lib/ainr/dfn2/dfn2_process.c`` through a tiny
 shim and compares frame by frame with stand-in heads, so the comparison is
 about the arithmetic, not about a network.  The shim builds its grid from the model numbers
 Python read out of ``config.ini`` (df_order and the [feature] values, passed in), so the
