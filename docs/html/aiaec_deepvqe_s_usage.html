@@ -30,7 +30,7 @@ th{background:#eef1f5}
 </style>
 </head>
 <body>
-<nav><a href="index.html">索引</a><a href="conventions.html">慣例</a><a href="conventions_latency.html">延遲預算</a><a href="onnx_prepost.html">ONNX 邊界</a><a href="aiaec_align_ulcnet.html">Align-ULCNet</a><a href="aiaec_align_ulcnet_detail.html">Align-ULCNet 細節</a><a href="aiaec_align_ulcnet_usage.html">Align-ULCNet 使用</a><a href="aiaec_align_cruse.html">Align-CRUSE</a><a href="aiaec_align_cruse_usage.html">Align-CRUSE 使用</a><a href="aiaec_deepvqe_s.html">DeepVQE-S</a><a href="aiaec_deepvqe_s_usage.html"><b>DeepVQE-S 使用</b></a><a href="aiaec_cagcrn.html">CAGCRN</a><a href="aiaec_cagcrn_usage.html">CAGCRN 使用</a></nav>
+<nav><a href="index.html">索引</a><a href="conventions.html">慣例</a><a href="conventions_latency.html">延遲預算</a><a href="onnx_prepost.html">ONNX 邊界</a><a href="aiaec_align_ulcnet.html">Align-ULCNet</a><a href="aiaec_align_ulcnet_detail.html">Align-ULCNet 細節</a><a href="aiaec_align_ulcnet_usage.html">Align-ULCNet 使用</a><a href="aiaec_ulcnet_stream_usage.html">Align-ULCNet PCM stream</a><a href="aiaec_align_cruse.html">Align-CRUSE</a><a href="aiaec_align_cruse_usage.html">Align-CRUSE 使用</a><a href="aiaec_deepvqe_s.html">DeepVQE-S</a><a href="aiaec_deepvqe_s_usage.html"><b>DeepVQE-S 使用</b></a><a href="aiaec_deepvqe_s_stream_usage.html">DeepVQE-S PCM stream</a><a href="aiaec_cagcrn.html">CAGCRN</a><a href="aiaec_cagcrn_usage.html">CAGCRN 使用</a></nav>
 
 <h1>AIAEC DeepVQE-S：如何呼叫、流程時序圖、外部／內部參數</h1>
 
@@ -209,7 +209,7 @@ caller / audiolib              DeepVqePrepost (C)                  NPU runtime
 
 <h2>相關檔案與測試路徑</h2>
 <ul>
-<li><code>AIAEC/DeepVQE_S/deepvqe_prepost.c</code> / <code>.h</code>、<code>deepvqe_process.c</code> / <code>.h</code>、<code>AIAEC/aiaec_process.c</code> / <code>.h</code>；建置：<code>make -C AIAEC lib</code></li>
+<li><code>lib/aiaec/deepvqe_s/deepvqe_prepost.c</code> / <code>.h</code>、<code>deepvqe_process.c</code> / <code>.h</code>、<code>AIAEC/aiaec_process.c</code> / <code>.h</code>；建置：<code>make -C AIAEC lib</code></li>
 <li>測試：<code>AIAEC/tests/test_deepvqe_prepost_c.py</code>（19 個測試函式、20 個案例）、<code>test_streaming_deepvqe_s.py</code>、<code>test_export_stateless.py</code>、<code>test_onnx_state_contract_names.py</code></li>
 <li>同類頁面：<a href="aiaec_deepvqe_s.html">aiaec_deepvqe_s</a>、<a href="aiaec_align_ulcnet_usage.html">aiaec_align_ulcnet_usage</a>、<a href="onnx_prepost.html">onnx_prepost</a>、<a href="index.html">index</a></li>
 <li>文件：<a href="../../AIAEC/DeepVQE_S/README.md">README.md</a>、<a href="../../AIAEC/README.md">AIAEC/README.md</a></li>

@@ -39,6 +39,7 @@ th{background:#eef1f5}
 <a href="ainr_dfn2_detail.html">DFN2 細節</a>
 <a href="ainr_dfn2_usage.html">DFN2 使用</a>
 <a href="ainr_dfn2_grids.html">DFN2 grid</a>
+<a href="ainr_dfn2_stream_usage.html">DFN2 PCM stream</a>
 <a href="ainr_dfn3.html">DFN3</a>
 <a href="ainr_dfn3_usage.html"><b>DFN3 使用</b></a>
 <a href="ainr_gtcrn.html">GTCRN</a>
@@ -226,7 +227,7 @@ caller (AcStft / AcIstft)      DFN3Prepost (C)                     NPU runtime
 
 <h2>相關檔案與測試路徑</h2>
 <ul>
-<li><code>AINR/DeepFilterNet3/dfn3_prepost.c</code> / <code>.h</code>、<code>dfn3_process.c</code> / <code>.h</code>、<code>dfn3_model_io.c</code> / <code>.h</code></li>
+<li><code>lib/ainr/dfn3/dfn3_prepost.c</code> / <code>.h</code>、<code>dfn3_process.c</code> / <code>.h</code>、<code>dfn3_model_io.c</code> / <code>.h</code></li>
 <li>測試：<code>AINR/tests/test_dfn3_stream.c</code>（<code>make -C AINR test-simd</code>，NEON／scalar digest 相同）、<code>test_dfn3_stream_c.py</code>、<code>test_dfn3_prepost_c.py</code>、<code>test_dfn_comparison.py</code>；<code>AINR/DeepFilterNet3/tests/test_dfn3_contract.py</code></li>
 <li>同類頁面：<a href="ainr_dfn3.html">ainr_dfn3</a>、<a href="ainr_dfn2_usage.html">ainr_dfn2_usage</a>、<a href="onnx_prepost.html">onnx_prepost</a>、<a href="index.html">index</a></li>
 <li>文件：<a href="../../AINR/DeepFilterNet3/README.md">README.md</a>、<a href="../../AINR/CHANGELOG.md">CHANGELOG.md</a></li>

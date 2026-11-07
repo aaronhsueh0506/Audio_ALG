@@ -1,0 +1,170 @@
+<!doctype html>
+<html lang="zh-TW">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>AIAEC DeepVQE-S PCM stream</title>
+<style>
+body{font-family:-apple-system,"Segoe UI",Roboto,"Noto Sans TC",sans-serif;max-width:62rem;margin:0 auto;padding:1rem 1.25rem 3rem;line-height:1.55;color:#1a222c;background:#fff}
+nav{font-size:.9rem;border-bottom:1px solid #ccd3dc;padding-bottom:.5rem;margin-bottom:1rem}
+nav a{margin-right:.7rem}
+h1{font-size:1.45rem;margin-bottom:.2em}
+h2{font-size:1.1rem;margin-top:1.7em;border-bottom:1px solid #dde3ea;padding-bottom:.2em}
+h3{font-size:1rem;margin-top:1.3em}
+code,pre{font-family:ui-monospace,SFMono-Regular,Menlo,Consolas,monospace;font-size:.85em}
+pre{background:#f5f7fa;border:1px solid #dde3ea;border-radius:6px;padding:.7rem .9rem;overflow-x:auto;line-height:1.35}
+.tbl{overflow-x:auto}
+table{border-collapse:collapse;font-size:.86rem}
+th,td{border:1px solid #ccd3dc;padding:.25rem .55rem;text-align:left;vertical-align:top}
+th{background:#eef1f5}
+.note{font-size:.88rem;color:#54606e}
+.warn{font-size:.88rem;color:#8a4b00;background:#fff4e5;border:1px solid #f0d3a8;border-radius:6px;padding:.5rem .8rem;margin:.6rem 0}
+@media (prefers-color-scheme:dark){
+ body{background:#14181d;color:#dbe2ea}
+ pre{background:#1c2229;border-color:#2c343d}
+ th{background:#212932}
+ th,td{border-color:#2c343d}
+ nav,h2{border-color:#2c343d}
+ a{color:#7cb3ff}
+ .note{color:#9aa7b4}
+ .warn{color:#f0b060;background:#2a2210;border-color:#5a4418}
+}
+</style>
+</head>
+<body>
+<nav>
+<a href="index.html">索引</a>
+<a href="conventions.html">慣例</a>
+<a href="conventions_latency.html">延遲預算</a>
+<a href="onnx_prepost.html">ONNX 邊界</a>
+<a href="aiaec_align_ulcnet.html">Align-ULCNet</a>
+<a href="aiaec_align_ulcnet_detail.html">Align-ULCNet 細節</a>
+<a href="aiaec_align_ulcnet_usage.html">Align-ULCNet 使用</a>
+<a href="aiaec_ulcnet_stream_usage.html">Align-ULCNet PCM stream</a>
+<a href="aiaec_align_cruse.html">Align-CRUSE</a>
+<a href="aiaec_align_cruse_usage.html">Align-CRUSE 使用</a>
+<a href="aiaec_deepvqe_s.html">DeepVQE-S</a>
+<a href="aiaec_deepvqe_s_usage.html">DeepVQE-S 使用</a>
+<a href="aiaec_deepvqe_s_stream_usage.html"><b>DeepVQE-S PCM stream</b></a>
+<a href="aiaec_cagcrn.html">CAGCRN</a>
+<a href="aiaec_cagcrn_usage.html">CAGCRN 使用</a>
+</nav>
+
+<h1>DeepVQE-S PCM stream：<code>stream/aiaec/deepvqe_s/deepvqe_stream.h</code></h1>
+
+<div class="warn"><b>驗證範圍</b>：本頁描述的行為已用主機端、替身加速器對照板端 sample 的逐 hop 流程驗證（逐樣本 PCM、逐 hop trace 比對；另以一個從零建的 <code>AC_OLA_ACCUMULATE</code> 對照組證明 <code>AC_OLA_ENV_NORM</code> 這個設定本身有可觀測的影響，不只是對齊問題）。<b>未經實板、未經真實 NPU graph 驗證。</b></div>
+
+<h2>概要</h2>
+<p>這是 <a href="aiaec_deepvqe_s.html">DeepVQE-S</a> 模型給板端 sample 用的單一標頭入口：把 <code>lib/aiaec/deepvqe_s/deepvqe_prepost.h</code> 的頻域 frame_open／finish／bypass 生命週期、兩路（mic、far）analysis <code>AcStft</code> 與一路 synthesis <code>AcIstft</code>（<code>AC_OLA_ENV_NORM</code>）包成「int16 PCM 進、int16 PCM 出，一 hop 一次呼叫」的介面。沒有 HPF（板端 sample 本身就沒有）、沒有檔案載入入口（這個模型沒有 ERB 矩陣這種需要外部檔案的東西）。</p>
+<p>這個模型從第 0 個 hop 就「有一幀可用」——沒有 DFN2 那種暖機拍概念。真正的啟動行為來自兩處：CCM ring（原始 mic 歷史）起始全零，前 <code>DEEPVQE_TIME_ORDER-1</code> 個 hop 的 tap 套用是在部分零的歷史上跑（模型自身的啟動行為，不是 stream 的人為限制）；以及 <code>AC_OLA_ENV_NORM</code> 本身的合成行為——重置後第一次 push 不吐出任何樣本，這一拍由 <code>post_process</code> 回報一個明確的 <code>0</code>。</p>
+
+<h2>API 用法</h2>
+<pre>ctx = deepvqe_stream_init(&amp;cfg, pool, pool_bytes);
+while (有一個 hop 的 int16 mic_in, far_in) {
+    DeepVqeHopIO io;
+    if (deepvqe_stream_pre_process(ctx, mic_in, far_in, &amp;io) != 1) break;   // -1 是契約錯誤
+    int ai_rc = run_accelerator(&amp;io.inputs, &amp;io.outputs);                  // 0 = taps + 每個 state 都寫了
+    if (deepvqe_stream_post_process(ctx, ai_rc, pcm_out) &lt; 0) break;
+    // pcm_out 永遠是完整一個 hop
+}</pre>
+<p><b>Bypass 是關閉式（fail CLOSED），不是直通</b>：這個模型的主輸入是原始麥克風、前面沒有線性消除器，所以一旦 <code>ai_rc != 0</code> 或 <code>frame_finish</code> 自己的有限性檢查拒收，被跳過的那拍輸出<b>靜音</b>，不是把 <code>mic_in</code> 原樣放過去（跟 <a href="aiaec_ulcnet_stream_usage.html">Align-ULCNet 的 fail-OPEN</a> 正好相反）。CCM ring 與任何登錄的 state 在 <code>ai_rc != 0</code> 的 bypass 上維持原狀（兩者都不動）；<code>frame_finish</code> 自己的非有限值拒收則不同：只歸零「登錄的 state」（CCM ring 不動，「ring 不推進」），generation 推進，然後本層照常呼叫 <code>frame_bypass</code> 把這拍關掉。</p>
+
+<h2>流程圖（block diagram）</h2>
+<pre>
+PCM in (int16 mic_in, far_in)
+  |
+  v
+int16 -> float (/32768)  x2（無 HPF）
+  |
+  v
+ac_stft_push_planar x2 (stft_mic, stft_far) -----> mic_re/im, far_re/im
+  |
+  v
+deepvqe_prepost_pre_process_freq
+  |
+  v
+deepvqe_prepost_frame_open ---> DeepVqeHopIO{inputs, outputs, state_generation}
+  |                                        |
+  |                                        v
+  |                              (呼叫端:NPU / 替身跑 io.inputs -> io.outputs)
+  |                                        |
+  v                                        v
+deepvqe_stream_post_process(ai_rc) <-------
+  |  ai_rc==0: frame_finish          ai_rc!=0: frame_bypass(靜音, 非直通)
+  v
+deepvqe_prepost_post_process_freq
+  |
+  v
+ac_istft_push_planar (AcIstft, AC_OLA_ENV_NORM；首拍回 0 個樣本)
+  |
+  v
+float -> int16 飽和轉換（首拍與 push 回 0 時填零）
+  |
+  v
+PCM out (int16, 永遠完整一個 hop)
+</pre>
+
+<h2>訊號泳道圖</h2>
+<p>lifeline：<code>caller</code>（含 <code>AcStft</code>／<code>AcIstft</code>）、<code>deepvqe_stream</code>（本層）、<code>NPU</code>（替身或目標平台 runtime）。沒有模型延遲，只有合成法的一拍啟動靜音。</p>
+<pre>
+hop   caller                       deepvqe_stream                       NPU
+0     mic_in,far_in -> pre_process -> STFT x2, pre_process_freq, open -> 跑一次 (CCM ring 全零歷史)
+      &lt;-- 1 (job開啟) --------------------------------------------
+      ai_rc=run_accelerator ---------------------------------->  寫 taps + state
+      post_process(ai_rc) --------> frame_finish -------------->
+      &lt;-- 0 (ENV_NORM 首拍無輸出, 靜音) ---- ISTFT push=0 ------
+1     mic_in,far_in -> pre_process -> STFT x2, pre_process_freq, open -> 跑一次
+      ai_rc=run_accelerator ---------------------------------->  寫 taps + state
+      post_process(ai_rc) --------> frame_finish -------------->
+      &lt;-- 1 (真實輸出) --------------------- ISTFT push=hop ----
+  ... (fail-closed 範例) ...
+k     pre_process -> open --------------------------------------> 替身回 -1, 不寫 taps
+      post_process(ai_rc=-1) -----> frame_bypass (靜音, 非直通) ->
+      &lt;-- 1 (這拍是靜音, 不是 mic_in) -------------------------
+</pre>
+
+<h2>I/O 表</h2>
+<div class="tbl"><table>
+<tr><th>方向</th><th>名稱</th><th>型別／shape</th><th>一次呼叫</th><th>對應時域樣本</th></tr>
+<tr><td>輸入</td><td><code>mic_in</code>、<code>far_in</code></td><td><code>const int16_t*</code>，各長度 <code>deepvqe_stream_hop_size(s)</code></td><td>每 hop 1 次</td><td>1 hop（16 kHz／512 時為 256 samples）</td></tr>
+<tr><td>輸入（可選）</td><td><code>io.inputs</code>（<code>DeepVqePrepostInputs</code>）</td><td><code>mic</code>／<code>far</code> 各 <code>[1,2,1,BINS]</code>（壓縮後平面複數），16 組 state 視圖（<code>DeepVqeStateId</code>）</td><td>僅 <code>pre_process</code> 回 1 時有效</td><td>—</td></tr>
+<tr><td>輸出</td><td><code>io.outputs</code>（<code>DeepVqePrepostOutputs</code>）</td><td><code>taps</code> <code>[1,1,BINS,TIME_ORDER*FREQ_TAPS*2]</code>（NaN 預填），16 組 <code>state_out</code></td><td>加速器寫一次</td><td>—</td></tr>
+<tr><td>輸出</td><td><code>pcm_out</code></td><td><code>int16_t*</code>，長度同 <code>mic_in</code></td><td>每 hop 1 次，永遠寫滿</td><td>1 hop</td></tr>
+</table></div>
+<p class="note"><code>DEEPVQE_TIME_ORDER = 3</code>、<code>DEEPVQE_FREQ_TAPS = 3</code>、<code>DEEPVQE_STATE_COUNT = 16</code>（<code>lib/aiaec/deepvqe_s/deepvqe_process.h</code>／<code>deepvqe_prepost.h</code>）。</p>
+
+<h2>State 表</h2>
+<div class="tbl"><table>
+<tr><th>State</th><th>誰保存</th><th>跨 hop 保存什麼</th><th>何時歸零／推進</th></tr>
+<tr><td>STFT／ISTFT 歷史</td><td>本層（兩路 <code>AcStft</code>＋一路 <code>AcIstft</code>，pool 內）</td><td><code>AC_OLA_ENV_NORM</code> 的重疊與包絡</td><td><code>deepvqe_stream_reset()</code></td></tr>
+<tr><td>CCM ring（原始 mic 歷史）</td><td><code>DeepVqePrepost</code> 內部</td><td>最近 <code>TIME_ORDER</code> 個原始 mic 頻譜，供 tap 套用</td><td>reset 時清空；<code>ai_rc != 0</code> 的 bypass 不動；<code>frame_finish</code> 的非有限拒收「ring 不推進」但不清空</td></tr>
+<tr><td>16 組遞迴 state</td><td>登錄則呼叫端持有，未登錄則加速器自行持有</td><td>align key/value ring、score history、GRU hidden、far/mic/up/res history 等</td><td>reset 全歸零；<code>frame_finish</code> 的非有限拒收只歸零「已登錄的 state」</td></tr>
+<tr><td><code>state_generation</code></td><td>轉呼叫 <code>deepvqe_prepost_state_generation()</code></td><td>目前 generation 值</td><td>init=0；reset 或非有限拒收各 +1；<code>ai_rc != 0</code> 的單純 bypass 不推進</td></tr>
+</table></div>
+
+<h2>延遲與啟動行為</h2>
+<div class="tbl"><table>
+<tr><th>項目</th><th>值（16 kHz／512／delay_depth=32）</th><th>出處</th></tr>
+<tr><td>hop</td><td>256 samples = 16 ms</td><td>實測（見下方 pool 量測）</td></tr>
+<tr><td>模型延遲</td><td>0（每 hop 一幀，<code>deepvqe_prepost.h</code>：「no latency beyond it」）</td><td><code>deepvqe_prepost.h</code></td></tr>
+<tr><td><code>AC_OLA_ENV_NORM</code> 啟動靜音</td><td>1 hop（init 或任一次 reset 後的第一次 push）</td><td><code>audio_stft.h</code>；<code>post_process</code> 的 0 回傳值</td></tr>
+<tr><td>CCM ring 部分零歷史</td><td>前 <code>TIME_ORDER-1</code> = 2 個 hop</td><td>模型自身啟動行為，非延遲</td></tr>
+</table></div>
+
+<h2>pool 大小（實測）</h2>
+<div class="tbl"><table>
+<tr><th>grid</th><th>bytes</th><th>alignment</th></tr>
+<tr><td>16 kHz／512／delay_depth=32（hop=256, n_bins=257）</td><td>126,016</td><td>16</td></tr>
+</table></div>
+<p class="note">由 <code>deepvqe_stream_get_mem_size()</code> 本機實跑量得（<code>DEEPVQE_STREAM_LAYOUT_VERSION = 1</code>）；不含登錄的遞迴 state buffer。</p>
+
+<h2>相關檔案與測試</h2>
+<ul>
+<li><code>stream/aiaec/deepvqe_s/deepvqe_stream.h</code> / <code>.c</code>、<code>deepvqe_stream_internal.h</code>、<code>Makefile</code></li>
+<li>測試：<code>tests/smoke_deepvqe_stream.c</code>（連結＋回傳值契約，含首拍必為 0 的斷言）、<code>tests/verify_vs_sample.c</code>（對板端 sample 獨立重建的逐 hop 比對，含 <code>--inject-shift</code> 與 <code>--ola-matters</code> 兩種自證比對有效的方式）</li>
+<li>底層模型：<code>lib/aiaec/deepvqe_s/deepvqe_prepost.h</code>（見 <a href="aiaec_deepvqe_s.html">aiaec_deepvqe_s</a>、<a href="aiaec_deepvqe_s_usage.html">aiaec_deepvqe_s_usage</a>）</li>
+<li>板端參考（唯讀，repo 外）：<code>alg_ai3_deepvqes.c</code> 的 <code>simple_thread()</code></li>
+<li>同類頁面：<a href="ainr_dfn2_stream_usage.html">DFN2 PCM stream</a>、<a href="aiaec_ulcnet_stream_usage.html">Align-ULCNet PCM stream</a>、<a href="index.html">index</a></li>
+</ul>
+</body>
+</html>

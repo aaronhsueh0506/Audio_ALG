@@ -68,7 +68,7 @@ int  dfn2_prepost_output_frame_index(const DFN2Prepost *p, long long *frame);
 
 #### DeepFilterNet3：`dfn3_prepost.h`
 
-與 DFN2 同一組函式（`dfn3_prepost_*`，含 `_pre_process_freq_dual`、`dfn3_model_run_frame()`），grid 用 `DFN3GridSpec`／`dfn3_grid_make()`（`AINR/DeepFilterNet3/dfn3_process.h`；欄位同 DFN2，沒有 `frames_per_call`）。差異：
+與 DFN2 同一組函式（`dfn3_prepost_*`，含 `_pre_process_freq_dual`、`dfn3_model_run_frame()`），grid 用 `DFN3GridSpec`／`dfn3_grid_make()`（`lib/ainr/dfn3/dfn3_process.h`；欄位同 DFN2，沒有 `frames_per_call`）。差異：
 
 - 兩個 heads 平行（不是 cascade）：模型延遲是 `grid.output_delay` = max(M, D) 個 frame（`dfn3_prepost_model_lookahead_frames()`）；ring 深度 `df_order + output_delay − D`（出貨 1/1 與 0/0、2/4 為 5，1/0 與 2/1 為 6，2/0 為 7）。
   lookahead pair 是 `DFN3GridSpec` 的欄位（M 0..2、D 0..`df_order`−1），在執行期給定；pair 不符由 descriptor、pool hash 與 grid 檢查在執行期擋下。出貨只有 1/1。

@@ -38,6 +38,7 @@ th{background:#eef1f5}
 <a href="ainr_dfn2_detail.html">DFN2 細節</a>
 <a href="ainr_dfn2_usage.html">DFN2 使用</a>
 <a href="ainr_dfn2_grids.html">DFN2 grid</a>
+<a href="ainr_dfn2_stream_usage.html">DFN2 PCM stream</a>
 <a href="ainr_dfn3.html">DFN3</a>
 <a href="ainr_dfn3_usage.html">DFN3 使用</a>
 <a href="ainr_gtcrn.html"><b>GTCRN</b></a>
@@ -245,7 +246,7 @@ context(conv window 深度 = 歷史 + 新的一幀,即 3、5、11),加上 RNN �
 
 <h2>相關檔案與測試路徑</h2>
 <ul>
-<li>C 前後處理:<code>AINR/GTCRN/gtcrn_process.c</code> / <code>.h</code>（DSP kernels 內含於本檔——porting 為單一 model，各自攜帶）</li>
+<li>C 前後處理:<code>lib/ainr/gtcrn/gtcrn_process.c</code> / <code>.h</code>（DSP kernels 內含於本檔——porting 為單一 model，各自攜帶）</li>
 <li>模型 / 訓練 / 推論:<code>AINR/GTCRN/model.py</code>、<code>train.py</code>、<code>inference.py</code>、<code>config.ini</code>、<code>checkpoint_utils.py</code></li>
 <li>串流 / 匯出:<code>AINR/GTCRN/stream_model.py</code>(<code>StreamGTCRN</code>、<code>initial_inputs</code>)、<code>export_onnx.py</code>、<code>export_erb_matrix.py</code></li>
 <li>文件:<a href="../../AINR/GTCRN/README.md">README.md</a>、<a href="../../AINR/GTCRN/docs/architecture_notes.md">docs/architecture_notes.md</a></li>

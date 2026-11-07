@@ -180,19 +180,19 @@ RNNoise-ERB 為 24 byte、沒有 reserved 欄）當<b>陳舊 pool 閘</b>：<cod
 
 <table>
 <tr><th>Model</th><th>C 類別</th><th>測試</th><th><code>frame_bypass</code> 政策</th><th>exporter 寫的 metadata key</th></tr>
-<tr><td>Align-ULCNet</td><td><code>AIAEC/Align_ULCNet/ulcnet_prepost.c/h</code></td>
+<tr><td>Align-ULCNet</td><td><code>lib/aiaec/ulcnet/ulcnet_prepost.c/h</code></td>
 <td><code>AIAEC/tests/test_ulcnet_prepost_c.py</code></td>
 <td>identity：error 頻譜原樣通過（stream 0 是 linear-AEC error）</td>
 <td><code>state_layout_version</code>（<code>Align_ULCNet/export_onnx.py</code>）</td></tr>
-<tr><td>DeepVQE-S</td><td><code>AIAEC/DeepVQE_S/deepvqe_prepost.c/h</code></td>
+<tr><td>DeepVQE-S</td><td><code>lib/aiaec/deepvqe_s/deepvqe_prepost.c/h</code></td>
 <td><code>AIAEC/tests/test_deepvqe_prepost_c.py</code></td>
 <td><b>mute_fail_closed</b>：靜音（stream 0 是原始 mic，放行＝未消迴聲）</td>
 <td><code>state_layout_version</code> + <code>c_descriptor</code>（<code>AIAEC/_streaming_export.py</code>）</td></tr>
-<tr><td>DeepFilterNet2</td><td><code>AINR/DeepFilterNet2/dfn2_prepost.c/h</code></td>
+<tr><td>DeepFilterNet2</td><td><code>lib/ainr/dfn2/dfn2_prepost.c/h</code></td>
 <td><code>AINR/tests/test_dfn2_prepost_c.py</code></td>
 <td>identity：unit ERB mask + alpha 0</td>
 <td><code>state_layout_version</code>（<code>DeepFilterNet2/export_onnx.py</code>）</td></tr>
-<tr><td><a href="ainr_dfn3.html">DeepFilterNet3</a></td><td><code>AINR/DeepFilterNet3/dfn3_prepost.c/h</code></td>
+<tr><td><a href="ainr_dfn3.html">DeepFilterNet3</a></td><td><code>lib/ainr/dfn3/dfn3_prepost.c/h</code></td>
 <td><code>AINR/tests/test_dfn3_prepost_c.py</code></td>
 <td>identity：高頻 unit ERB gain + 低頻 raw bin 的 unit center DF tap</td>
 <td><code>state_layout_version</code>（<code>DeepFilterNet3/export_onnx.py</code>）</td></tr>
@@ -202,10 +202,10 @@ RNNoise-ERB 為 24 byte、沒有 reserved 欄）當<b>陳舊 pool 閘</b>：<cod
 <tr><td>CAGCRN</td><td><b>沒有</b>——只有共用的 <code>AIAEC/aiaec_process.c/h</code> helper</td>
 <td>—</td><td>—</td>
 <td><b>兩個 key 都沒有</b></td></tr>
-<tr><td>GTCRN</td><td>不是 <code>frame_open</code> 形狀：<code>AINR/GTCRN/gtcrn_process.c/h</code> 的 <code>GTCRNProcess</code> pool 物件（<code>gtcrn_model_input()</code>／<code>gtcrn_model_output()</code>）</td>
+<tr><td>GTCRN</td><td>不是 <code>frame_open</code> 形狀：<code>lib/ainr/gtcrn/gtcrn_process.c/h</code> 的 <code>GTCRNProcess</code> pool 物件（<code>gtcrn_model_input()</code>／<code>gtcrn_model_output()</code>）</td>
 <td><code>AINR/tests/test_c_prepost.c</code></td><td>mask 或 state 驗證回 −1 時，應用端把頻譜直通、不呼叫 <code>gtcrn_model_output()</code></td>
 <td><code>state_layout_version</code>（<code>GTCRN/export_onnx.py</code>）</td></tr>
-<tr><td>RNNoise-ERB</td><td>不是 <code>frame_open</code> 形狀：<code>AINR/RNNoise-ERB/process.c/h</code> 的 <code>RNNoiseState</code> pool 物件（<code>rnnoise_compute_features()</code>／<code>rnnoise_frame_finish()</code>）</td>
+<tr><td>RNNoise-ERB</td><td>不是 <code>frame_open</code> 形狀：<code>lib/ainr/rnnoise_erb/process.c/h</code> 的 <code>RNNoiseState</code> pool 物件（<code>rnnoise_compute_features()</code>／<code>rnnoise_frame_finish()</code>）</td>
 <td><code>AINR/RNNoise-ERB/test/</code></td><td><code>rnnoise_frame_finish()</code> 回 −1 時，應用端改用 unit gains</td>
 <td><code>state_layout_version</code>（<code>RNNoise-ERB/export_onnx.py</code>）</td></tr>
 </table>
@@ -300,7 +300,7 @@ Transpose），全程維持 rank 4、batch 1，每個輸出元素是同一個內
 <ul>
 <li>pipeline 呼叫與時序：<a href="pipeline_dfn_usage.html">pipeline_dfn_usage</a>、<a href="pipeline_dfn_sequence.html">pipeline_dfn_sequence</a>、<a href="pipeline_ulcnet_usage.html">pipeline_ulcnet_usage</a>、<a href="pipeline_ulcnet_sequence.html">pipeline_ulcnet_sequence</a>；參數表：<a href="pipeline_dfn_params.html">pipeline_dfn_params</a>、<a href="pipeline_ulcnet_params.html">pipeline_ulcnet_params</a></li>
 <li>範例組合：<a href="pipeline_dfn_mono.html">pipeline_dfn_mono</a>、<a href="pipeline_dfn_4ch.html">pipeline_dfn_4ch</a>、<a href="pipeline_ulcnet_mono.html">pipeline_ulcnet_mono</a>、<a href="pipeline_ulcnet_4ch.html">pipeline_ulcnet_4ch</a>；總覽見 <a href="index.html">index</a>、<a href="conventions.html">conventions</a>、<a href="integration_example.html">integration_example</a></li>
-<li>原始碼：<code>AINR/onnx_streaming_contract.py</code>、<code>AIAEC/_streaming_export.py</code>、<code>AINR/DeepFilterNet2/dfn2_prepost.h</code>、<code>AINR/DeepFilterNet3/dfn3_prepost.h</code>、<code>AIAEC/Align_ULCNet/ulcnet_prepost.h</code>、<code>AIAEC/DeepVQE_S/deepvqe_prepost.h</code>、<code>AINR/GTCRN/gtcrn_process.h</code>、<code>AINR/RNNoise-ERB/process.h</code></li>
+<li>原始碼：<code>AINR/onnx_streaming_contract.py</code>、<code>AIAEC/_streaming_export.py</code>、<code>lib/ainr/dfn2/dfn2_prepost.h</code>、<code>lib/ainr/dfn3/dfn3_prepost.h</code>、<code>lib/aiaec/ulcnet/ulcnet_prepost.h</code>、<code>lib/aiaec/deepvqe_s/deepvqe_prepost.h</code>、<code>lib/ainr/gtcrn/gtcrn_process.h</code>、<code>lib/ainr/rnnoise_erb/process.h</code></li>
 </ul>
 </body>
 </html>

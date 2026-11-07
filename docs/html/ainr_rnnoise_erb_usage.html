@@ -39,6 +39,7 @@ th{background:#eef1f5}
 <a href="ainr_dfn2_detail.html">DFN2 細節</a>
 <a href="ainr_dfn2_usage.html">DFN2 使用</a>
 <a href="ainr_dfn2_grids.html">DFN2 grid</a>
+<a href="ainr_dfn2_stream_usage.html">DFN2 PCM stream</a>
 <a href="ainr_dfn3.html">DFN3</a>
 <a href="ainr_dfn3_usage.html">DFN3 使用</a>
 <a href="ainr_gtcrn.html">GTCRN</a>
@@ -237,7 +238,7 @@ caller (AcStft/AcIstft)        rnnoise (process.c)                 NPU graph
 
 <h2>相關檔案與測試路徑</h2>
 <ul>
-<li><code>AINR/RNNoise-ERB/process.c</code> / <code>process.h</code></li>
+<li><code>lib/ainr/rnnoise_erb/process.c</code> / <code>process.h</code></li>
 <li>測試：<code>AINR/RNNoise-ERB/test/</code>（<code>make -C AINR/RNNoise-ERB test</code> = <code>test-tables</code>（兩個 raw 矩陣檔比對與讀檔拒絕）、<code>test-feature-contract</code>、<code>test-features</code>（feature 參考；已註冊 state、非有限頻譜、attenuation limit 拒絕、pool descriptor）、<code>test-framing</code>、<code>test-simd</code>；矩陣檔預設由 <code>tests/erb_fixture.py</code> 寫出，<code>ERB_FWD=FILE ERB_INV=FILE</code> 可改讀其他檔）、<code>AINR/RNNoise-ERB/tests/</code>（pytest：<code>test_feature_contract.py</code>、<code>test_feature_norm.py</code>、<code>test_loss.py</code>、<code>test_python_c_features.py</code>（含 <code>test_pcm_chain</code>：PCM 經 AcStft／AcIstft 與 <code>train.py</code> 對照）、<code>test_export_metadata.py</code>、<code>test_erb_fixture.py</code>；<code>make test-python</code> 跑 Python 側）</li>
 <li>同類頁面：<a href="ainr_rnnoise_erb.html">ainr_rnnoise_erb</a>、<a href="ainr_gtcrn_usage.html">ainr_gtcrn_usage</a>、<a href="onnx_prepost.html">onnx_prepost</a>、<a href="index.html">index</a></li>
 <li>文件：<a href="../../AINR/RNNoise-ERB/README.md">README.md</a></li>

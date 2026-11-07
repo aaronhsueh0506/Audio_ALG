@@ -67,12 +67,12 @@
 | 只做單路 AEC，或自行組合 NN／其他 post-filter | `aec.h` |
 | 已有 STFT/WOLA，只需要頻域 NR | `anr.h` |
 | 只需要 FFT、resample、HPF | `audiolib/common/include/*.h` |
-| Align-ULCNet 加速器 handoff（頻譜） | `AIAEC/Align_ULCNet/ulcnet_prepost.h` |
-| DeepVQE-S 加速器 handoff（頻譜） | `AIAEC/DeepVQE_S/deepvqe_prepost.h` |
-| DeepFilterNet2 加速器 handoff（頻譜） | `AINR/DeepFilterNet2/dfn2_prepost.h` |
-| DeepFilterNet3 加速器 handoff（頻譜） | `AINR/DeepFilterNet3/dfn3_prepost.h` |
-| GTCRN 前後處理（頻譜） | `AINR/GTCRN/gtcrn_process.h` |
-| RNNoise-ERB 前後處理（頻譜） | `AINR/RNNoise-ERB/process.h` |
+| Align-ULCNet 加速器 handoff（頻譜） | `lib/aiaec/ulcnet/ulcnet_prepost.h` |
+| DeepVQE-S 加速器 handoff（頻譜） | `lib/aiaec/deepvqe_s/deepvqe_prepost.h` |
+| DeepFilterNet2 加速器 handoff（頻譜） | `lib/ainr/dfn2/dfn2_prepost.h` |
+| DeepFilterNet3 加速器 handoff（頻譜） | `lib/ainr/dfn3/dfn3_prepost.h` |
+| GTCRN 前後處理（頻譜） | `lib/ainr/gtcrn/gtcrn_process.h` |
+| RNNoise-ERB 前後處理（頻譜） | `lib/ainr/rnnoise_erb/process.h` |
 
 只有「多聲道線性 AEC 的 flow」被包成一個模組（`Mcab`；`mcab_fuse()` 之後 `frame->g_res_ctx` 為 NULL，mcab 不持有 `AecRes`、也不含 beamformer）。
 它是 flow 層而不是函式庫：四條 `Aec` lane 與（MATCHED）共用的 `DelayAec` 由應用用 lib/aec 自己的 `*_get_mem_size`／`*_init` 建立，以指標交給 `mcab_init_ex()`；mcab 只擁有自己 pool 裡的 flow 狀態。

@@ -7,12 +7,12 @@ framing、window、FFT／IFFT 與 overlap-add **不在函式庫裡**：應用端
 
 | 模型 | Public header | 物件 | 訊號輸入 |
 |---|---|---|---|
-| Align-ULCNet | `AIAEC/Align_ULCNet/ulcnet_prepost.h` | `UlcnetPrepost` | linear-AEC error + raw far |
-| DeepVQE-S | `AIAEC/DeepVQE_S/deepvqe_prepost.h` | `DeepVqePrepost` | **raw microphone** + far reference |
-| DeepFilterNet2 | `AINR/DeepFilterNet2/dfn2_prepost.h` | `DFN2Prepost` | 單路 noisy |
-| DeepFilterNet3 | `AINR/DeepFilterNet3/dfn3_prepost.h` | `DFN3Prepost` | 單路 noisy；raw 低頻 DF／高頻 ERB |
-| GTCRN | `AINR/GTCRN/gtcrn_process.h` | `GTCRNProcess` | 單路 noisy（interleaved 頻譜） |
-| RNNoise-ERB | `AINR/RNNoise-ERB/process.h` | `RNNoiseState` | 單路 noisy |
+| Align-ULCNet | `lib/aiaec/ulcnet/ulcnet_prepost.h` | `UlcnetPrepost` | linear-AEC error + raw far |
+| DeepVQE-S | `lib/aiaec/deepvqe_s/deepvqe_prepost.h` | `DeepVqePrepost` | **raw microphone** + far reference |
+| DeepFilterNet2 | `lib/ainr/dfn2/dfn2_prepost.h` | `DFN2Prepost` | 單路 noisy |
+| DeepFilterNet3 | `lib/ainr/dfn3/dfn3_prepost.h` | `DFN3Prepost` | 單路 noisy；raw 低頻 DF／高頻 ERB |
+| GTCRN | `lib/ainr/gtcrn/gtcrn_process.h` | `GTCRNProcess` | 單路 noisy（interleaved 頻譜） |
+| RNNoise-ERB | `lib/ainr/rnnoise_erb/process.h` | `RNNoiseState` | 單路 noisy |
 
 前四個是 `*_prepost` 類別（`frame_open`／`frame_finish`／`frame_bypass` 三步，§6.1–6.6）；GTCRN 與 RNNoise-ERB 是同樣由應用端給 pool 的物件，但沒有 `frame_*`，呼叫序見 §6.6。
 四個 prepost 類別各是獨立的翻譯單元（`*_prepost.c`），組合同目錄的 `*_process.c` 與（DFN2、DFN3、Align-ULCNet 的）`*_model_io.c`；這些檔案要能單獨連結給各自的 parity 測試，所以類別不放進其中任何一個。

@@ -24,6 +24,7 @@ document disagrees with them.
 | DFN3 raw-low / masked-high comparison contract and its lookahead pair | [`../AINR/DeepFilterNet3/README.md`](../AINR/DeepFilterNet3/README.md) |
 | Neural AEC candidates | [`../AIAEC/README.md`](../AIAEC/README.md) |
 | AIAEC candidate decision matrix | [`ai_aec_candidate_matrix.md`](ai_aec_candidate_matrix.md) |
+| PCM stream SDKs (int16 PCM in/out, one hop per call; DFN2, DeepVQE-S, Align-ULCNet only — host-only, fake-accelerator verified, not board-verified) | [`html/ainr_dfn2_stream_usage.html`](html/ainr_dfn2_stream_usage.html), [`html/aiaec_deepvqe_s_stream_usage.html`](html/aiaec_deepvqe_s_stream_usage.html), [`html/aiaec_ulcnet_stream_usage.html`](html/aiaec_ulcnet_stream_usage.html) |
 | PBFDKF + Align-ULCNet embedded streaming proposal (index, chapters 1-5; chapters 6-9 in [`part 01`](align_ulcnet_embedded_streaming_design_zh_TW_01_state_wola_delay.md), chapters 10-11 in [`part 02`](align_ulcnet_embedded_streaming_design_zh_TW_02_npu_boundary_validation.md)) | [`align_ulcnet_embedded_streaming_design_zh_TW.md`](align_ulcnet_embedded_streaming_design_zh_TW.md) |
 | AIAEC four-candidate streaming readiness audit | [`aiaec_streaming_readiness_zh_TW.md`](aiaec_streaming_readiness_zh_TW.md) |
 | Mono integration (sequence diagram, calls, external/internal parameters, config/pool/errors; index and chapters 6-8, chapters 0-2 in [`part 01`](integration_mono_zh_TW_01_overview_link_quickstart.md), chapters 3-5 in [`part 02`](integration_mono_zh_TW_02_lifecycle_config_errors.md)) | [`integration_mono_zh_TW.md`](integration_mono_zh_TW.md) |
@@ -72,7 +73,10 @@ usage page (`ainr_dfn2_usage.html`, `ainr_dfn3_usage.html`, `ainr_gtcrn_usage.ht
 `aiaec_align_cruse.html`, `aiaec_deepvqe_s.html` and `aiaec_cagcrn.html`, each with a usage page
 (`aiaec_align_ulcnet_usage.html`, `aiaec_align_cruse_usage.html`, `aiaec_deepvqe_s_usage.html`,
 `aiaec_cagcrn_usage.html`; Align-ULCNet far-branch, PTQ and layout detail in
-`aiaec_align_ulcnet_detail.html`).
+`aiaec_align_ulcnet_detail.html`). Three of the eight models also have an int16-PCM stream SDK
+page (one hop per call, host-only/fake-accelerator verified, not board-verified): DFN2's
+`ainr_dfn2_stream_usage.html`, DeepVQE-S's `aiaec_deepvqe_s_stream_usage.html`, Align-ULCNet's
+`aiaec_ulcnet_stream_usage.html`; the other five models have no stream page and none is planned.
 
 Who owns the residual-echo suppressor (RES):
 

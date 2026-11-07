@@ -39,6 +39,7 @@ th{background:#eef1f5}
 <a href="ainr_dfn2_detail.html"><b>DFN2 細節</b></a>
 <a href="ainr_dfn2_usage.html">DFN2 使用</a>
 <a href="ainr_dfn2_grids.html">DFN2 grid</a>
+<a href="ainr_dfn2_stream_usage.html">DFN2 PCM stream</a>
 <a href="ainr_dfn3.html">DFN3</a>
 <a href="ainr_dfn3_usage.html">DFN3 使用</a>
 <a href="ainr_gtcrn.html">GTCRN</a>
@@ -196,7 +197,7 @@ inverse 不是 partition of unity 的 ERB 矩陣會被 init 擋下,而不是讓 
 
 <h2>相關檔案與測試路徑</h2>
 <ul>
-<li>C 前後處理類別:<code>AINR/DeepFilterNet2/dfn2_prepost.c</code> / <code>.h</code>、<code>AINR/DeepFilterNet2/dfn2_model_io.c</code> / <code>.h</code>;完整清單見 <a href="ainr_dfn2.html">ainr_dfn2</a>。</li>
+<li>C 前後處理類別:<code>lib/ainr/dfn2/dfn2_prepost.c</code> / <code>.h</code>、<code>lib/ainr/dfn2/dfn2_model_io.c</code> / <code>.h</code>;完整清單見 <a href="ainr_dfn2.html">ainr_dfn2</a>。</li>
 <li>host 消費者:<code>pipelines/dfn/dfn_res_stage.c</code>、<code>pipelines/Makefile</code></li>
 <li>C 測試:<code>AINR/tests/test_c_prepost.c</code>(<code>test_dfn_erb_spans_exact</code>);grid:<code>AINR/tests/test_dfn2_grid.py</code>;測試程式的 grid 標頭:<code>AINR/tests/dfn2_test_grid.h</code></li>
 </ul>

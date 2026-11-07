@@ -261,7 +261,7 @@ push#1→2 幀（frame0 含 reflect 前綴 + frame1）、之後每 push 1 幀；
 </ul>
 <p><b>ULCNet 的兩種分析排程並存，出貨路徑分兩派。</b>
 <code>AcStft</code> 的 <code>center</code> 0（應用端以 <code>ac_stft_config_default()</code> 的預設建立，
-契約在 <code>AIAEC/Align_ULCNet/ulcnet_process.h</code>）是 rolling 分析：
+契約在 <code>lib/aiaec/ulcnet/ulcnet_process.h</code>）是 rolling 分析：
 <b>從第一次 push 起每次恰好一幀</b>（第一幀的前半段是被歸零的 history），
 且與 <code>center</code> 1 對同一個 pushed hop 所發的
 <b>最後一幀逐 bit 相同</b>——centered 排程只是多了開頭那個 reflect 前綴幀。
@@ -317,15 +317,15 @@ rolling 排程後兩者天生 hop-locked，不需再靠 centered 排程的 0/2/1
 <tr><td><code>DFN_RATE_BRIDGE_LAYOUT_VERSION</code> = 5</td>
 <td><code>pipelines/dfn/dfn_rate_bridge.h</code></td><td>原生格點 ↔ 48 kHz stage 的 rate bridge</td></tr>
 <tr><td><code>ULCNET_MODEL_IO_LAYOUT_VERSION</code> = 18</td>
-<td><code>AIAEC/Align_ULCNet/ulcnet_model_io.h</code></td><td>Align-ULCNet 模型 I/O 與 state 排列</td></tr>
+<td><code>lib/aiaec/ulcnet/ulcnet_model_io.h</code></td><td>Align-ULCNet 模型 I/O 與 state 排列</td></tr>
 <tr><td><code>DEEPVQE_PREPOST_LAYOUT_VERSION</code> = 4</td>
-<td><code>AIAEC/DeepVQE_S/deepvqe_prepost.h</code></td><td>DeepVQE-S 前後處理 class</td></tr>
+<td><code>lib/aiaec/deepvqe_s/deepvqe_prepost.h</code></td><td>DeepVQE-S 前後處理 class</td></tr>
 <tr><td><code>DFN2_PREPOST_CARVE_VERSION</code> = 11／<code>DFN3_PREPOST_CARVE_VERSION</code> = 9</td>
-<td><code>AINR/DeepFilterNet2/dfn2_prepost.h</code>、<code>AINR/DeepFilterNet3/dfn3_prepost.h</code></td><td>carve 走訪順序，進 <code>build_flags_hash</code></td></tr>
+<td><code>lib/ainr/dfn2/dfn2_prepost.h</code>、<code>lib/ainr/dfn3/dfn3_prepost.h</code></td><td>carve 走訪順序，進 <code>build_flags_hash</code></td></tr>
 <tr><td><code>ULCNET_PREPOST_CARVE_VERSION</code> = 8／<code>DEEPVQE_PREPOST_CARVE_VERSION</code> = 8</td>
-<td><code>AIAEC/Align_ULCNet/ulcnet_prepost.h</code>、<code>AIAEC/DeepVQE_S/deepvqe_prepost.h</code></td><td>同上</td></tr>
+<td><code>lib/aiaec/ulcnet/ulcnet_prepost.h</code>、<code>lib/aiaec/deepvqe_s/deepvqe_prepost.h</code></td><td>同上</td></tr>
 <tr><td><code>GTCRN_PROCESS_CARVE_VERSION</code> = 1／<code>RNNOISE_CARVE_VERSION</code> = 1</td>
-<td><code>AINR/GTCRN/gtcrn_process.h</code>、<code>AINR/RNNoise-ERB/process.h</code></td><td>同上</td></tr>
+<td><code>lib/ainr/gtcrn/gtcrn_process.h</code>、<code>lib/ainr/rnnoise_erb/process.h</code></td><td>同上</td></tr>
 </table>
 </div>
 <p class="note">4ch 應用端各物件（四條 lane、共享 estimator、<code>mcab</code> 自己的 pool、sample helper）的位元組數隨格點（16k/256、16k/512、48k/1024）與建置旗標而變，不在本頁列出，
@@ -342,7 +342,7 @@ rolling 排程後兩者天生 hop-locked，不需再靠 centered 排程的 0/2/1
 <code>pipelines/mono_aec_nr_res/main.c</code>、<code>pipelines/4ch_aec_bf_nr_res/mcab_static.c</code>（各 main 的 <code>AcIstft</code>）、
 <code>pipelines/ulcnet/ulcnet_nn_stage.c</code></td></tr>
 <tr><td>Framing 決策</td><td><code>docs/align_ulcnet_embedded_streaming_design_zh_TW_01_state_wola_delay.md</code> §7、
-<code>AINR/DeepFilterNet2/dfn2_process.h</code> 檔頭的 framing 契約</td></tr>
+<code>lib/ainr/dfn2/dfn2_process.h</code> 檔頭的 framing 契約</td></tr>
 <tr><td>測試</td><td><code>pipelines/mono_aec_nr_res/tests/test_signal_grids.py</code>、
 <code>pipelines/ulcnet/mono_alignulcnet/tests/test_mono_ulcnet.c</code>、
 <code>pipelines/ulcnet/4ch_alignulcnet/tests/test_4ch_ulcnet.c</code>（timing contract）、

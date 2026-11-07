@@ -38,6 +38,7 @@ th{background:#eef1f5}
 <a href="ainr_dfn2_detail.html">DFN2 細節</a>
 <a href="ainr_dfn2_usage.html">DFN2 使用</a>
 <a href="ainr_dfn2_grids.html">DFN2 grid</a>
+<a href="ainr_dfn2_stream_usage.html">DFN2 PCM stream</a>
 <a href="ainr_dfn3.html">DFN3</a>
 <a href="ainr_dfn3_usage.html">DFN3 使用</a>
 <a href="ainr_gtcrn.html">GTCRN</a>
@@ -210,7 +211,7 @@ h1/h2/h3</b>——3 框 conv 窗由 C 端 ring 重送,圖內無 conv cache。h1/
 
 <h2>相關檔案與測試路徑</h2>
 <ul>
-<li>C 前後處理:<code>AINR/RNNoise-ERB/process.c</code> / <code>process.h</code>;ERB 矩陣由應用端載入並以指標傳入(版面見 <a href="ainr_rnnoise_erb_usage.html">ainr_rnnoise_erb_usage</a>),沒有編譯期表格</li>
+<li>C 前後處理:<code>lib/ainr/rnnoise_erb/process.c</code> / <code>process.h</code>;ERB 矩陣由應用端載入並以指標傳入(版面見 <a href="ainr_rnnoise_erb_usage.html">ainr_rnnoise_erb_usage</a>),沒有編譯期表格</li>
 <li>模型 / 訓練 / 推論 / 匯出:<code>train.py</code>(<code>RNNoiseModel</code>)、<code>inference.py</code>、<code>export_onnx.py</code>、<code>config.ini</code>、<code>calibrate_norm_init.py</code></li>
 <li>文件:<a href="../../AINR/RNNoise-ERB/README.md">README.md</a></li>
 <li>C 測試:<code>AINR/RNNoise-ERB/test/</code> — <code>make test</code> = <code>test-tables</code>(兩個無標頭 float32 檔 <code>erb_fwd.bin</code>／<code>erb_inv.bin</code> 與獨立重算的三角 ERB 濾波器逐 byte 比對、矩陣契約、讀檔拒絕:缺檔、空檔、過短、過長、grid 不符)、<code>test-feature-contract</code>(config／Python／C feature 合約)、<code>test-features</code>(獨立 C 參考 feature;已註冊 state、非有限頻譜、attenuation limit 拒絕與 pool descriptor(init_ex 閘門、build hash)的行為)、<code>test-framing</code>(四組 grid 的 framing 契約:單位增益下輸出為輸入延遲一個 hop,只測 framing 鏈、不含 lookahead 的頻譜延遲,錯誤的縮放會被抓出)、<code>test-simd</code>(固定 shared FFT 下 local DSP 的 SIMD/scalar digest)。NE10 SIMD=0/1 本身允許有捨入差；不能跨 FFT 模式要求 digest 相同。兩個矩陣檔預設由 <code>tests/erb_fixture.py</code>(只用標準函式庫)寫到 <code>$(BUILD_DIR)/</code>,<code>ERB_FWD=FILE ERB_INV=FILE</code> 可改讀其他檔;<code>test/</code> 內另有共用的 <code>rnnoise_test_erb.h</code>(讀檔)、<code>rnnoise_test_support.h</code>,以及獨立執行的 <code>run_makefile_build_safety_test.sh</code>(Makefile 建置安全)。</li>

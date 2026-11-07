@@ -80,6 +80,7 @@ code{font-family:ui-monospace,Menlo,monospace;font-size:.92em}
 <a href="ainr_dfn2_detail.html">DFN2 細節</a> ·
 <a href="ainr_dfn2_usage.html">DFN2 使用</a> ·
 <a href="ainr_dfn2_grids.html">DFN2 grid</a> ·
+<a href="ainr_dfn2_stream_usage.html">DFN2 PCM stream</a> ·
 <a href="ainr_dfn3.html">DFN3</a> ·
 <a href="ainr_dfn3_usage.html">DFN3 使用</a> ·
 <a href="ainr_gtcrn.html">GTCRN</a> ·
@@ -89,10 +90,12 @@ code{font-family:ui-monospace,Menlo,monospace;font-size:.92em}
 <a href="aiaec_align_ulcnet.html">Align-ULCNet</a> ·
 <a href="aiaec_align_ulcnet_detail.html">Align-ULCNet 細節</a> ·
 <a href="aiaec_align_ulcnet_usage.html">Align-ULCNet 使用</a> ·
+<a href="aiaec_ulcnet_stream_usage.html">Align-ULCNet PCM stream</a> ·
 <a href="aiaec_align_cruse.html">Align-CRUSE</a> ·
 <a href="aiaec_align_cruse_usage.html">Align-CRUSE 使用</a> ·
 <a href="aiaec_deepvqe_s.html">DeepVQE-S</a> ·
 <a href="aiaec_deepvqe_s_usage.html">DeepVQE-S 使用</a> ·
+<a href="aiaec_deepvqe_s_stream_usage.html">DeepVQE-S PCM stream</a> ·
 <a href="aiaec_cagcrn.html">CAGCRN</a> ·
 <a href="aiaec_cagcrn_usage.html">CAGCRN 使用</a>
 </nav>
@@ -315,6 +318,8 @@ graph 只含 heads。</td></tr>
 <code>export_onnx.py</code> 以 GRU h1–h3 顯式進出，應用端登錄 h1–h3（板端不登錄），<code>rnnoise_frame_finish()</code> 檢查 finite。</td></tr>
 <tr><td><a href="ainr_dfn2_usage.html">ainr_dfn2_usage</a>／<a href="ainr_dfn3_usage.html">ainr_dfn3_usage</a>／<a href="ainr_gtcrn_usage.html">ainr_gtcrn_usage</a>／<a href="ainr_rnnoise_erb_usage.html">ainr_rnnoise_erb_usage</a></td>
 <td>四個 AINR 模型的使用與參數頁。</td></tr>
+<tr><td><a href="ainr_dfn2_stream_usage.html">ainr_dfn2_stream_usage</a></td>
+<td>DFN2 的 int16 PCM stream SDK（<code>stream/ainr/dfn2/dfn2_stream.h</code>）：一 hop 一次呼叫，暖機與排尾、ERB 檔案/記憶體兩種初始化。主機端、替身加速器驗證；未經實板。</td></tr>
 </table>
 
 <h3>AIAEC（NN AEC/RES 四候選）</h3>
@@ -338,6 +343,10 @@ attention），輸出 3×3 complex convolving mask。</td></tr>
 （CATA broadcast、動態 ConvTranspose2d）。</td></tr>
 <tr><td><a href="aiaec_align_ulcnet_usage.html">aiaec_align_ulcnet_usage</a>／<a href="aiaec_align_cruse_usage.html">aiaec_align_cruse_usage</a>／<a href="aiaec_deepvqe_s_usage.html">aiaec_deepvqe_s_usage</a>／<a href="aiaec_cagcrn_usage.html">aiaec_cagcrn_usage</a></td>
 <td>四個 AIAEC 候選的使用與參數頁。</td></tr>
+<tr><td><a href="aiaec_ulcnet_stream_usage.html">aiaec_ulcnet_stream_usage</a></td>
+<td>Align-ULCNet 的 int16 PCM stream SDK（<code>stream/aiaec/ulcnet/ulcnet_stream.h</code>）：線性 AEC 的 error/far 兩路輸入，對齊驅動 reset＋reprime，fail-OPEN（直通，非靜音）。主機端、替身加速器驗證；未經實板。</td></tr>
+<tr><td><a href="aiaec_deepvqe_s_stream_usage.html">aiaec_deepvqe_s_stream_usage</a></td>
+<td>DeepVQE-S 的 int16 PCM stream SDK（<code>stream/aiaec/deepvqe_s/deepvqe_stream.h</code>）：mic/far 兩路輸入，<code>AC_OLA_ENV_NORM</code>，fail-CLOSED（靜音，非直通）。主機端、替身加速器驗證；未經實板。</td></tr>
 </table>
 
 <h2>相關檔案與測試路徑</h2>

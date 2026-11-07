@@ -30,7 +30,7 @@ th{background:#eef1f5}
 </style>
 </head>
 <body>
-<nav><a href="index.html">索引</a><a href="conventions.html">慣例</a><a href="conventions_latency.html">延遲預算</a><a href="onnx_prepost.html">ONNX 邊界</a><a href="aiaec_align_ulcnet.html">Align-ULCNet</a><a href="aiaec_align_ulcnet_detail.html">Align-ULCNet 細節</a><a href="aiaec_align_ulcnet_usage.html"><b>Align-ULCNet 使用</b></a><a href="aiaec_align_cruse.html">Align-CRUSE</a><a href="aiaec_align_cruse_usage.html">Align-CRUSE 使用</a><a href="aiaec_deepvqe_s.html">DeepVQE-S</a><a href="aiaec_deepvqe_s_usage.html">DeepVQE-S 使用</a><a href="aiaec_cagcrn.html">CAGCRN</a><a href="aiaec_cagcrn_usage.html">CAGCRN 使用</a></nav>
+<nav><a href="index.html">索引</a><a href="conventions.html">慣例</a><a href="conventions_latency.html">延遲預算</a><a href="onnx_prepost.html">ONNX 邊界</a><a href="aiaec_align_ulcnet.html">Align-ULCNet</a><a href="aiaec_align_ulcnet_detail.html">Align-ULCNet 細節</a><a href="aiaec_align_ulcnet_usage.html"><b>Align-ULCNet 使用</b></a><a href="aiaec_ulcnet_stream_usage.html">Align-ULCNet PCM stream</a><a href="aiaec_align_cruse.html">Align-CRUSE</a><a href="aiaec_align_cruse_usage.html">Align-CRUSE 使用</a><a href="aiaec_deepvqe_s.html">DeepVQE-S</a><a href="aiaec_deepvqe_s_usage.html">DeepVQE-S 使用</a><a href="aiaec_deepvqe_s_stream_usage.html">DeepVQE-S PCM stream</a><a href="aiaec_cagcrn.html">CAGCRN</a><a href="aiaec_cagcrn_usage.html">CAGCRN 使用</a></nav>
 
 <h1>AIAEC Align-ULCNet：如何呼叫、流程時序圖、外部／內部參數</h1>
 
@@ -264,7 +264,7 @@ caller / audiolib              UlcnetPrepost (C)                   NPU runtime
 
 <h2>相關檔案與測試路徑</h2>
 <ul>
-<li><code>AIAEC/Align_ULCNet/ulcnet_prepost.c</code> / <code>.h</code>、<code>ulcnet_model_io.c</code> / <code>.h</code>、<code>ulcnet_process.c</code> / <code>.h</code>、<code>ulcnet_accelerator_adapter.c</code> / <code>.h</code>；建置：<code>make -C AIAEC lib</code>（<code>libaiaec_prepost.a</code>）</li>
+<li><code>lib/aiaec/ulcnet/ulcnet_prepost.c</code> / <code>.h</code>、<code>ulcnet_model_io.c</code> / <code>.h</code>、<code>ulcnet_process.c</code> / <code>.h</code>、<code>ulcnet_accelerator_adapter.c</code> / <code>.h</code>；建置：<code>make -C AIAEC lib</code>（<code>libaiaec_prepost.a</code>）</li>
 <li>測試：<code>AIAEC/tests/test_ulcnet_prepost_c.py</code>、<code>test_ulcnet_model_io_c.py</code>、<code>test_ulcnet_process_c.py</code>、<code>test_ulcnet_accelerator_adapter.c</code></li>
 <li>host 範例：<code>pipelines/ulcnet/mono_alignulcnet/main.c</code>、<code>pipelines/ulcnet/4ch_alignulcnet/main.c</code>（<a href="pipeline_ulcnet_mono.html">pipeline_ulcnet_mono</a>、<a href="pipeline_ulcnet_4ch.html">pipeline_ulcnet_4ch</a>、<a href="pipeline_ulcnet_detail.html">pipeline_ulcnet_detail</a>）</li>
 <li>同類頁面：<a href="aiaec_align_ulcnet.html">aiaec_align_ulcnet</a>、<a href="aiaec_deepvqe_s_usage.html">aiaec_deepvqe_s_usage</a>、<a href="onnx_prepost.html">onnx_prepost</a>、<a href="index.html">index</a></li>
