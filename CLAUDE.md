@@ -12,9 +12,13 @@ grids or checkpoint contracts:
   (`pipelines/ulcnet/`) application examples that sit on top of it. This is the reference
   integration path; `AINR/` and `AIAEC/` models are not silently wired into it.
 - **`AINR/`** — standalone AI speech-enhancement models (RNNoise-ERB, GTCRN, DeepFilterNet2,
-  DeepFilterNet3): Python training/export plus a hand-written C runtime per model.
+  DeepFilterNet3): Python training/export side; the C runtime itself lives in `lib/ainr/<model>/`.
 - **`AIAEC/`** — four neural AEC candidate architectures (Align_ULCNet, Align_CRUSE,
-  DeepVQE_S, CAGCRN), every one a joint AEC+RES+NR route (no AEC-only candidate).
+  DeepVQE_S, CAGCRN), every one a joint AEC+RES+NR route (no AEC-only candidate); Python
+  training/export side, C runtime in `lib/aiaec/<model>/`.
+- **`lib/ainr/`, `lib/aiaec/`** — the 8 models' C cores (single-model-release restructuring: each
+  model builds and ships independently of the rest of its family); **`stream/`** — the PCM
+  framing/OLA layer on top of them, implemented so far for DFN2 only (see below).
 
 ## External dependencies: mid-transition, read this before touching build paths
 
@@ -74,10 +78,15 @@ recurrent-state registration) and `*_prepost.{c,h}` (the frequency-domain per-ho
 GTCRN/RNNoise-ERB use their own `*_process_mask_validate`/`*_process_state_validate` /
 `*_frame_finish` names instead of `frame_open`/`frame_finish`/`frame_bypass`, see below). Reading
 just the model's `*_prepost.h` (or `*_process.h` for GTCRN/RNNoise-ERB) is usually enough to
-integrate it; `*_process.c` is only needed to change the model's math itself. A `*_stream.c` PCM
-framing/OLA layer for DFN2/Align-ULCNet/DeepVQE-S is a proposed follow-up, not yet implemented —
-every model today is integrated the way its own README shows, at the `*_prepost`/`*_process`
-level.
+integrate it; `*_process.c` is only needed to change the model's math itself. All 8 models' cores
+now live under `lib/ainr/<model>/` / `lib/aiaec/<model>/` (the single-model-release restructuring);
+`AINR/`/`AIAEC/` keep the Python training/export side and (for the six models that had one before)
+a forwarding compat header at the old public-header path for out-of-tree board samples. A PCM
+framing/OLA `stream/` layer wraps the per-hop `*_prepost`/`*_process` lifecycle for int16 PCM
+callers: DFN2's is implemented (`stream/ainr/dfn2/dfn2_stream.h` — `dfn2_stream_init[_from_erb_file]`
+/`_pre_process`/`_post_process`, frames_per_call==1 only). Align-ULCNet and DeepVQE-S are a planned
+follow-up, not yet implemented; every other model is still integrated the way its own README shows,
+at the `*_prepost`/`*_process` level.
 
 **Per-hop contract (DFN2/DFN3/Align-ULCNet/DeepVQE-S's `frame_open`/`_finish`/`_bypass` shape).**
 `pre_process_freq()` → `frame_open()` → accelerator fills the tensors → `frame_finish()` (or
