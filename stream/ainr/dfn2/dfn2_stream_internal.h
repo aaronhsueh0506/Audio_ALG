@@ -81,4 +81,14 @@ DFN2Stream *dfn2_stream_finish_init(const DFN2StreamConfig *cfg, unsigned char *
                                     const DFN2StreamLayout *layout,
                                     const float *erb_fwd, const float *erb_inv);
 
+/* The size/alignment/stale-pool-descriptor/carve-agreement validation shared by
+ * dfn2_stream_init_ex() and dfn2_stream_init_from_erb_file_ex() -- everything before each one's
+ * own mode-specific tail (finish_init directly, or load-the-ERB-file-then-finish_init). On success
+ * (0), `pool` is zeroed and `*layout` is a carved (non-sizing) layout over it, ready for
+ * finish_init() or the file loader. -1 on any check failure; `*layout` then undefined. Does not
+ * check dfn2_stream_is_file_mode(cfg) -- callers check that themselves first, since the two
+ * callers want opposite answers. */
+int dfn2_stream_prepare_pool(const DFN2StreamConfig *cfg, void *pool, size_t pool_bytes,
+                             const DFN2StreamMemReq *expected, DFN2StreamLayout *layout);
+
 #endif /* DFN2_STREAM_INTERNAL_H */

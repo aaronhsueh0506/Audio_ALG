@@ -2,7 +2,7 @@ CC ?= cc
 AR ?= ar
 CFLAGS ?= -O2 -std=c11 -Wall -Wextra -Wpedantic
 # Same floating-point/include invariants as AIAEC/Makefile.
-override CFLAGS += -ffp-contract=off -fno-math-errno -I. -I../../../lib/aiaec/ulcnet
+override CFLAGS += -ffp-contract=off -fno-math-errno -I. -I../../../lib/aiaec/ulcnet -I../../common
 LDFLAGS ?=
 SIMD ?= 1
 override SIMD := $(strip $(SIMD))
@@ -25,7 +25,7 @@ $(error NO_STDIO must be exactly 0 or 1)
 endif
 
 include ../../../lib/deps.mk
-COMMON_LIB = $(shell $(MAKE) -s -C $(COMMON_DIR) BACKEND=$(BACKEND) SIMD=$(SIMD) 	lib print-lib-path | tail -1)
+COMMON_LIB := $(shell $(MAKE) -s -C $(COMMON_DIR) BACKEND=$(BACKEND) SIMD=$(SIMD) 	lib print-lib-path | tail -1)
 override CFLAGS += -I$(COMMON_DIR)/include -I$(COMMON_DIR)
 
 WERROR ?= 0
@@ -64,7 +64,7 @@ CORE_HEADERS := ../../../lib/aiaec/ulcnet/ulcnet_model_io.h \
 	../../../lib/aiaec/ulcnet/ulcnet_prepost.h
 
 STREAM_SOURCES := ulcnet_stream.c
-STREAM_HEADERS := ulcnet_stream.h ulcnet_stream_internal.h
+STREAM_HEADERS := ulcnet_stream.h ulcnet_stream_internal.h ../../common/stream_mem.h
 
 LIB := $(OBJ_DIR)/libulcnet_stream.a
 LIB_OBJECTS := $(OBJ_DIR)/ulcnet_model_io.o $(OBJ_DIR)/ulcnet_prepost.o $(OBJ_DIR)/ulcnet_stream.o

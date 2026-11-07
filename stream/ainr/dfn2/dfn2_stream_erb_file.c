@@ -58,19 +58,10 @@ static void transpose_band_major(const float *bin_major, float *band_major,
 DFN2Stream *dfn2_stream_init_from_erb_file_ex(const DFN2StreamConfig *cfg, const char *erb_path,
                                               void *pool, size_t pool_bytes,
                                               const DFN2StreamMemReq *expected) {
-    DFN2StreamMemReq req;
     DFN2StreamLayout layout;
-    size_t total = 0;
 
-    if (!pool || !erb_path || !cfg || !dfn2_stream_is_file_mode(cfg)) return NULL;
-    if (dfn2_stream_get_mem_size(cfg, &req) != 0) return NULL;
-    if (pool_bytes < (size_t)req.bytes) return NULL;
-    if (((uintptr_t)pool % (uintptr_t)req.alignment) != 0u) return NULL;
-    if (expected && !dfn2_stream_descriptor_matches(expected, &req)) return NULL;
-
-    memset(pool, 0, (size_t)req.bytes);
-    if (dfn2_stream_layout(cfg, (unsigned char *)pool, &layout, &total) != 0) return NULL;
-    if (total != (size_t)req.bytes) return NULL;   /* sizing/carve agreement */
+    if (!erb_path || !dfn2_stream_is_file_mode(cfg)) return NULL;
+    if (dfn2_stream_prepare_pool(cfg, pool, pool_bytes, expected, &layout) != 0) return NULL;
 
     /* Loaded straight into pool-owned storage; a short read or mismatch below returns NULL with no
      * DFN2Stream ever constructed (dfn2_stream_finish_init() is never reached), though the

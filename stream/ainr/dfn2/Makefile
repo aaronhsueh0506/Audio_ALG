@@ -2,7 +2,7 @@ CC ?= cc
 AR ?= ar
 CFLAGS ?= -O2 -std=c11 -Wall -Wextra -Wpedantic
 # Same floating-point/include invariants as AINR/Makefile.
-override CFLAGS += -ffp-contract=off -fno-math-errno -I. -I../../../lib/ainr/dfn2
+override CFLAGS += -ffp-contract=off -fno-math-errno -I. -I../../../lib/ainr/dfn2 -I../../common
 LDFLAGS ?=
 SIMD ?= 1
 override SIMD := $(strip $(SIMD))
@@ -39,7 +39,7 @@ $(error NO_STDIO must be exactly 0 or 1)
 endif
 
 include ../../../lib/deps.mk
-COMMON_LIB = $(shell $(MAKE) -s -C $(COMMON_DIR) BACKEND=$(BACKEND) SIMD=$(SIMD) 	lib print-lib-path | tail -1)
+COMMON_LIB := $(shell $(MAKE) -s -C $(COMMON_DIR) BACKEND=$(BACKEND) SIMD=$(SIMD) 	lib print-lib-path | tail -1)
 override CFLAGS += -I$(COMMON_DIR)/include -I$(COMMON_DIR)
 
 WERROR ?= 0
@@ -81,7 +81,7 @@ STREAM_SOURCES := dfn2_stream.c
 ifneq ($(NO_STDIO),1)
 STREAM_SOURCES += dfn2_stream_erb_file.c
 endif
-STREAM_HEADERS := dfn2_stream.h dfn2_stream_internal.h
+STREAM_HEADERS := dfn2_stream.h dfn2_stream_internal.h ../../common/stream_mem.h
 
 LIB := $(OBJ_DIR)/libdfn2_stream.a
 LIB_OBJECTS := $(OBJ_DIR)/dfn2_process.o $(OBJ_DIR)/dfn2_model_io.o $(OBJ_DIR)/dfn2_prepost.o \

@@ -8,6 +8,7 @@
 
 #include "dfn2_stream_internal.h"
 #include "utility/mem_align.h"
+#include "stream_mem.h"
 
 #define DFN2_STREAM_ALIGN DFN2_STREAM_ALIGNMENT
 
@@ -18,25 +19,6 @@ _Static_assert(DFN2_STREAM_ALIGN == 16u,
 #endif
 #endif
 
-/* Reserve `bytes` at *cursor, 16-byte aligned; base NULL sizes only (out stays NULL). Saturating:
- * an overflow pins *cursor to SIZE_MAX, which MEM_SIZE_INVALID catches on the next check. */
-static int carve(unsigned char *base, size_t *cursor, size_t bytes, void **out) {
-    size_t aligned = ck_align16_size(*cursor);
-    size_t next = ck_add_size(aligned, bytes);
-    if (MEM_SIZE_INVALID(next)) return -1;
-    if (out) *out = base ? (void *)(base + aligned) : NULL;
-    *cursor = next;
-    return 0;
-}
-
-static uint32_t fnv1a_u32(uint32_t h, uint32_t v) {
-    int i;
-    for (i = 0; i < 4; ++i) {
-        h ^= (v >> (i * 8)) & 0xffu;
-        h *= 16777619u;
-    }
-    return h;
-}
 
 /* Never dereferenced: dfn2_prepost_get_mem_size()'s byte count and build_flags_hash depend only on
  * cfg->grid and on whether erb_fwd/erb_inv are NULL, never on the pointer values -- confirmed
@@ -95,17 +77,17 @@ int dfn2_stream_layout(const DFN2StreamConfig *cfg, unsigned char *base,
     n_bins = (size_t)cfg->grid.n_bins;
     n_erb = (size_t)cfg->grid.n_erb;
 
-    if (carve(base, &cursor, sizeof(DFN2Stream), &ptr) != 0) return -1;
+    if (stream_carve(base, &cursor, sizeof(DFN2Stream), &ptr) != 0) return -1;
     out->self = (DFN2Stream *)ptr;
 
     if (cfg->hpf_enable) {
         size_t hb = hpf_get_mem_size();
-        if (hb == 0 || carve(base, &cursor, hb, &ptr) != 0) return -1;
+        if (hb == 0 || stream_carve(base, &cursor, hb, &ptr) != 0) return -1;
         out->hpf_mem = ptr;
     }
 
     fft_bytes = fft_get_mem_size(cfg->grid.n_fft);
-    if (fft_bytes == 0 || carve(base, &cursor, fft_bytes, &ptr) != 0) return -1;
+    if (fft_bytes == 0 || stream_carve(base, &cursor, fft_bytes, &ptr) != 0) return -1;
     out->fft_mem = ptr;
 
     /* One AcStftConfig, reused for both the analysis and synthesis sizing/init calls exactly as
@@ -118,11 +100,11 @@ int dfn2_stream_layout(const DFN2StreamConfig *cfg, unsigned char *base,
      * own scfg for why this cannot borrow the not-yet-constructed shared handle. */
 
     stft_bytes = ac_stft_get_mem_size(&scfg);
-    if (stft_bytes == 0 || carve(base, &cursor, stft_bytes, &ptr) != 0) return -1;
+    if (stft_bytes == 0 || stream_carve(base, &cursor, stft_bytes, &ptr) != 0) return -1;
     out->stft_mem = ptr;
 
     istft_bytes = ac_istft_get_mem_size(&scfg);
-    if (istft_bytes == 0 || carve(base, &cursor, istft_bytes, &ptr) != 0) return -1;
+    if (istft_bytes == 0 || stream_carve(base, &cursor, istft_bytes, &ptr) != 0) return -1;
     out->istft_mem = ptr;
 
     if (dfn2_prepost_config_defaults(&pcfg, &cfg->grid) != 0) return -1;
@@ -135,7 +117,7 @@ int dfn2_stream_layout(const DFN2StreamConfig *cfg, unsigned char *base,
         pcfg.erb_inv = cfg->erb_inv;
     }
     if (dfn2_prepost_get_mem_size(&pcfg, &pp_req) != 0) return -1;
-    if (carve(base, &cursor, (size_t)pp_req.bytes, &ptr) != 0) return -1;
+    if (stream_carve(base, &cursor, (size_t)pp_req.bytes, &ptr) != 0) return -1;
     out->prepost_mem = ptr;
     out->prepost_bytes = (size_t)pp_req.bytes;
     out->prepost_build_hash = pp_req.build_flags_hash;
@@ -145,7 +127,7 @@ int dfn2_stream_layout(const DFN2StreamConfig *cfg, unsigned char *base,
     scratch_bytes = ck_add_size(
         ck_mul_size(2u, ck_mul_size((size_t)cfg->grid.hop, sizeof(float))),
         ck_mul_size(4u, ck_mul_size(n_bins, sizeof(float))));
-    if (MEM_SIZE_INVALID(scratch_bytes) || carve(base, &cursor, scratch_bytes, &ptr) != 0)
+    if (MEM_SIZE_INVALID(scratch_bytes) || stream_carve(base, &cursor, scratch_bytes, &ptr) != 0)
         return -1;
     out->scratch_mem = ptr;
 
@@ -154,11 +136,11 @@ int dfn2_stream_layout(const DFN2StreamConfig *cfg, unsigned char *base,
         erb_bytes = ck_mul_size(erb_elems, sizeof(float));
         if (MEM_SIZE_INVALID(erb_bytes)) return -1;
 
-        if (carve(base, &cursor, erb_bytes, &ptr) != 0) return -1;
+        if (stream_carve(base, &cursor, erb_bytes, &ptr) != 0) return -1;
         out->erb_fwd_storage = (float *)ptr;
-        if (carve(base, &cursor, erb_bytes, &ptr) != 0) return -1;
+        if (stream_carve(base, &cursor, erb_bytes, &ptr) != 0) return -1;
         out->erb_inv_storage = (float *)ptr;
-        if (carve(base, &cursor, erb_bytes, &ptr) != 0) return -1;
+        if (stream_carve(base, &cursor, erb_bytes, &ptr) != 0) return -1;
         out->erb_scratch = (float *)ptr;
     }
 
@@ -169,25 +151,25 @@ int dfn2_stream_layout(const DFN2StreamConfig *cfg, unsigned char *base,
 static uint32_t build_hash(const DFN2StreamConfig *cfg, uint32_t prepost_hash) {
     uint32_t h = 2166136261u;
     const DFN2Grid *g = &cfg->grid;
-    h = fnv1a_u32(h, (uint32_t)g->sample_rate);
-    h = fnv1a_u32(h, (uint32_t)g->n_fft);
-    h = fnv1a_u32(h, (uint32_t)g->hop);
-    h = fnv1a_u32(h, (uint32_t)g->n_bins);
-    h = fnv1a_u32(h, (uint32_t)g->n_erb);
-    h = fnv1a_u32(h, (uint32_t)g->df_bins);
-    h = fnv1a_u32(h, (uint32_t)g->df_order);
-    h = fnv1a_u32(h, (uint32_t)g->mask_lookahead);
-    h = fnv1a_u32(h, (uint32_t)g->df_lookahead);
-    h = fnv1a_u32(h, (uint32_t)g->frames_per_call);
-    h = fnv1a_u32(h, (uint32_t)DFN2_STREAM_LAYOUT_VERSION);
+    h = stream_fnv1a_u32(h, (uint32_t)g->sample_rate);
+    h = stream_fnv1a_u32(h, (uint32_t)g->n_fft);
+    h = stream_fnv1a_u32(h, (uint32_t)g->hop);
+    h = stream_fnv1a_u32(h, (uint32_t)g->n_bins);
+    h = stream_fnv1a_u32(h, (uint32_t)g->n_erb);
+    h = stream_fnv1a_u32(h, (uint32_t)g->df_bins);
+    h = stream_fnv1a_u32(h, (uint32_t)g->df_order);
+    h = stream_fnv1a_u32(h, (uint32_t)g->mask_lookahead);
+    h = stream_fnv1a_u32(h, (uint32_t)g->df_lookahead);
+    h = stream_fnv1a_u32(h, (uint32_t)g->frames_per_call);
+    h = stream_fnv1a_u32(h, (uint32_t)DFN2_STREAM_LAYOUT_VERSION);
 #ifdef DFN2_MASK_ONLY
-    h = fnv1a_u32(h, 1u);
+    h = stream_fnv1a_u32(h, 1u);
 #else
-    h = fnv1a_u32(h, 0u);
+    h = stream_fnv1a_u32(h, 0u);
 #endif
-    h = fnv1a_u32(h, dfn2_stream_is_file_mode(cfg) ? 1u : 0u);
-    h = fnv1a_u32(h, (uint32_t)(cfg->hpf_enable ? 1 : 0));
-    h = fnv1a_u32(h, prepost_hash);
+    h = stream_fnv1a_u32(h, dfn2_stream_is_file_mode(cfg) ? 1u : 0u);
+    h = stream_fnv1a_u32(h, (uint32_t)(cfg->hpf_enable ? 1 : 0));
+    h = stream_fnv1a_u32(h, prepost_hash);
     return ac_memreq_abi_hash(h);
 }
 
@@ -279,21 +261,29 @@ DFN2Stream *dfn2_stream_finish_init(const DFN2StreamConfig *cfg, unsigned char *
     return s;
 }
 
-DFN2Stream *dfn2_stream_init_ex(const DFN2StreamConfig *cfg, void *pool, size_t pool_bytes,
-                                const DFN2StreamMemReq *expected) {
+int dfn2_stream_prepare_pool(const DFN2StreamConfig *cfg, void *pool, size_t pool_bytes,
+                             const DFN2StreamMemReq *expected, DFN2StreamLayout *layout) {
     DFN2StreamMemReq req;
-    DFN2StreamLayout layout;
     size_t total = 0;
 
-    if (!pool || !cfg_valid(cfg) || dfn2_stream_is_file_mode(cfg)) return NULL;
-    if (dfn2_stream_get_mem_size(cfg, &req) != 0) return NULL;
-    if (pool_bytes < (size_t)req.bytes) return NULL;
-    if (((uintptr_t)pool % (uintptr_t)req.alignment) != 0u) return NULL;
-    if (expected && !dfn2_stream_descriptor_matches(expected, &req)) return NULL;
+    if (!pool || !cfg_valid(cfg)) return -1;
+    if (dfn2_stream_get_mem_size(cfg, &req) != 0) return -1;
+    if (pool_bytes < (size_t)req.bytes) return -1;
+    if (((uintptr_t)pool % (uintptr_t)req.alignment) != 0u) return -1;
+    if (expected && !dfn2_stream_descriptor_matches(expected, &req)) return -1;
 
     memset(pool, 0, (size_t)req.bytes);
-    if (dfn2_stream_layout(cfg, (unsigned char *)pool, &layout, &total) != 0) return NULL;
-    if (total != (size_t)req.bytes) return NULL;   /* sizing/carve agreement */
+    if (dfn2_stream_layout(cfg, (unsigned char *)pool, layout, &total) != 0) return -1;
+    if (total != (size_t)req.bytes) return -1;   /* sizing/carve agreement */
+    return 0;
+}
+
+DFN2Stream *dfn2_stream_init_ex(const DFN2StreamConfig *cfg, void *pool, size_t pool_bytes,
+                                const DFN2StreamMemReq *expected) {
+    DFN2StreamLayout layout;
+
+    if (dfn2_stream_is_file_mode(cfg)) return NULL;
+    if (dfn2_stream_prepare_pool(cfg, pool, pool_bytes, expected, &layout) != 0) return NULL;
 
     return dfn2_stream_finish_init(cfg, (unsigned char *)pool, &layout, cfg->erb_fwd, cfg->erb_inv);
 }
@@ -373,12 +363,7 @@ int dfn2_stream_post_process(DFN2Stream *s, int ai_rc, int16_t *pcm_out) {
         valid = 0;
     }
 
-    for (i = 0; i < hop; ++i) {
-        float v = s->hop_out[i] * 32768.0f;
-        if (v > 32767.0f) v = 32767.0f;
-        if (v < -32768.0f) v = -32768.0f;
-        pcm_out[i] = (int16_t)v;
-    }
+    for (i = 0; i < hop; ++i) pcm_out[i] = stream_saturate_s16(s->hop_out[i]);
 
     return valid ? 1 : 0;
 }

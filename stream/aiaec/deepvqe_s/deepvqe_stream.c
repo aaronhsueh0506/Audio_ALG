@@ -7,6 +7,7 @@
 
 #include "deepvqe_stream_internal.h"
 #include "utility/mem_align.h"
+#include "stream_mem.h"
 
 #define DEEPVQE_STREAM_ALIGN DEEPVQE_STREAM_ALIGNMENT
 
@@ -16,29 +17,6 @@ _Static_assert(DEEPVQE_STREAM_ALIGN == 16u,
                "ck_align16_size is the shared 16-byte carve alignment");
 #endif
 #endif
-
-/* Reserve `bytes` at *cursor, 16-byte aligned; base NULL sizes only (out stays NULL). Saturating:
- * an overflow pins *cursor to SIZE_MAX, which MEM_SIZE_INVALID catches on the next check. Same
- * helper as stream/ainr/dfn2/dfn2_stream.c's carve(). */
-static int carve(unsigned char *base, size_t *cursor, size_t bytes, void **out) {
-    size_t aligned = ck_align16_size(*cursor);
-    size_t next = ck_add_size(aligned, bytes);
-    if (MEM_SIZE_INVALID(next)) return -1;
-    if (out) *out = base ? (void *)(base + aligned) : NULL;
-    *cursor = next;
-    return 0;
-}
-
-/* Same FNV-1a-32 as stream/ainr/dfn2/dfn2_stream.c's fnv1a_u32() -- copied, not shared, since the
- * two models have no common internal header. */
-static uint32_t fnv1a_u32(uint32_t h, uint32_t v) {
-    int i;
-    for (i = 0; i < 4; ++i) {
-        h ^= (v >> (i * 8)) & 0xffu;
-        h *= 16777619u;
-    }
-    return h;
-}
 
 /* -1: inconsistent (some but not all of cfg->state[]/state_elements[] set, or a single entry with
  * a non-NULL pointer and a zero count or vice versa). 0: none registered (the accelerator owns
@@ -79,11 +57,11 @@ int deepvqe_stream_layout(const DeepVqeStreamConfig *cfg, unsigned char *base,
     hop = (size_t)cfg->grid.hop;
     n_bins = (size_t)cfg->grid.n_bins;
 
-    if (carve(base, &cursor, sizeof(DeepVqeStream), &ptr) != 0) return -1;
+    if (stream_carve(base, &cursor, sizeof(DeepVqeStream), &ptr) != 0) return -1;
     out->self = (DeepVqeStream *)ptr;
 
     fft_bytes = fft_get_mem_size(cfg->grid.n_fft);
-    if (fft_bytes == 0 || carve(base, &cursor, fft_bytes, &ptr) != 0) return -1;
+    if (fft_bytes == 0 || stream_carve(base, &cursor, fft_bytes, &ptr) != 0) return -1;
     out->fft_mem = ptr;
 
     /* One AcStftConfig, reused for sizing stft_mic/stft_far/istft exactly as deepvqe_prepost.h's
@@ -95,14 +73,14 @@ int deepvqe_stream_layout(const DeepVqeStreamConfig *cfg, unsigned char *base,
     scfg.ola = AC_OLA_ENV_NORM;
 
     stft_bytes = ac_stft_get_mem_size(&scfg);
-    if (stft_bytes == 0 || carve(base, &cursor, stft_bytes, &ptr) != 0) return -1;
+    if (stft_bytes == 0 || stream_carve(base, &cursor, stft_bytes, &ptr) != 0) return -1;
     out->stft_mic_mem = ptr;
 
-    if (stft_bytes == 0 || carve(base, &cursor, stft_bytes, &ptr) != 0) return -1;
+    if (stft_bytes == 0 || stream_carve(base, &cursor, stft_bytes, &ptr) != 0) return -1;
     out->stft_far_mem = ptr;
 
     istft_bytes = ac_istft_get_mem_size(&scfg);
-    if (istft_bytes == 0 || carve(base, &cursor, istft_bytes, &ptr) != 0) return -1;
+    if (istft_bytes == 0 || stream_carve(base, &cursor, istft_bytes, &ptr) != 0) return -1;
     out->istft_mem = ptr;
 
     if (deepvqe_prepost_config_defaults(&pcfg, &cfg->grid) != 0) return -1;
@@ -111,7 +89,7 @@ int deepvqe_stream_layout(const DeepVqeStreamConfig *cfg, unsigned char *base,
         pcfg.state_elements[i] = cfg->state_elements[i];
     }
     if (deepvqe_prepost_get_mem_size(&pcfg, &pp_req) != 0) return -1;
-    if (carve(base, &cursor, (size_t)pp_req.bytes, &ptr) != 0) return -1;
+    if (stream_carve(base, &cursor, (size_t)pp_req.bytes, &ptr) != 0) return -1;
     out->prepost_mem = ptr;
     out->prepost_bytes = (size_t)pp_req.bytes;
     out->prepost_build_hash = pp_req.build_flags_hash;
@@ -122,7 +100,7 @@ int deepvqe_stream_layout(const DeepVqeStreamConfig *cfg, unsigned char *base,
     scratch_bytes = ck_add_size(
         ck_mul_size(3u, ck_mul_size(hop, sizeof(float))),
         ck_mul_size(6u, ck_mul_size(n_bins, sizeof(float))));
-    if (MEM_SIZE_INVALID(scratch_bytes) || carve(base, &cursor, scratch_bytes, &ptr) != 0)
+    if (MEM_SIZE_INVALID(scratch_bytes) || stream_carve(base, &cursor, scratch_bytes, &ptr) != 0)
         return -1;
     out->scratch_mem = ptr;
 
@@ -133,14 +111,14 @@ int deepvqe_stream_layout(const DeepVqeStreamConfig *cfg, unsigned char *base,
 static uint32_t build_hash(const DeepVqeStreamConfig *cfg, uint32_t prepost_hash) {
     uint32_t h = 2166136261u;
     const DeepVqeGrid *g = &cfg->grid;
-    h = fnv1a_u32(h, (uint32_t)g->sample_rate);
-    h = fnv1a_u32(h, (uint32_t)g->n_fft);
-    h = fnv1a_u32(h, (uint32_t)g->hop);
-    h = fnv1a_u32(h, (uint32_t)g->n_bins);
-    h = fnv1a_u32(h, (uint32_t)g->delay_depth);
-    h = fnv1a_u32(h, (uint32_t)DEEPVQE_STREAM_LAYOUT_VERSION);
-    h = fnv1a_u32(h, (uint32_t)(state_mode(cfg) > 0 ? 1u : 0u));
-    h = fnv1a_u32(h, prepost_hash);
+    h = stream_fnv1a_u32(h, (uint32_t)g->sample_rate);
+    h = stream_fnv1a_u32(h, (uint32_t)g->n_fft);
+    h = stream_fnv1a_u32(h, (uint32_t)g->hop);
+    h = stream_fnv1a_u32(h, (uint32_t)g->n_bins);
+    h = stream_fnv1a_u32(h, (uint32_t)g->delay_depth);
+    h = stream_fnv1a_u32(h, (uint32_t)DEEPVQE_STREAM_LAYOUT_VERSION);
+    h = stream_fnv1a_u32(h, (uint32_t)(state_mode(cfg) > 0 ? 1u : 0u));
+    h = stream_fnv1a_u32(h, prepost_hash);
     return ac_memreq_abi_hash(h);
 }
 
@@ -337,11 +315,6 @@ int deepvqe_stream_post_process(DeepVqeStream *s, int ai_rc, int16_t *pcm_out) {
         return 0;
     }
 
-    for (i = 0; i < hop; ++i) {
-        float v = s->hop_out[i] * 32768.0f;
-        if (v > 32767.0f) v = 32767.0f;
-        if (v < -32768.0f) v = -32768.0f;
-        pcm_out[i] = (int16_t)v;
-    }
+    for (i = 0; i < hop; ++i) pcm_out[i] = stream_saturate_s16(s->hop_out[i]);
     return 1;
 }

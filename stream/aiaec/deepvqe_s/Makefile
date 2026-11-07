@@ -2,7 +2,7 @@ CC ?= cc
 AR ?= ar
 CFLAGS ?= -O2 -std=c11 -Wall -Wextra -Wpedantic
 # Same floating-point/include invariants as AIAEC/Makefile.
-override CFLAGS += -ffp-contract=off -fno-math-errno -I. -I../../../lib/aiaec/deepvqe_s
+override CFLAGS += -ffp-contract=off -fno-math-errno -I. -I../../../lib/aiaec/deepvqe_s -I../../common
 LDFLAGS ?=
 SIMD ?= 1
 override SIMD := $(strip $(SIMD))
@@ -24,7 +24,7 @@ $(error NO_STDIO must be exactly 0 or 1)
 endif
 
 include ../../../lib/deps.mk
-COMMON_LIB = $(shell $(MAKE) -s -C $(COMMON_DIR) BACKEND=$(BACKEND) SIMD=$(SIMD) 	lib print-lib-path | tail -1)
+COMMON_LIB := $(shell $(MAKE) -s -C $(COMMON_DIR) BACKEND=$(BACKEND) SIMD=$(SIMD) 	lib print-lib-path | tail -1)
 override CFLAGS += -I$(COMMON_DIR)/include -I$(COMMON_DIR)
 
 WERROR ?= 0
@@ -59,7 +59,7 @@ CORE_HEADERS := ../../../lib/aiaec/deepvqe_s/deepvqe_process.h \
 	../../../lib/aiaec/deepvqe_s/deepvqe_prepost.h
 
 STREAM_SOURCES := deepvqe_stream.c
-STREAM_HEADERS := deepvqe_stream.h deepvqe_stream_internal.h
+STREAM_HEADERS := deepvqe_stream.h deepvqe_stream_internal.h ../../common/stream_mem.h
 
 LIB := $(OBJ_DIR)/libdeepvqe_stream.a
 LIB_OBJECTS := $(OBJ_DIR)/deepvqe_process.o $(OBJ_DIR)/deepvqe_prepost.o $(OBJ_DIR)/deepvqe_stream.o

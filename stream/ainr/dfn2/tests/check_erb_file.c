@@ -6,6 +6,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <unistd.h>
 
 #include "dfn2_stream.h"
 
@@ -80,9 +81,16 @@ int main(void) {
     float *inv_bin_major = malloc(elems * sizeof(float));
     float *inv_band_major = malloc(elems * sizeof(float));
     size_t i, bin, band;
-    const char *path = "/tmp/dfn2_stream_scratch_erb.bin";
+    /* PID-suffixed, not a fixed name: two concurrent runs of this test (parallel make -jN across
+     * sibling model dirs, two CI jobs on one shared build host) must not interleave writes/reads
+     * of the same /tmp path and produce a spurious MISMATCH unrelated to the code under test. */
+    char path[64], bad_path[64], short_path[64];
     FILE *fp;
     int32_t hdr[2];
+
+    snprintf(path, sizeof(path), "/tmp/dfn2_stream_scratch_erb_%d.bin", (int)getpid());
+    snprintf(bad_path, sizeof(bad_path), "/tmp/dfn2_stream_scratch_erb_bad_%d.bin", (int)getpid());
+    snprintf(short_path, sizeof(short_path), "/tmp/dfn2_stream_scratch_erb_short_%d.bin", (int)getpid());
 
     for (i = 0; i < elems; ++i) { fwd[i] = (float)(i % 17) * 0.01f; inv_bin_major[i] = (float)((i + 3) % 11) * 0.02f; }
     for (bin = 0; bin < n_bins; ++bin)
@@ -119,6 +127,7 @@ int main(void) {
         if (dfn2_stream_get_mem_size(&cfg_file, &req_file) != 0) { fprintf(stderr, "get_mem_size file fail\n"); return 1; }
         posix_memalign(&pool_file, req_file.alignment, req_file.bytes);
         s_file = dfn2_stream_init_from_erb_file_ex(&cfg_file, path, pool_file, req_file.bytes, &req_file);
+        remove(path);
         if (!s_file) { fprintf(stderr, "init_from_erb_file_ex fail\n"); return 1; }
 
         run_hops(s_mem, 12, &digest_mem);
@@ -139,16 +148,17 @@ int main(void) {
             dfn2_stream_get_mem_size(&cfg_bad, &req_bad);
             posix_memalign(&pool_bad, req_bad.alignment, req_bad.bytes);
             {
-                FILE *bad_fp = fopen("/tmp/dfn2_stream_scratch_erb_bad.bin", "wb");
+                FILE *bad_fp = fopen(bad_path, "wb");
                 int32_t bad_hdr[2] = { (int32_t)grid.n_bins, (int32_t)grid.n_erb + 1 };
                 fwrite(bad_hdr, sizeof(int32_t), 2, bad_fp);
                 fclose(bad_fp);
             }
-            if (dfn2_stream_init_from_erb_file(&cfg_bad, "/tmp/dfn2_stream_scratch_erb_bad.bin",
-                                               pool_bad, req_bad.bytes) != NULL) {
+            if (dfn2_stream_init_from_erb_file(&cfg_bad, bad_path, pool_bad, req_bad.bytes) != NULL) {
                 fprintf(stderr, "FAIL: dimension-mismatch file was accepted\n");
+                remove(bad_path);
                 return 1;
             }
+            remove(bad_path);
             printf("dimension mismatch correctly refused\n");
             free(pool_bad);
         }
@@ -163,17 +173,18 @@ int main(void) {
             dfn2_stream_get_mem_size(&cfg_bad, &req_bad);
             posix_memalign(&pool_bad, req_bad.alignment, req_bad.bytes);
             {
-                FILE *short_fp = fopen("/tmp/dfn2_stream_scratch_erb_short.bin", "wb");
+                FILE *short_fp = fopen(short_path, "wb");
                 int32_t good_hdr[2] = { (int32_t)grid.n_bins, (int32_t)grid.n_erb };
                 fwrite(good_hdr, sizeof(int32_t), 2, short_fp);
                 fwrite(fwd, sizeof(float), elems / 2, short_fp);   /* truncated */
                 fclose(short_fp);
             }
-            if (dfn2_stream_init_from_erb_file(&cfg_bad, "/tmp/dfn2_stream_scratch_erb_short.bin",
-                                               pool_bad, req_bad.bytes) != NULL) {
+            if (dfn2_stream_init_from_erb_file(&cfg_bad, short_path, pool_bad, req_bad.bytes) != NULL) {
                 fprintf(stderr, "FAIL: truncated file was accepted\n");
+                remove(short_path);
                 return 1;
             }
+            remove(short_path);
             printf("short read correctly refused\n");
             free(pool_bad);
         }
