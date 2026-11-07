@@ -87,9 +87,15 @@ callers: DFN2's is implemented (`stream/ainr/dfn2/dfn2_stream.h` — `dfn2_strea
 /`_pre_process`/`_post_process`, frames_per_call==1 only), and so is DeepVQE-S's
 (`stream/aiaec/deepvqe_s/deepvqe_stream.h` — same shape, two PCM inputs `mic_in`/`far_in`, no HPF,
 no file-loader, `AC_OLA_ENV_NORM`'s first-hop-emits-nothing case surfaced as `post_process`'s own
-distinct 0 return; bypass fails closed — silence, never a passthrough of the raw mic). Align-ULCNet
-is a planned follow-up, not yet implemented; every other model is still integrated the way its own
-README shows, at the `*_prepost`/`*_process` level.
+distinct 0 return; bypass fails closed — silence, never a passthrough of the raw mic), and so is
+Align-ULCNet's (`stream/aiaec/ulcnet/ulcnet_stream.h` — two PCM inputs, the linear-AEC's
+`err_in`/raw `far_in`, never raw mic; no HPF, no file-loader; bypass fails OPEN — the linear-error
+spectrum passes through unguarded, the opposite of DeepVQE-S; an alignment-driven
+reset+one-hop-reprime, re-implemented at this level from the board sample rather than from
+`pipelines/ulcnet/ulcnet_nn_stage.{c,h}`, which is a different, higher-level component for a
+different caller — see `ulcnet_stream.h`'s own header comment). Every other model is still
+integrated the way its own README shows, at the `*_prepost`/`*_process` level — all three
+implemented streams are the full set this restructuring plans to add.
 
 **Per-hop contract (DFN2/DFN3/Align-ULCNet/DeepVQE-S's `frame_open`/`_finish`/`_bypass` shape).**
 `pre_process_freq()` → `frame_open()` → accelerator fills the tensors → `frame_finish()` (or

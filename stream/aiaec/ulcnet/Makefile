@@ -1,0 +1,150 @@
+CC ?= cc
+AR ?= ar
+CFLAGS ?= -O2 -std=c11 -Wall -Wextra -Wpedantic
+# Same floating-point/include invariants as AIAEC/Makefile.
+override CFLAGS += -ffp-contract=off -fno-math-errno -I. -I../../../lib/aiaec/ulcnet
+LDFLAGS ?=
+SIMD ?= 1
+override SIMD := $(strip $(SIMD))
+BACKEND ?= ne10
+ifneq ($(BACKEND),ne10)
+$(error BACKEND must be ne10 (got '$(BACKEND)'): ne10 is the only FFT backend)
+endif
+
+# Align-ULCNet has no file-loader TU (no matrices to load, unlike DFN2's ERB) -- nothing here
+# needs stdio at all. NO_STDIO is kept as a build-matrix knob for consistency with the other
+# stream Makefiles (and audit-no-stdio below checks it holds), but it changes nothing in this
+# directory's sources.
+NO_STDIO ?= 0
+override NO_STDIO := $(strip $(NO_STDIO))
+ifneq ($(words $(NO_STDIO)),1)
+$(error NO_STDIO must be exactly 0 or 1)
+endif
+ifneq ($(filter-out 0 1,$(NO_STDIO)),)
+$(error NO_STDIO must be exactly 0 or 1)
+endif
+
+include ../../../lib/deps.mk
+COMMON_LIB = $(shell $(MAKE) -s -C $(COMMON_DIR) BACKEND=$(BACKEND) SIMD=$(SIMD) 	lib print-lib-path | tail -1)
+override CFLAGS += -I$(COMMON_DIR)/include -I$(COMMON_DIR)
+
+WERROR ?= 0
+ifeq ($(WERROR),1)
+override CFLAGS += -Werror
+endif
+
+ifneq ($(words $(SIMD)),1)
+$(error SIMD must be exactly 0 or 1)
+endif
+ifneq ($(filter-out 0 1,$(SIMD)),)
+$(error SIMD must be exactly 0 or 1)
+endif
+
+SIMD_CPPFLAGS :=
+ifeq ($(SIMD),0)
+SIMD_CPPFLAGS += -DSIMD_KERNELS_FORCE_SCALAR
+endif
+
+BUILD_DIR := build
+override CC_TARGET_SIG := $(shell sh $(COMMON_DIR)/scripts/target_abi_signature.sh $(CC) $(CPPFLAGS) $(CFLAGS))
+CFG_SIG_PAYLOAD := CC_TARGET_SIG=$(CC_TARGET_SIG) CC=$(CC) AR=$(AR) CFLAGS=$(CFLAGS) LDFLAGS=$(LDFLAGS) SIMD=$(SIMD) SIMD_CPPFLAGS=$(SIMD_CPPFLAGS) NO_STDIO=$(NO_STDIO) BACKEND=$(BACKEND) WERROR=$(WERROR) COMMON_LIB=$(COMMON_LIB)
+CFG_SIG := $(shell printf '%s' "$(CFG_SIG_PAYLOAD)" | cksum | cut -d' ' -f1)
+OBJ_DIR := $(BUILD_DIR)/simd$(SIMD)-$(CFG_SIG)
+
+# The Align-ULCNet core, recompiled here under this OBJ_DIR (mirroring how the DFN2/DeepVQE-S
+# stream Makefiles recompile their own cores): ulcnet_prepost.c needs only ulcnet_model_io.c to
+# link (confirmed: it never calls into ulcnet_process.c's ulcnet_frame_is_finite(), the only
+# symbol that file defines; ulcnet_accelerator_adapter.c and ulcnet_mask_process.c are different
+# AIAEC-family concerns -- a synchronous-callback adapter and the split-off mask-apply helper --
+# neither needed to link this model's own frame_open/finish/bypass boundary).
+CORE_SOURCES := ../../../lib/aiaec/ulcnet/ulcnet_model_io.c \
+	../../../lib/aiaec/ulcnet/ulcnet_prepost.c
+CORE_HEADERS := ../../../lib/aiaec/ulcnet/ulcnet_model_io.h \
+	../../../lib/aiaec/ulcnet/ulcnet_process.h \
+	../../../lib/aiaec/ulcnet/ulcnet_prepost.h
+
+STREAM_SOURCES := ulcnet_stream.c
+STREAM_HEADERS := ulcnet_stream.h ulcnet_stream_internal.h
+
+LIB := $(OBJ_DIR)/libulcnet_stream.a
+LIB_OBJECTS := $(OBJ_DIR)/ulcnet_model_io.o $(OBJ_DIR)/ulcnet_prepost.o $(OBJ_DIR)/ulcnet_stream.o
+VPATH := ../../../lib/aiaec/ulcnet
+
+SMOKE_BIN := $(OBJ_DIR)/smoke_ulcnet_stream
+SMOKE_SOURCES := tests/smoke_ulcnet_stream.c $(CORE_SOURCES) ulcnet_stream.c
+
+# Compares ulcnet_stream against an independent re-implementation of the board sample's own loop,
+# built directly against lib/aiaec/ulcnet + audiolib (never against ulcnet_stream.c's internals).
+VERIFY_VS_SAMPLE_BIN := $(OBJ_DIR)/verify_vs_sample
+VERIFY_VS_SAMPLE_SOURCES := tests/verify_vs_sample.c $(CORE_SOURCES) ulcnet_stream.c
+
+.PHONY: all lib print-lib-path print-cflags print-sources test smoke verify-vs-sample audit-no-stdio clean _cfg_guard
+
+all: lib
+
+lib: $(LIB)
+
+print-lib-path:
+	@echo "$(abspath $(LIB))"
+
+print-cflags:
+	@printf '%s\n' "$(CFLAGS) $(SIMD_CPPFLAGS)"
+
+print-sources:
+	@printf '%s\n' "$(CORE_SOURCES) $(STREAM_SOURCES)"
+
+$(LIB): $(LIB_OBJECTS)
+	rm -f "$@" && $(AR) rcs "$@" $(LIB_OBJECTS)
+
+_cfg_guard:
+	@test -n "$(CC_TARGET_SIG)" && test "$(CC_TARGET_SIG)" != unavailable || { \
+	  echo "FATAL: cannot determine compiler target; CC preprocessing with the configured flags must succeed." >&2; \
+	  exit 1; }
+	@mkdir -p "$(OBJ_DIR)"
+	@m="$(OBJ_DIR)/config.manifest"; \
+	if [ -f "$$m" ] && [ "$$(cat "$$m")" != "$(CFG_SIG_PAYLOAD)" ]; then \
+	  echo "FATAL: configuration signature collision in $$m" >&2; \
+	  echo "  stored : $$(cat "$$m")" >&2; \
+	  echo "  current: $(CFG_SIG_PAYLOAD)" >&2; \
+	  exit 1; \
+	fi; \
+	printf '%s\n' "$(CFG_SIG_PAYLOAD)" > "$$m"
+
+$(OBJ_DIR)/%.o: %.c $(CORE_HEADERS) $(STREAM_HEADERS) | _cfg_guard
+	$(CC) $(CFLAGS) $(SIMD_CPPFLAGS) -MMD -MP -c -o "$@" "$<"
+
+-include $(LIB_OBJECTS:.o=.d)
+
+COMMON_HEADERS := $(wildcard $(COMMON_DIR)/include/*.h $(COMMON_DIR)/utility/*.h)
+
+$(SMOKE_BIN): $(SMOKE_SOURCES) $(CORE_HEADERS) $(STREAM_HEADERS) $(COMMON_LIB) $(COMMON_HEADERS) | _cfg_guard
+	$(CC) $(CFLAGS) $(SIMD_CPPFLAGS) $(SMOKE_SOURCES) "$(COMMON_LIB)" \
+		$(LDFLAGS) -lm -o "$@"
+
+smoke: $(SMOKE_BIN)
+	"$(SMOKE_BIN)"
+
+$(VERIFY_VS_SAMPLE_BIN): $(VERIFY_VS_SAMPLE_SOURCES) $(CORE_HEADERS) $(STREAM_HEADERS) $(COMMON_LIB) $(COMMON_HEADERS) | _cfg_guard
+	$(CC) $(CFLAGS) $(SIMD_CPPFLAGS) $(VERIFY_VS_SAMPLE_SOURCES) "$(COMMON_LIB)" \
+		$(LDFLAGS) -lm -o "$@"
+
+verify-vs-sample: $(VERIFY_VS_SAMPLE_BIN)
+	"$(VERIFY_VS_SAMPLE_BIN)"
+	"$(VERIFY_VS_SAMPLE_BIN)" --inject-shift
+
+test: smoke verify-vs-sample
+
+# audit-no-stdio: builds the archive and asserts, via `nm -u`, that ulcnet_stream.o references no
+# stdio symbol (nothing in this model needs stdio at all).
+audit-no-stdio:
+	@$(MAKE) --no-print-directory NO_STDIO=1 SIMD=$(SIMD) lib >/dev/null
+	@obj_dir="$$($(MAKE) -s --no-print-directory NO_STDIO=1 SIMD=$(SIMD) print-lib-path)"; \
+	obj_dir="$$(dirname "$$obj_dir")"; \
+	undef="$$(nm -u "$$obj_dir/ulcnet_stream.o" 2>/dev/null | grep -Ei 'fopen|fread|fclose|fwrite|fprintf|printf|puts' || true)"; \
+	if [ -n "$$undef" ]; then \
+	  echo "FAIL: ulcnet_stream.o references stdio symbols:" >&2; echo "$$undef" >&2; exit 1; \
+	fi; \
+	echo "audit-no-stdio: PASS ($$obj_dir/ulcnet_stream.o has no stdio references)"
+
+clean:
+	rm -rf "$(BUILD_DIR)"
