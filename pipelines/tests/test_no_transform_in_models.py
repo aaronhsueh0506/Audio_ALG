@@ -56,7 +56,7 @@ def test_the_real_tree_has_no_transform_code_in_model_dirs():
 @pytest.fixture
 def tree(tmp_path):
     root = tmp_path / 'Audio_ALG'
-    for part in ('AINR', 'AIAEC'):
+    for part in ('AINR', 'AIAEC', 'lib/ainr', 'lib/aiaec'):
         shutil.copytree(
             _REPO / part, root / part,
             ignore=shutil.ignore_patterns('*.pyc', '__pycache__', 'build',
@@ -66,8 +66,8 @@ def tree(tmp_path):
 
 
 @pytest.mark.parametrize('call', _FORBIDDEN)
-@pytest.mark.parametrize('where', ('AINR/DeepFilterNet3/dfn3_prepost.c',
-                                   'AIAEC/DeepVQE_S/deepvqe_process.h'))
+@pytest.mark.parametrize('where', ('lib/ainr/dfn3/dfn3_prepost.c',
+                                   'lib/aiaec/deepvqe_s/deepvqe_process.h'))
 def test_an_injected_transform_call_fails_the_gate(tree, call, where):
     path = tree / where
     path.write_text(path.read_text(encoding='utf-8') +
@@ -79,7 +79,7 @@ def test_an_injected_transform_call_fails_the_gate(tree, call, where):
 
 
 def test_a_mention_in_a_comment_or_in_a_test_dir_is_not_a_hit(tree):
-    path = tree / 'AINR/DeepFilterNet3/dfn3_prepost.c'
+    path = tree / 'lib/ainr/dfn3/dfn3_prepost.c'
     path.write_text(path.read_text(encoding='utf-8') +
                     '\n/* ac_istft_init(mem, n, &cfg);\n   fft_inverse(h) */\n'
                     '// ifft here\n/* ac_stft_push_planar(s, a, b, c) */\n',
@@ -92,7 +92,7 @@ def test_a_mention_in_a_comment_or_in_a_test_dir_is_not_a_hit(tree):
 
 
 def test_the_n_fft_check_pair_is_not_a_hit(tree):
-    path = tree / 'AIAEC/DeepVQE_S/deepvqe_process.h'
+    path = tree / 'lib/aiaec/deepvqe_s/deepvqe_process.h'
     path.write_text(path.read_text(encoding='utf-8') +
                     '\nstatic int injected(void) { %s; }\n' % _N_FFT_CHECK,
                     encoding='utf-8')
@@ -100,7 +100,7 @@ def test_the_n_fft_check_pair_is_not_a_hit(tree):
 
 
 def test_a_comment_marker_inside_a_string_does_not_hide_a_call(tree):
-    path = tree / 'AINR/DeepFilterNet3/dfn3_prepost.c'
+    path = tree / 'lib/ainr/dfn3/dfn3_prepost.c'
     path.write_text(path.read_text(encoding='utf-8') +
                     '\nstatic const char* url = "http://x"; '
                     'static void injected(void) { ac_stft_push(s, a, b); }\n',

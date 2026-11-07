@@ -146,7 +146,8 @@ def test_c_grid_accepts_every_exporter_grid(
     compiler = shutil.which('cc') or shutil.which('gcc') or shutil.which('clang')
     if compiler is None:
         pytest.skip('no C compiler available')
-    ulcnet_dir = Path(__file__).resolve().parents[1] / 'Align_ULCNet'
+    # ulcnet_model_io.c moved to lib/aiaec/ulcnet/ in the single-model-release restructuring.
+    ulcnet_dir = Path(__file__).resolve().parents[2] / 'lib' / 'aiaec' / 'ulcnet'
     ac_dir = Path(__file__).resolve().parents[3] / 'audiolib' / 'common'
     probe = tmp_path / 'probe.c'
     probe.write_text(_GRID_PROBE, encoding='utf-8')
@@ -313,9 +314,10 @@ def test_retired_boundary_switches_are_gone():
 
 
 def test_c_descriptor_constants_match_export_contract():
+    # ulcnet_model_io.h moved to lib/aiaec/ulcnet/ in the single-model-release restructuring.
     header = (
-        Path(__file__).resolve().parents[1]
-        / 'Align_ULCNet' / 'ulcnet_model_io.h'
+        Path(__file__).resolve().parents[2]
+        / 'lib' / 'aiaec' / 'ulcnet' / 'ulcnet_model_io.h'
     ).read_text(encoding='utf-8')
     expected = {
         'ULCNET_MODEL_IO_LAYOUT_VERSION': STATE_LAYOUT_VERSION,
@@ -366,9 +368,10 @@ def test_c_descriptor_constants_match_export_contract():
 
 def test_c_frontend_contract_equals_the_python_contract_version():
     """The board-side constant is the string the checkpoints are stamped with."""
+    # ulcnet_model_io.h moved to lib/aiaec/ulcnet/ in the single-model-release restructuring.
     header = (
-        Path(__file__).resolve().parents[1]
-        / 'Align_ULCNet' / 'ulcnet_model_io.h'
+        Path(__file__).resolve().parents[2]
+        / 'lib' / 'aiaec' / 'ulcnet' / 'ulcnet_model_io.h'
     ).read_text(encoding='utf-8')
     match = re.search(
         r'^#define\s+ULCNET_MODEL_IO_FRONTEND_CONTRACT\s+"([^"]+)"\s*$',

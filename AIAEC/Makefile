@@ -31,7 +31,8 @@ endif
 # COMMON_DIR comes from the one shared lib/deps.mk (see lib/audiolib.pin): the sibling audiolib
 # dev checkout by default, still a caller-overridable `?=`.
 include ../lib/deps.mk
-CPPFLAGS := -I. -IAlign_ULCNet -IDeepVQE_S -I$(COMMON_DIR)/include -I$(COMMON_DIR)
+CPPFLAGS := -I. -I../lib/aiaec/ulcnet -I../lib/aiaec/deepvqe_s -I../lib/aiaec/cagcrn \
+	-I../lib/aiaec/align_cruse -I$(COMMON_DIR)/include -I$(COMMON_DIR)
 ifeq ($(SIMD),0)
 CPPFLAGS += -DSIMD_KERNELS_FORCE_SCALAR
 endif
@@ -56,13 +57,18 @@ LIB := $(OBJ_DIR)/libaiaec_prepost.a
 # ulcnet_prepost.o and deepvqe_prepost.o are the pre/post classes, each a TU of
 # its own: they use ulcnet_model_io.o and deepvqe_process.o, which stay
 # independently linkable. The accelerator adapter drives the Align-ULCNet class.
+# cagcrn_process.o/align_cruse_process.o/ulcnet_mask_process.o are the three mask
+# helpers, each now living with the model it serves (lib/aiaec/{cagcrn,align_cruse,ulcnet}/)
+# since the single-model-release split of the old shared aiaec_process.c.
 OBJECTS := $(OBJ_DIR)/ulcnet_process.o \
 	$(OBJ_DIR)/ulcnet_model_io.o \
 	$(OBJ_DIR)/ulcnet_prepost.o \
 	$(OBJ_DIR)/ulcnet_accelerator_adapter.o \
-	$(OBJ_DIR)/aiaec_process.o \
+	$(OBJ_DIR)/ulcnet_mask_process.o \
 	$(OBJ_DIR)/deepvqe_process.o \
-	$(OBJ_DIR)/deepvqe_prepost.o
+	$(OBJ_DIR)/deepvqe_prepost.o \
+	$(OBJ_DIR)/cagcrn_process.o \
+	$(OBJ_DIR)/align_cruse_process.o
 
 PYTHON ?= python3
 
@@ -94,11 +100,11 @@ _cfg_guard:
 	fi; \
 	printf '%s\n' "$(CFG_SIG_PAYLOAD)" > "$$m"
 
-# One recipe for every object: the sources live in three directories, so
+# One recipe for every object: the sources live in several directories, so
 # VPATH resolves the %.c, and -MMD -MP records each object's real header
 # dependencies in $(OBJ_DIR)/*.d instead of hand-maintained prerequisite
 # lists.
-VPATH := Align_ULCNet:DeepVQE_S:.
+VPATH := ../lib/aiaec/ulcnet:../lib/aiaec/deepvqe_s:../lib/aiaec/cagcrn:../lib/aiaec/align_cruse:.
 
 $(OBJ_DIR)/%.o: %.c | _cfg_guard
 	$(CC) $(CPPFLAGS) $(CFLAGS) -MMD -MP -c "$<" -o "$@"

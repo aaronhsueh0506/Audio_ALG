@@ -52,7 +52,7 @@ from AIAEC.dataset_gen.linear_aec import (
 _THIS_DIR = os.path.dirname(os.path.abspath(__file__))
 _AIAEC_DIR = os.path.dirname(_THIS_DIR)
 _ALG_DIR = os.path.dirname(_AIAEC_DIR)
-_ULCNET_DIR = os.path.join(_AIAEC_DIR, 'Align_ULCNet')
+_ULCNET_DIR = os.path.join(_AIAEC_DIR, '..', 'lib', 'aiaec', 'ulcnet')
 _PIPELINES_DIR = os.path.join(_ALG_DIR, 'pipelines')
 _LANE_MAIN = os.path.join(_PIPELINES_DIR, 'ulcnet', 'mono_alignulcnet', 'main.c')
 _AEC_C_DIR = os.path.join(_ALG_DIR, 'lib', 'aec', 'c_impl')

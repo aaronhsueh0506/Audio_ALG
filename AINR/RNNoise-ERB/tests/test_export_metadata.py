@@ -8,6 +8,9 @@ import sys
 
 ROOT = pathlib.Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT))
+# process.h moved to lib/ainr/rnnoise_erb/ in the single-model-release restructuring; ROOT/
+# 'process.h' is now only a forwarding stub (an #include line), not the real header text.
+RNNOISE_C_DIR = ROOT.parents[1] / 'lib' / 'ainr' / 'rnnoise_erb'
 
 # 三個模型專案各有自己的 top-level ``train.py``/``model.py``/``export_onnx.py``。
 # 同一個 pytest session 裡先被 import 的那個會佔住 ``sys.modules``, 所以先清掉
@@ -23,7 +26,7 @@ from train import RNNoiseModel, read_feature_config  # noqa: E402
 
 
 def c_macro(name):
-    header = (ROOT / 'process.h').read_text(encoding='utf-8')
+    header = (RNNOISE_C_DIR / 'process.h').read_text(encoding='utf-8')
     match = re.search(
         r'^#define\s+%s\s+(\d+)u?\s*(?:/\*.*)?$' % re.escape(name),
         header,

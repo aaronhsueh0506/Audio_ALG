@@ -22,6 +22,9 @@ sys.path.insert(0, str(ROOT_PATH.parents[1]))
 _AINR_TESTS = str(ROOT_PATH.parent / 'tests')
 if _AINR_TESTS not in sys.path:
     sys.path.insert(0, _AINR_TESTS)
+# dfn3_*.c/.h moved to lib/ainr/dfn3/ in the single-model-release restructuring; ROOT_PATH /
+# 'dfn3_*.h' is now only a forwarding stub (an #include line), not the real header text.
+DFN3_C_DIR = ROOT_PATH.parents[1] / 'lib' / 'ainr' / 'dfn3'
 
 
 from AINR.DeepFilterNet3.model import (  # noqa: E402
@@ -833,7 +836,7 @@ STREAM_TEST = ROOT_PATH.parent / 'tests' / 'test_dfn3_stream.c'
 
 
 def test_dfn3_export_state_layout_and_c_dimensions_match(tmp_path):
-    header = (ROOT_PATH / 'dfn3_model_io.h').read_text()
+    header = (DFN3_C_DIR / 'dfn3_model_io.h').read_text()
     stream_test = STREAM_TEST.read_text()
 
     macro = c_macro

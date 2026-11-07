@@ -31,8 +31,11 @@ from AIAEC.aiaec_streaming import StreamISTFT, StreamSTFT
 from AIAEC.dataset_gen.aec_features import sqrt_hann_window
 
 _THIS_DIR = os.path.dirname(os.path.abspath(__file__))
-_ULCNET_DIR = os.path.join(os.path.dirname(_THIS_DIR), 'Align_ULCNet')
 _AIAEC_DIR = os.path.dirname(_THIS_DIR)
+_ULCNET_DIR = os.path.join(_AIAEC_DIR, '..', 'lib', 'aiaec', 'ulcnet')
+_CAGCRN_DIR = os.path.join(_AIAEC_DIR, '..', 'lib', 'aiaec', 'cagcrn')
+_ALIGN_CRUSE_DIR = os.path.join(_AIAEC_DIR, '..', 'lib', 'aiaec', 'align_cruse')
+_DEEPVQE_S_DIR = os.path.join(_AIAEC_DIR, '..', 'lib', 'aiaec', 'deepvqe_s')
 _AC_DIR = os.path.abspath(
     os.path.join(_THIS_DIR, '..', '..', '..', 'audiolib', 'common'))
 _AC_INCLUDE = os.path.join(_AC_DIR, 'include')
@@ -292,7 +295,7 @@ int main(int argc, char **argv) {
     subprocess.run(
         [cc, '-O2', '-std=c99', '-ffp-contract=off',
          '-I', _AIAEC_DIR, '-I', _ULCNET_DIR, '-I', _AC_INCLUDE, '-I', _AC_DIR,
-         str(source), os.path.join(_AIAEC_DIR, 'aiaec_process.c'),
+         str(source), os.path.join(_ULCNET_DIR, 'ulcnet_mask_process.c'),
          os.path.join(_ULCNET_DIR, 'ulcnet_process.c'),
          audio_common_lib, '-lm', '-o', str(executable)],
         check=True, capture_output=True)
@@ -345,9 +348,9 @@ int main(int argc, char **argv) {
     executable = work / 'shared_masks'
     subprocess.run(
         [cc, '-O2', '-std=c99', '-ffp-contract=off',
-         '-I', _AIAEC_DIR, '-I', _ULCNET_DIR, '-I', _AC_INCLUDE, '-I', _AC_DIR,
-         str(source), os.path.join(_AIAEC_DIR, 'aiaec_process.c'),
-         os.path.join(_ULCNET_DIR, 'ulcnet_process.c'),
+         '-I', _AIAEC_DIR, '-I', _CAGCRN_DIR, '-I', _ALIGN_CRUSE_DIR, '-I', _AC_INCLUDE, '-I', _AC_DIR,
+         str(source), os.path.join(_CAGCRN_DIR, 'cagcrn_process.c'),
+         os.path.join(_ALIGN_CRUSE_DIR, 'align_cruse_process.c'),
          audio_common_lib, '-lm', '-o', str(executable)],
         check=True, capture_output=True)
 
@@ -413,8 +416,8 @@ int main(int argc, char **argv) {
     subprocess.run(
         [cc, '-O2', '-std=c99', '-ffp-contract=off',
          '-I', _AIAEC_DIR, '-I', _ULCNET_DIR,
-         '-I', os.path.join(_AIAEC_DIR, 'DeepVQE_S'), '-I', _AC_INCLUDE, '-I', _AC_DIR,
-         str(source), os.path.join(_AIAEC_DIR, 'DeepVQE_S', 'deepvqe_process.c'),
+         '-I', _DEEPVQE_S_DIR, '-I', _AC_INCLUDE, '-I', _AC_DIR,
+         str(source), os.path.join(_DEEPVQE_S_DIR, 'deepvqe_process.c'),
          '-o', str(executable)], check=True, capture_output=True)
     torch.manual_seed(22)
     frames = 6

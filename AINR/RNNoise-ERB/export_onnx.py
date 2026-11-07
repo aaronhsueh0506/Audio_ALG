@@ -192,7 +192,7 @@ def build_metadata(feature_cfg, n_bands, gru_size, use_complex_input=False):
         'use_complex_input': str(bool(use_complex_input)).lower(),
         'output_schema': (f'gains[1,1,{n_bands}];'
                           f'h1_out/h2_out/h3_out[1,1,{gru_size}]'),
-        'c_prepost': 'process.c/process.h',
+        'c_prepost': 'lib/ainr/rnnoise_erb/process.c/.h',
     }
 
 

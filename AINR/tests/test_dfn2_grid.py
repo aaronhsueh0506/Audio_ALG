@@ -48,6 +48,9 @@ import dfn_pairs
 
 FAMILY = 'DeepFilterNet2'
 DFN2 = dfn_pairs.family_dir(FAMILY)
+# dfn2_*.c/.h moved to lib/ainr/dfn2/ in the single-model-release restructuring; DFN2 (still
+# AINR/DeepFilterNet2, the Python training dir) now holds only config.ini and forwarding stubs.
+DFN2_C_DIR = dfn_pairs.AINR.parent / 'lib' / 'ainr' / 'dfn2'
 
 SIMD_MODES = (1, 0)
 
@@ -746,7 +749,7 @@ def test_the_extremes_of_make_and_validate_run_clean_under_ubsan(ubsan_probe, pr
 def test_the_ubsan_gate_can_fail(builds, ubsan_probe, tmp_path):
     """The same cases against a copy of dfn2_process.c with the old `2 * n_erb > n_bins`
     abort under the sanitizer, naming the signed overflow; the shipped file does not."""
-    source = (DFN2 / 'dfn2_process.c').read_text(encoding='utf-8')
+    source = (DFN2_C_DIR / 'dfn2_process.c').read_text(encoding='utf-8')
     fixed = 'spec->n_erb > n_bins / 2'
     assert source.count(fixed) == 1, 'the overflow-free form is gone: update this mutation'
     mutated = tmp_path / 'dfn2_process.c'
@@ -1269,7 +1272,7 @@ def grid_lib(request, tmp_path_factory):
     library = work / ('grid.dylib' if sys.platform == 'darwin' else 'grid.so')
     shared = '-dynamiclib' if sys.platform == 'darwin' else '-shared'
     built = _cc([shared, '-fPIC', *dfn_pairs.house_cflags(simd), '-I', str(DFN2),
-                 str(wrapper), str(DFN2 / 'dfn2_process.c'),
+                 str(wrapper), str(DFN2_C_DIR / 'dfn2_process.c'),
                  dfn_pairs.audio_common_lib(simd), '-lm', '-o', str(library)])
     assert built.returncode == 0, built.stderr
     lib = ctypes.CDLL(str(library))

@@ -46,7 +46,7 @@ import pytest
 
 
 _THIS_DIR = os.path.dirname(os.path.abspath(__file__))
-_ULCNET_DIR = os.path.join(os.path.dirname(_THIS_DIR), 'Align_ULCNet')
+_ULCNET_DIR = os.path.join(os.path.dirname(_THIS_DIR), '..', 'lib', 'aiaec', 'ulcnet')
 _AC_DIR = os.path.abspath(
     os.path.join(_THIS_DIR, '..', '..', '..', 'audiolib', 'common'))
 _AC_INCLUDE = os.path.join(_AC_DIR, 'include')

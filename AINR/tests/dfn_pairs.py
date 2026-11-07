@@ -68,14 +68,20 @@ def family_dir(family):
     return AINR / family
 
 
+def c_dir(family):
+    """``lib/ainr/<dfn2|dfn3>/``: the family's C core, moved out of ``family_dir()``
+    (now Python training/config.ini only) by the single-model-release restructuring."""
+    return AINR.parent / 'lib' / 'ainr' / _SOURCE_PREFIX[family]
+
+
 def macro_prefix(family):
     """``'DFN2'`` / ``'DFN3'``: the prefix of the family's C macros."""
     return _MACRO_PREFIX[family]
 
 
 def source_path(family, kind):
-    """``<family>/dfn2_<kind>.c`` for kind in process, model_io, prepost."""
-    return family_dir(family) / ('%s_%s.c' % (_SOURCE_PREFIX[family], kind))
+    """``lib/ainr/<dfn2|dfn3>/dfn2_<kind>.c`` for kind in process, model_io, prepost."""
+    return c_dir(family) / ('%s_%s.c' % (_SOURCE_PREFIX[family], kind))
 
 
 def pair_id(pair):
@@ -152,7 +158,7 @@ _GRID_HEADER = {'DeepFilterNet2': 'dfn2_grid.h', 'DeepFilterNet3': 'dfn3_process
 def grid_status_codes(family):
     """``{'OK': 0, 'ERR_MASK_LOOKAHEAD': ..., ...}`` read from the family's own
     ``DFN<n>_GRID_*`` enum, so a test names a refusal instead of a number."""
-    text = (family_dir(family) / _GRID_HEADER[family]).read_text()
+    text = (c_dir(family) / _GRID_HEADER[family]).read_text()
     codes = {name: int(value) for name, value in re.findall(
         r'%s_GRID_(\w+)\s*=\s*(-?\d+)' % macro_prefix(family), text)}
     assert 'OK' in codes and 'ERR_MASK_LOOKAHEAD' in codes, codes

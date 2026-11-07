@@ -17,8 +17,8 @@ import pytest
 
 _THIS_DIR = os.path.dirname(os.path.abspath(__file__))
 _AIAEC_DIR = os.path.dirname(_THIS_DIR)
-_ULCNET_DIR = os.path.join(_AIAEC_DIR, 'Align_ULCNet')
-_DEEPVQE_DIR = os.path.join(_AIAEC_DIR, 'DeepVQE_S')
+_ULCNET_DIR = os.path.join(_AIAEC_DIR, '..', 'lib', 'aiaec', 'ulcnet')
+_DEEPVQE_DIR = os.path.join(_AIAEC_DIR, '..', 'lib', 'aiaec', 'deepvqe_s')
 _AC_DIR = os.path.abspath(
     os.path.join(_THIS_DIR, '..', '..', '..', 'audiolib', 'common'))
 _AC_INCLUDE = os.path.join(_AC_DIR, 'include')

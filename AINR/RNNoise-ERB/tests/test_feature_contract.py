@@ -12,7 +12,7 @@ import sys
 import tempfile
 
 sys.path.insert(0, str(pathlib.Path(__file__).resolve().parent))
-from rnnoise_c_build import compile_c  # noqa: E402
+from rnnoise_c_build import compile_c, RNNOISE_C_DIR  # noqa: E402
 
 ROOT = pathlib.Path(__file__).resolve().parents[1]
 
@@ -118,7 +118,7 @@ def enum_value(text, name):
 def main():
     cfg = configparser.ConfigParser()
     cfg.read(ROOT / 'config.ini')
-    header = (ROOT / 'process.h').read_text()
+    header = (RNNOISE_C_DIR / 'process.h').read_text()
     support = (ROOT / 'test' / 'rnnoise_test_support.h').read_text()
     train = (ROOT / 'train.py').read_text()
 

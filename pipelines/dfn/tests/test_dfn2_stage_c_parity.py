@@ -36,7 +36,7 @@ from pipelines.dfn.dfn2_stage import (  # noqa: E402
 from pipelines.tests.c_shim import build_shim, float_pointer as _fp  # noqa: E402
 from pipelines.dfn.tests.dfn2_pairs import C_PAIRS, SHIPPED, pair_config, pair_defines, pair_id  # noqa: E402
 
-DFN = ROOT / 'AINR' / 'DeepFilterNet2'
+DFN = ROOT / 'lib' / 'ainr' / 'dfn2'  # moved from AINR/DeepFilterNet2
 
 _SHIM = r'''
 #include <stdlib.h>

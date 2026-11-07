@@ -7,6 +7,9 @@ import subprocess
 import sys
 
 ROOT = pathlib.Path(__file__).resolve().parents[1]
+# process.c/.h moved to lib/ainr/rnnoise_erb/ in the single-model-release restructuring; ROOT
+# stays AINR/RNNoise-ERB/ (the tests/ and Python training side are still here).
+RNNOISE_C_DIR = ROOT.parents[1] / 'lib' / 'ainr' / 'rnnoise_erb'
 
 
 def _common_dir():
@@ -36,8 +39,8 @@ def compile_c(sources, output, shared=False):
     if shared:
         flags += ['-dynamiclib' if sys.platform == 'darwin' else '-shared', '-fPIC']
     subprocess.run([
-        cc, *flags, '-I', str(ROOT), '-I', str(ROOT / 'test'),
+        cc, *flags, '-I', str(ROOT), '-I', str(ROOT / 'test'), '-I', str(RNNOISE_C_DIR),
         '-I', str(common / 'include'), '-I', str(common),
-        *map(str, sources), str(ROOT / 'process.c'), archive,
+        *map(str, sources), str(RNNOISE_C_DIR / 'process.c'), archive,
         '-o', str(output), '-lm',
     ], check=True)

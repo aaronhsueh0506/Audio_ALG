@@ -63,28 +63,30 @@ OBJ_DIR := $(BUILD_DIR)/simd$(SIMD)-$(CFG_SIG)
 # behavioural gate is tests/test_dfn2_prepost_c.py and its shipped form is
 # the archive below.
 SOURCES := tests/test_c_prepost.c \
-	DeepFilterNet2/dfn2_process.c \
-	DeepFilterNet2/dfn2_model_io.c \
-	DeepFilterNet2/dfn2_prepost.c \
-	DeepFilterNet3/dfn3_process.c \
-	DeepFilterNet3/dfn3_model_io.c \
-	DeepFilterNet3/dfn3_prepost.c \
-	GTCRN/gtcrn_process.c
+	../lib/ainr/dfn2/dfn2_process.c \
+	../lib/ainr/dfn2/dfn2_model_io.c \
+	../lib/ainr/dfn2/dfn2_prepost.c \
+	../lib/ainr/dfn3/dfn3_process.c \
+	../lib/ainr/dfn3/dfn3_model_io.c \
+	../lib/ainr/dfn3/dfn3_prepost.c \
+	../lib/ainr/gtcrn/gtcrn_process.c
 # The test headers hold the grids the test programs run (the libraries hold none),
 # the hop framing and the page-guarded allocator; the wildcard keeps a header added
-# there in the prerequisites of every test binary.
+# there in the prerequisites of every test binary. The model cores and their headers
+# live under lib/ainr/<model>/ (single-model-release restructuring); AINR/ keeps the
+# Python training/export side and this Makefile, which builds them from their new path.
 HEADERS := \
 	$(wildcard tests/*.h) \
-	DeepFilterNet2/dfn2_grid.h \
-	DeepFilterNet2/dfn2_process.h \
-	DeepFilterNet2/dfn2_model_io.h \
-	DeepFilterNet2/dfn2_model_io_priv.h \
-	DeepFilterNet2/dfn2_prepost.h \
-	DeepFilterNet3/dfn3_process.h \
-	DeepFilterNet3/dfn3_model_io.h \
-	DeepFilterNet3/dfn3_model_io_priv.h \
-	DeepFilterNet3/dfn3_prepost.h \
-	GTCRN/gtcrn_process.h
+	../lib/ainr/dfn2/dfn2_grid.h \
+	../lib/ainr/dfn2/dfn2_process.h \
+	../lib/ainr/dfn2/dfn2_model_io.h \
+	../lib/ainr/dfn2/dfn2_model_io_priv.h \
+	../lib/ainr/dfn2/dfn2_prepost.h \
+	../lib/ainr/dfn3/dfn3_process.h \
+	../lib/ainr/dfn3/dfn3_model_io.h \
+	../lib/ainr/dfn3/dfn3_model_io_priv.h \
+	../lib/ainr/dfn3/dfn3_prepost.h \
+	../lib/ainr/gtcrn/gtcrn_process.h
 TEST_BIN := $(OBJ_DIR)/test_c_prepost
 SCALAR_BIN := $(OBJ_DIR)/test_c_prepost_scalar
 # Bit-exactness of the model-local kernels against their scalar twins; the
@@ -97,8 +99,8 @@ CHAINS_SOURCES := $(SOURCES:tests/test_c_prepost.c=tests/test_nn_chains.c)
 CHAINS_BIN := $(OBJ_DIR)/test_nn_chains
 CHAINS_SCALAR_BIN := $(OBJ_DIR)/test_nn_chains_scalar
 DFN3_STREAM_SOURCES := tests/test_dfn3_stream.c \
-	DeepFilterNet3/dfn3_process.c DeepFilterNet3/dfn3_model_io.c \
-	DeepFilterNet3/dfn3_prepost.c
+	../lib/ainr/dfn3/dfn3_process.c ../lib/ainr/dfn3/dfn3_model_io.c \
+	../lib/ainr/dfn3/dfn3_prepost.c
 DFN3_STREAM_BIN := $(OBJ_DIR)/test_dfn3_stream
 DFN3_STREAM_SCALAR_BIN := $(OBJ_DIR)/test_dfn3_stream_scalar
 
@@ -117,7 +119,7 @@ LIB_OBJECTS := $(OBJ_DIR)/dfn2_process.o \
 	$(OBJ_DIR)/dfn3_prepost.o \
 	$(OBJ_DIR)/gtcrn_process.o \
 	$(OBJ_DIR)/rnnoise_process.o
-VPATH := DeepFilterNet2:DeepFilterNet3:GTCRN
+VPATH := ../lib/ainr/dfn2:../lib/ainr/dfn3:../lib/ainr/gtcrn
 
 .PHONY: all lib print-lib-path print-cflags print-sources test test-simd test-pairs clean _cfg_guard
 
@@ -160,7 +162,7 @@ $(OBJ_DIR)/%.o: %.c | _cfg_guard
 	$(CC) $(CFLAGS) $(SIMD_CPPFLAGS) -MMD -MP -c -o "$@" "$<"
 
 # The member name carries the family: RNNoise-ERB's source is a bare process.c.
-$(OBJ_DIR)/rnnoise_process.o: RNNoise-ERB/process.c | _cfg_guard
+$(OBJ_DIR)/rnnoise_process.o: ../lib/ainr/rnnoise_erb/process.c | _cfg_guard
 	$(CC) $(CFLAGS) $(SIMD_CPPFLAGS) -MMD -MP -c -o "$@" "$<"
 
 -include $(LIB_OBJECTS:.o=.d)
@@ -176,7 +178,7 @@ $(SCALAR_BIN): $(SOURCES) $(HEADERS) $(COMMON_LIB) $(COMMON_HEADERS) | _cfg_guar
 	$(CC) $(CFLAGS) -DSIMD_KERNELS_FORCE_SCALAR $(SOURCES) "$(COMMON_LIB)" \
 		$(LDFLAGS) -lm -o "$@"
 
-KERNEL_SOURCES := DeepFilterNet2/dfn2_process.c GTCRN/gtcrn_process.c
+KERNEL_SOURCES := ../lib/ainr/dfn2/dfn2_process.c ../lib/ainr/gtcrn/gtcrn_process.c
 
 $(KERNEL_TEST_BIN): tests/test_nn_kernels.c $(KERNEL_SOURCES) $(HEADERS) $(COMMON_LIB) $(COMMON_HEADERS) | _cfg_guard
 	$(CC) $(CFLAGS) $(SIMD_CPPFLAGS) tests/test_nn_kernels.c "$(COMMON_LIB)" \

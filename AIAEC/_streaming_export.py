@@ -201,10 +201,10 @@ GENERIC_MODEL_NAMES = (
 )
 
 _C_BOUNDARIES = {
-    'Align_CRUSE': 'aiaec_process.c/aiaec_process.h',
-    'DeepVQE_S': ('aiaec_process.c/aiaec_process.h+'
-                  'DeepVQE_S/deepvqe_process.c/.h'),
-    'CAGCRN': 'aiaec_process.c/aiaec_process.h',
+    'Align_CRUSE': 'lib/aiaec/align_cruse/align_cruse_process.c/.h',
+    'DeepVQE_S': ('lib/aiaec/deepvqe_s/deepvqe_process.c/.h+'
+                  '.../deepvqe_prepost.c/.h'),
+    'CAGCRN': 'lib/aiaec/cagcrn/cagcrn_process.c/.h',
 }
 
 _CONTROL_SEMANTICS = {

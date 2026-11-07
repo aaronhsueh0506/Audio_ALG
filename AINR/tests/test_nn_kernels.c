@@ -9,8 +9,8 @@
 #include <string.h>
 
 #include "utility/simd_test_mode.h"
-#include "DeepFilterNet2/dfn2_process.c"
-#include "GTCRN/gtcrn_process.c"
+#include "../lib/ainr/dfn2/dfn2_process.c"
+#include "../lib/ainr/gtcrn/gtcrn_process.c"
 /* The kernels take their extents as arguments or from a grid; the grid macros only
  * size this program's buffers (DFN2_N_BINS, DFN2_N_ERB: dfn2_test_grid.h; GTCRN:
  * gtcrn_test_grid.h). */

@@ -13,7 +13,7 @@
 #include <string.h>
 
 #include "audio_stft.h"
-#include "DeepFilterNet3/dfn3_prepost.h"
+#include "../lib/ainr/dfn3/dfn3_prepost.h"
 
 #ifndef DFN3_MASK_LOOKAHEAD
 #define DFN3_MASK_LOOKAHEAD 1

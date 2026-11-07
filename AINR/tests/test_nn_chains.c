@@ -31,8 +31,8 @@
 #include <stdlib.h>
 #include <string.h>
 
-#include "DeepFilterNet2/dfn2_prepost.h"
-#include "GTCRN/gtcrn_process.h"
+#include "../lib/ainr/dfn2/dfn2_prepost.h"
+#include "../lib/ainr/gtcrn/gtcrn_process.h"
 #include "dfn2_test_grid.h"
 #include "gtcrn_test_grid.h"
 

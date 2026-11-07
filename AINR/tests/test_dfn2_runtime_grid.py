@@ -46,6 +46,9 @@ import dfn_pairs
 FAMILY = 'DeepFilterNet2'
 DFN2 = dfn_pairs.family_dir(FAMILY)
 TESTS_DIR = Path(__file__).resolve().parent
+# dfn2_*.c/.h moved to lib/ainr/dfn2/ in the single-model-release restructuring; DFN2 (still
+# AINR/DeepFilterNet2, the Python training dir) now holds only config.ini and forwarding stubs.
+DFN2_C_DIR = dfn_pairs.AINR.parent / 'lib' / 'ainr' / 'dfn2'
 CHAIN_SOURCE = TESTS_DIR / 'dfn2_runtime_grid_chain.c'
 UNITS = ('process', 'model_io', 'prepost')
 SIMD_MODES = (1, 0)
@@ -89,7 +92,7 @@ class _Builds:
     def _compile_unit(self, unit, flags, simd):
         stem = 'unit%d_%s' % (next(self._counter), unit)
         obj = self.work / (stem + '.o')
-        source = DFN2 / ('dfn2_%s.c' % unit)
+        source = DFN2_C_DIR / ('dfn2_%s.c' % unit)
         done = _cc([*dfn_pairs.house_cflags(simd), *flags, '-I', str(DFN2), '-c', str(source),
                     '-o', str(obj)])
         assert done.returncode == 0, done.stderr
@@ -1379,10 +1382,10 @@ def _grid_macro_uses(directory):
 
 
 def test_the_library_defines_and_uses_no_grid_macro():
-    assert sorted(p.name for p in DFN2.glob('dfn2_*.[ch]')) == [
+    assert sorted(p.name for p in DFN2_C_DIR.glob('dfn2_*.[ch]')) == [
         'dfn2_grid.h', 'dfn2_model_io.c', 'dfn2_model_io.h', 'dfn2_model_io_priv.h',
         'dfn2_prepost.c', 'dfn2_prepost.h', 'dfn2_process.c', 'dfn2_process.h']
-    assert _grid_macro_uses(DFN2) == []
+    assert _grid_macro_uses(DFN2_C_DIR) == []
 
 
 def _product_sources():
@@ -1464,7 +1467,7 @@ def test_the_scan_sees_what_it_is_meant_to_see(tmp_path):
         assert [m for _f, _l, m in _grid_macro_uses(tmp_path)] == want, source
     mutated = tmp_path / 'lib'
     mutated.mkdir()
-    for path in DFN2.glob('dfn2_*.[ch]'):
+    for path in DFN2_C_DIR.glob('dfn2_*.[ch]'):
         shutil.copy(path, mutated / path.name)
     assert _grid_macro_uses(mutated) == []
     with (mutated / 'dfn2_process.h').open('a', encoding='utf-8') as stream:

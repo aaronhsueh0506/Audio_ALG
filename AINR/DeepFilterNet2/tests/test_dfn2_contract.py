@@ -22,6 +22,9 @@ sys.path.insert(0, ROOT)
 _AINR_TESTS = os.path.join(os.path.dirname(ROOT), 'tests')
 if _AINR_TESTS not in sys.path:
     sys.path.insert(0, _AINR_TESTS)
+# dfn2_*.c/.h moved to lib/ainr/dfn2/ in the single-model-release restructuring; ROOT_PATH /
+# 'dfn2_*.h' is now only a forwarding stub (an #include line), not the real header text.
+DFN2_C_DIR = ROOT_PATH.parents[1] / 'lib' / 'ainr' / 'dfn2'
 
 # Each of the three model projects has its own top-level ``train.py`` (and
 # ``inference.py``/``model.py``). Under a single pytest session the first one
@@ -97,7 +100,7 @@ def c_macro(header_text, name):
 
 
 def model_io_header():
-    return (ROOT_PATH / 'dfn2_model_io.h').read_text(encoding='utf-8')
+    return (DFN2_C_DIR / 'dfn2_model_io.h').read_text(encoding='utf-8')
 
 
 def load_config():
@@ -390,7 +393,7 @@ def test_the_test_table_of_state_shapes_matches_the_shipped_export_shapes():
     table is the encoder and ERB rows only and has no pathway window."""
     macros = grid_header_macros()
     cfg = load_config()
-    frames = c_macro((ROOT_PATH / 'dfn2_grid.h').read_text(encoding='utf-8'),
+    frames = c_macro((DFN2_C_DIR / 'dfn2_grid.h').read_text(encoding='utf-8'),
                      'DFN2_MODEL_INPUT_FRAMES')
     n_erb = cfg.getint('model', 'n_erb')
     df_bins = cfg.getint('model', 'df_bins')

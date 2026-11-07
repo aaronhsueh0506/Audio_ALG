@@ -27,6 +27,9 @@ SHIPPED_PAIR = dfn_pairs.shipped_pair(FAMILY)
 
 AINR = dfn_pairs.AINR
 DFN = dfn_pairs.family_dir(FAMILY)
+# dfn3_*.c/.h moved to lib/ainr/dfn3/ in the single-model-release restructuring; DFN (still
+# AINR/DeepFilterNet3, the Python training dir) now holds only config.ini and a forwarding stub.
+DFN3_C_DIR = AINR.parent / 'lib' / 'ainr' / 'dfn3'
 sys.path.insert(0, str(AINR.parent))
 from AINR.DeepFilterNet3 import export_onnx as dfn_export  # noqa: E402
 from AINR.DeepFilterNet3 import model as dfn_model  # noqa: E402
@@ -168,8 +171,8 @@ def _wrapper_library(simd, tmp_path_factory):
     library = work / ('dfn3.dylib' if sys.platform == 'darwin' else 'dfn3.so')
     subprocess.run(['cc', *dfn_pairs.house_cflags(simd),
                     '-dynamiclib' if sys.platform == 'darwin' else '-shared',
-                    '-fPIC', str(wrapper), str(DFN / 'dfn3_process.c'),
-                    str(DFN / 'dfn3_model_io.c'), archive, '-lm',
+                    '-fPIC', str(wrapper), str(DFN3_C_DIR / 'dfn3_process.c'),
+                    str(DFN3_C_DIR / 'dfn3_model_io.c'), archive, '-lm',
                     '-o', str(library)],
                    check=True, capture_output=True)
     lib = ctypes.CDLL(str(library))
@@ -273,7 +276,7 @@ def test_c_feature_windows_equal_the_exporters_windows(c_dfn3):
 def _grid_status_codes():
     """``{'OK': 0, 'ERR_MASK_LOOKAHEAD': -7, ...}`` read from the library's own
     ``DFN3_GRID_*`` enum, so a test names a refusal instead of a number."""
-    text = (DFN / 'dfn3_process.h').read_text()
+    text = (DFN3_C_DIR / 'dfn3_process.h').read_text()
     codes = {name: int(value) for name, value in re.findall(
         r'DFN3_GRID_(\w+)\s*=\s*(-?\d+)', text)}
     assert {'OK', 'ERR_MASK_LOOKAHEAD', 'ERR_DF_LOOKAHEAD'} <= set(codes), codes

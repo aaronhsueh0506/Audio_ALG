@@ -190,19 +190,19 @@ $(BUILD_DIR)/erb_inv.bin: $(PY_TEST_DIR)/erb_fixture.py config.ini | _cfg_guard
 $(BUILD_DIR)/test_rnnoise_tables: test/test_rnnoise_tables.c test/rnnoise_test_erb.h | _cfg_guard
 	$(CC) $(CFLAGS) -o $@ test/test_rnnoise_tables.c -lm
 
-RN_TEST_DEPS = process.c process.h test/rnnoise_test_support.h test/rnnoise_test_erb.h $(COMMON_LIB)
+RN_TEST_DEPS = ../../lib/ainr/rnnoise_erb/process.c ../../lib/ainr/rnnoise_erb/process.h test/rnnoise_test_support.h test/rnnoise_test_erb.h $(COMMON_LIB)
 
 $(BUILD_DIR)/test_rnnoise_features: test/test_rnnoise_features.c $(RN_TEST_DEPS) | _cfg_guard
-	$(CC) $(CFLAGS) $(COMMON_INCLUDES) -o $@ test/test_rnnoise_features.c process.c $(COMMON_LIB) -lm
+	$(CC) $(CFLAGS) $(COMMON_INCLUDES) -o $@ test/test_rnnoise_features.c ../../lib/ainr/rnnoise_erb/process.c $(COMMON_LIB) -lm
 
 $(BUILD_DIR)/test_rnnoise_simd_auto: test/test_rnnoise_simd.c $(RN_TEST_DEPS) | _cfg_guard
-	$(CC) $(CFLAGS) $(COMMON_INCLUDES) -o $@ test/test_rnnoise_simd.c process.c $(COMMON_LIB) -lm
+	$(CC) $(CFLAGS) $(COMMON_INCLUDES) -o $@ test/test_rnnoise_simd.c ../../lib/ainr/rnnoise_erb/process.c $(COMMON_LIB) -lm
 
 $(BUILD_DIR)/test_rnnoise_simd_scalar: test/test_rnnoise_simd.c $(RN_TEST_DEPS) | _cfg_guard
-	$(CC) $(CFLAGS) $(COMMON_INCLUDES) -DSIMD_KERNELS_FORCE_SCALAR -o $@ test/test_rnnoise_simd.c process.c $(COMMON_LIB) -lm
+	$(CC) $(CFLAGS) $(COMMON_INCLUDES) -DSIMD_KERNELS_FORCE_SCALAR -o $@ test/test_rnnoise_simd.c ../../lib/ainr/rnnoise_erb/process.c $(COMMON_LIB) -lm
 
 $(BUILD_DIR)/test_rnnoise_framing: test/test_rnnoise_framing.c $(RN_TEST_DEPS) | _cfg_guard
-	$(CC) $(CFLAGS) $(COMMON_INCLUDES) -o $@ test/test_rnnoise_framing.c process.c $(COMMON_LIB) -lm
+	$(CC) $(CFLAGS) $(COMMON_INCLUDES) -o $@ test/test_rnnoise_framing.c ../../lib/ainr/rnnoise_erb/process.c $(COMMON_LIB) -lm
 
 $(COMMON_LIB): FORCE
 	$(MAKE) -s --no-print-directory -C $(COMMON_DIR) $(COMMON_FWD) lib

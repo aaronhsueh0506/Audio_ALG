@@ -30,9 +30,9 @@ _SOURCES = {
     'DFN_RATE_BRIDGE_LAYOUT_VERSION':
         'pipelines/dfn/dfn_rate_bridge.h',
     'ULCNET_MODEL_IO_LAYOUT_VERSION':
-        'AIAEC/Align_ULCNet/ulcnet_model_io.h',
+        'lib/aiaec/ulcnet/ulcnet_model_io.h',
     'DEEPVQE_PREPOST_LAYOUT_VERSION':
-        'AIAEC/DeepVQE_S/deepvqe_prepost.h',
+        'lib/aiaec/deepvqe_s/deepvqe_prepost.h',
 }
 
 _DOC_ROOT = _REPO / 'docs'
@@ -143,12 +143,12 @@ def test_the_scan_actually_reaches_the_pages_that_publish_versions():
 # stale carve version sends integrators looking for a mismatch that is not
 # there.
 _CARVE_SOURCES = {
-    'DFN2_PREPOST_CARVE_VERSION': 'AINR/DeepFilterNet2/dfn2_prepost.h',
-    'DFN3_PREPOST_CARVE_VERSION': 'AINR/DeepFilterNet3/dfn3_prepost.h',
-    'GTCRN_PROCESS_CARVE_VERSION': 'AINR/GTCRN/gtcrn_process.h',
-    'RNNOISE_CARVE_VERSION': 'AINR/RNNoise-ERB/process.h',
-    'ULCNET_PREPOST_CARVE_VERSION': 'AIAEC/Align_ULCNet/ulcnet_prepost.h',
-    'DEEPVQE_PREPOST_CARVE_VERSION': 'AIAEC/DeepVQE_S/deepvqe_prepost.h',
+    'DFN2_PREPOST_CARVE_VERSION': 'lib/ainr/dfn2/dfn2_prepost.h',
+    'DFN3_PREPOST_CARVE_VERSION': 'lib/ainr/dfn3/dfn3_prepost.h',
+    'GTCRN_PROCESS_CARVE_VERSION': 'lib/ainr/gtcrn/gtcrn_process.h',
+    'RNNOISE_CARVE_VERSION': 'lib/ainr/rnnoise_erb/process.h',
+    'ULCNET_PREPOST_CARVE_VERSION': 'lib/aiaec/ulcnet/ulcnet_prepost.h',
+    'DEEPVQE_PREPOST_CARVE_VERSION': 'lib/aiaec/deepvqe_s/deepvqe_prepost.h',
 }
 
 # Every spelling that mentions a carve version: the macro name, optionally

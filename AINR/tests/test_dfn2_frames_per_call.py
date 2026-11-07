@@ -172,7 +172,9 @@ def test_frames_per_call_must_be_a_positive_integer(export, bad):
 
 
 def test_the_frames_per_call_cap_is_the_c_hosts(export):
-    header = (pathlib.Path(export.__file__).parent / 'dfn2_grid.h').read_text()
+    # dfn2_grid.h moved to lib/ainr/dfn2/ in the single-model-release restructuring; the old
+    # AINR/DeepFilterNet2/dfn2_grid.h is now only a forwarding stub (an #include line).
+    header = (dfn_pairs.AINR.parent / 'lib' / 'ainr' / 'dfn2' / 'dfn2_grid.h').read_text()
     cap = re.search(r'#define\s+DFN2_MODEL_MAX_FRAMES_PER_CALL\s+(\d+)', header)
     assert cap and export.MAX_FRAMES_PER_CALL == int(cap.group(1)) == 64
     assert export.chunk_input_frames(export.MAX_FRAMES_PER_CALL) == 66

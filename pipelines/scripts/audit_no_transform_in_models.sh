@@ -2,7 +2,11 @@
 # audit_no_transform_in_models.sh -- source gate: no framing code inside a model directory. Framing (the
 # AcStft analysis, the AcIstft inverse FFT and overlap-add) is audiolib's (audio_stft.h), built and run by
 # the application; a model directory holds neither side of the transform and builds, sizes or runs no
-# AcStft or AcIstft. Scans the non-test C sources and headers of AINR/ and AIAEC/.
+# AcStft or AcIstft. Scans the non-test C sources and headers of lib/ainr/, lib/aiaec/ (the model
+# cores, moved there by the single-model-release restructuring) and AINR/, AIAEC/ (now Python-only,
+# plus any compatibility forwarding header). Does NOT, and must never, scan stream/: that layer's
+# whole job is PCM framing around a model core and legitimately calls AcStft/AcIstft -- a future
+# stream/ addition needs its own, deliberately permissive version of this audit, not this one widened.
 #
 # The one audiolib framing use a model directory may have is the n_fft check: ac_stft_config_default()
 # filling an AcStftConfig and ac_stft_get_mem_size() of it (non-zero = a size the framing builds).
@@ -22,10 +26,11 @@ set -eu
 
 ROOT="${1:-$(cd "$(dirname "$0")/../.." && pwd)}"
 
-[ -d "$ROOT/AINR" ] && [ -d "$ROOT/AIAEC" ] || { echo "FAIL: $ROOT has no AINR/ and AIAEC/" >&2; exit 2; }
+[ -d "$ROOT/AINR" ] && [ -d "$ROOT/AIAEC" ] && [ -d "$ROOT/lib/ainr" ] && [ -d "$ROOT/lib/aiaec" ] \
+    || { echo "FAIL: $ROOT has no AINR/, AIAEC/, lib/ainr/ and lib/aiaec/" >&2; exit 2; }
 
 # Non-test model sources: tests, third-party checkouts and build trees are not model code.
-files=$(find "$ROOT/AINR" "$ROOT/AIAEC" \
+files=$(find "$ROOT/lib/ainr" "$ROOT/lib/aiaec" "$ROOT/AINR" "$ROOT/AIAEC" \
     \( -name test -o -name tests -o -name gtcrn_github -o -name build -o -name obj -o -name bin -o -name output \) -prune -o \
     -type f \( -name '*.c' -o -name '*.h' \) -print | sort)
 [ -n "$files" ] || { echo "FAIL: no model sources found under $ROOT" >&2; exit 2; }
@@ -70,4 +75,4 @@ if [ -n "$hits" ]; then
     printf '%s\n' "$hits"
     exit 1
 fi
-echo "PASS: no framing code in $count model sources under AINR/ and AIAEC/ (the n_fft check pair only)"
+echo "PASS: no framing code in $count model sources under lib/ainr/, lib/aiaec/, AINR/ and AIAEC/ (the n_fft check pair only)"

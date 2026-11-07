@@ -15,6 +15,9 @@ import torch
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 ROOT_PATH = pathlib.Path(ROOT)
 sys.path.insert(0, ROOT)
+# gtcrn_process.c/.h moved to lib/ainr/gtcrn/ in the single-model-release restructuring;
+# ROOT_PATH / 'gtcrn_process.h' is now only a forwarding stub (an #include line).
+GTCRN_C_DIR = ROOT_PATH.parents[1] / 'lib' / 'ainr' / 'gtcrn'
 
 # Each model project has its own top-level ``train.py``/``model.py``/
 # ``export_onnx.py``.  Under a single pytest session the first one imported
@@ -50,7 +53,7 @@ GRID = {'sr': 16000, 'n_fft': 512, 'win_len': 512, 'hop_len': 256}
 
 
 def c_macro(name):
-    header = (ROOT_PATH / 'gtcrn_process.h').read_text(encoding='utf-8')
+    header = (GTCRN_C_DIR / 'gtcrn_process.h').read_text(encoding='utf-8')
     match = re.search(
         r'^#define\s+%s\s+(\d+)u?\s*(?:/\*.*)?$' % re.escape(name),
         header,
@@ -111,7 +114,7 @@ def test_state_layout_version_is_pinned_to_the_c_header(tmp_path):
 
 def _state_ids():
     """The GTCRNStateId enum of gtcrn_process.h in order, as the exporter's state names."""
-    header = (ROOT_PATH / 'gtcrn_process.h').read_text(encoding='utf-8')
+    header = (GTCRN_C_DIR / 'gtcrn_process.h').read_text(encoding='utf-8')
     body = re.search(r'typedef enum GTCRNStateId \{(.*?)\} GTCRNStateId;', header, re.S)
     assert body is not None
     code = re.sub(r'/\*.*?\*/', '', body.group(1), flags=re.S)

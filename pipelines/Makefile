@@ -77,15 +77,17 @@ include ../lib/deps.mk
 # the whole tree and not just pipelines/.
 ALG_ROOT = ..
 
-# Align-ULCNet sources (AIAEC/Align_ULCNet): the model-callback output check, the model I/O
-# descriptor, the pre/post class and the accelerator adapter, compiled by the rules below (none
-# is in a producer archive). Fixed repo-relative constants, not part of CFG_SIG's caller-varying
-# axes, like AEC_DIR/NR_DIR above. The Align-ULCNet grid is a run-time value of the programs
-# (--sample-rate) and of the tests; no object here holds one.
+# Align-ULCNet sources: the model-callback output check, the model I/O descriptor, the pre/post
+# class and the accelerator adapter, compiled by the rules below (none is in a producer archive).
+# Fixed repo-relative constants, not part of CFG_SIG's caller-varying axes, like AEC_DIR/NR_DIR
+# above. The Align-ULCNet grid is a run-time value of the programs (--sample-rate) and of the
+# tests; no object here holds one. AIAEC_DIR still names AIAEC/ itself (its Python side and
+# tests/test_ulcnet_accelerator_adapter.c stay there); ULCNET_DIR/DFN2_DIR point at the model
+# cores, moved to lib/ainr/, lib/aiaec/ by the single-model-release restructuring.
 AIAEC_DIR = ../AIAEC
-ULCNET_DIR = $(AIAEC_DIR)/Align_ULCNet
+ULCNET_DIR = ../lib/aiaec/ulcnet
 AINR_DIR = ../AINR
-DFN2_DIR = $(AINR_DIR)/DeepFilterNet2
+DFN2_DIR = ../lib/ainr/dfn2
 
 # DeepFilterNet2 lookahead pair the test programs run: mask 0..2, deep filter 0..4 (the shipped
 # deep filter has 5 taps), plain decimals. The stage, the rate bridge and the example mains hold
@@ -457,14 +459,16 @@ TARGET_ABI_SRCS := tests/test_target_abi.c \
  4ch_aec_bf_nr_res/mcab.c \
  dfn/dfn_res_stage.c dfn/dfn_rate_bridge.c \
  $(DFN2_DIR)/dfn2_process.c $(DFN2_DIR)/dfn2_model_io.c $(DFN2_DIR)/dfn2_prepost.c \
- ../AINR/DeepFilterNet3/dfn3_process.c ../AINR/DeepFilterNet3/dfn3_model_io.c \
- ../AINR/DeepFilterNet3/dfn3_prepost.c \
+ ../lib/ainr/dfn3/dfn3_process.c ../lib/ainr/dfn3/dfn3_model_io.c \
+ ../lib/ainr/dfn3/dfn3_prepost.c \
  $(ULCNET_DIR)/ulcnet_process.c $(ULCNET_DIR)/ulcnet_model_io.c $(ULCNET_DIR)/ulcnet_prepost.c \
- $(AIAEC_DIR)/aiaec_process.c $(AIAEC_DIR)/DeepVQE_S/deepvqe_process.c \
- $(AIAEC_DIR)/DeepVQE_S/deepvqe_prepost.c
+ $(ULCNET_DIR)/ulcnet_mask_process.c ../lib/aiaec/cagcrn/cagcrn_process.c \
+ ../lib/aiaec/align_cruse/align_cruse_process.c \
+ ../lib/aiaec/deepvqe_s/deepvqe_process.c \
+ ../lib/aiaec/deepvqe_s/deepvqe_prepost.c
 TARGET_ABI_INCLUDES := -I4ch_aec_bf_nr_res \
- -I$(DFN2_DIR) -I../AINR/DeepFilterNet3 -I$(ULCNET_DIR) \
- -I$(AIAEC_DIR) -I$(AIAEC_DIR)/DeepVQE_S -I$(COMMON_DIR)/utility
+ -I$(DFN2_DIR) -I../lib/ainr/dfn3 -I$(ULCNET_DIR) \
+ -I$(AIAEC_DIR) -I../lib/aiaec/deepvqe_s -I$(COMMON_DIR)/utility
 
 # The same CC command can select a different SDK through PATH.
 # Include effective pointer/FP/ISA predefines to avoid cross-ABI cache reuse.

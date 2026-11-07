@@ -42,8 +42,9 @@ ALG_DIR := ../..
 # Included by its own fixed location, not through ALG_DIR: a caller overriding ALG_DIR must not
 # also relocate which deps.mk this Makefile reads.
 include ../../lib/deps.mk
-ULCNET_DIR ?= $(ALG_DIR)/AIAEC/Align_ULCNet
-DFN2_DIR ?= $(ALG_DIR)/AINR/DeepFilterNet2
+# Model cores moved to lib/ainr/, lib/aiaec/ by the single-model-release restructuring.
+ULCNET_DIR ?= $(ALG_DIR)/lib/aiaec/ulcnet
+DFN2_DIR ?= $(ALG_DIR)/lib/ainr/dfn2
 
 # DeepFilterNet2 lookahead pair, same knobs and rules as pipelines/Makefile. The DFN2 stage, the
 # bridge and the example main take their grid and pair at run time (the config carries a DFN2Grid),

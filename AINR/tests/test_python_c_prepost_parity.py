@@ -40,6 +40,11 @@ ROOT = AINR.parent.parent
 AC = ROOT / 'audiolib' / 'common'
 DFN = AINR / 'DeepFilterNet2'
 GT = AINR / 'GTCRN'
+# dfn2_process.c/gtcrn_process.c moved to lib/ainr/{dfn2,gtcrn}/ in the single-model-release
+# restructuring; DFN/GT (still the Python training dirs) now hold only config.ini/model.py and
+# forwarding stubs for the headers.
+DFN2_C_DIR = AINR.parent / 'lib' / 'ainr' / 'dfn2'
+GTCRN_C_DIR = AINR.parent / 'lib' / 'ainr' / 'gtcrn'
 
 
 def _load(name, path):
@@ -189,8 +194,8 @@ def c_prepost(tmp_path_factory):
     subprocess.run(
         [cc, shared_flag, '-fPIC', '-O2', '-std=c11', '-ffp-contract=off',
          '-I', str(DFN), '-I', str(GT), '-I', str(AC / 'include'), '-I', str(AC),
-         str(wrapper), str(DFN / 'dfn2_process.c'),
-         str(GT / 'gtcrn_process.c'), archive, '-lm', '-o', str(library)],
+         str(wrapper), str(DFN2_C_DIR / 'dfn2_process.c'),
+         str(GTCRN_C_DIR / 'gtcrn_process.c'), archive, '-lm', '-o', str(library)],
         check=True, capture_output=True,
     )
     lib = ctypes.CDLL(str(library))
@@ -432,7 +437,7 @@ def test_dfn2_process_compiles_alone_without_the_class_symbols(tmp_path):
     obj = tmp_path / 'dfn2_process.o'
     subprocess.run(
         [cc, '-c', '-O2', '-std=c11', '-ffp-contract=off', '-fno-math-errno',
-         '-I', str(DFN), '-I', str(AC / 'include'), '-I', str(AC), str(DFN / 'dfn2_process.c'),
+         '-I', str(DFN), '-I', str(AC / 'include'), '-I', str(AC), str(DFN2_C_DIR / 'dfn2_process.c'),
          '-o', str(obj)],
         check=True, capture_output=True)
     undefined = subprocess.run(['nm', '-u', str(obj)], check=True,
