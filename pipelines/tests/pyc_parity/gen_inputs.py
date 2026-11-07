@@ -28,6 +28,8 @@ from scipy.signal import resample_poly
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 ALG = os.path.abspath(os.path.join(HERE, '..', '..', '..'))      # .../Audio_ALG
+# Still the lib/aec git submodule's own recordings, not the sibling AEC checkout lib/deps.mk
+# resolves for the C build: run `git submodule update --init --recursive` first.
 SRC_DIR = os.path.join(ALG, 'lib', 'aec', 'wav', 'aec_record')
 SRC = {'mic': 'aec_record_mic_10s.wav', 'ref': 'aec_record_ref_10s.wav'}
 GAINS = np.array([1.0, 0.9, 1.1, 0.8], np.float32)

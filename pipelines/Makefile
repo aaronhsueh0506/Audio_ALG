@@ -1440,6 +1440,14 @@ pyc-parity:
 # The gitlinks (while they still exist) are reported as a NOTE, never failed on here: that is the
 # step-5 "gitlink migration" readiness gate, not this build's pass/fail. Publish runs this after
 # taking its lock and before building.
+#
+# COMMON_DIR is checked separately from AUDIOLIB_DIR, not derived from it (lib/deps.mk keeps them
+# independent so a caller can override AUDIOLIB_DIR alone to drop the spatial doa/bf libs -- see
+# lib/deps.mk's own comment). Every pipelines build links COMMON_DIR's archive, whether or not
+# AUDIOLIB_DIR's spatial libs are also in play, so an override of COMMON_DIR alone (to a
+# different, even cleanly-compiling, audiolib checkout) must fail this check exactly as an
+# AUDIOLIB_DIR override would -- both point into the same audiolib repo by default and so report
+# the same commit, but nothing stops them from being pointed at two different ones.
 # ---------------------------------------------------------------------------
 .PHONY: check-pins _check_pins_impl
 check-pins: _check_pins_impl
@@ -1454,6 +1462,15 @@ _check_pins_impl:
 	 fi; \
 	 note=""; [ -n "$$(git -C "$(AUDIOLIB_DIR)" status --porcelain -uno 2>/dev/null)" ] && note=" (tracked changes present)"; \
 	 echo "check-pins: audiolib ($(AUDIOLIB_DIR)) $$have matches lib/audiolib.pin$$note"; \
+	 ac_have="$$(git -C "$(COMMON_DIR)" rev-parse HEAD 2>/dev/null || echo unknown)"; \
+	 if [ "$$ac_have" = unknown ]; then \
+	   echo "check-pins: FAIL audiolib common at $(COMMON_DIR) has no git identity (not a git checkout, or COMMON_DIR not present)" >&2; exit 1; \
+	 fi; \
+	 if [ "$$ac_have" != "$(AUDIOLIB_COMMIT)" ]; then \
+	   echo "check-pins: FAIL audiolib common at $(COMMON_DIR) is $$ac_have, lib/audiolib.pin expects $(AUDIOLIB_COMMIT) (the archive this build actually links)" >&2; exit 1; \
+	 fi; \
+	 note=""; [ -n "$$(git -C "$(COMMON_DIR)" status --porcelain -uno 2>/dev/null)" ] && note=" (tracked changes present)"; \
+	 echo "check-pins: audiolib common ($(COMMON_DIR)) $$ac_have matches lib/audiolib.pin$$note"; \
 	 aec_have="$$(git -C "$(AEC_DIR)" rev-parse HEAD 2>/dev/null || echo unknown)"; \
 	 if [ "$$aec_have" = unknown ]; then \
 	   echo "check-pins: FAIL lib/aec at $(AEC_DIR) has no git identity (not a git checkout, or AEC_DIR not present)" >&2; exit 1; \

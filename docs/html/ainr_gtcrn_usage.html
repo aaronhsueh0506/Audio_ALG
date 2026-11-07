@@ -133,8 +133,13 @@ int run_gtcrn(const float *erb_fwd, const float *erb_inv, RunGraph run_graph,
         ac_stft_push(stft, in + h * grid.hop, (Complex *)(void *)spectrum);
         gtcrn_model_input(p, spectrum, mag, real_part, imag_part);
         for (int i = 0; i &lt; 2 * grid.erb_bands; ++i) mask_erb[i] = NAN;   /* 沒被寫的 mask 會被拒 */
-        if (run_graph(mag, real_part, imag_part, state, mask_erb) != 0 ||
-            gtcrn_process_mask_validate(p, mask_erb) != 0 || gtcrn_process_state_validate(p) != 0)
+        int run_rc = run_graph(mag, real_part, imag_part, state, mask_erb);
+        /* 兩個驗證一律都呼叫，即使 run_graph() 本身回報失敗：NaN 填的 mask_erb 仍會觸發
+         * mask_validate 自己的有限值檢查，把已註冊的 state 歸零、generation +1 ——
+         * 短路跳過的話，失敗呼叫寫了一半、但仍有限的 state 會原封不動帶進下一個 hop。 */
+        int mask_rc = gtcrn_process_mask_validate(p, mask_erb);
+        int state_rc = gtcrn_process_state_validate(p);
+        if (run_rc != 0 || mask_rc != 0 || state_rc != 0)
             memcpy(enhanced, spectrum, sizeof *enhanced * 2 * (size_t)grid.n_bins);   /* 此框頻譜原樣通過 */
         else
             gtcrn_model_output(p, mask_erb, spectrum, enhanced);

@@ -56,26 +56,14 @@
 set -u
 set -o pipefail
 
+die() { echo "pyc_parity: $*" >&2; exit 2; }
+
 HERE="$(cd "$(dirname "$0")" && pwd)"
 PARITY="$HERE/pyc_parity"
 SELF_ALG="$(cd "$HERE/../.." && pwd)"
 TREE="${PYC_TREE:-$(cd "$SELF_ALG/.." && pwd)}"
 ALG="$TREE/Audio_ALG"
 
-# AEC_DIR/NR_DIR/COMMON_DIR: resolved the same way pipelines/Makefile resolves them for the build
-# below (lib/deps.mk's default -- the sibling AEC/c_impl, NR/c_impl and audiolib/common dev
-# checkouts, pinned in lib/aec.pin/lib/nr.pin/lib/audiolib.pin), via deps.mk's own print-deps-sh
-# instead of a second, independently hardcoded copy of that resolution here -- an override (e.g.
-# COMMON_DIR=) must change what this script builds, links and hashes identically, not just what
-# the Makefile sees. $ALG is this run's Audio_ALG checkout (PYC_TREE), so a $PYC_TREE run resolves
-# against that tree's own siblings, not this one's.
-PYC_DEPS_SH="$(make -s -f "$ALG/lib/deps.mk" print-deps-sh)" || die "could not resolve $ALG/lib/deps.mk"
-eval "$PYC_DEPS_SH"
-[ -n "${AEC_DIR:-}" ] && [ -n "${NR_DIR:-}" ] && [ -n "${COMMON_DIR:-}" ] \
-  || die "lib/deps.mk print-deps-sh did not set AEC_DIR/NR_DIR/COMMON_DIR"
-AC="$COMMON_DIR"
-PL="$ALG/pipelines"
-P4="$PL/4ch_aec_bf_nr_res"
 PYTHON="${PYTHON:-python3}"
 JOBS="${PYC_JOBS:-4}"
 CC="${CC:-cc}"
@@ -87,8 +75,6 @@ LAYERS="1,2"
 ONLY=""
 LIST=0
 REUSE=0
-
-die() { echo "pyc_parity: $*" >&2; exit 2; }
 
 while [ $# -gt 0 ]; do
   case "$1" in
@@ -107,9 +93,34 @@ export OMP_NUM_THREADS=1 OPENBLAS_NUM_THREADS=1 VECLIB_MAXIMUM_THREADS=1 MKL_NUM
 export PYTHONDONTWRITEBYTECODE=1
 PYRUN=("$PYTHON" -I -B)
 
+# --list only reads pyc_parity.py's own scenario table; it needs neither a tree to build nor
+# AEC_DIR/NR_DIR/COMMON_DIR resolved, so it runs before (and regardless of whether) either exists
+# -- in particular a PYC_TREE checkout from before lib/deps.mk existed can still be listed.
 if [ "$LIST" = 1 ]; then
   exec "${PYRUN[@]}" "$PARITY/pyc_parity.py" --list
 fi
+
+# AEC_DIR/NR_DIR/COMMON_DIR: resolved the same way pipelines/Makefile resolves them for the build
+# below (lib/deps.mk's default -- the sibling AEC/c_impl, NR/c_impl and audiolib/common dev
+# checkouts, pinned in lib/aec.pin/lib/nr.pin/lib/audiolib.pin), via deps.mk's own print-deps-sh
+# instead of a second, independently hardcoded copy of that resolution here -- an override (e.g.
+# COMMON_DIR=) must change what this script builds, links and hashes identically, not just what
+# the Makefile sees. $ALG is this run's Audio_ALG checkout (PYC_TREE), so a $PYC_TREE run resolves
+# against that tree's own siblings, not this one's.
+PYC_DEPS_SH="$(make -s -f "$ALG/lib/deps.mk" print-deps-sh)" || die "could not resolve $ALG/lib/deps.mk"
+eval "$PYC_DEPS_SH"
+[ -n "${AEC_DIR:-}" ] && [ -n "${NR_DIR:-}" ] && [ -n "${COMMON_DIR:-}" ] \
+  || die "lib/deps.mk print-deps-sh did not set AEC_DIR/NR_DIR/COMMON_DIR"
+# Absolute now: this script cd's into several build directories below (mono, then 4ch), and a
+# relative override (e.g. the README's AEC_DIR=../lib/aec/c_impl, still resolved here against
+# $(pwd) at this point) would otherwise resolve against whichever directory happens to be current
+# at each later use instead of the one place it was meant to name.
+AEC_DIR="$(cd "$AEC_DIR" && pwd)" || die "AEC_DIR=$AEC_DIR does not exist"
+NR_DIR="$(cd "$NR_DIR" && pwd)" || die "NR_DIR=$NR_DIR does not exist"
+COMMON_DIR="$(cd "$COMMON_DIR" && pwd)" || die "COMMON_DIR=$COMMON_DIR does not exist"
+AC="$COMMON_DIR"
+PL="$ALG/pipelines"
+P4="$PL/4ch_aec_bf_nr_res"
 
 [ -d "$ALG" ] && [ -d "$AC" ] || die "tree $TREE must hold Audio_ALG/ and audiolib/common/"
 
@@ -148,7 +159,15 @@ make_quiet() { # logfile dir args...
 build_layer() { # name simd debug extra opt
   local name="$1" simd="$2" debug="$3" extra="$4" opt="$5"
   local root="$WORK/build/$name" log="$WORK/logs/build_$name.log"
-  local knobs=("OBJ_ROOT=$root/obj" "BIN_ROOT=$root/bin" "SIMD=$simd" "DEBUG=$debug" "CC=$CC" "CXX=$CXX")
+  # AEC_DIR/NR_DIR/COMMON_DIR passed explicitly (not left to inherited environment/MAKEFLAGS): a
+  # caller's command-line override (e.g. the README's AEC_DIR=../lib/aec/c_impl) reaches this
+  # script's own `make -C pipelines ... pyc-parity` as a command-line variable, which GNU Make
+  # re-propagates to every nested $(MAKE) invocation via MAKEFLAGS using that ORIGINAL (relative)
+  # string, at a precedence that wins over both this script's own absolutized shell variable and
+  # whatever COMMON_DIR/AEC_DIR/NR_DIR the Makefile would otherwise resolve -- silently undoing
+  # the absolutization above for every build this function invokes unless restated here.
+  local knobs=("OBJ_ROOT=$root/obj" "BIN_ROOT=$root/bin" "SIMD=$simd" "DEBUG=$debug" "CC=$CC" "CXX=$CXX" \
+               "AEC_DIR=$AEC_DIR" "NR_DIR=$NR_DIR" "COMMON_DIR=$COMMON_DIR")
   local knobs4=("${knobs[@]}")
   [ -n "$extra" ] && { knobs+=("EXTRA_CFLAGS=$extra"); knobs4+=("EXTRA_CFLAGS=$extra"); }
   [ -n "$opt" ] && knobs4+=("OPT_CFLAGS=$opt")

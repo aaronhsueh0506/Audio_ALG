@@ -66,46 +66,72 @@ print-deps-sh:
 # "if an existing checkout is at a different version, report expected vs actual and leave the
 # developer's working tree alone". AEC_URL/NR_URL/AUDIOLIB_URL may be overridden (e.g. to a local
 # path or an already-cloned repo) to bootstrap without reaching the network.
+#
+# Clone + checkout happen in a staging directory next to the final one, moved into place only
+# once `checkout` to the exact pinned commit has actually succeeded: a `git clone && git checkout`
+# run directly against the final directory leaves a real, non-empty checkout behind even when the
+# checkout half fails (wrong commit, network drop mid-fetch), and the plain `[ -d DIR ]` guard
+# above would then see that directory on a retry and report "already exists, left alone" --
+# success, at the wrong HEAD. Staging makes a failed attempt leave nothing at the final path, so a
+# retry clones again instead of trusting a half-finished checkout.
 bootstrap-deps:
 	@if [ -d '$(AEC_REPO_DIR)' ]; then \
 	  echo "bootstrap-deps: AEC_REPO_DIR=$(AEC_REPO_DIR) already exists, left alone"; \
 	else \
 	  echo "bootstrap-deps: cloning AEC $(AEC_COMMIT) from $(AEC_URL) -> $(AEC_REPO_DIR)"; \
-	  git clone --quiet '$(AEC_URL)' '$(AEC_REPO_DIR)' && \
-	  git -C '$(AEC_REPO_DIR)' checkout --quiet '$(AEC_COMMIT)'; \
+	  stage='$(AEC_REPO_DIR).bootstrap-staging.'"$$$$"; rm -rf "$$stage"; \
+	  if git clone --quiet '$(AEC_URL)' "$$stage" && git -C "$$stage" checkout --quiet '$(AEC_COMMIT)'; then \
+	    mv "$$stage" '$(AEC_REPO_DIR)'; \
+	  else \
+	    echo "bootstrap-deps: FAIL could not clone+checkout AEC $(AEC_COMMIT) from $(AEC_URL)" >&2; rm -rf "$$stage"; exit 1; \
+	  fi; \
 	fi
 	@if [ -d '$(NR_REPO_DIR)' ]; then \
 	  echo "bootstrap-deps: NR_REPO_DIR=$(NR_REPO_DIR) already exists, left alone"; \
 	else \
 	  echo "bootstrap-deps: cloning NR $(NR_COMMIT) from $(NR_URL) -> $(NR_REPO_DIR)"; \
-	  git clone --quiet '$(NR_URL)' '$(NR_REPO_DIR)' && \
-	  git -C '$(NR_REPO_DIR)' checkout --quiet '$(NR_COMMIT)'; \
+	  stage='$(NR_REPO_DIR).bootstrap-staging.'"$$$$"; rm -rf "$$stage"; \
+	  if git clone --quiet '$(NR_URL)' "$$stage" && git -C "$$stage" checkout --quiet '$(NR_COMMIT)'; then \
+	    mv "$$stage" '$(NR_REPO_DIR)'; \
+	  else \
+	    echo "bootstrap-deps: FAIL could not clone+checkout NR $(NR_COMMIT) from $(NR_URL)" >&2; rm -rf "$$stage"; exit 1; \
+	  fi; \
 	fi
 	@if [ -d '$(AUDIOLIB_DIR)' ]; then \
 	  echo "bootstrap-deps: AUDIOLIB_DIR=$(AUDIOLIB_DIR) already exists, left alone"; \
 	else \
 	  echo "bootstrap-deps: cloning audiolib $(AUDIOLIB_COMMIT) from $(AUDIOLIB_URL) -> $(AUDIOLIB_DIR)"; \
-	  git clone --quiet '$(AUDIOLIB_URL)' '$(AUDIOLIB_DIR)' && \
-	  git -C '$(AUDIOLIB_DIR)' checkout --quiet '$(AUDIOLIB_COMMIT)'; \
+	  stage='$(AUDIOLIB_DIR).bootstrap-staging.'"$$$$"; rm -rf "$$stage"; \
+	  if git clone --quiet '$(AUDIOLIB_URL)' "$$stage" && git -C "$$stage" checkout --quiet '$(AUDIOLIB_COMMIT)'; then \
+	    mv "$$stage" '$(AUDIOLIB_DIR)'; \
+	  else \
+	    echo "bootstrap-deps: FAIL could not clone+checkout audiolib $(AUDIOLIB_COMMIT) from $(AUDIOLIB_URL)" >&2; rm -rf "$$stage"; exit 1; \
+	  fi; \
 	fi
 
-# Report (never fail the build -- pipelines/Makefile's check-pins target does that, against
-# whichever of these a particular build actually resolved AEC_DIR/NR_DIR/AUDIOLIB_DIR to, honoring
-# any override) each pinned dependency against the repo it names, AND, while the lib/aec and
-# lib/nr submodules still exist, their gitlinks against the same pins -- this second half is the
-# step-5 readiness gate: step 5 (migrating the two gitlinks onto these pins, and retiring the
-# now-redundant one of the two) is not proposed until every row below agrees.
+# Report each pinned dependency against the directory a build actually resolves to -- AEC_DIR/
+# NR_DIR/COMMON_DIR, honoring any override of those directly (not AEC_REPO_DIR/NR_REPO_DIR/
+# AUDIOLIB_DIR, which stay at their own default if a caller overrides AEC_DIR/NR_DIR/COMMON_DIR
+# instead and would then silently report the unused default's identity) -- AND, while the lib/aec
+# and lib/nr submodules still exist, their gitlinks against the same pins -- this second half is
+# the step-5 readiness gate: step 5 (migrating the two gitlinks onto these pins, and retiring the
+# now-redundant one of the two) is not proposed until every row below agrees. pipelines/Makefile's
+# check-pins target is what actually gates a real build/publish; this target is a standalone,
+# caller-invoked report with the same exit-nonzero-on-mismatch behavior.
 check-deps-pins:
 	@ok=1; \
-	have_aec="$$(git -C '$(AEC_REPO_DIR)' rev-parse HEAD 2>/dev/null || echo unknown)"; \
-	if [ "$$have_aec" = "$(AEC_COMMIT)" ]; then echo "check-deps-pins: AEC ($(AEC_REPO_DIR)) $$have_aec matches lib/aec.pin"; \
-	else echo "check-deps-pins: FAIL AEC ($(AEC_REPO_DIR)) is $$have_aec, lib/aec.pin expects $(AEC_COMMIT)" >&2; ok=0; fi; \
-	have_nr="$$(git -C '$(NR_REPO_DIR)' rev-parse HEAD 2>/dev/null || echo unknown)"; \
-	if [ "$$have_nr" = "$(NR_COMMIT)" ]; then echo "check-deps-pins: NR ($(NR_REPO_DIR)) $$have_nr matches lib/nr.pin"; \
-	else echo "check-deps-pins: FAIL NR ($(NR_REPO_DIR)) is $$have_nr, lib/nr.pin expects $(NR_COMMIT)" >&2; ok=0; fi; \
+	have_aec="$$(git -C '$(AEC_DIR)' rev-parse HEAD 2>/dev/null || echo unknown)"; \
+	if [ "$$have_aec" = "$(AEC_COMMIT)" ]; then echo "check-deps-pins: AEC ($(AEC_DIR)) $$have_aec matches lib/aec.pin"; \
+	else echo "check-deps-pins: FAIL AEC ($(AEC_DIR)) is $$have_aec, lib/aec.pin expects $(AEC_COMMIT)" >&2; ok=0; fi; \
+	have_nr="$$(git -C '$(NR_DIR)' rev-parse HEAD 2>/dev/null || echo unknown)"; \
+	if [ "$$have_nr" = "$(NR_COMMIT)" ]; then echo "check-deps-pins: NR ($(NR_DIR)) $$have_nr matches lib/nr.pin"; \
+	else echo "check-deps-pins: FAIL NR ($(NR_DIR)) is $$have_nr, lib/nr.pin expects $(NR_COMMIT)" >&2; ok=0; fi; \
 	have_ac="$$(git -C '$(AUDIOLIB_DIR)' rev-parse HEAD 2>/dev/null || echo unknown)"; \
 	if [ "$$have_ac" = "$(AUDIOLIB_COMMIT)" ]; then echo "check-deps-pins: audiolib ($(AUDIOLIB_DIR)) $$have_ac matches lib/audiolib.pin"; \
 	else echo "check-deps-pins: FAIL audiolib ($(AUDIOLIB_DIR)) is $$have_ac, lib/audiolib.pin expects $(AUDIOLIB_COMMIT)" >&2; ok=0; fi; \
+	have_common="$$(git -C '$(COMMON_DIR)' rev-parse HEAD 2>/dev/null || echo unknown)"; \
+	if [ "$$have_common" = "$(AUDIOLIB_COMMIT)" ]; then echo "check-deps-pins: audiolib common ($(COMMON_DIR)) $$have_common matches lib/audiolib.pin"; \
+	else echo "check-deps-pins: FAIL audiolib common ($(COMMON_DIR)) is $$have_common, lib/audiolib.pin expects $(AUDIOLIB_COMMIT)" >&2; ok=0; fi; \
 	if [ -e '$(AUDIO_ALG_ROOT)/lib/aec/.git' ]; then \
 	  gl_rec="$$(git -C '$(AUDIO_ALG_ROOT)' ls-files -s -- lib/aec 2>/dev/null | awk '$$3 == 0 {print $$2}')"; \
 	  gl_have="$$(git -C '$(AUDIO_ALG_ROOT)/lib/aec' rev-parse HEAD 2>/dev/null || echo unknown)"; \

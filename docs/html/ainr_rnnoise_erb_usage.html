@@ -143,8 +143,13 @@ int run_rnnoise(const float *erb_fwd, const float *erb_inv, RunModel run_model,
         for (int b = 0; b &lt; grid.n_bands; ++b) band_gains[b] = 1.0f;          /* 還沒有 3 框：unit gain */
         if (ready) {
             for (int b = 0; b &lt; grid.n_bands; ++b) band_gains[b] = NAN;       /* 沒被寫的輸出會被拒 */
-            if (run_model(erb, spec_win, h, h + GRU_HIDDEN, h + 2 * GRU_HIDDEN, band_gains) != 0 ||
-                rnnoise_frame_finish(st, band_gains) != 0)
+            int run_rc = run_model(erb, spec_win, h, h + GRU_HIDDEN, h + 2 * GRU_HIDDEN, band_gains);
+            /* rnnoise_frame_finish() 一律都呼叫，即使 run_model() 本身回報失敗：NaN 填的
+             * band_gains 仍會觸發它自己的有限值檢查，把已註冊的 state 歸零、generation +1
+             * （feature ring 與 OLA 時序不動）—— 短路跳過的話，失敗呼叫寫了一半、但仍有限
+             * 的 state 會原封不動帶進下一個 hop。 */
+            int finish_rc = rnnoise_frame_finish(st, band_gains);
+            if (run_rc != 0 || finish_rc != 0)
                 for (int b = 0; b &lt; grid.n_bands; ++b) band_gains[b] = 1.0f;   /* 被拒：unit gain */
             rnnoise_apply_atten_lim(st, band_gains, 0.0f);                     /* 可選；&lt;= 0 不作用 */
         }

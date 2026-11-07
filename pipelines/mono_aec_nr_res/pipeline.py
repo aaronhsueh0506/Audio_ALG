@@ -32,7 +32,9 @@ from typing import List, Tuple
 import numpy as np
 import soundfile as sf
 
-# Add parent directory to path for imports
+# Add parent directory to path for imports. Unlike the C build (lib/deps.mk, sibling AEC/NR
+# checkouts), this still imports lib.aec/lib.nr as the lib/aec and lib/nr git submodules -- run
+# `git submodule update --init --recursive` first even on a sibling-only C checkout.
 _ROOT = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 sys.path.insert(0, _ROOT)                                       # lib.* + pipelines.*
 sys.path.insert(0, os.path.join(_ROOT, 'lib', 'aec', 'python')) # aec + modules

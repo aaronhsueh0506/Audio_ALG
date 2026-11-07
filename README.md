@@ -87,6 +87,13 @@ make -C pipelines check-pins
 #   git submodule update --init --recursive
 #   make -C pipelines AEC_DIR=../lib/aec/c_impl NR_DIR=../lib/nr/c_impl ...
 
+# This pass moved only the C build's dependency resolution; the Python side (mono
+# pipeline.py, the 4-channel pipeline, pipelines/tests/pyc_parity's gen_inputs.py)
+# still imports lib.aec/lib.nr as Python packages and reads recordings from
+# lib/aec/wav, so it still needs the submodules initialized even on a sibling-only
+# checkout:
+git submodule update --init --recursive
+
 # Build the conventional mono example programs, the mono DFN2 and Align-ULCNet
 # examples and the DFN2 stage archive.
 make -C pipelines

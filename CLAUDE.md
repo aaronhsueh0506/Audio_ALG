@@ -70,20 +70,30 @@ exist on every Makefile for locating the config-keyed build output without guess
 **The three-file model pattern.** Every AINR/AIAEC model (DFN2, DFN3, GTCRN, RNNoise-ERB,
 ULCNet, DeepVQE-S, ...) splits into `*_process.{c,h}` (feature normalization, mask/deep-filter
 math — pure, stateless-ish numerics), `*_model_io.{c,h}` (tensor windowing/batching and
-recurrent-state registration) and `*_prepost.{c,h}` (the frequency-domain per-hop lifecycle:
-decides which frame's heads are ready, owns `frame_open`/`frame_finish`/`frame_bypass`). A new
-`*_stream.c` layer (in progress, DFN2/Align-ULCNet/DeepVQE-S only so far) wraps PCM framing/OLA
-around `*_prepost` so a board only needs the stream header. Reading just `*_prepost.h` is usually
-enough to integrate a model; `*_process.c` is only needed to change the model's math itself.
+recurrent-state registration) and `*_prepost.{c,h}` (the frequency-domain per-hop lifecycle;
+GTCRN/RNNoise-ERB use their own `*_process_mask_validate`/`*_process_state_validate` /
+`*_frame_finish` names instead of `frame_open`/`frame_finish`/`frame_bypass`, see below). Reading
+just the model's `*_prepost.h` (or `*_process.h` for GTCRN/RNNoise-ERB) is usually enough to
+integrate it; `*_process.c` is only needed to change the model's math itself. A `*_stream.c` PCM
+framing/OLA layer for DFN2/Align-ULCNet/DeepVQE-S is a proposed follow-up, not yet implemented —
+every model today is integrated the way its own README shows, at the `*_prepost`/`*_process`
+level.
 
-**Per-hop contract (same shape across every model).** `pre_process_freq()` → `frame_open()` →
-accelerator fills the tensors → `frame_finish()` (or `frame_bypass()` on failure/refusal) →
-`post_process_freq()` → push to `AcIstft`. The first `mask_lookahead` hops after init/reset are
-warm-up frames: they run this exact same flow (not a shortcut path) but their heads are discarded,
-registered state is zeroed, and the state generation counter advances by exactly one, so the first
-real frame always starts from zero state and the audio is bit-identical to skipping them. Missing
-a `frame_finish`/`frame_bypass` before the next `pre_process`/`post_process` call is a caller bug,
-not a library bug — the next call returns -1.
+**Per-hop contract (DFN2/DFN3/Align-ULCNet/DeepVQE-S's `frame_open`/`_finish`/`_bypass` shape).**
+`pre_process_freq()` → `frame_open()` → accelerator fills the tensors → `frame_finish()` (or
+`frame_bypass()` on failure/refusal) → `post_process_freq()` → push to `AcIstft`. Missing a
+`frame_finish`/`frame_bypass` before the next `pre_process`/`post_process` call is a caller bug,
+not a library bug — the next call returns -1. **Warm-up (DFN2/DFN3 only, and only when
+`frames_per_call` == 1):** the first `mask_lookahead` hops after init/reset run this exact same
+flow (not a shortcut path), heads discarded, registered state zeroed, state generation +1 per
+warm-up hop — bit-identical audio to skipping them. DFN2 with `frames_per_call` > 1 keeps its
+separate, older behavior instead (infers once every N hops, not once per hop); Align-ULCNet and
+DeepVQE-S were not touched by this round and keep their own, different warm-up handling — do not
+assume either without checking that model's own `*_prepost.h`. GTCRN/RNNoise-ERB have no
+`mask_lookahead`/warm-up concept at all: a callback failure is instead caught by their
+`*_mask_validate`/`*_frame_finish` finite-check, which (if the NaN-filled output sentinel the
+caller's own code must set before the call stays NaN) zeroes the registered state and advances the
+generation on that same hop, regardless of the callback's own return code.
 
 **State ownership and the generation counter.** Recurrent state is either registered by the host
 (pointer+count pairs, all-or-none) and owned in caller memory, or left to a hardware accelerator

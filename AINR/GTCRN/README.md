@@ -106,8 +106,15 @@ static int run_gtcrn(const float *erb_fwd, const float *erb_inv, RunGraph run_gr
         ac_stft_push(stft, in + h * grid.hop, (Complex *)(void *)spectrum);
         gtcrn_model_input(p, spectrum, mag, real_part, imag_part);
         for (int i = 0; i < 2 * grid.erb_bands; ++i) mask_erb[i] = NAN;      /* an unwritten mask is refused */
-        if (run_graph(mag, real_part, imag_part, state, mask_erb) != 0 ||
-            gtcrn_process_mask_validate(p, mask_erb) != 0 || gtcrn_process_state_validate(p) != 0)
+        int run_rc = run_graph(mag, real_part, imag_part, state, mask_erb);
+        /* Both validators always run, even when run_graph() itself reports failure: the
+         * NaN-filled mask_erb then still trips mask_validate's own finite check, which zeroes
+         * the registered state and advances the generation -- skipping them here would let a
+         * failed call's partial, finite state write (e.g. state[0] left non-zero) survive into
+         * the next hop undetected. */
+        int mask_rc = gtcrn_process_mask_validate(p, mask_erb);
+        int state_rc = gtcrn_process_state_validate(p);
+        if (run_rc != 0 || mask_rc != 0 || state_rc != 0)
             memcpy(enhanced, spectrum, sizeof *enhanced * 2 * (size_t)grid.n_bins);   /* pass the spectrum through */
         else
             gtcrn_model_output(p, mask_erb, spectrum, enhanced);

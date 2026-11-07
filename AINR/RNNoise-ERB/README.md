@@ -138,8 +138,14 @@ static int run_rnnoise(const float *erb_fwd, const float *erb_inv, RunModel run_
         for (int b = 0; b < grid.n_bands; ++b) band_gains[b] = 1.0f;          /* no 3-frame window yet: unit gains */
         if (ready) {
             for (int b = 0; b < grid.n_bands; ++b) band_gains[b] = NAN;       /* an unwritten output is refused */
-            if (run_model(erb, spec_win, h, h + GRU_HIDDEN, h + 2 * GRU_HIDDEN, band_gains) != 0 ||
-                rnnoise_frame_finish(st, band_gains) != 0)
+            int run_rc = run_model(erb, spec_win, h, h + GRU_HIDDEN, h + 2 * GRU_HIDDEN, band_gains);
+            /* rnnoise_frame_finish() always runs, even when run_model() itself reports failure:
+             * the NaN-filled band_gains then still trips its own finite check, which zeroes the
+             * registered state and advances the generation (feature ring and OLA timing
+             * untouched) -- skipping it here would let a failed call's partial, finite state
+             * write survive into the next hop undetected. */
+            int finish_rc = rnnoise_frame_finish(st, band_gains);
+            if (run_rc != 0 || finish_rc != 0)
                 for (int b = 0; b < grid.n_bands; ++b) band_gains[b] = 1.0f;   /* refused: unit gains */
             rnnoise_apply_atten_lim(st, band_gains, 0.0f);                     /* optional; <= 0 disables */
         }

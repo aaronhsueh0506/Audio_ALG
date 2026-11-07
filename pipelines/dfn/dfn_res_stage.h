@@ -13,9 +13,13 @@
  * heads are discarded, its state restarts), so the audio equals a stream whose model starts at its
  * first real frame.
  *
- * Fail-open: no model (model.infer == NULL), a nonzero infer() result or an unwritten/non-finite
- * output takes the frame as an identity through the cascade (clocks advance, recurrent state
- * unchanged); the output is P delayed by L hops.
+ * Fail-open: no model (model.infer == NULL), a nonzero infer() result, or an unwritten/non-finite
+ * output takes the frame as an identity through the cascade (clocks advance either way); the
+ * output is P delayed by L hops. Recurrent state is unchanged only for no-model and a nonzero
+ * infer() result (frame_bypass(), never reached for heads at all). An unwritten/non-finite output
+ * is different: that is a refused commit (frame_finish()'s own finite check), which zeroes the
+ * registered state and advances dfn_res_stage_state_generation() by one, the same as a warm-up
+ * frame -- see that function's own contract below.
  *
  * Reset: whole-pipeline resets only; an AEC delay change must not reset the stage. Grid: the
  * DFN2Grid in the config (dfn2_grid_make(); the shipped one is 48 kHz / 1024 / 512, hop 512, 513
