@@ -36,10 +36,10 @@ RANLIB ?= ranlib
 
 PIPELINES_DIR := ..
 ALG_DIR := ../..
-AEC_DIR ?= $(ALG_DIR)/lib/aec/c_impl
-NR_DIR ?= $(ALG_DIR)/lib/nr/c_impl
-AUDIOLIB_DIR ?= ../../../audiolib
-COMMON_DIR ?= ../../../audiolib/common
+# AEC_DIR / NR_DIR / AUDIOLIB_DIR / COMMON_DIR come from the one shared lib/deps.mk (see
+# lib/aec.pin, lib/nr.pin, lib/audiolib.pin): the sibling AEC/NR/audiolib dev checkouts by
+# default, still a caller-overridable `?=` (deps.mk's own, not this line's -- same effect).
+include $(ALG_DIR)/lib/deps.mk
 ULCNET_DIR ?= $(ALG_DIR)/AIAEC/Align_ULCNet
 DFN2_DIR ?= $(ALG_DIR)/AINR/DeepFilterNet2
 

@@ -1,0 +1,13 @@
+# Expected git commit of the sibling audiolib checkout (AUDIOLIB_DIR, default ../audiolib from
+# this repo's root -- see lib/deps.mk), and the URL `lib/deps.mk`'s `bootstrap-deps` clones it from
+# when that checkout is missing. audiolib is not a submodule, so this file plus
+# `make -C pipelines check-pins` is the source-level record of which audiolib
+# revision this Audio_ALG revision was built and tested against. Bump it in
+# the same commit that bumps the lib/aec.pin and lib/nr.pin (and, while they still exist, the
+# lib/aec and lib/nr submodule gitlinks).
+#
+# Moved from pipelines/audiolib.pin (same key, same value -- a working-tree relocation, not a new
+# pin) so the three dependencies' pins live in one place (lib/) read by one lib/deps.mk, instead of
+# this one file alone sitting in pipelines/ beside two unpinned submodule gitlinks.
+AUDIOLIB_COMMIT=d50dbaad32a5b2b3a0f6e95df46bb1f78d851c62
+AUDIOLIB_URL=https://github.com/aaronhsueh0506/audio_common.git

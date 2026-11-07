@@ -17,8 +17,10 @@ endif
 
 # The FFT (and Complex type) come from audiolib -- the cross-product
 # base library every port already carries; the models keep only their own
-# DSP on top of it.
-COMMON_DIR ?= $(abspath ../../audiolib/common)
+# DSP on top of it. COMMON_DIR comes from the one shared lib/deps.mk (see
+# lib/audiolib.pin): the sibling audiolib dev checkout by default, still a
+# caller-overridable `?=`.
+include ../lib/deps.mk
 COMMON_LIB = $(shell $(MAKE) -s -C $(COMMON_DIR) BACKEND=$(BACKEND) SIMD=$(SIMD) 	lib print-lib-path | tail -1)
 override CFLAGS += -I$(COMMON_DIR)/include -I$(COMMON_DIR)
 

@@ -63,8 +63,17 @@ ifneq ($(findstring $(AUDIO_PIPELINE_SPACE),$(CURDIR)),)
 $(error this build root path contains whitespace ('$(CURDIR)'), which is not supported -- re-run from a path with no spaces. (Whitespace build-root paths are a known, pre-existing limitation shared by all four repos in this stack -- audiolib, lib/aec, lib/nr, and this repo -- not something this pass fixes; this check only fails fast and clearly, here, instead of a cryptic "No such file or directory" deep inside an unrelated sub-invocation.))
 endif
 
-AEC_DIR = ../lib/aec/c_impl
-NR_DIR  = ../lib/nr/c_impl
+# The Audio_ALG git root (this directory's parent): check-pins and publish query it, so they see
+# the whole tree and not just pipelines/.
+ALG_ROOT = ..
+
+# AEC_DIR / NR_DIR / AUDIOLIB_DIR / COMMON_DIR, and each producer's pinned commit (AEC_COMMIT /
+# NR_COMMIT / AUDIOLIB_COMMIT, read by check-pins below), come from the one shared lib/deps.mk
+# (see lib/aec.pin, lib/nr.pin, lib/audiolib.pin) instead of being hardcoded here. Every one of
+# them stays a caller-overridable `?=` inside deps.mk, so `make AEC_DIR=...` still works exactly
+# as before; only the default changed, from the lib/aec submodule checkout to the sibling AEC dev
+# checkout (see deps.mk's own header for why).
+include $(ALG_ROOT)/lib/deps.mk
 
 # Align-ULCNet sources (AIAEC/Align_ULCNet): the model-callback output check, the model I/O
 # descriptor, the pre/post class and the accelerator adapter, compiled by the rules below (none
@@ -104,15 +113,6 @@ endif
 ifneq ($(DFN2_MASK_LOOKAHEAD)/$(DFN2_DF_LOOKAHEAD),1/1)
 DFN_TEST_CFLAGS += -DDFN2_MASK_LOOKAHEAD=$(DFN2_MASK_LOOKAHEAD) -DDFN2_DF_LOOKAHEAD=$(DFN2_DF_LOOKAHEAD)
 endif
-
-# audiolib sits two levels up from pipelines/ (SE/Audio_ALG/pipelines -> SE/audiolib/common).
-# lib/aec/c_impl and lib/nr/c_impl resolve it themselves from their own location; COMMON_DIR here
-# feeds this Makefile's CFLAGS/-I path and is passed to the lib/aec and lib/nr sub-makes as
-# COMMON_DIR=$(abspath $(COMMON_DIR)) so all three use the same audiolib checkout.
-COMMON_DIR ?= ../../audiolib/common
-# audiolib repo root (COMMON_DIR's parent): check-pins reports the whole
-# audiolib repo's HEAD, not just the common/ subdirectory's.
-AUDIOLIB_DIR ?= ../../audiolib
 
 # ne10 is the only FFT backend. BACKEND stays a variable because it names the
 # keyed obj/bin directories and is forwarded to the producers.
@@ -195,8 +195,8 @@ TOOLCHAIN_CHECK ?= 1
 # unhashable case above, and would refuse (or, under ALLOW_UNTRACKED_PUBLISH=1, perturb the
 # provenance hash of) an otherwise identical publish. The producers get no whitelist. Neither knob
 # is in CFG_SIG: they only decide whether publish proceeds.
-# UNTRACKED_FILES_CMD is that list; `make print-untracked` prints it.
-UNTRACKED_FILES_CMD = git ls-files --others --exclude-standard 2>/dev/null | grep -vE '^AINR/gtcrn_github/' || true
+# UNTRACKED_FILES_CMD is that list (paths relative to ALG_ROOT); `make print-untracked` prints it.
+UNTRACKED_FILES_CMD = git -C $(ALG_ROOT) ls-files --others --exclude-standard 2>/dev/null | grep -vE '^AINR/gtcrn_github/' || true
 
 # ATTEST_STAMP (test only): overrides the UTC timestamp in the attestation filename so the
 # isolation tests can force same-second collisions and exercise the no-clobber retry. Attestations
@@ -1068,8 +1068,8 @@ _publish_checked:
 # fixed-field record per path: "L <sha256(path)> <sha256(readlink)>" for a symlink, "F <mode>
 # <sha256(path)> <sha256(content)>" for a regular file, "X <path>" for anything else or any
 # stat/readlink/shasum failure (fail-closed, never an empty hash). Variable-length values are hashed
-# first so records concatenate unambiguously. It runs once per repo ("./" over the whitelist-filtered
-# list; "$(COMMON_DIR)/", "$(AEC_DIR)/", "$(NR_DIR)/" over the raw lists) into its own record file,
+# first so records concatenate unambiguously. It runs once per repo ("$(ALG_ROOT)/" over the
+# whitelist-filtered list; "$(COMMON_DIR)/", "$(AEC_DIR)/", "$(NR_DIR)/" over the raw lists) into its own record file,
 # and each untracked_tree_sha256 is `shasum -a 256` of that file.
 
 # Per repo, an unknown identity is checked first and is an unconditional FATAL. Each producer dir is
@@ -1203,7 +1203,7 @@ _publish_impl: $(PUBLISH_ARTIFACTS)
 	nr_ddiff=""; [ "$$nr_dirty" = "1" ] && nr_ddiff="$$(git -C "$(NR_DIR)" diff --binary HEAD 2>/dev/null | shasum -a 256 | cut -d' ' -f1)"; \
 	uhash=""; \
 	if [ "$$untracked" = "1" ]; then \
-	  printf '%s\n' "$$unt_list" | hash_untracked "./" > "$$work/untracked.records"; \
+	  printf '%s\n' "$$unt_list" | hash_untracked "$(ALG_ROOT)/" > "$$work/untracked.records"; \
 	  if grep -q '^X ' "$$work/untracked.records"; then \
 	    echo "FATAL: publish refused -- an untracked path in pipelines (this repo) cannot be hashed deterministically (embedded git checkout / special file / I/O failure) and so cannot enter the provenance record:" >&2; \
 	    grep '^X ' "$$work/untracked.records" | sed 's/^X /    /' >&2; \
@@ -1429,33 +1429,50 @@ pyc-parity:
 	bash tests/pyc_parity_pipelines.sh $(PYC_PARITY_ARGS)
 
 # ---------------------------------------------------------------------------
-# check-pins: verify the producer revisions this checkout expects. lib/aec and lib/nr are submodules
-# whose gitlinks are the pin (read from the index, so a staged bump validates before its commit);
-# audiolib is a sibling checkout resolved through COMMON_DIR, with its expected commit in audiolib.pin
-# (bump it with the gitlinks). A commit mismatch fails; tracked changes in a producer are reported but
-# allowed (`make publish` applies its own dirty policy). Publish runs this after taking its lock and
-# before building.
+# check-pins: verify the producer revisions this checkout expects, against the actual checkout
+# each producer directory (AEC_DIR / NR_DIR / AUDIOLIB_DIR, from lib/deps.mk, honoring any
+# override) resolves to for this build -- not the lib/aec / lib/nr submodule gitlinks, which are
+# a second, not-yet-authoritative record of the same two dependencies (see lib/aec.pin, lib/nr.pin
+# and lib/deps.mk's header). A commit mismatch on AEC_DIR/NR_DIR/AUDIOLIB_DIR fails; tracked
+# changes in a producer are reported but allowed (`make publish` applies its own dirty policy).
+# The gitlinks (while they still exist) are reported as a NOTE, never failed on here: that is the
+# step-5 "gitlink migration" readiness gate, not this build's pass/fail. Publish runs this after
+# taking its lock and before building.
 # ---------------------------------------------------------------------------
 .PHONY: check-pins _check_pins_impl
 check-pins: _check_pins_impl
 
 _check_pins_impl:
-	@pin="$$(sed -n 's/^AUDIOLIB_COMMIT=//p' audiolib.pin)"; \
-	 [ -n "$$pin" ] || { echo "check-pins: audiolib.pin has no AUDIOLIB_COMMIT" >&2; exit 1; }; \
-	 have="$$(git -C "$(AUDIOLIB_DIR)" rev-parse HEAD 2>/dev/null || echo unknown)"; \
-	 if [ "$$have" != "$$pin" ]; then \
-	   echo "check-pins: FAIL audiolib at $(AUDIOLIB_DIR) is $$have, audiolib.pin expects $$pin" >&2; exit 1; \
+	@have="$$(git -C "$(AUDIOLIB_DIR)" rev-parse HEAD 2>/dev/null || echo unknown)"; \
+	 if [ "$$have" != "$(AUDIOLIB_COMMIT)" ]; then \
+	   echo "check-pins: FAIL audiolib at $(AUDIOLIB_DIR) is $$have, lib/audiolib.pin expects $(AUDIOLIB_COMMIT)" >&2; exit 1; \
 	 fi; \
 	 note=""; [ -n "$$(git -C "$(AUDIOLIB_DIR)" status --porcelain -uno 2>/dev/null)" ] && note=" (tracked changes present)"; \
-	 echo "check-pins: audiolib $$have matches audiolib.pin$$note"; \
+	 echo "check-pins: audiolib ($(AUDIOLIB_DIR)) $$have matches lib/audiolib.pin$$note"; \
+	 aec_have="$$(git -C "$(AEC_DIR)" rev-parse HEAD 2>/dev/null || echo unknown)"; \
+	 if [ "$$aec_have" != "$(AEC_COMMIT)" ]; then \
+	   echo "check-pins: FAIL AEC at $(AEC_DIR) is $$aec_have, lib/aec.pin expects $(AEC_COMMIT)" >&2; exit 1; \
+	 fi; \
+	 note=""; [ -n "$$(git -C "$(AEC_DIR)" status --porcelain -uno 2>/dev/null)" ] && note=" (tracked changes present)"; \
+	 echo "check-pins: AEC ($(AEC_DIR)) $$aec_have matches lib/aec.pin$$note"; \
+	 nr_have="$$(git -C "$(NR_DIR)" rev-parse HEAD 2>/dev/null || echo unknown)"; \
+	 if [ "$$nr_have" != "$(NR_COMMIT)" ]; then \
+	   echo "check-pins: FAIL NR at $(NR_DIR) is $$nr_have, lib/nr.pin expects $(NR_COMMIT)" >&2; exit 1; \
+	 fi; \
+	 note=""; [ -n "$$(git -C "$(NR_DIR)" status --porcelain -uno 2>/dev/null)" ] && note=" (tracked changes present)"; \
+	 echo "check-pins: NR ($(NR_DIR)) $$nr_have matches lib/nr.pin$$note"; \
 	 for sub in lib/aec lib/nr; do \
-	   rec="$$(git -C .. ls-files -s -- $$sub 2>/dev/null | awk '$$3 == 0 {print $$2}')"; \
-	   have="$$(git -C ../$$sub rev-parse HEAD 2>/dev/null || echo unknown)"; \
-	   if [ "$$rec" != "$$have" ]; then \
-	     echo "check-pins: FAIL $$sub checkout is $$have, gitlink records $$rec" >&2; exit 1; \
+	   want=$(AEC_COMMIT); [ "$$sub" = lib/nr ] && want=$(NR_COMMIT); \
+	   if [ ! -e $(ALG_ROOT)/$$sub/.git ]; then \
+	     echo "check-pins: $$sub submodule not initialized (not needed for the default sibling build)"; continue; \
 	   fi; \
-	   note=""; [ -n "$$(git -C ../$$sub status --porcelain -uno 2>/dev/null)" ] && note=" (tracked changes present)"; \
-	   echo "check-pins: $$sub $$have matches gitlink$$note"; \
+	   rec="$$(git -C $(ALG_ROOT) ls-files -s -- $$sub 2>/dev/null | awk '$$3 == 0 {print $$2}')"; \
+	   have="$$(git -C $(ALG_ROOT)/$$sub rev-parse HEAD 2>/dev/null || echo unknown)"; \
+	   if [ "$$rec" = "$$have" ] && [ "$$have" = "$$want" ]; then \
+	     echo "check-pins: $$sub gitlink $$have matches its pin (step 5 ready on this axis)"; \
+	   else \
+	     echo "check-pins: NOTE $$sub gitlink is $$have (index records $$rec), pin expects $$want -- step 5 not ready"; \
+	   fi; \
 	 done
 
 -include $(wildcard $(OBJ_DIR)/target_abi/*.d)

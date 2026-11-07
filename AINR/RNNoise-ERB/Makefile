@@ -23,7 +23,9 @@
 #     a config.manifest collision guard. BUILD_DIR may be absolute.
 
 CC ?= cc
-COMMON_DIR ?= $(abspath ../../../audiolib/common)
+# COMMON_DIR comes from the one shared lib/deps.mk (see lib/audiolib.pin): the sibling audiolib
+# dev checkout by default, still a caller-overridable `?=`.
+include ../../lib/deps.mk
 COMMON_FWD = SIMD=$(SIMD) CC='$(CC)' EXTRA_CFLAGS='$(EXTRA_CFLAGS)'
 COMMON_LIB ?= $(shell $(MAKE) -s --no-print-directory -C $(COMMON_DIR) $(COMMON_FWD) print-lib-path)
 COMMON_INCLUDES = -I"$(COMMON_DIR)/include" -I"$(COMMON_DIR)"

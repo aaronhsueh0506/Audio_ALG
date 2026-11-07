@@ -258,6 +258,20 @@ class Ctx:
             h.update(f.read())
         return h.hexdigest()
 
+    def abs_sha(self, path):
+        h = hashlib.sha256()
+        with open(path, 'rb') as f:
+            h.update(f.read())
+        return h.hexdigest()
+
+    def source_sha(self, rel):
+        """SOURCES entries resolve tree-relative, except aec_res.c: the build links whatever
+        lib/deps.mk's AEC_DIR resolved to (the sibling AEC/c_impl by default), which may differ
+        from the lib/aec submodule checkout this path names; hash the one actually built."""
+        if rel == 'Audio_ALG/lib/aec/c_impl/src/aec_res.c':
+            return self.abs_sha(os.path.join(self.info['AEC_DIR'], 'src', 'aec_res.c'))
+        return self.tree_sha(rel)
+
 
 # --------------------------------------------------------------------------------------------------
 # Seam files
@@ -1094,7 +1108,7 @@ def main():
         'tolerance_table': {'layer1': TOL1, 'layer2': TOL2},
         'builds': {'1': BUILD_NAME[1], '2': BUILD_NAME[2]},
         'inputs_sha256': inputs,
-        'sources_sha256': {s: cx.tree_sha(s) for s in SOURCES},
+        'sources_sha256': {s: cx.source_sha(s) for s in SOURCES},
         'summary': counts,
         'scenarios': rows,
     }

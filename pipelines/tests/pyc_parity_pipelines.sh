@@ -61,7 +61,19 @@ PARITY="$HERE/pyc_parity"
 SELF_ALG="$(cd "$HERE/../.." && pwd)"
 TREE="${PYC_TREE:-$(cd "$SELF_ALG/.." && pwd)}"
 ALG="$TREE/Audio_ALG"
-AC="$TREE/audiolib/common"
+
+# AEC_DIR/NR_DIR/COMMON_DIR: resolved the same way pipelines/Makefile resolves them for the build
+# below (lib/deps.mk's default -- the sibling AEC/c_impl, NR/c_impl and audiolib/common dev
+# checkouts, pinned in lib/aec.pin/lib/nr.pin/lib/audiolib.pin), via deps.mk's own print-deps-sh
+# instead of a second, independently hardcoded copy of that resolution here -- an override (e.g.
+# COMMON_DIR=) must change what this script builds, links and hashes identically, not just what
+# the Makefile sees. $ALG is this run's Audio_ALG checkout (PYC_TREE), so a $PYC_TREE run resolves
+# against that tree's own siblings, not this one's.
+PYC_DEPS_SH="$(make -s -f "$ALG/lib/deps.mk" print-deps-sh)" || die "could not resolve $ALG/lib/deps.mk"
+eval "$PYC_DEPS_SH"
+[ -n "${AEC_DIR:-}" ] && [ -n "${NR_DIR:-}" ] && [ -n "${COMMON_DIR:-}" ] \
+  || die "lib/deps.mk print-deps-sh did not set AEC_DIR/NR_DIR/COMMON_DIR"
+AC="$COMMON_DIR"
 PL="$ALG/pipelines"
 P4="$PL/4ch_aec_bf_nr_res"
 PYTHON="${PYTHON:-python3}"
@@ -100,6 +112,7 @@ if [ "$LIST" = 1 ]; then
 fi
 
 [ -d "$ALG" ] && [ -d "$AC" ] || die "tree $TREE must hold Audio_ALG/ and audiolib/common/"
+
 case "$(cd "$(dirname "$WORK")" 2>/dev/null && pwd)/$(basename "$WORK")" in
   "$TREE"/*) die "work directory $WORK is inside the source tree $TREE" ;;
 esac
@@ -123,6 +136,9 @@ mkdir -p "$WORK/logs" "$WORK/inputs" "$WORK/run"
 # --------------------------------------------------------------------------------------------
 BUILD_INFO="$WORK/build_info.txt"
 : > "$BUILD_INFO.new"
+# So pyc_parity.py can hash the aec_res.c it actually linked, not the lib/aec submodule checkout
+# a tree-relative path would otherwise name.
+echo "AEC_DIR=$AEC_DIR" >> "$BUILD_INFO.new"
 
 make_quiet() { # logfile dir args...
   local log="$1" dir="$2"; shift 2
@@ -142,8 +158,8 @@ build_layer() { # name simd debug extra opt
   make_quiet "$log" "$P4" "${knobs4[@]}" libaudio_pipeline_mcab.a || { tail -20 "$log" >&2; die "build $name (4ch) failed"; }
   local ac aec nr four
   ac="$(make -s -C "$AC" "${knobs[@]}" print-lib-path | tail -1)"
-  aec="$(make -s -C "$ALG/lib/aec/c_impl" "${knobs[@]}" COMMON_DIR="$AC" COMMON_LIB="$ac" print-lib-path | tail -1)"
-  nr="$(make -s -C "$ALG/lib/nr/c_impl" "${knobs[@]}" COMMON_DIR="$AC" COMMON_LIB="$ac" print-lib-path | tail -1)"
+  aec="$(make -s -C "$AEC_DIR" "${knobs[@]}" COMMON_DIR="$AC" COMMON_LIB="$ac" print-lib-path | tail -1)"
+  nr="$(make -s -C "$NR_DIR" "${knobs[@]}" COMMON_DIR="$AC" COMMON_LIB="$ac" print-lib-path | tail -1)"
   four="$(make -s -C "$P4" "${knobs4[@]}" print-lib-path | tail -1)"
   for f in "$ac" "$aec" "$nr" "$four"; do [ -f "$f" ] || die "archive or object $f missing after build $name"; done
 
@@ -152,7 +168,7 @@ build_layer() { # name simd debug extra opt
   local macros="" inc
   if [ "$simd" = 0 ]; then macros="-DSIMD_KERNELS_FORCE_SCALAR"; fi
   case "$extra" in *USE_STANDARD_MATH*) macros="$macros -DUSE_STANDARD_MATH" ;; esac
-  inc="-I$PL -I$P4 -I$ALG/lib/aec/c_impl/include -I$ALG/lib/aec/c_impl/example -I$ALG/lib/nr/c_impl/include -I$AC/include -I$AC"
+  inc="-I$PL -I$P4 -I$AEC_DIR/include -I$AEC_DIR/example -I$NR_DIR/include -I$AC/include -I$AC"
   mkdir -p "$root/drv"
   # shellcheck disable=SC2086
   "$CC" -Wall -Wextra -O2 -std=gnu99 -ffp-contract=off -fno-math-errno $macros $inc -DPYC_WITH_4CH \

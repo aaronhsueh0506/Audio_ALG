@@ -13,8 +13,8 @@ contracts.
 | `AINR/` | Standalone speech enhancement | [`AINR/README.md`](AINR/README.md) |
 | `AIAEC/` | Four neural AEC candidate architectures | [`AIAEC/README.md`](AIAEC/README.md) |
 | `pipelines/4ch_aec_bf_nr_res/` | `mcab`, the four-microphone linear-AEC flow layer (`mcab.h`): the application creates four libaec `Aec` lanes and, in MATCHED delay mode, one shared `DelayAec`, and passes them in `McabLibs`; `mcab` keeps only flow state (delay admission, alignment ring, fuse buffers) and its per-hop output is `mcab_process_front()` then `mcab_fuse()` with the caller's beamformer weights. It holds no beamformer and no RES. Beside it: sample helpers outside the archive (`mcab_sample_flow`, `mcab_sample_beam` for SRP-PHAT/BF, `mcab_sample_driver`), the programs `mcab_raw`, `mcab_static` and `mcab_external_static`, and the Python twin `McabPipeline` | [`pipelines/4ch_aec_bf_nr_res/README.md`](pipelines/4ch_aec_bf_nr_res/README.md) |
-| `lib/aec/`, `lib/nr/` | Conventional algorithm libraries (AEC, NR) | Git submodules (`.gitmodules`) |
-| `../audiolib/common/` | Shared FFT / fast-math / SIMD kernel layer used by AEC, NR and the pipelines | Sibling checkout, expected revision in [`pipelines/audiolib.pin`](pipelines/audiolib.pin) (`make -C pipelines check-pins`) |
+| `lib/aec/`, `lib/nr/` | Conventional algorithm libraries (AEC, NR) | Git submodules (`.gitmodules`); also buildable standalone (see below) |
+| `../AEC/`, `../NR/`, `../audiolib/` | Sibling dev checkouts of AEC, NR and audiolib (`common/` is the shared FFT / fast-math / SIMD kernel layer) | **Default** build sources as of the dependency-path convergence pass; expected revisions in [`lib/aec.pin`](lib/aec.pin), [`lib/nr.pin`](lib/nr.pin), [`lib/audiolib.pin`](lib/audiolib.pin), resolved by [`lib/deps.mk`](lib/deps.mk) (`make -C pipelines check-pins`) |
 
 The conventional pipeline is the deployable reference path. `AINR/` and
 `AIAEC/` are model-training workspaces and are not silently inserted into that
@@ -71,18 +71,21 @@ Standalone AINR follows each model's own config; see the table above.
 ## Clone and build
 
 ```bash
-git clone --recursive https://github.com/aaronhsueh0506/Audio_ALG.git
+git clone https://github.com/aaronhsueh0506/Audio_ALG.git
 cd Audio_ALG
 
-# If the repository was cloned without submodules:
-git submodule update --init --recursive
-
-# audiolib is a sibling checkout, not a submodule: clone it next to this
-# repository at the revision recorded in pipelines/audiolib.pin, then
-# verify all three producer revisions.
-git clone https://github.com/aaronhsueh0506/audio_common.git ../audiolib
-git -C ../audiolib checkout "$(sed -n 's/^AUDIOLIB_COMMIT=//p' pipelines/audiolib.pin)"
+# AEC, NR and audiolib are read from sibling checkouts next to this repository
+# by default (../AEC, ../NR, ../audiolib -- lib/deps.mk; the lib/aec and lib/nr
+# git submodules still exist and still build, via AEC_DIR=lib/aec/c_impl /
+# NR_DIR=lib/nr/c_impl, but are no longer the default). `bootstrap-deps` clones
+# whichever sibling is missing, at the commit each is pinned to:
+make -f lib/deps.mk bootstrap-deps
 make -C pipelines check-pins
+
+# Only if you specifically want the git-submodule checkout instead of the sibling
+# dev checkouts (e.g. no write access to the sibling repos on this machine):
+#   git submodule update --init --recursive
+#   make -C pipelines AEC_DIR=../lib/aec/c_impl NR_DIR=../lib/nr/c_impl ...
 
 # Build the conventional mono example programs, the mono DFN2 and Align-ULCNet
 # examples and the DFN2 stage archive.
@@ -128,19 +131,30 @@ Audio_ALG/
 ├── docs/                # current docs plus archived design records
 ├── PTQ/                 # post-export graph cleanup and calibration-set analysis
 ├── lib/
-│   ├── aec/             # AEC submodule
-│   └── nr/              # NR submodule
+│   ├── deps.mk          # shared AEC_DIR/NR_DIR/AUDIOLIB_DIR/COMMON_DIR resolution
+│   ├── aec.pin, nr.pin, audiolib.pin  # pinned commit + bootstrap URL per dependency
+│   ├── aec/             # AEC submodule (gitlink; not the default build source)
+│   └── nr/              # NR submodule (gitlink; not the default build source)
 ├── pipelines/           # conventional integration; tests/ and offline tools/ are separated
 ├── scripts/             # repository helpers
 └── shared/              # shared utilities
 ```
 
-Submodule working trees are independent repositories. Commit their changes
-inside `lib/aec` or `lib/nr` first, then update the gitlink in this repository
-only when that submodule revision is intentionally part of an integration
-release. `audiolib` follows the same rule without a gitlink: commit and
-push it first, then update `AUDIOLIB_COMMIT` in `pipelines/audiolib.pin`
-in the same integration commit that bumps the gitlinks.
+AEC, NR and audiolib are independent repositories (`../AEC`, `../NR`,
+`../audiolib`, the sibling dev checkouts `lib/deps.mk` resolves to by
+default). Commit and push a change inside its own repository first, then
+bump that dependency's recorded commit — `lib/aec.pin`'s `AEC_COMMIT`,
+`lib/nr.pin`'s `NR_COMMIT`, or `lib/audiolib.pin`'s `AUDIOLIB_COMMIT` — in the
+same integration commit, all three together when more than one moved.
 `make -C pipelines publish` enforces the same pin check inside the publish
 lock before it builds any release artifact; `check-pins` remains the quick
 standalone preflight command.
+
+The `lib/aec` and `lib/nr` git submodules (`.gitmodules`) still exist, still
+carry their own gitlink, and still build (`AEC_DIR=lib/aec/c_impl` /
+`NR_DIR=lib/nr/c_impl`); they are a second, not-yet-authoritative record of
+the same two dependencies, kept in sync with `lib/aec.pin` / `lib/nr.pin` for
+now. `check-pins` reports (without failing on) any drift between a gitlink
+and its `.pin` as a step-5 readiness note — migrating the gitlinks onto the
+`.pin` files, and retiring the redundant one of the two, is a deliberately
+separate, not-yet-done step.

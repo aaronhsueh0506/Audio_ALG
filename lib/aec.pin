@@ -1,0 +1,13 @@
+# Expected git commit of the AEC dependency's sole authoritative checkout, and the URL
+# `lib/deps.mk`'s `bootstrap-deps` clones it from when that checkout is missing. Valid as both
+# shell (`. lib/aec.pin`) and Make (`include lib/aec.pin`) -- `KEY=value`, `#` comments, no spaces
+# around `=`. `make -C pipelines check-pins` validates the checkout AEC_DIR actually resolves to
+# (default: the sibling SE/AEC/c_impl -- see lib/deps.mk) against AEC_COMMIT below.
+#
+# The `lib/aec` git submodule (`.gitmodules`) still exists and still builds; its gitlink is a
+# second, not-yet-authoritative record of the same dependency, checked by check-pins as a
+# step-5 "is the gitlink caught up with this pin" NOTE, never as the value a build is judged
+# against. Bump AEC_COMMIT in the same commit that bumps the gitlink, until step 5 (migrating the
+# gitlink itself) retires one of the two.
+AEC_COMMIT=d6a5898910785e575c096163544ceeb12b43f87f
+AEC_URL=https://github.com/aaronhsueh0506/AEC.git

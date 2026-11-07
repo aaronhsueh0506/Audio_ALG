@@ -505,7 +505,7 @@ resolve_producers ne10
 # dirty-publish policy itself is exercised in SP-S17). ALLOW_UNTRACKED_PUBLISH=1 rides along too, except on
 # SP-S17's deliberate policy-negative calls: the untracked dimension is a separate default refusal. DIST_ROOT stays
 # a throwaway scratch path: the real dist/ is never read, written or removed.
-make -s BACKEND=ne10 DIST_ROOT="$S7_DIST_ROOT" ALLOW_DIRTY_PUBLISH=1 ALLOW_UNTRACKED_PUBLISH=1 publish COMMON_LIB="$AC_LIB_" AEC_LIB="$AEC_LIB_" NR_LIB="$NR_LIB_" >/dev/null
+make -s BACKEND=ne10 DIST_ROOT="$S7_DIST_ROOT" ALLOW_DIRTY_PUBLISH=1 ALLOW_UNTRACKED_PUBLISH=1 publish COMMON_LIB="$AC_LIB_" AEC_LIB="$AEC_LIB_" NR_LIB="$NR_LIB_" AEC_DIR="$AEC_DIR" NR_DIR="$NR_DIR" COMMON_DIR="$COMMON_DIR" >/dev/null
 
 ne10_current_target="$(readlink "$S7_DIST_ROOT/ne10/current" || true)"
 [ -n "$ne10_current_target" ] && [ -d "$S7_DIST_ROOT/ne10/$ne10_current_target" ] && \
@@ -542,8 +542,8 @@ s7_attest="$(find "$S7_DIST_ROOT/ne10/current/ATTEST" -type f -name 'attest-*.tx
 # lock windows and both succeed. Either outcome is fine as long as `current`
 # ends up pointing at a COMPLETE, self-consistent release.
 S7_LOG_A="$SCRATCH_ROOT/s7/log_a"; S7_LOG_B="$SCRATCH_ROOT/s7/log_b"
-( make -s BACKEND=ne10 DIST_ROOT="$S7_DIST_ROOT" ALLOW_DIRTY_PUBLISH=1 ALLOW_UNTRACKED_PUBLISH=1 publish COMMON_LIB="$AC_LIB_" AEC_LIB="$AEC_LIB_" NR_LIB="$NR_LIB_" >"$S7_LOG_A" 2>&1 ) & cp1=$!
-( make -s BACKEND=ne10 DIST_ROOT="$S7_DIST_ROOT" ALLOW_DIRTY_PUBLISH=1 ALLOW_UNTRACKED_PUBLISH=1 publish COMMON_LIB="$AC_LIB_" AEC_LIB="$AEC_LIB_" NR_LIB="$NR_LIB_" >"$S7_LOG_B" 2>&1 ) & cp2=$!
+( make -s BACKEND=ne10 DIST_ROOT="$S7_DIST_ROOT" ALLOW_DIRTY_PUBLISH=1 ALLOW_UNTRACKED_PUBLISH=1 publish COMMON_LIB="$AC_LIB_" AEC_LIB="$AEC_LIB_" NR_LIB="$NR_LIB_" AEC_DIR="$AEC_DIR" NR_DIR="$NR_DIR" COMMON_DIR="$COMMON_DIR" >"$S7_LOG_A" 2>&1 ) & cp1=$!
+( make -s BACKEND=ne10 DIST_ROOT="$S7_DIST_ROOT" ALLOW_DIRTY_PUBLISH=1 ALLOW_UNTRACKED_PUBLISH=1 publish COMMON_LIB="$AC_LIB_" AEC_LIB="$AEC_LIB_" NR_LIB="$NR_LIB_" AEC_DIR="$AEC_DIR" NR_DIR="$NR_DIR" COMMON_DIR="$COMMON_DIR" >"$S7_LOG_B" 2>&1 ) & cp2=$!
 cr1=0; cr2=0
 wait "$cp1" || cr1=$?
 wait "$cp2" || cr2=$?
@@ -799,14 +799,19 @@ echo "# SP1: pipeline-level A->B->A (SIMD=1 -> SIMD=0 -> SIMD=1)"
 echo "############################################################"
 resolve_producers ne10 1
 ac_a="$AC_LIB_"; aec_a="$AEC_LIB_"; nr_a="$NR_LIB_"
-make -s BACKEND=ne10 SIMD=1 WERROR=0 all COMMON_LIB="$ac_a" AEC_LIB="$aec_a" NR_LIB="$nr_a" >/dev/null
-bd_a1="$(make -s BACKEND=ne10 SIMD=1 WERROR=0 print-bin-dir COMMON_LIB="$ac_a" AEC_LIB="$aec_a" NR_LIB="$nr_a")"
+# AEC_DIR=/NR_DIR=/COMMON_DIR= pinned explicitly to this script's own vars (the submodule paths,
+# matching resolve_producers' own query above): pipelines/Makefile's bare default changed to the
+# sibling AEC/NR dev checkouts (lib/deps.mk), and without this the $(AEC_LIB)/$(NR_LIB) FORCE
+# rules below would silently build/query the sibling instead of the submodule path resolve_producers
+# just resolved, two different directories agreeing only because their content happens to match.
+make -s BACKEND=ne10 SIMD=1 WERROR=0 all COMMON_LIB="$ac_a" AEC_LIB="$aec_a" NR_LIB="$nr_a" AEC_DIR="$AEC_DIR" NR_DIR="$NR_DIR" COMMON_DIR="$COMMON_DIR" >/dev/null
+bd_a1="$(make -s BACKEND=ne10 SIMD=1 WERROR=0 print-bin-dir COMMON_LIB="$ac_a" AEC_LIB="$aec_a" NR_LIB="$nr_a" AEC_DIR="$AEC_DIR" NR_DIR="$NR_DIR" COMMON_DIR="$COMMON_DIR")"
 m_a1="$(mtime "$bd_a1/aec_nr_pipeline")"
 
 resolve_producers ne10 0
 ac_b="$AC_LIB_"; aec_b="$AEC_LIB_"; nr_b="$NR_LIB_"
-make -s BACKEND=ne10 SIMD=0 WERROR=0 all COMMON_LIB="$ac_b" AEC_LIB="$aec_b" NR_LIB="$nr_b" >/dev/null
-bd_b="$(make -s BACKEND=ne10 SIMD=0 WERROR=0 print-bin-dir COMMON_LIB="$ac_b" AEC_LIB="$aec_b" NR_LIB="$nr_b")"
+make -s BACKEND=ne10 SIMD=0 WERROR=0 all COMMON_LIB="$ac_b" AEC_LIB="$aec_b" NR_LIB="$nr_b" AEC_DIR="$AEC_DIR" NR_DIR="$NR_DIR" COMMON_DIR="$COMMON_DIR" >/dev/null
+bd_b="$(make -s BACKEND=ne10 SIMD=0 WERROR=0 print-bin-dir COMMON_LIB="$ac_b" AEC_LIB="$aec_b" NR_LIB="$nr_b" AEC_DIR="$AEC_DIR" NR_DIR="$NR_DIR" COMMON_DIR="$COMMON_DIR")"
 
 # Final-guard snapshot, taken NOW -- both of the real-tree normal-config builds
 # this suite intends (SIMD=1 above, via S6/S7 and this scenario; SIMD=0 just
@@ -823,8 +828,8 @@ FINAL_GUARD_SNAPSHOT_BEFORE="$(final_guard_snapshot)"
 # distinguishable from m_a1, regardless of how close in wall-clock time the two
 # SIMD=1 builds land (a whole-second mtime comparison could otherwise false-PASS
 # a real, same-second relink).
-make -s BACKEND=ne10 SIMD=1 WERROR=0 all COMMON_LIB="$ac_a" AEC_LIB="$aec_a" NR_LIB="$nr_a" >/dev/null
-bd_a2="$(make -s BACKEND=ne10 SIMD=1 WERROR=0 print-bin-dir COMMON_LIB="$ac_a" AEC_LIB="$aec_a" NR_LIB="$nr_a")"
+make -s BACKEND=ne10 SIMD=1 WERROR=0 all COMMON_LIB="$ac_a" AEC_LIB="$aec_a" NR_LIB="$nr_a" AEC_DIR="$AEC_DIR" NR_DIR="$NR_DIR" COMMON_DIR="$COMMON_DIR" >/dev/null
+bd_a2="$(make -s BACKEND=ne10 SIMD=1 WERROR=0 print-bin-dir COMMON_LIB="$ac_a" AEC_LIB="$aec_a" NR_LIB="$nr_a" AEC_DIR="$AEC_DIR" NR_DIR="$NR_DIR" COMMON_DIR="$COMMON_DIR")"
 m_a2="$(mtime "$bd_a2/aec_nr_pipeline")"
 
 [ "$bd_a1" != "$bd_b" ] && pass "SP1: SIMD=1 and SIMD=0 builds land in different bin dirs" \
@@ -1343,7 +1348,7 @@ echo "############################################################"
 mkscratch sp11
 SP11_DIST_ROOT="$SCRATCH_ROOT/sp11/dist"
 resolve_producers ne10
-make -s BACKEND=ne10 DIST_ROOT="$SP11_DIST_ROOT" ALLOW_DIRTY_PUBLISH=1 ALLOW_UNTRACKED_PUBLISH=1 publish COMMON_LIB="$AC_LIB_" AEC_LIB="$AEC_LIB_" NR_LIB="$NR_LIB_" >/dev/null
+make -s BACKEND=ne10 DIST_ROOT="$SP11_DIST_ROOT" ALLOW_DIRTY_PUBLISH=1 ALLOW_UNTRACKED_PUBLISH=1 publish COMMON_LIB="$AC_LIB_" AEC_LIB="$AEC_LIB_" NR_LIB="$NR_LIB_" AEC_DIR="$AEC_DIR" NR_DIR="$NR_DIR" COMMON_DIR="$COMMON_DIR" >/dev/null
 
 id1="$(readlink "$SP11_DIST_ROOT/ne10/current" || true)"
 [ -n "$id1" ] && [ -d "$SP11_DIST_ROOT/ne10/$id1" ] && pass "SP-S11: publish v4 -- current symlink resolves to release dir '$id1'" \
@@ -1409,7 +1414,7 @@ snap_before="$(release_mtime_snapshot "$rel_dir")"
 # same-second case directly, forcing 20 publishes into one literal second via
 # ATTEST_STAMP=).
 S11_LOG="$SCRATCH_ROOT/sp11/republish.log"
-make -s BACKEND=ne10 DIST_ROOT="$SP11_DIST_ROOT" ALLOW_DIRTY_PUBLISH=1 ALLOW_UNTRACKED_PUBLISH=1 publish COMMON_LIB="$AC_LIB_" AEC_LIB="$AEC_LIB_" NR_LIB="$NR_LIB_" >"$S11_LOG" 2>&1
+make -s BACKEND=ne10 DIST_ROOT="$SP11_DIST_ROOT" ALLOW_DIRTY_PUBLISH=1 ALLOW_UNTRACKED_PUBLISH=1 publish COMMON_LIB="$AC_LIB_" AEC_LIB="$AEC_LIB_" NR_LIB="$NR_LIB_" AEC_DIR="$AEC_DIR" NR_DIR="$NR_DIR" COMMON_DIR="$COMMON_DIR" >"$S11_LOG" 2>&1
 if grep -q "already published (byte-verified" "$S11_LOG"; then
   pass "SP-S11: idempotent republish printed 'already published (byte-verified, incl. MANIFEST)'"
 else
@@ -1622,7 +1627,7 @@ echo "############################################################"
 mkscratch sp15
 SP15_DIST="$SCRATCH_ROOT/sp15/dist"
 resolve_producers ne10
-make -s BACKEND=ne10 DIST_ROOT="$SP15_DIST" ALLOW_DIRTY_PUBLISH=1 ALLOW_UNTRACKED_PUBLISH=1 publish COMMON_LIB="$AC_LIB_" AEC_LIB="$AEC_LIB_" NR_LIB="$NR_LIB_" >/dev/null
+make -s BACKEND=ne10 DIST_ROOT="$SP15_DIST" ALLOW_DIRTY_PUBLISH=1 ALLOW_UNTRACKED_PUBLISH=1 publish COMMON_LIB="$AC_LIB_" AEC_LIB="$AEC_LIB_" NR_LIB="$NR_LIB_" AEC_DIR="$AEC_DIR" NR_DIR="$NR_DIR" COMMON_DIR="$COMMON_DIR" >/dev/null
 sp15_id="$(readlink "$SP15_DIST/ne10/current" || true)"
 sp15_attest_dir="$SP15_DIST/ne10/$sp15_id/ATTEST"
 
@@ -1635,7 +1640,7 @@ for f in $sp15_before_list; do
 done
 
 for i in $(seq 1 20); do
-  make -s BACKEND=ne10 DIST_ROOT="$SP15_DIST" ALLOW_DIRTY_PUBLISH=1 ALLOW_UNTRACKED_PUBLISH=1 ATTEST_STAMP=20260715T999999Z publish COMMON_LIB="$AC_LIB_" AEC_LIB="$AEC_LIB_" NR_LIB="$NR_LIB_" >/dev/null
+  make -s BACKEND=ne10 DIST_ROOT="$SP15_DIST" ALLOW_DIRTY_PUBLISH=1 ALLOW_UNTRACKED_PUBLISH=1 ATTEST_STAMP=20260715T999999Z publish COMMON_LIB="$AC_LIB_" AEC_LIB="$AEC_LIB_" NR_LIB="$NR_LIB_" AEC_DIR="$AEC_DIR" NR_DIR="$NR_DIR" COMMON_DIR="$COMMON_DIR" >/dev/null
 done
 
 sp15_after_list="$(find "$sp15_attest_dir" -name 'attest-*.txt' | sort)"

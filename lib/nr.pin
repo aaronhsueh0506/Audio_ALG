@@ -1,0 +1,13 @@
+# Expected git commit of the NR dependency's sole authoritative checkout, and the URL
+# `lib/deps.mk`'s `bootstrap-deps` clones it from when that checkout is missing. Valid as both
+# shell (`. lib/nr.pin`) and Make (`include lib/nr.pin`) -- `KEY=value`, `#` comments, no spaces
+# around `=`. `make -C pipelines check-pins` validates the checkout NR_DIR actually resolves to
+# (default: the sibling SE/NR/c_impl -- see lib/deps.mk) against NR_COMMIT below.
+#
+# The `lib/nr` git submodule (`.gitmodules`) still exists and still builds; its gitlink is a
+# second, not-yet-authoritative record of the same dependency, checked by check-pins as a
+# step-5 "is the gitlink caught up with this pin" NOTE, never as the value a build is judged
+# against. Bump NR_COMMIT in the same commit that bumps the gitlink, until step 5 (migrating the
+# gitlink itself) retires one of the two.
+NR_COMMIT=f28e7c7dd27239b43205d14aacf59f9b9322b4b5
+NR_URL=https://github.com/aaronhsueh0506/CVNR.git

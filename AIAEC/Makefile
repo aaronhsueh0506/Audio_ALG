@@ -28,7 +28,10 @@ ifeq ($(WERROR),1)
 override CFLAGS += -Werror
 endif
 
-CPPFLAGS := -I. -IAlign_ULCNet -IDeepVQE_S -I../../audiolib/common/include -I../../audiolib/common
+# COMMON_DIR comes from the one shared lib/deps.mk (see lib/audiolib.pin): the sibling audiolib
+# dev checkout by default, still a caller-overridable `?=`.
+include ../lib/deps.mk
+CPPFLAGS := -I. -IAlign_ULCNet -IDeepVQE_S -I$(COMMON_DIR)/include -I$(COMMON_DIR)
 ifeq ($(SIMD),0)
 CPPFLAGS += -DSIMD_KERNELS_FORCE_SCALAR
 endif
@@ -45,7 +48,7 @@ endif
 BUILD_DIR := build
 # The same CC command can select a different SDK through PATH.
 # Include effective pointer/FP/ISA predefines to avoid cross-ABI cache reuse.
-override CC_TARGET_SIG := $(shell sh ../../audiolib/common/scripts/target_abi_signature.sh $(CC) $(CPPFLAGS) $(CFLAGS))
+override CC_TARGET_SIG := $(shell sh $(COMMON_DIR)/scripts/target_abi_signature.sh $(CC) $(CPPFLAGS) $(CFLAGS))
 CFG_SIG_PAYLOAD := CC_TARGET_SIG=$(CC_TARGET_SIG) CC=$(CC) AR=$(AR) CFLAGS=$(CFLAGS) CPPFLAGS=$(CPPFLAGS) SIMD=$(SIMD) WERROR=$(WERROR)
 CFG_SIG := $(shell printf '%s' "$(CFG_SIG_PAYLOAD)" | cksum | cut -d' ' -f1)
 OBJ_DIR := $(BUILD_DIR)/simd$(SIMD)-$(CFG_SIG)

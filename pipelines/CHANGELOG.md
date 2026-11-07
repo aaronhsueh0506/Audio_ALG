@@ -3,6 +3,71 @@
 `Audio_ALG/pipelines`（含它建置的 `AINR`、`AIAEC` C 程式）的重要改動記錄在此，格式依
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/)。README 只寫現況，改動經過寫在這裡。
 
+## [Unreleased] — 2026-11-07 — Dependency path convergence, stage 0-1: one lib/deps.mk, three lib/*.pin
+
+Stages 0-1 of a 6-stage split-into-lib/{ainr,aiaec}+stream/ plan (stage 2, the actual file move, is
+a later, separate pass). This pass only converges where AEC/NR/audiolib are read from and how each
+is pinned; no model source moved.
+
+### Added
+- `lib/deps.mk`: the one place `AEC_DIR`/`NR_DIR`/`AUDIOLIB_DIR`/`COMMON_DIR` are resolved, included
+  by `pipelines/Makefile`, `pipelines/4ch_aec_bf_nr_res/Makefile`, `AINR/Makefile`,
+  `AINR/RNNoise-ERB/Makefile` and `AIAEC/Makefile`. Default changed from the `lib/aec`/`lib/nr`
+  submodule checkouts to the sibling dev checkouts (`../AEC/c_impl`, `../NR/c_impl`; audiolib was
+  already sibling-resolved) — the "recommended sole dev working directory" for each dependency.
+  Every value stays a caller-overridable `?=`; `AEC_DIR=lib/aec/c_impl NR_DIR=lib/nr/c_impl` still
+  builds against the submodules. Two extra targets: `bootstrap-deps` (clone whichever sibling is
+  missing, at its pinned commit, from an overridable URL) and `check-deps-pins` (report, not
+  enforce, each pin against its resolved checkout and against the two gitlinks).
+- `lib/aec.pin`, `lib/nr.pin`: pinned commit + bootstrap URL for AEC and NR, the same shape
+  `pipelines/audiolib.pin` already had (now `lib/audiolib.pin`, moved, same value — see Removed).
+  Each dependency has exactly one authoritative pinned version, read from one place, instead of
+  `lib/aec`'s/`lib/nr`'s gitlink being the only record.
+
+### Changed
+- `pipelines/Makefile`'s `check-pins`: now checks `AEC_DIR`/`NR_DIR`/`AUDIOLIB_DIR` — the checkout
+  that actually resolved for this build — against `lib/aec.pin`/`lib/nr.pin`/`lib/audiolib.pin`,
+  and fails on a mismatch there. The `lib/aec`/`lib/nr` gitlinks are reported as a NOTE only (the
+  step-5 "gitlink migration" readiness gate), never failed on, since they are no longer what a
+  default build reads.
+- `AIAEC/Makefile`'s hardcoded `../../audiolib/common` (`CPPFLAGS`, the `target_abi_signature.sh`
+  call) now reads `$(COMMON_DIR)` from `lib/deps.mk`.
+- `pipelines/tests/pyc_parity_pipelines.sh`: `aec`/`nr` archive-path queries and the driver's `-I`
+  flags, previously hardcoded to `$ALG/lib/aec/c_impl` / `$ALG/lib/nr/c_impl`, now use
+  `$AEC_DIR`/`$NR_DIR` from `lib/deps.mk print-deps-sh` — the same resolution the `aec_nr_pipeline`
+  build two lines above it already uses, so the driver links against the archive the build actually
+  produced instead of a second, independently-hardcoded path that would silently diverge from it.
+- `pipelines/scripts/test_build_isolation.sh`: this script's own `$AEC_DIR`/`$NR_DIR`/`$COMMON_DIR`
+  (set once, near the top, to the submodule/sibling-audiolib paths, used by its `resolve_producers`
+  helper) were never the problem by themselves, but 13 real-tree `make ... COMMON_LIB=/AEC_LIB=/
+  NR_LIB=...` invocations (SP1's `all`/`print-bin-dir` pair ×3, and S7's/SP-S11's/SP-S15's `publish`
+  ×7) resolved those archive paths via this script's own vars and then built/published *without*
+  re-passing `AEC_DIR=`/`NR_DIR=`/`COMMON_DIR=`, relying on `pipelines/Makefile`'s bare default to
+  agree with the script's own choice. That default is exactly what this pass changed (submodule ->
+  sibling), so left alone these 13 calls would have started resolving the `$(AEC_LIB)`/`$(NR_LIB)`
+  FORCE rules (and, for `publish`, the git-dirty/identity checks) against the sibling while the
+  archive path and the script's own invariants stayed keyed to the submodule -- the exact
+  divergence this pass already found and fixed once in `pyc_parity_pipelines.sh`. Fixed by adding
+  the explicit `AEC_DIR="$AEC_DIR" NR_DIR="$NR_DIR" COMMON_DIR="$COMMON_DIR"` to each of the 13
+  calls, restoring self-consistency with `resolve_producers`. The suite was read in full for this
+  class of issue and this fix was applied surgically (no other line changed); it was **not run**
+  end-to-end in this pass -- it is a long-running suite with its own heavy, carefully-documented
+  safety contract (scratch roots, sentinel snapshots of four to six real trees, a cross-process
+  lock) that a partial or rushed run risks tripping or desyncing. Running it to green is a
+  follow-up, not a claim made here.
+
+### Removed
+- `pipelines/audiolib.pin` → moved to `lib/audiolib.pin` (same `AUDIOLIB_COMMIT`, not a new pin;
+  sits beside `lib/aec.pin`/`lib/nr.pin` now instead of alone next to two unpinned gitlinks).
+
+### Not done this pass (deliberate)
+- `.gitmodules` and the `lib/aec`/`lib/nr` gitlink commits are untouched (step 5 of the proposal):
+  owner review of steps 0-1's result comes first. `check-deps-pins`/`check-pins`'s gitlink NOTE is
+  the readiness signal for that review, not an instruction to act on it here.
+- `pipelines/scripts/audit_fp_contract.sh` / `audit_dead_defines.sh` were read but left alone: both
+  only ever needed `COMMON_DIR`, already sibling-resolved before this pass. `test_build_isolation.sh`
+  needed and got a scoped fix -- see Changed above -- but was not run end-to-end.
+
 ## [Unreleased] — 2026-11-06 — The AI model libraries are frequency domain only, take run-time grids and caller memory; the pipelines follow
 
 The model libraries (`AINR`, `AIAEC`) lose everything that is not the model's own pre/post arithmetic, and the DFN and ULCNet pipeline

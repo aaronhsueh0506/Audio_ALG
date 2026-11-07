@@ -1,5 +1,12 @@
 # 開發指南
 
+> **2026-11 起的預設建置來源**：`AEC_DIR`/`NR_DIR`/`AUDIOLIB_DIR`/`COMMON_DIR` 由共用的
+> `lib/deps.mk` 解析，預設指向本倉庫旁的開發用 checkout `../AEC`、`../NR`、`../audiolib`（對應
+> `lib/aec.pin`/`lib/nr.pin`/`lib/audiolib.pin` 鎖定的 commit），不再是下面 `lib/aec`/`lib/nr`
+> submodule 的 checkout。下面這一節描述的 submodule 操作流程仍然有效、submodule 仍可獨立建置
+> （`make AEC_DIR=lib/aec/c_impl NR_DIR=lib/nr/c_impl ...`），只是不再是預設路徑；兩個 gitlink 何時
+> 真正移除是另一個待裁定的步驟（step 5），`check-pins` 目前只回報兩者是否已同步，不會因此失敗。
+
 ## Submodule 管理
 
 ### 日常開發流程
@@ -39,9 +46,9 @@ git commit -m "pin: NR to version xxx"
 
 | 目錄 | 說明 |
 |------|------|
-| `lib/nr/` | NR submodule（`.gitmodules` 中的遠端 repository 名稱為 CVNR） |
-| `lib/aec/` | AEC submodule |
-| `../audiolib/common/` | 共用層，非 submodule；預期 commit 記在 `pipelines/audiolib.pin`，`make -C pipelines check-pins` 驗證；`publish` 也會在建置 artifact 前強制檢查 |
+| `lib/nr/` | NR submodule（`.gitmodules` 中的遠端 repository 名稱為 CVNR）；gitlink 仍存在且可獨立建置，但預設建置已改走 `../NR`（見下） |
+| `lib/aec/` | AEC submodule；同上，預設建置已改走 `../AEC` |
+| `../AEC/`、`../NR/`、`../audiolib/common/` | AEC、NR 的開發用 checkout 與共用 FFT/fast-math/SIMD 層，皆非 submodule；預設建置來源（`lib/deps.mk` 解析 `AEC_DIR`/`NR_DIR`/`COMMON_DIR`，可用 `AEC_DIR=`/`NR_DIR=`/`COMMON_DIR=` 覆寫回 submodule 路徑）。預期 commit 分別記在 `lib/aec.pin`、`lib/nr.pin`、`lib/audiolib.pin`，`make -C pipelines check-pins` 驗證（含對兩個 submodule gitlink 的 step-5 就緒度提示）；`publish` 也會在建置 artifact 前強制檢查 |
 | `AINR/` | standalone AI noise reduction models |
 | `AIAEC/` | neural AEC candidate models and dataset |
 | `shared/` | 共享工具代碼 |
