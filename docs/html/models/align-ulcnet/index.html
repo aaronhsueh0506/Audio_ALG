@@ -1,0 +1,40 @@
+<!doctype html>
+<html lang="zh-Hant">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Align-ULCNet · Audio_ALG</title>
+<link rel="stylesheet" href="../../manual.css">
+</head>
+<body>
+<nav aria-label="導覽"><a href="../../index.html">Audio_ALG</a> / <a href="../index.html">模型開發與部署</a></nav>
+<main>
+<h1>Align-ULCNet</h1>
+<p>輸入是線性 AEC 的 error hop 與原始 far 參考。使用 <code>ulcnet_stream_pre_process_f32()</code> 可把 <code>AecResContext.formed_hop</code> 直接交給 STFT。兩路都是滿幅約 1.0 的 float，輸出是 int16 PCM。原生 int16 輸入可改呼叫 <code>ulcnet_stream_pre_process()</code>。</p><h2>建置與初始化</h2><pre><code>make -C stream/aiaec/ulcnet lib
+make -s -C stream/aiaec/ulcnet print-lib-path</code></pre><p>依模型建立 grid 與 config，用 <code>ulcnet_stream_get_mem_size()</code> 查詢 pool 大小與對齊，再配置 pool。以同一目標工具鏈建置並連結模型 archive 和 audiolib 的 <code>libaudio_common.a</code>。裝置 runtime 載入與 grid 相符的模型檔，負責每次 NPU 推論。</p>
+
+<h2>每 hop 呼叫</h2><p>範例中的讀寫、<code>run_accelerator</code> 與 <code>device_state_*</code> 由呼叫端實作。裝置第一次使用或 generation 改變時，把 recurrent state 還原為模型的量化零值。推論已開始後回錯，也立刻清掉可能部分寫入的裝置 state。</p><pre><code>UlcnetStream *ctx = ulcnet_stream_init(&amp;cfg, pool, bytes);
+if (!ctx) return -1;
+while (read_aec_hop(&amp;rctx, far_float, &amp;delay)) {
+    UlcnetHopIO io;
+    int pre = ulcnet_stream_pre_process_f32(ctx, rctx.formed_hop, far_float, delay, &amp;io);
+    if (pre &lt; 0) return -1;
+    int rc = 0;
+    if (pre == 1) {
+        device_state_sync(io.state_generation);
+        rc = run_accelerator(&amp;io.inputs, &amp;io.outputs);
+        if (rc != 0) device_state_refill_zero();
+    }
+    if (ulcnet_stream_post_process(ctx, rc, pcm_out) &lt; 0) return -1;
+    write_hop(pcm_out);
+}</code></pre><p><code>UlcnetStreamDelay.changed</code> 或 <code>solid</code> 從上一拍的假轉為真，會在分析前清除 STFT、ISTFT 與模型狀態，並安排一拍 reprime。該拍 pre 回 0，照常呼叫 post。Reprime 或推論失敗時，當拍線性誤差頻譜直接送入合成。init／reset 後第一個 ISTFT hop 的 PCM 填零。</p>
+
+<h2>參考</h2>
+<ul>
+<li><a href="reference/core.html">頻域整合、模型張量與狀態</a></li>
+<li><a href="../../../../stream/aiaec/ulcnet/ulcnet_stream.h">PCM SDK 公開標頭</a></li>
+<li><a href="../../../../AIAEC/Align_ULCNet/README.md">訓練與匯出</a></li>
+</ul>
+</main>
+</body>
+</html>

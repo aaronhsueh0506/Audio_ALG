@@ -2,8 +2,7 @@
 
 DFN3 band-split implementation alongside DFN2 cascade/alpha for controlled
 comparison. This custom port uses the current AINR training, calibration, ONNX
-and audiolib C interfaces. Release history is in
-[`../CHANGELOG.md`](../CHANGELOG.md).
+and audiolib C interfaces. For deployment, see the [DFN3 frequency-domain core](../../docs/html/models/dfn3/index.html).
 
 ## Architecture and comparison contract
 
@@ -48,7 +47,7 @@ the streaming C timing reference.
 are independent and part of the trained contract (`config.ini [model]`; a
 checkpoint is refused under another pair). All 15 pairs export and run; (1,1)
 is the shipped one. The shared rules (window, guards, tests) are in
-[`../README.md`](../README.md#lookahead-pairs-deepfilternet2-and-deepfilternet3).
+[shared DFN lookahead contract](../reference/training.md#dfn-lookahead).
 Specific to DFN3:
 
 - DFN3 is a parallel split: the deep filter reads the raw spectrum, so output
@@ -153,7 +152,7 @@ dfn3_prepost_get_mem_size(&cfg, &req);                              /* then a 16
 DFN3Prepost *p = dfn3_prepost_init_ex(pool, (size_t)req.bytes, &cfg, &req);
 ```
 
-The per-hop order is DFN2's (see [`../DeepFilterNet2/README.md`](../DeepFilterNet2/README.md#calling-the-library)) with the `dfn3_`
+The per-hop order is DFN2's (see [`../DeepFilterNet2/README.md`](../DeepFilterNet2/reference/frequency-api.md#calling-the-library)) with the `dfn3_`
 names: `ac_stft_push_planar()`, `dfn3_prepost_pre_process_freq()` (1 on every hop), `frame_open()`, the model, `frame_finish()`
 (`frame_bypass()` on a refusal), then `dfn3_prepost_post_process_freq()` and `ac_istft_push_planar()` on every hop (the zero
 spectrum before the first output yields zeros); `dfn3_model_run_frame()` wraps the middle three. DFN3 has no `frames_per_call`. The

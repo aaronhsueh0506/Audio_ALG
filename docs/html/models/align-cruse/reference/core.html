@@ -1,0 +1,145 @@
+<!doctype html>
+<html lang="zh-Hant">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Align-CRUSE 頻域與模型契約 · Audio_ALG</title>
+<link rel="stylesheet" href="../../../manual.css">
+</head>
+<body>
+<nav aria-label="導覽"><a href="../../../index.html">Audio_ALG</a> / <a href="../../index.html">模型開發與部署</a> / <a href="../index.html">Align-CRUSE</a></nav>
+<main>
+<h1>Align-CRUSE 頻域與模型契約</h1>
+<details><summary>本頁目錄</summary>
+<ul>
+<li><a href="#section-2">Block diagram</a></li>
+<li><a href="#section-3">訊號泳道圖</a></li>
+<li><a href="#section-4">I/O 表</a></li>
+<li><a href="#section-5">State 表</a></li>
+<li><a href="#section-6">延遲與 warm-up</a></li>
+<li><a href="#section-7">函式清單：公開 vs 內部</a></li>
+<li><a href="#section-8">參數表</a></li>
+</ul></details>
+<h2 id="section-1">參考</h2>
+<ul>
+<li><a href="../index.html">Align-CRUSE 整合入口</a></li>
+<li><a href="../../../../../lib/aiaec/align_cruse/align_cruse_process.h">頻域 C 標頭</a></li>
+<li><a href="../../../../../AIAEC/Align_CRUSE/README.md">模型設定與範例</a></li>
+</ul>
+
+<h2 id="section-2">Block diagram</h2>
+<pre>mic ──► StreamSTFT ──► [B,1,257] cplx      far ──► StreamSTFT ──► [B,1,257] cplx
+              │                                        │
+        log_power_feature                        log_power_feature
+              ▼                                        ▼
+  state["mic1"].step (CausalConvBlock 16ch)   state["far1"].step (8ch)
+              ▼                                        ▼
+  state["mic2"].step (40ch)  m2 [B,40,1,65]   state["far2"].step (24ch)  f2 [B,24,1,65]
+              │                                        │
+              └────────► state["align"].step(m2, f2) ◄─┘
+                          (GlobalDelayAttentionCell：K/V ring 63、
+                           score_sum cumsum 積分、frame_index 計數)
+                          │ aligned [B,24,1,65], delay [B,63]
+              ┌───────────┘
+              ▼ cat(m2, aligned) [B,64,1,65]
+  state["mic3"].step (72ch) → state["mic4"].step (32ch)  m4 [B,32,1,17]
+              ▼ reshape [B,1,544]
+  state["gru"].step (GRU 192) → gru_out (Linear) → [B,32,1,17]
+              ▼ (+ skip4/3/2/1 各 1x1 conv)
+  up3 → up2 → up1 (FrequencyTransposeBlock, 1x3 stride-2 freq, time kernel 1)
+              ▼
+  mask_up → sigmoid → mask·mask_gain.clamp_min(0)  mask [B,1,257] float
+              ▼
+  enhanced = microphone × mask ──► StreamISTFT ──► 256 samples</pre>
+
+<h2 id="section-3">訊號泳道圖</h2>
+<pre>hop（256 smp = 16 ms @16k）  h0          h1                h2         h3       …  flush
+caller（送樣本）             mic/far 256  256               256        256         —
+前處理：StreamSTFT×2          0 幀        F0+F1（reflect    F2         F3          尾幀
+（centered sqrt-Hann）                    前綴湊滿後補發）
+NN：forward_stream           —           out(F0), out(F1)  out(F2)    out(F3)     每尾幀 1 out
+（delay 0；同 invocation 出幀）
+後處理：StreamISTFT          —           out(F0)→0 smp     256 smp    256 smp     尾段補齊
+（WOLA + 半窗 trim）                      out(F1)→256 smp
+輸出樣本對應輸入區間         —           [0,256)           [256,512)  [512,768)
+hop-lag：端到端 256 samples（16 ms）＝ centered 半窗 lookahead；NN 本身 0 hop。</pre>
+
+<h2 id="section-4">I/O 表</h2>
+<p>Streaming（每 invocation 恰 1 幀 = 256 個新 samples；<code>inference.py</code>
+開機打印之實測，B=1、16k）：</p>
+<table>
+<tr><th>tensor</th><th>方向</th><th>shape</th><th>dtype</th><th>幀/invocation</th><th>time-domain samples</th></tr>
+<tr><td>mic</td><td>in</td><td>(1, 1, 257)</td><td>complex64</td><td>1</td><td>256 新樣本</td></tr>
+<tr><td>far</td><td>in</td><td>(1, 1, 257)</td><td>complex64</td><td>1</td><td>256 新樣本</td></tr>
+<tr><td>output</td><td>out</td><td>(1, 1, 257)</td><td>complex64</td><td>1</td><td>WOLA 後 256</td></tr>
+<tr><td>mask（real magnitude）</td><td>out</td><td>(1, 1, 257)</td><td>float32</td><td>1</td><td>—</td></tr>
+<tr><td>delay_distribution</td><td>out</td><td>(1, 1, 63)</td><td>float32</td><td>1</td><td>—</td></tr>
+</table>
+<p>Offline <code>forward(microphone, far_end)</code>：complex <code>[B,T,257]</code> in/out；
+<code>causal_running</code> 時 delay 為 <code>[B,T,63]</code>、<code>paper_global</code> 時為
+<code>[B,63]</code>（test：<code>test_align_cruse_paper_global_mode_is_explicitly_available</code>）。</p>
+
+<h2 id="section-5">State 表</h2>
+<p><code>state_report</code> 實測（B=1 fp32，total <b>559.2 KB</b>；conv window 是完整 window,含新的一幀）。graph boundary 上每個 state 都是 rank 4：<code>score_sum</code> 為 <code>(1,1,1,63)</code>、<code>frame_index</code> 為 <code>(1,1,1,1)</code> int64、<code>h_gru</code> 為 <code>(1,1,1,192)</code>。部署契約：顯式
+state I/O，由 host caller 保存；STFT/ISTFT 狀態屬應用端以 audiolib 建立的 <code>AcStft</code>／<code>AcIstft</code>：</p>
+<table>
+<tr><th>state</th><th>shape</th><th>size</th><th>保存者（部署契約）</th></tr>
+<tr><td>align.key_ring</td><td>(1, 64, 63, 1)</td><td>15.8 KB</td><td>host caller（顯式 graph I/O）</td></tr>
+<tr><td>align.value_ring</td><td>(1, 24, 63, 65)</td><td>383.9 KB</td><td>host caller（顯式 graph I/O）</td></tr>
+<tr><td>align.score_sum（cumsum 積分器）</td><td>(1, 63)</td><td>0.2 KB</td><td>顯式 fp32 state I/O；不得整數 PTQ</td></tr>
+<tr><td>align.frame_index（絕對幀計數）</td><td>scalar int64 tensor</td><td>8</td><td>顯式 int64 state I/O；不得量化</td></tr>
+<tr><td>mic1.window</td><td>(1, 1, 4, 257)</td><td>4.0 KB</td><td>host caller（顯式 graph I/O）</td></tr>
+<tr><td>mic2.window</td><td>(1, 16, 4, 129)</td><td>32.2 KB</td><td>host caller（顯式 graph I/O）</td></tr>
+<tr><td>mic3.window</td><td>(1, 64, 4, 65)</td><td>65.0 KB</td><td>host caller（顯式 graph I/O）</td></tr>
+<tr><td>mic4.window</td><td>(1, 72, 4, 33)</td><td>37.1 KB</td><td>host caller（顯式 graph I/O）</td></tr>
+<tr><td>far1.window</td><td>(1, 1, 4, 257)</td><td>4.0 KB</td><td>host caller（顯式 graph I/O）</td></tr>
+<tr><td>far2.window</td><td>(1, 8, 4, 129)</td><td>16.1 KB</td><td>host caller（顯式 graph I/O）</td></tr>
+<tr><td>h_gru（gru.hidden）</td><td>(1, 1, 192)</td><td>0.8 KB</td><td>host caller（顯式 graph I/O）</td></tr>
+<tr><td><b>NN 合計</b></td><td></td><td><b>559.2 KB</b></td><td></td></tr>
+<tr><td>STFT×2 / ISTFT 狀態</td><td>—</td><td>—</td><td>應用端的 <code>AcStft</code>×2／<code>AcIstft</code>（Python reference：host）</td></tr>
+</table>
+
+<h2 id="section-6">延遲與 warm-up</h2>
+<ul>
+<li>NN 演算法 lookahead = <b>0 hop</b>；framing 半窗 256 samples（16 ms）。</li>
+<li><b>T ≥ D caveat</b>（forward_stream docstring 明文）：offline 用<b>最終 utterance 長度
+T</b> 做 <code>arange(D) &lt; T</code> 的 observable mask，stream 無法預知 T，因此假設
+T ≥ D。utterance ≥ 63 hops（1 s @16k）時<b>每一幀</b>（含前 63 幀）精確等價：實測
+T=90 全幀 stream-vs-offline enhanced 4.9e-7 / mask 1.8e-7 / delay 3.3e-7（ATOL 釘 5e-6）。
+整段 &lt; 63 幀的短檔<b>刻意發散</b>：專屬測試 T=30 差 &gt; 1e-3
+（<code>test_short_utterance_below_delay_window_differs</code>）。</li>
+<li><code>paper_global</code> checkpoint 不可串流，必須以 <code>causal_running</code> 重訓。</li>
+<li>startup 前 D 幀的 softmax 含未觀測（score=0）delay 候選——這是 offline 訓練語意
+本身，非 streaming 造成（見 <code>AIAEC/aiaec_common.py</code> 的 <code>GlobalDelayAttention</code>）。</li>
+</ul>
+
+<h2 id="section-7">函式清單：公開 vs 內部</h2>
+<div class="tbl"><table>
+<tr><th>分類</th><th>名稱</th></tr>
+<tr><td><b>公開（Python）</b></td><td><code>AIAEC.Align_CRUSE.inference.load_model</code>、<code>AlignCRUSE.create_stream_state</code>、<code>AlignCRUSE.forward_stream</code>、<code>AIAEC.aiaec_streaming.StreamSTFT</code>／<code>StreamISTFT</code>、<code>export_onnx.py</code>／<code>inference.py</code>（含 <code>calib</code>）兩個命令列入口</td></tr>
+<tr><td><b>公開（C，可用零件）</b></td><td><code>aiaec_apply_real_mask</code>（<code>align_cruse_process.h</code>）；audiolib <code>ac_stft_*</code>／<code>ac_istft_*</code>、<code>ac_window_build</code></td></tr>
+<tr><td><b>內部</b></td><td>底線開頭的模組（<code>_cli_common.py</code>、<code>_streaming_export.py</code>、<code>_streaming_calibration.py</code> 等）是實作細節，不是命令列入口；<code>aiaec_streaming.py</code> 的 cell 類別（<code>GlobalDelayAttentionCell</code> 等）與 <code>AlignCRUSE.forward</code>（整段版）供測試與訓練使用</td></tr>
+</table></div>
+
+<h2 id="section-8">參數表</h2>
+<h3>外部：第三方可調</h3>
+<div class="tbl"><table>
+<tr><th>名稱</th><th>位置</th><th>範圍</th><th>預設</th><th>何時設定</th><th>說明</th></tr>
+<tr><td><code>alignment_mode</code></td><td><code>config.ini [model]</code>、<code>AlignCRUSE(...)</code></td><td><code>causal_running</code>／<code>paper_global</code></td><td><code>causal_running</code></td><td>訓練</td><td>部署只能用 <code>causal_running</code>（逐幀只用過去證據）；<code>paper_global</code> 整段非因果，不可串流</td></tr>
+<tr><td><code>max_delay_seconds</code></td><td><code>AlignCRUSE(...)</code></td><td>秒</td><td>1.0（16 kHz 上 D = 63）</td><td>訓練（config.ini [model] 內為註解掉的建構子預設值 1.0，取消註解即可覆寫）</td><td>delay 搜尋範圍；D 數的是 hop，grid 改了 D 就不同</td></tr>
+<tr><td><code>--max-delay-frames</code>、<code>--opset</code>(17)、<code>--verify</code></td><td><code>export_onnx.py</code></td><td>D</td><td>checkpoint 的 D</td><td>匯出</td><td>D 與 calibration、板端 state 配置須一致</td></tr>
+<tr><td>位置參數、<code>--device</code>、<code>--verify</code>、<code>--mic-dir</code>／<code>--ref-dir</code>／<code>--out-dir</code></td><td><code>inference.py</code></td><td>—</td><td>—</td><td>離線推論</td><td>見上方 A</td></tr>
+<tr><td><code>calib</code>：<code>--checkpoint</code>／<code>--primary-dir</code>／<code>--far-dir</code>／<code>--output</code>／<code>--format</code>(bin|npz)／<code>--frames</code>(256)／<code>--max-delay-frames</code>／<code>--seed</code>(42)／<code>--onnx</code>／<code>--pair-replace</code></td><td><code>inference.py calib</code></td><td>—</td><td>—</td><td>PTQ 校正</td><td>primary 為 mic WAV；同 process 匯出並 parity 檢查 graph；需連續錄音</td></tr>
+</table></div>
+<h3>內部：存在且可改，但不建議開放</h3>
+<div class="tbl"><table>
+<tr><th>名稱</th><th>值</th><th>位置</th><th>不開放的原因</th></tr>
+<tr><td><code>projection_size</code>、<code>gru_hidden</code></td><td>64、192</td><td><code>AlignCRUSE(...)</code></td><td>權重形狀；為對應論文 0.75 M class 的重建選擇，寫進 checkpoint contract</td></tr>
+<tr><td>encoder／decoder 通道數、<code>4x3</code> 因果 conv、頻率 stride-2</td><td>mic 16,40,72,32；far 8,24；decoder 32,48,48</td><td><code>model.py</code></td><td>拓撲決定所有 state 形狀</td></tr>
+<tr><td>grid</td><td>16 kHz，512/512/256</td><td><code>config.ini [signal]</code>、checkpoint contract</td><td>checkpoint 內記錄完整 grid，推論遇到不相容設定直接拒絕</td></tr>
+<tr><td>state 精度政策</td><td><code>state_align_score_sum</code>＝float32 不量化；<code>state_align_frame_index</code>＝int64 不量化</td><td><code>_streaming_export.py</code></td><td>score 是無衰減累加器，沒有任何有限長校正錄音能決定與部署時長無關的 int8 範圍</td></tr>
+<tr><td>訓練配方（Adam 1.5e-4、PLCPA c = 0.3 β = 0.7、50 epoch）</td><td>—</td><td><code>config.ini</code>、<code>AIAEC/README.md</code></td><td>換 loss 即換 <code>loss_version</code>，舊 checkpoint 會被拒絕續訓</td></tr>
+</table></div>
+</main>
+</body>
+</html>

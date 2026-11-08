@@ -58,11 +58,13 @@ NR_DIR      ?= $(NR_REPO_DIR)/c_impl
 COMMON_DIR  ?= $(abspath $(AUDIO_ALG_ROOT)/../audiolib/common)
 
 # Shared by every includer that forwards its own toolchain/flag choices to a COMMON_DIR (or other
-# producer) sub-make, instead of each one spelling out the same CC/CXX/EXTRA_CFLAGS/WERROR list --
-# a plain variable, lazily expanded at the point of use, so it costs nothing to a Makefile that
-# never references it and picks up whatever CC/CXX/EXTRA_CFLAGS/WERROR that Makefile has assigned
-# by the time it's actually used (definition order relative to this `include` doesn't matter).
-TOOLCHAIN_FWD = CC='$(CC)' CXX='$(CXX)' EXTRA_CFLAGS='$(EXTRA_CFLAGS)' WERROR=$(WERROR)
+# producer) sub-make, instead of each one spelling out the same CC/CXX/AR/RANLIB/EXTRA_CFLAGS/
+# WERROR list -- a plain variable, lazily expanded at the point of use, so it costs nothing to a
+# Makefile that never references it and picks up whatever values that Makefile has assigned by the
+# time it's actually used (definition order relative to this `include` doesn't matter). AR/RANLIB
+# matter for a cross build: without them the producer's own Makefile falls back to its own AR/
+# RANLIB default (the host archiver), which a cross toolchain's .a output cannot link against.
+TOOLCHAIN_FWD = CC='$(CC)' CXX='$(CXX)' AR='$(AR)' RANLIB='$(RANLIB)' EXTRA_CFLAGS='$(EXTRA_CFLAGS)' WERROR=$(WERROR)
 
 # Shared by every includer that needs the audiolib common archive's path: resolves COMMON_LIB via
 # a sub-make (forwarding BACKEND/SIMD/TOOLCHAIN_FWD, which the caller must already have set) and
@@ -115,39 +117,46 @@ print-deps-sh:
 # retry clones again instead of trusting a half-finished checkout.
 #
 # Two concurrent `bootstrap-deps` runs (two build jobs, or this and a sub-make's own forwarded
-# call) both installing the SAME not-yet-existing DIR would otherwise both pass the `[ -d DIR ]`
+# call) both installing the SAME not-yet-existing DIR would otherwise both pass a plain `[ -d DIR ]`
 # check, both clone+checkout successfully, and then race on `mv stage DIR`: whichever `mv` runs
 # second finds DIR already exists (the first `mv` having just created it) and -- `mv` onto an
 # existing, non-empty directory moves the SOURCE *inside* it, it does not replace it or fail --
 # silently leaves a second, untracked, nested checkout at DIR/$(basename stage) (confirmed: this
 # is exactly what reproduces). Each of the three installs below is therefore serialized by its own
-# mkdir-based lock (mkdir is atomic across processes on every POSIX filesystem this targets) and
-# re-checks `[ -d DIR ]` only AFTER acquiring it, not before -- a loser of the race then correctly
-# sees the winner's now-finished DIR and reports "already exists", instead of still racing it.
-BOOTSTRAP_LOCK_WAIT = @lock='$(2).bootstrap-lock'; tries=0; \
-	while ! mkdir "$$lock" 2>/dev/null; do \
-	  if [ ! -d "$$lock" ]; then \
-	    echo "bootstrap-deps: FAIL could not create lock directory $$lock (not contention -- \
-the lock itself doesn't exist; check the parent directory exists and is writable)" >&2; \
-	    exit 1; \
-	  fi; \
-	  tries=$$((tries + 1)); \
-	  if [ "$$tries" -ge 1800 ]; then \
-	    echo "bootstrap-deps: FAIL could not acquire $$lock after 30 minutes (another bootstrap-deps stuck on a very slow clone, or a crashed one left the lock behind -- remove it by hand if so)" >&2; \
-	    exit 1; \
-	  fi; \
-	  sleep 1; \
-	done; \
-	trap 'rmdir "$$lock" 2>/dev/null' EXIT; \
-	if [ -d '$(2)' ]; then \
+# mkdir-based lock (mkdir is atomic across processes on every POSIX filesystem this targets), but
+# only when DIR doesn't already exist -- an already-prepared dependency reports and returns without
+# ever touching the lock, so a read-only parent directory (lock creation impossible, but nothing
+# needs creating) doesn't fail a build that has nothing to bootstrap. Once in the lock, `[ -d DIR ]`
+# is re-checked AFTER acquiring it, not before -- a loser of the race then correctly sees the
+# winner's now-finished DIR and reports "already exists", instead of still racing it. A failed
+# `mkdir` is always retried (up to the 30-minute timeout below) rather than diagnosed by whether the
+# lock directory is momentarily absent: that absence is indistinguishable from "the winner just
+# released it" (confirmed: widening this exact window turned most concurrent runs into false
+# failures), so only sustained failure to acquire the lock -- not a single missing instant -- is
+# reported as stuck/misconfigured.
+BOOTSTRAP_LOCK_WAIT = @if [ -d '$(2)' ]; then \
 	  echo "bootstrap-deps: $(1) checkout $(2) already exists, left alone"; \
 	else \
-	  echo "bootstrap-deps: cloning $(1) $(4) from $(3) -> $(2)"; \
-	  stage='$(2).bootstrap-staging.'"$$$$"; rm -rf "$$stage"; \
-	  if git clone --quiet '$(3)' "$$stage" && git -C "$$stage" checkout --quiet '$(4)'; then \
-	    mv "$$stage" '$(2)'; \
+	  lock='$(2).bootstrap-lock'; tries=0; \
+	  while ! mkdir "$$lock" 2>/dev/null; do \
+	    tries=$$((tries + 1)); \
+	    if [ "$$tries" -ge 1800 ]; then \
+	      echo "bootstrap-deps: FAIL could not acquire $$lock after 30 minutes (another bootstrap-deps stuck on a very slow clone, a crashed one left the lock behind -- remove it by hand if so -- or the parent directory is not writable)" >&2; \
+	      exit 1; \
+	    fi; \
+	    sleep 1; \
+	  done; \
+	  trap 'rmdir "$$lock" 2>/dev/null' EXIT; \
+	  if [ -d '$(2)' ]; then \
+	    echo "bootstrap-deps: $(1) checkout $(2) already exists, left alone"; \
 	  else \
-	    echo "bootstrap-deps: FAIL could not clone+checkout $(1) $(4) from $(3)" >&2; rm -rf "$$stage"; exit 1; \
+	    echo "bootstrap-deps: cloning $(1) $(4) from $(3) -> $(2)"; \
+	    stage='$(2).bootstrap-staging.'"$$$$"; rm -rf "$$stage"; \
+	    if git clone --quiet '$(3)' "$$stage" && git -C "$$stage" checkout --quiet '$(4)'; then \
+	      mv "$$stage" '$(2)'; \
+	    else \
+	      echo "bootstrap-deps: FAIL could not clone+checkout $(1) $(4) from $(3)" >&2; rm -rf "$$stage"; exit 1; \
+	    fi; \
 	  fi; \
 	fi
 

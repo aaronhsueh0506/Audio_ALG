@@ -1,0 +1,46 @@
+<!doctype html>
+<html lang="zh-Hant">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>RNNoise-ERB · Audio_ALG</title>
+<link rel="stylesheet" href="../../manual.css">
+</head>
+<body>
+<nav aria-label="導覽"><a href="../../index.html">Audio_ALG</a> / <a href="../index.html">模型開發與部署</a></nav>
+<main>
+<h1>RNNoise-ERB</h1>
+<h2>概要</h2>
+<p>RNNoise-ERB 的 C 端是 <code>RNNoise-ERB/process.h</code> 的一組函式與呼叫端 pool 內的 <code>RNNoiseState</code>：grid 由應用端以 <code>RNNoiseGridSpec</code> 在執行期給定，記憶體由呼叫端配置（<code>rnnoise_get_mem_size()</code> → 記憶體 → <code>rnnoise_init_ex()</code>，沒有 create／destroy），只做頻域。framing（<code>AcStft</code>／<code>AcIstft</code>）、ERB 矩陣與 GRU state 都歸應用端。它與 DFN／GTCRN 有兩處不同，整合時最容易寫錯：(1) <code>lookahead_frames=1</code>：新特徵窗 <code>[t-2,t-1,t]</code> 的 gain 屬於 spectrum <code>t-1</code>，應用端必須保存並延遲對應的頻譜，再用 <code>rnnoise_apply_gains()</code> 套 gain（就地改寫頻譜，內含 × <code>stft_unscale</code>，所以 <code>AcIstft</code> 的 <code>ispec_scale</code> 必須維持 1.0f）；(2) 模型輸入是前 3 框特徵（oldest → newest），前 2 框無模型輸出。模型內容見 <a href="reference/core.html">RNNoise-ERB 頻域與模型契約</a>。</p>
+
+<h2>如何呼叫使用</h2>
+<ol>
+<li><b>grid</b>：<code>RNNoiseGridSpec</code> 取 <code>config.ini</code> 的 <code>[signal]</code>／<code>[feature]</code> 值（出貨：16000、512、22 bands、<code>min_bins_per_band</code> 2、<code>lookahead_frames</code> 1、<code>spec_max_hz</code> 4000，加上兩組 EMA 設定）→ <code>rnnoise_grid_make(&amp;grid, &amp;spec)</code>（非 <code>RNNOISE_GRID_OK</code> 就是被拒，<code>rnnoise_grid_status_text()</code> 給文字）。推導出 <code>hop</code> 256、<code>n_bins</code> 257、<code>spec_bins</code> 129、<code>conv_delay</code> 1、兩個 α 0.984、<code>stft_scale</code> 1/√512。</li>
+<li><b>framing</b>（audiolib）：<code>ac_stft_config_default(&amp;sc, grid.n_fft)</code>，只改 <code>sc.spec_scale = grid.stft_scale</code>，其餘維持預設（sqrt-Hann、center 0、<code>AC_OLA_ACCUMULATE</code>、<code>ispec_scale = 1.0f</code>）；每個 hop 餵 hop 個新樣本，<code>ac_stft_push_planar()</code> 內部保留前一個 hop，零歷史起算。函式庫不持有 framing 物件，縮放設錯偵測不到。</li>
+<li><b>ERB 矩陣</b>：兩個借用指標，由應用端載入並持有（函式庫不讀檔、不複製，矩陣須比所有借用它的物件活得久）：<code>erb_fwd</code> 是 bin-major <code>[n_bins][n_bands]</code>（<code>train.py</code> mode 0），<code>erb_inv</code> 是 band-major <code>[n_bands][n_bins]</code>（mode 1），各 <code>n_bins × n_bands</code> 個 float32（16000/512/22 為 257 × 22 × 4 = 22,616 bytes）。來源見下方說明。</li>
+<li><b>建立</b>：<code>rnnoise_config_defaults(&amp;cfg, &amp;grid)</code> → 填 <code>erb_fwd</code>／<code>erb_inv</code>（float host 再填 <code>h1</code>／<code>h2</code>／<code>h3</code> 與各自的 <code>_elements</code>，元素個數不是 bytes；三組都設或都不設）→ <code>rnnoise_get_mem_size(&amp;cfg, &amp;req)</code> → 16-byte 對齊的記憶體 → <code>rnnoise_init_ex(pool, req.bytes, &amp;cfg, &amp;req)</code>。init 把已註冊的 state 歸零，generation 從 1 開始。回 NULL ＝ config 或 pool 被拒（錯位、太小、別的 grid 或 build 做的 pool）。</li>
+<li>每個 hop：<code>ac_stft_push_planar</code> → <code>rnnoise_compute_features</code>（前 2 框回 0、沒有模型輸出：gain 用 unit gain，已存在的延遲頻譜（<code>t - grid.lookahead_frames</code> ≥ 0）照樣合成，否則第一個輸出會少一份重疊項，還沒有頻譜時才輸出補零；回 1 時 <code>out_erb</code> 與 <code>out_spec</code> 是平的陣列，長度為 <code>rnnoise_erb_window_elements()</code> 與 <code>rnnoise_spec_window_elements()</code>）→ 加速器（<code>h1_in/h1_out</code> 等綁同一塊 buffer，先讀完所有 state 輸入才寫輸出）→ <code>rnnoise_frame_finish</code>（非有限就改用 unit gain）→ <code>rnnoise_apply_atten_lim</code>（可選）→ <code>rnnoise_expand_gains</code> → 對延遲 <code>grid.lookahead_frames</code> 框的頻譜 <code>rnnoise_apply_gains</code> → <code>ac_istft_push_planar</code>。</li>
+<li>generation：<code>rnnoise_state_generation()</code> init 後為 1，reset 與被拒的 <code>rnnoise_frame_finish</code> 各加 1。float host 註冊的 buffer 已由函式庫歸零；板端若在加速器另存定點 hidden，須在起始填成量化後的 0，並在每次數值與上次看到的不同時重填。</li>
+<li>重新開始一段串流：<code>rnnoise_reset(st)</code>（清特徵 ring、正規化 EMA 回起始值、歸零已註冊的 state）加應用端自己的 <code>ac_stft_reset</code>／<code>ac_istft_reset</code>，並清掉應用端保存的延遲頻譜。同一段 stream 分 chunk 時須保留 EMA、GRU、framing／OLA 與對應的 spectrum 延遲；不同 WAV 之間必須重置。</li>
+</ol>
+<p class="note"><b>ERB 矩陣的來源</b>：<code>export_erb_matrix.py --format bin</code>（預設）寫 <code>erb_matrix.bin</code>，little-endian：<code>int32 n_bins</code>、<code>int32 n_bands</code>、float32 W_fwd <code>[n_bins][n_bands]</code>（mode 0）、float32 W_inv <code>[n_bins][n_bands]</code>（mode 1）、<code>int32 nfftborder[n_bands]</code>；<code>--format npy</code> 與 <code>c</code> 的兩個矩陣也都是 <code>[n_bins][n_bands]</code>。正向矩陣的版面等於函式庫要的；反向矩陣在檔內是 bin-major，函式庫要 band-major，band-major 的反向矩陣樹內沒有 exporter 輸出，應用端載入後自行轉置。</p>
+<p><a href="../../../../AINR/RNNoise-ERB/README.md">完整 C 整合範例</a></p><p>模型回錯時，至少將一個 gain 設為 NaN，再執行 <code>rnnoise_frame_finish()</code> 清零已登錄的 state。本拍使用單位增益、照常合成，保留 feature ring 與 OLA 時序。</p>
+
+<h2>推論呼叫範例</h2>
+<p>float host 的三幀 feature window 就緒後才執行這段。將結果展開為各 bin 的增益，套用到 t−lookahead 的頻譜。</p>
+<pre><code>for (int b = 0; b &lt; grid.n_bands; ++b) band_gains[b] = NAN;
+int rc = run_model(erb, spec_win, h, h + GRU_HIDDEN, h + 2 * GRU_HIDDEN,
+                   band_gains);
+if (rc != 0) band_gains[0] = NAN;
+if (rnnoise_frame_finish(st, band_gains) != 0)
+    for (int b = 0; b &lt; grid.n_bands; ++b) band_gains[b] = 1.0f;</code></pre>
+
+<h2>參考</h2>
+<ul>
+<li><a href="reference/core.html">模型張量、狀態與參數</a></li>
+<li><a href="../../../../lib/ainr/rnnoise_erb/process.h">公開 C 標頭</a></li>
+<li><a href="../../../../AINR/RNNoise-ERB/README.md">訓練與匯出</a></li>
+</ul>
+</main>
+</body>
+</html>

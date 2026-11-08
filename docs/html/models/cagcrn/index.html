@@ -1,0 +1,72 @@
+<!doctype html>
+<html lang="zh-Hant">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>CAGCRN · Audio_ALG</title>
+<link rel="stylesheet" href="../../manual.css">
+</head>
+<body>
+<nav aria-label="導覽"><a href="../../index.html">Audio_ALG</a> / <a href="../index.html">模型開發與部署</a></nav>
+<main>
+<h1>CAGCRN</h1>
+<h2>概要</h2>
+<p>CAGCRN 是端到端 AEC+RES+NR 的備援候選：輸入是未對齊的 mic 與 far 複數頻譜，輸出是 bounded complex ratio mask（Tanh，<code>[1,1,257,2]</code>），乘在 mic 頻譜上。<b>目前沒有對應的 C pre/post 類別</b>（<a href="../reference/onnx.html">ONNX 邊界與 calibration</a> 的缺口表有一列）：可執行、有測試的路徑是 Python 參考實作與 ONNX 匯出／校正；C 端現有零件只有 audiolib 的 <code>AcStft</code>／<code>AcIstft</code> 與 <code>cagcrn_process.h</code> 的 <code>aiaec_apply_complex_mask()</code>。模型內容、I/O 表、State 表見 <a href="reference/core.html">CAGCRN 頻域與模型契約</a>。</p>
+
+<h2>如何呼叫使用</h2>
+<h3>A. Python 串流參考（逐 hop，已測試）</h3>
+<ol>
+<li><code>load_model(checkpoint, device)</code> 回 <code>(model, grid)</code>，grid 與模型設定全取自 checkpoint contract（不讀 <code>config.ini</code>）。</li>
+<li><code>model.create_stream_state()</code> 建立全零 state；其中 <code>cata_gate_log</code> 是推論期常數（可學的 delay window 已預先算好），不是跨呼叫的 state。</li>
+<li>每個 hop 把 mic／far 推入 <code>StreamSTFT</code>，對每個吐出的框呼叫 <code>forward_stream(microphone=..., far_end=..., state=...)</code>，把 <code>res.enhanced[:, 0]</code> 推入 <code>StreamISTFT</code>；第一個 hop 的 STFT 不吐框、ISTFT 輸出 0 個樣本。</li>
+</ol>
+<pre>import soundfile as sf
+import torch
+from AIAEC.CAGCRN.inference import load_model
+from AIAEC.aiaec_streaming import StreamSTFT, StreamISTFT
+
+model, grid = load_model("checkpoint.pth", "cpu")   # grid/D 全部取自 checkpoint contract
+state = model.create_stream_state()                 # 新的一段串流 = 新的全零 state
+window = grid.window(device="cpu")                  # sqrt-Hann, 長度 n_fft
+H = grid.hop_len                                    # 16 kHz: 256
+mic_stft = StreamSTFT(grid.n_fft, H, window)
+far_stft = StreamSTFT(grid.n_fft, H, window)
+synth = StreamISTFT(grid.n_fft, H, window)
+
+mic, sr = sf.read("mic.wav", dtype="float32")       # 單聲道, 取樣率須等於 checkpoint 的 sr
+far, _ = sf.read("far.wav", dtype="float32")
+mic, far = torch.from_numpy(mic)[None], torch.from_numpy(far)[None]
+
+pieces = []
+with torch.no_grad():
+    for s in range(0, mic.shape[1] - H + 1, H):
+        for m, f in zip(mic_stft.push(mic[:, s:s + H]), far_stft.push(far[:, s:s + H])):
+            res = model.forward_stream(m.unsqueeze(1), f.unsqueeze(1), state)
+            pieces.append(synth.push(res.enhanced[:, 0]))   # 輸出頭一個 hop 為 0 個樣本
+sf.write("out.wav", torch.cat(pieces, dim=1)[0].numpy(), sr)</pre>
+<p class="note">片語已用隨機權重的模型代入 <code>load_model</code> 實際跑過（1 秒、16 kHz 輸入得到 15,616 個輸出樣本）。命令列等價形式：<code>python3 AIAEC/CAGCRN/inference.py checkpoint.pth mic.wav far.wav out.wav [--device cpu] [--verify]</code>，或目錄模式 <code>--mic-dir D [--ref-dir D2] --out-dir D3</code>（輸出沿用輸入樹，<code>*_mic.wav</code> 寫成 <code>*_ours.wav</code>）。</p>
+<h3>B. 匯出與 PTQ 校正</h3>
+<pre>python3 AIAEC/CAGCRN/export_onnx.py --checkpoint checkpoint.pth \
+    --output output/cagcrn.onnx [--max-delay-frames D] [--opset 17] --verify
+python3 AIAEC/CAGCRN/inference.py calib --checkpoint checkpoint.pth \
+    --primary-dir /path/to/microphone --far-dir /path/to/far \
+    --frames 8192 --format bin --output calib/cagcrn
+python3 AIAEC/CAGCRN/export_erb_matrix.py --checkpoint checkpoint.pth \
+    --output-dir output --format all     # checkpoint-exact ERB map，供工具鏈比對</pre>
+<h3>C. 部署契約（以現有零件組成；沒有對應的 C 類別與測試）</h3>
+<ol>
+<li>graph 輸入 21 個：<code>mic</code>、<code>far</code>（各 <code>[1,1,257,2]</code>，未正規化 RI 頻譜）加 19 個 state；輸出：<code>output</code>（<code>[1,1,257,2]</code> 的 CRM，最後一軸為 re／im）與 19 個 <code>*_out</code>，每個與同名輸入同 shape，綁在同一個位址。兩顆 GRU hidden 疊成單一 <code>h_gru (1,2,25,24)</code>（far 在前）。</li>
+<li>ERB merge／split 與 Tanh mask 都在圖內；C 端不載入任何 ERB 矩陣。</li>
+<li>host 後端：把 <code>output</code> 拆成 mask_re／mask_im，呼叫 <code>aiaec_apply_complex_mask(mic_re, mic_im, mask_re, mask_im, out_re, out_im, n_bins)</code>，再經 <code>AcIstft</code> 合成。</li>
+<li>匯出 metadata 沒有 <code>state_layout_version</code> 與 <code>c_descriptor</code>（缺席＝C 端沒有綁定這個模型）；<code>state_binding</code> 為 <code>in_place_same_address</code>。</li>
+</ol>
+
+<h2>參考</h2>
+<ul>
+<li><a href="reference/core.html">模型張量、狀態與參數</a></li>
+<li><a href="../../../../lib/aiaec/cagcrn/cagcrn_process.h">公開 C 標頭</a></li>
+<li><a href="../../../../AIAEC/CAGCRN/README.md">訓練與匯出</a></li>
+</ul>
+</main>
+</body>
+</html>

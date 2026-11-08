@@ -1,0 +1,48 @@
+<!doctype html>
+<html lang="zh-Hant">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>GTCRN · Audio_ALG</title>
+<link rel="stylesheet" href="../../manual.css">
+</head>
+<body>
+<nav aria-label="導覽"><a href="../../index.html">Audio_ALG</a> / <a href="../index.html">模型開發與部署</a></nav>
+<main>
+<h1>GTCRN</h1>
+<h2>概要</h2>
+<p>GTCRN 的 C 端是 <code>gtcrn_process.h</code> 的不透明類別 <code>GTCRNProcess</code>：grid 由應用端以 <code>GTCRNGridSpec</code> 在執行期給定，記憶體由呼叫端配置（<code>gtcrn_process_get_mem_size()</code> → 記憶體 → <code>gtcrn_process_init_ex()</code>，沒有 create／destroy），只做頻域。framing（<code>AcStft</code>／<code>AcIstft</code>）、兩張 ERB 矩陣與八個 recurrent state 都歸應用端：float host 把 state 的 buffer 註冊進 config，板端什麼都不註冊。每個 hop（256 samples = 16 ms @16 kHz）一次加速器呼叫，從第 0 個 hop 就有輸出，模型本身 lookahead 為 0。模型內容、I/O 表、State 表見 <a href="reference/core.html">GTCRN 頻域與模型契約</a>。</p>
+
+<h2>如何呼叫使用</h2>
+<ol>
+<li><b>grid</b>：<code>GTCRNGridSpec</code> = <code>{ n_fft = 512, erb_low_bins = 65, erb_high_bands = 64 }</code>（<code>config.ini</code> 的 <code>[signal] n_fft</code> 與 <code>[model] erb_subband_1</code>／<code>erb_subband_2</code>）→ <code>gtcrn_grid_make(&amp;grid, &amp;spec)</code>（非 <code>GTCRN_GRID_OK</code> 就是被拒，<code>gtcrn_grid_status_text()</code> 給文字）。推導出 <code>hop</code> 256、<code>n_bins</code> 257、<code>erb_bands</code> 129、<code>erb_high_bins</code> 192。模型的取樣率（16 kHz）不是 grid 欄位，歸應用端。</li>
+<li><b>framing</b>（audiolib）：<code>ac_stft_config_default(&amp;sc, grid.n_fft)</code> 的預設值就是 GTCRN 的契約，不必改任何欄位：sqrt-Hann、center 0、hop = n_fft/2、<code>spec_scale</code> = <code>ispec_scale</code> = 1.0f（未正規化）、<code>AC_OLA_ACCUMULATE</code>；頻譜是交錯的 <code>[n_bins][2]</code>（<code>ac_stft_push()</code>／<code>ac_istft_push()</code>）。函式庫不持有窗、FFT 或 STFT，尺度設錯偵測不到。</li>
+<li><b>ERB 矩陣</b>：<code>erb_fwd</code>（bin-major <code>[192][64]</code> float32）與 <code>erb_inv</code>（band-major <code>[64][192]</code>），各 12,288 個 float32 = 49,152 bytes，應用端載入後以指標傳入、函式庫只借用、不讀檔。<code>export_erb_matrix.py --runtime-bins DIR</code> 輸出 <code>erb_fwd.bin</code>（bin-major）／<code>erb_inv.bin</code>（band-major）兩個 raw little-endian 檔與 <code>erb_matrices.json</code>，版面等於函式庫要的；不帶 <code>--runtime-bins</code> 時（需 <code>--model</code>）另寫的 <code>erb_matrix.bin</code>（四個 int32 標頭 n_bins、n_erb、低頻 bins、高頻 bands，接 <code>[257][129]</code> 正向與 <code>[129][257]</code> 反向的整張矩陣）供工具鏈驗證，函式庫不吃。</li>
+<li><b>建立</b>：<code>gtcrn_process_config_defaults(&amp;cfg, &amp;grid)</code> → 填 <code>erb_fwd</code>／<code>erb_inv</code>（float host 再用 <code>state[i]</code>／<code>state_elements[i]</code> 依 <code>GTCRNStateId</code> 註冊八個 state，元素個數不是 bytes；八組都設或都不設）→ <code>gtcrn_process_get_mem_size(&amp;cfg, &amp;req)</code> → 16-byte 對齊的記憶體 → <code>gtcrn_process_init_ex(pool, req.bytes, &amp;cfg, &amp;req)</code>。init 把 pool 與已註冊的 state 歸零，generation 從 1 開始。</li>
+<li>每個 hop：<code>ac_stft_push</code> → <code>gtcrn_model_input(p, spectrum, mag, real_part, imag_part)</code> → 加速器（11 個輸入：<code>mag</code>／<code>real</code>／<code>imag</code> 與八個 state；每個 <code>*_out</code> 綁在同一塊 state buffer，先讀完所有 state 輸入才寫輸出）→ <code>gtcrn_process_mask_validate</code> → <code>gtcrn_process_state_validate</code> → <code>gtcrn_model_output(p, mask_erb, spectrum, enhanced)</code>（任一驗證回 -1 就改讓頻譜原樣通過）→ <code>ac_istft_push</code>。每次只送一個 frame，不要補成多框。</li>
+<li>板端（不註冊 state）：加速器自己保存定點 state，起始填成量化後的 0；每次 <code>gtcrn_process_state_generation()</code> 與上次看到的值不同，先把加速器 state 重填成量化後的 0 再跑。float host 註冊的 buffer 由函式庫歸零，不需要重填。</li>
+<li>重新開始一段串流：<code>gtcrn_process_reset(p)</code>（歸零已註冊的 state、generation +1）加應用端自己的 <code>ac_stft_reset</code>／<code>ac_istft_reset</code>，並把板端加速器 state 重填量化零。<b>沒有 destroy</b>：所有記憶體都是呼叫端的。</li>
+</ol>
+<p><a href="../../../../AINR/GTCRN/README.md">完整 C 整合範例</a></p><p>加速器回錯時，在 mask 留下一個 NaN 並執行兩個 validator，mask 驗證會清零所有已登錄的 state，確保即使寫入了有限值也能拒收。當拍使用原始頻譜，下一拍從乾淨的 recurrent state 繼續。</p>
+
+<h2>推論呼叫範例</h2>
+<p>float host 在 graph 前預填 mask。這段接在特徵產生後，完成的 enhanced 頻譜照常送去 ISTFT。</p>
+<pre><code>for (int k = 0; k &lt; 2 * grid.erb_bands; ++k) mask_erb[k] = NAN;
+int rc = run_graph(mag, real_part, imag_part, state, mask_erb);
+if (rc != 0) mask_erb[0] = NAN;
+int mask_rc = gtcrn_process_mask_validate(p, mask_erb);
+int state_rc = gtcrn_process_state_validate(p);
+if (mask_rc == 0 &amp;&amp; state_rc == 0)
+    gtcrn_model_output(p, mask_erb, spectrum, enhanced);
+else
+    memcpy(enhanced, spectrum, sizeof(float) * 2 * (size_t)grid.n_bins);</code></pre>
+
+<h2>參考</h2>
+<ul>
+<li><a href="reference/core.html">模型張量、狀態與參數</a></li>
+<li><a href="../../../../lib/ainr/gtcrn/gtcrn_process.h">公開 C 標頭</a></li>
+<li><a href="../../../../AINR/GTCRN/README.md">訓練與匯出</a></li>
+</ul>
+</main>
+</body>
+</html>

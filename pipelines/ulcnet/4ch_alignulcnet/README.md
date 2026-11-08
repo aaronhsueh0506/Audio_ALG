@@ -152,7 +152,7 @@ App       McabSampleFlow + Mcab (enable_post = 0)   McabSampleBeam      UlcnetNn
 External parameters: the delay profile below, the grid (`--sample-rate 16000|48000`), `D` of the exported
 graph, and the helper's array geometry and `num_angles` (the example uses the default 35 mm UCA; a product
 sets the measured one through `McabSampleBeamParams`). Internal: the helper's BF / DOA / VAD constants (section 0.3 of
-[`../../../docs/integration_4ch_spatial_zh_TW.md`](../../../docs/integration_4ch_spatial_zh_TW.md)),
+[SRP／BF helper](../../../docs/reference/mcab/beam.md)),
 `ULCNET_NN_STAGE_REPRIME_FRAMES`, the lane constants.
 
 ## Delay profile

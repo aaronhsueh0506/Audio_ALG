@@ -1,0 +1,392 @@
+<!doctype html>
+<html lang="zh-Hant">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>DeepVQE-S 頻域與模型契約 · Audio_ALG</title>
+<link rel="stylesheet" href="../../../manual.css">
+</head>
+<body>
+<nav aria-label="導覽"><a href="../../../index.html">Audio_ALG</a> / <a href="../../index.html">模型開發與部署</a> / <a href="../index.html">DeepVQE-S</a></nav>
+<main>
+<h1>DeepVQE-S 頻域與模型契約</h1>
+<details><summary>本頁目錄</summary>
+<ul>
+<li><a href="#section-2">Block diagram</a></li>
+<li><a href="#section-3">訊號泳道圖</a></li>
+<li><a href="#section-4">I/O 表</a></li>
+<li><a href="#section-5">State 表</a></li>
+<li><a href="#section-6">延遲與 warm-up</a></li>
+<li><a href="#frequency-api">頻域 API</a></li>
+<li><a href="#section-7">函式清單：公開 vs 內部</a></li>
+<li><a href="#section-8">參數表</a></li>
+<li><a href="#pcm">PCM SDK 時序與狀態</a></li>
+<li><a href="#section-9">訊號泳道圖</a></li>
+<li><a href="#section-10">I/O 表</a></li>
+<li><a href="#section-11">State 表</a></li>
+<li><a href="#section-12">延遲與啟動行為</a></li>
+</ul></details>
+<h2 id="section-1">參考</h2>
+<ul>
+<li><a href="../index.html">DeepVQE-S 整合入口</a></li>
+<li><a href="../../../../../lib/aiaec/deepvqe_s/deepvqe_prepost.h">頻域 C 標頭</a></li>
+<li><a href="../../../../../AIAEC/DeepVQE_S/README.md">模型設定與範例</a></li>
+</ul>
+
+<h2 id="section-2">Block diagram</h2>
+<pre>mic ──► StreamSTFT ──► [B,1,257] cplx      far ──► StreamSTFT ──► [B,1,257] cplx
+        │                                          │
+  compressed_ri_feature(0.3) [B,2,1,257]     compressed_ri_feature(0.3)
+  （C：host 的 compress_planar；匯出 graph 的 mic/far 輸入即此 tensor）
+        ▼                                          ▼
+  state["mic1"].step (16ch) → state["mic2"]   state["far1"].step (8ch) → state["far2"]
+        │ m2 [B,40,1,65]                           │ f2 [B,24,1,65]
+        └────────► state["align"].step(m2, f2) ◄───┘
+                    (FrameDelayAttentionCell：key/value ring 32、score conv window 5 幀)
+                    │ aligned [B,24,1,65], delay [B,1,32]
+        ┌───────────┘ cat(m2, aligned) [B,64,1,65]
+        ▼
+  state["mic3"].step (56ch) → state["mic4"].step (24ch)  m4 [B,24,1,17]
+        ▼ reshape [B,1,408]
+  state["gru"].step (GRU 192) → gru_out (Linear) → [B,24,1,17]
+        ▼ (+ skip4/3/2/1 各 1x1 conv)
+  state["up3"] → state["res3"] → state["up2"] → state["res2"] → state["up1"]
+  （FreqUpsample＝causal conv + 頻率 sub-pixel shuffle；ResidualBlock (4,3)）
+        ▼
+  Python reference：state["ccm_up"].step → raw [B,27,1,257] → reshape (…,3,3,3)
+                    → three_vector_complex → taps [B,1,257,3,3] cplx
+  匯出 graph：ccm_up conv 已折入換算（36 通道，phase 為主序）→ Transpose → Reshape
+                    → Slice → taps [1,1,257,18]（RI 實數，與上面同一塊記憶體次序）
+        ▼
+  state["spec_ring"].step(microphone)（3 幀 raw 譜史）
+        ▼
+  _apply_ccm_frame(spec_hist, taps) = enhanced [B,1,257] ──► StreamISTFT ──► 256 smp</pre>
+
+<h2 id="section-3">訊號泳道圖</h2>
+<pre>hop（256 smp = 16 ms @16k）        h0        h1         h2         h3     …
+caller（送樣本）             mic/far 256       256        256        256
+應用端:ac_stft_push_planar×2 (c=0) F0        F1         F2         F3     每 hop 恰 1 幀
+（center=False rolling，sqrt-Hann）；類別的 pre_process_freq 接在其後
+NN：一次 invocation                 out(F0)   out(F1)    out(F2)    out(F3) 每幀 1 out
+（delay 0；CCM 的過去 2 幀由 spec_ring 供應，不增加延遲）
+應用端:ac_istft_push_planar        0 smp     256 smp    256 smp    256 smp 半窗 trim
+（類別的 post_process_freq 交出增強頻譜給它）
+輸出樣本對應輸入區間                 —         [0,256)    [256,512)  [512,768)
+hop-lag：端到端 256 samples（16 ms）＝ synthesis 的<b>半窗 trim</b>（不是分析排程）；NN 本身 0 hop。
+hop#0 無輸出（呼叫端補零）。Python reference 的 StreamSTFT/StreamISTFT 仍是 centered 排程，
+兩條排程自第二個 hop 起位元相同。</pre>
+
+<h2 id="section-4">I/O 表</h2>
+<p>Streaming（每 invocation 恰 1 幀 = 256 個新 samples；<code>inference.py</code>
+開機打印之實測，B=1、16k）：</p>
+<table>
+<tr><th>tensor</th><th>方向</th><th>shape</th><th>dtype</th><th>幀/invocation</th><th>time-domain samples</th></tr>
+<tr><td>mic</td><td>in</td><td>(1, 1, 257)</td><td>complex64</td><td>1</td><td>256 新樣本</td></tr>
+<tr><td>far</td><td>in</td><td>(1, 1, 257)</td><td>complex64</td><td>1</td><td>256 新樣本</td></tr>
+<tr><td>output</td><td>out</td><td>(1, 1, 257)</td><td>complex64</td><td>1</td><td>WOLA 後 256</td></tr>
+<tr><td>delay_distribution</td><td>out</td><td>(1, 1, 32)</td><td>float32</td><td>1</td><td>—</td></tr>
+<tr><td>aux ccm_taps</td><td>out</td><td>(1, 1, 257, 3, 3)</td><td>complex64</td><td>1</td><td>—</td></tr>
+</table>
+<p>Offline <code>forward(microphone, far_end)</code>：complex <code>[B,T,257]</code> in/out、
+delay <code>[B,T,32]</code>、ccm_taps <code>[B,T,257,3,3]</code>；<code>mask = None</code>。</p>
+
+<h2 id="section-5">State 表</h2>
+<p><code>state_report</code> 實測（B=1 fp32，D=32 含 host CCM ring 共 <b>572.2 KB</b>、graph 顯式 state <b>566.2 KB</b>；
+建構子預設 D=63 時為 795.0 KB／789.0 KB；主因 value ring）。部署契約：
+graph state 歸應用端（浮點 host 登錄、目標平台由加速器持有）；STFT/ISTFT 是應用端的 <code>AcStft</code>／<code>AcIstft</code>，CCM 頻譜 ring 在類別的 pool 內。下表是 D=32 的 graph 邊界：</p>
+<table>
+<tr><th>state</th><th>shape</th><th>size</th><th>保存者（部署契約）</th></tr>
+<tr><td>align.key_ring</td><td>(1, 4, 32, 65)</td><td>32.5 KB</td><td>host caller（顯式 graph I/O）</td></tr>
+<tr><td>align.value_ring</td><td>(1, 24, 32, 65)</td><td>195.0 KB</td><td>host caller（顯式 graph I/O）</td></tr>
+<tr><td>align.score_history（5 幀 window）</td><td>(1, 4, 5, 32)</td><td>2.5 KB</td><td>host caller（顯式 graph I/O）</td></tr>
+<tr><td>mic1..mic4.history</td><td>(1,2,4,257) / (1,16,4,129) / (1,64,4,65) / (1,56,4,33)</td><td>8.0 / 32.3 / 65.0 / 28.9 KB</td><td>host caller（顯式 graph I/O）</td></tr>
+<tr><td>far1 / far2.history</td><td>(1,2,4,257) / (1,8,4,129)</td><td>8.0 / 16.1 KB</td><td>host caller（顯式 graph I/O）</td></tr>
+<tr><td>h_gru（gru.hidden）</td><td>(1, 1, 1, 192)</td><td>0.8 KB</td><td>host caller（顯式 graph I/O）</td></tr>
+<tr><td>up3 / up2 / up1.history</td><td>(1,24,4,17) / (1,40,4,33) / (1,32,4,65)</td><td>6.4 / 20.6 / 32.5 KB</td><td>host caller（顯式 graph I/O）</td></tr>
+<tr><td>res3 / res2.history</td><td>(1,40,4,33) / (1,32,4,65)</td><td>20.6 / 32.5 KB</td><td>host caller（顯式 graph I/O）</td></tr>
+<tr><td>ccm_up.history</td><td>(1, 32, 4, 129)</td><td>64.5 KB</td><td>host caller（顯式 graph I/O）</td></tr>
+<tr><td>spec_ring.ring（raw mic 複數譜 3 幀）</td><td>(1, 1, 3, 257)</td><td>6.0 KB（complex64）</td><td>類別 pool（<code>deepvqe_process.c/h</code>）</td></tr>
+<tr><td><b>graph state 合計</b></td><td></td><td><b>566.2 KB</b></td><td>host caller</td></tr>
+<tr><td>STFT×2 / ISTFT 狀態</td><td>—</td><td>—</td><td>應用端的 <code>AcStft</code>×2／<code>AcIstft</code>（Python reference：host）</td></tr>
+</table>
+<p><b>C 類別的顯式 state 邊界＝16 個 tensor</b>（<code>DEEPVQE_STATE_COUNT</code>），全部 rank 4。
+<code>DeepVqeStateId</code> 的列舉順序<b>就是</b> graph 在兩個 signal input 之後的 input 順序
+（<code>_streaming_export.py</code> 的 <code>input_names[2:]</code> 原文），輸出在 head 之後也用
+同一個順序，所以按索引綁定的 adapter 必須用這個列舉，按名字綁定的用
+<code>deepvqe_prepost_state_name(id)</code>／<code>_state_name_out(id)</code>
+（graph 輸出名一律是輸入名加 <code>_out</code>）：</p>
+<table>
+<tr><th>#</th><th><code>DeepVqeStateId</code></th><th>graph input 名</th><th>shape（D = delay_depth）</th></tr>
+<tr><td>0</td><td>ALIGN_KEY_RING</td><td><code>state_align_key_ring</code></td><td>(1, 4, D, 65)　newest-first</td></tr>
+<tr><td>1</td><td>ALIGN_VALUE_RING</td><td><code>state_align_value_ring</code></td><td>(1, 24, D, 65)　newest-first</td></tr>
+<tr><td>2</td><td>ALIGN_SCORE_HISTORY</td><td><code>state_align_score_history</code></td><td>(1, 4, 5, D)　oldest-first</td></tr>
+<tr><td>3</td><td>CCM_UP_HISTORY</td><td><code>state_ccm_up_history</code></td><td>(1, 32, 4, 129)</td></tr>
+<tr><td>4</td><td>FAR1_HISTORY</td><td><code>state_far1_history</code></td><td>(1, 2, 4, 257)</td></tr>
+<tr><td>5</td><td>FAR2_HISTORY</td><td><code>state_far2_history</code></td><td>(1, 8, 4, 129)</td></tr>
+<tr><td>6</td><td>H_GRU</td><td><code>h_gru</code></td><td>(1, 1, 1, 192)　[1, layers, 1, hidden]</td></tr>
+<tr><td>7–10</td><td>MIC1..MIC4_HISTORY</td><td><code>state_mic1..4_history</code></td><td>(1, 2, 4, 257) / (1, 16, 4, 129) / (1, 64, 4, 65) / (1, 56, 4, 33)</td></tr>
+<tr><td>11–12</td><td>RES2 / RES3_HISTORY</td><td><code>state_res2/3_history</code></td><td>(1, 32, 4, 65) / (1, 40, 4, 33)</td></tr>
+<tr><td>13–15</td><td>UP1 / UP2 / UP3_HISTORY</td><td><code>state_up1/2/3_history</code></td><td>(1, 32, 4, 65) / (1, 40, 4, 33) / (1, 24, 4, 17)</td></tr>
+</table>
+<p>每個 window 輸入由 graph 的 Slice 位移：conv 與 score window 取輸入的 frame <code>1..N−1</code>（Slice axis 2，start 1，end N，step 1）
+再把新一幀 Concat 在後面；attention ring 取輸入的 slot <code>0..D−2</code> 再把新一幀 Concat 在前面。Concat 的結果就是
+<code>*_out</code>，被丟掉的那一格（conv／score window 的 frame 0、ring 的 slot D−1）只讓輸入與輸出 shape 相同，graph 不讀它。
+<code>export_graph</code> 對寫出的檔案呼叫 <code>validate_inplace_state_contract</code>（每對 state shape 相同且 rank 4、
+每個 window 輸入恰有一個 Slice 消費者、沒有 state 輸出由 Slice 產生、metadata 帶 <code>state_binding = in_place_same_address</code>）。</p>
+<p>形狀屬於應用端：函式庫只收 <code>state_elements[id]</code>，不知道形狀；測試 driver 帶一張 16 列的表，
+由 <code>test_c_descriptor_matches_the_built_graph</code> 釘在匯出的 graph 上。頻率階梯 257→129→65→33→17 是 encoder 的 stride-2 halving，
+conv window = causal conv kernel 4 幀（3 幀過去加目前一幀）、alignment score conv 是 (5,3) 所以 window 是 5 幀。head 輸出
+<code>output</code> = packed CCM taps <code>[1,1,257,18]</code>；末軸保持
+<code>[time][frequency][RI]</code> 次序，與 <code>deepvqe_process.h</code> 的
+<code>taps[n_bins][3][3][2]</code> 攤平後同一塊記憶體，不需 transpose 或 copy。</p>
+<p><b>Descriptor（13 欄）</b>：<code>DeepVqePrepostDescriptor</code> =
+<code>layout_version</code>／<code>delay_depth</code>／<code>sample_rate</code>／
+<code>fft_size</code>／<code>hop_size</code>／<code>spectrum_bins</code>／<code>time_order</code>／
+<code>freq_taps</code>／<code>conv_window_frames</code>／<code>score_window_frames</code>／
+<code>gru_layers</code>／<code>gru_hidden</code>／<code>state_tensor_count</code>。
+<code>deepvqe_prepost_descriptor_default(&amp;grid, &amp;desc)</code> 填外部欄位，<code>_descriptor_validate(&amp;grid, &amp;desc)</code>
+把<b>除 <code>delay_depth</code> 之外</b>的外部欄位釘在 grid 與本 build 的常數上（<code>delay_depth</code> 是 export 期的部署參數，只檢查範圍）；
+<code>conv_window_frames</code>／<code>score_window_frames</code>／<code>gru_layers</code>／<code>gru_hidden</code> 四欄屬於模型內部，default 給 0、validate 不讀。
+<code>DEEPVQE_PREPOST_LAYOUT_VERSION</code> = 4（<code>mic</code>/<code>far</code> 的名稱與元素數 2×n_bins 不隨 layout 變，state 是完整 window、<code>h_gru</code> 是 rank 4，版號是唯一能攔下舊板綁新圖的閘門；1–3 已退役），且刻意<b>不</b>與
+<code>ULCNET_MODEL_IO_LAYOUT_VERSION</code> 共用：兩個模型的 boundary 各走各的，共用號碼會讓
+一邊的 bump 看起來像另一邊的。D 範圍 <code>DEEPVQE_PREPOST_MIN_D</code>=1 …
+<code>MAX_D</code>=256，沒有預設值：應用端給匯出該模型時的 D（出貨 32 ＝ 這個 grid 上的 0.5 秒搜尋範圍，<code>ceil(0.5 × 16000/256)</code>）。</p>
+<p><b>Exporter metadata</b>：<code>AIAEC/_streaming_export.py</code> 的
+<code>_C_DESCRIPTORS</code> 把 <code>DeepVQE_S</code> 映到
+<code>_deepvqe_c_descriptor()</code>，它<b>從剛建好的 graph 量</b>這 13 欄（tap 軸、conv／score
+window 深度、GRU 形狀、兩個 ring 的 D 與 model 自報的 D 必須一致、state 數 = input 數 − signal input
+數），再把 <code>metadata['state_layout_version']</code> 與
+<code>metadata['c_descriptor']</code> 一起寫進 ONNX props 與旁邊的 JSON。
+外部欄位（grid、<code>time_order</code>、<code>freq_taps</code>、<code>state_tensor_count</code>、layout）不符會在板端變成一次 <code>descriptor_validate()</code> 拒絕；四個內部欄位只記在 metadata，C 端不讀。</p>
+
+<h2 id="section-6">延遲與 warm-up</h2>
+<ul>
+<li>NN 演算法 lookahead = <b>0 hop</b>；每個算子都是因果、reset 時 zero 左 context ≡
+offline 左零 padding，<b>無 warm-up 特例</b>（無 CRUSE 的 T≥D caveat——delay softmax
+每幀獨立）。</li>
+<li>實測 stream-vs-offline（seed 0/1、96 幀、CPU fp32）：enhanced 1.5e-6、ccm_taps
+4.5e-7、delay 3.7e-9；tolerances 以 ~10x headroom 釘在 2e-5 / 5e-6
+（<code>test_streaming_deepvqe_s.py</code> 檔頭）。唯一算術差源是 GRU batched-vs-stepped
+kernel 路徑。</li>
+<li>Framing：應用端用 <b>center=False、每 hop 一幀</b>的 rolling 分析
+（<code>ac_stft_push_planar</code>，<code>center</code> 0）；端到端演算法延遲仍是 <b>256 samples</b>（16 ms），
+但它來自 <b>synthesis 的半窗 trim</b>、不是分析排程。Python reference 的
+<code>StreamSTFT/StreamISTFT</code> 仍是 centered 排程，兩條排程自第二個 hop 起位元相同
+（centered 只在開頭多一幀 reflect 前綴）。</li>
+</ul>
+
+<h2 id="frequency-api">頻域 API</h2>
+<h3>如何呼叫使用</h3>
+<ol>
+<li><b>grid 是 run-time 值</b>：填 <code>DeepVqeGridSpec</code>（<code>sample_rate</code>、<code>n_fft</code>、<code>delay_depth</code> 取自匯出該模型的設定）→ <code>deepvqe_grid_make(&amp;grid, &amp;spec)</code> 回 <code>DEEPVQE_GRID_OK</code> 或第一個失敗的 <code>DEEPVQE_GRID_ERR_*</code>。D = alignment 搜尋深度，範圍 <code>DEEPVQE_PREPOST_MIN_D</code>(1)…<code>MAX_D</code>(256)，<b>沒有預設值</b>，且<b>必須等於匯出該 ONNX 時的 D</b>（<code>export_onnx.py --max-delay-frames</code>，未給則用 checkpoint 的 D；出貨 32 ＝ 16 kHz 上 0.5 秒）。</li>
+<li><b>framing 由應用端做</b>：用 audiolib 建兩個 <code>AcStft</code>（mic、far）與一個 <code>AcIstft</code>，組態 <code>ac_stft_config_default(&amp;sc, grid.n_fft)</code>（sqrt-Hann、center 0、<code>spec_scale</code> = <code>ispec_scale</code> = 1），合成端另設 <code>sc.ola = AC_OLA_ENV_NORM</code>（<code>deepvqe_prepost.h</code> 檔頭）。類別不持有 window、<code>FftHandle</code> 或 STFT 物件。</li>
+<li><b>16 個 state 歸應用端</b>（<code>DeepVqeStateId</code> 順序，形狀見 <a href="core.html">DeepVQE-S 頻域與模型契約</a> 的 State 表，函式庫只收元素數）：浮點 host 配 16 塊 float buffer，把 16 組（指標，元素數）登錄進 <code>cfg.state[]</code>／<code>cfg.state_elements[]</code>——全登錄或全不登錄，init 與 reset 時清零，每次 <code>frame_finish</code> 整塊檢查有限，不計入 pool 大小與 hash；目標平台不登錄，由加速器持有，把每個 state 輸入與其 <code>*_out</code> 綁在同一塊加速器 buffer。</li>
+<li><code>deepvqe_prepost_config_defaults(&amp;cfg, &amp;grid)</code>（grid 被複製）→ 登錄 state → <code>deepvqe_prepost_get_mem_size(&amp;cfg, &amp;req)</code>（<code>req.alignment</code> = 16）→ <code>deepvqe_prepost_init_ex(pool, req.bytes, &amp;cfg, &amp;req)</code>。D = 32 的 pool：16 kHz／512 為 35,504 B、48 kHz／1024 為 70,320 B（本機量測，不含應用端的 state 與 <code>AcStft</code>／<code>AcIstft</code>）。</li>
+<li>按名稱綁定 graph 的 state 時用 <code>deepvqe_prepost_state_name(id)</code>／<code>_state_name_out(id)</code>；啟動時把 ONNX／JSON 內的 <code>c_descriptor</code> 讀成 <code>DeepVqePrepostDescriptor</code>，以 <code>deepvqe_prepost_descriptor_validate(&amp;grid, &amp;meta)</code> 檢查。</li>
+<li>每個 hop（從 hop 0 起一次推論）：<code>ac_stft_push_planar</code>×2 → <code>pre_process_freq(mic, far)</code> 恆回 1 → <code>frame_open</code>（host 端做 power-law 壓縮 0.3，<code>mic</code>／<code>far</code> 是壓縮後的 planar <code>[1,2,1,n_bins]</code>；只有 <code>taps</code> 預填 NaN）→ 加速器 → <code>frame_finish</code>（失敗改 <code>frame_bypass</code>）→ <code>post_process_freq</code> → <code>ac_istft_push_planar</code>。</li>
+<li>目標平台：每次 <code>deepvqe_prepost_state_generation()</code> 改變（<code>reset</code> 或被拒的 <code>frame_finish</code>），把加速器自己的 16 個 state 重填成量化後的 0；新建實例的 generation 為 0，做法同 <a href="../../align-ulcnet/reference/core.html#frequency-api">Align-ULCNet 頻域與模型契約</a> 的目標平台片段。</li>
+<li>重新開始：<code>deepvqe_prepost_reset(p)</code>（登錄的 state、CCM ring 歸零，generation +1），並自行 <code>ac_stft_reset</code>／<code>ac_istft_reset</code>；結束：<code>_destroy</code>（對 <code>_init</code> 實例是 no-op，登錄的 buffer 與 pool 歸應用端）。</li>
+</ol>
+<pre>#include &lt;stdlib.h&gt;
+#include &lt;string.h&gt;
+#include "audio_stft.h"
+#include "DeepVQE_S/deepvqe_prepost.h"
+
+extern int npu_run(const DeepVqePrepostInputs *in, DeepVqePrepostOutputs *out);
+
+static void *block(size_t n) { return aligned_alloc(16, (n + 15u) / 16u * 16u); }
+
+/* elems[id]：DeepVqeStateId 順序的 state 元素數（匯出圖的 shape 乘積，見 State 表）；
+ * D 必須等於匯出該 ONNX 時的 --max-delay-frames。 */
+int run_deepvqe(int D, const size_t elems[DEEPVQE_STATE_COUNT],
+                const float *mic, const float *far, float *out, long hops)
+{
+    const DeepVqeGridSpec spec = { 16000, 512, D };
+    DeepVqeGrid grid;
+    DeepVqePrepostConfig cfg;
+    DeepVqePrepostMemReq req;
+    AcStftConfig sc;
+    int rc = -1;
+
+    if (deepvqe_grid_make(&amp;grid, &amp;spec) != DEEPVQE_GRID_OK) return -1;
+    if (deepvqe_prepost_config_defaults(&amp;cfg, &amp;grid) != 0) return -1;
+    for (int id = 0; id &lt; DEEPVQE_STATE_COUNT; ++id) {      /* 浮點 host：16 組 (指標, 元素數) 全登錄 */
+        cfg.state[id] = calloc(elems[id], sizeof(float));
+        cfg.state_elements[id] = elems[id];
+    }
+
+    ac_stft_config_default(&amp;sc, grid.n_fft);   /* sqrt-Hann、center 0、spec_scale = ispec_scale = 1 */
+    sc.ola = AC_OLA_ENV_NORM;                  /* 合成用；分析忽略 */
+    size_t an = ac_stft_get_mem_size(&amp;sc), sy = ac_istft_get_mem_size(&amp;sc);
+    void *m0 = block(an), *m1 = block(an), *m2 = block(sy);
+    AcStft *mic_stft = m0 ? ac_stft_init(m0, an, &amp;sc) : NULL;
+    AcStft *far_stft = m1 ? ac_stft_init(m1, an, &amp;sc) : NULL;
+    AcIstft *istft   = m2 ? ac_istft_init(m2, sy, &amp;sc) : NULL;
+
+    float *buf = calloc(6u * (size_t)grid.n_bins, sizeof(float));
+    float *m_re = buf, *m_im = m_re + grid.n_bins, *f_re = m_im + grid.n_bins;
+    float *f_im = f_re + grid.n_bins, *o_re = f_im + grid.n_bins, *o_im = o_re + grid.n_bins;
+    void *pool = NULL;
+    DeepVqePrepost *p = NULL;
+    if (deepvqe_prepost_get_mem_size(&amp;cfg, &amp;req) == 0 &amp;&amp; (pool = block(req.bytes)))
+        p = deepvqe_prepost_init_ex(pool, (size_t)req.bytes, &amp;cfg, &amp;req);
+
+    if (p &amp;&amp; mic_stft &amp;&amp; far_stft &amp;&amp; istft &amp;&amp; buf) {
+        rc = 0;
+        for (long h = 0; h &lt; hops &amp;&amp; rc == 0; ++h) {
+            DeepVqePrepostInputs xin;
+            DeepVqePrepostOutputs xout;
+            float *dst = out + h * grid.hop;
+            /* mic：原始麥克風 hop（前面沒有 linear AEC）；far：同一輸入 hop 的遠端參考 */
+            ac_stft_push_planar(mic_stft, mic + h * grid.hop, m_re, m_im);   /* center 0：恆 1 幀 */
+            ac_stft_push_planar(far_stft, far + h * grid.hop, f_re, f_im);
+            if (deepvqe_prepost_pre_process_freq(p, m_re, m_im, f_re, f_im) != 1 ||
+                deepvqe_prepost_frame_open(p, &amp;xin, &amp;xout) != 0) { rc = -1; break; }
+            if (npu_run(&amp;xin, &amp;xout) != 0 || deepvqe_prepost_frame_finish(p) != 0)
+                deepvqe_prepost_frame_bypass(p);                  /* fail-closed：當前增強頻譜歸零 */
+            if (deepvqe_prepost_post_process_freq(p, o_re, o_im) != 0) { rc = -1; break; }
+            if (ac_istft_push_planar(istft, o_re, o_im, dst) == 0)   /* 第一個 hop 無輸出 */
+                memset(dst, 0, (size_t)grid.hop * sizeof(float));
+        }
+    }
+    deepvqe_prepost_destroy(p);   /* _init 實例：no-op；登錄的 buffer 與 pool 歸應用端 */
+    free(pool); free(buf); free(m0); free(m1); free(m2);
+    for (int id = 0; id &lt; DEEPVQE_STATE_COUNT; ++id) free(cfg.state[id]);
+    return rc;
+}</pre>
+<p class="note">片語已在暫存副本以 <code>-std=c11 -Wall -Wextra -Wpedantic -Werror</code> 編譯，並以替身加速器（CCM 為單位核）在 16 kHz／512、D = 32 跑 40 hop：輸出等於 mic 延後一個 hop。<code>npu_run</code> 由目標平台提供。</p>
+
+<h3>錯誤處理速查</h3>
+<div class="tbl"><table>
+<tr><th>呼叫</th><th>失敗回傳</th><th>原因／處置</th></tr>
+<tr><td><code>deepvqe_grid_make</code></td><td><code>DEEPVQE_GRID_ERR_*</code>（grid 不動）</td><td><code>_NULL</code>(-1)、<code>_SAMPLE_RATE</code>(-2)、<code>_N_FFT</code>(-3，audiolib 建不出該 n_fft)、<code>_DELAY_DEPTH</code>(-4，D 超出 1…256)</td></tr>
+<tr><td><code>config_defaults</code></td><td>-1</td><td>NULL 或無效 grid</td></tr>
+<tr><td><code>get_mem_size</code></td><td>-1，<code>*req</code> 不動</td><td>同上，或 state 登錄不一致（有指標無元素數、元素數無指標、16 組沒有全設或全空）</td></tr>
+<tr><td><code>init</code>／<code>init_ex</code></td><td>NULL</td><td>pool 未對齊／太小、config 錯、<code>expected</code> 不符（陳舊 pool；hash 認 grid、D、layout 與 carve 版本）；被拒的呼叫不動 pool</td></tr>
+<tr><td><code>pre_process_freq</code></td><td>-1</td><td>NULL、上一個 frame 尚未 <code>frame_finish</code>／<code>frame_bypass</code></td></tr>
+<tr><td><code>frame_open</code></td><td>-1</td><td>沒有開啟中的 frame</td></tr>
+<tr><td><code>frame_finish</code></td><td>-1</td><td>任一 tap 或登錄 buffer 的任一元素（整塊，含較舊的幀）非有限：登錄的 state 全部歸零（沒登錄時只檢查 taps）、generation +1、CCM ring 不前進、frame 仍開；呼叫 <code>frame_bypass</code> 或重新 <code>frame_open</code></td></tr>
+<tr><td><code>frame_bypass</code></td><td>-1（無 frame）</td><td>成功時當前增強頻譜歸零，PCM 合成保留前拍 overlap（<code>deepvqe_prepost_skip_policy_name()</code> = <code>"mute_fail_closed"</code>）：CCM ring 與 state 維持原樣。想要優雅降級的呼叫端須自己在 pipeline 層放 canceller 並 cross-fade</td></tr>
+<tr><td><code>post_process_freq</code></td><td>-1</td><td>NULL、frame 還開著；成功時 re／im 寫滿 n_bins 個值</td></tr>
+</table></div>
+
+<h2 id="section-7">函式清單：公開 vs 內部</h2>
+<div class="tbl"><table>
+<tr><th>分類</th><th>函式（<code>deepvqe_prepost.h</code>）</th></tr>
+<tr><td><b>公開（整合者）</b></td><td><code>deepvqe_prepost_config_defaults</code>、<code>_get_mem_size</code>、<code>_init</code>、<code>_init_ex</code>、<code>_create</code>、<code>_destroy</code>、<code>_reset</code>、<code>_state_generation</code>、<code>_hop_size</code>、<code>_num_bins</code>、<code>_descriptor</code>、<code>_pre_process_freq</code>、<code>_frame_open</code>、<code>_frame_finish</code>、<code>_frame_bypass</code>、<code>_post_process_freq</code></td></tr>
+<tr><td><b>公開（grid 與邊界查詢）</b></td><td><code>deepvqe_grid_make</code>、<code>deepvqe_grid_validate</code>、<code>deepvqe_prepost_state_name</code>、<code>_state_name_out</code>、<code>_descriptor_default</code>、<code>_descriptor_validate</code>、<code>_skip_policy_name</code>；inline <code>deepvqe_prepost_taps_elements</code></td></tr>
+<tr><td><b>低階（類別內部使用）</b></td><td><code>deepvqe_process.h</code>：<code>deepvqe_ccm_init</code>、<code>deepvqe_ccm_reset</code>、<code>deepvqe_ccm_process</code></td></tr>
+
+<tr><td><b>內部（<code>static</code>）</b></td><td><code>deepvqe_prepost.c</code>：<code>pp_carve</code>、<code>pp_layout</code>、<code>pp_build_hash</code>、<code>pp_fnv1a</code>、<code>pp_check_config</code>、<code>pp_registration_ok</code>、<code>compress_planar</code>、<code>zero_state</code>、<code>zero_registered</code>、<code>fill_nan</code>、<code>all_finite</code>、<code>dv_valid_depth</code>；<code>deepvqe_process.c</code>：<code>ccm_edge_bin</code></td></tr>
+</table></div>
+
+<h2 id="section-8">參數表</h2>
+<h3>外部：第三方可調</h3>
+<div class="tbl"><table>
+<tr><th>名稱</th><th>位置</th><th>型別／範圍</th><th>預設</th><th>何時設定</th><th>說明</th></tr>
+<tr><td><code>sample_rate</code>、<code>n_fft</code></td><td><code>DeepVqeGridSpec</code></td><td>sample_rate &gt; 0；n_fft 為 audiolib 建得出 framing 的大小</td><td>無（必給）</td><td>init 前</td><td>取自匯出該模型的設定，經 <code>deepvqe_grid_make()</code> 得 <code>DeepVqeGrid</code>，複製進 <code>DeepVqePrepostConfig.grid</code>；出貨模型 16000／512</td></tr>
+<tr><td><code>delay_depth</code>（D）</td><td><code>DeepVqeGridSpec</code></td><td>整數 1…256</td><td>無（必給）</td><td>init 前；<b>必須等於 export 的 D</b></td><td>attention ring 與 score window 的長度（即應用端 state 的大小）；不改權重形狀，也不改 pool 大小；<code>deepvqe_prepost_descriptor_validate</code> 只檢查 D 的範圍</td></tr>
+<tr><td><code>state[id]</code>／<code>state_elements[id]</code>（<code>DeepVqeStateId</code>，16 組）</td><td><code>DeepVqePrepostConfig</code></td><td>borrowed <code>float*</code>；元素數（不是位元組）</td><td>NULL／0（不登錄）</td><td>init 前</td><td>浮點 host 16 組全設，目標平台全空；指標有而元素數為 0、或反之，一律拒絕；須與物件同壽命</td></tr>
+<tr><td><code>--max-delay-frames</code>、<code>--opset</code>(17)、<code>--verify</code></td><td><code>export_onnx.py</code></td><td>D</td><td>checkpoint 的 D</td><td>匯出</td><td>匯出器量測剛建好的 graph 並寫 <code>c_descriptor</code> 到 ONNX props 與旁邊的 JSON</td></tr>
+<tr><td>位置參數與 <code>--device</code>、<code>--verify</code>、<code>--mic-dir</code>／<code>--ref-dir</code>／<code>--out-dir</code></td><td><code>inference.py</code></td><td><code>checkpoint mic.wav far.wav out.wav</code></td><td>—</td><td>離線推論</td><td>目錄模式以檔名配對（mic → lpb）；沒給 <code>--ref-dir</code> 則 reference 為靜音（純降噪）；輸出檔名 <code>*_mic.wav</code> 寫成 <code>*_ours.wav</code>；<code>--verify</code> 只列印差異、不改變結束碼</td></tr>
+<tr><td><code>calib</code> 子命令</td><td><code>inference.py calib</code></td><td><code>--checkpoint</code>／<code>--primary-dir</code>（mic WAV）／<code>--far-dir</code>／<code>--output</code>／<code>--format</code>(bin|npz)／<code>--frames</code>(256)／<code>--max-delay-frames</code>／<code>--seed</code>(42)／<code>--onnx</code>／<code>--pair-replace</code></td><td>—</td><td>PTQ 校正</td><td>錄到的 <code>mic</code>／<code>far</code> 是 host 壓縮後的 planar 頻譜；同 process 匯出並 parity 檢查 graph</td></tr>
+<tr><td><code>[model] max_delay_seconds</code></td><td>訓練 <code>config.ini</code></td><td>秒</td><td>出貨 0.5（建構子預設 1.0）</td><td>訓練</td><td>16 kHz 上 0.5 s ＝ D 32；訓練 D 與部署 D 可以不同</td></tr>
+</table></div>
+<h3>內部：存在且可改，但不建議開放</h3>
+<div class="tbl"><table>
+<tr><th>名稱</th><th>值</th><th>位置</th><th>不開放的原因</th></tr>
+<tr><td>出貨 grid</td><td>16000／512／256／257 bins</td><td><code>config.ini [signal]</code>、匯出的 graph</td><td>模型只訓練並驗證過這一組；頻率階梯 257→129→65→33→17 由此導出。函式庫不限定（run-time grid），但 graph 的頻率軸形狀隨 grid 變</td></tr>
+<tr><td><code>DEEPVQE_PREPOST_LAYOUT_VERSION</code></td><td>4（1–3 已退役）</td><td><code>deepvqe_prepost.h</code></td><td>與 exporter 的 <code>DEEPVQE_C_LAYOUT_VERSION</code> 互鎖；擋下舊板綁新圖。刻意不與 ULCNet 版號共用</td></tr>
+<tr><td><code>DEEPVQE_COMPRESSION_EXP</code></td><td>0.3</td><td><code>deepvqe_prepost.h</code></td><td>host 前端與訓練共用；<code>export_onnx.py</code> 拒絕其他指數的 checkpoint</td></tr>
+<tr><td><code>DEEPVQE_TIME_ORDER</code>／<code>DEEPVQE_FREQ_TAPS</code>、<code>deepvqe_prepost_taps_elements(grid)</code></td><td>3／3、n_bins×3×3×2</td><td><code>deepvqe_process.h</code>、<code>deepvqe_prepost.h</code></td><td>CCM 形狀；taps 末軸 <code>[time][frequency][RI]</code> 與 C 陣列同一塊記憶體</td></tr>
+<tr><td>state 形狀（conv window 4 幀、score window 5 幀、sim 通道 4、value 通道 24、GRU 1 層 192）</td><td>見 State 表</td><td>匯出的 graph</td><td>由 checkpoint 拓撲決定；函式庫不持有，descriptor 的四個 interior 欄位（<code>conv_window_frames</code>、<code>score_window_frames</code>、<code>gru_layers</code>、<code>gru_hidden</code>）恆為 0、不被讀取</td></tr>
+<tr><td><code>DeepVqeStateId</code> 與 <code>DEEPVQE_STATE_COUNT</code></td><td>16 個，順序固定</td><td><code>deepvqe_prepost.h</code></td><td>就是 graph 在兩個 signal input 之後的 input 順序；按索引綁定的 adapter 依賴它</td></tr>
+<tr><td><code>DEEPVQE_PREPOST_CARVE_VERSION</code> = 8；<code>DEEPVQE_PREPOST_DESCRIPTOR_VERSION</code>／<code>DEEPVQE_PREPOST_ALIGNMENT</code></td><td>1／16</td><td><code>deepvqe_prepost.h</code></td><td>pool 切分與 32-byte descriptor 版本；進 <code>build_flags_hash</code></td></tr>
+<tr><td>fail-closed 的 skip 政策</td><td><code>"mute_fail_closed"</code></td><td><code>deepvqe_prepost.c</code></td><td>由「stream 0 是原始 mic」這個事實決定，不是偏好設定</td></tr>
+</table></div>
+
+<h2 id="pcm">PCM SDK 時序與狀態</h2>
+<h3>流程圖（block diagram）</h3>
+<pre>
+PCM in (int16 mic_in, far_in)
+  |
+  v
+int16 -> float (/32768)  x2（無 HPF）
+  |
+  v
+ac_stft_push_planar x2 (stft_mic, stft_far) -----> mic_re/im, far_re/im
+  |
+  v
+deepvqe_prepost_pre_process_freq
+  |
+  v
+deepvqe_prepost_frame_open ---> DeepVqeHopIO{inputs, outputs, state_generation}
+  |                                        |
+  |                                        v
+  |                              (呼叫端:NPU / 替身跑 io.inputs -> io.outputs)
+  |                                        |
+  v                                        v
+deepvqe_stream_post_process(ai_rc) <-------
+  |  ai_rc==0: frame_finish          ai_rc!=0: frame_bypass(當拍頻譜歸零)
+  v
+deepvqe_prepost_post_process_freq
+  |
+  v
+ac_istft_push_planar (AcIstft, AC_OLA_ENV_NORM；首拍回 0 個樣本)
+  |
+  v
+float -> int16 飽和轉換（首拍與 push 回 0 時填零）
+  |
+  v
+PCM out (int16, 永遠完整一個 hop)
+</pre>
+
+<h2 id="section-9">訊號泳道圖</h2>
+<p>lifeline：<code>caller</code>（含 <code>AcStft</code>／<code>AcIstft</code>）、<code>deepvqe_stream</code>（本層）、<code>NPU</code>（替身或目標平台 runtime）。沒有模型延遲，只有合成法的一拍啟動靜音。</p>
+<pre>
+hop   caller                       deepvqe_stream                       NPU
+0     mic_in,far_in -> pre_process -> STFT x2, pre_process_freq, open -> 跑一次 (CCM ring 全零歷史)
+      &lt;-- 1 (job開啟) --------------------------------------------
+      ai_rc=run_accelerator ---------------------------------->  寫 taps + state
+      post_process(ai_rc) --------> frame_finish -------------->
+      &lt;-- 0 (ENV_NORM 首拍無輸出, 靜音) ---- ISTFT push=0 ------
+1     mic_in,far_in -> pre_process -> STFT x2, pre_process_freq, open -> 跑一次
+      ai_rc=run_accelerator ---------------------------------->  寫 taps + state
+      post_process(ai_rc) --------> frame_finish -------------->
+      &lt;-- 1 (真實輸出) --------------------- ISTFT push=hop ----
+  ... (fail-closed 範例) ...
+k     pre_process -> open --------------------------------------> 替身回 -1, 不寫 taps
+      post_process(ai_rc=-1) -----> frame_bypass (本拍頻譜貢獻歸零, 非直通 mic_in) ->
+      &lt;-- 1 (PCM 仍疊加上一拍 OLA 尾段, 單拍不保證全零; 連續兩拍才靜音) --
+</pre>
+
+<h2 id="section-10">I/O 表</h2>
+<div class="tbl"><table>
+<tr><th>方向</th><th>名稱</th><th>型別／shape</th><th>一次呼叫</th><th>對應時域樣本</th></tr>
+<tr><td>輸入</td><td><code>mic_in</code>、<code>far_in</code></td><td><code>const int16_t*</code>，各長度 <code>deepvqe_stream_hop_size(s)</code></td><td>每 hop 1 次</td><td>1 hop（16 kHz／512 時為 256 samples）</td></tr>
+<tr><td>輸入（可選）</td><td><code>io.inputs</code>（<code>DeepVqePrepostInputs</code>）</td><td><code>mic</code>／<code>far</code> 各 <code>[1,2,1,BINS]</code>（壓縮後平面複數），16 組 state 視圖（<code>DeepVqeStateId</code>）</td><td>僅 <code>pre_process</code> 回 1 時有效</td><td>—</td></tr>
+<tr><td>輸出</td><td><code>io.outputs</code>（<code>DeepVqePrepostOutputs</code>）</td><td><code>taps</code> <code>[1,1,BINS,TIME_ORDER*FREQ_TAPS*2]</code>（NaN 預填），16 組 <code>state_out</code></td><td>加速器寫一次</td><td>—</td></tr>
+<tr><td>輸出</td><td><code>pcm_out</code></td><td><code>int16_t*</code>，長度同 <code>mic_in</code></td><td>每 hop 1 次，永遠寫滿</td><td>1 hop</td></tr>
+</table></div>
+<p class="note"><code>DEEPVQE_TIME_ORDER = 3</code>、<code>DEEPVQE_FREQ_TAPS = 3</code>、<code>DEEPVQE_STATE_COUNT = 16</code>（<code>lib/aiaec/deepvqe_s/deepvqe_process.h</code>／<code>deepvqe_prepost.h</code>）。</p>
+
+<h2 id="section-11">State 表</h2>
+<div class="tbl"><table>
+<tr><th>State</th><th>誰保存</th><th>跨 hop 保存什麼</th><th>何時歸零／推進</th></tr>
+<tr><td>STFT／ISTFT 歷史</td><td>本層（兩路 <code>AcStft</code>＋一路 <code>AcIstft</code>，pool 內）</td><td><code>AC_OLA_ENV_NORM</code> 的重疊與包絡</td><td><code>deepvqe_stream_reset()</code></td></tr>
+<tr><td>CCM ring（原始 mic 歷史）</td><td><code>DeepVqePrepost</code> 內部</td><td>最近 <code>TIME_ORDER</code> 個原始 mic 頻譜，供 tap 套用</td><td>reset 時清空；<code>ai_rc != 0</code> 的 bypass 不動；<code>frame_finish</code> 的非有限拒收「ring 不推進」但不清空</td></tr>
+<tr><td>16 組遞迴 state</td><td>登錄則呼叫端持有，未登錄則加速器自行持有</td><td>align key/value ring、score history、GRU hidden、far/mic/up/res history 等</td><td>reset 全歸零；<code>frame_finish</code> 的非有限拒收只歸零「已登錄的 state」</td></tr>
+<tr><td><code>state_generation</code></td><td>轉呼叫 <code>deepvqe_prepost_state_generation()</code></td><td>目前 generation 值</td><td>init=0；reset 或非有限拒收各 +1；<code>ai_rc != 0</code> 的單純 bypass 不推進</td></tr>
+</table></div>
+
+<h2 id="section-12">延遲與啟動行為</h2>
+<div class="tbl"><table>
+<tr><th>項目</th><th>值（16 kHz／512／delay_depth=32）</th><th>出處</th></tr>
+<tr><td>hop</td><td>256 samples = 16 ms</td><td>實測（見下方 pool 量測）</td></tr>
+<tr><td>模型延遲</td><td>0（每 hop 一幀，<code>deepvqe_prepost.h</code>：「no latency beyond it」）</td><td><code>deepvqe_prepost.h</code></td></tr>
+<tr><td><code>AC_OLA_ENV_NORM</code> 啟動靜音</td><td>1 hop（init 或任一次 reset 後的第一次 push）</td><td><code>audio_stft.h</code>；<code>post_process</code> 的 0 回傳值</td></tr>
+<tr><td>CCM ring 部分零歷史</td><td>前 <code>TIME_ORDER-1</code> = 2 個 hop</td><td>模型自身啟動行為，非延遲</td></tr>
+</table></div>
+</main>
+</body>
+</html>

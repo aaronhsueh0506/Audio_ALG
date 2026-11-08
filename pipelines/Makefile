@@ -818,7 +818,7 @@ $(BIN_DIR)/test_mcab_sample_post: $(OBJ_DIR)/test_mcab_sample_post.o $(AEC_LIB) 
 	$(LINK) -o $@ $(OBJ_DIR)/test_mcab_sample_post.o $(AEC_LIB) $(NR_LIB) $(COMMON_LIB) $(LDFLAGS)
 	@echo "test_mcab_sample_post [$(BACKEND)] -> $@"
 
-# test_readme_flow: the call-flow examples of README_01_latency_call_flow.md, compiled and run (chain a stage, DFN and ULCNet phased hops).
+# test_readme_flow: the call-flow examples of reference/call-flow.md, compiled and run (chain a stage, DFN and ULCNet phased hops).
 $(BIN_DIR)/test_readme_flow: $(OBJ_DIR)/test_readme_flow.o $(ULCNET_PIPELINE_OBJS) $(OBJ_DIR)/ulcnet_model_io.o $(DFN_LIB_TARGET) $(AEC_LIB) $(NR_LIB) $(COMMON_LIB) | _cfg_guard
 	$(LINK) -o $@ $(OBJ_DIR)/test_readme_flow.o $(ULCNET_PIPELINE_OBJS) $(OBJ_DIR)/ulcnet_model_io.o $(DFN_LIB_TARGET) $(AEC_LIB) $(NR_LIB) $(COMMON_LIB) $(LDFLAGS)
 	@echo "test_readme_flow [$(BACKEND)] -> $@"

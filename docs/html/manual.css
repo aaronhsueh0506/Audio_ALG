@@ -1,0 +1,20 @@
+/* Shared by the offline Audio_ALG manuals. */
+:root { color-scheme: light dark; font-family: system-ui, sans-serif; line-height: 1.65; }
+body { max-width: 63rem; padding: 1rem clamp(1rem, 4vw, 3rem) 4rem; margin: auto; }
+h1, h2, h3 { line-height: 1.32; }
+h1 { margin: 1.4rem 0 1rem; }
+h2 { margin-top: 2rem; padding-top: .6rem; border-top: 1px solid #8995a366; }
+a { color: #164d86; text-underline-offset: .16em; }
+nav { font-size: .9rem; }
+pre, code { font-family: ui-monospace, Menlo, Consolas, monospace; }
+code { overflow-wrap: anywhere; }
+pre { overflow-x: auto; padding: .8rem 1rem; line-height: 1.45; background: #e3e9ef70; }
+pre code { overflow-wrap: normal; }
+table { display: block; overflow-x: auto; border-collapse: collapse; font-size: .95rem; }
+th, td { padding: .35rem .6rem; text-align: start; vertical-align: top; border: 1px solid #8995a36b; }
+th { background: #bacadd40; }
+.choices dt { margin-top: 1.4rem; font-size: 1.12rem; font-weight: 650; }
+.choices dd { margin: .2rem 0 .9rem; }
+.note, .small { font-size: .92rem; }
+.warn { border-inline-start: 3px solid #a56428; padding-inline-start: .8rem; }
+@media (prefers-color-scheme: dark) { a { color: #99c9ff; } pre { background: #283542; } }

@@ -1,0 +1,71 @@
+<!doctype html>
+<html lang="zh-Hant">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Align-CRUSE · Audio_ALG</title>
+<link rel="stylesheet" href="../../manual.css">
+</head>
+<body>
+<nav aria-label="導覽"><a href="../../index.html">Audio_ALG</a> / <a href="../index.html">模型開發與部署</a></nav>
+<main>
+<h1>Align-CRUSE</h1>
+<h2>概要</h2>
+<p>Align-CRUSE 是端到端 AEC+RES+NR：輸入是未對齊的 mic 與 far 複數頻譜（前面沒有 linear AEC），輸出是 real magnitude mask，乘在 mic 頻譜上（保留 mic 相位）。<b>目前沒有對應的 C pre/post 類別</b>（<a href="../reference/onnx.html">ONNX 邊界與 calibration</a> 的缺口表有一列）：可執行、有測試的呼叫路徑是 Python 參考實作與 ONNX 匯出／校正工具；C 端現有的零件只有 audiolib 的 <code>AcStft</code>／<code>AcIstft</code> 與 <code>align_cruse_process.h</code> 的 <code>aiaec_apply_real_mask()</code>。模型內容、I/O 表、State 表、warm-up 的 T ≥ D 限制見 <a href="reference/core.html">Align-CRUSE 頻域與模型契約</a>。</p>
+
+<h2>如何呼叫使用</h2>
+<h3>A. Python 串流參考（逐 hop，已測試）</h3>
+<ol>
+<li><code>load_model(checkpoint, device)</code> 回 <code>(model, grid)</code>：grid、alignment 設定全由 checkpoint 內的 contract 還原，<b>不讀 <code>config.ini</code></b>，所以推論不會悄悄偏離訓練設定。</li>
+<li><code>model.create_stream_state()</code>：新的一段串流＝新的全零 state（<code>alignment_mode="paper_global"</code> 的 checkpoint 會直接 <code>ValueError</code>，因為整段非因果）。</li>
+<li>每個 hop 把 mic／far 各推入 <code>StreamSTFT</code>，對每個吐出的框呼叫 <code>forward_stream(microphone, far_end, state)</code>，把 <code>res.enhanced[:, 0]</code> 推入 <code>StreamISTFT</code>。第一個 hop 的 STFT 不吐框、ISTFT 輸出 0 個樣本（centered 排程的 reflect 前綴）。</li>
+</ol>
+<pre>import soundfile as sf
+import torch
+from AIAEC.Align_CRUSE.inference import load_model
+from AIAEC.aiaec_streaming import StreamSTFT, StreamISTFT
+
+model, grid = load_model("checkpoint.pth", "cpu")   # grid/D 全部取自 checkpoint contract
+state = model.create_stream_state()                 # 新的一段串流 = 新的全零 state
+window = grid.window(device="cpu")                  # sqrt-Hann, 長度 n_fft
+H = grid.hop_len                                    # 16 kHz: 256
+mic_stft = StreamSTFT(grid.n_fft, H, window)
+far_stft = StreamSTFT(grid.n_fft, H, window)
+synth = StreamISTFT(grid.n_fft, H, window)
+
+mic, sr = sf.read("mic.wav", dtype="float32")       # 單聲道, 取樣率須等於 checkpoint 的 sr
+far, _ = sf.read("far.wav", dtype="float32")
+mic, far = torch.from_numpy(mic)[None], torch.from_numpy(far)[None]
+
+pieces = []
+with torch.no_grad():
+    for s in range(0, mic.shape[1] - H + 1, H):
+        for m, f in zip(mic_stft.push(mic[:, s:s + H]), far_stft.push(far[:, s:s + H])):
+            res = model.forward_stream(m.unsqueeze(1), f.unsqueeze(1), state)
+            pieces.append(synth.push(res.enhanced[:, 0]))   # 輸出頭一個 hop 為 0 個樣本
+sf.write("out.wav", torch.cat(pieces, dim=1)[0].numpy(), sr)</pre>
+<p class="note">片語已用隨機權重的模型代入 <code>load_model</code> 實際跑過（1 秒、16 kHz 輸入得到 15,616 個輸出樣本＝少第一個 hop）。命令列等價形式：<code>python3 AIAEC/Align_CRUSE/inference.py checkpoint.pth mic.wav far.wav out.wav [--device cpu] [--verify]</code>，或目錄模式 <code>--mic-dir D [--ref-dir D2] --out-dir D3</code>（沒給 <code>--ref-dir</code> 則 reference 為靜音，等同純降噪）；輸出沿用輸入樹，<code>*_mic.wav</code> 寫成 <code>*_ours.wav</code>。取樣率不同的 WAV 會先重取樣到 checkpoint 的 rate；兩路必須描述同一條時間軸。<code>--verify</code> 只列印差異、不改變結束碼。</p>
+<h3>B. 匯出與 PTQ 校正（給目標平台工具鏈）</h3>
+<pre>python3 AIAEC/Align_CRUSE/export_onnx.py --checkpoint checkpoint.pth \
+    --output output/align_cruse.onnx [--max-delay-frames D] [--opset 17] --verify
+python3 AIAEC/Align_CRUSE/inference.py calib --checkpoint checkpoint.pth \
+    --primary-dir /path/to/microphone --far-dir /path/to/far \
+    --frames 8192 --format bin --output calib/align_cruse</pre>
+<p>校正需要<b>一條不中斷的錄音</b>（拼接短檔會讓 <code>score_sum</code> 在每個接縫歸零）；<code>state_align_score_sum</code> 是 <code>float32_no_ptq</code>、<code>state_align_frame_index</code> 是 <code>int64_no_ptq</code>，不可整數量化。</p>
+<h3>C. 部署契約（以現有零件組成；沒有對應的 C 類別與測試）</h3>
+<ol>
+<li>graph 輸入：<code>mic</code>、<code>far</code>（各 <code>[1,1,257,2]</code>，未正規化 RI 頻譜）加 11 個 state；輸出：<code>output</code>（<code>[1,1,257]</code> mask）與 11 個 <code>*_out</code>，每個與同名輸入同 shape，由 runtime 綁在同一個位址。</li>
+<li>host 前端：應用端以 audiolib 建立的 <code>AcStft</code>（sqrt-Hann，512/512/256）把 mic 與 far 轉成頻譜，排成 <code>[bin][re,im]</code> 餵圖；<b>圖內自己做 log-power</b>，C 端不做壓縮。</li>
+<li>host 後端：<code>aiaec_apply_real_mask(mic_re, mic_im, mask, out_re, out_im, n_bins)</code>，再經 <code>AcIstft</code> 合成。</li>
+<li>匯出 metadata 沒有 <code>state_layout_version</code> 與 <code>c_descriptor</code>（缺席就是「C 端沒有綁定這個模型」）；<code>state_binding</code> 為 <code>in_place_same_address</code>。</li>
+</ol>
+
+<h2>參考</h2>
+<ul>
+<li><a href="reference/core.html">模型張量、狀態與參數</a></li>
+<li><a href="../../../../lib/aiaec/align_cruse/align_cruse_process.h">公開 C 標頭</a></li>
+<li><a href="../../../../AIAEC/Align_CRUSE/README.md">訓練與匯出</a></li>
+</ul>
+</main>
+</body>
+</html>

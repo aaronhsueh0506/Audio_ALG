@@ -1,0 +1,35 @@
+<!doctype html>
+<html lang="zh-Hant">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>建置與第一次執行 · Audio_ALG</title>
+<link rel="stylesheet" href="../manual.css">
+</head>
+<body>
+<nav aria-label="導覽"><a href="../index.html">Audio_ALG</a></nav>
+<main>
+<h1>建置與第一次執行</h1>
+<p>在 <code>Audio_ALG/</code> 根目錄執行。預設從同層的 <code>AEC/</code>、<code>NR/</code> 和 <code>audiolib/</code> 讀取 C 原始碼，版本由 <code>lib/*.pin</code> 指定。</p>
+
+<h2>建置 mono 範例</h2><pre><code>make -f lib/deps.mk bootstrap-deps
+make -C pipelines check-pins
+make -C pipelines
+BIN=&quot;$(make -s -C pipelines print-bin-dir)&quot;
+&quot;$BIN/aec_nr_pipeline&quot; mic.wav far.wav enhanced.wav balanced</code></pre>
+
+<p>準備取樣率相同、時間對齊的單聲道 16 kHz PCM WAV。<code>mic.wav</code> 是收音，<code>far.wav</code> 是播放參考，第三個路徑是輸出。要跑 Python pipeline 或 WAV parity，先執行 <code>git submodule update --init --recursive</code>，讓 Python 匯入和測資可從 <code>lib/aec</code>、<code>lib/nr</code> 取得。</p>
+
+<h2>參考</h2>
+<ul>
+<li><a href="../pipelines/mono/aec-nr-res/index.html">Mono 每 hop 呼叫與參數</a></li>
+<li><a href="../pipelines/index.html">四聲道與其他後級</a></li>
+<li><a href="../models/index.html">建立單模型串流</a></li>
+<li><a href="reference/integration.html">自訂 pipeline 的訊號與記憶體接線</a></li>
+<li><a href="reference/timing.html">時序與 reset</a></li>
+<li><a href="reference/grids.html">Grid、視窗、延遲與版號</a></li>
+<li><a href="reference/architecture.html">傳統語音鏈的演算法與訊號圖</a></li>
+</ul>
+</main>
+</body>
+</html>

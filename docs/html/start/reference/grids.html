@@ -1,0 +1,330 @@
+<!doctype html>
+<html lang="zh-Hant">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>訊號 grid、視窗與記憶體版號 · Audio_ALG</title>
+<link rel="stylesheet" href="../../manual.css">
+</head>
+<body>
+<nav aria-label="導覽"><a href="../../index.html">Audio_ALG</a> / <a href="../index.html">建置與第一次執行</a></nav>
+<main>
+<h1>訊號 grid、視窗與記憶體版號</h1>
+<details><summary>本頁目錄</summary>
+<ul>
+<li><a href="#section-2">Grid 總表（各層預設與白名單）</a></li>
+<li><a href="#section-3">視窗慣例：重建路徑一律 periodic sqrt-Hann</a></li>
+<li><a href="#section-4">centered framing 與串流（center=False）framing</a></li>
+<li><a href="#section-5">延遲預算表</a></li>
+<li><a href="#section-6">版號一覽（layout／carve）</a></li>
+<li><a href="#latency">延遲預算</a></li>
+</ul></details>
+<h2 id="section-1">概要</h2>
+<p>整條鏈的共同格點規則：<b>frame == FFT、hop = fft/2（50% overlap）、無
+transform zero-padding、bins = fft/2+1</b>。各層各有自己的預設與白名單，
+本頁把它們放在同一張表；另外收錄三件跨模組最容易踩的 framing 事實：
+重建路徑一律 periodic sqrt-Hann、PBFDKF 線性路徑的矩形窗例外、
+centered 與串流（center=False）framing 在穩態逐 bit 等價。</p>
+
+<h2 id="section-2">Grid 總表（各層預設與白名單）</h2>
+<div class="tbl">
+<table>
+<tr><th>元件</th><th>SR</th><th>FFT=frame / hop（bins）</th><th>預設？</th><th>出處</th></tr>
+<tr><td rowspan="4">AEC（<code>lib/aec/c_impl</code>）<br>
+<span class="note">hop=fft/2、block=fft、K=fft/2+1（<code>aec_derive_dims()</code>，<code>aec.c</code>）</span></td>
+<td>8 k</td><td>256 / 128（129）</td><td>預設（唯一）；legacy，非產品格點</td>
+<td rowspan="4"><code>aec.c</code> <code>aec_config_defaults()</code>
+（48k→1024、16k→256、8k→256）與 <code>aec_validate_config()</code> 白名單；
+<code>filter_length</code> 預設 52 ms（=832 taps @16k）、sr≥44100 為 64 ms</td></tr>
+<tr><td>16 k</td><td><b>256 / 128（129）＝8 ms hop 預設</b></td><td>預設</td></tr>
+<tr><td>16 k</td><td>512 / 256（257）＝16 ms hop</td><td>配置選項（ULCNet/NN 鏈用）</td></tr>
+<tr><td>48 k</td><td>1024 / 512（513）</td><td>預設（唯一）</td></tr>
+<tr><td rowspan="3">NR（<code>lib/nr/c_impl</code>）</td>
+<td>8 k</td><td>128 / 64（65）；替代 256 / 128</td><td>預設 128</td>
+<td rowspan="3"><code>anr_types.h</code> <code>anr_default_fft_size()</code>
+（48k→1024、16k→256、8k→128；註明 16 ms-hop 替代 grid 8k/256、16k/512）</td></tr>
+<tr><td>16 k</td><td>256 / 128（129）；替代 512 / 256</td><td>預設 256</td></tr>
+<tr><td>48 k</td><td>1024 / 512（513）</td><td>預設（唯一）</td></tr>
+<tr><td>mono pipeline（<code>pipelines/</code>）</td><td>8/16/48 k</td>
+<td>同 AEC 白名單；16 k 接受 256 或 512</td>
+<td>16k 預設 256/128</td>
+<td><code>pipelines/mono_aec_nr_res/main.c</code> <code>derive_lane()</code>（呼叫 lib/aec 的 <code>aec_resolve_signal_grid()</code>；8 k 只有 256）</td></tr>
+<tr><td>4ch mcab flow（<code>4ch_aec_bf_nr_res/</code>）</td><td>16/48 k</td>
+<td>只有三個 grid：16k/256、16k/512、48k/1024（<b>無 8 k</b>）</td><td>16k 預設 256</td>
+<td><code>pipelines/4ch_aec_bf_nr_res/mcab.c</code> <code>flow_grid()</code>（無 8 k）</td></tr>
+<tr><td rowspan="2">ULCNet 變體（mono + 4ch）</td><td>16 k</td>
+<td><b>512 / 256（257）</b>；ta_bins 26</td>
+<td rowspan="2">應用端於執行期給定：<code>ulcnet_grid_make(&amp;grid, &amp;spec)</code>
+（<code>UlcnetGridSpec</code> = <code>sample_rate</code>、<code>n_fft</code>、<code>delay_depth</code>），
+範例 main 以 <code>--sample-rate 16000|48000</code>（預設 16000）選；一支 binary 兩個 grid 皆可，
+exporter 只收這兩個（<code>SUPPORTED_GRIDS</code>），16 k 的 checkpoint 不能當 48 k 用</td>
+<td rowspan="2"><code>ulcnet_model_io.h</code>（<code>UlcnetGrid</code>）、<code>ulcnet_process.h</code>（framing 契約）、
+<code>pipelines/ulcnet/ulcnet_nn_stage.h</code>；<code>ta_bins</code> 由 exporter 的 <code>ta_bins_for()</code> 導出</td></tr>
+<tr><td>48 k</td><td><b>1024 / 512（513）</b>；ta_bins 52</td></tr>
+<tr><td rowspan="3">DFN2 變體（mono + 4ch）<br>
+<span class="note">共用 <code>pipelines/dfn/dfn_res_stage.{h,c}</code>；1/√n_fft 進 / √n_fft 出的尺度邊界（出貨 grid 為 <code>2^-5</code> / <code>2^5</code>）</span></td>
+<td>host：mono 8/16/48 k、4ch 16/48 k</td>
+<td>host 自己的格點清單（mono 8k/256、16k/256 預設、16k/512、48k/1024；4ch 無 8 k）</td>
+<td rowspan="3"><b>host 留在產品取樣率，只有 DFN2 stage 在模型的取樣率（出貨 48 k）</b>：host 在該取樣率時直接餵 stage，
+其他格點由 <code>pipelines/dfn/dfn_rate_bridge.{h,c}</code>（<code>DFN_RATE_BRIDGE_LAYOUT_VERSION = 5</code>）
+做原生 WOLA → 升頻 → 48 k 分析 → stage → 48 k WOLA → 降頻。
+呼叫端<b>不</b>需要在 API 之外先 resample</td>
+<td rowspan="3"><code>pipelines/dfn/dfn_res_stage.c</code>（<code>DfnResStageConfig.grid</code>）、
+<code>pipelines/dfn/dfn_rate_bridge.c</code>、
+<code>pipelines/dfn/dfn_hop.h</code>、
+<code>pipelines/dfn/mono_aec_dfn_res/main.c</code>、
+<code>pipelines/dfn/4ch_aec_bf_dfn_res/main.c</code></td></tr>
+<tr><td>stage：出貨 48 k</td><td><b>1024 / 512（513）</b>；stage 跑 <code>DfnResStageConfig.grid</code>（應用端 <code>dfn2_grid_make()</code> 建，範例 main 以 <code>--ai-sample-rate</code>／<code>--ai-fft-size</code> 從 16000/256、48000/1024 兩列的表選），rate bridge 只收 48 k／1024 的模型（其他回 -1）</td></tr>
+<tr><td>其他</td><td>拒絕（<code>get_mem_requirements()</code> 回 -1）</td></tr>
+<tr><td><a href="../../models/dfn2/reference/grid.html">AINR DFN2</a></td><td>出貨 48 k；其他 grid 由應用端於執行期給定（板端表有 16 k／32 k，暫定）</td>
+<td>出貨 1024 / 512（513）；<b>非上游 960/480</b>（2 的次方限制；DF 截止 4500 Hz
+vs 上游 4800 Hz）</td><td>執行期給定：應用端填 <code>DFN2GridSpec</code>、呼叫 <code>dfn2_grid_make()</code>，函式庫沒有格點常數（pool 由 <code>dfn2_prepost_get_mem_size()</code> 依 grid 算）；lookahead pair 是 spec 的欄位（出貨 1/1）</td>
+<td><code>dfn2_grid.h</code>、<code>dfn2_process.c</code></td></tr>
+<tr><td><a href="../../models/dfn3/reference/core.html">AINR DFN3</a></td><td>48 k</td><td>1024 / 512（513）；32 ERB bands、96 DF bins</td><td>執行期給定：<code>DFN3GridSpec</code>→<code>dfn3_grid_make()</code>；mask／DF lookahead pair 是 spec 的欄位（15 組合法 pair，出貨 1/1）</td><td><code>dfn3_process.h</code></td></tr>
+<tr><td>AINR GTCRN</td><td>16 k（模型的取樣率，不是 grid 欄位）</td><td>512 / 256（257）</td><td>執行期給定：<code>GTCRNGridSpec</code>（<code>n_fft</code>、<code>erb_low_bins</code>、<code>erb_high_bands</code>）→<code>gtcrn_grid_make()</code></td>
+<td><code>gtcrn_process.h</code></td></tr>
+<tr><td>AINR RNNoise-ERB</td><td>16 k</td>
+<td>512 / 256（257）；22 ERB bands + complex 特徵 0–4 kHz（129 bins）</td>
+<td>執行期給定：<code>RNNoiseGridSpec</code>→<code>rnnoise_grid_make()</code></td><td><code>RNNoise-ERB/process.h</code></td></tr>
+<tr><td>AIAEC Align-ULCNet</td><td>16 k / 48 k</td>
+<td>512 / 256（257）或 1024 / 512（513）</td><td>訓練端 config 固定；C 端執行期給定（<code>UlcnetGridSpec</code>）</td>
+<td><code>config.ini</code>；<code>export_onnx.py</code> 的
+<code>SUPPORTED_GRIDS</code></td></tr>
+<tr><td>AIAEC DeepVQE-S</td><td>16 k</td>
+<td>512 / 256（257）</td><td>訓練端 config 固定；C 端執行期給定（<code>DeepVqeGridSpec</code>→<code>deepvqe_grid_make()</code>）</td>
+<td><code>config.ini</code>；<code>deepvqe_prepost.h</code></td></tr>
+<tr><td>AIAEC 其餘兩個（CRUSE/CAGCRN）</td><td>16 k</td>
+<td>512 / 256（257）</td><td>config 固定；各模型的 mask helper 只處理 caller 給的 <code>n_bins</code></td>
+<td>各模型的 <code>config.ini</code></td></tr>
+</table>
+</div>
+
+<h2 id="section-3">視窗慣例：重建路徑一律 periodic sqrt-Hann</h2>
+<p>所有「會被合成回時域」的路徑（分析與合成兩側）用同一個公式，denominator
+= block 長度 N（periodic，非 symmetric）：</p>
+<pre>w[k] = sqrtf(0.5 * (1 - cos(2*pi*k / N)))     k = 0..N-1</pre>
+<div class="tbl">
+<table>
+<tr><th>使用點</th><th>程式碼</th></tr>
+<tr><td>AEC RES 分析窗（error_spec_windowed 用）</td>
+<td><code>pbfdkf.c</code> <code>pbfdaf_fill_windows()</code>（<code>ac_window_build()</code>,denom = block_size）</td></tr>
+<tr><td>AEC3 post 合成窗（16k/512 grid 表格化 = sin(πk/512)）</td>
+<td><code>aec_balanced_config.h</code> <code>AECB_SYNTH_WINDOW[512]</code>（per-rate 表）</td></tr>
+<tr><td>mono 範例合成窗</td><td><code>pipelines/mono_aec_nr_res/main.c</code>：main 自己初始化的 <code>AcIstft</code> 借用 AEC 的窗表（初始化後的 <code>Aec</code> 經 <code>aec_synthesis_window()</code> 取得；<code>AcStftConfig.window</code> 借入，不另切）</td></tr>
+<tr><td>4ch 範例合成窗</td><td><code>pipelines/4ch_aec_bf_nr_res/mcab_static.c</code>：main 自己初始化的 <code>AcIstft</code> 自帶的窗表（<code>ac_window_build()</code>，<code>audiolib/common/src/audio_window.c</code>）</td></tr>
+<tr><td>DFN rate bridge（原生格點合成 + 48 kHz 分析／合成）</td><td><code>pipelines/dfn/dfn_rate_bridge.c</code>：bridge 自建的兩張表（<code>win_n</code>、<code>win48</code>，<code>ac_window_build()</code>），借給五個 <code>AcStft</code>／<code>AcIstft</code></td></tr>
+<tr><td>ULCNet 兩條範例</td><td><code>pipelines/ulcnet/ulcnet_nn_stage.c</code>：far 分析的 <code>AcStft</code>（<code>ac_stft_config_default()</code>）自帶 FFT handle 與窗表，誤差分析與合成借用</td></tr>
+<tr><td>Align-ULCNet／DeepVQE-S／DFN2／DFN3／GTCRN／RNNoise-ERB 的前後處理</td><td>函式庫不持有窗表、FFT handle 或 STFT 物件：應用端用 <code>ac_stft_config_default(&amp;sc, grid.n_fft)</code> 的預設窗建 <code>AcStft</code>／<code>AcIstft</code>，分析與合成共用；各模型要求的 <code>center</code>、<code>ola</code> 與縮放寫在 <code>ulcnet_process.h</code>、<code>deepvqe_prepost.h</code>、<code>dfn2_process.h</code>、<code>dfn3_process.h</code>、<code>gtcrn_process.h</code>、<code>RNNoise-ERB/process.h</code> 檔頭</td></tr>
+<tr><td>AIAEC Python streaming 參考</td>
+<td><code>AIAEC/aiaec_streaming.py</code> StreamSTFT/StreamISTFT（對 torch center=True bit-exact）</td></tr>
+</table>
+</div>
+<p>sqrt-Hann 分析 × sqrt-Hann 合成 = Hann，在 50% overlap 下滿足 COLA，
+合成端不需 window-envelope 除法（<code>dfn2_process.h</code> 檔頭的 framing 契約：
+plain overlap-add，<code>AC_OLA_ACCUMULATE</code>）。
+例外是 torch.istft 語意的 ULCNet WOLA：它照 torch 做窗平方包絡正規化
+（<code>AC_OLA_ENV_NORM</code> 的 <code>env</code> 累加器），結果相同、簿記不同。</p>
+
+<h3>STFT／ISTFT 組幀家族（<code>audio_stft.h</code>）</h3>
+<p>上表所有呼叫點都經 audiolib 的 <code>AcStft</code>／<code>AcIstft</code>；差別只在兩個旋鈕：
+分析的 <code>center</code>（0 = 每次 push 恰一幀、零歷史起算；1 = torch <code>center=True</code>、reflect 前綴）與合成的
+<code>ola</code> 模式（<code>AC_OLA_ACCUMULATE</code> = acc += ifft×w、每幀吐一個 hop；<code>AC_OLA_ENV_NORM</code> =
+另累加 w×w、除以包絡、第一幀不吐）。頻譜縮放由 DFN2／DFN3／RNNoise-ERB 用：<code>spec_scale</code> = <code>grid.stft_scale</code>（1/√n_fft）；DFN2／DFN3 的 <code>ispec_scale</code> = <code>grid.stft_unscale</code>（√n_fft），
+RNNoise-ERB 的 <code>ispec_scale</code> 保持 1.0（√n_fft 已折進 <code>rnnoise_apply_gains()</code>）。出貨 grid（48 k／1024）的值是 1/32 與 32，皆 2 的冪、乘法不進位；
+n_fft 為 4 的次方（256、1024、4096）時精確，512 為四捨五入的 float。縮放恰為 1.0f 時略過乘法。
+<code>DfnResStage</code>／<code>DfnRateBridge</code> 吃 audio-scale 頻譜、自己乘 <code>stft_scale</code>／<code>stft_unscale</code>，呼叫端的 <code>AcStft</code>／<code>AcIstft</code> 保持 1.0。</p>
+<div class="tbl">
+<table>
+<tr><th>家族</th><th>呼叫點</th><th>分析</th><th>合成</th><th>FFT／窗</th></tr>
+<tr><td>A</td><td>mono／4ch 各 main 的 <code>ac_istft_push()</code></td><td>（在 AEC 內，非本物件）</td><td>ACCUMULATE</td><td>物件自帶 FFT 與窗</td></tr>
+<tr><td>B → A</td><td><code>dfn_rate_bridge.c</code>；應用端餵 DFN2／DFN3／GTCRN／RNNoise-ERB</td><td><code>center</code> 0（bridge 48 kHz 兩路、DFN2／DFN3／GTCRN／RNNoise-ERB）</td><td>ACCUMULATE（bridge 三路、DFN2／DFN3／GTCRN／RNNoise-ERB）</td><td>借用呼叫端／bridge 的 FFT handle 與窗</td></tr>
+<tr><td>C</td><td>應用端餵 <code>ulcnet_prepost</code>、<code>deepvqe_prepost</code>；兩條 ULCNet pipeline</td><td><code>center</code> 0（出貨路徑）；<code>center</code> 1 只剩 Python parity 測試</td><td>ENV_NORM</td><td>借用 pipeline／呼叫端的 FFT handle 與窗</td></tr>
+</table>
+</div>
+<p><code>AC_OLA_ACCUMULATE</code> 把每幀累加進已歸零的 acc 再吐出；若另一個實作改成「前一幀尾巴直接 copy」，兩者數值只可能差在零的符號
+（-0.0 對 +0.0），其他位元相同。窗公式 <code>sqrtf(0.5f - 0.5f*cosf(...))</code> 與 <code>sqrtf(0.5f*(1.0f - cosf(...)))</code> 在 float 下逐 bit 相同
+（0.5f 的乘法是精確的縮放）。</p>
+
+<h3>PBFDKF far_spec 矩形窗例外</h3>
+<p><b>線性濾波路徑沒有分析窗。</b>PBFDAF/PBFDKF 是 overlap-save 結構：
+far/near 的 block（= 2×hop 原始樣本）直接進 RFFT——
+<code>pbfdkf.c</code> 的 <code>rfft_padded(p, p->far_buffer, blk, p->far_spec)</code>
+與同樣的 near_spec——等效矩形窗。輸出取
+<code>echo_time[hop:block]</code> 有效半段、error_spec 由 zero-pad 的有效 hop 重建，全程無窗。sqrt-Hann 只出現在<b>供 RES/後級分析用</b>的
+<code>error_spec_windowed</code>（sqrt-Hann×near − echo_spec）。
+另有 <code>td_window</code>（IR 時域約束窗：在 [0, hop) 為 1、[hop, fft_size) 為 0，保留每個
+partition 的因果半、清掉其餘，避免 wrap-around 能量漏進下一個 valid hop），作用在濾波器係數不是訊號。</p>
+
+<h2 id="section-4">centered framing 與串流（center=False）framing</h2>
+<p>AINR DFN2 的 C 是 center=False 串流（<code>dfn2_process.h</code> 檔頭的 framing 契約：與訓練 graph 的 center=True 只差一個 clip 的第一幀），
+Align-ULCNet 的 C 出貨路徑也是 center=False rolling 分析，與 torch <code>center=True</code>
+的穩態幀逐 bit 重合（<code>ulcnet_process.h</code> 檔頭 +
+<code>docs/align_ulcnet_embedded_streaming_design_zh_TW_01_state_wola_delay.md</code> §7）。</p>
+<p><b>穩態幀為何重合（逐 bit）：</b>本 grid 下 win = n_fft、hop = win/2、同一
+sqrt-Hann 窗。centered 第 k 幀以樣本 k·hop 為中心，覆蓋
+[k·hop − win/2, k·hop + win/2) = [(k−1)·hop, (k+1)·hop)；
+non-centered 第 k−1 幀覆蓋 [(k−1)·hop, (k−1)·hop + win)——同一段樣本、
+同一張窗 → 頻譜逐 bit 相同，差別只剩幀編號。因此：</p>
+<ul>
+<li>兩種 framing 的 STFT→NN→ISTFT 鏈<b>穩態 I/O 延遲都是同一個 1 hop</b>
+（WOLA 收尾本來就要等下一幀；centered 的半窗 lookahead 藏在其中）。
+改 past-only framing 拿不到任何延遲收益。</li>
+<li>真實差異只有 (a) 串流開頭第一幀：reflect 前綴 vs 零填冷啟動（影響
+recurrent-state start transient）；(b) 檔案級評測的幀數/邊界；(c) 幀時間戳
+語意。checkpoint 的 feature-time contract 因此不能靜默改 framing——換
+framing 是輸入分佈變更，須 A/B。</li>
+<li>C 實作佐證：<code>AcStft</code>（<code>center</code> 1）的排程是 push#0→0 幀、
+push#1→2 幀（frame0 含 reflect 前綴 + frame1）、之後每 push 1 幀；輸出端
+<code>AcIstft</code>（ENV_NORM）frame#0→0 樣本（半窗 trim）、之後每幀 256 樣本——與 dfn2 的 center=False
+串流輸出排程逐 hop 相同。</li>
+</ul>
+<p><b>ULCNet 的兩種分析排程並存，出貨路徑分兩派。</b>
+<code>AcStft</code> 的 <code>center</code> 0（應用端以 <code>ac_stft_config_default()</code> 的預設建立，
+契約在 <code>lib/aiaec/ulcnet/ulcnet_process.h</code>）是 rolling 分析：
+<b>從第一次 push 起每次恰好一幀</b>（第一幀的前半段是被歸零的 history），
+且與 <code>center</code> 1 對同一個 pushed hop 所發的
+<b>最後一幀逐 bit 相同</b>——centered 排程只是多了開頭那個 reflect 前綴幀。
+上面的穩態等價性因此原封不動地成立，換掉的只是幀編號與串流開頭。
+<b>同一個 <code>AcStft</code> 不可混用兩種 <code>center</code></b>（<code>center</code> 在建立時固定）。</p>
+<ul>
+<li>用 <code>center</code> 0：三支前後處理 class 的 framing 契約
+（<code>ulcnet_prepost</code>／<code>deepvqe_prepost</code>／<code>dfn2_prepost</code> 都是
+center=False）、<b>4ch ULCNet pipeline 的 far 分支</b>，以及
+<b>mono ULCNet pipeline 兩路皆是</b>
+（<code>pipelines/ulcnet/ulcnet_nn_stage.c</code> 的 <code>ac_stft_push_planar(err_analysis / far_analysis, …)</code>）——因為它們要和
+AEC/BF seam 自己的頻譜（一 hop 一幀、從 hop 0 起）配對，一手已經是那種幀時，
+另一手就得用同一個排程才對得上 hop；mono 的 error/far 兩路本來就同 hop 推入，換成
+rolling 排程後兩者天生 hop-locked，不需再靠 centered 排程的 0/2/1 發射對齊。</li>
+<li>用 <code>center</code> 1：只剩 Python parity gate
+（<code>AIAEC/tests/test_ulcnet_process_c.py</code>）與
+<code>test_ulcnet_prepost_c.py</code> 的 <code>equiv</code> 案例，兩者都需要
+0/2/1 排程本身作為比對基準，不代表任何出貨 pipeline。</li>
+</ul>
+
+<h2 id="section-5">延遲預算表</h2>
+<p>mono／4ch 的 ULCNet pipeline 與 DFN2 變體（含 rate bridge）的逐階段演算法延遲，收在
+<a href="grids.html#latency">訊號 grid、視窗與記憶體版號</a>。</p>
+
+<h2 id="section-6">版號一覽（layout／carve）</h2>
+<p>跨呼叫保存或由呼叫端持有的 pool 都帶版號；版號只認 header 的 <code>#define</code>。
+<code>pipelines/tests/test_doc_layout_versions.py</code> 逐頁核對文件裡寫出的值，與下表同步。</p>
+<div class="tbl">
+<table>
+<tr><th>巨集 = 目前值</th><th>定義處</th><th>意義</th></tr>
+<tr><td><code>MCAB_LAYOUT_VERSION</code> = 26</td>
+<td><code>pipelines/4ch_aec_bf_nr_res/mcab.h</code></td>
+<td>4ch flow（共享 delay + 4 lanes + <code>mcab_fuse()</code>；lane 與 estimator 由應用程式建立後注入）自己的 pool 版號；<code>mcab_fuse()</code> 交出的 <code>g_res_ctx</code> 為 NULL；SRP-PHAT/BF 在 sample helper <code>mcab_sample_beam.h</code>，沒有 descriptor</td></tr>
+<tr><td><code>DFN_RES_STAGE_LAYOUT_VERSION</code> = 5</td>
+<td><code>pipelines/dfn/dfn_res_stage.h</code></td><td>DFN2 post-RES stage</td></tr>
+<tr><td><code>DFN_RATE_BRIDGE_LAYOUT_VERSION</code> = 5</td>
+<td><code>pipelines/dfn/dfn_rate_bridge.h</code></td><td>原生格點 ↔ 48 kHz stage 的 rate bridge</td></tr>
+<tr><td><code>ULCNET_MODEL_IO_LAYOUT_VERSION</code> = 18</td>
+<td><code>lib/aiaec/ulcnet/ulcnet_model_io.h</code></td><td>Align-ULCNet 模型 I/O 與 state 排列</td></tr>
+<tr><td><code>DEEPVQE_PREPOST_LAYOUT_VERSION</code> = 4</td>
+<td><code>lib/aiaec/deepvqe_s/deepvqe_prepost.h</code></td><td>DeepVQE-S 前後處理 class</td></tr>
+<tr><td><code>DFN2_PREPOST_CARVE_VERSION</code> = 11／<code>DFN3_PREPOST_CARVE_VERSION</code> = 9</td>
+<td><code>lib/ainr/dfn2/dfn2_prepost.h</code>、<code>lib/ainr/dfn3/dfn3_prepost.h</code></td><td>carve 走訪順序，進 <code>build_flags_hash</code></td></tr>
+<tr><td><code>ULCNET_PREPOST_CARVE_VERSION</code> = 8／<code>DEEPVQE_PREPOST_CARVE_VERSION</code> = 8</td>
+<td><code>lib/aiaec/ulcnet/ulcnet_prepost.h</code>、<code>lib/aiaec/deepvqe_s/deepvqe_prepost.h</code></td><td>同上</td></tr>
+<tr><td><code>GTCRN_PROCESS_CARVE_VERSION</code> = 1／<code>RNNOISE_CARVE_VERSION</code> = 1</td>
+<td><code>lib/ainr/gtcrn/gtcrn_process.h</code>、<code>lib/ainr/rnnoise_erb/process.h</code></td><td>同上</td></tr>
+</table>
+</div>
+<p class="note">4ch 應用端各物件（四條 lane、共享 estimator、<code>mcab</code> 自己的 pool、sample helper）的位元組數隨格點（16k/256、16k/512、48k/1024）與建置旗標而變，不在本頁列出，
+見 <a href="../../pipelines/4ch/aec-nr-res/index.html">四聲道 · AEC／NR／RES</a>；<code>MCAB_LAYOUT_VERSION</code> 只描述 <code>mcab</code> 自己的 pool；RES 不在其中，由 main 在自己的 pool 切出。BF 的結構為 GSC 形式（固定波束減自適應分支，
+<a href="../../libraries/index.html#audiolib">bf</a>），本站一律以 <code>bf</code> 稱呼該模組。</p>
+
+<h2 id="latency">延遲預算</h2>
+<h3>概要</h3>
+<p>演算法延遲（不含排程／緩衝）逐階段的預算：mono 與 4ch 的 ULCNet pipeline、以及 DFN2 變體（mono 與 4ch）。
+格點、視窗與 framing 慣例在 <a href="grids.html">訊號 grid、視窗與記憶體版號</a>。4ch 的前級是 <code>mcab</code> flow（共享 delay + 四條注入的 lane，
+<code>mcab_process_front()</code> → beamformer → <code>mcab_fuse()</code>；範例用 sample helper <code>mcab_sample_beam_*</code> 做 SRP-PHAT + BF）；
+<code>mcab</code> 不含 RES，DFN2 的 4ch 範例由 main 自己用 libaec 的
+<code>AecRes</code> 算 RES 增益，所以下表「RES gain」一列的歸屬依應用而異。</p>
+
+
+<h3>mono ULCNet pipeline（16 k / 512 / 256；48 k 為 1024 / 512）</h3>
+<div class="tbl">
+<table>
+<tr><th>階段</th><th>新增延遲</th><th>說明</th></tr>
+<tr><td>AEC 線性路徑（<code>pbfdaf_frontend</code>，overlap-save）</td>
+<td>+0 hop</td><td>線性誤差與輸入同 hop 交付（<code>AecResContext.formed_hop</code>）</td></tr>
+<tr><td>Align-ULCNet 鏈（rolling center=False STFT ×2 → NN callback → WOLA）</td>
+<td>+1 hop（16 k: 256 smp = 16 ms；48 k: 512 smp = 10.67 ms）</td>
+<td><code>ulcnet_process.h</code>：第一幀無輸出（pipeline 補零）、hop#p 輸出
+對應輸入 [（p−1)·<code>grid.hop</code>, p·<code>grid.hop</code>)</td></tr>
+<tr><td><b>合計</b></td><td><b>1 hop（16 k: 16 ms；48 k: 10.67 ms）</b></td>
+<td><code>ulcnet/ulcnet_nn_stage.h</code>：「Latency is one hop; hop #0 emits zeros」；輸出 hop p ≙ 輸入 hop p−1</td></tr>
+</table>
+</div>
+
+<h3>4ch ULCNet pipeline（16 k / 512 / 256；48 k 為 1024 / 512）</h3>
+<div class="tbl">
+<table>
+<tr><th>階段</th><th>新增延遲</th><th>說明</th></tr>
+<tr><td>共享 delay matcher + 4×AEC lanes + SRP-PHAT DOA + BF 權重
+（<code>mcab_sample_beam_process_with_activity()</code>：<code>mcab_process_front</code> → <code>doa_step</code> → <code>bf_process_with_weights</code>）；
+這條 pipeline 的 mcab <code>enable_post = 0</code>，不建 RES</td>
+<td>+0 hop</td><td>同 hop 產生 beamformed 線性誤差<b>頻譜</b></td></tr>
+<tr><td>BF 頻譜<b>直送</b>模型（不重建、不再分析）</td><td>+0 hop</td>
+<td><code>bf_spectrum</code> 已是當前 hop 的 sqrt-Hann、50% overlap、一 hop 一幀
+分析幀（各 lane 在 AEC 內分析，beamformer 只逐 bin 加權），拆成
+<code>err_re/err_im</code> 直接餵 model</td></tr>
+<tr><td>far 分支 <code>AcStft</code>（<code>center</code> 0）</td><td>+0（平行）</td>
+<td>同一 hop 的 far 走同樣的一 hop 一幀 framing（center=False），
+兩路幀對恆屬同一輸入 hop；<b>沒有補償 buffer</b></td></tr>
+<tr><td>Align-ULCNet synthesis（WOLA 半窗 trim）</td><td>+1 hop
+（16 k: 256 smp = 16 ms；48 k: 512 smp = 10.67 ms）</td><td>同 mono 變體</td></tr>
+<tr><td><b>合計（新增）</b></td><td><b>1 hop（16 k: 256 samples = 16 ms；
+48 k: 512 samples = 10.67 ms）</b></td>
+<td><code>ulcnet/ulcnet_nn_stage.h</code> 的 timing 契約：<b>僅 hop#0</b> 輸出零；
+輸出 hop p（p≥1）≙ 輸入 hop p−1 的 beamformed 線性誤差。
+測試以 far 單位脈衝釘住：16 k far[2085]→out[2341]（= 脈衝位置 + 1 hop = 256 samples，offset +0）；
+48 k：far[4133]→out[4645]（= 脈衝位置 + 1 hop = 512 samples，offset +0），<code>make -C pipelines/4ch_aec_bf_nr_res test</code> 的 <code>test_4ch_ulcnet</code> 在同一支 binary 內兩個格點各跑一次</td></tr>
+</table>
+</div>
+<p class="note">NN 模型本身：Align-ULCNet 演算法 lookahead = 0
+（readiness 總覽矩陣）；上表已含其 framing 的半窗 lookahead。</p>
+
+<h3>DFN2 變體（<a href="../../pipelines/mono/dfn2/index.html">mono</a> 與 <a href="../../pipelines/4ch/dfn2/index.html">4ch</a>）</h3>
+<p class="note">DFN2 stage 出貨在 48 k / 1024 / 512；host 則跑產品自己的取樣率。下表先列 48 k host，再列原生格點多付的 rate-bridge 延遲。</p>
+<div class="tbl">
+<table>
+<tr><th>階段</th><th>新增延遲</th><th>說明</th></tr>
+<tr><td>傳統前級（mono：線性 AEC，RES 增益在 <code>aec_process_context()</code> 內算出，經 <code>aec_get_res_context()</code> 的 <code>res_gain</code> 取得；
+4ch：mcab 的共用 delay → 4 lane → SRP-PHAT → BF 逐 bin 加權 → <code>mcab_fuse()</code>（經 helper 則為 <code>mcab_sample_beam_fuse()</code>），RES 增益由 main 自建的 libaec <code>AecRes</code> 經
+<code>aec_res_process()</code> 算；兩者皆可再加 comfort noise）</td>
+<td>+0 hop</td><td>同 hop 交出兩個頻譜：<code>error_spec</code>/<code>beamformed_error</code>（E，pre-RES，即 <code>dfn_res_stage_begin()</code> 的 <code>estimate_spec</code>）與
+post-RES 頻譜（P = E·G_res，開啟 CNG 時再加 comfort noise；DFN2 變體預設關；即 <code>apply_spec</code>）</td></tr>
+<tr><td><code>dfn_res_stage</code> 的尺度換算</td><td>+0 hop</td>
+<td>入 <code>grid.stft_scale</code>、出 <code>grid.stft_unscale</code>（= 1/sqrt(n_fft) 與其反數；出貨 grid 為 <code>2^-5</code>／<code>2^5</code>）：pipeline 頻譜是 audio-scale
+未正規化 STFT，DFN2 邊界要 <code>torch.stft(normalized=True)</code>。出貨 grid 下兩者是精確的 2 的次方，
+往返在 float32 下逐位元可逆（<code>pipelines/dfn/dfn_res_stage.h</code>）</td></tr>
+<tr><td>DFN2 模型 lookahead（48 k host）</td><td>+L hop，L = M + D（出貨 pair 1/1：+2 hop = 1024 samples = 21.33 ms）</td>
+<td>grid 的 <code>mask_lookahead + df_lookahead</code>，cascade 串聯<b>相加</b>而非取 max；M 為 0..2、D 為 0..4，共 15 個 pair；函式庫與 pipeline 單元都在執行期從 <code>DFN2Grid</code> 取得（<code>dfn_res_stage_lookahead_frames(grid)</code>；範例 main 的表的一列，make 變數只決定測試程式跑哪一對，見 <a href="../../pipelines/reference/dfn2/configuration.html#details">DFN2 pipeline 參數與狀態</a>）；
+前 L 個 hop 的 stage 輸出是全零頻譜（寫滿，故延遲是純延遲）。DFN3（平行）的模型延遲為 max(M, D)（<a href="../../models/dfn2/reference/core.html#memory">DeepFilterNet2 頻域與模型契約</a>）</td></tr>
+<tr><td>host／應用的 sqrt-Hann WOLA（48 k：各 main 的 <code>ac_istft_push()</code> 或 <code>dfn_hop_end()</code> 內的 <code>ac_istft_push()</code>）</td><td>+1 hop（512 samples = 10.67 ms）</td>
+<td>OLA 狀態屬於收尾的那個 <code>AcIstft</code>；同一個物件上混用兩種收尾方式仍連續</td></tr>
+<tr><td><b>合計（48 k host）</b></td><td><b>L + 1 hop；出貨 pair：3 hop = 1536 samples = 32.0 ms</b></td>
+<td>兩個範例 <code>main.c</code> 印出的延遲（48 k：<code>hop * (dfn_res_stage_lookahead_frames(grid) + 1)</code>；原生格點：<code>hop + dfn_rate_bridge_added_delay_samples()</code>）；
+兩支 C 測試（<code>test_mono_dfn.c</code>、<code>test_4ch_dfn.c</code>）釘住 added delay 與 48 k 的 L+1 hop（出貨 3）</td></tr>
+<tr><td><code>dfn_rate_bridge</code>（host 在 8/16 k 時取代上面兩列的 lookahead + WOLA）</td>
+<td>host 的 1 hop WOLA + added delay</td>
+<td>added delay = <code>prefill + lat_up + (L+1)×512×sr/48000 + lat_down×sr/48000</code> 個原生樣本
+（<code>dfn/dfn_rate_bridge.c</code>；prefill 由 init 用真正的 resampler 量出，<code>lat_up</code>／<code>lat_down</code> 是升/降頻 resampler 的 <code>audio_resampler_latency_input_frames()</code>）。
+出貨 pair：<b>16 k/hop 128 → 672（42.0 ms），總延遲 800 = 50.0 ms</b>；
+16 k/hop 256 → 629（39.3 ms），總 885 = 55.3 ms；
+8 k/hop 128 → 330（41.3 ms），總 458 = 57.3 ms（mono 專有）。
+(L+1)×512×sr/48000 是整數除法；L+1 不是 3 的倍數時 stage 延遲含小數個原生樣本，<code>dfn_rate_bridge_added_delay_samples()</code> 向下取整（pair 0/1：501／458／244；pair 2/4：1354／1311／671），
+<code>dfn_rate_bridge_added_delay_exact()</code> 回精確值（分子／6：pair 0/1 為 501 1/3、458 1/3、244 2/3；pair 2/4 為 1354 2/3、1311 2/3、671 1/3）。延遲由脈衝釘住（重心對精確值，容差 0.01 樣本），但訊號經兩顆 FIR resampler 往返，<b>不是</b>逐位元等值
+（<code>pipelines/dfn/dfn_rate_bridge.c</code>、
+<code>pipelines/dfn/tests/test_dfn_rate_bridge.c</code>）</td></tr>
+</table>
+</div>
+<p class="note">DFN2 的分析本來就是 center=False 串流（見 <a href="grids.html">訊號 grid、視窗與記憶體版號</a> 的 framing 一節），所以 48 k host 的格點與窗
+<b>就是</b>模型的格點與窗——E 直接是一個合法的 DFN2 分析幀，<b>不需要第二次 transform</b>
+（<code>pipelines/dfn/dfn_res_stage.h</code>）；8/16 k host 則由 rate bridge 在 48 k 上另做一次同款
+sqrt-Hann 1024/512 分析。AEC delay 改變<b>不</b>重置 stage 或 bridge：兩者都不消費 far-end。</p>
+</main>
+</body>
+</html>

@@ -158,7 +158,7 @@ External parameters: the same board-skeleton flags as the mono variant (`--sampl
 (array geometry, `num_angles`; the skeleton uses the default 35 mm UCA, which a
 product replaces with the measured one) and `aec_res_set_level(res, ...)` on the example's own `AecRes`.
 Internal: the helper's BF / DOA / VAD constants (section 0.3 of
-[`../../../docs/integration_4ch_spatial_zh_TW.md`](../../../docs/integration_4ch_spatial_zh_TW.md)), the stage
+[SRP／BF helper](../../../docs/reference/mcab/beam.md)), the stage
 grid and scale constants, the bridge FIR and schedule.
 
 ## Compute admission

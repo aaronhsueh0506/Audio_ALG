@@ -1,0 +1,36 @@
+<!doctype html>
+<html lang="zh-Hant">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>DeepVQE-S · Audio_ALG</title>
+<link rel="stylesheet" href="../../manual.css">
+</head>
+<body>
+<nav aria-label="導覽"><a href="../../index.html">Audio_ALG</a> / <a href="../index.html">模型開發與部署</a></nav>
+<main>
+<h1>DeepVQE-S</h1>
+<p>輸入是原始 mic 與 far 的 int16 PCM，兩路長度皆為一個模型 hop。SDK 做雙路分析，模型輸出複數濾波 taps，套在 mic 的頻譜歷史，再合成單路 int16 PCM。</p><h2>建置與初始化</h2><pre><code>make -C stream/aiaec/deepvqe_s lib
+make -s -C stream/aiaec/deepvqe_s print-lib-path</code></pre><p>依模型建立 grid 與 config，用 <code>deepvqe_stream_get_mem_size()</code> 查詢 pool 大小與對齊，再配置 pool。以同一目標工具鏈建置並連結模型 archive 和 audiolib 的 <code>libaudio_common.a</code>。裝置 runtime 載入與 grid 相符的模型檔，負責每次 NPU 推論。</p>
+
+<h2>每 hop 呼叫</h2><p>範例中的讀寫、<code>run_accelerator</code> 與 <code>device_state_*</code> 由呼叫端實作。裝置第一次使用或 generation 改變時，把 recurrent state 還原為模型的量化零值。推論已開始後回錯，也立刻清掉可能部分寫入的裝置 state。</p><pre><code>DeepVqeStream *ctx = deepvqe_stream_init(&amp;cfg, pool, bytes);
+if (!ctx) return -1;
+while (read_hops(mic_in, far_in)) {
+    DeepVqeHopIO io;
+    if (deepvqe_stream_pre_process(ctx, mic_in, far_in, &amp;io) != 1) return -1;
+    device_state_sync(io.state_generation);
+    int rc = run_accelerator(&amp;io.inputs, &amp;io.outputs);
+    if (rc != 0) device_state_refill_zero();
+    if (deepvqe_stream_post_process(ctx, rc, pcm_out) &lt; 0) return -1;
+    write_hop(pcm_out);
+}</code></pre><p>模型從 hop 0 起每拍推論，CCM ring 初始為零。init／reset 後第一次 ISTFT push 尚未吐出樣本，post 回 0 並輸出一整拍零 PCM。正式幀推論失敗時，當拍增強頻譜歸零。50% overlap 的 ISTFT 仍疊加上一拍尾端，因此若前拍已有音訊，需連續兩拍零頻譜才保證 PCM 全零。</p>
+
+<h2>參考</h2>
+<ul>
+<li><a href="reference/core.html">頻域整合、模型張量與狀態</a></li>
+<li><a href="../../../../stream/aiaec/deepvqe_s/deepvqe_stream.h">PCM SDK 公開標頭</a></li>
+<li><a href="../../../../AIAEC/DeepVQE_S/README.md">訓練與匯出</a></li>
+</ul>
+</main>
+</body>
+</html>

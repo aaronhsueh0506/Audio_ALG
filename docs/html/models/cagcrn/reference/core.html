@@ -1,0 +1,146 @@
+<!doctype html>
+<html lang="zh-Hant">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>CAGCRN 頻域與模型契約 · Audio_ALG</title>
+<link rel="stylesheet" href="../../../manual.css">
+</head>
+<body>
+<nav aria-label="導覽"><a href="../../../index.html">Audio_ALG</a> / <a href="../../index.html">模型開發與部署</a> / <a href="../index.html">CAGCRN</a></nav>
+<main>
+<h1>CAGCRN 頻域與模型契約</h1>
+<details><summary>本頁目錄</summary>
+<ul>
+<li><a href="#section-2">Block diagram</a></li>
+<li><a href="#section-3">訊號泳道圖</a></li>
+<li><a href="#section-4">I/O 表</a></li>
+<li><a href="#section-5">State 表</a></li>
+<li><a href="#section-6">延遲與 warm-up</a></li>
+<li><a href="#section-7">函式清單：公開 vs 內部</a></li>
+<li><a href="#section-8">參數表</a></li>
+</ul></details>
+<h2 id="section-1">參考</h2>
+<ul>
+<li><a href="../index.html">CAGCRN 整合入口</a></li>
+<li><a href="../../../../../lib/aiaec/cagcrn/cagcrn_process.h">頻域 C 標頭</a></li>
+<li><a href="../../../../../AIAEC/CAGCRN/README.md">模型設定與範例</a></li>
+</ul>
+
+<h2 id="section-2">Block diagram</h2>
+<pre>mic ──► StreamSTFT ─► [B,1,257] cplx        far ──► StreamSTFT ─► [B,1,257] cplx
+        │ mag_ri_feature + erb.merge                │ mag_ri_feature + erb.merge
+        ▼ [B,3,1,97]                                ▼ [B,3,1,97]
+  _stream_encoder_block(mic_encoder[0])       _stream_encoder_block(far_encoder[0])
+        │ mic [B,12,1,49]                           │ far [B,12,1,49]
+        │      ┌─────────────────────────────────────┘
+        ▼      ▼
+  _stream_cata(cata, ...)  （CATA：mic_query/mic_key 自注意 softmax；
+        │                   ref_kv → cata_ring(63) → delay softmax + cata_gate_log）
+        │ far' [B,24,1,49], delay [B,1,63], full_attention [B,24,1,63,49]
+        ▼
+  mic/far encoder blocks 1..3（_stream_encoder_block，depthwise dilated 1/2/4）
+        │ mic [B,24,1,25]  far [B,24,1,25]（skip 各層存 mic_skips/far_skips）
+        ▼
+  _stream_tfgru(mic_tfgru) / _stream_tfgru(far_tfgru)
+  （freq BiGRU 每幀 + time GRU per-bin hidden (1,25,24)）
+        ▼
+  _stream_tfag(tfag)（freq1/freq2 每幀；time1/time2 (5,1) 走 cell）
+        ▼ x [B,24,1,25]
+  decoder 0..3（_stream_decoder_block + skip_mic/skip_far 1x1）
+        ▼ x [B,12,1,97]
+  mask = Conv2d(12,2,1) + Tanh → erb.split → mask_full [B,2,1,257]
+        ▼
+  enhanced = complex_mask(mask_full, microphone) ──► StreamISTFT ──► 256 smp</pre>
+
+<h2 id="section-3">訊號泳道圖</h2>
+<pre>hop（256 smp = 16 ms @16k）  h0          h1                h2         h3       …  flush
+caller（送樣本）             mic/far 256  256               256        256         —
+前處理：StreamSTFT×2          0 幀        F0+F1（reflect    F2         F3          尾幀
+（centered sqrt-Hann）                    前綴湊滿後補發）
+NN：forward_stream           —           out(F0), out(F1)  out(F2)    out(F3)     每尾幀 1 out
+（delay 0；同 invocation 出幀）
+後處理：StreamISTFT          —           out(F0)→0 smp     256 smp    256 smp     尾段補齊
+                                          out(F1)→256 smp
+輸出樣本對應輸入區間         —           [0,256)           [256,512)  [512,768)
+hop-lag：端到端 256 samples（16 ms）＝ centered 半窗 lookahead；NN 本身 0 hop。</pre>
+
+<h2 id="section-4">I/O 表</h2>
+<p>Streaming（每 invocation 恰 1 幀 = 256 個新 samples；<code>inference.py</code>
+開機打印之實測，B=1、16k）：</p>
+<table>
+<tr><th>tensor</th><th>方向</th><th>shape</th><th>dtype</th><th>幀/invocation</th><th>time-domain samples</th></tr>
+<tr><td>mic</td><td>in</td><td>(1, 1, 257)</td><td>complex64</td><td>1</td><td>256 新樣本</td></tr>
+<tr><td>far</td><td>in</td><td>(1, 1, 257)</td><td>complex64</td><td>1</td><td>256 新樣本</td></tr>
+<tr><td>output</td><td>out</td><td>(1, 1, 257)</td><td>complex64</td><td>1</td><td>WOLA 後 256</td></tr>
+<tr><td>mask（bounded CRM）</td><td>out</td><td>(1, 2, 1, 257)</td><td>float32</td><td>1</td><td>—</td></tr>
+<tr><td>delay_distribution</td><td>out</td><td>(1, 1, 63)</td><td>float32</td><td>1</td><td>—</td></tr>
+<tr><td>aux erb_mask</td><td>out</td><td>(1, 2, 1, 97)</td><td>float32</td><td>1</td><td>—</td></tr>
+<tr><td>aux cata_attention</td><td>out</td><td>(1, 24, 1, 63, 49)</td><td>float32</td><td>1</td><td>—（診斷用，逐幀 74k 元素）</td></tr>
+</table>
+<p>Offline <code>forward(microphone, far_end)</code>：同名 tensor、T 軸為整段幀數。</p>
+
+<h2 id="section-5">State 表</h2>
+<p><code>state_report</code> 實測（B=1 fp32，total <b>469.9 KB</b>；conv 與 CATA 時間卷積的 window 是完整 window,含新的一幀）。部署契約：顯式
+state I/O，由 host caller 保存；STFT/ISTFT 屬應用端以 audiolib 建立的 <code>AcStft</code>／<code>AcIstft</code>：</p>
+<table>
+<tr><th>state</th><th>shape</th><th>size</th><th>保存者（部署契約）</th></tr>
+<tr><td>cata_ring.ring（延遲 far 特徵）</td><td>(1, 24, 63, 49)</td><td>289.4 KB</td><td>host caller（顯式 graph I/O）</td></tr>
+<tr><td>cata_gate_log（推論期常數）</td><td>(63,)</td><td>0.2 KB</td><td>常數表（隨權重部署）</td></tr>
+<tr><td>cata_query / cata_key / cata_ref_kv .window</td><td>(1,12,3,49) / (1,24,3,49) / (1,12,3,49)</td><td>6.9 / 13.8 / 6.9 KB</td><td>host caller（顯式 graph I/O）</td></tr>
+<tr><td>mic_enc0..3_group.window</td><td>(1,12,3,49) / (1,12,3,25) / (1,12,5,25) / (1,24,9,25)</td><td>6.9 / 3.5 / 5.9 / 21.1 KB</td><td>host caller（顯式 graph I/O）</td></tr>
+<tr><td>far_enc0..3_group.window</td><td>(1,12,3,49) / (1,24,3,25) / (1,24,5,25) / (1,24,9,25)</td><td>6.9 / 7.0 / 11.7 / 21.1 KB</td><td>host caller（顯式 graph I/O）</td></tr>
+<tr><td>h_mic_tfgru_time / h_far_tfgru_time（per-bin）</td><td>(1, 25, 24) ×2</td><td>2.3 KB ×2</td><td>host caller（顯式 graph I/O）</td></tr>
+<tr><td>tfag_time1 / tfag_time2 .window</td><td>(1,12,5,25) / (1,12,9,25)</td><td>5.9 / 10.5 KB</td><td>host caller（顯式 graph I/O）</td></tr>
+<tr><td>dec0..3_group.window</td><td>(1,24,9,25) / (1,12,5,25) / (1,12,3,49) / (1,12,3,97)</td><td>21.1 / 5.9 / 6.9 / 13.6 KB</td><td>host caller（顯式 graph I/O）</td></tr>
+<tr><td><b>NN 合計</b></td><td></td><td><b>469.9 KB</b></td><td></td></tr>
+<tr><td>STFT×2 / ISTFT 狀態</td><td>—</td><td>—</td><td>應用端的 <code>AcStft</code>×2／<code>AcIstft</code>（Python reference：host）</td></tr>
+</table>
+<p>LayerNorm ×4 只作用在 channel 軸（無跨時間統計）；可學 delay window
+（<code>raw_window</code>）在推論期為常數，已在 <code>create_stream_state()</code> 內以
+<code>torch.no_grad()</code> 預計算成 <code>cata_gate_log</code>。</p>
+<p>上表是 Python reference 的 cell 內容；graph boundary 上每個 window 與 ring 的 shape 相同（rank 4），
+兩顆 hidden 疊成單一 <code>h_gru (1, 2, 25, 24)</code>，值的總量與 host RAM 不變。</p>
+
+<h2 id="section-6">延遲與 warm-up</h2>
+<ul>
+<li>NN 演算法 lookahead = <b>0 hop</b>；zero-init ≡ offline 左零 padding，
+<b>無 warm-up 特例</b>（CATA delay softmax 每幀獨立、無累積 state）。</li>
+<li>實測 stream-vs-offline（seeds 0/1、B=2、T=96）：enhanced/mask/delay/erb_mask 最差
+5.3e-7（純 fp32 累加順序噪音）；TOL 以 ~10x headroom 釘 5e-6
+（<code>test_streaming_cagcrn.py</code> 檔頭）。</li>
+<li>Framing：center=True → 半窗 256 samples（16 ms）lookahead；端到端演算法延遲 256
+samples。</li>
+</ul>
+
+<h2 id="section-7">函式清單：公開 vs 內部</h2>
+<div class="tbl"><table>
+<tr><th>分類</th><th>名稱</th></tr>
+<tr><td><b>公開（Python）</b></td><td><code>AIAEC.CAGCRN.inference.load_model</code>、<code>CAGCRN.create_stream_state</code>、<code>CAGCRN.forward_stream</code>、<code>StreamSTFT</code>／<code>StreamISTFT</code>、<code>export_onnx.py</code>／<code>inference.py</code>（含 <code>calib</code>）／<code>export_erb_matrix.py</code> 命令列入口</td></tr>
+<tr><td><b>公開（C，可用零件）</b></td><td><code>aiaec_apply_complex_mask</code>（<code>cagcrn_process.h</code>）；audiolib <code>ac_stft_*</code>／<code>ac_istft_*</code>、<code>ac_window_build</code></td></tr>
+<tr><td><b>內部</b></td><td>底線開頭的模組（<code>_cli_common.py</code>、<code>_streaming_export.py</code>、<code>_streaming_calibration.py</code> 等）；<code>model.py</code> 的 <code>_stream_*</code> helper（<code>_stream_encoder_block</code>、<code>_stream_cata</code>、<code>_stream_tfgru</code>、<code>_stream_tfag</code>、<code>_stream_decoder_block</code>）與 <code>CrossAttentionTemporalAlignment</code>、<code>TFGRU</code>、<code>TFAG</code>、<code>ErbBandCodec</code></td></tr>
+</table></div>
+
+<h2 id="section-8">參數表</h2>
+<h3>外部：第三方可調</h3>
+<div class="tbl"><table>
+<tr><th>名稱</th><th>位置</th><th>範圍</th><th>預設</th><th>何時設定</th><th>說明</th></tr>
+<tr><td><code>max_delay_seconds</code></td><td><code>CAGCRN(...)</code>（<code>config.ini [model]</code> 為空，用預設）</td><td>秒</td><td>1.0（16 kHz 上 D = 63）</td><td>訓練</td><td>可微分 soft delay-window gate 的緩衝長度；論文的整數 <code>floor(D)</code> 窗無法以一般 autograd 訓練，因此與任何未公開的作者 checkpoint 不相容</td></tr>
+<tr><td><code>high_erb_bands</code></td><td><code>CAGCRN(...)</code></td><td>整數</td><td>32</td><td>訓練</td><td>2 kHz 以上的 ERB 帶數；16 kHz grid 上 <code>compressed_bins</code> = 97；改了權重形狀就變</td></tr>
+<tr><td><code>--max-delay-frames</code>、<code>--opset</code>(17)、<code>--verify</code></td><td><code>export_onnx.py</code></td><td>D</td><td>checkpoint 的 D</td><td>匯出</td><td>D 與 calibration、板端 state 配置須一致</td></tr>
+<tr><td>位置參數、<code>--device</code>、<code>--verify</code>、<code>--mic-dir</code>／<code>--ref-dir</code>／<code>--out-dir</code></td><td><code>inference.py</code></td><td>—</td><td>—</td><td>離線推論</td><td>見上方 A</td></tr>
+<tr><td><code>calib</code>：<code>--checkpoint</code>／<code>--primary-dir</code>／<code>--far-dir</code>／<code>--output</code>／<code>--format</code>(bin|npz)／<code>--frames</code>(256)／<code>--max-delay-frames</code>／<code>--seed</code>(42)／<code>--onnx</code>／<code>--pair-replace</code></td><td><code>inference.py calib</code></td><td>—</td><td>—</td><td>PTQ 校正</td><td>primary 為 mic WAV；同 process 匯出並 parity 檢查 graph</td></tr>
+<tr><td><code>--checkpoint</code>、<code>--output-dir</code>、<code>--format</code>(bin|npy|c|all)</td><td><code>export_erb_matrix.py</code></td><td>—</td><td>—</td><td>匯出</td><td>checkpoint-exact ERB 前向／反向矩陣，供工具鏈比對</td></tr>
+</table></div>
+<h3>內部：存在且可改，但不建議開放</h3>
+<div class="tbl"><table>
+<tr><th>名稱</th><th>值</th><th>位置</th><th>不開放的原因</th></tr>
+<tr><td>encoder 通道數、CATA、TFGRU、TFAG、decoder 結構</td><td>mic 12,12,12,24；far 12,24,24,24；TF-GRU 24 通道；TFAG 12</td><td><code>model.py</code></td><td>拓撲決定全部 19 個 state 形狀；論文未公開的細節以重建選擇固定</td></tr>
+<tr><td><code>raw_window</code>（可學的 delay window）</td><td>推論期為常數，預先算成 <code>cata_gate_log</code></td><td><code>model.py</code></td><td>訓練產物；不是部署旋鈕</td></tr>
+<tr><td>ERB 設定</td><td>2 kHz 以下線性 65 bins + 高頻 32 帶 → 97</td><td><code>ErbBandCodec</code></td><td>固定矩陣屬於權重的一部分（12,929 個 buffer 值）</td></tr>
+<tr><td>grid</td><td>16 kHz，512/512/256</td><td><code>config.ini [signal]</code>、checkpoint contract</td><td>checkpoint 記錄完整 grid，推論遇不相容設定直接拒絕</td></tr>
+<tr><td>訓練配方（AdamW 1.2e-3、MSE + SI-SNR + 參數 L1、batch 32、50 epoch）</td><td>—</td><td><code>config.ini</code>、<code>AIAEC/README.md</code></td><td>L1 以參數平均絕對值正規化，記錄在 checkpoint 的 loss version；改配方等於換 loss version</td></tr>
+</table></div>
+</main>
+</body>
+</html>

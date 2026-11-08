@@ -83,29 +83,15 @@ now live under `lib/ainr/<model>/` / `lib/aiaec/<model>/` (the single-model-rele
 `AINR/`/`AIAEC/` keep the Python training/export side and (for the six models that had one before)
 a forwarding compat header at the old public-header path for out-of-tree board samples.
 
-**The PCM stream layer.** `stream/` wraps a model's `*_prepost`/`*_process` per-hop lifecycle for
-int16-PCM callers (STFT analysis, ISTFT/OLA synthesis, the frame_open/finish/bypass dispatch), one
-hop per call. Implemented for three of the 8 models, each a thin wrapper built directly against
-that model's own `*_prepost.h` (never against a `pipelines/`-level "stage" component, even where
-one already existed for a different caller — see below): `stream/ainr/dfn2/dfn2_stream.h`
-(`dfn2_stream_init[_from_erb_file][_ex]`/`_reset`/`_pre_process`/`_post_process`,
-`frames_per_call==1` only, `AC_OLA_ACCUMULATE`, optional HPF, full/`-DDFN2_MASK_ONLY` variants);
-`stream/aiaec/deepvqe_s/deepvqe_stream.h` (two inputs `mic_in`/`far_in`, no HPF, no file-loader,
-`AC_OLA_ENV_NORM` — the first push after init/reset emits nothing, surfaced as `post_process`'s own
-distinct `0` return; bypass fails **closed**, silence, since there is no canceller in front of this
-model); `stream/aiaec/ulcnet/ulcnet_stream.h` (two inputs, the linear-AEC's own `err_in` and raw
-`far_in`, never raw mic; no HPF, no file-loader; `AC_OLA_ENV_NORM`; bypass fails **open** — the
-linear-error spectrum passes through unguarded, the opposite of DeepVQE-S's, since the signal is
-already the AEC's own residual; an alignment-driven reset+one-hop-reprime, re-implemented at the
-`ulcnet_prepost.h` level rather than by wrapping `pipelines/ulcnet/ulcnet_nn_stage.{c,h}` — a
-different, higher-level component built for a different caller, the 4-channel pipeline's
-synchronous installed-model callback, whose job struct exposes raw spectra rather than this
-model's real NPU tensor boundary; see `ulcnet_stream.h`'s own comment). These three are the full
-set this restructuring plans to add — DFN3, GTCRN, RNNoise-ERB, CAGCRN and Align-CRUSE stay
-integrated the way their own README shows, at the `*_prepost`/`*_process` level, with no `stream/`
-planned. `pipelines/dfn/{dfn_res_stage,dfn_rate_bridge}.{c,h}` (DFN2-specific, dual-spectrum,
-AEC-aware) are untouched and stay the right entry point for their existing callers, same as
-`ulcnet_nn_stage`.
+**PCM stream SDKs.** Each wraps a frequency-domain core with analysis STFT and synthesis ISTFT. The caller owns the accelerator, synchronizes its recurrent state before each job, and reloads quantized zeros after a run that may have partially written device state.
+
+| SDK | Integration contract |
+|---|---|
+| `stream/ainr/dfn2` | One int16 input, optional HPF, `AC_OLA_ACCUMULATE`, N=1. Full and mask-only use variant-specific public symbols. Post reports spectral validity. |
+| `stream/aiaec/deepvqe_s` | Mic and far int16 inputs, `AC_OLA_ENV_NORM`. A rejected job contributes a zero spectrum. The preceding frame can still contribute PCM through overlap-add. |
+| `stream/aiaec/ulcnet` | Feed the linear AEC's float residual and raw far to `ulcnet_stream_pre_process_f32()`. An int16 entry is also available. Reprime after an alignment change, and pass the error spectrum through on bypass. |
+
+DFN3, GTCRN and RNNoise-ERB expose frequency-domain cores. CAGCRN and Align-CRUSE provide mask helpers. Existing spectrum-level callers can use `pipelines/dfn/dfn_res_stage.h`, `dfn_rate_bridge.h`, or `pipelines/ulcnet/ulcnet_nn_stage.h`. The [model manual](docs/html/models/index.html) contains the per-hop examples.
 
 **Per-hop contract (DFN2/DFN3/Align-ULCNet/DeepVQE-S's `frame_open`/`_finish`/`_bypass` shape).**
 `pre_process_freq()` → `frame_open()` → accelerator fills the tensors → `frame_finish()` (or
@@ -156,10 +142,7 @@ their result JSON. `docs/c_python_function_map.md` plus
 `pipelines/tests/test_c_python_map.py` keep the C/Python symbol mapping and function counts in
 sync — update the map in the same change as adding/removing a C function with a Python twin.
 
-**Documentation has a single index and an offline HTML site.** `docs/README.md` is the current
-source-of-truth index (source/tests win over docs if they disagree); `docs/html/` is a per-module
-offline doc site (overview, API, block diagram, signal swimlane, I/O and state tables, latency)
-kept in sync by the `algdoc` skill after an algorithm change. `docs/development.md` covers the
+**Documentation.** The public entry point is `docs/html/index.html`. Group integration procedures under the corresponding model or pipeline, with detailed contracts in its reference directory. `docs/README.md` links the Markdown integration references. `docs/maintenance/README.md` covers the
 submodule/dependency workflow in more depth than the section above.
 
 ## Working across this repo's tree

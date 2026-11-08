@@ -1,0 +1,60 @@
+<!doctype html>
+<html lang="zh-Hant">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>DeepFilterNet3 · Audio_ALG</title>
+<link rel="stylesheet" href="../../manual.css">
+</head>
+<body>
+<nav aria-label="導覽"><a href="../../index.html">Audio_ALG</a> / <a href="../index.html">模型開發與部署</a></nav>
+<main>
+<h1>DeepFilterNet3</h1>
+<h2>概要</h2>
+<p>DFN3 的 C 類別 <code>DFN3Prepost</code> 與 <a href="../dfn2/reference/core.html#frequency-api">DFN2 的類別</a>同形（函式名把 <code>dfn2</code> 換成 <code>dfn3</code>，生命週期、交易式 frame 狀態機、bypass／generation 規則相同；兩者都只做頻域，grid、framing 與 recurrent state 都歸應用端），差別只在模型：低頻直接濾<b>原始</b> noisy 頻譜、高頻乘 ERB gain、<b>沒有 alpha head</b>（<code>DFN3PrepostOutputs</code> 只有 <code>erb_mask</code>／<code>coefs</code> 與兩個 <code>*_next</code>）、延遲短一個 hop，且 <code>DFN3GridSpec</code> 沒有 <code>frames_per_call</code>（一次 invocation 一個 frame）。模型內容見 <a href="reference/core.html">DeepFilterNet3 頻域與模型契約</a>。</p>
+<div class="tbl"><table>
+<tr><th>項目</th><th>DFN2</th><th>DFN3</th><th>出處</th></tr>
+<tr><td>accelerator heads</td><td>erb_mask、coefs、alpha</td><td>erb_mask、coefs</td><td><code>dfn*_prepost.h</code></td></tr>
+<tr><td>組合方式</td><td>cascade（先全頻 mask，再 DF，alpha 混合）</td><td>平行 band split（bins &lt; df_bins 走 DF，其餘乘 mask）</td><td><code>dfn3_process.h</code></td></tr>
+<tr><td>模型 lookahead</td><td>2 hops（出貨 1/1，相加）</td><td>max(M, D) hops（出貨 1；<code>dfn3_prepost_model_lookahead_frames()</code> = <code>grid.output_delay</code>）</td><td><code>dfn3_prepost.h</code></td></tr>
+<tr><td>identity 路徑輸出落後（經 <code>AcStft</code>/<code>AcIstft</code>）</td><td>3 hops = 1536 samples</td><td>1 + max(M, D) hops（出貨 2 hops = 1024 samples = 21.33 ms）</td><td><code>dfn3_prepost.h</code></td></tr>
+<tr><td><code>post_process_freq</code> 的 <code>valid = 0</code> 拍數</td><td>2</td><td>max(M, D)（出貨 1：只有 hop 0）</td><td><code>dfn3_prepost.h</code></td></tr>
+<tr><td><code>*_MODEL_IO_LAYOUT_VERSION</code></td><td>8</td><td>9（4–8 已退役）</td><td><code>dfn*_model_io.h</code></td></tr>
+<tr><td>pool（<code>get_mem_size</code>，出貨 grid 48000/1024、1/1，64-bit 本機量測）</td><td>92,608</td><td>90,384</td><td>—</td></tr>
+<tr><td>pool 內 state block／model_io block（本機量測）</td><td>67,904／2,688</td><td>65,808／2,688</td><td>—</td></tr>
+<tr><td><code>bypass</code> 的 identity</td><td>unit ERB mask、alpha 0</td><td>高頻 unit ERB gain、低頻 unit 目前框 DF tap</td><td><code>dfn3_prepost.h</code></td></tr>
+</table></div>
+
+<h2>如何呼叫使用</h2>
+<ol>
+<li>應用端備齊（皆為借用或由應用端配置）：<code>DFN3GridSpec</code>（模型匯出時決定的值）→ <code>dfn3_grid_make(&amp;grid, &amp;spec)</code>，非 0 就是被拒，<code>dfn3_grid_status_text()</code> 給文字；framing 用 audiolib 的 <code>AcStft</code>／<code>AcIstft</code>：<code>ac_stft_config_default(&amp;sc, grid.n_fft)</code>，只改 <code>sc.spec_scale = grid.stft_scale</code> 與 <code>sc.ispec_scale = grid.stft_unscale</code>（其餘預設：sqrt-Hann、center 0、hop = n_fft/2、<code>AC_OLA_ACCUMULATE</code>），函式庫不持有窗、FFT 或 STFT，尺度設錯偵測不到；ERB 矩陣 <code>erb_fwd</code>／<code>erb_inv</code> 兩個指標（由應用端載入並持有；<code>export_erb_matrix.py --runtime-bins DIR</code> 輸出 <code>erb_fwd.bin</code>（bin-major）／<code>erb_inv.bin</code>（band-major）兩個 raw 檔，版面等於函式庫要的）；float host 另備 <code>h_gru</code>（5 × 256 floats）與 <code>df_convp_history</code>（64 × 5 × 96 floats）兩塊 state buffer，板端不備。</li>
+<li><code>dfn3_prepost_config_defaults(&amp;cfg, &amp;grid)</code> → 填 <code>erb_fwd</code>／<code>erb_inv</code>（float host 再填兩組 state 的指標與元素個數：兩組都設或四個值全為 NULL／0）→ <code>dfn3_prepost_get_mem_size</code>（alignment 16）→ <code>dfn3_prepost_init_ex(pool, req.bytes, &amp;cfg, &amp;req)</code>；host 工具可用 <code>_create</code>／<code>_destroy</code>（只釋放 <code>_create</code> 配置的記憶體，不碰註冊的 buffer 與 ERB 矩陣）。</li>
+<li>每個 hop：<code>ac_stft_push_planar</code> → <code>pre_process_freq</code>（每拍回 1）→ <code>frame_open</code> → 加速器 → <code>frame_finish</code>，失敗或被拒就 <code>frame_bypass</code> → <code>post_process_freq</code>（<code>valid</code> 只是資訊，可傳 NULL）→ <code>ac_istft_push_planar</code>（每拍；零頻譜得零 hop）。前 M 拍（出貨 M=1：第 0 拍）是暖機幀：加速器照跑，heads 由 <code>frame_finish</code>／<code>frame_bypass</code> 丟棄、登錄 state 歸零、generation 加 1，回 0；M=0 沒有暖機幀。</li>
+<li>板端（不註冊 state）：加速器自己保存定點 state，起始時填成量化後的 0；每次 <code>dfn3_prepost_state_generation()</code> 與上次看到的值不同（reset、每個暖機幀或被拒的 <code>frame_finish</code>），先把加速器 state 重填成量化後的 0 再跑（M 個暖機幀各重填一次）。generation 在 init 後是 1，永遠用「與上次比較」判斷。float host 註冊的 buffer 由函式庫在 init、reset 與被拒時歸零，不需要重填。</li>
+<li>重新開始一段串流：<code>dfn3_prepost_reset(p)</code> 加應用端自己的 <code>ac_stft_reset</code>／<code>ac_istft_reset</code>。結尾：再餵零頻譜並照跑加速器，可把尾端排出（<code>grid.output_delay</code> 個只排出最後一個頻譜框，要輸出最後一個真實 hop 的 PCM 需再多 1 個，共 <code>grid.output_delay + 1</code>）（<code>dfn3_prepost_pre_process_freq</code> 的標頭註解）；若要<b>精確</b>處理有限長 clip 的尾端，模型 feature 需補訓練時的零 padding，而不是用零頻譜重算正規化後特徵。持續餵零音訊只是在延續 live stream。</li>
+</ol>
+<p><a href="../../../../AINR/DeepFilterNet3/README.md">完整 C 整合範例</a></p><p>加速器自行保存 state 時，每次推論前依 generation 回填量化零。若推論可能部分寫入後回錯，立即重新回填，再走當拍的 bypass。最後一個頻譜及 PCM 分別需要 output_delay 與 output_delay+1 拍排空。</p>
+
+<h2>推論呼叫範例</h2>
+<p>加速器擁有 state 時，每拍送入已分析的頻譜。下例的裝置同步、回填及推論由 adapter 提供。</p>
+<pre><code>DFN3PrepostInputs inputs;
+DFN3PrepostOutputs outputs;
+if (dfn3_prepost_pre_process_freq(p, re, im) != 1 ||
+    dfn3_prepost_frame_open(p, &amp;inputs, &amp;outputs) != 0) return -1;
+device_state_sync(dfn3_prepost_state_generation(p));
+int rc = run_accelerator(&amp;inputs, &amp;outputs);
+if (rc != 0) device_state_refill_zero();
+if (rc != 0 || dfn3_prepost_frame_finish(p) != 0) {
+    if (dfn3_prepost_frame_bypass(p) != 0) return -1;
+}
+if (dfn3_prepost_post_process_freq(p, out_re, out_im, &amp;valid) != 0) return -1;</code></pre>
+
+<h2>參考</h2>
+<ul>
+<li><a href="reference/core.html">模型張量、狀態與參數</a></li>
+<li><a href="../../../../lib/ainr/dfn3/dfn3_prepost.h">公開 C 標頭</a></li>
+<li><a href="../../../../AINR/DeepFilterNet3/README.md">訓練與匯出</a></li>
+</ul>
+</main>
+</body>
+</html>

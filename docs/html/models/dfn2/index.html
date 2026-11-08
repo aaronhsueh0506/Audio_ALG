@@ -1,0 +1,37 @@
+<!doctype html>
+<html lang="zh-Hant">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>DeepFilterNet2 · Audio_ALG</title>
+<link rel="stylesheet" href="../../manual.css">
+</head>
+<body>
+<nav aria-label="導覽"><a href="../../index.html">Audio_ALG</a> / <a href="../index.html">模型開發與部署</a></nav>
+<main>
+<h1>DeepFilterNet2</h1>
+<p>單路 int16 PCM，輸出同樣長度的一個 hop。SDK 封裝 HPF（選用）、STFT、DFN2 頻域前後處理與 ISTFT。設定 <code>frames_per_call=1</code>。輸入與輸出時序以 checkpoint 的 grid 為準。</p><h2>建置與初始化</h2><pre><code>make -C stream/ainr/dfn2 lib
+make -s -C stream/ainr/dfn2 print-lib-path</code></pre><p>依模型建立 grid 與 config，用 <code>dfn2_stream_get_mem_size()</code> 查詢 pool 大小與對齊，再配置 pool。以同一目標工具鏈建置並連結模型 archive 和 audiolib 的 <code>libaudio_common.a</code>。裝置 runtime 載入與 grid 相符的模型檔，負責每次 NPU 推論。</p>
+
+<h2>每 hop 呼叫</h2><p>範例中的讀寫、<code>run_accelerator</code> 與 <code>device_state_*</code> 由呼叫端實作。裝置第一次使用或 generation 改變時，把 recurrent state 還原為模型的量化零值。推論已開始後回錯，也立刻清掉可能部分寫入的裝置 state。</p><pre><code>DFN2Stream *ctx = dfn2_stream_init_from_erb_file(&amp;cfg, erb_path, pool, bytes);
+if (!ctx) return -1;
+while (read_hop(pcm_in)) {
+    DFN2HopIO io;
+    if (dfn2_stream_pre_process(ctx, pcm_in, &amp;io) != 1) return -1;
+    device_state_sync(io.state_generation);
+    int rc = run_accelerator(&amp;io.inputs, &amp;io.outputs);
+    if (rc != 0) device_state_refill_zero();
+    if (dfn2_stream_post_process(ctx, rc, pcm_out) &lt; 0) return -1;
+    write_hop(pcm_out);
+}</code></pre><p>若由記憶體初始化，將 forward 表排成 <code>[n_bins][n_erb]</code>、inverse 表排成 <code>[n_erb][n_bins]</code>，並在 stream 存活期間保留兩者。使用 <code>dfn2_stream_init_from_erb_file()</code> 時，兩個指標留 NULL，載入器負責轉置檔案內的 inverse 表。full 與 mask-only 的 archive 各自建置，呼叫端的 <code>DFN2_MASK_ONLY</code> 要與 archive 相符，否則連結會失敗。</p><p>單幀模式從 hop 0 起每拍都推論。暖機期間 core 丟棄 heads 並推進 generation。<code>post_process()</code> 的 1 代表當拍頻譜有效，PCM 還有一拍 OLA 延遲。full 出貨 grid 的 L=D=1，t=2 首次回 1，t=3 才對齊第一拍輸入。收尾繼續送 L+D+1 拍零 PCM。N&gt;1 使用頻域 core 搭配同 N 匯出的 graph。</p>
+
+<h2>參考</h2>
+<ul>
+<li><a href="reference/core.html">頻域整合、模型張量與狀態</a></li>
+<li><a href="../../../../stream/ainr/dfn2/dfn2_stream.h">PCM SDK 公開標頭</a></li>
+<li><a href="../../../../AINR/DeepFilterNet2/README.md">訓練與匯出</a></li>
+<li><a href="reference/grid.html">Grid 與 ERB 矩陣</a></li>
+</ul>
+</main>
+</body>
+</html>

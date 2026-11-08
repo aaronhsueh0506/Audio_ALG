@@ -1,0 +1,33 @@
+<!doctype html>
+<html lang="zh-Hant">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>模型開發與部署 · Audio_ALG</title>
+<link rel="stylesheet" href="../manual.css">
+</head>
+<body>
+<nav aria-label="導覽"><a href="../index.html">Audio_ALG</a></nav>
+<main>
+<h1>模型開發與部署</h1>
+<p>PCM SDK 負責窗函數、STFT／ISTFT 及模型前後處理，每 hop 交給呼叫端執行加速器。已經拿到頻譜的應用，可直接用 <code>lib/ainr/</code> 或 <code>lib/aiaec/</code> 內的 model core。</p>
+
+<h2>AINR</h2><table><thead><tr><th>模型</th><th>C 入口</th><th>訊號</th></tr></thead><tbody>
+<tr><th><a href="dfn2/index.html">DeepFilterNet2</a></th><td>PCM SDK、頻域 core</td><td>int16 語音 → 增強 PCM；full 或 mask-only。</td></tr>
+<tr><th><a href="dfn3/index.html">DeepFilterNet3</a></th><td>頻域 core</td><td>原始低頻深濾波與高頻 ERB mask，在同一頻譜輸出。</td></tr>
+<tr><th><a href="gtcrn/index.html">GTCRN</a></th><td>頻域 core</td><td>單路複數頻譜 → ERB 特徵 → 複數 mask。</td></tr>
+<tr><th><a href="rnnoise-erb/index.html">RNNoise-ERB</a></th><td>頻域 core</td><td>單路頻譜 → 三幀特徵窗 → ERB gains，對齊延遲頻譜。</td></tr>
+</tbody></table>
+
+<h2>AIAEC</h2><table><thead><tr><th>模型</th><th>C 入口</th><th>訊號</th></tr></thead><tbody>
+<tr><th><a href="align-ulcnet/index.html">Align-ULCNet</a></th><td>PCM SDK、頻域 core</td><td>線性 AEC 的 float 殘差與原始 far → 增強 PCM。</td></tr>
+<tr><th><a href="deepvqe-s/index.html">DeepVQE-S</a></th><td>PCM SDK、頻域 core</td><td>原始 mic 和 far PCM → 複數濾波 → 增強 PCM。</td></tr>
+<tr><th><a href="cagcrn/index.html">CAGCRN</a></th><td>mask 合成 helper</td><td>原始 mic 和 far。Python 串流與匯出，C 提供複數 mask 合成。</td></tr>
+<tr><th><a href="align-cruse/index.html">Align-CRUSE</a></th><td>mask 合成 helper</td><td>原始 mic 和 far。Python 串流與匯出，C 提供實數 mask 合成。</td></tr>
+</tbody></table>
+
+<p><a href="reference/onnx.html">ONNX 張量邊界、state、匯出與 PTQ calibration</a></p>
+<p>三個 PCM SDK 以主機和替身加速器驗證。目標板上的真實 graph、量化、cache／DMA 與每 hop 耗時，需在部署時另外核對。</p>
+</main>
+</body>
+</html>

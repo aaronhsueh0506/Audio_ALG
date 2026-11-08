@@ -129,13 +129,13 @@ before consuming the frame; the application's own synthesis is not restarted
 
 - [4-channel linear AEC + beamformer flow (mcab) and its examples](README.md#4-channel-linear-aec--beamformer-flow-mcab-and-its-examples) <!-- split-toc -->
   - [Call sequence and parameter surface](README.md#call-sequence-and-parameter-surface) <!-- split-toc -->
-  - [C API](README_01_c_api.md#c-api) <!-- split-toc -->
+  - [C API](reference/c-api.md#c-api) <!-- split-toc -->
   - [Python reference seam](README.md#python-reference-seam) <!-- split-toc -->
 ## Call sequence and parameter surface
 
 Per-hop lifelines of the two entry points (return values, refusal rules and the hop swimlane: section 0
-of [`integration_4ch_core_zh_TW.md`](../../docs/integration_4ch_core_zh_TW.md) and
-[`integration_4ch_spatial_zh_TW.md`](../../docs/integration_4ch_spatial_zh_TW.md)):
+of [四麥克風 MCAB](../../docs/reference/mcab/README.md) and
+[SRP／BF helper](../../docs/reference/mcab/beam.md)):
 
 ```
 Flow + your beamformer      App   lanes/DelayAec (yours)   Mcab   your BF   AecRes (yours)  AnrDenoiser  AcIstft
@@ -307,7 +307,7 @@ contract for every finite float32 input.
 The C module does not expose an async multi-frame queue. The sample beam helper
 does execute SRP-PHAT/BF and remains synchronous; the flow supports the heap convenience
 `mcab_create()` (mcab's own pool only) and the caller-owned, zero-heap `mcab_init_ex()` shown in
-[the C API](README_01_c_api.md#c-api). Automated tests prove caller-pool and heap lifecycle,
+[the C API](reference/c-api.md#c-api). Automated tests prove caller-pool and heap lifecycle,
 byte-identical construction paths, topology, supported grids, spatial
 arithmetic equivalence,
 sequencing, and finite DSP output; they do not replace objective speech

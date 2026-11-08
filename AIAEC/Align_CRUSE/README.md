@@ -1,48 +1,16 @@
 # Align-CRUSE
 
-Direct neural AEC/RES candidate. There is no matched filter or linear AEC in
-front of this network. Inputs are unaligned microphone and far-end spectra; the
-output is a real magnitude mask applied to the microphone spectrum, preserving
-microphone phase. This project runs it as an **end-to-end AEC+RES+NR**
-candidate: the training target is `near_target` (denoised, dereverberated,
-echo-cancelled near speech), the same joint task and target DeepVQE-S uses.
-This project has no AEC-only candidate.
+Align-CRUSE takes unaligned microphone and far-end spectra and predicts a real mask for the microphone, preserving its phase. Use the [C mask helper and graph contract](../../docs/html/models/align-cruse/index.html) when the application supplies the framing, accelerator and recurrent state.
 
-Paper-aligned details:
+The project grids use FFT/window/hop 512/512/256 at 16 kHz or 1024/1024/512 at 48 kHz. The hop duration determines the frame count for the one-second delay span. Use `alignment_mode="causal_running"` for streaming. The optional `paper_global` mode needs the complete utterance.
 
-- log-power features from microphone and far end;
-- mic encoder channels `16,40,72,32`, far encoder `8,24`;
-- causal `4x3`, frequency-stride-2 convolutions;
-- causal-running soft delay distribution and weighted far-feature alignment;
-- GRU bottleneck, trainable skip projections, decoder `32,48,48`;
-- sigmoid magnitude mask with learned output gain.
+## Training
 
-The paper used 16 kHz, `320/320/160` and `dmax=100`. This repository preserves
-the one-second delay span while using the project grid (`512/512/256` at 16 kHz
-or `1024/1024/512` at 48 kHz), so the number of delay frames is derived from the
-hop rather than copied as 100. The deployment default
-`alignment_mode="causal_running"` emits `D[B,T,dmax]` using past evidence
-only. Select `paper_global` explicitly to reproduce the paper's one
-`D[B,dmax]` vector; that mode reads the complete utterance and is not causal.
-
-All four frequency restorations use `1x3`, stride-2 transposed convolutions;
-the fourth is the shape-restoring convolution in the mask block. The default
-192-unit GRU keeps the 16 kHz project-grid graph in the paper's approximately
-0.75 M parameter class. No author code/checkpoint was released, so exact
-padding and projection width remain documented reconstruction choices.
-
-## Training recipe
-
-The shipped `config.ini` uses the paper's Adam settings (`lr=1.5e-4`, coupled
-L2 `weight_decay=5e-6`) and STFT-consistent PLCPA (`c=0.3`, `beta=0.7` on the
-phase-aware complex term). The shipped config adds three epochs of warmup from
-`1e-5`, then per-step cosine decay to `1e-6`. Batch 16 is the project memory-fit
-setting and it runs 50 epochs instead of the paper's batch 400 / 150 epochs. The paper does not
-publish example duration or steps per epoch, so the peak LR is not rescaled
-from an unknown exposure ratio. Early stopping is disabled; validation still selects
-the best checkpoint.
+The default uses Adam with peak LR `1.5e-4` and coupled L2 `5e-6`. The STFT-consistent PLCPA loss uses power `0.3` and phase-aware weight `0.7`. The config specifies batch 16, 50 epochs and a three-epoch warm-up. [Training and dataset](../reference/training.md)
 
 ## ONNX and calibration
+
+Run these commands from the model directory.
 
 ```bash
 python3 export_onnx.py --checkpoint checkpoint.pth \

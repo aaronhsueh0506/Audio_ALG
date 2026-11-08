@@ -1,0 +1,207 @@
+<!doctype html>
+<html lang="zh-Hant">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>GTCRN 頻域與模型契約 · Audio_ALG</title>
+<link rel="stylesheet" href="../../../manual.css">
+</head>
+<body>
+<nav aria-label="導覽"><a href="../../../index.html">Audio_ALG</a> / <a href="../../index.html">模型開發與部署</a> / <a href="../index.html">GTCRN</a></nav>
+<main>
+<h1>GTCRN 頻域與模型契約</h1>
+<details><summary>本頁目錄</summary>
+<ul>
+<li><a href="#section-2">Block diagram</a></li>
+<li><a href="#section-3">訊號泳道圖</a></li>
+<li><a href="#section-4">I/O 表</a></li>
+<li><a href="#section-5">State 表</a></li>
+<li><a href="#section-6">延遲與 warm-up</a></li>
+<li><a href="#section-7">函式清單：公開 vs 內部</a></li>
+<li><a href="#section-8">參數表</a></li>
+</ul></details>
+<h2 id="section-1">參考</h2>
+<ul>
+<li><a href="../index.html">GTCRN 整合入口</a></li>
+<li><a href="../../../../../lib/ainr/gtcrn/gtcrn_process.h">頻域 C 標頭</a></li>
+<li><a href="../../../../../AINR/GTCRN/README.md">模型設定與範例</a></li>
+</ul>
+
+<h2 id="section-2">Block diagram</h2>
+<pre>
+application (256 new samples/hop)
+   |
+   v
+ac_stft_push (AcStft)               history (512) 滑窗
+   |  sqrt-Hann + FFT512, spec_scale=1.0 (未正規化)
+   v
+spectrum [257][2]  ----------------------------------------+
+   |                                                       |
+   v  host 固定前端 gtcrn_model_input (fp32)               |
+   mag = sqrt(re^2+im^2+1e-12)                             |
+   ERB 前向 (erb_fwd): 低 65 bins 原樣 +                   |
+     高 192 bins -> 64 帶 = 129;mag/re/im 各一路 (1,129,1) |
+   |                                                       |
+   v  (以下在模型圖內, stream_model.StreamGTCRN)           |
+   concat 3x(1,129,1) -> (B,3,T,129)                       |
+   SFE(k=3): fixed grouped Conv -> (B,9,T,129)             |
+   Encoder: ConvBlock x2 (freq stride 2,2)                 |
+            + GTConvBlock x3 (dilation 1/2/5, causal)      |
+   DPGRNN x2 (intra: 雙向沿頻率; inter: 單向沿時間)        |
+   Decoder: GTConvBlock x3 + ConvBlock x2 (skip add)       |
+   mask_erb (B,2,T,129) = 圖輸出                           |
+   |                                                       |
+   v  gtcrn_process_mask_validate / _state_validate        |
+      (-1: 此框頻譜原樣通過)                               |
+   v  host 固定後端 gtcrn_model_output (fp32)              |
+   ERB 逆 (erb_inv): 129 -> 257;  CRM * spectrum  <--------+
+   |
+   v
+enhanced [257][2]
+   |
+   v
+ac_istft_push (AcIstft)             acc OLA
+   |  IFFT, sqrt-Hann, 50% OLA (ispec_scale=1.0)
+   v
+256 output samples
+</pre>
+
+<h2 id="section-3">訊號泳道圖</h2>
+<p>欄 = hop(256 samples = 16 ms)。模型時間軸完全 causal(圖內所有時間 conv 皆
+左填充、inter RNN 單向),輸出框不等未來框——hop-lag = 0 框,只剩 OLA 重疊延遲。</p>
+<pre>
+lane \ hop      | n=0             | n=1             | n=2 (穩態)
+----------------+-----------------+-----------------+-----------------
+application     | in256 f0 進     | f1 進           | f2 進
+ (AcStft)       | spec f0         | spec f1         | spec f2
+                | (窗前半為 0)    |                 |
+C pre           | mag/real/imag   | mag/real/imag   | mag/real/imag
+ (model_input)  |                 |                 |
+model (NPU)     | output f0       | output f1       | output f2
+                | (cache 全零起始)| (cache 累積中)  |
+C post          | enhanced f0     | enhanced f1     | enhanced f2
+ (model_output) |                 |                 |
+application     | audio 出 256s   | audio 出 256s   | audio 出 256s
+ (AcIstft)      | (OLA 前半暖機)  |                 |
+----------------+-----------------+-----------------+-----------------
+hop-lag: 0 框 (模型 causal); I/O 延遲僅 OLA 重疊 win-hop = 256 samples
+</pre>
+
+<h2 id="section-4">I/O 表</h2>
+<div class="tbl"><table>
+<tr><th>Tensor</th><th>shape</th><th>dtype</th><th>每次呼叫框數</th><th>時域樣本</th><th>備註</th></tr>
+<tr><td><code>input</code>(應用端入)</td><td>[256]</td><td>float32</td><td>1 hop</td><td>256(16 ms)</td><td><code>ac_stft_push</code> 只吃新樣本,滑窗自持</td></tr>
+<tr><td><code>spectrum</code>(AcStft 出 / host 前端入)</td><td>[257][2]</td><td>float32</td><td>1</td><td>—</td><td>bin-major [re,im],未正規化 RFFT</td></tr>
+<tr><td><code>mag</code>/<code>real</code>/<code>imag</code>(圖入 ×3)</td><td>各 (1,129,1)</td><td>float32</td><td>1(串流 T=1)</td><td>—</td><td><code>gtcrn_model_input</code> 產生;三個獨立輸入各持量化 scale</td></tr>
+<tr><td><code>output</code>(圖出)</td><td>(1,129,1,2)</td><td>float32</td><td>1</td><td>—</td><td>ERB 域 complex mask;host <code>gtcrn_model_output</code> 做 ERB 逆矩陣＋CRM</td></tr>
+<tr><td><code>enhanced</code>(model_output 出 / AcIstft 入)</td><td>[257][2]</td><td>float32</td><td>1</td><td>—</td><td>一框增強頻譜(可與 <code>spectrum</code> 同一塊記憶體)</td></tr>
+<tr><td><code>output</code>(AcIstft 出)</td><td>[256]</td><td>float32</td><td>1 hop</td><td>256</td><td>OLA 輸出</td></tr>
+</table></div>
+<p class="note">圖內中間特徵(不跨越模型邊界):concat (B,3,T,129)
+→ SFE (B,9,T,129) → encoder (B,16,T,33) → decoder → mask_erb (B,2,T,129)。
+離線 Python <code>GTCRN.forward(spec)</code> 仍是整段自含(特徵/ERB/CRM 在模型內),
+host 前後端邊界只描述部署用的 stream graph。</p>
+
+<h2 id="section-5">State 表</h2>
+<p><b>ONNX/匯出邊界</b>:<code>export_onnx.py</code> 交付 one-frame stateless
+graph；cache 尺寸由
+<code>stream_model.initial_inputs(model)</code> 從 module tree 推導（不寫死 grid：
+spectrum 寬度隨 n_fft，cache extent 隨 GT block kernel/dilation 與 encoder stride），
+六個 conv window、<code>h_tra</code> 與 <code>h_dpgrnn</code> 都是 graph input/output。
+這八個 state 張量歸<b>應用端</b>：float host 在 <code>GTCRNProcessConfig</code> 以 <code>state[]</code>／<code>state_elements[]</code>
+（依 <code>enum GTCRNStateId</code>，graph 順序）註冊八組 (pointer, 元素數)，全部註冊或全不註冊；板端的加速器自己保存定點 state，
+什麼都不註冊。<b>只有就地綁定</b>:
+runtime 把每個 state input 與對應 <code>*_out</code> 綁到<b>同一塊 buffer</b>，
+更新後的 state 就是下一次呼叫的輸入，沒有複製；須先讀完所有 state 輸入才寫同位址的輸出（目標平台已確認 NPU 的行為）。
+呼叫端在每次 invocation 後用 <code>gtcrn_process_state_validate()</code> 檢查（見下）。
+匯出不 pin 單一 grid——config 與 checkpoint 不成對時在 strict
+<code>load_state_dict</code>（形狀）或 checkpoint contract（同形語意）就大聲失敗。
+固定前後端全在 host：<code>gtcrn_model_input</code>（magnitude＋ERB 前向矩陣）
+產生 <code>mag/real/imag</code> 三個獨立輸入（各自量化 scale）；圖回傳 ERB 域
+complex mask，<code>gtcrn_model_output</code> 做 ERB 逆矩陣＋CRM。ERB 矩陣由
+<code>export_erb_matrix.py --runtime-bins</code> 匯出成 raw float32 的
+<code>erb_fwd.bin</code>（bin-major <code>[192][64]</code>）／<code>erb_inv.bin</code>（band-major <code>[64][192]</code>）；layout 與 C 迴圈一致，json 記
+shape；<b>C 只吃應用端載入的指標</b>（<code>GTCRNProcessConfig.erb_fwd</code>／<code>erb_inv</code>，
+或 <code>gtcrn_process_set_erb_matrices()</code>），函式庫不讀檔。ERB split 出貨為 65+64=129，
+graph I/O 寬度就是 <code>grid.erb_bands</code>。<code>inference.py calib</code> 會在同一 process 同一 model instance
+一併匯出並 parity-check graph（預設 <code>&lt;output&gt;.onnx</code>，<code>--onnx</code> 可改）。</p>
+
+<p><b>State 邊界(layout version 8)</b>:所有 state tensor 都是 rank 4,輸入與 <code>*_out</code> 輸出 shape 完全相同;
+metadata 記 <code>state_binding = in_place_same_address</code>。版本 3–7 已退役(<code>RETIRED_LAYOUT_VERSIONS</code>)。</p>
+<ul>
+<li><code>conv_enc0/1/2</code>、<code>conv_dec0/1/2</code> <code>(1,16,3|5|11,33)</code>:depth-conv 的<b>完整</b>因果 window(= 歷史 + 新的一幀)。
+圖在輸入上做一個 Slice(axes=[2]、starts=[1]、ends=[K]、step 1,end 是明確整數)丟掉最舊一幀,接上新的一幀,卷積,
+並把<b>整個</b> K 幀 Concat 結果當作 <code>conv_*_out</code>。輸入只有這一個 consumer,沒有任何 state 輸出由 Slice 產生。
+decoder 的 window 深度與 encoder 反向(11、5、3)。</li>
+<li><code>h_tra (1,6,1,16)</code>:六顆 TRA attention GRU,列順序 encoder 0–2 再 decoder 0–2;<code>h_dpgrnn (1,4,33,8)</code>:四顆 grouped inter GRU
+(<code>h_dpgrnn1_0</code>、<code>h_dpgrnn1_1</code>、<code>h_dpgrnn2_0</code>、<code>h_dpgrnn2_1</code>),hidden batch 是頻率軸。
+每顆 GRU 用輸入上 dim 1 的 Slice 取自己的列再 squeeze,下一個 state 以一個 Concat(dim 1)接回。</li>
+</ul>
+<p class="note">新 window 的前 K−1 幀等於輸入 window 的後 K−1 幀,<code>h_tra</code>／<code>h_dpgrnn</code>
+是六個／四個 hidden 依序串接。匯出圖經 exporter 內建 onnxoptimizer ＋ ORT 常數折疊後本機量測 299 節點(36 個 Slice,皆 step 1;合約測試門檻 ≤ 300)。
+<code>AINR/onnx_streaming_contract.py</code> 的 <code>validate_inplace_state_graph()</code> 在匯出時檢查上述條件,
+<code>AINR/check_state_quantization.py</code> 可對量化後的圖與報告再檢查 state 輸入／輸出的 dtype、scale、zero point、shape 是否一致。
+Slice 沿 axis 2 的起點在 int8 下落在 33 byte 的整數倍(window 一列 33 個元素),不是 16 byte 對齊;對齊處理由量化工具鏈決定,尚未在板上驗證。</p>
+<div class="tbl"><table>
+<tr><th>狀態</th><th>shape</th><th>bytes</th><th>儲存者</th><th>說明</th></tr>
+<tr><td><code>GTCRNProcess</code> pool</td><td>標頭 + 3 條 <code>[n_bins]</code> 暫存列</td><td>3,328（<code>gtcrn_process_get_mem_size</code>，64-bit 本機量測）</td><td>應用端提供的 16-byte 對齊記憶體</td><td>不含 ERB 矩陣、註冊的 state 與 framing 物件;暫存列每次完整覆寫,非跨呼叫</td></tr>
+<tr><td><code>AcStft</code>／<code>AcIstft</code></td><td>history／acc、FFT plan、窗表</td><td>預設（自帶 FFT 與窗表）各 21,840@512（本機量測，依 <code>ac_stft_get_mem_size()</code> 現查）</td><td>應用端(audiolib)</td><td>分析滑窗與 OLA 累加器(有效 256,跨 hop);函式庫不持有</td></tr>
+<tr><td><code>conv_enc0/1/2</code></td><td>(1,16,3/5/11,33)</td><td>40,128(10,032 f32)</td><td>應用端</td><td>三個 encoder depth-conv 的完整 window,<code>*_out</code> 與輸入同位址</td></tr>
+<tr><td><code>conv_dec0/1/2</code></td><td>(1,16,11/5/3,33)</td><td>40,128(10,032 f32)</td><td>應用端</td><td>三個 decoder depth-conv 的完整 window,<code>*_out</code> 與輸入同位址</td></tr>
+<tr><td><code>h_tra</code></td><td>(1,6,1,16)</td><td>384(96 f32)</td><td>應用端</td><td>顯式 graph I/O,六顆 TRA <code>att_gru</code> hidden:列 0–2 encoder、列 3–5 decoder</td></tr>
+<tr><td><code>h_dpgrnn</code></td><td>(1,4,33,8)</td><td>4,224(1,056 f32)</td><td>應用端</td><td>顯式 graph I/O,四顆 grouped inter GRU hidden(<code>h_dpgrnn1_0/1</code>、<code>h_dpgrnn2_0/1</code>)</td></tr>
+</table></div>
+<p class="note"><code>gtcrn_process_state_validate(p)</code>:每次 invocation 後就地檢查已註冊的 8 個 state 張量,
+全部有限(或沒有註冊)回 0;任何 NaN/Inf 則八個全部歸零、state generation 加 1 並回 -1(前一個 state 已被覆寫;寫一半而仍有限者偵測不到;可信 runtime 可不呼叫)。
+<code>gtcrn_process_mask_validate(p, mask_erb)</code> 檢查 mask,拒絕時同樣回 -1(此框改讓頻譜原樣通過);先 mask 後 state,兩者連續被拒 generation 至多加 1。
+<code>gtcrn_process_state_generation()</code> 回傳 generation:<code>gtcrn_process_init()</code> 後為 1,每次 <code>gtcrn_process_reset()</code> 與每次被拒的驗證加 1(mod 2^32),有沒有註冊 state 都一樣;
+加速器那份定點 state 看不到這兩件事,runtime 發現數值與上一幀不同就把自己的 state tensor 填成量化後的零。
+八個 state 張量合計 84,864 bytes(21,216 f32);各形狀取自
+<code>stream_model.initial_inputs()</code> 與匯出 graph schema,本目錄 <code>model.py</code> 無 cache 介面。</p>
+
+<h2 id="section-6">延遲與 warm-up</h2>
+<ul>
+<li><b>演算法 lookahead = 0 框</b>:圖內所有時間 conv 都是左填充 causal
+(<code>GTConvBlock</code> 的 <code>F.pad(h1,[0,0,pad_size,0])</code>),TRA 與 inter RNN 單向,
+intra RNN 只在單框的頻率軸上雙向。</li>
+<li>I/O 延遲 = OLA 重疊 win−hop = 256 samples = <b>16 ms</b> @16 kHz。</li>
+<li>Warm-up:無「無輸出」暖機框(第 0 hop 即有輸出);但 conv/TRA/inter cache 由零起始,
+且 C 串流的首框以零填充取代 PyTorch 離線 <code>center=True</code> 的 reflect padding
+(README 明載此差異只影響 clip 起點)。</li>
+<li>時間感受野:encoder/decoder 各 3 個 GTConvBlock 累積 (kT−1)·dilation = 2+4+10 = 16 框過去
+context(conv window 深度 = 歷史 + 新的一幀,即 3、5、11),加上 RNN 無限記憶。</li>
+</ul>
+
+<h2 id="section-7">函式清單：公開 vs 內部</h2>
+<div class="tbl"><table>
+<tr><th>分類</th><th>函式（<code>gtcrn_process.h</code>）</th></tr>
+<tr><td><b>公開（整合者呼叫）</b></td><td><code>gtcrn_grid_make</code>、<code>gtcrn_grid_validate</code>、<code>gtcrn_grid_status_text</code>；<code>gtcrn_process_config_defaults</code>、<code>_get_mem_size</code>、<code>_init</code>、<code>_init_ex</code>、<code>_reset</code>、<code>_state_generation</code>、<code>_grid</code>、<code>_set_erb_matrices</code>；<code>gtcrn_model_input</code>、<code>gtcrn_model_output</code>、<code>gtcrn_process_mask_validate</code>、<code>gtcrn_process_state_validate</code>；<code>gtcrn_simd_backend</code></td></tr>
+<tr><td><b>內部（<code>static</code>，<code>gtcrn_process.c</code>）</b></td><td><code>erb_band3</code>／<code>mask_expand</code>（各有 <code>_neon</code> 版）、<code>n_fft_accepted</code>、<code>pp_*</code>（carve、build hash、config 與註冊檢查、歸零）</td></tr>
+</table></div>
+
+<h2 id="section-8">參數表</h2>
+<h3>外部：第三方可調</h3>
+<div class="tbl"><table>
+<tr><th>名稱</th><th>位置</th><th>型別／範圍</th><th>預設</th><th>何時設定</th><th>說明</th></tr>
+<tr><td><code>n_fft</code>、<code>erb_low_bins</code>、<code>erb_high_bands</code></td><td><code>GTCRNGridSpec</code> → <code>gtcrn_grid_make()</code></td><td>int；<code>n_fft</code> 為 audiolib 接受的大小，<code>erb_low_bins</code> 在 [0, n_bins−1]，<code>erb_high_bands</code> 在 [1, erb_high_bins]</td><td>無；出貨值 512／65／64</td><td>init 前</td><td>模型匯出時決定；被拒時回傳 <code>GTCRN_GRID_ERR_*</code>（−1…−5）；grid 被複製進 config</td></tr>
+<tr><td><code>erb_fwd</code></td><td><code>GTCRNProcessConfig</code>；<code>gtcrn_process_set_erb_matrices</code></td><td><code>const float*</code>，bin-major [erb_high_bins][erb_high_bands]（出貨 [192][64]）</td><td>必填</td><td>init 前；hop 之間可換</td><td>borrowed；須與 checkpoint 的 ERB 設定相符</td></tr>
+<tr><td><code>erb_inv</code></td><td>同上</td><td><code>const float*</code>，band-major [erb_high_bands][erb_high_bins]（出貨 [64][192]）</td><td>必填</td><td>同上</td><td>borrowed</td></tr>
+<tr><td><code>state[8]</code>／<code>state_elements[8]</code></td><td><code>GTCRNProcessConfig</code>（<code>GTCRNStateId</code> 順序）</td><td><code>float*</code> 與元素個數；八組都設或都不設</td><td>NULL／0（板端）</td><td>init 前</td><td>borrowed；float host 註冊，init 與 reset 歸零，驗證時有限檢查；不進 pool 大小與 hash</td></tr>
+<tr><td>framing 物件</td><td>應用端的 <code>AcStft</code>／<code>AcIstft</code></td><td><code>ac_stft_config_default(&amp;sc, grid.n_fft)</code>，不改欄位</td><td>—</td><td>建立時</td><td>記憶體與 FFT 歸應用端（預設各 21,840 bytes@512，本機量測）</td></tr>
+<tr><td>Python CLI</td><td><code>GTCRN/inference.py</code>、<code>export_onnx.py</code>、<code>export_erb_matrix.py</code></td><td><code>--config</code>／<code>--model</code>／<code>--input</code>／<code>--output</code>／<code>--input-dir</code>／<code>--output-dir</code>；calib：<code>--wav-dir</code>／<code>--output</code>／<code>--format</code>(bin|npz)／<code>--frames</code>(256)／<code>--seed</code>(42)／<code>--onnx</code>；<code>--opset</code>(17)／<code>--verify</code>；<code>--runtime-bins</code></td><td>—</td><td>離線推論、PTQ 校正、匯出</td><td>GTCRN 沒有衰減上限或強度旋鈕（C 與 Python 皆無）</td></tr>
+</table></div>
+<h3>內部：存在且可改，但不建議開放</h3>
+<div class="tbl"><table>
+<tr><th>名稱</th><th>值</th><th>位置</th><th>不開放的原因</th></tr>
+<tr><td>grid 推導量：<code>hop</code>、<code>n_bins</code>、<code>erb_bands</code>、<code>erb_high_bins</code></td><td>256、257、129、192</td><td><code>GTCRNGrid</code>（<code>gtcrn_process.h</code>）</td><td>由 <code>gtcrn_grid_make()</code> 推導；手改的 grid 被 <code>gtcrn_grid_validate()</code> 拒絕；graph I/O 寬度就是 <code>erb_bands</code></td></tr>
+<tr><td>STFT 縮放</td><td><code>spec_scale</code> = <code>ispec_scale</code> = 1.0f</td><td>應用端的 <code>AcStftConfig</code></td><td>與 checkpoint 的 signal contract 綁定；未正規化（不是 <code>torch.stft(normalized=True)</code>）</td></tr>
+<tr><td>recurrent state 的形狀</td><td>conv_enc0..2 與 conv_dec0..2 為 16×(3,5,11 / 11,5,3)×33、<code>h_tra</code> 6×16、<code>h_dpgrnn</code> 4×33×8</td><td>匯出圖與 <code>export_onnx.py</code>(應用端自己的常數)</td><td>函式庫只收八個元素個數，不知道形狀；decoder 與 encoder 的 window 深度反向</td></tr>
+<tr><td><code>GTCRN_STATE_COUNT</code></td><td>8</td><td><code>gtcrn_process.h</code></td><td>圖的張量個數，不是容量</td></tr>
+<tr><td><code>GTCRN_MODEL_LAYOUT_VERSION</code></td><td>8（3–7 已退役）</td><td><code>gtcrn_process.h</code></td><td>與 <code>export_onnx.py</code> 的 <code>STATE_LAYOUT_VERSION</code> 互鎖，是拒絕舊圖的唯一閘門</td></tr>
+<tr><td><code>GTCRN_PROCESS_CARVE_VERSION</code>／<code>_DESCRIPTOR_VERSION</code>／<code>_ALIGNMENT</code></td><td>1／1／16</td><td><code>gtcrn_process.h</code></td><td>pool 切分與 descriptor 版本，進 <code>build_flags_hash</code>（整個 grid、layout 與切分版號）；pool 3,328 bytes@出貨 grid（64-bit 本機量測）；<code>init_ex</code> 拒絕別的 grid 或 build 做的 pool</td></tr>
+<tr><td>state generation</td><td>init 後 1，reset 與被拒的驗證各 +1（mod 2^32）</td><td><code>gtcrn_process_state_generation()</code></td><td>由函式庫維護；呼叫端只讀，不可自行寫入</td></tr>
+<tr><td>訓練端 <code>config.ini</code> 的 <code>[signal]</code>／<code>erb_subband_1</code>／<code>erb_subband_2</code></td><td>65／64</td><td>Python</td><td>寫進 checkpoint contract，<code>inference.py</code> 逐項比對</td></tr>
+</table></div>
+</main>
+</body>
+</html>

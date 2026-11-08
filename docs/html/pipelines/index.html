@@ -1,0 +1,24 @@
+<!doctype html>
+<html lang="zh-Hant">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>選擇 pipeline · Audio_ALG</title>
+<link rel="stylesheet" href="../manual.css">
+</head>
+<body>
+<nav aria-label="導覽"><a href="../index.html">Audio_ALG</a></nav>
+<main>
+<h1>選擇 pipeline</h1>
+<p>先選麥克風數，再選後級。四聲道共用 <code>mcab_process_front()</code> 做四路線性 AEC，應用端可用自己的 beamformer 或範例的 SRP／BF helper，透過 <code>mcab_fuse()</code> 產生融合結果。</p>
+
+<table><thead><tr><th>後級</th><th>Mono</th><th>四聲道</th><th>輸入邊界</th></tr></thead><tbody>
+<tr><th>AEC／NR／RES</th><td><a href="mono/aec-nr-res/index.html">Mono AEC／NR／RES</a></td><td><a href="4ch/aec-nr-res/index.html">四聲道 AEC／NR／RES</a></td><td>結合 NR 與殘留回音抑制增益，再合成 PCM。</td></tr>
+<tr><th>DFN2</th><td><a href="mono/dfn2/index.html">Mono DFN2</a></td><td><a href="4ch/dfn2/index.html">四聲道 DFN2</a></td><td>以 RES 前頻譜估計 mask，在 RES 後頻譜套用。</td></tr>
+<tr><th>Align-ULCNet</th><td><a href="mono/align-ulcnet/index.html">Mono Align-ULCNet</a></td><td><a href="4ch/align-ulcnet/index.html">四聲道 Align-ULCNet</a></td><td>以線性誤差與 far 參考估計神經後濾波。</td></tr>
+</tbody></table>
+
+<p>已有 PCM、要獨立呼叫 NPU 時，見 <a href="../models/index.html">單模型串流介面</a>。每條 pipeline 的頁面標出實際 C 入口、訊號來源及合成的位置。</p>
+</main>
+</body>
+</html>

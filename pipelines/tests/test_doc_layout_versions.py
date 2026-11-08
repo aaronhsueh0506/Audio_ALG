@@ -43,14 +43,14 @@ _DOC_SUFFIXES = ('.html', '.md')
 # historical prose, so pin only the narrowly-scoped forms that explicitly say
 # "current checkout/value" (or identify the measured build in the HTML table).
 _UNQUALIFIED_CURRENT_CLAIMS = (
-    ('docs/integration_4ch_core_zh_TW.md', 'MCAB_LAYOUT_VERSION',
+    ('docs/reference/mcab/config.md', 'MCAB_LAYOUT_VERSION',
      re.compile(r'本次 checkout（`layout_version=(\d+)`')),
-    ('docs/integration_4ch_core_zh_TW.md', 'MCAB_LAYOUT_VERSION',
+    ('docs/reference/mcab/errors.md', 'MCAB_LAYOUT_VERSION',
      re.compile(r'\| 4 \| `layout_version` \| `uint32_t` \| `(\d+)` \|')),
-    ('docs/integration_4ch_spatial_zh_TW.md',
+    ('docs/reference/mcab/beam-errors.md',
      'MCAB_LAYOUT_VERSION',
      re.compile(r'本次 checkout，`layout_version=(\d+)`')),
-    ('docs/html/pipeline_4ch.html', 'MCAB_LAYOUT_VERSION',
+    ('docs/html/pipelines/4ch/aec-nr-res/index.html', 'MCAB_LAYOUT_VERSION',
      re.compile(r'mcab_sample_unit_memory\(\)</code>'
                 r'\(ne10,layout_version=(\d+)\)')),
 )
@@ -101,23 +101,12 @@ def test_docs_publish_the_current_layout_version(macro):
         % (macro, expected, '\n  '.join(stale)))
 
 
-def _manual_text(path: pathlib.Path) -> str:
-    """Text of a manual: the entry file plus its ``<stem>_NN_<topic>.md`` parts.
-
-    A long manual is split into an index and part files; the claim may live in
-    any of them, so the scan covers the whole set instead of weakening the pin.
-    """
-    files = [path] + sorted(
-        path.parent.glob('%s_[0-9][0-9]_*%s' % (path.stem, path.suffix)))
-    return '\n'.join(f.read_text(encoding='utf-8') for f in files)
-
-
 @pytest.mark.parametrize('relative_path,macro,pattern',
                          _UNQUALIFIED_CURRENT_CLAIMS)
 def test_unqualified_current_layout_claims(relative_path, macro, pattern):
     """Current-value prose must move with the corresponding C counter."""
     path = _REPO / relative_path
-    matches = pattern.findall(_manual_text(path))
+    matches = pattern.findall(path.read_text(encoding='utf-8'))
     assert matches, '%s 的目前版號宣稱格式已改；請同步更新測試' % relative_path
     expected = _declared_version(macro)
     assert all(int(value) == expected for value in matches), (
@@ -204,8 +193,8 @@ def test_carve_scan_sees_the_dfn_pipeline_pages_and_rejects_stale_forms(
         tmp_path):
     """The scan has to reach the pipeline pages that quote the DFN2 carve
     version, and the checker has to fail on stale forms."""
-    pages = [_REPO / 'docs/html/pipeline_dfn_mono.html',
-             _REPO / 'docs/html/pipeline_dfn_4ch.html']
+    pages = [_REPO / 'docs/html/pipelines/mono/dfn2/index.html',
+             _REPO / 'docs/html/pipelines/4ch/dfn2/index.html']
     declared = {m: _declared_carve_version(m) for m in _CARVE_SOURCES}
     for page in pages:
         mentions = list(_carve_mentions([page]))
