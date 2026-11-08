@@ -1,17 +1,11 @@
-/* Shared, model-agnostic helpers for the stream/ PCM modules (stream/ainr/dfn2,
- * stream/aiaec/deepvqe_s, stream/aiaec/ulcnet): the 16-byte-aligned pool carve, the FNV-1a-32
- * fold used to build each module's own build_flags_hash, and the float-to-int16 PCM saturate.
- * static inline, header-only: including this adds no link dependency and does not compromise
- * any one model's ability to ship its own stream/ directory independently of the others -- these
- * three functions carry no model-specific content.
+/* Shared, model-agnostic helpers for the stream/ PCM modules (dfn2, deepvqe_s, ulcnet): the
+ * 16-byte-aligned pool carve, the FNV-1a-32 fold used to build each module's own
+ * build_flags_hash, and the float-to-int16 PCM saturate. static inline, header-only: including
+ * this adds no link dependency and does not compromise any one model's ability to ship its own
+ * stream/ directory independently of the others.
  *
- * This duplication across the three stream modules was flagged by the simplify pass; audiolib's
- * own utility/mem_align.h would be the architecturally deeper home (it already hosts
- * ac_memreq_abi_hash(), the same FNV-1a-32 fold, and six-plus per-model prepost source files
- * already hand-roll an equivalent carve+hash pair), but that header lives in the separate
- * audiolib repo and editing it needs its own commit+pin-bump cycle -- out of scope for this pass.
- * This header is the same-repo fix; promoting it into mem_align.h is a reasonable follow-up, not
- * done here. */
+ * Duplicates audiolib's own utility/mem_align.h equivalents; promoting these into mem_align.h
+ * (a separate repo, its own commit+pin-bump cycle) is a reasonable follow-up, not done here. */
 
 #ifndef STREAM_COMMON_MEM_H
 #define STREAM_COMMON_MEM_H
@@ -48,17 +42,12 @@ static inline uint32_t stream_fnv1a_u32(uint32_t h, uint32_t v) {
     return h;
 }
 
-/* float PCM (full-scale ~=1.0f) -> saturated int16, the convention every stream module's
- * post_process uses: scale by 32768 first, then clip to the asymmetric int16 range. A NaN input
- * (confirmed reachable: a finite but extreme accelerator output -- a large mask or CCM tap, both
- * accepted since they are finite -- can still overflow to NaN in the DSP between the accelerator
- * and this saturate, e.g. in the synthesis ISTFT's own math) would otherwise compare false
- * against both clip bounds, leave v as NaN, and reach `(int16_t)v`, which is undefined behavior
- * for a non-finite float (confirmed under UBSan: "nan is outside the range of representable
- * values of type 'short'") -- not merely unspecified rounding, an actual UB cast the compiler is
- * free to miscompile. +-Inf do not need this: they already compare true against a clip bound and
- * saturate correctly. Defined here as silence (0), matching this codebase's convention elsewhere
- * that a non-finite result is treated as invalid rather than propagated. */
+/* float PCM (full-scale ~=1.0f) -> saturated int16: scale by 32768 first, then clip to the
+ * asymmetric int16 range. A NaN input (reachable: a finite but extreme accelerator output can
+ * still overflow to NaN in the DSP between the accelerator and this saturate) would otherwise
+ * reach `(int16_t)v`, which is undefined behavior for a non-finite float (confirmed under
+ * UBSan). +-Inf already clip correctly without this check. Defined here as silence (0), matching
+ * this codebase's convention that a non-finite result is invalid, not propagated. */
 static inline int16_t stream_saturate_s16(float v) {
     v *= 32768.0f;
     if (isnan(v)) return 0;   /* only NaN is UB here; +-Inf already clip correctly below */

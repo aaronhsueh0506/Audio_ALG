@@ -72,10 +72,9 @@ int ulcnet_stream_layout(const UlcnetStreamConfig *cfg, unsigned char *base,
     if (fft_bytes == 0 || stream_carve(base, &cursor, fft_bytes, &ptr) != 0) return -1;
     out->fft_mem = ptr;
 
-    /* One AcStftConfig, reused for sizing stft_err/stft_far/istft; scfg.fft stays NULL here
-     * (own-carve sizing) for the same reason the other stream modules' layout functions do --
-     * audio_stft.c's config_valid() dereferences a non-NULL cfg->fft, so sizing cannot borrow the
-     * not-yet-constructed shared handle. */
+    /* One AcStftConfig, reused for sizing stft_err/stft_far/istft; scfg.fft stays NULL here --
+     * audio_stft.c's config_valid() dereferences a non-NULL cfg->fft, which doesn't exist yet
+     * during sizing (same reason the other stream modules' layout functions do this). */
     ac_stft_config_default(&scfg, cfg->grid.n_fft);
     scfg.ola = AC_OLA_ENV_NORM;
 
@@ -253,12 +252,10 @@ void ulcnet_stream_reset(UlcnetStream *s) {
     ulcnet_prepost_reset(s->prepost);
     s->hop_state = ULCNET_STREAM_IDLE;
     s->reprime_remaining = 0;
-    /* Also clear the alignment-edge tracker, so the hop right after any reset (an explicit
-     * caller reset, or this same function called internally from a pre_process-detected edge) is
-     * exactly like the first hop after init: had_hop == 0 suppresses the next edge check
-     * regardless of whatever delay.solid value happened to be recorded before this reset. Without
-     * this, an explicit mid-stream ulcnet_stream_reset() call left prev_solid stale, which could
-     * spuriously re-trigger a second reset+reprime on the very next hop. */
+    /* Also clear the alignment-edge tracker: had_hop == 0 suppresses the next edge check
+     * regardless of the recorded delay.solid, so the hop after ANY reset (explicit or
+     * pre_process-detected) is exactly like the first hop after init. Without this, an explicit
+     * mid-stream reset left prev_solid stale and could spuriously re-trigger a reset+reprime. */
     s->had_hop = 0;
     s->prev_solid = 0;
 }
@@ -289,12 +286,10 @@ int ulcnet_stream_pre_process_f32(UlcnetStream *s, const float *err_in, const fl
     if (!s || !err_in || !far_in || !io || s->hop_state != ULCNET_STREAM_IDLE) return -1;
 
     /* Alignment-edge detection, before this hop's own analysis (mirrors the board sample's Stage
-     * 3, run ahead of Stage 4): a new alignment generation, or the first hop where `solid` turns
-     * true after a prior hop where it was false. Only the solid-transition term is gated by
-     * s->had_hop (no prior solid value exists on the very first hop to compare against, matching
-     * the board sample's own g_processed_hops guard on that specific sub-check); delay.changed is
-     * NOT gated by had_hop, matching the board sample's own unguarded `changed` check -- a caller
-     * reporting a fresh alignment generation on hop 0 correctly resets there too. */
+     * 3, ahead of Stage 4): a new alignment generation, or the first hop where `solid` turns true
+     * after a prior hop where it was false. Only the solid-transition term is gated by
+     * s->had_hop (no prior value on the very first hop); delay.changed is NOT gated, matching the
+     * board sample's own unguarded check -- a fresh generation on hop 0 resets there too. */
     edge = delay.changed || (s->had_hop && !s->prev_solid && delay.solid);
     if (edge) {
         /* ulcnet_stream_reset() itself clears reprime_remaining; re-arm strictly after it
@@ -305,9 +300,8 @@ int ulcnet_stream_pre_process_f32(UlcnetStream *s, const float *err_in, const fl
     s->had_hop = 1;
     s->prev_solid = delay.solid;
 
-    /* err_in/far_in are read once each, here, and never stored -- no reason to copy into the
-     * per-hop scratch slab first (that scratch exists only for ulcnet_stream_pre_process()'s own
-     * int16 conversion below). */
+    /* err_in/far_in are read once each, here, and never stored -- the scratch slab exists only
+     * for ulcnet_stream_pre_process()'s int16 conversion below. */
     ac_stft_push_planar(s->stft_err, err_in, s->err_re, s->err_im);
     ac_stft_push_planar(s->stft_far, far_in, s->far_re, s->far_im);
 
@@ -319,13 +313,9 @@ int ulcnet_stream_pre_process_f32(UlcnetStream *s, const float *err_in, const fl
 
     if (s->reprime_remaining > 0) {
         s->reprime_remaining--;
-        /* Identity for this frame: frame_bypass() needs only pre_process_freq()'s own
-         * p->frame_open flag (set above), not the separate frame_open()/"prepared" state --
-         * confirmed against lib/aiaec/ulcnet/ulcnet_prepost.c: frame_bypass() checks
-         * `!p->frame_open` only, and pre_process_freq() already set that flag. It returns 0 here
-         * (the board sample ignores its return value on this exact path; this stream does not
-         * need to check it either, since pre_process_freq() having just succeeded guarantees
-         * p->frame_open is set and frame_bypass() cannot be refused). */
+        /* Identity for this frame: frame_bypass() only checks p->frame_open (set by
+         * pre_process_freq() above), not the separate frame_open()/"prepared" state, so it
+         * cannot be refused here -- its return value is not checked, same as the board sample. */
         (void)ulcnet_prepost_frame_bypass(s->prepost);
         memset(io, 0, sizeof(*io));
         s->hop_state = ULCNET_STREAM_FRAME_CLOSED;
@@ -343,13 +333,10 @@ int ulcnet_stream_pre_process(UlcnetStream *s, const int16_t *err_in, const int1
                               UlcnetStreamDelay delay, UlcnetHopIO *io) {
     int hop, i;
 
-    /* Thin int16 convenience wrapper: converts into the per-hop float scratch (never read by
-     * anyone else), then runs the exact same path ulcnet_stream_pre_process_f32() runs for a
-     * caller whose own lanes are already float (e.g. a linear AEC's formed_hop residual, which
-     * the board sample feeds this model WITHOUT ever quantizing to int16 -- see ulcnet_stream.h's
-     * own comment). The full contract check is repeated here (not just deferred to the f32 call)
-     * so this wrapper never touches s->err_f/far_f on a call that was going to be refused anyway
-     * -- same "no state touched before any write" shape the rest of this file keeps elsewhere. */
+    /* Thin int16 wrapper: converts into the per-hop float scratch, then runs
+     * ulcnet_stream_pre_process_f32()'s path (see ulcnet_stream.h). The contract check is
+     * repeated here, not deferred to the f32 call, so a refused call never touches
+     * s->err_f/far_f -- the "no state touched before any write" shape used elsewhere in this file. */
     if (!s || !err_in || !far_in || !io || s->hop_state != ULCNET_STREAM_IDLE) return -1;
     hop = s->grid.hop;
     for (i = 0; i < hop; ++i) {
@@ -366,11 +353,9 @@ int ulcnet_stream_post_process(UlcnetStream *s, int ai_rc, int16_t *pcm_out) {
     hop = s->grid.hop;
 
     if (s->hop_state == ULCNET_STREAM_FRAME_OPEN) {
-        /* Mirror the board sample's dispatch exactly, and DFN2/DeepVQE-S's own fix for the same
-         * hazard: a finish that itself fails (non-finite mask or state, despite ai_rc == 0) still
-         * needs a bypass to actually close the frame -- ulcnet_prepost_frame_finish()'s doc says
-         * "the frame stays open ... then frame_bypass() or a fresh frame_open()", and a frame left
-         * open here would desync this stream's own bookkeeping from UlcnetPrepost's. */
+        /* Same hazard DFN2/DeepVQE-S guard against: a finish that itself fails (non-finite mask
+         * or state despite ai_rc == 0) leaves the frame open per ulcnet_prepost_frame_finish()'s
+         * doc, so it still needs an explicit bypass to close it and stay in sync with UlcnetPrepost. */
         int rc = (ai_rc == 0) ? ulcnet_prepost_frame_finish(s->prepost) : -1;
         if (rc != 0) ulcnet_prepost_frame_bypass(s->prepost);
     }

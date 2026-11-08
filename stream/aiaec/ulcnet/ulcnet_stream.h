@@ -1,17 +1,16 @@
-/* Align-ULCNet PCM stream: the one header a board sample includes. Wraps two analysis AcStft
- * (linear-error, raw far), one synthesis AcIstft (AC_OLA_ENV_NORM) and lib/aiaec/ulcnet's
- * UlcnetPrepost frame_open/finish/bypass per-hop lifecycle around int16 PCM, one hop per call
- * (no HPF -- the board sample has none for this model), plus the alignment-driven reset/reprime
- * bookkeeping the board sample does itself
- * (alg_ai3_alignulcnet.c's stream_reset() + g_reprime_frames). This model is a post-filter
- * BEHIND a linear AEC: its two inputs are the AEC's linear-error hop and the raw far hop, never
- * raw mic -- see pipelines/ulcnet/ulcnet_nn_stage.h's own doc for why (trained on the analysis
- * seam, not the AEC's guarded rendering base). `pipelines/ulcnet/ulcnet_nn_stage.{c,h}` is a
- * different, higher-level component (a synchronous "installed model" callback consumer used by
- * the 4-channel pipeline) built on raw complex spectra, not on this model's real NPU tensor
- * boundary (compressed features + history/GRU state); it is untouched by this stream and stays
- * the right entry point for that caller. Frequency-domain callers with their own framing should
- * use lib/aiaec/ulcnet/ulcnet_prepost.h directly instead.
+/* Align-ULCNet PCM stream: wraps two analysis AcStft (linear-error, raw far), one synthesis
+ * AcIstft (AC_OLA_ENV_NORM) and lib/aiaec/ulcnet's UlcnetPrepost frame_open/finish/bypass per-hop
+ * lifecycle around int16 PCM, one hop per call (no HPF), plus the alignment-driven reset/reprime
+ * bookkeeping the board sample does itself (alg_ai3_alignulcnet.c's stream_reset() +
+ * g_reprime_frames). This model is a post-filter BEHIND a linear AEC: its two inputs are the
+ * AEC's linear-error hop and the raw far hop, never raw mic -- see
+ * pipelines/ulcnet/ulcnet_nn_stage.h's own doc for why (trained on the analysis seam, not the
+ * AEC's guarded rendering base). `pipelines/ulcnet/ulcnet_nn_stage.{c,h}` is a different,
+ * higher-level component (a synchronous "installed model" callback consumer used by the
+ * 4-channel pipeline) built on raw complex spectra, not on this model's real NPU tensor boundary
+ * (compressed features + history/GRU state); it is untouched by this stream and stays the right
+ * entry point for that caller. Frequency-domain callers with their own framing should use
+ * lib/aiaec/ulcnet/ulcnet_prepost.h directly.
  *
  *     ctx = ulcnet_stream_init(&cfg, pool, pool_bytes);
  *     while (have a hop of int16 err_in, far_in) {
@@ -21,64 +20,48 @@
  *         if (pre_rc < 0) break;                                // contract error
  *         int ai_rc = 0;
  *         if (pre_rc == 1) {
- *             device_state_sync(io.state_generation);   // reload the accelerator's OWN state
- *                                                        // copy with quantized zero if this
- *                                                        // changed since the last hop -- see
- *                                                        // below, not optional; skipped on a
- *                                                        // reprime hop (pre_rc == 0), which never
- *                                                        // reaches the accelerator at all
- *             ai_rc = run_accelerator(&io.inputs, &io.outputs);   // 0 = mask written
- *             if (ai_rc != 0) device_state_refill_zero(); // the run may have written PART of the
- *                                                        // state before failing; restart it from
- *                                                        // zero now, do not wait for the next
- *                                                        // hop's sync above
+ *             device_state_sync(io.state_generation);    // reload accelerator state on change;
+ *                                                         // skipped on a reprime hop (pre_rc==0),
+ *                                                         // which never reaches the accelerator
+ *             ai_rc = run_accelerator(&io.inputs, &io.outputs);
+ *             if (ai_rc != 0) device_state_refill_zero(); // partial write -> reload now, same hop
  *         }
  *         if (ulcnet_stream_post_process(ctx, ai_rc, pcm_out) < 0) break;
- *         // pcm_out is always a full hop; write/play it unconditionally. ai_rc is ignored by
- *         // post_process when pre_rc was 0 (a reprime hop): the frame was already bypassed
- *         // inside pre_process, before any accelerator run was due.
+ *         // ai_rc is ignored by post_process when pre_rc was 0 -- already bypassed in pre_process.
  *     }
  *
- * The two device_state_* calls above are not this stream's own functions -- they are the
- * adapter's own code operating the accelerator's state buffers directly (this stream only tracks
- * and reports io.state_generation). Same pattern as DFN2's and DeepVQE-S's streams (see DFN2's
- * header comment for the exact board-sample line numbers); skipping either one leaves the
- * accelerator's own state copy stale or holding a failed run's partial write, independent of
- * this model's own fail-OPEN PCM behavior below (that is about the error spectrum passing
- * through on this hop's output, not about the accelerator's recurrent state across hops).
+ * device_state_sync/refill_zero are the adapter's own code operating accelerator memory this
+ * stream never touches (it only tracks/reports io.state_generation) -- same pattern as DFN2's
+ * and DeepVQE-S's streams, independent of this model's own fail-OPEN PCM behavior below (that is
+ * about the error spectrum passing through on this hop's output, not about recurrent state).
  *
  * Two pre_process entry points, same contract either way: ulcnet_stream_pre_process_f32() (float
- * err_in/far_in, full-scale ~=1.0 -- what the board sample itself has on hand, straight off
- * AecResContext.formed_hop; use this when wiring behind an existing float linear AEC, to avoid an
- * int16 round-trip that is NOT the same signal, see its own comment) and ulcnet_stream_pre_process()
+ * err_in/far_in, full-scale ~=1.0 -- what the board sample has on hand, straight off
+ * AecResContext.formed_hop; use this behind an existing float linear AEC, to avoid an int16
+ * round-trip that is not the same signal, see its own comment) and ulcnet_stream_pre_process()
  * (int16, a thin wrapper around the float one, for a caller whose own lanes are natively PCM).
  *
  * Alignment / reprime: `delay.changed` (a new alignment generation starts this hop) or the first
  * hop where `delay.solid` turns true after a prior hop where it was false triggers, at the START
- * of that hop's pre_process (before this hop's own analysis): a full reset (both analysis STFTs,
- * the synthesis ISTFT and UlcnetPrepost together -- ulcnet_stream_reset(), the same function a
- * caller can invoke directly) and arms ULCNET_STREAM_REPRIME_FRAMES identity hops. During a
- * reprime hop, pre_process still runs this hop's own STFT analysis and pre_process_freq (the
- * framing must advance every hop), but bypasses the frame directly (frame_bypass(), no
- * frame_open() attempted) and returns 0: there is no accelerator job this hop. Only the
- * solid-transition half of this edge is suppressed on the very first hop after init/reset (there
- * is no prior solid value yet to compare against, same as the board sample's own processed-hop
- * guard); `delay.changed == 1` on that same first hop still triggers the reset, exactly as the
- * board sample's unguarded `changed` check does -- a caller whose AEC already reports a fresh
- * alignment generation on hop 0 gets a reset there too, which is correct, not a bug.
+ * of that hop's pre_process: a full reset (ulcnet_stream_reset(), the same function a caller can
+ * invoke directly) and arms ULCNET_STREAM_REPRIME_FRAMES identity hops. During a reprime hop,
+ * pre_process still runs this hop's own STFT analysis and pre_process_freq (the framing must
+ * advance every hop), but bypasses the frame directly (no frame_open() attempted) and returns 0:
+ * there is no accelerator job this hop. The solid-transition half of this edge is suppressed on
+ * the first hop after init/reset only (no prior solid value to compare against, matching the
+ * board sample's own processed-hop guard); `delay.changed == 1` on that same first hop still
+ * triggers the reset, exactly as the board sample's unguarded `changed` check does.
  *
  * Fail-OPEN, not fail-closed (the opposite of DeepVQE-S): a bypassed frame -- a reprime hop, a
- * refused accelerator run (ai_rc != 0), or frame_finish's own non-finite rejection -- passes the
- * linear-error spectrum through unchanged (ulcnet_prepost.h's frame_bypass(): "the error spectrum
- * passes through without the AEC output guard, so on a guard hop it can exceed the capture").
- * This is deliberate: the error is already the AEC's own residual, and a model failure should not
- * make the signal worse than running without the model at all.
+ * refused accelerator run, or frame_finish's own non-finite rejection -- passes the linear-error
+ * spectrum through unchanged (it can then exceed the capture, since it skips the AEC output
+ * guard). This is deliberate: the error is already the AEC's own residual, and a model failure
+ * should not make the signal worse than running without the model at all.
  *
  * First hop: AC_OLA_ENV_NORM's synthesis emits no samples on its very first push after
- * init/reset/reprime-triggered-reset (audio_stft.h); that one hop's pcm_out is zero-filled by
- * this stream, mirroring the board sample's own `if (emitted != hop) memset(...)` fallback.
- * post_process distinguishes this expected case (returns 0) from a post_process_freq() contract
- * error (returns -1, pcm_out still zero-filled). */
+ * init/reset/reprime-triggered-reset; that hop's pcm_out is zero-filled here, mirroring the
+ * board sample's own `if (emitted != hop) memset(...)` fallback. post_process distinguishes this
+ * expected case (returns 0) from a post_process_freq() contract error (returns -1). */
 
 #ifndef ULCNET_STREAM_H
 #define ULCNET_STREAM_H
@@ -93,9 +76,7 @@ extern "C" {
 #endif
 
 #define ULCNET_STREAM_DESCRIPTOR_VERSION 1u
-/* In build_flags_hash; bump on any change of pool size, carve order, or descriptor content, the
- * UlcnetPrepost pool and hash included. */
-#define ULCNET_STREAM_LAYOUT_VERSION     1u
+#define ULCNET_STREAM_LAYOUT_VERSION     1u   /* bump with build_flags_hash on any pool/carve/descriptor change */
 #define ULCNET_STREAM_ALIGNMENT          16u   /* the one alignment of every module */
 /* Identity hops after an alignment boundary; matches ULCNET_NN_STAGE_REPRIME_FRAMES
  * (pipelines/ulcnet/ulcnet_nn_stage.h) and the board sample's own ALIGNULCNET_REPRIME_FRAMES. */
@@ -116,10 +97,9 @@ typedef struct UlcnetStreamConfig {
     /* Optional recurrent-state registration (borrowed, all four or none; see ulcnet_prepost.h's
      * UlcnetPrepostConfig): every pointer non-NULL with a nonzero element count, or all four
      * NULL/0 (the accelerator owns its own state copy instead). The pointer values and element
-     * counts themselves are not in the pool size or hash (UlcnetPrepostConfig's own contract);
-     * only the on/off registration *mode* is folded into build_flags_hash below, so switching a
-     * caller between registered and accelerator-owned state is still caught as a stale-pool
-     * mismatch by init_ex(). */
+     * counts are not in the pool size or hash; only the on/off registration *mode* is folded
+     * into build_flags_hash below, so switching between registered and accelerator-owned state
+     * is still caught as a stale-pool mismatch by init_ex(). */
     float  *key_history;
     size_t  key_history_elements;
     float  *value_history;
@@ -185,9 +165,9 @@ int ulcnet_stream_layout_version(const UlcnetStream *s);
 
 /* The model's tensor views of one open hop (UlcnetModelIoInputs/Outputs; ulcnet_model_io.h via
  * ulcnet_prepost.h), plus the generation the accelerator's own state copy must match before this
- * call (reload quantized zero first if it doesn't; sampled right after frame_open(), before the
- * accelerator runs). Valid, and meaningful, only when pre_process returned 1 -- on a reprime hop
- * (pre_process returned 0) the fields are left zeroed and must not be used. */
+ * call (sampled right after frame_open(), before the accelerator runs). Valid, and meaningful,
+ * only when pre_process returned 1 -- on a reprime hop (pre_process returned 0) the fields are
+ * left zeroed and must not be used. */
 typedef struct UlcnetHopIO {
     UlcnetModelIoInputs  inputs;
     UlcnetModelIoOutputs outputs;
@@ -196,19 +176,19 @@ typedef struct UlcnetHopIO {
 
 /* One hop in, as full-scale (~=1.0) float for both err_in and far_in (each
  * ulcnet_stream_hop_size(s) samples -- no HPF): the alignment-edge check (see the file header
- * above; may trigger a full reset), two analysis STFT pushes, ulcnet_prepost pre_process_freq,
- * then either frame_bypass() directly (a reprime hop: no frame_open attempted, *io left zeroed,
- * returns 0 -- call post_process anyway, with any ai_rc, it is ignored) or frame_open() (returns
- * 1 with *io filled: run the accelerator, then call post_process with its result). Returns -1 on
- * a contract error (NULL args, or pre_process called again before the matching post_process --
- * the stream tracks open/closed itself, independent of frame_open()'s own refusal, because both
- * analysis pushes and the alignment check happen before frame_open() is ever attempted).
+ * above; may trigger a full reset), two analysis STFT pushes, pre_process_freq, then either
+ * frame_bypass() directly (a reprime hop: no frame_open attempted, *io left zeroed, returns 0 --
+ * call post_process anyway, with any ai_rc, it is ignored) or frame_open() (returns 1 with *io
+ * filled: run the accelerator, then call post_process with its result). Returns -1 on a contract
+ * error (NULL args, or called again before the matching post_process -- the stream tracks
+ * open/closed itself, independent of frame_open()'s own refusal, since both analysis pushes and
+ * the alignment check happen before frame_open() is ever attempted).
  *
  * This is the entry point to use when the caller's own err/far lanes are already float, which is
  * the board sample's own case: alg_ai3_alignulcnet.c feeds AecResContext.formed_hop (the linear
  * AEC's error, float) and its own float far buffer straight into ac_stft_push_planar, never
  * quantizing either to int16 first. Routing a float lane through ulcnet_stream_pre_process()
- * below instead would round-trip it through int16 for no reason, and is measurably not the same
+ * below instead round-trips it through int16 for no reason, and is measurably not the same
  * signal (confirmed: on a 10 s/16 kHz recording, 159,989 of 160,000 int16-quantized error samples
  * are not exactly representable in int16, every one of 624 hops' features then differs, and
  * 33,487 output PCM samples differ, up to 4 LSB -- no clipping, but not the same audio either). */
@@ -217,10 +197,9 @@ int ulcnet_stream_pre_process_f32(UlcnetStream *s, const float *err_in, const fl
 
 /* int16 convenience wrapper: converts err_in/far_in (each ulcnet_stream_hop_size(s) samples) to
  * float at the same /32768.0f scale as the board sample's own mic_f/ref_f conversion, then runs
- * exactly ulcnet_stream_pre_process_f32()'s path. For a caller whose own signal is natively
- * int16 PCM (not behind a float linear AEC); a caller whose lanes are already float -- the board
- * sample's own situation -- should call ulcnet_stream_pre_process_f32() directly instead, to
- * avoid the quantization round-trip described there. Same return-value contract as the f32
+ * exactly ulcnet_stream_pre_process_f32()'s path. A caller whose lanes are already float -- the
+ * board sample's own situation -- should call ulcnet_stream_pre_process_f32() directly instead,
+ * to avoid the quantization round-trip described there. Same return-value contract as the f32
  * entry point. */
 int ulcnet_stream_pre_process(UlcnetStream *s, const int16_t *err_in, const int16_t *far_in,
                               UlcnetStreamDelay delay, UlcnetHopIO *io);
@@ -238,9 +217,8 @@ int ulcnet_stream_pre_process(UlcnetStream *s, const int16_t *err_in, const int1
  *     not an error.
  *   - post_process_freq() itself returned nonzero (defensive only, unreached in correct use since
  *     the hop was just closed): pcm_out is zeroed, return -1, same as any other contract error.
- * Returns -1 also on a contract error with no pending hop (no pcm_out write in that case). Always
- * call this once after every pre_process call (both its 1 and its 0 return), never more than
- * once per hop. */
+ * Returns -1 also on a contract error with no pending hop (no pcm_out write in that case). Call
+ * once per pre_process call (both its 1 and its 0 return), never more than once per hop. */
 int ulcnet_stream_post_process(UlcnetStream *s, int ai_rc, int16_t *pcm_out);
 
 #ifdef __cplusplus

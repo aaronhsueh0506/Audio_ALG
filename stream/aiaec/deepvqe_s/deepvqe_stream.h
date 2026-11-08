@@ -1,59 +1,43 @@
-/* DeepVQE-S PCM stream: the one header a board sample includes. Wraps two analysis AcStft (mic,
- * far), one synthesis AcIstft (AC_OLA_ENV_NORM) and lib/aiaec/deepvqe_s's DeepVqePrepost
- * frame_open/finish/bypass per-hop lifecycle around int16 PCM, one hop per call. No HPF (the
- * board sample has none for this model); no latency beyond the framing itself -- a frame is
- * ready from the very first hop (deepvqe_prepost.h: "one frame per hop ... no latency beyond
- * it"). Frequency-domain callers with their own framing should use
- * lib/aiaec/deepvqe_s/deepvqe_prepost.h directly instead.
+/* DeepVQE-S PCM stream: wraps two analysis AcStft (mic, far), one synthesis AcIstft
+ * (AC_OLA_ENV_NORM) and lib/aiaec/deepvqe_s's DeepVqePrepost frame_open/finish/bypass per-hop
+ * lifecycle around int16 PCM, one hop per call. No HPF; no latency beyond the framing itself --
+ * a frame is ready from the very first hop. Frequency-domain callers should use
+ * lib/aiaec/deepvqe_s/deepvqe_prepost.h directly.
  *
  *     ctx = deepvqe_stream_init(&cfg, pool, pool_bytes);
  *     while (have a hop of int16 mic_in, far_in) {
  *         DeepVqeHopIO io;
  *         if (deepvqe_stream_pre_process(ctx, mic_in, far_in, &io) != 1) break;   // -1 is a contract error
- *         device_state_sync(io.state_generation);    // reload the accelerator's OWN state copy
- *                                                     // with quantized zero if this changed since
- *                                                     // the last hop -- not optional, see below
- *         int ai_rc = run_accelerator(&io.inputs, &io.outputs);    // 0 = taps + every state written
- *         if (ai_rc != 0) device_state_refill_zero(); // the run may have written PART of the
- *                                                     // state before failing; restart it from zero
- *                                                     // now, do not wait for the next hop's sync
+ *         device_state_sync(io.state_generation);      // reload accelerator state on change
+ *         int ai_rc = run_accelerator(&io.inputs, &io.outputs);
+ *         if (ai_rc != 0) device_state_refill_zero();   // partial write -> reload now, same hop
  *         if (deepvqe_stream_post_process(ctx, ai_rc, pcm_out) < 0) break;
- *         // pcm_out is always a full hop; write/play it unconditionally.
  *     }
  *
- * The two device_state_* calls above are not this stream's own functions -- they are the adapter's
- * own code operating the accelerator's state buffers directly (this stream only tracks and reports
- * io.state_generation). Skipping the sync leaves a state-dependent accelerator holding a stale
- * copy across a generation change (every sample of that hop then wrong); skipping the post-failure
- * refill leaves it holding a failed run's partial write, since a plain bypass does not itself
- * change the generation the next hop's sync would react to. Same pattern as DFN2's stream (see its
- * own header comment for the exact board-sample line numbers); this model has no registered-state
- * config fields to begin with (DeepVqeStreamConfig.state[]/state_elements[] -- all-NULL registers
- * nothing, same as the smoke test here), but a caller that DOES register still owns this sync.
+ * device_state_sync/refill_zero are the adapter's own code operating accelerator memory this
+ * stream never touches (it only tracks/reports io.state_generation); skipping sync leaves a
+ * stale state copy live across a generation change, skipping refill leaves a failed run's
+ * garbage write live until the next change -- same pattern as DFN2's stream. This model has no
+ * registered-state config fields by default (DeepVqeStreamConfig.state[]/state_elements[]
+ * all-NULL registers nothing), but a caller that does register still owns this sync.
  *
- * Bypass (ai_rc != 0): fails CLOSED, not through -- the primary input is the raw microphone with
- * no canceller in front of it, so this hop's own contribution to the enhanced spectrum is zeroed,
- * not a passthrough of mic_in (see deepvqe_prepost.h's frame_bypass()). This is a spectral-layer
- * guarantee, not a PCM one: AC_OLA_ENV_NORM's synthesis still overlap-adds the PRECEDING hop's
- * real output on top, so a single bypassed hop's pcm_out is not fully zero (confirmed: after a
- * normal hop, one forced-fail hop still writes a mostly-nonzero PCM hop, tapering off); pcm_out
- * only reaches true silence after enough CONSECUTIVE bypassed hops to flush that one hop of OLA
- * history (50% overlap: two). A caller must not assume a single bypass hop's pcm_out is silent.
- * The CCM ring and any registered state are left exactly as
- * they were on an ai_rc != 0 bypass -- bypass touches neither. frame_finish's own non-finite
- * rejection is different: it zeroes the *registered state* (not the CCM ring, which it also
- * leaves untouched -- "the ring is not pushed") and advances the generation, then this stream
- * still calls frame_bypass() to actually close the hop. There is no DFN2-style warm-up concept
- * here: a frame is ready from hop 0. The CCM ring itself starts zero-filled, though, so the taps
- * the first DEEPVQE_TIME_ORDER-1 hops apply run over a partially-zero raw-mic history -- that is
- * the model's own startup behavior, not a stream artifact, and does not gate pre/post_process's
- * return values the way DFN2's mask_lookahead does.
+ * Bypass (ai_rc != 0) fails CLOSED: the primary input is the raw microphone with no canceller in
+ * front of it, so this hop's own contribution to the enhanced spectrum is zeroed, not a
+ * passthrough of mic_in. This is a spectral-layer guarantee only, not a PCM one -- AC_OLA_ENV_NORM's
+ * synthesis still overlap-adds the PRECEDING hop's real output, so a single bypassed hop's
+ * pcm_out is not fully zero (confirmed: one forced-fail hop after a normal one still writes
+ * mostly-nonzero PCM, tapering off); true silence needs enough CONSECUTIVE bypassed hops to flush
+ * that OLA history (50% overlap: two). frame_finish's own non-finite rejection zeroes the
+ * registered state and advances the generation, then still falls through to frame_bypass() to
+ * close the hop; bypass itself touches neither the CCM ring nor registered state. There is no
+ * DFN2-style warm-up here -- a frame is ready from hop 0, though the CCM ring starts zero-filled
+ * so the first DEEPVQE_TIME_ORDER-1 hops' taps run over a partially-zero history (the model's own
+ * startup behavior, not gated by pre/post_process's return values).
  *
  * First hop: AC_OLA_ENV_NORM's synthesis emits no samples on its very first push after
- * init/reset (audio_stft.h); that one hop's pcm_out is zero-filled by this stream, mirroring the
- * board sample's own `if (written != hop) memset(...)` fallback. post_process distinguishes this
- * expected case (returns 0) from a post_process_freq() contract error (returns -1, pcm_out still
- * zero-filled) -- see post_process's own doc below. */
+ * init/reset; that hop's pcm_out is zero-filled here, mirroring the board sample's own
+ * `if (written != hop) memset(...)` fallback. post_process distinguishes this expected case
+ * (returns 0) from a post_process_freq() contract error (returns -1). */
 
 #ifndef DEEPVQE_STREAM_H
 #define DEEPVQE_STREAM_H
@@ -68,9 +52,7 @@ extern "C" {
 #endif
 
 #define DEEPVQE_STREAM_DESCRIPTOR_VERSION 1u
-/* In build_flags_hash; bump on any change of pool size, carve order, or descriptor content, the
- * DeepVqePrepost pool and hash included. */
-#define DEEPVQE_STREAM_LAYOUT_VERSION     1u
+#define DEEPVQE_STREAM_LAYOUT_VERSION     1u   /* bump with build_flags_hash on any pool/carve/descriptor change */
 #define DEEPVQE_STREAM_ALIGNMENT          16u   /* the one alignment of every module */
 
 typedef struct DeepVqeStreamConfig {
@@ -134,9 +116,8 @@ int deepvqe_stream_hop_size(const DeepVqeStream *s);              /* samples per
 int deepvqe_stream_layout_version(const DeepVqeStream *s);
 
 /* The model's tensor views of one open hop (DeepVqePrepostInputs/Outputs; deepvqe_prepost.h),
- * plus the generation the accelerator's own state copy must match before this call (reload
- * quantized zero first if it doesn't; sampled right after frame_open(), before the accelerator
- * runs, so it already reflects the previous hop's bypass/refusal). Valid until
+ * plus the generation the accelerator's own state copy must match before this call (sampled
+ * right after frame_open(), before the accelerator runs). Valid until
  * deepvqe_stream_post_process(). */
 typedef struct DeepVqeHopIO {
     DeepVqePrepostInputs  inputs;
@@ -145,11 +126,11 @@ typedef struct DeepVqeHopIO {
 } DeepVqeHopIO;
 
 /* One PCM hop in: int16 -> float for both mic_in and far_in (each deepvqe_stream_hop_size(s)
- * samples -- no HPF), two analysis STFT pushes, deepvqe_prepost pre_process_freq + frame_open. Returns 1
- * with *io filled (every hop, from the first one: there is no warm-up here), or -1 on a contract
- * error (NULL args, or pre_process called again before the matching post_process -- the stream
- * tracks open/closed itself, independent of frame_open()'s own refusal, because both analysis
- * pushes happen before frame_open() is even attempted). */
+ * samples -- no HPF), two analysis STFT pushes, pre_process_freq + frame_open. Returns 1 with
+ * *io filled (every hop, from the first one: there is no warm-up here), or -1 on a contract
+ * error (NULL args, or called again before the matching post_process -- the stream tracks
+ * open/closed itself, independent of frame_open()'s own refusal, since both analysis pushes
+ * happen before frame_open() is even attempted). */
 int deepvqe_stream_pre_process(DeepVqeStream *s, const int16_t *mic_in, const int16_t *far_in,
                                DeepVqeHopIO *io);
 
@@ -160,12 +141,12 @@ int deepvqe_stream_pre_process(DeepVqeStream *s, const int16_t *mic_in, const in
  * ac_istft_push_planar() runs. pcm_out is always a full hop:
  *   - the push returned the full hop (the ordinary case): pcm_out is saturated from it, return 1.
  *   - the push returned 0 (only ever the very first push after init/reset, AC_OLA_ENV_NORM's own
- *     documented startup behavior): pcm_out is zeroed, return 0 -- an expected, not an error,
- *     case; it happens exactly once per init/reset, never again until the next reset.
+ *     documented startup behavior): pcm_out is zeroed, return 0 -- expected, not an error; it
+ *     happens exactly once per init/reset.
  *   - post_process_freq() itself returned nonzero (defensive only, unreached in correct use since
  *     the hop was just closed): pcm_out is zeroed, return -1, same as any other contract error.
- * Returns -1 also on a contract error with no open hop (no pcm_out write in that case). Always
- * call this once after a successful pre_process, never more than once per hop. */
+ * Returns -1 also on a contract error with no open hop (no pcm_out write in that case). Call once
+ * per successful pre_process, never more than once per hop. */
 int deepvqe_stream_post_process(DeepVqeStream *s, int ai_rc, int16_t *pcm_out);
 
 #ifdef __cplusplus
