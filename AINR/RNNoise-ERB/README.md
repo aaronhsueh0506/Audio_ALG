@@ -139,6 +139,18 @@ static int run_rnnoise(const float *erb_fwd, const float *erb_inv, RunModel run_
         if (ready) {
             for (int b = 0; b < grid.n_bands; ++b) band_gains[b] = NAN;       /* an unwritten output is refused */
             int run_rc = run_model(erb, spec_win, h, h + GRU_HIDDEN, h + 2 * GRU_HIDDEN, band_gains);
+            if (run_rc != 0) {
+                /* run_model() itself reported failure, but may already have overwritten
+                 * band_gains and/or h1/h2/h3 with finite-looking garbage before discovering that:
+                 * rnnoise_frame_finish() only catches NON-FINITE values, so a finite garbage
+                 * write would otherwise be silently ACCEPTED (finish_rc 0, generation not
+                 * advanced) and carry that garbage into the next hop undetected -- the model's
+                 * own error code is the only signal that caught it. Poison all four with NaN
+                 * here so the already-correct finite-check mechanism rejects this hop's state
+                 * exactly as if run_model() had written nothing. */
+                for (int b = 0; b < grid.n_bands; ++b) band_gains[b] = NAN;
+                for (int k = 0; k < 3 * GRU_HIDDEN; ++k) h[k] = NAN;
+            }
             /* rnnoise_frame_finish() always runs, even when run_model() itself reports failure:
              * the NaN-filled band_gains then still trips its own finite check, which zeroes the
              * registered state and advances the generation (feature ring and OLA timing

@@ -107,6 +107,18 @@ static int run_gtcrn(const float *erb_fwd, const float *erb_inv, RunGraph run_gr
         gtcrn_model_input(p, spectrum, mag, real_part, imag_part);
         for (int i = 0; i < 2 * grid.erb_bands; ++i) mask_erb[i] = NAN;      /* an unwritten mask is refused */
         int run_rc = run_graph(mag, real_part, imag_part, state, mask_erb);
+        if (run_rc != 0) {
+            /* run_graph() itself reported failure, but may already have overwritten mask_erb
+             * and/or the registered state with finite-looking garbage before discovering that
+             * (e.g. a half-finished run): mask_validate/state_validate only catch NON-FINITE
+             * values, so a finite garbage write would otherwise be silently ACCEPTED (both rc
+             * 0, generation not advanced) and carry that garbage into the next hop undetected --
+             * the accelerator's own error code is the only signal that caught it. Poison both
+             * with NaN here so the already-correct finite-check mechanism rejects this hop's
+             * state exactly as if run_graph() had written nothing. */
+            for (int i = 0; i < 2 * grid.erb_bands; ++i) mask_erb[i] = NAN;
+            for (size_t i = 0; i < total; ++i) state[i] = NAN;
+        }
         /* Both validators always run, even when run_graph() itself reports failure: the
          * NaN-filled mask_erb then still trips mask_validate's own finite check, which zeroes
          * the registered state and advances the generation -- skipping them here would let a

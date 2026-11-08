@@ -63,11 +63,16 @@ th{background:#eef1f5}
 while (有一個 hop 的 int16 mic_in, far_in) {
     DeepVqeHopIO io;
     if (deepvqe_stream_pre_process(ctx, mic_in, far_in, &amp;io) != 1) break;   // -1 是契約錯誤
+    device_state_sync(io.state_generation);      // generation 若變了就把加速器自己的 state 拷貝
+                                                  // 重填量化零——不是可省的步驟
     int ai_rc = run_accelerator(&amp;io.inputs, &amp;io.outputs);                  // 0 = taps + 每個 state 都寫了
+    if (ai_rc != 0) device_state_refill_zero();  // 這次跑可能已經寫了「部分」state 才失敗；
+                                                  // 現在就重填零，不要等下一拍的 sync
     if (deepvqe_stream_post_process(ctx, ai_rc, pcm_out) &lt; 0) break;
     // pcm_out 永遠是完整一個 hop
 }</pre>
-<p><b>Bypass 是關閉式（fail CLOSED），不是直通</b>：這個模型的主輸入是原始麥克風、前面沒有線性消除器，所以一旦 <code>ai_rc != 0</code> 或 <code>frame_finish</code> 自己的有限性檢查拒收，被跳過的那拍輸出<b>靜音</b>，不是把 <code>mic_in</code> 原樣放過去（跟 <a href="aiaec_ulcnet_stream_usage.html">Align-ULCNet 的 fail-OPEN</a> 正好相反）。CCM ring 與任何登錄的 state 在 <code>ai_rc != 0</code> 的 bypass 上維持原狀（兩者都不動）；<code>frame_finish</code> 自己的非有限值拒收則不同：只歸零「登錄的 state」（CCM ring 不動，「ring 不推進」），generation 推進，然後本層照常呼叫 <code>frame_bypass</code> 把這拍關掉。</p>
+<p><code>device_state_sync</code>／<code>device_state_refill_zero</code> 不是這層 stream 自己的函式，道理跟 <a href="ainr_dfn2_stream_usage.html">DFN2 stream</a> 一樣（這層只追蹤並回報 <code>io.state_generation</code>，碰不到加速器記憶體）；這個模型預設沒有登錄任何 state（<code>DeepVqeStreamConfig.state[]/state_elements[]</code> 全留 NULL，加速器自己持有 state），但若呼叫端確實登錄了，這兩步仍不可省。</p>
+<p><b>Bypass 是關閉式（fail CLOSED），不是直通</b>：這個模型的主輸入是原始麥克風、前面沒有線性消除器，所以一旦 <code>ai_rc != 0</code> 或 <code>frame_finish</code> 自己的有限性檢查拒收，這個保證是<b>頻域層級</b>的——本拍模型對增強頻譜的貢獻歸零，不是把 <code>mic_in</code> 原樣放過去（跟 <a href="aiaec_ulcnet_stream_usage.html">Align-ULCNet 的 fail-OPEN</a> 正好相反）。但 <code>AC_OLA_ENV_NORM</code> 的合成仍會疊加<b>前一拍</b>的真實輸出，所以單獨一拍 bypass 的 <code>pcm_out</code><b>不是全零</b>（實測：正常一拍之後接一拍強制失敗，256 個樣本仍有約 254 個非零，數值從上一拍殘留衰減下來）；要連續兩拍 bypass（50% overlap 的那一拍重疊歷史排空）才會真正輸出靜音。呼叫端不能假設單一 bypass 拍的 <code>pcm_out</code> 是靜音。CCM ring 與任何登錄的 state 在 <code>ai_rc != 0</code> 的 bypass 上維持原狀（兩者都不動）；<code>frame_finish</code> 自己的非有限值拒收則不同：只歸零「登錄的 state」（CCM ring 不動，「ring 不推進」），generation 推進，然後本層照常呼叫 <code>frame_bypass</code> 把這拍關掉。</p>
 
 <h2>流程圖（block diagram）</h2>
 <pre>
@@ -119,8 +124,8 @@ hop   caller                       deepvqe_stream                       NPU
       &lt;-- 1 (真實輸出) --------------------- ISTFT push=hop ----
   ... (fail-closed 範例) ...
 k     pre_process -> open --------------------------------------> 替身回 -1, 不寫 taps
-      post_process(ai_rc=-1) -----> frame_bypass (靜音, 非直通) ->
-      &lt;-- 1 (這拍是靜音, 不是 mic_in) -------------------------
+      post_process(ai_rc=-1) -----> frame_bypass (本拍頻譜貢獻歸零, 非直通 mic_in) ->
+      &lt;-- 1 (PCM 仍疊加上一拍 OLA 尾段, 單拍不保證全零; 連續兩拍才靜音) --
 </pre>
 
 <h2>I/O 表</h2>

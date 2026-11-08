@@ -20,12 +20,38 @@
  *         int pre_rc = ulcnet_stream_pre_process(ctx, err_in, far_in, delay, &io);
  *         if (pre_rc < 0) break;                                // contract error
  *         int ai_rc = 0;
- *         if (pre_rc == 1) ai_rc = run_accelerator(&io.inputs, &io.outputs);   // 0 = mask written
+ *         if (pre_rc == 1) {
+ *             device_state_sync(io.state_generation);   // reload the accelerator's OWN state
+ *                                                        // copy with quantized zero if this
+ *                                                        // changed since the last hop -- see
+ *                                                        // below, not optional; skipped on a
+ *                                                        // reprime hop (pre_rc == 0), which never
+ *                                                        // reaches the accelerator at all
+ *             ai_rc = run_accelerator(&io.inputs, &io.outputs);   // 0 = mask written
+ *             if (ai_rc != 0) device_state_refill_zero(); // the run may have written PART of the
+ *                                                        // state before failing; restart it from
+ *                                                        // zero now, do not wait for the next
+ *                                                        // hop's sync above
+ *         }
  *         if (ulcnet_stream_post_process(ctx, ai_rc, pcm_out) < 0) break;
  *         // pcm_out is always a full hop; write/play it unconditionally. ai_rc is ignored by
  *         // post_process when pre_rc was 0 (a reprime hop): the frame was already bypassed
  *         // inside pre_process, before any accelerator run was due.
  *     }
+ *
+ * The two device_state_* calls above are not this stream's own functions -- they are the
+ * adapter's own code operating the accelerator's state buffers directly (this stream only tracks
+ * and reports io.state_generation). Same pattern as DFN2's and DeepVQE-S's streams (see DFN2's
+ * header comment for the exact board-sample line numbers); skipping either one leaves the
+ * accelerator's own state copy stale or holding a failed run's partial write, independent of
+ * this model's own fail-OPEN PCM behavior below (that is about the error spectrum passing
+ * through on this hop's output, not about the accelerator's recurrent state across hops).
+ *
+ * Two pre_process entry points, same contract either way: ulcnet_stream_pre_process_f32() (float
+ * err_in/far_in, full-scale ~=1.0 -- what the board sample itself has on hand, straight off
+ * AecResContext.formed_hop; use this when wiring behind an existing float linear AEC, to avoid an
+ * int16 round-trip that is NOT the same signal, see its own comment) and ulcnet_stream_pre_process()
+ * (int16, a thin wrapper around the float one, for a caller whose own lanes are natively PCM).
  *
  * Alignment / reprime: `delay.changed` (a new alignment generation starts this hop) or the first
  * hop where `delay.solid` turns true after a prior hop where it was false triggers, at the START
@@ -168,15 +194,34 @@ typedef struct UlcnetHopIO {
     uint32_t             state_generation;
 } UlcnetHopIO;
 
-/* One PCM hop in: int16 -> float for both err_in and far_in (each ulcnet_stream_hop_size(s)
- * samples -- no HPF), the alignment-edge check (see the file header above; may trigger a full
- * reset), two analysis STFT pushes, ulcnet_prepost pre_process_freq, then either frame_bypass()
- * directly (a reprime hop: no frame_open attempted, *io left zeroed, returns 0 -- call
- * post_process anyway, with any ai_rc, it is ignored) or frame_open() (returns 1 with *io filled:
- * run the accelerator, then call post_process with its result). Returns -1 on a contract error
- * (NULL args, or pre_process called again before the matching post_process -- the stream tracks
- * open/closed itself, independent of frame_open()'s own refusal, because both analysis pushes
- * and the alignment check happen before frame_open() is ever attempted). */
+/* One hop in, as full-scale (~=1.0) float for both err_in and far_in (each
+ * ulcnet_stream_hop_size(s) samples -- no HPF): the alignment-edge check (see the file header
+ * above; may trigger a full reset), two analysis STFT pushes, ulcnet_prepost pre_process_freq,
+ * then either frame_bypass() directly (a reprime hop: no frame_open attempted, *io left zeroed,
+ * returns 0 -- call post_process anyway, with any ai_rc, it is ignored) or frame_open() (returns
+ * 1 with *io filled: run the accelerator, then call post_process with its result). Returns -1 on
+ * a contract error (NULL args, or pre_process called again before the matching post_process --
+ * the stream tracks open/closed itself, independent of frame_open()'s own refusal, because both
+ * analysis pushes and the alignment check happen before frame_open() is ever attempted).
+ *
+ * This is the entry point to use when the caller's own err/far lanes are already float, which is
+ * the board sample's own case: alg_ai3_alignulcnet.c feeds AecResContext.formed_hop (the linear
+ * AEC's error, float) and its own float far buffer straight into ac_stft_push_planar, never
+ * quantizing either to int16 first. Routing a float lane through ulcnet_stream_pre_process()
+ * below instead would round-trip it through int16 for no reason, and is measurably not the same
+ * signal (confirmed: on a 10 s/16 kHz recording, 159,989 of 160,000 int16-quantized error samples
+ * are not exactly representable in int16, every one of 624 hops' features then differs, and
+ * 33,487 output PCM samples differ, up to 4 LSB -- no clipping, but not the same audio either). */
+int ulcnet_stream_pre_process_f32(UlcnetStream *s, const float *err_in, const float *far_in,
+                                  UlcnetStreamDelay delay, UlcnetHopIO *io);
+
+/* int16 convenience wrapper: converts err_in/far_in (each ulcnet_stream_hop_size(s) samples) to
+ * float at the same /32768.0f scale as the board sample's own mic_f/ref_f conversion, then runs
+ * exactly ulcnet_stream_pre_process_f32()'s path. For a caller whose own signal is natively
+ * int16 PCM (not behind a float linear AEC); a caller whose lanes are already float -- the board
+ * sample's own situation -- should call ulcnet_stream_pre_process_f32() directly instead, to
+ * avoid the quantization round-trip described there. Same return-value contract as the f32
+ * entry point. */
 int ulcnet_stream_pre_process(UlcnetStream *s, const int16_t *err_in, const int16_t *far_in,
                               UlcnetStreamDelay delay, UlcnetHopIO *io);
 

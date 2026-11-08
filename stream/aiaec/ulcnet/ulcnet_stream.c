@@ -282,12 +282,11 @@ int ulcnet_stream_layout_version(const UlcnetStream *s) {
     return d ? (int)d->layout_version : -1;
 }
 
-int ulcnet_stream_pre_process(UlcnetStream *s, const int16_t *err_in, const int16_t *far_in,
-                              UlcnetStreamDelay delay, UlcnetHopIO *io) {
-    int hop, i, edge;
+int ulcnet_stream_pre_process_f32(UlcnetStream *s, const float *err_in, const float *far_in,
+                                  UlcnetStreamDelay delay, UlcnetHopIO *io) {
+    int edge;
 
     if (!s || !err_in || !far_in || !io || s->hop_state != ULCNET_STREAM_IDLE) return -1;
-    hop = s->grid.hop;
 
     /* Alignment-edge detection, before this hop's own analysis (mirrors the board sample's Stage
      * 3, run ahead of Stage 4): a new alignment generation, or the first hop where `solid` turns
@@ -306,13 +305,11 @@ int ulcnet_stream_pre_process(UlcnetStream *s, const int16_t *err_in, const int1
     s->had_hop = 1;
     s->prev_solid = delay.solid;
 
-    for (i = 0; i < hop; ++i) {
-        s->err_f[i] = (float)err_in[i] / 32768.0f;
-        s->far_f[i] = (float)far_in[i] / 32768.0f;
-    }
-
-    ac_stft_push_planar(s->stft_err, s->err_f, s->err_re, s->err_im);
-    ac_stft_push_planar(s->stft_far, s->far_f, s->far_re, s->far_im);
+    /* err_in/far_in are read once each, here, and never stored -- no reason to copy into the
+     * per-hop scratch slab first (that scratch exists only for ulcnet_stream_pre_process()'s own
+     * int16 conversion below). */
+    ac_stft_push_planar(s->stft_err, err_in, s->err_re, s->err_im);
+    ac_stft_push_planar(s->stft_far, far_in, s->far_re, s->far_im);
 
     /* pre_process_freq() always returns 1 here (ulcnet_prepost.h: "Returns 1 (one invocation)");
      * any other return is a contract error this stream does not expect in correct use. */
@@ -340,6 +337,26 @@ int ulcnet_stream_pre_process(UlcnetStream *s, const int16_t *err_in, const int1
     io->state_generation = ulcnet_prepost_state_generation(s->prepost);
     s->hop_state = ULCNET_STREAM_FRAME_OPEN;
     return 1;
+}
+
+int ulcnet_stream_pre_process(UlcnetStream *s, const int16_t *err_in, const int16_t *far_in,
+                              UlcnetStreamDelay delay, UlcnetHopIO *io) {
+    int hop, i;
+
+    /* Thin int16 convenience wrapper: converts into the per-hop float scratch (never read by
+     * anyone else), then runs the exact same path ulcnet_stream_pre_process_f32() runs for a
+     * caller whose own lanes are already float (e.g. a linear AEC's formed_hop residual, which
+     * the board sample feeds this model WITHOUT ever quantizing to int16 -- see ulcnet_stream.h's
+     * own comment). The full contract check is repeated here (not just deferred to the f32 call)
+     * so this wrapper never touches s->err_f/far_f on a call that was going to be refused anyway
+     * -- same "no state touched before any write" shape the rest of this file keeps elsewhere. */
+    if (!s || !err_in || !far_in || !io || s->hop_state != ULCNET_STREAM_IDLE) return -1;
+    hop = s->grid.hop;
+    for (i = 0; i < hop; ++i) {
+        s->err_f[i] = (float)err_in[i] / 32768.0f;
+        s->far_f[i] = (float)far_in[i] / 32768.0f;
+    }
+    return ulcnet_stream_pre_process_f32(s, s->err_f, s->far_f, delay, io);
 }
 
 int ulcnet_stream_post_process(UlcnetStream *s, int ai_rc, int16_t *pcm_out) {

@@ -135,6 +135,15 @@ int run_gtcrn(const float *erb_fwd, const float *erb_inv, RunGraph run_graph,
         gtcrn_model_input(p, spectrum, mag, real_part, imag_part);
         for (int i = 0; i &lt; 2 * grid.erb_bands; ++i) mask_erb[i] = NAN;   /* 沒被寫的 mask 會被拒 */
         int run_rc = run_graph(mag, real_part, imag_part, state, mask_erb);
+        if (run_rc != 0) {
+            /* run_graph() 本身回報失敗，但發現失敗之前可能已經把有限但錯誤的垂圾寫進
+             * mask_erb 和／或已註冊的 state——mask_validate／state_validate 只檢查「非有限」，
+             * 這種有限垃圾寫入會被誤判通過（兩個 rc 都是 0，generation 不會推進），帶著垂圾
+             * 進下一個 hop 而偵測不到。這裡主動用 NaN 蓋掉兩者，讓既有的有限值檢查機制
+             * 照樣能拒收，等同 run_graph() 什麼都沒寫的情況。 */
+            for (int i = 0; i &lt; 2 * grid.erb_bands; ++i) mask_erb[i] = NAN;
+            for (size_t i = 0; i &lt; total; ++i) state[i] = NAN;
+        }
         /* 兩個驗證一律都呼叫，即使 run_graph() 本身回報失敗：NaN 填的 mask_erb 仍會觸發
          * mask_validate 自己的有限值檢查，把已註冊的 state 歸零、generation +1 ——
          * 短路跳過的話，失敗呼叫寫了一半、但仍有限的 state 會原封不動帶進下一個 hop。 */
@@ -150,7 +159,7 @@ done:
     free(pool); free(istft_mem); free(stft_mem); free(buf); free(state);
     return rc;
 }</pre>
-<p class="note">範例（float host）已在暫存副本以 <code>-std=c11 -Wall -Wextra -Wpedantic -Werror</code> 編譯通過，並以單位 mask 的假加速器實跑：輸出等於輸入延遲一個 hop（256 samples）；實際的加速器 runtime 由目標平台提供。<code>gtcrn_model_input</code>／<code>gtcrn_model_output</code> 沒有回傳值，參數有 NULL 時什麼都不做；<code>gtcrn_process_state_validate</code> 回 0（全部有限，或沒有註冊）或 -1（NULL，或有 NaN／Inf——此時八個 state 已歸零、generation +1，前一份 state 不存在，寫一半而仍有限者偵測不到）；<code>gtcrn_process_mask_validate</code> 對 mask 做同樣的檢查，先它後 state 的驗證，兩者連續被拒 generation 至多加 1。</p>
+<p class="note">範例（float host）已在暫存副本以 <code>-std=c11 -Wall -Wextra -Wpedantic -Werror</code> 編譯通過，並以單位 mask 的假加速器實跑：輸出等於輸入延遲一個 hop（256 samples）；實際的加速器 runtime 由目標平台提供。<code>gtcrn_model_input</code>／<code>gtcrn_model_output</code> 沒有回傳值，參數有 NULL 時什麼都不做；<code>gtcrn_process_state_validate</code> 回 0（全部有限，或沒有註冊）或 -1（NULL，或有 NaN／Inf——此時八個 state 已歸零、generation +1）；<code>gtcrn_process_mask_validate</code>／<code>gtcrn_process_state_validate</code> 本身只檢查「非有限」，偵測不出「寫了一半但仍有限」的垃圾，所以上面的範例在 <code>run_graph()</code> 回報失敗時主動用 NaN 蓋掉 <code>mask_erb</code> 與整個 <code>state</code>，把這個情境轉成兩個驗證都認得的「非有限」case；<code>gtcrn_process_mask_validate</code> 對 mask 做同樣的檢查，先它後 state 的驗證，兩者連續被拒 generation 至多加 1。</p>
 
 <h2>流程時序圖</h2>
 <pre>

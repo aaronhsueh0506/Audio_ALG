@@ -1,12 +1,14 @@
 /* Smoke build only: does dfn2_stream link and run one hop without crashing. Not a correctness
  * test -- it does not check PCM against a reference; that's the separate verification harness. */
 
+#include <math.h>
 #include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 
 #include "dfn2_stream.h"
+#include "stream_mem.h"   /* stream_saturate_s16(): shared by all three stream modules, checked once here */
 
 static float *alloc_filled(size_t n, float fill) {
     float *p = (float *)malloc(n * sizeof(float));
@@ -35,6 +37,23 @@ static int fake_accelerator(const DFN2PrepostInputs *in, DFN2PrepostOutputs *out
     return 0;
 }
 
+/* stream_saturate_s16(NaN) must return 0, not reach the (int16_t) cast of a non-finite float --
+ * that cast is undefined behavior (confirmed under -fsanitize=undefined: "nan is outside the
+ * range of representable values of type 'short'"), reachable whenever finite-but-extreme
+ * accelerator output (e.g. a large mask/CCM tap, accepted since it's finite) overflows to NaN in
+ * the DSP between the accelerator and this saturate. +-Inf already clip correctly without this
+ * check (they compare true against a clip bound), so they're asserted here too, as a guard
+ * against a future "fix" routing them through the same NaN-only early return. */
+static void check_saturate_s16_nonfinite(void) {
+    if (stream_saturate_s16(NAN) != 0) { fprintf(stderr, "stream_saturate_s16(NAN) != 0\n"); exit(1); }
+    if (stream_saturate_s16((float)INFINITY) != 32767) {
+        fprintf(stderr, "stream_saturate_s16(+Inf) != 32767\n"); exit(1);
+    }
+    if (stream_saturate_s16((float)-INFINITY) != -32768) {
+        fprintf(stderr, "stream_saturate_s16(-Inf) != -32768\n"); exit(1);
+    }
+}
+
 int main(void) {
     DFN2GridSpec spec;
     DFN2Grid grid;
@@ -45,6 +64,8 @@ int main(void) {
     float *erb_fwd, *erb_inv;
     int16_t *pcm_in, *pcm_out;
     int hop, hops, i, k;
+
+    check_saturate_s16_nonfinite();
 
     memset(&spec, 0, sizeof(spec));
     spec.sample_rate = 48000;

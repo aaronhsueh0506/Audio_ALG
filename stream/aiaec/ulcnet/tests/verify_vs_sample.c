@@ -149,12 +149,13 @@ static int board_always_bypass_pre(BoardDriver *d, const int16_t *err_in, const 
     return 0;
 }
 
-/* Stage 3 (alignment edge) + Stage 4 + the reprime-or-frame_open half of Stage 5. Returns 1 (a
- * real accelerator job is due, in/out filled), 0 (reprime: already bypassed, in/out
- * untouched/meaningless), -1 (contract error). */
-static int board_pre(BoardDriver *d, const int16_t *err_in, const int16_t *far_in,
-                     UlcnetStreamDelay delay, UlcnetModelIoInputs *in, UlcnetModelIoOutputs *out) {
-    int hop = d->grid.hop, k;
+/* Stage 3 (alignment edge) + Stage 4 + the reprime-or-frame_open half of Stage 5, taking
+ * err_in/far_in already as full-scale float, exactly like the real board sample's own Stage 4
+ * (alg_ai3_alignulcnet.c:1582: AecResContext.formed_hop and its float ref_f straight into
+ * ac_stft_push_planar, no int16 step at all). Returns 1 (a real accelerator job is due, in/out
+ * filled), 0 (reprime: already bypassed, in/out untouched/meaningless), -1 (contract error). */
+static int board_pre_f32(BoardDriver *d, const float *err_in, const float *far_in,
+                         UlcnetStreamDelay delay, UlcnetModelIoInputs *in, UlcnetModelIoOutputs *out) {
     int edge = delay.changed || (d->had_hop && !d->prev_solid && delay.solid);
     if (edge) {
         board_reset_only(d);
@@ -163,12 +164,8 @@ static int board_pre(BoardDriver *d, const int16_t *err_in, const int16_t *far_i
     d->had_hop = 1;
     d->prev_solid = delay.solid;
 
-    for (k = 0; k < hop; ++k) {
-        d->err_f[k] = (float)err_in[k] / 32768.0f;
-        d->far_f[k] = (float)far_in[k] / 32768.0f;
-    }
-    ac_stft_push_planar(d->stft_err, d->err_f, d->err_re, d->err_im);
-    ac_stft_push_planar(d->stft_far, d->far_f, d->far_re, d->far_im);
+    ac_stft_push_planar(d->stft_err, err_in, d->err_re, d->err_im);
+    ac_stft_push_planar(d->stft_far, far_in, d->far_re, d->far_im);
     if (ulcnet_prepost_pre_process_freq(d->prepost, d->err_re, d->err_im, d->far_re, d->far_im) != 1)
         return -1;
 
@@ -179,6 +176,21 @@ static int board_pre(BoardDriver *d, const int16_t *err_in, const int16_t *far_i
     }
     if (ulcnet_prepost_frame_open(d->prepost, in, out) != 0) return -1;
     return 1;
+}
+
+/* int16 convenience wrapper around board_pre_f32, mirroring ulcnet_stream.c's own
+ * int16-wrapper-around-the-f32-entry-point shape: converts into the per-hop float scratch (never
+ * read by anyone else), then runs exactly board_pre_f32's path -- the int16 -> /32768.0f
+ * conversion this harness's every OTHER row relies on, kept in exactly one place instead of
+ * duplicated alongside the edge/reset/STFT/reprime logic a second time. */
+static int board_pre(BoardDriver *d, const int16_t *err_in, const int16_t *far_in,
+                     UlcnetStreamDelay delay, UlcnetModelIoInputs *in, UlcnetModelIoOutputs *out) {
+    int hop = d->grid.hop, k;
+    for (k = 0; k < hop; ++k) {
+        d->err_f[k] = (float)err_in[k] / 32768.0f;
+        d->far_f[k] = (float)far_in[k] / 32768.0f;
+    }
+    return board_pre_f32(d, d->err_f, d->far_f, delay, in, out);
 }
 
 /* Stage 5's close + post_process_freq + synthesis. `pre_rc` selects whether to dispatch
@@ -551,6 +563,131 @@ static int run_explicit_reset_row(void) {
     return violations == 0 ? 0 : 1;
 }
 
+/* ---- Row 6 (float entry point): drives ulcnet_stream_pre_process_f32() with REAL float input
+ * (deliberately not exactly representable in int16, via a fractional-sine signal) against
+ * board_pre_f32() -- a board reference that, like the real board sample, never quantizes to
+ * int16 either. Then, separately, quantizes that SAME float signal to int16 first (as
+ * ulcnet_stream_pre_process(), the existing int16 entry, requires) and runs it through the
+ * already-verified int16 path, which produces a DIFFERENT PCM result -- the quantization gap the
+ * float entry point exists to avoid. Without this row, every other row in this file drives both
+ * compared sides from int16 and cannot see this gap on either side. ---- */
+static int run_float_entry_row(void) {
+    UlcnetGrid grid = make_grid();
+    BoardDriver D;
+    UlcnetStreamConfig cfg;
+    UlcnetStreamMemReq req;
+    UlcnetStream *E;
+    void *pool_e;
+    int hop = grid.hop;
+    float *err_f, *far_f;
+    int16_t *err_q, *far_q, *pcm_d, *pcm_e, *pcm_q;
+    int h, k, violations = 0;
+    int any_quantized_differs = 0;
+    const int total_hops = 6;
+    UlcnetStream *Q;
+    void *pool_q;
+
+    if (board_init(&D, &grid) != 0) return -1;
+    memset(&cfg, 0, sizeof(cfg));
+    cfg.grid = grid;
+    if (ulcnet_stream_get_mem_size(&cfg, &req) != 0) return -1;
+    if (posix_memalign(&pool_e, (size_t)req.alignment, (size_t)req.bytes) != 0) return -1;
+    E = ulcnet_stream_init_ex(&cfg, pool_e, (size_t)req.bytes, &req);
+    if (!E) return -1;
+    if (posix_memalign(&pool_q, (size_t)req.alignment, (size_t)req.bytes) != 0) return -1;
+    Q = ulcnet_stream_init_ex(&cfg, pool_q, (size_t)req.bytes, &req);
+    if (!Q) return -1;
+
+    err_f = malloc((size_t)hop * sizeof(float));
+    far_f = malloc((size_t)hop * sizeof(float));
+    err_q = malloc((size_t)hop * sizeof(int16_t));
+    far_q = malloc((size_t)hop * sizeof(int16_t));
+    pcm_d = malloc((size_t)hop * sizeof(int16_t));
+    pcm_e = malloc((size_t)hop * sizeof(int16_t));
+    pcm_q = malloc((size_t)hop * sizeof(int16_t));
+
+    for (h = 0; h < total_hops; ++h) {
+        UlcnetStreamDelay delay;
+        UlcnetModelIoInputs in_d;
+        UlcnetModelIoOutputs out_d;
+        UlcnetHopIO io_e;
+        int pre_rc_d, pre_rc_e, post_rc_d, post_rc_e, ai_rc;
+
+        memset(&delay, 0, sizeof(delay));
+        delay.changed = (h == 2) ? 1 : 0;
+        delay.solid = 1;
+
+        /* A fractional-sine signal: scaled so int16 quantization has sub-LSB rounding error on
+         * nearly every sample (not an integer multiple of 1/32768), unlike this file's other rows'
+         * int16-sourced-then-converted inputs, which are exactly representable by construction. */
+        for (k = 0; k < hop; ++k) {
+            err_f[k] = 0.1f * sinf(0.013f * (float)(k + h * hop)) + 0.0001234f;
+            far_f[k] = 0.08f * sinf(0.021f * (float)(k + h * hop) + 1.0f) - 0.0000777f;
+            err_q[k] = (int16_t)(err_f[k] * 32768.0f);
+            far_q[k] = (int16_t)(far_f[k] * 32768.0f);
+        }
+
+        pre_rc_d = board_pre_f32(&D, err_f, far_f, delay, &in_d, &out_d);
+        pre_rc_e = ulcnet_stream_pre_process_f32(E, err_f, far_f, delay, &io_e);
+        if (pre_rc_d != pre_rc_e) {
+            fprintf(stderr, "float-entry row: hop %d: pre_rc mismatch D=%d E=%d\n", h, pre_rc_d, pre_rc_e);
+            violations++;
+        }
+        if (pre_rc_d == 1 && pre_rc_e == 1) {
+            if (in_d.spectrum_bins_elements != io_e.inputs.spectrum_bins_elements ||
+                !cmp_floats_exact(in_d.error_mag, io_e.inputs.error_mag, in_d.spectrum_bins_elements) ||
+                !cmp_floats_exact(in_d.far_mag, io_e.inputs.far_mag, in_d.spectrum_bins_elements) ||
+                !cmp_floats_exact(in_d.error_cos, io_e.inputs.error_cos, in_d.spectrum_bins_elements) ||
+                !cmp_floats_exact(in_d.error_sin, io_e.inputs.error_sin, in_d.spectrum_bins_elements)) {
+                fprintf(stderr, "float-entry row: hop %d: feature mismatch D vs E\n", h);
+                violations++;
+            }
+        }
+
+        ai_rc = (pre_rc_d == 1) ? shared_fake(h, 0, &out_d) : 0;
+        if (pre_rc_e == 1) (void)shared_fake(h, 0, &io_e.outputs);
+
+        post_rc_d = board_post(&D, pre_rc_d, ai_rc, pcm_d, NULL);
+        post_rc_e = ulcnet_stream_post_process(E, ai_rc, pcm_e);
+        if (post_rc_d != post_rc_e || memcmp(pcm_d, pcm_e, (size_t)hop * sizeof(int16_t)) != 0) {
+            fprintf(stderr, "float-entry row: hop %d: PCM/rc mismatch D vs E (rc %d/%d)\n",
+                   h, post_rc_d, post_rc_e);
+            violations++;
+        }
+
+        /* Teeth: the SAME underlying signal, quantized to int16 first (as ulcnet_stream_pre_process()
+         * requires), run through the already-verified int16 path on a throwaway stream Q, must NOT
+         * produce the same PCM as the float path above once both are past the reprime/startup
+         * window -- otherwise this row would not actually be exercising the quantization gap. */
+        {
+            UlcnetHopIO io_q;
+            int pre_rc_q, post_rc_q, ai_rc_q;
+            pre_rc_q = ulcnet_stream_pre_process(Q, err_q, far_q, delay, &io_q);
+            ai_rc_q = (pre_rc_q == 1) ? shared_fake(h, 0, &io_q.outputs) : 0;
+            post_rc_q = ulcnet_stream_post_process(Q, ai_rc_q, pcm_q);
+            if (h >= 3 && post_rc_q == 1 && post_rc_e == 1 &&
+                memcmp(pcm_q, pcm_e, (size_t)hop * sizeof(int16_t)) != 0) {
+                any_quantized_differs = 1;
+            }
+        }
+    }
+
+    if (!any_quantized_differs) {
+        fprintf(stderr, "float-entry row: FAIL -- quantizing to int16 first made no difference to "
+                        "the output; this row is not exercising the gap it claims to\n");
+        violations++;
+    } else {
+        printf("float-entry row: PASS (f32 entry matches an unquantized board reference "
+              "bit-exact; quantizing the same signal to int16 first, as the int16 entry point "
+              "requires, measurably changes the output -- confirming the gap the f32 entry "
+              "point avoids)\n");
+    }
+
+    free(err_f); free(far_f); free(err_q); free(far_q); free(pcm_d); free(pcm_e); free(pcm_q);
+    free(pool_e); free(pool_q);
+    return violations == 0 ? 0 : 1;
+}
+
 int main(int argc, char **argv) {
     int inject_shift = (argc > 1 && strcmp(argv[1], "--inject-shift") == 0);
 
@@ -568,6 +705,7 @@ int main(int argc, char **argv) {
     {
         int rc1 = run_matrix(0);
         int rc2 = run_explicit_reset_row();
-        return (rc1 == 0 && rc2 == 0) ? 0 : 1;
+        int rc3 = run_float_entry_row();
+        return (rc1 == 0 && rc2 == 0 && rc3 == 0) ? 0 : 1;
     }
 }

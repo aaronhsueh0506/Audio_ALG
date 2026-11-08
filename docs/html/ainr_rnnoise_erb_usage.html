@@ -145,6 +145,15 @@ int run_rnnoise(const float *erb_fwd, const float *erb_inv, RunModel run_model,
         if (ready) {
             for (int b = 0; b &lt; grid.n_bands; ++b) band_gains[b] = NAN;       /* 沒被寫的輸出會被拒 */
             int run_rc = run_model(erb, spec_win, h, h + GRU_HIDDEN, h + 2 * GRU_HIDDEN, band_gains);
+            if (run_rc != 0) {
+                /* run_model() 本身回報失敗，但發現失敗之前可能已經把有限但錯誤的垂圾寫進
+                 * band_gains 和／或 h1/h2/h3——rnnoise_frame_finish() 只檢查「非有限」，
+                 * 這種有限垂圾寫入會被誤判通過（finish_rc 是 0，generation 不會推進），
+                 * 帶著垂圾進下一個 hop 而偵測不到。這裡主動用 NaN 蓋掉四者，讓既有的
+                 * 有限值檢查機制照樣能拒收，等同 run_model() 什麼都沒寫的情況。 */
+                for (int b = 0; b &lt; grid.n_bands; ++b) band_gains[b] = NAN;
+                for (int k = 0; k &lt; 3 * GRU_HIDDEN; ++k) h[k] = NAN;
+            }
             /* rnnoise_frame_finish() 一律都呼叫，即使 run_model() 本身回報失敗：NaN 填的
              * band_gains 仍會觸發它自己的有限值檢查，把已註冊的 state 歸零、generation +1
              * （feature ring 與 OLA 時序不動）—— 短路跳過的話，失敗呼叫寫了一半、但仍有限

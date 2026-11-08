@@ -56,17 +56,22 @@ th{background:#eef1f5}
 
 <h2>概要</h2>
 <p>這是 <a href="ainr_dfn2.html">DFN2</a> 模型給板端 sample 用的單一標頭入口：把 <code>lib/ainr/dfn2/dfn2_prepost.h</code> 的頻域 frame_open／finish／bypass 生命週期、audiolib 的 analysis／synthesis STFT（<code>AC_OLA_ACCUMULATE</code>）與選用的輸入 HPF 包成「int16 PCM 進、int16 PCM 出，一 hop 一次呼叫」的介面。只支援 <code>frames_per_call == 1</code>（N&gt;1 的板端多幀版本不在此列，見 <a href="ainr_dfn2_detail.html">ainr_dfn2_detail</a>）。自己做框化的頻域呼叫端應直接用 <code>dfn2_prepost.h</code>，不必透過這層。</p>
-<p>兩種初始化模式：記憶體模式（<code>dfn2_stream_init</code>，呼叫端已載入並持有 ERB 矩陣）與檔案模式（<code>dfn2_stream_init_from_erb_file</code>，由 stream 自己的 pool 讀檔、持有矩陣；<code>dfn2_stream_erb_file.c</code> 是唯一含 <code>&lt;stdio.h&gt;</code> 的檔案，<code>NO_STDIO</code> build 可以不連這個檔，只用記憶體模式）。full／<code>-DDFN2_MASK_ONLY</code> 兩個變體各自建置，沿用既有 <code>DFN2_VARIANT_SYMBOL</code> 連結期檢查避免混用。</p>
+<p>兩種初始化模式：記憶體模式（<code>dfn2_stream_init</code>，呼叫端已載入並持有 ERB 矩陣）與檔案模式（<code>dfn2_stream_init_from_erb_file</code>，由 stream 自己的 pool 讀檔、持有矩陣；<code>dfn2_stream_erb_file.c</code> 是唯一含 <code>&lt;stdio.h&gt;</code> 的檔案，<code>NO_STDIO</code> build 可以不連這個檔，只用記憶體模式）。full／<code>-DDFN2_MASK_ONLY</code> 兩個變體各自建置；兩者的 <code>DFN2HopIO</code> 大小不同，所以 <code>dfn2_stream.h</code> 把每個公開函式依呼叫端自己的 <code>-DDFN2_MASK_ONLY</code> 改名（同一機制套用到這層 SDK 自己的公開 API，而非僅 <code>dfn2_process.h</code> 原有、只在 SDK 內部編譯單元生效的 <code>DFN2_VARIANT_SYMBOL</code> 連結檢查）：caller 與 archive 變體不一致時會在連結期找不到符號，不會先連起來才在第一個 hop 寫壞呼叫端記憶體。</p>
 
 <h2>API 用法</h2>
 <pre>ctx = dfn2_stream_init_from_erb_file(&amp;cfg, erb_path, pool, pool_bytes);   // 或 dfn2_stream_init()
 while (有一個 hop 的 int16 pcm_in) {
     DFN2HopIO io;
     if (dfn2_stream_pre_process(ctx, pcm_in, &amp;io) != 1) break;            // -1 是契約錯誤
+    device_state_sync(io.state_generation);      // generation 若變了就把加速器自己的 state 拷貝
+                                                  // 重填量化零——不是可省的步驟，見下方說明
     int ai_rc = run_accelerator(&amp;io.inputs, &amp;io.outputs);                 // 0 = 每個輸出都寫了
+    if (ai_rc != 0) device_state_refill_zero();  // 這次跑可能已經寫了「部分」state 才失敗；
+                                                  // 現在就重填零，不要等下一拍的 sync
     if (dfn2_stream_post_process(ctx, ai_rc, pcm_out) &lt; 0) break;
     // pcm_out 永遠是完整一個 hop；不論內容都要寫出/播放
 }</pre>
+<p><code>device_state_sync</code>／<code>device_state_refill_zero</code> 不是這層 stream 自己的函式——是呼叫端 adapter 自己操作加速器 state buffer 的程式碼（這層 stream 只追蹤並回報 <code>io.state_generation</code>，碰不到加速器的記憶體）。省略前者，加速器會在 reset／暖機／拒收 commit 造成的 generation 變化時繼續抱著舊 state（實測：下一個對齊輸入的 PCM hop 512 個樣本全部不同）；省略後者，失敗跑留下的部分/髒寫會一路留到下一次 sync 才被發現（因為單純的 bypass 本身不會推進 generation，下一拍的 sync 看不出差異，實測下一拍讀到殘值而非預期的 0）。目標平台的 <code>alg_ai3_dfn.c</code> 範例本身就是這樣做的（每個 hop 跑之前呼叫 <code>state_generation_sync()</code>、跑失敗後立刻呼叫 <code>state_refill_zero()</code>），這裡只是把這條腿補進這層 SDK 自己的最短範例。</p>
 <p>暖機（<code>mask_lookahead</code> 個 hop，init／reset 後）：<code>pre_process</code> 仍回 1、仍開一個 job，加速器仍跑一次；輸出為靜音（函式庫丟棄 heads、推進 <code>io.state_generation</code>）——跟正常迴圈完全一樣，不用特判。排尾：最後一個真實 PCM hop 之後，照同一個迴圈再餵 <code>mask_lookahead + df_lookahead + 1</code> 個全零 PCM hop，才能把最後一個真實來源幀排出（stream 的 STFT/ISTFT 框化本身多疊一個 hop，在核心自己的 L+D 延遲之上）。</p>
 
 <h2>流程圖（block diagram）</h2>
@@ -137,7 +142,7 @@ hop   caller                    dfn2_stream                       NPU
 <div class="tbl"><table>
 <tr><th>State</th><th>誰保存</th><th>跨 hop 保存什麼</th><th>何時歸零／推進</th></tr>
 <tr><td>STFT／ISTFT 歷史</td><td>本層（<code>AcStft</code>／<code>AcIstft</code>，pool 內）</td><td>重疊相加的樣本歷史</td><td><code>dfn2_stream_reset()</code>；<code>AC_OLA_ACCUMULATE</code> 不需額外排水邏輯</td></tr>
-<tr><td>GRU／df_convp 遞迴 state</td><td>登錄則由呼叫端持有（<code>DFN2StreamConfig.erb_fwd/erb_inv</code> 旁的 config 沿用 <code>dfn2_prepost</code> 登錄規則），未登錄則加速器自行持有</td><td>模型的遞迴記憶</td><td>reset、每個暖機 hop、被拒的 commit 各歸零一次並讓 <code>state_generation</code> +1</td></tr>
+<tr><td>GRU／df_convp 遞迴 state</td><td>一律由加速器自行持有——<code>DFN2StreamConfig</code> 沒有狀態登錄欄位（跟 <code>dfn2_prepost</code> 自己的 <code>DFN2PrepostConfig.gru_hidden/df_convp_history</code> 不同，這層 stream SDK 從不設定它們，一律留空），呼叫端只能靠 <code>io.state_generation</code> 判斷要不要回填量化零</td><td>模型的遞迴記憶</td><td>reset、每個暖機 hop、被拒的 commit 各歸零一次並讓 <code>state_generation</code> +1</td></tr>
 <tr><td><code>state_generation</code></td><td>本層轉呼叫 <code>dfn2_prepost_state_generation()</code></td><td>目前 generation 值</td><td>init=1；之後每次上列事件 +1；<code>io.state_generation</code> 在 <code>frame_open()</code> 後才取樣，已反映本 hop 的暖機／拒絕</td></tr>
 <tr><td>ERB 矩陣</td><td>記憶體模式：呼叫端；檔案模式：本層 pool</td><td>forward（bin-major）／inverse（band-major）</td><td>stream 的生命週期內不變</td></tr>
 <tr><td>開／關 hop 旗標</td><td>本層內部</td><td>是否有待關閉的 <code>frame_open</code></td><td>每次成功 <code>pre_process</code>／<code>post_process</code> 切換</td></tr>

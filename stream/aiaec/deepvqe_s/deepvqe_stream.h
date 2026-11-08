@@ -10,14 +10,36 @@
  *     while (have a hop of int16 mic_in, far_in) {
  *         DeepVqeHopIO io;
  *         if (deepvqe_stream_pre_process(ctx, mic_in, far_in, &io) != 1) break;   // -1 is a contract error
+ *         device_state_sync(io.state_generation);    // reload the accelerator's OWN state copy
+ *                                                     // with quantized zero if this changed since
+ *                                                     // the last hop -- not optional, see below
  *         int ai_rc = run_accelerator(&io.inputs, &io.outputs);    // 0 = taps + every state written
+ *         if (ai_rc != 0) device_state_refill_zero(); // the run may have written PART of the
+ *                                                     // state before failing; restart it from zero
+ *                                                     // now, do not wait for the next hop's sync
  *         if (deepvqe_stream_post_process(ctx, ai_rc, pcm_out) < 0) break;
  *         // pcm_out is always a full hop; write/play it unconditionally.
  *     }
  *
+ * The two device_state_* calls above are not this stream's own functions -- they are the adapter's
+ * own code operating the accelerator's state buffers directly (this stream only tracks and reports
+ * io.state_generation). Skipping the sync leaves a state-dependent accelerator holding a stale
+ * copy across a generation change (every sample of that hop then wrong); skipping the post-failure
+ * refill leaves it holding a failed run's partial write, since a plain bypass does not itself
+ * change the generation the next hop's sync would react to. Same pattern as DFN2's stream (see its
+ * own header comment for the exact board-sample line numbers); this model has no registered-state
+ * config fields to begin with (DeepVqeStreamConfig.state[]/state_elements[] -- all-NULL registers
+ * nothing, same as the smoke test here), but a caller that DOES register still owns this sync.
+ *
  * Bypass (ai_rc != 0): fails CLOSED, not through -- the primary input is the raw microphone with
- * no canceller in front of it, so the bypassed hop is silence, not a passthrough of mic_in (see
- * deepvqe_prepost.h's frame_bypass()). The CCM ring and any registered state are left exactly as
+ * no canceller in front of it, so this hop's own contribution to the enhanced spectrum is zeroed,
+ * not a passthrough of mic_in (see deepvqe_prepost.h's frame_bypass()). This is a spectral-layer
+ * guarantee, not a PCM one: AC_OLA_ENV_NORM's synthesis still overlap-adds the PRECEDING hop's
+ * real output on top, so a single bypassed hop's pcm_out is not fully zero (confirmed: after a
+ * normal hop, one forced-fail hop still writes a mostly-nonzero PCM hop, tapering off); pcm_out
+ * only reaches true silence after enough CONSECUTIVE bypassed hops to flush that one hop of OLA
+ * history (50% overlap: two). A caller must not assume a single bypass hop's pcm_out is silent.
+ * The CCM ring and any registered state are left exactly as
  * they were on an ai_rc != 0 bypass -- bypass touches neither. frame_finish's own non-finite
  * rejection is different: it zeroes the *registered state* (not the CCM ring, which it also
  * leaves untouched -- "the ring is not pushed") and advances the generation, then this stream

@@ -66,10 +66,19 @@ while (有一個 hop 的 int16 err_in, far_in) {
     int pre_rc = ulcnet_stream_pre_process(ctx, err_in, far_in, delay, &amp;io);
     if (pre_rc &lt; 0) break;                                 // 契約錯誤
     int ai_rc = 0;
-    if (pre_rc == 1) ai_rc = run_accelerator(&amp;io.inputs, &amp;io.outputs);   // 0 = mask 已寫
+    if (pre_rc == 1) {
+        device_state_sync(io.state_generation);   // generation 若變了就把加速器自己的 state
+                                                    // 拷貝重填量化零；reprime hop（pre_rc==0）
+                                                    // 不會跑到加速器，不需要這步
+        ai_rc = run_accelerator(&amp;io.inputs, &amp;io.outputs);   // 0 = mask 已寫
+        if (ai_rc != 0) device_state_refill_zero(); // 這次跑可能已經寫了「部分」state 才失敗；
+                                                    // 現在就重填零，不要等下一拍的 sync
+    }
     if (ulcnet_stream_post_process(ctx, ai_rc, pcm_out) &lt; 0) break;
     // pcm_out 永遠完整一個 hop；pre_rc 為 0（reprime）時 ai_rc 會被忽略
 }</pre>
+<p><code>device_state_sync</code>／<code>device_state_refill_zero</code> 不是這層 stream 自己的函式，道理跟 <a href="ainr_dfn2_stream_usage.html">DFN2 stream</a> 一樣（這層只追蹤並回報 <code>io.state_generation</code>，碰不到加速器記憶體）；跟這個模型自己的 fail-OPEN（本拍錯誤頻譜直通輸出）是兩件事，不要混為一談——那是這個模型本身對當拍 PCM 的保證，這裡講的是加速器跨拍的遞迴 state。</p>
+<p><b>兩個 pre_process 入口，契約相同</b>：上面範例用的 <code>ulcnet_stream_pre_process()</code>（int16）是個薄 wrapper，內部先把 <code>err_in</code>／<code>far_in</code> 轉成 float 再呼叫 <code>ulcnet_stream_pre_process_f32()</code>。板端 sample 自己的接線其實已經是 float——<code>alg_ai3_alignulcnet.c</code> 把線性 AEC 的 <code>AecResContext.formed_hop</code>（float）跟自己的 float far buffer 直接送進 <code>ac_stft_push_planar</code>，從來沒有量化成 int16 過。若呼叫端的 error／far 兩路本來就是 float（線性 AEC 殘差正是這個情況），應直接呼叫 <code>ulcnet_stream_pre_process_f32()</code>，不要繞經 int16：實測 10 秒／16 kHz 錄音、624 次推論，量化成 int16 再轉回 float 會讓每一拍的特徵都不同，最終 160,000 個輸出 PCM 樣本裡有 33,487 個不同（無 clipping，最大差 4 LSB）——不是雜訊等級的差異，是另一個訊號。</p>
 <p><b>對齊驅動的 reset／reprime</b>：<code>delay.changed</code>（新的對齊世代開始）或「<code>delay.solid</code> 從上一拍的假變成這一拍的真」兩者之一，在<b>這一 hop 分析之前</b>觸發：完整重置（兩路 STFT、ISTFT 與 <code>UlcnetPrepost</code> 一起，等同呼叫端自己呼叫 <code>ulcnet_stream_reset()</code>）並武裝 <code>ULCNET_STREAM_REPRIME_FRAMES</code>（= 1）個恆等 hop。只有 solid 轉態那一半邊界條件在「init／reset 後的第一個 hop」被抑制（沒有前一拍可比）；<code>delay.changed == 1</code> 在同一個第一個 hop 仍會觸發重置——跟板端 sample 未加防護的 <code>changed</code> 判斷一致，這是正確行為，不是漏洞。</p>
 <p><b>Bypass 是直通式（fail OPEN）</b>，跟 <a href="aiaec_deepvqe_s_stream_usage.html">DeepVQE-S 的 fail CLOSED</a> 正好相反：reprime hop、加速器拒絕（<code>ai_rc != 0</code>）、或 <code>frame_finish</code> 自己的非有限值拒收，三者都讓 linear-error 頻譜原樣通過（不是靜音）——因為這個訊號本身已經是 AEC 的殘留，模型失敗時直通並不會比不跑模型更差。</p>
 
@@ -140,7 +149,7 @@ k     pre_process -> open --------------------------------------->  替身回 -1
 <h2>I/O 表</h2>
 <div class="tbl"><table>
 <tr><th>方向</th><th>名稱</th><th>型別／shape</th><th>一次呼叫</th><th>對應時域樣本</th></tr>
-<tr><td>輸入</td><td><code>err_in</code>、<code>far_in</code></td><td><code>const int16_t*</code>，各長度 <code>ulcnet_stream_hop_size(s)</code></td><td>每 hop 1 次</td><td>1 hop（16 kHz／512 時為 256 samples）</td></tr>
+<tr><td>輸入</td><td><code>err_in</code>、<code>far_in</code></td><td><code>const int16_t*</code>（<code>ulcnet_stream_pre_process</code>）或 <code>const float*</code> 滿幅 ~=1.0（<code>ulcnet_stream_pre_process_f32</code>，板端 sample 實際用的入口）；各長度 <code>ulcnet_stream_hop_size(s)</code></td><td>每 hop 1 次</td><td>1 hop（16 kHz／512 時為 256 samples）</td></tr>
 <tr><td>輸入</td><td><code>delay</code>（<code>UlcnetStreamDelay</code>）</td><td><code>{int changed, int solid}</code>，by value</td><td>每 hop 1 次</td><td>—</td></tr>
 <tr><td>輸入（可選）</td><td><code>io.inputs</code>（<code>UlcnetModelIoInputs</code>）</td><td><code>error_mag</code>／<code>far_mag</code>／<code>error_cos</code>／<code>error_sin</code> 各 <code>[BINS]</code>，<code>key_history</code>／<code>value_history</code>／<code>logit_history</code>／<code>h_gru</code> 視圖</td><td>僅 <code>pre_process</code> 回 1 時有效；回 0（reprime）時 <code>*io</code> 全零且不可用</td><td>—</td></tr>
 <tr><td>輸出</td><td><code>io.outputs</code>（<code>UlcnetModelIoOutputs</code>）</td><td><code>output</code>（mask）＋四組 <code>*_history_out</code>／<code>h_gru_out</code>（NaN 預填）</td><td>加速器寫一次</td><td>—</td></tr>

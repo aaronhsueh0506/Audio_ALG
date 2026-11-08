@@ -1,8 +1,16 @@
-CC ?= cc
-AR ?= ar
+CC  ?= cc
+CXX ?= c++
+AR  ?= ar
 CFLAGS ?= -O2 -std=c11 -Wall -Wextra -Wpedantic
+# EXTRA_CFLAGS is the supported hook for a caller's own flags (e.g. a cross-compile -arch/--target):
+# it reaches both this directory's own compiles and the audiolib sub-make below (as that
+# Makefile's own EXTRA_CFLAGS), same convention as pipelines/Makefile's FWD. Plain CFLAGS is never
+# forwarded to the sub-make -- audiolib's Makefile treats a command-line CFLAGS override as fatal
+# (it would silently drop that Makefile's own FP-contraction policy and NE10 defines), and this
+# directory's own CFLAGS carries -I paths meaningless there.
+EXTRA_CFLAGS ?=
 # Same floating-point/include invariants as AIAEC/Makefile.
-override CFLAGS += -ffp-contract=off -fno-math-errno -I. -I../../../lib/aiaec/ulcnet -I../../common
+override CFLAGS += -ffp-contract=off -fno-math-errno -I. -I../../../lib/aiaec/ulcnet -I../../common $(EXTRA_CFLAGS)
 LDFLAGS ?=
 SIMD ?= 1
 override SIMD := $(strip $(SIMD))
@@ -24,14 +32,20 @@ ifneq ($(filter-out 0 1,$(NO_STDIO)),)
 $(error NO_STDIO must be exactly 0 or 1)
 endif
 
-include ../../../lib/deps.mk
-COMMON_LIB := $(shell $(MAKE) -s -C $(COMMON_DIR) BACKEND=$(BACKEND) SIMD=$(SIMD) 	lib print-lib-path | tail -1)
-override CFLAGS += -I$(COMMON_DIR)/include -I$(COMMON_DIR)
-
 WERROR ?= 0
 ifeq ($(WERROR),1)
 override CFLAGS += -Werror
 endif
+
+include ../../../lib/deps.mk
+# RESOLVE_COMMON_LIB (from lib/deps.mk) resolves COMMON_LIB via a sub-make forwarding
+# BACKEND/SIMD/TOOLCHAIN_FWD and validates it -- a cross-compile (different CC/CXX, or
+# EXTRA_CFLAGS carrying e.g. -arch arm64e) must build a COMMON_LIB for the SAME target, not
+# silently fall back to the host default and fail to link only once an external consumer tries to
+# use it. Skipped outright (not just the validation) for a plain `make clean` -- see
+# RESOLVE_COMMON_LIB's own comment.
+$(eval $(call RESOLVE_COMMON_LIB))
+override CFLAGS += -I$(COMMON_DIR)/include -I$(COMMON_DIR)
 
 ifneq ($(words $(SIMD)),1)
 $(error SIMD must be exactly 0 or 1)
@@ -136,9 +150,12 @@ test: smoke verify-vs-sample
 
 # audit-no-stdio: builds the archive and asserts, via `nm -u`, that ulcnet_stream.o references no
 # stdio symbol (nothing in this model needs stdio at all).
+# TOOLCHAIN_FWD comes from lib/deps.mk (included above): CC/CXX/EXTRA_CFLAGS/WERROR, shared with
+# the COMMON_LIB resolution above instead of each spelling out the same four vars again.
+
 audit-no-stdio:
-	@$(MAKE) --no-print-directory NO_STDIO=1 SIMD=$(SIMD) lib >/dev/null
-	@obj_dir="$$($(MAKE) -s --no-print-directory NO_STDIO=1 SIMD=$(SIMD) print-lib-path)"; \
+	@$(MAKE) --no-print-directory NO_STDIO=1 SIMD=$(SIMD) $(TOOLCHAIN_FWD) lib >/dev/null
+	@obj_dir="$$($(MAKE) -s --no-print-directory NO_STDIO=1 SIMD=$(SIMD) $(TOOLCHAIN_FWD) print-lib-path)"; \
 	obj_dir="$$(dirname "$$obj_dir")"; \
 	undef="$$(nm -u "$$obj_dir/ulcnet_stream.o" 2>/dev/null | grep -Ei 'fopen|fread|fclose|fwrite|fprintf|printf|puts' || true)"; \
 	if [ -n "$$undef" ]; then \

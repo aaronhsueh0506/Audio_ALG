@@ -4,7 +4,9 @@
 # are read from, and at which commit each is pinned (lib/aec.pin, lib/nr.pin, lib/audiolib.pin).
 # Included by every Makefile that needs AEC_DIR / NR_DIR / AUDIOLIB_DIR / COMMON_DIR
 # (pipelines/Makefile, pipelines/4ch_aec_bf_nr_res/Makefile, AINR/Makefile,
-# AINR/RNNoise-ERB/Makefile, AIAEC/Makefile) instead of each hardcoding its own relative path.
+# AINR/RNNoise-ERB/Makefile, AIAEC/Makefile, stream/ainr/dfn2/Makefile,
+# stream/aiaec/deepvqe_s/Makefile, stream/aiaec/ulcnet/Makefile) instead of each hardcoding its
+# own relative path.
 # Every value here is `?=`, so a caller that already set one on its command line or in its
 # environment keeps that value untouched; this file only supplies the default.
 #
@@ -55,6 +57,43 @@ NR_DIR      ?= $(NR_REPO_DIR)/c_impl
 # make that override silently take COMMON_DIR down with it.
 COMMON_DIR  ?= $(abspath $(AUDIO_ALG_ROOT)/../audiolib/common)
 
+# Shared by every includer that forwards its own toolchain/flag choices to a COMMON_DIR (or other
+# producer) sub-make, instead of each one spelling out the same CC/CXX/EXTRA_CFLAGS/WERROR list --
+# a plain variable, lazily expanded at the point of use, so it costs nothing to a Makefile that
+# never references it and picks up whatever CC/CXX/EXTRA_CFLAGS/WERROR that Makefile has assigned
+# by the time it's actually used (definition order relative to this `include` doesn't matter).
+TOOLCHAIN_FWD = CC='$(CC)' CXX='$(CXX)' EXTRA_CFLAGS='$(EXTRA_CFLAGS)' WERROR=$(WERROR)
+
+# Shared by every includer that needs the audiolib common archive's path: resolves COMMON_LIB via
+# a sub-make (forwarding BACKEND/SIMD/TOOLCHAIN_FWD, which the caller must already have set) and
+# validates the result -- a cross-compile that can't build there, or a broken/pre-bootstrap
+# sibling checkout, fails loudly instead of silently handing an empty or stale path to whatever
+# recipe links against it. Call via `$(eval $(call RESOLVE_COMMON_LIB))` once BACKEND/SIMD/
+# TOOLCHAIN_FWD are in scope (order relative to this `include` doesn't matter: $(eval ...) runs
+# at the point it's written, same as any other top-level directive, so put the call after those
+# three are assigned, not before).
+#
+# The entire resolution -- the sub-make call AND both validations -- is skipped outright when
+# `clean` is the ONLY requested goal: that target never touches COMMON_LIB (just rm -rf a build
+# directory), so it must keep working even when audiolib can't be resolved at all (a fresh
+# checkout before bootstrap-deps has run, or a broken sibling). Skipping only the two $(error)
+# checks and leaving the $(shell ...) sub-make call itself unconditional would still shell out and
+# attempt to build audiolib as a side effect of a plain `make clean` -- wasted work, and still a
+# point of failure the clean goal has no reason to depend on. `make clean <other-goal>` is NOT
+# skipped, since <other-goal> may still need COMMON_LIB.
+define RESOLVE_COMMON_LIB
+ifneq ($$(MAKECMDGOALS),clean)
+COMMON_LIB := $$(shell $$(MAKE) -s -C $$(COMMON_DIR) BACKEND=$$(BACKEND) SIMD=$$(SIMD) $$(TOOLCHAIN_FWD) \
+	lib print-lib-path | tail -1)
+ifeq ($$(strip $$(COMMON_LIB)),)
+$$(error COMMON_LIB resolution failed: the audiolib sub-make (-C $$(COMMON_DIR)) produced no path -- check CC='$$(CC)' CXX='$$(CXX)' can build there)
+endif
+ifeq ($$(wildcard $$(COMMON_LIB)),)
+$$(error COMMON_LIB=$$(COMMON_LIB) does not exist after the audiolib sub-make reported it built)
+endif
+endif
+endef
+
 .PHONY: print-deps-sh bootstrap-deps check-deps-pins
 
 print-deps-sh:
@@ -74,40 +113,48 @@ print-deps-sh:
 # above would then see that directory on a retry and report "already exists, left alone" --
 # success, at the wrong HEAD. Staging makes a failed attempt leave nothing at the final path, so a
 # retry clones again instead of trusting a half-finished checkout.
+#
+# Two concurrent `bootstrap-deps` runs (two build jobs, or this and a sub-make's own forwarded
+# call) both installing the SAME not-yet-existing DIR would otherwise both pass the `[ -d DIR ]`
+# check, both clone+checkout successfully, and then race on `mv stage DIR`: whichever `mv` runs
+# second finds DIR already exists (the first `mv` having just created it) and -- `mv` onto an
+# existing, non-empty directory moves the SOURCE *inside* it, it does not replace it or fail --
+# silently leaves a second, untracked, nested checkout at DIR/$(basename stage) (confirmed: this
+# is exactly what reproduces). Each of the three installs below is therefore serialized by its own
+# mkdir-based lock (mkdir is atomic across processes on every POSIX filesystem this targets) and
+# re-checks `[ -d DIR ]` only AFTER acquiring it, not before -- a loser of the race then correctly
+# sees the winner's now-finished DIR and reports "already exists", instead of still racing it.
+BOOTSTRAP_LOCK_WAIT = @lock='$(2).bootstrap-lock'; tries=0; \
+	while ! mkdir "$$lock" 2>/dev/null; do \
+	  if [ ! -d "$$lock" ]; then \
+	    echo "bootstrap-deps: FAIL could not create lock directory $$lock (not contention -- \
+the lock itself doesn't exist; check the parent directory exists and is writable)" >&2; \
+	    exit 1; \
+	  fi; \
+	  tries=$$((tries + 1)); \
+	  if [ "$$tries" -ge 1800 ]; then \
+	    echo "bootstrap-deps: FAIL could not acquire $$lock after 30 minutes (another bootstrap-deps stuck on a very slow clone, or a crashed one left the lock behind -- remove it by hand if so)" >&2; \
+	    exit 1; \
+	  fi; \
+	  sleep 1; \
+	done; \
+	trap 'rmdir "$$lock" 2>/dev/null' EXIT; \
+	if [ -d '$(2)' ]; then \
+	  echo "bootstrap-deps: $(1) checkout $(2) already exists, left alone"; \
+	else \
+	  echo "bootstrap-deps: cloning $(1) $(4) from $(3) -> $(2)"; \
+	  stage='$(2).bootstrap-staging.'"$$$$"; rm -rf "$$stage"; \
+	  if git clone --quiet '$(3)' "$$stage" && git -C "$$stage" checkout --quiet '$(4)'; then \
+	    mv "$$stage" '$(2)'; \
+	  else \
+	    echo "bootstrap-deps: FAIL could not clone+checkout $(1) $(4) from $(3)" >&2; rm -rf "$$stage"; exit 1; \
+	  fi; \
+	fi
+
 bootstrap-deps:
-	@if [ -d '$(AEC_REPO_DIR)' ]; then \
-	  echo "bootstrap-deps: AEC_REPO_DIR=$(AEC_REPO_DIR) already exists, left alone"; \
-	else \
-	  echo "bootstrap-deps: cloning AEC $(AEC_COMMIT) from $(AEC_URL) -> $(AEC_REPO_DIR)"; \
-	  stage='$(AEC_REPO_DIR).bootstrap-staging.'"$$$$"; rm -rf "$$stage"; \
-	  if git clone --quiet '$(AEC_URL)' "$$stage" && git -C "$$stage" checkout --quiet '$(AEC_COMMIT)'; then \
-	    mv "$$stage" '$(AEC_REPO_DIR)'; \
-	  else \
-	    echo "bootstrap-deps: FAIL could not clone+checkout AEC $(AEC_COMMIT) from $(AEC_URL)" >&2; rm -rf "$$stage"; exit 1; \
-	  fi; \
-	fi
-	@if [ -d '$(NR_REPO_DIR)' ]; then \
-	  echo "bootstrap-deps: NR_REPO_DIR=$(NR_REPO_DIR) already exists, left alone"; \
-	else \
-	  echo "bootstrap-deps: cloning NR $(NR_COMMIT) from $(NR_URL) -> $(NR_REPO_DIR)"; \
-	  stage='$(NR_REPO_DIR).bootstrap-staging.'"$$$$"; rm -rf "$$stage"; \
-	  if git clone --quiet '$(NR_URL)' "$$stage" && git -C "$$stage" checkout --quiet '$(NR_COMMIT)'; then \
-	    mv "$$stage" '$(NR_REPO_DIR)'; \
-	  else \
-	    echo "bootstrap-deps: FAIL could not clone+checkout NR $(NR_COMMIT) from $(NR_URL)" >&2; rm -rf "$$stage"; exit 1; \
-	  fi; \
-	fi
-	@if [ -d '$(AUDIOLIB_DIR)' ]; then \
-	  echo "bootstrap-deps: AUDIOLIB_DIR=$(AUDIOLIB_DIR) already exists, left alone"; \
-	else \
-	  echo "bootstrap-deps: cloning audiolib $(AUDIOLIB_COMMIT) from $(AUDIOLIB_URL) -> $(AUDIOLIB_DIR)"; \
-	  stage='$(AUDIOLIB_DIR).bootstrap-staging.'"$$$$"; rm -rf "$$stage"; \
-	  if git clone --quiet '$(AUDIOLIB_URL)' "$$stage" && git -C "$$stage" checkout --quiet '$(AUDIOLIB_COMMIT)'; then \
-	    mv "$$stage" '$(AUDIOLIB_DIR)'; \
-	  else \
-	    echo "bootstrap-deps: FAIL could not clone+checkout audiolib $(AUDIOLIB_COMMIT) from $(AUDIOLIB_URL)" >&2; rm -rf "$$stage"; exit 1; \
-	  fi; \
-	fi
+	$(call BOOTSTRAP_LOCK_WAIT,AEC,$(AEC_REPO_DIR),$(AEC_URL),$(AEC_COMMIT))
+	$(call BOOTSTRAP_LOCK_WAIT,NR,$(NR_REPO_DIR),$(NR_URL),$(NR_COMMIT))
+	$(call BOOTSTRAP_LOCK_WAIT,audiolib,$(AUDIOLIB_DIR),$(AUDIOLIB_URL),$(AUDIOLIB_COMMIT))
 
 # Report each pinned dependency against the directory a build actually resolves to -- AEC_DIR/
 # NR_DIR/COMMON_DIR, honoring any override of those directly (not AEC_REPO_DIR/NR_REPO_DIR/

@@ -633,8 +633,8 @@ def _write_metadata(
         'logit_history_order': 'oldest_first',
         'score_window_frames': SCORE_WINDOW_FRAMES,
         'production_streaming_equivalent': True,
-        'c_frontend_postprocess': 'Align_ULCNet/ulcnet_process.c',
-        'c_model_io_state': 'Align_ULCNet/ulcnet_model_io.c',
+        'c_frontend_postprocess': 'lib/aiaec/ulcnet/ulcnet_process.c',
+        'c_model_io_state': 'lib/aiaec/ulcnet/ulcnet_model_io.c',
     }
     _write_sidecar(output_path, metadata)
     return metadata
