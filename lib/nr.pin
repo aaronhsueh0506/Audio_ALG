@@ -9,5 +9,5 @@
 # step-5 "is the gitlink caught up with this pin" NOTE, never as the value a build is judged
 # against. Bump NR_COMMIT in the same commit that bumps the gitlink, until step 5 (migrating the
 # gitlink itself) retires one of the two.
-NR_COMMIT=b0c7696dd673747675ff16e7e232a2f6039c0630
+NR_COMMIT=51cb46a977d515fa1316327624e22bac1f5a5d3e
 NR_URL=https://github.com/aaronhsueh0506/CVNR.git
