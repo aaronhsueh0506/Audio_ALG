@@ -65,7 +65,7 @@
 <tr><td>lane 的 <code>filter_length</code></td><td>外部</td><td>(0, 4096] 樣本;<code>aec_config_from_level()</code> 填預設 52 ms(≥ 44.1 kHz 為 64 ms):16 kHz 832、48 kHz 3072</td><td>每條 lane 的 PBFDKF 長度;調高 → 記憶體與運算上升(四條 lane 用同一份 config);超出範圍時 <code>aec_get_mem_size()</code> 回 0</td></tr>
 <tr><td><code>aec_config_from_level(&amp;cfg, level, sample_rate)</code>(RES 用)</td><td>外部</td><td><code>AEC_LEVEL_*</code>(範例用 BALANCED);<code>sample_rate</code> = flow 的 <code>sample_rate</code></td><td>RES 地板的起點;執行期改用 <code>aec_res_set_level(res, level, ramp_ms)</code></td></tr>
 <tr><td>RES 的 <code>cfg.fft_size</code></td><td>外部</td><td>= <code>mcab_fft_size(flow)</code></td><td>必須與 flow 同一格點;<code>aec_res_get_mem_size()</code> 回 0 = config 無效,<code>aec_res_init()</code> 回 NULL = pool 過小／未對齊／無效</td></tr>
-<tr><td>其餘 <code>AecConfig</code> 欄位</td><td>內部</td><td>level 建構函式的值</td><td>整合者不改;範例(<code>mcab_static.c</code>、<code>mcab_raw.c</code>、<code>mcab_external_static.c</code>、<code>dfn/4ch_aec_bf_dfn_res/main.c</code>)都只設 <code>fft_size</code></td></tr>
+<tr><td>其餘 <code>AecConfig</code> 欄位</td><td>內部</td><td>level 建構函式的值</td><td>整合者不改;範例(<code>mcab_static.c</code>、<code>mcab_raw.c</code>、<code>mcab_external_static.c</code>、<code>4ch/aec_bf_dfn_res/main.c</code>)都只設 <code>fft_size</code></td></tr>
 </table>
 
 <h2 id="section-2">2. 每 hop 由應用提供的輸入</h2>

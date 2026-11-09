@@ -29,7 +29,7 @@ reference ring 與對齊後的 far、每條 lane 的視圖、beamformer 權重�
 `aec_apply_external_realign()`、`delay_aec_accumulate_ex()`、`aec_reset()`、`delay_aec_reset()`）與唯讀 getter。
 post-beam residual suppressor（`AecRes`）、mono MMSE-LSA denoiser（`AnrDenoiser`）、comfort noise 與最終 iFFT/OLA（`AcIstft`）
 **不在**模組內：每一個都是獨立的函式庫物件，有自己的 `mem_size` 與 `init`，由應用各自初始化並明寫每 hop 的串接
-（完整範例見 §2 與 `mcab_external_static.c` 的 `post_plan()`／`post_init()`／`post_hop()`、`pipelines/4ch_aec_bf_nr_res/tests/conv_chain_mcab.h`；
+（完整範例見 §2 與 `mcab_external_static.c` 的 `post_plan()`／`post_init()`／`post_hop()`、`pipelines/4ch/tests/conv_chain_mcab.h`；
 範例用的銜接 helper 是 `mcab_sample_post.h`，見 §1.2）。
 flow 之後 `frame->g_res_ctx` 恆為 NULL：要 RES 就自己用 libaec 初始化一個 `AecRes`（見 §2）。
 
@@ -67,7 +67,7 @@ flow 之後 `frame->g_res_ctx` 恆為 NULL：要 RES 就自己用 libaec 初始�
 ### 1.4 編譯需要的 `-I` 清單（consumer 端最小集合）
 
 ```
--I pipelines/4ch_aec_bf_nr_res
+-I pipelines/4ch
 -I ../AEC/c_impl/include
 -I ../NR/c_impl/include
 -I <audiolib>/common/include
@@ -250,16 +250,16 @@ int main(void) {
 將範例存成 Audio_ALG 根目錄的 `app.c`。以下使用預設的 sibling 依賴。
 
 ```sh
-make -C pipelines/4ch_aec_bf_nr_res libs
-make -C pipelines/4ch_aec_bf_nr_res libaudio_pipeline_mcab.a
+make -C pipelines/4ch libs
+make -C pipelines/4ch libaudio_pipeline_mcab.a
 common_dir="$(cd ../audiolib/common && pwd)"
 common="$(make -s -C "$common_dir" print-lib-path)"
 cc -std=gnu99 -O2 -Wall -Wextra -c app.c -o app.o \
   -I ../AEC/c_impl/include -I ../NR/c_impl/include \
   -I ../audiolib/common/include -I ../audiolib/common \
-  -I pipelines/4ch_aec_bf_nr_res
+  -I pipelines/4ch
 c++ -o app app.o \
-  "$(make -s -C pipelines/4ch_aec_bf_nr_res print-lib-path)" \
+  "$(make -s -C pipelines/4ch print-lib-path)" \
   "$(make -s -C ../AEC/c_impl COMMON_DIR="$common_dir" COMMON_LIB="$common" print-lib-path)" \
   "$(make -s -C ../NR/c_impl COMMON_DIR="$common_dir" COMMON_LIB="$common" print-lib-path)" \
   "$common" -lm
@@ -390,7 +390,7 @@ aec_res_split_floor(res, &live, &target);                        /* 唯讀，線
 > 也真正決定 comfort noise 量的那個 gain，來自**唯一一個**共用的 post 級抑制器
 > （`AecRes`；由你的應用擁有）。這也是為什麼 level setter 要作用在它上面，而不是要你自己
 > 對四條 lane 迴圈呼叫 `aec_set_level()`。共用 post 級 `AecRes` 的 reset 與 level 行為由測試釘住
-> （`pipelines/4ch_aec_bf_nr_res/tests/test_mcab_sample_beam.c` 的 `test_caller_res_reset_and_level`），不是推測。
+> （`pipelines/4ch/tests/test_mcab_sample_beam.c` 的 `test_caller_res_reset_and_level`），不是推測。
 
 | 呼叫 | 改／讀什麼 | 失敗（回 `-1`，**什麼都不寫**） |
 |---|---|---|

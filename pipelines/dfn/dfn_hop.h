@@ -25,7 +25,7 @@
  * hop: through the bridge dfn_rate_bridge_reset_synthesis(bridge) (the host-grid synthesis is
  * inside the bridge and runs at the top of dfn_hop_begin(): no delay line); with the stage driven
  * directly the caller clears its own AcIstft dfn_res_stage_lookahead_frames() hops later (see
- * mono_aec_dfn_res/main.c). A negative return leaves recovery to the caller: reset the AEC front
+ * mono/aec_dfn_res/main.c). A negative return leaves recovery to the caller: reset the AEC front
  * end, the comfort-noise generator and DfnHop together. */
 #ifndef PIPELINES_DFN_DFN_HOP_H
 #define PIPELINES_DFN_DFN_HOP_H

@@ -68,7 +68,7 @@ flow 沒有 token，只有一個「front frame 有效」旗標。次序規則很
 ### 5.5 診斷輸出去向
 
 **這個模組在任何拒絕路徑上都不輸出任何訊息，也不連結任何 stdio 符號。**
-（`mcab.c` 完全沒有 `printf` 家族的呼叫；在 `pipelines/4ch_aec_bf_nr_res/` 下執行的 `make NO_STDIO=1 audit-no-stdio` 以 `nm` 逐一檢查 `libaudio_pipeline_mcab.a`、
+（`mcab.c` 完全沒有 `printf` 家族的呼叫；在 `pipelines/4ch/` 下執行的 `make NO_STDIO=1 audit-no-stdio` 以 `nm` 逐一檢查 `libaudio_pipeline_mcab.a`、
 其他 archive 與兩個 sample object 都沒有 stdio 符號。）
 
 也就是說：`mcab_init_ex()` 回 `NULL` 時你**不會**知道是哪一項不符。
@@ -92,15 +92,15 @@ destroy 之後不要再呼叫任何 accessor（caller-owned pool 的 instance �
 
 ## 6. 出貨內容 vs 範例
 
-`pipelines/4ch_aec_bf_nr_res/` 目錄不是自解釋的。
+`pipelines/4ch/` 目錄不是自解釋的。
 
 ### 6.1 函式庫（會進產品）
 
 | Source | 產出 | 說明 |
 |---|---|---|
-| `pipelines/4ch_aec_bf_nr_res/mcab.c` | `libaudio_pipeline_mcab.a`（唯一的 object `mcab.o`） | **本手冊的主體**：flow 層，不含 lane、estimator、SRP／BF、RES／NR |
-| `pipelines/4ch_aec_bf_nr_res/mcab.h` | — | 本手冊的公開 API |
-| `pipelines/4ch_aec_bf_nr_res/mcab_internal.h` | — | 內部 header，**不是**公開 API，不要 include |
+| `pipelines/4ch/mcab.c` | `libaudio_pipeline_mcab.a`（唯一的 object `mcab.o`） | **本手冊的主體**：flow 層，不含 lane、estimator、SRP／BF、RES／NR |
+| `pipelines/4ch/mcab.h` | — | 本手冊的公開 API |
+| `pipelines/4ch/mcab_internal.h` | — | 內部 header，**不是**公開 API，不要 include |
 
 sample 層檔案（範例碼，**不在** archive 內，沒有 ABI、沒有 layout version，可整份複製改寫）：`mcab_sample_flow.{h,c}`（應用端 init 順序的實作：
 四條 lane、estimator、mcab 的 pool 放進同一塊記憶體）、`mcab_sample_beam.{h,c}`（SRP-PHAT ＋ BF ＋ 備援 VAD 的 helper，另一份手冊）、
@@ -111,18 +111,18 @@ sample 層檔案（範例碼，**不在** archive 內，沒有 ABI、沒有 layo
 
 | Source | 是什麼 | 為什麼存在 |
 |---|---|---|
-| `pipelines/4ch_aec_bf_nr_res/mcab_external_static.c`（執行檔 `mcab_external_static`） | caller-owned pool 路徑的主機參考程式 | 示範 `aec_config_from_level`（balanced）＋ `mcab_apply_lane_contract` → `aec_init` ×4 → `delay_aec_init` → `mcab_init_ex`（`flow_plan()`／`flow_init()`）→ `mcab_process_front` → `mcab_fuse` → 明寫的 stage 串接（`post_hop()`，它自己建一個 `AecRes`） → 拆除（`flow_destroy()`）→ release。它在 front/fuse 之間塞的是**固定等權重**，那是決定性的 smoke adapter，**不是** production beamformer |
-| `pipelines/4ch_aec_bf_nr_res/mcab_static.c`（`mcab_static`） | 同一個 flow 加 sample 層 SRP-PHAT／BF helper、RES（libaec `AecRes`）／NR／合成的 pool 路徑主機參考程式 | 屬於另一份手冊；列在這裡是為了讓目錄內容一目了然 |
-| `pipelines/4ch_aec_bf_nr_res/mcab_raw.c`（`mcab_raw`） | raw-float 錄音驗證 runner（flow 加 helper 加 RES／NR／合成） | 主機一次性工具；四條 lane、estimator、mcab 的 pool 與 helper 放在一塊 `posix_memalign` 配置的記憶體，後級 stage 另一塊 |
+| `pipelines/4ch/mcab_external_static.c`（執行檔 `mcab_external_static`） | caller-owned pool 路徑的主機參考程式 | 示範 `aec_config_from_level`（balanced）＋ `mcab_apply_lane_contract` → `aec_init` ×4 → `delay_aec_init` → `mcab_init_ex`（`flow_plan()`／`flow_init()`）→ `mcab_process_front` → `mcab_fuse` → 明寫的 stage 串接（`post_hop()`，它自己建一個 `AecRes`） → 拆除（`flow_destroy()`）→ release。它在 front/fuse 之間塞的是**固定等權重**，那是決定性的 smoke adapter，**不是** production beamformer |
+| `pipelines/4ch/mcab_static.c`（`mcab_static`） | 同一個 flow 加 sample 層 SRP-PHAT／BF helper、RES（libaec `AecRes`）／NR／合成的 pool 路徑主機參考程式 | 屬於另一份手冊；列在這裡是為了讓目錄內容一目了然 |
+| `pipelines/4ch/mcab_raw.c`（`mcab_raw`） | raw-float 錄音驗證 runner（flow 加 helper 加 RES／NR／合成） | 主機一次性工具；四條 lane、estimator、mcab 的 pool 與 helper 放在一塊 `posix_memalign` 配置的記憶體，後級 stage 另一塊 |
 
 另有兩支組合了這個 flow 與 helper 的範例，檔案在各自的 family 目錄、由本目錄的 Makefile 建置（`make 4ch_aec_bf_dfn_res`、`make 4ch_alignulcnet`）：
-`pipelines/dfn/4ch_aec_bf_dfn_res/main.c`（DFN2 後級）與 `pipelines/ulcnet/4ch_alignulcnet/main.c`（Align-ULCNet 後級，`enable_post = 0`）。
+`pipelines/4ch/aec_bf_dfn_res/main.c`（DFN2 後級）與 `pipelines/4ch/alignulcnet/main.c`（Align-ULCNet 後級，`enable_post = 0`）。
 
-單聲道的 library 與參考程式（`pipelines/mono_aec_nr_res/main.c`、`example_board_adapter.c`）見 `docs/reference/mono/README.md`。
+單聲道的 library 與參考程式（`pipelines/mono/aec_nr_res/main.c`、`example_board_adapter.c`）見 `docs/reference/mono/README.md`。
 
 ### 6.3 其他（不出貨）
 
-* `pipelines/4ch_aec_bf_nr_res/tests/` —— 測試：`test_mcab.c`（本手冊 API 的測試）、`test_mcab_sample_beam.c`（helper 與整條範例鏈）、
+* `pipelines/4ch/tests/` —— 測試：`test_mcab.c`（本手冊 API 的測試）、`test_mcab_sample_beam.c`（helper 與整條範例鏈）、
   `test_mcab_sample_driver.c`；`tests/conv_chain_mcab.h` 是把後級串接寫在 flow 之上的參考鏈；`tests/mcab_test_rig.h` 是測試用的建立／拆除輔助。
   `tests/test_mcab_sample_post.c`（`mcab_sample_post.h` 的測試）由上一層 `pipelines/Makefile` 建置（`make -C pipelines test_mcab_sample_post`）。
 * `audiolib/{doa,bf}` 與 `libspatial_common.a` —— SRP-PHAT／BF／spatial kernel 函式庫，只有 sample 層 helper 需要。

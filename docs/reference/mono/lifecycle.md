@@ -11,7 +11,7 @@
 | 3 | allocate | 你自己的配置器，取得各塊 `ALIGN16(...)` 相加且 16-byte 對齊的記憶體 | 拿到大小之後 | 配置失敗由你自己處理。pool **不需要**預先清零（poison pattern 也可以）；但必須在 handle 生命週期內獨佔、不被其他人寫入 |
 | 4 | init | `aec_init(pool, aec_bytes, &aec_cfg)`、`anr_init(pool + ALIGN16(aec_bytes), nr_bytes, &nr_cfg)`、`ac_istft_init(...)`（視窗用 `aec_init` 之後的 `aec_synthesis_window(aec, &synth_cfg.window, &len)` 借來的表；`ac_istft_get_mem_size` 先用任一非 NULL 的替身視窗量大小）；每一塊的起點都是前一塊加 `ALIGN16(前一塊大小)` | 拿到 pool 之後，處理第一個 hop 之前 | 回傳 `NULL`：pool 未 16-byte 對齊、太小、config 無效、子模組 init 失敗。已建好的那幾個要由你 destroy |
 | 5 | process | `aec_process_context(aec, mic, ref)` → `aec_get_res_context(aec, &ctx)` → `aec_get_output_base(aec, &b)`（先設 `b.struct_size = sizeof(b)`）→ 每 hop 串接（[§1.1](integration.md#11-構成每個函式庫各自初始化每個-hop-的串接由你寫)：`ctx.res_gain`、`anr_process_gain()` + `anr_get_gain()`，降噪與增益都作用在 `b.base_spec` 上、`sk_min_f32()`、`sk_capply_gain_f32()`、`aec_cng_fill()`）→ `ac_istft_push(istft, spec, out)`；`aec_post_reset_serial(aec)` 與已處理的值不同時，在 CNG 抽樣與 push 之前 `ac_istft_reset(istft)` 並 `rng = AEC_CNG_SEED`（不重置 AEC 與降噪器） | 每收到一個 hop 呼叫一次。`mic`/`ref`/`out` 都必須剛好 `grid.hop_size` 個 float | `aec_process_context()` 與 `aec_get_res_context()` 回傳 `void`；`ctx.error_spec` 或 `ctx.res_gain` 為 NULL（沒有 context）、`aec_get_output_base()` 回非 0（拒絕，該 hop 不渲染）、`anr_process_gain()` 回非 0 或 `anr_get_gain()` 回 `NULL`（降噪器拒絕該 hop）都是你要處理的拒絕；`ac_istft_push()` 的回傳值與輸出有限性（選用 `skn_all_finite_f32()`）要自己檢查。**不會**檢查 buffer 長度 —— 長度錯是你的責任 |
-| 6 | recover | `aec_reset(aec)`、`anr_reset(nr)`、`ac_istft_reset(istft)`，並把你的 comfort-noise RNG 設回起始值（函式庫的 `AEC_CNG_SEED`，42） | 任何一步被拒、輸出非有限（若你有檢查）、換回聲路徑（換喇叭、重新 seat）或切換到不相關的另一條串流時 | 不會失敗。必須全部一起 reset：漏掉其中一個就不等於新建的實例（`mono_aec_nr_res/main.c` 的 `rig_reset()` 就是這四件事；`main.c` 在某個 stage 拒絕該 hop 時呼叫它，輸出有限性檢查是 `example_board_adapter.c` 的 `run_hops()` 做的） |
+| 6 | recover | `aec_reset(aec)`、`anr_reset(nr)`、`ac_istft_reset(istft)`，並把你的 comfort-noise RNG 設回起始值（函式庫的 `AEC_CNG_SEED`，42） | 任何一步被拒、輸出非有限（若你有檢查）、換回聲路徑（換喇叭、重新 seat）或切換到不相關的另一條串流時 | 不會失敗。必須全部一起 reset：漏掉其中一個就不等於新建的實例（`mono/aec_nr_res/main.c` 的 `rig_reset()` 就是這四件事；`main.c` 在某個 stage 拒絕該 hop 時呼叫它，輸出有限性檢查是 `example_board_adapter.c` 的 `run_hops()` 做的） |
 | 7 | destroy | `anr_destroy(nr)`、`aec_destroy(aec)` | 不再處理任何 hop 之後、釋放 pool 之前 | 不會失敗。`aec_destroy` NULL 安全、可重複，只放開實例內部的參照，**不**釋放你的 pool；`anr_destroy` 對 pool 實例立即返回，對 `anr_create()` 的 heap 實例才釋放記憶體 |
 | 8 | release | 你自己的釋放器 | **一定要在第 7 步之後** | 順序顛倒 = use-after-free |
 
@@ -45,7 +45,7 @@ aec_get_last_timing(aec, &t);
 /* t.delay_us t.frontend_us t.linear_us t.steering_us t.res_us ← lib/aec 量 */
 ```
 
-增益串接與合成的耗時是**範例程式自己**在呼叫前後讀時鐘量的（`mono_aec_nr_res/main.c` 的 `process_hop()`
+增益串接與合成的耗時是**範例程式自己**在呼叫前後讀時鐘量的（`mono/aec_nr_res/main.c` 的 `process_hop()`
 與 `timing_now_us()`），不是任何函式庫的 API。
 
 | 欄位 | 涵蓋範圍 |
@@ -130,13 +130,13 @@ hop 上生效：double-talk 期間套用的是 DT 地板（mild/balanced 共用 
 
 mono 的設定分成兩份：lib/aec 的 `AecConfig`（格點與接縫欄位由範例的 `derive_lane()` 填，其餘欄位的預設來自
 `aec_config_from_level()`）與範例程式自己的後級選項（RES gain 用不用、NR 開不開與強度、CNG、`use_r2`、合成），
-後者**不是**任何函式庫的 config struct，是 `mono_aec_nr_res/main.c` 的 `PostPlan` 這類程式內部欄位，決定要不要呼叫、
+後者**不是**任何函式庫的 config struct，是 `mono/aec_nr_res/main.c` 的 `PostPlan` 這類程式內部欄位，決定要不要呼叫、
 要不要建對應的函式庫物件。驗證發生在 `aec_resolve_signal_grid()`（回 `0`）與
 `aec_get_mem_size()`／`anr_get_mem_size()`／`ac_istft_get_mem_size()`（回 `0`）。
 
 ### 4.1 `AecConfig` 的接縫欄位（範例的 `derive_lane()`）
 
-`derive_lane(sample_rate, fft_size, level, &grid, &aec_cfg)`（`mono_aec_nr_res/main.c`）依序做：
+`derive_lane(sample_rate, fft_size, level, &grid, &aec_cfg)`（`mono/aec_nr_res/main.c`）依序做：
 `aec_resolve_signal_grid(sample_rate, fft_size ? fft_size : aec_default_fft_size(sample_rate), &grid)`（回 `0` 即回報失敗）、
 `aec_config_from_level(&aec_cfg, level, sample_rate)`，然後設下表的欄位。`aec_get_mem_size()` 與 `aec_init()` 會用 libaec 自己的驗證器
 再檢查整份 `AecConfig`（回 `0`／`NULL`）。`aec_config_from_level()` 對 8000／16000／48000 以外的取樣率回傳 `fft_size` 與 `filter_length` 皆為 `0` 的不可用設定，`aec_get_mem_size()` 回 `0`、`aec_init()` 回 `NULL`、`aec_create()` 回非 0，函式本身不會溢位。
@@ -165,7 +165,7 @@ mono 的設定分成兩份：lib/aec 的 `AecConfig`（格點與接縫欄位由�
 | NR 強度 | `ANR_LEVEL_BALANCED`（= 2） | `--nr-level mild\|moderate\|balanced\|aggressive`（舊旗標 `--nr-preset` 為別名）：交給 `anr_config_for_level_grid(sr, fft_size, level)`，四級都可用；最小值追蹤視窗 `L` 為函式庫預設，不覆寫 |
 | `use_r2` | 用 | `--legacy-amin`：`use_r2 = 0`，`mono_nr_gain()` 不把 R² 摺進 noise floor（noise-only NR）。只用於比對，新整合請保持用 R² |
 | CNG | 開，與 `aec_cfg.enable_cng`（AEC level 自己的值）取 AND | `--no-cng`：不呼叫 `aec_cng_fill()`。位準再乘該 bin 的 NR gain、下限 −10 dB（範例的 `CNG_NR_GAIN_FLOOR`；NR 看不到 comfort noise，在此補套）；沒有 RES gain 時也不填 |
-| 合成 | 用 | 範例是 `ac_istft_push()` 之後直接輸出；DFN2 的 stage 經 rate bridge 時由 bridge 自己合成、不建 `AcIstft`；stage 直接跑在主機格點時仍由應用建 `AcIstft`（見 `dfn/mono_aec_dfn_res`） |
+| 合成 | 用 | 範例是 `ac_istft_push()` 之後直接輸出；DFN2 的 stage 經 rate bridge 時由 bridge 自己合成、不建 `AcIstft`；stage 直接跑在主機格點時仍由應用建 `AcIstft`（見 `mono/aec_dfn_res`） |
 
 `--aec-only` 不建任何後級、輸出取 `ctx.linear_hop`（[§1.2](integration.md#12---aec-only)）。
 

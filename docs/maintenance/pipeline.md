@@ -43,7 +43,7 @@ make -C pipelines BACKEND=ne10 SIMD=<0-or-1> WERROR=1 test
 #       also run with --delay-num-filters 1 --cng --atten-lim 12, and with
 #       --sample-rate 48000 and 8000, and with --ai-sample-rate 16000
 #       --ai-fft-size 256, the model grid the stage drives directly)
-make -C pipelines/dfn/mono_aec_dfn_res test   # scoped: test_dfn_res_stage,
+make -C pipelines/mono/aec_dfn_res test   # scoped: test_dfn_res_stage,
 #       test_dfn_rate_bridge, test_mono_dfn and the skeleton runs (16 kHz,
 #       48 kHz, 8 kHz, the model-grid flags, the malformed-number and
 #       model-grid refusals); the top-level target
@@ -82,7 +82,7 @@ Pass conditions:
 
 - [ ] At a 48 kHz host, with no model (or a failing one), the example output is
       byte-equal to the hand-written conventional chain
-      (`mono_aec_nr_res/tests/conv_chain_mono.h`) with the denoiser off,
+      (`mono/aec_nr_res/tests/conv_chain_mono.h`) with the denoiser off,
       delayed by exactly two hops (`M + D` for the build's pair), with comfort
       noise OFF and ON, across an AEC delay change.
 - [ ] The stimulus actually engages RES (`min G_res < 0.9`), so an
@@ -115,7 +115,7 @@ Pass conditions:
 
 ## 9. Four-channel pipeline gate
 
-From `Audio_ALG/pipelines/4ch_aec_bf_nr_res/`, run both SIMD 0/1
+From `Audio_ALG/pipelines/4ch/`, run both SIMD 0/1
 combinations:
 
 ```bash
@@ -126,7 +126,7 @@ make BACKEND=ne10 SIMD=<0-or-1> WERROR=1 test
 From `Audio_ALG/`:
 
 ```bash
-python3 -m pytest -q pipelines/4ch_aec_bf_nr_res/tests
+python3 -m pytest -q pipelines/4ch/tests
 ```
 
 Pass conditions:
@@ -145,7 +145,7 @@ Pass conditions:
       example programs initialise and chain (the RES is an `AecRes` created with the
       `aec_res_*` functions of lib/aec), and the flow plus the examples' per-hop chain equals
       the hand-written reference chain bit for bit (`test_mcab_sample_beam`, oracle
-      `4ch_aec_bf_nr_res/tests/conv_chain_mcab.h`).
+      `4ch/tests/conv_chain_mcab.h`).
 - [ ] `libaudio_pipeline_mcab.a` holds `mcab.o` only and references no SRP-PHAT/BF symbol; the
       sample helpers (`mcab_sample_flow.o`, `mcab_sample_beam.o`) are not in it.
 - [ ] `make libaudio_pipeline_mcab.a` builds with `NR_DIR` absent (the archive needs only audiolib common and
@@ -155,17 +155,17 @@ Pass conditions:
 
 ### 9.0 Four-channel DeepFilterNet2 variant (`4ch_aec_bf_dfn_res`)
 
-`make -C pipelines/4ch_aec_bf_nr_res test` also builds and runs the DFN2
+`make -C pipelines/4ch test` also builds and runs the DFN2
 example over `mcab` plus the sample beam helper (real SRP-PHAT/BF; the post-beam RES is an `AecRes`
 the example creates itself; no denoiser; the host synthesis is the example's `AcIstft` on the
 stage path and the bridge's own otherwise; `dfn/dfn_hop.h`):
 
 ```bash
-make -C pipelines/4ch_aec_bf_nr_res BACKEND=ne10 SIMD=<0-or-1> WERROR=1 test
+make -C pipelines/4ch BACKEND=ne10 SIMD=<0-or-1> WERROR=1 test
 # adds: test_4ch_dfn, 4ch_aec_bf_dfn_res (board skeleton at its 16 kHz
 #       default, also run with --delay-num-filters 1 --cng --atten-lim 12,
 #       with --sample-rate 48000 and with --ai-sample-rate 16000 --ai-fft-size 256)
-make -C pipelines/dfn/4ch_aec_bf_dfn_res test   # scoped: test_4ch_dfn and the
+make -C pipelines/4ch/aec_bf_dfn_res test   # scoped: test_4ch_dfn and the
 #       skeleton runs (16 kHz, 48 kHz, the model-grid flags, the malformed-number,
 #       8 kHz and model-grid refusals); the rate bridge's own unit test lives under the mono target
 #       (`make -C pipelines test`, section 8.1). Run both before a release.
@@ -177,7 +177,7 @@ Pass conditions:
 
 - [ ] At a 48 kHz host, with no model (or a failing one), the example output is
       byte-equal to the hand-written conventional chain
-      (`4ch_aec_bf_nr_res/tests/conv_chain_mcab.h`, fed the sample helper's beam weights
+      (`4ch/tests/conv_chain_mcab.h`, fed the sample helper's beam weights
       and beamformed spectrum) with the denoiser off,
       delayed by exactly two hops (`M + D` for the build's pair), with comfort
       noise OFF and ON, across an AEC delay change.

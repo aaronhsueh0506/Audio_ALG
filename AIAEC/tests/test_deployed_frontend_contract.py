@@ -8,7 +8,7 @@ another behaviour hash, another filter length) with the same tensors passes it.
 That shape-only check is NOT sufficient; this file is the gate that is:
 
 * the AEC configuration the deployed mono lane builds
-  (pipelines/ulcnet/mono_alignulcnet/main.c ``derive_lane``, compiled into
+  (pipelines/mono/alignulcnet/main.c ``derive_lane``, compiled into
   tests/deployed_lane_dump.c, not copied) equals the contract on every
   supported grid (frontend_gate.lane_mismatches);
 * an exported graph's JSON sidecar carries the compiled
@@ -54,7 +54,7 @@ _AIAEC_DIR = os.path.dirname(_THIS_DIR)
 _ALG_DIR = os.path.dirname(_AIAEC_DIR)
 _ULCNET_DIR = os.path.join(_AIAEC_DIR, '..', 'lib', 'aiaec', 'ulcnet')
 _PIPELINES_DIR = os.path.join(_ALG_DIR, 'pipelines')
-_LANE_MAIN = os.path.join(_PIPELINES_DIR, 'ulcnet', 'mono_alignulcnet', 'main.c')
+_LANE_MAIN = os.path.join(_PIPELINES_DIR, 'mono', 'alignulcnet', 'main.c')
 _AEC_C_DIR = os.path.join(_ALG_DIR, 'lib', 'aec', 'c_impl')
 _AC_DIR = os.path.abspath(os.path.join(_ALG_DIR, '..', 'audiolib', 'common'))
 

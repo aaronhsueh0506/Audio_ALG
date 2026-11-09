@@ -1,5 +1,5 @@
 /* Command-line handling shared by the DFN2 board skeletons
- * (dfn/mono_aec_dfn_res/main.c, dfn/4ch_aec_bf_dfn_res/main.c): the host grid, the DFN2 model
+ * (mono/aec_dfn_res/main.c, 4ch/aec_bf_dfn_res/main.c): the host grid, the DFN2 model
  * grid (--ai-sample-rate / --ai-fft-size, a row of the table below built into a DFN2Grid with
  * dfn2_grid_make()), delay profile (common/example_cli.h), the exported ERB matrices, DFN2
  * attenuation limit and the comfort-noise switch (off by default). Header-only; not linked into

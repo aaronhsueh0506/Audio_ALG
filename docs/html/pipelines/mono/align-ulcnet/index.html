@@ -11,7 +11,7 @@
 <main>
 <h1>Mono · Align-ULCNet</h1>
 <h2>概要</h2>
-<p><code>pipelines/ulcnet/mono_alignulcnet/main.c</code>:範例直接組合 lib/aec 的 <code>Aec</code>(線性 AEC,<code>aec_process_context()</code>)與範例 stage <code>pipelines/ulcnet/ulcnet_nn_stage.{h,c}</code>(Align-ULCNet 神經後濾波),各有自己的 <code>mem_size</code> 與 <code>init</code>(<code>aec_get_mem_size()</code>、<code>ulcnet_nn_stage_mem_size(&amp;grid, 1)</code>)。stage 經 <code>ulcnet_process.h</code> 的 <code>UlcnetModel</code> 每幀 callback 驅動外部 NPU runtime;它只擁有已驗證的 C 前後處理(rolling center=False sqrt-Hann STFT、每 hop 恰一幀且至多一次推論、WOLA)與模型周邊的 delay-state policy。stage 是範例碼:沒有 ABI、沒有 layout version、沒有 descriptor。格點是執行期值:應用端把模型匯出時的 (取樣率, n_fft, delay depth D) 填進 <code>UlcnetGridSpec</code>,經 <code>ulcnet_grid_make()</code> 得 <code>UlcnetGrid</code>(<b>16 kHz / 512 / hop 256 / 257 bins</b>或<b>48 kHz / 1024 / hop 512 / 513 bins</b>),它同時決定 lane、stage 與 adapter;<code>main.c</code> 以 <code>--sample-rate 16000|48000</code> 從兩列的表選,同一個 binary 兩者都能跑。lane 以該 grid 建立(<code>derive_lane()</code>:<code>aec_config_from_level()</code> 加 <code>fft_size = grid.n_fft</code>)。</p>
+<p><code>pipelines/mono/alignulcnet/main.c</code>:範例直接組合 lib/aec 的 <code>Aec</code>(線性 AEC,<code>aec_process_context()</code>)與範例 stage <code>pipelines/ulcnet/ulcnet_nn_stage.{h,c}</code>(Align-ULCNet 神經後濾波),各有自己的 <code>mem_size</code> 與 <code>init</code>(<code>aec_get_mem_size()</code>、<code>ulcnet_nn_stage_mem_size(&amp;grid, 1)</code>)。stage 經 <code>ulcnet_process.h</code> 的 <code>UlcnetModel</code> 每幀 callback 驅動外部 NPU runtime;它只擁有已驗證的 C 前後處理(rolling center=False sqrt-Hann STFT、每 hop 恰一幀且至多一次推論、WOLA)與模型周邊的 delay-state policy。stage 是範例碼:沒有 ABI、沒有 layout version、沒有 descriptor。格點是執行期值:應用端把模型匯出時的 (取樣率, n_fft, delay depth D) 填進 <code>UlcnetGridSpec</code>,經 <code>ulcnet_grid_make()</code> 得 <code>UlcnetGrid</code>(<b>16 kHz / 512 / hop 256 / 257 bins</b>或<b>48 kHz / 1024 / hop 512 / 513 bins</b>),它同時決定 lane、stage 與 adapter;<code>main.c</code> 以 <code>--sample-rate 16000|48000</code> 從兩列的表選,同一個 binary 兩者都能跑。lane 以該 grid 建立(<code>derive_lane()</code>:<code>aec_config_from_level()</code> 加 <code>fft_size = grid.n_fft</code>)。</p>
 <p class="note">兩路 analysis 都由 rolling center=False 的 <code>AcStft</code>(<code>center</code> 0,<code>ac_stft_push_planar()</code>)驅動——自 hop#0 起每 hop 恰一幀、每 hop 至多一次推論。端到端延遲 1 hop;<code>ULCNET_NN_STAGE_REPRIME_FRAMES</code> 是 1,每 hop 遞減;幀 scratch 為 1 幀。</p>
 <h3>ONNX / NPU graph 邊界</h3>
 <table>
@@ -57,7 +57,7 @@ ulcnet_nn_stage_process(stage, out);                                 /* 已安�
 <pre>ulcnet_nn_stage_process(stage, out)
  = begin → [nn_begin → 模型 → nn_end] → end
 
-主程式(ulcnet/mono_alignulcnet/main.c 的 process_hop())
+主程式(mono/alignulcnet/main.c 的 process_hop())
  ├─ aec_process_context(aec, mic, ref)            context-only 線性 AEC
  ├─ aec_get_res_context(aec, &amp;rctx)               error tap = rctx.formed_hop
  ├─ aec_get_linear_context(aec, &amp;lctx)            far tap = 呼叫端 ref + lctx.delay_state

@@ -3,6 +3,58 @@
 `Audio_ALG/pipelines`（含它建置的 `AINR`、`AIAEC` C 程式）的重要改動記錄在此，格式依
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/)。README 只寫現況，改動經過寫在這裡。
 
+## [Unreleased] — 2026-11-09 — Pipeline layout: top-level split into `mono/` and `4ch/`, one directory per application chain
+
+The flat layout mixed two things per NN family (`dfn/`, `ulcnet/`: shared stage infra plus a
+mono *and* a 4-channel example subdirectory each) with two already-separate conventional chains
+(`mono_aec_nr_res/`, `4ch_aec_bf_nr_res/` — the latter was also the mcab flow's actual home, reached
+into by the other two 4-channel examples via `#include "4ch_aec_bf_nr_res/mcab*.h"`). Renamed with
+`git mv` (history preserved) to one topology-first split:
+
+```
+pipelines/mono/{aec_nr_res,aec_dfn_res,alignulcnet}/   # was mono_aec_nr_res/, dfn/mono_aec_dfn_res/, ulcnet/mono_alignulcnet/
+pipelines/4ch/{aec_bf_dfn_res,alignulcnet}/            # was dfn/4ch_aec_bf_dfn_res/, ulcnet/4ch_alignulcnet/
+pipelines/4ch/                                          # was 4ch_aec_bf_nr_res/ itself: the mcab flow (mcab*.{c,h},
+                                                          # pipeline.py, evaluate_recordings.py, Makefile) now sits one
+                                                          # level up from the two example chains that reach into it,
+                                                          # instead of being reached into through a sibling-example's own
+                                                          # directory name
+```
+
+`pipelines/dfn/` and `pipelines/ulcnet/` keep only their shared, model-family infra (the stage/
+bridge code, Python twins, shared tests) now that both chains per family moved out. No source
+code changed — this is a path move plus the follow-on fixes it forced:
+
+### Fixed
+- `pipelines/mono/aec_nr_res/pipeline.py`'s `_ROOT` was `dirname()` x3 off `__file__`, correct
+  when the file was one level under `pipelines/` (`mono_aec_nr_res/pipeline.py`); moving it one
+  level deeper (`mono/aec_nr_res/pipeline.py`) needed x4, or it silently resolved to
+  `pipelines/lib/nr/...` instead of `Audio_ALG/lib/nr/...` and `load_config` raised
+  `FileNotFoundError` (caught by `pipelines/tests/pyc_parity_pipelines.sh`'s `a.nr4.*`/`d.mono.*`
+  rows going `NOT_RUN`, not by any Python import error). The other moved `pipeline.py`/test files
+  kept the same nesting depth under `pipelines/` (e.g. `dfn/mono_aec_dfn_res/` -> `mono/aec_dfn_res/`
+  is still two levels down), so none of them needed this fix.
+- Six doc pages still quoted `DFN_RES_STAGE_LAYOUT_VERSION`/`DFN_RATE_BRIDGE_LAYOUT_VERSION = 5`
+  and `DFN2_PREPOST_CARVE_VERSION = 11` (the prior entry below bumped both to 6 and 12 in code but
+  missed these pages); `docs/html/models/dfn2/reference/grid.html`'s `build_flags_hash` field list
+  also still named the seven removed feature-normaliser fields instead of the two norm alphas and
+  two STFT-scale functions that replaced them. All now match
+  (`pipelines/tests/test_doc_layout_versions.py`).
+
+### Notes
+- Every `make -C <dir>` directory argument, `#include "<old>/..."` path, Python dotted-module
+  import string (`pipelines.<old>.pipeline`), and `pathlib`/`os.path` path-join literal referencing
+  one of the six moved directories was updated across `pipelines/`, `AINR/`, `AIAEC/`, `docs/`,
+  `CLAUDE.md` and `.gitignore` (already correct). Make *goal*/*binary* names (`mono_alignulcnet`,
+  `4ch_aec_bf_dfn_res`, …) are unchanged — only the directories moved, not what `make` calls them.
+  `lib/aec`'s and `lib/nr`'s own docs mention a couple of these paths too; left alone this round
+  (separate repos, already carrying unrelated uncommitted changes).
+- Verified: `make -C pipelines test` and `make -C pipelines/4ch test` both exit 0;
+  `pipelines/tests/pyc_parity_pipelines.sh` now reports `RESULT: OK` (91 PASS, 1 SKIP, was 6
+  NOT_RUN before the `_ROOT` fix); `test_doc_layout_versions.py`/`test_c_python_map.py` pass;
+  a filename-cross-reference sweep of every `.py`/`.c`/`.h`/`.sh` under `pipelines/` found no
+  dead files.
+
 ## [Unreleased] — 2026-11-08 — DFN2 grid: the feature-normaliser settings and FFT scale become fixed, not carried fields
 
 ### Changed

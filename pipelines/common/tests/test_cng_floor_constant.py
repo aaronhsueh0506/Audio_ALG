@@ -15,25 +15,25 @@ C_DEFINE = re.compile(r'^#define\s+\w*CNG_NR_GAIN_FLOOR\s+([0-9.]+)f\s*$', re.MU
 
 # Files that must each define the floor exactly once (a site that disappears fails the test).
 C_SITES = [
-    '4ch_aec_bf_nr_res/mcab_sample_post.h',
-    '4ch_aec_bf_nr_res/tests/conv_chain_mcab.h',
-    'mono_aec_nr_res/main.c',
-    'mono_aec_nr_res/example_board_adapter.c',
-    'mono_aec_nr_res/tests/test_mono_chain.c',
-    'mono_aec_nr_res/tests/test_no_stdio_stack.c',
-    'mono_aec_nr_res/tests/conv_chain_mono.h',
-    'dfn/mono_aec_dfn_res/main.c',
-    'dfn/mono_aec_dfn_res/tests/test_mono_dfn.c',
+    '4ch/mcab_sample_post.h',
+    '4ch/tests/conv_chain_mcab.h',
+    'mono/aec_nr_res/main.c',
+    'mono/aec_nr_res/example_board_adapter.c',
+    'mono/aec_nr_res/tests/test_mono_chain.c',
+    'mono/aec_nr_res/tests/test_no_stdio_stack.c',
+    'mono/aec_nr_res/tests/conv_chain_mono.h',
+    'mono/aec_dfn_res/main.c',
+    'mono/aec_dfn_res/tests/test_mono_dfn.c',
     'tests/test_readme_flow.c',
     'tests/pyc_parity/pyc_drv.c',
 ]
 
 OTHER_SITES = {
-    'python twin': (ROOT / 'mono_aec_nr_res' / 'pipeline.py',
+    'python twin': (ROOT / 'mono' / 'aec_nr_res' / 'pipeline.py',
                     r'^CNG_NR_GAIN_FLOOR\s*=\s*([0-9.]+)\s*$'),
-    'mono witness': (ROOT / 'mono_aec_nr_res' / 'tests' / 'test_mono_chain.c',
+    'mono witness': (ROOT / 'mono' / 'aec_nr_res' / 'tests' / 'test_mono_chain.c',
                      r'const double floor_amp = ([0-9.]+),'),
-    '4ch witness': (ROOT / '4ch_aec_bf_nr_res' / 'tests' / 'test_mcab.c',
+    '4ch witness': (ROOT / '4ch' / 'tests' / 'test_mcab.c',
                     r'const double floor_amp = ([0-9.]+),'),
 }
 
@@ -64,5 +64,5 @@ def test_cng_floor_is_one_value_everywhere():
 
 
 def test_cng_floor_is_minus_ten_db():
-    value = float(_declared(ROOT / '4ch_aec_bf_nr_res' / 'mcab_sample_post.h', C_DEFINE.pattern))
+    value = float(_declared(ROOT / '4ch' / 'mcab_sample_post.h', C_DEFINE.pattern))
     assert abs(value - 10.0 ** (-10.0 / 20.0)) < 1e-7

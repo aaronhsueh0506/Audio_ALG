@@ -7,4 +7,4 @@
 | 自備 beamformer、只取前端或串自有後級 | [初始化與 per-hop 範例](integration.md) → [格點、記憶體與設定](config.md) → [錯誤與 descriptor](errors.md) |
 | 使用內附 SRP／BF sample helper | [beam helper 的 C 範例與生命週期](beam.md) → [參數](beam-settings.md) → [錯誤與相容](beam-errors.md) |
 
-MCAB 由 `make -C pipelines/4ch_aec_bf_nr_res` 建置，提供 `libaudio_pipeline_mcab.a`。模型的 PCM stream SDK 可以各自使用。[四聲道路由](../../html/pipelines/index.html)
+MCAB 由 `make -C pipelines/4ch` 建置，提供 `libaudio_pipeline_mcab.a`。模型的 PCM stream SDK 可以各自使用。[四聲道路由](../../html/pipelines/index.html)

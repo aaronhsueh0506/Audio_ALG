@@ -59,12 +59,12 @@ TOL2 = {                     # Layer 2: shipped (fast-math, NEON) against std-ma
 }
 
 SOURCES = [   # hashed into the JSON so a result can be tied to the code it judged
-    'Audio_ALG/pipelines/4ch_aec_bf_nr_res/mcab.c',
-    'Audio_ALG/pipelines/4ch_aec_bf_nr_res/pipeline.py',
-    'Audio_ALG/pipelines/mono_aec_nr_res/pipeline.py',
+    'Audio_ALG/pipelines/4ch/mcab.c',
+    'Audio_ALG/pipelines/4ch/pipeline.py',
+    'Audio_ALG/pipelines/mono/aec_nr_res/pipeline.py',
     'Audio_ALG/pipelines/common/cng_aec3.py',
-    'Audio_ALG/pipelines/4ch_aec_bf_nr_res/mcab.h',
-    'Audio_ALG/pipelines/4ch_aec_bf_nr_res/mcab_sample_post.h',
+    'Audio_ALG/pipelines/4ch/mcab.h',
+    'Audio_ALG/pipelines/4ch/mcab_sample_post.h',
     'Audio_ALG/pipelines/tests/pyc_parity/pyc_drv.c',
     'Audio_ALG/lib/aec/c_impl/src/aec_res.c',
 ]
@@ -224,11 +224,11 @@ class Ctx:
 
     @property
     def P(self):
-        return self.mod('pipelines.mono_aec_nr_res.pipeline')
+        return self.mod('pipelines.mono.aec_nr_res.pipeline')
 
     @property
     def M4(self):
-        return self.mod('pipelines.4ch_aec_bf_nr_res.pipeline')
+        return self.mod('pipelines.4ch.pipeline')
 
     # ---- C drivers
     def drv(self, layer, kind):
@@ -399,7 +399,7 @@ def quiet():
 
 
 def py_nr(cx, seam, usable, nr_preset='balanced'):
-    """mono_aec_nr_res.pipeline.run_nr_spectrum over a recorded seam, usable_linear from `usable`.
+    """mono.aec_nr_res.pipeline.run_nr_spectrum over a recorded seam, usable_linear from `usable`.
 
     run_nr_spectrum estimates on output_base_spec. The mono chain's denoiser reads the rendering base B; the 4ch
     denoiser reads the analysis beam E (mcab_sample_anr_gain), so a 4ch seam hands Python E there."""
@@ -705,7 +705,7 @@ def mono_cng_twin_out(cx, seam, cn_floor, follow_reset=True):
     """Python reset event / min / apply / comfort noise (cng_aec3 twin of aec_cng_fill) / OLA over a C seam.
 
     The base is the rendering base of the hop (Y on a guard hop, else E); a new post-reset serial clears the OLA tail and
-    restarts the comfort noise before the hop's first draw, as mono_aec_nr_res/main.c does."""
+    restarts the comfort noise before the hop's first draw, as mono/aec_nr_res/main.c does."""
     from pipelines.common.cng_aec3 import Aec3ComfortNoise
     P = cx.P
     nf, hop = seam.nf, seam.hop
@@ -746,7 +746,7 @@ def sec_d(cx, g, sr, fft, want):
         out_py = mono_cng_twin_out(cx, nocng, None)
         m = stats(nocng.out, out_py)
         rows.append(make_row(pre + 'min_apply_ola', 1, 'mono min / apply / OLA: Python total_gain, apply_gain, synthesize_hop over the C seam and C gains vs C output (CNG off)',
-                             prod + ' enable_cng=0; mono_aec_nr_res.pipeline.total_gain/apply_gain/synthesize_hop', gate=m['max_abs'] <= tol_out,
+                             prod + ' enable_cng=0; mono.aec_nr_res.pipeline.total_gain/apply_gain/synthesize_hop', gate=m['max_abs'] <= tol_out,
                              metrics=m, tol={'max_abs': tol_out}, grid=g, ref='Python'))
     if want(pre + 'cng_glue'):
         cng = c_mono(cx, 1, g, sr, fft, tag='cng', enable_cng=1)
@@ -799,7 +799,7 @@ def sec_d_global(cx, want):
         r = subprocess.run([cx.drv(1, 'mono'), 'probe', 'sr=8000', 'fft=0'], stdout=subprocess.PIPE, stderr=subprocess.PIPE)
         c_line = r.stdout.decode(errors='replace').strip()
         m = {'python_supports_8k': not raised, 'python_message': msg, 'c_accepts_8k': r.returncode == 0, 'c_probe': c_line}
-        rows.append(make_row('d.mono.8k', 1, 'mono at 8 kHz', 'mono_aec_nr_res.pipeline._project_grid(8000); pyc_drv_mono probe sr=8000', skip=True,
+        rows.append(make_row('d.mono.8k', 1, 'mono at 8 kHz', 'mono.aec_nr_res.pipeline._project_grid(8000); pyc_drv_mono probe sr=8000', skip=True,
                              metrics=m, grid=None, ref='Python',
                              note='SKIP: Python mono pipeline admits only 16000 and 48000 Hz (%s); C mono at 8 kHz: %s (C only, documented) -- no reference to compare' % (msg, c_line)))
     return rows
@@ -863,7 +863,7 @@ def run_cng_c(cx, exe, n, rng, floor, spec, cn, gr, gn, use_gnr):
 
 
 def cng_pipeline(cx):
-    """mono_aec_nr_res.pipeline.comfort_noise_fill against the C fill, 400 hops with carried generator state."""
+    """mono.aec_nr_res.pipeline.comfort_noise_fill against the C fill, 400 hops with carried generator state."""
     from pipelines.common.cng_aec3 import SEED
     P = cx.P
     rs = np.random.RandomState(1)
@@ -882,8 +882,8 @@ def cng_pipeline(cx):
         worst = max(worst, float(np.max(np.abs(sp - sc))))
         bad += int(not np.array_equal(sp, sc))
     m = {'hops': 400, 'bit_exact_hops': 400 - bad, 'max_abs': worst, 'rng_equal': rng_p == rng_c}
-    return make_row('d.mono.cng_pipeline', 1, 'mono comfort-noise fill of mono_aec_nr_res/pipeline.py vs C aec_cng_fill (bit exact)',
-                    'mono_aec_nr_res.pipeline.comfort_noise_fill vs pyc_drv_mono cng, 400 hops, n=513', gate=(bad == 0 and rng_p == rng_c),
+    return make_row('d.mono.cng_pipeline', 1, 'mono comfort-noise fill of mono/aec_nr_res/pipeline.py vs C aec_cng_fill (bit exact)',
+                    'mono.aec_nr_res.pipeline.comfort_noise_fill vs pyc_drv_mono cng, 400 hops, n=513', gate=(bad == 0 and rng_p == rng_c),
                     metrics=m, tol={'max_abs': TOL1['cng_abs']}, ref='Python',
                     note='the pipeline fill is the AEC library\'s own generator (seed AEC_CNG_SEED); no look-alike remains')
 

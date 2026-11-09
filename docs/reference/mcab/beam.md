@@ -126,19 +126,19 @@ int main(void) {
 將範例存成 Audio_ALG 根目錄的 `app.c`。以下使用預設的 sibling 依賴。
 
 ```sh
-make -C pipelines/4ch_aec_bf_nr_res libs
-make -C pipelines/4ch_aec_bf_nr_res libaudio_pipeline_mcab.a
+make -C pipelines/4ch libs
+make -C pipelines/4ch libaudio_pipeline_mcab.a
 common_dir="$(cd ../audiolib/common && pwd)"
 common="$(make -s -C "$common_dir" print-lib-path)"
-obj="$(make -s -C pipelines/4ch_aec_bf_nr_res print-obj-dir)"
+obj="$(make -s -C pipelines/4ch print-obj-dir)"
 cc -std=gnu99 -O2 -Wall -Wextra -c app.c -o app.o \
   -I ../AEC/c_impl/include -I ../NR/c_impl/include \
   -I ../audiolib/common/include -I ../audiolib/common \
-  -I pipelines/4ch_aec_bf_nr_res \
+  -I pipelines/4ch \
   -I ../audiolib/DOA -I ../audiolib/BF
 c++ -o app app.o \
   "$obj/mcab_sample_beam.o" "$obj/mcab_sample_flow.o" \
-  "$(make -s -C pipelines/4ch_aec_bf_nr_res print-lib-path)" \
+  "$(make -s -C pipelines/4ch print-lib-path)" \
   "$(make -s -C ../audiolib print-doa-lib-path)" \
   "$(make -s -C ../audiolib print-bf-lib-path)" \
   "$(make -s -C ../audiolib print-spatial-common-lib-path)" \
@@ -149,9 +149,9 @@ c++ -o app app.o \
 ```
 
 要接 ULCNet 後濾波時，不呼叫 `mcab_sample_beam_fuse()`、`enable_post = 0`，把 `beam.spectrum`、同一次呼叫的**原始** far hop 與
-`info.delay.changed`／`info.delay.solid` 交給 `ulcnet_nn_stage_begin_complex()`（見 `pipelines/ulcnet/4ch_alignulcnet/README.md`）。
+`info.delay.changed`／`info.delay.solid` 交給 `ulcnet_nn_stage_begin_complex()`（見 `pipelines/4ch/alignulcnet/README.md`）。
 
-要自己寫 init 順序（不用 `mcab_sample_flow_*`）：照 `mcab.h` 檔頭註解與 `pipelines/4ch_aec_bf_nr_res/mcab_static.c` 的
+要自己寫 init 順序（不用 `mcab_sample_flow_*`）：照 `mcab.h` 檔頭註解與 `pipelines/4ch/mcab_static.c` 的
 `unit_plan()`／`unit_init()`／`unit_destroy()`（[§3](#3-lifecycle) 表列其步驟）。
 
 ## 3. Lifecycle

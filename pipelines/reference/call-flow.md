@@ -14,7 +14,7 @@
 加總額外延遲同樣是 **1 hop**（唯一來源是 ULCNet synthesis WOLA）：mono 與
 4ch 變體都是——4ch 把 BF 的 beamformed error 頻譜直接當成模型的分析幀，
 沒有中間的 beam WOLA→再 analysis 來回，也沒有 one-hop far 補償。細節見
-[`ulcnet/4ch_alignulcnet/README.md`](../ulcnet/4ch_alignulcnet/README.md)。
+[`4ch/alignulcnet/README.md`](../4ch/alignulcnet/README.md)。
 
 The two DFN2 applications have an algorithmic latency of `M + D + 1` hops on a 48 kHz host (`M` = mask lookahead, `D` =
 deep-filter lookahead, fixed by the model and carried by the `DFN2Grid` in the stage config; the shipped 1/1 pair gives 3 hops, 32 ms). Below 48 kHz the rate bridge is used and
@@ -63,11 +63,11 @@ there rather than editing it here, and always prefer the values `aec_get_mem_siz
 
 Every application analyses once per hop. The front end returns its context spectra as one borrowed
 view: `AecResContext` ([`aec.h`](../../lib/aec/c_impl/include/aec.h); read with `aec_get_res_context()` after
-`aec_process_context()`) for the mono `Aec`, and `McabFrame` ([`mcab.h`](../4ch_aec_bf_nr_res/mcab.h); filled
+`aec_process_context()`) for the mono `Aec`, and `McabFrame` ([`mcab.h`](../4ch/mcab.h); filled
 by `mcab_fuse()`) for the 4-channel flow. Each later stage is a plain function over that view, and the
 application writes the combination itself; each example `main` shows it (`mono_form()` in
-[`mono_aec_nr_res/main.c`](../mono_aec_nr_res/main.c), `raw_chain()` in
-[`mcab_raw.c`](../4ch_aec_bf_nr_res/mcab_raw.c)):
+[`mono/aec_nr_res/main.c`](../mono/aec_nr_res/main.c), `raw_chain()` in
+[`mcab_raw.c`](../4ch/mcab_raw.c)):
 
 ```
 mono:  mic/ref ─► Aec ─► AecResContext { error_spec, near_spec, far_spec, r2, comfort_noise, res_gain, usable_linear, ... }
@@ -101,9 +101,9 @@ There is no independent time-domain RES filter after NR and no function-pointer
 table of stages: `G_res` comes with the linear residual (mono, inside the AEC call) or from the application's own `AecRes`
 (4-ch, through `aec_res_process()` after `mcab_fuse()`), is fused with `G_nr` by `sk_min_f32` and applied once to
 `E(f)`. Which stages exist, in which order, is read straight from each example's per-hop
-function ([`main.c`](../mono_aec_nr_res/main.c) `process_hop()` / `mono_form()`,
-[`mcab_raw.c`](../4ch_aec_bf_nr_res/mcab_raw.c) `raw_post()` / `raw_chain()`). The 4-channel
-programs share two small header-only helpers, [`mcab_sample_post.h`](../4ch_aec_bf_nr_res/mcab_sample_post.h)
+function ([`main.c`](../mono/aec_nr_res/main.c) `process_hop()` / `mono_form()`,
+[`mcab_raw.c`](../4ch/mcab_raw.c) `raw_post()` / `raw_chain()`). The 4-channel
+programs share two small header-only helpers, [`mcab_sample_post.h`](../4ch/mcab_sample_post.h)
 (`mcab_sample_res_input()`, `mcab_sample_anr_gain()`, `MCAB_SAMPLE_CNG_NR_GAIN_FLOOR`,
 `MCAB_SAMPLE_CNG_RNG_SEED`; tested by `test_mcab_sample_post`); the mono examples keep their own
 `#define`s (`CNG_NR_GAIN_FLOOR`, `PSD_SCALE_INV`) in the file and start the comfort noise from the library's
@@ -126,7 +126,7 @@ Write it as a gain-type function over the frame and put its result into the
 `sk_min_f32` chain. The example below is compiled and run by
 [`tests/test_readme_flow.c`](../tests/test_readme_flow.c) (`make test_readme_flow`):
 with a unity stage the chain is bit-identical to the hand-written chain of
-[`mono_aec_nr_res/tests/conv_chain_mono.h`](../mono_aec_nr_res/tests/conv_chain_mono.h).
+[`mono/aec_nr_res/tests/conv_chain_mono.h`](../mono/aec_nr_res/tests/conv_chain_mono.h).
 
 ```c
 typedef struct HfTilt { int bin_hi; float amount; float* g; } HfTilt;   /* g: n_freqs floats, caller memory */
@@ -275,7 +275,7 @@ spectra, the caller computes mask, `vad_raw` and `vad_out`,
 `McabSampleBeamInfo` (DOA, BF adaptation state and `info.delay`).
 `mcab_sample_beam_process_with_activity()` is `process_front()` +
 `process_beam(front, v, v, NULL)`; see
-[`ulcnet/4ch_alignulcnet/README.md`](../ulcnet/4ch_alignulcnet/README.md). The stage reads the flow's
+[`4ch/alignulcnet/README.md`](../4ch/alignulcnet/README.md). The stage reads the flow's
 `front.delay` (`changed`, `solid`) and the caller's raw far hop; nothing else crosses.
 
 Fail-open is part of the contract, not an option: a non-zero result, an output

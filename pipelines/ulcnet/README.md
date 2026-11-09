@@ -11,8 +11,8 @@ quantized zeros when `ulcnet_accelerator_adapter_state_generation()` changes.
 |---|---|
 | `ulcnet_nn_stage.{h,c}` | The post-filter stage: far-end STFT, model call policy (identity reprime after an alignment event, fail-open), WOLA. |
 | `tests/test_ulcnet_nn_stage.c` | The stage on its own (framing, model policy, WOLA, grid and pool plan), on every grid of its table. |
-| `mono_alignulcnet/` | Mono example: lib/aec's `Aec` (linear stage only) -> the stage. `tests/test_mono_ulcnet.c`. |
-| `4ch_alignulcnet/` | 4-channel example: the mcab flow (`enable_post = 0`) and the sample SRP-PHAT/BF helper -> the stage. `tests/test_4ch_ulcnet.c`. |
+| `mono/alignulcnet/` (sibling, not under this folder) | Mono example: lib/aec's `Aec` (linear stage only) -> the stage. `tests/test_mono_ulcnet.c`. |
+| `4ch/alignulcnet/` (sibling, not under this folder) | 4-channel example: the mcab flow (`enable_post = 0`) and the sample SRP-PHAT/BF helper -> the stage. `tests/test_4ch_ulcnet.c`. |
 
 ## How the examples are called
 
@@ -46,19 +46,19 @@ profile flags and the sample rate of the mains, `D` of the exported graph);
 
 ## Build and test
 
-The mono program is built by `pipelines/Makefile`, the 4-channel one by `4ch_aec_bf_nr_res/Makefile`
+The mono program is built by `pipelines/Makefile`, the 4-channel one by `4ch/Makefile`
 (it links the mcab flow):
 
 ```sh
 make -C pipelines mono_alignulcnet test_mono_ulcnet test_ulcnet_nn_stage      # mono example, stage test
-make -C pipelines/4ch_aec_bf_nr_res 4ch_alignulcnet test_4ch_ulcnet           # 4-channel example
+make -C pipelines/4ch 4ch_alignulcnet test_4ch_ulcnet           # 4-channel example
 ```
 
 `test_ulcnet_nn_stage`, `test_mono_ulcnet` and `test_4ch_ulcnet` each run every grid of their table
 (16 kHz / fft 512 and 48 kHz / fft 1024) from one binary.
 
-`mono_alignulcnet/Makefile` and `4ch_alignulcnet/Makefile` are thin forwarders:
-`make -C pipelines/ulcnet/mono_alignulcnet test` and `make -C pipelines/ulcnet/4ch_alignulcnet test`
+`mono/alignulcnet/Makefile` and `4ch/alignulcnet/Makefile` are thin forwarders:
+`make -C pipelines/mono/alignulcnet test` and `make -C pipelines/4ch/alignulcnet test`
 run that example's tests and the board skeleton at n=5 and n=1 on both grids (`--sample-rate`), and
 check that malformed numbers (`--delay-num-filters 3x`, `--fixed-delay 12x`, `--sample-rate 16000x`)
 and a rate that is not a shipped grid exit with 2. Both parse numbers with
@@ -70,10 +70,10 @@ and a rate that is not a shipped grid exit with 2. Both parse numbers with
   example takes its lane config straight from lib/aec (`aec_config_from_level()`).
 - lib/aec (`Aec`), audiolib `audio_common` (STFT/ISTFT) and `AIAEC/Align_ULCNet`
   (`ulcnet_process`, `ulcnet_model_io`, `ulcnet_prepost`, `ulcnet_accelerator_adapter`).
-- The 4-channel example also needs the mcab flow in `4ch_aec_bf_nr_res/` (`mcab.h`, archive
+- The 4-channel example also needs the mcab flow in `4ch/` (`mcab.h`, archive
   `libaudio_pipeline_mcab.a` with `mcab.o` only) and its sample objects `mcab_sample_flow`,
   `mcab_sample_beam` and `mcab_sample_driver`, which are linked into the program and are not part of
   the archive.
 
 Includes across directories are written from the `pipelines/` root (`"ulcnet/ulcnet_nn_stage.h"`,
-`"common/example_cli.h"`, `"4ch_aec_bf_nr_res/mcab.h"`).
+`"common/example_cli.h"`, `"4ch/mcab.h"`).

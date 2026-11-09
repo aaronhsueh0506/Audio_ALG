@@ -1319,9 +1319,10 @@ def test_the_library_defines_and_uses_no_grid_macro():
 def _product_sources():
     """The pipelines' DFN2 product code: the units, the shared headers and the two example mains
     (not their tests/ folders, which are the test scaffolding that picks a grid at build time)."""
-    dfn = TESTS_DIR.parents[1] / 'pipelines' / 'dfn'
-    paths = sorted([*dfn.glob('*.[ch]'), dfn / 'mono_aec_dfn_res' / 'main.c',
-                    dfn / '4ch_aec_bf_dfn_res' / 'main.c'])
+    pipelines = TESTS_DIR.parents[1] / 'pipelines'
+    dfn = pipelines / 'dfn'
+    paths = sorted([*dfn.glob('*.[ch]'), pipelines / 'mono' / 'aec_dfn_res' / 'main.c',
+                    pipelines / '4ch' / 'aec_bf_dfn_res' / 'main.c'])
     return dfn, paths
 
 

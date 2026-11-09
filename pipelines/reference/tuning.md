@@ -63,10 +63,10 @@ NO_FLOOR，但 gate 還沒跟上」的中間狀態。C 的 level 就是 Python �
 > **4ch：對四條 lane 重新指定 level 是無效操作。** 四條 lane 都以
 > `spatial_linear_context` 建立（`mcab_apply_lane_contract()` 蓋上），從不走到自己的殘留抑制器，它們的地板
 > 什麼都不塑形。真正乘上輸出的 gain 來自應用自備的**唯一一個**後波束 `AecRes`，所以強度要設在它身上
-> （由 `4ch_aec_bf_nr_res/tests/test_mcab_sample_beam.c` 的 `test_caller_res_reset_and_level` 釘住）。
+> （由 `4ch/tests/test_mcab_sample_beam.c` 的 `test_caller_res_reset_and_level` 釘住）。
 
 > **NR：範例的降噪器就是函式庫的 level 組態。** 它以 `anr_config_for_level_grid()` 建立、
-> 沒有任何覆寫，所以 `anr_set_level()` 直接換強度（`4ch_aec_bf_nr_res/tests/test_mcab_sample_post.c` 的 `test_nr_set_level` 釘住）。要改 level 以外的欄位時，自己組好
+> 沒有任何覆寫，所以 `anr_set_level()` 直接換強度（`4ch/tests/test_mcab_sample_post.c` 的 `test_nr_set_level` 釘住）。要改 level 以外的欄位時，自己組好
 > 完整 target 再呼叫 `anr_reconfigure()`（grid、`L`、`num_init_frames` 不可變）。
 
 > **A/B 量測時該預期什麼。** far-active 地板只在 **far-active 且非 double-talk** 的
@@ -77,7 +77,7 @@ NO_FLOOR，但 gate 還沒跟上」的中間狀態。C 的 level 就是 Python �
 > echo／degradation 的 A/B 會把 CNG 的變化錯記到別的機制。請在 echo 對齊或
 > degradation 對齊的條件下比較，並實際試聽。
 
-兩條 Align-ULCNet 範例（`ulcnet/mono_alignulcnet/`、`ulcnet/4ch_alignulcnet/`）**刻意不提供**
+兩條 Align-ULCNet 範例（`mono/alignulcnet/`、`4ch/alignulcnet/`）**刻意不提供**
 這些 setter：mono 變體沒有 NR 實例、且算出的 `G_res` 沒有任何消費者（輸出由 ULCNet
 mask 塑形）；4ch 變體用的是 `enable_post = 0` 的 flow，抑制器與降噪器
 根本不存在。強度是模型的性質，不是 runtime 旋鈕。
@@ -86,15 +86,15 @@ mask 塑形）；4ch 變體用的是 `enable_post = 0` 的 flow，抑制器與�
 
 **Levels**: `ANR_LEVEL_MILD` / `ANR_LEVEL_MODERATE` / `ANR_LEVEL_BALANCED`（default）/ `ANR_LEVEL_AGGRESSIVE`
 
-> Both C pipeline CLIs — `mono_aec_nr_res/main.c` (`parse_nr_level()`) and
-> `4ch_aec_bf_nr_res/mcab_external_static.c` — accept
+> Both C pipeline CLIs — `mono/aec_nr_res/main.c` (`parse_nr_level()`) and
+> `4ch/mcab_external_static.c` — accept
 > `--nr-level mild|moderate|balanced|aggressive` (or the digits `0`..`3`, through
 > `anr_nr_level_from_name()`; `--nr-preset` is the same option under its earlier name). An unknown name falls back to
-> `ANR_LEVEL_BALANCED` with no error in `mono_aec_nr_res/main.c` (the same holds for its
+> `ANR_LEVEL_BALANCED` with no error in `mono/aec_nr_res/main.c` (the same holds for its
 > positional AEC level and `--aec-level`, and for `--nr-level` (earlier name `--nr-mode`) of the NR library's `example/main.c`);
 > `mcab_external_static` exits with code 2 for an unknown `--nr-level` name, for an unknown AEC
-> level and for a second AEC level (positional or `--aec-level`); `mono_aec_nr_res/main.c` exits with code 2 for a second AEC level too, whatever its spelling. In both, a `--nr-level` or `--aec-level` followed by another `--` option has no value (exit 2).
-> The Python `mono_aec_nr_res/pipeline.py` CLI accepts
+> level and for a second AEC level (positional or `--aec-level`); `mono/aec_nr_res/main.c` exits with code 2 for a second AEC level too, whatever its spelling. In both, a `--nr-level` or `--aec-level` followed by another `--` option has no value (exit 2).
+> The Python `mono/aec_nr_res/pipeline.py` CLI accepts
 > `mild|balanced|aggressive` only.
 
 `g_min_db` is amplitude dB (`g_min = 10^(g_min_db/20)`).
@@ -176,7 +176,7 @@ re-validation.
 
 ### Verification
 
-Both versions build from the default `make` (one source, `mono_aec_nr_res/main.c`); `mono_aec_nr_res/tests/test_mono_chain.c` checks both programs against the
+Both versions build from the default `make` (one source, `mono/aec_nr_res/main.c`); `mono/aec_nr_res/tests/test_mono_chain.c` checks both programs against the
 hand-written oracle bit for bit (so the pooled and the heap outputs are equal for the tested option sets). The
 static build derives the AEC, denoiser and synthesis configs from one `AecSignalGrid` (`derive_lane()`), so the three share
 one grid by construction (`--print-mem-size` prints the grid and runs a real init of every stage).

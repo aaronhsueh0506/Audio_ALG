@@ -20,7 +20,7 @@
 #include "ulcnet/ulcnet_nn_stage.h"
 #include "dfn/dfn_unit_partition.h"
 #include "dfn/tests/dfn_test_fixture.h"
-#include "mono_aec_nr_res/tests/conv_chain_mono.h"
+#include "mono/aec_nr_res/tests/conv_chain_mono.h"
 #include "utility/mem_align.h"
 #include "utility/simd_kernels.h"
 

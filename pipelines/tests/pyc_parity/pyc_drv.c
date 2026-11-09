@@ -8,22 +8,22 @@
  *
  * Both run the chain the example programs write out behind the front end (post_hop() below:
  * RES gain -> NR gain -> min -> apply -> comfort noise -> synthesis): the 4-channel build over
- * mcab_fuse()'s McabFrame through 4ch_aec_bf_nr_res/mcab_sample_post.h, the mono build over the
- * lane's AecResContext as mono_aec_nr_res/main.c writes it out. A deviation planted in a stage is
+ * mcab_fuse()'s McabFrame through 4ch/mcab_sample_post.h, the mono build over the
+ * lane's AecResContext as mono/aec_nr_res/main.c writes it out. A deviation planted in a stage is
  * seen by the comparison.
  *
  * Command line: <mode> key=value ...
  *
  *   chain  mic=F ref=F sr=N fft=N out=F [aec=balanced|mild|aggressive|no_floor] [nr=mild|balanced|aggressive]
  *          [legacy_amin=0|1] [enable_nr=0|1] [enable_res=0|1] [enable_cng=0|1]
- *     The 4-channel chain as 4ch_aec_bf_nr_res/mcab_external_static.c composes it (front end -> fuse
+ *     The 4-channel chain as 4ch/mcab_external_static.c composes it (front end -> fuse
  *     with equal 0.25 weights -> RES (an AecRes over the fused frame, as the unit builds it) -> NR
  *     stage -> min -> apply -> comfort noise -> synthesis), every hop dumped in the seam format below. Stops at the first non-zero
  *     status of the core or the chain, recording it in the header; the Python side treats that as
  *     a result.
  *     aec=no_floor is accepted like the other levels.
  *   mono   mic=F ref=F sr=N fft=N out=F [aec=..] [nr=..] [legacy_amin=0|1] [enable_cng=0|1] [reset_at=H]
- *     Aec + aec_get_res_context + the chain as mono_aec_nr_res/main.c composes them, with the AEC
+ *     Aec + aec_get_res_context + the chain as mono/aec_nr_res/main.c composes them, with the AEC
  *     seam read back after each hop. The chain applies the lane's own RES gain (frame gain). The chain
  *     renders the AEC's rendering base (aec_get_output_base) and follows aec_post_reset_serial() (OLA clear,
  *     comfort-noise reseed); reset_at=H makes the driver call aec_reset() before hop H.
@@ -68,7 +68,7 @@
 #define PYC_CNG_NR_GAIN_FLOOR MCAB_SAMPLE_CNG_NR_GAIN_FLOOR
 #define PYC_CNG_RNG_SEED MCAB_SAMPLE_CNG_RNG_SEED
 #else
-/* The constants of mono_aec_nr_res/main.c. */
+/* The constants of mono/aec_nr_res/main.c. */
 #define PYC_CNG_NR_GAIN_FLOOR 0.31622777f
 #define PYC_CNG_RNG_SEED AEC_CNG_SEED
 #define PYC_PSD_SCALE_INV (1.0f / (32768.0f * 32768.0f))
@@ -392,7 +392,7 @@ static int run_chain(const Args* a) {
 #endif /* PYC_WITH_4CH */
 
 #if defined(PYC_WITH_MONO)
-/* The mono lane as mono_aec_nr_res/main.c derives it: the rate's grid and the linear-stage AecConfig
+/* The mono lane as mono/aec_nr_res/main.c derives it: the rate's grid and the linear-stage AecConfig
  * (the lane keeps its own gain in the context; the chain applies it). */
 static int derive_mono_lane(const Args* a, AecSignalGrid* grid, AecConfig* aec_cfg) {
     if (!aec_resolve_signal_grid(a->sr, a->fft ? a->fft : aec_default_fft_size(a->sr), grid))

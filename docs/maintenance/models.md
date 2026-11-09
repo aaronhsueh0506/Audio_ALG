@@ -113,7 +113,7 @@ make -C AINR/RNNoise-ERB test   # ERB table, feature contract, features, framing
       `make_norm_alpha` of `train.py`) and `tests/test_dfn2_runtime_grid.py` (the whole chain on every grid and pair, pool bytes
       and hash equal to an independent Python layout mirror, a foreign pool refused, the variant link symbol) pass;
       `tests/test_dfn2_lookahead_pairs.py` builds the C suites on the 48, 32 and 16 kHz test grids for the shipped pair and 2/4;
-      a pool or `MemReq` recorded under another carve version (`DFN2_PREPOST_CARVE_VERSION` = 11) is refused. DeepFilterNet3
+      a pool or `MemReq` recorded under another carve version (`DFN2_PREPOST_CARVE_VERSION` = 12) is refused. DeepFilterNet3
       is the same (`DFN3GridSpec` -> `dfn3_grid_make()`; its pair refusals are in `tests/test_dfn3_stream_c.py`).
 - [ ] DeepFilterNet2 frames per call (`export_onnx.py --frames-per-call N`, N in 1..64; the C side takes it as
       `DFN2GridSpec.frames_per_call`): N = 1 is the one-frame graph byte for byte; for N > 1 the chunked stream equals

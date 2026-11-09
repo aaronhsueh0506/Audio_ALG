@@ -9,7 +9,7 @@
 
 生命線：應用（你的 `main`）、`Aec`（lib/aec）、`AnrDenoiser`（lib/nr）、`AcIstft`（audiolib）。
 箭頭上的名稱都是真實函式；沒有共用的串接 header，每 hop 的串接寫在各範例自己的 `main`
-（`mono_aec_nr_res/main.c` 的 `derive_lane()`、`mono_nr_gain()`、`mono_form()`），可整份複製改寫。
+（`mono/aec_nr_res/main.c` 的 `derive_lane()`、`mono_nr_gain()`、`mono_form()`），可整份複製改寫。
 
 ```
 應用                       Aec                 AnrDenoiser            AcIstft
@@ -88,7 +88,7 @@ Aec + RES + NR    處理 m[t] 處理 m[t+1] 處理 m[t+2]     （同一次呼叫
 | `aec_config_from_level()` 的 `level` 引數 | `aec.h` | `MILD`／`BALANCED`（預設）／`AGGRESSIVE`／`NO_FLOOR`；enum 外時退回 balanced | init 前；執行期用下一列 | 回聲抑制 vs 近端保留的單一取捨軸 |
 | `aec_set_level(aec, level, ramp_ms)` | `aec.h` | `ramp_ms` 屬於 `[0, 60000]`，`0` = 下一 hop 生效 | 兩個 hop 之間 | 執行期換 AEC 強度；回 `-1` 時什麼都不寫 |
 | NR 強度 | `AnrLevel`（`anr_types.h`）：`anr_config_for_level_grid()`、`anr_set_level()` | `MILD`／`MODERATE`／`BALANCED`（預設）／`AGGRESSIVE` | init 前或兩個 hop 之間 | 降噪深度的單一入口（一次調 `g_min_db`、`q`、`xi_min_db`、`noise_over_subtraction`） |
-| 後級開關（範例程式的欄位，不是函式庫 config） | `PostPlan`（`mono_aec_nr_res/main.c`）；CLI `--no-res`、`--no-nr`、`--no-cng`、`--legacy-amin` | 各 0／1 | init 前 | RES 增益用不用、要不要建降噪器、CNG、NR 是否折入 R²（[§4.2](lifecycle.md#42-後級選項範例程式的欄位與-cli-旗標)） |
+| 後級開關（範例程式的欄位，不是函式庫 config） | `PostPlan`（`mono/aec_nr_res/main.c`）；CLI `--no-res`、`--no-nr`、`--no-cng`、`--legacy-amin` | 各 0／1 | init 前 | RES 增益用不用、要不要建降噪器、CNG、NR 是否折入 R²（[§4.2](lifecycle.md#42-後級選項範例程式的欄位與-cli-旗標)） |
 
 進階外部（選擇性；改了以後自己重跑三個 grid 的驗證）：`AecConfig` 的 `enable_cng`（`aec.h:77`，下游已有舒適噪音時關）、
 `enable_highpass`／`highpass_cutoff_hz`（`aec.h:80,115`，上游已有高通時關；開啟時截止頻率須 `> 0` 且低於 `0.45 × sample_rate`）、
@@ -98,7 +98,7 @@ Aec + RES + NR    處理 m[t] 處理 m[t+1] 處理 m[t+2]     （同一次呼叫
 
 | 家族 | 位置 | 為什麼不開放 |
 |---|---|---|
-| 範例 `derive_lane()` 固定的接縫：`enable_res = 0`、`return_res_context = 1`、`spatial_linear_context`（保持預設 0 = 完整 context，`ctx.res_gain` 才有值） | `aec.h:83,88,92`；`mono_aec_nr_res/main.c` 的 `derive_lane()` | 改了就沒有 `ctx.res_gain`（或時域輸出改道），串接整個失效 |
+| 範例 `derive_lane()` 固定的接縫：`enable_res = 0`、`return_res_context = 1`、`spatial_linear_context`（保持預設 0 = 完整 context，`ctx.res_gain` 才有值） | `aec.h:83,88,92`；`mono/aec_nr_res/main.c` 的 `derive_lane()` | 改了就沒有 `ctx.res_gain`（或時域輸出改道），串接整個失效 |
 | 以 10 ms 格點撰寫、建立時 retime 的時間欄位：`warmup_frames`、`epc_hangover`、`ne_recent_hold`、`filter_misadjustment_*_frames`、`shadow_err_alpha` | `aec.h:94-146` | 單位是「N × 10 ms」，不是 hop 數；填錯單位會靜默失效 |
 | 適應步進與模型不確定度：`mu`、`delta`、`kalman_q_high`、`kalman_q_low`、`shadow_mu_*`、`epc_mu_floor` | `aec.h:74-75,96-103,117-118` | 決定收斂與發散邊界；驗證器範圍很寬，範圍內多數值不收斂 |
 | 偵測門檻：`epc_*`、`ne_recent_*`、`saturation_threshold`、`filter_misadjustment_scale_*` | `aec.h:101-102,116,133-146` | 與其他偵測器聯合調過；`scale_min > scale_max` 不會被驗證器擋 |
@@ -143,7 +143,7 @@ mono 的 RES 是明確的例外：它在 `Aec` 的呼叫裡（`aec_process_conte
 | 格點與 `AecConfig` | `lib/aec`（`libaec.a`） | – | `aec_resolve_signal_grid()` + `aec_config_from_level()`，接縫欄位自己設（[§4.1](lifecycle.md#41-aecconfig-的接縫欄位範例的-derive_lane)） |
 
 上面幾項怎麼放進 pool（heap 路徑各自配置，caller-pool 路徑依序切同一塊）與每個 hop 怎麼串，是範例程式
-（`mono_aec_nr_res/main.c`、`example_board_adapter.c`）各自寫出來的，沒有 ABI、沒有 layout version、沒有 descriptor、
+（`mono/aec_nr_res/main.c`、`example_board_adapter.c`）各自寫出來的，沒有 ABI、沒有 layout version、沒有 descriptor、
 不進任何 archive，也沒有共用的範例 header，可整份複製改寫。
 
 每個 hop 的串接（`main.c` 的 `mono_form()` 與 `mono_nr_gain()`；兩支執行檔共用）：

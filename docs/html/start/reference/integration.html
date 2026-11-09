@@ -29,11 +29,11 @@
 <div class="tblwrap"><table>
 <tr><th>需求</th><th>入口</th></tr>
 <tr><td>mono <code>AEC + NR + RES</code></td><td>沒有 mono unit:<code>aec.h</code> 的 <code>Aec</code>(<code>aec_process_context()</code> 加 <code>aec_get_res_context()</code>)＋ 各 main 自寫的逐 hop 串接(<code>mono_form()</code>,見 3)</td></tr>
-<tr><td>4ch <code>4×linear AEC → BF</code>(flow 層加 sample helper)</td><td><code>pipelines/4ch_aec_bf_nr_res/mcab.h</code>(<code>mcab_process_front</code>／<code>mcab_fuse</code>;4 條 lane 與 estimator 由應用注入)＋ <code>mcab_sample_beam.h</code>(helper:SRP-PHAT／BF);RES／NR／CNG／合成不在內,<code>g_res_ctx</code> 為 NULL,RES 由應用用 libaec 自備 <code>AecRes</code></td></tr>
-<tr><td>4ch flow(shared aligner + 4 條 linear AEC)+ <b>外部</b> beamformer(自己串後級,含自備 <code>AecRes</code>;不需要 helper)</td><td><code>pipelines/4ch_aec_bf_nr_res/mcab.h</code>(<code>mcab_process_front</code> / <code>mcab_fuse</code>)</td></tr>
-<tr><td>mono linear AEC + NN 後級</td><td><code>aec.h</code> ＋ <code>pipelines/ulcnet/ulcnet_nn_stage.h</code>(<code>pipelines/ulcnet/mono_alignulcnet/main.c</code>)</td></tr>
-<tr><td>4ch linear AEC + SRP/BF + NN 後級</td><td><code>mcab.h</code>(<code>enable_post = 0</code>)＋ <code>mcab_sample_beam.h</code> ＋ <code>ulcnet/ulcnet_nn_stage.h</code>(<code>pipelines/ulcnet/4ch_alignulcnet/main.c</code>)</td></tr>
-<tr><td>mono 或 4ch ＋ DeepFilterNet2 後級</td><td><code>dfn/dfn_hop.h</code> ＋ <code>dfn/dfn_res_stage.h</code>／<code>dfn/dfn_rate_bridge.h</code>(<code>pipelines/dfn/mono_aec_dfn_res/main.c</code>、<code>pipelines/dfn/4ch_aec_bf_dfn_res/main.c</code>)</td></tr>
+<tr><td>4ch <code>4×linear AEC → BF</code>(flow 層加 sample helper)</td><td><code>pipelines/4ch/mcab.h</code>(<code>mcab_process_front</code>／<code>mcab_fuse</code>;4 條 lane 與 estimator 由應用注入)＋ <code>mcab_sample_beam.h</code>(helper:SRP-PHAT／BF);RES／NR／CNG／合成不在內,<code>g_res_ctx</code> 為 NULL,RES 由應用用 libaec 自備 <code>AecRes</code></td></tr>
+<tr><td>4ch flow(shared aligner + 4 條 linear AEC)+ <b>外部</b> beamformer(自己串後級,含自備 <code>AecRes</code>;不需要 helper)</td><td><code>pipelines/4ch/mcab.h</code>(<code>mcab_process_front</code> / <code>mcab_fuse</code>)</td></tr>
+<tr><td>mono linear AEC + NN 後級</td><td><code>aec.h</code> ＋ <code>pipelines/ulcnet/ulcnet_nn_stage.h</code>(<code>pipelines/mono/alignulcnet/main.c</code>)</td></tr>
+<tr><td>4ch linear AEC + SRP/BF + NN 後級</td><td><code>mcab.h</code>(<code>enable_post = 0</code>)＋ <code>mcab_sample_beam.h</code> ＋ <code>ulcnet/ulcnet_nn_stage.h</code>(<code>pipelines/4ch/alignulcnet/main.c</code>)</td></tr>
+<tr><td>mono 或 4ch ＋ DeepFilterNet2 後級</td><td><code>dfn/dfn_hop.h</code> ＋ <code>dfn/dfn_res_stage.h</code>／<code>dfn/dfn_rate_bridge.h</code>(<code>pipelines/mono/aec_dfn_res/main.c</code>、<code>pipelines/4ch/aec_bf_dfn_res/main.c</code>)</td></tr>
 <tr><td>mono 線性 AEC + 自己的頻域 stage 鏈</td><td><code>aec_process_context()</code> + <code>aec_get_res_context()</code> + 自己的鏈(見 2.5)</td></tr>
 <tr><td>只做單路 AEC,或自行組合其他 post-filter</td><td><code>aec.h</code></td></tr>
 <tr><td>已有 STFT/WOLA,只需要頻域 NR</td><td><code>anr.h</code></td></tr>
@@ -60,7 +60,7 @@
 <div class="warn"><b><code>4ch_alignulcnet</code> 的總演算法延遲 = 1 hop</b>(16 k 256 smp/16 ms、48 k 512 smp/10.67 ms),只來自 synthesis 的半窗 trim。<b>兩個 branch 都從當前 input hop 取幀,所以不可以有 far 補償 buffer</b>——加回去就是 <code>error[t]</code> 配 <code>far[t-1]</code> 的一 hop 偏斜,而這種對齊細節<b>沒有任何自動檢查</b>。</div>
 
 <h2 id="section-4">2.5 串一個新的頻域 stage</h2>
-<p>接縫都是函式庫交出的借用 view:mono 是 <code>aec_get_res_context()</code> 填的 <code>AecResContext</code>(<code>error_spec</code> = E,<code>r2</code>、<code>comfort_noise</code>、<code>res_gain</code>),4ch 是 <code>mcab_fuse()</code>／<code>mcab_sample_beam_fuse()</code> 填的 <code>McabFrame</code>(定義在 <code>mcab.h</code>)。增益類 stage 是普通函式(mono 的 <code>mono_nr_gain()</code>、4ch 的 <code>mcab_sample_anr_gain()</code>),NN 類 stage 是 <code>begin → (呼叫端跑 NPU) → end</code>。<b>沒有函式指標表</b>:每個應用自己把鏈寫出來(<code>mono_aec_nr_res/main.c</code> 的 <code>mono_form()</code> 是現成的一份),順序固定是 <code>sk_min_f32 → sk_capply_gain_f32 → aec_cng_fill → ac_istft_push</code>。</p>
+<p>接縫都是函式庫交出的借用 view:mono 是 <code>aec_get_res_context()</code> 填的 <code>AecResContext</code>(<code>error_spec</code> = E,<code>r2</code>、<code>comfort_noise</code>、<code>res_gain</code>),4ch 是 <code>mcab_fuse()</code>／<code>mcab_sample_beam_fuse()</code> 填的 <code>McabFrame</code>(定義在 <code>mcab.h</code>)。增益類 stage 是普通函式(mono 的 <code>mono_nr_gain()</code>、4ch 的 <code>mcab_sample_anr_gain()</code>),NN 類 stage 是 <code>begin → (呼叫端跑 NPU) → end</code>。<b>沒有函式指標表</b>:每個應用自己把鏈寫出來(<code>mono/aec_nr_res/main.c</code> 的 <code>mono_form()</code> 是現成的一份),順序固定是 <code>sk_min_f32 → sk_capply_gain_f32 → aec_cng_fill → ac_istft_push</code>。</p>
 <pre>/* mono 的一個 hop:ctx 是借用視圖,有效至下一次 process 呼叫;任何 stage 都不得寫入 */
 AecResContext ctx;  aec_get_res_context(aec, &amp;ctx);
 AecOutputBase b = { sizeof(b) };  aec_get_output_base(aec, &amp;b);    /* b.base_spec = 渲染基底 B;守衛未觸發時等於 ctx.error_spec */
@@ -109,7 +109,7 @@ if (delay.changed || (frame_index != 0 && !last_delay.solid && delay.solid)) {  
     if (s->model.reset) s->model.reset(user);   /* 通知 NN 丟棄跨 frame 狀態 */
     s->reprime_frames = ULCNET_NN_STAGE_REPRIME_FRAMES;   /* mono=1, 4ch=1: 同一個 stage 常數 */
 }</pre>
-<div class="note"><b>reprime frame 數是量測出來的,不是猜的</b>:兩條都是 <b>1</b>——兩條的兩個 branch 都從<b>當前</b> input hop 取幀,50%-overlap 幀橫跨兩個 hop,只有邊界 hop 那一幀還蓋到切換前的 hop。常數<b>綁定 hop 結構</b>,改 framing 必須重新量(<code>ulcnet/mono_alignulcnet/tests/test_mono_ulcnet.c</code> 與 <code>ulcnet/4ch_alignulcnet/tests/test_4ch_ulcnet.c</code> 的 <code>test_reprime_straddle_derivation()</code>)。</div>
+<div class="note"><b>reprime frame 數是量測出來的,不是猜的</b>:兩條都是 <b>1</b>——兩條的兩個 branch 都從<b>當前</b> input hop 取幀,50%-overlap 幀橫跨兩個 hop,只有邊界 hop 那一幀還蓋到切換前的 hop。常數<b>綁定 hop 結構</b>,改 framing 必須重新量(<code>mono/alignulcnet/tests/test_mono_ulcnet.c</code> 與 <code>4ch/alignulcnet/tests/test_4ch_ulcnet.c</code> 的 <code>test_reprime_straddle_derivation()</code>)。</div>
 <h3>Fail-open 三層 + FULL-WRITE CONTRACT</h3>
 <pre>if (reprime_frames > 0) {
     /* identity,不 step model */
@@ -145,13 +145,13 @@ ulcnet_nn_stage_end(stage, out);   /* 合成剛好一個 hop */</pre>
 
 <h3>4ch ULCNet 的 front-only 契約</h3>
 <p>flow 以 <code>enable_post = 0</code> 建立(<code>ulcnet_example_unit_config(&amp;grid)</code>:<code>mcab_default_config(grid.sample_rate)</code> 加 <code>fft_size = grid.n_fft</code>)時,mcab <b>不 carve</b> fuse 緩衝,lane 只留線性 context(<code>AEC_CONTEXT_LINEAR_ONLY</code>),<code>mcab_sample_beam_fuse()</code> 回 <code>INVALID_ARGUMENT</code>;mcab、helper 與 stage 都不建任何 denoiser／suppressor／comfort noise／post iFFT。<code>McabConfig</code> 與 helper 參數沒有 RES／NR／CNG／level 欄位;<code>auto_vad_*</code> 欄位照常驗證(本範例走 <code>process_with_activity()</code>,不用內建 energy VAD)。pre-stage 欄位(<code>delay_*</code>／<code>capture_proxy_channel</code>／<code>max_delay_ms</code>)照常生效;lane 的 <code>filter_length</code> 是 lane 的 <code>AecConfig</code>(本範例經 <code>mcab_sample_flow</code> 用 <code>mcab_lane_config()</code> 的預設)。</p>
-<p class="small">stage 與 flow 的 grid 必須一致:<code>ulcnet/4ch_alignulcnet/tests/test_4ch_ulcnet.c</code> 的 <code>test_example_unit_config_grid</code> 檢查 unit config 的 grid、<code>enable_post = 0</code>、fuse 被拒,以及另一個格點的單元可以建立但接不上 stage。</p>
+<p class="small">stage 與 flow 的 grid 必須一致:<code>4ch/alignulcnet/tests/test_4ch_ulcnet.c</code> 的 <code>test_example_unit_config_grid</code> 檢查 unit config 的 grid、<code>enable_post = 0</code>、fuse 被拒,以及另一個格點的單元可以建立但接不上 stage。</p>
 
 <h2 id="section-8">6. <code>layout_version</code> 對整合者的意義</h2>
 <div class="tblwrap"><table>
 <tr><th>函式庫物件</th><th>目前版本</th></tr>
 <tr><td><code>4ch_aec_bf_nr_res</code>(4ch flow,mcab.h;只描述 mcab 自己的 pool)</td><td><code>MCAB_LAYOUT_VERSION</code> = 26</td></tr>
-<tr><td>DFN2 stage／rate bridge</td><td><code>DFN_RES_STAGE_LAYOUT_VERSION</code> = 5、<code>DFN_RATE_BRIDGE_LAYOUT_VERSION</code> = 5</td></tr>
+<tr><td>DFN2 stage／rate bridge</td><td><code>DFN_RES_STAGE_LAYOUT_VERSION</code> = 6、<code>DFN_RATE_BRIDGE_LAYOUT_VERSION</code> = 6</td></tr>
 <tr><td>mono(<code>Aec</code>、<code>AnrDenoiser</code>、<code>AcIstft</code>)、ULCNet stage、<code>DfnHop</code></td><td>沒有 descriptor、沒有 layout version(函式庫物件只提供大小查詢;stage／hop／helper 為範例碼)</td></tr>
 </table></div>
 <p class="small">規則:pool 大小、carve 順序或 descriptor 內容任一改變,該模組的版本加一。</p>

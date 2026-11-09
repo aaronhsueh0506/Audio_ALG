@@ -121,9 +121,9 @@ int phased_ulc_hop(UlcnetNnStage *stage, float *out) {
 
 <h2 id="section-3">3. 4ch 範例</h2>
 <p>與 mono 的差別:前端是 flow <code>Mcab</code>(lane 與 estimator 由 <code>mcab_sample_flow_init()</code> 建在同一塊記憶體,被注入的物件須是剛 init 或剛 reset 過的)加 SRP/BF helper,stage 以 <code>ulcnet_nn_stage_init(…, 0)</code> 建立(error 幀就是 <code>beam.spectrum</code>,不需要時域分析),每 hop 用 <code>ulcnet_nn_stage_begin_complex()</code>。flow 以 <code>enable_post = 0</code> 建立後 <code>mcab_sample_beam_fuse()</code> 不可用(回 <code>MCAB_INVALID_ARGUMENT</code>);mcab 本身沒有 RES,這條鏈也不自建 <code>AecRes</code>。</p>
-<pre>#include "4ch_aec_bf_nr_res/mcab.h"
-#include "4ch_aec_bf_nr_res/mcab_sample_flow.h"
-#include "4ch_aec_bf_nr_res/mcab_sample_beam.h"
+<pre>#include "4ch/mcab.h"
+#include "4ch/mcab_sample_flow.h"
+#include "4ch/mcab_sample_beam.h"
 #include "ulcnet/ulcnet_nn_stage.h"
 #include "ulcnet_accelerator_adapter.h"
 #include "utility/mem_align.h"

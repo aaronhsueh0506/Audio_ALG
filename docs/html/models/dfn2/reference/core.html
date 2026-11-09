@@ -395,7 +395,7 @@ hop   caller                    dfn2_stream                       NPU
 <tr><td>遞迴 state <code>h_gru</code>／<code>df_convp_history</code></td><td>應用端</td><td>浮點 host 登錄 pointer 與元素數;板端不登錄,由加速器持有</td></tr>
 </table></div>
 <ul>
-<li><b><code>DFN2_PREPOST_CARVE_VERSION = 11</code></b>(<code>dfn2_prepost.h</code>):carve 走訪順序的版本,
+<li><b><code>DFN2_PREPOST_CARVE_VERSION = 12</code></b>(<code>dfn2_prepost.h</code>):carve 走訪順序的版本,
 摺進 <code>build_flags_hash</code>,所以其他 carve 版本的 pool 與以前記下的 <code>DFN2PrepostMemReq</code> 會在 <b>hash</b> 被拒。pool 內容:<code>DFN2Prepost</code>／<code>DFN2State</code>／<code>DFN2ModelIOState</code> 三個標頭、state 區塊(<code>dfn2_state_mem_size</code>)、feature window 區塊(<code>dfn2_model_io_mem_size</code>)與逐框暫存;遞迴 state 不在其中(graph layout 8；<code>df_bins</code> 96)。任何 pool 大小、切分順序或 descriptor 內容的變更都會 bump 這個版本。</li>
 <li><b>遞迴 state:登錄或不登錄,只有就地綁定</b>:兩個 state tensor(<code>h_gru (1,5,1,256)</code> 與 <code>df_convp_history (1,64,5,96)</code>,
 共 32,000 float = 128,000 bytes)各只有一份 buffer、位址固定。浮點 host 把它們登錄在 <code>DFN2PrepostConfig</code>(<code>gru_hidden</code>／<code>df_convp_history</code> 與各自的 <code>*_elements</code>;四欄全設或全空,指標配 0 個元素、元素數配 NULL 都被拒,<code>-DDFN2_MASK_ONLY</code> 只有 <code>h_gru</code> 一對):函式庫在 init 與 reset 歸零、每次 <code>frame_finish</code> 檢查有限、被拒時歸零,並把同一個位址交給加速器。板端不登錄(四欄 NULL／0):加速器持有 state,函式庫只計 state generation。登錄的 buffer 不在 pool 大小與 <code>build_flags_hash</code> 內,須與 pool 同壽命。
@@ -514,7 +514,7 @@ make -C AINR -s print-lib-path   # 印出本組態的 archive 絕對路徑</pre>
 <code>WERROR=1</code> 會傳到 compiler 並進組態簽章。對應的 AIAEC archive 是 <code>libaiaec_prepost.a</code>。</li>
 <li><b>grid、pair 與 N 都不是建置選項</b>:archive 與它們無關,應用端以 <code>dfn2_grid_make()</code> 在執行期給定。建置只決定 variant:<code>-DDFN2_MASK_ONLY</code> 要加在<b>每一個</b>編譯單元(<code>make -C AINR lib</code> 建完整版),不同 variant 的目標檔連結失敗(符號 <code>dfn2_variant_{full|mask_only}</code>)。完整規則、各 grid 的大小與限制見 <a href="grid.html">DFN2 grid 與 ERB</a>。</li>
 <li>兩支 DFN2 pipeline<b>不</b>連這個 archive:<code>pipelines/Makefile</code> 直接把三個 DFN2 TU 編進
-<code>libaudio_pipeline_dfn.a</code>（<code>pipelines/</code> 建置）或 <code>libdfn_res_stage.a</code>（<code>4ch_aec_bf_nr_res/</code> 建置）。</li>
+<code>libaudio_pipeline_dfn.a</code>（<code>pipelines/</code> 建置）或 <code>libdfn_res_stage.a</code>（<code>4ch/</code> 建置）。</li>
 </ul>
 
 <h2 id="section-14">bypass identity 的 partition of unity 檢查</h2>

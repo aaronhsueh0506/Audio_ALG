@@ -568,7 +568,7 @@ echo "############################################################"
 echo "# SP-S19: the 4ch test_mcab_sample_driver object tracks the headers it includes"
 echo "############################################################"
 mkscratch sp19
-SP19_ARGS=(-C "$PIPE_DIR/4ch_aec_bf_nr_res" BACKEND=ne10 SIMD=1 WERROR=0
+SP19_ARGS=(-C "$PIPE_DIR/4ch" BACKEND=ne10 SIMD=1 WERROR=0
   OBJ_ROOT="$SCRATCH_ROOT/sp19/obj" BIN_ROOT="$SCRATCH_ROOT/sp19/bin")
 if make -s "${SP19_ARGS[@]}" test-mcab-sample-driver >"$SCRATCH_ROOT/sp19/build.log" 2>&1; then
   pass "SP-S19: make test-mcab-sample-driver builds and passes"
@@ -617,7 +617,7 @@ echo "############################################################"
 # and audiolib's spatial kernels may be absent. All five scenarios share one scratch obj/bin root, so the
 # producers are compiled once; nothing here touches a real obj/ or bin/.
 mkscratch sp21
-FOURCH_DIR="$PIPE_DIR/4ch_aec_bf_nr_res"
+FOURCH_DIR="$PIPE_DIR/4ch"
 SP21_ARGS=(-C "$FOURCH_DIR" BACKEND=ne10 SIMD=1 WERROR=0
   OBJ_ROOT="$SCRATCH_ROOT/sp21/obj" BIN_ROOT="$SCRATCH_ROOT/sp21/bin")
 # Directories that do not exist, and a copy of audiolib's include directories without its Makefile (the

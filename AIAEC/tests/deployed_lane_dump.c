@@ -2,7 +2,7 @@
  * tests/test_deployed_frontend_contract.py to compare against the training front-end contract
  * (dataset_gen/linear_aec.py LinearAecContract).
  *
- * The lane is not copied here: pipelines/ulcnet/mono_alignulcnet/main.c is compiled into this
+ * The lane is not copied here: pipelines/mono/alignulcnet/main.c is compiled into this
  * driver (its main() renamed), so parse_options() and derive_lane() are the deployed functions
  * themselves. Values are read from the initialized instance, i.e. after lib/aec has resolved
  * the config. Grid: the example's own option, `--sample-rate <rate>` (default 16000), passed
@@ -13,7 +13,7 @@
  * network) is byte-identical on every hop and comfort_noise is NULL; it is what allows the lane's
  * inherited enable_cng = 1 against the contract's False. */
 #define main mono_alignulcnet_example_main
-#include "mono_alignulcnet/main.c"
+#include "mono/alignulcnet/main.c"
 #undef main
 
 #define DUMP_HOPS 400

@@ -67,8 +67,8 @@ pipelines/bin/
 
 # Same hash-keyed obj/bin scheme for the conventional 4-channel package and
 # its spatial-component sub-Makefile.
-pipelines/4ch_aec_bf_nr_res/obj/
-pipelines/4ch_aec_bf_nr_res/bin/
+pipelines/4ch/obj/
+pipelines/4ch/bin/
 # Config-keyed build output. Written as a pattern, not per-directory: the
 # hash-dir scheme is the same for every producer under pipelines/, and
 # spelling each one out meant a directory move silently lost coverage.

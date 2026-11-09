@@ -56,7 +56,7 @@ BIN="$(make -s -C pipelines print-bin-dir)"
 （或改 CLI 原始碼），見 `pipeline_mono.html` API 節。
 
 目前 `mono_aec_nr_res` parser 對未知 positional level 與未知 `--nr-level`（或別名 `--nr-preset`）名稱會退回 balanced，且不會為所有未知 dash option 報錯；`--nr-level`／`--fft-size`（`aec_nr_pipeline_static` 的 `--print-mem-size` 路徑另含 `--sample-rate`）後面直接接另一個 `--` 選項或行尾時視為缺值，exit 2。`mcab_external_static` 則對未知 level 名稱 exit 2。產品或自動化腳本應只傳上表列出的值，不要依賴 silent fallback。
-只有 mono 的 smoke CLI（`mono_aec_nr_res/main.c`）的 `--fft-size`、`--sample-rate` 以 `atoi()` 轉換、不嚴格檢查（`12x` 當成 12）；DFN2／ULCNet 範例、`mcab_raw`、`mcab_static`、`mcab_external_static` 走 `common/example_cli.h` 的嚴格解析，非法數字 exit 2（見 [`pipelines/README.md`](../../../pipelines/README.md)）。
+只有 mono 的 smoke CLI（`mono/aec_nr_res/main.c`）的 `--fft-size`、`--sample-rate` 以 `atoi()` 轉換、不嚴格檢查（`12x` 當成 12）；DFN2／ULCNet 範例、`mcab_raw`、`mcab_static`、`mcab_external_static` 走 `common/example_cli.h` 的嚴格解析，非法數字 exit 2（見 [`pipelines/README.md`](../../../pipelines/README.md)）。
 
 ### 4.2 Debug context dump
 
@@ -80,7 +80,7 @@ DUMP_CTX=pipeline_ctx.bin \
 
 ## 5. 可編譯的 C integration wrapper
 
-下列範例只使用AEC、NR 與 audiolib 的公開 API，以 malloc 手寫一份與 `pipelines/mono_aec_nr_res` 範例等價的串接（RES 增益取自 AEC 自己的 context）。上層每次傳入 `audio_alg_hop_size()` 個 float sample。
+下列範例只使用AEC、NR 與 audiolib 的公開 API，以 malloc 手寫一份與 `pipelines/mono/aec_nr_res` 範例等價的串接（RES 增益取自 AEC 自己的 context）。上層每次傳入 `audio_alg_hop_size()` 個 float sample。
 
 ```c
 /* AUDIO_ALG_PIPELINE_EXAMPLE_BEGIN */
@@ -344,9 +344,9 @@ NR level（`--nr-level`，見 §4.1）：
 | balanced | 預設平衡 |
 | aggressive | 最強背景降噪 |
 
-> `anr_config_for_level()` 有四級：`mild`／`moderate`／`balanced`／`aggressive`（`moderate` 介於 mild 與 balanced 之間）。`aec_nr_pipeline` 的 `parse_nr_level()`（`pipelines/mono_aec_nr_res/main.c`）經 `anr_nr_level_from_name()` 接受這四個名稱（或 `0`..`3`），其餘字串一律 silently 落回 `balanced`，不會報錯。
+> `anr_config_for_level()` 有四級：`mild`／`moderate`／`balanced`／`aggressive`（`moderate` 介於 mild 與 balanced 之間）。`aec_nr_pipeline` 的 `parse_nr_level()`（`pipelines/mono/aec_nr_res/main.c`）經 `anr_nr_level_from_name()` 接受這四個名稱（或 `0`..`3`），其餘字串一律 silently 落回 `balanced`，不會報錯。
 
-Audio_ALG 的範例程式（`pipelines/mono_aec_nr_res/main.c` 等）直接用 NR 函式庫的 level：`anr_config_for_level_grid(sample_rate, fft_size, nr_level)`，不另外覆寫欄位（最小值追蹤視窗 `L` 為函式庫預設，約 512 ms；16 kHz 256/128 為 64 hops），所以 `anr_set_level()` 可以直接在執行中換強度。
+Audio_ALG 的範例程式（`pipelines/mono/aec_nr_res/main.c` 等）直接用 NR 函式庫的 level：`anr_config_for_level_grid(sample_rate, fft_size, nr_level)`，不另外覆寫欄位（最小值追蹤視窗 `L` 為函式庫預設，約 512 ms；16 kHz 256/128 為 64 hops），所以 `anr_set_level()` 可以直接在執行中換強度。
 
 若要改 CNG 或 gain combine（例如在 `min(G_nr, G_res)` 之外再加任何 floor），這已不是單純 API integration，而是演算法 operating point 變更，應重新跑 far-end-only、near-end-only、double-talk、movement 與 noisy cases。
 
@@ -359,7 +359,7 @@ Audio_ALG 的範例程式（`pipelines/mono_aec_nr_res/main.c` 等）直接用 N
 - split-pool reference path（`aec_nr_pipeline`）在初始化時用 `posix_memalign()` 配置兩塊（AEC 一塊、降噪器／合成／暫存一塊）；process loop 本身不配置記憶體。
 - 單一 caller-owned pool 的 static-memory 版本已完整支援：`aec_nr_pipeline_static` 各自查大小、各自 init
   （`aec_get_mem_size`/`aec_init`、`anr_get_mem_size`/`anr_init`、`ac_istft_get_mem_size`/`ac_istft_init`），
-  從一塊 16-byte 對齊的 pool 依序切出全部記憶體，init 後零 malloc；`pipelines/mono_aec_nr_res/tests/test_mono_chain.c` 以逐位元比對兩支 CLI 與手寫 oracle
+  從一塊 16-byte 對齊的 pool 依序切出全部記憶體，init 後零 malloc；`pipelines/mono/aec_nr_res/tests/test_mono_chain.c` 以逐位元比對兩支 CLI 與手寫 oracle
   （單一 pool 與 split 版的輸出因此相等，範圍為該測試涵蓋的選項組合）。
   NR 與 AEC 的 heap 與 static API 並存於同一份 `.a`（runtime 選擇）。
 
@@ -375,7 +375,7 @@ Audio_ALG 的範例程式（`pipelines/mono_aec_nr_res/main.c` 等）直接用 N
 | 輸出有洞或不自然靜音 | CNG 關閉或 gain 過深 | A/B 比較有無 `--no-cng`；CNG 只填 `G_res` 切掉的 bin，位準乘該 bin 的 NR gain（下限 −10 dB） |
 | 不同檔案結果互相影響 | state 未 reset | 每個獨立 stream reset 或重建全部 instance |
 | 尾端樣本變短 | CLI 只處理完整 hop | 上層先 padding，並在輸出後裁回原長度 |
-| 想用現成的 mono 整合寫法 | — | 見 `pipelines/mono_aec_nr_res/main.c` + `pipelines/reference/build.md`「Board Integration」；本手冊第 5 節的 wrapper 是直接組合 AEC／NR 的範例 |
+| 想用現成的 mono 整合寫法 | — | 見 `pipelines/mono/aec_nr_res/main.c` + `pipelines/reference/build.md`「Board Integration」；本手冊第 5 節的 wrapper 是直接組合 AEC／NR 的範例 |
 
 定位問題時建議依序比較：`--aec-only`、完整 production、`--no-cng`、`--legacy-amin`，再用 `DUMP_CTX` 檢查渲染基底 `B(f)`、`G_res`、`R²` 與 `G_nr`。
 

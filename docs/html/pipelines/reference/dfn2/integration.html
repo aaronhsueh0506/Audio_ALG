@@ -163,10 +163,10 @@ int phased_hop(DfnHop *hop, const AecOutputBase *b, const Complex *post, float *
 <h2 id="section-3">3. 4ch 範例(16 kHz 核心,經 rate bridge)</h2>
 <p>與 mono 的差別只有前端:flow 設定用 <code>McabConfig</code>(不含 beamformer、不含 RES),lane 與 estimator 由應用建立(此處經 <code>mcab_sample_flow_init()</code>,被注入的物件必須是剛 init 或剛 reset 過的),SRP/BF 在 helper <code>McabSampleBeam</code>。每 hop 用 <code>mcab_sample_beam_process_with_activity()</code>(VAD 由呼叫端提供;沒有 VAD 時用 <code>mcab_sample_beam_process()</code>)加 <code>mcab_sample_beam_fuse()</code>(本 hop 沒有 beam 回 <code>MCAB_SEQUENCE_ERROR</code>,未改狀態)。<code>g_res_ctx</code> 為 NULL:應用自己建 <code>AecRes</code>(接在 helper 之後),以 <code>mcab_sample_res_input()</code> 組輸入並呼叫 <code>aec_res_process()</code>。DSP 類拒絕已把 helper 與 flow 整個 reset,但呼叫端的 <code>AecRes</code>、CNG RNG 與 <code>DfnHop</code> 仍要自己 reset。</p>
 <pre>#include "aec_res.h"
-#include "4ch_aec_bf_nr_res/mcab.h"
-#include "4ch_aec_bf_nr_res/mcab_sample_flow.h"
-#include "4ch_aec_bf_nr_res/mcab_sample_beam.h"
-#include "4ch_aec_bf_nr_res/mcab_sample_post.h"
+#include "4ch/mcab.h"
+#include "4ch/mcab_sample_flow.h"
+#include "4ch/mcab_sample_beam.h"
+#include "4ch/mcab_sample_post.h"
 #include "dfn/dfn_hop.h"
 #include "dfn/dfn_hop_pool.h"
 #include "utility/mem_align.h"

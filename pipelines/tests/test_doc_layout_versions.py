@@ -24,7 +24,7 @@ _REPO = pathlib.Path(__file__).resolve().parents[2]
 # 巨集名 -> 定義它的檔案（相對 repo 根）。#define 只有一處，所以不必去重。
 _SOURCES = {
     'MCAB_LAYOUT_VERSION':
-        'pipelines/4ch_aec_bf_nr_res/mcab.h',
+        'pipelines/4ch/mcab.h',
     'DFN_RES_STAGE_LAYOUT_VERSION':
         'pipelines/dfn/dfn_res_stage.h',
     'DFN_RATE_BRIDGE_LAYOUT_VERSION':

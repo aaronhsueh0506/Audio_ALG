@@ -56,9 +56,9 @@ own version counters.
 | Field | Meaning |
 |-------|---------|
 | `descriptor_version` | This STRUCT's own ABI version — `MCAB_DESCRIPTOR_VERSION` (currently `1`). Bumped only when `McabMemReq`'s field set/order/width changes, independent of `layout_version` below. `mcab_init_ex()` checks this FIRST, before interpreting any other field. |
-| `layout_version` | `MCAB_LAYOUT_VERSION` (currently `26`). Bumped whenever the pool size, carve order or descriptor content of `../pipelines/4ch_aec_bf_nr_res/mcab.c` changes. A cached `bytes` alone is only a lower bound, so this counter is what refuses a descriptor persisted by another build. Versions 21 to 24 belonged to the predecessor layers and 25 to the layout without the rendering base; none is reused. |
-| `backend_id` | Compile-time FFT backend identity this build was made with, as a small integer — `MCAB_BACKEND_NE10` (2, `mcab.h`), the only FFT backend (matches the `BACKEND=` of `../pipelines/4ch_aec_bf_nr_res/Makefile`). A process-local rodata pointer cannot be serialized safely, so `backend_id` is compared with a plain integer `==`. A descriptor carrying any other value is never valid, even at matching `bytes`. `1` is never returned. |
-| `build_flags_hash` | FNV-1a-32 of a small fixed set of compile-time strings that affect the carve STRUCTURE of mcab's pool: the backend identity above, a literal carve-order token list, the alignment granularity, and the pointer-width token — see `mcab_build_flags_hash()` in `../pipelines/4ch_aec_bf_nr_res/mcab.c`. **Covers:** a change to mcab's own carve order/buffer set/alignment. **Does NOT cover:** config VALUES (`sample_rate`, `enable_post`, `delay_mode`, ...) — those change `bytes` but are config, not layout, so a caller re-querying `mcab_get_mem_requirements()` for its actual config already gets the right `bytes` regardless of this hash; the lanes', the estimator's and the beamformer helper's internal struct layouts (separate objects); the compiler/ABI/toolchain. |
+| `layout_version` | `MCAB_LAYOUT_VERSION` (currently `26`). Bumped whenever the pool size, carve order or descriptor content of `../pipelines/4ch/mcab.c` changes. A cached `bytes` alone is only a lower bound, so this counter is what refuses a descriptor persisted by another build. Versions 21 to 24 belonged to the predecessor layers and 25 to the layout without the rendering base; none is reused. |
+| `backend_id` | Compile-time FFT backend identity this build was made with, as a small integer — `MCAB_BACKEND_NE10` (2, `mcab.h`), the only FFT backend (matches the `BACKEND=` of `../pipelines/4ch/Makefile`). A process-local rodata pointer cannot be serialized safely, so `backend_id` is compared with a plain integer `==`. A descriptor carrying any other value is never valid, even at matching `bytes`. `1` is never returned. |
+| `build_flags_hash` | FNV-1a-32 of a small fixed set of compile-time strings that affect the carve STRUCTURE of mcab's pool: the backend identity above, a literal carve-order token list, the alignment granularity, and the pointer-width token — see `mcab_build_flags_hash()` in `../pipelines/4ch/mcab.c`. **Covers:** a change to mcab's own carve order/buffer set/alignment. **Does NOT cover:** config VALUES (`sample_rate`, `enable_post`, `delay_mode`, ...) — those change `bytes` but are config, not layout, so a caller re-querying `mcab_get_mem_requirements()` for its actual config already gets the right `bytes` regardless of this hash; the lanes', the estimator's and the beamformer helper's internal struct layouts (separate objects); the compiler/ABI/toolchain. |
 | `alignment` | Required base alignment of the pool pointer, bytes. Always 16 today (the one alignment every module in this stack — AEC, NR, the NE10 FFT backend, `mem_align.h`'s `ALIGN16` — carves to). `uint32_t`, not `size_t`. |
 | `reserved` | Always 0 and validated (`mcab_init_ex()` refuses a nonzero value). Exists only so `bytes` (a `uint64_t`) lands on an 8-byte-aligned offset within the struct with no compiler-inserted padding — part of the fixed 32-byte layout, not a field to read or write. |
 | `bytes` | Size of mcab's OWN pool to allocate (the `Mcab` control block carved at the front, then the mic lane, the aligned far, the fuse buffers when `enable_post` is set, and the alignment ring in MATCHED/FIXED; 74,624 B for 16 kHz/256 MATCHED with `enable_post = 1`). It does NOT include the four lanes, the shared estimator, the beamformer helper, the RES, NR, synthesis or any neural stage. `uint64_t`, not `size_t` — cast to `size_t` before passing to `malloc`/`posix_memalign`/`mcab_init*()` on a target where the two widths differ. |
@@ -78,7 +78,7 @@ THIRD, even older, build.
 ## Serializing the descriptor
 
 `McabMemReq` is a fixed-width, 32-byte POD (`_Static_assert`-pinned
-in `../pipelines/4ch_aec_bf_nr_res/mcab.h`, sizeof and every field's offset) — it
+in `../pipelines/4ch/mcab.h`, sizeof and every field's offset) — it
 can be copied byte-for-byte (`memcpy`) to a file, a flash region, or a wire
 message, and read back later, even by a different process, even after a
 restart. This is deliberately scoped narrower than "fully portable
@@ -104,8 +104,8 @@ None of the init functions requires a zero-filled pool. `mcab_init_ex()` clears 
 given, and AEC/NR/the FFT backend each zero
 their own sub-region during their own `_init()` — so a pool filled with poison bytes inits and
 processes identically to a freshly-zeroed one.
-`../pipelines/4ch_aec_bf_nr_res/tests/test_mcab.c` (`mcab`, `0xA5`-poisoned caller pool and heap construction) and
-`../pipelines/mono_aec_nr_res/tests/test_mono_chain.c` (mono, pool carved from a `0xA5`-poisoned
+`../pipelines/4ch/tests/test_mcab.c` (`mcab`, `0xA5`-poisoned caller pool and heap construction) and
+`../pipelines/mono/aec_nr_res/tests/test_mono_chain.c` (mono, pool carved from a `0xA5`-poisoned
 block against the heap flavor) exercise exactly this: byte-for-byte the same output. There is no
 need for a caller-side blanket `memset(pool, 0, bytes)` before `init`.
 
@@ -128,9 +128,9 @@ make BACKEND=ne10 audit-no-stdio-stack
 `nm` that it holds the stage, bridge and DFN2 pre/post members and none of
 `fprintf`/`printf`/`puts`/`fputs`/`stderr`/`__stderrp` (pattern/style follows
 `audiolib/common/scripts/audit_alloc_symbols.sh`); the same target in
-`4ch_aec_bf_nr_res/` (run with `NO_STDIO=1`) scans the 4-channel build: `libaudio_pipeline_mcab.a`, the DFN archive, the producers (including the spatial archives) and the sample objects `mcab_sample_flow.o` and `mcab_sample_beam.o`. `audit-no-stdio-stack` also builds
+`4ch/` (run with `NO_STDIO=1`) scans the 4-channel build: `libaudio_pipeline_mcab.a`, the DFN archive, the producers (including the spatial archives) and the sample objects `mcab_sample_flow.o` and `mcab_sample_beam.o`. `audit-no-stdio-stack` also builds
 AEC, NR and audiolib with `NO_STDIO=1`, scans each archive and links
-`mono_aec_nr_res/tests/test_no_stdio_stack.c` (query -> init -> one hop -> reset -> destroy over
+`mono/aec_nr_res/tests/test_no_stdio_stack.c` (query -> init -> one hop -> reset -> destroy over
 `Aec`, the denoiser and the synthesis, chained as the examples do) to prove the linked image has no stdio symbol. Run them after touching
 any diagnostic.
 

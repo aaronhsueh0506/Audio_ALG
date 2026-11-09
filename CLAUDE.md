@@ -45,13 +45,13 @@ make -C pipelines check-pins         # verify AEC_DIR/NR_DIR/AUDIOLIB_DIR match 
 # Build conventional mono examples + the DFN2 stage archive
 make -C pipelines
 # Build the 4-channel mcab flow archive + examples
-make -C pipelines/4ch_aec_bf_nr_res
+make -C pipelines/4ch
 
 # Tests (every C library/pipeline target takes SIMD=1 (default) / SIMD=0 (forced scalar, for
 # NEON-vs-scalar A/B parity) and WERROR=1 (promote warnings to errors, the closest thing to lint)):
 make -C pipelines test
 make -C pipelines SIMD=0 test
-make -C pipelines/4ch_aec_bf_nr_res test
+make -C pipelines/4ch test
 make -C AINR test               # also: test-simd (NEON+scalar in one run), test-pairs (all 15 DFN lookahead pairs)
 make -C AINR/RNNoise-ERB test
 make -C AIAEC test
@@ -127,7 +127,7 @@ via audiolib's `AcStft`/`AcIstft`; model libraries only ever see/produce spectra
 that itself performs STFT/ISTFT internally (`dfn_res_stage`, `dfn_rate_bridge`,
 `ulcnet_nn_stage`) is the exception that bridges a model into a different grid/host, not the norm.
 
-**`mcab` (4-channel flow, `pipelines/4ch_aec_bf_nr_res/mcab.h`) owns no library instances.** The
+**`mcab` (4-channel flow, `pipelines/4ch/mcab.h`) owns no library instances.** The
 application creates four `libaec` `Aec` lanes (plus one shared `DelayAec` in MATCHED delay mode)
 and injects them via `McabLibs`; `mcab` itself holds only flow state (delay admission, alignment
 ring, fuse buffers) and exposes no beamformer. This is deliberate — `mcab` is pipeline/flow

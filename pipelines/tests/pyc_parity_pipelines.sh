@@ -11,7 +11,7 @@
 #   (c) 4-channel shared-delay realign: the hop on which the lanes take a mixed warm/soft path at 48 kHz:
 #       stock Python 4ch against the C core on the same input.
 #   (d) mono pipeline glue (NR gain, min, apply, comfort noise, OLA): Python functions of
-#       mono_aec_nr_res/pipeline.py fed with the C AEC seam, against the C output.
+#       mono/aec_nr_res/pipeline.py fed with the C AEC seam, against the C output.
 #
 # Layers:
 #   Layer 1  std-math build (SIMD=0, -DUSE_STANDARD_MATH, NR's six USE_* optimisations off, i.e. NR's
@@ -120,7 +120,7 @@ NR_DIR="$(cd "$NR_DIR" && pwd)" || die "NR_DIR=$NR_DIR does not exist"
 COMMON_DIR="$(cd "$COMMON_DIR" && pwd)" || die "COMMON_DIR=$COMMON_DIR does not exist"
 AC="$COMMON_DIR"
 PL="$ALG/pipelines"
-P4="$PL/4ch_aec_bf_nr_res"
+P4="$PL/4ch"
 
 [ -d "$ALG" ] && [ -d "$AC" ] || die "tree $TREE must hold Audio_ALG/ and audiolib/common/"
 

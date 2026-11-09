@@ -665,7 +665,7 @@ checks only the layout version, the grid and the D range, so a graph trained on
 another front end (v3, another behaviour hash, another `filter_length`) with the
 same tensors passes it. `AIAEC/tests/test_deployed_frontend_contract.py` (run by
 `make -C AIAEC test`) closes that gap with `Align_ULCNet/frontend_gate.py`: it
-compiles the deployed mono lane (`pipelines/ulcnet/mono_alignulcnet/main.c`
+compiles the deployed mono lane (`pipelines/mono/alignulcnet/main.c`
 `derive_lane`, not a copy) once and runs it with `--sample-rate` for both grids,
 compares every `LinearAecContract` field plus partitions, saturation, delay bank
 and rate and live observer with the contract, and checks that an exported

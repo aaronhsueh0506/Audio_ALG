@@ -37,13 +37,13 @@ AEC_PY = ROOT / 'lib' / 'aec' / 'python'
 if str(AEC_PY) not in sys.path:
     sys.path.insert(0, str(AEC_PY))
 
-from pipelines.dfn.mono_aec_dfn_res.pipeline import make_stage, run_dfn2_res  # noqa: E402
+from pipelines.mono.aec_dfn_res.pipeline import make_stage, run_dfn2_res  # noqa: E402
 from pipelines.dfn.dfn2_stage import load_dfn2  # noqa: E402
 from lib.aec.python.aec import AecConfig  # noqa: E402
 
 
 def _load_dfn_post_module():
-    path = ROOT / 'pipelines' / 'dfn' / '4ch_aec_bf_dfn_res' / 'pipeline.py'
+    path = ROOT / 'pipelines' / '4ch' / 'aec_bf_dfn_res' / 'pipeline.py'
     spec = importlib.util.spec_from_file_location('dfn_eval_four_post', path)
     module = importlib.util.module_from_spec(spec)
     sys.modules[spec.name] = module

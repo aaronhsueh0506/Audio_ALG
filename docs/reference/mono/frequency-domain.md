@@ -39,7 +39,7 @@ follow the far talker. Comfort noise is driven by the AEC suppression gain so
 it fills echo-removal holes rather than every bin attenuated by NR, and its
 level is scaled by the denoiser gain of the bin, bounded below at -10 dB
 (`CNG_NR_GAIN_FLOOR` in the mono example, `MCAB_SAMPLE_CNG_NR_GAIN_FLOOR` in
-`pipelines/4ch_aec_bf_nr_res/mcab_sample_post.h`): the denoiser never sees the comfort noise, so applying
+`pipelines/4ch/mcab_sample_post.h`): the denoiser never sees the comfort noise, so applying
 its gain here keeps the fill near the denoised floor instead of the ambient
 level, while the bound keeps enough of it to mask the residual echo.
 
@@ -60,7 +60,7 @@ In the mono example `derive_lane()` resolves the rate's grid once with lib/aec's
 (`ac_stft_config_default()`) are all built from that grid's `fft_size`, so they share one set of
 dimensions by construction.
 
-The four-channel flow `mcab` (`pipelines/4ch_aec_bf_nr_res/`) uses the same three primary product grids
+The four-channel flow `mcab` (`pipelines/4ch/`) uses the same three primary product grids
 (16k/256/128, 16k/512/256, 48k/1024/512). AIAEC models remain a separate
 training/checkpoint contract even when a numeric grid happens to match.
 
@@ -71,9 +71,9 @@ with its own size query and `init`: lib/aec's `Aec` (`aec_process_context()`),
 the denoiser (`anr.h`) and `AcIstft`; the mono RES gain is the `Aec`'s own (`AecResContext.res_gain`,
 read with `aec_get_res_context()`, strength through `aec_set_level()`). Each example `main`
 initialises the libraries it uses and writes the per-hop sequence itself; the example headers
-(`pipelines/common/example_cli.h`, `pipelines/4ch_aec_bf_nr_res/mcab_sample_post.h`) carry no ABI and
+(`pipelines/common/example_cli.h`, `pipelines/4ch/mcab_sample_post.h`) carry no ABI and
 no layout version. The only multi-channel piece is
-`mcab`, the 4-channel flow layer, `pipelines/4ch_aec_bf_nr_res/mcab.h`: it is not a library that
+`mcab`, the 4-channel flow layer, `pipelines/4ch/mcab.h`: it is not a library that
 builds its own parts. The application creates the four `Aec` lanes and, in MATCHED mode, the shared
 `DelayAec`, and hands the pointers to `mcab_init_ex()`; mcab keeps only flow state (delay admission,
 alignment ring, fuse buffers) in a caller-owned 16-byte-aligned pool initialized from a versioned

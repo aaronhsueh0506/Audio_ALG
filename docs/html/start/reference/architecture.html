@@ -446,9 +446,9 @@ G[k] = G<sub>LSA</sub><sup>p[k]</sup> · g<sub>min</sub><sup>1−p[k]</sup>
   <tr><td><a href="architecture-aec.html">architecture_aec.html</a>、<a href="architecture-detail.html">architecture_detail.html</a></td><td>本頁拆出的 AEC 細節，以及效能／level／已知限制</td></tr>
   <tr><td><a href="../../../../pipelines/README.md">pipelines/README.md</a></td><td>目前的介面契約、CLI 與建置</td></tr>
   <tr><td><a href="../../../../lib/aec/docs/aec_methods.md">lib/aec/docs/aec_methods.md</a></td><td>AEC／RES 演算法本體</td></tr>
-  <tr><td><code>pipelines/mono_aec_nr_res/main.c</code></td><td>範例：初始化 <code>Aec</code>／<code>AnrDenoiser</code>／<code>AcIstft</code> 並以 <code>mono_form()</code> 明寫逐 hop 串接；同一份原始碼建出 <code>aec_nr_pipeline</code>（<code>-DAEC_NR_POOL_SPLIT=1</code>，兩塊 pool）與 <code>aec_nr_pipeline_static</code>（一塊 pool，另有 <code>--print-mem-size</code>）</td></tr>
-  <tr><td><code>pipelines/4ch_aec_bf_nr_res/mcab_sample_post.h</code></td><td>4ch 範例的後級接線：<code>mcab_sample_res_input()</code>（<code>AecResInput</code>）、<code>mcab_sample_anr_gain()</code>（NR 增益）與 CNG 常數；mono 的對應函式是 <code>mono_nr_gain()</code>（同在 <code>main.c</code>）</td></tr>
-  <tr><td><code>pipelines/mono_aec_nr_res/tests/test_mono_chain.c</code></td><td>串接驗收，對手寫 oracle <code>conv_chain_mono.h</code> 比對</td></tr>
+  <tr><td><code>pipelines/mono/aec_nr_res/main.c</code></td><td>範例：初始化 <code>Aec</code>／<code>AnrDenoiser</code>／<code>AcIstft</code> 並以 <code>mono_form()</code> 明寫逐 hop 串接；同一份原始碼建出 <code>aec_nr_pipeline</code>（<code>-DAEC_NR_POOL_SPLIT=1</code>，兩塊 pool）與 <code>aec_nr_pipeline_static</code>（一塊 pool，另有 <code>--print-mem-size</code>）</td></tr>
+  <tr><td><code>pipelines/4ch/mcab_sample_post.h</code></td><td>4ch 範例的後級接線：<code>mcab_sample_res_input()</code>（<code>AecResInput</code>）、<code>mcab_sample_anr_gain()</code>（NR 增益）與 CNG 常數；mono 的對應函式是 <code>mono_nr_gain()</code>（同在 <code>main.c</code>）</td></tr>
+  <tr><td><code>pipelines/mono/aec_nr_res/tests/test_mono_chain.c</code></td><td>串接驗收，對手寫 oracle <code>conv_chain_mono.h</code> 比對</td></tr>
 </table>
 </div>
 

@@ -67,7 +67,7 @@ Query the exact pool budget for any configuration without running audio:
 
 ```bash
 ./aec_nr_pipeline_static --print-mem-size --sample-rate 16000
-./mcab_static --print-mem-size --sample-rate 16000                   # in 4ch_aec_bf_nr_res/
+./mcab_static --print-mem-size --sample-rate 16000                   # in 4ch/
 ```
 
 **Embedded-target integration:** allocate one contiguous, 16-byte-aligned
@@ -81,7 +81,7 @@ aligned (the libraries assert this).
 1. query    AecSignalGrid grid;  AecConfig aec_cfg;
             if (!aec_resolve_signal_grid(sample_rate, aec_default_fft_size(sample_rate), &grid)) fail;  // 0 = no such grid
             aec_config_from_level(&aec_cfg, level, sample_rate);    // then fft_size = grid.fft_size, enable_res = 0,
-                                                                    // return_res_context = 1 (see mono_aec_nr_res/main.c derive_lane())
+                                                                    // return_res_context = 1 (see mono/aec_nr_res/main.c derive_lane())
             AnrConfig nr_cfg = anr_config_for_level_grid(sample_rate, grid.fft_size, level);
             AcStftConfig synth_cfg;  ac_stft_config_default(&synth_cfg, grid.fft_size);
             synth_cfg.window = k_sizing_window;   // static const float k_sizing_window[1]; borrowed tables carve no pool, so any non-NULL stand-in sizes the synthesis; the AEC's own window is borrowed in step 3
