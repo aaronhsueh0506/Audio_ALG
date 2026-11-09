@@ -37,7 +37,7 @@ disas() { fp_contract_disas "$1"; }
 # contracts remain comparable. The per-hop gain chain the example programs write out only calls
 # kernels audited elsewhere.
 ENTRIES='
-.:libaudio_pipeline_dfn.a:dfn_res_stage.o:shared DFN post-RES stage -- boundary scaling by the grid stft_scale / stft_unscale
+.:libaudio_pipeline_dfn.a:dfn_res_stage.o:shared DFN post-RES stage -- boundary scaling by dfn2_stft_scale()/dfn2_stft_unscale()
 .:libaudio_pipeline_dfn.a:dfn_rate_bridge.o:DFN rate bridge -- native and 48 kHz WOLA, analysis windows
 .:libaudio_pipeline_dfn.a:dfn2_process.o:DFN feature and streaming enhance-spectrum kernels
 .:mono_alignulcnet:ulcnet_nn_stage.o:Align-ULCNet stage (mono build) -- far-end analysis and enhanced-spectrum synthesis

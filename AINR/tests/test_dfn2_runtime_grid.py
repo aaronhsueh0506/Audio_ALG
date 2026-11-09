@@ -9,13 +9,13 @@ and the property that the library holds no grid of its own:
                          and state, skipped and unwritten frames) runs on every grid and
                          lookahead pair, NEON and scalar, full and mask-only, and every one
                          prints its own digest.
-  pool identity          get_mem_size differs between grids, lookahead pairs, full and
-                         mask-only and each normaliser field; init_ex refuses a MemReq of
-                         another grid or pair; a descriptor of one grid is refused by the host
-                         of another. Pool bytes and hash equal an independent Python mirror of
-                         the layout rules (``_PoolMirror``), not a recorded constant.
-  normaliser fields      the seven normaliser settings of the spec are in the pool hash alone
-                         and reach the state ``dfn2_state_init()`` starts
+  pool identity          get_mem_size differs between grids, lookahead pairs and full vs.
+                         mask-only; init_ex refuses a MemReq of another grid or pair; a
+                         descriptor of one grid is refused by the host of another. Pool bytes
+                         and hash equal an independent Python mirror of the layout rules
+                         (``_PoolMirror``), not a recorded constant. The seven feature-
+                         normaliser settings are fixed constants inside ``dfn2_grid.h`` now
+                         (no longer spec fields), so they are no longer swept here.
   registered state       the all-or-none registration rule, the board form (nothing registered:
                          generation moves as documented, no foreign buffer touched) and the stale
                          pool gate (a refused init_ex leaves the pool and the state unchanged)
@@ -206,13 +206,14 @@ def test_the_chain_tells_grids_and_pairs_apart(matrix, simd):
 
 @pytest.mark.parametrize('simd', SIMD_MODES, ids=['neon', 'scalar'])
 def test_the_chain_reads_every_spec_field(matrix, simd):
-    """The optional spec fields of the driver (order, taus, starts, scale) reach the chain:
-    each one alone changes the digest of the shipped grid."""
+    """The optional spec field of the driver (order) reaches the chain: it alone changes the
+    digest of the shipped grid. The seven feature-normaliser settings used to be optional
+    fields here too; they are fixed constants inside dfn2_grid.h now, so there is nothing left
+    to sweep for them at this level (see test_dfn2_grid.py's sample-rate sweeps instead)."""
     grid, pair = GRIDS['g16'], (1, 1)
     base = _digest(matrix.run_chain('full', simd, grid, pair))
     changed = {}
-    for option in ('order=4', 'order=7', 'erb_tau=0.5', 'erb_lo=-70', 'erb_hi=-80',
-                   'erb_scale=30', 'spec_tau=0.5', 'spec_lo=0.002', 'spec_hi=0.0002'):
+    for option in ('order=4', 'order=7'):
         digest = _digest(matrix.run_chain('full', simd, grid, pair, option))
         assert digest != base, option
         changed[option] = digest
@@ -224,6 +225,7 @@ def test_the_chain_driver_rejects_bad_arguments(matrix):
     for args in ([], ['1', '2', '3'], ['16000', '256', '24', '96', '1', 'x'],
                  ['16000', '256', '24', '96', '1'],
                  ['16000', '256', '24', '96', '1', '1', 'bogus=1'],
+                 ['16000', '256', '24', '96', '1', '1', 'erb_tau=0'],
                  ['16000', '256', '24', '96', '1', '1', 'order=x'],
                  ['16000', '256', '24', '96', '1', '1', 'frames=2']):
         assert subprocess.run([str(exe), *args], capture_output=True,
@@ -231,9 +233,6 @@ def test_the_chain_driver_rejects_bad_arguments(matrix):
     done = subprocess.run([str(exe), '16000', '960', '24', '96', '1', '1'],
                           capture_output=True, text=True)
     assert done.returncode == 3 and 'audiolib' in done.stdout, done.stdout
-    done = subprocess.run([str(exe), '16000', '256', '24', '96', '1', '1', 'erb_tau=0'],
-                          capture_output=True, text=True)
-    assert done.returncode == 3 and 'grid refused' in done.stdout, done.stdout
 
 
 def test_the_digests_of_the_shipped_grids_are_printed_for_the_record(matrix, capsys):
@@ -268,23 +267,22 @@ static float fwd[MAX_BINS * MAX_ERB], inv[MAX_BINS * MAX_ERB];
 static float zeros[MAX_BINS];
 static int infer_calls;
 
-/* The seven normaliser settings and the order of the shipped model (config.ini), the spec's
- * other fields for every grid; "[order tau lo hi scale tau lo hi]" after a grid overrides them. */
-static const float defaults[8] = { @ORDER@, @ERB_TAU@, @ERB_LO@, @ERB_HI@, @ERB_SCALE@,
-                                   @SPEC_TAU@, @SPEC_LO@, @SPEC_HI@ };
+/* The order of the shipped model (config.ini), the spec's other field for every grid;
+ * "[order]" after a grid overrides it. The seven normaliser settings are fixed constants
+ * inside dfn2_grid.h now, not spec fields: nothing left to override here. */
+static const float defaults[1] = { @ORDER@ };
 
 static int read_grid(const char *text, DFN2Grid *g, int *used) {
     DFN2GridSpec spec;
-    float v[8];
+    float v[1];
     int a, b, c, d, e, f, n = 0, m = 0, k;
     if (sscanf(text, "%d %d %d %d %d %d%n", &a, &b, &c, &d, &e, &f, &n) != 6) return -2;
-    for (k = 0; k < 8; ++k) v[k] = defaults[k];
+    for (k = 0; k < 1; ++k) v[k] = defaults[k];
     while (text[n] == ' ') ++n;
     if (text[n] == '[') {
-        float t[8];
-        if (sscanf(text + n + 1, "%f %f %f %f %f %f %f %f%n", &t[0], &t[1], &t[2], &t[3], &t[4],
-                   &t[5], &t[6], &t[7], &m) != 8) return -2;
-        for (k = 0; k < 8; ++k) v[k] = t[k];
+        float t[1];
+        if (sscanf(text + n + 1, "%f%n", &t[0], &m) != 1) return -2;
+        for (k = 0; k < 1; ++k) v[k] = t[k];
         n += 1 + m;
         while (text[n] == ' ') ++n;
         if (text[n] != ']') return -2;
@@ -299,13 +297,6 @@ static int read_grid(const char *text, DFN2Grid *g, int *used) {
     spec.mask_lookahead = e;
     spec.df_lookahead = f;
     spec.frames_per_call = 1;
-    spec.erb_norm_tau_sec = v[1];
-    spec.erb_norm_init_lo_db = v[2];
-    spec.erb_norm_init_hi_db = v[3];
-    spec.erb_norm_scale_db = v[4];
-    spec.spec_norm_tau_sec = v[5];
-    spec.spec_norm_init_lo = v[6];
-    spec.spec_norm_init_hi = v[7];
     *used = n;
     return dfn2_grid_make(g, &spec);
 }
@@ -550,21 +541,6 @@ int main(void) {
             }
             printf("descfield %d %d %d\n", (int)(sizeof words / sizeof words[0]), refused,
                    dfn2_model_io_descriptor_validate(&a, &d));
-        } else if (!strcmp(verb, "starts")) {
-            /* starts <grid>: what dfn2_state_init() puts into the two normalisers: the first and
-             * last band of the ERB one, the first and last bin of the spectrum one */
-            static DFN2State dsp;
-            size_t bytes = dfn2_state_mem_size(&a);
-            void *block = aligned_alloc(16, bytes);
-            if (!block || dfn2_state_init(&dsp, block, bytes, &a) != 0) {
-                printf("starts noinit\n");
-                free(block);
-                continue;
-            }
-            printf("starts %.9g %.9g %.9g %.9g\n", (double)dsp.erb_norm_state[0],
-                   (double)dsp.erb_norm_state[a.n_erb - 1], (double)dsp.spec_norm_state[0],
-                   (double)dsp.spec_norm_state[a.df_bins - 1]);
-            free(block);
         } else if (!strcmp(verb, "nullcalls")) {
             DFN2ModelIoDescriptor d;
             DFN2PrepostConfig cfg;
@@ -797,13 +773,7 @@ int main(void) {
 
 def _pool_main():
     values = dfn_pairs.dfn2_spec_values()
-    text = _POOL_MAIN
-    for token, key in (('ERB_TAU', 'erb_norm_tau_sec'), ('ERB_LO', 'erb_norm_init_lo_db'),
-                       ('ERB_HI', 'erb_norm_init_hi_db'), ('ERB_SCALE', 'erb_norm_scale_db'),
-                       ('SPEC_TAU', 'spec_norm_tau_sec'), ('SPEC_LO', 'spec_norm_init_lo'),
-                       ('SPEC_HI', 'spec_norm_init_hi')):
-        text = text.replace('@%s@' % token, repr(values[key]) + 'f')
-    return text.replace('@ORDER@', '%d.0f' % values['df_order'])
+    return _POOL_MAIN.replace('@ORDER@', '%d.0f' % values['df_order'])
 
 
 _PARSE_REQ = re.compile(r'req (-?\d+) (\d+) ([0-9a-f]{8})')
@@ -828,12 +798,14 @@ class _Pool:
 
     @staticmethod
     def grid_text(grid, overrides=None):
-        """'sr fft erb df mask dfla' and, with `overrides` (a dict of the spec fields of
-        dfn2_spec_values), the bracketed order and normaliser values."""
+        """'sr fft erb df mask dfla' and, with `overrides` (at most {'df_order': N}), the
+        bracketed order override. The seven normaliser settings are fixed constants inside
+        dfn2_grid.h now, not spec fields, so the order is the only thing left to override."""
         text = '%d %d %d %d %d %d' % grid
         if overrides:
+            assert set(overrides) <= {'df_order'}, overrides
             values = {**dfn_pairs.dfn2_spec_values(), **overrides}
-            text += ' [%d %s]' % (values['df_order'], ' '.join(repr(values[k]) for k in _NORM_KEYS))
+            text += ' [%d]' % values['df_order']
         return text
 
     def req(self, grid, overrides=None):
@@ -841,16 +813,6 @@ class _Pool:
             self.run(['req ' + self.grid_text(grid, overrides)])[0]).groups()
         assert status == '0', (grid, status)
         return int(size), digest
-
-    def starts(self, grid, overrides=None):
-        """[erb first, erb last, spec first, spec last] as dfn2_state_init() set them, float32."""
-        verb, *fields = self.run(['starts ' + self.grid_text(grid, overrides)])[0].split()
-        assert verb == 'starts' and len(fields) == 4, fields
-        return [float(np.float32(f)) for f in fields]
-
-
-_NORM_KEYS = ('erb_norm_tau_sec', 'erb_norm_init_lo_db', 'erb_norm_init_hi_db', 'erb_norm_scale_db',
-              'spec_norm_tau_sec', 'spec_norm_init_lo', 'spec_norm_init_hi')
 
 
 @pytest.fixture(scope='module')
@@ -862,7 +824,7 @@ def pools(builds):
             for name, objs, flags in (('full', full, []), ('mask', mask, [_MASK]))}
 
 
-def test_pool_identity_follows_the_grid_the_pair_the_variant_and_the_taus(pools):
+def test_pool_identity_follows_the_grid_the_pair_and_the_variant(pools):
     full, mask = pools['full'], pools['mask']
     shipped = full.req(_SHIPPED)
     assert full.req(_SHIPPED) == shipped, 'get_mem_size is a pure function of the config'
@@ -886,52 +848,15 @@ def test_pool_identity_follows_the_grid_the_pair_the_variant_and_the_taus(pools)
     full_48, mask_48 = full.req((48000, 1024, 32, 96, 1, 0)), mask.req((48000, 1024, 32, 96, 1, 0))
     assert mask_48[0] < full_48[0] and mask_48[1] != full_48[1]
     assert mask.req((16000, 256, 24, 96, 1, 0)) == mask_16 != mask.req((16000, 256, 24, 96, 0, 0))
-    # Either tau alone is in the hash (a model trained with another time constant), and so is
-    # the order.
+    # The order alone is in the hash (a model trained with another filter length). The seven
+    # feature-normaliser settings are fixed constants inside dfn2_grid.h now, not spec fields,
+    # so there is nothing left to vary there (dfn2_grid.h, dfn2_prepost.c's pp_build_hash()).
     base_grid = (16000, 256, 24, 96, 1, 1)
     base = full.req(base_grid)
     assert full.req(base_grid, {}) == base
-    erb_only = full.req(base_grid, {'erb_norm_tau_sec': 0.5})
-    spec_only = full.req(base_grid, {'spec_norm_tau_sec': 0.5})
-    both = full.req(base_grid, {'erb_norm_tau_sec': 0.5, 'spec_norm_tau_sec': 0.5})
     order = full.req(base_grid, {'df_order': 6})
-    assert len({base[1], erb_only[1], spec_only[1], both[1], order[1]}) == 5
-    assert erb_only[0] == spec_only[0] == both[0] == base[0], 'a tau changes the hash only'
+    assert order[1] != base[1], 'the order is not in the hash'
     assert order[0] > base[0], 'a longer filter needs a bigger pool'
-
-
-# The normaliser settings of the spec besides the taus: each is in the pool hash and none of
-# them changes the pool size. Each entry: the spec field, the slot of the state
-# dfn2_state_init() fills with it (erb first/last, spec first/last; None for the scale, which
-# scales the feature and starts nothing), the value tried.
-_NORMALISER_FIELDS = [
-    ('erb_norm_init_lo_db', 0, -70.0),
-    ('erb_norm_init_hi_db', 1, -80.0),
-    ('erb_norm_scale_db', None, 30.0),
-    ('spec_norm_init_lo', 2, 0.002),
-    ('spec_norm_init_hi', 3, 0.0002),
-]
-
-
-@pytest.mark.parametrize('field,slot,value', _NORMALISER_FIELDS,
-                         ids=[f for f, _s, _v in _NORMALISER_FIELDS])
-def test_the_pool_hash_reads_each_normaliser_field_and_the_state_starts_from_it(
-        pools, field, slot, value):
-    """A normaliser setting changes the pool hash and nothing else about the pool, and the state
-    dfn2_state_init() starts is the one the hash describes."""
-    full = pools['full']
-    base = full.req(_SHIPPED)
-    changed = full.req(_SHIPPED, {field: value})
-    assert changed[1] != base[1], 'the setting is not in the hash'
-    assert changed[0] == base[0], 'a normaliser setting changes the hash only'
-    default_state = full.starts(_SHIPPED)
-    state = full.starts(_SHIPPED, {field: value})
-    if slot is None:
-        assert state == default_state, 'the scale is not part of the state'
-    else:
-        # (the last band / bin is lo + 1.0 * (hi - lo) in float32: equal to hi within an ulp)
-        assert state[slot] == pytest.approx(float(np.float32(value)), rel=1e-6), state
-        assert state != default_state
 
 
 class _PoolMirror:
@@ -944,7 +869,7 @@ class _PoolMirror:
     layout or of the hash walk is made on purpose, in both places."""
 
     LAYOUT_VERSION = {False: 8, True: 9}
-    CARVE_VERSION = 11
+    CARVE_VERSION = 12
     MODEL_INPUT_FRAMES = 3
     FEATURE_VERSION = 'dfn2_libdf_wnorm_upstream_init_no_eps_v5'
 
@@ -966,8 +891,10 @@ class _PoolMirror:
         return (offset + align - 1) // align * align, align
 
     def _grid(self):
-        # DFN2Grid: two float taus, 13 ints (sample_rate .. input_frames), 9 floats
-        return self._struct_size(['float'] * 2 + ['int'] * 13 + ['float'] * 9)
+        # DFN2Grid: 13 ints (sample_rate .. input_frames), 2 floats (erb_norm_alpha,
+        # spec_norm_alpha). The seven tau/init/scale fields and stft_scale/stft_unscale moved
+        # out to fixed constants and dfn2_stft_scale()/dfn2_stft_unscale() (dfn2_grid.h).
+        return self._struct_size(['int'] * 13 + ['float'] * 2)
 
     def _state_header(self, mask):
         fields = [self._grid()] + ['ptr'] * 2 + ['ptr'] * 2
@@ -1062,12 +989,19 @@ class _PoolMirror:
             precision += 1
         return np.float32(alpha)
 
-    def build_hash(self, g, norm):
-        """`norm` = (erb tau, lo, hi, scale, spec tau, lo, hi)."""
+    # dfn2_grid.h's fixed-tau constants (DFN2_ERB_NORM_TAU_SEC, DFN2_SPEC_NORM_TAU_SEC): no
+    # longer spec fields, so the mirror hard-codes them like the library does.
+    ERB_NORM_TAU_SEC = 1.0
+    SPEC_NORM_TAU_SEC = 1.0
+
+    def build_hash(self, g):
+        """dfn2_prepost.c's pp_build_hash(): the grid's own fields plus the fixed-tau alphas and
+        the stft scale/unscale derived from n_fft -- the seven tau/init/scale settings are no
+        longer part of the hash at all (they are compile-time constants, identical for every
+        grid)."""
         mask = g['mask']
-        et, elo, ehi, esc, st, slo, shi = norm
-        erb_a = self.norm_alpha(g['sample_rate'], g['hop'], et)
-        spec_a = self.norm_alpha(g['sample_rate'], g['hop'], st)
+        erb_a = self.norm_alpha(g['sample_rate'], g['hop'], self.ERB_NORM_TAU_SEC)
+        spec_a = self.norm_alpha(g['sample_rate'], g['hop'], self.SPEC_NORM_TAU_SEC)
         scale = np.float32(1.0) / np.sqrt(np.float32(g['n_fft']))
         unscale = np.sqrt(np.float32(g['n_fft']))
         history = 0 if mask else g['df_order'] - g['df_lookahead'] - 1
@@ -1080,7 +1014,7 @@ class _PoolMirror:
         for ch in self.FEATURE_VERSION.encode():
             h ^= ch
             h = (h * 16777619) & 0xFFFFFFFF
-        for v in (et, st, erb_a, spec_a, scale, unscale, elo, ehi, esc, slo, shi):
+        for v in (erb_a, spec_a, scale, unscale):
             h = self._fnv(h, self._bits(v))
         if self.P == 4:                       # audiolib's ABI token on an ILP32 build
             for ch in b'|abi:ilp32':
@@ -1093,9 +1027,6 @@ _MIRROR_ROWS = [
     ((48000, 1024, 32, 96, 1, 1), {}), ((16000, 256, 24, 96, 0, 0), {}),
     ((16000, 256, 24, 96, 1, 1), {}), ((32000, 512, 28, 96, 2, 4), {}),
     ((24000, 512, 24, 64, 1, 2), {}), ((16000, 256, 24, 96, 1, 1), {'df_order': 7}),
-    ((16000, 256, 24, 96, 1, 1), {'erb_norm_tau_sec': 0.3, 'spec_norm_tau_sec': 2.0}),
-    ((16000, 256, 24, 96, 1, 1), {'erb_norm_init_lo_db': -70.0, 'erb_norm_scale_db': 30.0,
-                                  'spec_norm_init_hi': 0.0005}),
     ((8000, 128, 16, 40, 1, 1), {'df_order': 3}),
 ]
 
@@ -1104,8 +1035,8 @@ _MIRROR_ROWS = [
 @pytest.mark.parametrize('pool_name', ['full', 'mask'])
 def test_pool_equals_the_independent_mirror(pools, pool_name):
     """The pool bytes and the build-flags hash of the C library equal the Python mirror of the
-    layout rules, for the shipped grid and others, orders and normaliser settings. The mirror
-    holds the formula, so a deliberate layout change is made here as well as in the library."""
+    layout rules, for the shipped grid and others and orders. The mirror holds the formula, so a
+    deliberate layout change is made here as well as in the library."""
     mask = pool_name == 'mask'
     pool = pools[pool_name]
     mirror = _PoolMirror(8)
@@ -1113,9 +1044,8 @@ def test_pool_equals_the_independent_mirror(pools, pool_name):
         grid = (*grid[:5], 0) if mask else grid
         values = {**dfn_pairs.dfn2_spec_values(), **overrides}
         g = _PoolMirror.derive(*grid, mask, order=values['df_order'])
-        norm = tuple(values[k] for k in _NORM_KEYS)
         size, digest = pool.req(grid, overrides)
-        assert (size, digest) == (mirror.pool_bytes(g), '%08x' % mirror.build_hash(g, norm)), (
+        assert (size, digest) == (mirror.pool_bytes(g), '%08x' % mirror.build_hash(g)), (
             pool_name, grid, overrides, size, digest)
 
 
@@ -1143,13 +1073,12 @@ def test_init_ex_refuses_a_memreq_of_another_grid_or_pair(pools, pool_name):
     for other, line in zip(others + others, results[1:]):
         own, cross, tampered = map(int, line.split()[1:])
         assert (own, cross, tampered) == (1, 0, 6), (other, line)
-    # A MemReq of another tau or order is refused as well.
-    tau = ['initex %s  %s' % (_Pool.grid_text(base, {'erb_norm_tau_sec': 0.5}),
-                              _Pool.grid_text(base)),
-           'initex %s  %s' % (_Pool.grid_text(base, {'df_order': 6}), _Pool.grid_text(base))]
-    if mask:
-        tau = tau[:1]   # the order is not part of the mask-only model
-    for line in pool.run(tau):
+    # A MemReq of another order is refused as well (the order is not part of the mask-only
+    # model, which has nothing left to vary here: the seven feature-normaliser settings are
+    # fixed constants, not spec fields).
+    order = [] if mask else ['initex %s  %s' % (_Pool.grid_text(base, {'df_order': 6}),
+                                                _Pool.grid_text(base))]
+    for line in pool.run(order):
         own, cross, tampered = map(int, line.split()[1:])
         assert (own, cross, tampered) == (1, 0, 6), line
 
@@ -1268,7 +1197,6 @@ def _stale_neighbours(mask):
     if not mask:
         others += [(16000, 256, 24, 96, 1, 0), (16000, 256, 24, 96, 2, 2), (16000, 256, 24, 96, 0, 1)]
     texts = [_Pool.grid_text(other) for other in others]
-    texts.append(_Pool.grid_text(base, {'erb_norm_tau_sec': 0.5}))
     if not mask:
         texts.append(_Pool.grid_text(base, {'df_order': 6}))
     return _Pool.grid_text(base), texts
@@ -1523,20 +1451,13 @@ def _compile_test_grid_tu(work, header_dir, flags, name='tu'):
 def test_the_test_grid_header_stands_alone(tmp_path, grid):
     """dfn2_test_grid.h, included alone, compiles under the house flags (-Wall -Wextra -Wpedantic
     -Werror) for every preset, a custom grid and mask-only. Its scale macros call sqrtf, so the
-    header includes <math.h> itself instead of relying on what the library headers pull in."""
-    done = _compile_test_grid_tu(tmp_path, TESTS_DIR, _TEST_GRIDS[grid])
-    assert done.returncode == 0, done.stderr
-
-
-def test_the_stand_alone_gate_can_fail(tmp_path):
-    """The same translation unit against a copy of the header without its <math.h> include does
-    not compile (sqrtf is undeclared)."""
+    header keeps its own <math.h> include (dfn2_grid.h now also needs <math.h>, for
+    dfn2_stft_scale()/dfn2_stft_unscale(), so this header's own include is no longer provably
+    load-bearing by itself -- it is still correct hygiene, pinned textually below)."""
     text = (TESTS_DIR / 'dfn2_test_grid.h').read_text(encoding='utf-8')
     assert text.count('#include <math.h>\n') == 1
-    (tmp_path / 'dfn2_test_grid.h').write_text(text.replace('#include <math.h>\n', ''),
-                                              encoding='utf-8')
-    done = _compile_test_grid_tu(tmp_path, tmp_path, [])
-    assert done.returncode != 0 and 'sqrtf' in done.stderr, done.stderr
+    done = _compile_test_grid_tu(tmp_path, TESTS_DIR, _TEST_GRIDS[grid])
+    assert done.returncode == 0, done.stderr
 
 
 _BORDERS_MAIN = r'''
@@ -1590,9 +1511,6 @@ int main(void) {
     DFN2GridSpec spec = {
         .sample_rate = 16000, .n_fft = 256, .n_erb = 24, .df_bins = 96, .df_order = 5,
         .mask_lookahead = 1, .df_lookahead = 0, .frames_per_call = 1,
-        .erb_norm_tau_sec = 1.0f, .erb_norm_init_lo_db = -60.0f, .erb_norm_init_hi_db = -90.0f,
-        .erb_norm_scale_db = 40.0f, .spec_norm_tau_sec = 1.0f, .spec_norm_init_lo = 0.001f,
-        .spec_norm_init_hi = 0.0001f,
     };
     DFN2Grid grid;
     DFN2PrepostConfig cfg;

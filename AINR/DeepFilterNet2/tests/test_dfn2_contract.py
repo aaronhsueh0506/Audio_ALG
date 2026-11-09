@@ -660,14 +660,9 @@ int main(void) {
            g->df_lookahead, g->df_history, g->ring);
     printf("erb_alpha=%.9g spec_alpha=%.9g stft_scale=%.9g "
            "stft_unscale=%.9g\n", (double)g->erb_norm_alpha,
-           (double)g->spec_norm_alpha, (double)g->stft_scale,
-           (double)g->stft_unscale);
-    printf("df_order=%d frames=%d erb_tau=%.9g erb_lo=%.9g erb_hi=%.9g "
-           "erb_scale=%.9g spec_tau=%.9g spec_lo=%.9g spec_hi=%.9g\n",
-           g->df_order, g->frames_per_call, (double)g->erb_norm_tau_sec,
-           (double)g->erb_norm_init_lo_db, (double)g->erb_norm_init_hi_db,
-           (double)g->erb_norm_scale_db, (double)g->spec_norm_tau_sec,
-           (double)g->spec_norm_init_lo, (double)g->spec_norm_init_hi);
+           (double)g->spec_norm_alpha, (double)dfn2_stft_scale(g->n_fft),
+           (double)dfn2_stft_unscale(g->n_fft));
+    printf("df_order=%d frames=%d\n", g->df_order, g->frames_per_call);
     return 0;
 }
 """
@@ -774,12 +769,9 @@ def test_the_default_test_grid_is_the_grid_and_pair_config_ini_names(c_probe):
     assert got['history'] == df_order - df - 1
     assert got['ring'] == max(df_order, mask + df + 1)
     assert got['df_order'] == df_order and got['frames'] == 1
-    # the seven normaliser settings of the test table are config.ini [feature]
-    assert tuple(np.float32(got[key]) for key in (
-        'erb_tau', 'erb_lo', 'erb_hi', 'erb_scale', 'spec_tau', 'spec_lo', 'spec_hi')) == tuple(
-        np.float32(feature_cfg[key]) for key in (
-            'erb_tau_sec', 'erb_init_lo_db', 'erb_init_hi_db', 'erb_scale_db',
-            'spec_tau_sec', 'spec_init_lo', 'spec_init_hi'))
+    # The seven normaliser settings of config.ini [feature] are fixed constants inside
+    # dfn2_grid.h now (DFN2_ERB_NORM_TAU_SEC etc.), not spec/grid fields the C probe can
+    # report; only the derived alphas and the stft scale/unscale remain run-time-visible.
     assert np.float32(got['erb_alpha']) == np.float32(feature_cfg['erb_alpha'])
     assert np.float32(got['spec_alpha']) == np.float32(
         feature_cfg['spec_alpha'])

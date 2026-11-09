@@ -43,11 +43,9 @@ static inline uint32_t stream_fnv1a_u32(uint32_t h, uint32_t v) {
 }
 
 /* float PCM (full-scale ~=1.0f) -> saturated int16: scale by 32768 first, then clip to the
- * asymmetric int16 range. A NaN input (reachable: a finite but extreme accelerator output can
- * still overflow to NaN in the DSP between the accelerator and this saturate) would otherwise
- * reach `(int16_t)v`, which is undefined behavior for a non-finite float (confirmed under
- * UBSan). +-Inf already clip correctly without this check. Defined here as silence (0), matching
- * this codebase's convention that a non-finite result is invalid, not propagated. */
+ * asymmetric int16 range. A NaN input (reachable from an extreme accelerator output) would
+ * otherwise reach `(int16_t)v`, undefined behavior for a non-finite float; defined here as
+ * silence (0). +-Inf already clip correctly without this check. */
 static inline int16_t stream_saturate_s16(float v) {
     v *= 32768.0f;
     if (isnan(v)) return 0;   /* only NaN is UB here; +-Inf already clip correctly below */

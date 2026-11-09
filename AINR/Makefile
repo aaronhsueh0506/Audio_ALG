@@ -1,5 +1,6 @@
 CC ?= cc
 AR ?= ar
+RANLIB ?= ranlib
 CFLAGS ?= -O2 -std=c11 -Wall -Wextra -Wpedantic
 # The floating-point contract and project include paths are invariants of the
 # C/Python parity boundary. Keep them even when a board build overrides

@@ -1,8 +1,7 @@
 /* DFN2 pre/post chain on a grid given by arguments: the driver of test_dfn2_runtime_grid.py.
  *
  *   dfn2_runtime_grid_chain <sample_rate> <n_fft> <n_erb> <df_bins> <mask_lookahead> <df_lookahead>
- *                           [order=N] [frames=N] [erb_tau=X] [erb_lo=X] [erb_hi=X] [erb_scale=X]
- *                           [spec_tau=X] [spec_lo=X] [spec_hi=X]
+ *                           [order=N] [frames=N]
  *
  * It builds the grid with dfn2_grid_make() (the optional fields default to the shipped model's,
  * dfn2_test_grid.h), runs the whole pre/post chain through the frequency-domain entries with a
@@ -378,13 +377,6 @@ int main(int argc, char **argv)
         double x = 0.0;
         if (arg_key(argv[i], "order", &x) == 0) spec.df_order = (int)x;
         else if (arg_key(argv[i], "frames", &x) == 0) spec.frames_per_call = (int)x;
-        else if (arg_key(argv[i], "erb_tau", &x) == 0) spec.erb_norm_tau_sec = (float)x;
-        else if (arg_key(argv[i], "erb_lo", &x) == 0) spec.erb_norm_init_lo_db = (float)x;
-        else if (arg_key(argv[i], "erb_hi", &x) == 0) spec.erb_norm_init_hi_db = (float)x;
-        else if (arg_key(argv[i], "erb_scale", &x) == 0) spec.erb_norm_scale_db = (float)x;
-        else if (arg_key(argv[i], "spec_tau", &x) == 0) spec.spec_norm_tau_sec = (float)x;
-        else if (arg_key(argv[i], "spec_lo", &x) == 0) spec.spec_norm_init_lo = (float)x;
-        else if (arg_key(argv[i], "spec_hi", &x) == 0) spec.spec_norm_init_hi = (float)x;
         else {
             fprintf(stderr, "unknown option: %s\n", argv[i]);
             return 2;

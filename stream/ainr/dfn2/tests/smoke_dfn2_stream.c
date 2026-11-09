@@ -81,13 +81,6 @@ int main(void) {
     spec.df_lookahead = 1;
 #endif
     spec.frames_per_call = 1;
-    spec.erb_norm_tau_sec = 1.0f;
-    spec.erb_norm_init_lo_db = -60.0f;
-    spec.erb_norm_init_hi_db = -90.0f;
-    spec.erb_norm_scale_db = 40.0f;
-    spec.spec_norm_tau_sec = 1.0f;
-    spec.spec_norm_init_lo = 0.001f;
-    spec.spec_norm_init_hi = 0.0001f;
 
     if (dfn2_grid_make(&grid, &spec) != DFN2_GRID_OK) {
         fprintf(stderr, "dfn2_grid_make failed\n");

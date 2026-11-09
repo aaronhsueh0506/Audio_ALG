@@ -3,6 +3,27 @@
 `Audio_ALG/pipelines`（含它建置的 `AINR`、`AIAEC` C 程式）的重要改動記錄在此，格式依
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/)。README 只寫現況，改動經過寫在這裡。
 
+## [Unreleased] — 2026-11-08 — DFN2 grid: the feature-normaliser settings and FFT scale become fixed, not carried fields
+
+### Changed
+- `lib/ainr/dfn2/dfn2_grid.h`'s `DFN2GridSpec` and `DFN2Grid` lose the seven feature-normaliser
+  tau/init/scale fields (`erb_norm_tau_sec`, `erb_norm_init_lo_db`, `erb_norm_init_hi_db`,
+  `erb_norm_scale_db`, `spec_norm_tau_sec`, `spec_norm_init_lo`, `spec_norm_init_hi`) and
+  `DFN2Grid` loses `stft_scale`/`stft_unscale`: they never varied across any shipped grid, so
+  they are now fixed constants (`DFN2_ERB_NORM_TAU_SEC` etc.) and two pure functions
+  (`dfn2_stft_scale(n_fft)`/`dfn2_stft_unscale(n_fft)`) in the header instead of run-time fields.
+  `erb_norm_alpha`/`spec_norm_alpha` are unchanged in meaning and are still derived from the
+  grid's own sample rate and hop.
+- `DFN2_GRID_ERR_ERB_NORM`/`DFN2_GRID_ERR_SPEC_NORM` merge into one `DFN2_GRID_ERR_NORM_ALPHA`
+  (-12): with the tau/init/scale values no longer caller-supplied, the only way either alpha can
+  still be degenerate is an extreme sample rate, which is one failure mode, not two. -13 is now
+  permanently unassigned, like -8.
+- `DFN2_PREPOST_CARVE_VERSION` 11 -> 12 (`lib/ainr/dfn2/dfn2_prepost.h`),
+  `DFN2_STREAM_LAYOUT_VERSION` 1 -> 2 (`stream/ainr/dfn2/dfn2_stream.h`),
+  `DFN_RES_STAGE_LAYOUT_VERSION`/`DFN_RATE_BRIDGE_LAYOUT_VERSION` 5 -> 6 (`pipelines/dfn/`): the
+  carved pool byte counts shrank with the removed fields; a pool allocated by a caller before this
+  change is refused, not silently misread.
+
 ## [Unreleased] — 2026-11-08 — Single-model release stage 2-4: model cores move to lib/, a PCM stream SDK for DFN2/DeepVQE-S/Align-ULCNet
 
 Stages 2-4 of the 6-stage split-into-`lib/{ainr,aiaec}`+`stream/` plan (stage 0-1, the dependency-path

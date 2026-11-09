@@ -15,16 +15,15 @@
 struct DeepVqeStream {
     DeepVqeGrid grid;
 
-    FftHandle *fft;     /* carved once, shared by stft_mic/stft_far/istft (mirrors the board sample) */
+    FftHandle *fft;     /* carved once, shared by stft_mic/stft_far/istft */
     AcStft    *stft_mic;
     AcStft    *stft_far;
     AcIstft   *istft;
     DeepVqePrepost *prepost;
 
     /* Per-hop scratch, one slab: mic_f/far_f/hop_out [hop] each, mic_re/mic_im/far_re/far_im/
-     * enh_re/enh_im [n_bins] each -- the float-domain counterpart of the board sample's per-hop
-     * stack locals, minus the two int16 arrays (mic_in/far_in/pcm_out are the caller's own
-     * buffers, passed by pointer). */
+     * enh_re/enh_im [n_bins] each (mic_in/far_in/pcm_out are the caller's own buffers, passed
+     * by pointer). */
     float *mic_f;
     float *far_f;
     float *hop_out;

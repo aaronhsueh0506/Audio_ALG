@@ -6,6 +6,8 @@
 #ifndef DFN2_GRID_H
 #define DFN2_GRID_H
 
+#include <math.h>
+
 #ifdef __cplusplus
 extern "C" {
 #endif
@@ -19,10 +21,24 @@ extern "C" {
 #define DFN2_GRID_DF_ORDER_MAX          16     /* no Python bound; keeps the rings sensible */
 #define DFN2_MODEL_MAX_FRAMES_PER_CALL  64     /* export_onnx.py --frames-per-call */
 
-/* What a trained and exported model fixes (config.ini [signal], [model], [feature]). df_order is
- * only range-checked (stored 0) with -DDFN2_MASK_ONLY; frames_per_call = heads per accelerator call. The
- * normaliser fields must equal the training values: time constants in seconds, linspace starts over
- * the bands (ERB, dB) and the deep-filter bins (spec, magnitude), the ERB divisor in dB. */
+/* The feature normalisers' time constants and linspace seeds (config.ini [feature]): fixed by
+ * the checkpoint, identical for every shipped grid, not a per-call choice -- a new checkpoint
+ * that needs different values is a new build of this header, not a run-time parameter. */
+#define DFN2_ERB_NORM_TAU_SEC      1.0f
+#define DFN2_ERB_NORM_INIT_LO_DB   (-60.0f)    /* band 0 start */
+#define DFN2_ERB_NORM_INIT_HI_DB   (-90.0f)    /* last band start */
+#define DFN2_ERB_NORM_SCALE_DB     40.0f
+#define DFN2_SPEC_NORM_TAU_SEC     1.0f
+#define DFN2_SPEC_NORM_INIT_LO     0.001f      /* bin 0 start */
+#define DFN2_SPEC_NORM_INIT_HI     0.0001f     /* bin df_bins-1 start */
+
+/* torch.stft(normalized=True)'s analysis scale and its matching synthesis scale: a pure function
+ * of n_fft, derived wherever needed instead of carried on DFN2Grid. */
+static inline float dfn2_stft_scale(int n_fft) { return 1.0f / sqrtf((float)n_fft); }
+static inline float dfn2_stft_unscale(int n_fft) { return sqrtf((float)n_fft); }
+
+/* What a trained and exported model fixes (config.ini [signal], [model]). df_order is only
+ * range-checked (stored 0) with -DDFN2_MASK_ONLY; frames_per_call = heads per accelerator call. */
 typedef struct DFN2GridSpec {
     int    sample_rate;
     int    n_fft;
@@ -32,18 +48,9 @@ typedef struct DFN2GridSpec {
     int    mask_lookahead;
     int    df_lookahead;
     int    frames_per_call;
-    float  erb_norm_tau_sec;      /* > 0                    */
-    float  erb_norm_init_lo_db;   /* band 0 start           */
-    float  erb_norm_init_hi_db;   /* last band start        */
-    float  erb_norm_scale_db;     /* > 0                    */
-    float  spec_norm_tau_sec;     /* > 0                    */
-    float  spec_norm_init_lo;     /* bin 0 start, > 0       */
-    float  spec_norm_init_hi;     /* bin df_bins-1 start, > 0 */
 } DFN2GridSpec;
 
 typedef struct DFN2Grid {
-    float  erb_norm_tau_sec;
-    float  spec_norm_tau_sec;
     int    sample_rate;
     int    n_fft;           /* frame size = analysis window length */
     int    hop;             /* n_fft / 2 */
@@ -57,18 +64,11 @@ typedef struct DFN2Grid {
     int    ring;            /* frames the state rings hold (dfn2_process.h) */
     int    frames_per_call; /* heads per accelerator call */
     int    input_frames;    /* frames_per_call + DFN2_MODEL_INPUT_FRAMES - 1 */
-    float  erb_norm_init_lo_db;
-    float  erb_norm_init_hi_db;
-    float  erb_norm_scale_db;
-    float  spec_norm_init_lo;
-    float  spec_norm_init_hi;
-    float  erb_norm_alpha;  /* dfn2_norm_alpha() of erb_norm_tau_sec */
-    float  spec_norm_alpha; /* dfn2_norm_alpha() of spec_norm_tau_sec */
-    float  stft_scale;      /* 1 / sqrt(n_fft): normalized=True analysis scale */
-    float  stft_unscale;    /* sqrt(n_fft): the synthesis scale */
+    float  erb_norm_alpha;  /* dfn2_norm_alpha() of DFN2_ERB_NORM_TAU_SEC at this grid's hop rate */
+    float  spec_norm_alpha; /* dfn2_norm_alpha() of DFN2_SPEC_NORM_TAU_SEC at this grid's hop rate */
 } DFN2Grid;
 
-/* Status codes; -8 is unassigned and must not be reused. */
+/* Status codes; -8 and -13 are unassigned and must not be reused. */
 enum {
     DFN2_GRID_OK = 0,
     DFN2_GRID_ERR_NULL = -1,
@@ -81,8 +81,7 @@ enum {
     DFN2_GRID_ERR_INCONSISTENT = -9,
     DFN2_GRID_ERR_DF_ORDER = -10,
     DFN2_GRID_ERR_FRAMES_PER_CALL = -11,
-    DFN2_GRID_ERR_ERB_NORM = -12,
-    DFN2_GRID_ERR_SPEC_NORM = -13
+    DFN2_GRID_ERR_NORM_ALPHA = -12   /* the fixed-tau EMA alpha rounds to 0 or 1 at this sample rate */
 };
 
 /* Derive a grid from the spec and validate it: DFN2_GRID_OK (grid written), or the first failing
@@ -95,12 +94,11 @@ enum {
  *   df_order in [1, 16]; with -DDFN2_MASK_ONLY any value in [0, 16], stored as 0
  *   mask_lookahead in [0, 2]; df_lookahead in [0, df_order - 1], 0 with -DDFN2_MASK_ONLY
  *   frames_per_call in [1, 64]
- *   each normaliser: a finite tau > 0 giving an alpha strictly in (0, 1), finite starts, and for
- *     the ERB one a finite scale > 0; the spec starts must be > 0 (the feature divides by their root) */
+ *   both normaliser alphas (fixed tau, this grid's hop rate) strictly in (0, 1) */
 int dfn2_grid_make(DFN2Grid *grid, const DFN2GridSpec *spec);
 
 /* The same checks on an existing grid, plus every derived field must equal what dfn2_grid_make()
- * derives (hand-edited hop, ring, scale or alpha: refused). Run by every entry point on a grid. */
+ * derives (hand-edited hop, ring or alpha: refused). Run by every entry point on a grid. */
 int dfn2_grid_validate(const DFN2Grid *grid);
 
 /* train.py make_norm_alpha(): exp(-(hop / sample_rate) / tau_sec) rounded to three decimals (one

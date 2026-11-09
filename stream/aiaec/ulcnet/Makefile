@@ -1,6 +1,7 @@
 CC  ?= cc
 CXX ?= c++
 AR  ?= ar
+RANLIB ?= ranlib
 CFLAGS ?= -O2 -std=c11 -Wall -Wextra -Wpedantic
 # EXTRA_CFLAGS is the supported hook for a caller's own flags (e.g. a cross-compile -arch/--target):
 # it reaches both this directory's own compiles and the audiolib sub-make below (as that

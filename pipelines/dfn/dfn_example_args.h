@@ -18,21 +18,16 @@
 #include "dfn_unit_partition.h"
 
 /* The model grids the skeletons offer. Which (sample rate, fft size) pair maps to which n_erb,
- * df_bins, df_order, lookahead pair and normaliser settings is a property of the trained model
- * (AINR/DeepFilterNet2/config.ini [signal], [model], [feature]), so it is this program's table;
- * hop, bins and the scales follow from the formula in dfn2_grid_make(). There is no 32 kHz row:
- * the AEC in front of the stage has no 32 kHz grid, so no host could run that model. */
+ * df_bins, df_order and lookahead pair is a property of the trained model
+ * (AINR/DeepFilterNet2/config.ini [signal], [model]), so it is this program's table; hop, bins,
+ * the scales and the feature normaliser are all fixed by dfn2_grid.h / dfn2_grid_make(). There is
+ * no 32 kHz row: the AEC in front of the stage has no 32 kHz grid, so no host could run that
+ * model. */
 static const DFN2GridSpec DFN_EXAMPLE_MODEL_ROWS[] = {
     { .sample_rate = 16000, .n_fft = 256, .n_erb = 24, .df_bins = 96, .df_order = 5,
-      .mask_lookahead = 0, .df_lookahead = 0, .frames_per_call = 1,
-      .erb_norm_tau_sec = 1.0f, .erb_norm_init_lo_db = -60.0f, .erb_norm_init_hi_db = -90.0f,
-      .erb_norm_scale_db = 40.0f, .spec_norm_tau_sec = 1.0f, .spec_norm_init_lo = 0.001f,
-      .spec_norm_init_hi = 0.0001f },
+      .mask_lookahead = 0, .df_lookahead = 0, .frames_per_call = 1 },
     { .sample_rate = 48000, .n_fft = 1024, .n_erb = 32, .df_bins = 96, .df_order = 5,
-      .mask_lookahead = 1, .df_lookahead = 1, .frames_per_call = 1,
-      .erb_norm_tau_sec = 1.0f, .erb_norm_init_lo_db = -60.0f, .erb_norm_init_hi_db = -90.0f,
-      .erb_norm_scale_db = 40.0f, .spec_norm_tau_sec = 1.0f, .spec_norm_init_lo = 0.001f,
-      .spec_norm_init_hi = 0.0001f },
+      .mask_lookahead = 1, .df_lookahead = 1, .frames_per_call = 1 },
 };
 #define DFN_EXAMPLE_MODEL_ROW_COUNT \
     ((int)(sizeof(DFN_EXAMPLE_MODEL_ROWS) / sizeof(DFN_EXAMPLE_MODEL_ROWS[0])))

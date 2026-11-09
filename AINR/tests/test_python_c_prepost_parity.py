@@ -13,8 +13,9 @@ and on several lookahead pairs. The GTCRN wrapper builds its grid from
 ``GTCRN/config.ini`` the same way.
 
 The scale of the framing is the application's: the PCM-start cases at the end of
-the file drive audiolib's AcStft / AcIstft at ``grid.stft_scale`` /
-``grid.stft_unscale`` from one PCM clip and compare with
+the file drive audiolib's AcStft / AcIstft at ``dfn2_stft_scale(n_fft)`` /
+``dfn2_stft_unscale(n_fft)`` for DFN2 (plain ``grid.stft_scale`` / ``grid.stft_unscale``
+fields for DFN3, unchanged) from one PCM clip and compare with
 ``torch.stft(normalized=True)`` and ``torch.istft(normalized=True)``, for DFN2 and
 DFN3.
 """
@@ -80,21 +81,17 @@ _WRAPPER = r'''
 typedef struct { DFN2State state; void *block; } ParityDfn;
 
 /* The grid is an argument: the library holds none. NULL when the library
- * refuses it (dfn2_grid_make or dfn2_state_init). */
+ * refuses it (dfn2_grid_make or dfn2_state_init). The seven [feature] normaliser
+ * settings are fixed constants inside dfn2_grid.h now, not spec fields, so this
+ * wrapper no longer takes or forwards them. */
 void *parity_dfn_create(const float *fwd, const float *inv, int sample_rate,
                         int n_fft, int n_erb, int df_bins, int df_order,
-                        int mask_lookahead, int df_lookahead,
-                        float erb_tau, float erb_lo, float erb_hi, float erb_scale,
-                        float spec_tau, float spec_lo, float spec_hi) {
+                        int mask_lookahead, int df_lookahead) {
     DFN2GridSpec spec = {
         .sample_rate = sample_rate, .n_fft = n_fft, .n_erb = n_erb,
         .df_bins = df_bins, .df_order = df_order,
         .mask_lookahead = mask_lookahead, .df_lookahead = df_lookahead,
         .frames_per_call = 1,
-        .erb_norm_tau_sec = erb_tau, .erb_norm_init_lo_db = erb_lo,
-        .erb_norm_init_hi_db = erb_hi, .erb_norm_scale_db = erb_scale,
-        .spec_norm_tau_sec = spec_tau, .spec_norm_init_lo = spec_lo,
-        .spec_norm_init_hi = spec_hi,
     };
     DFN2Grid grid;
     ParityDfn *host;
@@ -200,8 +197,7 @@ def c_prepost(tmp_path_factory):
     )
     lib = ctypes.CDLL(str(library))
     fp = ctypes.POINTER(ctypes.c_float)
-    lib.parity_dfn_create.argtypes = ([fp, fp] + [ctypes.c_int] * 7 +
-                                      [ctypes.c_float] * 7)
+    lib.parity_dfn_create.argtypes = [fp, fp] + [ctypes.c_int] * 7
     lib.parity_dfn_create.restype = ctypes.c_void_p
     lib.parity_dfn_destroy.argtypes = [ctypes.c_void_p]
     lib.parity_dfn_features.argtypes = [ctypes.c_void_p, fp, fp, fp, fp]
@@ -274,12 +270,11 @@ def test_dfn2_features_and_compose_match_python(c_prepost, sr, n_fft, n_erb,
     fwd = np.ascontiguousarray(erb_fb.T.numpy(), dtype=np.float32)
     inv = np.ascontiguousarray(erb_inv.numpy(), dtype=np.float32)
 
-    order, *normalisers = _spec_tail(cfg)
+    order = _spec_tail(cfg)[0]
 
     def create():
         return c_prepost.parity_dfn_create(
-            _fp(fwd), _fp(inv), sr, n_fft, n_erb, df_bins, order, *pair,
-            *normalisers)
+            _fp(fwd), _fp(inv), sr, n_fft, n_erb, df_bins, order, *pair)
 
     rng = np.random.default_rng(41)
     frames = 9
@@ -347,7 +342,7 @@ def test_dfn2_library_refuses_a_grid_it_cannot_run(c_prepost):
     succeeds, so the refusals are not an artefact of the wrapper; sizes the
     library has no reason to bound are accepted."""
     sr, n_fft, n_erb, df_bins, pair = _SHIPPED
-    order, *normalisers = _spec_tail(_shipped_config())
+    order = _spec_tail(_shipped_config())[0]
     n_bins = n_fft // 2 + 1
     # The tables are borrowed and read at the grid's extent: room for the widest
     # band count tried below.
@@ -361,8 +356,7 @@ def test_dfn2_library_refuses_a_grid_it_cannot_run(c_prepost):
         grid.update(changes)
         state = c_prepost.parity_dfn_create(
             _fp(fwd), _fp(inv), grid['sr'], grid['n_fft'], grid['n_erb'],
-            grid['df_bins'], grid['order'], grid['mask'], grid['df'],
-            *normalisers)
+            grid['df_bins'], grid['order'], grid['mask'], grid['df'])
         if state:
             c_prepost.parity_dfn_destroy(state)
         return bool(state)
@@ -462,9 +456,11 @@ _FRAMING_PROLOGUE = r'''
 #include "tests/ainr_test_hop.h"
 '''
 
-# @N@ = 2 or 3; @FRAMES@ is DFN2's frames_per_call field. `g` = {sample_rate, n_fft,
-# n_erb, df_bins, df_order, mask_lookahead, df_lookahead}, `norm` = the seven
-# [feature] settings.
+# @N@ = 2 or 3; @FRAMES@ is DFN2's frames_per_call field; @NORM_UNUSED@/@NORM_FIELDS@ and
+# @STFT_SCALE@/@STFT_UNSCALE@ differ by family below, since DFN2's seven [feature] settings
+# and stft_scale/stft_unscale are fixed constants/helpers now (dfn2_grid.h), while DFN3's
+# grid still carries all of them as before. `g` = {sample_rate, n_fft, n_erb, df_bins,
+# df_order, mask_lookahead, df_lookahead}, `norm` = the seven [feature] settings (DFN3 only).
 _FRAMING_TEMPLATE = r'''
 typedef struct {
     DFN@N@Grid grid;
@@ -485,13 +481,10 @@ void framing_dfn@N@_destroy(void *host) {
 /* NULL when the library refuses the grid or the instance. */
 void *framing_dfn@N@_create(const int *g, const float *norm, const float *fwd,
                             const float *inv) {
-    DFN@N@GridSpec spec = {
+@NORM_UNUSED@    DFN@N@GridSpec spec = {
         .sample_rate = g[0], .n_fft = g[1], .n_erb = g[2], .df_bins = g[3],
         .df_order = g[4], .mask_lookahead = g[5], .df_lookahead = g[6],
-@FRAMES@        .erb_norm_tau_sec = norm[0], .erb_norm_init_lo_db = norm[1],
-        .erb_norm_init_hi_db = norm[2], .erb_norm_scale_db = norm[3],
-        .spec_norm_tau_sec = norm[4], .spec_norm_init_lo = norm[5],
-        .spec_norm_init_hi = norm[6],
+@FRAMES@@NORM_FIELDS@
     };
     DFN@N@PrepostConfig cfg;
     Framing@N@ *f = (Framing@N@ *)calloc(1, sizeof(*f));
@@ -504,8 +497,8 @@ void *framing_dfn@N@_create(const int *g, const float *norm, const float *fwd,
     f->re = (float *)malloc(2u * (size_t)f->grid.n_bins * sizeof(float));
     if (!f->p || !f->re) goto fail;
     f->im = f->re + f->grid.n_bins;
-    if (ainr_test_hop_open(&f->hop, f->grid.n_fft, f->grid.stft_scale,
-                           f->grid.stft_unscale) != 0) goto fail;
+    if (ainr_test_hop_open(&f->hop, f->grid.n_fft, @STFT_SCALE@,
+                           @STFT_UNSCALE@) != 0) goto fail;
     return f;
 fail:
     framing_dfn@N@_destroy(f);
@@ -540,11 +533,31 @@ void framing_dfn@N@_synthesize(void *host, const float *re, const float *im,
 '''
 
 
+_NORM_FIELDS_DFN3 = (
+    '        .erb_norm_tau_sec = norm[0], .erb_norm_init_lo_db = norm[1],\n'
+    '        .erb_norm_init_hi_db = norm[2], .erb_norm_scale_db = norm[3],\n'
+    '        .spec_norm_tau_sec = norm[4], .spec_norm_init_lo = norm[5],\n'
+    '        .spec_norm_init_hi = norm[6],\n')
+
+
 def _framing_wrapper():
+    # (frames_per_call line, "norm unused" marker, norm-field initialisers, stft scale,
+    # stft unscale) per family: DFN2's seven normaliser settings and its stft scale/unscale
+    # are fixed constants/helpers now (dfn2_grid.h), not spec/grid fields, so its generated
+    # copy neither fills them into the spec nor reads them off the grid; DFN3's is unchanged.
+    per_family = {
+        2: ('        .frames_per_call = 1,\n', '    (void)norm;\n', '',
+            'dfn2_stft_scale(f->grid.n_fft)', 'dfn2_stft_unscale(f->grid.n_fft)'),
+        3: ('', '', _NORM_FIELDS_DFN3, 'f->grid.stft_scale', 'f->grid.stft_unscale'),
+    }
     body = []
-    for n, frames in ((2, '        .frames_per_call = 1,\n'), (3, '')):
+    for n, (frames, norm_unused, norm_fields, scale, unscale) in per_family.items():
         body.append(_FRAMING_TEMPLATE.replace('@N@', str(n))
-                    .replace('@FRAMES@', frames))
+                    .replace('@FRAMES@', frames)
+                    .replace('@NORM_UNUSED@', norm_unused)
+                    .replace('@NORM_FIELDS@', norm_fields)
+                    .replace('@STFT_SCALE@', scale)
+                    .replace('@STFT_UNSCALE@', unscale))
     return _FRAMING_PROLOGUE + ''.join(body)
 
 
@@ -669,8 +682,9 @@ class _FramingReference:
 @pytest.mark.parametrize('family,sr,n_fft,n_erb,df_bins,pair', FRAMING_CASES)
 def test_pcm_through_audiolib_stft_matches_torch_stft_features(
         c_framing, family, sr, n_fft, n_erb, df_bins, pair):
-    """PCM -> AcStft(spec_scale = grid.stft_scale) -> pre_process_freq: the graph
-    windows equal the family's features of torch.stft(normalized=True). The C
+    """PCM -> AcStft(spec_scale = dfn2_stft_scale(n_fft) / grid.stft_scale) ->
+    pre_process_freq: the graph windows equal the family's features of
+    torch.stft(normalized=True). The C
     frame t covers pcm[(t-1)*hop:(t+1)*hop], so the reference is center=False on
     the clip behind one hop of zeros."""
     ref = _FramingReference(c_framing, family, sr, n_fft, n_erb, df_bins, pair)
@@ -707,8 +721,8 @@ def test_pcm_through_audiolib_stft_matches_torch_stft_features(
 @pytest.mark.parametrize('family,sr,n_fft,n_erb,df_bins,pair', FRAMING_CASES)
 def test_audiolib_istft_matches_torch_istft_normalized(
         c_framing, family, sr, n_fft, n_erb, df_bins, pair):
-    """A spectrum -> AcIstft(ispec_scale = grid.stft_unscale): the hops equal
-    torch.istft(normalized=True). center=True drops the first half window, so
+    """A spectrum -> AcIstft(ispec_scale = dfn2_stft_unscale(n_fft) / grid.stft_unscale):
+    the hops equal torch.istft(normalized=True). center=True drops the first half window, so
     the C hops 1.. are the reference (hop 0 has one frame of overlap)."""
     ref = _FramingReference(c_framing, family, sr, n_fft, n_erb, df_bins, pair)
     rng = np.random.default_rng(31)

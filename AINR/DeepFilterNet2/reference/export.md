@@ -52,7 +52,9 @@ in that header, so an integrator can refuse a graph whose state layout no longer
 matches the struct it allocated. `inference.py calib --frames N` captures `N`
 streaming invocations with real non-zero state. `calibrate_norm_init.py` is a
 different tool: it estimates the feature EMA initialization constants that
-become the `erb_norm_init_*` and `spec_norm_init_*` fields of `DFN2GridSpec`.
+must equal the fixed `DFN2_ERB_NORM_INIT_*` / `DFN2_SPEC_NORM_INIT_*` constants
+of `dfn2_grid.h` (no longer `DFN2GridSpec` fields -- they are compile-time
+constants now, identical for every shipped grid).
 Use `--format npz --output calib/dfn2.npz` when a NumPy archive is needed.
 
 ### Fixed-batch NPU profiling

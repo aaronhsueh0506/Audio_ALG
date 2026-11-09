@@ -29,7 +29,7 @@ The host forms E and P itself before the hop begins; the two example mains show 
 in `mono_aec_dfn_res/main.c`, `dfn_form()` in `4ch_aec_bf_dfn_res/main.c`). External parameters are
 the arguments shown (`atten_lim_db`, the ERB matrices, the model callback and its I/O descriptor,
 the host rate, the model grid in `DfnResStageConfig.grid`); the stage constants (the in and out scales, the
-grid's `stft_scale` / `stft_unscale` -- 2^-5 / 2^5 on the shipped 48 kHz grid -- and the bridge FIFO sizes) are internal.
+`dfn2_stft_scale()` / `dfn2_stft_unscale()` -- 2^-5 / 2^5 on the shipped 48 kHz grid -- and the bridge FIFO sizes) are internal.
 The stage and the bridge take audio-scale spectra and apply those two scales themselves, so the caller's `AcStft` / `AcIstft`
 keep audiolib's default `spec_scale` / `ispec_scale` of 1. They register no recurrent state: a float model callback owns it, a
 board's accelerator holds it and reloads quantized zeros at start and whenever `dfn_res_stage_state_generation()` (through the

@@ -1,6 +1,7 @@
 CC  ?= cc
 CXX ?= c++
 AR  ?= ar
+RANLIB ?= ranlib
 CFLAGS ?= -O2 -std=c11 -Wall -Wextra -Wpedantic
 # EXTRA_CFLAGS is the supported hook for a caller's own flags (e.g. a cross-compile -arch/--target):
 # it reaches both this directory's own compiles and the audiolib sub-make below (as that
@@ -35,8 +36,8 @@ ifeq ($(MASK_ONLY),1)
 MASK_CPPFLAGS += -DDFN2_MASK_ONLY
 endif
 
-# NO_STDIO=1 drops dfn2_stream_erb_file.o (the only <stdio.h> TU here) from the archive and from
-# the smoke build; see audit-no-stdio.
+# NO_STDIO=1 compiles out dfn2_stream.c's file-loader entry points (the only stdio in this SDK)
+# via -DDFN2_STREAM_NO_STDIO; see audit-no-stdio.
 NO_STDIO ?= 0
 override NO_STDIO := $(strip $(NO_STDIO))
 ifneq ($(words $(NO_STDIO)),1)
@@ -44,6 +45,10 @@ $(error NO_STDIO must be exactly 0 or 1)
 endif
 ifneq ($(filter-out 0 1,$(NO_STDIO)),)
 $(error NO_STDIO must be exactly 0 or 1)
+endif
+NO_STDIO_CPPFLAGS :=
+ifeq ($(NO_STDIO),1)
+NO_STDIO_CPPFLAGS += -DDFN2_STREAM_NO_STDIO
 endif
 
 WERROR ?= 0
@@ -76,7 +81,7 @@ endif
 
 BUILD_DIR := build
 override CC_TARGET_SIG := $(shell sh $(COMMON_DIR)/scripts/target_abi_signature.sh $(CC) $(CPPFLAGS) $(CFLAGS))
-CFG_SIG_PAYLOAD := CC_TARGET_SIG=$(CC_TARGET_SIG) CC=$(CC) AR=$(AR) CFLAGS=$(CFLAGS) LDFLAGS=$(LDFLAGS) SIMD=$(SIMD) SIMD_CPPFLAGS=$(SIMD_CPPFLAGS) MASK_ONLY=$(MASK_ONLY) MASK_CPPFLAGS=$(MASK_CPPFLAGS) NO_STDIO=$(NO_STDIO) BACKEND=$(BACKEND) WERROR=$(WERROR) COMMON_LIB=$(COMMON_LIB)
+CFG_SIG_PAYLOAD := CC_TARGET_SIG=$(CC_TARGET_SIG) CC=$(CC) AR=$(AR) CFLAGS=$(CFLAGS) LDFLAGS=$(LDFLAGS) SIMD=$(SIMD) SIMD_CPPFLAGS=$(SIMD_CPPFLAGS) MASK_ONLY=$(MASK_ONLY) MASK_CPPFLAGS=$(MASK_CPPFLAGS) NO_STDIO=$(NO_STDIO) NO_STDIO_CPPFLAGS=$(NO_STDIO_CPPFLAGS) BACKEND=$(BACKEND) WERROR=$(WERROR) COMMON_LIB=$(COMMON_LIB)
 CFG_SIG := $(shell printf '%s' "$(CFG_SIG_PAYLOAD)" | cksum | cut -d' ' -f1)
 OBJ_DIR := $(BUILD_DIR)/simd$(SIMD)-mask$(MASK_ONLY)-$(CFG_SIG)
 
@@ -93,29 +98,23 @@ CORE_HEADERS := ../../../lib/ainr/dfn2/dfn2_grid.h \
 	../../../lib/ainr/dfn2/dfn2_prepost.h
 
 STREAM_SOURCES := dfn2_stream.c
-ifneq ($(NO_STDIO),1)
-STREAM_SOURCES += dfn2_stream_erb_file.c
-endif
-STREAM_HEADERS := dfn2_stream.h dfn2_stream_internal.h ../../common/stream_mem.h
+STREAM_HEADERS := dfn2_stream.h ../../common/stream_mem.h
 
 LIB := $(OBJ_DIR)/libdfn2_stream.a
 LIB_OBJECTS := $(OBJ_DIR)/dfn2_process.o $(OBJ_DIR)/dfn2_model_io.o $(OBJ_DIR)/dfn2_prepost.o \
 	$(OBJ_DIR)/dfn2_stream.o
-ifneq ($(NO_STDIO),1)
-LIB_OBJECTS += $(OBJ_DIR)/dfn2_stream_erb_file.o
-endif
 VPATH := ../../../lib/ainr/dfn2
 
 SMOKE_BIN := $(OBJ_DIR)/smoke_dfn2_stream
 SMOKE_SOURCES := tests/smoke_dfn2_stream.c $(CORE_SOURCES) dfn2_stream.c
 
-# Needs the file-loader TU (stdio): never built when NO_STDIO=1.
+# Needs the file-loader entry points (stdio), so never built when NO_STDIO=1.
 ERB_FILE_CHECK_BIN := $(OBJ_DIR)/check_erb_file
-ERB_FILE_CHECK_SOURCES := tests/check_erb_file.c $(CORE_SOURCES) dfn2_stream.c dfn2_stream_erb_file.c
+ERB_FILE_CHECK_SOURCES := tests/check_erb_file.c $(CORE_SOURCES) dfn2_stream.c
 
 # Compares dfn2_stream against an independent re-implementation of the board sample's own loop,
 # built directly against lib/ainr/dfn2 + audiolib (never against dfn2_stream.c's internals); see
-# the file's own header comment. Memory-init only, so it never needs dfn2_stream_erb_file.c.
+# the file's own header comment.
 VERIFY_VS_SAMPLE_BIN := $(OBJ_DIR)/verify_vs_sample
 VERIFY_VS_SAMPLE_SOURCES := tests/verify_vs_sample.c $(CORE_SOURCES) dfn2_stream.c
 
@@ -129,7 +128,7 @@ print-lib-path:
 	@echo "$(abspath $(LIB))"
 
 print-cflags:
-	@printf '%s\n' "$(CFLAGS) $(SIMD_CPPFLAGS) $(MASK_CPPFLAGS)"
+	@printf '%s\n' "$(CFLAGS) $(SIMD_CPPFLAGS) $(MASK_CPPFLAGS) $(NO_STDIO_CPPFLAGS)"
 
 print-sources:
 	@printf '%s\n' "$(CORE_SOURCES) $(STREAM_SOURCES)"
@@ -152,14 +151,14 @@ _cfg_guard:
 	printf '%s\n' "$(CFG_SIG_PAYLOAD)" > "$$m"
 
 $(OBJ_DIR)/%.o: %.c $(CORE_HEADERS) $(STREAM_HEADERS) | _cfg_guard
-	$(CC) $(CFLAGS) $(SIMD_CPPFLAGS) $(MASK_CPPFLAGS) -MMD -MP -c -o "$@" "$<"
+	$(CC) $(CFLAGS) $(SIMD_CPPFLAGS) $(MASK_CPPFLAGS) $(NO_STDIO_CPPFLAGS) -MMD -MP -c -o "$@" "$<"
 
 -include $(LIB_OBJECTS:.o=.d)
 
 COMMON_HEADERS := $(wildcard $(COMMON_DIR)/include/*.h $(COMMON_DIR)/utility/*.h)
 
 $(SMOKE_BIN): $(SMOKE_SOURCES) $(CORE_HEADERS) $(STREAM_HEADERS) $(COMMON_LIB) $(COMMON_HEADERS) | _cfg_guard
-	$(CC) $(CFLAGS) $(SIMD_CPPFLAGS) $(MASK_CPPFLAGS) $(SMOKE_SOURCES) "$(COMMON_LIB)" \
+	$(CC) $(CFLAGS) $(SIMD_CPPFLAGS) $(MASK_CPPFLAGS) $(NO_STDIO_CPPFLAGS) $(SMOKE_SOURCES) "$(COMMON_LIB)" \
 		$(LDFLAGS) -lm -o "$@"
 
 smoke: $(SMOKE_BIN)
@@ -167,16 +166,16 @@ smoke: $(SMOKE_BIN)
 
 $(ERB_FILE_CHECK_BIN): $(ERB_FILE_CHECK_SOURCES) $(CORE_HEADERS) $(STREAM_HEADERS) $(COMMON_LIB) $(COMMON_HEADERS) | _cfg_guard
 ifeq ($(NO_STDIO),1)
-	$(error check-erb-file needs dfn2_stream_erb_file.c; run with NO_STDIO=0)
+	$(error check-erb-file needs the file-loader entry points; run with NO_STDIO=0)
 endif
-	$(CC) $(CFLAGS) $(SIMD_CPPFLAGS) $(MASK_CPPFLAGS) $(ERB_FILE_CHECK_SOURCES) "$(COMMON_LIB)" \
+	$(CC) $(CFLAGS) $(SIMD_CPPFLAGS) $(MASK_CPPFLAGS) $(NO_STDIO_CPPFLAGS) $(ERB_FILE_CHECK_SOURCES) "$(COMMON_LIB)" \
 		$(LDFLAGS) -lm -o "$@"
 
 check-erb-file: $(ERB_FILE_CHECK_BIN)
 	"$(ERB_FILE_CHECK_BIN)"
 
 $(VERIFY_VS_SAMPLE_BIN): $(VERIFY_VS_SAMPLE_SOURCES) $(CORE_HEADERS) $(STREAM_HEADERS) $(COMMON_LIB) $(COMMON_HEADERS) | _cfg_guard
-	$(CC) $(CFLAGS) $(SIMD_CPPFLAGS) $(MASK_CPPFLAGS) $(VERIFY_VS_SAMPLE_SOURCES) "$(COMMON_LIB)" \
+	$(CC) $(CFLAGS) $(SIMD_CPPFLAGS) $(MASK_CPPFLAGS) $(NO_STDIO_CPPFLAGS) $(VERIFY_VS_SAMPLE_SOURCES) "$(COMMON_LIB)" \
 		$(LDFLAGS) -lm -o "$@"
 
 verify-vs-sample: $(VERIFY_VS_SAMPLE_BIN)
@@ -221,8 +220,8 @@ test-variant-guard:
 	"$$lite_obj/vg_lite_consumer_vs_lite_archive" || exit 1; \
 	echo "test-variant-guard: PASS (both matched pairings link and run)"
 
-# audit-no-stdio: builds the NO_STDIO=1 archive and asserts, via `nm -u`, that dfn2_stream.o alone
-# (never dfn2_stream_erb_file.o, which legitimately uses stdio) references no stdio symbol.
+# audit-no-stdio: builds the NO_STDIO=1 archive and asserts, via `nm -u`, that dfn2_stream.o
+# references no stdio symbol (the file-loader entry points are compiled out under that flag).
 audit-no-stdio:
 	@$(MAKE) --no-print-directory NO_STDIO=1 MASK_ONLY=$(MASK_ONLY) SIMD=$(SIMD) $(TOOLCHAIN_FWD) lib >/dev/null
 	@obj_dir="$$($(MAKE) -s --no-print-directory NO_STDIO=1 MASK_ONLY=$(MASK_ONLY) SIMD=$(SIMD) $(TOOLCHAIN_FWD) print-lib-path)"; \

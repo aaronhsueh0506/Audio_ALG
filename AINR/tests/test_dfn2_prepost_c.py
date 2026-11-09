@@ -395,8 +395,8 @@ static AinrTestHop *hop_of(DFN2Prepost *p) {
     for (i = 0; i < 16; ++i)
         if (hop_slots[i].p == NULL) {
             const DFN2Grid *g = dfn2_test_grid();
-            if (ainr_test_hop_open(&hop_slots[i].hop, g->n_fft, g->stft_scale,
-                                   g->stft_unscale) != 0) abort();
+            if (ainr_test_hop_open(&hop_slots[i].hop, g->n_fft, dfn2_stft_scale(g->n_fft),
+                                   dfn2_stft_unscale(g->n_fft)) != 0) abort();
             hop_slots[i].p = p;
             return &hop_slots[i].hop;
         }
@@ -569,7 +569,8 @@ static int equiv_once(float atten_lim_db) {
      * stage and the synthesis, wired by hand from the two TUs the class
      * merely orchestrates.  dfn2_prepost.c is deliberately not involved. */
     CHECK(state_block != NULL && io_block != NULL);
-    CHECK(ainr_test_hop_open(&ref_hop, grid->n_fft, grid->stft_scale, grid->stft_unscale) == 0);
+    CHECK(ainr_test_hop_open(&ref_hop, grid->n_fft, dfn2_stft_scale(grid->n_fft),
+                             dfn2_stft_unscale(grid->n_fft)) == 0);
     CHECK(dfn2_state_init(&ref_st, state_block, state_bytes, grid) == 0);
     dfn2_set_erb_matrices(&ref_st, &erb_fwd[0][0], &erb_inv[0][0]);
     CHECK(dfn2_model_io_init(&ref_io, io_block, io_bytes, grid, ref_gru,
@@ -686,8 +687,8 @@ static int case_freq(void) {
 
     /* The caller owns the transform on both sides: one analysis per hop into the class,
      * one synthesis per emitted frame out of it, on a framing of its own. */
-    CHECK(ainr_test_hop_open(&caller_hop, DFN2_N_FFT, dfn2_test_grid()->stft_scale,
-                             dfn2_test_grid()->stft_unscale) == 0);
+    CHECK(ainr_test_hop_open(&caller_hop, DFN2_N_FFT, dfn2_stft_scale(DFN2_N_FFT),
+                             dfn2_stft_unscale(DFN2_N_FFT)) == 0);
     for (hop = 0; hop < HOPS; ++hop) {
         DFN2PrepostInputs inputs;
         DFN2PrepostOutputs outputs;
@@ -734,12 +735,13 @@ static int case_freq(void) {
 
 /* The library holds no grid, so a different grid is a different VALUE, not a different
  * build: these are valid grids that differ from the test grid in exactly one value, made
- * with dfn2_grid_make() inside the same binary (the two time constants stand for a model
- * trained with another tau). Every object that records the grid must tell them apart. */
+ * with dfn2_grid_make() inside the same binary. Every object that records the grid must
+ * tell them apart. (The two normaliser taus used to be two more variants here, standing for
+ * a model trained with another tau; they are fixed constants in dfn2_grid.h now, not spec
+ * fields, so there is nothing left to vary that way.) */
 enum {
     VARIANT_SAMPLE_RATE, VARIANT_N_FFT, VARIANT_N_ERB, VARIANT_DF_BINS,
-    VARIANT_MASK_LOOKAHEAD, VARIANT_DF_LOOKAHEAD, VARIANT_ERB_TAU,
-    VARIANT_SPEC_TAU, N_VARIANTS
+    VARIANT_MASK_LOOKAHEAD, VARIANT_DF_LOOKAHEAD, N_VARIANTS
 };
 
 static int make_variant(DFN2Grid *grid, int which) {
@@ -754,12 +756,10 @@ static int make_variant(DFN2Grid *grid, int which) {
                                      ? base->mask_lookahead - 1 : 1; break;
     case VARIANT_DF_LOOKAHEAD:   spec.df_lookahead = base->df_lookahead > 0
                                      ? base->df_lookahead - 1 : 1; break;
-    case VARIANT_ERB_TAU:        spec.erb_norm_tau_sec = 2.0f; break;
-    case VARIANT_SPEC_TAU:       spec.spec_norm_tau_sec = 2.0f; break;
     default: break;
     }
     if (dfn2_grid_make(grid, &spec) != DFN2_GRID_OK) return -1;
-    /* The alphas follow the sample rate, the hop and the taus (dfn2_norm_alpha), so a
+    /* The alphas follow the sample rate and the hop (dfn2_norm_alpha at the fixed tau), so a
      * variant of the rate or the frame size moves them with it. */
     return memcmp(grid, base, sizeof *grid) != 0 &&
            dfn2_grid_validate(grid) == DFN2_GRID_OK ? 0 : -1;
@@ -1008,7 +1008,7 @@ static int case_dual_guards(void) {
     DFN2Prepost *pf;
     void *pool_f;
 
-    CHECK(DFN2_PREPOST_CARVE_VERSION == 11u);
+    CHECK(DFN2_PREPOST_CARVE_VERSION == 12u);
 
     config_freq(&cfg_freq);
     CHECK(dfn2_prepost_get_mem_size(&cfg_freq, &req_freq) == 0);
@@ -1152,12 +1152,7 @@ static int case_model_run(void) {
         CHECK(dfn2_model_io_descriptor_default(&grid, &other) == 0);
         bad = model;
         bad.io_descriptor = &other;
-        /* the two alphas are not part of the graph contract: only the other
-         * six values can make the descriptor differ */
-        if (v == VARIANT_ERB_TAU || v == VARIANT_SPEC_TAU)
-            CHECK(memcmp(&other, &descriptor, sizeof other) == 0);
-        else
-            CHECK(dfn2_model_run_frame(&bad, p) == -1);
+        CHECK(dfn2_model_run_frame(&bad, p) == -1);
     }
     CHECK(stub.calls == DFN2_MASK_LOOKAHEAD);
     /* A full write commits and steps the recurrent state. */
@@ -1294,11 +1289,6 @@ static int case_descriptor(void) {
         CHECK(make_variant(&other, i) == 0);
         CHECK(dfn2_model_io_descriptor_default(&other, &other_descriptor) == 0);
         CHECK(dfn2_model_io_descriptor_validate(&other, &other_descriptor) == 0);
-        if (i == VARIANT_ERB_TAU || i == VARIANT_SPEC_TAU) {
-            /* the EMA coefficients are not part of the graph contract */
-            CHECK(memcmp(&other_descriptor, &base, sizeof base) == 0);
-            continue;
-        }
         CHECK(memcmp(&other_descriptor, &base, sizeof base) != 0);
         CHECK(dfn2_model_io_descriptor_validate(grid, &other_descriptor) == -1);
         CHECK(dfn2_model_io_descriptor_validate(&other, &base) == -1);
@@ -1420,14 +1410,12 @@ static void tamper_grid(DFN2Grid *grid, int which) {
     case 1: ++grid->n_bins; break;
     case 2: ++grid->df_history; break;
     case 3: ++grid->ring; break;
-    case 4: grid->stft_scale *= 2.0f; break;
-    case 5: grid->stft_unscale *= 2.0f; break;
-    case 6: grid->erb_norm_alpha = 1.0f; break;
-    case 7: grid->spec_norm_alpha = (float)NAN; break;
+    case 4: grid->erb_norm_alpha = 1.0f; break;
+    case 5: grid->spec_norm_alpha = (float)NAN; break;
     default: grid->erb_norm_alpha = 0.0f; break;
     }
 }
-#define N_TAMPERS 9
+#define N_TAMPERS 7
 
 static DFN2GridSpec case_spec(const GridCase *c) {
     DFN2GridSpec spec = dfn2_test_grid_spec();
@@ -2632,8 +2620,8 @@ static int case_warmup_synthesis(void) {
     p_all = make_class(&cfg);
     CHECK(p_valid != NULL && p_all != NULL);
     CHECK(drive_time(p_valid, pcm_in, out_a, HOPS) == 0);
-    CHECK(ainr_test_hop_open(&caller_hop, DFN2_N_FFT, dfn2_test_grid()->stft_scale,
-                             dfn2_test_grid()->stft_unscale) == 0);
+    CHECK(ainr_test_hop_open(&caller_hop, DFN2_N_FFT, dfn2_stft_scale(DFN2_N_FFT),
+                             dfn2_stft_unscale(DFN2_N_FFT)) == 0);
     for (hop = 0; hop < HOPS; ++hop) {
         DFN2PrepostInputs inputs;
         DFN2PrepostOutputs outputs;
@@ -2731,8 +2719,8 @@ int main(int argc, char **argv) {
         CHECK(grid->df_lookahead == DFN2_DF_LOOKAHEAD);
         CHECK(grid->df_history == DFN2_DF_HISTORY && grid->ring == DFN2_DF_RING);
         CHECK(grid->df_order == DFN2_DF_ORDER && grid->frames_per_call == 1);
-        CHECK(grid->stft_scale == DFN2_NORMALIZED_STFT_SCALE);
-        CHECK(grid->stft_unscale == DFN2_NORMALIZED_STFT_UNSCALE);
+        CHECK(dfn2_stft_scale(grid->n_fft) == DFN2_NORMALIZED_STFT_SCALE);
+        CHECK(dfn2_stft_unscale(grid->n_fft) == DFN2_NORMALIZED_STFT_UNSCALE);
         CHECK(dfn2_prepost_erb_window_elements(grid) ==
               (size_t)TEST_ERB_WINDOW_ELEMENTS);
         CHECK(dfn2_prepost_spec_window_elements(grid) ==
@@ -2964,7 +2952,7 @@ def test_dual_entry_estimates_on_est_and_applies_on_app(driver):
 
 def test_dual_entry_guards_and_gain_accessor(driver):
     """The dual entry is refused on any NULL argument and with a frame open
-    and a frame_bypass closes it; the carve version is 11."""
+    and a frame_bypass closes it; the carve version is 12."""
     _run(driver, 'dual_guards')
 
 

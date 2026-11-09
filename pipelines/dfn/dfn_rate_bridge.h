@@ -45,7 +45,7 @@ extern "C" {
 
 #define DFN_RATE_BRIDGE_DESCRIPTOR_VERSION 1u
 /* Carve layout version; bumped on any change of pool size, carve order or descriptor. */
-#define DFN_RATE_BRIDGE_LAYOUT_VERSION     5u
+#define DFN_RATE_BRIDGE_LAYOUT_VERSION     6u
 /* Denominator of dfn_rate_bridge_added_delay_exact(): sixths of a native sample. */
 #define DFN_RATE_BRIDGE_DELAY_DENOMINATOR  6
 

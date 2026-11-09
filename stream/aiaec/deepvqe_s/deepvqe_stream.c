@@ -64,11 +64,9 @@ int deepvqe_stream_layout(const DeepVqeStreamConfig *cfg, unsigned char *base,
     if (fft_bytes == 0 || stream_carve(base, &cursor, fft_bytes, &ptr) != 0) return -1;
     out->fft_mem = ptr;
 
-    /* One AcStftConfig, reused for sizing stft_mic/stft_far/istft exactly as deepvqe_prepost.h's
-     * framing doc describes ("all from ac_stft_config_default(&sc, n_fft) ... with sc.ola =
-     * AC_OLA_ENV_NORM (analysis ignores ola)"); scfg.fft stays NULL here (own-carve sizing) for
-     * the same reason dfn2_stream_layout()'s does -- audio_stft.c's config_valid() dereferences a
-     * non-NULL cfg->fft, so sizing cannot borrow the not-yet-constructed shared handle. */
+    /* One AcStftConfig, reused for sizing stft_mic/stft_far/istft (sc.ola = AC_OLA_ENV_NORM;
+     * analysis ignores ola). scfg.fft stays NULL here (own-carve sizing; the shared handle
+     * doesn't exist yet). */
     ac_stft_config_default(&scfg, cfg->grid.n_fft);
     scfg.ola = AC_OLA_ENV_NORM;
 
@@ -95,8 +93,7 @@ int deepvqe_stream_layout(const DeepVqeStreamConfig *cfg, unsigned char *base,
     out->prepost_build_hash = pp_req.build_flags_hash;
 
     /* mic_f, far_f, hop_out [hop] + mic_re, mic_im, far_re, far_im, enh_re, enh_im [n_bins], one
-     * slab (dfn2_stream_layout()'s "one aligned slab" pattern); only the slab base is part of the
-     * pool ABI. */
+     * slab; only the slab base is part of the pool ABI. */
     scratch_bytes = ck_add_size(
         ck_mul_size(3u, ck_mul_size(hop, sizeof(float))),
         ck_mul_size(6u, ck_mul_size(n_bins, sizeof(float))));
@@ -166,9 +163,8 @@ DeepVqeStream *deepvqe_stream_finish_init(const DeepVqeStreamConfig *cfg, unsign
     s->fft = fft_init(layout->fft_mem, fft_get_mem_size(cfg->grid.n_fft), cfg->grid.n_fft);
     if (!s->fft) return NULL;
 
-    /* Real, now-constructed handle, borrowed by all three framing objects -- a *different*,
-     * smaller `scfg` than deepvqe_stream_layout()'s own sizing config (which used fft = NULL so
-     * it could run before this handle existed); see the comment there. */
+    /* Real, now-constructed handle, borrowed by all three framing objects -- a smaller scfg
+     * than the sizing one above, which the larger carved region always fits. */
     ac_stft_config_default(&scfg, cfg->grid.n_fft);
     scfg.ola = AC_OLA_ENV_NORM;
     scfg.fft = s->fft;
@@ -290,19 +286,17 @@ int deepvqe_stream_post_process(DeepVqeStream *s, int ai_rc, int16_t *pcm_out) {
     if (!s || !pcm_out || !s->open) return -1;
     hop = s->grid.hop;
 
-    /* Mirror the board sample's dispatch exactly, and DFN2's own fix for the same hazard: a
-     * finish that itself fails (non-finite tap or state, despite ai_rc == 0) still needs a bypass
-     * to actually close the frame -- deepvqe_prepost_frame_finish() leaves it open on failure
-     * (deepvqe_prepost.h: "the frame stays open ... call frame_bypass() or re-run"), and a frame
-     * left open here would desync this stream's own `open` bookkeeping from DeepVqePrepost's. */
+    /* A finish that itself fails (non-finite tap or state, despite ai_rc == 0) still needs a
+     * bypass to actually close the frame -- deepvqe_prepost_frame_finish() leaves it open on
+     * failure, and a frame left open here would desync this stream's `open` bookkeeping from
+     * DeepVqePrepost's. */
     rc = (ai_rc == 0) ? deepvqe_prepost_frame_finish(s->prepost) : -1;
     if (rc != 0) deepvqe_prepost_frame_bypass(s->prepost);
     s->open = 0;
 
     prc = deepvqe_prepost_post_process_freq(s->prepost, s->enh_re, s->enh_im);
     if (prc != 0) {
-        /* Defensive only, unreached in correct use (the hop was just closed above): zero the hop,
-         * leave the synthesis untouched, same contract-error treatment DFN2 uses. */
+        /* Defensive only, unreached in correct use (the hop was just closed above). */
         memset(pcm_out, 0, (size_t)hop * sizeof(int16_t));
         return -1;
     }
@@ -310,7 +304,7 @@ int deepvqe_stream_post_process(DeepVqeStream *s, int ai_rc, int16_t *pcm_out) {
     written = ac_istft_push_planar(s->istft, s->enh_re, s->enh_im, s->hop_out);
     if (written != hop) {
         /* AC_OLA_ENV_NORM's documented startup behavior: the very first push after init/reset
-         * emits nothing. Mirrors the board sample's own `if (written != HOP_SIZE) memset(...)`. */
+         * emits nothing. */
         memset(pcm_out, 0, (size_t)hop * sizeof(int16_t));
         return 0;
     }

@@ -1,5 +1,6 @@
 CC ?= cc
 AR ?= ar
+RANLIB ?= ranlib
 CFLAGS ?= -O2 -std=c11 -Wall -Wextra -Wpedantic
 # The floating-point contract is an invariant of the C/Python parity boundary:
 # keep it when a board build overrides CFLAGS on the command line.

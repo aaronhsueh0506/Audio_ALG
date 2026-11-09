@@ -29,7 +29,7 @@ extern "C" {
 
 #define DFN2_PREPOST_DESCRIPTOR_VERSION 1u
 /* In build_flags_hash; bump on any change of pool size, carve order or descriptor content. */
-#define DFN2_PREPOST_CARVE_VERSION      11u
+#define DFN2_PREPOST_CARVE_VERSION      12u
 
 #define DFN2_PREPOST_ALIGNMENT 16u   /* the one alignment of every module (audiolib mem_align.h) */
 

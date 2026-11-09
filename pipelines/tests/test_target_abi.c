@@ -94,13 +94,15 @@ static void dfn3_target_grid(DFN3Grid *grid) {
         .df_order             = g->df_order,
         .mask_lookahead       = g->mask_lookahead,
         .df_lookahead         = g->df_lookahead,
-        .erb_norm_tau_sec     = g->erb_norm_tau_sec,
-        .erb_norm_init_lo_db  = g->erb_norm_init_lo_db,
-        .erb_norm_init_hi_db  = g->erb_norm_init_hi_db,
-        .erb_norm_scale_db    = g->erb_norm_scale_db,
-        .spec_norm_tau_sec    = g->spec_norm_tau_sec,
-        .spec_norm_init_lo    = g->spec_norm_init_lo,
-        .spec_norm_init_hi    = g->spec_norm_init_hi,
+        /* DFN3's own grid takes these explicitly; DFN2's are fixed constants in dfn2_grid.h,
+         * the same config.ini [feature] numbers. */
+        .erb_norm_tau_sec     = DFN2_ERB_NORM_TAU_SEC,
+        .erb_norm_init_lo_db  = DFN2_ERB_NORM_INIT_LO_DB,
+        .erb_norm_init_hi_db  = DFN2_ERB_NORM_INIT_HI_DB,
+        .erb_norm_scale_db    = DFN2_ERB_NORM_SCALE_DB,
+        .spec_norm_tau_sec    = DFN2_SPEC_NORM_TAU_SEC,
+        .spec_norm_init_lo    = DFN2_SPEC_NORM_INIT_LO,
+        .spec_norm_init_hi    = DFN2_SPEC_NORM_INIT_HI,
     };
     assert(dfn3_grid_make(grid, &spec) == DFN3_GRID_OK);
 }

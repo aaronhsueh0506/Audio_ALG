@@ -79,8 +79,8 @@ static int board_init(BoardDriver *d, const DFN2Grid *grid, const float *erb_fwd
     }
 
     ac_stft_config_default(&scfg, grid->n_fft);
-    scfg.spec_scale = grid->stft_scale;
-    scfg.ispec_scale = grid->stft_unscale;
+    scfg.spec_scale = dfn2_stft_scale(grid->n_fft);
+    scfg.ispec_scale = dfn2_stft_unscale(grid->n_fft);
     scfg.fft = d->fft;
 
     sb = ac_stft_get_mem_size(&scfg);
@@ -336,9 +336,6 @@ int main(int argc, char **argv) {
     memset(&row16k, 0, sizeof(row16k));
     row16k.sample_rate = 16000; row16k.n_fft = 256; row16k.n_erb = 24; row16k.df_bins = 96;
     row16k.df_order = 5; row16k.mask_lookahead = 0; row16k.df_lookahead = 0; row16k.frames_per_call = 1;
-    row16k.erb_norm_tau_sec = 1.0f; row16k.erb_norm_init_lo_db = -60.0f; row16k.erb_norm_init_hi_db = -90.0f;
-    row16k.erb_norm_scale_db = 40.0f; row16k.spec_norm_tau_sec = 1.0f; row16k.spec_norm_init_lo = 0.001f;
-    row16k.spec_norm_init_hi = 0.0001f;
 
     memset(&row48k, 0, sizeof(row48k));
     row48k.sample_rate = 48000; row48k.n_fft = 1024; row48k.n_erb = 32; row48k.df_bins = 96;
@@ -348,9 +345,6 @@ int main(int argc, char **argv) {
 #else
     row48k.df_order = 5; row48k.df_lookahead = 1;
 #endif
-    row48k.erb_norm_tau_sec = 1.0f; row48k.erb_norm_init_lo_db = -60.0f; row48k.erb_norm_init_hi_db = -90.0f;
-    row48k.erb_norm_scale_db = 40.0f; row48k.spec_norm_tau_sec = 1.0f; row48k.spec_norm_init_lo = 0.001f;
-    row48k.spec_norm_init_hi = 0.0001f;
 
     failures += (run_matrix(&row16k, "16k/256 L0D0", inject_shift, 0, 0.0f) != 0);
     failures += (run_matrix(&row48k, "48k/1024 L1D(0or1)", inject_shift, 0, 0.0f) != 0);

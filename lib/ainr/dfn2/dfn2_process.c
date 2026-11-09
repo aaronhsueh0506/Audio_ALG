@@ -298,30 +298,13 @@ int dfn2_grid_make(DFN2Grid* grid, const DFN2GridSpec* spec)
     g.ring = df_order > noisy_ring ? df_order : noisy_ring;
 #endif
 
-    /* The alphas are derived, never given. */
-    if (!isfinite(spec->erb_norm_tau_sec) || !(spec->erb_norm_tau_sec > 0.0f) ||
-        !isfinite(spec->erb_norm_init_lo_db) || !isfinite(spec->erb_norm_init_hi_db) ||
-        !isfinite(spec->erb_norm_scale_db) || !(spec->erb_norm_scale_db > 0.0f))
-        return DFN2_GRID_ERR_ERB_NORM;
-    g.erb_norm_tau_sec = spec->erb_norm_tau_sec;
-    g.erb_norm_init_lo_db = spec->erb_norm_init_lo_db;
-    g.erb_norm_init_hi_db = spec->erb_norm_init_hi_db;
-    g.erb_norm_scale_db = spec->erb_norm_scale_db;
-    g.erb_norm_alpha = dfn2_norm_alpha(spec->sample_rate, g.hop, spec->erb_norm_tau_sec);
-    if (!norm_alpha_ok(g.erb_norm_alpha)) return DFN2_GRID_ERR_ERB_NORM;
-    if (!isfinite(spec->spec_norm_tau_sec) || !(spec->spec_norm_tau_sec > 0.0f) ||
-        !(spec->spec_norm_init_lo > 0.0f) || !isfinite(spec->spec_norm_init_lo) ||
-        !(spec->spec_norm_init_hi > 0.0f) || !isfinite(spec->spec_norm_init_hi))
-        return DFN2_GRID_ERR_SPEC_NORM;
-    g.spec_norm_tau_sec = spec->spec_norm_tau_sec;
-    g.spec_norm_init_lo = spec->spec_norm_init_lo;
-    g.spec_norm_init_hi = spec->spec_norm_init_hi;
-    g.spec_norm_alpha = dfn2_norm_alpha(spec->sample_rate, g.hop, spec->spec_norm_tau_sec);
-    if (!norm_alpha_ok(g.spec_norm_alpha)) return DFN2_GRID_ERR_SPEC_NORM;
+    /* Both alphas come from the fixed, checkpoint-level taus (dfn2_grid.h) -- only the sample
+     * rate and hop (already validated above) can push either one to 0 or 1. */
+    g.erb_norm_alpha = dfn2_norm_alpha(spec->sample_rate, g.hop, DFN2_ERB_NORM_TAU_SEC);
+    if (!norm_alpha_ok(g.erb_norm_alpha)) return DFN2_GRID_ERR_NORM_ALPHA;
+    g.spec_norm_alpha = dfn2_norm_alpha(spec->sample_rate, g.hop, DFN2_SPEC_NORM_TAU_SEC);
+    if (!norm_alpha_ok(g.spec_norm_alpha)) return DFN2_GRID_ERR_NORM_ALPHA;
 
-    /* correctly rounded float32 division and square root: the same values on every compiler */
-    g.stft_scale = 1.0f / sqrtf((float)spec->n_fft);
-    g.stft_unscale = sqrtf((float)spec->n_fft);
     *grid = g;
     return DFN2_GRID_OK;
 }
@@ -340,13 +323,6 @@ int dfn2_grid_validate(const DFN2Grid* grid)
     spec.mask_lookahead = grid->mask_lookahead;
     spec.df_lookahead = grid->df_lookahead;
     spec.frames_per_call = grid->frames_per_call;
-    spec.erb_norm_tau_sec = grid->erb_norm_tau_sec;
-    spec.erb_norm_init_lo_db = grid->erb_norm_init_lo_db;
-    spec.erb_norm_init_hi_db = grid->erb_norm_init_hi_db;
-    spec.erb_norm_scale_db = grid->erb_norm_scale_db;
-    spec.spec_norm_tau_sec = grid->spec_norm_tau_sec;
-    spec.spec_norm_init_lo = grid->spec_norm_init_lo;
-    spec.spec_norm_init_hi = grid->spec_norm_init_hi;
     status = dfn2_grid_make(&want, &spec);
     if (status != DFN2_GRID_OK) return status;
     if (grid->hop != want.hop || grid->n_bins != want.n_bins ||
@@ -354,9 +330,7 @@ int dfn2_grid_validate(const DFN2Grid* grid)
         grid->df_history != want.df_history || grid->ring != want.ring ||
         grid->input_frames != want.input_frames ||
         grid->erb_norm_alpha != want.erb_norm_alpha ||
-        grid->spec_norm_alpha != want.spec_norm_alpha ||
-        grid->stft_scale != want.stft_scale ||
-        grid->stft_unscale != want.stft_unscale)
+        grid->spec_norm_alpha != want.spec_norm_alpha)
         return DFN2_GRID_ERR_INCONSISTENT;
     return DFN2_GRID_OK;
 }
@@ -374,8 +348,7 @@ const char* dfn2_grid_status_text(int status)
     case DFN2_GRID_ERR_MASK_LOOKAHEAD:  return "mask_lookahead must be in [0, 2]";
     case DFN2_GRID_ERR_DF_LOOKAHEAD:    return "df_lookahead must be in [0, df_order - 1] (0 when mask-only)";
     case DFN2_GRID_ERR_FRAMES_PER_CALL: return "frames_per_call must be in [1, 64]";
-    case DFN2_GRID_ERR_ERB_NORM:        return "erb normaliser: tau must be finite and > 0 with an alpha in (0, 1), starts finite, scale finite and > 0";
-    case DFN2_GRID_ERR_SPEC_NORM:       return "spec normaliser: tau must be finite and > 0 with an alpha in (0, 1), starts finite and > 0";
+    case DFN2_GRID_ERR_NORM_ALPHA:       return "a normaliser's fixed-tau ema alpha is not strictly in (0, 1) at this sample rate";
     case DFN2_GRID_ERR_INCONSISTENT:    return "derived grid fields do not match the given ones";
     default:                            return "unknown status";
     }
@@ -490,12 +463,12 @@ static void state_begin(DFN2State* st)
     dfn2_set_erb_matrices(st, st->erb_fwd, st->erb_inv);
     for (int b = 0; b < grid->n_erb; ++b) {
         float position = (float)b / (float)(grid->n_erb - 1);
-        st->erb_norm_state[b] = grid->erb_norm_init_lo_db + position *
-            (grid->erb_norm_init_hi_db - grid->erb_norm_init_lo_db);
+        st->erb_norm_state[b] = DFN2_ERB_NORM_INIT_LO_DB + position *
+            (DFN2_ERB_NORM_INIT_HI_DB - DFN2_ERB_NORM_INIT_LO_DB);
     }
     for (int k = 0; k < grid->df_bins; ++k) {
         float position = (float)k / (float)(grid->df_bins - 1);
-        st->spec_norm_state[k] = norm_seed_linear(grid->spec_norm_init_lo, grid->spec_norm_init_hi, position);
+        st->spec_norm_state[k] = norm_seed_linear(DFN2_SPEC_NORM_INIT_LO, DFN2_SPEC_NORM_INIT_HI, position);
     }
 }
 
@@ -541,8 +514,8 @@ void dfn2_compute_features(DFN2State* st,
         spec_re, spec_im, st->erb_fwd, st->erb_fwd_lo, st->erb_fwd_hi,
         st->erb_fwd_k0, st->erb_fwd_k1, st->grid.n_bins, st->grid.n_erb,
         st->grid.df_bins,
-        st->grid.stft_scale, DFN2_ERB_LOG_FLOOR,
-        st->grid.erb_norm_alpha, st->grid.erb_norm_scale_db,
+        dfn2_stft_scale(st->grid.n_fft), DFN2_ERB_LOG_FLOOR,
+        st->grid.erb_norm_alpha, DFN2_ERB_NORM_SCALE_DB,
         st->erb_norm_state,
         st->grid.spec_norm_alpha, DFN2_SPEC_NORM_EPS,
         st->spec_norm_state,

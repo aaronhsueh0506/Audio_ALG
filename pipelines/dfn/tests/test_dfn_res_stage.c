@@ -32,10 +32,10 @@
 static float erb_fwd[DFN2_N_BINS * DFN2_N_ERB];
 static float erb_inv[DFN2_N_ERB * DFN2_N_BINS];
 
-/* The identity paths scale a spectrum by the grid's stft_scale on the way in and stft_unscale on the
- * way out. Where n_fft is a power of four (256, 1024, 4096) both are powers of two and the round trip
- * is exact; elsewhere (512) they are correctly rounded floats and the round trip is within two float
- * ulps. */
+/* The identity paths scale a spectrum by dfn2_stft_scale(n_fft) on the way in and
+ * dfn2_stft_unscale(n_fft) on the way out. Where n_fft is a power of four (256, 1024, 4096) both
+ * are powers of two and the round trip is exact; elsewhere (512) they are correctly rounded
+ * floats and the round trip is within two float ulps. */
 static int scaled_equal(float got, float want, int n_fft) {
     int exact = n_fft == 256 || n_fft == 1024 || n_fft == 4096;
     return exact ? got == want : fabsf(got - want) <= 2.4e-7f * fabsf(want);
@@ -71,12 +71,13 @@ static void fill_frame(Complex *estimate, Complex *apply, int frame) {
 }
 
 /* ---- absolute scale at the model boundary --------------------------------
- * The stage hands DFN2 the host's audio-scale spectrum times the grid's stft_scale (2^-5 on the
+ * The stage hands DFN2 the host's audio-scale spectrum times dfn2_stft_scale(n_fft) (2^-5 on the
  * 48 kHz grid). The fail-open and identity paths reproduce their input at any scale
- * (stft_scale * stft_unscale == 1), so only this row sees a wrong factor: it drives one signal down
- * the product path (hand-assembled frames, unscaled FFT, through the stage) and through a
- * test-owned AcStft with spec_scale = stft_scale into dfn2_prepost_pre_process_freq, and compares
- * the ERB and complex feature windows the model receives bit for bit. That pins the scale factor,
+ * (dfn2_stft_scale(n_fft) * dfn2_stft_unscale(n_fft) == 1), so only this row sees a wrong factor:
+ * it drives one signal down the product path (hand-assembled frames, unscaled FFT, through the
+ * stage) and through a test-owned AcStft with spec_scale = dfn2_stft_scale(n_fft) into
+ * dfn2_prepost_pre_process_freq, and compares the ERB and complex feature windows the model
+ * receives bit for bit. That pins the scale factor,
  * the analysis window and the frame assembly ([previous hop | this hop], 50% overlap, no
  * centring). The reference instance registers state buffers, so its input/output aliasing check
  * compares real addresses. */
@@ -159,8 +160,8 @@ static int capture_via_stage(ScaleCapture *cap, FftHandle *fft) {
     return 0;
 }
 
-/* The reference: the library fed the spectra of an AcStft whose spec_scale is the grid's
- * stft_scale, the framing contract of dfn2_process.h. */
+/* The reference: the library fed the spectra of an AcStft whose spec_scale is
+ * dfn2_stft_scale(n_fft), the framing contract of dfn2_process.h. */
 static int capture_via_reference(ScaleCapture *cap) {
     static float re[DFN2_N_BINS], im[DFN2_N_BINS], out_re[DFN2_N_BINS], out_im[DFN2_N_BINS];
     static float reg_gru[REG_GRU_ELEMS], reg_convp[REG_CONVP_ELEMS];
@@ -188,7 +189,7 @@ static int capture_via_reference(ScaleCapture *cap) {
     for (i = 0; i < REG_GRU_ELEMS; ++i) if (reg_gru[i] != 0.0f) rc = 3;
     for (i = 0; i < REG_CONVP_ELEMS; ++i) if (reg_convp[i] != 0.0f) rc = 3;
     ac_stft_config_default(&scfg, grid->n_fft);
-    scfg.spec_scale = grid->stft_scale;
+    scfg.spec_scale = dfn2_stft_scale(grid->n_fft);
     stft_bytes = ac_stft_get_mem_size(&scfg);
     if (rc == 0 && (stft_bytes == 0 || posix_memalign(&stft_mem, 16u, stft_bytes) != 0)) rc = 4;
     if (rc == 0) {
@@ -283,7 +284,7 @@ static int run_absolute_scale(void) {
     }
     printf("dfn_res_stage: absolute scale -- %d frames (warm-up frames included) of ERB (%zu) and "
            "complex (%zu) features bit-identical to the library fed an AcStft with "
-           "spec_scale = stft_scale\n", via_stage.frames, via_stage.want_erb, via_stage.want_spec);
+           "spec_scale = dfn2_stft_scale(n_fft)\n", via_stage.frames, via_stage.want_erb, via_stage.want_spec);
     return 0;
 }
 
@@ -402,21 +403,6 @@ static int run_rejections(void) {
     if (!rejects(&cfg)) return 16;
     cfg = base_config(); cfg.grid.n_erb = 1 << 20;
     if (!rejects(&cfg)) return 17;
-    /* A tau edited with its alpha kept, a zero normaliser scale or start value, a zero stft scale. */
-    cfg = base_config(); cfg.grid.erb_norm_tau_sec = 0.5f;
-    if (!rejects(&cfg)) return 18;
-    cfg = base_config(); cfg.grid.spec_norm_tau_sec = 0.5f;
-    if (!rejects(&cfg)) return 19;
-    cfg = base_config(); cfg.grid.erb_norm_scale_db = 0.0f;
-    if (!rejects(&cfg)) return 50;
-    cfg = base_config(); cfg.grid.spec_norm_init_lo = 0.0f;
-    if (!rejects(&cfg)) return 51;
-    cfg = base_config(); cfg.grid.spec_norm_init_hi = -1.0f;
-    if (!rejects(&cfg)) return 52;
-    cfg = base_config(); cfg.grid.stft_scale = 0.0f;
-    if (!rejects(&cfg)) return 53;
-    cfg = base_config(); cfg.grid.stft_unscale = 0.0f;
-    if (!rejects(&cfg)) return 54;
     /* Two frames per call: a grid the library makes and runs, refused by the stage alone (its
      * lookahead and the emitted frame index are exact for one frame per call). */
     {
@@ -495,25 +481,13 @@ static int run_rejections(void) {
 static const DFN2GridSpec TABLE[] = {
     { .sample_rate = 16000, .n_fft = 256, .n_erb = 24, .df_bins = 96,
       .df_order = DFN_TEST_DF_ORDER, .mask_lookahead = 0, .df_lookahead = 0,
-      .frames_per_call = DFN_TEST_FRAMES_PER_CALL,
-      .erb_norm_tau_sec = DFN_TEST_ERB_NORM_TAU_SEC, .erb_norm_init_lo_db = DFN_TEST_ERB_NORM_INIT_LO_DB,
-      .erb_norm_init_hi_db = DFN_TEST_ERB_NORM_INIT_HI_DB, .erb_norm_scale_db = DFN_TEST_ERB_NORM_SCALE_DB,
-      .spec_norm_tau_sec = DFN_TEST_SPEC_NORM_TAU_SEC, .spec_norm_init_lo = DFN_TEST_SPEC_NORM_INIT_LO,
-      .spec_norm_init_hi = DFN_TEST_SPEC_NORM_INIT_HI },
+      .frames_per_call = DFN_TEST_FRAMES_PER_CALL },
     { .sample_rate = 32000, .n_fft = 512, .n_erb = 28, .df_bins = 96,   /* provisional: nothing is trained for it */
       .df_order = DFN_TEST_DF_ORDER, .mask_lookahead = 0, .df_lookahead = 0,
-      .frames_per_call = DFN_TEST_FRAMES_PER_CALL,
-      .erb_norm_tau_sec = DFN_TEST_ERB_NORM_TAU_SEC, .erb_norm_init_lo_db = DFN_TEST_ERB_NORM_INIT_LO_DB,
-      .erb_norm_init_hi_db = DFN_TEST_ERB_NORM_INIT_HI_DB, .erb_norm_scale_db = DFN_TEST_ERB_NORM_SCALE_DB,
-      .spec_norm_tau_sec = DFN_TEST_SPEC_NORM_TAU_SEC, .spec_norm_init_lo = DFN_TEST_SPEC_NORM_INIT_LO,
-      .spec_norm_init_hi = DFN_TEST_SPEC_NORM_INIT_HI },
+      .frames_per_call = DFN_TEST_FRAMES_PER_CALL },
     { .sample_rate = 48000, .n_fft = 1024, .n_erb = 32, .df_bins = 96,
       .df_order = DFN_TEST_DF_ORDER, .mask_lookahead = 1, .df_lookahead = 1,
-      .frames_per_call = DFN_TEST_FRAMES_PER_CALL,
-      .erb_norm_tau_sec = DFN_TEST_ERB_NORM_TAU_SEC, .erb_norm_init_lo_db = DFN_TEST_ERB_NORM_INIT_LO_DB,
-      .erb_norm_init_hi_db = DFN_TEST_ERB_NORM_INIT_HI_DB, .erb_norm_scale_db = DFN_TEST_ERB_NORM_SCALE_DB,
-      .spec_norm_tau_sec = DFN_TEST_SPEC_NORM_TAU_SEC, .spec_norm_init_lo = DFN_TEST_SPEC_NORM_INIT_LO,
-      .spec_norm_init_hi = DFN_TEST_SPEC_NORM_INIT_HI },
+      .frames_per_call = DFN_TEST_FRAMES_PER_CALL },
 };
 #define TABLE_ROWS ((int)(sizeof(TABLE) / sizeof(TABLE[0])))
 #define TG_HOPS 12

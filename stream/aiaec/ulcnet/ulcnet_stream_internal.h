@@ -26,16 +26,15 @@ enum {
 struct UlcnetStream {
     UlcnetGrid grid;
 
-    FftHandle *fft;     /* carved once, shared by stft_err/stft_far/istft (mirrors the board sample) */
+    FftHandle *fft;     /* carved once, shared by stft_err/stft_far/istft */
     AcStft    *stft_err;
     AcStft    *stft_far;
     AcIstft   *istft;
     UlcnetPrepost *prepost;
 
     /* Per-hop scratch, one slab: err_f/far_f/hop_out [hop] each, err_re/err_im/far_re/far_im/
-     * enh_re/enh_im [n_bins] each -- the float-domain counterpart of the board sample's per-hop
-     * stack locals, minus the two int16 arrays (err_in/far_in/pcm_out are the caller's own
-     * buffers, passed by pointer). */
+     * enh_re/enh_im [n_bins] each (err_in/far_in/pcm_out are the caller's own buffers, passed
+     * by pointer). */
     float *err_f;
     float *far_f;
     float *hop_out;

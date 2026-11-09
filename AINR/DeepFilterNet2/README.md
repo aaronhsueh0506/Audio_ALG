@@ -63,7 +63,7 @@ Use `AINR/dataset_gen` to produce or pack the noisy/clean pairs at the grid's sa
 The library is frequency domain only and holds no transform, window or grid. The application frames with audiolib (`AcStft` /
 `AcIstft`, `ac_stft_push_planar()` / `ac_istft_push_planar()`) and passes one spectrum per hop, framed as in training:
 audiolib's default periodic sqrt-Hann window, center 0, hop `n_fft / 2`, plain overlap-add (`AC_OLA_ACCUMULATE`),
-`spec_scale = grid.stft_scale` (1/sqrt(n_fft)) and `ispec_scale = grid.stft_unscale` (sqrt(n_fft)). A wrong window or scale is not
+`spec_scale = dfn2_stft_scale(grid.n_fft)` (1/sqrt(n_fft)) and `ispec_scale = dfn2_stft_unscale(grid.n_fft)` (sqrt(n_fft)). A wrong window or scale is not
 detectable inside the library. Against the training graph's `center=True` padding only the first frame of a clip differs.
 
 `dfn2_process.h/.c` owns the ERB/complex normalization, parameter-free cascade/alpha composition and the attenuation limit. The
@@ -81,9 +81,9 @@ Specific to this one:
   the audio is as if the accelerator had not run. `dfn2_model_run_frame()` still returns 1 for a warm-up frame whose `infer()`
   succeeded. For N > 1 frames per call it keeps the older flow, see [Multi-frame export](reference/multiframe.md); with M = 0 there is no
   warm-up frame;
-- the spectra are `torch.stft(normalized=True)` on the instance's grid (`grid.stft_scale` = 1/sqrt(n_fft); 1024 points on the shipped
-  48 kHz grid), so chaining an AIAEC spectrum in is a sqrt(n_fft) scale error (`grid.stft_unscale`, 32x on the shipped grid; see
-  `dfn2_prepost.h`);
+- the spectra are `torch.stft(normalized=True)` on the instance's grid (`dfn2_stft_scale(grid.n_fft)` = 1/sqrt(n_fft); 1024 points on
+  the shipped 48 kHz grid), so chaining an AIAEC spectrum in is a sqrt(n_fft) scale error (`dfn2_stft_unscale(grid.n_fft)`, 32x on
+  the shipped grid; see `dfn2_prepost.h`);
 - the pool is the caller's (`dfn2_prepost_get_mem_size()`, memory, `dfn2_prepost_init_ex()`) and holds the feature windows, rings,
   normaliser state and output staging, not the recurrent state;
 - the two recurrent state tensors (`h_gru`, `df_convp_history`) belong to the application. A float host registers a (pointer, element

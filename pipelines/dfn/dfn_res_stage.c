@@ -299,9 +299,9 @@ int dfn_res_stage_begin(DfnResStage *s,
     if (!grid || !inputs_valid(estimate_spec, apply_spec, grid->n_bins)) return -1;
 
     skn_deinterleave_scale_cf32(estimate_spec, s->est_re, s->est_im,
-                                grid->n_bins, grid->stft_scale);
+                                grid->n_bins, dfn2_stft_scale(grid->n_fft));
     skn_deinterleave_scale_cf32(apply_spec, s->app_re, s->app_im,
-                                grid->n_bins, grid->stft_scale);
+                                grid->n_bins, dfn2_stft_scale(grid->n_fft));
 
     need_heads = dfn2_prepost_pre_process_freq_dual(
         s->prepost, s->est_re, s->est_im, s->app_re, s->app_im);
@@ -341,7 +341,7 @@ int dfn_res_stage_end(DfnResStage *s, int model_rc, Complex *out_spec) {
         return 0;
     }
     skn_interleave_scale_cf32(s->out_re, s->out_im, out_spec, grid->n_bins,
-                              grid->stft_unscale);
+                              dfn2_stft_unscale(grid->n_fft));
     return 1;
 }
 

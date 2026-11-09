@@ -178,8 +178,8 @@ static int test_dfn2_grid_contract(void)
           g->df_history == DFN2_DF_HISTORY && g->ring == DFN2_DF_RING &&
           g->df_order == DFN2_DF_ORDER && g->frames_per_call == 1,
           "DFN2 test grid has the lookahead pair, order and ring the test expects");
-    CHECK(g->stft_scale == DFN2_NORMALIZED_STFT_SCALE &&
-          g->stft_unscale == DFN2_NORMALIZED_STFT_UNSCALE,
+    CHECK(dfn2_stft_scale(g->n_fft) == DFN2_NORMALIZED_STFT_SCALE &&
+          dfn2_stft_unscale(g->n_fft) == DFN2_NORMALIZED_STFT_UNSCALE,
           "DFN2 test grid has the analysis and synthesis scale of the framing");
 #ifdef DFN2_GRID_KHZ
     /* train.py make_norm_alpha(sr, hop, 1.0): the literals a model trained on
@@ -217,26 +217,28 @@ static int test_dfn2_grid_contract(void)
     CHECK(dfn2_grid_make(&other, &spec_other) == DFN2_GRID_ERR_DF_LOOKAHEAD,
           "DFN2 grid refuses a deep-filter lookahead the order cannot take");
 
-    /* A span wide enough to cancel in float keeps both configured ends of the spec normaliser,
-     * from init and from reset, whichever end is the larger. */
-    for (int e = 0; e < 2; ++e) {
-        const float lo = e ? 1e-8f : 1.0f, hi = e ? 1.0f : 1e-8f;
+    /* The spec normaliser's two configured ends (dfn2_grid.h's fixed DFN2_SPEC_NORM_INIT_LO/
+     * _HI; no longer a spec field a test can vary) are kept, from init and from reset. Bin 0 is
+     * lo + 0 * (hi - lo), exactly lo in float32; the last bin is lo + 1.0f * (hi - lo), which
+     * (unlike the wide, cancelling span the old per-grid override tested) does not overshoot
+     * past hi for these close-together shipped values, so the clamp never triggers and the
+     * result lands within an ulp of hi rather than bit-exact -- compared with a small relative
+     * tolerance instead of `==`. */
+    {
+        const float lo = DFN2_SPEC_NORM_INIT_LO, hi = DFN2_SPEC_NORM_INIT_HI;
+        const float tol = fabsf(hi) * 1e-5f;
         int ends_kept = 1;
-        spec_other = dfn2_test_grid_spec();
-        spec_other.spec_norm_init_lo = lo;
-        spec_other.spec_norm_init_hi = hi;
-        CHECK(dfn2_grid_make(&other, &spec_other) == DFN2_GRID_OK &&
-              dfn2_state_mem_size(&other) == state_bytes &&
-              dfn2_state_init(&state, state_block, state_bytes, &other) == 0,
-              "DFN2 state starts on a wide spec normaliser span");
+        CHECK(dfn2_state_mem_size(g) == state_bytes &&
+              dfn2_state_init(&state, state_block, state_bytes, g) == 0,
+              "DFN2 state starts on the spec normaliser span");
         for (int pass = 0; pass < 2; ++pass) {
             ends_kept = ends_kept && state.spec_norm_state[0] == lo &&
-                        state.spec_norm_state[other.df_bins - 1] == hi;
-            for (int k = 0; k < other.df_bins; ++k)
+                        fabsf(state.spec_norm_state[g->df_bins - 1] - hi) <= tol;
+            for (int k = 0; k < g->df_bins; ++k)
                 ends_kept = ends_kept && state.spec_norm_state[k] > 0.0f &&
                             state.spec_norm_state[k] >= (lo < hi ? lo : hi) &&
                             state.spec_norm_state[k] <= (lo < hi ? hi : lo);
-            memset(state.spec_norm_state, 0, sizeof(float) * (size_t)other.df_bins);
+            memset(state.spec_norm_state, 0, sizeof(float) * (size_t)g->df_bins);
             dfn2_state_reset(&state);
         }
         CHECK(ends_kept, "DFN2 spec normaliser keeps both configured ends, at init and after reset");
@@ -593,7 +595,8 @@ static int test_dfn2(uint64_t* digest)
     int valid_frames = 0;
 
     dfn_test_build_erb();
-    CHECK(ainr_test_hop_open(&hop_io, DFN2_N_FFT, grid->stft_scale, grid->stft_unscale) == 0,
+    CHECK(ainr_test_hop_open(&hop_io, DFN2_N_FFT, dfn2_stft_scale(DFN2_N_FFT),
+                             dfn2_stft_unscale(DFN2_N_FFT)) == 0,
           "DFN2 framing objects");
     CHECK(state_block != NULL &&
           dfn2_state_init(&state, state_block, state_bytes, grid) == 0,
@@ -1516,7 +1519,8 @@ static int test_dfn_erb_spans_exact(void)
     float re[BINS], im[BINS], fe[BANDS], fs[2 * DFN2_DF_BINS], mask[BANDS];
     float out_re[BINS], out_im[BINS], ref_state[BANDS], erb[BANDS], ref_gain[BINS];
     const DFN2Grid* grid = dfn2_test_grid();
-    const float scale2 = grid->stft_scale * grid->stft_scale;
+    const float s = dfn2_stft_scale(grid->n_fft);
+    const float scale2 = s * s;
     const float alpha = grid->erb_norm_alpha;
     const size_t state_bytes = dfn2_state_mem_size(grid);
     void* block = aligned_block(state_bytes);
@@ -1565,7 +1569,7 @@ static int test_dfn_erb_spans_exact(void)
             for (int b = 0; b < BANDS; ++b) {
                 float db = 10.0f * log10f(erb[b] + DFN2_ERB_LOG_FLOOR);
                 float mean = alpha * ref_state[b] + (1.0f - alpha) * db;
-                float ref = (db - mean) / grid->erb_norm_scale_db;
+                float ref = (db - mean) / DFN2_ERB_NORM_SCALE_DB;
                 ref_state[b] = mean;
                 CHECK(memcmp(&fe[b], &ref, sizeof(ref)) == 0,
                       "DFN2 ERB features over the nonzero spans equal the dense sum");

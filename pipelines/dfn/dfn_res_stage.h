@@ -1,10 +1,10 @@
 /* Post-RES DeepFilterNet2 stage shared by the mono and 4-channel "AEC + RES + DFN2" pipelines. One
- * hop in, one spectrum out: A = E * grid.stft_scale (E: pre-RES spectrum the RES gain was estimated
- * from), B = P * grid.stft_scale (P: post-RES spectrum, E * G_res + comfort noise), heads =
- * DFN2(estimated on A), Y = heads applied on B, out = Y * grid.stft_unscale. The model estimates from
- * the pre-RES spectrum and applies to the post-RES one; with the comfort-noise fill off E and P share
- * phase, so the deep-filter taps fitted on A apply to B (the hosting pipelines keep the fill off by
- * default).
+ * hop in, one spectrum out: A = E * dfn2_stft_scale(n_fft) (E: pre-RES spectrum the RES gain was
+ * estimated from), B = P * dfn2_stft_scale(n_fft) (P: post-RES spectrum, E * G_res + comfort
+ * noise), heads = DFN2(estimated on A), Y = heads applied on B, out = Y * dfn2_stft_unscale(n_fft).
+ * The model estimates from the pre-RES spectrum and applies to the post-RES one; with the
+ * comfort-noise fill off E and P share phase, so the deep-filter taps fitted on A apply to B (the
+ * hosting pipelines keep the fill off by default).
  *
  * Timing: the emitted spectrum belongs to source frame t - L, L = dfn_res_stage_lookahead_frames()
  * (grid.mask_lookahead + grid.df_lookahead, 2 for the shipped 1/1 pair); the first L hops return 0
@@ -43,15 +43,16 @@ extern "C" {
 #define DFN_RES_STAGE_DESCRIPTOR_VERSION 1u
 /* Carve layout version; bumped on any change of pool size, carve order or
  * descriptor content, the DFN2 pre/post pool included. */
-#define DFN_RES_STAGE_LAYOUT_VERSION     5u
+#define DFN_RES_STAGE_LAYOUT_VERSION     6u
 #define DFN_RES_STAGE_BACKEND_NE10       2u   /* id 1 is never returned */
 
 /* Frames the emitted spectrum trails the newest input by: the DFN2 cascade of the grid's
  * lookahead pair (the stage runs one frame per call). The audio-scale spectra the stage takes
- * and returns are scaled to and from DFN2's normalized=True spectra by the grid's stft_scale
- * (1/sqrt(n_fft)) and stft_unscale (sqrt(n_fft)): exact powers of two where n_fft is a power of
- * four (256, 1024, 4096), correctly rounded floats elsewhere (512). The caller's AcStft and
- * AcIstft keep audiolib's default spec_scale / ispec_scale of 1: the stage applies the grid's. */
+ * and returns are scaled to and from DFN2's normalized=True spectra by dfn2_stft_scale(n_fft)
+ * (1/sqrt(n_fft)) and dfn2_stft_unscale(n_fft) (sqrt(n_fft)): exact powers of two where n_fft is
+ * a power of four (256, 1024, 4096), correctly rounded floats elsewhere (512). The caller's
+ * AcStft and AcIstft keep audiolib's default spec_scale / ispec_scale of 1: the stage applies
+ * these itself. */
 static inline int dfn_res_stage_lookahead_frames(const DFN2Grid *grid)
 {
     return grid ? grid->mask_lookahead + grid->df_lookahead : 0;

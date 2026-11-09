@@ -68,9 +68,6 @@ int main(void) {
     DFN2GridSpec spec = {
         .sample_rate = 16000, .n_fft = 256, .n_erb = 24, .df_bins = 96, .df_order = 5,
         .mask_lookahead = 1, .df_lookahead = MAIN_DF_LOOKAHEAD, .frames_per_call = 1,
-        .erb_norm_tau_sec = 1.0f, .erb_norm_init_lo_db = -60.0f, .erb_norm_init_hi_db = -90.0f,
-        .erb_norm_scale_db = 40.0f, .spec_norm_tau_sec = 1.0f, .spec_norm_init_lo = 0.001f,
-        .spec_norm_init_hi = 0.0001f,
     };
     DFN2Grid grid;
     DFN2PrepostConfig config;
@@ -325,10 +322,6 @@ static DFN2GridSpec spec_for(int mask, int df)
     DFN2GridSpec spec = {
         .sample_rate = SR, .n_fft = N_FFT, .n_erb = N_ERB, .df_bins = DF_BINS, .df_order = @ORDER@,
         .mask_lookahead = mask, .df_lookahead = df, .frames_per_call = 1,
-        .erb_norm_tau_sec = @ERB_TAU@, .erb_norm_init_lo_db = @ERB_LO@,
-        .erb_norm_init_hi_db = @ERB_HI@, .erb_norm_scale_db = @ERB_SCALE@,
-        .spec_norm_tau_sec = @SPEC_TAU@, .spec_norm_init_lo = @SPEC_LO@,
-        .spec_norm_init_hi = @SPEC_HI@,
     };
     return spec;
 }
@@ -533,13 +526,7 @@ _GUARD_BUILDS = {
 
 def _guard_source():
     values = dfn_pairs.dfn2_spec_values()
-    text = _GUARD_DRIVER
-    for token, key in (('ERB_TAU', 'erb_norm_tau_sec'), ('ERB_LO', 'erb_norm_init_lo_db'),
-                       ('ERB_HI', 'erb_norm_init_hi_db'), ('ERB_SCALE', 'erb_norm_scale_db'),
-                       ('SPEC_TAU', 'spec_norm_tau_sec'), ('SPEC_LO', 'spec_norm_init_lo'),
-                       ('SPEC_HI', 'spec_norm_init_hi')):
-        text = text.replace('@%s@' % token, repr(values[key]) + 'f')
-    return text.replace('@ORDER@', str(values['df_order']))
+    return _GUARD_DRIVER.replace('@ORDER@', str(values['df_order']))
 
 
 @pytest.fixture(scope='module')

@@ -2,6 +2,42 @@
 
 ## Unreleased
 
+### DFN2Grid / DFN2GridSpec: the feature normaliser and the FFT scale become fixed, not run-time
+
+- `DFN2GridSpec` and `DFN2Grid` lose the seven `config.ini [feature]` normaliser fields
+  (`erb_norm_tau_sec`, `erb_norm_init_lo_db`, `erb_norm_init_hi_db`, `erb_norm_scale_db`,
+  `spec_norm_tau_sec`, `spec_norm_init_lo`, `spec_norm_init_hi`); `DFN2Grid` also loses
+  `stft_scale` / `stft_unscale`. They were already identical for every shipped grid (a new
+  checkpoint needing different values is a new build of `dfn2_grid.h`, not a run-time choice),
+  so they become fixed constants `DFN2_ERB_NORM_TAU_SEC`, `DFN2_ERB_NORM_INIT_LO_DB`,
+  `DFN2_ERB_NORM_INIT_HI_DB`, `DFN2_ERB_NORM_SCALE_DB`, `DFN2_SPEC_NORM_TAU_SEC`,
+  `DFN2_SPEC_NORM_INIT_LO`, `DFN2_SPEC_NORM_INIT_HI` plus two new inline helpers,
+  `dfn2_stft_scale(n_fft)` / `dfn2_stft_unscale(n_fft)`, replacing the two removed grid fields
+  with the same numeric result. `DFN2Grid` keeps `erb_norm_alpha` / `spec_norm_alpha` (the EMA
+  coefficients derived from the now-fixed tau and the grid's own sample rate and hop).
+- `DFN2_GRID_ERR_ERB_NORM` (-12) and `DFN2_GRID_ERR_SPEC_NORM` (-13) merge into one
+  `DFN2_GRID_ERR_NORM_ALPHA` (-12); -13 is now permanently unassigned, like -8. The only way
+  left to hit it is a sample rate whose fixed-tau EMA alpha rounds to exactly 0.0 or 1.0 in
+  float32 -- the seven settings are no longer caller-supplied, so there is nothing left to
+  corrupt at the spec level. `DFN2_PREPOST_CARVE_VERSION` bumps 11 -> 12.
+- DFN3, RNNoise-ERB and the other AINR/AIAEC models are unchanged (their own, separate grid
+  structs happen to share some of these field names, which is not shared state).
+
+### stream/ainr/dfn2: file-loader merge, comment trim
+
+- `dfn2_stream_erb_file.c` and `dfn2_stream_internal.h` are gone, folded into `dfn2_stream.c`:
+  the file-loader entry points (`dfn2_stream_init_from_erb_file[_ex]`) are now guarded by
+  `-DDFN2_STREAM_NO_STDIO` instead of living in a separate translation unit; `NO_STDIO=1` compiles
+  them out rather than dropping a second `.o` from the archive. `audit-no-stdio` is unchanged in
+  effect. `DFN2_STREAM_LAYOUT_VERSION` bumps 1 -> 2 (the dead `heap_base` field is also dropped
+  from `DFN2Stream`, on top of the grid shrink above). `stream/aiaec/deepvqe_s` and
+  `stream/aiaec/ulcnet` keep their existing internal-header split (a different, model-specific
+  decision, not touched here).
+- Comment pass across `stream/ainr/dfn2`, `stream/aiaec/deepvqe_s`, `stream/aiaec/ulcnet` and
+  `stream/common`: dropped development-process narration ("confirmed:", "mirrors the board
+  sample exactly") and condensed contract comments to the essential behavior, verified
+  comment-only via `cc -E -P`.
+
 ### AI model libraries: run-time grid, caller memory, frequency domain only, application-owned state and ERB matrices
 
 - Run-time grid for all four libraries. `dfn2_grid_make(&grid, const DFN2GridSpec *spec)` replaces the six-value form; the spec also

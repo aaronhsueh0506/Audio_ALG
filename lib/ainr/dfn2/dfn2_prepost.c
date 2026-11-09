@@ -119,10 +119,8 @@ static uint32_t pp_fnv1a_str(uint32_t h, const char *s) {
 static uint32_t pp_build_hash(const DFN2Grid *grid) {
     uint32_t h = 2166136261u;
     const float tuning[] = {
-        grid->erb_norm_tau_sec, grid->spec_norm_tau_sec,
-        grid->erb_norm_alpha, grid->spec_norm_alpha, grid->stft_scale, grid->stft_unscale,
-        grid->erb_norm_init_lo_db, grid->erb_norm_init_hi_db, grid->erb_norm_scale_db,
-        grid->spec_norm_init_lo, grid->spec_norm_init_hi,
+        grid->erb_norm_alpha, grid->spec_norm_alpha,
+        dfn2_stft_scale(grid->n_fft), dfn2_stft_unscale(grid->n_fft),
     };
     size_t i;
     DFN2_REQUIRE_VARIANT_LINK();

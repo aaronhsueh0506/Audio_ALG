@@ -92,13 +92,6 @@
 /* config.ini [model] df_order and [feature]: the shipped model's values, a test table that
  * tests/test_dfn2_contract.py pins to the files. */
 #define DFN2_DF_ORDER                  5
-#define DFN2_TEST_ERB_NORM_TAU_SEC     1.0f
-#define DFN2_TEST_ERB_NORM_INIT_LO_DB  (-60.0f)
-#define DFN2_TEST_ERB_NORM_INIT_HI_DB  (-90.0f)
-#define DFN2_TEST_ERB_NORM_SCALE_DB    40.0f
-#define DFN2_TEST_SPEC_NORM_TAU_SEC    1.0f
-#define DFN2_TEST_SPEC_NORM_INIT_LO    0.001f
-#define DFN2_TEST_SPEC_NORM_INIT_HI    0.0001f
 
 /* Shapes of the exported graph's recurrent state (export_onnx.py): h_gru is
  * [1, GRU_ROWS, 1, GRU_HIDDEN] (encoder row 0, ERB rows from 1, DF rows from 3) and
@@ -147,13 +140,6 @@ static inline DFN2GridSpec dfn2_test_grid_spec(void)
         .mask_lookahead = DFN2_MASK_LOOKAHEAD,
         .df_lookahead = DFN2_DF_LOOKAHEAD,
         .frames_per_call = 1,
-        .erb_norm_tau_sec = DFN2_TEST_ERB_NORM_TAU_SEC,
-        .erb_norm_init_lo_db = DFN2_TEST_ERB_NORM_INIT_LO_DB,
-        .erb_norm_init_hi_db = DFN2_TEST_ERB_NORM_INIT_HI_DB,
-        .erb_norm_scale_db = DFN2_TEST_ERB_NORM_SCALE_DB,
-        .spec_norm_tau_sec = DFN2_TEST_SPEC_NORM_TAU_SEC,
-        .spec_norm_init_lo = DFN2_TEST_SPEC_NORM_INIT_LO,
-        .spec_norm_init_hi = DFN2_TEST_SPEC_NORM_INIT_HI,
     };
     return spec;
 }

@@ -205,20 +205,14 @@ int main(int argc, char **argv)
 {
     DFN@N@GridSpec spec;
     int mask, df;
-    if (argc != 13) return 2;
+    if (argc != @ARGC@) return 2;
     memset(&spec, 0, sizeof spec);
     spec.sample_rate = atoi(argv[1]);
     spec.n_fft = atoi(argv[2]);
     spec.n_erb = atoi(argv[3]);
     spec.df_bins = atoi(argv[4]);
     spec.df_order = atoi(argv[5]);
-@FRAMES@    spec.erb_norm_tau_sec = (float)atof(argv[6]);
-    spec.erb_norm_init_lo_db = (float)atof(argv[7]);
-    spec.erb_norm_init_hi_db = (float)atof(argv[8]);
-    spec.erb_norm_scale_db = (float)atof(argv[9]);
-    spec.spec_norm_tau_sec = (float)atof(argv[10]);
-    spec.spec_norm_init_lo = (float)atof(argv[11]);
-    spec.spec_norm_init_hi = (float)atof(argv[12]);
+@FRAMES@@NORM_FIELDS@
     for (mask = -1; mask <= 3; ++mask) {
         for (df = -1; df <= 5; ++df) {
             DFN@N@Grid grid, before;
@@ -245,8 +239,25 @@ int main(int argc, char **argv)
 
 def _grid_probe_source(family):
     number = family[-1]
-    frames = '    spec.frames_per_call = 1;\n' if family == 'DeepFilterNet2' else ''
-    return (_GRID_PROBE.replace('@N@', number).replace('@FRAMES@', frames))
+    if family == 'DeepFilterNet2':
+        # The seven [feature] normaliser settings are fixed constants inside dfn2_grid.h now,
+        # not spec fields -- nothing to fill in from argv for this family.
+        frames = '    spec.frames_per_call = 1;\n'
+        norm_fields = ''
+        argc = '6'
+    else:
+        frames = ''
+        norm_fields = (
+            '    spec.erb_norm_tau_sec = (float)atof(argv[6]);\n'
+            '    spec.erb_norm_init_lo_db = (float)atof(argv[7]);\n'
+            '    spec.erb_norm_init_hi_db = (float)atof(argv[8]);\n'
+            '    spec.erb_norm_scale_db = (float)atof(argv[9]);\n'
+            '    spec.spec_norm_tau_sec = (float)atof(argv[10]);\n'
+            '    spec.spec_norm_init_lo = (float)atof(argv[11]);\n'
+            '    spec.spec_norm_init_hi = (float)atof(argv[12]);\n')
+        argc = '13'
+    return (_GRID_PROBE.replace('@N@', number).replace('@FRAMES@', frames)
+            .replace('@NORM_FIELDS@', norm_fields).replace('@ARGC@', argc))
 
 
 def build_grid_probe(workdir, std='c11', flags=(), cxx=False, family='DeepFilterNet2'):
@@ -289,10 +300,15 @@ def run_grid_probe(exe, grid=_SHIPPED_GRID, cfg=None, family='DeepFilterNet2'):
     with the order and normalisers of ``cfg`` (default: the family's shipped
     config)."""
     values = dfn2_spec_values(cfg, family)
-    spec = [values['df_order'], *[repr(values[key]) for key in (
-        'erb_norm_tau_sec', 'erb_norm_init_lo_db', 'erb_norm_init_hi_db',
-        'erb_norm_scale_db', 'spec_norm_tau_sec', 'spec_norm_init_lo',
-        'spec_norm_init_hi')]]
+    if family == 'DeepFilterNet2':
+        # The seven normaliser settings are no longer spec fields for this family (see
+        # _grid_probe_source); the probe binary takes no extra argv for them.
+        spec = [values['df_order']]
+    else:
+        spec = [values['df_order'], *[repr(values[key]) for key in (
+            'erb_norm_tau_sec', 'erb_norm_init_lo_db', 'erb_norm_init_hi_db',
+            'erb_norm_scale_db', 'spec_norm_tau_sec', 'spec_norm_init_lo',
+            'spec_norm_init_hi')]]
     done = subprocess.run([str(exe), *map(str, grid), *map(str, spec)],
                           capture_output=True, text=True)
     assert done.returncode == 0, (done.stdout, done.stderr)

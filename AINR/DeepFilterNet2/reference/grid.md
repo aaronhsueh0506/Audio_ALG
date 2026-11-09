@@ -15,14 +15,21 @@ The shipped model's spec is the `SHIPPED` initializer of the example under [Call
 |---|---|
 | `sample_rate`, `n_fft`, `n_erb`, `df_bins`, `df_order`, `mask_lookahead`, `df_lookahead` | `config.ini` `[signal]` (`sr`, `n_fft`) and `[model]` (the same names) |
 | `frames_per_call` | heads per accelerator call (`export_onnx.py --frames-per-call`, 1 for the shipped graph) |
-| `erb_norm_tau_sec`, `erb_norm_init_lo_db`, `erb_norm_init_hi_db`, `erb_norm_scale_db`, `spec_norm_tau_sec`, `spec_norm_init_lo`, `spec_norm_init_hi` | `config.ini` `[feature]` (the same names); `calibrate_norm_init.py` estimates them for another grid; they must equal the training values |
+
+The seven `config.ini` `[feature]` normaliser settings (`erb_norm_tau_sec`, `erb_norm_init_lo_db`, `erb_norm_init_hi_db`,
+`erb_norm_scale_db`, `spec_norm_tau_sec`, `spec_norm_init_lo`, `spec_norm_init_hi`) are **not** spec fields: they are identical for
+every shipped grid, so `dfn2_grid.h` fixes them as compile-time constants (`DFN2_ERB_NORM_TAU_SEC`, `DFN2_ERB_NORM_INIT_LO_DB`,
+`DFN2_ERB_NORM_INIT_HI_DB`, `DFN2_ERB_NORM_SCALE_DB`, `DFN2_SPEC_NORM_TAU_SEC`, `DFN2_SPEC_NORM_INIT_LO`,
+`DFN2_SPEC_NORM_INIT_HI`), equal to the `config.ini` `[feature]` values (`calibrate_norm_init.py` still estimates them for another
+grid, to confirm they equal the training values -- a checkpoint that genuinely needs different ones is a new build of
+`dfn2_grid.h`, not a run-time parameter).
 
 | derived field | value |
 |---|---|
 | `hop`, `n_bins` | `n_fft / 2`, `n_fft / 2 + 1` (audiolib 50 % overlap sqrt-Hann framing) |
 | `input_frames` | `frames_per_call + 2` (`DFN2_MODEL_INPUT_FRAMES` is 3) |
-| `stft_scale`, `stft_unscale` | float32 `1 / sqrt(n_fft)` and `sqrt(n_fft)`: the `torch.stft(normalized=True)` factor, also `train.py`'s `analysis_scale()` for win = n_fft, hop = n_fft / 2 |
-| `erb_norm_alpha`, `spec_norm_alpha` | `dfn2_norm_alpha(sample_rate, hop, tau_sec)` = `train.py` `make_norm_alpha`: `exp(-(hop / sr) / tau)` rounded to three decimals, one more digit while that reaches 1.0. 0.989 for hop 512 at 48 kHz, 0.992 for hop 128 at 16 kHz and hop 256 at 32 kHz (tau 1.0 s). Derived, never given |
+| `dfn2_stft_scale(n_fft)`, `dfn2_stft_unscale(n_fft)` | inline helpers, not grid fields: float32 `1 / sqrt(n_fft)` and `sqrt(n_fft)`, the `torch.stft(normalized=True)` factor, also `train.py`'s `analysis_scale()` for win = n_fft, hop = n_fft / 2 |
+| `erb_norm_alpha`, `spec_norm_alpha` | `dfn2_norm_alpha(sample_rate, hop, tau_sec)` at the fixed `DFN2_ERB_NORM_TAU_SEC` / `DFN2_SPEC_NORM_TAU_SEC` = `train.py` `make_norm_alpha`: `exp(-(hop / sr) / tau)` rounded to three decimals, one more digit while that reaches 1.0. 0.989 for hop 512 at 48 kHz, 0.992 for hop 128 at 16 kHz and hop 256 at 32 kHz (tau 1.0 s). Derived, never given |
 | `df_history`, `ring` | `df_order - df_lookahead - 1` past deep-filter taps; ring depth `max(df_order, mask + df + 1)` (mask-only `mask + 1`) |
 
 **Validity** (`dfn2_grid_make()` returns the first failing check, in this order, and leaves the grid untouched;
@@ -39,11 +46,12 @@ The shipped model's spec is the `SHIPPED` initializer of the example under [Call
 | `DFN2_GRID_ERR_MASK_LOOKAHEAD` | in [0, `DFN2_GRID_MASK_LOOKAHEAD_MAX` = 2] |
 | `DFN2_GRID_ERR_DF_LOOKAHEAD` | in [0, `df_order` - 1]; 0 with `-DDFN2_MASK_ONLY` |
 | `DFN2_GRID_ERR_FRAMES_PER_CALL` | in [1, `DFN2_MODEL_MAX_FRAMES_PER_CALL` = 64] |
-| `DFN2_GRID_ERR_ERB_NORM`, `DFN2_GRID_ERR_SPEC_NORM` | tau finite and > 0, starts finite (spec starts and the ERB scale > 0), and the alpha it gives strictly between 0 and 1 as float32: a rate or tau that rounds the alpha to 0 or 1 is refused |
+| `DFN2_GRID_ERR_NORM_ALPHA` | the fixed-tau EMA alpha (`dfn2_norm_alpha()` at `DFN2_ERB_NORM_TAU_SEC` / `DFN2_SPEC_NORM_TAU_SEC` and this grid's sample rate and hop) strictly between 0 and 1 as float32: a sample rate that rounds either alpha to 0 or 1 is refused. Since the seven normaliser settings are fixed constants now, a sample-rate sweep is the only way left to hit this |
 | `DFN2_GRID_ERR_INCONSISTENT` | (`dfn2_grid_validate()`) a derived field differs from what `dfn2_grid_make()` derives, or an alpha is not in (0, 1) |
 
-Status -8 is unassigned and is never reused. Every library entry point that takes a grid runs `dfn2_grid_validate()` and refuses
-an invalid one (-1 or NULL).
+Status -8 and -13 are unassigned and are never reused (`DFN2_GRID_ERR_ERB_NORM` / `DFN2_GRID_ERR_SPEC_NORM` used to be -12 / -13;
+they merged into the single `DFN2_GRID_ERR_NORM_ALPHA` = -12). Every library entry point that takes a grid runs
+`dfn2_grid_validate()` and refuses an invalid one (-1 or NULL).
 
 **RAM.** The pool follows the grid and the pair (`dfn2_prepost_get_mem_size()`, 64-bit host, bytes). The application's `AcStft` /
 `AcIstft`, the ERB matrices and the registered recurrent state are not in the pool:
@@ -68,14 +76,16 @@ zero from `dfn2_model_io_descriptor_default()` and never read.
   `dfn2_variant_full` or `dfn2_variant_mask_only`. Objects built with a different variant (`-DDFN2_MASK_ONLY` on some units only)
   do not link; the grid and the pair are not in it. Under a `.c` -> `.o` rule objects of other flags share names: keep one object
   directory per flag set (`make -C AINR lib` does), or clean between builds.
-- `DFN2_PREPOST_CARVE_VERSION` is 11. The pool hash (`build_flags_hash`, FNV-1a-32) folds the whole grid: sample rate, n_fft, hop,
-  n_bins, n_erb, df_bins, `df_order`, both lookaheads, history, ring, `frames_per_call`, `input_frames`, both time constants and
-  alphas, the two scales and the five normaliser starting points, plus the variant, the layout and carve versions and the feature
-  version. A `DFN2PrepostMemReq` recorded by another grid or build is refused by `dfn2_prepost_init_ex`; query the size again.
+- `DFN2_PREPOST_CARVE_VERSION` is 12. The pool hash (`build_flags_hash`, FNV-1a-32) folds the whole grid: sample rate, n_fft, hop,
+  n_bins, n_erb, df_bins, `df_order`, both lookaheads, history, ring, `frames_per_call`, `input_frames`, plus the variant, the
+  layout and carve versions, the feature version, the two alphas and `dfn2_stft_scale(n_fft)` / `dfn2_stft_unscale(n_fft)`. The
+  seven normaliser settings are no longer in the hash at all (they are fixed constants, identical for every grid). A
+  `DFN2PrepostMemReq` recorded by another grid or build is refused by `dfn2_prepost_init_ex`; query the size again.
 
 **Board samples.** The board samples (`audio_sample/`, outside this repo) own the table from (sample rate, FFT size) to a
-`DFN2GridSpec` row, designated initialisers passed to `dfn2_grid_make()`; a row carries the model's numbers (`df_order`,
-`frames_per_call` 1 and the seven normaliser values). The library only validates what they pass. The three rows below are the table of
+`DFN2GridSpec` row, designated initialisers passed to `dfn2_grid_make()`; a row carries the model's numbers (`df_order` and
+`frames_per_call` 1 -- the seven normaliser values are fixed constants in `dfn2_grid.h` now, not a per-row value). The library
+only validates what they pass. The three rows below are the table of
 the standalone samples; `alg_ai3_aec_dfn.c` and the pipeline example mains (`pipelines/dfn/dfn_example_args.h`) keep two of them,
 without 32000 / 512, because the AEC in front of the model has no 32 kHz grid; the mask-only sample differs, in its df lookahead (see
 its row in the second table):
@@ -134,8 +144,8 @@ mains hold no build-time grid: the `DFN2Grid` travels in `DfnResStageConfig.grid
 this README (`(1,1,3,32)` and so on) are the shipped grid's. Tests: `../tests/test_dfn2_grid.py` (every refusal and status code, the
 derived fields, `make` agreeing with `validate` over a sweep of sample rates, `dfn2_norm_alpha` against `train.py` bit for bit, the
 overflow-free `n_erb` check under UBSan, C against Python from one binary on every grid), `../tests/test_dfn2_runtime_grid.py` (the
-whole chain on every grid and pair, pool identity against an independent Python mirror of the layout, the normaliser fields, no
-grid in the library, the variant link symbol), `../tests/test_dfn2_prepost_c.py`, `../tests/test_c_prepost.c`,
+whole chain on every grid and pair, pool identity against an independent Python mirror of the layout, no grid in the library, the
+variant link symbol), `../tests/test_dfn2_prepost_c.py`, `../tests/test_c_prepost.c`,
 `../tests/test_nn_chains.c`.
 
 [返回本主題](../README.md)

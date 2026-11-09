@@ -16,8 +16,9 @@
  *      32       32000   512    256   257   28     96     (not trained yet)
  *      16       16000   256    128   129   24     96
  *
- * The df_order, frames_per_call and normaliser numbers are the shipped checkpoint's
- * (AINR/DeepFilterNet2/config.ini [model], [feature]); test_dfn_test_grid_pin.py compares them.
+ * The df_order and frames_per_call are the shipped checkpoint's (AINR/DeepFilterNet2/config.ini
+ * [model]); test_dfn_test_grid_pin.py compares them. The feature normaliser settings are fixed
+ * constants in dfn2_grid.h, not test-grid literals.
  * Test scaffolding only: product code takes its grid from its caller or its arguments.
  * pipelines/Makefile applies the selectors to the test programs only (DFN2_TEST_GRID_KHZ,
  * DFN2_MASK_LOOKAHEAD / DFN2_DF_LOOKAHEAD). */
@@ -81,13 +82,6 @@
 /* Model numbers every row of the test tables carries. */
 #define DFN_TEST_DF_ORDER             5
 #define DFN_TEST_FRAMES_PER_CALL      1
-#define DFN_TEST_ERB_NORM_TAU_SEC     1.0f
-#define DFN_TEST_ERB_NORM_INIT_LO_DB  (-60.0f)
-#define DFN_TEST_ERB_NORM_INIT_HI_DB  (-90.0f)
-#define DFN_TEST_ERB_NORM_SCALE_DB    40.0f
-#define DFN_TEST_SPEC_NORM_TAU_SEC    1.0f
-#define DFN_TEST_SPEC_NORM_INIT_LO    0.001f
-#define DFN_TEST_SPEC_NORM_INIT_HI    0.0001f
 
 /* Largest row of the test tables (48 kHz / 1024): the static matrices and spectra of the table
  * rows are sized from it, and dfn_test_table_fits() refuses a row beyond it. */
@@ -110,13 +104,6 @@ static inline DFN2GridSpec dfn_test_spec(int sample_rate, int n_fft, int n_erb, 
         .mask_lookahead       = mask_lookahead,
         .df_lookahead         = df_lookahead,
         .frames_per_call      = DFN_TEST_FRAMES_PER_CALL,
-        .erb_norm_tau_sec     = DFN_TEST_ERB_NORM_TAU_SEC,
-        .erb_norm_init_lo_db  = DFN_TEST_ERB_NORM_INIT_LO_DB,
-        .erb_norm_init_hi_db  = DFN_TEST_ERB_NORM_INIT_HI_DB,
-        .erb_norm_scale_db    = DFN_TEST_ERB_NORM_SCALE_DB,
-        .spec_norm_tau_sec    = DFN_TEST_SPEC_NORM_TAU_SEC,
-        .spec_norm_init_lo    = DFN_TEST_SPEC_NORM_INIT_LO,
-        .spec_norm_init_hi    = DFN_TEST_SPEC_NORM_INIT_HI,
     };
     return spec;
 }
@@ -133,13 +120,6 @@ static inline DFN2GridSpec dfn_test_spec_of(const DFN2Grid *grid)
         .mask_lookahead       = grid->mask_lookahead,
         .df_lookahead         = grid->df_lookahead,
         .frames_per_call      = grid->frames_per_call,
-        .erb_norm_tau_sec     = grid->erb_norm_tau_sec,
-        .erb_norm_init_lo_db  = grid->erb_norm_init_lo_db,
-        .erb_norm_init_hi_db  = grid->erb_norm_init_hi_db,
-        .erb_norm_scale_db    = grid->erb_norm_scale_db,
-        .spec_norm_tau_sec    = grid->spec_norm_tau_sec,
-        .spec_norm_init_lo    = grid->spec_norm_init_lo,
-        .spec_norm_init_hi    = grid->spec_norm_init_hi,
     };
     return spec;
 }

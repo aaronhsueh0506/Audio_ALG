@@ -6,8 +6,8 @@ the application gives it one, so step 1 comes first and its `DFN2Grid` goes to e
 1. `dfn2_grid_make()` from the application's table row (or `dfn2_grid_validate()` on a grid it already holds).
 2. Load the ERB matrices of that model (the layouts are described under [Choosing the grid](grid.md#choosing-the-grid); the library never
    reads files and borrows the pointers).
-3. The framing: `ac_stft_config_default(&sc, grid.n_fft)` with `sc.spec_scale = grid.stft_scale` and `sc.ispec_scale =
-   grid.stft_unscale`, then `ac_stft_get_mem_size()` / `ac_stft_init()` and `ac_istft_get_mem_size()` / `ac_istft_init()`.
+3. The framing: `ac_stft_config_default(&sc, grid.n_fft)` with `sc.spec_scale = dfn2_stft_scale(grid.n_fft)` and `sc.ispec_scale =
+   dfn2_stft_unscale(grid.n_fft)`, then `ac_stft_get_mem_size()` / `ac_stft_init()` and `ac_istft_get_mem_size()` / `ac_istft_init()`.
 4. `dfn2_prepost_config_defaults(&cfg, &grid)`, set `erb_fwd`, `erb_inv` (and `atten_lim_db` when wanted) and, on a float host, the
    state registration; `dfn2_prepost_get_mem_size()`, a 16-byte aligned pool of `req.bytes`, `dfn2_prepost_init_ex()` (a stale `req`
    is refused).
@@ -27,13 +27,11 @@ the application gives it one, so step 1 comes first and its `DFN2Grid` goes to e
 #include "audio_stft.h"
 #include "dfn2_prepost.h"
 
-/* The shipped model: config.ini [signal] [model] [feature]. */
+/* The shipped model: config.ini [signal] [model]. The seven [feature] normaliser settings
+ * are fixed constants inside dfn2_grid.h now (DFN2_ERB_NORM_TAU_SEC etc.), not spec fields. */
 static const DFN2GridSpec SHIPPED = {
     .sample_rate = 48000, .n_fft = 1024, .n_erb = 32, .df_bins = 96, .df_order = 5,
     .mask_lookahead = 1, .df_lookahead = 1, .frames_per_call = 1,
-    .erb_norm_tau_sec = 1.0f, .erb_norm_init_lo_db = -60.0f, .erb_norm_init_hi_db = -90.0f,
-    .erb_norm_scale_db = 40.0f, .spec_norm_tau_sec = 1.0f,
-    .spec_norm_init_lo = 0.001f, .spec_norm_init_hi = 0.0001f,
 };
 
 /* State shapes belong to the application: the exported graph's h_gru [1,5,1,256] and
@@ -98,8 +96,8 @@ static int run_dfn2(const char *erb_path, RunModel run_model, const float *in, f
     /* 3. the framing: audiolib, the scales from the grid */
     AcStftConfig sc;
     ac_stft_config_default(&sc, grid.n_fft);
-    sc.spec_scale = grid.stft_scale;
-    sc.ispec_scale = grid.stft_unscale;
+    sc.spec_scale = dfn2_stft_scale(grid.n_fft);
+    sc.ispec_scale = dfn2_stft_unscale(grid.n_fft);
     size_t stft_bytes = ac_stft_get_mem_size(&sc), istft_bytes = ac_istft_get_mem_size(&sc);
     stft_mem = alloc16(stft_bytes);
     istft_mem = alloc16(istft_bytes);
@@ -155,8 +153,8 @@ done:
 }
 ```
 
-The spectra are `torch.stft(normalized=True)` scaled: the `AcStft` / `AcIstft` of step 3 carry `grid.stft_scale` and
-`grid.stft_unscale`, so the application passes audio-scale samples. Build every unit that includes the DFN2 headers with the same
+The spectra are `torch.stft(normalized=True)` scaled: the `AcStft` / `AcIstft` of step 3 carry `dfn2_stft_scale(grid.n_fft)` and
+`dfn2_stft_unscale(grid.n_fft)`, so the application passes audio-scale samples. Build every unit that includes the DFN2 headers with the same
 `-DDFN2_MASK_ONLY` setting as the library; `DFN2_REQUIRE_VARIANT_LINK()` turns a mismatch into a link error. With the shipped 1/1
 pair `valid` is 0 for the first two hops (the output is zeros) and the end-to-end delay is three hops. The example assumes
 `frames_per_call` 1 (the table row above); the other pairs are in

@@ -336,10 +336,6 @@ _GRID_PROBE = r'''
 int main(int argc, char **argv) {
     DFN2GridSpec spec = {
         .df_order = @ORDER@, .frames_per_call = 1,
-        .erb_norm_tau_sec = @ERB_TAU@, .erb_norm_init_lo_db = @ERB_LO@,
-        .erb_norm_init_hi_db = @ERB_HI@, .erb_norm_scale_db = @ERB_SCALE@,
-        .spec_norm_tau_sec = @SPEC_TAU@, .spec_norm_init_lo = @SPEC_LO@,
-        .spec_norm_init_hi = @SPEC_HI@,
     };
     DFN2Grid g;
     int status;
@@ -360,13 +356,7 @@ int main(int argc, char **argv) {
 
 def _grid_probe_source():
     values = dfn_pairs.dfn2_spec_values()
-    text = _GRID_PROBE
-    for token, key in (('ERB_TAU', 'erb_norm_tau_sec'), ('ERB_LO', 'erb_norm_init_lo_db'),
-                       ('ERB_HI', 'erb_norm_init_hi_db'), ('ERB_SCALE', 'erb_norm_scale_db'),
-                       ('SPEC_TAU', 'spec_norm_tau_sec'), ('SPEC_LO', 'spec_norm_init_lo'),
-                       ('SPEC_HI', 'spec_norm_init_hi')):
-        text = text.replace('@%s@' % token, repr(values[key]) + 'f')
-    return text.replace('@ORDER@', str(values['df_order']))
+    return _GRID_PROBE.replace('@ORDER@', str(values['df_order']))
 
 
 @pytest.fixture(scope='module')

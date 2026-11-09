@@ -3,7 +3,8 @@
  * contract: audiolib's sqrt-Hann window, centre 0, hop = n_fft / 2, overlap-add accumulate.
  * The scales are the family's:
  *
- *   DeepFilterNet2 / 3   spec_scale = grid.stft_scale (1/sqrt(n_fft)), ispec_scale = grid.stft_unscale
+ *   DeepFilterNet2       dfn2_stft_scale(n_fft) in (1/sqrt(n_fft)), dfn2_stft_unscale(n_fft) out
+ *   DeepFilterNet3       spec_scale = grid.stft_scale, ispec_scale = grid.stft_unscale (unchanged)
  *   GTCRN                1.0f, 1.0f (unnormalised spectra, interleaved [n_bins][2])
  *
  * One object per stream; the objects live in aligned blocks from aligned_alloc(). */

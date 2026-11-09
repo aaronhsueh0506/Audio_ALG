@@ -881,10 +881,6 @@ int main(int argc, char **argv)
     DFN2GridSpec spec = {
         .sample_rate = 48000, .n_fft = 1024, .n_erb = 32, .df_bins = 96, .df_order = @ORDER@,
         .mask_lookahead = 1, .df_lookahead = 1, .frames_per_call = 1,
-        .erb_norm_tau_sec = @ERB_TAU@, .erb_norm_init_lo_db = @ERB_LO@,
-        .erb_norm_init_hi_db = @ERB_HI@, .erb_norm_scale_db = @ERB_SCALE@,
-        .spec_norm_tau_sec = @SPEC_TAU@, .spec_norm_init_lo = @SPEC_LO@,
-        .spec_norm_init_hi = @SPEC_HI@,
     };
     DFN2Grid grid;
     int written, filled, as_filled, old_frames, made;
@@ -918,13 +914,7 @@ int main(int argc, char **argv)
 
 def _abi_source():
     values = dfn_pairs.dfn2_spec_values()
-    text = _ABI_DRIVER
-    for token, key in (('ERB_TAU', 'erb_norm_tau_sec'), ('ERB_LO', 'erb_norm_init_lo_db'),
-                       ('ERB_HI', 'erb_norm_init_hi_db'), ('ERB_SCALE', 'erb_norm_scale_db'),
-                       ('SPEC_TAU', 'spec_norm_tau_sec'), ('SPEC_LO', 'spec_norm_init_lo'),
-                       ('SPEC_HI', 'spec_norm_init_hi')):
-        text = text.replace('@%s@' % token, repr(values[key]) + 'f')
-    return text.replace('@ORDER@', str(values['df_order']))
+    return _ABI_DRIVER.replace('@ORDER@', str(values['df_order']))
 
 
 @pytest.fixture(scope='module')

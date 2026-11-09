@@ -830,24 +830,10 @@ int main(void) {
         static const DFN2GridSpec table[] = {
             { .sample_rate = 16000, .n_fft = 256, .n_erb = 24, .df_bins = 96,
               .df_order = DFN_TEST_DF_ORDER, .mask_lookahead = 0, .df_lookahead = 0,
-              .frames_per_call = DFN_TEST_FRAMES_PER_CALL,
-              .erb_norm_tau_sec = DFN_TEST_ERB_NORM_TAU_SEC,
-              .erb_norm_init_lo_db = DFN_TEST_ERB_NORM_INIT_LO_DB,
-              .erb_norm_init_hi_db = DFN_TEST_ERB_NORM_INIT_HI_DB,
-              .erb_norm_scale_db = DFN_TEST_ERB_NORM_SCALE_DB,
-              .spec_norm_tau_sec = DFN_TEST_SPEC_NORM_TAU_SEC,
-              .spec_norm_init_lo = DFN_TEST_SPEC_NORM_INIT_LO,
-              .spec_norm_init_hi = DFN_TEST_SPEC_NORM_INIT_HI },
+              .frames_per_call = DFN_TEST_FRAMES_PER_CALL },
             { .sample_rate = 32000, .n_fft = 512, .n_erb = 28, .df_bins = 96,
               .df_order = DFN_TEST_DF_ORDER, .mask_lookahead = 0, .df_lookahead = 0,
-              .frames_per_call = DFN_TEST_FRAMES_PER_CALL,
-              .erb_norm_tau_sec = DFN_TEST_ERB_NORM_TAU_SEC,
-              .erb_norm_init_lo_db = DFN_TEST_ERB_NORM_INIT_LO_DB,
-              .erb_norm_init_hi_db = DFN_TEST_ERB_NORM_INIT_HI_DB,
-              .erb_norm_scale_db = DFN_TEST_ERB_NORM_SCALE_DB,
-              .spec_norm_tau_sec = DFN_TEST_SPEC_NORM_TAU_SEC,
-              .spec_norm_init_lo = DFN_TEST_SPEC_NORM_INIT_LO,
-              .spec_norm_init_hi = DFN_TEST_SPEC_NORM_INIT_HI },
+              .frames_per_call = DFN_TEST_FRAMES_PER_CALL },
         };
         for (i = 0; i < 2; ++i) {
             DFN2Grid g;
