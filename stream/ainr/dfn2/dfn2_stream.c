@@ -42,7 +42,10 @@ struct DFN2Stream {
     float *enh_re;
     float *enh_im;
 
-    int open;   /* 0 closed, 1: pre_process succeeded and post_process is due */
+    int open;    /* 0 closed, 1: a DFN2Prepost frame is open, post_process must finish/bypass it */
+    int pending; /* 0 closed, 1: pre_process succeeded and post_process is due (every hop,
+                  * independent of `open` -- frames_per_call > 1 opens a frame on only one hop in
+                  * every N, but post_process is still due every hop to drain the previous one) */
 };
 
 typedef struct DFN2StreamLayout {
@@ -81,7 +84,6 @@ static const float SIZING_ERB_DUMMY = 0.0f;
 static int cfg_valid(const DFN2StreamConfig *cfg) {
     if (!cfg) return 0;
     if (dfn2_grid_validate(&cfg->grid) != DFN2_GRID_OK) return 0;
-    if (cfg->grid.frames_per_call != 1) return 0;
     if (!isfinite(cfg->atten_lim_db)) return 0;
     /* hpf_init()'s own accepted range (hpf.h): finite, > 0, < 0.45 * sample_rate. Checked here too
      * so get_mem_size() -- which never touches the HPF itself -- rejects the same bad cutoffs init()
@@ -264,6 +266,7 @@ static DFN2Stream *dfn2_stream_finish_init(const DFN2StreamConfig *cfg, unsigned
     s->atten_lim_db = cfg->atten_lim_db;
     s->hpf_enable = cfg->hpf_enable;
     s->open = 0;
+    s->pending = 0;
     s->hpf = NULL;
 
     if (cfg->hpf_enable) {
@@ -350,6 +353,7 @@ void dfn2_stream_reset(DFN2Stream *s) {
     ac_istft_reset(s->istft);
     dfn2_prepost_reset(s->prepost);
     s->open = 0;
+    s->pending = 0;
 }
 
 unsigned int dfn2_stream_state_generation(const DFN2Stream *s) {
@@ -369,9 +373,9 @@ int dfn2_stream_layout_version(const DFN2Stream *s) {
 }
 
 int dfn2_stream_pre_process(DFN2Stream *s, const int16_t *pcm_in, DFN2HopIO *io) {
-    int hop, i;
+    int hop, i, rc;
 
-    if (!s || !pcm_in || !io || s->open) return -1;
+    if (!s || !pcm_in || !io || s->pending) return -1;
     hop = s->grid.hop;
 
     for (i = 0; i < hop; ++i) s->hop_in[i] = (float)pcm_in[i] / 32768.0f;
@@ -379,28 +383,36 @@ int dfn2_stream_pre_process(DFN2Stream *s, const int16_t *pcm_in, DFN2HopIO *io)
 
     ac_stft_push_planar(s->stft, s->hop_in, s->spec_re, s->spec_im);
 
-    /* N == 1 (enforced at init): pre_process_freq() returns 1 on every hop, warm-up included; any
-     * other return here is a contract error this stream does not expect in correct use. */
-    if (dfn2_prepost_pre_process_freq(s->prepost, s->spec_re, s->spec_im) != 1) return -1;
-    if (dfn2_prepost_frame_open(s->prepost, &io->inputs, &io->outputs) != 0) return -1;
-
+    /* frames_per_call == 1: rc is 1 on every hop, warm-up included, same as before. N > 1: rc is
+     * 1 only once every N hops (a job for the accelerator), 0 the other N-1 (push only, nothing
+     * to run) -- io->job_ready carries that to the caller; -1 is still a genuine contract error. */
+    rc = dfn2_prepost_pre_process_freq(s->prepost, s->spec_re, s->spec_im);
+    if (rc < 0) return -1;
     io->state_generation = dfn2_prepost_state_generation(s->prepost);
-    s->open = 1;
+    io->job_ready = rc;
+    if (rc == 1) {
+        if (dfn2_prepost_frame_open(s->prepost, &io->inputs, &io->outputs) != 0) return -1;
+        s->open = 1;
+    }
+    s->pending = 1;
     return 1;
 }
 
 int dfn2_stream_post_process(DFN2Stream *s, int ai_rc, int16_t *pcm_out) {
     int hop, i, valid, prc, rc;
 
-    if (!s || !pcm_out || !s->open) return -1;
+    if (!s || !pcm_out || !s->pending) return -1;
     hop = s->grid.hop;
+    s->pending = 0;
 
-    /* A finish that itself fails (non-finite head or state, despite ai_rc == 0) still needs a
-     * bypass to actually close the frame -- frame_finish() leaves it open on failure, and a
-     * frame left open here would desync this stream's `open` bookkeeping from DFN2Prepost's. */
-    rc = (ai_rc == 0) ? dfn2_prepost_frame_finish(s->prepost) : -1;
-    if (rc != 0) dfn2_prepost_frame_bypass(s->prepost);
-    s->open = 0;
+    if (s->open) {
+        /* A finish that itself fails (non-finite head or state, despite ai_rc == 0) still needs a
+         * bypass to actually close the frame -- frame_finish() leaves it open on failure, and a
+         * frame left open here would desync this stream's `open` bookkeeping from DFN2Prepost's. */
+        rc = (ai_rc == 0) ? dfn2_prepost_frame_finish(s->prepost) : -1;
+        if (rc != 0) dfn2_prepost_frame_bypass(s->prepost);
+        s->open = 0;
+    }
 
     valid = 0;
     prc = dfn2_prepost_post_process_freq(s->prepost, s->enh_re, s->enh_im, &valid);

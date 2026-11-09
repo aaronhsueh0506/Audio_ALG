@@ -296,12 +296,13 @@ stateless heads graph 每次由 host 傳入 3 幀 feature window 與兩個顯式
 <tr><td><code>DFN2_MODEL_IO_LAYOUT_VERSION</code></td><td>8（mask-only 為 9）</td><td><code>dfn2_model_io.h</code></td><td>graph 邊界版號；與 <code>export_onnx.py</code> 互鎖，4–7 已退役不可重用</td></tr>
 <tr><td><code>DFN2_MODEL_INPUT_FRAMES</code></td><td>3</td><td><code>dfn2_grid.h</code></td><td>graph 輸入卷積的時間核；<code>input_frames</code> = N + 2 由它推導</td></tr>
 <tr><td>graph 的 state 形狀（<code>h_gru</code> <code>(1,5,1,256)</code>、<code>df_convp_history</code> <code>(1,64,5,96)</code>）</td><td>5 列 GRU、hidden 256、64 channel、5 幀 window</td><td>應用端或 sample 的常數；函式庫不含</td><td>與 checkpoint／graph 綁定；函式庫只收 pointer 與元素數，descriptor 的六個內部欄位不讀；板端 sample 比對載入模型回報的元素數</td></tr>
-<tr><td><code>DFN2_PREPOST_CARVE_VERSION</code>／<code>_DESCRIPTOR_VERSION</code>／<code>_ALIGNMENT</code></td><td>11／1／16</td><td><code>dfn2_prepost.h</code></td><td>pool 切分順序與 32-byte descriptor 的版本；進 <code>build_flags_hash</code>，由 <code>init_ex</code> 把關</td></tr>
+<tr><td><code>DFN2_PREPOST_CARVE_VERSION</code>／<code>_DESCRIPTOR_VERSION</code>／<code>_ALIGNMENT</code></td><td>12／1／16</td><td><code>dfn2_prepost.h</code></td><td>pool 切分順序與 32-byte descriptor 的版本；進 <code>build_flags_hash</code>，由 <code>init_ex</code> 把關</td></tr>
 <tr><td>cascade 合成（全頻 mask → 低頻 5-tap FIR → alpha 混合）</td><td>固定算式</td><td><code>dfn2_process.c</code></td><td>parameter-free 地重現 <code>model.py compose()</code>；改動等於換模型</td></tr>
 <tr><td>訓練端 <code>config.ini</code> 的 <code>[signal]</code>／<code>[model]</code>／<code>[feature]</code></td><td>見 <code>DeepFilterNet2/config.ini</code></td><td>Python</td><td>寫進 checkpoint contract，<code>inference.py</code>／<code>train.py --resume</code> 逐項比對，不一致即拒絕載入</td></tr>
 </table></div>
 
 <h2 id="pcm">PCM SDK 時序與狀態</h2>
+<p>以下流程圖、泳道圖與下面兩表都是 <code>frames_per_call</code> N=1 的情形（加速器每拍都跑）。N&gt;1 時 <code>pre_process</code>／<code>post_process</code> 仍是每拍各呼叫一次，但只有 <code>io.job_ready</code> 為真的那一拍才會真的開 frame、需要呼叫加速器；<code>post_process</code> 不論該拍有無 job 都要呼叫，從上一批算好的 N 個 frame 逐拍吐 PCM。細節與公式見 <a href="../index.html">DeepFilterNet2</a> 頁與 <a href="../../../../../AINR/DeepFilterNet2/reference/multiframe.md">Multi-frame export</a>。</p>
 <h3>流程圖（block diagram）</h3>
 <pre>
 PCM in (int16)
@@ -411,7 +412,7 @@ power 全有限時正向和依 <code>erb_fwd_k0/k1</code> 逐 band 算(相鄰四
 <li><b>框化是應用端的</b>:窗、FFT 與 STFT 物件都不在函式庫內,窗與尺度的契約寫在 <code>dfn2_process.h</code> 檔頭(見 <a href="core.html">DeepFilterNet2 頻域與模型契約</a>);ERB 矩陣是借用的,從不建立或銷毀。</li>
 <li>32-byte <code>DFN2PrepostMemReq</code> 七欄:<code>descriptor_version</code>(=1)、<code>layout_version</code>
 (<code>DFN2_MODEL_IO_LAYOUT_VERSION</code>)、<code>reserved0</code>(必須為 0,<code>_init_ex</code> 拒絕其他值)、<code>build_flags_hash</code>
-(FNV-1a-32 蓋整個 grid(含 <code>df_order</code>、兩個 lookahead、<code>frames_per_call</code>、<code>input_frames</code>、兩個時間常數與 alpha、兩個 scale、四個正規化起點與 <code>erb_norm_scale_db</code>)、variant、layout 與 carve 版號、feature version)、<code>alignment</code>(16)、<code>reserved</code>、<code>bytes</code>。</li>
+(FNV-1a-32 蓋整個 grid(含 <code>df_order</code>、兩個 lookahead、<code>frames_per_call</code>、<code>input_frames</code>)、variant、model_io layout 與 carve 版號、feature version,加上兩個正規化 alpha(<code>erb_norm_alpha</code>、<code>spec_norm_alpha</code>,由取樣率與 hop 推算)與兩個 STFT scale(<code>dfn2_stft_scale()</code>／<code>dfn2_stft_unscale()</code>,由 <code>n_fft</code> 推算;固定的 tau／初始值／scale 常數在 <code>dfn2_grid.h</code>,不是 grid 欄位,不折入 hash))、<code>alignment</code>(16)、<code>reserved</code>、<code>bytes</code>。</li>
 </ul>
 
 <h3>Setter 的保證邊界</h3>

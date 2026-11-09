@@ -54,7 +54,13 @@ static void check_saturate_s16_nonfinite(void) {
     }
 }
 
-int main(void) {
+/* Runs the full init/hop-loop/reset cycle for one frames_per_call N. Every hop calls
+ * pre_process, calls the fake accelerator only when io.job_ready (as the header's usage example
+ * does), then always calls post_process -- the one loop shape serves N == 1 and N > 1 alike.
+ * Cross-checks io.job_ready against the documented cadence (ready once mask_lookahead + N hops
+ * have been pushed, then every N hops): a job on the wrong hop, or the wrong number of jobs
+ * total, fails the test instead of just not crashing. */
+static int run_smoke(int frames_per_call) {
     DFN2GridSpec spec;
     DFN2Grid grid;
     DFN2StreamConfig cfg;
@@ -63,9 +69,7 @@ int main(void) {
     void *pool;
     float *erb_fwd, *erb_inv;
     int16_t *pcm_in, *pcm_out;
-    int hop, hops, i, k;
-
-    check_saturate_s16_nonfinite();
+    int hop, hops, i, k, jobs_run, jobs_expected;
 
     memset(&spec, 0, sizeof(spec));
     spec.sample_rate = 48000;
@@ -80,10 +84,10 @@ int main(void) {
     spec.df_order = 5;
     spec.df_lookahead = 1;
 #endif
-    spec.frames_per_call = 1;
+    spec.frames_per_call = frames_per_call;
 
     if (dfn2_grid_make(&grid, &spec) != DFN2_GRID_OK) {
-        fprintf(stderr, "dfn2_grid_make failed\n");
+        fprintf(stderr, "dfn2_grid_make failed (N=%d)\n", frames_per_call);
         return 1;
     }
 
@@ -98,64 +102,98 @@ int main(void) {
     cfg.erb_inv = erb_inv;
 
     if (dfn2_stream_get_mem_size(&cfg, &req) != 0) {
-        fprintf(stderr, "dfn2_stream_get_mem_size failed\n");
+        fprintf(stderr, "dfn2_stream_get_mem_size failed (N=%d)\n", frames_per_call);
         return 1;
     }
 
     pool = NULL;
     if (posix_memalign(&pool, (size_t)req.alignment, (size_t)req.bytes) != 0 || !pool) {
-        fprintf(stderr, "pool allocation failed (%llu bytes)\n", (unsigned long long)req.bytes);
+        fprintf(stderr, "pool allocation failed (%llu bytes, N=%d)\n",
+               (unsigned long long)req.bytes, frames_per_call);
         return 1;
     }
 
     s = dfn2_stream_init_ex(&cfg, pool, (size_t)req.bytes, &req);
     if (!s) {
-        fprintf(stderr, "dfn2_stream_init_ex failed\n");
+        fprintf(stderr, "dfn2_stream_init_ex failed (N=%d)\n", frames_per_call);
         return 1;
     }
 
     hop = dfn2_stream_hop_size(s);
     if (hop <= 0) {
-        fprintf(stderr, "dfn2_stream_hop_size returned %d\n", hop);
+        fprintf(stderr, "dfn2_stream_hop_size returned %d (N=%d)\n", hop, frames_per_call);
         return 1;
     }
     pcm_in = (int16_t *)calloc((size_t)hop, sizeof(int16_t));
     pcm_out = (int16_t *)calloc((size_t)hop, sizeof(int16_t));
     if (!pcm_in || !pcm_out) {
-        fprintf(stderr, "pcm buffer allocation failed\n");
+        fprintf(stderr, "pcm buffer allocation failed (N=%d)\n", frames_per_call);
         return 1;
     }
 
-    hops = grid.mask_lookahead + grid.df_lookahead + 8;
+    hops = grid.mask_lookahead + grid.df_lookahead + 3 * frames_per_call + 8;
+    jobs_run = 0;
     for (i = 0; i < hops; ++i) {
         DFN2HopIO io;
-        int pre_rc, post_rc, ai_rc;
+        int pre_rc, post_rc, ai_rc, ready_expected;
 
         for (k = 0; k < hop; ++k) pcm_in[k] = (int16_t)((k * 7 + i * 3) % 101 - 50);
 
         pre_rc = dfn2_stream_pre_process(s, pcm_in, &io);
         if (pre_rc != 1) {
-            fprintf(stderr, "pre_process rc=%d at hop %d (expected 1)\n", pre_rc, i);
+            fprintf(stderr, "pre_process rc=%d at hop %d (expected 1, N=%d)\n",
+                   pre_rc, i, frames_per_call);
             return 1;
         }
 
-        ai_rc = fake_accelerator(&io.inputs, &io.outputs);
+        /* Same cadence as dfn2_prepost_pre_process_freq()/AINR/DeepFilterNet2/reference/
+         * multiframe.md: N == 1 keeps the old per-hop warm-up flow (ready every hop); N > 1 has
+         * no warm-up at all -- ready once mask_lookahead + N hops have been pushed, then every N. */
+        ready_expected = frames_per_call == 1 ? 1 :
+                        (i + 1 >= grid.mask_lookahead + frames_per_call) &&
+                        (i + 1 - grid.mask_lookahead) % frames_per_call == 0;
+        if (io.job_ready != ready_expected) {
+            fprintf(stderr, "job_ready=%d at hop %d, expected %d (N=%d)\n",
+                   io.job_ready, i, ready_expected, frames_per_call);
+            return 1;
+        }
+
+        ai_rc = 0;
+        if (io.job_ready) {
+            ai_rc = fake_accelerator(&io.inputs, &io.outputs);
+            ++jobs_run;
+        }
 
         post_rc = dfn2_stream_post_process(s, ai_rc, pcm_out);
         if (post_rc != 0 && post_rc != 1) {
-            fprintf(stderr, "post_process rc=%d at hop %d (expected 0 or 1)\n", post_rc, i);
+            fprintf(stderr, "post_process rc=%d at hop %d (expected 0 or 1, N=%d)\n",
+                   post_rc, i, frames_per_call);
             return 1;
         }
     }
 
+    jobs_expected = frames_per_call == 1 ? hops : (hops - grid.mask_lookahead) / frames_per_call;
+    if (jobs_run != jobs_expected) {
+        fprintf(stderr, "ran %d accelerator jobs over %d hops, expected %d (N=%d)\n",
+               jobs_run, hops, jobs_expected, frames_per_call);
+        return 1;
+    }
+
     dfn2_stream_reset(s);
-    printf("smoke_dfn2_stream: %d hops, hop=%d, generation after reset=%u -- PASS\n",
-          hops, hop, dfn2_stream_state_generation(s));
+    printf("smoke_dfn2_stream: N=%d, %d hops, %d accelerator jobs, hop=%d, generation after reset=%u -- PASS\n",
+          frames_per_call, hops, jobs_run, hop, dfn2_stream_state_generation(s));
 
     free(pcm_in);
     free(pcm_out);
     free(erb_fwd);
     free(erb_inv);
     free(pool);
+    return 0;
+}
+
+int main(void) {
+    check_saturate_s16_nonfinite();
+    if (run_smoke(1) != 0) return 1;   /* every hop is a job, as before frames_per_call was accepted */
+    if (run_smoke(4) != 0) return 1;   /* one job every 4 hops */
     return 0;
 }

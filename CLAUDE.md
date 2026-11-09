@@ -87,7 +87,7 @@ a forwarding compat header at the old public-header path for out-of-tree board s
 
 | SDK | Integration contract |
 |---|---|
-| `stream/ainr/dfn2` | One int16 input, optional HPF, `AC_OLA_ACCUMULATE`, N=1. Full and mask-only use variant-specific public symbols. Post reports spectral validity. |
+| `stream/ainr/dfn2` | One int16 input, optional HPF, `AC_OLA_ACCUMULATE`, `frames_per_call` 1..64 (`DFN2HopIO.job_ready` says which hop runs the accelerator). Full and mask-only use variant-specific public symbols. Post reports spectral validity. |
 | `stream/aiaec/deepvqe_s` | Mic and far int16 inputs, `AC_OLA_ENV_NORM`. A rejected job contributes a zero spectrum. The preceding frame can still contribute PCM through overlap-add. |
 | `stream/aiaec/ulcnet` | Feed the linear AEC's float residual and raw far to `ulcnet_stream_pre_process_f32()`. An int16 entry is also available. Reprime after an alignment change, and pass the error spectrum through on bypass. |
 

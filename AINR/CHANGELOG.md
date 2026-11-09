@@ -2,6 +2,42 @@
 
 ## Unreleased
 
+### stream/ainr/dfn2: the PCM stream accepts frames_per_call > 1
+
+- `dfn2_stream_get_mem_size()`/`init`/`init_ex` no longer refuse `grid.frames_per_call != 1`
+  (`cfg_valid()`'s check is gone); any N in [1, 64] now sizes and builds a pool, exactly as
+  `dfn2_grid_make()` already allowed at the grid level. No struct layout changed (the pool
+  already scaled with N through `dfn2_prepost_get_mem_size()`, and `build_flags_hash` already
+  folded `frames_per_call` in), so no version bump.
+- `DFN2HopIO` gains `job_ready`: 1 means `inputs`/`outputs` are open and the accelerator must run
+  this hop (always true when N == 1, matching every prior hop exactly); 0 means N > 1 and this
+  hop has no job -- `inputs`/`outputs` are stale, skip straight to `post_process`. `pre_process`
+  now reads whatever `dfn2_prepost_pre_process_freq()` actually returns (0 or 1) instead of
+  treating any non-1 return as a contract error, and only opens a frame on 1.
+- `post_process` now runs every hop regardless of whether that hop had a job (it drains one hop
+  of PCM from whatever the last job computed either way), calling `frame_finish`/`frame_bypass`
+  only when a frame is actually open. `DFN2Stream` splits what used to be one `open` flag into
+  `open` (a `DFN2Prepost` frame needs finishing) and `pending` (a `pre_process` without its
+  matching `post_process` is outstanding) -- for N == 1 the two always flip together, so this is
+  not a behavior change for existing N == 1 callers beyond adding the always-true `job_ready`
+  check at their call site.
+- One function body each (`pre_process`/`post_process`), no `#ifdef`, no separate N-aware file:
+  the N == 1 case is a strict special case of the general N-hop cadence, not a different code
+  path. `frames_per_call` is a run-time `DFN2Grid` field everywhere else in this codebase (unlike
+  `DFN2_MASK_ONLY`, a real build-time variant); gating it with a stream-level build macro would
+  have been the one inconsistent case.
+- `tests/smoke_dfn2_stream.c` now runs the full init/hop-loop/reset cycle twice per build
+  (N=1, N=4), cross-checking `io.job_ready` against the documented cadence
+  (`AINR/DeepFilterNet2/reference/multiframe.md`) and the total accelerator-job count, not just
+  that it doesn't crash.
+- Docs: `docs/html/models/dfn2/index.html` and `reference/core.html` updated (the per-hop
+  walkthrough there is still the N=1 case specifically; it links out to the N>1 contract instead
+  of being redrawn for it). Two unrelated stale version numbers found while touching these pages
+  (`DFN2_PREPOST_CARVE_VERSION` still read 11 in two places `pipelines/tests/test_doc_layout_versions.py`
+  doesn't scan) fixed to 12 in passing.
+- Verified: `make -C stream/ainr/dfn2 test` (default, `SIMD=0`, `MASK_ONLY=1`, `NO_STDIO=1`) and
+  `audit-no-stdio` all exit 0; `pipelines/tests/test_doc_layout_versions.py` passes.
+
 ### DFN2Grid / DFN2GridSpec: the feature normaliser and the FFT scale become fixed, not run-time
 
 - `DFN2GridSpec` and `DFN2Grid` lose the seven `config.ini [feature]` normaliser fields
