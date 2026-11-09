@@ -3,7 +3,7 @@
 # Single source of truth for where this repo's three external producers -- AEC, NR and audiolib --
 # are read from, and at which commit each is pinned (lib/aec.pin, lib/nr.pin, lib/audiolib.pin).
 # Included by every Makefile that needs AEC_DIR / NR_DIR / AUDIOLIB_DIR / COMMON_DIR
-# (pipelines/Makefile, pipelines/4ch_aec_bf_nr_res/Makefile, AINR/Makefile,
+# (pipelines/Makefile, pipelines/4ch/Makefile, AINR/Makefile,
 # AINR/RNNoise-ERB/Makefile, AIAEC/Makefile, stream/ainr/dfn2/Makefile,
 # stream/aiaec/deepvqe_s/Makefile, stream/aiaec/ulcnet/Makefile) instead of each hardcoding its
 # own relative path.
@@ -51,7 +51,7 @@ AUDIOLIB_DIR  ?= $(abspath $(AUDIO_ALG_ROOT)/../audiolib)
 
 AEC_DIR     ?= $(AEC_REPO_DIR)/c_impl
 NR_DIR      ?= $(NR_REPO_DIR)/c_impl
-# Not $(AUDIOLIB_DIR)/common: some callers (pipelines/4ch_aec_bf_nr_res/Makefile's SP-S21/SP-S23
+# Not $(AUDIOLIB_DIR)/common: some callers (pipelines/4ch/Makefile's SP-S21/SP-S23
 # isolation tests) override AUDIOLIB_DIR alone to simulate the spatial (doa/bf) libs being
 # unavailable while the common FFT archive must still resolve -- deriving one from the other would
 # make that override silently take COMMON_DIR down with it.
