@@ -64,6 +64,12 @@ COMMON_DIR  ?= $(abspath $(AUDIO_ALG_ROOT)/../audiolib/common)
 # time it's actually used (definition order relative to this `include` doesn't matter). AR/RANLIB
 # matter for a cross build: without them the producer's own Makefile falls back to its own AR/
 # RANLIB default (the host archiver), which a cross toolchain's .a output cannot link against.
+# Defaulted here, not just in each includer: an includer that forwards AR/RANLIB without also
+# defaulting them forwards an empty override that breaks the producer's own `ar`/`ranlib` calls --
+# confirmed to have broken AINR/AIAEC/stream/* builds this way until every leaf Makefile was
+# audited; defaulting once here closes the gap for any future includer too.
+AR      ?= ar
+RANLIB  ?= ranlib
 TOOLCHAIN_FWD = CC='$(CC)' CXX='$(CXX)' AR='$(AR)' RANLIB='$(RANLIB)' EXTRA_CFLAGS='$(EXTRA_CFLAGS)' WERROR=$(WERROR)
 
 # Shared by every includer that needs the audiolib common archive's path: resolves COMMON_LIB via
