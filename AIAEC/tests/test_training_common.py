@@ -1121,12 +1121,21 @@ class _StopAfterSetup(Exception):
     """Sentinel: main() reached its first epoch, so setup completed."""
 
 
+def _linear_for_training_config(config_path):
+    """A fake corpus must match the real trainer grid it is standing in for."""
+    cfg = configparser.ConfigParser()
+    assert cfg.read(config_path), config_path
+    grid, _ = read_grids(cfg)
+    return make_linear_aec_contract(grid.sr, frame_size=grid.n_fft)
+
+
 @pytest.mark.parametrize('model_name', sorted(MODEL_TASKS))
 def test_main_builds_its_paper_optimizer_before_the_first_epoch(
         model_name, monkeypatch, tmp_path):
     """Execute setup using each shipped config; stub only the epoch body."""
     trainer = importlib.import_module(f'AIAEC.{model_name}.train')
-    linear = make_linear_aec_contract(16000, frame_size=512)
+    config = pathlib.Path(training_common.__file__).parent / model_name / 'config.ini'
+    linear = _linear_for_training_config(config)
 
     class FakePackedDataset:
         def __init__(self, path, expected_sr=None, mmap=False):
@@ -1152,7 +1161,6 @@ def test_main_builds_its_paper_optimizer_before_the_first_epoch(
     monkeypatch.setattr(trainer, 'run_epoch', fake_run_epoch)
     monkeypatch.chdir(tmp_path)
 
-    config = pathlib.Path(training_common.__file__).parent / model_name / 'config.ini'
     args = trainer.build_parser().parse_args(
         ['--config', str(config), '--packed-dir', 'fake', '--device', 'cpu']
     )
@@ -1172,7 +1180,7 @@ def _drive_main_capturing(model_name, monkeypatch, tmp_path, config_path,
                           capture, scheduler_box=None):
     """Run a trainer's real ``main`` far enough to build its objects."""
     trainer = importlib.import_module(f'AIAEC.{model_name}.train')
-    linear = make_linear_aec_contract(16000, frame_size=512)
+    linear = _linear_for_training_config(config_path)
 
     class FakePackedDataset:
         def __init__(self, path, expected_sr=None, mmap=False):

@@ -229,6 +229,18 @@ def read_grids(cfg, section: str = 'signal') -> Tuple[AecGrid, 'SignalGrid']:
     return aec_grid, model_grid
 
 
+def _require_linear_aec_grid(linear: LinearAecContract, grid, context: str) -> None:
+    """A supported frontend grid must also be the model's selected grid."""
+    sr = getattr(grid, 'sr', getattr(grid, 'sample_rate', None))
+    expected = (int(sr), int(grid.n_fft), int(grid.hop_len))
+    actual = (linear.sample_rate, linear.frame_size, linear.hop_size)
+    if actual != expected:
+        raise ValueError(
+            f"{context} model/PBFDKF grid mismatch: "
+            f"model sr/frame/hop={expected}, linear_aec={actual}"
+        )
+
+
 # ============================================================
 # Train/val split at load time (paired with --split all / build_unified_manifest)
 # ============================================================
@@ -279,6 +291,9 @@ def build_plain_loaders(cfg, aec_grid, seed: int = 42,
         raise ValueError("--packed-dir or [data] packed_dir required")
     dataset = PackedAecDataset(
         resolved_packed_dir, expected_sr=aec_grid.sr, mmap=mmap
+    )
+    _require_linear_aec_grid(
+        dataset.linear_aec_contract, aec_grid, 'training dataset'
     )
     val_fraction = cfg.getfloat(section, 'val_fraction', fallback=0.1)
     train_indices, val_indices = split_dataset_by_sample(
@@ -551,14 +566,7 @@ def require_checkpoint_linear_aec(contract: Dict, grid) -> Dict:
         raise ValueError(
             "checkpoint linear_aec_contract_hash does not match linear_aec"
         )
-    sr = getattr(grid, 'sr', getattr(grid, 'sample_rate', None))
-    expected = (int(sr), int(grid.n_fft), int(grid.hop_len))
-    actual = (linear.sample_rate, linear.frame_size, linear.hop_size)
-    if actual != expected:
-        raise ValueError(
-            "checkpoint model/PBFDKF grid mismatch: "
-            f"model sr/frame/hop={expected}, linear_aec={actual}"
-        )
+    _require_linear_aec_grid(linear, grid, 'checkpoint')
     return linear.as_dict()
 
 

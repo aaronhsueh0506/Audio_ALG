@@ -73,12 +73,19 @@ RETIRED_CONTRACT_VERSIONS: Dict[str, str] = {
         "formed seam could carry the capture instead of the selected residual",
 }
 
-# The linear-AEC frontend is a frozen, versioned contract: its (frame_size,
-# hop_size) per sample rate is a pinned choice of this dataset, not meant to
-# track lib/aec's own production preset default. Every caller that resolves a
-# frame_size (the contract validator, the config-driven path and the factories'
-# fallback) reads this one map.
+# Keep the historical defaults for callers that omit frame_size. These are
+# dataset choices, independent of lib/aec's production preset defaults; changing
+# the set of supported grids must not silently change an existing caller's grid.
 FROZEN_FRAME_HOP_BY_SR = {16000: (512, 256), 48000: (1024, 512)}
+
+# A corpus/checkpoint freezes ONE of these grids in its existing frame_size and
+# hop_size fields. Accept both 16-kHz grids without reinterpreting old metadata
+# or allowing different grids to compare equal. The signal seam and contract
+# serialization are unchanged, so historical fingerprints remain valid.
+SUPPORTED_FRAME_HOP_BY_SR: Dict[int, Tuple[Tuple[int, int], ...]] = {
+    16000: ((512, 256), (256, 128)),
+    48000: ((1024, 512),),
+}
 
 # Matched-filter bank size every AIAEC corpus is, and stays, materialized
 # with. It is NOT part of the contract dict: the contract records the SIGNAL
@@ -206,7 +213,7 @@ class LinearAecContract:
     behavior_hash_schema: str = BEHAVIOR_HASH_SCHEMA
 
     def __post_init__(self) -> None:
-        supported = FROZEN_FRAME_HOP_BY_SR
+        supported = SUPPORTED_FRAME_HOP_BY_SR
         if self.engine != "python_pbfdkf":
             raise ValueError(f"unsupported linear AEC engine {self.engine!r}")
         if self.preset != "balanced":
@@ -218,11 +225,13 @@ class LinearAecContract:
                 "linear AEC sample_rate must be 16000 or 48000, got "
                 f"{self.sample_rate}"
             )
-        expected_frame, expected_hop = supported[self.sample_rate]
-        if (self.frame_size, self.hop_size) != (expected_frame, expected_hop):
+        if (self.frame_size, self.hop_size) not in supported[self.sample_rate]:
+            choices = ", ".join(
+                f"{frame}/{hop}" for frame, hop in supported[self.sample_rate]
+            )
             raise ValueError(
                 f"linear AEC contract for sr={self.sample_rate} requires "
-                f"frame/hop={expected_frame}/{expected_hop}, got "
+                f"frame/hop in {{{choices}}}, got "
                 f"{self.frame_size}/{self.hop_size}"
             )
         expected_flags = {
@@ -432,16 +441,18 @@ def linear_aec_contract_from_config(
         "linear_aec", "frame_size",
         fallback=n_fft,
     )
-    supported = FROZEN_FRAME_HOP_BY_SR
+    supported = SUPPORTED_FRAME_HOP_BY_SR
     if sample_rate not in supported:
         raise ValueError(
             f"linear AEC dataset supports sr=16000 or 48000, got {sample_rate}"
         )
-    expected_frame, expected_hop = supported[sample_rate]
-    if (frame_size, hop_len) != (expected_frame, expected_hop):
+    if (frame_size, hop_len) not in supported[sample_rate]:
+        choices = ", ".join(
+            f"{frame}/{hop}" for frame, hop in supported[sample_rate]
+        )
         raise ValueError(
             f"linear AEC grid for sr={sample_rate} must be "
-            f"frame/hop={expected_frame}/{expected_hop}, got "
+            f"frame/hop in {{{choices}}}, got "
             f"{frame_size}/{hop_len}"
         )
     if frame_size != n_fft or win_len != n_fft or hop_len != frame_size // 2:
@@ -828,6 +839,8 @@ __all__ = [
     "DATASET_DELAY_NUM_FILTERS",
     "DELAY_NUM_FILTERS_RANGE",
     "LINEAR_AEC_CONTRACT_VERSION",
+    "FROZEN_FRAME_HOP_BY_SR",
+    "SUPPORTED_FRAME_HOP_BY_SR",
     "LinearAecContract",
     "LinearAecProcessor",
     "aec_python_behavior_hash",

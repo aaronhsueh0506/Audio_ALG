@@ -1606,8 +1606,8 @@ def chunk_samples_from_config(cfg: configparser.ConfigParser,
                               hop_size: int) -> int:
     """`[sequence] chunk_sec` in samples, or raise naming what has to change.
 
-    The linear-AEC frontend consumes whole hops and the hop is frozen per
-    sample rate (linear_aec.FROZEN_FRAME_HOP_BY_SR), so ``round(chunk_sec * sr)
+    The linear-AEC frontend consumes whole hops and the selected contract fixes
+    the hop (linear_aec.SUPPORTED_FRAME_HOP_BY_SR), so ``round(chunk_sec * sr)
     % hop == 0`` must hold; a value exact at one rate need not be at another.
     Shared by the renderer and gen_aec_dataset.py's config preflight.
     """
@@ -1629,7 +1629,7 @@ def chunk_samples_from_config(cfg: configparser.ConfigParser,
             f"training chunk geometry must be divisible by the linear AEC "
             f"hop: [sequence] chunk_sec = {chunk_sec:g} at sr={sample_rate} "
             f"is {chunk_samples} samples, which is not a whole number of "
-            f"hop={hop_size} hops. The hop is frozen per sample rate, so "
+            f"hop={hop_size} hops. The hop is fixed by the selected contract, so "
             f"chunk_sec is the side that has to change: it must satisfy "
             f"round(chunk_sec * sr) % hop == 0. Among whole seconds this "
             f"rate admits only multiples of {second_step} s -- "

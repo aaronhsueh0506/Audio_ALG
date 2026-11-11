@@ -39,14 +39,15 @@ and refuses a pool or descriptor made for another grid.
 Three things are true, deliberate, and easy to get wrong. State each of them in
 the handover documentation, and check them off here.
 
-- [ ] **AIAEC is on a different grid from the pipeline, on purpose.** The
-      traditional pipeline defaults to 16 kHz **256/128**; AIAEC's frozen
-      dataset contract is 16 kHz **512/256** (`AIAEC/dataset_gen/config.ini`,
-      `FROZEN_FRAME_HOP_BY_SR` in `linear_aec.py`). These are two independent
-      contracts, not a drift to be reconciled. A dataset must never be
-      regenerated "to match the pipeline default" without a contract-version
-      bump and retraining, and the pipeline default must never be changed to
-      match AIAEC.
+- [ ] **AIAEC chooses its grid independently of the pipeline.** The
+      traditional pipeline defaults to 16 kHz **256/128**; AIAEC retains its
+      historical dataset default **512/256** and also accepts **256/128**
+      (`SUPPORTED_FRAME_HOP_BY_SR` in `linear_aec.py`). Each corpus/checkpoint
+      freezes its actual frame/hop pair. Switching grids requires rebuilding
+      `linear_error`, repacking and training for the new grid, not relabelling
+      old data or changing the pipeline default. The supported-pair addition
+      preserves the old contract version, serialization and fingerprints;
+      existing grid, behaviour and checkpoint compatibility checks remain strict.
 
 - [ ] **Static pools are fully supported but are NOT what `*_create()` gives
       you.** `aec_create()` / `mcab_create()` / the other `*_create()` constructors use

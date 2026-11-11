@@ -516,15 +516,31 @@ any of these is opting out of the comparison** — the same failure that
 
 ### The signal grid
 
-16 kHz first target: `n_fft = 512`, `win_len = 512`, `hop_len = 256`,
+16 kHz default: `n_fft = 512`, `win_len = 512`, `hop_len = 256`,
 `n_freqs = 257`, sqrt-Hann (periodic), 50 % overlap (COLA), 62.5 fps. The
 48 kHz grid is `sr = 48000, n_fft = 1024, win_len = 1024, hop_len = 512` —
 `AecGrid` derives `n_freqs` and `frame_rate`, and rejects a hop that is not
 `win_len/2` or a `win_len` different from `n_fft`.
 
+16 kHz also supports `n_fft = 256`, `win_len = 256`, `hop_len = 128`
+(`n_freqs = 129`, 125 fps). The allowed pairs are listed in
+`linear_aec.py`'s `SUPPORTED_FRAME_HOP_BY_SR`; `FROZEN_FRAME_HOP_BY_SR`
+retains the historical defaults for callers that omit a frame size. Each
+corpus and checkpoint still records exactly one grid, and the packer/trainer
+refuse a different grid. Adding the new pair does not change the contract
+version, serialization or existing fingerprints.
+
+To train on 256/128, use that same `[signal]` in the materialization/packing
+config and the model config. Keep the old corpus in its own directory:
+`rematerialize_linear_aec.py` rewrites its input WAVs in place. The first four
+acoustic stems can be reused, but the last `linear_error` stem must be rebuilt
+for the new frontend, then repacked. A 512/256 checkpoint is not a 256/128
+checkpoint; its frequency dimensions and data contract differ. Do not edit a
+ledger/hash to relabel it, or mix shards from the two grids.
+
 **⚠ `[signal]` is not the whole rate change.** The linear-AEC frontend's
-`(frame, hop)` is frozen per rate in `linear_aec.py`'s
-`FROZEN_FRAME_HOP_BY_SR`, so `[sequence] chunk_sec` must satisfy
+`(frame, hop)` is selected from the supported pairs and frozen in each corpus,
+so `[sequence] chunk_sec` must satisfy
 `round(chunk_sec * sr) % hop == 0` — the shipped `10.0` is exact at 16 kHz and
 not at 48 kHz, where whole seconds must be multiples of 4 (`8.0` is exact on
 both grids and keeps the same 2–3 chunks per sequence). `[codec]

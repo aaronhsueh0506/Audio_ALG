@@ -14,7 +14,7 @@ should not be reported as an upstream checkpoint-equivalent setting.
 
 ## Grid and training
 
-The 16 kHz grid uses FFT/window/hop 512/512/256. The 48 kHz grid uses 1024/1024/512 and needs a checkpoint trained for its frequency dimensions. The checkpoint, ONNX and runtime must agree on attention history `max_delay_frames` (D). The supplied training config uses D=32. The matched-filter count in the upstream AEC is independent of D. [Delay profiles and memory](reference/delay.md)
+The historical 16 kHz dataset default uses FFT/window/hop 512/512/256; materialization, packing, training and Python inference also accept 256/256/128. Keep the two corpora/checkpoints separate and match the model grid to its materialized frontend. The streaming ONNX exporter still limits its deployed profiles to 16 kHz/512 and 48 kHz/1024; admitting the smaller corpus grid does not qualify a new exported C boundary. The 48 kHz grid uses 1024/1024/512 and needs a checkpoint trained for its frequency dimensions. The checkpoint, ONNX and runtime must agree on attention history `max_delay_frames` (D). The matched-filter count in the upstream AEC is independent of D. [Delay profiles and memory](reference/delay.md)
 
 The supplied config uses Adam, peak LR `4e-3`, and STFT-consistent PLCPA with power `0.3` and complex weight `0.7`. It selects the best checkpoint by validation. [Training and dataset](../reference/training.md)
 
