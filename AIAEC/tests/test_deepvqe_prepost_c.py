@@ -140,7 +140,8 @@ static DeepVqeGrid g_grid;
 
 static DeepVqeGrid grid_with_depth(int depth) {
     const DeepVqeGridSpec spec = { .sample_rate = g_grid.sample_rate,
-                                   .n_fft = g_grid.n_fft, .delay_depth = depth };
+                                   .n_fft = g_grid.n_fft, .delay_depth = depth,
+                                   .frames_per_call = 1 };
     DeepVqeGrid made;
     if (deepvqe_grid_make(&made, &spec) != DEEPVQE_GRID_OK) made.n_fft = 0;
     return made;
@@ -710,9 +711,11 @@ static int case_stalepool(void) {
     Inst a, deep, shipped;
     DeepVqePrepostMemReq req_rate, req_fft;
     const DeepVqeGridSpec rate_spec = { .sample_rate = 2 * g_grid.sample_rate,
-                                        .n_fft = g_grid.n_fft, .delay_depth = D };
+                                        .n_fft = g_grid.n_fft, .delay_depth = D,
+                                        .frames_per_call = 1 };
     const DeepVqeGridSpec fft_spec = { .sample_rate = g_grid.sample_rate,
-                                       .n_fft = 2 * g_grid.n_fft, .delay_depth = D };
+                                       .n_fft = 2 * g_grid.n_fft, .delay_depth = D,
+                                       .frames_per_call = 1 };
     Snap snap;
     void *pool;
     int id;
@@ -1913,7 +1916,8 @@ static int audiolib_builds(int n_fft) {
 
 static int case_grid(void) {
     static const int bad_fft[] = { 0, -512, 8, 513, 1000, 16384 };
-    DeepVqeGridSpec spec = { .sample_rate = 16000, .n_fft = 512, .delay_depth = D };
+    DeepVqeGridSpec spec = { .sample_rate = 16000, .n_fft = 512, .delay_depth = D,
+                             .frames_per_call = 1 };
     DeepVqeGrid made;
     size_t i;
 
@@ -1931,21 +1935,32 @@ static int case_grid(void) {
     CHECK(made.delay_depth == DEEPVQE_PREPOST_MAX_D);
 
     CHECK(deepvqe_grid_make(NULL, &spec) == DEEPVQE_GRID_ERR_NULL);
-    MAKE_REFUSED(DEEPVQE_GRID_ERR_SAMPLE_RATE, .sample_rate = 0, .n_fft = 512, .delay_depth = D);
-    MAKE_REFUSED(DEEPVQE_GRID_ERR_SAMPLE_RATE, .sample_rate = -16000, .n_fft = 512, .delay_depth = D);
+    MAKE_REFUSED(DEEPVQE_GRID_ERR_SAMPLE_RATE, .sample_rate = 0, .n_fft = 512, .delay_depth = D,
+                 .frames_per_call = 1);
+    MAKE_REFUSED(DEEPVQE_GRID_ERR_SAMPLE_RATE, .sample_rate = -16000, .n_fft = 512,
+                 .delay_depth = D, .frames_per_call = 1);
     for (i = 0; i < sizeof bad_fft / sizeof bad_fft[0]; ++i) {
         CHECK(!audiolib_builds(bad_fft[i]));
         MAKE_REFUSED(DEEPVQE_GRID_ERR_N_FFT, .sample_rate = 16000, .n_fft = bad_fft[i],
-                     .delay_depth = D);
+                     .delay_depth = D, .frames_per_call = 1);
     }
     MAKE_REFUSED(DEEPVQE_GRID_ERR_DELAY_DEPTH, .sample_rate = 16000, .n_fft = 512,
-                 .delay_depth = DEEPVQE_PREPOST_MIN_D - 1);
+                 .delay_depth = DEEPVQE_PREPOST_MIN_D - 1, .frames_per_call = 1);
     MAKE_REFUSED(DEEPVQE_GRID_ERR_DELAY_DEPTH, .sample_rate = 16000, .n_fft = 512,
-                 .delay_depth = DEEPVQE_PREPOST_MAX_D + 1);
-    MAKE_REFUSED(DEEPVQE_GRID_ERR_DELAY_DEPTH, .sample_rate = 16000, .n_fft = 512, .delay_depth = -1);
-    /* The first failing check wins: sample rate, then n_fft, then the depth. */
-    MAKE_REFUSED(DEEPVQE_GRID_ERR_SAMPLE_RATE, .sample_rate = 0, .n_fft = 0, .delay_depth = 0);
-    MAKE_REFUSED(DEEPVQE_GRID_ERR_N_FFT, .sample_rate = 16000, .n_fft = 0, .delay_depth = 0);
+                 .delay_depth = DEEPVQE_PREPOST_MAX_D + 1, .frames_per_call = 1);
+    MAKE_REFUSED(DEEPVQE_GRID_ERR_DELAY_DEPTH, .sample_rate = 16000, .n_fft = 512,
+                 .delay_depth = -1, .frames_per_call = 1);
+    MAKE_REFUSED(DEEPVQE_GRID_ERR_FRAMES_PER_CALL, .sample_rate = 16000, .n_fft = 512,
+                 .delay_depth = D, .frames_per_call = 0);
+    MAKE_REFUSED(DEEPVQE_GRID_ERR_FRAMES_PER_CALL, .sample_rate = 16000, .n_fft = 512,
+                 .delay_depth = D, .frames_per_call = DEEPVQE_MODEL_MAX_FRAMES_PER_CALL + 1);
+    MAKE_REFUSED(DEEPVQE_GRID_ERR_FRAMES_PER_CALL, .sample_rate = 16000, .n_fft = 512,
+                 .delay_depth = D, .frames_per_call = -1);
+    /* The first failing check wins: sample rate, then n_fft, then the depth, then frames_per_call. */
+    MAKE_REFUSED(DEEPVQE_GRID_ERR_SAMPLE_RATE, .sample_rate = 0, .n_fft = 0, .delay_depth = 0,
+                 .frames_per_call = 1);
+    MAKE_REFUSED(DEEPVQE_GRID_ERR_N_FFT, .sample_rate = 16000, .n_fft = 0, .delay_depth = 0,
+                 .frames_per_call = 1);
     {
         DeepVqeGrid untouched;
         memset(&untouched, 0xa5, sizeof untouched);
@@ -1965,6 +1980,9 @@ static int case_grid(void) {
     VALIDATE_AS(DEEPVQE_GRID_ERR_N_FFT, n_fft, 513);
     VALIDATE_AS(DEEPVQE_GRID_ERR_DELAY_DEPTH, delay_depth, DEEPVQE_PREPOST_MIN_D - 1);
     VALIDATE_AS(DEEPVQE_GRID_ERR_DELAY_DEPTH, delay_depth, DEEPVQE_PREPOST_MAX_D + 1);
+    VALIDATE_AS(DEEPVQE_GRID_ERR_FRAMES_PER_CALL, frames_per_call, 0);
+    VALIDATE_AS(DEEPVQE_GRID_ERR_FRAMES_PER_CALL, frames_per_call,
+                DEEPVQE_MODEL_MAX_FRAMES_PER_CALL + 1);
     VALIDATE_AS(DEEPVQE_GRID_ERR_INCONSISTENT, hop, made.hop + 1);
     VALIDATE_AS(DEEPVQE_GRID_ERR_INCONSISTENT, hop, made.n_fft);
     VALIDATE_AS(DEEPVQE_GRID_ERR_INCONSISTENT, n_bins, made.n_bins + 1);
@@ -1985,7 +2003,7 @@ int main(int argc, char **argv) {
     }
     {
         const DeepVqeGridSpec spec = { .sample_rate = sample_rate, .n_fft = n_fft,
-                                       .delay_depth = D };
+                                       .delay_depth = D, .frames_per_call = 1 };
         CHECK(deepvqe_grid_make(&g_grid, &spec) == DEEPVQE_GRID_OK);
     }
     CHECK(g_grid.n_bins <= BINS_MAX && g_grid.hop <= HOP_MAX);
@@ -2443,13 +2461,14 @@ def test_pool_identity_moved_with_the_full_window_carve(driver):
             r'^#define\s+DEEPVQE_PREPOST_CARVE_VERSION\s+(\d+)u',
             stream.read(), re.MULTILINE).group(1))
     assert (layout, carve) == (4, 8)
-    expected = _fnv1a([16000, 512, layout, carve, 8])
+    expected = _fnv1a([16000, 512, layout, carve, 8, 1])
     ptr_bytes = int(re.search(r'ptr_bytes=(\d+)', out).group(1))
     if ptr_bytes == 4:
         for byte in b'|abi:ilp32':
             expected = ((expected ^ byte) * 16777619) & 0xffffffff
     assert c_hash == expected
-    assert c_hash != _fnv1a([16000, 512, 3, 3, 8])
-    assert c_hash != _fnv1a([16000, 512, layout, carve - 1, 8])
-    assert c_hash != _fnv1a([16000, 512, layout, carve, 32])
-    assert c_hash != _fnv1a([48000, 1024, layout, carve, 8])
+    assert c_hash != _fnv1a([16000, 512, 3, 3, 8, 1])
+    assert c_hash != _fnv1a([16000, 512, layout, carve - 1, 8, 1])
+    assert c_hash != _fnv1a([16000, 512, layout, carve, 32, 1])
+    assert c_hash != _fnv1a([48000, 1024, layout, carve, 8, 1])
+    assert c_hash != _fnv1a([16000, 512, layout, carve, 8, 4])

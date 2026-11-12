@@ -86,7 +86,7 @@ App                 Aec           UlcnetNnStage + adapter          accelerator (
  |   per hop: aec_process_context --> aec_get_res_context / aec_get_linear_context --> delay {changed, solid}
  |            --> ulcnet_nn_stage_begin_time(formed_hop, ref, delay)
  |            --> ulcnet_nn_stage_nn_begin == 1 --> run_accelerator(job) --> ulcnet_nn_stage_nn_end(rc)
- |            --> ulcnet_nn_stage_end(out)                (hop 0 is zeros; fail-open = the error spectrum)
+ |            --> ulcnet_nn_stage_end(out)                (overlap-add: hop 0 is real output; fail-open = the error spectrum)
  |   refused call: aec_reset + ulcnet_nn_stage_reset   (an alignment change resets the model state itself)
  |-- aec_destroy; release the blocks
 ```

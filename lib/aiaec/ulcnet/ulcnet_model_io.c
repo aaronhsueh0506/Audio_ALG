@@ -35,7 +35,9 @@ struct UlcnetModelIoState {
     float *error_cos;
     float *error_sin;
     float *error_ri;
+    float *frame_reset;   /* [frames]; packet boundary only, NULL otherwise */
 
+    int frames;           /* frames one graph call runs: 1, or the packet size */
     size_t spectrum_ri_elements;
     size_t key_history_elements;
     size_t value_history_elements;
@@ -60,9 +62,11 @@ static int mio_carve(unsigned char *base, size_t *cursor, size_t count, size_t e
 
 /* Walk the layout once: base == NULL sizes it, otherwise it also carves into `state`; get_mem_requirements and init
  * share this walk so their order agrees. */
-static int mio_layout(UlcnetModelIoState *state, unsigned char *base, size_t bins,
+static int mio_layout(UlcnetModelIoState *state, unsigned char *base, size_t bins, size_t frames,
                       size_t *total) {
-    const size_t counts[] = { bins, bins, bins, bins, 2u * bins, 2u * bins };
+    const size_t counts[] = { frames * bins, frames * bins, frames * bins, frames * bins,
+                              2u * frames * bins, 2u * frames * bins, frames };
+    const size_t used = frames > 1u ? sizeof counts / sizeof counts[0] : sizeof counts / sizeof counts[0] - 1u;
     float **slots[sizeof counts / sizeof counts[0]] = { NULL };
     size_t cursor = 0;
     size_t i;
@@ -72,9 +76,10 @@ static int mio_layout(UlcnetModelIoState *state, unsigned char *base, size_t bin
         slots[0] = &state->error_mag;  slots[1] = &state->far_mag;
         slots[2] = &state->error_cos;  slots[3] = &state->error_sin;
         slots[4] = &state->error_ri;   slots[5] = &state->output;
+        slots[6] = &state->frame_reset;
     }
     if (mio_carve(base, &cursor, 1u, sizeof(UlcnetModelIoState), &ptr) != 0) return -1;
-    for (i = 0; i < sizeof counts / sizeof counts[0]; ++i) {
+    for (i = 0; i < used; ++i) {
         if (mio_carve(base, &cursor, counts[i], sizeof(float), &ptr) != 0) return -1;
         if (base && slots[i]) *slots[i] = (float *)ptr;
     }
@@ -136,10 +141,35 @@ const char *ulcnet_far_input_mode_name(int mode) {
     }
 }
 
+int ulcnet_model_io_descriptor_default_packet(const UlcnetGrid *grid, int frames_per_call,
+                                              UlcnetModelIoDescriptor *descriptor) {
+    if (frames_per_call < 2 || frames_per_call > ULCNET_MODEL_IO_MAX_FRAMES_PER_CALL ||
+        ulcnet_model_io_descriptor_default(grid, descriptor) != 0) {
+        return -1;
+    }
+    descriptor->layout_version = ULCNET_MODEL_IO_PACKET_LAYOUT_VERSION;
+    descriptor->frames_per_call = frames_per_call;
+    return 0;
+}
+
+int ulcnet_model_io_descriptor_frames(const UlcnetModelIoDescriptor *descriptor) {
+    if (!descriptor) return 0;
+    return descriptor->frames_per_call > 1 ? descriptor->frames_per_call : 1;
+}
+
+/* The layout number and the frame count name one boundary together: 18 with one frame, 19 with a packet. */
+static int boundary_is_consistent(const UlcnetModelIoDescriptor *descriptor) {
+    const int frames = descriptor->frames_per_call;
+    if (frames < 0 || frames > ULCNET_MODEL_IO_MAX_FRAMES_PER_CALL) return 0;
+    if (descriptor->layout_version == ULCNET_MODEL_IO_LAYOUT_VERSION) return frames <= 1;
+    if (descriptor->layout_version == ULCNET_MODEL_IO_PACKET_LAYOUT_VERSION) return frames >= 2;
+    return 0;
+}
+
 int ulcnet_model_io_descriptor_validate(
     const UlcnetGrid *grid, const UlcnetModelIoDescriptor *descriptor) {
     if (!descriptor || ulcnet_grid_validate(grid) != ULCNET_GRID_OK ||
-        descriptor->layout_version != ULCNET_MODEL_IO_LAYOUT_VERSION ||
+        !boundary_is_consistent(descriptor) ||
         descriptor->delay_depth < ULCNET_MODEL_IO_MIN_D ||
         descriptor->delay_depth > ULCNET_MODEL_IO_MAX_D ||
         descriptor->sample_rate != grid->sample_rate ||
@@ -194,7 +224,8 @@ int ulcnet_model_io_get_mem_requirements(
     size_t bytes;
 
     if (!requirements || ulcnet_model_io_descriptor_grid(descriptor, &grid) != 0 ||
-        mio_layout(NULL, NULL, (size_t)descriptor->spectrum_bins, &bytes) != 0) {
+        mio_layout(NULL, NULL, (size_t)descriptor->spectrum_bins,
+                   (size_t)ulcnet_model_io_descriptor_frames(descriptor), &bytes) != 0) {
         return -1;
     }
     requirements->bytes = bytes;
@@ -233,7 +264,8 @@ UlcnetModelIoState *ulcnet_model_io_init(
     memset(pool, 0, requirements.bytes);
     state = (UlcnetModelIoState *)pool;
     state->descriptor = *descriptor;
-    state->spectrum_ri_elements = 2u * (size_t)descriptor->spectrum_bins;
+    state->frames = ulcnet_model_io_descriptor_frames(descriptor);
+    state->spectrum_ri_elements = 2u * (size_t)state->frames * (size_t)descriptor->spectrum_bins;
     if (buffers) {
         state->key_history = buffers->key_history;
         state->value_history = buffers->value_history;
@@ -245,8 +277,8 @@ UlcnetModelIoState *ulcnet_model_io_init(
         state->gru_hidden_elements = buffers->gru_hidden_elements;
     }
 
-    if (mio_layout(state, (unsigned char *)pool,
-                   (size_t)descriptor->spectrum_bins, &total) != 0 ||
+    if (mio_layout(state, (unsigned char *)pool, (size_t)descriptor->spectrum_bins,
+                   (size_t)state->frames, &total) != 0 ||
         total != requirements.bytes) {
         return NULL;
     }
@@ -272,9 +304,29 @@ uint32_t ulcnet_model_io_state_generation(const UlcnetModelIoState *state) {
     return state ? state->state_generation : 0u;
 }
 
+/* The frame-sized windows of the feature planes one front-end call writes: frame 0 for the one-frame boundary. */
+typedef struct FramePlanes {
+    float *error_mag;
+    float *far_mag;
+    float *error_cos;
+    float *error_sin;
+    float *error_ri;
+} FramePlanes;
+
+static FramePlanes frame_planes(const UlcnetModelIoState *state, size_t frame) {
+    const size_t bins = (size_t)state->descriptor.spectrum_bins;
+    FramePlanes planes;
+    planes.error_mag = state->error_mag + frame * bins;
+    planes.far_mag = state->far_mag + frame * bins;
+    planes.error_cos = state->error_cos + frame * bins;
+    planes.error_sin = state->error_sin + frame * bins;
+    planes.error_ri = state->error_ri + 2u * frame * bins;
+    return planes;
+}
+
 /* Front end: signed-power compression, magnitudes and compressed-domain phase direction (cos/sin of atan2); hypotf
  * avoids underflow, a zero vector gives cos 1, sin 0. Python reference: export_onnx.stream_features. */
-ULCNET_TWIN void front_end_scalar(UlcnetModelIoState *state,
+ULCNET_TWIN void front_end_scalar(const UlcnetModelIoState *state, const FramePlanes *out,
                                   const float *error_re, const float *error_im,
                                   const float *far_re, const float *far_im) {
     int bin;
@@ -289,31 +341,32 @@ ULCNET_TWIN void front_end_scalar(UlcnetModelIoState *state,
         float f_im = ulcnet_model_io_signed_pow(
             far_im[bin], ULCNET_MODEL_IO_COMPRESSION_EXP);
         float norm = hypotf(c_re, c_im);
-        state->error_mag[bin] = sqrtf(c_re * c_re + c_im * c_im + 1e-12f);
-        state->far_mag[bin] = sqrtf(f_re * f_re + f_im * f_im + 1e-12f);
-        state->error_cos[bin] = norm > 0.0f ? c_re / norm : 1.0f;
-        state->error_sin[bin] = norm > 0.0f ? c_im / norm : 0.0f;
-        state->error_ri[2 * bin] = c_re;
-        state->error_ri[2 * bin + 1] = c_im;
+        out->error_mag[bin] = sqrtf(c_re * c_re + c_im * c_im + 1e-12f);
+        out->far_mag[bin] = sqrtf(f_re * f_re + f_im * f_im + 1e-12f);
+        out->error_cos[bin] = norm > 0.0f ? c_re / norm : 1.0f;
+        out->error_sin[bin] = norm > 0.0f ? c_im / norm : 0.0f;
+        out->error_ri[2 * bin] = c_re;
+        out->error_ri[2 * bin + 1] = c_im;
     }
 }
 
 #if SK_HAVE_NEON
 /* Two-pass front end: libm calls run per bin into planes the frame owns, then
- * sqrt, divide and direction run four bins at a time. */
-static inline void front_end_tail_one(UlcnetModelIoState *state, int bin) {
-    const float c_re = state->error_ri[2 * bin];
-    const float c_im = state->error_ri[2 * bin + 1];
+ * sqrt, divide and direction run four bins at a time. The far planes are staged in the start of `output`, which
+ * prepare() NaN-fills only after every frame's front end. */
+static inline void front_end_tail_one(const UlcnetModelIoState *state, const FramePlanes *out, int bin) {
+    const float c_re = out->error_ri[2 * bin];
+    const float c_im = out->error_ri[2 * bin + 1];
     const float f_re = state->output[bin];
     const float f_im = state->output[state->descriptor.spectrum_bins + bin];
-    const float norm = state->error_cos[bin];
-    state->error_mag[bin] = sqrtf(c_re * c_re + c_im * c_im + 1e-12f);
-    state->far_mag[bin] = sqrtf(f_re * f_re + f_im * f_im + 1e-12f);
-    state->error_cos[bin] = norm > 0.0f ? c_re / norm : 1.0f;
-    state->error_sin[bin] = norm > 0.0f ? c_im / norm : 0.0f;
+    const float norm = out->error_cos[bin];
+    out->error_mag[bin] = sqrtf(c_re * c_re + c_im * c_im + 1e-12f);
+    out->far_mag[bin] = sqrtf(f_re * f_re + f_im * f_im + 1e-12f);
+    out->error_cos[bin] = norm > 0.0f ? c_re / norm : 1.0f;
+    out->error_sin[bin] = norm > 0.0f ? c_im / norm : 0.0f;
 }
 
-static inline void front_end_neon(UlcnetModelIoState *state,
+static inline void front_end_neon(const UlcnetModelIoState *state, const FramePlanes *out,
                                   const float *error_re, const float *error_im,
                                   const float *far_re, const float *far_im) {
     const int bins = state->descriptor.spectrum_bins;
@@ -333,51 +386,44 @@ static inline void front_end_neon(UlcnetModelIoState *state,
             far_re[bin], ULCNET_MODEL_IO_COMPRESSION_EXP);
         far_plane_im[bin] = ulcnet_model_io_signed_pow(
             far_im[bin], ULCNET_MODEL_IO_COMPRESSION_EXP);
-        state->error_cos[bin] = hypotf(c_re, c_im);
-        state->error_ri[2 * bin] = c_re;
-        state->error_ri[2 * bin + 1] = c_im;
+        out->error_cos[bin] = hypotf(c_re, c_im);
+        out->error_ri[2 * bin] = c_re;
+        out->error_ri[2 * bin + 1] = c_im;
     }
     for (bin = 0; bin + 4 <= bins; bin += 4) {
-        const float32x4x2_t c = vld2q_f32(state->error_ri + 2 * bin);
+        const float32x4x2_t c = vld2q_f32(out->error_ri + 2 * bin);
         const float32x4_t f_re = vld1q_f32(far_plane_re + bin);
         const float32x4_t f_im = vld1q_f32(far_plane_im + bin);
-        const float32x4_t norm = vld1q_f32(state->error_cos + bin);
+        const float32x4_t norm = vld1q_f32(out->error_cos + bin);
         const uint32x4_t positive = vcgtq_f32(norm, zero);
-        vst1q_f32(state->error_mag + bin, vsqrtq_f32(vaddq_f32(
+        vst1q_f32(out->error_mag + bin, vsqrtq_f32(vaddq_f32(
             vaddq_f32(vmulq_f32(c.val[0], c.val[0]),
                       vmulq_f32(c.val[1], c.val[1])), eps)));
-        vst1q_f32(state->far_mag + bin, vsqrtq_f32(vaddq_f32(
+        vst1q_f32(out->far_mag + bin, vsqrtq_f32(vaddq_f32(
             vaddq_f32(vmulq_f32(f_re, f_re), vmulq_f32(f_im, f_im)), eps)));
-        vst1q_f32(state->error_cos + bin,
+        vst1q_f32(out->error_cos + bin,
                   vbslq_f32(positive, vdivq_f32(c.val[0], norm), one));
-        vst1q_f32(state->error_sin + bin,
+        vst1q_f32(out->error_sin + bin,
                   vbslq_f32(positive, vdivq_f32(c.val[1], norm), zero));
     }
-    for (; bin < bins; ++bin) front_end_tail_one(state, bin);
+    for (; bin < bins; ++bin) front_end_tail_one(state, out, bin);
 }
 #endif
 
-static inline void front_end(UlcnetModelIoState *state, const float *error_re,
+static inline void front_end(const UlcnetModelIoState *state, size_t frame, const float *error_re,
                              const float *error_im, const float *far_re,
                              const float *far_im) {
+    const FramePlanes planes = frame_planes(state, frame);
 #if SK_HAVE_NEON
-    front_end_neon(state, error_re, error_im, far_re, far_im);
+    front_end_neon(state, &planes, error_re, error_im, far_re, far_im);
 #else
-    front_end_scalar(state, error_re, error_im, far_re, far_im);
+    front_end_scalar(state, &planes, error_re, error_im, far_re, far_im);
 #endif
 }
 
-int ulcnet_model_io_prepare(UlcnetModelIoState *state,
-                            const float *error_re, const float *error_im,
-                            const float *far_re, const float *far_im,
-                            UlcnetModelIoInputs *inputs,
-                            UlcnetModelIoOutputs *outputs) {
-    if (!state || !error_re || !error_im || !far_re || !far_im || !inputs ||
-        !outputs) {
-        return -1;
-    }
-    front_end(state, error_re, error_im, far_re, far_im);
-
+/* Publish the views of the prepared frame (or packet) and arm the transaction. */
+static void publish_views(UlcnetModelIoState *state, UlcnetModelIoInputs *inputs,
+                          UlcnetModelIoOutputs *outputs) {
     skn_fill_f32(state->output, state->spectrum_ri_elements, NAN);
 
     inputs->error_mag = state->error_mag;
@@ -388,11 +434,13 @@ int ulcnet_model_io_prepare(UlcnetModelIoState *state,
     inputs->value_history = state->value_history;
     inputs->logit_history = state->logit_history;
     inputs->h_gru = state->h_gru;
-    inputs->spectrum_bins_elements = (size_t)state->descriptor.spectrum_bins;
+    inputs->spectrum_bins_elements = (size_t)state->frames * (size_t)state->descriptor.spectrum_bins;
     inputs->key_history_elements = state->key_history_elements;
     inputs->value_history_elements = state->value_history_elements;
     inputs->logit_history_elements = state->logit_history_elements;
     inputs->gru_hidden_elements = state->gru_hidden_elements;
+    inputs->frame_reset = state->frame_reset;
+    inputs->frame_reset_elements = state->frame_reset ? (size_t)state->frames : 0u;
 
     outputs->output = state->output;
     outputs->key_history_out = state->key_history;
@@ -405,6 +453,41 @@ int ulcnet_model_io_prepare(UlcnetModelIoState *state,
     outputs->logit_history_elements = state->logit_history_elements;
     outputs->gru_hidden_elements = state->gru_hidden_elements;
     state->prepared = 1;
+}
+
+int ulcnet_model_io_prepare(UlcnetModelIoState *state,
+                            const float *error_re, const float *error_im,
+                            const float *far_re, const float *far_im,
+                            UlcnetModelIoInputs *inputs,
+                            UlcnetModelIoOutputs *outputs) {
+    if (!state || !error_re || !error_im || !far_re || !far_im || !inputs ||
+        !outputs || state->frames != 1) {
+        return -1;
+    }
+    front_end(state, 0u, error_re, error_im, far_re, far_im);
+    publish_views(state, inputs, outputs);
+    return 0;
+}
+
+int ulcnet_model_io_prepare_packet(UlcnetModelIoState *state,
+                                   const float *error_re, const float *error_im,
+                                   const float *far_re, const float *far_im,
+                                   const int *events,
+                                   UlcnetModelIoInputs *inputs,
+                                   UlcnetModelIoOutputs *outputs) {
+    const size_t bins = state ? (size_t)state->descriptor.spectrum_bins : 0u;
+    size_t frame;
+
+    if (!state || !error_re || !error_im || !far_re || !far_im || !events || !inputs ||
+        !outputs || state->frames < 2) {
+        return -1;
+    }
+    for (frame = 0; frame < (size_t)state->frames; ++frame) {
+        front_end(state, frame, error_re + frame * bins, error_im + frame * bins,
+                  far_re + frame * bins, far_im + frame * bins);
+        state->frame_reset[frame] = events[frame] != 0 ? 1.0f : 0.0f;
+    }
+    publish_views(state, inputs, outputs);
     return 0;
 }
 
@@ -423,17 +506,20 @@ static int frame_is_finite(const UlcnetModelIoState *state) {
 }
 
 /* Back end: compressed error times the planar complex mask, then inverse signed power. Products stay unfused
- * (-ffp-contract=off). Python reference: export_onnx.apply_mask_ri. */
-ULCNET_TWIN void back_end_scalar(const UlcnetModelIoState *state,
+ * (-ffp-contract=off). Python reference: export_onnx.apply_mask_ri. The mask of `frame` is the frame's window in the
+ * real plane and in the imaginary plane of `output` (one frame: the first and second BINS values). */
+ULCNET_TWIN void back_end_scalar(const UlcnetModelIoState *state, size_t frame,
                                  float *enhanced_re, float *enhanced_im) {
     const float inverse_exponent = 1.0f / ULCNET_MODEL_IO_COMPRESSION_EXP;
-    const float *mask_re = state->output;
-    const float *mask_im = state->output + state->descriptor.spectrum_bins;
+    const int bins = state->descriptor.spectrum_bins;
+    const float *mask_re = state->output + frame * (size_t)bins;
+    const float *mask_im = state->output + ((size_t)state->frames + frame) * (size_t)bins;
+    const float *error_ri = state->error_ri + 2u * frame * (size_t)bins;
     int bin;
 
-    for (bin = 0; bin < state->descriptor.spectrum_bins; ++bin) {
-        const float err_re = state->error_ri[2 * bin];
-        const float err_im = state->error_ri[2 * bin + 1];
+    for (bin = 0; bin < bins; ++bin) {
+        const float err_re = error_ri[2 * bin];
+        const float err_im = error_ri[2 * bin + 1];
         enhanced_re[bin] = ulcnet_model_io_signed_pow(
             err_re * mask_re[bin] - err_im * mask_im[bin], inverse_exponent);
         enhanced_im[bin] = ulcnet_model_io_signed_pow(
@@ -443,16 +529,17 @@ ULCNET_TWIN void back_end_scalar(const UlcnetModelIoState *state,
 
 #if SK_HAVE_NEON
 /* Complex products four bins at a time, then the libm pass in place. */
-static inline void back_end_neon(const UlcnetModelIoState *state,
+static inline void back_end_neon(const UlcnetModelIoState *state, size_t frame,
                                  float *enhanced_re, float *enhanced_im) {
     const float inverse_exponent = 1.0f / ULCNET_MODEL_IO_COMPRESSION_EXP;
     const int bins = state->descriptor.spectrum_bins;
-    const float *mask_re = state->output;
-    const float *mask_im = state->output + bins;
+    const float *mask_re = state->output + frame * (size_t)bins;
+    const float *mask_im = state->output + ((size_t)state->frames + frame) * (size_t)bins;
+    const float *error_ri = state->error_ri + 2u * frame * (size_t)bins;
     int bin;
 
     for (bin = 0; bin + 4 <= bins; bin += 4) {
-        const float32x4x2_t err = vld2q_f32(state->error_ri + 2 * bin);
+        const float32x4x2_t err = vld2q_f32(error_ri + 2 * bin);
         const float32x4_t m_re = vld1q_f32(mask_re + bin);
         const float32x4_t m_im = vld1q_f32(mask_im + bin);
         vst1q_f32(enhanced_re + bin,
@@ -463,8 +550,8 @@ static inline void back_end_neon(const UlcnetModelIoState *state,
                             vmulq_f32(err.val[1], m_re)));
     }
     for (; bin < bins; ++bin) {
-        const float err_re = state->error_ri[2 * bin];
-        const float err_im = state->error_ri[2 * bin + 1];
+        const float err_re = error_ri[2 * bin];
+        const float err_im = error_ri[2 * bin + 1];
         enhanced_re[bin] = err_re * mask_re[bin] - err_im * mask_im[bin];
         enhanced_im[bin] = err_re * mask_im[bin] + err_im * mask_re[bin];
     }
@@ -477,29 +564,52 @@ static inline void back_end_neon(const UlcnetModelIoState *state,
 }
 #endif
 
-static inline void back_end(const UlcnetModelIoState *state,
+static inline void back_end(const UlcnetModelIoState *state, size_t frame,
                             float *enhanced_re, float *enhanced_im) {
 #if SK_HAVE_NEON
-    back_end_neon(state, enhanced_re, enhanced_im);
+    back_end_neon(state, frame, enhanced_re, enhanced_im);
 #else
-    back_end_scalar(state, enhanced_re, enhanced_im);
+    back_end_scalar(state, frame, enhanced_re, enhanced_im);
 #endif
+}
+
+/* The finite gate shared by both boundaries. State is updated in place, so a bad frame cannot be rolled back: restart
+ * the recurrent state (the registered buffers; a runtime that holds the state itself sees the generation). */
+static int finish_is_valid(UlcnetModelIoState *state) {
+    if (!frame_is_finite(state)) {
+        clear_recurrent_state(state);
+        state->prepared = 0;
+        return 0;
+    }
+    return 1;
 }
 
 int ulcnet_model_io_enhance_spectrum(UlcnetModelIoState *state,
                                      float *enhanced_re, float *enhanced_im) {
-    if (!state || !state->prepared || !enhanced_re || !enhanced_im) {
+    if (!state || !state->prepared || !enhanced_re || !enhanced_im || state->frames != 1) {
         return -1;
     }
-    /* State is updated in place, so a bad frame cannot be rolled back: restart the recurrent state (the registered
-     * buffers; a runtime that holds the state itself sees the generation). */
-    if (!frame_is_finite(state)) {
-        clear_recurrent_state(state);
-        state->prepared = 0;
-        return -1;
-    }
+    if (!finish_is_valid(state)) return -1;
 
-    back_end(state, enhanced_re, enhanced_im);
+    back_end(state, 0u, enhanced_re, enhanced_im);
+    state->prepared = 0;
+    return 0;
+}
+
+int ulcnet_model_io_enhance_packet(UlcnetModelIoState *state,
+                                   float *enhanced_re, float *enhanced_im) {
+    const size_t bins = state ? (size_t)state->descriptor.spectrum_bins : 0u;
+    size_t frame;
+
+    if (!state || !state->prepared || !enhanced_re || !enhanced_im || state->frames < 2) {
+        return -1;
+    }
+    if (!finish_is_valid(state)) return -1;
+
+    for (frame = 0; frame < (size_t)state->frames; ++frame) {
+        if (state->frame_reset[frame] == 0.0f)
+            back_end(state, frame, enhanced_re + frame * bins, enhanced_im + frame * bins);
+    }
     state->prepared = 0;
     return 0;
 }

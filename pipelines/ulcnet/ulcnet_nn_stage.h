@@ -2,7 +2,7 @@
  * no layout version: copy and adapt). Per hop it takes the linear-error spectrum, the same hop's
  * raw far samples and the AEC's alignment events, runs one UlcnetModel call (ulcnet_process.h)
  * and emits one WOLA hop. The grid is the application's UlcnetGrid: spectra have grid.n_bins
- * bins, hops grid.hop samples. Latency is one hop; hop #0 emits zeros. The error is the AEC's
+ * bins, hops grid.hop samples. Latency is one hop; hop #0 is real output (the first half of the first frame's synthesis, over a zero history). The error is the AEC's
  * analysis seam, never the rendering base of aec_get_output_base(), so the identity, fail-open
  * and reprime frames are the unguarded residual and may exceed the capture.
  *
@@ -91,7 +91,7 @@ int ulcnet_nn_stage_nn_begin(UlcnetNnStage* s, UlcnetNnJob* job);
  * bin is finite. */
 int ulcnet_nn_stage_nn_end(UlcnetNnStage* s, int model_rc);
 
-/* WOLA of the hop into out[grid.hop]; hop #0 is zeros. A frame left open or never fetched is
+/* WOLA of the hop into out[grid.hop]; every hop, hop #0 included, is a full hop of synthesis. A frame left open or never fetched is
  * the identity. A negative return leaves recovery to the caller: reset the AEC unit and the
  * stage together. */
 int ulcnet_nn_stage_end(UlcnetNnStage* s, float* out);

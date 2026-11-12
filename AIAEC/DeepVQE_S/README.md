@@ -24,3 +24,12 @@ Use `--format npz --output calib/deepvqe_s.npz` for a NumPy archive. BIN
 output contains one directory per graph input and one numbered file per
 streaming invocation. The `mic`/`far` tensors it records are the host-compressed
 planar spectra the graph binds (layout version 4).
+
+## Graph port order
+
+The exported graph lists inputs as the signal inputs (`mic`, `far`) followed by the 16 state inputs, and outputs as the head
+(`output`, the CCM taps) followed by the 16 state outputs named `<input>_out`; state `k` is input `2 + k` and output `1 + k`
+with equal shapes (18 inputs, 17 outputs). `stream/aiaec` keeps no port list: `AiaecWork` carries the block's mic/far views and the CCM
+taps, and the 16 state shapes are the board sample's model configuration (`stream/aiaec/ai3_model_io_deepvqes.h`, shared helper `stream/common/ai3_model_io.h`), which binds by position, never by
+name. `AIAEC/tests/test_aiaec_bind_info_pin.py` compares the `AiaecWork` views of real pre calls with a fresh export and asserts this
+name order. Fixed-point state ports need `zero_point` 0 at both ends (the sample's `stream_check_ports()` refuses a graph that does not).

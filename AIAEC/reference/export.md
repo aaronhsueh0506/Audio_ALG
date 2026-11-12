@@ -67,7 +67,7 @@ error signal of one specific front end, the unified AEC's analysis seam
   --primary-is-mic run), or
 - a `linear_error.done.json` corpus ledger next to it (the dataset
   generator's ledger) that records the contract it was written under; a
-  legacy ledger with only a fingerprint does not count, and a ledger that does
+  fingerprint-only ledger does not count, and a ledger that does
   not claim every chunk sequence under the directory (a half re-rendered
   corpus) is refused.
 

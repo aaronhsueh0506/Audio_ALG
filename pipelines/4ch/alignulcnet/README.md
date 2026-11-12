@@ -53,8 +53,10 @@ side, and every hop from hop #0 is exactly one inference.
 
 Total added algorithmic latency is **1 hop** — 256 samples / 16 ms at 16 kHz,
 512 samples / 10.67 ms at 48 kHz — the Align-ULCNet synthesis WOLA and
-nothing else. `ulcnet_nn_stage_end()` emits zeros for hop #0 only; the output of hop p
-(p >= 1) is the beamformed error of input hop p-1.
+nothing else. The synthesis is overlap-add (`AC_OLA_ACCUMULATE`): every hop, hop #0 included,
+is one full hop, this frame's windowed first half plus the previous frame's saved second half.
+Hop #0 is real output (its first half is added to a zero history); in the identity case the output
+of hop p is the beamformed error of input hop p-1.
 
 The beam hop is not reconstructed by WOLA and re-analysed (that would cost one
 IFFT plus one RFFT and one extra hop of latency per hop), so the pipeline has no

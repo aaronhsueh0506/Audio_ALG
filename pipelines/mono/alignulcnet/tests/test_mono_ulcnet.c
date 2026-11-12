@@ -22,6 +22,7 @@
 #include <stdarg.h>
 #include <time.h>
 #include <math.h>
+#include "audio_stft.h"
 
 /* Largest row of the grid table: 48 kHz / fft 1024. */
 enum { HOP_MAX = 512, BINS_MAX = 513 };
@@ -324,7 +325,8 @@ static int reprime_take(int* armed, int frames) {
 /* =========================================================================
  * 1. identity E2E: NULL model, zero-delay echo. Every hop, BEFORE the next
  *    process call, ctx.formed_hop is recorded; out[hop p] must match
- *    formed_history[p-1] within 2e-4 and hop 0 must be exactly zeros.
+ *    formed_history[p-1] within 2e-4. Hop 0 is real output (the first half of the first
+ *    frame's synthesis), which for an identity stage is the zero history: it stays ~0.
  * ========================================================================= */
 static void test_identity_e2e(void) {
     enum { N = 100 };
@@ -350,9 +352,12 @@ static void test_identity_e2e(void) {
         memcpy(formed_hist[h], rctx.formed_hop, HOP_BYTES);
     }
 
-    int hop0_zero = 1;
-    for (int i = 0; i < HOP; i++) if (out_hist[0][i] != 0.0f) hop0_zero = 0;
-    CHECK(hop0_zero, "hop #0 output is exactly all zeros (nothing emitted yet)");
+    double hop0_peak = 0.0;
+    for (int i = 0; i < HOP; i++) if (fabs((double)out_hist[0][i]) > hop0_peak) hop0_peak = fabs((double)out_hist[0][i]);
+    CHECK(hop0_peak <= 2e-4,
+          fmt_msg("identity: hop #0 is the first synthesis half over a zero history, ~0 "
+                  "(peak %.3e); the non-zero first hop is covered by the accumulate-reference "
+                  "tests below", hop0_peak));
 
     double max_err = 0.0, max_sig = 0.0;
     for (int h = 1; h < N; h++) {
@@ -470,11 +475,22 @@ static void test_counting_model(void) {
     int calls_before = st.infer_calls;
     echo_sim_hop(&sim, mic, ref);
     mu_process(p, mic, ref, out);
-    int hop0_zero = 1;
-    for (int i = 0; i < HOP; i++) if (out[i] != 0.0f) hop0_zero = 0;
-    CHECK(st.infer_calls == calls_before + 1 && hop0_zero,
-          "after pipeline reset the next hop is hop #0 again: one inference "
-          "(like every hop), all-zero output (synthesis preamble)");
+    {   /* the hop after a reset is hop #0 of a new pipeline: same output, same inference count */
+        CountingModelState st_fresh = {0, 0};
+        MonoUlcnetConfig cfg_fresh = cfg;
+        float out_fresh[HOP_MAX];
+        cfg_fresh.model.user = &st_fresh;
+        MonoUlcnet* pf = mu_create(&cfg_fresh);
+        int same = 0;
+        if (pf) {
+            mu_process(pf, mic, ref, out_fresh);
+            same = memcmp(out, out_fresh, HOP_BYTES) == 0 && st_fresh.infer_calls == 1;
+            mu_destroy(pf);
+        }
+        CHECK(st.infer_calls == calls_before + 1 && same,
+              "after pipeline reset the next hop is hop #0 again: one inference (like every "
+              "hop), output bit-identical to the first hop of a newly built pipeline");
+    }
 
     mu_destroy(p);
 }
@@ -835,10 +851,10 @@ static void test_fail_open_and_delay_gating(void) {
             n_reprime_hops += reprimed;
         }
 
-        /* equal_expected: hop 0 both zero; hop p>=1 mixes the frames pushed
-         * at hops p-1 and p (one frame per hop from hop #0). */
+        /* equal_expected: hop 0 is the first half of frame 0 alone; hop p>=1 mixes the
+         * frames pushed at hops p-1 and p (one frame per hop from hop #0). */
         int equal_expected;
-        if (h == 0)      equal_expected = 1;
+        if (h == 0)      equal_expected = ident[0];
         else             equal_expected = ident[h - 1] && ident[h];
 
         int bitwise_equal = memcmp(out_a, out_b, HOP_BYTES) == 0;
@@ -1290,9 +1306,12 @@ static void test_model_applies_unlocked(void) {
         mu_process(pr, mic, ref, out_r);
         mu_process(pn, mic, ref, out_n);
         if (h == 0) {
-            int zero = 1;
-            for (int i = 0; i < HOP; i++) if (out_r[i] != 0.0f) zero = 0;
-            CHECK(zero, "hop #0 still emits zeros (timing preamble unchanged)");
+            /* hop #0 is frame 0's first half alone, and the model halves that frame's
+             * spectrum: the synthesis is linear, so the output is exactly half the NULL-model one */
+            int halved = 1;
+            for (int i = 0; i < HOP; i++)
+                if (fabs((double)out_r[i] - 0.5 * (double)out_n[i]) > 1e-9) halved = 0;
+            CHECK(halved, "hop #0: the model is applied from the first frame (output == 0.5 x the NULL-model hop)");
         } else if (memcmp(out_r, out_n, HOP_BYTES) == 0 && applied_from_hop1) {
             applied_from_hop1 = 0;
             first_equal_hop = h;
@@ -1386,7 +1405,7 @@ static void test_nan_guard(void) {
             if (!isfinite(out_a[i])) no_nan = 0;
 
         int equal_expected;
-        if (h == 0)      equal_expected = 1;               /* both all-zero */
+        if (h == 0)      equal_expected = poisoned[0];     /* frame 0's first half alone */
         else             equal_expected = poisoned[h - 1] && poisoned[h];
 
         int bitwise_equal = memcmp(out_a, out_b, HOP_BYTES) == 0;
@@ -1493,7 +1512,7 @@ static void test_partial_write_guard(void) {
             if (!isfinite(out_a[i])) no_nan = 0;
 
         int equal_expected;
-        if (h == 0)      equal_expected = 1;               /* both all-zero */
+        if (h == 0)      equal_expected = partial[0];      /* frame 0's first half alone */
         else             equal_expected = partial[h - 1] && partial[h];
 
         int bitwise_equal = memcmp(out_a, out_b, HOP_BYTES) == 0;
@@ -2244,7 +2263,7 @@ static void test_phased_hop(void) {
  * base_spec must differ from error_spec on those hops (so the check can tell the two apart). The hops
  * on which the identity output is louder than the mic hop are counted and printed, not gated: that is
  * a characteristic of the contract, evaluated with the retrained model. A hop after aec_reset() emits
- * zeros and is not compared.
+ * a previous formed hop to compare against and is not compared.
  * ========================================================================= */
 typedef struct {
     int hops, compared, guard_hops, guard_compared, louder, louder_on_guard;
@@ -2386,6 +2405,331 @@ static void test_guard_hops_feed_analysis_seam(void) {
     for (int i = 0; i < 3; i++) guard_scene_free(&sc[i]);
 }
 
+
+/* =========================================================================
+ * 11. Overlap-add acceptance of the time-domain entry (begin_time with the AEC's float formed_hop
+ *     and the raw far). The stage synthesises with AC_OLA_ACCUMULATE: every hop is the frame's
+ *     first half plus the previous frame's saved second half, nothing is held back, so hop #0 is
+ *     real output. A band-varying real mask model makes that first half non-zero, and every hop
+ *     is compared with an independent chain -- own analysis STFT of the formed hop the AEC
+ *     published, the mask applied where (and only where) the stage really ran the model, and a
+ *     direct-DFT per-sample accumulate written here -- plus the audiolib accumulate chain bit for
+ *     bit. Cases: first hop and steady state, `changed`, `solid false -> true`, full reset.
+ * ========================================================================= */
+static float band_gain(int k) { return 0.25f + 0.75f * (float)(k % 9) / 8.0f; }
+
+typedef struct BandModelState { int infer_calls, reset_calls; } BandModelState;
+
+static int band_infer(void* user, const float* err_re, const float* err_im,
+                      const float* far_re, const float* far_im, float* out_re, float* out_im) {
+    (void)far_re; (void)far_im;
+    ((BandModelState*)user)->infer_calls++;
+    for (int k = 0; k < BINS; k++) { out_re[k] = band_gain(k) * err_re[k]; out_im[k] = band_gain(k) * err_im[k]; }
+    return 0;
+}
+static void band_reset(void* user) { ((BandModelState*)user)->reset_calls++; }
+
+/* Writes finite garbage, then reports failure: the stage must discard it. */
+static int band_fail_infer(void* user, const float* err_re, const float* err_im,
+                           const float* far_re, const float* far_im, float* out_re, float* out_im) {
+    (void)far_re; (void)far_im;
+    ((BandModelState*)user)->infer_calls++;
+    for (int k = 0; k < BINS; k++) { out_re[k] = 3.0f * err_re[k]; out_im[k] = -2.0f * err_im[k]; }
+    return -1;
+}
+
+typedef struct AccRef {
+    double saved[HOP_MAX];
+    double win[2 * HOP_MAX], cs[2 * HOP_MAX], sn[2 * HOP_MAX];
+    AcStft* stft;
+    AcIstft* istft;
+    void *m1, *m2;
+} AccRef;
+
+static int accref_init(AccRef* a) {
+    const double pi = 3.14159265358979323846;
+    const int N = g_grid.n_fft;
+    AcStftConfig sc;
+    size_t b1, b2;
+    memset(a, 0, sizeof *a);
+    for (int n = 0; n < N; ++n) {
+        a->win[n] = sqrt(0.5 * (1.0 - cos(2.0 * pi * (double)n / (double)N)));   /* periodic sqrt-Hann */
+        a->cs[n] = cos(2.0 * pi * (double)n / (double)N);
+        a->sn[n] = sin(2.0 * pi * (double)n / (double)N);
+    }
+    ac_stft_config_default(&sc, N);
+    sc.ola = AC_OLA_ACCUMULATE;
+    b1 = ac_stft_get_mem_size(&sc);
+    b2 = ac_istft_get_mem_size(&sc);
+    if (posix_memalign(&a->m1, 16, b1) != 0 || posix_memalign(&a->m2, 16, b2) != 0) return -1;
+    a->stft = ac_stft_init(a->m1, b1, &sc);
+    a->istft = ac_istft_init(a->m2, b2, &sc);
+    return a->stft && a->istft ? 0 : -1;
+}
+
+static void accref_free(AccRef* a) { free(a->m1); free(a->m2); memset(a, 0, sizeof *a); }
+
+/* hop = this frame's windowed IFFT first half + saved; saved = its second half. The spectrum is
+ * unnormalised (the inverse carries 1/N); DC and Nyquist take their real parts. */
+static void accref_dft_hop(AccRef* a, const float* re, const float* im, float* out) {
+    const int N = g_grid.n_fft, H = HOP;
+    double y[2 * HOP_MAX];
+    for (int n = 0; n < N; ++n) {
+        double acc = (double)re[0] + ((n & 1) ? -1.0 : 1.0) * (double)re[N / 2];
+        for (int k = 1; k < N / 2; ++k) {
+            int idx = (int)(((long long)k * n) % N);
+            acc += 2.0 * ((double)re[k] * a->cs[idx] - (double)im[k] * a->sn[idx]);
+        }
+        y[n] = a->win[n] * acc / (double)N;
+    }
+    for (int n = 0; n < H; ++n) { out[n] = (float)(y[n] + a->saved[n]); a->saved[n] = y[H + n]; }
+}
+
+enum { ACC_MAX_HOPS = 160 };
+typedef struct AccStats {
+    double max_err;               /* worst |stage - direct-DFT reference| */
+    double peak0;                 /* peak |hop #0| of the first pass */
+    int chain_bad;                /* hops not bit-equal to the audiolib accumulate chain */
+    int hops;
+    int ran[ACC_MAX_HOPS];        /* the model ran on this hop (infer_calls advanced) */
+    int state[ACC_MAX_HOPS];      /* AEC delay state of the hop */
+    int solid[ACC_MAX_HOPS];
+    int changed[ACC_MAX_HOPS];
+} AccStats;
+
+/* Drive `n` hops of `sim` through p, compare each with ref (analysis + mask + accumulate), and
+ * append the PCM to out_hist (n * HOP floats) when given. Stats are per call (hop index from 0). */
+static int acc_drive(MonoUlcnet* p, BandModelState* st, EchoSim* sim, int n, AccRef* ref,
+                     AccStats* r, float* out_hist, int model_effective) {
+    float mic[HOP_MAX], far[HOP_MAX], out[HOP_MAX], want[HOP_MAX], dft[HOP_MAX];
+    float re[BINS_MAX], im[BINS_MAX], mre[BINS_MAX], mim[BINS_MAX];
+    memset(r, 0, sizeof *r);
+    if (n > ACC_MAX_HOPS) return -1;
+    for (int h = 0; h < n; h++) {
+        int before = st->infer_calls;
+        AecResContext rctx;
+        AecLinearContext lctx;
+        echo_sim_hop(sim, mic, far);
+        if (mu_process(p, mic, far, out) != 0) return -1;
+        aec_get_res_context(mu_get_aec(p), &rctx);
+        aec_get_linear_context(mu_get_aec(p), &lctx);
+        r->ran[h] = st->infer_calls > before;
+        r->state[h] = (int)lctx.delay_state;
+        r->changed[h] = lctx.delay_state == AEC_LINEAR_DELAY_CHANGED;
+        r->solid[h] = lctx.delay_state != AEC_LINEAR_DELAY_UNLOCKED;
+        (void)ac_stft_push_planar(ref->stft, rctx.formed_hop, re, im);
+        if (r->ran[h] && model_effective) for (int k = 0; k < BINS; k++) { mre[k] = band_gain(k) * re[k]; mim[k] = band_gain(k) * im[k]; }
+        else { memcpy(mre, re, sizeof(float) * BINS); memcpy(mim, im, sizeof(float) * BINS); }
+        if (ac_istft_push_planar(ref->istft, mre, mim, want) != HOP || memcmp(want, out, HOP_BYTES) != 0)
+            r->chain_bad++;
+        accref_dft_hop(ref, mre, mim, dft);
+        for (int k = 0; k < HOP; k++) {
+            double d = fabs((double)out[k] - (double)dft[k]);
+            if (d > r->max_err) r->max_err = d;
+            if (h == 0 && fabs((double)out[k]) > r->peak0) r->peak0 = fabs((double)out[k]);
+        }
+        if (out_hist) memcpy(out_hist + (size_t)h * HOP, out, HOP_BYTES);
+        r->hops++;
+    }
+    return 0;
+}
+
+static MonoUlcnet* acc_make(BandModelState* st, AecDelayMode mode, int fixed_delay) {
+    MonoUlcnetConfig cfg = mu_default_config(g_grid.sample_rate);
+    cfg.delay_mode = mode;
+    cfg.fixed_delay_samples = fixed_delay;
+    cfg.model.user = st;
+    cfg.model.infer = band_infer;
+    cfg.model.reset = band_reset;
+    cfg.model.io_descriptor = test_io_descriptor();
+    return mu_create(&cfg);
+}
+
+static void test_accumulate_acceptance(void) {
+    const double tol = 2e-6;
+    static float pcm_a[ACC_MAX_HOPS * HOP_MAX], pcm_b[ACC_MAX_HOPS * HOP_MAX];
+    static AccStats ra, rb;
+    BandModelState sta = {0, 0}, stb = {0, 0};
+    AccRef ref;
+    EchoSim sim;
+    MonoUlcnet *p, *q;
+
+    /* (1) first hop and steady state: zero-delay echo (the delay stays UNLOCKED, no event). */
+    {
+        enum { N = 40 };
+        p = acc_make(&sta, AEC_DELAY_MATCHED, -1);
+        CHECK(p && accref_init(&ref) == 0, "accumulate: setup (first hop / steady state)");
+        if (!p) return;
+        echo_sim_init(&sim, 0, 0xC0FFEEu);
+        CHECK(acc_drive(p, &sta, &sim, N, &ref, &ra, NULL, 1) == 0, "accumulate: run");
+        printf("  accumulate (%d Hz / fft %d): first hop peak %.6f, worst |stage - direct DFT| %.3g over %d hops, "
+               "model calls %d (first hop %d)\n", g_grid.sample_rate, g_grid.n_fft, ra.peak0, ra.max_err, N,
+               sta.infer_calls, ra.ran[0]);
+        CHECK(ra.peak0 > 0.005, fmt_msg("accumulate: hop #0 is real output, not zeros (peak %.6f)", ra.peak0));
+        CHECK(ra.max_err < tol && ra.chain_bad == 0,
+              fmt_msg("accumulate: every PCM sample of %d hops equals the independent per-sample accumulate "
+                      "reference (max err %.3e) and the audiolib accumulate chain bit for bit", N, ra.max_err));
+        CHECK(ra.ran[0] == 1 && sta.infer_calls == N && sta.reset_calls == 0,
+              fmt_msg("accumulate: one submission on the first hop, one per hop after it (%d calls over %d hops, "
+                      "%d resets)", sta.infer_calls, N, sta.reset_calls));
+        mu_destroy(p); accref_free(&ref);
+    }
+
+    /* (1b) identity and model failure are transparent: a pipeline without a model and one whose model
+     * fails every frame (finite garbage, rc != 0) both emit the unmasked accumulate reference, bit
+     * for bit the same PCM, and the failing model is still offered a frame on every hop. */
+    {
+        enum { N = 30 };
+        BandModelState stn = {0, 0}, stf = {0, 0};
+        MonoUlcnetConfig cfg_n = mu_default_config(g_grid.sample_rate);
+        MonoUlcnetConfig cfg_f = mu_default_config(g_grid.sample_rate);
+        AccRef ref_f;
+        cfg_f.model.user = &stf;
+        cfg_f.model.infer = band_fail_infer;
+        cfg_f.model.reset = band_reset;
+        cfg_f.model.io_descriptor = test_io_descriptor();
+        p = mu_create(&cfg_n);
+        q = mu_create(&cfg_f);
+        CHECK(p && q && accref_init(&ref) == 0 && accref_init(&ref_f) == 0, "accumulate: setup (identity / failing model)");
+        if (!p || !q) return;
+        echo_sim_init(&sim, 0, 0xC0FFEEu);
+        CHECK(acc_drive(p, &stn, &sim, N, &ref, &ra, pcm_a, 0) == 0, "accumulate: identity run");
+        echo_sim_init(&sim, 0, 0xC0FFEEu);
+        CHECK(acc_drive(q, &stf, &sim, N, &ref_f, &rb, pcm_b, 0) == 0, "accumulate: failing-model run");
+        CHECK(ra.max_err < tol && ra.chain_bad == 0 && rb.max_err < tol && rb.chain_bad == 0,
+              fmt_msg("accumulate: with no model, and with a model that fails every frame, each hop equals the "
+                      "unmasked accumulate reference (max err %.3e / %.3e)", ra.max_err, rb.max_err));
+        CHECK(memcmp(pcm_a, pcm_b, (size_t)N * HOP_BYTES) == 0 && stf.infer_calls == N,
+              fmt_msg("accumulate: a failing model leaves PCM bit-identical to no model although it was offered "
+                      "a frame on all %d hops (%d calls)", N, stf.infer_calls));
+        mu_destroy(p); mu_destroy(q); accref_free(&ref); accref_free(&ref_f);
+    }
+
+    /* (1c) a first hop whose only event information is solid = true still submits one frame. */
+    {
+        BandModelState st1 = {0, 0};
+        MonoUlcnet* pp = acc_make(&st1, AEC_DELAY_MATCHED, -1);
+        float err[HOP_MAX], far[HOP_MAX], out[HOP_MAX], dftout[HOP_MAX];
+        float re[BINS_MAX], im[BINS_MAX], mre[BINS_MAX], mim[BINS_MAX];
+        UlcnetNnDelay ev; ev.changed = 0; ev.solid = 1;
+        CHECK(pp && accref_init(&ref) == 0, "accumulate: setup (solid-only first hop)");
+        if (pp) {
+            lcg_state = 0x5EEDu;
+            for (int i = 0; i < HOP; i++) { err[i] = lcg_sample(); far[i] = lcg_sample(); }
+            CHECK(ulcnet_nn_stage_begin_time(pp->stage, err, far, ev) == 0 &&
+                  ulcnet_nn_stage_process(pp->stage, out) == 0, "accumulate: solid-only first hop processes");
+            (void)ac_stft_push_planar(ref.stft, err, re, im);
+            for (int k = 0; k < BINS; k++) { mre[k] = band_gain(k) * re[k]; mim[k] = band_gain(k) * im[k]; }
+            accref_dft_hop(&ref, mre, mim, dftout);
+            double e = 0.0, pk = 0.0;
+            for (int i = 0; i < HOP; i++) { e = fmax(e, fabs((double)out[i] - (double)dftout[i])); pk = fmax(pk, fabs((double)out[i])); }
+            CHECK(st1.infer_calls == 1 && st1.reset_calls == 0 && e < tol && pk > 0.005,
+                  fmt_msg("accumulate: a first hop with only solid=true submits once, no reset, non-zero output "
+                          "matching the reference (peak %.6f, err %.3e)", pk, e));
+            mu_destroy(pp); accref_free(&ref);
+        }
+    }
+
+    /* (2) `changed`: a bulk-delay echo -- UNLOCKED, then the matched filter locks (CHANGED), then LOCKED. */
+    {
+        enum { N = 120 };
+        p = acc_make(&sta, AEC_DELAY_MATCHED, -1);
+        sta.infer_calls = sta.reset_calls = 0;
+        CHECK(p && accref_init(&ref) == 0, "accumulate events: setup (changed)");
+        if (!p) return;
+        echo_sim_init(&sim, ECHO_DELAY, 0xC0FFEEu);
+        CHECK(acc_drive(p, &sta, &sim, N, &ref, &ra, NULL, 1) == 0, "accumulate events: run (changed)");
+        int ch = -1;
+        for (int h = 0; h < N; h++) if (ra.changed[h]) { ch = h; break; }
+        CHECK(ch >= 1, fmt_msg("accumulate events: the delay was acquired (CHANGED at hop %d)", ch));
+        if (ch >= 1) {
+            int ran_ok = !ra.ran[ch] && ra.ran[ch - 1] && ra.ran[ch + 1];
+            printf("  accumulate changed at hop %d: submissions on hops %d/%d/%d = %d/%d/%d, resets %d, total %d calls, "
+                   "max err %.3g\n", ch, ch - 1, ch, ch + 1, ra.ran[ch - 1], ra.ran[ch], ra.ran[ch + 1],
+                   sta.reset_calls, sta.infer_calls, ra.max_err);
+            CHECK(ran_ok && ULCNET_NN_STAGE_REPRIME_FRAMES == 1,
+                  "accumulate events: the CHANGED hop sends the model nothing, the hop before and after run it once");
+            CHECK(sta.reset_calls == 1 && sta.infer_calls == N - ULCNET_NN_STAGE_REPRIME_FRAMES,
+                  fmt_msg("accumulate events: the model is reset once and skipped for exactly the %d event frame "
+                          "(%d resets, %d calls over %d hops)", (int)ULCNET_NN_STAGE_REPRIME_FRAMES,
+                          sta.reset_calls, sta.infer_calls, N));
+            CHECK(ra.max_err < tol && ra.chain_bad == 0,
+                  fmt_msg("accumulate events: PCM through the CHANGED hop equals the continuous accumulate "
+                          "reference -- the event hop bypasses with the residual spectrum and keeps the previous "
+                          "frame's second half (max err %.3e)", ra.max_err));
+        }
+        mu_destroy(p); accref_free(&ref);
+    }
+
+    /* (2b) `solid false -> true` after earlier hops, no CHANGED: FIXED delay, the aligned far becomes
+     * usable after fixed_delay + hop samples. */
+    {
+        enum { N = 14 };
+        p = acc_make(&sta, AEC_DELAY_FIXED, 2 * HOP);
+        sta.infer_calls = sta.reset_calls = 0;
+        CHECK(p && accref_init(&ref) == 0, "accumulate events: setup (solid false -> true)");
+        if (!p) return;
+        echo_sim_init(&sim, 0, 0xA11FEEDu);
+        CHECK(acc_drive(p, &sta, &sim, N, &ref, &ra, NULL, 1) == 0, "accumulate events: run (solid false -> true)");
+        int first_solid = -1, any_changed = 0;
+        for (int h = 0; h < N; h++) { if (ra.solid[h] && first_solid < 0) first_solid = h; if (ra.changed[h]) any_changed = 1; }
+        CHECK(first_solid >= 1 && !any_changed,
+              fmt_msg("accumulate events: solid rises at hop %d with no CHANGED hop", first_solid));
+        if (first_solid >= 1) {
+            printf("  accumulate solid false->true at hop %d: submissions on hops %d/%d/%d = %d/%d/%d, resets %d, "
+                   "total %d calls, max err %.3g\n", first_solid, first_solid - 1, first_solid, first_solid + 1,
+                   ra.ran[first_solid - 1], ra.ran[first_solid], ra.ran[first_solid + 1],
+                   sta.reset_calls, sta.infer_calls, ra.max_err);
+            CHECK(!ra.ran[first_solid] && ra.ran[first_solid - 1] && ra.ran[first_solid + 1] &&
+                  sta.reset_calls == 1 && sta.infer_calls == N - ULCNET_NN_STAGE_REPRIME_FRAMES,
+                  "accumulate events: solid false->true resets the model once, sends it nothing on the event hop, "
+                  "exactly one submission on the next");
+            CHECK(ra.max_err < tol && ra.chain_bad == 0,
+                  fmt_msg("accumulate events: PCM through the solid transition equals the continuous accumulate "
+                          "reference (max err %.3e)", ra.max_err));
+        }
+        mu_destroy(p); accref_free(&ref);
+    }
+
+    /* (3) full reset after non-zero overlap, replayed end to end (AEC and stage), against a newly
+     * built pipeline and references restarted from zero. The bulk-delay echo makes the replay cross
+     * the CHANGED hop again. */
+    {
+        enum { N = 60 };
+        p = acc_make(&sta, AEC_DELAY_MATCHED, -1);
+        q = acc_make(&stb, AEC_DELAY_MATCHED, -1);
+        sta.infer_calls = sta.reset_calls = 0; stb.infer_calls = stb.reset_calls = 0;
+        CHECK(p && q && accref_init(&ref) == 0, "accumulate reset: setup");
+        if (!p || !q) return;
+        echo_sim_init(&sim, ECHO_DELAY, 0xC0FFEEu);
+        CHECK(acc_drive(p, &sta, &sim, 30, &ref, &ra, NULL, 1) == 0, "accumulate reset: pre-reset hops");   /* non-zero overlap now held */
+        accref_free(&ref);
+        mu_reset(p);
+        sta.infer_calls = 0;
+        CHECK(accref_init(&ref) == 0, "accumulate reset: references restarted");
+        echo_sim_init(&sim, ECHO_DELAY, 0xBEEF01u);
+        CHECK(acc_drive(p, &sta, &sim, N, &ref, &ra, pcm_a, 1) == 0, "accumulate reset: replay after reset");
+        AccRef ref_b;
+        CHECK(accref_init(&ref_b) == 0, "accumulate reset: fresh-pipeline reference");
+        echo_sim_init(&sim, ECHO_DELAY, 0xBEEF01u);
+        CHECK(acc_drive(q, &stb, &sim, N, &ref_b, &rb, pcm_b, 1) == 0, "accumulate reset: newly built pipeline");
+        int same_ran = 1;
+        for (int h = 0; h < N; h++) if (ra.ran[h] != rb.ran[h]) same_ran = 0;
+        printf("  accumulate reset: first hop peak %.6f (replay) vs %.6f (new pipeline), submissions %d vs %d over %d hops, "
+               "max err %.3g / %.3g\n", ra.peak0, rb.peak0, sta.infer_calls, stb.infer_calls, N, ra.max_err, rb.max_err);
+        CHECK(memcmp(pcm_a, pcm_b, (size_t)N * HOP_BYTES) == 0,
+              "accumulate reset: first hop and every later hop of the replay equal a newly built pipeline bit for bit");
+        CHECK(same_ran && sta.infer_calls == stb.infer_calls,
+              fmt_msg("accumulate reset: submission timing equals a newly built pipeline (%d vs %d calls)",
+                      sta.infer_calls, stb.infer_calls));
+        CHECK(ra.max_err < tol && ra.chain_bad == 0 && rb.max_err < tol && rb.chain_bad == 0 && ra.peak0 > 1e-4,
+              fmt_msg("accumulate reset: the replay equals the independent reference restarted from zero "
+                      "(max err %.3e)", ra.max_err));
+        accref_free(&ref); accref_free(&ref_b);
+        mu_destroy(p); mu_destroy(q);
+    }
+}
+
 /* Every test on the grid in g_grid. */
 static void run_grid(void) {
     printf("=== mono_alignulcnet: identity E2E (one-hop latency) ===\n");
@@ -2447,6 +2791,9 @@ static void run_grid(void) {
 
     printf("\n=== mono_alignulcnet: known-delay profile (acquisition/coverage/mislock/cost) ===\n");
     test_known_delay_profile();
+
+    printf("\n=== mono_alignulcnet: overlap-add acceptance (first hop, events, reset) ===\n");
+    test_accumulate_acceptance();
 }
 
 int main(void) {

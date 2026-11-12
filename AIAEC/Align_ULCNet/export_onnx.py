@@ -45,7 +45,7 @@ output writes ``manifest.json`` inside its output directory.
 
 STFT/WOLA and PBFDKF stay outside the graph (``ulcnet_process.c`` and the AEC
 library). The graph boundary follows the checkpoint and supports 16 kHz / FFT
-window 512 / hop 256 or 48 kHz / 1024 / 512; the C pre/post must be compiled
+window 256 / hop 128, 16 kHz / 512 / 256 or 48 kHz / 1024 / 512; the C pre/post must be compiled
 for the same grid (one binary serves one grid).
 
 Graph boundary (state layout version ``LAYOUT_VERSION``)
@@ -77,6 +77,21 @@ the inverse power) runs on the host (``host_back_end``; C:
 ``export_graph`` validates the written file with
 ``validate_inplace_state_contract`` and records ``state_binding`` and
 ``state_window_drop`` in its metadata.
+
+Packet graph (``--frames-per-call N``, N in [2, 64], layout ``PACKET_LAYOUT_VERSION``)
+--------------------------------------------------------------------------------
+
+One call runs N consecutive frames of one stream. Inputs, in order:
+``error_mag``, ``far_mag``, ``error_cos``, ``error_sin`` (each ``[1, N, F]``),
+``frame_reset`` (``[1, N]``, 0.0 / 1.0), then the same four state inputs as
+above. Outputs: ``output`` ``[1, 2, N, F]`` (plane 0 real, plane 1 imaginary,
+time axis 2) followed by the four ``*_out`` end-of-packet states. A frame with
+``frame_reset`` 1.0 resets the model state to zero BEFORE that frame and
+bypasses it: its head is the identity mask (1, 0), the model is not stepped and
+the state stays zero, so the next frame continues from the reset state; frames
+before it use the old state. This equals the N = 1 stream that resets and
+bypasses one hop at an alignment boundary. ``frame_reset`` is a control, not an
+activation: it carries no quantization. The N frames are unrolled in the graph.
 """
 
 from __future__ import annotations
@@ -124,11 +139,11 @@ STATE_LAYOUT_VERSION = LAYOUT_VERSION
 # The deployed C front/back end hardcodes this exponent
 # (ULCNET_MODEL_IO_COMPRESSION_EXP); export_graph refuses a checkpoint whose
 # model carries a different value, since nothing downstream could detect it.
-# The two product grids: SignalGrid admits more (16 kHz / 256 is constructible)
-# but the deployed boundary is defined only for the pair the corpus is
-# materialized on, so anything else is refused here rather than failing deep in
-# a matmul or exporting a graph no C build can bind.
-SUPPORTED_GRIDS = ((16000, 512), (48000, 1024))
+# The product grids: the deployed boundary is defined only for the pairs the
+# corpus is materialized on (16 kHz FFT 256 / hop 128, 16 kHz FFT 512 / hop 256,
+# 48 kHz FFT 1024 / hop 512), so anything else is refused here rather than
+# failing deep in a matmul or exporting a graph no C build can bind.
+SUPPORTED_GRIDS = ((16000, 256), (16000, 512), (48000, 1024))
 COMPRESSION_EXPONENT = 0.3
 MIN_DELAY_DEPTH = 2
 MAX_DELAY_DEPTH = 64
@@ -170,6 +185,25 @@ STATE_OUTPUT_NAMES = tuple(name + '_out' for name in STATE_NAMES)
 INPUT_NAMES = SIGNAL_INPUT_NAMES + STATE_NAMES
 OUTPUT_NAMES = HEAD_OUTPUT_NAMES + STATE_OUTPUT_NAMES
 SIGNAL_INPUTS = len(SIGNAL_INPUT_NAMES)
+
+# Packet boundary (frames_per_call N > 1): one graph call runs N consecutive
+# frames of ONE stream. The signal inputs gain a time axis ([1, N, F]) and a
+# fifth signal input, ``frame_reset`` [1, N], carries the alignment event of
+# each frame (1.0 = boundary, else 0.0). A boundary frame f resets the model
+# state to zero BEFORE frame f and bypasses it: the head output of frame f is
+# the identity mask (real 1, imaginary 0), the model is not stepped, and the
+# state stays zero until frame f + 1 -- exactly what the N = 1 stream does with
+# a reset + one bypassed hop (ulcnet_stream_pre_process_f32: edge -> reset ->
+# ULCNET_STREAM_REPRIME_FRAMES identity hop). Frames before f use the old
+# state, frames after f continue from the reset state, and the graph returns
+# the end-of-packet state. The N = 1 boundary above is unchanged (an event hop
+# is bypassed by the caller and never reaches the accelerator).
+# A new boundary gets a new number: 18 is the N = 1 boundary only.
+PACKET_LAYOUT_VERSION = 19
+CONTROL_INPUT_NAME = 'frame_reset'
+PACKET_INPUT_NAMES = SIGNAL_INPUT_NAMES + (CONTROL_INPUT_NAME,) + STATE_NAMES
+PACKET_SIGNAL_INPUTS = len(SIGNAL_INPUT_NAMES) + 1
+MAX_PACKET_FRAMES = 64
 
 
 def optimize_graph_file(path):
@@ -326,6 +360,16 @@ class AlignUlcnetStreamingExport(nn.Module):
                 error_sin: Tensor, key_history: Tensor,
                 value_history: Tensor, logit_history: Tensor,
                 h_gru: Tensor) -> Tuple[Tensor, ...]:
+        return self.step(error_mag, far_mag, error_cos, error_sin,
+                         key_history, value_history, logit_history, h_gru)
+
+    def step(self, error_mag: Tensor, far_mag: Tensor, error_cos: Tensor,
+             error_sin: Tensor, key_history: Tensor,
+             value_history: Tensor, logit_history: Tensor,
+             h_gru: Tensor, keep: Tensor = None) -> Tuple[Tensor, ...]:
+        """One frame. ``keep`` (None, or a 0/1 tensor broadcastable to a state
+        tensor) multiplies the carried history AFTER its Slice, so a 0 runs the
+        frame from the zero state; None adds no op to the traced graph."""
         model = self.model
         depth = self.delay_depth
         # One Slice per subband GRU off the shared input. dim 1, not dim 0:
@@ -333,6 +377,13 @@ class AlignUlcnetStreamingExport(nn.Module):
         # tensor and an empty one WITHOUT raising.
         h_gru0 = h_gru[:, :GRU_LAYERS]
         h_gru1 = h_gru[:, GRU_LAYERS:GRU_SUBBANDS * GRU_LAYERS]
+        key_tail = key_history[:, :, :depth - 1]
+        value_tail = value_history[:, :, :depth - 1]
+        logit_tail = logit_history[:, :, 1:SCORE_WINDOW_FRAMES]
+        if keep is not None:
+            h_gru0, h_gru1 = h_gru0 * keep, h_gru1 * keep
+            key_tail, value_tail = key_tail * keep, value_tail * keep
+            logit_tail = logit_tail * keep
 
         error_feature = model.error_encoder(
             model.reorient(error_mag.unsqueeze(1))
@@ -349,9 +400,8 @@ class AlignUlcnetStreamingExport(nn.Module):
         # [B,C,D,F], delay slot zero is the current frame. The Slice keeps
         # the D-1 newest slots of the input window and the Concat result is
         # both the attention candidates and the next window.
-        key_window = torch.cat((key_now, key_history[:, :, :depth - 1]), dim=2)
-        value_window = torch.cat(
-            (value_now, value_history[:, :, :depth - 1]), dim=2)
+        key_window = torch.cat((key_now, key_tail), dim=2)
+        value_window = torch.cat((value_now, value_tail), dim=2)
         key_candidates = key_window.unsqueeze(2)
         value_candidates = value_window.unsqueeze(2)
         logit_now = (
@@ -361,8 +411,7 @@ class AlignUlcnetStreamingExport(nn.Module):
         # Reproduce StreamConv2dCell: the four newest chronological frames of
         # the window plus current logits, frequency-axis padding only, then
         # the raw Conv2d. The Concat result is the next window.
-        score_input = torch.cat(
-            (logit_history[:, :, 1:SCORE_WINDOW_FRAMES], logit_now), dim=2)
+        score_input = torch.cat((logit_tail, logit_now), dim=2)
         frequency_total = (attention.score.kf - 1) * attention.score.df
         frequency_left = frequency_total // 2
         score = attention.score.conv(F.pad(
@@ -424,6 +473,55 @@ class AlignUlcnetStreamingExport(nn.Module):
         # ulcnet_model_io.h stores the two hiddens in.
         return (output, key_window, value_window, score_input,
                 torch.cat(tuple(hidden_next), dim=1))
+
+
+class AlignUlcnetPacketExport(nn.Module):
+    """``frames_per_call`` frames of one stream per call, with per-frame
+    alignment events (see PACKET_LAYOUT_VERSION). The N single-frame steps are
+    unrolled in the graph: the recurrent state is reset mid-packet, which a
+    time-batched formulation could not express exactly.
+    """
+
+    input_names = PACKET_INPUT_NAMES
+    output_names = OUTPUT_NAMES
+    signal_inputs = PACKET_SIGNAL_INPUTS
+    layout_version = PACKET_LAYOUT_VERSION
+
+    def __init__(self, model: nn.Module, frames_per_call: int):
+        super().__init__()
+        if (isinstance(frames_per_call, bool)
+                or not isinstance(frames_per_call, int)
+                or not 2 <= frames_per_call <= MAX_PACKET_FRAMES):
+            raise ValueError(
+                'packet graph frames_per_call must be an integer in [2, %d], '
+                'got %r (N = 1 uses the one-frame graph)'
+                % (MAX_PACKET_FRAMES, frames_per_call))
+        self.step = AlignUlcnetStreamingExport(model)
+        self.model = model
+        self.frames_per_call = frames_per_call
+        self.delay_depth = self.step.delay_depth
+        self.n_freqs = self.step.n_freqs
+        self.ta_bins = self.step.ta_bins
+
+    def forward(self, error_mag: Tensor, far_mag: Tensor, error_cos: Tensor,
+                error_sin: Tensor, frame_reset: Tensor, key_history: Tensor,
+                value_history: Tensor, logit_history: Tensor,
+                h_gru: Tensor) -> Tuple[Tensor, ...]:
+        identity = torch.cat((
+            error_mag.new_ones(1, 1, 1, self.n_freqs),
+            error_mag.new_zeros(1, 1, 1, self.n_freqs)), dim=1)
+        state = (key_history, value_history, logit_history, h_gru)
+        masks = []
+        for index in range(self.frames_per_call):
+            event = frame_reset[:, index:index + 1].reshape(1, 1, 1, 1)
+            keep = 1.0 - event
+            output, key, value, logit, hidden = self.step.step(
+                error_mag[:, index:index + 1], far_mag[:, index:index + 1],
+                error_cos[:, index:index + 1], error_sin[:, index:index + 1],
+                *state, keep=keep)
+            masks.append(output * keep + identity * event)
+            state = (key * keep, value * keep, logit * keep, hidden * keep)
+        return (torch.cat(masks, dim=2),) + state
 
 
 def ta_bins_for(model) -> int:
@@ -524,6 +622,51 @@ def dummy_inputs(delay_depth: int, n_freqs: int, ta_bins: int
     return signals + tuple(torch.zeros(shapes[name]) for name in STATE_NAMES)
 
 
+def dummy_packet_inputs(frames_per_call: int, delay_depth: int, n_freqs: int,
+                        ta_bins: int) -> Tuple[Tensor, ...]:
+    """Trace inputs for a packet graph: signals [1, N, F], frame_reset [1, N]."""
+    shapes = state_shapes(delay_depth, ta_bins)
+    n = frames_per_call
+    signals = (
+        torch.randn(1, n, n_freqs).abs(),          # error_mag
+        torch.randn(1, n, n_freqs).abs(),          # far_mag
+        torch.randn(1, n, n_freqs).clamp(-1, 1),   # error_cos
+        torch.randn(1, n, n_freqs).clamp(-1, 1),   # error_sin
+        torch.zeros(1, n),                         # frame_reset
+    )
+    return signals + tuple(torch.zeros(shapes[name]) for name in STATE_NAMES)
+
+
+def packet_frame_reset(events: Sequence[int], frames_per_call: int) -> Tensor:
+    """The ``frame_reset`` input [1, N] for a packet whose frames carry
+    ``events`` (0/1 per frame; a shorter list is zero-completed)."""
+    if len(events) > frames_per_call:
+        raise ValueError('%d events for a %d-frame packet'
+                         % (len(events), frames_per_call))
+    values = [1.0 if event else 0.0 for event in events]
+    values += [0.0] * (frames_per_call - len(values))
+    return torch.tensor([values], dtype=torch.float32)
+
+
+def run_packet(wrapper, model, error_c: Tensor, far_c: Tensor,
+               events: Sequence[int], state: Tuple[Tensor, ...]):
+    """Host front end -> packet graph -> host back end for N complex frames.
+
+    ``error_c`` / ``far_c`` are complex ``[1, N, F]`` (raw spectra, N =
+    ``wrapper.frames_per_call``). Returns ``(enhanced complex [1, N, F],
+    next_state)``. This is the C pipeline's per-packet flow: the fixed front
+    end (stream_features) and back end (host_back_end) run on the host, one
+    graph call runs the N frames.
+    """
+    error_ri = torch.view_as_real(error_c)
+    far_ri = torch.view_as_real(far_c)
+    *signals, compressed = stream_features(model, error_ri, far_ri)
+    outputs = wrapper(*signals, packet_frame_reset(
+        events, wrapper.frames_per_call).to(error_ri.device), *state)
+    enhanced = host_back_end(model, compressed, outputs[0])
+    return torch.view_as_complex(enhanced.contiguous()), next_state(outputs)
+
+
 def next_state(outputs: Sequence[Tensor]) -> Tuple[Tensor, ...]:
     """The caller-held state for the next frame.
 
@@ -580,6 +723,7 @@ def _write_metadata(
     contract: Dict,
     inputs: Sequence[Tensor],
     outputs: Sequence[Tensor],
+    frames_per_call: int = 1,
 ) -> Dict:
     training_far_input_mode = checkpoint_far_input_mode(contract)
     deployed_far_input_mode = DEPLOYED_FAR_INPUT_MODE
@@ -590,10 +734,14 @@ def _write_metadata(
             f'{deployed_far_input_mode!r}'
         )
     linear_aec = _checkpoint_linear_aec(contract)
+    packet = frames_per_call != 1
+    input_names = PACKET_INPUT_NAMES if packet else INPUT_NAMES
     metadata = {
         'model_family': 'Align_ULCNet',
-        'boundary': 'stateless_one_frame_full_state',
-        'state_layout_version': LAYOUT_VERSION,
+        'boundary': ('stateless_packet_full_state_frame_reset' if packet
+                     else 'stateless_one_frame_full_state'),
+        'state_layout_version': (PACKET_LAYOUT_VERSION if packet
+                                 else LAYOUT_VERSION),
         'state_binding': STATE_BINDING,
         'state_window_drop': WINDOW_STATE_DROPS,
         'feature_layout': 'host',
@@ -604,7 +752,7 @@ def _write_metadata(
         'n_fft': model.grid.n_fft,
         'win_len': model.grid.win_len,
         'hop_len': model.grid.hop_len,
-        'frames_per_invocation': 1,
+        'frames_per_invocation': frames_per_call,
         'temporal_padding_inside_graph': False,
         'temporal_context': 'explicit_kv_logit_and_gru_state',
         'max_delay_frames': model.max_delay_frames,
@@ -627,7 +775,7 @@ def _write_metadata(
         'cpu_delta_state_update': False,
         'tensor_dtype': 'float32',
         'complex_tensor_policy': 'real_imag_last_dimension',
-        'input_schema': _schema(INPUT_NAMES, inputs),
+        'input_schema': _schema(input_names, inputs),
         'output_schema': _schema(OUTPUT_NAMES, outputs),
         'k_v_history_order': 'newest_first',
         'logit_history_order': 'oldest_first',
@@ -636,6 +784,25 @@ def _write_metadata(
         'c_frontend_postprocess': 'lib/aiaec/ulcnet/ulcnet_process.c',
         'c_model_io_state': 'lib/aiaec/ulcnet/ulcnet_model_io.c',
     }
+    if packet:
+        metadata['frames_per_call'] = int(frames_per_call)
+        # The fifth signal input is a 0/1 control, not an activation: it must
+        # stay out of range calibration and integer PTQ.
+        metadata['control_inputs'] = {
+            CONTROL_INPUT_NAME: {
+                'shape': [1, int(frames_per_call)],
+                'values': [0.0, 1.0],
+                'semantics': (
+                    '1.0 at frame f: reset the model state to zero before '
+                    'frame f and bypass it (identity mask, state stays '
+                    'zero); other frames step normally'),
+                'quantization': 'none',
+            },
+        }
+        metadata['signal_input_names'] = list(SIGNAL_INPUT_NAMES)
+        metadata['signal_time_axis'] = 1
+        metadata['head_output_time_axis'] = 2
+        metadata['bypass_head_value'] = 'identity_mask_real1_imag0'
     _write_sidecar(output_path, metadata)
     return metadata
 
@@ -663,21 +830,31 @@ def _verify_onnx(output_path: str, wrapper: nn.Module,
     session = ort.InferenceSession(
         output_path, providers=['CPUExecutionProvider']
     )
-    state = tuple(value.clone() for value in inputs[SIGNAL_INPUTS:])
+    packet = isinstance(wrapper, AlignUlcnetPacketExport)
+    frames = wrapper.frames_per_call if packet else 1
+    names = PACKET_INPUT_NAMES if packet else INPUT_NAMES
+    state = tuple(value.clone() for value in inputs[wrapper.signal_inputs:])
     worst = 0.0
     generator = torch.Generator().manual_seed(20260816)
+    steps = (2 * wrapper.delay_depth + 5 if not packet
+             else 2 * wrapper.delay_depth // frames + 6)
     with torch.no_grad():
-        for _ in range(2 * wrapper.delay_depth + 5):
+        for step in range(steps):
             signals = graph_signals(
                 wrapper.model,
-                torch.randn(1, 1, wrapper.n_freqs, 2, generator=generator),
-                torch.randn(1, 1, wrapper.n_freqs, 2, generator=generator),
+                torch.randn(1, frames, wrapper.n_freqs, 2, generator=generator),
+                torch.randn(1, frames, wrapper.n_freqs, 2, generator=generator),
             )
+            if packet:
+                # events at varying positions, including none and several
+                events = [(step + 3 * k) % (frames + 1) == 0 and step % 2 == 1
+                          for k in range(frames)]
+                signals = signals + (packet_frame_reset(events, frames),)
             torch_inputs = signals + state
             expected = wrapper(*torch_inputs)
             actual = session.run(None, {
                 name: value.numpy()
-                for name, value in zip(INPUT_NAMES, torch_inputs)
+                for name, value in zip(names, torch_inputs)
             })
             for got, want in zip(actual, expected):
                 worst = max(worst, float(np.max(
@@ -688,8 +865,12 @@ def _verify_onnx(output_path: str, wrapper: nn.Module,
 
 
 def export_graph(model, checkpoint_path, output_path, opset=17,
-                 verify=False):
+                 verify=False, frames_per_call=1):
     """Write the streaming graph plus its metadata; optionally verify parity.
+
+    ``frames_per_call`` N > 1 writes the packet graph (PACKET_LAYOUT_VERSION,
+    N unrolled frames, ``frame_reset`` control input); N == 1 is the one-frame
+    graph, byte-for-byte what this function wrote before the option existed.
 
     Shared by the export CLI and the calib recorder, so the calibration
     tensors and the graph they bind to always come from the same wrapper in
@@ -710,9 +891,17 @@ def export_graph(model, checkpoint_path, output_path, opset=17,
     # Refused before anything is written: the metadata step below would also
     # refuse, but only after torch.onnx.export has put a graph on disk.
     _checkpoint_linear_aec(checkpoint_data['contract'])
-    wrapper = AlignUlcnetStreamingExport(model).eval()
-    inputs = dummy_inputs(
-        wrapper.delay_depth, wrapper.n_freqs, wrapper.ta_bins)
+    packet = frames_per_call != 1
+    if packet:
+        wrapper = AlignUlcnetPacketExport(model, frames_per_call).eval()
+        inputs = dummy_packet_inputs(
+            frames_per_call, wrapper.delay_depth, wrapper.n_freqs,
+            wrapper.ta_bins)
+    else:
+        wrapper = AlignUlcnetStreamingExport(model).eval()
+        inputs = dummy_inputs(
+            wrapper.delay_depth, wrapper.n_freqs, wrapper.ta_bins)
+    input_names = PACKET_INPUT_NAMES if packet else INPUT_NAMES
     with torch.no_grad():
         outputs = wrapper(*inputs)
     if not all(torch.isfinite(value).all() for value in outputs):
@@ -723,7 +912,7 @@ def export_graph(model, checkpoint_path, output_path, opset=17,
         wrapper,
         inputs,
         output_path,
-        input_names=list(INPUT_NAMES),
+        input_names=list(input_names),
         output_names=list(OUTPUT_NAMES),
         opset_version=opset,
         do_constant_folding=True,
@@ -741,6 +930,7 @@ def export_graph(model, checkpoint_path, output_path, opset=17,
         checkpoint_data['contract'],
         inputs,
         outputs,
+        frames_per_call,
     )
     _set_onnx_metadata(graph, metadata)
     _pin_static_output_shapes(graph, OUTPUT_NAMES, outputs)
@@ -773,14 +963,26 @@ def main() -> None:
     parser.add_argument('--max-delay-frames', type=int, default=None)
     parser.add_argument('--opset', type=int, default=17)
     parser.add_argument('--verify', action='store_true')
+    parser.add_argument(
+        '--frames-per-call', type=int, default=1, metavar='N',
+        help='frames of one stream per accelerator call (default 1). N > 1 '
+             'writes the packet graph (layout %d): N unrolled frames, a fifth '
+             'signal input frame_reset [1, N] marking per-frame alignment '
+             'events, and the end-of-packet state; range [2, %d]'
+             % (PACKET_LAYOUT_VERSION, MAX_PACKET_FRAMES))
     args = parser.parse_args()
+    if args.frames_per_call != 1 and not (
+            2 <= args.frames_per_call <= MAX_PACKET_FRAMES):
+        parser.error('--frames-per-call must be 1 or in [2, %d]'
+                     % MAX_PACKET_FRAMES)
 
     model, _grid, _linear_contract = load_model(
         args.checkpoint, 'cpu', max_delay_frames=args.max_delay_frames
     )
     model.eval()
     export_graph(model, args.checkpoint, args.output,
-                 opset=args.opset, verify=args.verify)
+                 opset=args.opset, verify=args.verify,
+                 frames_per_call=args.frames_per_call)
     print(args.output)
 
 

@@ -36,6 +36,41 @@ from AIAEC.training_common import auto_device, require_checkpoint_model_identity
 
 DEVICE_HELP = 'cuda / cpu / mps (default: auto-detect)'
 
+FRAMES_PER_CALL_HELP = (
+    'run the model as the deployment graph does: one stream, N consecutive '
+    'STFT frames per model call, state carried from call to call, the last '
+    'call zero-completed and the output cut back to the input length. '
+    'Default: one frame per call. Only %s support N > 1'
+)
+
+
+def _ready_models_text():
+    from AIAEC._streaming_export import (
+        FRAMES_PER_CALL_READY_MODELS, PACKET_GRAPH_MODELS)
+    return ', '.join(FRAMES_PER_CALL_READY_MODELS + PACKET_GRAPH_MODELS)
+
+
+def require_frames_per_call(model_name, frames_per_call):
+    """Validate ``--frames-per-call`` for ``model_name``; returns N (>= 1).
+
+    ``None`` (the option omitted) is N == 1. A model whose streaming cells are
+    not verified for N > 1 refuses it rather than tracing it as if correct.
+    """
+    from AIAEC._streaming_export import (
+        FRAMES_PER_CALL_READY_MODELS, MAX_FRAMES_PER_CALL, PACKET_GRAPH_MODELS)
+    ready = FRAMES_PER_CALL_READY_MODELS + PACKET_GRAPH_MODELS
+    if frames_per_call is None:
+        return 1
+    if (isinstance(frames_per_call, bool) or not isinstance(frames_per_call, int)
+            or not 1 <= frames_per_call <= MAX_FRAMES_PER_CALL):
+        raise ValueError('--frames-per-call must be an integer in [1, %d], got %r'
+                         % (MAX_FRAMES_PER_CALL, frames_per_call))
+    if frames_per_call != 1 and model_name not in ready:
+        raise ValueError(
+            '--frames-per-call %d is not available for %s: only %s support '
+            'N > 1 today' % (frames_per_call, model_name, ', '.join(ready)))
+    return frames_per_call
+
 # --verify is a diagnostic print, deliberately not a gate: it has no tolerance
 # and never changes the exit code.  Streaming equivalence is gated by the
 # test_stream_matches_offline tests, which pin measured tolerances.
@@ -259,6 +294,8 @@ def make_streaming_main(model_name):
                   f"{grid.sr} Hz")
         length = microphone.shape[-1]
 
+        packet_size = require_frames_per_call(
+            model_name, getattr(args, 'frames_per_call', None))
         window = grid.window(device=device)
         mic_stft = StreamSTFT(grid.n_fft, grid.hop_len, window)
         far_stft = StreamSTFT(grid.n_fft, grid.hop_len, window)
@@ -268,27 +305,51 @@ def make_streaming_main(model_name):
         pieces = []
         emitted = 0
         frames = 0
+        calls = 0
+        pending_mic = []
+        pending_far = []
 
-        def run_frames(mic_frames, far_frames):
-            nonlocal emitted, frames
-            require_matched_frames(mic_frames, far_frames)
-            for mic_frame, far_frame in zip(mic_frames, far_frames):
-                inputs = {
-                    'microphone': mic_frame.unsqueeze(1),   # complex [B,1,F]
-                    'far_end': far_frame.unsqueeze(1),
-                }
-                with torch.no_grad():
-                    output = model.forward_stream(
-                        inputs['microphone'], inputs['far_end'], state
-                    )
-                if frames == 0:
-                    print_io_table(inputs, output)
-                    print('state inventory after the first frame:')
-                    print(state_report(state))
+        def run_packet(count):
+            """One model call over the first ``count`` queued frames (a
+            short last packet is completed with zero frames; the outputs of
+            the zero frames are dropped)."""
+            nonlocal emitted, frames, calls
+            mic_packet = pending_mic[:count]
+            far_packet = pending_far[:count]
+            del pending_mic[:count], pending_far[:count]
+            real = len(mic_packet)
+            for missing in range(packet_size - real):
+                mic_packet.append(torch.zeros_like(mic_packet[0]))
+                far_packet.append(torch.zeros_like(far_packet[0]))
+            inputs = {
+                'microphone': torch.stack(mic_packet, dim=1),   # complex [B,N,F]
+                'far_end': torch.stack(far_packet, dim=1),
+            }
+            with torch.no_grad():
+                output = model.forward_stream(
+                    inputs['microphone'], inputs['far_end'], state
+                )
+            if calls == 0:
+                print_io_table(inputs, output)
+                print('state inventory after the first call:'
+                      if packet_size > 1 else
+                      'state inventory after the first frame:')
+                print(state_report(state))
+            calls += 1
+            for index in range(real):
                 frames += 1
-                samples = synthesis.push(output.enhanced[:, 0])
+                samples = synthesis.push(output.enhanced[:, index])
                 emitted += samples.shape[-1]
                 pieces.append(samples)
+
+        def run_frames(mic_frames, far_frames, final=False):
+            require_matched_frames(mic_frames, far_frames)
+            pending_mic.extend(mic_frames)
+            pending_far.extend(far_frames)
+            while len(pending_mic) >= packet_size:
+                run_packet(packet_size)
+            if final and pending_mic:
+                run_packet(len(pending_mic))
 
         # One hop of audio per push mirrors the deployment cadence; both
         # analyses see identical chunk boundaries so frames arrive in lockstep.
@@ -296,7 +357,7 @@ def make_streaming_main(model_name):
             stop = min(start + grid.hop_len, length)
             run_frames(mic_stft.push(microphone[:, start:stop]),
                        far_stft.push(far_end[:, start:stop]))
-        run_frames(mic_stft.flush(), far_stft.flush())
+        run_frames(mic_stft.flush(), far_stft.flush(), final=True)
         pieces.append(synthesis.flush(length=length, already_emitted=emitted))
 
         streamed = torch.cat(pieces, dim=-1)[:, :length]
@@ -306,7 +367,8 @@ def make_streaming_main(model_name):
         sf.write(args.out_wav, streamed.squeeze(0).cpu().numpy(), grid.sr,
                  subtype='FLOAT')
         print(f"wrote {args.out_wav} ({length / grid.sr:.2f}s @ {grid.sr} Hz, "
-              f"{frames} frames)")
+              f"{frames} frames"
+              f"{f', {calls} model calls of {packet_size}' if packet_size > 1 else ''})")
 
         if args.verify:
             mic_spec = stft(microphone, grid).transpose(-2, -1)
@@ -348,6 +410,10 @@ def make_inference_cli(model_name, model_class, description):
         parser.add_argument('out_wav', nargs='?')
         parser.add_argument('--device', default=None, help=DEVICE_HELP)
         parser.add_argument('--verify', action='store_true', help=VERIFY_HELP)
+        parser.add_argument('--frames-per-call', type=int, default=None,
+                            metavar='N',
+                            help=FRAMES_PER_CALL_HELP % (
+                                _ready_models_text(),))
         add_directory_arguments(parser)
         return parser
 
@@ -389,6 +455,10 @@ def make_inference_cli(model_name, model_class, description):
         parser = build_parser()
         args = parser.parse_args()
         require_single_or_directory(parser, args)
+        try:
+            require_frames_per_call(model_name, args.frames_per_call)
+        except ValueError as error:
+            parser.error(str(error))
         main(args)
 
     return build_parser, load_model, main, cli

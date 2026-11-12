@@ -22,6 +22,17 @@ extern "C" {
  *   outputs  `output`, the complex mask planar [1,2,1,BINS] (real, then imaginary), and each state tensor's full next
  *            value as *_out; enhance_spectrum() applies the mask */
 #define ULCNET_MODEL_IO_LAYOUT_VERSION 18u
+
+/* The packet boundary (frames_per_call N in [2, ULCNET_MODEL_IO_MAX_FRAMES_PER_CALL]); equals PACKET_LAYOUT_VERSION in
+ * export_onnx.py and is a different number from the one-frame boundary, never interchangeable with it:
+ *   inputs   error_mag, far_mag, error_cos, error_sin [1,N,BINS] (frame-major, oldest first), frame_reset [1,N]
+ *            (0.0 or 1.0 per frame), then the same four state tensors as layout 18
+ *   outputs  `output` [1,2,N,BINS]: the real plane of all N frames, then the imaginary plane; then the *_out states
+ * A frame_reset frame resets the model state to zero BEFORE that frame and bypasses it inside the graph (identity mask,
+ * model not stepped, state stays zero); the frames after it continue from the reset state. The host therefore never
+ * restarts the state for such a frame (no generation change) and fills the frame itself with the error spectrum. */
+#define ULCNET_MODEL_IO_PACKET_LAYOUT_VERSION 19u
+#define ULCNET_MODEL_IO_MAX_FRAMES_PER_CALL   64
 #define ULCNET_MODEL_IO_ALIGNMENT      16u
 
 /* The checkpoint's linear_aec.version (metadata linear_aec_contract_version): the front end the weights are trained
@@ -95,12 +106,13 @@ typedef struct UlcnetModelIoDescriptor {
     int gru_layers;           /* model interior, never read here */
     int gru_hidden;           /* model interior, never read here */
     int far_input_mode;       /* a UlcnetFarInputMode value */
+    int frames_per_call;      /* 0 or 1: the one-frame boundary (layout 18); 2..64: the packet boundary (layout 19) */
 } UlcnetModelIoDescriptor;
 
 #ifdef __STDC_VERSION__
 #if __STDC_VERSION__ >= 201112L
-_Static_assert(sizeof(UlcnetModelIoDescriptor) == 48,
-               "UlcnetModelIoDescriptor must stay 48 bytes");
+_Static_assert(sizeof(UlcnetModelIoDescriptor) == 52,
+               "UlcnetModelIoDescriptor must stay 52 bytes");
 #endif
 #endif
 
@@ -123,7 +135,9 @@ typedef struct UlcnetModelIoStateBuffers {
     size_t gru_hidden_elements;
 } UlcnetModelIoStateBuffers;
 
-/* Flat pointers, sizes in *_elements. The state views are the registered buffers: NULL and 0 elements when none. */
+/* Flat pointers, sizes in *_elements. The state views are the registered buffers: NULL and 0 elements when none. In the
+ * packet boundary the four signal tensors hold N frames (spectrum_bins_elements = N * BINS each) and frame_reset points
+ * at the N control values; both are NULL / 0 in the one-frame boundary. */
 typedef struct UlcnetModelIoInputs {
     const float *error_mag;
     const float *far_mag;
@@ -138,9 +152,12 @@ typedef struct UlcnetModelIoInputs {
     size_t value_history_elements;
     size_t logit_history_elements;
     size_t gru_hidden_elements;
+    const float *frame_reset;
+    size_t frame_reset_elements;
 } UlcnetModelIoInputs;
 
-/* `output` is planar: BINS real, then BINS imaginary. Each state *_out has the address of the input it continues
+/* `output` is planar: BINS real, then BINS imaginary (packet: the N * BINS real values, then the N * BINS imaginary ones,
+ * spectrum_ri_elements = 2 * N * BINS). Each state *_out has the address of the input it continues
  * (NULL and 0 elements when none), fixed for the life of the state: the runtime reads all state inputs before writing
  * any state output. prepare() NaN-fills `output`, so an unwritten mask is refused by enhance_spectrum(); a refused
  * frame zeroes the registered state, advances the generation and is discarded. */
@@ -163,9 +180,19 @@ typedef struct UlcnetModelIoState UlcnetModelIoState;
 int ulcnet_model_io_descriptor_default(const UlcnetGrid *grid,
                                        UlcnetModelIoDescriptor *descriptor);
 
+/* As _default for the packet boundary: layout ULCNET_MODEL_IO_PACKET_LAYOUT_VERSION, frames_per_call set. -1 (also) for
+ * a frames_per_call outside [2, ULCNET_MODEL_IO_MAX_FRAMES_PER_CALL]. */
+int ulcnet_model_io_descriptor_default_packet(const UlcnetGrid *grid, int frames_per_call,
+                                              UlcnetModelIoDescriptor *descriptor);
+
+/* Frames one graph call runs: 1 for frames_per_call 0 or 1, else the value; 0 for NULL. */
+int ulcnet_model_io_descriptor_frames(const UlcnetModelIoDescriptor *descriptor);
+
 /* Validate a descriptor against `grid`: layout version, sample_rate, fft_size, hop_size and spectrum_bins equal to
  * the grid's, far_input_mode == ULCNET_FAR_RAW, delay_depth within the exporter's bounds (not compared with
- * grid->delay_depth: the export depth is the application's); interior fields not read. 0 if valid, -1 otherwise. */
+ * grid->delay_depth: the export depth is the application's); interior fields not read. The layout and the frame count
+ * must agree: LAYOUT_VERSION with 1 frame, PACKET_LAYOUT_VERSION with 2..MAX_FRAMES_PER_CALL. 0 if valid, -1
+ * otherwise. */
 int ulcnet_model_io_descriptor_validate(
     const UlcnetGrid *grid, const UlcnetModelIoDescriptor *descriptor);
 
@@ -207,12 +234,29 @@ int ulcnet_model_io_prepare(UlcnetModelIoState *state,
                             UlcnetModelIoInputs *inputs,
                             UlcnetModelIoOutputs *outputs);
 
+/* Packet boundary (descriptor frames > 1; the one-frame calls above refuse such a state and these refuse a one-frame
+ * state): as prepare(), for N frames. The spectra are frame-major, N * spectrum_bins floats per plane, oldest frame
+ * first; events[k] != 0 marks frame k as an alignment boundary (frame_reset 1.0), N entries. Every frame's features are
+ * computed, event frames included (the graph needs finite inputs); `output` is NaN-prefilled after all of them. */
+int ulcnet_model_io_prepare_packet(UlcnetModelIoState *state,
+                                   const float *error_re, const float *error_im,
+                                   const float *far_re, const float *far_im,
+                                   const int *events,
+                                   UlcnetModelIoInputs *inputs,
+                                   UlcnetModelIoOutputs *outputs);
+
 /* Call after a successful inference; one prepare() permits one call. Checks that the accelerator wrote a finite mask
  * and, when state is registered, finite state (every registered buffer scanned whole), then applies the mask and the
  * inverse signed power into the enhanced arrays. On a non-finite value the registered state is zeroed, the generation
  * advances, the caller's outputs stay untouched and -1 is returned. */
 int ulcnet_model_io_enhance_spectrum(UlcnetModelIoState *state,
                                      float *enhanced_re, float *enhanced_im);
+
+/* As enhance_spectrum() for a packet: enhanced_re / enhanced_im hold N * spectrum_bins floats, frame-major. The
+ * frames marked as events are not written (the caller fills them with the error spectrum); the finite check covers the
+ * whole mask, event frames included. */
+int ulcnet_model_io_enhance_packet(UlcnetModelIoState *state,
+                                   float *enhanced_re, float *enhanced_im);
 
 const UlcnetModelIoDescriptor *ulcnet_model_io_descriptor(
     const UlcnetModelIoState *state);

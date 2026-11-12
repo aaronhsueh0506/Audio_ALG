@@ -53,6 +53,15 @@ self-stamping route:
         --primary-is-mic --frames 8192 --max-delay-frames 8 --format bin \\
         --output calib/align_ulcnet_d8
 
+Alignment events: the Python linear AEC reports no delay state, so the C
+stage's per-hop restarts are replayed from a record file instead:
+    python3 inference.py checkpoint.pth mic.wav far.wav out.wav \\
+        --frames-per-call 8 --events mic.events.json
+An event hop resets the model state at that hop and bypasses it (enhanced
+frame = error spectrum); N = 1 and N = 8 take the same records and the same
+edge rule (changed, or solid false -> true after an earlier hop). See
+Align_ULCNet/README.md for the record format.
+
 mic.wav / far.wav must be mono. Both are resampled to the checkpoint's sample
 rate before the linear AEC when needed; output stays at that model rate.
 
@@ -88,10 +97,12 @@ if _AUDIO_ALG_ROOT not in sys.path:
     sys.path.insert(0, _AUDIO_ALG_ROOT)
 
 from AIAEC.Align_ULCNet import AlignULCNet
+from AIAEC.Align_ULCNet.alignment_events import EVENTS_HELP
 from AIAEC._cli_common import (
     DEVICE_HELP,
     VERIFY_HELP,
     add_directory_arguments,
+    require_frames_per_call,
     require_single_or_directory,
     run_pipeline,
 )
@@ -165,6 +176,16 @@ def build_parser() -> argparse.ArgumentParser:
              'far WAV is consumed unchanged in either mode.',
     )
     parser.add_argument('--verify', action='store_true', help=VERIFY_HELP)
+    parser.add_argument(
+        '--frames-per-call', type=int, default=None, metavar='N',
+        help='run the model through the packet graph: one stream, N '
+             'consecutive STFT frames per call (range 2..64; default one '
+             'frame per call), state carried across calls, the last call '
+             'zero-completed, the output cut back to the input length. The '
+             'Python PBFDKF reports no alignment events: without --events '
+             'every packet frame is a normal frame')
+    parser.add_argument('--events', default=None, metavar='PATH',
+                        help=EVENTS_HELP)
     add_directory_arguments(parser)
     return parser
 
@@ -225,6 +246,10 @@ def main(args):
             '--delay-num-filters cannot be used with '
             '--input-is-linear-error because that mode bypasses PBFDKF'
         )
+    if getattr(args, 'events', None) and getattr(args, 'mic_dir', None):
+        raise ValueError(
+            '--events takes one record file for one clip and cannot be used '
+            'with --mic-dir')
     run_pipeline(args, _run_one)
 
 
@@ -237,6 +262,10 @@ def cli():
     parser = build_parser()
     args = parser.parse_args()
     require_single_or_directory(parser, args)
+    try:
+        require_frames_per_call('Align_ULCNet', args.frames_per_call)
+    except ValueError as error:
+        parser.error(str(error))
     main(args)
 
 

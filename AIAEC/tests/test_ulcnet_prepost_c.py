@@ -1592,7 +1592,7 @@ def test_pool_identity_moved_with_the_full_window_carve(driver):
         carve = int(re.search(
             r'^#define\s+ULCNET_PREPOST_CARVE_VERSION\s+(\d+)u',
             stream.read(), re.MULTILINE).group(1))
-    assert carve == 8
+    assert carve == 9
     # grid 16000 / 512, D == 8 (this driver's grid).
     expected = _fnv1a([16000, 512, layout, carve, 8])
     ptr_bytes = int(re.search(r'ptr_bytes=(\d+)', out).group(1))

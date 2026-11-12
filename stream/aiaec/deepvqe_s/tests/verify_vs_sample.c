@@ -1,26 +1,29 @@
-/* Verifies deepvqe_stream_pre_process/post_process against an independent re-implementation of
- * the board sample's own per-hop loop (alg_ai3_deepvqes.c's simple_thread(): int16->float mic+far
- * (no HPF) -> ac_stft_push_planar x2 -> deepvqe_prepost_pre_process_freq -> frame_open -> NPU ->
- * frame_finish/frame_bypass -> post_process_freq -> ac_istft_push_planar -> int16 saturate),
- * built directly against lib/aiaec/deepvqe_s/deepvqe_prepost.h and audiolib, never against
- * deepvqe_stream.c. Both drivers run the SAME deterministic fake accelerator (pure function of a
- * global hop counter + a force_fail flag) and must produce byte-identical PCM and an identical
- * (pre_rc, ai_rc, post_rc, written, generation) trace, hop for hop.
- *
- * Board sample read-only reference: ~/Desktop/exp/audio_sample/alg_ai3_deepvqes.c lines
- * ~1668-1745 (simple_thread's per-hop body) and ~1531 (grid: 16 kHz, n_fft 512, delay_depth 32).
- * Never edited; this file re-implements the same sequence against the public
- * lib/aiaec/deepvqe_s/deepvqe_prepost.h API instead of calling into it.
+/* Verifies deepvqe_stream.c (deepvqe_stream_pre_process/post_process) against an independent
+ * re-implementation of the same per-hop lifecycle (driver A below): int16->float mic+far (no
+ * HPF) -> ac_stft_push_planar x2 -> deepvqe_prepost_pre_process_freq -> deepvqe_prepost_frame_open
+ * -> NPU -> deepvqe_prepost_frame_finish/frame_bypass -> deepvqe_prepost_post_process_freq ->
+ * ac_istft_push_planar -> int16 saturate, built directly against
+ * lib/aiaec/deepvqe_s/deepvqe_prepost.h and audiolib, never
+ * against deepvqe_stream.c itself -- the same lib-level core deepvqe_stream.c wraps, called by
+ * hand instead of through the wrapper. Both drivers run the SAME deterministic fake accelerator
+ * (pure function of a global hop counter + a force_fail flag) and must produce byte-identical
+ * PCM and an identical (pre_rc, ai_rc, post_rc, written, generation) trace, hop for hop, at
+ * frames_per_call == 1 -- an independent-implementation cross-check of the wrapper, not a
+ * comparison against any specific caller's source file (the board sample calls
+ * aiaec_preprocess()/aiaec_postprocess(), one layer up, not deepvqe_stream_*
+ * directly; stream/aiaec/tests/test_aiaec_block.c covers that layer, including
+ * frames_per_call > 1).
  *
  * --inject-shift: delays the comparison's view of driver B's PCM by one hop, to prove this
  * harness's comparison can actually detect a divergence. Injects nothing into deepvqe_stream.c.
  *
- * --ola-matters: builds a THIRD, separate driver (C) identical to the board re-implementation
- * (driver A) except its AcStftConfig.ola is AC_OLA_ACCUMULATE instead of AC_OLA_ENV_NORM, and
- * diffs it against the real board driver (A, ENV_NORM) to prove the OLA mode itself is
- * load-bearing -- not just hop alignment. This never touches deepvqe_stream.c; DeepVqeStreamConfig
- * has no public hook to override the OLA mode, so proving this on the actual B driver isn't
- * possible without editing the production file, which this test does not do. */
+ * --ola-matters: a separate run (run_ola_matters_proof(), its own pair of driver instances, not
+ * involved in the A-vs-B comparison above) builds driver A with AC_OLA_ENV_NORM and driver C
+ * with AC_OLA_ACCUMULATE, same board_init()/board_pre()/board_post() helpers, and diffs the two
+ * to show the OLA mode itself is load-bearing -- not just hop alignment. This never touches
+ * deepvqe_stream.c; DeepVqeStreamConfig has no public hook to override the OLA mode, so proving
+ * this on the actual B driver isn't possible without editing deepvqe_stream.c, which this test
+ * does not do. */
 
 #include <stdint.h>
 #include <stdio.h>
@@ -32,24 +35,25 @@
 #include "fft_wrapper.h"
 #include "audio_stft.h"
 
-/* DEEPVQE_TIME_ORDER itself comes from deepvqe_process.h via deepvqe_stream.h -> deepvqe_prepost.h
- * -> deepvqe_process.h; used directly below instead of a local, driftable copy. */
+/* DEEPVQE_TIME_ORDER itself comes from deepvqe_process.h via deepvqe_stream.h ->
+ * deepvqe_prepost.h -> deepvqe_process.h; used directly below instead of a local, driftable
+ * copy. */
 
 /* ---- shared deterministic fake accelerator: pure function of (global hop, force_fail) ---- */
 static int shared_fake(long long ghop, int force_fail, DeepVqePrepostOutputs *out) {
     size_t i;
-    if (force_fail) return -1;   /* writes nothing: mirrors the real accelerator leaving the
-                                  * NaN-prefilled taps untouched on failure */
     for (i = 0; i < out->taps_elements; ++i)
         out->taps[i] = 0.05f * (float)(((ghop + (long long)i) % 37) - 18);
+    if (force_fail) return -1;   /* valid finite taps AND a failure status: only the status can fail the hop closed */
     /* No state registered in this test (state[id] all NULL), so state_out[*] are all NULL too --
      * nothing else to write. */
     return 0;
 }
 
-/* ---- driver: independent re-implementation of the board sample's loop, OLA mode parameterized
- * so the same code builds both the real board driver (A, ENV_NORM) and the OLA-matters driver
- * (C, ACCUMULATE). ---- */
+/* ---- driver: independent re-implementation of deepvqe_stream.c's own per-hop lifecycle, OLA
+ * mode parameterized so the same code builds run_matrix()'s reference driver (A, ACCUMULATE,
+ * matching deepvqe_stream.c) and the OLA-matters proof's two driver instances (ENV_NORM vs
+ * ACCUMULATE). ---- */
 typedef struct BoardDriver {
     DeepVqeGrid grid;
     FftHandle *fft;
@@ -166,7 +170,7 @@ static uint32_t board_generation(const BoardDriver *d) {
     return deepvqe_prepost_state_generation(d->prepost);
 }
 
-/* ---- main comparison run: board driver A (ENV_NORM, the real reference) vs. deepvqe_stream B ---- */
+/* ---- main comparison run: hand-rolled reference driver A (ACCUMULATE) vs. deepvqe_stream B ---- */
 
 typedef struct Stats {
     long long hops, mismatches, feat_mismatches;
@@ -196,14 +200,16 @@ static int run_matrix(int inject_shift) {
 
     memset(&st, 0, sizeof(st));
     memset(&spec, 0, sizeof(spec));
-    spec.sample_rate = 16000; spec.n_fft = 512; spec.delay_depth = 32;
+    spec.sample_rate = 16000; spec.n_fft = 512; spec.delay_depth = 32; spec.frames_per_call = 1;
     if (deepvqe_grid_make(&grid, &spec) != DEEPVQE_GRID_OK) {
         fprintf(stderr, "deepvqe_grid_make failed\n");
         return -1;
     }
     hop = grid.hop;
 
-    if (board_init(&A, &grid, AC_OLA_ENV_NORM) != 0) { fprintf(stderr, "board_init failed\n"); return -1; }
+    /* ACCUMULATE, matching deepvqe_stream.c -- the reference B is compared against (run_ola_matters_proof()
+     * contrasts it with ENV_NORM). */
+    if (board_init(&A, &grid, AC_OLA_ACCUMULATE) != 0) { fprintf(stderr, "board_init failed\n"); return -1; }
 
     memset(&cfg, 0, sizeof(cfg));
     cfg.grid = grid;
@@ -264,8 +270,9 @@ static int run_matrix(int inject_shift) {
             post_rc_a = board_post(&A, ai_rc, pcm_out_a, &written_a);
             post_rc_b = deepvqe_stream_post_process(B, ai_rc, pcm_out_b);
             /* B doesn't expose `written` directly; infer it from post_rc_b per deepvqe_stream.h's
-             * documented 3-way split (1 => written==hop, 0 => written==0/ENV_NORM startup,
-             * -1 => post_process_freq contract error, written undefined/not applicable). */
+             * documented 3-way split (1 => written==hop; 0 => written==0, the frames_per_call > 1
+             * pre-roll case, never reached here since frames_per_call == 1; -1 => post_process_freq
+             * contract error, written undefined/not applicable). */
             written_b = (post_rc_b == 1) ? hop : (post_rc_b == 0 ? 0 : -1);
 
             if (post_rc_a != post_rc_b) {
@@ -277,15 +284,9 @@ static int run_matrix(int inject_shift) {
                 st.mismatches++;
             }
             /* Explicit assertion of the documented return-code pattern, not just "PCM happens to
-             * be zero": hop 0 of each phase must be post_rc == 0 (ENV_NORM's first-push silence);
-             * every other non-faulted hop must be post_rc == 1. */
-            if (hip == 0) {
-                if (post_rc_a != 0 || post_rc_b != 0) {
-                    fprintf(stderr, "hop %lld: expected post_rc==0 (ENV_NORM first push) on BOTH "
-                                    "sides, got A=%d B=%d\n", ghop, post_rc_a, post_rc_b);
-                    st.mismatches++;
-                }
-            } else if (!force_fail) {
+             * be zero": AC_OLA_ACCUMULATE has no first-push special case, so every non-faulted
+             * hop from hop 0 onward must be post_rc == 1 on both sides. */
+            if (!force_fail) {
                 if (post_rc_a != 1 || post_rc_b != 1) {
                     fprintf(stderr, "hop %lld: expected post_rc==1 on BOTH sides, got A=%d B=%d\n",
                            ghop, post_rc_a, post_rc_b);
@@ -342,9 +343,10 @@ static int run_matrix(int inject_shift) {
             st.generation_advanced_on_bypass == 0) ? 0 : 1;
 }
 
-/* ---- OLA-matters proof: driver A (ENV_NORM, the real board reference) vs. driver C
- * (ACCUMULATE) on IDENTICAL inputs and an identical fake. Both are independent re-implementations
- * built by this test file; deepvqe_stream.c is never touched or involved in this comparison. ---- */
+/* ---- OLA-matters proof: driver A (AC_OLA_ENV_NORM) vs. driver C (AC_OLA_ACCUMULATE) on
+ * IDENTICAL inputs and an identical fake, to show the OLA mode itself changes the output (not
+ * just hop alignment). Both are independent re-implementations built by this test file;
+ * deepvqe_stream.c is never touched or involved in this comparison. ---- */
 static int run_ola_matters_proof(void) {
     DeepVqeGridSpec spec;
     DeepVqeGrid grid;
@@ -356,7 +358,7 @@ static int run_ola_matters_proof(void) {
     const long long hops = DEEPVQE_TIME_ORDER + 4;
 
     memset(&spec, 0, sizeof(spec));
-    spec.sample_rate = 16000; spec.n_fft = 512; spec.delay_depth = 32;
+    spec.sample_rate = 16000; spec.n_fft = 512; spec.delay_depth = 32; spec.frames_per_call = 1;
     if (deepvqe_grid_make(&grid, &spec) != DEEPVQE_GRID_OK) return -1;
     hop = grid.hop;
 
@@ -404,9 +406,92 @@ static int run_ola_matters_proof(void) {
                         "cannot prove the mode is load-bearing\n");
         return 1;
     }
-    printf("ola-matters: %lld/%lld hops diverged between ENV_NORM (real board reference) and "
-          "ACCUMULATE -- OLA mode is confirmed load-bearing\n", mismatches, hops);
+    printf("ola-matters: %lld/%lld hops diverged between ENV_NORM and ACCUMULATE -- OLA mode is "
+          "confirmed load-bearing\n", mismatches, hops);
     return 0;
+}
+
+/* ---- fail-closed oracle: the stream against an STFT -> ISTFT chain that never sees the library's bypass ----
+ * An identity accelerator (CCM taps = 1 + 0j at delay 0, centre frequency) makes the stream's output the mic one hop
+ * late. The oracle is that chain built by hand from ac_stft/ac_istft: mic spectrum in, the same spectrum out, except a
+ * ZERO spectrum at the failed hop. The stream must equal it sample for sample (+-1 LSB, int16 conversion), so a failed
+ * hop that kept the mic spectrum (a passthrough), or one that ignored a reported infer_status, differs from the oracle
+ * by thousands of LSB. Three failures: a reported infer_status != 0 with valid finite taps, non-finite taps with
+ * infer_status 0 (refused), and both. The oracle is independent of deepvqe_prepost_frame_bypass(). */
+static void identity_taps(DeepVqePrepostOutputs *out) {
+    const size_t tapn = 9, bins = out->taps_elements / (tapn * 2u);
+    size_t b;
+    memset(out->taps, 0, out->taps_elements * sizeof(float));
+    for (b = 0; b < bins; ++b) out->taps[b * tapn * 2u + 1u * 2u] = 1.0f;
+}
+
+static int run_fail_closed_oracle(int kind) {   /* 0 status only, 1 non-finite taps, 2 both */
+    DeepVqeGridSpec spec;
+    DeepVqeGrid grid;
+    BoardDriver O;
+    DeepVqeStreamConfig cfg;
+    DeepVqeStreamMemReq req;
+    DeepVqeStream *B;
+    void *pool_b = NULL;
+    int16_t *mic_in, *prev_mic, *far_in, *pcm_b, *pcm_o;
+    const long long hops = DEEPVQE_TIME_ORDER + 12, fault_hop = DEEPVQE_TIME_ORDER + 4;
+    long long ghop, bad = 0, discriminating = 0;
+    int hop, k;
+
+    memset(&spec, 0, sizeof(spec));
+    spec.sample_rate = 16000; spec.n_fft = 512; spec.delay_depth = 32; spec.frames_per_call = 1;
+    if (deepvqe_grid_make(&grid, &spec) != DEEPVQE_GRID_OK) return 1;
+    hop = grid.hop;
+    if (board_init(&O, &grid, AC_OLA_ACCUMULATE) != 0) return 1;
+    memset(&cfg, 0, sizeof(cfg));
+    cfg.grid = grid;
+    if (deepvqe_stream_get_mem_size(&cfg, &req) != 0 || posix_memalign(&pool_b, (size_t)req.alignment, (size_t)req.bytes) != 0) return 1;
+    B = deepvqe_stream_init_ex(&cfg, pool_b, (size_t)req.bytes, &req);
+    if (!B) return 1;
+    mic_in = calloc((size_t)hop, sizeof(int16_t)); prev_mic = calloc((size_t)hop, sizeof(int16_t));
+    far_in = calloc((size_t)hop, sizeof(int16_t));
+    pcm_b = calloc((size_t)hop, sizeof(int16_t)); pcm_o = calloc((size_t)hop, sizeof(int16_t));
+
+    for (ghop = 0; ghop < hops; ++ghop) {
+        DeepVqeHopIO io;
+        const int fail = ghop == fault_hop;
+        long long maxd = 0;
+
+        memcpy(prev_mic, mic_in, (size_t)hop * sizeof(int16_t));
+        for (k = 0; k < hop; ++k) mic_in[k] = (int16_t)(((((long long)ghop * hop + k) * 977) % 20001 - 10000) / 2);
+        /* the oracle: mic spectrum through, a zero spectrum at the failed hop */
+        for (k = 0; k < hop; ++k) O.mic_f[k] = (float)mic_in[k] / 32768.0f;
+        ac_stft_push_planar(O.stft_mic, O.mic_f, O.mic_re, O.mic_im);
+        if (fail) { memset(O.mic_re, 0, (size_t)grid.n_bins * sizeof(float)); memset(O.mic_im, 0, (size_t)grid.n_bins * sizeof(float)); }
+        if (ac_istft_push_planar(O.istft, O.mic_re, O.mic_im, O.hop_out) != hop) { bad++; continue; }
+        for (k = 0; k < hop; ++k) {
+            float v = O.hop_out[k] * 32768.0f;
+            pcm_o[k] = (int16_t)(v > 32767.0f ? 32767.0f : v < -32768.0f ? -32768.0f : v);
+        }
+
+        if (deepvqe_stream_pre_process(B, mic_in, far_in, &io) != 1) { bad++; continue; }
+        identity_taps(&io.outputs);
+        if (fail && kind != 0) io.outputs.taps[io.outputs.taps_elements / 3] = NAN;
+        if (deepvqe_stream_post_process(B, fail && kind != 1 ? -1 : 0, pcm_b) < 0) { bad++; continue; }
+        for (k = 0; k < hop; ++k) {
+            long long d = (long long)pcm_b[k] - pcm_o[k];
+            if (d < 0) d = -d;
+            if (d > maxd) maxd = d;
+        }
+        if (maxd > 1) {
+            fprintf(stderr, "fail-closed oracle (kind %d) hop %lld: stream differs from the zero-spectrum oracle by %lld LSB%s\n", kind, ghop, maxd,
+                    fail ? " (the failed hop)" : "");
+            bad++;
+        }
+        if (fail) {   /* the oracle's failed hop is far from the hop an identity run would return (the previous mic hop) */
+            for (k = 0; k < hop; ++k) { long long d = (long long)pcm_o[k] - prev_mic[k]; if (d < 0) d = -d; if (d > 1000) ++discriminating; }
+        }
+    }
+    if (discriminating < hop / 4) { fprintf(stderr, "fail-closed oracle (kind %d): the failed hop is not distinguishable from a normal one (%lld samples)\n", kind, discriminating); bad++; }
+    free(mic_in); free(prev_mic); free(far_in); free(pcm_b); free(pcm_o); free(pool_b);
+    printf("fail-closed oracle (kind %d: %s): %lld deviations %s\n", kind,
+           kind == 0 ? "infer_status only" : kind == 1 ? "non-finite taps" : "both", bad, bad == 0 ? "PASS" : "FAIL");
+    return bad == 0 ? 0 : 1;
 }
 
 int main(int argc, char **argv) {
@@ -426,5 +511,5 @@ int main(int argc, char **argv) {
         return 0;
     }
 
-    return run_matrix(0) ? 1 : 0;
+    return (run_matrix(0) ? 1 : 0) | run_fail_closed_oracle(0) | run_fail_closed_oracle(1) | run_fail_closed_oracle(2);
 }

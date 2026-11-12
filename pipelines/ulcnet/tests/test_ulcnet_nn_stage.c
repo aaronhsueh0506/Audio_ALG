@@ -54,8 +54,11 @@ typedef struct ModelState {
     const float* want_far_re; const float* want_far_im;
 } ModelState;
 
-typedef enum { M_COPY, M_FAIL, M_HALF_WRITE, M_NAN, M_SCALE } ModelKind;
+typedef enum { M_COPY, M_FAIL, M_HALF_WRITE, M_NAN, M_SCALE, M_BAND } ModelKind;
 static ModelKind g_kind;
+
+/* The band mask M_BAND applies: a real gain that varies from bin to bin. */
+static float band_gain(int k) { return 0.25f + 0.75f * (float)(k % 9) / 8.0f; }
 
 static int model_infer(void* user, const float* er, const float* ei,
                        const float* fr, const float* fi, float* orr, float* oi) {
@@ -83,6 +86,9 @@ static int model_infer(void* user, const float* er, const float* ei,
         case M_SCALE:
             for (k = 0; k < BINS; ++k) { orr[k] = 0.5f * er[k]; oi[k] = 0.5f * ei[k]; }
             return 0;
+        case M_BAND:
+            for (k = 0; k < BINS; ++k) { orr[k] = band_gain(k) * er[k]; oi[k] = band_gain(k) * ei[k]; }
+            return 0;
         default:
             memcpy(orr, er, sizeof(float) * BINS);
             memcpy(oi, ei, sizeof(float) * BINS);
@@ -103,6 +109,8 @@ static UlcnetModel make_model(ModelState* st) {
 }
 
 /* ---- an independent STFT/WOLA chain: own FFT handles, own windows ---- */
+/* (overlap-add synthesis: each hop is this frame's first half plus the previous frame's second
+ * half, nothing held back -- hop #0 is already output) */
 
 typedef struct Ref {
     AcStft* stft;
@@ -114,7 +122,7 @@ static int ref_init(Ref* r) {
     AcStftConfig sc;
     size_t b1, b2;
     ac_stft_config_default(&sc, g_grid.n_fft);
-    sc.ola = AC_OLA_ENV_NORM;
+    sc.ola = AC_OLA_ACCUMULATE;
     b1 = ac_stft_get_mem_size(&sc);
     b2 = ac_istft_get_mem_size(&sc);
     r->m1 = pool_of(b1, 0);
@@ -172,7 +180,7 @@ static void test_identity_all_entries(void) {
     float err[HOP_MAX], far[HOP_MAX], re[BINS_MAX], im[BINS_MAX], want[HOP_MAX];
     float o1[HOP_MAX], o2[HOP_MAX], o3[HOP_MAX];
     Complex c[BINS_MAX];
-    int h, i, bad_planar = 0, bad_complex = 0, bad_timed = 0, hop0_zero = 1;
+    int h, i, bad_planar = 0, bad_complex = 0, bad_timed = 0;
     size_t hop_bytes = (size_t)HOP * sizeof(float);
     double energy = 0.0;
     CHECK(planar && cplx && timed && ref_init(&ref) == 0, "identity: setup");
@@ -184,10 +192,7 @@ static void test_identity_all_entries(void) {
         (void)ac_stft_push_planar(ref.stft, err, re, im);
         interleave(c, re, im);
         /* with no model the frame is the identity: the expected hop is the reference WOLA */
-        {
-            int w = ac_istft_push_planar(ref.istft, re, im, want);
-            if (w == 0) memset(want, 0, hop_bytes);
-        }
+        if (ac_istft_push_planar(ref.istft, re, im, want) != HOP) bad_planar++;
         if (ulcnet_nn_stage_begin(planar, re, im, far, ev(0, 0)) != 0 ||
             ulcnet_nn_stage_process(planar, o1) != 0) bad_planar++;
         if (ulcnet_nn_stage_begin_complex(cplx, c, far, ev(0, 0)) != 0 ||
@@ -197,13 +202,11 @@ static void test_identity_all_entries(void) {
         if (memcmp(o1, want, hop_bytes) != 0) bad_planar++;
         if (memcmp(o2, want, hop_bytes) != 0) bad_complex++;
         if (memcmp(o3, want, hop_bytes) != 0) bad_timed++;
-        if (h == 0) for (i = 0; i < HOP; ++i) if (o1[i] != 0.0f || o2[i] != 0.0f || o3[i] != 0.0f) hop0_zero = 0;
         if (h > 0) for (i = 0; i < HOP; ++i) energy += fabs((double)o1[i]);
     }
     CHECK(bad_planar == 0, "identity: planar entry equals the independent STFT/WOLA chain bit for bit");
     CHECK(bad_complex == 0, "identity: interleaved entry equals it too");
     CHECK(bad_timed == 0, "identity: time-domain entry (own error STFT) equals it too");
-    CHECK(hop0_zero, "identity: hop #0 is exactly zero");
     CHECK(energy > 1.0, "identity: the output carries signal");
     ref_free(&ref);
     free(p1); free(p2); free(p3);
@@ -411,9 +414,11 @@ static void test_reset_and_sequence(void) {
     CHECK(ulcnet_nn_stage_nn_end(s, 0) == 0, "sequence: nn_end");
     CHECK(ulcnet_nn_stage_nn_begin(s, &job) == 0, "sequence: no second frame in a hop");
     CHECK(ulcnet_nn_stage_end(s, first) == 0, "sequence: end (hop #0)");
-    for (k = 0; k < HOP; ++k) if (first[k] != 0.0f) break;
-    CHECK(k == HOP, "sequence: hop #0 is zero");
-
+    {   /* hop #0 is real output: this spectrum's first synthesis half over a zero history */
+        double e = 0.0;
+        for (k = 0; k < HOP; ++k) e += fabs((double)first[k]);
+        CHECK(e > 1e-3, "sequence: hop #0 carries the first half of the first frame's synthesis");
+    }
     /* a frame left open, and a frame never fetched, are the identity and leave the stage usable */
     for (h = 0; h < 3; ++h) {
         CHECK(ulcnet_nn_stage_begin(s, re, im, far, ev(0, 0)) == 0, "sequence: begin (open frame case)");
@@ -431,8 +436,8 @@ static void test_reset_and_sequence(void) {
     CHECK(ulcnet_nn_stage_begin(s, re, im, far, ev(0, 0)) == 0, "reset: begin after reset");
     CHECK(ulcnet_nn_stage_nn_begin(s, &job) == 1, "reset: the pending reprime was dropped, the model runs");
     CHECK(ulcnet_nn_stage_nn_end(s, 0) == 0 && ulcnet_nn_stage_end(s, out) == 0, "reset: finish the hop");
-    for (k = 0; k < HOP; ++k) if (out[k] != 0.0f) break;
-    CHECK(k == HOP, "reset: the next hop is hop #0 (zeros)");
+    CHECK(memcmp(out, first, (size_t)HOP * sizeof(float)) == 0,
+          "reset: the next hop is hop #0 again (same input, same output as the first hop of a new stage)");
     ulcnet_nn_stage_reset(NULL);
     free(pool);
     free(before);
@@ -619,6 +624,21 @@ static void test_model_gate(void) {
         bad.io_descriptor = &aligned;
         CHECK(ulcnet_nn_stage_set_model(s, &bad) == -1, "gate: a descriptor with another bin count is refused");
     }
+    {   /* a packet descriptor (layout 19, N > 1) validates against the grid but is not a one-frame graph: refused */
+        UlcnetModelIoDescriptor packet;
+        static const int counts[] = { 2, 8, ULCNET_MODEL_IO_MAX_FRAMES_PER_CALL };
+        size_t c;
+        for (c = 0; c < sizeof counts / sizeof counts[0]; ++c) {
+            CHECK(ulcnet_model_io_descriptor_default_packet(&g_grid, counts[c], &packet) == 0 &&
+                  packet.layout_version == ULCNET_MODEL_IO_PACKET_LAYOUT_VERSION &&
+                  ulcnet_model_io_descriptor_validate(&g_grid, &packet) == 0 &&
+                  ulcnet_model_io_descriptor_frames(&packet) == counts[c],
+                  "gate: a layout-19 descriptor builds and validates for N = 2, 8 and the maximum");
+            bad = m;
+            bad.io_descriptor = &packet;
+            CHECK(ulcnet_nn_stage_set_model(s, &bad) == -1, "gate: a packet descriptor (layout 19, N > 1) is refused");
+        }
+    }
     /* the refused models left the installed one in place */
     for (k = 0; k < BINS; ++k) { re[k] = 0.5f; im[k] = 0.25f; }
     fill_hop(far, HOP);
@@ -635,6 +655,166 @@ static void test_model_gate(void) {
     free(pool);
 }
 
+
+/* ---- independent per-sample accumulate reference: direct inverse DFT in double, own window ---- */
+
+typedef struct AccRef {
+    double saved[HOP_MAX];   /* second half of the previous frame's windowed IFFT */
+    double win[2 * HOP_MAX], cs[2 * HOP_MAX], sn[2 * HOP_MAX];
+} AccRef;
+
+static void accref_init(AccRef* a) {
+    int n, N = g_grid.n_fft;
+    const double pi = 3.14159265358979323846;
+    memset(a, 0, sizeof *a);
+    for (n = 0; n < N; ++n) {
+        a->win[n] = sqrt(0.5 * (1.0 - cos(2.0 * pi * (double)n / (double)N)));   /* periodic sqrt-Hann */
+        a->cs[n] = cos(2.0 * pi * (double)n / (double)N);
+        a->sn[n] = sin(2.0 * pi * (double)n / (double)N);
+    }
+}
+
+/* hop = frame's first half + saved; saved = frame's second half. The spectrum is unnormalised
+ * (the inverse carries 1/N); DC and Nyquist take their real parts. */
+static void accref_hop(AccRef* a, const float* re, const float* im, float* out) {
+    int n, k, N = g_grid.n_fft, H = HOP;
+    double y[2 * HOP_MAX];
+    for (n = 0; n < N; ++n) {
+        double acc = (double)re[0] + ((n & 1) ? -1.0 : 1.0) * (double)re[N / 2];
+        for (k = 1; k < N / 2; ++k) {
+            int idx = (int)(((long long)k * n) % N);
+            acc += 2.0 * ((double)re[k] * a->cs[idx] - (double)im[k] * a->sn[idx]);
+        }
+        y[n] = a->win[n] * acc / (double)N;
+    }
+    for (n = 0; n < H; ++n) {
+        out[n] = (float)(y[n] + a->saved[n]);
+        a->saved[n] = y[H + n];
+    }
+}
+
+/* Drives a time-domain-entry stage with the band-mask model and, hop for hop, an independent
+ * analysis + (model applied where the stage actually ran it) + (a) the audiolib accumulate chain
+ * and (b) the direct-DFT accumulate reference. replay != 0 resets the stage and the references
+ * after hop n and feeds the same hops again; both passes are compared with the references, and the
+ * second pass bit for bit with the first. */
+typedef struct RefRun {
+    double max_err;            /* worst |stage - direct-DFT reference| over every hop */
+    double peak0;              /* peak |hop #0| */
+    int chain_bad;             /* hops not bit-equal to the audiolib accumulate chain */
+    int replay_bad;            /* hops of the replay not bit-equal to the first pass */
+    int infer_calls[2], reset_calls[2];
+    int inferred_at[2][96];
+} RefRun;
+
+static int run_vs_reference(const Sched* sc, int n, int replay, RefRun* r) {
+    void* pool;
+    UlcnetNnStage* s = make_stage(1, &pool, 0);
+    ModelState st;
+    UlcnetModel m = make_model(&st);
+    static float first_pass[96 * HOP_MAX];
+    Ref ref;
+    AccRef acc;
+    float err[HOP_MAX], far[HOP_MAX], out[HOP_MAX], want[HOP_MAX], dft[HOP_MAX];
+    float re[BINS_MAX], im[BINS_MAX], mre[BINS_MAX], mim[BINS_MAX];
+    int pass, h, k, passes = replay ? 2 : 1;
+    memset(r, 0, sizeof *r);
+    if (!s || n > 96 || ref_init(&ref) != 0) { free(pool); return -1; }
+    accref_init(&acc);
+    memset(&st, 0, sizeof st);
+    g_kind = M_BAND;
+    if (ulcnet_nn_stage_set_model(s, &m) != 0) { free(pool); ref_free(&ref); return -1; }
+    for (pass = 0; pass < passes; ++pass) {
+        if (pass == 1) {
+            ulcnet_nn_stage_reset(s);
+            ref_free(&ref);
+            if (ref_init(&ref) != 0) { free(pool); return -1; }
+            accref_init(&acc);
+            r->infer_calls[0] = st.infer_calls; r->reset_calls[0] = st.reset_calls;
+            st.infer_calls = 0; st.reset_calls = 0;
+        }
+        g_lcg = 77u;
+        for (h = 0; h < n; ++h) {
+            int before = st.infer_calls, ran;
+            fill_hop(err, HOP);
+            fill_hop(far, HOP);
+            if (ulcnet_nn_stage_begin_time(s, err, far, sched_event(sc, h)) != 0 ||
+                ulcnet_nn_stage_process(s, out) != 0) { free(pool); ref_free(&ref); return -1; }
+            ran = st.infer_calls > before;
+            r->inferred_at[pass][h] = ran;
+            (void)ac_stft_push_planar(ref.stft, err, re, im);
+            if (ran) for (k = 0; k < BINS; ++k) { mre[k] = band_gain(k) * re[k]; mim[k] = band_gain(k) * im[k]; }
+            else memcpy(mre, re, sizeof(float) * BINS), memcpy(mim, im, sizeof(float) * BINS);
+            if (ac_istft_push_planar(ref.istft, mre, mim, want) != HOP ||
+                memcmp(want, out, (size_t)HOP * sizeof(float)) != 0) r->chain_bad++;
+            accref_hop(&acc, mre, mim, dft);
+            for (k = 0; k < HOP; ++k) {
+                double d = fabs((double)out[k] - (double)dft[k]);
+                if (d > r->max_err) r->max_err = d;
+            }
+            if (pass == 0 && h == 0)
+                for (k = 0; k < HOP; ++k) if (fabs((double)out[k]) > r->peak0) r->peak0 = fabs((double)out[k]);
+            if (pass == 0) memcpy(first_pass + (size_t)h * HOP, out, (size_t)HOP * sizeof(float));
+            else if (memcmp(first_pass + (size_t)h * HOP, out, (size_t)HOP * sizeof(float)) != 0) r->replay_bad++;
+        }
+    }
+    r->infer_calls[passes - 1] = st.infer_calls; r->reset_calls[passes - 1] = st.reset_calls;
+    ref_free(&ref);
+    free(pool);
+    return 0;
+}
+
+static void test_accumulate_reference(void) {
+    enum { N = 40 };
+    RefRun r;
+    Sched sc;
+    int k, h, ev_ok;
+    const double tol = 2e-6;
+
+    /* first hop and steady state: solid from hop #0, no event -- one inference on every hop,
+     * including the first, and a first hop that is real output */
+    memset(&sc, 0, sizeof sc);
+    for (k = 0; k < 8; ++k) sc.changed_at[k] = -1;
+    sc.solid_off_at = -1; sc.solid_back_at = -1; sc.solid_from = 0;
+    CHECK(run_vs_reference(&sc, N, 0, &r) == 0, "accumulate: first-hop run");
+    printf("  accumulate reference: first hop peak %.6f, worst |stage - direct DFT| %.3g over %d hops\n",
+           r.peak0, r.max_err, N);
+    CHECK(r.peak0 > 0.01, "accumulate: hop #0 is real output (peak well above zero)");
+    CHECK(r.max_err < tol, "accumulate: every hop equals the direct-DFT per-sample accumulate reference");
+    CHECK(r.chain_bad == 0, "accumulate: every hop equals the audiolib accumulate chain bit for bit");
+    CHECK(r.infer_calls[0] == N && r.reset_calls[0] == 0 && r.inferred_at[0][0] == 1,
+          "accumulate: the first hop sends the model one frame; one inference per hop after it");
+
+    /* mid-stream events: a generation change (hop 10) and solid dropping then rising again (20..30).
+     * The event hops run the identity, the overlap of the previous frame carries through them. */
+    memset(&sc, 0, sizeof sc);
+    for (k = 0; k < 8; ++k) sc.changed_at[k] = -1;
+    sc.solid_from = 0; sc.solid_off_at = 20; sc.solid_back_at = 30;
+    sc.changed_at[0] = 10;
+    CHECK(run_vs_reference(&sc, N, 0, &r) == 0, "events: run");
+    CHECK(r.max_err < tol && r.chain_bad == 0,
+          "events: PCM through a generation change and a relock equals the continuous accumulate reference");
+    CHECK(r.reset_calls[0] == 2 && r.infer_calls[0] == N - 2 * ULCNET_NN_STAGE_REPRIME_FRAMES,
+          "events: one model reset and no inference on each event hop");
+    ev_ok = 1;
+    for (h = 10; h < 10 + ULCNET_NN_STAGE_REPRIME_FRAMES; ++h) if (r.inferred_at[0][h]) ev_ok = 0;
+    for (h = 30; h < 30 + ULCNET_NN_STAGE_REPRIME_FRAMES; ++h) if (r.inferred_at[0][h]) ev_ok = 0;
+    CHECK(ev_ok && r.inferred_at[0][10 + ULCNET_NN_STAGE_REPRIME_FRAMES] == 1,
+          "events: the event hop bypasses the model and the next hop runs it");
+
+    /* full stage reset after non-zero overlap: replaying the same hops equals the first pass bit
+     * for bit and equals references restarted from zero */
+    memset(&sc, 0, sizeof sc);
+    for (k = 0; k < 8; ++k) sc.changed_at[k] = -1;
+    sc.solid_off_at = -1; sc.solid_back_at = -1; sc.solid_from = 0;
+    sc.changed_at[0] = 6;
+    CHECK(run_vs_reference(&sc, 24, 1, &r) == 0, "reset: replay run");
+    CHECK(r.max_err < tol && r.chain_bad == 0, "reset: both passes equal the references (the second restarted from zero)");
+    CHECK(r.replay_bad == 0, "reset: the replay after ulcnet_nn_stage_reset() equals the first pass bit for bit");
+    CHECK(r.infer_calls[0] == r.infer_calls[1] && r.reset_calls[1] >= 1 + 0 && r.inferred_at[1][0] == r.inferred_at[0][0],
+          "reset: the replay sends the model the same frames as a new stage");
+}
+
 int main(void) {
     size_t g;
     for (g = 0; g < sizeof k_grids / sizeof k_grids[0]; ++g) {
@@ -646,6 +826,7 @@ int main(void) {
         printf("grid %d Hz / fft %d / hop %d / %d bins\n", g_grid.sample_rate, g_grid.n_fft,
                g_grid.hop, g_grid.n_bins);
         test_identity_all_entries();
+        test_accumulate_reference();
         test_counting_and_events();
         test_model_policy();
         test_model_sees_the_hop();

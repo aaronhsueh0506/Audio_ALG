@@ -88,12 +88,24 @@ class StreamConv2dCell:
         if self._window is None:
             b, c, _, f = x.shape
             self._window = x.new_zeros(b, c, self.window, f)
-        conv_input = torch.cat(
-            (self._window[:, :, 1:self.window], x), dim=2)
+        # The window's one allowed Slice consumer (checked by the in-place
+        # state contract) -- named once so the T_new > 1 branch below reads
+        # it again instead of slicing self._window a second time.
+        window_tail = self._window[:, :, 1:self.window]
+        conv_input = torch.cat((window_tail, x), dim=2)
         if conv_input.shape[2] == self.window:
             self._window = conv_input
         else:
-            self._window = conv_input[:, :, -self.window:]
+            # T_new > 1: conv_input is longer than the window, and its
+            # trimmed tail must still be produced by a Concat, not a bare
+            # Slice (the in-place state-output contract) -- split at the
+            # carried-old/all-new boundary, the same old-tail + new-frame
+            # shape the T_new == 1 branch above already produces.
+            new_keep = min(self.window, x.shape[2])
+            old_keep = self.window - new_keep
+            old_tail = window_tail[:, :, window_tail.shape[2] - old_keep :]
+            new_tail = x[:, :, x.shape[2] - new_keep :]
+            self._window = torch.cat((old_tail, new_tail), dim=2)
         padded = F.pad(conv_input, (self.freq_left, self.freq_right, 0, 0))
         return self.conv(padded)
 
@@ -158,9 +170,16 @@ class StreamGRUCell:
 class DelayRingCell:
     """Streaming twin of :func:`aiaec_common.causal_delay_stack`.
 
-    Keeps the ``delays`` most recent frames of a ``[B, C, F]`` feature; slot
-    ``d`` of the returned ``[B, C, 1, delays, F]`` stack holds ``x[t - d]``
-    (zero before stream start, matching the offline left zero pad).
+    Keeps the ``delays`` most recent frames of a ``[B, C, F]`` feature.
+    ``step`` takes one frame (``[B, C, F]`` or ``[B, C, 1, F]``) and returns
+    ``[B, C, 1, delays, F]`` with slot ``d`` holding ``x[t - d]`` (zero before
+    stream start, matching the offline left zero pad) -- this one-frame path
+    is byte-for-byte the original code, unchanged, since every existing
+    caller still uses it. Given ``[B, C, T_new, F]`` with ``T_new > 1`` (a
+    multi-frame accelerator call), it instead returns ``[B, C, T_new, delays,
+    F]``: slot ``i`` of the new axis is the ring exactly as it stood after
+    frame ``t + i`` was pushed, i.e. the same per-frame output as calling
+    this method ``T_new`` times with one frame each.
     """
 
     def __init__(self, delays: int):
@@ -174,16 +193,47 @@ class DelayRingCell:
 
     def step(self, frame: Tensor) -> Tensor:
         if frame.ndim == 4:
-            if frame.shape[2] != 1:
-                raise ValueError("DelayRingCell takes one frame per step")
-            frame = frame[:, :, 0]
+            t_new = frame.shape[2]
+            if t_new == 1:
+                frame = frame[:, :, 0]
+        elif frame.ndim == 3:
+            t_new = 1
+        else:
+            raise ValueError("DelayRingCell expects [B,C,F] or [B,C,T,F]")
         if self._ring is None:
-            b, c, f = frame.shape
+            if t_new == 1:
+                b, c, f = frame.shape
+            else:
+                b, c, _, f = frame.shape
             self._ring = frame.new_zeros(b, c, self.delays, f)
-        self._ring = torch.cat(
-            (frame.unsqueeze(2), self._ring[:, :, : self.delays - 1]), dim=2,
+        if t_new == 1:
+            self._ring = torch.cat(
+                (frame.unsqueeze(2), self._ring[:, :, : self.delays - 1]), dim=2,
+            )
+            return self._ring.unsqueeze(2)
+        # history: the ring's own single Slice consumer, unchanged from the
+        # one-frame path above regardless of T_new -- everything below reads
+        # its output, never the ring state tensor itself again.
+        history = self._ring[:, :, : self.delays - 1]
+        full = torch.cat((history.flip(2), frame), dim=2)   # chronological
+        # Tensor.unfold has no ONNX exporter support; the same sliding
+        # window, one Slice+Flip per output position, stacked on a new axis,
+        # traces to Slice/Concat like every other cell here.
+        windows = torch.stack(
+            [full[:, :, i : i + self.delays].flip(2) for i in range(t_new)],
+            dim=2,
         )
-        return self._ring.unsqueeze(2)
+        # The new ring state must be produced by a Concat, not a bare Slice
+        # of `windows` (the in-place state-output contract): same newest-
+        # kept-new + oldest-kept-old split as the T_new == 1 branch, and
+        # `history` (not `self._ring` again) is the sole second operand, so
+        # the ring input keeps its one required Slice consumer.
+        new_keep = min(self.delays, t_new)
+        old_keep = self.delays - new_keep
+        new_part = frame[:, :, frame.shape[2] - new_keep :].flip(2)
+        old_part = history[:, :, :old_keep]
+        self._ring = torch.cat((new_part, old_part), dim=2)
+        return windows
 
     def state_tensors(self) -> Dict[str, Tensor]:
         return {} if self._ring is None else {"ring": self._ring}
@@ -195,7 +245,12 @@ class FrameDelayAttentionCell:
     State: key ring, value ring (``max_delay_frames`` frames each, newest
     first) and the score conv's five-frame logit window (oldest first).  The
     per-frame arithmetic keeps the offline multiply-then-sum order, so
-    outputs match ``forward`` exactly.
+    outputs match ``forward`` exactly. ``step`` takes one frame (``mic``/
+    ``far`` time axis == 1, the original contract) or ``T_new > 1`` frames at
+    once; every op below is already batched over that axis (the rings via
+    :class:`DelayRingCell`, the score conv via :class:`StreamConv2dCell`,
+    softmax/the weighted sums elementwise per output frame), so the T_new > 1
+    result is the same per-frame output as T_new calls of one frame each.
     """
 
     def __init__(self, attention: FrameDelayAttention):
@@ -211,10 +266,10 @@ class FrameDelayAttentionCell:
 
     def step(self, mic: Tensor, far: Tensor) -> Tuple[Tensor, Tensor]:
         att = self.attention
-        q = att.query(mic)                            # [B,H,1,F]
-        k_delayed = self.key_ring.step(att.key(far))  # [B,H,1,D,F]
-        logits = (q.unsqueeze(3) * k_delayed).sum(dim=-1)   # [B,H,1,D]
-        logits = self.score_cell.step(logits).squeeze(1)    # [B,1,D]
+        q = att.query(mic)                            # [B,H,T,F]
+        k_delayed = self.key_ring.step(att.key(far))  # [B,H,T,D,F]
+        logits = (q.unsqueeze(3) * k_delayed).sum(dim=-1)   # [B,H,T,D]
+        logits = self.score_cell.step(logits).squeeze(1)    # [B,T,D]
         distribution = torch.softmax(logits, dim=-1)
         v_delayed = self.value_ring.step(att.value(far))
         aligned = (v_delayed * distribution[:, None, :, :, None]).sum(dim=3)

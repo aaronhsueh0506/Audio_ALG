@@ -43,8 +43,13 @@ static int state_mode(const UlcnetStreamConfig *cfg) {
     return any_set ? 1 : 0;
 }
 
+static int cfg_frames(const UlcnetStreamConfig *cfg) {
+    return cfg->frames_per_call > 1 ? cfg->frames_per_call : 1;
+}
+
 static int cfg_valid(const UlcnetStreamConfig *cfg) {
     if (!cfg) return 0;
+    if (cfg->frames_per_call < 0 || cfg->frames_per_call > ULCNET_MODEL_IO_MAX_FRAMES_PER_CALL) return 0;
     if (ulcnet_grid_validate(&cfg->grid) != ULCNET_GRID_OK) return 0;
     if (state_mode(cfg) < 0) return 0;
     return 1;
@@ -58,12 +63,12 @@ int ulcnet_stream_layout(const UlcnetStreamConfig *cfg, unsigned char *base,
     UlcnetPrepostConfig pcfg;
     UlcnetPrepostMemReq pp_req;
     size_t fft_bytes, stft_bytes, istft_bytes, scratch_bytes;
-    size_t hop, n_bins;
+    size_t hop, plane_bins;
 
     if (!cfg || !out || !total || !cfg_valid(cfg)) return -1;
     memset(out, 0, sizeof(*out));
     hop = (size_t)cfg->grid.hop;
-    n_bins = (size_t)cfg->grid.n_bins;
+    plane_bins = (size_t)cfg_frames(cfg) * (size_t)cfg->grid.n_bins;
 
     if (stream_carve(base, &cursor, sizeof(UlcnetStream), &ptr) != 0) return -1;
     out->self = (UlcnetStream *)ptr;
@@ -76,7 +81,7 @@ int ulcnet_stream_layout(const UlcnetStreamConfig *cfg, unsigned char *base,
      * audio_stft.c's config_valid() dereferences a non-NULL cfg->fft, which doesn't exist yet
      * during sizing. */
     ac_stft_config_default(&scfg, cfg->grid.n_fft);
-    scfg.ola = AC_OLA_ENV_NORM;
+    scfg.ola = AC_OLA_ACCUMULATE;
 
     stft_bytes = ac_stft_get_mem_size(&scfg);
     if (stft_bytes == 0 || stream_carve(base, &cursor, stft_bytes, &ptr) != 0) return -1;
@@ -98,18 +103,19 @@ int ulcnet_stream_layout(const UlcnetStreamConfig *cfg, unsigned char *base,
     pcfg.logit_history_elements = cfg->logit_history_elements;
     pcfg.h_gru = cfg->h_gru;
     pcfg.gru_hidden_elements = cfg->gru_hidden_elements;
+    pcfg.frames_per_call = cfg->frames_per_call;
     if (ulcnet_prepost_get_mem_size(&pcfg, &pp_req) != 0) return -1;
     if (stream_carve(base, &cursor, (size_t)pp_req.bytes, &ptr) != 0) return -1;
     out->prepost_mem = ptr;
     out->prepost_bytes = (size_t)pp_req.bytes;
     out->prepost_build_hash = pp_req.build_flags_hash;
 
-    /* err_f, far_f, hop_out [hop] + err_re, err_im, far_re, far_im, enh_re, enh_im [n_bins], one
+    /* err_f, far_f, hop_out [hop] + err_re, err_im, far_re, far_im, enh_re, enh_im [frames * n_bins], one
      * slab (the other stream modules' "one aligned slab" pattern); only the slab base is part of
      * the pool ABI. */
     scratch_bytes = ck_add_size(
         ck_mul_size(3u, ck_mul_size(hop, sizeof(float))),
-        ck_mul_size(6u, ck_mul_size(n_bins, sizeof(float))));
+        ck_mul_size(6u, ck_mul_size(plane_bins, sizeof(float))));
     if (MEM_SIZE_INVALID(scratch_bytes) || stream_carve(base, &cursor, scratch_bytes, &ptr) != 0)
         return -1;
     out->scratch_mem = ptr;
@@ -129,6 +135,7 @@ static uint32_t build_hash(const UlcnetStreamConfig *cfg, uint32_t prepost_hash)
     h = stream_fnv1a_u32(h, (uint32_t)ULCNET_STREAM_LAYOUT_VERSION);
     h = stream_fnv1a_u32(h, (uint32_t)(state_mode(cfg) > 0 ? 1u : 0u));
     h = stream_fnv1a_u32(h, prepost_hash);
+    if (cfg_frames(cfg) > 1) h = stream_fnv1a_u32(h, (uint32_t)cfg_frames(cfg));
     return ac_memreq_abi_hash(h);
 }
 
@@ -164,12 +171,13 @@ UlcnetStream *ulcnet_stream_finish_init(const UlcnetStreamConfig *cfg, unsigned 
     UlcnetStream *s;
     AcStftConfig scfg;
     UlcnetPrepostConfig pcfg;
-    size_t hop, n_bins;
+    size_t hop, n_bins, plane_bins;
 
     if (!cfg || !base || !layout || !layout->self) return NULL;
     s = layout->self;
 
     s->grid = cfg->grid;
+    s->frames = cfg_frames(cfg);
     s->hop_state = ULCNET_STREAM_IDLE;
     s->had_hop = 0;
     s->prev_solid = 0;
@@ -181,7 +189,7 @@ UlcnetStream *ulcnet_stream_finish_init(const UlcnetStreamConfig *cfg, unsigned 
     /* Real, now-constructed handle, borrowed by all three framing objects -- a smaller scfg
      * than the sizing one above, which the larger carved region always fits. */
     ac_stft_config_default(&scfg, cfg->grid.n_fft);
-    scfg.ola = AC_OLA_ENV_NORM;
+    scfg.ola = AC_OLA_ACCUMULATE;
     scfg.fft = s->fft;
 
     s->stft_err = ac_stft_init(layout->stft_err_mem, ac_stft_get_mem_size(&scfg), &scfg);
@@ -202,20 +210,22 @@ UlcnetStream *ulcnet_stream_finish_init(const UlcnetStreamConfig *cfg, unsigned 
     pcfg.logit_history_elements = cfg->logit_history_elements;
     pcfg.h_gru = cfg->h_gru;
     pcfg.gru_hidden_elements = cfg->gru_hidden_elements;
+    pcfg.frames_per_call = cfg->frames_per_call;
     s->prepost = ulcnet_prepost_init(layout->prepost_mem, layout->prepost_bytes, &pcfg);
     if (!s->prepost) return NULL;
 
     hop = (size_t)cfg->grid.hop;
     n_bins = (size_t)cfg->grid.n_bins;
+    plane_bins = (size_t)s->frames * n_bins;
     s->err_f = (float *)layout->scratch_mem;
     s->far_f = s->err_f + hop;
     s->hop_out = s->far_f + hop;
     s->err_re = s->hop_out + hop;
-    s->err_im = s->err_re + n_bins;
-    s->far_re = s->err_im + n_bins;
-    s->far_im = s->far_re + n_bins;
-    s->enh_re = s->far_im + n_bins;
-    s->enh_im = s->enh_re + n_bins;
+    s->err_im = s->err_re + plane_bins;
+    s->far_re = s->err_im + plane_bins;
+    s->far_im = s->far_re + plane_bins;
+    s->enh_re = s->far_im + plane_bins;
+    s->enh_im = s->enh_re + plane_bins;
 
     return s;
 }
@@ -251,12 +261,13 @@ void ulcnet_stream_reset(UlcnetStream *s) {
     ulcnet_prepost_reset(s->prepost);
     s->hop_state = ULCNET_STREAM_IDLE;
     s->reprime_remaining = 0;
-    /* Also clear the alignment-edge tracker: had_hop == 0 suppresses the next edge check
+    /* Also clears the alignment-edge tracker: had_hop == 0 suppresses the next edge check
      * regardless of the recorded delay.solid, so the hop after ANY reset (explicit or
-     * pre_process-detected) is exactly like the first hop after init. Without this, an explicit
-     * mid-stream reset left prev_solid stale and could spuriously re-trigger a reset+reprime. */
+     * pre_process-detected) is exactly like the first hop after init, never re-triggering off a
+     * stale prev_solid. */
     s->had_hop = 0;
     s->prev_solid = 0;
+    s->restart_mask = 0;
 }
 
 uint32_t ulcnet_stream_state_generation(const UlcnetStream *s) {
@@ -271,6 +282,14 @@ int ulcnet_stream_hop_size(const UlcnetStream *s) {
     return s ? s->grid.hop : -1;
 }
 
+int ulcnet_stream_frames_per_call(const UlcnetStream *s) {
+    return s ? s->frames : -1;
+}
+
+uint64_t ulcnet_stream_restart_mask(const UlcnetStream *s) {
+    return s ? s->restart_mask : 0u;
+}
+
 int ulcnet_stream_layout_version(const UlcnetStream *s) {
     const UlcnetModelIoDescriptor *d;
     if (!s) return -1;
@@ -278,17 +297,13 @@ int ulcnet_stream_layout_version(const UlcnetStream *s) {
     return d ? (int)d->layout_version : -1;
 }
 
-int ulcnet_stream_pre_process_f32(UlcnetStream *s, const float *err_in, const float *far_in,
-                                  UlcnetStreamDelay delay, UlcnetHopIO *io) {
-    int edge;
+/* Alignment-edge detection, before the hop's own analysis: a new alignment generation, or the
+ * first hop where `solid` turns true after a prior hop where it was false. Only the solid-transition
+ * term is gated by s->had_hop (no prior value on the very first hop); delay.changed is NOT gated --
+ * a fresh generation on hop 0 resets there too. Returns 1 on an edge (the stream was reset). */
+static int apply_alignment_edge(UlcnetStream *s, UlcnetStreamDelay delay) {
+    int edge = delay.changed || (s->had_hop && !s->prev_solid && delay.solid);
 
-    if (!s || !err_in || !far_in || !io || s->hop_state != ULCNET_STREAM_IDLE) return -1;
-
-    /* Alignment-edge detection, before this hop's own analysis: a new alignment generation, or
-     * the first hop where `solid` turns true after a prior hop where it was false. Only the
-     * solid-transition term is gated by s->had_hop (no prior value on the very first hop);
-     * delay.changed is NOT gated -- a fresh generation on hop 0 resets there too. */
-    edge = delay.changed || (s->had_hop && !s->prev_solid && delay.solid);
     if (edge) {
         /* ulcnet_stream_reset() itself clears reprime_remaining; re-arm strictly after it
          * returns, or the arm below would be immediately undone. */
@@ -297,16 +312,15 @@ int ulcnet_stream_pre_process_f32(UlcnetStream *s, const float *err_in, const fl
     }
     s->had_hop = 1;
     s->prev_solid = delay.solid;
+    return edge;
+}
 
-    /* err_in/far_in are read once each, here, and never stored -- the scratch slab exists only
-     * for ulcnet_stream_pre_process()'s int16 conversion below. */
-    ac_stft_push_planar(s->stft_err, err_in, s->err_re, s->err_im);
-    ac_stft_push_planar(s->stft_far, far_in, s->far_re, s->far_im);
-
+/* Shared tail of every pre_process entry, from the analysed (or supplied) spectra on. */
+static int open_hop(UlcnetStream *s, const float *err_re, const float *err_im,
+                    const float *far_re, const float *far_im, UlcnetHopIO *io) {
     /* pre_process_freq() always returns 1 here (ulcnet_prepost.h: "Returns 1 (one invocation)");
      * any other return is a contract error this stream does not expect in correct use. */
-    if (ulcnet_prepost_pre_process_freq(s->prepost, s->err_re, s->err_im,
-                                       s->far_re, s->far_im) != 1)
+    if (ulcnet_prepost_pre_process_freq(s->prepost, err_re, err_im, far_re, far_im) != 1)
         return -1;
 
     if (s->reprime_remaining > 0) {
@@ -327,6 +341,92 @@ int ulcnet_stream_pre_process_f32(UlcnetStream *s, const float *err_in, const fl
     return 1;
 }
 
+int ulcnet_stream_pre_process_f32(UlcnetStream *s, const float *err_in, const float *far_in,
+                                  UlcnetStreamDelay delay, UlcnetHopIO *io) {
+    if (!s || !err_in || !far_in || !io || s->hop_state != ULCNET_STREAM_IDLE || s->frames != 1) return -1;
+
+    s->restart_mask = apply_alignment_edge(s, delay) ? 1u : 0u;
+
+    /* err_in/far_in are read once each, here, and never stored -- the scratch slab exists only
+     * for ulcnet_stream_pre_process()'s int16 conversion below. */
+    ac_stft_push_planar(s->stft_err, err_in, s->err_re, s->err_im);
+    ac_stft_push_planar(s->stft_far, far_in, s->far_re, s->far_im);
+
+    return open_hop(s, s->err_re, s->err_im, s->far_re, s->far_im, io);
+}
+
+int ulcnet_stream_pre_process_freq(UlcnetStream *s, const float *err_re, const float *err_im,
+                                   const float *far_re, const float *far_im,
+                                   UlcnetStreamDelay delay, UlcnetHopIO *io) {
+    if (!s || !err_re || !err_im || !far_re || !far_im || !io || s->hop_state != ULCNET_STREAM_IDLE ||
+        s->frames != 1)
+        return -1;
+
+    (void)apply_alignment_edge(s, delay);
+    s->restart_mask = 0;   /* the caller owns the analysers and the ISTFT */
+    return open_hop(s, err_re, err_im, far_re, far_im, io);
+}
+
+/* The one-hop edge rule without its model restart: the graph resets and bypasses an event hop of a packet. */
+static void packet_events(UlcnetStream *s, const UlcnetStreamDelay *delay, int *events) {
+    int k;
+    for (k = 0; k < s->frames; ++k) {
+        events[k] = delay[k].changed || (s->had_hop && !s->prev_solid && delay[k].solid);
+        s->had_hop = 1;
+        s->prev_solid = delay[k].solid;
+    }
+}
+
+static int open_packet(UlcnetStream *s, const int *events, UlcnetHopIO *io) {
+    if (ulcnet_prepost_pre_process_packet(s->prepost, s->err_re, s->err_im, s->far_re, s->far_im, events) != 1)
+        return -1;
+    if (ulcnet_prepost_frame_open(s->prepost, &io->inputs, &io->outputs) != 0) return -1;
+    io->state_generation = ulcnet_prepost_state_generation(s->prepost);
+    s->hop_state = ULCNET_STREAM_FRAME_OPEN;
+    return 1;
+}
+
+int ulcnet_stream_pre_process_packet_f32(UlcnetStream *s, const float *err_in, const float *far_in,
+                                         const UlcnetStreamDelay *delay, UlcnetHopIO *io) {
+    int events[ULCNET_MODEL_IO_MAX_FRAMES_PER_CALL];
+    size_t k;
+    const size_t hop = s ? (size_t)s->grid.hop : 0u, bins = s ? (size_t)s->grid.n_bins : 0u;
+
+    if (!s || !err_in || !far_in || !delay || !io || s->hop_state != ULCNET_STREAM_IDLE || s->frames < 2) return -1;
+    packet_events(s, delay, events);
+    s->restart_mask = 0;
+    for (k = 0; k < (size_t)s->frames; ++k) {
+        /* An event hop restarts the stream's own analysis exactly where the one-hop stream does: before the hop's
+         * push, so the hops before it are analysed from the incoming history and the hops after it from this one. */
+        if (events[k]) {
+            ac_stft_reset(s->stft_err);
+            ac_stft_reset(s->stft_far);
+            s->restart_mask |= (uint64_t)1u << k;
+        }
+        ac_stft_push_planar(s->stft_err, err_in + k * hop, s->err_re + k * bins, s->err_im + k * bins);
+        ac_stft_push_planar(s->stft_far, far_in + k * hop, s->far_re + k * bins, s->far_im + k * bins);
+    }
+    return open_packet(s, events, io);
+}
+
+int ulcnet_stream_pre_process_packet_freq(UlcnetStream *s, const float *err_re, const float *err_im,
+                                          const float *far_re, const float *far_im,
+                                          const UlcnetStreamDelay *delay, UlcnetHopIO *io) {
+    int events[ULCNET_MODEL_IO_MAX_FRAMES_PER_CALL];
+    const size_t plane = s ? (size_t)s->frames * (size_t)s->grid.n_bins * sizeof(float) : 0u;
+
+    if (!s || !err_re || !err_im || !far_re || !far_im || !delay || !io || s->hop_state != ULCNET_STREAM_IDLE ||
+        s->frames < 2)
+        return -1;
+    packet_events(s, delay, events);
+    s->restart_mask = 0;   /* the caller owns the analysers and the ISTFT */
+    memcpy(s->err_re, err_re, plane);
+    memcpy(s->err_im, err_im, plane);
+    memcpy(s->far_re, far_re, plane);
+    memcpy(s->far_im, far_im, plane);
+    return open_packet(s, events, io);
+}
+
 int ulcnet_stream_pre_process(UlcnetStream *s, const int16_t *err_in, const int16_t *far_in,
                               UlcnetStreamDelay delay, UlcnetHopIO *io) {
     int hop, i;
@@ -335,7 +435,7 @@ int ulcnet_stream_pre_process(UlcnetStream *s, const int16_t *err_in, const int1
      * ulcnet_stream_pre_process_f32()'s path (see ulcnet_stream.h). The contract check is
      * repeated here, not deferred to the f32 call, so a refused call never touches
      * s->err_f/far_f -- the "no state touched before any write" shape used elsewhere in this file. */
-    if (!s || !err_in || !far_in || !io || s->hop_state != ULCNET_STREAM_IDLE) return -1;
+    if (!s || !err_in || !far_in || !io || s->hop_state != ULCNET_STREAM_IDLE || s->frames != 1) return -1;
     hop = s->grid.hop;
     for (i = 0; i < hop; ++i) {
         s->err_f[i] = (float)err_in[i] / 32768.0f;
@@ -344,11 +444,10 @@ int ulcnet_stream_pre_process(UlcnetStream *s, const int16_t *err_in, const int1
     return ulcnet_stream_pre_process_f32(s, s->err_f, s->far_f, delay, io);
 }
 
-int ulcnet_stream_post_process(UlcnetStream *s, int ai_rc, int16_t *pcm_out) {
-    int hop, i, prc, written;
+int ulcnet_stream_post_process_freq(UlcnetStream *s, int ai_rc, float *re, float *im) {
+    int prc;
 
-    if (!s || !pcm_out || s->hop_state == ULCNET_STREAM_IDLE) return -1;
-    hop = s->grid.hop;
+    if (!s || !re || !im || s->hop_state == ULCNET_STREAM_IDLE) return -1;
 
     if (s->hop_state == ULCNET_STREAM_FRAME_OPEN) {
         /* A finish that itself fails (non-finite mask or state despite ai_rc == 0) leaves the
@@ -360,21 +459,35 @@ int ulcnet_stream_post_process(UlcnetStream *s, int ai_rc, int16_t *pcm_out) {
     /* ULCNET_STREAM_FRAME_CLOSED: already bypassed inside pre_process; ai_rc is not read. */
     s->hop_state = ULCNET_STREAM_IDLE;
 
-    prc = ulcnet_prepost_post_process_freq(s->prepost, s->enh_re, s->enh_im);
+    prc = ulcnet_prepost_post_process_freq(s->prepost, re, im);
     if (prc != 0) {
         /* Defensive only, unreached in correct use (the hop was just closed above). */
-        memset(pcm_out, 0, (size_t)hop * sizeof(int16_t));
+        memset(re, 0, (size_t)s->frames * (size_t)s->grid.n_bins * sizeof(float));
+        memset(im, 0, (size_t)s->frames * (size_t)s->grid.n_bins * sizeof(float));
+        return -1;
+    }
+    return 1;
+}
+
+int ulcnet_stream_post_process(UlcnetStream *s, int ai_rc, int16_t *pcm_out) {
+    int hop, i, k;
+    const size_t bins = s ? (size_t)s->grid.n_bins : 0u;
+
+    if (!s || !pcm_out || s->hop_state == ULCNET_STREAM_IDLE) return -1;
+    hop = s->grid.hop;
+
+    if (ulcnet_stream_post_process_freq(s, ai_rc, s->enh_re, s->enh_im) != 1) {
+        memset(pcm_out, 0, (size_t)s->frames * (size_t)hop * sizeof(int16_t));
         return -1;
     }
 
-    written = ac_istft_push_planar(s->istft, s->enh_re, s->enh_im, s->hop_out);
-    if (written != hop) {
-        /* AC_OLA_ENV_NORM's documented startup behavior: the very first push after
-         * init/reset/reprime-triggered-reset emits nothing. */
-        memset(pcm_out, 0, (size_t)hop * sizeof(int16_t));
-        return 0;
+    /* AC_OLA_ACCUMULATE always emits a full hop with no first-push suppression (same convention
+     * as dfn2_stream.c's own post_process): the first real hop out of a fresh init/reset/reprime
+     * is the model's actual half-window synthesis result (may be non-zero), not forced silence. */
+    for (k = 0; k < s->frames; ++k) {
+        if ((s->restart_mask >> k) & 1u) ac_istft_reset(s->istft);   /* the hop's analysis was restarted */
+        ac_istft_push_planar(s->istft, s->enh_re + (size_t)k * bins, s->enh_im + (size_t)k * bins, s->hop_out);
+        for (i = 0; i < hop; ++i) pcm_out[(size_t)k * (size_t)hop + (size_t)i] = stream_saturate_s16(s->hop_out[i]);
     }
-
-    for (i = 0; i < hop; ++i) pcm_out[i] = stream_saturate_s16(s->hop_out[i]);
     return 1;
 }

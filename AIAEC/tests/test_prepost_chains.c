@@ -429,7 +429,8 @@ static uint64_t run_chain(int depth)
     static DeepVqePrepostInputs in;
     static DeepVqePrepostOutputs out;
     const DeepVqeGridSpec spec = {
-        .sample_rate = g_sample_rate, .n_fft = g_n_fft, .delay_depth = depth };
+        .sample_rate = g_sample_rate, .n_fft = g_n_fft, .delay_depth = depth,
+        .frames_per_call = 1 };
     float* buf[DEEPVQE_STATE_COUNT];
     DeepVqePrepostConfig cfg;
     DeepVqePrepost* p;

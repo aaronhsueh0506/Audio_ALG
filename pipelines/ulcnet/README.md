@@ -34,7 +34,7 @@ UlcnetNnDelay delay = { info.delay.changed, info.delay.solid };
 ulcnet_nn_stage_begin_complex(stage, beam.spectrum, far, delay);
 if (ulcnet_nn_stage_nn_begin(stage, &job) == 1)
     ulcnet_nn_stage_nn_end(stage, run_network(&job));
-ulcnet_nn_stage_end(stage, out);                      /* hop #0 is zeros */
+ulcnet_nn_stage_end(stage, out);                      /* a full hop every call, hop #0 included */
 ```
 
 A mono lane maps `AecLinearContext.delay_state` to `{ state == CHANGED, state != UNLOCKED }` and

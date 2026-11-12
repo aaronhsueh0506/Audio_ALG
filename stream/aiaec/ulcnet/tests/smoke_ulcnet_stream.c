@@ -1,9 +1,9 @@
 /* Smoke build only: does ulcnet_stream link and run several hops without crashing. Not a
  * correctness test -- it does not check PCM against a reference; that's the separate
  * verification harness. Asserts the documented return-value splits: post_process returns exactly
- * 0 at hop 0 (AC_OLA_ENV_NORM's first-push startup quirk) and at the reprime hop triggered by
- * delay.changed, 1 at every other hop; pre_process returns 0 at that same reprime hop, 1
- * elsewhere. Also independently confirms (against the bare UlcnetPrepost class, not through the
+ * 1 at every hop (AC_OLA_ACCUMULATE has no first-push startup quirk); pre_process
+ * returns 0 at the reprime hop triggered by delay.changed, 1 elsewhere. Also independently
+ * confirms (against the bare UlcnetPrepost class, not through the
  * stream) what ulcnet_prepost_frame_bypass() returns when called right after
  * ulcnet_prepost_pre_process_freq() with no intervening frame_open() -- the exact sequence a
  * reprime hop uses -- since that return value is not otherwise observable through the stream's
@@ -193,17 +193,9 @@ int main(void) {
         if (pre_rc == 1) ai_rc = fake_accelerator(&io.inputs, &io.outputs);
 
         post_rc = ulcnet_stream_post_process(s, ai_rc, pcm_out);
-        if (post_rc != 0 && post_rc != 1) {
-            fprintf(stderr, "post_process rc=%d at hop %d (expected 0 or 1)\n", post_rc, i);
-            return 1;
-        }
-        if ((i == 0 || i == reprime_hop) && post_rc != 0) {
-            fprintf(stderr, "post_process rc=%d at hop %d (expected exactly 0: AC_OLA_ENV_NORM's "
-                            "first-push-after-reset case)\n", post_rc, i);
-            return 1;
-        }
-        if (i != 0 && i != reprime_hop && post_rc != 1) {
-            fprintf(stderr, "post_process rc=%d at hop %d (expected exactly 1)\n", post_rc, i);
+        if (post_rc != 1) {
+            fprintf(stderr, "post_process rc=%d at hop %d (expected exactly 1: AC_OLA_ACCUMULATE "
+                            "has no first-push-after-reset suppression)\n", post_rc, i);
             return 1;
         }
     }

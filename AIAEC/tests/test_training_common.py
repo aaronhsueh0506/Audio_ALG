@@ -1069,7 +1069,7 @@ def test_shipped_loss_and_delay_overrides_are_explicit():
         configs[path.parent.name] = cfg
 
     ulcnet = configs['Align_ULCNet']
-    assert ulcnet.getint('model', 'max_delay_frames') == 32
+    assert ulcnet.getfloat('model', 'max_delay_seconds') == pytest.approx(0.5)
 
     for name in ('Align_ULCNet', 'Align_CRUSE', 'DeepVQE_S'):
         cfg = configs[name]
@@ -1402,7 +1402,7 @@ def test_align_ulcnet_step_schedule_advances_per_batch(
     with io.open(override, 'w', encoding='utf-8') as handle:
         cfg.write(handle)
 
-    linear = make_linear_aec_contract(16000, frame_size=512)
+    linear = make_linear_aec_contract(16000, frame_size=cfg.getint('signal', 'n_fft'))
 
     class FakePackedDataset:
         def __init__(self, path, expected_sr=None, mmap=False):
@@ -1492,7 +1492,7 @@ def test_align_ulcnet_trains_on_plcpa_of_the_stft_consistent_estimate(
     with io.open(override, 'w', encoding='utf-8') as handle:
         cfg.write(handle)
 
-    linear = make_linear_aec_contract(16000, frame_size=512)
+    linear = make_linear_aec_contract(16000, frame_size=cfg.getint('signal', 'n_fft'))
 
     class FakePackedDataset:
         def __init__(self, path, expected_sr=None, mmap=False):
@@ -1567,7 +1567,7 @@ def test_other_step_schedules_advance_per_batch(
     with io.open(override, 'w', encoding='utf-8') as handle:
         cfg.write(handle)
 
-    linear = make_linear_aec_contract(16000, frame_size=512)
+    linear = make_linear_aec_contract(16000, frame_size=cfg.getint('signal', 'n_fft'))
 
     class FakePackedDataset:
         def __init__(self, path, expected_sr=None, mmap=False):
@@ -1650,7 +1650,7 @@ def test_zero_patience_finishes_the_budget_and_saves_the_live_counter(
     with io.open(override, 'w', encoding='utf-8') as handle:
         cfg.write(handle)
 
-    linear = make_linear_aec_contract(16000, frame_size=512)
+    linear = make_linear_aec_contract(16000, frame_size=cfg.getint('signal', 'n_fft'))
 
     class FakePackedDataset:
         def __init__(self, path, expected_sr=None, mmap=False):

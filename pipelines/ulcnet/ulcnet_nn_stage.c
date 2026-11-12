@@ -31,8 +31,11 @@ struct UlcnetNnStage {
     int nn_accepted;              /* the model output replaces the error frame */
 };
 
-/* The grid's framing: unnormalised spectra, centre 0, envelope-normalised synthesis. */
-#define STAGE_OLA AC_OLA_ENV_NORM
+/* The grid's framing: unnormalised spectra, centre 0, overlap-add synthesis. Each hop is this frame's
+ * IFFT times the synthesis window, first half, plus the previous frame's saved second half; the second
+ * half is saved for the next hop. Nothing is held back: hop #0 is already output, its first half
+ * added to a zero history. */
+#define STAGE_OLA AC_OLA_ACCUMULATE
 
 static void framing_config(AcStftConfig* sc, const UlcnetGrid* grid) {
     ac_stft_config_default(sc, grid->n_fft);
@@ -129,7 +132,8 @@ int ulcnet_nn_stage_set_model(UlcnetNnStage* s, const UlcnetModel* model) {
          * and the stage's grid is undetectable downstream. */
         if (model->infer && !model->io_descriptor) return -1;
         if (model->io_descriptor &&
-            ulcnet_model_io_descriptor_validate(&s->grid, model->io_descriptor) != 0)
+            (ulcnet_model_io_descriptor_validate(&s->grid, model->io_descriptor) != 0 ||
+             ulcnet_model_io_descriptor_frames(model->io_descriptor) != 1))
             return -1;
         s->model = *model;
     } else {
@@ -251,12 +255,7 @@ int ulcnet_nn_stage_end(UlcnetNnStage* s, float* out) {
     spec_im = s->nn_accepted ? s->enh_im : s->err_im;
     s->phase = 0;
     written = ac_istft_push_planar(s->synthesis, spec_re, spec_im, out);
-    if (written == 0) {
-        /* hop #0: the synthesis holds its first frame back. */
-        memset(out, 0, (size_t)s->grid.hop * sizeof(float));
-    } else if (written != s->grid.hop) {
-        return ULCNET_NN_STAGE_DSP_ERROR;
-    }
+    if (written != s->grid.hop) return ULCNET_NN_STAGE_DSP_ERROR;
     s->frame_index += 1;
     return ULCNET_NN_STAGE_OK;
 }

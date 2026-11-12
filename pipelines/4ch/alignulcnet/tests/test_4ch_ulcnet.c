@@ -306,7 +306,6 @@ static int test_identity_e2e(void) {
     float* out;
     float* ref;
     float max_ref = 0.0f;
-    float max_preamble = 0.0f;
     int identical_hops = 0;
     int hop;
 
@@ -343,7 +342,7 @@ static int test_identity_e2e(void) {
         AcStftConfig sc;
         size_t ref_bytes;
         ac_stft_config_default(&sc, g_grid.n_fft);
-        sc.ola = AC_OLA_ENV_NORM;
+        sc.ola = AC_OLA_ACCUMULATE;
         ref_bytes = ac_istft_get_mem_size(&sc);
         CHECK(ref_bytes != 0 && posix_memalign(&ref_mem, 16, ref_bytes) == 0,
               "allocate reference synthesis");
@@ -360,15 +359,15 @@ static int test_identity_e2e(void) {
 
     for (int frame = 0; frame < FRAMES; ++frame) {
         int ref_wrote;
-        /* Poison the output buffer first, so "hop 0 is exact zeros" and the
-         * memcmp below prove the pipeline WROTE the hop, not that the
-         * allocator handed over zeroed memory. */
+        /* Poison the output buffer first, so the memcmp below proves the
+         * pipeline WROTE the hop, not that the allocator handed over
+         * zeroed memory. */
         for (int i = 0; i < hop; ++i) out[i] = 1.0f;
         for (int i = 0; i < hop; ++i) {
             int64_t absolute = (int64_t)frame * hop + i;
             float phase = 2.0f * (float)M_PI * 700.0f *
                           (float)absolute / (float)g_grid.sample_rate;
-            /* frame 0 silent so the 1-hop preamble is provably zero. */
+            /* frame 0 silent: its synthesis is compared like every other hop. */
             float echo = frame >= 1 ? 0.08f * sinf(phase) : 0.0f;
             float near = frame >= 30
                 ? 0.025f * sinf(phase * 1.73f + 0.2f) : 0.0f;
@@ -388,31 +387,23 @@ static int test_identity_e2e(void) {
         /* The reference: the frame the model saw, through the test's own
          * synthesis. Same arithmetic on the same history -> bit-identical. */
         ref_wrote = ac_istft_push_planar(ref_synth, m.re, m.im, ref);
-        if (frame == 0) {
-            CHECK(ref_wrote == 0, "reference emits nothing on hop #0");
-            for (int i = 0; i < hop; ++i) {
-                float a = fabsf(out[i]);
-                if (a > max_preamble) max_preamble = a;
-            }
-        } else {
-            CHECK(ref_wrote == hop, "reference emits a full hop from hop #1");
-            for (int i = 0; i < hop; ++i) {
-                float a = fabsf(ref[i]);
-                if (a > max_ref) max_ref = a;
-                CHECK(isfinite(out[i]), "identity output finite");
-            }
-            CHECK(memcmp(out, ref, (size_t)hop * sizeof(float)) == 0,
-                  "out[hop p] is bit-identical to the synthesis of the "
-                  "spectrum the model saw at hop p (identity chain, 1-hop "
-                  "latency)");
-            identical_hops += 1;
+        CHECK(ref_wrote == hop,
+              "reference emits a full hop on every hop, hop #0 included");
+        for (int i = 0; i < hop; ++i) {
+            float a = fabsf(ref[i]);
+            if (a > max_ref) max_ref = a;
+            CHECK(isfinite(out[i]), "identity output finite");
         }
+        CHECK(memcmp(out, ref, (size_t)hop * sizeof(float)) == 0,
+              "out[hop p] is bit-identical to the accumulate synthesis of "
+              "the spectrum the model saw at hop p (identity chain, 1-hop "
+              "latency), from hop #0");
+        identical_hops += 1;
     }
     CHECK(m.resets == 0,
           "FIXED delay 0 keeps the identity run boundary-free (no reprime "
           "frame ever bypassed the capture model)");
-    CHECK(max_preamble == 0.0f, "hop 0 emits exact zeros (1-hop preamble)");
-    CHECK(identical_hops == FRAMES - 1, "every later hop was compared");
+    CHECK(identical_hops == FRAMES, "every hop was compared, hop #0 included");
     /* The comparison must not be vacuous: the reference has to carry real
      * signal for this test to be able to fail. */
     CHECK(max_ref > 1e-3f, "beamformed error is non-trivial");
@@ -630,22 +621,19 @@ static int test_counting_model_policy(void) {
     CHECK(max_identity_err <= 2e-4f,
           "infer error => fail-open identity (3x marker ignored)");
 
-    /* Pipeline reset must also reset the runtime and restart the 1-hop
-     * preamble. */
+    /* Pipeline reset must also reset the runtime and restart the overlap
+     * history. */
     ul4_reset(p);
     CHECK(m.reset_calls == changed_count + 1,
           "pipeline reset fires model->reset once");
     {
         long infer_before = m.infer_calls;
-        float max_out = 0.0f;
         CHECK(ul4_process_with_activity(
                   p, microphones, far, 0, out) == MCAB_OK,
               "post-reset frame processes");
-        for (int i = 0; i < hop; ++i) {
-            float a = fabsf(out[i]);
-            if (a > max_out) max_out = a;
-        }
-        CHECK(max_out == 0.0f, "post-reset hop#0 emits exact zeros");
+        for (int i = 0; i < hop; ++i)
+            CHECK(isfinite(out[i]), "post-reset hop#0 output is finite");
+        /* its PCM against a fresh pipeline is test_complex_entry_accumulate()'s reset case */
         CHECK(m.infer_calls == infer_before + 1,
               "post-reset hop#0 is one inference, like every hop");
     }
@@ -1421,12 +1409,13 @@ static int test_nan_guard(void) {
                   "no NaN/Inf ever reaches the pipeline output");
         }
 
-        /* 50%-overlap mixing rule: hop 0 emits exact zeros on both sides
-         * (frame #0 lies inside the synthesis's trimmed half window); hop
-         * p >= 1 mixes the frames pushed at hops p-1 and p, so it is
-         * bit-identical only when BOTH were identity frames. */
+        /* 50%-overlap mixing rule: hop 0 is the first half of frame #0
+         * over a zero history, so it is bit-identical only when frame #0
+         * was an identity frame; hop p >= 1 mixes the frames pushed at
+         * hops p-1 and p, so it is bit-identical only when BOTH were
+         * identity frames. */
         if (frame == 0) {
-            equal_expected = 1;
+            equal_expected = poisoned[0];
         } else {
             equal_expected = poisoned[frame - 1] && poisoned[frame];
         }
@@ -1563,9 +1552,9 @@ static int test_partial_write_guard(void) {
                   "no NaN/Inf ever reaches the output (partial-write test)");
         }
 
-        /* Same 50%-overlap mixing rule as test 7. */
+        /* Same 50%-overlap mixing rule as test 7 (hop 0 depends on frame #0 alone). */
         if (frame == 0) {
-            equal_expected = 1;
+            equal_expected = partial[0];
         } else {
             equal_expected = partial[frame - 1] && partial[frame];
         }
@@ -2469,6 +2458,339 @@ static int test_recovery_equals_fresh_pair(void) {
     return 1;
 }
 
+
+/* ============================================================================
+ * 18. Complex-spectrum entry vs an independent per-sample accumulate reference
+ *     (begin_complex with the front end's beamformed spectrum and the raw far).
+ *     The expected PCM is built by the TEST: the spectrum the stage was handed (or, where the
+ *     model ran and was accepted, the same spectrum through the band mask) goes through
+ *     (a) its own AcIstft in accumulate mode, bit for bit, and (b) a direct inverse DFT in
+ *     double with the periodic sqrt-Hann window and a saved second half, within 2e-6.
+ *     The alignment events are scheduled by the test (the real front end supplies the
+ *     spectrum); every submission is counted at the model.
+ * ========================================================================== */
+
+typedef struct CxAccRef {
+    double saved[HOP_MAX];
+    double win[2 * HOP_MAX], cs[2 * HOP_MAX], sn[2 * HOP_MAX];
+} CxAccRef;
+
+static void cx_accref_init(CxAccRef* a) {
+    const double pi = 3.14159265358979323846;
+    int N = g_grid.n_fft;
+    memset(a, 0, sizeof(*a));
+    for (int n = 0; n < N; ++n) {
+        a->win[n] = sqrt(0.5 * (1.0 - cos(2.0 * pi * (double)n / (double)N)));
+        a->cs[n] = cos(2.0 * pi * (double)n / (double)N);
+        a->sn[n] = sin(2.0 * pi * (double)n / (double)N);
+    }
+}
+
+/* hop = this frame's windowed IFFT first half + the saved previous second half. */
+static void cx_accref_hop(CxAccRef* a, const float* re, const float* im, float* out) {
+    int N = g_grid.n_fft, H = HOP;
+    double y[2 * HOP_MAX];
+    for (int n = 0; n < N; ++n) {
+        double acc = (double)re[0] + ((n & 1) ? -1.0 : 1.0) * (double)re[N / 2];
+        for (int k = 1; k < N / 2; ++k) {
+            int idx = (int)(((long long)k * n) % N);
+            acc += 2.0 * ((double)re[k] * a->cs[idx] - (double)im[k] * a->sn[idx]);
+        }
+        y[n] = a->win[n] * acc / (double)N;
+    }
+    for (int n = 0; n < H; ++n) {
+        out[n] = (float)(y[n] + a->saved[n]);
+        a->saved[n] = y[H + n];
+    }
+}
+
+static float cx_gain(int k) { return 0.25f + 0.75f * (float)(k % 9) / 8.0f; }
+
+typedef struct CxModel { long calls, resets; int fail; } CxModel;
+
+static int cx_infer(void* user, const float* er, const float* ei, const float* fr, const float* fi,
+                    float* orr, float* oi) {
+    CxModel* m = (CxModel*)user;
+    (void)fr; (void)fi;
+    m->calls += 1;
+    for (int k = 0; k < BINS; ++k) {
+        orr[k] = (m->fail ? 7.0f : cx_gain(k)) * er[k];
+        oi[k] = (m->fail ? 7.0f : cx_gain(k)) * ei[k];
+    }
+    return m->fail ? -1 : 0;
+}
+static void cx_reset(void* user) { ((CxModel*)user)->resets += 1; }
+
+enum { CX_MAX_HOPS = 40 };
+
+typedef struct CxScn {
+    int hops, use_model;
+    int changed_at;            /* -1: none */
+    int solid_off_at, solid_back_at;   /* solid dropped on [off, back) */
+    int fail_from, fail_to;    /* model reports failure on [from, to) */
+} CxScn;
+
+static UlcnetNnDelay cx_event(const CxScn* sc, int h) {
+    UlcnetNnDelay d;
+    d.changed = h == sc->changed_at;
+    d.solid = !(sc->solid_off_at >= 0 && h >= sc->solid_off_at && h < sc->solid_back_at);
+    return d;
+}
+
+/* One recorded upstream: the four-channel input and the beamformed spectrum the front end made. */
+typedef struct CxIn {
+    float mic[CX_MAX_HOPS][HOP_MAX * MCAB_CHANNELS];
+    float far[CX_MAX_HOPS][HOP_MAX];
+    float re[CX_MAX_HOPS][BINS_MAX], im[CX_MAX_HOPS][BINS_MAX];
+} CxIn;
+
+typedef struct CxRun {
+    float out[CX_MAX_HOPS][HOP_MAX];
+    int ran[CX_MAX_HOPS], accepted[CX_MAX_HOPS];
+    long calls, resets;
+    double max_err, peak0;
+    int chain_bad;
+} CxRun;
+
+/* Non-zero from the very first sample (the shared echo scene is silent for its first 400 samples,
+ * which would make frame #0 empty): a source seen by all four mics plus per-mic noise, and an
+ * independent far. */
+static void cx_make_input(CxIn* in, int hops) {
+    g_rng = 0x2468acu;
+    for (int h = 0; h < hops; ++h) {
+        for (int i = 0; i < HOP; ++i) {
+            float src = 0.3f * frand();
+            in->far[h][i] = 0.25f * frand();
+            for (int ch = 0; ch < MCAB_CHANNELS; ++ch)
+                in->mic[h][i * MCAB_CHANNELS + ch] = src * (1.0f - 0.02f * ch) + 0.05f * frand();
+        }
+    }
+}
+
+static McabTestUnitConfig cx_unit_config(void) {
+    McabTestUnitConfig cfg = ulcnet_example_unit_config();
+    cfg.beam.bf_fixed_mode = 1;
+    cfg.beam.bf_fixed_doa_rad = 0.4f;
+    cfg.beam.bf_mu = 0.02f;
+    cfg.core.delay_mode = AEC_DELAY_FIXED;
+    cfg.core.fixed_delay_samples = 0;
+    return cfg;
+}
+
+/* mode 0: front end makes the spectrum (recorded into `in`); 1: feed in->re/im straight to the
+ * stage; 2: re-run the front end on in->mic/far and count spectra that differ from the record. */
+static int cx_drive(Ul4* p, UlcnetNnStage* stage, const CxScn* sc, CxIn* in, int mode, CxModel* m,
+                    CxRun* r, int* spec_diff) {
+    memset(r, 0, sizeof(*r));
+    if (spec_diff) *spec_diff = 0;
+    for (int h = 0; h < sc->hops; ++h) {
+        Complex c[BINS_MAX];
+        long before = m->calls;
+        m->fail = h >= sc->fail_from && h < sc->fail_to;
+        if (mode == 1) {
+            for (int k = 0; k < BINS; ++k) { c[k].r = in->re[h][k]; c[k].i = in->im[h][k]; }
+        } else {
+            McabSampleBeamResult beam;
+            McabSampleBeamInfo info;
+            CHECK(mcab_sample_beam_process_with_activity(p->unit, in->mic[h], in->far[h], 0, 0, NULL,
+                                                         &beam, &info) == MCAB_OK,
+                  "complex entry: front end hop");
+            for (int k = 0; k < BINS; ++k) c[k] = beam.spectrum[k];
+            if (mode == 0) {
+                for (int k = 0; k < BINS; ++k) { in->re[h][k] = c[k].r; in->im[h][k] = c[k].i; }
+            } else {
+                for (int k = 0; k < BINS; ++k)
+                    if (in->re[h][k] != c[k].r || in->im[h][k] != c[k].i) { (*spec_diff)++; break; }
+            }
+        }
+        CHECK(ulcnet_nn_stage_begin_complex(stage, c, in->far[h], cx_event(sc, h)) == 0 &&
+              ulcnet_nn_stage_process(stage, r->out[h]) == 0, "complex entry: stage hop");
+        r->ran[h] = m->calls > before;
+        r->accepted[h] = r->ran[h] && !m->fail;
+    }
+    r->calls = m->calls;
+    r->resets = m->resets;
+    return 1;
+}
+
+/* Compare one pass with the references (restarted from zero for every pass). */
+static int cx_check(const CxScn* sc, const CxIn* in, CxRun* r) {
+    AcStftConfig cf;
+    void* mem = NULL;
+    AcIstft* ref;
+    CxAccRef acc;
+    size_t bytes;
+    ac_stft_config_default(&cf, g_grid.n_fft);
+    cf.ola = AC_OLA_ACCUMULATE;
+    bytes = ac_istft_get_mem_size(&cf);
+    CHECK(bytes != 0 && posix_memalign(&mem, 16, bytes) == 0, "complex entry: reference memory");
+    ref = ac_istft_init(mem, bytes, &cf);
+    CHECK(ref != NULL, "complex entry: reference synthesis");
+    cx_accref_init(&acc);
+    r->max_err = 0.0; r->peak0 = 0.0; r->chain_bad = 0;
+    for (int h = 0; h < sc->hops; ++h) {
+        float re[BINS_MAX], im[BINS_MAX], want[HOP_MAX], dft[HOP_MAX];
+        for (int k = 0; k < BINS; ++k) {
+            float g = r->accepted[h] ? cx_gain(k) : 1.0f;
+            re[k] = g * in->re[h][k];
+            im[k] = g * in->im[h][k];
+        }
+        if (ac_istft_push_planar(ref, re, im, want) != HOP ||
+            memcmp(want, r->out[h], (size_t)HOP * sizeof(float)) != 0) r->chain_bad += 1;
+        cx_accref_hop(&acc, re, im, dft);
+        for (int i = 0; i < HOP; ++i) {
+            double d = fabs((double)r->out[h][i] - (double)dft[i]);
+            if (d > r->max_err) r->max_err = d;
+            if (h == 0 && fabs((double)r->out[h][i]) > r->peak0) r->peak0 = fabs((double)r->out[h][i]);
+        }
+    }
+    free(mem);
+    return 1;
+}
+
+static int cx_fresh_stage(void** mem, UlcnetNnStage** st, CxModel* m, UlcnetModel* um, int use_model) {
+    size_t bytes = ulcnet_nn_stage_mem_size(&g_grid, 0);
+    CHECK(bytes != 0 && posix_memalign(mem, 16, bytes) == 0, "complex entry: stage memory");
+    memset(*mem, 0x5A, bytes);
+    *st = ulcnet_nn_stage_init(*mem, bytes, &g_grid, 0);
+    CHECK(*st != NULL, "complex entry: stage init");
+    memset(m, 0, sizeof(*m));
+    memset(um, 0, sizeof(*um));
+    if (use_model) {
+        um->user = m; um->infer = cx_infer; um->reset = cx_reset;
+        um->io_descriptor = test_io_descriptor();
+    }
+    CHECK(ulcnet_nn_stage_set_model(*st, use_model ? um : NULL) == 0, "complex entry: model installed");
+    return 1;
+}
+
+static int cx_case(const char* name, const CxScn* sc, CxIn* in, CxRun* r) {
+    McabTestUnitConfig cfg = cx_unit_config();
+    Ul4* p = ul4_create(&cfg);
+    void* mem = NULL;
+    UlcnetNnStage* stage = NULL;
+    CxModel m;
+    UlcnetModel um;
+    int ok;
+    CHECK(p != NULL, "complex entry: create the front end");
+    ok = cx_fresh_stage(&mem, &stage, &m, &um, sc->use_model);
+    if (ok) ok = cx_drive(p, stage, sc, in, 0, &m, r, NULL) && cx_check(sc, in, r);
+    free(mem);
+    ul4_destroy(p);
+    if (!ok) return 0;
+    printf("  complex entry [%s]: hop0 peak %.6f, max |stage - direct DFT| %.3g, %ld inferences, %ld resets\n",
+           name, r->peak0, r->max_err, r->calls, r->resets);
+    CHECK(r->max_err < 2e-6, "complex entry: PCM equals the direct-DFT accumulate reference");
+    CHECK(r->chain_bad == 0, "complex entry: PCM equals the audiolib accumulate chain bit for bit");
+    return 1;
+}
+
+static int test_complex_entry_accumulate(void) {
+    static CxIn in;
+    static CxRun r;
+    const int R = ULCNET_NN_STAGE_REPRIME_FRAMES;
+    CxScn sc;
+    cx_make_input(&in, CX_MAX_HOPS);
+
+    /* first hop and steady state: solid on the very first hop, no event -- one submission per hop
+     * from hop #0, and a first hop that is real output */
+    sc = (CxScn){ .hops = 24, .use_model = 1, .changed_at = -1, .solid_off_at = -1, .solid_back_at = -1,
+                  .fail_from = -1, .fail_to = -1 };
+    CHECK(cx_case("first+steady", &sc, &in, &r), "complex entry: first hop and steady state");
+    CHECK(r.peak0 > 0.005, "complex entry: hop #0 is real output (non-zero)");
+    CHECK(r.calls == 24 && r.resets == 0 && r.ran[0] == 1,
+          "complex entry: one submission on the first hop and on every hop after it");
+
+    /* identity (no model) and model failure: the beamformed spectrum passes through unchanged */
+    sc.use_model = 0;
+    CHECK(cx_case("identity", &sc, &in, &r) && r.calls == 0, "complex entry: identity path");
+    sc.use_model = 1; sc.fail_from = 6; sc.fail_to = 10;
+    CHECK(cx_case("model-failure", &sc, &in, &r), "complex entry: failing model falls open");
+    CHECK(r.calls == 24 && !r.accepted[6] && !r.accepted[9] && r.accepted[10],
+          "complex entry: failed frames are not applied, later frames are");
+
+    /* mid-stream realignment, hop 8 after seven normal hops */
+    sc = (CxScn){ .hops = 24, .use_model = 1, .changed_at = 8, .solid_off_at = -1, .solid_back_at = -1,
+                  .fail_from = -1, .fail_to = -1 };
+    CHECK(cx_case("changed@8", &sc, &in, &r), "complex entry: generation change");
+    {
+        int skipped_ok = 1;
+        for (int h = 8; h < 8 + R; ++h) if (r.ran[h]) skipped_ok = 0;
+        CHECK(r.resets == 1 && skipped_ok && r.ran[7] == 1 && r.ran[8 + R] == 1 &&
+              r.calls == 24 - R,
+              "complex entry: model reset once, no submission on the event hop, exactly one on the next");
+    }
+
+    /* solid false -> true with earlier hops: boundary at the relock hop */
+    sc = (CxScn){ .hops = 24, .use_model = 1, .changed_at = -1, .solid_off_at = 6, .solid_back_at = 12,
+                  .fail_from = -1, .fail_to = -1 };
+    CHECK(cx_case("solid-relock@12", &sc, &in, &r), "complex entry: solid false -> true");
+    {
+        int skipped_ok = 1;
+        for (int h = 12; h < 12 + R; ++h) if (r.ran[h]) skipped_ok = 0;
+        CHECK(r.resets == 1 && skipped_ok && r.ran[11] == 1 && r.ran[12 + R] == 1 &&
+              r.calls == 24 - R,
+              "complex entry: relock resets once, skips the event hop, submits on the next");
+    }
+
+    /* full reset after non-zero overlap, replayed three ways */
+    sc = (CxScn){ .hops = 20, .use_model = 1, .changed_at = 5, .solid_off_at = -1, .solid_back_at = -1,
+                  .fail_from = -1, .fail_to = -1 };
+    {
+        McabTestUnitConfig cfg = cx_unit_config();
+        Ul4* p = ul4_create(&cfg);
+        void *m1 = NULL, *m2 = NULL;
+        UlcnetNnStage *s1 = NULL, *s2 = NULL;
+        CxModel ma, mb;
+        UlcnetModel ua, ub;
+        static CxRun first, replay, fresh, e2e;
+        int spec_diff = 0;
+        CHECK(p != NULL, "complex entry: reset case front end");
+        CHECK(cx_fresh_stage(&m1, &s1, &ma, &ua, 1) && cx_fresh_stage(&m2, &s2, &mb, &ub, 1),
+              "complex entry: reset case stages");
+        CHECK(cx_drive(p, s1, &sc, &in, 0, &ma, &first, NULL) && cx_check(&sc, &in, &first),
+              "complex entry: reset case first pass");
+        {   /* overlap is non-zero at the reset */
+            double e = 0.0;
+            for (int i = 0; i < HOP; ++i) e += fabs((double)first.out[sc.hops - 1][i]);
+            CHECK(e > 1e-3, "complex entry: the stream carries non-zero overlap into the reset");
+        }
+        /* (a) the stage alone, same recorded spectra */
+        ma.calls = 0; ma.resets = 0;
+        ulcnet_nn_stage_reset(s1);
+        CHECK(ma.resets == 1, "complex entry: stage reset resets the model once");
+        ma.resets = 0;
+        CHECK(cx_drive(NULL, s1, &sc, &in, 1, &ma, &replay, NULL) && cx_check(&sc, &in, &replay),
+              "complex entry: stage replay");
+        CHECK(cx_drive(NULL, s2, &sc, &in, 1, &mb, &fresh, NULL) && cx_check(&sc, &in, &fresh),
+              "complex entry: fresh stage pass");
+        CHECK(memcmp(replay.out, fresh.out, sizeof(replay.out)) == 0 &&
+              memcmp(replay.out, first.out, sizeof(replay.out)) == 0,
+              "complex entry: PCM after a stage reset equals a new stage and the first pass bit for bit");
+        CHECK(memcmp(replay.ran, fresh.ran, sizeof(replay.ran)) == 0 &&
+              replay.calls == fresh.calls && ma.resets == mb.resets,
+              "complex entry: submission timing after the reset equals a new stage");
+        CHECK(replay.max_err < 2e-6 && replay.chain_bad == 0 && fresh.chain_bad == 0,
+              "complex entry: both replays match the references restarted from zero");
+        printf("  complex entry [reset]: hop0 peak %.6f (replay) / %.6f (first), submissions first=%ld replay=%ld fresh=%ld, event hop5 ran=%d, max err %.3g\n",
+               replay.peak0, first.peak0, first.calls, replay.calls, fresh.calls, replay.ran[5], replay.max_err);
+        /* (b) end to end: the whole pair reset (the front end here, the stage under test beside it),
+         * the front end regenerates the spectrum from the same four-channel input */
+        ma.calls = 0; ma.resets = 0;
+        ulcnet_nn_stage_reset(s1);
+        ul4_reset(p);
+        ma.resets = 0;
+        CHECK(cx_drive(p, s1, &sc, &in, 2, &ma, &e2e, &spec_diff) && cx_check(&sc, &in, &e2e),
+              "complex entry: end-to-end replay after the paired reset");
+        CHECK(spec_diff == 0, "complex entry: the reset front end regenerates the same beamformed spectrum");
+        CHECK(memcmp(e2e.out, first.out, sizeof(e2e.out)) == 0 && e2e.calls == first.calls,
+              "complex entry: end-to-end PCM and submission count equal the first pass");
+        free(m1); free(m2);
+        ul4_destroy(p);
+    }
+    return 1;
+}
+
 static int run_all_tests(void) {
     CHECK(test_example_unit_config_grid(),
           "example unit config: the stage's grid, linear context only");
@@ -2506,6 +2828,8 @@ static int run_all_tests(void) {
     CHECK(test_phased_hop(), "phased hop (begin / nn / end)");
     CHECK(test_recovery_equals_fresh_pair(),
           "recovery: the paired reset restarts the stream as a fresh pair");
+    CHECK(test_complex_entry_accumulate(),
+          "complex entry: accumulate reference, realignment and reset");
     return 1;
 }
 

@@ -1,7 +1,12 @@
 /* Align-ULCNet pre/post class, frequency domain only (framing: ulcnet_process.h): the caller's spectra to the
  * accelerator's tensors and back. Per hop: pre_process_freq, frame_open, the NPU run, frame_finish (or frame_bypass),
  * post_process_freq. The recurrent state is outside the pool: it belongs to the application and is optionally
- * registered in the config. */
+ * registered in the config.
+ *
+ * Packet boundary (config frames_per_call N >= 2, model layout ULCNET_MODEL_IO_PACKET_LAYOUT_VERSION): the same
+ * sequence with pre_process_packet in place of pre_process_freq, one NPU run for the N frames, and N * n_bins values
+ * per spectrum plane everywhere a one-frame call takes n_bins. A frame marked as an alignment event passes the error
+ * spectrum through unchanged and is reset in the graph; the host does not restart the state for it. */
 
 #ifndef ULCNET_PREPOST_H
 #define ULCNET_PREPOST_H
@@ -17,11 +22,13 @@ extern "C" {
 
 #define ULCNET_PREPOST_DESCRIPTOR_VERSION 1u
 /* Folded into build_flags_hash; bump on any change of pool size, carve order or descriptor content. */
-#define ULCNET_PREPOST_CARVE_VERSION 8u
+#define ULCNET_PREPOST_CARVE_VERSION 9u
 
 typedef struct UlcnetPrepostConfig {
     UlcnetGrid   grid;         /* ulcnet_grid_make(); copied at init; D is a sanity bound only */
-    uint32_t model_layout_version; /* 0 = ULCNET_MODEL_IO_LAYOUT_VERSION; else must equal it and the graph metadata */
+    uint32_t model_layout_version; /* 0 = ULCNET_MODEL_IO_LAYOUT_VERSION (PACKET_LAYOUT_VERSION when frames_per_call >= 2);
+                                    * else must equal it and the graph metadata */
+    int          frames_per_call;  /* 0 or 1: one frame per graph call; 2..ULCNET_MODEL_IO_MAX_FRAMES_PER_CALL: a packet */
     /* Optional registration of the application's recurrent state: borrowed buffers (they must outlive the instance),
      * element counts not bytes; a float host registers all four (zeroed at init and reset, checked whole at every
      * frame_finish), a board none. Every pair set or all NULL/0, else refused; not in the pool size or hash. */
@@ -86,6 +93,7 @@ void ulcnet_prepost_reset(UlcnetPrepost *p);
 uint32_t ulcnet_prepost_state_generation(const UlcnetPrepost *p);
 
 int ulcnet_prepost_hop_size(const UlcnetPrepost *p);   /* or -1 */
+int ulcnet_prepost_frames_per_call(const UlcnetPrepost *p);   /* 1 for a one-frame instance; or -1 */
 int ulcnet_prepost_num_bins(const UlcnetPrepost *p);   /* or -1 */
 /* Built from the config's grid and layout; the five interior fields are 0. */
 const UlcnetModelIoDescriptor *ulcnet_prepost_descriptor(const UlcnetPrepost *p);
@@ -97,6 +105,14 @@ const UlcnetModelIoDescriptor *ulcnet_prepost_descriptor(const UlcnetPrepost *p)
 int ulcnet_prepost_pre_process_freq(UlcnetPrepost *p,
                                     const float *err_re, const float *err_im,
                                     const float *far_re, const float *far_im);
+
+/* As _pre_process_freq for a packet instance: N consecutive frames, frame-major, N * n_bins per plane, oldest first;
+ * events[k] != 0 marks frame k as an alignment event (N entries). Refused (-1) on a one-frame instance, as
+ * _pre_process_freq is on a packet one. */
+int ulcnet_prepost_pre_process_packet(UlcnetPrepost *p,
+                                      const float *err_re, const float *err_im,
+                                      const float *far_re, const float *far_im,
+                                      const int *events);
 
 /* Publish the current frame's accelerator boundary. `output` is NaN-prefilled so an unwritten frame is caught by
  * frame_finish. Each state output has the address of its state input: read every state input before writing any state
@@ -113,10 +129,11 @@ int ulcnet_prepost_frame_open(UlcnetPrepost *p,
 int ulcnet_prepost_frame_finish(UlcnetPrepost *p);
 
 /* Identity for the current frame (after a failed run or a reprime): the error spectrum passes through without the AEC
- * output guard, so on a guard hop it can exceed the capture. State is left as is. Returns 0, or -1. */
+ * output guard, so on a guard hop it can exceed the capture. State is left as is. Returns 0, or -1. A packet is
+ * bypassed whole: all N frames. */
 int ulcnet_prepost_frame_bypass(UlcnetPrepost *p);
 
-/* The enhanced spectrum (n_bins bins) of the frame just finished or bypassed. Returns 0, or -1. */
+/* The enhanced spectrum (n_bins bins; a packet: N * n_bins) of the frame just finished or bypassed. Returns 0, or -1. */
 int ulcnet_prepost_post_process_freq(UlcnetPrepost *p, float *re, float *im);
 
 #ifdef __cplusplus

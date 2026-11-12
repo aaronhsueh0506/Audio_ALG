@@ -242,10 +242,14 @@ class DeepVQES(nn.Module):
 
     def forward_stream(self, microphone: Tensor, far_end: Tensor,
                        state: Dict[str, object]) -> AecOutput:
+        """T=1 (one hop per accelerator call) or T=N (``frames_per_call`` =
+        N): every cell below is already batched over the time axis, so an
+        N-frame call returns the same per-frame output as N one-frame calls.
+        """
         require_complex_btf(microphone, "microphone")
         require_complex_btf(far_end, "far_end")
-        if microphone.shape[1] != 1 or far_end.shape[1] != 1:
-            raise ValueError("forward_stream consumes exactly one frame (T=1)")
+        if microphone.shape[1] < 1 or far_end.shape[1] < 1:
+            raise ValueError("forward_stream needs at least one frame")
         if microphone.shape != far_end.shape:
             raise ValueError("microphone and far_end STFT grids must match")
         if microphone.shape[-1] != self.grid.n_freqs:
@@ -277,8 +281,17 @@ class DeepVQES(nn.Module):
             self.time_order, 2 * self.freq_radius + 1, 3,
         )
         taps = three_vector_complex(raw)
-        spec_hist = state["spec_ring"].step(microphone)[:, 0, 0]
-        enhanced = self._apply_ccm_frame(spec_hist, taps)
+        # Host-side CCM: each frame's convolution reads the ring state the
+        # previous frame left behind, so it is a plain per-frame loop for
+        # T>1 -- never part of the accelerator graph (see _apply_ccm_frame /
+        # lib/aiaec/deepvqe_s's frame_finish, which loops the same way).
+        enhanced = torch.cat([
+            self._apply_ccm_frame(
+                state["spec_ring"].step(microphone[:, i:i + 1])[:, 0, 0],
+                taps[:, i:i + 1],
+            )
+            for i in range(t)
+        ], dim=1)
         return AecOutput(
             enhanced=enhanced,
             delay_distribution=delay,

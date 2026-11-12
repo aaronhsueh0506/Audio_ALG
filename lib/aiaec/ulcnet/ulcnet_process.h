@@ -1,8 +1,8 @@
 /* Align-ULCNet outside the network; the application frames with audiolib on a run-time UlcnetGrid (ulcnet_model_io.h;
  * Python reference aiaec_streaming). Trained against: sqrt-Hann (ac_window_build default); analysis AcStft from
  * ac_stft_config_default(&sc, grid.n_fft), hop = grid.hop, spec_scale 1, center 0 (one frame per push; the Python
- * reference is centered: 0, 2, then 1); synthesis AcIstft, same config, ola AC_OLA_ENV_NORM, ispec_scale 1, first
- * frame emits nothing, latency grid.hop. FftHandle and window table: caller-owned, shareable. */
+ * reference is centered: 0, 2, then 1); synthesis AcIstft, same config, ola AC_OLA_ACCUMULATE, ispec_scale 1, every
+ * push emits a full hop (hop #0 included), latency grid.hop. FftHandle and window table: caller-owned, shareable. */
 
 #ifndef ULCNET_PROCESS_H
 #define ULCNET_PROCESS_H

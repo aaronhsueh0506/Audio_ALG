@@ -65,9 +65,8 @@ CFG_SIG_PAYLOAD := CC_TARGET_SIG=$(CC_TARGET_SIG) CC=$(CC) AR=$(AR) CFLAGS=$(CFL
 CFG_SIG := $(shell printf '%s' "$(CFG_SIG_PAYLOAD)" | cksum | cut -d' ' -f1)
 OBJ_DIR := $(BUILD_DIR)/simd$(SIMD)-$(CFG_SIG)
 
-# The DeepVQE-S core, recompiled here under this OBJ_DIR (mirroring how stream/ainr/dfn2/Makefile
-# recompiles lib/ainr/dfn2's core under its own OBJ_DIR): same two sources AIAEC/Makefile's own
-# OBJECTS list uses for this model, now resolved from lib/aiaec/deepvqe_s/.
+# The only DeepVQE-S PCM stream ABI (frames_per_call 1..64, AC_OLA_ACCUMULATE); every caller in
+# this tree (aiaec.c's catalog dispatch, the board sample) uses it.
 CORE_SOURCES := ../../../lib/aiaec/deepvqe_s/deepvqe_process.c \
 	../../../lib/aiaec/deepvqe_s/deepvqe_prepost.c
 CORE_HEADERS := ../../../lib/aiaec/deepvqe_s/deepvqe_process.h \
@@ -83,13 +82,8 @@ VPATH := ../../../lib/aiaec/deepvqe_s
 SMOKE_BIN := $(OBJ_DIR)/smoke_deepvqe_stream
 SMOKE_SOURCES := tests/smoke_deepvqe_stream.c $(CORE_SOURCES) deepvqe_stream.c
 
-# Compares deepvqe_stream against an independent re-implementation of the board sample's own
-# loop, built directly against lib/aiaec/deepvqe_s + audiolib (never against deepvqe_stream.c's
-# internals); see the file's own header comment.
-VERIFY_VS_SAMPLE_BIN := $(OBJ_DIR)/verify_vs_sample
-VERIFY_VS_SAMPLE_SOURCES := tests/verify_vs_sample.c $(CORE_SOURCES) deepvqe_stream.c
-
-.PHONY: all lib print-lib-path print-cflags print-sources test smoke verify-vs-sample audit-no-stdio clean _cfg_guard
+.PHONY: all lib print-lib-path print-cflags print-sources test smoke verify-vs-sample \
+	audit-no-stdio clean _cfg_guard
 
 all: lib
 
@@ -135,21 +129,13 @@ $(SMOKE_BIN): $(SMOKE_SOURCES) $(CORE_HEADERS) $(STREAM_HEADERS) $(COMMON_LIB) $
 smoke: $(SMOKE_BIN)
 	"$(SMOKE_BIN)"
 
-$(VERIFY_VS_SAMPLE_BIN): $(VERIFY_VS_SAMPLE_SOURCES) $(CORE_HEADERS) $(STREAM_HEADERS) $(COMMON_LIB) $(COMMON_HEADERS) | _cfg_guard
-	$(CC) $(CFLAGS) $(SIMD_CPPFLAGS) $(VERIFY_VS_SAMPLE_SOURCES) "$(COMMON_LIB)" \
-		$(LDFLAGS) -lm -o "$@"
-
-verify-vs-sample: $(VERIFY_VS_SAMPLE_BIN)
-	"$(VERIFY_VS_SAMPLE_BIN)"
-	"$(VERIFY_VS_SAMPLE_BIN)" --inject-shift
-	"$(VERIFY_VS_SAMPLE_BIN)" --ola-matters
-
 test: smoke verify-vs-sample
 
-# audit-no-stdio: builds the archive and asserts, via `nm -u`, that deepvqe_stream.o references
-# no stdio symbol (nothing in this model needs stdio at all, unlike DFN2's file loader).
-# TOOLCHAIN_FWD comes from lib/deps.mk (included above): CC/CXX/EXTRA_CFLAGS/WERROR, shared with
-# the COMMON_LIB resolution below instead of each spelling out the same four vars again.
+# audit-no-stdio: builds the archive (the one every real caller in this tree links) and asserts,
+# via `nm -u`, that deepvqe_stream.o references no stdio symbol (nothing in this model needs
+# stdio at all, unlike DFN2's file loader). TOOLCHAIN_FWD comes from lib/deps.mk (included
+# above): CC/CXX/EXTRA_CFLAGS/WERROR, shared with the COMMON_LIB resolution below instead of each
+# spelling out the same four vars again.
 audit-no-stdio:
 	@$(MAKE) --no-print-directory NO_STDIO=1 SIMD=$(SIMD) $(TOOLCHAIN_FWD) lib >/dev/null
 	@obj_dir="$$($(MAKE) -s --no-print-directory NO_STDIO=1 SIMD=$(SIMD) $(TOOLCHAIN_FWD) print-lib-path)"; \
@@ -159,6 +145,23 @@ audit-no-stdio:
 	  echo "FAIL: deepvqe_stream.o references stdio symbols:" >&2; echo "$$undef" >&2; exit 1; \
 	fi; \
 	echo "audit-no-stdio: PASS ($$obj_dir/deepvqe_stream.o has no stdio references)"
+
+VERIFY_VS_SAMPLE_BIN := $(OBJ_DIR)/verify_vs_sample
+VERIFY_VS_SAMPLE_SOURCES := tests/verify_vs_sample.c $(CORE_SOURCES) deepvqe_stream.c
+
+$(VERIFY_VS_SAMPLE_BIN): $(VERIFY_VS_SAMPLE_SOURCES) $(CORE_HEADERS) $(STREAM_HEADERS) $(COMMON_LIB) $(COMMON_HEADERS) | _cfg_guard
+	$(CC) $(CFLAGS) $(SIMD_CPPFLAGS) $(VERIFY_VS_SAMPLE_SOURCES) "$(COMMON_LIB)" \
+		$(LDFLAGS) -lm -o "$@"
+
+# verify_vs_sample.c compares an independent hand-rolled re-implementation of deepvqe_stream.c's
+# own per-hop lifecycle (its own driver A, built directly against the CORE_SOURCES lib, not the
+# archive) against deepvqe_stream.c itself (driver B, same CORE_SOURCES, its own object compiled
+# straight into this binary -- see verify_vs_sample.c's own top comment), and (in --ola-matters
+# mode) a third, separate driver pair to prove the OLA-mode choice is itself load-bearing.
+verify-vs-sample: $(VERIFY_VS_SAMPLE_BIN)
+	"$(VERIFY_VS_SAMPLE_BIN)" && \
+	"$(VERIFY_VS_SAMPLE_BIN)" --inject-shift && \
+	"$(VERIFY_VS_SAMPLE_BIN)" --ola-matters
 
 clean:
 	rm -rf "$(BUILD_DIR)"

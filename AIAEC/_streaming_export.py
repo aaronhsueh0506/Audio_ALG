@@ -221,7 +221,7 @@ DEEPVQE_C_LAYOUT_VERSION = 4
 DEEPVQE_COMPRESSION_EXPONENT = 0.3
 
 
-def _deepvqe_c_descriptor(built, outputs) -> Dict[str, int]:
+def _deepvqe_c_descriptor(built, outputs, frames_per_call=1) -> Dict[str, int]:
     """DeepVqePrepostDescriptor (DeepVQE_S/deepvqe_prepost.h), MEASURED off
     the graph just built rather than restated by hand: the head's tap axes,
     the conv and score window depths, the GRU shape, the alignment depth and
@@ -236,16 +236,18 @@ def _deepvqe_c_descriptor(built, outputs) -> Dict[str, int]:
         for name, tensor in zip(input_names, inputs)
     }
     head = tuple(int(size) for size in outputs[0].shape)
-    # The CCM taps cross the accelerator boundary as one rank-4 tensor.  Its
-    # packed channel keeps the model's row-major [time][frequency][RI] order,
-    # so the C postprocessor can consume it without a transpose or copy.
+    # The CCM taps cross the accelerator boundary as one rank-4 tensor per
+    # frame.  Its packed channel keeps the model's row-major
+    # [time][frequency][RI] order, so the C postprocessor can consume it
+    # without a transpose or copy; the time axis (position 1) holds
+    # frames_per_call frames, oldest first.
     time_order = int(wrapper.model.time_order)
     freq_taps = 2 * int(wrapper.model.freq_radius) + 1
     packed_width = time_order * freq_taps * 2
-    if head != (1, 1, grid.n_freqs, packed_width):
+    if head != (1, frames_per_call, grid.n_freqs, packed_width):
         raise ValueError(
-            'DeepVQE_S head is not packed [1,1,F,T*K*2]=[1,1,%d,%d]: %r'
-            % (grid.n_freqs, packed_width, head))
+            'DeepVQE_S head is not packed [1,N,F,T*K*2]=[1,%d,%d,%d]: %r'
+            % (frames_per_call, grid.n_freqs, packed_width, head))
     h_gru = shapes['h_gru']                       # [1, layers, 1, hidden]
     conv = shapes['state_mic1_history']           # [1, C, window, F]
     key_ring = shapes['state_align_key_ring']     # [1, sim, D, F2]
@@ -258,6 +260,9 @@ def _deepvqe_c_descriptor(built, outputs) -> Dict[str, int]:
             'DeepVQE_S alignment depth is inconsistent: key ring %d, score '
             'history %d, model %d'
             % (depth, score[3], alignment_depth(wrapper.model)))
+    # frames_per_call is not a field of this descriptor (DEEPVQE_PREPOST_LAYOUT_VERSION's own
+    # comment: it is tracked by the pool's build_flags_hash instead, same as DFN2's
+    # input_frames/frames_per_call split); only the top-level metadata key below carries it.
     return {
         'layout_version': DEEPVQE_C_LAYOUT_VERSION,
         'delay_depth': depth,
@@ -288,11 +293,12 @@ _C_DESCRIPTORS = {
 }
 
 
-def c_descriptor(model_name: str, built, outputs) -> Optional[Dict[str, int]]:
+def c_descriptor(model_name: str, built, outputs,
+                 frames_per_call=1) -> Optional[Dict[str, int]]:
     """The compiled-ABI descriptor the model's C class validates, or None
     for a model with no C class."""
     measure = _C_DESCRIPTORS.get(model_name)
-    return None if measure is None else measure(built, outputs)
+    return None if measure is None else measure(built, outputs, frames_per_call)
 
 
 def state_precision_policy(model_name: str) -> Dict[str, str]:
@@ -758,11 +764,16 @@ class StatelessOneFrameAIAEC(nn.Module):
             'up1', state['res2'].step(value + model.skip2(m2)), m1.shape[-1]
         )
         packed = state['ccm_up'].conv_cell.step(value + model.skip1(m1))
-        # [1,36,1,W] -> [1,W,1,36] -> [1,1,2W,18]: phase-major channels make
+        # [1,36,T,W] -> [1,T,W,36] -> [1,T,2W,18]: phase-major channels make
         # the flatten of (W, phase) the shuffled bin order, so the layout is
-        # exactly the CCM memory order deepvqe_ccm_process consumes.
-        taps = packed.permute(0, 3, 2, 1).reshape(
-            1, 1, 2 * self._ccm_pre_shuffle_width, -1
+        # exactly the CCM memory order deepvqe_ccm_process consumes, one
+        # frame at a time; T is carried as its own axis (not merged into the
+        # reshape) so it generalizes to frames_per_call > 1 without mixing
+        # one frame's channels into another's. T == 1 reduces to the same
+        # flattened order as the former [1,1,2W,18]-only formula.
+        _, channels, time, _ = packed.shape
+        taps = packed.permute(0, 2, 3, 1).reshape(
+            1, time, 2 * self._ccm_pre_shuffle_width, channels // 2
         )
         extra = 2 * self._ccm_pre_shuffle_width - model.grid.n_freqs
         if extra > 0:
@@ -863,16 +874,42 @@ def host_signal_inputs(model_name: str, model, signals):
     return tuple(signals)
 
 
-def _build(model_name: str, model):
+# Models whose streaming cells are verified to batch frames_per_call > 1
+# frames in one call (see AIAEC/aiaec_streaming.py's DelayRingCell/
+# FrameDelayAttentionCell and this module's _deepvqe CCM-tap packing).
+# Align_CRUSE's GlobalDelayAttentionCell and CAGCRN's _stream_* helpers have
+# not been generalized or verified this way, so frames_per_call > 1 is
+# refused for them rather than silently traced as if it were correct.
+FRAMES_PER_CALL_READY_MODELS = ('DeepVQE_S',)
+# Align-ULCNet batches frames through its own packet graph (unrolled frames with
+# a per-frame alignment-event input, Align_ULCNet/export_onnx.py
+# AlignUlcnetPacketExport), not through this module's time-batched cells; its
+# exporter and calibration backend drive it directly.
+PACKET_GRAPH_MODELS = ('Align_ULCNet',)
+MAX_FRAMES_PER_CALL = 64
+
+
+def _build(model_name: str, model, frames_per_call: int = 1):
     if (model_name == 'DeepVQE_S'
             and model.compression_exponent != DEEPVQE_COMPRESSION_EXPONENT):
         raise ValueError(
             'DeepVQE_S host front end is compiled for compression exponent '
             '%r, checkpoint has %r'
             % (DEEPVQE_COMPRESSION_EXPONENT, model.compression_exponent))
+    if (frames_per_call != 1
+            and model_name not in FRAMES_PER_CALL_READY_MODELS):
+        raise ValueError(
+            '%s has not been verified for frames_per_call > 1; only %s has'
+            % (model_name, FRAMES_PER_CALL_READY_MODELS))
+    if (isinstance(frames_per_call, bool)
+            or not isinstance(frames_per_call, int)
+            or not 1 <= frames_per_call <= MAX_FRAMES_PER_CALL):
+        raise ValueError('frames_per_call must be an integer in [1, %d], got %r'
+                         % (MAX_FRAMES_PER_CALL, frames_per_call))
     wrapper = StatelessOneFrameAIAEC(model_name, model).eval()
-    shape = ((1, 2, 1, model.grid.n_freqs) if model_name == 'DeepVQE_S'
-             else (1, 1, model.grid.n_freqs, 2))
+    shape = ((1, 2, frames_per_call, model.grid.n_freqs)
+             if model_name == 'DeepVQE_S'
+             else (1, frames_per_call, model.grid.n_freqs, 2))
     inputs = (torch.randn(shape), torch.randn(shape)) + wrapper.initial_state()
     input_names = ('mic', 'far') + wrapper.state_names
     output_names = ('output',) + tuple(
@@ -909,13 +946,18 @@ def _verify_onnx(path, wrapper, inputs, input_names, split: GraphSplit,
 
 
 def export_graph(grid, built, checkpoint_path, output_path, checkpoint_depth,
-                 opset=17, verify=False):
+                 opset=17, verify=False, frames_per_call=1):
     """Write the streaming graph plus its metadata JSON; optionally verify.
 
     Shared by the export CLI and the calib recorder, so the calibration tensors
     and the graph they bind to come from the same wrapper in the same process.
     ``checkpoint_depth`` is the alignment depth the checkpoint recorded,
-    captured by the caller BEFORE any deployment override. Returns the metadata
+    captured by the caller BEFORE any deployment override. ``frames_per_call``
+    (N, default 1) must be the same value ``built`` was constructed with
+    (``_build``'s own `frames_per_call`); a one-frame graph (N == 1) is
+    byte-for-byte what this function wrote before the option existed, and
+    records no ``frames_per_call`` metadata key, matching
+    ``AINR/DeepFilterNet2/export_onnx.py``'s rule. Returns the metadata
     written into the graph.
     """
     wrapper, inputs, input_names, output_names, split = built
@@ -925,6 +967,10 @@ def export_graph(grid, built, checkpoint_path, output_path, checkpoint_depth,
         outputs = wrapper(*inputs)
     if not all(torch.isfinite(value).all() for value in outputs):
         raise RuntimeError('streaming export reference contains NaN or Inf')
+    if frames_per_call != 1 and int(outputs[0].shape[1]) != frames_per_call:
+        raise RuntimeError(
+            'head output time axis is %d, not frames_per_call %d'
+            % (int(outputs[0].shape[1]), frames_per_call))
 
     os.makedirs(os.path.dirname(os.path.abspath(output_path)), exist_ok=True)
     torch.onnx.export(
@@ -949,8 +995,8 @@ def export_graph(grid, built, checkpoint_path, output_path, checkpoint_depth,
         'n_fft': int(grid.n_fft),
         'win_len': int(grid.win_len),
         'hop_len': int(grid.hop_len),
-        'input_feature_frames': 1,
-        'output_frames_per_invocation': 1,
+        'input_feature_frames': frames_per_call,
+        'output_frames_per_invocation': frames_per_call,
         'temporal_padding_inside_graph': False,
         'temporal_context': 'explicit_state_inputs_outputs',
         'accelerator_persistent_state': False,
@@ -964,7 +1010,9 @@ def export_graph(grid, built, checkpoint_path, output_path, checkpoint_depth,
         'checkpoint_max_delay_frames': checkpoint_depth,
         'production_streaming_equivalent': True,
     }
-    descriptor = c_descriptor(model_name, built, outputs)
+    if frames_per_call != 1:
+        metadata['frames_per_call'] = int(frames_per_call)
+    descriptor = c_descriptor(model_name, built, outputs, frames_per_call)
     if descriptor is not None:
         metadata['state_layout_version'] = descriptor['layout_version']
         metadata['c_descriptor'] = descriptor
@@ -1019,15 +1067,26 @@ def main(model_name: str) -> None:
     parser.add_argument('--max-delay-frames', type=int, default=None)
     parser.add_argument('--opset', type=int, default=17)
     parser.add_argument('--verify', action='store_true')
+    parser.add_argument('--frames-per-call', type=int, default=1,
+                        help='frames per accelerator call (default 1); only '
+                             '%s support > 1' % (FRAMES_PER_CALL_READY_MODELS,))
     args = parser.parse_args()
     args.model_name = model_name
+    if not 1 <= args.frames_per_call <= MAX_FRAMES_PER_CALL:
+        parser.error('--frames-per-call must be in [1, %d]'
+                     % MAX_FRAMES_PER_CALL)
+    if (args.frames_per_call != 1
+            and model_name not in FRAMES_PER_CALL_READY_MODELS):
+        parser.error('--frames-per-call > 1 is only supported for %s'
+                     % (FRAMES_PER_CALL_READY_MODELS,))
 
     model, grid = load_checkpoint_model(args.model_name, args.checkpoint)
     checkpoint_depth = alignment_depth(model)
     if args.max_delay_frames is not None:
         set_alignment_depth(model, args.max_delay_frames)
     model.eval()
-    built = _build(args.model_name, model)
+    built = _build(args.model_name, model, args.frames_per_call)
     export_graph(grid, built, args.checkpoint, args.output, checkpoint_depth,
-                 opset=args.opset, verify=args.verify)
+                 opset=args.opset, verify=args.verify,
+                 frames_per_call=args.frames_per_call)
     print(args.output)

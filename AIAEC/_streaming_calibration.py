@@ -36,6 +36,17 @@ another contract version, or retired. ``--primary-is-mic`` stamps itself: the
 derived directory gets its ``linear_error.contract.json`` from the same
 checkpoint contract.
 
+Align-ULCNet only: ``--events PATH`` replays per-hop alignment events
+(Align_ULCNet/alignment_events.py) into the capture. PATH is a record file (one
+primary/far pair) or a directory holding ``<relative wav name without
+.wav>.events.json|csv|npz`` per pair. At ``--frames-per-call N > 1`` the packet's
+``frame_reset`` control carries 1.0 on an event hop (0.0 otherwise; binary, never
+quantized). At N = 1 the graph has no control input: an event hop resets the
+state and is never captured (it is a bypass the accelerator does not run), and
+is not counted in ``--frames``. Without ``--events`` every control is 0 and only
+whole packets are captured; with it a short last packet is kept, zero-completed, and
+its padding slots carry frame_reset 0.
+
 Every calibration run also exports and parity-checks the ONNX graph the
 tensors bind to (default ``<output>.onnx``, override with ``--onnx``).
 
@@ -74,9 +85,9 @@ from calibration_io import (  # noqa: E402
 )
 
 from AIAEC._calibration_common import (
-    blocks_from_pair,
     discover_pairs,
     far_mode_provenance,
+    iter_blocks,
 )
 from AIAEC._export_common import (
     ALL_MODEL_NAMES,
@@ -84,13 +95,20 @@ from AIAEC._export_common import (
     load_checkpoint_model,
     set_alignment_depth,
 )
+from AIAEC._cli_common import require_frames_per_call
 from AIAEC._streaming_export import (
+    FRAMES_PER_CALL_READY_MODELS,
     GraphSplit,
     _build,
     host_signal_inputs,
     export_graph,
     requires_contiguous_calibration,
     state_precision_policy,
+)
+from AIAEC.Align_ULCNet.alignment_events import (
+    EVENTS_HELP,
+    EVENTS_SCHEMA,
+    find_events_file,
 )
 from AIAEC.Align_ULCNet.inference import load_model as load_ulcnet_model
 from AIAEC.dataset_gen.linear_aec import (
@@ -108,12 +126,10 @@ from AIAEC.dataset_gen.linear_error_ledger import (
 from AIAEC.dataset_gen.seq_layout import scan_chunks
 from AIAEC.Align_ULCNet.export_onnx import (
     ERROR_INPUT_SEAM as ULCNET_ERROR_INPUT_SEAM,
-    INPUT_NAMES as ULCNET_INPUT_NAMES,
-    LAYOUT_VERSION as ULCNET_LAYOUT_VERSION,
-    SIGNAL_INPUTS as ULCNET_SIGNAL_INPUTS,
     export_graph as ulcnet_export_graph,
     graph_signals as ulcnet_graph_signals,
     next_state as ulcnet_next_state,
+    packet_frame_reset as ulcnet_packet_frame_reset,
 )
 
 
@@ -209,8 +225,9 @@ def _stamp_from_sidecar(path):
 def _stamp_from_ledger(root):
     """The contract a corpus ledger beside ``root`` records, or ``None``.
 
-    ``None`` covers no ledger and a legacy one without a recorded identity: the
-    fingerprint alone cannot say which front end wrote the data. A ledger that
+    ``None`` covers no ledger and a fingerprint-only one without a recorded
+    identity: the fingerprint alone cannot say which front end wrote the data.
+    A ledger that
     does not name every chunk sequence present is a corpus mid-rematerialization
     (part old front end, part new) and is refused.
     """
@@ -336,6 +353,22 @@ def _materialize_linear_error(pairs, linear_contract, grid, output_path):
     return derived, root
 
 
+def _clip_events(args, relative, primary_path, grid):
+    """The replayed events of one calibration clip, checked against its length."""
+    from AIAEC.Align_ULCNet.alignment_events import AlignmentEvents
+    from AIAEC.inference_common import load_linear_error_far
+
+    path = (find_events_file(args.events, relative)
+            if os.path.isdir(args.events) else args.events)
+    events = AlignmentEvents.load(path)
+    # Length at the model rate, as blocks_from_pair sees it (primary is the
+    # linear-error stem; --primary-is-mic derives it at the same length).
+    samples = load_linear_error_far(str(primary_path), None,
+                                    grid.sr)[0].shape[-1]
+    events.require_hops(samples, grid.hop_len)
+    return events
+
+
 def main(model_name: str) -> None:
     """Run one model's calib CLI; each model's inference.py names itself."""
     if model_name not in ALL_MODEL_NAMES:
@@ -350,7 +383,14 @@ def main(model_name: str) -> None:
     parser.add_argument('--frames', type=int, default=256,
                         help='number of streaming invocations to capture')
     parser.add_argument('--max-delay-frames', type=int, default=None)
+    parser.add_argument('--frames-per-call', type=int, default=1, metavar='N',
+                        help='STFT frames per streaming invocation (default 1): '
+                             'the graph and every captured tensor carry N time '
+                             'frames, --frames still counts invocations. Only '
+                             '%s support N > 1' % (FRAMES_PER_CALL_READY_MODELS,))
     parser.add_argument('--seed', type=int, default=42)
+    parser.add_argument('--events', default=None, metavar='PATH',
+                        help='Align_ULCNet only: ' + EVENTS_HELP)
     parser.add_argument('--onnx', default=None,
                         help='where to write the graph these tensors bind to '
                              '(default: <output>.onnx)')
@@ -375,6 +415,10 @@ def main(model_name: str) -> None:
     if args.frames <= 0:
         parser.error('--frames must be positive')
     try:
+        require_frames_per_call(args.model_name, args.frames_per_call)
+    except ValueError as error:
+        parser.error(str(error))
+    try:
         artifact_format = resolve_calibration_format(args.output, args.format)
     except ValueError as error:
         parser.error(str(error))
@@ -388,6 +432,9 @@ def main(model_name: str) -> None:
                      'Align_ULCNet --primary-dir linear-error WAVs, not to '
                      '--primary-is-mic or the microphone-input models')
 
+    if args.events and args.model_name != 'Align_ULCNet':
+        parser.error('--events applies only to Align_ULCNet')
+
     # Pairs are discovered before the model load and export, so a bad
     # --primary-dir/--far-dir fails on its own actionable error first.
     pair_replace = None
@@ -398,6 +445,13 @@ def main(model_name: str) -> None:
         pair_replace = (pieces[0], pieces[1])
     pairs = discover_pairs(args.primary_dir, args.far_dir, pair_replace)
     random.Random(args.seed).shuffle(pairs)
+    if args.events:
+        if os.path.isfile(args.events) and len(pairs) != 1:
+            parser.error('--events names one record file but %d primary/far '
+                         'pairs were found; pass a directory of '
+                         '<name>.events.json|csv|npz records' % len(pairs))
+        if not os.path.exists(args.events):
+            parser.error('--events path does not exist: %s' % args.events)
 
     # The graph is exported (and parity-checked) in the same process, from
     # the same wrapper the tensors below are recorded against, so the two
@@ -419,14 +473,18 @@ def main(model_name: str) -> None:
                 args.allow_unstamped_linear_error))
         wrapper, dummy, graph_metadata = ulcnet_export_graph(
             model, args.checkpoint, onnx_path, verify=True,
+            frames_per_call=args.frames_per_call,
         )
-        input_names = ULCNET_INPUT_NAMES
+        # The one-frame graph and the packet graph differ in input names (the
+        # packet graph adds the frame_reset control), so both come off the
+        # wrapper that was just exported.
+        input_names = wrapper.input_names
         # One head plus full next-state; the state slots are taken from
         # next_state() rather than sliced, so only signal_inputs is read.
         split = GraphSplit(
-            signal_inputs=ULCNET_SIGNAL_INPUTS, head_outputs=1
+            signal_inputs=wrapper.signal_inputs, head_outputs=1
         )
-        state_layout_version = ULCNET_LAYOUT_VERSION
+        state_layout_version = graph_metadata['state_layout_version']
         # Which linear-AEC front end produced the error tensors these ranges
         # describe: the checkpoint's own contract, the same fields the graph
         # sidecar carries. Only Align-ULCNet consumes a linear error; the
@@ -441,12 +499,18 @@ def main(model_name: str) -> None:
 
         # The block carries RAW error/far RI; graph_signals applies the host
         # front end. State is rebuilt by next_state() rather than sliced.
-        def make_signal(block):
-            return ulcnet_graph_signals(
+        def make_signal(block, control):
+            signals = ulcnet_graph_signals(
                 model,
                 torch.from_numpy(block['error']).unsqueeze(0),
                 torch.from_numpy(block['far']).unsqueeze(0),
             )
+            if args.frames_per_call != 1:
+                # The packet's frame_reset: the replayed events of its frames
+                # (all 0 without --events), exact 0.0 / 1.0 values.
+                signals = signals + (ulcnet_packet_frame_reset(
+                    control, args.frames_per_call),)
+            return signals
 
         def advance_state(state, outputs):
             return ulcnet_next_state(outputs)
@@ -461,14 +525,15 @@ def main(model_name: str) -> None:
         if args.max_delay_frames is not None:
             set_alignment_depth(model, args.max_delay_frames)
         model.eval()
-        built = _build(args.model_name, model)
+        built = _build(args.model_name, model, args.frames_per_call)
         graph_metadata = export_graph(grid, built, args.checkpoint, onnx_path,
-                                      checkpoint_depth, verify=True)
+                                      checkpoint_depth, verify=True,
+                                      frames_per_call=args.frames_per_call)
         wrapper, dummy, input_names, _output_names, split = built
         signal_names = input_names[:split.signal_inputs]
-        state_layout_version = None
+        state_layout_version = graph_metadata.get('state_layout_version')
 
-        def make_signal(block):
+        def make_signal(block, control):
             return host_signal_inputs(args.model_name, model, tuple(
                 torch.from_numpy(block[name]).unsqueeze(0)
                 for name in signal_names
@@ -480,16 +545,21 @@ def main(model_name: str) -> None:
 
     captured = {}
     source_files = []
+    event_frames = 0
     with torch.no_grad():
         for relative, primary_path, far_path in pairs:
-            blocks = list(blocks_from_pair(
+            # With --events the short last packet is kept and zero-completed
+            # (its padding slots carry frame_reset 0); without it only whole
+            # packets are captured, as before.
+            blocks = list(iter_blocks(
                 args.model_name,
                 model,
                 grid,
                 primary_path,
                 far_path,
-                1,
+                args.frames_per_call,
                 feature_config,
+                pad_tail=bool(args.events),
             ))
             if not blocks:
                 continue
@@ -499,9 +569,28 @@ def main(model_name: str) -> None:
             state = tuple(
                 value.clone() for value in dummy[split.signal_inputs:]
             )
+            clip_events = None
+            if args.events:
+                clip_events = _clip_events(args, relative, primary_path,
+                                           grid)
             used = False
-            for block in blocks:
-                inputs = make_signal(block) + state
+            for block_index, (block, real) in enumerate(blocks):
+                if clip_events is None:
+                    control = [0] * args.frames_per_call
+                else:
+                    # Slots past ``real`` (tail padding) are never events.
+                    control = clip_events.packet_control(
+                        block_index * args.frames_per_call,
+                        real, args.frames_per_call)
+                    event_frames += sum(control)
+                if args.frames_per_call == 1 and control[0]:
+                    # N = 1 boundary: no control input. The event hop is a
+                    # bypass the accelerator never runs; the state restarts.
+                    state = tuple(
+                        value.clone() for value in dummy[split.signal_inputs:]
+                    )
+                    continue
+                inputs = make_signal(block, control) + state
                 capture_calibration_inputs(captured, input_names, inputs)
                 outputs = wrapper(*inputs)
                 state = advance_state(state, outputs)
@@ -529,7 +618,10 @@ def main(model_name: str) -> None:
         if np.issubdtype(value.dtype, np.floating):
             value = value.astype(np.float32, copy=False)
         arrays[name] = value
-    policy = state_precision_policy(args.model_name)
+    policy = dict(state_precision_policy(args.model_name))
+    if args.model_name == 'Align_ULCNet' and args.frames_per_call != 1:
+        # A 0/1 control input is not an activation: no range, no integer PTQ.
+        policy['frame_reset'] = 'binary_control_no_ptq'
     report = {
         'schema': 'aiaec-stateless-stream-calibration-v1',
         'model_family': args.model_name,
@@ -539,7 +631,7 @@ def main(model_name: str) -> None:
         'n_fft': int(grid.n_fft),
         'win_len': int(grid.win_len),
         'hop_len': int(grid.hop_len),
-        'input_feature_frames': 1,
+        'input_feature_frames': args.frames_per_call,
         'primary_source': (
             'raw_mic_via_frozen_pbfdkf' if args.primary_is_mic
             else 'materialized_primary_wavs'),
@@ -570,6 +662,17 @@ def main(model_name: str) -> None:
         'inputs': input_range_report(arrays, policy),
         **frontend_stamp,
     }
+    if args.frames_per_call != 1:
+        report['frames_per_call'] = int(args.frames_per_call)
+    if args.events:
+        report['alignment_events'] = {
+            'schema': EVENTS_SCHEMA,
+            'source': os.path.abspath(args.events),
+            'edge_rule': 'changed or (solid rising after an earlier hop)',
+            # N > 1: frames of captured packets whose frame_reset is 1.0;
+            # N = 1: event hops that restarted the state and were not captured.
+            'event_frames_replayed': int(event_frames),
+        }
     write_calibration_artifact(
         args.output, arrays, report, artifact_format
     )

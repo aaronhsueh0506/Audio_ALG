@@ -92,7 +92,9 @@ def test_ta_bins_follows_the_grid():
     g48 = SignalGrid(48000, 1024, 1024, 512)
     m16 = AlignULCNet(GRID, max_delay_frames=D)
     m48 = AlignULCNet(g48, max_delay_frames=D)
+    m256 = AlignULCNet(SignalGrid(16000, 256, 256, 128), max_delay_frames=D)
     assert ta_bins_for(m16) == TA_BINS == 26
+    assert ta_bins_for(m256) == 13 == (SignalGrid(16000, 256, 256, 128).n_freqs + 9) // 10
     assert ta_bins_for(m48) == 52
     assert m16.reorient.width == 52 and m48.reorient.width == 104
     # The K/V caches carry it, so the state geometry follows the grid too.
@@ -910,17 +912,18 @@ def test_streaming_export_rejects_a_non_verified_grid():
     """The boundary guard must fire before any shape can go wrong.
 
     SignalGrid admits grids the deployed boundary is not defined for -- 16 kHz
-    / 256 is constructible and the model runs on it -- so a checkpoint from one
+    / 1024 is constructible and the model runs on it -- so a checkpoint from one
     has to be rejected here with an actionable message, never crash deep in a
-    matmul nor export a graph no C build can bind. Both product grids must be
-    accepted, or lifting the rate pin achieved nothing.
+    matmul nor export a graph no C build can bind. All three product grids
+    (16 kHz / 256, 16 kHz / 512, 48 kHz / 1024) must be accepted.
     """
-    model = AlignULCNet(SignalGrid(16000, 256, 256, 128),
+    model = AlignULCNet(SignalGrid(16000, 1024, 1024, 512),
                         max_delay_frames=D).eval()
     with pytest.raises(ValueError, match='streaming export supports'):
         AlignUlcnetStreamingExport(model)
 
-    for grid in (GRID, SignalGrid(48000, 1024, 1024, 512)):
+    for grid in (GRID, SignalGrid(16000, 256, 256, 128),
+                 SignalGrid(48000, 1024, 1024, 512)):
         wrapper = AlignUlcnetStreamingExport(
             AlignULCNet(grid, max_delay_frames=D).eval())
         assert wrapper.n_freqs == grid.n_freqs

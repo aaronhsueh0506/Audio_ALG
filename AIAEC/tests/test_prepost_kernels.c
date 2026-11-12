@@ -214,7 +214,10 @@ static int test_ulcnet_kernels(void)
               same_bits(a->error_sin, w_sin, BINS) &&
               same_bits(a->error_ri, w_ri, 2 * BINS),
               "prepare equals the plain contract");
-        front_end_scalar(b, er, ei, fr, fi);
+        {
+            const FramePlanes planes_b = frame_planes(b, 0u);
+            front_end_scalar(b, &planes_b, er, ei, fr, fi);
+        }
         CHECK(same_bits(b->error_mag, w_mag, BINS) &&
               same_bits(b->far_mag, w_far, BINS) &&
               same_bits(b->error_cos, w_cos, BINS) &&
@@ -222,7 +225,10 @@ static int test_ulcnet_kernels(void)
               same_bits(b->error_ri, w_ri, 2 * BINS),
               "front end scalar twin equals the plain contract");
 #if SK_HAVE_NEON
-        front_end_neon(c, er, ei, fr, fi);
+        {
+            const FramePlanes planes_c = frame_planes(c, 0u);
+            front_end_neon(c, &planes_c, er, ei, fr, fi);
+        }
         CHECK(same_features(c, b), "front end NEON kernel equals its scalar twin");
 #endif
 
@@ -231,8 +237,8 @@ static int test_ulcnet_kernels(void)
         fill(a->error_ri, 2 * BINS, 1.0f, kRates[k]);
         memcpy(b->output, a->output, 2 * BINS * sizeof(float));
         memcpy(b->error_ri, a->error_ri, 2 * BINS * sizeof(float));
-        back_end_scalar(b, enh_b[0], enh_b[1]);
-        back_end(a, enh_a[0], enh_a[1]);
+        back_end_scalar(b, 0u, enh_b[0], enh_b[1]);
+        back_end(a, 0u, enh_a[0], enh_a[1]);
         CHECK(same_bits(enh_a[0], enh_b[0], BINS) && same_bits(enh_a[1], enh_b[1], BINS),
               "back end equals its scalar twin");
         for (int i = 0; i < BINS; ++i) {
@@ -246,7 +252,7 @@ static int test_ulcnet_kernels(void)
         CHECK(same_bits(enh_c[0], enh_b[0], BINS) && same_bits(enh_c[1], enh_b[1], BINS),
               "back end scalar twin equals the plain contract");
 #if SK_HAVE_NEON
-        back_end_neon(a, enh_a[0], enh_a[1]);
+        back_end_neon(a, 0u, enh_a[0], enh_a[1]);
         CHECK(same_bits(enh_a[0], enh_b[0], BINS) && same_bits(enh_a[1], enh_b[1], BINS),
               "back end NEON kernel equals its scalar twin");
 #endif
@@ -338,7 +344,7 @@ static int test_deepvqe_kernels(void)
         int k = round % KCASES;
         fill(re, BINS, kScales[k], kRates[k]);
         fill(im, BINS, kScales[k], kRates[k]);
-        compress_planar(re, im, got, BINS);
+        compress_planar(re, im, got, got + BINS, BINS);
         for (int i = 0; i < BINS; ++i) {
             float a = re[i] * re[i], b = im[i] * im[i];
             float scale = powf(sqrtf(a + b + 1e-12f), exponent);

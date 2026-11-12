@@ -74,7 +74,7 @@ static int board_init(BoardDriver *d, const UlcnetGrid *grid) {
     if (!d->fft) return -1;
 
     ac_stft_config_default(&scfg, grid->n_fft);
-    scfg.ola = AC_OLA_ENV_NORM;
+    scfg.ola = AC_OLA_ACCUMULATE;   /* must track ulcnet_stream.c's OLA mode */
     scfg.fft = d->fft;
 
     seb = ac_stft_get_mem_size(&scfg);
@@ -381,11 +381,9 @@ static int run_matrix(int inject_shift) {
             fprintf(stderr, "hop %lld: written mismatch A=%d B=%d\n", ghop, written_a, written_b);
             st.mismatches++;
         }
-        if (expect_reprime_hop && (post_rc_a != 0 || post_rc_b != 0)) {
-            fprintf(stderr, "hop %lld: expected post_rc==0 (ENV_NORM first push after reset) on "
-                            "BOTH sides, got A=%d B=%d\n", ghop, post_rc_a, post_rc_b);
-            st.mismatches++;
-        }
+        /* AC_OLA_ACCUMULATE has no first-push-after-reset suppression: a reprime hop's post_process
+         * returns 1 on both sides, like every other hop, so post_rc is not compared against
+         * expect_reprime_hop here. */
 
         {
             const int16_t *b_for_compare = inject_shift ? prev_pcm_b : pcm_b;

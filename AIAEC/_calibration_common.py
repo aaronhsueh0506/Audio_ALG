@@ -119,8 +119,14 @@ def _ri(spec):
     return torch.view_as_real(spec.transpose(-2, -1)).contiguous()
 
 
-def blocks_from_pair(model_name, model, grid, primary_path, far_path,
-                     frames, feature_config=None):
+def iter_blocks(model_name, model, grid, primary_path, far_path,
+                frames, feature_config=None, pad_tail=False):
+    """Yield ``(block, real)`` packets of ``frames`` STFT frames.
+
+    A short tail is dropped, or with ``pad_tail`` zero-completed (zero error
+    and far spectra, as the WAV inference pads) and kept; ``real`` counts the
+    block's true frames so a caller can keep padding slots free of events.
+    """
     loader = (load_linear_error_far if model_name in LINEAR_ERROR_MODELS
               else load_mic_far)
     primary, far, _ = loader(str(primary_path), str(far_path), grid.sr)
@@ -131,12 +137,26 @@ def blocks_from_pair(model_name, model, grid, primary_path, far_path,
     }
     time_axis = {name: 1 for name in tensors}
     total = tensors[next(iter(tensors))].shape[time_axis[next(iter(tensors))]]
-    for start in range(0, total - frames + 1, frames):
+    stop = total if pad_tail else total - frames + 1
+    for start in range(0, stop, frames):
+        real = min(frames, total - start)
         block = {}
         for name, tensor in tensors.items():
             axis = time_axis[name]
             slices = [slice(None)] * tensor.ndim
-            slices[axis] = slice(start, start + frames)
-            block[name] = tensor[tuple(slices)][0].cpu().numpy().astype(
+            slices[axis] = slice(start, start + real)
+            value = tensor[tuple(slices)][0].cpu().numpy().astype(
                 np.float32, copy=False)
+            if real < frames:
+                # Batch is dropped by [0], so the time axis moves down by one.
+                pad = [(0, 0)] * value.ndim
+                pad[axis - 1] = (0, frames - real)
+                value = np.pad(value, pad)
+            block[name] = value
+        yield block, real
+
+
+def blocks_from_pair(*args, **kwargs):
+    """Whole packets only (``iter_blocks`` without tail padding)."""
+    for block, _real in iter_blocks(*args, pad_tail=False, **kwargs):
         yield block
