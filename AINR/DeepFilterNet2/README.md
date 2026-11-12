@@ -109,6 +109,18 @@ Therefore the shipped `mask_lookahead=1` and `df_lookahead=1` have a total strea
 frames_per_call - 1`) the model's delay in hops. The C test uses changing masks and nontrivial future taps so an off-by-one
 head/spectrum pairing cannot pass as a merely finite output.
 
+## Graph port order
+
+Every exported graph lists its ports in one order, and the board samples bind by position, never by name (`stream/ainr` keeps no
+port list: `AinrWork` carries the block's signals and heads, the graph's wiring and state shapes are the sample's model configuration,
+`stream/ainr/ai3_model_io_dfn2.h`, shared helper `stream/common/ai3_model_io.h`): inputs are the signal inputs, then the state inputs; outputs are the head outputs, then the state outputs; state `k`
+is input `signal_in + k` and output `head_out + k`, with equal shapes at both ends. Full: `erb`, `spec` | `h_gru`,
+`df_convp_history` in; `erb_mask`, `df_coefs`, `df_alpha` | `h_gru_out`, `df_convp_history_out` out (2 signals, 3 heads, 2 states).
+Mask-only: `erb`, `spec` | `h_gru` in; `erb_mask` | `h_gru_out` out (2 signals, 1 head, 1 state). Fixed-point state ports need
+`zero_point` 0 at both ends (the sample's `stream_check_ports()` refuses a graph that does not). `../tests/test_dfn2_port_order.py` asserts
+this order on a fresh export (full and mask-only, N = 1 and 8) and compares the `AinrWork` views of real pre calls with the exported
+signal inputs and heads at the registered grids.
+
 ## Lookahead pairs
 
 `mask_lookahead` (M, 0..2) and `df_lookahead` (D, 0..4, i.e. below `df_order`)

@@ -348,10 +348,8 @@ int main(int argc, char **argv) {
 
     failures += (run_matrix(&row16k, "16k/256 L0D0", inject_shift, 0, 0.0f) != 0);
     failures += (run_matrix(&row48k, "48k/1024 L1D(0or1)", inject_shift, 0, 0.0f) != 0);
-    /* HPF-enabled coverage (project rule: a carved-but-never-exercised path is not covered;
-     * code review flagged dfn2_stream's hpf_enable=1 path -- carve, hpf_init, hpf_process,
-     * hpf_reset -- as untested by every binary in this directory before this run). 80 Hz matches
-     * the board sample's own --hpf default cutoff. */
+    /* HPF-enabled coverage of dfn2_stream's carve, hpf_init, hpf_process and hpf_reset path; 80 Hz is the
+     * board sample's --hpf default cutoff. */
     failures += (run_matrix(&row48k, "48k/1024 L1D(0or1) hpf80", inject_shift, 1, 80.0f) != 0);
 
     if (inject_shift) {

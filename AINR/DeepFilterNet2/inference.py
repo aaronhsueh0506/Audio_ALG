@@ -9,6 +9,10 @@ DeepFilterNet2 推論腳本
     python inference.py --config config.ini --model output/dfn2_best.pth \
                       --input-dir /path/to/noisy --output-dir /path/to/enhanced
 
+Streamed as the deployment graph (N frames per call, state carried across calls):
+    python inference.py --model output/dfn2_best.pth --input noisy.wav \
+                      --output clean.wav --frames-per-call 8
+
 Calibration (also exports the ONNX graph the tensors bind to):
     python inference.py calib --model output/dfn2_best.pth \
         --wav-dir /path/to/noisy --frames 8192 --format bin \
@@ -134,10 +138,60 @@ def mask_only_path(output_path):
     return stem + '_mask_only' + ext
 
 
+def _export_module():
+    try:
+        from . import export_onnx
+    except ImportError:
+        import export_onnx
+    return export_onnx
+
+
+def stream_heads(model, feat_erb, feat_spec, frames_per_call):
+    """The network's heads over one stream, ``frames_per_call`` (N) frames per call.
+
+    The same ``StatelessDFN2Heads`` graph that ``export_onnx`` ships, fed the
+    N + 2 frame windows of ``feature_chunk_windows`` in order with the GRU and
+    deep-filter pathway state carried from call to call. The last call is
+    completed with zero frames (as the host flushes), and the heads are cut
+    back to the stream's own frame count, so the result equals
+    ``model.heads()`` over the whole stream. Returns
+    ``(erb_mask, coefs, alpha, calls)``: the shapes of ``model.heads()`` plus
+    the number of invocations, ``ceil(frames / N)``.
+    """
+    export = _export_module()
+    export.chunk_input_frames(frames_per_call)   # validates N
+    frames = feat_erb.shape[2]
+    wrapper = export.StatelessDFN2Heads(
+        model, frames_per_call=frames_per_call).eval()
+    state = wrapper.initial_inputs()[2:]
+    heads = [[], [], []]
+    calls = 0
+    windows = zip(
+        export.feature_chunk_windows(feat_erb, model.mask_lookahead,
+                                     frames_per_call),
+        export.feature_chunk_windows(feat_spec, model.mask_lookahead,
+                                     frames_per_call))
+    for erb_window, spec_window in windows:
+        outputs = wrapper(erb_window, spec_window, *state)
+        for index in range(3):
+            heads[index].append(outputs[index])
+        state = tuple(outputs[3:])
+        calls += 1
+    erb_mask = torch.cat(heads[0], dim=2)[:, :, :frames]
+    coefs = torch.cat(heads[1], dim=1)[:, :frames]
+    alpha = torch.cat(heads[2], dim=1)[:, :frames]
+    return erb_mask, coefs, alpha, calls
+
+
 def process_file(input_path, output_path, model, params, atten_lim_db=None,
-                 mask_only=False):
+                 mask_only=False, frames_per_call=None):
     """Enhance one file into ``output_path``. With ``mask_only`` the stage-1-only
-    result (ERB mask, no deep filter) is also written, to ``mask_only_path``."""
+    result (ERB mask, no deep filter) is also written, to ``mask_only_path``.
+
+    ``frames_per_call=None`` (default) runs the model over the whole file at
+    once. An integer N runs it as the deployment graph does: one stream, N
+    consecutive frames per call, state carried across calls, the last call
+    zero-completed and the output cut back to the file's length."""
     SR      = params['SR']
     N_FFT   = params['N_FFT']
     WIN_LEN = params['WIN_LEN']
@@ -162,7 +216,12 @@ def process_file(input_path, output_path, model, params, atten_lim_db=None,
             spec_c, model.erb_fb, DF_BINS,
             feature_cfg=feature_cfg,
         )
-        enhanced_spec, erb_mask = model(spec_c, feat_erb, feat_spec)
+        if frames_per_call is None:
+            enhanced_spec, erb_mask = model(spec_c, feat_erb, feat_spec)
+        else:
+            erb_mask, coefs, alpha, _ = stream_heads(
+                model, feat_erb, feat_spec, frames_per_call)
+            enhanced_spec = model.compose(spec_c, erb_mask, coefs, alpha)
         results = [(output_path,
                     apply_atten_lim(spec_c, enhanced_spec, atten_lim_db))]
         if mask_only:
@@ -186,7 +245,8 @@ def process_file(input_path, output_path, model, params, atten_lim_db=None,
 def denoise_single(args):
     model, params = load_model(args)
     process_file(args.input, args.output, model, params,
-                 atten_lim_db=args.atten_lim, mask_only=args.mask_only)
+                 atten_lim_db=args.atten_lim, mask_only=args.mask_only,
+                 frames_per_call=args.frames_per_call)
     print(f"降噪完成: {args.output}")
     if args.mask_only:
         print(f"mask only: {mask_only_path(args.output)}")
@@ -213,7 +273,8 @@ def denoise_batch(args):
         try:
             process_file(input_path, output_path, model, params,
                         atten_lim_db=args.atten_lim,
-                        mask_only=args.mask_only)
+                        mask_only=args.mask_only,
+                        frames_per_call=args.frames_per_call)
         except Exception as e:
             failed.append((rel, str(e)))
 
@@ -445,7 +506,19 @@ def cli():
                              'deep filter, same checkpoint) beside each output as '
                              '<name>_mask_only.wav. The normal output is still '
                              'the full model.')
+    parser.add_argument('--frames-per-call', type=int, default=None,
+                        metavar='N',
+                        help='Run the model as the deployment graph does: one '
+                             'stream, N consecutive frames per call (the '
+                             'export_onnx / calib --frames-per-call value), '
+                             'state carried across calls, the last call '
+                             'zero-completed and the output cut back to the '
+                             'input length. Default: the whole file at once.')
     args = parser.parse_args()
+    if args.frames_per_call is not None:
+        max_n = _export_module().MAX_FRAMES_PER_CALL
+        if not 1 <= args.frames_per_call <= max_n:
+            parser.error('--frames-per-call must be in [1, %d]' % max_n)
 
     if args.input_dir and args.output_dir:
         denoise_batch(args)

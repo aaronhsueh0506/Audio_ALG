@@ -53,7 +53,9 @@ typedef struct DFN2StreamLayout {
     void       *hpf_mem;      /* NULL region when !cfg->hpf_enable */
     void       *fft_mem;
     void       *stft_mem;
+    size_t      stft_bytes;
     void       *istft_mem;
+    size_t      istft_bytes;
     void       *prepost_mem;
     size_t      prepost_bytes;
     void       *scratch_mem;  /* the hop_in/hop_out/spec_re/spec_im/enh_re/enh_im slab */
@@ -75,11 +77,16 @@ static int dfn2_stream_is_file_mode(const DFN2StreamConfig *cfg) {
  * gives byte-identical sizing in file mode where the real tables aren't loaded yet. */
 static const float SIZING_ERB_DUMMY = 0.0f;
 
-/* Sizing always uses cfg.fft = NULL (audio_stft.c's config_valid() dereferences a non-NULL
- * cfg->fft) -- costs fft_get_mem_size(n_fft) extra bytes, since a borrowed handle needs
- * strictly fewer. dfn2_stream_finish_init() then constructs one shared FftHandle and points
- * cfg.fft at it only once real init runs, so the smaller real requirement always fits the
- * larger carved region. */
+/* STFT and ISTFT borrow the stream's one FftHandle (carved once, handed to both as cfg.fft by
+ * dfn2_stream_finish_init()), so each needs the borrowed-handle size. audio_stft.c's config_valid()
+ * dereferences a non-NULL cfg->fft, and no handle exists while sizing, so the size is taken with
+ * cfg.fft = NULL and the FFT table that size then includes (one ALIGN16 field of
+ * fft_get_mem_size(n_fft)) is removed. dfn2_stream_finish_init() asks the borrowed configuration for
+ * its size again and refuses a region that is not exactly that. */
+static size_t borrowed_fft_size(size_t own_fft_size, int n_fft) {
+    size_t fft_field = ck_align16_size(fft_get_mem_size(n_fft));
+    return own_fft_size > fft_field ? own_fft_size - fft_field : 0u;
+}
 
 static int cfg_valid(const DFN2StreamConfig *cfg) {
     if (!cfg) return 0;
@@ -134,20 +141,22 @@ static int dfn2_stream_layout(const DFN2StreamConfig *cfg, unsigned char *base,
     if (fft_bytes == 0 || stream_carve(base, &cursor, fft_bytes, &ptr) != 0) return -1;
     out->fft_mem = ptr;
 
-    /* One AcStftConfig, reused for both the analysis and synthesis sizing/init calls -- window
-     * left NULL, each of AcStft/AcIstft carves its own window table independently. scfg.fft
-     * stays NULL here (own-carve sizing; the shared handle doesn't exist yet). */
+    /* One AcStftConfig, reused for both the analysis and synthesis sizing calls -- window left
+     * NULL, each of AcStft/AcIstft carves its own window table independently. scfg.fft stays NULL
+     * (the shared handle doesn't exist yet), see borrowed_fft_size(). */
     ac_stft_config_default(&scfg, cfg->grid.n_fft);
     scfg.spec_scale = dfn2_stft_scale(cfg->grid.n_fft);
     scfg.ispec_scale = dfn2_stft_unscale(cfg->grid.n_fft);
 
-    stft_bytes = ac_stft_get_mem_size(&scfg);
+    stft_bytes = borrowed_fft_size(ac_stft_get_mem_size(&scfg), cfg->grid.n_fft);
     if (stft_bytes == 0 || stream_carve(base, &cursor, stft_bytes, &ptr) != 0) return -1;
     out->stft_mem = ptr;
+    out->stft_bytes = stft_bytes;
 
-    istft_bytes = ac_istft_get_mem_size(&scfg);
+    istft_bytes = borrowed_fft_size(ac_istft_get_mem_size(&scfg), cfg->grid.n_fft);
     if (istft_bytes == 0 || stream_carve(base, &cursor, istft_bytes, &ptr) != 0) return -1;
     out->istft_mem = ptr;
+    out->istft_bytes = istft_bytes;
 
     if (dfn2_prepost_config_defaults(&pcfg, &cfg->grid) != 0) return -1;
     pcfg.atten_lim_db = cfg->atten_lim_db;
@@ -277,17 +286,20 @@ static DFN2Stream *dfn2_stream_finish_init(const DFN2StreamConfig *cfg, unsigned
     s->fft = fft_init(layout->fft_mem, fft_get_mem_size(cfg->grid.n_fft), cfg->grid.n_fft);
     if (!s->fft) return NULL;
 
-    /* Real, now-constructed handle, borrowed by both -- a smaller scfg than the sizing one
-     * above, which the larger carved region always fits. */
+    /* The now-constructed handle, borrowed by both: each carved region must be exactly the
+     * borrowed-handle size. */
     ac_stft_config_default(&scfg, cfg->grid.n_fft);
     scfg.spec_scale = dfn2_stft_scale(cfg->grid.n_fft);
     scfg.ispec_scale = dfn2_stft_unscale(cfg->grid.n_fft);
     scfg.fft = s->fft;
 
-    s->stft = ac_stft_init(layout->stft_mem, ac_stft_get_mem_size(&scfg), &scfg);
+    if (ac_stft_get_mem_size(&scfg) != layout->stft_bytes ||
+        ac_istft_get_mem_size(&scfg) != layout->istft_bytes)
+        return NULL;
+    s->stft = ac_stft_init(layout->stft_mem, layout->stft_bytes, &scfg);
     if (!s->stft) return NULL;
 
-    s->istft = ac_istft_init(layout->istft_mem, ac_istft_get_mem_size(&scfg), &scfg);
+    s->istft = ac_istft_init(layout->istft_mem, layout->istft_bytes, &scfg);
     if (!s->istft) return NULL;
 
     if (dfn2_prepost_config_defaults(&pcfg, &cfg->grid) != 0) return NULL;
@@ -360,6 +372,13 @@ unsigned int dfn2_stream_state_generation(const DFN2Stream *s) {
     return s ? dfn2_prepost_state_generation(s->prepost) : 0u;
 }
 
+int dfn2_stream_set_atten_lim(DFN2Stream *s, float atten_lim_db) {
+    if (!s) return -1;
+    if (dfn2_prepost_set_atten_lim(s->prepost, atten_lim_db) != 0) return -1;
+    s->atten_lim_db = atten_lim_db;
+    return 0;
+}
+
 const DFN2Grid *dfn2_stream_grid(const DFN2Stream *s) {
     return s ? &s->grid : NULL;
 }
@@ -398,21 +417,24 @@ int dfn2_stream_pre_process(DFN2Stream *s, const int16_t *pcm_in, DFN2HopIO *io)
     return 1;
 }
 
+/* Frame-close half of post_process, shared by PCM and spectrum-only entry points: frame_finish()
+ * can itself fail (non-finite despite ai_rc == 0) and leaves the frame open, so a failure here
+ * still bypasses to close it and keep `s->open` synced with DFN2Prepost's; no-op if no frame is open. */
+static void dfn2_stream_close_frame(DFN2Stream *s, int ai_rc) {
+    int rc;
+    if (!s->open) return;
+    rc = (ai_rc == 0) ? dfn2_prepost_frame_finish(s->prepost) : -1;
+    if (rc != 0) dfn2_prepost_frame_bypass(s->prepost);
+    s->open = 0;
+}
+
 int dfn2_stream_post_process(DFN2Stream *s, int ai_rc, int16_t *pcm_out) {
-    int hop, i, valid, prc, rc;
+    int hop, i, valid, prc;
 
     if (!s || !pcm_out || !s->pending) return -1;
     hop = s->grid.hop;
     s->pending = 0;
-
-    if (s->open) {
-        /* A finish that itself fails (non-finite head or state, despite ai_rc == 0) still needs a
-         * bypass to actually close the frame -- frame_finish() leaves it open on failure, and a
-         * frame left open here would desync this stream's `open` bookkeeping from DFN2Prepost's. */
-        rc = (ai_rc == 0) ? dfn2_prepost_frame_finish(s->prepost) : -1;
-        if (rc != 0) dfn2_prepost_frame_bypass(s->prepost);
-        s->open = 0;
-    }
+    dfn2_stream_close_frame(s, ai_rc);
 
     valid = 0;
     prc = dfn2_prepost_post_process_freq(s->prepost, s->enh_re, s->enh_im, &valid);
@@ -427,6 +449,37 @@ int dfn2_stream_post_process(DFN2Stream *s, int ai_rc, int16_t *pcm_out) {
     for (i = 0; i < hop; ++i) pcm_out[i] = stream_saturate_s16(s->hop_out[i]);
 
     return valid ? 1 : 0;
+}
+
+int dfn2_stream_pre_process_freq_dual(DFN2Stream *s, const float *est_re, const float *est_im,
+                                      const float *app_re, const float *app_im, DFN2HopIO *io) {
+    int rc;
+
+    if (!s || !est_re || !est_im || !app_re || !app_im || !io || s->pending) return -1;
+    /* A bin that is non-finite or too large for the feature power would poison the normaliser until reset. */
+    if (!dfn2_stream_bins_in_range(est_re, (size_t)s->grid.n_bins, 1.0f) ||
+        !dfn2_stream_bins_in_range(est_im, (size_t)s->grid.n_bins, 1.0f) ||
+        !dfn2_stream_bins_in_range(app_re, (size_t)s->grid.n_bins, 1.0f) ||
+        !dfn2_stream_bins_in_range(app_im, (size_t)s->grid.n_bins, 1.0f))
+        return -1;
+
+    rc = dfn2_prepost_pre_process_freq_dual(s->prepost, est_re, est_im, app_re, app_im);
+    if (rc < 0) return -1;
+    io->state_generation = dfn2_prepost_state_generation(s->prepost);
+    io->job_ready = rc;
+    if (rc == 1) {
+        if (dfn2_prepost_frame_open(s->prepost, &io->inputs, &io->outputs) != 0) return -1;
+        s->open = 1;
+    }
+    s->pending = 1;
+    return 1;
+}
+
+int dfn2_stream_post_process_freq(DFN2Stream *s, int ai_rc, float *re, float *im, int *valid) {
+    if (!s || !re || !im || !s->pending) return -1;
+    s->pending = 0;
+    dfn2_stream_close_frame(s, ai_rc);
+    return dfn2_prepost_post_process_freq(s->prepost, re, im, valid) == 0 ? 0 : -1;
 }
 
 #ifndef DFN2_STREAM_NO_STDIO

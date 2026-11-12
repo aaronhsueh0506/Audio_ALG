@@ -103,6 +103,7 @@ STREAM_HEADERS := dfn2_stream.h ../../common/stream_mem.h
 LIB := $(OBJ_DIR)/libdfn2_stream.a
 LIB_OBJECTS := $(OBJ_DIR)/dfn2_process.o $(OBJ_DIR)/dfn2_model_io.o $(OBJ_DIR)/dfn2_prepost.o \
 	$(OBJ_DIR)/dfn2_stream.o
+
 VPATH := ../../../lib/ainr/dfn2
 
 SMOKE_BIN := $(OBJ_DIR)/smoke_dfn2_stream
@@ -118,7 +119,10 @@ ERB_FILE_CHECK_SOURCES := tests/check_erb_file.c $(CORE_SOURCES) dfn2_stream.c
 VERIFY_VS_SAMPLE_BIN := $(OBJ_DIR)/verify_vs_sample
 VERIFY_VS_SAMPLE_SOURCES := tests/verify_vs_sample.c $(CORE_SOURCES) dfn2_stream.c
 
-.PHONY: all lib print-lib-path print-cflags print-sources test smoke check-erb-file verify-vs-sample test-variant-guard audit-no-stdio clean _cfg_guard
+POOL_SIZE_BIN := $(OBJ_DIR)/pool_size
+POOL_SIZE_SOURCES := tests/pool_size.c $(CORE_SOURCES) dfn2_stream.c
+
+.PHONY: all lib print-lib-path print-cflags print-sources test smoke check-erb-file verify-vs-sample pool-size test-variant-guard audit-no-stdio clean _cfg_guard
 
 all: lib
 
@@ -182,7 +186,14 @@ verify-vs-sample: $(VERIFY_VS_SAMPLE_BIN)
 	"$(VERIFY_VS_SAMPLE_BIN)"
 	"$(VERIFY_VS_SAMPLE_BIN)" --inject-shift
 
-test: smoke check-erb-file verify-vs-sample test-variant-guard
+$(POOL_SIZE_BIN): $(POOL_SIZE_SOURCES) $(CORE_HEADERS) $(STREAM_HEADERS) $(COMMON_LIB) $(COMMON_HEADERS) | _cfg_guard
+	$(CC) $(CFLAGS) $(SIMD_CPPFLAGS) $(MASK_CPPFLAGS) $(NO_STDIO_CPPFLAGS) $(POOL_SIZE_SOURCES) "$(COMMON_LIB)" \
+		$(LDFLAGS) -lm -o "$@"
+
+pool-size: $(POOL_SIZE_BIN)
+	"$(POOL_SIZE_BIN)"
+
+test: smoke check-erb-file verify-vs-sample pool-size test-variant-guard
 
 # test-variant-guard: builds BOTH full and mask-only archives, then links an external-consumer TU
 # (tests/variant_consumer.c, never the SDK's own .c files) against each in all four combinations.
@@ -218,14 +229,22 @@ test-variant-guard:
 	$(CC) $$lite_cflags "$$lite_obj/variant_consumer_lite.o" "$$lite_lib" "$(COMMON_LIB)" -lm \
 	     -o "$$lite_obj/vg_lite_consumer_vs_lite_archive" || exit 1; \
 	"$$lite_obj/vg_lite_consumer_vs_lite_archive" || exit 1; \
+	for spec in "$$full_lib::_mask_only" "$$lite_lib:_mask_only:"; do \
+	  lib="$${spec%%:*}"; rest="$${spec#*:}"; var="$${rest%%:*}"; other="$${rest#*:}"; \
+	  for sym in dfn2_stream_pre_process dfn2_stream_post_process dfn2_stream_pre_process_freq_dual dfn2_stream_post_process_freq; do \
+	    nm "$$lib" 2>/dev/null | grep -Eq " T _?$${sym}$${var}$$" || { echo "FAIL: $${sym}$${var} not exported by $$lib" >&2; exit 1; }; \
+	    if nm "$$lib" 2>/dev/null | grep -Eq " T _?$${sym}$${other}$$"; then echo "FAIL: $${sym}$${other} is exported by $$lib (wrong variant)" >&2; exit 1; fi; \
+	  done; \
+	done; \
+	echo "test-variant-guard: variant-suffixed hop entries present, no cross-variant entry exported"; \
 	echo "test-variant-guard: PASS (both matched pairings link and run)"
 
 # audit-no-stdio: builds the NO_STDIO=1 archive and asserts, via `nm -u`, that dfn2_stream.o
 # references no stdio symbol (the file-loader entry points are compiled out under that flag).
 audit-no-stdio:
 	@$(MAKE) --no-print-directory NO_STDIO=1 MASK_ONLY=$(MASK_ONLY) SIMD=$(SIMD) $(TOOLCHAIN_FWD) lib >/dev/null
-	@obj_dir="$$($(MAKE) -s --no-print-directory NO_STDIO=1 MASK_ONLY=$(MASK_ONLY) SIMD=$(SIMD) $(TOOLCHAIN_FWD) print-lib-path)"; \
-	obj_dir="$$(dirname "$$obj_dir")"; \
+	@nostdio_lib="$$($(MAKE) -s --no-print-directory NO_STDIO=1 MASK_ONLY=$(MASK_ONLY) SIMD=$(SIMD) $(TOOLCHAIN_FWD) print-lib-path)"; \
+	obj_dir="$$(dirname "$$nostdio_lib")"; \
 	undef="$$(nm -u "$$obj_dir/dfn2_stream.o" 2>/dev/null | grep -Ei 'fopen|fread|fclose|fwrite|fprintf|printf|puts' || true)"; \
 	if [ -n "$$undef" ]; then \
 	  echo "FAIL: dfn2_stream.o references stdio symbols:" >&2; echo "$$undef" >&2; exit 1; \

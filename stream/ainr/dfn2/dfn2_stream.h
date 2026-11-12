@@ -1,10 +1,6 @@
-/* DeepFilterNet2 PCM stream: wraps the optional HPF, audiolib AcStft/AcIstft
- * (AC_OLA_ACCUMULATE) and lib/ainr/dfn2's DFN2Prepost around int16 PCM, one hop in and one hop
- * out per call, any grid.frames_per_call in [1, 64]. With frames_per_call == 1 the accelerator
- * runs on every hop, exactly as before this field was accepted. With frames_per_call == N > 1 the
- * accelerator runs once every N hops (io.job_ready says which): pre_process/post_process are
- * still called every hop either way -- post_process just drains one hop of PCM from whatever the
- * last job computed on the hops where there isn't a new one.
+/* DeepFilterNet2 PCM stream: optional HPF, AcStft/AcIstft (AC_OLA_ACCUMULATE) and DFN2Prepost around int16
+ * PCM, one hop in and one hop out per call, grid.frames_per_call N in [1, 64]. N == 1: the accelerator runs
+ * every hop. N > 1: once every N hops (io.job_ready); pre/post are still called every hop.
  *
  *     ctx = dfn2_stream_init_from_erb_file(&cfg, erb_path, pool, pool_bytes);
  *     while (have a hop of int16 pcm_in) {
@@ -14,27 +10,22 @@
  *         if (io.job_ready) {
  *             device_state_sync(io.state_generation);      // reload accelerator state on change
  *             ai_rc = run_accelerator(&io.inputs, &io.outputs);
- *             if (ai_rc != 0) device_state_refill_zero();   // partial write -> reload now, same hop
+ *             if (ai_rc != 0) device_state_refill_zero();   // partial write: reload now, same hop
  *         }
  *         if (dfn2_stream_post_process(ctx, ai_rc, pcm_out) < 0) break;
  *     }
  *
- * device_state_sync/refill_zero are the caller's own code on accelerator memory this stream
- * never touches (it only tracks/reports io.state_generation); skipping sync leaves a stale
- * state copy live across a generation change, skipping refill leaves a failed run's garbage
- * write live until the next change. io.state_generation is sampled every hop regardless of
- * job_ready, so a generation change is never missed just because that hop had no job.
- *
- * Warm-up (frames_per_call == 1: mask_lookahead hops after init/reset; N > 1: none, see
- * AINR/DeepFilterNet2/reference/multiframe.md) runs this same loop, emitting silence. Tail flush: push
- * mask_lookahead + df_lookahead + frames_per_call zero hops after the last real one, to drain the
- * core's L+D+N-1 latency plus this stream's own one hop of STFT/ISTFT framing. */
+ * device_state_sync/refill_zero are the caller's code on accelerator memory this stream never touches;
+ * skipping either leaves stale or garbage state live. io.state_generation is sampled every hop.
+ * Warm-up (N == 1: mask_lookahead hops after init/reset; N > 1: none) runs the same loop and emits silence.
+ * Tail: push mask_lookahead + df_lookahead + N zero hops after the last real one. */
 
 #ifndef DFN2_STREAM_H
 #define DFN2_STREAM_H
 
 #include <stddef.h>
 #include <stdint.h>
+#include <string.h>
 
 #include "dfn2_prepost.h"   /* DFN2Grid, DFN2PrepostInputs/Outputs */
 
@@ -43,20 +34,34 @@ extern "C" {
 #endif
 
 #define DFN2_STREAM_DESCRIPTOR_VERSION 1u
-#define DFN2_STREAM_LAYOUT_VERSION     2u   /* bump with build_flags_hash on any pool/carve/descriptor change */
+#define DFN2_STREAM_LAYOUT_VERSION     3u   /* bump with build_flags_hash on any pool/carve/descriptor change */
 #define DFN2_STREAM_ALIGNMENT          16u   /* the one alignment of every module (audiolib mem_align.h) */
+
+/* Largest accepted |bin| of a MODEL-scale spectrum, as IEEE bits: 2^63, so the feature power re^2 + im^2 stays
+ * <= 2^127 < FLT_MAX. A larger or non-finite bin would put Inf/NaN into the feature normaliser until reset. */
+#define DFN2_STREAM_BIN_LIMIT_BITS 0x5F000000u
+
+/* 1 when every x[k] * scale (float product, scale 1.0f for MODEL scale) is finite and within the limit above. */
+static inline int dfn2_stream_bins_in_range(const float *x, size_t n, float scale)
+{
+    size_t k;
+    for (k = 0; k < n; ++k) {
+        float m = x[k] * scale;
+        uint32_t bits;
+        memcpy(&bits, &m, sizeof bits);
+        if ((bits & 0x7FFFFFFFu) > DFN2_STREAM_BIN_LIMIT_BITS) return 0;
+    }
+    return 1;
+}
 
 typedef struct DFN2StreamConfig {
     DFN2Grid grid;             /* dfn2_grid_make(); frames_per_call in [1, 64] */
     float    atten_lim_db;     /* 0 disables the attenuation limit, as dfn2_prepost */
     int      hpf_enable;       /* optional input high-pass, applied before analysis only */
     float    hpf_cutoff_hz;    /* > 0, read only when hpf_enable */
-    /* Memory-init mode only (dfn2_stream_init): required, borrowed, alive for the stream's life.
-     * erb_fwd is bin-major [n_bins][n_erb]; erb_inv is band-major [n_erb][n_bins] -- NOT the
-     * same layout as erb_fwd, and not the raw on-disk (bin-major) format a loader reads; a
-     * caller must transpose first. Leave both NULL for file-init mode
-     * (dfn2_stream_init_from_erb_file): get_mem_size() then reserves table storage from the grid
-     * instead, and both fields are ignored. */
+    /* Memory-init mode (dfn2_stream_init): both required, borrowed for the stream's life; erb_fwd bin-major
+     * [n_bins][n_erb], erb_inv band-major [n_erb][n_bins] (transpose the on-disk table). Both NULL: file-init mode,
+     * storage sized from the grid. */
     const float *erb_fwd;
     const float *erb_inv;
 } DFN2StreamConfig;
@@ -81,11 +86,8 @@ _Static_assert(sizeof(DFN2StreamMemReq) == 32,
 
 typedef struct DFN2Stream DFN2Stream;
 
-/* DFN2HopIO's size depends on DFN2_MASK_ONLY (deep-filter output members omitted under it), so
- * every entry point below is variant-suffixed by this header, keyed off the caller's own
- * -DDFN2_MASK_ONLY -- a mismatched pairing fails to link instead of overrunning DFN2HopIO at
- * run time. Same mechanism as dfn2_process.h's DFN2_VARIANT_SYMBOL, extended to this SDK's own
- * public API. */
+/* DFN2HopIO's size depends on DFN2_MASK_ONLY, so every entry point is suffixed _mask_only under it: a
+ * mismatched pairing fails to link instead of overrunning DFN2HopIO. */
 #ifdef DFN2_MASK_ONLY
 #define dfn2_stream_get_mem_size            dfn2_stream_get_mem_size_mask_only
 #define dfn2_stream_init                    dfn2_stream_init_mask_only
@@ -94,36 +96,32 @@ typedef struct DFN2Stream DFN2Stream;
 #define dfn2_stream_init_from_erb_file_ex   dfn2_stream_init_from_erb_file_ex_mask_only
 #define dfn2_stream_reset                   dfn2_stream_reset_mask_only
 #define dfn2_stream_state_generation        dfn2_stream_state_generation_mask_only
+#define dfn2_stream_set_atten_lim           dfn2_stream_set_atten_lim_mask_only
 #define dfn2_stream_grid                    dfn2_stream_grid_mask_only
 #define dfn2_stream_hop_size                dfn2_stream_hop_size_mask_only
 #define dfn2_stream_layout_version          dfn2_stream_layout_version_mask_only
 #define dfn2_stream_pre_process             dfn2_stream_pre_process_mask_only
 #define dfn2_stream_post_process            dfn2_stream_post_process_mask_only
+#define dfn2_stream_pre_process_freq_dual   dfn2_stream_pre_process_freq_dual_mask_only
+#define dfn2_stream_post_process_freq       dfn2_stream_post_process_freq_mask_only
 #endif
 
-/* Exact pool size for the mode cfg->erb_fwd/erb_inv implies (both NULL: file mode, sized from
- * cfg->grid; both non-NULL: memory mode, no table storage). The pool grows with
- * cfg->grid.frames_per_call (folded into build_flags_hash, so a pool sized for one N is refused
- * for another). -1 (req untouched) on NULL, an invalid grid, non-finite atten_lim_db, an
- * out-of-range hpf_cutoff_hz, or exactly one of erb_fwd/erb_inv set. */
+/* Exact pool size for the mode erb_fwd/erb_inv imply (both NULL: file mode; both set: memory mode). -1
+ * (req untouched) on NULL, an invalid grid, non-finite atten_lim_db, bad hpf_cutoff_hz or exactly one table. */
 int dfn2_stream_get_mem_size(const DFN2StreamConfig *cfg, DFN2StreamMemReq *req);
 
-/* Construct in caller memory (16-byte aligned, >= get_mem_size()'s bytes): carves the HPF (if
- * enabled, hpf_init()'d -- no heap after init), the STFT/ISTFT pair and DFN2Prepost from `pool`;
- * starts reset. NULL on a bad config, misaligned/undersized pool, or erb_fwd/erb_inv not both set. */
+/* Constructs in the pool (16-byte aligned, >= get_mem_size()): HPF (if enabled), STFT/ISTFT and DFN2Prepost,
+ * no heap; starts reset. NULL on a bad config, a misaligned or small pool, or erb_fwd/erb_inv not both set. */
 DFN2Stream *dfn2_stream_init(const DFN2StreamConfig *cfg, void *pool, size_t pool_bytes);
 
-/* As dfn2_stream_init, plus the stale-pool gate: a pool carved for another grid, mode, variant or
- * layout is refused. `expected` NULL behaves as dfn2_stream_init. */
+/* As dfn2_stream_init, plus the stale-pool gate: a pool carved for another grid, mode, variant or layout
+ * is refused. `expected` NULL: as dfn2_stream_init. */
 DFN2Stream *dfn2_stream_init_ex(const DFN2StreamConfig *cfg, void *pool, size_t pool_bytes,
                                 const DFN2StreamMemReq *expected);
 
-/* As dfn2_stream_init, but loads ERB tables from `erb_path` into pool-owned storage instead of
- * borrowing cfg->erb_fwd/erb_inv (both must be NULL): int32 n_bins, n_erb, then n_bins*n_erb
- * float32 forward + inverse, both bin-major on disk (inverse transposed to band-major on load).
- * Rejects a header mismatching cfg->grid or a short file; on any failure the file is closed and
- * NULL returned (treat NULL as total failure, never reuse the pool as live). Only this entry
- * point does file I/O; compiled out under -DDFN2_STREAM_NO_STDIO. */
+/* As dfn2_stream_init, loading the ERB tables from `erb_path` into pool storage (cfg->erb_fwd/erb_inv NULL): int32 n_bins,
+ * n_erb, then n_bins*n_erb float32 forward and inverse, both bin-major. NULL (pool not live) on a header not matching
+ * cfg->grid or a short file. The only file I/O; out under -DDFN2_STREAM_NO_STDIO. */
 DFN2Stream *dfn2_stream_init_from_erb_file(const DFN2StreamConfig *cfg, const char *erb_path,
                                            void *pool, size_t pool_bytes);
 
@@ -132,50 +130,50 @@ DFN2Stream *dfn2_stream_init_from_erb_file_ex(const DFN2StreamConfig *cfg, const
                                               void *pool, size_t pool_bytes,
                                               const DFN2StreamMemReq *expected);
 
-/* Back to the start: HPF, STFT/ISTFT and DFN2Prepost all reset (recurrent state zeroed, generation
- * advanced, warm-up frames due again); ERB tables (borrowed or pool-owned) kept. */
+/* Back to the start: HPF, STFT/ISTFT and DFN2Prepost reset (state zeroed, generation advanced, warm-up due
+ * again); ERB tables kept. */
 void dfn2_stream_reset(DFN2Stream *s);
 
 /* Generation of the recurrent state (dfn2_prepost_state_generation()); 0 for NULL. */
 unsigned int dfn2_stream_state_generation(const DFN2Stream *s);
 
+/* Attenuation limit in dB (0 disables), between hops only; 0, or -1 on NULL, a non-finite value or an open
+ * frame. Kept by reset. */
+int dfn2_stream_set_atten_lim(DFN2Stream *s, float atten_lim_db);
+
 const DFN2Grid *dfn2_stream_grid(const DFN2Stream *s);   /* NULL for NULL */
 int dfn2_stream_hop_size(const DFN2Stream *s);           /* samples per PCM hop; -1 on NULL */
-/* dfn2_prepost_layout_version(): the graph contract this instance is bound to. -1 on NULL. */
+/* dfn2_prepost_layout_version(): the graph contract of this instance. -1 on NULL. */
 int dfn2_stream_layout_version(const DFN2Stream *s);
 
-/* The model's tensor views of one open hop, plus the generation the accelerator's own state
- * copy must match before this call. Valid until dfn2_stream_post_process(). */
+/* The tensor views of one open hop and the generation the accelerator's state must match; valid until
+ * dfn2_stream_post_process(). */
 typedef struct DFN2HopIO {
-    int                job_ready;   /* 1: inputs/outputs are open, run the accelerator this hop.
-                                      * 0: frames_per_call > 1 and this hop has no job -- inputs/
-                                      * outputs are stale, skip straight to post_process. Always 1
-                                      * when frames_per_call == 1. */
+    int                job_ready;   /* 1: run the accelerator. 0 (N > 1 only): no job, inputs/outputs stale */
     DFN2PrepostInputs  inputs;      /* valid only when job_ready */
     DFN2PrepostOutputs outputs;     /* valid only when job_ready */
-    /* Sampled every hop, job_ready or not -- reflects the previous hop's warm-up/refusal. Reload
-     * the accelerator's own state copy with quantized zero first if it doesn't match. */
+    /* Sampled every hop; reload the accelerator's state with quantized zero if it differs. */
     unsigned int       state_generation;
 } DFN2HopIO;
 
-/* One PCM hop in: int16 -> float, HPF (if enabled), analysis STFT, pre_process_freq, and
- * frame_open when a job is ready (io->job_ready). Returns 1 with *io filled (every hop, warm-up
- * included), or -1 on a contract error (NULL args, or called again before the matching
- * post_process). pcm_in holds exactly dfn2_stream_hop_size(s) samples. */
+/* One PCM hop in (dfn2_stream_hop_size(s) samples): int16 -> float, HPF, STFT, pre_process_freq, frame_open
+ * when io->job_ready. 1 with *io filled (warm-up included), or -1 on NULL args or no preceding post_process. */
 int dfn2_stream_pre_process(DFN2Stream *s, const int16_t *pcm_in, DFN2HopIO *io);
 
-/* Closes the hop opened by pre_process, if io->job_ready was set (otherwise ai_rc is ignored):
- * ai_rc == 0 commits (frame_finish), anything else bypasses (frame_bypass). Either way
- * post_process_freq() then runs once, draining one hop from whatever the last job computed
- * (frames_per_call > 1: that may be a hop or more before this one, never this one), and
- * ac_istft_push_planar() writes a full hop (AC_OLA_ACCUMULATE) that pcm_out is saturated from.
- *
- * Return value (1/0/-1) is dfn2_prepost_post_process_freq()'s own spectral-validity flag, NOT
- * "pcm_out is this hop delayed by L+D" -- this stream's STFT/ISTFT framing adds one more hop. A
- * caller needing sample-accurate alignment must count hops itself (L + D + frames_per_call),
- * not branch on this return value. Call once per pre_process, every hop, whether or not
- * io->job_ready was set -- never more than once per hop. */
+/* Closes the hop, once per pre_process: with io->job_ready ai_rc 0 commits, else bypasses (otherwise ignored); one hop
+ * is then drained to pcm_out through the ISTFT. Returns the spectral-validity flag (1/0) of
+ * dfn2_prepost_post_process_freq(), -1 on error; it is not an alignment: count L + D + N hops. */
 int dfn2_stream_post_process(DFN2Stream *s, int ai_rc, int16_t *pcm_out);
+
+/* As dfn2_stream_pre_process() on spectra: est and app are n_bins floats each, MODEL scale; est drives features and
+ * heads, app is what mask, deep filter and attenuation limit act on (est == app: one spectrum). -1, state untouched, on
+ * NULL args, no preceding post_process, or a bin that is non-finite or beyond DFN2_STREAM_BIN_LIMIT_BITS. */
+int dfn2_stream_pre_process_freq_dual(DFN2Stream *s, const float *est_re, const float *est_im,
+                                      const float *app_re, const float *app_im, DFN2HopIO *io);
+
+/* As dfn2_stream_post_process(), delivering the enhanced spectrum (re/im n_bins floats each, MODEL scale)
+ * and *valid (may be NULL) instead of an ISTFT. 0, or -1 on NULL args or no pending pre_process. */
+int dfn2_stream_post_process_freq(DFN2Stream *s, int ai_rc, float *re, float *im, int *valid);
 
 #ifdef __cplusplus
 }
