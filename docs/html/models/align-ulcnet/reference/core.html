@@ -12,7 +12,7 @@
 <h1>Align-ULCNet 頻域與模型契約</h1>
 <details><summary>本頁目錄</summary>
 <ul>
-<li><a href="#section-2">ONNX graph boundary（layout 18）</a></li>
+<li><a href="#section-2">ONNX graph boundary（layout 18；封包 19）</a></li>
 <li><a href="#section-3">Block diagram</a></li>
 <li><a href="#section-4">訊號泳道圖</a></li>
 <li><a href="#section-5">I/O 表</a></li>
@@ -39,8 +39,9 @@
 <li><a href="../../../../../AIAEC/Align_ULCNet/README.md">模型設定與範例</a></li>
 </ul>
 
-<h2 id="section-2">ONNX graph boundary（layout 18）</h2>
-<p>boundary 只有一種：四個 host 特徵輸入加四個 rank-4 state，每個 state 都有同 shape 的 <code>*_out</code>。
+<h2 id="section-2">ONNX graph boundary（layout 18；封包 19）</h2>
+<p>單拍（N=1）的 boundary：四個 host 特徵輸入加四個 rank-4 state，每個 state 都有同 shape 的 <code>*_out</code>。
+封包 graph（<code>--frames-per-call N</code>，N=2 至 64，<code>ULCNET_MODEL_IO_PACKET_LAYOUT_VERSION</code> = 19）在四路特徵之後、state 之前多一個 <code>frame_reset</code>（最後一個訊號輸入，<code>[1,N]</code>，0.0／1.0 控制值），state 的形狀與配對不變；事件 hop 的語意見<a href="#pcm">PCM SDK 時序與狀態</a>與<a href="../index.html">整合入口</a>。下文的張量表以單拍為準。
 版本號在 <code>export_onnx.py</code> 的 <code>LAYOUT_VERSION</code>，與 <code>ulcnet_model_io.h</code> 的
 <code>ULCNET_MODEL_IO_LAYOUT_VERSION</code> 互鎖（<code>test_c_descriptor_constants_match_export_contract</code>）。
 <code>inference.py calib</code> 與匯出用同一個 wrapper，同一個 process 匯出。</p>
@@ -54,11 +55,10 @@
 <p>輸出是 <code>output</code>（planar mask <code>(1,2,1,K)</code>）加四個 <code>*_out</code>，每個與同名輸入 shape 完全相同。位移在 graph 內、用輸入端的 Slice 再把新一幀 Concat 進去（K/V 放前面、logit 放後面），沒有 state 輸出由 Slice 產生，所以 runtime 可把每個 <code>*_out</code> 綁到同名輸入的位址、CPU 不搬不複製;<code>export_graph</code> 以 <code>validate_inplace_state_contract</code>（<code>AIAEC/_onnx_contract.py</code>）檢查,任何一項不成立匯出直接失敗。Slice 參數與檢查項目逐條收在 <a href="core.html#calibration">Align-ULCNet 頻域與模型契約</a>。</p>
 <pre>python3 AIAEC/Align_ULCNet/export_onnx.py --checkpoint ckpt.pth \
     --max-delay-frames 8 --output output/align_ulcnet_d8.onnx --verify</pre>
-<div class="note">boundary 沒有可選開關：前後端固定在 host，GRU hidden 固定併成單一 <code>h_gru</code>，
-export 與 calibration CLI 都沒有 layout 旗標。C 端把 state 清零（reset 或拒絕一幀）時，定點 accelerator 自己的
+<div class="note">前後端固定在 host，GRU hidden 固定併成單一 <code>h_gru</code>，除 <code>--frames-per-call</code> 外沒有 layout 旗標。C 端把 state 清零（reset 或拒絕一幀）時，定點 accelerator 自己的
 state 緩衝不會跟著變，所以板端 sample 要追蹤 <code>ulcnet_accelerator_adapter_state_generation()</code>（見下節），
-值一變就用量化後的 0 重填 state。第一個 hop 的 state 全為 0（reset 值）；定點 runtime 的「0」是否等於量化後的 0
-由量化工具鏈確認，尚未驗證。</div>
+值一變就把 state 緩衝清成零。第一個 hop 的 state 全為 0（reset 值）。定點 state 埠的輸入與輸出兩端 <code>zero_point</code> 都必須是 0，清零才等於量化後的 0；
+sample 端的埠檢查（<code>stream_check_ports()</code>）在第一次送件前以 <code>STREAM_PORT_ERR_STATE_ZERO_POINT</code>（-110）拒絕不符的 graph。</div>
 
 <h2 id="section-3">Block diagram</h2>
 <pre>mic ────────┐                          far ──────────────┐
@@ -178,11 +178,11 @@ double twiddles），非 bit-exact（<code>test_ulcnet_process_c.py</code> 檔�
 <ol>
 <li><b>grid 是 run-time 值</b>：填 <code>UlcnetGridSpec</code>（<code>sample_rate</code>、<code>n_fft</code>、<code>delay_depth</code> 取自匯出該模型的設定）→ <code>ulcnet_grid_make(&amp;grid, &amp;spec)</code> 回 <code>ULCNET_GRID_OK</code> 或第一個失敗的 <code>ULCNET_GRID_ERR_*</code>；<code>hop</code> = n_fft/2、<code>n_bins</code> = n_fft/2+1。函式庫接受 audiolib 建得出 framing 的任何 n_fft；匯出器目前只支援 16 kHz／512 與 48 kHz／1024（<code>SUPPORTED_GRIDS</code>）。</li>
 <li><b>D（delay depth）必須等於匯出該 ONNX 時的 <code>--max-delay-frames</code></b>：C 端只檢查範圍 <code>ULCNET_MODEL_IO_MIN_D</code>(2)…<code>MAX_D</code>(64)，檢查不出與 graph 不符。D 不跨 grid 沿用（D 數的是 hop）。</li>
-<li><b>framing 由應用端做</b>：用 audiolib 建兩個 <code>AcStft</code>（error、raw far）與一個 <code>AcIstft</code>，組態 <code>ac_stft_config_default(&amp;sc, grid.n_fft)</code>（sqrt-Hann、center 0、<code>spec_scale</code> = <code>ispec_scale</code> = 1），合成端另設 <code>sc.ola = AC_OLA_ENV_NORM</code>（契約寫在 <code>ulcnet_process.h</code>）。<code>FftHandle</code> 與窗表可循序共用；函式庫不持有 window、FFT 或 STFT 物件。</li>
+<li><b>framing 由應用端做</b>：用 audiolib 建兩個 <code>AcStft</code>（error、raw far）與一個 <code>AcIstft</code>，組態 <code>ac_stft_config_default(&amp;sc, grid.n_fft)</code>（sqrt-Hann、center 0、<code>spec_scale</code> = <code>ispec_scale</code> = 1），合成端另設 <code>sc.ola = AC_OLA_ACCUMULATE</code>（契約寫在 <code>ulcnet_process.h</code>）。<code>FftHandle</code> 與窗表可循序共用；函式庫不持有 window、FFT 或 STFT 物件。</li>
 <li><b>recurrent state 歸應用端</b>（<code>key_history</code>、<code>value_history</code>、<code>logit_history</code>、<code>h_gru</code>；形狀見 <a href="core.html">Align-ULCNet 頻域與模型契約</a> 的 State 表，函式庫不知道這些形狀）：浮點 host 配四塊 float buffer，把四組（指標，元素數）登錄進 <code>cfg</code>——全登錄或全不登錄，init 與 reset 時清零，每次 <code>frame_finish</code> 整塊檢查有限，不計入 pool 大小與 hash；目標平台不登錄，由加速器持有。</li>
 <li><code>ulcnet_prepost_config_defaults(&amp;cfg, &amp;grid)</code>（grid 被複製）→ 登錄 state → <code>ulcnet_prepost_get_mem_size(&amp;cfg, &amp;req)</code>（<code>req.alignment</code> = 16）→ <code>ulcnet_prepost_init_ex(pool, req.bytes, &amp;cfg, &amp;req)</code>；host 工具可用 <code>_create</code>／<code>_destroy</code>。</li>
 <li>每個 hop（<b>從 hop 0 起一次推論</b>，沒有只暖機不推論的拍）：<code>ac_stft_push_planar</code>×2 → <code>pre_process_freq(err, far)</code> 恆回 1 → <code>frame_open</code> → 加速器 → <code>frame_finish</code>（失敗改 <code>frame_bypass</code>）→ <code>post_process_freq</code> → <code>ac_istft_push_planar</code>。</li>
-<li>目標平台：啟動時先載入量化後的 0 並記下 <code>ulcnet_prepost_state_generation()</code>（新建實例為 0）；之後每次它改變（<code>reset</code>、被拒的 <code>frame_finish</code>）就重填加速器自己的 state。</li>
+<li>目標平台：啟動時先把 state 緩衝清成零（定點 state 埠兩端的 <code>zero_point</code> 須為 0）並記下 <code>ulcnet_prepost_state_generation()</code>（新建實例為 0）；之後每次它改變（<code>reset</code>、被拒的 <code>frame_finish</code>）就重填加速器自己的 state。</li>
 <li>重新開始：<code>ulcnet_prepost_reset(p)</code>（清登錄的 state、丟掉未結束的 frame、generation +1；config、登錄與 pool 不動），並自行 <code>ac_stft_reset</code>／<code>ac_istft_reset</code>；結束：<code>_destroy</code>（對 <code>_init</code> 實例是 no-op，登錄的 buffer 與 pool 歸應用端）。</li>
 </ol>
 <pre>#include &lt;stdlib.h&gt;
@@ -214,7 +214,7 @@ int run_ulcnet(int sample_rate, int n_fft, int D, const size_t el[4],
     cfg.h_gru         = calloc(el[3], sizeof(float));  cfg.gru_hidden_elements    = el[3];
 
     ac_stft_config_default(&amp;sc, grid.n_fft);   /* sqrt-Hann、center 0、spec_scale = ispec_scale = 1 */
-    sc.ola = AC_OLA_ENV_NORM;                  /* 合成用；分析忽略 */
+    sc.ola = AC_OLA_ACCUMULATE;                 /* 合成用；分析忽略 */
     size_t an = ac_stft_get_mem_size(&amp;sc), sy = ac_istft_get_mem_size(&amp;sc);
     void *m0 = block(an), *m1 = block(an), *m2 = block(sy);
     AcStft *err_stft = m0 ? ac_stft_init(m0, an, &amp;sc) : NULL;
@@ -301,7 +301,7 @@ UlcnetAcceleratorAdapter *make_adapter(const UlcnetGrid *grid, void *runtime, Ul
     *model = ulcnet_accelerator_adapter_model(a);   /* 交給 pipeline；adapter 與 pool 須活得比 pipeline 久 */
     return a;
 }</pre>
-<p class="note">三段程式已在暫存副本以 <code>-std=c11 -Wall -Wextra -Wpedantic -Werror</code> 編譯，並以替身加速器（mask 恆為 1）在 16 kHz／512 與 48 kHz／1024 各跑 40 hop：輸出等於 error 延後一個 hop。<code>npu_run</code>／<code>run_graph</code>／<code>npu_fill_state_with_quantized_zero</code> 由目標平台提供。<code>UlcnetModel.infer</code> 回非 0 或輸出非有限時，pipeline 會改走 identity（輸出 linear error；這是未經 guard 的 analysis residual，即 <code>formed_hop</code>／<code>error_spec</code>，在 lib/aec 渲染 guard 作用的 hop 上可能大於 capture）；<code>io_descriptor</code> 必須發布，且須比 pipeline 活得久（pipeline 只複製 struct）。</p>
+<p class="note">三段程式可在 <code>-std=c11 -Wall -Wextra -Wpedantic -Werror</code> 下編譯；接替身加速器（mask 恆為 1）在 16 kHz／512 與 48 kHz／1024 各跑 40 hop，輸出等於 error 延後一個 hop。<code>npu_run</code>／<code>run_graph</code>／<code>npu_fill_state_with_quantized_zero</code> 由目標平台提供。<code>UlcnetModel.infer</code> 回非 0 或輸出非有限時，pipeline 會改走 identity（輸出 linear error；這是未經 guard 的 analysis residual，即 <code>formed_hop</code>／<code>error_spec</code>，在 lib/aec 渲染 guard 作用的 hop 上可能大於 capture）；<code>io_descriptor</code> 必須發布，且須比 pipeline 活得久（pipeline 只複製 struct）。</p>
 
 <h3>錯誤處理速查</h3>
 <div class="tbl"><table>
@@ -346,11 +346,12 @@ UlcnetAcceleratorAdapter *make_adapter(const UlcnetGrid *grid, void *runtime, Ul
 <tr><td>state 形狀（<code>TA_CHANNELS</code> 32、<code>SCORE_WINDOW_FRAMES</code> 5、GRU 2 subband×2 層×128、<code>ta_bins</code> = ⌈K/10⌉）</td><td>K/V <code>(1,32,D,TA)</code>、logit <code>(1,32,5,D)</code>、<code>h_gru (1,4,1,128)</code></td><td><code>export_onnx.py</code> 的 <code>state_shapes()</code></td><td>由模型拓撲決定；函式庫不持有這些形狀，descriptor 的五個 interior 欄位（<code>ta_channels</code>…<code>gru_hidden</code>）恆為 0、不被讀取</td></tr>
 <tr><td><code>ULCNET_MODEL_IO_COMPRESSION_EXP</code></td><td>0.3</td><td><code>ulcnet_model_io.h</code></td><td>host 前後端與訓練 loss 共用；<code>export_onnx.py</code> 拒絕其他指數</td></tr>
 <tr><td><code>ULCNET_FAR_RAW</code>／<code>ULCNET_FAR_ALIGNED</code></td><td>0／1</td><td><code>ulcnet_model_io.h</code></td><td>production descriptor 只驗證 raw；aligned 為診斷模式</td></tr>
-<tr><td><code>ULCNET_PREPOST_CARVE_VERSION</code> = 8；<code>ULCNET_PREPOST_DESCRIPTOR_VERSION</code>／<code>ULCNET_MODEL_IO_ALIGNMENT</code></td><td>1／16</td><td><code>ulcnet_prepost.h</code>、<code>ulcnet_model_io.h</code></td><td>pool 切分與 32-byte descriptor 版本；進 <code>build_flags_hash</code></td></tr>
+<tr><td><code>ULCNET_PREPOST_CARVE_VERSION</code> = 9；<code>ULCNET_PREPOST_DESCRIPTOR_VERSION</code>／<code>ULCNET_MODEL_IO_ALIGNMENT</code></td><td>1／16</td><td><code>ulcnet_prepost.h</code>、<code>ulcnet_model_io.h</code></td><td>pool 切分與 32-byte descriptor 版本；進 <code>build_flags_hash</code></td></tr>
 <tr><td>訓練端 <code>config.ini</code> 的 <code>[model]</code>（<code>gamma</code>、<code>subband_bins</code>、<code>compression_exponent</code>）</td><td>5、2、0.3</td><td><code>Align_ULCNet/config.ini</code></td><td>權重形狀的一部分，寫進 checkpoint contract</td></tr>
 </table></div>
 
 <h2 id="pcm">PCM SDK 時序與狀態</h2>
+<div class="note"><b>本節的流程圖與表格是單拍（N=1）stream。</b>封包 stream（<code>frames_per_call</code> N≥2，<code>ulcnet_stream_pre_process_packet_f32()</code>／<code>_freq()</code>）一包 N 個 hop 只做一次加速器呼叫。事件 hop 的模型 state 由 graph 內的 <code>frame_reset</code> 重設並直通該 hop，generation 不變，不是 BYPASS。PCM 入口（<code>_f32</code>）在該 hop 重啟自己的分析與 ISTFT，位置與 N=1 相同（<code>ulcnet_stream_restart_mask()</code> 回報哪些 hop），所以 N=8 的 PCM 與同樣事件的 N=1 逐樣本相同；頻譜入口（<code>_freq</code>、<code>ulcnet_nn_stage</code>）只重啟模型，呼叫端的分析器與 ISTFT 不重啟。</div>
 <h3>流程圖（block diagram）</h3>
 <pre>
 PCM in (float AEC error, float raw far)
@@ -383,7 +384,7 @@ ulcnet_stream_post_process(ai_rc)
 ulcnet_prepost_post_process_freq
   |
   v
-ac_istft_push_planar (AcIstft, AC_OLA_ENV_NORM；首拍回 0 個樣本)
+ac_istft_push_planar (AcIstft, AC_OLA_ACCUMULATE；每拍回整個 hop，含首拍)
   |
   v
 float -> int16 飽和轉換
@@ -401,7 +402,7 @@ hop   caller                         ulcnet_stream                         NPU
       &lt;-- 1 (job開啟) ----------------------------------------------
       ai_rc=run_accelerator ------------------------------------>  寫 mask + state
       post_process(ai_rc) --------------> frame_finish ---------->
-      &lt;-- 0 (ENV_NORM 首拍無輸出) -------- ISTFT push=0 ----------
+      &lt;-- 1 (首拍即真實合成輸出) -------- ISTFT push=hop ----------
 n     err,far,delay={1,1} -> pre_process -> changed=1, 觸發完整重置 + 武裝 reprime
                                       -> STFT x2, pre_process_freq
                                       -> reprime>0: frame_bypass (不開 frame)
@@ -428,9 +429,9 @@ k     pre_process -> open --------------------------------------->  替身回 -1
 <h2 id="section-12">State 表</h2>
 <div class="tbl"><table>
 <tr><th>State</th><th>誰保存</th><th>跨 hop 保存什麼</th><th>何時歸零／推進</th></tr>
-<tr><td>STFT／ISTFT 歷史</td><td>本層（兩路 <code>AcStft</code>＋一路 <code>AcIstft</code>，pool 內）</td><td><code>AC_OLA_ENV_NORM</code> 的重疊與包絡</td><td>明確 <code>ulcnet_stream_reset()</code> 或對齊邊界觸發的重置</td></tr>
+<tr><td>STFT／ISTFT 歷史</td><td>本層（兩路 <code>AcStft</code>＋一路 <code>AcIstft</code>，pool 內）</td><td><code>AC_OLA_ACCUMULATE</code> 的前一幀後半窗（重疊相加，無包絡正規化）</td><td>明確 <code>ulcnet_stream_reset()</code> 或對齊邊界觸發的重置</td></tr>
 <tr><td>四組遞迴 state（key／value／logit history、h_gru）</td><td>登錄則呼叫端持有，未登錄則加速器自行持有</td><td>attention K/V window、attention-logit window、GRU hidden</td><td>reset 全歸零；<code>frame_finish</code> 的非有限拒收只歸零已登錄的部分</td></tr>
-<tr><td><code>state_generation</code></td><td>轉呼叫 <code>ulcnet_prepost_state_generation()</code></td><td>目前 generation 值</td><td>reset（含對齊觸發的）或非有限拒收各 +1；純粹 <code>ai_rc != 0</code> 的 bypass 不推進</td></tr>
+<tr><td><code>state_generation</code></td><td>轉呼叫 <code>ulcnet_prepost_state_generation()</code></td><td>目前 generation 值</td><td>reset（含對齊觸發的）或非有限拒收各 +1；純粹 <code>ai_rc != 0</code> 的 bypass 不推進；封包 stream 的事件 hop 不推進</td></tr>
 <tr><td>對齊記帳（<code>had_hop</code>／<code>prev_solid</code>／<code>reprime_remaining</code>）</td><td>本層內部，<b>這個模型特有</b></td><td>上一拍的 <code>solid</code> 值、是否已處理過第一拍、剩餘的 reprime 倒數</td><td><code>ulcnet_stream_reset()</code>（含內部自動呼叫）歸零 <code>had_hop</code>／<code>prev_solid</code>，確保重置後下一拍不會誤觸發第二次邊界</td></tr>
 </table></div>
 
@@ -438,7 +439,7 @@ k     pre_process -> open --------------------------------------->  替身回 -1
 <div class="tbl"><table>
 <tr><th>項目</th><th>值（16 kHz／512／delay_depth=32）</th><th>出處</th></tr>
 <tr><td>hop</td><td>256 samples = 16 ms</td><td>實測（見下方 pool 量測）</td></tr>
-<tr><td><code>AC_OLA_ENV_NORM</code> 啟動靜音</td><td>1 hop（init 或任一次重置後的第一次 push）</td><td><code>audio_stft.h</code>；<code>post_process</code> 的 0 回傳值</td></tr>
+<tr><td>合成啟動</td><td>無首拍特例：hop 0 即為真實合成輸出（前半窗疊加的歷史為零）</td><td><code>ulcnet_stream.h</code> 檔頭</td></tr>
 <tr><td>reprime hop 數</td><td>1（<code>ULCNET_STREAM_REPRIME_FRAMES</code>）</td><td>同 <code>pipelines/ulcnet/ulcnet_nn_stage.h</code> 的 <code>ULCNET_NN_STAGE_REPRIME_FRAMES</code> 與板端 sample 的 <code>ALIGNULCNET_REPRIME_FRAMES</code></td></tr>
 </table></div>
 

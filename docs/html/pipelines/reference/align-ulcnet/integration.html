@@ -200,7 +200,7 @@ int four_ulcnet_run(void) {
 <tr><td><code>ulcnet_nn_stage_begin / _begin_complex / _begin_time</code></td><td>0</td><td><code>INVALID_ARGUMENT</code>(-1:NULL、<code>begin_time</code> 但 stage 以 err_analysis = 0 建立)、<code>SEQUENCE_ERROR</code>(-2:上一 hop 沒 end)</td><td>reset 前端 + stage</td></tr>
 <tr><td><code>ulcnet_nn_stage_nn_begin</code></td><td>1(幀已開)、0(本 hop 無模型幀)</td><td>-1／-2</td><td>reset 前端 + stage</td></tr>
 <tr><td><code>ulcnet_nn_stage_nn_end(rc)</code></td><td>0</td><td><code>rc != 0</code> 或輸出有非有限 bin 不是錯誤:該幀 identity;只有序列錯誤回 -2</td><td>不用 reset</td></tr>
-<tr><td><code>ulcnet_nn_stage_end / _process</code></td><td>0;hop #0 輸出全零</td><td><code>DSP_ERROR</code>(-3:synthesis 吐出非 0 且非整 hop 的樣本數)、-1、-2</td><td>reset 前端 + stage</td></tr>
+<tr><td><code>ulcnet_nn_stage_end / _process</code></td><td>0;每次輸出整個 hop(hop #0 也是)</td><td><code>DSP_ERROR</code>(-3:synthesis 吐出的樣本數不是整個 hop)、-1、-2</td><td>reset 前端 + stage</td></tr>
 <tr><td><code>mcab_sample_beam_process*()</code></td><td><code>MCAB_OK</code></td><td><code>MCAB_INVALID_ARGUMENT</code>(NULL／非有限樣本,狀態未動)、<code>MCAB_SEQUENCE_ERROR</code>(<code>process_beam</code> 沒有待處理的 front,未改)、<code>MCAB_DSP_ERROR</code>(lane 拒絕,flow 已 reset)</td><td>reset helper + stage</td></tr>
 <tr><td>adapter 的 <code>run()</code></td><td>0</td><td>非 0:該幀 <code>frame_bypass</code>,state 不動(回報失敗的 runtime 視同沒寫);<code>frame_finish</code> 發現非有限:已登錄的 state 歸零、generation +1(板端未登錄,只加 generation)</td><td>定點加速器依 <code>ulcnet_accelerator_adapter_state_generation()</code> 重填量化 0</td></tr>
 </table>
@@ -262,7 +262,7 @@ int four_ulcnet_run(void) {
 -- 收尾(兩條路徑相同) ----------------------------------------------------------------------------------------------------
   | ulcnet_nn_stage_end(stage, out)       沒取走的幀 = identity                    |                          |
   |----------------------------------------------------&gt;|                          |                          |
-  |                          |                          | ac_istft_push_planar(synthesis, 採用的頻譜, out);hop #0 回 0 樣本 -&gt; out 補零
+  |                          |                          | ac_istft_push_planar(synthesis, 採用的頻譜, out);每 hop 回整個 hop(含 hop #0,AC_OLA_ACCUMULATE)
   | 0 | ULCNET_NN_STAGE_DSP_ERROR(-3,非整 hop)| SEQUENCE_ERROR(-2)| INVALID_ARGUMENT(-1)                      |
   |&lt;----------------------------------------------------|                          |                          |</pre>
 
@@ -285,7 +285,7 @@ int four_ulcnet_run(void) {
   |-------------------------------------------------------------------------------&gt;|                          |
   |                          |                          | model.infer(...) -&gt; run(...) -&gt; NPU(與 mono 完全相同)
   |                          |                          |------------------------------------------------&gt;|
-  |&lt;- 0;out = 一個 hop(hop #0 全零) ---------------------------------------------------|                          |
+  |&lt;- 0;out = 一個 hop(hop #0 也是整個 hop) ---------------------------------------------------|                          |
 -- 拆開形式(需要用 lane 頻譜算 mask / VAD 時) ----------------------------------------------------------------------------
   | mcab_sample_beam_process_front(unit, mics, far, &amp;front)       front.linear_spectra[4] 唯讀              |
   |-------------------------&gt;|                          |                          |                          |

@@ -13,21 +13,22 @@
 <p>PCM SDK 負責窗函數、STFT／ISTFT 及模型前後處理，每 hop 交給呼叫端執行加速器。已經拿到頻譜的應用，可直接用 <code>lib/ainr/</code> 或 <code>lib/aiaec/</code> 內的 model core。</p>
 
 <h2>AINR</h2><table><thead><tr><th>模型</th><th>C 入口</th><th>訊號</th></tr></thead><tbody>
-<tr><th><a href="dfn2/index.html">DeepFilterNet2</a></th><td>PCM SDK、頻域 core</td><td>int16 語音 → 增強 PCM；full 或 mask-only。</td></tr>
+<tr><th><a href="dfn2/index.html">DeepFilterNet2</a></th><td><code>ainr.h</code>（PCM、PCM → 頻譜、頻譜 → 頻譜）、頻域 core</td><td>int16 語音 → 增強 PCM；客戶只設 sr、fft、hop_in，full 或 lite 由產品綁定。</td></tr>
 <tr><th><a href="dfn3/index.html">DeepFilterNet3</a></th><td>頻域 core</td><td>原始低頻深濾波與高頻 ERB mask，在同一頻譜輸出。</td></tr>
 <tr><th><a href="gtcrn/index.html">GTCRN</a></th><td>頻域 core</td><td>單路複數頻譜 → ERB 特徵 → 複數 mask。</td></tr>
 <tr><th><a href="rnnoise-erb/index.html">RNNoise-ERB</a></th><td>頻域 core</td><td>單路頻譜 → 三幀特徵窗 → ERB gains，對齊延遲頻譜。</td></tr>
 </tbody></table>
 
 <h2>AIAEC</h2><table><thead><tr><th>模型</th><th>C 入口</th><th>訊號</th></tr></thead><tbody>
-<tr><th><a href="align-ulcnet/index.html">Align-ULCNet</a></th><td>PCM SDK、頻域 core</td><td>線性 AEC 的 float 殘差與原始 far → 增強 PCM。</td></tr>
-<tr><th><a href="deepvqe-s/index.html">DeepVQE-S</a></th><td>PCM SDK、頻域 core</td><td>原始 mic 和 far PCM → 複數濾波 → 增強 PCM。</td></tr>
+<tr><th><a href="align-ulcnet/index.html">Align-ULCNet</a></th><td><code>aiaec.h</code>（PCM、PCM → 頻譜、頻譜 → 頻譜）、頻域 core</td><td>線性 AEC 的 float 殘差、原始 far 與對齊事件 → 增強 PCM；目前沒有交付的 graph。</td></tr>
+<tr><th><a href="deepvqe-s/index.html">DeepVQE-S</a></th><td><code>aiaec.h</code>（PCM、PCM → 頻譜、頻譜 → 頻譜）、頻域 core</td><td>原始 mic 和 far PCM → 複數濾波 → 增強 PCM；只有 16 kHz／512／N=1 有登錄的 graph。</td></tr>
 <tr><th><a href="cagcrn/index.html">CAGCRN</a></th><td>mask 合成 helper</td><td>原始 mic 和 far。Python 串流與匯出，C 提供複數 mask 合成。</td></tr>
 <tr><th><a href="align-cruse/index.html">Align-CRUSE</a></th><td>mask 合成 helper</td><td>原始 mic 和 far。Python 串流與匯出，C 提供實數 mask 合成。</td></tr>
 </tbody></table>
 
 <p><a href="reference/onnx.html">ONNX 張量邊界、state、匯出與 PTQ calibration</a></p>
-<p>三個 PCM SDK 以主機和替身加速器驗證。目標板上的真實 graph、量化、cache／DMA 與每 hop 耗時，需在部署時另外核對。</p>
+<p>DFN2、DeepVQE-S、Align-ULCNet 的客戶介面（<code>stream/ainr/ainr.h</code>、<code>stream/aiaec/aiaec.h</code>）以主機和替身加速器驗證，各模型首頁列出組態與驗證狀態。沒有交付 graph 的組態在 init 被拒絕。目標板上的真實 graph、量化、cache／DMA 與每 hop 耗時，需在部署時另外核對。</p>
+<p>三個模型的 init 都回 0 或負的錯誤碼，並填一份精簡的 info：圖路徑、<code>trim_samples</code>、<code>queue_frames</code>、<code>tail_zero_blocks</code>。stream 函式庫不描述圖的埠：客戶只設 <code>sr、fft、hop_in</code>，N = <code>hop_in / (fft / 2)</code> 由 sample 從 config 算；每個已交付 graph 的訊號、head 與 state 的 shape 放在各函式庫旁的模型設定（<code>stream/ainr/ai3_model_io_dfn2.h</code>、<code>stream/aiaec/ai3_model_io_deepvqes.h</code>、<code>stream/aiaec/ai3_model_io_alignulcnet.h</code>，只有標頭，<code>ainr.h</code>／<code>aiaec.h</code> 不引用），共用的接線程式是 <code>stream/common/ai3_model_io.h</code>。圖的埠順序是同一條規則：輸入為訊號再接 state、輸出為 head 再接 state，所以 sample 依位置綁埠並以 SDK 無關的檢查器 <code>stream_check_ports()</code>（<code>stream/common</code>）檢查，細節見<a href="dfn2/reference/board.html#info">板端整合</a>。</p>
 </main>
 </body>
 </html>

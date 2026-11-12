@@ -205,7 +205,7 @@ def test_carve_scan_sees_the_dfn_pipeline_pages_and_rejects_stale_forms(
     for text in ('<code>CARVE_VERSION 5</code>',
                  '<code>DFN2_PREPOST_CARVE_VERSION 5</code>',
                  '<code>DFN2_PREPOST_CARVE_VERSION = 5</code>',
-                 '`ULCNET_PREPOST_CARVE_VERSION`\n  = 9'):
+                 '`ULCNET_PREPOST_CARVE_VERSION`\n  = 8'):
         stale.write_text(text, encoding='utf-8')
         assert _carve_problems(_carve_mentions([stale]), declared), text
     stale.write_text('<code>DFN2_PREPOST_CARVE_VERSION = %d</code>'

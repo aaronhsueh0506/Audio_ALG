@@ -113,7 +113,8 @@ static void ulcnet_target_grid(UlcnetGrid *grid) {
 }
 
 static void deepvqe_target_grid(DeepVqeGrid *grid) {
-    const DeepVqeGridSpec spec = { .sample_rate = 16000, .n_fft = 512, .delay_depth = 8 };
+    const DeepVqeGridSpec spec = { .sample_rate = 16000, .n_fft = 512, .delay_depth = 8,
+                                   .frames_per_call = 1 };
     assert(deepvqe_grid_make(grid, &spec) == DEEPVQE_GRID_OK);
 }
 

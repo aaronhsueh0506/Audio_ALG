@@ -196,20 +196,26 @@ library sources. Their build lists drop `fix_gain.c` and the `third_party/gain` 
 samples apply their input gain with a small `InputGain` helper over `sk_scale_f32()` and `sk_clip_f32()`).
 The DeepFilterNet2, Align-ULCNet and DeepVQE-S libraries are frequency domain only: the sample builds its own `AcStft` / `AcIstft`
 (audiolib's framing, so the board build list must include `audio_stft.c` and `audio_window.c`) and hands spectra to the library. No
-grid or lookahead pair is a build setting, so no model-grid `-D` flag belongs on a compile line. Each grid is a run-time spec filled from the sample's own table (`DFN2GridSpec` -> `dfn2_grid_make()`, `UlcnetGridSpec` ->
-`ulcnet_grid_make()`, `DeepVqeGridSpec` -> `deepvqe_grid_make()`), the pool comes from the library's `*_get_mem_size()` for that grid, and
-a model or pool built for another grid or pair is refused at run time. The one DFN2 variant flag is `-DDFN2_MASK_ONLY`; every DFN2 unit
-of a build must share it (mixed units do not link). The pipeline units (`dfn_res_stage.c`, `dfn_rate_bridge.c`) hold no grid and no pair
-either: the application puts its `DFN2Grid` in `DfnResStageConfig.grid`. The analysis and synthesis scales and the overlap-add mode
-are part of each library's framing contract (see its header or README): the DFN2 samples that call the pre/post class directly set
-`spec_scale = grid.stft_scale` and `ispec_scale = grid.stft_unscale`, the stage-hosted samples keep both at 1, and the Align-ULCNet and
-DeepVQE-S samples use `AC_OLA_ENV_NORM`; the default `AcStftConfig` gives the wrong feature scale for DFN2.
+grid or lookahead pair is a build setting, so no model-grid `-D` flag belongs on a compile line. The grid is a run-time value: a sample
+passes `{sr, fft, hop_in}` (`AinrConfig` / `AiaecConfig`) to its model stream, which resolves the grid, `N = hop_in / (fft / 2)`, the graph path
+and (DFN2) ERB matrices from its catalog and reports the graph and the stream timing in the `AinrInfo` / `AiaecInfo` that `*_init()` fills
+(`graph_path`, `trim_samples`, `queue_frames`, `tail_zero_blocks`; no port list). The graph's wiring (signal, head and state shapes, one row per
+registered `(model, sr, fft, N)`) is the sample's model configuration: the per-graph tables `ai3_model_io_<model>.h` next to each library (`stream/ainr/ai3_model_io_dfn2.h`,
+`stream/aiaec/ai3_model_io_{deepvqes,alignulcnet}.h`; header-only, not included by `ainr.h` / `aiaec.h`) and the shared helper
+`stream/common/ai3_model_io.h` (row expansion, state pairing, the `stream_check_ports()` call, buffer sizing, the check of every block's work
+against the row; tested by `make -C stream/common test-model-io`). A sample adds `-I stream/common -I stream/ainr` (or `stream/aiaec`) and compiles
+`stream/common/stream_bind.c` for the checker; the stream libraries do not. The pool comes from the stream's `*_get_mem_size()` (`StreamMemReq`: `bytes`, `alignment`, declared in
+`stream/common/stream_mem.h`), and a
+configuration, model or pool that is not registered or is too small is refused at run time, before any SDK call. The one DFN2 variant flag is
+`-DDFN2_MASK_ONLY`; every DFN2 unit of a build must share it (mixed units do not link). The pipeline units (`dfn_res_stage.c`,
+`dfn_rate_bridge.c`) hold no grid and no pair either: the application puts its `DFN2Grid` in `DfnResStageConfig.grid`. The analysis and
+synthesis scales and the overlap-add mode are part of each library's framing contract (see its header or README): the model streams take
+and return audio-scale spectra (the default `AcStft` / `AcIstft` scales of 1) and convert to the model scale internally, and the
+DFN2, Align-ULCNet and DeepVQE-S samples synthesize with `AC_OLA_ACCUMULATE`.
 
-A DFN2 grid row carries the model's `df_order`, lookahead pair, `frames_per_call` and the normaliser values of `config.ini`. The
-samples take the row from their own (sample rate, FFT size) table (three rows, the 32 kHz one provisional because no 32 kHz model is
-trained; two in `alg_ai3_aec_dfn.c` and the example mains, whose AEC has no 32 kHz grid): `alg_ai3_dfn.c` and `alg_ai3_dfn_lite.c` from
-`--sample-rate` / `--fft-size`, `alg_ai3_aec_dfn.c` from `--ai-sample-rate` / `--ai-fft-size` (its `--sr` is the host rate), and the two
-UVC samples (`uvc_ai_nr_stream.c`, `uvc_audio_live2a.c`) are 48 kHz only with the shipped row built into the sample.
+A sample supplies only `sr`, `fft` and `hop_in`; the stream selects everything else. For DFN2 that is the grid row (the model's
+`df_order`, lookahead pair, `frames_per_call` and the normaliser values of `config.ini`), the graph and the ERB matrices. A
+configuration without a delivered graph is refused by `*_get_mem_size()` / `*_init()` with its own return code.
 
 The board registers no recurrent state (the DFN2 `gru_hidden` / `df_convp_history` pairs and the Align-ULCNet and DeepVQE-S state views
 stay NULL / 0): the accelerator keeps it. A sample therefore reads the library's state generation before every accelerator run
@@ -219,11 +225,11 @@ saw, reloads quantized zeros into the accelerator's state input buffers (DFN2 wi
 warm-up frames, so a stream start makes M extra NPU runs whose heads are discarded). The start value differs per library (1 for DFN2 and the
 stage / bridge, 0 for Align-ULCNet and DeepVQE-S), so compare, never assume.
 
-Every DFN2 sample reads its ERB matrices from `/mnt/sd/dfn2_blobs/fb_<sr>_<n_erb>.bin` (for example `fb_48000_32.bin`; `<sr>` is the model
-grid's rate). The file has the layout of the DFN2 exporter's `erb_matrix.bin`: int32 `n_bins`, int32 `n_bands`, the forward matrix, the inverse
-matrix (float32; both `[n_bins][n_erb]`, bin-major). The sample refuses a header that disagrees with the grid or a short read, transposes the inverse to
-band-major `[n_erb][n_bins]` itself once at init, and passes the two pointers as `erb_fwd` / `erb_inv` (the buffers outlive every DFN2
-object). The checkpoint, the ERB file and the `model.bin` must be the ones trained for the chosen grid and pair.
+The DFN2 stream loads the ERB matrices of the resolved grid from the board's release-asset directory during `ainr_init()`; a sample
+neither names nor opens that file, and a missing file or a header or size mismatch returns `AINR_ERR_ERB_FILE`. The file has the layout
+of the DFN2 exporter's `erb_matrix.bin`: int32 `n_bins`, int32 `n_bands`, the forward matrix, the inverse matrix (float32; both
+`[n_bins][n_erb]`, bin-major). The stream transposes the inverse to band-major `[n_erb][n_bins]` once at init into pool-owned storage.
+The checkpoint, the ERB file and the `model.bin` must be the ones trained for the chosen grid and pair.
 
 ## Compile flags (`EXTRA_CFLAGS`)
 

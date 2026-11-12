@@ -133,6 +133,7 @@ float host 把 buffer（指標與<b>元素數</b>，不是 byte）登錄在 conf
 DeepVQE-S 的 <code>state[16]</code>、GTCRN 的 <code>state[8]</code>、RNNoise-ERB 的 <code>h1</code>／<code>h2</code>／<code>h3</code>；init 與 reset 歸零它們，<code>frame_finish</code>（GTCRN 為 <code>state_validate</code>）掃過每個 buffer 的<b>全部元素</b>，
 舊格子裡殘留的非有限值也會被拒。板端不登錄（view 回 NULL 與 0），state 由加速器的 buffer 保存。登錄規則一律「全登或全不登」，只給指標或只給元素數會被拒；
 登錄的 buffer 不在 pool 大小與 hash 裡，生命期由應用端負責。
+埠順序只有一條規則：輸入 = 訊號輸入再接 state 輸入，輸出 = head 輸出再接 state 輸出，第 k 組 state 是輸入 <code>signal_in + k</code> 與輸出 <code>head_out + k</code>；<code>stream/ainr</code> 與 <code>stream/aiaec</code> 不保存埠表，只在 <code>AinrWork</code>／<code>AiaecWork</code> 給這一包的訊號與 head；完整的埠與 state 形狀在各函式庫旁的模型設定（<code>stream/ainr/ai3_model_io_dfn2.h</code>、<code>stream/aiaec/ai3_model_io_*.h</code>，共用程式 <code>stream/common/ai3_model_io.h</code>），sample 依位置綁，不比對名稱（見<a href="../dfn2/reference/board.html#info">DFN2 板端整合</a>）。
 runtime 把每個 <code>*_out</code> 綁到同名輸入的同一個位址，<b>先讀完</b>所有 state 輸入、<b>才寫</b>輸出（做不到的 runtime 要自己用暫存區暫存讀取）；維護者的板端驗證確認 NPU 以這個順序工作。
 graph 回每個 state 的<b>完整下一個 window</b>，shape 與輸入完全相同：位移在 graph 內，用輸入端的 Slice 切掉一幀、
 再把新一幀 Concat 上去（time-ordered window 取 frame <code>1..N−1</code> 再接在後面；newest-first 的 K/V 與 attention ring 取 slot <code>0..D−2</code> 再接在前面），

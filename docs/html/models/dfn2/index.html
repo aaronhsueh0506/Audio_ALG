@@ -10,30 +10,169 @@
 <nav aria-label="導覽"><a href="../../index.html">Audio_ALG</a> / <a href="../index.html">模型開發與部署</a></nav>
 <main>
 <h1>DeepFilterNet2</h1>
-<p>單路 int16 PCM，輸出同樣長度的一個 hop。SDK 封裝 HPF（選用）、STFT、DFN2 頻域前後處理與 ISTFT。<code>frames_per_call</code> 可以是 1..64（grid 欄位，執行期給）：N=1 每拍都推論；N&gt;1 每 N 拍才推論一次，<code>DFN2HopIO.job_ready</code> 標示哪一拍要跑加速器，但 <code>pre_process</code>／<code>post_process</code> 兩支函式每拍都要照常呼叫。輸入與輸出時序以 checkpoint 的 grid 為準。</p><h2>建置與初始化</h2><pre><code>make -C stream/ainr/dfn2 lib
-make -s -C stream/ainr/dfn2 print-lib-path</code></pre><p>依模型建立 grid 與 config，用 <code>dfn2_stream_get_mem_size()</code> 查詢 pool 大小與對齊，再配置 pool。以同一目標工具鏈建置並連結模型 archive 和 audiolib 的 <code>libaudio_common.a</code>。裝置 runtime 載入與 grid 相符的模型檔，負責每次 NPU 推論。</p>
+<p>單路 int16 PCM 進、同樣長度的 PCM 出。客戶只設三個值：<code>sr</code>、<code>fft</code>、<code>hop_in</code>。一個產品只含一種 DFN2（full 或 lite）；stream 由這三個值決定模型 hop（<code>fft / 2</code>）、每包張數 N（<code>hop_in / 模型 hop</code>）與要開的 graph。介面在 <code>stream/ainr/ainr.h</code>。開圖、送張量、執行與讀回是板端 sample 自己的程式，見<a href="reference/board.html">板端整合</a>。</p>
+<p>stream 只選圖並做 host 端的前後處理，不描述圖的埠。圖的埠順序只有一條規則，埠表在 <code>stream/ainr/ai3_model_io_dfn2.h</code>，sample 依位置綁埠、不比對名稱（見下方「Graph 接線」）。</p>
 
-<h2>每 hop 呼叫</h2><p>範例中的讀寫、<code>run_accelerator</code> 與 <code>device_state_*</code> 由呼叫端實作。裝置第一次使用或 generation 改變時，把 recurrent state 還原為模型的量化零值。推論已開始後回錯，也立刻清掉可能部分寫入的裝置 state。</p><pre><code>DFN2Stream *ctx = dfn2_stream_init_from_erb_file(&amp;cfg, erb_path, pool, bytes);
-if (!ctx) return -1;
-while (read_hop(pcm_in)) {
-    DFN2HopIO io;
-    if (dfn2_stream_pre_process(ctx, pcm_in, &amp;io) != 1) return -1;
-    int rc = 0;
-    if (io.job_ready) {
-        device_state_sync(io.state_generation);
-        rc = run_accelerator(&amp;io.inputs, &amp;io.outputs);
-        if (rc != 0) device_state_refill_zero();
-    }
-    if (dfn2_stream_post_process(ctx, rc, pcm_out) &lt; 0) return -1;
-    write_hop(pcm_out);
-}</code></pre><p>若由記憶體初始化，將 forward 表排成 <code>[n_bins][n_erb]</code>、inverse 表排成 <code>[n_erb][n_bins]</code>，並在 stream 存活期間保留兩者。使用 <code>dfn2_stream_init_from_erb_file()</code> 時，兩個指標留 NULL，載入器負責轉置檔案內的 inverse 表。full 與 mask-only 的 archive 各自建置，呼叫端的 <code>DFN2_MASK_ONLY</code> 要與 archive 相符，否則連結會失敗。</p><p>N=1 從 hop 0 起每拍都推論（暖機期間 core 丟棄 heads 並推進 generation）。N&gt;1 沒有暖機拍：前 <code>mask_lookahead + N - 1</code> 拍 <code>job_ready</code> 恆 0，之後每 N 拍才回 1 一次；<code>post_process()</code> 不管該拍有無推論都要呼叫，從上一批算好的結果逐拍吐 PCM。<code>post_process()</code> 的回傳 1 代表當拍頻譜有效，PCM 還有一拍 OLA 延遲。full 出貨 grid 在 N=1、L=D=1 時 t=2 首次回 1、t=3 才對齊第一拍輸入；N&gt;1 時收尾要多送 <code>L+D+N</code> 拍零 PCM（不是 N=1 的 <code>L+D+1</code>）才能把最後一批排完。對應的匯出選項與公式見 <a href="../../../../AINR/DeepFilterNet2/reference/multiframe.md">Multi-frame export</a>。</p>
+<h2>支援的組態</h2>
+<p>下表是各產品可啟動的組態。<code>trim_samples</code>、<code>queue_frames</code> 與 <code>tail_zero_blocks</code> 的意義見「延遲與檔案尾端」，數值以 <code>ainr_init()</code> 填的 <code>AinrInfo</code> 為準。</p>
+<table>
+<thead><tr><th>產品</th><th>sr / fft</th><th>hop_in（N）</th><th>啟動回傳</th><th><code>trim_samples</code></th><th><code>tail_zero_blocks</code></th></tr></thead>
+<tbody>
+<tr><th>full</th><td>16000 / 256</td><td>128（N=1）</td><td><code>AINR_OK</code></td><td>128</td><td>1</td></tr>
+<tr><th>full</th><td>16000 / 256</td><td>1024（N=8）</td><td><code>AINR_OK</code></td><td>1024</td><td>1</td></tr>
+<tr><th>full</th><td>48000 / 1024</td><td>512（N=1）</td><td><code>AINR_OK</code></td><td>1536</td><td>3</td></tr>
+<tr><th>lite</th><td>48000 / 1024</td><td>512（N=1）</td><td><code>AINR_OK</code></td><td>1024</td><td>2</td></tr>
+</tbody></table>
+<p>lite 只有 48 kHz／1024／N=1，沒有 16 kHz，也沒有 N&gt;1。full 與 lite 的 archive 分開建置，不可混連。「可啟動」只表示登錄表有這一列；graph 的實際交付狀態見「驗證狀態」。</p>
+
+<h3>被拒絕的組態</h3>
+<p><code>ainr_get_mem_size()</code> 與 <code>ainr_init()</code> 依序檢查 sr／fft、<code>hop_in</code>、N 的限制、graph 是否登錄，第一個不成立的就是回傳碼。被拒時尚未呼叫任何 SDK。兩者都回 0（<code>AINR_OK</code>）或負的 <code>AINR_ERR_*</code>。下列回傳碼為本庫 host 建置對 full 與 lite archive 各探測的結果。</p>
+<table>
+<thead><tr><th>組態</th><th>full</th><th>lite</th></tr></thead>
+<tbody>
+<tr><td>sr／fft 不在上表（例：16000/512、32000/512、8000/256）</td><td><code>AINR_ERR_GRID</code>（-3）</td><td><code>AINR_ERR_GRID</code>（-3）；16 kHz 一律在此被拒</td></tr>
+<tr><td><code>hop_in</code> 為 0、負數，或不是 <code>fft / 2</code> 的正整數倍（例：16000/256 的 100；48000/1024 的 256）</td><td><code>AINR_ERR_IN_HOP</code>（-4）</td><td><code>AINR_ERR_IN_HOP</code>（-4）</td></tr>
+<tr><td>48000/1024，<code>hop_in</code> 為 1024、2048 等（N&gt;1）</td><td><code>AINR_ERR_LOOKAHEAD_BLOCK_UNSUPPORTED</code>（-5）</td><td><code>AINR_ERR_LOOKAHEAD_BLOCK_UNSUPPORTED</code>（-5）</td></tr>
+<tr><td>16000/256，<code>hop_in</code> 是 128 的倍數但 N 不是 1 或 8（例：256、2048）</td><td><code>AINR_ERR_FRAMES_PER_CALL</code>（-6）</td><td>不適用（先被 -3 擋下）</td></tr>
+</tbody></table>
+<p>其他回傳碼：<code>AINR_ERR_NULL</code>（-1，必要的指標參數為 NULL）、<code>AINR_ERR_MODEL_ID</code>（-2，產品綁定的模型不屬於這份 archive 的 full 或 lite 版本，屬建置設定錯誤，所有組態都回此碼）、<code>AINR_ERR_POOL</code>（-7，pool 小於 <code>ainr_get_mem_size()</code> 的位元組數或未對齊 <code>AINR_ALIGNMENT</code>；較大的 pool 可以）、<code>AINR_ERR_ERB_FILE</code>（-8，ERB 檔缺失、標頭或尺寸不符）、<code>AINR_ERR_SEQUENCE</code>（-9，每包 pre／post 沒有成對呼叫）、<code>AINR_ERR_NONFINITE_INPUT</code>（-10，只有 <code>ainr_preprocess_freq()</code> 會回：呼叫端的 E 或 P 頻譜有 NaN／Inf）。<code>ainr_status_text()</code> 給 log 用的短字串。</p>
+
+<h2 id="graph-wiring">Graph 接線</h2>
+<p><code>ainr_init()</code> 只回報選出的圖（<code>AinrInfo.graph_path</code>）與尾端長度，不回報埠表，函式庫也沒有任何只為 graph 接線存在的 state 尺寸常數。每個已交付 graph 的完整接線——訊號與 head 的數量及 shape、state 的 shape——放在 <code>stream/ainr/ai3_model_io_dfn2.h</code>：full 與 lite 共用一份，依 <code>-DDFN2_MASK_ONLY</code> 選產品，每個登錄的 (產品, sr, fft, N) 一列，列旁註明所對應的匯出器。共用的接線程式 <code>stream/common/ai3_model_io.h</code>（由 <code>make -C stream/common test-model-io</code> 測試）把一列展開成 <code>StreamWiring</code>，並做 state 配對、開圖後的埠檢查、input buffer 大小與送件前的核對（見「初始化與每包呼叫」）。兩者都與 SDK 無關、只有標頭，<code>ainr.h</code> 不引用，函式庫不含接線；sample 加 <code>-I stream/common -I stream/ainr</code> 並編譯 <code>stream/common/stream_bind.c</code>。沒有對應列的組態，或與 init 選出的 graph 不符，由 sample 的啟動檢查在任何 SDK 呼叫之前拒絕。</p>
+<p>所有轉出的圖都照同一條規則排埠：輸入 = 訊號輸入，再接 state 輸入；輸出 = head 輸出，再接 state 輸出。第 k 組 state 是輸入 <code>signal_in_count + k</code> 與輸出 <code>head_out_count + k</code>，兩端形狀相同。sample 依數量迴圈處理，full 與 lite 用同一段程式。訊息以位置稱呼埠，例如 <code>input 3 (state 0)</code>。</p>
+<table>
+<thead><tr><th>產品</th><th><code>signal_in_count</code></th><th><code>head_out_count</code></th><th>輸入／輸出埠數</th><th>state 組數與 shape</th></tr></thead>
+<tbody>
+<tr><th>full</th><td>2（erb 視窗、spec 視窗）</td><td>3（erb_mask、df_coefs、df_alpha）</td><td>4 ／ 5</td><td>2：<code>h_gru</code> [1,5,1,256]、<code>df_convp_history</code> [1,64,5,96]</td></tr>
+<tr><th>lite</th><td>2</td><td>1（erb_mask）</td><td>3 ／ 2</td><td>1：<code>h_gru</code> [1,3,1,256]</td></tr>
+</tbody></table>
+<p>括號裡的名稱是匯出器的 ONNX 名稱，只用來說明哪一位置是什麼，C 端與 sample 不讀名稱。signal 與 head 的 shape 隨 grid 與 N 而變（視窗 N + 2 個 frame，head N 個；E = n_erb，16 kHz／256 為 24，48 kHz／1024 為 32；df_bins 恆為 96）：</p>
+<table>
+<thead><tr><th>組態</th><th>erb（輸入 0）</th><th>spec（輸入 1）</th><th>erb_mask</th><th>df_coefs</th><th>df_alpha</th></tr></thead>
+<tbody>
+<tr><th>full 16 kHz／256／N=1</th><td>[1,1,3,24]</td><td>[1,2,3,96]</td><td>[1,1,1,24]</td><td>[1,1,96,10]</td><td>[1,1,1,1]</td></tr>
+<tr><th>full 16 kHz／256／N=8</th><td>[1,1,10,24]</td><td>[1,2,10,96]</td><td>[1,1,8,24]</td><td>[1,8,96,10]</td><td>[1,1,8,1]</td></tr>
+<tr><th>full 48 kHz／1024／N=1</th><td>[1,1,3,32]</td><td>[1,2,3,96]</td><td>[1,1,1,32]</td><td>[1,1,96,10]</td><td>[1,1,1,1]</td></tr>
+<tr><th>lite 48 kHz／1024／N=1</th><td>[1,1,3,32]</td><td>[1,2,3,96]</td><td>[1,1,1,32]</td><td colspan="2">無</td></tr>
+</tbody></table>
+<p><code>AinrWork.inputs[i]</code> 是這一包的訊號輸入 i（兩個），<code>AinrWork.outputs[j]</code> 是 head j（full 三個，lite 一個）；它們的 shape 與元素數就是上表同一列的 signal i、head j，state 不在 <code>AinrWork</code> 裡。本庫的 <code>AINR/tests/test_dfn2_port_order.py</code> 把真實 pre 呼叫給出的 <code>AinrWork</code> 與匯出圖的訊號輸入、head 輸出逐位置比對。模型設定各列（<code>stream/ainr/ai3_model_io_dfn2.h</code>）與匯出器的對照也在本庫：同一個測試用 <code>make -C stream/ainr model-io-dumper</code> 傾印每一列，逐列比對全新匯出的圖（layout 版本、埠數與順序、各輸入輸出 shape、state 兩端同 shape），並要求列集合恰為登錄的四列；C 端的列對 <code>AinrWork</code> 由 <code>test-ainr-model-io</code> 檢查。<code>audio_sample/</code> 不在本庫。</p>
+
+<h2>初始化與每包呼叫</h2>
+<p>啟動做一次，之後每包三步：<code>ainr_preprocess()</code>、板端 sample 自己的 AI3 執行、<code>ainr_postprocess()</code>。每次成功的 pre 都對應一次加速器執行與一次 post，沒有「這拍不推論」的分支。</p>
+<pre><code>/* 啟動（一次） */
+AinrConfig cfg = { sr, fft, hop_in };              /* 例：{ 48000, 1024, 512 } */
+int n = cfg.hop_in / (cfg.fft / 2);                /* N；整除與支援範圍由 ainr_init() 檢查 */
+StreamMemReq req;
+if (ainr_get_mem_size(&amp;cfg, &amp;req) != AINR_OK) return -1;   /* 未登錄的組態在此被拒 */
+void *pool = alloc_aligned(req.alignment, req.bytes);
+AinrCtx *ctx;
+AinrInfo info;                                     /* graph_path、trim_samples、queue_frames、tail_zero_blocks */
+int rc = ainr_init(&amp;cfg, pool, req.bytes, &amp;ctx, &amp;info);   /* 0 或負的 AINR_ERR_*；尚未呼叫 SDK */
+if (rc != AINR_OK) { log(ainr_status_text(rc)); return -1; }
+
+/* sample 的模型設定：這個產品、這個 grid 與 N 的接線列；沒有列就在開圖前拒絕 */
+Ai3ModelIoConfig model;
+if (ai3_model_io_dfn2_find(AI3_MODEL_IO_DFN2_PRODUCT, cfg.sr, cfg.fft, n, &amp;model) != AI3_MODEL_IO_OK) return -1;
+
+/* 板端：開圖、逐埠描述、與模型設定比對，再把 state 同步起點設為目前的 generation */
+open_graph(info.graph_path);
+char msg[160];
+if (ai3_model_io_check_ports(&amp;model, din, n_in, dout, n_out, msg, sizeof msg) != STREAM_PORT_OK) return -1;
+unsigned seen = ainr_state_generation(ctx);
+
+/* 每包（剛好 hop_in 個樣本） */
+while (read_block(pcm_in, hop_in)) {
+    AinrWork work;
+    if (ainr_preprocess(ctx, pcm_in, &amp;work) != AINR_OK) return -1;   /* 1. 成功回 0 */
+    int ai_rc = -1, chk;
+    AI3_MODEL_IO_CHECK_WORK(chk, &amp;model, &amp;work);               /* work 的數量與 shape 必須等於這一列 */
+    if (chk == AI3_MODEL_IO_OK) ai_rc = run_ai3(&amp;work);          /* 2. 板端 sample 自己的 AI3；不符就不送件 */
+    if (ainr_postprocess(ctx, ai_rc, pcm_out) != AINR_OK) return -1; /* 3. ai_rc != 0 也要呼叫 */
+    write_block(pcm_out, hop_in);
+}</code></pre>
+<ul>
+<li>步驟 2 的 <code>run_ai3()</code> 把 <code>work.inputs</code> 依位置填進加速器、執行、把 <code>work.outputs</code> 讀回。state 留在加速器的 buffer，由 sample 依 <code>work.state_generation</code> 與失敗紀錄重載量化零，細節與範例在<a href="reference/board.html#state">板端整合</a>。</li>
+<li>送件前的核對失敗（數量或 shape 與模型設定的列不同）代表 stream 與接線資料不一致：該包不呼叫 AI3，<code>ai_rc</code> 填非零，照常呼叫 <code>ainr_postprocess()</code>。每次成功的 pre 仍恰好對應一次 post。</li>
+<li>執行或讀回失敗時，<code>ai_rc</code> 填非零並照常呼叫 <code>ainr_postprocess()</code>：當拍走近恆等直通（單位 mask、alpha 0），不是靜音，<code>pcm_out</code> 仍有 <code>hop_in</code> 個有效樣本。</li>
+<li><code>ainr.h</code> 沒有 destroy 函式，pool 由呼叫端釋放。介面是檔案模式：ERB 表在 <code>ainr_init()</code> 從產品設定的路徑載入；沒有 stdio 的板子改用較低階的 <a href="../../../../stream/ainr/dfn2/dfn2_stream.h">dfn2_stream.h</a>。</li>
+<li><code>AinrInfo</code> 只有 <code>graph_path</code>、<code>trim_samples</code>、<code>queue_frames</code>、<code>tail_zero_blocks</code> 四欄；N 與 <code>hop_in</code> 不在其中，sample 由 config 算 N = <code>hop_in / (fft / 2)</code>。三個家族（PCM、<code>_spec</code>、<code>_freq</code>）對同一組態填出相同的內容。</li>
+</ul>
+
+<h2>延遲與檔案尾端</h2>
+<p><code>trim_samples</code> 是輸出相對輸入的總延遲，以最終 PCM 的樣本數計（<code>_spec</code>、<code>_freq</code> 是外部 ISTFT 之後）：<code>(queue_frames + 1) × 模型 hop</code>，那個 <code>+1</code> 是 stream 自己的一個 STFT／OLA hop。<code>queue_frames</code> 是模型佇列單獨保存的 frame 數：<code>mask_lookahead + df_lookahead + N − 1</code>。三個家族對同一組態的值相同。下表單位：<code>trim_samples</code> 為樣本，<code>queue_frames</code> 為 frame（本庫 host 建置讀出的 <code>AinrInfo</code>）。</p>
+<table>
+<thead><tr><th>組態</th><th>模型 hop</th><th><code>queue_frames</code></th><th><code>trim_samples</code></th><th><code>tail_zero_blocks</code></th></tr></thead>
+<tbody>
+<tr><td>full 16 kHz／256／N=1</td><td>128</td><td>0</td><td>128</td><td>1</td></tr>
+<tr><td>full 16 kHz／256／N=8</td><td>128</td><td>7</td><td>1024</td><td>1</td></tr>
+<tr><td>full 48 kHz／1024／N=1</td><td>512</td><td>2</td><td>1536</td><td>3</td></tr>
+<tr><td>lite 48 kHz／1024／N=1</td><td>512</td><td>1</td><td>1024</td><td>2</td></tr>
+</tbody></table>
+<p><code>tail_zero_blocks</code> = <code>ceil(trim_samples / hop_in)</code>。N&gt;1 時，每包的 N 個 hop 在同一次加速器執行中算完。</p>
+<p>輸出與輸入等長的做法（離線處理）：</p>
+<ol>
+<li>最後一包不足 <code>hop_in</code> 時補零成完整一包，真實樣本數 <code>total_in</code> 另外記下。</li>
+<li>再用同一組 pre／AI3／post 送 <code>info.tail_zero_blocks</code> 包全零。</li>
+<li>輸出串流前端丟掉 <code>info.trim_samples</code> 個樣本，總長只留 <code>total_in</code>，補零與排尾包多出來的部分不輸出。</li>
+</ol>
+<p>輸入為空時沒有真實樣本，不需要推任何包。</p>
+
+<h2>衰減上限（<code>--atten-lim</code>）</h2>
+<p><code>ainr_set_atten_lim(ctx, dB)</code>（<code>_spec</code>、<code>_freq</code> 家族各有同名函式）設定抑制量上限，預設 0 dB（關閉）。只能在兩包之間呼叫：pre 之後、post 之前回 <code>AINR_ERR_SEQUENCE</code>，NaN 或 Inf 回 <code>AINR_ERR_NONFINITE_INPUT</code>，NULL 回 <code>AINR_ERR_NULL</code>。它不改 pool 大小、不改 layout、不動 state；<code>ainr_reset()</code> 保留設定值。N &gt; 1 時新值從下一個完整區塊起生效。</p>
+<h2>PCM 進、頻譜出（外接 ISTFT）與頻譜進、頻譜出</h2>
+<p>已有自己的合成器時用 <code>_spec</code> 家族：<code>ainr_get_mem_size_spec()</code>、<code>ainr_init_spec()</code>、<code>ainr_preprocess_spec()</code>、<code>ainr_postprocess_spec()</code>。邊界、登錄表、<code>AinrInfo</code> 與 <code>AinrWork</code> 都與 PCM 家族相同，只有交換的資料不同：<code>ainr_preprocess_spec()</code> 收 <code>hop_in</code> 個 PCM 樣本，<code>ainr_postprocess_spec()</code> 輸出這包 N 個 hop 的增強頻譜（audio 尺度、frame-major、最舊在前；<code>out_re</code>、<code>out_im</code> 各 <code>N * (fft / 2 + 1)</code> 個 float），交給外部的 <code>AcIstft</code>（<code>AC_OLA_ACCUMULATE</code>、<code>ispec_scale</code> 為 1）。頻譜進、頻譜出用 <code>_freq</code> 家族（<code>ainr_preprocess_freq()</code> 收估計頻譜 E 與套用頻譜 P，E 與 P 同指標即單頻譜）。</p>
+<p><code>_freq</code> 的輸入檢查：<code>ainr_preprocess_freq()</code> 在任何一個 frame 進入模型之前，先掃整包 N 個 frame 的 E 與 P；只要有一個 bin 是 NaN 或 Inf（有限但功率會溢位的 bin 同樣算），整包以 <code>AINR_ERR_NONFINITE_INPUT</code> 拒絕。拒絕時特徵正規化器、frame 佇列與 state generation 都沒有動，也沒有開啟的 block：sample 不要跑加速器，也不要呼叫 <code>ainr_postprocess_freq()</code>（會回 <code>AINR_ERR_SEQUENCE</code>），該包輸出由 sample 自己補，下一包照常呼叫，仍是「一次成功的 pre 對一次 post」。模型沒看過被拒絕的那一包，仍在佇列中的 frame 會晚一包出來，直到佇列深度（<code>AinrInfo.queue_frames</code>）過去才回到原本的對齊。沒有這個檢查時，一個壞 bin 會讓特徵正規化器永久帶 NaN，之後每一包的 ERB／spec 視窗都是 NaN，直到 <code>ainr_reset_freq()</code>。<code>uvc_audio_live2a</code> 經 rate bridge 轉出的 E／P 走的是同一個入口，適用同一個合約。PCM 與 <code>_spec</code> 家族的輸入是 int16，不會有這個狀況。</p>
+<h3>檔案尾端的半個視窗</h3>
+<p>DFN2 以 <code>AC_OLA_ACCUMULATE</code> 合成，沒有 flush：一個 hop 的輸出是這個 frame 合成的前半加上前一個 frame 的後半。最後一段真實樣本落在「從最後一個真實 hop 開始」的分析 frame 裡，要再多一個 hop 的輸入，這個 frame 才完整。</p>
+<ul>
+<li>stream 這邊的佇列（<code>queue_frames</code>）比 PCM 家族的總延遲少一個 hop，但外部合成器的 OLA 還要再一個 hop 才吐出最後一段，所以 <code>trim_samples</code> 與 PCM 家族相同；<code>_spec</code> 的 <code>info.tail_zero_blocks</code> 是同一個值。</li>
+<li>先把最後一包補成完整 <code>hop_in</code>，再用同一組 pre／AI3／post 推 <code>tail_zero_blocks</code> 包全零，每包的輸出頻譜都推給外部 ISTFT；輸出前端去掉上表的 <code>trim_samples</code>，保留輸入長度。</li>
+<li>只推 <code>queue_frames</code> 個全零 hop、再多給外部 ISTFT 一個零頻譜，會漏掉最後一個 hop（含最後真實樣本的那個 frame 沒被分析）。在 <code>stream/ainr/tests/test_ainr_tail.c</code> 的 bypass 測項中，最後一個樣本設為 16000：照上述排程時，PCM、<code>_spec</code>、<code>_freq</code> 三個家族都取回 16000（PCM 家族在 48 kHz 為 15999）；錯誤的排程在 full 16 kHz／N=1 取回 2.4，在 48 kHz 的 full 與 lite 取回 0.2。</li>
+<li>使用 <code>AC_OLA_ACCUMULATE</code> 時 <code>ac_istft_flush()</code> 回 0（只有 <code>AC_OLA_ENV_NORM</code> 會回資料），不能靠它補尾；改照上述排程推全零 hop（或全零頻譜）。</li>
+<li><code>_freq</code>：上游分析器要先吐出含最後真實樣本的 E／P frame（對它餵同樣的全零 PCM 包），之後模型佇列再用同樣數量的全零包排空。</li>
+</ul>
+
+<h2>各呼叫端的可用範圍</h2>
+<table>
+<thead><tr><th>呼叫端</th><th>入口</th><th>組態</th></tr></thead>
+<tbody>
+<tr><th>full 產品（<code>alg_ai3_dfn.c</code>）</th><td>PCM → PCM</td><td>三欄由 <code>--sample-rate</code>、<code>--fft-size</code>、<code>--hop-in</code> 給，預設 48000／1024／512（<code>--hop-in</code> 省略時取 <code>fft / 2</code>）。支援的組態是上表 full 的三列；其他組態啟動時以回傳碼訊息被拒，結束碼 1，未執行任何加速器。不認得的選項結束碼 2。</td></tr>
+<tr><th>lite 產品（<code>alg_ai3_dfn_lite.c</code>）</th><td>PCM → PCM</td><td>同樣三個選項與預設。只有 48000／1024／512 一列，其他組態同樣啟動即被拒。</td></tr>
+<tr><th><code>uvc_ai_nr_stream</code></th><td>PCM → PCM</td><td>固定 48000／1024／512（N=1），沒有選項。sample 自己在前後做 16 ↔ 48 kHz 重採樣；模型設定查不到這個組態的列時拒絕啟動。</td></tr>
+<tr><th><code>uvc_audio_live2a</code></th><td>E／P 頻譜 → 頻譜（<code>_freq</code> 家族）</td><td>固定 48000／1024／512（N=1）。pipeline 在 16 kHz 的頻譜經 sample 內的 rate bridge 轉成 48 kHz 的 E 與 P 再進模型，輸出轉回原生 hop；模型設定查不到這個組態的列時拒絕啟動。設定中的衰減上限不生效（登錄表固定為 0 dB），非零時 sample 印出提示。</td></tr>
+</tbody></table>
+<p>兩支 UVC sample 都不是 N=8 的呼叫端，通用 API 能接受 N=8 不代表 UVC 已經跑過 N=8。兩支 UVC sample 目前不使用 <code>tail_zero_blocks</code>。它們各自連結 full 或 lite 的 archive 由產品建置決定，本庫未核對。</p>
+
+<h2>驗證狀態</h2>
+<p>五欄的意義：「主機替身」是 <code>stream/ainr/tests</code> 與替身加速器（SDK 替身，沒有目標板的圖、量化與 cache／DMA）；埠檢查器 <code>stream_check_ports()</code> 由 <code>stream/common</code> 的 <code>test_stream_bind</code> 另外涵蓋，與組態列無關；「PyTorch」與「ONNX Runtime」是 <code>AINR</code> 的 Python 測試，用隨機權重的小 checkpoint；「正式 bin」是量化後交付的 <code>model.bin</code> 對上述組態與 N 的核對；「板端」是目標板實跑。</p>
+<table>
+<thead><tr><th>組態</th><th>主機替身</th><th>PyTorch</th><th>ONNX Runtime</th><th>正式 bin</th><th>板端</th></tr></thead>
+<tbody>
+<tr><th>full 16 kHz／256／N=1</th><td>已驗：PCM 與 <code>dfn2_stream</code> 參考逐位元相同；<code>_spec</code>／<code>_freq</code> 逐位元相同；三個家族的排尾；work 形狀（<code>test-ainr-work-shapes</code>）；連結往返</td><td>未驗（此 grid）</td><td>未驗</td><td>未驗</td><td>未驗</td></tr>
+<tr><th>full 16 kHz／256／N=8</th><td>已驗：PCM 兩包與 <code>dfn2_stream</code> 參考逐位元相同；三個家族的排尾；work 形狀（<code>test-ainr-work-shapes</code>）。<code>_spec</code>／<code>_freq</code> 的逐位元比對只在 N=1 與 N=4 的核心做過，N=8 未做</td><td>未驗（此 grid）</td><td>未驗</td><td>登錄的路徑存在；交付與是否相符未驗</td><td>未驗</td></tr>
+<tr><th>full 48 kHz／1024／N=1</th><td>已驗：<code>_spec</code>／<code>_freq</code> 逐位元相同；三個家族的排尾；work 形狀（<code>test-ainr-work-shapes</code>）；連結往返</td><td>已驗（隨機小 checkpoint，同 grid、同 N）</td><td>未驗</td><td>未驗</td><td>未驗</td></tr>
+<tr><th>lite 48 kHz／1024／N=1</th><td>已驗：三個家族的排尾；work 形狀（<code>test-ainr-work-shapes</code>）；產品綁定；連結往返</td><td>已驗（隨機小 checkpoint 的 mask-only 圖，同 grid、同 N）</td><td>未驗</td><td>未驗</td><td>未驗</td></tr>
+<tr><th><code>uvc_ai_nr_stream</code>（PCM → PCM，48 kHz／1024／N=1）</th><td>PCM 家族的上述項目已驗；sample 本身的重採樣與 AI3 接線未在本庫建置或驗證</td><td>—</td><td>未驗</td><td>未驗</td><td>未驗</td></tr>
+<tr><th><code>uvc_audio_live2a</code>（E／P 頻譜 → 頻譜，經 rate bridge）</th><td><code>_freq</code> 家族的上述項目已驗；bridge 與 AI3 接線未在本庫建置或驗證</td><td>—</td><td>未驗</td><td>未驗</td><td>未驗</td></tr>
+</tbody></table>
+<p>PyTorch 與 ONNX Runtime 欄的範圍，以 <code>AINR/tests/test_dfn2_inference_frames_per_call.py</code> 為準：</p>
+<ul>
+<li>測試用隨機權重的小 checkpoint（48 kHz／1024／hop 512，與 full 的 48 kHz 產品同 grid）。一般 WAV 的 <code>inference.py --frames-per-call</code> 路徑在 PyTorch 上逐包串流，N=1 與 N=8 的輸出彼此一致、也與整檔一次跑一致，長度與輸入相同；mask-only（lite 的圖）同樣比對。這條路徑不經 ONNX Runtime。</li>
+<li>ONNX Runtime 在這個檔案裡只執行校正流程（<code>calib --frames-per-call 8</code>）匯出的 N=8 full 與 mask-only 圖，逐包串流後與 PyTorch 比對。</li>
+<li>這個 N=8 圖的 grid 是 48 kHz／1024，而 stream 對 48 kHz／1024 的 N&gt;1 回 <code>AINR_ERR_LOOKAHEAD_BLOCK_UNSUPPORTED</code>（-5），所以它不對應上表任何一列，不能當作 full 16 kHz／256／N=8 的證據。</li>
+<li><code>AINR/tests</code> 內另有兩個測試檔也有 ONNX Runtime 的串流比對，用的是 16 kHz／512 的隨機小模型，上表不引用它們。</li>
+</ul>
+<p>上表的「未驗」代表本庫沒有對應的測試或實跑紀錄，不代表已知失敗。</p>
 
 <h2>參考</h2>
 <ul>
+<li><a href="reference/board.html">板端整合：pool、AinrInfo、sample 模型設定與埠檢查、state</a></li>
 <li><a href="reference/core.html">頻域整合、模型張量與狀態</a></li>
-<li><a href="../../../../stream/ainr/dfn2/dfn2_stream.h">PCM SDK 公開標頭</a></li>
-<li><a href="../../../../AINR/DeepFilterNet2/README.md">訓練與匯出</a></li>
 <li><a href="reference/grid.html">Grid 與 ERB 矩陣</a></li>
+<li><a href="../../../../stream/ainr/ainr.h">客戶介面標頭 ainr.h</a></li>
+<li><a href="../../../../stream/ainr/dfn2/dfn2_stream.h">較低階的 PCM SDK 標頭</a></li>
+<li><a href="../../../../AINR/DeepFilterNet2/README.md">訓練與匯出</a></li>
+<li><a href="../../../../AINR/DeepFilterNet2/reference/multiframe.md">Multi-frame export</a></li>
 </ul>
 </main>
 </body>

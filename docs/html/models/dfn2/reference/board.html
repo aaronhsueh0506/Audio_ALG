@@ -1,0 +1,108 @@
+<!doctype html>
+<html lang="zh-Hant">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>DFN2 板端整合 · Audio_ALG</title>
+<link rel="stylesheet" href="../../../manual.css">
+</head>
+<body>
+<nav aria-label="導覽"><a href="../../../index.html">Audio_ALG</a> / <a href="../../index.html">模型開發與部署</a> / <a href="../index.html">DeepFilterNet2</a></nav>
+<main>
+<h1>DFN2 板端整合</h1>
+<p>給負責 AI3 接線的人。<code>ainr.h</code> 在 host 端算好 pool、選出要開的圖與尾端長度；state generation 由 <code>ainr_state_generation()</code> 給；圖的埠表（數量、shape、state 配對）、開圖、送張量、執行、讀回與 state 重載是板端 sample 的程式與它的模型設定。<a href="../index.html">產品首頁</a>列組態與每包三步，這一頁補啟動後的細節。</p>
+
+<h2 id="pool">Pool</h2>
+<p><code>ainr_get_mem_size()</code> 回 <code>StreamMemReq</code>（<code>bytes</code> 與 <code>alignment</code> 兩欄，定義在 <code>stream/common/stream_mem.h</code>，與接線型別無關；<code>ainr.h</code> 只引用它）。呼叫端配 <code>bytes</code> 個位元組、對齊 <code>alignment</code>（<code>AINR_ALIGNMENT</code> = 16），交給 <code>ainr_init()</code>。init 自己重算所需大小：pool 小於它或沒有對齊就回 <code>AINR_ERR_POOL</code>（pool 不會被寫入）；較大的 pool 可以。</p>
+<p>三個家族（PCM、<code>_spec</code>、<code>_freq</code>）的 pool 都含完整的內層 stream，也就是 STFT 與 ISTFT；不跑 ISTFT 的家族不會縮小。<code>_spec</code>、<code>_freq</code> 另外多一份跨 hop 的暫存，所以 N&gt;1 時三者大小不同。</p>
+<p>下表是在本庫 host 建置（arm64 macOS、<code>SIMD=1</code>、<code>BACKEND=ne10</code>）以 <code>ainr_get_mem_size()</code>、<code>_spec()</code>、<code>_freq()</code> 實際讀出的值，單位 bytes。目標板的值隨指標寬度與編譯設定而異，請在板上呼叫同一組函式取得。</p>
+<table>
+<thead><tr><th>組態</th><th>PCM</th><th>PCM → 頻譜（<code>_spec</code>）</th><th>頻譜 → 頻譜（<code>_freq</code>）</th></tr></thead>
+<tbody>
+<tr><th>full 16 kHz／256／N=1</th><td>103728</td><td>103728</td><td>105792</td></tr>
+<tr><th>full 16 kHz／256／N=8</th><td>160896</td><td>166336</td><td>168400</td></tr>
+<tr><th>full 48 kHz／1024／N=1</th><td>361424</td><td>361424</td><td>369632</td></tr>
+<tr><th>lite 48 kHz／1024／N=1</th><td>301056</td><td>301056</td><td>309264</td></tr>
+</tbody></table>
+
+<h2 id="info">AinrInfo 與 sample 模型設定</h2>
+<p><code>ainr_init()</code>（<code>_spec</code>、<code>_freq</code> 同）填 <code>AinrInfo</code>，只有四欄：</p>
+<ul>
+<li><code>graph_path</code>：這個組態要開的圖，由產品的發布資料決定，客戶不必也不應自己拼檔名。</li>
+<li><code>trim_samples</code>、<code>queue_frames</code>、<code>tail_zero_blocks</code>。</li>
+</ul>
+<p>N 與 <code>hop_in</code> 不在 <code>AinrInfo</code>：客戶的三欄設定已經帶有它們，sample 自己算 N = <code>cfg.hop_in / (cfg.fft / 2)</code>。state 的起始 generation 也不在其中：sample 在 init 之後、第一次 <code>ainr_preprocess()</code> 之前呼叫 <code>ainr_state_generation(ctx)</code> 取得（reset 之後同樣用它）。函式庫不描述圖的埠，也不保存 state 的尺寸。</p>
+<p>圖的接線在兩個無 SDK 標頭：<code>stream/ainr/ai3_model_io_dfn2.h</code> 是 DFN2 的固定表（只有標頭，<code>ainr.h</code> 不引用），每個登錄的 (產品, sr, fft, N) 一列，列出每個訊號輸入、每個 head 與每個 state 的 [b,c,h,w]，註明所對應的匯出器；<code>stream/common/ai3_model_io.h</code>（由 <code>make -C stream/common test-model-io</code> 測試）是四支 sample（與另兩款模型）共用的程式：把一列展開成 <code>StreamWiring</code>、用數量迴圈算 state 配對、依 shape 算 input buffer 大小、呼叫埠檢查，以及送件前核對 <code>AinrWork</code> 的數量與 shape（<code>AI3_MODEL_IO_CHECK_WORK</code>）。sample 加 <code>-I stream/common -I stream/ainr</code> 並編譯 <code>stream/common/stream_bind.c</code>。查不到列（<code>AI3_MODEL_IO_ERR_NO_ROW</code>）的組態在開圖前拒絕。</p>
+<p>埠順序是一條規則：輸入 = 訊號輸入，再接 state 輸入；輸出 = head 輸出，再接 state 輸出；第 k 組 state 是輸入 <code>signal_in_count + k</code> 與輸出 <code>head_out_count + k</code>，每組兩端同形狀。DFN2 的 <code>signal_in_count</code> 恆為 2（erb 視窗、spec 視窗）。各列的 shape 見<a href="../index.html#graph-wiring">產品首頁的表</a>。</p>
+<table>
+<thead><tr><th>產品</th><th>輸入位置</th><th>輸出位置</th></tr></thead>
+<tbody>
+<tr><th>full（<code>signal_in_count</code> 2、<code>head_out_count</code> 3）</th><td>0 erb、1 spec、2 state 0（<code>h_gru</code> [1,5,1,256]）、3 state 1（<code>df_convp_history</code> [1,64,5,96]）</td><td>0 erb_mask、1 df_coefs、2 df_alpha、3 state 0、4 state 1</td></tr>
+<tr><th>lite（2、1）</th><td>0 erb、1 spec、2 state 0（<code>h_gru</code> [1,3,1,256]）</td><td>0 erb_mask、1 state 0</td></tr>
+</tbody></table>
+<p>括號與表中的名稱是匯出器的 ONNX 名稱，只用來讀表；C 端不保存名稱，sample 不比對名稱。<code>AinrWork.inputs[i]</code> 是圖的輸入 i（只有兩個訊號輸入），<code>AinrWork.outputs[j]</code> 是圖的輸出 j（full 三個 head，lite 一個），索引與模型設定的 signal i、head j 一致。</p>
+
+<h2 id="ports">開圖後的埠檢查</h2>
+<p>開圖後、第一次執行前，把 SDK 回報的每個埠填成 <code>StreamDeviceDesc</code>（軸 <code>w, h, c, b</code>、<code>elem_bits</code>、<code>is_float</code>、<code>scale_ratio</code>／<code>zero_point</code>、<code>line_ofs</code>／<code>channel_ofs</code>／<code>batch_ofs</code>、<code>capacity_bytes</code>），依 SDK 的埠順序交給 <code>ai3_model_io_check_ports(&amp;model, in, n_in, out, n_out, msg, sizeof msg)</code>，它呼叫 <code>stream_check_ports()</code>。<code>StreamWiring</code>、<code>StreamDeviceDesc</code> 與 <code>stream_check_ports()</code> 在 <code>stream/common/stream_bind.{h,c}</code>：SDK 無關的 sample 端檢查器，只由 sample 連結；<code>libainr.a</code> 不含它。回傳 <code>STREAM_PORT_OK</code> 或下列負值，並在 <code>msg</code> 給一行原因，以位置稱呼埠（例如 <code>input 2 (state 0)</code>）；不符就不要啟動，不會誤讀。</p>
+<table>
+<thead><tr><th>回傳</th><th>意義</th></tr></thead>
+<tbody>
+<tr><td><code>STREAM_PORT_ERR_NULL</code>（-101）</td><td>參數為 NULL，或 wiring 本身不合規則（埠數、state 形狀）</td></tr>
+<tr><td><code>STREAM_PORT_ERR_IN_COUNT</code>（-102）／<code>STREAM_PORT_ERR_OUT_COUNT</code>（-103）</td><td>輸入或輸出埠數不對；埠數先於所有索引檢查</td></tr>
+<tr><td><code>STREAM_PORT_ERR_AXES</code>（-104）</td><td>軸與 ONNX 邏輯形狀不符；大小為 1 的軸不比，兩個大小大於 1 的軸對調即使元素數相同也拒絕</td></tr>
+<tr><td><code>STREAM_PORT_ERR_FORMAT</code>（-105）</td><td>不支援的元素格式</td></tr>
+<tr><td><code>STREAM_PORT_ERR_SCALE</code>（-106）</td><td>定點埠的 <code>scale_ratio</code> 為 0 或非有限值（float 埠不看 scale）</td></tr>
+<tr><td><code>STREAM_PORT_ERR_STRIDE</code>（-107）</td><td>有 padding 或不連續；只接受連續張量，因為 sample 以連續搬運</td></tr>
+<tr><td><code>STREAM_PORT_ERR_CAPACITY</code>（-108）</td><td>裝置 buffer 小於張量</td></tr>
+<tr><td><code>STREAM_PORT_ERR_STATE_PAIR</code>（-109）</td><td>state 輸入與輸出的格式、<code>scale_ratio</code>、軸或 stride 不一致</td></tr>
+<tr><td><code>STREAM_PORT_ERR_STATE_ZERO_POINT</code>（-110）</td><td>定點 state 埠（任一端）的 <code>zero_point</code> 不是 0；float 的 state 埠不看 zero_point</td></tr>
+</tbody></table>
+<p>每個埠依序檢查格式、scale、軸、stride、容量；最後檢查每個 state 輸入與它的輸出。這條規則對 DFN2、DeepVQE-S 與 Align-ULCNet 相同：state 的清零是對 buffer 填位元組 0，只有 <code>zero_point</code> 為 0 時才等於量化後的 0。主機端的 <code>stream/common</code> 的 <code>test_stream_bind</code> 以替身描述涵蓋這條路徑；真實的 descriptor 值要在取得正式 bin 後於板上核對。</p>
+<p>送件前的核對是另一道：每個成功的 pre 之後，<code>AI3_MODEL_IO_CHECK_WORK</code> 比對 <code>work.input_count</code>／<code>work.output_count</code> 與每個 tensor 的元素數、[b,c,h,w] 和資料指標是否等於模型設定的列。不符回 <code>AI3_MODEL_IO_ERR_COUNT</code>／<code>_ERR_SHAPE</code>／<code>_ERR_NULL</code>（共用程式的回傳碼範圍為 -301..-306）：不呼叫 AI3，該包以失敗交給 <code>ainr_postprocess()</code>（近恆等直通），仍是一次 pre 對一次 post。</p>
+
+<h2 id="state">State 與失敗後的回復</h2>
+<ul>
+<li>recurrent state（<code>h_gru</code>、full 另有 <code>df_convp_history</code>）留在加速器的 buffer，不經 host。每對 state 輸入與輸出綁同一塊 buffer：輸入 <code>signal_in_count + k</code> 與輸出 <code>head_out_count + k</code>；shape 取自模型設定，函式庫不保存。</li>
+<li>定點 state 埠兩端的 <code>zero_point</code> 都必須是 0（清零用位元組填 0，只有 zero_point 0 時才等於量化後的 0）；不為 0 的 graph 在第一次送件前被埠檢查（<code>stream_check_ports()</code>）以 <code>STREAM_PORT_ERR_STATE_ZERO_POINT</code>（-110）拒絕，float 的 state 埠不看 zero_point。</li>
+<li>每拍 <code>ainr_preprocess()</code> 之後，<code>work.state_generation</code> 與 sample 上次同步的值不同，就在這次執行前把 state 輸入 buffer 重載量化零。generation 在 <code>ainr_reset()</code>、暖機拍，以及 post 拒絕這拍的 head（例如 head 不是有限值）時前進。</li>
+<li>呼叫端自己通報的失敗（<code>infer_status != 0</code>）本身不推進 generation。但失敗的執行或讀回可能已經寫過 state，所以 sample 還要自己記一個「待回復」旗標：在 AI3 開始執行前設起，執行與全部 head 讀回都成功才清除；下一次送件前，generation 不同<b>或</b>旗標仍設著，就重載量化零。</li>
+</ul>
+<pre><code>static void state_generation_sync(unsigned int generation)
+{
+    if (generation == g_state_gen_seen &amp;&amp; !g_state_pending_recovery) return;
+    state_refill_zero();                 /* 每個 state 輸入 buffer 寫量化零並 flush cache */
+    g_state_gen_seen = generation;
+    g_state_pending_recovery = 0;
+}
+
+/* 每拍：pre 之後、執行之前 */
+state_generation_sync(work.state_generation);
+g_state_pending_recovery = 1;            /* 從這裡起，加速器可能就地改寫 state */
+ret = run_and_read_back(&amp;work);          /* 執行 + 讀回全部 head */
+if (ret == OK) g_state_pending_recovery = 0;
+ainr_postprocess(ctx, ret == OK ? 0 : -1, pcm_out);</code></pre>
+<p>起始時 sample 先載入一次量化零，再把 <code>g_state_gen_seen</code> 設成 <code>ainr_state_generation(ctx)</code>。失敗的那一拍輸出近恆等直通，不是靜音；回復發生在下一次送件前。</p>
+
+<h2 id="samples">板端 sample 的接線</h2>
+<p>板端 sample 是本庫以外的檔案（<code>audio_sample</code>），本庫沒有建置它們，也沒有目標板 SDK。AI3 的接線程式——開圖、設定緩衝、加速器執行呼叫、讀回、cache flush——是板端負責人的程式，原版不改；我方只加模型設定與共用接線（<code>stream/ainr/ai3_model_io_dfn2.h</code>、<code>stream/common/ai3_model_io.h</code>）這一側。本庫提供 <code>ainr_*</code> 與 SDK 無關的檢查器 <code>stream_check_ports()</code>。四支 sample 的 stream 端接線一致：</p>
+<table>
+<thead><tr><th>sample</th><th>使用的入口</th><th>啟動</th></tr></thead>
+<tbody>
+<tr><th><code>alg_ai3_dfn.c</code>（full）</th><td><code>ainr_*</code>（PCM）</td><td>一個 host 端初始化函式依序做 size、pool、<code>ainr_init()</code>，由 config 算 N，查 <code>stream/ainr/ai3_model_io_dfn2.h</code> 的列；開圖後埠檢查，再用 <code>ainr_state_generation()</code> 設同步起點；組態被拒或查無列時結束碼 1，未執行加速器</td></tr>
+<tr><th><code>alg_ai3_dfn_lite.c</code>（lite）</th><td>同上</td><td>同上；只登錄 48000／1024／512</td></tr>
+<tr><th><code>uvc_ai_nr_stream.c</code></th><td><code>ainr_*</code>（PCM）</td><td>固定 48000／1024／512；模型設定查不到該列時拒絕；開圖後埠檢查</td></tr>
+<tr><th><code>uvc_audio_live2a.c</code></th><td><code>ainr_*_freq</code>（E／P 頻譜）</td><td>固定 48000／1024／512；同樣查列；開圖後埠檢查</td></tr>
+</tbody></table>
+<p>四支 sample 共用同一份 DFN2 模型設定，按位置把 <code>work.inputs[i]</code>、<code>work.outputs[j]</code> 對到 SDK 的第 i 個輸入與第 j 個輸出，state 對依 <code>signal_in_count</code>／<code>head_out_count</code> 之後的位置綁同一塊 buffer，都有「待回復」旗標（見上節），也都沒有 job_ready 分支：每次成功的 pre 都接一次 AI3 執行與一次 post。保留 full 的 alpha 對應與既有的數值處理。</p>
+<p>本庫未驗證的部分：正式量化後的 <code>model.bin</code>、目標板 SDK 的建置、板上的 descriptor 實值、音訊與每 hop 耗時。</p>
+
+<h2>參考</h2>
+<ul>
+<li><a href="../index.html">DeepFilterNet2 產品首頁</a></li>
+<li><a href="core.html">頻域整合、模型張量與狀態</a></li>
+<li><a href="grid.html">Grid 與 ERB 矩陣</a></li>
+<li><a href="../../../../../stream/ainr/ainr.h">客戶介面標頭 ainr.h</a></li>
+</ul>
+</main>
+</body>
+</html>

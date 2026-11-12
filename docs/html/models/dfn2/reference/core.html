@@ -241,7 +241,7 @@ stateless heads graph 每次由 host 傳入 3 幀 feature window 與兩個顯式
 <li>重新開始一段串流：<code>dfn2_prepost_reset(p)</code>，並 reset 自己的 <code>AcStft</code>／<code>AcIstft</code>，然後把加速器 state 重填量化零；結束：<code>dfn2_prepost_destroy(p)</code>（對 <code>_init</code> 實例是 no-op）。</li>
 </ol>
 <p><a href="../../../../../AINR/DeepFilterNet2/README.md">完整頻域 C 範例</a></p>
-<p class="note">以上片語已在暫存副本以 <code>-std=c11 -Wall -Wextra -Wpedantic -Werror</code> 編譯通過，並以 unit mask、alpha 0 的替身加速器實跑（出貨 grid 與 pair 1/1），輸出等於輸入延遲 3 hops（40 個 hop 加 M+D+1 = 3 個全零 hop：加速器跑 43 次、state 重填 2 次，少推一個全零 hop 就排不完）。估計與套用分支來自不同頻譜時用 <code>_pre_process_freq_dual</code>。</p>
+<p class="note">以上片語可在 <code>-std=c11 -Wall -Wextra -Wpedantic -Werror</code> 下編譯；接 unit mask、alpha 0 的替身加速器（出貨 grid 與 pair 1/1），輸出等於輸入延遲 3 hops（40 個 hop 加 M+D+1 = 3 個全零 hop：加速器跑 43 次、state 重填 2 次，少推一個全零 hop 就排不完）。估計與套用分支來自不同頻譜時用 <code>_pre_process_freq_dual</code>。</p>
 
 <h3>錯誤處理速查</h3>
 <div class="tbl"><table>

@@ -15,6 +15,8 @@ python3 -m pytest -q pipelines/tests/test_doc_layout_versions.py pipelines/tests
 | Mono、4ch、記憶體隔離與 parity | [管線驗收](pipeline.md) |
 | AINR／AIAEC 模型與匯出 | [模型驗收](models.md) |
 | Manifest、artifact 與跨庫發布順序 | [發布](publish.md) |
+| AINR 產品綁定、graph 與 ERB 檔的登錄資料 | [AINR 發布資料](ainr-release-data.md) |
+| 轉出圖的埠順序、sample 端接線資料與 `stream_check_ports()` 的比對依據 | [圖的埠順序與接線資料](graph-wiring.md) |
 | 比對 C 與 Python 的函式和覆蓋 | [函式對照表](../c_python_function_map.md) |
 
 ## 交付相容離線文件

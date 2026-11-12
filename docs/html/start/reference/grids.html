@@ -87,11 +87,11 @@ vs 上游 4800 Hz）</td><td>執行期給定：應用端填 <code>DFN2GridSpec</
 <td>512 / 256（257）；22 ERB bands + complex 特徵 0–4 kHz（129 bins）</td>
 <td>執行期給定：<code>RNNoiseGridSpec</code>→<code>rnnoise_grid_make()</code></td><td><code>RNNoise-ERB/process.h</code></td></tr>
 <tr><td>AIAEC Align-ULCNet</td><td>16 k / 48 k</td>
-<td>512 / 256（257）或 1024 / 512（513）</td><td>訓練端 config 固定；C 端執行期給定（<code>UlcnetGridSpec</code>）</td>
+<td>256 / 128（129）、512 / 256（257）或 1024 / 512（513）</td><td>訓練端 config 固定；C 端執行期給定（<code>UlcnetGridSpec</code>）</td>
 <td><code>config.ini</code>；<code>export_onnx.py</code> 的
 <code>SUPPORTED_GRIDS</code></td></tr>
 <tr><td>AIAEC DeepVQE-S</td><td>16 k</td>
-<td>512 / 256（257）</td><td>訓練端 config 固定；C 端執行期給定（<code>DeepVqeGridSpec</code>→<code>deepvqe_grid_make()</code>）</td>
+<td>512 / 256（257）、256 / 128（129）</td><td>訓練端 config 固定；C 端執行期給定（<code>DeepVqeGridSpec</code>→<code>deepvqe_grid_make()</code>）</td>
 <td><code>config.ini</code>；<code>deepvqe_prepost.h</code></td></tr>
 <tr><td>AIAEC 其餘兩個（CRUSE/CAGCRN）</td><td>16 k</td>
 <td>512 / 256（257）</td><td>config 固定；各模型的 mask helper 只處理 caller 給的 <code>n_bins</code></td>
@@ -122,14 +122,13 @@ vs 上游 4800 Hz）</td><td>執行期給定：應用端填 <code>DFN2GridSpec</
 <p>sqrt-Hann 分析 × sqrt-Hann 合成 = Hann，在 50% overlap 下滿足 COLA，
 合成端不需 window-envelope 除法（<code>dfn2_process.h</code> 檔頭的 framing 契約：
 plain overlap-add，<code>AC_OLA_ACCUMULATE</code>）。
-例外是 torch.istft 語意的 ULCNet WOLA：它照 torch 做窗平方包絡正規化
-（<code>AC_OLA_ENV_NORM</code> 的 <code>env</code> 累加器），結果相同、簿記不同。</p>
+ULCNet 與 DeepVQE-S 的合成同樣用 <code>AC_OLA_ACCUMULATE</code>：每 hop 輸出 = 當幀 IFFT 乘合成窗的前半 + 前一幀留下的後半（sqrt-Hann、50% overlap 時窗平方和為 1，不需要包絡除法）。<code>AC_OLA_ENV_NORM</code> 仍在 audiolib 供其他呼叫端選用。</p>
 
 <h3>STFT／ISTFT 組幀家族（<code>audio_stft.h</code>）</h3>
 <p>上表所有呼叫點都經 audiolib 的 <code>AcStft</code>／<code>AcIstft</code>；差別只在兩個旋鈕：
 分析的 <code>center</code>（0 = 每次 push 恰一幀、零歷史起算；1 = torch <code>center=True</code>、reflect 前綴）與合成的
 <code>ola</code> 模式（<code>AC_OLA_ACCUMULATE</code> = acc += ifft×w、每幀吐一個 hop；<code>AC_OLA_ENV_NORM</code> =
-另累加 w×w、除以包絡、第一幀不吐）。頻譜縮放由 DFN2／DFN3／RNNoise-ERB 用：<code>spec_scale</code> = <code>grid.stft_scale</code>（1/√n_fft）；DFN2／DFN3 的 <code>ispec_scale</code> = <code>grid.stft_unscale</code>（√n_fft），
+另累加 w×w、除以包絡、第一幀不吐；ULCNet、DeepVQE-S、DFN2 的出貨路徑都用 ACCUMULATE）。頻譜縮放由 DFN2／DFN3／RNNoise-ERB 用：<code>spec_scale</code> = <code>grid.stft_scale</code>（1/√n_fft）；DFN2／DFN3 的 <code>ispec_scale</code> = <code>grid.stft_unscale</code>（√n_fft），
 RNNoise-ERB 的 <code>ispec_scale</code> 保持 1.0（√n_fft 已折進 <code>rnnoise_apply_gains()</code>）。出貨 grid（48 k／1024）的值是 1/32 與 32，皆 2 的冪、乘法不進位；
 n_fft 為 4 的次方（256、1024、4096）時精確，512 為四捨五入的 float。縮放恰為 1.0f 時略過乘法。
 <code>DfnResStage</code>／<code>DfnRateBridge</code> 吃 audio-scale 頻譜、自己乘 <code>stft_scale</code>／<code>stft_unscale</code>，呼叫端的 <code>AcStft</code>／<code>AcIstft</code> 保持 1.0。</p>
@@ -138,7 +137,7 @@ n_fft 為 4 的次方（256、1024、4096）時精確，512 為四捨五入的 f
 <tr><th>家族</th><th>呼叫點</th><th>分析</th><th>合成</th><th>FFT／窗</th></tr>
 <tr><td>A</td><td>mono／4ch 各 main 的 <code>ac_istft_push()</code></td><td>（在 AEC 內，非本物件）</td><td>ACCUMULATE</td><td>物件自帶 FFT 與窗</td></tr>
 <tr><td>B → A</td><td><code>dfn_rate_bridge.c</code>；應用端餵 DFN2／DFN3／GTCRN／RNNoise-ERB</td><td><code>center</code> 0（bridge 48 kHz 兩路、DFN2／DFN3／GTCRN／RNNoise-ERB）</td><td>ACCUMULATE（bridge 三路、DFN2／DFN3／GTCRN／RNNoise-ERB）</td><td>借用呼叫端／bridge 的 FFT handle 與窗</td></tr>
-<tr><td>C</td><td>應用端餵 <code>ulcnet_prepost</code>、<code>deepvqe_prepost</code>；兩條 ULCNet pipeline</td><td><code>center</code> 0（出貨路徑）；<code>center</code> 1 只剩 Python parity 測試</td><td>ENV_NORM</td><td>借用 pipeline／呼叫端的 FFT handle 與窗</td></tr>
+<tr><td>C</td><td>應用端餵 <code>ulcnet_prepost</code>、<code>deepvqe_prepost</code>；兩條 ULCNet pipeline</td><td><code>center</code> 0（出貨路徑）；<code>center</code> 1 只剩 Python parity 測試</td><td>ACCUMULATE</td><td>借用 pipeline／呼叫端的 FFT handle 與窗</td></tr>
 </table>
 </div>
 <p><code>AC_OLA_ACCUMULATE</code> 把每幀累加進已歸零的 acc 再吐出；若另一個實作改成「前一幀尾巴直接 copy」，兩者數值只可能差在零的符號
@@ -175,7 +174,7 @@ recurrent-state start transient）；(b) 檔案級評測的幀數/邊界；(c) �
 framing 是輸入分佈變更，須 A/B。</li>
 <li>C 實作佐證：<code>AcStft</code>（<code>center</code> 1）的排程是 push#0→0 幀、
 push#1→2 幀（frame0 含 reflect 前綴 + frame1）、之後每 push 1 幀；輸出端
-<code>AcIstft</code>（ENV_NORM）frame#0→0 樣本（半窗 trim）、之後每幀 256 樣本——與 dfn2 的 center=False
+<code>AcIstft</code>（ACCUMULATE）每幀 256 樣本、frame#0 也是（前一幀為零歷史）——與 dfn2 的 center=False
 串流輸出排程逐 hop 相同。</li>
 </ul>
 <p><b>ULCNet 的兩種分析排程並存，出貨路徑分兩派。</b>
@@ -224,7 +223,7 @@ rolling 排程後兩者天生 hop-locked，不需再靠 centered 排程的 0/2/1
 <td><code>lib/aiaec/deepvqe_s/deepvqe_prepost.h</code></td><td>DeepVQE-S 前後處理 class</td></tr>
 <tr><td><code>DFN2_PREPOST_CARVE_VERSION</code> = 12／<code>DFN3_PREPOST_CARVE_VERSION</code> = 9</td>
 <td><code>lib/ainr/dfn2/dfn2_prepost.h</code>、<code>lib/ainr/dfn3/dfn3_prepost.h</code></td><td>carve 走訪順序，進 <code>build_flags_hash</code></td></tr>
-<tr><td><code>ULCNET_PREPOST_CARVE_VERSION</code> = 8／<code>DEEPVQE_PREPOST_CARVE_VERSION</code> = 8</td>
+<tr><td><code>ULCNET_PREPOST_CARVE_VERSION</code> = 9／<code>DEEPVQE_PREPOST_CARVE_VERSION</code> = 8</td>
 <td><code>lib/aiaec/ulcnet/ulcnet_prepost.h</code>、<code>lib/aiaec/deepvqe_s/deepvqe_prepost.h</code></td><td>同上</td></tr>
 <tr><td><code>GTCRN_PROCESS_CARVE_VERSION</code> = 1／<code>RNNOISE_CARVE_VERSION</code> = 1</td>
 <td><code>lib/ainr/gtcrn/gtcrn_process.h</code>、<code>lib/ainr/rnnoise_erb/process.h</code></td><td>同上</td></tr>
@@ -254,7 +253,7 @@ rolling 排程後兩者天生 hop-locked，不需再靠 centered 排程的 0/2/1
 <td><code>ulcnet_process.h</code>：第一幀無輸出（pipeline 補零）、hop#p 輸出
 對應輸入 [（p−1)·<code>grid.hop</code>, p·<code>grid.hop</code>)</td></tr>
 <tr><td><b>合計</b></td><td><b>1 hop（16 k: 16 ms；48 k: 10.67 ms）</b></td>
-<td><code>ulcnet/ulcnet_nn_stage.h</code>：「Latency is one hop; hop #0 emits zeros」；輸出 hop p ≙ 輸入 hop p−1</td></tr>
+<td><code>ulcnet/ulcnet_nn_stage.h</code>：「Latency is one hop; hop #0 is real output」(第一幀合成窗前半疊加零歷史)；輸出 hop p ≙ 輸入 hop p−1</td></tr>
 </table>
 </div>
 

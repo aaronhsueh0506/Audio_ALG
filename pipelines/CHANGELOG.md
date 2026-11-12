@@ -3,6 +3,70 @@
 `Audio_ALG/pipelines`（含它建置的 `AINR`、`AIAEC` C 程式）的重要改動記錄在此，格式依
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/)。README 只寫現況，改動經過寫在這裡。
 
+## [Unreleased] — 2026-11-12 — `stream/ainr` and `stream/aiaec` customer API: slim Info, graph wiring in the sample's model configuration
+
+Nothing was released, so the old names are gone without aliases.
+
+- **Slim Info.** `AinrInfo` / `AiaecInfo` carry `graph_path`, `trim_samples`, `queue_frames` and `tail_zero_blocks` only; they replace
+  `*_get_bind_info*`, `pcm_delay_samples` and the queue-depth accessors. N is not reported: the sample derives `N = cfg.hop_in / (cfg.fft / 2)`
+  from the config (the client still sets only `sr`, `fft`, `hop_in`). `trim_samples` = `(queue_frames + 1) * model_hop` for DFN2 (full
+  16 kHz/256 N=1 128, N=8 1024; 48 kHz/1024 full 1536, lite 1024), DeepVQE-S `N * model_hop`, Align-ULCNet `model_hop`. The initial state
+  generation is read with `*_state_generation()`.
+- **Init signature.** `int ainr_init(cfg, pool, pool_bytes, &ctx, &info)` and `aiaec_init(...)` (and `_spec` / `_freq`) return 0 or a negative
+  `AINR_ERR_*` / `AIAEC_ERR_*`; there is no `err_out`, no `expected` descriptor and no `*_ERR_STALE_POOL`. Init recomputes the size and refuses a
+  too-small or misaligned pool (`*_ERR_POOL`); a larger pool is accepted. Codes renumbered after the stale-pool gate was removed: `AINR_ERR_ERB_FILE`
+  -9 -> -8, `AINR_ERR_SEQUENCE` -10 -> -9, `AINR_ERR_NONFINITE_INPUT` -11 -> -10 (ends at -10); `AIAEC_ERR_SEQUENCE` -8 -> -7,
+  `AIAEC_ERR_INPUT_KIND` -9 -> -8, `AIAEC_ERR_INPUT_SIZE` -10 -> -9 (ends at -9). The model-io helper's own codes, `AI3_MODEL_IO_ERR_*`, are
+  -301..-306. `ainr_preprocess*` returns `AINR_OK` (0) on success instead of 1, like `aiaec_preprocess*`.
+- **No graph wiring in the libraries.** `AinrInfo.wiring`, `ainr_fill_wiring()`, the `aiaec_core_wiring()` / `aiaec_describe_*` generators, the
+  test wiring accessors and every state-dimension constant that existed only for graph wiring are removed. The libraries keep what the
+  work views need: `AinrWork` / `AiaecWork` carry the block's signal and head pointers, element counts and `[b,c,h,w]`, the generation, the
+  action and, for Align-ULCNet at N > 1, the `frame_reset` control values the stream computes from the hop events as a fifth signal
+  (`[1,1,1,N]`; hop 3 of a packet alone gives `00100000`). `ainr.h` / `aiaec.h` include `stream_mem.h` only; `libainr.a` / `libaiaec.a` no
+  longer compile or link `stream_bind.c`.
+- **Wiring in the sample.** Every converted graph is inputs = signals then states, outputs = heads then states, state k = input
+  `signal_in_count + k` <-> output `head_out_count + k` (counts: DFN2 full 2/3, lite 2/1, DeepVQE-S 2/1, Align-ULCNet 4/1 at N=1 and 5/1 at
+  N>1). The shapes of every registered `(model, sr, fft, N)` row, state shapes included, are fixed tables in `stream/ainr/ai3_model_io_dfn2.h`,
+  `stream/aiaec/ai3_model_io_deepvqes.h` and `ai3_model_io_alignulcnet.h` (header-only, not included by `ainr.h` / `aiaec.h`); the shared
+  `stream/common/ai3_model_io.h` (tested by `make -C stream/common test-model-io`) expands a row, pairs states by count, calls the
+  checker, sizes buffers and checks each block's work against the row before any AI3 call (a mismatch is no run, a failed post). A config
+  without a row, or one that does not match the selected graph, is refused at start-up before any SDK call.
+- **Shared checker and memory type.** `stream/common/stream_bind.{h,c}` (`StreamWiring`, `StreamDeviceDesc`, `stream_check_ports()`, codes
+  `STREAM_PORT_ERR_*`, -101..-110) is the SDK-free sample-side checker; the `AINR_PORT_*` / `AIAEC_PORT_*` codes are gone. `StreamMemReq
+  {bytes, alignment}` moved to `stream/common/stream_mem.h` and no longer depends on the wiring types.
+- **Renames.** The `aiaec_*_block` entries are `aiaec_*` (`AiaecCtx`, `AiaecInput` / `AIAEC_INPUT_*`, `AiaecWork`, `AIAEC_SUBMIT` /
+  `AIAEC_BYPASS`, `aiaec_front_preprocess`); `AinrHopIO` is `AinrWork`. The `ainr_*_from_erb_file` entries are in the test-only
+  `stream/ainr/ainr_test.h`; `aiaec_internal.h` is likewise not a customer header. The three DFN2 families share one `AinrCore`.
+- **Tests.** `test-ainr-work-shapes` (replaces `test-ainr-ports`) checks the `AinrWork` views of real pre calls against tables spelled out from the
+  exporter; `AIAEC/tests/test_aiaec_bind_info_pin.py` and `AINR/tests/test_dfn2_port_order.py` compare the work views of real pre calls (dumped by
+  `make -C stream/aiaec bind-dumpers`, `make -C stream/ainr [MASK_ONLY=1] work-dumper`) with fresh exports and assert the exporters' name order and
+  state pairing. The same two tests compare every row of the model tables (`ai3_model_io_<model>.h`, dumped by `make model-io-dumper`) with a fresh export.
+- **zero_point rule for every model.** `STREAM_PORT_ERR_STATE_ZERO_POINT` (-110) also covers DFN2: a fixed-point state port with
+  `zero_point` != 0 at either end is refused; float state ports ignore it.
+- **DFN2 pool.** The inner STFT and ISTFT borrow the stream's one FFT instance (`DFN2_STREAM_LAYOUT_VERSION` 2 -> 3).
+  `ainr_get_mem_size()` bytes (PCM / `_spec` / `_freq`), before -> after: full 16 kHz/256 N=1 118032 / 118032 / 120112 -> 103728 /
+  103728 / 105792; N=8 175200 / 180640 / 182720 -> 160896 / 166336 / 168400; full 48 kHz/1024 414128 / 414128 / 422352 -> 361424 /
+  361424 / 369632; lite 353760 / 353760 / 361984 -> 301056 / 301056 / 309264 (arm64 host, SIMD=1, ne10). The public
+  `AINR_DFN2_*_LAYOUT_VERSION` and `AIAEC_*_LAYOUT_VERSION` macros are gone with the descriptor; the AIAEC pools are unchanged.
+
+## [Unreleased] — 2026-11-11 — Align-ULCNet packet graph (layout 19) in the C model I/O, prepost and stream
+
+`lib/aiaec/ulcnet` and `stream/aiaec/ulcnet` run the exporter's N > 1 packet graph (`PACKET_LAYOUT_VERSION` = 19):
+`ULCNET_MODEL_IO_PACKET_LAYOUT_VERSION`, `UlcnetModelIoDescriptor.frames_per_call` (the struct is 52 bytes now; 0 or 1
+means layout 18, 2..64 layout 19, any other pairing is refused), `ulcnet_model_io_prepare_packet` /
+`_enhance_packet`, `UlcnetPrepostConfig.frames_per_call` with `ulcnet_prepost_pre_process_packet`, and
+`ulcnet_stream_pre_process_packet_{f32,freq}`. One-frame callers (layout 18, N = 1) keep their call sequence and tensor layout (PCM
+comparison below); `ulcnet_nn_stage` refuses a packet descriptor. Pool sizes grew by the extra state fields, so
+`ULCNET_PREPOST_CARVE_VERSION` 8 -> 9, `ULCNET_STREAM_LAYOUT_VERSION` 1 -> 2 and the three `AIAEC_*_LAYOUT_VERSION`
+bumped; a `MemReq` queried before this change is refused by `init_ex()`. Align calib keeps the real tail hops when
+`--events` is given (padding slots carry `frame_reset` 0); without `--events` only whole packets are captured.
+
+`stream/ainr/ainr.h` adds `ainr_set_atten_lim` (`_spec`, `_freq`): runtime attenuation limit, default the catalog row's 0 dB, callable between blocks only,
+kept across `ainr_reset`; pool size and layout are unchanged.
+
+N = 1 audio was compared only against the `5c61d2b` sources (identity mask,
+16 kHz FFT 256 and 512, 24 hops, no event and one event hop): at most 1 PCM16 step apart; nothing wider is claimed.
+
 ## [Unreleased] — 2026-11-09 — Pipeline layout: top-level split into `mono/` and `4ch/`, one directory per application chain
 
 The flat layout mixed two things per NN family (`dfn/`, `ulcnet/`: shared stage infra plus a

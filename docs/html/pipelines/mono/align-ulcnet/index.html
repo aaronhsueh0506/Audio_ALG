@@ -18,7 +18,7 @@
 <tr><th>位置</th><th>內容</th></tr>
 <tr><td>graph <b>內</b>(已由 <code>export_onnx.py</code> 匯出)</td><td>(四個壓縮域特徵輸入 error_mag/far_mag/error_cos/error_sin, 顯式 states) → output(複數 mask, planar [1,2,1,K]):reorient、attention、GRU、到 complex_mask 1×1 Conv 為止;learned compute only(model-I/O layout 18)。</td></tr>
 <tr><td>graph <b>外</b>(C 前處理)</td><td>線性 AEC(<code>aec_process_context</code>)、rolling center=False sqrt-Hann STFT(<code>AcStft</code>,<code>center</code> 0,對最近 <code>grid.n_fft</code> 樣本做 transform,每次 push 恰一幀;與 <code>center</code> 1 對同一個 pushed hop 吐出的最後一幀逐 bit 相同,見 <a href="../../../start/reference/grids.html">訊號 grid、視窗與記憶體版號</a>)、delay-state policy、固定前端(signed |x|^0.3 壓縮 <code>ULCNET_MODEL_IO_COMPRESSION_EXP=0.3f</code>、magnitude、壓縮域相位 cos/sin;封在 <code>ulcnet_model_io_prepare()</code> 內,壓縮域 error 頻譜留在 model_io state)。</td></tr>
-<tr><td>graph <b>外</b>(C 後處理)</td><td>output(mask)× 壓縮域 error → 逆冪(皆在 <code>ulcnet_model_io_enhance_spectrum()</code> 內)→ WOLA(sqrt-Hann、包絡正規化、半窗 trim;<code>AcIstft</code> 的 <code>AC_OLA_ENV_NORM</code>,<code>ac_istft_push_planar()</code>,機制不因上游 analysis 排程改變)。</td></tr>
+<tr><td>graph <b>外</b>(C 後處理)</td><td>output(mask)× 壓縮域 error → 逆冪(皆在 <code>ulcnet_model_io_enhance_spectrum()</code> 內)→ WOLA(sqrt-Hann、前一幀後半窗疊加;<code>AcIstft</code> 的 <code>AC_OLA_ACCUMULATE</code>,<code>ac_istft_push_planar()</code>,機制不因上游 analysis 排程改變)。</td></tr>
 <tr><td>runtime 跨呼叫保存的 NN states</td><td>far attention K/V window、attention-logit window、GRU hidden h(四個 state tensor)屬於應用端:板端登錄 NULL、state 在加速器裡,float host 登錄自己的緩衝。stage 只透過 <code>model.reset</code> 要求全部清除；adapter 的 reset 會將已登錄的 K/V、logit 與 <code>h_gru</code> 歸零,並讓 state generation 加一,板端據此重載量化後的零。</td></tr>
 </table>
 
@@ -113,7 +113,7 @@ out             全零 256          hop#0 內容            hop p-1 內容
 <tr><th>state</th><th>shape / size</th><th>存放者</th><th>備註</th></tr>
 <tr><td><code>Aec</code> 全狀態</td><td>494,720 B(16 kHz/512,<code>aec_get_mem_size()</code>)</td><td>pool(C struct)</td><td><code>enable_res=0 / return_res_context=1 / spatial_linear_context=AEC_CONTEXT_LINEAR_ONLY</code>(只留線性半邊,線性輸出與完整 context 逐位元相同,<code>lib/aec</code> 的 <code>test_process_context</code> 釘住);delay estimation 開</td></tr>
 <tr><td><code>far_analysis</code>／<code>err_analysis</code>(<code>AcStft</code> ×2,後者借用前者的 <code>FftHandle</code> 與視窗表)</td><td>各:結構 + <code>history</code> [n_fft] f32 + <code>seg</code> [n_fft] f32 + 頻譜暫存 [n_bins] Complex;<code>FftHandle</code> 與視窗表 [n_fft] 在 far 那份</td><td>stage pool</td><td>rolling 原始樣本(跨 hop 必要狀態);seg／頻譜暫存是 per-call FFT scratch,刻意不放 stack</td></tr>
-<tr><td><code>synthesis</code>(<code>AcIstft</code>,<code>AC_OLA_ENV_NORM</code>,借用)</td><td>結構 + <code>acc</code>／<code>env</code>／<code>time</code> 各 [n_fft] f32 + 頻譜暫存</td><td>stage pool</td><td>WOLA 累加器 + 窗平方包絡 + IFFT 輸出</td></tr>
+<tr><td><code>synthesis</code>(<code>AcIstft</code>,<code>AC_OLA_ACCUMULATE</code>,借用)</td><td>結構 + <code>acc</code>／<code>time</code> 各 [n_fft] f32 + 頻譜暫存</td><td>stage pool</td><td>WOLA 累加器 + IFFT 輸出</td></tr>
 <tr><td>頻譜暫存(err／far／enh)</td><td>6 × n_bins float:16 kHz 6,168 B、48 kHz 12,312 B</td><td>stage pool</td><td>err 1 幀 + far 1 幀 + model 輸出 1 幀,每 hop 覆寫</td></tr>
 <tr><td><code>model</code>(by value)+delay transition+<code>reprime_frames</code></td><td>純量級</td><td>C struct(self)</td><td>model 指標指向物由 caller 保活;<code>reprime_frames</code> 在 alignment 邊界武裝為 <code>ULCNET_NN_STAGE_REPRIME_FRAMES</code>=1,每發射一幀遞減</td></tr>
 <tr><td>adapter pool</td><td>14,816 B(16 kHz／512)、29,152 B(48 kHz／1024),與 D 無關</td><td>caller 的獨立一塊</td><td><code>ulcnet_prepost</code> 實例與幀 staging(特徵張量、mask 暫存);不含遞迴 state</td></tr>
@@ -124,9 +124,9 @@ out             全零 256          hop#0 內容            hop p-1 內容
 <h2>延遲與 warm-up</h2>
 <ul>
 <li>端到端演算法延遲 = <b>1 個 grid hop</b>:16 kHz 為256 samples/16 ms，48 kHz 為512 samples/10.67 ms。延遲來源是 <b>synthesis 的半窗 trim</b>,不是 analysis 排程(rolling push 從 hop#0 起就吐幀)。</li>
-<li>warm-up:hop#0 就推入 1 幀並跑 1 次推論(history 全零),但 synthesis 的第一幀吃在半窗 trim 內,輸出仍全零;hop#1 起每 hop 正常輸出 256(16 kHz)/512(48 kHz)樣本。identity E2E 測試:out[hop p] ≈ formed_history[p-1](2e-4 內),hop 0 精確為零。</li>
+<li>warm-up:hop#0 就推入 1 幀並跑 1 次推論(history 全零),synthesis 採累加(<code>AC_OLA_ACCUMULATE</code>),每 hop 都輸出整個 hop(256(16 kHz)/512(48 kHz)樣本),hop 0 也是:第一幀合成窗前半疊加零歷史。identity E2E 測試:out[hop p] ≈ formed_history[p-1](2e-4 內);identity 時 hop 0 的前半窗是零歷史,所以數值接近零,mask 改變頻譜時 hop 0 不為零。</li>
 <li>模型從第一個發射幀就執行並套用(far 恆為 caller 的 raw far)。取得 alignment(或 delay 變動)時 reset recurrent state;邊界後 1 幀走 identity reprime(不 step 模型),第 2 幀起恢復 step+apply。</li>
-<li>reset:整合者呼叫 <code>aec_reset()</code> 與 <code>ulcnet_nn_stage_reset()</code>(後者重置兩路 analysis/synthesis 並呼叫 <code>model-&gt;reset</code>);timing 前導(hop#0 零輸出)重新開始。</li>
+<li>reset:整合者呼叫 <code>aec_reset()</code> 與 <code>ulcnet_nn_stage_reset()</code>(後者重置兩路 analysis/synthesis 並呼叫 <code>model-&gt;reset</code>);合成與分析歷史從零重新開始。</li>
 </ul>
 <p class="note"><b>短延遲注意</b>:echo path 落在線性濾波器涵蓋範圍內時，matched estimator 可能因 already-cancelling 保護而維持 UNLOCKED。這不會停用模型；模型繼續看到 raw far，能否解掉偏移取決於 export-time D。</p>
 

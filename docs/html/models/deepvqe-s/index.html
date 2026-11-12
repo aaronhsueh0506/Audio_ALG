@@ -10,25 +10,132 @@
 <nav aria-label="導覽"><a href="../../index.html">Audio_ALG</a> / <a href="../index.html">模型開發與部署</a></nav>
 <main>
 <h1>DeepVQE-S</h1>
-<p>輸入是原始 mic 與 far 的 int16 PCM，兩路長度皆為一個模型 hop。SDK 做雙路分析，模型輸出複數濾波 taps，套在 mic 的頻譜歷史，再合成單路 int16 PCM。</p><h2>建置與初始化</h2><pre><code>make -C stream/aiaec/deepvqe_s lib
-make -s -C stream/aiaec/deepvqe_s print-lib-path</code></pre><p>依模型建立 grid 與 config，用 <code>deepvqe_stream_get_mem_size()</code> 查詢 pool 大小與對齊，再配置 pool。以同一目標工具鏈建置並連結模型 archive 和 audiolib 的 <code>libaudio_common.a</code>。裝置 runtime 載入與 grid 相符的模型檔，負責每次 NPU 推論。</p>
+<p>輸入是原始 mic 與 far 的 int16 PCM，兩路每次各 <code>hop_in</code> 個樣本。SDK 做雙路分析，模型輸出複數濾波 taps，套在 mic 的頻譜歷史，再合成單路 int16 PCM。客戶只設三個值：<code>sr</code>、<code>fft</code>、<code>hop_in</code>。每包張數 N = <code>hop_in / (fft / 2)</code>，grid、graph 與其餘參數由產品登錄表決定；介面在 <a href="../../../../stream/aiaec/aiaec.h">aiaec.h</a>。</p>
 
-<h2>每 hop 呼叫</h2><p>範例中的讀寫、<code>run_accelerator</code> 與 <code>device_state_*</code> 由呼叫端實作。裝置第一次使用或 generation 改變時，把 recurrent state 還原為模型的量化零值。推論已開始後回錯，也立刻清掉可能部分寫入的裝置 state。</p><pre><code>DeepVqeStream *ctx = deepvqe_stream_init(&amp;cfg, pool, bytes);
-if (!ctx) return -1;
-while (read_hops(mic_in, far_in)) {
-    DeepVqeHopIO io;
-    if (deepvqe_stream_pre_process(ctx, mic_in, far_in, &amp;io) != 1) return -1;
-    device_state_sync(io.state_generation);
-    int rc = run_accelerator(&amp;io.inputs, &amp;io.outputs);
-    if (rc != 0) device_state_refill_zero();
-    if (deepvqe_stream_post_process(ctx, rc, pcm_out) &lt; 0) return -1;
-    write_hop(pcm_out);
-}</code></pre><p>模型從 hop 0 起每拍推論，CCM ring 初始為零。init／reset 後第一次 ISTFT push 尚未吐出樣本，post 回 0 並輸出一整拍零 PCM。正式幀推論失敗時，當拍增強頻譜歸零。50% overlap 的 ISTFT 仍疊加上一拍尾端，因此若前拍已有音訊，需連續兩拍零頻譜才保證 PCM 全零。</p>
+<h2>支援的組態</h2>
+<table>
+<thead><tr><th>sr / fft</th><th>hop_in → N</th><th>正式登錄表</th><th>測試登錄表（僅主機測試）</th></tr></thead>
+<tbody>
+<tr><th>16000 / 512</th><td>256 → 1</td><td>有登錄的 graph，接受</td><td>可建構</td></tr>
+<tr><th>16000 / 512</th><td>2048 → 8</td><td>無 graph，init 拒絕</td><td>無，init 拒絕</td></tr>
+<tr><th>16000 / 256</th><td>128 → 1</td><td>無 graph，init 拒絕</td><td>可建構</td></tr>
+<tr><th>16000 / 256</th><td>1024 → 8</td><td>無 graph，init 拒絕</td><td>可建構</td></tr>
+</tbody></table>
+<p>沒有交付 graph 的組態在 <code>aiaec_get_mem_size()</code>／<code>aiaec_init()</code> 被拒絕（<code>AIAEC_ERR_FRAMES_PER_CALL</code>），不會呼叫任何 SDK。測試登錄表只存在於主機測試用的測試建置，不在交付的 archive 裡，以佔位路徑讓主機測試走完整個 API，不代表有 graph。表外的 <code>(sr, fft)</code> 回 <code>AIAEC_ERR_GRID</code>；不是模型 hop 倍數的 <code>hop_in</code>（例如 129）回 <code>AIAEC_ERR_IN_HOP</code>。FFT 512 與 256 使用同一個迴圈。</p>
+
+<h2>建置與連結</h2>
+<p>DeepVQE-S 的單模型產品用 <code>AIAEC_MODEL=deepvqe</code> 建置，連結 <code>libaiaec.a</code>、該款 backend <code>libdeepvqe_stream.a</code> 與 audiolib 的 <code>libaudio_common.a</code>（與本庫同一目標工具鏈建置）。路徑一律用 <code>print-lib-path</code> 查，且查詢要帶與建置相同的 <code>AIAEC_MODEL</code>、<code>SIMD</code>、<code>CC</code>、<code>EXTRA_CFLAGS</code>；不帶 <code>AIAEC_MODEL</code> 會查到預設 <code>both</code> 版的路徑。</p>
+<pre><code>AUDIOLIB=/path/to/audiolib
+COMMON_LIB="$(make -s -C $AUDIOLIB/common lib print-lib-path | tail -1)"
+make -C stream/aiaec AIAEC_MODEL=deepvqe COMMON_DIR=$AUDIOLIB/common COMMON_LIB="$COMMON_LIB" lib
+make -C stream/aiaec/deepvqe_s COMMON_DIR=$AUDIOLIB/common COMMON_LIB="$COMMON_LIB" lib
+cc app.c -Istream/aiaec \
+   "$(make -s -C stream/aiaec AIAEC_MODEL=deepvqe COMMON_DIR=$AUDIOLIB/common COMMON_LIB="$COMMON_LIB" print-lib-path)" \
+   "$(make -s -C stream/aiaec/deepvqe_s COMMON_DIR=$AUDIOLIB/common COMMON_LIB="$COMMON_LIB" print-lib-path)" \
+   "$COMMON_LIB" -lm -o app</code></pre>
+<p>漏掉 <code>libdeepvqe_stream.a</code> 會缺 <code>deepvqe_stream_*</code>。預設 <code>AIAEC_MODEL=both</code> 的 <code>libaiaec.a</code> 同時引用兩款 backend，只連 DeepVQE-S 的 backend 會缺 <code>ulcnet_stream_*</code>。</p>
+
+<h2 id="graph-wiring">Graph 接線</h2>
+<p><code>aiaec_init()</code> 只回報選出的圖（<code>AiaecInfo.graph_path</code>）與尾端長度，不回報埠表。每個已交付 graph 的完整接線——訊號與 head 的 shape、16 組 state 的 shape——放在 <code>stream/aiaec/ai3_model_io_deepvqes.h</code>，每個登錄的 (sr, fft, N) 一列，列旁註明所對應的匯出器；共用的接線程式 <code>stream/common/ai3_model_io.h</code>（由 <code>make -C stream/common test-model-io</code> 測試）負責列的展開、state 配對、開圖後的埠檢查、input buffer 大小與送件前的核對。兩者與 SDK 無關、只有標頭，<code>aiaec.h</code> 不引用，函式庫不含接線；sample 加 <code>-I stream/common -I stream/aiaec</code>並編譯 <code>stream/common/stream_bind.c</code>。沒有對應列的組態，或與 init 選出的 graph 不符，由 sample 的啟動檢查在任何 SDK 呼叫之前拒絕。</p>
+<p>圖的埠順序只有一條規則：輸入 = 訊號輸入，再接 state 輸入；輸出 = head 輸出，再接 state 輸出；第 k 組 state 是輸入 <code>signal_in_count + k</code> 與輸出 <code>head_out_count + k</code>，兩端同形狀。DeepVQE-S：<code>signal_in_count</code> 2（mic、far）、<code>head_out_count</code> 1（CCM taps）、16 組 state，所以輸入 18 個、輸出 17 個，N=1 與 N&gt;1 相同。sample 依數量迴圈處理，不比對名稱。N 改變 mic／far 與 CCM head 的時間軸，不改埠順序；state 的 shape 隨 grid 與延遲深度 D = ceil(0.5 s / hop) 而變：</p>
+<table>
+<thead><tr><th>組態</th><th>mic、far（輸入 0、1）</th><th>CCM taps（輸出 0）</th><th>state</th></tr></thead>
+<tbody>
+<tr><th>16k／256／N=1</th><td>[1,2,1,129]</td><td>[1,1,129,18]</td><td>16 組，D = 63</td></tr>
+<tr><th>16k／256／N=8</th><td>[1,2,8,129]</td><td>[1,8,129,18]</td><td>16 組，D = 63</td></tr>
+<tr><th>16k／512／N=1</th><td>[1,2,1,257]</td><td>[1,1,257,18]</td><td>16 組，D = 32</td></tr>
+</tbody></table>
+<p><code>AiaecWork.inputs[0..1]</code> 與 <code>outputs[0]</code> 的 shape 與元素數就是上表同一列；state 不在 <code>AiaecWork</code> 裡。state 的順序是匯出器的順序（<code>align_key_ring</code>、<code>align_value_ring</code>、<code>align_score_history</code>、<code>ccm_up_history</code>、<code>far1_history</code>、<code>far2_history</code>、<code>h_gru</code>、<code>mic1_history</code> … <code>mic4_history</code>、<code>res2_history</code>、<code>res3_history</code>、<code>up1_history</code> … <code>up3_history</code>；ONNX 名稱除 <code>h_gru</code> 外都帶 <code>state_</code> 前綴），各自的 shape 見模型設定的列。</p>
+
+<h2>初始化與每包呼叫</h2>
+<p>一次 init（<code>aiaec_get_mem_size()</code> → <code>aiaec_init()</code>）備好 pool，並填 <code>AiaecInfo</code>：圖路徑、<code>trim_samples</code>、<code>queue_frames</code>、<code>tail_zero_blocks</code> 四欄。N 不在其中，sample 由 config 算 N = <code>hop_in / (fft / 2)</code>。起始 generation 由 <code>aiaec_state_generation()</code> 取得。sample 的演算法入口只有 init／pre／post；AI3 的開圖、送張量、執行、讀回與 state 緩衝是 sample 自己的。每包 pre／post 只交換這一包的特徵（<code>work.inputs[0..1]</code> 為 mic、far 的特徵）與模型 head（<code>work.outputs[0]</code>，CCM taps）。</p>
+<pre><code>AiaecConfig cfg = { sr, fft, hop_in };             /* 例：{ 16000, 512, 256 } */
+StreamMemReq req;
+if (aiaec_get_mem_size(&amp;cfg, &amp;req) != AIAEC_OK) return -1;   /* 未登錄組態在此被拒 */
+void *pool = alloc_aligned(req.alignment, req.bytes);
+AiaecCtx *ctx;
+AiaecInfo info;                                    /* graph_path、trim_samples、queue_frames、tail_zero_blocks */
+int rc = aiaec_init(&amp;cfg, pool, req.bytes, &amp;ctx, &amp;info);   /* 0 或負的 AIAEC_ERR_* */
+if (rc != AIAEC_OK) { log(aiaec_status_text(rc)); return -1; }
+
+/* sample 的模型設定：這個 grid 與 N 的接線列；沒有列就在開圖前拒絕 */
+int n = ai3_model_io_frames(cfg.fft, cfg.hop_in);  /* N = hop_in / (fft / 2) */
+Ai3ModelIoConfig model;
+if (ai3_model_io_deepvqes_find(cfg.sr, cfg.fft, n, &amp;model) != AI3_MODEL_IO_OK) return -1;
+
+open_graph(info.graph_path);                       /* sample 的 AI3 */
+char msg[160];
+if (ai3_model_io_check_ports(&amp;model, din, n_in, dout, n_out, msg, sizeof msg) != STREAM_PORT_OK) return -1;
+
+unsigned seen = aiaec_state_generation(ctx);
+
+while (read_blocks(mic, far, hop_in)) {
+    AiaecInput in = { .kind = AIAEC_INPUT_DEEPVQE_S, .samples = hop_in };
+    in.u.deepvqe_s.mic_in = mic;
+    in.u.deepvqe_s.far_in = far;
+    AiaecWork work;
+    if (aiaec_preprocess(ctx, &amp;in, &amp;work) != AIAEC_OK) return -1;
+    int ai_rc = 0;
+    if (work.action == AIAEC_SUBMIT) {             /* DeepVQE-S 每包都是 SUBMIT */
+        int chk;
+        AI3_MODEL_IO_CHECK_WORK(chk, &amp;model, &amp;work);   /* work 的數量與 shape 必須等於這一列 */
+        if (chk != AI3_MODEL_IO_OK) ai_rc = -1;    /* 不符：不送件，仍呼叫 post */
+        else {
+            if (work.state_generation != seen) { clear_state_buffers(); seen = work.state_generation; }
+            ai_rc = run_ai3(&amp;work);                /* 填 work.inputs，執行，讀回 work.outputs */
+        }
+        if (ai_rc != 0) clear_state_buffers_before_next_run();
+    }
+    if (aiaec_postprocess(ctx, ai_rc, pcm_out) != AIAEC_OK) return -1;   /* 失敗也呼叫 */
+    write_block(pcm_out, hop_in);
+}</code></pre>
+<p><code>aiaec_init()</code> 回 0 或負的 <code>AIAEC_ERR_*</code>，pool 小於 <code>aiaec_get_mem_size()</code> 的位元組數或未對齊時回 <code>AIAEC_ERR_POOL</code>，較大的 pool 可以。<code>aiaec_preprocess()</code> 成功回 <code>AIAEC_OK</code>（0），是否要跑加速器看 <code>work.action</code>。開圖後、第一次執行前，共用接線程式的 <code>ai3_model_io_check_ports()</code>（內部呼叫 SDK 無關的檢查器 <code>stream_check_ports()</code>，在 <code>stream/common</code>，<code>libaiaec.a</code> 不含它）檢查每個埠的格式、軸、stride、容量與 state 配對；每包送件前 <code>AI3_MODEL_IO_CHECK_WORK</code> 再核對 <code>work</code> 的數量與 shape。</p>
+<p>pool 大小（本庫 host 建置讀出，單位 bytes；16k／256 兩列只存在於測試登錄表）：</p>
+<table>
+<thead><tr><th>組態</th><th>PCM</th><th><code>_spec</code></th><th><code>_freq</code></th></tr></thead>
+<tbody>
+<tr><td>16k／512／N=1</td><td>124096</td><td>124096</td><td>124096</td></tr>
+<tr><td>16k／256／N=1</td><td>64192</td><td>64192</td><td>64192</td></tr>
+<tr><td>16k／256／N=8</td><td>167024</td><td>172464</td><td>172464</td></tr>
+</tbody></table>
+
+<h2>State</h2>
+<ul>
+<li>recurrent state 留在 AI3 的 buffer。每對 state 輸入與輸出依位置（輸入 <code>signal_in_count + k</code> 與輸出 <code>head_out_count + k</code>）綁同一塊 buffer；DeepVQE-S 有 16 對。</li>
+<li>定點 state 埠兩端的 <code>zero_point</code> 都必須是 0（清零用位元組填 0，只有 zero_point 0 時才等於量化後的 0）。5/5、0/5、5/0 都在第一次送件前被埠檢查（<code>stream_check_ports()</code>）以 <code>STREAM_PORT_ERR_STATE_ZERO_POINT</code>（-110）拒絕；float 的 state 埠不看 zero_point。</li>
+<li>init 時每塊 state buffer 清零一次（memset 加 cache flush）。正常連續推論不碰 state，每包只交換特徵與 head。</li>
+<li>函式庫只在 reset 與加速器輸出非有限時動 state 並讓 <code>work.state_generation</code> 改變；sample 看到 generation 改變就清。回報失敗（<code>infer_status</code> 非 0）的一包只旁路該包，state 與 generation 都不動，所以 sample 在任何失敗的一包之後，也要在下一次實際送件前自行再清一次。</li>
+</ul>
+
+<h2>失敗語義與延遲</h2>
+<ul>
+<li>執行失敗或加速器輸出非有限時為 fail-closed：當拍自己的頻譜貢獻歸零，不是直通。<code>pcm_out</code> 仍可能有非零樣本，因為 overlap-add 會加上前一包已提交的結果。失敗那一批 N 個 frame 的頻譜全為零：失敗那包的最後一個 hop 只剩前一個 frame 的 overlap（半個窗），下一包的前 N − 1 個 hop 恰為零，下一包的最後一個 hop 又只有半個窗，再往後恢復正常；N=1 時受影響的是失敗的 hop 與下一個 hop，各只有半個窗。</li>
+<li>N&gt;1 時第一包開頭的 <code>(N − 1) × 模型 hop</code> 個樣本依設計為零。</li>
+<li><code>trim_samples</code> = <code>N × 模型 hop</code>（含 stream 自己的一個 STFT／ISTFT hop），三個家族相同；<code>queue_frames</code> = <code>N − 1</code> 個 frame（模型佇列單獨保存的部分）。</li>
+<li>檔案尾端：最後一包補成完整 <code>hop_in</code>，再送 <code>info.tail_zero_blocks</code>（恆為 1）包全零，輸出去掉 <code>info.trim_samples</code> 個樣本，保留輸入長度。</li>
+</ul>
+<p>有自己合成器的應用可用 <code>aiaec_*_spec</code>（PCM 進、頻譜出）或 <code>aiaec_*_freq</code>（頻譜進、頻譜出）家族；邊界與 <code>AiaecInfo</code> 相同，延遲與尾端規則見 <a href="../../../../stream/aiaec/aiaec.h">aiaec.h</a> 的 "Tail" 一節。<code>AC_OLA_ACCUMULATE</code> 的 <code>ac_istft_flush()</code> 回 0，外部 ISTFT 要照常推全零頻譜。</p>
+
+<h2>驗證狀態</h2>
+<p>目前所有驗證都在主機上：SDK 替身加速器（<code>stream/aiaec/tests</code>）與隨機權重的 ONNX。沒有正式量化 graph 的符合性驗證，沒有廠商 SDK 建置，沒有板端執行。</p>
+<table>
+<thead><tr><th>組態</th><th>主機替身</th><th>ONNX Runtime</th><th>正式 bin</th><th>板端</th></tr></thead>
+<tbody>
+<tr><th>16k／512／N=1</th><td>正式登錄表與測試登錄表都已測</td><td>已驗：匯出圖與 PyTorch 逐項比對（隨機權重）；未經 C 家族逐包執行</td><td>有登錄路徑；交付與符合性未驗</td><td>未驗</td></tr>
+<tr><th>16k／256／N=1</th><td>僅測試登錄表</td><td>已驗：匯出圖在 ONNX Runtime 逐包串流，與 N=8 的輸出一致（隨機權重）；未經 C 家族逐包執行</td><td>無 graph，init 拒絕</td><td>未驗</td></tr>
+<tr><th>16k／256／N=8</th><td>僅測試登錄表</td><td>同上（N=8 封包圖，每包一次呼叫）</td><td>無 graph，init 拒絕</td><td>未驗</td></tr>
+<tr><th>16k／512／N=8</th><td>不存在，init 拒絕</td><td>不適用</td><td>不適用</td><td>不適用</td></tr>
+</tbody></table>
+<ul>
+<li><b>work 對匯出圖</b>（不跑推論）：<code>AIAEC/tests/test_aiaec_bind_info_pin.py</code> 以隨機權重匯出 16k／256 N=1、N=8 與 16k／512 N=1，依位置比對三個家族真實 <code>aiaec_preprocess*()</code> 給出的 <code>AiaecWork</code>（mic、far 與 CCM taps 的 shape 與元素數）和匯出圖的訊號輸入、head 輸出，並檢查匯出器的 ONNX 名稱順序符合上述規則（訊號輸入在前、state 在後；head 在前、state 輸出 = 輸入名稱加 <code>_out</code>、state 兩端同 shape）。函式庫不保存 state 的 shape；模型設定各列（<code>ai3_model_io_deepvqes.h</code>）同一個測試用 <code>make -C stream/aiaec model-io-dumper</code> 傾印，逐列比對全新匯出的圖（layout 版本、埠數與順序、各輸入輸出 shape、state 名稱與順序、兩端同 shape），列集合恰為匯出的案例；C 端的列對 <code>AiaecWork</code> 由 <code>test-aiaec-model-io</code> 檢查。</li>
+<li><b>ONNX Runtime</b>：<code>AIAEC/tests/test_deepvqe_frames_per_call.py</code> 匯出 16k／512 的 N=1、2、4，驗 state 就地契約並以 ONNX Runtime 對 PyTorch 驗證；<code>test_deepvqe_inference_frames_per_call.py</code> 在 16k／256 匯出 N=1 與 N=8 兩張圖，在 ONNX Runtime 串流同一段輸入，CCM taps 最大差小於 5e-5，加速器呼叫數分別為 hop 數與 hop 數除以 8 進位。兩者都不經 C 的 <code>aiaec_*</code> 家族。</li>
+</ul>
 
 <h2>參考</h2>
 <ul>
 <li><a href="reference/core.html">頻域整合、模型張量與狀態</a></li>
-<li><a href="../../../../stream/aiaec/deepvqe_s/deepvqe_stream.h">PCM SDK 公開標頭</a></li>
+<li><a href="../../../../stream/aiaec/aiaec.h">客戶介面標頭 aiaec.h</a></li>
+<li><a href="../../../../stream/aiaec/deepvqe_s/deepvqe_stream.h">較低階的 PCM SDK 標頭</a></li>
 <li><a href="../../../../AIAEC/DeepVQE_S/README.md">訓練與匯出</a></li>
 </ul>
 </main>
