@@ -1,6 +1,6 @@
 /* The call-flow examples of pipelines/reference/call-flow.md, compiled and run.
  *
- * Each function below is the code the README shows for one question: chaining
+ * Each function below is the code call-flow.md shows for one question: chaining
  * a new frequency-domain stage behind the AEC, finishing the hop, the memory a
  * stage needs, and running a neural stage on an accelerator. The checks make
  * the examples tests: the chained mono composition with a unity stage is
@@ -14,7 +14,6 @@
 #include <string.h>
 
 #include "aec.h"
-#include "aec_res.h"           /* aec_cng_fill */
 #include "anr.h"
 #include "dfn/dfn_hop.h"
 #include "ulcnet/ulcnet_nn_stage.h"
@@ -36,24 +35,21 @@ static float lcg(void) {
     return ((float)(int)(g_lcg >> 9) / 4194304.0f - 1.0f) * 0.25f;
 }
 
-#define CNG_NR_GAIN_FLOOR 0.31622777f
 #define PSD_SCALE_INV (1.0f / (32768.0f * 32768.0f))   /* int16^2 -> audio scale, exact */
 
 /* The mono lane every example below starts from: the grid (fft_size 0: the rate's default) and
- * the linear stage keeping its own gain in the context. */
+ * the AEC keeping its own gain in the residual view (AEC_RESIDUAL_FULL). */
 static int derive_mono_lane(int sample_rate, int fft_size, AecSignalGrid* grid,
                             AecConfig* aec_cfg) {
-    if (!aec_resolve_signal_grid(sample_rate,
-                                 fft_size ? fft_size : aec_default_fft_size(sample_rate), grid))
+    if (aec_resolve_signal_grid(sample_rate,
+                                 fft_size ? fft_size : aec_default_fft_size(sample_rate), grid) != AEC_OK)
         return -1;
     aec_config_from_level(aec_cfg, AEC_LEVEL_BALANCED, sample_rate);
     aec_cfg->fft_size = grid->fft_size;
     aec_cfg->delay_mode = AEC_DELAY_MATCHED;
     aec_cfg->delay_num_filters = DA_NUM_FILTERS;
     aec_cfg->fixed_delay_samples = -1;
-    aec_cfg->enable_delay_est = 1;
-    aec_cfg->enable_res = 0;
-    aec_cfg->return_res_context = 1;
+    aec_cfg->residual = AEC_RESIDUAL_FULL;
     return 0;
 }
 
@@ -88,52 +84,45 @@ static const float* hf_tilt_gain(HfTilt* s, int n_freqs) {
 
 /* One hop: the AEC, then the stages written out in the order the product
  * applies them -- the denoiser, the AEC's own residual gain, the new stage --
- * min of the gains, apply, comfort noise, synthesis. Each stage is its own
+ * the extra gain handed to aec_apply_gain / aec_apply_cng, comfort noise, synthesis. Each stage is its own
  * library object in the caller's pool. */
 typedef struct Chain {
     Aec* aec;
     AnrDenoiser* nr;
     AcIstft* istft;
     HfTilt* tilt;
-    float *g_nr_scratch, *g_min, *g_total;   /* n_freqs floats each */
+    float *g_nr_scratch, *g_extra;           /* n_freqs floats each */
     Complex* spec;                           /* n_freqs bins */
-    uint32_t rng;
     uint32_t reset_serial;                   /* the aec_post_reset_serial() value already handled */
     int n_freqs;
 } Chain;
 
 static int chain_hop(Chain* c, const float* mic, const float* ref, float* out) {
-    AecResContext f;
-    AecOutputBase base;
-    const float* extra = NULL;
+    AecResidualView f;
+    const float* residual_psd_audio = NULL;
     const float* nr_gain;
     const float* tilt;
     uint32_t serial;
-    aec_process_context(c->aec, mic, ref);
-    aec_get_res_context(c->aec, &f);
-    if (!f.error_spec) return -1;
-    memset(&base, 0, sizeof(base));
-    base.struct_size = sizeof(base);
-    if (aec_get_output_base(c->aec, &base) != 0) return -1;   /* the spectrum the gains are applied to */
+    if (aec_process_linear(c->aec, mic, ref) != AEC_OK) return -1;
+    if (aec_process_residual(c->aec, NULL) != AEC_OK) return -1;
+    memset(&f, 0, sizeof(f));
+    f.struct_size = sizeof(f);
+    if (aec_get_residual(c->aec, &f) != AEC_OK) return -1;   /* f.base_spec: the spectrum the gains are applied to */
     serial = aec_post_reset_serial(c->aec);
-    if (serial != c->reset_serial) {        /* hard post-chain reset inside this hop: before the CNG draw and the push */
+    if (serial != c->reset_serial) {        /* hard post-chain reset inside this hop: before the push */
         c->reset_serial = serial;
         ac_istft_reset(c->istft);
-        c->rng = AEC_CNG_SEED;
     }
     if (f.r2 && f.usable_linear) {         /* residual-echo powers into the noise floor */
         sk_scale_f32(c->g_nr_scratch, f.r2, PSD_SCALE_INV, f.n_freqs);
-        extra = c->g_nr_scratch;
+        residual_psd_audio = c->g_nr_scratch;
     }
-    if (anr_process_gain(c->nr, base.base_spec, extra, NULL) != 0) return -1;
-    nr_gain = anr_get_gain(c->nr, NULL);
+    nr_gain = anr_process_gain_with_residual_psd(c->nr, f.base_spec, residual_psd_audio);
     if (!nr_gain) return -1;
     tilt = hf_tilt_gain(c->tilt, f.n_freqs);
-    sk_min_f32(c->g_min, nr_gain, f.res_gain, f.n_freqs);
-    sk_min_f32(c->g_total, c->g_min, tilt, f.n_freqs);
-    sk_capply_gain_f32(c->spec, base.base_spec, c->g_total, f.n_freqs);
-    aec_cng_fill(&c->rng, c->spec, f.comfort_noise, f.res_gain, nr_gain,
-                 CNG_NR_GAIN_FLOOR, f.n_freqs);
+    sk_min_f32(c->g_extra, nr_gain, tilt, f.n_freqs);        /* every stage but the AEC's own gain */
+    if (aec_apply_gain(c->aec, c->g_extra, c->spec) != AEC_OK) return -1;
+    if (aec_apply_cng(c->aec, c->g_extra, c->spec) != AEC_OK) return -1;
     (void)ac_istft_push(c->istft, c->spec, out);
     return 0;
 }
@@ -164,12 +153,11 @@ static size_t chain_build(Chain* c, void* mem, size_t bytes, const AecSignalGrid
     nr_b = anr_get_mem_size(&nc);
     synth_b = ac_istft_get_mem_size(&sc);
     vec = ALIGN16((size_t)n * sizeof(float));
-    used = ALIGN16(aec_b) + ALIGN16(nr_b) + ALIGN16(synth_b) + hf_tilt_mem_size(n) + 3 * vec +
+    used = ALIGN16(aec_b) + ALIGN16(nr_b) + ALIGN16(synth_b) + hf_tilt_mem_size(n) + 2 * vec +
            ALIGN16((size_t)n * sizeof(Complex));
     if (bytes < used) return 0;
     memset(c, 0, sizeof(*c));
     c->n_freqs = n;
-    c->rng = AEC_CNG_SEED;
     c->aec = aec_init(cur, aec_b, aec_cfg);            cur += ALIGN16(aec_b);
     c->reset_serial = c->aec ? aec_post_reset_serial(c->aec) : 0u;
     c->nr = anr_init(cur, nr_b, &nc);                  cur += ALIGN16(nr_b);
@@ -179,8 +167,7 @@ static size_t chain_build(Chain* c, void* mem, size_t bytes, const AecSignalGrid
     cur += ALIGN16(synth_b);
     c->tilt = hf_tilt_init(cur, n, bin_hi, amount);    cur += hf_tilt_mem_size(n);
     c->g_nr_scratch = (float*)cur;                     cur += vec;
-    c->g_min = (float*)cur;                            cur += vec;
-    c->g_total = (float*)cur;                          cur += vec;
+    c->g_extra = (float*)cur;                          cur += vec;
     c->spec = (Complex*)cur;
     return c->aec && c->nr && c->istft ? used : 0;
 }
@@ -193,7 +180,7 @@ static size_t chain_bytes(const AecSignalGrid* grid, const AecConfig* aec_cfg, i
     sc.window = k_sizing_window;   /* borrowed, as chain_build() */
     return ALIGN16(aec_get_mem_size(aec_cfg)) + ALIGN16(anr_get_mem_size(&nc)) +
            ALIGN16(ac_istft_get_mem_size(&sc)) + hf_tilt_mem_size(n) +
-           3 * ALIGN16((size_t)n * sizeof(float)) + ALIGN16((size_t)n * sizeof(Complex));
+           2 * ALIGN16((size_t)n * sizeof(float)) + ALIGN16((size_t)n * sizeof(Complex));
 }
 
 static void example_chain_new_stage(void) {
@@ -269,13 +256,11 @@ static int npu_callback(void* user, const DFN2PrepostInputs* in, DFN2PrepostOutp
 
 static float g_erb_fwd[DFN2_N_BINS * DFN2_N_ERB], g_erb_inv[DFN2_N_ERB * DFN2_N_BINS];
 
-/* One DFN2 host: the AEC (its own RES gain), P = E * min(1, G_res) without denoiser or comfort
- * noise (E and P must share a phase), and the rate bridge with its DfnHop. */
+/* One DFN2 host: the AEC (its own RES gain), P = B * G_res without denoiser or comfort
+ * noise (B and P must share a phase), and the rate bridge with its DfnHop. */
 typedef struct DfnHost {
     Aec* aec;
-    float *unity, *total;
     Complex* post;
-    int n_freqs;
     DfnRateBridge* bridge;
     DfnHop hop;
     uint8_t* mem;
@@ -286,27 +271,21 @@ static int dfn_host_build(DfnHost* d, const DFN2Model* model) {
     AecConfig aec_cfg;
     DfnRateBridgeConfig bc = dfn_rate_bridge_default_config(16000, dfn_test_grid());
     DfnRateBridgeMemReq breq;
-    size_t aec_b, vec, cvec;
+    size_t aec_b, cvec;
     uint8_t* cur;
-    int k;
     memset(d, 0, sizeof(*d));
     if (derive_mono_lane(16000, 0, &grid, &aec_cfg) != 0) return -1;
     bc.stage.erb_fwd = g_erb_fwd;
     bc.stage.erb_inv = g_erb_inv;
     bc.stage.model = *model;
     aec_b = aec_get_mem_size(&aec_cfg);
-    vec = ALIGN16((size_t)grid.n_freqs * sizeof(float));
     cvec = ALIGN16((size_t)grid.n_freqs * sizeof(Complex));
     if (dfn_rate_bridge_get_mem_requirements(&bc, &breq) != 0) return -1;
-    if (posix_memalign((void**)&d->mem, 16, ALIGN16(aec_b) + 2 * vec + cvec + (size_t)breq.bytes) != 0)
+    if (posix_memalign((void**)&d->mem, 16, ALIGN16(aec_b) + cvec + (size_t)breq.bytes) != 0)
         return -1;
     cur = d->mem;
     d->aec = aec_init(cur, aec_b, &aec_cfg);  cur += ALIGN16(aec_b);
-    d->unity = (float*)cur;                    cur += vec;
-    d->total = (float*)cur;                    cur += vec;
     d->post = (Complex*)cur;                   cur += cvec;
-    d->n_freqs = grid.n_freqs;
-    for (k = 0; k < d->n_freqs; ++k) d->unity[k] = 1.0f;
     d->bridge = dfn_rate_bridge_init(cur, (size_t)breq.bytes, &bc);
     if (!d->aec || !d->bridge) return -1;
     dfn_hop_init_bridge(&d->hop, d->bridge);
@@ -319,19 +298,16 @@ static void dfn_host_free(DfnHost* d) {
     free(d->mem);
 }
 
-/* AEC, RES gain, P; the DFN hop begins on (E, P). */
+/* AEC, RES gain, P; the DFN hop begins on (B, P). */
 static int dfn_host_begin(DfnHost* d, const float* mic, const float* ref) {
-    AecResContext f;
-    AecOutputBase base;
-    aec_process_context(d->aec, mic, ref);
-    aec_get_res_context(d->aec, &f);
-    if (!f.error_spec || !f.res_gain) return -1;
-    memset(&base, 0, sizeof(base));
-    base.struct_size = sizeof(base);
-    if (aec_get_output_base(d->aec, &base) != 0) return -1;
-    sk_min_f32(d->total, d->unity, f.res_gain, d->n_freqs);
-    sk_capply_gain_f32(d->post, base.base_spec, d->total, d->n_freqs);
-    return dfn_hop_begin(&d->hop, base.base_spec, d->post) == 0 ? 0 : -1;
+    AecResidualView f;
+    if (aec_process_linear(d->aec, mic, ref) != AEC_OK) return -1;
+    if (aec_process_residual(d->aec, NULL) != AEC_OK) return -1;
+    memset(&f, 0, sizeof(f));
+    f.struct_size = sizeof(f);
+    if (aec_get_residual(d->aec, &f) != AEC_OK) return -1;
+    if (aec_apply_gain(d->aec, NULL, d->post) != AEC_OK) return -1;
+    return dfn_hop_begin(&d->hop, f.base_spec, d->post) == 0 ? 0 : -1;
 }
 
 static void example_dfn_phased(void) {
@@ -378,7 +354,7 @@ static void example_dfn_phased(void) {
 /* The shipped Align-ULCNet grid (hop 256) and its export delay depth: the grid the stage, the lane and the
  * model descriptor below are built for. */
 static const UlcnetGridSpec k_ulcnet_spec = { .sample_rate = 16000, .n_fft = 512, .delay_depth = 8 };
-enum { ULC_HOP_MAX = 256 };
+enum { ULC_HOP_MAX = 256, BINS_MAX_ULC = 257 };
 static UlcnetGrid g_ulc_grid;
 
 static int half_infer(void* user, const float* er, const float* ei, const float* fr,
@@ -400,28 +376,43 @@ static int run_ulcnet_npu(const UlcnetNnJob* job) {
 typedef struct UlcHost {
     Aec* aec;
     UlcnetNnStage* stage;
+    AcStft *far_stft, *err_stft;    /* the application's analyses and synthesis */
+    AcIstft* istft;
+    Complex far_spec[BINS_MAX_ULC], err_spec[BINS_MAX_ULC], out_spec[BINS_MAX_ULC];
     uint8_t* mem;
 } UlcHost;
 
 static int ulc_host_build(UlcHost* u, const UlcnetModel* model) {
     AecConfig aec_cfg;
-    size_t aec_b, stage_b = ulcnet_nn_stage_mem_size(&g_ulc_grid, 1);
+    AcStftConfig sc;
+    size_t aec_b, stage_b = ulcnet_nn_stage_mem_size(&g_ulc_grid), stft_b, istft_b;
+    uint8_t* cur;
     memset(u, 0, sizeof(*u));
-    /* the stage's grid; the lane returns the linear context only */
+    ac_stft_config_default(&sc, g_ulc_grid.n_fft);
+    sc.ola = AC_OLA_ACCUMULATE;
+    stft_b = ac_stft_get_mem_size(&sc);
+    istft_b = ac_istft_get_mem_size(&sc);
+    /* the stage's grid; the lane keeps the state of the linear residual only */
     aec_config_from_level(&aec_cfg, AEC_LEVEL_BALANCED, g_ulc_grid.sample_rate);
     aec_cfg.fft_size = g_ulc_grid.n_fft;
     aec_cfg.delay_mode = AEC_DELAY_MATCHED;
     aec_cfg.delay_num_filters = DA_NUM_FILTERS;
     aec_cfg.fixed_delay_samples = -1;
-    aec_cfg.enable_delay_est = 1;
-    aec_cfg.enable_res = 0;
-    aec_cfg.return_res_context = 1;
-    aec_cfg.spatial_linear_context = AEC_CONTEXT_LINEAR_ONLY;
+    aec_cfg.residual = AEC_RESIDUAL_STATE;
     aec_b = aec_get_mem_size(&aec_cfg);
-    if (posix_memalign((void**)&u->mem, 16, ALIGN16(aec_b) + ALIGN16(stage_b)) != 0) return -1;
+    if (posix_memalign((void**)&u->mem, 16,
+                       ALIGN16(aec_b) + ALIGN16(stage_b) + 2 * ALIGN16(stft_b) + ALIGN16(istft_b)) != 0) return -1;
     u->aec = aec_init(u->mem, aec_b, &aec_cfg);
-    u->stage = ulcnet_nn_stage_init(u->mem + ALIGN16(aec_b), stage_b, &g_ulc_grid, 1);
-    if (!u->aec || !u->stage || ulcnet_nn_stage_set_model(u->stage, model) != 0) return -1;
+    cur = u->mem + ALIGN16(aec_b);
+    u->stage = ulcnet_nn_stage_init(cur, stage_b, &g_ulc_grid);
+    cur += ALIGN16(stage_b);
+    u->far_stft = ac_stft_init(cur, stft_b, &sc);
+    cur += ALIGN16(stft_b);
+    u->err_stft = ac_stft_init(cur, stft_b, &sc);
+    cur += ALIGN16(stft_b);
+    u->istft = ac_istft_init(cur, istft_b, &sc);
+    if (!u->aec || !u->stage || !u->far_stft || !u->err_stft || !u->istft ||
+        ulcnet_nn_stage_set_model(u->stage, model) != 0) return -1;
     return 0;
 }
 
@@ -430,17 +421,24 @@ static void ulc_host_free(UlcHost* u) {
     free(u->mem);
 }
 
-/* AEC, then the stage's begin: the lane's formed hop, the raw reference, the delay events. */
+/* AEC, then the application's analyses of the lane's formed hop and the raw reference, then the
+ * stage's begin_spec with the delay events. */
 static int ulc_host_begin(UlcHost* u, const float* mic, const float* ref) {
-    AecResContext rctx;
-    AecLinearContext lctx;
+    AecResidualView rv;
+    AecLinearView lv;
     UlcnetNnDelay delay;
-    aec_process_context(u->aec, mic, ref);
-    aec_get_res_context(u->aec, &rctx);
-    aec_get_linear_context(u->aec, &lctx);
-    delay.changed = lctx.delay_state == AEC_LINEAR_DELAY_CHANGED;
-    delay.solid = lctx.delay_state != AEC_LINEAR_DELAY_UNLOCKED;
-    return ulcnet_nn_stage_begin_time(u->stage, rctx.formed_hop, ref, delay);
+    if (aec_process_linear(u->aec, mic, ref) != AEC_OK) return -1;
+    if (aec_process_residual(u->aec, NULL) != AEC_OK) return -1;
+    memset(&rv, 0, sizeof(rv));
+    rv.struct_size = sizeof(rv);
+    memset(&lv, 0, sizeof(lv));
+    lv.struct_size = sizeof(lv);
+    if (aec_get_residual(u->aec, &rv) != AEC_OK || aec_get_linear(u->aec, &lv) != AEC_OK) return -1;
+    delay.changed = lv.delay_state == AEC_LINEAR_DELAY_CHANGED;
+    delay.solid = lv.delay_state != AEC_LINEAR_DELAY_UNLOCKED;
+    (void)ac_stft_push(u->err_stft, rv.formed_hop, u->err_spec);
+    (void)ac_stft_push(u->far_stft, ref, u->far_spec);
+    return ulcnet_nn_stage_begin_spec(u->stage, u->err_spec, u->far_spec, delay);
 }
 
 static void example_ulcnet_phased(void) {
@@ -467,19 +465,21 @@ static void example_ulcnet_phased(void) {
     for (h = 0; h < 60; ++h) {
         for (i = 0; i < hop; ++i) { ref[i] = lcg(); mic[i] = 0.3f * ref[i] + 0.05f * lcg(); }
 
-        ulc_host_begin(&p, mic, ref);                                /* AEC, both analyses        */
+        ulc_host_begin(&p, mic, ref);                                /* AEC, analyses, begin_spec */
         if (ulcnet_nn_stage_nn_begin(p.stage, &job) > 0) {           /* a frame to run            */
             ulcnet_nn_stage_nn_end(p.stage, run_ulcnet_npu(&job));   /* accept, or the identity   */
             ++ran;
         }
-        ulcnet_nn_stage_end(p.stage, out);                           /* WOLA, one hop             */
+        ulcnet_nn_stage_end_spec(p.stage, p.out_spec);               /* the output spectrum       */
+        ac_istft_push(p.istft, p.out_spec, out);                     /* the application's WOLA    */
 
         ulc_host_begin(&cb, mic, ref);
-        ulcnet_nn_stage_process(cb.stage, out_cb);                   /* the callback-driven hop   */
+        ulcnet_nn_stage_process(cb.stage, cb.out_spec);              /* the callback-driven hop   */
+        ac_istft_push(cb.istft, cb.out_spec, out_cb);
         if (memcmp(out, out_cb, (size_t)hop * sizeof(float)) != 0) identical = 0;
     }
     CHECK(ran > 0 && identical,
-          "readme/ulcnet: begin / nn_begin / nn_end / end equals the callback-driven hop");
+          "readme/ulcnet: begin_spec / nn_begin / nn_end / end_spec equals the callback-driven hop");
     ulc_host_free(&p);
     ulc_host_free(&cb);
 }

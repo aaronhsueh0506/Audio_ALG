@@ -1,13 +1,13 @@
-/** Implementation of mcab_sample_beam.h: SRP-PHAT + BF + fallback VAD between
- * mcab_process_front() and mcab_fuse(), with the arithmetic and the refusal/reset rules that
- * header documents. Sample code, not part of the mcab module. */
+/** Implementation of array_sample_beam.h: SRP-PHAT + BF + fallback VAD between
+ * aec_process_linear() and aec_process_residual(), with the arithmetic and the refusal/reset rules that
+ * header documents. Sample code. */
 
 #include <math.h>
 #include <stdint.h>
 #include <stdlib.h>
 #include <string.h>
 
-#include "mcab_sample_beam.h"
+#include "array_sample_beam.h"
 #include "anr_types.h"            /* anr_retime_alpha, anr_retime_frames */
 #include "spatial_simd.h"
 #include "utility/mem_align.h"
@@ -21,9 +21,9 @@
 #define DEFAULT_SPACING_M 0.035f
 #define DEFAULT_ANGLES    72
 
-struct McabSampleBeam {
-    McabSampleBeamParams params;
-    Mcab* flow;                   /* borrowed */
+struct ArraySampleBeam {
+    ArraySampleBeamParams params;
+    Aec* aec;                     /* borrowed */
     SRP* srp;
     BF* bf;
     int hop_size;
@@ -45,18 +45,18 @@ struct McabSampleBeam {
     int destroyed;
 };
 
-McabSampleBeamParams mcab_sample_beam_default_params(void) {
-    McabSampleBeamParams bp;
+ArraySampleBeamParams array_sample_beam_default_params(void) {
+    ArraySampleBeamParams bp;
     float radius = DEFAULT_RADIUS_M;
     int m;
     memset(&bp, 0, sizeof(bp));
-    bp.geometry = MCAB_SAMPLE_GEOMETRY_UCA;
+    bp.geometry = ARRAY_SAMPLE_GEOMETRY_UCA;
     bp.uca_radius_m = radius;
     bp.ula_spacing_m = DEFAULT_SPACING_M;
     /* float arithmetic for the CUSTOM defaults, double in fill_uca_geometry(): do not unify,
      * the outputs are pinned bit-exact. */
-    for (m = 0; m < MCAB_CHANNELS; ++m) {
-        float phi = 2.0f * M_PI_F * (float)m / (float)MCAB_CHANNELS;
+    for (m = 0; m < AEC_ARRAY_MICS; ++m) {
+        float phi = 2.0f * M_PI_F * (float)m / (float)AEC_ARRAY_MICS;
         bp.microphone_x_m[m] = radius * cosf(phi);
         bp.microphone_y_m[m] = radius * sinf(phi);
     }
@@ -83,11 +83,11 @@ McabSampleBeamParams mcab_sample_beam_default_params(void) {
 
 static int flag_valid(int v) { return v == 0 || v == 1; }
 
-static int params_valid(const McabSampleBeamParams* bp, int sample_rate) {
+static int params_valid(const ArraySampleBeamParams* bp, int sample_rate) {
     float nyquist = 0.5f * (float)sample_rate;
     int m;
-    if (bp->geometry != MCAB_SAMPLE_GEOMETRY_UCA && bp->geometry != MCAB_SAMPLE_GEOMETRY_ULA &&
-        bp->geometry != MCAB_SAMPLE_GEOMETRY_CUSTOM) return 0;
+    if (bp->geometry != ARRAY_SAMPLE_GEOMETRY_UCA && bp->geometry != ARRAY_SAMPLE_GEOMETRY_ULA &&
+        bp->geometry != ARRAY_SAMPLE_GEOMETRY_CUSTOM) return 0;
     if (bp->num_angles < 4 || bp->num_angles > 3600) return 0;
     if (!isfinite(bp->speed_of_sound_m_s) || bp->speed_of_sound_m_s <= 0.0f) return 0;
     if (!isfinite(bp->doa_low_freq_hz) || bp->doa_low_freq_hz < 0.0f ||
@@ -105,16 +105,16 @@ static int params_valid(const McabSampleBeamParams* bp, int sample_rate) {
         !isfinite(bp->bf_mu) || bp->bf_mu < 0.0f ||
         !flag_valid(bp->bf_fixed_mode) || !isfinite(bp->bf_fixed_doa_rad) ||
         !flag_valid(bp->bf_fixed_align_notebook) || bp->bf_adapt_interval <= 0 ||
-        bp->bf_adapt_interval > MCAB_SAMPLE_BEAM_MAX_ADAPT_INTERVAL) return 0;
+        bp->bf_adapt_interval > ARRAY_SAMPLE_BEAM_MAX_ADAPT_INTERVAL) return 0;
     if (!isfinite(bp->auto_vad_threshold_dbfs) ||
         !isfinite(bp->auto_vad_snr_ratio) || bp->auto_vad_snr_ratio < 1.0f ||
         bp->auto_vad_hangover_frames < 0) return 0;
-    if (bp->geometry == MCAB_SAMPLE_GEOMETRY_UCA &&
+    if (bp->geometry == ARRAY_SAMPLE_GEOMETRY_UCA &&
         (!isfinite(bp->uca_radius_m) || bp->uca_radius_m <= 0.0f)) return 0;
-    if (bp->geometry == MCAB_SAMPLE_GEOMETRY_ULA &&
+    if (bp->geometry == ARRAY_SAMPLE_GEOMETRY_ULA &&
         (!isfinite(bp->ula_spacing_m) || bp->ula_spacing_m <= 0.0f)) return 0;
-    if (bp->geometry == MCAB_SAMPLE_GEOMETRY_CUSTOM) {
-        for (m = 0; m < MCAB_CHANNELS; ++m) {
+    if (bp->geometry == ARRAY_SAMPLE_GEOMETRY_CUSTOM) {
+        for (m = 0; m < AEC_ARRAY_MICS; ++m) {
             if (!isfinite(bp->microphone_x_m[m]) || !isfinite(bp->microphone_y_m[m])) return 0;
         }
     }
@@ -122,7 +122,7 @@ static int params_valid(const McabSampleBeamParams* bp, int sample_rate) {
 }
 
 static void fill_uca_geometry(float radius, float* x, float* y) {
-    int M = MCAB_CHANNELS;
+    int M = AEC_ARRAY_MICS;
     int m;
     for (m = 0; m < M; m++) {
         float phi = 2.0f * M_PI * m / M;   /* double on purpose, see the default params */
@@ -132,7 +132,7 @@ static void fill_uca_geometry(float radius, float* x, float* y) {
 }
 
 static void fill_ula_geometry(float spacing, float* x, float* y) {
-    int M = MCAB_CHANNELS;
+    int M = AEC_ARRAY_MICS;
     float center = 0.5f * (M - 1);
     int m;
     for (m = 0; m < M; m++) {
@@ -141,33 +141,34 @@ static void fill_ula_geometry(float spacing, float* x, float* y) {
     }
 }
 
-int mcab_sample_spatial_config(const McabConfig* cfg, const McabSampleBeamParams* bp,
-                               McabSampleSpatialConfig* out) {
-    McabMemBreakdown grid;
+int array_sample_spatial_config(const AecConfig* cfg, const ArraySampleBeamParams* bp,
+                               ArraySampleSpatialConfig* out) {
+    AecSignalGrid grid;
     int hop, fft, n, m;
     int bf_effective_interval;
-    if (!out || !bp || mcab_get_mem_breakdown(cfg, &grid) != 0 ||
+    if (!out || !bp || !cfg || cfg->n_mics != AEC_ARRAY_MICS ||
+        aec_resolve_signal_grid(cfg->sample_rate, cfg->fft_size, &grid) != AEC_OK ||
         !params_valid(bp, cfg->sample_rate)) return -1;
     hop = grid.hop_size;
     fft = grid.fft_size;
     n = grid.n_freqs;
 
     memset(out, 0, sizeof(*out));
-    out->n_channels = MCAB_CHANNELS;
+    out->n_channels = AEC_ARRAY_MICS;
     out->n_freqs = n;
     out->num_angles = bp->num_angles;
     switch (bp->geometry) {
-        case MCAB_SAMPLE_GEOMETRY_UCA: fill_uca_geometry(bp->uca_radius_m, out->mic_x, out->mic_y); break;
-        case MCAB_SAMPLE_GEOMETRY_ULA: fill_ula_geometry(bp->ula_spacing_m, out->mic_x, out->mic_y); break;
+        case ARRAY_SAMPLE_GEOMETRY_UCA: fill_uca_geometry(bp->uca_radius_m, out->mic_x, out->mic_y); break;
+        case ARRAY_SAMPLE_GEOMETRY_ULA: fill_ula_geometry(bp->ula_spacing_m, out->mic_x, out->mic_y); break;
         default:
-            for (m = 0; m < MCAB_CHANNELS; ++m) {
+            for (m = 0; m < AEC_ARRAY_MICS; ++m) {
                 out->mic_x[m] = bp->microphone_x_m[m];
                 out->mic_y[m] = bp->microphone_y_m[m];
             }
             break;
     }
 
-    out->srp.M = MCAB_CHANNELS;
+    out->srp.M = AEC_ARRAY_MICS;
     out->srp.F = n;
     out->srp.num_angles = bp->num_angles;
     out->srp.sr = (float)cfg->sample_rate;
@@ -202,29 +203,29 @@ int mcab_sample_spatial_config(const McabConfig* cfg, const McabSampleBeamParams
 }
 
 typedef struct HelperLayout {
-    McabSampleSpatialConfig sc;
+    ArraySampleSpatialConfig sc;
     size_t srp_bytes;
     size_t bf_bytes;
     size_t total;
 } HelperLayout;
 
-static int helper_layout(const McabConfig* cfg, const McabSampleBeamParams* bp, HelperLayout* l) {
+static int helper_layout(const AecConfig* cfg, const ArraySampleBeamParams* bp, HelperLayout* l) {
     size_t total;
-    if (mcab_sample_spatial_config(cfg, bp, &l->sc) != 0) return 0;
+    if (array_sample_spatial_config(cfg, bp, &l->sc) != 0) return 0;
     l->srp_bytes = srp_get_mem_size(&l->sc.srp);
     l->bf_bytes = bf_get_mem_size(l->sc.n_channels, l->sc.n_freqs);
     if (l->srp_bytes == 0 || l->bf_bytes == 0) return 0;
-    total = ck_align16_size(sizeof(McabSampleBeam));
+    total = ck_align16_size(sizeof(ArraySampleBeam));
     total = ck_add_size(total, ck_align16_size(l->srp_bytes));
     total = ck_add_size(total, ck_align16_size(l->bf_bytes));
     total = ck_field_size(total, (size_t)l->sc.n_freqs, sizeof(Complex));
-    total = ck_field_size(total, (size_t)MCAB_CHANNELS * (size_t)l->sc.n_freqs, sizeof(Complex));
+    total = ck_field_size(total, (size_t)AEC_ARRAY_MICS * (size_t)l->sc.n_freqs, sizeof(Complex));
     if (MEM_SIZE_INVALID(total)) return 0;
     l->total = total;
     return 1;
 }
 
-int mcab_sample_beam_get_mem_size(const McabConfig* cfg, const McabSampleBeamParams* bp,
+int array_sample_beam_get_mem_size(const AecConfig* cfg, const ArraySampleBeamParams* bp,
                                   size_t* bytes) {
     HelperLayout l;
     if (!bytes || !cfg || !bp || !helper_layout(cfg, bp, &l)) return -1;
@@ -242,25 +243,23 @@ static void* take(uint8_t** cursor, size_t* remaining, size_t bytes) {
     return out;
 }
 
-McabSampleBeam* mcab_sample_beam_init(void* mem, size_t bytes, const McabConfig* cfg,
-                                      const McabSampleBeamParams* bp, Mcab* flow) {
+ArraySampleBeam* array_sample_beam_init(void* mem, size_t bytes, const AecConfig* cfg,
+                                      const ArraySampleBeamParams* bp, Aec* aec) {
     HelperLayout l;
-    McabSampleBeam* b;
+    ArraySampleBeam* b;
     ArrayGeometry geom;
     uint8_t* cursor;
     size_t remaining;
     void* region;
     int hop;
-    if (!mem || !cfg || !bp || !flow || !MEM_IS_ALIGNED16(mem) || !helper_layout(cfg, bp, &l) ||
+    if (!mem || !cfg || !bp || !aec || !MEM_IS_ALIGNED16(mem) || !helper_layout(cfg, bp, &l) ||
         bytes < l.total) return NULL;
     hop = l.sc.n_freqs - 1;   /* 50 % overlap: n_freqs = hop + 1 */
-    if (mcab_n_freqs(flow) != l.sc.n_freqs || mcab_hop_size(flow) != hop ||
-        mcab_sample_rate(flow) != cfg->sample_rate ||
-        mcab_enable_post(flow) != cfg->enable_post) return NULL;
+    if (aec_hop_size(aec) != hop || aec_array_linear_aec_count(aec) != AEC_ARRAY_MICS) return NULL;
     memset(mem, 0, l.total);
-    b = (McabSampleBeam*)mem;
+    b = (ArraySampleBeam*)mem;
     b->params = *bp;
-    b->flow = flow;
+    b->aec = aec;
     b->hop_size = hop;
     b->n_freqs = l.sc.n_freqs;
     cursor = (uint8_t*)mem + ck_align16_size(sizeof(*b));
@@ -279,7 +278,7 @@ McabSampleBeam* mcab_sample_beam_init(void* mem, size_t bytes, const McabConfig*
         return NULL;
     b->bf_spectrum = (Complex*)take(&cursor, &remaining, (size_t)b->n_freqs * sizeof(Complex));
     b->bf_weights = (Complex*)take(
-        &cursor, &remaining, (size_t)MCAB_CHANNELS * (size_t)b->n_freqs * sizeof(Complex));
+        &cursor, &remaining, (size_t)AEC_ARRAY_MICS * (size_t)b->n_freqs * sizeof(Complex));
     if (!b->bf_spectrum || !b->bf_weights || remaining != 0) return NULL;
 
     /* Hangover and the noise-EMA pairs are retimed to the grid like bf_lambda; keep and new
@@ -294,16 +293,16 @@ McabSampleBeam* mcab_sample_beam_init(void* mem, size_t bytes, const McabConfig*
     return b;
 }
 
-void mcab_sample_beam_destroy(McabSampleBeam* b) {
+void array_sample_beam_destroy(ArraySampleBeam* b) {
     if (!b || b->destroyed) return;
     bf_destroy(b->bf);
     srp_destroy(b->srp);
     b->destroyed = 1;
 }
 
-void mcab_sample_beam_reset(McabSampleBeam* b) {
+void array_sample_beam_reset(ArraySampleBeam* b) {
     if (!b || b->destroyed) return;
-    mcab_reset(b->flow);
+    aec_reset(b->aec);
     srp_reset(b->srp);
     bf_reset(b->bf);
     b->phase = 0;
@@ -313,19 +312,24 @@ void mcab_sample_beam_reset(McabSampleBeam* b) {
     b->frame_index = 0;
 }
 
-int mcab_sample_beam_process_front(McabSampleBeam* b, const float* microphones_interleaved,
-                                   const float* far_reference, McabFront* out) {
+int array_sample_beam_process_front(ArraySampleBeam* b, const float* microphones_interleaved,
+                                   const float* far_reference, AecArrayView* out) {
     int status;
     if (!b || b->destroyed || !microphones_interleaved || !far_reference || !out)
-        return MCAB_INVALID_ARGUMENT;
-    status = mcab_process_front(b->flow, microphones_interleaved, far_reference, out);
-    /* The flow dropped its front on any refusal, so no beam or fuse may follow. */
-    b->phase = status == MCAB_OK ? 1 : 0;
+        return AEC_ERR_ARG;
+    status = aec_process_linear(b->aec, microphones_interleaved, far_reference);
+    if (status == AEC_OK) {
+        memset(out, 0, sizeof(*out));
+        out->struct_size = sizeof(*out);
+        status = aec_get_array(b->aec, out);
+    }
+    /* Any refusal drops the pending hop, so no beam or fuse may follow. */
+    b->phase = status == AEC_OK ? 1 : 0;
     return status;
 }
 
-static void fill_info(McabSampleBeam* b, const McabFront* front, int vad_raw, int vad_out,
-                      McabSampleBeamInfo* info) {
+static void fill_info(ArraySampleBeam* b, const AecArrayView* front, int vad_raw, int vad_out,
+                      ArraySampleBeamInfo* info) {
     if (!info) return;
     info->frame_index = b->frame_index;
     info->delay = front->delay;
@@ -335,23 +339,22 @@ static void fill_info(McabSampleBeam* b, const McabFront* front, int vad_raw, in
     info->vad_raw = vad_raw;
     info->vad_out = vad_out;
     info->bf_adaptive = bf_get_adaptive(b->bf);
-    info->doa_analysis_frames = 1;
 }
 
-int mcab_sample_beam_process_beam(McabSampleBeam* b, const McabFront* front, int vad_raw,
+int array_sample_beam_process_beam(ArraySampleBeam* b, const AecArrayView* front, int vad_raw,
                                   int vad_out, const int* frequency_mask,
-                                  McabSampleBeamResult* beam, McabSampleBeamInfo* info) {
+                                  ArraySampleBeamResult* beam, ArraySampleBeamInfo* info) {
     int m;
     if (!b || b->destroyed || !front || !beam || !flag_valid(vad_raw) ||
         !flag_valid(vad_out) || front->n_freqs != b->n_freqs)
-        return MCAB_INVALID_ARGUMENT;
-    for (m = 0; m < MCAB_CHANNELS; ++m)
-        if (!front->linear_spectra[m]) return MCAB_INVALID_ARGUMENT;
-    if (b->phase != 1) return MCAB_SEQUENCE_ERROR;
+        return AEC_ERR_ARG;
+    for (m = 0; m < AEC_ARRAY_MICS; ++m)
+        if (!front->lane_error_spec[m]) return AEC_ERR_ARG;
+    if (b->phase != 1) return AEC_ERR_SEQUENCE;
 
     /* SRP/BF only read the lanes' live spectra, so no copy. */
-    doa_step(b->srp, front->linear_spectra, frequency_mask, vad_raw, vad_out);
-    bf_process_with_weights(b->bf, front->linear_spectra, doa_get_smooth(b->srp),
+    doa_step(b->srp, front->lane_error_spec, frequency_mask, vad_raw, vad_out);
+    bf_process_with_weights(b->bf, front->lane_error_spec, doa_get_smooth(b->srp),
                             vad_out ? 0 : 1, frequency_mask, b->bf_spectrum, b->bf_weights);
 
     beam->spectrum = b->bf_spectrum;
@@ -359,21 +362,21 @@ int mcab_sample_beam_process_beam(McabSampleBeam* b, const McabFront* front, int
     fill_info(b, front, vad_raw, vad_out, info);
     b->frame_index += 1;
     b->phase = 2;
-    return MCAB_OK;
+    return AEC_OK;
 }
 
-int mcab_sample_beam_process_with_activity(McabSampleBeam* b, const float* microphones_interleaved,
+int array_sample_beam_process_with_activity(ArraySampleBeam* b, const float* microphones_interleaved,
                                            const float* far_reference, int vad_raw, int vad_out,
-                                           const int* frequency_mask, McabSampleBeamResult* beam,
-                                           McabSampleBeamInfo* info) {
-    McabFront front;
+                                           const int* frequency_mask, ArraySampleBeamResult* beam,
+                                           ArraySampleBeamInfo* info) {
+    AecArrayView front;
     int status;
     if (!b || b->destroyed || !microphones_interleaved || !far_reference || !beam ||
         !flag_valid(vad_raw) || !flag_valid(vad_out))
-        return MCAB_INVALID_ARGUMENT;
-    status = mcab_sample_beam_process_front(b, microphones_interleaved, far_reference, &front);
-    if (status != MCAB_OK) return status;
-    return mcab_sample_beam_process_beam(b, &front, vad_raw, vad_out, frequency_mask, beam, info);
+        return AEC_ERR_ARG;
+    status = array_sample_beam_process_front(b, microphones_interleaved, far_reference, &front);
+    if (status != AEC_OK) return status;
+    return array_sample_beam_process_beam(b, &front, vad_raw, vad_out, frequency_mask, beam, info);
 }
 
 static int floats_finite(const float* values, size_t count) {
@@ -385,12 +388,12 @@ static int floats_finite(const float* values, size_t count) {
     return 1;
 }
 
-static int auto_vad(McabSampleBeam* b, const float* microphones_interleaved) {
+static int auto_vad(ArraySampleBeam* b, const float* microphones_interleaved) {
     float sum = 0.0f;
     float power;
     float threshold = b->vad_power_threshold;
     int speech;
-    size_t count = (size_t)b->hop_size * MCAB_CHANNELS;
+    size_t count = (size_t)b->hop_size * AEC_ARRAY_MICS;
 
     for (size_t i = 0; i < count; ++i) {
         float value = microphones_interleaved[i];
@@ -418,39 +421,46 @@ static int auto_vad(McabSampleBeam* b, const float* microphones_interleaved) {
     return speech;
 }
 
-int mcab_sample_beam_process(McabSampleBeam* b, const float* microphones_interleaved,
-                             const float* far_reference, McabSampleBeamResult* beam,
-                             McabSampleBeamInfo* info) {
+int array_sample_beam_process(ArraySampleBeam* b, const float* microphones_interleaved,
+                             const float* far_reference, ArraySampleBeamResult* beam,
+                             ArraySampleBeamInfo* info) {
     int speech;
     if (!b || b->destroyed || !microphones_interleaved || !far_reference || !beam)
-        return MCAB_INVALID_ARGUMENT;
+        return AEC_ERR_ARG;
     /* auto_vad() reads only the microphones: refuse a non-finite far before it moves. */
-    if (!floats_finite(far_reference, (size_t)b->hop_size)) return MCAB_INVALID_ARGUMENT;
+    if (!floats_finite(far_reference, (size_t)b->hop_size)) return AEC_ERR_ARG;
     speech = auto_vad(b, microphones_interleaved);
-    return mcab_sample_beam_process_with_activity(b, microphones_interleaved, far_reference,
+    return array_sample_beam_process_with_activity(b, microphones_interleaved, far_reference,
                                                   speech, speech, NULL, beam, info);
 }
 
-int mcab_sample_beam_fuse(McabSampleBeam* b, McabFrame* frame) {
+int array_sample_beam_fuse(ArraySampleBeam* b, AecResidualView* frame) {
+    AecBeam beam;
     int status;
-    /* The flow's own setting decides: a helper config that disagrees cannot turn the flow's
-     * plain refusal into a reset. */
-    if (!b || b->destroyed || !frame || mcab_enable_post(b->flow) != 1) return MCAB_INVALID_ARGUMENT;
-    if (b->phase != 2) return MCAB_SEQUENCE_ERROR;
+    if (!b || b->destroyed || !frame) return AEC_ERR_ARG;
+    if (b->phase != 2) return AEC_ERR_SEQUENCE;
     /* Spectrum and weights come from one bf_process_with_weights() call. A refusal of what this
-     * helper computed takes everything down, not only the flow; a sequence refusal changed
-     * nothing. */
-    status = mcab_fuse(b->flow, b->bf_weights, b->bf_spectrum, frame);
-    if (status != MCAB_OK && status != MCAB_SEQUENCE_ERROR) mcab_sample_beam_reset(b);
+     * helper computed takes everything down, not only the array; a sequence or mode refusal
+     * changed nothing. */
+    beam.weights = b->bf_weights;
+    beam.beamformed_error = b->bf_spectrum;
+    status = aec_process_residual(b->aec, &beam);
+    if (status == AEC_OK) {
+        memset(frame, 0, sizeof(*frame));
+        frame->struct_size = sizeof(*frame);
+        status = aec_get_residual(b->aec, frame);
+    }
+    if (status != AEC_OK && status != AEC_ERR_SEQUENCE && status != AEC_ERR_MODE)
+        array_sample_beam_reset(b);
     return status;
 }
 
-int mcab_sample_beam_bf_effective_adapt_interval(const McabSampleBeam* b) {
+int array_sample_beam_bf_effective_adapt_interval(const ArraySampleBeam* b) {
     return b && !b->destroyed ? b->bf->adapt_interval : -1;
 }
 
-float mcab_sample_beam_bf_lambda(const McabSampleBeam* b) {
+float array_sample_beam_bf_lambda(const ArraySampleBeam* b) {
     return b && !b->destroyed ? b->bf->lambda : NAN;
 }
 
-const char* mcab_sample_beam_spatial_backend(void) { return spatial_simd_backend(); }
+const char* array_sample_beam_spatial_backend(void) { return spatial_simd_backend(); }

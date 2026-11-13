@@ -2,8 +2,9 @@
 
 Hybrid `linear AEC -> joint RES + NR` reference candidate. Inputs are the
 **frozen production linear-AEC error** and far-end reference. That frontend
-runs on the context-only seam (`enable_res=0`, `return_res_context=1`) and the
-error is its analysis seam (`get_formed_output()`, the C `formed_hop`): the real
+runs on the context-only seam (Python: `enable_res=False`, `return_res_context=True`; C lane:
+`AecConfig.residual = AEC_RESIDUAL_STATE`) and the
+error is its analysis seam (`get_formed_output()`, the C `AecResidualView.formed_hop`): the real
 selected linear residual of every hop, which can exceed the capture on a hop
 where the rendering guard of `lib/aec` would publish the capture. The guard
 selects the rendering base only and never alters this input; see

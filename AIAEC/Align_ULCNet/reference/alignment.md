@@ -5,7 +5,7 @@ Python inference (`inference.py` -> `_streaming.py`) differ at alignment events:
 
 | | C stage | Python inference |
 |---|---|---|
-| event | `delay.changed`, or the first transition to solid after the first hop | not detected: `lib/aec/python` has `get_post_reset_serial` but no equivalent of `AecLinearContext.delay_state`; replayed from a record file with `--events` (below) |
+| event | `delay.changed`, or the first transition to solid after the first hop | not detected: `lib/aec/python` has `get_post_reset_serial` but no equivalent of `AecLinearView.delay_state`; replayed from a record file with `--events` (below) |
 | model state | `model->reset` zeroes every state tensor (attention ring, logit history, recurrent state) | never reset without `--events`; with it, zeroed at each replayed event frame |
 | frames | `ULCNET_NN_STAGE_REPRIME_FRAMES` (1) identity frame | every frame goes through the model; a replayed event frame is the error spectrum unchanged |
 

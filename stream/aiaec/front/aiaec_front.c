@@ -5,7 +5,6 @@
 #include <string.h>
 
 #include "aec.h"
-#include "delay_aec.h"
 #include "stream_mem.h"
 
 _Static_assert((int)AIAEC_FRONT_DELAY_MATCHED == (int)AEC_DELAY_MATCHED, "delay mode values");
@@ -41,15 +40,13 @@ static void build_aec_config(const AiaecFrontConfig *fc, AecConfig *c) {
     c->delay_mode = (AecDelayMode)fc->delay_mode;
     c->delay_num_filters = fc->delay_num_filters;
     c->fixed_delay_samples = fc->fixed_delay_samples;
-    c->enable_delay_est = (fc->delay_mode == AIAEC_FRONT_DELAY_MATCHED) ? 1 : 0;
-    c->enable_res = 0;
-    c->return_res_context = 1;
+    c->residual = AEC_RESIDUAL_STATE;
 }
 
 static int validate(const AiaecFrontConfig *fc, int *hop) {
     AecSignalGrid g;
     if (!fc) return AIAEC_ERR_NULL;
-    if (!aec_resolve_signal_grid(fc->grid.sr, fc->grid.fft, &g) || g.is_legacy) return AIAEC_ERR_GRID;
+    if (aec_resolve_signal_grid(fc->grid.sr, fc->grid.fft, &g) != AEC_OK || g.is_legacy) return AIAEC_ERR_GRID;
     if (fc->grid.hop_in <= 0 || fc->grid.hop_in > FRONT_MAX_HOP_IN || fc->grid.hop_in % g.hop_size != 0)
         return AIAEC_ERR_IN_HOP;
     switch (fc->delay_mode) {
@@ -155,14 +152,17 @@ AiaecAlignEvent aiaec_front_event_from_delay_state(int delay_state) {
 static int run(AiaecFront *f, const float *mic, const float *far, AiaecFrontOut *out) {
     int h;
     for (h = 0; h < f->frames; ++h) {
-        AecResContext rc;
-        AecLinearContext lc;
-        aec_process_context(f->aec, mic + (size_t)h * f->hop, far + (size_t)h * f->hop);
-        aec_get_res_context(f->aec, &rc);
-        aec_get_linear_context(f->aec, &lc);
-        if (!rc.formed_hop) return AIAEC_FRONT_ERR_AEC;
-        memcpy(f->formed + (size_t)h * f->hop, rc.formed_hop, (size_t)f->hop * sizeof(float));
-        f->events[h] = aiaec_front_event_from_delay_state((int)lc.delay_state);
+        AecResidualView rv;
+        AecLinearView lv;
+        rv.struct_size = sizeof(rv);
+        lv.struct_size = sizeof(lv);
+        if (aec_process_linear(f->aec, mic + (size_t)h * f->hop, far + (size_t)h * f->hop) != AEC_OK ||
+            aec_process_residual(f->aec, NULL) != AEC_OK ||
+            aec_get_residual(f->aec, &rv) != AEC_OK || aec_get_linear(f->aec, &lv) != AEC_OK ||
+            !rv.formed_hop)
+            return AIAEC_FRONT_ERR_AEC;
+        memcpy(f->formed + (size_t)h * f->hop, rv.formed_hop, (size_t)f->hop * sizeof(float));
+        f->events[h] = aiaec_front_event_from_delay_state((int)lv.delay_state);
     }
     out->formed_hop = f->formed;
     out->raw_far = far;

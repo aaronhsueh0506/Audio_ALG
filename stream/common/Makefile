@@ -1,8 +1,9 @@
 # Shared stream/ helpers: the header-only stream_mem.h (StreamMemReq, carve, hash, saturate), the
-# SDK-free port check stream_bind.{h,c}, which does not depend on stream_mem.h, and the header-only board
-# sample helper ai3_model_io.h (row expansion, state pairing, boundary check) over stream_bind.
-# Standalone: `make -C stream/common test` builds and runs the three unit tests, the C++ header compile and
-# the no-stdio audit.
+# SDK-free port check stream_bind.{h,c}, which does not depend on stream_mem.h (over the private message helper
+# stream_msg.h), and the header-only board sample helper ai3_model_io.h (row expansion, state pairing, boundary
+# check) over it.
+# Standalone: `make -C stream/common test` builds and runs the three unit tests, the C++ header compile and the
+# no-stdio audit.
 CC ?= cc
 CXX ?= c++
 CFLAGS ?= -O2 -std=c11 -Wall -Wextra -Wpedantic
@@ -22,10 +23,12 @@ all: $(BUILD_DIR)/stream_bind.o
 $(BUILD_DIR):
 	@mkdir -p "$(BUILD_DIR)"
 
-$(BUILD_DIR)/stream_bind.o: stream_bind.c stream_bind.h | $(BUILD_DIR)
+$(BUILD_DIR)/stream_bind.o: stream_bind.c stream_bind.h stream_msg.h | $(BUILD_DIR)
 	$(CC) $(CFLAGS) -c stream_bind.c -o "$@"
 
-$(BUILD_DIR)/test_stream_bind: tests/test_stream_bind.c stream_bind.c stream_bind.h | $(BUILD_DIR)
+TEST_WIRINGS = tests/stream_test_wirings.h stream_bind.h
+
+$(BUILD_DIR)/test_stream_bind: tests/test_stream_bind.c stream_bind.c stream_bind.h stream_msg.h $(TEST_WIRINGS) | $(BUILD_DIR)
 	$(CC) $(CFLAGS) tests/test_stream_bind.c stream_bind.c -lm -o "$@"
 
 test-stream-bind: $(BUILD_DIR)/test_stream_bind
@@ -38,7 +41,7 @@ $(BUILD_DIR)/test_stream_mem: tests/test_stream_mem.c stream_mem.h stream_bind.h
 test-stream-mem: $(BUILD_DIR)/test_stream_mem
 	"$(BUILD_DIR)/test_stream_mem"
 
-$(BUILD_DIR)/test_model_io: tests/test_model_io.c ai3_model_io.h stream_bind.c stream_bind.h | $(BUILD_DIR)
+$(BUILD_DIR)/test_model_io: tests/test_model_io.c ai3_model_io.h stream_bind.c stream_bind.h stream_msg.h | $(BUILD_DIR)
 	$(CC) $(CFLAGS) tests/test_model_io.c stream_bind.c -o "$@"
 
 test-model-io: $(BUILD_DIR)/test_model_io

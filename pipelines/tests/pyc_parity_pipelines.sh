@@ -3,11 +3,11 @@
 #
 # What it measures (nothing here modifies an algorithm, a C numeric behaviour or a tolerance):
 #   (a) 4-channel NR gain: the C chain's fused frame fed to Python run_nr_spectrum, against the C G_nr,
-#       with usable_linear taken from the C frame flag (mcab_fuse AND-folds it over contributing
-#       lanes) and, as an independent cross-check, from the Python verdict of the same hop, plus
+#       with usable_linear taken from the C frame flag (the array's fusion AND-folds it over the
+#       contributing lanes) and, as an independent cross-check, from the Python verdict of the same hop, plus
 #       "legacy_amin 0 and 1 must differ" inside C.
 #   (b) 4-channel post-beam RES gain: PostBeamResidualSuppressor (+ set_preset) fed with the C fused
-#       frame, against the C G_res, for balanced / mild / aggressive / no_floor.
+#       frame, against the array's G_res (AecResidualView.res_gain), for balanced / mild / aggressive / no_floor.
 #   (c) 4-channel shared-delay realign: the hop on which the lanes take a mixed warm/soft path at 48 kHz:
 #       stock Python 4ch against the C core on the same input.
 #   (d) mono pipeline glue (NR gain, min, apply, comfort noise, OLA): Python functions of
@@ -15,8 +15,7 @@
 #
 # Layers:
 #   Layer 1  std-math build (SIMD=0, -DUSE_STANDARD_MATH, NR's six USE_* optimisations off, i.e. NR's
-#            DEBUG=1; the 4ch Makefile additionally gets OPT_CFLAGS=-O2 so DEBUG=1 does not turn on -O0) of
-#            the C code, compared with Python. Catches sync bugs. The fused frame / AEC seam that Python is
+#            DEBUG=1) of the C code, compared with Python. Catches sync bugs. The fused frame / AEC seam that Python is
 #            fed with is always the one the C code produced, so the comparison isolates the stage under test
 #            from the (separately audited) divergence of the AEC library itself.
 #   Layer 2  shipped build (Makefile defaults: SIMD=1, fast-math, the six USE_*) compared with the std-math
@@ -27,7 +26,7 @@
 # Scenario ids (see --list): a.nr4.<grid>.*  4ch NR gain      b.res4.<grid>.<preset>  4ch post-beam RES
 #   c.realign4.<grid>  shared-delay realign   d.mono.*  mono glue     l2.*  Layer 2      <grid> = 16k256 | 16k512 | 48k1024
 #   Rows a.nr4.*.glue_cflag and a.nr4.*.glue_fold both compare the Python NR stage with C over the same
-#   frame; the first takes usable_linear from the C frame flag (mcab_fuse's AND-over-contributing-lanes
+#   frame; the first takes usable_linear from the C frame flag (the array fusion's AND-over-contributing-lanes
 #   fold), the second forces the Python verdict into the C stage as an independent check of the fold.
 #
 # Tolerances are frozen (pyc_parity.py's TOL1/TOL2 carry the measured max error each constant was set
@@ -49,7 +48,8 @@
 #   --list           print the scenario ids and exit
 #   --reuse-build    keep the build trees of an earlier run (skips the build-flag assertion)
 # environment: PYTHON (python3 with numpy, scipy, soundfile, pyyaml), PYC_TREE (a directory holding
-#   Audio_ALG/ and audiolib/common/ to build and test instead of this checkout),
+#   Audio_ALG/, audiolib/common/ and the sibling AEC/ and NR/ -- or AEC_DIR / NR_DIR / COMMON_DIR set -- to
+#   build and test instead of this checkout),
 #   PYC_JOBS (make -j, default 4), CC / CXX (default cc / c++).
 # Python runs serially (OMP_NUM_THREADS=1); the C builds use PYC_JOBS.
 
@@ -122,7 +122,7 @@ AC="$COMMON_DIR"
 PL="$ALG/pipelines"
 P4="$PL/4ch"
 
-[ -d "$ALG" ] && [ -d "$AC" ] || die "tree $TREE must hold Audio_ALG/ and audiolib/common/"
+[ -d "$ALG" ] && [ -d "$AC" ] || die "tree $TREE must hold Audio_ALG/ and audiolib/common/ (and AEC/ and NR/, or AEC_DIR / NR_DIR set)"
 
 case "$(cd "$(dirname "$WORK")" 2>/dev/null && pwd)/$(basename "$WORK")" in
   "$TREE"/*) die "work directory $WORK is inside the source tree $TREE" ;;
@@ -140,14 +140,13 @@ mkdir -p "$WORK/logs" "$WORK/inputs" "$WORK/run"
 
 # --------------------------------------------------------------------------------------------
 # Builds. Each layer gets its own OBJ_ROOT / BIN_ROOT under $WORK, so nothing is written into the tree.
-#   Layer 1: SIMD=0 DEBUG=1 EXTRA_CFLAGS=-DUSE_STANDARD_MATH (+ OPT_CFLAGS=-O2 for the 4ch Makefile,
-#            where DEBUG=1 alone would also select -O0 -g; the override isolates the math axis).
+#   Layer 1: SIMD=0 DEBUG=1 EXTRA_CFLAGS=-DUSE_STANDARD_MATH.
 #            DEBUG=1 is the only knob that drops NR's six USE_* optimisations.
 #   Layer 2: Makefile defaults.
 # --------------------------------------------------------------------------------------------
 BUILD_INFO="$WORK/build_info.txt"
 : > "$BUILD_INFO.new"
-# So pyc_parity.py can hash the aec_res.c it actually linked, not the lib/aec submodule checkout
+# So pyc_parity.py can hash the AEC sources it actually linked, not the lib/aec submodule checkout
 # a tree-relative path would otherwise name.
 echo "AEC_DIR=$AEC_DIR" >> "$BUILD_INFO.new"
 
@@ -156,8 +155,8 @@ make_quiet() { # logfile dir args...
   ( cd "$dir" && make -j"$JOBS" "$@" ) >> "$log" 2>&1
 }
 
-build_layer() { # name simd debug extra opt
-  local name="$1" simd="$2" debug="$3" extra="$4" opt="$5"
+build_layer() { # name simd debug extra
+  local name="$1" simd="$2" debug="$3" extra="$4"
   local root="$WORK/build/$name" log="$WORK/logs/build_$name.log"
   # AEC_DIR/NR_DIR/COMMON_DIR passed explicitly (not left to inherited environment/MAKEFLAGS): a
   # caller's command-line override (e.g. the README's AEC_DIR=../lib/aec/c_impl) reaches this
@@ -168,19 +167,20 @@ build_layer() { # name simd debug extra opt
   # the absolutization above for every build this function invokes unless restated here.
   local knobs=("OBJ_ROOT=$root/obj" "BIN_ROOT=$root/bin" "SIMD=$simd" "DEBUG=$debug" "CC=$CC" "CXX=$CXX" \
                "AEC_DIR=$AEC_DIR" "NR_DIR=$NR_DIR" "COMMON_DIR=$COMMON_DIR")
-  local knobs4=("${knobs[@]}")
-  [ -n "$extra" ] && { knobs+=("EXTRA_CFLAGS=$extra"); knobs4+=("EXTRA_CFLAGS=$extra"); }
-  [ -n "$opt" ] && knobs4+=("OPT_CFLAGS=$opt")
+  [ -n "$extra" ] && knobs+=("EXTRA_CFLAGS=$extra")
   if [ "$REUSE" = 0 ]; then rm -rf "$root"; : > "$log"; fi
   mkdir -p "$root"
   make_quiet "$log" "$PL" "${knobs[@]}" aec_nr_pipeline || { tail -20 "$log" >&2; die "build $name (pipelines) failed"; }
-  make_quiet "$log" "$P4" "${knobs4[@]}" libaudio_pipeline_mcab.a || { tail -20 "$log" >&2; die "build $name (4ch) failed"; }
-  local ac aec nr four
+  local ac aec aect nr
   ac="$(make -s -C "$AC" "${knobs[@]}" print-lib-path | tail -1)"
   aec="$(make -s -C "$AEC_DIR" "${knobs[@]}" COMMON_DIR="$AC" COMMON_LIB="$ac" print-lib-path | tail -1)"
   nr="$(make -s -C "$NR_DIR" "${knobs[@]}" COMMON_DIR="$AC" COMMON_LIB="$ac" print-lib-path | tail -1)"
-  four="$(make -s -C "$P4" "${knobs4[@]}" print-lib-path | tail -1)"
-  for f in "$ac" "$aec" "$nr" "$four"; do [ -f "$f" ] || die "archive or object $f missing after build $name"; done
+  # The AEC_TESTING archive keys its own build tree; only the 4-channel replay driver links it (it runs the array's
+  # gain stage on recorded frames through aec_testing_res_*), so no test hook reaches the other two drivers.
+  make_quiet "$log" "$AEC_DIR" "${knobs[@]}" AEC_TESTING=1 COMMON_DIR="$AC" COMMON_LIB="$ac" lib || { tail -20 "$log" >&2; die "build $name (AEC_TESTING archive) failed"; }
+  aect="$(make -s -C "$AEC_DIR" "${knobs[@]}" AEC_TESTING=1 COMMON_DIR="$AC" COMMON_LIB="$ac" print-lib-path | tail -1)"
+  [ "$aect" != "$aec" ] || die "the AEC_TESTING archive resolved to the production archive $aec"
+  for f in "$ac" "$aec" "$aect" "$nr"; do [ -f "$f" ] || die "archive or object $f missing after build $name"; done
 
   # Compile line of the C drivers: the same math/SIMD macros as the libraries, and the FP policy of the
   # Makefiles (-ffp-contract=off -fno-math-errno).
@@ -195,7 +195,11 @@ build_layer() { # name simd debug extra opt
   # shellcheck disable=SC2086
   "$CC" -Wall -Wextra -O2 -std=gnu99 -ffp-contract=off -fno-math-errno $macros $inc -DPYC_WITH_MONO \
       -c "$PARITY/pyc_drv.c" -o "$root/drv/pyc_drv_mono.o" >> "$log" 2>&1 || { tail -20 "$log" >&2; die "driver mono ($name) failed"; }
-  "$CXX" -o "$root/drv/pyc_drv_4ch" "$root/drv/pyc_drv_4ch.o" "$four" "$aec" "$nr" "$ac" -lm >> "$log" 2>&1 || die "link 4ch ($name) failed"
+  # shellcheck disable=SC2086
+  "$CC" -Wall -Wextra -O2 -std=gnu99 -ffp-contract=off -fno-math-errno $macros $inc -I"$AEC_DIR/test" -DAEC_TESTING \
+      -DPYC_WITH_4CH -DPYC_REPLAY_RES -c "$PARITY/pyc_drv.c" -o "$root/drv/pyc_drv_4ch_replay.o" >> "$log" 2>&1 || { tail -20 "$log" >&2; die "driver 4ch replay ($name) failed"; }
+  "$CXX" -o "$root/drv/pyc_drv_4ch" "$root/drv/pyc_drv_4ch.o" "$aec" "$nr" "$ac" -lm >> "$log" 2>&1 || die "link 4ch ($name) failed"
+  "$CXX" -o "$root/drv/pyc_drv_4ch_replay" "$root/drv/pyc_drv_4ch_replay.o" "$aect" "$nr" "$ac" -lm >> "$log" 2>&1 || die "link 4ch replay ($name) failed"
   "$CXX" -o "$root/drv/pyc_drv_mono" "$root/drv/pyc_drv_mono.o" "$aec" "$nr" "$ac" -lm >> "$log" 2>&1 || die "link mono ($name) failed"
 
   # Build-flag assertion on the compile lines of this run's log (not possible on a reused tree).
@@ -217,6 +221,7 @@ build_layer() { # name simd debug extra opt
   echo "$name.flags=$verdict" >> "$BUILD_INFO.new"
   case "$verdict" in FAIL*) die "build flag assertion for $name: $verdict" ;; esac
   echo "$name.drv_4ch=$root/drv/pyc_drv_4ch" >> "$BUILD_INFO.new"
+  echo "$name.drv_4ch_replay=$root/drv/pyc_drv_4ch_replay" >> "$BUILD_INFO.new"
   echo "$name.drv_mono=$root/drv/pyc_drv_mono" >> "$BUILD_INFO.new"
 }
 
@@ -224,8 +229,8 @@ want_layer() { case ",$LAYERS," in *",$1,"*) return 0 ;; esac; return 1; }
 
 want_layer 1 || want_layer 2 || die "--layers must be 1, 2 or 1,2"
 # Layer 2 compares against Layer 1, so Layer 1 is always built.
-build_layer L1 0 1 "-DUSE_STANDARD_MATH" "-O2"
-want_layer 2 && build_layer L2 1 0 "" ""
+build_layer L1 0 1 "-DUSE_STANDARD_MATH"
+want_layer 2 && build_layer L2 1 0 ""
 mv -f "$BUILD_INFO.new" "$BUILD_INFO"
 
 # --------------------------------------------------------------------------------------------

@@ -55,8 +55,11 @@ _ALG_DIR = os.path.dirname(_AIAEC_DIR)
 _ULCNET_DIR = os.path.join(_AIAEC_DIR, '..', 'lib', 'aiaec', 'ulcnet')
 _PIPELINES_DIR = os.path.join(_ALG_DIR, 'pipelines')
 _LANE_MAIN = os.path.join(_PIPELINES_DIR, 'mono', 'alignulcnet', 'main.c')
-_AEC_C_DIR = os.path.join(_ALG_DIR, 'lib', 'aec', 'c_impl')
-_AC_DIR = os.path.abspath(os.path.join(_ALG_DIR, '..', 'audiolib', 'common'))
+# Resolved as lib/deps.mk resolves them: the environment, else the sibling checkouts.
+_AEC_C_DIR = os.path.abspath(os.environ.get('AEC_DIR') or os.path.join(
+    os.environ.get('AEC_REPO_DIR') or os.path.join(_ALG_DIR, '..', 'AEC'), 'c_impl'))
+_AC_DIR = os.path.abspath(os.environ.get('COMMON_DIR') or os.path.join(
+    _ALG_DIR, '..', 'audiolib', 'common'))
 
 GRIDS = {16000: 512, 48000: 1024}
 
@@ -146,12 +149,45 @@ def test_deployed_lane_matches_the_contract(lanes, contracts, sample_rate):
     assert lane['formed_hop_cng_invariant'] == '1'
 
 
-def test_deployed_stage_reads_the_formed_seam():
-    """output_seam is the formed hop only if main.c hands that to the stage."""
+def _process_hop_source():
+    """The text of the deployed lane's per-hop function, comments removed."""
     with open(_LANE_MAIN, encoding='utf-8') as stream:
         source = stream.read()
-    assert re.search(r'ulcnet_nn_stage_begin_time\(\s*stage,\s*rctx\.formed_hop,',
-                     source)
+    match = re.search(r'^static int process_hop\(.*?^\}', source, re.DOTALL | re.MULTILINE)
+    assert match, 'process_hop() not found in the deployed lane'
+    return re.sub(r'/\*.*?\*/|//[^\n]*', '', match.group(0), flags=re.DOTALL)
+
+
+def test_deployed_stage_reads_the_formed_seam():
+    """output_seam is the formed hop only if main.c hands that to the stage.
+
+    The error spectrum is the STFT of the AEC's analysis seam (AecResidualView.formed_hop), the far
+    spectrum the STFT of the raw reference, and those two spectra, in that order and after both
+    pushes, are what the stage is begun on. The rendering base is never read.
+    """
+    body = _process_hop_source()
+    err = re.search(r'ac_stft_push\(\s*(\w+)->err_stft,\s*rctx\.formed_hop,\s*\1->err_spec\s*\)', body)
+    far = re.search(r'ac_stft_push\(\s*(\w+)->far_stft,\s*ref,\s*\1->far_spec\s*\)', body)
+    begin = re.search(r'ulcnet_nn_stage_begin_spec\(\s*stage,\s*(\w+)->err_spec,\s*\1->far_spec,', body)
+    assert err, 'the error STFT is not fed rctx.formed_hop'
+    assert far, 'the far STFT is not fed the raw reference'
+    assert begin, 'the stage is not begun on (err_spec, far_spec)'
+    assert err.group(1) == far.group(1) == begin.group(1)
+    assert err.end() < begin.start() and far.end() < begin.start()
+    assert 'aec_get_residual(aec, &rctx)' in body
+    assert 'base_spec' not in body
+
+
+def test_deployed_lane_is_stage_driven_without_a_gain():
+    """The lane dump reports enable_res = 0 as a constant: that holds only while the lane runs the
+    linear stage and the residual-state stage and never the full chain or a gain."""
+    with open(_LANE_MAIN, encoding='utf-8') as stream:
+        source = re.sub(r'/\*.*?\*/|//[^\n]*', '', stream.read(), flags=re.DOTALL)
+    body = _process_hop_source()
+    assert re.search(r'aec_process_linear\(\s*aec,\s*mic,\s*ref\s*\)', body)
+    assert re.search(r'aec_process_residual\(\s*aec,\s*NULL\s*\)', body)
+    assert re.search(r'->residual\s*=\s*AEC_RESIDUAL_STATE\s*;', source)
+    assert not re.search(r'\baec_process\s*\(|\baec_apply_(?:gain|cng)\w*\s*\(', source)
 
 
 @pytest.mark.parametrize('key, value, field', [

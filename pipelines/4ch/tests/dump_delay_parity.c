@@ -3,12 +3,12 @@
  * (tests/test_delay_parity.py).
  *
  * Drives one deterministic synthetic scene (xorshift32 far noise plus a half-amplitude
- * echo at a known bulk delay) through the real 4ch core and prints, per hop, the
+ * echo at a known bulk delay) through the real array instance (aec.h, n_mics = 4) and prints, per hop, the
  * published shared-delay state and a hash of the aligned far the four lanes consumed.
  * pipeline.py generates the same scene and must reproduce every column.
- * The matched-filter duty cycle is pinned at full rate
- * (mcab_pin_duty_full_rate(), mcab_internal.h) because it is a C-only
- * schedule. printf lives in this test binary only; the core stays stdio-free.
+ * The matched-filter duty cycle stays off (delay_est_period_s = 0 analyses every hop)
+ * because it is a C-only schedule. printf lives in this test binary only; the library stays
+ * stdio-free.
  *
  * Build:  make -C pipelines/4ch dump_delay_parity
  * Usage:
@@ -19,7 +19,7 @@
  *                       [--backward-quarantine] [--quarantine-s SECONDS]
  *                       [--proxy-noise GAIN]
  * --seed reseeds the far/echo stream only. --backward-quarantine sets
- * McabConfig::delay_backward_quarantine_enabled (default off) and
+ * AecConfig::delay_backward_quarantine_enabled (default off) and
  * --quarantine-s its window (default 1.0 s). --proxy-noise adds independent noise to the
  * capture-proxy channel only, so the proxy lane cannot cancel while the other three can
  * and the proxy-lane rule is told apart from a judge-any-lane rule.
@@ -30,9 +30,8 @@
 #include <stdlib.h>
 #include <string.h>
 
-#include "mcab.h"
-#include "mcab_internal.h"
-#include "mcab_test_rig.h"
+#include "aec.h"
+#include "array_test_rig.h"
 
 /* xorshift32 -> [-0.125, 0.125). Every operation is exactly representable in
  * float32 (the 24-bit mantissa feed is exact, the two scale factors are
@@ -68,8 +67,8 @@ static uint64_t hash_hop(const float* samples, int count) {
 }
 
 int main(int argc, char** argv) {
-    McabConfig cfg;
-    Mcab* p = NULL;
+    AecConfig cfg;
+    Aec* p = NULL;
     float* far_hist = NULL;
     float* proxy_hist = NULL;
     float* mic = NULL;
@@ -126,9 +125,9 @@ int main(int argc, char** argv) {
     }
     if (shift_delay < 0) shift_delay = delay;
 
-    cfg = mcab_default_config(sample_rate);
+    cfg = array_test_default_config(sample_rate);
     cfg.fft_size = fft_size;
-    cfg.enable_post = 0;          /* the alignment seam lives in mcab_process_front */
+    cfg.residual = AEC_RESIDUAL_STATE;          /* the alignment seam lives in aec_process_linear */
     cfg.delay_backward_quarantine_enabled = quarantine;
     if (quarantine_s >= 0.0f) cfg.delay_backward_quarantine_s = quarantine_s;
     if (strcmp(mode, "fixed") == 0) {
@@ -139,23 +138,22 @@ int main(int argc, char** argv) {
         return 2;
     }
 
-    p = mcab_test_create(&cfg);
+    p = array_test_create(&cfg);
     if (!p) {
-        fprintf(stderr, "mcab flow init failed\n");
+        fprintf(stderr, "array init failed\n");
         return 3;
     }
-    /* Analyse every hop: the duty-cycle schedule is C-only with no Python counterpart;
-     * everything else runs as in production. The schedule is covered in
-     * tests/test_mcab.c. */
-    mcab_pin_duty_full_rate(p);
-    hop = mcab_hop_size(p);
+    /* delay_est_period_s = 0 (the default) analyses every hop: the duty-cycle schedule is C-only
+     * with no Python counterpart; everything else runs as in production. The schedule is covered
+     * by the AEC library's test_aec_array_flow.c. */
+    hop = aec_hop_size(p);
 
     /* `pad` samples of pre-history so the echo is valid from the first
      * streamed sample, at either bulk delay. */
     pad = delay > shift_delay ? delay : shift_delay;
     total = pad + hops * hop;
     far_hist = (float*)malloc((size_t)total * sizeof(float));
-    mic = (float*)malloc((size_t)hop * MCAB_CHANNELS *
+    mic = (float*)malloc((size_t)hop * AEC_ARRAY_MICS *
                          sizeof(float));
     far = (float*)malloc((size_t)hop * sizeof(float));
     if (!far_hist || !mic || !far) {
@@ -182,21 +180,21 @@ int main(int argc, char** argv) {
     printf("hop,delay_samples,solid,changed,far_hash,aligned_hash,"
            "aligned_first\n");
     for (h = 0; h < hops; ++h) {
-        McabFront pre;
+        AecArrayView pre;
         int base = pad + h * hop;
         int echo_delay = (shift_at >= 0 && h >= shift_at) ? shift_delay : delay;
         for (i = 0; i < hop; ++i) {
             float echo = 0.5f * far_hist[base + i - echo_delay];
             far[i] = far_hist[base + i];
-            for (ch = 0; ch < MCAB_CHANNELS; ++ch)
-                mic[i * MCAB_CHANNELS + ch] = echo;
+            for (ch = 0; ch < AEC_ARRAY_MICS; ++ch)
+                mic[i * AEC_ARRAY_MICS + ch] = echo;
             if (proxy_hist)
-                mic[i * MCAB_CHANNELS + cfg.capture_proxy_channel] +=
+                mic[i * AEC_ARRAY_MICS + cfg.capture_proxy_channel] +=
                     proxy_hist[base + i];
         }
-        if (mcab_process_front(p, mic, far, &pre) !=
-            MCAB_OK) {
-            fprintf(stderr, "mcab_process_front failed at hop %d\n", h);
+        if (array_test_front(p, mic, far, &pre) !=
+            AEC_OK) {
+            fprintf(stderr, "aec_process_linear failed at hop %d\n", h);
             status = 5;
             goto cleanup;
         }
@@ -213,6 +211,6 @@ cleanup:
     free(proxy_hist);
     free(mic);
     free(far);
-    mcab_test_destroy(p);
+    array_test_destroy(p);
     return status;
 }

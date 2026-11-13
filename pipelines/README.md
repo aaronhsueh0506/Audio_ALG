@@ -10,7 +10,7 @@
 
 從 repo 根目錄執行 `make -C pipelines` 建置 mono，`make -C pipelines/4ch` 建置 4ch。透過 `make -s -C pipelines print-bin-dir` 取得相同設定下的 mono 執行檔目錄。
 
-**單模型 PCM 呼叫端**可直接接 [stream SDK](../docs/html/models/index.html)。已持有頻譜的管線可使用 [DFN2 的 RES stage 與 rate bridge](dfn/README.md) 或 [ULCNet 的頻域 stage](ulcnet/README.md)。四麥克風共用的 MCAB 前端、beam 和後級的接線見 [四麥克風整合](../docs/reference/mcab/README.md)。
+**單模型 PCM 呼叫端**可直接接 [stream SDK](../docs/html/models/index.html)。已持有頻譜的管線可使用 [DFN2 的 RES stage 與 rate bridge](dfn/README.md) 或 [ULCNet 的頻域 stage](ulcnet/README.md)。四麥克風 array instance（lib/aec，`AecConfig.n_mics = 4`）、beam 和後級的接線見 [四麥克風整合](../docs/reference/array/README.md)。
 
 - [逐 hop 呼叫、延遲與新增頻域 stage](reference/call-flow.md)
 - [建置、板端和 debug](reference/build.md)

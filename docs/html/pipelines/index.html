@@ -10,7 +10,7 @@
 <nav aria-label="導覽"><a href="../index.html">Audio_ALG</a></nav>
 <main>
 <h1>選擇 pipeline</h1>
-<p>先選麥克風數，再選後級。四聲道共用 <code>mcab_process_front()</code> 做四路線性 AEC，應用端可用自己的 beamformer 或範例的 SRP／BF helper，透過 <code>mcab_fuse()</code> 產生融合結果。</p>
+<p>先選麥克風數，再選後級。四聲道是 <code>libaec.a</code> 的 array 實例（<code>AecConfig.n_mics = AEC_ARRAY_MICS</code>）：<code>aec_process_linear()</code> 做四路線性 AEC，應用端可用自己的 beamformer 或範例的 SRP／BF helper，再以 <code>aec_process_residual()</code> 產生融合結果。</p>
 
 <table><thead><tr><th>後級</th><th>Mono</th><th>四聲道</th><th>輸入邊界</th></tr></thead><tbody>
 <tr><th>AEC／NR／RES</th><td><a href="mono/aec-nr-res/index.html">Mono AEC／NR／RES</a></td><td><a href="4ch/aec-nr-res/index.html">四聲道 AEC／NR／RES</a></td><td>結合 NR 與殘留回音抑制增益，再合成 PCM。</td></tr>

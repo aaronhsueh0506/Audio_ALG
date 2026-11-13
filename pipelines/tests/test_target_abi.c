@@ -13,7 +13,7 @@
 #include <stdlib.h>
 #include <string.h>
 
-#include "mcab.h"
+#include "aec.h"
 #include "dfn/tests/dfn_test_grid.h"
 #include "dfn/dfn_res_stage.h"
 #include "dfn/dfn_rate_bridge.h"
@@ -52,35 +52,6 @@ static unsigned cases;
     ++cases; \
     free(pool); \
 } while (0)
-
-/* mcab's init takes the objects it drives: one set of lanes and the shared estimator, built
- * once in main() with their own libaec init calls, serves both mcab cases. */
-static McabLibs g_mcab_libs;
-static Mcab *mcab_case_init_ex(void *mem, size_t bytes, const McabConfig *cfg,
-                               const McabMemReq *req) {
-    return mcab_init_ex(mem, bytes, cfg, &g_mcab_libs, req);
-}
-#define mcab_case_get_mem_requirements mcab_get_mem_requirements
-
-static void build_mcab_libs(const McabConfig *cfg) {
-    AecConfig lane;
-    McabDelayEstimatorConfig dc;
-    size_t bytes;
-    static DelayAec delay;
-    void *mem;
-    int ch;
-    assert(mcab_lane_config(cfg, &lane) == 0 && mcab_delay_estimator_config(cfg, &dc) == 0);
-    bytes = aec_get_mem_size(&lane);
-    for (ch = 0; ch < MCAB_CHANNELS; ++ch) {
-        assert(posix_memalign(&mem, 16, bytes) == 0);
-        assert((g_mcab_libs.lanes[ch] = aec_init(mem, bytes, &lane)) != NULL);
-    }
-    assert(dc.required);
-    bytes = delay_aec_get_mem_size(dc.sample_rate, dc.hop_size, dc.num_filters);
-    assert(posix_memalign(&mem, 16, bytes) == 0);
-    assert(delay_aec_init(&delay, mem, bytes, dc.sample_rate, dc.hop_size, dc.num_filters) == 0);
-    g_mcab_libs.delay = &delay;
-}
 
 /* The grids the descriptors are taken for: the DFN3 class at the DFN2 test grid's numbers (the same
  * config.ini [feature] values), the AIAEC models at their shipped grid with delay depth 8. */
@@ -126,8 +97,7 @@ static void deepvqe_target_grid(DeepVqeGrid *grid) {
 
 int main(int argc, char **argv) {
     uint32_t pointer_bytes = (uint32_t)sizeof(void *), foreign_pointer_bytes;
-    McabConfig flow = mcab_default_config(16000);
-    McabConfig front_only = flow;
+    AecConfig flow, lanes_only;
     DFN2PrepostConfig dfn2;
     DFN3PrepostConfig dfn3;
     UlcnetPrepostConfig ulc;
@@ -152,6 +122,22 @@ int main(int argc, char **argv) {
         assert(argc == 1);
     }
 
+    aec_config_from_level(&flow, AEC_LEVEL_BALANCED, 16000);
+#ifdef TARGET_ABI_TEST_NO_ARRAY
+    /* A single-channel libaec refuses the array instance; its two descriptor carves are the one-channel lane. */
+    {
+        AecConfig array = flow;
+        AecMemReq refused;
+        array.n_mics = AEC_ARRAY_MICS;
+        assert(aec_get_mem_requirements(&array, &refused) != 0);
+    }
+    flow.n_mics = 1;
+#else
+    flow.n_mics = AEC_ARRAY_MICS;
+#endif
+    flow.residual = AEC_RESIDUAL_FULL;
+    lanes_only = flow;
+    lanes_only.residual = AEC_RESIDUAL_STATE;
     dfn3_target_grid(&dfn3_grid);
     ulcnet_target_grid(&ulc_grid);
     deepvqe_target_grid(&deep_grid);
@@ -169,12 +155,9 @@ int main(int argc, char **argv) {
     EXERCISE(dfn3_prepost, DFN3PrepostMemReq, dfn3);
     EXERCISE(ulcnet_prepost, UlcnetPrepostMemReq, ulc);
     EXERCISE(deepvqe_prepost, DeepVqePrepostMemReq, deep);
-    /* Two carves of the one flow: with the fuse buffers and front only. */
-    front_only.enable_post = 0;
-    build_mcab_libs(&flow);
-    EXERCISE(mcab_case, McabMemReq, flow);
-    build_mcab_libs(&front_only);   /* the front-only flow needs front-only lanes */
-    EXERCISE(mcab_case, McabMemReq, front_only);
+    /* Two carves of the one instance: with the fusion and the gain stage (FULL), and lanes only (STATE). */
+    EXERCISE(aec, AecMemReq, flow);
+    EXERCISE(aec, AecMemReq, lanes_only);
     EXERCISE(dfn_res_stage, DfnResStageMemReq, stage);
     EXERCISE(dfn_rate_bridge, DfnRateBridgeMemReq, bridge);
     assert(cases == 8u);

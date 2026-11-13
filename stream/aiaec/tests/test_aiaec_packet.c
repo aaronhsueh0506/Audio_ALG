@@ -104,7 +104,7 @@ static void ctxs_free(Ctxs *c) { free(c->pb); free(c->ps); free(c->pf); }
 
 /* ---- the accelerator stand-in ------------------------------------------------------------------------------- */
 
-typedef enum { ACC_MODEL = 0, ACC_IDENTITY = 1, ACC_NAN = 2 } AccMode;
+typedef enum { ACC_MODEL = 0, ACC_IDENTITY = 1, ACC_NAN = 2, ACC_INF_FIRST = 3, ACC_NEGINF_LAST = 4 } AccMode;
 
 typedef struct Accel {
     float st[BINS];
@@ -145,6 +145,8 @@ static void accel_run(Accel *a, const AiaecWork *w, int n) {
         }
     }
     if (a->mode == ACC_NAN) out[BINS / 2] = NAN;
+    else if (a->mode == ACC_INF_FIRST) out[0] = INFINITY;
+    else if (a->mode == ACC_NEGINF_LAST) out[w->outputs[0].elements - 1u] = -INFINITY;
 }
 
 /* ---- the signal and its independent analysis ----------------------------------------------------------------- */
@@ -832,18 +834,22 @@ static int section_failure(void) {
     static Run r;
     Ctxs c;
     Accel acc;
-    int p, h;
+    int p, h, m;
     unsigned gen_before, gen_after;
 
     sched_clear(&s, "failure", 4);
     s.ev[10].changed = 1;
-    /* non-finite mask in every packet: all frames pass through, generation advances once per packet */
-    run_freq_n8(&s, &r, ACC_NAN);   /* the driver does not look at ai_rc; the library must catch the NaN */
-    for (h = 0; h < s.packets * NF; ++h)
-        CHECK(memcmp(r.re + (size_t)h * BINS, g_ere + (size_t)h * BINS, BINS * sizeof(float)) == 0 &&
-              memcmp(r.im + (size_t)h * BINS, g_eim + (size_t)h * BINS, BINS * sizeof(float)) == 0,
-              "non-finite mask: hop %d is not the error spectrum", h);
-    CHECK(r.gen_changes == (unsigned)s.packets - 1u, "non-finite mask: generation changes seen by the accelerator %u", r.gen_changes);
+    /* non-finite mask in every packet: all frames pass through, generation advances once per packet; NaN in the middle
+     * of the real plane, +Inf first, -Inf at the last element of the imaginary plane */
+    for (m = 0; m < 3; ++m) {
+        static const AccMode bad_mode[3] = { ACC_NAN, ACC_INF_FIRST, ACC_NEGINF_LAST };
+        run_freq_n8(&s, &r, bad_mode[m]);   /* the driver does not look at ai_rc; the library must catch it */
+        for (h = 0; h < s.packets * NF; ++h)
+            CHECK(memcmp(r.re + (size_t)h * BINS, g_ere + (size_t)h * BINS, BINS * sizeof(float)) == 0 &&
+                  memcmp(r.im + (size_t)h * BINS, g_eim + (size_t)h * BINS, BINS * sizeof(float)) == 0,
+                  "non-finite mask %d: hop %d is not the error spectrum", m, h);
+        CHECK(r.gen_changes == (unsigned)s.packets - 1u, "non-finite mask %d: generation changes seen by the accelerator %u", m, r.gen_changes);
+    }
 
     /* inference failure: infer_status != 0 passes the packet through and leaves the generation alone */
     if (ctxs_make(&c, NF, 0, 0, 1) != 0) return 1;

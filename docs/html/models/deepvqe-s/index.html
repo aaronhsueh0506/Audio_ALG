@@ -102,7 +102,7 @@ while (read_blocks(mic, far, hop_in)) {
 <h2>State</h2>
 <ul>
 <li>recurrent state 留在 AI3 的 buffer。每對 state 輸入與輸出依位置（輸入 <code>signal_in_count + k</code> 與輸出 <code>head_out_count + k</code>）綁同一塊 buffer；DeepVQE-S 有 16 對。</li>
-<li>定點 state 埠兩端的 <code>zero_point</code> 都必須是 0（清零用位元組填 0，只有 zero_point 0 時才等於量化後的 0）。5/5、0/5、5/0 都在第一次送件前被埠檢查（<code>stream_check_ports()</code>）以 <code>STREAM_PORT_ERR_STATE_ZERO_POINT</code>（-110）拒絕；float 的 state 埠不看 zero_point。</li>
+<li>定點 state 埠兩端的 <code>zero_point</code> 都必須是 0（清零用位元組填 0，只有 zero_point 0 時才等於量化後的 0）。5/5、0/5、5/0 都在第一次送件前被埠檢查（<code>stream_check_ports()</code>）以 <code>STREAM_PORT_ERR_STATE_ZERO_POINT</code>（-110）拒絕；float 的 state 埠不看 zero_point，清零仍是填位元組 0，不受 <code>FLOAT_IN</code>／<code>FLOAT_OUT</code> 影響（見<a href="../dfn2/reference/board.html#float-io">Float I/O 模式</a>）。</li>
 <li>init 時每塊 state buffer 清零一次（memset 加 cache flush）。正常連續推論不碰 state，每包只交換特徵與 head。</li>
 <li>函式庫只在 reset 與加速器輸出非有限時動 state 並讓 <code>work.state_generation</code> 改變；sample 看到 generation 改變就清。回報失敗（<code>infer_status</code> 非 0）的一包只旁路該包，state 與 generation 都不動，所以 sample 在任何失敗的一包之後，也要在下一次實際送件前自行再清一次。</li>
 </ul>

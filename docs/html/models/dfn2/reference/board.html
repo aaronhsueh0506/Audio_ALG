@@ -57,13 +57,23 @@
 <tr><td><code>STREAM_PORT_ERR_STATE_PAIR</code>（-109）</td><td>state 輸入與輸出的格式、<code>scale_ratio</code>、軸或 stride 不一致</td></tr>
 <tr><td><code>STREAM_PORT_ERR_STATE_ZERO_POINT</code>（-110）</td><td>定點 state 埠（任一端）的 <code>zero_point</code> 不是 0；float 的 state 埠不看 zero_point</td></tr>
 </tbody></table>
-<p>每個埠依序檢查格式、scale、軸、stride、容量；最後檢查每個 state 輸入與它的輸出。這條規則對 DFN2、DeepVQE-S 與 Align-ULCNet 相同：state 的清零是對 buffer 填位元組 0，只有 <code>zero_point</code> 為 0 時才等於量化後的 0。主機端的 <code>stream/common</code> 的 <code>test_stream_bind</code> 以替身描述涵蓋這條路徑；真實的 descriptor 值要在取得正式 bin 後於板上核對。</p>
+<p>每個埠依序檢查格式、scale、軸、stride、容量；最後檢查每個 state 輸入與它的輸出。這條規則對 DFN2、DeepVQE-S 與 Align-ULCNet 相同：state 的清零是對 buffer 填位元組 0，只有 <code>zero_point</code> 為 0 時才等於量化後的 0（float 的 <code>0.0f</code> 也是零位元組）。主機端的 <code>stream/common</code> 的 <code>test_stream_bind</code> 以替身描述涵蓋這條路徑；真實的 descriptor 值要在取得正式 bin 後於板上核對。</p>
 <p>送件前的核對是另一道：每個成功的 pre 之後，<code>AI3_MODEL_IO_CHECK_WORK</code> 比對 <code>work.input_count</code>／<code>work.output_count</code> 與每個 tensor 的元素數、[b,c,h,w] 和資料指標是否等於模型設定的列。不符回 <code>AI3_MODEL_IO_ERR_COUNT</code>／<code>_ERR_SHAPE</code>／<code>_ERR_NULL</code>（共用程式的回傳碼範圍為 -301..-306）：不呼叫 AI3，該包以失敗交給 <code>ainr_postprocess()</code>（近恆等直通），仍是一次 pre 對一次 post。</p>
+
+<h2 id="float-io">Float I/O 模式</h2>
+<p>函式庫與 stream 層的 tensor 都是 float32，定點與 float 的軟體轉換只在板端 sample。每支 AI3 sample 開頭有編譯期的 <code>#define FLOAT_IN 0</code> 與 <code>#define FLOAT_OUT 0</code>（預設關閉，沒有執行期旗標）：<code>FLOAT_IN</code> 讓 NPU 量化訊號輸入，<code>FLOAT_OUT</code> 讓 NPU 反量化 head 輸出，CPU 不再轉換。開啟只省轉換，不省搬運：輸入的 <code>memcpy</code> 與 cache flush 仍在，head 讀回改為 flush 加 <code>memcpy(elem * 4)</code>。</p>
+<ul>
+<li>兩個值應相等。SDK 在開圖時套用 float I/O，state 的輸入與輸出共用同一塊 buffer、型別來自 SDK 回報；<code>FLOAT_IN != FLOAT_OUT</code> 沒有驗證過，只會有編譯警告（<code>#warning</code>；用 <code>-Werror</code> 建置時會變成錯誤）和啟動 log <code>[AI3] float_in=%d float_out=%d</code> 後面的 <code>WARNING: mixed setting</code>。</li>
+<li>State 埠不受這兩個 define 管，維持 SDK 回報的型別；清零是對 buffer 填位元組 0 並 flush cache，float 與定點通用，因為通過埠檢查的定點 state 兩端 <code>zero_point</code> 都是 0。</li>
+<li>模型永遠是定點，<code>FLOAT_IN</code>／<code>FLOAT_OUT</code> 只讓硬體在邊界轉換，SDK 回報的埠型別因此不能當作請求是否生效的依據，sample 不拿請求去比對回報的型別。<code>ai3_model_io_check_ports()</code> 通過後、任何 buffer 覆寫之前，sample 印出 <code>[AI3] float_in=%d float_out=%d</code>（混合時尾端加 <code>WARNING: mixed setting</code>）與每個輸入、輸出埠一行 <code>[AI3] in[i]</code>／<code>out[i]</code>（<code>float</code>、<code>bits</code>、<code>scale_ratio</code>、<code>zero_point</code>），供板端 A/B 比對；埠檢查不會因 float 與定點的差異而失敗。</li>
+<li>float head 可以帶 NaN／Inf（定點會飽和），NaN 預填與函式庫的有限值檢查仍在：被拒的那拍走近恆等直通並推進 generation。DFN2 的 <code>df_alpha</code> 在 sample 端夾到 [0, 1] 的步驟也保留。</li>
+<li>只能上板確認的：CTRL 位元是否也作用在 state 埠、NPU 內建轉換與 host 呼叫的數值是否相等、現有 <code>model.bin</code> 是否直接接受 float I/O。步驟見維護文件 <code>docs/maintenance/float-io-board-ab.md</code>。</li>
+</ul>
 
 <h2 id="state">State 與失敗後的回復</h2>
 <ul>
 <li>recurrent state（<code>h_gru</code>、full 另有 <code>df_convp_history</code>）留在加速器的 buffer，不經 host。每對 state 輸入與輸出綁同一塊 buffer：輸入 <code>signal_in_count + k</code> 與輸出 <code>head_out_count + k</code>；shape 取自模型設定，函式庫不保存。</li>
-<li>定點 state 埠兩端的 <code>zero_point</code> 都必須是 0（清零用位元組填 0，只有 zero_point 0 時才等於量化後的 0）；不為 0 的 graph 在第一次送件前被埠檢查（<code>stream_check_ports()</code>）以 <code>STREAM_PORT_ERR_STATE_ZERO_POINT</code>（-110）拒絕，float 的 state 埠不看 zero_point。</li>
+<li>定點 state 埠兩端的 <code>zero_point</code> 都必須是 0（清零用位元組填 0，只有 zero_point 0 時才等於量化後的 0）；不為 0 的 graph 在第一次送件前被埠檢查（<code>stream_check_ports()</code>）以 <code>STREAM_PORT_ERR_STATE_ZERO_POINT</code>（-110）拒絕，float 的 state 埠不看 zero_point，清零仍是填位元組 0（見<a href="#float-io">Float I/O 模式</a>）。</li>
 <li>每拍 <code>ainr_preprocess()</code> 之後，<code>work.state_generation</code> 與 sample 上次同步的值不同，就在這次執行前把 state 輸入 buffer 重載量化零。generation 在 <code>ainr_reset()</code>、暖機拍，以及 post 拒絕這拍的 head（例如 head 不是有限值）時前進。</li>
 <li>呼叫端自己通報的失敗（<code>infer_status != 0</code>）本身不推進 generation。但失敗的執行或讀回可能已經寫過 state，所以 sample 還要自己記一個「待回復」旗標：在 AI3 開始執行前設起，執行與全部 head 讀回都成功才清除；下一次送件前，generation 不同<b>或</b>旗標仍設著，就重載量化零。</li>
 </ul>

@@ -1,10 +1,9 @@
-# Four-channel linear AEC + beamformer flow (mcab) and the examples composed over it.
+# Four-microphone array AEC (lib/aec, AecConfig.n_mics = 4) + beamformer and the examples composed over it.
 #
 # This Makefile lives beside the 4-channel implementation; the parent pipelines/Makefile builds the
-# mono examples. libaudio_pipeline_mcab.a holds the flow layer, which drives the lane and
-# estimator objects the application creates; mcab_sample_flow.o (the application-side init in one
-# place) and mcab_sample_beam.o (SRP-PHAT/BF) are sample helpers; the post-beam RES (lib/aec), NR, comfort noise, synthesis and the neural post-filters are
-# separate libraries the example binaries chain.
+# mono examples. The array instance (lanes, shared delay, aligned far, fusion and the residual gain stage)
+# is part of libaec.a; array_sample_beam.o (SRP-PHAT/BF) is the sample helper; NR, comfort noise,
+# synthesis and the neural post-filters are separate libraries the example binaries chain.
 # AEC, NR, common, DOA, BF and spatial kernels remain component libs.
 #
 # Producers: audiolib's libaudio_common.a, lib/aec's libaec.a, lib/nr's libanr.a and audiolib's
@@ -13,26 +12,46 @@
 # the keyed archive path of the producers it needs; those identities, and only those, enter its
 # CFG_SIG, so the object/binary directory of a goal does not change when a producer it never
 # uses is reconfigured, and that producer need not exist:
-#   libaudio_pipeline_mcab.a, lib   common, aec         (mcab.o references only lib/aec)
-#   test_mcab                       common, aec, nr     (its reference chain calls the NR)
+#   test_4ch_chain                       common, aec, nr     (its reference chain calls the NR)
 #   every other goal                common, aec, nr, spatial
 # A goal built in a smaller scope lands in a different bin/obj directory than the same goal built
-# by `make all` or `make test`. print-lib-path prints the flow archive of the smaller scope;
-# print-bin-dir and print-obj-dir print the directory of `make all`, and PRINT_FOR=<goal> prints
-# the one `make <goal>` uses (PRINT_FOR=all for the archive of `make all`):
-#   make test_mcab && "$(make -s print-bin-dir PRINT_FOR=test_mcab)/test_mcab"
+# by `make all` or `make test`. print-bin-dir and print-obj-dir print the directory of `make all`,
+# and PRINT_FOR=<goal> prints the one `make <goal>` uses (PRINT_FOR=all for the archive of `make all`):
+#   make test_4ch_chain && "$(make -s print-bin-dir PRINT_FOR=test_4ch_chain)/test_4ch_chain"
 # Phase 2 (producer archives supplied) refuses a goal whose producers it did not receive.
 #
 # Common invocations:
 #   make SIMD=1
 #   make SIMD=0 test
-#   make mcab_raw
-#   make libaudio_pipeline_mcab.a   # needs only common and lib/aec (NR_DIR may be absent)
+#   make 4ch_raw
 
 CC ?= cc
 CXX ?= c++
 AR ?= ar
 RANLIB ?= ranlib
+
+# Every program here runs on the array instance. AEC_NO_ARRAY=1 selects the single-channel lib/aec (no array instance): this
+# Makefile then builds nothing and every goal prints a message and succeeds.
+AEC_NO_ARRAY ?= 0
+ifneq ($(words $(AEC_NO_ARRAY)),1)
+$(error AEC_NO_ARRAY must be exactly 0 or 1, got '$(AEC_NO_ARRAY)')
+endif
+ifneq ($(filter-out 0 1,$(AEC_NO_ARRAY)),)
+$(error AEC_NO_ARRAY must be exactly 0 or 1, got '$(AEC_NO_ARRAY)')
+endif
+ifeq ($(AEC_NO_ARRAY),1)
+.PHONY: all clean clean-all
+all:
+	@echo "pipelines/4ch: SKIPPED -- the four-microphone programs need the array instance; AEC_NO_ARRAY=1 builds the single-channel lib/aec only"
+OBJ_ROOT ?= obj
+BIN_ROOT ?= bin
+clean clean-all:
+	rm -rf "$(OBJ_ROOT)" "$(BIN_ROOT)"
+print-bin-dir print-obj-dir:
+	@echo "pipelines/4ch: $@ has no value under AEC_NO_ARRAY=1 (no four-microphone program is built)" >&2; exit 1
+.DEFAULT:
+	@echo "pipelines/4ch: $@ SKIPPED -- the four-microphone programs need the array instance; AEC_NO_ARRAY=1 builds the single-channel lib/aec only"
+else
 
 PIPELINES_DIR := ..
 ALG_DIR := ../..
@@ -69,28 +88,10 @@ NO_STDIO = 0
 DEBUG = 0
 TOOLCHAIN_CHECK = 1
 EXTRA_CFLAGS =
-# PROFILE=1 turns on per-hop stage timing across the whole chain: the module's own stages and,
-# through the PROFILE knob forwarded to the lib/aec build, the four summed off the lanes. Off
-# otherwise, so a release build takes no clock reads; McabLastTiming's doc comment (mcab.h)
-# carries the field list.
+# PROFILE=1 turns on per-hop stage timing: through the PROFILE knob forwarded to the lib/aec build
+# the array's stages (aec_array_get_timing()). Off otherwise, so a release build takes no clock reads.
 
-# PROFILE_CFLAGS goes into CFLAGS rather than EXTRA_CFLAGS, as SIMD does: EXTRA_CFLAGS is forwarded
-# to every producer sub-make and folded into CFG_SIG, so a -D smuggled through it reached lib/aec
-# twice, splitting identical objects across two keys and re-keying producers that never use the
-# macro. CFLAGS here is `override CFLAGS :=`, so a command-line assignment cannot drop the knob.
-# Both -D land in this Makefile's CFLAGS only; lib/aec gets AEC_STAGE_TIMING from the PROFILE knob
-# forwarded by name in FWD.
-
-# AEC_STAGE_TIMING is repeated on purpose: this layer's own TUs test it, to decide whether to copy
-# the lanes' record out and what the tests may assert about it; deriving both flags from PROFILE
-# keeps the two views consistent. A lib/aec pin without the PROFILE knob degrades to the one-half
-# state: the module's stages measure and the AEC block reads zero.
 PROFILE ?= 0
-ifeq ($(PROFILE),1)
-PROFILE_CFLAGS := -DMCAB_STAGE_TIMING=1 -DAEC_STAGE_TIMING=1
-else
-PROFILE_CFLAGS :=
-endif
 EXTRA_LDFLAGS =
 CPPFLAGS ?=
 CXXFLAGS ?=
@@ -154,8 +155,7 @@ endif
 
 # lib/nr's headers are on the include path only when this goal received libanr.a (see the producer
 # scope below): a goal that needs no NR neither names NR_DIR on its compile lines nor keys on it.
-# audiolib's include directories (common, doa, bf) stay on every goal: they are source directories,
-# and test_mcab reaches the sample beam headers through tests/mcab_test_rig.h without linking them.
+# audiolib's include directories (common, doa, bf) stay on every goal: they are source directories.
 NR_INC := $(if $(NR_LIB),-I$(NR_DIR)/include)
 
 override CFLAGS := -Wall -Wextra $(OPT_CFLAGS) -std=gnu99 \
@@ -166,7 +166,7 @@ override CFLAGS := -Wall -Wextra $(OPT_CFLAGS) -std=gnu99 \
           -I$(AUDIOLIB_DIR)/doa \
           -I$(AUDIOLIB_DIR)/bf \
           -I$(DFN2_DIR) \
-          $(CPPFLAGS) $(EXTRA_CFLAGS) $(SIMD_CFLAGS) $(PROFILE_CFLAGS) \
+          $(CPPFLAGS) $(EXTRA_CFLAGS) $(SIMD_CFLAGS) \
           -DAUDIO_PIPELINE_BACKEND_STR=\"$(BACKEND)\" \
           $(WERROR_CFLAGS) -ffp-contract=off -fno-math-errno
 LIB_CFLAGS := $(CFLAGS)
@@ -186,21 +186,18 @@ FWD = BACKEND=$(BACKEND) SIMD=$(SIMD) PROFILE=$(PROFILE) WERROR=$(WERROR) \
 # resolved nor keyed. aec = lib/aec's libaec.a, nr = lib/nr's libanr.a, spatial = audiolib's
 # libspatial_common.a + libdoa.a + libbf.a (one audiolib invocation builds the three).
 PRODUCERS_ALL := aec nr spatial
-NEEDS_lib := aec
-NEEDS_libaudio_pipeline_mcab.a := aec
-NEEDS_test_mcab := aec nr
+NEEDS_test_4ch_chain := aec nr
 
-DISPATCH_GOALS := all test libs lib libaudio_pipeline_mcab.a libdfn_res_stage.a \
-        mcab_raw mcab_external_static mcab_static 4ch_alignulcnet \
+DISPATCH_GOALS := all test libs libdfn_res_stage.a \
+        4ch_raw 4ch_external_static 4ch_static 4ch_alignulcnet \
         4ch_aec_bf_dfn_res \
-        test_mcab test_mcab_sample_beam test_4ch_dfn \
+        test_4ch_chain test_array_sample_beam test_4ch_dfn \
         test_4ch_ulcnet dump_delay_parity \
-        print-bin-dir print-obj-dir print-lib-path audit-no-stdio \
-        test-third-party test-mcab-sample-driver
+        print-bin-dir print-obj-dir audit-no-stdio \
+        test-third-party test-array-sample-driver
 
 # The query goals report the directory of another goal's build: PRINT_FOR=<goal> names it. Without
-# it print-bin-dir and print-obj-dir report `make all` and print-lib-path the flow archive of
-# `make libaudio_pipeline_mcab.a`.
+# it print-bin-dir and print-obj-dir report `make all`.
 PRINT_FOR ?=
 ifneq ($(PRINT_FOR),)
 ifneq ($(words $(PRINT_FOR)),1)
@@ -211,7 +208,7 @@ $(error PRINT_FOR='$(PRINT_FOR)' is not a goal of this Makefile)
 endif
 endif
 
-goal_scope = $(strip $(if $(filter print-lib-path,$(1)),$(or $(PRINT_FOR),libaudio_pipeline_mcab.a),$(if $(filter print-bin-dir print-obj-dir,$(1)),$(or $(PRINT_FOR),all),$(1))))
+goal_scope = $(strip $(if $(filter print-bin-dir print-obj-dir,$(1)),$(or $(PRINT_FOR),all),$(1)))
 goal_needs = $(if $(filter undefined,$(origin NEEDS_$(call goal_scope,$(1)))),$(PRODUCERS_ALL),$(NEEDS_$(call goal_scope,$(1))))
 
 # Resolve the producers of the goal's scope before constructing this consumer's CFG identity.
@@ -267,17 +264,17 @@ ifneq ($(SPATIAL_COMMON_LIB),)
 PRODUCER_SIGS += SPATIAL_PRODUCER_SIG=$(SPATIAL_PRODUCER_SIG)
 endif
 
-SRCS := mcab.c mcab_sample_flow.c mcab_sample_beam.c \
+SRCS := array_sample_beam.c \
         ../dfn/dfn_res_stage.c ../dfn/dfn_rate_bridge.c \
         $(DFN2_DIR)/dfn2_process.c $(DFN2_DIR)/dfn2_model_io.c \
         $(DFN2_DIR)/dfn2_prepost.c \
         ../ulcnet/ulcnet_nn_stage.c \
-        mcab_raw.c mcab_sample_driver.c \
-        mcab_external_static.c mcab_static.c \
-        tests/test_mcab.c tests/test_mcab_sample_driver.c \
+        4ch_raw.c array_sample_driver.c \
+        4ch_external_static.c 4ch_static.c \
+        tests/test_4ch_chain.c tests/test_array_sample_driver.c \
         aec_bf_dfn_res/tests/test_4ch_dfn.c \
         aec_bf_dfn_res/main.c \
-        tests/test_mcab_sample_beam.c tests/dump_delay_parity.c \
+        tests/test_array_sample_beam.c tests/dump_delay_parity.c \
         alignulcnet/tests/test_4ch_ulcnet.c \
         $(ULCNET_DIR)/ulcnet_accelerator_adapter.c \
         $(ULCNET_DIR)/ulcnet_prepost.c \
@@ -293,14 +290,9 @@ OBJ_ROOT ?= obj
 BIN_ROOT ?= bin
 OBJ_DIR := $(OBJ_ROOT)/$(BACKEND)-$(CFG_SIG)
 BIN_DIR := $(BIN_ROOT)/$(BACKEND)-$(CFG_SIG)
-PIPELINE_LIB := $(BIN_DIR)/libaudio_pipeline_mcab.a
 DFN_PIPELINE_LIB := $(BIN_DIR)/libdfn_res_stage.a
 
-# The module: the shared delay, the four-lane flow and the fuse. The lane configs, the
-# beamformer helper, the post-beam stages and the NN stages are not part of it.
-PIPELINE_OBJS := $(OBJ_DIR)/mcab.o
-SAMPLE_FLOW_OBJ := $(OBJ_DIR)/mcab_sample_flow.o
-SAMPLE_BEAM_OBJ := $(OBJ_DIR)/mcab_sample_beam.o
+SAMPLE_BEAM_OBJ := $(OBJ_DIR)/array_sample_beam.o
 DFN_PIPELINE_OBJS := $(OBJ_DIR)/dfn_res_stage.o \
                      $(OBJ_DIR)/dfn_rate_bridge.o \
                      $(OBJ_DIR)/dfn2_process.o \
@@ -332,14 +324,8 @@ _cfg_guard:
 	  fi; \
 	done
 
-$(OBJ_DIR)/mcab.o: mcab.c mcab.h mcab_internal.h | _cfg_guard
-	$(CC) $(LIB_CFLAGS) -MD -MP -c -o $@ $<
-
-# Sample-level helpers over the flow; not in the module archive.
-$(OBJ_DIR)/mcab_sample_flow.o: mcab_sample_flow.c mcab_sample_flow.h mcab.h | _cfg_guard
-	$(CC) $(LIB_CFLAGS) -MD -MP -c -o $@ $<
-
-$(OBJ_DIR)/mcab_sample_beam.o: mcab_sample_beam.c mcab_sample_beam.h mcab.h | _cfg_guard
+# Sample-level helpers over the array; not in an archive.
+$(OBJ_DIR)/array_sample_beam.o: array_sample_beam.c array_sample_beam.h | _cfg_guard
 	$(CC) $(LIB_CFLAGS) -MD -MP -c -o $@ $<
 
 $(OBJ_DIR)/dfn_res_stage.o: ../dfn/dfn_res_stage.c ../dfn/dfn_res_stage.h | _cfg_guard
@@ -359,10 +345,10 @@ $(OBJ_DIR)/dfn2_prepost.o: $(DFN2_DIR)/dfn2_prepost.c $(DFN2_DIR)/dfn2_prepost.h
 
 # aec_bf_dfn_res/main.c and its tests/test_4ch_dfn.c compose the unit with
 # ../dfn/dfn_hop.h.
-$(OBJ_DIR)/test_4ch_dfn.o: aec_bf_dfn_res/tests/test_4ch_dfn.c mcab.h mcab_sample_flow.h mcab_sample_beam.h mcab_sample_post.h tests/conv_chain_mcab.h tests/mcab_test_rig.h ../dfn/dfn_hop.h ../dfn/tests/dfn_test_fixture.h ../dfn/tests/dfn_test_grid.h | _cfg_guard
+$(OBJ_DIR)/test_4ch_dfn.o: aec_bf_dfn_res/tests/test_4ch_dfn.c array_sample_beam.h array_sample_post.h tests/conv_chain_4ch.h tests/array_test_rig.h ../dfn/dfn_hop.h ../dfn/tests/dfn_test_fixture.h ../dfn/tests/dfn_test_grid.h | _cfg_guard
 	$(CC) $(CFLAGS) $(DFN_TEST_CFLAGS) -MD -MP -c -o $@ $<
 
-$(OBJ_DIR)/4ch_aec_bf_dfn_res_main.o: aec_bf_dfn_res/main.c mcab_sample_driver.h mcab.h mcab_sample_flow.h mcab_sample_beam.h mcab_sample_post.h ../dfn/dfn_hop.h ../dfn/dfn_example_args.h ../dfn/dfn_unit_partition.h ../common/example_cli.h ../dfn/dfn_hop_pool.h | _cfg_guard
+$(OBJ_DIR)/4ch_aec_bf_dfn_res_main.o: aec_bf_dfn_res/main.c array_sample_driver.h array_sample_beam.h array_sample_post.h ../dfn/dfn_hop.h ../dfn/dfn_example_args.h ../dfn/dfn_unit_partition.h ../common/example_cli.h ../dfn/dfn_hop_pool.h | _cfg_guard
 	$(CC) $(CFLAGS) -MD -MP -c -o $@ $<
 
 # alignulcnet/main.c and its tests/test_4ch_ulcnet.c compose the unit with the
@@ -385,40 +371,35 @@ $(OBJ_DIR)/ulcnet_prepost.o: $(ULCNET_DIR)/ulcnet_prepost.c $(ULCNET_DIR)/ulcnet
 $(OBJ_DIR)/ulcnet_accelerator_adapter.o: $(ULCNET_DIR)/ulcnet_accelerator_adapter.c $(ULCNET_DIR)/ulcnet_accelerator_adapter.h $(ULCNET_DIR)/ulcnet_prepost.h $(ULCNET_DIR)/ulcnet_model_io.h $(ULCNET_DIR)/ulcnet_process.h | _cfg_guard
 	$(CC) $(LIB_CFLAGS) -I$(ULCNET_DIR) -MD -MP -c -o $@ $<
 
-$(OBJ_DIR)/4ch_alignulcnet_main.o: alignulcnet/main.c mcab_sample_driver.h mcab.h mcab_sample_flow.h mcab_sample_beam.h ../ulcnet/ulcnet_nn_stage.h ../common/example_cli.h $(ULCNET_DIR)/ulcnet_accelerator_adapter.h | _cfg_guard
+$(OBJ_DIR)/4ch_alignulcnet_main.o: alignulcnet/main.c array_sample_driver.h array_sample_beam.h ../ulcnet/ulcnet_nn_stage.h ../common/example_cli.h $(ULCNET_DIR)/ulcnet_accelerator_adapter.h | _cfg_guard
 	$(CC) $(CFLAGS) -I$(ULCNET_DIR) -MD -MP -c -o $@ $<
 
-$(OBJ_DIR)/test_4ch_ulcnet.o: alignulcnet/tests/test_4ch_ulcnet.c mcab.h mcab_sample_flow.h mcab_sample_beam.h ../ulcnet/ulcnet_nn_stage.h $(ULCNET_DIR)/ulcnet_process.h | _cfg_guard
+$(OBJ_DIR)/test_4ch_ulcnet.o: alignulcnet/tests/test_4ch_ulcnet.c array_sample_beam.h ../ulcnet/ulcnet_nn_stage.h $(ULCNET_DIR)/ulcnet_process.h | _cfg_guard
 	$(CC) $(CFLAGS) -I$(ULCNET_DIR) -MD -MP -c -o $@ $<
 
-$(OBJ_DIR)/mcab_raw.o: mcab_raw.c mcab.h mcab_sample_flow.h mcab_sample_beam.h mcab_sample_driver.h mcab_sample_post.h | _cfg_guard
+$(OBJ_DIR)/4ch_raw.o: 4ch_raw.c array_sample_beam.h array_sample_driver.h array_sample_post.h array_sample_unit.h | _cfg_guard
 	$(CC) $(CFLAGS) -MD -MP -c -o $@ $<
 
-$(OBJ_DIR)/test_mcab_sample_driver.o: tests/test_mcab_sample_driver.c mcab_sample_driver.h mcab.h mcab_sample_flow.h mcab_sample_beam.h ../common/example_cli.h | _cfg_guard
+$(OBJ_DIR)/test_array_sample_driver.o: tests/test_array_sample_driver.c array_sample_driver.h array_sample_beam.h ../common/example_cli.h | _cfg_guard
 	$(CC) $(CFLAGS) -MD -MP -c -o $@ $<
 
-$(OBJ_DIR)/mcab_sample_driver.o: mcab_sample_driver.c mcab_sample_driver.h mcab.h mcab_sample_flow.h mcab_sample_beam.h ../common/example_cli.h | _cfg_guard
+$(OBJ_DIR)/array_sample_driver.o: array_sample_driver.c array_sample_driver.h array_sample_beam.h ../common/example_cli.h | _cfg_guard
 	$(CC) $(CFLAGS) -MD -MP -c -o $@ $<
 
-$(OBJ_DIR)/mcab_external_static.o: mcab_external_static.c mcab.h mcab_sample_post.h | _cfg_guard
+$(OBJ_DIR)/4ch_external_static.o: 4ch_external_static.c array_sample_post.h | _cfg_guard
 	$(CC) $(CFLAGS) -MD -MP -c -o $@ $<
 
-$(OBJ_DIR)/mcab_static.o: mcab_static.c mcab.h mcab_sample_flow.h mcab_sample_beam.h mcab_sample_driver.h mcab_sample_post.h | _cfg_guard
+$(OBJ_DIR)/4ch_static.o: 4ch_static.c array_sample_beam.h array_sample_driver.h array_sample_post.h array_sample_unit.h | _cfg_guard
 	$(CC) $(CFLAGS) -MD -MP -c -o $@ $<
 
-$(OBJ_DIR)/test_mcab.o: tests/test_mcab.c mcab.h mcab_internal.h mcab_sample_flow.h tests/conv_chain_mcab.h tests/mcab_test_rig.h | _cfg_guard
+$(OBJ_DIR)/test_4ch_chain.o: tests/test_4ch_chain.c array_sample_beam.h tests/conv_chain_4ch.h tests/array_test_rig.h | _cfg_guard
 	$(CC) $(CFLAGS) -MD -MP -c -o $@ $<
 
-$(OBJ_DIR)/test_mcab_sample_beam.o: tests/test_mcab_sample_beam.c mcab.h mcab_sample_flow.h mcab_sample_beam.h tests/conv_chain_mcab.h tests/mcab_test_rig.h mcab_sample_post.h | _cfg_guard
+$(OBJ_DIR)/test_array_sample_beam.o: tests/test_array_sample_beam.c array_sample_beam.h tests/conv_chain_4ch.h tests/array_test_rig.h array_sample_post.h | _cfg_guard
 	$(CC) $(CFLAGS) -MD -MP -c -o $@ $<
 
-$(OBJ_DIR)/dump_delay_parity.o: tests/dump_delay_parity.c mcab.h mcab_internal.h mcab_sample_flow.h tests/mcab_test_rig.h | _cfg_guard
+$(OBJ_DIR)/dump_delay_parity.o: tests/dump_delay_parity.c array_sample_beam.h tests/array_test_rig.h | _cfg_guard
 	$(CC) $(CFLAGS) -MD -MP -c -o $@ $<
-
-$(PIPELINE_LIB): $(PIPELINE_OBJS) | _cfg_guard
-	t="$@.tmp.$$$$" && rm -f "$$t" && $(AR) rcs "$$t" $^ && \
-	  $(RANLIB) "$$t" && mv -f "$$t" $@
-	@echo "libaudio_pipeline_mcab.a [$(BACKEND), SIMD=$(SIMD)] -> $@"
 
 $(DFN_PIPELINE_LIB): $(DFN_PIPELINE_OBJS) | _cfg_guard
 	t="$@.tmp.$$$$" && rm -f "$$t" && $(AR) rcs "$$t" $^ && \
@@ -426,37 +407,37 @@ $(DFN_PIPELINE_LIB): $(DFN_PIPELINE_OBJS) | _cfg_guard
 	@echo "libdfn_res_stage.a [$(BACKEND), SIMD=$(SIMD)] -> $@"
 
 ifneq ($(COMMON_LIB),)
-.PHONY: all test libs lib libaudio_pipeline_mcab.a libdfn_res_stage.a \
-        mcab_raw mcab_external_static mcab_static 4ch_alignulcnet \
+.PHONY: all test libs libdfn_res_stage.a \
+        4ch_raw 4ch_external_static 4ch_static 4ch_alignulcnet \
         4ch_aec_bf_dfn_res \
-        test_mcab test_mcab_sample_beam test_4ch_dfn \
+        test_4ch_chain test_array_sample_beam test_4ch_dfn \
         test_4ch_ulcnet dump_delay_parity \
-        audit-no-stdio test-third-party test-mcab-sample-driver
+        audit-no-stdio test-third-party test-array-sample-driver
 
-all: $(PIPELINE_LIB) $(DFN_PIPELINE_LIB) \
-     $(BIN_DIR)/mcab_raw $(BIN_DIR)/mcab_external_static $(BIN_DIR)/mcab_static \
+all: $(DFN_PIPELINE_LIB) \
+     $(BIN_DIR)/4ch_raw $(BIN_DIR)/4ch_external_static $(BIN_DIR)/4ch_static \
      $(BIN_DIR)/4ch_aec_bf_dfn_res
 
 # The 4ch_alignulcnet application shares this Makefile (it composes the unit with the NN stage
 # example), so its acceptance test and board skeleton run here too: this directory's `make test`
 # is the one-stop gate, mirroring the mono arrangement in pipelines/Makefile.
-test: test-third-party test-mcab-sample-driver \
-      $(BIN_DIR)/test_mcab \
+test: test-third-party test-array-sample-driver \
+      $(BIN_DIR)/test_4ch_chain \
       $(BIN_DIR)/test_4ch_dfn \
-      $(BIN_DIR)/test_mcab_sample_beam $(BIN_DIR)/mcab_raw \
-      $(BIN_DIR)/mcab_external_static \
-      $(BIN_DIR)/mcab_static \
+      $(BIN_DIR)/test_array_sample_beam $(BIN_DIR)/4ch_raw \
+      $(BIN_DIR)/4ch_external_static \
+      $(BIN_DIR)/4ch_static \
       $(BIN_DIR)/test_4ch_ulcnet $(BIN_DIR)/4ch_alignulcnet \
       $(BIN_DIR)/4ch_aec_bf_dfn_res
-	"$(abspath $(BIN_DIR))/test_mcab"
+	"$(abspath $(BIN_DIR))/test_4ch_chain"
 	"$(abspath $(BIN_DIR))/test_4ch_dfn"
-	"$(abspath $(BIN_DIR))/test_mcab_sample_beam" "$(abspath $(BIN_DIR))" "$(abspath $(OBJ_DIR))"
+	"$(abspath $(BIN_DIR))/test_array_sample_beam" "$(abspath $(BIN_DIR))" "$(abspath $(OBJ_DIR))"
 	"$(abspath $(BIN_DIR))/test_4ch_ulcnet"
-	"$(abspath $(BIN_DIR))/mcab_external_static" --sample-rate 16000
-	"$(abspath $(BIN_DIR))/mcab_external_static" --sample-rate 48000
-	"$(abspath $(BIN_DIR))/mcab_static" --sample-rate 16000
-	"$(abspath $(BIN_DIR))/mcab_static" --sample-rate 48000
-# The command lines of mcab_static and mcab_external_static: bad numbers exit 2, refused configs 1.
+	"$(abspath $(BIN_DIR))/4ch_external_static" --sample-rate 16000
+	"$(abspath $(BIN_DIR))/4ch_external_static" --sample-rate 48000
+	"$(abspath $(BIN_DIR))/4ch_static" --sample-rate 16000
+	"$(abspath $(BIN_DIR))/4ch_static" --sample-rate 48000
+# The command lines of 4ch_static and 4ch_external_static: bad numbers exit 2, refused configs 1.
 	bash tests/test_cli_strict.sh "$(abspath $(BIN_DIR))"
 	"$(abspath $(BIN_DIR))/4ch_alignulcnet"
 	"$(abspath $(BIN_DIR))/4ch_alignulcnet" --delay-num-filters 1
@@ -481,18 +462,17 @@ test: test-third-party test-mcab-sample-driver \
 # Empty, leading or trailing garbage and out-of-int-range numbers.
 	for v in "" " 3" "3 " x3 +-1 99999999999 999999999999999999999999; do "$(abspath $(BIN_DIR))/4ch_alignulcnet" --delay-num-filters "$$v" >/dev/null 2>&1; test $$? -eq 2 || exit 1; done
 
-lib libaudio_pipeline_mcab.a: $(PIPELINE_LIB)
 libdfn_res_stage.a: $(DFN_PIPELINE_LIB)
-libs: $(COMMON_LIB) $(AEC_LIB) $(NR_LIB) $(SPATIAL_COMMON_LIB) $(DOA_LIB) $(BF_LIB) $(PIPELINE_LIB) $(DFN_PIPELINE_LIB) \
-      $(SAMPLE_FLOW_OBJ) $(SAMPLE_BEAM_OBJ)
-mcab_raw: $(BIN_DIR)/mcab_raw
-mcab_external_static: $(BIN_DIR)/mcab_external_static
-mcab_static: $(BIN_DIR)/mcab_static
+libs: $(COMMON_LIB) $(AEC_LIB) $(NR_LIB) $(SPATIAL_COMMON_LIB) $(DOA_LIB) $(BF_LIB) $(DFN_PIPELINE_LIB) \
+      $(SAMPLE_BEAM_OBJ)
+4ch_raw: $(BIN_DIR)/4ch_raw
+4ch_external_static: $(BIN_DIR)/4ch_external_static
+4ch_static: $(BIN_DIR)/4ch_static
 4ch_alignulcnet: $(BIN_DIR)/4ch_alignulcnet
 4ch_aec_bf_dfn_res: $(BIN_DIR)/4ch_aec_bf_dfn_res
-test_mcab: $(BIN_DIR)/test_mcab
+test_4ch_chain: $(BIN_DIR)/test_4ch_chain
 test_4ch_dfn: $(BIN_DIR)/test_4ch_dfn
-test_mcab_sample_beam: $(BIN_DIR)/test_mcab_sample_beam
+test_array_sample_beam: $(BIN_DIR)/test_array_sample_beam
 test_4ch_ulcnet: $(BIN_DIR)/test_4ch_ulcnet
 # CSV dumper for the C/Python per-hop alignment parity test
 # (tests/test_delay_parity.py builds and runs it); not part of `make test`,
@@ -500,16 +480,16 @@ test_4ch_ulcnet: $(BIN_DIR)/test_4ch_ulcnet
 dump_delay_parity: $(BIN_DIR)/dump_delay_parity
 
 # Same audit as the mono full stack: no archive may reference the stdio set
-# (printf family, stderr, fputc, fwrite). The module's archive carries the module TU.
-audit-no-stdio: $(PIPELINE_LIB) $(DFN_PIPELINE_LIB) $(AEC_LIB) $(NR_LIB) $(COMMON_LIB) \
-                $(SPATIAL_COMMON_LIB) $(DOA_LIB) $(BF_LIB) $(SAMPLE_FLOW_OBJ) $(SAMPLE_BEAM_OBJ)
+# (printf family, stderr, fputc, fwrite).
+audit-no-stdio: $(DFN_PIPELINE_LIB) $(AEC_LIB) $(NR_LIB) $(COMMON_LIB) \
+                $(SPATIAL_COMMON_LIB) $(DOA_LIB) $(BF_LIB) $(SAMPLE_BEAM_OBJ)
 	@test "$(NO_STDIO)" = 1 || { \
 	  echo "FATAL: audit-no-stdio must be invoked with NO_STDIO=1" >&2; \
 	  exit 1; \
 	}
 	@pat='^_?(fprintf|vfprintf|printf|puts|fputs|stderr|__stderrp|fputc|fwrite)$$'; \
-	 for archive in "$(PIPELINE_LIB)" "$(DFN_PIPELINE_LIB)" "$(AEC_LIB)" "$(NR_LIB)" "$(COMMON_LIB)" \
-	                "$(SPATIAL_COMMON_LIB)" "$(DOA_LIB)" "$(BF_LIB)" "$(SAMPLE_FLOW_OBJ)" "$(SAMPLE_BEAM_OBJ)"; do \
+	 for archive in "$(DFN_PIPELINE_LIB)" "$(AEC_LIB)" "$(NR_LIB)" "$(COMMON_LIB)" \
+	                "$(SPATIAL_COMMON_LIB)" "$(DOA_LIB)" "$(BF_LIB)" "$(SAMPLE_BEAM_OBJ)"; do \
 	  hits=$$(nm -A "$$archive" | awk -v re="$$pat" '{ n=$$NF; if (n ~ re) print }'); \
 	  if [ -n "$$hits" ]; then echo "FAIL: stdio symbols in $$archive" >&2; echo "$$hits" >&2; exit 1; fi; \
 	 done; \
@@ -548,27 +528,25 @@ $(BF_LIB): FORCE
 endif
 
 
-# The spatial dependencies (SRP-PHAT, BF, VAD) live in audiolib and test themselves there; this
+# The spatial dependencies (SRP-PHAT and BF) live in audiolib and test themselves there; this
 # target only invokes audiolib's tests.
 test-third-party: FORCE
 	+$(MAKE) -C $(AUDIOLIB_DIR) $(FWD) test
 
-# The module needs only lib/aec (and NR/common for the post stages). FLOW_LIBS adds the sample
-# builder of the application-side init (mcab_sample_flow.o); UNIT_LIBS adds the sample beamformer
-# helper, which pulls SRP-PHAT and BF. Sample objects first, then the module, DOA, BF, spatial
-# kernels, AEC, NR, common.
-CORE_LIBS := $(PIPELINE_LIB) $(AEC_LIB) $(NR_LIB) $(COMMON_LIB)
-FLOW_LIBS := $(SAMPLE_FLOW_OBJ) $(CORE_LIBS)
-UNIT_LIBS := $(SAMPLE_BEAM_OBJ) $(SAMPLE_FLOW_OBJ) $(PIPELINE_LIB) $(DOA_LIB) $(BF_LIB) $(SPATIAL_COMMON_LIB) $(AEC_LIB) $(NR_LIB) $(COMMON_LIB)
+# The array needs only lib/aec (and NR/common for the post stages). UNIT_LIBS adds the sample
+# beamformer helper, which pulls SRP-PHAT and BF. Sample object first, then DOA, BF, spatial kernels,
+# AEC, NR, common.
+CORE_LIBS := $(AEC_LIB) $(NR_LIB) $(COMMON_LIB)
+UNIT_LIBS := $(SAMPLE_BEAM_OBJ) $(DOA_LIB) $(BF_LIB) $(SPATIAL_COMMON_LIB) $(AEC_LIB) $(NR_LIB) $(COMMON_LIB)
 
-$(BIN_DIR)/test_mcab: $(OBJ_DIR)/test_mcab.o $(FLOW_LIBS) | _cfg_guard
-	$(LINK) -o $@ $(OBJ_DIR)/test_mcab.o $(FLOW_LIBS) $(LDLIBS)
+$(BIN_DIR)/test_4ch_chain: $(OBJ_DIR)/test_4ch_chain.o $(CORE_LIBS) | _cfg_guard
+	$(LINK) -o $@ $(OBJ_DIR)/test_4ch_chain.o $(CORE_LIBS) $(LDLIBS)
 
-$(BIN_DIR)/dump_delay_parity: $(OBJ_DIR)/dump_delay_parity.o $(FLOW_LIBS) | _cfg_guard
-	$(LINK) -o $@ $(OBJ_DIR)/dump_delay_parity.o $(FLOW_LIBS) $(LDLIBS)
+$(BIN_DIR)/dump_delay_parity: $(OBJ_DIR)/dump_delay_parity.o $(CORE_LIBS) | _cfg_guard
+	$(LINK) -o $@ $(OBJ_DIR)/dump_delay_parity.o $(CORE_LIBS) $(LDLIBS)
 
-$(BIN_DIR)/test_mcab_sample_beam: $(OBJ_DIR)/test_mcab_sample_beam.o $(UNIT_LIBS) | _cfg_guard
-	$(LINK) -o $@ $(OBJ_DIR)/test_mcab_sample_beam.o $(UNIT_LIBS) $(LDLIBS)
+$(BIN_DIR)/test_array_sample_beam: $(OBJ_DIR)/test_array_sample_beam.o $(UNIT_LIBS) | _cfg_guard
+	$(LINK) -o $@ $(OBJ_DIR)/test_array_sample_beam.o $(UNIT_LIBS) $(LDLIBS)
 
 # The NN stage example and the ULCNet framing objects the stage links.
 ULCNET_4CH_OBJS := $(OBJ_DIR)/ulcnet_nn_stage.o \
@@ -587,32 +565,32 @@ ULCNET_ADAPTER_OBJS := $(OBJ_DIR)/ulcnet_accelerator_adapter.o \
                        $(OBJ_DIR)/ulcnet_prepost.o \
                        $(OBJ_DIR)/ulcnet_model_io.o
 
-$(BIN_DIR)/4ch_alignulcnet: $(OBJ_DIR)/4ch_alignulcnet_main.o $(OBJ_DIR)/mcab_sample_driver.o $(ULCNET_ADAPTER_OBJS) $(ULCNET_4CH_OBJS) $(UNIT_LIBS) | _cfg_guard
-	$(LINK) -o $@ $(OBJ_DIR)/4ch_alignulcnet_main.o $(OBJ_DIR)/mcab_sample_driver.o $(ULCNET_ADAPTER_OBJS) $(ULCNET_4CH_OBJS) $(UNIT_LIBS) $(LDLIBS)
+$(BIN_DIR)/4ch_alignulcnet: $(OBJ_DIR)/4ch_alignulcnet_main.o $(OBJ_DIR)/array_sample_driver.o $(ULCNET_ADAPTER_OBJS) $(ULCNET_4CH_OBJS) $(UNIT_LIBS) | _cfg_guard
+	$(LINK) -o $@ $(OBJ_DIR)/4ch_alignulcnet_main.o $(OBJ_DIR)/array_sample_driver.o $(ULCNET_ADAPTER_OBJS) $(ULCNET_4CH_OBJS) $(UNIT_LIBS) $(LDLIBS)
 
-# The 4-channel DFN2 example and its test compose the unit and an AecRes of their own, so they
-# link the DFN archive ahead of the unit's archives.
-$(BIN_DIR)/4ch_aec_bf_dfn_res: $(OBJ_DIR)/4ch_aec_bf_dfn_res_main.o $(OBJ_DIR)/mcab_sample_driver.o $(DFN_PIPELINE_LIB) $(UNIT_LIBS) | _cfg_guard
-	$(LINK) -o $@ $(OBJ_DIR)/4ch_aec_bf_dfn_res_main.o $(OBJ_DIR)/mcab_sample_driver.o $(DFN_PIPELINE_LIB) $(UNIT_LIBS) $(LDLIBS)
+# The 4-channel DFN2 example and its test compose the unit, so they link the DFN archive ahead of
+# the unit's archives.
+$(BIN_DIR)/4ch_aec_bf_dfn_res: $(OBJ_DIR)/4ch_aec_bf_dfn_res_main.o $(OBJ_DIR)/array_sample_driver.o $(DFN_PIPELINE_LIB) $(UNIT_LIBS) | _cfg_guard
+	$(LINK) -o $@ $(OBJ_DIR)/4ch_aec_bf_dfn_res_main.o $(OBJ_DIR)/array_sample_driver.o $(DFN_PIPELINE_LIB) $(UNIT_LIBS) $(LDLIBS)
 
 $(BIN_DIR)/test_4ch_dfn: $(OBJ_DIR)/test_4ch_dfn.o $(DFN_PIPELINE_LIB) $(UNIT_LIBS) | _cfg_guard
 	$(LINK) -o $@ $(OBJ_DIR)/test_4ch_dfn.o $(DFN_PIPELINE_LIB) $(UNIT_LIBS) $(LDLIBS)
 
-# mcab_external_static spells the application-side init out and needs the module only.
-$(BIN_DIR)/mcab_external_static: $(OBJ_DIR)/mcab_external_static.o $(CORE_LIBS) | _cfg_guard
-	$(LINK) -o $@ $(OBJ_DIR)/mcab_external_static.o $(CORE_LIBS) $(LDLIBS)
+# 4ch_external_static spells the application-side init out and needs lib/aec only.
+$(BIN_DIR)/4ch_external_static: $(OBJ_DIR)/4ch_external_static.o $(CORE_LIBS) | _cfg_guard
+	$(LINK) -o $@ $(OBJ_DIR)/4ch_external_static.o $(CORE_LIBS) $(LDLIBS)
 
-$(BIN_DIR)/mcab_static: $(OBJ_DIR)/mcab_static.o $(OBJ_DIR)/mcab_sample_driver.o $(UNIT_LIBS) | _cfg_guard
-	$(LINK) -o $@ $(OBJ_DIR)/mcab_static.o $(OBJ_DIR)/mcab_sample_driver.o $(UNIT_LIBS) $(LDLIBS)
+$(BIN_DIR)/4ch_static: $(OBJ_DIR)/4ch_static.o $(OBJ_DIR)/array_sample_driver.o $(UNIT_LIBS) | _cfg_guard
+	$(LINK) -o $@ $(OBJ_DIR)/4ch_static.o $(OBJ_DIR)/array_sample_driver.o $(UNIT_LIBS) $(LDLIBS)
 
-$(BIN_DIR)/mcab_raw: $(OBJ_DIR)/mcab_raw.o $(OBJ_DIR)/mcab_sample_driver.o $(UNIT_LIBS) | _cfg_guard
-	$(LINK) -o $@ $(OBJ_DIR)/mcab_raw.o $(OBJ_DIR)/mcab_sample_driver.o $(UNIT_LIBS) $(LDLIBS)
+$(BIN_DIR)/4ch_raw: $(OBJ_DIR)/4ch_raw.o $(OBJ_DIR)/array_sample_driver.o $(UNIT_LIBS) | _cfg_guard
+	$(LINK) -o $@ $(OBJ_DIR)/4ch_raw.o $(OBJ_DIR)/array_sample_driver.o $(UNIT_LIBS) $(LDLIBS)
 
 # The sample runner has no algorithm-library link dependency.
-test-mcab-sample-driver: $(BIN_DIR)/test_mcab_sample_driver
-	"$(abspath $(BIN_DIR))/test_mcab_sample_driver"
-$(BIN_DIR)/test_mcab_sample_driver: $(OBJ_DIR)/test_mcab_sample_driver.o $(OBJ_DIR)/mcab_sample_driver.o | _cfg_guard
-	$(LINK) -o $@ $(OBJ_DIR)/test_mcab_sample_driver.o $(OBJ_DIR)/mcab_sample_driver.o $(LDLIBS)
+test-array-sample-driver: $(BIN_DIR)/test_array_sample_driver
+	"$(abspath $(BIN_DIR))/test_array_sample_driver"
+$(BIN_DIR)/test_array_sample_driver: $(OBJ_DIR)/test_array_sample_driver.o $(OBJ_DIR)/array_sample_driver.o | _cfg_guard
+	$(LINK) -o $@ $(OBJ_DIR)/test_array_sample_driver.o $(OBJ_DIR)/array_sample_driver.o $(LDLIBS)
 endif
 
 ifeq ($(COMMON_LIB),)
@@ -622,8 +600,6 @@ print-bin-dir:
 	@echo $(abspath $(BIN_DIR))
 print-obj-dir:
 	@echo $(abspath $(OBJ_DIR))
-print-lib-path:
-	@echo $(abspath $(PIPELINE_LIB))
 endif
 
 clean:
@@ -636,3 +612,4 @@ clean-all: clean
 	$(MAKE) -C $(COMMON_DIR) clean
 
 -include $(wildcard $(OBJ_DIR)/*.d)
+endif # AEC_NO_ARRAY

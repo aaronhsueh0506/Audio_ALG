@@ -1,22 +1,24 @@
 /** AEC(linear) -> echo-aware NR -> RES, composed here from the library calls. Example code: Aec
  * (lib/aec) for the linear stage and its own RES gain, AnrDenoiser (lib/nr) and AcIstft (audiolib)
  * initialised here. Per hop:
- *     aec_process_context(aec, mic, ref);
- *     follow_post_reset();                             // new aec_post_reset_serial(): clear the OLA tail, reseed the CNG
- *     aec_get_res_context(aec, &ctx);                  // R2, CN and G_res (ctx.res_gain)
- *     aec_get_output_base(aec, &base);                 // B: the rendering base (E, or E + echo on a guard hop)
- *     G_nr = anr_process_gain(nr, B, R2 / 32768^2) + anr_get_gain(nr);
- *     P = B * min(G_nr, G_res) + comfort noise;        // mono_form()
+ *     aec_process_linear(aec, mic, ref);
+ *     aec_process_residual(aec, NULL);
+ *     follow_post_reset();                             // new aec_post_reset_serial(): clear the OLA tail
+ *     aec_get_residual(aec, &v);                       // v.base_spec = B, v.r2 = R2, v.usable_linear
+ *     G_nr = anr_process_gain_with_residual_psd(nr, B, R2 / 32768^2);
+ *     aec_apply_gain(aec, G_nr, P);                    // P = B * min(G_nr, G_res)
+ *     aec_apply_cng(aec, G_nr, P);                     // comfort noise on the bins the gain cut
  *     ac_istft_push(istft, P, out);
- * The AEC context carries two things that are not the same signal. E (ctx.error_spec, ctx.formed_hop)
+ * The residual view carries two things that are not the same signal. E (v.error_spec, v.formed_hop)
  * is the analysis seam: the selected linear residual, never altered by the output guard. The rendering
- * base B is what aec_process() itself would multiply by its gain: E, or the capture spectrum E + echo on
- * a hop where the linear estimate is unusable and E is louder than the capture. Both the denoiser's
- * estimator and its gain read B and the gain is applied to B, so the denoiser judges the very spectrum it
- * filters; B is E bit for bit on every hop the guard leaves alone. A hard post-chain reset of the AEC
- * moves aec_post_reset_serial(); the denoiser keeps running through it (the library does not touch NR
+ * base B (v.base_spec) is what aec_process() itself would multiply by its gain: E, or the capture spectrum
+ * E + echo on a hop where the linear estimate is unusable and E is louder than the capture. Both the
+ * denoiser's estimator and its gain read B and the gain is applied to B, so the denoiser judges the very
+ * spectrum it filters; B is E bit for bit on every hop the guard leaves alone. A hard post-chain reset of
+ * the AEC moves aec_post_reset_serial(): this program clears its overlap-add tail and the library reseeds
+ * its comfort-noise generator; the denoiser keeps running through it (the library does not touch NR
  * state and neither does this program). With --no-nr the chain is the AEC's own full output: it equals
- * aec_process() with enable_res set, bit for bit (the synthesis uses the library's window table).
+ * aec_process() with AEC_RESIDUAL_FULL, bit for bit (the synthesis uses the library's window table).
  * A refused call resets every stage together. The stages are carved in the order AEC, denoiser,
  * synthesis, gain/spectrum buffers with no malloc after the pool allocation. One source, two
  * binaries:
@@ -25,14 +27,15 @@
  *                           a second one
  * Build:  make -C pipelines            (builds both binaries)
  * Usage:
- *   AEC level: 0=mild, 1=balanced, 2=aggressive, 3=no_floor; names also accepted. The positional
+ *   AEC level (one digit): 0=mild, 1=balanced, 2=aggressive, 3=no_floor. The positional
  *   [aec-level] and --aec-level <level> are the same setting; give one of them once.
- *   NR level: mild, moderate, balanced, aggressive or 0..3; --nr-preset is the same option.
+ *   NR level (one digit): 0=mild, 1=moderate, 2=balanced, 3=aggressive; --nr-preset is the same option.
+ *   Any other level text, and a --sample-rate / --fft-size that is not a whole integer, exits 2.
  *   ./aec_nr_pipeline_static <mic.wav> <ref.wav> <out.wav> [aec-level | --aec-level <level>]
- *                     [--nr-level mild|moderate|balanced|aggressive] [--aec-only]
- *                     [--no-nr] [--no-res] [--legacy-amin] [--debug]
- *   ./aec_nr_pipeline_static --print-mem-size [aec-level | --aec-level <level>] [--nr-level ...] [--aec-only]
- *                     [--no-nr] [--no-res] [--sample-rate <hz>]
+ *                     [--nr-level <0..3>] [--aec-only] [--no-nr] [--no-res] [--no-cng]
+ *                     [--legacy-amin] [--fft-size 256|512|1024] [--debug] [--timing]
+ *   ./aec_nr_pipeline_static --print-mem-size [aec-level | --aec-level <level>] [--nr-level <0..3>]
+ *                     [--aec-only] [--no-nr] [--no-res] [--no-cng] [--sample-rate <hz>] [--fft-size <n>]
  * --debug: once per second of processed audio, one status line to stderr from aec_debug_status() + anr_debug_status() (read-only). */
 
 #include <stdio.h>
@@ -42,7 +45,6 @@
 #include <time.h>
 
 #include "aec.h"
-#include "aec_res.h"           /* aec_cng_fill */
 #include "anr.h"
 #include "audio_stft.h"
 #include "utility/mem_align.h"
@@ -54,26 +56,11 @@
 #define AEC_NR_POOL_SPLIT 0
 #endif
 
-/* Comfort noise follows the denoiser gain of its bin but never below this amplitude (-10 dB),
- * so the residual echo it masks does not surface. */
-#define CNG_NR_GAIN_FLOOR 0.31622777f
 /* The AEC's residual-echo powers are on the int16^2 scale, the denoiser's on the audio scale;
  * the reciprocal is a power of two, so the multiply is exact. */
 #define PSD_SCALE_INV (1.0f / (32768.0f * 32768.0f))
 
-/* CLI aliases only; unknown names fall back to balanced. */
-static AecLevel parse_level(const char* s) {
-    if (strcmp(s, "mild") == 0 || strcmp(s, "0") == 0)
-        return AEC_LEVEL_MILD;
-    if (strcmp(s, "balanced") == 0 || strcmp(s, "1") == 0)
-        return AEC_LEVEL_BALANCED;
-    if (strcmp(s, "aggressive") == 0 || strcmp(s, "2") == 0)
-        return AEC_LEVEL_AGGRESSIVE;
-    if (strcmp(s, "no_floor") == 0 || strcmp(s, "3") == 0)
-        return AEC_LEVEL_NO_FLOOR;
-    return AEC_LEVEL_BALANCED;
-}
-
+/* The digits of a level option are the enum values; the names are for the banner only. */
 static const char* level_name(AecLevel level) {
     switch (level) {
         case AEC_LEVEL_MILD:       return "mild";
@@ -83,37 +70,27 @@ static const char* level_name(AecLevel level) {
     }
 }
 
-/* Name table lives beside the enum (anr_types.h); unknown names fall back to balanced. */
-static AnrLevel parse_nr_level(const char* s) {
-    int level = anr_nr_level_from_name(s);
-    return level < 0 ? ANR_LEVEL_BALANCED : (AnrLevel)level;
-}
-
-static const char* nr_level_name(AnrLevel level) {
-    return anr_nr_level_name(level);
-}
-
 /* --nr-level is the option; --nr-preset is the same option under its earlier name. */
 static int is_nr_level_option(const char* arg) {
     return strcmp(arg, "--nr-level") == 0 || strcmp(arg, "--nr-preset") == 0;
 }
 
-/* The mono lane: the rate's grid (fft_size 0: the rate's default) and the linear-stage
- * AecConfig. The lane keeps its own gain in the context (enable_res = 0, return_res_context = 1);
- * mono_form() applies it. Returns 0, or -1 for a pair libaec has no grid for. */
-static int derive_lane(int sample_rate, int fft_size, AecLevel level, AecSignalGrid* grid,
+/* The mono lane: the rate's grid (fft_size 0: the rate's default) and the AecConfig. The lane keeps its
+ * own gain in the residual view (AEC_RESIDUAL_FULL); mono_form() applies it. --aec-only needs the linear
+ * output only, but keeps the residual stage (AEC_RESIDUAL_STATE): its post-filter state steers the linear
+ * filter's step size, so the lane's linear hop equals the chain's. Returns 0, or -1 for a pair libaec has
+ * no grid for. */
+static int derive_lane(int sample_rate, int fft_size, AecLevel level, int aec_only, AecSignalGrid* grid,
                        AecConfig* aec_cfg) {
-    if (!aec_resolve_signal_grid(sample_rate,
-                                 fft_size ? fft_size : aec_default_fft_size(sample_rate), grid))
+    if (aec_resolve_signal_grid(sample_rate,
+                                 fft_size ? fft_size : aec_default_fft_size(sample_rate), grid) != AEC_OK)
         return -1;
     aec_config_from_level(aec_cfg, level, sample_rate);
     aec_cfg->fft_size = grid->fft_size;
     aec_cfg->delay_mode = AEC_DELAY_MATCHED;
     aec_cfg->delay_num_filters = DA_NUM_FILTERS;
     aec_cfg->fixed_delay_samples = -1;
-    aec_cfg->enable_delay_est = 1;
-    aec_cfg->enable_res = 0;
-    aec_cfg->return_res_context = 1;
+    aec_cfg->residual = aec_only ? AEC_RESIDUAL_STATE : AEC_RESIDUAL_FULL;
     return 0;
 }
 
@@ -141,9 +118,8 @@ typedef struct Rig {
     PostPlan plan;
     AnrDenoiser* nr;          /* NULL with --no-nr */
     AcIstft* istft;
-    float *unity, *total_gain, *extra_noise;
+    float *unity, *extra_noise;
     Complex* spec;
-    uint32_t rng;             /* comfort-noise generator state, AEC_CNG_SEED after every hard post-chain reset */
     uint32_t reset_serial;    /* the aec_post_reset_serial() value this rig has handled */
     const float* last_nr;     /* the NR gain of the last formed hop (unity without NR) */
 } Rig;
@@ -174,8 +150,8 @@ static int post_plan(PostPlan* q, int sample_rate, const AecSignalGrid* grid, co
     ac_stft_config_default(&q->synth_cfg, grid->fft_size);
     q->synth_cfg.window = k_sizing_window;
     q->synth_bytes = ac_istft_get_mem_size(&q->synth_cfg);
-    /* unity, total gain, NR prior, output spectrum */
-    q->buf_bytes = 3 * ALIGN16((size_t)q->n_freqs * sizeof(float)) +
+    /* unity, NR prior, output spectrum */
+    q->buf_bytes = 2 * ALIGN16((size_t)q->n_freqs * sizeof(float)) +
                    ALIGN16((size_t)q->n_freqs * sizeof(Complex));
     return q->synth_bytes ? 0 : -1;
 }
@@ -240,11 +216,9 @@ static int rig_build(Rig* r, const AecConfig* aec_cfg, const PostPlan* q) {
     cur += ALIGN16(q->synth_bytes);
     vec = ALIGN16((size_t)q->n_freqs * sizeof(float));
     r->unity = (float*)cur;       cur += vec;
-    r->total_gain = (float*)cur;  cur += vec;
     r->extra_noise = (float*)cur; cur += vec;
     r->spec = (Complex*)cur;
     for (k = 0; k < q->n_freqs; ++k) r->unity[k] = 1.0f;
-    r->rng = AEC_CNG_SEED;
     r->reset_serial = aec_post_reset_serial(r->aec);
     return 0;
 }
@@ -254,51 +228,48 @@ static void rig_reset(Rig* r) {
     aec_reset(r->aec);
     if (r->nr) anr_reset(r->nr);
     if (r->istft) ac_istft_reset(r->istft);
-    r->rng = AEC_CNG_SEED;
     r->reset_serial = aec_post_reset_serial(r->aec);
     r->last_nr = NULL;
 }
 
 /* The AEC's hard post-chain reset event (aec.h, aec_post_reset_serial): the reset happened inside this
- * hop's aec_process_context(), before its synthesis. When the serial moved, the synthesis drops the
- * overlap-add tail of the previous filter and the comfort noise restarts from AEC_CNG_SEED, before the
- * first draw and before the ac_istft_push of this hop. Nothing else follows: the AEC is not reset in
- * response and the denoiser keeps its state (following the event there is application policy; this
- * program keeps the denoiser running). */
+ * hop's aec_process_linear(), before its synthesis. When the serial moved, the synthesis drops the
+ * overlap-add tail of the previous filter before the ac_istft_push of this hop (the library reseeds its
+ * own comfort-noise generator). Nothing else follows: the AEC is not reset in response and the denoiser
+ * keeps its state (following the event there is application policy; this program keeps the denoiser
+ * running). */
 static void follow_post_reset(Rig* r) {
     uint32_t serial = aec_post_reset_serial(r->aec);
     if (serial == r->reset_serial) return;
     r->reset_serial = serial;
     ac_istft_reset(r->istft);
-    r->rng = AEC_CNG_SEED;
 }
 
 /* The denoiser gain of this hop, estimated on the rendering base (the spectrum it will filter). With
  * use_r2 and a usable linear estimate the residual-echo powers fold into its noise floor; otherwise
  * plain noise reduction. NULL for a refused hop. */
-static const float* mono_nr_gain(Rig* r, const AecResContext* c, const Complex* base) {
-    const float* extra = NULL;
-    if (r->plan.use_r2 && c->r2 && c->usable_linear) {
-        sk_scale_f32(r->extra_noise, c->r2, PSD_SCALE_INV, r->plan.n_freqs);
-        extra = r->extra_noise;
+static const float* mono_nr_gain(Rig* r, const AecResidualView* v) {
+    const float* residual_psd_audio = NULL;
+    if (r->plan.use_r2 && v->r2 && v->usable_linear) {
+        sk_scale_f32(r->extra_noise, v->r2, PSD_SCALE_INV, r->plan.n_freqs);
+        residual_psd_audio = r->extra_noise;
     }
-    if (anr_process_gain(r->nr, base, extra, NULL) != 0) return NULL;
-    return anr_get_gain(r->nr, NULL);
+    return anr_process_gain_with_residual_psd(r->nr, v->base_spec, residual_psd_audio);
 }
 
-/* P = B * min(G_nr, G_res) plus comfort noise on the bins the RES cut, B the rendering base; an
- * absent gain is the unity vector. NULL when a stage refuses the hop. */
-static const Complex* mono_form(Rig* r, const AecResContext* c, const Complex* base) {
+/* P = B * min(G_nr, G_res) plus comfort noise on the bins the RES cut, B the rendering base; without
+ * the RES gain the denoiser gain alone. NULL when a stage refuses the hop. */
+static const Complex* mono_form(Rig* r, const AecResidualView* v) {
     const PostPlan* q = &r->plan;
-    const float* res = q->with_res ? c->res_gain : r->unity;
-    const float* nr = r->unity;
-    if (!res) return NULL;
-    if (r->nr && !(nr = mono_nr_gain(r, c, base))) return NULL;
-    sk_min_f32(r->total_gain, nr, res, q->n_freqs);   /* NaN in the second operand reaches the finite gate; in the first it is replaced */
-    sk_capply_gain_f32(r->spec, base, r->total_gain, q->n_freqs);
-    if (q->enable_cng && q->with_res && c->comfort_noise)
-        aec_cng_fill(&r->rng, r->spec, c->comfort_noise, res, nr, CNG_NR_GAIN_FLOOR, q->n_freqs);
-    r->last_nr = nr;
+    const float* nr = NULL;   /* NULL: no denoiser, the unity gain */
+    if (r->nr && !(nr = mono_nr_gain(r, v))) return NULL;
+    if (q->with_res) {
+        if (aec_apply_gain(r->aec, nr, r->spec) != AEC_OK) return NULL;
+        if (q->enable_cng && aec_apply_cng(r->aec, nr, r->spec) != AEC_OK) return NULL;
+    } else {
+        aec_apply_gain_spec(r->spec, v->base_spec, r->unity, nr, q->n_freqs);
+    }
+    r->last_nr = nr ? nr : r->unity;
     return r->spec;
 }
 
@@ -387,30 +358,33 @@ static uint32_t timing_now_us(void) {
                       + (uint64_t)ts.tv_nsec / 1000ull);
 }
 
-/* One hop. --aec-only copies the AEC's own time-domain hop (ctx.linear_hop); otherwise the post
+/* One hop. --aec-only runs both AEC stages and copies the linear hop (AecLinearView.linear_hop); otherwise the post
  * stages run over the AEC's rendering base and the synthesis is ac_istft_push(). The clock is read
  * only when `timed`. Returns 0, or -1 after a refused hop (the caller resets). */
 static int process_hop(Rig* r, const float* mic, const float* ref, float* out, int timed,
                        uint32_t* chain_us, uint32_t* synth_us) {
-    AecResContext ctx;
-    AecOutputBase ob;
+    AecResidualView v;
+    AecLinearView lv;
     const Complex* spec;
     uint32_t t0, t1;
     *chain_us = 0u;
     *synth_us = 0u;
-    aec_process_context(r->aec, mic, ref);
-    aec_get_res_context(r->aec, &ctx);
+    if (aec_process_linear(r->aec, mic, ref) != AEC_OK) return -1;
     if (!r->with_post) {
-        memcpy(out, ctx.linear_hop, (size_t)ctx.hop_size * sizeof(float));
+        if (aec_process_residual(r->aec, NULL) != AEC_OK) return -1;
+        memset(&lv, 0, sizeof(lv));
+        lv.struct_size = sizeof(lv);
+        if (aec_get_linear(r->aec, &lv) != AEC_OK) return -1;
+        memcpy(out, lv.linear_hop, (size_t)lv.hop_size * sizeof(float));
         return 0;
     }
-    if (!ctx.error_spec) return -1;
-    memset(&ob, 0, sizeof(ob));
-    ob.struct_size = sizeof(ob);
-    if (aec_get_output_base(r->aec, &ob) != 0) return -1;
+    if (aec_process_residual(r->aec, NULL) != AEC_OK) return -1;
+    memset(&v, 0, sizeof(v));
+    v.struct_size = sizeof(v);
+    if (aec_get_residual(r->aec, &v) != AEC_OK) return -1;
     follow_post_reset(r);
     t0 = timed ? timing_now_us() : 0u;
-    spec = mono_form(r, &ctx, ob.base_spec);
+    spec = mono_form(r, &v);
     t1 = timed ? timing_now_us() : 0u;
     *chain_us = t1 - t0;
     if (!spec) return -1;
@@ -469,14 +443,22 @@ int main(int argc, char* argv[]) {
                 const char* name = argv[i];
                 const char* value = example_cli_option_value(argc, argv, &i, argv[0]);
                 if (!value) return 2;
-                if (is_nr_level_option(name)) nr_level = parse_nr_level(value);
-                else if (strcmp(name, "--sample-rate") == 0) sample_rate = atoi(value);
-                else fft_size = atoi(value);
+                if (is_nr_level_option(name)) {
+                    int v;
+                    if (example_cli_level_option(name, value, 3, &v, argv[0])) return 2;
+                    nr_level = (AnrLevel)v;
+                } else if (example_cli_int_option(name, value, strcmp(name, "--sample-rate") == 0 ?
+                                                  &sample_rate : &fft_size, argv[0])) {
+                    return 2;
+                }
             }
             else if (strcmp(argv[i], "--aec-level") == 0 || argv[i][0] != '-') {
                 /* The positional and --aec-level are the same setting: one per command line. */
                 const char* text = argv[i];
+                const char* what = "AEC level";
+                int v;
                 if (argv[i][0] == '-') {
+                    what = argv[i];
                     text = example_cli_option_value(argc, argv, &i, argv[0]);
                     if (!text) return 2;
                 }
@@ -484,14 +466,15 @@ int main(int argc, char* argv[]) {
                     fprintf(stderr, "%s: a second AEC level '%s'; give one\n", argv[0], text);
                     return 2;
                 }
-                level = parse_level(text);
+                if (example_cli_level_option(what, text, 3, &v, argv[0])) return 2;
+                level = (AecLevel)v;
                 have_level = 1;
             }
         }
 
         AecSignalGrid grid;
         AecConfig aec_cfg;
-        if (derive_lane(sample_rate, fft_size, level, &grid, &aec_cfg) != 0) {
+        if (derive_lane(sample_rate, fft_size, level, aec_only, &grid, &aec_cfg) != 0) {
             fprintf(stderr, "Error: invalid config (sample_rate=%d?)\n", sample_rate);
             return 1;
         }
@@ -518,14 +501,14 @@ int main(int argc, char* argv[]) {
 
     if (argc < 4) {
         printf("Usage: %s <mic.wav> <ref.wav> <out.wav> [aec-level | --aec-level <level>] "
-               "[--nr-level mild|moderate|balanced|aggressive] [--aec-only] [--no-nr] [--no-res] [--legacy-amin] "
+               "[--nr-level <0..3>] [--aec-only] [--no-nr] [--no-res] [--no-cng] [--legacy-amin] "
                "[--fft-size 256|512|1024] [--debug] [--timing]\n"
-               "AEC level: 0=mild, 1=balanced, 2=aggressive, 3=no_floor; names also accepted. The positional [aec-level] and --aec-level are the same setting; give one of them once.\n"
-               "NR level: mild, moderate, balanced, aggressive or 0..3; --nr-preset is the same option.\n",
+               "AEC level (one digit): 0=mild, 1=balanced, 2=aggressive, 3=no_floor. The positional [aec-level] and --aec-level are the same setting; give one of them once.\n"
+               "NR level (one digit): 0=mild, 1=moderate, 2=balanced, 3=aggressive; --nr-preset is the same option.\n",
                argv[0]);
 #if !AEC_NR_POOL_SPLIT
-        printf("       %s --print-mem-size [aec-level | --aec-level <level>] [--nr-level ...] [--aec-only] [--no-nr] [--no-res] "
-               "[--sample-rate <hz>] [--fft-size <n>]\n", argv[0]);
+        printf("       %s --print-mem-size [aec-level | --aec-level <level>] [--nr-level <0..3>] [--aec-only] [--no-nr] [--no-res] "
+               "[--no-cng] [--sample-rate <hz>] [--fft-size <n>]\n", argv[0]);
 #endif
         return 1;
     }
@@ -538,7 +521,7 @@ int main(int argc, char* argv[]) {
     AnrLevel      nr_level = ANR_LEVEL_BALANCED;
     int           have_level = 0;
     int           aec_only = 0;
-    int           legacy   = 0;   /* --legacy-amin → min-only A_min_pl */
+    int           legacy   = 0;   /* --legacy-amin → the denoiser without the residual-echo powers */
     int           no_nr    = 0;   /* --no-nr → no denoiser, g_total is G_res */
     int           no_res   = 0;   /* --no-res → no residual gain, g_total is G_nr */
     int           no_cng   = 0;   /* --no-cng -> disable comfort noise */
@@ -560,12 +543,20 @@ int main(int argc, char* argv[]) {
             const char* name = argv[i];
             const char* value = example_cli_option_value(argc, argv, &i, argv[0]);
             if (!value) return 2;
-            if (strcmp(name, "--fft-size") == 0) fft_size = atoi(value);
-            else nr_level = parse_nr_level(value);
+            if (strcmp(name, "--fft-size") == 0) {
+                if (example_cli_int_option(name, value, &fft_size, argv[0])) return 2;
+            } else {
+                int v;
+                if (example_cli_level_option(name, value, 3, &v, argv[0])) return 2;
+                nr_level = (AnrLevel)v;
+            }
         }
         else if (strcmp(argv[i], "--aec-level") == 0 || argv[i][0] != '-') {
             const char* text = argv[i];
+            const char* what = "AEC level";
+            int v;
             if (argv[i][0] == '-') {
+                what = argv[i];
                 text = example_cli_option_value(argc, argv, &i, argv[0]);
                 if (!text) return 2;
             }
@@ -573,7 +564,8 @@ int main(int argc, char* argv[]) {
                 fprintf(stderr, "%s: a second AEC level '%s'; give one\n", argv[0], text);
                 return 2;
             }
-            level = parse_level(text);
+            if (example_cli_level_option(what, text, 3, &v, argv[0])) return 2;
+            level = (AecLevel)v;
             have_level = 1;
         }
     }
@@ -599,14 +591,13 @@ int main(int argc, char* argv[]) {
 
     AecSignalGrid grid;
     AecConfig aec_cfg;
-    int lane_ok = derive_lane(sr, fft_size, level, &grid, &aec_cfg) == 0;
+    int lane_ok = derive_lane(sr, fft_size, level, aec_only, &grid, &aec_cfg) == 0;
 
     printf("AEC(linear) -> echo-aware NR -> RES  (%s%s)\n",
-           AEC_NR_POOL_SPLIT ? "freq A_min_pl" : "static memory", legacy ? ", legacy min-only" : "");
+           AEC_NR_POOL_SPLIT ? "split pools" : "one pool", legacy ? ", no residual-echo prior" : "");
     printf("  Input:  %s (%.2fs)\n", mic_path, (float)n_samples / sr);
-    /* Wording kept as in earlier releases: the baseline matrix compares this program's stdout byte for byte. */
     printf("  AEC preset: %s   NR preset: %s   NR: %s   RES: %s   CNG: %s\n\n",
-           level_name(level), nr_level_name(nr_level), !no_nr ? "on" : "off",
+           level_name(level), anr_nr_level_name(nr_level), !no_nr ? "on" : "off",
            !no_res ? "on" : "off", !no_cng ? "on" : "off");
 
     /* Size the pool, then allocate it (a host stand-in for a platform memory block; a board
@@ -626,7 +617,7 @@ int main(int argc, char* argv[]) {
 
     Rig rig;
     if (!lane_ok || rig_build(&rig, &aec_cfg, aec_only ? NULL : &plan) != 0) {
-        fputs(AEC_NR_POOL_SPLIT ? "Error: pipeline create failed\n" : "Error: invalid config\n", stderr);
+        fputs("Error: pipeline create failed\n", stderr);
         wav_close_read(mic_r); wav_close_read(ref_r); return 1;
     }
 
@@ -652,7 +643,7 @@ int main(int argc, char* argv[]) {
 
     /* Optional per-frame context dump (DUMP_CTX=<path>): header [n_freqs, hop]; then per
      * frame base(2*nf) res_gain(nf) r2(nf) comfort_noise(nf) far_power(1) g_nr(nf)
-     * out_hop(hop), all float32. base is the rendering base (aec_get_output_base: the AEC's error
+     * out_hop(hop), all float32. base is the rendering base (AecResidualView.base_spec: the AEC's error
      * spectrum, or error + echo on a hop where the output guard fired). res_gain is the lane's own
      * gain. g_nr is the NR gain, the unity vector without a denoiser. Written only for hops whose
      * freq seam was available. */
@@ -684,18 +675,20 @@ int main(int argc, char* argv[]) {
         wav_write_float(writer, out_buf, hop);
 
         if (dctx) {
-            AecResContext ctx;
-            AecOutputBase ob;
-            aec_get_res_context(rig.aec, &ctx);
-            memset(&ob, 0, sizeof(ob));
-            ob.struct_size = sizeof(ob);
+            AecResidualView v;
+            AecLinearView lv;
+            memset(&v, 0, sizeof(v));
+            v.struct_size = sizeof(v);
+            memset(&lv, 0, sizeof(lv));
+            lv.struct_size = sizeof(lv);
             const float* g_nr = rig.last_nr;
-            if (aec_get_output_base(rig.aec, &ob) == 0 && ctx.error_spec && ctx.res_gain && g_nr) {
-                fwrite(ob.base_spec, sizeof(Complex), n_freqs, dctx);
-                fwrite(ctx.res_gain, sizeof(float), n_freqs, dctx);
-                fwrite(ctx.r2, sizeof(float), n_freqs, dctx);
-                fwrite(ctx.comfort_noise, sizeof(float), n_freqs, dctx);
-                float fp = ctx.far_power; fwrite(&fp, sizeof(float), 1, dctx);
+            if (aec_get_residual(rig.aec, &v) == AEC_OK && aec_get_linear(rig.aec, &lv) == AEC_OK &&
+                v.res_gain && g_nr) {
+                fwrite(v.base_spec, sizeof(Complex), n_freqs, dctx);
+                fwrite(v.res_gain, sizeof(float), n_freqs, dctx);
+                fwrite(v.r2, sizeof(float), n_freqs, dctx);
+                fwrite(v.comfort_noise, sizeof(float), n_freqs, dctx);
+                float fp = lv.far_power; fwrite(&fp, sizeof(float), 1, dctx);
                 fwrite(g_nr, sizeof(float), n_freqs, dctx);
                 fwrite(out_buf, sizeof(float), hop, dctx);
             }

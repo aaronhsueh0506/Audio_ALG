@@ -275,6 +275,11 @@ static void fill_identity_taps(float *taps, size_t elements, int n) {
 }
 
 
+/* The non-finite tap FAIL_NONFINITE plants: NaN a third of the way in; section_fail_closed also plants +Inf first and
+ * -Inf last. */
+static float g_poison_value = NAN;
+static int g_poison_at = 1;   /* 0 first element, 1 a third of the way in, 2 last element */
+
 typedef enum FailKind {
     FAIL_STATUS = 0,       /* the run reports infer_status != 0 and its taps are valid and finite */
     FAIL_NONFINITE = 1,    /* infer_status 0, the taps are not finite (the library refuses the commit) */
@@ -324,7 +329,10 @@ static int section_fail_closed_one(FailKind kind) {
         CHECK(work.state_generation == aiaec_state_generation(ctx), "fail_closed block %d: work generation %u, live %u", b,
               work.state_generation, aiaec_state_generation(ctx));
         fill_identity_taps((float *)work.outputs[0].data, work.outputs[0].elements, N);
-        if (fail && kind != FAIL_STATUS) ((float *)work.outputs[0].data)[work.outputs[0].elements / 3] = NAN;
+        if (fail && kind != FAIL_STATUS) {
+            const size_t n_el = work.outputs[0].elements;
+            ((float *)work.outputs[0].data)[g_poison_at == 0 ? 0u : g_poison_at == 2 ? n_el - 1u : n_el / 3u] = g_poison_value;
+        }
         CHECK(aiaec_postprocess(ctx, fail && kind != FAIL_NONFINITE ? 1 : 0, pcm_out + (size_t)b * BS) == AIAEC_OK,
               "fail_closed block %d: postprocess", b);
     }
@@ -369,7 +377,13 @@ static int section_fail_closed_one(FailKind kind) {
 }
 
 static int section_fail_closed(void) {
-    return section_fail_closed_one(FAIL_STATUS) | section_fail_closed_one(FAIL_NONFINITE) | section_fail_closed_one(FAIL_BOTH);
+    int rc = section_fail_closed_one(FAIL_STATUS) | section_fail_closed_one(FAIL_NONFINITE) | section_fail_closed_one(FAIL_BOTH);
+    g_poison_value = INFINITY; g_poison_at = 0;
+    rc |= section_fail_closed_one(FAIL_NONFINITE);
+    g_poison_value = -INFINITY; g_poison_at = 2;
+    rc |= section_fail_closed_one(FAIL_NONFINITE);
+    g_poison_value = NAN; g_poison_at = 1;
+    return rc;
 }
 
 /* AiaecInfo.trim_samples (frames_per_call * hop) against an IDENTITY accelerator: CCM taps

@@ -5,15 +5,17 @@ descriptor 的 ``bytes`` 只是下界，擋得住成長、擋不住等量的語�
 ``build_flags_hash`` 是 carve token 字串的 FNV-1a，對結構單純長大是盲的。
 所以文件把版號寫錯，整合者會沿用一份 ``init_ex()`` 其實會拒絕的 descriptor。
 
-C 測試把字面值釘死在 header 上（例如 ``test_mcab.c`` 的
-``MCAB_LAYOUT_VERSION == Nu`` 那一列），這裡是文件端對稱的閘。
+``Aec`` 的 pool（單支與 4ch array 同一個 ``AecMemReq``）只有一個計數器
+``AEC_LAYOUT_VERSION``，定義在 AEC 函式庫的 ``aec.h``；已退役的 ``MCAB_LAYOUT_VERSION``
+文件不得再把它寫成目前值。
 
-只檢查**具名巨集**的宣稱（``MCAB_LAYOUT_VERSION = N``）。文件裡另有
+只檢查**具名巨集**的宣稱（``AEC_LAYOUT_VERSION = N``）。文件裡另有
 「layout vN 起新增…」這類**沿革**敘述不是在陳述目前值，刻意不納入；
 AIAEC 兩個 C 類別的版號（``ULCNET_MODEL_IO_LAYOUT_VERSION``、
 ``DEEPVQE_PREPOST_LAYOUT_VERSION``）以具名巨集形式納入，AINR 各模型自有的版號則不在此表。
 """
 
+import os
 import pathlib
 import re
 
@@ -21,10 +23,16 @@ import pytest
 
 _REPO = pathlib.Path(__file__).resolve().parents[2]
 
+
+def _aec_include():
+    """AEC include 目錄，解析方式同 lib/deps.mk：環境變數 AEC_DIR，否則是並列的 AEC 目錄的 c_impl。"""
+    repo = pathlib.Path(os.environ.get('AEC_REPO_DIR') or _REPO.parent / 'AEC')
+    return pathlib.Path(os.environ.get('AEC_DIR') or repo / 'c_impl') / 'include'
+
+
 # 巨集名 -> 定義它的檔案（相對 repo 根）。#define 只有一處，所以不必去重。
+# AEC 函式庫的巨集不在本 repo 內，另列於 _AEC_SOURCES。
 _SOURCES = {
-    'MCAB_LAYOUT_VERSION':
-        'pipelines/4ch/mcab.h',
     'DFN_RES_STAGE_LAYOUT_VERSION':
         'pipelines/dfn/dfn_res_stage.h',
     'DFN_RATE_BRIDGE_LAYOUT_VERSION':
@@ -35,6 +43,13 @@ _SOURCES = {
         'lib/aiaec/deepvqe_s/deepvqe_prepost.h',
 }
 
+_AEC_SOURCES = {
+    'AEC_LAYOUT_VERSION': 'aec.h',
+}
+
+# 已退役的巨集：文件不能再把它寫成目前值。
+_RETIRED_MACROS = ('MCAB_LAYOUT_VERSION',)
+
 _DOC_ROOT = _REPO / 'docs'
 _DOC_SUFFIXES = ('.html', '.md')
 
@@ -43,28 +58,21 @@ _DOC_SUFFIXES = ('.html', '.md')
 # historical prose, so pin only the narrowly-scoped forms that explicitly say
 # "current checkout/value" (or identify the measured build in the HTML table).
 _UNQUALIFIED_CURRENT_CLAIMS = (
-    ('docs/reference/mcab/config.md', 'MCAB_LAYOUT_VERSION',
-     re.compile(r'本次 checkout（`layout_version=(\d+)`')),
-    ('docs/reference/mcab/errors.md', 'MCAB_LAYOUT_VERSION',
-     re.compile(r'\| 4 \| `layout_version` \| `uint32_t` \| `(\d+)` \|')),
-    ('docs/reference/mcab/beam-errors.md',
-     'MCAB_LAYOUT_VERSION',
-     re.compile(r'本次 checkout，`layout_version=(\d+)`')),
-    ('docs/html/pipelines/4ch/aec-nr-res/index.html', 'MCAB_LAYOUT_VERSION',
-     re.compile(r'mcab_sample_unit_memory\(\)</code>'
-                r'\(ne10,layout_version=(\d+)\)')),
+    ('docs/reference/array/beam-settings.md', 'AEC_LAYOUT_VERSION',
+     re.compile(r'直接查詢；`AEC_LAYOUT_VERSION` (\d+)）')),
 )
 
 
 def _declared_version(macro: str) -> int:
     """讀 header 裡的 ``#define <macro> Nu``。找不到就是測試自己過時了。"""
-    source = _REPO / _SOURCES[macro]
+    source = (_aec_include() / _AEC_SOURCES[macro] if macro in _AEC_SOURCES
+              else _REPO / _SOURCES[macro])
     text = source.read_text(encoding='utf-8')
     match = re.search(r'^#define\s+%s\s+(\d+)u?\s*$' % re.escape(macro),
                       text, re.MULTILINE)
     assert match is not None, (
         '%s 沒有在 %s 找到 #define；巨集被改名或搬家了，'
-        '這張表要跟著更新' % (macro, _SOURCES[macro]))
+        '這張表要跟著更新' % (macro, source))
     return int(match.group(1))
 
 
@@ -75,15 +83,15 @@ def _doc_files():
                   if p.suffix in _DOC_SUFFIXES and p.is_file())
 
 
-# 巨集名之後允許夾一個 </code> 與空白，再吃 `=` 與數字。像
-# ``<code>MCAB_LAYOUT_VERSION</code> = N`` 與
-# ``MCAB_LAYOUT_VERSION=N`` 兩種寫法都要抓到。
+# 巨集名之後允許夾一個 </code> 或反引號與空白，再吃 `=` 與數字。像
+# ``<code>AEC_LAYOUT_VERSION</code> = N``、```AEC_LAYOUT_VERSION` = N`` 與
+# ``AEC_LAYOUT_VERSION=N`` 三種寫法都要抓到。
 def _claim_pattern(macro: str) -> re.Pattern:
     return re.compile(
-        r'%s(?:</code>)?\s*=\s*(\d+)' % re.escape(macro))
+        r'%s(?:</code>|`)?\s*=\s*(\d+)' % re.escape(macro))
 
 
-@pytest.mark.parametrize('macro', sorted(_SOURCES))
+@pytest.mark.parametrize('macro', sorted(set(_SOURCES) | set(_AEC_SOURCES)))
 def test_docs_publish_the_current_layout_version(macro):
     expected = _declared_version(macro)
     pattern = _claim_pattern(macro)
@@ -99,6 +107,18 @@ def test_docs_publish_the_current_layout_version(macro):
     assert not stale, (
         '%s 目前是 %d，但文件仍寫著舊值：\n  %s'
         % (macro, expected, '\n  '.join(stale)))
+
+
+@pytest.mark.parametrize('macro', _RETIRED_MACROS)
+def test_docs_do_not_claim_a_retired_layout_version(macro):
+    pattern = _claim_pattern(macro)
+    claims = ['%s:%d 寫 %s' % (path.relative_to(_REPO), lineno, match.group(0))
+              for path in _doc_files()
+              for lineno, line in enumerate(
+                  path.read_text(encoding='utf-8').splitlines(), 1)
+              for match in pattern.finditer(line)]
+    assert not claims, '%s 已退役，文件不得再寫它的值：\n  %s' % (
+        macro, '\n  '.join(claims))
 
 
 @pytest.mark.parametrize('relative_path,macro,pattern',
@@ -120,11 +140,11 @@ def test_the_scan_actually_reaches_the_pages_that_publish_versions():
     assert files, '沒有掃到任何文件檔，%s 的路徑假設壞了' % _DOC_ROOT
     hits = sum(
         1 for path in files
-        for macro in _SOURCES
+        for macro in sorted(set(_SOURCES) | set(_AEC_SOURCES))
         if _claim_pattern(macro).search(path.read_text(encoding='utf-8')))
     assert hits >= 2, (
-        '只在 %d 個檔案裡找到具名版號宣稱；至少 integration_example 與 '
-        'pipeline_4ch 兩頁應該有，比對式可能失效了' % hits)
+        '只在 %d 個檔案裡找到具名版號宣稱；至少整合頁與 4ch 頁應該有，'
+        '比對式可能失效了' % hits)
 
 
 # Carve versions live with the headers whose pool they version.  A pool carved

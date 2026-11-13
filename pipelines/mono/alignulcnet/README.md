@@ -2,10 +2,13 @@
 
 This directory is an application integration example, not another DSP
 library, and there is no mono unit: `main.c` composes lib/aec's `Aec` (the linear stage) with the
-example stage `ulcnet/ulcnet_nn_stage.{h,c}` (far-end STFT, model call policy, WOLA). The
+example stage `ulcnet/ulcnet_nn_stage.{h,c}` (model call policy; spectra in, one spectrum out). The
+framing is `main.c`'s own: an `AcStft` for the formed hop, one for the raw reference and an `AcIstft`
+for the output spectrum. The
 executable links the stage object, the Align-ULCNet C pre/post-processing object, and the existing
-AEC/audiolib/common libraries. The AEC and the stage are initialised separately
-(`aec_get_mem_size()`, `ulcnet_nn_stage_mem_size()`); the example prints both pool sizes.
+AEC/audiolib/common libraries. The AEC, the stage and the framing objects are initialised separately
+(`aec_get_mem_size()`, `ulcnet_nn_stage_mem_size()`, `ac_stft_get_mem_size()` / `ac_istft_get_mem_size()`); the example prints the
+total pool size.
 
 `main.c` shows the board boundary. The K/V windows, logit window and GRU hidden state belong
 to the application; on a board they live in the accelerator's own buffers, so the example
@@ -30,7 +33,7 @@ The production far branch is fixed: it always consumes the caller's raw
 reference, matching training and the paper. PBFDKF uses its aligned copy only
 to form the linear error; the model's TA block aligns raw far to that error.
 The model state is reset when the AEC delay regime changes, including FIXED
-mode's first usable error. The C-side STFT keeps running across it, so the
+mode's first usable error. The application's STFT keeps running across it, so the
 frames still straddling the error change emit identity WITHOUT stepping the model:
 `ULCNET_NN_STAGE_REPRIME_FRAMES` = 1 frame (both branches are framed
 from the current hop, as in the 4ch example). The constant is derived and
@@ -48,46 +51,52 @@ on the stage. A board that runs the network itself (the NPU between `nn_begin` a
 
 ```c
 UlcnetNnJob job;
-UlcnetNnDelay delay;                                     /* from AecLinearContext.delay_state */
-aec_process_context(aec, mic, ref);                      /* linear stage */
-aec_get_res_context(aec, &rctx);  aec_get_linear_context(aec, &lctx);
+UlcnetNnDelay delay;                                     /* from AecLinearView.delay_state */
+aec_process_linear(aec, mic, ref);                       /* linear stage; AEC_RESIDUAL_STATE: */
+aec_process_residual(aec, NULL);                         /*   the selected residual, no gain */
+aec_get_residual(aec, &rctx);  aec_get_linear(aec, &lctx);
 delay.changed = lctx.delay_state == AEC_LINEAR_DELAY_CHANGED;
 delay.solid   = lctx.delay_state != AEC_LINEAR_DELAY_UNLOCKED;
-ulcnet_nn_stage_begin_time(stage, rctx.formed_hop, ref, delay);   /* far analysis, reprime / model reset */
+ac_stft_push(err_stft, rctx.formed_hop, err_spec);       /* the application's analyses */
+ac_stft_push(far_stft, ref, far_spec);
+ulcnet_nn_stage_begin_spec(stage, err_spec, far_spec, delay);   /* reprime / model reset */
 if (ulcnet_nn_stage_nn_begin(stage, &job) > 0) {         /* 1 = a frame to run */
     int rc = run_network(&job);                          /* write every bin of job.out_re/out_im */
     ulcnet_nn_stage_nn_end(stage, rc);                   /* accepted only if rc == 0 and finite */
 }
-ulcnet_nn_stage_end(stage, out);                         /* WOLA, one hop */
-/* on any negative return: aec_reset(aec); ulcnet_nn_stage_reset(stage); */
+ulcnet_nn_stage_end_spec(stage, out_spec);               /* accepted model spectrum, else err_spec */
+ac_istft_push(istft, out_spec, out);                     /* the application's WOLA, one hop */
+/* on any negative return: aec_reset(aec); ulcnet_nn_stage_reset(stage);
+ *                         ac_stft_reset(err_stft); ac_stft_reset(far_stft); ac_istft_reset(istft); */
 ```
 
 **Data domain.** The stage reads the AEC's analysis seam, `rctx.formed_hop` (the selected linear residual, the same
 signal in training and in C inference; the AIAEC frontend contract). It does not read the rendering base
-(`aec_get_output_base()`): that spectrum exists for chains that render `base * gain` and does not pair with
+(`rctx.base_spec`): that spectrum exists for chains that render `base * gain` and does not pair with
 `formed_hop` on a hop where the output guard fires. Consequently the output guard (capture instead of residual when the
 estimate is unusable and the residual is louder) is not part of this chain's audio: on such hops the network sees the
 real linear residual, which may exceed the capture (a characteristic to evaluate with the retrained model, not a
-property fixed here). This program has no comfort noise and no synthesis of its own besides the stage's WOLA, so the
+property fixed here). This program has no comfort noise and no synthesis of its own besides the application's WOLA, so the
 AEC's hard post-chain reset event (`aec_post_reset_serial()`) has nothing to reseed or clear here; the stage's own
 policy for a changed alignment is the `delay.changed` flag above, and following a reset event in the network state is
 application policy (this program: none beyond that flag, and it never resets the AEC in response).
 
 A frame left open or never fetched is the identity (fail-open); the reprime
-frame after an alignment boundary has no model frame (`nn_begin` returns 0). The stage is built
-with `ulcnet_nn_stage_mem_size(&grid, 1)` here because the time-domain error entry needs its own STFT.
+frame after an alignment boundary has no model frame (`nn_begin` returns 0). The error is a time-domain
+hop here, so `main.c` owns a second `AcStft` for it; a caller whose error already is a spectrum (the 4-channel
+beam spectrum) passes it straight to `begin_spec`.
 
 ## Calling sequence and parameters
 
 ```
 App                 Aec           UlcnetNnStage + adapter          accelerator (board)
  |-- ulcnet_grid_make(--sample-rate); aec_config_from_level; aec_get_mem_size / aec_init -->|
- |-- ulcnet_nn_stage_mem_size(&grid, 1) / ulcnet_nn_stage_init; ulcnet_accelerator_adapter_* (state: the accelerator's)
- |   per hop: aec_process_context --> aec_get_res_context / aec_get_linear_context --> delay {changed, solid}
- |            --> ulcnet_nn_stage_begin_time(formed_hop, ref, delay)
+ |-- ulcnet_nn_stage_mem_size(&grid) / ulcnet_nn_stage_init; ac_stft_init x2 / ac_istft_init; ulcnet_accelerator_adapter_* (state: the accelerator's)
+ |   per hop: aec_process_linear --> aec_process_residual --> aec_get_residual / aec_get_linear --> delay {changed, solid}
+ |            --> ac_stft_push(formed_hop), ac_stft_push(ref) --> ulcnet_nn_stage_begin_spec(err_spec, far_spec, delay)
  |            --> ulcnet_nn_stage_nn_begin == 1 --> run_accelerator(job) --> ulcnet_nn_stage_nn_end(rc)
- |            --> ulcnet_nn_stage_end(out)                (overlap-add: hop 0 is real output; fail-open = the error spectrum)
- |   refused call: aec_reset + ulcnet_nn_stage_reset   (an alignment change resets the model state itself)
+ |            --> ulcnet_nn_stage_end_spec(out_spec) --> ac_istft_push(out)   (overlap-add: hop 0 is real output; fail-open = the error spectrum)
+ |   refused call: aec_reset + ulcnet_nn_stage_reset + ac_stft_reset x2 + ac_istft_reset   (an alignment change resets the model state itself)
  |-- aec_destroy; release the blocks
 ```
 

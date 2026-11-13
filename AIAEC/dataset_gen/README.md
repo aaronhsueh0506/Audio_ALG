@@ -631,11 +631,11 @@ residual.
 
 **Training and C inference read the same signal.** The board pipelines feed the
 network the analysis seam, not the rendering base: `mono_alignulcnet` passes
-`AecResContext.formed_hop` to `ulcnet_nn_stage_begin_time()`, which takes its own
-STFT of it, and the Python `LinearAecEngine` returns `get_formed_output()`. The
-rendering base (`aec_get_output_base()` / `output_base_spec`, error or capture
-depending on the guard) exists for consumers that render audio as
-`output_base_spec * gain`; it does not pair with `formed_hop` and must never be
+`AecResidualView.formed_hop` to its own `AcStft` and hands that spectrum to
+`ulcnet_nn_stage_begin_spec()`, and the Python `LinearAecEngine` returns
+`get_formed_output()`. The rendering base (`aec_get_residual().base_spec`, error or
+capture depending on the guard) exists for consumers that render audio as
+`base_spec * gain`; it does not pair with `formed_hop` and must never be
 substituted for it. (The 4-channel unit feeds the network a beamformed spectrum;
 that seam belongs to the 4-channel lane/fusion contract, not to this one.)
 
@@ -682,13 +682,14 @@ another front end (v3, another behaviour hash, another `filter_length`) with the
 same tensors passes it. `AIAEC/tests/test_deployed_frontend_contract.py` (run by
 `make -C AIAEC test`) closes that gap with `Align_ULCNet/frontend_gate.py`: it
 compiles the deployed mono lane (`pipelines/mono/alignulcnet/main.c`
-`derive_lane`, not a copy) once and runs it with `--sample-rate` for both grids,
-compares every `LinearAecContract` field plus partitions, saturation, delay bank
+`derive_lane`, not a copy) against the AEC library `lib/deps.mk` resolves
+(`AEC_DIR`, else the sibling `AEC/c_impl`) once and runs it with
+`--sample-rate` for both grids, compares every `LinearAecContract` field plus partitions, saturation, delay bank
 and rate and live observer with the contract, and checks that an exported
 graph's JSON sidecar carries the compiled `ULCNET_MODEL_IO_FRONTEND_CONTRACT`,
 the live `aec_behavior_hash` and the `onnx_sha256` of the graph file. The one
 difference it accepts is the lane's inherited `enable_cng = 1`, only on a
-LINEAR_ONLY lane and only because the test measures `formed_hop` byte-identical
+state-only (`AEC_RESIDUAL_STATE`) lane and only because the test measures `formed_hop` byte-identical
 with CNG off. Run it before generating or training on a large corpus. The board
 sample outside this repository builds its own lane and is covered only while its
 `derive_lane` is the example's.

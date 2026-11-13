@@ -263,7 +263,7 @@ def test_default_grids_are_no_padding_power_of_two():
     with pytest.raises(ValueError, match="256, 512"):
         McabConfig(sample_rate=16000, frame_size=320).resolved_grid()
     # 128 is a power of two but outside the C core's whitelist (16 kHz: 256/512,
-    # mcab.c derive_flow); it must be rejected here too.
+    # aec_array_impl_config_ok); it must be rejected here too.
     with pytest.raises(ValueError, match="256, 512"):
         McabConfig(sample_rate=16000, frame_size=128).resolved_grid()
     with pytest.raises(ValueError, match="1024"):
@@ -501,7 +501,7 @@ def test_admitted_delay_change_realigns_four_lanes_instead_of_resetting_them():
         )
 
     # 4. The counters share the lanes' reset epoch, so an instrumentation
-    #    total can never span two of them (matches mcab_reset()).
+    #    total can never span two of them (matches aec_reset() on the array).
     pipeline.reset()
     assert pipeline.realign_warm_lane_count == 0
     assert pipeline.realign_soft_lane_count == 0
@@ -865,7 +865,7 @@ class _RotatingBeamformer:
 
 
 def test_rendering_base_is_the_weighted_lane_bases():
-    """The fused context's rendering base (C: McabFrame.b): ``error_spec`` itself when no
+    """The fused context's rendering base (C: AecResidualView.base_spec): ``error_spec`` itself when no
     contributing lane's output guard fired, else sum(w * lane output_base_spec); a unit weight
     gives the lane's own base; the analysis fields never see the guard; the reset serial is the
     lanes' sum and moves by 4 on reset()."""

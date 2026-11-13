@@ -1,5 +1,9 @@
 .PHONY: all test clean
 
+ifeq ($(AEC_NO_ARRAY),1)
+all test:
+	@echo "pipelines/4ch: SKIPPED -- the four-microphone programs need the array instance; AEC_NO_ARRAY=1 builds the single-channel lib/aec only"
+else
 all:
 	$(MAKE) -C .. 4ch_aec_bf_dfn_res
 
@@ -16,6 +20,7 @@ test: all
 	  rc=0; "$$bin/4ch_aec_bf_dfn_res" --sample-rate 16000Hz >/dev/null 2>&1 || rc=$$?; test "$$rc" -eq 2; \
 	  rc=0; "$$bin/4ch_aec_bf_dfn_res" --sample-rate 8000 >/dev/null 2>&1 || rc=$$?; test "$$rc" -eq 2; \
 	  rc=0; "$$bin/4ch_aec_bf_dfn_res" --atten-lim 12dB >/dev/null 2>&1 || rc=$$?; test "$$rc" -eq 2
+endif
 
 clean:
 	$(MAKE) -C .. clean

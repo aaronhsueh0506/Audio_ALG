@@ -99,8 +99,8 @@ int ulcnet_prepost_num_bins(const UlcnetPrepost *p);   /* or -1 */
 const UlcnetModelIoDescriptor *ulcnet_prepost_descriptor(const UlcnetPrepost *p);
 
 /* One analysed frame per stream (n_bins bins; unnormalised rfft of a sqrt-Hann n_fft block on the hop grid, center
- * 0). The error spectrum is AecResContext.error_spec, the analysis seam the model is trained on, never
- * AecOutputBase.base_spec of aec_get_output_base() (on a guard hop it does not pair with the formed hop); the far
+ * 0). The error spectrum is AecResidualView.error_spec, the analysis seam the model is trained on, never
+ * AecResidualView.base_spec (on a guard hop it does not pair with the formed hop); the far
  * spectrum is the raw far of the same hop. Returns 1 (one invocation); -1 on NULL args or while a frame is open. */
 int ulcnet_prepost_pre_process_freq(UlcnetPrepost *p,
                                     const float *err_re, const float *err_im,

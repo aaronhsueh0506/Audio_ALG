@@ -16,7 +16,7 @@
 make -C pipelines check-pins
 make -C pipelines
 BIN=&quot;$(make -s -C pipelines print-bin-dir)&quot;
-&quot;$BIN/aec_nr_pipeline&quot; mic.wav far.wav enhanced.wav balanced</code></pre>
+&quot;$BIN/aec_nr_pipeline&quot; mic.wav far.wav enhanced.wav 1</code></pre>
 
 <p>準備取樣率相同、時間對齊的單聲道 16 kHz PCM WAV。<code>mic.wav</code> 是收音，<code>far.wav</code> 是播放參考，第三個路徑是輸出。要跑 Python pipeline 或 WAV parity，先執行 <code>git submodule update --init --recursive</code>，讓 Python 匯入和測資可從 <code>lib/aec</code>、<code>lib/nr</code> 取得。</p>
 

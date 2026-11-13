@@ -125,8 +125,7 @@ _NR_YAML_CONFIG = os.path.join(_ROOT, 'lib', 'nr', 'python', 'config', 'v3_2_con
 # near-end floor: g_total is applied as computed.
 PROD_INJECT_ECHO_PSD = True
 # Comfort noise is scaled by the denoiser gain of its bin, never below this
-# amplitude (-10 dB); the same value as CNG_NR_GAIN_FLOOR in mono/aec_nr_res/main.c and
-# MCAB_SAMPLE_CNG_NR_GAIN_FLOOR in 4ch/mcab_sample_post.h.
+# amplitude (-10 dB); the same value as AEC_CNG_NR_GAIN_FLOOR in lib/aec's aec.h.
 CNG_NR_GAIN_FLOOR = 0.31622777
 
 

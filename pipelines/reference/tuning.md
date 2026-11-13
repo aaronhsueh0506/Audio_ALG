@@ -20,7 +20,7 @@ external parameters first and mark the internal constants as such.
 
 **RES / level strength axis**：RES has no standalone `ResConfig` — it lives inside `AecConfig`
 and the AEC3 post-filter chain (`SuppressionGain`, `ResidualEchoEstimator`, etc.), surfaced
-externally through the `AecResContext` seam (see [`## Modules`](../../docs/reference/mono/integration.md)). The four AEC levels
+externally through the `AecResidualView` seam (`AecConfig.residual`; see [`## Modules`](../../docs/reference/mono/integration.md)). The four AEC levels
 differ in exactly three fields:
 
 | Parameter | Mild | Balanced | Aggressive | No-floor | Description |
@@ -37,18 +37,15 @@ differ in exactly three fields:
 
 | Entry point | 目標 |
 |---|---|
-| `aec_set_level(aec, level, ramp_ms)` | mono：`Aec` 的 far-active 地板（mono 的 RES 增益 `ctx.res_gain` 就在 AEC 裡，經 `aec_get_res_context()` 讀出） |
-| `aec_res_set_level(res, level, ramp_ms)` | 4ch：應用自備的後波束 `AecRes`（`Mcab` 不持有；`res` 為 `NULL` 時回 `-1`） |
-| `aec_res_split_floor(res, &live, &target)` | 4ch：唯讀，線性功率。`live == target` 代表 ramp 已走完 |
+| `aec_set_level(aec, level)` | mono：`Aec` 的 far-active 地板（mono 的 RES 增益 `v.res_gain` 就在 AEC 裡，經 `aec_get_residual()` 讀出、由 `aec_apply_gain()` 取用）；4ch：四麥克風 array 內**唯一一個**增益級（`residual = AEC_RESIDUAL_FULL`；低於 FULL 時只更新 config、對輸出無效）。`aec` 為 `NULL` 時回 `-1` |
 | `anr_set_level(nr, level)` | 範例自己初始化的**那一個**降噪器（`anr_init()` 回傳的 `AnrDenoiser*`）；`NULL` 回 `-1` |
 
 4ch 的初始 RES 強度由應用傳給 `aec_config_from_level()` 的 level 決定，執行中改強度走上面的
-`aec_res_set_level()`；`aec_res_reset()` 不會把它改回建構時的 level。`Mcab`（與取樣用的
-`mcab_sample_beam` helper）沒有強度 setter：它的 lane 只算線性殘留，RES 與 NR 不在裡面。
+`aec_set_level()`；`aec_reset()` 不會把它改回建構時的 level。取樣用的
+`array_sample_beam` helper 沒有強度 setter：它不持有 array 的增益級，也不持有 NR。目前沒有公開的 live／target 讀回函式。
 
-`ramp_ms == 0` 代表下一個 hop 套用（**不是錯誤**），落點與「用該 level 從頭建一個新
-實例」完全相同；`> 0` 則以 dB 為單位線性走過去，上限 60 秒（mild ↔ aggressive 是
-18 dB 落差、地板又是硬性 clamp，互動式旋鈕應該給一個 ramp）。ramp 途中再呼叫會從當前
+far-active 地板固定在 100 ms 內以 dB 為單位線性走過去（AEC 內部常數，呼叫端不能調），落點與「用該 level 從頭建一個新
+實例」完全相同（mild ↔ aggressive 是 18 dB 落差、地板又是硬性 clamp，所以 ramp 內建）。ramp 途中再呼叫會從當前
 live 值重新起走。兩者都**不是重啟**：濾波器、延遲鎖定、噪聲底與增益平滑歷史全部繼續
 跑；要重啟請用對應的 `_reset()`。
 
@@ -60,13 +57,12 @@ NO_FLOOR，但 gate 還沒跟上」的中間狀態。C 的 level 就是 Python �
 `PostBeamResidualSuppressor.from_aec_config(config)` 或 `PostBeamResidualSuppressor(sr, hop, n_freqs, preset)`，
 每 hop 呼叫 `process(post.context, post.aligned_render)`，`reset()` 自己重置）。
 
-> **4ch：對四條 lane 重新指定 level 是無效操作。** 四條 lane 都以
-> `spatial_linear_context` 建立（`mcab_apply_lane_contract()` 蓋上），從不走到自己的殘留抑制器，它們的地板
-> 什麼都不塑形。真正乘上輸出的 gain 來自應用自備的**唯一一個**後波束 `AecRes`，所以強度要設在它身上
-> （由 `4ch/tests/test_mcab_sample_beam.c` 的 `test_caller_res_reset_and_level` 釘住）。
+> **4ch：lane 自己的 level 是無效操作。** 四條 lane 由 array 以殘餘階段 `ESTIMATE`（或 `STATE`）衍生，從不走到自己的殘留抑制器，它們的地板
+> 什麼都不塑形。真正乘上輸出的 gain 來自 array 內**唯一一個**增益級，所以強度要設在 array 上（`aec_set_level()`）
+> （由 `4ch/tests/test_array_sample_beam.c` 的 `test_array_gain_reset_and_level` 釘住；ramp 本身由 AEC 函式庫的 `test_runtime_preset.c`／`test_aec_res.c` 釘住）。
 
 > **NR：範例的降噪器就是函式庫的 level 組態。** 它以 `anr_config_for_level_grid()` 建立、
-> 沒有任何覆寫，所以 `anr_set_level()` 直接換強度（`4ch/tests/test_mcab_sample_post.c` 的 `test_nr_set_level` 釘住）。要改 level 以外的欄位時，自己組好
+> 沒有任何覆寫，所以 `anr_set_level()` 直接換強度（`4ch/tests/test_array_sample_post.c` 的 `test_nr_set_level` 釘住）。要改 level 以外的欄位時，自己組好
 > 完整 target 再呼叫 `anr_reconfigure()`（grid、`L`、`num_init_frames` 不可變）。
 
 > **A/B 量測時該預期什麼。** far-active 地板只在 **far-active 且非 double-talk** 的
@@ -78,23 +74,19 @@ NO_FLOOR，但 gate 還沒跟上」的中間狀態。C 的 level 就是 Python �
 > degradation 對齊的條件下比較，並實際試聽。
 
 兩條 Align-ULCNet 範例（`mono/alignulcnet/`、`4ch/alignulcnet/`）**刻意不提供**
-這些 setter：mono 變體沒有 NR 實例、且算出的 `G_res` 沒有任何消費者（輸出由 ULCNet
-mask 塑形）；4ch 變體用的是 `enable_post = 0` 的 flow，抑制器與降噪器
+這些 setter：mono 變體沒有 NR 實例、且以 `AEC_RESIDUAL_STATE` 建立而不算 `G_res`（輸出由 ULCNet
+mask 塑形）；4ch 變體用的是 `residual = AEC_RESIDUAL_STATE` 的 array，增益級與降噪器
 根本不存在。強度是模型的性質，不是 runtime 旋鈕。
 
 ### NR (`AnrConfig`, see `anr_types.h`)
 
 **Levels**: `ANR_LEVEL_MILD` / `ANR_LEVEL_MODERATE` / `ANR_LEVEL_BALANCED`（default）/ `ANR_LEVEL_AGGRESSIVE`
 
-> Both C pipeline CLIs — `mono/aec_nr_res/main.c` (`parse_nr_level()`) and
-> `4ch/mcab_external_static.c` — accept
-> `--nr-level mild|moderate|balanced|aggressive` (or the digits `0`..`3`, through
-> `anr_nr_level_from_name()`; `--nr-preset` is the same option under its earlier name). An unknown name falls back to
-> `ANR_LEVEL_BALANCED` with no error in `mono/aec_nr_res/main.c` (the same holds for its
-> positional AEC level and `--aec-level`, and for `--nr-level` (earlier name `--nr-mode`) of the NR library's `example/main.c`);
-> `mcab_external_static` exits with code 2 for an unknown `--nr-level` name, for an unknown AEC
-> level and for a second AEC level (positional or `--aec-level`); `mono/aec_nr_res/main.c` exits with code 2 for a second AEC level too, whatever its spelling. In both, a `--nr-level` or `--aec-level` followed by another `--` option has no value (exit 2).
-> The Python `mono/aec_nr_res/pipeline.py` CLI accepts
+> Both C pipeline CLIs — `mono/aec_nr_res/main.c` and `4ch/4ch_external_static.c` — take `--nr-level` as one digit
+> `0`..`3` (0 mild, 1 moderate, 2 balanced, 3 aggressive; `--nr-preset` is the same option under its earlier name) and the
+> AEC level (positional or `--aec-level`) as one digit `0`..`3` (0 mild, 1 balanced, 2 aggressive, 3 no_floor). Any other text,
+> and a second AEC level (positional or `--aec-level`), exits with code 2; a `--nr-level` or `--aec-level` followed by another `--` option has
+> no value (exit 2). The libraries parse no level names. The Python `mono/aec_nr_res/pipeline.py` CLI accepts
 > `mild|balanced|aggressive` only.
 
 `g_min_db` is amplitude dB (`g_min = 10^(g_min_db/20)`).
@@ -149,7 +141,7 @@ re-validation.
 
 | 症狀 | 原因 | 調整方式 |
 |------|------|----------|
-| **殘留回聲明顯** | RES 抑制不足 | `aec_set_level()` 改用 aggressive（給 `ramp_ms`，例如 100） |
+| **殘留回聲明顯** | RES 抑制不足 | `aec_set_level()` 改用 aggressive（地板固定 100 ms ramp） |
 | **殘留回聲 + 遠端持續講話** | Filter 未完全收斂或尾巴不夠長 | 增加 `filter_length`（如 832→1536，init 參數，要重查 pool），確認 mic-ref delay 落在 `delay_mode` 的搜尋範圍 |
 | **近端語音被壓制（DT degradation）** | RES 過度抑制 | `aec_set_level()` 改用 mild |
 | **輸出底噪不自然（突然靜音）** | CNG 未開啟 | 確認 `enable_cng=1`（預設已開），範例沒有帶 `--no-cng` |

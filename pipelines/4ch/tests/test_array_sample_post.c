@@ -1,7 +1,7 @@
-/* Acceptance test of 4ch/mcab_sample_post.h, the glue between mcab_fuse() and the
- * libraries behind it: the libaec RES input of a fused frame, the denoiser call with the
- * residual-echo fold, the finite-hop check the programs run on an emitted hop, and the NR
- * configuration the oracles use. Expected values are written out by hand, not recomputed with
+/* Acceptance test of 4ch/array_sample_post.h, the glue between aec_get_residual() of an array
+ * instance and the libraries behind it: the denoiser call with the residual-echo fold, the
+ * post-reset hand-over to the synthesis, the finite-hop check the programs run on an emitted hop,
+ * and the NR configuration the oracles use. Expected values are written out by hand, not recomputed with
  * the code under test. */
 #include <math.h>
 #include <stdint.h>
@@ -10,8 +10,7 @@
 #include <string.h>
 
 #include "anr.h"
-#include "aec_res.h"
-#include "4ch/mcab_sample_post.h"
+#include "4ch/array_sample_post.h"
 #include "utility/simd_kernel_nn.h"
 #include "utility/simd_test_mode.h"
 
@@ -60,14 +59,14 @@ static void test_stage(void) {
     void *pool = aligned_pool(bytes), *pool2 = aligned_pool(bytes), *pool3 = aligned_pool(bytes);
     AnrDenoiser *a, *b, *c;
     Complex spec[129];
-    float r2[129], scratch[129], extra[129];
+    float r2[129], scratch[129], residual_psd_audio[129];
     const float *ga, *gb;
-    McabFrame f;
+    AecResidualView f;
     int k, m, frame;
 
     memset(&f, 0, sizeof(f));
     f.n_freqs = n;
-    f.e = spec;
+    f.error_spec = spec;
     f.r2 = r2;
     f.usable_linear = 1;
 
@@ -87,14 +86,14 @@ static void test_stage(void) {
             spec[k].r = (float)((frame * 7 + k * 13) % 101) * 31.0f - 1500.0f;
             spec[k].i = (float)((frame * 5 + k * 3) % 89) * 17.0f - 700.0f;
             r2[k] = (float)((k + 1) * (frame + 3)) * 4.0e5f;
-            extra[k] = r2[k] / (32768.0f * 32768.0f);
+            residual_psd_audio[k] = r2[k] / (32768.0f * 32768.0f);
         }
-        ga = mcab_sample_anr_gain(a, &f, scratch, 1);
+        ga = array_sample_anr_gain(a, &f, scratch, 1);
         CHECK(ga != NULL, "stage process");
-        CHECK(anr_process_gain(b, spec, extra, NULL) == 0, "direct process");
-        gb = anr_get_gain(b, NULL);
+        gb = anr_process_gain_with_residual_psd(b, spec, residual_psd_audio);
+        CHECK(gb != NULL, "direct process");
         CHECK(ga && gb && memcmp(ga, gb, (size_t)n * sizeof(float)) == 0, "stage gain equals the direct call");
-        CHECK(memcmp(scratch, extra, (size_t)n * sizeof(float)) == 0, "scratch holds r2 / 32768^2");
+        CHECK(memcmp(scratch, residual_psd_audio, (size_t)n * sizeof(float)) == 0, "scratch holds r2 / 32768^2");
     }
     /* usable_linear = 0 fails closed: with r2 and scratch both non-NULL, a cold-start
      * unusable estimate must not fold into the noise floor, so the gain equals the plain
@@ -113,20 +112,20 @@ static void test_stage(void) {
             spec[k].r = (float)((frame * 7 + k * 13) % 101) * 31.0f - 1500.0f;
             spec[k].i = (float)((frame * 5 + k * 3) % 89) * 17.0f - 700.0f;
             r2[k] = 3.0e12f + (float)k * 1.0e9f;
-            extra[k] = r2[k] / (32768.0f * 32768.0f);
+            residual_psd_audio[k] = r2[k] / (32768.0f * 32768.0f);
         }
-        ga = mcab_sample_anr_gain(a, &f, scratch, 1);
+        ga = array_sample_anr_gain(a, &f, scratch, 1);
         CHECK(ga != NULL, "usable_linear=0 stage process");
-        CHECK(anr_process_gain(b, spec, NULL, NULL) == 0, "usable_linear=0 direct process (no prior)");
-        gb = anr_get_gain(b, NULL);
+        gb = anr_process_gain(b, spec);
+        CHECK(gb != NULL, "usable_linear=0 direct process (no prior)");
         CHECK(ga && gb && memcmp(ga, gb, (size_t)n * sizeof(float)) == 0,
               "usable_linear=0 ignores r2 even though r2 and scratch are both present");
         /* Mutation guard: on these same inputs, actually folding r2 (as the
          * gate must prevent) measurably suppresses the gain below the plain
          * value -- so the CHECK above is not a vacuous no-op comparison. */
-        CHECK(anr_process_gain(c, spec, extra, NULL) == 0, "counterfactual folded process");
-        if (frame >= 25) {
-            const float* gc = anr_get_gain(c, NULL);
+        const float* gc = anr_process_gain_with_residual_psd(c, spec, residual_psd_audio);
+        CHECK(gc != NULL, "counterfactual folded process");
+        if (frame >= 25 && gc && gb) {
             int differs = 0;
             for (k = 0; k < n; ++k)
                 if (gc[k] < gb[k] - 1e-6f) { differs = 1; break; }
@@ -139,16 +138,17 @@ static void test_stage(void) {
     anr_reset(b);
     for (frame = 0; frame < 10; ++frame) {
         for (k = 0; k < n; ++k) { spec[k].r = (float)(k + frame); spec[k].i = (float)(frame - k); }
-        ga = mcab_sample_anr_gain(a, &f, scratch, 0);
+        ga = array_sample_anr_gain(a, &f, scratch, 0);
         CHECK(ga != NULL, "no prior");
-        CHECK(anr_process_gain(b, spec, NULL, NULL) == 0, "direct no prior");
-        CHECK(memcmp(ga, anr_get_gain(b, NULL), (size_t)n * sizeof(float)) == 0, "no-prior gain");
-        CHECK(mcab_sample_anr_gain(a, &f, NULL, 1) != NULL, "no scratch selects plain NR");
+        gb = anr_process_gain(b, spec);
+        CHECK(gb != NULL, "direct no prior");
+        CHECK(gb && memcmp(ga, gb, (size_t)n * sizeof(float)) == 0, "no-prior gain");
+        CHECK(array_sample_anr_gain(a, &f, NULL, 1) != NULL, "no scratch selects plain NR");
     }
-    CHECK(mcab_sample_anr_gain(NULL, &f, NULL, 0) == NULL, "NULL denoiser");
-    CHECK(mcab_sample_anr_gain(a, NULL, NULL, 0) == NULL, "NULL frame");
-    f.e = NULL;
-    CHECK(mcab_sample_anr_gain(a, &f, NULL, 0) == NULL, "NULL spectrum");
+    CHECK(array_sample_anr_gain(NULL, &f, NULL, 0) == NULL, "NULL denoiser");
+    CHECK(array_sample_anr_gain(a, NULL, NULL, 0) == NULL, "NULL frame");
+    f.error_spec = NULL;
+    CHECK(array_sample_anr_gain(a, &f, NULL, 0) == NULL, "NULL spectrum");
 
     anr_destroy(a);
     anr_destroy(b);
@@ -171,7 +171,7 @@ static void test_psd_scale(void) {
     volatile float divisor = 32768.0f * 32768.0f;
     Complex spec[129];
     float r2[129], scratch[129];
-    McabFrame f;
+    AecResidualView f;
     uint32_t seed = 987654321u;
     int frame, k, ok = 1, ok_len = 1;
     const uint32_t fixed[] = {0x00000000u, 0x80000000u, 0x00000001u, 0x007fffffu,
@@ -181,7 +181,7 @@ static void test_psd_scale(void) {
 
     memset(&f, 0, sizeof f);
     f.n_freqs = n;
-    f.e = spec;
+    f.error_spec = spec;
     f.r2 = r2;
     f.usable_linear = 1;
     CHECK(a != NULL, "psd scale: stage init");
@@ -198,7 +198,7 @@ static void test_psd_scale(void) {
             memcpy(&r2[k], &bits, sizeof bits);
         }
         f.n_freqs = n;
-        (void)mcab_sample_anr_gain(a, &f, scratch, 1);
+        (void)array_sample_anr_gain(a, &f, scratch, 1);
         for (k = 0; k < n; ++k) {
             float want = r2[k] / divisor;
             uint32_t gb, wb;
@@ -216,7 +216,7 @@ static void test_psd_scale(void) {
         float guard = 1234.5f;
         scratch[frame < n ? frame : n - 1] = guard;
         f.n_freqs = frame;
-        (void)mcab_sample_anr_gain(a, &f, scratch, 1);
+        (void)array_sample_anr_gain(a, &f, scratch, 1);
         for (k = 0; k < frame; ++k)
             if (scratch[k] != r2[k] / divisor) ok_len = 0;
         if (frame < n && scratch[frame] != guard) ok_len = 0;
@@ -227,59 +227,32 @@ static void test_psd_scale(void) {
     free(pool);
 }
 
-/* mcab_sample_res_input: every AecResInput field from its McabFrame field; a NULL frame gives the
- * all-zero input aec_res_process() refuses. */
-static void test_res_input(void) {
-    static Complex e[129], y[129];
-    static float r2[129], cn[129], far[128];
-    McabFrame f;
-    AecResInput in;
-    AecConfig cfg;
-    size_t bytes;
-    void* pool;
-    AecRes* res;
-
-    memset(&f, 0, sizeof f);
-    f.n_freqs = 129;
-    f.hop = 128;
-    f.e = e;
-    f.y = y;
-    f.r2 = r2;
-    f.cn = cn;
-    f.far_hop = far;
-    f.all_converged = 1;
-    f.max_dt = 0.25f;
-    f.max_sat = 0.75f;
-    f.clock_drift = 1;
-    memset(&in, 0x5A, sizeof in);
-    mcab_sample_res_input(&f, &in);
-    CHECK(in.error_spec == e && in.near_spec == y && in.r2 == r2 && in.comfort_noise == cn &&
-          in.render_hop == far, "res input: the spectra and the render hop alias the frame");
-    CHECK(in.all_converged == 1 && in.max_dt == 0.25f && in.max_saturation == 0.75f &&
-          in.clock_drift == 1, "res input: the scalars are the frame's");
-    memset(&in, 0x5A, sizeof in);
-    mcab_sample_res_input(NULL, &in);
-    CHECK(!in.error_spec && !in.near_spec && !in.r2 && !in.comfort_noise && !in.render_hop &&
-          in.all_converged == 0 && in.max_dt == 0.0f && in.max_saturation == 0.0f &&
-          in.clock_drift == 0, "res input: a NULL frame zeroes the input");
-    mcab_sample_res_input(&f, NULL);   /* a NULL input is a no-op */
-
-    aec_config_from_level(&cfg, AEC_LEVEL_BALANCED, 16000);
-    cfg.fft_size = 256;
-    bytes = aec_res_get_mem_size(&cfg);
-    pool = bytes ? aligned_pool(bytes) : NULL;
-    res = pool ? aec_res_init(pool, bytes, &cfg) : NULL;
-    CHECK(res != NULL, "res input: suppressor init");
-    if (res) {
-        CHECK(aec_res_process(res, &in) == NULL, "res input: the zeroed input is refused");
-        mcab_sample_res_input(&f, &in);
-        CHECK(aec_res_process(res, &in) != NULL, "res input: the frame's input is accepted");
-    }
-    free(pool);
+/* array_sample_post_reset_due: fires once per move of the view's serial, stores it, and is inert for NULL
+ * arguments or an unchanged serial (a fresh array's first frame matches *handled = 0). */
+static void test_post_reset_due(void) {
+    AecResidualView v;
+    uint32_t handled = 0;
+    memset(&v, 0, sizeof v);
+    v.post_reset_serial = 0;
+    CHECK(array_sample_post_reset_due(&handled, &v) == 0 && handled == 0,
+          "reset due: an unchanged serial does not fire");
+    v.post_reset_serial = 4;
+    CHECK(array_sample_post_reset_due(&handled, &v) == 1 && handled == 4,
+          "reset due: a moved serial fires and is stored");
+    CHECK(array_sample_post_reset_due(&handled, &v) == 0 && handled == 4,
+          "reset due: it fires once per move");
+    v.post_reset_serial = 0xFFFFFFFFu;
+    CHECK(array_sample_post_reset_due(&handled, &v) == 1 && handled == 0xFFFFFFFFu,
+          "reset due: any different serial fires, wrap-around included");
+    v.post_reset_serial = 0;
+    CHECK(array_sample_post_reset_due(&handled, &v) == 1 && handled == 0,
+          "reset due: a return to 0 from a stored nonzero serial fires");
+    CHECK(array_sample_post_reset_due(NULL, &v) == 0 && array_sample_post_reset_due(&handled, NULL) == 0,
+          "reset due: a NULL argument is inert");
 }
 
 /* NR strength at runtime: anr_set_level() before the first hop makes a denoiser equal, through
- * mcab_sample_anr_gain, to one built at the target level, on every grid the examples use. */
+ * array_sample_anr_gain, to one built at the target level, on every grid the examples use. */
 static void test_nr_set_level(void) {
     static const struct { int sr, fft; } grid[] = {{16000, 256}, {16000, 512}, {48000, 1024}, {8000, 256}};
     static Complex spec[513];
@@ -296,10 +269,10 @@ static void test_nr_set_level(void) {
             void *pa = aligned_pool(ba), *pb = aligned_pool(bb);
             AnrDenoiser* a = pa ? anr_init(pa, ba, &ca) : NULL;
             AnrDenoiser* b = pb ? anr_init(pb, bb, &cb) : NULL;
-            McabFrame f;
+            AecResidualView f;
             memset(&f, 0, sizeof f);
             f.n_freqs = n;
-            f.e = spec;
+            f.error_spec = spec;
             f.r2 = r2;
             f.usable_linear = 1;
             if (!a || !b || anr_set_level(a, (AnrLevel)m) != 0) { refused++; free(pa); free(pb); continue; }
@@ -310,8 +283,8 @@ static void test_nr_set_level(void) {
                     spec[k].i = (float)((h * 5 + k * 3) % 89) * 1.7e-4f - 0.007f;
                     r2[k] = (float)((k + 1) * (h % 11 + 3)) * 4.0e3f;
                 }
-                ga = mcab_sample_anr_gain(a, &f, s_a, 1);
-                gb = mcab_sample_anr_gain(b, &f, s_b, 1);
+                ga = array_sample_anr_gain(a, &f, s_a, 1);
+                gb = array_sample_anr_gain(b, &f, s_b, 1);
                 if (!ga || !gb || memcmp(ga, gb, (size_t)n * sizeof(float)) != 0) bad++;
                 else for (k = 0; k < n; ++k) if (ga[k] < 0.999f) { shaped = 1; break; }
             }
@@ -355,7 +328,7 @@ int main(void) {
     test_nr_config();
     test_stage();
     test_psd_scale();
-    test_res_input();
+    test_post_reset_due();
     test_nr_set_level();
     test_hop_is_finite();
     if (g_fail) { printf("%d check(s) FAILED\n", g_fail); return 1; }

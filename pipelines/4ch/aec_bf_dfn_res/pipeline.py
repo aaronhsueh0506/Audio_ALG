@@ -8,7 +8,7 @@ spectrum-to-hop tail after ``res_gain`` in two flavours:
 
 * ``post_conventional``: MMSE-LSA on the fused pre-RES spectrum,
   ``min(G_nr, G_res)``, comfort noise, WOLA -- the post chain of the C
-  application (``mcab_external_static.c``);
+  application (``4ch_external_static.c``);
 * ``post_dfn2``: ``P = E * G_res`` plus comfort noise (the conventional
   post spectrum with the denoiser off), the dual-input DFN2 stage estimated
   on ``E`` (the beamformed spectrum) and applied on ``P``, WOLA -- the

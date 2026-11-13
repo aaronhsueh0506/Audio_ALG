@@ -16,6 +16,7 @@
 #include "mono/alignulcnet/main.c"
 #undef main
 
+#define LANE_DUMP_CONTEXT_LINEAR_ONLY 2   /* the gate's code for a lane that stops after the AecState (AEC_RESIDUAL_STATE) */
 #define DUMP_HOPS 400
 #define DUMP_ECHO_DELAY 37
 #define DUMP_HOP_MAX 512   /* the largest hop of the example's grid table */
@@ -33,7 +34,7 @@ static float dump_noise(uint32_t* state) {
 }
 
 /* 1 when formed_hop carries signal and matches byte for byte on every hop and comfort_noise is
- * NULL in both runs, 0 otherwise, -1 when an instance cannot be built. */
+ * NULL in both runs, 0 otherwise, -1 when an instance cannot be built or refuses a hop. */
 static int formed_hop_cng_invariant(const AecConfig* lane, int hop_size) {
     AecConfig twin = *lane;
     void *pool_a = NULL, *pool_b = NULL;
@@ -54,17 +55,20 @@ static int formed_hop_cng_invariant(const AecConfig* lane, int hop_size) {
         return -1;
     }
     for (hop = 0; hop < DUMP_HOPS && same; ++hop) {
-        AecResContext ra, rb;
+        AecResidualView ra, rb;
         memmove(ref_line, ref_line + hop_size, DUMP_ECHO_DELAY * sizeof(float));
         for (k = 0; k < hop_size; ++k) {
             ref[k] = 0.3f * dump_noise(&far_seed);
             ref_line[DUMP_ECHO_DELAY + k] = ref[k];
             mic[k] = 0.5f * ref_line[k] + 0.003f * dump_noise(&near_seed);
         }
-        aec_process_context(a, mic, ref);
-        aec_process_context(b, mic, ref);
-        aec_get_res_context(a, &ra);
-        aec_get_res_context(b, &rb);
+        ra.struct_size = rb.struct_size = sizeof(ra);
+        if (aec_process_linear(a, mic, ref) != AEC_OK || aec_process_linear(b, mic, ref) != AEC_OK ||
+            aec_process_residual(a, NULL) != AEC_OK || aec_process_residual(b, NULL) != AEC_OK ||
+            aec_get_residual(a, &ra) != AEC_OK || aec_get_residual(b, &rb) != AEC_OK) {
+            same = -1;
+            break;
+        }
         same = ra.formed_hop != NULL && rb.formed_hop != NULL &&
                ra.comfort_noise == NULL && rb.comfort_noise == NULL &&
                memcmp(ra.formed_hop, rb.formed_hop, (size_t)hop_size * sizeof(float)) == 0;
@@ -74,6 +78,7 @@ static int formed_hop_cng_invariant(const AecConfig* lane, int hop_size) {
     aec_destroy(b);
     free(pool_a);
     free(pool_b);
+    if (same < 0) return -1;
     /* An all-zero seam would compare equal whatever the flag does. */
     return same && energy > 0.0;
 }
@@ -104,27 +109,33 @@ int main(int argc, char** argv) {
         return 1;
     }
     c = &aec->cfg;
+    /* The text keys of the contract gate (frontend_gate.py), written for the lane's AecConfig.residual:
+     * the lane is stage-driven (aec_process_linear + aec_process_residual, never aec_process), so enable_res is
+     * 0; return_res_context is 1 for any residual stage; spatial_linear_context is the stop-level code
+     * (STATE = context_linear_only, ESTIMATE = 1, FULL = 0). */
     printf("frontend_contract=%s\n", ULCNET_MODEL_IO_FRONTEND_CONTRACT);
     printf("sample_rate=%d\n", c->sample_rate);
     printf("fft_size=%d\n", c->fft_size);
     printf("hop_size=%d\n", aec_hop_size(aec));
     printf("filter_length=%d\n", c->filter_length);
     printf("n_partitions=%d\n", aec->n_partitions);
-    printf("enable_res=%d\n", c->enable_res);
+    printf("enable_res=%d\n", 0);
     printf("enable_cng=%d\n", c->enable_cng);
     printf("enable_shadow=%d\n", c->enable_shadow);
     printf("enable_highpass=%d\n", c->enable_highpass);
     printf("enable_saturation=%d\n", c->enable_saturation);
     printf("saturation_softclip_ref=%d\n", c->saturation_softclip_ref);
-    printf("enable_delay_est=%d\n", c->enable_delay_est);
+    printf("enable_delay_est=%d\n", c->delay_mode == AEC_DELAY_MATCHED);
     printf("delay_mode=%d\n", (int)c->delay_mode);
     printf("delay_mode_matched=%d\n", (int)AEC_DELAY_MATCHED);
     printf("delay_num_filters=%d\n", c->delay_num_filters);
     printf("fixed_delay_samples=%d\n", c->fixed_delay_samples);
-    printf("delay_analysis_every_hop=%d\n", aec->duty_period_hops == 1);
-    printf("return_res_context=%d\n", c->return_res_context);
-    printf("spatial_linear_context=%d\n", c->spatial_linear_context);
-    printf("context_linear_only=%d\n", AEC_CONTEXT_LINEAR_ONLY);
+    printf("delay_analysis_every_hop=%d\n", aec->duty.period_hops == 1);
+    printf("return_res_context=%d\n", c->residual != AEC_RESIDUAL_OFF);
+    printf("spatial_linear_context=%d\n",
+           c->residual == AEC_RESIDUAL_STATE ? LANE_DUMP_CONTEXT_LINEAR_ONLY :
+           c->residual == AEC_RESIDUAL_ESTIMATE ? 1 : 0);
+    printf("context_linear_only=%d\n", LANE_DUMP_CONTEXT_LINEAR_ONLY);
     printf("live_observer_enabled=%d\n", c->live_observer_enabled);
     printf("min_gain_floor_far_active_db=%.9g\n", c->min_gain_floor_far_active_db);
     printf("min_gain_floor_dt_db=%.9g\n", c->min_gain_floor_dt_db);

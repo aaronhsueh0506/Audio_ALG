@@ -1,6 +1,6 @@
 """Per-hop C/Python parity for the shared four-channel reference alignment.
 
-The C flow (mcab.c) and pipeline.py publish the same three per-hop
+The C array instance (AEC src/aec_array.c) and pipeline.py publish the same three per-hop
 fields (applied delay, ``solid``, ``changed``) and hand the four linear lanes
 the same aligned far hop.  Both sides are driven from ONE synthetic scene
 (xorshift32 far noise plus a half-amplitude echo at a known bulk delay) and

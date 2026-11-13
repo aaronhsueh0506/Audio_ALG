@@ -1,4 +1,4 @@
-#include "mcab_sample_driver.h"
+#include "array_sample_driver.h"
 #include "common/example_cli.h"
 
 #include <stdio.h>
@@ -9,17 +9,17 @@
 #define M_PI 3.14159265358979323846
 #endif
 
-const char* mcab_sample_backend_name(uint32_t backend_id) {
+const char* array_sample_backend_name(uint32_t backend_id) {
     switch (backend_id) {
-        case MCAB_BACKEND_NE10: return "ne10";
+        case AEC_BACKEND_NE10: return "ne10";
         default:                return "unknown";
     }
 }
 
-int mcab_sample_print_mem_budget(const char* title, const McabConfig* cfg,
-                                 const McabSampleBeamParams* bp, McabSampleMemoryQuery query,
-                                 const McabSampleMemLine* extra, size_t n_extra) {
-    McabMemReq req;
+int array_sample_print_mem_budget(const char* title, const AecConfig* cfg,
+                                 const ArraySampleBeamParams* bp, ArraySampleMemoryQuery query,
+                                 const ArraySampleMemLine* extra, size_t n_extra) {
+    AecMemReq req;
     unsigned long long unit_bytes, total;
     size_t i;
     if (query(cfg, bp, &req, &unit_bytes) != 0) {
@@ -30,10 +30,9 @@ int mcab_sample_print_mem_budget(const char* title, const McabConfig* cfg,
     for (i = 0; i < n_extra; ++i) total += extra[i].bytes;
     printf("Memory Budget (%s)\n", title);
     printf("=============================================================\n");
-    /* cfg->fft_size may be the unresolved 0 sentinel; print the grid actually used. */
     printf("  sample_rate=%d fft=%d geometry=%d num_angles=%d\n",
            cfg->sample_rate,
-           mcab_sample_resolved_fft(cfg->sample_rate, cfg->fft_size),
+           cfg->fft_size,
            (int)bp->geometry, bp->num_angles);
     printf("  Unit:           %9llu bytes (%7.1f KB)\n",
            unit_bytes, (float)unit_bytes / 1024.0f);
@@ -46,14 +45,14 @@ int mcab_sample_print_mem_budget(const char* title, const McabConfig* cfg,
            "layout_version=%u backend_id=%u (%s) "
            "build_flags_hash=0x%08x\n\n",
            req.descriptor_version, req.alignment, req.layout_version,
-           req.backend_id, mcab_sample_backend_name(req.backend_id),
+           req.backend_id, array_sample_backend_name(req.backend_id),
            req.build_flags_hash);
     return 0;
 }
 
-int mcab_sample_scan_cli(int argc, char **argv, const McabSampleCliOption *options,
-                  size_t count, void *user, McabSampleCliSet set,
-                  McabSampleCliUnknown unknown) {
+int array_sample_scan_cli(int argc, char **argv, const ArraySampleCliOption *options,
+                  size_t count, void *user, ArraySampleCliSet set,
+                  ArraySampleCliUnknown unknown) {
     for (int i = 1; i < argc; ++i) {
         size_t j;
         for (j = 0; j < count; ++j)
@@ -70,8 +69,8 @@ int mcab_sample_scan_cli(int argc, char **argv, const McabSampleCliOption *optio
     return 0;
 }
 
-static int mcab_sample_spatial_set(void *user, const char *name, const char *value) {
-    McabSampleSpatialOptions *o = user;
+static int array_sample_spatial_set(void *user, const char *name, const char *value) {
+    ArraySampleSpatialOptions *o = user;
     if (!strcmp(name, "--print-mem-size")) o->print_mem_size = 1;
     else if (!strcmp(name, "--mic-raw")) o->mic_path = value;
     else if (!strcmp(name, "--ref-raw")) o->ref_path = value;
@@ -92,12 +91,12 @@ static int mcab_sample_spatial_set(void *user, const char *name, const char *val
     }
     return 0;
 }
-static int mcab_sample_spatial_unknown(void *user, const char *name) {
+static int array_sample_spatial_unknown(void *user, const char *name) {
     (void)user; (void)name;
     return 2;
 }
-int mcab_sample_parse_spatial_cli(int argc, char **argv, int raw, McabSampleSpatialOptions *out) {
-    static const McabSampleCliOption spatial[] = {
+int array_sample_parse_spatial_cli(int argc, char **argv, int raw, ArraySampleSpatialOptions *out) {
+    static const ArraySampleCliOption spatial[] = {
         {"--print-mem-size",0}, {"--sample-rate",1}, {"--fft-size",1},
         {"--uca-radius-m",1}, {"--fixed-doa-deg",1},
         {"--mic-raw",1}, {"--ref-raw",1}, {"--output-raw",1}, {"--vad-u8",1}
@@ -105,8 +104,8 @@ int mcab_sample_parse_spatial_cli(int argc, char **argv, int raw, McabSampleSpat
     memset(out, 0, sizeof(*out));
     out->sample_rate = raw ? 0 : 16000;
     out->uca_radius_m = 0.035f;
-    if (mcab_sample_scan_cli(argc, argv, spatial, raw ? 9 : 5, out,
-                      mcab_sample_spatial_set, mcab_sample_spatial_unknown) != 0) return 2;
+    if (array_sample_scan_cli(argc, argv, spatial, raw ? 9 : 5, out,
+                      array_sample_spatial_set, array_sample_spatial_unknown) != 0) return 2;
     if (!raw) return 0;
     if (!out->print_mem_size && (!out->mic_path || !out->ref_path ||
                                  !out->output_path)) return 2;
@@ -118,8 +117,8 @@ int mcab_sample_parse_spatial_cli(int argc, char **argv, int raw, McabSampleSpat
     return 2;
 }
 
-int mcab_sample_main(int argc, char **argv, const McabSampleOps *ops, void *user) {
-    McabSampleHopView hop = {0};
+int array_sample_main(int argc, char **argv, const ArraySampleOps *ops, void *user) {
+    ArraySampleHopView hop = {0};
     hop.program = argv[0];
     int rc = ops->parse(user, argc, argv);
     if (rc != 0) return rc == 1 ? 0 : 2;

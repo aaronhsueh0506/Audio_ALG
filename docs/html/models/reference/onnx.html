@@ -112,7 +112,7 @@ N 是 <code>DFN2GridSpec.frames_per_call</code>（1..64），<code>pre_process_f
 
 <p><b>pipeline 層的對應</b>：四個應用（<code>mono_alignulcnet</code>、<code>4ch_alignulcnet</code>、<code>mono_aec_dfn_res</code>、<code>4ch_aec_bf_dfn_res</code>）把同一個 hop 拆成 begin → 取 job → 呼叫端在 NPU 上推論 → 回報 rc → end。
 DFN2 應用用 <code>dfn/dfn_hop.h</code>：<code>dfn_hop_begin()</code> → <code>while (dfn_hop_nn_begin() &gt; 0) { 推論; dfn_hop_nn_end(rc) }</code> → <code>dfn_hop_end()</code>，job 是 <code>DfnResStageJob</code>（<code>DFN2PrepostInputs/Outputs</code> 視圖）。
-ULCNet 應用用 <code>ulcnet/ulcnet_nn_stage.h</code>：<code>ulcnet_nn_stage_begin()</code>／<code>_begin_complex()</code>／<code>_begin_time()</code> → <code>ulcnet_nn_stage_nn_begin()</code>（回 1 並交出 <code>UlcnetNnJob</code>；回 0 表示本 hop 無模型幀）→ 推論 → <code>ulcnet_nn_stage_nn_end(rc)</code> → <code>ulcnet_nn_stage_end()</code>。
+ULCNet 應用用 <code>ulcnet/ulcnet_nn_stage.h</code>：應用端的 <code>ac_stft_push()</code> → <code>ulcnet_nn_stage_begin_spec()</code> → <code>ulcnet_nn_stage_nn_begin()</code>（回 1 並交出 <code>UlcnetNnJob</code>；回 0 表示本 hop 無模型幀）→ 推論 → <code>ulcnet_nn_stage_nn_end(rc)</code> → <code>ulcnet_nn_stage_end_spec()</code> → 應用端的 <code>ac_istft_push()</code>。
 兩者都是：<code>rc==0</code> 且輸出有限才提交，否則該幀走 identity（等同 <code>_frame_bypass</code> 的語意）；輸出預填 NaN；合成剛好一個 hop。
 DFN 應用經 rate bridge 時一個 native hop 可能有 0..2 個幀，所以 <code>dfn_hop_nn_begin()</code> 放在迴圈裡。
 逐步呼叫序列與時序圖見「相關檔案」，另見 <code>pipelines/README.md</code> 的 Call flow。</p>

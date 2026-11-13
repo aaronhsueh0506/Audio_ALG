@@ -16,6 +16,16 @@ code, so the whole `pipelines/` tree is collected, not only `pipelines/tests`):
 python3 -m pytest -q pipelines
 ```
 
+The source-text guards in that tree read the AEC library's headers (`aec.h`,
+`aec_post.h`, `aec_balanced_config.h`) from the same place `lib/deps.mk` points
+the build at: `AEC_DIR` from the environment (absolute path), else the sibling
+`../AEC/c_impl`. They pin `AEC_LAYOUT_VERSION` against the docs
+(`pipelines/tests/test_doc_layout_versions.py`), the comfort-noise floor and
+seed against the oracle chains, the Python twin and the C witnesses
+(`pipelines/common/tests/test_cng_floor_constant.py`, `test_cng_aec3.py`), and
+the file list `pyc_parity.py` hashes into its result against the tree
+(`pipelines/tests/test_pyc_parity_sources.py`).
+
 Pass conditions:
 
 - [ ] AEC -> NR -> RES ordering is correct.
@@ -39,7 +49,7 @@ the example's `AcIstft` on the stage path and the bridge's own otherwise) and
 ```bash
 make -C pipelines BACKEND=ne10 SIMD=<0-or-1> WERROR=1 test
 # adds: test_dfn_res_stage, test_dfn_rate_bridge, test_mono_dfn, test_dfn_hop,
-#       test_mcab_sample_post, mono_aec_dfn_res (board skeleton at its 16 kHz default,
+#       test_array_sample_post, mono_aec_dfn_res (board skeleton at its 16 kHz default,
 #       also run with --delay-num-filters 1 --cng --atten-lim 12, and with
 #       --sample-rate 48000 and 8000, and with --ai-sample-rate 16000
 #       --ai-fft-size 256, the model grid the stage drives directly)
@@ -48,7 +58,7 @@ make -C pipelines/mono/aec_dfn_res test   # scoped: test_dfn_res_stage,
 #       48 kHz, 8 kHz, the model-grid flags, the malformed-number and
 #       model-grid refusals); the top-level target
 #       above is the one that gates a release (it also runs test_dfn_hop,
-#       test_mcab_sample_post and the rest of the pipelines/ set).
+#       test_array_sample_post and the rest of the pipelines/ set).
 ```
 
 The stage runs the DeepFilterNet2 grid its config carries, lookahead pair included (a row of
@@ -137,27 +147,24 @@ Pass conditions:
 - [ ] Four linear spectra cross the beamformer boundary and only one mono
       NR+RES path follows it.
 - [ ] SRP-PHAT/BF and AEC/NR use the same selected grid.
-- [ ] Sequence rules (front before fuse; with the sample helper, front before beam before fuse), reset and refused calls fail closed: a call out of order returns `MCAB_SEQUENCE_ERROR` and changes nothing, a fuse refused with `MCAB_DSP_ERROR` resets the flow (the sample helper resets everything it owns).
-- [ ] `mcab` is a flow layer, not a library: the application creates the four lanes (`aec_init()` over `mcab_lane_config()`, or a config stamped with `mcab_apply_lane_contract()`) and, in MATCHED mode, the shared `DelayAec`, and passes them to `mcab_init_ex()`; `mcab` supports caller-owned pool init (and `mcab_create()` for its own small pool), never creates, resets by destroying or frees an injected object, and refuses a flow built from the wrong objects.
-- [ ] `mcab` and the sample beam helper (SRP-PHAT/BF) allocate no heap after static init.
-- [ ] `mcab` contains no beamformer and no post-beam RES, NR, comfort noise or synthesis
-      (`mcab_fuse()` leaves `frame.g_res_ctx` NULL); those stages are separate libraries that the
-      example programs initialise and chain (the RES is an `AecRes` created with the
-      `aec_res_*` functions of lib/aec), and the flow plus the examples' per-hop chain equals
-      the hand-written reference chain bit for bit (`test_mcab_sample_beam`, oracle
-      `4ch/tests/conv_chain_mcab.h`).
-- [ ] `libaudio_pipeline_mcab.a` holds `mcab.o` only and references no SRP-PHAT/BF symbol; the
-      sample helpers (`mcab_sample_flow.o`, `mcab_sample_beam.o`) are not in it.
-- [ ] `make libaudio_pipeline_mcab.a` builds with `NR_DIR` absent (the archive needs only audiolib common and
-      lib/aec; check SP-S21 in `pipelines/scripts/test_build_isolation.sh`).
+- [ ] Sequence rules (linear before residual; with the sample helper, front before beam before fuse), reset and refused calls fail closed: a call out of order returns `AEC_ERR_SEQUENCE` and changes nothing, a residual stage refused with `AEC_ERR_DSP` has already reset the array (the sample helper resets everything it owns).
+- [ ] The 4-channel flow is one `Aec` instance of lib/aec (`AecConfig.n_mics = AEC_ARRAY_MICS`), not a pipeline module: `aec_get_mem_requirements()` + `aec_init_ex()` (or `aec_create()`) build the shared `DelayAec`, the four lanes, the alignment ring, the fusion buffers and the gain stage in one pool; the application supplies no lane or estimator, and the lanes have no public handle.
+- [ ] The array and the sample beam helper (SRP-PHAT/BF) allocate no heap after static init.
+- [ ] The array contains no beamformer and no NR, comfort-noise rendering or synthesis (`aec_process_residual()` fuses with the caller's weights; the gain comes from the array's gain stage under `AEC_RESIDUAL_FULL`, rendered by `aec_apply_gain()` / `aec_apply_cng()`); the denoiser and the synthesis are separate libraries that the
+      example programs initialise and chain, and the array plus the examples' per-hop chain equals
+      the hand-written reference chain bit for bit (`test_array_sample_beam`, oracle
+      `4ch/tests/conv_chain_4ch.h`, a second array driven through explicit arrays); the array equalled the former flow bit for bit
+      (one-off comparison against the pre-fold flow, retired on 2026-11-13; the AEC repo's `test_aec_array` keeps the contract checks).
+- [ ] There is no array archive: `libaec.a` holds the array and references no SRP-PHAT/BF symbol; the
+      sample helper (`array_sample_beam.o`) is in no archive.
+- [ ] `libaec.a` and the 4ch `test_4ch_chain` build with the spatial archives absent (`make test_4ch_chain` needs common, lib/aec and lib/nr only; check SP-S21..SP-S25 in `pipelines/scripts/test_build_isolation.sh`).
 - [ ] SIMD/scalar parity passes.
 - [ ] All three product grids pass.
 
 ### 9.0 Four-channel DeepFilterNet2 variant (`4ch_aec_bf_dfn_res`)
 
 `make -C pipelines/4ch test` also builds and runs the DFN2
-example over `mcab` plus the sample beam helper (real SRP-PHAT/BF; the post-beam RES is an `AecRes`
-the example creates itself; no denoiser; the host synthesis is the example's `AcIstft` on the
+example over the array plus the sample beam helper (real SRP-PHAT/BF; the post-beam RES is the array's gain stage; no denoiser; the host synthesis is the example's `AcIstft` on the
 stage path and the bridge's own otherwise; `dfn/dfn_hop.h`):
 
 ```bash
@@ -177,17 +184,17 @@ Pass conditions:
 
 - [ ] At a 48 kHz host, with no model (or a failing one), the example output is
       byte-equal to the hand-written conventional chain
-      (`4ch/tests/conv_chain_mcab.h`, fed the sample helper's beam weights
+      (`4ch/tests/conv_chain_4ch.h`, fed the sample helper's beam weights
       and beamformed spectrum) with the denoiser off,
       delayed by exactly two hops (`M + D` for the build's pair), with comfort
       noise OFF and ON, across an AEC delay change.
-- [ ] The stimulus actually engages the post-beam RES (a run without the example's `AecRes` differs).
+- [ ] The stimulus actually engages the post-beam RES (a run without the array's gain stage differs).
 - [ ] Stage counters show no mid-stream reset (the stage is not reset by a
       delay change of the shared aligner).
-- [ ] A rate `mcab` does not offer is refused at
-      `mcab_get_mem_requirements()`, and a non-partition-of-unity
+- [ ] A rate the array does not offer is refused at
+      `aec_get_mem_requirements()`, and a non-partition-of-unity
       `erb_inv` at `dfn_res_stage_get_mem_requirements()` (`test_dfn_res_stage`).
-      8 kHz in particular must be refused: `mcab` has no 8 kHz grid, so the
+      8 kHz in particular must be refused: the array has no 8 kHz grid, so the
       4-channel DFN2 example cannot offer one either.
 - [ ] Native-grid gates pass for 16 kHz/fft 256 and 16 kHz/fft 512: the
       per-hop 48 kHz frame schedule (0,1,1,1 at hop 128; 1,2 at hop 256), the
@@ -195,7 +202,7 @@ Pass conditions:
       samples) and a pass-band tolerance against the conventional NR-off
       output. The native path is a tolerance, NOT a memcmp.
 - [ ] The build produces `libdfn_res_stage.a` (carrying
-      `dfn_rate_bridge.o`); `MCAB_LAYOUT_VERSION` is 26 (the pool of `mcab` alone).
+      `dfn_rate_bridge.o`); `AEC_LAYOUT_VERSION` is 1 (the `Aec` pool, array included).
 
 ### 9.1 Real four-microphone validation
 

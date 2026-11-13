@@ -100,10 +100,10 @@ probes the host's MPS backend and fails where the backend agrees with the CPU.
 
 C-side `make test` targets that print `PASS:` markers rather than a count
 (`make clean` first, `^PASS:` lines counted): `pipelines` (the mono applications, the
-`dfn/` and `ulcnet/` stage tests and `test_mcab_sample_post`), `pipelines/mono/aec_nr_res`, `pipelines/mono/alignulcnet`
+`dfn/` and `ulcnet/` stage tests and `test_array_sample_post`), `pipelines/mono/aec_nr_res`, `pipelines/mono/alignulcnet`
 (its test covers the 16 kHz and the 48 kHz grid in one binary, and the target also runs `mono_alignulcnet --sample-rate 48000`) and `pipelines/4ch`
-(`mcab`; one-stop gate for the four-channel side: `test_mcab`, `test_mcab_sample_beam`, `test_mcab_sample_driver`, the
-`mcab_raw`, `mcab_static` and `mcab_external_static` runs, `test_4ch_dfn` with the
+(the four-microphone array; one-stop gate for the four-channel side: `test_4ch_chain`, `test_array_sample_beam`, `test_array_sample_driver`, the
+`4ch_raw`, `4ch_static` and `4ch_external_static` runs, `test_4ch_dfn` with the
 `4ch_aec_bf_dfn_res` command-line runs, and the `4ch_alignulcnet` binaries, whose test
 prints a single `All 4ch_ulcnet tests passed` line and no `PASS:`
 markers, and covers both grids; the target also runs `4ch_alignulcnet --sample-rate 48000`). Each additionally prints a small number of non-`PASS:`

@@ -207,7 +207,7 @@
   <!-- arrow to NR -->
   <line x1="455" y1="130" x2="520" y2="130" stroke="#64748b" stroke-width="2" marker-end="url(#arrow)"/>
   <text x="488" y="120" font-size="11" fill="#475569" text-anchor="middle">error[n]</text>
-  <text x="488" y="148" font-size="10" fill="#475569" text-anchor="middle">+ AecResContext</text>
+  <text x="488" y="148" font-size="10" fill="#475569" text-anchor="middle">+ AecResidualView</text>
 
   <!-- NR block -->
   <rect x="525" y="80" width="160" height="100" rx="8" fill="#10b981"/>
@@ -243,7 +243,7 @@
   <strong>關鍵點（echo-aware joint 設計）：</strong>
   <ol style="margin: 4px 0 0 20px;">
     <li>HPF <strong>只對 mic path</strong> 做；ref（far-end）<strong>不經 HPF</strong>（far-end HPF 預設 OFF，downstream Saturation / DelayEst 吃原始 ref）</li>
-    <li>AEC 只做線性消除，輸出 <code>E(f)</code>（分析 seam）、渲染底座 <code>B</code>（<code>aec_get_output_base()</code>）+ <code>AecResContext</code>（殘響回音功率 R²、res_gain、CNG、ERLE、DT 指標）</li>
+    <li>AEC 只做線性消除，輸出 <code>E(f)</code>（分析 seam）、渲染底座 <code>B</code>（<code>AecResidualView.base_spec</code>）+ 同一個 <code>AecResidualView</code>（殘響回音功率 R²、res_gain、CNG、DT 指標；ERLE 等在 <code>AecLinearView</code>）</li>
     <li>NR 把 R² 折進雜訊地板：<code>ξ = S²/(N²+R²)</code>，用<strong>一個</strong> MMSE-LSA gain 同時壓雜訊＋殘響回音（無 re-FFT）</li>
     <li>gain fusion <code>g_total = min(G_nr, G_res)</code>：每個 bin 取兩個 gain 的較小者，沒有 near-end floor；comfort noise 只補 RES 切掉的 bin</li>
     <li>分析 STFT 在 AEC 內做一次（periodic sqrt-Hann、50% overlap），合成由應用的 <code>AcIstft</code> 做一次（iFFT + sqrt-Hann OLA）；中間的 NR 與 gain 融合都是頻域 block，可替換（NN seam）</li>
@@ -312,7 +312,7 @@
 <h2 id="aec">3. AEC — PBFDKF + Shadow Filter</h2>
 
 <div class="panel">
-<p>線性 AEC 的核心是 PBFDKF（Partitioned Block Frequency-Domain Kalman Filter）搭配 shadow filter 的雙濾波器策略，並有 Echo Path Change（EPC）偵測與 stationary far-end 的 double-talk 保護。結構圖、config 常數與各機制的觸發條件收在 <a href="architecture-aec.html">architecture_aec.html</a>（拆頁以維持單頁大小）；演算法本體見 <a href="../../../../lib/aec/docs/aec_methods.md">lib/aec/docs/aec_methods.md</a>。</p>
+<p>線性 AEC 的核心是 PBFDKF（Partitioned Block Frequency-Domain Kalman Filter）搭配 shadow filter 的雙濾波器策略，並有 Echo Path Change（EPC）偵測與 stationary far-end 的 double-talk 保護。結構圖、config 常數與各機制的觸發條件收在 <a href="architecture-aec.html">architecture-aec.html</a>（拆頁以維持單頁大小）；演算法本體見 <a href="../../../../lib/aec/docs/aec_methods.md">lib/aec/docs/aec_methods.md</a>。</p>
 </div>
 
 <!-- ============================================================ -->
@@ -321,7 +321,7 @@
 <div class="panel">
 <p>NR 處理 AEC 輸出的 error 訊號，移除背景噪音同時保留近端語音。三大組件：MCRA + SPP + MMSE-LSA。</p>
 <div class="note" style="margin-top:0;">
-  <strong>整合 pipeline（joint echo-aware）：</strong>NR 直接吃 AEC 的頻域渲染底座 <code>B</code>（<code>aec_get_output_base()</code>；守衛未啟動的 hop 上逐位元等於 <code>E(f)</code>，守衛 hop 上為 <code>E + echo</code>；無 re-FFT），
+  <strong>整合 pipeline（joint echo-aware）：</strong>NR 直接吃 AEC 的頻域渲染底座 <code>B</code>（<code>base_spec</code>；守衛未啟動的 hop 上逐位元等於 <code>E(f)</code>，守衛 hop 上為 <code>E + echo</code>；無 re-FFT），
   並把 AEC 估的殘響回音功率 R² 折進先驗 SNR：<code>ξ = S²/(N²+R²)</code>，讓同一個 MMSE-LSA gain
   一次壓掉雜訊＋殘響回音。底下的 MCRA/SPP/MMSE-LSA 是 NR 單獨運作時的演算法本體。
 </div>
@@ -416,15 +416,15 @@ G[k] = G<sub>LSA</sub><sup>p[k]</sup> · g<sub>min</sub><sup>1−p[k]</sup>
 <h2 id="res">5. Post-filter — RES + CNG</h2>
 
 <div class="panel">
-<p>RES 是 AEC3-aligned 的抑制鏈（<code>AecState</code> → <code>ResidualEchoEstimator</code> → <code>SuppressionGain</code>），在 AEC 內部以頻域計算 <code>G_res(f)</code> 與 <code>R²(f)</code>，經 <code>AecResContext</code> 交給 pipeline；它不是 NR 之後的第二個時域濾波器。演算法本體見 <a href="../../../../lib/aec/docs/aec_methods.md">lib/aec/docs/aec_methods.md</a> <a href="../../../../lib/aec/docs/aec_methods_02_post_filter.md#3-aec3-post-filter-_aec3_post">§3</a>。mono 的 RES 增益就是這個 AEC 自己的 <code>ctx.res_gain</code>（經 <code>aec_get_res_context()</code> 讀 <code>AecResContext.res_gain</code>，強度用 <code>aec_set_level()</code>）；4ch 的 post-beam RES 不在 <code>mcab</code> 內（<code>mcab_fuse()</code> 讓 <code>g_res_ctx</code> 為 NULL），而是由 libaec 管理、應用在自己的 init 建立的 <code>AecRes</code>（<code>aec_res_get_mem_size()</code>／<code>aec_res_init()</code>，每 hop <code>aec_res_process(res, &amp;in)</code>，強度用 <code>aec_res_set_level(res, …)</code>）；NR 與最後合成一律是另外初始化的函式庫物件。</p>
+<p>RES 是 AEC3-aligned 的抑制鏈（<code>AecState</code> → <code>ResidualEchoEstimator</code> → <code>SuppressionGain</code>），在 AEC 內部以頻域計算 <code>G_res(f)</code> 與 <code>R²(f)</code>，經 <code>AecResidualView</code> 交給 pipeline；它不是 NR 之後的第二個時域濾波器。演算法本體見 <a href="../../../../lib/aec/docs/aec_methods.md">lib/aec/docs/aec_methods.md</a> <a href="../../../../lib/aec/docs/aec_methods_02_post_filter.md#3-aec3-post-filter-_aec3_post">§3</a>。mono 的 RES 增益就是這個 AEC 自己的 <code>v.res_gain</code>（經 <code>aec_get_residual()</code> 讀 <code>AecResidualView.res_gain</code>，由 <code>aec_apply_gain()</code> 取用，強度用 <code>aec_set_level()</code>）；4ch 的 post-beam RES 是四麥克風 array（<code>AecConfig.n_mics = 4</code>）內唯一一個增益級（<code>residual = AEC_RESIDUAL_FULL</code>），由 <code>aec_process_residual()</code> 對融合後的頻譜算出，同樣經 <code>aec_get_residual()</code> 讀、<code>aec_apply_gain()</code> 取用，強度用同一個 <code>aec_set_level()</code>；NR 與最後合成一律是另外初始化的函式庫物件。</p>
 
 <h3>5.1 Gain fusion</h3>
 
-<p><code>g_total = min(G_nr, G_res)</code>，每個 bin 取兩個 gain 的較小者並對渲染底座 <code>B</code>（<code>aec_get_output_base()</code>；守衛未啟動的 hop 上等於 <code>E(f)</code>）套用一次；<code>E(f)</code>（<code>error_spec</code>）只是分析 seam，合成要乘 <code>B</code>；沒有 near-end floor。NR 把 <code>R²</code> 折進先驗 SNR，因此兩個 gain 不是重複計算同一件事。</p>
+<p><code>g_total = min(G_nr, G_res)</code>，每個 bin 取兩個 gain 的較小者並對渲染底座 <code>B</code>（<code>base_spec</code>；守衛未啟動的 hop 上等於 <code>E(f)</code>）套用一次；<code>E(f)</code>（<code>error_spec</code>）只是分析 seam，合成要乘 <code>B</code>；沒有 near-end floor。NR 把 <code>R²</code> 折進先驗 SNR，因此兩個 gain 不是重複計算同一件事。</p>
 
 <h3>5.2 CNG (Comfort Noise Generation)</h3>
 
-<p>Comfort noise 由 AEC 的 <code>comfort_noise</code> PSD 產生，只填 <code>G_res</code> 切掉的 bin；位準再乘該 bin 的 <code>G_nr</code>（下限 −10 dB，範例內的 <code>CNG_NR_GAIN_FLOOR</code>／<code>MCAB_SAMPLE_CNG_NR_GAIN_FLOOR</code>），讓補進去的噪聲落在降噪後的底噪。pipeline 預設 <code>enable_cng=1</code>。</p>
+<p>Comfort noise 由 AEC 的 <code>comfort_noise</code> PSD 產生，只填 <code>G_res</code> 切掉的 bin；位準再乘該 bin 的 <code>G_nr</code>（下限 −10 dB，<code>aec.h</code> 的 <code>AEC_CNG_NR_GAIN_FLOOR</code>，由 <code>aec_apply_cng()</code> 套用），讓補進去的噪聲落在降噪後的底噪。pipeline 預設 <code>enable_cng=1</code>。</p>
 
 </div>
 
@@ -432,7 +432,7 @@ G[k] = G<sub>LSA</sub><sup>p[k]</sup> · g<sub>min</sub><sup>1−p[k]</sup>
 <h2 id="perf">6. 效能、資源消耗、level 與限制</h2>
 
 <div class="panel">
-<p>系統規格與資源消耗（取樣率、grid、演算法延遲、靜態記憶體查詢方式）、AEC 收斂與保護時間、AEC level 與 NR 降噪等級對照表、以及第 7 節的已知限制，收在 <a href="architecture-detail.html">architecture_detail.html</a>（拆頁以維持單頁大小）。</p>
+<p>系統規格與資源消耗（取樣率、grid、演算法延遲、靜態記憶體查詢方式）、AEC 收斂與保護時間、AEC level 與 NR 降噪等級對照表、以及第 7 節的已知限制，收在 <a href="architecture-detail.html">architecture-detail.html</a>（拆頁以維持單頁大小）。</p>
 </div>
 
 <!-- ============================================================ -->
@@ -441,13 +441,13 @@ G[k] = G<sub>LSA</sub><sup>p[k]</sup> · g<sub>min</sub><sup>1−p[k]</sup>
 <div class="panel">
 <table>
   <tr><th>路徑(相對 <code>docs/</code>)</th><th>內容</th></tr>
-  <tr><td><a href="timing.html">html/integration_sequence.html</a></td><td>各函式庫的建立、逐 hop、reset／destroy 時序圖與被拒呼叫的錯誤矩陣</td></tr>
-  <tr><td><a href="../../pipelines/mono/aec-nr-res/index.html">html/pipeline_mono.html</a>、<a href="../../pipelines/mono/aec-nr-res/reference/configuration.html">pipeline_mono_params</a>、<a href="../../pipelines/mono/aec-nr-res/reference/configuration.html#diagnostics">pipeline_mono_detail</a></td><td>mono 的呼叫順序與範例、外部／內部參數分級、執行期強度控制與逐階段耗時</td></tr>
-  <tr><td><a href="architecture-aec.html">architecture_aec.html</a>、<a href="architecture-detail.html">architecture_detail.html</a></td><td>本頁拆出的 AEC 細節，以及效能／level／已知限制</td></tr>
+  <tr><td><a href="timing.html">start/reference/timing.html</a></td><td>各函式庫的建立、逐 hop、reset／destroy 時序圖與被拒呼叫的錯誤矩陣</td></tr>
+  <tr><td><a href="../../pipelines/mono/aec-nr-res/index.html">pipelines/mono/aec-nr-res/index.html</a>、<a href="../../pipelines/mono/aec-nr-res/reference/configuration.html">reference/configuration.html</a>、<a href="../../pipelines/mono/aec-nr-res/reference/configuration.html#diagnostics">#diagnostics</a></td><td>mono 的呼叫順序與範例、外部／內部參數分級、執行期強度控制與逐階段耗時</td></tr>
+  <tr><td><a href="architecture-aec.html">architecture-aec.html</a>、<a href="architecture-detail.html">architecture-detail.html</a></td><td>本頁拆出的 AEC 細節，以及效能／level／已知限制</td></tr>
   <tr><td><a href="../../../../pipelines/README.md">pipelines/README.md</a></td><td>目前的介面契約、CLI 與建置</td></tr>
   <tr><td><a href="../../../../lib/aec/docs/aec_methods.md">lib/aec/docs/aec_methods.md</a></td><td>AEC／RES 演算法本體</td></tr>
   <tr><td><code>pipelines/mono/aec_nr_res/main.c</code></td><td>範例：初始化 <code>Aec</code>／<code>AnrDenoiser</code>／<code>AcIstft</code> 並以 <code>mono_form()</code> 明寫逐 hop 串接；同一份原始碼建出 <code>aec_nr_pipeline</code>（<code>-DAEC_NR_POOL_SPLIT=1</code>，兩塊 pool）與 <code>aec_nr_pipeline_static</code>（一塊 pool，另有 <code>--print-mem-size</code>）</td></tr>
-  <tr><td><code>pipelines/4ch/mcab_sample_post.h</code></td><td>4ch 範例的後級接線：<code>mcab_sample_res_input()</code>（<code>AecResInput</code>）、<code>mcab_sample_anr_gain()</code>（NR 增益）與 CNG 常數；mono 的對應函式是 <code>mono_nr_gain()</code>（同在 <code>main.c</code>）</td></tr>
+  <tr><td><code>pipelines/4ch/array_sample_post.h</code></td><td>4ch 範例的後級接線：<code>array_sample_anr_gain()</code>（NR 增益）、<code>array_sample_post_reset_due()</code> 與 PSD 尺度常數；mono 的對應函式是 <code>mono_nr_gain()</code>（同在 <code>main.c</code>）</td></tr>
   <tr><td><code>pipelines/mono/aec_nr_res/tests/test_mono_chain.c</code></td><td>串接驗收，對手寫 oracle <code>conv_chain_mono.h</code> 比對</td></tr>
 </table>
 </div>

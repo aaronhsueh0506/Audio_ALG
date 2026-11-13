@@ -3,6 +3,177 @@
 `Audio_ALG/pipelines`（含它建置的 `AINR`、`AIAEC` C 程式）的重要改動記錄在此，格式依
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/)。README 只寫現況，改動經過寫在這裡。
 
+## [Unreleased] — 2026-11-13 — the 4-channel sample layer is named `array_sample_*`; the flow wrapper is gone
+
+Nothing was released, so the old names are gone without aliases.
+
+- **Renames.** `mcab_sample_{beam,driver,post}` -> `array_sample_{beam,driver,post}` (types `ArraySample*`, macros `ARRAY_SAMPLE_*`); programs `mcab_raw`,
+  `mcab_static`, `mcab_external_static` -> `4ch_raw`, `4ch_static`, `4ch_external_static` (the banners follow: `4ch_static: smoke PASS`); tests
+  `test_mcab` -> `test_4ch_chain` (`All 4ch chain tests passed`), `test_mcab_sample_{beam,driver,post}` -> `test_array_sample_*`, `conv_chain_mcab.h` ->
+  `conv_chain_4ch.h` (`CONV_4CH_CNG_NR_GAIN_FLOOR`), `mcab_test_rig.h` -> `array_test_rig.h`; make goal `test-mcab-sample-driver` -> `test-array-sample-driver`;
+  `docs/reference/mcab/` -> `docs/reference/array/`. The Python twin keeps its `Mcab*` names.
+- **Removed.** `mcab_sample_flow.{h,c}` (`McabSampleFlow`): the programs call `aec_get_mem_requirements()` + `aec_init_ex()` and `aec_destroy()` themselves;
+  `array_sample_default_config()` moved into `array_sample_beam.h`. `mcab_sample_resolved_fft()` (the driver prints `cfg->fft_size`, which
+  `aec_config_from_level()` always fills). The `Unit` / `PostStages` code that `4ch_raw.c` and `4ch_static.c` each carried is `array_sample_unit.h`.
+  `ArraySampleBeamInfo.doa_analysis_frames` (always 1); the raw runner's JSON key `doa_analysis_frames` stays and counts the processed hops.
+- **Tests.** `test_array_sample_beam.c` drops the array gain reset/level, the ramped level and the view/timing checks that the AEC repo's
+  `test_aec_array*.c` cover; the ramp-vs-oracle chain test stays. The rig reads the sample rate from its own slot instead of `Aec` internals.
+- **Build.** The 4ch Makefile no longer adds `-DAEC_STAGE_TIMING` (no 4ch TU reads it; `PROFILE` still reaches lib/aec). `test_build_isolation.sh` SP-S19..S25
+  follow the new goal names; SP-S24 compares `test_4ch_chain.o` across the two audiolib variants.
+- **Docs.** `docs/reference/array/config.md` §4.4, `errors.md` §5.4 and §8 and `integration.md` §1.1 link to the AEC docs instead of repeating them.
+
+## [Unreleased] — 2026-11-13 — mono CLI levels are digits, one-off golden retired
+
+- **Levels.** `aec_nr_pipeline` / `aec_nr_pipeline_static` take the AEC level (positional or `--aec-level`) and the NR level (`--nr-level`, alias
+  `--nr-preset`) as one digit only (AEC 0 mild, 1 balanced, 2 aggressive, 3 no_floor; NR 0 mild, 1 moderate, 2 balanced, 3 aggressive). Any other
+  text (a name, an out-of-range, signed, padded or empty value) exits 2 instead of falling back to balanced; `--sample-rate` and `--fft-size` are whole
+  decimal integers (`example_cli_int_option()`, `example_cli_level_option()` in `common/example_cli.h`; `atoi()` is gone) and exit 2 otherwise.
+  The banner's first line reads `(one pool)` / `(split pools)`; with `--legacy-amin` it adds `no residual-echo prior`. The failed-build message is
+  the same in both binaries.
+- **`--aec-only`** is unchanged: the lane is built with `AEC_RESIDUAL_STATE` and each hop runs `aec_process_linear()` then `aec_process_residual()`; the
+  output is `aec_get_linear().linear_hop`. The residual stage's state update steers the linear filter's step size, so this hop equals the full chain's lane
+  bit for bit. `test_mono_chain` compares it with a second `STATE` lane driven by the two stages and with the `FULL` lane of the chain (400 hops on its
+  moving-echo scene at 16 kHz/256, 16 kHz/512 and 48 kHz/1024); the pool is the `Aec` block of the chain.
+- **`enable_delay_est`** is no longer written by any program, test or the AIAEC front (`delay_mode` is the only delay input); `deployed_lane_dump`
+  derives its `enable_delay_est` key from `delay_mode`.
+- **Golden.** `ulcnet/tests/golden_ulcnet_stage_oldapi.txt` and `test_golden_oldapi()` are removed: the replay compared equal (1,920 hops per build, SIMD=1
+  `apple-aarch64-neon` and SIMD=0 `apple-aarch64-scalar`) before the file was deleted.
+- **`AEC_NO_ARRAY`** is no longer appended to the pipeline TUs' `CFLAGS` (nothing read it); it stays in `CFG_SIG` and in `AEC_FWD`.
+  `test_target_abi` learns it through `TARGET_ABI_TEST_CFLAGS` (`-DTARGET_ABI_TEST_NO_ARRAY`): an array `libaec.a` must accept `n_mics = 4`, a
+  single-channel one must refuse it, and the two `aec` descriptor carves are then the one-channel lane (8 cases in both modes).
+  `make audit-dead-defines` passes.
+- `stream/aiaec/front` builds its AEC with `AEC_RESIDUAL_STATE` (it reads `formed_hop` and `delay_state` only); the front tests stay bit-exact.
+
+## [Unreleased] — 2026-11-13 — Callers follow the AEC public-header trims
+
+- `aec_get_residual_gain()` is gone: `conv_chain_4ch.h` reads `c->frame.res_gain`, `test_4ch_dfn.c` / `test_array_sample_beam.c` drop the equality with the getter, `test_4ch_chain.c` checks the array's `residual` mode. `aec_cng_fill` (`pyc_drv.c`, `conv_chain_mono.h`) is included from `aec_internal.h`.
+- `enable_delay_est` is no longer written anywhere (mono mains, `example_board_adapter.c`, `aiaec_front.c`, `pyc_drv.c`, the tests and the sample `alg_audio_aec_nr.c`); `AIAEC/tests/deployed_lane_dump.c` still prints `enable_delay_est=` for the Python contract, derived from `delay_mode`, and reads `duty.period_hops`.
+- Pool figures re-measured after the AEC single-channel allocation trims: mono 16k/256 `Aec` 343,760 B (total 401,520 B), array 720,352 B `FULL` / 616,912 B `STATE` (Unit 1,512,576 B; ULCNet unit 2,490,416 B at 16k/512); the `docs/` and pipeline READMEs quote the new values. Docs no longer say that `AecPreset` / `ANR_MODE_*` stay in the headers. The pool figures in the earlier 2026-11-13 entries below (the `mcab` removal, the mono single-init entry, the review follow-ups) describe the state before this entry and are superseded by the values above and in the docs.
+
+## [Unreleased] — 2026-11-13 — Level arguments are numbers; `aec_set_level()` has no `ramp_ms`; the 4-channel `replay` recomputes G_res again
+
+- `aec_set_level(aec, level)`: the library's far-active ramp is a fixed 100 ms. `test_4ch_dfn.c`, `test_mono_dfn.c` and `test_array_sample_beam.c` follow the signature. `test_array_gain_ramped_level` is removed with the argument it tested (a 3000 ms ramp against an immediate twin); the AEC library's `test_runtime_preset.c`, `test_aec_res.c` and `test_aec_array.c` check the ramp and its landing, and `test_array_level_ramp_vs_oracle` (the same call as 100 ms before) still checks the chain.
+- `mono/aec_nr_res/main.c` and `4ch/4ch_external_static.c` take levels as numbers: the AEC level (positional or `--aec-level`) and `--nr-level` / `--nr-preset` are a whole decimal string 0..3, anything else (a name included) exits 2. They used `anr_nr_level_from_name()` (removed from NR) and name tables; the mono program turned an unknown word into balanced. `test_cli_strict.sh` (742 command lines) and `test_mono_chain.c` use digits and gain refusals of names, `-x`, `1x`, `4`, `-1`; README, `docs/reference/mono/*`, `pipelines/reference/{tuning,build}.md` and the HTML pages follow.
+- `tests/pyc_parity`: `pyc_drv` takes `aec=` / `nr=` as numbers (`pyc_parity.py` translates its names); the nine `l2.res4.*.replay` rows recompute G_res through a standalone gain stage again. The array's stage is internal, so `pyc_parity_pipelines.sh` builds the AEC archive with `AEC_TESTING=1` per layer and links it into a third driver, `pyc_drv_4ch_replay` (the `replay` mode of the 4-channel build; `pyc_drv_4ch` keeps only `chain`, `pyc_drv_mono` is unchanged); the production archive and the other two drivers carry no `aec_testing_*` symbol. The rows measure the shipped build against the std-math build over identical frames again (max |dG| up to 0.028 at 48k/1024, tolerance 0.05), and `a.nr4.*.replay_identity` shows the standalone stage reproduces the array's own gain bit for bit (`out_max_abs <= 0.0`).
+
+## [Unreleased] — 2026-11-13 — Float I/O of the AI3 samples: documentation and board A/B tools
+
+- The model is always fixed point; `FLOAT_IN` / `FLOAT_OUT` only make the hardware convert at the boundary, so the requested mode is not compared with the port types the SDK reports. `stream/common` keeps the SDK-free `stream_check_ports()` (`stream_bind.{h,c}`, port codes -101..-110) and the header-only `ai3_model_io.h`; the wiring fixtures of `test_stream_bind` live in `tests/stream_test_wirings.h`. The samples print `[AI3] float_in=.. float_out=..` and one line per port (`float`, `bits`, `scale_ratio`, `zero_point`) at start-up for the board A/B.
+- Non-finite float heads (tests only): `test_ainr_state_generation` poisons the first / last element of each DFN2 head with NaN, +Inf and -Inf; `test_aiaec_block` (DeepVQE-S taps) and `test_aiaec_packet` (Align-ULCNet mask, both planes) add Inf at the first and last element. Each is a refused commit with the generation advanced. Mutating the DFN2 alpha scan, the coefficient or tap tail and the ULCNet mask tail fails them. `lib/ainr`, `lib/aiaec`, `stream/ainr` and `stream/aiaec` outside `tests/` are byte-identical.
+- `docs/maintenance/graph-wiring.md` has the Float I/O section (these models inherit the state port types so both settings should be alike, mixed only warns, state ports follow the SDK with a type-agnostic zero fill, the start-up log); `docs/maintenance/float-io-board-ab.md` and `float_io_compare.py` are the board A/B checklist and comparison script. The sample-side edits are a separate change. Open on the board: whether the control bits also apply to state ports, numeric equality of the NPU conversion with the host call, and whether the existing `model.bin` files accept float I/O.
+
+## [Unreleased] — 2026-11-13 — Review follow-ups: fma audit of the array instance, flow reset between beam and fuse
+
+- `scripts/audit_fp_contract.sh` audits `aec_array.o` of the AEC checkout `lib/deps.mk` selects (lane-spectrum projection and fused PSD views, the arithmetic the deleted `mcab.o` row covered): 7 objects, 0 fma-class instructions.
+- `test_mcab_sample_beam.c`: an `aec_reset()` of the flow between the beam half and `mcab_sample_beam_fuse()` makes the fuse answer `AEC_ERR_SEQUENCE` without resetting the helper (the frame counter goes on). The test fails when the `AEC_ERR_SEQUENCE` exemption in `mcab_sample_beam_fuse()` is removed.
+- Pool figures of the `mcab` removal entry re-measured with `mcab_static --print-mem-size`, `4ch_alignulcnet`, `4ch_aec_bf_dfn_res` and `aec_get_mem_requirements()`: each was 256 B too high (array FULL 724,736 / 1,132,736 / 2,487,200).
+
+## [Unreleased] — 2026-11-13 — `make AEC_NO_ARRAY=1`: the mono programs on the single-channel lib/aec
+
+`AEC_NO_ARRAY=1` is forwarded to the lib/aec sub-makes (`AEC_FWD`, also in `audit-no-stdio-stack`), folded into `CFG_SIG` (no pipeline TU reads it; `test_target_abi` gets its own test flag). `make test AEC_NO_ARRAY=1` runs every mono program and
+test against the array-less `libaec.a` (the default build is unchanged); `pipelines/4ch/Makefile` builds nothing under it (every build and test goal prints a SKIPPED line and succeeds; `clean` / `clean-all` still remove the trees, and `print-bin-dir` / `print-obj-dir` fail instead of printing a sentence as if it were a path; the two example Makefiles under `4ch/` skip the same way) and `make pyc-parity` is skipped.
+The mono board samples (`alg_audio_aec.c`, `alg_audio_aec_nr.c`, `alg_ai3_aec_dfn.c`) need no code change; their headers note it.
+
+## [Unreleased] — 2026-11-13 — the 4-channel flow is an `Aec` array instance; `mcab` is removed
+
+The four-microphone flow moved into lib/aec: `AecConfig.n_mics = AEC_ARRAY_MICS` builds the shared delay estimator, the alignment ring, the
+four lanes, the fusion buffers and, with `AecConfig.residual = AEC_RESIDUAL_FULL`, the one residual gain stage in a single pool
+(`aec_get_mem_requirements()` + `aec_init_ex()`). `4ch/mcab.c`, `mcab.h`, `mcab_internal.h`, `libaudio_pipeline_mcab.a` (and its `print-lib-path`
+and `lib` goals) are deleted; nothing was released, so the old names are gone without aliases. The array's own tests, including the golden that
+reproduces the former flow bit for bit, live in the AEC repo.
+
+- **API mapping.** `mcab_process_front()` -> `aec_process_linear()` + `aec_get_array()` (`AecArrayView`: `lane_error_spec`, `lane_base_spec`,
+  `lane_formed_hop`, `lane_guard_active`, `aligned_ref`, `delay`, `post_reset_serial`); `mcab_fuse(W, E)` -> `aec_process_residual(&AecBeam{W, E})` +
+  `aec_get_residual()` (`AecResidualView`: `error_spec`, `base_spec`, `near_spec`, `far_spec`, `r2`, `comfort_noise`, `res_gain`); `McabLibs`,
+  `mcab_lane_config()`, `mcab_apply_lane_contract()`, `mcab_delay_estimator_config()` and caller-owned lanes/`DelayAec` are gone (the array derives
+  its lanes); `McabMemReq` -> `AecMemReq` (`AEC_LAYOUT_VERSION` 1 replaces `MCAB_LAYOUT_VERSION` 26); `mcab_*` diagnostics -> `aec_array_*`;
+  `MCAB_OK/INVALID_ARGUMENT/SEQUENCE_ERROR/DSP_ERROR` (0/-1/-2/-3) -> `AEC_OK/ERR_ARG/ERR_SEQUENCE/ERR_DSP` (0/-1/-3/-4) plus `AEC_ERR_MODE` (-2).
+  `enable_post = 0` is `residual = AEC_RESIDUAL_STATE` (lanes only; `aec_process_residual()` and `aec_get_residual()` return `AEC_ERR_MODE`), `enable_post = 1`
+  is `ESTIMATE` (fusion without a gain) or `FULL`.
+- **Behaviour differences (decided).** A second `aec_process_residual()` on one hop is `AEC_ERR_SEQUENCE` with `FULL` (allowed with `ESTIMATE`);
+  `formed_hop` and `echo_spec` are NULL in the fused view; `aec_get_linear()` on an array is lane 0's; `aec_apply_external_realign()` and
+  `aec_process_linear_shared_far_from()` are refused on an array.
+- **Gain and comfort noise.** The standalone `AecRes` of the 4-channel programs (`mcab_sample_res_input()`, `aec_res_process()`, `aec_res_set_level()`,
+  `aec_res_reset()`) is the array's gain stage: `aec_get_residual_gain()`, `aec_apply_gain(aec, nr, spec)` and `aec_apply_cng(aec, nr, spec)` with the NR
+  gain as the extra gain of both, and `aec_set_level()` for strength; the comfort-noise generator is the array's and restarts at `AEC_CNG_SEED` on a lane
+  hard reset and on `aec_reset()`. `array_sample_post.h` keeps `array_sample_anr_gain()` (NR estimated on `error_spec`), `array_sample_post_reset_due()` and
+  `ARRAY_SAMPLE_PSD_SCALE_INV`; the old `MCAB_SAMPLE_CNG_NR_GAIN_FLOOR` is `AEC_CNG_NR_GAIN_FLOOR` and `MCAB_SAMPLE_CNG_RNG_SEED` is gone.
+- **Sample layer.** `array_sample_default_config(&AecConfig, sr)` (balanced, MATCHED, bank 5, FULL, 4 mics) is in `array_sample_beam.h`; the array is placed by
+  `aec_get_mem_requirements()` + `aec_init_ex()`. `array_sample_beam_*` take the `Aec*`;
+  `array_sample_beam_fuse()` returns `AEC_ERR_MODE` for a `STATE` array and resets the helper on any refusal except SEQUENCE and MODE.
+- **Bit-exactness.** The five production programs (`4ch_external_static`, `4ch_static`, `4ch_raw`, `4ch_aec_bf_dfn_res`, `4ch_alignulcnet`) match the
+  previous tree's outputs byte for byte at SIMD=1 and SIMD=0. The 4ch tests, `pyc_drv.c` `chain`/`replay`, `test_target_abi`, `test_build_isolation.sh`
+  and `pyc_parity_pipelines.sh` follow the array API; the groups of the old `test_mcab.c` that test the flow itself moved to the AEC repo (the list was in a one-off document retired on 2026-11-13), the chain-level ones stay.
+- **Pools** (NE10, SIMD=1, MATCHED n=5; bytes; measured against the sibling AEC checkout including its 2026-11-13 lane-pool trims, which are bit-exact).
+  Array (`aec_get_mem_requirements()`, `FULL`): 16 kHz/256 724,736, 16 kHz/512 1,132,736, 48 kHz/1024 2,487,200
+  (lanes 593,152 / 980,416 / 2,157,888; before: lanes 803,968 / 1,318,848 / 2,936,832, plus estimator, mcab pool and a separate `AecRes` of 7,904 /
+  14,048 / 29,408). `mcab_static` Unit (array + SRP/BF helper): 1,706,240 -> 1,516,960, 3,007,040 -> 2,702,688, 6,329,312 -> 5,612,608; Total
+  1,772,928 -> 1,575,216, 3,103,504 -> 2,784,064, 6,554,368 -> 5,806,192. `4ch_alignulcnet` unit pool (`STATE`): 16 kHz (fft 512) 2,994,640 -> 2,676,240,
+  48 kHz 6,304,624 -> 5,558,512. `4ch_aec_bf_dfn_res`: 16 kHz 1,939,200 -> 1,740,880, 48 kHz 6,518,960 -> 5,768,640.
+- **Docs.** `docs/reference/array/*`, `docs/reference/board/*`, the 4ch and mono HTML pages, `4ch/README.md`, `4ch/reference/c-api.md`, the two 4ch example
+  READMEs, `reference/{tuning,call-flow,build}.md` and the function map follow the array API; the examples of the two quick starts compile with
+  `-Wall -Wextra -Werror` and run.
+
+## [Unreleased] — 2026-11-13 — mono examples and tests follow lib/aec's single-init, three-entry API
+
+The single-channel programs, tests and docs use `AecConfig.residual` and the new entry points; nothing was released, so the removed names
+(`aec_process_context`, `aec_get_res_context`, `aec_get_output_base`, `aec_get_linear_context`, `AecResContext`, `AecOutputBase`,
+`AecLinearContext`, `enable_res`, `return_res_context`, `spatial_linear_context`, `AEC_CONTEXT_*`) are gone without aliases. The 4-channel
+programs, `mcab` and `AecRes` were migrated in the entry above.
+
+- **Lane.** `derive_lane()` sets `residual = AEC_RESIDUAL_FULL` (`mono/aec_nr_res`, `mono/aec_dfn_res`) or `AEC_RESIDUAL_STATE`
+  (`mono/alignulcnet`, formerly `LINEAR_ONLY`). Per hop: `aec_process_linear()` then `aec_process_residual(aec, NULL)`, then
+  `aec_get_residual()` (rendering base `base_spec`, `res_gain`, `r2`, `comfort_noise`, `formed_hop`, `usable_linear`, `guard_active`) and
+  `aec_get_linear()` (`linear_hop`, `far_power`, `delay_state`, `aligned_far_hop`); a non-`AEC_OK` return is a refused hop.
+- **Gain and comfort noise.** The hand-written `sk_min_f32` / `sk_capply_gain_f32` / `aec_cng_fill` step and the caller's `rng` are replaced by
+  `aec_apply_gain(aec, nr, spec)` and `aec_apply_cng(aec, nr, spec)` with the NR gain as the extra gain of both (NULL without a denoiser; the
+  DFN2 chain passes NULL). `--no-res` uses `aec_apply_gain_spec()` with the unity vector and no comfort noise. The comfort-noise
+  generator is the `Aec`'s own and is reseeded by every hard post-chain reset and by `aec_reset()`; the application still clears its
+  overlap-add tail when `aec_post_reset_serial()` moves. The `total gain` vector (and the DFN2 chain's unity vector) are no longer carved.
+- **Bit-exactness.** Output WAVs and `DUMP_CTX` seam dumps of `aec_nr_pipeline` / `aec_nr_pipeline_static` (42 runs over 16 kHz / 8 kHz / 48 kHz
+  inputs and the `--no-nr`, `--no-res`, `--no-cng`, `--aec-only`, `--legacy-amin`, level and `--fft-size` options, SIMD=1 and SIMD=0) equal
+  the runs of the previous tree byte for byte; the `pyc-parity` mono rows (`d.mono.*`) and their seam dumps are unchanged.
+- **Tests.** The hand-written oracle `conv_chain_mono.h` keeps its own min / apply / `aec_cng_fill` and generator, so it stays independent of
+  `aec_apply_gain` / `aec_apply_cng`; the planted defects that need the caller to own the generator (`SAB_NO_RESEED`, `SAB_OLD_SEED`,
+  `MDFN_SAB_NO_RESEED`) draw through `aec_apply_cng_spec()` with the test's own state, `SAB_ERROR_SPEC` through `aec_apply_gain_spec()` on
+  `error_spec`. The `--aec-only` oracle is `aec_process()` on a second `Aec` with `AEC_RESIDUAL_STATE` (below `FULL` it returns the linear hop).
+  `test_readme_flow` folds its extra stage (the HF tilt) into the extra gain given to both calls.
+- **Pools** (NE10, SIMD=1, MATCHED n=5; bytes). `aec_nr_pipeline_static --print-mem-size`: 8 kHz 310,720 -> 310,240, 16 kHz/256 424,288 -> 423,808,
+  16 kHz/512 576,128 -> 575,136, 48 kHz 1,356,352 -> 1,354,336 (the AEC block is 48 B larger in lib/aec, the gain buffers one vector smaller).
+  `mono_aec_dfn_res` banner: 16 kHz 590,976 -> 589,968, 48 kHz 1,322,896 -> 1,318,816, 8 kHz 495,600 -> 494,592.
+
+## [Unreleased] — 2026-11-12 — NR gain calls use `anr_process_gain_with_residual_psd()`
+
+The pipeline code, tests and docs follow lib/nr's gain API (`anr_get_gain()` and the `gain_out` argument are gone): the denoiser
+gain of a hop is now the return value of `anr_process_gain_with_residual_psd(nr, spectrum, residual_psd_audio)`
+(`residual_psd_audio` = the AEC `r2` divided by 32768^2, NULL when the linear estimate is not usable), NULL for a refused hop.
+Touched: `4ch/mcab_sample_post.h` (`mcab_sample_anr_gain()`), `mono/aec_nr_res/main.c` (`mono_nr_gain()`) and
+`example_board_adapter.c`, the chain tests and the pyc-parity driver. Gains are unchanged; the locals that held the residual PSD are
+named `residual_psd_audio`.
+
+## [Unreleased] — 2026-11-12 — `ulcnet_nn_stage` takes and returns spectra
+
+The stage no longer owns an STFT or an ISTFT. The application analyses the raw far hop (and the error hop when its error is a time-domain
+signal) with its own `AcStft` (audiolib defaults on the grid) and synthesises the output spectrum with its own `AcIstft`
+(`AC_OLA_ACCUMULATE`); nothing was added to a library. Nothing was released, so the old names are gone without aliases.
+
+- **API.** `ulcnet_nn_stage_begin_spec(stage, err_spec, far_spec, delay)` (`Complex[n_bins]` each, audio scale) replaces `_begin`, `_begin_complex`
+  and `_begin_time`; `ulcnet_nn_stage_end_spec(stage, out_spec)` replaces `_end` and writes the accepted model spectrum, else the error spectrum
+  (identity), without synthesising; `ulcnet_nn_stage_process(stage, out_spec)` is the begin-less hop after `begin_spec`.
+  `ulcnet_nn_stage_mem_size(grid)` / `_init(mem, bytes, grid)` lose the `err_analysis` argument. `ULCNET_NN_STAGE_DSP_ERROR` is gone (the stage
+  has no synthesis to fail).
+- **Reset.** `ulcnet_nn_stage_reset()` clears the model, the alignment memory, the frame index and a pending reprime; it no longer clears
+  transform history. The application resets its `AcStft` / `AcIstft` together with it.
+- **Pool.** The stage block is the state plus six planar spectra (16 kHz / fft 512: 6,320 B, was 34,416 B, or 40,656 B with the error
+  analysis; 48 kHz / fft 1024: 12,464 B, was 67,696 B / 80,080 B). The application adds one `AcStft` per analysed signal and one `AcIstft`.
+- **Bit-exactness.** The stage plus the caller's `AcStft` / `AcIstft` reproduce the hops of the previous stage bit for bit:
+  `ulcnet/tests/golden_ulcnet_stage_oldapi.txt` holds the FNV-1a-64 hash of every output hop (6 model/error-source variants, 320 hops, alignment
+  events changed / solid false-to-true / relock, a reset mid-stream, both grids, macOS arm64 with NEON and scalar), dumped from the previous sources;
+  `test_ulcnet_nn_stage` replays it. Any other host (the window table comes from libm) reports SKIP for the golden rows and runs the other checks.
+- **Callers.** `mono/alignulcnet/main.c` and `test_mono_ulcnet.c`, `4ch/alignulcnet/main.c` and `test_4ch_ulcnet.c`, `tests/test_readme_flow.c`
+  own the transforms (mono: error and far analyses; 4ch: far analysis only, the beam spectrum is the error); `AIAEC/tests/test_deployed_frontend_contract.py`
+  checks the new seam calls in `main.c`.
+
 ## [Unreleased] — 2026-11-12 — `stream/ainr` and `stream/aiaec` customer API: slim Info, graph wiring in the sample's model configuration
 
 Nothing was released, so the old names are gone without aliases.

@@ -27,11 +27,13 @@ WERROR="${WERROR:-1}"
 # can silently disagree. Depending on audiolib is the allowed direction;
 # the reverse is not, which is why the audit LIST below stays here.
 COMMON_DIR="${COMMON_DIR:-../../audiolib/common}"
+# The array instance (lane-spectrum projection, fused PSD views) is compiled from AEC_DIR, where lib/deps.mk looks for it.
+AEC_DIR="${AEC_DIR:-$(make -s --no-print-directory -f ../lib/deps.mk print-deps-sh | sed -n 's/^AEC_DIR=//p')}"
 . "$COMMON_DIR/scripts/fp_contract_lib.sh"
 FMA_RE="$FP_CONTRACT_FMA_RE"
 disas() { fp_contract_disas "$1"; }
 
-# One row per TU: "make-dir:build-goal:object:note". These either run WOLA, implement the
+# One row per TU: "make-dir:build-goal:object:note" (@AEC@ is AEC_DIR). These either run WOLA, implement the
 # DFN spectrum path or do per-bin spectral arithmetic that the C/Python parity gate
 # compares, and must stay fma-free so the scalar/NEON and C/Python multiply-then-add
 # contracts remain comparable. The per-hop gain chain the example programs write out only calls
@@ -40,10 +42,10 @@ ENTRIES='
 .:libaudio_pipeline_dfn.a:dfn_res_stage.o:shared DFN post-RES stage -- boundary scaling by dfn2_stft_scale()/dfn2_stft_unscale()
 .:libaudio_pipeline_dfn.a:dfn_rate_bridge.o:DFN rate bridge -- native and 48 kHz WOLA, analysis windows
 .:libaudio_pipeline_dfn.a:dfn2_process.o:DFN feature and streaming enhance-spectrum kernels
-.:mono_alignulcnet:ulcnet_nn_stage.o:Align-ULCNet stage (mono build) -- far-end analysis and enhanced-spectrum synthesis
-4ch:libs:mcab.o:4-channel flow -- lane-spectrum projection and the fused PSD views
-4ch:libs:mcab_sample_beam.o:4-channel sample beamformer helper -- SRP-PHAT and beamformer glue
-4ch:4ch_alignulcnet:ulcnet_nn_stage.o:Align-ULCNet stage (4-channel build) -- far-end analysis and enhanced-spectrum synthesis
+.:mono_alignulcnet:ulcnet_nn_stage.o:Align-ULCNet stage (mono build) -- spectrum copies and the model-output finite check
+@AEC@:lib:aec_array.o:4-channel array instance in lib/aec -- lane-spectrum projection and the fused PSD views
+4ch:libs:array_sample_beam.o:4-channel sample beamformer helper -- SRP-PHAT and beamformer glue
+4ch:4ch_alignulcnet:ulcnet_nn_stage.o:Align-ULCNet stage (4-channel build) -- spectrum copies and the model-output finite check
 '
 
 # An explicit fma() call is deterministic by definition, not a contraction of a*b+c, so a function
@@ -89,6 +91,7 @@ rows=$(printf '%s\n' "$ENTRIES" | grep -cv '^[[:space:]]*$')
 printf '%-6s %-6s %-34s %-5s %s\n' BACKEND SIMD OBJECT FMA RESULT
 for be in $BACKENDS; do
     printf '%s\n' "$ENTRIES" | grep -v '^[[:space:]]*$' | while IFS=: read -r dir goal obj note; do
+        [ "$dir" = "@AEC@" ] && dir="$AEC_DIR"
         MK="BACKEND=$be SIMD=$SIMD WERROR=$WERROR"
         # Build first, then ask THAT configuration where its objects went.
         # shellcheck disable=SC2086

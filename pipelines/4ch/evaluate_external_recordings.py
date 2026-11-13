@@ -28,7 +28,7 @@ from .evaluate_recordings import (
 def _default_binary() -> Optional[Path]:
     pipeline_root = Path(__file__).resolve().parent
     candidates = sorted(
-        pipeline_root.glob("bin/*/mcab_raw"),
+        pipeline_root.glob("bin/*/4ch_raw"),
         key=lambda path: path.stat().st_mtime,
         reverse=True,
     )
@@ -110,7 +110,7 @@ def evaluate_case(
     near = np.ascontiguousarray(near[:n_samples], dtype=np.float32)
     near_activity = _activity(_frame_power(near, hop, n_frames)).astype(np.uint8)
 
-    with tempfile.TemporaryDirectory(prefix="mcab-raw-") as directory:
+    with tempfile.TemporaryDirectory(prefix="4ch-raw-") as directory:
         temporary = Path(directory)
         mic_raw = temporary / "mic.f32"
         ref_raw = temporary / "ref.f32"
@@ -280,8 +280,8 @@ def main() -> None:
     args = parser.parse_args()
     if args.binary is None or not args.binary.exists():
         raise SystemExit(
-            "mcab_raw not found; build it with "
-            "`make -C Audio_ALG/pipelines/4ch mcab_raw`"
+            "4ch_raw not found; build it with "
+            "`make -C Audio_ALG/pipelines/4ch 4ch_raw`"
         )
     results = [
         evaluate_case(

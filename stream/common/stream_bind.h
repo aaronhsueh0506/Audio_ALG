@@ -69,7 +69,7 @@ enum {
     STREAM_PORT_ERR_STRIDE = -107,      /* padded / non-contiguous layout */
     STREAM_PORT_ERR_CAPACITY = -108,    /* device buffer smaller than the tensor */
     STREAM_PORT_ERR_STATE_PAIR = -109,  /* a state input and its output disagree */
-    STREAM_PORT_ERR_STATE_ZERO_POINT = -110   /* a fixed-point state port (either end) has zero_point != 0 */
+    STREAM_PORT_ERR_STATE_ZERO_POINT = -110    /* a fixed-point state port (either end) has zero_point != 0 */
 };
 
 /* Checks the opened graph (in[n_in], out[n_out]) against w before the first run: 0 or a STREAM_PORT_ERR_*, msg (may

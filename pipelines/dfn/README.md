@@ -16,7 +16,7 @@ adapt).
 | `dfn2_stage.py`, `dfn2_rate_adapter.py` | Python twins of the stage and the rate bridge (`pipelines.dfn.dfn2_stage`, `pipelines.dfn.dfn2_rate_adapter`). The stage takes its lookahead pair from the model it is built with. |
 | `tests/` | C: `test_dfn_res_stage.c`, `test_dfn_rate_bridge.c`, `test_dfn_hop.c`, the shared `dfn_test_fixture.h` and `dfn_test_grid.h`, the only build-time grid selector left (`-DDFN2_GRID_KHZ=16\|32\|48`, `-DDFN2_SR` / `-DDFN2_N_FFT` / `-DDFN2_N_ERB` / `-DDFN2_DF_BINS`, `-DDFN2_MASK_LOOKAHEAD` / `-DDFN2_DF_LOOKAHEAD`): test programs size their arrays with its `DFN2_*` macros and hand `dfn_test_grid()` to the stage and the bridge; product code never includes it. `test_dfn_test_grid_pin.py` compares its model numbers with `AINR/DeepFilterNet2/config.ini`. `check_pair_report.sh` is the `make test-pairs` gate. Python: `test_dfn2_stage.py`, `test_dfn2_rate_adapter.py` and the C-parity tests `test_dfn2_stage_c_parity.py`, `test_dfn2_rate_bridge_c_parity.py`; `dfn2_pairs.py` lists the lookahead pairs they run. |
 | `mono/aec_dfn_res/` (sibling, not under this folder) | Mono example: lib/aec's `Aec` (linear AEC and its RES gain) -> DFN2. `pipeline.py` is its Python reference (`python -m pipelines.mono.aec_dfn_res.pipeline`); tests: `tests/test_mono_dfn.c`, `tests/test_dfn2_pipeline_contract.py`. |
-| `4ch/aec_bf_dfn_res/` (sibling, not under this folder) | 4-channel example: the mcab flow and the sample SRP-PHAT/BF helper, a post-beam `AecRes`, then DFN2. `pipeline.py` is its Python reference; tests: `tests/test_4ch_dfn.c`, `tests/test_dfn2_4ch_contract.py`. |
+| `4ch/aec_bf_dfn_res/` (sibling, not under this folder) | 4-channel example: the four-microphone array (with its gain stage) and the sample SRP-PHAT/BF helper, then DFN2. `pipeline.py` is its Python reference; tests: `tests/test_4ch_dfn.c`, `tests/test_dfn2_4ch_contract.py`. |
 
 ## How the examples are called
 
@@ -39,7 +39,7 @@ frames whose heads are discarded and whose state is zero again afterwards, so th
 
 ## Build and test
 
-The two programs are built by different Makefiles, because the 4-channel one links the mcab flow:
+The two programs are built by different Makefiles, because the 4-channel one links the array sample objects:
 
 ```sh
 make -C pipelines WERROR=1 libaudio_pipeline_dfn.a mono_aec_dfn_res       # mono example
@@ -114,23 +114,22 @@ Board notes. The pipeline units (`dfn_res_stage.c`, `dfn_rate_bridge.c`) need no
 builds the `DFN2Grid` with `dfn2_grid_make()` (the pair is one of its fields; install a model exported for that pair) and puts it in
 `DfnResStageConfig.grid`. A standalone
 DFN2 board sample does not go through this folder: it picks the grid and the pair from its own (sample rate, FFT size) table, see
-`AINR/DeepFilterNet2/README.md`, "Choosing the grid". A board build lists no `fix_gain.c` and no `third_party/gain` include path.
+`AINR/DeepFilterNet2/README.md`, "Choosing the grid".
 
 ## Dependencies
 
 - `common/`: `example_cli.h` (the strict command-line parsers and delay options) and, for the
-  4-channel example, `4ch/mcab_sample_post.h` (`mcab_sample_res_input()` and the
-  comfort-noise constants). The mono example takes the grid and the lane config straight from lib/aec
+  4-channel example, `4ch/array_sample_post.h` (`array_sample_post_reset_due()` and the
+  PSD scale constant). The mono example takes the grid and the lane config straight from lib/aec
   (`aec_resolve_signal_grid()`, `aec_config_from_level()`).
-- lib/aec (`Aec`, `AecRes`), audiolib `audio_common` (resamplers, STFT/ISTFT) and
-  `AINR/DeepFilterNet2` (grid, pre/post class, model I/O descriptor; the ERB matrices are the application's data).
-- The 4-channel example also needs the mcab flow in `4ch/` (`mcab.h`, archive
-  `libaudio_pipeline_mcab.a` with `mcab.o` only) and its sample objects `mcab_sample_flow`,
-  `mcab_sample_beam` and `mcab_sample_driver`, which are linked into the program and are not part of
-  the archive.
+- lib/aec (`Aec`), audiolib `audio_common` (resamplers, STFT/ISTFT) and
+  `lib/ainr/dfn2` (grid, pre/post class, model I/O descriptor; the ERB matrices are the application's data).
+- The 4-channel example also needs the array instance of lib/aec (`aec.h`, `AecConfig.n_mics = 4`, in `libaec.a`) and the sample objects
+  `array_sample_beam` and `array_sample_driver` in `4ch/`, which are linked into the program and are not part of
+  any archive.
 
 Includes across directories are written from the `pipelines/` root (`"dfn/dfn_hop.h"`,
-`"common/example_cli.h"`, `"4ch/mcab.h"`); inside this folder they use the plain file
+`"common/example_cli.h"`, `"4ch/array_sample_beam.h"`); inside this folder they use the plain file
 name. The Python twins are `dfn2_stage.py` and `dfn2_rate_adapter.py` here, `mono/aec_dfn_res/pipeline.py`,
 `4ch/aec_bf_dfn_res/pipeline.py` and `common/cng_aec3.py`; their C parity tests are
 `dfn/tests/test_dfn2_stage_c_parity.py` and `dfn/tests/test_dfn2_rate_bridge_c_parity.py`.

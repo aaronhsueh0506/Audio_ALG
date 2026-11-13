@@ -4,13 +4,14 @@
  * the counter must move exactly where ainr.h says:
  *
  *   +1 on ainr_reset(); +1 after each of the first mask_lookahead warm-up blocks (48 kHz);
- *   +1 on a refused commit (postprocess status 0 with the heads left NaN);
+ *   +1 on a refused commit (postprocess status 0 with the heads left NaN, or one NaN/Inf element in any head);
  *   unchanged on a caller bypass (postprocess status != 0).
  *
  * A fault that hands the sample a stale or zero generation passes every functional test, so each
  * value is compared against the live counter after it has moved off zero. Not built under
  * NO_STDIO. */
 
+#include <math.h>
 #include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -173,6 +174,32 @@ static int run_family(Fam *f, int warm, const char *label) {
     CHECK(io.state_generation == g, "pre after refusal: io %u != live %u", io.state_generation, g);
     fill_heads(&io);
     CHECK(fam_post(f, 0) == AINR_OK, "post failed");
+
+    /* A float head from the accelerator can carry one non-finite element among finite ones: any head, either end,
+     * NaN or Inf, is a refused commit. */
+    {
+        static const float bad_value[3] = { NAN, INFINITY, -INFINITY };
+        int head, v, at;
+        for (head = 0; head < io.output_count; ++head)
+            for (v = 0; v < 3; ++v)
+                for (at = 0; at < 2; ++at) {
+                    AinrWork pw;
+                    size_t idx;
+                    g = fam_gen(f);
+                    CHECK(fam_pre(f, blk++, &pw) == AINR_OK, "pre failed");
+                    fill_heads(&pw);
+                    idx = at ? pw.outputs[head].elements - 1u : 0u;
+                    pw.outputs[head].data[idx] = bad_value[v];
+                    CHECK(fam_post(f, 0) == AINR_OK, "poisoned post failed");
+                    CHECK(fam_gen(f) == g + 1u, "head %d element %zu = %g: generation %u -> %u, want +1", head, idx,
+                          (double)bad_value[v], g, fam_gen(f));
+                    g = fam_gen(f);
+                    CHECK(fam_pre(f, blk++, &pw) == AINR_OK, "pre failed");
+                    fill_heads(&pw);
+                    CHECK(fam_post(f, 0) == AINR_OK, "clean post failed");
+                    CHECK(fam_gen(f) == g, "head %d: a finite block after the refusal moved the generation", head);
+                }
+    }
     return 0;
 }
 

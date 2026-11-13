@@ -1,22 +1,22 @@
 /* mono_aec_dfn_res board skeleton: AEC -> RES -> DeepFilterNet2 composed from the library calls.
- * Example code: lib/aec's Aec for the linear stage and its own RES gain, P = E * G_res (+ comfort
+ * Example code: lib/aec's Aec for the linear stage and its own RES gain, P = B * G_res (+ comfort
  * noise) formed here, and dfn/dfn_hop.h for the DFN2 hop (sized and carved by
  * dfn/dfn_hop_pool.h). Per hop:
  *
- *     aec_process_context(aec, mic, ref);
- *     follow_post_reset();                                // new aec_post_reset_serial(): reseed the CNG, clear the OLA tail
- *     aec_get_res_context(aec, &ctx);                     // CN and G_res (ctx.res_gain)
- *     aec_get_output_base(aec, &base);                    // B: the rendering base (E, or E + echo on a guard hop)
- *     P = B * G_res (+ comfort noise);                    // before the DFN hop begins
+ *     aec_process_linear(aec, mic, ref);  aec_process_residual(aec, NULL);
+ *     follow_post_reset();                                // new aec_post_reset_serial(): clear the OLA tail
+ *     aec_get_residual(aec, &v);                          // v.base_spec = B: the rendering base (E, or E + echo on a guard hop)
+ *     aec_apply_gain(aec, NULL, P);                       // P = B * G_res
+ *     aec_apply_cng(aec, NULL, P);                        // (+ comfort noise), before the DFN hop begins
  *     dfn_hop_process(&hop, B, P, out);                   // or begin / nn_begin / nn_end / end
  *
- * The AEC context carries two signals. E (ctx.error_spec, ctx.formed_hop) is the analysis seam, never
+ * The AEC residual view carries two signals. E (v.error_spec, v.formed_hop) is the analysis seam, never
  * altered by the output guard; B is what aec_process() itself would multiply by its gain, E bit for bit
  * on every hop the guard leaves alone. The DFN2 stage reads the pair (B, P): its estimate and the
  * spectrum it filters stay the same signal, so a guard hop does not pair a capture-based P with a
  * residual-based estimate. There is no denoiser in this chain; the stage keeps running through an AEC
- * reset event (it never resets on one). On a new aec_post_reset_serial() the comfort noise restarts from
- * AEC_CNG_SEED before that hop's first draw. On the stage path (host rate equals the model grid's) the
+ * reset event (it never resets on one). On a new aec_post_reset_serial() the library reseeds its
+ * comfort-noise generator before that hop's first draw. On the stage path (host rate equals the model grid's) the
  * host synthesis also drops its overlap-add tail, dfn_res_stage_lookahead_frames() hops later (0 for
  * the 16 kHz row), before the push of the first frame built after the reset: the stage delays
  * every frame by that many hops, so the event is delayed with it. On the bridge path the host-grid
@@ -36,11 +36,9 @@
  * fail-open model callback and runs a few silent hops. Replace run_accelerator() with the board
  * runtime call. */
 #include "aec.h"
-#include "aec_res.h"           /* aec_cng_fill */
 #include "dfn/dfn_hop.h"
 #include "dfn/dfn_hop_pool.h"
 #include "utility/mem_align.h"
-#include "utility/simd_kernels.h"
 #include "dfn/dfn_example_args.h"
 
 #include <math.h>
@@ -68,23 +66,17 @@ static int run_accelerator(void *user, const DFN2PrepostInputs *inputs,
 /* Host grids accepted at parse time (0-terminated). */
 static const int HOST_RATES[] = { 8000, 16000, 48000, 0 };
 
-/* Comfort noise follows the denoiser gain of its bin but never below this amplitude (-10 dB),
- * so the residual echo it masks does not surface. */
-#define CNG_NR_GAIN_FLOOR 0.31622777f
-
-/* The mono lane: the rate's default grid and the linear-stage AecConfig keeping its own gain in
- * the context. Returns 0, or -1 for a rate libaec has no grid for. */
+/* The mono lane: the rate's default grid and the AecConfig keeping its own gain in the residual
+ * view (AEC_RESIDUAL_FULL). Returns 0, or -1 for a rate libaec has no grid for. */
 static int derive_lane(const DfnExampleArgs *args, AecSignalGrid *grid, AecConfig *aec_cfg) {
-    if (!aec_resolve_signal_grid(args->sample_rate, aec_default_fft_size(args->sample_rate), grid))
+    if (aec_resolve_signal_grid(args->sample_rate, aec_default_fft_size(args->sample_rate), grid) != AEC_OK)
         return -1;
     aec_config_from_level(aec_cfg, AEC_LEVEL_BALANCED, args->sample_rate);
     aec_cfg->fft_size = grid->fft_size;
     aec_cfg->delay_mode = args->delay_mode;
     aec_cfg->delay_num_filters = args->delay_num_filters;
     aec_cfg->fixed_delay_samples = args->fixed_delay_samples;
-    aec_cfg->enable_delay_est = args->delay_mode == AEC_DELAY_MATCHED;
-    aec_cfg->enable_res = 0;
-    aec_cfg->return_res_context = 1;
+    aec_cfg->residual = AEC_RESIDUAL_FULL;
     return 0;
 }
 
@@ -94,7 +86,7 @@ typedef struct Plan {
     AecSignalGrid grid;
     int enable_cng;
     DfnHopPoolPlan dfn;               /* the stage (or bridge), its synthesis and output */
-    size_t aec_bytes, vec_bytes, spec_bytes;
+    size_t aec_bytes, spec_bytes;
     size_t total;
 } Plan;
 
@@ -107,7 +99,6 @@ static int make_plan(const DfnExampleArgs *args, const DfnExampleErb *erb,
     /* No denoiser, RES gain only; the comfort-noise fill is the program's switch. E and P must
      * share a phase for the DFN2 stage, so it is off unless asked for. */
     p->enable_cng = args->enable_cng;
-    p->vec_bytes = ALIGN16((size_t)p->grid.n_freqs * sizeof(float));
     p->spec_bytes = ALIGN16((size_t)p->grid.n_freqs * sizeof(Complex));
 
     p->dfn.stage_cfg = dfn_res_stage_default_config(&args->model_grid);
@@ -119,9 +110,8 @@ static int make_plan(const DfnExampleArgs *args, const DfnExampleErb *erb,
     p->aec_bytes = aec_get_mem_size(&p->aec_cfg);
     if (p->aec_bytes == 0 || !isfinite(args->atten_lim_db)) return -1;
     if (dfn_hop_pool_plan(&p->dfn, args->sample_rate, 0) != 0) return -1;
-    /* AEC, unity, total gain, P, then the stage (or bridge) and its synthesis */
-    p->total = ALIGN16(p->aec_bytes) + 2 * p->vec_bytes + p->spec_bytes +
-               dfn_hop_pool_bytes(&p->dfn);
+    /* AEC, P, then the stage (or bridge) and its synthesis */
+    p->total = ALIGN16(p->aec_bytes) + p->spec_bytes + dfn_hop_pool_bytes(&p->dfn);
     return 0;
 }
 
@@ -129,12 +119,10 @@ static int make_plan(const DfnExampleArgs *args, const DfnExampleErb *erb,
 typedef struct Rig {
     void *pool;
     Aec *aec;
-    float *unity, *total_gain;        /* the RES gain path: min(1, G_res) */
     Complex *post;                    /* P */
-    uint32_t rng;                     /* comfort-noise state, AEC_CNG_SEED after every hard post-chain reset */
     uint32_t reset_serial;            /* the aec_post_reset_serial() value already handled */
     uint32_t reset_pending;           /* bit k: a hard reset was seen k hops ago (the stage path's delay line) */
-    int n_freqs, enable_cng;
+    int enable_cng;
     int reset_delay;                  /* hops the stage path delays a frame by (the model's lookahead) */
     DfnResStage *stage;
     DfnRateBridge *bridge;
@@ -152,21 +140,15 @@ static void rig_free(Rig *r) {
 
 static int rig_build(Rig *r, const Plan *p) {
     unsigned char *cur;
-    int k;
     memset(r, 0, sizeof(*r));
     if (posix_memalign(&r->pool, 16, p->total) != 0) { r->pool = NULL; return -1; }
     cur = (unsigned char *)r->pool;
     r->aec = aec_init(cur, p->aec_bytes, &p->aec_cfg);
     cur += ALIGN16(p->aec_bytes);
     if (!r->aec) goto fail;
-    r->n_freqs = p->grid.n_freqs;
     r->enable_cng = p->enable_cng;
     r->reset_delay = dfn_res_stage_lookahead_frames(&p->dfn.stage_cfg.grid);
-    r->unity = (float *)cur;      cur += p->vec_bytes;
-    r->total_gain = (float *)cur; cur += p->vec_bytes;
     r->post = (Complex *)cur;     cur += p->spec_bytes;
-    for (k = 0; k < r->n_freqs; ++k) r->unity[k] = 1.0f;
-    r->rng = AEC_CNG_SEED;
     r->reset_serial = aec_post_reset_serial(r->aec);
     if (dfn_hop_pool_build(&p->dfn, cur, p->grid.n_freqs, p->grid.hop_size, 0, &r->hop,
                            &r->stage, &r->bridge, &r->istft) != 0)
@@ -180,15 +162,14 @@ fail:
 /* A refused hop: back to the state of a fresh pipeline, every stage together. */
 static void rig_reset(Rig *r) {
     aec_reset(r->aec);
-    r->rng = AEC_CNG_SEED;
     r->reset_serial = aec_post_reset_serial(r->aec);
     r->reset_pending = 0;
     dfn_hop_reset(&r->hop);
 }
 
 /* The AEC's hard post-chain reset event (aec.h, aec_post_reset_serial): the reset happened inside this
- * hop's aec_process_context(), before its synthesis. The comfort noise restarts from AEC_CNG_SEED before
- * this hop's first draw. The stage path (host rate equals the model grid's) owns its synthesis: its output for the frame built on
+ * hop's aec_process_linear(), before its synthesis; the library reseeds its comfort-noise generator.
+ * The stage path (host rate equals the model grid's) owns its synthesis: its output for the frame built on
  * this hop appears dfn_res_stage_lookahead_frames() hops later, so the overlap-add tail is dropped
  * before the push of that frame. The bridge path synthesises the spectra it is given at the top of
  * its begin(), so its tail is dropped now, before this hop enters it. Call this before
@@ -198,32 +179,26 @@ static void follow_post_reset(Rig *r) {
     uint32_t serial = aec_post_reset_serial(r->aec);
     uint32_t moved = serial != r->reset_serial;
     r->reset_serial = serial;
-    if (moved) r->rng = AEC_CNG_SEED;
     if (moved && r->bridge) (void)dfn_rate_bridge_reset_synthesis(r->bridge);   /* between hops: cannot refuse */
     if (!r->istft) return;
     r->reset_pending = (r->reset_pending << 1) | moved;
     if ((r->reset_pending >> r->reset_delay) & 1u) ac_istft_reset(r->istft);
 }
 
-/* One host hop: P = B * min(1, G_res), B the rendering base, plus comfort noise on the bins the RES
- * cut when enabled (no denoiser: its gain is the unity vector). The stage's estimate is B too.
- * Returns 0, or -1 after a refused call (the caller resets). */
+/* One host hop: P = B * G_res, B the rendering base, plus comfort noise on the bins the RES cut when
+ * enabled (no denoiser: no extra gain). The stage's estimate is B too. Returns 0, or -1 after a refused
+ * call (the caller resets). */
 static int rig_process(Rig *r, const float *mic, const float *ref, float *out) {
-    AecResContext c;
-    AecOutputBase base;
-    aec_process_context(r->aec, mic, ref);
-    aec_get_res_context(r->aec, &c);
-    if (!c.error_spec || !c.res_gain) return -1;
-    memset(&base, 0, sizeof(base));
-    base.struct_size = sizeof(base);
-    if (aec_get_output_base(r->aec, &base) != 0) return -1;
+    AecResidualView v;
+    if (aec_process_linear(r->aec, mic, ref) != AEC_OK) return -1;
+    if (aec_process_residual(r->aec, NULL) != AEC_OK) return -1;
+    memset(&v, 0, sizeof(v));
+    v.struct_size = sizeof(v);
+    if (aec_get_residual(r->aec, &v) != AEC_OK) return -1;
     follow_post_reset(r);
-    sk_min_f32(r->total_gain, r->unity, c.res_gain, r->n_freqs);
-    sk_capply_gain_f32(r->post, base.base_spec, r->total_gain, r->n_freqs);
-    if (r->enable_cng && c.comfort_noise)
-        aec_cng_fill(&r->rng, r->post, c.comfort_noise, c.res_gain, r->unity, CNG_NR_GAIN_FLOOR,
-                     r->n_freqs);
-    return dfn_hop_process(&r->hop, base.base_spec, r->post, out) == 0 ? 0 : -1;
+    if (aec_apply_gain(r->aec, NULL, r->post) != AEC_OK) return -1;
+    if (r->enable_cng && aec_apply_cng(r->aec, NULL, r->post) != AEC_OK) return -1;
+    return dfn_hop_process(&r->hop, v.base_spec, r->post, out) == 0 ? 0 : -1;
 }
 
 int main(int argc, char **argv) {

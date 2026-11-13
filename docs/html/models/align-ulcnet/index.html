@@ -129,7 +129,7 @@ in.u.align_ulcnet.event_count = N;</code></pre>
 <h2>State</h2>
 <ul>
 <li>recurrent state 留在 AI3 的 buffer。每對 state 輸入與輸出依位置（輸入 <code>signal_in_count + k</code> 與輸出 <code>head_out_count + k</code>）綁同一塊 buffer；Align-ULCNet 有 4 對。</li>
-<li>定點 state 埠兩端的 <code>zero_point</code> 都必須是 0（清零用位元組填 0，只有 zero_point 0 時才等於量化後的 0）。5/5、0/5、5/0 都在第一次送件前被埠檢查（<code>stream_check_ports()</code>）以 <code>STREAM_PORT_ERR_STATE_ZERO_POINT</code>（-110）拒絕；float 的 state 埠不看 zero_point。</li>
+<li>定點 state 埠兩端的 <code>zero_point</code> 都必須是 0（清零用位元組填 0，只有 zero_point 0 時才等於量化後的 0）。5/5、0/5、5/0 都在第一次送件前被埠檢查（<code>stream_check_ports()</code>）以 <code>STREAM_PORT_ERR_STATE_ZERO_POINT</code>（-110）拒絕；float 的 state 埠不看 zero_point，清零仍是填位元組 0，不受 <code>FLOAT_IN</code>／<code>FLOAT_OUT</code> 影響（見<a href="../dfn2/reference/board.html#float-io">Float I/O 模式</a>）。</li>
 <li>init 時每塊 state buffer 清零一次（memset 加 cache flush）。正常連續推論不碰 state，每包只交換特徵與 head。</li>
 <li>函式庫只在 reset 與輸出被拒（非有限）時讓 <code>work.state_generation</code> 改變；sample 看到 generation 改變就清。回報失敗（<code>infer_status</code> 非 0）的一包只旁路該包，generation 不動，所以 sample 在任何失敗的一包之後，也要在下一次實際送件前自行再清一次。N&gt;1 封包的事件 hop 由 graph 內的 <code>frame_reset</code> 重設模型 state，generation 不變，host 不需要清 buffer。</li>
 </ul>
@@ -142,7 +142,7 @@ in.u.align_ulcnet.event_count = N;</code></pre>
 <tr><th><code>aiaec_*</code>（PCM → PCM）</th><td>事件 hop 是 BYPASS，不呼叫加速器；stream 自己的分析與 ISTFT 在該 hop 重啟，該 hop 的 PCM 輸出恰為靜音，前一個輸入 hop 的音訊不輸出。</td><td>一包恆為一次 SUBMIT，graph 內以 <code>frame_reset</code>（0.0／1.0）重設 state 並直通該 hop；stream 自己的 STFT 分析與 ISTFT 合成在該 hop 重啟，與 N=1 在同一位置。PCM 輸出與同樣事件的 N=1 逐樣本相同，事件 hop 同樣恰為靜音。</td></tr>
 <tr><th><code>_spec</code>（PCM → 頻譜）</th><td>同 PCM 家族的分析重啟；ISTFT 在呼叫端。重啟的 hop 同樣記在 <code>work.synthesis_restart_mask</code>，外部 ISTFT 要在推入這些 hop 的增強頻譜之前先 <code>ac_istft_reset()</code>，輸出才等於 PCM 家族。</td><td>分析重啟同 PCM 家族；<code>work.synthesis_restart_mask</code> 的 bit k 是第 k 個 hop（最舊為 0），重設規則同 N=1。</td></tr>
 <tr><th><code>_freq</code>（頻譜 → 頻譜，aiaec）</th><td>只重啟模型；呼叫端的分析器與 ISTFT 不重啟，overlap 連續。</td><td>同 N=1：只有模型在 graph 內重設，分析與 ISTFT 的 overlap 連續。不要為此重設 ISTFT。</td></tr>
-<tr><th>pipeline stage（mono、4ch、live3 經 <code>ulcnet_nn_stage</code>）</th><td>只重啟模型；stage 外的分析器與 ISTFT 不重啟，overlap 連續。</td><td>不適用：stage 只接受一幀一包的 graph，封包 graph（layout 19）在 <code>ulcnet_nn_stage_set_model()</code> 被拒（回 -1）。</td></tr>
+<tr><th>pipeline stage（mono、4ch、live3 經 <code>ulcnet_nn_stage</code>）</th><td>只重啟模型；stage 外（應用端）的分析器與 ISTFT 不重啟，overlap 連續。</td><td>不適用：stage 只接受一幀一包的 graph，封包 graph（layout 19）在 <code>ulcnet_nn_stage_set_model()</code> 被拒（回 -1）。</td></tr>
 </tbody></table>
 <ul>
 <li>N=8 的事件由 graph 處理，generation 不變，一包仍是一次 AI3 呼叫。stream 把事件寫成 <code>frame_reset</code>：包內第 3 個 hop 是事件時為 <code>0 0 1 0 0 0 0 0</code>，sample 原樣搬進第五個訊號輸入。24 個 hop、第 3 個 hop 有事件的情境，N=1 送件 23 次（事件 hop 是 BYPASS，不送件，仍呼叫 post），N=8 每個完整包送一次、共 3 次。</li>

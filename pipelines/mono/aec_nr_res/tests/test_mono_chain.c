@@ -1,8 +1,8 @@
 /**
  * tests/test_mono_chain.c -- acceptance tests of the mono AEC -> NR -> RES chain as the example
- * programs compose it: lib/aec's Aec (its own RES gain) read through aec_get_res_context(),
- * lib/nr's denoiser through anr_process_gain(), min / apply / comfort noise / synthesis written
- * out per hop.
+ * programs compose it: lib/aec's Aec (its own RES gain) read through aec_get_residual(),
+ * lib/nr's denoiser through anr_process_gain_with_residual_psd(), aec_apply_gain / aec_apply_cng and
+ * the synthesis per hop.
  * The pool plan and hop of main.c (AEC, denoiser, synthesis, buffers in one aligned
  * block) are repeated here and tested: the pooled instance behaves exactly like the heap one,
  * reset restores a fresh instance, the switches route what they claim to, comfort noise obeys
@@ -16,7 +16,6 @@
  * a scratch directory for the black-box files).
  */
 #include "aec.h"
-#include "aec_res.h"               /* aec_cng_fill */
 #include "anr.h"
 #include "audio_stft.h"
 #include "utility/simd_kernels.h"
@@ -33,7 +32,7 @@
 #include <stdint.h>
 #include <stdarg.h>
 
-/* sqrt(2)*sin(2*pi*i/32): the phase table aec_cng_fill indexes (aec_res.h). */
+/* sqrt(2)*sin(2*pi*i/32): the phase table aec_cng_fill indexes (aec_internal.h). */
 static const float kCngTable[32] = {
     0.0f, 0.27589938f, 0.541196108f, 0.785694957f, 1.0f, 1.17587554f,
     1.30656302f, 1.3870399f, 1.41421354f, 1.3870399f, 1.30656302f,
@@ -83,7 +82,6 @@ static float lcg_sample(void) {
  * one block holding the AEC, the denoiser, the synthesis and the gain/spectrum buffers.
  * --------------------------------------------------------------------------------------- */
 
-#define CNG_NR_GAIN_FLOOR 0.31622777f
 #define PSD_SCALE_INV (1.0f / (32768.0f * 32768.0f))   /* int16^2 -> audio scale, exact */
 
 /* The synthesis borrows the AEC's own window table (aec_synthesis_window()), which exists once the AEC is
@@ -109,11 +107,11 @@ static ConvMonoConfig grid_opts(int sr, int fft_size) {
 static int plan_make(Plan* p, const ConvMonoConfig* o) {
     memset(p, 0, sizeof(*p));
     p->opt = *o;
-    if (!aec_resolve_signal_grid(o->sample_rate,
+    if (aec_resolve_signal_grid(o->sample_rate,
                                  o->fft_size ? o->fft_size : aec_default_fft_size(o->sample_rate),
-                                 &p->grid))
+                                 &p->grid) != AEC_OK)
         return -1;
-    /* The CLI maps unknown names to balanced; an out-of-enum value is this harness's own refusal
+    /* The CLI refuses a value that is not a level number; an out-of-enum value here is this harness's own refusal
      * (aec_config_from_level would fall back to balanced). */
     if (o->aec_level != AEC_LEVEL_MILD && o->aec_level != AEC_LEVEL_BALANCED &&
         o->aec_level != AEC_LEVEL_AGGRESSIVE && o->aec_level != AEC_LEVEL_NO_FLOOR)
@@ -123,9 +121,7 @@ static int plan_make(Plan* p, const ConvMonoConfig* o) {
     p->aec_cfg.delay_mode = o->delay_mode;
     p->aec_cfg.delay_num_filters = o->delay_num_filters;
     p->aec_cfg.fixed_delay_samples = o->fixed_delay_samples;
-    p->aec_cfg.enable_delay_est = o->delay_mode == AEC_DELAY_MATCHED;
-    p->aec_cfg.enable_res = 0;
-    p->aec_cfg.return_res_context = 1;
+    p->aec_cfg.residual = o->aec_only ? AEC_RESIDUAL_STATE : AEC_RESIDUAL_FULL;
     p->aec_bytes = aec_get_mem_size(&p->aec_cfg);
     if (p->aec_bytes == 0) return -1;
     p->total = ALIGN16(p->aec_bytes);
@@ -140,7 +136,7 @@ static int plan_make(Plan* p, const ConvMonoConfig* o) {
     p->synth_cfg.window = k_sizing_window;
     p->synth_bytes = ac_istft_get_mem_size(&p->synth_cfg);
     if (p->synth_bytes == 0) return -1;
-    p->buf_bytes = 3 * ALIGN16((size_t)p->grid.n_freqs * sizeof(float)) +
+    p->buf_bytes = 2 * ALIGN16((size_t)p->grid.n_freqs * sizeof(float)) +
                    ALIGN16((size_t)p->grid.n_freqs * sizeof(Complex));
     p->enable_cng = p->aec_cfg.enable_cng && o->enable_cng;
     p->total += ALIGN16(p->nr_bytes) + ALIGN16(p->synth_bytes) + p->buf_bytes;
@@ -159,9 +155,9 @@ typedef struct Rig {
     int with_res, use_r2, enable_cng, n_freqs;
     AnrDenoiser* nr;          /* NULL without NR */
     AcIstft* istft;
-    float *unity, *total_gain, *extra_noise;
+    float *unity, *extra_noise;
     Complex* spec;
-    uint32_t rng;
+    uint32_t rng;             /* caller-owned comfort-noise state, read only on the SAB_NO_RESEED / SAB_OLD_SEED path */
     uint32_t serial;          /* the aec_post_reset_serial() value already handled */
     long guard_hops, reset_hops;
     int sabotage;             /* negative controls of the full-mode identity test (SAB_*), 0 in the chain */
@@ -191,7 +187,6 @@ static int rig_carve_post(Rig* r, uint8_t* cur, const Plan* p) {
     if (!r->istft) return -1;
     cur += ALIGN16(p->synth_bytes);
     r->unity = (float*)cur;       cur += vec;
-    r->total_gain = (float*)cur;  cur += vec;
     r->extra_noise = (float*)cur; cur += vec;
     r->spec = (Complex*)cur;
     for (k = 0; k < r->n_freqs; ++k) r->unity[k] = 1.0f;
@@ -250,49 +245,59 @@ static void rig_destroy_only(Rig* r) {
     if (r->aec) aec_destroy(r->aec);
 }
 
-/* The hop of main.c: G_res is the lane's own (ctx.res_gain) or unity, G_nr the
- * denoiser's or unity; P = E * min(G_nr, G_res) plus comfort noise on the bins the RES cut. */
+/* The hop of main.c: G_res is the lane's own (aec_apply_gain) or unity, G_nr the denoiser's or
+ * unity; P = B * min(G_nr, G_res) plus comfort noise on the bins the RES cut. The SAB_NO_RESEED /
+ * SAB_OLD_SEED defects draw the noise from the rig's own generator (aec_apply_cng_spec), which the
+ * library's reseeding does not reach. */
 static int rig_hop(Rig* r, const float* mic, const float* ref, float* out) {
-    AecResContext c;
-    AecOutputBase ob;
-    const float* res;
-    const float* nr;
+    AecResidualView v;
+    AecLinearView lv;
+    const float* nr = NULL;
     uint32_t serial;
-    aec_process_context(r->aec, mic, ref);
-    aec_get_res_context(r->aec, &c);
+    if (aec_process_linear(r->aec, mic, ref) != AEC_OK) return -1;
     if (!r->with_post) {
-        memcpy(out, c.linear_hop, (size_t)c.hop_size * sizeof(float));
+        if (aec_process_residual(r->aec, NULL) != AEC_OK) return -1;
+        memset(&lv, 0, sizeof(lv));
+        lv.struct_size = sizeof(lv);
+        if (aec_get_linear(r->aec, &lv) != AEC_OK) return -1;
+        memcpy(out, lv.linear_hop, (size_t)lv.hop_size * sizeof(float));
         return 0;
     }
-    if (!c.error_spec) return -1;
-    memset(&ob, 0, sizeof(ob));
-    ob.struct_size = sizeof(ob);
-    if (aec_get_output_base(r->aec, &ob) != 0) return -1;
-    if (ob.guard_active) ++r->guard_hops;
+    if (aec_process_residual(r->aec, NULL) != AEC_OK) return -1;
+    memset(&v, 0, sizeof(v));
+    v.struct_size = sizeof(v);
+    if (aec_get_residual(r->aec, &v) != AEC_OK) return -1;
+    if (v.guard_active) ++r->guard_hops;
     serial = aec_post_reset_serial(r->aec);
-    if (serial != r->serial) {      /* before the first CNG draw and the ac_istft_push of this hop */
+    if (serial != r->serial) {      /* before the ac_istft_push of this hop */
         r->serial = serial;
         ++r->reset_hops;
         if (!(r->sabotage & SAB_NO_OLA_CLEAR)) ac_istft_reset(r->istft);
         if (!(r->sabotage & SAB_NO_RESEED)) r->rng = (r->sabotage & SAB_OLD_SEED) ? RETIRED_CNG_SEED : AEC_CNG_SEED;
         if ((r->sabotage & SAB_RESET_NR) && r->nr) anr_reset(r->nr);
     }
-    res = r->with_res ? c.res_gain : r->unity;
-    nr = r->unity;
-    if (!res) return -1;
     if (r->nr) {
-        const float* extra = NULL;
-        if (r->use_r2 && c.r2 && c.usable_linear) {
-            sk_scale_f32(r->extra_noise, c.r2, PSD_SCALE_INV, r->n_freqs);
-            extra = r->extra_noise;
+        const float* residual_psd_audio = NULL;
+        if (r->use_r2 && v.r2 && v.usable_linear) {
+            sk_scale_f32(r->extra_noise, v.r2, PSD_SCALE_INV, r->n_freqs);
+            residual_psd_audio = r->extra_noise;
         }
-        if (anr_process_gain(r->nr, ob.base_spec, extra, NULL) != 0) return -1;
-        if (!(nr = anr_get_gain(r->nr, NULL))) return -1;
+        if (!(nr = anr_process_gain_with_residual_psd(r->nr, v.base_spec, residual_psd_audio))) return -1;
     }
-    sk_min_f32(r->total_gain, nr, res, r->n_freqs);
-    sk_capply_gain_f32(r->spec, (r->sabotage & SAB_ERROR_SPEC) ? c.error_spec : ob.base_spec, r->total_gain, r->n_freqs);
-    if (r->enable_cng && r->with_res && c.comfort_noise)
-        aec_cng_fill(&r->rng, r->spec, c.comfort_noise, res, nr, CNG_NR_GAIN_FLOOR, r->n_freqs);
+    if (r->with_res) {
+        if (r->sabotage & SAB_ERROR_SPEC)
+            aec_apply_gain_spec(r->spec, v.error_spec, v.res_gain, nr, r->n_freqs);
+        else if (aec_apply_gain(r->aec, nr, r->spec) != AEC_OK)
+            return -1;
+        if (r->enable_cng) {
+            if (r->sabotage & (SAB_NO_RESEED | SAB_OLD_SEED))
+                aec_apply_cng_spec(&r->rng, r->spec, v.comfort_noise, v.res_gain, nr, r->n_freqs);
+            else if (aec_apply_cng(r->aec, nr, r->spec) != AEC_OK)
+                return -1;
+        }
+    } else {
+        aec_apply_gain_spec(r->spec, v.base_spec, r->unity, nr, r->n_freqs);
+    }
     (void)ac_istft_push(r->istft, r->spec, out);
     return 0;
 }
@@ -639,7 +644,6 @@ static void test_nr_res_switches(void) {
         float* ibuf = (float*)malloc((size_t)frame * sizeof(float));
         ac_window_build(win, frame);
         for (h = 0; h < total_hops; h++) {
-            AecResContext ctx;
             for (i = 0; i < hop; i++) {
                 float t = (float)(h * hop + i);
                 float r = 0.6f * sinf(0.06f * t);
@@ -653,13 +657,12 @@ static void test_nr_res_switches(void) {
             (void)rig_hop(&thru, mic, ref, o_thru);
             /* Reference: the seam spectrum the thru instance just applied gain 1.0 to,
              * resynthesised with the same window and overlap. */
-            aec_get_res_context(thru.aec, &ctx);
             {   /* the spectrum the instance rendered: the AEC's rendering base */
-                AecOutputBase ob;
-                memset(&ob, 0, sizeof(ob));
-                ob.struct_size = sizeof(ob);
-                if (aec_get_output_base(thru.aec, &ob) != 0) { g_failures++; continue; }
-                fft_inverse(fft, ob.base_spec, ibuf);
+                AecResidualView rv;
+                memset(&rv, 0, sizeof(rv));
+                rv.struct_size = sizeof(rv);
+                if (aec_get_residual(thru.aec, &rv) != AEC_OK) { g_failures++; continue; }
+                fft_inverse(fft, rv.base_spec, ibuf);
             }
             for (i = 0; i < frame; i++) ola[i] += ibuf[i] * win[i];
             if (h >= 4)
@@ -919,7 +922,7 @@ static void test_comfort_noise_follows_nr_gain(void) {
 }
 
 /* ---- the chain against the hand-written oracle ---------------------------------------
- * The example composition (Aec + aec_get_res_context + the per-hop chain) must be conv_chain_mono.h
+ * The example composition (Aec + aec_get_residual + the per-hop chain) must be conv_chain_mono.h
  * with its stages written out: the oracle's output is reproduced bit for bit, comfort noise ON
  * so the fill and its RNG are part of the claim. Every combination of the switches runs on
  * 16 kHz / FFT 256; the other grids run a sample of them. */
@@ -1017,8 +1020,8 @@ static void test_frame_and_chain_args(void) {
     ConvMonoConfig o = grid_opts(16000, 256);
     Rig r;
     void* pool;
-    AecResContext c;
-    AecResContext untouched;
+    AecResidualView v;
+    AecResidualView untouched;
     static float mic[128], ref[128], out[128];
 
     if (plan_make(&p, &o) != 0 || !(pool = aligned_block(p.total, 0xA5)) ||
@@ -1026,18 +1029,24 @@ static void test_frame_and_chain_args(void) {
         CHECK(0, "args: setup");
         return;
     }
-    aec_process_context(r.aec, mic, ref);
-    aec_get_res_context(r.aec, &c);
-    CHECK(c.error_spec != NULL && c.res_gain != NULL && c.n_freqs == 129,
-          "args: the res context of the lane carries the error spectrum and the lane's own gain");
+    CHECK(aec_process_linear(r.aec, mic, ref) == AEC_OK && aec_process_residual(r.aec, NULL) == AEC_OK,
+          "args: the lane's two stages run");
+    memset(&v, 0, sizeof v);
+    v.struct_size = sizeof v;
+    CHECK(aec_get_residual(r.aec, &v) == AEC_OK && v.error_spec != NULL && v.res_gain != NULL && v.n_freqs == 129,
+          "args: the residual view of the lane carries the error spectrum and the lane's own gain");
+    memset(&untouched, 0, sizeof untouched);
+    untouched.struct_size = sizeof untouched;
+    CHECK(aec_get_residual(NULL, &untouched) == AEC_ERR_ARG && aec_get_residual(r.aec, NULL) == AEC_ERR_ARG,
+          "args: aec_get_residual refuses NULL arguments");
     memset(&untouched, 0x5A, sizeof untouched);
-    aec_get_res_context(NULL, &untouched);
-    aec_get_res_context(r.aec, NULL);
-    CHECK(untouched.n_freqs == 0x5A5A5A5A, "args: aec_get_res_context ignores NULL arguments");
+    untouched.struct_size = sizeof untouched - 1;
+    CHECK(aec_get_residual(r.aec, &untouched) == AEC_ERR_ARG && untouched.n_freqs == 0x5A5A5A5A,
+          "args: aec_get_residual refuses a short struct_size and leaves the struct untouched");
     rig_free(&r);
     free(pool);
 
-    /* --aec-only: the AEC's own time-domain hop, no post stage and no synthesis */
+    /* --aec-only: both AEC stages, the linear hop out, no post stage and no synthesis */
     o.aec_only = 1;
     if (plan_make(&p, &o) != 0 || !(pool = aligned_block(p.total, 0xA5)) ||
         rig_init_pool(&r, pool, p.total, &p) != 0) {
@@ -1045,59 +1054,78 @@ static void test_frame_and_chain_args(void) {
         return;
     }
     CHECK(!r.with_post && p.total == ALIGN16(p.aec_bytes) && rig_hop(&r, mic, ref, out) == 0,
-          "args: an aec_only plan holds the AEC alone and copies the context's linear hop");
+          "args: an aec_only plan holds the AEC alone and copies the linear stage's hop");
     rig_free(&r);
     free(pool);
 }
 
-/* --aec-only copies ctx.linear_hop out of aec_process_context(). The oracle is the library's
- * own time-domain entry, aec_process(), on a second instance of the same lane config: it must
- * return the same hop (the rig, the harness hop and the oracle advance identical state). The
- * count of hops where the formed hop differs from the linear hop shows the comparison can tell
- * the two apart. */
-static int aec_only_equals_aec_process(int sr, int fft_size, int hops, int* formed_differs) {
+/* --aec-only runs both AEC stages (AEC_RESIDUAL_STATE) and copies AecLinearView.linear_hop. Two oracles on the
+ * moving-echo scene: (1) a second STATE instance of the lane config driven by aec_process_linear +
+ * aec_process_residual, whose linear_hop the rig of main.c and the harness hop must equal; (2) the FULL lane of the
+ * chain itself (the rig of main.c without --aec-only, NR and synthesis running), whose aec_get_linear().linear_hop
+ * must equal the --aec-only hop: the residual stage steers the linear filter, so the two share one linear path.
+ * Returns -1 on a setup failure, else 1 when (1) held on every hop; *chain_diff counts the hops where (2) failed. */
+static int aec_only_equals_chain_linear(int sr, int fft_size, int hops, int* chain_diff) {
     enum { HIST = 8192 };
-    ConvMonoConfig o = grid_opts(sr, fft_size);
-    Plan p;
-    Rig r;
+    ConvMonoConfig o = grid_opts(sr, fft_size), full_o = grid_opts(sr, fft_size);
+    Plan p, full_p;
+    Rig r, full;
     ConvMono* cm;
     Aec* oracle = (Aec*)calloc(1, sizeof(Aec));
-    AecResContext c;
-    float *mic, *ref, *want, *got_rig, *got_cm, *hist;
+    AecLinearView lv, fv;
+    AecConfig oracle_cfg;
+    float *mic, *ref, *got_rig, *got_cm, *chain_out, *hist;
     unsigned int rng = 0x2468ACEu;
     int hop, h, ok = 1;
     o.aec_only = 1;
-    *formed_differs = 0;
-    if (!oracle || plan_make(&p, &o) != 0 || rig_init_heap(&r, &p) != 0 ||
-        aec_create(oracle, &p.aec_cfg) != 0 || !(cm = conv_mono_create(&o))) {
+    *chain_diff = 0;
+    if (!oracle || plan_make(&p, &o) != 0 || plan_make(&full_p, &full_o) != 0 || rig_init_heap(&r, &p) != 0) {
+        free(oracle);
+        return -1;
+    }
+    if (rig_init_heap(&full, &full_p) != 0) {
+        rig_free(&r);
+        free(oracle);
+        return -1;
+    }
+    oracle_cfg = p.aec_cfg;
+    oracle_cfg.residual = AEC_RESIDUAL_STATE;
+    if (aec_create(oracle, &oracle_cfg) != 0 || !(cm = conv_mono_create(&o))) {
+        rig_free(&r);
+        rig_free(&full);
         free(oracle);
         return -1;
     }
     hop = p.grid.hop_size;
     mic = (float*)malloc((size_t)hop * sizeof(float));
     ref = (float*)malloc((size_t)hop * sizeof(float));
-    want = (float*)malloc((size_t)hop * sizeof(float));
     got_rig = (float*)malloc((size_t)hop * sizeof(float));
     got_cm = (float*)malloc((size_t)hop * sizeof(float));
+    chain_out = (float*)malloc((size_t)hop * sizeof(float));
     hist = (float*)calloc(HIST, sizeof(float));
     for (h = 0; h < hops; ++h) {
         reset_scene_hop(&rng, mic, ref, hop, h, hist, HIST, 293, 0.5f);
-        aec_process(oracle, mic, ref, want);
-        if (rig_hop(&r, mic, ref, got_rig) != 0 || conv_mono_hop(cm, mic, ref, got_cm) != 0) {
+        memset(&lv, 0, sizeof lv); lv.struct_size = sizeof lv;
+        memset(&fv, 0, sizeof fv); fv.struct_size = sizeof fv;
+        if (aec_process_linear(oracle, mic, ref) != AEC_OK || aec_process_residual(oracle, NULL) != AEC_OK ||
+            aec_get_linear(oracle, &lv) != AEC_OK ||
+            rig_hop(&r, mic, ref, got_rig) != 0 || conv_mono_hop(cm, mic, ref, got_cm) != 0 ||
+            rig_hop(&full, mic, ref, chain_out) != 0 || aec_get_linear(full.aec, &fv) != AEC_OK) {
             ok = 0;
             break;
         }
-        aec_get_res_context(r.aec, &c);
-        if (memcmp(c.formed_hop, c.linear_hop, (size_t)hop * sizeof(float)) != 0) ++*formed_differs;
-        if (memcmp(want, got_rig, (size_t)hop * sizeof(float)) != 0 ||
-            memcmp(want, got_cm, (size_t)hop * sizeof(float)) != 0)
+        if (memcmp(lv.linear_hop, got_rig, (size_t)hop * sizeof(float)) != 0 ||
+            memcmp(lv.linear_hop, got_cm, (size_t)hop * sizeof(float)) != 0)
             ok = 0;
+        if (memcmp(fv.linear_hop, got_rig, (size_t)hop * sizeof(float)) != 0) ++*chain_diff;
     }
-    free(mic); free(ref); free(want); free(got_rig); free(got_cm); free(hist);
+    if (h < hops) *chain_diff += hops - h;     /* a refused hop counts as a difference */
+    free(mic); free(ref); free(got_rig); free(got_cm); free(chain_out); free(hist);
     conv_mono_destroy(cm);
     aec_destroy(oracle);
     free(oracle);
     rig_free(&r);
+    rig_free(&full);
     return ok;
 }
 
@@ -1105,20 +1133,21 @@ static void test_aec_only_output(void) {
     static const struct { int sr, fft; } g[] = { {16000, 256}, {16000, 512}, {48000, 1024} };
     size_t i;
     for (i = 0; i < sizeof g / sizeof g[0]; ++i) {
-        int formed = 0, rc = aec_only_equals_aec_process(g[i].sr, g[i].fft, 400, &formed);
+        int chain_diff = 0;
+        int rc = aec_only_equals_chain_linear(g[i].sr, g[i].fft, 400, &chain_diff);
         CHECK(rc == 1,
-              fmt_msg("--aec-only hop (main.c rig, harness) == aec_process() oracle @ %d Hz / %d, 400 hops",
+              fmt_msg("--aec-only hop (main.c rig, harness) == aec_process_linear + aec_process_residual oracle (STATE lane) @ %d Hz / %d, 400 hops",
                       g[i].sr, g[i].fft));
-        CHECK(formed > 0,
-              fmt_msg("--aec-only @ %d Hz / %d: the formed hop differs from the linear hop on %d hops, so the comparison separates them",
-                      g[i].sr, g[i].fft, formed));
+        CHECK(rc != -1 && chain_diff == 0,
+              fmt_msg("--aec-only hop == linear_hop of the chain's FULL lane @ %d Hz / %d, 400 hops (%d hops differ)",
+                      g[i].sr, g[i].fft, chain_diff));
     }
 }
 
 
 /* ---- the full-mode identity ---------------------------------------------------------------
  * With the denoiser off the chain is the AEC's own output: RES gain on the rendering base, comfort
- * noise, synthesis. aec_process() on a second Aec in full mode (enable_res = 1) is the independent
+ * noise, synthesis. aec_process() on a second Aec in full mode (AEC_RESIDUAL_FULL) is the independent
  * oracle: the rig of main.c, the hand-written chain and the oracle must agree bit for bit on streams
  * that fire the output guard, move the hard-reset serial (a delay change restarting the filter, an
  * aec_reset() the application issues), start with silence and never become usable. Deliberate
@@ -1150,8 +1179,6 @@ static void run_full_identity(const GuardScene* s, int sabotage, FullRun* out) {
     o.enable_cng = s->enable_cng;
     if (!oracle || plan_make(&p, &o) != 0) { free(oracle); return; }
     oracle_cfg = p.aec_cfg;                    /* the lane, with the library's own full output */
-    oracle_cfg.enable_res = 1;
-    oracle_cfg.return_res_context = 0;
     oracle_cfg.enable_cng = p.enable_cng;
     pool = aligned_block(p.total, 0xA5);
     cm = conv_mono_create(&o);
@@ -1413,6 +1440,7 @@ static int black_box_aec_only(const char* bin, const char* tmp, int sr, int fft_
     enum { HOPS = 400 };
     char mic_path[512], ref_path[512], out_path[512], ora_path[512], cmd[2048];
     ConvMonoConfig o = grid_opts(sr, fft_size);
+    AecConfig oracle_cfg;
     Plan p;
     Aec* oracle = (Aec*)calloc(1, sizeof(Aec));
     WavReader *rm, *rr, *ro, *rp;
@@ -1424,7 +1452,12 @@ static int black_box_aec_only(const char* bin, const char* tmp, int sr, int fft_
     snprintf(ref_path, sizeof ref_path, "%s/bba_ref.wav", tmp);
     snprintf(out_path, sizeof out_path, "%s/bba_out.wav", tmp);
     snprintf(ora_path, sizeof ora_path, "%s/bba_oracle.wav", tmp);
-    if (!oracle || plan_make(&p, &o) != 0 || aec_create(oracle, &p.aec_cfg) != 0) {
+    if (!oracle || plan_make(&p, &o) != 0) {
+        free(oracle);
+        return -1;
+    }
+    oracle_cfg = p.aec_cfg;   /* AEC_RESIDUAL_STATE: aec_process() returns the linear hop */
+    if (aec_create(oracle, &oracle_cfg) != 0) {
         free(oracle);
         return -1;
     }
@@ -1471,7 +1504,7 @@ static int black_box_aec_only(const char* bin, const char* tmp, int sr, int fft_
 static void test_examples_aec_only(const char* bin_dir, const char* tmp) {
     static const struct { const char* args; int sr, fft; } cases[] = {
         {"--fft-size 256 --aec-only", 16000, 256},
-        {"--fft-size 512 aggressive --aec-only", 16000, 512},
+        {"--fft-size 512 2 --aec-only", 16000, 512},
         {"--aec-level 3 --aec-only", 8000, 0},
     };
     static const char* const programs[] = {"aec_nr_pipeline", "aec_nr_pipeline_static"};
@@ -1513,8 +1546,6 @@ static int black_box_full_mode(const char* bin, const char* tmp, const GuardScen
     o.enable_nr = 0; o.enable_res = 1; o.enable_cng = cng;
     if (!oracle || plan_make(&p, &o) != 0) { free(oracle); return -1; }
     cfg = p.aec_cfg;
-    cfg.enable_res = 1;
-    cfg.return_res_context = 0;
     cfg.enable_cng = p.enable_cng;
     if (aec_create(oracle, &cfg) != 0) { free(oracle); return -1; }
     hop = p.grid.hop_size;
@@ -1550,13 +1581,13 @@ static int black_box_full_mode(const char* bin, const char* tmp, const GuardScen
     rec = (float*)malloc(rec_floats * sizeof(float));
     serial_seen = (int)aec_post_reset_serial(oracle);
     for (h = 0; ok == 1 && h < sc->nh; ++h) {
-        AecOutputBase ob;
+        AecResidualView rv;
         if (fread(rec, sizeof(float), rec_floats, fd) != rec_floats) { ok = 0; break; }
         if (wav_read_float(rm, mic, hop) != hop || wav_read_float(rr, ref, hop) != hop) { ok = -1; break; }
         aec_process(oracle, mic, ref, want);
-        memset(&ob, 0, sizeof ob);
-        ob.struct_size = sizeof ob;
-        if (aec_get_output_base(oracle, &ob) == 0 && ob.guard_active) ++*guard_hops;
+        memset(&rv, 0, sizeof rv);
+        rv.struct_size = sizeof rv;
+        if (aec_get_residual(oracle, &rv) == AEC_OK && rv.guard_active) ++*guard_hops;
         if ((int)aec_post_reset_serial(oracle) != serial_seen) {
             serial_seen = (int)aec_post_reset_serial(oracle);
             ++*reset_hops;
@@ -1706,25 +1737,22 @@ static void test_examples_black_box(const char* bin_dir, const char* tmp) {
         {"--fft-size 256 --no-cng", 16000, 256, AEC_LEVEL_BALANCED, ANR_LEVEL_BALANCED, 1, 1, 0, 0},
         {"--fft-size 256 --legacy-amin", 16000, 256, AEC_LEVEL_BALANCED, ANR_LEVEL_BALANCED, 1, 1, 1, 1},
         {"--fft-size 256 --no-nr --no-res", 16000, 256, AEC_LEVEL_BALANCED, ANR_LEVEL_BALANCED, 0, 0, 1, 0},
-        /* The NR level is --nr-level; --nr-preset is the same option under its earlier name. */
-        {"--fft-size 256 aggressive --nr-level aggressive", 16000, 256, AEC_LEVEL_AGGRESSIVE,
-         ANR_LEVEL_AGGRESSIVE, 1, 1, 1, 0},
-        {"--fft-size 512 mild --nr-level mild", 16000, 512, AEC_LEVEL_MILD, ANR_LEVEL_MILD, 1, 1, 1, 0},
+        /* Levels are one digit: AEC 0=mild 1=balanced 2=aggressive 3=no_floor, NR 0=mild 1=moderate
+         * 2=balanced 3=aggressive. The NR level is --nr-level; --nr-preset is the same option under its earlier name. */
         {"--fft-size 256 2 --nr-level 3", 16000, 256, AEC_LEVEL_AGGRESSIVE, ANR_LEVEL_AGGRESSIVE, 1, 1, 1, 0},
+        {"--fft-size 512 0 --nr-level 0", 16000, 512, AEC_LEVEL_MILD, ANR_LEVEL_MILD, 1, 1, 1, 0},
         {"--fft-size 256 --nr-preset 0 3", 16000, 256, AEC_LEVEL_NO_FLOOR, ANR_LEVEL_MILD, 1, 1, 1, 0},
-        {"--nr-level moderate", 8000, 0, AEC_LEVEL_BALANCED, ANR_LEVEL_MODERATE, 1, 1, 1, 0},
-        {"--nr-preset aggressive --nr-level mild", 8000, 0, AEC_LEVEL_BALANCED, ANR_LEVEL_MILD, 1, 1, 1, 0},
+        {"--nr-level 1", 8000, 0, AEC_LEVEL_BALANCED, ANR_LEVEL_MODERATE, 1, 1, 1, 0},
+        {"--nr-preset 3 --nr-level 0", 8000, 0, AEC_LEVEL_BALANCED, ANR_LEVEL_MILD, 1, 1, 1, 0},
         /* The AEC level is the positional argument or --aec-level. */
-        {"--fft-size 256 --aec-level aggressive --nr-level aggressive", 16000, 256, AEC_LEVEL_AGGRESSIVE,
-         ANR_LEVEL_AGGRESSIVE, 1, 1, 1, 0},
+        {"--fft-size 256 --aec-level 2 --nr-level 3", 16000, 256, AEC_LEVEL_AGGRESSIVE, ANR_LEVEL_AGGRESSIVE, 1, 1, 1, 0},
         {"--aec-level 3 --fft-size 256", 16000, 256, AEC_LEVEL_NO_FLOOR, ANR_LEVEL_BALANCED, 1, 1, 1, 0},
-        {"--aec-level mild --fft-size 512 --nr-level mild", 16000, 512, AEC_LEVEL_MILD, ANR_LEVEL_MILD, 1, 1, 1, 0},
-        {"mild --fft-size 256", 16000, 256, AEC_LEVEL_MILD, ANR_LEVEL_BALANCED, 1, 1, 1, 0},
+        {"--aec-level 0 --fft-size 512 --nr-level 0", 16000, 512, AEC_LEVEL_MILD, ANR_LEVEL_MILD, 1, 1, 1, 0},
+        {"0 --fft-size 256", 16000, 256, AEC_LEVEL_MILD, ANR_LEVEL_BALANCED, 1, 1, 1, 0},
         {"--aec-level 2", 8000, 0, AEC_LEVEL_AGGRESSIVE, ANR_LEVEL_BALANCED, 1, 1, 1, 0},
-        {"--fft-size 256 aggressive --nr-preset aggressive", 16000, 256, AEC_LEVEL_AGGRESSIVE,
-         ANR_LEVEL_AGGRESSIVE, 1, 1, 1, 0},
-        {"--fft-size 512 mild --nr-preset mild", 16000, 512, AEC_LEVEL_MILD, ANR_LEVEL_MILD, 1, 1, 1, 0},
-        {"--nr-preset moderate", 8000, 0, AEC_LEVEL_BALANCED, ANR_LEVEL_MODERATE, 1, 1, 1, 0},
+        {"--fft-size 256 2 --nr-preset 3", 16000, 256, AEC_LEVEL_AGGRESSIVE, ANR_LEVEL_AGGRESSIVE, 1, 1, 1, 0},
+        {"--fft-size 512 0 --nr-preset 0", 16000, 512, AEC_LEVEL_MILD, ANR_LEVEL_MILD, 1, 1, 1, 0},
+        {"--nr-preset 1", 8000, 0, AEC_LEVEL_BALANCED, ANR_LEVEL_MODERATE, 1, 1, 1, 0},
     };
     static const char* const programs[] = {"aec_nr_pipeline", "aec_nr_pipeline_static"};
     size_t pi, ci;
@@ -1762,19 +1790,30 @@ static void test_examples_cli_values(const char* bin_dir) {
     static const char* const programs[] = {"aec_nr_pipeline", "aec_nr_pipeline_static"};
     static const char* const missing[] = {
         "--nr-preset", "--fft-size", "--nr-preset --no-res", "--fft-size --no-cng",
-        "--nr-preset --", "--fft-size --nr-preset mild", "mild --nr-preset --no-nr",
-        "--nr-level", "--nr-level --no-res", "--nr-level --", "--fft-size --nr-level mild",
-        "mild --nr-level --no-nr", "--nr-level --nr-preset", "--nr-preset --nr-level",
-        "--nr-level mild --nr-level", "--nr-preset mild --nr-level --no-cng",
+        "--nr-preset --", "--fft-size --nr-preset 0", "0 --nr-preset --no-nr",
+        "--nr-level", "--nr-level --no-res", "--nr-level --", "--fft-size --nr-level 0",
+        "0 --nr-level --no-nr", "--nr-level --nr-preset", "--nr-preset --nr-level",
+        "--nr-level 0 --nr-level", "--nr-preset 0 --nr-level --no-cng",
         "--aec-level", "--aec-level --no-res", "--aec-level --", "--fft-size --aec-level 1",
-        "mild --aec-level --no-nr", "--aec-level --nr-level", "--aec-level mild --aec-level",
+        "0 --aec-level --no-nr", "--aec-level --nr-level", "--aec-level 0 --aec-level",
     };
     /* One AEC level per command line: a second one, in any mix of the positional and
-     * --aec-level, is a command-line error (exit 2) even when it is an unknown word. */
+     * --aec-level, is a command-line error (exit 2). */
     static const char* const second_level[] = {
-        "1 2", "mild mild", "--aec-level 1 2", "1 --aec-level 2", "--aec-level 1 --aec-level 2",
-        "--aec-level mild --aec-level mild", "1 --no-res 2", "--fft-size 256 1 bogus", "bogus 1",
-        "2 --nr-level mild --aec-level 2",
+        "1 2", "0 0", "--aec-level 1 2", "1 --aec-level 2", "--aec-level 1 --aec-level 2",
+        "--aec-level 0 --aec-level 0", "1 --no-res 2", "2 --nr-level 0 --aec-level 2",
+    };
+    /* A level is one digit in range; a name, an out-of-range digit, a signed, padded or empty value exits 2. */
+    static const char* const bad_level[] = {
+        "balanced", "mild", "no_floor", "4", "9", "+1", "01", "1x", "''",
+        "--aec-level aggressive", "--aec-level 4", "--aec-level -1", "--aec-level 01", "--aec-level ''",
+        "--nr-level moderate", "--nr-level 4", "--nr-level -1", "--nr-level 2x", "--nr-level ''",
+        "--nr-preset balanced", "--nr-preset 4", "--fft-size 256 bogus", "bogus 1",
+    };
+    /* A number option is a whole decimal integer. */
+    static const char* const bad_number[] = {
+        "--fft-size 256x", "--fft-size x256", "--fft-size ''", "--fft-size 2.5", "--fft-size ' 256'",
+        "--fft-size 99999999999",
     };
     size_t pi, ci;
     char bin[512], args[256];
@@ -1790,24 +1829,36 @@ static void test_examples_cli_values(const char* bin_dir) {
             CHECK(example_exit_is(bin, args, 2),
                   fmt_msg("%s %s: a second AEC level, exit 2", programs[pi], second_level[ci]));
         }
+        for (ci = 0; ci < sizeof bad_level / sizeof bad_level[0]; ++ci) {
+            snprintf(args, sizeof args, "no_mic.wav no_ref.wav no_out.wav %s", bad_level[ci]);
+            CHECK(example_exit_is(bin, args, 2),
+                  fmt_msg("%s %s: not a level, exit 2", programs[pi], bad_level[ci]));
+        }
+        for (ci = 0; ci < sizeof bad_number / sizeof bad_number[0]; ++ci) {
+            snprintf(args, sizeof args, "no_mic.wav no_ref.wav no_out.wav %s", bad_number[ci]);
+            CHECK(example_exit_is(bin, args, 2),
+                  fmt_msg("%s %s: not a whole integer, exit 2", programs[pi], bad_number[ci]));
+        }
         CHECK(example_output_has(bin, "no_mic.wav no_ref.wav no_out.wav 1 --aec-level 2", "second AEC level"),
               fmt_msg("%s a second AEC level names the problem on the output", programs[pi]));
-        CHECK(example_exit_is(bin, "no_mic.wav no_ref.wav no_out.wav --nr-preset -x", 1),
-              fmt_msg("%s --nr-preset -x: \"-x\" is a value, the run stops at the input", programs[pi]));
-        CHECK(example_exit_is(bin, "no_mic.wav no_ref.wav no_out.wav --fft-size 256 --nr-preset mild", 1),
+        CHECK(example_output_has(bin, "no_mic.wav no_ref.wav no_out.wav balanced", "is not a level"),
+              fmt_msg("%s a level name is refused with 'is not a level'", programs[pi]));
+        CHECK(example_exit_is(bin, "no_mic.wav no_ref.wav no_out.wav --nr-preset -x", 2),
+              fmt_msg("%s --nr-preset -x: \"-x\" is a value but not a level, exit 2", programs[pi]));
+        CHECK(example_exit_is(bin, "no_mic.wav no_ref.wav no_out.wav --fft-size 256 --nr-preset 0", 1),
               fmt_msg("%s valid options reach the input check", programs[pi]));
         CHECK(example_output_has(bin, "", "--nr-level") && example_output_has(bin, "", "--nr-preset") &&
                   example_output_has(bin, "", "--aec-level"),
               fmt_msg("%s usage names --aec-level, --nr-level and its earlier spelling --nr-preset", programs[pi]));
         CHECK(example_output_has(bin, "", "give one of them once"),
               fmt_msg("%s usage says to give one AEC level", programs[pi]));
-        CHECK(example_exit_is(bin, "no_mic.wav no_ref.wav no_out.wav --aec-level -x", 1),
-              fmt_msg("%s --aec-level -x: \"-x\" is a value, the run stops at the input", programs[pi]));
+        CHECK(example_exit_is(bin, "no_mic.wav no_ref.wav no_out.wav --aec-level -x", 2),
+              fmt_msg("%s --aec-level -x: \"-x\" is a value but not a level, exit 2", programs[pi]));
         CHECK(example_exit_is(bin, "no_mic.wav no_ref.wav no_out.wav --aec-level 3 --fft-size 256", 1),
               fmt_msg("%s --aec-level with other options reaches the input check", programs[pi]));
-        CHECK(example_exit_is(bin, "no_mic.wav no_ref.wav no_out.wav --nr-level -x", 1),
-              fmt_msg("%s --nr-level -x: \"-x\" is a value, the run stops at the input", programs[pi]));
-        CHECK(example_exit_is(bin, "no_mic.wav no_ref.wav no_out.wav --fft-size 256 --nr-level mild 2", 1),
+        CHECK(example_exit_is(bin, "no_mic.wav no_ref.wav no_out.wav --nr-level -x", 2),
+              fmt_msg("%s --nr-level -x: \"-x\" is a value but not a level, exit 2", programs[pi]));
+        CHECK(example_exit_is(bin, "no_mic.wav no_ref.wav no_out.wav --fft-size 256 --nr-level 0 2", 1),
               fmt_msg("%s --nr-level with an AEC level reaches the input check", programs[pi]));
     }
     snprintf(bin, sizeof bin, "%s/aec_nr_pipeline_static", bin_dir);
@@ -1815,7 +1866,7 @@ static void test_examples_cli_values(const char* bin_dir) {
           "aec_nr_pipeline_static --print-mem-size --nr-preset --no-res: exit 2");
     CHECK(example_exit_is(bin, "--print-mem-size --nr-preset", 2),
           "aec_nr_pipeline_static --print-mem-size --nr-preset: exit 2");
-    CHECK(example_exit_is(bin, "--print-mem-size --nr-preset mild --fft-size 256", 0),
+    CHECK(example_exit_is(bin, "--print-mem-size --nr-preset 0 --fft-size 256", 0),
           "aec_nr_pipeline_static --print-mem-size with valid options: exit 0");
     CHECK(example_exit_is(bin, "--print-mem-size --nr-level --no-res", 2),
           "aec_nr_pipeline_static --print-mem-size --nr-level --no-res: exit 2");
@@ -1825,24 +1876,38 @@ static void test_examples_cli_values(const char* bin_dir) {
           "aec_nr_pipeline_static --print-mem-size --aec-level --no-res: exit 2");
     CHECK(example_exit_is(bin, "--print-mem-size --aec-level", 2),
           "aec_nr_pipeline_static --print-mem-size --aec-level: exit 2");
-    CHECK(example_exit_is(bin, "--print-mem-size --aec-level 3 --nr-level aggressive --fft-size 256", 0),
+    CHECK(example_exit_is(bin, "--print-mem-size --aec-level 3 --nr-level 3 --fft-size 256", 0),
           "aec_nr_pipeline_static --print-mem-size --aec-level with --nr-level: exit 0");
-    CHECK(example_exit_is(bin, "--print-mem-size 3 --nr-level aggressive --fft-size 256", 0),
+    CHECK(example_exit_is(bin, "--print-mem-size 3 --nr-level 3 --fft-size 256", 0),
           "aec_nr_pipeline_static --print-mem-size --nr-level with an AEC level: exit 0");
     CHECK(example_exit_is(bin, "--print-mem-size 1 2", 2),
           "aec_nr_pipeline_static --print-mem-size 1 2: a second AEC level, exit 2");
-    CHECK(example_exit_is(bin, "--print-mem-size mild mild", 2),
-          "aec_nr_pipeline_static --print-mem-size mild mild: a second AEC level, exit 2");
+    CHECK(example_exit_is(bin, "--print-mem-size 0 0", 2),
+          "aec_nr_pipeline_static --print-mem-size 0 0: a second AEC level, exit 2");
     CHECK(example_exit_is(bin, "--print-mem-size --aec-level 1 2", 2),
           "aec_nr_pipeline_static --print-mem-size --aec-level 1 2: a second AEC level, exit 2");
     CHECK(example_exit_is(bin, "--print-mem-size 1 --aec-level 2", 2),
           "aec_nr_pipeline_static --print-mem-size 1 --aec-level 2: a second AEC level, exit 2");
     CHECK(example_exit_is(bin, "--print-mem-size --aec-level 1 --aec-level 2", 2),
           "aec_nr_pipeline_static --print-mem-size --aec-level 1 --aec-level 2: a second AEC level, exit 2");
-    CHECK(example_exit_is(bin, "--print-mem-size 1 --no-res bogus", 2),
-          "aec_nr_pipeline_static --print-mem-size 1 --no-res bogus: a second AEC level, exit 2");
-    CHECK(example_exit_is(bin, "--print-mem-size bogus", 0),
-          "aec_nr_pipeline_static --print-mem-size bogus: one unknown level falls back, exit 0");
+    CHECK(example_exit_is(bin, "--print-mem-size 1 --no-res 2", 2),
+          "aec_nr_pipeline_static --print-mem-size 1 --no-res 2: a second AEC level, exit 2");
+    for (ci = 0; ci < sizeof bad_level / sizeof bad_level[0]; ++ci) {
+        snprintf(args, sizeof args, "--print-mem-size %s", bad_level[ci]);
+        CHECK(example_exit_is(bin, args, 2),
+              fmt_msg("aec_nr_pipeline_static %s: not a level, exit 2", args));
+    }
+    for (ci = 0; ci < sizeof bad_number / sizeof bad_number[0]; ++ci) {
+        snprintf(args, sizeof args, "--print-mem-size %s", bad_number[ci]);
+        CHECK(example_exit_is(bin, args, 2),
+              fmt_msg("aec_nr_pipeline_static %s: not a whole integer, exit 2", args));
+    }
+    CHECK(example_exit_is(bin, "--print-mem-size --sample-rate 16000Hz", 2),
+          "aec_nr_pipeline_static --print-mem-size --sample-rate 16000Hz: not a whole integer, exit 2");
+    CHECK(example_exit_is(bin, "--print-mem-size --sample-rate ''", 2),
+          "aec_nr_pipeline_static --print-mem-size --sample-rate '': not a whole integer, exit 2");
+    CHECK(example_exit_is(bin, "--print-mem-size --sample-rate 16000 --fft-size 256", 0),
+          "aec_nr_pipeline_static --print-mem-size --sample-rate 16000 --fft-size 256: exit 0");
 }
 
 int main(int argc, char** argv) {

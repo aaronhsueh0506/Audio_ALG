@@ -1,9 +1,10 @@
 /* Test helper: the conventional mono chain written out over lib/aec's Aec, for tests that
  * compare an application against it.
  *
- *   aec_process_context -> aec_get_res_context + aec_get_output_base -> follow aec_post_reset_serial
- *   (clear the OLA tail, reseed the comfort noise) -> NR gain on the rendering base (if enabled) ->
- *   min with the lane's RES gain (if enabled) -> apply to the base -> comfort noise -> ac_istft_push
+ *   aec_process_linear + aec_process_residual -> aec_get_residual (base_spec) -> follow
+ *   aec_post_reset_serial (clear the OLA tail, reseed the comfort noise) -> NR gain on the rendering
+ *   base (if enabled) -> min with the lane's RES gain (if enabled) -> apply to the base -> comfort
+ *   noise -> ac_istft_push
  *
  * The rendering base is the library's own choice per hop (error spectrum, or error + echo when the
  * output guard fires); the NR estimator reads it and the gain multiplies it, so the full-mode chain
@@ -13,7 +14,8 @@
  *
  * Independent of the example headers: the AecConfig, the NR configuration (anr_config_for_level_grid with
  * the 512 ms minimum window written out, r2 scaled by 2^-30 as the residual-echo prior) and the
- * min/apply loops are spelled out here, so a defect in the shared sample code cannot hide behind itself. A disabled
+ * min/apply loops and the caller-owned comfort-noise generator (aec_cng_fill from aec_internal.h, not aec_apply_gain / aec_apply_cng)
+ * are spelled out here, so a defect in the shared sample code cannot hide behind itself. A disabled
  * gain source reads as the unity vector; the comfort-noise fill runs only with the RES gain and
  * enable_cng. The Aec is heap-built (aec_create). Test code only: heap, no error recovery
  * beyond the status codes. */
@@ -25,12 +27,13 @@
 #include <string.h>
 
 #include "aec.h"
-#include "aec_res.h"
+#include "aec_internal.h"
 #include "anr.h"
 #include "audio_stft.h"
 #include "utility/mem_align.h"
 
-/* The comfort-noise floor of the example programs (the seed is AEC_CNG_SEED). */
+/* The comfort-noise floor written out for the oracle: the value of AEC_CNG_NR_GAIN_FLOOR (aec.h), duplicated on purpose
+ * so a change of the library constant is seen (the seed is AEC_CNG_SEED). */
 #define CONV_MONO_CNG_NR_GAIN_FLOOR 0.31622777f
 
 typedef struct ConvMonoConfig {
@@ -41,7 +44,7 @@ typedef struct ConvMonoConfig {
     int fixed_delay_samples;
     AecLevel aec_level;
     AnrLevel nr_level;
-    int aec_only;                 /* the AEC's own time-domain hop (ctx.linear_hop) */
+    int aec_only;                 /* AEC stages only; the hop is AecLinearView.linear_hop */
     int enable_nr, enable_res, enable_cng, legacy_amin;
     int default_synth_window;     /* 1: audiolib's default window (as the DFN stage), 0: the AEC's table */
 } ConvMonoConfig;
@@ -86,16 +89,14 @@ static inline void conv_mono_destroy(ConvMono* c) {
 }
 
 /* The lane the applications derive: level config on the rate's grid, the delay request as
- * given, RES left to the chain and the context kept (enable_res 0, return_res_context 1). */
+ * given, RES left to the chain (the residual view kept, AEC_RESIDUAL_FULL; aec_only: AEC_RESIDUAL_STATE, the residual stage still runs). */
 static inline void conv_mono_lane_config(const ConvMonoConfig* cfg, AecConfig* lane) {
     aec_config_from_level(lane, cfg->aec_level, cfg->sample_rate);
     lane->fft_size = cfg->fft_size ? cfg->fft_size : aec_default_fft_size(cfg->sample_rate);
     lane->delay_mode = cfg->delay_mode;
     lane->delay_num_filters = cfg->delay_num_filters;
     lane->fixed_delay_samples = cfg->fixed_delay_samples;
-    lane->enable_delay_est = cfg->delay_mode == AEC_DELAY_MATCHED ? 1 : 0;
-    lane->enable_res = 0;
-    lane->return_res_context = 1;
+    lane->residual = cfg->aec_only ? AEC_RESIDUAL_STATE : AEC_RESIDUAL_FULL;
 }
 
 static inline ConvMono* conv_mono_create(const ConvMonoConfig* cfg) {
@@ -162,25 +163,29 @@ static inline ConvMono* conv_mono_create(const ConvMonoConfig* cfg) {
 
 /* One hop into out (hop samples). Returns 0, or -1 when a stage refuses. */
 static inline int conv_mono_hop(ConvMono* c, const float* mic, const float* ref, float* out) {
-    const float* extra = NULL;
+    const float* residual_psd_audio = NULL;
     const float* res_gain;
     const float* nr_gain;
-    AecResContext ctx;
-    AecOutputBase ob;
+    AecResidualView rv;
+    AecLinearView lv;
     const Complex* base;
     uint32_t serial;
     int k;
-    aec_process_context(c->aec, mic, ref);
-    aec_get_res_context(c->aec, &ctx);
+    if (aec_process_linear(c->aec, mic, ref) != AEC_OK) return -1;
     if (c->cfg.aec_only) {
-        memcpy(out, ctx.linear_hop, (size_t)c->hop * sizeof(float));
+        if (aec_process_residual(c->aec, NULL) != AEC_OK) return -1;
+        memset(&lv, 0, sizeof(lv));
+        lv.struct_size = sizeof(lv);
+        if (aec_get_linear(c->aec, &lv) != AEC_OK) return -1;
+        memcpy(out, lv.linear_hop, (size_t)c->hop * sizeof(float));
         return 0;
     }
-    memset(&ob, 0, sizeof(ob));
-    ob.struct_size = sizeof(ob);
-    if (aec_get_output_base(c->aec, &ob) != 0) return -1;
-    base = ob.base_spec;
-    if (ob.guard_active) ++c->guard_hops;
+    if (aec_process_residual(c->aec, NULL) != AEC_OK) return -1;
+    memset(&rv, 0, sizeof(rv));
+    rv.struct_size = sizeof(rv);
+    if (aec_get_residual(c->aec, &rv) != AEC_OK) return -1;
+    base = rv.base_spec;
+    if (rv.guard_active) ++c->guard_hops;
     serial = aec_post_reset_serial(c->aec);
     if (serial != c->serial) {
         c->serial = serial;
@@ -188,15 +193,14 @@ static inline int conv_mono_hop(ConvMono* c, const float* mic, const float* ref,
         ac_istft_reset(c->istft);
         c->rng = AEC_CNG_SEED;
     }
-    res_gain = c->cfg.enable_res ? ctx.res_gain : c->unity;
+    res_gain = c->cfg.enable_res ? rv.res_gain : c->unity;
     nr_gain = c->unity;
     if (c->nr) {
-        if (!c->cfg.legacy_amin && ctx.usable_linear) {
-            for (k = 0; k < c->n_freqs; ++k) c->extra_noise[k] = ctx.r2[k] * 0x1p-30f;
-            extra = c->extra_noise;
+        if (!c->cfg.legacy_amin && rv.usable_linear) {
+            for (k = 0; k < c->n_freqs; ++k) c->extra_noise[k] = rv.r2[k] * 0x1p-30f;
+            residual_psd_audio = c->extra_noise;
         }
-        if (anr_process_gain(c->nr, base, extra, NULL) != 0) return -1;
-        nr_gain = anr_get_gain(c->nr, NULL);
+        nr_gain = anr_process_gain_with_residual_psd(c->nr, base, residual_psd_audio);
         if (!nr_gain) return -1;
     }
     for (k = 0; k < c->n_freqs; ++k) {
@@ -205,8 +209,8 @@ static inline int conv_mono_hop(ConvMono* c, const float* mic, const float* ref,
         c->spec[k].r = base[k].r * c->total_gain[k];
         c->spec[k].i = base[k].i * c->total_gain[k];
     }
-    if (c->cfg.enable_cng && c->cfg.enable_res && ctx.comfort_noise)
-        aec_cng_fill(&c->rng, c->spec, ctx.comfort_noise, ctx.res_gain, nr_gain,
+    if (c->cfg.enable_cng && c->cfg.enable_res && rv.comfort_noise)
+        aec_cng_fill(&c->rng, c->spec, rv.comfort_noise, rv.res_gain, nr_gain,
                      CONV_MONO_CNG_NR_GAIN_FLOOR, c->n_freqs);
     (void)ac_istft_push(c->istft, c->spec, out);
     return 0;

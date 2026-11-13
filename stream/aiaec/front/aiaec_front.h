@@ -11,9 +11,9 @@
  *                ...SUBMIT: the sample's AI3 run; BYPASS: none...
  *                aiaec_postprocess(ctx, ai_rc, pcm_out);          // exactly once per successful pre
  *
- * The AEC runs context-only (enable_res = 0, return_res_context = 1); the residual is the analysis seam
- * (AecResContext.formed_hop). int16 input is scaled by 1/32768 once; float input is used as is; no int16 round trip
- * on the way to the block entry. A pipeline with its own linear AEC passes its residual, raw far and events to
+ * The AEC runs stage by stage at AEC_RESIDUAL_STATE (aec_process_linear, aec_process_residual: no gain, no output
+ * stage); the residual is the analysis seam (AecResidualView.formed_hop). int16 input is scaled by 1/32768 once; float input is used as is; no
+ * int16 round trip on the way to the block entry. A pipeline with its own linear AEC passes its residual, raw far and events to
  * aiaec_preprocess() directly. */
 
 #ifndef AIAEC_FRONT_H

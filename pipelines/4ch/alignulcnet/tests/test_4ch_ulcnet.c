@@ -1,11 +1,12 @@
 /**
- * Composition tests of the 4-channel linear AEC + beamformer unit (the mcab flow with the sample
- * SRP-PHAT/BF helper, mcab_sample_beam.h, enable_post = 0) feeding the Align-ULCNet stage (ulcnet/ulcnet_nn_stage.h), wired as
- * 4ch/alignulcnet/main.c wires them: one-hop STFT/WOLA latency, delay-event identity reprime on
+ * Composition tests of the 4-channel linear AEC + beamformer unit (the array instance, lanes only
+ * (AEC_RESIDUAL_STATE), with the sample SRP-PHAT/BF helper, array_sample_beam.h) feeding the Align-ULCNet stage (ulcnet/ulcnet_nn_stage.h), wired as
+ * 4ch/alignulcnet/main.c wires them (the application's own far AcStft and output AcIstft around the
+ * stage): one-hop STFT/WOLA latency, delay-event identity reprime on
  * the real alignment state, the model-callback policy on real framing, and recovery by resetting
  * unit and stage together. A contract test, not a DSP-quality test. The stage alone (synthetic
  * alignment events) is tested in ulcnet/tests/test_ulcnet_nn_stage.c; the unit's split calls
- * are tested in test_mcab_sample_beam.c. What needs the real lanes (FIXED and MATCHED delay
+ * are tested in test_array_sample_beam.c. What needs the real lanes (FIXED and MATCHED delay
  * states, the framing straddle derivation, acquisition of a known delay) stays here. Each test
  * banner states its case:
  *   0. grid of the example unit config                1. identity E2E and the 1-hop timing contract
@@ -19,8 +20,9 @@
  * 4ch/.
  */
 
-#define MCAB_TEST_RIG_WITH_BEAM 1
-#include "4ch/tests/mcab_test_rig.h"
+#define ARRAY_TEST_RIG_WITH_BEAM 1
+#include "4ch/tests/array_test_rig.h"
+#include "audio_stft.h"
 #include "ulcnet/ulcnet_nn_stage.h"
 #include "utility/mem_align.h"
 
@@ -52,45 +54,72 @@ static UlcnetGrid other_grid(void) {
 }
 
 /* The unit on the stage's grid, linear context only: what 4ch/alignulcnet/main.c builds. */
-static McabTestUnitConfig ulcnet_example_unit_config(void) {
-    McabTestUnitConfig cfg = mcab_test_unit_default_config(g_grid.sample_rate);
-    cfg.core.fft_size = g_grid.n_fft;
-    cfg.core.enable_post = 0;
+static ArrayTestUnitConfig ulcnet_example_unit_config(void) {
+    ArrayTestUnitConfig cfg = array_test_unit_default_config(g_grid.sample_rate);
+    cfg.aec_cfg.fft_size = g_grid.n_fft;
+    cfg.aec_cfg.residual = AEC_RESIDUAL_STATE;
     return cfg;
 }
 
 /* ---------------------------------------------------------------------------------------
- * The composition under test: the unit plus the stage (err_analysis 0: the beamformed
- * spectrum is the error frame), as main.c builds them. A small test-local shim gives the
+ * The composition under test: the unit plus the stage (the beamformed spectrum is the error
+ * frame) plus the application's far analysis and output synthesis, as main.c builds them. A small test-local shim gives the
  * pieces the shape the tests below drive. The unit is always called through its split
  * (front + beam) or one-call forms with the activity flag in both slots and no mask.
  * --------------------------------------------------------------------------------------- */
 
+/* The application's framing around the stage: the raw far analysis and the output synthesis. */
+typedef struct Frm {
+    AcStft* far_stft;
+    AcIstft* istft;
+    void* mem;
+    Complex far_spec[BINS_MAX], out_spec[BINS_MAX];
+} Frm;
+
+static int frm_init(Frm* f, const UlcnetGrid* grid) {
+    AcStftConfig sc;
+    size_t a, b;
+    memset(f, 0, sizeof(*f));
+    ac_stft_config_default(&sc, grid->n_fft);
+    sc.ola = AC_OLA_ACCUMULATE;
+    a = ac_stft_get_mem_size(&sc);
+    b = ac_istft_get_mem_size(&sc);
+    if (posix_memalign(&f->mem, 16, ALIGN16(a) + ALIGN16(b)) != 0) { f->mem = NULL; return -1; }
+    f->far_stft = ac_stft_init(f->mem, a, &sc);
+    f->istft = ac_istft_init((uint8_t*)f->mem + ALIGN16(a), b, &sc);
+    return f->far_stft && f->istft ? 0 : -1;
+}
+static void frm_free(Frm* f) { free(f->mem); f->mem = NULL; }
+static void frm_reset(Frm* f) { ac_stft_reset(f->far_stft); ac_istft_reset(f->istft); }
+static int frm_synth(Frm* f, int hop, float* out) { return ac_istft_push(f->istft, f->out_spec, out) == hop ? 0 : -1; }
+
 typedef struct Ul4 {
-    McabSampleBeam* unit;
+    ArraySampleBeam* unit;
     UlcnetNnStage* stage;
+    Frm frm;
     void* stage_mem;
-    McabDelayState last_delay;   /* alignment of the most recent successful hop */
+    AecDelayState last_delay;   /* alignment of the most recent successful hop */
 } Ul4;
 
 /* The stage takes grid.n_bins bins per hop, so a unit of another grid cannot feed it. */
-static int unit_matches_stage(const McabSampleBeam* unit, const UlcnetGrid* grid) {
-    return mcab_hop_size(mcab_test_beam_flow(unit)) == grid->hop &&
-           mcab_n_freqs(mcab_test_beam_flow(unit)) == grid->n_bins &&
-           mcab_fft_size(mcab_test_beam_flow(unit)) == grid->n_fft &&
-           mcab_sample_rate(mcab_test_beam_flow(unit)) == grid->sample_rate;
+static int unit_matches_stage(const ArraySampleBeam* unit, const UlcnetGrid* grid) {
+    return aec_hop_size(array_test_beam_aec(unit)) == grid->hop &&
+           array_test_n_freqs(array_test_beam_aec(unit)) == grid->n_bins &&
+           array_test_fft_size(array_test_beam_aec(unit)) == grid->n_fft &&
+           array_test_sample_rate(array_test_beam_aec(unit)) == grid->sample_rate;
 }
 
-static Ul4* ul4_wrap(McabSampleBeam* unit, void* stage_mem, size_t stage_bytes,
+static Ul4* ul4_wrap(ArraySampleBeam* unit, void* stage_mem, size_t stage_bytes,
                      const UlcnetGrid* grid) {
     Ul4* p = (Ul4*)calloc(1, sizeof(*p));
     if (!p) return NULL;
     p->unit = unit;
     p->stage_mem = stage_mem;
-    if (unit && stage_mem && unit_matches_stage(unit, grid))
-        p->stage = ulcnet_nn_stage_init(stage_mem, stage_bytes, grid, 0);
+    if (unit && stage_mem && unit_matches_stage(unit, grid) && frm_init(&p->frm, grid) == 0)
+        p->stage = ulcnet_nn_stage_init(stage_mem, stage_bytes, grid);
     if (!p->stage) {
-        if (unit) mcab_test_beam_destroy(unit);
+        frm_free(&p->frm);
+        if (unit) array_test_beam_destroy(unit);
         free(stage_mem);
         free(p);
         return NULL;
@@ -100,20 +129,21 @@ static Ul4* ul4_wrap(McabSampleBeam* unit, void* stage_mem, size_t stage_bytes,
 
 /* A fresh instance from separate heap allocations; the stage block starts stale. NULL when the
  * unit's grid is not the stage's. */
-static Ul4* ul4_create_for(const McabTestUnitConfig* cfg, const UlcnetGrid* grid) {
-    size_t stage_bytes = ulcnet_nn_stage_mem_size(grid, 0);
+static Ul4* ul4_create_for(const ArrayTestUnitConfig* cfg, const UlcnetGrid* grid) {
+    size_t stage_bytes = ulcnet_nn_stage_mem_size(grid);
     void* stage_mem = NULL;
     if (!cfg || stage_bytes == 0 || posix_memalign(&stage_mem, 16, stage_bytes) != 0)
         return NULL;
     memset(stage_mem, 0x5A, stage_bytes);
-    return ul4_wrap(mcab_test_beam_create(cfg), stage_mem, stage_bytes, grid);
+    return ul4_wrap(array_test_beam_create(cfg), stage_mem, stage_bytes, grid);
 }
 
-static Ul4* ul4_create(const McabTestUnitConfig* cfg) { return ul4_create_for(cfg, &g_grid); }
+static Ul4* ul4_create(const ArrayTestUnitConfig* cfg) { return ul4_create_for(cfg, &g_grid); }
 
 static void ul4_destroy(Ul4* p) {
     if (!p) return;
-    mcab_test_beam_destroy(p->unit);
+    array_test_beam_destroy(p->unit);
+    frm_free(&p->frm);
     free(p->stage_mem);
     free(p);
 }
@@ -122,47 +152,50 @@ static int ul4_set_model(Ul4* p, const UlcnetModel* model) {
     return p ? ulcnet_nn_stage_set_model(p->stage, model) : -1;
 }
 
-static int ul4_hop_size(const Ul4* p) { return p ? mcab_hop_size(mcab_test_beam_flow(p->unit)) : -1; }
-static int ul4_fft_size(const Ul4* p) { return p ? mcab_fft_size(mcab_test_beam_flow(p->unit)) : -1; }
-static int ul4_n_freqs(const Ul4* p) { return p ? mcab_n_freqs(mcab_test_beam_flow(p->unit)) : -1; }
-static int ul4_sample_rate(const Ul4* p) { return p ? mcab_sample_rate(mcab_test_beam_flow(p->unit)) : -1; }
+static int ul4_hop_size(const Ul4* p) { return p ? aec_hop_size(array_test_beam_aec(p->unit)) : -1; }
+static int ul4_fft_size(const Ul4* p) { return p ? array_test_fft_size(array_test_beam_aec(p->unit)) : -1; }
+static int ul4_n_freqs(const Ul4* p) { return p ? array_test_n_freqs(array_test_beam_aec(p->unit)) : -1; }
+static int ul4_sample_rate(const Ul4* p) { return p ? array_test_sample_rate(array_test_beam_aec(p->unit)) : -1; }
 
 /* Unit and stage together: the recovery after any refused call, and the stream restart. */
 static void ul4_reset(Ul4* p) {
     if (!p) return;
-    mcab_sample_beam_reset(p->unit);
+    array_sample_beam_reset(p->unit);
     ulcnet_nn_stage_reset(p->stage);
+    frm_reset(&p->frm);
     memset(&p->last_delay, 0, sizeof(p->last_delay));
 }
 
-static int ul4_last_delay(const Ul4* p, McabDelayState* out) {
+static int ul4_last_delay(const Ul4* p, AecDelayState* out) {
     if (!p || !out) return -1;
     *out = p->last_delay;
     return 0;
 }
 
-static UlcnetNnDelay delay_events(const McabDelayState* d) {
+static UlcnetNnDelay delay_events(const AecDelayState* d) {
     UlcnetNnDelay e;
     e.changed = d->changed;
     e.solid = d->solid;
     return e;
 }
 
-/* Unit (split calls), then the stage's begin with the beamformed spectrum, the raw far and the
- * alignment events of the front. A refused unit hop takes both down. */
+/* Unit (split calls), the application's analysis of the raw far, then the stage's begin_spec with the
+ * beamformed spectrum, the far spectrum and the alignment events of the front. A refused unit hop
+ * takes both down. */
 static int ul4_process_begin(Ul4* p, const float* mic, const float* far, int vad) {
-    McabFront front;
-    McabSampleBeamResult beam;
+    AecArrayView front;
+    ArraySampleBeamResult beam;
     int rc;
-    if (!p || !mic || !far) return MCAB_INVALID_ARGUMENT;
-    rc = mcab_sample_beam_process_front(p->unit, mic, far, &front);
-    if (rc == MCAB_OK)
-        rc = mcab_sample_beam_process_beam(p->unit, &front, vad, vad, NULL, &beam, NULL);
-    if (rc != MCAB_OK) {
-        if (rc == MCAB_DSP_ERROR) ul4_reset(p);
+    if (!p || !mic || !far) return AEC_ERR_ARG;
+    rc = array_sample_beam_process_front(p->unit, mic, far, &front);
+    if (rc == AEC_OK)
+        rc = array_sample_beam_process_beam(p->unit, &front, vad, vad, NULL, &beam, NULL);
+    if (rc != AEC_OK) {
+        if (rc == AEC_ERR_DSP) ul4_reset(p);
         return rc;
     }
-    rc = ulcnet_nn_stage_begin_complex(p->stage, beam.spectrum, far, delay_events(&front.delay));
+    (void)ac_stft_push(p->frm.far_stft, far, p->frm.far_spec);
+    rc = ulcnet_nn_stage_begin_spec(p->stage, beam.spectrum, p->frm.far_spec, delay_events(&front.delay));
     if (rc == ULCNET_NN_STAGE_OK) p->last_delay = front.delay;
     return rc;
 }
@@ -174,25 +207,30 @@ static int ul4_nn_end(Ul4* p, int model_rc) {
     return p ? ulcnet_nn_stage_nn_end(p->stage, model_rc) : -1;
 }
 static int ul4_process_end(Ul4* p, float* out) {
-    return p ? ulcnet_nn_stage_end(p->stage, out) : -1;
+    int rc;
+    if (!p || !out) return -1;
+    rc = ulcnet_nn_stage_end_spec(p->stage, p->frm.out_spec);
+    return rc != 0 ? rc : frm_synth(&p->frm, ul4_hop_size(p), out);
 }
 
 /* The whole hop with the installed model (identity when unset), the unit's one-call form. */
 static int ul4_process_with_activity(Ul4* p, const float* mic, const float* far, int vad,
                                      float* out) {
-    McabSampleBeamResult beam;
-    McabSampleBeamInfo info;
+    ArraySampleBeamResult beam;
+    ArraySampleBeamInfo info;
     int rc;
-    if (!p || !mic || !far || !out) return MCAB_INVALID_ARGUMENT;
-    rc = mcab_sample_beam_process_with_activity(p->unit, mic, far, vad, vad, NULL, &beam, &info);
-    if (rc != MCAB_OK) {
-        if (rc == MCAB_DSP_ERROR) ul4_reset(p);
+    if (!p || !mic || !far || !out) return AEC_ERR_ARG;
+    rc = array_sample_beam_process_with_activity(p->unit, mic, far, vad, vad, NULL, &beam, &info);
+    if (rc != AEC_OK) {
+        if (rc == AEC_ERR_DSP) ul4_reset(p);
         return rc;
     }
-    rc = ulcnet_nn_stage_begin_complex(p->stage, beam.spectrum, far, delay_events(&info.delay));
+    (void)ac_stft_push(p->frm.far_stft, far, p->frm.far_spec);
+    rc = ulcnet_nn_stage_begin_spec(p->stage, beam.spectrum, p->frm.far_spec, delay_events(&info.delay));
     if (rc != ULCNET_NN_STAGE_OK) return rc;
     p->last_delay = info.delay;
-    return ulcnet_nn_stage_process(p->stage, out);
+    rc = ulcnet_nn_stage_process(p->stage, p->frm.out_spec);
+    return rc != 0 ? rc : frm_synth(&p->frm, ul4_hop_size(p), out);
 }
 
 /* Every test model that actually infers must publish a descriptor: the stage refuses
@@ -242,8 +280,8 @@ static void fill_echo_hop(int frame, int hop, int true_delay,
         far_hist[t] = noise;
         far[i] = noise;
         echo = t >= true_delay ? 0.6f * far_hist[t - true_delay] : 0.0f;
-        for (int ch = 0; ch < MCAB_CHANNELS; ++ch) {
-            microphones[i * MCAB_CHANNELS + ch] =
+        for (int ch = 0; ch < AEC_ARRAY_MICS; ++ch) {
+            microphones[i * AEC_ARRAY_MICS + ch] =
                 echo * (1.0f - 0.02f * ch);
         }
     }
@@ -295,7 +333,7 @@ static void capture_reset(void* user) { ((CaptureModel*)user)->resets += 1; }
 
 static int test_identity_e2e(void) {
     enum { FRAMES = 60 };
-    McabTestUnitConfig cfg = ulcnet_example_unit_config();
+    ArrayTestUnitConfig cfg = ulcnet_example_unit_config();
     Ul4* p;
     CaptureModel m;
     UlcnetModel model;
@@ -309,14 +347,14 @@ static int test_identity_e2e(void) {
     int identical_hops = 0;
     int hop;
 
-    CHECK(cfg.core.sample_rate == g_grid.sample_rate &&
-          cfg.core.fft_size == g_grid.n_fft,
+    CHECK(cfg.aec_cfg.sample_rate == g_grid.sample_rate &&
+          cfg.aec_cfg.fft_size == g_grid.n_fft,
           "default config matches the stage's grid");
     cfg.beam.bf_fixed_mode = 1;
     cfg.beam.bf_fixed_doa_rad = 0.4f;
     cfg.beam.bf_mu = 0.02f;
-    cfg.core.delay_mode = AEC_DELAY_FIXED;
-    cfg.core.fixed_delay_samples = 0;
+    cfg.aec_cfg.delay_mode = AEC_DELAY_FIXED;
+    cfg.aec_cfg.fixed_delay_samples = 0;
 
     p = ul4_create(&cfg);
     CHECK(p != NULL, "create ULCNet 4ch pipeline");
@@ -351,7 +389,7 @@ static int test_identity_e2e(void) {
     }
 
     microphones = (float*)malloc(
-        (size_t)hop * MCAB_CHANNELS * sizeof(float));
+        (size_t)hop * AEC_ARRAY_MICS * sizeof(float));
     far = (float*)malloc((size_t)hop * sizeof(float));
     out = (float*)malloc((size_t)hop * sizeof(float));
     ref = (float*)malloc((size_t)hop * sizeof(float));
@@ -372,14 +410,14 @@ static int test_identity_e2e(void) {
             float near = frame >= 30
                 ? 0.025f * sinf(phase * 1.73f + 0.2f) : 0.0f;
             far[i] = echo;
-            for (int ch = 0; ch < MCAB_CHANNELS; ++ch) {
-                microphones[i * MCAB_CHANNELS + ch] =
+            for (int ch = 0; ch < AEC_ARRAY_MICS; ++ch) {
+                microphones[i * AEC_ARRAY_MICS + ch] =
                     echo * (1.0f - 0.03f * ch) + near * (1.0f + 0.02f * ch);
             }
         }
         CHECK(ul4_process_with_activity(
                   p, microphones, far, frame >= 30, out) ==
-                  MCAB_OK,
+                  AEC_OK,
               "identity frame processes");
         CHECK(m.calls == (long)frame + 1,
               "exactly one inference per hop, from hop #0");
@@ -426,7 +464,7 @@ typedef struct IdentityTwin {
     float* out;
 } IdentityTwin;
 
-static int twin_create(IdentityTwin* t, const McabTestUnitConfig* cfg) {
+static int twin_create(IdentityTwin* t, const ArrayTestUnitConfig* cfg) {
     t->p = ul4_create(cfg);
     t->out = NULL;
     if (t->p != NULL) {
@@ -439,7 +477,7 @@ static int twin_create(IdentityTwin* t, const McabTestUnitConfig* cfg) {
 static int twin_step(IdentityTwin* t, const float* microphones,
                      const float* far) {
     return ul4_process_with_activity(
-               t->p, microphones, far, 0, t->out) == MCAB_OK;
+               t->p, microphones, far, 0, t->out) == AEC_OK;
 }
 
 static void twin_destroy(IdentityTwin* t) {
@@ -481,11 +519,11 @@ static void counting_reset(void* user) {
 
 static int test_counting_model_policy(void) {
     enum { FRAMES = 240, TRUE_DELAY = 400, FAIL_FRAMES = 8 };
-    McabTestUnitConfig cfg = ulcnet_example_unit_config();
+    ArrayTestUnitConfig cfg = ulcnet_example_unit_config();
     Ul4* p;
     CountingModel m;
     UlcnetModel model;
-    McabDelayState delay;
+    AecDelayState delay;
     float* microphones;
     float* far;
     float* out;
@@ -525,7 +563,7 @@ static int test_counting_model_policy(void) {
     CHECK(ul4_set_model(p, &model) == 0,
           "install counting model");
     microphones = (float*)malloc(
-        (size_t)hop * MCAB_CHANNELS * sizeof(float));
+        (size_t)hop * AEC_ARRAY_MICS * sizeof(float));
     far = (float*)malloc((size_t)hop * sizeof(float));
     out = (float*)malloc((size_t)hop * sizeof(float));
     far_hist = (float*)calloc((size_t)total_frames * hop, sizeof(float));
@@ -546,7 +584,7 @@ static int test_counting_model_policy(void) {
 
         fill_echo_hop(frame, hop, TRUE_DELAY, far_hist, far, microphones);
         CHECK(ul4_process_with_activity(
-                  p, microphones, far, 0, out) == MCAB_OK,
+                  p, microphones, far, 0, out) == AEC_OK,
               "counting-model frame processes");
         CHECK(ul4_last_delay(p, &delay) == 0,
               "delay-state accessor works");
@@ -629,7 +667,7 @@ static int test_counting_model_policy(void) {
     {
         long infer_before = m.infer_calls;
         CHECK(ul4_process_with_activity(
-                  p, microphones, far, 0, out) == MCAB_OK,
+                  p, microphones, far, 0, out) == AEC_OK,
               "post-reset frame processes");
         for (int i = 0; i < hop; ++i)
             CHECK(isfinite(out[i]), "post-reset hop#0 output is finite");
@@ -654,19 +692,19 @@ static int test_counting_model_policy(void) {
 static int test_fixed_first_alignment_resets_model(void) {
     enum { N = 8 };
     const int FIXED_DELAY = 2 * HOP;
-    McabTestUnitConfig cfg = ulcnet_example_unit_config();
+    ArrayTestUnitConfig cfg = ulcnet_example_unit_config();
     Ul4* p;
     CountingModel m;
     UlcnetModel model;
-    McabDelayState delay;
-    float microphones[MCAB_CHANNELS * HOP_MAX] = {0};
+    AecDelayState delay;
+    float microphones[AEC_ARRAY_MICS * HOP_MAX] = {0};
     float far[HOP_MAX] = {0};
     float out[HOP_MAX];
     int first_solid = -1;
     int changed = 0;
 
-    cfg.core.delay_mode = AEC_DELAY_FIXED;
-    cfg.core.fixed_delay_samples = FIXED_DELAY;
+    cfg.aec_cfg.delay_mode = AEC_DELAY_FIXED;
+    cfg.aec_cfg.fixed_delay_samples = FIXED_DELAY;
     p = ul4_create(&cfg);
     CHECK(p != NULL, "create 4ch FIXED transition pipeline");
     if (!p) return 0;
@@ -683,7 +721,7 @@ static int test_fixed_first_alignment_resets_model(void) {
 
     for (int frame = 0; frame < N; ++frame) {
         CHECK(ul4_process_with_activity(
-                  p, microphones, far, 0, out) == MCAB_OK,
+                  p, microphones, far, 0, out) == AEC_OK,
               "4ch FIXED transition frame processes");
         CHECK(ul4_last_delay(p, &delay) == 0,
               "4ch FIXED transition exposes delay state");
@@ -723,9 +761,9 @@ static int test_fixed_first_alignment_resets_model(void) {
 #define FIXED_SEAM_HOP  (FIXED_SEAM_FFT / 2)
 
 static int fixed_seam_case(int fixed_delay, int frames, int expect_first_solid) {
-    McabConfig cfg = mcab_default_config(FIXED_SEAM_SR);
-    Mcab* core;
-    McabFront pre;
+    AecConfig cfg = array_test_default_config(FIXED_SEAM_SR);
+    Aec* core;
+    AecArrayView pre;
     float* microphones;
     float* far;
     float* far_hist;
@@ -740,12 +778,12 @@ static int fixed_seam_case(int fixed_delay, int frames, int expect_first_solid) 
     cfg.fft_size = FIXED_SEAM_FFT;
     cfg.delay_mode = AEC_DELAY_FIXED;
     cfg.fixed_delay_samples = fixed_delay;
-    core = mcab_test_create(&cfg);
+    core = array_test_create(&cfg);
     CHECK(core != NULL, "create FIXED seam core");
-    hop = mcab_hop_size(core);
+    hop = aec_hop_size(core);
 
     microphones = (float*)calloc(
-        (size_t)hop * MCAB_CHANNELS, sizeof(float));
+        (size_t)hop * AEC_ARRAY_MICS, sizeof(float));
     far = (float*)malloc((size_t)hop * sizeof(float));
     far_hist = (float*)calloc((size_t)frames * hop, sizeof(float));
     expected = (float*)malloc((size_t)hop * sizeof(float));
@@ -760,8 +798,8 @@ static int fixed_seam_case(int fixed_delay, int frames, int expect_first_solid) 
             far[i] = noise;
         }
         memset(&pre, 0, sizeof(pre));
-        CHECK(mcab_process_front(
-                  core, microphones, far, &pre) == MCAB_OK,
+        CHECK(array_test_front(
+                  core, microphones, far, &pre) == AEC_OK,
               "FIXED seam hop processes");
         CHECK(pre.aligned_ref != NULL, "FIXED seam exposes aligned_ref");
         CHECK(pre.delay.delay_samples == fixed_delay,
@@ -811,7 +849,7 @@ static int fixed_seam_case(int fixed_delay, int frames, int expect_first_solid) 
     free(far_hist);
     free(far);
     free(microphones);
-    mcab_test_destroy(core);
+    array_test_destroy(core);
     return 1;
 }
 
@@ -840,11 +878,11 @@ static int test_fixed_prelock_seam_is_raw_far(void) {
 static int test_relock_same_delay_resets_model(void) {
     enum { WARM_FRAMES = 60, RELOCK_FRAMES = 60 };
     const int true_delay = 64 * DELAY_RATE_FACTOR;
-    McabTestUnitConfig cfg = ulcnet_example_unit_config();
+    ArrayTestUnitConfig cfg = ulcnet_example_unit_config();
     Ul4* p;
     CountingModel m;
     UlcnetModel model;
-    McabDelayState delay;
+    AecDelayState delay;
     float* microphones;
     float* far;
     float* out;
@@ -883,7 +921,7 @@ static int test_relock_same_delay_resets_model(void) {
     CHECK(ul4_set_model(p, &model) == 0,
           "install counting model");
     microphones = (float*)malloc(
-        (size_t)hop * MCAB_CHANNELS * sizeof(float));
+        (size_t)hop * AEC_ARRAY_MICS * sizeof(float));
     far = (float*)malloc((size_t)hop * sizeof(float));
     out = (float*)malloc((size_t)hop * sizeof(float));
     far_hist = (float*)calloc((size_t)total_frames * hop, sizeof(float));
@@ -893,7 +931,7 @@ static int test_relock_same_delay_resets_model(void) {
     for (int frame = 0; frame < total_frames; ++frame) {
         if (frame == WARM_FRAMES) {
             /* The forced unlock. This is the only lever the core exposes:
-             * mcab_reset() (which the unit's reset calls) is the
+             * aec_reset() (which the unit's reset calls) is the
              * sole caller of delay_aec_reset(), and the
              * estimator's REFINED-confidence latch cannot otherwise drop
              * once set. It also puts accepted_delay back to 0 -- which is
@@ -907,7 +945,7 @@ static int test_relock_same_delay_resets_model(void) {
         fill_echo_hop(frame, hop, true_delay, far_hist, far, microphones);
         reset_before_hop = m.reset_calls;
         CHECK(ul4_process_with_activity(
-                  p, microphones, far, 0, out) == MCAB_OK,
+                  p, microphones, far, 0, out) == AEC_OK,
               "relock frame processes");
         CHECK(ul4_last_delay(p, &delay) == 0,
               "delay-state accessor works");
@@ -1046,7 +1084,7 @@ typedef struct ImpulseRun {
     double near_ratio;   /* energy within +-8 of expect_index / total */
 } ImpulseRun;
 
-static int run_impulse(const McabTestUnitConfig* cfg,
+static int run_impulse(const ArrayTestUnitConfig* cfg,
                        const UlcnetModel* model, int impulse_on_mics,
                        int activity, ImpulseRun* r) {
     enum { FRAMES = 40, IMP_FRAME = 8, IMP_OFF = 37 };
@@ -1066,7 +1104,7 @@ static int run_impulse(const McabTestUnitConfig* cfg,
               "install impulse-timestamp model");
     }
     microphones = (float*)calloc(
-        (size_t)hop * MCAB_CHANNELS, sizeof(float));
+        (size_t)hop * AEC_ARRAY_MICS, sizeof(float));
     far = (float*)calloc((size_t)hop, sizeof(float));
     out_hist = (float*)calloc((size_t)FRAMES * hop, sizeof(float));
     CHECK(microphones && far && out_hist,
@@ -1080,18 +1118,18 @@ static int run_impulse(const McabTestUnitConfig* cfg,
     for (int frame = 0; frame < FRAMES; ++frame) {
         memset(far, 0, (size_t)hop * sizeof(float));
         memset(microphones, 0,
-               (size_t)hop * MCAB_CHANNELS * sizeof(float));
+               (size_t)hop * AEC_ARRAY_MICS * sizeof(float));
         if (frame == IMP_FRAME) {
             if (impulse_on_mics) {
-                for (int ch = 0; ch < MCAB_CHANNELS; ++ch)
-                    microphones[IMP_OFF * MCAB_CHANNELS + ch] = 1.0f;
+                for (int ch = 0; ch < AEC_ARRAY_MICS; ++ch)
+                    microphones[IMP_OFF * AEC_ARRAY_MICS + ch] = 1.0f;
             } else {
                 far[IMP_OFF] = 1.0f;
             }
         }
         CHECK(ul4_process_with_activity(
                   p, microphones, far, activity,
-                  out_hist + (size_t)frame * hop) == MCAB_OK,
+                  out_hist + (size_t)frame * hop) == AEC_OK,
               "impulse-timestamp frame processes");
     }
 
@@ -1117,15 +1155,15 @@ static int run_impulse(const McabTestUnitConfig* cfg,
 }
 
 static int test_raw_far_timestamp_after_fixed_delay_lock(void) {
-    McabTestUnitConfig cfg = ulcnet_example_unit_config();
+    ArrayTestUnitConfig cfg = ulcnet_example_unit_config();
     UlcnetModel model;
     ImpulseRun r;
 
     cfg.beam.bf_fixed_mode = 1;
     cfg.beam.bf_fixed_doa_rad = 0.4f;
     cfg.beam.bf_mu = 0.02f;
-    cfg.core.delay_mode = AEC_DELAY_FIXED;
-    cfg.core.fixed_delay_samples = 2 * HOP;
+    cfg.aec_cfg.delay_mode = AEC_DELAY_FIXED;
+    cfg.aec_cfg.fixed_delay_samples = 2 * HOP;
     memset(&model, 0, sizeof(model));
     model.infer = passthrough_far_infer;
     model.io_descriptor = test_io_descriptor();
@@ -1151,14 +1189,14 @@ static int test_raw_far_timestamp_after_fixed_delay_lock(void) {
  *    raises the energy outside the peak neighbourhood to about half. */
 
 static int test_error_timestamp_and_content(void) {
-    McabTestUnitConfig cfg = ulcnet_example_unit_config();
+    ArrayTestUnitConfig cfg = ulcnet_example_unit_config();
     ImpulseRun r;
 
     cfg.beam.bf_fixed_mode = 1;
     cfg.beam.bf_fixed_doa_rad = 0.3f;
     cfg.beam.bf_mu = 0.0f;
-    cfg.core.delay_mode = AEC_DELAY_FIXED;
-    cfg.core.fixed_delay_samples = 0;
+    cfg.aec_cfg.delay_mode = AEC_DELAY_FIXED;
+    cfg.aec_cfg.fixed_delay_samples = 0;
 
     /* Mics carry the impulse, far is silent, NULL model = identity. */
     CHECK(run_impulse(&cfg, NULL, 1, 1, &r), "error-timestamp run");
@@ -1193,11 +1231,11 @@ static int test_error_timestamp_and_content(void) {
 
 static int test_model_applies_unlocked(void) {
     enum { FRAMES = 60, TRUE_DELAY = 400 };
-    McabTestUnitConfig cfg = ulcnet_example_unit_config();
+    ArrayTestUnitConfig cfg = ulcnet_example_unit_config();
     Ul4* p;
     CountingModel m;
     UlcnetModel model;
-    McabDelayState delay;
+    AecDelayState delay;
     float* microphones;
     float* far;
     float* out;
@@ -1232,7 +1270,7 @@ static int test_model_applies_unlocked(void) {
           "install 0.5x model");
 
     microphones = (float*)malloc(
-        (size_t)hop * MCAB_CHANNELS * sizeof(float));
+        (size_t)hop * AEC_ARRAY_MICS * sizeof(float));
     far = (float*)malloc((size_t)hop * sizeof(float));
     out = (float*)malloc((size_t)hop * sizeof(float));
     far_hist = (float*)calloc((size_t)FRAMES * hop, sizeof(float));
@@ -1243,7 +1281,7 @@ static int test_model_applies_unlocked(void) {
         const int frames = 1;   /* one frame per hop, from hop #0 */
         fill_echo_hop(frame, hop, TRUE_DELAY, far_hist, far, microphones);
         CHECK(ul4_process_with_activity(
-                  p, microphones, far, 0, out) == MCAB_OK,
+                  p, microphones, far, 0, out) == AEC_OK,
               "unlocked-model frame processes");
         CHECK(ul4_last_delay(p, &delay) == 0,
               "unlocked-model delay accessor works");
@@ -1332,12 +1370,12 @@ static int nan_infer(
 
 static int test_nan_guard(void) {
     enum { FRAMES = 60, TRUE_DELAY = 400 };
-    McabTestUnitConfig cfg = ulcnet_example_unit_config();
+    ArrayTestUnitConfig cfg = ulcnet_example_unit_config();
     Ul4* pa;
     IdentityTwin twin;   /* NULL model: identity */
     NanModel m;
     UlcnetModel model;
-    McabDelayState delay;
+    AecDelayState delay;
     float* microphones;
     float* far;
     float* out_a;
@@ -1367,7 +1405,7 @@ static int test_nan_guard(void) {
           "install NaN-poisoning model");
 
     microphones = (float*)malloc(
-        (size_t)hop * MCAB_CHANNELS * sizeof(float));
+        (size_t)hop * AEC_ARRAY_MICS * sizeof(float));
     far = (float*)malloc((size_t)hop * sizeof(float));
     out_a = (float*)malloc((size_t)hop * sizeof(float));
     far_hist = (float*)calloc((size_t)FRAMES * hop, sizeof(float));
@@ -1383,7 +1421,7 @@ static int test_nan_guard(void) {
 
         fill_echo_hop(frame, hop, TRUE_DELAY, far_hist, far, microphones);
         CHECK(ul4_process_with_activity(
-                  pa, microphones, far, 0, out_a) == MCAB_OK,
+                  pa, microphones, far, 0, out_a) == AEC_OK,
               "NaN-guard model frame processes");
         CHECK(twin_step(&twin, microphones, far),
               "NaN-guard reference frame processes");
@@ -1480,12 +1518,12 @@ static int partial_write_infer(
 
 static int test_partial_write_guard(void) {
     enum { FRAMES = 60, TRUE_DELAY = 400 };
-    McabTestUnitConfig cfg = ulcnet_example_unit_config();
+    ArrayTestUnitConfig cfg = ulcnet_example_unit_config();
     Ul4* pa;
     IdentityTwin twin;   /* NULL model: identity */
     PartialModel m;
     UlcnetModel model;
-    McabDelayState delay;
+    AecDelayState delay;
     float* microphones;
     float* far;
     float* out_a;
@@ -1515,7 +1553,7 @@ static int test_partial_write_guard(void) {
           "install partial-write model");
 
     microphones = (float*)malloc(
-        (size_t)hop * MCAB_CHANNELS * sizeof(float));
+        (size_t)hop * AEC_ARRAY_MICS * sizeof(float));
     far = (float*)malloc((size_t)hop * sizeof(float));
     out_a = (float*)malloc((size_t)hop * sizeof(float));
     far_hist = (float*)calloc((size_t)FRAMES * hop, sizeof(float));
@@ -1531,7 +1569,7 @@ static int test_partial_write_guard(void) {
 
         fill_echo_hop(frame, hop, TRUE_DELAY, far_hist, far, microphones);
         CHECK(ul4_process_with_activity(
-                  pa, microphones, far, 0, out_a) == MCAB_OK,
+                  pa, microphones, far, 0, out_a) == AEC_OK,
               "partial-write model frame processes");
         CHECK(twin_step(&twin, microphones, far),
               "partial-write reference frame processes");
@@ -1658,10 +1696,10 @@ static void probe_reset(void* user) { ((ProbeModel*)user)->resets += 1; }
  * fixed_delay == RP_T*HOP puts the FIXED raw->aligned switch on hop
  * RP_T. mark_far selects which branch carries the impulse. */
 static int reprime_probe_run(int fixed_delay, int mark_far, ProbeModel* st) {
-    McabTestUnitConfig cfg = ulcnet_example_unit_config();
+    ArrayTestUnitConfig cfg = ulcnet_example_unit_config();
     Ul4* p;
     UlcnetModel model;
-    float microphones[MCAB_CHANNELS * HOP_MAX];
+    float microphones[AEC_ARRAY_MICS * HOP_MAX];
     float far[HOP_MAX];
     float out[HOP_MAX];
 
@@ -1672,8 +1710,8 @@ static int reprime_probe_run(int fixed_delay, int mark_far, ProbeModel* st) {
     cfg.beam.bf_fixed_mode = 1;
     cfg.beam.bf_fixed_doa_rad = 0.3f;
     cfg.beam.bf_mu = 0.0f;
-    cfg.core.delay_mode = AEC_DELAY_FIXED;
-    cfg.core.fixed_delay_samples = fixed_delay;
+    cfg.aec_cfg.delay_mode = AEC_DELAY_FIXED;
+    cfg.aec_cfg.fixed_delay_samples = fixed_delay;
 
     p = ul4_create(&cfg);
     if (!p) return 0;
@@ -1688,20 +1726,20 @@ static int reprime_probe_run(int fixed_delay, int mark_far, ProbeModel* st) {
     }
 
     for (int frame = 0; frame < RP_RUN; ++frame) {
-        memset(microphones, 0, (size_t)MCAB_CHANNELS * HOP * sizeof(float));
+        memset(microphones, 0, (size_t)AEC_ARRAY_MICS * HOP * sizeof(float));
         memset(far, 0, (size_t)HOP * sizeof(float));
         if (frame == RP_MARK_HOP) {
             if (mark_far) {
                 far[RP_MARK_POS] = 1.0f;
             } else {
-                for (int ch = 0; ch < MCAB_CHANNELS; ++ch)
-                    microphones[RP_MARK_POS * MCAB_CHANNELS + ch] =
+                for (int ch = 0; ch < AEC_ARRAY_MICS; ++ch)
+                    microphones[RP_MARK_POS * AEC_ARRAY_MICS + ch] =
                         1.0f;
             }
         }
         st->hop = frame;
         if (ul4_process_with_activity(
-                p, microphones, far, 1, out) != MCAB_OK) {
+                p, microphones, far, 1, out) != AEC_OK) {
             ul4_destroy(p);
             return 0;
         }
@@ -1852,11 +1890,11 @@ static int test_reprime_straddle_derivation(void) {
 
 static int test_reprime_behavior(void) {
     enum { FRAMES = 120, TRUE_DELAY = 400, FIXED_HOPS = 8 };
-    McabTestUnitConfig cfg = ulcnet_example_unit_config();
+    ArrayTestUnitConfig cfg = ulcnet_example_unit_config();
     Ul4* p;
     CountingModel m;
     UlcnetModel model;
-    McabDelayState delay;
+    AecDelayState delay;
     float* microphones;
     float* far;
     float* out;
@@ -1887,7 +1925,7 @@ static int test_reprime_behavior(void) {
           "install counting model (reprime behaviour)");
 
     microphones = (float*)malloc(
-        (size_t)hop * MCAB_CHANNELS * sizeof(float));
+        (size_t)hop * AEC_ARRAY_MICS * sizeof(float));
     far = (float*)malloc((size_t)hop * sizeof(float));
     out = (float*)malloc((size_t)hop * sizeof(float));
     far_hist = (float*)calloc((size_t)FRAMES * hop, sizeof(float));
@@ -1903,7 +1941,7 @@ static int test_reprime_behavior(void) {
 
         fill_echo_hop(frame, hop, TRUE_DELAY, far_hist, far, microphones);
         CHECK(ul4_process_with_activity(
-                  p, microphones, far, 0, out) == MCAB_OK,
+                  p, microphones, far, 0, out) == AEC_OK,
               "reprime-behaviour frame processes");
         CHECK(ul4_last_delay(p, &delay) == 0,
               "reprime-behaviour delay accessor works");
@@ -1944,12 +1982,12 @@ static int test_reprime_behavior(void) {
 
     /* ---- FIXED ring-fill completion ---- */
     {
-        McabTestUnitConfig fcfg =
+        ArrayTestUnitConfig fcfg =
             ulcnet_example_unit_config();
         Ul4* fp;
         CountingModel fm;
         UlcnetModel fmodel;
-        float mics[MCAB_CHANNELS * HOP_MAX];
+        float mics[AEC_ARRAY_MICS * HOP_MAX];
         float ffar[HOP_MAX];
         float fout[HOP_MAX];
         int fixed_boundary = -1;
@@ -1958,8 +1996,8 @@ static int test_reprime_behavior(void) {
         long fskipped = 0;
         int farmed = 0;
 
-        fcfg.core.delay_mode = AEC_DELAY_FIXED;
-        fcfg.core.fixed_delay_samples = FIXED_HOPS * HOP;
+        fcfg.aec_cfg.delay_mode = AEC_DELAY_FIXED;
+        fcfg.aec_cfg.fixed_delay_samples = FIXED_HOPS * HOP;
         fp = ul4_create(&fcfg);
         CHECK(fp != NULL, "create FIXED reprime-behaviour pipeline");
         memset(&fm, 0, sizeof(fm));
@@ -1972,9 +2010,9 @@ static int test_reprime_behavior(void) {
         CHECK(ul4_set_model(fp, &fmodel) == 0,
               "install counting model (FIXED reprime behaviour)");
 
-        memset(mics, 0, (size_t)MCAB_CHANNELS * HOP * sizeof(float));
+        memset(mics, 0, (size_t)AEC_ARRAY_MICS * HOP * sizeof(float));
         for (int frame = 0; frame < 20; ++frame) {
-            McabDelayState fdelay;
+            AecDelayState fdelay;
             const int frames = 1;   /* one frame per hop, from hop #0 */
             long calls_before = fm.infer_calls;
             int solid_before;
@@ -1986,7 +2024,7 @@ static int test_reprime_behavior(void) {
             solid_before = fdelay.solid;
             for (int i = 0; i < HOP; ++i) ffar[i] = 0.25f * frand();
             CHECK(ul4_process_with_activity(
-                      fp, mics, ffar, 0, fout) == MCAB_OK,
+                      fp, mics, ffar, 0, fout) == AEC_OK,
                   "FIXED reprime frame processes");
             CHECK(ul4_last_delay(fp, &fdelay) == 0,
                   "FIXED reprime: delay accessor works after the hop");
@@ -2040,7 +2078,7 @@ static int gate_infer_identity(
 }
 
 static int test_raw_descriptor_gate(void) {
-    McabTestUnitConfig cfg = ulcnet_example_unit_config();
+    ArrayTestUnitConfig cfg = ulcnet_example_unit_config();
     Ul4* p;
     UlcnetModelIoDescriptor raw_desc;
     UlcnetModelIoDescriptor aligned_desc;
@@ -2122,7 +2160,7 @@ static int phased_fail_infer(void* user,
 
 static int phased_twin_matches(int mode, int frames) {
     enum { TRUE_DELAY = 400 };
-    McabTestUnitConfig cfg = ulcnet_example_unit_config();
+    ArrayTestUnitConfig cfg = ulcnet_example_unit_config();
     Ul4 *ph, *cb;
     UlcnetModel model;
     UlcnetNnJob job;
@@ -2144,7 +2182,7 @@ static int phased_twin_matches(int mode, int frames) {
         if (ul4_set_model(cb, &model) != 0) return 0;
     }
     hop = ul4_hop_size(ph);
-    mics = (float*)malloc((size_t)hop * MCAB_CHANNELS * sizeof(float));
+    mics = (float*)malloc((size_t)hop * AEC_ARRAY_MICS * sizeof(float));
     far = (float*)malloc((size_t)hop * sizeof(float));
     far_hist = (float*)calloc((size_t)frames * hop, sizeof(float));
     a = (float*)malloc((size_t)hop * sizeof(float));
@@ -2152,8 +2190,8 @@ static int phased_twin_matches(int mode, int frames) {
     for (int f = 0; f < frames && ok; ++f) {
         int r = 0;
         fill_echo_hop(f, hop, TRUE_DELAY, far_hist, far, mics);
-        ok = ul4_process_with_activity(cb, mics, far, 0, b) == MCAB_OK &&
-             ul4_process_begin(ph, mics, far, 0) == MCAB_OK;
+        ok = ul4_process_with_activity(cb, mics, far, 0, b) == AEC_OK &&
+             ul4_process_begin(ph, mics, far, 0) == AEC_OK;
         if (!ok) break;
         if (mode != PH_UNFETCHED) {
             r = ul4_nn_begin(ph, &job);
@@ -2164,15 +2202,15 @@ static int phased_twin_matches(int mode, int frames) {
             if (mode == PH_RUN)
                 ok = phased_half_infer(NULL, job.err_re, job.err_im, job.far_re, job.far_im,
                                        job.out_re, job.out_im) == 0 &&
-                     ul4_nn_end(ph, 0) == MCAB_OK;
+                     ul4_nn_end(ph, 0) == AEC_OK;
             else if (mode == PH_FAIL)
-                ok = ul4_nn_end(ph, -1) == MCAB_OK;
+                ok = ul4_nn_end(ph, -1) == AEC_OK;
             else if (mode == PH_NAN)
                 ok = phased_half_infer(&poison_tag, job.err_re, job.err_im, job.far_re, job.far_im,
                                        job.out_re, job.out_im) == 0 &&
-                     ul4_nn_end(ph, 0) == MCAB_OK;
+                     ul4_nn_end(ph, 0) == AEC_OK;
         }
-        ok = ok && ul4_process_end(ph, a) == MCAB_OK;
+        ok = ok && ul4_process_end(ph, a) == AEC_OK;
         if (!ok) break;
         if (memcmp(a, b, (size_t)hop * sizeof(float)) != 0) ok = 0;
         for (int i = 0; i < hop; ++i) if (a[i] != 0.0f) nonzero = 1;
@@ -2201,32 +2239,41 @@ static int test_phased_hop(void) {
  * ========================================================================== */
 
 static int test_example_unit_config_grid(void) {
-    McabTestUnitConfig cfg = ulcnet_example_unit_config();
+    ArrayTestUnitConfig cfg = ulcnet_example_unit_config();
     const UlcnetGrid og = other_grid();
-    McabTestUnitConfig other = mcab_test_unit_default_config(og.sample_rate);
-    McabSampleBeam* unit;
-    McabFrame frame;
+    ArrayTestUnitConfig other = array_test_unit_default_config(og.sample_rate);
+    ArraySampleBeam* unit;
+    AecResidualView frame;
 
     CHECK(og.n_fft != 0 && og.n_fft != g_grid.n_fft, "the grid table has a second row");
-    CHECK(cfg.core.sample_rate == g_grid.sample_rate && cfg.core.fft_size == g_grid.n_fft &&
-          cfg.core.enable_post == 0,
-          "example unit config: the stage's grid, enable_post = 0");
-    unit = mcab_test_beam_create(&cfg);
+    CHECK(cfg.aec_cfg.sample_rate == g_grid.sample_rate && cfg.aec_cfg.fft_size == g_grid.n_fft &&
+          cfg.aec_cfg.residual == AEC_RESIDUAL_STATE,
+          "example unit config: the stage's grid, lanes only (AEC_RESIDUAL_STATE)");
+    unit = array_test_beam_create(&cfg);
     CHECK(unit != NULL && unit_matches_stage(unit, &g_grid),
           "example unit: hop, bins, FFT size and rate are the stage's");
-    CHECK(mcab_sample_rate(mcab_test_beam_flow(unit)) == g_grid.sample_rate,
+    CHECK(array_test_sample_rate(array_test_beam_aec(unit)) == g_grid.sample_rate,
           "example unit: sample rate is the stage's");
-    CHECK(mcab_sample_beam_fuse(unit, &frame) == MCAB_INVALID_ARGUMENT,
-          "example unit: fuse is refused without the post lanes (enable_post = 0)");
-    mcab_test_beam_destroy(unit);
+    CHECK(array_sample_beam_fuse(unit, &frame) == AEC_ERR_SEQUENCE,
+          "example unit: fuse is refused without a beam of this hop");
+    {   /* with a beam of this hop the lanes-only array refuses the fusion itself */
+        AecArrayView front;
+        ArraySampleBeamResult beam;
+        float mic[AEC_ARRAY_MICS * HOP_MAX] = {0}, far[HOP_MAX] = {0};
+        CHECK(array_sample_beam_process_front(unit, mic, far, &front) == AEC_OK &&
+              array_sample_beam_process_beam(unit, &front, 0, 0, NULL, &beam, NULL) == AEC_OK &&
+              array_sample_beam_fuse(unit, &frame) == AEC_ERR_MODE,
+              "example unit: fuse is refused on a lanes-only array (AEC_RESIDUAL_STATE)");
+    }
+    array_test_beam_destroy(unit);
 
-    other.core.fft_size = og.n_fft;
-    other.core.enable_post = 0;
-    unit = mcab_test_beam_create(&other);
+    other.aec_cfg.fft_size = og.n_fft;
+    other.aec_cfg.residual = AEC_RESIDUAL_STATE;
+    unit = array_test_beam_create(&other);
     CHECK(unit != NULL, "a unit of the other grid builds");
     CHECK(unit != NULL && !unit_matches_stage(unit, &g_grid),
           "the other grid's unit does not fit the stage");
-    mcab_test_beam_destroy(unit);
+    array_test_beam_destroy(unit);
     CHECK(ul4_create(&other) == NULL, "the composition refuses a unit of the other grid");
     CHECK(ul4_create_for(&cfg, &og) == NULL,
           "the composition refuses a stage of the other grid");
@@ -2240,15 +2287,16 @@ static int test_example_unit_config_grid(void) {
  *    reusable after destroy.
  * ========================================================================== */
 
-static Ul4* ul4_in_pools(void* unit_pool, size_t unit_bytes, const McabTestUnitConfig* cfg,
-                         const McabMemReq* req, void* stage_pool,
+static Ul4* ul4_in_pools(void* unit_pool, size_t unit_bytes, const ArrayTestUnitConfig* cfg,
+                         const AecMemReq* req, void* stage_pool,
                          size_t stage_bytes) {
     Ul4* p = (Ul4*)calloc(1, sizeof(*p));
     if (!p) return NULL;
     (void)req;
-    p->unit = mcab_test_beam_init(unit_pool, unit_bytes, cfg);
-    p->stage = ulcnet_nn_stage_init(stage_pool, stage_bytes, &g_grid, 0);
+    p->unit = array_test_beam_init(unit_pool, unit_bytes, cfg);
+    p->stage = frm_init(&p->frm, &g_grid) == 0 ? ulcnet_nn_stage_init(stage_pool, stage_bytes, &g_grid) : NULL;
     if (!p->unit || !p->stage) {
+        frm_free(&p->frm);
         free(p);
         return NULL;
     }
@@ -2257,18 +2305,18 @@ static Ul4* ul4_in_pools(void* unit_pool, size_t unit_bytes, const McabTestUnitC
 
 static int test_create_vs_pool_parity(void) {
     enum { EXTRA = 32, FRAMES = 40, TRUE_DELAY = 400 };
-    McabTestUnitConfig cfg = ulcnet_example_unit_config();
-    McabMemReq req;
+    ArrayTestUnitConfig cfg = ulcnet_example_unit_config();
+    AecMemReq req;
     UlcnetModel model;
     Ul4 *heap, *pooled;
     unsigned char *unit_pool = NULL, *stage_pool = NULL;
-    size_t stage_bytes = ulcnet_nn_stage_mem_size(&g_grid, 0);
+    size_t stage_bytes = ulcnet_nn_stage_mem_size(&g_grid);
     float *mics, *far, *far_hist, *oh, *op;
     size_t k;
     int hop;
 
     cfg.beam.bf_mu = 0.02f;
-    CHECK(mcab_test_unit_get_mem_requirements(&cfg, &req) == 0 && stage_bytes != 0,
+    CHECK(array_test_unit_get_mem_requirements(&cfg, &req) == 0 && stage_bytes != 0,
           "pool queries succeed");
     CHECK(posix_memalign((void**)&unit_pool, req.alignment, (size_t)req.bytes + EXTRA) == 0 &&
               posix_memalign((void**)&stage_pool, 16, stage_bytes + EXTRA) == 0,
@@ -2287,7 +2335,7 @@ static int test_create_vs_pool_parity(void) {
           "the model installs on both");
 
     hop = ul4_hop_size(heap);
-    mics = (float*)malloc((size_t)hop * MCAB_CHANNELS * sizeof(float));
+    mics = (float*)malloc((size_t)hop * AEC_ARRAY_MICS * sizeof(float));
     far = (float*)malloc((size_t)hop * sizeof(float));
     far_hist = (float*)calloc((size_t)FRAMES * hop, sizeof(float));
     oh = (float*)malloc((size_t)hop * sizeof(float));
@@ -2296,8 +2344,8 @@ static int test_create_vs_pool_parity(void) {
     g_rng = 0x7A11E5u;
     for (int frame = 0; frame < FRAMES; ++frame) {
         fill_echo_hop(frame, hop, TRUE_DELAY, far_hist, far, mics);
-        CHECK(ul4_process_with_activity(heap, mics, far, 0, oh) == MCAB_OK &&
-              ul4_process_with_activity(pooled, mics, far, 0, op) == MCAB_OK,
+        CHECK(ul4_process_with_activity(heap, mics, far, 0, oh) == AEC_OK &&
+              ul4_process_with_activity(pooled, mics, far, 0, op) == AEC_OK,
               "heap and pool instances process");
         CHECK(memcmp(oh, op, (size_t)hop * sizeof(float)) == 0,
               "heap/pool output is byte-identical");
@@ -2306,11 +2354,13 @@ static int test_create_vs_pool_parity(void) {
         if (unit_pool[(size_t)req.bytes + k] != 0xa5 || stage_pool[stage_bytes + k] != 0xa5) break;
     CHECK(k == (size_t)EXTRA, "init stays inside both queried pools");
 
-    mcab_test_beam_destroy(pooled->unit);
+    array_test_beam_destroy(pooled->unit);
+    frm_free(&pooled->frm);
     free(pooled);
     pooled = ul4_in_pools(unit_pool, (size_t)req.bytes, &cfg, &req, stage_pool, stage_bytes);
     CHECK(pooled != NULL, "the caller pools are reusable after destroy");
-    mcab_test_beam_destroy(pooled->unit);
+    array_test_beam_destroy(pooled->unit);
+    frm_free(&pooled->frm);
     free(pooled);
     ul4_destroy(heap);
     free(oh); free(op); free(far_hist); free(far); free(mics);
@@ -2363,7 +2413,7 @@ enum { RC_STAGE_SEQUENCE, RC_UNIT_NONFINITE, RC_OPEN_FRAME };
 static int run_scene(Ul4* p, int frames, float* out_all) {
     enum { TRUE_DELAY = 400 };
     int hop = ul4_hop_size(p);
-    float* mics = (float*)malloc((size_t)hop * MCAB_CHANNELS * sizeof(float));
+    float* mics = (float*)malloc((size_t)hop * AEC_ARRAY_MICS * sizeof(float));
     float* far = (float*)malloc((size_t)hop * sizeof(float));
     float* far_hist = (float*)calloc((size_t)frames * hop, sizeof(float));
     int ok = mics && far && far_hist;
@@ -2371,7 +2421,7 @@ static int run_scene(Ul4* p, int frames, float* out_all) {
     for (int f = 0; ok && f < frames; ++f) {
         fill_echo_hop(f, hop, TRUE_DELAY, far_hist, far, mics);
         ok = ul4_process_with_activity(p, mics, far, (f / 7) % 2,
-                                       out_all + (size_t)f * hop) == MCAB_OK;
+                                       out_all + (size_t)f * hop) == AEC_OK;
     }
     free(mics); free(far); free(far_hist);
     return ok;
@@ -2379,7 +2429,7 @@ static int run_scene(Ul4* p, int frames, float* out_all) {
 
 static int recovery_case(int refusal) {
     enum { PRE = 70, POST = 80 };
-    McabTestUnitConfig cfg = ulcnet_example_unit_config();
+    ArrayTestUnitConfig cfg = ulcnet_example_unit_config();
     Ul4 *a, *b;
     StatefulModel ma, mb;
     UlcnetModel model;
@@ -2404,7 +2454,7 @@ static int recovery_case(int refusal) {
     CHECK(ul4_set_model(b, &model) == 0, "recovery: model installs on the fresh pair");
     oa = (float*)malloc((size_t)(PRE > POST ? PRE : POST) * hop * sizeof(float));
     ob = (float*)malloc((size_t)POST * hop * sizeof(float));
-    mics = (float*)calloc((size_t)hop * MCAB_CHANNELS, sizeof(float));
+    mics = (float*)calloc((size_t)hop * AEC_ARRAY_MICS, sizeof(float));
     far = (float*)calloc((size_t)hop, sizeof(float));
     CHECK(oa && ob && mics && far, "recovery: buffers allocate");
 
@@ -2414,17 +2464,17 @@ static int recovery_case(int refusal) {
 
     switch (refusal) {
     case RC_STAGE_SEQUENCE:
-        CHECK(ul4_process_begin(a, mics, far, 0) == MCAB_OK &&
+        CHECK(ul4_process_begin(a, mics, far, 0) == AEC_OK &&
               ul4_process_begin(a, mics, far, 0) == ULCNET_NN_STAGE_SEQUENCE_ERROR,
               "recovery: a second stage begin in one hop is refused");
         break;
     case RC_UNIT_NONFINITE:
         mics[3] = NAN;
-        CHECK(ul4_process_with_activity(a, mics, far, 0, oa) == MCAB_INVALID_ARGUMENT,
+        CHECK(ul4_process_with_activity(a, mics, far, 0, oa) == AEC_ERR_ARG,
               "recovery: a non-finite sample is refused by the unit");
         break;
     default:
-        CHECK(ul4_process_begin(a, mics, far, 0) == MCAB_OK &&
+        CHECK(ul4_process_begin(a, mics, far, 0) == AEC_OK &&
               ul4_nn_begin(a, &job) == 1,
               "recovery: a model frame is opened and left open");
         break;
@@ -2461,7 +2511,7 @@ static int test_recovery_equals_fresh_pair(void) {
 
 /* ============================================================================
  * 18. Complex-spectrum entry vs an independent per-sample accumulate reference
- *     (begin_complex with the front end's beamformed spectrum and the raw far).
+ *     (begin_spec with the front end's beamformed spectrum and the far spectrum the application analysed).
  *     The expected PCM is built by the TEST: the spectrum the stage was handed (or, where the
  *     model ran and was accepted, the same spectrum through the band mask) goes through
  *     (a) its own AcIstft in accumulate mode, bit for bit, and (b) a direct inverse DFT in
@@ -2539,7 +2589,7 @@ static UlcnetNnDelay cx_event(const CxScn* sc, int h) {
 
 /* One recorded upstream: the four-channel input and the beamformed spectrum the front end made. */
 typedef struct CxIn {
-    float mic[CX_MAX_HOPS][HOP_MAX * MCAB_CHANNELS];
+    float mic[CX_MAX_HOPS][HOP_MAX * AEC_ARRAY_MICS];
     float far[CX_MAX_HOPS][HOP_MAX];
     float re[CX_MAX_HOPS][BINS_MAX], im[CX_MAX_HOPS][BINS_MAX];
 } CxIn;
@@ -2561,25 +2611,25 @@ static void cx_make_input(CxIn* in, int hops) {
         for (int i = 0; i < HOP; ++i) {
             float src = 0.3f * frand();
             in->far[h][i] = 0.25f * frand();
-            for (int ch = 0; ch < MCAB_CHANNELS; ++ch)
-                in->mic[h][i * MCAB_CHANNELS + ch] = src * (1.0f - 0.02f * ch) + 0.05f * frand();
+            for (int ch = 0; ch < AEC_ARRAY_MICS; ++ch)
+                in->mic[h][i * AEC_ARRAY_MICS + ch] = src * (1.0f - 0.02f * ch) + 0.05f * frand();
         }
     }
 }
 
-static McabTestUnitConfig cx_unit_config(void) {
-    McabTestUnitConfig cfg = ulcnet_example_unit_config();
+static ArrayTestUnitConfig cx_unit_config(void) {
+    ArrayTestUnitConfig cfg = ulcnet_example_unit_config();
     cfg.beam.bf_fixed_mode = 1;
     cfg.beam.bf_fixed_doa_rad = 0.4f;
     cfg.beam.bf_mu = 0.02f;
-    cfg.core.delay_mode = AEC_DELAY_FIXED;
-    cfg.core.fixed_delay_samples = 0;
+    cfg.aec_cfg.delay_mode = AEC_DELAY_FIXED;
+    cfg.aec_cfg.fixed_delay_samples = 0;
     return cfg;
 }
 
 /* mode 0: front end makes the spectrum (recorded into `in`); 1: feed in->re/im straight to the
  * stage; 2: re-run the front end on in->mic/far and count spectra that differ from the record. */
-static int cx_drive(Ul4* p, UlcnetNnStage* stage, const CxScn* sc, CxIn* in, int mode, CxModel* m,
+static int cx_drive(Ul4* p, UlcnetNnStage* stage, Frm* frm, const CxScn* sc, CxIn* in, int mode, CxModel* m,
                     CxRun* r, int* spec_diff) {
     memset(r, 0, sizeof(*r));
     if (spec_diff) *spec_diff = 0;
@@ -2590,10 +2640,10 @@ static int cx_drive(Ul4* p, UlcnetNnStage* stage, const CxScn* sc, CxIn* in, int
         if (mode == 1) {
             for (int k = 0; k < BINS; ++k) { c[k].r = in->re[h][k]; c[k].i = in->im[h][k]; }
         } else {
-            McabSampleBeamResult beam;
-            McabSampleBeamInfo info;
-            CHECK(mcab_sample_beam_process_with_activity(p->unit, in->mic[h], in->far[h], 0, 0, NULL,
-                                                         &beam, &info) == MCAB_OK,
+            ArraySampleBeamResult beam;
+            ArraySampleBeamInfo info;
+            CHECK(array_sample_beam_process_with_activity(p->unit, in->mic[h], in->far[h], 0, 0, NULL,
+                                                         &beam, &info) == AEC_OK,
                   "complex entry: front end hop");
             for (int k = 0; k < BINS; ++k) c[k] = beam.spectrum[k];
             if (mode == 0) {
@@ -2603,8 +2653,10 @@ static int cx_drive(Ul4* p, UlcnetNnStage* stage, const CxScn* sc, CxIn* in, int
                     if (in->re[h][k] != c[k].r || in->im[h][k] != c[k].i) { (*spec_diff)++; break; }
             }
         }
-        CHECK(ulcnet_nn_stage_begin_complex(stage, c, in->far[h], cx_event(sc, h)) == 0 &&
-              ulcnet_nn_stage_process(stage, r->out[h]) == 0, "complex entry: stage hop");
+        (void)ac_stft_push(frm->far_stft, in->far[h], frm->far_spec);
+        CHECK(ulcnet_nn_stage_begin_spec(stage, c, frm->far_spec, cx_event(sc, h)) == 0 &&
+              ulcnet_nn_stage_process(stage, frm->out_spec) == 0 && frm_synth(frm, HOP, r->out[h]) == 0,
+              "complex entry: stage hop");
         r->ran[h] = m->calls > before;
         r->accepted[h] = r->ran[h] && !m->fail;
     }
@@ -2648,11 +2700,12 @@ static int cx_check(const CxScn* sc, const CxIn* in, CxRun* r) {
     return 1;
 }
 
-static int cx_fresh_stage(void** mem, UlcnetNnStage** st, CxModel* m, UlcnetModel* um, int use_model) {
-    size_t bytes = ulcnet_nn_stage_mem_size(&g_grid, 0);
+static int cx_fresh_stage(void** mem, UlcnetNnStage** st, Frm* frm, CxModel* m, UlcnetModel* um, int use_model) {
+    size_t bytes = ulcnet_nn_stage_mem_size(&g_grid);
+    CHECK(frm_init(frm, &g_grid) == 0, "complex entry: application framing");
     CHECK(bytes != 0 && posix_memalign(mem, 16, bytes) == 0, "complex entry: stage memory");
     memset(*mem, 0x5A, bytes);
-    *st = ulcnet_nn_stage_init(*mem, bytes, &g_grid, 0);
+    *st = ulcnet_nn_stage_init(*mem, bytes, &g_grid);
     CHECK(*st != NULL, "complex entry: stage init");
     memset(m, 0, sizeof(*m));
     memset(um, 0, sizeof(*um));
@@ -2665,16 +2718,18 @@ static int cx_fresh_stage(void** mem, UlcnetNnStage** st, CxModel* m, UlcnetMode
 }
 
 static int cx_case(const char* name, const CxScn* sc, CxIn* in, CxRun* r) {
-    McabTestUnitConfig cfg = cx_unit_config();
+    ArrayTestUnitConfig cfg = cx_unit_config();
     Ul4* p = ul4_create(&cfg);
     void* mem = NULL;
     UlcnetNnStage* stage = NULL;
     CxModel m;
     UlcnetModel um;
+    Frm frm;
     int ok;
     CHECK(p != NULL, "complex entry: create the front end");
-    ok = cx_fresh_stage(&mem, &stage, &m, &um, sc->use_model);
-    if (ok) ok = cx_drive(p, stage, sc, in, 0, &m, r, NULL) && cx_check(sc, in, r);
+    ok = cx_fresh_stage(&mem, &stage, &frm, &m, &um, sc->use_model);
+    if (ok) ok = cx_drive(p, stage, &frm, sc, in, 0, &m, r, NULL) && cx_check(sc, in, r);
+    frm_free(&frm);
     free(mem);
     ul4_destroy(p);
     if (!ok) return 0;
@@ -2737,18 +2792,19 @@ static int test_complex_entry_accumulate(void) {
     sc = (CxScn){ .hops = 20, .use_model = 1, .changed_at = 5, .solid_off_at = -1, .solid_back_at = -1,
                   .fail_from = -1, .fail_to = -1 };
     {
-        McabTestUnitConfig cfg = cx_unit_config();
+        ArrayTestUnitConfig cfg = cx_unit_config();
         Ul4* p = ul4_create(&cfg);
         void *m1 = NULL, *m2 = NULL;
         UlcnetNnStage *s1 = NULL, *s2 = NULL;
+        Frm f1, f2;
         CxModel ma, mb;
         UlcnetModel ua, ub;
         static CxRun first, replay, fresh, e2e;
         int spec_diff = 0;
         CHECK(p != NULL, "complex entry: reset case front end");
-        CHECK(cx_fresh_stage(&m1, &s1, &ma, &ua, 1) && cx_fresh_stage(&m2, &s2, &mb, &ub, 1),
+        CHECK(cx_fresh_stage(&m1, &s1, &f1, &ma, &ua, 1) && cx_fresh_stage(&m2, &s2, &f2, &mb, &ub, 1),
               "complex entry: reset case stages");
-        CHECK(cx_drive(p, s1, &sc, &in, 0, &ma, &first, NULL) && cx_check(&sc, &in, &first),
+        CHECK(cx_drive(p, s1, &f1, &sc, &in, 0, &ma, &first, NULL) && cx_check(&sc, &in, &first),
               "complex entry: reset case first pass");
         {   /* overlap is non-zero at the reset */
             double e = 0.0;
@@ -2758,11 +2814,12 @@ static int test_complex_entry_accumulate(void) {
         /* (a) the stage alone, same recorded spectra */
         ma.calls = 0; ma.resets = 0;
         ulcnet_nn_stage_reset(s1);
+        frm_reset(&f1);   /* the stage keeps no transform history: the application's objects restart with it */
         CHECK(ma.resets == 1, "complex entry: stage reset resets the model once");
         ma.resets = 0;
-        CHECK(cx_drive(NULL, s1, &sc, &in, 1, &ma, &replay, NULL) && cx_check(&sc, &in, &replay),
+        CHECK(cx_drive(NULL, s1, &f1, &sc, &in, 1, &ma, &replay, NULL) && cx_check(&sc, &in, &replay),
               "complex entry: stage replay");
-        CHECK(cx_drive(NULL, s2, &sc, &in, 1, &mb, &fresh, NULL) && cx_check(&sc, &in, &fresh),
+        CHECK(cx_drive(NULL, s2, &f2, &sc, &in, 1, &mb, &fresh, NULL) && cx_check(&sc, &in, &fresh),
               "complex entry: fresh stage pass");
         CHECK(memcmp(replay.out, fresh.out, sizeof(replay.out)) == 0 &&
               memcmp(replay.out, first.out, sizeof(replay.out)) == 0,
@@ -2778,13 +2835,15 @@ static int test_complex_entry_accumulate(void) {
          * the front end regenerates the spectrum from the same four-channel input */
         ma.calls = 0; ma.resets = 0;
         ulcnet_nn_stage_reset(s1);
+        frm_reset(&f1);
         ul4_reset(p);
         ma.resets = 0;
-        CHECK(cx_drive(p, s1, &sc, &in, 2, &ma, &e2e, &spec_diff) && cx_check(&sc, &in, &e2e),
+        CHECK(cx_drive(p, s1, &f1, &sc, &in, 2, &ma, &e2e, &spec_diff) && cx_check(&sc, &in, &e2e),
               "complex entry: end-to-end replay after the paired reset");
         CHECK(spec_diff == 0, "complex entry: the reset front end regenerates the same beamformed spectrum");
         CHECK(memcmp(e2e.out, first.out, sizeof(e2e.out)) == 0 && e2e.calls == first.calls,
               "complex entry: end-to-end PCM and submission count equal the first pass");
+        frm_free(&f1); frm_free(&f2);
         free(m1); free(m2);
         ul4_destroy(p);
     }

@@ -44,7 +44,7 @@ make -C pipelines check-pins         # verify AEC_DIR/NR_DIR/AUDIOLIB_DIR match 
 ```bash
 # Build conventional mono examples + the DFN2 stage archive
 make -C pipelines
-# Build the 4-channel mcab flow archive + examples
+# Build the 4-channel (AEC array instance) examples
 make -C pipelines/4ch
 
 # Tests (every C library/pipeline target takes SIMD=1 (default) / SIMD=0 (forced scalar, for
@@ -92,7 +92,7 @@ a forwarding compat header at the old public-header path for out-of-tree board s
 | `stream/aiaec` (`aiaec.h`) | The customer-facing entry over DeepVQE-S and Align-ULCNet (PCM, `_spec` and `_freq` families): `aiaec_init(cfg, pool, bytes, &ctx, &info)` returns 0 or a negative `AIAEC_ERR_*` and fills the slim `AiaecInfo` (`graph_path`, `trim_samples`, `queue_frames`, `tail_zero_blocks`; N is `cfg.hop_in / (cfg.fft / 2)`, computed by the caller). |
 | `stream/aiaec/ulcnet` | Feed the linear AEC's float residual and raw far to `ulcnet_stream_pre_process_f32()`. An int16 entry is also available. Reprime after an alignment change, and pass the error spectrum through on bypass. In a packet stream (`frames_per_call` N >= 2) an alignment event hop restarts the model in the graph and, on the PCM entries, the stream's own analysis and synthesis at that hop (`ulcnet_stream_restart_mask()`), so N = 8 PCM equals the N = 1 stream sample for sample; the spectrum entries keep continuous overlap. |
 
-`ainr.h` / `aiaec.h` report no graph ports: `AinrInfo` / `AiaecInfo` carry only the selected `graph_path` and the trim/queue/tail lengths, and `AinrWork` / `AiaecWork` hold the block's signal and head tensors. The graph wiring (signal, head and state shapes per registered `(model, sr, fft, N)`) is the board sample's model configuration: the per-graph tables `ai3_model_io_<model>.h` next to each library (`stream/ainr/ai3_model_io_dfn2.h`, `stream/aiaec/ai3_model_io_{deepvqes,alignulcnet}.h`; header-only, not included by `ainr.h` / `aiaec.h`) and the shared helper `stream/common/ai3_model_io.h` (tested by `make -C stream/common test-model-io`); samples add `-I stream/common -I stream/ainr|stream/aiaec`. The SDK-free checker `StreamWiring` / `StreamDeviceDesc` / `stream_check_ports()` (`stream/common/stream_bind.{h,c}`) is compiled by samples only, and `StreamMemReq` lives in `stream/common/stream_mem.h`. A board sample binds by index, never by name: inputs = signal inputs, then state inputs; outputs = head outputs, then state outputs; state k is input `signal_in_count + k` and output `head_out_count + k`. Align-ULCNet at N > 1 has `frame_reset` as the last signal input; the stream fills it in `AiaecWork` and the sample moves it like any other signal. The sample checks every block's work against its row before the accelerator call (a mismatch means no run and a failed post) and the opened graph's ports once after opening; fixed-point state ports need `zero_point` 0 at both ends. `docs/maintenance/graph-wiring.md` has the details and the pins.
+`ainr.h` / `aiaec.h` report no graph ports: `AinrInfo` / `AiaecInfo` carry only the selected `graph_path` and the trim/queue/tail lengths, and `AinrWork` / `AiaecWork` hold the block's signal and head tensors. The graph wiring (signal, head and state shapes per registered `(model, sr, fft, N)`) is the board sample's model configuration: the per-graph tables `ai3_model_io_<model>.h` next to each library (`stream/ainr/ai3_model_io_dfn2.h`, `stream/aiaec/ai3_model_io_{deepvqes,alignulcnet}.h`; header-only, not included by `ainr.h` / `aiaec.h`) and the shared helper `stream/common/ai3_model_io.h` (tested by `make -C stream/common test-model-io`); samples add `-I stream/common -I stream/ainr|stream/aiaec`. The SDK-free checker `StreamWiring` / `StreamDeviceDesc` / `stream_check_ports()` (`stream/common/stream_bind.{h,c}`) is compiled by samples only, and `StreamMemReq` lives in `stream/common/stream_mem.h`. A board sample binds by index, never by name: inputs = signal inputs, then state inputs; outputs = head outputs, then state outputs; state k is input `signal_in_count + k` and output `head_out_count + k`. Align-ULCNet at N > 1 has `frame_reset` as the last signal input; the stream fills it in `AiaecWork` and the sample moves it like any other signal. The sample checks every block's work against its row before the accelerator call (a mismatch means no run and a failed post) and the opened graph's ports once after opening; fixed-point state ports need `zero_point` 0 at both ends. Float I/O is a compile-time choice of the AI3 samples (`FLOAT_IN` / `FLOAT_OUT`, default 0; the model stays fixed point and the hardware converts at the boundary). These models inherit the state port types, so set both alike (a mixed setting only warns); the samples print the reported port types at start-up for the board A/B (`docs/maintenance/float-io-board-ab.md`). `docs/maintenance/graph-wiring.md` has the details and the pins.
 
 DFN3, GTCRN and RNNoise-ERB expose frequency-domain cores. CAGCRN and Align-CRUSE provide mask helpers. Existing spectrum-level callers can use `pipelines/dfn/dfn_res_stage.h`, `dfn_rate_bridge.h`, or `pipelines/ulcnet/ulcnet_nn_stage.h`. The [model manual](docs/html/models/index.html) contains the per-hop examples.
 
@@ -127,15 +127,16 @@ being handed to a newer library build.
 
 **Frequency domain only inside models.** Framing, windowing, FFT/IFFT belong to the application
 via audiolib's `AcStft`/`AcIstft`; model libraries only ever see/produce spectra. A pipeline stage
-that itself performs STFT/ISTFT internally (`dfn_res_stage`, `dfn_rate_bridge`,
-`ulcnet_nn_stage`) is the exception that bridges a model into a different grid/host, not the norm.
+that itself performs STFT/ISTFT internally (`dfn_res_stage`, `dfn_rate_bridge`) is the exception that
+bridges a model into a different grid/host, not the norm. `ulcnet_nn_stage` takes and returns spectra.
 
-**`mcab` (4-channel flow, `pipelines/4ch/mcab.h`) owns no library instances.** The
-application creates four `libaec` `Aec` lanes (plus one shared `DelayAec` in MATCHED delay mode)
-and injects them via `McabLibs`; `mcab` itself holds only flow state (delay admission, alignment
-ring, fuse buffers) and exposes no beamformer. This is deliberate — `mcab` is pipeline/flow
-machinery, not a `lib/`-shaped algorithm core, and library tuning parameters stay outside it by
-design, not by oversight.
+**The 4-channel flow is an `Aec` array instance (`AecConfig.n_mics == AEC_ARRAY_MICS`).** One
+`aec_init` builds the four lanes, the shared delay estimator, the aligned far ring and the fusion /
+gain stage (`src/aec_array.c` in the AEC repo). The per-hop
+shape is `aec_process_linear` → `aec_get_array` (lane error spectra for the caller's SRP/BF) →
+`aec_process_residual(&AecBeam)` → `aec_get_residual` → `aec_apply_gain` / `aec_apply_cng`. The
+instance exposes no beamformer: the caller supplies the BF weights and spectrum. The `array_sample_*`
+files under `pipelines/4ch/` are sample-side helpers (init in one place, SRP/BF), not a library.
 
 **Python <-> C parity is enforced, not aspirational.** Changes to model math are expected
 Python-first; the C mirror is then checked bit-exact (or against a frozen, previously-measured

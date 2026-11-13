@@ -3,40 +3,37 @@
 This example replaces the post-beam MMSE-LSA denoiser of the conventional four-channel
 application (`4ch/`) with DeepFilterNet2 while keeping the shared delay estimator,
 the four linear AEC lanes, the SRP-PHAT and beamformer (bf) glue, a post-beam AEC3 residual
-suppressor and the comfort-noise recipe. mcab (`4ch/mcab.h`) is a flow layer, not a
-library: the application initialises the four libaec `Aec` lanes and, in MATCHED mode, the one
-shared `DelayAec`, and passes the pointers; mcab owns only its flow state. There is no DFN wrapper
-library either. `main.c` builds the lanes, the estimator and mcab in one block with
-`mcab_sample_flow.h`, adds the sample SRP-PHAT/BF helper (`mcab_sample_beam.h`, not part of the mcab
-archive), initialises the post-beam `AecRes` (libaec: `aec_res_get_mem_size()` / `aec_res_init()`
-on the flow's grid, balanced level), the gain and spectrum buffers of the RES path (no denoiser)
+suppressor and the comfort-noise recipe. The four-microphone flow is one `Aec` instance of the AEC library
+(`aec.h`, `AecConfig.n_mics = AEC_ARRAY_MICS`): the four lanes, the shared `DelayAec`, the fusion buffers and
+the residual gain stage are carved from one pool by `aec_init_ex()`; the application supplies none of them.
+There is no DFN wrapper library either. `main.c` builds the array in one block with
+`aec_get_mem_requirements()` + `aec_init_ex()` on `array_sample_default_config()` (residual `AEC_RESIDUAL_FULL`), adds the sample SRP-PHAT/BF helper
+(`array_sample_beam.h`, in no archive), carves the P spectrum of the RES path (no denoiser)
 and the DFN2 stage (or the rate bridge, sized and carved by `dfn/dfn_hop_pool.h`) separately,
-forms P in `dfn_form()`, and `dfn/dfn_hop.h` runs the network between the post-RES spectrum and
-the synthesis:
+forms P in `dfn_form()` (`aec_apply_gain(aec, NULL, P)`, optional `aec_apply_cng(aec, NULL, P)`), and `dfn/dfn_hop.h` runs
+the network between the post-RES spectrum and the synthesis:
 
 ```text
-mics/ref -> mcab_sample_beam_process(unit, mics, far, &beam, NULL)
-            mcab_process_front(): shared delay, four lanes; helper: SRP-PHAT, beamformer (bf)
-         -> mcab_sample_beam_fuse(unit, &frame)     = mcab_fuse(flow, weights, E, &frame)
-              E = beamformed error spectrum         -> DFN2 feature input
-              frame.g_res_ctx = NULL (mcab has no RES)
-         -> G_res = aec_res_process(res, &in)       the example's own AecRes; in filled by mcab_sample_res_input(&frame, &in)
-         -> P = B * min(1, G_res)                   P = B * G_res (+ comfort noise) -> DFN2 applied here
-                                                   (dfn_form(): sk_min_f32 + sk_capply_gain_f32 + aec_cng_fill)
-         -> dfn_hop_begin(&hop, frame.e, P)
+mics/ref -> array_sample_beam_process(unit, mics, far, &beam, NULL)
+            aec_process_linear() + aec_get_array(): shared delay, four lanes; helper: SRP-PHAT, beamformer (bf)
+         -> array_sample_beam_fuse(unit, &v)         = aec_process_residual(aec, &{weights, E}) + aec_get_residual(aec, &v)
+              E = beamformed error spectrum (v.error_spec)   -> DFN2 feature input
+         -> G_res = the array's gain stage, applied by aec_apply_gain(aec, NULL, P)
+         -> P = B * G_res (B = v.base_spec)         P = B * G_res (+ comfort noise) -> DFN2 applied here
+                                                   (dfn_form(): aec_apply_gain + aec_apply_cng)
+         -> dfn_hop_begin(&hop, v.error_spec, P)
          -> while (dfn_hop_nn_begin(&hop, &job) > 0) { run the model on the job; dfn_hop_nn_end(&hop, rc) }
          -> dfn_hop_end(&hop, out)                  -> enhanced P, frame t-L (L = M + D, 2 for the shipped pair),
                                                        the host's iFFT / OLA
 ```
 
-The skeleton uses the helper's own SRP-PHAT and BF, so `mcab_sample_beam_fuse()` hands mcab the
-BF's spectrum and weights. An application with its own beamformer calls `mcab_process_front()` and
-`mcab_fuse(p, W, E, &frame)` instead. `dfn_hop_process(&hop, frame.e, P, out)` is the sequence of
+The skeleton uses the helper's own SRP-PHAT and BF, so `array_sample_beam_fuse()` hands the array the
+BF's spectrum and weights. An application with its own beamformer calls `aec_process_linear()` and
+`aec_process_residual(aec, &{W, E})` instead. `dfn_hop_process(&hop, v.error_spec, P, out)` is the sequence of
 the `dfn_hop_*` calls with the model callback (`dfn_res_stage_infer()` here) as the runner. The RES
-strength is `aec_res_set_level(res, level, ramp_ms)` on the example's own `AecRes`. The example
-owns its RES, gain scratch and comfort-noise state and the ISTFT in the `DfnHop`: mcab carries none
-of them, and a refused call resets the helper (and with it the flow), the `AecRes`, the
-comfort-noise generator and the `DfnHop` together (`dfn_reset()` in `main.c`). The
+strength is `aec_set_level(aec, level)` on the array. The array owns the RES gain stage and the
+comfort-noise generator; the example owns the P buffer and the ISTFT in the `DfnHop`, and a refused call resets
+the helper (and with it the array, gain stage and comfort-noise generator) and the `DfnHop` together (`dfn_reset()` in `main.c`). The
 network estimates from the beamformed error and is applied to the post-RES
 spectrum. The comfort-noise fill is kept as a switch but is OFF by
 default in this variant: with it on, the additive fill perturbs P's phase in
@@ -46,15 +43,15 @@ rest of P and `atten_lim_db` bounds the attenuation of every bin). With no model
 (or a failing one) the output is the
 conventional chain with the denoiser off delayed: bit for bit by L = M + D hops at
 48 kHz (two for the shipped lookahead pair; the acceptance gate in `tests/test_4ch_dfn.c` asserts it against the hand-written chain of
-`4ch/tests/conv_chain_mcab.h`, with comfort noise off and on, across a real
-shared-estimator delay re-lock, on a stimulus where a run without the example's `AecRes` provably
+`4ch/tests/conv_chain_4ch.h`, with comfort noise off and on, across a real
+shared-estimator delay re-lock, on a stimulus where a run without the array's gain stage provably
 differs, and checks that the stage is not reset on the shared aligner's delay change), and through the resampler round trip by the bridge delay at
 16 kHz (the same test pins the delay with a near-end impulse, the frame
 schedule, and, where the delay is a whole number of native samples, the pass-band error
 against the conventional 16 kHz output, observed at about 1e-5 against a gate of 1e-3 for the shipped pair).
 
 The flow runs on the product's own grid: 16 kHz (fft 256, hop 128) by
-default, 16 kHz/512 (covered by `test_4ch_dfn`; the skeleton has no fft flag), or 48 kHz (mcab's
+default, 16 kHz/512 (covered by `test_4ch_dfn`; the skeleton has no fft flag), or 48 kHz (the array's
 rates, no 8 kHz). Only the DFN2 stage runs
 at 48 kHz: directly on the flow's spectra at 48 kHz (algorithmic latency
 L + 1 hops; three hops, 32 ms, for the shipped pair), or through the rate bridge (`pipelines/dfn/dfn_rate_bridge.h`)
@@ -93,9 +90,9 @@ builds and runs `test_4ch_dfn`, then the skeleton (default, `--delay-num-filters
 `--atten-lim 12dB` exit with 2, and that a 32 kHz model grid (not in the table: the AEC has no 32 kHz grid) is a rejected argument (exit 2).
 
 `libdfn_res_stage.a` holds the shared stage, the rate bridge and the DFN2 host
-pre/post objects; link it ahead of the flow's archives (`libaudio_pipeline_mcab.a`, which holds
-`mcab.o` only, the SRP/BF archives of audiolib, `libaec`, `libanr` and `libaudio_common`). The
-sample objects `mcab_sample_flow.o`, `mcab_sample_beam.o` and `mcab_sample_driver.o` are linked into
+pre/post objects; link it ahead of the producer archives (the SRP/BF archives of audiolib, `libaec` (which holds the array),
+`libanr` and `libaudio_common`). The
+sample objects `array_sample_beam.o` and `array_sample_driver.o` are linked into
 the program, not archived. The board supplies the stateless model
 callback (`DFN2Model`; its recurrent state is the accelerator's, reloaded with quantized zeros when
 `dfn_res_stage_state_generation()`, through the bridge `dfn_rate_bridge_state_generation()`, changes: a reset, each warm-up frame or a
@@ -128,37 +125,36 @@ current model-v6/feature-v5.
 ## Calling sequence and parameters
 
 ```
-App          McabSampleFlow + Mcab   McabSampleBeam   libaec AecRes   DfnHop + DfnResStage | DfnRateBridge   AcIstft (DFN2 grid rate; 48 kHz as shipped)
+App          Aec (array)                   ArraySampleBeam   DfnHop + DfnResStage | DfnRateBridge   AcIstft (DFN2 grid rate; 48 kHz as shipped)
  |-- dfn2_grid_make (row of --ai-sample-rate / --ai-fft-size); load erb_fwd.bin / erb_inv.bin (--erb-fwd / --erb-inv)
- |-- mcab_default_config; mcab_get_mem_requirements / _breakdown; mcab_sample_flow_get_mem_size / _init -->|
- |-- mcab_sample_beam_default_params; mcab_sample_beam_get_mem_size / _init(flow) -->|
- |-- aec_config_from_level (fft_size = mcab_get_mem_breakdown().fft_size); aec_res_get_mem_size; aec_res_init -->|
+ |-- array_sample_default_config; aec_get_mem_requirements; aec_init_ex -->|
+ |-- array_sample_beam_default_params; array_sample_beam_get_mem_size / _init(aec) -->|
  |-- dfn_hop_pool_plan / dfn_hop_pool_build: dfn_res_stage_* (48 kHz) or dfn_rate_bridge_* (16 kHz), dfn_hop_init_*
- |   per hop: mcab_sample_beam_process --> mcab_sample_beam_fuse --> aec_res_process(res, &in) (on E)
- |            --> frame.post_reset_serial moved: dfn_rate_bridge_reset_synthesis (16 kHz) | dfn_hop_reset (48 kHz), rng = MCAB_SAMPLE_CNG_RNG_SEED --> P = B * min(1, G_res) (dfn_form())
+ |   per hop: array_sample_beam_process --> array_sample_beam_fuse (the array's gain stage runs on E)
+ |            --> v.post_reset_serial moved: dfn_rate_bridge_reset_synthesis (16 kHz) | dfn_hop_reset (48 kHz) (the array reseeds its comfort noise) --> P = B * G_res (dfn_form())
  |            --> dfn_hop_begin(E, P) --> while (dfn_hop_nn_begin == 1) { model; dfn_hop_nn_end } --> dfn_hop_end --> out
- |   refused call: mcab_sample_beam_reset + aec_res_reset + comfort-noise rng = MCAB_SAMPLE_CNG_RNG_SEED + dfn_hop_reset   (dfn_reset())
+ |   refused call: array_sample_beam_reset (helper + array) + dfn_hop_reset   (dfn_reset())
  |   never reset the stage on the shared aligner's delay change
- |-- stage / bridge destroy; mcab_sample_beam_destroy; mcab_sample_flow_destroy; release the blocks
+ |-- stage / bridge destroy; array_sample_beam_destroy; aec_destroy; release the blocks
 ```
 
-The model estimates on the analysis beam `E` (`frame.e`) and is applied on `P`, formed over the rendering base
-`B` (`frame.b`, see [the 4ch README](../../4ch/README.md), "Analysis and rendering spectra"). `B` is
+The model estimates on the analysis beam `E` (`v.error_spec`) and is applied on `P`, formed over the rendering base
+`B` (`v.base_spec`, see [the 4ch README](../../4ch/README.md), "Analysis and rendering spectra"). `B` is
 `E` except on hops where a contributing lane's output guard fired; there `P` carries that lane's capture while the
 estimate stays on `E`. A lane's post-chain reset reseeds the comfort noise and clears the synthesis. At 16 kHz that is
 `dfn_rate_bridge_reset_synthesis()` on the hop of the event (the bridge synthesises the host-grid spectra at the top of
 its `begin()`; DFN2, the resamplers and the FIFOs keep running, no delay line). At 48 kHz the synthesis follows the stage
 by its lookahead and this example resets the whole hop (the delayed tail clear of `mono_aec_dfn_res` is not ported). In
-this flow the serial moves only with a flow reset (the lanes take an aligned far), which the refused-call path already
+this flow the serial moves only with an array reset (the lanes take an aligned far), which the refused-call path already
 pairs with a hop reset.
 
 External parameters: the same board-skeleton flags as the mono variant (`--sample-rate` 16000 default or
-48000, `--ai-sample-rate` / `--ai-fft-size`, delay profile, `--erb-fwd` / `--erb-inv`, `--atten-lim`, `--cng`), plus the flow's `McabConfig`
-(delay profile, `capture_proxy_channel`, `enable_post`) and the helper's `McabSampleBeamParams`
+48000, `--ai-sample-rate` / `--ai-fft-size`, delay profile, `--erb-fwd` / `--erb-inv`, `--atten-lim`, `--cng`), plus the array's `AecConfig`
+(delay profile, `capture_proxy_channel`, `residual`) and the helper's `ArraySampleBeamParams`
 (array geometry, `num_angles`; the skeleton uses the default 35 mm UCA, which a
-product replaces with the measured one) and `aec_res_set_level(res, ...)` on the example's own `AecRes`.
+product replaces with the measured one) and `aec_set_level(aec, ...)` on the array.
 Internal: the helper's BF / DOA / VAD constants (section 0.3 of
-[SRP／BF helper](../../../docs/reference/mcab/beam.md)), the stage
+[SRP／BF helper](../../../docs/reference/array/beam.md)), the stage
 grid and scale constants, the bridge FIR and schedule.
 
 ## Compute admission
@@ -177,11 +173,11 @@ model dominates this arithmetic budget; target-CPU-only admission still
 requires the final int8/fp runtime and board cycle measurement.
 
 Pool printed by the skeleton (`4ch_aec_bf_dfn_res`, matched delay, five-filter bank, NE10; the
-flow objects (four lanes, shared estimator, mcab pool), the SRP/BF helper, the post-beam `AecRes` carved by the example,
-the P and gain buffers, and the stage or bridge, each 16-byte
-aligned; shipped pair): 1,939,200 bytes at the 16 kHz default (flow plus helper 1,706,240 bytes, plus the rate bridge) and
-6,518,960 bytes at 48 kHz (flow plus helper 6,329,312 bytes). mcab's own pool is 74,624 bytes at
-16 kHz/256 (68,368 bytes front-only); the lanes and the estimator have their own pools.
+array (four lanes, shared estimator, ring, fusion buffers and gain stage in one pool), the SRP/BF helper,
+the P buffer, and the stage or bridge, each 16-byte
+aligned; shipped pair): 1,736,496 bytes at the 16 kHz default (array plus helper 1,512,576 bytes, plus the rate bridge) and
+5,751,968 bytes at 48 kHz (array plus helper 5,595,936 bytes). The array's own pool is 720,352 bytes at
+16 kHz/256 (the lanes 588,800 of it; `residual = STATE` 616,912 bytes); the model stage and the bridge have their own pools.
 Model weights, accelerator activation/workspace memory and the recurrent state are external;
 adding int8 weights alone brings the pool plus weights to about 3.9 MiB at
 16 kHz.

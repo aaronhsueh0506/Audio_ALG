@@ -2,7 +2,7 @@
 
 This Python reference deliberately does not implement SRP-PHAT or the
 beamformer (bf).  Its production API is split at that ownership boundary, with
-the stage names of the C core (mcab_process_front / mcab_fuse)::
+the stage names of the C array API (aec_process_linear / aec_process_residual)::
 
     front = pipeline.process_front(mics, render)
     bf = external_srp_bf(front.linear_channels)
@@ -49,8 +49,8 @@ _SUPPORTED_SAMPLE_RATES = (16000, 48000)
 _N_CHANNELS = 4
 
 # Admission of a shared-delay CHANGE (lib/aec's Path B; same values as the C
-# core's MCAB_DELAY_CHANGE_MIN_SAMPLES / _CONFIRM_SAMPLES / _CANDIDATE_TTL in
-# mcab_internal.h): the movement must exceed MIN samples and be offered
+# AEC_ARRAY_DELAY_CHANGE_MIN_SAMPLES / _CONFIRM_SAMPLES / _CANDIDATE_TTL in
+# aec_array_internal.h): the movement must exceed MIN samples and be offered
 # again within CONFIRM samples before the held candidate's TTL hops run out.
 _DELAY_CHANGE_MIN_SAMPLES = 32
 _DELAY_CHANGE_CONFIRM_SAMPLES = 16
@@ -70,7 +70,7 @@ class McabDelayState:
     generation begins on this hop (first acquisition included, even at applied
     delay 0); consumers flush history derived from the aligned reference.  A
     change while locked must pass the admission rule above.  Same contract as
-    the C core's ``McabDelayState`` (mcab.h).
+    the C ``AecDelayState`` (aec.h).
     """
 
     delay_samples: int
@@ -177,7 +177,7 @@ class SharedMatchedDelayEstimator:
         # exists and only for an estimate strictly EARLIER than the accepted
         # one.  Armed once per continuous backward episode, then one tick per
         # hop; a forward/ineligible estimate or lost cancellation disarms it.
-        # Mirrors the C core's update_shared_delay().
+        # Mirrors update_shared_delay() in lib/aec's aec_array.c.
         if (
             eligible
             and self.quarantine_enabled
@@ -256,7 +256,7 @@ class _SharedReferenceDelayLine:
         start = self._samples_seen
         absolute = start + np.arange(render.size, dtype=np.int64)
         self._ring[absolute % self._capacity] = render
-        # Whole-hop decision, as the C core's align_render(): the ring serves the
+        # Whole-hop decision, as align_render() in aec_array.c: the ring serves the
         # offset only once the samples seen cover ``delay_samples``; before that
         # the far content is the raw render hop (never silence).  Per hop, not
         # per sample, so raw and shifted audio are never spliced in one frame.
@@ -339,7 +339,7 @@ class McabConfig:
     capture_proxy_channel: int = 0
     max_delay_ms: float = 1024.0
     # Backward-jump quarantine on a shared-delay CHANGE (default off; mirrors
-    # McabConfig::delay_backward_quarantine_enabled / _s): an estimate
+    # AecConfig.delay_backward_quarantine_enabled / _s): an estimate
     # strictly EARLIER than the accepted delay is held while the estimator's own
     # capture lane (capture_proxy_channel) still cancels at the applied
     # alignment, and is adopted at the window's expiry or when cancellation
@@ -354,12 +354,12 @@ class McabConfig:
             raise ValueError(
                 f"four-channel path supports {_SUPPORTED_SAMPLE_RATES}, got {self.sample_rate}"
             )
-        # 16 kHz default is 256/128 (8 ms hop), as the C core's
-        # derive_flow (mcab.c); 512/256 is an explicit alternate.
+        # 16 kHz default is 256/128 (8 ms hop); the C side takes the grid from
+        # AecConfig.fft_size; 512/256 is an explicit alternate.
         default_frame = 256 if self.sample_rate == 16000 else 1024
         frame = default_frame if self.frame_size is None else int(self.frame_size)
         hop = frame // 2 if self.hop_size is None else int(self.hop_size)
-        # Same whitelist as the C core (mcab.c derive_flow):
+        # Same whitelist as aec_resolve_signal_grid() in lib/aec:
         # 16 kHz frame/FFT in {256, 512}, 48 kHz only 1024.
         if self.sample_rate == 16000:
             if frame not in (256, 512):
@@ -379,7 +379,7 @@ class McabConfig:
 
 
 def mcab_apply_lane_contract(config: McabConfig, lane: AecConfig) -> AecConfig:
-    """Twin of C ``mcab_apply_lane_contract``: the flow's contract stamped onto an
+    """The flow's contract stamped onto an
     application-composed lane config (the flow's grid, no own delay estimation, the
     linear context returned without a gain of its own).  Every other field is the
     application's.  Raises ValueError for a lane built for another sample rate."""
@@ -398,7 +398,7 @@ def mcab_apply_lane_contract(config: McabConfig, lane: AecConfig) -> AecConfig:
 
 
 def mcab_lane_config(config: McabConfig) -> AecConfig:
-    """Twin of C ``mcab_lane_config``: the default lane (PBFDKF, 52 ms filter at 16 kHz,
+    """The default lane (PBFDKF, 52 ms filter at 16 kHz,
     64 ms at 48 kHz) with the contract stamped."""
     filter_length = config.sample_rate * (64 if config.sample_rate == 48000 else 52) // 1000
     return mcab_apply_lane_contract(
@@ -481,7 +481,7 @@ def _fuse_contexts(
     lanes).  ``guard_active``: a contributing lane's guard fired.
     ``post_reset_serial``: the four lanes' hard post-chain reset counters
     summed modulo 2**32; it moves whenever any lane's moves, and the one
-    synthesizer of the fused output follows it (C: ``McabFrame``).
+    synthesizer of the fused output follows it.
     """
 
     n_freqs = _require_context_arrays(contexts)
@@ -535,7 +535,7 @@ def _fuse_contexts(
     if weight_sum <= 1e-12:
         raise ValueError("beamformer has zero weight on all channels")
     norm_weight = channel_weight / weight_sum
-    # Match fuse_contexts() in the C core: a lane that contributes no
+    # Match fuse_contexts() in lib/aec's aec_array.c: a lane that contributes no
     # spectrum must not steer the post-beam suppressor's three control
     # scalars. Test coefficients directly, not normalized magnitudes, so a
     # genuinely nonzero coefficient cannot disappear through underflow.
@@ -787,7 +787,7 @@ class McabPipeline:
         lane_config: Optional[AecConfig] = None,
     ) -> None:
         """``lane_config``: the application's lane parameters (preset, filter length,
-        ...); the flow stamps its contract onto them.  None selects mcab_lane_config()."""
+        ...); the flow stamps its contract onto them.  None selects the module's mcab_lane_config()."""
         self.config = config or McabConfig()
         frame, hop = self.config.resolved_grid()
         self.frame_size = frame
@@ -840,7 +840,8 @@ class McabPipeline:
         (``apply_external_realign`` returns 0 for both), so read the pair
         against the delay trajectory.  The rejection outcome (-1) cannot occur
         here (the lanes resolve to EXTERNAL_ALIGNED).  Mirrors the C core's
-        ``mcab_realign_warm_lane_count()`` pair.
+        ``aec_array_realign_warm_lane_count()`` /
+        ``aec_array_realign_soft_lane_count()`` pair.
         """
         return self._realign_warm_lanes
 
@@ -854,7 +855,7 @@ class McabPipeline:
         for lane in self._lanes:
             lane.reset()
         self._last_delay = 0
-        # Zeroed with the lanes' state (as mcab_reset()).
+        # Zeroed with the lanes' state (as aec_reset() on the array).
         self._realign_warm_lanes = 0
         self._realign_soft_lanes = 0
         self._generation += 1
@@ -880,7 +881,7 @@ class McabPipeline:
 
         proxy = microphones[:, self.config.capture_proxy_channel]
         # Read before the lanes process this hop, so it reports last hop's
-        # cancellation (as lib/aec's Path-B guard and the C core, which calls
+        # cancellation (as lib/aec's Path-B guard and aec_array.c, which calls
         # update_shared_delay() ahead of its lane loop).  Capture-proxy lane
         # only, and only when the quarantine is on.
         proxy_lane_cancelling = bool(
@@ -898,7 +899,7 @@ class McabPipeline:
             # cancellation survives and the WOLA sequences continue.
             # ``_last_delay`` is the alignment served before this hop's decision
             # (0 until the estimate first turns solid).  Same sweep as the C
-            # flow's mcab_process_front (mcab.c).
+            # array's aec_process_linear() (aec_array.c).
             delta = int(delay.delay_samples) - int(self._last_delay)
             for lane in self._lanes:
                 outcome = lane.apply_external_realign(delta)

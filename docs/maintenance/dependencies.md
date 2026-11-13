@@ -50,7 +50,7 @@ the handover documentation, and check them off here.
       existing grid, behaviour and checkpoint compatibility checks remain strict.
 
 - [ ] **Static pools are fully supported but are NOT what `*_create()` gives
-      you.** `aec_create()` / `mcab_create()` / the other `*_create()` constructors use
+      you.** `aec_create()` / the other `*_create()` constructors use
       the heap. Zero-heap operation requires the caller to explicitly use
       `*_get_mem_requirements()` (or `aec_get_mem_size()`) followed by
       `*_init_ex()` / `aec_init()`. A board integration that calls `*_create()`

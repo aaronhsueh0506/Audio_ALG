@@ -1,5 +1,5 @@
 /* mono AEC -> RES -> DeepFilterNet2 composition test: lib/aec's Aec with its own RES gain,
- * P = E * min(1, G_res) (+ comfort noise) and the DFN2 hop (dfn/dfn_hop.h), wired as
+ * P = B * G_res (+ comfort noise) and the DFN2 hop (dfn/dfn_hop.h), wired as
  * mono/aec_dfn_res/main.c wires them.
  * 48 kHz: with the identity model the composition equals the hand-written mono chain
  * (tests/conv_chain_mono.h with enable_nr=0), delayed by exactly the test grid's lookahead
@@ -18,16 +18,13 @@
 #include <string.h>
 
 #include "aec.h"
-#include "aec_res.h"           /* aec_cng_fill */
 #include "dfn/dfn_hop.h"
 #include "utility/mem_align.h"
-#include "utility/simd_kernels.h"
 #include "dfn/tests/dfn_test_fixture.h"
 #include "mono/aec_nr_res/tests/conv_chain_mono.h"
 #include "mono/aec_nr_res/tests/guard_scene.h"
 
 #define TEST_FRAMES 64
-#define CNG_NR_GAIN_FLOOR 0.31622777f
 #define ECHO_DELAY 384
 
 static float erb_fwd[DFN2_N_BINS * DFN2_N_ERB];
@@ -64,10 +61,9 @@ enum { MDFN_SAB_NO_DELAY = 1, MDFN_SAB_ERROR_SPEC = 2, MDFN_SAB_NO_RESEED = 4, M
 
 typedef struct MonoDfn {
     Aec *aec;
-    float *unity, *total;        /* the RES gain path: min(1, G_res) */
     Complex *post;               /* P */
     void *post_mem;
-    uint32_t rng;
+    uint32_t rng;                /* caller-owned comfort-noise state, read only on the MDFN_SAB_NO_RESEED path */
     uint32_t reset_serial;       /* the aec_post_reset_serial() value already handled */
     uint32_t reset_pending;      /* bit k: a hard reset was seen k hops ago (the stage path's delay line) */
     int bridge_clear_due;        /* LATE_CLEAR only: the event of the previous hop, cleared one hop late */
@@ -100,20 +96,16 @@ static MonoDfn *mdfn_create(int sample_rate, int fft_size, int enable_cng, const
     AecSignalGrid grid;
     AecConfig lane;
     DfnResStageConfig stage_cfg = dfn_res_stage_default_config(dfn_test_grid());
-    size_t vec;
-    int k;
     if (!m) return NULL;
-    if (!aec_resolve_signal_grid(sample_rate,
-                                 fft_size ? fft_size : aec_default_fft_size(sample_rate), &grid))
+    if (aec_resolve_signal_grid(sample_rate,
+                                 fft_size ? fft_size : aec_default_fft_size(sample_rate), &grid) != AEC_OK)
         goto fail;
     aec_config_from_level(&lane, AEC_LEVEL_BALANCED, sample_rate);
     lane.fft_size = grid.fft_size;
     lane.delay_mode = AEC_DELAY_MATCHED;
     lane.delay_num_filters = DA_NUM_FILTERS;
     lane.fixed_delay_samples = -1;
-    lane.enable_delay_est = 1;
-    lane.enable_res = 0;
-    lane.return_res_context = 1;
+    lane.residual = AEC_RESIDUAL_FULL;
     m->hop_size = grid.hop_size;
 
     m->aec = (Aec *)calloc(1, sizeof(Aec));
@@ -121,15 +113,11 @@ static MonoDfn *mdfn_create(int sample_rate, int fft_size, int enable_cng, const
 
     m->n_freqs = grid.n_freqs;
     m->enable_cng = enable_cng;
-    vec = ALIGN16((size_t)grid.n_freqs * sizeof(float));
-    if (posix_memalign(&m->post_mem, 16, 2 * vec + ALIGN16((size_t)grid.n_freqs * sizeof(Complex))) != 0) {
+    if (posix_memalign(&m->post_mem, 16, ALIGN16((size_t)grid.n_freqs * sizeof(Complex))) != 0) {
         m->post_mem = NULL;
         goto fail;
     }
-    m->unity = (float *)m->post_mem;
-    m->total = (float *)((unsigned char *)m->post_mem + vec);
-    m->post = (Complex *)((unsigned char *)m->post_mem + 2 * vec);
-    for (k = 0; k < m->n_freqs; ++k) m->unity[k] = 1.0f;
+    m->post = (Complex *)m->post_mem;
     m->rng = AEC_CNG_SEED;
 
     stage_cfg.erb_fwd = erb_fwd;
@@ -166,20 +154,19 @@ fail:
 }
 
 /* AEC, rendering base, the hard-reset event, RES gain, P; the DFN hop begins on (B, P), as main.c's
- * rig_process() and follow_post_reset() do. */
+ * rig_process() and follow_post_reset() do. The MDFN_SAB_ERROR_SPEC and MDFN_SAB_NO_RESEED defects render
+ * through the explicit-array forms (aec_apply_gain_spec / aec_apply_cng_spec) with the test's own rng. */
 static int mdfn_begin(MonoDfn *m, const float *mic, const float *ref) {
-    AecResContext c;
-    AecOutputBase base;
+    AecResidualView v;
     uint32_t serial, moved;
     const Complex *b;
-    aec_process_context(m->aec, mic, ref);
-    aec_get_res_context(m->aec, &c);
-    if (!c.error_spec || !c.res_gain) return -1;
-    memset(&base, 0, sizeof(base));
-    base.struct_size = sizeof(base);
-    if (aec_get_output_base(m->aec, &base) != 0) return -1;
-    b = (m->sabotage & MDFN_SAB_ERROR_SPEC) ? c.error_spec : base.base_spec;
-    if (base.guard_active) ++m->guard_hops;
+    if (aec_process_linear(m->aec, mic, ref) != AEC_OK) return -1;
+    if (aec_process_residual(m->aec, NULL) != AEC_OK) return -1;
+    memset(&v, 0, sizeof(v));
+    v.struct_size = sizeof(v);
+    if (aec_get_residual(m->aec, &v) != AEC_OK || !v.res_gain) return -1;
+    b = (m->sabotage & MDFN_SAB_ERROR_SPEC) ? v.error_spec : v.base_spec;
+    if (v.guard_active) ++m->guard_hops;
     serial = aec_post_reset_serial(m->aec);
     moved = serial != m->reset_serial;
     m->reset_serial = serial;
@@ -202,11 +189,16 @@ static int mdfn_begin(MonoDfn *m, const float *mic, const float *ref) {
             if ((m->reset_pending >> DFN_TEST_LOOKAHEAD_FRAMES) & 1u) ac_istft_reset(m->istft);
         }
     }
-    sk_min_f32(m->total, m->unity, c.res_gain, m->n_freqs);
-    sk_capply_gain_f32(m->post, b, m->total, m->n_freqs);
-    if (m->enable_cng && c.comfort_noise)
-        aec_cng_fill(&m->rng, m->post, c.comfort_noise, c.res_gain, m->unity, CNG_NR_GAIN_FLOOR,
-                     m->n_freqs);
+    if (m->sabotage & MDFN_SAB_ERROR_SPEC)
+        aec_apply_gain_spec(m->post, b, v.res_gain, NULL, m->n_freqs);
+    else if (aec_apply_gain(m->aec, NULL, m->post) != AEC_OK)
+        return -1;
+    if (m->enable_cng) {
+        if (m->sabotage & (MDFN_SAB_NO_RESEED | MDFN_SAB_ERROR_SPEC))
+            aec_apply_cng_spec(&m->rng, m->post, v.comfort_noise, v.res_gain, NULL, m->n_freqs);
+        else if (aec_apply_cng(m->aec, NULL, m->post) != AEC_OK)
+            return -1;
+    }
     return dfn_hop_begin(&m->hop, b, m->post) == 0 ? 0 : -1;
 }
 
@@ -258,16 +250,18 @@ static int run_identity(int enable_cng) {
     if (!baseline) return 2;
 
     for (frame = 0; frame < TEST_FRAMES; ++frame) {
-        AecLinearContext linear;
-        AecResContext ctx;
+        AecLinearView linear;
+        AecResidualView ctx;
         int any = 0;
         make_hop(mic, ref, frame);
         if (mdfn_process(dfn, mic, ref, out) != 0 ||
             conv_mono_hop(baseline, mic, ref, saved[frame]) != 0)
             return 10 + frame;
-        aec_get_linear_context(dfn->aec, &linear);
+        memset(&linear, 0, sizeof linear); linear.struct_size = sizeof linear;
+        memset(&ctx, 0, sizeof ctx); ctx.struct_size = sizeof ctx;
+        if (aec_get_linear(dfn->aec, &linear) != AEC_OK || aec_get_residual(dfn->aec, &ctx) != AEC_OK)
+            return 11;
         if (linear.delay_state == AEC_LINEAR_DELAY_CHANGED) ++delay_changes;
-        aec_get_res_context(dfn->aec, &ctx);
         if (ctx.res_gain)
             for (k = 0; k < ctx.n_freqs; ++k)
                 if (ctx.res_gain[k] < min_res) min_res = ctx.res_gain[k];
@@ -286,7 +280,7 @@ static int run_identity(int enable_cng) {
     dfn_res_stage_get_counters(dfn->stage, &frames, &commits, &skips);
     if (frames != TEST_FRAMES || commits != 0 || skips != TEST_FRAMES - DFN2_MASK_LOOKAHEAD)
         return 6;                             /* a reset would leave a gap */
-    if (aec_set_level(dfn->aec, AEC_LEVEL_AGGRESSIVE, 0.0f) != 0)
+    if (aec_set_level(dfn->aec, AEC_LEVEL_AGGRESSIVE) != 0)
         return 7;
     if (dfn_res_stage_set_atten_lim(dfn->stage, 12.0f) != 0 ||
         dfn_res_stage_set_atten_lim(dfn->stage, NAN) != -1)
@@ -494,8 +488,7 @@ static void run_post_chain(const GuardScene *sc, int sabotage, SceneRun *out) {
     if (!dfn || !oracle || !want || !got || !scratch) goto done;
     aec_config_from_level(&cfg, AEC_LEVEL_BALANCED, sc->sr);
     cfg.fft_size = sc->fft;
-    cfg.enable_res = 1;
-    cfg.return_res_context = 0;
+    cfg.residual = AEC_RESIDUAL_FULL;
     cfg.enable_cng = sc->enable_cng;
     ac_stft_config_default(&scfg, sc->fft);
     if (aec_create(oracle, &cfg) != 0 ||
@@ -642,8 +635,7 @@ static void run_bridge_scene(const GuardScene *sc, int sabotage, BridgeSceneRun 
     if (!dfn || !dfn->bridge || !chain || !oracle || !want || !chain_hop || !probe_hop || !scratch) goto done;
     aec_config_from_level(&cfg, AEC_LEVEL_BALANCED, sc->sr);
     cfg.fft_size = sc->fft;
-    cfg.enable_res = 1;
-    cfg.return_res_context = 0;
+    cfg.residual = AEC_RESIDUAL_FULL;
     cfg.enable_cng = sc->enable_cng;
     ac_stft_config_default(&scfg, sc->fft);
     if (aec_create(oracle, &cfg) != 0 ||
@@ -658,7 +650,7 @@ static void run_bridge_scene(const GuardScene *sc, int sabotage, BridgeSceneRun 
         const float *te, *tp;
         long resets = dfn->reset_hops;
         int moved, i;
-        AecOutputBase base;
+        AecResidualView base;
         for (k = 0; k < 4; ++k)
             if (sc->reset_at[k] == h) {          /* the application restarts the AEC and nothing else */
                 aec_reset(dfn->aec);
@@ -673,7 +665,7 @@ static void run_bridge_scene(const GuardScene *sc, int sabotage, BridgeSceneRun 
         moved = dfn->reset_hops != resets;
         memset(&base, 0, sizeof(base));
         base.struct_size = sizeof(base);
-        if (aec_get_output_base(dfn->aec, &base) != 0) { out->ok = 0; break; }
+        if (aec_get_residual(dfn->aec, &base) != AEC_OK) { out->ok = 0; break; }
         if (conv_mono_hop(chain, mic, ref, chain_hop) != 0) { out->ok = 0; break; }
         aec_process(oracle, mic, ref, want);
         if (moved) ac_istft_reset(probe);
@@ -776,9 +768,9 @@ static int run_rejections(void) {
     DfnRateBridgeConfig bc;
     DfnRateBridgeMemReq bridge_req;
 
-    if (aec_resolve_signal_grid(44100, aec_default_fft_size(44100), &grid)) return 1;
-    if (aec_resolve_signal_grid(DFN2_SR, 512, &grid)) return 2;   /* not a 48 kHz grid */
-    if (!aec_resolve_signal_grid(DFN2_SR, aec_default_fft_size(DFN2_SR), &grid) ||
+    if (aec_resolve_signal_grid(44100, aec_default_fft_size(44100), &grid) == AEC_OK) return 1;
+    if (aec_resolve_signal_grid(DFN2_SR, 512, &grid) == AEC_OK) return 2;   /* not a 48 kHz grid */
+    if (aec_resolve_signal_grid(DFN2_SR, aec_default_fft_size(DFN2_SR), &grid) != AEC_OK ||
         grid.fft_size != DFN2_N_FFT)
         return 3;
     /* a bridge is for hosts below 48 kHz and needs the partition through its stage config */

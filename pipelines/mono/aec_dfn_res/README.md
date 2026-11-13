@@ -3,21 +3,21 @@
 This example replaces the MMSE-LSA denoiser of the conventional mono
 chain with DeepFilterNet2 while keeping the linear AEC, the AEC3 residual echo
 suppressor and the comfort-noise recipe. There is no mono unit and no DFN wrapper
-library: `main.c` initialises lib/aec's `Aec` (which carries the RES gain itself), the gain
-and spectrum buffers of the RES path (no denoiser) and the DFN2
+library: `main.c` initialises lib/aec's `Aec` (which carries the RES gain itself), the post spectrum
+buffer of the RES path (no denoiser) and the DFN2
 stage (`dfn/dfn_res_stage.h`, or `dfn/dfn_rate_bridge.h` below 48 kHz) separately, forms P in
 `rig_process()`, and `dfn/dfn_hop.h` runs the network between the post-RES spectrum and the
 synthesis. `dfn/dfn_hop_pool.h` sizes and carves the DFN tail of the pool (the stage or the bridge,
 its synthesis and the output spectrum):
 
 ```text
-mic/ref -> aec_process_context(aec, mic, ref)
-           follow_post_reset()                     new aec_post_reset_serial(): rng = AEC_CNG_SEED (+ the host-synthesis OLA clear, see below)
-           aec_get_res_context(aec, &ctx)          G_res = ctx.res_gain, comfort-noise PSD
-           aec_get_output_base(aec, &base)         B = base.base_spec = the rendering base (E, or E + echo on a guard hop)
+mic/ref -> aec_process_linear(aec, mic, ref); aec_process_residual(aec, NULL)
+           follow_post_reset()                     new aec_post_reset_serial(): the host-synthesis OLA clear, see below (the library reseeds its comfort noise)
+           aec_get_residual(aec, &v)               G_res = v.res_gain, comfort-noise PSD
+                                                   B = v.base_spec = the rendering base (E, or E + echo on a guard hop)
                                                    -> DFN2 feature input
-           P = B * min(1, ctx.res_gain)            P = B * G_res (+ comfort noise) -> DFN2 applied here
-                                                   (sk_min_f32 + sk_capply_gain_f32 + aec_cng_fill)
+           P = B * G_res                           aec_apply_gain(aec, NULL, P) (+ aec_apply_cng(aec, NULL, P) when on)
+                                                   -> DFN2 applied here
          -> dfn_hop_begin(&hop, B, P)
          -> while (dfn_hop_nn_begin(&hop, &job) > 0) { run the model on the job; dfn_hop_nn_end(&hop, rc) }
          -> dfn_hop_end(&hop, out)                  -> enhanced P, frame t-L (L = M + D, 2 for the shipped pair),
@@ -25,12 +25,11 @@ mic/ref -> aec_process_context(aec, mic, ref)
 ```
 
 `dfn_hop_process(&hop, B, P, out)` runs the same sequence with the model callback; P must
-be formed before `dfn_hop_begin()`. A refused hop is the integrator's to recover: reset the AEC,
-the comfort-noise generator (`rng = AEC_CNG_SEED`, the library's constant) and the `DfnHop` together
-(`rig_reset()` in `main.c`).
+be formed before `dfn_hop_begin()`. A refused hop is the integrator's to recover: reset the AEC (which also
+reseeds its own comfort-noise generator) and the `DfnHop` together (`rig_reset()` in `main.c`).
 
-**Two spectra.** `ctx.error_spec` / `ctx.formed_hop` are the AEC's analysis seam: the selected linear residual, never
-altered by the output guard. B (`aec_get_output_base()`) is what `aec_process()` itself would multiply by its gain:
+**Two spectra.** `v.error_spec` / `v.formed_hop` are the AEC's analysis seam: the selected linear residual, never
+altered by the output guard. B (`v.base_spec`) is what `aec_process()` itself would multiply by its gain:
 E, or the capture spectrum E + echo on a hop where the linear estimate is unusable and E is louder than the
 capture. B is E bit for bit on every hop the guard leaves alone. The stage reads the pair (B, P): its feature input
 and the spectrum it filters stay one signal, so a guard hop never pairs a capture-based P with a residual-based
@@ -39,8 +38,8 @@ estimate. There is no denoiser here, so no further estimator reads either spectr
 **Hard post-chain reset event.** The AEC moves `aec_post_reset_serial()` when its post chain is hard-reset inside a
 processing call (a confirmed delay change that restarts the filter, a first acquisition without warm
 transfer) or by `aec_reset()`; warm-transfer and soft realignments and the bad-relock soft revert do not move it. `follow_post_reset()` keeps the
-last handled serial. On a new value the comfort noise restarts from `AEC_CNG_SEED` before that hop's first draw. The
-stage never resets on it and the program never resets the AEC in response. At 48 kHz the program owns the synthesis
+last handled serial; the library reseeds its comfort-noise generator to `AEC_CNG_SEED` on the same event, before that
+hop's first draw. The stage never resets on it and the program never resets the AEC in response. At 48 kHz the program owns the synthesis
 (`AcIstft`) and the stage delays every frame by `dfn_res_stage_lookahead_frames()` hops, so the overlap-add tail is
 dropped when the frame built on the reset hop reaches the synthesis (a delay line of that many hops, not at the
 reset hop: that would cut the previous filter's last frame out of the output). Below 48 kHz the host-grid synthesis
@@ -70,7 +69,7 @@ lookahead pair; the acceptance gate in `tests/test_mono_dfn.c`, compared with th
 `pipelines/mono/aec_nr_res/tests/conv_chain_mono.h`, asserted with
 comfort noise off and on, across a real matched-delay re-lock, with the
 suppressor demonstrably active, and on streams that fire the output guard and hard-reset the post chain, with
-the reset event delayed by L hops), the post spectrum P itself equals `aec_process()` of a full-mode `Aec`
+the reset event delayed by L hops), the post spectrum P itself equals `aec_process()` of an `Aec` with `AEC_RESIDUAL_FULL`
 after the host's own synthesis with the AEC's window table, bit for bit, at 16 kHz/256, 16 kHz/512 and 48 kHz, and through the resampler round trip by
 the bridge delay on a native grid (the same test pins the delay with a
 near-end impulse, the frame schedule, and, where the delay is a whole number of native samples, the pass-band
@@ -108,8 +107,8 @@ DFN2 grid. Neither the DFN2 library nor the pipeline units hold a grid (see [`AI
 pair is refused with the list, exit 2) and hands it to `DfnResStageConfig.grid`. The stage takes its rate, FFT size and its input and
 output scales (1/sqrt(n_fft) and its inverse) from that grid. A host at the model's rate needs no bridge:
 `--ai-sample-rate 16000 --ai-fft-size 256` with the 16 kHz host runs straight through the stage (hop 128, algorithmic latency 128
-samples for the 0/0 row, pool 431,456 B), against 800 samples and
-591,056 B for the shipped 48 kHz model with the same 16 kHz host through the bridge. The bridge exists only for the shipped
+samples for the 0/0 row, pool 408,080 B), against 800 samples and
+567,680 B for the shipped 48 kHz model with the same 16 kHz host through the bridge. The bridge exists only for the shipped
 48 kHz / 1024 model (`resolve()` returns -1 on any other stage grid) and its hosts stay 8 kHz and 16 kHz, so a 16 kHz model
 refuses a host of another rate ("pool query rejected", exit 1), and the 48 kHz host needs the 48 kHz model. The banner prints the model
 grid and whether the stage or the bridge runs. `tests/test_mono_dfn.c` and the Python reference cover the shipped grid; the stage test
@@ -119,7 +118,7 @@ Lookahead pair. The DFN2 mask and deep-filter lookaheads M (0..2) and D (0..4) a
 (a row of the table above, not a build setting) and must equal the pair the model was trained for;
 `dfn_res_stage_lookahead_frames(grid)` = M + D. The make variables `DFN2_MASK_LOOKAHEAD` / `DFN2_DF_LOOKAHEAD` choose only the pair
 the test programs run, never the pair `main.c` runs. The rules and
-`make test-pairs` are in [`../README.md`](../README.md). Only the shipped 1/1 pair has a trained checkpoint, and the numbers in this
+`make test-pairs` are in [`../../reference/build.md`](../../reference/build.md) ("DFN lookahead pair"). Only the shipped 1/1 pair has a trained checkpoint, and the numbers in this
 file are for it unless a pair is named.
 
 Build and test from `pipelines/` (the Makefile that owns the rules):
@@ -139,7 +138,7 @@ skeleton (default, `--delay-num-filters 1 --cng --atten-lim 12`, `--sample-rate 
 host pre/post objects. The example links it with `libaec` and
 `libaudio_common` (no denoiser, so no `libanr`); the board supplies the stateless model callback
 (`DFN2Model`) and the ERB matrices (`erb_fwd.bin` / `erb_inv.bin`
-from `AINR/DeepFilterNet2/export_erb_matrix.py`; layout in [`../README.md`](../README.md), "Build and test"). `main.c` is the board
+from `AINR/DeepFilterNet2/export_erb_matrix.py`; layout in [`../../dfn/README.md`](../../dfn/README.md)). `main.c` is the board
 skeleton: delay-profile flags in the `aec_wav` spelling, `--erb-fwd` /
 `--erb-inv`, `--sample-rate` (default 16000), `--ai-sample-rate` / `--ai-fft-size` (the model grid, default 48000 / 1024), `--atten-lim`, `--cng`, and a fail-open `run_accelerator()`
 stub to replace with the runtime call (the recurrent state is the accelerator's: it reloads quantized zeros when
@@ -161,10 +160,10 @@ App                 Aec           DfnHop + DfnResStage | DfnRateBridge      AcIs
  |-- dfn_res_stage_get_mem_requirements / dfn_res_stage_init_ex            (host at the DFN2 rate: 48 kHz as shipped)
  |   or dfn_rate_bridge_get_mem_requirements / dfn_rate_bridge_init_ex     (8 / 16 kHz host)
  |-- dfn_hop_init_stage(...) or dfn_hop_init_bridge(...)
- |   per hop: aec_process_context --> follow_post_reset --> aec_get_res_context / aec_get_output_base
- |            --> P = B * min(1, res_gain) (+ comfort noise, off by default)
+ |   per hop: aec_process_linear --> aec_process_residual --> follow_post_reset --> aec_get_residual
+ |            --> aec_apply_gain (+ aec_apply_cng, off by default) -> P = B * G_res
  |            --> dfn_hop_begin(B, P) --> while (dfn_hop_nn_begin == 1) { model; dfn_hop_nn_end } --> dfn_hop_end --> out
- |   refused hop: aec_reset + comfort-noise rng = AEC_CNG_SEED + dfn_hop_reset   (rig_reset())
+ |   refused hop: aec_reset + dfn_hop_reset   (rig_reset())
  |   never reset the stage on an AEC delay change
  |-- aec_destroy; dfn_res_stage_destroy | dfn_rate_bridge_destroy; release the blocks
 ```
@@ -199,11 +198,11 @@ moves the AEC itself to 48 kHz; that extra AEC cost is separate from this
 resampler count and must be included in the board measurement.
 
 Pool printed by the skeleton (`mono_aec_dfn_res`, matched delay, five-filter bank, NE10; the sum
-of `aec_get_mem_size()`, the three gain and spectrum buffers of the RES path and the stage or
-bridge requirement, each 16-byte aligned): 591,056 bytes at the 16 kHz default (the AEC and the RES gain path plus the
-rate bridge, whose own pool is 222,960 bytes including the stage), 1,322,976 bytes at 48 kHz (the
+of `aec_get_mem_size()`, the post spectrum buffer of the RES path and the stage or
+bridge requirement, each 16-byte aligned): 567,680 bytes at the 16 kHz default (the AEC and the RES post spectrum plus the
+rate bridge, whose own pool is 222,880 bytes including the stage), 1,234,592 bytes at 48 kHz (the
 stage's 105,056 bytes, its synthesis and the AEC; the conventional MMSE-LSA chain on the 48 kHz
-grid needs 1,356,352 bytes) and 495,680 bytes at 8 kHz. Model weights, accelerator activation/
+grid needs 1,270,112 bytes) and 475,408 bytes at 8 kHz. Model weights, accelerator activation/
 workspace memory and the recurrent state are external to this descriptor (the state of the shipped graph is
 1,280 + 30,720 float32 values, registered by a float host or held by the accelerator); adding int8 weights alone
 brings the pool plus weights to about 2.6 MiB at 16 kHz.

@@ -32,6 +32,37 @@
 
 Align-ULCNet 只有一個描述產生器：N>1 在訊號輸入的最後多一個 `frame_reset`，由 stream 依逐 hop 事件填進 `AiaecWork.inputs`，sample 把它當一般的第五個訊號輸入搬運，沒有特例。N=1 維持 layout 18，圖裡沒有 `frame_reset`，事件 hop 是 BYPASS 區塊。包內第 3 個 hop 有事件時 `frame_reset` 為 `00100000`。
 
+## Float I/O 模式（FLOAT_IN／FLOAT_OUT）
+
+函式庫與 stream 層的所有 tensor 本來就是 float32（`AinrWork`／`AiaecWork` 的資料指標都是 `float *`），沒有任何量化程式。定點與 float 之間的軟體轉換只在板端 sample：輸入端把 float 轉成定點再送進 NPU，head 讀回時再轉回 float。Float I/O 的目的只有一個：讓 NPU 在開圖時做這兩步（量化與反量化），CPU 不再做。
+
+- 開關是每支 AI3 sample 開頭的編譯期 `#define FLOAT_IN 0`、`#define FLOAT_OUT 0`，預設關閉；沒有執行期旗標，也沒有全域模式結構。`FLOAT_IN` 管訊號輸入，`FLOAT_OUT` 管 head 輸出。
+- 這些 model 的 state 就地繼承 input／output 的型別（recurrent state 的輸入與輸出共用同一塊 buffer），所以**要求 `FLOAT_IN == FLOAT_OUT`**；混合設定只適用於不繼承 state 的模型，這裡的 AI3 sample 都不是。混合設定不會被編譯擋下，只有一個編譯警告（`#warning`，內容為 `FLOAT_IN != FLOAT_OUT: these models inherit the state port types, so FLOAT_IN must equal FLOAT_OUT; ...`）和啟動時 `[AI3] float_in=%d float_out=%d` 那行 log 後面的 `WARNING: mixed setting`。用 `-Werror` 建置時這個 `#warning` 會變成錯誤。
+- State 埠不受這兩個 define 管：它們維持 SDK 回報的型別。state 的清零一律是對 buffer 填位元組 0 並 flush cache，不分 float 與定點：float 的 `0.0f` 全為零位元組；定點則靠 `stream_check_ports()` 保證兩端 `zero_point` 為 0（`STREAM_PORT_ERR_STATE_ZERO_POINT`，-110），所以通過埠檢查的 graph 不會有需要非零量化零的 state 埠。
+- 開 float I/O 只省轉換，不省搬運：函式庫的資料在 host heap，NPU buffer 在 NPU 可見的記憶體，輸入的 `memcpy` 與 cache flush 仍在，head 讀回變成 flush 加 `memcpy(elem * 4 bytes)`。Host 端的 DFN2 `df_alpha` 夾到 [0, 1] 仍保留，NaN 預填與函式庫的有限值檢查仍在：float head 不會像定點那樣飽和，NPU 輸出的 NaN／Inf 由函式庫拒絕該拍（直通加 generation 前進，見上節 State 的回復）。
+
+### 啟動 log
+
+模型永遠是定點；`FLOAT_IN`／`FLOAT_OUT` 只讓硬體在邊界做轉換。SDK 回報的埠型別因此不能當作請求是否生效的依據，sample 不拿請求去比對回報的型別，也沒有對應的錯誤碼。埠檢查（`ports_check()` 或等價函式）仍只做 `stream_check_ports()`，它通過後、任何 buffer 覆寫之前，sample 印出（`float_io_compare.py` 讀這幾行）：
+
+```
+[AI3] float_in=0 float_out=0
+[AI3] in[0] float=0 bits=16 scale_ratio=... zero_point=0
+[AI3] out[0] float=0 bits=16 scale_ratio=... zero_point=0
+```
+
+第一行在 `FLOAT_IN != FLOAT_OUT` 時尾端加 ` WARNING: mixed setting`；之後每個輸入埠與輸出埠各一行，內容是 SDK 回報的 `is_float`、`elem_bits`、`scale_ratio`、`zero_point`。埠檢查不會因 float 與定點的差異而失敗，是否生效由板端 A/B（下節）從這些行與輸出比對判斷。
+
+### 板端尚未驗證的項目
+
+以下只能上板確認，本庫沒有 SDK 標頭也沒有板子，所以沒有猜：
+
+1. CTRL 位元（`CTRL_BUF_FLOATIN`、`CTRL_BUF_FLOATOUT`）是否也作用在 state 埠。
+2. NPU 內建轉換與 host 呼叫的數值是否相等：host 對輸入傳 scale 1.0f，對輸出傳埠的 `scale_ratio`。
+3. 現有 `model.bin` 是否直接接受 float I/O，還是工具鏈需要另一個選項並重編。若需要另一個 bin，在 `stream/ainr/ainr.c`／`stream/aiaec/aiaec.c` 的 catalog 加第二個 `graph_path`，不改 layout 版號。
+
+上板 A/B 的步驟與比對腳本見 `docs/maintenance/float-io-board-ab.md` 與 `docs/maintenance/float_io_compare.py`。
+
 ## 依據
 
 - 四種匯出器（`AINR/DeepFilterNet2/export_onnx.py`、`AIAEC/_streaming_export.py` 的 DeepVQE-S、`AIAEC/Align_ULCNet/export_onnx.py` 的 N=1 與 N>1）實際寫出的 ONNX 名稱順序都符合上列規則，匯出器不必改。
@@ -53,4 +84,5 @@ make -C stream/aiaec test-aiaec-model-io
 - `test_dfn2_port_order.py` 對 DFN2 full 與 lite、N=1 與 8 的匯出圖做名稱順序與 state 形狀檢查，並用 `make -C stream/ainr [MASK_ONLY=1] work-dumper` 建的傾印程式，把四個登錄列（full 16 kHz/256 的 N=1 與 8、full 與 lite 48 kHz/1024 的 N=1）的 `AinrWork` 對匯出圖的訊號輸入與 head 輸出，另驗拒絕的組態回傳碼。它也用 `make -C stream/ainr model-io-dumper`（`AINR_MODEL_IO_DUMPER` 可改指別的建置）傾印 `ai3_model_io_dfn2.h` 的每一列，逐列比對全新匯出的圖（`test_sample_row_equals_a_fresh_export`，項目同上），列集合必須恰為登錄的四列。
 - `test-ainr-work-shapes` 以匯出器寫下的形狀表檢查三個家族的 `AinrWork`（登錄的每個組態，full 與 lite）。
 - `stream/common` 的 `test_stream_bind` 涵蓋 `stream_check_ports()` 的每條拒絕規則（含定點 state 埠兩端 `zero_point` 必須為 0）；`test_stream_mem` 涵蓋 `StreamMemReq` 與 pool 工具。
+- 函式庫端的 float head 非有限值回歸：`make -C stream/ainr test-ainr-state-generation`（DFN2 三個 head 任一端的 NaN／+Inf／-Inf 都是被拒的 commit，generation 前進）、`make -C stream/aiaec test-aiaec-block test-aiaec-packet`（DeepVQE-S taps、Align-ULCNet mask 首尾元素的 Inf）。
 - state 的 shape 只在 `ai3_model_io_<model>.h` 的表裡（`stream/ainr/ai3_model_io_dfn2.h`、`stream/aiaec/ai3_model_io_{deepvqes,alignulcnet}.h`），函式庫沒有。表各列與匯出器的對照有兩層：上面兩個 pytest 對全新匯出逐列比對（埠序、每個登錄 grid 與 N 的形狀、state 順序）；C 端的 `test-ainr-model-io`、`test-aiaec-model-io` 把每一列展開後對真實 pre 呼叫給出的 `AinrWork`／`AiaecWork` 核對。共用的展開、配對與檢查程式 `stream/common/ai3_model_io.h` 由 `make -C stream/common test-model-io` 測試。

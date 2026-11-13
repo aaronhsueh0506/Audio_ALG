@@ -159,7 +159,7 @@
   <tr><td>Frame / Hop</td><td colspan="2">8k 256/128；16k 256/128（預設）或 512/256；48k 1024/512</td><td>frame=FFT、50% overlap、無補零</td></tr>
   <tr><td>FFT size</td><td>256 / 512 / 1024</td><td>256 / 512 / 1024</td><td>NE10，float32</td></tr>
   <tr><td>Algorithmic delay</td><td>0 samples（linear 路徑）</td><td>—</td><td>完整 mono pipeline 為 1 grid hop（final sqrt-Hann OLA）；不含裝置 I/O／resampler／OS scheduling</td></tr>
-  <tr><td>靜態記憶體</td><td><code>aec_get_mem_size()</code></td><td><code>anr_get_mem_size()</code></td><td>各函式庫各自查大小，整合者加總（各 main 自己加總 <code>aec_get_mem_size()</code>、<code>anr_get_mem_size()</code>、<code>ac_istft_get_mem_size()</code>；4ch 由應用依序查四條 lane 的 <code>aec_get_mem_size()</code>、共享 estimator 的 <code>delay_aec_get_mem_size()</code> 與 mcab 自己的 <code>mcab_get_mem_requirements()</code>，其後的 RES 另用 <code>aec_res_get_mem_size()</code>）</td></tr>
+  <tr><td>靜態記憶體</td><td><code>aec_get_mem_size()</code></td><td><code>anr_get_mem_size()</code></td><td>各函式庫各自查大小，整合者加總（各 main 自己加總 <code>aec_get_mem_size()</code>、<code>anr_get_mem_size()</code>、<code>ac_istft_get_mem_size()</code>；4ch 的 array 一次 <code>aec_get_mem_requirements()</code>：四條 lane、共享 estimator、融合緩衝與增益級都在同一塊 pool，其後只有 NR 與合成另查）</td></tr>
   <tr><td>計算量</td><td>依 grid、partition、shadow 與 backend</td><td>依 n_freqs、MCRA 視窗與 backend</td><td>release 前在目標 SoC profile，不使用本頁固定估算</td></tr>
 </table>
 
@@ -185,7 +185,7 @@
 </table>
 
 <p style="font-size: 12px; color: var(--muted); margin-top: 8px;">
-  執行期用 <code>aec_set_level(aec, level, ramp_ms)</code> 改（ramp 範圍 [0, 60000] ms；DT floor 與 split floor 一律立即階躍）。AEC 整合與預設參數見 <a href="../../libraries/index.html#aec">AEC/README.md</a>。
+  執行期用 <code>aec_set_level(aec, level)</code> 改（far-active floor 以函式庫內部固定的 ramp 走到新值；DT floor 與 split floor 立即階躍）。AEC 整合與預設參數見 <a href="../../libraries/index.html#aec">AEC/README.md</a>。
 </p>
 
 <h3>6.5 NR 降噪等級</h3>

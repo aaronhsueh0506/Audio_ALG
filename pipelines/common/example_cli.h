@@ -92,6 +92,28 @@ static inline int example_cli_parse_float(const char* text, float* value) {
     return 0;
 }
 
+/* The integer value of a numeric option: 0, or 2 after
+ * "<prog>: <option> '<text>' is not an integer" on stderr (same strictness as the parse above). */
+static inline int example_cli_int_option(const char* option, const char* text, int* value,
+                                         const char* prog) {
+    if (example_cli_parse_int(text, value) == 0) return 0;
+    fprintf(stderr, "%s: %s '%s' is not an integer\n", prog, option, text);
+    return 2;
+}
+
+/* A level option's value: a single digit 0..max, nothing else (no names). 0, or 2 after
+ * "<prog>: <option> '<text>' is not a level (accepted: 0..<max>)" on stderr. */
+static inline int example_cli_level_option(const char* option, const char* text, int max, int* level,
+                                           const char* prog) {
+    if (text && text[0] >= '0' && text[0] <= '0' + max && text[1] == '\0') {
+        *level = text[0] - '0';
+        return 0;
+    }
+    fprintf(stderr, "%s: %s '%s' is not a level (accepted: 0..%d)\n", prog, option,
+            text ? text : "", max);
+    return 2;
+}
+
 /* One of --delay-mode / --delay-num-filters / --fixed-delay with its value. */
 static inline int example_cli_delay_set_option(ExampleCliDelayOptions* o, const char* name,
                                                const char* value, const char* prog) {

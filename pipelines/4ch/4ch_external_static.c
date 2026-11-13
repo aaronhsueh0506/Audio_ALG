@@ -1,22 +1,22 @@
 /** 4x AEC(linear) -> beamformer -> NR/RES with static memory and the stages chained
- * by the caller. Minimal example of the application side of mcab.h: default config ->
- * the lanes' and the estimator's own get_mem_size/init -> mcab's get_mem_requirements/init ->
- * process -> destroy -> release, every object in one caller allocation.
- * mcab drives the shared aligner and the four lanes this file creates; the post-beam stages go
- * behind them in the same allocation, each a separate library initialised here: the RES
- * (AecRes: the lanes compute no gain of their own), the denoiser and the synthesis:
- *   process_front -> (weights) -> fuse -> RES gain -> NR gain -> min -> CNG -> synthesis
+ * by the caller. Minimal example of the array instance of aec.h: config (n_mics = 4) ->
+ * aec_get_mem_requirements -> aec_init_ex -> process -> destroy -> release, the array and
+ * the post-beam stages in one caller allocation.
+ * The array drives the shared aligner, the four lanes and the residual gain stage (AEC_RESIDUAL_FULL;
+ * --no-res selects ESTIMATE: fusion without a gain); the post-beam stages go behind it in the same
+ * allocation, each a separate library initialised here: the denoiser and the synthesis:
+ *   aec_process_linear -> (weights) -> aec_process_residual -> NR gain -> min with G_res -> CNG -> synthesis
  * The beamformer is externally owned in a product; this executable supplies fixed
  * equal weights, a deterministic smoke adapter and not a production beamformer.
- * Build:  make -C pipelines/4ch mcab_external_static
+ * Build:  make -C pipelines/4ch 4ch_external_static
  * Usage:
- *   AEC level: 0=mild, 1=balanced, 2=aggressive, 3=no_floor; names also accepted. The positional
+ *   AEC level: 0=mild, 1=balanced, 2=aggressive, 3=no_floor (the number). The positional
  *   [aec-level] and --aec-level <level> are the same setting; give one of them once.
- *   NR level: mild, moderate, balanced, aggressive or 0..3; --nr-preset is the same option.
- *   ./mcab_external_static [aec-level | --aec-level <level>] [--nr-level mild|moderate|balanced|aggressive]
+ *   NR level: 0=mild, 1=moderate, 2=balanced, 3=aggressive; --nr-preset is the same option.
+ *   ./4ch_external_static [aec-level | --aec-level <level>] [--nr-level 0|1|2|3]
  *       [--sample-rate 16000|48000] [--fft-size 256|512|1024]
  *       [--capture-proxy 0|1|2|3] [--legacy-amin] [--no-cng] [--no-res]
- *   ./mcab_external_static --print-mem-size [same options]
+ *   ./4ch_external_static --print-mem-size [same options]
  * Numbers are whole decimal ints. Exit: 0 done, 1 refused config or failed run, 2 command line. */
 
 #include <stdio.h>
@@ -25,27 +25,18 @@
 #include <stdint.h>
 #include <math.h>
 
-#include "mcab.h"
-#include "aec_res.h"
+#include "aec.h"
 #include "anr.h"
 #include "audio_stft.h"
-#include "mcab_sample_post.h"
+#include "array_sample_post.h"
 #include "common/example_cli.h"
 #include "utility/mem_align.h"
-#include "utility/simd_kernels.h"
 #include "utility/simd_kernel_nn.h"   /* skn_all_finite_f32 */
 
-/* CLI aliases only; -1 for a name that is none of them. */
+/* A level is its enum number, given as a whole decimal string 0..3; -1 for anything else. */
 static int parse_level(const char* s) {
-    if (strcmp(s, "mild") == 0 || strcmp(s, "0") == 0)
-        return AEC_LEVEL_MILD;
-    if (strcmp(s, "balanced") == 0 || strcmp(s, "1") == 0)
-        return AEC_LEVEL_BALANCED;
-    if (strcmp(s, "aggressive") == 0 || strcmp(s, "2") == 0)
-        return AEC_LEVEL_AGGRESSIVE;
-    if (strcmp(s, "no_floor") == 0 || strcmp(s, "3") == 0)
-        return AEC_LEVEL_NO_FLOOR;
-    return -1;
+    int v;
+    return example_cli_parse_int(s, &v) == 0 && v >= 0 && v <= 3 ? v : -1;
 }
 
 static const char* level_name(AecLevel level) {
@@ -63,107 +54,61 @@ static const char* nr_level_name(AnrLevel level) {
 
 static const char* backend_id_name(uint32_t backend_id) {
     switch (backend_id) {
-        case MCAB_BACKEND_NE10: return "ne10";
-        default:                           return "unknown";
+        case AEC_BACKEND_NE10: return "ne10";
+        default:               return "unknown";
     }
 }
 
-/* The application side of mcab.h, in the order the objects are carved: four lanes, the shared
- * estimator object and its pool (MATCHED only), mcab's pool. The lanes' parameters are this
- * program's (balanced; the CLI level drives the post-beam RES); mcab stamps its contract. */
+/* The array: one pool, one aec_init_ex(). The CLI level sets the residual gain stage (the lanes'
+ * own level has no effect). */
 typedef struct Flow {
-    AecConfig lane_cfg;
-    McabDelayEstimatorConfig dc;
-    McabMemReq req;           /* mcab's own pool */
-    McabMemBreakdown grid;
-    size_t lane_bytes, delay_bytes, total;
-    Aec* lanes[MCAB_CHANNELS];
-    DelayAec* delay;
-    Mcab* p;
+    AecConfig cfg;
+    AecMemReq req;
+    AecMemBreakdown breakdown;
+    size_t total;
+    Aec* aec;
 } Flow;
 
-static int flow_plan(Flow* fl, const McabConfig* cfg) {
-    int ch;
+static int flow_plan(Flow* fl, int sample_rate, int fft_size, AecLevel level, int capture_proxy,
+                     int with_res) {
     memset(fl, 0, sizeof(*fl));
-    aec_config_from_level(&fl->lane_cfg, AEC_LEVEL_BALANCED, cfg->sample_rate);
-    if (mcab_apply_lane_contract(cfg, &fl->lane_cfg) != 0 ||
-        mcab_delay_estimator_config(cfg, &fl->dc) != 0 ||
-        mcab_get_mem_requirements(cfg, &fl->req) != 0 ||
-        mcab_get_mem_breakdown(cfg, &fl->grid) != 0) return -1;
-    fl->lane_bytes = aec_get_mem_size(&fl->lane_cfg);
-    if (fl->lane_bytes == 0) return -1;
-    for (ch = 0; ch < MCAB_CHANNELS; ++ch) fl->total += ALIGN16(fl->lane_bytes);
-    if (fl->dc.required) {
-        fl->delay_bytes = delay_aec_get_mem_size(fl->dc.sample_rate, fl->dc.hop_size,
-                                                 fl->dc.num_filters);
-        if (fl->delay_bytes == 0) return -1;
-        fl->total += ALIGN16(sizeof(DelayAec)) + ALIGN16(fl->delay_bytes);
-    }
-    fl->total += ALIGN16((size_t)fl->req.bytes);
+    aec_config_from_level(&fl->cfg, level, sample_rate);
+    if (fft_size) fl->cfg.fft_size = fft_size;
+    fl->cfg.n_mics = AEC_ARRAY_MICS;
+    fl->cfg.capture_proxy_channel = capture_proxy;
+    fl->cfg.residual = with_res ? AEC_RESIDUAL_FULL : AEC_RESIDUAL_ESTIMATE;
+    if (aec_get_mem_requirements(&fl->cfg, &fl->req) != 0 ||
+        aec_get_mem_breakdown(&fl->cfg, &fl->breakdown) != AEC_OK) return -1;
+    fl->total = ALIGN16((size_t)fl->req.bytes);
     return 0;
 }
 
-/* The flow tears down before the objects it borrows. */
 static void flow_destroy(Flow* fl) {
-    int ch;
-    mcab_destroy(fl->p);
-    fl->p = NULL;
-    for (ch = 0; ch < MCAB_CHANNELS; ++ch) {
-        if (fl->lanes[ch]) aec_destroy(fl->lanes[ch]);
-        fl->lanes[ch] = NULL;
-    }
+    aec_destroy(fl->aec);
+    fl->aec = NULL;
 }
 
-static int flow_init(Flow* fl, void* mem, const McabConfig* cfg) {
-    unsigned char* cur = (unsigned char*)mem;
-    McabLibs libs;
-    int ch;
-    memset(&libs, 0, sizeof(libs));
-    for (ch = 0; ch < MCAB_CHANNELS; ++ch) {
-        fl->lanes[ch] = aec_init(cur, fl->lane_bytes, &fl->lane_cfg);
-        if (!fl->lanes[ch]) return -1;
-        libs.lanes[ch] = fl->lanes[ch];
-        cur += ALIGN16(fl->lane_bytes);
-    }
-    if (fl->dc.required) {
-        fl->delay = (DelayAec*)cur;
-        cur += ALIGN16(sizeof(DelayAec));
-        if (delay_aec_init(fl->delay, cur, fl->delay_bytes, fl->dc.sample_rate, fl->dc.hop_size,
-                           fl->dc.num_filters) != 0) return -1;
-        cur += ALIGN16(fl->delay_bytes);
-        libs.delay = fl->delay;
-    }
-    fl->p = mcab_init_ex(cur, (size_t)fl->req.bytes, cfg, &libs, &fl->req);
-    return fl->p ? 0 : -1;
+static int flow_init(Flow* fl, void* mem) {
+    fl->aec = aec_init_ex(mem, (size_t)fl->req.bytes, &fl->cfg, &fl->req);
+    return fl->aec ? 0 : -1;
 }
 
-/* The stages after the fuse, carved in this order behind the flow. */
+/* The stages after the fuse, carved in this order behind the array. */
 typedef struct Post {
-    AecConfig res_cfg;
     AnrConfig nr_cfg;
     AcStftConfig synth_cfg;
-    size_t res_bytes, nr_bytes, synth_bytes, vec_bytes, spec_bytes, total;
-    int use_r2, enable_cng;
-    AecRes* res;              /* NULL with --no-res */
+    size_t nr_bytes, synth_bytes, vec_bytes, spec_bytes, total;
+    int use_r2, enable_cng, with_res;
     AnrDenoiser* nr;
     AcIstft* istft;
-    float *unity, *total_gain, *extra_noise;
+    float *unity, *extra_noise;
     Complex* spec;
-    uint32_t rng;
-    uint32_t reset_handled;   /* McabFrame.post_reset_serial the synthesis last followed */
+    uint32_t reset_handled;   /* AecResidualView.post_reset_serial the synthesis last followed */
     int n_freqs;
 } Post;
 
-static int post_plan(Post* q, int sample_rate, int fft_size, int with_res, AecLevel level,
-                     AnrLevel nr_level) {
+static int post_plan(Post* q, int sample_rate, int fft_size, AnrLevel nr_level) {
     int n_freqs = fft_size / 2 + 1;
-    q->res_bytes = 0;
-    if (with_res) {
-        aec_config_from_level(&q->res_cfg, level, sample_rate);
-        q->res_cfg.fft_size = fft_size;
-        q->res_bytes = aec_res_get_mem_size(&q->res_cfg);
-        if (q->res_bytes == 0) return -1;
-    }
     q->nr_cfg = anr_config_for_level_grid(sample_rate, fft_size, nr_level);
     ac_stft_config_default(&q->synth_cfg, fft_size);
     q->nr_bytes = anr_get_mem_size(&q->nr_cfg);
@@ -171,9 +116,8 @@ static int post_plan(Post* q, int sample_rate, int fft_size, int with_res, AecLe
     q->vec_bytes = ALIGN16((size_t)n_freqs * sizeof(float));
     q->spec_bytes = ALIGN16((size_t)n_freqs * sizeof(Complex));
     if (q->nr_bytes == 0 || q->synth_bytes == 0) return -1;
-    /* res, nr, synthesis, unity, total gain, NR prior, output spectrum */
-    q->total = ALIGN16(q->res_bytes) + ALIGN16(q->nr_bytes) + ALIGN16(q->synth_bytes) +
-               3 * q->vec_bytes + q->spec_bytes;
+    /* nr, synthesis, unity, NR prior, output spectrum */
+    q->total = ALIGN16(q->nr_bytes) + ALIGN16(q->synth_bytes) + 2 * q->vec_bytes + q->spec_bytes;
     q->n_freqs = n_freqs;
     return 0;
 }
@@ -181,49 +125,32 @@ static int post_plan(Post* q, int sample_rate, int fft_size, int with_res, AecLe
 static int post_init(Post* q, void* mem) {
     unsigned char* cur = (unsigned char*)mem;
     int k;
-    q->res = NULL;
-    if (q->res_bytes) {
-        q->res = aec_res_init(cur, q->res_bytes, &q->res_cfg);
-        if (!q->res) return -1;
-        cur += ALIGN16(q->res_bytes);
-    }
     q->nr = anr_init(cur, q->nr_bytes, &q->nr_cfg);
     cur += ALIGN16(q->nr_bytes);
     q->istft = ac_istft_init(cur, q->synth_bytes, &q->synth_cfg);
     cur += ALIGN16(q->synth_bytes);
     if (!q->nr || !q->istft) return -1;
     q->unity = (float*)cur;       cur += q->vec_bytes;
-    q->total_gain = (float*)cur;  cur += q->vec_bytes;
     q->extra_noise = (float*)cur; cur += q->vec_bytes;
     q->spec = (Complex*)cur;
     for (k = 0; k < q->n_freqs; ++k) q->unity[k] = 1.0f;
-    q->rng = MCAB_SAMPLE_CNG_RNG_SEED;
     q->reset_handled = 0u;
     return 0;
 }
 
-/* One hop after the fuse into out: G_res and G_nr estimated on E, P = B * min(G_nr, G_res) over
- * the rendering base B, comfort noise on the bins the RES cut, synthesis (cleared and reseeded
+/* One hop after the fuse into out: G_nr estimated on E, P = B * min(G_nr, G_res) over the rendering
+ * base B (G_res = 1 without the gain stage), comfort noise on the bins the gain cut, synthesis (cleared
  * first when a lane had a post-chain reset). 0, or -1 when a stage refuses the hop. */
-static int post_hop(Post* q, const McabFrame* f, float* out) {
-    const float* res = q->unity;
-    const float* nr;
-    if (q->res) {
-        AecResInput in;
-        mcab_sample_res_input(f, &in);
-        res = aec_res_process(q->res, &in);
-    }
-    if (!res) return -1;
-    nr = mcab_sample_anr_gain(q->nr, f, q->extra_noise, q->use_r2);
+static int post_hop(Post* q, Aec* aec, const AecResidualView* v, float* out) {
+    const float* nr = array_sample_anr_gain(q->nr, v, q->extra_noise, q->use_r2);
     if (!nr) return -1;
-    sk_min_f32(q->total_gain, nr, res, q->n_freqs);   /* NaN in the second operand reaches the finite gate; in the first it is replaced */
-    if (mcab_sample_post_reset_due(&q->reset_handled, f)) {
-        ac_istft_reset(q->istft);
-        q->rng = MCAB_SAMPLE_CNG_RNG_SEED;
+    if (array_sample_post_reset_due(&q->reset_handled, v)) ac_istft_reset(q->istft);
+    if (q->with_res) {
+        if (aec_apply_gain(aec, nr, q->spec) != AEC_OK) return -1;
+        if (q->enable_cng && aec_apply_cng(aec, nr, q->spec) != AEC_OK) return -1;
+    } else {
+        aec_apply_gain_spec(q->spec, v->base_spec, q->unity, nr, q->n_freqs);
     }
-    sk_capply_gain_f32(q->spec, f->b, q->total_gain, q->n_freqs);
-    if (q->enable_cng && q->res && f->cn)
-        aec_cng_fill(&q->rng, q->spec, f->cn, res, nr, MCAB_SAMPLE_CNG_NR_GAIN_FLOOR, q->n_freqs);
     (void)ac_istft_push(q->istft, q->spec, out);
     return 0;
 }
@@ -233,25 +160,25 @@ static void post_destroy(Post* q) {
     q->nr = NULL;
 }
 
-/* "AEC x4" is the four lanes; "Front end" everything else the flow needs (the shared
- * estimator and mcab's own pool); the descriptor is mcab's. */
-static void print_mem_budget(const McabConfig* cfg, const Flow* fl, const Post* q) {
-    const McabMemReq req = fl->req;
-    const McabMemBreakdown b = fl->grid;
-    size_t bufs = 3 * q->vec_bytes + q->spec_bytes;
-    size_t aec_bytes = 4u * ALIGN16(fl->lane_bytes);
+/* "AEC x4" is the four lanes; "Front end" everything else of the array pool (the shared
+ * estimator and ring, the fusion buffers and the residual gain stage); the descriptor is the array's. */
+static void print_mem_budget(const Flow* fl, const Post* q) {
+    const AecMemReq req = fl->req;
+    const AecMemBreakdown b = fl->breakdown;
+    AecSignalGrid grid;
+    size_t bufs = 2 * q->vec_bytes + q->spec_bytes;
+    size_t aec_bytes = b.lane_bytes;
 
+    (void)aec_resolve_signal_grid(fl->cfg.sample_rate, fl->cfg.fft_size, &grid);
     printf("Memory Budget (4AEC + post-beam NR/RES static pipeline)\n");
     printf("======================================================\n");
     printf("  sample_rate=%d hop=%d fft=%d n_freqs=%d\n",
-           cfg->sample_rate, b.hop_size, b.fft_size, b.n_freqs);
+           fl->cfg.sample_rate, grid.hop_size, grid.fft_size, grid.n_freqs);
     printf("  AEC x4:         %9zu bytes (%7.1f KB)\n",
            aec_bytes, (float)aec_bytes / 1024.0f);
     printf("  Front end:      %9zu bytes (%7.1f KB)\n",
            fl->total - aec_bytes,
            (float)(fl->total - aec_bytes) / 1024.0f);
-    printf("  RES (AecRes):   %9zu bytes (%7.1f KB)\n",
-           q->res_bytes, (float)q->res_bytes / 1024.0f);
     printf("  NR (MMSE-LSA):  %9zu bytes (%7.1f KB)\n",
            q->nr_bytes, (float)q->nr_bytes / 1024.0f);
     printf("  Synthesis(OLA): %9zu bytes (%7.1f KB)\n",
@@ -279,8 +206,8 @@ static void fill_hop(float* microphones, float* reference,
             2.0f * 3.14159265358979323846f * 440.0f *
             (float)absolute / (float)sample_rate;
         reference[i] = 0.08f * sinf(phase);
-        for (ch = 0; ch < MCAB_CHANNELS; ++ch) {
-            microphones[i * MCAB_CHANNELS + ch] =
+        for (ch = 0; ch < AEC_ARRAY_MICS; ++ch) {
+            microphones[i * AEC_ARRAY_MICS + ch] =
                 reference[i] * (0.35f + 0.05f * (float)ch);
         }
     }
@@ -316,7 +243,6 @@ int main(int argc, char* argv[]) {
     void* pool = NULL;
     float *mic_buf = NULL, *ref_buf = NULL, *out_buf = NULL;
     Complex* weights = NULL;
-    Mcab* pipe;
     Flow flow;
     Post post;
 
@@ -340,10 +266,10 @@ int main(int argc, char* argv[]) {
             const char* text = example_cli_option_value(argc, argv, &i, argv[0]);
             int level_id;
             if (!text) return 2;
-            level_id = anr_nr_level_from_name(text);
+            level_id = parse_level(text);
             if (level_id < 0) {
                 fprintf(stderr, "%s: %s '%s' is not an NR level "
-                        "(accepted: mild|moderate|balanced|aggressive or 0..3)\n", argv[0], name, text);
+                        "(accepted: 0 mild, 1 moderate, 2 balanced, 3 aggressive)\n", argv[0], name, text);
                 return 2;
             }
             nr_level = (AnrLevel)level_id;
@@ -357,7 +283,7 @@ int main(int argc, char* argv[]) {
             p = parse_level(text);
             if (p < 0) {
                 fprintf(stderr, "%s: AEC level '%s' is not a level "
-                        "(accepted: mild|balanced|aggressive|no_floor or 0..3)\n", argv[0], text);
+                        "(accepted: 0 mild, 1 balanced, 2 aggressive, 3 no_floor)\n", argv[0], text);
                 return 2;
             }
             if (have_level) {
@@ -373,23 +299,18 @@ int main(int argc, char* argv[]) {
                 "[--sample-rate 16000|48000] "
                 "[--fft-size 256|512|1024] [--capture-proxy 0|1|2|3] "
                 "[--legacy-amin] [--no-cng] [--no-res] [--print-mem-size]\n"
-                "AEC level: 0=mild, 1=balanced, 2=aggressive, 3=no_floor; names also accepted.\n"
+                "AEC level: 0=mild, 1=balanced, 2=aggressive, 3=no_floor (the number).\n"
                 "The positional [aec-level] and --aec-level are the same setting; give one of them once.\n"
-                "NR level: mild, moderate, balanced, aggressive or 0..3; --nr-preset is the same option.\n",
+                "NR level: 0=mild, 1=moderate, 2=balanced, 3=aggressive; --nr-preset is the same option.\n",
                 argv[0]);
             return 2;
         }
     }
 
-    McabConfig cfg = mcab_default_config(sample_rate);
-    cfg.fft_size = fft_size;
-    cfg.capture_proxy_channel = capture_proxy;
-
     printf("4x AEC(linear) -> external beamformer -> NR/RES"
            "  (static memory%s)\n",
            legacy ? ", legacy min-only" : "");
-    /* Wording kept as in earlier releases: tests/test_cli_strict.sh matches this line and the baseline
-     * matrix compares this program's stdout byte for byte. */
+    /* tests/test_cli_strict.sh matches this line. */
     printf("  AEC preset: %s   NR preset: %s   CNG: %s\n",
            level_name(level), nr_level_name(nr_level),
            no_cng ? "off" : "on");
@@ -399,18 +320,19 @@ int main(int argc, char* argv[]) {
      * memory manager. Every owner starts empty, so one teardown serves every exit. */
     memset(&flow, 0, sizeof(flow));
     memset(&post, 0, sizeof(post));
-    if (flow_plan(&flow, &cfg) != 0) {
+    if (flow_plan(&flow, sample_rate, fft_size, level, capture_proxy, !no_res) != 0) {
         fprintf(stderr, "Error: invalid 4-channel config\n");
         goto done;
     }
-    if (post_plan(&post, sample_rate, flow.grid.fft_size, !no_res, level, nr_level) != 0) {
+    if (post_plan(&post, sample_rate, flow.cfg.fft_size, nr_level) != 0) {
         fprintf(stderr, "Error: invalid config\n");
         goto done;
     }
     post.use_r2 = !legacy;
     post.enable_cng = !no_cng;
+    post.with_res = !no_res;
 
-    print_mem_budget(&cfg, &flow, &post);
+    print_mem_budget(&flow, &post);
     pool_bytes = flow.total + post.total;
     if (posix_memalign(&pool, flow.req.alignment, pool_bytes) != 0) pool = NULL;
     if (!pool) {
@@ -418,13 +340,12 @@ int main(int argc, char* argv[]) {
         goto done;
     }
 
-    /* Place the lanes, the estimator and the flow, then the post stages behind them. */
-    if (flow_init(&flow, pool, &cfg) != 0 ||
+    /* Place the array, then the post stages behind it. */
+    if (flow_init(&flow, pool) != 0 ||
         post_init(&post, (uint8_t*)pool + flow.total) != 0) goto done;
-    pipe = flow.p;
 
-    hop = mcab_hop_size(pipe);
-    n_freqs = mcab_n_freqs(pipe);
+    hop = aec_hop_size(flow.aec);
+    n_freqs = hop + 1;
     printf("n_freqs agreement OK (n_freqs=%d, hop=%d) at %d Hz\n",
            n_freqs, hop, sample_rate);
     if (print_only) {
@@ -432,27 +353,32 @@ int main(int argc, char* argv[]) {
         goto done;
     }
 
-    mic_buf = (float*)malloc((size_t)hop * MCAB_CHANNELS * sizeof(float));
+    mic_buf = (float*)malloc((size_t)hop * AEC_ARRAY_MICS * sizeof(float));
     ref_buf = (float*)malloc((size_t)hop * sizeof(float));
     out_buf = (float*)malloc((size_t)hop * sizeof(float));
-    weights = (Complex*)calloc((size_t)MCAB_CHANNELS * n_freqs, sizeof(Complex));
+    weights = (Complex*)calloc((size_t)AEC_ARRAY_MICS * n_freqs, sizeof(Complex));
     if (!mic_buf || !ref_buf || !out_buf || !weights) {
         fprintf(stderr, "Error: hop-buffer alloc failed\n");
         goto done;
     }
-    for (ch = 0; ch < MCAB_CHANNELS; ++ch) {
+    for (ch = 0; ch < AEC_ARRAY_MICS; ++ch) {
         for (k = 0; k < n_freqs; ++k)
             weights[(size_t)ch * n_freqs + k].r = 0.25f;
     }
 
     /* Processing loop */
     for (frame = 0; frame < 6; ++frame) {
-        McabFront front;
-        McabFrame f;
+        AecResidualView f;
+        AecBeam beam;
+        beam.weights = weights;
+        beam.beamformed_error = NULL;
+        memset(&f, 0, sizeof(f));
+        f.struct_size = sizeof(f);
         fill_hop(mic_buf, ref_buf, hop, sample_rate, frame);
-        if (mcab_process_front(pipe, mic_buf, ref_buf, &front) != MCAB_OK ||
-            mcab_fuse(pipe, weights, NULL, &f) != MCAB_OK ||
-            post_hop(&post, &f, out_buf) != 0) {
+        if (aec_process_linear(flow.aec, mic_buf, ref_buf) != AEC_OK ||
+            aec_process_residual(flow.aec, &beam) != AEC_OK ||
+            aec_get_residual(flow.aec, &f) != AEC_OK ||
+            post_hop(&post, flow.aec, &f, out_buf) != 0) {
             fprintf(stderr, "Error: 4AEC pipeline process failed\n");
             goto done;
         }
@@ -463,7 +389,7 @@ int main(int argc, char* argv[]) {
     }
 
     printf("Processed: %d frames (%d samples)\n", frame, frame * hop);
-    printf("mcab_external_static: smoke PASS\n");
+    printf("4ch_external_static: smoke PASS\n");
     rc = 0;
 
 done:

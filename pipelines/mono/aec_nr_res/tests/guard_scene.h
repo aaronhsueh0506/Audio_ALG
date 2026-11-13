@@ -6,7 +6,8 @@
  * aec_post_reset_serial()), an optional near-end burst and an optional silent head with no echo path
  * (the estimate never becomes usable and the guard fires). The application-issued aec_reset() hops of a
  * scene are listed in reset_at (-1 terminated); the test applies them to every instance. Shared by
- * mono/aec_nr_res/tests/test_mono_chain.c and mono/alignulcnet/tests/test_mono_ulcnet.c. */
+ * mono/aec_nr_res/tests/test_mono_chain.c, mono/aec_dfn_res/tests/test_mono_dfn.c and
+ * mono/alignulcnet/tests/test_mono_ulcnet.c. */
 #ifndef GUARD_SCENE_H
 #define GUARD_SCENE_H
 

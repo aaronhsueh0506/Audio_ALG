@@ -1,8 +1,8 @@
 /**
  * Composition tests of the mono linear AEC feeding the Align-ULCNet stage (lib/aec's Aec +
- * ulcnet/ulcnet_nn_stage.h), wired as mono/alignulcnet/main.c wires them: one-hop STFT/WOLA
- * latency, delay-event identity reprime on the real alignment state and the model-callback
- * policy on real framing. A contract test, not a DSP-quality test. The stage alone (synthetic
+ * ulcnet/ulcnet_nn_stage.h + the caller's own AcStft / AcIstft), wired as mono/alignulcnet/main.c
+ * wires them: one-hop STFT/WOLA latency, delay-event identity reprime on the real alignment state and the
+ * model-callback policy on real framing. A contract test, not a DSP-quality test. The stage alone (synthetic
  * alignment events) is tested in ulcnet/tests/test_ulcnet_nn_stage.c; what needs the real AEC
  * (FIXED and MATCHED delay states, the framing straddle derivation, acquisition of a known
  * delay) stays here. One binary runs every grid of k_grids.
@@ -47,7 +47,7 @@ static const UlcnetModelIoDescriptor* test_io_descriptor(void) {
 }
 
 /* ---------------------------------------------------------------------------------------
- * The composition under test: Aec (linear context only) + UlcnetNnStage, as main.c builds
+ * The composition under test: Aec (AEC_RESIDUAL_STATE lane) + UlcnetNnStage, as main.c builds
  * them. A small test-local shim gives the pieces the shape the tests below drive.
  * --------------------------------------------------------------------------------------- */
 
@@ -65,9 +65,42 @@ typedef struct MonoUlcnetMemReq { uint64_t bytes; } MonoUlcnetMemReq;
 typedef struct MonoUlcnet {
     Aec* aec;
     UlcnetNnStage* stage;
+    /* The application's framing, as main.c owns it: the far and error analyses and the synthesis. */
+    AcStft *far_stft, *err_stft;
+    AcIstft* istft;
+    Complex far_spec[BINS_MAX], err_spec[BINS_MAX], out_spec[BINS_MAX];
     Aec* heap_aec;                /* separate-allocation construction only */
     void* heap_stage_mem;
+    void* heap_frame_mem;
 } MonoUlcnet;
+
+static void mu_frame_config(AcStftConfig* sc, const UlcnetGrid* grid) {
+    ac_stft_config_default(sc, grid->n_fft);
+    sc->ola = AC_OLA_ACCUMULATE;
+}
+
+/* Bytes of the two analyses and the synthesis, each in its own 16-byte slot. */
+static size_t mu_frame_bytes(const UlcnetGrid* grid) {
+    AcStftConfig sc;
+    mu_frame_config(&sc, grid);
+    return 2 * ALIGN16(ac_stft_get_mem_size(&sc)) + ALIGN16(ac_istft_get_mem_size(&sc));
+}
+
+static int mu_frame_init(MonoUlcnet* p, void* mem, size_t bytes, const UlcnetGrid* grid) {
+    AcStftConfig sc;
+    uint8_t* cur = (uint8_t*)mem;
+    size_t a, s;
+    if (!mem || bytes < mu_frame_bytes(grid)) return -1;
+    mu_frame_config(&sc, grid);
+    a = ac_stft_get_mem_size(&sc);
+    s = ac_istft_get_mem_size(&sc);
+    p->far_stft = ac_stft_init(cur, a, &sc);
+    cur += ALIGN16(a);
+    p->err_stft = ac_stft_init(cur, a, &sc);
+    cur += ALIGN16(a);
+    p->istft = ac_istft_init(cur, s, &sc);
+    return p->far_stft && p->err_stft && p->istft ? 0 : -1;
+}
 
 static MonoUlcnetConfig mu_default_config(int sample_rate) {
     MonoUlcnetConfig cfg;
@@ -82,7 +115,7 @@ static MonoUlcnetConfig mu_default_config(int sample_rate) {
     return cfg;
 }
 
-/* The lane on the stage's grid, linear context only; -1 for a lane whose rate or fft differs
+/* The lane on the stage's grid, AEC_RESIDUAL_STATE; -1 for a lane whose rate or fft differs
  * from the grid (fft_size 0 takes the grid's), a bad grid or an out-of-enum level (this
  * harness's policy; libaec refuses the rest when sizing). */
 static int mu_lane(const MonoUlcnetConfig* cfg, AecConfig* aec_cfg) {
@@ -99,46 +132,46 @@ static int mu_lane(const MonoUlcnetConfig* cfg, AecConfig* aec_cfg) {
     aec_cfg->delay_mode = cfg->delay_mode;
     aec_cfg->delay_num_filters = cfg->delay_num_filters;
     aec_cfg->fixed_delay_samples = cfg->fixed_delay_samples;
-    aec_cfg->enable_delay_est = cfg->delay_mode == AEC_DELAY_MATCHED;
-    aec_cfg->enable_res = 0;
-    aec_cfg->return_res_context = 1;
-    aec_cfg->spatial_linear_context = AEC_CONTEXT_LINEAR_ONLY;
+    aec_cfg->residual = AEC_RESIDUAL_STATE;
     return 0;
 }
 
-/* Pool bytes of the AEC and the stage (with its error analysis), 0 for a refused config. */
+/* Pool bytes of the AEC, the stage and the application's STFT / ISTFT objects, -1 for a refused config. */
 static int mu_get_mem_requirements(const MonoUlcnetConfig* cfg, MonoUlcnetMemReq* req) {
     AecConfig aec_cfg;
     size_t aec_bytes, stage_bytes;
     if (!req || mu_lane(cfg, &aec_cfg) != 0) return -1;
-    stage_bytes = ulcnet_nn_stage_mem_size(&cfg->grid, 1);
+    stage_bytes = ulcnet_nn_stage_mem_size(&cfg->grid);
     aec_bytes = aec_get_mem_size(&aec_cfg);
     if (aec_bytes == 0 || stage_bytes == 0) return -1;
-    req->bytes = (uint64_t)(ALIGN16(aec_bytes) + ALIGN16(stage_bytes));
+    req->bytes = (uint64_t)(ALIGN16(aec_bytes) + ALIGN16(stage_bytes) + mu_frame_bytes(&cfg->grid));
     return 0;
 }
 
-static MonoUlcnet* mu_wrap(Aec* aec, void* stage_mem, size_t stage_bytes, const MonoUlcnetConfig* cfg,
-                           MonoUlcnet* p) {
+static MonoUlcnet* mu_wrap(Aec* aec, void* stage_mem, size_t stage_bytes, void* frame_mem, size_t frame_bytes,
+                           const MonoUlcnetConfig* cfg, MonoUlcnet* p) {
     p->aec = aec;
-    p->stage = aec ? ulcnet_nn_stage_init(stage_mem, stage_bytes, &cfg->grid, 1) : NULL;
-    if (!p->stage || ulcnet_nn_stage_set_model(p->stage, &cfg->model) != 0) return NULL;
+    p->stage = aec ? ulcnet_nn_stage_init(stage_mem, stage_bytes, &cfg->grid) : NULL;
+    if (!p->stage || mu_frame_init(p, frame_mem, frame_bytes, &cfg->grid) != 0 ||
+        ulcnet_nn_stage_set_model(p->stage, &cfg->model) != 0) return NULL;
     return p;
 }
 
-/* A fresh instance in one block of `bytes` at `pool` (AEC first, then the stage). */
+/* A fresh instance in one block of `bytes` at `pool` (AEC first, then the stage, then the framing). */
 static MonoUlcnet* mu_init(void* pool, size_t bytes, const MonoUlcnetConfig* cfg) {
     AecConfig aec_cfg;
     MonoUlcnetMemReq req;
     MonoUlcnet* p;
-    size_t aec_bytes;
+    size_t aec_bytes, stage_bytes;
     if (!pool || mu_get_mem_requirements(cfg, &req) != 0 || bytes < req.bytes) return NULL;
     if (mu_lane(cfg, &aec_cfg) != 0) return NULL;
     aec_bytes = aec_get_mem_size(&aec_cfg);
+    stage_bytes = ulcnet_nn_stage_mem_size(&cfg->grid);
     p = (MonoUlcnet*)calloc(1, sizeof(*p));
     if (!p) return NULL;
-    if (!mu_wrap(aec_init(pool, aec_bytes, &aec_cfg), (uint8_t*)pool + ALIGN16(aec_bytes),
-                 ulcnet_nn_stage_mem_size(&cfg->grid, 1), cfg, p)) {
+    if (!mu_wrap(aec_init(pool, aec_bytes, &aec_cfg), (uint8_t*)pool + ALIGN16(aec_bytes), stage_bytes,
+                 (uint8_t*)pool + ALIGN16(aec_bytes) + ALIGN16(stage_bytes), mu_frame_bytes(&cfg->grid),
+                 cfg, p)) {
         free(p);
         return NULL;
     }
@@ -149,24 +182,29 @@ static MonoUlcnet* mu_init(void* pool, size_t bytes, const MonoUlcnetConfig* cfg
 static MonoUlcnet* mu_create(const MonoUlcnetConfig* cfg) {
     AecConfig aec_cfg;
     MonoUlcnet* p;
-    size_t stage_bytes;
+    size_t stage_bytes, frame_bytes;
     if (mu_lane(cfg, &aec_cfg) != 0) return NULL;
-    stage_bytes = ulcnet_nn_stage_mem_size(&cfg->grid, 1);
+    stage_bytes = ulcnet_nn_stage_mem_size(&cfg->grid);
+    frame_bytes = mu_frame_bytes(&cfg->grid);
     p = (MonoUlcnet*)calloc(1, sizeof(*p));
     if (!p) return NULL;
     p->heap_aec = (Aec*)calloc(1, sizeof(Aec));
     if (!p->heap_aec || aec_create(p->heap_aec, &aec_cfg) != 0 ||
-        posix_memalign(&p->heap_stage_mem, 16, stage_bytes) != 0) {
+        posix_memalign(&p->heap_stage_mem, 16, stage_bytes) != 0 ||
+        posix_memalign(&p->heap_frame_mem, 16, frame_bytes) != 0) {
+        free(p->heap_stage_mem);
         p->heap_stage_mem = NULL;
         free(p->heap_aec);
         free(p);
         return NULL;
     }
     memset(p->heap_stage_mem, 0x5A, stage_bytes);
-    if (!mu_wrap(p->heap_aec, p->heap_stage_mem, stage_bytes, cfg, p)) {
+    memset(p->heap_frame_mem, 0x5A, frame_bytes);
+    if (!mu_wrap(p->heap_aec, p->heap_stage_mem, stage_bytes, p->heap_frame_mem, frame_bytes, cfg, p)) {
         aec_destroy(p->heap_aec);
         free(p->heap_aec);
         free(p->heap_stage_mem);
+        free(p->heap_frame_mem);
         free(p);
         return NULL;
     }
@@ -178,6 +216,7 @@ static void mu_destroy(MonoUlcnet* p) {
     if (p->aec) aec_destroy(p->aec);
     free(p->heap_aec);
     free(p->heap_stage_mem);
+    free(p->heap_frame_mem);
     free(p);
 }
 
@@ -186,36 +225,65 @@ static int mu_hop_size(const MonoUlcnet* p) {
 }
 static Aec* mu_get_aec(const MonoUlcnet* p) { return p ? p->aec : NULL; }
 
+/* The AEC's two views of the last hop; zeroed when a getter refuses. */
+static AecResidualView mu_residual(const MonoUlcnet* p) {
+    AecResidualView v;
+    memset(&v, 0, sizeof(v));
+    v.struct_size = sizeof(v);
+    if (aec_get_residual(mu_get_aec(p), &v) != AEC_OK) memset(&v, 0, sizeof(v));
+    return v;
+}
+static AecLinearView mu_linear(const MonoUlcnet* p) {
+    AecLinearView v;
+    memset(&v, 0, sizeof(v));
+    v.struct_size = sizeof(v);
+    if (aec_get_linear(mu_get_aec(p), &v) != AEC_OK) memset(&v, 0, sizeof(v));
+    return v;
+}
+
 static void mu_reset(MonoUlcnet* p) {
     if (!p) return;
     aec_reset(p->aec);
     ulcnet_nn_stage_reset(p->stage);
+    ac_stft_reset(p->far_stft);
+    ac_stft_reset(p->err_stft);
+    ac_istft_reset(p->istft);
 }
 
 /* Planted defect for the guard-hop test only: on a hop where the AEC's output guard fires, feed the
- * stage the rendering base (aec_get_output_base()) instead of the analysis seam. */
+ * stage the rendering base (AecResidualView.base_spec) instead of the analysis seam. */
 static int g_mu_feed_base = 0;
 
-/* AEC, then the stage's begin with the lane's formed hop, the raw reference and the alignment
- * events (changed = CHANGED, solid = not UNLOCKED). */
+/* AEC, then the caller's analyses of the raw reference and the lane's formed hop, then the stage's
+ * begin_spec with the alignment events (changed = CHANGED, solid = not UNLOCKED). */
 static int mu_process_begin(MonoUlcnet* p, const float* mic, const float* ref) {
-    AecResContext rctx;
-    AecLinearContext lctx;
+    AecResidualView rv;
+    AecLinearView lv;
     UlcnetNnDelay delay;
     if (!p || !mic || !ref) return -1;
-    aec_process_context(p->aec, mic, ref);
-    aec_get_res_context(p->aec, &rctx);
-    aec_get_linear_context(p->aec, &lctx);
-    delay.changed = lctx.delay_state == AEC_LINEAR_DELAY_CHANGED;
-    delay.solid = lctx.delay_state != AEC_LINEAR_DELAY_UNLOCKED;
-    if (g_mu_feed_base) {
-        AecOutputBase ob;
-        memset(&ob, 0, sizeof(ob));
-        ob.struct_size = sizeof(ob);
-        if (aec_get_output_base(p->aec, &ob) == 0 && ob.guard_active && ob.base_spec)
-            return ulcnet_nn_stage_begin_complex(p->stage, ob.base_spec, ref, delay) == 0 ? 0 : -1;
-    }
-    return ulcnet_nn_stage_begin_time(p->stage, rctx.formed_hop, ref, delay) == 0 ? 0 : -1;
+    if (aec_process_linear(p->aec, mic, ref) != AEC_OK) return -1;
+    if (aec_process_residual(p->aec, NULL) != AEC_OK) return -1;
+    rv = mu_residual(p);
+    lv = mu_linear(p);
+    delay.changed = lv.delay_state == AEC_LINEAR_DELAY_CHANGED;
+    delay.solid = lv.delay_state != AEC_LINEAR_DELAY_UNLOCKED;
+    (void)ac_stft_push(p->far_stft, ref, p->far_spec);
+    if (g_mu_feed_base && rv.guard_active && rv.base_spec)
+        return ulcnet_nn_stage_begin_spec(p->stage, rv.base_spec, p->far_spec, delay) == 0 ? 0 : -1;
+    (void)ac_stft_push(p->err_stft, rv.formed_hop, p->err_spec);
+    return ulcnet_nn_stage_begin_spec(p->stage, p->err_spec, p->far_spec, delay) == 0 ? 0 : -1;
+}
+
+/* The stage without an AEC: the error as a time-domain hop and the raw far hop. */
+static int mu_stage_begin_time(MonoUlcnet* p, const float* err_hop, const float* far_hop, UlcnetNnDelay delay) {
+    (void)ac_stft_push(p->far_stft, far_hop, p->far_spec);
+    (void)ac_stft_push(p->err_stft, err_hop, p->err_spec);
+    return ulcnet_nn_stage_begin_spec(p->stage, p->err_spec, p->far_spec, delay) == 0 ? 0 : -1;
+}
+
+/* The caller's synthesis of the stage's output spectrum. */
+static int mu_synth(MonoUlcnet* p, float* out) {
+    return ac_istft_push(p->istft, p->out_spec, out) == mu_hop_size(p) ? 0 : -1;
 }
 
 static int mu_nn_begin(MonoUlcnet* p, UlcnetNnJob* job) {
@@ -230,14 +298,14 @@ static int mu_nn_end(MonoUlcnet* p, int model_rc) {
 }
 
 static int mu_process_end(MonoUlcnet* p, float* out) {
-    return p && out && ulcnet_nn_stage_end(p->stage, out) == 0 ? 0 : -1;
+    return p && out && ulcnet_nn_stage_end_spec(p->stage, p->out_spec) == 0 && mu_synth(p, out) == 0 ? 0 : -1;
 }
 
 /* The whole hop with the installed model (identity when unset). */
 static int mu_process(MonoUlcnet* p, const float* mic, const float* ref, float* out) {
     if (!p || !mic || !ref || !out) return -1;
     if (mu_process_begin(p, mic, ref) != 0) return -1;
-    return ulcnet_nn_stage_process(p->stage, out) == 0 ? 0 : -1;
+    return ulcnet_nn_stage_process(p->stage, p->out_spec) == 0 && mu_synth(p, out) == 0 ? 0 : -1;
 }
 
 
@@ -302,9 +370,7 @@ static void echo_sim_hop(EchoSim* s, float* mic, float* ref) {
 }
 
 static AecLinearDelayState pipeline_delay_state(const MonoUlcnet* p) {
-    AecLinearContext lctx;
-    aec_get_linear_context(mu_get_aec(p), &lctx);
-    return lctx.delay_state;
+    return mu_linear(p).delay_state;
 }
 
 /* Frames emitted at hop index h: the rolling (center=False) analysis emits
@@ -324,7 +390,7 @@ static int reprime_take(int* armed, int frames) {
 
 /* =========================================================================
  * 1. identity E2E: NULL model, zero-delay echo. Every hop, BEFORE the next
- *    process call, ctx.formed_hop is recorded; out[hop p] must match
+ *    process call, the formed hop is recorded; out[hop p] must match
  *    formed_history[p-1] within 2e-4. Hop 0 is real output (the first half of the first
  *    frame's synthesis), which for an identity stage is the zero history: it stays ~0.
  * ========================================================================= */
@@ -347,9 +413,8 @@ static void test_identity_e2e(void) {
         mu_process(p, mic, ref, out_hist[h]);
         /* Read the tap AFTER process, BEFORE the next AEC call — the seam
          * pointers alias AEC-internal buffers valid until then. */
-        AecResContext rctx;
-        aec_get_res_context(mu_get_aec(p), &rctx);
-        memcpy(formed_hist[h], rctx.formed_hop, HOP_BYTES);
+        AecResidualView rv = mu_residual(p);
+        memcpy(formed_hist[h], rv.formed_hop, HOP_BYTES);
     }
 
     double hop0_peak = 0.0;
@@ -534,7 +599,7 @@ static void test_fixed_first_alignment_resets_model(void) {
     lcg_state = 0xA11FEEDu;
     for (int h = 0; h < N; ++h) {
         AecLinearDelayState state;
-        AecLinearContext lctx;
+        AecLinearView lv;
         for (int i = 0; i < HOP; ++i) ref[i] = lcg_sample();
         memcpy(ref_hist[h], ref, HOP_BYTES);
         CHECK(mu_process(p, mic, ref, out) == 0,
@@ -542,19 +607,19 @@ static void test_fixed_first_alignment_resets_model(void) {
         state = pipeline_delay_state(p);
         /* The far tap aliases AEC-internal memory valid only until the next
          * aec call, so it is read here, right after process. */
-        aec_get_linear_context(mu_get_aec(p), &lctx);
+        lv = mu_linear(p);
         if (state == AEC_LINEAR_DELAY_CHANGED) changed++;
         if (state == AEC_LINEAR_DELAY_LOCKED && first_locked < 0)
             first_locked = h;
         if (state == AEC_LINEAR_DELAY_LOCKED) {
             /* FIXED_DELAY is exactly 2 hops, so the shifted content is the
              * far hop from 2 hops back -- an independently held reference. */
-            if (memcmp(lctx.aligned_far_hop, ref_hist[h - 2], HOP_BYTES) != 0
+            if (memcmp(lv.aligned_far_hop, ref_hist[h - 2], HOP_BYTES) != 0
                 && shifted_mismatch < 0)
                 shifted_mismatch = h;
             shifted_hops++;
         } else {
-            if (memcmp(lctx.aligned_far_hop, ref_hist[h], HOP_BYTES) != 0
+            if (memcmp(lv.aligned_far_hop, ref_hist[h], HOP_BYTES) != 0
                 && raw_mismatch < 0)
                 raw_mismatch = h;
             raw_hops++;
@@ -597,9 +662,7 @@ static void test_fixed_first_alignment_resets_model(void) {
  *     ulcnet/ulcnet_nn_stage.c turns this test red.
  * ========================================================================= */
 static int pipeline_delay_samples(const MonoUlcnet* p) {
-    AecLinearContext lctx;
-    aec_get_linear_context(mu_get_aec(p), &lctx);
-    return lctx.delay_samples;
+    return mu_linear(p).delay_samples;
 }
 
 static void test_relock_same_delay_resets_model(void) {
@@ -2257,7 +2320,7 @@ static void test_phased_hop(void) {
 
 /* =========================================================================
  * Guard hops. The stage reads the AEC's analysis seam (formed_hop), never the rendering base, so on a
- * hop where aec_get_output_base().guard_active == 1 the identity output is the unguarded linear
+ * hop where AecResidualView.guard_active == 1 the identity output is the unguarded linear
  * residual and may be louder than the capture. Three guard scenes run with the NULL model (identity):
  * on every guard hop out[h+1] must equal formed[h] (the stage input is formed_hop, not base_spec), and
  * base_spec must differ from error_spec on those hops (so the check can tell the two apart). The hops
@@ -2287,8 +2350,7 @@ static int guard_hops_run(const GuardScene* sc, GuardHopStats* gs) {
     for (int h = 0; h < sc->nh; h++) {
         const float* mic = sc->mic + (size_t)h * HOP;
         const float* far = sc->far + (size_t)h * HOP;
-        AecResContext rctx;
-        AecOutputBase ob;
+        AecResidualView rv;
         for (int k = 0; k < 4; k++) {
             if (sc->reset_at[k] == h) { mu_reset(p); prev_ok = 0; }
         }
@@ -2311,27 +2373,25 @@ static int guard_hops_run(const GuardScene* sc, GuardHopStats* gs) {
                 if (guard_prev) gs->louder_on_guard++;
             }
         }
-        aec_get_res_context(mu_get_aec(p), &rctx);
-        memset(&ob, 0, sizeof(ob));
-        ob.struct_size = sizeof(ob);
-        if (!rctx.error_spec || aec_get_output_base(mu_get_aec(p), &ob) != 0 || !ob.base_spec) {
+        rv = mu_residual(p);
+        if (!rv.error_spec || !rv.base_spec) {
             mu_destroy(p);
             return -1;
         }
-        guard_prev = ob.guard_active;
+        guard_prev = rv.guard_active;
         if (guard_prev) {
             double num = 0.0, den = 0.0;
             gs->guard_hops++;
-            for (int k = 0; k < ob.n_freqs; k++) {
-                double dr = (double)ob.base_spec[k].r - (double)rctx.error_spec[k].r;
-                double di = (double)ob.base_spec[k].i - (double)rctx.error_spec[k].i;
+            for (int k = 0; k < rv.n_freqs; k++) {
+                double dr = (double)rv.base_spec[k].r - (double)rv.error_spec[k].r;
+                double di = (double)rv.base_spec[k].i - (double)rv.error_spec[k].i;
                 num += dr * dr + di * di;
-                den += (double)rctx.error_spec[k].r * rctx.error_spec[k].r +
-                       (double)rctx.error_spec[k].i * rctx.error_spec[k].i;
+                den += (double)rv.error_spec[k].r * rv.error_spec[k].r +
+                       (double)rv.error_spec[k].i * rv.error_spec[k].i;
             }
             if (den > 0.0 && num / den > gs->max_sep) gs->max_sep = num / den;
         }
-        memcpy(formed_prev, rctx.formed_hop, HOP_BYTES);
+        memcpy(formed_prev, rv.formed_hop, HOP_BYTES);
         memcpy(mic_prev, mic, HOP_BYTES);
         prev_ok = 1;
     }
@@ -2407,8 +2467,8 @@ static void test_guard_hops_feed_analysis_seam(void) {
 
 
 /* =========================================================================
- * 11. Overlap-add acceptance of the time-domain entry (begin_time with the AEC's float formed_hop
- *     and the raw far). The stage synthesises with AC_OLA_ACCUMULATE: every hop is the frame's
+ * 11. Overlap-add acceptance of the time-domain error (the caller analyses the AEC's float formed_hop
+ *     and the raw far, the stage takes the spectra). The caller synthesises with AC_OLA_ACCUMULATE: every hop is the frame's
  *     first half plus the previous frame's saved second half, nothing is held back, so hop #0 is
  *     real output. A band-varying real mask model makes that first half non-zero, and every hop
  *     is compared with an independent chain -- own analysis STFT of the formed hop the AEC
@@ -2507,17 +2567,17 @@ static int acc_drive(MonoUlcnet* p, BandModelState* st, EchoSim* sim, int n, Acc
     if (n > ACC_MAX_HOPS) return -1;
     for (int h = 0; h < n; h++) {
         int before = st->infer_calls;
-        AecResContext rctx;
-        AecLinearContext lctx;
+        AecResidualView rv;
+        AecLinearView lv;
         echo_sim_hop(sim, mic, far);
         if (mu_process(p, mic, far, out) != 0) return -1;
-        aec_get_res_context(mu_get_aec(p), &rctx);
-        aec_get_linear_context(mu_get_aec(p), &lctx);
+        rv = mu_residual(p);
+        lv = mu_linear(p);
         r->ran[h] = st->infer_calls > before;
-        r->state[h] = (int)lctx.delay_state;
-        r->changed[h] = lctx.delay_state == AEC_LINEAR_DELAY_CHANGED;
-        r->solid[h] = lctx.delay_state != AEC_LINEAR_DELAY_UNLOCKED;
-        (void)ac_stft_push_planar(ref->stft, rctx.formed_hop, re, im);
+        r->state[h] = (int)lv.delay_state;
+        r->changed[h] = lv.delay_state == AEC_LINEAR_DELAY_CHANGED;
+        r->solid[h] = lv.delay_state != AEC_LINEAR_DELAY_UNLOCKED;
+        (void)ac_stft_push_planar(ref->stft, rv.formed_hop, re, im);
         if (r->ran[h] && model_effective) for (int k = 0; k < BINS; k++) { mre[k] = band_gain(k) * re[k]; mim[k] = band_gain(k) * im[k]; }
         else { memcpy(mre, re, sizeof(float) * BINS); memcpy(mim, im, sizeof(float) * BINS); }
         if (ac_istft_push_planar(ref->istft, mre, mim, want) != HOP || memcmp(want, out, HOP_BYTES) != 0)
@@ -2616,8 +2676,9 @@ static void test_accumulate_acceptance(void) {
         if (pp) {
             lcg_state = 0x5EEDu;
             for (int i = 0; i < HOP; i++) { err[i] = lcg_sample(); far[i] = lcg_sample(); }
-            CHECK(ulcnet_nn_stage_begin_time(pp->stage, err, far, ev) == 0 &&
-                  ulcnet_nn_stage_process(pp->stage, out) == 0, "accumulate: solid-only first hop processes");
+            CHECK(mu_stage_begin_time(pp, err, far, ev) == 0 &&
+                  ulcnet_nn_stage_process(pp->stage, pp->out_spec) == 0 && mu_synth(pp, out) == 0,
+                  "accumulate: solid-only first hop processes");
             (void)ac_stft_push_planar(ref.stft, err, re, im);
             for (int k = 0; k < BINS; k++) { mre[k] = band_gain(k) * re[k]; mim[k] = band_gain(k) * im[k]; }
             accref_dft_hop(&ref, mre, mim, dftout);

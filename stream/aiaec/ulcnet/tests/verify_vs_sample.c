@@ -151,7 +151,7 @@ static int board_always_bypass_pre(BoardDriver *d, const int16_t *err_in, const 
 
 /* Stage 3 (alignment edge) + Stage 4 + the reprime-or-frame_open half of Stage 5, taking
  * err_in/far_in already as full-scale float, exactly like the real board sample's own Stage 4
- * (alg_ai3_alignulcnet.c:1582: AecResContext.formed_hop and its float ref_f straight into
+ * (alg_ai3_alignulcnet.c:1582: AecResidualView.formed_hop and its float ref_f straight into
  * ac_stft_push_planar, no int16 step at all). Returns 1 (a real accelerator job is due, in/out
  * filled), 0 (reprime: already bypassed, in/out untouched/meaningless), -1 (contract error). */
 static int board_pre_f32(BoardDriver *d, const float *err_in, const float *far_in,

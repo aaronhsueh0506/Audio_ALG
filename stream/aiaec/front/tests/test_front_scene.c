@@ -37,9 +37,7 @@ static Aec *ref_aec(const Case *c, void **pool) {
     a.delay_mode = c->mode == 0 ? AEC_DELAY_MATCHED : c->mode == 1 ? AEC_DELAY_FIXED : AEC_DELAY_EXTERNAL_ALIGNED;
     a.delay_num_filters = c->filters;
     a.fixed_delay_samples = c->fixed;
-    a.enable_delay_est = c->mode == 0;
-    a.enable_res = 0;
-    a.return_res_context = 1;
+    a.residual = AEC_RESIDUAL_STATE;
     bytes = aec_get_mem_size(&a);
     *pool = alloc16(bytes);
     return aec_init(*pool, bytes, &a);
@@ -97,17 +95,21 @@ static void run_case(const Case *c, const Scene *sc, int is_f32, Counts *cnt, fl
               "%s: raw_far differs from the converted far (block %d)", c->name, b);
         if (is_f32) CHECK(fo.raw_far == far_f + (size_t)b * hop_in, "%s: float raw_far is not the caller's buffer", c->name);
         for (h = 0; h < c->n_frames; ++h) {
-            AecResContext rc_ctx;
-            AecLinearContext lc;
+            AecResidualView rv;
+            AecLinearView lv;
             AiaecAlignEvent want;
             size_t o = (size_t)(b * c->n_frames + h) * hop;
-            aec_process_context(r, mic_f + o, far_f + o);
-            aec_get_res_context(r, &rc_ctx);
-            aec_get_linear_context(r, &lc);
+            rv.struct_size = sizeof(rv);
+            lv.struct_size = sizeof(lv);
+            CHECK(aec_process_linear(r, mic_f + o, far_f + o) == AEC_OK, "%s: reference linear stage", c->name);
+            CHECK(aec_process_residual(r, NULL) == AEC_OK, "%s: reference residual stage", c->name);
+            CHECK(aec_get_residual(r, &rv) == AEC_OK && aec_get_linear(r, &lv) == AEC_OK && rv.formed_hop,
+                  "%s: reference views", c->name);
+            if (g_fail) return;
             /* the AEC's own contract: CHANGED is a compensated hop, so solid is "not UNLOCKED" */
-            want.changed = lc.delay_state == AEC_LINEAR_DELAY_CHANGED;
-            want.solid = lc.delay_state != AEC_LINEAR_DELAY_UNLOCKED;
-            CHECK(memcmp(fo.formed_hop + (size_t)h * hop, rc_ctx.formed_hop, (size_t)hop * sizeof(float)) == 0,
+            want.changed = lv.delay_state == AEC_LINEAR_DELAY_CHANGED;
+            want.solid = lv.delay_state != AEC_LINEAR_DELAY_UNLOCKED;
+            CHECK(memcmp(fo.formed_hop + (size_t)h * hop, rv.formed_hop, (size_t)hop * sizeof(float)) == 0,
                   "%s: residual differs at block %d hop %d", c->name, b, h);
             CHECK(events_equal(&fo.events[h], &want), "%s: event differs at block %d hop %d (%d/%d vs %d/%d)",
                   c->name, b, h, fo.events[h].changed, fo.events[h].solid, want.changed, want.solid);

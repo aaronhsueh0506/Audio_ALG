@@ -1,8 +1,8 @@
 #!/usr/bin/env python3
 """pyc_parity.py -- comparison half of pyc_parity_pipelines.sh (run it through the shell script).
 
-The shell script builds the C code twice (Layer 1: std-math, Layer 2: shipped) and the two C drivers
-(pyc_drv.c). This program runs the drivers, runs the Python references of the pipelines, compares, prints a
+The shell script builds the C code twice (Layer 1: std-math, Layer 2: shipped) and the three C drivers
+(pyc_drv.c: 4-channel chain, 4-channel replay against the AEC_TESTING archive, mono). This program runs the drivers, runs the Python references of the pipelines, compares, prints a
 table and writes a JSON file. Every tolerance below is frozen: set from the measured max error over every
 scenario in both layers, with a margin (see the comment above TOL1/TOL2). A tolerance prints next to the
 number it judged and changes only by re-measuring, never silently.
@@ -31,9 +31,8 @@ GRIDS = [('16k256', 16000, 256), ('16k512', 16000, 512), ('48k1024', 48000, 1024
 GRID_LABEL = {'16k256': '16k/256', '16k512': '16k/512', '48k1024': '48k/1024'}
 PRESETS = ['balanced', 'mild', 'aggressive']
 # b.res4 only (not the shared PRESETS list, so PRESETS-driven scenarios such as l2.res4.*.replay
-# are unaffected). aec=no_floor on the C side is a direct construction-time preset (the AecRes of
-# pyc_drv.c takes any AecPreset), matching the Python side's
-# PostBeamResidualSuppressor.set_preset('no_floor').
+# are unaffected). aec=no_floor on the C side: the array is built at the requested AecLevel
+# (no_floor included), matching the Python side's PostBeamResidualSuppressor.set_preset('no_floor').
 PRESETS_B = PRESETS + ['no_floor']
 
 # Known gaps: a row listed here may exceed its tolerance without failing; if it does not, the script
@@ -58,16 +57,25 @@ TOL2 = {                     # Layer 2: shipped (fast-math, NEON) against std-ma
     'chain_rms_db': -45.0,       # closed loop: rms(d)/rms(ref) in dB up to the first divergence hop; measured worst -50.6 dB (l2.chain4.48k1024.gres)
 }
 
+# Tree-relative paths, except those under AEC_SOURCE_PREFIX: the build links whatever lib/deps.mk's AEC_DIR
+# resolved to (the sibling AEC/c_impl by default), so those are hashed from the AEC_DIR the build used.
+AEC_SOURCE_PREFIX = 'AEC/c_impl/'
 SOURCES = [   # hashed into the JSON so a result can be tied to the code it judged
-    'Audio_ALG/pipelines/4ch/mcab.c',
     'Audio_ALG/pipelines/4ch/pipeline.py',
     'Audio_ALG/pipelines/mono/aec_nr_res/pipeline.py',
     'Audio_ALG/pipelines/common/cng_aec3.py',
-    'Audio_ALG/pipelines/4ch/mcab.h',
-    'Audio_ALG/pipelines/4ch/mcab_sample_post.h',
+    'Audio_ALG/pipelines/4ch/array_sample_post.h',
     'Audio_ALG/pipelines/tests/pyc_parity/pyc_drv.c',
-    'Audio_ALG/lib/aec/c_impl/src/aec_res.c',
+    'AEC/c_impl/src/aec.c',
+    'AEC/c_impl/src/aec_array.c',
+    'AEC/c_impl/src/aec_array_internal.h',
+    'AEC/c_impl/src/aec_res.c',
+    'AEC/c_impl/src/aec_res_internal.h',
+    'AEC/c_impl/test/aec_test_hooks.h',
 ]
+
+C_LEVEL_DIGIT = {'mild': '0', 'balanced': '1', 'aggressive': '2', 'no_floor': '3'}
+C_NR_LEVEL_DIGIT = {'mild': '0', 'moderate': '1', 'balanced': '2', 'aggressive': '3'}
 
 BUILD_NAME = {1: 'std-math SIMD=0', 2: 'shipped SIMD=1'}
 
@@ -231,7 +239,10 @@ class Ctx:
         return self.mod('pipelines.4ch.pipeline')
 
     # ---- C drivers
-    def drv(self, layer, kind):
+    def drv(self, layer, kind, mode=None):
+        """The 4-channel replay runs in its own executable (built against the AEC_TESTING archive)."""
+        if kind == '4ch' and mode == 'replay':
+            kind = '4ch_replay'
         return self.info['L%d.drv_%s' % (layer, kind)]
 
     def run(self, layer, kind, mode, name, **kv):
@@ -241,7 +252,9 @@ class Ctx:
         key = ('run', layer, name)
         if key in self.cache:
             return self.cache[key]
-        cmd = [self.drv(layer, kind), mode] + ['%s=%s' % (k, v) for k, v in kv.items()] + ['out=' + out]
+        # The drivers take a level as its enum number; the Python side names it.
+        kv = {k: (C_LEVEL_DIGIT[v] if k == 'aec' else C_NR_LEVEL_DIGIT[v] if k == 'nr' else v) for k, v in kv.items()}
+        cmd = [self.drv(layer, kind, mode), mode] + ['%s=%s' % (k, v) for k, v in kv.items()] + ['out=' + out]
         r = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, cwd=self.work)
         if r.returncode != 0:
             raise RuntimeError('driver failed (%s): %s\n%s' % (' '.join(os.path.basename(c) if os.sep in c else c for c in cmd),
@@ -265,11 +278,10 @@ class Ctx:
         return h.hexdigest()
 
     def source_sha(self, rel):
-        """SOURCES entries resolve tree-relative, except aec_res.c: the build links whatever
-        lib/deps.mk's AEC_DIR resolved to (the sibling AEC/c_impl by default), which may differ
-        from the lib/aec submodule checkout this path names; hash the one actually built."""
-        if rel == 'Audio_ALG/lib/aec/c_impl/src/aec_res.c':
-            return self.abs_sha(os.path.join(self.info['AEC_DIR'], 'src', 'aec_res.c'))
+        """SOURCES entries resolve tree-relative, except the AEC library's: hash the file under the
+        AEC_DIR the build linked, which may differ from the lib/aec submodule checkout."""
+        if rel.startswith(AEC_SOURCE_PREFIX):
+            return self.abs_sha(os.path.join(self.info['AEC_DIR'], rel[len(AEC_SOURCE_PREFIX):]))
         return self.tree_sha(rel)
 
 
@@ -320,7 +332,7 @@ class Seam:
 
     @property
     def guard(self):
-        """sc[12]: mono guard_active (B is Y = error + echo there, else E); 4ch McabFrame.guard_lanes."""
+        """sc[12]: mono guard_active (B is Y = error + echo there, else E); 4ch AecResidualView.guard_lanes."""
         return self.sc[:, 12].astype(np.int64)
 
     @property
@@ -402,7 +414,7 @@ def py_nr(cx, seam, usable, nr_preset='balanced'):
     """mono.aec_nr_res.pipeline.run_nr_spectrum over a recorded seam, usable_linear from `usable`.
 
     run_nr_spectrum estimates on output_base_spec. The mono chain's denoiser reads the rendering base B; the 4ch
-    denoiser reads the analysis beam E (mcab_sample_anr_gain), so a 4ch seam hands Python E there."""
+    denoiser reads the analysis beam E (array_sample_anr_gain), so a 4ch seam hands Python E there."""
     est = seam.B if seam.kind == 0 else seam.E
     ctxs = [types.SimpleNamespace(error_spec=seam.E[h], output_base_spec=est[h], r2=seam.R2[h],
                                   usable_linear=bool(usable[h]))
@@ -542,10 +554,10 @@ def sec_a(cx, g, sr, fft, want):
                            usable=np.concatenate([verdict, np.zeros(base.nh - n, np.uint8)]))
             m = stats(rep.Gnr, g_pyv)
             rows.append(make_row(pre + 'glue_fold', 1,
-                                 'NR glue with the R^2 fold active: Python NR vs C mcab_sample_anr_gain over the same frame, usable = Python verdict',
-                                 'pyc_drv_4ch replay (usable = Python verdict); run_nr_spectrum(C E, C R2, Python verdict)',
+                                 'NR glue with the R^2 fold active: Python NR vs C array_sample_anr_gain over the same frame, usable = Python verdict',
+                                 'pyc_drv_4ch_replay replay (usable = Python verdict); run_nr_spectrum(C E, C R2, Python verdict)',
                                  gate=m['max_abs'] <= tol, metrics=m, tol={'max_abs': tol}, grid=g, ref='Python',
-                                 note='verdict true on %d of %d hops (this row exercises the mcab_sample_post.h r2 fold)' % (int(verdict.sum()), n)))
+                                 note='verdict true on %d of %d hops (this row exercises the array_sample_post.h r2 fold)' % (int(verdict.sum()), n)))
         if want(pre + 'verdict_flag'):
             mism = int(np.count_nonzero(verdict.astype(bool) != base.usable[:n]))
             first = np.flatnonzero(verdict.astype(bool) != base.usable[:n])
@@ -555,7 +567,7 @@ def sec_a(cx, g, sr, fft, want):
             rows.append(make_row(pre + 'verdict_flag', 1, 'fused usable_linear: Python verdict vs C frame flag, per hop',
                                  prod_c + '; pipeline.fuse() context.usable_linear (stock Python 4ch; lane-0 far-spec fusion on a mixed warm/soft-realign hop, S-27, no raise)',
                                  gate=mism == 0, metrics=m, tol={'mismatch_hops': 0}, grid=g, ref='Python',
-                                 note='C flag = mcab_fuse AND of usable_linear over contributing lanes'))
+                                 note='C flag = the array fusion (aec_array.c fuse_contexts) AND of usable_linear over contributing lanes'))
         if want(pre + 'gnr_e2e'):
             g_pyv = py_nr(cx, base, np.concatenate([verdict, np.zeros(base.nh - n, np.uint8)]))
             m = stats(base.Gnr, g_pyv)
@@ -588,10 +600,10 @@ def sec_a(cx, g, sr, fft, want):
              'gnr_bit_identical': d_gnr['bit_identical'], 'gres_bit_identical': d_gres['bit_identical'],
              'guard_hops': guard_hops, 'max_abs_B_minus_E': b_vs_e}
         rows.append(make_row(pre + 'replay_identity', 1, 'C internal: replay over the chain\'s seam (recorded usable, recorded B) reproduces the chain bit for bit',
-                             'pyc_drv_4ch replay seam=<L1 chain> vs pyc_drv_4ch chain, same build', grid=g, ref='C (self)',
+                             'pyc_drv_4ch_replay replay seam=<L1 chain> vs pyc_drv_4ch chain, same build', grid=g, ref='C (self)',
                              gate=(d_out['bit_identical'] and d_gnr['bit_identical'] and d_gres['bit_identical'] and guard_hops > 0 and b_vs_e > 0.0),
                              metrics=m, tol={'out_max_abs': 0.0, 'guard_hops_must_exceed': 0},
-                             note='guard hops (McabFrame.guard_lanes != 0): %d of %d, max |B - E| %.3g; a replay rendering E instead of B differs there'
+                             note='guard hops (AecResidualView.guard_lanes != 0): %d of %d, max |B - E| %.3g; a replay rendering E instead of B differs there'
                                   % (guard_hops, base.nh, b_vs_e)))
     return rows
 
@@ -931,7 +943,7 @@ def sec_l2(cx, g, sr, fft, want):
         verdict = np.concatenate([py['verdict'][:n], np.zeros(base1.nh - n, np.uint8)])
         r1 = c_replay(cx, 1, '4ch', path1, 'replay2_%s_fold.bin' % g, usable=verdict)
         r2 = c_replay(cx, 2, '4ch', path1, 'replay2_%s_fold.bin' % g, usable=verdict)
-        prod = 'pyc_drv_4ch replay seam=<L1 chain>, usable = Python verdict (R^2 fold active), built in both layers'
+        prod = 'pyc_drv_4ch_replay replay seam=<L1 chain>, usable = Python verdict (R^2 fold active), built in both layers'
         for k, a, b, t in (('gnr', r1.Gnr, r2.Gnr, tg), ('out', r1.out, r2.out, to)):
             if want(pre + '.' + k):
                 m = stats(a, b)
@@ -948,7 +960,7 @@ def sec_l2(cx, g, sr, fft, want):
         m = stats(r1.Gres, r2.Gres)
         m['dt_hops'] = int((sp.max_dt > 0.2).sum())
         rows.append(make_row(rid, 2, '4ch post-beam RES stage over identical std-math frames, shipped vs std-math C: G_res (%s)' % p,
-                             'pyc_drv_4ch replay seam=<L1 chain aec=%s>, built in both layers' % p, gate=m['max_abs'] <= tg, metrics=m,
+                             'pyc_drv_4ch_replay replay seam=<L1 chain aec=%s>, built in both layers' % p, gate=m['max_abs'] <= tg, metrics=m,
                              tol={'max_abs': tg}, grid=g, ref='C std-math'))
     pre = 'l2.mono.%s.replay' % g
     if want(pre + '.gnr') or want(pre + '.out'):

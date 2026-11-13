@@ -1,26 +1,25 @@
-/* 4ch_aec_bf_dfn_res board skeleton: four-channel linear AEC -> beamformer (bf) -> RES ->
- * DeepFilterNet2 composed from the library calls. Example code: the four lanes, the shared
- * estimator and the mcab flow (mcab_sample_flow.h builds them in the application's order) with the
- * sample SRP-PHAT/BF helper (mcab_sample_beam.h), the post-beam RES (lib/aec AecRes) initialised
- * here, P = B * G_res (+ comfort noise) formed here over the rendering base B, and dfn/dfn_hop.h
- * for the DFN2 hop (sized and carved by dfn/dfn_hop_pool.h). Per hop:
+/* 4ch_aec_bf_dfn_res board skeleton: four-microphone array AEC -> beamformer (bf) -> RES ->
+ * DeepFilterNet2 composed from the library calls. Example code: the array instance of lib/aec
+ * (aec.h, n_mics = 4: four lanes, the shared estimator and the residual gain stage; one pool placed
+ * by aec_get_mem_requirements() + aec_init_ex()) with the sample SRP-PHAT/BF helper (array_sample_beam.h), P = B * G_res (+ comfort noise)
+ * formed here over the rendering base B, and dfn/dfn_hop.h for the DFN2 hop (sized and carved by
+ * dfn/dfn_hop_pool.h). Per hop:
  *
- *     mcab_sample_beam_process(unit, mics, far, &beam, &info);    // delay, lanes, SRP-PHAT, BF
- *     mcab_sample_beam_fuse(unit, &frame);                         // E, B, R2, CN
- *     mcab_sample_res_input(&frame, &in);                          // the RES input of that frame
- *     G_res = aec_res_process(res, &in);                           // estimated on E
- *     P = B * G_res (+ comfort noise);                              // before the DFN hop begins
- *     dfn_hop_process(&hop, frame.e, P, out);                       // estimated on E, applied on P
+ *     array_sample_beam_process(unit, mics, far, &beam, &info);    // delay, lanes, SRP-PHAT, BF
+ *     array_sample_beam_fuse(unit, &frame);                         // aec_process_residual + aec_get_residual
+ *     aec_apply_gain(aec, NULL, P);                                // P = B * G_res (estimated on E)
+ *     aec_apply_cng(aec, NULL, P);                                 // optional comfort noise
+ *     dfn_hop_process(&hop, frame.error_spec, P, out);             // estimated on E, applied on P
  *
- * B is E except on hops where a contributing lane's output guard fired (mcab.h); there P carries
- * that lane's capture while the model still estimates on E. A lane's post-chain reset
- * (frame.post_reset_serial moved) reseeds the comfort noise before P is formed. On the bridge path
+ * B is E except on hops where a contributing lane's output guard fired (aec.h); there P carries
+ * that lane's capture while the model still estimates on E. The array reseeds its comfort noise
+ * on a lane's post-chain reset (frame.post_reset_serial moved) before P is formed. On the bridge path
  * (host rate differs from the model grid) the host-grid synthesis is inside the bridge and runs at
  * the top of its begin(), so dfn_rate_bridge_reset_synthesis() on that hop clears just its
  * overlap-add tail (DFN2 and the resamplers keep running, no delay line). On the stage path (host
  * rate equals the model grid's) the synthesis follows the stage by its lookahead and this example
- * resets the whole hop instead. In this flow that serial moves only with
- * a flow reset, which the refused-call path below already pairs with a hop reset.
+ * resets the whole hop instead. Here that serial moves only with an array reset, which the
+ * refused-call path below already pairs with a hop reset.
  *
  * A host on the model's own rate (--ai-sample-rate, default 48 kHz) drives dfn_res_stage.h and
  * synthesises through an AcIstft; any other host rate runs the same stage on its 48 kHz grid inside
@@ -34,17 +33,14 @@
  * The program builds the pool from the command-line delay profile and ERB matrices, installs a
  * fail-open model callback and runs a few silent hops. Replace run_accelerator() with the board
  * runtime call. */
-#include "aec_res.h"
-#include "4ch/mcab.h"
-#include "4ch/mcab_sample_beam.h"
-#include "4ch/mcab_sample_flow.h"
-#include "4ch/mcab_sample_post.h"
+#include "aec.h"
+#include "4ch/array_sample_beam.h"
+#include "4ch/array_sample_post.h"
 #include "dfn/dfn_hop.h"
 #include "dfn/dfn_hop_pool.h"
 #include "utility/mem_align.h"
-#include "utility/simd_kernels.h"
 #include "dfn/dfn_example_args.h"
-#include "4ch/mcab_sample_driver.h"
+#include "4ch/array_sample_driver.h"
 
 #include <math.h>
 #include <stdio.h>
@@ -67,30 +63,25 @@ static int run_accelerator(void *user, const DFN2PrepostInputs *inputs,
 static const int HOST_RATES[] = { 16000, 48000, 0 };
 
 static const char *name="4ch_aec_bf_dfn_res";
-static float microphones[HOST_MAX_HOP*MCAB_CHANNELS];
+static float microphones[HOST_MAX_HOP*AEC_ARRAY_MICS];
 static float far[HOST_MAX_HOP],output[HOST_MAX_HOP];
 typedef struct DfnSample {
     DfnExampleArgs args;
     ExampleCliDelayOptions delay;
-    McabConfig unit_cfg;
-    McabSampleBeamParams unit_bp;
-    McabMemReq unit_req;              /* mcab's own descriptor: the pool alignment */
-    McabMemBreakdown grid;
-    size_t flow_bytes, beam_bytes;    /* lanes + estimator + mcab pool; SRP/BF helper */
-    McabSampleFlow objs;
+    AecConfig unit_cfg;
+    ArraySampleBeamParams unit_bp;
+    AecMemReq unit_req;               /* the array's descriptor: the pool alignment */
+    AecSignalGrid grid;
+    size_t aec_bytes, beam_bytes;     /* the array pool; SRP/BF helper */
+    Aec *aec;
     DfnHopPoolPlan dfn;               /* the stage (or bridge), its synthesis and output */
     DfnExampleErb erb;                /* the stage borrows these matrices until it is destroyed */
     DFN2ModelIoDescriptor descriptor;
-    AecConfig res_cfg;
-    size_t vec_bytes, spec_bytes, res_bytes, total;
+    size_t spec_bytes, total;
     void *pool;
-    McabSampleBeam *unit;
-    AecRes *res;
-    float *unity, *total_gain;        /* the RES gain path: min(1, G_res) */
+    ArraySampleBeam *unit;
     Complex *post;                    /* P */
-    uint32_t rng;
-    uint32_t reset_handled;           /* McabFrame.post_reset_serial last followed */
-    int n_freqs;
+    uint32_t reset_handled;           /* AecResidualView.post_reset_serial last followed */
     DfnResStage *stage;
     DfnRateBridge *bridge;
     AcIstft *istft;
@@ -132,7 +123,7 @@ static int dfn_set(void *user, const char *arg, const char *value) {
 }
 static int dfn_parse(void *user, int argc, char **argv) {
     DfnSample *s=user;
-    static const McabSampleCliOption options[]={
+    static const ArraySampleCliOption options[]={
         {"-h",0},{"--help",0},{"--sample-rate",1},{"--ai-sample-rate",1},{"--ai-fft-size",1},
         {"--delay-mode",1},
         {"--delay-num-filters",1},{"--fixed-delay",1},{"--erb-fwd",1},
@@ -145,7 +136,7 @@ static int dfn_parse(void *user, int argc, char **argv) {
     s->delay.mode=s->args.delay_mode;
     s->delay.num_filters=s->args.delay_num_filters;
     s->delay.fixed_samples=s->args.fixed_delay_samples;
-    int rc=mcab_sample_scan_cli(argc,argv,options,sizeof(options)/sizeof(options[0]),
+    int rc=array_sample_scan_cli(argc,argv,options,sizeof(options)/sizeof(options[0]),
                           s,dfn_set,dfn_unknown);
     if (rc != 0) return rc;
     if (dfn_example_resolve_model_grid(&s->args,name) != 0) return 2;
@@ -161,20 +152,13 @@ static int dfn_parse(void *user, int argc, char **argv) {
 
 /* Everything the pool holds, sized once. 0, or -1 for a configuration no stage accepts. */
 static int dfn_plan(DfnSample *s) {
-    if (mcab_get_mem_requirements(&s->unit_cfg,&s->unit_req) != 0 ||
-        mcab_get_mem_breakdown(&s->unit_cfg,&s->grid) != 0 ||
-        mcab_sample_flow_get_mem_size(&s->unit_cfg,&s->flow_bytes) != 0 ||
-        mcab_sample_beam_get_mem_size(&s->unit_cfg,&s->unit_bp,&s->beam_bytes) != 0 ||
+    if (aec_get_mem_requirements(&s->unit_cfg,&s->unit_req) != 0 ||
+        aec_resolve_signal_grid(s->unit_cfg.sample_rate,s->unit_cfg.fft_size,&s->grid) != AEC_OK ||
+        array_sample_beam_get_mem_size(&s->unit_cfg,&s->unit_bp,&s->beam_bytes) != 0 ||
         s->grid.fft_size/2 > HOST_MAX_HOP || !isfinite(s->args.atten_lim_db))
         return -1;
-    /* The RES: the balanced level's AecConfig on the unit's grid. */
-    aec_config_from_level(&s->res_cfg,AEC_LEVEL_BALANCED,s->args.sample_rate);
-    s->res_cfg.fft_size=s->grid.fft_size;
-    s->res_bytes=aec_res_get_mem_size(&s->res_cfg);
-    if (s->res_bytes == 0) return -1;
-    s->n_freqs=s->grid.n_freqs;
-    s->vec_bytes=ALIGN16((size_t)s->n_freqs*sizeof(float));
-    s->spec_bytes=ALIGN16((size_t)s->n_freqs*sizeof(Complex));
+    s->aec_bytes=ALIGN16((size_t)s->unit_req.bytes);
+    s->spec_bytes=ALIGN16((size_t)s->grid.n_freqs*sizeof(Complex));
 
     s->dfn.stage_cfg=dfn_res_stage_default_config(&s->args.model_grid);
     s->dfn.stage_cfg.atten_lim_db=s->args.atten_lim_db;
@@ -184,18 +168,16 @@ static int dfn_plan(DfnSample *s) {
     s->dfn.stage_cfg.model.infer=run_accelerator;
     s->dfn.stage_cfg.model.reset=NULL;
     s->dfn.stage_cfg.model.io_descriptor=&s->descriptor;
-    if (dfn_hop_pool_plan(&s->dfn,s->args.sample_rate,s->unit_cfg.fft_size) != 0) return -1;
-    /* flow objects, helper, RES, unity, total gain, P, then the stage (or bridge) and its synthesis */
-    s->total=ALIGN16(s->flow_bytes)+ALIGN16(s->beam_bytes)+ALIGN16(s->res_bytes)+2*s->vec_bytes+s->spec_bytes+
+    if (dfn_hop_pool_plan(&s->dfn,s->args.sample_rate,0) != 0) return -1;   /* the rate's default grid */
+    /* array, helper, P, then the stage (or bridge) and its synthesis */
+    s->total=s->aec_bytes+ALIGN16(s->beam_bytes)+s->spec_bytes+
              dfn_hop_pool_bytes(&s->dfn);
     return 0;
 }
 
 /* A refused hop: back to the state of a fresh pipeline, every stage together. */
 static void dfn_reset(DfnSample *s) {
-    mcab_sample_beam_reset(s->unit);
-    aec_res_reset(s->res);
-    s->rng=MCAB_SAMPLE_CNG_RNG_SEED;
+    array_sample_beam_reset(s->unit);
     dfn_hop_reset(&s->hop);
 }
 
@@ -203,51 +185,43 @@ static void dfn_cleanup(void *user) {
     DfnSample *s=user;
     if (s->bridge) dfn_rate_bridge_destroy(s->bridge);
     else if (s->stage) dfn_res_stage_destroy(s->stage);
-    if (s->unit) mcab_sample_beam_destroy(s->unit);
-    mcab_sample_flow_destroy(&s->objs);
+    if (s->unit) array_sample_beam_destroy(s->unit);
+    aec_destroy(s->aec);
+    s->aec=NULL;
     free(s->pool);
     s->pool=NULL;
     dfn_example_erb_free(&s->erb);
-    s->bridge=NULL; s->stage=NULL; s->unit=NULL; s->res=NULL; s->istft=NULL;
+    s->bridge=NULL; s->stage=NULL; s->unit=NULL; s->istft=NULL;
 }
 
-/* Carves the planned pool: the flow's objects, the helper, the RES, the P buffers, then the stage
+/* Carves the planned pool: the array, the helper, the P buffer, then the stage
  * (or bridge) and its synthesis. */
 static int dfn_build(DfnSample *s) {
     unsigned char *cur;
-    int k;
     if (posix_memalign(&s->pool,s->unit_req.alignment,s->total) != 0) { s->pool=NULL; return -1; }
     cur=s->pool;
-    if (mcab_sample_flow_init(&s->objs,cur,s->flow_bytes,&s->unit_cfg) != 0) return -1;
-    cur+=ALIGN16(s->flow_bytes);
-    s->unit=mcab_sample_beam_init(cur,s->beam_bytes,&s->unit_cfg,&s->unit_bp,s->objs.flow);
+    s->aec=aec_init_ex(cur,s->aec_bytes,&s->unit_cfg,&s->unit_req);
+    if (!s->aec) return -1;
+    cur+=s->aec_bytes;
+    s->unit=array_sample_beam_init(cur,s->beam_bytes,&s->unit_cfg,&s->unit_bp,s->aec);
     cur+=ALIGN16(s->beam_bytes);
     if (!s->unit) return -1;
-    s->res=aec_res_init(cur,s->res_bytes,&s->res_cfg);
-    cur+=ALIGN16(s->res_bytes);
-    if (!s->res || aec_res_n_bins(s->res) != mcab_n_freqs(s->objs.flow) ||
-        aec_res_hop_size(s->res) != mcab_hop_size(s->objs.flow))
-        return -1;
-    s->unity=(float *)cur;      cur+=s->vec_bytes;
-    s->total_gain=(float *)cur; cur+=s->vec_bytes;
     s->post=(Complex *)cur;     cur+=s->spec_bytes;
-    for (k=0; k<s->n_freqs; ++k) s->unity[k]=1.0f;
-    s->rng=MCAB_SAMPLE_CNG_RNG_SEED;
-    return dfn_hop_pool_build(&s->dfn,cur,mcab_n_freqs(s->objs.flow),mcab_hop_size(s->objs.flow),1,
+    s->reset_handled=0u;
+    return dfn_hop_pool_build(&s->dfn,cur,s->grid.n_freqs,s->grid.hop_size,1,
                               &s->hop,&s->stage,&s->bridge,&s->istft);
 }
 
-static int dfn_setup(void *user, McabSampleHopView *view) {
+static int dfn_setup(void *user, ArraySampleHopView *view) {
     DfnSample *s=user;
     int hop_size, latency;
     if (dfn_example_load_matrices(&s->args, &s->erb, name) != 0)
         return 1;
 
-    /* The RES (balanced, built in dfn_plan) is always on; the comfort-noise fill is the program's
-     * switch: E and P must share a phase for the DFN2 stage, so it is off unless asked for. */
-    s->unit_cfg = mcab_default_config(s->args.sample_rate);
-    s->unit_bp = mcab_sample_beam_default_params();
-    s->unit_cfg.fft_size = 0;   /* the flow's rate default */
+    /* The residual gain stage (balanced, in the array) is always on; the comfort-noise fill is the
+     * program's switch: E and P must share a phase for the DFN2 stage, so it is off unless asked for. */
+    array_sample_default_config(&s->unit_cfg, s->args.sample_rate);
+    s->unit_bp = array_sample_beam_default_params();
     s->unit_cfg.delay_mode = s->args.delay_mode;
     s->unit_cfg.delay_num_filters = s->args.delay_num_filters;
     s->unit_cfg.fixed_delay_samples = s->args.fixed_delay_samples;
@@ -281,7 +255,7 @@ static int dfn_setup(void *user, McabSampleHopView *view) {
         dfn_cleanup(s);
         return 1;
     }
-    hop_size = mcab_hop_size(s->objs.flow);
+    hop_size = s->grid.hop_size;
     /* Core WOLA hop plus the bridge's added delay, or the model's lookahead hops plus the
      * core hop on the stage path. */
     DFN2_REQUIRE_VARIANT_LINK();   /* this unit's DFN2 variant is the archive's */
@@ -293,42 +267,32 @@ static int dfn_setup(void *user, McabSampleHopView *view) {
     view->reference=far; view->output=output; view->check_finite=1;
     return 0;
 }
-static int dfn_read(void *user, McabSampleHopView *view, int frame) {
+static int dfn_read(void *user, ArraySampleHopView *view, int frame) {
     (void)user; (void)view; return frame < 8;
 }
-/* P = B * min(1, G_res), plus comfort noise on the bins the RES cut when enabled (no denoiser:
- * its gain is the unity vector); a lane's post-chain reset first clears the synthesis (the bridge's
- * host-grid tail on the bridge path, the whole hop on the stage path) and reseeds. Before the hop enters the DFN hop. */
-static void dfn_form(DfnSample *s, const McabFrame *f, const float *g_res) {
-    if (mcab_sample_post_reset_due(&s->reset_handled,f)) {
+/* P = B * G_res, plus comfort noise on the bins the gain cut when enabled (no denoiser: unity extra
+ * gain); a lane's post-chain reset first clears the synthesis (the bridge's host-grid tail on the bridge
+ * path, the whole hop on the stage path). Before the hop enters the DFN hop. 0, or -1 on a refusal. */
+static int dfn_form(DfnSample *s, const AecResidualView *f) {
+    if (array_sample_post_reset_due(&s->reset_handled,f)) {
         if (s->bridge) (void)dfn_rate_bridge_reset_synthesis(s->bridge);   /* between hops: cannot refuse */
         else dfn_hop_reset(&s->hop);
-        s->rng=MCAB_SAMPLE_CNG_RNG_SEED;
     }
-    sk_min_f32(s->total_gain,s->unity,g_res,s->n_freqs);
-    sk_capply_gain_f32(s->post,f->b,s->total_gain,s->n_freqs);
-    if (s->args.enable_cng && f->cn)
-        aec_cng_fill(&s->rng,s->post,f->cn,g_res,s->unity,MCAB_SAMPLE_CNG_NR_GAIN_FLOOR,
-                     s->n_freqs);
+    if (aec_apply_gain(s->aec,NULL,s->post) != AEC_OK) return -1;
+    if (s->args.enable_cng && aec_apply_cng(s->aec,NULL,s->post) != AEC_OK) return -1;
+    return 0;
 }
 
-static int dfn_process(void *user, McabSampleHopView *view, int frame) {
+static int dfn_process(void *user, ArraySampleHopView *view, int frame) {
     DfnSample *s=user; (void)view; (void)frame;
-    McabSampleBeamResult beam;
-    McabFrame spec;
-    AecResInput in;
-    const float *g_res = NULL;
-    if (mcab_sample_beam_process(s->unit,microphones,far,&beam,NULL) == MCAB_OK &&
-        mcab_sample_beam_fuse(s->unit,&spec) == MCAB_OK) {
-        mcab_sample_res_input(&spec,&in);
-        g_res=aec_res_process(s->res,&in);
-    }
-    if (!g_res) {
+    ArraySampleBeamResult beam;
+    AecResidualView spec;
+    if (array_sample_beam_process(s->unit,microphones,far,&beam,NULL) != AEC_OK ||
+        array_sample_beam_fuse(s->unit,&spec) != AEC_OK || dfn_form(s,&spec) != 0) {
         dfn_reset(s);
         return 1;
     }
-    dfn_form(s,&spec,g_res);
-    if (dfn_hop_process(&s->hop,spec.e,s->post,output) != 0) {
+    if (dfn_hop_process(&s->hop,spec.error_spec,s->post,output) != 0) {
         dfn_reset(s);
         return 1;
     }
@@ -340,7 +304,7 @@ static void dfn_complete(void *user) {
 }
 int main(int argc, char **argv) {
     DfnSample sample={0};
-    static const McabSampleOps ops={dfn_parse,dfn_setup,dfn_read,dfn_process,
+    static const ArraySampleOps ops={dfn_parse,dfn_setup,dfn_read,dfn_process,
                                   NULL,NULL,NULL,dfn_cleanup,dfn_complete};
-    return mcab_sample_main(argc,argv,&ops,&sample);
+    return array_sample_main(argc,argv,&ops,&sample);
 }

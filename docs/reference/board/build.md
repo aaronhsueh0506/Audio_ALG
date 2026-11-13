@@ -11,7 +11,7 @@ the `expected` descriptor if one was passed); it has no visibility into the
 platform allocator, DMA engine, or power state behind that pointer.
 
 - **16-byte alignment**: every pool pointer is aligned exactly as
-  the size query reports (16 today). `mcab_init_ex()` and `aec_init()` reject a
+  the size query reports (16 today). `aec_init_ex()` and `aec_init()` reject a
   misaligned `mem` argument, but only if one is actually passed in
   misaligned — the platform allocator itself must honor the alignment it
   was asked for.
@@ -43,7 +43,7 @@ platform allocator, DMA engine, or power state behind that pointer.
   so there is nothing on ITS side to roll back, but the caller's own
   pool-acquisition failure handling is not something a library can verify.
 - **Reset / reconfigure / double-destroy / power-resume**: exercise
-  the paired reset (`aec_reset()`/`mcab_reset()` with `aec_res_reset()` (4ch), `anr_reset()`, `ac_istft_reset()` and any
+  the paired reset (`aec_reset()` (the 4-channel array resets its lanes, estimator and gain stage with it), `anr_reset()`, `ac_istft_reset()` and any
   neural stage reset — echo-path change), a full destroy-then-
   re-`init` on the SAME pool (config change), calling
   `destroy` twice in a row (must be a safe no-op the
@@ -204,7 +204,7 @@ registered `(model, sr, fft, N)`) is the sample's model configuration: the per-g
 `stream/aiaec/ai3_model_io_{deepvqes,alignulcnet}.h`; header-only, not included by `ainr.h` / `aiaec.h`) and the shared helper
 `stream/common/ai3_model_io.h` (row expansion, state pairing, the `stream_check_ports()` call, buffer sizing, the check of every block's work
 against the row; tested by `make -C stream/common test-model-io`). A sample adds `-I stream/common -I stream/ainr` (or `stream/aiaec`) and compiles
-`stream/common/stream_bind.c` for the checker; the stream libraries do not. The pool comes from the stream's `*_get_mem_size()` (`StreamMemReq`: `bytes`, `alignment`, declared in
+`stream/common/stream_bind.c` for the checker; the stream libraries do not. The AI3 samples carry compile-time `#define FLOAT_IN 0` / `FLOAT_OUT 0` (default off) that let the NPU quantize the inputs and dequantize the heads; set both alike (a mixed setting only warns), see `docs/maintenance/graph-wiring.md`. The pool comes from the stream's `*_get_mem_size()` (`StreamMemReq`: `bytes`, `alignment`, declared in
 `stream/common/stream_mem.h`), and a
 configuration, model or pool that is not registered or is too small is refused at run time, before any SDK call. The one DFN2 variant flag is
 `-DDFN2_MASK_ONLY`; every DFN2 unit of a build must share it (mixed units do not link). The pipeline units (`dfn_res_stage.c`,

@@ -1,9 +1,9 @@
-/* 4-channel AEC -> BF -> RES -> DeepFilterNet2 composition test: the linear AEC + BF unit
- * (the mcab flow with the sample SRP-PHAT/BF helper, mcab_sample_beam.h), the post-beam RES (an AecRes the composition builds with the libaec
- * functions), P = E * min(1, G_res) (+ comfort noise) and the DFN2 hop (dfn/dfn_hop.h),
- * wired as 4ch/aec_bf_dfn_res/main.c wires them.
+/* 4-channel AEC -> BF -> RES -> DeepFilterNet2 composition test: the array AEC + BF unit
+ * (the array instance with the sample SRP-PHAT/BF helper, array_sample_beam.h), the array's own
+ * residual gain stage, P = B * G_res (aec_apply_gain, + aec_apply_cng comfort noise) and the DFN2
+ * hop (dfn/dfn_hop.h), wired as 4ch/aec_bf_dfn_res/main.c wires them.
  * 48 kHz: with the identity model the composition equals the hand-written conventional chain with
- * the denoiser off (tests/conv_chain_mcab.h, its own front end and AecRes, fed the unit's beam
+ * the denoiser off (tests/conv_chain_4ch.h, its own array instance, fed the unit's beam
  * weights and beamformed spectrum), delayed by exactly DFN_TEST_LOOKAHEAD_FRAMES hops (two for
  * the shipped 1/1 pair), byte for byte, with comfort noise
  * OFF and ON.
@@ -20,14 +20,13 @@
 #include <stdlib.h>
 #include <string.h>
 
-#define MCAB_TEST_RIG_WITH_BEAM 1
-#include "4ch/tests/mcab_test_rig.h"
+#define ARRAY_TEST_RIG_WITH_BEAM 1
+#include "4ch/tests/array_test_rig.h"
 #include "dfn/dfn_hop.h"
 #include "utility/mem_align.h"
-#include "utility/simd_kernels.h"
 #include "dfn/tests/dfn_test_fixture.h"
-#include "4ch/tests/conv_chain_mcab.h"
-#include "4ch/mcab_sample_post.h"
+#include "4ch/tests/conv_chain_4ch.h"
+#include "4ch/array_sample_post.h"
 
 #define TEST_FRAMES 64
 #define ECHO_DELAY 384
@@ -48,7 +47,7 @@ static void make_far(void) {
 
 static void make_weights(Complex *weights) {
     int ch, k;
-    for (ch = 0; ch < MCAB_CHANNELS; ++ch) {
+    for (ch = 0; ch < AEC_ARRAY_MICS; ++ch) {
         for (k = 0; k < DFN2_N_BINS; ++k) {
             Complex *w = weights + (size_t)ch * DFN2_N_BINS + k;
             w->r = 0.25f;
@@ -62,31 +61,31 @@ static void make_hop(float *mics, float *ref, int frame) {
     for (i = 0; i < DFN2_HOP_LEN; ++i) {
         int t = frame * DFN2_HOP_LEN + i;
         ref[i] = far_all[t];
-        for (ch = 0; ch < MCAB_CHANNELS; ++ch) {
+        for (ch = 0; ch < AEC_ARRAY_MICS; ++ch) {
             int d = ECHO_DELAY + 3 * ch;
             float echo = t >= d ? 0.5f * far_all[t - d] : 0.0f;
-            mics[(size_t)i * MCAB_CHANNELS + ch] =
+            mics[(size_t)i * AEC_ARRAY_MICS + ch] =
                 echo + 0.01f * sinf((float)t * 0.071f + (float)ch);
         }
     }
 }
 
 /* The core every oracle in this file starts from. */
-static McabConfig core_config(int sample_rate, int fft_size) {
-    McabConfig cfg = mcab_default_config(sample_rate);
+static AecConfig core_config(int sample_rate, int fft_size) {
+    AecConfig cfg = array_test_default_config(sample_rate);
     cfg.fft_size = fft_size;
     return cfg;
 }
 
-/* The unit of the composition: its rate default grid. */
-static McabTestUnitConfig unit_config(int sample_rate, int fft_size) {
-    McabTestUnitConfig cfg = mcab_test_unit_default_config(sample_rate);
-    cfg.core.fft_size = fft_size;
+/* The unit of the composition: the rate's default grid, or the named FFT size (fft_size 0: the default). */
+static ArrayTestUnitConfig unit_config(int sample_rate, int fft_size) {
+    ArrayTestUnitConfig cfg = array_test_unit_default_config(sample_rate);
+    if (fft_size) cfg.aec_cfg.fft_size = fft_size;
     return cfg;
 }
 
 /* The hand-written chain with the denoiser off: RES on, comfort noise as asked. */
-static ConvChain *oracle_create(const McabConfig *cfg, int enable_res, int enable_cng) {
+static ConvChain *oracle_create(const AecConfig *cfg, int enable_res, int enable_cng) {
     ConvChainOptions opt = conv_default_options();
     opt.enable_res = enable_res;
     opt.enable_nr = 0;
@@ -98,23 +97,20 @@ static ConvChain *oracle_create(const McabConfig *cfg, int enable_res, int enabl
  * The composition under test, built from heap pieces as main.c builds it from one pool.
  * --------------------------------------------------------------------------------------- */
 
-/* Deliberate defects the flow-reset row plants to show it can fail. */
+/* Deliberate defects the array-reset row plants to show it can fail. */
 enum { FDFN_SAB_NO_CLEAR = 1, FDFN_SAB_LATE_CLEAR = 2 };
 
 typedef struct FourDfn {
-    McabSampleBeam *unit;
-    McabSampleBeamResult beam;   /* the last hop's beam, for the oracle */
-    McabSampleBeamInfo info;
-    AecRes *res;                 /* the post-beam RES, balanced, on the unit's grid */
-    void *res_mem;
+    ArraySampleBeam *unit;
+    ArraySampleBeamResult beam;   /* the last hop's beam, for the oracle */
+    ArraySampleBeamInfo info;
+    Aec *aec;                    /* the array under the unit: balanced gain stage, comfort noise */
     const float *res_gain;       /* the last hop's G_res */
-    float *unity, *total;
     Complex *post;
     void *post_mem;
-    uint32_t rng;
-    uint32_t reset_handled;   /* McabFrame.post_reset_serial last followed */
+    uint32_t reset_handled;   /* AecResidualView.post_reset_serial last followed */
     long reset_hops;          /* hops on which the serial had moved */
-    const Complex *estimate;  /* E of the last hop (mcab memory, until the next hop) */
+    const Complex *estimate;  /* E of the last hop (array memory, until the next hop) */
     int sabotage;             /* negative controls (FDFN_SAB_*), 0 in the composition */
     int bridge_clear_due;     /* FDFN_SAB_LATE_CLEAR only: the event of the previous hop */
     int n_freqs, enable_cng;
@@ -131,54 +127,36 @@ static void fdfn_destroy(FourDfn *m) {
     if (!m) return;
     if (m->bridge) dfn_rate_bridge_destroy(m->bridge);
     else if (m->stage) dfn_res_stage_destroy(m->stage);
-    if (m->unit) mcab_test_beam_destroy(m->unit);
-    free(m->res_mem);
+    if (m->unit) array_test_beam_destroy(m->unit);
     free(m->post_mem);
     free(m->istft_mem);
     free(m->stage_out);
     free(m);
 }
 
-/* fft_size 0: the core's rate default grid. bf_enable 0 bypasses the BF (lane 0's error, unit
+/* bf_enable 0 bypasses the BF (lane 0's error, unit
  * weights), which keeps an impulse's timing unchanged by the spatial filter. */
 static FourDfn *fdfn_create(int sample_rate, int fft_size, int enable_cng, const DFN2Model *model,
                             int bf_enable) {
     FourDfn *m = (FourDfn *)calloc(1, sizeof(*m));
-    McabTestUnitConfig ucfg = unit_config(sample_rate, fft_size);
+    ArrayTestUnitConfig ucfg = unit_config(sample_rate, fft_size);
     DfnResStageConfig stage_cfg = dfn_res_stage_default_config(dfn_test_grid());
-    AecConfig res_cfg;
-    size_t vec, res_bytes;
-    int n_freqs, k;
+    int n_freqs;
     if (!m) return NULL;
     ucfg.beam.bf_enable = bf_enable;
-    m->unit = mcab_test_beam_create(&ucfg);
+    m->unit = array_test_beam_create(&ucfg);
     if (!m->unit) goto fail;
-    m->hop_size = mcab_hop_size(mcab_test_beam_flow(m->unit));
-    n_freqs = mcab_n_freqs(mcab_test_beam_flow(m->unit));
-
-    aec_config_from_level(&res_cfg, AEC_LEVEL_BALANCED, sample_rate);
-    res_cfg.fft_size = mcab_fft_size(mcab_test_beam_flow(m->unit));
-    res_bytes = aec_res_get_mem_size(&res_cfg);
-    if (res_bytes == 0 || posix_memalign(&m->res_mem, 16, res_bytes) != 0) {
-        m->res_mem = NULL;
-        goto fail;
-    }
-    m->res = aec_res_init(m->res_mem, res_bytes, &res_cfg);
-    if (!m->res || aec_res_n_bins(m->res) != n_freqs || aec_res_hop_size(m->res) != m->hop_size)
-        goto fail;
+    m->aec = array_test_beam_aec(m->unit);
+    m->hop_size = aec_hop_size(m->aec);
+    n_freqs = array_test_n_freqs(m->aec);
 
     m->n_freqs = n_freqs;
     m->enable_cng = enable_cng;
-    vec = ALIGN16((size_t)n_freqs * sizeof(float));
-    if (posix_memalign(&m->post_mem, 16, 2 * vec + ALIGN16((size_t)n_freqs * sizeof(Complex))) != 0) {
+    if (posix_memalign(&m->post_mem, 16, ALIGN16((size_t)n_freqs * sizeof(Complex))) != 0) {
         m->post_mem = NULL;
         goto fail;
     }
-    m->unity = (float *)m->post_mem;
-    m->total = (float *)((unsigned char *)m->post_mem + vec);
-    m->post = (Complex *)((unsigned char *)m->post_mem + 2 * vec);
-    for (k = 0; k < n_freqs; ++k) m->unity[k] = 1.0f;
-    m->rng = MCAB_SAMPLE_CNG_RNG_SEED;
+    m->post = (Complex *)m->post_mem;
 
     stage_cfg.erb_fwd = erb_fwd;
     stage_cfg.erb_inv = erb_inv;
@@ -218,24 +196,21 @@ fail:
 
 /* What an integrator does after a refused call or to start over: every stage together. */
 static void fdfn_reset(FourDfn *m) {
-    mcab_sample_beam_reset(m->unit);
-    aec_res_reset(m->res);
-    m->rng = MCAB_SAMPLE_CNG_RNG_SEED;
+    array_sample_beam_reset(m->unit);
     dfn_hop_reset(&m->hop);
 }
 
-/* Unit (front end, SRP-PHAT, BF), fuse, the RES gain, P; the DFN hop begins on (E, P). */
+/* Unit (array front end, SRP-PHAT, BF), fuse, P = B * G_res (+ comfort noise); the DFN hop begins on (E, P). */
 static int fdfn_begin(FourDfn *m, const float *mics, const float *ref) {
-    McabFrame f;
-    AecResInput in;
+    AecResidualView f;
     int due;
-    if (mcab_sample_beam_process(m->unit, mics, ref, &m->beam, &m->info) != MCAB_OK ||
-        mcab_sample_beam_fuse(m->unit, &f) != MCAB_OK || f.g_res_ctx != NULL)
+    if (array_sample_beam_process(m->unit, mics, ref, &m->beam, &m->info) != AEC_OK ||
+        array_sample_beam_fuse(m->unit, &f) != AEC_OK ||
+        f.res_gain == NULL)
         return -1;
-    mcab_sample_res_input(&f, &in);
-    if (!(m->res_gain = aec_res_process(m->res, &in))) return -1;
-    m->estimate = f.e;
-    due = mcab_sample_post_reset_due(&m->reset_handled, &f);
+    m->res_gain = f.res_gain;
+    m->estimate = f.error_spec;
+    due = array_sample_post_reset_due(&m->reset_handled, &f);
     if (due) ++m->reset_hops;
     if (m->bridge) {
         /* the bridge synthesises the host-grid spectra at the top of its begin(): the clear goes in on the hop
@@ -247,13 +222,9 @@ static int fdfn_begin(FourDfn *m, const float *mics, const float *ref) {
     } else if (due) {
         dfn_hop_reset(&m->hop);
     }
-    if (due) m->rng = MCAB_SAMPLE_CNG_RNG_SEED;
-    sk_min_f32(m->total, m->unity, m->res_gain, m->n_freqs);
-    sk_capply_gain_f32(m->post, f.b, m->total, m->n_freqs);
-    if (m->enable_cng && f.cn)
-        aec_cng_fill(&m->rng, m->post, f.cn, m->res_gain, m->unity, MCAB_SAMPLE_CNG_NR_GAIN_FLOOR,
-                     m->n_freqs);
-    return dfn_hop_begin(&m->hop, f.e, m->post) == 0 ? 0 : -1;
+    if (aec_apply_gain(m->aec, NULL, m->post) != AEC_OK) return -1;
+    if (m->enable_cng && aec_apply_cng(m->aec, NULL, m->post) != AEC_OK) return -1;
+    return dfn_hop_begin(&m->hop, f.error_spec, m->post) == 0 ? 0 : -1;
 }
 
 static int fdfn_process(FourDfn *m, const float *mics, const float *ref, float *out) {
@@ -268,13 +239,13 @@ static int fdfn_process(FourDfn *m, const float *mics, const float *ref, float *
 
 static int run_identity(int enable_cng) {
     FourDfn *dfn = fdfn_create(DFN2_SR, DFN2_N_FFT, enable_cng, NULL, 1);
-    McabConfig ccfg = core_config(DFN2_SR, DFN2_N_FFT);
+    AecConfig ccfg = core_config(DFN2_SR, DFN2_N_FFT);
     ConvChain *conventional;
-    float mics[DFN2_HOP_LEN * MCAB_CHANNELS];
+    float mics[DFN2_HOP_LEN * AEC_ARRAY_MICS];
     float ref[DFN2_HOP_LEN];
     float dfn_out[DFN2_HOP_LEN];
     long long frames = -1, commits = -1, skips = -1;
-    float min_res = 1.0f, live0 = 0.0f, live1 = 0.0f;
+    float min_res = 1.0f;
     int frame, i, k, delay_changes = 0, nonzero_hops = 0;
 
     if (!dfn || dfn->hop_size != DFN2_HOP_LEN || dfn->bridge != NULL)
@@ -306,9 +277,8 @@ static int run_identity(int enable_cng) {
     dfn_res_stage_get_counters(dfn->stage, &frames, &commits, &skips);
     if (frames != TEST_FRAMES || commits != 0 || skips != TEST_FRAMES - DFN2_MASK_LOOKAHEAD)
         return 5;                             /* a reset would leave a gap */
-    if (aec_res_split_floor(dfn->res, &live0, NULL) != 0 ||
-        aec_res_set_level(dfn->res, AEC_LEVEL_AGGRESSIVE, 0.0f) != 0 ||
-        aec_res_split_floor(dfn->res, &live1, NULL) != 0 || live1 == live0)
+    if (aec_set_level(dfn->aec, AEC_LEVEL_AGGRESSIVE) != 0 ||
+        aec_set_level(dfn->aec, (AecLevel)77) != -1)
         return 6;
     if (dfn_res_stage_set_atten_lim(dfn->stage, 12.0f) != 0 ||
         dfn_res_stage_set_atten_lim(dfn->stage, NAN) != -1)
@@ -324,11 +294,11 @@ static int run_identity(int enable_cng) {
 /* The stimulus must make the post-beam RES cut: a RES-off chain on the same input has to differ
  * from the RES-on chain after the warm-up hops. */
 static int run_res_is_active(void) {
-    McabConfig cfg = core_config(DFN2_SR, DFN2_N_FFT);
+    AecConfig cfg = core_config(DFN2_SR, DFN2_N_FFT);
     ConvChain *on = oracle_create(&cfg, 1, 0);
     ConvChain *off = oracle_create(&cfg, 0, 0);
-    Complex weights[MCAB_CHANNELS * DFN2_N_BINS];
-    float mics[DFN2_HOP_LEN * MCAB_CHANNELS];
+    Complex weights[AEC_ARRAY_MICS * DFN2_N_BINS];
+    float mics[DFN2_HOP_LEN * AEC_ARRAY_MICS];
     float ref[DFN2_HOP_LEN], a[DFN2_HOP_LEN], b[DFN2_HOP_LEN];
     int frame, differing = 0;
     if (!on || !off) return 1;
@@ -351,9 +321,9 @@ static int run_res_is_active(void) {
  * delay; the 48 kHz schedule is the documented one. */
 static int run_native(int sample_rate, int fft_size, int expected_sixths) {
     FourDfn *dfn = fdfn_create(sample_rate, fft_size, 0, NULL, 0);
-    McabConfig ccfg = core_config(sample_rate, fft_size);
+    AecConfig ccfg = core_config(sample_rate, fft_size);
     ConvChain *conventional;
-    static float mics[512 * MCAB_CHANNELS];
+    static float mics[512 * AEC_ARRAY_MICS];
     static float ref[512], out[512];
     static float conv[TEST_FRAMES * 4 * 256];
     static float mine[TEST_FRAMES * 4 * 256];
@@ -382,10 +352,10 @@ static int run_native(int sample_rate, int fft_size, int expected_sixths) {
         for (i = 0; i < hop; ++i) {
             int t = frame * hop + i;
             ref[i] = far_tones[t];
-            for (ch = 0; ch < MCAB_CHANNELS; ++ch) {
+            for (ch = 0; ch < AEC_ARRAY_MICS; ++ch) {
                 int d = (ECHO_DELAY + 3 * ch) * sample_rate / DFN2_SR;
                 float echo = t >= d ? 0.5f * far_tones[t - d] : 0.0f;
-                mics[(size_t)i * MCAB_CHANNELS + ch] =
+                mics[(size_t)i * AEC_ARRAY_MICS + ch] =
                     echo + 0.01f * sinf((float)t * 0.071f + (float)ch) +
                     (t == imp ? 1.0f : 0.0f);
             }
@@ -433,21 +403,21 @@ static int run_native(int sample_rate, int fft_size, int expected_sixths) {
     return 0;
 }
 
-/* The flow reset at 16 kHz: the application restarts the unit and the RES (a lane's hard post-chain
- * reset, which moves McabFrame.post_reset_serial) and nothing else; the hop, DFN2 and the bridge keep
+/* The array reset at 16 kHz: the application restarts the unit and the RES (a lane's hard post-chain
+ * reset, which moves AecResidualView.post_reset_serial) and nothing else; the hop, DFN2 and the bridge keep
  * running. The bridge's native-grid synthesis (dfn_rate_bridge_get_host_hops) must equal the
  * hand-written chain (restarted the same way) bit for bit on every hop, the reset hop included, and a
  * bridge that is not cleared, or cleared one hop late, must not. */
-static int run_flow_reset(int sample_rate, int fft_size, int sabotage, long *diff_hops, long *resets) {
+static int run_array_reset(int sample_rate, int fft_size, int sabotage, long *diff_hops, long *resets) {
     FourDfn *dfn = fdfn_create(sample_rate, fft_size, 1, NULL, 1);
-    McabConfig ccfg = core_config(sample_rate, fft_size);
+    AecConfig ccfg = core_config(sample_rate, fft_size);
     ConvChain *conventional;
     AcStftConfig scfg;
     AcIstft *probe = NULL;
     void *probe_mem = NULL;
     static float probe_hop[512];
     long long stage_frames = 0, commits, skips;
-    static float mics[512 * MCAB_CHANNELS], ref[512], conv_out[512], out[512];
+    static float mics[512 * AEC_ARRAY_MICS], ref[512], conv_out[512], out[512];
     static float tones[160 * 512];
     int hop, frame, i, ch, e, frames = 160, reset_at = 81;
     *diff_hops = 0;
@@ -471,13 +441,12 @@ static int run_flow_reset(int sample_rate, int fft_size, int sabotage, long *dif
         for (i = 0; i < hop; ++i) {
             int t = frame * hop + i;
             ref[i] = tones[t];
-            for (ch = 0; ch < MCAB_CHANNELS; ++ch)
-                mics[(size_t)i * MCAB_CHANNELS + (size_t)ch] =
+            for (ch = 0; ch < AEC_ARRAY_MICS; ++ch)
+                mics[(size_t)i * AEC_ARRAY_MICS + (size_t)ch] =
                     (t >= e ? 0.5f * tones[t - e] : 0.0f) + 0.01f * sinf((float)t * 0.071f + (float)ch);
         }
-        if (frame == reset_at) {          /* the application restarts the unit and the RES, nothing downstream */
-            mcab_sample_beam_reset(dfn->unit);
-            aec_res_reset(dfn->res);
+        if (frame == reset_at) {          /* the application restarts the unit (the array and its gain stage), nothing downstream */
+            array_sample_beam_reset(dfn->unit);
             conv_reset(conventional);
         }
         if (fdfn_begin(dfn, mics, ref) != 0) return 10 + frame;
@@ -505,20 +474,22 @@ static int run_flow_reset(int sample_rate, int fft_size, int sabotage, long *dif
 
 /* The unit serves 16 and 48 kHz only: the composition has no 8 kHz or off-grid host. */
 static int run_rejections(void) {
-    McabTestUnitConfig cfg = unit_config(8000, 0);
-    McabMemReq req;
-    if (mcab_test_unit_get_mem_requirements(&cfg, &req) == 0) return 1;
+    ArrayTestUnitConfig cfg = unit_config(8000, 0);
+    AecMemReq req;
+    if (array_test_unit_get_mem_requirements(&cfg, &req) == 0) return 1;
     cfg = unit_config(44100, 0);
-    if (mcab_test_unit_get_mem_requirements(&cfg, &req) == 0) return 2;
+    if (array_test_unit_get_mem_requirements(&cfg, &req) == 0) return 2;
     cfg = unit_config(DFN2_SR, 512);   /* not a 48 kHz grid */
-    if (mcab_test_unit_get_mem_requirements(&cfg, &req) == 0) return 3;
+    if (array_test_unit_get_mem_requirements(&cfg, &req) == 0) return 3;
     cfg = unit_config(DFN2_SR, 0);
-    if (mcab_test_unit_get_mem_requirements(&cfg, &req) != 0) return 4;
+    if (array_test_unit_get_mem_requirements(&cfg, &req) != 0) return 4;
+    cfg.aec_cfg.fft_size = 0;             /* the array takes no "rate default" placeholder: a grid is named */
+    if (array_test_unit_get_mem_requirements(&cfg, &req) == 0) return 5;
     return 0;
 }
 
 /* Long enough for the RES to leave its initial state, where its gain no longer hides what a
- * missing aec_res_reset() leaves behind. */
+ * missing reset of the gain stage leaves behind. */
 #define RESET_FRAMES 200
 
 /* A reset of every stage (unit, RES, comfort-noise seed, hop) returns the composition to
@@ -527,7 +498,7 @@ static int run_rejections(void) {
  * of a loop equals the first. */
 static int run_reset_equals_fresh(int sample_rate, int fft_size) {
     FourDfn *dfn = fdfn_create(sample_rate, fft_size, 1, NULL, 1);
-    static float mics[512 * MCAB_CHANNELS], ref[512];
+    static float mics[512 * AEC_ARRAY_MICS], ref[512];
     static float first[RESET_FRAMES][512], again[RESET_FRAMES][512];
     static float tones[RESET_FRAMES * 512];
     int hop, frame, pass, i, ch, e;
@@ -540,8 +511,8 @@ static int run_reset_equals_fresh(int sample_rate, int fft_size) {
             for (i = 0; i < hop; ++i) {
                 int t = frame * hop + i;
                 ref[i] = tones[t];
-                for (ch = 0; ch < MCAB_CHANNELS; ++ch)
-                    mics[(size_t)i * MCAB_CHANNELS + (size_t)ch] =
+                for (ch = 0; ch < AEC_ARRAY_MICS; ++ch)
+                    mics[(size_t)i * AEC_ARRAY_MICS + (size_t)ch] =
                         (t >= e ? 0.5f * tones[t - e] : 0.0f) +
                         0.01f * sinf((float)t * 0.071f + (float)ch);
             }
@@ -566,7 +537,7 @@ static int run_phased(int sample_rate, int fft_size, int behaviour) {
     DFN2Model cb_model;
     DFN2ModelIoDescriptor descriptor;
     FourDfn *ph, *cb;
-    static float mics[512 * MCAB_CHANNELS], ref[512], oa[512], ob[512];
+    static float mics[512 * AEC_ARRAY_MICS], ref[512], oa[512], ob[512];
     static float tones[100 * 512];
     DfnResStageJob job;
     int hop, frame, i, ch, r, nonzero = 0, ran = 0, frames = 80;
@@ -587,8 +558,8 @@ static int run_phased(int sample_rate, int fft_size, int behaviour) {
         for (i = 0; i < hop; ++i) {
             int t = frame * hop + i;
             ref[i] = tones[t];
-            for (ch = 0; ch < MCAB_CHANNELS; ++ch)
-                mics[(size_t)i * MCAB_CHANNELS + (size_t)ch] =
+            for (ch = 0; ch < AEC_ARRAY_MICS; ++ch)
+                mics[(size_t)i * AEC_ARRAY_MICS + (size_t)ch] =
                     (t >= e ? 0.5f * tones[t - e] : 0.0f) +
                     0.01f * sinf((float)t * 0.071f + (float)ch);
         }
@@ -643,18 +614,18 @@ int main(void) {
         size_t c;
         for (g = 0; g < 2; ++g) {
             long diff, resets;
-            rc = run_flow_reset(grids[g][0], grids[g][1], 0, &diff, &resets);
+            rc = run_array_reset(grids[g][0], grids[g][1], 0, &diff, &resets);
             if (rc || diff != 0 || resets < 1) {
-                fprintf(stderr, "4ch DFN flow reset %d Hz/%d: rc %d, %ld hops differ, %ld reset hop(s)\n",
+                fprintf(stderr, "4ch DFN array reset %d Hz/%d: rc %d, %ld hops differ, %ld reset hop(s)\n",
                         grids[g][0], grids[g][1], rc, diff, resets);
                 return 1;
             }
-            printf("4ch_aec_bf_dfn_res: flow reset %d Hz/%d: the bridge's host synthesis, cleared on the hop of the event, equals the "
+            printf("4ch_aec_bf_dfn_res: array reset %d Hz/%d: the bridge's host synthesis, cleared on the hop of the event, equals the "
                    "hand-written chain bit for bit (%ld reset hop(s))\n", grids[g][0], grids[g][1], resets);
             for (c = 0; c < sizeof sabs / sizeof sabs[0]; ++c) {
-                rc = run_flow_reset(grids[g][0], grids[g][1], sabs[c], &diff, &resets);
+                rc = run_array_reset(grids[g][0], grids[g][1], sabs[c], &diff, &resets);
                 if (rc || diff == 0) {
-                    fprintf(stderr, "4ch DFN flow reset %d Hz/%d: planted defect %d not detected (rc %d)\n",
+                    fprintf(stderr, "4ch DFN array reset %d Hz/%d: planted defect %d not detected (rc %d)\n",
                             grids[g][0], grids[g][1], sabs[c], rc);
                     return 1;
                 }
