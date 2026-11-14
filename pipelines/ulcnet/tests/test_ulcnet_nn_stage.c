@@ -3,8 +3,8 @@
  * descriptor gate, driven by synthetic alignment events and deterministic models. The stage takes
  * and returns spectra; every test wraps it in the application's own AcStft / AcIstft (struct Rig)
  * and compares the output hops with an independently built STFT/WOLA chain, with a direct-DFT
- * reference. One binary runs every grid of the table below. Build and run: `make test` in
- * pipelines/. */
+ * reference. One binary runs every grid of the table in ulcnet/tests/ulcnet_test_fixture.h.
+ * Build and run: `make test` in pipelines/. */
 #include <math.h>
 #include <stdint.h>
 #include <stdio.h>
@@ -12,20 +12,9 @@
 #include <string.h>
 
 #include "ulcnet/ulcnet_nn_stage.h"
+#include "ulcnet/tests/ulcnet_test_fixture.h"
 #include "utility/mem_align.h"
 #include "utility/simd_kernels.h"
-
-/* Largest row of the grid table: 48 kHz / fft 1024. */
-enum { HOP_MAX = 512, BINS_MAX = 513 };
-
-static const UlcnetGridSpec k_grids[] = {
-    { .sample_rate = 16000, .n_fft = 512,  .delay_depth = 8 },
-    { .sample_rate = 48000, .n_fft = 1024, .delay_depth = 8 },
-};
-
-static UlcnetGrid g_grid;   /* the grid under test */
-#define HOP (g_grid.hop)
-#define BINS (g_grid.n_bins)
 
 static int g_fail;
 #define CHECK(c, msg) do { if (!(c)) { printf("FAIL: %s (line %d)\n", msg, __LINE__); ++g_fail; } } while (0)
@@ -41,11 +30,6 @@ static void* pool_of(size_t bytes, int fill) {
     if (posix_memalign(&p, 16, bytes) != 0) return NULL;
     memset(p, fill, bytes);
     return p;
-}
-
-static const UlcnetModelIoDescriptor* io_descriptor(void) {
-    static UlcnetModelIoDescriptor d;
-    return ulcnet_model_io_descriptor_default(&g_grid, &d) == 0 ? &d : NULL;
 }
 
 /* ---- models ---- */
@@ -107,7 +91,7 @@ static UlcnetModel make_model(ModelState* st) {
     m.user = st;
     m.infer = model_infer;
     m.reset = model_reset;
-    m.io_descriptor = io_descriptor();
+    m.io_descriptor = test_io_descriptor();
     return m;
 }
 
@@ -720,7 +704,7 @@ static void test_model_gate(void) {
     Complex e[BINS_MAX];
     float far[HOP_MAX], out[HOP_MAX];
     int k;
-    CHECK(r && rig_init(r, 0) == 0 && io_descriptor(), "gate: setup");
+    CHECK(r && rig_init(r, 0) == 0 && test_io_descriptor(), "gate: setup");
     if (!r || !r->stage) { if (r) rig_free(r); free(r); return; }
     s = r->stage;
     memset(&st, 0, sizeof st);
@@ -730,12 +714,12 @@ static void test_model_gate(void) {
     bad = m;
     bad.io_descriptor = NULL;
     CHECK(ulcnet_nn_stage_set_model(s, &bad) == -1, "gate: a model that infers must publish a descriptor");
-    aligned = *io_descriptor();
+    aligned = *test_io_descriptor();
     aligned.far_input_mode = ULCNET_FAR_ALIGNED;
     bad = m;
     bad.io_descriptor = &aligned;
     CHECK(ulcnet_nn_stage_set_model(s, &bad) == -1, "gate: an aligned-far descriptor is refused");
-    aligned = *io_descriptor();
+    aligned = *test_io_descriptor();
     aligned.delay_depth = 1;
     bad.io_descriptor = &aligned;
     CHECK(ulcnet_nn_stage_set_model(s, &bad) == -1, "gate: a descriptor with D out of range is refused");
@@ -749,19 +733,19 @@ static void test_model_gate(void) {
         bad = m;
         bad.io_descriptor = &other;
         CHECK(ulcnet_nn_stage_set_model(s, &bad) == -1, "gate: a descriptor of the other grid is refused");
-        aligned = *io_descriptor();
+        aligned = *test_io_descriptor();
         aligned.sample_rate = other.sample_rate;
         bad.io_descriptor = &aligned;
         CHECK(ulcnet_nn_stage_set_model(s, &bad) == -1, "gate: a descriptor with another sample rate is refused");
-        aligned = *io_descriptor();
+        aligned = *test_io_descriptor();
         aligned.fft_size = other.fft_size;
         bad.io_descriptor = &aligned;
         CHECK(ulcnet_nn_stage_set_model(s, &bad) == -1, "gate: a descriptor with another fft size is refused");
-        aligned = *io_descriptor();
+        aligned = *test_io_descriptor();
         aligned.hop_size += 1;
         bad.io_descriptor = &aligned;
         CHECK(ulcnet_nn_stage_set_model(s, &bad) == -1, "gate: a descriptor with another hop is refused");
-        aligned = *io_descriptor();
+        aligned = *test_io_descriptor();
         aligned.spectrum_bins += 1;
         bad.io_descriptor = &aligned;
         CHECK(ulcnet_nn_stage_set_model(s, &bad) == -1, "gate: a descriptor with another bin count is refused");

@@ -67,9 +67,7 @@
 #endif
 
 #define DFN2_N_BINS         ((DFN2_N_FFT) / 2 + 1)
-#define DFN2_WIN_LEN        (DFN2_N_FFT)
 #define DFN2_HOP_LEN        ((DFN2_N_FFT) / 2)
-#define DFN2_OVL_LEN        (DFN2_WIN_LEN - DFN2_HOP_LEN)
 
 #ifndef DFN2_MASK_LOOKAHEAD
 #define DFN2_MASK_LOOKAHEAD 1

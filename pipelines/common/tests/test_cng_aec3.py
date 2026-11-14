@@ -21,7 +21,7 @@ def _aec_include():
 
 
 def _c_lut_literals():
-    header = (_aec_include() / 'aec_balanced_config.h').read_text(encoding='utf-8')
+    header = (_aec_include() / 'internal' / 'aec_balanced_config.h').read_text(encoding='utf-8')
     match = re.search(r'AECB_SQRT2_SIN_LUT\[32\]\s*=\s*\{([^}]*)\}', header)
     assert match, 'AECB_SQRT2_SIN_LUT not found in the AEC header'
     values = [float(v.strip().rstrip('f')) for v in match.group(1).split(',')]

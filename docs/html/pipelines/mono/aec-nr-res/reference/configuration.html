@@ -54,7 +54,7 @@
 <table>
 <tr><th>項目</th><th>位置</th><th>為什麼不開放</th></tr>
 <tr><td>範例固定的 seam:<code>residual = AEC_RESIDUAL_FULL</code>(<code>--aec-only</code> 為 <code>AEC_RESIDUAL_STATE</code>)</td><td><code>mono/aec_nr_res/main.c</code> 的 <code>derive_lane()</code> 設定(<code>FULL</code> 也是預設值)</td><td>這是整合拓樸不是調參:低於 <code>FULL</code> 就沒有 <code>v.res_gain</code>(<code>ESTIMATE</code> 少增益,<code>STATE</code> 另少 <code>r2</code>／<code>comfort_noise</code>),<code>aec_apply_gain()</code> 回 <code>AEC_ERR_MODE</code>。mono 的 RES 增益由這個 <code>Aec</code> 自己算,經 <code>v.res_gain</code> 交出、由 <code>aec_apply_gain()</code> 取用</td></tr>
-<tr><td>AEC 的全部調校值(<code>AecTuning</code>,<code>src/aec_tuning.h</code>;不是 <code>AecConfig</code> 欄位)</td><td>函式庫內部</td><td>由 <code>aec_resolve()</code> 依 <code>(sample_rate, fft_size, n_mics, level)</code> 建立並在建立時 retime,呼叫端沒有設定入口:濾波器長度(52 ms／64 ms)與適應步進、shadow 與 EPC 門檻、延遲獲取策略與 delay ring 範圍、double-talk 政策、HPF、保護性開關、預設關閉的實驗。都是聯合調出來的,validator 只防崩壞不防音質崩壞</td></tr>
+<tr><td>AEC 的全部調校值(<code>AecTuning</code>,<code>include/internal/aec_tuning.h</code>;不是 <code>AecConfig</code> 欄位)</td><td>函式庫內部</td><td>由 <code>aec_resolve()</code> 依 <code>(sample_rate, fft_size, n_mics, level)</code> 建立並在建立時 retime,呼叫端沒有設定入口:濾波器長度(52 ms／64 ms)與適應步進、shadow 與 EPC 門檻、延遲獲取策略與 delay ring 範圍、double-talk 政策、HPF、保護性開關、預設關閉的實驗。都是聯合調出來的,validator 只防崩壞不防音質崩壞</td></tr>
 <tr><td>編譯期常數(不在 config 內)</td><td><code>aec_balanced_config.h</code> 的 <code>AECB_*</code>、<code>SuppressionGainConfig</code>、<code>AecPostConfig</code>、<code>delay_aec.h</code> 的 <code>DA_*</code></td><td>runtime 完全改不了,也不該提供接口</td></tr>
 <tr><td><code>AnrConfig</code> 其餘 33 欄(共 41 欄:外部為 <code>sample_rate</code>、<code>fft_size</code> 與 level 改的四個;<code>frame_size</code>／<code>hop_size</code> 是衍生值)</td><td><code>anr_types.h</code></td><td><code>alpha_xi</code>、<code>alpha_s／d／p</code>、<code>L</code>、<code>delta_db</code>、<code>num_init_frames</code>、<code>scene_change_*</code>、<code>noise_gate_*</code>、<code>speech_protect_*</code>、<code>makeup_*</code> 等為時間常數或聯合調過的門檻,以 10 ms／16 ms 為基準 retime;<code>alpha_g</code> 在增益路徑上不被讀取(<code>alpha_attack</code>／<code>alpha_decay</code> 才有作用)</td></tr>
 <tr><td><code>AcStftConfig</code> 其餘欄位</td><td><code>audio_stft.h</code>;範例用 <code>ac_stft_config_default()</code></td><td><code>center=0</code>、<code>ola=AC_OLA_ACCUMULATE</code>、<code>spec_scale=ispec_scale=1.0f</code>、自帶 FFT 與 periodic sqrt-Hann 窗:與 AEC 的分析窗配對(50% overlap COLA),改了會破壞重建</td></tr>
@@ -74,7 +74,7 @@
 <table>
 <tr><th>內部(不要依賴)</th><th>說明</th></tr>
 <tr><td><code>aec_apply_external_realign()</code>、<code>aec_far_fft_real_compute_count()</code></td><td>4ch 的 array 在內部用來對 lane 做 realign 與共用 far-FFT(在 array 上 <code>aec_apply_external_realign()</code> 被拒);mono 單一 AEC 用不到</td></tr>
-<tr><td><code>aec_config_build.h</code>、<code>aec_internal.h</code>、<code>struct Aec</code> 內容</td><td>內部建構與內部宣告(<code>aec_config_build.h</code> 在函式庫的 <code>src/</code>);<code>Aec</code> 是不透明型別(<code>aec.h</code> 只有 <code>typedef struct Aec Aec;</code>,本體在 <code>src/aec_impl.h</code>),沒有欄位可讀</td></tr>
+<tr><td><code>aec_config_build.h</code>、<code>aec_internal.h</code>、<code>struct Aec</code> 內容</td><td>內部建構與內部宣告(<code>aec_config_build.h</code> 在函式庫的 <code>src/</code>);<code>Aec</code> 是不透明型別(<code>aec.h</code> 只有 <code>typedef struct Aec Aec;</code>,本體在 <code>include/internal/aec_impl.h</code>),沒有欄位可讀</td></tr>
 </table>
 
 <h2 id="diagnostics">執行期控制與診斷</h2><h3>執行期強度控制</h3>

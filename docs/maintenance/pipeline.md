@@ -17,7 +17,7 @@ python3 -m pytest -q pipelines
 ```
 
 The source-text guards in that tree read the AEC library's public headers (`aec.h`,
-`aec_balanced_config.h`) and, for the parity hash, its `src/aec_impl.h` from the same place `lib/deps.mk` points
+`aec_balanced_config.h`) and, for the parity hash, its `include/internal/aec_impl.h` from the same place `lib/deps.mk` points
 the build at: `AEC_DIR` from the environment (absolute path), else the sibling
 `../AEC/c_impl`. They pin `AEC_LAYOUT_VERSION` against the docs
 (`pipelines/tests/test_doc_layout_versions.py`), the comfort-noise floor and

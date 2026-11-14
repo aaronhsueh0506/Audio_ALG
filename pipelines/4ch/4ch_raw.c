@@ -121,12 +121,11 @@ static int raw_setup(void *user, ArraySampleHopView *view) {
         return 1;
     }
 
-    view->hop=s->hop; view->microphones=s->microphones;
-    view->reference=s->reference; view->output=s->output;
+    view->hop=s->hop; view->output=s->output;
     return 0;
 }
-static int raw_read(void *user, ArraySampleHopView *view, int frame) {
-    RawSample *s=user; (void)view; (void)frame;
+static int raw_read(void *user, int frame) {
+    RawSample *s=user; (void)frame;
     size_t mic_count=fread(s->microphones,sizeof(float),
         (size_t)s->hop*AEC_ARRAY_MICS,s->mic_file);
     size_t ref_count=fread(s->reference,sizeof(float),(size_t)s->hop,s->ref_file);
@@ -152,8 +151,8 @@ static int raw_post(RawSample *s) {
     if (status != AEC_OK) array_sample_stages_reset(&s->post);
     return status;
 }
-static int raw_process(void *user, ArraySampleHopView *view, int frame) {
-    RawSample *s=user; (void)view;
+static int raw_process(void *user, int frame) {
+    RawSample *s=user;
     int status;
     if (s->vad_file)
         status=array_sample_beam_process_with_activity(s->unit.beam,s->microphones,
@@ -167,8 +166,8 @@ static int raw_process(void *user, ArraySampleHopView *view, int frame) {
     }
     return 0;
 }
-static int raw_consume(void *user, ArraySampleHopView *view, int frame) {
-    RawSample *s=user; (void)view; (void)frame;
+static int raw_consume(void *user, int frame) {
+    RawSample *s=user; (void)frame;
     if (fwrite(s->output, sizeof(float), (size_t)s->hop, s->output_file) !=
         (size_t)s->hop) {
         fprintf(stderr, "failed to write output frame\n");
@@ -179,8 +178,8 @@ static int raw_consume(void *user, ArraySampleHopView *view, int frame) {
     ++s->frames;
     return 0;
 }
-static int raw_finish(void *user, ArraySampleHopView *view, int processed) {
-    RawSample *s=user; (void)view;
+static int raw_finish(void *user, int processed) {
+    RawSample *s=user;
     char final_raw[32], final_smooth[32], final_used[32];
     int write_failed;
     /* The last buffered hops reach the file only here: a failed flush is an I/O failure too. */

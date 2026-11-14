@@ -68,7 +68,7 @@ static void trace_add(Trace *t, const float *p, size_t n) {
     t->len += n;
 }
 
-typedef enum { INJ_NONE = 0, INJ_EST_NAN_FIRST, INJ_APP_INF_LAST, INJ_EST_INF_MID, INJ_SINGLE_NAN,
+typedef enum { INJ_EST_NAN_FIRST, INJ_APP_INF_LAST, INJ_EST_INF_MID, INJ_SINGLE_NAN,
                INJ_EST_HUGE_FIRST, INJ_APP_HUGE_LAST, INJ_SINGLE_HUGE } Injection;
 /* CLEAN: every block as is. OMIT: block BAD_BLOCK never offered. SKIP / RETRY: block BAD_BLOCK is
  * corrupt and must be refused (SKIP: not offered again; RETRY: offered clean right after). */

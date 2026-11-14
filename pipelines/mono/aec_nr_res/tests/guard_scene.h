@@ -22,7 +22,6 @@ static inline float gs_rnd(void) {                   /* xorshift32, uniform in [
 }
 
 typedef struct GuardScene {
-    const char* name;
     int sr, fft, hop, nh;
     float *mic, *far;
     int enable_cng;
@@ -31,14 +30,14 @@ typedef struct GuardScene {
 
 /* Speech-like far-end bursts (or a steady one), a piecewise echo path whose delay changes at 1/3 and
  * 2/3 of the stream, an optional near-end burst, an optional silent head. */
-static inline int guard_scene_make(GuardScene* s, const char* name, int sr, int fft, int seconds, uint32_t seed,
+static inline int guard_scene_make(GuardScene* s, int sr, int fft, int seconds, uint32_t seed,
                             int speech_far, int echo, int near_burst, int silent_head_hops) {
     int n, i, seg = sr / 4;
     int d1 = 480 * (sr / 16000), d2 = 1100 * (sr / 16000), d3 = 240 * (sr / 16000);
     float env = 0.2f, lp = 0.0f, nlp = 0.0f;
     float* nearv;
     memset(s, 0, sizeof(*s));
-    s->name = name; s->sr = sr; s->fft = fft; s->hop = fft / 2;
+    s->sr = sr; s->fft = fft; s->hop = fft / 2;
     s->nh = seconds * sr / s->hop;
     s->enable_cng = 1;
     for (i = 0; i < 4; ++i) s->reset_at[i] = -1;

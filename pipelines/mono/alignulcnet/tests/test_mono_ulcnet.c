@@ -353,7 +353,7 @@ static AecLinearDelayState pipeline_delay_state(const MonoUlcnet* p) {
 /* Frames emitted at hop index h: the rolling (center=False) analysis emits
  * exactly one frame per hop from hop #0 (kept as a function so the
  * schedule stays in one place). */
-static int frames_at_hop(int h) { (void)h; return 1; }
+static int frames_at_hop(void) { return 1; }
 
 /* Spend an armed identity-reprime budget over one hop's `frames` emitted
  * frames, and report how many of them the reprime covered. The budget is
@@ -469,7 +469,7 @@ static void test_counting_model(void) {
         AecLinearDelayState ds = pipeline_delay_state(p);
         if (ds == AEC_LINEAR_DELAY_CHANGED)
             armed = ULCNET_NN_STAGE_REPRIME_FRAMES;
-        frames = frames_at_hop(h);
+        frames = frames_at_hop();
         skipped_here = reprime_take(&armed, frames);
         skipped_total += skipped_here;
         expected_calls += frames - skipped_here;
@@ -1671,7 +1671,7 @@ static void test_reprime_straddle_derivation(void) {
     float first_visible_err_peak = -1.0f, first_visible_far_peak = -1.0f;
     int stepped_inside_reprime = 0;
 
-    for (int h = 0; h < RP_RUN; h++) expected_frames += frames_at_hop(h);
+    for (int h = 0; h < RP_RUN; h++) expected_frames += frames_at_hop();
 
     if (reprime_probe_run(0, 0, &err_ctl) != 0 ||
         reprime_probe_run(0, 1, &far_ctl) != 0 ||
@@ -1816,7 +1816,7 @@ static void test_reprime_behavior(void) {
             n_changed++;
             if (boundary_hop < 0) boundary_hop = h;
         }
-        frames = frames_at_hop(h);
+        frames = frames_at_hop();
         skipped_here = reprime_take(&armed, frames);
         skipped_total += skipped_here;
         expected_delta = frames - skipped_here;
@@ -1883,7 +1883,7 @@ static void test_reprime_behavior(void) {
                 armed = ULCNET_NN_STAGE_REPRIME_FRAMES;
                 fixed_boundary = h;
             }
-            frames = frames_at_hop(h);
+            frames = frames_at_hop();
             skipped_here = reprime_take(&armed, frames);
             skipped_total += skipped_here;
             delta = fst.infer_calls - calls_before;
@@ -2341,13 +2341,13 @@ static void test_guard_hops_feed_analysis_seam(void) {
     double worst_guard_err = 0.0, worst_sep = 0.0;
     int built = 1, ran = 1;
 
-    built &= guard_scene_make(&sc[0], nm[0], g_grid.sample_rate, g_grid.n_fft, seconds, 0x2545F491u, 1, 1, 1, 0) == 0;
-    built &= guard_scene_make(&sc[1], nm[1], g_grid.sample_rate, g_grid.n_fft, seconds, 0x1234567u, 0, 0, 0, 30) == 0;
+    built &= guard_scene_make(&sc[0], g_grid.sample_rate, g_grid.n_fft, seconds, 0x2545F491u, 1, 1, 1, 0) == 0;
+    built &= guard_scene_make(&sc[1], g_grid.sample_rate, g_grid.n_fft, seconds, 0x1234567u, 0, 0, 0, 30) == 0;
     if (built) {
         int n = sc[1].nh * sc[1].hop;
         for (int i = 0; i < n; ++i) sc[1].mic[i] += 0.03f * gs_rnd();
     }
-    built &= guard_scene_make(&sc[2], nm[2], g_grid.sample_rate, g_grid.n_fft, seconds, 0x2545F491u, 1, 1, 1, 0) == 0;
+    built &= guard_scene_make(&sc[2], g_grid.sample_rate, g_grid.n_fft, seconds, 0x2545F491u, 1, 1, 1, 0) == 0;
     CHECK(built, "guard hops: the three guard scenes build");
     if (!built) return;
     sc[2].reset_at[0] = sc[2].nh / 4;
@@ -2482,9 +2482,7 @@ typedef struct AccStats {
     double max_err;               /* worst |stage - direct-DFT reference| */
     double peak0;                 /* peak |hop #0| of the first pass */
     int chain_bad;                /* hops not bit-equal to the audiolib accumulate chain */
-    int hops;
     int ran[ACC_MAX_HOPS];        /* the model ran on this hop (infer_calls advanced) */
-    int state[ACC_MAX_HOPS];      /* AEC delay state of the hop */
     int solid[ACC_MAX_HOPS];
     int changed[ACC_MAX_HOPS];
 } AccStats;
@@ -2506,7 +2504,6 @@ static int acc_drive(MonoUlcnet* p, BandModelState* st, EchoSim* sim, int n, Acc
         rv = mu_residual(p);
         lv = mu_linear(p);
         r->ran[h] = st->infer_calls > before;
-        r->state[h] = (int)lv.delay_state;
         r->changed[h] = lv.delay_state == AEC_LINEAR_DELAY_CHANGED;
         r->solid[h] = lv.delay_state != AEC_LINEAR_DELAY_UNLOCKED;
         (void)ac_stft_push_planar(ref->stft, rv.formed_hop, re, im);
@@ -2521,7 +2518,6 @@ static int acc_drive(MonoUlcnet* p, BandModelState* st, EchoSim* sim, int n, Acc
             if (h == 0 && fabs((double)out[k]) > r->peak0) r->peak0 = fabs((double)out[k]);
         }
         if (out_hist) memcpy(out_hist + (size_t)h * HOP, out, HOP_BYTES);
-        r->hops++;
     }
     return 0;
 }

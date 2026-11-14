@@ -71,10 +71,10 @@ Aec + RES + NR    處理 m[t] 處理 m[t+1] 處理 m[t+2]     （同一次呼叫
 | 重置／收尾 | `aec_reset()`、`anr_reset()`、`ac_istft_reset()`、`aec_destroy()`、`anr_destroy()` | [§3](lifecycle.md#3-lifecycle)、[§5](lifecycle.md#5-錯誤處理) |
 | 診斷（唯讀） | `aec_debug_status()`、`anr_debug_status()`、`aec_get_last_timing()` | [§3.1](lifecycle.md#31-執行期唯讀存取)、[§3.1b](lifecycle.md#31b-逐階段耗時診斷用) |
 
-**內部函式（不要依賴，隨版本改變）**：AEC 的內部標頭在函式庫的 `src/`（`pbfdkf.h`、`delay_aec.h`、`aec_post.h`、
-`suppression_gain.h`、`aec_config_build.h`、`aec_tuning.h` 等），不在 include 路徑上；`include/` 只有 `aec.h`、`aec_internal.h`、`aec_balanced_config.h`、`aec_debug.h`；NR 的 `noise_estimator.h`、`spp_estimator.h`、
+**內部函式（不要依賴，隨版本改變）**：AEC 的內部標頭在函式庫的 `include/internal/`（`pbfdkf.h`、`delay_aec.h`、`aec_post.h`、
+`suppression_gain.h`、`aec_config_build.h`、`aec_tuning.h` 等），不在公開的 include 路徑（`-I include`）上；`include/` 只有 `aec.h`；NR 的 `noise_estimator.h`、`spp_estimator.h`、
 `anr_internal.h`，以及 `anr_apply_*_experiment()`；audiolib 的 `utility/` 內核（除上表列出的 `sk_*`、`ALIGN16` 外）。
-`Aec` 是不透明型別（`aec.h` 只有 `typedef struct Aec Aec;`，本體在函式庫的 `src/aec_impl.h`）：不能 `sizeof(Aec)`、不能宣告 `Aec` 變數、沒有欄位可讀，只能經由函式存取。
+`Aec` 是不透明型別（`aec.h` 只有 `typedef struct Aec Aec;`，本體在函式庫的 `include/internal/aec_impl.h`）：不能 `sizeof(Aec)`、不能宣告 `Aec` 變數、沒有欄位可讀，只能經由函式存取。
 
 ### 0.3 參數面：外部與內部
 
@@ -96,7 +96,7 @@ Aec + RES + NR    處理 m[t] 處理 m[t+1] 處理 m[t+2]     （同一次呼叫
 | 家族 | 位置 | 為什麼不開放 |
 |---|---|---|
 | 範例 `derive_lane()` 固定的接縫：`residual = AEC_RESIDUAL_FULL`（預設值；`OFF`／`STATE`／`ESTIMATE` 依序少給 `res_gain`、`r2`／`comfort_noise` 等） | `aec.h` 的 `AecConfig.residual`；`mono/aec_nr_res/main.c` 的 `derive_lane()` | 低於 `FULL` 就沒有 `v.res_gain`，`aec_apply_gain()` 回 `AEC_ERR_MODE`，串接整個失效 |
-| AEC 的全部調校值（濾波器長度與步進、shadow、HPF、飽和處理、EPC／近端偵測門檻、延遲獲取策略、double-talk 與 floor 常數、預設關閉的實驗、以 10 ms 格點撰寫的時間欄位） | 函式庫內部的 `AecTuning`（`src/aec_tuning.h`），不在 `aec.h` | 由 `aec_resolve()` 依 `(sample_rate, fft_size, n_mics, level)` 建立並在建立時 retime，呼叫端沒有設定入口；level 的三個 floor 值隨 `AecConfig.level`／`aec_set_level()` 成組改變 |
+| AEC 的全部調校值（濾波器長度與步進、shadow、HPF、飽和處理、EPC／近端偵測門檻、延遲獲取策略、double-talk 與 floor 常數、預設關閉的實驗、以 10 ms 格點撰寫的時間欄位） | 函式庫內部的 `AecTuning`（`include/internal/aec_tuning.h`），不在 `aec.h` | 由 `aec_resolve()` 依 `(sample_rate, fft_size, n_mics, level)` 建立並在建立時 retime，呼叫端沒有設定入口；level 的三個 floor 值隨 `AecConfig.level`／`aec_set_level()` 成組改變 |
 | `SuppressionGainConfig`、`AecPostConfig`、`AecStateConfig`、`aec_balanced_config.h` 的常數 | AEC 內部標頭 | 編譯期依 `(sample_rate, fft_size)` 查表，runtime 改不了，也不該提供接口 |
 | NR 的追蹤器與平滑欄位：`alpha_xi`、`alpha_s`、`alpha_d`、`alpha_p`、`alpha_attack`、`alpha_decay`、`delta_db`、`scene_change_*`、`speech_protect_*`、`speech_aware_*`、`noise_gate_*`、`makeup_*`、`cross_band_*` | `AnrConfig`（`anr_types.h`）的同名欄位 | 聯合調出的操作點，四個 `AnrLevel` 共用；`AnrConfig.alpha_g` 在增益路徑上沒有作用 |
 | NR 的 `L`、`num_init_frames` | `AnrConfig.L`、`AnrConfig.num_init_frames`（`anr_types.h`） | 決定 pool 版面，`anr_reconfigure()` 與 `anr_set_level()` 不能改它們；範例用函式庫預設 |

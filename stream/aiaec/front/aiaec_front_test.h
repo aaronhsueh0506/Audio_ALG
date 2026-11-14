@@ -12,15 +12,15 @@
 extern "C" {
 #endif
 
-typedef enum AiaecFrontDelayMode {
+enum {
     AIAEC_FRONT_DELAY_MATCHED  = 0,   /* online matched-filter estimate; needs delay_num_filters 1..5 */
     AIAEC_FRONT_DELAY_FIXED    = 1,   /* caller-measured delay; needs fixed_delay_samples >= 0 */
     AIAEC_FRONT_DELAY_EXTERNAL = 2    /* far already aligned to the mic; no estimator, always solid */
-} AiaecFrontDelayMode;
+};
 
 typedef struct AiaecFrontConfig {
     AiaecConfig grid;              /* sr, fft, hop_in; AEC hop = fft / 2, hop_in a multiple of it */
-    int delay_mode;                /* AiaecFrontDelayMode */
+    int delay_mode;                /* AIAEC_FRONT_DELAY_* */
     int delay_num_filters;         /* MATCHED only, 1..5 */
     int fixed_delay_samples;       /* FIXED only, >= 0; -1 otherwise */
 } AiaecFrontConfig;

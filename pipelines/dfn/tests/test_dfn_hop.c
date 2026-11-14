@@ -48,7 +48,7 @@ static DfnResStageConfig stage_config(void) {
 /* One grid under test: the test grid (48 kHz as shipped) drives the stage, 16 kHz/256 the bridge
  * (which needs the 48 kHz / 1024 model). */
 typedef struct Rig {
-    int bridge_mode, n, hop;
+    int n, hop;
     DfnHop h;
     DfnResStage* stage;
     DfnRateBridge* bridge;
@@ -59,7 +59,6 @@ typedef struct Rig {
 
 static int rig_init(Rig* r, int bridge_mode) {
     memset(r, 0, sizeof *r);
-    r->bridge_mode = bridge_mode;
     if (bridge_mode) {
         DfnRateBridgeConfig bc = dfn_rate_bridge_default_config(16000, dfn_test_grid());
         bc.stage = stage_config();

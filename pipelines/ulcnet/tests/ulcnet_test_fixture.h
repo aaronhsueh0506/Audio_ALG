@@ -1,4 +1,4 @@
-/* Shared fixture of the Align-ULCNet pipeline tests (mono and 4ch): the grids they run, the grid under test, the
+/* Shared fixture of the Align-ULCNet pipeline tests (mono, 4ch and the stage alone): the grids they run, the grid under test, the
  * descriptor of that grid, and the stand-in models that need no state of their own. Header-only; define nothing it
  * names before including it. A test includes it after "ulcnet/ulcnet_nn_stage.h". */
 

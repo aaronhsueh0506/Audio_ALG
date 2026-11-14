@@ -834,7 +834,7 @@ echo "############################################################"
 mkscratch pshared
 mkscratch sp2
 # audiolib's common/ has no .git of its own (it is a subdirectory of the audiolib repo), so the clone is of the
-# whole audiolib repo, named "audiolib" so it sits where the wav_io.h shim of AEC's/NR's c_impl/example expects it
+# whole audiolib repo, named "audiolib" so it sits where the wav_io.h shim of AEC's c_impl/example expects it
 # ("../../../audiolib/common/include/wav_io.h" via __has_include): a sibling of the AEC/NR clones, all under
 # $SCRATCH_ROOT/pshared/, with no symlink or tracked-source edit. PSHARED_AC_CLONE is that clone's common/
 # subdirectory.
@@ -1253,8 +1253,8 @@ if ar -t "$sp10_lib" | grep -qx 'sp10_foreign.o'; then
 else
   pass "SP-S10: foreign member is GONE after rebuild (fresh-archive discipline: \$@.tmp + mv -f)"
 fi
-ar -t "$sp10_lib" | grep -qx 'aec_debug.o' && pass "SP-S10: aec_debug.o present in the freshly-rebuilt archive" \
-  || fail "SP-S10: aec_debug.o missing from the freshly-rebuilt archive"
+ar -t "$sp10_lib" | grep -qx 'aec_post.o' && pass "SP-S10: aec_post.o present in the freshly-rebuilt archive" \
+  || fail "SP-S10: aec_post.o missing from the freshly-rebuilt archive"
 
 sp10_objdir="$(make -s -C "$AEC_R6_DIR" BACKEND=ne10 OBJ_ROOT="$SP10_OBJ_ROOT" BIN_ROOT="$SP10_BIN_ROOT" COMMON_DIR="$COMMON_DIR" COMMON_LIB="$sp10_ac_lib" print-obj-dir)"
 grep -q 'SRCS=' "$sp10_objdir/config.manifest" && pass "SP-S10: the SCRATCH obj dir's config.manifest records a SRCS= entry" \
@@ -1741,7 +1741,7 @@ SP17_PIN_ARGS=(AUDIOLIB_DIR="$PSHARED_AUDIOLIB_CLONE"
 # content, so git still considers them clean coming into this scenario --
 # this is the FIRST real content edit either clone sees.)
 echo "/* sp17 disposable dirty probe */" >> "$SP17_AC_CLONE/src/hpf.c"
-echo "/* sp17 disposable dirty probe */" >> "$SP17_AEC_CLONE/c_impl/src/aec_debug.c"
+echo "/* sp17 disposable dirty probe */" >> "$SP17_AEC_CLONE/c_impl/src/aec_post.c"
 echo "/* sp17 disposable dirty probe */" >> "$SP17_NR_CLONE/c_impl/src/anr.c"
 
 SP17_OBJ_ROOT="$SCRATCH_ROOT/sp17/obj"

@@ -33,7 +33,7 @@ int array_sample_parse_spatial_cli(int argc, char **argv, int raw,
                            ArraySampleSpatialOptions *out);
 
 typedef struct ArraySampleHopView {
-    float *microphones, *reference, *output;
+    float *output;
     int hop;
     int check_finite;
 } ArraySampleHopView;
@@ -43,12 +43,12 @@ typedef struct ArraySampleOps {
     /* setup: 0=run, 1=failure, 2=print-only success. */
     int (*setup)(void *user, ArraySampleHopView *hop);
     /* read: 1=complete hop, 0=end, -1=failure. No hot-path allocations. */
-    int (*read)(void *user, ArraySampleHopView *hop, int frame);
-    int (*process)(void *user, ArraySampleHopView *hop, int frame);
-    int (*consume)(void *user, ArraySampleHopView *hop, int frame);
+    int (*read)(void *user, int frame);
+    int (*process)(void *user, int frame);
+    int (*consume)(void *user, int frame);
     void (*nonfinite)(void *user);
     /* Optional (NULL = success). */
-    int (*finish)(void *user, ArraySampleHopView *hop, int frames);
+    int (*finish)(void *user, int frames);
     void (*cleanup)(void *user);
     /* Optional success report after resource destruction. */
     void (*complete)(void *user);

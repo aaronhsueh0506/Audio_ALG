@@ -3,7 +3,7 @@
 The C gain chains of the example programs fill the residual-suppressed bins through
 ``aec_cng_fill`` (an AEC library helper; the public entry is ``aec_apply_cng_spec`` in ``aec.h``) with comfort noise drawn from one
 multiplicative-congruential step per bin whose top five bits index ``AECB_SQRT2_SIN_LUT``
-(``lib/aec/c_impl/include/aec_balanced_config.h``), the imaginary part reading a quarter turn
+(``lib/aec/c_impl/include/internal/aec_balanced_config.h``), the imaginary part reading a quarter turn
 (+8 of 32) ahead of the real one.  The numeric core (square roots, product order, draw schedule)
 is the AEC library's own Python module ``modules/cng.py`` -- the one the in-chain comfort noise of
 ``AEC.process()`` uses -- so a Python reference that renders the context seam itself reproduces the

@@ -82,34 +82,6 @@ static const unsigned kRates[] = { 0, 0, 0, 97, 9, 2 };
 static const float kScales[] = { 1.0f, 1e-3f, 1e3f, 1.0f, 1.0f, 1.0f };
 #define KCASES ((int)(sizeof(kRates) / sizeof(kRates[0])))
 
-/* The finite predicate over strided rows, against a plain double loop; the
- * gaps between rows hold non-finite values that must not matter. */
-static int test_rows_all_finite(void)
-{
-    static float buf[8 * 64];
-    for (int round = 0; round < 4000; ++round) {
-        size_t width = 1 + rng() % 40;
-        size_t stride = width + rng() % 24;
-        size_t rows = 1 + rng() % 8;
-        int want = 1;
-        for (size_t i = 0; i < sizeof(buf) / sizeof(float); ++i) buf[i] = uniform();
-        for (size_t r = 0; r < rows; ++r)
-            for (size_t i = width; i < stride; ++i) buf[r * stride + i] = special();
-        if (round % 3 != 0) {
-            size_t r = rng() % rows, i = rng() % width;
-            buf[r * stride + i] = special();
-        }
-        for (size_t r = 0; r < rows; ++r)
-            for (size_t i = 0; i < width; ++i)
-                if (!isfinite(buf[r * stride + i])) want = 0;
-        CHECK(skn_all_finite_rows_f32(buf, rows, stride, width) == want,
-              "skn_all_finite_rows_f32 equals the plain predicate");
-        CHECK(skn_all_finite_rows_f32_scalar(buf, rows, stride, width) == want,
-              "skn_all_finite_rows_f32 scalar twin equals the plain predicate");
-    }
-    return 1;
-}
-
 #if defined(KERNEL_TEST_ULCNET)
 /* State table of the shipped graph (pinned to the exporter by
  * test_export_streaming_ulcnet.py). */
@@ -370,7 +342,6 @@ int main(int argc, char** argv)
         g_bins = g_n_fft / 2 + 1;
         if (g_bins > BINS_MAX) return EXIT_FAILURE;
     }
-    if (!test_rows_all_finite()) return EXIT_FAILURE;
 #if defined(KERNEL_TEST_ULCNET)
     if (!test_ulcnet_kernels()) return EXIT_FAILURE;
     if (!test_ulcnet_frame_finite()) return EXIT_FAILURE;

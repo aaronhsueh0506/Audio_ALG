@@ -2222,11 +2222,9 @@ static int test_example_unit_config_grid(void) {
  * ========================================================================== */
 
 static Ul4* ul4_in_pools(void* unit_pool, size_t unit_bytes, const ArrayTestUnitConfig* cfg,
-                         const AecMemReq* req, void* stage_pool,
-                         size_t stage_bytes) {
+                         void* stage_pool, size_t stage_bytes) {
     Ul4* p = (Ul4*)calloc(1, sizeof(*p));
     if (!p) return NULL;
-    (void)req;
     p->unit = array_test_beam_init(unit_pool, unit_bytes, cfg);
     p->stage = frm_init(&p->frm, &g_grid) == 0 ? ulcnet_nn_stage_init(stage_pool, stage_bytes, &g_grid) : NULL;
     if (!p->unit || !p->stage) {
@@ -2259,7 +2257,7 @@ static int test_create_vs_pool_parity(void) {
     memset(stage_pool, 0xa5, stage_bytes + EXTRA);
 
     heap = ul4_create(&cfg);
-    pooled = ul4_in_pools(unit_pool, (size_t)req.bytes, &cfg, &req, stage_pool, stage_bytes);
+    pooled = ul4_in_pools(unit_pool, (size_t)req.bytes, &cfg, stage_pool, stage_bytes);
     CHECK(heap != NULL && pooled != NULL,
           "heap and poisoned caller-pool construction both succeed");
     memset(&model, 0, sizeof(model));
@@ -2291,7 +2289,7 @@ static int test_create_vs_pool_parity(void) {
     array_test_beam_destroy(pooled->unit);
     frm_free(&pooled->frm);
     free(pooled);
-    pooled = ul4_in_pools(unit_pool, (size_t)req.bytes, &cfg, &req, stage_pool, stage_bytes);
+    pooled = ul4_in_pools(unit_pool, (size_t)req.bytes, &cfg, stage_pool, stage_bytes);
     CHECK(pooled != NULL, "the caller pools are reusable after destroy");
     array_test_beam_destroy(pooled->unit);
     frm_free(&pooled->frm);

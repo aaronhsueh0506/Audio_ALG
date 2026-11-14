@@ -3,6 +3,16 @@
 `Audio_ALG/pipelines`（含它建置的 `AINR`、`AIAEC` C 程式）的重要改動記錄在此，格式依
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/)。README 只寫現況，改動經過寫在這裡。
 
+## [Unreleased] — 2026-11-14 — dead parameters, members and locals of samples and tests removed; follows lib/aec's `include/internal/` headers and the removed per-hop trace
+
+No numerics changed; the library archives are untouched. Every item is in a sample, a test or an inline helper of a private header.
+
+- **Build paths.** `pipelines/Makefile`, `pyc_parity_pipelines.sh`, `pyc_parity.py` (hashed `SOURCES`) and `AIAEC/tests/test_deployed_frontend_contract.py` take AEC's private headers from `$(AEC_DIR)/include/internal` (they moved out of `src/`). `test_build_isolation.sh` SP-S10 and SP17 name `aec_post.o` / `aec_post.c` where they named the removed `aec_debug.o` / `aec_debug.c` (the member and the dirtied file only have to exist in both trees).
+- **`ArraySampleHopView` / `ArraySampleOps`.** `microphones` and `reference` (written by the four samples' `*_setup`, read by nobody) are gone from the view, and `read`, `process`, `consume` and `finish` no longer take the view (all ten sample implementations and the four test probes ignored it): `ops->read(user, frame)` and so on. `setup` keeps the view.
+- **Tests and helpers.** `ul4_in_pools()` loses the unused `req`; `dfn_example_rates_text()` returns `void` (both callers dropped the pointer); `Rig.bridge_mode` (test_dfn_hop), `SceneRun.hops` and `BridgeSceneRun.reset_hops_off` (test_mono_dfn), `GuardScene.name` with the `name` argument of `guard_scene_make()`, `AccStats.hops` / `.state[]` and the argument of `frames_at_hop()` (test_mono_ulcnet), the `bad_rig` / `bad_cm` tallies of `test_full_mode_identity`, and the `n_freqs` argument of the README-flow `hf_tilt_init()` are removed.
+- **`test_ulcnet_nn_stage.c`** uses `ulcnet/tests/ulcnet_test_fixture.h` (grid table, `g_grid`, `HOP`/`BINS`, `test_io_descriptor()`) like the mono and 4ch tests instead of its own identical copy; the Makefile object rule lists the fixture.
+- **Stream tests and header.** `AiaecFrontDelayMode` (an enum name nobody used as a type) is an anonymous enum, `Accel.have_gen`, two never-read arrays and `nb` in the AIAEC packet / spec-freq tests, `bad_grid` in `check_erb_file.c`, `did_reset` in the DFN2 `verify_vs_sample.c` and `INJ_NONE` in `test_ainr_freq_nonfinite.c` are removed.
+
 ## [Unreleased] — 2026-11-14 — Review round: the AIAEC front resets the AEC on a refused block; AEC test hooks never reach a pipeline build; `print-deps-sh` is not eval'd; NR flag set is four
 
 No numerics changed (the 4ch, mono and stream outputs are the ones of the previous entry).

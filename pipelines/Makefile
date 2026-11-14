@@ -274,7 +274,7 @@ endif
 CFLAGS = -Wall -Wextra -O2 -std=gnu99 \
          -I. \
          -I$(ULCNET_DIR) -I$(DFN2_DIR) \
-         -I$(AEC_DIR)/include -I$(AEC_DIR)/example \
+         -I$(AEC_DIR)/include -I$(AEC_DIR)/include/internal -I$(AEC_DIR)/example \
          -I$(NR_DIR)/include \
          -I$(COMMON_DIR)/include -I$(COMMON_DIR)
 # AUDIO_PIPELINE_BACKEND_STR: compile-time FFT backend identity baked into the DFN stage and
@@ -292,8 +292,8 @@ ifeq ($(WERROR),1)
   CFLAGS += -Werror
 endif
 
-# NO_STDIO=1 is forwarded to the producers (audiolib, lib/aec, lib/nr compile their diagnostics
-# out) and folded into CFG_SIG; this repo's archived objects use no stdio at all. The host
+# NO_STDIO=1 is forwarded to the producers (audiolib and lib/nr compile their diagnostics
+# out; lib/aec has no stdio) and folded into CFG_SIG; this repo's archived objects use no stdio at all. The host
 # programs and the tests use stdio unconditionally.
 
 # --- FP-contraction policy (unified across the four repos) -------------------
@@ -592,7 +592,7 @@ $(OBJ_DIR)/test_mono_ulcnet.o: mono/alignulcnet/tests/test_mono_ulcnet.c ulcnet/
 
 # test_ulcnet_nn_stage: the stage alone, inside the application's own AcStft / AcIstft (model policy, WOLA)
 # on every grid of its table.
-$(OBJ_DIR)/test_ulcnet_nn_stage.o: ulcnet/tests/test_ulcnet_nn_stage.c ulcnet/ulcnet_nn_stage.h | _cfg_guard
+$(OBJ_DIR)/test_ulcnet_nn_stage.o: ulcnet/tests/test_ulcnet_nn_stage.c ulcnet/ulcnet_nn_stage.h ulcnet/tests/ulcnet_test_fixture.h | _cfg_guard
 	$(CC) $(CFLAGS) -I$(ULCNET_DIR) -MD -MP -c -o $@ $<
 
 $(OBJ_DIR)/dfn2_process.o: $(DFN2_DIR)/dfn2_process.c $(DFN2_DIR)/dfn2_process.h | _cfg_guard

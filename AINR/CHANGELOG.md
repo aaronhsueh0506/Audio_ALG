@@ -2,6 +2,11 @@
 
 ## Unreleased
 
+### Tests: shared stand-in schedule, two dead macros
+
+- `tests/chain_standin.h` holds the generator, digest, spectrum maker and stand-in model schedule that `tests/test_nn_chains.c` and `tests/dfn2_runtime_grid_chain.c` each carried as an identical copy. Printed digests are unchanged (SIMD 1 and 0).
+- `tests/dfn2_test_grid.h` loses `DFN2_WIN_LEN` and `DFN2_OVL_LEN` (the second had no reader, the first only fed it).
+
 ### stream/ainr/dfn2: the PCM stream accepts frames_per_call > 1
 
 - `dfn2_stream_get_mem_size()`/`init`/`init_ex` no longer refuse `grid.frames_per_call != 1`

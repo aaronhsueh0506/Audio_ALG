@@ -705,7 +705,6 @@ static int section_bind_and_pool(int fft, int n) {
 }
 
 static int section_gates(void) {
-    const int nb = 129;
     AiaecConfig cfg = make_cfg(256, 1);
     Trio t;
     float re[129], im[129], zeros[129];
@@ -786,7 +785,6 @@ static int section_gates(void) {
     CHECK(aiaec_preprocess_spec(t.spec, &in, &w) == AIAEC_ERR_SEQUENCE, "gates: second spec preprocess");
     if (w.action == AIAEC_SUBMIT) fake_head(&w, 0);
     CHECK(aiaec_postprocess_spec(t.spec, 0, re, im) == AIAEC_OK, "gates: spec postprocess");
-    (void)nb;
     printf("section_gates: kind/size/null/sequence rejections precede any state write\n");
     trio_free(&t);
     return 0;

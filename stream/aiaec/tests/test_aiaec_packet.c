@@ -103,7 +103,6 @@ typedef enum { ACC_MODEL = 0, ACC_IDENTITY = 1, ACC_NAN = 2, ACC_INF_FIRST = 3, 
 typedef struct Accel {
     float st[BINS];
     unsigned gen;
-    int have_gen;
     int calls;
     unsigned gen_changes;   /* state_generation values the accelerator saw change */
     AccMode mode;
@@ -111,7 +110,7 @@ typedef struct Accel {
 
 static void accel_init(Accel *a, unsigned gen, AccMode mode) {
     memset(a, 0, sizeof(*a));
-    a->gen = gen; a->have_gen = 1; a->mode = mode;
+    a->gen = gen; a->mode = mode;
 }
 
 /* The graph of layout 18 (N == 1, no frame_reset input) and 19 (frame_reset = inputs[4]). */
@@ -874,7 +873,6 @@ static int section_failure(void) {
 
 static int section_gates(void) {
     static Sched s;
-    static float re[NF * BINS], im[NF * BINS];
     static int16_t pcm[HOP_IN];
     Ctxs c;
     AiaecInput in;
@@ -910,7 +908,6 @@ static int section_gates(void) {
     memset(w.outputs[0].data, 0, w.outputs[0].elements * sizeof(float));
     CHECK(aiaec_postprocess(c.blk, 0, pcm) == AIAEC_OK, "postprocess");
     CHECK(aiaec_postprocess(c.blk, 0, pcm) == AIAEC_ERR_SEQUENCE, "second postprocess");
-    (void)re; (void)im;
 
     CHECK(aiaec_get_mem_size(&n2, &rq) == AIAEC_ERR_FRAMES_PER_CALL, "N=2 is not in the catalog");
     CHECK(aiaec_get_mem_size(&n16, &rq) == AIAEC_ERR_FRAMES_PER_CALL, "N=16 is not in the catalog");

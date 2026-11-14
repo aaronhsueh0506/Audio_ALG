@@ -189,7 +189,7 @@ build_layer() { # name simd debug extra
   local macros="" inc
   if [ "$simd" = 0 ]; then macros="-DSIMD_KERNELS_FORCE_SCALAR"; fi
   case "$extra" in *USE_STANDARD_MATH*) macros="$macros -DUSE_STANDARD_MATH" ;; esac
-  inc="-I$PL -I$P4 -I$AEC_DIR/include -I$AEC_DIR/example -I$NR_DIR/include -I$AC/include -I$AC"
+  inc="-I$PL -I$P4 -I$AEC_DIR/include -I$AEC_DIR/include/internal -I$AEC_DIR/example -I$NR_DIR/include -I$AC/include -I$AC"
   mkdir -p "$root/drv"
   # shellcheck disable=SC2086
   "$CC" -Wall -Wextra -O2 -std=gnu99 -ffp-contract=off -fno-math-errno $macros $inc -DPYC_WITH_4CH \

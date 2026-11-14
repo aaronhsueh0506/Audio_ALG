@@ -1222,17 +1222,17 @@ static void test_full_mode_identity(void) {
         GuardScene sc[4];
         const char* nm[4] = { "moving echo path with double talk", "moving echo path, comfort noise off",
                               "silent head, no echo path (never usable)", "aec_reset events and a moving path" };
-        long guard = 0, resets = 0, bad_rig = 0, bad_cm = 0, hops = 0;
+        long guard = 0, resets = 0, hops = 0;
         int i, built = 1;
-        built &= guard_scene_make(&sc[0], nm[0], g[gi].sr, g[gi].fft, g[gi].seconds, 0x2545F491u, 1, 1, 1, 0) == 0;
-        built &= guard_scene_make(&sc[1], nm[1], g[gi].sr, g[gi].fft, g[gi].seconds, 0x2545F491u, 1, 1, 1, 0) == 0;
+        built &= guard_scene_make(&sc[0], g[gi].sr, g[gi].fft, g[gi].seconds, 0x2545F491u, 1, 1, 1, 0) == 0;
+        built &= guard_scene_make(&sc[1], g[gi].sr, g[gi].fft, g[gi].seconds, 0x2545F491u, 1, 1, 1, 0) == 0;
         sc[1].enable_cng = 0;
-        built &= guard_scene_make(&sc[2], nm[2], g[gi].sr, g[gi].fft, g[gi].seconds, 0x1234567u, 0, 0, 0, 30) == 0;
+        built &= guard_scene_make(&sc[2], g[gi].sr, g[gi].fft, g[gi].seconds, 0x1234567u, 0, 0, 0, 30) == 0;
         if (built) {
             int n = sc[2].nh * sc[2].hop;
             for (i = 0; i < n; ++i) sc[2].mic[i] += 0.03f * gs_rnd();
         }
-        built &= guard_scene_make(&sc[3], nm[3], g[gi].sr, g[gi].fft, g[gi].seconds, 0x2545F491u, 1, 1, 1, 0) == 0;
+        built &= guard_scene_make(&sc[3], g[gi].sr, g[gi].fft, g[gi].seconds, 0x2545F491u, 1, 1, 1, 0) == 0;
         if (built) { sc[3].reset_at[0] = sc[3].nh / 4; sc[3].reset_at[1] = sc[3].nh / 2; sc[3].reset_at[2] = 3 * sc[3].nh / 5; }
         CHECK(built, fmt_msg("full mode @ %d Hz / %d: the four guard scenes build", g[gi].sr, g[gi].fft));
         for (i = 0; built && i < 4; ++i) {
@@ -1244,7 +1244,6 @@ static void test_full_mode_identity(void) {
                   fmt_msg("full mode @ %d Hz / %d, %s: main.c rig (%ld hops differ) and hand-written chain (%ld) equal aec_process(), "
                           "NR off, bit for bit", g[gi].sr, g[gi].fft, nm[i], fr.rig_diff_hops, fr.conv_diff_hops));
             guard += fr.guard_hops; resets += fr.reset_hops; hops += fr.hops;
-            bad_rig += fr.rig_diff_hops; bad_cm += fr.conv_diff_hops;
         }
         printf("  full mode @ %d Hz / %d: %ld hops, guard fired on %ld, hard-reset serial moved on %ld\n",
                g[gi].sr, g[gi].fft, hops, guard, resets);
@@ -1268,7 +1267,6 @@ static void test_full_mode_identity(void) {
                               g[gi].sr, g[gi].fft, ctl[c].what, fr.rig_diff_hops));
             }
         }
-        (void)bad_rig; (void)bad_cm;
         for (i = 0; i < 4; ++i) guard_scene_free(&sc[i]);
     }
 }
@@ -1313,7 +1311,7 @@ static long run_nr_policy(const GuardScene* s, int sabotage, long* cleared) {
 static void test_nr_keeps_running(void) {
     GuardScene sc;
     long cleared = 0, events;
-    if (guard_scene_make(&sc, "nr policy", 16000, 256, 14, 0x2545F491u, 1, 1, 1, 0) != 0) {
+    if (guard_scene_make(&sc, 16000, 256, 14, 0x2545F491u, 1, 1, 1, 0) != 0) {
         CHECK(0, "nr policy: the scene builds");
         return;
     }
@@ -1599,7 +1597,7 @@ static void test_examples_full_mode(const char* bin_dir, const char* tmp) {
     char bin[512];
     for (ci = 0; ci < sizeof cases / sizeof cases[0]; ++ci) {
         GuardScene sc;
-        if (guard_scene_make(&sc, "black box", cases[ci].sr, cases[ci].fft, cases[ci].seconds, 0x2545F491u, 1, 1, 1, 0) != 0) {
+        if (guard_scene_make(&sc, cases[ci].sr, cases[ci].fft, cases[ci].seconds, 0x2545F491u, 1, 1, 1, 0) != 0) {
             CHECK(0, "black box full mode: the scene builds");
             continue;
         }
@@ -1697,7 +1695,7 @@ static void test_examples_full_chain(const char* bin_dir, const char* tmp) {
     char bin[512];
     for (ci = 0; ci < sizeof cases / sizeof cases[0]; ++ci) {
         GuardScene sc;
-        if (guard_scene_make(&sc, "black box chain", cases[ci].sr, cases[ci].fft, cases[ci].seconds, 0x2545F491u, 1, 1, 1, 0) != 0) {
+        if (guard_scene_make(&sc, cases[ci].sr, cases[ci].fft, cases[ci].seconds, 0x2545F491u, 1, 1, 1, 0) != 0) {
             CHECK(0, "black box full chain: the scene builds");
             continue;
         }

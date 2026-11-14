@@ -140,12 +140,11 @@ static int static_setup(void *user, ArraySampleHopView *view) {
         return 1;
     }
 
-    view->hop=s->hop; view->microphones=s->mic_buf;
-    view->reference=s->ref_buf; view->output=s->out_buf;
+    view->hop=s->hop; view->output=s->out_buf;
     return 0;
 }
-static int static_read(void *user, ArraySampleHopView *view, int frame) {
-    StaticSample *s=user; (void)view;
+static int static_read(void *user, int frame) {
+    StaticSample *s=user;
     if (frame >= 48) return 0;
     fill_hop(s->mic_buf,s->ref_buf,s->hop,s->options.sample_rate,frame);
     return 1;
@@ -167,16 +166,16 @@ static int static_hop(StaticSample *s, int vad_active) {
     if (status != AEC_OK) array_sample_stages_reset(&s->post);
     return status;
 }
-static int static_process(void *user, ArraySampleHopView *view, int frame) {
-    StaticSample *s=user; (void)view;
+static int static_process(void *user, int frame) {
+    StaticSample *s=user;
     if (static_hop(s,frame < 8 ? 1 : 0) != AEC_OK) {
         fprintf(stderr,"Error: 4ch hop (unit, fuse, post-beam chain) failed\n");
         return 1;
     }
     return 0;
 }
-static int static_consume(void *user, ArraySampleHopView *view, int frame) {
-    StaticSample *s=user; (void)view;
+static int static_consume(void *user, int frame) {
+    StaticSample *s=user;
     if (isfinite(s->info.doa_raw_rad)) s->saw_finite_doa_raw = 1;
     if (s->info.bf_adaptive) s->saw_bf_adaptive = 1;
     if (frame == 48 - 1) {
@@ -187,8 +186,8 @@ static int static_consume(void *user, ArraySampleHopView *view, int frame) {
     }
     return 0;
 }
-static int static_finish(void *user, ArraySampleHopView *view, int frame) {
-    StaticSample *s=user; (void)view;
+static int static_finish(void *user, int frame) {
+    StaticSample *s=user;
     printf("Processed: %d frames (%d samples)\n", frame, frame * s->hop);
     printf("  saw a finite doa_raw at least once: %s\n",
            s->saw_finite_doa_raw ? "yes" : "no");

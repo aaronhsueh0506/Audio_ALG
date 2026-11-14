@@ -260,12 +260,11 @@ static int ulc_setup(void *user, ArraySampleHopView *view) {
     s->far = calloc((size_t)s->grid.hop, sizeof(float));
     s->output = calloc((size_t)s->grid.hop, sizeof(float));
     if (!s->microphones || !s->far || !s->output) return 1;
-    view->hop=s->grid.hop; view->microphones=s->microphones;
-    view->reference=s->far; view->output=s->output; view->check_finite=1;
+    view->hop=s->grid.hop; view->output=s->output; view->check_finite=1;
     return 0;
 }
-static int ulc_read(void *user, ArraySampleHopView *view, int frame) {
-    (void)user; (void)view; return frame < 4;
+static int ulc_read(void *user, int frame) {
+    (void)user; return frame < 4;
 }
 
 /* One hop: the unit, the application's analysis of the raw far, the stage with the beamformed
@@ -285,8 +284,8 @@ static int ulc_hop(UlcSample *s) {
     if (ulcnet_nn_stage_process(s->stage, s->out_spec) != 0) return -1;
     return ac_istft_push(s->istft, s->out_spec, s->output) == s->grid.hop ? 0 : -1;
 }
-static int ulc_process(void *user, ArraySampleHopView *view, int frame) {
-    UlcSample *s=user; (void)view; (void)frame;
+static int ulc_process(void *user, int frame) {
+    UlcSample *s=user; (void)frame;
     if (ulc_hop(s) == 0) return 0;
     array_sample_beam_reset(s->unit);
     ulcnet_nn_stage_reset(s->stage);

@@ -126,10 +126,10 @@ int array_sample_main(int argc, char **argv, const ArraySampleOps *ops, void *us
     if (rc == 2) { result = 0; goto cleanup; }
     if (rc != 0) goto cleanup;
     for (;;) {
-        rc = ops->read(user, &hop, frames);
+        rc = ops->read(user, frames);
         if (rc < 0) goto cleanup;
         if (rc == 0) break;
-        if (ops->process(user, &hop, frames) != 0) goto cleanup;
+        if (ops->process(user, frames) != 0) goto cleanup;
         if (hop.check_finite) {
             for (int i = 0; i < hop.hop; ++i) {
                 if (!isfinite(hop.output[i])) {
@@ -138,10 +138,10 @@ int array_sample_main(int argc, char **argv, const ArraySampleOps *ops, void *us
                 }
             }
         }
-        if (ops->consume && ops->consume(user, &hop, frames) != 0) goto cleanup;
+        if (ops->consume && ops->consume(user, frames) != 0) goto cleanup;
         ++frames;
     }
-    result = ops->finish ? ops->finish(user, &hop, frames) : 0;
+    result = ops->finish ? ops->finish(user, frames) : 0;
 cleanup:
     ops->cleanup(user);
     if (result == 0 && ops->complete) ops->complete(user);

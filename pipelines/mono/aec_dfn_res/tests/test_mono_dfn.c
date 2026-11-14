@@ -411,7 +411,7 @@ static int run_native(int sample_rate, int fft_size, int expected_sixths, int sa
  * --------------------------------------------------------------------------------------- */
 
 typedef struct SceneRun {
-    long hops, diff_hops, guard_hops, reset_hops;
+    long diff_hops, guard_hops, reset_hops;
     int ok;
 } SceneRun;
 
@@ -465,7 +465,6 @@ static void run_identity_scene(const GuardScene *sc, int sabotage, SceneRun *out
             for (i = 0; i < hop; ++i) if (got[i] != (want ? want[i] : 0.0f)) same = 0;
             if (!same) ++out->diff_hops;
         }
-        ++out->hops;
     }
     out->guard_hops = dfn->guard_hops;
     out->reset_hops = dfn->reset_hops;
@@ -519,7 +518,6 @@ static void run_post_chain(const GuardScene *sc, int sabotage, SceneRun *out) {
         if (dfn->reset_hops != resets) ac_istft_reset(probe);
         (void)ac_istft_push(probe, dfn->post, got);
         if (memcmp(want, got, (size_t)hop * sizeof(float)) != 0) ++out->diff_hops;
-        ++out->hops;
     }
     out->guard_hops = dfn->guard_hops;
     out->reset_hops = dfn->reset_hops;
@@ -537,8 +535,8 @@ static int run_scene_tests(void) {
     for (gi = 0; gi < sizeof g / sizeof g[0]; ++gi) {
         GuardScene moving, quiet;
         SceneRun r;
-        int built = guard_scene_make(&moving, "moving", g[gi].sr, g[gi].fft, g[gi].seconds, 0x2545F491u, 1, 1, 1, 0) == 0;
-        built &= guard_scene_make(&quiet, "never usable", g[gi].sr, g[gi].fft, g[gi].seconds, 0x1234567u, 0, 0, 0, 30) == 0;
+        int built = guard_scene_make(&moving, g[gi].sr, g[gi].fft, g[gi].seconds, 0x2545F491u, 1, 1, 1, 0) == 0;
+        built &= guard_scene_make(&quiet, g[gi].sr, g[gi].fft, g[gi].seconds, 0x1234567u, 0, 0, 0, 30) == 0;
         if (!built) { fprintf(stderr, "scene build failed\n"); return 1; }
         {   int n = quiet.nh * quiet.hop, i; for (i = 0; i < n; ++i) quiet.mic[i] += 0.03f * gs_rnd(); }
         moving.reset_at[0] = moving.nh / 2;
@@ -615,7 +613,7 @@ static int run_scene_tests(void) {
  * The bridge's downstream (resamplers, stage) is not bit-identical to anything by construction; the
  * pass-band rows of run_native cover it. */
 typedef struct BridgeSceneRun {
-    long hops, apply_diff_hops, estimate_diff_hops, guard_hops, reset_hops, reset_hops_off;
+    long hops, apply_diff_hops, estimate_diff_hops, guard_hops, reset_hops;
     double max_dev, max_dev_reset;   /* apply lane against aec_process(): everywhere / on the reset hops */
     int ok;
 } BridgeSceneRun;
@@ -711,8 +709,8 @@ static int run_bridge_scene_tests(void) {
         double dev = 0.0, dev_reset = 0.0;
         long guard = 0, resets = 0, hops = 0;
         int si, built;
-        built = guard_scene_make(&moving, "moving", g[gi].sr, g[gi].fft, g[gi].seconds, 0x2545F491u, 1, 1, 1, 0) == 0;
-        built &= guard_scene_make(&quiet, "never usable", g[gi].sr, g[gi].fft, g[gi].seconds, 0x1234567u, 0, 0, 0, 30) == 0;
+        built = guard_scene_make(&moving, g[gi].sr, g[gi].fft, g[gi].seconds, 0x2545F491u, 1, 1, 1, 0) == 0;
+        built &= guard_scene_make(&quiet, g[gi].sr, g[gi].fft, g[gi].seconds, 0x1234567u, 0, 0, 0, 30) == 0;
         if (!built) { fprintf(stderr, "scene build failed\n"); return 1; }
         {   int n = quiet.nh * quiet.hop, i; for (i = 0; i < n; ++i) quiet.mic[i] += 0.03f * gs_rnd(); }
         moving.reset_at[0] = moving.nh / 2;

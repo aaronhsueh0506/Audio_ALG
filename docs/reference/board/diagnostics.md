@@ -8,6 +8,6 @@
 | 量測單一 stage 的時間 | AEC 編譯時啟用 `AEC_STAGE_TIMING` 後讀 `aec_get_last_timing()`（四麥克風讀 `aec_array_get_timing()`，多一欄 `fuse_us`）。關閉時數值為零。 |
 | 評估記憶體 | 用各庫的 size／breakdown 查詢帶入目標 grid 和 build（array：`aec_get_mem_requirements()`、`aec_get_mem_breakdown()`），確認對齊與 descriptor。 |
 
-`NO_STDIO=1` 仍可讀結構化狀態。逐 hop 的檔案 trace 需要具備 stdio 的建置。[板端整合](README.md)
+`NO_STDIO=1` 仍可讀結構化狀態。[板端整合](README.md)
 
 [返回本主題](README.md)

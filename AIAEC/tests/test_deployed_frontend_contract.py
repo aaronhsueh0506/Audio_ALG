@@ -111,6 +111,7 @@ def lanes(tmp_path_factory, producer_libs):
     ]
     includes = [_PIPELINES_DIR, os.path.join(_PIPELINES_DIR, 'ulcnet'),
                 _ULCNET_DIR, os.path.join(_AEC_C_DIR, 'include'),
+                os.path.join(_AEC_C_DIR, 'include', 'internal'),
                 os.path.join(_AEC_C_DIR, 'example'),
                 os.path.join(_AC_DIR, 'include'), _AC_DIR]
     # One program: the grid is the example's own --sample-rate option.

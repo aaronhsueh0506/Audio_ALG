@@ -25,18 +25,18 @@ static int setup(void *u,ArraySampleHopView *v) {
     Probe *p=u;v->hop=2;v->output=p->output;v->check_finite=p->finite;
     return p->setup_rc;
 }
-static int read_hop(void *u,ArraySampleHopView *v,int frame) {
-    Probe *p=u;(void)v;return frame < 3 ? p->read_rc : 0;
+static int read_hop(void *u,int frame) {
+    Probe *p=u;return frame < 3 ? p->read_rc : 0;
 }
-static int process(void *u,ArraySampleHopView *v,int frame) {
-    Probe *p=u;(void)v;(void)frame;p->processed++;return p->process_rc;
+static int process(void *u,int frame) {
+    Probe *p=u;(void)frame;p->processed++;return p->process_rc;
 }
-static int consume(void *u,ArraySampleHopView *v,int frame) {
-    Probe *p=u;(void)v;(void)frame;p->consumed++;return p->consume_rc;
+static int consume(void *u,int frame) {
+    Probe *p=u;(void)frame;p->consumed++;return p->consume_rc;
 }
 static void nonfinite(void *u) {((Probe*)u)->nonfinite++;}
-static int finish(void *u,ArraySampleHopView *v,int frames) {
-    Probe *p=u;(void)v;p->finished++;p->frames=frames;return 0;
+static int finish(void *u,int frames) {
+    Probe *p=u;p->finished++;p->frames=frames;return 0;
 }
 static void cleanup(void *u) {((Probe*)u)->cleaned++;}
 static void complete(void *u) { Probe *p=u;assert(p->cleaned==1);p->completed++; }

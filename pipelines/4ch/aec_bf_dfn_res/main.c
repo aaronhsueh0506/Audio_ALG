@@ -263,12 +263,11 @@ static int dfn_setup(void *user, ArraySampleHopView *view) {
         ? hop_size + dfn_rate_bridge_added_delay_samples(s->bridge)
         : hop_size * (dfn_res_stage_lookahead_frames(&s->args.model_grid) + 1);
     printf("%s: hop %d samples, algorithmic latency %d samples\n", name, hop_size, latency);
-    view->hop=hop_size; view->microphones=microphones;
-    view->reference=far; view->output=output; view->check_finite=1;
+    view->hop=hop_size; view->output=output; view->check_finite=1;
     return 0;
 }
-static int dfn_read(void *user, ArraySampleHopView *view, int frame) {
-    (void)user; (void)view; return frame < 8;
+static int dfn_read(void *user, int frame) {
+    (void)user; return frame < 8;
 }
 /* P = B * G_res, plus comfort noise on the bins the gain cut when enabled (no denoiser: unity extra
  * gain); a lane's post-chain reset first clears the synthesis (the bridge's host-grid tail on the bridge
@@ -283,8 +282,8 @@ static int dfn_form(DfnSample *s, const AecResidualView *f) {
     return 0;
 }
 
-static int dfn_process(void *user, ArraySampleHopView *view, int frame) {
-    DfnSample *s=user; (void)view; (void)frame;
+static int dfn_process(void *user, int frame) {
+    DfnSample *s=user; (void)frame;
     ArraySampleBeamResult beam;
     AecResidualView spec;
     if (array_sample_beam_process(s->unit,microphones,far,&beam,NULL) != AEC_OK ||

@@ -162,7 +162,7 @@ re-validation.
 
 | 症狀 | 內部欄位（位置） | 風險 |
 |------|------|------|
-| 收斂太慢、濾波器發散、echo path 變化後適應慢 | AEC 內部調校值（`AecTuning`，`src/aec_tuning.h`）；`AecConfig` 沒有對應欄位 | 只能改函式庫並自己重跑三個 grid 的驗證；範圍內多數值不收斂 |
+| 收斂太慢、濾波器發散、echo path 變化後適應慢 | AEC 內部調校值（`AecTuning`，`include/internal/aec_tuning.h`）；`AecConfig` 沒有對應欄位 | 只能改函式庫並自己重跑三個 grid 的驗證；範圍內多數值不收斂 |
 | Musical noise | NR `alpha_decay`、`alpha_xi`（`anr_types.h`） | 與增益平滑聯合調過；`alpha_g` 在增益路徑上沒有作用，調它無效 |
 | 語音起始被截斷 | NR `alpha_attack`（`anr_types.h`） | 與 `alpha_decay` 成對 |
 | 噪聲環境切換後適應慢 | NR `L`（pool 版面欄位）、`scene_change_*` | `L` 要重新 `anr_get_mem_size()` 並重建實例；`anr_set_level()` 不能改它 |

@@ -67,12 +67,11 @@ static size_t hf_tilt_mem_size(int n_freqs) {
     return ALIGN16(sizeof(HfTilt)) + ALIGN16((size_t)n_freqs * sizeof(float));
 }
 
-static HfTilt* hf_tilt_init(void* mem, int n_freqs, int bin_hi, float amount) {
+static HfTilt* hf_tilt_init(void* mem, int bin_hi, float amount) {
     HfTilt* s = (HfTilt*)mem;          /* mem: 16-byte aligned, hf_tilt_mem_size() bytes */
     s->bin_hi = bin_hi;
     s->amount = amount;
     s->g = (float*)((uint8_t*)mem + ALIGN16(sizeof(HfTilt)));
-    (void)n_freqs;
     return s;
 }
 
@@ -165,7 +164,7 @@ static size_t chain_build(Chain* c, void* mem, size_t bytes, const AecSignalGrid
     if (c->aec && aec_synthesis_window(c->aec, &sc.window, &win_n) == 0 && win_n == sc.fft_size)
         c->istft = ac_istft_init(cur, synth_b, &sc);
     cur += ALIGN16(synth_b);
-    c->tilt = hf_tilt_init(cur, n, bin_hi, amount);    cur += hf_tilt_mem_size(n);
+    c->tilt = hf_tilt_init(cur, bin_hi, amount);    cur += hf_tilt_mem_size(n);
     c->g_nr_scratch = (float*)cur;                     cur += vec;
     c->g_extra = (float*)cur;                          cur += vec;
     c->spec = (Complex*)cur;

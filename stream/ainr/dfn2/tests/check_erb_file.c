@@ -131,17 +131,16 @@ int main(void) {
 
         /* Negative: dimension mismatch. */
         {
-            DFN2Grid bad_grid = grid;
             DFN2StreamConfig cfg_bad;
             DFN2StreamMemReq req_bad;
             void *pool_bad;
-            bad_grid.n_erb = grid.n_erb; /* keep grid itself valid; corrupt the FILE header instead */
             memset(&cfg_bad, 0, sizeof(cfg_bad));
             cfg_bad.grid = grid;
             dfn2_stream_get_mem_size(&cfg_bad, &req_bad);
             posix_memalign(&pool_bad, req_bad.alignment, req_bad.bytes);
             {
                 FILE *bad_fp = fopen(bad_path, "wb");
+                /* keep grid itself valid; corrupt the FILE header instead */
                 int32_t bad_hdr[2] = { (int32_t)grid.n_bins, (int32_t)grid.n_erb + 1 };
                 fwrite(bad_hdr, sizeof(int32_t), 2, bad_fp);
                 fclose(bad_fp);

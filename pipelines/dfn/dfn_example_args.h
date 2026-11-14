@@ -67,13 +67,12 @@ static int dfn_example_rate_known(const int *rates, int value) {
     return 0;
 }
 
-static const char *dfn_example_rates_text(const int *rates, char *buf, size_t cap) {
+static void dfn_example_rates_text(const int *rates, char *buf, size_t cap) {
     size_t used = 0;
     buf[0] = '\0';
     for (; *rates && used < cap; ++rates)
         used += (size_t)snprintf(buf + used, cap - used, "%s%d",
                                  used ? "|" : "", *rates);
-    return buf;
 }
 
 /* "16000/256, 48000/1024". */

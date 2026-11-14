@@ -211,7 +211,6 @@ ac_istft_push(istft, out_spec, out);   /* 應用端合成剛好一個 hop */</pr
 <tr><th>類別</th><th class="ok">存活</th><th class="dead">消失</th></tr>
 <tr><td><b>狀態快照(pull)</b></td><td><code>aec_debug_status</code>、<code>aec_get_residual</code>、<code>aec_get_linear</code>、<code>aec_linear_is_cancelling</code>、<code>aec_far_fft_real_compute_count</code>、<code>aec_get_mem_breakdown</code>、<code>anr_debug_status</code>、<code>anr_get_noise_psd</code>、4ch 的全部 census/counter accessor(<code>aec_array_*_count()</code>等;duty census 讀 <code>aec_debug_status</code>)</td><td>—</td></tr>
 <tr><td><b>耗時</b></td><td>函式在(<b>回 0</b>)</td><td><b>全部數值</b>(<code>AecStageTiming</code>／<code>AecArrayTiming</code>)</td></tr>
-<tr><td><b>Log / trace(push)</b></td><td>—</td><td><b>全部</b>:<code>aec_debug_set_frame</code>、<code>aec_debug_set_trace</code>、<code>AecDebugTraceRow</code> 的 CSV 14 欄</td></tr>
 <tr><td><b>錯誤碼</b></td><td>全部</td><td>—</td></tr>
 <tr><td><b>Finite guards</b></td><td>全部(不受任何開關影響)</td><td>—</td></tr>
 </table></div>
@@ -248,8 +247,7 @@ log("delay=%d conf=%.1f upd=%d erle=%.1fdB usable=%d conv=%d "
 <h3>7.3 現況的已知盲點(整合前先知道)</h3>
 <div class="tblwrap"><table>
 <tr><th>盲點</th><th>實情</th></tr>
-<tr><td class="dead">per-hop CSV trace <b>四條 pipeline 全部不可達</b></td><td><code>AecDebugTraceRow</code> 的唯一填寫點要求 <code>residual == AEC_RESIDUAL_FULL</code> <b>且</b>走 <code>aec_process()</code>。四條 pipeline <b>全部</b>走 <code>aec_process_linear()</code>／<code>aec_process_residual()</code>(4ch 的 <code>aec_process()</code> 回 <code>AEC_ERR_MODE</code>)→ <code>dominant_nearend</code>／<code>saturated_echo</code>／<code>usable_linear</code>／<code>fullband_erle</code>／<code>gain_mean</code> 這些沒有第二個出口的量,在產品組態下<b>永遠取不到</b>。只有 CLI <code>aec_wav --debug-trace</code> 拿得到</td></tr>
-<tr><td class="dead">沒有層級式 log</td><td>函式庫沒有 log 等級介面:<code>aec_debug_set_level()</code>／<code>aec_debug_set_log()</code>(只存值、沒有讀取端)與 CLI 的 <code>--debug-level</code>／<code>--debug-log</code> 已移除;診斷走 <code>aec_debug_status()</code> 與 <code>aec_debug_set_trace()</code></td></tr>
+<tr><td class="dead">沒有層級式 log</td><td>函式庫沒有 log 等級介面:<code>aec_debug_set_level()</code>／<code>aec_debug_set_log()</code>(只存值、沒有讀取端)與 CLI 的 <code>--debug-level</code>／<code>--debug-log</code> 已移除;診斷走 <code>aec_debug_status()</code>(AEC 沒有逐 hop 的檔案 trace)</td></tr>
 <tr><td class="dead"><code>assert()</code> 在出貨板上是<b>活的</b></td><td>四個 Makefile <b>沒有任何一個</b>設 <code>-DNDEBUG</code>。<code>suppression_gain.c</code> 的 table-length assert <b>沒有 release-path fallback</b>,失敗即 <code>abort()</code>——沒有回傳碼、沒有 log、沒有 hook 可攔</td></tr>
 <tr><td class="dead">self-reset 不計數</td><td><code>AEC_ERR_DSP</code> 路徑會內部呼叫 <code>reset()</code>,而 <code>reset()</code> 本身<b>清掉所有 instrumentation</b>(realign counters／duty census 全歸零)→ 一次 self-reset 之後「之前發生過什麼」在計數器上完全消失</td></tr>
 <tr><td class="dead">delay lock 遺失不計數</td><td><code>AecLinearView.delay_state</code> 與 <code>generation</code>(<code>aec_get_linear()</code>;4ch 為 <code>AecArrayView.delay</code>)每 hop 可讀,但 <code>AecDebugStatus</code> <b>兩者都沒有</b> → 只 poll <code>aec_debug_status()</code> 的整合者<b>看不到 lock 的丟失與重獲</b></td></tr>

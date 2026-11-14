@@ -234,13 +234,11 @@ static int run_matrix(const DFN2GridSpec *spec, const char *label, int inject_sh
 
     {
         long long phase, phase_hops, hop_in_phase;
-        int did_reset = 0;
         long long total_phases = 2; /* pre-reset run, then reset + post-reset run; drain appended after */
         for (phase = 0; phase < total_phases + 1; ++phase) {
             if (phase == 0) phase_hops = warm_hops;
-            else if (phase == 1) { board_reset(&A); dfn2_stream_reset(B); did_reset = 1; phase_hops = post_reset_hops; }
+            else if (phase == 1) { board_reset(&A); dfn2_stream_reset(B); phase_hops = post_reset_hops; }
             else phase_hops = drain_hops;
-            (void)did_reset;
 
             for (hop_in_phase = 0; hop_in_phase < phase_hops; ++hop_in_phase, ++ghop) {
                 DFN2HopIO io_b;
