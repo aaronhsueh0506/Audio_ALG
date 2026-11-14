@@ -55,7 +55,7 @@
 <tr><td>應用端的 framing 約定(audiolib <code>ac_stft_config_default()</code> 加 <code>AC_OLA_ACCUMULATE</code>)</td><td><code>lib/aiaec/ulcnet/ulcnet_process.h</code>(檔頭);stage 的 <code>framing_config()</code></td><td>sqrt-Hann、center 0、一 hop 一幀；synthesis 為 <code>AC_OLA_ACCUMULATE</code>、<code>spec_scale</code>／<code>ispec_scale</code> 為 1</td><td>與模型訓練的 STFT 慣例綁定，改了模型輸入就錯(慣例見 <a href="../../../start/reference/grids.html">訊號 grid、視窗與記憶體版號</a>)</td></tr>
 <tr><td><code>ArraySampleBeamParams.doa_*</code>、<code>bf_*</code>、<code>auto_vad_*</code>;<code>AecConfig.delay_backward_quarantine_*</code>;AEC 函式庫內部的延遲追蹤調校(duty-cycle、delay ring 範圍)</td><td><code>pipelines/4ch/array_sample_beam.c</code>、<code>lib/aec</code>(各自的 <code>*_default_*()</code>;AEC 的調校值在函式庫內部,不是欄位)</td><td>預設值見 <a href="../dfn2/configuration.html">DFN2 pipeline 參數與狀態</a></td><td>DOA／BF／VAD fallback／延遲追蹤的門檻與時間常數,互相耦合；範例以預設運作</td></tr>
 <tr><td><code>AecConfig</code> 其餘欄位</td><td><code>AEC/c_impl/include/aec.h</code>(<code>AecConfig</code>)</td><td>由 <code>aec_config_from_level()</code> 給出</td><td>分類與理由見 <a href="../../../libraries/index.html#aec">AEC 元件頁</a></td></tr>
-<tr><td><code>ULCNET_MODEL_IO_LAYOUT_VERSION</code>、<code>AEC_LAYOUT_VERSION</code></td><td><code>lib/aiaec/ulcnet/ulcnet_model_io.h</code>、<code>aec.h</code></td><td>18、2</td><td>契約／版面計數器，不是參數</td></tr>
+<tr><td><code>ULCNET_MODEL_IO_LAYOUT_VERSION</code>、<code>AEC_LAYOUT_VERSION</code></td><td><code>lib/aiaec/ulcnet/ulcnet_model_io.h</code>、<code>aec.h</code></td><td>18、3</td><td>契約／版面計數器，不是參數</td></tr>
 </table>
 
 <h2 id="section-4">4. 函式:public 與 internal</h2>

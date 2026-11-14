@@ -227,8 +227,6 @@ static int exercise(int sample_rate, int n_fft) {
     CHECK(model.io_descriptor->far_input_mode == ULCNET_FAR_RAW);
     CHECK(model.io_descriptor->delay_depth == DEPTH);
     CHECK(model.io_descriptor->layout_version == 18u);
-    CHECK(strcmp(ulcnet_far_input_mode_name(
-                     model.io_descriptor->far_input_mode), "raw_far") == 0);
     CHECK(ulcnet_accelerator_adapter_state_generation(adapter) == 0u);
     CHECK(ulcnet_accelerator_adapter_state_generation(NULL) == 0u);
 

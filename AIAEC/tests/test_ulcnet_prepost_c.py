@@ -479,8 +479,6 @@ static int case_equiv(FftHandle *fft) {
     /* path B -- the class, fed the same analysed spectra */
     p = class_make(&host_b, &pool, &req);
     CHECK(p != NULL);
-    CHECK(ulcnet_prepost_hop_size(p) == grid.hop);
-    CHECK(ulcnet_prepost_num_bins(p) == grid.n_bins);
     CHECK(ulcnet_prepost_descriptor(p) != NULL);
     CHECK(ulcnet_prepost_descriptor(p)->delay_depth == D);
     for (hop = 0; hop < HOPS; ++hop) {
@@ -620,8 +618,6 @@ static int case_lifecycle(void) {
     host_register(&host_heap, &cfg);
     heap = ulcnet_prepost_create(&cfg);
     CHECK(heap != NULL);
-    CHECK(ulcnet_prepost_hop_size(heap) == grid.hop);
-    CHECK(ulcnet_prepost_num_bins(heap) == grid.n_bins);
     CHECK(ulcnet_prepost_descriptor(heap)->delay_depth == D);
     CHECK(drive_spec(heap, 0, SHORT_HOPS, outs_a) == 0);
 
@@ -659,8 +655,6 @@ static int case_lifecycle(void) {
     CHECK(ulcnet_prepost_create(&bad) == NULL);
 
     /* Accessors on NULL. */
-    CHECK(ulcnet_prepost_hop_size(NULL) == -1);
-    CHECK(ulcnet_prepost_num_bins(NULL) == -1);
     CHECK(ulcnet_prepost_descriptor(NULL) == NULL);
     ulcnet_prepost_reset(NULL);
     return 0;

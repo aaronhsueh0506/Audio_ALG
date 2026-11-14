@@ -166,7 +166,10 @@ static double round_decimals(double x, int digits)
     return t / scale;
 }
 
-float dfn3_norm_alpha(int sample_rate, int hop, float tau_sec)
+/* Same value as train.py make_norm_alpha(): exp(-(hop / sample_rate) / tau_sec) rounded half to even to three
+ * decimals, one more digit while that reaches 1.0, as float32. A tau that is not a float32 value (0.3) enters as its
+ * float32 value. 0 for a non-positive argument. */
+static float dfn3_norm_alpha(int sample_rate, int hop, float tau_sec)
 {
     /* The loop is bounded: a hop of a few samples at a high rate never reaches 1.0 at 17 digits. */
     double exact;
@@ -282,25 +285,6 @@ int dfn3_grid_validate(const DFN3Grid* grid)
         grid->stft_unscale != want.stft_unscale)
         return DFN3_GRID_ERR_INCONSISTENT;
     return DFN3_GRID_OK;
-}
-
-const char* dfn3_grid_status_text(int status)
-{
-    switch (status) {
-    case DFN3_GRID_OK:               return "ok";
-    case DFN3_GRID_ERR_NULL:         return "null pointer";
-    case DFN3_GRID_ERR_SAMPLE_RATE:  return "sample rate must be positive";
-    case DFN3_GRID_ERR_N_FFT:        return "n_fft is not a size the audiolib framing builds (or has too many bins for the 16-bit ERB spans)";
-    case DFN3_GRID_ERR_N_ERB:        return "n_erb must be a positive multiple of 4 with at least two bins per band";
-    case DFN3_GRID_ERR_DF_BINS:      return "df_bins must be in [2, n_fft/2 + 1)";
-    case DFN3_GRID_ERR_DF_ORDER:     return "df_order must be in [1, 16]";
-    case DFN3_GRID_ERR_MASK_LOOKAHEAD: return "mask_lookahead must be in [0, 2]";
-    case DFN3_GRID_ERR_DF_LOOKAHEAD: return "df_lookahead must be in [0, df_order - 1]";
-    case DFN3_GRID_ERR_ERB_NORM:     return "erb normaliser: tau must be finite and > 0 with an alpha in (0, 1), starts finite, scale finite and > 0";
-    case DFN3_GRID_ERR_SPEC_NORM:    return "spec normaliser: tau must be finite and > 0 with an alpha in (0, 1), starts finite and > 0";
-    case DFN3_GRID_ERR_INCONSISTENT: return "derived grid fields do not match the given ones";
-    default:                         return "unknown status";
-    }
 }
 
 /* ---- State ---- */
@@ -469,10 +453,11 @@ void dfn3_compute_features(DFN3State* st,
         st->scratch_power, st->scratch_erb_db, feat_erb, feat_spec);
 }
 
-void dfn3_apply_atten_lim(int n_bins,
-                          const float* noisy_re, const float* noisy_im,
-                          float* enh_re, float* enh_im,
-                          float atten_lim_db)
+/* In place on enh: enh = lim * noisy + (1 - lim) * enh, lim = 10^(-|atten_lim_db| / 20); 0 or non-finite: no-op. */
+static void dfn3_apply_atten_lim(int n_bins,
+                                 const float* noisy_re, const float* noisy_im,
+                                 float* enh_re, float* enh_im,
+                                 float atten_lim_db)
 {
     if (n_bins <= 0 || !noisy_re || !noisy_im || !enh_re || !enh_im ||
         !isfinite(atten_lim_db) || atten_lim_db == 0.0f) return;
@@ -648,9 +633,4 @@ int dfn3_enhance_spectrum_stream(DFN3State* st,
                          out_re, out_im, atten_lim_db);
     if (output_frame_index) *output_frame_index = target_frame;
     return 1;
-}
-
-const char* dfn3_simd_backend(void)
-{
-    return SK_NEON_BACKEND_NAME;
 }

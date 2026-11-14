@@ -69,31 +69,6 @@ _Static_assert(ULCNET_STREAM_ALIGN == 16u,
 #endif
 #endif
 
-/* -1: inconsistent (some but not all of the four pointer/count pairs set, or a single pair with a
- * non-NULL pointer and a zero count or vice versa). 0: none registered (the accelerator owns its
- * own state copy). 1: all four registered. */
-static int state_mode(const UlcnetStreamConfig *cfg) {
-    int key_set = cfg->key_history != NULL && cfg->key_history_elements != 0;
-    int key_unset = cfg->key_history == NULL && cfg->key_history_elements == 0;
-    int value_set = cfg->value_history != NULL && cfg->value_history_elements != 0;
-    int value_unset = cfg->value_history == NULL && cfg->value_history_elements == 0;
-    int logit_set = cfg->logit_history != NULL && cfg->logit_history_elements != 0;
-    int logit_unset = cfg->logit_history == NULL && cfg->logit_history_elements == 0;
-    int gru_set = cfg->h_gru != NULL && cfg->gru_hidden_elements != 0;
-    int gru_unset = cfg->h_gru == NULL && cfg->gru_hidden_elements == 0;
-    int any_set, any_unset;
-
-    if (!key_set && !key_unset) return -1;
-    if (!value_set && !value_unset) return -1;
-    if (!logit_set && !logit_unset) return -1;
-    if (!gru_set && !gru_unset) return -1;
-
-    any_set = key_set || value_set || logit_set || gru_set;
-    any_unset = key_unset || value_unset || logit_unset || gru_unset;
-    if (any_set && any_unset) return -1;   /* mixed across the four pairs */
-    return any_set ? 1 : 0;
-}
-
 static int cfg_frames(const UlcnetStreamConfig *cfg) {
     return cfg->frames_per_call > 1 ? cfg->frames_per_call : 1;
 }
@@ -102,7 +77,6 @@ static int cfg_valid(const UlcnetStreamConfig *cfg) {
     if (!cfg) return 0;
     if (cfg->frames_per_call < 0 || cfg->frames_per_call > ULCNET_MODEL_IO_MAX_FRAMES_PER_CALL) return 0;
     if (ulcnet_grid_validate(&cfg->grid) != ULCNET_GRID_OK) return 0;
-    if (state_mode(cfg) < 0) return 0;
     return 1;
 }
 
@@ -149,14 +123,6 @@ static int ulcnet_stream_layout(const UlcnetStreamConfig *cfg, unsigned char *ba
     out->istft_mem = ptr;
 
     if (ulcnet_prepost_config_defaults(&pcfg, &cfg->grid) != 0) return -1;
-    pcfg.key_history = cfg->key_history;
-    pcfg.key_history_elements = cfg->key_history_elements;
-    pcfg.value_history = cfg->value_history;
-    pcfg.value_history_elements = cfg->value_history_elements;
-    pcfg.logit_history = cfg->logit_history;
-    pcfg.logit_history_elements = cfg->logit_history_elements;
-    pcfg.h_gru = cfg->h_gru;
-    pcfg.gru_hidden_elements = cfg->gru_hidden_elements;
     pcfg.frames_per_call = cfg->frames_per_call;
     if (ulcnet_prepost_get_mem_size(&pcfg, &pp_req) != 0) return -1;
     if (stream_carve(base, &cursor, (size_t)pp_req.bytes, &ptr) != 0) return -1;
@@ -187,7 +153,6 @@ static uint32_t build_hash(const UlcnetStreamConfig *cfg, uint32_t prepost_hash)
     h = stream_fnv1a_u32(h, (uint32_t)g->n_bins);
     h = stream_fnv1a_u32(h, (uint32_t)g->delay_depth);
     h = stream_fnv1a_u32(h, (uint32_t)ULCNET_STREAM_LAYOUT_VERSION);
-    h = stream_fnv1a_u32(h, (uint32_t)(state_mode(cfg) > 0 ? 1u : 0u));
     h = stream_fnv1a_u32(h, prepost_hash);
     if (cfg_frames(cfg) > 1) h = stream_fnv1a_u32(h, (uint32_t)cfg_frames(cfg));
     return ac_memreq_abi_hash(h);
@@ -259,14 +224,6 @@ static UlcnetStream *ulcnet_stream_finish_init(const UlcnetStreamConfig *cfg, un
     if (!s->istft) return NULL;
 
     if (ulcnet_prepost_config_defaults(&pcfg, &cfg->grid) != 0) return NULL;
-    pcfg.key_history = cfg->key_history;
-    pcfg.key_history_elements = cfg->key_history_elements;
-    pcfg.value_history = cfg->value_history;
-    pcfg.value_history_elements = cfg->value_history_elements;
-    pcfg.logit_history = cfg->logit_history;
-    pcfg.logit_history_elements = cfg->logit_history_elements;
-    pcfg.h_gru = cfg->h_gru;
-    pcfg.gru_hidden_elements = cfg->gru_hidden_elements;
     pcfg.frames_per_call = cfg->frames_per_call;
     s->prepost = ulcnet_prepost_init(layout->prepost_mem, layout->prepost_bytes, &pcfg);
     if (!s->prepost) return NULL;

@@ -24,7 +24,6 @@ struct UlcnetPrepost {
     int *events;        /* [frames]; packet instances only, NULL otherwise */
 
     int n_bins;
-    int hop;
     int frames;         /* frames per graph call: 1, or the packet size */
     int frame_open;     /* a frame is pending the accelerator */
     int prepared;       /* frame_open() armed the transaction for the open frame; implies frame_open */
@@ -217,7 +216,6 @@ UlcnetPrepost *ulcnet_prepost_init_ex(void *pool, size_t bytes,
     if (total != (size_t)req.bytes) return NULL;   /* sizing/carve agreement */
 
     p->n_bins = cfg->grid.n_bins;
-    p->hop = cfg->grid.hop;
     p->frames = ulcnet_model_io_descriptor_frames(&descriptor);
     return p;
 }
@@ -268,18 +266,6 @@ void ulcnet_prepost_reset(UlcnetPrepost *p) {
 
 uint32_t ulcnet_prepost_state_generation(const UlcnetPrepost *p) {
     return p ? ulcnet_model_io_state_generation(p->io) : 0u;
-}
-
-int ulcnet_prepost_hop_size(const UlcnetPrepost *p) {
-    return p ? p->hop : -1;
-}
-
-int ulcnet_prepost_frames_per_call(const UlcnetPrepost *p) {
-    return p ? p->frames : -1;
-}
-
-int ulcnet_prepost_num_bins(const UlcnetPrepost *p) {
-    return p ? p->n_bins : -1;
 }
 
 const UlcnetModelIoDescriptor *ulcnet_prepost_descriptor(const UlcnetPrepost *p) {

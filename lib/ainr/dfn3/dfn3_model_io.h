@@ -87,24 +87,14 @@ int dfn3_model_io_init(DFN3ModelIOState *state, void *block, size_t bytes,
 /* mask_lookahead + 1: the feature frames the first accelerator call needs. 0 for NULL or no grid. */
 unsigned int dfn3_model_io_ready_frames(const DFN3ModelIOState *state);
 
-/* Slide a window by one frame and append the newest: after frame n it holds [n-2, n-1, n], earlier slots zero as in
- * training. `window` is the packed [3][n_erb] run, or [2][3][df_bins] with frame[2][df_bins]. */
-void dfn3_model_io_push_erb_window(float *window, const float *frame, int n_erb);
-void dfn3_model_io_push_spec_window(float *window, const float *frame, int df_bins);
-
-/* Check the recurrent arrays the accelerator wrote in place (element counts): 0 when all are finite, else both arrays
- * are zeroed and -1 is returned. A NULL array or a count of 0 returns -1 and touches nothing. */
-int dfn3_model_io_validate_arrays(float *gru_hidden, size_t gru_count,
-                                  float *df_convp_history, size_t convp_count);
-
 /* Push one feature frame: erb[n_erb] and spec[2][df_bins] (re, then im). Returns 1 when the window of
  * heads[t] is complete and the graph may emit it, 0 for the first mask_lookahead frames, -1 on NULL or no grid.
  * To flush the final heads, push mask_lookahead all-zero frames. */
 int dfn3_model_io_push_features(DFN3ModelIOState *state, const float *erb,
                                 const float *spec);
 
-/* validate_arrays() over the registered state; call after each invocation. Returns 0 with nothing registered, -1
- * on NULL or non-finite (the registered arrays zeroed, generation advances). The windows are untouched. */
+/* Finite check over the registered state; call after each invocation. Returns 0 with nothing registered, -1 on NULL
+ * or non-finite (the registered arrays zeroed, generation advances). The windows are untouched. */
 int dfn3_model_io_validate_state(DFN3ModelIOState *state);
 
 /* Windows, registered state, frame count back to init values; generation advances; pointers stay. NULL: no-op. */

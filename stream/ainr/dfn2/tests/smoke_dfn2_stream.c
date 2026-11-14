@@ -22,9 +22,8 @@ static float *alloc_filled(size_t n, float fill) {
 }
 
 /* Writes zeros/success, every output element -- shape correctness only, no numerical realism. */
-static int fake_accelerator(const DFN2PrepostInputs *in, DFN2PrepostOutputs *out) {
+static int fake_accelerator(DFN2PrepostOutputs *out) {
     size_t i;
-    (void)in;
     for (i = 0; i < out->erb_mask_elements; ++i) out->erb_mask[i] = 0.0f;
 #ifndef DFN2_MASK_ONLY
     for (i = 0; i < out->coefs_elements; ++i) out->coefs[i] = 0.0f;
@@ -160,7 +159,7 @@ static int run_smoke(int frames_per_call) {
 
         ai_rc = 0;
         if (io.job_ready) {
-            ai_rc = fake_accelerator(&io.inputs, &io.outputs);
+            ai_rc = fake_accelerator(&io.outputs);
             ++jobs_run;
         }
 

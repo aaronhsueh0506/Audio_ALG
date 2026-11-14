@@ -663,8 +663,6 @@ static int case_equiv(FftHandle *fft) {
 
     /* Path B -- the class, fed the same analysed spectra. */
     CHECK(inst_make(&inst) == 0);
-    CHECK(deepvqe_prepost_hop_size(inst.p) == g_grid.hop);
-    CHECK(deepvqe_prepost_num_bins(inst.p) == g_grid.n_bins);
     CHECK(deepvqe_prepost_descriptor(inst.p) != NULL);
     CHECK(deepvqe_prepost_descriptor(inst.p)->delay_depth == D);
     CHECK(drive_spec(inst.p, 0, HOPS, outs_b) == 0);
@@ -796,8 +794,6 @@ static int case_lifecycle(void) {
     DeepVqePrepostConfig bad;
 
     CHECK(inst_config(&heap, D) == 0 && inst_init(&heap, 1) == 0);
-    CHECK(deepvqe_prepost_hop_size(heap.p) == g_grid.hop);
-    CHECK(deepvqe_prepost_num_bins(heap.p) == g_grid.n_bins);
     CHECK(deepvqe_prepost_descriptor(heap.p) != NULL);
     CHECK(deepvqe_prepost_descriptor(heap.p)->delay_depth == D);
     CHECK(deepvqe_prepost_descriptor(heap.p)->layout_version ==
@@ -834,8 +830,6 @@ static int case_lifecycle(void) {
     CHECK(deepvqe_prepost_create(&bad) == NULL);
 
     /* Accessors on NULL. */
-    CHECK(deepvqe_prepost_hop_size(NULL) == -1);
-    CHECK(deepvqe_prepost_num_bins(NULL) == -1);
     CHECK(deepvqe_prepost_descriptor(NULL) == NULL);
     deepvqe_prepost_reset(NULL);
     return 0;
@@ -1054,9 +1048,6 @@ static int case_skip(void) {
     int id;
     int moved;
     size_t i;
-
-    CHECK(strcmp(deepvqe_prepost_skip_policy_name(),
-                 "mute_fail_closed") == 0);
 
     make_frame(f1_re, f1_im, 0.0f);
     make_frame(f2_re, f2_im, 0.125f);

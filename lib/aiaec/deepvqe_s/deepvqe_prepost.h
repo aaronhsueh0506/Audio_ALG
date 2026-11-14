@@ -210,10 +210,6 @@ typedef struct DeepVqePrepostOutputs {
 const char *deepvqe_prepost_state_name(int state_id);      /* graph input  */
 const char *deepvqe_prepost_state_name_out(int state_id);  /* graph output */
 
-#define DEEPVQE_PREPOST_OUTPUT_NAME "output"   /* graph name of the head output */
-
-const char *deepvqe_prepost_skip_policy_name(void);   /* "mute_fail_closed" (frame_bypass()) */
-
 /* Fill a config for `grid` (copied), nothing registered. Returns 0, or -1 on NULL/invalid grid. */
 int deepvqe_prepost_config_defaults(DeepVqePrepostConfig *cfg, const DeepVqeGrid *grid);
 
@@ -258,8 +254,6 @@ void deepvqe_prepost_reset(DeepVqePrepost *p);
  * into its own copy of the state at start and on every change. */
 uint32_t deepvqe_prepost_state_generation(const DeepVqePrepost *p);
 
-int deepvqe_prepost_hop_size(const DeepVqePrepost *p);   /* or -1 */
-int deepvqe_prepost_num_bins(const DeepVqePrepost *p);   /* or -1 */
 const DeepVqePrepostDescriptor *deepvqe_prepost_descriptor(
     const DeepVqePrepost *p);
 

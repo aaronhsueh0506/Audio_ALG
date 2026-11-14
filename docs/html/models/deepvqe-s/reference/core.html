@@ -266,15 +266,15 @@ int run_deepvqe(int D, const size_t elems[DEEPVQE_STATE_COUNT],
 <tr><td><code>pre_process_freq</code></td><td>-1</td><td>NULL、上一個 frame 尚未 <code>frame_finish</code>／<code>frame_bypass</code></td></tr>
 <tr><td><code>frame_open</code></td><td>-1</td><td>沒有開啟中的 frame</td></tr>
 <tr><td><code>frame_finish</code></td><td>-1</td><td>任一 tap 或登錄 buffer 的任一元素（整塊，含較舊的幀）非有限：登錄的 state 全部歸零（沒登錄時只檢查 taps）、generation +1、CCM ring 不前進、frame 仍開；呼叫 <code>frame_bypass</code> 或重新 <code>frame_open</code></td></tr>
-<tr><td><code>frame_bypass</code></td><td>-1（無 frame）</td><td>成功時當前增強頻譜歸零，PCM 合成保留前拍 overlap（<code>deepvqe_prepost_skip_policy_name()</code> = <code>"mute_fail_closed"</code>）：CCM ring 與 state 維持原樣。想要優雅降級的呼叫端須自己在 pipeline 層放 canceller 並 cross-fade</td></tr>
+<tr><td><code>frame_bypass</code></td><td>-1（無 frame）</td><td>成功時當前增強頻譜歸零，PCM 合成保留前拍 overlap（mute、fail closed）：CCM ring 與 state 維持原樣。想要優雅降級的呼叫端須自己在 pipeline 層放 canceller 並 cross-fade</td></tr>
 <tr><td><code>post_process_freq</code></td><td>-1</td><td>NULL、frame 還開著；成功時 re／im 寫滿 n_bins 個值</td></tr>
 </table></div>
 
 <h2 id="section-7">函式清單：公開 vs 內部</h2>
 <div class="tbl"><table>
 <tr><th>分類</th><th>函式（<code>deepvqe_prepost.h</code>）</th></tr>
-<tr><td><b>公開（整合者）</b></td><td><code>deepvqe_prepost_config_defaults</code>、<code>_get_mem_size</code>、<code>_init</code>、<code>_init_ex</code>、<code>_create</code>、<code>_destroy</code>、<code>_reset</code>、<code>_state_generation</code>、<code>_hop_size</code>、<code>_num_bins</code>、<code>_descriptor</code>、<code>_pre_process_freq</code>、<code>_frame_open</code>、<code>_frame_finish</code>、<code>_frame_bypass</code>、<code>_post_process_freq</code></td></tr>
-<tr><td><b>公開（grid 與邊界查詢）</b></td><td><code>deepvqe_grid_make</code>、<code>deepvqe_grid_validate</code>、<code>deepvqe_prepost_state_name</code>、<code>_state_name_out</code>、<code>_descriptor_default</code>、<code>_descriptor_validate</code>、<code>_skip_policy_name</code>；inline <code>deepvqe_prepost_taps_elements</code></td></tr>
+<tr><td><b>公開（整合者）</b></td><td><code>deepvqe_prepost_config_defaults</code>、<code>_get_mem_size</code>、<code>_init</code>、<code>_init_ex</code>、<code>_create</code>、<code>_destroy</code>、<code>_reset</code>、<code>_state_generation</code>、<code>_descriptor</code>、<code>_pre_process_freq</code>、<code>_frame_open</code>、<code>_frame_finish</code>、<code>_frame_bypass</code>、<code>_post_process_freq</code></td></tr>
+<tr><td><b>公開（grid 與邊界查詢）</b></td><td><code>deepvqe_grid_make</code>、<code>deepvqe_grid_validate</code>、<code>deepvqe_prepost_state_name</code>、<code>_state_name_out</code>、<code>_descriptor_default</code>、<code>_descriptor_validate</code>；inline <code>deepvqe_prepost_taps_elements</code></td></tr>
 <tr><td><b>低階（類別內部使用）</b></td><td><code>deepvqe_process.h</code>：<code>deepvqe_ccm_init</code>、<code>deepvqe_ccm_reset</code>、<code>deepvqe_ccm_process</code></td></tr>
 
 <tr><td><b>內部（<code>static</code>）</b></td><td><code>deepvqe_prepost.c</code>：<code>pp_carve</code>、<code>pp_layout</code>、<code>pp_build_hash</code>、<code>pp_fnv1a</code>、<code>pp_check_config</code>、<code>pp_registration_ok</code>、<code>compress_planar</code>、<code>zero_state</code>、<code>zero_registered</code>、<code>fill_nan</code>、<code>all_finite</code>、<code>dv_valid_depth</code>；<code>deepvqe_process.c</code>：<code>ccm_edge_bin</code></td></tr>

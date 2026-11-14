@@ -173,11 +173,7 @@ void dfn2_prepost_reset(DFN2Prepost *p);
  * zeros on every change. */
 unsigned int dfn2_prepost_state_generation(const DFN2Prepost *p);
 
-int dfn2_prepost_hop_size(const DFN2Prepost *p);   /* or -1 */
-int dfn2_prepost_num_bins(const DFN2Prepost *p);   /* or -1 */
 const DFN2Grid *dfn2_prepost_grid(const DFN2Prepost *p);   /* the grid it runs; NULL for NULL */
-int dfn2_prepost_model_lookahead_frames(const DFN2Prepost *p);   /* latency_frames(); -1 on NULL */
-int dfn2_prepost_layout_version(const DFN2Prepost *p);   /* the graph contract bound; -1 on NULL */
 
 /* Point at caller-loaded ERB matrices, borrowed and never copied. Between hops only; a swap consistent per
  * source frame needs a reset first. -1 on NULL or with a frame open. */

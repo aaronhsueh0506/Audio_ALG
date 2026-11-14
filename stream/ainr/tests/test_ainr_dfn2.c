@@ -20,9 +20,8 @@
  * path driven directly through dfn2_stream -- the fill values themselves are arbitrary, what
  * matters is that both paths get exactly the same ones. ---- */
 
-static int raw_fill_accel(const DFN2PrepostInputs *in, DFN2PrepostOutputs *out) {
+static int raw_fill_accel(DFN2PrepostOutputs *out) {
     size_t i;
-    (void)in;
     for (i = 0; i < out->erb_mask_elements; ++i) out->erb_mask[i] = 0.3f;
 #ifndef DFN2_MASK_ONLY
     for (i = 0; i < out->coefs_elements; ++i) out->coefs[i] = 0.0f;
@@ -72,7 +71,7 @@ static void run_reference_hops(DFN2Stream *s, const int16_t *pcm_in, int hops, i
             fprintf(stderr, "reference pre_process fail at hop %d\n", i);
             exit(1);
         }
-        if (io.job_ready) ai_rc = raw_fill_accel(&io.inputs, &io.outputs);
+        if (io.job_ready) ai_rc = raw_fill_accel(&io.outputs);
         if (dfn2_stream_post_process(s, ai_rc, pcm_out + (size_t)i * (size_t)hop) < 0) {
             fprintf(stderr, "reference post_process fail at hop %d\n", i);
             exit(1);

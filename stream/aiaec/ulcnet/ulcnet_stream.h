@@ -30,7 +30,7 @@ extern "C" {
 #endif
 
 #define ULCNET_STREAM_DESCRIPTOR_VERSION 1u
-#define ULCNET_STREAM_LAYOUT_VERSION     2u   /* bump with build_flags_hash on any pool/carve/descriptor change */
+#define ULCNET_STREAM_LAYOUT_VERSION     3u   /* bump with build_flags_hash on any pool/carve/descriptor change */
 #define ULCNET_STREAM_ALIGNMENT          16u
 /* Identity hops after an alignment boundary; equals ULCNET_NN_STAGE_REPRIME_FRAMES (pipelines/ulcnet/ulcnet_nn_stage.h). */
 #define ULCNET_STREAM_REPRIME_FRAMES     1u
@@ -45,24 +45,14 @@ typedef struct UlcnetStreamConfig {
     UlcnetGrid grid;   /* ulcnet_grid_make() */
     /* 0 or 1: one model hop per call. 2..ULCNET_MODEL_IO_MAX_FRAMES_PER_CALL: a packet stream, N hops per accelerator job. */
     int frames_per_call;
-    /* Optional borrowed state registration, all four or none (see ulcnet_prepost.h): every pointer non-NULL with a
-     * nonzero count, or all NULL / 0 (the accelerator owns its state). Only on / off enters build_flags_hash. */
-    float  *key_history;
-    size_t  key_history_elements;
-    float  *value_history;
-    size_t  value_history_elements;
-    float  *logit_history;
-    size_t  logit_history_elements;
-    float  *h_gru;
-    size_t  gru_hidden_elements;
 } UlcnetStreamConfig;
 
-/* Fixed 32-byte descriptor; init refuses a pool sized for another grid, registration mode or build. */
+/* Fixed 32-byte descriptor; init refuses a pool sized for another grid or build. */
 typedef struct UlcnetStreamMemReq {
     uint32_t descriptor_version;  /* ULCNET_STREAM_DESCRIPTOR_VERSION        */
     uint32_t layout_version;      /* ULCNET_STREAM_LAYOUT_VERSION            */
     uint32_t reserved0;           /* must be 0                                */
-    uint32_t build_flags_hash;    /* FNV-1a-32 over grid, state-registration mode and the UlcnetPrepost hash */
+    uint32_t build_flags_hash;    /* FNV-1a-32 over grid, frames_per_call and the UlcnetPrepost hash */
     uint32_t alignment;           /* ULCNET_STREAM_ALIGNMENT                  */
     uint32_t reserved;            /* 0                                        */
     uint64_t bytes;
@@ -77,18 +67,18 @@ _Static_assert(sizeof(UlcnetStreamMemReq) == 32,
 
 typedef struct UlcnetStream UlcnetStream;
 
-/* Exact pool size for cfg. -1 (req untouched) on NULL, an invalid grid, or a partial state registration. */
+/* Exact pool size for cfg. -1 (req untouched) on NULL or an invalid grid. */
 int ulcnet_stream_get_mem_size(const UlcnetStreamConfig *cfg, UlcnetStreamMemReq *req);
 
 /* Constructs in caller memory (16-byte aligned, >= get_mem_size() bytes), starts reset; no heap, no stdio. NULL on a bad
  * config or a misaligned / undersized pool. */
 UlcnetStream *ulcnet_stream_init(const UlcnetStreamConfig *cfg, void *pool, size_t pool_bytes);
 
-/* As ulcnet_stream_init, refusing a pool carved for another grid, registration mode or layout; `expected` NULL skips it. */
+/* As ulcnet_stream_init, refusing a pool carved for another grid, frames_per_call or layout; `expected` NULL skips it. */
 UlcnetStream *ulcnet_stream_init_ex(const UlcnetStreamConfig *cfg, void *pool, size_t pool_bytes,
                                     const UlcnetStreamMemReq *expected);
 
-/* Back to the start: framing and UlcnetPrepost reset (registered state zeroed, generation advanced), reprime countdown
+/* Back to the start: framing and UlcnetPrepost reset (generation advanced), reprime countdown
  * cleared. The alignment-edge detector runs the same operation. */
 void ulcnet_stream_reset(UlcnetStream *s);
 

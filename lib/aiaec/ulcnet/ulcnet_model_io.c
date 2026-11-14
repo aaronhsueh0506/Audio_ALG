@@ -133,14 +133,6 @@ int ulcnet_model_io_descriptor_default(const UlcnetGrid *grid,
     return 0;
 }
 
-const char *ulcnet_far_input_mode_name(int mode) {
-    switch (mode) {
-        case ULCNET_FAR_RAW:     return "raw_far";
-        case ULCNET_FAR_ALIGNED: return "aligned_far";
-        default:                 return "unknown";
-    }
-}
-
 int ulcnet_model_io_descriptor_default_packet(const UlcnetGrid *grid, int frames_per_call,
                                               UlcnetModelIoDescriptor *descriptor) {
     if (frames_per_call < 2 || frames_per_call > ULCNET_MODEL_IO_MAX_FRAMES_PER_CALL ||

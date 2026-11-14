@@ -39,10 +39,10 @@ stays explicitly selectable.
 
 | Rate | AEC | Synthesis (`AcIstft`) | NR | Gain/spectrum buffers | **Total** |
 |------|-----|-----------|-----|---------------|-----------|
-| **8 kHz** | 211,552 B | 10,320 B | 28,784 B | 2,096 B | **252,752 B (246.8 KB)** |
-| **16 kHz (default, 256/128)** | 239,920 B | 10,320 B | 45,344 B | 2,096 B | **297,680 B (290.7 KB)** |
-| **16 kHz (alt, 512/256)** | 352,288 B | 19,792 B | 56,432 B | 4,144 B | **432,656 B (422.5 KB)** |
-| **48 kHz** | 776,224 B | 38,736 B | 144,576 B | 8,240 B | **967,776 B (945.1 KB)** |
+| **8 kHz** | 211,392 B | 10,320 B | 27,696 B | 2,096 B | **251,504 B (245.6 KB)** |
+| **16 kHz (default, 256/128)** | 239,760 B | 10,320 B | 44,256 B | 2,096 B | **296,432 B (289.5 KB)** |
+| **16 kHz (alt, 512/256)** | 352,128 B | 19,792 B | 54,320 B | 4,144 B | **430,384 B (420.3 KB)** |
+| **48 kHz** | 776,064 B | 38,736 B | 140,416 B | 8,240 B | **963,456 B (940.9 KB)** |
 
 The AEC column is owned by `AEC/docs/reference/lifecycle.md` (§4, the pool-size section) — re-measure from
 there rather than editing it here, and always prefer the values `aec_get_mem_size()`,
@@ -223,10 +223,10 @@ AcIstft* istft = ac_istft_init(pool + ALIGN16(aec_b) + ALIGN16(nr_b), sy_b, &sy_
   the `Aec`). Gain vectors the chain needs (the extra gain, the NR prior scratch, the
   spectrum buffer) are `n_freqs` floats / bins each, also from the caller's block.
 - The 4-channel array is one `Aec` pool (`aec_get_mem_requirements()`): the `Aec` structure, the four lanes, the shared `DelayAec` (MATCHED only),
-  the alignment ring, the fusion buffers and the gain stage: 701,280 B at 16 kHz/256 (MATCHED, `AEC_RESIDUAL_FULL`; 595,744 B with
-  `AEC_RESIDUAL_STATE`, `test_target_abi`), of which the four lanes are 571,520 B (4 x 142,880 B).
-  `4ch_external_static --print-mem-size` prints lanes (`AEC x4`) 571,520 B and front end (the rest of the array pool) 129,760 B
-  at 16 kHz/256 (48 kHz/1024: 2,074,816 B and 336,704 B). The sample beam helper
+  the alignment ring, the fusion buffers and the gain stage: 700,480 B at 16 kHz/256 (MATCHED, `AEC_RESIDUAL_FULL`; 594,944 B with
+  `AEC_RESIDUAL_STATE`, `test_target_abi`), of which the four lanes are 570,880 B (4 x 142,720 B).
+  `4ch_external_static --print-mem-size` prints lanes (`AEC x4`) 570,880 B and front end (the rest of the array pool) 129,600 B
+  at 16 kHz/256 (48 kHz/1024: 2,074,176 B and 336,544 B). The sample beam helper
   (SRP-PHAT, BF, scratch) is one more block. The post-beam stages are separate blocks sized by their own queries
   (`anr_get_mem_size()`, `ac_istft_get_mem_size()`),
   and a neural stage (`ulcnet_nn_stage_mem_size(&grid)` plus the application's `AcStft` / `AcIstft`, `dfn_rate_bridge_get_mem_requirements()`)

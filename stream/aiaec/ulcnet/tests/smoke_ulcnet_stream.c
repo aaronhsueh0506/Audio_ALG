@@ -18,9 +18,8 @@
 
 /* Writes a zero mask and zero to every registered state_out -- shape correctness only, no
  * numerical realism. This smoke test registers no state, so only output is touched. */
-static int fake_accelerator(const UlcnetModelIoInputs *in, UlcnetModelIoOutputs *out) {
+static int fake_accelerator(UlcnetModelIoOutputs *out) {
     size_t i;
-    (void)in;
     for (i = 0; i < out->spectrum_ri_elements; ++i) out->output[i] = 0.0f;
     if (out->key_history_out)
         for (i = 0; i < out->key_history_elements; ++i) out->key_history_out[i] = 0.0f;
@@ -111,7 +110,7 @@ int main(void) {
     }
 
     memset(&cfg, 0, sizeof(cfg));
-    cfg.grid = grid;   /* all four state pointers/counts zero: no state registered */
+    cfg.grid = grid;
 
     if (ulcnet_stream_get_mem_size(&cfg, &req) != 0) {
         fprintf(stderr, "ulcnet_stream_get_mem_size failed\n");
@@ -190,7 +189,7 @@ int main(void) {
             return 1;
         }
 
-        if (pre_rc == 1) ai_rc = fake_accelerator(&io.inputs, &io.outputs);
+        if (pre_rc == 1) ai_rc = fake_accelerator(&io.outputs);
 
         post_rc = ulcnet_stream_post_process(s, ai_rc, pcm_out);
         if (post_rc != 1) {

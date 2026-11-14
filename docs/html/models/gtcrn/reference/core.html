@@ -175,7 +175,7 @@ context(conv window 深度 = 歷史 + 新的一幀,即 3、5、11),加上 RNN �
 <h2 id="section-7">函式清單：公開 vs 內部</h2>
 <div class="tbl"><table>
 <tr><th>分類</th><th>函式（<code>gtcrn_process.h</code>）</th></tr>
-<tr><td><b>公開（整合者呼叫）</b></td><td><code>gtcrn_grid_make</code>、<code>gtcrn_grid_validate</code>、<code>gtcrn_grid_status_text</code>；<code>gtcrn_process_config_defaults</code>、<code>_get_mem_size</code>、<code>_init</code>、<code>_init_ex</code>、<code>_reset</code>、<code>_state_generation</code>、<code>_grid</code>、<code>_set_erb_matrices</code>；<code>gtcrn_model_input</code>、<code>gtcrn_model_output</code>、<code>gtcrn_process_mask_validate</code>、<code>gtcrn_process_state_validate</code>；<code>gtcrn_simd_backend</code></td></tr>
+<tr><td><b>公開（整合者呼叫）</b></td><td><code>gtcrn_grid_make</code>、<code>gtcrn_grid_validate</code>、<code>gtcrn_grid_status_text</code>；<code>gtcrn_process_config_defaults</code>、<code>_get_mem_size</code>、<code>_init</code>、<code>_init_ex</code>、<code>_reset</code>、<code>_state_generation</code>、<code>_grid</code>、<code>_set_erb_matrices</code>；<code>gtcrn_model_input</code>、<code>gtcrn_model_output</code>、<code>gtcrn_process_mask_validate</code>、<code>gtcrn_process_state_validate</code></td></tr>
 <tr><td><b>內部（<code>static</code>，<code>gtcrn_process.c</code>）</b></td><td><code>erb_band3</code>／<code>mask_expand</code>（各有 <code>_neon</code> 版）、<code>n_fft_accepted</code>、<code>pp_*</code>（carve、build hash、config 與註冊檢查、歸零）</td></tr>
 </table></div>
 

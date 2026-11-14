@@ -758,7 +758,7 @@ int main(void) {
                 refused += !accepted(pool, most, &ca, &bad);
             }
             untouched = memcmp(pool, copy, most) == 0 && state_all(7.0f);
-            alive = live != NULL && dfn2_prepost_hop_size(live) == b.hop && dfn2_prepost_num_bins(live) == b.n_bins;
+            alive = live != NULL;
             live = dfn2_prepost_init_ex(pool, most, &ca, &ra);
             control = live != NULL && registered_zero() && frame_commits(live, s_gru, s_convp);
             printf("stale %d %d %d %d\n", refused, untouched, alive, control);

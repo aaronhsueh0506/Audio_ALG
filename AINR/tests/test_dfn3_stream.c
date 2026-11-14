@@ -13,6 +13,7 @@
 #include <string.h>
 
 #include "audio_stft.h"
+#include "utility/simd_kernels.h"
 #include "../lib/ainr/dfn3/dfn3_prepost.h"
 
 #ifndef DFN3_MASK_LOOKAHEAD
@@ -432,8 +433,6 @@ static int lifecycle_and_transactions(int registered) {
     CHECK(dfn3_prepost_init_ex(pool, (size_t)req.bytes, &cfg, &stale) == NULL);
     p = dfn3_prepost_init_ex(pool, (size_t)req.bytes, &cfg, &req);
     CHECK(p != NULL);
-    CHECK(dfn3_prepost_layout_version(p) == 9);
-    CHECK(dfn3_prepost_model_lookahead_frames(p) == DELAY);
     CHECK(dfn3_prepost_state_generation(p) == 1);
     CHECK(dfn3_model_io_descriptor_default(&G, &descriptor) == 0);
     CHECK(dfn3_model_io_descriptor_validate(&G, &descriptor) == 0);
@@ -516,7 +515,7 @@ static int lifecycle_and_transactions(int registered) {
     spectrum(DELAY);
     CHECK(dfn3_prepost_pre_process_freq(p, re, im) == 1);
     {
-        DFN3Model model = {NULL, callback, NULL, &descriptor};
+        DFN3Model model = {NULL, callback, &descriptor};
         descriptor.layout_version = 8;
         CHECK(dfn3_model_run_frame(&model, p) == -1);
         descriptor.layout_version = 9;
@@ -681,7 +680,7 @@ static int board_form_follows_the_documented_generation(void) {
     CHECK(dfn3_prepost_state_generation(p) == 3u + WARM);
     CHECK(frame_commits(p, 0) == 0 && dfn3_prepost_state_generation(p) == 3u + 2u * WARM);
     {
-        DFN3Model model = {.user = NULL, .infer = failing_callback, .reset = NULL,
+        DFN3Model model = {.user = NULL, .infer = failing_callback,
                            .io_descriptor = &descriptor};
         CHECK(dfn3_model_io_descriptor_default(&G, &descriptor) == 0);
         CHECK(hop_ready(p, hop++) == 0);
@@ -761,7 +760,6 @@ static int stale_pool_is_refused_untouched(void) {
         CHECK(pool_same(pool, most) && state_is(7.0f));
         CHECK(dfn3_prepost_init_ex(pool, most, &other, &req) == NULL);
         CHECK(pool_same(pool, most) && state_is(7.0f));
-        CHECK(dfn3_prepost_grid(live)->n_erb == grid.n_erb && dfn3_prepost_hop_size(live) == grid.hop);
     }
     memset(pool, 0xa5, most);
     p = dfn3_prepost_init_ex(pool, most, &cfg, &req);
@@ -888,7 +886,7 @@ static int warm_up_frames_discard_heads_and_zero_state(void) {
     DFN3PrepostInputs in;
     DFN3PrepostOutputs out;
     DFN3ModelIoDescriptor descriptor;
-    DFN3Model model = {.user = NULL, .infer = stand_in_garbage, .reset = NULL, .io_descriptor = &descriptor};
+    DFN3Model model = {.user = NULL, .infer = stand_in_garbage, .io_descriptor = &descriptor};
     DFN3Prepost *p;
     long long index;
     int valid;
@@ -1222,7 +1220,7 @@ int main(int argc, char **argv) {
     printf("DFN3 %s mask=%d df=%d: raw future taps, layout9, transactions, "
            "reset, dual input, identity delay=%d samples PASS build=%08x "
            "digest=%08x\n",
-           dfn3_simd_backend(), DFN3_MASK_LOOKAHEAD, DFN3_DF_LOOKAHEAD,
+           SK_NEON_BACKEND_NAME, DFN3_MASK_LOOKAHEAD, DFN3_DF_LOOKAHEAD,
            (1 + DELAY) * G.hop, build_hash, digest);
     return 0;
 }

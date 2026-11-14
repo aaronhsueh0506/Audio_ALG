@@ -131,9 +131,6 @@ int main(int argc, char **argv) {
     cfg.atten_lim_db = (float)atof(argv[7]);
     p = dfn2_prepost_create(&cfg);
     CHECK(p != NULL);
-    CHECK(dfn2_prepost_layout_version(p) ==
-          DFN2_MODEL_IO_LAYOUT_VERSION_MASK_ONLY);
-    CHECK(dfn2_prepost_model_lookahead_frames(p) == DFN2_MASK_LOOKAHEAD);
     CHECK(dfn2_prepost_grid(p) != NULL &&
           dfn2_prepost_grid(p)->n_erb == DFN2_N_ERB);
 

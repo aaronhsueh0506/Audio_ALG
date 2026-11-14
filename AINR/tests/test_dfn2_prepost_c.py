@@ -615,12 +615,8 @@ static int equiv_once(float atten_lim_db) {
     CHECK(pool != NULL);
     p = start_ex(pool, (size_t)req.bytes, &cfg, &req);
     CHECK(p != NULL);
-    CHECK(dfn2_prepost_hop_size(p) == DFN2_HOP_LEN);
-    CHECK(dfn2_prepost_num_bins(p) == DFN2_N_BINS);
     CHECK(dfn2_prepost_grid(p) != NULL);
     CHECK(memcmp(dfn2_prepost_grid(p), dfn2_test_grid(), sizeof(DFN2Grid)) == 0);
-    CHECK(dfn2_prepost_layout_version(p) == DFN2_MODEL_IO_LAYOUT_VERSION);
-    CHECK(dfn2_prepost_model_lookahead_frames(p) == LOOKAHEAD);
     CHECK(drive_time_ex(p, pcm_in, out_b, HOPS, 1,
                         written_log, frame_log) == 0);
 
@@ -1317,14 +1313,10 @@ static int case_lifecycle(void) {
     config_freq(&cfg);
     heap = make_class(&cfg);
     CHECK(heap != NULL);
-    CHECK(dfn2_prepost_hop_size(heap) == DFN2_HOP_LEN);
-    CHECK(dfn2_prepost_num_bins(heap) == DFN2_N_BINS);
     /* The instance reports the grid it was configured with, by value. */
     CHECK(dfn2_prepost_grid(heap) != NULL);
     CHECK(dfn2_prepost_grid(heap) != dfn2_test_grid());
     CHECK(memcmp(dfn2_prepost_grid(heap), dfn2_test_grid(), sizeof(DFN2Grid)) == 0);
-    CHECK(dfn2_prepost_layout_version(heap) == DFN2_MODEL_IO_LAYOUT_VERSION);
-    CHECK(dfn2_prepost_model_lookahead_frames(heap) == LOOKAHEAD);
     CHECK(drive_time(heap, pcm_in, out_a, SHORT_HOPS) == 0);
     CHECK(any_nonzero(out_a, (size_t)SHORT_HOPS * DFN2_HOP_LEN));
 
@@ -1381,10 +1373,6 @@ static int case_lifecycle(void) {
     stop(tmp);
 
     /* Accessors on NULL. */
-    CHECK(dfn2_prepost_hop_size(NULL) == -1);
-    CHECK(dfn2_prepost_num_bins(NULL) == -1);
-    CHECK(dfn2_prepost_model_lookahead_frames(NULL) == -1);
-    CHECK(dfn2_prepost_layout_version(NULL) == -1);
     CHECK(dfn2_prepost_grid(NULL) == NULL);
     CHECK(dfn2_prepost_output_frame_index(NULL, &frame) == -1);
     dfn2_prepost_reset(NULL);

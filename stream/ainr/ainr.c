@@ -376,17 +376,6 @@ int ainr_init(const AinrConfig *cfg, void *pool, size_t pool_bytes, AinrCtx **ct
     return rc;
 }
 
-int ainr_init_spec(const AinrConfig *cfg, void *pool, size_t pool_bytes, AinrSpecCtx **ctx, AinrInfo *info)
-{
-    AinrCore *core = (AinrCore *)0;
-    int rc;
-
-    if (!ctx) return AINR_ERR_NULL;
-    rc = ainr_init_common(AINR_FAMILY_SPEC, cfg, (const char *)0, pool, pool_bytes, &core, info);
-    *ctx = (AinrSpecCtx *)core;
-    return rc;
-}
-
 int ainr_init_freq(const AinrConfig *cfg, void *pool, size_t pool_bytes, AinrFreqCtx **ctx, AinrInfo *info)
 {
     AinrCore *core = (AinrCore *)0;

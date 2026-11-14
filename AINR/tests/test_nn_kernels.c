@@ -434,7 +434,7 @@ int main(void)
     if (!test_dfn2_expand_mask()) return EXIT_FAILURE;
     if (!test_gtcrn_kernels()) return EXIT_FAILURE;
     if (!test_gtcrn_unshipped_geometry()) return EXIT_FAILURE;
-    printf("nn kernels: backend=%s/%s ok\n", dfn2_simd_backend(),
-           gtcrn_simd_backend());
+    printf("nn kernels: backend=%s/%s ok\n", SK_NEON_BACKEND_NAME,
+           SK_NEON_BACKEND_NAME);
     return EXIT_SUCCESS;
 }

@@ -468,8 +468,3 @@ int gtcrn_process_mask_validate(GTCRNProcess* p, const float* mask_erb)
     ++p->state_generation;
     return -1;
 }
-
-const char* gtcrn_simd_backend(void)
-{
-    return SK_NEON_BACKEND_NAME;
-}

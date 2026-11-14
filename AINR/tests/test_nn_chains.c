@@ -31,6 +31,7 @@
 #include <stdlib.h>
 #include <string.h>
 
+#include "utility/simd_kernels.h"
 #include "../lib/ainr/dfn2/dfn2_prepost.h"
 #include "../lib/ainr/gtcrn/gtcrn_process.h"
 #include "dfn2_test_grid.h"
@@ -124,8 +125,6 @@ static uint64_t run_dfn2(void)
     cfg.df_convp_history_elements = DFN2_TEST_CONVP_ELEMENTS;
     p = dfn2_prepost_create(&cfg);
     if (!p) exit(2);
-    if (dfn2_prepost_hop_size(p) != DFN2_HOP_LEN ||
-        dfn2_prepost_num_bins(p) != DFN2_N_BINS) exit(2);
     for (int h = 0; h < HOPS; ++h) {
         int v, valid = 0, kind = hop_kind(h);
         const int warm = h < grid->mask_lookahead;
@@ -336,7 +335,7 @@ int main(void)
         return EXIT_FAILURE;
     }
     printf("nn chains: backend=%s/%s digest=%016llx:%016llx\n",
-           dfn2_simd_backend(), gtcrn_simd_backend(),
+           SK_NEON_BACKEND_NAME, SK_NEON_BACKEND_NAME,
            (unsigned long long)dfn2, (unsigned long long)gtcrn);
     return EXIT_SUCCESS;
 }

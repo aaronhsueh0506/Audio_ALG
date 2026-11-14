@@ -65,7 +65,7 @@ typedef struct RNNoiseGrid {
     int    spec_bins;           /* spec_max_hz * n_fft / sample_rate + 1 (train.py) */
     double erb_norm_tau_sec;
     double spec_norm_tau_sec;
-    float  erb_norm_alpha;      /* rnnoise_norm_alpha(sample_rate, hop, tau) */
+    float  erb_norm_alpha;      /* train.py make_norm_alpha(sample_rate, hop, tau) */
     float  erb_norm_init_lo_db;
     float  erb_norm_init_hi_db;
     float  erb_norm_scale_db;
@@ -93,27 +93,6 @@ enum {
 
 /* Derive and validate a grid: RNNOISE_GRID_OK (written) or the first failing status (untouched). */
 int rnnoise_grid_make(RNNoiseGrid *grid, const RNNoiseGridSpec *spec);
-
-/* The same checks on an existing grid, and every derived field must equal what
- * rnnoise_grid_make() derives (a hand-edited hop, alpha or scale is refused). */
-int rnnoise_grid_validate(const RNNoiseGrid *grid);
-
-/* train.py make_norm_alpha(): exp(-(hop / sample_rate) / tau_sec) rounded to 3 decimals (one
- * more digit while it reaches 1.0) as float32, half to even on the exact value. 0 if invalid. */
-float rnnoise_norm_alpha(int sample_rate, int hop, double tau_sec);
-
-/* Short text for a status code, for logs. Never NULL. */
-const char *rnnoise_grid_status_text(int status);
-
-/* Lengths of out_erb and out_spec (flat), for binding tensors by count. */
-static inline size_t rnnoise_erb_window_elements(const RNNoiseGrid *grid)
-{
-    return (size_t)RNNOISE_MODEL_INPUT_FRAMES * (size_t)grid->n_bands;
-}
-static inline size_t rnnoise_spec_window_elements(const RNNoiseGrid *grid)
-{
-    return (size_t)RNNOISE_MODEL_INPUT_FRAMES * 2u * (size_t)grid->spec_bins;
-}
 
 typedef struct RNNoiseConfig {
     RNNoiseGrid  grid;      /* rnnoise_grid_make(); copied at init */
@@ -241,9 +220,6 @@ int rnnoise_expand_gains(const RNNoiseState *st, const float *band_gains,
  * Returns 0, or -1 on a NULL argument (spectra untouched). */
 int rnnoise_apply_gains(const RNNoiseState *st, float *spec_re, float *spec_im,
                         const float *bin_gains);
-
-/* Name of the compiled SIMD backend: "aarch64-neon", "aarch32-neon" or "scalar". */
-const char *rnnoise_simd_backend(void);
 
 #ifdef __cplusplus
 }

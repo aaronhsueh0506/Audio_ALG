@@ -97,7 +97,7 @@ Each item is a deliberate, verified divergence.
    `spec_norm_init_hi`) that the application passes, not macros.
 5. **`erb_norm_tau_sec` / `spec_norm_tau_sec = 1.0`:** keep τ in seconds and
    re-derive α for the grid; do not hardcode upstream's α. In C the spec carries τ
-   (`erb_norm_tau_sec`, `spec_norm_tau_sec`) and `dfn3_norm_alpha()` derives α.
+   (`erb_norm_tau_sec`, `spec_norm_tau_sec`) and `dfn3_grid_make()` derives α.
 6. **The triangular, overlapping, energy-SUM forward ERB bank** (`mode=0`).
 7. **`erb_inv` needs no row normalisation.** All 513 row sums are exactly 1.0
    (partition of unity), so `gain=1 → bin_gain=1`; upstream's inverse is a plain

@@ -323,14 +323,6 @@ int main(int argc, char **argv) {
     host_make();
     CHECK(ulcnet_model_io_init(pool, sizeof(pool), &invalid, &host.buffers) == NULL);
 
-    /* The names are exactly the exporter's metadata strings. */
-    CHECK(strcmp(ulcnet_far_input_mode_name(ULCNET_FAR_RAW),
-                 "raw_far") == 0);
-    CHECK(strcmp(ulcnet_far_input_mode_name(ULCNET_FAR_ALIGNED),
-                 "aligned_far") == 0);
-    CHECK(strcmp(ulcnet_far_input_mode_name(2), "unknown") == 0);
-    CHECK(strcmp(ulcnet_far_input_mode_name(-1), "unknown") == 0);
-
     host_make();
     CHECK(ulcnet_model_io_init(pool + 1, sizeof(pool) - 1, &d8, &host.buffers) == NULL);
     CHECK(ulcnet_model_io_init(pool, r8.bytes - 1, &d8, &host.buffers) == NULL);

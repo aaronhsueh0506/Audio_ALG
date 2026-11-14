@@ -16,6 +16,7 @@
 #include <stdlib.h>
 #include <string.h>
 
+#include "utility/simd_kernels.h"
 #include "../lib/ainr/dfn2/dfn2_process.h"
 #include "../lib/ainr/dfn2/dfn2_model_io.h"
 #include "../lib/ainr/gtcrn/gtcrn_process.h"
@@ -1871,7 +1872,7 @@ static int run_all_tests(void)
     CHECK(test_gtcrn_state_evolution(&digest), "GTCRN state evolution");
     CHECK(test_gtcrn(&digest), "GTCRN C pre/post");
     printf("backend=%s/%s digest=%016llx\n",
-           dfn2_simd_backend(), gtcrn_simd_backend(),
+           SK_NEON_BACKEND_NAME, SK_NEON_BACKEND_NAME,
            (unsigned long long)digest);
     return 1;
 }

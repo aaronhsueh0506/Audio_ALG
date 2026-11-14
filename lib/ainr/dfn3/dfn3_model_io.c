@@ -163,7 +163,9 @@ int dfn3_model_io_descriptor_validate(const DFN3Grid *g,
     return 0;
 }
 
-void dfn3_model_io_push_erb_window(float *window, const float *frame, int n_erb)
+/* Slide a window by one frame and append the newest: after frame n it holds [n-2, n-1, n], earlier slots zero as in
+ * training. `window` is the packed [3][n_erb] run, or [2][3][df_bins] with frame[2][df_bins]. */
+static void dfn3_model_io_push_erb_window(float *window, const float *frame, int n_erb)
 {
     if (window == NULL || frame == NULL || n_erb <= 0) return;
     memmove(window, window + n_erb,
@@ -172,7 +174,7 @@ void dfn3_model_io_push_erb_window(float *window, const float *frame, int n_erb)
            (size_t)n_erb * sizeof(float));
 }
 
-void dfn3_model_io_push_spec_window(float *window, const float *frame, int df_bins)
+static void dfn3_model_io_push_spec_window(float *window, const float *frame, int df_bins)
 {
     if (window == NULL || frame == NULL || df_bins <= 0) return;
     for (int channel = 0; channel < 2; ++channel) {
@@ -189,8 +191,10 @@ static int all_finite(const float *values, size_t count)
     return skn_all_finite_f32(values, count);
 }
 
-int dfn3_model_io_validate_arrays(float *gru_hidden, size_t gru_count,
-                                  float *df_convp_history, size_t convp_count)
+/* Check the recurrent arrays the accelerator wrote in place (element counts): 0 when all are finite, else both arrays
+ * are zeroed and -1 is returned. A NULL array or a count of 0 returns -1 and touches nothing. */
+static int dfn3_model_io_validate_arrays(float *gru_hidden, size_t gru_count,
+                                         float *df_convp_history, size_t convp_count)
 {
     if (gru_hidden == NULL || gru_count == 0u || df_convp_history == NULL ||
         convp_count == 0u) return -1;

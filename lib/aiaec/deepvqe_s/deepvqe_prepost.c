@@ -87,7 +87,6 @@ struct DeepVqePrepost {
 
     size_t taps_elements;
     int n_bins;
-    int hop;
     int frames_per_call;
 
     int pending;         /* frames accumulated into the open batch via pre_process_freq */
@@ -119,10 +118,6 @@ const char *deepvqe_prepost_state_name(int state_id) {
 const char *deepvqe_prepost_state_name_out(int state_id) {
     if (state_id < 0 || state_id >= DEEPVQE_STATE_COUNT) return NULL;
     return dv_state_names_out[state_id];
-}
-
-const char *deepvqe_prepost_skip_policy_name(void) {
-    return "mute_fail_closed";
 }
 
 #ifdef __STDC_VERSION__
@@ -359,7 +354,6 @@ DeepVqePrepost *deepvqe_prepost_init_ex(void *pool, size_t bytes,
     if (total != (size_t)req.bytes) return NULL;   /* sizing/carve agreement */
 
     p->n_bins = cfg->grid.n_bins;
-    p->hop = cfg->grid.hop;
     p->frames_per_call = cfg->grid.frames_per_call;
     p->taps_elements = deepvqe_prepost_taps_elements(&cfg->grid);
     for (id = 0; id < DEEPVQE_STATE_COUNT; ++id) {
@@ -433,14 +427,6 @@ void deepvqe_prepost_reset(DeepVqePrepost *p) {
 
 uint32_t deepvqe_prepost_state_generation(const DeepVqePrepost *p) {
     return p ? p->state_generation : 0u;
-}
-
-int deepvqe_prepost_hop_size(const DeepVqePrepost *p) {
-    return p ? p->hop : -1;
-}
-
-int deepvqe_prepost_num_bins(const DeepVqePrepost *p) {
-    return p ? p->n_bins : -1;
 }
 
 const DeepVqePrepostDescriptor *deepvqe_prepost_descriptor(

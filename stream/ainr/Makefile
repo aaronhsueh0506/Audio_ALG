@@ -296,7 +296,7 @@ model-io-dumper: $(OBJ_DIR)/dump_model_io
 # test-link-only-ainr: builds BOTH full and mask-only dfn2/ archives (sub-make, as ainr.c is built here), then
 # links tests/link_only_ainr.c -- which #includes ONLY ainr.h -- against each; both must complete a real round trip.
 AINR_SYMBOLS := ainr_get_mem_size ainr_init_from_erb_file ainr_init ainr_get_mem_size_spec \
-	ainr_init_spec_from_erb_file ainr_init_spec ainr_get_mem_size_freq ainr_init_freq_from_erb_file \
+	ainr_init_spec_from_erb_file ainr_get_mem_size_freq ainr_init_freq_from_erb_file \
 	ainr_init_freq
 
 test-link-only-ainr:

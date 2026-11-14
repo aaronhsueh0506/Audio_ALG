@@ -351,26 +351,6 @@ unsigned int dfn3_prepost_state_generation(const DFN3Prepost *p) {
 
 /* ---- accessors ---- */
 
-int dfn3_prepost_hop_size(const DFN3Prepost *p) {
-    return p ? p->grid.hop : -1;
-}
-
-int dfn3_prepost_num_bins(const DFN3Prepost *p) {
-    return p ? p->grid.n_bins : -1;
-}
-
-const DFN3Grid *dfn3_prepost_grid(const DFN3Prepost *p) {
-    return p ? &p->grid : NULL;
-}
-
-int dfn3_prepost_model_lookahead_frames(const DFN3Prepost *p) {
-    return p ? p->grid.output_delay : -1;
-}
-
-int dfn3_prepost_layout_version(const DFN3Prepost *p) {
-    return p ? DFN3_MODEL_IO_LAYOUT_VERSION : -1;
-}
-
 int dfn3_prepost_set_erb_matrices(DFN3Prepost *p, const float *erb_fwd,
                                   const float *erb_inv) {
     if (!p || !erb_fwd || !erb_inv) return -1;
@@ -477,8 +457,6 @@ int dfn3_prepost_frame_open(DFN3Prepost *p, DFN3PrepostInputs *inputs,
     outputs->df_convp_window_next = p->io->df_convp_window;
     outputs->erb_mask_elements = dfn3_prepost_erb_mask_elements(&p->grid);
     outputs->coefs_elements = dfn3_prepost_coefs_elements(&p->grid);
-    outputs->gru_hidden_elements = p->io->gru_hidden_elements;
-    outputs->df_convp_window_elements = p->io->df_convp_window_elements;
     p->prepared = 1;
     return 0;
 }

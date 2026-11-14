@@ -160,8 +160,6 @@ int gtcrn_process_state_validate(GTCRNProcess* p);
  * a mask the accelerator did not write, fill it with NaN first. */
 int gtcrn_process_mask_validate(GTCRNProcess* p, const float* mask_erb);
 
-const char* gtcrn_simd_backend(void);   /* kernel backend name, for a log line */
-
 #ifdef __cplusplus
 }
 #endif

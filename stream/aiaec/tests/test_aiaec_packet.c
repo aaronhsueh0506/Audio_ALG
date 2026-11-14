@@ -1005,7 +1005,7 @@ static int section_model_io_pin(void) {
         ulcnet_prepost_get_mem_size(&c1, &q1); ulcnet_prepost_get_mem_size(&c8, &q8);
         m1p = alloc_aligned((size_t)q1.bytes); m8p = alloc_aligned((size_t)q8.bytes);
         p1 = ulcnet_prepost_init(m1p, (size_t)q1.bytes, &c1); p8 = ulcnet_prepost_init(m8p, (size_t)q8.bytes, &c8);
-        CHECK(p1 && p8 && ulcnet_prepost_frames_per_call(p1) == 1 && ulcnet_prepost_frames_per_call(p8) == NF, "prepost init");
+        CHECK(p1 && p8, "prepost init");
         if (p1 && p8) {
             CHECK(ulcnet_prepost_pre_process_freq(p8, z, z, z, z) == -1, "one-frame entry on a packet instance");
             CHECK(ulcnet_prepost_pre_process_packet(p1, z, z, z, z, ev) == -1, "packet entry on a one-frame instance");

@@ -13,9 +13,8 @@
 
 /* Writes zeros/success to taps and every registered state_out -- shape correctness only, no
  * numerical realism. This smoke test registers no state, so only taps is touched. */
-static int fake_accelerator(const DeepVqePrepostInputs *in, DeepVqePrepostOutputs *out) {
+static int fake_accelerator(DeepVqePrepostOutputs *out) {
     size_t i;
-    (void)in;
     for (i = 0; i < out->taps_elements; ++i) out->taps[i] = 0.0f;
     for (i = 0; i < DEEPVQE_STATE_COUNT; ++i) {
         size_t k;
@@ -183,7 +182,7 @@ int main(void) {
             return 1;
         }
 
-        ai_rc = fake_accelerator(&io.inputs, &io.outputs);
+        ai_rc = fake_accelerator(&io.outputs);
 
         post_rc = deepvqe_stream_post_process(s, ai_rc, pcm_out);
         if (post_rc != 1) {
@@ -204,7 +203,7 @@ int main(void) {
         for (k = 0; k < hop; ++k) { mic_in[k] = (int16_t)k; far_in[k] = (int16_t)(k * 2); }
         pre_rc = deepvqe_stream_pre_process(s, mic_in, far_in, &io);
         if (pre_rc != 1) { fprintf(stderr, "pairing probe: setup pre_process rc=%d\n", pre_rc); return 1; }
-        (void)fake_accelerator(&io.inputs, &io.outputs);
+        (void)fake_accelerator(&io.outputs);
         post_rc = deepvqe_stream_post_process(s, 0, pcm_out);
         if (post_rc != 1) { fprintf(stderr, "pairing probe: setup post_process rc=%d\n", post_rc); return 1; }
 
@@ -220,7 +219,7 @@ int main(void) {
         /* Back to a clean, paired state before probing the other direction. */
         pre_rc = deepvqe_stream_pre_process(s, mic_in, far_in, &io);
         if (pre_rc != 1) { fprintf(stderr, "pairing probe: re-sync pre_process rc=%d\n", pre_rc); return 1; }
-        (void)fake_accelerator(&io.inputs, &io.outputs);
+        (void)fake_accelerator(&io.outputs);
 
         /* A second pre_process with no intervening post_process must be rejected too. */
         misuse_rc = deepvqe_stream_pre_process(s, mic_in, far_in, &io);

@@ -92,9 +92,6 @@ void ulcnet_prepost_reset(UlcnetPrepost *p);
  * fresh instance or NULL. A fixed-point accelerator loads quantized zeros at start and on every change. */
 uint32_t ulcnet_prepost_state_generation(const UlcnetPrepost *p);
 
-int ulcnet_prepost_hop_size(const UlcnetPrepost *p);   /* or -1 */
-int ulcnet_prepost_frames_per_call(const UlcnetPrepost *p);   /* 1 for a one-frame instance; or -1 */
-int ulcnet_prepost_num_bins(const UlcnetPrepost *p);   /* or -1 */
 /* Built from the config's grid and layout; the five interior fields are 0. */
 const UlcnetModelIoDescriptor *ulcnet_prepost_descriptor(const UlcnetPrepost *p);
 

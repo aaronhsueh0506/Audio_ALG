@@ -103,8 +103,6 @@ typedef struct DFN3PrepostOutputs {
     float *df_convp_window_next;    /* df_convp_history_out */
     size_t erb_mask_elements;
     size_t coefs_elements;
-    size_t gru_hidden_elements;
-    size_t df_convp_window_elements;
 } DFN3PrepostOutputs;
 
 /* Config for `grid`: no ERB matrices or registration, atten_lim_db 0. Returns 0, or -1 on NULL or an invalid grid. */
@@ -135,12 +133,6 @@ void dfn3_prepost_reset(DFN3Prepost *p);
 /* State generation (see DFN3ModelIOState): 1 after init, +1 per reset, per warm-up frame and per refused
  * frame_finish(); 0 for NULL. A runtime with its own state copy reloads quantized zeros on every change. */
 unsigned int dfn3_prepost_state_generation(const DFN3Prepost *p);
-
-int dfn3_prepost_hop_size(const DFN3Prepost *p);   /* or -1 */
-int dfn3_prepost_num_bins(const DFN3Prepost *p);   /* or -1 */
-const DFN3Grid *dfn3_prepost_grid(const DFN3Prepost *p);   /* NULL for NULL */
-int dfn3_prepost_model_lookahead_frames(const DFN3Prepost *p);   /* grid.output_delay; or -1 */
-int dfn3_prepost_layout_version(const DFN3Prepost *p);   /* or -1 */
 
 /* Use other ERB matrices (borrowed; call again after an in-place rewrite). A swap consistent per source frame needs a
  * reset first. Returns 0, or -1 on NULL or frame open. */
@@ -184,13 +176,12 @@ int dfn3_prepost_post_process_freq(DFN3Prepost *p, float *re, float *im, int *va
 /* Source frame (from 0) of the last emitted output: 0 and *frame after the first emission since reset, else -1. */
 int dfn3_prepost_output_frame_index(const DFN3Prepost *p, long long *frame);
 
-/* Accelerator callback: `infer` writes every output of the open frame and returns 0; `reset` is optional;
- * `io_descriptor` is the graph contract the runtime was built against. */
+/* Accelerator callback: `infer` writes every output of the open frame and returns 0; `io_descriptor` is the graph
+ * contract the runtime was built against. */
 typedef struct DFN3Model {
     void *user;
     int (*infer)(void *user, const DFN3PrepostInputs *inputs,
                  DFN3PrepostOutputs *outputs);
-    void (*reset)(void *user);
     const DFN3ModelIoDescriptor *io_descriptor;   /* NULL = not published */
 } DFN3Model;
 

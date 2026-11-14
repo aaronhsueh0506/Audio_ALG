@@ -175,8 +175,10 @@ int dfn2_model_io_descriptor_validate(const DFN2Grid *g,
     return 0;
 }
 
-void dfn2_model_io_push_erb_window(float *window, const float *frame, int n_erb,
-                                   int window_frames)
+/* Slide a feature window by one frame, the newest in the last slot. `window` is [window_frames][n_erb] or
+ * [2][window_frames][df_bins] (frame[2][df_bins]); window_frames is the grid's input_frames. */
+static void dfn2_model_io_push_erb_window(float *window, const float *frame, int n_erb,
+                                          int window_frames)
 {
     if (window == NULL || frame == NULL || n_erb <= 0 || window_frames <= 0) return;
     memmove(window, window + n_erb,
@@ -185,8 +187,8 @@ void dfn2_model_io_push_erb_window(float *window, const float *frame, int n_erb,
            (size_t)n_erb * sizeof(float));
 }
 
-void dfn2_model_io_push_spec_window(float *window, const float *frame, int df_bins,
-                                    int window_frames)
+static void dfn2_model_io_push_spec_window(float *window, const float *frame, int df_bins,
+                                           int window_frames)
 {
     if (window == NULL || frame == NULL || df_bins <= 0 || window_frames <= 0) return;
     for (int channel = 0; channel < 2; ++channel) {

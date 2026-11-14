@@ -1,17 +1,13 @@
-"""DFN3 pre/post class: accessor and ERB-matrix swap contract through ctypes.
+"""DFN3 pre/post class: ERB-matrix swap contract through ctypes.
 
 ``dfn3_prepost.c`` is built once per SIMD setting as a shared library with the two
 translation units it composes and the audiolib archive, then driven through its
 public C API only. The lookahead pair is a field of the ``DFN3Grid`` each instance is
-created for, so every pair the trainer accepts runs against the same library. Two
-groups of contract:
-
-* the accessors (``_hop_size``, ``_num_bins``) report the fixed 48 kHz / 1024 / 512
-  grid and answer -1 for a NULL instance;
-* ``_set_erb_matrices`` ("BETWEEN HOPS ONLY") is atomic per hop: a swap before
-  the first hop is indistinguishable from constructing with the new pair, a
-  mid-stream swap leaves the rows already in the graph window untouched, and a
-  refused call (NULL argument, or a frame still open) changes nothing.
+created for, so every pair the trainer accepts runs against the same library. The
+contract: ``_set_erb_matrices`` ("BETWEEN HOPS ONLY") is atomic per hop: a swap before
+the first hop is indistinguishable from constructing with the new pair, a
+mid-stream swap leaves the rows already in the graph window untouched, and a
+refused call (NULL argument, or a frame still open) changes nothing.
 
 Every hop opens a frame, the first ``mask_lookahead`` of them being warm-up frames
 whose heads are discarded; the first output comes ``max(mask, df)`` hops in.
@@ -123,9 +119,7 @@ class _Outputs(ctypes.Structure):
                 ('gru_hidden_next', ctypes.c_void_p),
                 ('df_convp_window_next', ctypes.c_void_p),
                 ('erb_mask_elements', ctypes.c_size_t),
-                ('coefs_elements', ctypes.c_size_t),
-                ('gru_hidden_elements', ctypes.c_size_t),
-                ('df_convp_window_elements', ctypes.c_size_t)]
+                ('coefs_elements', ctypes.c_size_t)]
 
 
 def _grid_spec(pair):
@@ -224,10 +218,6 @@ def dll(request, tmp_path_factory):
     dll.dfn3_prepost_reset.argtypes = [vp]
     dll.dfn3_prepost_state_generation.argtypes = [vp]
     dll.dfn3_prepost_state_generation.restype = ctypes.c_uint
-    for name in ('hop_size', 'num_bins'):
-        getter = getattr(dll, f'dfn3_prepost_{name}')
-        getter.argtypes = [vp]
-        getter.restype = ci
     dll.dfn3_prepost_set_erb_matrices.argtypes = [vp, vp, vp]
     dll.dfn3_prepost_set_erb_matrices.restype = ci
     dll.dfn3_prepost_pre_process_freq.argtypes = [vp, _FP, _FP]
@@ -383,26 +373,6 @@ def pair_b():
     return _erb_pair(True)
 
 
-def test_accessors_report_the_fixed_grid(lib, pair_a):
-    inst = _Instance(lib, *pair_a)
-    try:
-        assert lib.dfn3_prepost_hop_size(inst.handle) == HOP
-        assert lib.dfn3_prepost_num_bins(inst.handle) == BINS
-    finally:
-        inst.close()
-
-
-def test_accessors_do_not_change_with_stream_state(lib, pair_a):
-    inst = _Instance(lib, *pair_a)
-    try:
-        re, im = _spectra(4)
-        _run(inst, re, im)
-        assert lib.dfn3_prepost_hop_size(inst.handle) == HOP
-        assert lib.dfn3_prepost_num_bins(inst.handle) == BINS
-    finally:
-        inst.close()
-
-
 def test_warm_up_is_the_lookahead_and_the_window_is_zero_padded(lib, pair_a):
     """Every hop opens a frame, the warm-up frames (t < mask_lookahead)
     included; hop t's window holds frames [t-2 .. t], the frames before the
@@ -553,11 +523,6 @@ def test_reset_restarts_the_warm_up_also_inside_a_warm_up_frame(lib, pair_a):
         assert inst.generation() == gen + 1 + mask
     finally:
         inst.close()
-
-
-def test_accessors_answer_minus_one_for_a_null_instance(lib):
-    assert lib.dfn3_prepost_hop_size(None) == -1
-    assert lib.dfn3_prepost_num_bins(None) == -1
 
 
 def test_swap_before_the_first_hop_equals_constructing_with_the_new_pair(

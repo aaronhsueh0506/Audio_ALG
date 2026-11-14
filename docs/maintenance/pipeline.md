@@ -202,7 +202,7 @@ Pass conditions:
       samples) and a pass-band tolerance against the conventional NR-off
       output. The native path is a tolerance, NOT a memcmp.
 - [ ] The build produces `libdfn_res_stage.a` (carrying
-      `dfn_rate_bridge.o`); `AEC_LAYOUT_VERSION` is 2 (the `Aec` pool, array included).
+      `dfn_rate_bridge.o`); `AEC_LAYOUT_VERSION` is 3 (the `Aec` pool, array included).
 
 ### 9.1 Real four-microphone validation
 

@@ -702,8 +702,3 @@ int dfn2_enhance_spectrum_stream(DFN2State* st,
     return 1;
 #endif
 }
-
-const char* dfn2_simd_backend(void)
-{
-    return SK_NEON_BACKEND_NAME;
-}

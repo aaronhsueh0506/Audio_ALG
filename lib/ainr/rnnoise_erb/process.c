@@ -44,7 +44,9 @@ static double round_decimals(double x, int digits)
     return t / scale;
 }
 
-float rnnoise_norm_alpha(int sample_rate, int hop, double tau_sec)
+/* train.py make_norm_alpha(): exp(-(hop / sample_rate) / tau_sec) rounded to 3 decimals (one
+ * more digit while it reaches 1.0) as float32, half to even on the exact value. 0 if invalid. */
+static float rnnoise_norm_alpha(int sample_rate, int hop, double tau_sec)
 {
     /* train.py make_norm_alpha: three decimals, one more while it reaches 1.0 (at most 17). */
     double exact;
@@ -116,7 +118,9 @@ int rnnoise_grid_make(RNNoiseGrid *grid, const RNNoiseGridSpec *spec)
     return RNNOISE_GRID_OK;
 }
 
-int rnnoise_grid_validate(const RNNoiseGrid *grid)
+/* The same checks on an existing grid, and every derived field must equal what
+ * rnnoise_grid_make() derives (a hand-edited hop, alpha or scale is refused). */
+static int rnnoise_grid_validate(const RNNoiseGrid *grid)
 {
     RNNoiseGridSpec spec;
     RNNoiseGrid want;
@@ -146,24 +150,6 @@ int rnnoise_grid_validate(const RNNoiseGrid *grid)
         grid->stft_unscale != want.stft_unscale)
         return RNNOISE_GRID_ERR_INCONSISTENT;
     return RNNOISE_GRID_OK;
-}
-
-const char *rnnoise_grid_status_text(int status)
-{
-    switch (status) {
-    case RNNOISE_GRID_OK:               return "ok";
-    case RNNOISE_GRID_ERR_NULL:         return "null argument";
-    case RNNOISE_GRID_ERR_SAMPLE_RATE:  return "invalid sample_rate";
-    case RNNOISE_GRID_ERR_N_FFT:        return "n_fft refused by audiolib";
-    case RNNOISE_GRID_ERR_N_BANDS:      return "invalid n_bands";
-    case RNNOISE_GRID_ERR_MIN_BINS:     return "invalid min_bins_per_band";
-    case RNNOISE_GRID_ERR_LOOKAHEAD:    return "lookahead_frames outside 0..2";
-    case RNNOISE_GRID_ERR_SPEC_MAX_HZ:  return "spec_max_hz outside (0, sample_rate/2]";
-    case RNNOISE_GRID_ERR_ERB_NORM:     return "invalid ERB normaliser setting";
-    case RNNOISE_GRID_ERR_SPEC_NORM:    return "invalid spectrum normaliser setting";
-    case RNNOISE_GRID_ERR_INCONSISTENT: return "derived grid fields inconsistent";
-    default:                            return "unknown status";
-    }
 }
 
 /* ---- Pool arithmetic ---- */
@@ -715,9 +701,4 @@ int rnnoise_apply_gains(const RNNoiseState *st, float *spec_re, float *spec_im,
         spec_im[i] *= bin_gains[i] * unscale;
     }
     return 0;
-}
-
-const char *rnnoise_simd_backend(void)
-{
-    return SK_NEON_BACKEND_NAME;
 }

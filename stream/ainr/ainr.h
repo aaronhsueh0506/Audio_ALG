@@ -146,9 +146,6 @@ typedef struct AinrSpecCtx AinrSpecCtx;
 /* As ainr_get_mem_size(), for the PCM -> spectrum family. */
 int ainr_get_mem_size_spec(const AinrConfig *cfg, StreamMemReq *req);
 
-/* As ainr_init(), for the PCM -> spectrum family. */
-int ainr_init_spec(const AinrConfig *cfg, void *pool, size_t pool_bytes, AinrSpecCtx **ctx, AinrInfo *info);
-
 /* As ainr_reset(), for the PCM -> spectrum family. */
 void ainr_reset_spec(AinrSpecCtx *ctx);
 

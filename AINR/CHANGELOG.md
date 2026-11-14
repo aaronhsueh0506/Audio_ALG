@@ -2,6 +2,15 @@
 
 ## Unreleased
 
+### Write-only accessors, backend names and `DFN3Model.reset` removed; DFN3/RNNoise/DFN2 helpers made static
+
+No numerics changed (the `test_c_prepost`, `test_nn_chains`, `test_dfn3_stream` and RNNoise SIMD digests are identical to the previous tree at SIMD=1 and SIMD=0; `pytest AINR/tests AINR/RNNoise-ERB` is green). Full list, layout figures and the NR/AEC pool re-measurements: `pipelines/CHANGELOG.md`, same date.
+
+- **Removed.** `dfn2_prepost_hop_size/_num_bins/_model_lookahead_frames/_layout_version`; `dfn3_prepost_hop_size/_num_bins/_grid/_model_lookahead_frames/_layout_version`; `dfn2_simd_backend`, `dfn3_simd_backend`, `gtcrn_simd_backend`, `rnnoise_simd_backend` (test banners print `SK_NEON_BACKEND_NAME`); `dfn3_grid_status_text`, `rnnoise_grid_status_text`, `rnnoise_erb_window_elements`, `rnnoise_spec_window_elements`. Use `grid->hop`, `grid->n_bins`, `dfn2_prepost_latency_frames(grid)`, `grid.output_delay`, `RNNOISE_MODEL_INPUT_FRAMES * n_bands` and `* 2 * spec_bins` instead.
+- **`DFN3PrepostOutputs`** loses `gru_hidden_elements` and `df_convp_window_elements` (arm64 64 to 48 B), **`DFN3Model`** loses `reset` (32 to 24 B); both are caller-stack structs, no pool or version constant changes. A positional `DFN3Model` initialiser must drop the `reset` slot.
+- **Static now.** `dfn2_model_io_push_erb_window/_push_spec_window`, `dfn3_model_io_push_erb_window/_push_spec_window/_validate_arrays`, `dfn3_norm_alpha`, `dfn3_apply_atten_lim`, `rnnoise_norm_alpha`, `rnnoise_grid_validate`.
+- **Tests.** `test_dfn3_prepost_c.py` loses the three accessor tests and the `_Outputs` ctypes fields; `dfn_pairs.py` prints `-` as the DFN3 status text; the DFN2/DFN3 chain tests hash `grid.hop`, `grid.n_bins` and `dfn2_prepost_latency_frames(&grid)` where they hashed the accessors (digests unchanged).
+
 ### stream/ainr tests: the DFN2 rows' state count is compared with the library
 
 - `stream/ainr/tests/test_ainr_model_io.c` checks every accepted row's state count against `dfn2_model_io_descriptor_default().state_tensor_count` (full: 2, mask-only: 1). A row with a wrong count passed before this check and fails with it. No library change.

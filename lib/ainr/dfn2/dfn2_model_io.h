@@ -100,13 +100,6 @@ int dfn2_model_io_init(DFN2ModelIOState *state, void *block, size_t bytes,
 /* Feature frames the first call needs: mask_lookahead + frames_per_call; 0 for NULL or no grid. */
 unsigned int dfn2_model_io_ready_frames(const DFN2ModelIOState *state);
 
-/* Slide a feature window by one frame, the newest in the last slot. `window` is [window_frames][n_erb] or
- * [2][window_frames][df_bins] (frame[2][df_bins]); window_frames is the grid's input_frames. */
-void dfn2_model_io_push_erb_window(float *window, const float *frame, int n_erb,
-                                   int window_frames);
-void dfn2_model_io_push_spec_window(float *window, const float *frame, int df_bins,
-                                    int window_frames);
-
 /* Check the recurrent arrays after the accelerator wrote them in place (element counts; df_convp_history
  * count 0 = absent): 0 when finite, else zeroes them and returns -1. -1 with nothing touched: NULL or empty
  * h_gru, NULL df_convp_history with a count, or any df_convp_history with DFN2_MASK_ONLY. */

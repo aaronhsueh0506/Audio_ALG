@@ -63,8 +63,8 @@ typedef struct DFN3Grid {
     float spec_norm_tau_sec;
     float spec_norm_init_lo;
     float spec_norm_init_hi;
-    float erb_norm_alpha;    /* dfn3_norm_alpha() of erb_norm_tau_sec */
-    float spec_norm_alpha;   /* dfn3_norm_alpha() of spec_norm_tau_sec */
+    float erb_norm_alpha;    /* train.py make_norm_alpha() of erb_norm_tau_sec */
+    float spec_norm_alpha;   /* train.py make_norm_alpha() of spec_norm_tau_sec */
     float stft_scale;        /* 1 / sqrt(n_fft) */
     float stft_unscale;      /* sqrt(n_fft) */
 } DFN3Grid;
@@ -94,13 +94,6 @@ int dfn3_grid_make(DFN3Grid *grid, const DFN3GridSpec *spec);
 
 /* The same checks on an existing grid, whose derived fields must equal what dfn3_grid_make() derives. */
 int dfn3_grid_validate(const DFN3Grid *grid);
-
-/* Same value as train.py make_norm_alpha(): exp(-(hop / sample_rate) / tau_sec) rounded half to even to three
- * decimals, one more digit while that reaches 1.0, as float32. A tau that is not a float32 value (0.3) enters as its
- * float32 value. 0 for a non-positive argument. */
-float dfn3_norm_alpha(int sample_rate, int hop, float tau_sec);
-
-const char *dfn3_grid_status_text(int status);   /* never NULL */
 
 /* ---- State ----
  * A header over arrays that dfn3_state_init() carves out of a caller block of dfn3_state_mem_size(grid) bytes,
@@ -170,12 +163,6 @@ void dfn3_compute_features(DFN3State *st,
                            const float *spec_re, const float *spec_im,
                            float *feat_erb, float *feat_spec);
 
-/* In place on enh: enh = lim * noisy + (1 - lim) * enh, lim = 10^(-|atten_lim_db| / 20); 0 or non-finite: no-op. */
-void dfn3_apply_atten_lim(int n_bins,
-                          const float *noisy_re, const float *noisy_im,
-                          float *enh_re, float *enh_im,
-                          float atten_lim_db);
-
 /* Network heads -> enhanced spectrum (C twin of model.py compose()): the deep filter on the raw spectrum owns bins
  * below df_bins, the ERB mask the rest. erb_mask [n_erb] in [0,1]; coefs [df_bins][df_order][2]; spec_re/spec_im the
  * current frame at the framing scale, pushed into the ring; out_re/out_im the enhanced spectrum, df_lookahead frames
@@ -205,8 +192,6 @@ int dfn3_enhance_spectrum_stream(DFN3State *st,
                                  float *out_re,
                                  float *out_im,
                                  long long *output_frame_index);
-
-const char *dfn3_simd_backend(void);
 
 #ifdef __cplusplus
 }

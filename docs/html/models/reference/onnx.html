@@ -100,7 +100,7 @@ p = &lt;pfx&gt;_prepost_init(pool, req.bytes, &amp;cfg);       /* 或 _init_ex(p
   }
   &lt;pfx&gt;_prepost_post_process_freq(p, out_re, out_im[, &amp;valid]);
   ac_istft_push_planar(istft, out_re, out_im, hop_out);   /* AC_OLA_ACCUMULATE：每 hop 都 push，valid 只是資訊 */
-其餘：_reset（應用端的 AcStft／AcIstft 要一併 reset）／_destroy／_hop_size／_num_bins／_state_generation（見下）</pre>
+其餘：_reset（應用端的 AcStft／AcIstft 要一併 reset）／_destroy／_state_generation（見下）</pre>
 
 <p><b>一 hop = 一次推論</b>：<code>pre_process_freq</code> 回傳這一 hop 需要的加速器呼叫次數（−1 = 引數為 NULL 或上一幀還開著）。
 Align-ULCNet（引數 <code>err_re, err_im, far_re, far_im</code>）與 DeepVQE-S（<code>mic_re, mic_im, far_re, far_im</code>）<b>從 hop 0 起恆為 1</b>，<code>post_process_freq</code> 不帶 <code>valid</code>；

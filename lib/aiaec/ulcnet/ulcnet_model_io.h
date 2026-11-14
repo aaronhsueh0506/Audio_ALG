@@ -200,9 +200,6 @@ int ulcnet_model_io_descriptor_validate(
 int ulcnet_model_io_descriptor_grid(const UlcnetModelIoDescriptor *descriptor,
                                     UlcnetGrid *grid);
 
-/* Metadata string of a far-input mode ("raw_far", "aligned_far" or "unknown"); a static literal. */
-const char *ulcnet_far_input_mode_name(int mode);
-
 /* 0 for a valid registration (NULL counts as nothing registered), -1 otherwise. */
 int ulcnet_model_io_state_buffers_validate(
     const UlcnetModelIoStateBuffers *buffers);

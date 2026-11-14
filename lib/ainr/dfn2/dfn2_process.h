@@ -144,6 +144,4 @@ int dfn2_enhance_spectrum_stream(DFN2State *st,
                         float *out_im,
                         long long *output_frame_index);
 
-const char *dfn2_simd_backend(void);
-
 #endif /* DFN2_PROCESS_H */

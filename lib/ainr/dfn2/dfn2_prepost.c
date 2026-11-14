@@ -406,24 +406,8 @@ unsigned int dfn2_prepost_state_generation(const DFN2Prepost *p) {
     return p ? dfn2_model_io_state_generation(p->io) : 0u;
 }
 
-int dfn2_prepost_hop_size(const DFN2Prepost *p) {
-    return p ? p->grid.hop : -1;
-}
-
-int dfn2_prepost_num_bins(const DFN2Prepost *p) {
-    return p ? p->grid.n_bins : -1;
-}
-
 const DFN2Grid *dfn2_prepost_grid(const DFN2Prepost *p) {
     return p ? &p->grid : NULL;
-}
-
-int dfn2_prepost_model_lookahead_frames(const DFN2Prepost *p) {
-    return p ? dfn2_prepost_latency_frames(&p->grid) : -1;
-}
-
-int dfn2_prepost_layout_version(const DFN2Prepost *p) {
-    return p ? DFN2_MODEL_IO_LAYOUT_VERSION : -1;
 }
 
 int dfn2_prepost_set_erb_matrices(DFN2Prepost *p, const float *erb_fwd,

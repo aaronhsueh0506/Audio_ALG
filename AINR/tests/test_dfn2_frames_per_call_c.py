@@ -402,7 +402,6 @@ static int case_contract(void) {
     /* The class: pre_process readiness, views, latency, first output. */
     p = make();
     CHECK(p != NULL);
-    CHECK(dfn2_prepost_model_lookahead_frames(p) == LA + DA + NF - 1);
     CHECK(dfn2_prepost_latency_frames(grid) == LA + DA + NF - 1);
     CHECK(dfn2_prepost_grid(p) != NULL && dfn2_prepost_grid(p)->n_erb == E &&
           dfn2_prepost_grid(p)->df_bins == F &&

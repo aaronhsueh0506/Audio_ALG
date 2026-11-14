@@ -87,14 +87,14 @@ static int run_rnnoise(const float *erb_fwd, const float *erb_inv, RunModel run_
     RNNoiseGrid grid;
     int status = rnnoise_grid_make(&grid, &spec);
     if (status != RNNOISE_GRID_OK) {
-        fprintf(stderr, "grid refused: %s\n", rnnoise_grid_status_text(status));
+        fprintf(stderr, "grid refused: status %d\n", status);
         return -1;
     }
 
     int rc = -1;
-    const size_t nb = (size_t)grid.n_bins, erb_n = rnnoise_erb_window_elements(&grid);
+    const size_t nb = (size_t)grid.n_bins, erb_n = (size_t)RNNOISE_MODEL_INPUT_FRAMES * grid.n_bands;
     float *h = calloc(3 * GRU_HIDDEN, sizeof *h);                          /* h1, h2, h3 */
-    float *buf = malloc(sizeof *buf * (9 * nb + grid.n_bands + erb_n + rnnoise_spec_window_elements(&grid)));
+    float *buf = malloc(sizeof *buf * (9 * nb + grid.n_bands + erb_n + (size_t)RNNOISE_MODEL_INPUT_FRAMES * 2 * grid.spec_bins));
     float *hist_re = buf, *hist_im = hist_re + 3 * nb;                     /* the last three spectra */
     float *cur_re = hist_im + 3 * nb, *cur_im = cur_re + nb, *bin_gains = cur_im + nb;
     float *band_gains = bin_gains + nb, *erb = band_gains + grid.n_bands, *spec_win = erb + erb_n;

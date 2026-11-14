@@ -2,6 +2,7 @@
 /* Scalar/SIMD equivalence: one digest over the whole pre/post chain (analysis, features,
  * attenuation limit, expansion, gains, synthesis, normaliser states); the Makefile compares the
  * digests of the two builds. Usage: test_rnnoise_simd ERB_FWD_FILE ERB_INV_FILE */
+#include "utility/simd_kernels.h"
 #include "rnnoise_test_support.h"
 
 static uint32_t rng_state = 0x31415926u;
@@ -84,7 +85,7 @@ int main(int argc, char **argv) {
     hash = hash_bytes(hash, pool.st->spec_norm_state,
                       (size_t)grid.spec_bins * sizeof(float));
     fprintf(stderr, "rnnoise preprocessing backend=%s\n",
-            rnnoise_simd_backend());
+            SK_NEON_BACKEND_NAME);
     printf("%016llx\n", (unsigned long long)hash);
     rnn_framing_close(&framing);
     free(pool.pool);

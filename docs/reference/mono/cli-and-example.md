@@ -94,7 +94,7 @@ DUMP_CTX=pipeline_ctx.bin \
 #include "anr.h"
 #include "anr_types.h"
 
-#if !defined(AEC_OUTPUT_GUARD_API_VERSION) || AEC_OUTPUT_GUARD_API_VERSION < 2
+#if !defined(AEC_CNG_NR_GAIN_FLOOR)
 #error "aec.h is too old: this wrapper needs the output-guard API (aec_get_residual().base_spec, aec_apply_gain, aec_apply_cng, aec_post_reset_serial, aec_synthesis_window)"
 #endif
 

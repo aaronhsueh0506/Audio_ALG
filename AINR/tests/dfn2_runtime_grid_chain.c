@@ -26,6 +26,7 @@
 #include <stdlib.h>
 #include <string.h>
 
+#include "utility/simd_kernels.h"
 #include "dfn2_prepost.h"
 #include "dfn2_test_grid.h"
 
@@ -232,9 +233,9 @@ static uint64_t run_chain(void)
         hash_f32(&d.post, out_re, (size_t)grid.n_bins);
         hash_f32(&d.post, out_im, (size_t)grid.n_bins);
     }
-    hash_u32(&d.status, (uint32_t)dfn2_prepost_hop_size(p));
-    hash_u32(&d.status, (uint32_t)dfn2_prepost_num_bins(p));
-    hash_u32(&d.status, (uint32_t)dfn2_prepost_model_lookahead_frames(p));
+    hash_u32(&d.status, (uint32_t)grid.hop);
+    hash_u32(&d.status, (uint32_t)grid.n_bins);
+    hash_u32(&d.status, (uint32_t)dfn2_prepost_latency_frames(&grid));
     dfn2_prepost_destroy(p);
     printf("  freq in=%016llx state=%016llx post=%016llx status=%016llx\n",
            (unsigned long long)d.in, (unsigned long long)d.state, (unsigned long long)d.post,
@@ -304,6 +305,6 @@ int main(int argc, char **argv)
     printf("grid sr=%d fft=%d erb=%d df=%d mask=%d dfla=%d\n", grid.sample_rate, grid.n_fft,
            grid.n_erb, grid.df_bins, grid.mask_lookahead, grid.df_lookahead);
     f = run_chain();
-    printf("chain digest=%016llx backend=%s\n", (unsigned long long)f, dfn2_simd_backend());
+    printf("chain digest=%016llx backend=%s\n", (unsigned long long)f, SK_NEON_BACKEND_NAME);
     return 0;
 }

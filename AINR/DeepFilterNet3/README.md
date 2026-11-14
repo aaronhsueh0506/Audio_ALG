@@ -139,7 +139,7 @@ DFN3GridSpec spec = {                      /* the shipped model: config.ini [sig
     .spec_norm_init_lo = 0.001f, .spec_norm_init_hi = 0.0001f,
 };
 DFN3Grid grid;
-if (dfn3_grid_make(&grid, &spec) != DFN3_GRID_OK) return -1;       /* dfn3_grid_status_text() names the failure */
+if (dfn3_grid_make(&grid, &spec) != DFN3_GRID_OK) return -1;       /* a nonzero status is the rejected check */
 
 DFN3PrepostConfig cfg;
 DFN3PrepostMemReq req;

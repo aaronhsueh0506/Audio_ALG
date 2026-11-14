@@ -38,9 +38,8 @@ omitting it would silently reduce the trained receptive field. CPU-side
 feature-window storage is defined by
 `dfn2_model_io.c/.h` (the windows are carved from the caller's block at the grid's stride, `dfn2_model_io_mem_size(grid)` bytes);
 the recurrent state is not: `dfn2_model_io_init()` registers the application's buffers, or none. The header also exports the
-window-slide and state-validate helpers so an external dual-input consumer with its own state struct reuses
-this window/validate discipline instead of inlining a second copy of the
-memmove/memcpy pair. `dfn2_model_io_validate_arrays(gru_hidden, gru_count, df_convp_history, convp_count)` takes the flat buffers
+state-validate helper so an external dual-input consumer with its own state struct reuses
+this validate discipline; the window slide is internal to `dfn2_model_io_push_features()`. `dfn2_model_io_validate_arrays(gru_hidden, gru_count, df_convp_history, convp_count)` takes the flat buffers
 and their element counts (`df_convp_history` count 0 = absent; `64 * 5 * df_bins` floats, the graph tensor element for element) and
 `dfn2_model_io_validate_state()` the registered ones. Validation is a finite
 check over the state itself: a null argument returns `-1`, and a non-finite

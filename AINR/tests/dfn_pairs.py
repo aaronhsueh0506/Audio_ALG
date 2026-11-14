@@ -229,7 +229,7 @@ int main(int argc, char **argv)
                 untouched = 1;
             }
             printf("%d %d %d %d %d %d %s\n", mask, df, status, ring, valid,
-                   untouched, dfn@N@_grid_status_text(status));
+                   untouched, @STATUS_TEXT@);
         }
     }
     return 0;
@@ -256,8 +256,11 @@ def _grid_probe_source(family):
             '    spec.spec_norm_init_lo = (float)atof(argv[11]);\n'
             '    spec.spec_norm_init_hi = (float)atof(argv[12]);\n')
         argc = '13'
-    return (_GRID_PROBE.replace('@N@', number).replace('@FRAMES@', frames)
-            .replace('@NORM_FIELDS@', norm_fields).replace('@ARGC@', argc))
+    # Only dfn2_grid_status_text exists; the DFN3 probe prints "-" in the text column.
+    status_text = 'dfn2_grid_status_text(status)' if number == '2' else '"-"'
+    return (_GRID_PROBE.replace('@STATUS_TEXT@', status_text).replace('@N@', number)
+            .replace('@FRAMES@', frames).replace('@NORM_FIELDS@', norm_fields)
+            .replace('@ARGC@', argc))
 
 
 def build_grid_probe(workdir, std='c11', flags=(), cxx=False, family='DeepFilterNet2'):

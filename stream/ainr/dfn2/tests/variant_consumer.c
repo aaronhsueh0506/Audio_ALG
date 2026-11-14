@@ -21,9 +21,8 @@ static float *alloc_filled(size_t n, float fill) {
     return p;
 }
 
-static int fake_accelerator(const DFN2PrepostInputs *in, DFN2PrepostOutputs *out) {
+static int fake_accelerator(DFN2PrepostOutputs *out) {
     size_t i;
-    (void)in;
     for (i = 0; i < out->erb_mask_elements; ++i) out->erb_mask[i] = 0.3f;
 #ifndef DFN2_MASK_ONLY
     for (i = 0; i < out->coefs_elements; ++i) out->coefs[i] = 0.0f;
@@ -89,7 +88,7 @@ int main(void) {
         int ai_rc;
         for (k = 0; k < hop; ++k) pcm_in[k] = (int16_t)((k * 11 + i * 7) % 151 - 75);
         if (dfn2_stream_pre_process(s, pcm_in, &io) != 1) { fprintf(stderr, "pre fail\n"); return 1; }
-        ai_rc = fake_accelerator(&io.inputs, &io.outputs);
+        ai_rc = fake_accelerator(&io.outputs);
         if (dfn2_stream_post_process(s, ai_rc, pcm_out) < 0) { fprintf(stderr, "post fail\n"); return 1; }
     }
 
