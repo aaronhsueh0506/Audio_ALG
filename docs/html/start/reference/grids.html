@@ -33,7 +33,7 @@ centered 與串流（center=False）framing 在穩態逐 bit 等價。</p>
 <tr><td rowspan="4">AEC（<code>AEC/c_impl</code>）<br>
 <span class="note">hop=fft/2、block=fft、K=fft/2+1（<code>aec_derive_dims()</code>，<code>aec.c</code>）</span></td>
 <td>8 k</td><td>256 / 128（129）</td><td>預設（唯一）；legacy，非產品格點</td>
-<td rowspan="4"><code>aec.c</code> <code>aec_default_fft_size()</code>／<code>aec_resolve_signal_grid()</code>
+<td rowspan="4"><code>aec_tuning.c</code> <code>aec_default_fft_size()</code>／<code>aec_resolve_signal_grid()</code>
 （48k→1024、16k→256、8k→256）白名單；
 濾波器長度由取樣率決定（52 ms = 832 taps @16k、sr≥44100 為 64 ms），不是 <code>AecConfig</code> 欄位</td></tr>
 <tr><td>16 k</td><td><b>256 / 128（129）＝8 ms hop 預設</b></td><td>預設</td></tr>
@@ -94,7 +94,7 @@ vs 上游 4800 Hz）</td><td>執行期給定：應用端填 <code>DFN2GridSpec</
 <td>512 / 256（257）、256 / 128（129）</td><td>訓練端 config 固定；C 端執行期給定（<code>DeepVqeGridSpec</code>→<code>deepvqe_grid_make()</code>）</td>
 <td><code>config.ini</code>；<code>deepvqe_prepost.h</code></td></tr>
 <tr><td>AIAEC 其餘兩個（CRUSE/CAGCRN）</td><td>16 k</td>
-<td>512 / 256（257）</td><td>config 固定；各模型的 mask helper 只處理 caller 給的 <code>n_bins</code></td>
+<td>512 / 256（257）</td><td>config 固定；沒有 C 程式碼，C 端的框架由應用端用 audiolib 自行建立</td>
 <td>各模型的 <code>config.ini</code></td></tr>
 </table>
 </div>

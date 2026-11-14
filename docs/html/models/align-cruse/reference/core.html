@@ -23,7 +23,6 @@
 <h2 id="section-1">參考</h2>
 <ul>
 <li><a href="../index.html">Align-CRUSE 整合入口</a></li>
-<li><a href="../../../../../lib/aiaec/align_cruse/align_cruse_process.h">頻域 C 標頭</a></li>
 <li><a href="../../../../../AIAEC/Align_CRUSE/README.md">模型設定與範例</a></li>
 </ul>
 
@@ -117,7 +116,7 @@ T=90 全幀 stream-vs-offline enhanced 4.9e-7 / mask 1.8e-7 / delay 3.3e-7（ATO
 <div class="tbl"><table>
 <tr><th>分類</th><th>名稱</th></tr>
 <tr><td><b>公開（Python）</b></td><td><code>AIAEC.Align_CRUSE.inference.load_model</code>、<code>AlignCRUSE.create_stream_state</code>、<code>AlignCRUSE.forward_stream</code>、<code>AIAEC.aiaec_streaming.StreamSTFT</code>／<code>StreamISTFT</code>、<code>export_onnx.py</code>／<code>inference.py</code>（含 <code>calib</code>）兩個命令列入口</td></tr>
-<tr><td><b>公開（C，可用零件）</b></td><td><code>aiaec_apply_real_mask</code>（<code>align_cruse_process.h</code>）；audiolib <code>ac_stft_*</code>／<code>ac_istft_*</code>、<code>ac_window_build</code></td></tr>
+<tr><td><b>公開（C，可用零件）</b></td><td>本模型沒有 C 函式；audiolib <code>ac_stft_*</code>／<code>ac_istft_*</code>、<code>ac_window_build</code></td></tr>
 <tr><td><b>內部</b></td><td>底線開頭的模組（<code>_cli_common.py</code>、<code>_streaming_export.py</code>、<code>_streaming_calibration.py</code> 等）是實作細節，不是命令列入口；<code>aiaec_streaming.py</code> 的 cell 類別（<code>GlobalDelayAttentionCell</code> 等）與 <code>AlignCRUSE.forward</code>（整段版）供測試與訓練使用</td></tr>
 </table></div>
 

@@ -224,6 +224,21 @@ int main(void)
         CHECK(mc.layout_version == (AI3_MODEL_IO_DFN2_PRODUCT == AI3_MODEL_IO_DFN2_LITE ? DFN2_MODEL_IO_LAYOUT_VERSION_MASK_ONLY
                                                                                         : DFN2_MODEL_IO_LAYOUT_VERSION_FULL),
               "layout version");
+        {   /* the row's state count against the library's: a build constant, so any valid grid of the row's rate and size asks it */
+            DFN2GridSpec gs;
+            DFN2Grid grid;
+            DFN2ModelIoDescriptor desc;
+            memset(&gs, 0, sizeof gs);
+            gs.sample_rate = cfg.sr; gs.n_fft = cfg.fft; gs.n_erb = (int)mc.wiring.outputs[0].w; gs.df_bins = 96;
+#ifndef DFN2_MASK_ONLY
+            gs.df_order = 5;
+#endif
+            gs.frames_per_call = n;
+            CHECK(dfn2_grid_make(&grid, &gs) == DFN2_GRID_OK && dfn2_model_io_descriptor_default(&grid, &desc) == 0,
+                  "sr %d fft %d N %d: no descriptor to compare the state count with", cfg.sr, cfg.fft, n);
+            CHECK(ai3_model_io_state_count(&mc) == desc.state_tensor_count, "sr %d fft %d N %d: row has %d states, the library %d",
+                  cfg.sr, cfg.fft, n, ai3_model_io_state_count(&mc), desc.state_tensor_count);
+        }
         for (family = 0; family < 3; ++family) {
             char tag[96];
             snprintf(tag, sizeof tag, "sr %d fft %d N %d family %d", cfg.sr, cfg.fft, n, family);

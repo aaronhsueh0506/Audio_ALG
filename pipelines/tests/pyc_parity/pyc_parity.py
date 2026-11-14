@@ -67,6 +67,9 @@ SOURCES = [   # hashed into the JSON so a result can be tied to the code it judg
     'Audio_ALG/pipelines/4ch/array_sample_post.h',
     'Audio_ALG/pipelines/tests/pyc_parity/pyc_drv.c',
     'AEC/c_impl/src/aec.c',
+    'AEC/c_impl/src/aec_tuning.c',
+    'AEC/c_impl/src/aec_post.c',
+    'AEC/c_impl/src/aec_config_build.c',
     'AEC/c_impl/include/internal/aec_impl.h',
     'AEC/c_impl/src/aec_array.c',
     'AEC/c_impl/include/internal/aec_array_internal.h',
@@ -1063,7 +1066,7 @@ def main():
         if layer in cx.layers and key in cx.info:
             ok = cx.info[key].strip()
             rows.append(make_row('build.L%d.flags' % layer, layer,
-                                 'build flags of the layer (%s)' % ('std-math, NR four USE_* off, scalar' if layer == 1 else 'Makefile defaults'),
+                                 'build flags of the layer (%s)' % ('std-math, NR three USE_* off, scalar' if layer == 1 else 'Makefile defaults'),
                                  'make build log', gate=(ok == 'ok') if ok != 'not_asserted_reused_tree' else None,
                                  metrics={'assertion': ok}, note=ok))
     steps = []

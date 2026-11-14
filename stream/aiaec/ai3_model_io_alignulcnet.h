@@ -1,6 +1,6 @@
 /* Align-ULCNet graph rows for the board samples, from AIAEC/Align_ULCNet/export_onnx.py: one generator per grid for
- * the one-frame graph (layout 18, N = 1) and the packet graph (layout 19, N > 1). D = ceil(0.5 s / hop) and
- * ta_bins = (bins + 9) / 10, as exported. */
+ * the one-frame graph (layout 18, N = 1) and the packet graph (layout 19, N > 1). bins = fft / 2 + 1, the K/V width
+ * ta_bins = (bins + 9) / 10 and the delay depth D = ceil(0.5 s / hop) = ceil(sample_rate / fft), as exported. */
 
 #ifndef AI3_MODEL_IO_ALIGNULCNET_H
 #define AI3_MODEL_IO_ALIGNULCNET_H
@@ -20,15 +20,15 @@ extern "C" {
 #define AI3_MODEL_IO_ALIGNULCNET_GRU_ROWS      4
 #define AI3_MODEL_IO_ALIGNULCNET_GRU_HIDDEN    128
 
-/* One registered graph: the grid's bins, the K/V width ta_bins and the delay depth D are exporter values. */
+/* One registered graph. */
 typedef struct Ai3ModelIoAlignulcnetGrid {
-    int sample_rate, fft, n, bins, ta_bins, depth;
+    int sample_rate, fft, n;
 } Ai3ModelIoAlignulcnetGrid;
 
 static const Ai3ModelIoAlignulcnetGrid AI3_MODEL_IO_ALIGNULCNET_GRIDS[] = {
-    { 16000, 256, 1, 129, 13, 63 },
-    { 16000, 256, 8, 129, 13, 63 },
-    { 16000, 512, 1, 257, 26, 32 },
+    { 16000, 256, 1 },
+    { 16000, 256, 8 },
+    { 16000, 512, 1 },
 };
 
 #define AI3_MODEL_IO_ALIGNULCNET_ROW_COUNT \
@@ -39,8 +39,8 @@ static const Ai3ModelIoAlignulcnetGrid AI3_MODEL_IO_ALIGNULCNET_GRIDS[] = {
  * outputs: output [1, 2, N, bins], then the states as <name>_out. */
 static inline void ai3_model_io_alignulcnet_describe(const Ai3ModelIoAlignulcnetGrid *g, Ai3ModelIoRow *row)
 {
-    unsigned int n = (unsigned int)g->n, bins = (unsigned int)g->bins, d = (unsigned int)g->depth;
-    unsigned int ta = (unsigned int)g->ta_bins;
+    unsigned int n = (unsigned int)g->n, bins = (unsigned int)g->fft / 2u + 1u, ta = (bins + 9u) / 10u;
+    unsigned int d = ((unsigned int)g->sample_rate + (unsigned int)g->fft - 1u) / (unsigned int)g->fft;
     int i;
 
     memset(row, 0, sizeof *row);

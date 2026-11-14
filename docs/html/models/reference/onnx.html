@@ -65,13 +65,13 @@ grid 與 state contract。<code>--format npz</code> 產生 NumPy archive 與
 <code>ulcnet_model_io.c/h</code>(<code>ulcnet_model_io_prepare()</code>／<code>ulcnet_model_io_enhance_spectrum()</code> 內建前後端),
 外面包 <b><code>ulcnet_prepost.c/h</code> 類別</b></td></tr>
 <tr><td>Align-CRUSE</td><td>mic + far + conv/GRU/alignment state</td>
-<td>real mask + next state</td><td><code>lib/aiaec/align_cruse/align_cruse_process.h</code> 提供 mask 合成</td></tr>
+<td>real mask + next state</td><td>無（沒有 C 程式碼）</td></tr>
 <tr><td>DeepVQE-S</td><td>mic + far(host 壓縮後的 planar 頻譜 <code>[1,2,1,257]</code>，graph 自第一個 conv 起) + 16 個 rank-4 顯式 state(conv window 4 幀、score window 5 幀、attention ring D 幀、<code>h_gru [1,1,1,192]</code>)</td>
 <td>3x3 complex CCM taps + <b>每個 state 的完整下一個 window</b></td>
 <td><code>lib/aiaec/deepvqe_s/deepvqe_process.c/h</code>，
 外面包 <b><code>deepvqe_prepost.c/h</code> 類別</b></td></tr>
 <tr><td>CAGCRN</td><td>mic + far + conv/GRU/delay state</td>
-<td>complex mask + next state</td><td><code>lib/aiaec/cagcrn/cagcrn_process.h</code> 提供 mask 合成</td></tr>
+<td>complex mask + next state</td><td>無（沒有 C 程式碼）</td></tr>
 </table>
 
 <p class="note">Align-CRUSE 的 cumulative score_sum 必須是 float32，frame
@@ -178,10 +178,10 @@ RNNoise-ERB 為 24 byte、沒有 reserved 欄）當<b>陳舊 pool 閘</b>：<cod
 <td><code>AINR/tests/test_dfn3_prepost_c.py</code></td>
 <td>identity：高頻 unit ERB gain + 低頻 raw bin 的 unit center DF tap</td>
 <td><code>state_layout_version</code>（<code>DeepFilterNet3/export_onnx.py</code>）</td></tr>
-<tr><td>Align-CRUSE</td><td>mask helper <code>lib/aiaec/align_cruse/align_cruse_process.h</code></td>
+<tr><td>Align-CRUSE</td><td>無（沒有 C 程式碼）</td>
 <td>—</td><td>—</td>
 <td><b>兩個 key 都沒有</b></td></tr>
-<tr><td>CAGCRN</td><td>mask helper <code>lib/aiaec/cagcrn/cagcrn_process.h</code></td>
+<tr><td>CAGCRN</td><td>無（沒有 C 程式碼）</td>
 <td>—</td><td>—</td>
 <td><b>兩個 key 都沒有</b></td></tr>
 <tr><td>GTCRN</td><td>不是 <code>frame_open</code> 形狀：<code>lib/ainr/gtcrn/gtcrn_process.c/h</code> 的 <code>GTCRNProcess</code> pool 物件（<code>gtcrn_model_input()</code>／<code>gtcrn_model_output()</code>）</td>
@@ -222,7 +222,7 @@ make -C AIAEC test                                  # 建庫 + pytest</pre>
 
 <p><code>libaiaec_prepost.a</code> 成員：<code>ulcnet_process</code>、
 <code>ulcnet_model_io</code>、<code>ulcnet_prepost</code>、
-<code>ulcnet_accelerator_adapter</code>、<code>ulcnet_mask_process</code>、<code>cagcrn_process</code>、<code>align_cruse_process</code>、
+<code>ulcnet_accelerator_adapter</code>、
 <code>deepvqe_process</code>、<code>deepvqe_prepost</code>。
 <code>libainr_prepost.a</code> 成員：<code>dfn2_process</code>、<code>dfn2_model_io</code>、
 <code>dfn2_prepost</code>、<code>dfn3_process</code>、<code>dfn3_model_io</code>、<code>dfn3_prepost</code>、<code>gtcrn_process</code>、<code>rnnoise_process</code>

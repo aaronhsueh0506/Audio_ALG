@@ -2,6 +2,10 @@
 
 ## Unreleased
 
+### stream/ainr tests: the DFN2 rows' state count is compared with the library
+
+- `stream/ainr/tests/test_ainr_model_io.c` checks every accepted row's state count against `dfn2_model_io_descriptor_default().state_tensor_count` (full: 2, mask-only: 1). A row with a wrong count passed before this check and fails with it. No library change.
+
 ### Tests: shared stand-in schedule, two dead macros
 
 - `tests/chain_standin.h` holds the generator, digest, spectrum maker and stand-in model schedule that `tests/test_nn_chains.c` and `tests/dfn2_runtime_grid_chain.c` each carried as an identical copy. Printed digests are unchanged (SIMD 1 and 0).

@@ -60,6 +60,10 @@ static void compare_work(const char *tag, const Ai3ModelIoConfig *mc, const Aiae
 {
     int i, rc;
     const StreamWiring *w = &mc->wiring;
+#if !IS_ALIGN
+    CHECK(ai3_model_io_state_count(mc) == DEEPVQE_STATE_COUNT, "%s state count %d, the library has %d", tag,
+          ai3_model_io_state_count(mc), (int)DEEPVQE_STATE_COUNT);
+#endif
     CHECK(work->action == AIAEC_SUBMIT, "%s action %d", tag, (int)work->action);
     CHECK(work->input_count == w->signal_in_count, "%s input_count %d vs %d", tag, work->input_count, w->signal_in_count);
     CHECK(work->output_count == w->head_out_count, "%s output_count %d vs %d", tag, work->output_count, w->head_out_count);

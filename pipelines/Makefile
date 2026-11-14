@@ -475,8 +475,6 @@ TARGET_ABI_SRCS := tests/test_target_abi.c \
  ../lib/ainr/dfn3/dfn3_process.c ../lib/ainr/dfn3/dfn3_model_io.c \
  ../lib/ainr/dfn3/dfn3_prepost.c \
  $(ULCNET_DIR)/ulcnet_process.c $(ULCNET_DIR)/ulcnet_model_io.c $(ULCNET_DIR)/ulcnet_prepost.c \
- $(ULCNET_DIR)/ulcnet_mask_process.c ../lib/aiaec/cagcrn/cagcrn_process.c \
- ../lib/aiaec/align_cruse/align_cruse_process.c \
  ../lib/aiaec/deepvqe_s/deepvqe_process.c \
  ../lib/aiaec/deepvqe_s/deepvqe_prepost.c
 # test_target_abi expects the array instance from an array libaec and its refusal from a single-channel one.

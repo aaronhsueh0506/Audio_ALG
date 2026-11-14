@@ -69,9 +69,8 @@ OBJ_DIR := $(BUILD_DIR)/simd$(SIMD)-$(CFG_SIG)
 # The Align-ULCNet core, recompiled here under this OBJ_DIR (mirroring how the DFN2/DeepVQE-S
 # stream Makefiles recompile their own cores): ulcnet_prepost.c needs only ulcnet_model_io.c to
 # link (confirmed: it never calls into ulcnet_process.c's ulcnet_frame_is_finite(), the only
-# symbol that file defines; ulcnet_accelerator_adapter.c and ulcnet_mask_process.c are different
-# AIAEC-family concerns -- a synchronous-callback adapter and the split-off mask-apply helper --
-# neither needed to link this model's own frame_open/finish/bypass boundary).
+# symbol that file defines; ulcnet_accelerator_adapter.c is a different AIAEC-family concern -- a
+# synchronous-callback adapter -- not needed to link this model's own frame_open/finish/bypass boundary).
 CORE_SOURCES := ../../../lib/aiaec/ulcnet/ulcnet_model_io.c \
 	../../../lib/aiaec/ulcnet/ulcnet_prepost.c
 CORE_HEADERS := ../../../lib/aiaec/ulcnet/ulcnet_model_io.h \

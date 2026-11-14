@@ -1,6 +1,6 @@
 # CAGCRN
 
-CAGCRN estimates a complex mask from microphone and raw far-end spectra. Train it on the early, denoised near-end target. Use the [C mask helper and graph contract](../../docs/html/models/cagcrn/index.html) when the application provides its own framing, inference and recurrent state.
+CAGCRN estimates a complex mask from microphone and raw far-end spectra. Train it on the early, denoised near-end target. Use the [graph contract](../../docs/html/models/cagcrn/index.html) when the application provides its own framing, inference, mask multiply and recurrent state; the model has no C code.
 
 The 16 kHz configuration uses FFT/window/hop 512/512/256. It retains linear frequency bins through 2 kHz and applies a differentiable delay-window gate over the far-end history. Checkpoints must match this implementation’s encoder, delay gate and bounded complex mask.
 

@@ -76,13 +76,13 @@
 |---|---|---|---|---|---|---|---|---|
 | `PL` pipelines（common、mono、DFN、4ch、ULCNet 範例）與其 Python 參考 | 257 | 47 | 29 | 18 | 210 | 0 | 55 | 16 |
 | `TP` audiolib (doa/bf/VAD/common/utility) | 62 | 0 | 0 | 0 | 62 | 0 | 0 | 0 |
-| `AC` audiolib | 296 | 39 | 19 | 20 | 257 | 0 | 0 | 12 |
+| `AC` audiolib | 295 | 39 | 19 | 20 | 256 | 0 | 0 | 12 |
 | `AINR` AINR（DFN2、GTCRN、RNNoise-ERB） | 155 | 51 | 25 | 26 | 104 | 0 | 2 | 20 |
-| `AIAEC` AIAEC（Align-ULCNet、DeepVQE-S、共用 helper） | 117 | 40 | 23 | 17 | 77 | 0 | 0 | 16 |
-| `TOTAL` 合計 | 887 | 177 | 96 | 81 | 710 | 0 | 57 | 64 |
+| `AIAEC` AIAEC（Align-ULCNet、DeepVQE-S、共用 helper） | 113 | 36 | 20 | 16 | 77 | 0 | 0 | 16 |
+| `TOTAL` 合計 | 882 | 173 | 93 | 80 | 709 | 0 | 57 | 64 |
 <!-- map:stats:end -->
 
-讀法：887 個 C 函式中，177 個有 Python 對應（mirror 96、partial 81），其中 64 個的配對是推論；710 個是 C-only；未能判斷 0 個。另有 57 個 Python 符號只在 Python。
+讀法：882 個 C 函式中，173 個有 Python 對應（mirror 93、partial 80），其中 64 個的配對是推論；709 個是 C-only；未能判斷 0 個。另有 57 個 Python 符號只在 Python。
 
 「已對應」是**索引**，不是「已驗證一致」。真正量過數值的只有「對拍工具／測試」欄標（C↔Py）的項目，以及備註內註明為一次性量測的數字；其餘靠「已知落差」欄的編號。
 
@@ -158,7 +158,7 @@
 | `audiolib/common/src/audio_resampler.c` | all | 17 |
 | `audiolib/common/src/audio_stft.c` | all | 28 |
 | `audiolib/common/src/audio_window.c` | all | 1 |
-| `audiolib/common/src/fft_wrapper_ne10.c` | all | 12 |
+| `audiolib/common/src/fft_wrapper_ne10.c` | all | 11 |
 | `audiolib/common/src/hpf.c` | all | 8 |
 | `lib/ainr/dfn2/dfn2_model_io.c` | all | 18 |
 | `lib/ainr/dfn2/dfn2_model_io_priv.h` | all | 1 |
@@ -176,9 +176,6 @@
 | `lib/aiaec/deepvqe_s/deepvqe_prepost.c` | all | 36 |
 | `lib/aiaec/deepvqe_s/deepvqe_prepost.h` | all | 1 |
 | `lib/aiaec/deepvqe_s/deepvqe_process.c` | all | 4 |
-| `lib/aiaec/cagcrn/cagcrn_process.c` | all | 1 |
-| `lib/aiaec/align_cruse/align_cruse_process.c` | all | 1 |
-| `lib/aiaec/ulcnet/ulcnet_mask_process.c` | all | 2 |
 <!-- map:coverage:end -->
 
 ## 7. 對照表
@@ -292,7 +289,7 @@
 | AC-STFT-07 | `audiolib/common/src/audio_stft.c: ac_istft_flush` | `AIAEC/aiaec_streaming.py:StreamISTFT.flush` | mirror | D-27 | — | 最後一個 hop 的尾端 <=8 個樣本被包絡除法放大（n=512 時 1.73e-5），C 與 Python 孿生同形。 |
 | AC-STFT-08 | `audiolib/common/src/audio_stft.c: ac_istft_reset` | `AIAEC/aiaec_streaming.py:StreamISTFT.reset` | mirror | — | — | — |
 | AC-STFT-09 | `audiolib/common/src/audio_stft.c: config_valid, layout_walk, take, carve_tables, ac_stft_config_default, ac_stft_get_mem_size, ac_stft_init, ac_stft_window, istft_arrays, ac_istft_get_mem_size, ac_istft_init, ac_istft_get_config` | — | C-only | — | — | 設定、記憶體佈局、存取函式。 |
-| AC-FFT-01 | `audiolib/common/src/fft_wrapper_ne10.c: fft_size_in_range, fft_create, fft_get_mem_size, fft_init, fft_destroy, fft_get_n_freqs, fft_forward, fft_inverse, fft_forward_scratch, fft_inverse_scratch, fft_power, fft_apply_gain` | — | C-only | D-31；T-09 | — | NE10 後端的 FFT 包裝。外部參照是 numpy.fft（正向絕對差 <=3.95e-5 @ n=8192，一次性量測），repo 內沒有同名 Python 符號；沒有專屬的 Python golden。 |
+| AC-FFT-01 | `audiolib/common/src/fft_wrapper_ne10.c: fft_size_in_range, fft_create, fft_get_mem_size, fft_init, fft_destroy, fft_get_n_freqs, fft_forward, fft_inverse, fft_forward_scratch, fft_inverse_scratch, fft_power` | — | C-only | D-31；T-09 | — | NE10 後端的 FFT 包裝。外部參照是 numpy.fft（正向絕對差 <=3.95e-5 @ n=8192，一次性量測），repo 內沒有同名 Python 符號；沒有專屬的 Python golden。 |
 | AC-WAV-01 | `audiolib/common/include/wav_io.h: wav_io_file_size, wav_io_skip_chunk, wav_open_read, wav_read_float, wav_close_read, wav_open_write, wav_write_float, wav_finalize_write, wav_close_write` | — | C-only | D-29；D-31 | — | WAV 讀寫（header-only）。量化慣例與 soundfile／NR／評測端不同，跨 C／Python 的 WAV 位元比對天生帶 1~2 LSB 偏差。 |
 | AC-MATH-01 | `audiolib/common/utility/fast_math.h: fast_exp, fast_exp_neg, fast_log, fast_log10, fast_sqrt, exp1_approx, max_f` | — | C-only | D-28 | — | fast_exp／fast_log／fast_sqrt 等近似；參照是 libm（USE_STANDARD_MATH 建置），沒有 Python 孿生。 |
 | AC-MEM-01 | `audiolib/common/utility/mem_align.h: ck_add_size, ck_mul_size, ck_align16_size, ck_field_size, ck_field_size_reps, ac_pool_carve, ck_carve, ac_fnv1a_u32, ac_fnv1a_str, ac_memreq_abi_hash` | — | C-only | — | — | 尺寸運算的溢位檢查與對齊工具；`ac_memreq_abi_hash` 為 native-pointer pool descriptor 加入32-bit ABI識別，64-bit既有hash不變。 |
@@ -358,7 +355,7 @@
 | ID | C 檔:函式 | Python 檔:符號 | 關係 | 已知落差 | 對拍工具／測試 | 備註 |
 |---|---|---|---|---|---|---|
 | AIAEC-UL-01 | `lib/aiaec/ulcnet/ulcnet_model_io.c: ulcnet_model_io_prepare, ulcnet_model_io_prepare_packet, publish_views, frame_planes, front_end, front_end_scalar, front_end_neon, front_end_tail_one` | `AIAEC/Align_ULCNet/export_onnx.py:stream_features` | mirror | D-34 | `AIAEC/tests/test_ulcnet_model_io_c.py`（C 契約）；`AIAEC/tests/test_prepost_kernels.py`（NEON 對純量） | 有號冪壓縮、幅度與壓縮域相位方向。16k/257 bin 與 48k/513 bin：error_mag 4.77e-7、far_mag 9.54e-7（一次性量測）。 |
-| AIAEC-UL-02 | `lib/aiaec/ulcnet/ulcnet_model_io.c: ulcnet_model_io_enhance_spectrum, ulcnet_model_io_enhance_packet, finish_is_valid, back_end, back_end_scalar, back_end_neon` | `AIAEC/Align_ULCNet/export_onnx.py:host_back_end` | mirror | D-34 | `AIAEC/tests/test_ulcnet_model_io_c.py`（C 契約）；`AIAEC/tests/test_prepost_kernels.py`（NEON 對純量） | 壓縮誤差乘上圖輸出的平面複數 mask，再做逆有號冪。enhance_spectrum 相對誤差 8e-8~5.8e-7。 |
+| AIAEC-UL-02 | `lib/aiaec/ulcnet/ulcnet_model_io.c: ulcnet_model_io_enhance_spectrum, ulcnet_model_io_enhance_packet, finish_is_valid, back_end, back_end_scalar, back_end_neon` | `AIAEC/Align_ULCNet/export_onnx.py:host_back_end` | mirror | D-34 | `AIAEC/tests/test_ulcnet_model_io_c.py`（C 契約）；`AIAEC/tests/test_prepost_kernels.py`（NEON 對純量）；`AIAEC/tests/test_ulcnet_process_c.py`（C↔Py，<2e-5，出貨版與純量孿生） | 壓縮誤差乘上圖輸出的平面複數 mask，再做逆有號冪。enhance_spectrum 相對誤差 8e-8~5.8e-7。 |
 | AIAEC-UL-03 | `lib/aiaec/ulcnet/ulcnet_model_io.h: ulcnet_model_io_signed_pow` | `AIAEC/Align_ULCNet/model.py:_signed_power` | mirror | — | — | 檔內註解明載是 model.py `_signed_power` 的唯一 C 副本。 |
 | AIAEC-UL-06 | `lib/aiaec/ulcnet/ulcnet_prepost.c: ulcnet_prepost_pre_process_freq, ulcnet_prepost_pre_process_packet, ulcnet_prepost_frame_open` | `AIAEC/Align_ULCNet/export_onnx.py:stream_features` | partial | T-14 | `AIAEC/tests/test_ulcnet_prepost_c.py`（C 對 C） | （推論）暫存一個 hop 的誤差頻譜與遠端頻譜，再送進 model I/O 的 prepare；頻譜由應用端的 AcStft 產生，類別不含框架。 |
 | AIAEC-UL-07 | `lib/aiaec/ulcnet/ulcnet_prepost.c: ulcnet_prepost_frame_finish, ulcnet_prepost_post_process_freq` | `AIAEC/Align_ULCNet/export_onnx.py:host_back_end` | partial | T-14 | `AIAEC/tests/test_ulcnet_prepost_c.py`（C 對 C） | （推論）把圖輸出送進 model I/O 的 `enhance_spectrum`，再交出增強後頻譜；合成由應用端的 AcIstft 完成。 |
@@ -371,9 +368,6 @@
 | AIAEC-DV-06 | `lib/aiaec/deepvqe_s/deepvqe_prepost.c: deepvqe_prepost_descriptor_default, deepvqe_prepost_descriptor_validate, deepvqe_prepost_descriptor` | `AIAEC/_streaming_export.py:c_descriptor` | partial | T-14 | — | （推論）描述子對匯出器寫入的 metadata。 |
 | AIAEC-DV-07 | `lib/aiaec/deepvqe_s/deepvqe_prepost.c: pp_carve, pp_fnv1a, pp_build_hash, pp_layout, dv_valid_frames_per_call, deepvqe_grid_make, deepvqe_grid_validate, deepvqe_prepost_config_defaults, pp_registration_ok, pp_check_config, deepvqe_prepost_get_mem_size, deepvqe_prepost_init_ex, deepvqe_prepost_init, deepvqe_prepost_create, deepvqe_prepost_destroy, zero_registered, zero_state, deepvqe_prepost_reset, deepvqe_prepost_state_generation, deepvqe_prepost_hop_size, deepvqe_prepost_num_bins, fill_nan, all_finite, deepvqe_prepost_frame_bypass` | — | C-only | T-14 | — | 記憶體池佈局、`DeepVqeGrid` 與設定檢查（`dv_valid_frames_per_call`：[1, DEEPVQE_MODEL_MAX_FRAMES_PER_CALL] 範圍）、已註冊狀態檢查（十六個張量全有或全無）、build hash（已折入 frames_per_call）、生命週期、有限性掃描、NaN 填充；`deepvqe_prepost_frame_bypass` 對整批 N 個幀輸出靜音（fail closed）；沒有 Python 孿生。 |
 | AIAEC-DV-08 | `lib/aiaec/deepvqe_s/deepvqe_prepost.h: deepvqe_prepost_taps_elements` | — | C-only | — | — | CCM taps 張量的 float 個數，由 grid 算出：`n_bins` × `DEEPVQE_TIME_ORDER` × `DEEPVQE_FREQ_TAPS` × 2；應用端據此配置 taps 緩衝。標頭內的 inline 函式；Python 端的形狀在匯出的 `output_schema`。 |
-| AIAEC-MASK-01 | `lib/aiaec/cagcrn/cagcrn_process.c: aiaec_apply_complex_mask` | `AIAEC/aiaec_common.py:complex_mask`<br>`AIAEC/_export_common.py:COMPOSITION` | mirror | — | `AIAEC/tests/test_ulcnet_process_c.py`（C↔Py，逐位元） | CAGCRN 的 host 複數 mask 乘法（`_export_common.COMPOSITION` 表指定）。 |
-| AIAEC-MASK-02 | `lib/aiaec/ulcnet/ulcnet_mask_process.c: aiaec_apply_ulcnet_compressed_mask, aiaec_signed_pow` | `AIAEC/Align_ULCNet/export_onnx.py:host_back_end`<br>`AIAEC/_export_common.py:COMPOSITION` | mirror | D-34 | `AIAEC/tests/test_ulcnet_process_c.py`（C↔Py，<2e-5） | Align-ULCNet 的 host 後處理（`_export_common.COMPOSITION` 表指定），與 AIAEC-UL-02 的 back_end 是同一數學。 |
-| AIAEC-MASK-03 | `lib/aiaec/align_cruse/align_cruse_process.c: aiaec_apply_real_mask` | `AIAEC/Align_CRUSE/model.py:AlignCRUSE.forward`<br>`AIAEC/_export_common.py:COMPOSITION` | partial | D-36 | `AIAEC/tests/test_ulcnet_process_c.py`（C↔Py，逐位元，對內聯 torch 算式） | 實數幅度 mask（Align-CRUSE 的 `enhanced = microphone * mask`）。Align-CRUSE 沒有 C pre/post 類別，C 只提供這個共用 helper。 |
 
 <!-- map:rows:end -->
 
@@ -398,7 +392,6 @@
 | D-33 | 離線 Python 用 center=True，C 串流用 center=False，第 0 幀不同。 |
 | D-34 | AIAEC 應用端的 AcStft 用 center=0 滾動框，Python 訓練／評測用 center=1。 |
 | D-35 | spec_norm_eps：C 保留 1e-12，trainer 沒有。 |
-| D-36 | Align_CRUSE、CAGCRN 沒有 C pre/post 類別，只各自帶一份 mask helper（`lib/aiaec/{align_cruse,cagcrn}/`，split 自舊 aiaec_process.c）。 |
 | D-38 | 範例組出的 AecConfig（`aec_config_from_level` 加欄位）struct 值與 Python 有效值有 10 個欄位不同（10 ms 基準、carve 時 retime）。 |
 | D-39 | 4ch 共用 estimator 的 C-only 排程（duty-cycle）與 delay 模式（FIXED、EXTERNAL_ALIGNED、delay_num_filters）。 |
 | D-40 | 8 kHz mono 只有 C；mono CLI 旗標不對等（另見 S-30、S-31）。 |

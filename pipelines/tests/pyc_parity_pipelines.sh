@@ -14,11 +14,11 @@
 #       mono/aec_nr_res/pipeline.py fed with the C AEC seam, against the C output.
 #
 # Layers:
-#   Layer 1  std-math build (SIMD=0, -DUSE_STANDARD_MATH, NR's four USE_* optimisations off, i.e. NR's
+#   Layer 1  std-math build (SIMD=0, -DUSE_STANDARD_MATH, NR's three USE_* optimisations off, i.e. NR's
 #            DEBUG=1) of the C code, compared with Python. Catches sync bugs. The fused frame / AEC seam that Python is
 #            fed with is always the one the C code produced, so the comparison isolates the stage under test
 #            from the (separately audited) divergence of the AEC library itself.
-#   Layer 2  shipped build (Makefile defaults: SIMD=1, fast-math, the four USE_*) compared with the std-math
+#   Layer 2  shipped build (Makefile defaults: SIMD=1, fast-math, the three USE_*) compared with the std-math
 #            C: stage replays over identical frames (open loop, max |d|) and the closed-loop chains (the
 #            adaptive filters diverge, so those rows are judged on the hops before the first divergence, by
 #            p99.9 and rms dB; the whole-run numbers are reported next to them).
@@ -143,7 +143,7 @@ mkdir -p "$WORK/logs" "$WORK/inputs" "$WORK/run"
 # --------------------------------------------------------------------------------------------
 # Builds. Each layer gets its own OBJ_ROOT / BIN_ROOT under $WORK, so nothing is written into the tree.
 #   Layer 1: SIMD=0 DEBUG=1 EXTRA_CFLAGS=-DUSE_STANDARD_MATH.
-#            DEBUG=1 is the only knob that drops NR's four USE_* optimisations.
+#            DEBUG=1 is the only knob that drops NR's three USE_* optimisations.
 #   Layer 2: Makefile defaults.
 # --------------------------------------------------------------------------------------------
 BUILD_INFO="$WORK/build_info.txt"
@@ -205,7 +205,7 @@ build_layer() { # name simd debug extra
   "$CXX" -o "$root/drv/pyc_drv_mono" "$root/drv/pyc_drv_mono.o" "$aec" "$nr" "$ac" -lm >> "$log" 2>&1 || die "link mono ($name) failed"
 
   # Build-flag assertion on the compile lines of this run's log (not possible on a reused tree).
-  local six="USE_FAST_GAIN_SMOOTHING USE_SHARED_XI_RATIO USE_OPTIMIZED_E1 USE_SINGLE_CLAMP"
+  local six="USE_FAST_GAIN_SMOOTHING USE_SHARED_XI_RATIO USE_OPTIMIZED_E1"
   local verdict="not_asserted_reused_tree" d
   if [ "$REUSE" = 0 ]; then
     verdict="ok"

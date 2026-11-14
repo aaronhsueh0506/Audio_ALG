@@ -201,10 +201,10 @@ GENERIC_MODEL_NAMES = (
 )
 
 _C_BOUNDARIES = {
-    'Align_CRUSE': 'lib/aiaec/align_cruse/align_cruse_process.c/.h',
+    'Align_CRUSE': 'none',
     'DeepVQE_S': ('lib/aiaec/deepvqe_s/deepvqe_process.c/.h+'
                   '.../deepvqe_prepost.c/.h'),
-    'CAGCRN': 'lib/aiaec/cagcrn/cagcrn_process.c/.h',
+    'CAGCRN': 'none',
 }
 
 _CONTROL_SEMANTICS = {
@@ -283,8 +283,8 @@ def _deepvqe_c_descriptor(built, outputs, frames_per_call=1) -> Dict[str, int]:
 # Models with a C pre/post class, mapped to the function that measures that
 # class's descriptor. The layout version inside it is the class header's
 # *_PREPOST_LAYOUT_VERSION (the header is the source of truth; the class test
-# pins the two). A model absent here has no C class yet -- only the shared
-# aiaec_process.c helpers -- and its artifact carries neither
+# pins the two). A model absent here has no C code at all (Align-CRUSE, CAGCRN)
+# and its artifact carries neither
 # `state_layout_version` nor `c_descriptor`: ABSENT means "nothing on the C
 # side pins this boundary", and a present value is always real JSON (a None
 # would reach the ONNX props as the string "None").

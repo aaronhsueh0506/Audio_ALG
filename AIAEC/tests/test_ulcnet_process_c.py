@@ -1,4 +1,4 @@
-"""Parity gate for the Align-ULCNet framing contract and the mask helpers.
+"""Parity gate for the Align-ULCNet framing contract, its back end and the CCM kernel.
 
 The framing is the application's, built from audiolib directly (the contract
 the weights are trained against is stated in ulcnet_process.h). A tiny
@@ -10,8 +10,9 @@ the bit-exact twin of torch.stft/istft(center=True)). One program serves both
 grids: n_fft is an argument. The fixture first builds audiolib's NE10 static lib
 the way the AEC C tests document it. The driver shares ONE FftHandle across
 analysis and synthesis (strictly sequential), the sharing contract the pipeline
-variants rely on. The mask helpers (aiaec_process.c) and the DeepVQE-S CCM
-kernel are checked against their Python statements at the same widths.
+variants rely on. The Align-ULCNet back end (ulcnet_model_io_enhance_spectrum)
+and the DeepVQE-S CCM kernel are checked against their Python statements at
+the same widths.
 
 Agreement is float-ULP class, not bit-exact (the C side uses the f32 NE10 FFT,
 torch double twiddles): tolerances sit at ~10x the ~2e-5 absolute error on
@@ -33,8 +34,6 @@ from AIAEC.dataset_gen.aec_features import sqrt_hann_window
 _THIS_DIR = os.path.dirname(os.path.abspath(__file__))
 _AIAEC_DIR = os.path.dirname(_THIS_DIR)
 _ULCNET_DIR = os.path.join(_AIAEC_DIR, '..', 'lib', 'aiaec', 'ulcnet')
-_CAGCRN_DIR = os.path.join(_AIAEC_DIR, '..', 'lib', 'aiaec', 'cagcrn')
-_ALIGN_CRUSE_DIR = os.path.join(_AIAEC_DIR, '..', 'lib', 'aiaec', 'align_cruse')
 _DEEPVQE_S_DIR = os.path.join(_AIAEC_DIR, '..', 'lib', 'aiaec', 'deepvqe_s')
 _AC_DIR = os.path.abspath(
     os.path.join(_THIS_DIR, '..', '..', '..', 'audiolib', 'common'))
@@ -264,45 +263,69 @@ def test_emission_timing_contract(driver):
     assert raw.size == (7 + 1) * 2 * BINS
 
 
-def test_ulcnet_compressed_mask_helper_matches_python(driver, audio_common_lib):
+@pytest.mark.parametrize('scalar_twin', [False, True], ids=['shipped', 'scalar_twin'])
+def test_ulcnet_back_end_matches_python(driver, audio_common_lib, scalar_twin):
+    """The shipped back end (ulcnet_model_io_enhance_spectrum over a prepared
+    state with nothing registered): the compressed error times the planar mask,
+    then the inverse signed power, against the same statement in torch.
+    scalar_twin builds the scalar twin that a NEON build replaces."""
     work, _ = driver
     cc = shutil.which('cc') or shutil.which('gcc') or shutil.which('clang')
-    source = work / 'ulc_mask.c'
-    source.write_text(r'''
+    source = work / 'ulc_back_end.c'
+    source.write_text(r"""
 #include <stdio.h>
 #include <stdlib.h>
-#include "ulcnet_mask_process.h"
+#include "ulcnet_model_io.h"
 #define BINS_MAX 513
+_Alignas(16) static unsigned char pool[1024 * 1024];
 int main(int argc, char **argv) {
-    static float in[4][BINS_MAX], out[2][BINS_MAX];
+    static float in[4][BINS_MAX], zero[BINS_MAX], out[2][BINS_MAX];
+    UlcnetGridSpec spec;
+    UlcnetGrid grid;
+    UlcnetModelIoDescriptor descriptor;
+    UlcnetModelIoMemReq req;
+    UlcnetModelIoState *state;
+    UlcnetModelIoInputs inputs;
+    UlcnetModelIoOutputs outputs;
     FILE *fi, *fo;
     int n_bins;
     if (argc != 4) return 2;
     n_bins = atoi(argv[3]);
-    if (n_bins < 1 || n_bins > BINS_MAX) return 2;
+    if (n_bins < 3 || n_bins > BINS_MAX) return 2;
     fi = fopen(argv[1], "rb"); fo = fopen(argv[2], "wb");
     if (!fi || !fo) return 3;
     for (int row = 0; row < 4; ++row)
         if (fread(in[row], sizeof(float), (size_t)n_bins, fi) != (size_t)n_bins) return 4;
-    aiaec_apply_ulcnet_compressed_mask(
-        in[0], in[1], in[2], in[3], out[0], out[1], n_bins);
+    spec.sample_rate = 16000; spec.n_fft = 2 * (n_bins - 1); spec.delay_depth = 8;
+    if (ulcnet_grid_make(&grid, &spec) != ULCNET_GRID_OK || grid.n_bins != n_bins) return 5;
+    if (ulcnet_model_io_descriptor_default(&grid, &descriptor) != 0) return 5;
+    if (ulcnet_model_io_get_mem_requirements(&descriptor, &req) != 0 || req.bytes > sizeof pool) return 5;
+    state = ulcnet_model_io_init(pool, req.bytes, &descriptor, NULL);   /* no state registered */
+    if (!state) return 5;
+    if (ulcnet_model_io_prepare(state, in[0], in[1], zero, zero, &inputs, &outputs) != 0) return 6;
+    if (outputs.spectrum_ri_elements != 2u * (size_t)n_bins) return 6;
+    for (int bin = 0; bin < n_bins; ++bin) {          /* the planar mask: real plane, then imaginary plane */
+        outputs.output[bin] = in[2][bin];
+        outputs.output[n_bins + bin] = in[3][bin];
+    }
+    if (ulcnet_model_io_enhance_spectrum(state, out[0], out[1]) != 0) return 7;
     for (int row = 0; row < 2; ++row)
         fwrite(out[row], sizeof(float), (size_t)n_bins, fo);
     fclose(fi); fclose(fo); return 0;
 }
-''')
-    executable = work / 'ulc_mask'
+""")
+    executable = work / ('ulc_back_end_scalar' if scalar_twin else 'ulc_back_end')
+    flags = ['-DSIMD_KERNELS_FORCE_SCALAR'] if scalar_twin else []
     subprocess.run(
-        [cc, '-O2', '-std=c99', '-ffp-contract=off',
+        [cc, '-O2', '-std=c11', '-ffp-contract=off', *flags,
          '-I', _ULCNET_DIR, '-I', _AC_INCLUDE, '-I', _AC_DIR,
-         str(source), os.path.join(_ULCNET_DIR, 'ulcnet_mask_process.c'),
-         os.path.join(_ULCNET_DIR, 'ulcnet_process.c'),
+         str(source), os.path.join(_ULCNET_DIR, 'ulcnet_model_io.c'),
          audio_common_lib, '-lm', '-o', str(executable)],
         check=True, capture_output=True)
     torch.manual_seed(21)
     values = torch.randn(4, BINS).clamp(-2.0, 2.0)
-    input_path = work / 'ulc_mask_in.f32'
-    output_path = work / 'ulc_mask_out.f32'
+    input_path = work / 'ulc_back_end_in.f32'
+    output_path = work / 'ulc_back_end_out.f32'
     values.numpy().astype(np.float32).tofile(input_path)
     subprocess.run([str(executable), str(input_path), str(output_path),
                     str(BINS)], check=True)
@@ -315,63 +338,6 @@ int main(int argc, char **argv) {
     ))
     expected = masked.sign() * masked.abs().pow(1.0 / exponent)
     assert (got - expected).abs().max().item() < 2e-5
-
-
-def test_shared_real_and_complex_masks_match_python(driver, audio_common_lib):
-    """Pins the host post-processing used by Align-CRUSE and CAGCRN."""
-    work, _ = driver
-    cc = shutil.which('cc') or shutil.which('gcc') or shutil.which('clang')
-    source = work / 'shared_masks.c'
-    source.write_text(r'''
-#include <stdio.h>
-#include <stdlib.h>
-#include "cagcrn_process.h"
-#include "align_cruse_process.h"
-#define BINS_MAX 513
-int main(int argc, char **argv) {
-    static float in[5][BINS_MAX], out[4][BINS_MAX];
-    FILE *fi, *fo;
-    int n_bins;
-    if (argc != 4) return 2;
-    n_bins = atoi(argv[3]);
-    if (n_bins < 1 || n_bins > BINS_MAX) return 2;
-    fi = fopen(argv[1], "rb"); fo = fopen(argv[2], "wb");
-    if (!fi || !fo) return 3;
-    for (int row = 0; row < 5; ++row)
-        if (fread(in[row], sizeof(float), (size_t)n_bins, fi) != (size_t)n_bins) return 4;
-    aiaec_apply_real_mask(in[0], in[1], in[2], out[0], out[1], n_bins);
-    aiaec_apply_complex_mask(in[0], in[1], in[3], in[4], out[2], out[3], n_bins);
-    for (int row = 0; row < 4; ++row)
-        fwrite(out[row], sizeof(float), (size_t)n_bins, fo);
-    fclose(fi); fclose(fo); return 0;
-}
-''')
-    executable = work / 'shared_masks'
-    subprocess.run(
-        [cc, '-O2', '-std=c99', '-ffp-contract=off',
-         '-I', _CAGCRN_DIR, '-I', _ALIGN_CRUSE_DIR, '-I', _AC_INCLUDE, '-I', _AC_DIR,
-         str(source), os.path.join(_CAGCRN_DIR, 'cagcrn_process.c'),
-         os.path.join(_ALIGN_CRUSE_DIR, 'align_cruse_process.c'),
-         audio_common_lib, '-lm', '-o', str(executable)],
-        check=True, capture_output=True)
-
-    torch.manual_seed(24)
-    values = torch.randn(5, BINS, dtype=torch.float32)
-    input_path = work / 'shared_masks_in.f32'
-    output_path = work / 'shared_masks_out.f32'
-    values.numpy().tofile(input_path)
-    subprocess.run([str(executable), str(input_path), str(output_path),
-                    str(BINS)], check=True)
-    got = torch.from_numpy(
-        np.fromfile(output_path, dtype=np.float32)).reshape(4, BINS)
-    real_expected = torch.stack((values[0] * values[2],
-                                 values[1] * values[2]))
-    complex_expected = torch.stack((
-        values[0] * values[3] - values[1] * values[4],
-        values[1] * values[3] + values[0] * values[4],
-    ))
-    torch.testing.assert_close(got[:2], real_expected, rtol=0, atol=0)
-    torch.testing.assert_close(got[2:], complex_expected, rtol=0, atol=0)
 
 
 def test_deepvqe_ccm_helper_matches_python(tmp_path):

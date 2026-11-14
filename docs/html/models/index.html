@@ -22,8 +22,8 @@
 <h2>AIAEC</h2><table><thead><tr><th>模型</th><th>C 入口</th><th>訊號</th></tr></thead><tbody>
 <tr><th><a href="align-ulcnet/index.html">Align-ULCNet</a></th><td><code>aiaec.h</code>（PCM、PCM → 頻譜、頻譜 → 頻譜）、頻域 core</td><td>線性 AEC 的 float 殘差、原始 far 與對齊事件 → 增強 PCM；目前沒有交付的 graph。</td></tr>
 <tr><th><a href="deepvqe-s/index.html">DeepVQE-S</a></th><td><code>aiaec.h</code>（PCM、PCM → 頻譜、頻譜 → 頻譜）、頻域 core</td><td>原始 mic 和 far PCM → 複數濾波 → 增強 PCM；只有 16 kHz／512／N=1 有登錄的 graph。</td></tr>
-<tr><th><a href="cagcrn/index.html">CAGCRN</a></th><td>mask 合成 helper</td><td>原始 mic 和 far。Python 串流與匯出，C 提供複數 mask 合成。</td></tr>
-<tr><th><a href="align-cruse/index.html">Align-CRUSE</a></th><td>mask 合成 helper</td><td>原始 mic 和 far。Python 串流與匯出，C 提供實數 mask 合成。</td></tr>
+<tr><th><a href="cagcrn/index.html">CAGCRN</a></th><td>無（沒有 C 程式碼）</td><td>原始 mic 和 far。只有 Python 串流與 ONNX 匯出。</td></tr>
+<tr><th><a href="align-cruse/index.html">Align-CRUSE</a></th><td>無（沒有 C 程式碼）</td><td>原始 mic 和 far。只有 Python 串流與 ONNX 匯出。</td></tr>
 </tbody></table>
 
 <p><a href="reference/onnx.html">ONNX 張量邊界、state、匯出與 PTQ calibration</a></p>

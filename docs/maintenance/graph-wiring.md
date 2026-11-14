@@ -8,12 +8,14 @@
 |---|---|
 | 產品、grid、`N = hop_in / (fft / 2)`、graph 與 ERB 的選擇，尾端長度 | `stream/ainr/ainr.c`、`stream/aiaec/aiaec.c` 的內部 catalog；`AinrInfo` / `AiaecInfo` 只回 `graph_path`、`trim_samples`、`queue_frames`、`tail_zero_blocks` |
 | 這一包的訊號與 head（資料指標、元素數、`[b,c,h,w]`、generation、action、`frame_reset` 控制值） | `AinrWork` / `AiaecWork`，由真實的 pre 呼叫填 |
-| 每個已交付 graph 的完整接線（訊號、head、state 的數量與 shape） | `stream/ainr/ai3_model_io_dfn2.h`、`stream/aiaec/ai3_model_io_deepvqes.h`、`stream/aiaec/ai3_model_io_alignulcnet.h`（只有標頭，`ainr.h`／`aiaec.h` 不引用）：每個登錄的 `(產品, sr, fft, N)` 一列，註明所對應的匯出器 |
+| 每個登錄的組態（含尚未交付 graph 的）的完整接線（訊號、head、state 的數量與 shape） | `stream/ainr/ai3_model_io_dfn2.h`、`stream/aiaec/ai3_model_io_deepvqes.h`、`stream/aiaec/ai3_model_io_alignulcnet.h`（只有標頭，`ainr.h`／`aiaec.h` 不引用）：每個登錄的 `(產品, sr, fft, N)` 一列，註明所對應的匯出器 |
 | 共用接線程式：列的展開、state 配對、`stream_check_ports()` 呼叫、buffer 大小、pre 到 AI3 的邊界核對 | `stream/common/ai3_model_io.h`（SDK 無關、只有標頭；`make -C stream/common test-model-io`）。sample 加 `-I stream/common -I stream/ainr`（或 `stream/aiaec`）並編譯 `stream/common/stream_bind.c` |
 | SDK 無關的 graph／裝置描述檢查器（`StreamWiring`、`StreamDeviceDesc`、`stream_check_ports()`、`STREAM_PORT_ERR_*`） | `stream/common/stream_bind.{h,c}`，只由 sample 連結；`libainr.a`、`libaiaec.a` 不含它 |
 | 記憶體需求型別 `StreamMemReq` 與 pool 工具 | `stream/common/stream_mem.h`，與接線型別無關；`ainr.h`、`aiaec.h` 只引用它 |
 
 `ainr.h` 與 `aiaec.h` 不引用 `stream_bind.h`；函式庫也沒有只為 graph 接線存在的 state 尺寸常數。缺少列或與所選 graph 不符的組態，由 sample 的啟動檢查在任何 SDK 呼叫之前拒絕。
+
+接線表登錄的組態比函式庫目前交付的 graph 多：AIAEC 的正式目錄（`aiaec.c`）現在只有 DeepVQE-S 16 kHz／fft 512／N=1 帶 graph 路徑，DeepVQE-S 其餘兩列與 Align-ULCNet 的三列有接線、沒有交付的 graph，正式建置在 init 就拒絕它們（測試目錄 `-DAIAEC_TEST_CATALOG` 才接受，見 `stream/aiaec/tests/test_aiaec_model_io.c`）。
 
 ## 規則
 

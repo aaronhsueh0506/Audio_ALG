@@ -201,7 +201,6 @@ No production quality claim is required or permitted without trained models.
 
 `AIAEC/Makefile` builds `libaiaec_prepost.a` — `ulcnet_process`,
 `ulcnet_model_io`, `ulcnet_prepost`, `ulcnet_accelerator_adapter`,
-`ulcnet_mask_process`, `cagcrn_process`, `align_cruse_process`,
 `deepvqe_process`, `deepvqe_prepost`.
 
 ```bash

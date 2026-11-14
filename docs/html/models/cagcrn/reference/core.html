@@ -23,7 +23,6 @@
 <h2 id="section-1">參考</h2>
 <ul>
 <li><a href="../index.html">CAGCRN 整合入口</a></li>
-<li><a href="../../../../../lib/aiaec/cagcrn/cagcrn_process.h">頻域 C 標頭</a></li>
 <li><a href="../../../../../AIAEC/CAGCRN/README.md">模型設定與範例</a></li>
 </ul>
 
@@ -117,7 +116,7 @@ samples。</li>
 <div class="tbl"><table>
 <tr><th>分類</th><th>名稱</th></tr>
 <tr><td><b>公開（Python）</b></td><td><code>AIAEC.CAGCRN.inference.load_model</code>、<code>CAGCRN.create_stream_state</code>、<code>CAGCRN.forward_stream</code>、<code>StreamSTFT</code>／<code>StreamISTFT</code>、<code>export_onnx.py</code>／<code>inference.py</code>（含 <code>calib</code>）／<code>export_erb_matrix.py</code> 命令列入口</td></tr>
-<tr><td><b>公開（C，可用零件）</b></td><td><code>aiaec_apply_complex_mask</code>（<code>cagcrn_process.h</code>）；audiolib <code>ac_stft_*</code>／<code>ac_istft_*</code>、<code>ac_window_build</code></td></tr>
+<tr><td><b>公開（C，可用零件）</b></td><td>本模型沒有 C 函式；audiolib <code>ac_stft_*</code>／<code>ac_istft_*</code>、<code>ac_window_build</code></td></tr>
 <tr><td><b>內部</b></td><td>底線開頭的模組（<code>_cli_common.py</code>、<code>_streaming_export.py</code>、<code>_streaming_calibration.py</code> 等）；<code>model.py</code> 的 <code>_stream_*</code> helper（<code>_stream_encoder_block</code>、<code>_stream_cata</code>、<code>_stream_tfgru</code>、<code>_stream_tfag</code>、<code>_stream_decoder_block</code>）與 <code>CrossAttentionTemporalAlignment</code>、<code>TFGRU</code>、<code>TFAG</code>、<code>ErbBandCodec</code></td></tr>
 </table></div>
 

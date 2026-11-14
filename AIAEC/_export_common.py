@@ -252,10 +252,10 @@ REQUIRED_OUTPUT_INDICES = {
 }
 
 COMPOSITION = {
-    'Align_CRUSE': 'aiaec_apply_real_mask',
-    'Align_ULCNet': 'aiaec_apply_ulcnet_compressed_mask',
+    'Align_CRUSE': 'none',
+    'Align_ULCNet': 'ulcnet_model_io_enhance_spectrum',
     'DeepVQE_S': 'deepvqe_ccm_process',
-    'CAGCRN': 'aiaec_apply_complex_mask',
+    'CAGCRN': 'none',
 }
 
 

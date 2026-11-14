@@ -1,6 +1,6 @@
 # Align-CRUSE
 
-Align-CRUSE takes unaligned microphone and far-end spectra and predicts a real mask for the microphone, preserving its phase. Use the [C mask helper and graph contract](../../docs/html/models/align-cruse/index.html) when the application supplies the framing, accelerator and recurrent state.
+Align-CRUSE takes unaligned microphone and far-end spectra and predicts a real mask for the microphone, preserving its phase. Use the [graph contract](../../docs/html/models/align-cruse/index.html) when the application supplies the framing, accelerator, mask multiply and recurrent state; the model has no C code.
 
 The project grids use FFT/window/hop 512/512/256 at 16 kHz or 1024/1024/512 at 48 kHz. The hop duration determines the frame count for the one-second delay span. Use `alignment_mode="causal_running"` for streaming. The optional `paper_global` mode needs the complete utterance.
 
