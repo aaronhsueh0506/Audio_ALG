@@ -3,6 +3,17 @@
 `Audio_ALG/pipelines`（含它建置的 `AINR`、`AIAEC` C 程式）的重要改動記錄在此，格式依
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/)。README 只寫現況，改動經過寫在這裡。
 
+## [Unreleased] — 2026-11-14 — Review round: the AIAEC front resets the AEC on a refused block; AEC test hooks never reach a pipeline build; `print-deps-sh` is not eval'd; NR flag set is four
+
+No numerics changed (the 4ch, mono and stream outputs are the ones of the previous entry).
+
+- **`aiaec_front_process_*()` / `aiaec_front_preprocess()`.** A refused block (a non-finite sample in hop h of the block, `AIAEC_FRONT_ERR_AEC`) used to leave the AEC advanced by the hops before h, so a retried or skipped block no longer matched the stream. The front now calls `aec_reset()` on that path, like the mono sample does; the next block equals a fresh front's output (`stream/aiaec/front/tests/test_front_refusal.c`, hop 0 and hop 1 of a two-hop block). `aiaec_front.h` says so.
+- **`AEC_TESTING=0` is forwarded** to every AEC sub-make of `pipelines/Makefile`, `pipelines/4ch/Makefile` and `stream/aiaec/front/Makefile`. An exported `AEC_TESTING=1` (left over from an AEC test session) used to select the archive that carries the `aec_testing_*` hooks for a pipeline build and a `make publish`; the command-line value now wins. The archive path is unchanged for the default `AEC_TESTING=0`.
+- **`lib/deps.mk print-deps-sh`** output is read one key at a time (`pipelines/scripts/test_build_isolation.sh`, `pipelines/tests/pyc_parity_pipelines.sh`) instead of `eval`; a checkout path with a space or a shell metacharacter is data. `pipelines/scripts/test_deps_env_safe.sh` (run by `make -C pipelines test`) checks it.
+- **`docs/maintenance/float_io_compare.py`** fails a `--fail-max-abs` / `--fail-audio-lsb` limit when the two runs cannot be compared (different length or channel count, empty WAV, a head dump shorter than one hop); a B run that stopped halfway used to compare its common prefix and exit 0. `pipelines/tests/test_float_io_compare.py`.
+- **NR flags.** `USE_OPTIMIZED_MIN_BUFFER` and `USE_INCREMENTAL_MIN` no longer exist in NR (one implementation); `pyc_parity_pipelines.sh` asserts the four remaining `USE_*` flags on the L2 build and none on L1.
+- `4ch_external_static` and `mono/aec_nr_res/main.c` use `aec_level_name()` and `example_cli_int_option()`; `4ch_raw` and `4ch_static` drop includes nothing in them uses.
+
 ## [Unreleased] — 2026-11-14 — `aec_nr_pipeline` refuses unknown options and malformed positionals; the denoiser-input docs agree
 
 - **CLI.** `aec_nr_pipeline` and `aec_nr_pipeline_static` ignored an unknown option and a positional `-1` and exited 0; they now print `unknown option or malformed argument '<token>'` and the usage to stderr and exit 2 (the policy of `4ch_external_static` and of the level parser), also on the `--print-mem-size` path. Every valid command line is byte-identical to before (stdout, stderr, exit code and output WAV, 10 lines on both binaries; the usage on argc < 4 and the `--print-mem-size` report); `--legacy-amin`, `--debug` and `--timing` stay accepted, as no-ops, after `--print-mem-size`. `test_mono_chain.c` has 13 unknown-argument rows per binary, the stderr text and `--print-mem-size` rows; `cli-and-example.md` and the README no longer say that unknown options are skipped.

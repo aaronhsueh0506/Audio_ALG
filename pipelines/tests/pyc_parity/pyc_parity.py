@@ -1063,7 +1063,7 @@ def main():
         if layer in cx.layers and key in cx.info:
             ok = cx.info[key].strip()
             rows.append(make_row('build.L%d.flags' % layer, layer,
-                                 'build flags of the layer (%s)' % ('std-math, NR six USE_* off, scalar' if layer == 1 else 'Makefile defaults'),
+                                 'build flags of the layer (%s)' % ('std-math, NR four USE_* off, scalar' if layer == 1 else 'Makefile defaults'),
                                  'make build log', gate=(ok == 'ok') if ok != 'not_asserted_reused_tree' else None,
                                  metrics={'assertion': ok}, note=ok))
     steps = []

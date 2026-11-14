@@ -9,7 +9,9 @@ Inputs are whatever the run left behind; every part is optional and the report o
                         (names ending in us/ms or starting with io_, ai3_, conv, wall) and the lines that print
                         scale_ratio / zero_point of the ports are compared
 No tolerance is built in: derive it from the first measurement. --fail-max-abs / --fail-audio-lsb turn the
-corresponding number into an exit status when a limit has been chosen.
+corresponding number into an exit status when a limit has been chosen. Runs that cannot be compared (a different
+length or channel count, an empty WAV, a head dump shorter than one hop) fail such a limit; without a limit they
+are reported only.
 
 Usage:
   python3 -I float_io_compare.py --audio-a a.wav --audio-b b.wav --heads-a a.f32 --heads-b b.f32 \
@@ -45,13 +47,15 @@ def read_wav(path):
 def audio_report(pa, pb):
     (a, ca), (b, cb) = read_wav(pa), read_wav(pb)
     print("== final audio ==")
+    incomparable = False
     if ca != cb or len(a) != len(b):
         print("  length/channels differ: A %d samples x%d, B %d samples x%d (compared over the common part)"
               % (len(a) // ca, ca, len(b) // cb, cb))
+        incomparable = True
     n = min(len(a), len(b))
     if n == 0:
         print("  empty")
-        return 0.0
+        return float("inf")
     mx = 0
     se = sa = 0.0
     for i in range(n):
@@ -62,7 +66,7 @@ def audio_report(pa, pb):
     rms_d = math.sqrt(se / n)
     snr = 10.0 * math.log10(sa / se) if se > 0 and sa > 0 else float("inf")
     print("  samples %d  max |A-B| %d LSB  rms(A-B) %.3f LSB  SNR(A vs A-B) %.1f dB" % (n, mx, rms_d, snr))
-    return float(mx)
+    return float("inf") if incomparable else float(mx)
 
 
 def read_f32(path):
@@ -81,10 +85,15 @@ def head_report(pa, pb, elems):
     a, b = read_f32(pa), read_f32(pb)
     print("== head tensors ==")
     n = min(len(a), len(b))
+    incomparable = n == 0
     if len(a) != len(b):
         print("  size differs: A %d floats, B %d floats (compared over the common part)" % (len(a), len(b)))
+        incomparable = True
     per_hop = sum(elems) if elems else n
     hops = n // per_hop if per_hop else 0
+    if hops == 0:
+        print("  fewer than one whole hop in the common part")
+        incomparable = True
     ranges = []
     if elems:
         off = 0
@@ -113,7 +122,7 @@ def head_report(pa, pb, elems):
         rel = math.sqrt(se / sa) if sa > 0 else (0.0 if se == 0 else float("inf"))
         print("  %-22s hops %d  max|A-B| %.6g  rel RMS %.6g  non-finite A %d B %d" % (name, hops, mx, rel, bad_a, bad_b))
         worst = max(worst, mx, float("inf") if bad_b > bad_a else 0.0)   # a new non-finite value is never within a limit
-    return worst
+    return float("inf") if incomparable else worst
 
 
 def parse_log(path):

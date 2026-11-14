@@ -12,7 +12,6 @@
  * Numbers are whole decimals. Exit: 0 done, 1 refused config or failed run, 2 command line. */
 
 #include <math.h>
-#include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -22,8 +21,6 @@
 #include "array_sample_beam.h"
 #include "array_sample_driver.h"
 #include "array_sample_unit.h"
-#include "audio_stft.h"
-#include "utility/mem_align.h"
 #include "utility/simd_kernel_nn.h"   /* skn_all_finite_f32 */
 
 static void fill_hop(float* microphones, float* reference, int hop,

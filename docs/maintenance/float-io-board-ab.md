@@ -26,7 +26,7 @@ python3 -I docs/maintenance/float_io_compare.py \
     --log-a a.log --log-b b.log
 ```
 
-`--head-elems` 是每拍各個 head 的元素數（DFN2 full 16 kHz/256 N=1 為 `24,960,1`；Align-ULCNet 為 `2*BINS`，DeepVQE-S 為 `BINS*18`）。腳本印出：兩邊的模式行、時間 bucket 的 B/A 比值（`io_in`、`io_out`、`ai3_*`、`conv`、`wall` 等名稱以 `us`／`ms` 結尾或前綴相符者）、`scale_ratio`／`zero_point` 的原文行、每個 head 的最大絕對差與相對 RMS、非有限值個數、最終音訊的最大差（LSB）、差異的 RMS 與 SNR。選定容許誤差後可用 `--fail-max-abs`、`--fail-audio-lsb` 變成退出碼；B 比 A 多出的 NaN／Inf 一律不算在限內。
+`--head-elems` 是每拍各個 head 的元素數（DFN2 full 16 kHz/256 N=1 為 `24,960,1`；Align-ULCNet 為 `2*BINS`，DeepVQE-S 為 `BINS*18`）。腳本印出：兩邊的模式行、時間 bucket 的 B/A 比值（`io_in`、`io_out`、`ai3_*`、`conv`、`wall` 等名稱以 `us`／`ms` 結尾或前綴相符者）、`scale_ratio`／`zero_point` 的原文行、每個 head 的最大絕對差與相對 RMS、非有限值個數、最終音訊的最大差（LSB）、差異的 RMS 與 SNR。選定容許誤差後可用 `--fail-max-abs`、`--fail-audio-lsb` 變成退出碼；B 比 A 多出的 NaN／Inf 一律不算在限內；長度或聲道數不同、空的 WAV、短於一個 hop 的 head 傾印（B 跑到一半停掉的典型樣子）在設了限值時同樣視為失敗。
 
 5. 判斷：
    - 100 拍以上的運行中 B 的 head 沒有非有限值，`state_check` 通過，沒有該拍被函式庫拒絕（generation 沒有無故前進）。

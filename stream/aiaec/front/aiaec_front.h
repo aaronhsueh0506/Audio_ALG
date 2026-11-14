@@ -55,7 +55,7 @@ AiaecFront *aiaec_front_init(void *pool, size_t pool_bytes, const AiaecConfig *g
 
 /* One block, mic and far int16 of grid.hop_in samples each: the linear AEC over the model hops, the events, then
  * aiaec_preprocess() (same returns and work). ctx: same AiaecConfig, no block open. A refusal zeroes work, leaves AEC and ctx
- * untouched and owes no postprocess; success owes one. AIAEC_FRONT_ERR_AEC owes none, but the AEC may have advanced. */
+ * untouched and owes no postprocess; success owes one. AIAEC_FRONT_ERR_AEC owes none; the AEC has been reset. */
 int aiaec_front_preprocess(AiaecFront *f, AiaecCtx *ctx, const int16_t *mic, const int16_t *far,
                            AiaecWork *work);
 

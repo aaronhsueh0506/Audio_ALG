@@ -33,19 +33,6 @@
 #include "utility/mem_align.h"
 #include "utility/simd_kernel_nn.h"   /* skn_all_finite_f32 */
 
-static const char* level_name(AecLevel level) {
-    switch (level) {
-        case AEC_LEVEL_MILD:       return "mild";
-        case AEC_LEVEL_AGGRESSIVE: return "aggressive";
-        case AEC_LEVEL_NO_FLOOR:   return "no_floor";
-        default:                   return "balanced";
-    }
-}
-
-static const char* nr_level_name(AnrLevel level) {
-    return anr_nr_level_name(level);
-}
-
 static const char* backend_id_name(uint32_t backend_id) {
     switch (backend_id) {
         case AEC_BACKEND_NE10: return "ne10";
@@ -212,12 +199,7 @@ static void fill_hop(float* microphones, float* reference,
 static int int_option(int argc, char* argv[], int* i, int* value) {
     const char* name = argv[*i];
     const char* text = example_cli_option_value(argc, argv, i, argv[0]);
-    if (!text) return 2;
-    if (example_cli_parse_int(text, value) != 0) {
-        fprintf(stderr, "%s: %s '%s' is not an integer\n", argv[0], name, text);
-        return 2;
-    }
-    return 0;
+    return text ? example_cli_int_option(name, text, value, argv[0]) : 2;
 }
 
 int main(int argc, char* argv[]) {
@@ -296,7 +278,7 @@ int main(int argc, char* argv[]) {
            legacy ? ", legacy min-only" : "");
     /* tests/test_cli_strict.sh matches this line. */
     printf("  AEC preset: %s   NR preset: %s   CNG: %s\n",
-           level_name(level), nr_level_name(nr_level),
+           aec_level_name(level), anr_nr_level_name(nr_level),
            no_cng ? "off" : "on");
     printf("  Beamformer: fixed equal weights (smoke adapter only)\n\n");
 

@@ -61,16 +61,6 @@
  * the reciprocal is a power of two, so the multiply is exact. */
 #define PSD_SCALE_INV (1.0f / (32768.0f * 32768.0f))
 
-/* The digits of a level option are the enum values; the names are for the banner only. */
-static const char* level_name(AecLevel level) {
-    switch (level) {
-        case AEC_LEVEL_MILD:       return "mild";
-        case AEC_LEVEL_AGGRESSIVE: return "aggressive";
-        case AEC_LEVEL_NO_FLOOR:   return "no_floor";
-        default:                   return "balanced";
-    }
-}
-
 /* --nr-level is the option; --nr-preset is the same option under its earlier name. */
 static int is_nr_level_option(const char* arg) {
     return strcmp(arg, "--nr-level") == 0 || strcmp(arg, "--nr-preset") == 0;
@@ -613,7 +603,7 @@ int main(int argc, char* argv[]) {
            AEC_NR_POOL_SPLIT ? "split pools" : "one pool", legacy ? ", no residual-echo prior" : "");
     printf("  Input:  %s (%.2fs)\n", mic_path, (float)n_samples / sr);
     printf("  AEC preset: %s   NR preset: %s   NR: %s   RES: %s   CNG: %s\n\n",
-           level_name(level), anr_nr_level_name(nr_level), !no_nr ? "on" : "off",
+           aec_level_name(level), anr_nr_level_name(nr_level), !no_nr ? "on" : "off",
            !no_res ? "on" : "off", !no_cng ? "on" : "off");
 
     /* Size the pool, then allocate it (a host stand-in for a platform memory block; a board

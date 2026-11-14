@@ -31,9 +31,10 @@
 #                                          # exist, the lib/aec and lib/nr gitlinks against the same
 #                                          # pins (the step-5 "gitlink migration" readiness gate)
 #   make -f lib/deps.mk print-deps-sh     # emit the four resolved directories as
-#                                          # `eval`-able `KEY=value` shell assignments, so a shell
-#                                          # script resolves them the same way a Makefile does
-#                                          # instead of reimplementing the resolution itself
+#                                          # `KEY=value` lines (read one key at a time with sed, never
+#                                          # eval'd: a directory name is data), so a shell script
+#                                          # resolves them the same way a Makefile does instead of
+#                                          # reimplementing the resolution itself
 
 # This file's own absolute directory, computed before the three .pin files are included: an
 # `include` changes $(MAKEFILE_LIST)'s last word to the included file, so capturing

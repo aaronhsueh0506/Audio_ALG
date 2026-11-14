@@ -159,8 +159,10 @@ static int run(AiaecFront *f, const float *mic, const float *far, AiaecFrontOut 
         if (aec_process_linear(f->aec, mic + (size_t)h * f->hop, far + (size_t)h * f->hop) != AEC_OK ||
             aec_process_residual(f->aec, NULL) != AEC_OK ||
             aec_get_residual(f->aec, &rv) != AEC_OK || aec_get_linear(f->aec, &lv) != AEC_OK ||
-            !rv.formed_hop)
+            !rv.formed_hop) {
+            aec_reset(f->aec);       /* an earlier hop of this block may already have advanced it */
             return AIAEC_FRONT_ERR_AEC;
+        }
         memcpy(f->formed + (size_t)h * f->hop, rv.formed_hop, (size_t)f->hop * sizeof(float));
         f->events[h] = aiaec_front_event_from_delay_state((int)lv.delay_state);
     }

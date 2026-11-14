@@ -436,7 +436,8 @@ LINK = $(CXX)
 # assertion in the FORCE rule would fail.
 # PROFILE is read by AEC's Makefile only (NR's and audiolib's ignore it); it rides in the one list all three producers get.
 FWD = BACKEND=$(BACKEND) SIMD=$(SIMD) PROFILE=$(PROFILE) WERROR=$(WERROR) CC='$(CC)' CXX='$(CXX)' EXTRA_CFLAGS='$(EXTRA_CFLAGS)' NO_STDIO=$(NO_STDIO) TOOLCHAIN_CHECK=$(TOOLCHAIN_CHECK) DEBUG=$(DEBUG)
-AEC_FWD = $(FWD) AEC_NO_ARRAY=$(AEC_NO_ARRAY)
+# AEC_TESTING=0: an exported AEC_TESTING=1 must not select the test-hook archive for a pipeline build or a publish.
+AEC_FWD = $(FWD) AEC_NO_ARRAY=$(AEC_NO_ARRAY) AEC_TESTING=0
 
 ifeq ($(COMMON_LIB),)
 .PHONY: all test test_target_abi target-abi-test libs _publish_impl aec_nr_pipeline aec_nr_pipeline_static mono_alignulcnet mono_aec_dfn_res test_mono_chain test_mono_ulcnet test_ulcnet_accelerator_adapter test_dfn_res_stage test_dfn_rate_bridge test_mono_dfn test_array_sample_post test_readme_flow test_dfn_hop test_ulcnet_nn_stage example-adapter libaudio_pipeline_dfn.a
@@ -696,6 +697,7 @@ test: $(BIN_DIR)/test_mono_chain $(BIN_DIR)/aec_nr_pipeline $(BIN_DIR)/aec_nr_pi
 	out="$$("$(abspath $(BIN_DIR))/mono_aec_dfn_res" --ai-sample-rate 48000 --ai-fft-size 1024 --sample-rate 48000)" && printf '%s\n' "$$out" | grep -q "model grid 48000 Hz / FFT 1024 (n_erb 32, df_bins 96, lookahead 1/1), the stage on the host grid"
 	sh scripts/test_cli_exit_codes.sh mono_aec_dfn_res "$(abspath $(BIN_DIR))/mono_aec_dfn_res"
 	sh scripts/test_cli_exit_codes.sh mono_alignulcnet "$(abspath $(BIN_DIR))/mono_alignulcnet"
+	bash scripts/test_deps_env_safe.sh
 
 # example-adapter: build + RUN the REFERENCE ONLY
 # board-adapter host simulation (example_board_adapter.c) standalone -- same
@@ -948,10 +950,10 @@ audit-no-stdio-stack:
 	@bd="$$($(MAKE) -s --no-print-directory BACKEND=$(BACKEND) NO_STDIO=1 print-bin-dir)"; \
 	 dfnpl="$$bd/libaudio_pipeline_dfn.a"; \
 	 ac="$$($(MAKE) -s --no-print-directory -C $(COMMON_DIR) BACKEND=$(BACKEND) SIMD=$(SIMD) WERROR=$(WERROR) CC='$(CC)' CXX='$(CXX)' EXTRA_CFLAGS='$(EXTRA_CFLAGS)' NO_STDIO=1 print-lib-path)"; \
-	 aec="$$($(MAKE) -s --no-print-directory -C $(AEC_DIR) BACKEND=$(BACKEND) SIMD=$(SIMD) WERROR=$(WERROR) CC='$(CC)' CXX='$(CXX)' EXTRA_CFLAGS='$(EXTRA_CFLAGS)' NO_STDIO=1 AEC_NO_ARRAY=$(AEC_NO_ARRAY) COMMON_DIR=$(abspath $(COMMON_DIR)) COMMON_LIB="$$ac" print-lib-path)"; \
+	 aec="$$($(MAKE) -s --no-print-directory -C $(AEC_DIR) BACKEND=$(BACKEND) SIMD=$(SIMD) WERROR=$(WERROR) CC='$(CC)' CXX='$(CXX)' EXTRA_CFLAGS='$(EXTRA_CFLAGS)' NO_STDIO=1 AEC_NO_ARRAY=$(AEC_NO_ARRAY) AEC_TESTING=0 COMMON_DIR=$(abspath $(COMMON_DIR)) COMMON_LIB="$$ac" print-lib-path)"; \
 	 nr="$$($(MAKE) -s --no-print-directory -C $(NR_DIR) BACKEND=$(BACKEND) SIMD=$(SIMD) WERROR=$(WERROR) CC='$(CC)' CXX='$(CXX)' EXTRA_CFLAGS='$(EXTRA_CFLAGS)' NO_STDIO=1 COMMON_DIR=$(abspath $(COMMON_DIR)) COMMON_LIB="$$ac" print-lib-path)"; \
 	 $(MAKE) --no-print-directory -C $(COMMON_DIR) BACKEND=$(BACKEND) SIMD=$(SIMD) WERROR=$(WERROR) CC='$(CC)' CXX='$(CXX)' EXTRA_CFLAGS='$(EXTRA_CFLAGS)' NO_STDIO=1 lib >/dev/null; \
-	 $(MAKE) --no-print-directory -C $(AEC_DIR) BACKEND=$(BACKEND) SIMD=$(SIMD) WERROR=$(WERROR) CC='$(CC)' CXX='$(CXX)' EXTRA_CFLAGS='$(EXTRA_CFLAGS)' NO_STDIO=1 AEC_NO_ARRAY=$(AEC_NO_ARRAY) COMMON_DIR=$(abspath $(COMMON_DIR)) COMMON_LIB="$$ac" lib >/dev/null; \
+	 $(MAKE) --no-print-directory -C $(AEC_DIR) BACKEND=$(BACKEND) SIMD=$(SIMD) WERROR=$(WERROR) CC='$(CC)' CXX='$(CXX)' EXTRA_CFLAGS='$(EXTRA_CFLAGS)' NO_STDIO=1 AEC_NO_ARRAY=$(AEC_NO_ARRAY) AEC_TESTING=0 COMMON_DIR=$(abspath $(COMMON_DIR)) COMMON_LIB="$$ac" lib >/dev/null; \
 	 $(MAKE) --no-print-directory -C $(NR_DIR) BACKEND=$(BACKEND) SIMD=$(SIMD) WERROR=$(WERROR) CC='$(CC)' CXX='$(CXX)' EXTRA_CFLAGS='$(EXTRA_CFLAGS)' NO_STDIO=1 COMMON_DIR=$(abspath $(COMMON_DIR)) COMMON_LIB="$$ac" lib >/dev/null; \
 	 pat='^_?(fprintf|vfprintf|printf|puts|fputs|stderr|__stderrp|fputc|fwrite)$$'; \
 	 for lib in "$$dfnpl" "$$aec" "$$nr" "$$ac"; do \

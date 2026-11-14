@@ -45,7 +45,7 @@ endif
 # keyed archive path equals the one resolved here.
 AEC_FWD = BACKEND=$(BACKEND) SIMD=$(SIMD) PROFILE=$(PROFILE) WERROR=$(WERROR) CC='$(CC)' CXX='$(CXX)' \
 	EXTRA_CFLAGS='$(EXTRA_CFLAGS)' NO_STDIO=$(NO_STDIO) TOOLCHAIN_CHECK=$(TOOLCHAIN_CHECK) DEBUG=$(DEBUG) \
-	COMMON_DIR=$(abspath $(COMMON_DIR)) COMMON_LIB="$(COMMON_LIB)"
+	AEC_TESTING=0 COMMON_DIR=$(abspath $(COMMON_DIR)) COMMON_LIB="$(COMMON_LIB)"
 PARENT_FWD = BACKEND=$(BACKEND) SIMD=$(SIMD) $(TOOLCHAIN_FWD)
 
 ifneq ($(MAKECMDGOALS),clean)
@@ -72,7 +72,7 @@ ALIGN_SOURCES := ../aiaec.c ../../../lib/aiaec/ulcnet/ulcnet_model_io.c ../../..
 ALIGN_CPPFLAGS := -DAIAEC_ENABLE_DEEPVQE_S=0 -DAIAEC_ENABLE_ALIGN_ULCNET=1 -DAIAEC_PRODUCT_MODEL_ID=10 \
 	-DAIAEC_TEST_CATALOG -I../deepvqe_s -I../../../lib/aiaec/deepvqe_s -I../ulcnet -I../../../lib/aiaec/ulcnet
 
-.PHONY: all lib print-lib-path test test-front-events test-front-scene test-front-block test-front-oneshot \
+.PHONY: all lib print-lib-path test test-front-events test-front-scene test-front-block test-front-oneshot test-front-refusal \
 	audit-libaiaec-no-aec clean _cfg_guard _aec_lib
 
 all: lib
@@ -122,6 +122,9 @@ test-front-block: $(LIB) _aec_lib $(ALIGN_SOURCES) ../aiaec.h ../aiaec_product.h
 test-front-oneshot: $(LIB) _aec_lib $(ALIGN_SOURCES) ../aiaec.h ../aiaec_product.h
 	$(call BUILD_TEST,test_front_oneshot,$(ALIGN_CPPFLAGS),$(ALIGN_SOURCES))
 
+test-front-refusal: $(LIB) _aec_lib
+	$(call BUILD_TEST,test_front_refusal,,)
+
 # libaiaec.a must not contain or reference any symbol the AEC archive defines (checked for each
 # AIAEC_MODEL variant). The same check run against libaiaec_front.a must find some: otherwise the
 # gate could not fail.
@@ -146,7 +149,7 @@ audit-libaiaec-no-aec: $(LIB) _aec_lib
 	done; \
 	echo "audit-libaiaec-no-aec: PASS (control: libaiaec_front.a overlaps the AEC archive on $$(echo "$$front_hits" | wc -l | tr -d ' ') symbols)"
 
-test: test-front-events test-front-scene test-front-block test-front-oneshot audit-libaiaec-no-aec
+test: test-front-events test-front-scene test-front-block test-front-oneshot test-front-refusal audit-libaiaec-no-aec
 
 clean:
 	rm -rf "$(BUILD_DIR)"

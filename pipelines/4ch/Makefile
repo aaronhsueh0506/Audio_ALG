@@ -178,6 +178,8 @@ FWD = BACKEND=$(BACKEND) SIMD=$(SIMD) PROFILE=$(PROFILE) WERROR=$(WERROR) \
       CC='$(CC)' CXX='$(CXX)' AR='$(AR)' RANLIB='$(RANLIB)' \
       EXTRA_CFLAGS='$(EXTRA_CFLAGS)' NO_STDIO=$(NO_STDIO) \
       TOOLCHAIN_CHECK=$(TOOLCHAIN_CHECK) DEBUG=$(DEBUG)
+# AEC_TESTING=0: an exported AEC_TESTING=1 must not select the test-hook archive.
+AEC_FWD = $(FWD) AEC_TESTING=0
 
 # Producer scope. Each goal is dispatched on its own and resolves only the producers in its
 # scope (PRODUCERS_ALL unless a NEEDS_<goal> line below narrows it); audiolib's libaudio_common.a
@@ -214,7 +216,7 @@ goal_needs = $(if $(filter undefined,$(origin NEEDS_$(call goal_scope,$(1)))),$(
 # Resolve the producers of the goal's scope before constructing this consumer's CFG identity.
 ifeq ($(COMMON_LIB),)
 .PHONY: $(DISPATCH_GOALS)
-RESOLVE_AEC = aec="$$($(MAKE) -s --no-print-directory -C $(AEC_DIR) $(FWD) COMMON_DIR=$(abspath $(COMMON_DIR)) COMMON_LIB="$$ac" print-lib-path)"; \
+RESOLVE_AEC = aec="$$($(MAKE) -s --no-print-directory -C $(AEC_DIR) $(AEC_FWD) COMMON_DIR=$(abspath $(COMMON_DIR)) COMMON_LIB="$$ac" print-lib-path)"; \
 	 test -n "$$aec" || { echo "FATAL: cannot resolve AEC archive" >&2; exit 1; };
 RESOLVE_NR = nr="$$($(MAKE) -s --no-print-directory -C $(NR_DIR) $(FWD) COMMON_DIR=$(abspath $(COMMON_DIR)) COMMON_LIB="$$ac" print-lib-path)"; \
 	 test -n "$$nr" || { echo "FATAL: cannot resolve NR archive" >&2; exit 1; };
@@ -494,7 +496,7 @@ $(COMMON_LIB): FORCE
 
 ifneq ($(AEC_LIB),)
 $(AEC_LIB): FORCE
-	+$(MAKE) -C $(AEC_DIR) $(FWD) COMMON_DIR=$(abspath $(COMMON_DIR)) COMMON_LIB=$(COMMON_LIB) lib
+	+$(MAKE) -C $(AEC_DIR) $(AEC_FWD) COMMON_DIR=$(abspath $(COMMON_DIR)) COMMON_LIB=$(COMMON_LIB) lib
 	@test -f '$@' || { echo "FATAL: AEC did not produce $@" >&2; exit 1; }
 endif
 

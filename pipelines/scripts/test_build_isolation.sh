@@ -126,7 +126,11 @@ PIPE_DIR="$(cd "$SCRIPT_DIR/.." && pwd)"
 AUDIO_ALG_ROOT="$(cd "$PIPE_DIR/.." && pwd)"
 # The producers are where lib/deps.mk resolves them (an AEC_DIR / NR_DIR / AUDIOLIB_DIR / COMMON_DIR in the
 # environment wins, as for every Makefile), not the lib/aec and lib/nr gitlink worktrees.
-eval "$(make -s --no-print-directory -f "$AUDIO_ALG_ROOT/lib/deps.mk" print-deps-sh)"
+DEPS_SH="$(make -s --no-print-directory -f "$AUDIO_ALG_ROOT/lib/deps.mk" print-deps-sh)"
+# KEY=value lines read one key at a time, never eval'd: a directory name is data.
+for key in AEC_DIR NR_DIR AUDIOLIB_DIR COMMON_DIR; do
+    printf -v "$key" '%s' "$(printf '%s\n' "$DEPS_SH" | sed -n "s/^$key=//p")"
+done
 COMMON_DIR="$(cd "$COMMON_DIR" && pwd)"
 AUDIOLIB_DIR="$(cd "$AUDIOLIB_DIR" && pwd)"
 AEC_DIR="$(cd "$AEC_DIR" && pwd)"
