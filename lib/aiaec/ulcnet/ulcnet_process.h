@@ -13,8 +13,6 @@
 extern "C" {
 #endif
 
-#define ULCNET_COMPRESSION_EXP ULCNET_MODEL_IO_COMPRESSION_EXP
-
 /* A nonzero infer return or non-finite output fails open to the linear error: the AEC analysis seam
  * (AecResidualView.formed_hop; 4ch beam.spectrum), never base_spec; on a guard hop base_spec can exceed the
  * capture. With infer, io_descriptor is required (NULL only for the memset-zero identity model), checked against the

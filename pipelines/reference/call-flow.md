@@ -39,22 +39,22 @@ stays explicitly selectable.
 
 | Rate | AEC | Synthesis (`AcIstft`) | NR | Gain/spectrum buffers | **Total** |
 |------|-----|-----------|-----|---------------|-----------|
-| **8 kHz** | 249,856 B | 10,320 B | 28,784 B | 2,096 B | **291,056 B (284.2 KB)** |
-| **16 kHz (default, 256/128)** | 343,760 B | 10,320 B | 45,344 B | 2,096 B | **401,520 B (392.1 KB)** |
-| **16 kHz (alt, 512/256)** | 456,640 B | 19,792 B | 56,432 B | 4,144 B | **537,008 B (524.4 KB)** |
-| **48 kHz** | 1,078,560 B | 38,736 B | 144,576 B | 8,240 B | **1,270,112 B (1,240.3 KB)** |
+| **8 kHz** | 211,552 B | 10,320 B | 28,784 B | 2,096 B | **252,752 B (246.8 KB)** |
+| **16 kHz (default, 256/128)** | 239,920 B | 10,320 B | 45,344 B | 2,096 B | **297,680 B (290.7 KB)** |
+| **16 kHz (alt, 512/256)** | 352,288 B | 19,792 B | 56,432 B | 4,144 B | **432,656 B (422.5 KB)** |
+| **48 kHz** | 776,224 B | 38,736 B | 144,576 B | 8,240 B | **967,776 B (945.1 KB)** |
 
-The AEC column is owned by `lib/aec/docs/c_user_manual_zh_TW_01_lifecycle.md` §4 — re-measure from
+The AEC column is owned by `AEC/docs/reference/lifecycle.md` (§4, the pool-size section) — re-measure from
 there rather than editing it here, and always prefer the values `aec_get_mem_size()`,
 `anr_get_mem_size()` and `ac_istft_get_mem_size()` return at runtime. `--no-nr` drops the NR column;
 `--aec-only` is the AEC column alone. The synthesis borrows the AEC's synthesis window (`aec_synthesis_window()`), so its column carries no window table.
 
-> filter_length 是 ms-derived（52 ms；≥44.1 kHz 用 64 ms → 48 kHz 為 3072
-> taps、6 partitions at hop=512），加長會等比增加 AEC 記憶體；記憶體吃緊時先縮
-> `filter_length`（外部參數）。NR 的 `L` 是內部欄位且決定 pool 版面：要縮它就得自己組
+> AEC 的濾波器長度由取樣率決定（52 ms；≥44.1 kHz 用 64 ms → 48 kHz 為 3072
+> taps、6 partitions at hop=512），不是 `AecConfig` 欄位；記憶體吃緊時調 `delay_num_filters`
+> （MATCHED，每少一個單支省 11,264 B、48 kHz 為 23,552 B）或改 `delay_mode`。NR 的 `L` 是內部欄位且決定 pool 版面：要縮它就得自己組
 > `AnrConfig`（先 `anr_config_for_level_grid()` 再改 `L`）、重新 `anr_get_mem_size()`，
 > 該實例之後不再等於裸 level 組態，`anr_set_level()` 會被拒（見 [call sequence](#call-flow) 一節）。
-> `n_partitions` 由 `filter_length` 與 hop 推導，不建議手填。三個 rate 各自依 grid 的 hop=fft_size/2
+> `n_partitions` 由濾波器長度與 hop 推導（函式庫內部）。三個 rate 各自依 grid 的 hop=fft_size/2
 > 規則自動推導，不是統一的 10 ms 規則；16 kHz 另外還有一個可選的
 > 512/256 grid（見上表）。靜態範例的 AEC、NR 與合成 config 都由同一個
 > `AecSignalGrid`（`derive_lane()` 的輸出，即 `aec_resolve_signal_grid()` 的結果）導出，三方格點因此一致。
@@ -62,7 +62,7 @@ there rather than editing it here, and always prefer the values `aec_get_mem_siz
 ## Call flow
 
 Every application analyses once per hop. The front end returns its context spectra as one borrowed
-view: `AecResidualView` ([`aec.h`](../../lib/aec/c_impl/include/aec.h); read with `aec_get_residual()` after
+view: `AecResidualView` ([`aec.h`](../../../AEC/c_impl/include/aec.h); read with `aec_get_residual()` after
 `aec_process_linear()` and `aec_process_residual()`) for the mono `Aec`, and the same `AecResidualView` of the 4-channel array (`AecConfig.n_mics = 4`; filled
 by `aec_process_residual(&AecBeam)`) for the 4-channel flow. Each later stage is a plain function over that view, and the
 application writes the combination itself; each example `main` shows it (`mono_form()` in
@@ -223,10 +223,10 @@ AcIstft* istft = ac_istft_init(pool + ALIGN16(aec_b) + ALIGN16(nr_b), sy_b, &sy_
   the `Aec`). Gain vectors the chain needs (the extra gain, the NR prior scratch, the
   spectrum buffer) are `n_freqs` floats / bins each, also from the caller's block.
 - The 4-channel array is one `Aec` pool (`aec_get_mem_requirements()`): the `Aec` structure, the four lanes, the shared `DelayAec` (MATCHED only),
-  the alignment ring, the fusion buffers and the gain stage: 720,352 B at 16 kHz/256 (MATCHED, `AEC_RESIDUAL_FULL`; 616,912 B with
-  `AEC_RESIDUAL_STATE`, `test_target_abi`), of which the four lanes are 588,800 B (4 x 147,200 B).
-  `4ch_external_static --print-mem-size` prints lanes (`AEC x4`) 588,800 B and front end (the rest of the array pool) 131,552 B
-  at 16 kHz/256 (48 kHz/1024: 2,141,248 B and 329,280 B). The sample beam helper
+  the alignment ring, the fusion buffers and the gain stage: 701,280 B at 16 kHz/256 (MATCHED, `AEC_RESIDUAL_FULL`; 595,744 B with
+  `AEC_RESIDUAL_STATE`, `test_target_abi`), of which the four lanes are 571,520 B (4 x 142,880 B).
+  `4ch_external_static --print-mem-size` prints lanes (`AEC x4`) 571,520 B and front end (the rest of the array pool) 129,760 B
+  at 16 kHz/256 (48 kHz/1024: 2,074,816 B and 336,704 B). The sample beam helper
   (SRP-PHAT, BF, scratch) is one more block. The post-beam stages are separate blocks sized by their own queries
   (`anr_get_mem_size()`, `ac_istft_get_mem_size()`),
   and a neural stage (`ulcnet_nn_stage_mem_size(&grid)` plus the application's `AcStft` / `AcIstft`, `dfn_rate_bridge_get_mem_requirements()`)

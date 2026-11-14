@@ -88,7 +88,7 @@ static int derive_lane(int sample_rate, int fft_size, AecLevel level, int aec_on
     aec_config_from_level(aec_cfg, level, sample_rate);
     aec_cfg->fft_size = grid->fft_size;
     aec_cfg->delay_mode = AEC_DELAY_MATCHED;
-    aec_cfg->delay_num_filters = DA_NUM_FILTERS;
+    aec_cfg->delay_num_filters = AEC_DELAY_NUM_FILTERS_MAX;
     aec_cfg->fixed_delay_samples = -1;
     aec_cfg->residual = aec_only ? AEC_RESIDUAL_STATE : AEC_RESIDUAL_FULL;
     return 0;

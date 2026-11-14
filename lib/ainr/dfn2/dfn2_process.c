@@ -100,51 +100,6 @@ static inline void df_common_features(
 #pragma GCC diagnostic pop
 #endif
 
-/* Scalar twin of a NEON kernel; it is the whole kernel in a SIMD=0 build. */
-#define DFN2_TWIN static inline __attribute__((unused))
-
-/* erb_inv: caller-loaded matrix, band-major [n_bands][n_bins]; the inner loop
- * runs over the band's nonzero bins, or the whole row for a non-finite gain. */
-DFN2_TWIN void df_common_expand_mask_scalar(const float *band_gain,
-                                            const float *erb_inv,
-                                            const uint16_t *inv_lo,
-                                            const uint16_t *inv_hi,
-                                            int n_bins, int n_bands,
-                                            float *bin_gain) {
-    skn_erb_expand_mask_f32_scalar(band_gain, erb_inv, inv_lo, inv_hi, n_bins,
-                                   n_bands, bin_gain);
-}
-
-#if DF_COMMON_HAVE_NEON
-/* The same sums four bins per step. A band's last step may run up to three bins
- * past its span, where the weights are zero (a non-finite gain takes the whole
- * row, as in the twin). */
-static inline void df_common_expand_mask_neon(const float *band_gain,
-                                              const float *erb_inv,
-                                              const uint16_t *inv_lo,
-                                              const uint16_t *inv_hi,
-                                              int n_bins, int n_bands,
-                                              float *bin_gain) {
-    skn_erb_expand_mask_f32_neon(band_gain, erb_inv, inv_lo, inv_hi, n_bins,
-                                 n_bands, bin_gain);
-}
-#endif
-
-static inline void df_common_expand_mask(const float *band_gain,
-                                         const float *erb_inv,
-                                         const uint16_t *inv_lo,
-                                         const uint16_t *inv_hi,
-                                         int n_bins, int n_bands,
-                                         float *bin_gain) {
-#if DF_COMMON_HAVE_NEON
-    df_common_expand_mask_neon(band_gain, erb_inv, inv_lo, inv_hi, n_bins,
-                               n_bands, bin_gain);
-#else
-    df_common_expand_mask_scalar(band_gain, erb_inv, inv_lo, inv_hi, n_bins,
-                                 n_bands, bin_gain);
-#endif
-}
-
 /* enh = noisy*lim + enh*mix, expressed as sk_ema_f32 (state=enh, x=noisy,
  * alpha=mix, beta=lim). */
 static inline void df_common_atten_lim(const float *noisy_re,
@@ -539,9 +494,9 @@ static void df_mask_spectrum(DFN2State *st, const float *erb_mask,
                              const float *in_re, const float *in_im,
                              float *out_re, float *out_im) {
     const int n_bins = st->grid.n_bins;
-    df_common_expand_mask(erb_mask, st->erb_inv, st->erb_inv_lo,
-                          st->erb_inv_hi, n_bins, st->grid.n_erb,
-                          st->scratch_bin_gain);
+    skn_erb_expand_mask_f32(erb_mask, st->erb_inv, st->erb_inv_lo,
+                            st->erb_inv_hi, n_bins, st->grid.n_erb,
+                            st->scratch_bin_gain);
     skn_mul_f32(out_re, in_re, st->scratch_bin_gain, (size_t)n_bins);
     skn_mul_f32(out_im, in_im, st->scratch_bin_gain, (size_t)n_bins);
 }
@@ -571,10 +526,10 @@ int dfn2_enhance_spectrum(DFN2State* st,
     const int ring = st->grid.ring;
     const size_t row = (size_t)n_bins;
     const size_t frame_coefs = (size_t)df_bins * (size_t)df_order * 2u;
-    df_common_expand_mask(erb_mask, st->erb_inv,
-                          st->erb_inv_lo, st->erb_inv_hi,
-                          n_bins, st->grid.n_erb,
-                          st->scratch_bin_gain);
+    skn_erb_expand_mask_f32(erb_mask, st->erb_inv,
+                            st->erb_inv_lo, st->erb_inv_hi,
+                            n_bins, st->grid.n_erb,
+                            st->scratch_bin_gain);
     slot = st->df_ring_idx;
     {
         float *masked_re = st->masked_re + (size_t)slot * row;
@@ -698,10 +653,10 @@ int dfn2_enhance_spectrum_stream(DFN2State* st,
 
     head_frame = current - mask_lookahead;
     head_slot = (int)(head_frame % ring);
-    df_common_expand_mask(erb_mask, st->erb_inv,
-                          st->erb_inv_lo, st->erb_inv_hi,
-                          n_bins, st->grid.n_erb,
-                          st->scratch_bin_gain);
+    skn_erb_expand_mask_f32(erb_mask, st->erb_inv,
+                            st->erb_inv_lo, st->erb_inv_hi,
+                            n_bins, st->grid.n_erb,
+                            st->scratch_bin_gain);
     skn_mul_f32(st->masked_re + (size_t)head_slot * row,
                 st->noisy_ring_re + (size_t)head_slot * row,
                 st->scratch_bin_gain, (size_t)n_bins);

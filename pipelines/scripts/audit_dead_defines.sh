@@ -3,16 +3,17 @@
 # C source or header. cc accepts an unread -D without a word, so a knob whose reader is gone keeps building
 # the same objects while claiming to select something.
 #
-# Build files: every Makefile under AINR/, AIAEC/ and pipelines/ (obj, bin, build, output, dist and
+# Build files: every Makefile under AINR/, AIAEC/, pipelines/ and stream/ (obj, bin, build, output, dist and
 # gtcrn_github pruned), or the files named on the command line (a relative name is looked up from the
 # working directory, then from ROOT). --py adds the Python files under test/ and
 # tests/ directories, whose -D strings are flags they pass to a C compiler.
 #
 # A flag is read when its name is an identifier in the code of a source, with comments and string and
-# character literals blanked first. Sources: the .c/.h files of AINR/, AIAEC/, pipelines/, shared/ and lib/,
-# and audiolib's common/ (include, src, utility). A flag set on a line that assigns a variable whose name
-# contains TEST (DFN_TEST_CFLAGS) is a test flag and may be read by a test source; every other flag needs a
-# reader outside the test and tests directories.
+# character literals blanked first. Sources: the .c/.h files of AINR/, AIAEC/, pipelines/, stream/,
+# lib/ainr/ and lib/aiaec/, AEC's and NR's include/src (and AEC's example/) resolved through lib/deps.mk, and
+# audiolib's common/ (include, src, utility). A flag set on a line that assigns a variable whose name
+# contains TEST (DFN_TEST_CFLAGS), or whose own name has a TEST word (AIAEC_TEST_CATALOG), is a test flag and
+# may be read by a test source; every other flag needs a reader outside the test and tests directories.
 #
 # Usage:  scripts/audit_dead_defines.sh [--root DIR] [--common DIR] [--py] [--verbose] [FILE...]
 #         scripts/audit_dead_defines.sh --self-test
@@ -98,6 +99,17 @@ for d in "$ROOT/AINR" "$ROOT/AIAEC" "$ROOT/pipelines" "$COMMON/include"; do
     [ -d "$d" ] || { echo "FAIL: no $d (ROOT=$ROOT, COMMON=$COMMON)" >&2; exit 2; }
 done
 
+# AEC's and NR's sources are where lib/deps.mk looks for them (the sibling checkouts), not the lib/aec and lib/nr
+# gitlinks; a tree without lib/deps.mk (the self-test's) has none.
+AEC_DIR="${AEC_DIR:-}"
+NR_DIR="${NR_DIR:-}"
+if [ -f "$ROOT/lib/deps.mk" ] && { [ -z "$AEC_DIR" ] || [ -z "$NR_DIR" ]; }; then
+    deps="$(make -s --no-print-directory -f "$ROOT/lib/deps.mk" print-deps-sh)" \
+        || { echo "FAIL: cannot resolve AEC_DIR/NR_DIR through $ROOT/lib/deps.mk" >&2; exit 2; }
+    [ -n "$AEC_DIR" ] || AEC_DIR="$(printf '%s\n' "$deps" | sed -n 's/^AEC_DIR=//p')"
+    [ -n "$NR_DIR" ] || NR_DIR="$(printf '%s\n' "$deps" | sed -n 's/^NR_DIR=//p')"
+fi
+
 dirs_of() { for d in "$@"; do [ -d "$d" ] && printf '%s\n' "$d"; done; }
 PRUNE='-name obj -o -name bin -o -name build -o -name output -o -name dist -o -name gtcrn_github'
 
@@ -109,12 +121,12 @@ if [ $# -gt 0 ]; then
     done > "$TMP/build_files"
 else
     # shellcheck disable=SC2086
-    find $(dirs_of "$ROOT/AINR" "$ROOT/AIAEC" "$ROOT/pipelines") \( $PRUNE \) -prune -o -type f -name Makefile -print \
+    find $(dirs_of "$ROOT/AINR" "$ROOT/AIAEC" "$ROOT/pipelines" "$ROOT/stream") \( $PRUNE \) -prune -o -type f -name Makefile -print \
         | sort > "$TMP/build_files"
 fi
 if [ "$PY" -eq 1 ]; then
     # shellcheck disable=SC2086
-    find $(dirs_of "$ROOT/AINR" "$ROOT/AIAEC" "$ROOT/pipelines") \( $PRUNE \) -prune -o -type f -name '*.py' \
+    find $(dirs_of "$ROOT/AINR" "$ROOT/AIAEC" "$ROOT/pipelines" "$ROOT/stream") \( $PRUNE \) -prune -o -type f -name '*.py' \
         \( -path '*/tests/*' -o -path '*/test/*' \) -print | sort >> "$TMP/build_files"
 fi
 [ -s "$TMP/build_files" ] || { echo "FAIL: no build files found under $ROOT" >&2; exit 2; }
@@ -138,7 +150,8 @@ while IFS= read -r f; do
             before = (RSTART > 1) ? substr(rest, RSTART - 1, 1) : " "
             rest = substr(rest, RSTART + RLENGTH)
             if (before ~ /[A-Za-z0-9_-]/) continue
-            print FILENAME "\t" FNR "\t" substr(tok, 3) "\t" scope
+            name = substr(tok, 3)
+            print FILENAME "\t" FNR "\t" name "\t" ((scope == "build" && name ~ /(^|_)TEST(_|$)/) ? "test" : scope)
         }
     }' "$f" >> "$TMP/flags"
 done < "$TMP/build_files"
@@ -151,7 +164,8 @@ cut -f3 "$TMP/flags" | sort -u > "$TMP/names"
 
 # ---- readers: name TAB path, once per (name, file) ----
 # shellcheck disable=SC2086
-find $(dirs_of "$ROOT/AINR" "$ROOT/AIAEC" "$ROOT/pipelines" "$ROOT/shared" "$ROOT/lib" \
+find $(dirs_of "$ROOT/AINR" "$ROOT/AIAEC" "$ROOT/pipelines" "$ROOT/stream" "$ROOT/lib/ainr" "$ROOT/lib/aiaec" \
+               "$AEC_DIR/include" "$AEC_DIR/src" "$AEC_DIR/example" "$NR_DIR/include" "$NR_DIR/src" \
                "$COMMON/include" "$COMMON/src" "$COMMON/utility") \
      \( $PRUNE \) -prune -o -type f \( -name '*.c' -o -name '*.h' \) -print | sort > "$TMP/sources"
 [ -s "$TMP/sources" ] || { echo "FAIL: no C sources found under $ROOT" >&2; exit 2; }

@@ -85,7 +85,6 @@ int mono_dfn_run(void) {
     size_t aec_b = aec_get_mem_size(&amp;aec_cfg);
     DfnRateBridgeMemReq breq;
     if (aec_b == 0 || dfn_rate_bridge_get_mem_requirements(&amp;bc, &amp;breq) != 0) return -1;
-    aec_b = ALIGN16((size_t)req.bytes);
     size_t cvec = ALIGN16((size_t)grid.n_freqs * sizeof(Complex));
     void *pool = NULL;
     if (posix_memalign(&amp;pool, breq.alignment, ALIGN16(aec_b) + cvec + (size_t)breq.bytes) != 0)

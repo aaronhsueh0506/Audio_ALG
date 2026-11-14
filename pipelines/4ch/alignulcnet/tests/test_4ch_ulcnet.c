@@ -24,6 +24,7 @@
 #include "4ch/tests/array_test_rig.h"
 #include "audio_stft.h"
 #include "ulcnet/ulcnet_nn_stage.h"
+#include "ulcnet/tests/ulcnet_test_fixture.h"
 #include "utility/mem_align.h"
 
 #include <math.h>
@@ -31,27 +32,6 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
-
-/* Largest row of the grid table: 48 kHz / fft 1024. */
-enum { HOP_MAX = 512, BINS_MAX = 513 };
-
-static const UlcnetGridSpec k_grids[] = {
-    { .sample_rate = 16000, .n_fft = 512,  .delay_depth = 8 },
-    { .sample_rate = 48000, .n_fft = 1024, .delay_depth = 8 },
-};
-
-static UlcnetGrid g_grid;   /* the grid under test: the stage's, and the unit's by the example config */
-#define HOP (g_grid.hop)
-#define BINS (g_grid.n_bins)
-
-/* The table row that is not the grid under test. */
-static UlcnetGrid other_grid(void) {
-    UlcnetGrid other;
-    memset(&other, 0, sizeof(other));
-    for (size_t i = 0; i < sizeof(k_grids) / sizeof(k_grids[0]); ++i)
-        if (k_grids[i].n_fft != g_grid.n_fft) (void)ulcnet_grid_make(&other, &k_grids[i]);
-    return other;
-}
 
 /* The unit on the stage's grid, linear context only: what 4ch/alignulcnet/main.c builds. */
 static ArrayTestUnitConfig ulcnet_example_unit_config(void) {
@@ -237,11 +217,6 @@ static int ul4_process_with_activity(Ul4* p, const float* mic, const float* far,
  * infer-without-descriptor, because a shape disagreement between the graph and the stage's
  * grid is undetectable downstream (the finite guard catches an unwritten output, never a
  * wrong-shaped one). The descriptor of the grid under test. */
-static const UlcnetModelIoDescriptor* test_io_descriptor(void) {
-    static UlcnetModelIoDescriptor d;
-    return ulcnet_model_io_descriptor_default(&g_grid, &d) == 0 ? &d : NULL;
-}
-
 
 /* DelayAec searches a 16 kHz-equivalent sidechain and scales the selected
  * delay back to native samples. Echo-delay stimuli therefore scale by
@@ -291,12 +266,6 @@ static void fill_echo_hop(int frame, int hop, int true_delay,
  * frames, and report how many of them the reprime covered. The budget is
  * armed at the TOP of the hop that reports the alignment generation, so the
  * arming hop's own frames are already spending it. */
-static int reprime_take(int* armed, int frames) {
-    int skipped = *armed < frames ? *armed : frames;
-    *armed -= skipped;
-    return skipped;
-}
-
 /* ============================================================================
  * 1. Identity E2E: direct BF -> model -> synthesis chain and the 1-hop latency contract.
  *    The reference is synthesised by the TEST from the spectra the pipeline hands the model
@@ -1058,19 +1027,6 @@ static int test_relock_same_delay_resets_model(void) {
  *    (output hop #p = chain input hop p-1).
  *    MUTATION: delaying the far branch by a hop moves the impulse to T + 2 hops. */
 
-static int passthrough_far_infer(
-    void* user,
-    const float* err_re, const float* err_im,
-    const float* far_re, const float* far_im,
-    float* out_re, float* out_im) {
-    (void)user;
-    (void)err_re;
-    (void)err_im;
-    memcpy(out_re, far_re, BINS * sizeof(float));
-    memcpy(out_im, far_im, BINS * sizeof(float));
-    return 0;
-}
-
 /* Shared shell of the two impulse-timestamp tests (5 and 5b): FRAMES hops
  * of silence with one unit impulse on ONE branch at (IMP_FRAME, IMP_OFF),
  * through `model` (NULL = identity). Reports where the output peaks and how
@@ -1660,17 +1616,6 @@ typedef struct ProbeModel {
     int   overflow;
 } ProbeModel;
 
-static float spec_peak(const float* re, const float* im) {
-    float m = 0.0f;
-    for (int k = 0; k < BINS; ++k) {
-        float a = fabsf(re[k]);
-        if (a > m) m = a;
-        a = fabsf(im[k]);
-        if (a > m) m = a;
-    }
-    return m;
-}
-
 static int probe_infer(
     void* user,
     const float* err_re, const float* err_im,
@@ -2066,17 +2011,6 @@ static int test_reprime_behavior(void) {
  * aligned enumerator is used only for negative ABI tests; there is no runtime far-mode
  * setter.
  * ========================================================================== */
-static int gate_infer_identity(
-    void* user,
-    const float* err_re, const float* err_im,
-    const float* far_re, const float* far_im,
-    float* out_re, float* out_im) {
-    (void)user; (void)far_re; (void)far_im;
-    memcpy(out_re, err_re, sizeof(float) * BINS);
-    memcpy(out_im, err_im, sizeof(float) * BINS);
-    return 0;
-}
-
 static int test_raw_descriptor_gate(void) {
     ArrayTestUnitConfig cfg = ulcnet_example_unit_config();
     Ul4* p;

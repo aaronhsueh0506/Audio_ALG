@@ -24,7 +24,6 @@ _Static_assert(DFN2_STREAM_ALIGN == 16u,
 
 struct DFN2Stream {
     DFN2Grid grid;
-    float    atten_lim_db;
     int      hpf_enable;
 
     Hpf        *hpf;     /* NULL when !hpf_enable */
@@ -272,7 +271,6 @@ static DFN2Stream *dfn2_stream_finish_init(const DFN2StreamConfig *cfg, unsigned
     s = layout->self;
 
     s->grid = cfg->grid;
-    s->atten_lim_db = cfg->atten_lim_db;
     s->hpf_enable = cfg->hpf_enable;
     s->open = 0;
     s->pending = 0;
@@ -374,21 +372,25 @@ unsigned int dfn2_stream_state_generation(const DFN2Stream *s) {
 
 int dfn2_stream_set_atten_lim(DFN2Stream *s, float atten_lim_db) {
     if (!s) return -1;
-    if (dfn2_prepost_set_atten_lim(s->prepost, atten_lim_db) != 0) return -1;
-    s->atten_lim_db = atten_lim_db;
-    return 0;
-}
-
-const DFN2Grid *dfn2_stream_grid(const DFN2Stream *s) {
-    return s ? &s->grid : NULL;
+    return dfn2_prepost_set_atten_lim(s->prepost, atten_lim_db) != 0 ? -1 : 0;
 }
 
 int dfn2_stream_hop_size(const DFN2Stream *s) {
     return s ? s->grid.hop : -1;
 }
 
-int dfn2_stream_layout_version(const DFN2Stream *s) {
-    return s ? dfn2_prepost_layout_version(s->prepost) : -1;
+/* Shared tail of both pre_process entries: rc is the prepost's pre_process result (1: a job for the accelerator,
+ * 0: push only), -1 a contract error. Opens the frame when a job is due and marks post_process due. */
+static int open_hop(DFN2Stream *s, int rc, DFN2HopIO *io) {
+    if (rc < 0) return -1;
+    io->state_generation = dfn2_prepost_state_generation(s->prepost);
+    io->job_ready = rc;
+    if (rc == 1) {
+        if (dfn2_prepost_frame_open(s->prepost, &io->inputs, &io->outputs) != 0) return -1;
+        s->open = 1;
+    }
+    s->pending = 1;
+    return 1;
 }
 
 int dfn2_stream_pre_process(DFN2Stream *s, const int16_t *pcm_in, DFN2HopIO *io) {
@@ -406,15 +408,7 @@ int dfn2_stream_pre_process(DFN2Stream *s, const int16_t *pcm_in, DFN2HopIO *io)
      * 1 only once every N hops (a job for the accelerator), 0 the other N-1 (push only, nothing
      * to run) -- io->job_ready carries that to the caller; -1 is still a genuine contract error. */
     rc = dfn2_prepost_pre_process_freq(s->prepost, s->spec_re, s->spec_im);
-    if (rc < 0) return -1;
-    io->state_generation = dfn2_prepost_state_generation(s->prepost);
-    io->job_ready = rc;
-    if (rc == 1) {
-        if (dfn2_prepost_frame_open(s->prepost, &io->inputs, &io->outputs) != 0) return -1;
-        s->open = 1;
-    }
-    s->pending = 1;
-    return 1;
+    return open_hop(s, rc, io);
 }
 
 /* Frame-close half of post_process, shared by PCM and spectrum-only entry points: frame_finish()
@@ -464,15 +458,7 @@ int dfn2_stream_pre_process_freq_dual(DFN2Stream *s, const float *est_re, const 
         return -1;
 
     rc = dfn2_prepost_pre_process_freq_dual(s->prepost, est_re, est_im, app_re, app_im);
-    if (rc < 0) return -1;
-    io->state_generation = dfn2_prepost_state_generation(s->prepost);
-    io->job_ready = rc;
-    if (rc == 1) {
-        if (dfn2_prepost_frame_open(s->prepost, &io->inputs, &io->outputs) != 0) return -1;
-        s->open = 1;
-    }
-    s->pending = 1;
-    return 1;
+    return open_hop(s, rc, io);
 }
 
 int dfn2_stream_post_process_freq(DFN2Stream *s, int ai_rc, float *re, float *im, int *valid) {

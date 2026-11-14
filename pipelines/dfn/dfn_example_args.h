@@ -37,13 +37,13 @@ static const DFN2GridSpec DFN_EXAMPLE_MODEL_ROWS[] = {
 /* Delay profile: `n` (matched-filter bank size) sets the bulk-delay search range
  * and is chosen from the delay distribution of the deployment route. Range per
  * bank: n=1 ~125 ms, 2 ~221 ms, 3 ~317 ms, 4 ~413 ms, 5 ~509 ms. No runtime
- * setter. DA_NUM_FILTERS is the bank-size cap and the value the non-MATCHED modes
+ * setter. AEC_DELAY_NUM_FILTERS_MAX is the bank-size cap and the value the non-MATCHED modes
  * require. */
 #ifndef DFN_EXAMPLE_DELAY_NUM_FILTERS
-#define DFN_EXAMPLE_DELAY_NUM_FILTERS DA_NUM_FILTERS
+#define DFN_EXAMPLE_DELAY_NUM_FILTERS AEC_DELAY_NUM_FILTERS_MAX
 #endif
 _Static_assert(DFN_EXAMPLE_DELAY_NUM_FILTERS >= 1 &&
-               DFN_EXAMPLE_DELAY_NUM_FILTERS <= DA_NUM_FILTERS,
+               DFN_EXAMPLE_DELAY_NUM_FILTERS <= AEC_DELAY_NUM_FILTERS_MAX,
                "DFN_EXAMPLE_DELAY_NUM_FILTERS outside lib/aec's bank range");
 
 typedef struct DfnExampleArgs {
@@ -52,7 +52,7 @@ typedef struct DfnExampleArgs {
     int ai_fft_size;         /* --ai-fft-size (default 1024) */
     DFN2Grid model_grid;     /* the DFN2 model's grid of that pair, set by dfn_example_resolve_model_grid() */
     AecDelayMode delay_mode;
-    int delay_num_filters;   /* MATCHED only; 1..DA_NUM_FILTERS             */
+    int delay_num_filters;   /* MATCHED only; 1..AEC_DELAY_NUM_FILTERS_MAX             */
     int fixed_delay_samples; /* FIXED only; -1 otherwise                    */
     const char *erb_fwd_path;
     const char *erb_inv_path;

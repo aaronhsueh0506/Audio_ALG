@@ -52,14 +52,14 @@ static const UlcnetGridSpec k_grids[] = {
 };
 enum { K_GRIDS = (int)(sizeof k_grids / sizeof k_grids[0]) };
 
-/* Delay profile is a deployment decision: `n` (matched-filter bank size) sets the bulk-delay search range and comes from the command line (--delay-mode / --delay-num-filters / --fixed-delay, as lib/aec's aec_wav); the resolved profile is printed. Reliable range per bank: n=1 ~125 ms, 2 ~221 ms, 3 ~317 ms, 4 ~413 ms, 5 ~509 ms. DA_NUM_FILTERS is the bank-size cap and the value non-MATCHED modes require. */
+/* Delay profile is a deployment decision: `n` (matched-filter bank size) sets the bulk-delay search range and comes from the command line (--delay-mode / --delay-num-filters / --fixed-delay, as lib/aec's aec_wav); the resolved profile is printed. Reliable range per bank: n=1 ~125 ms, 2 ~221 ms, 3 ~317 ms, 4 ~413 ms, 5 ~509 ms. AEC_DELAY_NUM_FILTERS_MAX is the bank-size cap and the value non-MATCHED modes require. */
 
 /* MATCHED bank size n for this example, overridable with -DULCNET_EXAMPLE_DELAY_NUM_FILTERS=N; --delay-num-filters wins. MATCHED only; changing it needs a rebuild and a fresh pool query. */
 #ifndef ULCNET_EXAMPLE_DELAY_NUM_FILTERS
-#define ULCNET_EXAMPLE_DELAY_NUM_FILTERS DA_NUM_FILTERS
+#define ULCNET_EXAMPLE_DELAY_NUM_FILTERS AEC_DELAY_NUM_FILTERS_MAX
 #endif
 _Static_assert(ULCNET_EXAMPLE_DELAY_NUM_FILTERS >= 1 &&
-               ULCNET_EXAMPLE_DELAY_NUM_FILTERS <= DA_NUM_FILTERS,
+               ULCNET_EXAMPLE_DELAY_NUM_FILTERS <= AEC_DELAY_NUM_FILTERS_MAX,
                "ULCNET_EXAMPLE_DELAY_NUM_FILTERS outside lib/aec's bank range");
 
 static void usage(const char* prog) {

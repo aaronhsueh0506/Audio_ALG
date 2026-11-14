@@ -23,22 +23,19 @@
 <li><a href="#section-10">切 grid 的流程</a></li>
 </ul></details>
 <h2 id="section-1">概要</h2>
-<p><b>DFN2 函式庫不持有任何 grid</b>：取樣率、FFT 大小、ERB 帶數、deep filter 的 bin 數與階數、lookahead pair、每次呼叫的 frame 數、兩組正規化器設定都不是函式庫的常數，沒有 preset、沒有預設值。應用端把模型固定的值填成 <code>DFN2GridSpec</code>，用 <code>dfn2_grid_make()</code> 得到 <code>DFN2Grid</code>，傳給它建立的每一個物件（<code>DFN2State</code>、<code>DFN2ModelIOState</code>、model-I/O descriptor、<code>DFN2Prepost</code>）；<b>同一個 binary 跑任何 grid</b>，記憶體由 <code>get_mem_size</code> 依 grid 在執行期算出。grid、訓練好的模型、它的 ERB 矩陣三者必須屬於同一組；出貨 checkpoint 的 grid 是 48 kHz、FFT 1024、32 個 ERB band、<code>df_bins</code> 96、lookahead 1／1。</p>
+<p><b>DFN2 函式庫不持有任何 grid</b>：取樣率、FFT 大小、ERB 帶數、deep filter 的 bin 數與階數、lookahead pair、每次呼叫的 frame 數都不是函式庫的常數，沒有 preset、沒有預設值；兩組特徵正規化器的 tau 與起點則是 <code>dfn2_grid.h</code> 的固定常數（出貨 checkpoint 對每個 grid 都相同），不在 spec 裡。應用端把模型固定的值填成 <code>DFN2GridSpec</code>，用 <code>dfn2_grid_make()</code> 得到 <code>DFN2Grid</code>，傳給它建立的每一個物件（<code>DFN2State</code>、<code>DFN2ModelIOState</code>、model-I/O descriptor、<code>DFN2Prepost</code>）；<b>同一個 binary 跑任何 grid</b>，記憶體由 <code>get_mem_size</code> 依 grid 在執行期算出。grid、訓練好的模型、它的 ERB 矩陣三者必須屬於同一組；出貨 checkpoint 的 grid 是 48 kHz、FFT 1024、32 個 ERB band、<code>df_bins</code> 96、lookahead 1／1。</p>
 <p>(sample rate, FFT size) 對應 n_erb、df_bins 與 lookahead pair 的表是<b>模型的性質</b>，由應用端持有（板端 sample 有自己的表，見下）；函式庫只驗證應用端傳入的值。框化（<code>AcStft</code>／<code>AcIstft</code>）也是應用端的，尺度由 grid 給（<code>stft_scale</code>／<code>stft_unscale</code>）。模型本身（cascade、I/O、State）見 <a href="core.html">DeepFilterNet2 頻域與模型契約</a>，呼叫順序見 <a href="core.html#frequency-api">DeepFilterNet2 頻域與模型契約</a>。</p>
 <p class="note">本頁的大小為本機（64 位元主機、<code>-ffp-contract=off</code>）量測；非出貨 grid 的音質與板端行為<b>待量測</b>。DFN2 的 grid 與 pool 版號的詳細規則另見 <code>AINR/DeepFilterNet2/README.md</code> 的 "Choosing the grid"。</p>
 
 <h2 id="section-2">API 用法</h2>
 <ol>
-<li>應用端依模型的 <code>config.ini</code>（<code>[signal] sr／n_fft</code>、<code>[model] n_erb／df_bins／df_order／mask_lookahead／df_lookahead</code>、<code>[feature]</code> 的正規化器）填 <code>DFN2GridSpec</code>，呼叫 <code>dfn2_grid_make()</code>；回傳 <code>DFN2_GRID_OK</code>（grid 已寫入）或第一個失敗的檢查（grid 不動）。<code>dfn2_grid_status_text()</code> 給 log 用的短字串。</li>
+<li>應用端依模型的 <code>config.ini</code>（<code>[signal] sr／n_fft</code>、<code>[model] n_erb／df_bins／df_order／mask_lookahead／df_lookahead</code>）填 <code>DFN2GridSpec</code>（八個欄位；<code>[feature]</code> 的正規化器是 <code>dfn2_grid.h</code> 的固定常數），呼叫 <code>dfn2_grid_make()</code>；回傳 <code>DFN2_GRID_OK</code>（grid 已寫入）或第一個失敗的檢查（grid 不動）。<code>dfn2_grid_status_text()</code> 給 log 用的短字串。</li>
 <li>把 <code>&amp;grid</code> 交給 <code>dfn2_state_mem_size()</code>／<code>dfn2_state_init()</code>、<code>dfn2_model_io_mem_size()</code>／<code>dfn2_model_io_init()</code>、<code>dfn2_model_io_descriptor_default()</code>／<code>_validate()</code>、<code>dfn2_prepost_config_defaults()</code>；<code>DFN2PrepostConfig</code> 按值持有一份，<code>dfn2_prepost_grid(p)</code> 回傳實例的那份。</li>
 <li>每個收 grid 的入口先跑 <code>dfn2_grid_validate()</code>，無效的 grid 回 -1（size 函式回 0）；手改過的衍生欄位（hop、ring、scale、alpha）也會被擋（<code>DFN2_GRID_ERR_INCONSISTENT</code>）。</li>
 </ol>
 <pre>DFN2GridSpec spec = {                 /* config.ini 的值(出貨 48 kHz 模型) */
     .sample_rate = 48000, .n_fft = 1024, .n_erb = 32, .df_bins = 96, .df_order = 5,
-    .mask_lookahead = 1, .df_lookahead = 1, .frames_per_call = 1,
-    .erb_norm_tau_sec = 1.0f, .erb_norm_init_lo_db = -60.0f, .erb_norm_init_hi_db = -90.0f,
-    .erb_norm_scale_db = 40.0f, .spec_norm_tau_sec = 1.0f,
-    .spec_norm_init_lo = 0.001f, .spec_norm_init_hi = 0.0001f };
+    .mask_lookahead = 1, .df_lookahead = 1, .frames_per_call = 1 };
 DFN2Grid grid;
 int status = dfn2_grid_make(&amp;grid, &amp;spec);
 if (status != DFN2_GRID_OK) { fprintf(stderr, "%s\n", dfn2_grid_status_text(status)); return -1; }
@@ -52,7 +49,7 @@ dfn2_prepost_get_mem_size(&amp;cfg, &amp;req);           /* 48 kHz 1/1：92,608 
 <h2 id="section-3">Block diagram</h2>
 <pre>
 應用端（板端 sample 與 pipeline 範例 main 的表；測試另有 dfn2_test_grid.h／dfn_test_grid.h）
-   |  (sr, n_fft) -> n_erb, df_bins, df_order, 兩個 lookahead, 正規化器   模型決定，不是函式庫
+   |  (sr, n_fft) -> n_erb, df_bins, df_order, 兩個 lookahead   模型決定，不是函式庫
    v
 DFN2GridSpec spec
    v
@@ -71,22 +68,25 @@ DFN2Grid grid
 </pre>
 
 <h2 id="section-4">給定量與推導量</h2>
-<p><code>DFN2GridSpec</code> 的 15 個欄位是訓練好的模型所固定的（<code>dfn2_grid.h</code>）；其餘由公式推導：</p>
+<p><code>DFN2GridSpec</code> 的 8 個欄位是訓練好的模型所固定的（<code>dfn2_grid.h</code>）；其餘由公式推導，兩組正規化器的常數固定在標頭：</p>
 <div class="tbl"><table>
 <tr><th>給定欄位</th><th>出貨值</th><th>來源（<code>config.ini</code>）</th></tr>
 <tr><td><code>sample_rate</code>、<code>n_fft</code></td><td>48000、1024</td><td>[signal]</td></tr>
 <tr><td><code>n_erb</code>、<code>df_bins</code>、<code>df_order</code></td><td>32、96、5</td><td>[model]</td></tr>
 <tr><td><code>mask_lookahead</code>、<code>df_lookahead</code></td><td>1、1</td><td>[model]；pair 規則見 <a href="core.html#memory">DeepFilterNet2 頻域與模型契約</a></td></tr>
 <tr><td><code>frames_per_call</code></td><td>1</td><td>匯出的 graph（<code>--frames-per-call</code>）</td></tr>
-<tr><td><code>erb_norm_tau_sec</code>、<code>erb_norm_init_lo_db</code>、<code>erb_norm_init_hi_db</code>、<code>erb_norm_scale_db</code></td><td>1.0 s、−60 dB、−90 dB、40 dB</td><td>[feature]</td></tr>
-<tr><td><code>spec_norm_tau_sec</code>、<code>spec_norm_init_lo</code>、<code>spec_norm_init_hi</code></td><td>1.0 s、0.001、0.0001</td><td>[feature]</td></tr>
+</table></div>
+<div class="tbl"><table>
+<tr><th>固定常數（<code>dfn2_grid.h</code>）</th><th>值</th><th>來源（<code>config.ini</code>）</th></tr>
+<tr><td><code>DFN2_ERB_NORM_TAU_SEC</code>、<code>DFN2_ERB_NORM_INIT_LO_DB</code>、<code>DFN2_ERB_NORM_INIT_HI_DB</code>、<code>DFN2_ERB_NORM_SCALE_DB</code></td><td>1.0 s、−60 dB、−90 dB、40 dB</td><td>[feature]</td></tr>
+<tr><td><code>DFN2_SPEC_NORM_TAU_SEC</code>、<code>DFN2_SPEC_NORM_INIT_LO</code>、<code>DFN2_SPEC_NORM_INIT_HI</code></td><td>1.0 s、0.001、0.0001</td><td>[feature]</td></tr>
 </table></div>
 <div class="tbl"><table>
 <tr><th>推導欄位</th><th>公式</th></tr>
 <tr><td><code>hop</code>、<code>n_bins</code></td><td>n_fft／2、n_fft／2 + 1（組幀固定為 50 % overlap、sqrt-Hann、不補零，audiolib <code>audio_stft.h</code>）</td></tr>
 <tr><td><code>input_frames</code></td><td><code>frames_per_call</code> + <code>DFN2_MODEL_INPUT_FRAMES</code>（3）− 1 = N + 2</td></tr>
 <tr><td><code>stft_scale</code>、<code>stft_unscale</code></td><td>float32 的 1／√n_fft 與 √n_fft（<code>torch.stft(normalized=True)</code> 的尺度與其反向；float32 的除法與開根號是正確捨入，各編譯器結果相同）。<code>train.py</code> 的 <code>analysis_scale()</code> = 2·hop／win²·√n_fft，win = n_fft、hop = n_fft／2 時恰為同一值，它作用在餵給正規化器的拷貝；應用端的 <code>AcStft</code>／<code>AcIstft</code> 以這兩個值做 <code>spec_scale</code>／<code>ispec_scale</code></td></tr>
-<tr><td><code>erb_norm_alpha</code>、<code>spec_norm_alpha</code></td><td><code>dfn2_norm_alpha(sample_rate, hop, tau_sec)</code> = <code>train.py</code> 的 <code>make_norm_alpha</code>：exp(−(hop／sr)／tau) 取到小數第三位（若進位到 1.0 就多一位）。tau = 1.0 s 時，hop 512 @ 48 kHz 得 0.989（<code>0x3f7d2f1b</code>）；hop 128 @ 16 kHz 與 hop 256 @ 32 kHz 的 hop／sr 都是 8 ms，得 0.992（<code>0x3f7df3b6</code>）。alpha 是推導值、不能給；tau 不同的模型改 spec 的 tau 欄位，alpha 須在 (0, 1)</td></tr>
+<tr><td><code>erb_norm_alpha</code>、<code>spec_norm_alpha</code></td><td><code>dfn2_norm_alpha(sample_rate, hop, tau_sec)</code> = <code>train.py</code> 的 <code>make_norm_alpha</code>：exp(−(hop／sr)／tau) 取到小數第三位（若進位到 1.0 就多一位）。tau = 1.0 s 時，hop 512 @ 48 kHz 得 0.989（<code>0x3f7d2f1b</code>）；hop 128 @ 16 kHz 與 hop 256 @ 32 kHz 的 hop／sr 都是 8 ms，得 0.992（<code>0x3f7df3b6</code>）。alpha 是推導值、不能給；tau 是標頭的固定常數，需要不同 tau 的新 checkpoint 是新版標頭，不是執行期參數；alpha 須在 (0, 1)</td></tr>
 <tr><td><code>df_history</code>、<code>ring</code></td><td><code>df_order</code> − df_lookahead − 1 個過去 tap；ring 深度 max(<code>df_order</code>, mask + df + 1)，mask-only 為 mask + 1</td></tr>
 </table></div>
 
@@ -103,10 +103,10 @@ DFN2Grid grid
 <tr><td><code>DFN2_GRID_ERR_MASK_LOOKAHEAD</code>（-6）</td><td>[0, <code>DFN2_GRID_MASK_LOOKAHEAD_MAX</code> = 2]</td></tr>
 <tr><td><code>DFN2_GRID_ERR_DF_LOOKAHEAD</code>（-7）</td><td>[0, <code>df_order</code> − 1]；mask-only 必須為 0（沒有 deep filter 可以 look ahead）</td></tr>
 <tr><td><code>DFN2_GRID_ERR_FRAMES_PER_CALL</code>（-11）</td><td>[1, <code>DFN2_MODEL_MAX_FRAMES_PER_CALL</code> = 64]</td></tr>
-<tr><td><code>DFN2_GRID_ERR_ERB_NORM</code>（-12）／<code>_SPEC_NORM</code>（-13）</td><td>tau 有限且 &gt; 0，起點有限（spec 的起點與 ERB 的 scale 須 &gt; 0），且它給出的 alpha（float32）嚴格在 0 與 1 之間：取樣率或 tau 讓 alpha 取整後到 0 或 1 的被拒絕，所以 <code>dfn2_grid_make()</code> 接受的 grid，<code>dfn2_grid_validate()</code> 一定接受</td></tr>
+<tr><td><code>DFN2_GRID_ERR_NORM_ALPHA</code>（-12）</td><td>固定 tau 在此取樣率與 hop 給出的 alpha（float32）嚴格在 0 與 1 之間：取整後到 0 或 1 的被拒絕，所以 <code>dfn2_grid_make()</code> 接受的 grid，<code>dfn2_grid_validate()</code> 一定接受（-8 與 -13 未指派，不重用）</td></tr>
 <tr><td><code>DFN2_GRID_ERR_INCONSISTENT</code>（-9）</td><td>（<code>dfn2_grid_validate()</code>）衍生欄位與 <code>dfn2_grid_make()</code> 推導的不同</td></tr>
 </table></div>
-<p class="note">本機以 <code>dfn2_grid_status_text()</code> 驗證：n_erb 30 回 <code>DFN2_GRID_ERR_N_ERB</code>；n_erb 36、df_bins 100、n_fft 2048、2／4 這組 pair（ring 7）、frames_per_call 64 都接受；df_order 17 回 <code>_DF_ORDER</code>、frames_per_call 65 回 <code>_FRAMES_PER_CALL</code>、erb_norm_tau_sec 1e-6 回 <code>_ERB_NORM</code>。</p>
+<p class="note">本機以 <code>dfn2_grid_status_text()</code> 驗證：n_erb 30 回 <code>DFN2_GRID_ERR_N_ERB</code>；n_erb 36、df_bins 100、n_fft 2048、2／4 這組 pair（ring 7）、frames_per_call 64 都接受；df_order 17 回 <code>_DF_ORDER</code>、frames_per_call 65 回 <code>_FRAMES_PER_CALL</code>。</p>
 
 <h2 id="section-6">State 表：大小隨 grid</h2>
 <p>各 tensor 的 I/O 表見 <a href="core.html">DeepFilterNet2 頻域與模型契約</a>。pool 的陣列依 grid 精確配置。遞迴 state（出貨模型 1,280 + 30,720 float）、ERB 矩陣與應用端的 <code>AcStft</code>／<code>AcIstft</code> 都不在 pool 內。</p>

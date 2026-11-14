@@ -37,7 +37,7 @@ Firmware         Aec (mono: 1 mic | 4ch: n_mics = 4)       AnrDenoiser          
 | Mono | `aec_resolve_signal_grid()`/`aec_config_from_level()`, `aec_get_mem_size()`/`aec_init()`, `anr_get_mem_size()`/`anr_init()`, `ac_istft_get_mem_size()`/`ac_istft_init()`, `aec_process_linear()`, `aec_process_residual()`, `aec_get_residual()`, `anr_process_gain()`/`anr_process_gain_with_residual_psd()`, `aec_apply_gain()`, `aec_apply_cng()`, `ac_istft_push()`, resets, destroys, `aec_set_level()`, `anr_set_level()` | AEC headers other than `aec.h`, NR `noise_estimator.h`/`spp_estimator.h`/`anr_internal.h` |
 | 4-channel | `aec.h` (`n_mics = AEC_ARRAY_MICS`: `aec_get_mem_requirements()`/`aec_init_ex()`, `aec_process_linear()`, `aec_get_array()`, `aec_process_residual()`, `aec_get_residual()`, `aec_array_*` diagnostics), plus the same post libraries | `aec_array_internal.h`; `bf.h`/`srp.h` and `audiolib/{doa,bf}` (used by the sample helper `array_sample_beam` only) |
 
-Parameters: what a third party may tune (grid and rate, `filter_length`, delay mode and bank size,
+Parameters: what a third party may tune (grid and rate, delay mode and bank size,
 AEC and NR levels, array geometry and `num_angles` of the sample helper) and what stays inside
 (time constants, step sizes, detector thresholds, DOA/BF recursion constants, NR tracker constants)
 is classified field by field in section 0.3 of the mono manual and in the config references of the 4-channel manuals ([array](../array/config.md), [helper](../array/beam-settings.md)).

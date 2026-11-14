@@ -45,11 +45,13 @@ BIN="$(make -s -C pipelines print-bin-dir)"
 | `--debug` | flag | off | 每秒一行 AEC+NR 狀態（read-only，不影響輸出） |
 | `--timing` | flag | off | 結束時印每個階段的平均耗時；AEC 的列需要 `make PROFILE=1` |
 
+level 的值不是 `0`..`3` 的一位數字（名稱、`4`、`03`、空字串）一律 exit 2。以 `-` 開頭的 token 會被當成選項，未知的選項被忽略（exit 0、不報錯），所以位置參數寫成 `-1` 不會被拒絕，而是被略過、AEC level 維持預設。
+
 `aec_nr_pipeline_static` 另有 `--print-mem-size [aec-level] [--nr-level <level>] [--aec-only] [--no-nr] [--no-res] [--no-cng]
 [--sample-rate <hz>] [--fft-size <n>]`（`--sample-rate`／`--fft-size` 不是十進位整數 exit 2）：印出 pool 預算並真的在那塊 pool 上 init 每個 stage 後結束，不讀 WAV；`aec_nr_pipeline` 沒有這個模式。
 
-`delay_mode`／`delay_num_filters`／`fixed_delay_samples`／`filter_length`
-（`AecConfig` 的欄位，見 `aec.h`）**沒有對應 CLI 旗標**；
+`delay_mode`／`delay_num_filters`／`fixed_delay_samples`
+（`AecConfig` 的欄位，見 `aec.h`；濾波器長度由取樣率決定，不是欄位）**沒有對應 CLI 旗標**；
 兩支 CLI（`aec_nr_pipeline`/`aec_nr_pipeline_static`）目前都只能吃
 預設值（`MATCHED`、n=5、−1）。要測試
 非預設 delay mode 得直接寫 C 改 `AecConfig` 後呼叫 `aec_get_mem_size()`／`aec_init()`
@@ -100,7 +102,6 @@ DUMP_CTX=pipeline_ctx.bin \
 
 typedef struct {
     Aec *aec;
-    int aec_ready;
     AnrDenoiser *nr;
     AcIstft *istft;
     void *istft_mem;
@@ -118,8 +119,7 @@ typedef struct {
 void audio_alg_destroy(AudioAlgPipeline *p)
 {
     if (!p) return;
-    if (p->aec_ready) aec_destroy(p->aec);
-    free(p->aec);
+    if (p->aec) aec_destroy(p->aec);   /* 釋放 aec_create() 的那一塊；指標之後作廢 */
     anr_destroy(p->nr);
     free(p->istft_mem);
     free(p->g_nr);
@@ -147,10 +147,9 @@ int audio_alg_init(AudioAlgPipeline *p, int sample_rate,
     aec_config_from_level(&aec_cfg, aec_level, sample_rate);
     aec_cfg.residual = AEC_RESIDUAL_FULL;   /* 預設值：殘留 gain 與 comfort noise 都由 Aec 提供 */
 
-    p->aec = (Aec *)calloc(1, sizeof(Aec));
-    if (!p->aec || aec_create(p->aec, &aec_cfg) != 0)
+    p->aec = aec_create(&aec_cfg);   /* 一塊 16-byte 對齊的 heap 配置，Aec 結構與 pool 都在裡面 */
+    if (!p->aec)
         goto fail;
-    p->aec_ready = 1;
     p->hop = aec_hop_size(p->aec);
     p->frame_size = 2 * p->hop;
     p->fft_size = p->frame_size;   /* no padding: AEC's grid is frame == FFT */
@@ -205,7 +204,7 @@ int audio_alg_process(AudioAlgPipeline *p,
     uint32_t serial;
     int k;
 
-    if (!p || !p->aec_ready || !p->nr || !mic || !ref || !out)
+    if (!p || !p->aec || !p->nr || !mic || !ref || !out)
         return -1;
 
     if (aec_process_linear(p->aec, mic, ref) != AEC_OK ||
@@ -251,7 +250,7 @@ int audio_alg_process(AudioAlgPipeline *p,
 
 void audio_alg_reset(AudioAlgPipeline *p)
 {
-    if (!p || !p->aec_ready || !p->nr) return;
+    if (!p || !p->aec || !p->nr) return;
     aec_reset(p->aec);
     anr_reset(p->nr);
     ac_istft_reset(p->istft);

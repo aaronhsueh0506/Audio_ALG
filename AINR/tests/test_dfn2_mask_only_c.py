@@ -331,7 +331,7 @@ _GRID_PROBE = r'''
 #include <stdio.h>
 #include <stdlib.h>
 
-#include "DeepFilterNet2/dfn2_grid.h"
+#include "dfn2_grid.h"
 
 int main(int argc, char **argv) {
     DFN2GridSpec spec = {
@@ -426,7 +426,7 @@ def test_units_built_for_different_variants_do_not_link(
     if reason:
         pytest.skip(reason)
     main = tmp_path / 'main.c'
-    main.write_text('#include "DeepFilterNet2/dfn2_model_io.h"\n'
+    main.write_text('#include "dfn2_model_io.h"\n'
                     'int main(void) {\n'
                     '    return dfn2_model_io_push_features(0, 0, 0);\n}\n')
     objects = []

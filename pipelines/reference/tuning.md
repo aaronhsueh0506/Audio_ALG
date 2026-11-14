@@ -14,19 +14,25 @@ external parameters first and mark the internal constants as such.
 | Parameter | Default | Description |
 |-----------|---------|-------------|
 | `sample_rate` | 16000 | 8000 / 16000 / 48000，自動計算 frame/fft/hop |
-| `filter_length` | sr×52ms（sr≥44100 時 sr×64ms） | 自適應濾波器長度（416@8k, 832@16k／52ms, 3072@48k／64ms；`aec_config_defaults()` 的公式，不是固定 32ms） |
-| `enable_highpass` | 1 | 高通濾波器（移除 DC + 低頻） |
-| `highpass_cutoff_hz` | 80.0 | HPF 截止頻率 (Hz) |
+| `fft_size` | rate 預設（16 kHz 256／48 kHz 1024） | 見格點表；16 kHz 另可 512 |
+| `n_mics` | 1 | 1 = 單支；4 = array instance（`AEC_ARRAY_MICS`） |
+| `level` | `AEC_LEVEL_BALANCED` | 見下表；`aec_config_from_level()` 寫入，`aec_set_level()` 執行期更換 |
+| `residual` | `AEC_RESIDUAL_FULL` | 殘留階段做到哪裡（`OFF`／`STATE`／`ESTIMATE`／`FULL`） |
+| `delay_mode`、`delay_num_filters`、`fixed_delay_samples` | `MATCHED`、5、-1 | 對齊方式與 bank 大小，init 後不可變 |
+| `enable_cng` | 1 | comfort-noise 產生 |
+
+`AecConfig` 只有 12 個公開欄位（另有 `capture_proxy_channel` 與 `delay_backward_quarantine_enabled`／`_s`，只給 array）。
+濾波器長度（416@8k、832@16k／52 ms、3072@48k／64 ms）、HPF、shadow 濾波器、飽和處理與所有門檻都是函式庫內部的調校值（`AecTuning`），由 `(sample_rate, fft_size, n_mics, level)` 決定，不是欄位。
 
 **RES / level strength axis**：RES has no standalone `ResConfig` — it lives inside `AecConfig`
 and the AEC3 post-filter chain (`SuppressionGain`, `ResidualEchoEstimator`, etc.), surfaced
 externally through the `AecResidualView` seam (`AecConfig.residual`; see [`## Modules`](../../docs/reference/mono/integration.md)). The four AEC levels
-differ in exactly three fields:
+differ in exactly three internal values (the library's own, set from `AecConfig.level`; the names below are the library's):
 
 | Parameter | Mild | Balanced | Aggressive | No-floor | Description |
 |-----------|------|----------|------------|----------|-------------|
 | `min_gain_floor_far_active_db` | -20 | -28 | -38 | -28（inert） | AEC3 `SuppressionGain` 遠端活躍時的最低增益下限 dB（最大抑制量） |
-| `min_gain_floor_dt_db` | -20 | -20 | -30 | -20（inert） | double-talk 期間套用的地板 dB；mild/balanced 停在 dataclass 共用預設 -20，只有 aggressive 額外下探到 -30（其餘欄位：filter length、Kalman Q、delay buffer、CNG…四個 level 皆相同） |
+| `min_gain_floor_dt_db` | -20 | -20 | -30 | -20（inert） | double-talk 期間套用的地板 dB；mild/balanced 停在 dataclass 共用預設 -20，只有 aggressive 額外下探到 -30（其餘調校值四個 level 皆相同） |
 | `min_gain_split_floor_enabled` | true | true | true | **false** | 地板機制本身的開關；`AEC_LEVEL_NO_FLOOR` 把它關掉，此時上面兩個 dB 欄位不生效（AEC3 原生 min_gain 不被任何東西往上拉），抑制可以深到 AEC3 自己算出的極限 |
 
 ### Runtime strength control（不重建、不動 pool）
@@ -142,23 +148,21 @@ re-validation.
 | 症狀 | 原因 | 調整方式 |
 |------|------|----------|
 | **殘留回聲明顯** | RES 抑制不足 | `aec_set_level()` 改用 aggressive（地板固定 100 ms ramp） |
-| **殘留回聲 + 遠端持續講話** | Filter 未完全收斂或尾巴不夠長 | 增加 `filter_length`（如 832→1536，init 參數，要重查 pool），確認 mic-ref delay 落在 `delay_mode` 的搜尋範圍 |
+| **殘留回聲 + 遠端持續講話** | Filter 未完全收斂或尾巴不夠長 | 濾波器長度由取樣率決定、不可調；確認 mic-ref delay 落在 `delay_mode` 的搜尋範圍（`delay_num_filters` 越大範圍越長，init 參數，要重查 pool） |
 | **近端語音被壓制（DT degradation）** | RES 過度抑制 | `aec_set_level()` 改用 mild |
 | **輸出底噪不自然（突然靜音）** | CNG 未開啟 | 確認 `enable_cng=1`（預設已開），範例沒有帶 `--no-cng` |
 | **噪聲殘留太多** | 抑制量不夠 | `anr_set_level()` 往 aggressive 走（`g_min_db` -28 dB、`q` 0.45） |
 | **語音被吃掉** | NR 抑制太激進 | `anr_set_level()` 往 mild 走（`g_min_db` -20 dB、`q` 0.58） |
 | **回聲消了但底噪變大** | NR 沒開或太保守 | 確認 NR level 非 MILD，且範例沒有帶 `--no-nr` |
 | **整體語音品質差（悶、失真）** | 多階段過度處理 | AEC 與 NR 都改 MILD，只在必要時加強個別模組；用 `--no-nr` / `--no-res` 隔離是哪個增益來源 |
-| **處理 48kHz 音訊記憶體不足** | 模組記憶體隨 fft_size 增長 | 縮短 `filter_length`（見 [Memory Budget](call-flow.md#memory-budget) 的說明） |
+| **處理 48kHz 音訊記憶體不足** | 模組記憶體隨 fft_size 增長 | 降低 `delay_num_filters`（MATCHED 每少一個省 11,264 B，48 kHz 為 23,552 B），或改用 `FIXED`／`EXTERNAL_ALIGNED`（見 [Memory Budget](call-flow.md#memory-budget) 的說明） |
 | **NR 把回聲當噪聲學進去** | AEC 殘留回聲被 MCRA 當底噪 | 先確保 AEC 收斂良好再調 NR；範例預設把 R² 折入 NR 的噪聲底（不要帶 `--legacy-amin`） |
 
 ### Internal remedies (not recommended to open)
 
 | 症狀 | 內部欄位（位置） | 風險 |
 |------|------|------|
-| 收斂太慢 | AEC `kalman_q_high`、`warmup_frames`（`aec.h`） | `warmup_frames` 以 10 ms 為單位並在建立時 retime；Q 決定收斂／發散邊界 |
-| Filter 發散（輸出爆音） | AEC `kalman_q_high`、`mu`（`aec.h`） | 驗證器範圍很寬，範圍內多數值不收斂 |
-| Echo path 變化後適應慢 | AEC `shadow_mu_nlms`、`shadow_err_alpha`（`aec.h`） | 與 `epc_*` 偵測器聯合調過 |
+| 收斂太慢、濾波器發散、echo path 變化後適應慢 | AEC 內部調校值（`AecTuning`，`src/aec_tuning.h`）；`AecConfig` 沒有對應欄位 | 只能改函式庫並自己重跑三個 grid 的驗證；範圍內多數值不收斂 |
 | Musical noise | NR `alpha_decay`、`alpha_xi`（`anr_types.h`） | 與增益平滑聯合調過；`alpha_g` 在增益路徑上沒有作用，調它無效 |
 | 語音起始被截斷 | NR `alpha_attack`（`anr_types.h`） | 與 `alpha_decay` 成對 |
 | 噪聲環境切換後適應慢 | NR `L`（pool 版面欄位）、`scene_change_*` | `L` 要重新 `anr_get_mem_size()` 並重建實例；`anr_set_level()` 不能改它 |

@@ -28,7 +28,7 @@ def _c_lut_literals():
     return np.array(values, dtype=np.float32)
 
 
-# The library owns the generator behind aec_apply_cng and starts it at AEC_CNG_SEED (aec_post.h) after
+# The library owns the generator behind aec_apply_cng and starts it at AEC_CNG_SEED (aec.h) after
 # every hard post-chain reset, so the examples hold no seed. The C files below keep a generator of their
 # own (an oracle chain, a replay driver, a planted-defect rig) and drive it through the explicit-array forms
 # aec_apply_cng_spec / aec_cng_fill; each must start it from AEC_CNG_SEED and define no seed of its own.
@@ -65,9 +65,9 @@ LIB_SEED = re.compile(r'^#define\s+AEC_CNG_SEED\s+(\d+)u\s*$', re.MULTILINE)
 
 
 def _lib_seed():
-    header = (_aec_include() / 'aec_post.h').read_text(encoding='utf-8')
+    header = (_aec_include() / 'aec.h').read_text(encoding='utf-8')
     found = LIB_SEED.findall(header)
-    assert len(found) == 1, 'AEC_CNG_SEED must be defined once in aec_post.h'
+    assert len(found) == 1, 'AEC_CNG_SEED must be defined once in aec.h'
     return int(found[0])
 
 

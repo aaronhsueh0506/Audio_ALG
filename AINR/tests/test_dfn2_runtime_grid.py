@@ -46,8 +46,8 @@ import dfn_pairs
 FAMILY = 'DeepFilterNet2'
 DFN2 = dfn_pairs.family_dir(FAMILY)
 TESTS_DIR = Path(__file__).resolve().parent
-# dfn2_*.c/.h moved to lib/ainr/dfn2/ in the single-model-release restructuring; DFN2 (still
-# AINR/DeepFilterNet2, the Python training dir) now holds only config.ini and forwarding stubs.
+# dfn2_*.c/.h live in lib/ainr/dfn2/; DFN2 (AINR/DeepFilterNet2, the Python training dir) holds
+# config.ini and the Python side only.
 DFN2_C_DIR = dfn_pairs.AINR.parent / 'lib' / 'ainr' / 'dfn2'
 CHAIN_SOURCE = TESTS_DIR / 'dfn2_runtime_grid_chain.c'
 UNITS = ('process', 'model_io', 'prepost')
@@ -93,7 +93,7 @@ class _Builds:
         stem = 'unit%d_%s' % (next(self._counter), unit)
         obj = self.work / (stem + '.o')
         source = DFN2_C_DIR / ('dfn2_%s.c' % unit)
-        done = _cc([*dfn_pairs.house_cflags(simd), *flags, '-I', str(DFN2), '-c', str(source),
+        done = _cc([*dfn_pairs.house_cflags(simd), *flags, '-I', str(DFN2_C_DIR), '-c', str(source),
                     '-o', str(obj)])
         assert done.returncode == 0, done.stderr
         return obj
@@ -131,7 +131,7 @@ class _Builds:
     def _link_chain(self, flags, simd):
         objs = self._objects[(tuple(flags), simd)]
         exe = self.work / ('chain%d' % next(self._counter))
-        done = _cc([*dfn_pairs.house_cflags(simd), *flags, '-I', str(DFN2), str(CHAIN_SOURCE),
+        done = _cc([*dfn_pairs.house_cflags(simd), *flags, '-I', str(DFN2_C_DIR), str(CHAIN_SOURCE),
                     *map(str, objs), dfn_pairs.audio_common_lib(simd), '-lm', '-o', str(exe)])
         assert done.returncode == 0, done.stderr
         return exe
@@ -149,7 +149,7 @@ class _Builds:
         source = self.work / (stem + '.c')
         source.write_text(main_source, encoding='utf-8')
         exe = self.work / stem
-        done = _cc([*dfn_pairs.house_cflags(simd), *flags, '-I', str(DFN2), str(source),
+        done = _cc([*dfn_pairs.house_cflags(simd), *flags, '-I', str(DFN2_C_DIR), str(source),
                     *map(str, objs), dfn_pairs.audio_common_lib(simd), '-lm', '-o', str(exe)])
         return done, exe
 

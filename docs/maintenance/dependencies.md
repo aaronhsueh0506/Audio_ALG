@@ -89,8 +89,8 @@ the handover documentation, and check them off here.
 
 ## 3. `audiolib` gate
 
-Every repository's Makefile also has the aggregate entry points `make test` (core tier) and `make test-full`
-(extended tier); the lists in sections [3](#3-audiolib-gate) to [9](pipeline.md#9-four-channel-pipeline-gate) name the individual targets that a release report must
+The AEC, NR and audiolib (`common/`) Makefiles also have the aggregate entry points `make test` (core tier) and
+`make test-full` (extended tier); the Audio_ALG Makefiles have `make test` only; the lists in sections [3](#3-audiolib-gate) to [9](pipeline.md#9-four-channel-pipeline-gate) name the individual targets that a release report must
 record one by one.
 
 Run from `audiolib/common/`:

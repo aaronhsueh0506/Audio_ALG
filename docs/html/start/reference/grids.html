@@ -30,16 +30,16 @@ centered 與串流（center=False）framing 在穩態逐 bit 等價。</p>
 <div class="tbl">
 <table>
 <tr><th>元件</th><th>SR</th><th>FFT=frame / hop（bins）</th><th>預設？</th><th>出處</th></tr>
-<tr><td rowspan="4">AEC（<code>lib/aec/c_impl</code>）<br>
+<tr><td rowspan="4">AEC（<code>AEC/c_impl</code>）<br>
 <span class="note">hop=fft/2、block=fft、K=fft/2+1（<code>aec_derive_dims()</code>，<code>aec.c</code>）</span></td>
 <td>8 k</td><td>256 / 128（129）</td><td>預設（唯一）；legacy，非產品格點</td>
-<td rowspan="4"><code>aec.c</code> <code>aec_config_defaults()</code>
-（48k→1024、16k→256、8k→256）與 <code>aec_validate_config()</code> 白名單；
-<code>filter_length</code> 預設 52 ms（=832 taps @16k）、sr≥44100 為 64 ms</td></tr>
+<td rowspan="4"><code>aec.c</code> <code>aec_default_fft_size()</code>／<code>aec_resolve_signal_grid()</code>
+（48k→1024、16k→256、8k→256）白名單；
+濾波器長度由取樣率決定（52 ms = 832 taps @16k、sr≥44100 為 64 ms），不是 <code>AecConfig</code> 欄位</td></tr>
 <tr><td>16 k</td><td><b>256 / 128（129）＝8 ms hop 預設</b></td><td>預設</td></tr>
 <tr><td>16 k</td><td>512 / 256（257）＝16 ms hop</td><td>配置選項（ULCNet/NN 鏈用）</td></tr>
 <tr><td>48 k</td><td>1024 / 512（513）</td><td>預設（唯一）</td></tr>
-<tr><td rowspan="3">NR（<code>lib/nr/c_impl</code>）</td>
+<tr><td rowspan="3">NR（<code>NR/c_impl</code>）</td>
 <td>8 k</td><td>128 / 64（65）；替代 256 / 128</td><td>預設 128</td>
 <td rowspan="3"><code>anr_types.h</code> <code>anr_default_fft_size()</code>
 （48k→1024、16k→256、8k→128；註明 16 ms-hop 替代 grid 8k/256、16k/512）</td></tr>
@@ -85,7 +85,7 @@ vs 上游 4800 Hz）</td><td>執行期給定：應用端填 <code>DFN2GridSpec</
 <td><code>gtcrn_process.h</code></td></tr>
 <tr><td>AINR RNNoise-ERB</td><td>16 k</td>
 <td>512 / 256（257）；22 ERB bands + complex 特徵 0–4 kHz（129 bins）</td>
-<td>執行期給定：<code>RNNoiseGridSpec</code>→<code>rnnoise_grid_make()</code></td><td><code>RNNoise-ERB/process.h</code></td></tr>
+<td>執行期給定：<code>RNNoiseGridSpec</code>→<code>rnnoise_grid_make()</code></td><td><code>lib/ainr/rnnoise_erb/process.h</code></td></tr>
 <tr><td>AIAEC Align-ULCNet</td><td>16 k / 48 k</td>
 <td>256 / 128（129）、512 / 256（257）或 1024 / 512（513）</td><td>訓練端 config 固定；C 端執行期給定（<code>UlcnetGridSpec</code>）</td>
 <td><code>config.ini</code>；<code>export_onnx.py</code> 的
@@ -108,13 +108,13 @@ vs 上游 4800 Hz）</td><td>執行期給定：應用端填 <code>DFN2GridSpec</
 <tr><th>使用點</th><th>程式碼</th></tr>
 <tr><td>AEC RES 分析窗（error_spec_windowed 用）</td>
 <td><code>pbfdkf.c</code> <code>pbfdaf_fill_windows()</code>（<code>ac_window_build()</code>,denom = block_size）</td></tr>
-<tr><td>AEC3 post 合成窗（16k/512 grid 表格化 = sin(πk/512)）</td>
-<td><code>aec_balanced_config.h</code> <code>AECB_SYNTH_WINDOW[512]</code>（per-rate 表）</td></tr>
+<tr><td>AEC3 post 合成窗（值 = sin(πk/N)）</td>
+<td><code>aec_init()</code>／<code>aec_create()</code> 在實例的 pool 內建立（mono 一份，4ch array 一份、lane 不持有），經 <code>aec_synthesis_window()</code> 取得，壽命同 <code>Aec</code>；來源是 <code>aec_balanced_config.h</code> 的半窗表 <code>AECB_SYNTH_WINDOW_HALF</code>（最長已啟用格點的半窗：啟用 48 kHz 時 513 個 float，否則 257 個；較短的格點以固定步幅取值，init 時鏡射展開成整張窗，不呼叫 libm）</td></tr>
 <tr><td>mono 範例合成窗</td><td><code>pipelines/mono/aec_nr_res/main.c</code>：main 自己初始化的 <code>AcIstft</code> 借用 AEC 的窗表（初始化後的 <code>Aec</code> 經 <code>aec_synthesis_window()</code> 取得；<code>AcStftConfig.window</code> 借入，不另切）</td></tr>
 <tr><td>4ch 範例合成窗</td><td><code>pipelines/4ch/4ch_static.c</code>：main 自己初始化的 <code>AcIstft</code> 自帶的窗表（<code>ac_window_build()</code>，<code>audiolib/common/src/audio_window.c</code>）</td></tr>
 <tr><td>DFN rate bridge（原生格點合成 + 48 kHz 分析／合成）</td><td><code>pipelines/dfn/dfn_rate_bridge.c</code>：bridge 自建的兩張表（<code>win_n</code>、<code>win48</code>，<code>ac_window_build()</code>），借給五個 <code>AcStft</code>／<code>AcIstft</code></td></tr>
 <tr><td>ULCNet 兩條範例</td><td>應用端（<code>main.c</code>）的 <code>AcStft</code>／<code>AcIstft</code>（<code>ac_stft_config_default()</code>，<code>AC_OLA_ACCUMULATE</code>）；<code>pipelines/ulcnet/ulcnet_nn_stage.c</code> 本身沒有 FFT</td></tr>
-<tr><td>Align-ULCNet／DeepVQE-S／DFN2／DFN3／GTCRN／RNNoise-ERB 的前後處理</td><td>函式庫不持有窗表、FFT handle 或 STFT 物件：應用端用 <code>ac_stft_config_default(&amp;sc, grid.n_fft)</code> 的預設窗建 <code>AcStft</code>／<code>AcIstft</code>，分析與合成共用；各模型要求的 <code>center</code>、<code>ola</code> 與縮放寫在 <code>ulcnet_process.h</code>、<code>deepvqe_prepost.h</code>、<code>dfn2_process.h</code>、<code>dfn3_process.h</code>、<code>gtcrn_process.h</code>、<code>RNNoise-ERB/process.h</code> 檔頭</td></tr>
+<tr><td>Align-ULCNet／DeepVQE-S／DFN2／DFN3／GTCRN／RNNoise-ERB 的前後處理</td><td>函式庫不持有窗表、FFT handle 或 STFT 物件：應用端用 <code>ac_stft_config_default(&amp;sc, grid.n_fft)</code> 的預設窗建 <code>AcStft</code>／<code>AcIstft</code>，分析與合成共用；各模型要求的 <code>center</code>、<code>ola</code> 與縮放寫在 <code>ulcnet_process.h</code>、<code>deepvqe_prepost.h</code>、<code>dfn2_process.h</code>、<code>dfn3_process.h</code>、<code>gtcrn_process.h</code>、<code>lib/ainr/rnnoise_erb/process.h</code> 檔頭</td></tr>
 <tr><td>AIAEC Python streaming 參考</td>
 <td><code>AIAEC/aiaec_streaming.py</code> StreamSTFT/StreamISTFT（對 torch center=True bit-exact）</td></tr>
 </table>
@@ -157,8 +157,7 @@ partition 的因果半、清掉其餘，避免 wrap-around 能量漏進下一個
 <h2 id="section-4">centered framing 與串流（center=False）framing</h2>
 <p>AINR DFN2 的 C 是 center=False 串流（<code>dfn2_process.h</code> 檔頭的 framing 契約：與訓練 graph 的 center=True 只差一個 clip 的第一幀），
 Align-ULCNet 的 C 出貨路徑也是 center=False rolling 分析，與 torch <code>center=True</code>
-的穩態幀逐 bit 重合（<code>ulcnet_process.h</code> 檔頭 +
-<code>docs/align_ulcnet_embedded_streaming_design_zh_TW_01_state_wola_delay.md</code> §7）。</p>
+的穩態幀逐 bit 重合（<code>ulcnet_process.h</code> 檔頭）。</p>
 <p><b>穩態幀為何重合（逐 bit）：</b>本 grid 下 win = n_fft、hop = win/2、同一
 sqrt-Hann 窗。centered 第 k 幀以樣本 k·hop 為中心，覆蓋
 [k·hop − win/2, k·hop + win/2) = [(k−1)·hop, (k+1)·hop)；
@@ -210,7 +209,7 @@ rolling 排程後兩者天生 hop-locked，不需再靠 centered 排程的 0/2/1
 <div class="tbl">
 <table>
 <tr><th>巨集 = 目前值</th><th>定義處</th><th>意義</th></tr>
-<tr><td><code>AEC_LAYOUT_VERSION</code> = 1</td>
+<tr><td><code>AEC_LAYOUT_VERSION</code> = 2</td>
 <td>AEC 函式庫 <code>aec.h</code>（sibling 檢出）</td>
 <td><code>Aec</code> pool 的版號，單支與 4ch array（<code>AecConfig.n_mics = 4</code>：共享 delay + 4 lanes + 融合與增益級，全在同一塊 pool）共用 <code>AecMemReq</code>；SRP-PHAT/BF 在 sample helper <code>array_sample_beam.h</code>，沒有 descriptor</td></tr>
 <tr><td><code>DFN_RES_STAGE_LAYOUT_VERSION</code> = 6</td>

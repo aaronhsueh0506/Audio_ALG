@@ -6,8 +6,7 @@
  * echo at a known bulk delay) through the real array instance (aec.h, n_mics = 4) and prints, per hop, the
  * published shared-delay state and a hash of the aligned far the four lanes consumed.
  * pipeline.py generates the same scene and must reproduce every column.
- * The matched-filter duty cycle stays off (delay_est_period_s = 0 analyses every hop)
- * because it is a C-only schedule. printf lives in this test binary only; the library stays
+ * The matched-filter duty cycle is a C-only schedule; the library's tuning leaves it off (every hop is analysed). printf lives in this test binary only; the library stays
  * stdio-free.
  *
  * Build:  make -C pipelines/4ch dump_delay_parity
@@ -143,9 +142,9 @@ int main(int argc, char** argv) {
         fprintf(stderr, "array init failed\n");
         return 3;
     }
-    /* delay_est_period_s = 0 (the default) analyses every hop: the duty-cycle schedule is C-only
-     * with no Python counterpart; everything else runs as in production. The schedule is covered
-     * by the AEC library's test_aec_array_flow.c. */
+    /* The library analyses every hop (its duty cycle is off): the schedule is C-only with no
+     * Python counterpart; everything else runs as in production. The schedule is covered by the
+     * AEC library's test_aec_array_flow.c. */
     hop = aec_hop_size(p);
 
     /* `pad` samples of pre-history so the echo is valid from the first

@@ -83,7 +83,7 @@ static void mdfn_destroy(MonoDfn *m) {
     if (!m) return;
     if (m->bridge) dfn_rate_bridge_destroy(m->bridge);
     else if (m->stage) dfn_res_stage_destroy(m->stage);
-    if (m->aec) { aec_destroy(m->aec); free(m->aec); }
+    if (m->aec) aec_destroy(m->aec);
     free(m->post_mem);
     free(m->istft_mem);
     free(m->stage_out);
@@ -103,13 +103,13 @@ static MonoDfn *mdfn_create(int sample_rate, int fft_size, int enable_cng, const
     aec_config_from_level(&lane, AEC_LEVEL_BALANCED, sample_rate);
     lane.fft_size = grid.fft_size;
     lane.delay_mode = AEC_DELAY_MATCHED;
-    lane.delay_num_filters = DA_NUM_FILTERS;
+    lane.delay_num_filters = AEC_DELAY_NUM_FILTERS_MAX;
     lane.fixed_delay_samples = -1;
     lane.residual = AEC_RESIDUAL_FULL;
     m->hop_size = grid.hop_size;
 
-    m->aec = (Aec *)calloc(1, sizeof(Aec));
-    if (!m->aec || aec_create(m->aec, &lane) != 0) { free(m->aec); m->aec = NULL; goto fail; }
+    m->aec = aec_create(&lane);
+    if (!m->aec) goto fail;
 
     m->n_freqs = grid.n_freqs;
     m->enable_cng = enable_cng;
@@ -301,8 +301,8 @@ static int run_identity(int enable_cng) {
  * bridge. The hand-written chain's NR-off output delayed by the bridge's
  * added delay must match within the resampler round-trip error; a near-end
  * impulse pins the delay; the 48 kHz frame schedule is the documented one. */
-static int run_native(int sample_rate, int fft_size, int expected_sixths, int sabotage) {
-    MonoDfn *dfn = mdfn_create(sample_rate, fft_size, 0, NULL);
+static int run_native_rows(MonoDfn *dfn, ConvMono **baseline_out, int sample_rate, int fft_size, int expected_sixths,
+                           int sabotage) {
     ConvMonoConfig bcfg = conv_mono_default_config(sample_rate, fft_size);
     ConvMono *baseline;
     static float mic[512], ref[512], out[512];
@@ -329,6 +329,7 @@ static int run_native(int sample_rate, int fft_size, int expected_sixths, int sa
     bcfg.enable_res = 1;
     bcfg.enable_cng = 0;
     baseline = conv_mono_create(&bcfg);
+    *baseline_out = baseline;
     if (!baseline || baseline->hop != hop) return 3;
     n = frames * hop;
 
@@ -392,9 +393,16 @@ static int run_native(int sample_rate, int fft_size, int expected_sixths, int sa
     if (!(max_err < 1e-3f)) return 7;
     /* the stream must carry hard-reset events, or the row says nothing about the synthesis clear */
     if (dfn->reset_hops < 1) return 15;
+    return 0;
+}
+
+static int run_native(int sample_rate, int fft_size, int expected_sixths, int sabotage) {
+    MonoDfn *dfn = mdfn_create(sample_rate, fft_size, 0, NULL);
+    ConvMono *baseline = NULL;
+    int rc = run_native_rows(dfn, &baseline, sample_rate, fft_size, expected_sixths, sabotage);
     conv_mono_destroy(baseline);
     mdfn_destroy(dfn);
-    return 0;
+    return rc;
 }
 
 
@@ -475,7 +483,7 @@ done:
 static void run_post_chain(const GuardScene *sc, int sabotage, SceneRun *out) {
     MonoDfn *dfn = mdfn_create(sc->sr, sc->fft, sc->enable_cng, NULL);
     AecConfig cfg;
-    Aec *oracle = (Aec *)calloc(1, sizeof(Aec));
+    Aec *oracle = NULL;
     AcStftConfig scfg;
     AcIstft *probe = NULL;
     void *probe_mem = NULL;
@@ -485,13 +493,14 @@ static void run_post_chain(const GuardScene *sc, int sabotage, SceneRun *out) {
     want = (float *)malloc((size_t)hop * sizeof(float));
     got = (float *)malloc((size_t)hop * sizeof(float));
     scratch = (float *)malloc((size_t)(hop + 4096) * sizeof(float));
-    if (!dfn || !oracle || !want || !got || !scratch) goto done;
+    if (!dfn || !want || !got || !scratch) goto done;
     aec_config_from_level(&cfg, AEC_LEVEL_BALANCED, sc->sr);
     cfg.fft_size = sc->fft;
     cfg.residual = AEC_RESIDUAL_FULL;
     cfg.enable_cng = sc->enable_cng;
     ac_stft_config_default(&scfg, sc->fft);
-    if (aec_create(oracle, &cfg) != 0 ||
+    oracle = aec_create(&cfg);
+    if (!oracle ||
         aec_synthesis_window(oracle, &scfg.window, &win_n) != 0 || win_n != sc->fft ||
         posix_memalign(&probe_mem, 16, ac_istft_get_mem_size(&scfg)) != 0)
         goto done;
@@ -516,7 +525,7 @@ static void run_post_chain(const GuardScene *sc, int sabotage, SceneRun *out) {
     out->reset_hops = dfn->reset_hops;
 done:
     free(want); free(got); free(scratch);
-    if (oracle) { aec_destroy(oracle); free(oracle); }
+    if (oracle) aec_destroy(oracle);
     free(probe_mem);
     mdfn_destroy(dfn);
 }
@@ -616,7 +625,7 @@ static void run_bridge_scene(const GuardScene *sc, int sabotage, BridgeSceneRun 
     ConvMonoConfig bcfg = conv_mono_default_config(sc->sr, sc->fft);
     ConvMono *chain;
     AecConfig cfg;
-    Aec *oracle = (Aec *)calloc(1, sizeof(Aec));
+    Aec *oracle = NULL;
     AcStftConfig scfg;
     AcIstft *probe = NULL;
     void *probe_mem = NULL;
@@ -632,13 +641,14 @@ static void run_bridge_scene(const GuardScene *sc, int sabotage, BridgeSceneRun 
     chain_hop = (float *)malloc((size_t)hop * sizeof(float));
     probe_hop = (float *)malloc((size_t)hop * sizeof(float));
     scratch = (float *)malloc((size_t)hop * sizeof(float));
-    if (!dfn || !dfn->bridge || !chain || !oracle || !want || !chain_hop || !probe_hop || !scratch) goto done;
+    if (!dfn || !dfn->bridge || !chain || !want || !chain_hop || !probe_hop || !scratch) goto done;
     aec_config_from_level(&cfg, AEC_LEVEL_BALANCED, sc->sr);
     cfg.fft_size = sc->fft;
     cfg.residual = AEC_RESIDUAL_FULL;
     cfg.enable_cng = sc->enable_cng;
     ac_stft_config_default(&scfg, sc->fft);
-    if (aec_create(oracle, &cfg) != 0 ||
+    oracle = aec_create(&cfg);
+    if (!oracle ||
         posix_memalign(&probe_mem, 16, ac_istft_get_mem_size(&scfg)) != 0)
         goto done;
     probe = ac_istft_init(probe_mem, ac_istft_get_mem_size(&scfg), &scfg);
@@ -685,7 +695,7 @@ static void run_bridge_scene(const GuardScene *sc, int sabotage, BridgeSceneRun 
 done:
     free(want); free(chain_hop); free(probe_hop); free(scratch);
     free(probe_mem);
-    if (oracle) { aec_destroy(oracle); free(oracle); }
+    if (oracle) aec_destroy(oracle);
     conv_mono_destroy(chain);
     mdfn_destroy(dfn);
 }

@@ -1,13 +1,64 @@
 /* Align-ULCNet PCM stream: everything (no file-loader TU for this model). No <stdio.h>, no
  * malloc/calloc/posix_memalign anywhere in this TU -- it links into a NO_STDIO target. See
- * ulcnet_stream.h for the public contract and ulcnet_stream_internal.h for the pool layout this
- * file carves and constructs. */
+ * ulcnet_stream.h for the public contract. */
 
+#include <stddef.h>
+#include <stdint.h>
 #include <string.h>
 
-#include "ulcnet_stream_internal.h"
+#include "ulcnet_stream.h"
+#include "fft_wrapper.h"
+#include "audio_stft.h"
 #include "utility/mem_align.h"
 #include "stream_mem.h"
+
+/* IDLE: no pending hop (post_process refuses with -1). FRAME_OPEN: frame_open() ran; post_process dispatches
+ * frame_finish / frame_bypass on ai_rc. FRAME_CLOSED: a reprime hop, already bypassed in pre_process; ai_rc is ignored. */
+enum {
+    ULCNET_STREAM_IDLE = 0,
+    ULCNET_STREAM_FRAME_OPEN = 1,
+    ULCNET_STREAM_FRAME_CLOSED = 2
+};
+
+struct UlcnetStream {
+    UlcnetGrid grid;
+    int frames;         /* hops per accelerator job: 1, or the packet size */
+
+    FftHandle *fft;     /* shared by stft_err / stft_far / istft */
+    AcStft    *stft_err;
+    AcStft    *stft_far;
+    AcIstft   *istft;
+    UlcnetPrepost *prepost;
+
+    /* Per-job scratch, one slab: err_f / far_f / hop_out [hop], err_re / err_im / far_re / far_im / enh_re / enh_im [frames * n_bins]. */
+    float *err_f;
+    float *far_f;
+    float *hop_out;
+    float *err_re;
+    float *err_im;
+    float *far_re;
+    float *far_im;
+    float *enh_re;
+    float *enh_im;
+
+    int hop_state;              /* ULCNET_STREAM_IDLE / _FRAME_OPEN / _FRAME_CLOSED */
+    int had_hop;                 /* 0 until the first pre_process call completes */
+    int prev_solid;               /* delay.solid as of the previous hop */
+    unsigned reprime_remaining;  /* identity hops still owed after an alignment-edge reset */
+    uint64_t restart_mask;       /* bit k: hop k of the last PCM-entry pre_process restarted the stream's own framing */
+};
+
+typedef struct UlcnetStreamLayout {
+    UlcnetStream *self;
+    void *fft_mem;
+    void *stft_err_mem;
+    void *stft_far_mem;
+    void *istft_mem;
+    void *prepost_mem;
+    size_t prepost_bytes;
+    void *scratch_mem;   /* the per-job scratch slab */
+    uint32_t prepost_build_hash;   /* UlcnetPrepostMemReq.build_flags_hash, folded into this stream's hash */
+} UlcnetStreamLayout;
 
 #define ULCNET_STREAM_ALIGN ULCNET_STREAM_ALIGNMENT
 
@@ -55,8 +106,11 @@ static int cfg_valid(const UlcnetStreamConfig *cfg) {
     return 1;
 }
 
-int ulcnet_stream_layout(const UlcnetStreamConfig *cfg, unsigned char *base,
-                         UlcnetStreamLayout *out, size_t *total) {
+/* One carve walk: sizing (base == NULL, *out pointers stay NULL) or carving; *total must match across both with one cfg.
+ * -1 on a bad config or an overflowing carve. Order (bump LAYOUT_VERSION and build_flags_hash on a change): self, fft,
+ * stft_err, stft_far, istft, prepost, scratch. */
+static int ulcnet_stream_layout(const UlcnetStreamConfig *cfg, unsigned char *base,
+                                UlcnetStreamLayout *out, size_t *total) {
     size_t cursor = 0;
     void *ptr;
     AcStftConfig scfg;
@@ -155,8 +209,9 @@ int ulcnet_stream_get_mem_size(const UlcnetStreamConfig *cfg, UlcnetStreamMemReq
     return 0;
 }
 
-int ulcnet_stream_descriptor_matches(const UlcnetStreamMemReq *expected,
-                                     const UlcnetStreamMemReq *req) {
+/* Field-by-field memory-requirement comparison for the stale-pool gate. */
+static int ulcnet_stream_descriptor_matches(const UlcnetStreamMemReq *expected,
+                                            const UlcnetStreamMemReq *req) {
     return expected->descriptor_version == req->descriptor_version &&
            expected->layout_version == req->layout_version &&
            expected->reserved0 == req->reserved0 &&
@@ -166,8 +221,10 @@ int ulcnet_stream_descriptor_matches(const UlcnetStreamMemReq *expected,
            expected->bytes == req->bytes;
 }
 
-UlcnetStream *ulcnet_stream_finish_init(const UlcnetStreamConfig *cfg, unsigned char *base,
-                                        const UlcnetStreamLayout *layout) {
+/* Constructs every carved object; NULL leaves no valid instance. Called after ulcnet_stream_layout() and the caller's
+ * size / alignment / stale-pool checks. */
+static UlcnetStream *ulcnet_stream_finish_init(const UlcnetStreamConfig *cfg, unsigned char *base,
+                                               const UlcnetStreamLayout *layout) {
     UlcnetStream *s;
     AcStftConfig scfg;
     UlcnetPrepostConfig pcfg;
@@ -274,27 +331,12 @@ uint32_t ulcnet_stream_state_generation(const UlcnetStream *s) {
     return s ? ulcnet_prepost_state_generation(s->prepost) : 0u;
 }
 
-const UlcnetGrid *ulcnet_stream_grid(const UlcnetStream *s) {
-    return s ? &s->grid : NULL;
-}
-
 int ulcnet_stream_hop_size(const UlcnetStream *s) {
     return s ? s->grid.hop : -1;
 }
 
-int ulcnet_stream_frames_per_call(const UlcnetStream *s) {
-    return s ? s->frames : -1;
-}
-
 uint64_t ulcnet_stream_restart_mask(const UlcnetStream *s) {
     return s ? s->restart_mask : 0u;
-}
-
-int ulcnet_stream_layout_version(const UlcnetStream *s) {
-    const UlcnetModelIoDescriptor *d;
-    if (!s) return -1;
-    d = ulcnet_prepost_descriptor(s->prepost);
-    return d ? (int)d->layout_version : -1;
 }
 
 /* Alignment-edge detection, before the hop's own analysis: a new alignment generation, or the

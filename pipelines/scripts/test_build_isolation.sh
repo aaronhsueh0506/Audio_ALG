@@ -28,10 +28,10 @@
 #     after the ISOL_INTERRUPT_PROBE early return and before `export TMPDIR=...`, so it resolves against the
 #     invoking TMPDIR.
 #
-# AEC/NR note: the scenarios that use OBJ_ROOT=/BIN_ROOT=/ALLOW_DIRTY_PUBLISH=/ATTEST_STAMP= or the -n/-q/-t
-# dry-run guard on the AEC/NR Makefiles target $AEC_R6_DIR/$NR_R6_DIR (the primary repos' c_impl/, siblings of
-# Audio_ALG), not the submodule paths $AEC_DIR/$NR_DIR; scenarios that need only basic behavior (normal all/lib
-# builds, print-lib-path) use the submodule paths.
+# AEC/NR note: $AEC_DIR/$NR_DIR are what lib/deps.mk resolves (the primary repos' c_impl/, siblings of Audio_ALG,
+# or the AEC_DIR/NR_DIR of the environment), so $AEC_R6_DIR/$NR_R6_DIR and $AEC_DIR/$NR_DIR name the same
+# directories; the scenarios keep both names for the OBJ_ROOT=/BIN_ROOT=/ALLOW_DIRTY_PUBLISH=/ATTEST_STAMP=/-n/-q/-t
+# scratch-root cases and the basic builds (normal all/lib builds, print-lib-path).
 #
 # Scenario index:
 #   S6:      audit-no-stdio false-pass check (the nm filter must be able to report a stdio reference)
@@ -124,10 +124,13 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 SCRIPT_PATH="$SCRIPT_DIR/$(basename "${BASH_SOURCE[0]}")"
 PIPE_DIR="$(cd "$SCRIPT_DIR/.." && pwd)"
 AUDIO_ALG_ROOT="$(cd "$PIPE_DIR/.." && pwd)"
-COMMON_DIR="$(cd "$PIPE_DIR/../../audiolib/common" && pwd)"
-AUDIOLIB_DIR="$(cd "$PIPE_DIR/../../audiolib" && pwd)"
-AEC_DIR="$(cd "$PIPE_DIR/../lib/aec/c_impl" && pwd)"
-NR_DIR="$(cd "$PIPE_DIR/../lib/nr/c_impl" && pwd)"
+# The producers are where lib/deps.mk resolves them (an AEC_DIR / NR_DIR / AUDIOLIB_DIR / COMMON_DIR in the
+# environment wins, as for every Makefile), not the lib/aec and lib/nr gitlink worktrees.
+eval "$(make -s --no-print-directory -f "$AUDIO_ALG_ROOT/lib/deps.mk" print-deps-sh)"
+COMMON_DIR="$(cd "$COMMON_DIR" && pwd)"
+AUDIOLIB_DIR="$(cd "$AUDIOLIB_DIR" && pwd)"
+AEC_DIR="$(cd "$AEC_DIR" && pwd)"
+NR_DIR="$(cd "$NR_DIR" && pwd)"
 AEC_SUB_ROOT="$(cd "$AEC_DIR/.." && pwd)"
 NR_SUB_ROOT="$(cd "$NR_DIR/.." && pwd)"
 RNN_DIR="$(cd "$PIPE_DIR/../AINR/RNNoise-ERB" && pwd)"
@@ -136,10 +139,10 @@ RNN_DIR="$(cd "$PIPE_DIR/../AINR/RNNoise-ERB" && pwd)"
 # OBJ_ROOT=/BIN_ROOT=/ALLOW_DIRTY_PUBLISH=/ATTEST_STAMP=/-n/-q/-t dry-run guard
 # features and so target these PRIMARY sibling repos ($AEC_R6_DIR/$NR_R6_DIR)
 # instead of $AEC_DIR/$NR_DIR.
-AEC_REPO_DIR="$(cd "$PIPE_DIR/../../AEC" && pwd)"
-AEC_R6_DIR="$AEC_REPO_DIR/c_impl"
-NR_REPO_DIR="$(cd "$PIPE_DIR/../../NR" && pwd)"
-NR_R6_DIR="$NR_REPO_DIR/c_impl"
+AEC_REPO_DIR="$AEC_SUB_ROOT"
+AEC_R6_DIR="$AEC_DIR"
+NR_REPO_DIR="$NR_SUB_ROOT"
+NR_R6_DIR="$NR_DIR"
 
 # --- single scratch root, single trap -------------------------------------------
 SCRATCH_ROOT="$(mktemp -d)"
@@ -1718,6 +1721,13 @@ mkscratch sp17
 SP17_AC_CLONE="$PSHARED_AC_CLONE"
 SP17_AEC_CLONE="$PSHARED_AEC_CLONE"
 SP17_NR_CLONE="$PSHARED_NR_CLONE"
+# The clones' HEAD is the producers' HEAD, or one throwaway adoption commit above it when a producer working tree is
+# dirty (adopt_worktree_clone). This scenario tests the dirty-publish policy and the attestation fields, not pin
+# equality, so check-pins is given the clones (audiolib's repo root included) and their own HEADs; the pin check itself runs on the real trees in S7.
+SP17_PIN_ARGS=(AUDIOLIB_DIR="$PSHARED_AUDIOLIB_CLONE"
+               AUDIOLIB_COMMIT="$(git -C "$SP17_AC_CLONE" rev-parse HEAD)"
+               AEC_COMMIT="$(git -C "$SP17_AEC_CLONE" rev-parse HEAD)"
+               NR_COMMIT="$(git -C "$SP17_NR_CLONE" rev-parse HEAD)")
 
 # Dirty each clone with a disposable, comment-only edit to one tracked
 # source -- this scenario tests the DIRTY-PUBLISH POLICY (attestation
@@ -1751,7 +1761,7 @@ SP17_LOG_OK="$SCRATCH_ROOT/sp17/log_ok"
 # edits above), but uniform with every other publish call in this script from
 # S7 onward.
 if make -s BACKEND=ne10 DIST_ROOT="$SP17_DIST" OBJ_ROOT="$SP17_OBJ_ROOT" BIN_ROOT="$SP17_BIN_ROOT" \
-     COMMON_DIR="$SP17_AC_CLONE" AEC_DIR="$SP17_AEC_CLONE/c_impl" NR_DIR="$SP17_NR_CLONE/c_impl" \
+     COMMON_DIR="$SP17_AC_CLONE" AEC_DIR="$SP17_AEC_CLONE/c_impl" NR_DIR="$SP17_NR_CLONE/c_impl" "${SP17_PIN_ARGS[@]}" \
      ALLOW_DIRTY_PUBLISH=1 ALLOW_UNTRACKED_PUBLISH=1 publish >"$SP17_LOG_OK" 2>&1; then
   pass "SP-S17: publish against three dirty producer clones + ALLOW_DIRTY_PUBLISH=1 succeeds"
 else
@@ -1787,7 +1797,7 @@ fi
 
 SP17_LOG_FAIL="$SCRATCH_ROOT/sp17/log_fail"
 if make -s BACKEND=ne10 DIST_ROOT="$SP17_DIST" OBJ_ROOT="$SP17_OBJ_ROOT" BIN_ROOT="$SP17_BIN_ROOT" \
-     COMMON_DIR="$SP17_AC_CLONE" AEC_DIR="$SP17_AEC_CLONE/c_impl" NR_DIR="$SP17_NR_CLONE/c_impl" \
+     COMMON_DIR="$SP17_AC_CLONE" AEC_DIR="$SP17_AEC_CLONE/c_impl" NR_DIR="$SP17_NR_CLONE/c_impl" "${SP17_PIN_ARGS[@]}" \
      publish >"$SP17_LOG_FAIL" 2>&1; then
   fail "SP-S17: publish against the same dirty producer clones WITHOUT ALLOW_DIRTY_PUBLISH unexpectedly SUCCEEDED"
 else
@@ -1812,7 +1822,7 @@ echo "int sp17a_untracked_probe;" > "$SP17_AC_CLONE/probe.c"
 
 SP17_LOG_A1="$SCRATCH_ROOT/sp17/log_untracked_a1"
 if make -s BACKEND=ne10 DIST_ROOT="$SP17_DIST" OBJ_ROOT="$SP17_OBJ_ROOT" BIN_ROOT="$SP17_BIN_ROOT" \
-     COMMON_DIR="$SP17_AC_CLONE" AEC_DIR="$SP17_AEC_CLONE/c_impl" NR_DIR="$SP17_NR_CLONE/c_impl" \
+     COMMON_DIR="$SP17_AC_CLONE" AEC_DIR="$SP17_AEC_CLONE/c_impl" NR_DIR="$SP17_NR_CLONE/c_impl" "${SP17_PIN_ARGS[@]}" \
      ALLOW_DIRTY_PUBLISH=1 publish >"$SP17_LOG_A1" 2>&1; then
   fail "SP-S17a: ALLOW_DIRTY_PUBLISH=1 ALONE unexpectedly admitted an untracked file in audiolib"
 else
@@ -1826,7 +1836,7 @@ fi
 
 SP17_LOG_A2="$SCRATCH_ROOT/sp17/log_untracked_a2"
 if make -s BACKEND=ne10 DIST_ROOT="$SP17_DIST" OBJ_ROOT="$SP17_OBJ_ROOT" BIN_ROOT="$SP17_BIN_ROOT" \
-     COMMON_DIR="$SP17_AC_CLONE" AEC_DIR="$SP17_AEC_CLONE/c_impl" NR_DIR="$SP17_NR_CLONE/c_impl" \
+     COMMON_DIR="$SP17_AC_CLONE" AEC_DIR="$SP17_AEC_CLONE/c_impl" NR_DIR="$SP17_NR_CLONE/c_impl" "${SP17_PIN_ARGS[@]}" \
      ALLOW_DIRTY_PUBLISH=1 ALLOW_UNTRACKED_PUBLISH=1 publish >"$SP17_LOG_A2" 2>&1; then
   pass "SP-S17a: ALLOW_DIRTY_PUBLISH=1 + ALLOW_UNTRACKED_PUBLISH=1 together succeed with an untracked audiolib file present"
 else
@@ -1859,7 +1869,7 @@ tar -c -C "$AEC_REPO_DIR" --exclude obj --exclude bin --exclude dist --exclude .
 
 SP17_LOG_B="$SCRATCH_ROOT/sp17/log_unknown_aec"
 if make -s BACKEND=ne10 DIST_ROOT="$SP17_DIST" OBJ_ROOT="$SP17_OBJ_ROOT" BIN_ROOT="$SP17_BIN_ROOT" \
-     COMMON_DIR="$SP17_AC_CLONE" AEC_DIR="$SP17B_NOGIT_AEC/c_impl" NR_DIR="$SP17_NR_CLONE/c_impl" \
+     COMMON_DIR="$SP17_AC_CLONE" AEC_DIR="$SP17B_NOGIT_AEC/c_impl" NR_DIR="$SP17_NR_CLONE/c_impl" "${SP17_PIN_ARGS[@]}" \
      ALLOW_DIRTY_PUBLISH=1 ALLOW_UNTRACKED_PUBLISH=1 publish >"$SP17_LOG_B" 2>&1; then
   fail "SP-S17b: publish with AEC_DIR pointed at a no-git copy unexpectedly SUCCEEDED (unknown identity slipped past both hatches)"
 else

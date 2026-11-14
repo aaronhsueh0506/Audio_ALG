@@ -163,18 +163,18 @@
   <tr><td>計算量</td><td>依 grid、partition、shadow 與 backend</td><td>依 n_freqs、MCRA 視窗與 backend</td><td>release 前在目標 SoC profile，不使用本頁固定估算</td></tr>
 </table>
 
-<h3>6.2 AEC 收斂與保護時間（來自 config 常數）</h3>
+<h3>6.2 AEC 收斂與保護時間（函式庫內部調校值，不是 AecConfig 欄位）</h3>
 
 <table>
   <tr><th>項目</th><th>時間</th><th>出處</th></tr>
-  <tr><td>Warmup（不更新收斂判定）</td><td>1.0 s</td><td><code>warmup_frames</code> = 100 hops @10 ms 格點撰寫，建立時 retime；僅在有效 far-active hop 遞減</td></tr>
-  <tr><td>EPC hangover</td><td>200 ms</td><td><code>epc_hangover</code> = 20 hops @10 ms，建立時 retime</td></tr>
+  <tr><td>Warmup（不更新收斂判定）</td><td>1.0 s</td><td>內部值 <code>warmup_frames</code> = 100 hops @10 ms 格點撰寫，建立時 retime；僅在有效 far-active hop 遞減</td></tr>
+  <tr><td>EPC hangover</td><td>200 ms</td><td>內部值 <code>epc_hangover</code> = 20 hops @10 ms，建立時 retime</td></tr>
   <tr><td>冷啟動到 ERLE 10／20／30 dB、EPC 後 re-convergence、stationary far-end 收斂</td><td>待量測</td><td>取決於 far-end 頻寬與 echo 路徑；本頁不重複舊量測，量測方式見 <a href="../../libraries/index.html#aec">AEC README</a></td></tr>
 </table>
 
 <h3>6.4 AEC Level — 單一 Pareto 旋鈕</h3>
 
-<p style="margin: 8px 0 4px;">level 改動的欄位為 <code>min_gain_floor_far_active_db</code>（far-active 殘響 gain 地板，權衡回音消除 ↔ 近端保留）、<code>min_gain_floor_dt_db</code>（double-talk 地板）與 <code>min_gain_split_floor_enabled</code>（<code>aec_config_from_level()</code> 實測）：</p>
+<p style="margin: 8px 0 4px;"><code>AecConfig.level</code> 是這條軸唯一的公開設定，它決定函式庫內部的三個值：<code>min_gain_floor_far_active_db</code>（far-active 殘響 gain 地板，權衡回音消除 ↔ 近端保留）、<code>min_gain_floor_dt_db</code>（double-talk 地板）與 <code>min_gain_split_floor_enabled</code>。下表可由 <code>aec_internal.h</code> 的 <code>aec_level_floor_db()</code>／<code>aec_level_dt_floor_db()</code>／<code>aec_level_split_floor_enabled()</code> 讀出：</p>
 
 <table>
   <tr><th>Level</th><th>far-active floor</th><th>DT floor</th><th>split floor</th><th>特性 / 場景</th></tr>

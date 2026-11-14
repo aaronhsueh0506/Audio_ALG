@@ -225,7 +225,7 @@ ATTEST_STAMP ?=
 
 # EXTRA_CFLAGS is forwarded to the producer builds and to this pipeline's own compile (the
 # producers' Makefiles already do `CFLAGS += $(EXTRA_CFLAGS)`). The matched-filter and
-# delay-estimator duty-cycle arithmetic is built in unconditionally (lib/aec/c_impl/src/delay_aec.c).
+# delay-estimator duty-cycle arithmetic is built in unconditionally (AEC's c_impl/src/delay_aec.c).
 # Changing EXTRA_CFLAGS, SIMD, WERROR or NO_STDIO needs no `make clean-libs`: every Makefile in the
 # stack keys its objects/archives on the same axes.
 EXTRA_CFLAGS ?=
@@ -434,6 +434,7 @@ LINK = $(CXX)
 # must therefore reach every lib/aec and lib/nr sub-make (queries and real builds): otherwise a `lib`
 # build would land in a different keyed directory than the query resolved and the archive-exists
 # assertion in the FORCE rule would fail.
+# PROFILE is read by AEC's Makefile only (NR's and audiolib's ignore it); it rides in the one list all three producers get.
 FWD = BACKEND=$(BACKEND) SIMD=$(SIMD) PROFILE=$(PROFILE) WERROR=$(WERROR) CC='$(CC)' CXX='$(CXX)' EXTRA_CFLAGS='$(EXTRA_CFLAGS)' NO_STDIO=$(NO_STDIO) TOOLCHAIN_CHECK=$(TOOLCHAIN_CHECK) DEBUG=$(DEBUG)
 AEC_FWD = $(FWD) AEC_NO_ARRAY=$(AEC_NO_ARRAY)
 
@@ -585,7 +586,7 @@ $(OBJ_DIR)/ulcnet_nn_stage.o: ulcnet/ulcnet_nn_stage.c ulcnet/ulcnet_nn_stage.h 
 
 # test_mono_ulcnet: the mono linear AEC feeding the stage (identity end to end, alignment
 # events from the real delay state, reprime, model policy on real framing).
-$(OBJ_DIR)/test_mono_ulcnet.o: mono/alignulcnet/tests/test_mono_ulcnet.c ulcnet/ulcnet_nn_stage.h | _cfg_guard
+$(OBJ_DIR)/test_mono_ulcnet.o: mono/alignulcnet/tests/test_mono_ulcnet.c ulcnet/ulcnet_nn_stage.h ulcnet/tests/ulcnet_test_fixture.h | _cfg_guard
 	$(CC) $(CFLAGS) -I$(ULCNET_DIR) -MD -MP -c -o $@ $<
 
 # test_ulcnet_nn_stage: the stage alone, inside the application's own AcStft / AcIstft (model policy, WOLA)
@@ -648,7 +649,7 @@ DFN_PIPELINE_OBJS = $(OBJ_DIR)/dfn_rate_bridge.o $(DFN_STAGE_OBJS)
 # NR_LIB, always set together by phase 1's re-invoke) is known.
 # =============================================================================
 ifneq ($(COMMON_LIB),)
-.PHONY: all test libs aec_nr_pipeline aec_nr_pipeline_static mono_alignulcnet mono_aec_dfn_res test_mono_chain test_mono_ulcnet test_ulcnet_accelerator_adapter test_dfn_res_stage test_dfn_rate_bridge test_mono_dfn test_array_sample_post test_readme_flow test_dfn_hop test_ulcnet_nn_stage example-adapter example_board_adapter libaudio_pipeline_dfn.a FORCE
+.PHONY: all test libs aec_nr_pipeline aec_nr_pipeline_static mono_alignulcnet mono_aec_dfn_res test_mono_chain test_mono_ulcnet test_ulcnet_accelerator_adapter test_dfn_res_stage test_dfn_rate_bridge test_mono_dfn test_array_sample_post test_readme_flow test_dfn_hop test_ulcnet_nn_stage example-adapter libaudio_pipeline_dfn.a FORCE
 # This branch is entered through the recursive `$(MAKE) ... COMMON_LIB=... AEC_LIB=... NR_LIB=...`
 # re-invoke. Make folds command-line variables into MAKEOVERRIDES/MAKEFLAGS for every further
 # $(MAKE) recipe, where another Makefile's own producer variables would collide with them.
@@ -693,22 +694,8 @@ test: $(BIN_DIR)/test_mono_chain $(BIN_DIR)/aec_nr_pipeline $(BIN_DIR)/aec_nr_pi
 # 1024 model only (pool query rejected, exit 1); a pair outside the table is a rejected argument (2).
 	out="$$("$(abspath $(BIN_DIR))/mono_aec_dfn_res" --ai-sample-rate 16000 --ai-fft-size 256)" && printf '%s\n' "$$out" | grep -q "model grid 16000 Hz / FFT 256 (n_erb 24, df_bins 96, lookahead 0/0), the stage on the host grid"
 	out="$$("$(abspath $(BIN_DIR))/mono_aec_dfn_res" --ai-sample-rate 48000 --ai-fft-size 1024 --sample-rate 48000)" && printf '%s\n' "$$out" | grep -q "model grid 48000 Hz / FFT 1024 (n_erb 32, df_bins 96, lookahead 1/1), the stage on the host grid"
-	"$(abspath $(BIN_DIR))/mono_aec_dfn_res" --ai-sample-rate 32000 --ai-fft-size 512 >/dev/null 2>&1; test $$? -eq 2
-	"$(abspath $(BIN_DIR))/mono_aec_dfn_res" --ai-sample-rate 16000 --ai-fft-size 256 --sample-rate 8000 >/dev/null 2>&1; test $$? -eq 1
-	"$(abspath $(BIN_DIR))/mono_aec_dfn_res" --ai-sample-rate 16000 --ai-fft-size 256 --sample-rate 48000 >/dev/null 2>&1; test $$? -eq 1
-	for a in "--ai-sample-rate 44100" "--ai-sample-rate 16000" "--ai-fft-size 512" "--ai-fft-size 256x" "--ai-sample-rate --cng" "--ai-fft-size --cng"; do "$(abspath $(BIN_DIR))/mono_aec_dfn_res" $$a >/dev/null 2>&1; test $$? -eq 2 || exit 1; done
-# Malformed numbers (DFN2 and ULCNet examples) are refused at parse time with the documented exit code 2,
-# not merely "some failure" (a crash or a later pool rejection is nonzero too).
-	"$(abspath $(BIN_DIR))/mono_aec_dfn_res" --sample-rate 16000Hz >/dev/null 2>&1; test $$? -eq 2
-	"$(abspath $(BIN_DIR))/mono_aec_dfn_res" --delay-mode fixed --fixed-delay 12x >/dev/null 2>&1; test $$? -eq 2
-	"$(abspath $(BIN_DIR))/mono_aec_dfn_res" --atten-lim 12dB >/dev/null 2>&1; test $$? -eq 2
-# An option followed by another option has no value (exit 2); "-x" is a value, here a file that is missing (exit 1).
-	for a in "--erb-fwd --cng --erb-inv x" "--erb-inv --cng --erb-fwd x" "--erb-fwd" "--atten-lim --cng" "--sample-rate --cng" "--delay-num-filters --cng" "--delay-mode --" "--fixed-delay --"; do "$(abspath $(BIN_DIR))/mono_aec_dfn_res" $$a >/dev/null 2>&1; test $$? -eq 2 || exit 1; done
-	"$(abspath $(BIN_DIR))/mono_aec_dfn_res" --erb-fwd -x --erb-inv -y >/dev/null 2>&1; test $$? -eq 1
-	"$(abspath $(BIN_DIR))/mono_alignulcnet" --delay-num-filters 3x >/dev/null 2>&1; test $$? -eq 2
-	"$(abspath $(BIN_DIR))/mono_alignulcnet" --delay-mode fixed --fixed-delay 12x >/dev/null 2>&1; test $$? -eq 2
-# Empty, leading or trailing garbage and out-of-int-range numbers.
-	for v in "" " 3" "3 " x3 +-1 99999999999 999999999999999999999999; do "$(abspath $(BIN_DIR))/mono_alignulcnet" --delay-num-filters "$$v" >/dev/null 2>&1; test $$? -eq 2 || exit 1; done
+	sh scripts/test_cli_exit_codes.sh mono_aec_dfn_res "$(abspath $(BIN_DIR))/mono_aec_dfn_res"
+	sh scripts/test_cli_exit_codes.sh mono_alignulcnet "$(abspath $(BIN_DIR))/mono_alignulcnet"
 
 # example-adapter: build + RUN the REFERENCE ONLY
 # board-adapter host simulation (example_board_adapter.c) standalone -- same
@@ -718,11 +705,6 @@ test: $(BIN_DIR)/test_mono_chain $(BIN_DIR)/aec_nr_pipeline $(BIN_DIR)/aec_nr_pi
 # `make test` does.
 example-adapter: $(BIN_DIR)/example_board_adapter
 	"$(abspath $(BIN_DIR))/example_board_adapter"
-
-# Root-name alias for the binary itself (mirrors test_mono_chain: below)
-# -- `example-adapter` (above) is the build-AND-run entry point; this is just
-# "build the binary" for whoever wants that split.
-example_board_adapter: $(BIN_DIR)/example_board_adapter
 
 # libs: alias that builds the three producer archives (an automatic side
 # effect of the FORCE rules below) and asserts the local DFN pipeline archive

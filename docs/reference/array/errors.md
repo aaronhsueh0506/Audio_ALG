@@ -30,7 +30,7 @@
 |---|---|---|---|
 | 1 | `a` 為 NULL、`mics` 或 `ref` 為 NULL；陣列已 destroy | `AEC_ERR_ARG`(−1) | 無 |
 | 2 | `mics`（`hop*4` 個）或 `ref`（`hop` 個）含非有限值 | `AEC_ERR_ARG`(−1) | 什麼都不改：耗時記錄、linear 有效旗標、上一個 hop 的視圖與自適應狀態（lane、estimator、ring）都保持原樣 |
-| 3 | 內部 render 對齊失敗（例如目前採用的延遲超過 ring 能供應的範圍，如 `max_delay_ms = 0` 卻估到 608 samples（16 kHz 下約 38 ms）的回音延遲） | `AEC_ERR_DSP`(−4) | **陣列已被自動 reset** |
+| 3 | 內部 render 對齊失敗（例如目前採用的延遲超過 ring 能供應的範圍；ring 的容量是函式庫內部的 1024 ms 延遲範圍加 2 hop 與 1 個 sample） | `AEC_ERR_DSP`(−4) | **陣列已被自動 reset** |
 | 4 | 某條 lane 的 linear 或殘餘階段拒絕，或其視圖綁定失敗 | `AEC_ERR_DSP`(−4) | **陣列已被自動 reset** |
 
 `aec_process_linear()` **不會**檢查 buffer 長度 —— `hop*4` 與 `hop` 是你的責任。`aec_get_array()` 在沒有待處理的 linear 幀時回 `AEC_ERR_SEQUENCE`，`struct_size` 短於 `sizeof(AecArrayView)` 時回 `AEC_ERR_ARG`（`out` 保持原樣）。
@@ -73,10 +73,10 @@
 
 | Instance 來源 | `aec_destroy()` 行為 |
 |---|---|
-| `aec_init()` / `aec_init_ex()`（caller-owned pool） | **不釋放**你的 pool，只把 handle 標成已銷毀。NULL 安全、**冪等**，重複呼叫安全。之後由你自己交還或重用 pool |
-| `aec_create()`（heap） | 釋放 `aec_create()` 配置的那一塊，清掉你的 `Aec` 並把它標成已銷毀（重複 `aec_destroy()` 安全；再次 `aec_create()` 可重建）|
+| `aec_init()` / `aec_init_ex()`（caller-owned pool） | **不釋放**你的 pool，只把 handle 標成已銷毀。NULL 安全、**冪等**，重複呼叫安全（已銷毀的 handle 之後被各入口拒絕）。之後由你自己交還或重用 pool |
+| `aec_create()`（heap） | 先把 handle 標成不可用，再釋放 `aec_create()` 配置的那一塊（`Aec` 與 pool 同在這一塊）。**只能呼叫一次，指標之後作廢**（不要再 `aec_destroy()`、`free()` 或讀取；再次 `aec_create()` 回新的實例）|
 
-destroy 之後，兩種 instance 的每個入口都拒絕該 handle（`AEC_ERR_ARG`／`-1`／`0`／NULL／清零的結構，`aec_hop_size()` 回 `0`），直到再次 create／init；但 `Aec` 本身的儲存或 caller-owned pool 已被釋放或改寫時行為未定義，也不要保存 destroy 之前取得的視圖指標。
+destroy 之後，caller-owned pool 的 instance 的每個入口都拒絕該 handle（`AEC_ERR_ARG`／`-1`／`0`／NULL／清零的結構，`aec_hop_size()` 回 `0`），直到再次 init；`aec_create()` 的 instance 在 destroy 時已被釋放，之後不可再傳給任何入口。caller-owned pool 已被釋放或改寫時行為未定義，也不要保存 destroy 之前取得的視圖指標（包含 `aec_synthesis_window()` 的窗指標：窗在實例自己的記憶體內，借用它的 `AcIstft` 不可比 `Aec` 活得久）。
 沒有 lane 或 estimator 要另外拆除：它們都在陣列的 pool 裡。
 
 ---
@@ -136,7 +136,7 @@ destroy 之後，兩種 instance 的每個入口都拒絕該 handle（`AEC_ERR_A
 初始化：
 
 - [ ] 每次 init 之前都重新呼叫 `aec_get_mem_requirements()`；後級 stage 也各自重查 `get_mem_size`
-- [ ] `n_mics = AEC_ARRAY_MICS`；`aec_config_from_level()` 對 8000／16000／48000 以外的取樣率回傳 `fft_size`、`filter_length` 皆為 0 的設定，`aec_get_mem_requirements()` 回 `-1`、`aec_init()` 回 NULL
+- [ ] `n_mics = AEC_ARRAY_MICS`；`aec_config_from_level()` 對 8000／16000／48000 以外的取樣率回傳 `fft_size` 為 0 的設定，`aec_get_mem_requirements()` 回 `-1`、`aec_init()` 回 NULL
 - [ ] `residual` 是 STATE／ESTIMATE／FULL 之一，且符合你的鏈（FULL 才有增益；STATE 不能呼叫 `aec_process_residual()`）
 - [ ] pool 對齊 16、大小 ≥ `req.bytes`
 - [ ] 用 `aec_init_ex()` 並把剛查到的 `req` 當 `expected` 傳回去
@@ -167,7 +167,7 @@ linear / residual 協定：
 收尾：
 
 - [ ] 先拆你的 stage，再 `aec_destroy()`，最後才釋放記憶體
-- [ ] `aec_create()` 建的 instance 只 `aec_destroy()` 一次
+- [ ] `aec_create()` 建的 instance 只 `aec_destroy()` 一次，之後不 `free()`、不再讀取該指標
 - [ ] destroy 之後沒有再呼叫任何 accessor
 
 ---

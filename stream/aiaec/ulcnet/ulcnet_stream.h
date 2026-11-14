@@ -95,11 +95,7 @@ void ulcnet_stream_reset(UlcnetStream *s);
 /* Generation of the recurrent state; 0 for NULL. */
 uint32_t ulcnet_stream_state_generation(const UlcnetStream *s);
 
-const UlcnetGrid *ulcnet_stream_grid(const UlcnetStream *s);   /* NULL for NULL */
 int ulcnet_stream_hop_size(const UlcnetStream *s);             /* samples per PCM hop; -1 on NULL */
-int ulcnet_stream_frames_per_call(const UlcnetStream *s);      /* 1 for a one-hop stream; -1 on NULL */
-/* The graph layout version this instance is bound to (ulcnet_prepost_descriptor()); -1 on NULL. */
-int ulcnet_stream_layout_version(const UlcnetStream *s);
 
 /* Hops of the last pre_process at which the stream restarted its own analysis framing (bit k = hop k; bit 0 only for a
  * one-hop stream). Set by the f32 / int16 entries; 0 after the freq entries, a reset and for NULL. A caller with its own

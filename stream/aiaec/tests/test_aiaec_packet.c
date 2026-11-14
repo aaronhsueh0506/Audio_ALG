@@ -32,6 +32,7 @@
 #include <string.h>
 
 #include "aiaec.h"
+#include "aiaec_test_fixture.h"
 #include "aiaec_product.h"
 #include "audio_stft.h"
 #include "stream_mem.h"
@@ -52,13 +53,6 @@
 static int g_fail = 0;
 #define FAIL(...) do { fprintf(stderr, __VA_ARGS__); fprintf(stderr, "\n"); g_fail = 1; } while (0)
 #define CHECK(cond, ...) do { if (!(cond)) FAIL(__VA_ARGS__); } while (0)
-
-static void *alloc_aligned(size_t bytes) {
-    void *p = NULL;
-    if (posix_memalign(&p, 16, bytes) != 0) { fprintf(stderr, "alloc fail\n"); exit(1); }
-    memset(p, 0xA5, bytes);
-    return p;
-}
 
 static AiaecConfig cfg_n(int n) {
     AiaecConfig cfg;

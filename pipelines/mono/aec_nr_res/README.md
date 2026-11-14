@@ -110,9 +110,9 @@ Command line of the two binaries built from `main.c` (`example_board_adapter.c` 
 
 Public functions an integrator copies from this main: the ones in the sequence above and `aec_debug_status()`,
 `anr_debug_status()`. Internal (not for application code): the AEC and NR headers other than
-`aec.h`, `anr.h`. External parameters: the `AecConfig` fields `sample_rate`, `fft_size`, `filter_length`, `delay_mode`,
-`delay_num_filters`, `fixed_delay_samples` and the AEC level passed to `aec_config_from_level()`, `AnrLevel`, the three switches above.
-Internal: the remaining `AecConfig` and `AnrConfig` fields, including the denoiser's `L` and
+`aec.h`, `anr.h`. External parameters: the `AecConfig` fields `sample_rate`, `fft_size`, `delay_mode`,
+`delay_num_filters`, `fixed_delay_samples` and the AEC level passed to `aec_config_from_level()` (stored in `AecConfig.level`), `AnrLevel`, the three switches above.
+Internal: the AEC library's own tuning (`AecTuning`, not part of `AecConfig`), the `AnrConfig` fields, including the denoiser's `L` and
 `num_init_frames` (pool-sizing); classification with header lines in section 0.3 of the manual above.
 
 Python twin: `pipeline.py` (from the `Audio_ALG` root: `python -m pipelines.mono.aec_nr_res.pipeline --mic mic.wav --ref ref.wav --output out.wav`,
@@ -129,5 +129,5 @@ make SIMD=1 test
 
 The configuration selects sample rate and FFT independently. Supported
 production grids are 16 kHz/256/128, 16 kHz/512/256 and 48 kHz/1024/512.
-`filter_length`, `delay_mode`, `delay_num_filters` and
-`fixed_delay_samples` are independent initialization controls.
+`delay_mode`, `delay_num_filters` and
+`fixed_delay_samples` are independent initialization controls (the filter length follows the sample rate).

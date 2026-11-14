@@ -27,8 +27,8 @@ SHIPPED_PAIR = dfn_pairs.shipped_pair(FAMILY)
 
 AINR = dfn_pairs.AINR
 DFN = dfn_pairs.family_dir(FAMILY)
-# dfn3_*.c/.h moved to lib/ainr/dfn3/ in the single-model-release restructuring; DFN (still
-# AINR/DeepFilterNet3, the Python training dir) now holds only config.ini and a forwarding stub.
+# dfn3_*.c/.h live in lib/ainr/dfn3/; DFN (AINR/DeepFilterNet3, the Python training dir) holds
+# config.ini and the Python side only.
 DFN3_C_DIR = AINR.parent / 'lib' / 'ainr' / 'dfn3'
 sys.path.insert(0, str(AINR.parent))
 from AINR.DeepFilterNet3 import export_onnx as dfn_export  # noqa: E402
@@ -39,7 +39,7 @@ from AINR.DeepFilterNet3 import train as dfn_train  # noqa: E402
 _WRAPPER = r'''
 #include <stdlib.h>
 #include <string.h>
-#include "DeepFilterNet3/dfn3_prepost.h"
+#include "dfn3_prepost.h"
 
 typedef struct { DFN3Grid grid; DFN3State state; void *block; } ParityState;
 typedef struct { DFN3Grid grid; DFN3ModelIOState io; void *block; } ParityIo;

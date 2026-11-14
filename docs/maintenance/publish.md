@@ -110,7 +110,10 @@ markers, and covers both grids; the target also runs `4ch_alignulcnet --sample-r
 pass lines (static smokes, board-skeleton profiles, adapter).
 
 Pass/fail-only targets (no count): `pipelines` `test-pairs` (the DFN C tests for
-the pairs of `DFN_TEST_PAIRS`; an empty list is an error, and `make -n`/`-q`/`-t` only print the plan) and `AINR` `test-pairs` (the lookahead-pair pytest
+the pairs of `DFN_TEST_PAIRS`; an empty list is an error, and `make -n`/`-q`/`-t` only print the plan), `test-fp-contract` (the pipeline objects that run
+windowed overlap-add emit no fma-class instruction), `test-publish-manifest` (every `PUBLISH_ARTIFACTS` name appears in a throwaway
+publish's manifest), `target-abi-test` (the descriptor test over all public pipeline and prepost APIs; `test_target_abi` only builds it),
+`audit-no-transform` and `audit-dead-defines` (the two source gates), and `AINR` `test-pairs` (the lookahead-pair pytest
 files); `AEC` `selftest`, `test-counter-saturation`,
 `test-process-context`, `test-shared-far-spec`, `test-shared-fft-handle`,
 `test-static-aec` (needs the doubletalk blind-test wav pair, overridable with

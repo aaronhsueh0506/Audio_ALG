@@ -3,8 +3,10 @@
  * 10 Align-ULCNet): every SUBMIT block passes AI3_MODEL_IO_CHECK_WORK against the row of its configuration, and with
  * the test catalog (-DAIAEC_TEST_CATALOG) the library accepts a (sr, fft, N) exactly when the row exists; with the
  * production catalog every accepted configuration has a row. Align-ULCNet also runs an event hop: N = 1 is BYPASS with
- * an empty work, N = 8 at hop 2 puts frame_reset 00100000 in the last signal. The rows against a fresh export are
- * pinned by AIAEC/tests/test_aiaec_bind_info_pin.py. */
+ * an empty work, N = 8 at hop 2 puts frame_reset 00100000 in the last signal. A SUBMIT work has pairwise disjoint
+ * buffers and empty slots beyond its signals, and the three families report one and the same AiaecInfo (trim, queue
+ * and tail of the 16 kHz rows pinned by the literals below). The rows
+ * against a fresh export are pinned by AIAEC/tests/test_aiaec_bind_info_pin.py. */
 
 #include <stdio.h>
 #include <stdlib.h>
@@ -31,8 +33,28 @@ _Static_assert(AI3_MODEL_IO_DEEPVQES_LAYOUT == DEEPVQE_PREPOST_LAYOUT_VERSION, "
 _Static_assert(AI3_MODEL_IO_ALIGNULCNET_LAYOUT_ONE_FRAME == ULCNET_MODEL_IO_LAYOUT_VERSION, "Align-ULCNet layout 18");
 _Static_assert(AI3_MODEL_IO_ALIGNULCNET_LAYOUT_PACKET == ULCNET_MODEL_IO_PACKET_LAYOUT_VERSION, "Align-ULCNet layout 19");
 
+/* AiaecInfo is the init's slim result (graph, trim, queue, tail): no port list can sit inside it. */
+typedef char info_stays_slim[sizeof(AiaecInfo) <= sizeof(const char *) + 4 * sizeof(int) ? 1 : -1];
+
+/* Trim, queue and tail of the 16 kHz rows, as literals (the pre-batching delay of DeepVQE-S is N hops, Align-ULCNet's is one). */
+static const struct { int fft, n, trim_dv, queue_dv, trim_align; } INFO_ROWS[] = {
+    { 256, 1, 128, 0, 128 }, { 256, 8, 1024, 7, 128 }, { 512, 1, 256, 0, 256 },
+};
+
 static int g_fail, g_patterns;
 #define CHECK(cond, ...) do { if (!(cond)) { ++g_fail; fprintf(stderr, "FAIL (line %d): ", __LINE__); fprintf(stderr, __VA_ARGS__); fprintf(stderr, "\n"); } } while (0)
+
+static int disjoint(const void *a, size_t na, const void *b, size_t nb)
+{
+    const unsigned char *pa = (const unsigned char *)a, *pb = (const unsigned char *)b;
+    return pa + na * sizeof(float) <= pb || pb + nb * sizeof(float) <= pa;
+}
+
+static int same_info(const AiaecInfo *a, const AiaecInfo *b)
+{
+    return a->graph_path == b->graph_path && a->trim_samples == b->trim_samples &&
+           a->queue_frames == b->queue_frames && a->tail_zero_blocks == b->tail_zero_blocks;
+}
 
 static void compare_work(const char *tag, const Ai3ModelIoConfig *mc, const AiaecWork *work)
 {
@@ -49,6 +71,24 @@ static void compare_work(const char *tag, const Ai3ModelIoConfig *mc, const Aiae
         CHECK(work->outputs[i].b == w->outputs[i].b && work->outputs[i].c == w->outputs[i].c &&
               work->outputs[i].h == w->outputs[i].h && work->outputs[i].w == w->outputs[i].w &&
               work->outputs[i].elements == w->outputs[i].elements, "%s head %d shape", tag, i);
+    for (i = work->input_count; i < AIAEC_MAX_INPUT_TENSORS; ++i)
+        CHECK(work->inputs[i].data == NULL && work->inputs[i].elements == 0u && work->inputs[i].w == 0u,
+              "%s inputs[%d] beyond the %d signals is not empty", tag, i, work->input_count);
+    for (i = 0; i < work->input_count; ++i) {
+        int j;
+        for (j = i + 1; j < work->input_count; ++j)
+            CHECK(disjoint(work->inputs[i].data, work->inputs[i].elements, work->inputs[j].data, work->inputs[j].elements),
+                  "%s inputs[%d] and inputs[%d] overlap", tag, i, j);
+        for (j = 0; j < work->output_count; ++j)
+            CHECK(disjoint(work->inputs[i].data, work->inputs[i].elements, work->outputs[j].data, work->outputs[j].elements),
+                  "%s inputs[%d] overlaps outputs[%d]", tag, i, j);
+    }
+    for (i = 0; i < work->output_count; ++i) {
+        int j;
+        for (j = i + 1; j < work->output_count; ++j)
+            CHECK(disjoint(work->outputs[i].data, work->outputs[i].elements, work->outputs[j].data, work->outputs[j].elements),
+                  "%s outputs[%d] and outputs[%d] overlap", tag, i, j);
+    }
     AI3_MODEL_IO_CHECK_WORK(rc, mc, work);
     CHECK(rc == AI3_MODEL_IO_OK, "%s AI3_MODEL_IO_CHECK_WORK rc %d", tag, rc);
     CHECK(ai3_model_io_fits(mc, AIAEC_MAX_INPUT_TENSORS, AIAEC_MAX_OUTPUT_TENSORS) == AI3_MODEL_IO_OK, "%s fits", tag);
@@ -77,7 +117,7 @@ static int run_pre(const AiaecConfig *cfg, int family, int event_hop, AiaecWork 
     s16 = (int16_t *)calloc((size_t)cfg->hop_in, sizeof *s16);
     f32 = (float *)calloc((size_t)(cfg->hop_in > n * bins ? cfg->hop_in : n * bins), sizeof *f32);
     if (event_hop >= 0 && event_hop < n) events[event_hop].changed = 1;
-    memset(work, 0, sizeof *work); memset(&in, 0, sizeof in); memset(&fin, 0, sizeof fin);
+    memset(work, 0x5a, sizeof *work); memset(&in, 0, sizeof in); memset(&fin, 0, sizeof fin);
 #if IS_ALIGN
     in.kind = AIAEC_INPUT_ALIGN_ULCNET; in.samples = cfg->hop_in;
     in.u.align_ulcnet.residual_in = f32; in.u.align_ulcnet.far_in = f32;
@@ -113,6 +153,8 @@ int main(void)
     static const int ffts[] = { 128, 256, 512, 1024 };
     static const int srs[] = { 16000, 48000 };
     int si, fi, n, accepted = 0, rows_hit = 0, compared = 0, family;
+    AiaecInfo infos[3];
+    int row;
 
     for (si = 0; si < 2; ++si) for (fi = 0; fi < 4; ++fi) for (n = 1; n <= 8; ++n) {
         AiaecConfig cfg;
@@ -132,6 +174,7 @@ int main(void)
               cfg.fft, n);
 #endif
         if (!lib_ok || !row_ok) continue;
+        memset(infos, 0, sizeof infos);
         for (family = 0; family < 3; ++family) {
             AiaecWork work; AiaecInfo info;
             char tag[96];
@@ -142,6 +185,7 @@ int main(void)
                 rc = run_pre(&cfg, family, ev, &work, &info);
                 CHECK(rc == AIAEC_OK, "%s pre rc %d", tag, rc);
                 if (rc != AIAEC_OK) continue;
+                if (e == 0) infos[family] = info;
                 if (IS_ALIGN && n == 1 && ev == 0) {
                     /* an N = 1 event hop is BYPASS: no tensors, so no boundary check (and none would pass) */
                     CHECK(work.action == AIAEC_BYPASS && work.input_count == 0 && work.output_count == 0,
@@ -154,6 +198,15 @@ int main(void)
                 compare_work(tag, &mc, &work);
                 ++compared;
             }
+        }
+        CHECK(infos[0].graph_path != NULL && same_info(&infos[0], &infos[1]) && same_info(&infos[0], &infos[2]),
+              "sr %d fft %d N %d: the three families report one and the same info", cfg.sr, cfg.fft, n);
+        for (row = 0; row < (int)(sizeof INFO_ROWS / sizeof INFO_ROWS[0]); ++row) {
+            if (cfg.sr != 16000 || cfg.fft != INFO_ROWS[row].fft || n != INFO_ROWS[row].n) continue;
+            CHECK(infos[0].trim_samples == (IS_ALIGN ? INFO_ROWS[row].trim_align : INFO_ROWS[row].trim_dv) &&
+                  infos[0].queue_frames == (IS_ALIGN ? 0 : INFO_ROWS[row].queue_dv) && infos[0].tail_zero_blocks == 1,
+                  "sr %d fft %d N %d: trim %d queue %d tail %d", cfg.sr, cfg.fft, n, infos[0].trim_samples,
+                  infos[0].queue_frames, infos[0].tail_zero_blocks);
         }
     }
 #ifdef AIAEC_TEST_CATALOG

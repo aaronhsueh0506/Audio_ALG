@@ -3,10 +3,10 @@
 # AcStft analysis, the AcIstft inverse FFT and overlap-add) is audiolib's (audio_stft.h), built and run by
 # the application; a model directory holds neither side of the transform and builds, sizes or runs no
 # AcStft or AcIstft. Scans the non-test C sources and headers of lib/ainr/, lib/aiaec/ (the model
-# cores, moved there by the single-model-release restructuring) and AINR/, AIAEC/ (now Python-only,
-# plus any compatibility forwarding header). Does NOT, and must never, scan stream/: that layer's
-# whole job is PCM framing around a model core and legitimately calls AcStft/AcIstft -- a future
-# stream/ addition needs its own, deliberately permissive version of this audit, not this one widened.
+# cores, moved there by the single-model-release restructuring) and AINR/, AIAEC/ (Python-only). Does NOT,
+# and must never, scan stream/: that layer's whole job is PCM framing around a model core and legitimately
+# calls AcStft/AcIstft -- a future stream/ addition needs its own, deliberately permissive version of this
+# audit, not this one widened.
 #
 # The one audiolib framing use a model directory may have is the n_fft check: ac_stft_config_default()
 # filling an AcStftConfig and ac_stft_get_mem_size() of it (non-zero = a size the framing builds).

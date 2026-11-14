@@ -167,11 +167,6 @@ static inline int dfn_fixture_bridge_added_delay_sixths(int sr, int hop) {
     return (prefill + 16 + 16) * 6 + (int)((long long)DFN_FIXTURE_STAGE_DELAY_48K * sr / 8000);
 }
 
-/* The same delay floored to whole native samples (dfn_rate_bridge_added_delay_samples()). */
-static inline int dfn_fixture_bridge_added_delay(int sr, int hop) {
-    return dfn_fixture_bridge_added_delay_sixths(sr, hop) / 6;
-}
-
 /* out[i] = in[i - delay] for a delay of `delay_sixths` / 6 native samples, by a Hann-windowed
  * sinc of 129 taps (exact for a whole delay). Exact only for content well below Nyquist; the
  * first and last 64 samples see a truncated kernel. */

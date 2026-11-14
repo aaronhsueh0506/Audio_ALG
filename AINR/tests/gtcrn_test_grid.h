@@ -10,15 +10,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 
-#if defined(__has_include)
-#if __has_include("gtcrn_process.h")
-#include "gtcrn_process.h"
-#else
-#include "GTCRN/gtcrn_process.h"
-#endif
-#else
-#include "GTCRN/gtcrn_process.h"
-#endif
+#include "../../lib/ainr/gtcrn/gtcrn_process.h"
 
 #define GTCRN_TEST_SR              16000
 #define GTCRN_TEST_N_FFT           512

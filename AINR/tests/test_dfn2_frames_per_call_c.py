@@ -828,7 +828,7 @@ _ABI_DRIVER = r"""
 #include <stdlib.h>
 #include <string.h>
 
-#include "DeepFilterNet2/dfn2_grid.h"
+#include "dfn2_grid.h"
 
 typedef struct {
     unsigned int layout_version;

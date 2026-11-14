@@ -82,7 +82,7 @@ The Python twins sit beside their applications: `mono/aec_nr_res/pipeline.py`, `
 `dfn/dfn2_rate_adapter.py`, `mono/aec_dfn_res/pipeline.py`, `4ch/aec_bf_dfn_res/pipeline.py` and
 `common/cng_aec3.py` (module paths `pipelines.<folder>.<module>`). Python and C agree for the default settings; the documented
 differences S-02 (AEC live observer guard) and S-13 (NR make-up prior) exist only when those default-off features are enabled,
-so do not read the twins as identical for every setting (`docs/c_python_function_map.md`, `make pyc-parity`; the two differences are defined in `lib/aec/c_impl/test/pyc_parity/pyc_parity.py` and `lib/nr/docs/c_python_function_map.md`).
+so do not read the twins as identical for every setting (`docs/c_python_function_map.md`, `make pyc-parity`; the two differences are defined in `AEC/c_impl/test/pyc_parity/pyc_parity.py` (S-02) and `NR/docs/c_python_function_map.md` (S-13)).
 
 **DFN lookahead pair.** The DeepFilterNet2/3 model lookahead is a pair: mask `M` in 0..2 and deep-filter
 `D` in 0..4 (15 legal pairs, no ordering rule between them; `AINR/README.md`, "Lookahead pairs"). The exported graph does
@@ -118,7 +118,7 @@ producers and that object. The example programs (`4ch_raw`, `4ch_static`,
 `4ch_external_static`, `4ch_aec_bf_dfn_res`, `4ch_alignulcnet`) link the producer archives and the
 example headers or objects. The array carries its own RES gain stage (`AecConfig.residual = AEC_RESIDUAL_FULL`);
 `4ch_alignulcnet` runs with `AEC_RESIDUAL_STATE` and has none. The four lanes and the shared estimator are built
-inside the array's pool by `aec_init_ex()`; `aec_create()` is the heap convenience, while
+inside the array's pool by `aec_init_ex()`; `Aec* aec_create(const AecConfig*)` is the heap convenience (one block; `aec_destroy()` frees it and the pointer is dead afterwards), while
 `aec_get_mem_requirements()` + `aec_init_ex()` place the whole array in one caller-owned
 16-byte-aligned pool. Both paths share the same allocation-free processing code;
 `4ch/tests/test_4ch_chain.c` checks the pooled chain at 16 kHz/256, 16 kHz/512 and
@@ -180,16 +180,11 @@ power). `nr:` fields are `AnrDebugStatus` (`init` = noise-floor initialized;
 `noise` = mean noise-floor dB). With `--aec-only` the `nr:` half prints `n/a`
 (no denoiser exists in that mode).
 
-### Delay-estimator duty-cycling (opt-in)
+### Delay-estimator duty-cycling
 
-`AecConfig.delay_est_period_s` (default `0` = analyse every hop) duty-cycles the
-AEC3 matched-filter delay estimator: once the estimate is solid (confidence 1.0)
-and unchanged for `delay_est_init_s` (default 0.3 s), analysis drops to 1 hop in
-every K = round(`delay_est_period_s`/hop)/5 (minimum 1). Full-rate analysis
-resumes when the estimate changes, loses solidity, or ERLE drops more than 6 dB
-below its running peak. A decimated hop publishes no new estimate, so a delay
-movement is seen at the next scheduled analysis, up to one duty period later.
-The pipelines in this directory leave it at `0`.
+The AEC3 matched-filter delay estimator can be duty-cycled once the estimate is solid; that schedule is an internal
+tuning of the AEC library, off by default (every hop is analysed), and `AecConfig` has no field for it. The pipelines
+in this directory analyse every hop.
 
 ## Two Versions
 

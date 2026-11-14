@@ -162,7 +162,6 @@ typedef struct Rig {
     long guard_hops, reset_hops;
     int sabotage;             /* negative controls of the full-mode identity test (SAB_*), 0 in the chain */
     int hop;
-    Aec* heap_aec;            /* heap construction only */
     void* heap_post_mem;
 } Rig;
 
@@ -217,13 +216,8 @@ static int rig_init_heap(Rig* r, const Plan* p) {
     size_t post_bytes = p->total - ALIGN16(p->aec_bytes);
     memset(r, 0, sizeof(*r));
     r->hop = p->grid.hop_size;
-    r->heap_aec = (Aec*)calloc(1, sizeof(Aec));
-    if (!r->heap_aec || aec_create(r->heap_aec, &p->aec_cfg) != 0) {
-        free(r->heap_aec);
-        r->heap_aec = NULL;
-        return -1;
-    }
-    r->aec = r->heap_aec;
+    r->aec = aec_create(&p->aec_cfg);
+    if (!r->aec) return -1;
     if (p->opt.aec_only) return 0;
     if (posix_memalign(&r->heap_post_mem, 16, post_bytes) != 0) return -1;
     memset(r->heap_post_mem, 0x5A, post_bytes);
@@ -233,7 +227,6 @@ static int rig_init_heap(Rig* r, const Plan* p) {
 static void rig_free(Rig* r) {
     if (r->nr) anr_destroy(r->nr);
     if (r->aec) aec_destroy(r->aec);
-    free(r->heap_aec);
     free(r->heap_post_mem);
     memset(r, 0, sizeof(*r));
 }
@@ -1071,7 +1064,7 @@ static int aec_only_equals_chain_linear(int sr, int fft_size, int hops, int* cha
     Plan p, full_p;
     Rig r, full;
     ConvMono* cm;
-    Aec* oracle = (Aec*)calloc(1, sizeof(Aec));
+    Aec* oracle = NULL;
     AecLinearView lv, fv;
     AecConfig oracle_cfg;
     float *mic, *ref, *got_rig, *got_cm, *chain_out, *hist;
@@ -1079,21 +1072,18 @@ static int aec_only_equals_chain_linear(int sr, int fft_size, int hops, int* cha
     int hop, h, ok = 1;
     o.aec_only = 1;
     *chain_diff = 0;
-    if (!oracle || plan_make(&p, &o) != 0 || plan_make(&full_p, &full_o) != 0 || rig_init_heap(&r, &p) != 0) {
-        free(oracle);
-        return -1;
-    }
+    if (plan_make(&p, &o) != 0 || plan_make(&full_p, &full_o) != 0 || rig_init_heap(&r, &p) != 0) return -1;
     if (rig_init_heap(&full, &full_p) != 0) {
         rig_free(&r);
-        free(oracle);
         return -1;
     }
     oracle_cfg = p.aec_cfg;
     oracle_cfg.residual = AEC_RESIDUAL_STATE;
-    if (aec_create(oracle, &oracle_cfg) != 0 || !(cm = conv_mono_create(&o))) {
+    oracle = aec_create(&oracle_cfg);
+    if (!oracle || !(cm = conv_mono_create(&o))) {
         rig_free(&r);
         rig_free(&full);
-        free(oracle);
+        if (oracle) aec_destroy(oracle);
         return -1;
     }
     hop = p.grid.hop_size;
@@ -1123,7 +1113,6 @@ static int aec_only_equals_chain_linear(int sr, int fft_size, int hops, int* cha
     free(mic); free(ref); free(got_rig); free(got_cm); free(chain_out); free(hist);
     conv_mono_destroy(cm);
     aec_destroy(oracle);
-    free(oracle);
     rig_free(&r);
     rig_free(&full);
     return ok;
@@ -1168,7 +1157,7 @@ static void run_full_identity(const GuardScene* s, int sabotage, FullRun* out) {
     Rig r;
     ConvMono* cm;
     AecConfig oracle_cfg;
-    Aec* oracle = (Aec*)calloc(1, sizeof(Aec));
+    Aec* oracle = NULL;
     void* pool;
     float *want, *got_rig, *got_cm;
     int h, k, hop;
@@ -1177,15 +1166,16 @@ static void run_full_identity(const GuardScene* s, int sabotage, FullRun* out) {
     o.enable_nr = 0;
     o.enable_res = 1;
     o.enable_cng = s->enable_cng;
-    if (!oracle || plan_make(&p, &o) != 0) { free(oracle); return; }
+    if (plan_make(&p, &o) != 0) return;
     oracle_cfg = p.aec_cfg;                    /* the lane, with the library's own full output */
     oracle_cfg.enable_cng = p.enable_cng;
     pool = aligned_block(p.total, 0xA5);
     cm = conv_mono_create(&o);
-    if (!pool || !cm || aec_create(oracle, &oracle_cfg) != 0 || rig_init_pool(&r, pool, p.total, &p) != 0) {
+    oracle = aec_create(&oracle_cfg);
+    if (!pool || !cm || !oracle || rig_init_pool(&r, pool, p.total, &p) != 0) {
         conv_mono_destroy(cm);
         free(pool);
-        free(oracle);
+        if (oracle) aec_destroy(oracle);
         return;
     }
     r.sabotage = sabotage;
@@ -1222,7 +1212,6 @@ static void run_full_identity(const GuardScene* s, int sabotage, FullRun* out) {
     rig_free(&r);
     conv_mono_destroy(cm);
     aec_destroy(oracle);
-    free(oracle);
     free(pool);
 }
 
@@ -1442,7 +1431,7 @@ static int black_box_aec_only(const char* bin, const char* tmp, int sr, int fft_
     ConvMonoConfig o = grid_opts(sr, fft_size);
     AecConfig oracle_cfg;
     Plan p;
-    Aec* oracle = (Aec*)calloc(1, sizeof(Aec));
+    Aec* oracle = NULL;
     WavReader *rm, *rr, *ro, *rp;
     WavWriter* wo;
     float *mic, *ref, *want, *got, *back;
@@ -1452,20 +1441,15 @@ static int black_box_aec_only(const char* bin, const char* tmp, int sr, int fft_
     snprintf(ref_path, sizeof ref_path, "%s/bba_ref.wav", tmp);
     snprintf(out_path, sizeof out_path, "%s/bba_out.wav", tmp);
     snprintf(ora_path, sizeof ora_path, "%s/bba_oracle.wav", tmp);
-    if (!oracle || plan_make(&p, &o) != 0) {
-        free(oracle);
-        return -1;
-    }
+    if (plan_make(&p, &o) != 0) return -1;
     oracle_cfg = p.aec_cfg;   /* AEC_RESIDUAL_STATE: aec_process() returns the linear hop */
-    if (aec_create(oracle, &oracle_cfg) != 0) {
-        free(oracle);
-        return -1;
-    }
+    oracle = aec_create(&oracle_cfg);
+    if (!oracle) return -1;
     hop = p.grid.hop_size;
-    if (write_scene_wav(mic_path, ref_path, sr, HOPS, hop) != 0) { aec_destroy(oracle); free(oracle); return -1; }
+    if (write_scene_wav(mic_path, ref_path, sr, HOPS, hop) != 0) { aec_destroy(oracle); return -1; }
     snprintf(cmd, sizeof cmd, "'%s' '%s' '%s' '%s' %s > '%s/bba_stdout.txt' 2>&1",
              bin, mic_path, ref_path, out_path, args, tmp);
-    if (system(cmd) != 0) { aec_destroy(oracle); free(oracle); return -1; }
+    if (system(cmd) != 0) { aec_destroy(oracle); return -1; }
     rm = wav_open_read(mic_path);
     rr = wav_open_read(ref_path);
     wo = wav_open_write(ora_path, sr, 1);
@@ -1497,7 +1481,6 @@ static int black_box_aec_only(const char* bin, const char* tmp, int sr, int fft_
     if (rp) wav_close_read(rp);
     free(mic); free(ref); free(want); free(got); free(back);
     aec_destroy(oracle);
-    free(oracle);
     return ok == 1 ? (nonzero ? 1 : 0) : ok;
 }
 
@@ -1531,7 +1514,7 @@ static int black_box_full_mode(const char* bin, const char* tmp, const GuardScen
     ConvMonoConfig o = grid_opts(sc->sr, sc->fft);
     AecConfig cfg;
     Plan p;
-    Aec* oracle = (Aec*)calloc(1, sizeof(Aec));
+    Aec* oracle = NULL;
     WavWriter *wm, *wr;
     WavReader *rm, *rr;
     FILE* fd;
@@ -1544,10 +1527,11 @@ static int black_box_full_mode(const char* bin, const char* tmp, const GuardScen
     snprintf(out_path, sizeof out_path, "%s/bbf_out.wav", tmp);
     snprintf(dump_path, sizeof dump_path, "%s/bbf_ctx.bin", tmp);
     o.enable_nr = 0; o.enable_res = 1; o.enable_cng = cng;
-    if (!oracle || plan_make(&p, &o) != 0) { free(oracle); return -1; }
+    if (plan_make(&p, &o) != 0) return -1;
     cfg = p.aec_cfg;
     cfg.enable_cng = p.enable_cng;
-    if (aec_create(oracle, &cfg) != 0) { free(oracle); return -1; }
+    oracle = aec_create(&cfg);
+    if (!oracle) return -1;
     hop = p.grid.hop_size;
     wm = wav_open_write(mic_path, sc->sr, 1);
     wr = wav_open_write(ref_path, sc->sr, 1);
@@ -1558,11 +1542,11 @@ static int black_box_full_mode(const char* bin, const char* tmp, const GuardScen
     }
     if (wm) wav_close_write(wm);
     if (wr) wav_close_write(wr);
-    if (ok != 1) { aec_destroy(oracle); free(oracle); return -1; }
+    if (ok != 1) { aec_destroy(oracle); return -1; }
     remove(dump_path);
     snprintf(cmd, sizeof cmd, "DUMP_CTX='%s' '%s' '%s' '%s' '%s' %s > '%s/bbf_stdout.txt' 2>&1",
              dump_path, bin, mic_path, ref_path, out_path, args, tmp);
-    if (system(cmd) != 0) { aec_destroy(oracle); free(oracle); return -1; }
+    if (system(cmd) != 0) { aec_destroy(oracle); return -1; }
     fd = fopen(dump_path, "rb");
     rm = wav_open_read(mic_path);
     rr = wav_open_read(ref_path);
@@ -1570,7 +1554,7 @@ static int black_box_full_mode(const char* bin, const char* tmp, const GuardScen
         if (fd) fclose(fd);
         if (rm) wav_close_read(rm);
         if (rr) wav_close_read(rr);
-        aec_destroy(oracle); free(oracle);
+        aec_destroy(oracle);
         return -1;
     }
     nf = hdr[0];
@@ -1600,7 +1584,6 @@ static int black_box_full_mode(const char* bin, const char* tmp, const GuardScen
     wav_close_read(rr);
     free(mic); free(ref); free(want); free(rec);
     aec_destroy(oracle);
-    free(oracle);
     if (ok != 1) return ok;
     return (*guard_hops > 0 && *reset_hops > 0) ? 1 : 0;
 }

@@ -199,7 +199,7 @@ _GRID_PROBE = r"""
 #include <stdlib.h>
 #include <string.h>
 
-#include "DeepFilterNet@N@/dfn@N@_prepost.h"
+#include "dfn@N@_prepost.h"
 
 int main(int argc, char **argv)
 {
@@ -390,14 +390,17 @@ def require_toolchain():
 @functools.lru_cache(maxsize=None)
 def house_cflags(simd=1):
     """The flags ``make`` compiles AINR with (``make print-cflags``) with -Werror
-    on and the include of AINR itself made absolute."""
+    on, the include of AINR itself made absolute, and the include directories of
+    the C cores (``lib/ainr/{dfn2,dfn3,gtcrn}``) added."""
     out = subprocess.run(
         ['make', '-s', '-C', str(AINR), 'WERROR=1', 'SIMD=%d' % simd,
          'print-cflags'],
         check=True, capture_output=True, text=True).stdout
     flags = out.strip().splitlines()[-1].split()
+    core_includes = tuple('-I' + str(AINR.parent / 'lib' / 'ainr' / name)
+                          for name in ('dfn2', 'dfn3', 'gtcrn'))
     return tuple('-I' + str(AINR) if flag == '-I.' else flag
-                 for flag in flags)
+                 for flag in flags) + core_includes
 
 
 @functools.lru_cache(maxsize=None)

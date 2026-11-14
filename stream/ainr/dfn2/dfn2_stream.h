@@ -97,9 +97,7 @@ typedef struct DFN2Stream DFN2Stream;
 #define dfn2_stream_reset                   dfn2_stream_reset_mask_only
 #define dfn2_stream_state_generation        dfn2_stream_state_generation_mask_only
 #define dfn2_stream_set_atten_lim           dfn2_stream_set_atten_lim_mask_only
-#define dfn2_stream_grid                    dfn2_stream_grid_mask_only
 #define dfn2_stream_hop_size                dfn2_stream_hop_size_mask_only
-#define dfn2_stream_layout_version          dfn2_stream_layout_version_mask_only
 #define dfn2_stream_pre_process             dfn2_stream_pre_process_mask_only
 #define dfn2_stream_post_process            dfn2_stream_post_process_mask_only
 #define dfn2_stream_pre_process_freq_dual   dfn2_stream_pre_process_freq_dual_mask_only
@@ -141,10 +139,7 @@ unsigned int dfn2_stream_state_generation(const DFN2Stream *s);
  * frame. Kept by reset. */
 int dfn2_stream_set_atten_lim(DFN2Stream *s, float atten_lim_db);
 
-const DFN2Grid *dfn2_stream_grid(const DFN2Stream *s);   /* NULL for NULL */
 int dfn2_stream_hop_size(const DFN2Stream *s);           /* samples per PCM hop; -1 on NULL */
-/* dfn2_prepost_layout_version(): the graph contract of this instance. -1 on NULL. */
-int dfn2_stream_layout_version(const DFN2Stream *s);
 
 /* The tensor views of one open hop and the generation the accelerator's state must match; valid until
  * dfn2_stream_post_process(). */

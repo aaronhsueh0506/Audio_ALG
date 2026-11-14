@@ -22,8 +22,7 @@ sys.path.insert(0, ROOT)
 _AINR_TESTS = os.path.join(os.path.dirname(ROOT), 'tests')
 if _AINR_TESTS not in sys.path:
     sys.path.insert(0, _AINR_TESTS)
-# dfn2_*.c/.h moved to lib/ainr/dfn2/ in the single-model-release restructuring; ROOT_PATH /
-# 'dfn2_*.h' is now only a forwarding stub (an #include line), not the real header text.
+# dfn2_*.c/.h live in lib/ainr/dfn2/.
 DFN2_C_DIR = ROOT_PATH.parents[1] / 'lib' / 'ainr' / 'dfn2'
 
 # Each of the three model projects has its own top-level ``train.py`` (and
@@ -367,7 +366,7 @@ def grid_header_macros(*flags):
     test programs' table of the shipped model (order, normalisers, state shapes), which the
     library does not hold."""
     out = subprocess.run(
-        ['cc', '-E', '-dM', '-x', 'c', '-I', str(ROOT_PATH.parent), '-I', str(ROOT_PATH),
+        ['cc', '-E', '-dM', '-x', 'c', '-I', str(ROOT_PATH.parent), '-I', str(dfn_pairs.c_dir('DeepFilterNet2')),
          '-I', str(dfn_pairs.AUDIO_COMMON / 'include'), '-I', str(dfn_pairs.AUDIO_COMMON),
          *flags, str(ROOT_PATH.parent / 'tests' / 'dfn2_test_grid.h')],
         check=True, capture_output=True, text=True).stdout

@@ -8,8 +8,7 @@ import sys
 
 ROOT = pathlib.Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT))
-# process.h moved to lib/ainr/rnnoise_erb/ in the single-model-release restructuring; ROOT/
-# 'process.h' is now only a forwarding stub (an #include line), not the real header text.
+# process.h lives in lib/ainr/rnnoise_erb/.
 RNNOISE_C_DIR = ROOT.parents[1] / 'lib' / 'ainr' / 'rnnoise_erb'
 
 # 三個模型專案各有自己的 top-level ``train.py``/``model.py``/``export_onnx.py``。

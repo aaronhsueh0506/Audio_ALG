@@ -43,7 +43,7 @@ else
 SIMD_CFLAGS :=
 endif
 CFLAGS = -O2 -Wall -Wextra
-CFLAGS += -I.
+CFLAGS += -I. -I../../lib/ainr/rnnoise_erb
 CFLAGS += $(EXTRA_CFLAGS)
 CFLAGS += $(SIMD_CFLAGS)
 

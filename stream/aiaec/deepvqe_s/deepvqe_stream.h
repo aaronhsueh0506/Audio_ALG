@@ -73,10 +73,7 @@ void deepvqe_stream_reset(DeepVqeStream *s);
 /* Generation of the recurrent state; 0 for NULL. */
 uint32_t deepvqe_stream_state_generation(const DeepVqeStream *s);
 
-const DeepVqeGrid *deepvqe_stream_grid(const DeepVqeStream *s);   /* NULL for NULL */
 int deepvqe_stream_hop_size(const DeepVqeStream *s);              /* samples per PCM hop; -1 on NULL */
-/* The graph layout version this instance is bound to (deepvqe_prepost_descriptor()); -1 on NULL. */
-int deepvqe_stream_layout_version(const DeepVqeStream *s);
 
 /* The tensor views of one open hop and the generation the accelerator's state must match; valid until post_process. */
 typedef struct DeepVqeHopIO {

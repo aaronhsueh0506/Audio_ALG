@@ -47,7 +47,7 @@ static int derive_mono_lane(int sample_rate, int fft_size, AecSignalGrid* grid,
     aec_config_from_level(aec_cfg, AEC_LEVEL_BALANCED, sample_rate);
     aec_cfg->fft_size = grid->fft_size;
     aec_cfg->delay_mode = AEC_DELAY_MATCHED;
-    aec_cfg->delay_num_filters = DA_NUM_FILTERS;
+    aec_cfg->delay_num_filters = AEC_DELAY_NUM_FILTERS_MAX;
     aec_cfg->fixed_delay_samples = -1;
     aec_cfg->residual = AEC_RESIDUAL_FULL;
     return 0;
@@ -396,7 +396,7 @@ static int ulc_host_build(UlcHost* u, const UlcnetModel* model) {
     aec_config_from_level(&aec_cfg, AEC_LEVEL_BALANCED, g_ulc_grid.sample_rate);
     aec_cfg.fft_size = g_ulc_grid.n_fft;
     aec_cfg.delay_mode = AEC_DELAY_MATCHED;
-    aec_cfg.delay_num_filters = DA_NUM_FILTERS;
+    aec_cfg.delay_num_filters = AEC_DELAY_NUM_FILTERS_MAX;
     aec_cfg.fixed_delay_samples = -1;
     aec_cfg.residual = AEC_RESIDUAL_STATE;
     aec_b = aec_get_mem_size(&aec_cfg);

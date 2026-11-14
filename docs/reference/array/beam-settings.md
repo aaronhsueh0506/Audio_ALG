@@ -24,16 +24,16 @@ ArraySampleBeamParams bp = array_sample_beam_default_params();
 | `sample_rate`、`fft_size` | 傳入的 rate、該 rate 的預設 fft | 16000/256、16000/512、48000/1024 三組 | helper 由這個格點導出 SRP 與 BF 的設定（`array_sample_spatial_config()`） |
 | `n_mics` | `AEC_ARRAY_MICS` | 4 | helper 只接四麥克風 array |
 | `residual` | `AEC_RESIDUAL_FULL` | `STATE`／`ESTIMATE`／`FULL` | `STATE`：`array_sample_beam_fuse()` 回 `AEC_ERR_MODE`（給直接吃 BF 頻譜的 ULCNet）；其他：fuse 可用 |
-| `delay_mode`、`delay_num_filters`、`fixed_delay_samples`、`max_delay_ms`、`capture_proxy_channel`、`delay_est_period_s`、quarantine 兩欄 | MATCHED、5、-1、1024、0、0.0、關 | 見 config.md | 決定共用 aligner；與 helper 無關 |
-| `filter_length` 與 level 等 | balanced、52 ms | 見 `aec.h` | 四條 lane 的 pool 隨 `filter_length` 等比縮放 |
+| `delay_mode`、`delay_num_filters`、`fixed_delay_samples`、`capture_proxy_channel`、quarantine 兩欄 | MATCHED、5、-1、0、關 | 見 config.md | 決定共用 aligner；與 helper 無關 |
+| `level`、`enable_cng` | balanced、開 | 見 `aec.h` | `level` 決定增益級的地板；lane 的濾波器長度由取樣率決定（不是欄位） |
 
 > Quarantine 窗只對「連續符合條件的 backward episode」有界。候選轉為 forward／無效、confidence 中斷，或 proxy lane 的 cancellation 證據消失時會解除本次隔離；
 > 之後的新 backward episode 重新計時。Cancellation collapse 常見於路徑完全替換，但不是 multipath／新增路徑的必然特徵。**產品預設維持 `0`。**
-> 打開之後只是把誤鎖往後推一個窗，不會修正誤鎖本身（那個誤鎖已在估計器端根治，見 `AEC/docs/aec_methods_01_front_end.md` §2.3）。
+> 打開之後只是把誤鎖往後推一個窗，不會修正誤鎖本身（那個誤鎖已在估計器端根治，見 `AEC/docs/delay_estimator_design_zh_TW.md` §2）。
 
 `AecConfig.residual = AEC_RESIDUAL_STATE` 時只有四條 lane（沒有融合與增益級）。
 `AecConfig` 沒有 NR 欄位（`nr_level`、`enable_nr`、`legacy_amin` 屬於你的 `AnrConfig` 與後級串接）。
-`AecConfig.filter_length` 合法範圍 `(0, 4096]` 樣本，`aec_config_from_level()` 填入的預設是 52 ms（取樣率 ≥ 44.1 kHz 為 64 ms），即 16 kHz → 832、48 kHz → 3072 樣本，是記憶體吃緊時最有效的旋鈕。
+濾波器長度不是 `AecConfig` 欄位：由取樣率決定（52 ms；取樣率 ≥ 44.1 kHz 為 64 ms），即 16 kHz → 832、48 kHz → 3072 樣本。
 
 Grid 只有三組（`hop = fft_size / 2`、`n_freqs = fft_size / 2 + 1`）：
 
@@ -191,34 +191,33 @@ fallback VAD 的噪聲 EMA 係數（0.999／0.95）同樣依 hop retime。
 | 欄位 | 影響哪一塊 |
 |---|---|
 | `sample_rate` / `fft_size` | 全部（改 grid） |
-| `AecConfig.filter_length` | 四條 lane 的 pool（等比縮放）；不影響 helper |
-| `delay_mode` / `delay_num_filters` / `fixed_delay_samples` / `max_delay_ms` | array pool 內的共用 estimator（僅 MATCHED）與對齊環；不是四份 |
+| `delay_mode` / `delay_num_filters` / `fixed_delay_samples` | array pool 內的共用 estimator（僅 MATCHED）與對齊環；不是四份 |
 | `residual` | array pool 內的融合緩衝與增益級（STATE 最小） |
 | **`num_angles`** | **helper pool，而且影響很大**（steering table） |
 | 其他 DOA / BF / VAD 欄位 | 不變 |
 | `geometry` 與座標 | 不變 |
 
 ne10、`SIMD=1`、`delay_mode=MATCHED`（`delay_num_filters` = 5）預設的實測（`4ch_static --print-mem-size` 輸出，以及 `aec_get_mem_requirements()`、
-`array_sample_beam_get_mem_size()` 的直接查詢；`AEC_LAYOUT_VERSION` 1）。
+`array_sample_beam_get_mem_size()` 的直接查詢；`AEC_LAYOUT_VERSION` 2）。
 **Array** = `aec_get_mem_requirements()` 的 `req.bytes`（四條 lane、共用 estimator、對齊環、融合緩衝與增益級，加 `Aec` 結構）；**helper** = `array_sample_beam_get_mem_size()`；
 **Unit** = Array + helper（`4ch_static` 的 `Unit:`）；**後級** = NR + 合成 + 暫存（範例程式自己各自查大小後加總）。array 與 helper 都**不含**後級，後級另計：
 
 | Config | Array | helper | Unit | 後級 | 合計（`Total:`） |
 |---|---:|---:|---:|---:|---:|
-| 16000，全預設（256/128，`num_angles=72`） | 720,352（lane ×4 588,800） | 792,224 | 1,512,576 | 58,256 | 1,570,832 |
-| 16000，`fft_size = 512` | 1,124,256（lane ×4 971,968） | 1,569,952 | 2,694,208 | 81,376 | 2,775,584 |
-| 16000，`num_angles = 360` | 720,352 | 3,794,336 | 4,514,688 | 58,256 | 4,572,944 |
-| 48000，全預設（1024/512，`num_angles=72`） | 2,470,528（lane ×4 2,141,248） | 3,125,408 | 5,595,936 | 193,584 | 5,789,520 |
+| 16000，全預設（256/128，`num_angles=72`） | 701,280（lane ×4 571,520） | 792,192 | 1,493,472 | 58,256 | 1,551,728 |
+| 16000，`fft_size = 512` | 1,091,872（lane ×4 938,304） | 1,569,920 | 2,661,792 | 81,376 | 2,743,168 |
+| 16000，`num_angles = 360` | 701,280 | 3,794,304 | 4,495,584 | 58,256 | 4,553,840 |
+| 48000，全預設（1024/512，`num_angles=72`） | 2,411,520（lane ×4 2,074,816） | 3,125,376 | 5,536,896 | 193,584 | 5,730,480 |
 
 後級在 16 kHz/256 為 NR 45,344 + 合成 11,344 + 暫存 1,568 B，16 kHz/512 為 56,432 + 21,840 + 3,104 B，48 kHz/1024 為 144,576 + 42,832 + 6,176 B
 （`anr_get_mem_size()` 等的實測；增益級在 array 內，不再另列）。`4ch_static` 的 CLI 沒有 `num_angles` 選項，
 `num_angles = 360` 那列是在程式裡設 `bp.num_angles` 後呼叫 `array_sample_beam_get_mem_size()` 的結果，後級與合計欄用同格點的後級。
-`residual = STATE`（ULCNet 範例的設定，`delay_num_filters = 5`）時 array 較小（16 kHz/256 為 616,912、16 kHz/512 為 920,464、48 kHz/1024 為 2,062,960），
-Unit 為 1,409,136（16 kHz/256）、2,490,416（16 kHz/512）、5,188,368（48 kHz/1024）。
+`residual = STATE`（ULCNet 範例的設定，`delay_num_filters = 5`）時 array 較小（16 kHz/256 為 595,744、16 kHz/512 為 883,936、48 kHz/1024 為 1,995,712），
+Unit 為 1,387,936（16 kHz/256）、2,453,856（16 kHz/512）、5,121,088（48 kHz/1024）。
 
 ⚠ 上表是某一次建置的實測輸出，不是契約：這些 byte 數不會隨程式改動自動更新——引用前請自己現查一次。
 
-`num_angles` 越大，helper 的 SRP steering table 越大（16 kHz/256 下 72 → 360，helper 由 792,224 增為 3,794,336 B）。
+`num_angles` 越大，helper 的 SRP steering table 越大（16 kHz/256 下 72 → 360，helper 由 792,192 增為 3,794,304 B）。
 **先確認你的角度解析度真的需要那麼細，再調這個值。**
 
 換 backend、換編譯選項、更新函式庫版本 都會讓上表失效。

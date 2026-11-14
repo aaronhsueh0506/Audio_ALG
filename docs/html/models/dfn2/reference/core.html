@@ -136,7 +136,7 @@ dfn2_compute_features                              |
    |                                               |
    v                                               v
 dfn2_enhance_spectrum_stream(spec, heads(current-M))   noisy_ring (延遲的原譜)
-   |  df_common_expand_mask: 32 band -> 513 bin gain
+   |  skn_erb_expand_mask_f32: 32 band -> 513 bin gain
    |  cascade: masked spec(全頻)入 masked ring
    |  DF FIR 5-tap @ target=current-(M+D), alpha blend (低 96 bins)
    |  -> dfn2_apply_atten_lim(0=no-op)
@@ -523,7 +523,7 @@ make -C AINR -s print-lib-path   # 印出本組態的 archive 絕對路徑</pre>
 <li><b>bypass 是精確的 identity,不是近似</b>:<code>erb_inv</code> 是 partition of unity
 (每個 bin 的 band 權重和為 1),unit band mask 展開後就是 unit bin gain,noisy 頻譜原樣穿過 cascade。
 <b>匯出時檢查</b>:<code>export_erb_matrix.py</code> 的 <code>--runtime-bins</code> 在寫檔前、一般輸出在寫檔後呼叫
-<code>require_partition_of_unity()</code>(後者被拒時檔案已寫出)——照 <code>df_common_expand_mask</code> 的順序逐 band
+<code>require_partition_of_unity()</code>(後者被拒時檔案已寫出)——照 <code>skn_erb_expand_mask_f32</code> 的順序逐 band
 以 float32 累加後<b>逐位元</b>比對 <code>1.0f</code>(一般路徑另印 <code>inverse_unity_max_error</code>)。C 側 host
 (<code>pipelines/dfn/dfn_res_stage.c</code>)在 <code>get_mem_requirements()</code> 再驗一次,所以載到一份
 inverse 不是 partition of unity 的 ERB 矩陣會被 init 擋下,而不是讓 identity 悄悄變成近似。</li>

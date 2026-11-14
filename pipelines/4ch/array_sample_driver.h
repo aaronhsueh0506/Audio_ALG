@@ -33,7 +33,6 @@ int array_sample_parse_spatial_cli(int argc, char **argv, int raw,
                            ArraySampleSpatialOptions *out);
 
 typedef struct ArraySampleHopView {
-    const char *program;
     float *microphones, *reference, *output;
     int hop;
     int check_finite;
@@ -56,7 +55,6 @@ typedef struct ArraySampleOps {
 } ArraySampleOps;
 int array_sample_main(int argc, char **argv, const ArraySampleOps *ops, void *user);
 
-const char *array_sample_backend_name(uint32_t backend_id);
 /* One pool the sample carves beside the unit (a post-beam chain, an NN stage). */
 typedef struct ArraySampleMemLine { const char *label; unsigned long long bytes; } ArraySampleMemLine;
 /* The unit's size: the array pool plus the beamformer helper (*total) and the array's descriptor

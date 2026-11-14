@@ -22,7 +22,7 @@ import numpy as np
 from lib.aec.python.modules.cng import AEC_CNG_SEED, cng_fill
 
 #: The comfort-noise seed of the AEC library and of every consumer: after construction and after every
-#: hard post-chain reset (``AEC_CNG_SEED`` in ``lib/aec/c_impl/include/aec_post.h``).
+#: hard post-chain reset (``AEC_CNG_SEED`` in ``lib/aec/c_impl/include/aec.h``).
 SEED = AEC_CNG_SEED
 
 #: The 32 float32 literals of ``AECB_SQRT2_SIN_LUT``: sqrt(2) * sin(2*pi*i/32).  Copied as literals

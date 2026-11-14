@@ -410,16 +410,17 @@ static int test_dfn2_expand_mask(void)
         fill(gain, DFN2_N_ERB, 1.0f, rate);
 
         ref_expand(gain, inv, want);
-        df_common_expand_mask_scalar(gain, inv, lo, hi, DFN2_N_BINS, DFN2_N_ERB,
-                                     twin);
+        skn_erb_expand_mask_f32_scalar(gain, inv, lo, hi, DFN2_N_BINS,
+                                       DFN2_N_ERB, twin);
         CHECK(same_bits(twin, want, DFN2_N_BINS),
               "DFN2 scalar mask expansion equals the dense contract");
-        df_common_expand_mask(gain, inv, lo, hi, DFN2_N_BINS, DFN2_N_ERB, got);
+        skn_erb_expand_mask_f32(gain, inv, lo, hi, DFN2_N_BINS, DFN2_N_ERB,
+                                got);
         CHECK(same_bits(got, want, DFN2_N_BINS),
               "DFN2 mask expansion equals the dense contract");
-#if DF_COMMON_HAVE_NEON
-        df_common_expand_mask_neon(gain, inv, lo, hi, DFN2_N_BINS, DFN2_N_ERB,
-                                   got);
+#if SK_HAVE_NEON
+        skn_erb_expand_mask_f32_neon(gain, inv, lo, hi, DFN2_N_BINS,
+                                     DFN2_N_ERB, got);
         CHECK(same_bits(got, twin, DFN2_N_BINS),
               "DFN2 NEON mask expansion equals its scalar twin");
 #endif

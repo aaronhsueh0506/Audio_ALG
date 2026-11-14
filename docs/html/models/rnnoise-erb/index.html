@@ -11,7 +11,7 @@
 <main>
 <h1>RNNoise-ERB</h1>
 <h2>概要</h2>
-<p>RNNoise-ERB 的 C 端是 <code>RNNoise-ERB/process.h</code> 的一組函式與呼叫端 pool 內的 <code>RNNoiseState</code>：grid 由應用端以 <code>RNNoiseGridSpec</code> 在執行期給定，記憶體由呼叫端配置（<code>rnnoise_get_mem_size()</code> → 記憶體 → <code>rnnoise_init_ex()</code>，沒有 create／destroy），只做頻域。framing（<code>AcStft</code>／<code>AcIstft</code>）、ERB 矩陣與 GRU state 都歸應用端。它與 DFN／GTCRN 有兩處不同，整合時最容易寫錯：(1) <code>lookahead_frames=1</code>：新特徵窗 <code>[t-2,t-1,t]</code> 的 gain 屬於 spectrum <code>t-1</code>，應用端必須保存並延遲對應的頻譜，再用 <code>rnnoise_apply_gains()</code> 套 gain（就地改寫頻譜，內含 × <code>stft_unscale</code>，所以 <code>AcIstft</code> 的 <code>ispec_scale</code> 必須維持 1.0f）；(2) 模型輸入是前 3 框特徵（oldest → newest），前 2 框無模型輸出。模型內容見 <a href="reference/core.html">RNNoise-ERB 頻域與模型契約</a>。</p>
+<p>RNNoise-ERB 的 C 端是 <code>lib/ainr/rnnoise_erb/process.h</code> 的一組函式與呼叫端 pool 內的 <code>RNNoiseState</code>：grid 由應用端以 <code>RNNoiseGridSpec</code> 在執行期給定，記憶體由呼叫端配置（<code>rnnoise_get_mem_size()</code> → 記憶體 → <code>rnnoise_init_ex()</code>，沒有 create／destroy），只做頻域。framing（<code>AcStft</code>／<code>AcIstft</code>）、ERB 矩陣與 GRU state 都歸應用端。它與 DFN／GTCRN 有兩處不同，整合時最容易寫錯：(1) <code>lookahead_frames=1</code>：新特徵窗 <code>[t-2,t-1,t]</code> 的 gain 屬於 spectrum <code>t-1</code>，應用端必須保存並延遲對應的頻譜，再用 <code>rnnoise_apply_gains()</code> 套 gain（就地改寫頻譜，內含 × <code>stft_unscale</code>，所以 <code>AcIstft</code> 的 <code>ispec_scale</code> 必須維持 1.0f）；(2) 模型輸入是前 3 框特徵（oldest → newest），前 2 框無模型輸出。模型內容見 <a href="reference/core.html">RNNoise-ERB 頻域與模型契約</a>。</p>
 
 <h2>如何呼叫使用</h2>
 <ol>

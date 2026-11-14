@@ -242,7 +242,7 @@
   <ul style="margin: 4px 0 0 20px;">
     <li><strong>頻域處理</strong>：FFT 加速卷積，降低複雜度</li>
     <li><strong>Partition</strong>：把長 filter 切成多個短 partition，減少 latency</li>
-    <li><strong>Kalman</strong>：動態調整 step size（Q/R），比固定 mu 的 NLMS 收斂更快、追蹤更穩</li>
+    <li><strong>Kalman</strong>：動態調整 step size（Kalman gain），比固定 mu 的 NLMS 收斂更快、追蹤更穩</li>
   </ul>
 </div>
 
@@ -250,9 +250,9 @@
   <tr><th>項目</th><th>值</th></tr>
   <tr><td>block_size</td><td>256 samples (= 2 × hop，16 kHz 預設 256/128)</td></tr>
   <tr><td>fft_size</td><td>256 (= frame size)</td></tr>
-  <tr><td>n_partitions</td><td>ceil(filter_length ÷ hop) = 7（16 kHz 預設 FL=832）</td></tr>
-  <tr><td>Kalman Q (model uncertainty)</td><td>1e−3 (<code>kalman_q_high</code>，未收斂), 1e−6 (<code>kalman_q_low</code>，收斂後)</td></tr>
-  <tr><td>main filter step size <code>mu</code></td><td>0.3</td></tr>
+  <tr><td>n_partitions</td><td>ceil(濾波器長度 ÷ hop) = 7（16 kHz 預設 832 taps；長度由取樣率決定，不是 <code>AecConfig</code> 欄位）</td></tr>
+  <tr><td>Kalman Q (model uncertainty)</td><td>C 實作沒有 Q 參數（Python 參考實作保留 <code>kalman_q_high</code>／<code>kalman_q_low</code>）</td></tr>
+  <tr><td>main filter step size <code>mu</code></td><td>0.3（函式庫內部調校值）</td></tr>
 </table>
 
 <h3>3.2 Shadow Filter 雙濾波器策略</h3>
@@ -332,7 +332,7 @@ delta_ratio &lt; 0.3
 
 <p><strong>問題場景</strong>：白噪音、風扇、冷氣等穩態 far-end + 近端有人講話 → 傳統 DT 偵測全部失效（dt_indicator → 0, coh² → 1），RES 把語音當 echo 壓掉。</p>
 
-<p>AEC3 post chain 以 StationarityEstimator 與 <code>is_stationary_dt</code> 旗標處理這個場景，演算法見 <a href="../../../../lib/aec/docs/aec_methods.md">lib/aec/docs/aec_methods.md</a> <a href="../../../../lib/aec/docs/aec_methods_02_post_filter.md#31-stationarityestimator">§3.1</a>。</p>
+<p>AEC3 post chain 以 StationarityEstimator 與 <code>is_stationary_dt</code> 旗標處理這個場景，演算法見 <a href="../../../../../AEC/docs/aec_methods.md">AEC/docs/aec_methods.md</a> <a href="../../../../../AEC/docs/reference/postfilter.md#31-stationarityestimator">§3.1</a>。</p>
 
 </div>
 

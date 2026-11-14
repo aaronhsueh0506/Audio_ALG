@@ -107,8 +107,8 @@ DFN2 grid. Neither the DFN2 library nor the pipeline units hold a grid (see [`AI
 pair is refused with the list, exit 2) and hands it to `DfnResStageConfig.grid`. The stage takes its rate, FFT size and its input and
 output scales (1/sqrt(n_fft) and its inverse) from that grid. A host at the model's rate needs no bridge:
 `--ai-sample-rate 16000 --ai-fft-size 256` with the 16 kHz host runs straight through the stage (hop 128, algorithmic latency 128
-samples for the 0/0 row, pool 408,080 B), against 800 samples and
-567,680 B for the shipped 48 kHz model with the same 16 kHz host through the bridge. The bridge exists only for the shipped
+samples for the 0/0 row, pool 304,240 B), against 800 samples and
+463,792 B for the shipped 48 kHz model with the same 16 kHz host through the bridge. The bridge exists only for the shipped
 48 kHz / 1024 model (`resolve()` returns -1 on any other stage grid) and its hosts stay 8 kHz and 16 kHz, so a 16 kHz model
 refuses a host of another rate ("pool query rejected", exit 1), and the 48 kHz host needs the 48 kHz model. The banner prints the model
 grid and whether the stage or the bridge runs. `tests/test_mono_dfn.c` and the Python reference cover the shipped grid; the stage test
@@ -199,10 +199,10 @@ resampler count and must be included in the board measurement.
 
 Pool printed by the skeleton (`mono_aec_dfn_res`, matched delay, five-filter bank, NE10; the sum
 of `aec_get_mem_size()`, the post spectrum buffer of the RES path and the stage or
-bridge requirement, each 16-byte aligned): 567,680 bytes at the 16 kHz default (the AEC and the RES post spectrum plus the
-rate bridge, whose own pool is 222,880 bytes including the stage), 1,234,592 bytes at 48 kHz (the
+bridge requirement, each 16-byte aligned): 463,792 bytes at the 16 kHz default (the AEC and the RES post spectrum plus the
+rate bridge, whose own pool is 222,832 bytes including the stage), 932,256 bytes at 48 kHz (the
 stage's 105,056 bytes, its synthesis and the AEC; the conventional MMSE-LSA chain on the 48 kHz
-grid needs 1,270,112 bytes) and 475,408 bytes at 8 kHz. Model weights, accelerator activation/
+grid needs 967,776 bytes) and 437,056 bytes at 8 kHz. Model weights, accelerator activation/
 workspace memory and the recurrent state are external to this descriptor (the state of the shipped graph is
 1,280 + 30,720 float32 values, registered by a float host or held by the accelerator); adding int8 weights alone
-brings the pool plus weights to about 2.6 MiB at 16 kHz.
+brings the pool plus weights to about 2.5 MiB at 16 kHz.

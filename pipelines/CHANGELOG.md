@@ -3,6 +3,45 @@
 `Audio_ALG/pipelines`（含它建置的 `AINR`、`AIAEC` C 程式）的重要改動記錄在此，格式依
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/)。README 只寫現況，改動經過寫在這裡。
 
+## [Unreleased] — 2026-11-14 — follows lib/aec's `Aec* aec_create()`, the 12-field `AecConfig`, opaque `Aec` and `AEC_LAYOUT_VERSION` 2; pool figures re-measured
+
+No numerics changed in this repository; the AEC pool figures and the layout version moved with lib/aec.
+
+- **API.** Every caller of the old `aec_create(Aec*, cfg)` (`test_mono_chain.c`, `conv_chain_mono.h`, `test_mono_dfn.c`, `test_mono_ulcnet.c`) takes the returned `Aec*`, and each `aec_destroy(x); free(x);` pair is a single `aec_destroy(x)`
+  (the pointer is dead afterwards). `DA_NUM_FILTERS` -> `AEC_DELAY_NUM_FILTERS_MAX` and the three `DA_*` geometry macros of `test_mono_ulcnet.c` -> `AEC_DELAY_*` in 14 files; `MonoUlcnetConfig.filter_length` and the
+  write to `AecConfig.filter_length` are gone (the length follows the rate). `AIAEC/tests/deployed_lane_dump.c` reads `n_partitions` and `delay_period_hops` from `aec_debug_status()` and the level's floors from
+  `aec_level_*()`; the printed keys are unchanged. Six keys (`filter_length`, `enable_shadow`, `enable_highpass`, `enable_saturation`, `saturation_softclip_ref`, `live_observer_enabled`) have no reader in the shipped library any more
+  and print the lane's fixed values until `AecDebugStatus` is widened.
+- `test_mono_dfn.c` `run_native()`: the instance and the baseline chain are destroyed on every return path (the planted-defect rows returned early and leaked 6 `MonoDfn` and 6 `ConvMono`, 4.8 MB at exit); `leaks --atExit` now reports 0.
+- **Guards.** `test_cng_aec3.py` reads `AEC_CNG_SEED` from `aec.h`; `pyc_parity.py` hashes `src/aec_impl.h`; `test_build_isolation.sh` SP-S17 gives `check-pins` the scratch clones' own HEADs and audiolib repo root (a dirty
+  producer makes the adoption commit differ from the pin).
+- **Docs.** `AEC_LAYOUT_VERSION` 2 in the nine policed lines and the prose and table lines that quote it; pool figures from `aec_get_mem_size()`, `aec_get_mem_breakdown()`, `aec_nr_pipeline_static`, `4ch_static`, `4ch_external_static`, `4ch_alignulcnet`,
+  `4ch_aec_bf_dfn_res` and `mono_aec_dfn_res` (mono 16k/256 AEC 343,760 -> 239,920 B, total 401,520 -> 297,680 B; array FULL 720,352 -> 701,280 B; `4ch_static` Unit 1,512,576 -> 1,493,472 B; the per-filter step of
+  `delay_num_filters` 5,728 -> 11,264 B single channel, 5,120 B array; SRP/BF helper 792,224 -> 792,192 B after audiolib's 16-byte `BF`/`SRP` shrink); the `AecConfig` tables of the mono and 4ch pages, `tuning.md`, `build.md`,
+  `call-flow.md` and the array references describe the 12 public fields and the internal `AecTuning`; `aec_create()` snippets and destroy rules follow the new contract.
+
+## [Unreleased] — 2026-11-14 — tidy of stream/, the model cores' test wiring and the pipeline tests
+
+No numerics changed: every lib/ainr and lib/aiaec object file is byte-identical (SIMD 1 and 0, full and mask-only) and the AINR chain digests are unchanged.
+
+- **Removed.** The 16 forwarding headers under `AINR/` and `AIAEC/` (`AINR/DeepFilterNet{2,3}/dfn*_*.h`, `AINR/GTCRN/gtcrn_process.h`, `AINR/RNNoise-ERB/process.h`, `AIAEC/Align_ULCNet/*.h`,
+  `AIAEC/DeepVQE_S/*.h`, `AIAEC/aiaec_process.h`): the tests, the test-grid headers, the RNNoise-ERB Makefile and the docs include the core headers from `lib/ainr/<model>/` and `lib/aiaec/<model>/`.
+  Seven accessors with no caller (`dfn2_stream_grid`, `dfn2_stream_layout_version`, `deepvqe_stream_grid`, `deepvqe_stream_layout_version`, `ulcnet_stream_grid`, `ulcnet_stream_frames_per_call`,
+  `ulcnet_stream_layout_version`) and the two `dfn2_stream_*_mask_only` rename macros for them; the write-only `DFN2Stream.atten_lim_db` and `AinrCore.cfg` (`dfn2_stream_get_mem_size()` is 16 bytes smaller and `ainr_get_mem_size*()` 32 bytes smaller; no layout version moved; `pool_size.c` and `models/dfn2/reference/board.html` follow);
+  `df_common_expand_mask{,_scalar,_neon}` in `dfn2_process.c` (the three sites call `skn_erb_expand_mask_f32`; `test_nn_kernels.c` tests the `skn_` names); `ULCNET_COMPRESSION_EXP`;
+  `deepvqe_stream_internal.h` and `ulcnet_stream_internal.h` (folded into the `.c` files; the layout helpers are static); `ArraySampleHopView.program`; `dfn_fixture_bridge_added_delay`;
+  `Audio_ALG/shared/`, `scripts/update_submodules.sh`, the unreachable `example_board_adapter` make alias.
+  Tests: `test_ainr_work_shapes.c` (its refusal and second-block checks moved into `test_ainr_model_io.c`) and `test_aiaec_ports.c` (its disjoint-buffer, empty-slot, slim-`AiaecInfo` and three-family-info checks moved into
+  `test_aiaec_model_io.c`).
+- **CLI.** `4ch_external_static` parses its AEC and NR levels with `example_cli_level_option()`: one digit 0..3 only, and the error text is the shared "is not a level (accepted: 0..3)" (exit code 2 as before).
+- **Shared.** `scripts/test_cli_exit_codes.sh` (run as `sh scripts/test_cli_exit_codes.sh PROGRAM BINARY`) holds the command-line exit-code cases that six Makefile recipes spelled out (the union of the lists); `ulcnet/tests/ulcnet_test_fixture.h` the grid table, descriptor and stand-in
+  models of the mono and 4ch ULCNet tests; `stream/ainr/tests/ainr_test_fixture.h` and `stream/aiaec/tests/aiaec_test_fixture.h` the ERB writer and pool allocator of the stream tests;
+  `ai3_model_io_shape_ok()` the axis check of `ai3_model_io_expand()`. The commented 8x8 catalogue rows of `stream/ainr/ainr.c` are in `docs/maintenance/ainr-release-data.md`.
+- **Build and gates.** `test_build_isolation.sh` resolves AEC, NR and audiolib through `lib/deps.mk` (it used the `lib/aec` and `lib/nr` gitlink worktrees); `audit_dead_defines.sh` also covers `stream/`, takes AEC's and NR's
+  sources from `lib/deps.mk` and reads `*_TEST_*` flags as test flags; `lib/deps.mk` lists its twelve includers.
+- **Docs.** `models/dfn2/reference/grid.html` (the 8-field `DFN2GridSpec`, fixed normaliser constants, `DFN2_GRID_ERR_NORM_ALPHA`), stale file and test names in six pages, `c_python_function_map.md` (AINR-DFN2-05, counts), `dependencies.md`,
+  `publish.md` Appendix A (`test-fp-contract`, `test-publish-manifest`, `target-abi-test`, the two audits).
+
 ## [Unreleased] — 2026-11-13 — the 4-channel sample layer is named `array_sample_*`; the flow wrapper is gone
 
 Nothing was released, so the old names are gone without aliases.

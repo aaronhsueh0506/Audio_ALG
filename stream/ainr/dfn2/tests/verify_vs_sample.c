@@ -1,21 +1,14 @@
-/* Verifies dfn2_stream_pre_process/post_process against an independent re-implementation of the
- * board sample's own per-hop loop (alg_ai3_dfn.c's simple_thread(): compute_features ->
- * dfn2_prepost_frame_open -> NPU -> dfn2_prepost_frame_finish/frame_bypass -> post_process_freq ->
- * ac_istft_push_planar -> int16 saturate), built directly against lib/ainr/dfn2/dfn2_prepost.h and
- * audiolib, never against dfn2_stream.c. The two drivers run the SAME deterministic fake
- * accelerator (a pure function of a global hop counter, ignoring its own input argument so its
- * output cannot accidentally depend on which driver is calling it) and must produce byte-identical
- * PCM and an identical (pre_rc, generation, valid) trace, hop for hop.
+/* Verifies dfn2_stream_pre_process/post_process against a hand-written per-hop loop (the oracle): features ->
+ * dfn2_prepost_frame_open -> accelerator -> dfn2_prepost_frame_finish/frame_bypass -> post_process_freq ->
+ * ac_istft_push_planar -> int16 saturate. The oracle is built directly against lib/ainr/dfn2/dfn2_prepost.h and
+ * audiolib, never against dfn2_stream.c. The two drivers run the SAME deterministic fake accelerator (a pure
+ * function of a global hop counter, ignoring its own input argument so its output cannot depend on which driver
+ * is calling it) and must produce byte-identical PCM and an identical (pre_rc, generation, valid) trace, hop for
+ * hop.
  *
- * Board sample read-only reference: ~/Desktop/exp/audio_sample/alg_ai3_dfn.c lines 505-520
- * (compute_features), 1750-1838 (the per-hop dispatch + synthesis). Never edited; this file
- * re-implements the same sequence against the public lib/ainr/dfn2 API instead of calling into it.
- *
- * INJECT_BUG_SHIFT (compile-time, off by default): delays the comparison's view of driver B's PCM
- * by one hop, to prove this harness's comparison can actually detect a divergence (project rule:
- * a verification gate must be shown capable of failing). It injects nothing into dfn2_stream.c
- * itself -- that file is never touched by this test -- it only mis-feeds the comparator, which is
- * exactly what a real one-hop OLA bug in the implementation would look like to this harness. */
+ * INJECT_BUG_SHIFT (compile-time, off by default): delays the comparison's view of driver B's PCM by one hop, to
+ * prove this harness's comparison can detect a divergence. It injects nothing into dfn2_stream.c; it only mis-feeds
+ * the comparator, which is what a one-hop OLA bug in the implementation would look like to this harness. */
 
 #include <stdint.h>
 #include <stdio.h>

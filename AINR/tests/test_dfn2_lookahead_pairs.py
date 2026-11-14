@@ -163,8 +163,8 @@ _STREAM_DRIVER = r'''
 #include <string.h>
 
 #include "tests/dfn2_test_grid.h"
-#include "DeepFilterNet2/dfn2_model_io.h"
-#include "DeepFilterNet2/dfn2_process.h"
+#include "dfn2_model_io.h"
+#include "dfn2_process.h"
 
 #define COEFS (DFN2_DF_BINS * DFN2_DF_ORDER * 2)
 

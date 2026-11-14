@@ -3,13 +3,13 @@
  * strictly and checked together. Header-only, no ABI: copy and adapt.
  *
  *     ExampleCliDelayOptions d;
- *     example_cli_delay_options_default(&d, DA_NUM_FILTERS);
+ *     example_cli_delay_options_default(&d, AEC_DELAY_NUM_FILTERS_MAX);
  *     for each option: example_cli_delay_set_option(&d, name, value, prog)  // 0, or 2 = rejected
  *     example_cli_delay_validate(&d, prog)                                  // 0, or 2 = rejected
  *
  * A rejection prints "<prog>: ..." with the requested value and what the build accepts. The
  * bank size `n` applies to MATCHED only; the other modes build no bank and leave
- * n == DA_NUM_FILTERS. */
+ * n == AEC_DELAY_NUM_FILTERS_MAX. */
 #ifndef PIPELINES_EXAMPLE_CLI_H
 #define PIPELINES_EXAMPLE_CLI_H
 
@@ -29,7 +29,7 @@ extern "C" {
 
 typedef struct ExampleCliDelayOptions {
     AecDelayMode mode;
-    int num_filters;        /* MATCHED only; 1..DA_NUM_FILTERS */
+    int num_filters;        /* MATCHED only; 1..AEC_DELAY_NUM_FILTERS_MAX */
     int fixed_samples;      /* FIXED only; -1 otherwise */
     int have_num_filters, have_fixed;
 } ExampleCliDelayOptions;
@@ -129,7 +129,7 @@ static inline int example_cli_delay_set_option(ExampleCliDelayOptions* o, const 
     } else if (!strcmp(name, "--delay-num-filters")) {
         if (example_cli_parse_int(value, &o->num_filters) != 0) {
             fprintf(stderr, "%s: --delay-num-filters '%s' is not an "
-                    "integer (accepted: 1..%d)\n", prog, value, DA_NUM_FILTERS);
+                    "integer (accepted: 1..%d)\n", prog, value, AEC_DELAY_NUM_FILTERS_MAX);
             return 2;
         }
         o->have_num_filters = 1;
@@ -144,7 +144,7 @@ static inline int example_cli_delay_set_option(ExampleCliDelayOptions* o, const 
     return 0;
 }
 
-/* The options together; outside MATCHED, n is set to DA_NUM_FILTERS. */
+/* The options together; outside MATCHED, n is set to AEC_DELAY_NUM_FILTERS_MAX. */
 static inline int example_cli_delay_validate(ExampleCliDelayOptions* o, const char* prog) {
     if (o->have_fixed && o->mode != AEC_DELAY_FIXED) {
         fprintf(stderr, "%s: --fixed-delay %d is only valid with "
@@ -159,22 +159,22 @@ static inline int example_cli_delay_validate(ExampleCliDelayOptions* o, const ch
         return 2;
     }
     if (o->mode == AEC_DELAY_MATCHED) {
-        if (o->num_filters < 1 || o->num_filters > DA_NUM_FILTERS) {
+        if (o->num_filters < 1 || o->num_filters > AEC_DELAY_NUM_FILTERS_MAX) {
             fprintf(stderr, "%s: --delay-num-filters %d is out of range "
                     "(accepted: 1..%d; 0 does not mean 'off' -- use "
                     "--delay-mode fixed or external instead)\n", prog,
-                    o->num_filters, DA_NUM_FILTERS);
+                    o->num_filters, AEC_DELAY_NUM_FILTERS_MAX);
             return 2;
         }
     } else {
-        if (o->have_num_filters && o->num_filters != DA_NUM_FILTERS) {
+        if (o->have_num_filters && o->num_filters != AEC_DELAY_NUM_FILTERS_MAX) {
             fprintf(stderr, "%s: --delay-num-filters %d is only valid with "
                     "--delay-mode matched (requested mode: %s, which builds "
                     "no matched bank and requires n == %d)\n", prog,
-                    o->num_filters, example_cli_delay_mode_name(o->mode), DA_NUM_FILTERS);
+                    o->num_filters, example_cli_delay_mode_name(o->mode), AEC_DELAY_NUM_FILTERS_MAX);
             return 2;
         }
-        o->num_filters = DA_NUM_FILTERS;
+        o->num_filters = AEC_DELAY_NUM_FILTERS_MAX;
     }
     return 0;
 }

@@ -22,8 +22,7 @@ sys.path.insert(0, str(ROOT_PATH.parents[1]))
 _AINR_TESTS = str(ROOT_PATH.parent / 'tests')
 if _AINR_TESTS not in sys.path:
     sys.path.insert(0, _AINR_TESTS)
-# dfn3_*.c/.h moved to lib/ainr/dfn3/ in the single-model-release restructuring; ROOT_PATH /
-# 'dfn3_*.h' is now only a forwarding stub (an #include line), not the real header text.
+# dfn3_*.c/.h live in lib/ainr/dfn3/.
 DFN3_C_DIR = ROOT_PATH.parents[1] / 'lib' / 'ainr' / 'dfn3'
 
 

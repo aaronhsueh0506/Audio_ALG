@@ -398,7 +398,7 @@ static int derive_mono_lane(const Args* a, AecSignalGrid* grid, AecConfig* aec_c
     aec_config_from_level(aec_cfg, a->aec, a->sr);
     aec_cfg->fft_size = grid->fft_size;
     aec_cfg->delay_mode = AEC_DELAY_MATCHED;
-    aec_cfg->delay_num_filters = DA_NUM_FILTERS;
+    aec_cfg->delay_num_filters = AEC_DELAY_NUM_FILTERS_MAX;
     aec_cfg->fixed_delay_samples = -1;
     aec_cfg->residual = AEC_RESIDUAL_FULL;
     return 0;

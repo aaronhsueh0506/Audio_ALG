@@ -11,7 +11,7 @@
 | ID 常數 | 值 | 量化 | 登錄狀態 |
 |---|---:|---|---|
 | `AINR_MODEL_ID_DFN2_FULL` | 1 | 16x16（預設） | 已登錄 |
-| `AINR_MODEL_ID_DFN2_FULL_ALT1` | 10 | 8x8 | 登錄列已註解；所有組態以 `AINR_ERR_GRID` 被拒 |
+| `AINR_MODEL_ID_DFN2_FULL_ALT1` | 10 | 8x8 | 未登錄（列在下方「8x8（ALT1）登錄列」）；所有組態以 `AINR_ERR_GRID` 被拒 |
 | `AINR_MODEL_ID_DFN2_FULL_ALT2` | 11 | 16x8 | 已登錄 |
 | `AINR_MODEL_ID_DFN2_LITE` | 2 | 16x16（預設） | 已登錄 |
 | `AINR_MODEL_ID_DFN2_LITE_ALT1` | 20 | 8x8 | 同 full 的 ALT1 |
@@ -38,10 +38,46 @@
 - ERB 矩陣檔依 `(sr, n_erb)` 命名，與量化無關，形如 `fb_<sr>_<n_erb>.bin`，放在 `AINR_ERB_MATRIX_DIR`（`ainr.c` 內有預設值，可在編譯時覆寫）。格式見 `docs/html/models/dfn2/reference/grid.html` 的 ERB 一節（`export_erb_matrix.py` 的 `erb_matrix.bin`）。
 - 登錄的 graph 是否已交付、量化版本是否與該列的 grid 與 N 相符，本庫沒有核對紀錄。full 16 kHz／256／N=8 的路徑存在於登錄表；交付與是否相符待交付端確認。
 
+## 8x8（ALT1）登錄列
+
+ALT1 的登錄列與 graph 路徑陣列不放在 `ainr.c`；要登錄時把下列片段放回對應的 `#ifndef DFN2_MASK_ONLY` 區塊（full）或 `#else` 區塊（lite），並把列加進 `AINR_DFN2_CATALOG`；`<前綴>` 與上一節相同（現行各列見 `ainr.c`），路徑為暫定檔名。full 的 graph 路徑陣列：
+
+```c
+static const AinrDfn2FramesVariant AINR_DFN2_FULL_16K_256_N_8X8[] = {
+    { 1, AINR_MODEL_DIR_BASE "/8x8/dfn2/<前綴>_model_16k_n1.bin" },
+    { 8, AINR_MODEL_DIR_BASE "/8x8/dfn2/<前綴>_model_16k_n8.bin" },
+};
+static const AinrDfn2FramesVariant AINR_DFN2_FULL_48K_1024_N_8X8[] = {
+    { 1, AINR_MODEL_DIR_BASE "/8x8/dfn2/<前綴>_model_48k_n1.bin" },
+};
+```
+
+full 的 catalog 列（接在 `AINR_MODEL_ID_DFN2_FULL` 的兩列之後）：
+
+```c
+{ AINR_MODEL_ID_DFN2_FULL_ALT1, 16000, 256,  24, 96, 5, 0, 0, 0.0f, 0, 0.0f,
+  AINR_DFN2_FULL_16K_256_N_8X8, 2 },
+{ AINR_MODEL_ID_DFN2_FULL_ALT1, 48000, 1024, 32, 96, 5, 1, 1, 0.0f, 0, 0.0f,
+  AINR_DFN2_FULL_48K_1024_N_8X8, 1 },
+```
+
+lite 的 graph 路徑陣列與 catalog 列：
+
+```c
+static const AinrDfn2FramesVariant AINR_DFN2_LITE_48K_1024_N_8X8[] = {
+    { 1, AINR_MODEL_DIR_BASE "/8x8/dfn2_lite/<前綴>_model_48k_n1.bin" },
+};
+
+{ AINR_MODEL_ID_DFN2_LITE_ALT1, 48000, 1024, 32, 96, 0, 1, 0, 0.0f, 0, 0.0f,
+  AINR_DFN2_LITE_48K_1024_N_8X8, 1 },
+```
+
+登錄後 `make -C stream/ainr test-ainr-product` 中「ALT1 每個組態都被 `AINR_ERR_GRID` 拒絕」的檢查要改成 ALT1 的 graph 路徑檢查。
+
 ## 驗收入口
 
 ```sh
-make -C stream/ainr test                 # full：dfn2、spec-freq、work-shapes、tail、freq-nonfinite、state-generation、pool-gates、atten-lim、product、model-io、link-only
+make -C stream/ainr test                 # full：dfn2、spec-freq、tail、freq-nonfinite、state-generation、pool-gates、atten-lim、product、model-io、link-only
 make -C stream/ainr MASK_ONLY=1 test     # lite：同上，去掉 dfn2 與 spec-freq
 ```
 

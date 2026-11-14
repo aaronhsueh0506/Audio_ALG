@@ -33,12 +33,6 @@
 #include "utility/mem_align.h"
 #include "utility/simd_kernel_nn.h"   /* skn_all_finite_f32 */
 
-/* A level is its enum number, given as a whole decimal string 0..3; -1 for anything else. */
-static int parse_level(const char* s) {
-    int v;
-    return example_cli_parse_int(s, &v) == 0 && v >= 0 && v <= 3 ? v : -1;
-}
-
 static const char* level_name(AecLevel level) {
     switch (level) {
         case AEC_LEVEL_MILD:       return "mild";
@@ -266,12 +260,7 @@ int main(int argc, char* argv[]) {
             const char* text = example_cli_option_value(argc, argv, &i, argv[0]);
             int level_id;
             if (!text) return 2;
-            level_id = parse_level(text);
-            if (level_id < 0) {
-                fprintf(stderr, "%s: %s '%s' is not an NR level "
-                        "(accepted: 0 mild, 1 moderate, 2 balanced, 3 aggressive)\n", argv[0], name, text);
-                return 2;
-            }
+            if (example_cli_level_option(name, text, 3, &level_id, argv[0]) != 0) return 2;
             nr_level = (AnrLevel)level_id;
         } else if (strcmp(argv[i], "--aec-level") == 0 || argv[i][0] != '-') {
             const char* text = argv[i];
@@ -280,12 +269,7 @@ int main(int argc, char* argv[]) {
                 text = example_cli_option_value(argc, argv, &i, argv[0]);
                 if (!text) return 2;
             }
-            p = parse_level(text);
-            if (p < 0) {
-                fprintf(stderr, "%s: AEC level '%s' is not a level "
-                        "(accepted: 0 mild, 1 balanced, 2 aggressive, 3 no_floor)\n", argv[0], text);
-                return 2;
-            }
+            if (example_cli_level_option("AEC level", text, 3, &p, argv[0]) != 0) return 2;
             if (have_level) {
                 fprintf(stderr, "%s: a second AEC level '%s'; give one\n", argv[0], text);
                 return 2;

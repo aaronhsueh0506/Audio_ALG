@@ -48,8 +48,8 @@ import dfn_pairs
 
 FAMILY = 'DeepFilterNet2'
 DFN2 = dfn_pairs.family_dir(FAMILY)
-# dfn2_*.c/.h moved to lib/ainr/dfn2/ in the single-model-release restructuring; DFN2 (still
-# AINR/DeepFilterNet2, the Python training dir) now holds only config.ini and forwarding stubs.
+# dfn2_*.c/.h live in lib/ainr/dfn2/; DFN2 (AINR/DeepFilterNet2, the Python training dir) holds
+# config.ini and the Python side only.
 DFN2_C_DIR = dfn_pairs.AINR.parent / 'lib' / 'ainr' / 'dfn2'
 
 SIMD_MODES = (1, 0)
@@ -286,7 +286,7 @@ class _Builds:
         path = self.work / (stem + '.c')
         path.write_text(source, encoding='utf-8')
         exe = self.work / stem
-        done = _cc([*dfn_pairs.house_cflags(simd), *flags, '-I', str(DFN2),
+        done = _cc([*dfn_pairs.house_cflags(simd), *flags, '-I', str(DFN2_C_DIR),
                     str(path),
                     *[str(dfn_pairs.source_path(FAMILY, u)) for u in units],
                     dfn_pairs.audio_common_lib(simd), '-lm', '-o', str(exe)])
@@ -702,7 +702,7 @@ def test_the_ubsan_gate_can_fail(builds, ubsan_probe, tmp_path):
     probe_source = tmp_path / 'probe.c'
     probe_source.write_text(_probe_source(), encoding='utf-8')
     exe = tmp_path / 'probe_mutated'
-    done = _cc([*dfn_pairs.house_cflags(1), *_UBSAN, '-I', str(DFN2), str(probe_source),
+    done = _cc([*dfn_pairs.house_cflags(1), *_UBSAN, '-I', str(DFN2_C_DIR), str(probe_source),
                 str(mutated), dfn_pairs.audio_common_lib(1), '-lm', '-o', str(exe)])
     assert done.returncode == 0, done.stderr
     cases = ['make 16000 256 %d 96 1 1' % n_erb for n_erb in (1 << 30, 0x7ffffffc)]
@@ -1180,7 +1180,7 @@ def grid_lib(request, tmp_path_factory):
     wrapper.write_text(_WRAPPER, encoding='utf-8')
     library = work / ('grid.dylib' if sys.platform == 'darwin' else 'grid.so')
     shared = '-dynamiclib' if sys.platform == 'darwin' else '-shared'
-    built = _cc([shared, '-fPIC', *dfn_pairs.house_cflags(simd), '-I', str(DFN2),
+    built = _cc([shared, '-fPIC', *dfn_pairs.house_cflags(simd), '-I', str(DFN2_C_DIR),
                  str(wrapper), str(DFN2_C_DIR / 'dfn2_process.c'),
                  dfn_pairs.audio_common_lib(simd), '-lm', '-o', str(library)])
     assert built.returncode == 0, built.stderr

@@ -11,28 +11,9 @@
 
 #include "ainr.h"
 #include "ainr_test.h"
+#include "ainr_test_fixture.h"
 
 #define FAIL(...) do { fprintf(stderr, "%s: ", label); fprintf(stderr, __VA_ARGS__); fprintf(stderr, "\n"); return 1; } while (0)
-
-static void write_synthetic_erb(const char *path, int n_bins, int n_erb) {
-    size_t elems = (size_t)n_bins * (size_t)n_erb, i;
-    float *fwd = (float *)malloc(elems * sizeof(float)), *inv = (float *)malloc(elems * sizeof(float));
-    int32_t hdr[2] = { n_bins, n_erb };
-    FILE *fp = fopen(path, "wb");
-    if (!fwd || !inv || !fp) exit(1);
-    for (i = 0; i < elems; ++i) { fwd[i] = (float)(i % 17) * 0.01f; inv[i] = (float)((i + 3) % 11) * 0.02f; }
-    fwrite(hdr, sizeof(int32_t), 2, fp);
-    fwrite(fwd, sizeof(float), elems, fp);
-    fwrite(inv, sizeof(float), elems, fp);
-    fclose(fp);
-    free(fwd); free(inv);
-}
-
-static void *pool_for(size_t bytes, unsigned int alignment) {
-    void *p = NULL;
-    if (posix_memalign(&p, alignment, bytes) != 0) exit(1);
-    return p;
-}
 
 /* Energy of `blocks` PCM blocks through a fully suppressing mask (every head zero). */
 static double run_energy(AinrCtx *ctx, int hop_in, int blocks) {
@@ -59,7 +40,7 @@ static AinrCtx *make_pcm(const AinrConfig *cfg, const char *erb) {
     if (ainr_get_mem_size(cfg, &req) != AINR_OK) return NULL;
     AinrCtx *ctx = NULL;
     AinrInfo info;
-    if (ainr_init_from_erb_file(cfg, erb, pool_for((size_t)req.bytes, req.alignment), (size_t)req.bytes, &ctx, &info) != AINR_OK)
+    if (ainr_init_from_erb_file(cfg, erb, alloc_aligned((size_t)req.bytes, req.alignment), (size_t)req.bytes, &ctx, &info) != AINR_OK)
         return NULL;
     return ctx;
 }
@@ -113,10 +94,10 @@ static int run_case(int sr, int fft, int n_erb, int n, const char *label) {
     /* Same refusals on the other two families. */
     if (ainr_get_mem_size_spec(&cfg, &req) != AINR_OK) FAIL("spec size");
     sp = NULL;
-    if (ainr_init_spec_from_erb_file(&cfg, erb, pool_for((size_t)req.bytes, req.alignment), (size_t)req.bytes, &sp, &info) != AINR_OK) sp = NULL;
+    if (ainr_init_spec_from_erb_file(&cfg, erb, alloc_aligned((size_t)req.bytes, req.alignment), (size_t)req.bytes, &sp, &info) != AINR_OK) sp = NULL;
     if (ainr_get_mem_size_freq(&cfg, &req) != AINR_OK) FAIL("freq size");
     fq = NULL;
-    if (ainr_init_freq_from_erb_file(&cfg, erb, pool_for((size_t)req.bytes, req.alignment), (size_t)req.bytes, &fq, &info) != AINR_OK) fq = NULL;
+    if (ainr_init_freq_from_erb_file(&cfg, erb, alloc_aligned((size_t)req.bytes, req.alignment), (size_t)req.bytes, &fq, &info) != AINR_OK) fq = NULL;
     if (!sp || !fq) FAIL("spec/freq init failed");
     z = (float *)calloc((size_t)n * (size_t)n_bins * 4u, sizeof(float));
     buf = (int16_t *)calloc((size_t)cfg.hop_in, sizeof(int16_t));

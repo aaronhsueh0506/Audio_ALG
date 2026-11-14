@@ -86,7 +86,7 @@ Hard invariants:
   own suppression gain (see above).
 - The lanes and the estimator are inside the array's pool and have no public handle: they cannot be driven or reset
   by the application, only through `aec_reset()` on the array.
-- `delay_num_filters`, each PBFDKF lane's `filter_length`, and an
+- `delay_num_filters`, each PBFDKF lane's filter length (set by the sample rate, not by the application), and an
   Align-ULCNet checkpoint's TA depth `D` are independent budgets.
 - The Python reference and the C flow leave SRP-PHAT/BF at an explicit
   ownership seam. The C sample helper `array_sample_beam.*` connects
@@ -189,7 +189,7 @@ with `aec_reset()`.
 
 | | External (a third party may tune) | Internal (exists, not recommended to open) |
 |---|---|---|
-| Array (`AecConfig`) | `sample_rate`, `fft_size`, `delay_mode` + `delay_num_filters` / `fixed_delay_samples`, `capture_proxy_channel`, `max_delay_ms`, `residual`, the level (`aec_config_from_level()`, `aec_set_level()`), `filter_length`; opt-in and off by default: `delay_est_period_s` (a compute knob; a non-zero value can change the lag it picks) | `delay_backward_quarantine_enabled` / `_s` (off by default, kept off in products: it only holds an earlier estimate for one window and does not cure a mis-lock), the lanes' derived fields (`EXTERNAL_ALIGNED`, lane `residual`), the 10 ms-grid retimed tunables, `DA_*`, projection kernels |
+| Array (`AecConfig`, 12 public fields) | `sample_rate`, `fft_size`, `delay_mode` + `delay_num_filters` / `fixed_delay_samples`, `capture_proxy_channel`, `residual`, `level` (`aec_config_from_level()`, `aec_set_level()`), `enable_cng` | `delay_backward_quarantine_enabled` / `_s` (off by default, kept off in products: it only holds an earlier estimate for one window and does not cure a mis-lock), the lanes' derived fields (`EXTERNAL_ALIGNED`, lane `residual`); everything else is the library's own tuning (`AecTuning`: filter length, delay ring range, duty cycle, shadow, thresholds) and is not settable |
 | Sample beam helper (`ArraySampleBeamParams`) | `geometry` with `uca_radius_m` / `ula_spacing_m` / `microphone_x_m` / `microphone_y_m`, `num_angles`; advanced: `bf_enable`, `bf_fixed_mode` + `bf_fixed_doa_rad`, `doa_low_freq_hz` / `doa_high_freq_hz` | `bf_lambda`, `bf_mu`, `bf_adapt_interval`, `bf_fixed_align_notebook` (the set value differs from the effective one), `doa_enable_smoothing`, `doa_switch_consecutive`, `doa_angle_tolerance_rad`, `doa_update_interval`, `speed_of_sound_m_s`, `auto_vad_*` (only the fallback VAD) |
 | Runtime | `aec_set_level()` on the array (its one gain stage), `anr_set_level(nr, level)` | a level on a lane (a no-op by construction: the lanes have no handle) |
 
@@ -208,10 +208,10 @@ The Python twin has the same classes under `Mcab*` names: `McabConfig`, `McabPip
 `AecConfig`, stamps the contract onto it, and defaults to `mcab_lane_config()` (a PBFDKF lane with a 52 ms filter at
 16 kHz and 64 ms at 48 kHz; the C default lane is the balanced level). The Python grid is chosen by
 `McabConfig.frame_size` / `hop_size`, and the Python shared delay is always the MATCHED estimator.
-The Python `McabConfig` carries the grid, `capture_proxy_channel`, `max_delay_ms` and the backward-quarantine pair; it
+The Python `McabConfig` carries the grid, `capture_proxy_channel`, `max_delay_ms` (a C-internal 1024 ms) and the backward-quarantine pair; it
 has no `delay_mode`, `delay_num_filters`, `fixed_delay_samples`, `delay_est_period_s` or `enable_post` (C: `AecConfig.residual`). The matched-filter
-duty cycle (`delay_est_period_s`) is C-only. `tests/test_delay_parity.py` drives the C flow (`dump_delay_parity`) and
-`pipeline.py` from one synthetic scene with the duty cycle pinned at full rate and compares the applied delay, `solid`,
+duty cycle is C-only and internal to the library: its tuning leaves it off (every hop is analysed) and `AecConfig` cannot set it. `tests/test_delay_parity.py` drives the C flow (`dump_delay_parity`) and
+`pipeline.py` from one synthetic scene and compares the applied delay, `solid`,
 `changed` and the served aligned far hop by hop.
 
 ```python
@@ -297,7 +297,7 @@ contract for every finite float32 input.
 
 The array instance does not expose an async multi-frame queue. The sample beam helper
 does execute SRP-PHAT/BF and remains synchronous; the array supports the heap convenience
-`aec_create()` and the caller-owned, zero-heap `aec_init_ex()` shown in
+`Aec* aec_create(const AecConfig*)` (freed by `aec_destroy()`) and the caller-owned, zero-heap `aec_init_ex()` shown in
 [the C API](reference/c-api.md#c-api). Automated tests prove caller-pool and heap lifecycle,
 byte-identical construction paths, topology, supported grids, spatial
 arithmetic equivalence,

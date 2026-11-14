@@ -30,6 +30,7 @@
 #include <string.h>
 
 #include "aiaec.h"
+#include "aiaec_test_fixture.h"
 #include "aiaec_product.h"
 #include "audio_stft.h"
 #include "stream_mem.h"
@@ -47,12 +48,6 @@ static AiaecConfig make_cfg(int fft, int n) {
     memset(&cfg, 0, sizeof(cfg));
     cfg.sr = 16000; cfg.fft = fft; cfg.hop_in = (fft / 2) * n;
     return cfg;
-}
-
-static void *alloc_aligned(size_t bytes) {
-    void *p = NULL;
-    if (posix_memalign(&p, 16, bytes) != 0) { fprintf(stderr, "alloc fail\n"); exit(1); }
-    return p;
 }
 
 /* One context per family on its own pool. */

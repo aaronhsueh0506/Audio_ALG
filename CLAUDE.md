@@ -80,8 +80,7 @@ GTCRN/RNNoise-ERB use their own `*_process_mask_validate`/`*_process_state_valid
 just the model's `*_prepost.h` (or `*_process.h` for GTCRN/RNNoise-ERB) is usually enough to
 integrate it; `*_process.c` is only needed to change the model's math itself. All 8 models' cores
 now live under `lib/ainr/<model>/` / `lib/aiaec/<model>/` (the single-model-release restructuring);
-`AINR/`/`AIAEC/` keep the Python training/export side and (for the six models that had one before)
-a forwarding compat header at the old public-header path for out-of-tree board samples.
+`AINR/`/`AIAEC/` keep the Python training/export side only.
 
 **PCM stream SDKs.** Each wraps a frequency-domain core with analysis STFT and synthesis ISTFT. The caller owns the accelerator, synchronizes its recurrent state before each job, and reloads quantized zeros after a run that may have partially written device state.
 

@@ -118,7 +118,7 @@ if (delay.changed || (frame_index != 0 && !last_delay.solid && delay.solid)) {  
 } else if (model.infer) {
     for (k) { mdl_re[k] = NAN; mdl_im[k] = NAN; }   /* ← 先全填 NaN */
     rc = model.infer(user, err_re, err_im, far_re, far_im, mdl_re, mdl_im);
-    if (rc == 0 && ulcnet_frame_is_finite(mdl_re, mdl_im)) { /* 採用 */ }
+    if (rc == 0 && ulcnet_frame_is_finite(mdl_re, mdl_im, n_bins)) { /* 採用 */ }
     /* 否則 identity */
 }
 ac_istft_push_planar(synth, sre, sim, out + wrote);</pre>
@@ -148,13 +148,13 @@ ac_istft_push(istft, out_spec, out);   /* 應用端合成剛好一個 hop */</pr
 <div class="warn"><b>掛了真的 runtime 就必須提供 descriptor</b>(identity model 才可以留 NULL)。理由:finite guard 只抓得到「沒寫」,永遠抓不到「寫錯形狀」——graph 的 <code>D</code> 與 descriptor 不符時,會<b>靜默地</b>以錯誤形狀讀寫 state(float host 登錄的緩衝或加速器內的 state),pool 擋不住。descriptor 內容包含 <code>layout_version</code>(必須等於 <code>ULCNET_MODEL_IO_LAYOUT_VERSION</code>)、<code>delay_depth</code> D ∈ [2,64]、grid 幾何、以及 <code>far_input_mode</code> 必須是 <code>ULCNET_FAR_RAW</code>。</div>
 
 <h3>4ch ULCNet 的 front-only 契約</h3>
-<p>array 以 <code>residual = AEC_RESIDUAL_STATE</code> 建立(<code>ulcnet_example_unit_config(&amp;grid)</code>:<code>array_sample_default_config(&amp;cfg, grid.sample_rate)</code> 加 <code>fft_size = grid.n_fft</code> 與 <code>residual = STATE</code>)時,array <b>不 carve</b> 融合緩衝與增益級,只有四條 lane;<code>aec_process_residual()</code> 與 <code>array_sample_beam_fuse()</code> 回 <code>AEC_ERR_MODE</code>;array、helper 與 stage 都不建任何 denoiser／suppressor／comfort noise／post iFFT。<code>AecConfig</code> 與 helper 參數沒有 NR 欄位;<code>auto_vad_*</code> 欄位照常驗證(本範例走 <code>process_with_activity()</code>,不用內建 energy VAD)。pre-stage 欄位(<code>delay_*</code>／<code>capture_proxy_channel</code>／<code>max_delay_ms</code>)照常生效;lane 的 <code>filter_length</code> 是同一個 <code>AecConfig</code> 的欄位(本範例用 <code>array_sample_default_config()</code> 的預設 balanced)。</p>
+<p>array 以 <code>residual = AEC_RESIDUAL_STATE</code> 建立(<code>ulcnet_example_unit_config(&amp;grid)</code>:<code>array_sample_default_config(&amp;cfg, grid.sample_rate)</code> 加 <code>fft_size = grid.n_fft</code> 與 <code>residual = STATE</code>)時,array <b>不 carve</b> 融合緩衝與增益級,只有四條 lane;<code>aec_process_residual()</code> 與 <code>array_sample_beam_fuse()</code> 回 <code>AEC_ERR_MODE</code>;array、helper 與 stage 都不建任何 denoiser／suppressor／comfort noise／post iFFT。<code>AecConfig</code> 與 helper 參數沒有 NR 欄位;<code>auto_vad_*</code> 欄位照常驗證(本範例走 <code>process_with_activity()</code>,不用內建 energy VAD)。pre-stage 欄位(<code>delay_*</code>／<code>capture_proxy_channel</code>)照常生效;lane 的濾波器長度由取樣率決定(不是 <code>AecConfig</code> 欄位;本範例用 <code>array_sample_default_config()</code> 的預設 balanced)。</p>
 <p class="small">stage 與 array 的 grid 必須一致:<code>4ch/alignulcnet/tests/test_4ch_ulcnet.c</code> 的 <code>test_example_unit_config_grid</code> 檢查 unit config 的 grid、<code>residual = STATE</code>、fuse 被拒,以及另一個格點的單元可以建立但接不上 stage。</p>
 
 <h2 id="section-8">6. <code>layout_version</code> 對整合者的意義</h2>
 <div class="tblwrap"><table>
 <tr><th>函式庫物件</th><th>目前版本</th></tr>
-<tr><td><code>Aec</code>(單支與 4ch array;<code>AecMemReq</code>,涵蓋整個 pool)</td><td><code>AEC_LAYOUT_VERSION</code> = 1</td></tr>
+<tr><td><code>Aec</code>(單支與 4ch array;<code>AecMemReq</code>,涵蓋整個 pool)</td><td><code>AEC_LAYOUT_VERSION</code> = 2</td></tr>
 <tr><td>DFN2 stage／rate bridge</td><td><code>DFN_RES_STAGE_LAYOUT_VERSION</code> = 6、<code>DFN_RATE_BRIDGE_LAYOUT_VERSION</code> = 6</td></tr>
 <tr><td><code>AnrDenoiser</code>、<code>AcIstft</code>、ULCNet stage、<code>DfnHop</code>、4ch helper</td><td>沒有 descriptor、沒有 layout version(函式庫物件只提供大小查詢;stage／hop／helper 為範例碼)</td></tr>
 </table></div>
@@ -211,7 +211,7 @@ ac_istft_push(istft, out_spec, out);   /* 應用端合成剛好一個 hop */</pr
 <tr><th>類別</th><th class="ok">存活</th><th class="dead">消失</th></tr>
 <tr><td><b>狀態快照(pull)</b></td><td><code>aec_debug_status</code>、<code>aec_get_residual</code>、<code>aec_get_linear</code>、<code>aec_linear_is_cancelling</code>、<code>aec_far_fft_real_compute_count</code>、<code>aec_get_mem_breakdown</code>、<code>anr_debug_status</code>、<code>anr_get_noise_psd</code>、4ch 的全部 census/counter accessor(<code>aec_array_*_count()</code>等;duty census 讀 <code>aec_debug_status</code>)</td><td>—</td></tr>
 <tr><td><b>耗時</b></td><td>函式在(<b>回 0</b>)</td><td><b>全部數值</b>(<code>AecStageTiming</code>／<code>AecArrayTiming</code>)</td></tr>
-<tr><td><b>Log / trace(push)</b></td><td>—</td><td><b>全部</b>:<code>aec_debug_set_level/_log/_frame</code>、<code>aec_debug_set_trace</code>、<code>AecDebugTraceRow</code> 的 CSV 14 欄</td></tr>
+<tr><td><b>Log / trace(push)</b></td><td>—</td><td><b>全部</b>:<code>aec_debug_set_frame</code>、<code>aec_debug_set_trace</code>、<code>AecDebugTraceRow</code> 的 CSV 14 欄</td></tr>
 <tr><td><b>錯誤碼</b></td><td>全部</td><td>—</td></tr>
 <tr><td><b>Finite guards</b></td><td>全部(不受任何開關影響)</td><td>—</td></tr>
 </table></div>
@@ -233,7 +233,7 @@ log("delay=%d conf=%.1f upd=%d erle=%.1fdB usable=%d conv=%d "
 <tr><th>讀到這樣</th><th>通常代表</th></tr>
 <tr><td><code>delay=-1</code> 一直不變</td><td>從未鎖定。檢查 ref 是否真的是送往喇叭的訊號、電平是否過低</td></tr>
 <tr><td><code>erle</code> 低但 <code>conv=1</code></td><td>濾波器收斂了但 echo 仍在 → 懷疑鎖到錯的 delay(早期反射),或非線性失真超出線性模型</td></tr>
-<tr><td><code>duty_run/duty_total</code> 接近 1.0 且長時間不降</td><td>duty-cycle 未啟用(<code>delay_est_period_s</code> = 0,預設),或已啟用但 delay 一直不穩定而從未進入抽樣</td></tr>
+<tr><td><code>duty_run/duty_total</code> 接近 1.0 且長時間不降</td><td>duty-cycle 未啟用(函式庫內部的調校預設為關,每 hop 都分析;<code>AecConfig</code> 沒有對應欄位),或已啟用但 delay 一直不穩定而從未進入抽樣</td></tr>
 <tr><td><code>nr_init=0</code> 持續</td><td>還在啟動 pass-through(前 <code>num_init_frames</code> 個 frame),此時完全不降噪是正常的</td></tr>
 <tr><td><code>mean_spp</code> 長期接近 0</td><td>判定沒有語音 → 檢查電平或噪聲底是否估過高</td></tr>
 <tr><td><code>noise_floor_db</code> 隨語音一起爬升</td><td>噪聲估計正在吸收語音 → 檢查 <code>delta_db</code>／<code>alpha_d</code></td></tr>
@@ -249,7 +249,7 @@ log("delay=%d conf=%.1f upd=%d erle=%.1fdB usable=%d conv=%d "
 <div class="tblwrap"><table>
 <tr><th>盲點</th><th>實情</th></tr>
 <tr><td class="dead">per-hop CSV trace <b>四條 pipeline 全部不可達</b></td><td><code>AecDebugTraceRow</code> 的唯一填寫點要求 <code>residual == AEC_RESIDUAL_FULL</code> <b>且</b>走 <code>aec_process()</code>。四條 pipeline <b>全部</b>走 <code>aec_process_linear()</code>／<code>aec_process_residual()</code>(4ch 的 <code>aec_process()</code> 回 <code>AEC_ERR_MODE</code>)→ <code>dominant_nearend</code>／<code>saturated_echo</code>／<code>usable_linear</code>／<code>fullband_erle</code>／<code>gain_mean</code> 這些沒有第二個出口的量,在產品組態下<b>永遠取不到</b>。只有 CLI <code>aec_wav --debug-trace</code> 拿得到</td></tr>
-<tr><td class="dead">沒有層級式 log</td><td><code>aec_debug_set_level()</code>／<code>aec_debug_set_log()</code> 只把值存進 <code>aec_debug.c</code> 的靜態變數,library 內沒有任何讀取端,也沒有 emit 函式 → CLI 的 <code>--debug-level</code>／<code>--debug-log</code> 不會產生輸出</td></tr>
+<tr><td class="dead">沒有層級式 log</td><td>函式庫沒有 log 等級介面:<code>aec_debug_set_level()</code>／<code>aec_debug_set_log()</code>(只存值、沒有讀取端)與 CLI 的 <code>--debug-level</code>／<code>--debug-log</code> 已移除;診斷走 <code>aec_debug_status()</code> 與 <code>aec_debug_set_trace()</code></td></tr>
 <tr><td class="dead"><code>assert()</code> 在出貨板上是<b>活的</b></td><td>四個 Makefile <b>沒有任何一個</b>設 <code>-DNDEBUG</code>。<code>suppression_gain.c</code> 的 table-length assert <b>沒有 release-path fallback</b>,失敗即 <code>abort()</code>——沒有回傳碼、沒有 log、沒有 hook 可攔</td></tr>
 <tr><td class="dead">self-reset 不計數</td><td><code>AEC_ERR_DSP</code> 路徑會內部呼叫 <code>reset()</code>,而 <code>reset()</code> 本身<b>清掉所有 instrumentation</b>(realign counters／duty census 全歸零)→ 一次 self-reset 之後「之前發生過什麼」在計數器上完全消失</td></tr>
 <tr><td class="dead">delay lock 遺失不計數</td><td><code>AecLinearView.delay_state</code> 與 <code>generation</code>(<code>aec_get_linear()</code>;4ch 為 <code>AecArrayView.delay</code>)每 hop 可讀,但 <code>AecDebugStatus</code> <b>兩者都沒有</b> → 只 poll <code>aec_debug_status()</code> 的整合者<b>看不到 lock 的丟失與重獲</b></td></tr>

@@ -15,8 +15,7 @@ import torch
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 ROOT_PATH = pathlib.Path(ROOT)
 sys.path.insert(0, ROOT)
-# gtcrn_process.c/.h moved to lib/ainr/gtcrn/ in the single-model-release restructuring;
-# ROOT_PATH / 'gtcrn_process.h' is now only a forwarding stub (an #include line).
+# gtcrn_process.c/.h live in lib/ainr/gtcrn/.
 GTCRN_C_DIR = ROOT_PATH.parents[1] / 'lib' / 'ainr' / 'gtcrn'
 
 # Each model project has its own top-level ``train.py``/``model.py``/

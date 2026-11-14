@@ -374,7 +374,7 @@ $(OBJ_DIR)/ulcnet_accelerator_adapter.o: $(ULCNET_DIR)/ulcnet_accelerator_adapte
 $(OBJ_DIR)/4ch_alignulcnet_main.o: alignulcnet/main.c array_sample_driver.h array_sample_beam.h ../ulcnet/ulcnet_nn_stage.h ../common/example_cli.h $(ULCNET_DIR)/ulcnet_accelerator_adapter.h | _cfg_guard
 	$(CC) $(CFLAGS) -I$(ULCNET_DIR) -MD -MP -c -o $@ $<
 
-$(OBJ_DIR)/test_4ch_ulcnet.o: alignulcnet/tests/test_4ch_ulcnet.c array_sample_beam.h ../ulcnet/ulcnet_nn_stage.h $(ULCNET_DIR)/ulcnet_process.h | _cfg_guard
+$(OBJ_DIR)/test_4ch_ulcnet.o: alignulcnet/tests/test_4ch_ulcnet.c array_sample_beam.h ../ulcnet/ulcnet_nn_stage.h ../ulcnet/tests/ulcnet_test_fixture.h $(ULCNET_DIR)/ulcnet_process.h | _cfg_guard
 	$(CC) $(CFLAGS) -I$(ULCNET_DIR) -MD -MP -c -o $@ $<
 
 $(OBJ_DIR)/4ch_raw.o: 4ch_raw.c array_sample_beam.h array_sample_driver.h array_sample_post.h array_sample_unit.h | _cfg_guard
@@ -420,7 +420,8 @@ all: $(DFN_PIPELINE_LIB) \
 
 # The 4ch_alignulcnet application shares this Makefile (it composes the unit with the NN stage
 # example), so its acceptance test and board skeleton run here too: this directory's `make test`
-# is the one-stop gate, mirroring the mono arrangement in pipelines/Makefile.
+# is the one-stop gate, mirroring the mono arrangement in pipelines/Makefile. 4ch_raw has no run line of its
+# own here: test_array_sample_beam runs it (test_raw_runner_black_box, handed the bin directory).
 test: test-third-party test-array-sample-driver \
       $(BIN_DIR)/test_4ch_chain \
       $(BIN_DIR)/test_4ch_dfn \
@@ -449,18 +450,8 @@ test: test-third-party test-array-sample-driver \
 # the host on the model's own rate runs the stage directly at that grid, any other host rate needs the
 # bridge (48 kHz / 1024 model only: pool query rejected, exit 1), a pair outside the table is exit 2.
 	out="$$("$(abspath $(BIN_DIR))/4ch_aec_bf_dfn_res" --ai-sample-rate 16000 --ai-fft-size 256)" && printf '%s\n' "$$out" | grep -q "model grid 16000 Hz / FFT 256 (n_erb 24, df_bins 96, lookahead 0/0), the stage on the host grid"
-	"$(abspath $(BIN_DIR))/4ch_aec_bf_dfn_res" --ai-sample-rate 32000 --ai-fft-size 512 >/dev/null 2>&1; test $$? -eq 2
-	"$(abspath $(BIN_DIR))/4ch_aec_bf_dfn_res" --ai-sample-rate 16000 --ai-fft-size 256 --sample-rate 48000 >/dev/null 2>&1; test $$? -eq 1
-	for a in "--ai-sample-rate 44100" "--ai-sample-rate 16000" "--ai-fft-size 512" "--ai-fft-size 256x" "--ai-sample-rate --cng"; do "$(abspath $(BIN_DIR))/4ch_aec_bf_dfn_res" $$a >/dev/null 2>&1; test $$? -eq 2 || exit 1; done
-# Malformed numbers, and the 8 kHz grid the core does not offer, are refused
-# at parse time with the documented exit code 2 (the ULCNet example too).
-	"$(abspath $(BIN_DIR))/4ch_aec_bf_dfn_res" --sample-rate 16000Hz >/dev/null 2>&1; test $$? -eq 2
-	"$(abspath $(BIN_DIR))/4ch_aec_bf_dfn_res" --sample-rate 8000 >/dev/null 2>&1; test $$? -eq 2
-	"$(abspath $(BIN_DIR))/4ch_aec_bf_dfn_res" --atten-lim 12dB >/dev/null 2>&1; test $$? -eq 2
-	"$(abspath $(BIN_DIR))/4ch_alignulcnet" --delay-num-filters 3x >/dev/null 2>&1; test $$? -eq 2
-	"$(abspath $(BIN_DIR))/4ch_alignulcnet" --delay-mode fixed --fixed-delay 12x >/dev/null 2>&1; test $$? -eq 2
-# Empty, leading or trailing garbage and out-of-int-range numbers.
-	for v in "" " 3" "3 " x3 +-1 99999999999 999999999999999999999999; do "$(abspath $(BIN_DIR))/4ch_alignulcnet" --delay-num-filters "$$v" >/dev/null 2>&1; test $$? -eq 2 || exit 1; done
+	sh ../scripts/test_cli_exit_codes.sh 4ch_aec_bf_dfn_res "$(abspath $(BIN_DIR))/4ch_aec_bf_dfn_res"
+	sh ../scripts/test_cli_exit_codes.sh 4ch_alignulcnet "$(abspath $(BIN_DIR))/4ch_alignulcnet"
 
 libdfn_res_stage.a: $(DFN_PIPELINE_LIB)
 libs: $(COMMON_LIB) $(AEC_LIB) $(NR_LIB) $(SPATIAL_COMMON_LIB) $(DOA_LIB) $(BF_LIB) $(DFN_PIPELINE_LIB) \

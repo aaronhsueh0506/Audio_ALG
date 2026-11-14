@@ -9,7 +9,7 @@
 #define M_PI 3.14159265358979323846
 #endif
 
-const char* array_sample_backend_name(uint32_t backend_id) {
+static const char* array_sample_backend_name(uint32_t backend_id) {
     switch (backend_id) {
         case AEC_BACKEND_NE10: return "ne10";
         default:                return "unknown";
@@ -119,7 +119,6 @@ int array_sample_parse_spatial_cli(int argc, char **argv, int raw, ArraySampleSp
 
 int array_sample_main(int argc, char **argv, const ArraySampleOps *ops, void *user) {
     ArraySampleHopView hop = {0};
-    hop.program = argv[0];
     int rc = ops->parse(user, argc, argv);
     if (rc != 0) return rc == 1 ? 0 : 2;
     int result = 1, frames = 0;

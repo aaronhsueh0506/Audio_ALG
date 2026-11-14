@@ -79,7 +79,7 @@ CORE_HEADERS := ../../../lib/aiaec/ulcnet/ulcnet_model_io.h \
 	../../../lib/aiaec/ulcnet/ulcnet_prepost.h
 
 STREAM_SOURCES := ulcnet_stream.c
-STREAM_HEADERS := ulcnet_stream.h ulcnet_stream_internal.h ../../common/stream_mem.h
+STREAM_HEADERS := ulcnet_stream.h ../../common/stream_mem.h
 
 LIB := $(OBJ_DIR)/libulcnet_stream.a
 LIB_OBJECTS := $(OBJ_DIR)/ulcnet_model_io.o $(OBJ_DIR)/ulcnet_prepost.o $(OBJ_DIR)/ulcnet_stream.o

@@ -30,4 +30,4 @@ python3 -m pytest -q pipelines/tests/test_doc_layout_versions.py pipelines/tests
 python3 docs/maintenance/offline/build_legacy_docs.py --repo all --source .. --output ../SE-manuals
 ```
 
-單獨發送 AEC 時改用 `--repo AEC --source ../AEC --output ../AEC-manual`。四庫副本由 `Audio_ALG/docs/html/index.html` 開啟，單庫副本由 `docs/html/index.html` 開啟。只有 checkout 具備的來源檔在交付副本中顯示為檔案名稱。
+單獨發送 AEC 時改用 `--repo AEC --source ../AEC --output ../AEC-manual`。四庫副本由 `Audio_ALG/docs/html/index.html` 開啟，單庫副本由 `docs/html/index.html` 開啟。只有 checkout 具備的來源檔在交付副本中顯示為檔案名稱。`aliases.tsv` 只收 `docs/html/` 下的 HTML 網址，Markdown 目錄的搬移（例如 `docs/reference/mcab/` 改為 `docs/reference/array/`）無法登錄。

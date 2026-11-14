@@ -1,13 +1,54 @@
 /* DeepVQE-S PCM stream: everything (no file-loader TU for this model -- there are no ERB
  * matrices to load). No <stdio.h>, no malloc/calloc/posix_memalign anywhere in this TU -- it
- * links into a NO_STDIO target. See deepvqe_stream.h for the public contract and
- * deepvqe_stream_internal.h for the pool layout this file carves and constructs. */
+ * links into a NO_STDIO target. See deepvqe_stream.h for the public contract. */
 
+#include <stddef.h>
+#include <stdint.h>
 #include <string.h>
 
-#include "deepvqe_stream_internal.h"
+#include "deepvqe_stream.h"
+#include "fft_wrapper.h"
+#include "audio_stft.h"
 #include "utility/mem_align.h"
 #include "stream_mem.h"
+
+struct DeepVqeStream {
+    DeepVqeGrid grid;
+
+    FftHandle *fft;     /* shared by stft_mic / stft_far / istft */
+    AcStft    *stft_mic;
+    AcStft    *stft_far;
+    AcIstft   *istft;
+    DeepVqePrepost *prepost;
+
+    /* Per-hop scratch, one slab: mic_f / far_f / hop_out [hop], mic_re / mic_im / far_re / far_im / enh_re / enh_im [n_bins]. */
+    float *mic_f;
+    float *far_f;
+    float *hop_out;
+    float *mic_re;
+    float *mic_im;
+    float *far_re;
+    float *far_im;
+    float *enh_re;
+    float *enh_im;
+
+    int open;    /* 1: a DeepVqePrepost frame is open, post_process must finish / bypass it */
+    int pending; /* 1: pre_process succeeded and post_process is due (every hop, job or not) */
+    /* 0 until the first batch has finished or bypassed (N > 1 pre-roll hops synthesize silence); reset by deepvqe_stream_reset(). */
+    int result_ready;
+};
+
+typedef struct DeepVqeStreamLayout {
+    DeepVqeStream *self;
+    void *fft_mem;
+    void *stft_mic_mem;
+    void *stft_far_mem;
+    void *istft_mem;
+    void *prepost_mem;
+    size_t prepost_bytes;
+    void *scratch_mem;   /* the per-hop scratch slab */
+    uint32_t prepost_build_hash;   /* DeepVqePrepostMemReq.build_flags_hash, folded into this stream's hash */
+} DeepVqeStreamLayout;
 
 #define DEEPVQE_STREAM_ALIGN DEEPVQE_STREAM_ALIGNMENT
 
@@ -41,8 +82,11 @@ static int cfg_valid(const DeepVqeStreamConfig *cfg) {
     return 1;
 }
 
-int deepvqe_stream_layout(const DeepVqeStreamConfig *cfg, unsigned char *base,
-                          DeepVqeStreamLayout *out, size_t *total) {
+/* One carve walk: sizing (base == NULL, *out pointers stay NULL) or carving; *total must match across both with one cfg.
+ * -1 on a bad config or an overflowing carve. Order (bump LAYOUT_VERSION and build_flags_hash on a change): self, fft,
+ * stft_mic, stft_far, istft, prepost, scratch. */
+static int deepvqe_stream_layout(const DeepVqeStreamConfig *cfg, unsigned char *base,
+                                 DeepVqeStreamLayout *out, size_t *total) {
     size_t cursor = 0;
     void *ptr;
     AcStftConfig scfg;
@@ -135,8 +179,9 @@ int deepvqe_stream_get_mem_size(const DeepVqeStreamConfig *cfg, DeepVqeStreamMem
     return 0;
 }
 
-int deepvqe_stream_descriptor_matches(const DeepVqeStreamMemReq *expected,
-                                      const DeepVqeStreamMemReq *req) {
+/* Field-by-field memory-requirement comparison for the stale-pool gate. */
+static int deepvqe_stream_descriptor_matches(const DeepVqeStreamMemReq *expected,
+                                             const DeepVqeStreamMemReq *req) {
     return expected->descriptor_version == req->descriptor_version &&
            expected->layout_version == req->layout_version &&
            expected->reserved0 == req->reserved0 &&
@@ -146,8 +191,10 @@ int deepvqe_stream_descriptor_matches(const DeepVqeStreamMemReq *expected,
            expected->bytes == req->bytes;
 }
 
-DeepVqeStream *deepvqe_stream_finish_init(const DeepVqeStreamConfig *cfg, unsigned char *base,
-                                          const DeepVqeStreamLayout *layout) {
+/* Constructs every carved object; NULL leaves no valid instance. Called after deepvqe_stream_layout() and the caller's
+ * size / alignment / stale-pool checks. */
+static DeepVqeStream *deepvqe_stream_finish_init(const DeepVqeStreamConfig *cfg, unsigned char *base,
+                                                 const DeepVqeStreamLayout *layout) {
     DeepVqeStream *s;
     AcStftConfig scfg;
     DeepVqePrepostConfig pcfg;
@@ -240,19 +287,8 @@ uint32_t deepvqe_stream_state_generation(const DeepVqeStream *s) {
     return s ? deepvqe_prepost_state_generation(s->prepost) : 0u;
 }
 
-const DeepVqeGrid *deepvqe_stream_grid(const DeepVqeStream *s) {
-    return s ? &s->grid : NULL;
-}
-
 int deepvqe_stream_hop_size(const DeepVqeStream *s) {
     return s ? s->grid.hop : -1;
-}
-
-int deepvqe_stream_layout_version(const DeepVqeStream *s) {
-    const DeepVqePrepostDescriptor *d;
-    if (!s) return -1;
-    d = deepvqe_prepost_descriptor(s->prepost);
-    return d ? (int)d->layout_version : -1;
 }
 
 /* Shared tail of every pre_process entry: batch accumulation, state_generation sample, frame_open. */

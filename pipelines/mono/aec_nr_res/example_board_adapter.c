@@ -125,7 +125,7 @@ static int mono_plan(MonoPlan* plan, int sample_rate) {
     aec_config_from_level(&plan->aec_cfg, AEC_LEVEL_BALANCED, sample_rate);
     plan->aec_cfg.fft_size = plan->grid.fft_size;
     plan->aec_cfg.delay_mode = AEC_DELAY_MATCHED;
-    plan->aec_cfg.delay_num_filters = DA_NUM_FILTERS;
+    plan->aec_cfg.delay_num_filters = AEC_DELAY_NUM_FILTERS_MAX;
     plan->aec_cfg.fixed_delay_samples = -1;
     plan->aec_cfg.residual = AEC_RESIDUAL_FULL;
     plan->nr_cfg = anr_config_for_level_grid(sample_rate, plan->grid.fft_size, ANR_LEVEL_BALANCED);

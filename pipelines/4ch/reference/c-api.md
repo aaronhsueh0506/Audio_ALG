@@ -12,7 +12,7 @@ The deployable C seam is the array instance of the AEC library:
   `aec_synthesis_window()`); the strength setter `aec_set_level()`; and the structural audit accessors
   (`aec_array_matched_filter_count()`, `aec_array_linear_aec_count()`, `aec_far_fft_real_compute_count()`,
   `aec_array_realign_{warm,soft}_lane_count()`, `aec_array_get_timing()`). The array has no beamformer; the
-  lane parameters (`filter_length` ...) are fields of the same `AecConfig`, the lanes' own level has no effect;
+  lane parameters are the public fields of the same `AecConfig` (12 fields: the filter length and every other tuning value are the library's, set from the rate and the level), the lanes' own level has no effect;
 - `AEC/c_impl/src/aec_array.c` (private to the AEC library): the flow over one shared `DelayAec` and four linear `Aec`
   lanes **that it creates itself in the caller's pool**, the shared-delay admission, the alignment ring, the fusion
   (coherent context projection) and, with `AEC_RESIDUAL_FULL`, the residual gain stage. The MMSE-LSA instance and the
@@ -83,7 +83,7 @@ For side-by-side reading, the mono example and its four-channel counterpart:
 |---|---|
 | `derive_lane()` + `aec_get_mem_size()` (`mono/aec_nr_res/main.c`) | `array_sample_default_config` / `aec_config_from_level` + `n_mics`, then `aec_get_mem_requirements` |
 | `aec_init` | `aec_init_ex` (one call; the lanes and the estimator are built inside) |
-| (heap flavor) | `aec_create` |
+| (heap flavor) | `aec_create` (`Aec* aec_create(const AecConfig*)`; `aec_destroy` frees the block) |
 | `aec_process_linear` + `aec_process_residual(aec, NULL)` + `aec_get_residual` | `aec_process_linear` + `aec_get_array` → external beamformer → `aec_process_residual(&AecBeam)` + `aec_get_residual` |
 | `aec_reset` / `aec_destroy` | `aec_reset` (also resets the lanes, the estimator and the gain stage) / `aec_destroy` (releases the lanes with the pool) |
 
@@ -106,18 +106,19 @@ aec_get_mem_requirements(&cfg, &req); /* 0 = OK, -1 = invalid; the whole array p
 Heap convenience (the array with an external beamformer; the caller writes the post-beam stages out):
 
 ```c
-Aec array;                                         /* the handle's storage; the pool is a heap block */
+Aec *array;                                        /* one heap block (Aec and pool); aec_destroy() frees it */
 AecArrayView front;
 AecResidualView v;
 const float *nr;
 
-aec_create(&array, &cfg);                          /* 0 = OK, -1 = refused */
+array = aec_create(&cfg);                          /* NULL = refused or out of memory */
+if (!array) return -1;
 memset(&front, 0, sizeof front);  front.struct_size = sizeof front;
 memset(&v, 0, sizeof v);          v.struct_size = sizeof v;
 
 /* microphones is interleaved [hop][4], reference is [hop]. */
-aec_process_linear(&array, microphones, reference);
-aec_get_array(&array, &front);
+aec_process_linear(array, microphones, reference);
+aec_get_array(array, &front);
 
 /* External SRP-PHAT/BF consumes front.lane_error_spec and produces
  * channel-major Complex[4][n_freqs] weights (and, optionally, the mono error).
@@ -125,26 +126,26 @@ aec_get_array(&array, &front);
 external_srp_bf_update(front.lane_error_spec, weights);
 
 AecBeam beam = { weights, NULL };                  /* NULL: rebuild E from the weights */
-aec_process_residual(&array, &beam);
-aec_get_residual(&array, &v);
+aec_process_residual(array, &beam);
+aec_get_residual(array, &v);
 
 /* The application chains its own stages over v (4ch_external_static.c post_hop() is the
  * example, tests/conv_chain_4ch.h the independent reference): */
 nr = array_sample_anr_gain(my_nr, &v, scratch, 1);  /* array_sample_post.h; scratch: v.n_freqs floats; on v.error_spec */
 if (array_sample_post_reset_due(&handled, &v))      /* a lane had a post-chain reset */
     ac_istft_reset(my_istft);                      /* the array reseeds its own comfort noise */
-aec_apply_gain(&array, nr, spec);                  /* P = v.base_spec * min(G_nr, G_res) */
-aec_apply_cng(&array, nr, spec);                   /* comfort noise on the bins the gain cut */
+aec_apply_gain(array, nr, spec);                   /* P = v.base_spec * min(G_nr, G_res) */
+aec_apply_cng(array, nr, spec);                    /* comfort noise on the bins the gain cut */
 ac_istft_push(my_istft, spec, mono_output);
 
-aec_destroy(&array);                               /* the lanes and the estimator go with the pool */
+aec_destroy(array);                                /* the block is freed (lanes, estimator, window); the pointer is dead */
 anr_destroy(my_nr);
 ```
 
 A product that keeps linear AEC, RES, CNG and synthesis but omits MMSE-LSA simply never initialises the denoiser and
 passes `NULL` for `extra_gain` (the example's `--no-res` selects `ESTIMATE` and applies a unity vector with
 `aec_apply_gain_spec()` instead). The array itself has no NR or comfort-noise setting beyond `AecConfig`
-(`enable_cng`, the level fields). `residual` selects whether the array fuses at all and whether it carves the gain stage
+(`enable_cng`, `level`). `residual` selects whether the array fuses at all and whether it carves the gain stage
 (`AEC_RESIDUAL_STATE` is the front-only seam the Align-ULCNet application uses).
 
 The sample beam helper does not apply a gain either: `array_sample_beam_fuse()` runs `aec_process_residual()`, fills the
@@ -218,8 +219,8 @@ platform_free(pool);
 last reset (`AEC_ERR_SEQUENCE` otherwise); a linear frame stays
 valid until the next `aec_process_linear()` or `aec_reset()`,
 and there is no token to return. Invalid weights leave the linear frame usable,
-so the caller may correct and retry. `aec_create()` allocates one block for the array pool;
-`aec_init_ex()` uses only the caller's aligned pool. Neither per-hop call performs
+so the caller may correct and retry. `aec_create()` allocates one 16-byte-aligned block (the `Aec` and the array pool) and `aec_destroy()` frees it; the pointer is dead
+afterwards and must not be freed. `aec_init_ex()` uses only the caller's aligned pool. Neither per-hop call performs
 any allocation.
 
 Build the applications or run the complete C acceptance gate from

@@ -67,6 +67,7 @@ SOURCES = [   # hashed into the JSON so a result can be tied to the code it judg
     'Audio_ALG/pipelines/4ch/array_sample_post.h',
     'Audio_ALG/pipelines/tests/pyc_parity/pyc_drv.c',
     'AEC/c_impl/src/aec.c',
+    'AEC/c_impl/src/aec_impl.h',
     'AEC/c_impl/src/aec_array.c',
     'AEC/c_impl/src/aec_array_internal.h',
     'AEC/c_impl/src/aec_res.c',

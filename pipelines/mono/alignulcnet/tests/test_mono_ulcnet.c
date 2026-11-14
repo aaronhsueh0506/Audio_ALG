@@ -12,6 +12,7 @@
  */
 #include "aec.h"
 #include "ulcnet/ulcnet_nn_stage.h"
+#include "ulcnet/tests/ulcnet_test_fixture.h"
 #include "utility/mem_align.h"
 #include "../../../mono/aec_nr_res/tests/guard_scene.h"
 
@@ -24,27 +25,7 @@
 #include <math.h>
 #include "audio_stft.h"
 
-/* Largest row of the grid table: 48 kHz / fft 1024. */
-enum { HOP_MAX = 512, BINS_MAX = 513 };
-
-static const UlcnetGridSpec k_grids[] = {
-    { .sample_rate = 16000, .n_fft = 512,  .delay_depth = 8 },
-    { .sample_rate = 48000, .n_fft = 1024, .delay_depth = 8 },
-};
-
-static UlcnetGrid g_grid;   /* the grid under test */
-#define HOP (g_grid.hop)
-#define BINS (g_grid.n_bins)
 #define HOP_BYTES ((size_t)HOP * sizeof(float))
-
-/* Every test model that actually infers must publish a descriptor: the pipeline refuses
- * infer-without-descriptor, because a shape disagreement between the graph and the stage's
- * grid is undetectable downstream (the finite guard catches an unwritten output, never a
- * wrong-shaped one). The descriptor of the grid under test. */
-static const UlcnetModelIoDescriptor* test_io_descriptor(void) {
-    static UlcnetModelIoDescriptor d;
-    return ulcnet_model_io_descriptor_default(&g_grid, &d) == 0 ? &d : NULL;
-}
 
 /* ---------------------------------------------------------------------------------------
  * The composition under test: Aec (AEC_RESIDUAL_STATE lane) + UlcnetNnStage, as main.c builds
@@ -53,7 +34,7 @@ static const UlcnetModelIoDescriptor* test_io_descriptor(void) {
 
 typedef struct MonoUlcnetConfig {
     UlcnetGrid grid;              /* the stage's grid */
-    int sample_rate, fft_size, filter_length;   /* the lane's */
+    int sample_rate, fft_size;    /* the lane's */
     AecDelayMode delay_mode;
     int delay_num_filters, fixed_delay_samples;
     AecLevel aec_level;
@@ -69,7 +50,6 @@ typedef struct MonoUlcnet {
     AcStft *far_stft, *err_stft;
     AcIstft* istft;
     Complex far_spec[BINS_MAX], err_spec[BINS_MAX], out_spec[BINS_MAX];
-    Aec* heap_aec;                /* separate-allocation construction only */
     void* heap_stage_mem;
     void* heap_frame_mem;
 } MonoUlcnet;
@@ -128,7 +108,6 @@ static int mu_lane(const MonoUlcnetConfig* cfg, AecConfig* aec_cfg) {
         return -1;
     aec_config_from_level(aec_cfg, cfg->aec_level, cfg->grid.sample_rate);
     aec_cfg->fft_size = cfg->grid.n_fft;
-    if (cfg->filter_length != 0) aec_cfg->filter_length = cfg->filter_length;
     aec_cfg->delay_mode = cfg->delay_mode;
     aec_cfg->delay_num_filters = cfg->delay_num_filters;
     aec_cfg->fixed_delay_samples = cfg->fixed_delay_samples;
@@ -181,6 +160,7 @@ static MonoUlcnet* mu_init(void* pool, size_t bytes, const MonoUlcnetConfig* cfg
 /* A fresh instance from separate allocations (the heap path). */
 static MonoUlcnet* mu_create(const MonoUlcnetConfig* cfg) {
     AecConfig aec_cfg;
+    Aec* aec;
     MonoUlcnet* p;
     size_t stage_bytes, frame_bytes;
     if (mu_lane(cfg, &aec_cfg) != 0) return NULL;
@@ -188,21 +168,19 @@ static MonoUlcnet* mu_create(const MonoUlcnetConfig* cfg) {
     frame_bytes = mu_frame_bytes(&cfg->grid);
     p = (MonoUlcnet*)calloc(1, sizeof(*p));
     if (!p) return NULL;
-    p->heap_aec = (Aec*)calloc(1, sizeof(Aec));
-    if (!p->heap_aec || aec_create(p->heap_aec, &aec_cfg) != 0 ||
-        posix_memalign(&p->heap_stage_mem, 16, stage_bytes) != 0 ||
+    aec = aec_create(&aec_cfg);
+    if (!aec || posix_memalign(&p->heap_stage_mem, 16, stage_bytes) != 0 ||
         posix_memalign(&p->heap_frame_mem, 16, frame_bytes) != 0) {
         free(p->heap_stage_mem);
         p->heap_stage_mem = NULL;
-        free(p->heap_aec);
+        if (aec) aec_destroy(aec);
         free(p);
         return NULL;
     }
     memset(p->heap_stage_mem, 0x5A, stage_bytes);
     memset(p->heap_frame_mem, 0x5A, frame_bytes);
-    if (!mu_wrap(p->heap_aec, p->heap_stage_mem, stage_bytes, p->heap_frame_mem, frame_bytes, cfg, p)) {
-        aec_destroy(p->heap_aec);
-        free(p->heap_aec);
+    if (!mu_wrap(aec, p->heap_stage_mem, stage_bytes, p->heap_frame_mem, frame_bytes, cfg, p)) {
+        aec_destroy(aec);
         free(p->heap_stage_mem);
         free(p->heap_frame_mem);
         free(p);
@@ -214,7 +192,6 @@ static MonoUlcnet* mu_create(const MonoUlcnetConfig* cfg) {
 static void mu_destroy(MonoUlcnet* p) {
     if (!p) return;
     if (p->aec) aec_destroy(p->aec);
-    free(p->heap_aec);
     free(p->heap_stage_mem);
     free(p->heap_frame_mem);
     free(p);
@@ -382,12 +359,6 @@ static int frames_at_hop(int h) { (void)h; return 1; }
  * frames, and report how many of them the reprime covered. The budget is
  * armed at the TOP of the CHANGED hop, so that hop's own frames are already
  * spending it. */
-static int reprime_take(int* armed, int frames) {
-    int skipped = *armed < frames ? *armed : frames;
-    *armed -= skipped;
-    return skipped;
-}
-
 /* =========================================================================
  * 1. identity E2E: NULL model, zero-delay echo. Every hop, BEFORE the next
  *    process call, the formed hop is recorded; out[hop p] must match
@@ -958,16 +929,6 @@ static void test_fail_open_and_delay_gating(void) {
  * checkpoint the descriptor describes. Both directions are checked, on
  * every construction path of the composition.
  * ========================================================================= */
-static int gate_infer_identity(void* user,
-                               const float* er, const float* ei,
-                               const float* fr, const float* fi,
-                               float* or_, float* oi) {
-    (void)user; (void)fr; (void)fi;
-    memcpy(or_, er, sizeof(float) * BINS);
-    memcpy(oi, ei, sizeof(float) * BINS);
-    return 0;
-}
-
 static void test_raw_descriptor_gate(void) {
     UlcnetModelIoDescriptor raw_desc, aligned_desc;
     MonoUlcnetMemReq req;
@@ -1036,14 +997,6 @@ static void test_raw_descriptor_gate(void) {
 }
 
 /* The table row that is not the grid under test. */
-static UlcnetGrid other_grid(void) {
-    UlcnetGrid other;
-    memset(&other, 0, sizeof(other));
-    for (size_t i = 0; i < sizeof(k_grids) / sizeof(k_grids[0]); i++)
-        if (k_grids[i].n_fft != g_grid.n_fft) (void)ulcnet_grid_make(&other, &k_grids[i]);
-    return other;
-}
-
 /* =========================================================================
  * The grid and the pool plan of the composition: the lane refuses what is not the stage's
  * grid, the delay request reaches the AEC pool size, and the stage and AEC blocks are
@@ -1271,16 +1224,6 @@ static void test_null_model_equals_identity_model(void) {
  *    land at exactly T + HOP. Feeding the AEC's aligned far would move it by
  *    FIXED_DELAY.
  * ========================================================================= */
-static int passthrough_far_infer(void* user,
-                                 const float* err_re, const float* err_im,
-                                 const float* far_re, const float* far_im,
-                                 float* out_re, float* out_im) {
-    (void)user; (void)err_re; (void)err_im;
-    memcpy(out_re, far_re, BINS * sizeof(float));
-    memcpy(out_im, far_im, BINS * sizeof(float));
-    return 0;
-}
-
 static void test_raw_far_timestamp_after_fixed_delay_lock(void) {
     enum { N = 40, IMP_HOP = 8, IMP_OFF = 37 };
     const int FIXED_DELAY = 2 * HOP;
@@ -1642,17 +1585,6 @@ typedef struct {
     int   overflow;
 } ProbeModelState;
 
-static float spec_peak(const float* re, const float* im) {
-    float m = 0.0f;
-    for (int k = 0; k < BINS; k++) {
-        float a = fabsf(re[k]);
-        if (a > m) m = a;
-        a = fabsf(im[k]);
-        if (a > m) m = a;
-    }
-    return m;
-}
-
 static int probe_infer(void* user,
                        const float* err_re, const float* err_im,
                        const float* far_re, const float* far_im,
@@ -1997,12 +1929,12 @@ static void test_reprime_behavior(void) {
  * so the whole per-filter pool cost lands in its pool.
  * ========================================================================= */
 
-/* A bank of n filters reaches (n-1)*DA_FILTER_INTRA_SHIFT + (DA_FILTER_SIZE - 11)
+/* A bank of n filters reaches (n-1)*AEC_DELAY_FILTER_INTRA_SHIFT + (AEC_DELAY_FILTER_SIZE - 11)
  * downsampled samples (the -11 is the `lag < filter_size - 10` reliability cut),
- * decimation DA_DOWN_SAMPLING_FACTOR. */
+ * decimation AEC_DELAY_DOWN_SAMPLING_FACTOR. */
 #define KD_RELIABLE_SAMPLES(n) \
-    ((((n) - 1) * DA_FILTER_INTRA_SHIFT * DA_DOWN_SAMPLING_FACTOR + \
-      (DA_FILTER_SIZE - 11) * DA_DOWN_SAMPLING_FACTOR) * DELAY_RATE_FACTOR)
+    ((((n) - 1) * AEC_DELAY_FILTER_INTRA_SHIFT * AEC_DELAY_DOWN_SAMPLING_FACTOR + \
+      (AEC_DELAY_FILTER_SIZE - 11) * AEC_DELAY_DOWN_SAMPLING_FACTOR) * DELAY_RATE_FACTOR)
 /* Applied alignment may be EARLY of the true echo (PBFDKF then models a
  * positive residual) but never LATE; measured shortfall is 64-80 samples. */
 #define KD_MAX_UNDERSHOOT (128 * DELAY_RATE_FACTOR)

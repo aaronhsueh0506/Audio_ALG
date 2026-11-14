@@ -55,7 +55,7 @@ _FP = ctypes.POINTER(ctypes.c_float)
 
 _PROBE = r'''
 #include <stddef.h>
-#include "DeepFilterNet3/dfn3_prepost.h"
+#include "dfn3_prepost.h"
 size_t probe_sizeof_spec(void) { return sizeof(DFN3GridSpec); }
 size_t probe_sizeof_grid(void) { return sizeof(DFN3Grid); }
 size_t probe_sizeof_config(void) { return sizeof(DFN3PrepostConfig); }

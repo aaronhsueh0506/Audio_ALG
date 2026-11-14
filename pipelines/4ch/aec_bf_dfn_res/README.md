@@ -175,9 +175,9 @@ requires the final int8/fp runtime and board cycle measurement.
 Pool printed by the skeleton (`4ch_aec_bf_dfn_res`, matched delay, five-filter bank, NE10; the
 array (four lanes, shared estimator, ring, fusion buffers and gain stage in one pool), the SRP/BF helper,
 the P buffer, and the stage or bridge, each 16-byte
-aligned; shipped pair): 1,736,496 bytes at the 16 kHz default (array plus helper 1,512,576 bytes, plus the rate bridge) and
-5,751,968 bytes at 48 kHz (array plus helper 5,595,936 bytes). The array's own pool is 720,352 bytes at
-16 kHz/256 (the lanes 588,800 of it; `residual = STATE` 616,912 bytes); the model stage and the bridge have their own pools.
+aligned; shipped pair): 1,717,344 bytes at the 16 kHz default (array plus helper 1,493,472 bytes, plus the rate bridge) and
+5,692,928 bytes at 48 kHz (array plus helper 5,536,896 bytes). The array's own pool is 701,280 bytes at
+16 kHz/256 (the lanes 571,520 of it; `residual = STATE` 595,744 bytes); the model stage and the bridge have their own pools.
 Model weights, accelerator activation/workspace memory and the recurrent state are external;
-adding int8 weights alone brings the pool plus weights to about 3.9 MiB at
+adding int8 weights alone brings the pool plus weights to about 3.7 MiB at
 16 kHz.

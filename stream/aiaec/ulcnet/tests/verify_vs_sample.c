@@ -1,23 +1,16 @@
-/* Verifies ulcnet_stream_pre_process/post_process against an independent re-implementation of the
- * board sample's own per-hop loop (alg_ai3_alignulcnet.c's simple_thread(): Stage 3 alignment-edge
- * check -> stream_reset() + arm reprime -> Stage 4 int16->float + 2 STFT pushes + pre_process_freq
- * -> Stage 5 reprime-bypass or frame_open/accelerator/frame_finish-or-bypass -> post_process_freq
- * -> ac_istft_push_planar -> int16 saturate), built directly against
- * lib/aiaec/ulcnet/ulcnet_prepost.h and audiolib, never against ulcnet_stream.c. Both drivers run
- * the SAME deterministic fake accelerator and must produce byte-identical PCM and an identical
+/* Verifies ulcnet_stream_pre_process/post_process against a hand-written per-hop loop (the oracle): alignment-edge
+ * check -> stream reset + armed reprime -> int16->float + two STFT pushes + pre_process_freq -> reprime bypass or
+ * frame_open / accelerator / frame_finish-or-bypass -> post_process_freq -> ac_istft_push_planar -> int16
+ * saturate. The oracle is built directly against lib/aiaec/ulcnet/ulcnet_prepost.h and audiolib, never against
+ * ulcnet_stream.c, on the grid of the shipped model (16 kHz, FFT 512, delay_depth 32). Both drivers run the SAME
+ * deterministic fake accelerator and must produce byte-identical PCM and an identical
  * (pre_rc, ai_rc, post_rc, written, generation) trace, hop for hop.
  *
- * Board sample read-only reference: ~/Desktop/exp/audio_sample/alg_ai3_alignulcnet.c, stream_reset()
- * (~line 1304: ulcnet_prepost_reset + ac_stft_reset x2 + ac_istft_reset), the per-hop loop
- * (~1555-1634) and its grid constants (ALIGNULCNET_SR=16000, ALIGNULCNET_FFT=512, delay_depth=32).
- * This model's own internal AEC (the sample's Stage 1-2) is NOT part of what this harness verifies
- * -- the stream's contract starts at "caller already has a linear-error hop and a far hop," so
- * both drivers here take err_in/far_in directly, exactly like ulcnet_stream_pre_process does.
- * Never edited; this file re-implements Stage 3-5 against the public
- * lib/aiaec/ulcnet/ulcnet_prepost.h API instead of calling into it.
+ * The model's own AEC is not part of what is verified: the stream's contract starts at "the caller already has a
+ * linear-error hop and a far hop", so both drivers take err_in/far_in directly.
  *
- * --inject-shift: delays the comparison's view of driver B's PCM by one hop, to prove this
- * harness's comparison can actually detect a divergence. Injects nothing into ulcnet_stream.c. */
+ * --inject-shift: delays the comparison's view of driver B's PCM by one hop, to prove this harness's comparison
+ * can detect a divergence. Injects nothing into ulcnet_stream.c. */
 
 #include <stdint.h>
 #include <stdio.h>

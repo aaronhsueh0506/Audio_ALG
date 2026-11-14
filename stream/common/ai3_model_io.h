@@ -64,6 +64,12 @@ static inline int ai3_model_io_frames(int fft, int hop_in)
     return hop_in / model_hop;
 }
 
+/* 1 when all four axes of a shape are nonzero. */
+static inline int ai3_model_io_shape_ok(const unsigned int s[4])
+{
+    return s[0] && s[1] && s[2] && s[3];
+}
+
 /* Expands a row: signals then states as inputs, heads then states as outputs. OK, or ERR_NULL / ERR_ROW
  * (counts outside the tables, a zero axis); cfg is zeroed on failure. */
 static inline int ai3_model_io_expand(const Ai3ModelIoRow *row, Ai3ModelIoConfig *cfg)
@@ -79,14 +85,11 @@ static inline int ai3_model_io_expand(const Ai3ModelIoRow *row, Ai3ModelIoConfig
         row->head_count + row->state_count > STREAM_MAX_OUT_PORTS)
         return AI3_MODEL_IO_ERR_ROW;
     for (i = 0; i < row->signal_count; ++i)
-        if (!row->signal[i][0] || !row->signal[i][1] || !row->signal[i][2] || !row->signal[i][3])
-            return AI3_MODEL_IO_ERR_ROW;
+        if (!ai3_model_io_shape_ok(row->signal[i])) return AI3_MODEL_IO_ERR_ROW;
     for (i = 0; i < row->head_count; ++i)
-        if (!row->head[i][0] || !row->head[i][1] || !row->head[i][2] || !row->head[i][3])
-            return AI3_MODEL_IO_ERR_ROW;
+        if (!ai3_model_io_shape_ok(row->head[i])) return AI3_MODEL_IO_ERR_ROW;
     for (k = 0; k < row->state_count; ++k)
-        if (!row->state[k][0] || !row->state[k][1] || !row->state[k][2] || !row->state[k][3])
-            return AI3_MODEL_IO_ERR_ROW;
+        if (!ai3_model_io_shape_ok(row->state[k])) return AI3_MODEL_IO_ERR_ROW;
 
     cfg->model = row->model; cfg->sample_rate = row->sample_rate; cfg->fft = row->fft; cfg->n = row->n;
     cfg->layout_version = row->layout_version;

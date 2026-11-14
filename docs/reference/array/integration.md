@@ -205,7 +205,7 @@ int main(void) {
 }
 ```
 
-將範例存成 Audio_ALG 根目錄的 `app.c`。以下使用預設的 sibling 依賴；執行會印 `ok hop=128 n_freqs=129 pool=720352`
+將範例存成 Audio_ALG 根目錄的 `app.c`。以下使用預設的 sibling 依賴；執行會印 `ok hop=128 n_freqs=129 pool=701280`
 （`pool` 隨函式庫版本與編譯選項而變，見 [config.md §4.4](config.md#44-檢視欄位記憶體用量與實測-pool)）。
 
 ```sh
@@ -222,7 +222,7 @@ c++ -o app app.o \
 ./app
 ```
 
-四條 lane 的參數（level、`filter_length`…）是 `AecConfig` 的一部分：`aec_config_from_level()` 設 level 並填預設 `filter_length`，之後直接覆寫欄位；
+四條 lane 的參數只有 `AecConfig` 的公開欄位（`level`、`delay_*`、`enable_cng`…）：`aec_config_from_level()` 填預設，之後直接覆寫欄位；濾波器長度等調校值由函式庫依取樣率與 level 決定；
 陣列從這份 config 衍生 lane 的 config（EXTERNAL_ALIGNED、單支、`residual` 為 STATE 或 ESTIMATE），應用不必也不能自己建 lane。
 **level 只作用在融合後的增益級**；lane 自己的 level 沒有效果（細節見 §3.2）。
 
@@ -235,7 +235,7 @@ c++ -o app app.o \
 
 | # | 步驟 | 呼叫 | 什麼時候呼叫 | 這一步可能怎麼失敗 |
 |---|---|---|---|---|
-| 1 | config | `aec_config_from_level(&cfg, level, sr)`（或 `aec_config_defaults()`），再設 `n_mics = AEC_ARRAY_MICS`、`residual`、delay 欄位 | 配置任何記憶體之前 | 兩個 factory 不驗證；對 8000／16000／48000 以外的取樣率，`fft_size` 與 `filter_length` 為 0，之後被拒。驗證發生在第 2 步與第 4 步（[config.md §4](config.md#4-config-完整參考)） |
+| 1 | config | `aec_config_from_level(&cfg, level, sr)`，再設 `n_mics = AEC_ARRAY_MICS`、`residual`、delay 欄位 | 配置任何記憶體之前 | 兩個 factory 不驗證；對 8000／16000／48000 以外的取樣率，`fft_size` 為 0，之後被拒。驗證發生在第 2 步與第 4 步（[config.md §4](config.md#4-config-完整參考)） |
 | 2 | query | `aec_get_mem_requirements(&cfg, &req)`（或 `aec_get_mem_size()`） | **每次 init 之前**都要重查，不可跨 build / backend / config 快取 | `aec_get_mem_requirements()` 回 `-1`（`req` 清零）：`cfg` 為 NULL 或未通過驗證。`aec_get_mem_size()` 回 `0` = 無效 |
 | 3 | allocate | 你自己的配置器：`req.bytes` 且對齊 `req.alignment`（16）的一塊 | 拿到大小之後 | pool **不需要**預先清零；`aec_init_ex()` 在驗證全部通過後才寫入，被拒時 pool 一個 byte 都不動 |
 | 4 | init | `aec_init_ex(pool, bytes, &cfg, &req)`（`aec_init(pool, bytes, &cfg)` 等同 `expected = NULL`） | 配置之後、處理第一個 hop 之前 | 回傳 `NULL`：descriptor 檢查任一不符；pool 未 16-byte 對齊；pool 太小；config 無效。**沒有任何診斷輸出**（見 [§5.5](errors.md#55-診斷輸出去向)） |
@@ -245,10 +245,10 @@ c++ -o app app.o \
 | 5c | residual | `aec_process_residual(a, &beam)`；`aec_get_residual(a, &v)` | 緊接著同一幀的 `aec_process_linear()` | `AEC_ERR_ARG` / `AEC_ERR_MODE` / `AEC_ERR_SEQUENCE` / `AEC_ERR_DSP`，見 [§5.3](errors.md#53-aec_process_residual-的完整拒絕清單依實際檢查順序) |
 | 5d | 你的後級 stage | `anr_process_gain()` → `aec_apply_gain()` → `aec_apply_cng()` → `ac_istft_push()` | residual 之後、下一次 `aec_process_linear()` 之前 | 由你負責 |
 | 6 | reset | `aec_reset(a)` | 換回聲路徑、切換串流時 | 不會失敗。`a` 為 NULL 或已 destroy 的陣列是 no-op。四條 lane、共用 estimator、對齊環、增益級（level 設定保留）、CNG 種子與計數全部回到初始狀態。**會作廢目前的視圖**，且之後 `aec_process_residual()` 回 `AEC_ERR_SEQUENCE` 直到下一次 `aec_process_linear()`；你的 stage 要各自 reset（`anr_reset`、`ac_istft_reset`，並把你記的 `post_reset_serial` 更新成 `aec_post_reset_serial(a)`） |
-| 7 | destroy | `aec_destroy(a)` | 不再處理任何 hop 之後、釋放記憶體之前 | 不會失敗。NULL 安全、可重複呼叫。caller-owned pool 不被釋放；`aec_create()` 建的 instance 釋放自己的 heap 區塊 |
+| 7 | destroy | `aec_destroy(a)` | 不再處理任何 hop 之後、釋放記憶體之前 | 不會失敗。NULL 安全。caller-owned pool 不被釋放，可重複呼叫（已 destroy 的 handle 之後被拒）；`aec_create()` 建的 instance 釋放自己的 heap 區塊，**只能 destroy 一次**，指標之後作廢 |
 | 8 | release | 你自己的釋放器 | **一定要在第 7 步之後** | 順序顛倒 = use-after-free |
 
-`aec_create(&a_storage, &cfg)` 是 heap 便利路徑：呼叫端提供 `Aec` 結構本身，pool 由函式庫配置（回 `0` 成功、`-1` 失敗），`aec_destroy()` 釋放它。其餘完全相同。
+`Aec* a = aec_create(&cfg)` 是 heap 便利路徑：函式庫配置一塊 16-byte 對齊的記憶體（大小 `aec_get_mem_size(&cfg)`），`Aec` 與 pool 都在裡面，回傳 `NULL` 表示 `cfg` 無效或配置失敗；`aec_destroy(a)` 釋放那一塊，之後指標作廢，呼叫端不再 `free()`。`Aec` 是不透明型別（不能 `sizeof(Aec)`、不能宣告變數）。其餘完全相同。
 
 **物件存活期間，不要對它的內部物件做任何事**：四條 lane、共用 estimator 都在 pool 裡，沒有公開 handle；要重置請呼叫 `aec_reset()`。
 

@@ -56,7 +56,7 @@ _DFN2_VARIANTS = {
 }
 
 _DFN2_MAIN = r'''
-#include "DeepFilterNet2/dfn2_prepost.h"
+#include "dfn2_prepost.h"
 
 #ifdef DFN2_MASK_ONLY
 #define MAIN_DF_LOOKAHEAD 0
@@ -297,7 +297,7 @@ _GUARD_DRIVER = r'''
 #include <stdlib.h>
 #include <string.h>
 
-#include "DeepFilterNet2/dfn2_prepost.h"
+#include "dfn2_prepost.h"
 
 #define SR 16000
 #define N_FFT 256
@@ -671,7 +671,7 @@ def test_dfn2_grid_header_defaults_are_the_pair_of_config_ini(
         pytest.skip('C compiler unavailable')
     out = subprocess.run(
         ['cc', '-E', '-dM', '-x', 'c', '-I', str(dfn_pairs.AINR),
-         '-I', str(dfn_pairs.family_dir(DFN2)),
+         '-I', str(dfn_pairs.c_dir(DFN2)),
          '-I', str(dfn_pairs.AUDIO_COMMON / 'include'),
          '-I', str(dfn_pairs.AUDIO_COMMON),
          *(['-DDFN2_MASK_ONLY'] if mask_only else []),

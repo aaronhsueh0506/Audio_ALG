@@ -206,7 +206,7 @@ int main(void) {
         }
     }
     ExampleCliDelayOptions d={AEC_DELAY_FIXED,1,0,0,1};
-    assert(example_cli_delay_validate(&d,"probe")==0 && d.num_filters==DA_NUM_FILTERS);
+    assert(example_cli_delay_validate(&d,"probe")==0 && d.num_filters==AEC_DELAY_NUM_FILTERS_MAX);
     {   /* The budget printer: the unit's size comes from the caller's query. */
         AecConfig cfg;
         ArraySampleBeamParams bp;

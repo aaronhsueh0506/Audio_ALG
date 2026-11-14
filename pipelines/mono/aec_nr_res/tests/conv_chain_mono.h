@@ -55,7 +55,7 @@ static inline ConvMonoConfig conv_mono_default_config(int sample_rate, int fft_s
     c.sample_rate = sample_rate;
     c.fft_size = fft_size;
     c.delay_mode = AEC_DELAY_MATCHED;
-    c.delay_num_filters = DA_NUM_FILTERS;
+    c.delay_num_filters = AEC_DELAY_NUM_FILTERS_MAX;
     c.fixed_delay_samples = -1;
     c.aec_level = AEC_LEVEL_BALANCED;
     c.nr_level = ANR_LEVEL_BALANCED;
@@ -83,7 +83,7 @@ typedef struct ConvMono {
 static inline void conv_mono_destroy(ConvMono* c) {
     if (!c) return;
     if (c->nr) anr_destroy(c->nr);
-    if (c->aec) { aec_destroy(c->aec); free(c->aec); }
+    if (c->aec) aec_destroy(c->aec);
     free(c->mem);
     free(c);
 }
@@ -110,10 +110,8 @@ static inline ConvMono* conv_mono_create(const ConvMonoConfig* cfg) {
     if (!c) return NULL;
     c->cfg = *cfg;
     conv_mono_lane_config(cfg, &lane);
-    c->aec = (Aec*)calloc(1, sizeof(Aec));
-    if (!c->aec || aec_create(c->aec, &lane) != 0) {
-        free(c->aec);
-        c->aec = NULL;
+    c->aec = aec_create(&lane);
+    if (!c->aec) {
         conv_mono_destroy(c);
         return NULL;
     }

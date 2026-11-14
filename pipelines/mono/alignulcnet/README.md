@@ -128,7 +128,7 @@ leading `+` are accepted.
 
 Choose `n` from the SKU's measured bulk far-to-mic delay distribution. The
 reliable search ceiling per bank is ~125 / 221 / 317 / 413 / 509 ms for
-n = 1..5; each filter costs 5,728 bytes of pool. `0` is not "off" — use
+n = 1..5; each filter costs 11,264 bytes of pool (23,552 at 48 kHz). `0` is not "off" — use
 `--delay-mode fixed` (delay known at bring-up) or `external` (upstream
 guarantees alignment) instead. A bulk delay beyond the ceiling does not
 merely fail to lock: with any in-range early reflection present the estimator

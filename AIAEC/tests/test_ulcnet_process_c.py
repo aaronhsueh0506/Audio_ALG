@@ -271,7 +271,7 @@ def test_ulcnet_compressed_mask_helper_matches_python(driver, audio_common_lib):
     source.write_text(r'''
 #include <stdio.h>
 #include <stdlib.h>
-#include "aiaec_process.h"
+#include "ulcnet_mask_process.h"
 #define BINS_MAX 513
 int main(int argc, char **argv) {
     static float in[4][BINS_MAX], out[2][BINS_MAX];
@@ -294,7 +294,7 @@ int main(int argc, char **argv) {
     executable = work / 'ulc_mask'
     subprocess.run(
         [cc, '-O2', '-std=c99', '-ffp-contract=off',
-         '-I', _AIAEC_DIR, '-I', _ULCNET_DIR, '-I', _AC_INCLUDE, '-I', _AC_DIR,
+         '-I', _ULCNET_DIR, '-I', _AC_INCLUDE, '-I', _AC_DIR,
          str(source), os.path.join(_ULCNET_DIR, 'ulcnet_mask_process.c'),
          os.path.join(_ULCNET_DIR, 'ulcnet_process.c'),
          audio_common_lib, '-lm', '-o', str(executable)],
@@ -325,7 +325,8 @@ def test_shared_real_and_complex_masks_match_python(driver, audio_common_lib):
     source.write_text(r'''
 #include <stdio.h>
 #include <stdlib.h>
-#include "aiaec_process.h"
+#include "cagcrn_process.h"
+#include "align_cruse_process.h"
 #define BINS_MAX 513
 int main(int argc, char **argv) {
     static float in[5][BINS_MAX], out[4][BINS_MAX];
@@ -348,7 +349,7 @@ int main(int argc, char **argv) {
     executable = work / 'shared_masks'
     subprocess.run(
         [cc, '-O2', '-std=c99', '-ffp-contract=off',
-         '-I', _AIAEC_DIR, '-I', _CAGCRN_DIR, '-I', _ALIGN_CRUSE_DIR, '-I', _AC_INCLUDE, '-I', _AC_DIR,
+         '-I', _CAGCRN_DIR, '-I', _ALIGN_CRUSE_DIR, '-I', _AC_INCLUDE, '-I', _AC_DIR,
          str(source), os.path.join(_CAGCRN_DIR, 'cagcrn_process.c'),
          os.path.join(_ALIGN_CRUSE_DIR, 'align_cruse_process.c'),
          audio_common_lib, '-lm', '-o', str(executable)],
@@ -415,7 +416,7 @@ int main(int argc, char **argv) {
     executable = tmp_path / 'ccm'
     subprocess.run(
         [cc, '-O2', '-std=c99', '-ffp-contract=off',
-         '-I', _AIAEC_DIR, '-I', _ULCNET_DIR,
+         '-I', _ULCNET_DIR,
          '-I', _DEEPVQE_S_DIR, '-I', _AC_INCLUDE, '-I', _AC_DIR,
          str(source), os.path.join(_DEEPVQE_S_DIR, 'deepvqe_process.c'),
          '-o', str(executable)], check=True, capture_output=True)

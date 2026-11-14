@@ -3,12 +3,12 @@
 ## 4. Config 完整參考
 
 array 的設定就是 `aec.h` 的 `AecConfig`，`n_mics = AEC_ARRAY_MICS`（4）。沒有獨立的 array config 型別，也沒有 lane config：陣列從這一份 config 衍生四條 lane
-（`EXTERNAL_ALIGNED`、單支、`residual` 為 STATE 或 ESTIMATE，其餘欄位照抄）。
+（`EXTERNAL_ALIGNED`、單支、`residual` 為 STATE 或 ESTIMATE，其餘欄位照抄）。`AecConfig` 只有 12 個公開欄位；濾波器長度、shadow、HPF、飽和處理、各門檻與 delay ring 的上限等調校值都在函式庫內部（`AecTuning`），由 `(sample_rate, fft_size, n_mics, level)` 決定。
 取得預設值的方式：
 
 ```c
 AecConfig cfg;
-aec_config_from_level(&cfg, AEC_LEVEL_BALANCED, 16000);   /* 或 aec_config_defaults() */
+aec_config_from_level(&cfg, AEC_LEVEL_BALANCED, 16000);
 cfg.n_mics = AEC_ARRAY_MICS;
 /* 之後只覆寫你真正要改的欄位 */
 ```
@@ -19,7 +19,7 @@ sample 層另有 `array_sample_default_config(&cfg, sr)`（`array_sample_beam.h`
 
 ### 4.1 逐欄位
 
-下表只列陣列新增或有不同限制的欄位；其餘欄位（`mu`、`filter_length`、`enable_cng`、level 的地板、shadow／EPC 等）的意義與單支相同，見 `aec.h`，並套用到四條 lane 與增益級。
+下表只列陣列新增或有不同限制的欄位；其餘欄位（`enable_cng`、`level`）的意義與單支相同，見 `aec.h`，並套用到四條 lane 與增益級。
 
 | 欄位 | 型別 | 預設 | 合法值（驗證器實際檢查的） | 你該怎麼設 |
 |---|---|---|---|---|
@@ -28,17 +28,14 @@ sample 層另有 `array_sample_default_config(&cfg, sr)`（`array_sample_beam.h`
 | `fft_size` | `int` | factory 填 rate 預設（16 kHz → 256，48 kHz → 1024） | `0` **被拒絕**（factory 不填的取樣率會得到 0）。16 kHz 接受 `256` 或 `512`；48 kHz 只接受 `1024` | 除非有明確理由要 16 kHz 的 512 grid，否則用 factory 的預設 |
 | `residual` | `AecResidualMode` | `AEC_RESIDUAL_FULL` | `STATE`／`ESTIMATE`／`FULL`；`OFF` 拒絕 | STATE = 只有 lane，不融合（ULCNet 等吃 BF 頻譜的後濾波器）；ESTIMATE = 融合但無增益；FULL = 融合加唯一一個 G_res。見 §4.3 |
 | `delay_mode` | `AecDelayMode` | `AEC_DELAY_MATCHED` | `MATCHED`／`FIXED`／`EXTERNAL_ALIGNED` | 描述**共用**的對齊（四條 lane 一律吃已對齊的 far）。`MATCHED` 建共用 estimator 與對齊 ring；`FIXED` 只建固定延遲 ring；`EXTERNAL_ALIGNED` 由呼叫端給已對齊的 far，不建 estimator 也不建 ring（記憶體差異見 [§4.4](#44-檢視欄位記憶體用量與實測-pool) 的連結） |
-| `delay_num_filters` | `int` | `5`（`DA_NUM_FILTERS`） | 僅 `MATCHED`：`[1, 5]`；其餘模式須為預設 | matched-filter bank 大小，每少一個省 5,728 B（pool 內的 estimator 部分） |
+| `delay_num_filters` | `int` | `5`（`AEC_DELAY_NUM_FILTERS_MAX`） | 僅 `MATCHED`：`[1, 5]`；其餘模式須為預設 | matched-filter bank 大小，每少一個省 5,120 B（pool 內的 estimator 部分） |
 | `fixed_delay_samples` | `int` | `-1` | 僅 `FIXED`：`[0, 120 × sample_rate]`，原生取樣點數；其餘模式須為 `-1`；`FIXED` 給 `-1` 拒絕 | 決定共用 delay ring 大小 |
 | `capture_proxy_channel` | `int` | `0` | `[0, 3]`。其他值拒絕（單支必須為 0） | 共用 delay matcher 要用哪一支麥克風當輸入。挑訊噪比最穩定、離喇叭關係最典型的那一支 |
-| `max_delay_ms` | `float` | `1024.0f` | 必須是有限值，且落在 `[0.0, 4096.0]` | 僅 `MATCHED` 使用：共用 reference delay line 的容量上限（毫秒）。實際的 ring 大小 = `ceil(max_delay_ms * sample_rate / 1000) + 2 * hop + 1` 個 sample。設得比你系統真實最大 mic↔ref 延遲**略大**即可；設太大只是白白吃記憶體 |
 | `delay_backward_quarantine_enabled` | `int`（bool） | `0` | `0` 或 `1`（單支必須為 0） | 僅 `MATCHED`。開啟後，比現行 accepted delay **更早**的共用估計會先被隔離（`capture_proxy_channel` 那條 lane 在目前對齊上仍明顯在消除回音時），到期才採用；往後跳與首次取得對齊不受影響。產品組態維持 `0` |
 | `delay_backward_quarantine_s` | `float` | `1.0` | 有限值，`[0.0, 3600.0]` | 隔離窗長（秒），init 時換算成 hop 數（最小 1）；enable 為 0 時無作用但仍被驗證 |
-| `delay_est_period_s` | `float` | `0.0` | 有限值，`[0.0, 3600.0]` | 共用 matched-filter 的 duty-cycle 週期：`0.0` = 每 hop 全速分析；正值時估計 solid 且不變 0.3 s（固定）後，改為每 round(`delay_est_period_s`/hop 時長) 除以 5（整數除法，最小 1）個 hop 分析一次，省算力但可能鎖到不同的 lag |
-| `filter_length` | `int` | 52 ms（≥ 44.1 kHz 為 64 ms） | `(0, 4096]` 樣本 | 記憶體吃緊時最有效的旋鈕；四條 lane 等比縮放 |
 
-**level（強度）是 `AecConfig` 的 level 欄位**（`aec_config_from_level()` 或 `aec_set_level()`）：只作用在融合後的增益級（`FULL`），lane 自己的地板什麼都不塑形（[integration.md §3.2](integration.md#32-執行期強度控制)）。
-RES 與 NR 的其他設定：增益級是 `AecConfig` 的一部分（`min_gain_*`、`ne_recent_*`、`dt_aware_*`…）；NR 是你的 `AnrConfig`（`anr_config_for_level_grid()`）。
+**level（強度）是 `AecConfig.level`**（`aec_config_from_level()` 寫入；`aec_set_level()` 在執行期更換並存回實例；不在 0..3 會被拒絕，全零的 `AecConfig` 是 `MILD`）：只作用在融合後的增益級（`FULL`），lane 自己的地板什麼都不塑形（[integration.md §3.2](integration.md#32-執行期強度控制)）。
+RES 與 NR 的其他設定：增益級的調校值（地板、近端偵測、double-talk）是函式庫內部的，隨 `level` 成組決定；NR 是你的 `AnrConfig`（`anr_config_for_level_grid()`）。共用 delay ring 的容量由函式庫決定（延遲範圍 1024 ms 加 2 hop 與 1 個 sample，隨 `delay_mode` 與 `delay_num_filters`），不是欄位。
 `AecConfig.residual` 決定陣列做到哪裡：`AEC_RESIDUAL_STATE`（只有 lane）、`ESTIMATE`（融合、無增益）或 `FULL`。
 
 ### 4.2 Grid（由 `sample_rate` + `fft_size` 唯一決定）

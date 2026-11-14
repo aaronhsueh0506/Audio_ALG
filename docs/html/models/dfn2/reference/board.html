@@ -19,10 +19,10 @@
 <table>
 <thead><tr><th>組態</th><th>PCM</th><th>PCM → 頻譜（<code>_spec</code>）</th><th>頻譜 → 頻譜（<code>_freq</code>）</th></tr></thead>
 <tbody>
-<tr><th>full 16 kHz／256／N=1</th><td>103728</td><td>103728</td><td>105792</td></tr>
-<tr><th>full 16 kHz／256／N=8</th><td>160896</td><td>166336</td><td>168400</td></tr>
-<tr><th>full 48 kHz／1024／N=1</th><td>361424</td><td>361424</td><td>369632</td></tr>
-<tr><th>lite 48 kHz／1024／N=1</th><td>301056</td><td>301056</td><td>309264</td></tr>
+<tr><th>full 16 kHz／256／N=1</th><td>103696</td><td>103696</td><td>105760</td></tr>
+<tr><th>full 16 kHz／256／N=8</th><td>160864</td><td>166304</td><td>168368</td></tr>
+<tr><th>full 48 kHz／1024／N=1</th><td>361392</td><td>361392</td><td>369600</td></tr>
+<tr><th>lite 48 kHz／1024／N=1</th><td>301024</td><td>301024</td><td>309232</td></tr>
 </tbody></table>
 
 <h2 id="info">AinrInfo 與 sample 模型設定</h2>
@@ -63,7 +63,7 @@
 <h2 id="float-io">Float I/O 模式</h2>
 <p>函式庫與 stream 層的 tensor 都是 float32，定點與 float 的軟體轉換只在板端 sample。每支 AI3 sample 開頭有編譯期的 <code>#define FLOAT_IN 0</code> 與 <code>#define FLOAT_OUT 0</code>（預設關閉，沒有執行期旗標）：<code>FLOAT_IN</code> 讓 NPU 量化訊號輸入，<code>FLOAT_OUT</code> 讓 NPU 反量化 head 輸出，CPU 不再轉換。開啟只省轉換，不省搬運：輸入的 <code>memcpy</code> 與 cache flush 仍在，head 讀回改為 flush 加 <code>memcpy(elem * 4)</code>。</p>
 <ul>
-<li>兩個值應相等。SDK 在開圖時套用 float I/O，state 的輸入與輸出共用同一塊 buffer、型別來自 SDK 回報；<code>FLOAT_IN != FLOAT_OUT</code> 沒有驗證過，只會有編譯警告（<code>#warning</code>；用 <code>-Werror</code> 建置時會變成錯誤）和啟動 log <code>[AI3] float_in=%d float_out=%d</code> 後面的 <code>WARNING: mixed setting</code>。</li>
+<li>這些 model 的 state 就地繼承 input／output 的型別（state 的輸入與輸出共用同一塊 buffer，型別來自 SDK 回報），所以<b>要求 <code>FLOAT_IN == FLOAT_OUT</code></b>；混合設定只適用於不繼承 state 的模型，這裡的 AI3 sample 都不是，沒有在板上驗證過。<code>FLOAT_IN != FLOAT_OUT</code> 不會被編譯擋下，只有編譯警告（<code>#warning</code>；用 <code>-Werror</code> 建置時會變成錯誤）和啟動 log <code>[AI3] float_in=%d float_out=%d</code> 後面的 <code>WARNING: mixed setting</code>。</li>
 <li>State 埠不受這兩個 define 管，維持 SDK 回報的型別；清零是對 buffer 填位元組 0 並 flush cache，float 與定點通用，因為通過埠檢查的定點 state 兩端 <code>zero_point</code> 都是 0。</li>
 <li>模型永遠是定點，<code>FLOAT_IN</code>／<code>FLOAT_OUT</code> 只讓硬體在邊界轉換，SDK 回報的埠型別因此不能當作請求是否生效的依據，sample 不拿請求去比對回報的型別。<code>ai3_model_io_check_ports()</code> 通過後、任何 buffer 覆寫之前，sample 印出 <code>[AI3] float_in=%d float_out=%d</code>（混合時尾端加 <code>WARNING: mixed setting</code>）與每個輸入、輸出埠一行 <code>[AI3] in[i]</code>／<code>out[i]</code>（<code>float</code>、<code>bits</code>、<code>scale_ratio</code>、<code>zero_point</code>），供板端 A/B 比對；埠檢查不會因 float 與定點的差異而失敗。</li>
 <li>float head 可以帶 NaN／Inf（定點會飽和），NaN 預填與函式庫的有限值檢查仍在：被拒的那拍走近恆等直通並推進 generation。DFN2 的 <code>df_alpha</code> 在 sample 端夾到 [0, 1] 的步驟也保留。</li>

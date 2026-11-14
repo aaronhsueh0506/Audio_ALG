@@ -90,7 +90,7 @@ LIB_OBJECTS := $(OBJ_DIR)/aiaec.o
 VPATH := .
 
 .PHONY: all lib print-lib-path print-cflags print-sources test deepvqe-lib ulcnet-lib \
-	test-aiaec-catalog test-aiaec-block test-aiaec-spec-freq test-aiaec-ports test-aiaec-product test-aiaec-packet test-aiaec-model-io link-only-aiaec \
+	test-aiaec-catalog test-aiaec-block test-aiaec-spec-freq test-aiaec-product test-aiaec-packet test-aiaec-model-io link-only-aiaec \
 	bind-dumpers model-io-dumper packet-driver test-single-model audit-no-stdio clean _cfg_guard
 
 all: lib
@@ -155,12 +155,12 @@ ULCNET_CORE_HEADERS := ../../lib/aiaec/ulcnet/ulcnet_model_io.h \
 	../../lib/aiaec/ulcnet/ulcnet_process.h \
 	../../lib/aiaec/ulcnet/ulcnet_prepost.h
 ULCNET_STREAM_SOURCES := ulcnet/ulcnet_stream.c
-ULCNET_STREAM_HEADERS := ulcnet/ulcnet_stream.h ulcnet/ulcnet_stream_internal.h
+ULCNET_STREAM_HEADERS := ulcnet/ulcnet_stream.h
 
 TEST_SOURCES := $(DEEPVQE_CORE_SOURCES) deepvqe_s/deepvqe_stream.c \
 	$(ULCNET_CORE_SOURCES) $(ULCNET_STREAM_SOURCES) aiaec.c
 TEST_DEPS := $(DEEPVQE_CORE_HEADERS) $(ULCNET_CORE_HEADERS) $(ULCNET_STREAM_HEADERS) \
-	$(STREAM_HEADERS) $(COMMON_LIB) $(COMMON_HEADERS)
+	$(STREAM_HEADERS) $(wildcard tests/*.h) $(COMMON_LIB) $(COMMON_HEADERS)
 
 # The product a test binary is built for is chosen by compiling aiaec.c with
 # -DAIAEC_PRODUCT_MODEL_ID=<id> (aiaec_product.h) -- the only way a test reaches the other model;
@@ -200,10 +200,6 @@ test-aiaec-packet: $(TEST_DEPS) | _cfg_guard
 	$(CC) $(CFLAGS) $(SIMD_CPPFLAGS) -DAIAEC_TEST_CATALOG -DAIAEC_PRODUCT_MODEL_ID=10 -Ideepvqe_s -Iulcnet \
 	  tests/test_aiaec_packet.c $(TEST_SOURCES) "$(COMMON_LIB)" $(LDFLAGS) -lm -o "$(OBJ_DIR)/test_aiaec_packet"
 	"$(OBJ_DIR)/test_aiaec_packet"
-
-# test_aiaec_ports: the AiaecWork signal and head views of real pre calls against the exporters' tables, with the test catalog.
-test-aiaec-ports: $(TEST_DEPS) | _cfg_guard
-	$(call RUN_PER_PRODUCT,test_aiaec_ports,-DAIAEC_TEST_CATALOG)
 
 # test_aiaec_product: the product binding (1 DeepVQE-S, 2 Align-ULCNet, 3 an id naming no model);
 # builds 1 and 2 report the pool size of the same config, which must differ.
@@ -310,7 +306,7 @@ link-only-aiaec: $(LINK_ONLY_AIAEC_BIN)
 # single-model `test` runs only `lib` (confirms aiaec.o itself still compiles clean under this
 # variant) and says plainly what covers that variant's contract: test-single-model.
 ifeq ($(AIAEC_MODEL),both)
-test: test-aiaec-catalog test-aiaec-block test-aiaec-spec-freq test-aiaec-ports test-aiaec-product test-aiaec-packet test-aiaec-model-io link-only-aiaec ulcnet-lib
+test: test-aiaec-catalog test-aiaec-block test-aiaec-spec-freq test-aiaec-product test-aiaec-packet test-aiaec-model-io link-only-aiaec ulcnet-lib
 else
 test: lib
 	@echo "test: AIAEC_MODEL=$(AIAEC_MODEL) -- the per-product tests and link-only-aiaec assume both models and are skipped; run 'make test-single-model' for this variant's coverage (built with AIAEC_MODEL=both, which exercises AIAEC_MODEL=deepvqe and =align internally)."

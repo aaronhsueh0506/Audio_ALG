@@ -22,43 +22,11 @@
 
 #include "ainr.h"
 #include "ainr_test.h"
+#include "ainr_test_fixture.h"
 #include "audio_stft.h"
 
 #define PULSE 16000
 #define BLOCKS_REAL 4
-
-/* ERB tables that make the bypass an exact identity: every bin belongs to one contiguous band
- * (forward = band mean, inverse = copy the band's gain back), so a unit mask is a unit gain. */
-static void write_synthetic_erb(const char *path, int n_bins, int n_erb) {
-    size_t elems = (size_t)n_bins * (size_t)n_erb;
-    float *fwd = (float *)calloc(elems, sizeof(float));
-    float *inv = (float *)calloc(elems, sizeof(float));
-    int *size = (int *)calloc((size_t)n_erb, sizeof(int));
-    int32_t hdr[2];
-    FILE *fp;
-    int k, e;
-    if (!fwd || !inv || !size) { fprintf(stderr, "calloc fail\n"); exit(1); }
-    for (k = 0; k < n_bins; ++k) { e = (int)((long long)k * n_erb / n_bins); size[e]++; }
-    for (k = 0; k < n_bins; ++k) {
-        e = (int)((long long)k * n_erb / n_bins);
-        fwd[(size_t)k * (size_t)n_erb + (size_t)e] = 1.0f / (float)size[e];
-        inv[(size_t)k * (size_t)n_erb + (size_t)e] = 1.0f;
-    }
-    fp = fopen(path, "wb");
-    if (!fp) { fprintf(stderr, "fopen write fail (%s)\n", path); exit(1); }
-    hdr[0] = (int32_t)n_bins; hdr[1] = (int32_t)n_erb;
-    fwrite(hdr, sizeof(int32_t), 2, fp);
-    fwrite(fwd, sizeof(float), elems, fp);
-    fwrite(inv, sizeof(float), elems, fp);
-    fclose(fp);
-    free(fwd); free(inv); free(size);
-}
-
-static void *alloc_aligned(size_t bytes, unsigned int alignment) {
-    void *p = NULL;
-    if (posix_memalign(&p, (size_t)alignment, bytes) != 0) { fprintf(stderr, "posix_memalign fail\n"); exit(1); }
-    return p;
-}
 
 typedef struct Ola { AcIstft *istft; void *mem; } Ola;
 
@@ -111,7 +79,7 @@ static int run_case(int sr, int fft, int n_erb, int n, int want_queue, int want_
 
     cfg.sr = sr; cfg.fft = fft; cfg.hop_in = hop_in;
     snprintf(erb, sizeof(erb), "/tmp/ainr_tail_erb_%d_%d_%d.bin", sr, fft, (int)getpid());
-    write_synthetic_erb(erb, n_bins, n_erb);
+    write_identity_erb(erb, n_bins, n_erb);
 
     /* PCM family: init reports the lengths; the internal ISTFT drains with the documented zero blocks. */
     if (ainr_get_mem_size(&cfg, &req) != AINR_OK) { fprintf(stderr, "%s: get_mem_size fail\n", label); return 1; }

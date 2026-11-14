@@ -24,39 +24,12 @@
 
 #include "ainr.h"
 #include "ainr_test.h"
+#include "ainr_test_fixture.h"
 #include "dfn2_grid.h"
 #include "dfn2_stream.h"
 
 #define BLOCKS    10
 #define BAD_BLOCK 3
-
-static void write_synthetic_erb(const char *path, int n_bins, int n_erb) {
-    size_t elems = (size_t)n_bins * (size_t)n_erb;
-    float *fwd = (float *)malloc(elems * sizeof(float));
-    float *inv = (float *)malloc(elems * sizeof(float));
-    size_t i;
-    int32_t hdr[2];
-    FILE *fp;
-    if (!fwd || !inv) { fprintf(stderr, "malloc fail\n"); exit(1); }
-    for (i = 0; i < elems; ++i) {
-        fwd[i] = (float)(i % 17) * 0.01f;
-        inv[i] = (float)((i + 3) % 11) * 0.02f;
-    }
-    fp = fopen(path, "wb");
-    if (!fp) { fprintf(stderr, "fopen write fail (%s)\n", path); exit(1); }
-    hdr[0] = (int32_t)n_bins; hdr[1] = (int32_t)n_erb;
-    fwrite(hdr, sizeof(int32_t), 2, fp);
-    fwrite(fwd, sizeof(float), elems, fp);
-    fwrite(inv, sizeof(float), elems, fp);
-    fclose(fp);
-    free(fwd); free(inv);
-}
-
-static void *alloc_aligned(size_t bytes, unsigned int alignment) {
-    void *p = NULL;
-    if (posix_memalign(&p, (size_t)alignment, bytes) != 0) { fprintf(stderr, "posix_memalign fail\n"); exit(1); }
-    return p;
-}
 
 static int all_finite(const float *p, size_t n) {
     size_t i;

@@ -145,8 +145,8 @@ tensor，無隱藏 state；四個 state 都歸應用端——浮點 host 登錄�
 <code>output</code> 與兩路頻譜的 staging，只隨 grid 走、不隨 D 走（本機量測：D = 4、8、16、32、64 位元組相同；D 只進 <code>build_flags_hash</code>）：</p>
 <table>
 <tr><th>函式</th><th>16 kHz／512（TA=26）</th><th>48 kHz／1024（TA=52）</th></tr>
-<tr><td><code>ulcnet_prepost_get_mem_size</code>（class）</td><td>14,784 B</td><td>29,120 B</td></tr>
-<tr><td><code>ulcnet_accelerator_adapter_get_mem_size</code>（class + 32 B header）</td><td>14,816 B</td><td>29,152 B</td></tr>
+<tr><td><code>ulcnet_prepost_get_mem_size</code>（class）</td><td>14,832 B</td><td>29,168 B</td></tr>
+<tr><td><code>ulcnet_accelerator_adapter_get_mem_size</code>（class + 32 B header）</td><td>14,864 B</td><td>29,200 B</td></tr>
 </table>
 <table>
 <tr><th>其他 state</th><th>內容</th><th>保存者</th></tr>
@@ -188,7 +188,7 @@ double twiddles），非 bit-exact（<code>test_ulcnet_process_c.py</code> 檔�
 <pre>#include &lt;stdlib.h&gt;
 #include &lt;string.h&gt;
 #include "audio_stft.h"
-#include "Align_ULCNet/ulcnet_prepost.h"
+#include "ulcnet_prepost.h"
 
 extern int npu_run(const UlcnetModelIoInputs *in, UlcnetModelIoOutputs *out);
 
@@ -255,7 +255,7 @@ int run_ulcnet(int sample_rate, int n_fft, int D, const size_t el[4],
 <p>目標平台形式（加速器持有 state）：<code>config_defaults</code> 之後什麼都不登錄，每個 hop 在 <code>frame_open</code> 之後、加速器執行之前比對 generation：</p>
 <pre>#include &lt;stdint.h&gt;
 #include "audio_stft.h"
-#include "Align_ULCNet/ulcnet_prepost.h"
+#include "ulcnet_prepost.h"
 
 extern int  npu_run(const UlcnetModelIoInputs *in, UlcnetModelIoOutputs *out);
 extern void npu_fill_state_with_quantized_zero(void);
@@ -276,7 +276,7 @@ int board_hop(UlcnetPrepost *p, uint32_t *seen)
 }</pre>
 <p>入口 B（交給 pipeline 的 callback 邊界）：</p>
 <pre>#include &lt;stdlib.h&gt;
-#include "Align_ULCNet/ulcnet_accelerator_adapter.h"
+#include "ulcnet_accelerator_adapter.h"
 
 /* 目標平台 runtime：綁定 inputs 的八個張量與 outputs 的五個張量；
  * 每個 *_out 綁在同名 state 輸入的位址，先讀完所有 state 輸入才寫輸出。成功回 0。 */
@@ -440,7 +440,7 @@ k     pre_process -> open --------------------------------------->  替身回 -1
 <tr><th>項目</th><th>值（16 kHz／512／delay_depth=32）</th><th>出處</th></tr>
 <tr><td>hop</td><td>256 samples = 16 ms</td><td>實測（見下方 pool 量測）</td></tr>
 <tr><td>合成啟動</td><td>無首拍特例：hop 0 即為真實合成輸出（前半窗疊加的歷史為零）</td><td><code>ulcnet_stream.h</code> 檔頭</td></tr>
-<tr><td>reprime hop 數</td><td>1（<code>ULCNET_STREAM_REPRIME_FRAMES</code>）</td><td>同 <code>pipelines/ulcnet/ulcnet_nn_stage.h</code> 的 <code>ULCNET_NN_STAGE_REPRIME_FRAMES</code> 與板端 sample 的 <code>ALIGNULCNET_REPRIME_FRAMES</code></td></tr>
+<tr><td>reprime hop 數</td><td>1（<code>ULCNET_STREAM_REPRIME_FRAMES</code>）</td><td>同 <code>pipelines/ulcnet/ulcnet_nn_stage.h</code> 的 <code>ULCNET_NN_STAGE_REPRIME_FRAMES</code></td></tr>
 </table></div>
 
 <h2 id="calibration">Far 分支與校正</h2><h2 id="section-14">far branch 與 PTQ calibration</h2>

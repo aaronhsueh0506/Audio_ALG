@@ -315,7 +315,7 @@ int four_ulcnet_run(void) {
 -- 每個 hop(mics = [grid.hop][4] interleaved,far / out 各 grid.hop 個 float) -----------------------------------------
   | array_sample_beam_process_with_activity(unit, mics, far, vad, vad, NULL, &amp;beam, &amp;info)                       |
   |-------------------------&gt;|                          |                          |                          |
-  |                          | aec_process_linear + aec_get_array(aec, mics, far, &amp;front):共用 delay aligner -&gt; 4 條線性 AEC lane |
+  |                          | aec_process_linear(aec, mics, far) + aec_get_array(aec, &amp;front):共用 delay -&gt; 4 條線性 lane        |
   |                          |-------------------------&gt;|                          |                          |
   |                          | doa_step -&gt; bf_process_with_weights;不 fuse(residual = STATE);此鏈沒有 RES        |
   | AEC_OK;beam.spectrum(BF 後頻譜)、info.delay.{changed, solid}                   |                          |

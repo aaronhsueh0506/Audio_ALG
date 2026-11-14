@@ -167,8 +167,8 @@ sets the measured one through `ArraySampleBeamParams`). Internal: the helper's B
 The matched-filter bank size `n` is a product deployment decision, so it is a
 command-line argument rather than a literal in `main.c`; the resolved profile
 and the pool it costs are printed at start-up — at the default matched/n=5
-profile, that banner reads a 2,490,416 B unit pool (the array plus the helper; the 16 kHz row of the example's table is fft 512) plus a
-6,320 B stage pool at 16 kHz and a 5,188,368 B unit pool plus a 12,464 B stage pool at 48 kHz
+profile, that banner reads a 2,453,856 B unit pool (the array plus the helper; the 16 kHz row of the example's table is fft 512) plus a
+6,320 B stage pool at 16 kHz and a 5,121,088 B unit pool plus a 12,464 B stage pool at 48 kHz
 (`--sample-rate 48000`); the application's framing line follows (47,808 B at 16 kHz, 93,888 B at 48 kHz: the far `AcStft`, the output
 `AcIstft` and two spectra); the adapter pool follows on its own line (14,864 B at 16 kHz,
 29,200 B at 48 kHz; it follows the grid, not `D`). Read it from your
@@ -191,8 +191,8 @@ leading `+` are accepted.
 
 There is exactly ONE matched bank here: the array's shared estimator.
 The four lane AECs run `EXTERNAL_ALIGNED` off its single aligned reference, so
-each filter costs 5,728 bytes ONCE — not four times — and the lane pools inside the array
-do not move with `n` at all (`aec_get_mem_breakdown()`: `lane_bytes` is the same for every `n`, `estimator_bytes` drops by 5,728 per filter).
+each filter costs 5,120 bytes ONCE — not four times — and the lane pools inside the array
+do not move with `n` at all (`aec_get_mem_breakdown()`: `lane_bytes` is the same for every `n`, `estimator_bytes` drops by 5,120 per filter).
 
 Choose `n` from the SKU's measured bulk far-to-mic delay distribution. The
 reliable search ceiling per bank is ~125 / 221 / 317 / 413 / 509 ms for

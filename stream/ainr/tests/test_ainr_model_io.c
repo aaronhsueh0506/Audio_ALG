@@ -3,8 +3,10 @@
  * (AINR_PRODUCT_MODEL_ID, incl. the quantization alternates): every PCM, _spec and _freq block must pass
  * AI3_MODEL_IO_CHECK_WORK against the row of its configuration, and the library accepts a (sr, fft, N) exactly
  * when the row exists (a product id with no catalog rows refuses every configuration). The other variant's row
- * of the same grid must reject this variant's work. The rows against a fresh export are pinned by
- * AINR/tests/test_dfn2_port_order.py. Not built under NO_STDIO (ainr.c is file-mode). */
+ * of the same grid must reject this variant's work. The second block of a family carries the same shapes as the
+ * first, and every refusal of ainr_get_mem_size() comes back from the three init families with *ctx NULL and
+ * *info untouched. The rows against a fresh export are pinned by AINR/tests/test_dfn2_port_order.py. Not built
+ * under NO_STDIO (ainr.c is file-mode). */
 
 #include <stdint.h>
 #include <stdio.h>
@@ -68,7 +70,56 @@ static void compare_work(const char *tag, const Ai3ModelIoConfig *mc, const Ainr
     CHECK(ai3_model_io_fits(mc, AINR_MAX_INPUT_TENSORS, AINR_MAX_OUTPUT_TENSORS) == AI3_MODEL_IO_OK, "%s fits", tag);
 }
 
-/* One pre call of `family` on a fresh init; compares the work with the row. */
+static void fill_heads(AinrWork *w)
+{
+    int i;
+    size_t k;
+    for (i = 0; i < w->output_count; ++i)
+        for (k = 0; k < w->outputs[i].elements; ++k) w->outputs[i].data[k] = i == 0 ? 0.5f : 0.0f;
+}
+
+/* Every refusal of the sizing call comes back from the three init families, with *ctx NULL and *info untouched. */
+static void check_refusals(const char *erb)
+{
+    static const struct { int sr, fft, hop_in, want; const char *what; } cases[] = {
+        { 44100, 256, 128, AINR_ERR_GRID, "unregistered grid" },
+        { 48000, 1024, 100, AINR_ERR_IN_HOP, "hop_in not a multiple of model_hop" },
+        { 48000, 1024, 1024, AINR_ERR_LOOKAHEAD_BLOCK_UNSUPPORTED, "lookahead grid with N = 2" },
+#ifndef DFN2_MASK_ONLY
+        { 16000, 256, 512, AINR_ERR_FRAMES_PER_CALL, "N = 4 has no graph" },
+#endif
+    };
+    _Alignas(16) static unsigned char pool[1 << 21];
+    size_t i;
+    AinrInfo info, sentinel;
+    AinrConfig cfg;
+    StreamMemReq req;
+    memset(&sentinel, 0x5a, sizeof(sentinel));
+    for (i = 0; i < sizeof(cases) / sizeof(cases[0]); ++i) {
+        AinrCtx *c0 = (AinrCtx *)pool;
+        AinrSpecCtx *c1 = (AinrSpecCtx *)pool;
+        AinrFreqCtx *c2 = (AinrFreqCtx *)pool;
+        cfg.sr = cases[i].sr; cfg.fft = cases[i].fft; cfg.hop_in = cases[i].hop_in;
+        CHECK(ainr_get_mem_size(&cfg, &req) == cases[i].want, "refusal (%s): get_mem_size", cases[i].what);
+        info = sentinel;
+        CHECK(ainr_init_from_erb_file(&cfg, erb, pool, sizeof(pool), &c0, &info) == cases[i].want, "refusal (%s): init",
+              cases[i].what);
+        CHECK(c0 == NULL && memcmp(&info, &sentinel, sizeof(info)) == 0, "refusal (%s): ctx/info after init", cases[i].what);
+        info = sentinel;
+        CHECK(ainr_init_spec_from_erb_file(&cfg, erb, pool, sizeof(pool), &c1, &info) == cases[i].want,
+              "refusal (%s): init_spec", cases[i].what);
+        CHECK(c1 == NULL && memcmp(&info, &sentinel, sizeof(info)) == 0, "refusal (%s): ctx/info after init_spec",
+              cases[i].what);
+        info = sentinel;
+        CHECK(ainr_init_freq_from_erb_file(&cfg, erb, pool, sizeof(pool), &c2, &info) == cases[i].want,
+              "refusal (%s): init_freq", cases[i].what);
+        CHECK(c2 == NULL && memcmp(&info, &sentinel, sizeof(info)) == 0, "refusal (%s): ctx/info after init_freq",
+              cases[i].what);
+    }
+}
+
+/* One pre call of `family` on a fresh init; compares the work with the row, then closes the block and compares
+ * the next one. */
 static void run_family(const AinrConfig *cfg, int family, int n, const Ai3ModelIoConfig *mc, const char *tag)
 {
     AinrInfo info;
@@ -79,7 +130,7 @@ static void run_family(const AinrConfig *cfg, int family, int n, const Ai3ModelI
     AinrFreqCtx *freq = NULL;
     void *pool = NULL;
     int16_t *pcm_in;
-    float *zeros;
+    float *zeros, *out_re, *out_im;
     char erb[96];
     int rc, bins = cfg->fft / 2 + 1;
 
@@ -97,7 +148,9 @@ static void run_family(const AinrConfig *cfg, int family, int n, const Ai3ModelI
     CHECK(rc == AINR_OK, "%s init %d", tag, rc);
     pcm_in = (int16_t *)calloc((size_t)cfg->hop_in, sizeof(int16_t));
     zeros = (float *)calloc((size_t)n * (size_t)bins, sizeof(float));
-    if (!pcm_in || !zeros) exit(2);
+    out_re = (float *)calloc((size_t)n * (size_t)bins, sizeof(float));
+    out_im = (float *)calloc((size_t)n * (size_t)bins, sizeof(float));
+    if (!pcm_in || !zeros || !out_re || !out_im) exit(2);
     memset(&work, 0, sizeof work);
     if (rc == AINR_OK) {
         rc = family == 0 ? ainr_preprocess(pcm, pcm_in, &work)
@@ -115,9 +168,19 @@ static void run_family(const AinrConfig *cfg, int family, int n, const Ai3ModelI
                 AI3_MODEL_IO_CHECK_WORK(rc2, &other, &work);
                 CHECK(rc2 != AI3_MODEL_IO_OK, "%s the other variant's row accepted this work", tag);
             }
+            fill_heads(&work);
+            rc = family == 0 ? ainr_postprocess(pcm, 0, pcm_in) : family == 1 ? ainr_postprocess_spec(spec, 0, out_re, out_im)
+                                                                              : ainr_postprocess_freq(freq, 0, out_re, out_im);
+            CHECK(rc == AINR_OK, "%s postprocess %d", tag, rc);
+            memset(&work, 0, sizeof work);
+            rc = family == 0 ? ainr_preprocess(pcm, pcm_in, &work)
+               : family == 1 ? ainr_preprocess_spec(spec, pcm_in, &work)
+                             : ainr_preprocess_freq(freq, zeros, zeros, zeros, zeros, &work);
+            CHECK(rc == AINR_OK, "%s second preprocess %d", tag, rc);
+            if (rc == AINR_OK) compare_work(tag, mc, &work);
         }
     }
-    free(pool); free(pcm_in); free(zeros);
+    free(pool); free(pcm_in); free(zeros); free(out_re); free(out_im);
 }
 
 int main(void)
@@ -132,6 +195,14 @@ int main(void)
         own_rows += c.model == AI3_MODEL_IO_DFN2_PRODUCT;
     }
     CHECK(ai3_model_io_dfn2_row(AI3_MODEL_IO_DFN2_ROW_COUNT, NULL) == AI3_MODEL_IO_ERR_NULL, "row NULL cfg");
+
+    if (ID_HAS_ROWS) {
+        char erb[96];
+        snprintf(erb, sizeof erb, "/tmp/ainr_model_io_refusal_%d.bin", (int)getpid());
+        if (write_erb(erb, 513, 32) != 0) exit(2);
+        check_refusals(erb);
+        unlink(erb);
+    }
 
     for (si = 0; si < 4; ++si) for (fi = 0; fi < 5; ++fi) for (n = 1; n <= 8; ++n) {
         AinrConfig cfg;

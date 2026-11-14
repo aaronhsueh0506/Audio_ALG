@@ -12,7 +12,7 @@
 | 4 | init | `aec_init(pool, aec_bytes, &aec_cfg)`、`anr_init(pool + ALIGN16(aec_bytes), nr_bytes, &nr_cfg)`、`ac_istft_init(...)`（視窗用 `aec_init` 之後的 `aec_synthesis_window(aec, &synth_cfg.window, &len)` 借來的表；`ac_istft_get_mem_size` 先用任一非 NULL 的替身視窗量大小）；每一塊的起點都是前一塊加 `ALIGN16(前一塊大小)` | 拿到 pool 之後，處理第一個 hop 之前 | 回傳 `NULL`：pool 未 16-byte 對齊、太小、config 無效、子模組 init 失敗。已建好的那幾個要由你 destroy |
 | 5 | process | `aec_process_linear(aec, mic, ref)` → `aec_process_residual(aec, NULL)` → `aec_get_residual(aec, &v)`（先設 `v.struct_size = sizeof(v)`）→ 每 hop 串接（[§1.1](integration.md#11-構成每個函式庫各自初始化每個-hop-的串接由你寫)：`v.res_gain` 留在 `Aec` 裡、`anr_process_gain_with_residual_psd()`，降噪與增益都作用在 `v.base_spec` 上、`aec_apply_gain()`、`aec_apply_cng()`，兩者傳同一個降噪增益）→ `ac_istft_push(istft, spec, out)`；`aec_post_reset_serial(aec)` 與已處理的值不同時，在 push 之前 `ac_istft_reset(istft)`（Aec 自己的 comfort noise 種子已重設；不重置 AEC 與降噪器） | 每收到一個 hop 呼叫一次。`mic`/`ref`/`out` 都必須剛好 `grid.hop_size` 個 float | `aec_process_linear()`、`aec_process_residual()`、`aec_get_residual()`、`aec_apply_gain()`、`aec_apply_cng()` 回 `AEC_OK` 或 `AEC_ERR_ARG`／`AEC_ERR_MODE`／`AEC_ERR_SEQUENCE`（實例不變）；`v.res_gain` 為 NULL（`residual` 低於 `AEC_RESIDUAL_FULL`）、`anr_process_gain_with_residual_psd()` 回 `NULL`（降噪器拒絕該 hop）都是你要處理的拒絕；`ac_istft_push()` 的回傳值與輸出有限性（選用 `skn_all_finite_f32()`）要自己檢查。**不會**檢查 buffer 長度 —— 長度錯是你的責任 |
 | 6 | recover | `aec_reset(aec)`、`anr_reset(nr)`、`ac_istft_reset(istft)`（`aec_reset()` 同時把 `Aec` 自己的 comfort-noise 產生器設回 `AEC_CNG_SEED`，42），並更新你已處理的 `aec_post_reset_serial()` 值 | 任何一步被拒、輸出非有限（若你有檢查）、換回聲路徑（換喇叭、重新 seat）或切換到不相關的另一條串流時 | 不會失敗。必須全部一起 reset：漏掉其中一個就不等於新建的實例（`mono/aec_nr_res/main.c` 的 `rig_reset()` 就是這幾件事；`main.c` 在某個 stage 拒絕該 hop 時呼叫它，輸出有限性檢查是 `example_board_adapter.c` 的 `run_hops()` 做的） |
-| 7 | destroy | `anr_destroy(nr)`、`aec_destroy(aec)` | 不再處理任何 hop 之後、釋放 pool 之前 | 不會失敗。`aec_destroy` NULL 安全、可重複，只放開實例內部的參照，**不**釋放你的 pool；`anr_destroy` 對 pool 實例立即返回，對 `anr_create()` 的 heap 實例才釋放記憶體 |
+| 7 | destroy | `anr_destroy(nr)`、`aec_destroy(aec)` | 不再處理任何 hop 之後、釋放 pool 之前 | 不會失敗。`aec_destroy` NULL 安全；對 `aec_init()` 的 pool 實例可重複呼叫，只放開實例內部的參照，**不**釋放你的 pool；對 `aec_create()` 的實例釋放它自己的那一塊，**只能呼叫一次**，之後指標作廢（不要再 `free()`）；`anr_destroy` 對 pool 實例立即返回，對 `anr_create()` 的 heap 實例才釋放記憶體 |
 | 8 | release | 你自己的釋放器 | **一定要在第 7 步之後** | 順序顛倒 = use-after-free |
 
 補充規則：
@@ -139,18 +139,17 @@ mono 的設定分成兩份：lib/aec 的 `AecConfig`（格點與接縫欄位由�
 `derive_lane(sample_rate, fft_size, level, &grid, &aec_cfg)`（`mono/aec_nr_res/main.c`）依序做：
 `aec_resolve_signal_grid(sample_rate, fft_size ? fft_size : aec_default_fft_size(sample_rate), &grid)`（回非 `AEC_OK` 即回報失敗）、
 `aec_config_from_level(&aec_cfg, level, sample_rate)`，然後設下表的欄位。`aec_get_mem_size()` 與 `aec_init()` 會用 libaec 自己的驗證器
-再檢查整份 `AecConfig`（回 `0`／`NULL`）。`aec_config_from_level()` 對 8000／16000／48000 以外的取樣率回傳 `fft_size` 與 `filter_length` 皆為 `0` 的不可用設定，`aec_get_mem_size()` 回 `0`、`aec_init()` 回 `NULL`、`aec_create()` 回非 0，函式本身不會溢位。
+再檢查整份 `AecConfig`（回 `0`／`NULL`）。`aec_config_from_level()` 對 8000／16000／48000 以外的取樣率回傳 `fft_size` 為 `0` 的不可用設定，`aec_get_mem_size()` 回 `0`、`aec_init()` 與 `aec_create()` 回 `NULL`，函式本身不會溢位。`AecConfig` 只有 12 個公開欄位（`sample_rate`、`fft_size`、`n_mics`、`level`、`residual`、`delay_mode`、`fixed_delay_samples`、`delay_num_filters`、`enable_cng`、`capture_proxy_channel`、`delay_backward_quarantine_enabled`／`_s`）；其餘調校值（濾波器長度、shadow、HPF、飽和處理、各門檻）由函式庫依 `(sample_rate, fft_size, n_mics, level)` 在內部決定，呼叫端不能設。
 
 | 欄位 | 型別 | 範例的值 | 合法值（驗證器實際檢查的） | 你該怎麼設 |
 |---|---|---|---|---|
 | `sample_rate` | `int` | 你的取樣率 | `8000` / `16000` / `48000`，其他一律拒絕（例如 `44100`；`aec_is_valid_sample_rate()` 可先查） | 設成你音訊實際的取樣率。這個值同時決定預設 grid |
 | `fft_size` | `int` | `aec_default_fft_size(sample_rate)`（CLI `--fft-size 0` 時） | 8 kHz 只接受 `256`；16 kHz 接受 `256` 或 `512`；48 kHz 只接受 `1024`；`0` 與其他組合拒絕（`aec_resolve_signal_grid()` 回 `AEC_ERR_ARG`） | 除非你有明確理由要 16 kHz 的 512 grid，否則取 rate 預設 |
-| `filter_length` | `int` | `aec_config_from_level()` 的預設（52 ms；≥ 44.1 kHz 為 64 ms） | `[1, 4096]`，範圍外 `aec_get_mem_size()` 回 `0` | PBFDKF taps，init 後不可變；沒有明確需求就不改 |
 | `delay_mode` | `AecDelayMode` | `AEC_DELAY_MATCHED` | `AEC_DELAY_MATCHED` / `AEC_DELAY_FIXED` / `AEC_DELAY_EXTERNAL_ALIGNED` | 語意同 `lib/aec`；記憶體差異見 [§4.5a](#45a-delay_mode-對-16000預設-grid-的影響matched-n5-為-baseline) |
-| `delay_num_filters` | `int` | `DA_NUM_FILTERS`（5） | 一律 `[1, DA_NUM_FILTERS]`；`FIXED` 與 `EXTERNAL_ALIGNED` 要求維持 `DA_NUM_FILTERS` | matched-filter bank 大小，決定 bulk delay 搜尋範圍；init 參數，不是 runtime setter |
+| `delay_num_filters` | `int` | `AEC_DELAY_NUM_FILTERS_MAX`（5） | 一律 `[1, AEC_DELAY_NUM_FILTERS_MAX]`；`FIXED` 與 `EXTERNAL_ALIGNED` 要求維持 `AEC_DELAY_NUM_FILTERS_MAX` | matched-filter bank 大小，決定 bulk delay 搜尋範圍；init 參數，不是 runtime setter |
 | `fixed_delay_samples` | `int` | `-1` | 僅 `FIXED` 有效（原生取樣點數 ≥ 0，上限為該取樣率下的 120 秒）；其他模式須為 `-1` | 已知固定 delay 時使用 |
 | `residual` | `AecResidualMode` | `AEC_RESIDUAL_FULL` | `AEC_RESIDUAL_OFF`／`STATE`／`ESTIMATE`／`FULL` | 接縫：`FULL` 時 lane 不自己輸出時域音訊（除非呼叫 `aec_process()`），`aec_get_residual()` 交出 `error_spec`／`base_spec`／`res_gain`／`r2`／`comfort_noise`，增益由你的每 hop 串接經 `aec_apply_gain()`／`aec_apply_cng()` 套用 |
-| `level`（`aec_config_from_level()` 的引數） | `AecLevel` | `AEC_LEVEL_BALANCED`（= 1） | `AEC_LEVEL_MILD`(0) / `AEC_LEVEL_BALANCED`(1) / `AEC_LEVEL_AGGRESSIVE`(2) / `AEC_LEVEL_NO_FLOOR`(3)；列舉以外的整數**退回 balanced**（執行期換強度用 `aec_set_level()`，它對 enum 外回 `-1`） | 近端保留優先 → `MILD`；回聲抑制優先 → `AGGRESSIVE`；不確定就留預設 |
+| `level` | `AecLevel` | `AEC_LEVEL_BALANCED`（= 1，由 `aec_config_from_level(&cfg, level, sr)` 寫入） | `AEC_LEVEL_MILD`(0) / `AEC_LEVEL_BALANCED`(1) / `AEC_LEVEL_AGGRESSIVE`(2) / `AEC_LEVEL_NO_FLOOR`(3)；`aec_config_from_level()` 對列舉以外的整數存成 balanced；手填或全零的 `AecConfig` 是 level 0（`MILD`），手填的值不在 0..3 時 `aec_get_mem_size()`／`aec_init()`／`aec_create()` 拒絕（執行期換強度用 `aec_set_level()`，它對 enum 外回 `-1`，並把新 level 存回實例） | 近端保留優先 → `MILD`；回聲抑制優先 → `AGGRESSIVE`；不確定就留預設 |
 
 `residual` 保持預設 `AEC_RESIDUAL_FULL`：`v.res_gain` 才有值；只要 `error_spec`／`formed_hop` 與狀態旗標的 lane（例如 Align-ULCNet 範例）用 `AEC_RESIDUAL_STATE`，
 `ESTIMATE` 另給 `r2` 與 `comfort_noise`；4ch array 的 lane 用哪一級由陣列依它的 `residual` 衍生，不是 mono 範例的事。
@@ -188,9 +187,9 @@ mono 的設定分成兩份：lib/aec 的 `AecConfig`（格點與接縫欄位由�
 | 欄位 | 影響 pool 大小嗎 |
 |---|---|
 | `sample_rate`、`fft_size` | 會（改 grid、改 AEC filter 長度） |
-| `filter_length` | 會（有效範圍 `[1, 4096]`，`n_partitions` 由它與 hop 推導；16 kHz/256 把 832 改成 1664，AEC 那一塊多 61,824 B） |
+| 濾波器長度 | 不是欄位：由取樣率決定（8 kHz 416、16 kHz 832、48 kHz 3072 samples），隨 `sample_rate`／`fft_size` 一起改 pool |
 | `delay_mode` | 會（`MATCHED` 建 matched-filter estimator + 大 ring；`FIXED` 只建剛好夠用的小 ring；`EXTERNAL_ALIGNED` 兩者都不建，見 [§4.5a](#45a-delay_mode-對-16000預設-grid-的影響matched-n5-為-baseline)） |
-| `delay_num_filters` | 僅 `MATCHED` 有效：每少一個固定省 5,728 B（四格點皆同，與 `lib/aec` 一致） |
+| `delay_num_filters` | 僅 `MATCHED` 有效：每少一個省 11,264 B（8／16 kHz；48 kHz 為 23,552 B），因為單支的參考環隨 bank 大小成長 |
 | `fixed_delay_samples` | 僅 `FIXED` 有效：ring 大小 = `ALIGN16((fixed_delay_samples+hop)×4)` B |
 | `aec_level`、`nr_level` | 實測不變 |
 | 要不要建降噪器（`--no-nr`） | 會（不建就省下整份 MMSE-LSA state） |
@@ -214,12 +213,12 @@ mono 的設定分成兩份：lib/aec 的 `AecConfig`（格點與接縫欄位由�
 
 | Config | 總計 | AEC（`aec_get_mem_size`） | 合成 `AcIstft` | `nr_bytes` | 暫存 |
 |---|---:|---:|---:|---:|---:|
-| 8000，預設 | 291,056 | 249,856 | 10,320 | 28,784 | 2,096 |
-| 16000，預設（256/128） | 401,520 | 343,760 | 10,320 | 45,344 | 2,096 |
-| 16000，`fft_size=512` | 537,008 | 456,640 | 19,792 | 56,432 | 4,144 |
-| 48000，預設（1024/512） | 1,270,112 | 1,078,560 | 38,736 | 144,576 | 8,240 |
-| 16000，`--no-nr`（不建降噪器） | 356,176 | 343,760 | 10,320 | 0 | 2,096 |
-| 16000，`--aec-only`（STATE lane，不建後級） | 343,760 | 343,760 | – | – | – |
+| 8000，預設 | 252,752 | 211,552 | 10,320 | 28,784 | 2,096 |
+| 16000，預設（256/128） | 297,680 | 239,920 | 10,320 | 45,344 | 2,096 |
+| 16000，`fft_size=512` | 432,656 | 352,288 | 19,792 | 56,432 | 4,144 |
+| 48000，預設（1024/512） | 967,776 | 776,224 | 38,736 | 144,576 | 8,240 |
+| 16000，`--no-nr`（不建降噪器） | 252,336 | 239,920 | 10,320 | 0 | 2,096 |
+| 16000，`--aec-only`（STATE lane，不建後級） | 239,920 | 239,920 | – | – | – |
 
 總計 = `ALIGN16(AEC)` + `ALIGN16(nr_bytes)` + `ALIGN16(合成)` + 暫存（各塊對齊後相加）。合成 `AcIstft` 借用 AEC 的合成窗（`aec_synthesis_window()`），所以不帶自己的窗表（比各自帶窗少一個 `fft_size` 長的 float 向量）。
 
@@ -227,10 +226,10 @@ mono 的設定分成兩份：lib/aec 的 `AecConfig`（格點與接縫欄位由�
 
 | `delay_mode` | AEC 加後級合計 | 相對 `MATCHED n=5` |
 |---|---:|---:|
-| `MATCHED` n=5（預設） | 401,520 | — |
-| `MATCHED` n=1 | 378,608 | −22,912 |
-| `FIXED`，`fixed_delay_samples=1600`（100 ms） | 243,424 | −158,096 |
-| `EXTERNAL_ALIGNED` | 236,512 | −165,008 |
+| `MATCHED` n=5（預設） | 297,680 | — |
+| `MATCHED` n=1 | 252,624 | −45,056 |
+| `FIXED`，`fixed_delay_samples=1600`（100 ms） | 242,240 | −55,440 |
+| `EXTERNAL_ALIGNED` | 235,328 | −62,352 |
 
 這四列的差額全部落在 AEC 那一塊（`delay_mode`/`delay_num_filters` 不影響
 後級），數字與 `lib/aec` 自己的 `aec_get_mem_size()` 一致
@@ -275,7 +274,7 @@ mono 的設定分成兩份：lib/aec 的 `AecConfig`（格點與接縫欄位由�
 
 ### 5.3 `destroy()` 的語意
 
-`aec_destroy()` 與 `anr_destroy()` 都**不釋放**你的 pool；`aec_destroy()` NULL 安全、可重複呼叫（只放開實例內部的參照）；`anr_destroy()` 對 pool 實例立即返回，只有 `anr_create()` 的 heap 實例才釋放記憶體。`AcIstft` 沒有 destroy。
+`aec_destroy()` 與 `anr_destroy()` 都**不釋放**你的 pool；`aec_destroy()` NULL 安全，對 pool 實例可重複呼叫（只放開實例內部的參照），對 `aec_create()` 的實例則釋放那一塊、只能呼叫一次、之後指標作廢；`anr_destroy()` 對 pool 實例立即返回，只有 `anr_create()` 的 heap 實例才釋放記憶體。`AcIstft` 沒有 destroy。
 `posix_memalign` 之類由你配置的 pool，由你在 destroy 之後釋放。
 
 ### 5.4 診斷輸出去向

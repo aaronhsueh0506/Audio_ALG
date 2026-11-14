@@ -119,7 +119,7 @@ cc -std=gnu99 -O2 -Wall -Wextra -c app.c -o app.o \
   -I ../AEC/c_impl/include -I ../NR/c_impl/include \
   -I ../audiolib/common/include -I ../audiolib/common \
   -I pipelines/4ch \
-  -I ../audiolib/DOA -I ../audiolib/BF
+  -I ../audiolib/doa -I ../audiolib/bf
 c++ -o app app.o \
   "$obj/array_sample_beam.o" \
   "$(make -s -C ../audiolib print-doa-lib-path)" \

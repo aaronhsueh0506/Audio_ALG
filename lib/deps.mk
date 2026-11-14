@@ -3,10 +3,11 @@
 # Single source of truth for where this repo's three external producers -- AEC, NR and audiolib --
 # are read from, and at which commit each is pinned (lib/aec.pin, lib/nr.pin, lib/audiolib.pin).
 # Included by every Makefile that needs AEC_DIR / NR_DIR / AUDIOLIB_DIR / COMMON_DIR
-# (pipelines/Makefile, pipelines/4ch/Makefile, AINR/Makefile,
-# AINR/RNNoise-ERB/Makefile, AIAEC/Makefile, stream/ainr/dfn2/Makefile,
-# stream/aiaec/deepvqe_s/Makefile, stream/aiaec/ulcnet/Makefile) instead of each hardcoding its
-# own relative path.
+# (pipelines/Makefile, pipelines/4ch/Makefile, AINR/Makefile, AINR/RNNoise-ERB/Makefile,
+# AIAEC/Makefile, stream/common/Makefile, stream/ainr/Makefile, stream/ainr/dfn2/Makefile,
+# stream/aiaec/Makefile, stream/aiaec/deepvqe_s/Makefile, stream/aiaec/ulcnet/Makefile,
+# stream/aiaec/front/Makefile) instead of each hardcoding its own relative path; shell scripts
+# resolve the same values with `print-deps-sh` below.
 # Every value here is `?=`, so a caller that already set one on its command line or in its
 # environment keeps that value untouched; this file only supplies the default.
 #

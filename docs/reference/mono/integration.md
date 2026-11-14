@@ -64,17 +64,17 @@ Aec + RES + NR    處理 m[t] 處理 m[t+1] 處理 m[t+2]     （同一次呼叫
 |---|---|---|
 | 格點與 `AecConfig` | `aec_resolve_signal_grid()`、`aec_default_fft_size()`、`aec_config_from_level()`（`aec.h`） | `aec_resolve_signal_grid()` 回 `AEC_OK` = 有這組格點、`AEC_ERR_ARG` = 沒有；其餘接縫欄位由你設（[§4.1](lifecycle.md#41-aecconfig-的接縫欄位範例的-derive_lane)） |
 | 大小查詢 | `aec_get_mem_size()`（`aec.h`）、`anr_get_mem_size()`（`anr.h`）、`ac_istft_get_mem_size()`（`audio_stft.h`） | 回 `0` = config 無效 |
-| 建立 | `aec_init()`、`anr_init()`、`ac_istft_init()`；桌面也可 `aec_create()`、`anr_create()` | pool 路徑回 `NULL` = 失敗 |
+| 建立 | `aec_init()`、`anr_init()`、`ac_istft_init()`；桌面也可 `Aec* aec_create(const AecConfig*)`、`anr_create()` | 失敗回 `NULL`。`aec_create()` 是一塊 heap 配置，`aec_destroy()` 釋放它，之後指標作廢（不要再 `free()`）；`aec_init()` 的 pool 實例由呼叫端持有 |
 | 每 hop | `aec_process_linear()`、`aec_process_residual()`、`aec_get_residual()`、`aec_apply_gain()`、`aec_apply_cng()`（`aec.h`）、`anr_process_gain_with_residual_psd()`（沒有殘留回音 PSD 時傳 NULL；`anr.h`）、`sk_scale_f32()`（`utility/simd_kernels.h`）、`ac_istft_push()`；選用 `skn_all_finite_f32()`（`utility/simd_kernel_nn.h`） | 順序見 [§0.1](#01-流程時序圖monoaec-加逐個初始化的函式庫) |
 | 只要線性 AEC | lane 設 `residual = AEC_RESIDUAL_STATE`，`aec_process_linear()`、`aec_process_residual()` 之後 `aec_get_linear()`，輸出取 `AecLinearView.linear_hop` | 範例的 `--aec-only` 這樣做；`aec_process()` 是函式庫的時域便利入口，`residual` 低於 `AEC_RESIDUAL_FULL` 時回傳同一個 hop |
 | 強度 | `aec_set_level()`、`anr_set_level()`（需要整組覆寫時 `anr_reconfigure()`） | [§3.2](lifecycle.md#32-執行期強度控制) |
 | 重置／收尾 | `aec_reset()`、`anr_reset()`、`ac_istft_reset()`、`aec_destroy()`、`anr_destroy()` | [§3](lifecycle.md#3-lifecycle)、[§5](lifecycle.md#5-錯誤處理) |
 | 診斷（唯讀） | `aec_debug_status()`、`anr_debug_status()`、`aec_get_last_timing()` | [§3.1](lifecycle.md#31-執行期唯讀存取)、[§3.1b](lifecycle.md#31b-逐階段耗時診斷用) |
 
-**內部函式（不要依賴，隨版本改變）**：`aec.h` 以外的 AEC 內部標頭（`pbfdkf.h`、`delay_aec.h`、`aec_post.h`、
-`suppression_gain.h`、`aec_config_build.h`、`aec_balanced_config.h`）；NR 的 `noise_estimator.h`、`spp_estimator.h`、
+**內部函式（不要依賴，隨版本改變）**：AEC 的內部標頭在函式庫的 `src/`（`pbfdkf.h`、`delay_aec.h`、`aec_post.h`、
+`suppression_gain.h`、`aec_config_build.h`、`aec_tuning.h` 等），不在 include 路徑上；`include/` 只有 `aec.h`、`aec_internal.h`、`aec_balanced_config.h`、`aec_debug.h`；NR 的 `noise_estimator.h`、`spp_estimator.h`、
 `anr_internal.h`，以及 `anr_apply_*_experiment()`；audiolib 的 `utility/` 內核（除上表列出的 `sk_*`、`ALIGN16` 外）。
-`struct Aec` 目前整個攤在 `aec.h` 裡，只是因為 C 需要完整型別；欄位是內部，只能經由函式存取。
+`Aec` 是不透明型別（`aec.h` 只有 `typedef struct Aec Aec;`，本體在函式庫的 `src/aec_impl.h`）：不能 `sizeof(Aec)`、不能宣告 `Aec` 變數、沒有欄位可讀，只能經由函式存取。
 
 ### 0.3 參數面：外部與內部
 
@@ -83,32 +83,23 @@ Aec + RES + NR    處理 m[t] 處理 m[t+1] 處理 m[t+2]     （同一次呼叫
 | 名稱 | 位置 | 範圍／預設 | 何時設定 | 作用 |
 |---|---|---|---|---|
 | `sample_rate`、`fft_size` | `aec_resolve_signal_grid()`、`AecConfig.fft_size`（`aec.h`） | 8000／16000／48000；`fft_size` 取 `aec_default_fft_size(sr)`（0 = 不支援的 rate），16 kHz 另可 256／512 | init 前，之後不可變 | 決定格點（[§4.3](lifecycle.md#43-grid由-sample_rate--fft_size-唯一決定)）；改了要重查所有大小 |
-| `filter_length` | `AecConfig`（`aec.h`） | `aec_config_from_level()` 依 rate 填預設；有效範圍 `[1, 4096]`，範圍外 `aec_get_mem_size()` 回 `0` | init 前 | 回聲路徑長度（taps）；越長記憶體與算量越大 |
 | `delay_mode`、`delay_num_filters`、`fixed_delay_samples` | `AecConfig` | `MATCHED`（預設，bank 1..5，預設 5）／`FIXED`（已知延遲）／`EXTERNAL_ALIGNED`（上游已對齊） | init 前，之後不可變 | 對齊方式；決定 pool 版面（[§4.4](lifecycle.md#44-哪些欄位會改變記憶體用量)、[§4.5a](lifecycle.md#45a-delay_mode-對-16000預設-grid-的影響matched-n5-為-baseline)） |
-| `aec_config_from_level()` 的 `level` 引數 | `aec.h` | `MILD`／`BALANCED`（預設）／`AGGRESSIVE`／`NO_FLOOR`；enum 外時退回 balanced | init 前；執行期用下一列 | 回聲抑制 vs 近端保留的單一取捨軸 |
+| `AecConfig.level`（`aec_config_from_level(&cfg, level, sr)` 寫入） | `aec.h` | `MILD`(0)／`BALANCED`(1，預設)／`AGGRESSIVE`(2)／`NO_FLOOR`(3)；`aec_config_from_level()` 對 enum 外存成 balanced，手填的 `level` 不在 0..3 會被拒絕 | init 前；執行期用下一列 | 回聲抑制 vs 近端保留的單一取捨軸 |
 | `aec_set_level(aec, level)` | `aec.h` | level 在 enum 內（ramp 固定 100 ms） | 兩個 hop 之間 | 執行期換 AEC 強度；回 `-1` 時什麼都不寫 |
 | NR 強度 | `AnrLevel`（`anr_types.h`）：`anr_config_for_level_grid()`、`anr_set_level()` | `MILD`／`MODERATE`／`BALANCED`（預設）／`AGGRESSIVE` | init 前或兩個 hop 之間 | 降噪深度的單一入口（一次調 `g_min_db`、`q`、`xi_min_db`、`noise_over_subtraction`） |
 | 後級開關（範例程式的欄位，不是函式庫 config） | `PostPlan`（`mono/aec_nr_res/main.c`）；CLI `--no-res`、`--no-nr`、`--no-cng`、`--legacy-amin` | 各 0／1 | init 前 | RES 增益用不用、要不要建降噪器、CNG、NR 是否折入 R²（[§4.2](lifecycle.md#42-後級選項範例程式的欄位與-cli-旗標)） |
 
-進階外部（選擇性；改了以後自己重跑三個 grid 的驗證）：`AecConfig` 的 `enable_cng`（`aec.h`，下游已有舒適噪音時關）、
-`enable_highpass`／`highpass_cutoff_hz`（`aec.h`，上游已有高通時關；開啟時截止頻率須 `> 0` 且低於 `0.45 × sample_rate`）、
-`enable_shadow`（`aec.h`，關掉省記憶體但路徑突變後恢復變慢）、`delay_est_period_s`（`aec.h`，預設 0 = 每 hop 全速分析；非 0 會省算力，但可能改變選到的 lag）。這些在 `aec_config_from_level()` 之後、`aec_get_mem_size()` 之前直接改 `aec_cfg`。
+進階外部（選擇性；改了以後自己重跑三個 grid 的驗證）：`AecConfig.enable_cng`（`aec.h`，下游已有舒適噪音時關）。`AecConfig` 只有 12 個公開欄位；濾波器長度、HPF、shadow、飽和處理與所有門檻都不是欄位，由函式庫依 `(sample_rate, fft_size, n_mics, level)` 決定。
 
 **內部（存在、可調，但不建議開放）**
 
 | 家族 | 位置 | 為什麼不開放 |
 |---|---|---|
 | 範例 `derive_lane()` 固定的接縫：`residual = AEC_RESIDUAL_FULL`（預設值；`OFF`／`STATE`／`ESTIMATE` 依序少給 `res_gain`、`r2`／`comfort_noise` 等） | `aec.h` 的 `AecConfig.residual`；`mono/aec_nr_res/main.c` 的 `derive_lane()` | 低於 `FULL` 就沒有 `v.res_gain`，`aec_apply_gain()` 回 `AEC_ERR_MODE`，串接整個失效 |
-| 以 10 ms 格點撰寫、建立時 retime 的時間欄位：`warmup_frames`、`epc_hangover`、`ne_recent_hold`、`filter_misadjustment_*_frames`、`shadow_err_alpha` | `aec.h` | 單位是「N × 10 ms」，不是 hop 數；填錯單位會靜默失效 |
-| 適應步進與模型不確定度：`mu`、`delta`、`kalman_q_high`、`kalman_q_low`、`shadow_mu_*`、`epc_mu_floor` | `aec.h` | 決定收斂與發散邊界；驗證器範圍很寬，範圍內多數值不收斂 |
-| 偵測門檻：`epc_*`、`ne_recent_*`、`saturation_threshold`、`filter_misadjustment_scale_*` | `aec.h` | 與其他偵測器聯合調過；`scale_min > scale_max` 不會被驗證器擋 |
-| 延遲獲取策略：`delay_acquire_*`、`delay_est_init_s`、`max_delay_ms`、`delay_buffer_ms`（`delay_est_period_s` 是上面的進階外部） | `aec.h` | 影響冷啟動；`max_delay_ms`／`delay_buffer_ms` 只決定搜尋環大小，不是可擷取上限（上限由 `delay_num_filters` 決定） |
-| Double-talk 政策與 floor：`dt_aware_*`、`min_gain_floor_*_db`、`min_gain_split_floor_enabled` | `aec.h` | 三個 floor 欄位已由 `aec_level`／`aec_set_level()` 成組設定；單獨改 dB 值會得到沒有物理意義的 floor |
-| 預設關閉的實驗：`live_observer_*`、`cng_n2_windowed_psd` | `aec.h` | 未通過 default-on 門檻；observer 開啟會增加 pool 與算量 |
-| 衍生值：`n_partitions` | `aec.h` | 由 `filter_length` 與 hop 推導，手填只會造成不一致 |
+| AEC 的全部調校值（濾波器長度與步進、shadow、HPF、飽和處理、EPC／近端偵測門檻、延遲獲取策略、double-talk 與 floor 常數、預設關閉的實驗、以 10 ms 格點撰寫的時間欄位） | 函式庫內部的 `AecTuning`（`src/aec_tuning.h`），不在 `aec.h` | 由 `aec_resolve()` 依 `(sample_rate, fft_size, n_mics, level)` 建立並在建立時 retime，呼叫端沒有設定入口；level 的三個 floor 值隨 `AecConfig.level`／`aec_set_level()` 成組改變 |
 | `SuppressionGainConfig`、`AecPostConfig`、`AecStateConfig`、`aec_balanced_config.h` 的常數 | AEC 內部標頭 | 編譯期依 `(sample_rate, fft_size)` 查表，runtime 改不了，也不該提供接口 |
-| NR 的追蹤器與平滑欄位：`alpha_xi`、`alpha_s`、`alpha_d`、`alpha_p`、`alpha_attack`、`alpha_decay`、`delta_db`、`scene_change_*`、`speech_protect_*`、`speech_aware_*`、`noise_gate_*`、`makeup_*`、`cross_band_*` | `anr_types.h:66-120` | 聯合調出的操作點，四個 `AnrLevel` 共用；`alpha_g` 在增益路徑上沒有作用（`anr_types.h:117`） |
-| NR 的 `L`、`num_init_frames` | `anr_types.h:104,106` | 決定 pool 版面，`anr_reconfigure()` 與 `anr_set_level()` 不能改它們；範例用函式庫預設 |
+| NR 的追蹤器與平滑欄位：`alpha_xi`、`alpha_s`、`alpha_d`、`alpha_p`、`alpha_attack`、`alpha_decay`、`delta_db`、`scene_change_*`、`speech_protect_*`、`speech_aware_*`、`noise_gate_*`、`makeup_*`、`cross_band_*` | `AnrConfig`（`anr_types.h`）的同名欄位 | 聯合調出的操作點，四個 `AnrLevel` 共用；`AnrConfig.alpha_g` 在增益路徑上沒有作用 |
+| NR 的 `L`、`num_init_frames` | `AnrConfig.L`、`AnrConfig.num_init_frames`（`anr_types.h`） | 決定 pool 版面，`anr_reconfigure()` 與 `anr_set_level()` 不能改它們；範例用函式庫預設 |
 
 ---
 
@@ -189,7 +180,7 @@ mono 的 RES 是明確的例外：它在 `Aec` 的呼叫裡（`aec_process_resid
 -I <audiolib>/common
 ```
 
-`pipelines/Makefile` 自己建置範例時的 `-I` 清單比這個長（多了 `lib/aec/c_impl/example`，給 CLI 的 WAV I/O 用，以及 AIAEC／AINR 的目錄），
+`pipelines/Makefile` 自己建置範例時的 `-I` 清單比這個長（多了 `../AEC/c_impl/example`，給 CLI 的 WAV I/O 用，以及 AIAEC／AINR 的目錄），
 consumer 不需要。語言標準：以 `-std=gnu99` 建置；
 NE10 後端的 header 需要 GNU 擴充，所以你的 TU 也請用 `gnu99`（或以上的 GNU 方言）。
 
@@ -244,7 +235,7 @@ int main(void) {
     aec_config_from_level(&aec_cfg, AEC_LEVEL_BALANCED, sample_rate);
     aec_cfg.fft_size = grid.fft_size;
     aec_cfg.delay_mode = AEC_DELAY_MATCHED;
-    aec_cfg.delay_num_filters = DA_NUM_FILTERS;
+    aec_cfg.delay_num_filters = AEC_DELAY_NUM_FILTERS_MAX;
     aec_cfg.fixed_delay_samples = -1;
     aec_cfg.residual = AEC_RESIDUAL_FULL;                          /* the lane keeps its own RES gain (the default) */
     const int n = grid.n_freqs;

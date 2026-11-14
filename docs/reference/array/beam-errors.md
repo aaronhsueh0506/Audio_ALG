@@ -108,7 +108,7 @@ lane 的 far 頻譜不一致、lane 頻譜非有限、投影溢位時回 `AEC_ER
 | 呼叫 | 行為 |
 |---|---|
 | `aec_destroy(aec)`（`aec_init()`／`init_ex()` 的 caller-owned pool） | **不釋放**你的 pool。NULL 安全、冪等 |
-| `aec_destroy(aec)`（`aec_create()`，heap） | 釋放 `aec_create()` 配置的那一塊。遵循一般 `free()` 語意：**只能呼叫一次** |
+| `aec_destroy(aec)`（`aec_create()`，heap） | 釋放 `aec_create()` 配置的那一塊（`Aec` 與 pool 同在其中）。遵循一般 `free()` 語意：**只能呼叫一次**，指標之後作廢，不要再 `free()` |
 | `array_sample_beam_destroy(b)` | 先 `bf_destroy()` 再 `srp_destroy()`（BF 借用 SRP 的 steering 表）；不釋放 helper 的 pool，也不動 array。NULL 安全、冪等 |
 
 拆除順序：helper → `aec_destroy()`。destroy 之後不要再呼叫任何 accessor。

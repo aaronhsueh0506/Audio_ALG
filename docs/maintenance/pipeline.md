@@ -16,8 +16,8 @@ code, so the whole `pipelines/` tree is collected, not only `pipelines/tests`):
 python3 -m pytest -q pipelines
 ```
 
-The source-text guards in that tree read the AEC library's headers (`aec.h`,
-`aec_post.h`, `aec_balanced_config.h`) from the same place `lib/deps.mk` points
+The source-text guards in that tree read the AEC library's public headers (`aec.h`,
+`aec_balanced_config.h`) and, for the parity hash, its `src/aec_impl.h` from the same place `lib/deps.mk` points
 the build at: `AEC_DIR` from the environment (absolute path), else the sibling
 `../AEC/c_impl`. They pin `AEC_LAYOUT_VERSION` against the docs
 (`pipelines/tests/test_doc_layout_versions.py`), the comfort-noise floor and
@@ -202,7 +202,7 @@ Pass conditions:
       samples) and a pass-band tolerance against the conventional NR-off
       output. The native path is a tolerance, NOT a memcmp.
 - [ ] The build produces `libdfn_res_stage.a` (carrying
-      `dfn_rate_bridge.o`); `AEC_LAYOUT_VERSION` is 1 (the `Aec` pool, array included).
+      `dfn_rate_bridge.o`); `AEC_LAYOUT_VERSION` is 2 (the `Aec` pool, array included).
 
 ### 9.1 Real four-microphone validation
 

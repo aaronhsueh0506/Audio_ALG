@@ -148,10 +148,10 @@ while (read_block(pcm_in, hop_in)) {
 <table>
 <thead><tr><th>組態</th><th>主機替身</th><th>PyTorch</th><th>ONNX Runtime</th><th>正式 bin</th><th>板端</th></tr></thead>
 <tbody>
-<tr><th>full 16 kHz／256／N=1</th><td>已驗：PCM 與 <code>dfn2_stream</code> 參考逐位元相同；<code>_spec</code>／<code>_freq</code> 逐位元相同；三個家族的排尾；work 形狀（<code>test-ainr-work-shapes</code>）；連結往返</td><td>未驗（此 grid）</td><td>未驗</td><td>未驗</td><td>未驗</td></tr>
-<tr><th>full 16 kHz／256／N=8</th><td>已驗：PCM 兩包與 <code>dfn2_stream</code> 參考逐位元相同；三個家族的排尾；work 形狀（<code>test-ainr-work-shapes</code>）。<code>_spec</code>／<code>_freq</code> 的逐位元比對只在 N=1 與 N=4 的核心做過，N=8 未做</td><td>未驗（此 grid）</td><td>未驗</td><td>登錄的路徑存在；交付與是否相符未驗</td><td>未驗</td></tr>
-<tr><th>full 48 kHz／1024／N=1</th><td>已驗：<code>_spec</code>／<code>_freq</code> 逐位元相同；三個家族的排尾；work 形狀（<code>test-ainr-work-shapes</code>）；連結往返</td><td>已驗（隨機小 checkpoint，同 grid、同 N）</td><td>未驗</td><td>未驗</td><td>未驗</td></tr>
-<tr><th>lite 48 kHz／1024／N=1</th><td>已驗：三個家族的排尾；work 形狀（<code>test-ainr-work-shapes</code>）；產品綁定；連結往返</td><td>已驗（隨機小 checkpoint 的 mask-only 圖，同 grid、同 N）</td><td>未驗</td><td>未驗</td><td>未驗</td></tr>
+<tr><th>full 16 kHz／256／N=1</th><td>已驗：PCM 與 <code>dfn2_stream</code> 參考逐位元相同；<code>_spec</code>／<code>_freq</code> 逐位元相同；三個家族的排尾；work 形狀（<code>test-ainr-model-io</code>）；連結往返</td><td>未驗（此 grid）</td><td>未驗</td><td>未驗</td><td>未驗</td></tr>
+<tr><th>full 16 kHz／256／N=8</th><td>已驗：PCM 兩包與 <code>dfn2_stream</code> 參考逐位元相同；三個家族的排尾；work 形狀（<code>test-ainr-model-io</code>）。<code>_spec</code>／<code>_freq</code> 的逐位元比對只在 N=1 與 N=4 的核心做過，N=8 未做</td><td>未驗（此 grid）</td><td>未驗</td><td>登錄的路徑存在；交付與是否相符未驗</td><td>未驗</td></tr>
+<tr><th>full 48 kHz／1024／N=1</th><td>已驗：<code>_spec</code>／<code>_freq</code> 逐位元相同；三個家族的排尾；work 形狀（<code>test-ainr-model-io</code>）；連結往返</td><td>已驗（隨機小 checkpoint，同 grid、同 N）</td><td>未驗</td><td>未驗</td><td>未驗</td></tr>
+<tr><th>lite 48 kHz／1024／N=1</th><td>已驗：三個家族的排尾；work 形狀（<code>test-ainr-model-io</code>）；產品綁定；連結往返</td><td>已驗（隨機小 checkpoint 的 mask-only 圖，同 grid、同 N）</td><td>未驗</td><td>未驗</td><td>未驗</td></tr>
 <tr><th><code>uvc_ai_nr_stream</code>（PCM → PCM，48 kHz／1024／N=1）</th><td>PCM 家族的上述項目已驗；sample 本身的重採樣與 AI3 接線未在本庫建置或驗證</td><td>—</td><td>未驗</td><td>未驗</td><td>未驗</td></tr>
 <tr><th><code>uvc_audio_live2a</code>（E／P 頻譜 → 頻譜，經 rate bridge）</th><td><code>_freq</code> 家族的上述項目已驗；bridge 與 AI3 接線未在本庫建置或驗證</td><td>—</td><td>未驗</td><td>未驗</td><td>未驗</td></tr>
 </tbody></table>

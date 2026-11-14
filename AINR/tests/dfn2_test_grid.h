@@ -30,15 +30,7 @@
 #include <stdlib.h>
 #include <string.h>
 
-#if defined(__has_include)
-#if __has_include("dfn2_prepost.h")
-#include "dfn2_prepost.h"
-#else
-#include "DeepFilterNet2/dfn2_prepost.h"
-#endif
-#else
-#include "DeepFilterNet2/dfn2_prepost.h"
-#endif
+#include "../../lib/ainr/dfn2/dfn2_prepost.h"
 
 #ifdef DFN2_SR
 #ifdef DFN2_GRID_KHZ

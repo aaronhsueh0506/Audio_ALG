@@ -88,13 +88,6 @@ static const AinrDfn2FramesVariant AINR_DFN2_FULL_16K_256_N_16X16[] = {
 static const AinrDfn2FramesVariant AINR_DFN2_FULL_48K_1024_N_16X16[] = {
     { 1, AINR_MODEL_DIR_BASE "/16x16/dfn2/nvt_model_48k_n1.bin" },   /* shipped grid */
 };
-// static const AinrDfn2FramesVariant AINR_DFN2_FULL_16K_256_N_8X8[] = {
-//     { 1, AINR_MODEL_DIR_BASE "/8x8/dfn2/nvt_model_16k_n1.bin" },
-//     { 8, AINR_MODEL_DIR_BASE "/8x8/dfn2/nvt_model_16k_n8.bin" },
-// };
-// static const AinrDfn2FramesVariant AINR_DFN2_FULL_48K_1024_N_8X8[] = {
-//     { 1, AINR_MODEL_DIR_BASE "/8x8/dfn2/nvt_model_48k_n1.bin" },
-// };
 static const AinrDfn2FramesVariant AINR_DFN2_FULL_16K_256_N_16X8[] = {
     { 1, AINR_MODEL_DIR_BASE "/16x8/dfn2/nvt_model_16k_n1.bin" },
     { 8, AINR_MODEL_DIR_BASE "/16x8/dfn2/nvt_model_16k_n8.bin" },
@@ -108,10 +101,6 @@ static const AinrDfn2ModelEntry AINR_DFN2_CATALOG[] = {
       AINR_DFN2_FULL_16K_256_N_16X16, 2 },
     { AINR_MODEL_ID_DFN2_FULL,      48000, 1024, 32, 96, 5, 1, 1, 0.0f, 0, 0.0f,
       AINR_DFN2_FULL_48K_1024_N_16X16, 1 },
-    // { AINR_MODEL_ID_DFN2_FULL_ALT1, 16000, 256,  24, 96, 5, 0, 0, 0.0f, 0, 0.0f,
-    //   AINR_DFN2_FULL_16K_256_N_8X8, 2 },
-    // { AINR_MODEL_ID_DFN2_FULL_ALT1, 48000, 1024, 32, 96, 5, 1, 1, 0.0f, 0, 0.0f,
-    //   AINR_DFN2_FULL_48K_1024_N_8X8, 1 },
     { AINR_MODEL_ID_DFN2_FULL_ALT2, 16000, 256,  24, 96, 5, 0, 0, 0.0f, 0, 0.0f,
       AINR_DFN2_FULL_16K_256_N_16X8, 2 },
     { AINR_MODEL_ID_DFN2_FULL_ALT2, 48000, 1024, 32, 96, 5, 1, 1, 0.0f, 0, 0.0f,
@@ -126,9 +115,6 @@ static const AinrDfn2ModelEntry AINR_DFN2_CATALOG[] = {
 static const AinrDfn2FramesVariant AINR_DFN2_LITE_48K_1024_N_16X16[] = {
     { 1, AINR_MODEL_DIR_BASE "/16x16/dfn2_lite/nvt_model_48k_n1.bin" },
 };
-// static const AinrDfn2FramesVariant AINR_DFN2_LITE_48K_1024_N_8X8[] = {
-//     { 1, AINR_MODEL_DIR_BASE "/8x8/dfn2_lite/nvt_model_48k_n1.bin" },
-// };
 static const AinrDfn2FramesVariant AINR_DFN2_LITE_48K_1024_N_16X8[] = {
     { 1, AINR_MODEL_DIR_BASE "/16x8/dfn2_lite/nvt_model_48k_n1.bin" },
 };
@@ -136,8 +122,6 @@ static const AinrDfn2FramesVariant AINR_DFN2_LITE_48K_1024_N_16X8[] = {
 static const AinrDfn2ModelEntry AINR_DFN2_CATALOG[] = {
     { AINR_MODEL_ID_DFN2_LITE,      48000, 1024, 32, 96, 0, 1, 0, 0.0f, 0, 0.0f,
       AINR_DFN2_LITE_48K_1024_N_16X16, 1 },
-    // { AINR_MODEL_ID_DFN2_LITE_ALT1, 48000, 1024, 32, 96, 0, 1, 0, 0.0f, 0, 0.0f,
-    //   AINR_DFN2_LITE_48K_1024_N_8X8, 1 },
     { AINR_MODEL_ID_DFN2_LITE_ALT2, 48000, 1024, 32, 96, 0, 1, 0, 0.0f, 0, 0.0f,
       AINR_DFN2_LITE_48K_1024_N_16X8, 1 },
 };
@@ -149,7 +133,6 @@ static const AinrDfn2ModelEntry AINR_DFN2_CATALOG[] = {
  * family, MODEL-scale spectra ([i][re(n_bins)][im(n_bins)]) for the other two; NULL when n == 1.
  * scratch (_freq only) is one frame of MODEL-scale est/app input, 4 * n_bins floats. */
 typedef struct AinrCore {
-    AinrConfig   cfg;
     DFN2Stream  *inner;
     DFN2Grid     grid;
     int          n;            /* frames_per_call */
@@ -359,7 +342,6 @@ static int ainr_init_common(AinrFamily family, const AinrConfig *cfg, const char
                                                     (size_t)lay.sreq.bytes);
     if (!lay.core->inner) return AINR_ERR_ERB_FILE;
 
-    lay.core->cfg = *cfg;
     lay.core->grid = grid;
     lay.core->n = n;
     lay.core->stash = lay.stash;
