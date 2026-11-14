@@ -23,7 +23,8 @@ Firmware         Aec (mono: 1 mic | 4ch: n_mics = 4)       AnrDenoiser          
    |-- aec_get_residual -->|  v{error_spec, base_spec, r2, comfort_noise, res_gain (FULL), post_reset_serial, ...}
    |      (error_spec is the analysis seam; the gain is applied to base_spec; 4ch: the one G_res is computed over the fused spectra)
    |-- v.post_reset_serial moved: ac_istft_reset (before the CNG draw and the push; the library reseeds its own comfort noise)
-   |-- anr_process_gain_with_residual_psd (mono: on base_spec; 4ch: array_sample_anr_gain, on error_spec) -->|  G_nr
+   |-- anr_process_gain_with_residual_psd (mono: on base_spec, the spectrum the gain is applied to; 4ch: array_sample_anr_gain, on error_spec = the beam E) -->|  G_nr
+   |      (the two spectra differ only on a hop where an output guard fired; board samples outside the repository may feed error_spec in mono: a known difference)
    |-- aec_apply_gain(aec, G_nr, P), aec_apply_cng(aec, G_nr, P)   (P = base * min(G_nr, G_res) + comfort noise)
    |-- ac_istft_push ------------------------------------------------>|  out[hop]   (1 hop behind the input)
    |== refused call or non-finite output =======================================

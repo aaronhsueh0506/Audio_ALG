@@ -1793,6 +1793,12 @@ static void test_examples_cli_values(const char* bin_dir) {
         "--nr-level moderate", "--nr-level 4", "--nr-level -1", "--nr-level 2x", "--nr-level ''",
         "--nr-preset balanced", "--nr-preset 4", "--fft-size 256 bogus", "bogus 1",
     };
+    /* A token no branch takes is a command-line error (exit 2), not ignored: an unknown option, "--print-mem-size"
+     * after the three paths, and a positional that is not a level ("-1", "-x", a lone "-"). */
+    static const char* const unknown_arg[] = {
+        "--bogus", "--", "--print-mem-size", "-1", "-x", "-", "1 --bogus", "--bogus 1", "--no-res -1",
+        "--nr-level 0 --bogus", "--aec-level 1 -1", "--fft-size 256 --sample-rate 16000", "--Aec-only",
+    };
     /* A number option is a whole decimal integer. */
     static const char* const bad_number[] = {
         "--fft-size 256x", "--fft-size x256", "--fft-size ''", "--fft-size 2.5", "--fft-size ' 256'",
@@ -1817,6 +1823,17 @@ static void test_examples_cli_values(const char* bin_dir) {
             CHECK(example_exit_is(bin, args, 2),
                   fmt_msg("%s %s: not a level, exit 2", programs[pi], bad_level[ci]));
         }
+        for (ci = 0; ci < sizeof unknown_arg / sizeof unknown_arg[0]; ++ci) {
+            snprintf(args, sizeof args, "no_mic.wav no_ref.wav no_out.wav %s", unknown_arg[ci]);
+            CHECK(example_exit_is(bin, args, 2),
+                  fmt_msg("%s %s: unknown option or malformed argument, exit 2", programs[pi], unknown_arg[ci]));
+        }
+        CHECK(example_output_has(bin, "no_mic.wav no_ref.wav no_out.wav --bogus", "unknown option or malformed argument") &&
+                  example_output_has(bin, "no_mic.wav no_ref.wav no_out.wav -1", "unknown option or malformed argument") &&
+                  example_output_has(bin, "no_mic.wav no_ref.wav no_out.wav --bogus", "Usage:"),
+              fmt_msg("%s an unknown argument is named and the usage follows", programs[pi]));
+        CHECK(example_exit_is(bin, "no_mic.wav no_ref.wav no_out.wav --legacy-amin --debug --timing --no-nr --no-res --no-cng --aec-only", 1),
+              fmt_msg("%s every known flag still reaches the input check", programs[pi]));
         for (ci = 0; ci < sizeof bad_number / sizeof bad_number[0]; ++ci) {
             snprintf(args, sizeof args, "no_mic.wav no_ref.wav no_out.wav %s", bad_number[ci]);
             CHECK(example_exit_is(bin, args, 2),
@@ -1863,6 +1880,12 @@ static void test_examples_cli_values(const char* bin_dir) {
           "aec_nr_pipeline_static --print-mem-size --aec-level with --nr-level: exit 0");
     CHECK(example_exit_is(bin, "--print-mem-size 3 --nr-level 3 --fft-size 256", 0),
           "aec_nr_pipeline_static --print-mem-size --nr-level with an AEC level: exit 0");
+    CHECK(example_exit_is(bin, "--print-mem-size --bogus", 2) && example_exit_is(bin, "--print-mem-size --", 2) &&
+              example_exit_is(bin, "--print-mem-size -1", 2) && example_exit_is(bin, "--print-mem-size -", 2) &&
+              example_exit_is(bin, "--print-mem-size 1 --bogus", 2) && example_exit_is(bin, "--print-mem-size --print-mem-size", 2),
+          "aec_nr_pipeline_static --print-mem-size with an unknown option or a malformed positional: exit 2");
+    CHECK(example_exit_is(bin, "--print-mem-size --legacy-amin --debug --timing --aec-only --no-nr", 0),
+          "aec_nr_pipeline_static --print-mem-size with the run flags: exit 0, as before");
     CHECK(example_exit_is(bin, "--print-mem-size 1 2", 2),
           "aec_nr_pipeline_static --print-mem-size 1 2: a second AEC level, exit 2");
     CHECK(example_exit_is(bin, "--print-mem-size 0 0", 2),

@@ -58,6 +58,11 @@ every hop the guard leaves alone and does not pair with `formed_hop` on a guard 
   `AEC_RESIDUAL_FULL`) sample for sample, comfort noise on or off: the synthesis uses the AEC's window table
   (`aec_synthesis_window()` of the initialised `Aec`), not audiolib's default window, which differs in the last float bit.
 
+The four-channel chain hands the denoiser `error_spec` (the beamformer output E) instead; the gain is still applied to
+`base_spec`, and the two differ only on a hop where a lane's output guard fired. Board samples outside this repository
+(for example `alg_audio_aec_nr.c`) currently feed `error_spec` to the denoiser in mono: a known difference, not a
+recommendation.
+
 ### The hard post-chain reset event
 
 A hard reset of the AEC post chain (a confirmed delay change that restarts the filter, the first acquisition without
@@ -95,6 +100,10 @@ Per-flow detail with return values: section 0 of
 [mono 整合](../../../docs/reference/mono/integration.md#0-速覽流程時序圖公開內部函式外部內部參數).
 
 Command line of the two binaries built from `main.c` (`example_board_adapter.c` takes none):
+
+An unknown option (`--bogus`, a lone `--`) or a positional that is not an AEC level (`-1`, `-x`, a lone `-`) prints
+`unknown option or malformed argument '<token>'` and the usage to stderr and exits 2, in both binaries and in the
+`--print-mem-size` path; nothing is skipped silently.
 
 | Argument | Meaning | Default |
 |---|---|---|

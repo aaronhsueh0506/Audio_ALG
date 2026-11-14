@@ -45,10 +45,10 @@ BIN="$(make -s -C pipelines print-bin-dir)"
 | `--debug` | flag | off | 每秒一行 AEC+NR 狀態（read-only，不影響輸出） |
 | `--timing` | flag | off | 結束時印每個階段的平均耗時；AEC 的列需要 `make PROFILE=1` |
 
-level 的值不是 `0`..`3` 的一位數字（名稱、`4`、`03`、空字串）一律 exit 2。以 `-` 開頭的 token 會被當成選項，未知的選項被忽略（exit 0、不報錯），所以位置參數寫成 `-1` 不會被拒絕，而是被略過、AEC level 維持預設。
+level 的值不是 `0`..`3` 的一位數字（名稱、`4`、`03`、空字串）一律 exit 2。未知的選項（例如 `--bogus`、單獨的 `--`）和不是 level 的位置參數（`-1`、`-x`、單獨的 `-`）一律在 stderr 印出 `unknown option or malformed argument '<token>'` 與 usage，exit 2；`--print-mem-size` 路徑相同。第 1 個 token 之外的 `--print-mem-size` 也是未知選項。
 
 `aec_nr_pipeline_static` 另有 `--print-mem-size [aec-level] [--nr-level <level>] [--aec-only] [--no-nr] [--no-res] [--no-cng]
-[--sample-rate <hz>] [--fft-size <n>]`（`--sample-rate`／`--fft-size` 不是十進位整數 exit 2）：印出 pool 預算並真的在那塊 pool 上 init 每個 stage 後結束，不讀 WAV；`aec_nr_pipeline` 沒有這個模式。
+[--sample-rate <hz>] [--fft-size <n>]`（`--sample-rate`／`--fft-size` 不是十進位整數 exit 2；`--legacy-amin`／`--debug`／`--timing` 照舊可以帶，對預算沒有作用）：印出 pool 預算並真的在那塊 pool 上 init 每個 stage 後結束，不讀 WAV；`aec_nr_pipeline` 沒有這個模式。
 
 `delay_mode`／`delay_num_filters`／`fixed_delay_samples`
 （`AecConfig` 的欄位，見 `aec.h`；濾波器長度由取樣率決定，不是欄位）**沒有對應 CLI 旗標**；
@@ -57,7 +57,7 @@ level 的值不是 `0`..`3` 的一位數字（名稱、`4`、`03`、空字串）
 非預設 delay mode 得直接寫 C 改 `AecConfig` 後呼叫 `aec_get_mem_size()`／`aec_init()`
 （或改 CLI 原始碼），見 [設定參考](../../html/pipelines/mono/aec-nr-res/reference/configuration.html)。
 
-`aec_nr_pipeline` 的 level 與數字選項一律嚴格解析（`common/example_cli.h`）：level 只收上表的一位數字，`--fft-size`／`--sample-rate` 只收完整的十進位整數，其他一律 exit 2；`--nr-level`／`--aec-level`／`--fft-size`（`--print-mem-size` 路徑另含 `--sample-rate`）後面直接接另一個 `--` 選項或行尾時視為缺值，exit 2。未知的 dash option 不報錯（被忽略）。DFN2／ULCNet 範例與 `4ch_raw`、`4ch_static`、`4ch_external_static` 走同一份嚴格解析（見 [`pipelines/README.md`](../../../pipelines/README.md)）。
+`aec_nr_pipeline` 的 level 與數字選項一律嚴格解析（`common/example_cli.h`）：level 只收上表的一位數字，`--fft-size`／`--sample-rate` 只收完整的十進位整數，其他一律 exit 2；`--nr-level`／`--aec-level`／`--fft-size`（`--print-mem-size` 路徑另含 `--sample-rate`）後面直接接另一個 `--` 選項或行尾時視為缺值，exit 2。未知的選項與不是 level 的位置參數同樣 exit 2（見上）。DFN2／ULCNet 範例與 `4ch_raw`、`4ch_static`、`4ch_external_static` 走同一份嚴格解析（見 [`pipelines/README.md`](../../../pipelines/README.md)）。
 
 ### 4.2 Debug context dump
 

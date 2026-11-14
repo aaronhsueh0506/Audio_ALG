@@ -162,7 +162,7 @@ linear / residual 協定：
 - [ ] mic / ref 內容都是有限值（NaN/Inf 會被 `AEC_ERR_ARG` 拒絕）
 - [ ] hop / n_freqs 是查來的，不是寫死的
 - [ ] 同一個 instance 沒有被多 thread 同時處理
-- [ ] 鏈的順序：`anr_process_gain`（估計用 `error_spec`）→ `aec_apply_gain` → `aec_apply_cng` → `ac_istft_push`；兩個 apply 都傳同一個 NR 增益；缺席的增益來源傳 NULL
+- [ ] 鏈的順序：`anr_process_gain`（4ch 鏈估計用 `error_spec`，即 beamformer 輸出 E；單聲道鏈用 `base_spec`）→ `aec_apply_gain` → `aec_apply_cng` → `ac_istft_push`；兩個 apply 都傳同一個 NR 增益；缺席的增益來源傳 NULL
 
 收尾：
 

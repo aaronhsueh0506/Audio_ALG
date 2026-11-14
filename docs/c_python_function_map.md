@@ -74,15 +74,15 @@
 <!-- map:stats:begin -->
 | 範圍 | C 函式總數 | 已對應 | 其中 mirror | 其中 partial | C-only | 未能判斷 | Python-only 符號 | 已對應中的推論 |
 |---|---|---|---|---|---|---|---|---|
-| `PL` pipelines（common、mono、DFN、4ch、ULCNet 範例）與其 Python 參考 | 258 | 47 | 29 | 18 | 211 | 0 | 55 | 16 |
+| `PL` pipelines（common、mono、DFN、4ch、ULCNet 範例）與其 Python 參考 | 260 | 47 | 29 | 18 | 213 | 0 | 55 | 16 |
 | `TP` audiolib (doa/bf/VAD/common/utility) | 62 | 0 | 0 | 0 | 62 | 0 | 0 | 0 |
 | `AC` audiolib | 299 | 39 | 19 | 20 | 260 | 0 | 0 | 12 |
 | `AINR` AINR（DFN2、GTCRN、RNNoise-ERB） | 155 | 51 | 25 | 26 | 104 | 0 | 2 | 20 |
 | `AIAEC` AIAEC（Align-ULCNet、DeepVQE-S、共用 helper） | 117 | 40 | 23 | 17 | 77 | 0 | 0 | 16 |
-| `TOTAL` 合計 | 891 | 177 | 96 | 81 | 714 | 0 | 57 | 64 |
+| `TOTAL` 合計 | 893 | 177 | 96 | 81 | 716 | 0 | 57 | 64 |
 <!-- map:stats:end -->
 
-讀法：891 個 C 函式中，177 個有 Python 對應（mirror 96、partial 81），其中 64 個的配對是推論；714 個是 C-only；未能判斷 0 個。另有 57 個 Python 符號只在 Python。
+讀法：893 個 C 函式中，177 個有 Python 對應（mirror 96、partial 81），其中 64 個的配對是推論；716 個是 C-only；未能判斷 0 個。另有 57 個 Python 符號只在 Python。
 
 「已對應」是**索引**，不是「已驗證一致」。真正量過數值的只有「對拍工具／測試」欄標（C↔Py）的項目，以及備註內註明為一次性量測的數字；其餘靠「已知落差」欄的編號。
 
@@ -123,7 +123,7 @@
 | `pipelines/ulcnet/ulcnet_nn_stage.c` | all | 12 |
 | `pipelines/common/example_cli.h` | all | 10 |
 | `pipelines/mono/aec_nr_res/example_board_adapter.c` | all | 12 |
-| `pipelines/mono/aec_nr_res/main.c` | all | 20 |
+| `pipelines/mono/aec_nr_res/main.c` | all | 22 |
 | `pipelines/dfn/dfn_example_args.h` | all | 10 |
 | `pipelines/dfn/dfn_rate_bridge.c` | all | 32 |
 | `pipelines/dfn/dfn_res_stage.c` | all | 26 |
@@ -195,7 +195,7 @@
 | PL-STAGE-05 | — | `pipelines/4ch/pipeline.py:PostBeamResidualSuppressor.process` | Python-only | T-16 | `pipelines/tests/pyc_parity_pipelines.sh`（C↔Py） | 後波束 RES 的 C 側已併入 AEC 函式庫的陣列實例：增益級（`src/aec_res.c: aec_res_process`，不再是公開 API）在 `aec_process_residual()`（`AecConfig.residual = AEC_RESIDUAL_FULL`）內對融合後的頻譜算一次，4ch 範例的 `raw_chain`／`static_chain` 與 4ch_external_static.c 的 `post_hop` 以 `aec_apply_gain` 取用；應用端不再有填輸入的函式（原 `array_sample_res_input`）。對拍的 replay 模式（`l2.res4.*.replay`、`a.nr4.*.replay_identity`）用 AEC 的 `AEC_TESTING` 鉤子 `aec_testing_res_*` 在錄下的 frame 上單獨重算這個增益階段（`pyc_drv_4ch_replay`，只連結 `AEC_TESTING` 版 archive；正式 archive 與其他 driver 沒有這些符號）。clock_drift 在 Python 寫死 False。 |
 | PL-STAGE-07 | `pipelines/mono/aec_nr_res/main.c: mono_form, follow_post_reset` | `pipelines/mono/aec_nr_res/pipeline.py:run_res`<br>`pipelines/mono/aec_nr_res/pipeline.py:total_gain`<br>`pipelines/mono/aec_nr_res/pipeline.py:apply_gain`<br>`pipelines/mono/aec_nr_res/pipeline.py:comfort_noise_fill` | mirror | T-17 | `pipelines/tests/pyc_parity_pipelines.sh`（C↔Py） | 各範例 main 自己寫的逐 hop 後級（沒有共用的 chain 型別）：NR 增益 `mono_nr_gain`（`--no-nr` 時為 NULL）、`aec_apply_gain`（RES 增益取 `aec_get_residual` 的 `v.res_gain`，與 NR 增益取 min；`--no-res` 時改 `aec_apply_gain_spec` 配 unity 向量）、comfort noise（`aec_apply_cng`，只在 `with_res` 且 AEC 設定允許時）；任一 stage 拒絕就回 NULL，由 `process_hop` 重置全部。Python 的 RES 增益同樣只來自 `ctx.res_gain`（`run_res`）。渲染的頻譜是 AEC 的渲染基底 B（`aec_get_residual` 的 `v.base_spec`／Python 的 `ctx.output_base_spec`，未觸發輸出 guard 的 hop 上就是 E），NR 估計與增益都讀 B；`follow_post_reset` 對應 `run_res` 內對 `ctx.post_reset_serial` 的處理（變了就清 OLA 尾巴並把 comfort noise 種子設回 `AEC_CNG_SEED`，在該 hop 的第一次抽樣與合成之前；NR 不動）。comfort noise 兩邊都是 AEC 函式庫的同一個產生器（C 是 `aec_apply_cng`，Python 呼叫 `modules/cng.py:cng_fill`），`--no-nr` 且 RES 開啟時整條等於 `aec_process()`（C、Python 各自對自己的第二個 `Aec` 逐位元相同）。合成（`ac_istft_push`）不在 `mono_form` 內，對應 `synthesize_hop`，見 AC-STFT-06；對拍腳本 `d.mono.*.min_apply_ola` 的註解記載 48k/1024 最大差 7.5e-8。其中 min 與 apply 的核心見 AC-SIMD-01。 |
 | PL-MONO-08 | `pipelines/mono/aec_nr_res/main.c: main` | `pipelines/mono/aec_nr_res/pipeline.py:main` | partial | S-31；D-40 | — | 旗標集合不對稱：Python 沒有 moderate、--no-nr／--no-res／--no-cng；C 以位置參數給 aec-level。main 直接組合：`derive_lane` 導 lane、`Aec`（`aec_process_linear`、`aec_process_residual`）→ `aec_get_residual` → `mono_form`（NR 增益，再 `aec_apply_gain`／`aec_apply_cng`，RES 增益是 AEC 自己的 `v.res_gain`，見 PL-STAGE-07）→ `ac_istft_push`；同一份 main.c 編出兩個 binary：aec_nr_pipeline_static 用一個呼叫端記憶體池，aec_nr_pipeline（-DAEC_NR_POOL_SPLIT=1）把 AEC 與後級分成兩塊。 |
-| PL-MONO-09 | `pipelines/mono/aec_nr_res/main.c: level_name, is_nr_level_option, rig_free, post_plan, post_bytes, pool_bytes, rig_build, rig_reset, print_debug_status, stage_accum_add, stage_accum_row, print_stage_timing, timing_now_us, process_hop, print_mem_budget`<br>`pipelines/mono/aec_nr_res/example_board_adapter.c: board_mem_alloc, board_mem_free, mono_plan, mono_init, mono_hop, mono_reset, mono_destroy, lcg_sample, run_hops, run_one_cycle, run_negative_demonstrations, main` | — | C-only | — | — | CLI 解析（值的位置出現 `--` 開頭的 token 以 `example_cli_option_value` 判為缺值，exit 2；level 只收一位數字、`--sample-rate`／`--fft-size` 只收完整十進位整數，非法值 exit 2）、lane 與後級（NR、合成、增益緩衝）的組裝（`post_plan`、rig_* 與 pool 切分）、逐 hop 組合（process_hop，其中增益運算在 `mono_form`，見 PL-STAGE-07）、診斷列印、計時、板端轉接範例。 |
+| PL-MONO-09 | `pipelines/mono/aec_nr_res/main.c: level_name, is_nr_level_option, print_usage, unknown_argument, rig_free, post_plan, post_bytes, pool_bytes, rig_build, rig_reset, print_debug_status, stage_accum_add, stage_accum_row, print_stage_timing, timing_now_us, process_hop, print_mem_budget`<br>`pipelines/mono/aec_nr_res/example_board_adapter.c: board_mem_alloc, board_mem_free, mono_plan, mono_init, mono_hop, mono_reset, mono_destroy, lcg_sample, run_hops, run_one_cycle, run_negative_demonstrations, main` | — | C-only | — | — | CLI 解析（值的位置出現 `--` 開頭的 token 以 `example_cli_option_value` 判為缺值，exit 2；level 只收一位數字、`--sample-rate`／`--fft-size` 只收完整十進位整數，非法值 exit 2；未知選項與不是 level 的位置參數由 `unknown_argument` 在 stderr 印 usage 並 exit 2）、lane 與後級（NR、合成、增益緩衝）的組裝（`post_plan`、rig_* 與 pool 切分）、逐 hop 組合（process_hop，其中增益運算在 `mono_form`，見 PL-STAGE-07）、診斷列印、計時、板端轉接範例。 |
 | PL-DFN-01 | `pipelines/dfn/dfn_res_stage.c: dfn_res_stage_process, dfn_res_stage_begin, dfn_res_stage_infer, dfn_res_stage_end` | `pipelines/dfn/dfn2_stage.py:Dfn2Stage.push` | mirror | D-42；S-17 | `pipelines/dfn/tests/test_dfn2_stage_c_parity.py`（C↔Py，驅動 dfn2_process.c）；`pipelines/dfn/tests/test_dfn2_stage.py`（Py 契約） | C 把一個 hop 拆成 begin／callback／end 三段；Python 的 `push` 在內部呼叫 heads。`dfn2_enhance_spectrum_stream` 路徑逐位元相同、特徵在 AINR 容差內（測試驅動的是 dfn2_process.c，不是 dfn_res_stage.c 本體）。 |
 | PL-DFN-02 | `pipelines/dfn/dfn_res_stage.c: dfn_res_stage_reset` | `pipelines/dfn/dfn2_stage.py:Dfn2Stage.reset` | mirror | D-42 | — | 重置 DFN2 類別與計數並呼叫 `model.reset`；fail-open 後的狀態語意不同（D-42）。 |
 | PL-DFN-03 | `pipelines/dfn/dfn_res_stage.c: dfn_res_stage_set_atten_lim` | `pipelines/dfn/dfn2_stage.py:Dfn2Stage.set_atten_lim` | mirror | — | — | — |

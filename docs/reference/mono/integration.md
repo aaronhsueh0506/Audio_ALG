@@ -141,8 +141,8 @@ mono 的 RES 是明確的例外：它在 `Aec` 的呼叫裡（`aec_process_resid
 
 0. `aec_post_reset_serial(aec)` 與已處理的值不同（AEC 在這個 hop 內做了硬重置）時，在 `ac_istft_push()` 之前 `ac_istft_reset(istft)`（Aec 自己的 comfort noise 產生器已在同一個事件重設種子）；不要因此重置 AEC，降噪器也不動。
 1. `aec_process_linear()` 與 `aec_process_residual()` 都回 `AEC_OK`，`aec_get_residual()` 回 `AEC_OK` 且 `v.res_gain` 非 NULL；任一個不是就視為拒絕該 hop。
-2. NR 增益：`use_r2` 開著、`v.r2` 非 NULL 且 `v.usable_linear` 時，先 `sk_scale_f32(extra_noise, v.r2, PSD_SCALE_INV, n_freqs)` 得到殘留回音 PSD（audio 功率尺度）；再 `anr_process_gain_with_residual_psd(nr, v.base_spec, residual_psd_audio)`（`v.base_spec` 是渲染基底 B，與要套增益的是同一張頻譜；回傳降噪器擁有的 `n_freqs` 個增益，NULL = 降噪器拒絕該 hop；不用殘留回音 PSD 時傳 NULL）。沒有降噪器時 `nr` 用 NULL。
-3. `aec_apply_gain(aec, nr, spec)`：`spec = B × min(nr, G_res)`（`nr` 為 NULL 時是 `B × G_res`）。`v.error_spec`／`v.formed_hop` 是分析 seam（永不被輸出守衛改動），不在這裡渲染。`--no-res` 時 G_res 視為全 1：`aec_apply_gain_spec(spec, v.base_spec, unity, nr, n_freqs)`。
+2. NR 增益：`use_r2` 開著、`v.r2` 非 NULL 且 `v.usable_linear` 時，先 `sk_scale_f32(extra_noise, v.r2, PSD_SCALE_INV, n_freqs)` 得到殘留回音 PSD（audio 功率尺度）；再 `anr_process_gain_with_residual_psd(nr, v.base_spec, residual_psd_audio)`（`v.base_spec` 是渲染基底 B，與要套增益的是同一張頻譜，所以降噪器判斷的就是它要濾的訊號；未觸發守衛的 hop 上 B 與 `v.error_spec` 逐位元相同；回傳降噪器擁有的 `n_freqs` 個增益，NULL = 降噪器拒絕該 hop；不用殘留回音 PSD 時傳 NULL）。沒有降噪器時 `nr` 用 NULL。
+3. `aec_apply_gain(aec, nr, spec)`：`spec = B × min(nr, G_res)`（`nr` 為 NULL 時是 `B × G_res`）。`v.error_spec`／`v.formed_hop` 是分析 seam（永不被輸出守衛改動；AI 模型的分析輸入讀它），不在這裡渲染。git 之外的板端 sample（例如 `alg_audio_aec_nr.c`）目前把 `v.error_spec` 交給降噪器，這是已知差異，不是建議。`--no-res` 時 G_res 視為全 1：`aec_apply_gain_spec(spec, v.base_spec, unity, nr, n_freqs)`。
 4. CNG 開著（`aec_cfg.enable_cng` 且沒有 `--no-cng`）且有 RES gain 時 `aec_apply_cng(aec, nr, spec)`：與上一步同一個 `nr`，由 Aec 自己的產生器（種子 `AEC_CNG_SEED`）抽樣。
 5. `ac_istft_push(istft, spec, out)` 產生這個 hop 的時域輸出。
 

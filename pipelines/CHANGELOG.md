@@ -3,6 +3,11 @@
 `Audio_ALG/pipelines`（含它建置的 `AINR`、`AIAEC` C 程式）的重要改動記錄在此，格式依
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/)。README 只寫現況，改動經過寫在這裡。
 
+## [Unreleased] — 2026-11-14 — `aec_nr_pipeline` refuses unknown options and malformed positionals; the denoiser-input docs agree
+
+- **CLI.** `aec_nr_pipeline` and `aec_nr_pipeline_static` ignored an unknown option and a positional `-1` and exited 0; they now print `unknown option or malformed argument '<token>'` and the usage to stderr and exit 2 (the policy of `4ch_external_static` and of the level parser), also on the `--print-mem-size` path. Every valid command line is byte-identical to before (stdout, stderr, exit code and output WAV, 10 lines on both binaries; the usage on argc < 4 and the `--print-mem-size` report); `--legacy-amin`, `--debug` and `--timing` stay accepted, as no-ops, after `--print-mem-size`. `test_mono_chain.c` has 13 unknown-argument rows per binary, the stderr text and `--print-mem-size` rows; `cli-and-example.md` and the README no longer say that unknown options are skipped.
+- **Docs.** One statement everywhere: the shipped mono chain hands `base_spec` to the denoiser (it estimates on the spectrum its gain is multiplied on), the shipped 4ch chain hands `error_spec` (the beam E), the two differ only on output-guard hops; board samples outside the repository (`alg_audio_aec_nr.c`) feed `error_spec` in mono, a known difference. No code behaviour changed.
+
 ## [Unreleased] — 2026-11-14 — follows lib/aec's `Aec* aec_create()`, the 12-field `AecConfig`, opaque `Aec` and `AEC_LAYOUT_VERSION` 2; pool figures re-measured
 
 No numerics changed in this repository; the AEC pool figures and the layout version moved with lib/aec.

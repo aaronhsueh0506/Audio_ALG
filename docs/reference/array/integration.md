@@ -174,7 +174,7 @@ int main(void) {
             rc = aec_process_residual(a, &beam);
             if (rc == AEC_OK) rc = aec_get_residual(a, &v);
         }
-        const float* g_nr = rc == AEC_OK ? anr_process_gain(nr, v.error_spec) : NULL;  /* estimated on E */
+        const float* g_nr = rc == AEC_OK ? anr_process_gain(nr, v.error_spec) : NULL;  /* estimated on the beam E; B = E unless a lane guard fired */
         if (g_nr) {
             if (v.post_reset_serial != handled) {              /* a lane hard-reset: clear the OLA tail */
                 ac_istft_reset(istft);

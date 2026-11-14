@@ -31,6 +31,7 @@
  *   [aec-level] and --aec-level <level> are the same setting; give one of them once.
  *   NR level (one digit): 0=mild, 1=moderate, 2=balanced, 3=aggressive; --nr-preset is the same option.
  *   Any other level text, and a --sample-rate / --fft-size that is not a whole integer, exits 2.
+ *   An unknown option, or a positional that is not a level ("-1", "-"), prints the usage to stderr and exits 2.
  *   ./aec_nr_pipeline_static <mic.wav> <ref.wav> <out.wav> [aec-level | --aec-level <level>]
  *                     [--nr-level <0..3>] [--aec-only] [--no-nr] [--no-res] [--no-cng]
  *                     [--legacy-amin] [--fft-size 256|512|1024] [--debug] [--timing]
@@ -73,6 +74,26 @@ static const char* level_name(AecLevel level) {
 /* --nr-level is the option; --nr-preset is the same option under its earlier name. */
 static int is_nr_level_option(const char* arg) {
     return strcmp(arg, "--nr-level") == 0 || strcmp(arg, "--nr-preset") == 0;
+}
+
+static void print_usage(FILE* out, const char* prog) {
+    fprintf(out, "Usage: %s <mic.wav> <ref.wav> <out.wav> [aec-level | --aec-level <level>] "
+            "[--nr-level <0..3>] [--aec-only] [--no-nr] [--no-res] [--no-cng] [--legacy-amin] "
+            "[--fft-size 256|512|1024] [--debug] [--timing]\n"
+            "AEC level (one digit): 0=mild, 1=balanced, 2=aggressive, 3=no_floor. The positional [aec-level] and --aec-level are the same setting; give one of them once.\n"
+            "NR level (one digit): 0=mild, 1=moderate, 2=balanced, 3=aggressive; --nr-preset is the same option.\n",
+            prog);
+#if !AEC_NR_POOL_SPLIT
+    fprintf(out, "       %s --print-mem-size [aec-level | --aec-level <level>] [--nr-level <0..3>] [--aec-only] [--no-nr] [--no-res] "
+            "[--no-cng] [--sample-rate <hz>] [--fft-size <n>]\n", prog);
+#endif
+}
+
+/* A token no branch took (an unknown option, or "-1" where an AEC level belongs): the usage on stderr, exit code 2. */
+static int unknown_argument(const char* prog, const char* arg) {
+    fprintf(stderr, "%s: unknown option or malformed argument '%s'\n", prog, arg);
+    print_usage(stderr, prog);
+    return 2;
 }
 
 /* The mono lane: the rate's grid (fft_size 0: the rate's default) and the AecConfig. The lane keeps its
@@ -437,6 +458,8 @@ int main(int argc, char* argv[]) {
             else if (strcmp(argv[i], "--no-nr") == 0) no_nr = 1;
             else if (strcmp(argv[i], "--no-res") == 0) no_res = 1;
             else if (strcmp(argv[i], "--no-cng") == 0) no_cng = 1;
+            else if (strcmp(argv[i], "--legacy-amin") == 0 || strcmp(argv[i], "--debug") == 0 ||
+                     strcmp(argv[i], "--timing") == 0) { /* run options: no effect on the budget */ }
             else if (is_nr_level_option(argv[i]) ||
                      strcmp(argv[i], "--sample-rate") == 0 ||
                      strcmp(argv[i], "--fft-size") == 0) {
@@ -470,6 +493,7 @@ int main(int argc, char* argv[]) {
                 level = (AecLevel)v;
                 have_level = 1;
             }
+            else return unknown_argument(argv[0], argv[i]);
         }
 
         AecSignalGrid grid;
@@ -500,16 +524,7 @@ int main(int argc, char* argv[]) {
 #endif
 
     if (argc < 4) {
-        printf("Usage: %s <mic.wav> <ref.wav> <out.wav> [aec-level | --aec-level <level>] "
-               "[--nr-level <0..3>] [--aec-only] [--no-nr] [--no-res] [--no-cng] [--legacy-amin] "
-               "[--fft-size 256|512|1024] [--debug] [--timing]\n"
-               "AEC level (one digit): 0=mild, 1=balanced, 2=aggressive, 3=no_floor. The positional [aec-level] and --aec-level are the same setting; give one of them once.\n"
-               "NR level (one digit): 0=mild, 1=moderate, 2=balanced, 3=aggressive; --nr-preset is the same option.\n",
-               argv[0]);
-#if !AEC_NR_POOL_SPLIT
-        printf("       %s --print-mem-size [aec-level | --aec-level <level>] [--nr-level <0..3>] [--aec-only] [--no-nr] [--no-res] "
-               "[--no-cng] [--sample-rate <hz>] [--fft-size <n>]\n", argv[0]);
-#endif
+        print_usage(stdout, argv[0]);
         return 1;
     }
 
@@ -568,6 +583,7 @@ int main(int argc, char* argv[]) {
             level = (AecLevel)v;
             have_level = 1;
         }
+        else return unknown_argument(argv[0], argv[i]);
     }
 
     /* Open inputs */
