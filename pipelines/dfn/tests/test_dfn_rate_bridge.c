@@ -824,6 +824,11 @@ static int run_other_grid_refusal(const DFN2Grid *model) {
 int main(void) {
     int rc, i;
     DFN2_REQUIRE_VARIANT_LINK();   /* does not link against an archive of the other DFN2 variant */
+    /* The pool descriptor is a fixed-width 32-byte POD. */
+    if (sizeof(DfnRateBridgeMemReq) != 32u) {
+        fprintf(stderr, "DfnRateBridgeMemReq is %zu bytes, pinned to 32\n", sizeof(DfnRateBridgeMemReq));
+        return 1;
+    }
     dfn_unit_partition(erb_fwd, erb_inv, dfn_test_grid());
     dfn_test_report_pair("dfn_rate_bridge", -1);
     {   /* the table's non-48 kHz model grids: refused by the bridge, run at run time by the stage */

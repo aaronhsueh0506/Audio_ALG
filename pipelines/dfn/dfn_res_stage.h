@@ -76,9 +76,6 @@ typedef struct {
     uint64_t bytes;
 } DfnResStageMemReq;
 
-_Static_assert(sizeof(DfnResStageMemReq) == 32,
-               "DfnResStageMemReq must be exactly 32 bytes");
-
 typedef struct DfnResStage DfnResStage;
 
 /* Defaults for the model grid `grid` (copied; NULL leaves a zeroed grid, which the stage refuses): no

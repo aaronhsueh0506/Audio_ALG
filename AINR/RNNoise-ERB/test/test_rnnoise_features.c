@@ -739,6 +739,19 @@ static void norm_seed_gates(const float *fwd, const float *inv)
     }
 }
 
+/* The pool descriptor is a fixed-width 24-byte POD, and the carve alignment is audiolib's 16 bytes. */
+static int pin_eq(const char *what, unsigned long long got, unsigned long long want) {
+    if (got == want) return 1;
+    printf("FAIL: %s is %llu, pinned to %llu\n", what, got, want);
+    return 0;
+}
+#define PIN(expr, want) pin_eq(#expr, (unsigned long long)(expr), (unsigned long long)(want))
+
+static void abi_pins(void) {
+    CHECK("abi.memreq", PIN(sizeof(RNNoiseMemReq), 24));
+    CHECK("abi.align", PIN(RNNOISE_ALIGNMENT, 16) && PIN(ck_align16_size(1u), RNNOISE_ALIGNMENT));
+}
+
 int main(int argc, char **argv) {
     RNNoiseGrid grid;
     RnnErb mats;
@@ -765,6 +778,7 @@ int main(int argc, char **argv) {
         return 1;
     }
 
+    abi_pins();
     registered_state_gates(&grid, mats.fwd, mats.inv);
     registration_gates(&grid, mats.fwd, mats.inv);
     nonfinite_spectrum_gates(&grid, mats.fwd, mats.inv);

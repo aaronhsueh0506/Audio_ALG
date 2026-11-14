@@ -95,13 +95,6 @@ typedef struct GTCRNProcessMemReq {
     uint64_t bytes;
 } GTCRNProcessMemReq;
 
-#ifdef __STDC_VERSION__
-#if __STDC_VERSION__ >= 201112L
-_Static_assert(sizeof(GTCRNProcessMemReq) == 32,
-               "GTCRNProcessMemReq must stay 32 bytes");
-#endif
-#endif
-
 /* Not reentrant: one instance per stream, and model_input / model_output of one instance share
  * its scratch. */
 typedef struct GTCRNProcess GTCRNProcess;

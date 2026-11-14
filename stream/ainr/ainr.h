@@ -85,11 +85,11 @@ typedef struct AinrWork {
     unsigned int  state_generation;
 } AinrWork;
 
-/* Tail: AC_OLA_ACCUMULATE has no flush. After the last real block push info.tail_zero_blocks zero blocks
- * (_spec: also through the caller's ISTFT), drop info.trim_samples from the start, keep the real length.
- * _freq: feed the upstream analyser the same zero blocks first, then drain the queue with the same count. */
+/* Tail: AC_OLA_ACCUMULATE has no flush. After the last real block push info.tail_zero_blocks zero blocks,
+ * drop info.trim_samples from the start, keep the real length. _freq: feed the upstream analyser the same
+ * zero blocks first, then drain the queue with the same count. */
 
-/* Result of one init, the same for the three families of a config. */
+/* Result of one init, the same for both families of a config. */
 typedef struct AinrInfo {
     const char  *graph_path;           /* model.bin of this configuration */
     int          trim_samples;         /* samples dropped from the start of the final PCM: (queue_frames + 1) * model_hop */
@@ -115,7 +115,7 @@ void ainr_reset(AinrCtx *ctx);
 
 /* Attenuation limit in dB (0 disables, the default), between blocks only. AINR_ERR_SEQUENCE while a
  * preprocess awaits its postprocess, AINR_ERR_NONFINITE_INPUT for NaN/Inf, AINR_ERR_NULL for NULL; else
- * 0. Kept by ainr_reset(). The _spec/_freq variants are the same. */
+ * 0. Kept by ainr_reset(). The _freq variant is the same. */
 int ainr_set_atten_lim(AinrCtx *ctx, float atten_lim_db);
 
 /* Current state generation (0 for NULL): seeds the sample's sync after init or reset. It advances on reset,
@@ -133,33 +133,14 @@ int ainr_preprocess(AinrCtx *ctx, const int16_t *pcm_in, AinrWork *work);
  * matching preprocess (pcm_out untouched). */
 int ainr_postprocess(AinrCtx *ctx, int infer_status, int16_t *pcm_out);
 
-/* ---- PCM -> spectrum ("_spec") and spectrum -> spectrum ("_freq") families ----
+/* ---- Spectrum -> spectrum ("_freq") family ----
  * Same config, AinrInfo and AinrWork as the PCM family; only the data crossing the block boundary differs.
- * Spectra are AUDIO scale (AcStft/AcIstft with scale 1.0), frame-major, oldest first, N frames of n_bins.
- * "_spec": PCM in, enhanced spectrum out (the caller does the ISTFT/OLA). "_freq": the caller supplies an
- * estimate spectrum E (features, mask, deep filter) and an apply spectrum P (what mask, deep filter and
- * attenuation limit act on); E == P (same pointers) is the single-spectrum case. A bypass delivers P-aligned
- * near-identity. */
-
-typedef struct AinrSpecCtx AinrSpecCtx;
-
-/* As ainr_get_mem_size(), for the PCM -> spectrum family. */
-int ainr_get_mem_size_spec(const AinrConfig *cfg, StreamMemReq *req);
-
-/* As ainr_reset(), for the PCM -> spectrum family. */
-void ainr_reset_spec(AinrSpecCtx *ctx);
-
-/* As ainr_set_atten_lim(), for the PCM -> spectrum family. */
-int ainr_set_atten_lim_spec(AinrSpecCtx *ctx, float atten_lim_db);
-
-/* As ainr_state_generation(), for the PCM -> spectrum family. */
-unsigned int ainr_state_generation_spec(const AinrSpecCtx *ctx);
-
-/* As ainr_preprocess(). */
-int ainr_preprocess_spec(AinrSpecCtx *ctx, const int16_t *pcm_in, AinrWork *work);
-
-/* As ainr_postprocess(), writing N frames of enhanced spectrum (out_re/out_im: N * n_bins floats each). */
-int ainr_postprocess_spec(AinrSpecCtx *ctx, int infer_status, float *out_re, float *out_im);
+ * Spectra are AUDIO scale (AcStft/AcIstft with scale 1.0, ac_stft_config_default(), the PCM scaled as
+ * int16 / 32768), frame-major, oldest first, N frames of n_bins. The caller owns the analysis and synthesis:
+ * it supplies an estimate spectrum E (features, mask, deep filter) and an apply spectrum P (what mask, deep
+ * filter and attenuation limit act on) and does the ISTFT/OLA of the result; E == P (same pointers) is the
+ * single-spectrum case. After ainr_reset_freq() reset the analyser too (ac_stft_reset()). A bypass delivers
+ * P-aligned near-identity. */
 
 typedef struct AinrFreqCtx AinrFreqCtx;
 
@@ -184,7 +165,8 @@ unsigned int ainr_state_generation_freq(const AinrFreqCtx *ctx);
 int ainr_preprocess_freq(AinrFreqCtx *ctx, const float *est_re, const float *est_im,
                          const float *app_re, const float *app_im, AinrWork *work);
 
-/* As ainr_postprocess_spec(). */
+/* Closes the block like ainr_postprocess(), writing N frames of enhanced spectrum (out_re/out_im: N * n_bins
+ * floats each). */
 int ainr_postprocess_freq(AinrFreqCtx *ctx, int infer_status, float *out_re, float *out_im);
 
 #ifdef __cplusplus

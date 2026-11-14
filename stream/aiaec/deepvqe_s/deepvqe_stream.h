@@ -47,13 +47,6 @@ typedef struct DeepVqeStreamMemReq {
     uint64_t bytes;
 } DeepVqeStreamMemReq;
 
-#ifdef __STDC_VERSION__
-#if __STDC_VERSION__ >= 201112L
-_Static_assert(sizeof(DeepVqeStreamMemReq) == 32,
-               "DeepVqeStreamMemReq must stay 32 bytes");
-#endif
-#endif
-
 typedef struct DeepVqeStream DeepVqeStream;
 
 /* Exact pool size for cfg. -1 (req untouched) on NULL, an invalid grid, or a partial state registration. */

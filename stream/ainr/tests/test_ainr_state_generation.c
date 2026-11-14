@@ -1,5 +1,5 @@
-/* The state-generation contract the samples reload their accelerator state by, for all three
- * families (PCM, _spec, _freq): AinrWork.state_generation must equal the live
+/* The state-generation contract the samples reload their accelerator state by, for both
+ * families (PCM, _freq): AinrWork.state_generation must equal the live
  * ainr_state_generation*() at the moment it is read (the seed read right after init included), and
  * the counter must move exactly where ainr.h says:
  *
@@ -22,12 +22,11 @@
 #include "ainr_test.h"
 #include "ainr_test_fixture.h"
 
-typedef enum { FAM_PCM = 0, FAM_SPEC, FAM_FREQ } Family;
+typedef enum { FAM_PCM = 0, FAM_FREQ } Family;
 
 typedef struct Fam {
     Family family;
     AinrCtx *pcm;
-    AinrSpecCtx *spec;
     AinrFreqCtx *freq;
     AinrConfig cfg;
     int n_bins, n;
@@ -35,7 +34,7 @@ typedef struct Fam {
     float *re, *im, *out_re, *out_im;
 } Fam;
 
-static const char *fam_name(Family f) { return f == FAM_PCM ? "pcm" : f == FAM_SPEC ? "spec" : "freq"; }
+static const char *fam_name(Family f) { return f == FAM_PCM ? "pcm" : "freq"; }
 
 static int fam_init(Fam *f, const char *erb) {
     StreamMemReq req;
@@ -46,10 +45,6 @@ static int fam_init(Fam *f, const char *erb) {
         if (ainr_get_mem_size(&f->cfg, &req) != AINR_OK) return 1;
         pool = alloc_aligned((size_t)req.bytes, req.alignment);
         return ainr_init_from_erb_file(&f->cfg, erb, pool, (size_t)req.bytes, &f->pcm, &info) != AINR_OK || !f->pcm;
-    case FAM_SPEC:
-        if (ainr_get_mem_size_spec(&f->cfg, &req) != AINR_OK) return 1;
-        pool = alloc_aligned((size_t)req.bytes, req.alignment);
-        return ainr_init_spec_from_erb_file(&f->cfg, erb, pool, (size_t)req.bytes, &f->spec, &info) != AINR_OK || !f->spec;
     default:
         if (ainr_get_mem_size_freq(&f->cfg, &req) != AINR_OK) return 1;
         pool = alloc_aligned((size_t)req.bytes, req.alignment);
@@ -58,14 +53,11 @@ static int fam_init(Fam *f, const char *erb) {
 }
 
 static unsigned int fam_gen(const Fam *f) {
-    return f->family == FAM_PCM ? ainr_state_generation(f->pcm)
-         : f->family == FAM_SPEC ? ainr_state_generation_spec(f->spec)
-         : ainr_state_generation_freq(f->freq);
+    return f->family == FAM_PCM ? ainr_state_generation(f->pcm) : ainr_state_generation_freq(f->freq);
 }
 
 static void fam_reset(Fam *f) {
     if (f->family == FAM_PCM) ainr_reset(f->pcm);
-    else if (f->family == FAM_SPEC) ainr_reset_spec(f->spec);
     else ainr_reset_freq(f->freq);
 }
 
@@ -79,13 +71,11 @@ static int fam_pre(Fam *f, int blk, AinrWork *io) {
         return ainr_preprocess_freq(f->freq, f->re, f->im, f->re, f->im, io);
     }
     for (i = 0; i < (size_t)f->cfg.hop_in; ++i) f->pcm_in[i] = (int16_t)(((i * 13 + (size_t)blk * 7) % 211) - 100);
-    return f->family == FAM_PCM ? ainr_preprocess(f->pcm, f->pcm_in, io)
-                                        : ainr_preprocess_spec(f->spec, f->pcm_in, io);
+    return ainr_preprocess(f->pcm, f->pcm_in, io);
 }
 
 static int fam_post(Fam *f, int status) {
     return f->family == FAM_PCM ? ainr_postprocess(f->pcm, status, f->pcm_out)
-         : f->family == FAM_SPEC ? ainr_postprocess_spec(f->spec, status, f->out_re, f->out_im)
          : ainr_postprocess_freq(f->freq, status, f->out_re, f->out_im);
 }
 
@@ -186,7 +176,7 @@ static int run_case(int sr, int fft, int n_erb, int n, int warm, const char *lab
     int n_bins = fft / 2 + 1;
     snprintf(erb, sizeof(erb), "/tmp/ainr_stategen_erb_%d_%d_%d.bin", sr, fft, (int)getpid());
     write_synthetic_erb(erb, n_bins, n_erb);
-    for (fi = 0; fi < 3; ++fi) {
+    for (fi = 0; fi < 2; ++fi) {
         Fam f;
         size_t cnt = (size_t)n * (size_t)n_bins;
         memset(&f, 0, sizeof(f));

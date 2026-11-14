@@ -1,10 +1,10 @@
 /* The board samples' DFN2 graph rows (stream/ainr/ai3_model_io_dfn2.h) against the AinrWork a real preprocess
  * call returns, for this build's variant (full, or lite under -DDFN2_MASK_ONLY) and product id
- * (AINR_PRODUCT_MODEL_ID, incl. the quantization alternates): every PCM, _spec and _freq block must pass
+ * (AINR_PRODUCT_MODEL_ID, incl. the quantization alternates): every PCM and _freq block must pass
  * AI3_MODEL_IO_CHECK_WORK against the row of its configuration, and the library accepts a (sr, fft, N) exactly
  * when the row exists (a product id with no catalog rows refuses every configuration). The other variant's row
  * of the same grid must reject this variant's work. The second block of a family carries the same shapes as the
- * first, and every refusal of ainr_get_mem_size() comes back from the three init families with *ctx NULL and
+ * first, and every refusal of ainr_get_mem_size() comes back from the two init families with *ctx NULL and
  * *info untouched. The rows against a fresh export are pinned by AINR/tests/test_dfn2_port_order.py. Not built
  * under NO_STDIO (ainr.c is file-mode). */
 
@@ -20,9 +20,6 @@
 #include "dfn2_model_io.h"
 #include "ai3_model_io.h"
 #include "ai3_model_io_dfn2.h"
-
-_Static_assert(AI3_MODEL_IO_DFN2_LAYOUT_FULL == DFN2_MODEL_IO_LAYOUT_VERSION_FULL, "full layout version");
-_Static_assert(AI3_MODEL_IO_DFN2_LAYOUT_LITE == DFN2_MODEL_IO_LAYOUT_VERSION_MASK_ONLY, "lite layout version");
 
 /* The product id has catalog rows in this build (ainr.c: the default and _ALT2 of the variant; _ALT1 and the
  * other variant's ids are refused by every entry). */
@@ -97,7 +94,6 @@ static void check_refusals(const char *erb)
     memset(&sentinel, 0x5a, sizeof(sentinel));
     for (i = 0; i < sizeof(cases) / sizeof(cases[0]); ++i) {
         AinrCtx *c0 = (AinrCtx *)pool;
-        AinrSpecCtx *c1 = (AinrSpecCtx *)pool;
         AinrFreqCtx *c2 = (AinrFreqCtx *)pool;
         cfg.sr = cases[i].sr; cfg.fft = cases[i].fft; cfg.hop_in = cases[i].hop_in;
         CHECK(ainr_get_mem_size(&cfg, &req) == cases[i].want, "refusal (%s): get_mem_size", cases[i].what);
@@ -106,11 +102,6 @@ static void check_refusals(const char *erb)
               cases[i].what);
         CHECK(c0 == NULL && memcmp(&info, &sentinel, sizeof(info)) == 0, "refusal (%s): ctx/info after init", cases[i].what);
         info = sentinel;
-        CHECK(ainr_init_spec_from_erb_file(&cfg, erb, pool, sizeof(pool), &c1, &info) == cases[i].want,
-              "refusal (%s): init_spec", cases[i].what);
-        CHECK(c1 == NULL && memcmp(&info, &sentinel, sizeof(info)) == 0, "refusal (%s): ctx/info after init_spec",
-              cases[i].what);
-        info = sentinel;
         CHECK(ainr_init_freq_from_erb_file(&cfg, erb, pool, sizeof(pool), &c2, &info) == cases[i].want,
               "refusal (%s): init_freq", cases[i].what);
         CHECK(c2 == NULL && memcmp(&info, &sentinel, sizeof(info)) == 0, "refusal (%s): ctx/info after init_freq",
@@ -118,7 +109,7 @@ static void check_refusals(const char *erb)
     }
 }
 
-/* One pre call of `family` on a fresh init; compares the work with the row, then closes the block and compares
+/* One pre call of `family` (0 PCM, 1 _freq) on a fresh init; compares the work with the row, then closes the block and compares
  * the next one. */
 static void run_family(const AinrConfig *cfg, int family, int n, const Ai3ModelIoConfig *mc, const char *tag)
 {
@@ -126,7 +117,6 @@ static void run_family(const AinrConfig *cfg, int family, int n, const Ai3ModelI
     AinrWork work;
     StreamMemReq req;
     AinrCtx *pcm = NULL;
-    AinrSpecCtx *spec = NULL;
     AinrFreqCtx *freq = NULL;
     void *pool = NULL;
     int16_t *pcm_in;
@@ -134,15 +124,13 @@ static void run_family(const AinrConfig *cfg, int family, int n, const Ai3ModelI
     char erb[96];
     int rc, bins = cfg->fft / 2 + 1;
 
-    rc = family == 0 ? ainr_get_mem_size(cfg, &req) : family == 1 ? ainr_get_mem_size_spec(cfg, &req)
-                                                                  : ainr_get_mem_size_freq(cfg, &req);
+    rc = family == 0 ? ainr_get_mem_size(cfg, &req) : ainr_get_mem_size_freq(cfg, &req);
     CHECK(rc == AINR_OK, "%s mem size %d", tag, rc);
     if (rc != AINR_OK) return;
     snprintf(erb, sizeof erb, "/tmp/ainr_model_io_erb_%d.bin", (int)getpid());
     if (write_erb(erb, bins, (int)mc->wiring.outputs[0].w) != 0) exit(2);
     if (posix_memalign(&pool, req.alignment, (size_t)req.bytes) != 0) exit(2);
     rc = family == 0 ? ainr_init_from_erb_file(cfg, erb, pool, (size_t)req.bytes, &pcm, &info)
-       : family == 1 ? ainr_init_spec_from_erb_file(cfg, erb, pool, (size_t)req.bytes, &spec, &info)
                      : ainr_init_freq_from_erb_file(cfg, erb, pool, (size_t)req.bytes, &freq, &info);
     unlink(erb);
     CHECK(rc == AINR_OK, "%s init %d", tag, rc);
@@ -154,7 +142,6 @@ static void run_family(const AinrConfig *cfg, int family, int n, const Ai3ModelI
     memset(&work, 0, sizeof work);
     if (rc == AINR_OK) {
         rc = family == 0 ? ainr_preprocess(pcm, pcm_in, &work)
-           : family == 1 ? ainr_preprocess_spec(spec, pcm_in, &work)
                          : ainr_preprocess_freq(freq, zeros, zeros, zeros, zeros, &work);
         CHECK(rc == AINR_OK, "%s preprocess %d", tag, rc);
         if (rc == AINR_OK) {
@@ -169,12 +156,10 @@ static void run_family(const AinrConfig *cfg, int family, int n, const Ai3ModelI
                 CHECK(rc2 != AI3_MODEL_IO_OK, "%s the other variant's row accepted this work", tag);
             }
             fill_heads(&work);
-            rc = family == 0 ? ainr_postprocess(pcm, 0, pcm_in) : family == 1 ? ainr_postprocess_spec(spec, 0, out_re, out_im)
-                                                                              : ainr_postprocess_freq(freq, 0, out_re, out_im);
+            rc = family == 0 ? ainr_postprocess(pcm, 0, pcm_in) : ainr_postprocess_freq(freq, 0, out_re, out_im);
             CHECK(rc == AINR_OK, "%s postprocess %d", tag, rc);
             memset(&work, 0, sizeof work);
             rc = family == 0 ? ainr_preprocess(pcm, pcm_in, &work)
-               : family == 1 ? ainr_preprocess_spec(spec, pcm_in, &work)
                              : ainr_preprocess_freq(freq, zeros, zeros, zeros, zeros, &work);
             CHECK(rc == AINR_OK, "%s second preprocess %d", tag, rc);
             if (rc == AINR_OK) compare_work(tag, mc, &work);
@@ -188,6 +173,14 @@ int main(void)
     static const int srs[] = { 8000, 16000, 32000, 48000 };
     static const int ffts[] = { 128, 256, 512, 1024, 2048 };
     int si, fi, n, i, accepted = 0, own_rows = 0, compared = 0;
+
+    /* The wiring table and the library name the same graph layouts. */
+    CHECK(AI3_MODEL_IO_DFN2_LAYOUT_FULL == DFN2_MODEL_IO_LAYOUT_VERSION_FULL,
+          "full layout version: table %d, dfn2_model_io.h %d", (int)AI3_MODEL_IO_DFN2_LAYOUT_FULL,
+          (int)DFN2_MODEL_IO_LAYOUT_VERSION_FULL);
+    CHECK(AI3_MODEL_IO_DFN2_LAYOUT_LITE == DFN2_MODEL_IO_LAYOUT_VERSION_MASK_ONLY,
+          "lite layout version: table %d, dfn2_model_io.h %d", (int)AI3_MODEL_IO_DFN2_LAYOUT_LITE,
+          (int)DFN2_MODEL_IO_LAYOUT_VERSION_MASK_ONLY);
 
     for (i = 0; i < AI3_MODEL_IO_DFN2_ROW_COUNT; ++i) {
         Ai3ModelIoConfig c;
@@ -239,7 +232,7 @@ int main(void)
             CHECK(ai3_model_io_state_count(&mc) == desc.state_tensor_count, "sr %d fft %d N %d: row has %d states, the library %d",
                   cfg.sr, cfg.fft, n, ai3_model_io_state_count(&mc), desc.state_tensor_count);
         }
-        for (family = 0; family < 3; ++family) {
+        for (family = 0; family < 2; ++family) {
             char tag[96];
             snprintf(tag, sizeof tag, "sr %d fft %d N %d family %d", cfg.sr, cfg.fft, n, family);
             run_family(&cfg, family, n, &mc, tag);

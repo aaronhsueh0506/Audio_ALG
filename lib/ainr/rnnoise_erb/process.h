@@ -120,13 +120,6 @@ typedef struct RNNoiseMemReq {
     uint64_t bytes;
 } RNNoiseMemReq;
 
-#ifdef __STDC_VERSION__
-#if __STDC_VERSION__ >= 201112L
-_Static_assert(sizeof(RNNoiseMemReq) == 24,
-               "RNNoiseMemReq must stay 24 bytes");
-#endif
-#endif
-
 /* The pool's header. Its arrays are carved from the pool; the ERB matrices and the
  * registered tensors are borrowed, never created or released here. */
 typedef struct RNNoiseState {

@@ -73,13 +73,6 @@ typedef struct DFN3PrepostMemReq {
     uint64_t bytes;
 } DFN3PrepostMemReq;
 
-#ifdef __STDC_VERSION__
-#if __STDC_VERSION__ >= 201112L
-_Static_assert(sizeof(DFN3PrepostMemReq) == 32,
-               "DFN3PrepostMemReq must stay 32 bytes");
-#endif
-#endif
-
 typedef struct DFN3Prepost DFN3Prepost;
 
 /* Accelerator inputs at stable addresses: read-only pool windows and the registered state (NULL and 0 if none; the

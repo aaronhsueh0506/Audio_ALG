@@ -55,9 +55,6 @@ _DRIVER = r'''
 #ifndef DFN2_MASK_ONLY
 #error "this driver is the mask-only build"
 #endif
-_Static_assert(DFN2_DF_LOOKAHEAD == 0, "no deep filter to look ahead for");
-_Static_assert(DFN2_MODEL_IO_LAYOUT_VERSION == DFN2_MODEL_IO_LAYOUT_VERSION_MASK_ONLY,
-               "mask-only layout number");
 
 #define CHECK(x) do { if (!(x)) { \
     fprintf(stderr, "CHECK failed at line %d: %s\n", __LINE__, #x); \
@@ -98,6 +95,9 @@ int main(int argc, char **argv) {
     int frames, t, valid;
     long long frame;
 
+    /* The mask-only build has no deep filter to look ahead for, and carries the mask-only layout number. */
+    CHECK(DFN2_DF_LOOKAHEAD == 0);
+    CHECK(DFN2_MODEL_IO_LAYOUT_VERSION == DFN2_MODEL_IO_LAYOUT_VERSION_MASK_ONLY);
     if (argc != 8) return 2;
     frames = atoi(argv[6]);
     erb_fwd = load_matrix(argv[1], (size_t)grid->n_bins * grid->n_erb);

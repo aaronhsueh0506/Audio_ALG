@@ -62,13 +62,6 @@ typedef struct UlcnetStreamLayout {
 
 #define ULCNET_STREAM_ALIGN ULCNET_STREAM_ALIGNMENT
 
-#ifdef __STDC_VERSION__
-#if __STDC_VERSION__ >= 201112L
-_Static_assert(ULCNET_STREAM_ALIGN == 16u,
-               "ck_align16_size is the shared 16-byte carve alignment");
-#endif
-#endif
-
 static int cfg_frames(const UlcnetStreamConfig *cfg) {
     return cfg->frames_per_call > 1 ? cfg->frames_per_call : 1;
 }

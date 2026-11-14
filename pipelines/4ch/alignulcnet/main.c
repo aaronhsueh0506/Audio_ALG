@@ -38,9 +38,6 @@
 #ifndef ULCNET_EXAMPLE_DELAY_FRAMES
 #define ULCNET_EXAMPLE_DELAY_FRAMES 8
 #endif
-_Static_assert(ULCNET_EXAMPLE_DELAY_FRAMES >= ULCNET_MODEL_IO_MIN_D &&
-               ULCNET_EXAMPLE_DELAY_FRAMES <= ULCNET_MODEL_IO_MAX_D,
-               "ULCNET_EXAMPLE_DELAY_FRAMES outside the descriptor's range");
 
 /* The shipped grids: one row per sample rate. */
 static const UlcnetGridSpec k_grids[] = {
@@ -55,9 +52,6 @@ enum { K_GRIDS = (int)(sizeof k_grids / sizeof k_grids[0]) };
 #ifndef ULCNET_EXAMPLE_DELAY_NUM_FILTERS
 #define ULCNET_EXAMPLE_DELAY_NUM_FILTERS AEC_DELAY_NUM_FILTERS_MAX
 #endif
-_Static_assert(ULCNET_EXAMPLE_DELAY_NUM_FILTERS >= 1 &&
-               ULCNET_EXAMPLE_DELAY_NUM_FILTERS <= AEC_DELAY_NUM_FILTERS_MAX,
-               "ULCNET_EXAMPLE_DELAY_NUM_FILTERS outside lib/aec's bank range");
 
 static void usage(const char* prog) {
     fprintf(stderr,

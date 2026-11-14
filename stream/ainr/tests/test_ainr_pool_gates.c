@@ -1,4 +1,4 @@
-/* The init gates of all three families: init recomputes the size itself. A pool one byte short or
+/* The init gates of both families (PCM, _freq): init recomputes the size itself. A pool one byte short or
  * misaligned is refused (AINR_ERR_POOL) before anything is written; a larger pool is accepted; NULL
  * arguments are AINR_ERR_NULL; a missing ERB file is AINR_ERR_ERB_FILE. Every refusal leaves *ctx NULL
  * and *info untouched (a pool refusal also leaves the pool bytes unchanged), and the same pool then
@@ -14,14 +14,12 @@
 #include "ainr_test.h"
 #include "ainr_test_fixture.h"
 
-typedef enum { FAM_PCM = 0, FAM_SPEC, FAM_FREQ } Fam;
+typedef enum { FAM_PCM = 0, FAM_FREQ } Fam;
 
-static const char *fam_name(Fam f) { return f == FAM_PCM ? "pcm" : f == FAM_SPEC ? "spec" : "freq"; }
+static const char *fam_name(Fam f) { return f == FAM_PCM ? "pcm" : "freq"; }
 
 static int get_size(Fam f, const AinrConfig *cfg, StreamMemReq *req) {
-    return f == FAM_PCM ? ainr_get_mem_size(cfg, req)
-         : f == FAM_SPEC ? ainr_get_mem_size_spec(cfg, req)
-         : ainr_get_mem_size_freq(cfg, req);
+    return f == FAM_PCM ? ainr_get_mem_size(cfg, req) : ainr_get_mem_size_freq(cfg, req);
 }
 
 /* Init through the family's file entry; the context pointer goes to *ctx_out (NULL when refused).
@@ -35,12 +33,6 @@ static int try_init(Fam f, const AinrConfig *cfg, const char *erb, void *pool, s
     case FAM_PCM: {
         AinrCtx *c = (AinrCtx *)(void *)&g_junk;
         rc = ainr_init_from_erb_file(cfg, erb, pool, bytes, &c, info);
-        *ctx_out = c;
-        break;
-    }
-    case FAM_SPEC: {
-        AinrSpecCtx *c = (AinrSpecCtx *)(void *)&g_junk;
-        rc = ainr_init_spec_from_erb_file(cfg, erb, pool, bytes, &c, info);
         *ctx_out = c;
         break;
     }

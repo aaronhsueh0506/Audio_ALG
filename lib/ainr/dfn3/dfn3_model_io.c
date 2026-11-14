@@ -115,31 +115,6 @@ unsigned int dfn3_model_io_ready_frames(const DFN3ModelIOState *state)
     X(input_frames, DFN3_MODEL_INPUT_FRAMES)                          \
     X(state_tensor_count, DFN3_MODEL_IO_STATE_TENSORS)
 
-#define DFN3_MODEL_IO_DESCRIPTOR_INTERIOR_FIELDS(X)                   \
-    X(encoder_gru_layers)                                             \
-    X(erb_gru_layers)                                                 \
-    X(df_gru_layers)                                                  \
-    X(gru_hidden)                                                     \
-    X(encoder_channels)                                               \
-    X(df_pathway_window)
-
-/* Every descriptor field is in one of the two lists. */
-#define DFN3_COUNT_FIELD(field, value) + 1
-#define DFN3_COUNT_INTERIOR(field) + 1
-enum { DFN3_MODEL_IO_DESCRIPTOR_FIELD_COUNT =
-           0 DFN3_MODEL_IO_DESCRIPTOR_EXTERNAL_FIELDS(DFN3_COUNT_FIELD)
-             DFN3_MODEL_IO_DESCRIPTOR_INTERIOR_FIELDS(DFN3_COUNT_INTERIOR) };
-#undef DFN3_COUNT_FIELD
-#undef DFN3_COUNT_INTERIOR
-#ifdef __STDC_VERSION__
-#if __STDC_VERSION__ >= 201112L
-_Static_assert(DFN3_MODEL_IO_DESCRIPTOR_FIELD_COUNT == 18 &&
-                   sizeof(DFN3ModelIoDescriptor) ==
-                       DFN3_MODEL_IO_DESCRIPTOR_FIELD_COUNT * sizeof(int),
-               "the field lists cover the 18-field descriptor");
-#endif
-#endif
-
 int dfn3_model_io_descriptor_default(const DFN3Grid *g,
                                      DFN3ModelIoDescriptor *descriptor)
 {

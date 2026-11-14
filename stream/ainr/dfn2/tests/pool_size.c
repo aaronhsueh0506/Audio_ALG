@@ -143,8 +143,20 @@ static void run_row(const Row *r, int idx) {
     free(pcm_in); free(pcm_out); free(pool); free(fwd); free(inv);
 }
 
+/* The descriptor is a fixed-width 32-byte POD and the carve alignment is audiolib's 16 bytes. */
+static void pin_abi(void) {
+    size_t size = sizeof(DFN2StreamMemReq), align = (size_t)DFN2_STREAM_ALIGNMENT;
+    if (size != 32u) { printf("FAIL: DFN2StreamMemReq is %zu bytes, pinned to 32\n", size); ++g_fail; }
+    if (align != 16u || ck_align16_size(1u) != align) {
+        printf("FAIL: DFN2_STREAM_ALIGNMENT is %zu (ck_align16_size(1) = %zu), pinned to the shared 16\n", align,
+               ck_align16_size(1u));
+        ++g_fail;
+    }
+}
+
 int main(void) {
     size_t i;
+    pin_abi();
     for (i = 0; i < sizeof(ROWS) / sizeof(ROWS[0]); ++i) run_row(&ROWS[i], (int)i);
     if (g_fail) { printf("pool_size: %d check(s) FAILED\n", g_fail); return 1; }
     printf("pool_size: %d grid(s), memory and file mode -- PASS\n", (int)(sizeof(ROWS) / sizeof(ROWS[0])));

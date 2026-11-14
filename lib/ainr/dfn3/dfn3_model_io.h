@@ -38,13 +38,6 @@ typedef struct DFN3ModelIoDescriptor {
     int state_tensor_count;        /* 2: h_gru, df_convp_history */
 } DFN3ModelIoDescriptor;
 
-#ifdef __STDC_VERSION__
-#if __STDC_VERSION__ >= 201112L
-_Static_assert(sizeof(DFN3ModelIoDescriptor) == 72,
-               "DFN3ModelIoDescriptor must stay 72 bytes");
-#endif
-#endif
-
 /* Fill the external fields for `grid`, zero the interior ones. Returns 0, or -1 on NULL or an invalid grid. */
 int dfn3_model_io_descriptor_default(const DFN3Grid *grid,
                                      DFN3ModelIoDescriptor *descriptor);

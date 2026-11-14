@@ -2,6 +2,10 @@
 
 ## Unreleased
 
+### No `_Static_assert` in `lib/ainr`, `stream/ainr` and the AINR tests; the ainr `_spec` family retired
+
+No numerics changed (every printed digest is identical at SIMD=1 and SIMD=0; the objects of the libraries are byte-identical). The size, alignment and descriptor-field pins of `DFN2/DFN3PrepostMemReq`, `GTCRNProcessMemReq`, `RNNoiseMemReq`, `DFN2/DFN3ModelIoDescriptor` and the `DFN2StreamMemReq` are run-time checks in `tests/test_c_prepost.c`, `tests/test_dfn3_stream.c`, `RNNoise-ERB/test/test_rnnoise_features.c` and `stream/ainr/dfn2/tests/pool_size.c`; the three embedded C drivers of `test_dfn2_mask_only_c.py`, `test_dfn2_prepost_c.py` and `test_dfn2_frames_per_call_c.py` check theirs in `main`. The DFN2/DFN3 descriptor field lists keep only the external list that `default()` and `validate()` use (the six interior fields are documented in the header). `ainr_*_spec` and `AinrSpecCtx` are removed: analyse with `AcStft` and use `ainr_*_freq` with E == P (bit-identical output, same `_freq` pool). Full list and evidence: `pipelines/CHANGELOG.md`.
+
 ### Write-only accessors, backend names and `DFN3Model.reset` removed; DFN3/RNNoise/DFN2 helpers made static
 
 No numerics changed (the `test_c_prepost`, `test_nn_chains`, `test_dfn3_stream` and RNNoise SIMD digests are identical to the previous tree at SIMD=1 and SIMD=0; `pytest AINR/tests AINR/RNNoise-ERB` is green). Full list, layout figures and the NR/AEC pool re-measurements: `pipelines/CHANGELOG.md`, same date.

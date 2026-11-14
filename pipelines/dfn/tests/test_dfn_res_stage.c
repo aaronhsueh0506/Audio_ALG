@@ -1025,6 +1025,11 @@ static int run_warmup_frames(void) {
 int main(void) {
     int rc;
     DFN2_REQUIRE_VARIANT_LINK();   /* does not link against an archive of the other DFN2 variant */
+    /* The pool descriptor is a fixed-width 32-byte POD. */
+    if (sizeof(DfnResStageMemReq) != 32u) {
+        fprintf(stderr, "DfnResStageMemReq is %zu bytes, pinned to 32\n", sizeof(DfnResStageMemReq));
+        return 1;
+    }
     make_partition();
     rc = run_identity_case(0);
     if (rc) { fprintf(stderr, "NULL-model identity failed: %d\n", rc); return 1; }

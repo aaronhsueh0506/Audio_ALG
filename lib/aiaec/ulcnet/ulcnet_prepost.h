@@ -52,13 +52,6 @@ typedef struct UlcnetPrepostMemReq {
     uint64_t bytes;
 } UlcnetPrepostMemReq;
 
-#ifdef __STDC_VERSION__
-#if __STDC_VERSION__ >= 201112L
-_Static_assert(sizeof(UlcnetPrepostMemReq) == 32,
-               "UlcnetPrepostMemReq must stay 32 bytes");
-#endif
-#endif
-
 typedef struct UlcnetPrepost UlcnetPrepost;
 
 /* Fill a config for `grid` (copied): nothing registered, the built layout. 0, or -1 on NULL or an invalid grid. */

@@ -154,13 +154,6 @@ static int rnnoise_grid_validate(const RNNoiseGrid *grid)
 
 /* ---- Pool arithmetic ---- */
 
-#ifdef __STDC_VERSION__
-#if __STDC_VERSION__ >= 201112L
-_Static_assert(RNNOISE_ALIGNMENT == 16u,
-               "ck_align16_size is the shared 16-byte carve alignment");
-#endif
-#endif
-
 /* Reserve `count` elements of `elem` bytes at *cursor, aligned; base==NULL sizes only. An
  * overflow saturates the cursor to SIZE_MAX (audiolib's helpers), caught by MEM_SIZE_INVALID. */
 static int st_carve(unsigned char *base, size_t *cursor, size_t count, size_t elem,

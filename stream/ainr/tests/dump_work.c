@@ -2,7 +2,7 @@
  * -DDFN2_MASK_ONLY), the init result and the AinrWork views of the first block, one line per fact, for the
  * Python pins and the sample model-config check to compare against the exporter. Built by `make work-dumper`.
  *
- *   dump_work <sr> <fft> <hop_in> [family]        family 0 PCM (default), 1 _spec, 2 _freq
+ *   dump_work <sr> <fft> <hop_in> [family]        family 0 PCM (default), 2 _freq (1 was the retired _spec)
  *     rc <int>                                    status of ainr_get_mem_size*() / ainr_init*() / the first
  *                                                 preprocess (a refused config prints this line only)
  *     graph <path>                                AinrInfo.graph_path
@@ -42,7 +42,6 @@ int main(int argc, char **argv) {
     AinrWork work;
     StreamMemReq req;
     AinrCtx *pcm = NULL;
-    AinrSpecCtx *spec = NULL;
     AinrFreqCtx *freq = NULL;
     void *pool = NULL;
     int16_t *pcm_in = NULL;
@@ -53,10 +52,9 @@ int main(int argc, char **argv) {
     if (argc != 4 && argc != 5) return 2;
     cfg.sr = atoi(argv[1]); cfg.fft = atoi(argv[2]); cfg.hop_in = atoi(argv[3]);
     family = argc == 5 ? atoi(argv[4]) : 0;
-    if (family < 0 || family > 2) return 2;
+    if (family != 0 && family != 2) return 2;
 
-    rc = family == 0 ? ainr_get_mem_size(&cfg, &req)
-       : family == 1 ? ainr_get_mem_size_spec(&cfg, &req) : ainr_get_mem_size_freq(&cfg, &req);
+    rc = family == 0 ? ainr_get_mem_size(&cfg, &req) : ainr_get_mem_size_freq(&cfg, &req);
     if (rc == AINR_OK) {
         hop = cfg.fft / 2;
         bins = hop + 1;
@@ -65,7 +63,6 @@ int main(int argc, char **argv) {
         if (write_erb(erb, bins, n_erb) != 0) return 2;
         if (posix_memalign(&pool, (size_t)req.alignment, (size_t)req.bytes) != 0 || !pool) return 2;
         rc = family == 0 ? ainr_init_from_erb_file(&cfg, erb, pool, (size_t)req.bytes, &pcm, &info)
-           : family == 1 ? ainr_init_spec_from_erb_file(&cfg, erb, pool, (size_t)req.bytes, &spec, &info)
                          : ainr_init_freq_from_erb_file(&cfg, erb, pool, (size_t)req.bytes, &freq, &info);
         unlink(erb);
     }
@@ -74,7 +71,6 @@ int main(int argc, char **argv) {
         zeros = (float *)calloc((size_t)(cfg.hop_in / hop) * (size_t)bins, sizeof(float));
         if (!pcm_in || !zeros) return 2;
         rc = family == 0 ? ainr_preprocess(pcm, pcm_in, &work)
-           : family == 1 ? ainr_preprocess_spec(spec, pcm_in, &work)
                          : ainr_preprocess_freq(freq, zeros, zeros, zeros, zeros, &work);
     }
     printf("rc %d\n", rc);

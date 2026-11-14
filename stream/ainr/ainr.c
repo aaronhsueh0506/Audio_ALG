@@ -128,10 +128,10 @@ static const AinrDfn2ModelEntry AINR_DFN2_CATALOG[] = {
 #define AINR_DFN2_CATALOG_ROWS ((int)(sizeof(AINR_DFN2_CATALOG) / sizeof(AINR_DFN2_CATALOG[0])))
 #endif
 
-/* One context for all three families (PCM, _spec, _freq): the public Ainr*Ctx types are one-member
- * wrappers around it. stash holds the (n - 1) pre-roll hops of a block: int16 PCM for the PCM
- * family, MODEL-scale spectra ([i][re(n_bins)][im(n_bins)]) for the other two; NULL when n == 1.
- * scratch (_freq only) is one frame of MODEL-scale est/app input, 4 * n_bins floats. */
+/* One context for both families (PCM, _freq): the public Ainr*Ctx types are one-member wrappers around
+ * it. stash holds the (n - 1) pre-roll hops of a block: int16 PCM for the PCM family, MODEL-scale
+ * spectra ([i][re(n_bins)][im(n_bins)]) for _freq; NULL when n == 1. scratch (_freq only) is one frame
+ * of MODEL-scale est/app input, 4 * n_bins floats. */
 typedef struct AinrCore {
     DFN2Stream  *inner;
     DFN2Grid     grid;
@@ -142,10 +142,9 @@ typedef struct AinrCore {
 } AinrCore;
 
 struct AinrCtx { AinrCore core; };
-struct AinrSpecCtx { AinrCore core; };
 struct AinrFreqCtx { AinrCore core; };
 
-typedef enum AinrFamily { AINR_FAMILY_PCM = 0, AINR_FAMILY_SPEC, AINR_FAMILY_FREQ } AinrFamily;
+typedef enum AinrFamily { AINR_FAMILY_PCM = 0, AINR_FAMILY_FREQ } AinrFamily;
 
 /* Resolves cfg to a catalog entry, frames_per_call, and that variant's graph path for the
  * product's bound model. Order: the bound model belongs to this archive variant (see
@@ -280,11 +279,6 @@ int ainr_get_mem_size(const AinrConfig *cfg, StreamMemReq *req)
     return ainr_get_mem_size_family(AINR_FAMILY_PCM, cfg, req);
 }
 
-int ainr_get_mem_size_spec(const AinrConfig *cfg, StreamMemReq *req)
-{
-    return ainr_get_mem_size_family(AINR_FAMILY_SPEC, cfg, req);
-}
-
 int ainr_get_mem_size_freq(const AinrConfig *cfg, StreamMemReq *req)
 {
     return ainr_get_mem_size_family(AINR_FAMILY_FREQ, cfg, req);
@@ -399,18 +393,6 @@ int ainr_init_from_erb_file(const AinrConfig *cfg, const char *erb_path, void *p
     return rc;
 }
 
-int ainr_init_spec_from_erb_file(const AinrConfig *cfg, const char *erb_path, void *pool, size_t pool_bytes,
-                                 AinrSpecCtx **ctx, AinrInfo *info)
-{
-    AinrCore *core = (AinrCore *)0;
-    int rc;
-
-    if (!ctx) return AINR_ERR_NULL;
-    rc = ainr_init_file(AINR_FAMILY_SPEC, cfg, erb_path, pool, pool_bytes, &core, info);
-    *ctx = (AinrSpecCtx *)core;
-    return rc;
-}
-
 int ainr_init_freq_from_erb_file(const AinrConfig *cfg, const char *erb_path, void *pool, size_t pool_bytes,
                                  AinrFreqCtx **ctx, AinrInfo *info)
 {
@@ -430,7 +412,6 @@ static void ainr_reset_core(AinrCore *c)
 }
 
 void ainr_reset(AinrCtx *ctx) { if (ctx) ainr_reset_core(&ctx->core); }
-void ainr_reset_spec(AinrSpecCtx *ctx) { if (ctx) ainr_reset_core(&ctx->core); }
 void ainr_reset_freq(AinrFreqCtx *ctx) { if (ctx) ainr_reset_core(&ctx->core); }
 
 static int ainr_set_atten_lim_core(AinrCore *c, float atten_lim_db)
@@ -444,22 +425,12 @@ int ainr_set_atten_lim(AinrCtx *ctx, float atten_lim_db)
     return ctx ? ainr_set_atten_lim_core(&ctx->core, atten_lim_db) : AINR_ERR_NULL;
 }
 
-int ainr_set_atten_lim_spec(AinrSpecCtx *ctx, float atten_lim_db)
-{
-    return ctx ? ainr_set_atten_lim_core(&ctx->core, atten_lim_db) : AINR_ERR_NULL;
-}
-
 int ainr_set_atten_lim_freq(AinrFreqCtx *ctx, float atten_lim_db)
 {
     return ctx ? ainr_set_atten_lim_core(&ctx->core, atten_lim_db) : AINR_ERR_NULL;
 }
 
 unsigned int ainr_state_generation(const AinrCtx *ctx)
-{
-    return ctx ? dfn2_stream_state_generation(ctx->core.inner) : 0u;
-}
-
-unsigned int ainr_state_generation_spec(const AinrSpecCtx *ctx)
 {
     return ctx ? dfn2_stream_state_generation(ctx->core.inner) : 0u;
 }
@@ -546,28 +517,6 @@ static int ainr_open_pcm(AinrCore *c, const int16_t *pcm_in, DFN2HopIO *hio)
     return AINR_OK;
 }
 
-/* As ainr_open_pcm(), the pre-roll hops going to the stash as MODEL-scale spectra (via
- * dfn2_stream_post_process_freq()). */
-static int ainr_open_spec(AinrCore *c, const int16_t *pcm_in, DFN2HopIO *hio)
-{
-    int i, hop = c->grid.hop, n_bins = c->grid.n_bins;
-    float *stash = (float *)c->stash;
-
-    for (i = 0; i < c->n - 1; ++i) {
-        float *sre = stash + (size_t)i * (size_t)n_bins * 2u;
-        float *sim = sre + n_bins;
-        int valid = 0;
-
-        if (dfn2_stream_pre_process(c->inner, pcm_in + (size_t)i * (size_t)hop, hio) != 1 || hio->job_ready)
-            return AINR_ERR_SEQUENCE;
-        if (dfn2_stream_post_process_freq(c->inner, 0, sre, sim, &valid) < 0) return AINR_ERR_SEQUENCE;
-    }
-    if (dfn2_stream_pre_process(c->inner, pcm_in + (size_t)(c->n - 1) * (size_t)hop, hio) != 1 ||
-        !hio->job_ready)
-        return AINR_ERR_SEQUENCE;
-    return AINR_OK;
-}
-
 /* Spectrum -> spectrum: converts each of the n caller-supplied audio-scale est/app frames to MODEL
  * scale in `scratch` (one frame's worth, reused every iteration) before
  * dfn2_stream_pre_process_freq_dual(); drains every frame but the last into the stash, leaves the
@@ -612,7 +561,7 @@ static int ainr_open_freq(AinrCore *c, const float *est_re, const float *est_im,
     return AINR_OK;
 }
 
-/* Close/deliver half of _spec and _freq: closes the real Nth hop via
+/* Close/deliver half of _freq: closes the real Nth hop via
  * dfn2_stream_post_process_freq() (ai_rc = infer_status), writes it to out_re/out_im's last slot,
  * then copies the n - 1 MODEL-scale stashed frames into the earlier slots -- the SAME
  * dfn2_stft_unscale() multiply applied uniformly to every frame, at delivery time, never twice and
@@ -681,34 +630,6 @@ int ainr_postprocess(AinrCtx *ctx, int infer_status, int16_t *pcm_out)
     }
     c->block_open = 0;
     return AINR_OK;
-}
-
-int ainr_preprocess_spec(AinrSpecCtx *ctx, const int16_t *pcm_in, AinrWork *work)
-{
-    AinrCore *c;
-    DFN2HopIO hio;
-
-    if (!ctx || !pcm_in || !work) return AINR_ERR_NULL;
-    c = &ctx->core;
-    if (c->block_open) return AINR_ERR_SEQUENCE;
-    if (ainr_open_spec(c, pcm_in, &hio) != AINR_OK) return AINR_ERR_SEQUENCE;
-
-    ainr_fill_work(&c->grid, &hio.inputs, &hio.outputs, hio.state_generation, work);
-    c->block_open = 1;
-    return AINR_OK;
-}
-
-int ainr_postprocess_spec(AinrSpecCtx *ctx, int infer_status, float *out_re, float *out_im)
-{
-    AinrCore *c;
-    int status;
-
-    if (!ctx || !out_re || !out_im) return AINR_ERR_NULL;
-    c = &ctx->core;
-    if (!c->block_open) return AINR_ERR_SEQUENCE;
-    status = ainr_close_spectrum(c, infer_status, out_re, out_im);
-    c->block_open = 0;
-    return status;
 }
 
 /* True when every bin of the block's n frames (frame-major, contiguous) passes the stream's guard at the model scale

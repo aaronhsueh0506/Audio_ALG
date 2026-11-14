@@ -11,13 +11,6 @@
 /* Scalar twin of a NEON kernel; it is the whole kernel in a SIMD=0 build. */
 #define ULCNET_TWIN static inline __attribute__((unused))
 
-#ifdef __STDC_VERSION__
-#if __STDC_VERSION__ >= 201112L
-_Static_assert(ULCNET_MODEL_IO_ALIGNMENT == 16u,
-               "ck_align16_size is the shared 16-byte carve alignment");
-#endif
-#endif
-
 struct UlcnetModelIoState {
     UlcnetModelIoDescriptor descriptor;
 

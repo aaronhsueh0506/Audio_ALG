@@ -95,11 +95,11 @@ while (read_block(pcm_in, hop_in)) {
 <li>送件前的核對失敗（數量或 shape 與模型設定的列不同）代表 stream 與接線資料不一致：該包不呼叫 AI3，<code>ai_rc</code> 填非零，照常呼叫 <code>ainr_postprocess()</code>。每次成功的 pre 仍恰好對應一次 post。</li>
 <li>執行或讀回失敗時，<code>ai_rc</code> 填非零並照常呼叫 <code>ainr_postprocess()</code>：當拍走近恆等直通（單位 mask、alpha 0），不是靜音，<code>pcm_out</code> 仍有 <code>hop_in</code> 個有效樣本。</li>
 <li><code>ainr.h</code> 沒有 destroy 函式，pool 由呼叫端釋放。介面是檔案模式：ERB 表在 <code>ainr_init()</code> 從產品設定的路徑載入；沒有 stdio 的板子改用較低階的 <a href="../../../../stream/ainr/dfn2/dfn2_stream.h">dfn2_stream.h</a>。</li>
-<li><code>AinrInfo</code> 只有 <code>graph_path</code>、<code>trim_samples</code>、<code>queue_frames</code>、<code>tail_zero_blocks</code> 四欄；N 與 <code>hop_in</code> 不在其中，sample 由 config 算 N = <code>hop_in / (fft / 2)</code>。三個家族（PCM、<code>_spec</code>、<code>_freq</code>）對同一組態填出相同的內容。</li>
+<li><code>AinrInfo</code> 只有 <code>graph_path</code>、<code>trim_samples</code>、<code>queue_frames</code>、<code>tail_zero_blocks</code> 四欄；N 與 <code>hop_in</code> 不在其中，sample 由 config 算 N = <code>hop_in / (fft / 2)</code>。兩個家族（PCM、<code>_freq</code>）對同一組態填出相同的內容。</li>
 </ul>
 
 <h2>延遲與檔案尾端</h2>
-<p><code>trim_samples</code> 是輸出相對輸入的總延遲，以最終 PCM 的樣本數計（<code>_spec</code>、<code>_freq</code> 是外部 ISTFT 之後）：<code>(queue_frames + 1) × 模型 hop</code>，那個 <code>+1</code> 是 stream 自己的一個 STFT／OLA hop。<code>queue_frames</code> 是模型佇列單獨保存的 frame 數：<code>mask_lookahead + df_lookahead + N − 1</code>。三個家族對同一組態的值相同。下表單位：<code>trim_samples</code> 為樣本，<code>queue_frames</code> 為 frame（本庫 host 建置讀出的 <code>AinrInfo</code>）。</p>
+<p><code>trim_samples</code> 是輸出相對輸入的總延遲，以最終 PCM 的樣本數計（<code>_freq</code> 是呼叫端自己的 ISTFT 之後）：<code>(queue_frames + 1) × 模型 hop</code>，那個 <code>+1</code> 是 stream 自己的一個 STFT／OLA hop。<code>queue_frames</code> 是模型佇列單獨保存的 frame 數：<code>mask_lookahead + df_lookahead + N − 1</code>。兩個家族對同一組態的值相同。下表單位：<code>trim_samples</code> 為樣本，<code>queue_frames</code> 為 frame（本庫 host 建置讀出的 <code>AinrInfo</code>）。</p>
 <table>
 <thead><tr><th>組態</th><th>模型 hop</th><th><code>queue_frames</code></th><th><code>trim_samples</code></th><th><code>tail_zero_blocks</code></th></tr></thead>
 <tbody>
@@ -118,16 +118,16 @@ while (read_block(pcm_in, hop_in)) {
 <p>輸入為空時沒有真實樣本，不需要推任何包。</p>
 
 <h2>衰減上限（<code>--atten-lim</code>）</h2>
-<p><code>ainr_set_atten_lim(ctx, dB)</code>（<code>_spec</code>、<code>_freq</code> 家族各有同名函式）設定抑制量上限，預設 0 dB（關閉）。只能在兩包之間呼叫：pre 之後、post 之前回 <code>AINR_ERR_SEQUENCE</code>，NaN 或 Inf 回 <code>AINR_ERR_NONFINITE_INPUT</code>，NULL 回 <code>AINR_ERR_NULL</code>。它不改 pool 大小、不改 layout、不動 state；<code>ainr_reset()</code> 保留設定值。N &gt; 1 時新值從下一個完整區塊起生效。</p>
+<p><code>ainr_set_atten_lim(ctx, dB)</code>（<code>_freq</code> 家族有同名函式）設定抑制量上限，預設 0 dB（關閉）。只能在兩包之間呼叫：pre 之後、post 之前回 <code>AINR_ERR_SEQUENCE</code>，NaN 或 Inf 回 <code>AINR_ERR_NONFINITE_INPUT</code>，NULL 回 <code>AINR_ERR_NULL</code>。它不改 pool 大小、不改 layout、不動 state；<code>ainr_reset()</code> 保留設定值。N &gt; 1 時新值從下一個完整區塊起生效。</p>
 <h2>PCM 進、頻譜出（外接 ISTFT）與頻譜進、頻譜出</h2>
-<p>已有自己的合成器時用 <code>_spec</code> 家族：<code>ainr_get_mem_size_spec()</code>、<code>ainr_init_spec_from_erb_file()</code>、<code>ainr_preprocess_spec()</code>、<code>ainr_postprocess_spec()</code>。邊界、登錄表、<code>AinrInfo</code> 與 <code>AinrWork</code> 都與 PCM 家族相同，只有交換的資料不同：<code>ainr_preprocess_spec()</code> 收 <code>hop_in</code> 個 PCM 樣本，<code>ainr_postprocess_spec()</code> 輸出這包 N 個 hop 的增強頻譜（audio 尺度、frame-major、最舊在前；<code>out_re</code>、<code>out_im</code> 各 <code>N * (fft / 2 + 1)</code> 個 float），交給外部的 <code>AcIstft</code>（<code>AC_OLA_ACCUMULATE</code>、<code>ispec_scale</code> 為 1）。頻譜進、頻譜出用 <code>_freq</code> 家族（<code>ainr_preprocess_freq()</code> 收估計頻譜 E 與套用頻譜 P，E 與 P 同指標即單頻譜）。</p>
-<p><code>_freq</code> 的輸入檢查：<code>ainr_preprocess_freq()</code> 在任何一個 frame 進入模型之前，先掃整包 N 個 frame 的 E 與 P；只要有一個 bin 是 NaN 或 Inf（有限但功率會溢位的 bin 同樣算），整包以 <code>AINR_ERR_NONFINITE_INPUT</code> 拒絕。拒絕時特徵正規化器、frame 佇列與 state generation 都沒有動，也沒有開啟的 block：sample 不要跑加速器，也不要呼叫 <code>ainr_postprocess_freq()</code>（會回 <code>AINR_ERR_SEQUENCE</code>），該包輸出由 sample 自己補，下一包照常呼叫，仍是「一次成功的 pre 對一次 post」。模型沒看過被拒絕的那一包，仍在佇列中的 frame 會晚一包出來，直到佇列深度（<code>AinrInfo.queue_frames</code>）過去才回到原本的對齊。沒有這個檢查時，一個壞 bin 會讓特徵正規化器永久帶 NaN，之後每一包的 ERB／spec 視窗都是 NaN，直到 <code>ainr_reset_freq()</code>。<code>uvc_audio_live2a</code> 經 rate bridge 轉出的 E／P 走的是同一個入口，適用同一個合約。PCM 與 <code>_spec</code> 家族的輸入是 int16，不會有這個狀況。</p>
+<p>已有自己的分析與合成時用 <code>_freq</code> 家族（頻譜進、頻譜出）：<code>ainr_get_mem_size_freq()</code>、<code>ainr_init_freq()</code>、<code>ainr_preprocess_freq()</code>、<code>ainr_postprocess_freq()</code>。邊界、登錄表、<code>AinrInfo</code> 與 <code>AinrWork</code> 都與 PCM 家族相同，只有交換的資料不同：<code>ainr_preprocess_freq()</code> 收這包 N 個 hop 的估計頻譜 E 與套用頻譜 P（E 與 P 同指標即單頻譜），<code>ainr_postprocess_freq()</code> 輸出 N 個 frame 的增強頻譜（audio 尺度、frame-major、最舊在前；<code>out_re</code>、<code>out_im</code> 各 <code>N * (fft / 2 + 1)</code> 個 float），交給呼叫端的 <code>AcIstft</code>（<code>AC_OLA_ACCUMULATE</code>、<code>ispec_scale</code> 為 1）。分析是呼叫端的 <code>AcStft</code>：<code>ac_stft_config_default()</code>、<code>spec_scale</code> 為 1，輸入是 int16 除以 32768 的 float，每個 hop 推一次；<code>ainr_reset_freq()</code> 之後分析器也要 <code>ac_stft_reset()</code>。這樣的輸出與已移除的 <code>_spec</code> 家族（庫內分析、PCM 進頻譜出）逐位元相同。</p>
+<p><code>_freq</code> 的輸入檢查：<code>ainr_preprocess_freq()</code> 在任何一個 frame 進入模型之前，先掃整包 N 個 frame 的 E 與 P；只要有一個 bin 是 NaN 或 Inf（有限但功率會溢位的 bin 同樣算），整包以 <code>AINR_ERR_NONFINITE_INPUT</code> 拒絕。拒絕時特徵正規化器、frame 佇列與 state generation 都沒有動，也沒有開啟的 block：sample 不要跑加速器，也不要呼叫 <code>ainr_postprocess_freq()</code>（會回 <code>AINR_ERR_SEQUENCE</code>），該包輸出由 sample 自己補，下一包照常呼叫，仍是「一次成功的 pre 對一次 post」。模型沒看過被拒絕的那一包，仍在佇列中的 frame 會晚一包出來，直到佇列深度（<code>AinrInfo.queue_frames</code>）過去才回到原本的對齊。沒有這個檢查時，一個壞 bin 會讓特徵正規化器永久帶 NaN，之後每一包的 ERB／spec 視窗都是 NaN，直到 <code>ainr_reset_freq()</code>。<code>uvc_audio_live2a</code> 經 rate bridge 轉出的 E／P 走的是同一個入口，適用同一個合約。PCM 家族的輸入是 int16，不會有這個狀況。</p>
 <h3>檔案尾端的半個視窗</h3>
 <p>DFN2 以 <code>AC_OLA_ACCUMULATE</code> 合成，沒有 flush：一個 hop 的輸出是這個 frame 合成的前半加上前一個 frame 的後半。最後一段真實樣本落在「從最後一個真實 hop 開始」的分析 frame 裡，要再多一個 hop 的輸入，這個 frame 才完整。</p>
 <ul>
-<li>stream 這邊的佇列（<code>queue_frames</code>）比 PCM 家族的總延遲少一個 hop，但外部合成器的 OLA 還要再一個 hop 才吐出最後一段，所以 <code>trim_samples</code> 與 PCM 家族相同；<code>_spec</code> 的 <code>info.tail_zero_blocks</code> 是同一個值。</li>
+<li>stream 這邊的佇列（<code>queue_frames</code>）比 PCM 家族的總延遲少一個 hop，但外部合成器的 OLA 還要再一個 hop 才吐出最後一段，所以 <code>trim_samples</code> 與 PCM 家族相同；<code>_freq</code> 的 <code>info.tail_zero_blocks</code> 是同一個值。</li>
 <li>先把最後一包補成完整 <code>hop_in</code>，再用同一組 pre／AI3／post 推 <code>tail_zero_blocks</code> 包全零，每包的輸出頻譜都推給外部 ISTFT；輸出前端去掉上表的 <code>trim_samples</code>，保留輸入長度。</li>
-<li>只推 <code>queue_frames</code> 個全零 hop、再多給外部 ISTFT 一個零頻譜，會漏掉最後一個 hop（含最後真實樣本的那個 frame 沒被分析）。在 <code>stream/ainr/tests/test_ainr_tail.c</code> 的 bypass 測項中，最後一個樣本設為 16000：照上述排程時，PCM、<code>_spec</code>、<code>_freq</code> 三個家族都取回 16000（PCM 家族在 48 kHz 為 15999）；錯誤的排程在 full 16 kHz／N=1 取回 2.4，在 48 kHz 的 full 與 lite 取回 0.2。</li>
+<li>只推 <code>queue_frames</code> 個全零 hop 給上游分析器、再多給外部 ISTFT 一個零頻譜，會漏掉最後一個 hop（含最後真實樣本的那個 frame 沒被分析）。在 <code>stream/ainr/tests/test_ainr_tail.c</code> 的 bypass 測項中，最後一個樣本設為 16000：照上述排程時，PCM、<code>_freq</code> 兩個家族都取回 16000（PCM 家族在 48 kHz 為 15999）；錯誤的排程在 full 16 kHz／N=1 取回 2.4，在 48 kHz 的 full 與 lite 取回 0.2。</li>
 <li>使用 <code>AC_OLA_ACCUMULATE</code> 時 <code>ac_istft_flush()</code> 回 0（只有 <code>AC_OLA_ENV_NORM</code> 會回資料），不能靠它補尾；改照上述排程推全零 hop（或全零頻譜）。</li>
 <li><code>_freq</code>：上游分析器要先吐出含最後真實樣本的 E／P frame（對它餵同樣的全零 PCM 包），之後模型佇列再用同樣數量的全零包排空。</li>
 </ul>
@@ -148,10 +148,10 @@ while (read_block(pcm_in, hop_in)) {
 <table>
 <thead><tr><th>組態</th><th>主機替身</th><th>PyTorch</th><th>ONNX Runtime</th><th>正式 bin</th><th>板端</th></tr></thead>
 <tbody>
-<tr><th>full 16 kHz／256／N=1</th><td>已驗：PCM 與 <code>dfn2_stream</code> 參考逐位元相同；<code>_spec</code>／<code>_freq</code> 逐位元相同；三個家族的排尾；work 形狀（<code>test-ainr-model-io</code>）；連結往返</td><td>未驗（此 grid）</td><td>未驗</td><td>未驗</td><td>未驗</td></tr>
-<tr><th>full 16 kHz／256／N=8</th><td>已驗：PCM 兩包與 <code>dfn2_stream</code> 參考逐位元相同；三個家族的排尾；work 形狀（<code>test-ainr-model-io</code>）。<code>_spec</code>／<code>_freq</code> 的逐位元比對只在 N=1 與 N=4 的核心做過，N=8 未做</td><td>未驗（此 grid）</td><td>未驗</td><td>登錄的路徑存在；交付與是否相符未驗</td><td>未驗</td></tr>
-<tr><th>full 48 kHz／1024／N=1</th><td>已驗：<code>_spec</code>／<code>_freq</code> 逐位元相同；三個家族的排尾；work 形狀（<code>test-ainr-model-io</code>）；連結往返</td><td>已驗（隨機小 checkpoint，同 grid、同 N）</td><td>未驗</td><td>未驗</td><td>未驗</td></tr>
-<tr><th>lite 48 kHz／1024／N=1</th><td>已驗：三個家族的排尾；work 形狀（<code>test-ainr-model-io</code>）；產品綁定；連結往返</td><td>已驗（隨機小 checkpoint 的 mask-only 圖，同 grid、同 N）</td><td>未驗</td><td>未驗</td><td>未驗</td></tr>
+<tr><th>full 16 kHz／256／N=1</th><td>已驗：PCM 與 <code>dfn2_stream</code> 參考逐位元相同；PCM 與 <code>_freq</code>（呼叫端 AcStft／AcIstft）逐位元相同；兩個家族的排尾；work 形狀（<code>test-ainr-model-io</code>）；連結往返</td><td>未驗（此 grid）</td><td>未驗</td><td>未驗</td><td>未驗</td></tr>
+<tr><th>full 16 kHz／256／N=8</th><td>已驗：PCM 兩包與 <code>dfn2_stream</code> 參考逐位元相同；PCM 與 <code>_freq</code>（呼叫端 AcStft／AcIstft）兩包逐位元相同（commit 與 bypass 各一包）；兩個家族的排尾；work 形狀（<code>test-ainr-model-io</code>）</td><td>未驗（此 grid）</td><td>未驗</td><td>登錄的路徑存在；交付與是否相符未驗</td><td>未驗</td></tr>
+<tr><th>full 48 kHz／1024／N=1</th><td>已驗：PCM 與 <code>_freq</code>（呼叫端 AcStft／AcIstft）逐位元相同；兩個家族的排尾；work 形狀（<code>test-ainr-model-io</code>）；連結往返</td><td>已驗（隨機小 checkpoint，同 grid、同 N）</td><td>未驗</td><td>未驗</td><td>未驗</td></tr>
+<tr><th>lite 48 kHz／1024／N=1</th><td>已驗：兩個家族的排尾；work 形狀（<code>test-ainr-model-io</code>）；產品綁定；連結往返</td><td>已驗（隨機小 checkpoint 的 mask-only 圖，同 grid、同 N）</td><td>未驗</td><td>未驗</td><td>未驗</td></tr>
 <tr><th><code>uvc_ai_nr_stream</code>（PCM → PCM，48 kHz／1024／N=1）</th><td>PCM 家族的上述項目已驗；sample 本身的重採樣與 AI3 接線未在本庫建置或驗證</td><td>—</td><td>未驗</td><td>未驗</td><td>未驗</td></tr>
 <tr><th><code>uvc_audio_live2a</code>（E／P 頻譜 → 頻譜，經 rate bridge）</th><td><code>_freq</code> 家族的上述項目已驗；bridge 與 AI3 接線未在本庫建置或驗證</td><td>—</td><td>未驗</td><td>未驗</td><td>未驗</td></tr>
 </tbody></table>

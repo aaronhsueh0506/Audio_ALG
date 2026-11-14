@@ -136,58 +136,7 @@ static int run_round_trip(void) {
     return 0;
 }
 
-/* As run_round_trip(), for the "_spec" family (PCM in, enhanced spectrum out) -- confirms the
- * shipped archive exports ainr_*_spec too and that it round-trips on both variants' own
- * shipped-grid catalog row, same as the PCM family above. N = 1, so exactly one frame out. */
-static int run_round_trip_spec(void) {
-    AinrConfig cfg;
-    StreamMemReq req;
-    void *pool;
-    AinrSpecCtx *ctx = NULL;
-    AinrInfo info;
-    char erb_path[64];
-    int hop = EXPECT_FFT / 2;
-    int16_t pcm_in[EXPECT_FFT / 2];
-    float out_re[EXPECT_N_BINS], out_im[EXPECT_N_BINS];
-    AinrWork io;
-    int rc, i;
-
-    snprintf(erb_path, sizeof(erb_path), "/tmp/ainr_link_only_spec_erb_%d.bin", (int)getpid());
-    write_synthetic_erb(erb_path, EXPECT_N_BINS, EXPECT_N_ERB);
-
-    cfg.sr = EXPECT_SR;
-    cfg.fft = EXPECT_FFT;
-    cfg.hop_in = hop;
-
-    if (ainr_get_mem_size_spec(&cfg, &req) != AINR_OK) { fprintf(stderr, "ainr_get_mem_size_spec fail\n"); return 1; }
-    pool = alloc_aligned((size_t)req.bytes, req.alignment);
-    if (ainr_init_spec_from_erb_file(&cfg, erb_path, pool, (size_t)req.bytes, &ctx, &info) != AINR_OK || !ctx) { fprintf(stderr, "ainr_init_spec_from_erb_file fail\n"); return 1; }
-
-    for (i = 0; i < hop; ++i) pcm_in[i] = (int16_t)((i * 13) % 211 - 100);
-    rc = ainr_preprocess_spec(ctx, pcm_in, &io);
-    if (rc != AINR_OK) { fprintf(stderr, "ainr_preprocess_spec rc=%d\n", rc); return 1; }
-
-    if (io.input_count != EXPECT_INPUT_COUNT || io.output_count != EXPECT_OUTPUT_COUNT) {
-        fprintf(stderr, "link_only_ainr (_spec): input_count=%d output_count=%d, expected %d/%d\n",
-               io.input_count, io.output_count, EXPECT_INPUT_COUNT, EXPECT_OUTPUT_COUNT);
-        return 1;
-    }
-    if (check_work_tensors(&io) != 0) return 1;
-    for (i = 0; i < io.output_count; ++i) {
-        size_t k;
-        for (k = 0; k < io.outputs[i].elements; ++k) io.outputs[i].data[k] = 0.0f;
-    }
-    rc = ainr_postprocess_spec(ctx, 0, out_re, out_im);
-    if (rc != AINR_OK) { fprintf(stderr, "ainr_postprocess_spec rc=%d\n", rc); return 1; }
-
-    unlink(erb_path);
-    free(pool);
-    printf("link_only_ainr (_spec): round trip OK (%d Hz/fft %d)\n",
-          EXPECT_SR, EXPECT_FFT);
-    return 0;
-}
-
-/* As run_round_trip_spec(), for the "_freq" family (spectrum in, enhanced spectrum out) --
+/* As run_round_trip(), for the "_freq" family (spectrum in, enhanced spectrum out) --
  * E == P (same synthetic spectrum passed as both est and app). */
 static int run_round_trip_freq(void) {
     AinrConfig cfg;
@@ -239,7 +188,6 @@ static int run_round_trip_freq(void) {
 
 int main(void) {
     if (run_round_trip() != 0) return 1;
-    if (run_round_trip_spec() != 0) return 1;
     if (run_round_trip_freq() != 0) return 1;
     return 0;
 }

@@ -29,13 +29,6 @@
 #define IS_ALIGN 0
 #endif
 
-_Static_assert(AI3_MODEL_IO_DEEPVQES_LAYOUT == DEEPVQE_PREPOST_LAYOUT_VERSION, "DeepVQE-S layout version");
-_Static_assert(AI3_MODEL_IO_ALIGNULCNET_LAYOUT_ONE_FRAME == ULCNET_MODEL_IO_LAYOUT_VERSION, "Align-ULCNet layout 18");
-_Static_assert(AI3_MODEL_IO_ALIGNULCNET_LAYOUT_PACKET == ULCNET_MODEL_IO_PACKET_LAYOUT_VERSION, "Align-ULCNet layout 19");
-
-/* AiaecInfo is the init's slim result (graph, trim, queue, tail): no port list can sit inside it. */
-typedef char info_stays_slim[sizeof(AiaecInfo) <= sizeof(const char *) + 4 * sizeof(int) ? 1 : -1];
-
 /* Trim, queue and tail of the 16 kHz rows, as literals (the pre-batching delay of DeepVQE-S is N hops, Align-ULCNet's is one). */
 static const struct { int fft, n, trim_dv, queue_dv, trim_align; } INFO_ROWS[] = {
     { 256, 1, 128, 0, 128 }, { 256, 8, 1024, 7, 128 }, { 512, 1, 256, 0, 256 },
@@ -159,6 +152,21 @@ int main(void)
     int si, fi, n, accepted = 0, rows_hit = 0, compared = 0, family;
     AiaecInfo infos[3];
     int row;
+
+    /* The wiring tables and the libraries name the same graph layouts. */
+    CHECK(AI3_MODEL_IO_DEEPVQES_LAYOUT == DEEPVQE_PREPOST_LAYOUT_VERSION,
+          "DeepVQE-S layout version: table %d, deepvqe_prepost.h %d", (int)AI3_MODEL_IO_DEEPVQES_LAYOUT,
+          (int)DEEPVQE_PREPOST_LAYOUT_VERSION);
+    CHECK(AI3_MODEL_IO_ALIGNULCNET_LAYOUT_ONE_FRAME == ULCNET_MODEL_IO_LAYOUT_VERSION,
+          "Align-ULCNet one-frame layout: table %d, ulcnet_model_io.h %d", (int)AI3_MODEL_IO_ALIGNULCNET_LAYOUT_ONE_FRAME,
+          (int)ULCNET_MODEL_IO_LAYOUT_VERSION);
+    CHECK(AI3_MODEL_IO_ALIGNULCNET_LAYOUT_PACKET == ULCNET_MODEL_IO_PACKET_LAYOUT_VERSION,
+          "Align-ULCNet packet layout: table %d, ulcnet_model_io.h %d", (int)AI3_MODEL_IO_ALIGNULCNET_LAYOUT_PACKET,
+          (int)ULCNET_MODEL_IO_PACKET_LAYOUT_VERSION);
+    /* AiaecInfo is the init's slim result (graph, trim, queue, tail): no port list can sit inside it. */
+    CHECK(sizeof(AiaecInfo) <= sizeof(const char *) + 4 * sizeof(int),
+          "AiaecInfo grew to %zu bytes (graph path + 4 ints = %zu)", sizeof(AiaecInfo),
+          sizeof(const char *) + 4 * sizeof(int));
 
     for (si = 0; si < 2; ++si) for (fi = 0; fi < 4; ++fi) for (n = 1; n <= 8; ++n) {
         AiaecConfig cfg;

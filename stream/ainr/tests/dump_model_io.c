@@ -11,12 +11,21 @@
 #include "ai3_model_io.h"
 #include "ai3_model_io_dfn2.h"
 
-_Static_assert(AI3_MODEL_IO_DFN2_LAYOUT_FULL == DFN2_MODEL_IO_LAYOUT_VERSION_FULL, "full layout version");
-_Static_assert(AI3_MODEL_IO_DFN2_LAYOUT_LITE == DFN2_MODEL_IO_LAYOUT_VERSION_MASK_ONLY, "lite layout version");
-
 int main(void)
 {
     int r, i;
+
+    /* The rows carry the layout numbers of dfn2_model_io.h; a stale table must not reach the Python pin. */
+    if (AI3_MODEL_IO_DFN2_LAYOUT_FULL != DFN2_MODEL_IO_LAYOUT_VERSION_FULL) {
+        fprintf(stderr, "full layout version: table %d, library %d\n", (int)AI3_MODEL_IO_DFN2_LAYOUT_FULL,
+                (int)DFN2_MODEL_IO_LAYOUT_VERSION_FULL);
+        return 2;
+    }
+    if (AI3_MODEL_IO_DFN2_LAYOUT_LITE != DFN2_MODEL_IO_LAYOUT_VERSION_MASK_ONLY) {
+        fprintf(stderr, "lite layout version: table %d, library %d\n", (int)AI3_MODEL_IO_DFN2_LAYOUT_LITE,
+                (int)DFN2_MODEL_IO_LAYOUT_VERSION_MASK_ONLY);
+        return 2;
+    }
 
     for (r = 0; r < AI3_MODEL_IO_DFN2_ROW_COUNT; ++r) {
         Ai3ModelIoConfig c;

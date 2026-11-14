@@ -77,13 +77,6 @@ typedef struct DFN2StreamMemReq {
     uint64_t bytes;
 } DFN2StreamMemReq;
 
-#ifdef __STDC_VERSION__
-#if __STDC_VERSION__ >= 201112L
-_Static_assert(sizeof(DFN2StreamMemReq) == 32,
-               "DFN2StreamMemReq must stay 32 bytes");
-#endif
-#endif
-
 typedef struct DFN2Stream DFN2Stream;
 
 /* DFN2HopIO's size depends on DFN2_MASK_ONLY, so every entry point is suffixed _mask_only under it: a

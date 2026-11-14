@@ -89,13 +89,6 @@ typedef struct DFN2PrepostMemReq {
     uint64_t bytes;
 } DFN2PrepostMemReq;
 
-#ifdef __STDC_VERSION__
-#if __STDC_VERSION__ >= 201112L
-_Static_assert(sizeof(DFN2PrepostMemReq) == 32,
-               "DFN2PrepostMemReq must stay 32 bytes");
-#endif
-#endif
-
 typedef struct DFN2Prepost DFN2Prepost;
 
 /* Accelerator inputs, pointers into the pool valid for the instance's life. State tensors are the registered

@@ -58,13 +58,6 @@ typedef struct UlcnetStreamMemReq {
     uint64_t bytes;
 } UlcnetStreamMemReq;
 
-#ifdef __STDC_VERSION__
-#if __STDC_VERSION__ >= 201112L
-_Static_assert(sizeof(UlcnetStreamMemReq) == 32,
-               "UlcnetStreamMemReq must stay 32 bytes");
-#endif
-#endif
-
 typedef struct UlcnetStream UlcnetStream;
 
 /* Exact pool size for cfg. -1 (req untouched) on NULL or an invalid grid. */

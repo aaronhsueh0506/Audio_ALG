@@ -15,6 +15,7 @@
 #include <string.h>
 
 #include "ulcnet_stream.h"
+#include "utility/mem_align.h"
 
 /* Writes a zero mask and zero to every registered state_out -- shape correctness only, no
  * numerical realism. This smoke test registers no state, so only output is touched. */
@@ -90,6 +91,17 @@ int main(void) {
     int hop, hops, i, k;
     int bare_bypass_rc;
     const int reprime_hop = 5;
+
+    /* The descriptor is a fixed-width 32-byte POD and the carve alignment is audiolib's 16 bytes. */
+    if (sizeof(UlcnetStreamMemReq) != 32u) {
+        fprintf(stderr, "FAIL: UlcnetStreamMemReq is %zu bytes, pinned to 32\n", sizeof(UlcnetStreamMemReq));
+        return 1;
+    }
+    if ((size_t)ULCNET_STREAM_ALIGNMENT != 16u || ck_align16_size(1u) != (size_t)ULCNET_STREAM_ALIGNMENT) {
+        fprintf(stderr, "FAIL: ULCNET_STREAM_ALIGNMENT is %zu (ck_align16_size(1) = %zu), pinned to the shared 16\n",
+                (size_t)ULCNET_STREAM_ALIGNMENT, ck_align16_size(1u));
+        return 1;
+    }
 
     memset(&spec, 0, sizeof(spec));
     spec.sample_rate = 16000;

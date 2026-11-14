@@ -13,10 +13,6 @@
 #include "ai3_model_io_deepvqes.h"
 #include "ai3_model_io_alignulcnet.h"
 
-_Static_assert(AI3_MODEL_IO_DEEPVQES_LAYOUT == DEEPVQE_PREPOST_LAYOUT_VERSION, "DeepVQE-S layout version");
-_Static_assert(AI3_MODEL_IO_ALIGNULCNET_LAYOUT_ONE_FRAME == ULCNET_MODEL_IO_LAYOUT_VERSION, "Align-ULCNet layout 18");
-_Static_assert(AI3_MODEL_IO_ALIGNULCNET_LAYOUT_PACKET == ULCNET_MODEL_IO_PACKET_LAYOUT_VERSION, "Align-ULCNet layout 19");
-
 static void dump(const char *name, const Ai3ModelIoConfig *c)
 {
     const StreamWiring *w = &c->wiring;
@@ -36,6 +32,17 @@ int main(void)
 {
     Ai3ModelIoConfig c;
     int i;
+
+    /* The rows carry the layout numbers of the model libraries; a stale table must not reach the Python pin. */
+    if (AI3_MODEL_IO_DEEPVQES_LAYOUT != DEEPVQE_PREPOST_LAYOUT_VERSION ||
+        AI3_MODEL_IO_ALIGNULCNET_LAYOUT_ONE_FRAME != ULCNET_MODEL_IO_LAYOUT_VERSION ||
+        AI3_MODEL_IO_ALIGNULCNET_LAYOUT_PACKET != ULCNET_MODEL_IO_PACKET_LAYOUT_VERSION) {
+        fprintf(stderr, "layout version: DeepVQE-S table %d lib %d, Align-ULCNet table %d/%d lib %d/%d\n",
+                (int)AI3_MODEL_IO_DEEPVQES_LAYOUT, (int)DEEPVQE_PREPOST_LAYOUT_VERSION,
+                (int)AI3_MODEL_IO_ALIGNULCNET_LAYOUT_ONE_FRAME, (int)AI3_MODEL_IO_ALIGNULCNET_LAYOUT_PACKET,
+                (int)ULCNET_MODEL_IO_LAYOUT_VERSION, (int)ULCNET_MODEL_IO_PACKET_LAYOUT_VERSION);
+        return 2;
+    }
 
     for (i = 0; i < AI3_MODEL_IO_DEEPVQES_ROW_COUNT; ++i) {
         if (ai3_model_io_deepvqes_row(i, &c) != AI3_MODEL_IO_OK) return 1;

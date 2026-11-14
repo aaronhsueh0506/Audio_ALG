@@ -7,12 +7,14 @@
  * pool) byte-identical. The registration rule, the board form (nothing registered), the stale-pool gate, the
  * scan of the registered state and the warm-up frames have their own functions below. */
 #include <math.h>
+#include <stddef.h>
 #include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 
 #include "audio_stft.h"
+#include "utility/mem_align.h"
 #include "utility/simd_kernels.h"
 #include "../lib/ainr/dfn3/dfn3_prepost.h"
 
@@ -1191,6 +1193,59 @@ static int norm_seed_keeps_both_ends(void) {
     return 0;
 }
 
+/* The ABI a caller's pool or adapter is built against: PIN prints the pinned fact and both numbers on a mismatch. */
+static int pin_eq(const char *what, unsigned long long got, unsigned long long want) {
+    if (got == want) return 1;
+    fprintf(stderr, "DFN3 pin failed: %s is %llu, pinned to %llu\n", what, got, want);
+    return 0;
+}
+#define PIN(expr, want) pin_eq(#expr, (unsigned long long)(expr), (unsigned long long)(want))
+
+/* DFN3PrepostMemReq is a 32-byte POD and the carve alignment is audiolib's 16 bytes. DFN3ModelIoDescriptor is the
+ * 18-int, 72-byte struct an adapter was compiled against: its twelve external fields are the ones default() writes
+ * and validate() compares, the six interior ones are zero from default() and never compared, so a field added to
+ * the struct but to neither list changes the size or breaks the 12 / 6 split. */
+static int abi_pins(void) {
+    static const size_t external[] = {
+        offsetof(DFN3ModelIoDescriptor, layout_version), offsetof(DFN3ModelIoDescriptor, sample_rate),
+        offsetof(DFN3ModelIoDescriptor, fft_size), offsetof(DFN3ModelIoDescriptor, hop_size),
+        offsetof(DFN3ModelIoDescriptor, spectrum_bins), offsetof(DFN3ModelIoDescriptor, erb_bands),
+        offsetof(DFN3ModelIoDescriptor, df_bins), offsetof(DFN3ModelIoDescriptor, df_order),
+        offsetof(DFN3ModelIoDescriptor, mask_lookahead), offsetof(DFN3ModelIoDescriptor, df_lookahead),
+        offsetof(DFN3ModelIoDescriptor, input_frames), offsetof(DFN3ModelIoDescriptor, state_tensor_count),
+    };
+    static const size_t interior[] = {
+        offsetof(DFN3ModelIoDescriptor, encoder_gru_layers), offsetof(DFN3ModelIoDescriptor, erb_gru_layers),
+        offsetof(DFN3ModelIoDescriptor, df_gru_layers), offsetof(DFN3ModelIoDescriptor, gru_hidden),
+        offsetof(DFN3ModelIoDescriptor, encoder_channels), offsetof(DFN3ModelIoDescriptor, df_pathway_window),
+    };
+    DFN3ModelIoDescriptor d;
+    size_t i;
+
+    CHECK(PIN(sizeof(DFN3PrepostMemReq), 32));
+    CHECK(PIN(DFN3_PREPOST_ALIGNMENT, 16) && PIN(ck_align16_size(1u), DFN3_PREPOST_ALIGNMENT));
+    CHECK(PIN(sizeof(DFN3ModelIoDescriptor), 72));
+    CHECK(PIN(sizeof(DFN3ModelIoDescriptor) / sizeof(int), 18));
+    CHECK(PIN(sizeof(external) / sizeof(external[0]) + sizeof(interior) / sizeof(interior[0]),
+              sizeof(DFN3ModelIoDescriptor) / sizeof(int)));
+    for (i = 0; i < sizeof(external) / sizeof(external[0]); ++i) {
+        CHECK(dfn3_model_io_descriptor_default(&G, &d) == 0);
+        *(unsigned int *)((unsigned char *)&d + external[i]) ^= 0x40u;
+        if (dfn3_model_io_descriptor_validate(&G, &d) != -1)
+            fprintf(stderr, "DFN3 external descriptor field at offset %zu is not validated\n", external[i]);
+        CHECK(dfn3_model_io_descriptor_validate(&G, &d) == -1);
+    }
+    for (i = 0; i < sizeof(interior) / sizeof(interior[0]); ++i) {
+        CHECK(dfn3_model_io_descriptor_default(&G, &d) == 0);
+        CHECK(*(int *)((unsigned char *)&d + interior[i]) == 0);
+        *(int *)((unsigned char *)&d + interior[i]) = 7;
+        if (dfn3_model_io_descriptor_validate(&G, &d) != 0)
+            fprintf(stderr, "DFN3 interior descriptor field at offset %zu is validated\n", interior[i]);
+        CHECK(dfn3_model_io_descriptor_validate(&G, &d) == 0);
+    }
+    return 0;
+}
+
 int main(int argc, char **argv) {
     const DFN3GridSpec spec = test_spec();
     CHECK(dfn3_grid_make(&G, &spec) == DFN3_GRID_OK);
@@ -1201,6 +1256,7 @@ int main(int argc, char **argv) {
     if (argc == 4 && strcmp(argv[1], "req_check") == 0)
         return req_check(argv[2], atoi(argv[3]));
     CHECK(argc == 1);
+    CHECK(abi_pins() == 0);
     CHECK(tap_timing() == 0);
     CHECK(every_tap_reads_its_frame() == 0);
     CHECK(heads_stay_with_their_frame() == 0);

@@ -1,12 +1,11 @@
-/* The end-of-input tail through all three families, against a bypassing stand-in accelerator
+/* The end-of-input tail through both families, against a bypassing stand-in accelerator
  * (infer_status != 0: unit mask, alpha 0 -- the near-identity pass-through). A single 16000-count
  * sample is placed at the very last real input sample; the test reads it back at output index
  * (real length - 1 + trim_samples) after the documented drain (ainr.h "Tail"): tail_zero_blocks
  * all-zero hop_in blocks after the last real block.
  *
  *   PCM family   ainr_preprocess/ainr_postprocess, internal ISTFT.
- *   _spec        ainr_preprocess_spec/ainr_postprocess_spec, external AcIstft (ACCUMULATE, scale 1).
- *   _freq        an upstream AcStft feeds E == P; same external AcIstft.
+ *   _freq        an upstream AcStft feeds E == P; an external AcIstft (ACCUMULATE, scale 1) synthesises.
  *
  * It also reproduces the failing procedure -- draining only queue_frames zero hops of PCM
  * and then one zero SPECTRUM -- and asserts that it loses the pulse. Covers full (16 kHz/256 N=1
@@ -63,7 +62,7 @@ static int run_case(int sr, int fft, int n_erb, int n, int want_queue, int want_
                     const char *label) {
     AinrConfig cfg;
     StreamMemReq req;
-    AinrInfo bi_pcm, bi_spec, bi_freq;
+    AinrInfo bi_pcm, bi_freq;
     int hop = fft / 2, n_bins = fft / 2 + 1, hop_in = n * hop;
     int tail, total_blocks, b, f, k, bad = 0;
     size_t s_real = (size_t)BLOCKS_REAL * (size_t)hop_in, total = 0, idx;
@@ -72,7 +71,6 @@ static int run_case(int sr, int fft, int n_erb, int n, int want_queue, int want_
     char erb[160];
     void *pool;
     AinrCtx *cp;
-    AinrSpecCtx *cs;
     AinrFreqCtx *cf;
     Ola ola;
     double v;
@@ -88,23 +86,21 @@ static int run_case(int sr, int fft, int n_erb, int n, int want_queue, int want_
         fprintf(stderr, "%s: init fail\n", label); return 1;
     }
     tail = bi_pcm.tail_zero_blocks;
-    {   /* the other two families report the same lengths */
-        StreamMemReq rs, rf;
-        void *pool_s, *pool_f;
-        const AinrInfo *all[3];
+    {   /* the _freq family reports the same lengths */
+        StreamMemReq rf;
+        void *pool_f;
+        const AinrInfo *all[2];
         int fi;
-        if (ainr_get_mem_size_spec(&cfg, &rs) != AINR_OK || ainr_get_mem_size_freq(&cfg, &rf) != AINR_OK) {
-            fprintf(stderr, "%s: spec/freq size fail\n", label); return 1;
+        if (ainr_get_mem_size_freq(&cfg, &rf) != AINR_OK) {
+            fprintf(stderr, "%s: freq size fail\n", label); return 1;
         }
-        pool_s = alloc_aligned((size_t)rs.bytes, rs.alignment);
         pool_f = alloc_aligned((size_t)rf.bytes, rf.alignment);
-        if (ainr_init_spec_from_erb_file(&cfg, erb, pool_s, (size_t)rs.bytes, &cs, &bi_spec) != AINR_OK ||
-            ainr_init_freq_from_erb_file(&cfg, erb, pool_f, (size_t)rf.bytes, &cf, &bi_freq) != AINR_OK) {
-            fprintf(stderr, "%s: spec/freq init fail\n", label); return 1;
+        if (ainr_init_freq_from_erb_file(&cfg, erb, pool_f, (size_t)rf.bytes, &cf, &bi_freq) != AINR_OK) {
+            fprintf(stderr, "%s: freq init fail\n", label); return 1;
         }
-        free(pool_s); free(pool_f);
-        all[0] = &bi_pcm; all[1] = &bi_spec; all[2] = &bi_freq;
-        for (fi = 0; fi < 3; ++fi) {
+        free(pool_f);
+        all[0] = &bi_pcm; all[1] = &bi_freq;
+        for (fi = 0; fi < 2; ++fi) {
             if (all[fi]->queue_frames != want_queue || all[fi]->trim_samples != want_trim ||
                 all[fi]->tail_zero_blocks != want_tail) {
                 fprintf(stderr, "%s: family %d info queue %d trim %d tail %d, want %d / %d / %d\n", label, fi,
@@ -140,48 +136,30 @@ static int run_case(int sr, int fft, int n_erb, int n, int want_queue, int want_
     if (!bad) printf("%s: PCM family tail OK, out[%zu] = %.1f (tail blocks %d)\n", label, idx, v, tail);
     free(pool);
 
-    /* _spec family + external ISTFT. */
-    {
-        StreamMemReq rs;
-        int rc;
-        if (ainr_get_mem_size_spec(&cfg, &rs) != AINR_OK) { fprintf(stderr, "%s: spec size fail\n", label); return 1; }
-        pool = alloc_aligned((size_t)rs.bytes, rs.alignment);
-        if (ainr_init_spec_from_erb_file(&cfg, erb, pool, (size_t)rs.bytes, &cs, &bi_spec) != AINR_OK || !cs) {
-            fprintf(stderr, "%s: spec init fail\n", label); return 1;
-        }
-        ola = ola_make(fft);
-        memset(outf, 0, total * sizeof(float));
-        for (b = 0; b < total_blocks; ++b) {
-            AinrWork io;
-            rc = ainr_preprocess_spec(cs, pcm + (size_t)b * (size_t)hop_in, &io);
-            if (rc != AINR_OK) { fprintf(stderr, "%s: spec pre block %d rc=%d\n", label, b, rc); return 1; }
-            rc = ainr_postprocess_spec(cs, 1, fre, fim);
-            if (rc != AINR_OK) { fprintf(stderr, "%s: spec post block %d rc=%d\n", label, b, rc); return 1; }
-            for (f = 0; f < n; ++f)
-                ac_istft_push_planar(ola.istft, fre + (size_t)f * (size_t)n_bins, fim + (size_t)f * (size_t)n_bins,
-                                     outf + ((size_t)b * (size_t)n + (size_t)f) * (size_t)hop);
-        }
-        bad |= check_pulse(outf, total, idx, label, &v);
-        if (!bad) printf("%s: _spec + external ISTFT tail OK, out[%zu] = %.1f\n", label, idx, v);
-        free(pool); free(ola.mem);
-    }
-
-    /* The failing procedure (N=1): only the reported _spec delay in zero PCM hops, then one zero
-     * SPECTRUM to the external ISTFT -- the last real hop is never analysed. */
+    /* The failing procedure (N=1): only the reported delay in zero PCM hops through the upstream analyser,
+     * then one zero SPECTRUM to the external ISTFT -- the last real hop is never analysed. */
     if (n == 1) {
-        StreamMemReq rs;
-        int zero_hops = bi_spec.queue_frames;
+        StreamMemReq rf;
+        AcStftConfig sc;
+        AcStft *st;
+        void *stm;
+        int zero_hops = bi_freq.queue_frames;
         float *zre = (float *)calloc((size_t)n_bins, sizeof(float));
         float *zim = (float *)calloc((size_t)n_bins, sizeof(float));
-        if (ainr_get_mem_size_spec(&cfg, &rs) != AINR_OK) return 1;
-        pool = alloc_aligned((size_t)rs.bytes, rs.alignment);
-        if (ainr_init_spec_from_erb_file(&cfg, erb, pool, (size_t)rs.bytes, &cs, &bi_spec) != AINR_OK || !cs) return 1;
+        ac_stft_config_default(&sc, fft);
+        stm = alloc_aligned(ac_stft_get_mem_size(&sc), 16);
+        st = ac_stft_init(stm, ac_stft_get_mem_size(&sc), &sc);
+        if (!st || ainr_get_mem_size_freq(&cfg, &rf) != AINR_OK) return 1;
+        pool = alloc_aligned((size_t)rf.bytes, rf.alignment);
+        if (ainr_init_freq_from_erb_file(&cfg, erb, pool, (size_t)rf.bytes, &cf, &bi_freq) != AINR_OK || !cf) return 1;
         ola = ola_make(fft);
         memset(outf, 0, total * sizeof(float));
         for (b = 0; b < BLOCKS_REAL + zero_hops; ++b) {
             AinrWork io;
-            if (ainr_preprocess_spec(cs, pcm + (size_t)b * (size_t)hop_in, &io) != AINR_OK ||
-                ainr_postprocess_spec(cs, 1, fre, fim) != AINR_OK) return 1;
+            for (k = 0; k < hop; ++k) hopf[k] = (float)pcm[(size_t)b * (size_t)hop + (size_t)k] / 32768.0f;
+            ac_stft_push_planar(st, hopf, are, aim);
+            if (ainr_preprocess_freq(cf, are, aim, are, aim, &io) != AINR_OK ||
+                ainr_postprocess_freq(cf, 1, fre, fim) != AINR_OK) return 1;
             ac_istft_push_planar(ola.istft, fre, fim, outf + (size_t)b * (size_t)hop);
         }
         ac_istft_push_planar(ola.istft, zre, zim, outf + (size_t)b * (size_t)hop);
@@ -193,7 +171,7 @@ static int run_case(int sr, int fft, int n_erb, int n, int want_queue, int want_
             printf("%s: reported-delay drain + zero spectrum loses the tail: out[%zu] = %.1f (want %d)\n",
                    label, idx, v, PULSE);
         }
-        free(pool); free(ola.mem); free(zre); free(zim);
+        free(pool); free(ola.mem); free(zre); free(zim); free(stm);
     }
 
     /* _freq family: the upstream analyser sees the same zero blocks of PCM. */

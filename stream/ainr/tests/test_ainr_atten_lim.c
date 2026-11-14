@@ -1,6 +1,6 @@
 /* ainr_set_atten_lim*(): the limit reaches the enhance stage (a fully suppressing mask leaves more
  * energy under a 20 dB limit than with the limit disabled), the value survives ainr_reset(), and the
- * three families refuse NULL, NaN/Inf and a call with a block open. Not built under NO_STDIO. */
+ * two families refuse NULL, NaN/Inf and a call with a block open. Not built under NO_STDIO. */
 
 #include <math.h>
 #include <stdint.h>
@@ -49,7 +49,6 @@ static int run_case(int sr, int fft, int n_erb, int n, const char *label) {
     AinrConfig cfg;
     StreamMemReq req;
     AinrCtx *ctx;
-    AinrSpecCtx *sp;
     AinrFreqCtx *fq;
     AinrWork io;
     AinrInfo info;
@@ -91,24 +90,16 @@ static int run_case(int sr, int fft, int n_erb, int n, const char *label) {
     if (ainr_set_atten_lim(ctx, 6.0f) != AINR_OK) FAIL("set after post refused");
     free(buf);
 
-    /* Same refusals on the other two families. */
-    if (ainr_get_mem_size_spec(&cfg, &req) != AINR_OK) FAIL("spec size");
-    sp = NULL;
-    if (ainr_init_spec_from_erb_file(&cfg, erb, alloc_aligned((size_t)req.bytes, req.alignment), (size_t)req.bytes, &sp, &info) != AINR_OK) sp = NULL;
+    /* Same refusals on the _freq family. */
     if (ainr_get_mem_size_freq(&cfg, &req) != AINR_OK) FAIL("freq size");
     fq = NULL;
     if (ainr_init_freq_from_erb_file(&cfg, erb, alloc_aligned((size_t)req.bytes, req.alignment), (size_t)req.bytes, &fq, &info) != AINR_OK) fq = NULL;
-    if (!sp || !fq) FAIL("spec/freq init failed");
+    if (!fq) FAIL("freq init failed");
     z = (float *)calloc((size_t)n * (size_t)n_bins * 4u, sizeof(float));
     buf = (int16_t *)calloc((size_t)cfg.hop_in, sizeof(int16_t));
-    if (ainr_set_atten_lim_spec(sp, 12.0f) != AINR_OK || ainr_set_atten_lim_freq(fq, 12.0f) != AINR_OK) FAIL("spec/freq set refused");
-    if (ainr_set_atten_lim_spec(sp, NAN) != AINR_ERR_NONFINITE_INPUT || ainr_set_atten_lim_freq(fq, NAN) != AINR_ERR_NONFINITE_INPUT)
-        FAIL("spec/freq NaN not refused");
-    if (ainr_set_atten_lim_spec(NULL, 1.0f) != AINR_ERR_NULL || ainr_set_atten_lim_freq(NULL, 1.0f) != AINR_ERR_NULL)
-        FAIL("spec/freq NULL not refused");
-    if (ainr_preprocess_spec(sp, buf, &io) != AINR_OK) FAIL("spec pre failed");
-    if (ainr_set_atten_lim_spec(sp, 6.0f) != AINR_ERR_SEQUENCE) FAIL("spec open block not refused");
-    if (ainr_postprocess_spec(sp, -1, z, z + (size_t)n * (size_t)n_bins) != AINR_OK) FAIL("spec post failed");
+    if (ainr_set_atten_lim_freq(fq, 12.0f) != AINR_OK) FAIL("freq set refused");
+    if (ainr_set_atten_lim_freq(fq, NAN) != AINR_ERR_NONFINITE_INPUT) FAIL("freq NaN not refused");
+    if (ainr_set_atten_lim_freq(NULL, 1.0f) != AINR_ERR_NULL) FAIL("freq NULL not refused");
     if (ainr_preprocess_freq(fq, z, z + (size_t)n * (size_t)n_bins, z, z + (size_t)n * (size_t)n_bins, &io) != AINR_OK) FAIL("freq pre failed");
     if (ainr_set_atten_lim_freq(fq, 6.0f) != AINR_ERR_SEQUENCE) FAIL("freq open block not refused");
     if (ainr_postprocess_freq(fq, -1, z + (size_t)n * (size_t)n_bins * 2u, z + (size_t)n * (size_t)n_bins * 3u) != AINR_OK) FAIL("freq post failed");

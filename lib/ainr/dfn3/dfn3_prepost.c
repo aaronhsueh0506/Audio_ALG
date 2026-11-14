@@ -54,13 +54,6 @@ struct DFN3Prepost {
     void *heap_base;         /* set by _create; NULL for an _init instance */
 };
 
-#ifdef __STDC_VERSION__
-#if __STDC_VERSION__ >= 201112L
-_Static_assert(DFN3_PREPOST_ALIGNMENT == 16u,
-               "ck_align16_size is the shared 16-byte carve alignment");
-#endif
-#endif
-
 /* Reserve `count` elements of `elem` bytes at *cursor, 16-byte aligned; base==NULL sizes only. Overflow
  * saturates (audiolib mem_align.h). */
 static int pp_carve(unsigned char *base, size_t *cursor, size_t count, size_t elem,

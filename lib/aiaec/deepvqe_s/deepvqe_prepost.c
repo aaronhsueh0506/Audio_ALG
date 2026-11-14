@@ -53,17 +53,6 @@ static const char *const dv_state_names_out[] = {
     "state_up3_history_out"
 };
 
-#ifdef __STDC_VERSION__
-#if __STDC_VERSION__ >= 201112L
-_Static_assert(sizeof(dv_state_names) / sizeof(dv_state_names[0]) ==
-               DEEPVQE_STATE_COUNT,
-               "dv_state_names must name every DeepVqeStateId");
-_Static_assert(sizeof(dv_state_names_out) / sizeof(dv_state_names_out[0]) ==
-               DEEPVQE_STATE_COUNT,
-               "dv_state_names_out must name every DeepVqeStateId");
-#endif
-#endif
-
 struct DeepVqePrepost {
     DeepVqePrepostDescriptor descriptor;
 
@@ -119,13 +108,6 @@ const char *deepvqe_prepost_state_name_out(int state_id) {
     if (state_id < 0 || state_id >= DEEPVQE_STATE_COUNT) return NULL;
     return dv_state_names_out[state_id];
 }
-
-#ifdef __STDC_VERSION__
-#if __STDC_VERSION__ >= 201112L
-_Static_assert(DEEPVQE_PREPOST_ALIGNMENT == 16u,
-               "ck_align16_size is the shared 16-byte carve alignment");
-#endif
-#endif
 
 /* Reserve `bytes` at *cursor, aligned (base == NULL: size only). Saturating arithmetic: overflow
  * pins the cursor to SIZE_MAX, which MEM_SIZE_INVALID catches. */

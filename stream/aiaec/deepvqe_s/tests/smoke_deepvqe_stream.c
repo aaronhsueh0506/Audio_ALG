@@ -10,6 +10,7 @@
 #include <string.h>
 
 #include "deepvqe_stream.h"
+#include "utility/mem_align.h"
 
 /* Writes zeros/success to taps and every registered state_out -- shape correctness only, no
  * numerical realism. This smoke test registers no state, so only taps is touched. */
@@ -121,6 +122,17 @@ int main(void) {
     void *pool;
     int16_t *mic_in, *far_in, *pcm_out;
     int hop, hops, i, k;
+
+    /* The descriptor is a fixed-width 32-byte POD and the carve alignment is audiolib's 16 bytes. */
+    if (sizeof(DeepVqeStreamMemReq) != 32u) {
+        fprintf(stderr, "FAIL: DeepVqeStreamMemReq is %zu bytes, pinned to 32\n", sizeof(DeepVqeStreamMemReq));
+        return 1;
+    }
+    if ((size_t)DEEPVQE_STREAM_ALIGNMENT != 16u || ck_align16_size(1u) != (size_t)DEEPVQE_STREAM_ALIGNMENT) {
+        fprintf(stderr, "FAIL: DEEPVQE_STREAM_ALIGNMENT is %zu (ck_align16_size(1) = %zu), pinned to the shared 16\n",
+                (size_t)DEEPVQE_STREAM_ALIGNMENT, ck_align16_size(1u));
+        return 1;
+    }
 
     memset(&spec, 0, sizeof(spec));
     spec.sample_rate = 16000;

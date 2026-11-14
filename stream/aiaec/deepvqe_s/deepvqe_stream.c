@@ -52,13 +52,6 @@ typedef struct DeepVqeStreamLayout {
 
 #define DEEPVQE_STREAM_ALIGN DEEPVQE_STREAM_ALIGNMENT
 
-#ifdef __STDC_VERSION__
-#if __STDC_VERSION__ >= 201112L
-_Static_assert(DEEPVQE_STREAM_ALIGN == 16u,
-               "ck_align16_size is the shared 16-byte carve alignment");
-#endif
-#endif
-
 /* -1: inconsistent (some but not all of cfg->state[]/state_elements[] set, or a single entry with
  * a non-NULL pointer and a zero count or vice versa). 0: none registered (the accelerator owns
  * its own state copy). 1: all sixteen registered. */

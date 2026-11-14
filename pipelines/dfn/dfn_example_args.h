@@ -42,9 +42,6 @@ static const DFN2GridSpec DFN_EXAMPLE_MODEL_ROWS[] = {
 #ifndef DFN_EXAMPLE_DELAY_NUM_FILTERS
 #define DFN_EXAMPLE_DELAY_NUM_FILTERS AEC_DELAY_NUM_FILTERS_MAX
 #endif
-_Static_assert(DFN_EXAMPLE_DELAY_NUM_FILTERS >= 1 &&
-               DFN_EXAMPLE_DELAY_NUM_FILTERS <= AEC_DELAY_NUM_FILTERS_MAX,
-               "DFN_EXAMPLE_DELAY_NUM_FILTERS outside lib/aec's bank range");
 
 typedef struct DfnExampleArgs {
     int sample_rate;         /* one of the skeleton's host grids (default 16000) */

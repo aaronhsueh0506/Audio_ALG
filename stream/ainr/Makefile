@@ -177,9 +177,9 @@ endif
 test-ainr-dfn2: $(AINR_TEST_BIN)
 	"$(AINR_TEST_BIN)"
 
-# Host-only regression suite for the "_spec"/"_freq" families (tests/test_ainr_spec_freq.c's own
-# top comment) -- same build shape as test-ainr-dfn2 above (full-variant only, same reason: needs
-# real catalog grids to cross-check against). AINR_ERB_MATRIX_DIR is unused by this suite (every init goes through
+# Host-only regression suite for the "_freq" family against the PCM family (tests/test_ainr_spec_freq.c's own
+# top comment; the file and target keep their names from the retired "_spec" family) -- same build shape as
+# test-ainr-dfn2 above (full-variant only, same reason: needs real catalog grids to cross-check against). AINR_ERB_MATRIX_DIR is unused by this suite (every init goes through
 # the explicit-path *_from_erb_file entry points) but passed anyway for build-command symmetry.
 AINR_SPEC_FREQ_TEST_BIN := $(OBJ_DIR)/test_ainr_spec_freq
 AINR_SPEC_FREQ_TEST_SOURCES := tests/test_ainr_spec_freq.c $(CORE_SOURCES) dfn2/dfn2_stream.c ainr.c
@@ -199,7 +199,7 @@ test-ainr-spec-freq: $(AINR_SPEC_FREQ_TEST_BIN)
 	"$(AINR_SPEC_FREQ_TEST_BIN)"
 
 # Variant-agnostic host suites (they pick the full or the lite catalog rows by DFN2_MASK_ONLY): the
-# end-of-input tail through all three families (test_ainr_tail.c) and the other single-purpose suites below.
+# end-of-input tail through both families (test_ainr_tail.c) and the other single-purpose suites below.
 # Never built under NO_STDIO.
 GENERIC_TEST_SOURCES := $(CORE_SOURCES) dfn2/dfn2_stream.c ainr.c
 
@@ -295,9 +295,8 @@ model-io-dumper: $(OBJ_DIR)/dump_model_io
 
 # test-link-only-ainr: builds BOTH full and mask-only dfn2/ archives (sub-make, as ainr.c is built here), then
 # links tests/link_only_ainr.c -- which #includes ONLY ainr.h -- against each; both must complete a real round trip.
-AINR_SYMBOLS := ainr_get_mem_size ainr_init_from_erb_file ainr_init ainr_get_mem_size_spec \
-	ainr_init_spec_from_erb_file ainr_get_mem_size_freq ainr_init_freq_from_erb_file \
-	ainr_init_freq
+AINR_SYMBOLS := ainr_get_mem_size ainr_init_from_erb_file ainr_init ainr_get_mem_size_freq \
+	ainr_init_freq_from_erb_file ainr_init_freq
 
 test-link-only-ainr:
 ifeq ($(NO_STDIO),1)

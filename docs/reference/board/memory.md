@@ -44,7 +44,7 @@
 
 Every field is a fixed-width integer
 (`uint32_t`/`uint64_t`, never `size_t` or a pointer), and the struct is
-pinned to a stable, `_Static_assert`-enforced **32-byte** layout — see
+pinned to a stable **32-byte** layout (the AEC library's `test_memory_layout` checks it at run time) — see
 "Serializing the descriptor" below for what that does (and does not) buy
 you. One `Aec` descriptor covers the single-channel instance and the whole 4-channel array pool alike. The DFN stage and the rate bridge use the same shape with their
 own version counters.
@@ -73,8 +73,8 @@ THIRD, even older, build.
 
 ## Serializing the descriptor
 
-`AecMemReq` is a fixed-width, 32-byte POD (`_Static_assert`-pinned
-in `aec.h`, sizeof and every field's offset) — it
+`AecMemReq` is a fixed-width, 32-byte POD (pinned by the AEC
+library's `test_memory_layout`: sizeof and the offset of `bytes`) — it
 can be copied byte-for-byte (`memcpy`) to a file, a flash region, or a wire
 message, and read back later, even by a different process, even after a
 restart. This is deliberately scoped narrower than "fully portable

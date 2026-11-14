@@ -185,7 +185,23 @@ static void test_pool_and_input_gates(void) {
     free(raw);
 }
 
+/* The front's delay-mode values pass through to the AEC unchanged, and the matched-filter default is the AEC's bank
+ * size: aiaec_front_config_defaults() documents five matched filters. */
+static void test_aec_constants_pin(void) {
+    CHECK((int)AIAEC_FRONT_DELAY_MATCHED == (int)AEC_DELAY_MATCHED,
+          "AIAEC_FRONT_DELAY_MATCHED %d != AEC_DELAY_MATCHED %d", (int)AIAEC_FRONT_DELAY_MATCHED, (int)AEC_DELAY_MATCHED);
+    CHECK((int)AIAEC_FRONT_DELAY_FIXED == (int)AEC_DELAY_FIXED,
+          "AIAEC_FRONT_DELAY_FIXED %d != AEC_DELAY_FIXED %d", (int)AIAEC_FRONT_DELAY_FIXED, (int)AEC_DELAY_FIXED);
+    CHECK((int)AIAEC_FRONT_DELAY_EXTERNAL == (int)AEC_DELAY_EXTERNAL_ALIGNED,
+          "AIAEC_FRONT_DELAY_EXTERNAL %d != AEC_DELAY_EXTERNAL_ALIGNED %d",
+          (int)AIAEC_FRONT_DELAY_EXTERNAL, (int)AEC_DELAY_EXTERNAL_ALIGNED);
+    CHECK(AEC_DELAY_NUM_FILTERS_MAX == 5,
+          "AEC_DELAY_NUM_FILTERS_MAX is %d, aiaec_front_config_defaults documents 5 matched filters",
+          (int)AEC_DELAY_NUM_FILTERS_MAX);
+}
+
 int main(void) {
+    test_aec_constants_pin();
     test_event_mapping();
     test_config_gates();
     test_product_grid();

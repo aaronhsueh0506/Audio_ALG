@@ -109,13 +109,6 @@ typedef struct UlcnetModelIoDescriptor {
     int frames_per_call;      /* 0 or 1: the one-frame boundary (layout 18); 2..64: the packet boundary (layout 19) */
 } UlcnetModelIoDescriptor;
 
-#ifdef __STDC_VERSION__
-#if __STDC_VERSION__ >= 201112L
-_Static_assert(sizeof(UlcnetModelIoDescriptor) == 52,
-               "UlcnetModelIoDescriptor must stay 52 bytes");
-#endif
-#endif
-
 typedef struct UlcnetModelIoMemReq {
     size_t bytes;
     size_t alignment;

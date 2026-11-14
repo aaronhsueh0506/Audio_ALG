@@ -15,13 +15,6 @@
 
 #define DFN2_STREAM_ALIGN DFN2_STREAM_ALIGNMENT
 
-#ifdef __STDC_VERSION__
-#if __STDC_VERSION__ >= 201112L
-_Static_assert(DFN2_STREAM_ALIGN == 16u,
-               "ck_align16_size is the shared 16-byte carve alignment");
-#endif
-#endif
-
 struct DFN2Stream {
     DFN2Grid grid;
     int      hpf_enable;

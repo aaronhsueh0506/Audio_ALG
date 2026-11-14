@@ -16,9 +16,11 @@
 #include <stdlib.h>
 #include <string.h>
 
+#include "utility/mem_align.h"
 #include "utility/simd_kernels.h"
 #include "../lib/ainr/dfn2/dfn2_process.h"
 #include "../lib/ainr/dfn2/dfn2_model_io.h"
+#include "../lib/ainr/dfn2/dfn2_prepost.h"
 #include "../lib/ainr/gtcrn/gtcrn_process.h"
 #include "ainr_test_hop.h"
 #include "dfn2_test_grid.h"
@@ -1848,9 +1850,80 @@ static int test_gtcrn_state_evolution(uint64_t* digest)
     return 1;
 }
 
+/* ---- ABI pins (the sizes and constants that a caller's pool or adapter is built against) ---- */
+
+static int pin_eq(const char* what, unsigned long long got, unsigned long long want)
+{
+    if (got == want) return 1;
+    fprintf(stderr, "FAIL: %s is %llu, pinned to %llu\n", what, got, want);
+    return 0;
+}
+#define PIN(expr, want) pin_eq(#expr, (unsigned long long)(expr), (unsigned long long)(want))
+
+/* The memory descriptors are fixed-width PODs of a stable size, and every carve uses audiolib's 16-byte alignment. */
+static int test_abi_pins(void)
+{
+    CHECK(PIN(sizeof(DFN2PrepostMemReq), 32), "DFN2PrepostMemReq must stay 32 bytes");
+    CHECK(PIN(sizeof(GTCRNProcessMemReq), 32), "GTCRNProcessMemReq must stay 32 bytes");
+    CHECK(PIN(DFN2_PREPOST_ALIGNMENT, 16) && PIN(ck_align16_size(1u), DFN2_PREPOST_ALIGNMENT),
+          "DFN2_PREPOST_ALIGNMENT must be the shared 16-byte carve alignment (ck_align16_size)");
+    CHECK(PIN(GTCRN_PROCESS_ALIGNMENT, 16) && PIN(ck_align16_size(1u), GTCRN_PROCESS_ALIGNMENT),
+          "GTCRN_PROCESS_ALIGNMENT must be the shared 16-byte carve alignment (ck_align16_size)");
+    return 1;
+}
+
+/* DFN2ModelIoDescriptor is the 18-int, 72-byte struct an adapter was compiled against. Its twelve external fields
+ * are the ones default() writes and validate() compares, the six interior ones are zero from default() and never
+ * compared: a field added to the struct but to neither list changes the size or breaks the 12 / 6 split. */
+static int test_dfn2_descriptor_layout(void)
+{
+    static const size_t external[] = {
+        offsetof(DFN2ModelIoDescriptor, layout_version), offsetof(DFN2ModelIoDescriptor, sample_rate),
+        offsetof(DFN2ModelIoDescriptor, fft_size), offsetof(DFN2ModelIoDescriptor, hop_size),
+        offsetof(DFN2ModelIoDescriptor, spectrum_bins), offsetof(DFN2ModelIoDescriptor, erb_bands),
+        offsetof(DFN2ModelIoDescriptor, df_bins), offsetof(DFN2ModelIoDescriptor, df_order),
+        offsetof(DFN2ModelIoDescriptor, mask_lookahead), offsetof(DFN2ModelIoDescriptor, df_lookahead),
+        offsetof(DFN2ModelIoDescriptor, input_frames), offsetof(DFN2ModelIoDescriptor, state_tensor_count),
+    };
+    static const size_t interior[] = {
+        offsetof(DFN2ModelIoDescriptor, encoder_gru_layers), offsetof(DFN2ModelIoDescriptor, erb_gru_layers),
+        offsetof(DFN2ModelIoDescriptor, df_gru_layers), offsetof(DFN2ModelIoDescriptor, gru_hidden),
+        offsetof(DFN2ModelIoDescriptor, encoder_channels), offsetof(DFN2ModelIoDescriptor, df_pathway_window),
+    };
+    const DFN2Grid* g = dfn2_test_grid();
+    DFN2ModelIoDescriptor d;
+    size_t i;
+
+    CHECK(PIN(sizeof(DFN2ModelIoDescriptor), 72), "DFN2ModelIoDescriptor must stay 72 bytes");
+    CHECK(PIN(sizeof(external) / sizeof(external[0]) + sizeof(interior) / sizeof(interior[0]),
+              sizeof(DFN2ModelIoDescriptor) / sizeof(int)),
+          "the external and interior field lists must cover the descriptor");
+    CHECK(PIN(sizeof(DFN2ModelIoDescriptor) / sizeof(int), 18), "DFN2ModelIoDescriptor must stay 18 fields");
+    for (i = 0; i < sizeof(external) / sizeof(external[0]); ++i) {
+        int bumped;
+        CHECK(dfn2_model_io_descriptor_default(g, &d) == 0, "DFN2 descriptor default");
+        *(unsigned int*)((unsigned char*)&d + external[i]) ^= 0x40u;
+        bumped = dfn2_model_io_descriptor_validate(g, &d);
+        if (bumped != -1) fprintf(stderr, "external field at offset %zu is not validated\n", external[i]);
+        CHECK(bumped == -1, "DFN2 an edited external descriptor field is refused");
+    }
+    for (i = 0; i < sizeof(interior) / sizeof(interior[0]); ++i) {
+        int bumped;
+        CHECK(dfn2_model_io_descriptor_default(g, &d) == 0, "DFN2 descriptor default");
+        CHECK(*(int*)((unsigned char*)&d + interior[i]) == 0, "DFN2 an interior descriptor field is zero by default");
+        *(int*)((unsigned char*)&d + interior[i]) = 7;
+        bumped = dfn2_model_io_descriptor_validate(g, &d);
+        if (bumped != 0) fprintf(stderr, "interior field at offset %zu is validated\n", interior[i]);
+        CHECK(bumped == 0, "DFN2 an interior descriptor field is carried, not validated");
+    }
+    return 1;
+}
+
 static int run_all_tests(void)
 {
     uint64_t digest = UINT64_C(1469598103934665603);
+    CHECK(test_abi_pins(), "ABI pins");
+    CHECK(test_dfn2_descriptor_layout(), "DFN2 descriptor layout");
     CHECK(test_dfn2_grid_contract(), "DFN2 test grid contract");
     CHECK(test_dfn_erb_spans_exact(),
           "DFN2 ERB nonzero spans are exact");

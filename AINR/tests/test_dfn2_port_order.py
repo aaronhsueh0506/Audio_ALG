@@ -148,7 +148,7 @@ def _export_row(export, tmp_path, row):
     return onnx.load(str(path)).graph
 
 
-@pytest.mark.parametrize('family', (0, 1, 2), ids=('pcm', 'spec', 'freq'))
+@pytest.mark.parametrize('family', (0, 2), ids=('pcm', 'freq'))   # the dumper's family 1 (_spec) is retired
 @pytest.mark.parametrize('row', ROWS, ids=_row_id)
 def test_library_work_views_are_the_exported_signals_and_heads(export, tmp_path, work_dumpers, row, family):
     lite, sr, fft, _n_erb, n = row

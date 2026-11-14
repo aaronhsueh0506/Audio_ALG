@@ -520,10 +520,23 @@ static uint64_t run_chain(int depth)
 }
 #endif
 
+#if defined(CHAIN_ULCNET)
+/* The pool descriptor is a fixed-width 32-byte POD (the carve alignment is pinned in test_prepost_kernels.c). */
+static int pin_memreq_size(void)
+{
+    if (sizeof(UlcnetPrepostMemReq) == 32u) return 1;
+    fprintf(stderr, "FAIL: UlcnetPrepostMemReq is %zu bytes, pinned to 32\n", sizeof(UlcnetPrepostMemReq));
+    return 0;
+}
+#endif
+
 int main(int argc, char** argv)
 {
     uint64_t got[2];
     SK_MATCH_SCALAR_TO_VECTOR_MODE();
+#if defined(CHAIN_ULCNET)
+    if (!pin_memreq_size()) return 1;
+#endif
     for (int i = 1; i < argc; ++i) {
         if (strncmp(argv[i], "grid=", 5) != 0 ||
             sscanf(argv[i] + 5, "%d,%d", &g_sample_rate, &g_n_fft) != 2) {

@@ -862,10 +862,6 @@ typedef struct {
 } Box;
 static Box box;
 
-_Static_assert(sizeof(OldDescriptor) == 72 &&
-                   offsetof(Box, guard) == 72,
-               "the guard band starts right after the descriptor");
-
 static int guard_intact(void)
 {
     size_t i;
@@ -883,6 +879,12 @@ int main(int argc, char **argv)
     };
     DFN2Grid grid;
     int written, filled, as_filled, old_frames, made;
+    /* OldDescriptor is the one-frame header's 72-byte struct, and the guard band starts right after it. */
+    if (sizeof(OldDescriptor) != 72 || offsetof(Box, guard) != 72) {
+        fprintf(stderr, "OldDescriptor is %zu bytes (want 72), guard at offset %zu (want 72)\n",
+                sizeof(OldDescriptor), offsetof(Box, guard));
+        return 3;
+    }
     if (argc != 2) return 2;
     spec.frames_per_call = atoi(argv[1]);
     made = dfn2_grid_make(&grid, &spec);

@@ -7,11 +7,6 @@
 #include "aec.h"
 #include "stream_mem.h"
 
-_Static_assert((int)AIAEC_FRONT_DELAY_MATCHED == (int)AEC_DELAY_MATCHED, "delay mode values");
-_Static_assert((int)AIAEC_FRONT_DELAY_FIXED == (int)AEC_DELAY_FIXED, "delay mode values");
-_Static_assert((int)AIAEC_FRONT_DELAY_EXTERNAL == (int)AEC_DELAY_EXTERNAL_ALIGNED, "delay mode values");
-_Static_assert(AEC_DELAY_NUM_FILTERS_MAX == 5, "aiaec_front_config_defaults documents 5 matched filters");
-
 #define FRONT_MAX_HOP_IN 65536
 
 typedef struct Layout {

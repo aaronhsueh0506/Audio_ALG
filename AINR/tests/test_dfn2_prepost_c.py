@@ -132,8 +132,6 @@ _DRIVER = r'''
  * table on this driver's grid).  erb_inv is a partition of unity per bin, which is what makes
  * frame_bypass an EXACT identity rather than an approximate one -- main() asserts that property
  * before any case runs, in the same accumulation order df_common_expand_mask() uses. */
-_Static_assert(DFN2_N_FFT == 1024 && DFN2_N_ERB == 32,
-               "this driver is built for the shipped grid and only varies the lookahead pair");
 static int erb_borders[DFN2_N_ERB];
 static float erb_fwd[DFN2_N_BINS][DFN2_N_ERB];
 static float erb_inv[DFN2_N_ERB][DFN2_N_BINS];
@@ -2699,6 +2697,8 @@ int main(int argc, char **argv) {
      * tensor would overrun a buffer here without any case noticing. */
     {
         const DFN2Grid *grid = dfn2_test_grid();
+        /* This driver is built for the shipped grid and only varies the lookahead pair. */
+        CHECK(DFN2_N_FFT == 1024 && DFN2_N_ERB == 32);
         CHECK(dfn2_grid_validate(grid) == DFN2_GRID_OK);
         CHECK(grid->sample_rate == DFN2_SR && grid->n_fft == DFN2_N_FFT);
         CHECK(grid->hop == DFN2_HOP_LEN && grid->n_bins == DFN2_N_BINS);

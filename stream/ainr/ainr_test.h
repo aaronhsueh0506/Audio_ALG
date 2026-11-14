@@ -14,10 +14,6 @@ extern "C" {
 int ainr_init_from_erb_file(const AinrConfig *cfg, const char *erb_path, void *pool, size_t pool_bytes,
                             AinrCtx **ctx, AinrInfo *info);
 
-/* As ainr_init_from_erb_file(), for the PCM -> spectrum family. */
-int ainr_init_spec_from_erb_file(const AinrConfig *cfg, const char *erb_path, void *pool, size_t pool_bytes,
-                                 AinrSpecCtx **ctx, AinrInfo *info);
-
 /* As ainr_init_from_erb_file(), for the spectrum -> spectrum family. */
 int ainr_init_freq_from_erb_file(const AinrConfig *cfg, const char *erb_path, void *pool, size_t pool_bytes,
                                  AinrFreqCtx **ctx, AinrInfo *info);

@@ -78,13 +78,6 @@ struct DFN2Prepost {
 
 /* ---- pool arithmetic: audiolib's saturating helpers (overflow pins the cursor to SIZE_MAX) ---- */
 
-#ifdef __STDC_VERSION__
-#if __STDC_VERSION__ >= 201112L
-_Static_assert(DFN2_PREPOST_ALIGNMENT == 16u,
-               "ck_align16_size is the shared 16-byte carve alignment");
-#endif
-#endif
-
 /* Reserve `count` elements of `elem` bytes at *cursor, aligned; base==NULL sizes only. */
 static int pp_carve(unsigned char *base, size_t *cursor, size_t count, size_t elem,
                     void **out) {

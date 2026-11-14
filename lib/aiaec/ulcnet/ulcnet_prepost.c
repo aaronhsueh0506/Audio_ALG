@@ -34,13 +34,6 @@ struct UlcnetPrepost {
 
 /* Pool arithmetic uses audiolib's saturating helpers: overflow pins the cursor to SIZE_MAX (MEM_SIZE_INVALID). */
 
-#ifdef __STDC_VERSION__
-#if __STDC_VERSION__ >= 201112L
-_Static_assert(ULCNET_MODEL_IO_ALIGNMENT == 16u,
-               "ck_align16_size is the shared 16-byte carve alignment");
-#endif
-#endif
-
 /* Reserve count * elem bytes at *cursor, aligned; base == NULL sizes only. */
 static int pp_carve(unsigned char *base, size_t *cursor, size_t count, size_t elem,
                     void **out) {

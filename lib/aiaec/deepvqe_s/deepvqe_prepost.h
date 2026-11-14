@@ -173,13 +173,6 @@ typedef struct DeepVqePrepostMemReq {
     uint64_t bytes;
 } DeepVqePrepostMemReq;
 
-#ifdef __STDC_VERSION__
-#if __STDC_VERSION__ >= 201112L
-_Static_assert(sizeof(DeepVqePrepostMemReq) == 32,
-               "DeepVqePrepostMemReq must stay 32 bytes");
-#endif
-#endif
-
 typedef struct DeepVqePrepost DeepVqePrepost;
 
 /* Read-only accelerator views: `mic`/`far` are the compressed planar spectra, N = grid.frames_per_call

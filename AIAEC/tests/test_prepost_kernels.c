@@ -330,6 +330,34 @@ static int test_deepvqe_kernels(void)
 }
 #endif
 
+static int pin_eq(const char* what, unsigned long long got, unsigned long long want)
+{
+    if (got == want) return 1;
+    fprintf(stderr, "FAIL: %s is %llu, pinned to %llu\n", what, got, want);
+    return 0;
+}
+#define PIN(expr, want) pin_eq(#expr, (unsigned long long)(expr), (unsigned long long)(want))
+
+/* The ABI facts of the translation unit this build includes: fixed descriptor sizes and the shared 16-byte carve
+ * alignment (audiolib's ck_align16_size). */
+static int test_abi_pins(void)
+{
+#if defined(KERNEL_TEST_ULCNET)
+    CHECK(PIN(sizeof(UlcnetModelIoDescriptor), 52), "UlcnetModelIoDescriptor must stay 52 bytes");
+    CHECK(PIN(ULCNET_MODEL_IO_ALIGNMENT, 16) && PIN(ck_align16_size(1u), ULCNET_MODEL_IO_ALIGNMENT),
+          "ULCNET_MODEL_IO_ALIGNMENT must be the shared 16-byte carve alignment (ck_align16_size)");
+#else
+    CHECK(PIN(sizeof(DeepVqePrepostMemReq), 32), "DeepVqePrepostMemReq must stay 32 bytes");
+    CHECK(PIN(DEEPVQE_PREPOST_ALIGNMENT, 16) && PIN(ck_align16_size(1u), DEEPVQE_PREPOST_ALIGNMENT),
+          "DEEPVQE_PREPOST_ALIGNMENT must be the shared 16-byte carve alignment (ck_align16_size)");
+    CHECK(PIN(sizeof(dv_state_names) / sizeof(dv_state_names[0]), DEEPVQE_STATE_COUNT),
+          "dv_state_names must name every DeepVqeStateId");
+    CHECK(PIN(sizeof(dv_state_names_out) / sizeof(dv_state_names_out[0]), DEEPVQE_STATE_COUNT),
+          "dv_state_names_out must name every DeepVqeStateId");
+#endif
+    return 1;
+}
+
 int main(int argc, char** argv)
 {
     SK_MATCH_SCALAR_TO_VECTOR_MODE();
@@ -342,6 +370,7 @@ int main(int argc, char** argv)
         g_bins = g_n_fft / 2 + 1;
         if (g_bins > BINS_MAX) return EXIT_FAILURE;
     }
+    if (!test_abi_pins()) return EXIT_FAILURE;
 #if defined(KERNEL_TEST_ULCNET)
     if (!test_ulcnet_kernels()) return EXIT_FAILURE;
     if (!test_ulcnet_frame_finite()) return EXIT_FAILURE;

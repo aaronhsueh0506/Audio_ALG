@@ -71,9 +71,6 @@ typedef struct {
     uint64_t bytes;
 } DfnRateBridgeMemReq;
 
-_Static_assert(sizeof(DfnRateBridgeMemReq) == 32,
-               "DfnRateBridgeMemReq must be exactly 32 bytes");
-
 typedef struct DfnRateBridge DfnRateBridge;
 
 /* Native grid `sample_rate` with the rate-default fft and the stage defaults for the model grid
